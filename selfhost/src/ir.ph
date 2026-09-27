@@ -1472,6 +1472,26 @@ pub fn extract(bd: *mut Builder, agg: *mut Value, i: u32) *mut Value {
 }
 
 pub fn insert(bd: *mut Builder, agg: *mut Value, x: *mut Value, i: u32) *mut Value {
+    // constants fold (a literal of constants is a constant, and lowering
+    // turns a large one into read-only data instead of stores)
+    let ak = agg.kind;
+    if is_const(x) and ((ak == V_CAGG) or (ak == V_UNDEF) or (ak == V_ZERO)) and (agg.ty.kind != T_VEC) and
+       (field_count(agg.ty) <= 256) {
+        let n = field_count(agg.ty);
+        let xs = u.newn.[*mut Value](n + 1);
+        for k in 0..n {
+            if k == @as(usize, i) {
+                xs[k] = x;
+            } else if ak == V_CAGG {
+                xs[k] = agg.xs.get(k);
+            } else if ak == V_ZERO {
+                xs[k] = czero(field_ty(agg.ty, k));
+            } else {
+                xs[k] = undef(field_ty(agg.ty, k));
+            }
+        }
+        return cagg(agg.ty, xs[0..n]);
+    }
     let v = emit(bd, OP_INSERTVALUE, agg.ty);
     v.a = agg;
     v.b = x;

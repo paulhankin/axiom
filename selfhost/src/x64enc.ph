@@ -521,9 +521,15 @@ pub fn rm_b(m: *Mem) u64 {
 pub fn modrm_mem(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64) void {
     let rf = (reg & 7) << 3;
     if m.tpoff {
-        // [disp32] absolute via SIB (no base, no index)
+        // [index*scale + disp32] via SIB (no base), the displacement relocated
         byte(e, 0x04 | rf);
-        byte(e, 0x25);
+        let mut ss: u64 = 0;
+        let mut xi: u64 = 4;
+        if m.index >= 0 {
+            ss = scale_bits(m.scale);
+            xi = gpr(m.index) & 7;
+        }
+        byte(e, ((ss << 6) | (xi << 3)) | 5);
         e.relocs.push(Reloc.{ off: @as(u64, e.b.len()), ty: 23, sym: m.sym, addend: m.disp });
         e.b.u32_(0);
         return;
@@ -574,7 +580,7 @@ pub fn modrm_mem(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64) void {
     }
 }
 
-fn scale_bits(s: u8) u64 {
+pub fn scale_bits(s: u8) u64 {
     if s == 2 {
         return 1;
     }

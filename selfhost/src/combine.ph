@@ -306,7 +306,8 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             return mk_icmp(B, p, a.a, ir.czero(ir.t_ptr()));
         }
     }
-    // Overflow checks: (x + c) <u x is x >u MAX - c; (x + c) >=u x is x <=u MAX - c.
+    // Overflow checks: (x + c) <u x and (x + c) <=u x are x >u MAX - c (for
+    // c != 0); (x + c) >=u x and (x + c) >u x are x <=u MAX - c.
     if at.kind == ir.T_INT {
         let mut sum = vnil();
         let mut q = p;
@@ -316,13 +317,14 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             sum = b;
             q = swap_pred(p);
         }
-        if u.notnil(sum) and ((q == ir.IntULT) or (q == ir.IntUGE)) {
+        if u.notnil(sum) and ((q == ir.IntULT) or (q == ir.IntUGE) or (q == ir.IntUGT) or (q == ir.IntULE)) {
+            // (x + c) wraps exactly when x >u MAX - c
             let c = kval(sum.b);
             if c == 0 {
-                return kbool(q == ir.IntUGE);
+                return kbool((q == ir.IntUGE) or (q == ir.IntULE));
             }
             let lim = kt(at, ir.mask_bits(bits) -% c);
-            if q == ir.IntULT {
+            if (q == ir.IntULT) or (q == ir.IntULE) {
                 return mk_icmp(B, ir.IntUGT, sum.a, lim);
             }
             return mk_icmp(B, ir.IntULE, sum.a, lim);
@@ -706,6 +708,63 @@ fn simplify_mul_ov(B: *mut ir.Builder, i: *mut ir.Value, signed: bool) *mut ir.V
     return ir.or_(B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
 }
 
+// The scalar of type t at byte offset off in constant c, or nil.
+fn const_at(c: *mut ir.Value, off: u64, t: *mut ir.Ty) *mut ir.Value {
+    let ct = c.ty;
+    if (c.kind == ir.V_CAGG) and ir.is_agg(ct) {
+        for k in 0..c.xs.len {
+            let fo = ir.field_off(ct, k);
+            let ft = ir.field_ty(ct, k);
+            if (off >= fo) and (off < (fo + ft.size)) {
+                return const_at(c.xs.get(k), off - fo, t);
+            }
+        }
+        return vnil();
+    }
+    if (c.kind == ir.V_ZERO) or (c.kind == ir.V_UNDEF) {
+        if (off + t.size) > ct.size {
+            return vnil();
+        }
+        if (t.kind == ir.T_INT) or (t.kind == ir.T_FLOAT) or (t.kind == ir.T_PTR) {
+            if c.kind == ir.V_ZERO {
+                return ir.czero(t);
+            }
+            return ir.undef(t);
+        }
+        return vnil();
+    }
+    if off != 0 {
+        return vnil();
+    }
+    if ct == t {
+        if (c.kind == ir.V_CINT) or (c.kind == ir.V_CFP) or (c.kind == ir.V_GLOBAL) or (c.kind == ir.V_FUNC) {
+            return c;
+        }
+    }
+    return vnil();
+}
+
+// A load from read-only data at a constant offset: the constant.
+fn simplify_load(i: *mut ir.Value) *mut ir.Value {
+    if i.flags != 0 {
+        return vnil();
+    }
+    let mut p = i.a;
+    let mut off: u64 = 0;
+    while is_op(p, ir.OP_PTRADD) and is_k(p.b) {
+        off = off +% kval(p.b);
+        p = p.a;
+    }
+    if (p.kind != ir.V_GLOBAL) or not p.gv.is_const or u.isnil(p.gv.init) or p.gv.tls or
+       (p.gv.linkage == ir.LINK_WEAK) or (p.gv.linkage == ir.LINK_EXTWEAK) {
+        return vnil();
+    }
+    if (off >= p.gv.ty.size) or (i.ty.kind == ir.T_VEC) {
+        return vnil();
+    }
+    return const_at(p.gv.init, off, i.ty);
+}
+
 // The value i can be replaced by, or nil (i may have been rewritten in place).
 pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
@@ -730,6 +789,9 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     }
     if op == ir.OP_PTRADD {
         return simplify_ptradd(B, i);
+    }
+    if op == ir.OP_LOAD {
+        return simplify_load(i);
     }
     if op == ir.OP_INTR {
         let id = pred_of(i);

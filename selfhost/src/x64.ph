@@ -287,7 +287,15 @@ fn reg(v: *mut ir.Value) i32 {
     if (k == ir.V_INST) and ((v.op == ir.OP_ALLOCA) or ((v.flag & 1) != 0)) {
         // folded into memory operands where it is used; recomputed here
         let r = vgpr();
-        _ = e2(xe.LEA, 8, W(r), addr(v));
+        let mut m = addr(v);
+        if m.slot == -3 {
+            // lea ignores segments: the thread pointer is the base
+            let t = vgpr();
+            _ = e1(xe.TLSBASE, 8, W(t));
+            m.base = t;
+            m.slot = -2;
+        }
+        _ = e2(xe.LEA, 8, W(r), m);
         return r;
     }
     if (k == ir.V_INST) or (k == ir.V_PARAM) {
@@ -408,6 +416,20 @@ fn addr(p: *mut ir.Value) mc.MOp {
             }
         }
         // base + index * scale
+        if ((p.flag & 1) != 0) and tls_global(p.a) {
+            let mut m = tls_mem(p.a);
+            if is_inst(off, ir.OP_MUL) and is_c(off.b) {
+                let s = cval(off.b);
+                if (s == 1) or (s == 2) or (s == 4) or (s == 8) {
+                    m.index = reg(off.a);
+                    m.scale = @truncate(u8, @bit_cast(u64, s));
+                    return m;
+                }
+            }
+            m.index = reg(off);
+            m.scale = 1;
+            return m;
+        }
         if (p.flag & 1) != 0 {
             let b = reg(p.a);
             if is_inst(off, ir.OP_MUL) and is_c(off.b) {
@@ -422,7 +444,22 @@ fn addr(p: *mut ir.Value) mc.MOp {
     if (p.kind == ir.V_GLOBAL) and not p.gv.tls and not extern_global(p.gv) {
         return mc.mem_sym(global_sym(p.gv), 0);
     }
+    if tls_global(p) {
+        return tls_mem(p);
+    }
     return mc.mem(reg(p), -1, 0, 0);
+}
+
+fn tls_global(p: *ir.Value) bool {
+    return (p.kind == ir.V_GLOBAL) and p.gv.tls;
+}
+
+// %fs:[sym@tpoff] (local-exec: the executable holds all thread-local data)
+fn tls_mem(p: *ir.Value) mc.MOp {
+    let mut m = mc.mem(-1, -1, 0, 0);
+    m.sym = global_sym(p.gv);
+    m.slot = -3;
+    return m;
 }
 
 // -----------------------------------------------------------------------------
@@ -2672,7 +2709,7 @@ fn gen_ptradd(v: *mut ir.Value) void {
     if imm_ok(v.b) {
         let mut m = addr(v.a);
         let nd = m.disp + cval(v.b);
-        if fits32(nd) and (m.scale != 99) and (m.slot != -2) {
+        if fits32(nd) and (m.scale != 99) and (m.slot != -2) and (m.slot != -3) {
             m.disp = nd;
             _ = e2(xe.LEA, 8, W(d), m);
             return;
@@ -3202,7 +3239,7 @@ fn to_mem(o: mc.MOp) xe.Mem {
         m.base = xe.RBP;
         m.disp += MF.slots.get(@int_cast(usize, o.slot)).offset;
         m.sym = -1;
-    } else if o.slot == -2 {
+    } else if (o.slot == -2) or (o.slot == -3) {
         m.tpoff = true;
     }
     return m;
@@ -3211,6 +3248,19 @@ fn to_mem(o: mc.MOp) xe.Mem {
 // ModRM for a memory operand, with TLS offsets relative to a base register.
 fn enc_mem(rf: i32, o: mc.MOp, imm_after: i64) void {
     let m = to_mem(o);
+    if m.tpoff and ((m.base < 0) or (m.index >= 0)) {
+        if m.base < 0 {
+            xe.modrm_mem(&mut E, @as(u64, @bit_cast(u32, rf)), &m, imm_after);
+            return;
+        }
+        // [base + index*scale + sym@tpoff]: mod=10 with SIB
+        let rfb = @as(u64, @bit_cast(u32, rf & 7)) << 3;
+        b8((0x80 | rfb) | 4);
+        b8(((xe.scale_bits(m.scale) << 6) | (@as(u64, @bit_cast(u32, m.index & 7)) << 3)) | @as(u64, @bit_cast(u32, m.base & 7)));
+        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_TPOFF32, sym: m.sym, addend: m.disp });
+        E.b.u32_(0);
+        return;
+    }
     if m.tpoff {
         // [base + sym@tpoff] : mod=10, disp32 relocated
         let rfb = @as(u64, @bit_cast(u32, rf & 7)) << 3;
@@ -3394,6 +3444,13 @@ fn enc_sse(i: *mut mc.MInst) void {
 fn enc_inst(i: *mut mc.MInst) void {
     let op = i.op;
     let sz = i.sz;
+    // thread-local memory addressed relative to the fs segment
+    for k in 0..i.ops.len {
+        if (i.ops[k].kind == mc.K_MEM) and (i.ops[k].slot == -3) {
+            b8(0x64);
+            break;
+        }
+    }
     if op == xe.MOV_RR {
         let d = P(i.ops[0].reg);
         let s = P(i.ops[1].reg);

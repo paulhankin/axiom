@@ -128,6 +128,12 @@ fn edges(x: u8, y: u64) i64 {
     if (y -% 5) > y {
         r += 10000;
     }
+    if (y +% 3) <= y {
+        r += 100000;
+    }
+    if y < (y +% 2) {
+        r += 1000000;
+    }
     return r;
 }
 
@@ -180,9 +186,9 @@ export fn run() void {
     io.int(classify(3, 5));                     // expect: 1
     io.int(classify(7, 5));                     // expect: 7
     io.int(classify(8, 5));                     // expect: 2
-    io.int(edges(0, 0xFFFF_FFFF_FFFF_FFFF));    // expect: 101
-    io.int(edges(255, 3));                      // expect: 10010
-    io.int(edges(4, 10));                       // expect: 0
+    io.int(edges(0, 0xFFFF_FFFF_FFFF_FFFF));    // expect: 100101
+    io.int(edges(255, 3));                      // expect: 1010010
+    io.int(edges(4, 10));                       // expect: 1000000
     io.uint(fib(20));                           // expect: 6765
     let mut arr: [5]i64 = [0; 5];
     io.int(loop_store(arr[..]));                // expect: 20
