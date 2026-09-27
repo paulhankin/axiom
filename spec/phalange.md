@@ -1788,7 +1788,7 @@ The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `net`) i
 ordinary Phalange code; see `std/README.md`. It adds no language rules. Operating-system
 services are reached through host functions imported from module `"phalange"` (the
 *Phalange host ABI*). Implementations exist for node (`runtime/host.mjs`) and POSIX
-(`runtime/native_host.c`). A program that uses only the language and `std/mem`, `vec`,
+(`runtime/native_host.c` in C, `runtime/native.ph` in Phalange). A program that uses only the language and `std/mem`, `vec`,
 `hash`, `map` and `matrix` needs no host at all.
 
 ---

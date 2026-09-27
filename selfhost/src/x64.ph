@@ -1204,6 +1204,74 @@ fn gen_fminmax(d: i32, a: i32, b: i32, is_min: bool, single: bool, vec: bool) vo
     sse3(orp, d, r, R(n));
 }
 
+// Rounding without SSE4.1: values of magnitude 2^52 (2^23) and above, and
+// NaNs, are already integers; smaller ones go through an integer conversion
+// (truncation, then adjusted for floor / ceil) or, for ties-to-even, the
+// addition and subtraction of 2^52. The sign is copied back (-0.5 -> -0).
+fn round_sse2(d: i32, a: i32, id: i32, single: bool) void {
+    let mut andp = xe.ANDPD;
+    let mut orp = xe.ORPD;
+    let mut cmp = xe.UCOMISD;
+    let mut add = xe.ADDSD;
+    let mut sub = xe.SUBSD;
+    let mut cvt = xe.CVTTSD2SI;
+    let mut big = pow2f(52);
+    if single {
+        andp = xe.ANDPS;
+        orp = xe.ORPS;
+        cmp = xe.UCOMISS;
+        add = xe.ADDSS;
+        sub = xe.SUBSS;
+        cvt = xe.CVTTSS2SI;
+        big = pow2f(23);
+    }
+    let done = new_label();
+    copy(d, a, XMM);
+    let ab = vxmm();
+    sse3(andp, ab, a, abs_mask(single));
+    let lim = fconst_reg(big, single);
+    _ = sse2(cmp, R(ab), R(lim));
+    jcc(xe.CC_AE, done);  // large, or unordered (CF set)
+    jcc(xe.CC_P, done);
+    let r = vxmm();
+    if id == ir.IN_NEAREST {
+        let t = vxmm();
+        sse3(add, t, ab, R(lim));
+        sse3(sub, r, t, R(lim));
+    } else {
+        let i = vgpr();
+        let c = sse2(cvt, W(i), R(a));
+        c.sz = 8;
+        cvt_si2f(r, i, true, single);
+        if (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) {
+            // floor: r > a -> r - 1; ceil: r < a -> r + 1
+            let one = fconst_reg(1.0, single);
+            let skip = new_label();
+            if id == ir.IN_FLOOR {
+                _ = sse2(cmp, R(r), R(a));
+                jcc(xe.CC_BE, skip);
+                sse3(sub, r, r, R(one));
+            } else {
+                _ = sse2(cmp, R(a), R(r));
+                jcc(xe.CC_BE, skip);
+                sse3(add, r, r, R(one));
+            }
+            place(skip);
+        }
+        let ra = vxmm();
+        sse3(andp, ra, r, abs_mask(single));
+        copy(r, ra, XMM);
+    }
+    // the magnitude of r with the sign of a
+    let sg = vxmm();
+    sse3(andp, sg, a, sign_mask(single));
+    let res = vxmm();
+    sse3(orp, res, r, R(sg));
+    let m = sse2(xe.MOVAPS, RW(d), R(res));
+    _ = m;
+    place(done);
+}
+
 fn round_imm(id: i32) i64 {
     if id == ir.IN_FLOOR {
         return 9;
@@ -1260,6 +1328,11 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         sse3(andp, x, a, abs_mask(single));
         sse3(andp, y, b, sign_mask(single));
         sse3(orp, d, x, R(y));
+        return;
+    }
+    if ((id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST)) and
+       not has41() and not vec {
+        round_sse2(d, a, id, single);
         return;
     }
     if (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST) {

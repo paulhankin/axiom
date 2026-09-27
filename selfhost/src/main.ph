@@ -11,7 +11,7 @@
 //   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
 //   --release                  same as --overflow=saturate
 //   --overflow=trap|saturate   integer overflow mode (default trap)
-//   --emit=exe|obj|ir|asm      output kind (default: exe = .wasm module / native executable)
+//   --emit=exe|obj|ir          output kind (default: exe = .wasm module / native executable)
 //   --format=human|agent-json  diagnostic format
 //   --std=<dir>                standard library directory
 //   --link=<file>              extra C source, object or library to link (repeatable)
@@ -42,7 +42,7 @@ fn usage() void {
     u.eprint("  test: --filter=<text> --timeout=<ms>\n");
     u.eprint("  --target=wasm32|wasm64|x86_64|aarch64|native   --cpu=<name>   --features=+ext,-ext\n");
     u.eprint("  -O0..-O3   --release | --overflow=trap|saturate\n");
-    u.eprint("  --emit=exe|obj|ir|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
+    u.eprint("  --emit=exe|obj|ir  --format=human|agent-json  --std=<dir>  -o <out>\n");
     u.eprint("  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
     u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
@@ -1220,7 +1220,8 @@ fn driver(args: [][]u8) i32 {
     } else if u.str_eq(emit, "ir") {
         co.emit = cg.EMIT_IR;
     } else if u.str_eq(emit, "asm") {
-        co.emit = cg.EMIT_ASM;
+        dg.emit_fatal(json, "E9001", "--emit=asm is not supported: use --emit=obj and a disassembler, or --emit=ir");
+        return 2;
     } else if final_link {
         co.emit = cg.EMIT_OBJ;
     } else {

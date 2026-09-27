@@ -80,5 +80,7 @@ Two implementations are provided:
   `node runtime/host.mjs prog.wasm`. Node sockets are asynchronous, so they live in
   a worker thread, and the wasm thread blocks on `Atomics.wait` until each
   operation completes.
-- **[`runtime/native_host.c`](../runtime/native_host.c)** for POSIX. The compiler
-  links it automatically when a native program uses the host ABI.
+- **[`runtime/native_host.c`](../runtime/native_host.c)** for POSIX. The C compiler
+  links it automatically when a native program uses the host ABI. The self-hosted
+  compiler builds the same host ABI written in Phalange,
+  [`runtime/native.ph`](../runtime/native.ph), into every native program.

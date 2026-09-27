@@ -10,6 +10,7 @@
 // per-program link unit (globals, error codes, runtime state, exports).
 // =============================================================================
 import "util.ph" as u;
+import "target.ph" as tg;
 import "diag.ph" as dg;
 import "ast.ph" as ast;
 import "types.ph" as ty;
@@ -86,6 +87,8 @@ fn options_id(o: *cg.CgOptions) []u8 {
     if not u.isnos(o.cpu) {
         b.s(o.cpu);
     }
+    b.s("|");
+    b.s(u.hex16(tg.g_features));  // the extensions the code may use
     return b.done();
 }
 

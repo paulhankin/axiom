@@ -5,8 +5,9 @@ backend. It compiles `.ph` programs to WebAssembly modules (the primary target) 
 native executables.
 
 [`selfhost/`](../selfhost/README.md) has a port of this compiler to Phalange, which this
-one bootstraps. The two produce identical output, so a change to one belongs in both;
-`selfhost/difftest.sh` compares them.
+one bootstraps. The port has the same front end (identical diagnostics, so a change to
+one belongs in both) and its own backends instead of LLVM; programs must behave the same
+with either compiler. `selfhost/difftest.sh` compares them.
 
 ```
 $ make -C compiler
