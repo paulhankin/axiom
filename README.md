@@ -19,6 +19,7 @@ phalange test mylib.ph                # run a file's `test` blocks
 phalange new geometry                 # a package: phalange.toml + src/lib.ph (spec §4.6)
 phalange test geometry                # build/check/test also take a package directory
 phalange profile prog.ph              # sampling profiler: hot functions, call sites, flame graph input
+phalange build app --verbose          # modules compile separately and are cached (spec §17.7)
 node tests/run.mjs                    # run the test suite
 ```
 

@@ -250,7 +250,7 @@ int main(int argc, char **argv) {
             code = "T0000";
             snprintf(msg, sizeof msg, "test process exited unexpectedly (status %d)", status);
         }
-        printf("PHT\t%u\t%s\t%s\t%d\t%u\t%u\t%.0f\t", i, st, code, (int)file_id, start, end, ms);
+        printf("PHT\t%u\t%s\t%s\t%lld\t%u\t%u\t%.0f\t", i, st, code, file_id == (unsigned)-1 ? -1ll : (long long)file_id, start, end, ms);
         put_escaped(msg, strlen(msg));
         putchar('\t');
         if (outbuf) put_escaped(outbuf, outlen);

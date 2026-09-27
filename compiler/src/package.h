@@ -32,4 +32,7 @@ bool pkg_new(const char *name, bool json);
 // Every .ph file under the package's src/ directory (sorted).
 void pkg_source_files(Package *p, StrVec *out);
 
+// The toolchain cache: $PHALANGE_CACHE, $XDG_CACHE_HOME/phalange or ~/.cache/phalange.
+const char *pkg_cache_dir(void);
+
 #endif

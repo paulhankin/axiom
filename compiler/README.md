@@ -27,6 +27,7 @@ phalange check <file.ph> [options]    parse and type-check only
 phalange test  <file.ph> [options]    build and run the file's test blocks (spec §18)
                                       --filter=<text> --timeout=<ms> (default 10000)
 phalange new   <name>                 create a package (phalange.toml, src/lib.ph)
+phalange cache [path|clean]           the compiled-module cache
 phalange profile <file.ph> [options]  build, run under the sampling profiler, report (spec §17.6)
                                       --rate=<hz> (default 999) --folded=<path>
 
@@ -43,6 +44,9 @@ current directory (spec §4.6).
                                   sources are compiled with clang for the same target
   -l<lib> -L<dir> -I<dir>         C libraries, library directories, include directories
   --stack-traces=on|off           call-site shadow stack for crash traces and profiles (default on)
+  --units=module|program          compile modules separately, with a cache (default at -O0/-O1),
+                                  or the program as one unit (default at -O2/-O3)
+  --verbose                       report compiled and cached modules
   --emit-header=<path>            write a C header for the `export fn`s (also works with `check`)
   --std=<dir>                     standard library directory (default: found next to the binary,
                                   or $PHALANGE_STD)
@@ -63,6 +67,14 @@ instance in a node worker (`runtime/test_runner.mjs`) or a forked process
 (`runtime/test_main.c`). It reports human-readable text or `phalange-tests/1` JSON.
 Every trap reports its code, the failing expression and its location, in tests and in
 normal runs.
+
+**Separate compilation** (spec §17.7, `src/units.c`): each module becomes its own object,
+cached under `~/.cache/phalange/obj` by a key that hashes the compiler, the options, the
+module's source and the keys of its imports. So an edit recompiles only that module and
+its importers, and those are compiled in parallel worker processes. Program-wide pieces
+(globals, error codes, runtime state, exports) go in a small link unit that is
+regenerated on every build. Error codes are link-time symbols in module objects, so
+adding an error name never invalidates the cache.
 
 **Stack traces** (spec §17.4): every trap and crash (including stack overflow and
 faults in C code) prints the call path with source locations, and failing tests show

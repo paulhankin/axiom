@@ -73,6 +73,12 @@ typedef struct FnState {
 
 static FnState *F;
 
+static LLVMValueRef errcode_value(uint32_t code);
+static bool type_mentions_error(Type *t);
+static const char *export_symbol(Decl *d);
+static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out);
+static LLVMValueRef shared_global(LLVMTypeRef t, const char *name, LLVMValueRef init, unsigned addrspace);
+
 static LLVMValueRef gen(Expr *e);
 static LLVMValueRef gen_inner(Expr *e);
 static LLVMValueRef gen_addr_inner(Expr *e);
@@ -255,9 +261,7 @@ static SymMap site_map;
 static LLVMValueRef trap_info_global(void) {
     if (!trap_info) {
         LLVMTypeRef t = LLVMArrayType2(T_i64, 6);
-        trap_info = LLVMAddGlobal(mod, t, "phalange.trap_info");
-        LLVMSetInitializer(trap_info, LLVMConstNull(t));
-        LLVMSetLinkage(trap_info, LLVMInternalLinkage);
+        trap_info = shared_global(t, "phalange.trap_info", LLVMConstNull(t), 0);
         LLVMSetAlignment(trap_info, 8);
     }
     return trap_info;
@@ -266,6 +270,31 @@ static LLVMValueRef trap_info_global(void) {
 static LLVMValueRef trap_info_slot(int i) {
     LLVMValueRef ix[2] = {LLVMConstInt(T_i32, 0, false), LLVMConstInt(T_i32, (unsigned)i, false)};
     return LLVMBuildGEP2(B, LLVMArrayType2(T_i64, 6), trap_info_global(), ix, 2, "");
+}
+
+uint32_t file_key(int file_id) {
+    if (file_id < 0 || file_id >= g_files.len) return 0xFFFFFFFFu;
+    uint32_t h = 2166136261u;
+    for (const char *p = g_files.data[file_id]->display; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    return h == 0xFFFFFFFFu ? 0 : h;
+}
+
+void collect_link_names(void) {
+    SymMap seen = {0};
+    for (int i = 0; i < g_prog.fns.len; i++) {
+        Decl *d = g_prog.fns.data[i];
+        if (!d->is_export) continue;
+        Sym s = intern_cstr(export_symbol(d));
+        if (!symmap_get(&seen, s)) vec_push(g_export_names, s);
+        symmap_put(&seen, s, (void *)1);
+    }
+    for (int i = 0; i < g_prog.host_fns.len; i++) {
+        Decl *d = g_prog.host_fns.data[i];
+        if (!d->extern_c || !d->link_lib) continue;
+        Sym s = intern_cstr(d->link_lib);
+        if (!symmap_get(&seen, s)) vec_push(g_link_libs, s);
+        symmap_put(&seen, s, (void *)1);
+    }
 }
 
 static const char *cur_fn_display(void) { return F && F->inst ? F->inst->display : ""; }
@@ -302,7 +331,7 @@ static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
         text = arena_strndup(f->text + sp.start, n);
     }
     LLVMValueRef vals[10] = {
-        LLVMConstInt(T_i32, (unsigned)code, false), LLVMConstInt(T_i32, (unsigned)sp.file, false),
+        LLVMConstInt(T_i32, (unsigned)code, false), LLVMConstInt(T_i32, file_key(sp.file), false),
         LLVMConstInt(T_i32, sp.start, false),       LLVMConstInt(T_i32, sp.end, false),
         LLVMConstInt(T_i32, (unsigned)sl, false),   LLVMConstInt(T_i32, (unsigned)sc, false),
         string_ptr(file, (uint32_t)strlen(file)),   string_ptr(text, (uint32_t)strlen(text)),
@@ -344,28 +373,26 @@ static LLVMTypeRef ss_type(void) {
     return ss_ty;
 }
 
-static LLVMValueRef ss_ptr(void) {
+static void ss_globals(void) {
     LLVMTypeRef t = ss_type();
     if (!ss_global) {
         if (g_target.wasm) {
-            ss_main = LLVMAddGlobal(mod, t, "phalange.ss.main");
-            LLVMSetInitializer(ss_main, LLVMConstNull(t));
-            LLVMSetLinkage(ss_main, LLVMInternalLinkage);
+            ss_main = shared_global(t, "phalange.ss.main", LLVMConstNull(t), 0);
             LLVMSetAlignment(ss_main, 8);
             // null means the main thread's record (wasm-ld does not relocate
             // wasm global initializers); thread starts set their own.
-            ss_global = LLVMAddGlobalInAddressSpace(mod, T_ptr, "phalange.ss", 1);
-            LLVMSetInitializer(ss_global, LLVMConstNull(T_ptr));
-            LLVMSetLinkage(ss_global, LLVMInternalLinkage);
+            ss_global = shared_global(T_ptr, "phalange.ss", LLVMConstNull(T_ptr), 1);
         } else {
-            ss_global = LLVMAddGlobal(mod, t, "phalange.ss");
-            LLVMSetInitializer(ss_global, LLVMConstNull(t));
-            LLVMSetLinkage(ss_global, LLVMInternalLinkage);
+            ss_global = shared_global(t, "phalange.ss", LLVMConstNull(t), 0);
             LLVMSetThreadLocal(ss_global, true);
             LLVMSetThreadLocalMode(ss_global, LLVMInitialExecTLSModel);
             LLVMSetAlignment(ss_global, 8);
         }
     }
+}
+
+static LLVMValueRef ss_ptr(void) {
+    ss_globals();
     if (g_target.wasm) {
         LLVMValueRef p = LLVMBuildLoad2(B, T_ptr, ss_global, "");
         return LLVMBuildSelect(B, LLVMBuildIsNull(B, p, ""), ss_main, p, "ss");
@@ -668,13 +695,85 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
     return LLVMConstNull(lty(t));
 }
 
+// Symbols are prefixed with the module's path (without .ph), which is unique
+// within a build, so modules compiled separately never clash.
 static const char *mangle_prefix(Decl *d) {
     const char *base = d->module ? g_files.data[d->module->file->id]->display : "";
-    const char *slash = strrchr(base, '/');
-    if (slash) base = slash + 1;
     size_t n = strlen(base);
     if (n > 3 && strcmp(base + n - 3, ".ph") == 0) n -= 3;
     return arena_strndup(base, n);
+}
+
+// A type in a symbol name: like type_str, but struct and union names are
+// qualified by their module, so instances are named the same in every unit.
+static void mangle_type_into(CharVec *b, Type *t) {
+#define MPUT(str)                                                  \
+    do {                                                           \
+        for (const char *q_ = (str); *q_; q_++) vec_push(*b, *q_); \
+    } while (0)
+    switch (t->kind) {
+    case TY_STRUCT:
+    case TY_UNION:
+        if (t->decl->anon) {  // anonymous structs are the same type everywhere
+            MPUT("struct{");
+            for (int i = 0; i < t->decl->fields.len; i++) {
+                if (i) MPUT(",");
+                MPUT(t->decl->fields.data[i].name);
+                MPUT(":");
+                mangle_type_into(b, type_field(t, i));
+            }
+            MPUT("}");
+            break;
+        }
+        MPUT(mangle_prefix(t->decl));
+        MPUT(".");
+        MPUT(t->decl->name);
+        if (t->nargs) {
+            MPUT("[");
+            for (int i = 0; i < t->nargs; i++) {
+                if (i) MPUT(",");
+                mangle_type_into(b, t->args[i]);
+            }
+            MPUT("]");
+        }
+        break;
+    case TY_PTR:
+        MPUT(t->mut ? "*mut " : "*");
+        mangle_type_into(b, t->elem);
+        break;
+    case TY_SLICE:
+        MPUT(t->mut ? "[]mut " : "[]");
+        mangle_type_into(b, t->elem);
+        break;
+    case TY_ARRAY:
+        MPUT(arena_printf("[%lld]", (long long)t->len));
+        mangle_type_into(b, t->elem);
+        break;
+    case TY_ERRUNION:
+        MPUT("!");
+        mangle_type_into(b, t->elem);
+        break;
+    case TY_FN:
+        MPUT("fn(");
+        for (int i = 0; i < t->nparams; i++) {
+            if (i) MPUT(",");
+            mangle_type_into(b, t->params[i]);
+        }
+        MPUT(")");
+        mangle_type_into(b, t->ret);
+        break;
+    default: MPUT(type_str(t)); break;
+    }
+#undef MPUT
+}
+
+static const char *mangle_type(Type *t) {
+    CharVec b = {0};
+    mangle_type_into(&b, t);
+    vec_push(b, 0);
+    const char *r = arena_strndup(b.data, strlen(b.data));
+    free(b.data);
+    return r;
 }
 
 // Owner.[A].name.[B], or test "name".
@@ -715,18 +814,65 @@ static const char *fn_display(Decl *d, Type **gargs, int n) {
     return r;
 }
 
+// The symbol of an exported function. On wasm (and in test binaries, which
+// have their own main) `main` is renamed; the export name is an attribute.
+static const char *export_symbol(Decl *d) {
+    return (g_target.wasm || g_test_mode) && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
+}
+
+// Globals live in the link unit when units are compiled separately (their
+// initializers may contain error codes, which only the link unit knows).
 static LLVMValueRef global_ref(Decl *d) {
     Sym k = ptr_key(d);
     LLVMValueRef g = symmap_get(&global_vals, k);
     if (g) return g;
     Type *t = d->type;
     g = LLVMAddGlobal(mod, lty(t), arena_printf("%s.%s", mangle_prefix(d), d->name));
-    LLVMSetLinkage(g, LLVMInternalLinkage);
     LLVMSetAlignment(g, (unsigned)type_align(t));
     symmap_put(&global_vals, k, g);
+    if (O->unit == CG_MODULE) return g;  // defined by the link unit
+    if (O->unit == CG_WHOLE) LLVMSetLinkage(g, LLVMInternalLinkage);
     LLVMSetInitializer(g, gen_const(d->init, t));
     if (!d->mut) LLVMSetGlobalConstant(g, true);
     return g;
+}
+
+// Program-wide state shared by all units: defined (internal) in a whole
+// program, declared by module units, defined (external) by the link unit.
+static LLVMValueRef shared_global(LLVMTypeRef t, const char *name, LLVMValueRef init, unsigned addrspace) {
+    LLVMValueRef g = addrspace ? LLVMAddGlobalInAddressSpace(mod, t, name, addrspace) : LLVMAddGlobal(mod, t, name);
+    if (O->unit == CG_MODULE) return g;
+    LLVMSetInitializer(g, init);
+    if (O->unit == CG_WHOLE) LLVMSetLinkage(g, LLVMInternalLinkage);
+    return g;
+}
+
+// An error code: a constant, except in module units, where the codes are
+// only known at link time (spec §11.1) and are loaded from the link unit.
+static LLVMValueRef errcode_value(uint32_t code) {
+    if (O->unit != CG_MODULE || code == 0 || (int)code > g_prog.error_names.len)
+        return LLVMConstInt(T_i16, code, false);
+    const char *name = arena_printf("phalange.errcode.%s", g_prog.error_names.data[code - 1]);
+    LLVMValueRef g = LLVMGetNamedGlobal(mod, name);
+    if (!g) {
+        g = LLVMAddGlobal(mod, T_i16, name);
+        LLVMSetGlobalConstant(g, true);
+    }
+    return LLVMBuildLoad2(B, T_i16, g, "");
+}
+
+static bool type_mentions_error(Type *t) {
+    switch (t->kind) {
+    case TY_ERROR:
+    case TY_ERRUNION: return true;
+    case TY_ARRAY: return type_mentions_error(t->elem);
+    case TY_STRUCT:
+        for (int i = 0; i < t->decl->fields.len; i++)
+            if (type_mentions_error(type_field(t, i))) return true;
+        return false;
+    case TY_UNION: return true;  // conservatively
+    default: return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,8 +907,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         // from the wasm-export-name attribute: LLVM treats a symbol called
         // `main` specially on wasm (it would add a second `main` export).
         // Test binaries bring their own `main` (the test driver).
-        name = (g_target.wasm || g_test_mode) && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
-        vec_push(g_export_names, intern_cstr(name));
+        name = export_symbol(d);
     } else {
         CharVec nb = {0};
         const char *pre = mangle_prefix(d);
@@ -773,7 +918,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
             const char *o = ".[";
             while (*o) vec_push(nb, *o++);
             for (int i = n - nown; i < n; i++) {
-                const char *ts = type_str(gargs[i]);
+                const char *ts = mangle_type(gargs[i]);
                 if (i > n - nown) {
                     vec_push(nb, ',');
                     vec_push(nb, ' ');
@@ -786,7 +931,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
             const char *o = "@[";
             while (*o) vec_push(nb, *o++);
             for (int i = 0; i < d->owner->gparams.len; i++) {
-                const char *ts = type_str(gargs[i]);
+                const char *ts = mangle_type(gargs[i]);
                 if (i) vec_push(nb, ',');
                 while (*ts) vec_push(nb, *ts++);
             }
@@ -807,7 +952,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
     add_ext_attrs(fi->fn, fi->fnty, fi->sret, false);
     if (d->kind == D_HOST_FN) {
         if (d->extern_c) {
-            if (d->link_lib) vec_push(g_link_libs, d->link_lib);
+            // libraries: see collect_link_names
         } else if (g_target.wasm) {
             LLVMAddAttributeAtIndex(fi->fn, LLVMAttributeFunctionIndex,
                                     LLVMCreateStringAttribute(ctx, "wasm-import-module", 18, d->host_module,
@@ -817,14 +962,24 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
                                                               (unsigned)strlen(d->name)));
         }
     } else {
-        if (!d->is_export) LLVMSetLinkage(fi->fn, LLVMInternalLinkage);
-        else if (g_target.wasm)
+        // Whole program: everything but exports is internal. Separate units:
+        // a non-generic function is defined (externally visible) by its own
+        // module's unit and only declared elsewhere; generic instances are
+        // defined link-once by every unit that uses them.
+        bool define = true;
+        if (O->unit == CG_LINK) define = false;
+        else if (O->unit == CG_MODULE && n == 0) define = d->module == O->module;
+        if (O->unit == CG_WHOLE && !d->is_export) LLVMSetLinkage(fi->fn, LLVMInternalLinkage);
+        else if (define && n > 0) LLVMSetLinkage(fi->fn, LLVMLinkOnceODRLinkage);
+        if (define && d->is_export && g_target.wasm)
             LLVMAddAttributeAtIndex(fi->fn, LLVMAttributeFunctionIndex,
                                     LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, d->name,
                                                               (unsigned)strlen(d->name)));
-        if (pending_tail) pending_tail->next = fi;
-        else pending_head = fi;
-        pending_tail = fi;
+        if (define) {
+            if (pending_tail) pending_tail->next = fi;
+            else pending_head = fi;
+            pending_tail = fi;
+        }
     }
     symmap_put(&inst_map, k, fi);
     return fi;
@@ -1522,7 +1677,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_MEMORY_GROW: {
         LLVMValueRef prev = mem_grow(gen(a[0].e));
         LLVMValueRef failed = LLVMBuildICmp(B, LLVMIntEQ, prev, LLVMConstAllOnes(T_isz), "");
-        LLVMValueRef code = LLVMBuildSelect(B, failed, LLVMConstInt(T_i16, error_code_of(intern_cstr("OutOfMemory")), false),
+        LLVMValueRef code = LLVMBuildSelect(B, failed, errcode_value(error_code_of(intern_cstr("OutOfMemory"))),
                                             LLVMConstInt(T_i16, 0, false), "");
         return errunion_value(rt, code, prev);
     }
@@ -1564,7 +1719,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         const char *op = e->index == BI_ADD_CHECKED ? "add" : e->index == BI_SUB_CHECKED ? "sub" : "mul";
         LLVMValueRef val, ovf;
         op_with_overflow(op, t->is_signed, l, r, &val, &ovf);
-        LLVMValueRef code = LLVMBuildSelect(B, ovf, LLVMConstInt(T_i16, error_code_of(intern_cstr("Overflow")), false),
+        LLVMValueRef code = LLVMBuildSelect(B, ovf, errcode_value(error_code_of(intern_cstr("Overflow"))),
                                             LLVMConstInt(T_i16, 0, false), "");
         return errunion_value(rt, code, val);
     }
@@ -1742,15 +1897,9 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_ATOMIC_NOTIFY: return gen_atomic(e);
     case BI_ERROR_NAME: {
         LLVMValueRef code = gen(a[0].e);
-        LLVMValueRef tab = error_name_table();
-        int n = g_prog.error_names.len;
-        LLVMValueRef c = LLVMBuildZExt(B, code, T_isz, "");
-        LLVMValueRef inb = LLVMBuildICmp(B, LLVMIntULE, c, usz(n), "");
-        c = LLVMBuildSelect(B, inb, c, usz(0), "");
-        LLVMTypeRef st = lty(type_slice(t_u8, false));
-        LLVMValueRef ix[2] = {usz(0), c};
-        LLVMValueRef p = LLVMBuildGEP2(B, LLVMArrayType2(st, (uint64_t)n + 1), tab, ix, 2, "");
-        return LLVMBuildLoad2(B, st, p, "");
+        LLVMTypeRef fty;
+        LLVMValueRef f = error_name_fn(&fty);
+        return LLVMBuildCall2(B, fty, f, &code, 1, "");
     }
     default: break;
     }
@@ -1947,7 +2096,7 @@ static void emit_thread_start(void) {
         LLVMValueRef neg = LLVMConstInt(T_isz, (unsigned long long)-(long long)size, true);
         LLVMValueRef base = LLVMBuildGEP2(B, T_i8, top, &neg, 1, "");
         LLVMBuildMemSet(B, base, LLVMConstInt(T_i8, 0, false), usz((int64_t)size), 16);
-        ss_ptr();
+        ss_globals();
         LLVMBuildStore(B, base, ss_global);
         top = base;
     }
@@ -1977,6 +2126,29 @@ static LLVMValueRef error_name_table(void) {
     return g_errtab;
 }
 
+// phalange.error_name(code) []u8: the name table lives with the error codes
+// (in the link unit when units are compiled separately).
+static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out) {
+    LLVMTypeRef st = lty(type_slice(t_u8, false));
+    LLVMTypeRef fty = LLVMFunctionType(st, &T_i16, 1, false);
+    *fty_out = fty;
+    LLVMValueRef f = LLVMGetNamedFunction(mod, "phalange.error_name");
+    if (f) return f;
+    f = LLVMAddFunction(mod, "phalange.error_name", fty);
+    if (O->unit == CG_MODULE) return f;
+    if (O->unit == CG_WHOLE) LLVMSetLinkage(f, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
+    LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, f, "entry"));
+    LLVMValueRef tab = error_name_table();
+    int n = g_prog.error_names.len;
+    LLVMValueRef c = LLVMBuildZExt(B, LLVMGetParam(f, 0), T_isz, "");
+    c = LLVMBuildSelect(B, LLVMBuildICmp(B, LLVMIntULE, c, usz(n), ""), c, usz(0), "");
+    LLVMValueRef ix[2] = {usz(0), c};
+    LLVMBuildRet(B, LLVMBuildLoad2(B, st, LLVMBuildGEP2(B, LLVMArrayType2(st, (uint64_t)n + 1), tab, ix, 2, ""), ""));
+    if (saved) LLVMPositionBuilderAtEnd(B, saved);
+    return f;
+}
+
 // Linear memory growth. On wasm these are the real instructions; on native
 // targets a reserved, 64 KiB-aligned region emulates linear memory pages.
 #define NATIVE_HEAP_PAGES 4096
@@ -1984,13 +2156,10 @@ static LLVMValueRef native_heap, native_pages;
 
 static void ensure_native_heap(void) {
     if (native_heap) return;
-    native_heap = LLVMAddGlobal(mod, LLVMArrayType2(T_i8, (uint64_t)NATIVE_HEAP_PAGES * 65536), "phalange.heap");
-    LLVMSetInitializer(native_heap, LLVMConstNull(LLVMArrayType2(T_i8, (uint64_t)NATIVE_HEAP_PAGES * 65536)));
+    LLVMTypeRef ht = LLVMArrayType2(T_i8, (uint64_t)NATIVE_HEAP_PAGES * 65536);
+    native_heap = shared_global(ht, "phalange.heap", LLVMConstNull(ht), 0);
     LLVMSetAlignment(native_heap, 65536);
-    LLVMSetLinkage(native_heap, LLVMInternalLinkage);
-    native_pages = LLVMAddGlobal(mod, T_isz, "phalange.heap_pages");
-    LLVMSetInitializer(native_pages, usz(0));
-    LLVMSetLinkage(native_pages, LLVMInternalLinkage);
+    native_pages = shared_global(T_isz, "phalange.heap_pages", usz(0), 0);
 }
 
 static LLVMValueRef mem_size(void) {
@@ -2154,7 +2323,9 @@ static LLVMValueRef gen_inner(Expr *e) {
             case D_GLOBAL: return load(t, global_ref(e->decl), false);
             case D_FN:
             case D_HOST_FN: return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
-            case D_CONST: return gen_const(e->decl->cexpr, t);
+            case D_CONST:
+                if (O->unit == CG_MODULE && type_mentions_error(t)) return gen(e->decl->cexpr);
+                return gen_const(e->decl->cexpr, t);
             default: break;
             }
         }
@@ -2166,7 +2337,7 @@ static LLVMValueRef gen_inner(Expr *e) {
     case E_STRUCT_LIT: return gen_struct_lit(e);
     case E_ARRAY_LIT:
     case E_ARRAY_REPEAT: return gen_array_lit(e);
-    case E_ERROR_VAL: return LLVMConstInt(T_i16, (unsigned long long)e->cval, false);
+    case E_ERROR_VAL: return errcode_value((uint32_t)e->cval);
     case E_BUILTIN: return gen_builtin(e);
     case E_WASM: return gen_wasm(&e->wasm, t);
     case E_UNARY: return gen_unary(e);
@@ -2335,6 +2506,17 @@ static void gen_match(Stmt *s) {
         if (else_idx >= 0)
             for (int v = 0; v < nv; v++)
                 if (!covered[v]) LLVMAddCase(sw, LLVMConstInt(lty(union_tag_type(t)), (unsigned long long)v, false), bbs[else_idx]);
+    } else if (O->unit == CG_MODULE && n > 0 && ct(s->e->type)->kind == TY_ERROR) {
+        // Error codes are link-time values here: compare in arm order.
+        LLVMValueRef v = gen(s->e);
+        for (int i = 0; i < n; i++) {
+            MatchArm *a = &s->arms.data[i];
+            if (a->kind != P_ERROR) continue;
+            LLVMBasicBlockRef next = new_bb("match.next");
+            LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntEQ, v, errcode_value(a->error_code), ""), bbs[i], next);
+            LLVMPositionBuilderAtEnd(B, next);
+        }
+        LLVMBuildBr(B, else_idx >= 0 ? bbs[else_idx] : trap_block(T_TRAP));
     } else {
         LLVMValueRef v = gen(s->e);
         LLVMValueRef sw = LLVMBuildSwitch(B, v, else_idx >= 0 ? bbs[else_idx] : trap_block(T_TRAP), (unsigned)n);
@@ -3026,18 +3208,47 @@ bool codegen_program(CgOptions *o) {
     T_v128 = LLVMVectorType(T_i32, 4);
 
     if (g_target.wasm) emit_multi3();
-    if (g_target.wasm && g_threads) emit_thread_start();
+    bool program_parts = O->unit != CG_MODULE;
+    if (program_parts && g_target.wasm && g_threads) emit_thread_start();
 
-    // Roots: exported functions. Everything else (functions, generic
-    // instances, globals) is generated on first reference, so unreachable
-    // code costs nothing in the backend.
-    for (int i = 0; i < g_prog.fns.len; i++) {
-        Decl *d = g_prog.fns.data[i];
-        if (d->is_export) get_inst(d, NULL, 0);
+    if (O->unit == CG_WHOLE) {
+        // Roots: exported functions. Everything else (functions, generic
+        // instances, globals) is generated on first reference, so
+        // unreachable code costs nothing in the backend.
+        for (int i = 0; i < g_prog.fns.len; i++) {
+            Decl *d = g_prog.fns.data[i];
+            if (d->is_export) get_inst(d, NULL, 0);
+        }
+    } else if (O->unit == CG_MODULE) {
+        // Every non-generic function of the module (other units may call
+        // any of them, directly or from a generic instance).
+        for (int i = 0; i < g_prog.fns.len; i++) {
+            Decl *d = g_prog.fns.data[i];
+            if (d->module == O->module && !d->gparams.len && !(d->owner && d->owner->gparams.len))
+                get_inst(d, NULL, 0);
+        }
+        if (g_test_mode)
+            for (int i = 0; i < g_prog.tests.len; i++)
+                if (g_prog.tests.data[i]->module == O->module) get_inst(g_prog.tests.data[i], NULL, 0);
+    } else {
+        // The link unit: globals, error codes and names.
+        for (int i = 0; i < g_prog.globals.len; i++) global_ref(g_prog.globals.data[i]);
+        for (int i = 0; i < g_prog.error_names.len; i++) {
+            LLVMValueRef g = LLVMAddGlobal(mod, T_i16, arena_printf("phalange.errcode.%s", g_prog.error_names.data[i]));
+            LLVMSetInitializer(g, LLVMConstInt(T_i16, (unsigned long long)i + 1, false));
+            LLVMSetGlobalConstant(g, true);
+        }
+        LLVMTypeRef fty;
+        error_name_fn(&fty);
+        if (stack_traces_on()) ss_globals();
+        trap_info_global();
+        if (!g_target.wasm) ensure_native_heap();
     }
-    if (g_test_mode) emit_test_exports();
-    if (g_target.wasm) emit_trap_info_export();
-    emit_shadow_stack_export();
+    if (program_parts) {
+        if (g_test_mode) emit_test_exports();
+        if (g_target.wasm) emit_trap_info_export();
+        emit_shadow_stack_export();
+    }
     while (pending_head) {
         FnInst *fi = pending_head;
         pending_head = fi->next;

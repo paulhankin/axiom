@@ -23,6 +23,7 @@ typedef struct Parser {
     int pos, n;
     Module *mod;
     int errors_at_pos;  // suppress cascades: last position we reported at
+    int ntests;         // test blocks so far (their symbol names are per module)
 } Parser;
 
 static Token *peek(Parser *P) { return &P->t[P->pos]; }
@@ -1033,13 +1034,12 @@ static void parse_top(Parser *P) {
     if (t->kind == KW_TEST) {
         // TestDecl ::= "test" STRING_LIT ( "expect" "trap" ( "(" IDENT ")" )? )? Block
         advance(P);
-        static int ntests;
         Decl *d = new_decl(P, D_FN, start);
         d->is_test = true;
         d->test_trap = -1;
         Token *nm = expect(P, TK_STRING);
         d->test_name = nm->kind == TK_STRING ? intern(nm->str.bytes, nm->str.len) : intern_cstr("?");
-        d->name = intern_cstr(arena_printf("test.%d", ntests++));
+        d->name = intern_cstr(arena_printf("test.%d", P->ntests++));
         d->name_span = nm->span;
         if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "expect")) {
             advance(P);

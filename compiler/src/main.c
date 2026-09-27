@@ -19,12 +19,14 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "codegen.h"
 #include "diag.h"
 #include "header.h"
 #include "package.h"
+#include "units.h"
 #include "sema.h"
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void);
@@ -36,10 +38,13 @@ static void usage(void) {
             "usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n"
             "       phalange profile [<file.ph> | <package dir>] [--rate=<hz>] [--folded=<path>]\n"
             "       phalange new <name>      create a package skeleton\n"
+            "       phalange cache [path|clean]   the compiled-module cache\n"
             "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
-            "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
+            "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n"
+            "  --units=module|program   compile modules separately (cached) or as one unit\n"
+            "                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
 }
 
 static bool file_exists(const char *p) { return access(p, R_OK) == 0; }
@@ -170,6 +175,16 @@ static const char *source_line(Span sp) {
     return arena_strndup(f->text + a, b - a);
 }
 
+// Site records name files by a stable key (codegen: file_key); -1 if none.
+static int file_from_key(const char *text) {
+    char *end;
+    long long k = strtoll(text, &end, 10);
+    if (end == text || k < 0 || k >= 0xFFFFFFFFll) return -1;
+    for (int i = 0; i < g_files.len; i++)
+        if (file_key(i) == (uint32_t)k) return i;
+    return -1;
+}
+
 // Stack frames from the test runner (see runtime/test_main.c: encode_stack).
 typedef struct TFrame {
     char kind;  // T trap site, C call, U innermost function (no location), E error return, R repeat, O omitted
@@ -195,11 +210,10 @@ static int parse_frames(char *s, TFrame *out, int cap) {
         }
         if (nf == 5) {
             TFrame fr = {.kind = f[0][0], .fn = f[4]};
-            long a = strtol(f[1], NULL, 10);
             if (fr.kind == 'R' || fr.kind == 'O') {
-                fr.count = a;
-            } else if (a >= 0 && a < g_files.len) {
-                fr.sp = (Span){(int)a, (uint32_t)strtoul(f[2], NULL, 10), (uint32_t)strtoul(f[3], NULL, 10)};
+                fr.count = strtol(f[1], NULL, 10);
+            } else if (file_from_key(f[1]) >= 0) {
+                fr.sp = (Span){file_from_key(f[1]), (uint32_t)strtoul(f[2], NULL, 10), (uint32_t)strtoul(f[3], NULL, 10)};
                 fr.has_span = fr.kind != 'U';
             }
             out[n++] = fr;
@@ -310,7 +324,7 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
         Decl *d = g_prog.tests.data[idx];
         bool pass = !strcmp(f[2], "pass");
         const char *code = f[3];
-        int file_id = atoi(f[4]);
+        int file_id = file_from_key(f[4]);
         Span sp = d->name_span;
         if (file_id >= 0 && file_id < g_files.len)
             sp = (Span){file_id, (uint32_t)strtoul(f[5], NULL, 10), (uint32_t)strtoul(f[6], NULL, 10)};
@@ -505,7 +519,7 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
                         ok = false;
                         break;
                     }
-                    int fid = atoi(g[0]);
+                    int fid = file_from_key(g[0]);
                     spans[nc] = (Span){fid >= 0 && fid < g_files.len ? fid : -1, (uint32_t)strtoul(g[1], NULL, 10),
                                        (uint32_t)strtoul(g[2], NULL, 10)};
                     chain[nc++] = intern_cstr(g[3]);
@@ -631,6 +645,22 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "cache")) {
+        // phalange cache [path|clean]: the object cache of separate compilation
+        const char *dir = arena_printf("%s/obj", pkg_cache_dir());
+        if (argc >= 3 && !strcmp(argv[2], "clean")) {
+            char *rm[] = {"rm", "-rf", (char *)dir, NULL};
+            int rc = run(rm);
+            if (rc == 0) printf("removed %s\n", dir);
+            return rc == 0 ? 0 : 1;
+        }
+        if (argc >= 3 && strcmp(argv[2], "path")) {
+            usage();
+            return 2;
+        }
+        printf("%s\n", dir);
+        return 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "new")) {
         bool js = argc >= 4 && !strcmp(argv[3], "--format=agent-json");
         if (argc < 3) {
@@ -661,6 +691,8 @@ int main(int argc, char **argv) {
     const char *header_path = NULL;
     const char *test_filter = NULL, *test_timeout = NULL;
     int prof_hz = 999;
+    int units_mode = -1;  // -1: by optimization level
+    bool verbose = false;
     const char *folded_path = NULL;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
@@ -673,6 +705,9 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
         else if (!strcmp(a, "--stack-traces=on")) co.stack_traces = true;
         else if (!strcmp(a, "--stack-traces=off")) co.stack_traces = false;
+        else if (!strcmp(a, "--units=module")) units_mode = 1;
+        else if (!strcmp(a, "--units=program")) units_mode = 0;
+        else if (!strcmp(a, "--verbose")) verbose = true;
         else if (!strcmp(a, "--format=agent-json")) json = true;
         else if (!strcmp(a, "--format=human")) json = false;
         else if (!strncmp(a, "--std=", 6)) std_dir = a + 6;
@@ -833,7 +868,27 @@ int main(int argc, char **argv) {
     } else {
         co.out_path = out;
     }
-    if (!codegen_program(&co)) {
+    collect_link_names();
+    // Separate compilation (spec §17.7) applies to executables; --emit of a
+    // single object/IR/assembly file is always one unit.
+    bool separate = final_link && (units_mode >= 0 ? units_mode == 1 : co.opt_level <= 1);
+    if (separate) {
+        UnitObjs objs = {0};
+        UnitStats us = {0};
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (!build_units(&co, objpath, &objs, &us)) {
+            diag_emit(json, json ? stdout : stderr);
+            if (!diag_error_count()) diag_emit_fatal(json, "E9007", "code generation failed");
+            unlink(objpath);
+            return 1;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (verbose)
+            fprintf(stderr, "phalange: %d modules, %d compiled, %d cached (%.0f ms)\n", us.total, us.compiled,
+                    us.total - us.compiled, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+        for (int i = 0; i < objs.len; i++) vec_push(link_inputs, objs.data[i]);
+    } else if (!codegen_program(&co)) {
         diag_emit(json, json ? stdout : stderr);
         if (final_link) unlink(objpath);
         return 1;
@@ -926,6 +981,15 @@ int main(int argc, char **argv) {
                 unlink(objpath);
                 diag_emit_fatal(json, "E9003", "cannot find a C compiler to link with");
                 return 2;
+            }
+            // The toolchain's runtime sources are compiled once and cached.
+            const char *rtdir = arena_printf("%s/../runtime/", so.std_dir);
+            for (int i = 0; i < link_inputs.len; i++) {
+                const char *in = link_inputs.data[i];
+                if (!strncmp(in, rtdir, strlen(rtdir))) {
+                    const char *o = cached_runtime_object(cc, in);
+                    if (o) link_inputs.data[i] = (char *)o;
+                }
             }
             Vec(char *) av = {0};
             vec_push(av, (char *)cc);

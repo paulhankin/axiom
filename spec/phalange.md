@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.8
+**Version:** 0.1-draft.9
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -505,9 +505,9 @@ cycle between their modules is still `E0210`.
 - `phalange test <dir>` loads **every** `.ph` file under the package's `src/`, so tests in
   modules that the entry module doesn't import still run. Only the root package's tests
   run; its dependencies' tests don't (§18).
-- Everything a program uses is still compiled together as one unit (§12), so
-  cross-package calls cost the same as calls within a package, and generics monomorphize
-  across packages. Separately compiled package artifacts are future work (Appendix D).
+- Modules, not packages, are the unit of compilation, and they are compiled and cached
+  separately (§17.7). Generics monomorphize across packages as they do within one.
+  Distributing precompiled packages is future work (Appendix D).
 
 ---
 
@@ -1249,7 +1249,8 @@ all declarations of the same name refer to the same error. Using `error.X` where
 declared anywhere in the program is `E0650`, which catches typos.
 
 Codes are assigned deterministically: all declared names are sorted by byte value and
-numbered starting at 1. `@error_name(e)` returns the name as a `[]u8`. For an unknown code
+numbered starting at 1. Codes therefore depend on the whole program, so modules that
+are compiled separately refer to them by name, and they are fixed at link time (§17.7). `@error_name(e)` returns the name as a `[]u8`. For an unknown code
 it returns `"<unknown>"`.
 
 ### 11.2 Returning and handling errors
@@ -1805,6 +1806,7 @@ phalange explain <CODE>                   # long-form documentation for a diagno
 phalange test  <file.ph> [--filter=text] [--timeout=ms]   # run test blocks (§18)
 phalange new   <name>                     # create a package skeleton (§4.6)
 phalange profile <file.ph> [--rate=hz]    # sampling profiler (§17.6)
+phalange cache [path|clean]               # the compiled-module cache (§17.7)
 ```
 
 `build`, `check` and `test` also accept a package directory, or no path at all for the
@@ -2093,6 +2095,59 @@ Limitations in v0.1:
 - On WebAssembly, only the main thread is sampled.
 - Stacks deeper than 256 calls lose their outermost frames. These samples are
   counted and reported as truncated.
+
+### 17.7 Separate compilation
+
+Each **module** is a compilation unit. A build type-checks the whole program (sema is
+fast), then:
+
+1. Compiles each module to an object file. The object holds the module's non-generic
+   functions and methods, plus link-once copies of the generic instances the module
+   uses.
+2. Generates a small per-program **link unit**. It holds the global variables, the
+   error codes and the error-name table, runtime state (the trap-info block, shadow
+   stacks, and the native heap), and the host and test exports.
+3. Links everything.
+
+Module objects are cached in `<cache>/obj/`, where `<cache>` is `$PHALANGE_CACHE`,
+`$XDG_CACHE_HOME/phalange` or `~/.cache/phalange`. The cache key hashes everything the
+object depends on:
+
+- the compiler binary;
+- the code-generation options (target, `-O`, overflow mode, stack traces, profiling,
+  test mode);
+- the module's source and path;
+- and, recursively, the keys of the modules it imports.
+
+Editing a module recompiles it and every module that imports it, directly or
+indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
+toolchain's C runtime (`runtime/*.c`) is compiled once per content and cached the
+same way. `phalange cache clean` empties the cache, which is never evicted
+automatically in v0.1. `--verbose` reports how many modules were compiled and how
+many came from the cache.
+
+What makes modules independent:
+
+| Program-wide fact | How units agree on it |
+|---|---|
+| Error codes (§11.1) | Module objects load `phalange.errcode.<Name>` from the link unit. A `match` on errors becomes a chain of comparisons. Adding an error name anywhere renumbers every code without invalidating any cached object |
+| `@error_name` | One function in the link unit, next to the table |
+| Globals | Defined in the link unit (initializers may contain error codes) and referenced by name |
+| Generic instances | Defined link-once by every unit that uses them, under names built from module-qualified types, so the linker keeps one copy |
+| Private functions | Externally visible under their module-qualified names, because another unit's generic instance may call them |
+| Source locations in site records (§17.4) | A stable hash of the file's path, not a per-build file number |
+
+**When it is used.** Separate compilation is the default for executables at `-O0` and
+`-O1`. Those are the edit–build–test builds, where only changed modules are recompiled.
+At `-O2` and `-O3` the default is still one whole-program unit, so functions can be
+inlined across modules. `--units=module|program` overrides the default. Emitting a
+single object, IR or assembly file (`--emit=obj|llvm|asm`) always uses one unit.
+
+A program means the same whatever the unit mode. The test suite runs in both modes.
+
+One observable difference: in module mode every non-generic function is compiled,
+not only the reachable ones. So on native targets an `extern "C"` function that is
+declared but never called must still exist at link time.
 
 ---
 
@@ -2425,6 +2480,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C28 | Packages: `phalange.toml`, `pkg:` imports, path and pinned-git dependencies, one source per name (§4.6) | The user asked for packages |
 | C29 | Stack traces from a per-thread shadow stack, and error return traces (§17.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
 | C30 | `phalange profile`: a sampling profiler over the shadow stack (§17.6) | The user asked for profiling support |
+| C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§17.7) | The user asked for independent compilation units |
 
 ---
 
@@ -2492,3 +2548,10 @@ Each question is followed by the options and the current leaning.
 12. **Loop labels.** v0.1 has none.
 13. **Relaxed SIMD.** Allow it in inline WASM with implementation-defined results, or forbid
     it (the current rule)?
+14. **Separate compilation follow-ups** (§17.7):
+    - distributing precompiled packages (objects plus an interface, instead of sources);
+    - cross-module inlining at `-O2` with separate units (ThinLTO, or exporting small
+      function bodies in the interface);
+    - cache eviction;
+    - finer invalidation, where a module's dependents are recompiled only when its
+      public interface changes, not when any part of it does.

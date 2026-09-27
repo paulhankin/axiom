@@ -10,7 +10,7 @@
 //   // link: file.c            C source (next to the test) compiled and linked in
 //   // header: name.h          generate a C header for the exports (for the C source)
 //
-// Usage: node tests/run.mjs [--native] [--filter=substr] [-O2]
+// Usage: node tests/run.mjs [--native] [--filter=substr] [-O2] [--units=module|program]
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -22,7 +22,7 @@ const compiler = path.resolve(process.env.PHALANGE || path.join(root, 'compiler/
 const argv = process.argv.slice(2);
 const native = argv.includes('--native');
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
-const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a));
+const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phalange-tests-'));
 
 function files(dir) {
@@ -215,6 +215,40 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
       else if (!fn('main') || fn('main').total_pct < 90) problem = `main should be on (almost) every stack: ${JSON.stringify(j.functions)}`;
       else if (!site('work', 'spin') || site('work', 'spin').line !== 18) problem = `missing call site work -> spin: ${JSON.stringify(j.call_sites)}`;
       else if (!/^main;work;spin \d+$/m.test(fs.readFileSync(folded, 'utf8'))) problem = `folded stacks lack main;work;spin:\n${fs.readFileSync(folded, 'utf8')}`;
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
+// Separate compilation (spec §17.7): the object cache is reused and
+// invalidated along imports, and cached objects stay correct when the
+// program's error codes are renumbered.
+{
+  const name = 'tests/units [separate compilation]';
+  if (!filter || name.includes(filter)) {
+    const dir = path.join(tmp, 'units');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of ['lib.ph', 'main.ph']) fs.copyFileSync(path.join(root, 'tests/units', f), path.join(dir, f));
+    const env = { ...process.env, PHALANGE_CACHE: path.join(tmp, 'units-cache') };
+    const out = path.join(tmp, 'units-prog' + (native ? '' : '.wasm'));
+    const want = ['42', '3', '9', 'too big', 'TooBig'].join('\n');
+    const steps = [
+      ['cold build', () => {}, (n, t) => n === t],
+      ['no change', () => {}, (n) => n === 0],
+      ['new error name renumbers all codes', () => fs.appendFileSync(path.join(dir, 'main.ph'), '\nerror { Aardvark }\n'), (n) => n === 1],
+      ['library edit', () => fs.appendFileSync(path.join(dir, 'lib.ph'), '\n// edited\n'), (n) => n === 2],
+    ];
+    let problem = null;
+    for (const [what, edit, ok] of steps) {
+      edit();
+      const c = spawnSync(compiler, ['build', path.join(dir, 'main.ph'), '-o', out, '--verbose', '--units=module',
+        ...(native ? ['--target=native'] : [])], { encoding: 'utf8', env });
+      const m = /(\d+) modules, (\d+) compiled/.exec(c.stderr);
+      if (c.status !== 0 || !m) { problem = `${what}: build failed:\n${c.stdout}${c.stderr}`; break; }
+      if (!ok(Number(m[2]), Number(m[1]))) { problem = `${what}: ${m[0]}`; break; }
+      const r = native ? spawnSync(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      if (r.stdout.trim() !== want) { problem = `${what}: output\n${r.stdout}${r.stderr}`; break; }
     }
     if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
     else { pass++; console.log(`ok   ${name}`); }

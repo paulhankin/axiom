@@ -69,7 +69,7 @@ static inline size_t ph_format_stack(char *out, size_t cap, const struct ph_trap
     size_t n = 0;
 #define PH_PUT(...)                                                               \
     do {                                                                          \
-        if (n < cap) {                                                            \
+        if (n + 1 < cap) {                                                        \
             int k_ = snprintf(out + n, cap - n, __VA_ARGS__);                     \
             if (k_ > 0) n += (size_t)k_ < cap - n ? (size_t)k_ : cap - n - 1;     \
         }                                                                         \

@@ -142,7 +142,7 @@ static int run_quiet(char *const argv[]) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-static const char *cache_dir(void) {
+const char *pkg_cache_dir(void) {
     const char *c = getenv("PHALANGE_CACHE");
     if (c && *c) return c;
     const char *x = getenv("XDG_CACHE_HOME");
@@ -169,9 +169,9 @@ static const char *fetch_git(const char *url, const char *rev, Span sp) {
     int k = 0;
     for (const char *p = url; *p && k < 150; p++) key[k++] = isalnum((unsigned char)*p) ? *p : '_';
     key[k] = 0;
-    const char *dir = arena_printf("%s/git/%s-%s", cache_dir(), key, rev);
+    const char *dir = arena_printf("%s/git/%s-%s", pkg_cache_dir(), key, rev);
     if (is_file(arena_printf("%s/phalange.toml", dir))) return dir;  // cached
-    mkdirs(arena_printf("%s/git", cache_dir()));
+    mkdirs(arena_printf("%s/git", pkg_cache_dir()));
     const char *tmp = arena_printf("%s.tmp%d", dir, (int)getpid());
     char *clone[] = {"git", "clone", "--quiet", (char *)url, (char *)tmp, NULL};
     char *co[] = {"git", "-C", (char *)tmp, "-c", "advice.detachedHead=false", "checkout", "--quiet", (char *)rev, NULL};
