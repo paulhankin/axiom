@@ -1358,8 +1358,14 @@ static Type *check_catch(Expr *e) {
     if (e->capture) e->capture_local = declare_local(e->capture, e->capture_span, t_error, false, false);
     switch (e->hkind) {
     case H_VALUE:
-        if (vt->kind == TY_VOID) diag_error(e->hexpr->span, "E0613", "a fallback value makes no sense for !void; use a block");
-        else check_expr_to(&e->hexpr, vt);
+        if (vt->kind == TY_VOID) {
+            // For !void only a diverging handler (e.g. @trap()) makes sense.
+            Type *ht = check_expr(e->hexpr, NULL);
+            if (ht->kind != TY_NEVER && ht->kind != TY_INVALID)
+                diag_error(e->hexpr->span, "E0613", "a fallback value makes no sense for !void; use a block");
+        } else {
+            check_expr_to(&e->hexpr, vt);
+        }
         break;
     case H_RETURN: check_return_value(e->hexpr ? &e->hexpr : NULL, e->span); break;
     case H_BREAK:
@@ -1369,8 +1375,13 @@ static Type *check_catch(Expr *e) {
         if (e->hkind == H_BREAK && C->loop_breaks.len) vec_last(C->loop_breaks) = true;
         break;
     case H_BLOCK:
-        if (!check_block(e->hblock))
-            diag_error(e->hblock->span, "E0612", "a 'catch' block must not complete normally (end it with return, break, continue or @trap())");
+        // For !void the block may complete normally: execution continues after
+        // the expression. For !T there is no value to produce, so it must diverge.
+        if (!check_block(e->hblock) && vt->kind != TY_VOID && vt->kind != TY_INVALID)
+            diag_error(e->hblock->span, "E0612",
+                       "this 'catch' block must not complete normally, because the expression needs a value of type %s "
+                       "(end it with return, break, continue or @trap(), or use 'catch <value>')",
+                       type_str(vt));
         break;
     }
     scope_pop();

@@ -215,6 +215,20 @@ int main(int argc, char **argv) {
             vec_push(av, NULL);
             rc = run(av.data);
         } else {
+            // Programs that use the Phalange host ABI (std/io, std/net) get the
+            // native implementation of it linked in.
+            bool uses_host_abi = false;
+            for (int i = 0; i < g_prog.host_fns.len; i++)
+                if (!strcmp(g_prog.host_fns.data[i]->host_module, "phalange")) uses_host_abi = true;
+            if (uses_host_abi) {
+                const char *rt = arena_printf("%s/../runtime/native_host.c", so.std_dir);
+                if (!file_exists(rt)) {
+                    unlink(objpath);
+                    diag_emit_fatal(json, "E9003", arena_printf("cannot find the native runtime (%s)", rt));
+                    return 2;
+                }
+                vec_push(link_inputs, (char *)rt);
+            }
             const char *names[] = {"cc", "clang", "gcc", NULL};
             const char *cc = find_tool(names);
             if (!cc) {

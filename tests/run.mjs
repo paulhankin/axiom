@@ -12,6 +12,7 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { createHost } from '../runtime/host.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const compiler = process.env.PHALANGE || path.join(root, 'compiler/build/phalange');
@@ -39,24 +40,40 @@ function directives(src) {
 }
 
 async function runWasm(file) {
-  const out = [];
+  // Output from the test print helpers (env) and from fd 1 (std/io) is
+  // collected as one text stream, in order.
+  let text = '';
   let mem;
   const dec = new TextDecoder();
+  const line = (s) => { text += s + '\n'; };
+  const host = createHost({
+    write: (fd, bytes) => {
+      if (fd === 1) {
+        text += dec.decode(bytes);
+        return bytes.length;
+      }
+      return fs.writeSync(fd, bytes);
+    },
+  });
   const env = {
-    print_i64: x => out.push(String(x)),
-    print_u64: x => out.push(String(BigInt.asUintN(64, x))),
-    print_f64: x => out.push(String(x)),
-    print_str: (p, n) => out.push(dec.decode(new Uint8Array(mem.buffer, p, n))),
-    print_bool: b => out.push(b ? 'true' : 'false'),
+    print_i64: x => line(String(x)),
+    print_u64: x => line(String(BigInt.asUintN(64, x))),
+    print_f64: x => line(String(x)),
+    print_str: (p, n) => line(dec.decode(new Uint8Array(mem.buffer, p >>> 0, n >>> 0))),
+    print_bool: b => line(b ? 'true' : 'false'),
   };
-  const { instance } = await WebAssembly.instantiate(fs.readFileSync(file), { env });
+  const { instance } = await WebAssembly.instantiate(fs.readFileSync(file), { env, ...host.imports });
   mem = instance.exports.memory;
+  host.setMemory(mem);
+  const lines = () => { const o = text.split('\n'); if (o[o.length - 1] === '') o.pop(); return o; };
   try {
     instance.exports.run();
-    return { out, trapped: false };
+    return { out: lines(), trapped: false };
   } catch (e) {
-    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) return { out, trapped: true, msg: e.message };
+    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) return { out: lines(), trapped: true, msg: e.message };
     throw e;
+  } finally {
+    host.close();
   }
 }
 

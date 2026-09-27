@@ -813,7 +813,7 @@ return some `!U` (`E0610`).
 |---|---|
 | `catch fallback` | If `e` holds an error, the result is `fallback`, which must have type `T` |
 | `catch return x` / `catch break` / `catch continue` | Leaves the function or loop on error |
-| `catch { … }` | The block MUST NOT complete normally: every path ends in `return`, `break`, `continue`, or `@trap()` (`E0612`) |
+| `catch { … }` | If `T` is `void`, the block may complete normally, and execution continues after the expression. Otherwise the block MUST NOT complete normally, because there is no value to produce: every path ends in `return`, `break`, `continue`, or `@trap()` (`E0612`) |
 | `catch \|err\| …` | Binds the `error` value to `err` in the handler |
 
 `catch` applies to the whole `BinExpr` on its left, so `a + f() catch 0` is `E0150`.
@@ -1486,6 +1486,16 @@ WASM memory cannot shrink.
 returns `error.OutOfMemory` when the buffer is full. It is intended for `static` arena
 patterns like the example in §18.
 
+
+### 16.5 Other modules and the host ABI
+
+The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `net`) is
+ordinary Phalange code; see `std/README.md`. It adds no language rules. Operating-system
+services are reached through host functions imported from module `"phalange"` (the
+*Phalange host ABI*). Implementations exist for node (`runtime/host.mjs`) and POSIX
+(`runtime/native_host.c`). A program that uses only the language and `std/mem`, `vec`,
+`hash`, `map` and `matrix` needs no host at all.
+
 ---
 
 ## 17. Toolchain and Agent Diagnostic Interface
@@ -1881,6 +1891,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C19 | Added monomorphized generics with builtin constraints (§10) | Design review, draft 2 |
 | C20 | The language was renamed from Axiom to Phalange, and the extension from `.ax` to `.ph` | Design review, draft 2 |
 | C21 | Float literals round to the nearest value of their target type (formerly open question Q5) | The spec's own examples (`3.14159265` as `f32`) need it; found while implementing the compiler |
+| C22 | For `!void`, a `catch` block may complete normally ("handle and continue") | Found while writing the standard library: without it, `f() catch \|e\| { log(e); }` could not be written |
 
 ---
 

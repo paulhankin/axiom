@@ -1,0 +1,49 @@
+// std/net: a loopback echo within one program.
+import "std/io" as io;
+import "std/net" as net;
+
+fn err_of[T](r: !T) []u8 {
+    _ = r catch |e| {
+        return @error_name(e);
+    };
+    return "ok";
+}
+
+fn demo() !void {
+    let out = io.stdout();
+    let a = net.parse_ipv4("192.168.0.254")!;
+    out.print_hex(@as(u64, a))!;
+    out.print("\n")!;                                    // expect: c0a800fe
+    let mut buf: [15]u8 = [0; 15];
+    out.println(net.format_ipv4(buf[..], 0x7F000001))!;  // expect: 127.0.0.1
+    out.println(err_of(net.parse_ipv4("1.2.3.256")))!;   // expect: InvalidAddress
+
+    let listener = net.listen("127.0.0.1", 0)!;
+    let port = listener.port();
+    out.print_bool(port != 0)!;
+    out.print("\n")!;                                    // expect: true
+    let client = net.connect("127.0.0.1", port)!;
+    let server = listener.accept()!;
+    client.write_all("ping")!;
+    let mut rb: [16]u8 = [0; 16];
+    server.reader().read_exact(rb[0..4])!;
+    out.println(rb[0..4])!;                              // expect: ping
+    server.writer().println("pong")!;
+    let mut lb: [16]u8 = [0; 16];
+    out.println(client.reader().read_line(lb[..])!)!;    // expect: pong
+    server.close();
+    let n = client.read(rb[..])!;
+    out.print_u64(@as(u64, n))!;
+    out.print("\n")!;                                    // expect: 0
+    client.close();
+    listener.close();
+
+    out.println(err_of(net.connect("127.0.0.1", port)))!;  // expect: ConnectionRefused
+}
+
+export fn run() void {
+    demo() catch |e| {
+        io.stdout().println(@error_name(e)) catch {};
+        @trap();
+    };
+}

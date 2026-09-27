@@ -487,8 +487,11 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
     if (d->kind == D_HOST_FN) {
         name = d->name;
     } else if (d->is_export) {
-        name = d->name;
-        vec_push(g_export_names, d->name);
+        // On wasm the symbol gets a private name and the export name comes
+        // from the wasm-export-name attribute: LLVM treats a symbol called
+        // `main` specially on wasm (it would add a second `main` export).
+        name = g_target.wasm ? arena_printf("phalange.export.%s", d->name) : d->name;
+        vec_push(g_export_names, intern_cstr(name));
     } else {
         CharVec nb = {0};
         const char *pre = mangle_prefix(d);
@@ -991,7 +994,7 @@ static LLVMValueRef gen_catch(Expr *e) {
     case H_CONTINUE: gen_break(false); break;
     case H_BLOCK:
         gen_block(e->hblock);
-        if (!terminated()) LLVMBuildUnreachable(B);
+        if (!terminated()) LLVMBuildBr(B, merge);  // only possible for !void
         break;
     }
     if (!terminated()) LLVMBuildUnreachable(B);

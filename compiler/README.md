@@ -41,6 +41,10 @@ Exit codes: `0` success, `1` the program has errors (or linking failed), `2` bad
 With `--format=agent-json`, stdout holds exactly one JSON object in the spec's
 `phalange-diagnostics/1` schema, including machine-applicable fixes.
 
+Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the host ABI
+used by `std/io` and `std/net` and calls the `main` export. Native programs that use
+the host ABI get `runtime/native_host.c` linked in automatically.
+
 On wasm, `export fn` functions become WebAssembly exports, `import host "mod" { ... }`
 functions become imports from `mod`, and the linear memory is exported as `memory`.
 The shadow stack is placed first in memory (`--stack-first`), so a stack overflow

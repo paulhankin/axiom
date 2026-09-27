@@ -14,6 +14,7 @@ Its main target is WebAssembly. Its design mandate is:
 ```
 make -C compiler                      # needs llvm-18-dev, lld
 ./compiler/build/phalange build examples/dot_product.ph -O2 -o engine.wasm
+node runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
 node tests/run.mjs                    # run the test suite
 ```
 
@@ -26,7 +27,8 @@ node tests/run.mjs                    # run the test suite
 | [`examples/shapes.ph`](examples/shapes.ph) | Tagged unions, `match`, errors, inline WASM |
 | [`examples/generics.ph`](examples/generics.ph) | Generic functions and types, constraints, const parameters |
 | [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |
-| [`std/`](std/mem.ph) | Standard library (`std/mem`: `Allocator`, `Arena`, `FixedBuffer`, `page_allocator`) |
+| [`std/`](std/README.md) | Standard library: `mem`, `vec`, `hash`, `map`, `matrix`, `io`, `net` |
+| [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native_host.c`) |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs and expected compile errors |
 
 The spec's [Appendix C](spec/phalange.md#appendix-c-changes-from-the-design-notes) lists the

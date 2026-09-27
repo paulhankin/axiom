@@ -1,0 +1,132 @@
+// runtime/native_host.c - the Phalange host ABI (import module "phalange")
+// for native targets, on POSIX. The compiler links this automatically when a
+// native program uses std/io or std/net.
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// Error codes shared with runtime/host.mjs and std/net.ph.
+enum { PH_ERR = -1, PH_REFUSED = -2, PH_ADDR_IN_USE = -3, PH_BAD_ADDRESS = -4 };
+
+intptr_t ph_write(int32_t fd, const uint8_t *p, size_t n) {
+    ssize_t r;
+    do r = write(fd, p, n);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : (intptr_t)r;
+}
+
+intptr_t ph_read(int32_t fd, uint8_t *p, size_t n) {
+    ssize_t r;
+    do r = read(fd, p, n);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : (intptr_t)r;
+}
+
+static int copy_cstr(char *dst, size_t cap, const uint8_t *s, size_t n) {
+    if (n + 1 > cap) return -1;
+    memcpy(dst, s, n);
+    dst[n] = 0;
+    return 0;
+}
+
+int32_t ph_open(const uint8_t *path, size_t len, uint32_t flags) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
+    int f = flags == 1 ? O_WRONLY | O_CREAT | O_TRUNC : flags == 2 ? O_WRONLY | O_CREAT | O_APPEND : O_RDONLY;
+    int fd = open(buf, f | O_CLOEXEC, 0644);
+    if (fd >= 0) return fd;
+    return errno == ENOENT ? -2 : errno == EACCES ? -13 : PH_ERR;
+}
+
+void ph_close(int32_t fd) { close(fd); }
+
+static int resolve(const uint8_t *name, size_t len, uint32_t port, int passive, struct addrinfo **res) {
+    char host[256], serv[16];
+    if (copy_cstr(host, sizeof host, name, len)) return PH_BAD_ADDRESS;
+    snprintf(serv, sizeof serv, "%u", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (passive) hints.ai_flags = AI_PASSIVE;
+    return getaddrinfo(len ? host : NULL, serv, &hints, res) == 0 ? 0 : PH_BAD_ADDRESS;
+}
+
+int32_t ph_tcp_connect(const uint8_t *name, size_t len, uint32_t port) {
+    struct addrinfo *res;
+    int rc = resolve(name, len, port, 0, &res);
+    if (rc) return rc;
+    int result = PH_ERR;
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        int fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) {
+            result = fd;
+            break;
+        }
+        result = errno == ECONNREFUSED ? PH_REFUSED : PH_ERR;
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return result;
+}
+
+int32_t ph_tcp_listen(const uint8_t *name, size_t len, uint32_t port) {
+    struct addrinfo *res;
+    int rc = resolve(name, len, port, 1, &res);
+    if (rc) return rc;
+    int result = PH_ERR;
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        int fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind(fd, a->ai_addr, a->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+            result = fd;
+            break;
+        }
+        result = errno == EADDRINUSE ? PH_ADDR_IN_USE : PH_ERR;
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return result;
+}
+
+int32_t ph_tcp_accept(int32_t listener) {
+    int fd;
+    do fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+    while (fd < 0 && errno == EINTR);
+    return fd < 0 ? PH_ERR : fd;
+}
+
+int32_t ph_tcp_local_port(int32_t h) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if (getsockname(h, (struct sockaddr *)&ss, &sl) != 0) return PH_ERR;
+    if (ss.ss_family == AF_INET) return ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    if (ss.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+    return PH_ERR;
+}
+
+intptr_t ph_sock_read(int32_t h, uint8_t *p, size_t n) {
+    ssize_t r;
+    do r = recv(h, p, n, 0);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : (intptr_t)r;
+}
+
+intptr_t ph_sock_write(int32_t h, const uint8_t *p, size_t n) {
+    ssize_t r;
+    do r = send(h, p, n, MSG_NOSIGNAL);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : (intptr_t)r;
+}
+
+void ph_sock_close(int32_t h) { close(h); }
