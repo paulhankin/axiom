@@ -30,6 +30,7 @@ pub extern "C" {
     fn getcwd(buf: *mut u8, n: usize) *mut u8;
     fn readlink(path: *u8, buf: *mut u8, n: usize) isize;
     fn access(path: *u8, mode: i32) i32;
+    fn chmod(path: *u8, mode: u32) i32;
     fn getpid() i32;
     fn unlink(path: *u8) i32;
     fn rename(from: *u8, to: *u8) i32;

@@ -95,6 +95,7 @@ struct LoopCtx {
 }
 
 struct FnState {
+    no_trace: bool,  // runtime code: not on the shadow stack
     inst: *mut FnInst,
     decl: *mut ast.Decl,
     from: []mut *mut ast.Type,
@@ -702,7 +703,23 @@ let mut ss_global: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 let mut ss_main: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
 fn stack_traces_on() bool {
-    return u.notnil(O) and O.stack_traces;
+    return u.notnil(O) and O.stack_traces and not (u.notnil(F) and F.no_trace);
+}
+
+// The native runtime (runtime/*.ph) reports stack traces; it is not part of
+// them.
+fn is_runtime_module(m: *ast.Module) bool {
+    if u.isnil(m) {
+        return false;
+    }
+    let names = ["/runtime/native.ph", "/runtime/trap_format.ph", "/runtime/test_main.ph", "/runtime/profile.ph",
+                 "/runtime/rt.ph"];
+    for n in names {
+        if u.ends(m.path, n) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn ss_type() *mut ir.Ty {
@@ -1297,7 +1314,7 @@ fn fn_display(d: *mut ast.Decl, gargs: []mut *mut ast.Type) []u8 {
 // The symbol of an exported function. On wasm (and in test binaries, which
 // have their own main) `main` is renamed; the export name is an attribute.
 fn export_symbol(d: *mut ast.Decl) []u8 {
-    if (ty.g_target.is_wasm or g_test_mode) and u.str_eq(d.name, "main") {
+    if d.is_export and u.str_eq(d.name, "main") {
         return "phalange.export.main";
     }
     return d.name;
@@ -3761,6 +3778,7 @@ fn gen_fn_body(fi: *mut FnInst) void {
     stt.from = d.all_gparams;
     stt.to = fi.gargs;
     stt.fnv = fi.fnv;
+    stt.no_trace = is_runtime_module(d.module);
     stt.locals = u.newn.[*mut ir.Value](d.locals.len + 1);
     let saved = F;
     F = stt;
@@ -4450,6 +4468,57 @@ fn emit_test_exports() void {
     ir.ret(B, extract(sl, 0));
 }
 
+fn call_runtime(name: []u8) void {
+    let fty = fn_type(T_void, no_tys(), false);
+    _ = call(fty, ir.add_function(M, name, fty).val, no_vals());
+}
+
+// Native programs: phalange_target_arch() for the runtime (runtime/native.ph)
+// and the C entry point, which initializes the runtime (and the profiler)
+// before running the program's main, or the tests.
+fn emit_native_entry() void {
+    _ = add_export("phalange_target_arch", T_i32, no_tys());
+    let mut arch: u64 = 1;
+    if tg.g_arch == tg.ARCH_A64 {
+        arch = 2;
+    }
+    ir.ret(B, ci32(arch));
+
+    let mut user_main = u.nil.[ast.Decl]();
+    for i in 0..sema.g_prog.fns.len {
+        let d = sema.g_prog.fns.get(i);
+        if d.is_export and u.str_eq(d.name, "main") {
+            user_main = d;
+        }
+    }
+    if u.isnil(user_main) and not g_test_mode {
+        return;  // a library, or C code has the entry point
+    }
+    let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
+    let f = add_export("main", T_i32, pi[..]);
+    call_runtime("ph_rt_init");
+    if O.profile {
+        call_runtime("ph_profile_start");
+    }
+    if g_test_mode {
+        let tty = fn_type(T_i32, pi[..], false);
+        let mut args: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
+        ir.ret(B, call(tty, ir.add_function(M, "ph_test_main", tty).val, args[..]));
+        return;
+    }
+    let fi = get_inst(user_main, ty.no_types());
+    let fty = fi.llty;
+    let mut args: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
+    let r = call(fty, fi.fnv, args[0..fty.params.len]);
+    if fty.ret.kind == ir.T_VOID {
+        ir.ret(B, ci32(0));
+    } else if fty.ret.bits < 32 {
+        ir.ret(B, zext(r, T_i32));
+    } else {
+        ir.ret(B, r);
+    }
+}
+
 pub fn default_triple() []u8 {
     return tg.host_triple();
 }
@@ -4537,6 +4606,9 @@ pub fn codegen_program(o: *mut CgOptions) bool {
             }
         }
         emit_shadow_stack_export();
+        if not ty.g_target.is_wasm {
+            emit_native_entry();
+        }
     }
     while u.notnil(pending_head) {
         let fi = pending_head;

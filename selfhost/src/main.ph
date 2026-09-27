@@ -31,6 +31,8 @@ import "package.ph" as pkg;
 import "target.ph" as tg;
 import "wobj.ph" as wo;
 import "wlink.ph" as wl;
+import "elf.ph" as elf;
+import "elink.ph" as el;
 
 fn usage() void {
     u.eprint("usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n");
@@ -866,6 +868,32 @@ fn now_ms() f64 {
 }
 
 // Links our wasm objects into a module (no external tools).
+fn link_native(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
+    let mut os = u.List.[*mut elf.Obj].{ data: u.nil.[*mut elf.Obj](), len: 0, cap: 0 };
+    let mut paths = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    paths.push(objpath);
+    for p in unit_objs {
+        paths.push(p);
+    }
+    for k in 0..paths.len {
+        let d = u.read_file(paths.get(k));
+        let mut o = u.nil.[elf.Obj]();
+        if not u.isnos(d) {
+            o = elf.read(d);
+        }
+        if u.isnil(o) {
+            u.eprint(u.f1("phalange: cannot read object %s\n", paths.get(k)));
+            return 1;
+        }
+        os.push(o);
+    }
+    let mut machine = elf.EM_X86_64;
+    if tg.g_arch == tg.ARCH_A64 {
+        machine = elf.EM_AARCH64;
+    }
+    return el.link(os.items(), machine, cg.g_link_libs.items(), out);
+}
+
 fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
     let mut us = u.List.[*mut wo.Unit].{ data: u.nil.[*mut wo.Unit](), len: 0, cap: 0 };
     let mut paths = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
@@ -1113,6 +1141,28 @@ fn driver(args: [][]u8) i32 {
         if u.file_exists(rtp) {
             pkg_files.push(rtp);
         }
+        // Native programs: the host ABI, crash reports, the test runner and
+        // the profiler are Phalange code too.
+        if not ty.g_target.is_wasm {
+            let mut names: [3][]u8 = ["native.ph", "", ""];
+            if testing {
+                names[1] = "test_main.ph";
+            }
+            if profiling {
+                names[2] = "profile.ph";
+            }
+            for nm in names {
+                if nm.len == 0 {
+                    continue;
+                }
+                let p = u.f2("%s/../runtime/%s", std_dir, nm);
+                if not u.file_exists(p) {
+                    dg.emit_fatal(json, "E9003", u.f1("cannot find the native runtime (%s)", p));
+                    return 2;
+                }
+                pkg_files.push(p);
+            }
+        }
     }
     let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: pkg_files.items() };
     let ok = sema.run(input, &so);
@@ -1167,14 +1217,6 @@ fn driver(args: [][]u8) i32 {
             }
         }
         out = u.f3("%s/phalange-profile-%s%s", tmp_dir(), u.idec(u.getpid()), wext);
-        if not ty.g_target.is_wasm {
-            let pr = u.f1("%s/../runtime/profile.c", std_dir);
-            if not u.file_exists(pr) {
-                dg.emit_fatal(json, "E9003", u.f1("cannot find the profiler runtime (%s)", pr));
-                return 2;
-            }
-            link_inputs.push(pr);
-        }
     }
     if testing {
         if not final_link {
@@ -1182,14 +1224,6 @@ fn driver(args: [][]u8) i32 {
             return 2;
         }
         out = u.f3("%s/phalange-test-%s%s", tmp_dir(), u.idec(u.getpid()), wext);
-        if not ty.g_target.is_wasm {
-            let tm = u.f1("%s/../runtime/test_main.c", std_dir);
-            if not u.file_exists(tm) {
-                dg.emit_fatal(json, "E9003", u.f1("cannot find the test runtime (%s)", tm));
-                return 2;
-            }
-            link_inputs.push(tm);
-        }
     }
     if u.isnos(out) {
         let mut ext: []u8 = "";
@@ -1266,9 +1300,17 @@ fn driver(args: [][]u8) i32 {
     if final_link {
         let mut rc: i32 = 0;
         let own_link = (n_user_inputs == 0) and (link_flags.len == 0) and (cg.g_link_libs.len == 0);
+        let mut native_own = false;
+        if not ty.g_target.is_wasm and (n_user_inputs == 0) and (link_flags.len == 0) {
+            // our own linker; a C toolchain is only needed to link C code
+            rc = link_native(objpath, unit_objs.items(), out);
+            native_own = rc != 2;
+        }
         if ty.g_target.is_wasm and own_link {
             // our own linker; wasm-ld is only needed to link C code
             rc = link_wasm(objpath, unit_objs.items(), out);
+        } else if native_own {
+            // linked
         } else if ty.g_target.is_wasm {
             let names = ["wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld"];
             let ld = find_tool(names[..]);
@@ -1352,15 +1394,6 @@ fn driver(args: [][]u8) i32 {
                 _ = u.unlink(u.cz(c_objs.get(k)));
             }
         } else {
-            // Every native executable gets the native runtime: the host ABI
-            // (std/io, std/net, threads) and crash reporting (spec §17.4).
-            let rt = u.f1("%s/../runtime/native_host.c", std_dir);
-            if not u.file_exists(rt) {
-                _ = u.unlink(u.cz(objpath));
-                dg.emit_fatal(json, "E9003", u.f1("cannot find the native runtime (%s)", rt));
-                return 2;
-            }
-            link_inputs.push(rt);
             let names = ["cc", "clang", "gcc"];
             let cc = find_tool(names[..]);
             if u.isnos(cc) {

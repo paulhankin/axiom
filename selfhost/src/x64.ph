@@ -217,6 +217,10 @@ fn func_sym(f: *ir.Func) i32 {
     return @as(i32, @bit_cast(i32, fsym.get(@int_cast(usize, f.id))));
 }
 
+fn extern_global(g: *ir.Global) bool {
+    return u.isnil(g.init);
+}
+
 fn global_sym(g: *ir.Global) i32 {
     return @as(i32, @bit_cast(i32, gsym.get(@int_cast(usize, g.id))));
 }
@@ -299,6 +303,14 @@ fn reg(v: *mut ir.Value) i32 {
             m.sym = global_sym(g);
             m.slot = -2;  // marks a TLS offset
             _ = e2(xe.LEA, 8, W(r), m);
+            return r;
+        }
+        if extern_global(g) {
+            // possibly in a shared library: its address comes from the GOT
+            // (the linker turns this into a lea when it is not)
+            let mut m = mc.mem_sym(global_sym(g), 0);
+            m.scale = 99;
+            _ = e2(xe.LOAD, 8, W(r), m);
             return r;
         }
         _ = e2(xe.LEA, 8, W(r), mc.mem_sym(global_sym(g), 0));
@@ -407,7 +419,7 @@ fn addr(p: *mut ir.Value) mc.MOp {
             return mc.mem(b, reg(off), 1, 0);
         }
     }
-    if (p.kind == ir.V_GLOBAL) and not p.gv.tls {
+    if (p.kind == ir.V_GLOBAL) and not p.gv.tls and not extern_global(p.gv) {
         return mc.mem_sym(global_sym(p.gv), 0);
     }
     return mc.mem(reg(p), -1, 0, 0);

@@ -345,19 +345,19 @@ pub fn write(o: *mut Obj) []u8 {
 // -----------------------------------------------------------------------------
 // Reading (objects this compiler wrote)
 // -----------------------------------------------------------------------------
-fn rd16(d: []u8, off: usize) u64 {
+pub fn rd16(d: []u8, off: usize) u64 {
     return @as(u64, d[off]) | (@as(u64, d[off + 1]) << 8);
 }
 
-fn rd32(d: []u8, off: usize) u64 {
+pub fn rd32(d: []u8, off: usize) u64 {
     return rd16(d, off) | (rd16(d, off + 2) << 16);
 }
 
-fn rd64(d: []u8, off: usize) u64 {
+pub fn rd64(d: []u8, off: usize) u64 {
     return rd32(d, off) | (rd32(d, off + 4) << 32);
 }
 
-fn cstr_at(d: []u8, off: usize) []u8 {
+pub fn cstr_at(d: []u8, off: usize) []u8 {
     let mut e = off;
     while (e < d.len) and (d[e] != 0) {
         e += 1;

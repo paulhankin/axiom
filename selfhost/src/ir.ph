@@ -1838,3 +1838,57 @@ pub fn remove_unreachable(f: *mut Func) void {
         b = b.next;
     }
 }
+
+fn resolve_const(c: *mut Value) void {
+    if c.kind != V_CAGG {
+        return;
+    }
+    for k in 0..c.xs.len {
+        let x = resolve(c.xs.get(k));
+        c.xs.set(k, x);
+        resolve_const(x);
+    }
+}
+
+// Declarations of a function the module also defines (an extern "C" block
+// naming a runtime export, say) refer to the definition. Same for globals.
+pub fn merge_same_named(m: *mut Module) void {
+    let mut defs = u.SymMap.[*mut Func].{ keys: u.nil.[usize](), vals: u.nil.[*mut Func](), cap: 0, len: 0 };
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if not is_decl(f) and (f.linkage != LINK_INTERNAL) {
+            defs.put(f.name, f);
+        }
+    }
+    let mut any = false;
+    let mut kept = u.List.[*mut Func].{ data: u.nil.[*mut Func](), len: 0, cap: 0 };
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if is_decl(f) {
+            let d = defs.get(f.name);
+            if u.notnil(d) {
+                f.val.fwd = d.val;
+                any = true;
+                continue;
+            }
+        }
+        f.id = @int_cast(i32, kept.len);
+        kept.push(f);
+    }
+    if not any {
+        return;
+    }
+    m.funcs = kept;
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        m.fmap.put(f.name, f);
+        apply_forwarding(f);
+    }
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if u.notnil(g.init) {
+            g.init = resolve(g.init);
+            resolve_const(g.init);
+        }
+    }
+}

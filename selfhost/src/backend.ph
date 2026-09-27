@@ -18,6 +18,7 @@ pub const EMIT_ASM: i32 = 2;
 
 pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) bool {
     let raw = (emit == EMIT_IR) and not u.isnos(u.env("PHALANGE_IR_RAW"));
+    ir.merge_same_named(m);
     if not raw {
         lower.lower_module(m);
         for i in 0..m.funcs.len {
