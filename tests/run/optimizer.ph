@@ -173,7 +173,59 @@ fn modify_in_loop(p: *mut Pair) i64 {
     return t;
 }
 
+error { Neg }
+
+// The first test of the loop is known on entry (jump threading peels it);
+// values flow around the back edge.
+fn digits(x0: u64) u64 {
+    let mut buf: [24]u8 = [0; 24];
+    let mut i = buf.len;
+    let mut v = x0;
+    loop {
+        i -= 1;
+        buf[i] = @truncate(u8, v % 10) + '0';
+        v = v / 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut s: u64 = 0;
+    for k in i..buf.len {
+        s = (s * 10) + @as(u64, buf[k] - '0');
+    }
+    return s + (@as(u64, i) * 1000000000);
+}
+
+fn leading_spaces(s: []u8) u64 {
+    let mut i: usize = 0;
+    let mut n: u64 = 0;
+    while (i < s.len) and (s[i] == ' ') {
+        i += 1;
+        n += 1;
+    }
+    return n;
+}
+
+fn checked(x: i64) !i64 {
+    if x < 0 {
+        return error.Neg;
+    }
+    return x * 2;
+}
+
+fn use_checked(x: i64) i64 {
+    let a = checked(x) catch -1;
+    return a + 1;
+}
+
 export fn run() void {
+    io.uint(digits(343073));                    // expect: 18000343073
+    io.uint(digits(0));                         // expect: 23000000000
+    io.uint(leading_spaces("   ab "));          // expect: 3
+    io.uint(leading_spaces("    "));            // expect: 4
+    io.uint(leading_spaces(""));                // expect: 0
+    io.int(use_checked(5));                     // expect: 11
+    io.int(use_checked(-3));                    // expect: 0
     let mut pa = Pair.{ a: 0, b: 0 };
     io.int(alias(&mut pa, &mut pa));            // expect: 2
     let mut pb = Pair.{ a: 0, b: 0 };

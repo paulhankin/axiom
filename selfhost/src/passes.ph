@@ -2,8 +2,9 @@
 // passes.ph - the optimization pipeline over a module's IR (after lowering).
 //
 //   -O0   mem2reg, constant folding, CFG simplification, dead code
-//   -O1+  also instruction combining (combine.ph), scalar replacement of
-//         aggregates (sroa.ph) and global value numbering (gvn.ph)
+//   -O1+  also instruction combining (combine.ph), jump threading
+//         (thread.ph), scalar replacement of aggregates (sroa.ph) and global
+//         value numbering (gvn.ph)
 //   -O2+  also inlining (inline.ph), bottom-up over the call graph, each
 //         function simplified again after its calls are inlined
 // =============================================================================
@@ -13,12 +14,16 @@ import "opt.ph" as opt;
 import "sroa.ph" as sroa;
 import "gvn.ph" as gvn;
 import "inline.ph" as inl;
+import "thread.ph" as thr;
 
 fn cleanup(f: *mut ir.Func, level: i32) void {
     let mut rounds: i32 = 0;
     loop {
         let a = opt.fold_combine(f, level > 0);
-        let c = opt.simplify_cfg(f);
+        let mut c = opt.simplify_cfg(f);
+        if (level > 0) and thr.jump_thread(f) {
+            c = true;
+        }
         rounds += 1;
         if not (a or c) or (rounds > 8) {
             break;

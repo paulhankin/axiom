@@ -521,6 +521,7 @@ pub struct Block {
     loop_depth: i32,
     aux: i64,
     auxp: *mut void,
+    mark: i64,         // pass scratch that survives CFG analyses
 }
 
 pub const LINK_EXTERNAL: i32 = 0;
