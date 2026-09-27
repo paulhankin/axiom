@@ -1702,3 +1702,277 @@ pub fn ss_opt(f: *mut ir.Func) bool {
     }
     return any;
 }
+
+// -----------------------------------------------------------------------------
+// Loop-invariant code motion: instructions of a loop whose operands come
+// from outside it move to its preheader (inner loops first, so they can
+// move out of several). Hoisted: operations without effects that cannot
+// trap (divisions only by a nonzero constant), and loads that no write in
+// the loop may alias and that may run early: in the header (which runs
+// whenever the loop is entered), or within a stack slot or global.
+// -----------------------------------------------------------------------------
+fn licm_speculatable(i: *ir.Value) bool {
+    let op = i.op;
+    if (op == ir.OP_UDIV) or (op == ir.OP_SDIV) or (op == ir.OP_UREM) or (op == ir.OP_SREM) {
+        if not cb.is_k(i.b) or (ir.cint_val(i.b) == 0) {
+            return false;
+        }
+        // (a signed division by -1 overflows for MIN: the checks come first)
+        return ((op == ir.OP_UDIV) or (op == ir.OP_UREM)) or (ir.sval(i.b) != -1);
+    }
+    return cse_able(i);
+}
+
+fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) void {
+    out.clear();
+    h.mark = tag;
+    out.push(h);
+    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for k in 0..h.preds.len {
+        let p = h.preds.get(k);
+        if (p.rpo >= 0) and opt.dominates(h, p) and (p.mark != tag) {
+            p.mark = tag;
+            work.push(p);
+        }
+    }
+    while work.len > 0 {
+        let x = work.pop();
+        out.push(x);
+        for k in 0..x.preds.len {
+            let p = x.preds.get(k);
+            if (p.rpo >= 0) and (p.mark != tag) {
+                p.mark = tag;
+                work.push(p);
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+}
+
+fn loop_headers(order: *u.List.[*mut ir.Block]) u.List.[*mut ir.Block] {
+    let mut hs = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for i in 1..order.len {
+        let h = order.get(i);
+        for k in 0..h.preds.len {
+            let p = h.preds.get(k);
+            if (p.rpo >= 0) and opt.dominates(h, p) {
+                hs.push(h);
+                break;
+            }
+        }
+    }
+    return hs;
+}
+
+let mut loop_mark: i64 = 0x1000_0000;
+
+// A preheader for h (members marked `tag`): the only outside predecessor
+// when it ends in `br h`, else a new block the outside edges go through.
+fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
+    let mut outside = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for k in 0..h.preds.len {
+        let p = h.preds.get(k);
+        if p.mark != tag {
+            outside.push(p);
+        }
+    }
+    let mut made = false;
+    if (outside.len == 1) and (ir.succ_count(ir.terminator(outside.get(0))) == 1) {
+        // already one
+    } else if outside.len > 0 {
+        let pre = ir.append_block(f, "preheader");
+        let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+        br.t1 = h;
+        ir.append_inst(pre, br);
+        for k in 0..outside.len {
+            let q = outside.get(k);
+            let t = ir.terminator(q);
+            for j in 0..ir.succ_count(t) {
+                if ir.succ(t, j) == h {
+                    ir.set_succ(t, j, pre);
+                }
+            }
+        }
+        // h's phis: the outside inputs merge in the preheader
+        let bld = ir.new_builder();
+        let mut p = h.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            let mut np = vnil();
+            if outside.len > 1 {
+                ir.at_before(bld, br);
+                np = ir.phi(bld, p.ty);
+            }
+            let mut k: usize = 0;
+            while k < p.bs.len {
+                let from = p.bs.get(k);
+                if from.mark != tag {
+                    if u.notnil(np) {
+                        ir.add_incoming(np, p.xs.get(k), from);
+                        p.bs.set(k, p.bs.get(p.bs.len - 1));
+                        p.xs.set(k, p.xs.get(p.xs.len - 1));
+                        p.bs.len -= 1;
+                        p.xs.len -= 1;
+                        continue;
+                    }
+                    p.bs.set(k, pre);
+                }
+                k += 1;
+            }
+            if u.notnil(np) {
+                ir.add_incoming(p, np, pre);
+            }
+            p = p.next;
+        }
+        made = true;
+    }
+    u.free(@ptr_cast(*mut void, outside.data));
+    return made;
+}
+
+// Is the load at l safe to run before the loop without the loop's guard?
+fn deref_ok(l: *Loc, size: i64) bool {
+    if u.isnil(l.obj) or not l.rok or (l.rlo < 0) {
+        return false;
+    }
+    let mut objsize: u64 = 0;
+    if is_inst(l.obj, ir.OP_ALLOCA) {
+        objsize = l.obj.aty.size;
+    } else if l.obj.kind == ir.V_GLOBAL {
+        if l.obj.gv.tls {
+            return false;
+        }
+        objsize = l.obj.gv.ty.size;
+    } else {
+        return false;
+    }
+    return (l.rhi + size) <= @bit_cast(i64, objsize);
+}
+
+pub fn licm(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    // preheaders
+    opt.compute_preds(f);
+    let mut order = opt.dominators(f);
+    let mut hs = loop_headers(&order);
+    if hs.len == 0 {
+        u.free(@ptr_cast(*mut void, order.data));
+        return false;
+    }
+    let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let mut made = false;
+    for k in 0..hs.len {
+        loop_mark += 1;
+        members_of(hs.get(k), loop_mark, &mut members);
+        if make_preheader(f, hs.get(k), loop_mark) {
+            made = true;
+        }
+    }
+    if made {
+        u.free(@ptr_cast(*mut void, order.data));
+        u.free(@ptr_cast(*mut void, hs.data));
+        opt.compute_preds(f);
+        order = opt.dominators(f);
+        hs = loop_headers(&order);
+    }
+    escapes(f);
+    // inner loops first
+    for i in 1..hs.len {
+        let mut j = i;
+        while (j > 0) and (hs.get(j - 1).depth < hs.get(j).depth) {
+            let t = hs.get(j - 1);
+            hs.set(j - 1, hs.get(j));
+            hs.set(j, t);
+            j -= 1;
+        }
+    }
+    let mut any = false;
+    for hi in 0..hs.len {
+        let h = hs.get(hi);
+        loop_mark += 1;
+        let tag = loop_mark;
+        members_of(h, tag, &mut members);
+        let mut pre = ir.bnil();
+        for k in 0..h.preds.len {
+            if h.preds.get(k).mark != tag {
+                pre = h.preds.get(k);
+            }
+        }
+        if u.isnil(pre) or (ir.succ_count(ir.terminator(pre)) != 1) {
+            continue;
+        }
+        let at = ir.terminator(pre);
+        // the loop's writes (for loads)
+        writes.clear();
+        for k in 0..members.len {
+            let mut i = members.get(k).first;
+            while u.notnil(i) {
+                note_writes(i);
+                i = i.next;
+            }
+        }
+        // in dominance order: the header first, then the rest by rpo
+        for k in 1..members.len {
+            let mut j = k;
+            while (j > 1) and (members.get(j - 1).rpo > members.get(j).rpo) {
+                let t = members.get(j - 1);
+                members.set(j - 1, members.get(j));
+                members.set(j, t);
+                j -= 1;
+            }
+        }
+        for k in 0..members.len {
+            let b = members.get(k);
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                if hoist_ok(i, tag, b == h) {
+                    ir.remove_inst(i);
+                    ir.insert_before(at, i);
+                    any = true;
+                }
+                i = next;
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, members.data));
+    u.free(@ptr_cast(*mut void, order.data));
+    u.free(@ptr_cast(*mut void, hs.data));
+    return any or made;
+}
+
+fn invariant(o: *ir.Value, tag: i64) bool {
+    return u.isnil(o) or (o.kind != ir.V_INST) or u.isnil(o.blk) or (o.blk.mark != tag);
+}
+
+fn hoist_ok(i: *mut ir.Value, tag: i64, in_header: bool) bool {
+    if (i.op == ir.OP_PHI) or ir.is_term(i.op) {
+        return false;
+    }
+    if not invariant(i.a, tag) or not invariant(i.b, tag) or not invariant(i.c, tag) {
+        return false;
+    }
+    for k in 0..i.xs.len {
+        if not invariant(i.xs.get(k), tag) {
+            return false;
+        }
+    }
+    if i.op == ir.OP_LOAD {
+        if (i.flags != 0) or (i.ty.kind == ir.T_VOID) {
+            return false;
+        }
+        let sz = @bit_cast(i64, i.ty.size);
+        let l = loc_of(i.a, sz);
+        if not in_header and not deref_ok(&l, sz) {
+            return false;
+        }
+        for w in 0..writes.len {
+            if may_alias(&l, writes.at(w)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return licm_speculatable(i);
+}

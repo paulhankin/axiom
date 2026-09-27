@@ -3,8 +3,9 @@
 //
 //   -O0   mem2reg, constant folding, CFG simplification, dead code
 //   -O1+  also instruction combining (combine.ph), jump threading and
-//         if-conversion (thread.ph), scalar replacement of aggregates (sroa.ph) and global
-//         value numbering (gvn.ph)
+//         if-conversion (thread.ph), scalar replacement of aggregates (sroa.ph),
+//         global value numbering, dead stores, bounds and loop-invariant code
+//         motion (gvn.ph)
 //   -O2+  also interprocedural constant propagation and inlining
 //         (inline.ph), bottom-up over the call graph, each function simplified
 //         again after its calls are inlined
@@ -55,6 +56,11 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
             cleanup(f, level);
         }
         if gvn.ss_opt(f) {
+            cleanup(f, level);
+        }
+        if gvn.licm(f) {
+            cleanup(f, level);
+            _ = gvn.gvn(f);
             cleanup(f, level);
         }
     }
