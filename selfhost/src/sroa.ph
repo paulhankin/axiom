@@ -28,6 +28,8 @@ struct Part {
     split_ok: bool,   // every access matches the leaves
     reads: bool,
     skip: bool,       // a copy partner changed this round: next round
+    nwrites: i32,
+    write: *mut ir.Value,  // the last write seen
     uses: u.List.[*mut ir.Value],
     leaves: u.List.[Leaf],
 }
@@ -121,6 +123,9 @@ fn make_leaves(p: *mut Part) bool {
     u.free(@ptr_cast(*mut void, raw.data));
     return ok and (p.leaves.len <= MAX_LEAVES * 2);
 }
+
+// The offset of a pointer derived with a variable offset.
+const VAR_OFF: i64 = -0x7fff_ffff_ffff_ffff;
 
 fn leaf_at(p: *mut Part, off: i64) i64 {
     if off < 0 {
@@ -237,7 +242,7 @@ fn classify(i: *mut ir.Value) void {
     if op == ir.OP_PTRADD {
         let p = part_of(i.a);
         if u.notnil(p) and (part_of(i) != p) {
-            p.escaped = true;  // a variable offset
+            p.escaped = true;  // not derived (an unreachable definition)
         }
         escape(i.b);
         return;
@@ -258,6 +263,8 @@ fn classify(i: *mut ir.Value) void {
         let p = part_of(i.b);
         if u.notnil(p) {
             p.uses.push(i);
+            p.nwrites += 1;
+            p.write = i;
             if (i.flags != 0) or not access_ok(p, off_of(i.b), i.a.ty) {
                 p.split_ok = false;
             }
@@ -274,6 +281,8 @@ fn classify(i: *mut ir.Value) void {
         }
         if u.notnil(pd) {
             pd.uses.push(i);
+            pd.nwrites += 1;
+            pd.write = i;
             if not is_k(i.c) or not range_ok(pd, off_of(i.a), cval(i.c)) {
                 pd.split_ok = false;
             }
@@ -293,6 +302,8 @@ fn classify(i: *mut ir.Value) void {
         let p = part_of(i.a);
         if u.notnil(p) {
             p.uses.push(i);
+            p.nwrites += 1;
+            p.write = i;
             if not is_k(i.c) or not is_k(i.b) or not range_ok(p, off_of(i.a), cval(i.c)) {
                 p.split_ok = false;
             } else {
@@ -424,6 +435,19 @@ fn delete_writes(p: *mut Part) void {
     }
 }
 
+// Is the slot written exactly once, by a copy of a whole constant global?
+fn const_copy(p: *mut Part) bool {
+    if p.nwrites != 1 {
+        return false;
+    }
+    let w = p.write;
+    if (w.op != ir.OP_MEMCPY) or (w.a != p.a) or not is_k(w.c) or (cval(w.c) != p.a.aty.size) {
+        return false;
+    }
+    let g = w.b;
+    return (g.kind == ir.V_GLOBAL) and g.gv.is_const and u.notnil(g.gv.init) and (g.gv.ty.size >= p.a.aty.size);
+}
+
 // True if anything changed.
 pub fn sroa(f: *mut ir.Func) bool {
     if u.isnil(B) {
@@ -453,11 +477,15 @@ pub fn sroa(f: *mut ir.Func) bool {
                 parts.push(p);
                 i.aux = @int_cast(i64, parts.len);
                 i.aux2 = 0;
-            } else if (i.op == ir.OP_PTRADD) and is_k(i.b) {
+            } else if i.op == ir.OP_PTRADD {
                 let p = part_of(i.a);
                 if u.notnil(p) {
                     i.aux = i.a.aux;
-                    i.aux2 = i.a.aux2 + ir.sval(i.b);
+                    if is_k(i.b) and (i.a.aux2 != VAR_OFF) {
+                        i.aux2 = i.a.aux2 + ir.sval(i.b);
+                    } else {
+                        i.aux2 = VAR_OFF;
+                    }
                 }
             }
             i = i.next;
@@ -485,6 +513,12 @@ pub fn sroa(f: *mut ir.Func) bool {
         if not p.reads {
             defer_partners(p);
             delete_writes(p);
+            ir.remove_inst(p.a);
+            any = true;
+        } else if const_copy(p) {
+            // only ever a copy of constant memory: read the constant
+            ir.remove_inst(p.write);
+            p.a.fwd = p.write.b;
             ir.remove_inst(p.a);
             any = true;
         } else if p.split_ok {

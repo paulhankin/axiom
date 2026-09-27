@@ -75,3 +75,18 @@ test "indirect call" {
 test "stack overflow" {
     _ = forever(0);
 }
+
+fn first(xs: []i32) i32 {
+    return xs[0];
+}
+
+fn mid(xs: []i32, i: usize) i32 {
+    let a = first(xs);
+    return a + get(xs, i);
+}
+
+// stack: nested inlining | get@7 mid@85 test "nested inlining"@91
+test "nested inlining" {
+    let xs: [2]i32 = [1, 2];
+    _ = mid(xs[..], 4);
+}

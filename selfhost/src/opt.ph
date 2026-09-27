@@ -610,14 +610,18 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     let mut any = false;
     let mut changed = true;
     let mut rounds: i32 = 0;
+    // in reverse postorder, definitions come before their uses (but for
+    // phis on back edges), so a round or two reach the fixed point
+    compute_preds(f);
+    let order = rpo(f);
     while changed and (rounds < 16) {
         changed = false;
         rounds += 1;
         if combine {
             count_uses(f);
         }
-        let mut b = f.first;
-        while u.notnil(b) {
+        for bi in 0..order.len {
+            let b = order.get(bi);
             let mut i = b.first;
             while u.notnil(i) {
                 let next = i.next;
@@ -655,9 +659,9 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
                 }
                 i = next;
             }
-            b = b.next;
         }
     }
+    u.free(@ptr_cast(*mut void, order.data));
     ir.apply_forwarding(f);
     return any;
 }

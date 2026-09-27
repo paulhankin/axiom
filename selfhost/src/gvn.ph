@@ -55,13 +55,19 @@ struct Write {
     obj: *mut ir.Value,
     off: i64,
     size: i64,            // -1: unknown
+    rok: bool,
+    rlo: i64,
+    rhi: i64,
 }
 
 struct Loc {
     base: *mut ir.Value,
     obj: *mut ir.Value,   // alloca or global under the ptradds, or nil
-    off: i64,
+    off: i64,             // from base
     size: i64,
+    rok: bool,            // the offset from obj is known to lie in [rlo, rhi]
+    rlo: i64,
+    rhi: i64,
 }
 
 let mut ents: u.List.[Ent] = u.List.[Ent].{ data: @ptr_from_int(*mut Ent, 0), len: 0, cap: 0 };
@@ -240,6 +246,68 @@ fn is_obj(v: *ir.Value) bool {
     return is_inst(v, ir.OP_ALLOCA) or (v.kind == ir.V_GLOBAL);
 }
 
+struct Range {
+    ok: bool,
+    lo: i64,
+    hi: i64,
+}
+
+const RLIM: i64 = 0x4000_0000;
+
+fn rng(lo: i64, hi: i64) Range {
+    if (lo < -RLIM) or (hi > RLIM) or (lo > hi) {
+        return Range.{ ok: false, lo: 0, hi: 0 };
+    }
+    return Range.{ ok: true, lo: lo, hi: hi };
+}
+
+// The values an integer offset expression can take (small ranges only).
+fn range_of(v: *ir.Value, depth: i32) Range {
+    if ir.is_cint(v) {
+        let x = ir.sval(v);
+        return rng(x, x);
+    }
+    let none = Range.{ ok: false, lo: 0, hi: 0 };
+    if (depth > 6) or (v.kind != ir.V_INST) {
+        return none;
+    }
+    let op = v.op;
+    if (op == ir.OP_AND) and ir.is_cint(v.b) and (ir.sval(v.b) >= 0) {
+        return rng(0, ir.sval(v.b));
+    }
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) {
+        let r = range_of(v.a, depth + 1);
+        if r.ok and ((op == ir.OP_SEXT) or (r.lo >= 0)) {
+            return r;
+        }
+        return none;
+    }
+    if (op == ir.OP_MUL) and ir.is_cint(v.b) {
+        let c = ir.sval(v.b);
+        let r = range_of(v.a, depth + 1);
+        if r.ok and (c >= 0) and (c <= RLIM) {
+            return rng(r.lo * c, r.hi * c);
+        }
+        return none;
+    }
+    if (op == ir.OP_SHL) and ir.is_cint(v.b) and (ir.cint_val(v.b) < 30) {
+        let r = range_of(v.a, depth + 1);
+        let k = @truncate(u32, ir.cint_val(v.b));
+        if r.ok and (r.lo >= 0) {
+            return rng(r.lo << k, r.hi << k);
+        }
+        return none;
+    }
+    if op == ir.OP_ADD {
+        let x = range_of(v.a, depth + 1);
+        let y = range_of(v.b, depth + 1);
+        if x.ok and y.ok {
+            return rng(x.lo + y.lo, x.hi + y.hi);
+        }
+    }
+    return none;
+}
+
 fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     let mut p = p0;
     let mut off: i64 = 0;
@@ -248,7 +316,16 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
         p = p.a;
     }
     let base = p;
+    let mut r = rng(off, off);
     while is_inst(p, ir.OP_PTRADD) {
+        if r.ok {
+            let x = range_of(p.b, 0);
+            if x.ok {
+                r = rng(r.lo + x.lo, r.hi + x.hi);
+            } else {
+                r.ok = false;
+            }
+        }
         p = p.a;
     }
     let mut obj = vnil();
@@ -258,7 +335,26 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
         // wasm: the thread's shadow stack record, or the main thread's
         obj = p.b;
     }
-    return Loc.{ base: base, obj: obj, off: off, size: size };
+    return Loc.{ base: base, obj: obj, off: off, size: size, rok: r.ok and u.notnil(obj), rlo: r.lo, rhi: r.hi };
+}
+
+// Where in the shadow stack record: 0 the depth, 2 the call site slots.
+fn ss_field(l: *Loc) i32 {
+    if not noalias_global(l.obj) or not l.rok or (l.size < 0) {
+        return -1;
+    }
+    let t = l.obj.gv.ty;
+    if (t.kind != ir.T_STRUCT) or (t.fields.len < 3) {
+        return -1;
+    }
+    if (l.rlo == 0) and (l.rhi == 0) and (l.size == 4) {
+        return 0;
+    }
+    let s = @bit_cast(i64, t.offs[2]);
+    if (l.rlo >= s) and ((l.rhi + l.size) <= (s + @bit_cast(i64, t.fields[2].size))) {
+        return 2;
+    }
+    return -1;
 }
 
 // Memory the program can only reach by the global's name (the shadow stack).
@@ -288,6 +384,9 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if x.base == w.base {
         return overlap(x.off, x.size, w.off, w.size);
     }
+    if u.notnil(x.obj) and (x.obj == w.obj) and x.rok and w.rok and (x.size >= 0) and (w.size >= 0) {
+        return overlap(x.rlo, (x.rhi - x.rlo) + x.size, w.rlo, (w.rhi - w.rlo) + w.size);
+    }
     if u.notnil(x.obj) and u.notnil(w.obj) and (x.obj != w.obj) {
         return false;
     }
@@ -301,11 +400,11 @@ fn may_alias(x: *Loc, w: *Write) bool {
 }
 
 fn push_write(kind: i32, l: Loc) void {
-    writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size });
+    writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo, rhi: l.rhi });
 }
 
 fn nowhere() Loc {
-    return Loc.{ base: vnil(), obj: vnil(), off: 0, size: -1 };
+    return Loc.{ base: vnil(), obj: vnil(), off: 0, size: -1, rok: false, rlo: 0, rhi: 0 };
 }
 
 // Marks allocas whose address stays private (aux2 = 1): used only as the
@@ -768,7 +867,7 @@ pub fn gvn(f: *mut ir.Func) bool {
 // function returns.
 // -----------------------------------------------------------------------------
 fn loc_write(l: *Loc) Write {
-    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size };
+    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo, rhi: l.rhi };
 }
 
 // Is a covered by b (both exact)?
@@ -803,6 +902,30 @@ fn read_nonprivate(killed: *mut u.List.[Loc]) void {
     }
 }
 
+let mut restored: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut ss_dead: bool = false;
+
+fn ss_reads() void {
+    ss_dead = false;
+    restored.clear();
+}
+
+// Is one of xs an operand of v (transitively)?
+fn uses_any(v: *mut ir.Value, xs: *u.List.[*mut ir.Value], depth: i32) bool {
+    if u.isnil(v) or (depth > 8) {
+        return false;
+    }
+    for k in 0..xs.len {
+        if xs.get(k) == v {
+            return true;
+        }
+    }
+    if v.kind != ir.V_INST {
+        return false;
+    }
+    return uses_any(v.a, xs, depth + 1) or uses_any(v.b, xs, depth + 1);
+}
+
 fn has_obj(xs: *u.List.[*mut ir.Value], o: *mut ir.Value) bool {
     for k in 0..xs.len {
         if xs.get(k) == o {
@@ -819,6 +942,13 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
     let t = ir.terminator(b);
     // at a return, private allocas are dead unless read later in the block
     let mut at_ret = u.notnil(t) and (t.op == ir.OP_RET);
+    // Shadow stack call site slots at or above the depth are never read. A
+    // push stores the site at slots[D] for the depth D it loaded, and the
+    // pop stores D back; a slot store followed by the store of the depth its
+    // index was computed from (or by the return), with no call, trap or
+    // load of the slots in between, is dead.
+    ss_dead = at_ret;
+    restored.clear();
     let mut i = b.last;
     while u.notnil(i) {
         let prev = i.prev;
@@ -827,9 +957,17 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             if i.flags != 0 {
                 killed.clear();
                 at_ret = false;
+                ss_reads();
             } else {
                 let l = loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+                let sf = ss_field(&l);
                 let mut dead = at_ret and private_obj(l.obj) and not has_obj(read_objs, l.obj);
+                if (sf == 2) and (ss_dead or uses_any(i.b, &restored, 0)) {
+                    dead = true;
+                }
+                if sf == 0 {
+                    restored.push(i.a);
+                }
                 for k in 0..killed.len {
                     if covers(killed.at(k), &l) {
                         dead = true;
@@ -846,9 +984,13 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             if i.flags != 0 {
                 killed.clear();
                 at_ret = false;
+                ss_reads();
             } else {
                 let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
                 read_loc(killed, &l);
+                if noalias_global(l.obj) and (ss_field(&l) != 0) {
+                    ss_reads();
+                }
                 if u.notnil(l.obj) {
                     read_objs.push(l.obj);
                 }
@@ -858,6 +1000,9 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             read_loc(killed, &s);
             if u.notnil(s.obj) {
                 read_objs.push(s.obj);
+            }
+            if noalias_global(s.obj) {
+                ss_reads();
             }
             let d = loc_of(i.a, size_of(i.c));
             if (killed.len < 32) and (d.size >= 0) {
@@ -870,12 +1015,17 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             }
         } else if (op == ir.OP_CALL) or (op == ir.OP_RET) {
             read_nonprivate(killed);
+            if op == ir.OP_CALL {
+                ss_reads();
+            }
         } else if (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
             killed.clear();
             at_ret = false;
+            ss_reads();
         } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
             killed.clear();
             at_ret = false;
+            ss_reads();
         }
         i = prev;
     }
