@@ -1215,6 +1215,10 @@ fn driver(args: [][]u8) i32 {
     if profiling and ty.g_target.is_wasm {
         cg.g_threads = true;
     }
+    if cg.g_threads and ty.g_target.is_wasm and not tg.has(tg.W_ATOMICS) {
+        dg.emit_fatal(json, "E9002", "threads on WebAssembly need the atomics extension (--features=+atomics)");
+        return 2;
+    }
     let mut objpath = out;
     if final_link {
         objpath = u.f2("%s.tmp%s.o", out, u.idec(u.getpid()));

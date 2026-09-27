@@ -4530,6 +4530,11 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         }
         if ty.g_target.is_wasm {
             emit_trap_info_export();
+            if ty.g_target.ptr_bits == 64 {
+                // tells hosts that pointers in memory are 64-bit
+                _ = add_export("phalange_wasm64", T_i32, no_tys());
+                ir.ret(B, ci32(1));
+            }
         }
         emit_shadow_stack_export();
     }

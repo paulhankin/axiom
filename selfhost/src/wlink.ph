@@ -668,10 +668,12 @@ pub fn link(us: []mut *mut wo.Unit, o: *Options) []u8 {
         }
         section(&mut out, 9, &mut c);
     }
-    // datacount
-    c = bn.new_bytes();
-    c.uleb(@as(u64, segs.len));
-    section(&mut out, 12, &mut c);
+    // datacount (for memory.init / data.drop)
+    if start >= 0 {
+        c = bn.new_bytes();
+        c.uleb(@as(u64, segs.len));
+        section(&mut out, 12, &mut c);
+    }
     // code
     c = bn.new_bytes();
     c.uleb(@as(u64, ndef));

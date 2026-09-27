@@ -2712,6 +2712,10 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
+            if (i.ty.kind == ir.T_VEC) and not tg.has(tg.W_SIMD128) {
+                fail("vector types need the simd128 extension (--features=+simd128)");
+                return;
+            }
             if (i.ty.kind != ir.T_VOID) and (i.flag == FL_LOCAL) and ((i.uses > 0) or (i.op == ir.OP_PHI)) {
                 i.loc = @int_cast(i32, new_local(vt(i.ty)));
             }
