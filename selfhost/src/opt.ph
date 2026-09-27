@@ -887,7 +887,8 @@ pub fn optimize(f: *mut ir.Func, level: i32) void {
 
 // The layout order for code generation: reverse postorder with the blocks
 // that end in `unreachable` (trap paths) moved to the end, out of the way of
-// the hot code. Sets b.rpo to the new positions.
+// the hot code, and loop headers that test for the exit after their loop's
+// body. Sets b.rpo to the new positions. Needs dominators.
 pub fn layout(order: *mut u.List.[*mut ir.Block]) void {
     let mut cold = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     let mut n: usize = 0;
@@ -908,6 +909,211 @@ pub fn layout(order: *mut u.List.[*mut ir.Block]) void {
         order.get(i).rpo = @int_cast(i32, i);
     }
     u.free(@ptr_cast(*mut void, cold.data));
+    rotate_loops(order);
+}
+
+// A loop whose header tests for the exit (a `while` loop) has its header
+// placed after its body, so an iteration ends in one branch back to the
+// body instead of a jump to the header followed by the test. Needs
+// dominators; b.rpo holds the positions.
+fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
+    let mut headers = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for i in 1..order.len {
+        let h = order.get(i);
+        for k in 0..h.preds.len {
+            let p = h.preds.get(k);
+            if (p.rpo >= 0) and dominates(h, p) {
+                headers.push(h);
+                break;
+            }
+        }
+    }
+    let mut body = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for hi in 0..headers.len {
+        let h = headers.get(hi);
+        let t = ir.terminator(h);
+        if u.isnil(t) or (t.op != ir.OP_CONDBR) {
+            continue;
+        }
+        // the loop's blocks: backwards from the latches to the header
+        let tag = @int_cast(i64, hi) + 3000000;
+        h.aux = tag;
+        body.clear();
+        let mut last = h.rpo;
+        for k in 0..h.preds.len {
+            let p = h.preds.get(k);
+            if (p.rpo >= 0) and dominates(h, p) and (p.aux != tag) {
+                p.aux = tag;
+                body.push(p);
+            }
+        }
+        let mut members: i32 = 1;
+        while body.len > 0 {
+            let x = body.pop();
+            members += 1;
+            if x.rpo > last {
+                last = x.rpo;
+            }
+            for k in 0..x.preds.len {
+                let p = x.preds.get(k);
+                if (p.rpo >= 0) and (p.aux != tag) {
+                    p.aux = tag;
+                    body.push(p);
+                }
+            }
+        }
+        // one successor in the loop, one outside; the loop contiguous
+        let in1 = t.t1.aux == tag;
+        let in2 = t.t2.aux == tag;
+        if (in1 == in2) or (last == h.rpo) or ((last - h.rpo) + 1 != members) {
+            continue;
+        }
+        let from = @int_cast(usize, h.rpo);
+        let to = @int_cast(usize, last);
+        for i in from..to {
+            let x = order.get(i + 1);
+            order.set(i, x);
+            x.rpo = @int_cast(i32, i);
+        }
+        order.set(to, h);
+        h.rpo = @int_cast(i32, to);
+    }
+    u.free(@ptr_cast(*mut void, headers.data));
+    u.free(@ptr_cast(*mut void, body.data));
+}
+
+// -----------------------------------------------------------------------------
+// Constants in loops: those the target must build in a register (`needs`:
+// 64-bit immediates, floating point constants) are built once in the loop's
+// preheader, by a copy instruction, instead of at every use. Needs
+// dominators and predecessors.
+// -----------------------------------------------------------------------------
+fn same_const(a: *ir.Value, b: *ir.Value) bool {
+    if (a.kind != b.kind) or (a.ty != b.ty) {
+        return false;
+    }
+    if a.kind == ir.V_CINT {
+        return a.cv == b.cv;
+    }
+    if a.kind == ir.V_CFP {
+        return @bit_cast(u64, a.fv) == @bit_cast(u64, b.fv);
+    }
+    return a == b;
+}
+
+pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value) bool) void {
+    // headers, outermost first; each block's innermost header in auxp
+    let mut headers = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for i in 0..order.len {
+        let b = order.get(i);
+        b.auxp = u.vnil();
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if (p.rpo >= 0) and dominates(b, p) {
+                headers.push(b);
+                break;
+            }
+        }
+    }
+    if headers.len == 0 {
+        return;
+    }
+    // (insertion sort by depth: few headers)
+    for i in 1..headers.len {
+        let mut j = i;
+        while (j > 0) and (headers.get(j - 1).depth > headers.get(j).depth) {
+            let t = headers.get(j - 1);
+            headers.set(j - 1, headers.get(j));
+            headers.set(j, t);
+            j -= 1;
+        }
+    }
+    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for hi in 0..headers.len {
+        let h = headers.get(hi);
+        let tag = @int_cast(i64, hi) + 4000000;
+        h.aux = tag;
+        h.auxp = @ptr_cast(*mut void, h);
+        for k in 0..h.preds.len {
+            let p = h.preds.get(k);
+            if (p.rpo >= 0) and dominates(h, p) and (p.aux != tag) {
+                p.aux = tag;
+                work.push(p);
+            }
+        }
+        while work.len > 0 {
+            let x = work.pop();
+            x.auxp = @ptr_cast(*mut void, h);
+            for k in 0..x.preds.len {
+                let p = x.preds.get(k);
+                if (p.rpo >= 0) and (p.aux != tag) {
+                    p.aux = tag;
+                    work.push(p);
+                }
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+    // copies per header: (constant, copy) in the preheader
+    let mut made = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    for hi in 0..headers.len {
+        let h = headers.get(hi);
+        // the preheader: the one predecessor outside the loop, ending in br h
+        let mut pre = bnil();
+        let mut outside: i32 = 0;
+        for k in 0..h.preds.len {
+            let p = h.preds.get(k);
+            if not dominates(h, p) {
+                outside += 1;
+                pre = p;
+            }
+        }
+        if outside != 1 {
+            continue;
+        }
+        let pt = ir.terminator(pre);
+        if u.isnil(pt) or (pt.op != ir.OP_BR) {
+            continue;
+        }
+        made.clear();
+        for bi in 0..order.len {
+            let b = order.get(bi);
+            if b.auxp != @ptr_cast(*mut void, h) {
+                continue;
+            }
+            let mut i = b.first;
+            while u.notnil(i) {
+                if i.op != ir.OP_PHI {
+                    i.a = hoisted(f, i.a, pt, &mut made, needs);
+                    i.b = hoisted(f, i.b, pt, &mut made, needs);
+                    i.c = hoisted(f, i.c, pt, &mut made, needs);
+                    for k in 0..i.xs.len {
+                        i.xs.set(k, hoisted(f, i.xs.get(k), pt, &mut made, needs));
+                    }
+                }
+                i = i.next;
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, headers.data));
+    u.free(@ptr_cast(*mut void, made.data));
+}
+
+fn hoisted(f: *mut ir.Func, v: *mut ir.Value, at: *mut ir.Value, made: *mut u.List.[*mut ir.Value], needs: fn(*ir.Value) bool) *mut ir.Value {
+    if u.isnil(v) or not needs(v) {
+        return v;
+    }
+    for k in 0..made.len {
+        let c = made.get(k);
+        if same_const(c.a, v) {
+            return c;
+        }
+    }
+    let c = ir.new_inst(f, ir.OP_COPY, v.ty);
+    c.a = v;
+    ir.insert_before(at, c);
+    made.push(c);
+    return c;
 }
 
 // Splits edges from blocks with several successors to blocks with phis and

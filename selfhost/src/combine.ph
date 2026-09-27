@@ -329,6 +329,16 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             }
             return mk_icmp(B, ir.IntULE, sum.a, lim);
         }
+        // (x + c) <u c: the addition wrapped, x >u MAX - c; (x + c) >=u c: it did not
+        if is_op(a, ir.OP_ADD) and is_k(a.b) and is_k(b) and (kval(a.b) == kval(b)) and (kval(b) != 0) {
+            let lim = kt(at, ir.mask_bits(bits) -% kval(b));
+            if p == ir.IntULT {
+                return mk_icmp(B, ir.IntUGT, a.a, lim);
+            }
+            if p == ir.IntUGE {
+                return mk_icmp(B, ir.IntULE, a.a, lim);
+            }
+        }
         // (x - y) >u x  ->  y >u x  (x - y wraps below 0 exactly when y > x)
         if is_op(a, ir.OP_SUB) and (a.a == b) and (p == ir.IntUGT) {
             return mk_icmp(B, ir.IntUGT, a.b, b);

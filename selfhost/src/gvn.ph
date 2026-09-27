@@ -729,6 +729,9 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     }
     // facts from x's definition
     let op = x.op;
+    if op == ir.OP_PHI {
+        return phi_le(x, y, bound, depth);
+    }
     if (op == ir.OP_LSHR) or (op == ir.OP_UDIV) {
         return le_path(x.a, y, bound, depth + 1);
     }
@@ -738,8 +741,8 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
         }
         return le_path(x.a, y, bound, depth + 1);
     }
-    if op == ir.OP_ZEXT {
-        return le_path(x.a, y, bound, depth + 1);
+    if (op == ir.OP_ZEXT) or (op == ir.OP_TRUNC) {
+        return le_path(x.a, y, bound, depth + 1);  // (truncation only lowers it)
     }
     if (op == ir.OP_UREM) and not ir.is_const(x.b) {
         return le_path(x.b, y, bound + 1, depth + 1);
@@ -769,11 +772,64 @@ fn pick1(c: bool) i64 {
     return 0;
 }
 
+// A phi is bounded when every incoming value is, at the end of its block
+// with the condition of the edge (the facts in scope hold there too: they
+// come from branches every path to the phi's block goes through).
+fn phi_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
+    if x.xs.len > 4 {
+        return false;
+    }
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        if v == x {
+            continue;
+        }
+        let mark = ents.len;
+        edge_assume(x.bs.get(k), x.blk);
+        let ok = le_path(v, y, bound, depth + 1);
+        pop_to(mark);
+        if not ok {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn edge_assume(p: *mut ir.Block, b: *mut ir.Block) void {
+    let t = ir.terminator(p);
+    if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) {
+        assume(t.a, t.t1 == b, 0);
+    }
+}
+
+fn phi_below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
+    if x.xs.len > 4 {
+        return false;
+    }
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        if v == x {
+            continue;
+        }
+        let mark = ents.len;
+        edge_assume(x.bs.get(k), x.blk);
+        let ok = below_max(v, d, depth + 1);
+        pop_to(mark);
+        if not ok {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Is x <= MAX - d (d >= 1)? True when x <= w + c for some value w and c <= -d
 // (w is at most MAX), following the facts.
 fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
     if small_k(x) {
         return true;
+    }
+    if u.notnil(x) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 64) {
+        return true;  // (the question is about 64-bit values: narrower ones are far below)
     }
     if (depth > 5) or (prove_budget <= 0) or u.isnil(x) {
         return false;
@@ -794,6 +850,12 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
     }
     if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and cb.is_k(x.b) and (ir.cint_val(x.b) >= 2) {
         return true;  // at most MAX / 2
+    }
+    if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
+        return phi_below_max(x, d, depth);
+    }
+    if (x.kind == ir.V_INST) and ((x.op == ir.OP_ZEXT) or (x.op == ir.OP_TRUNC) or (x.op == ir.OP_AND)) {
+        return below_max(x.a, d, depth + 1) or ((x.op == ir.OP_AND) and small_k(x.b));
     }
     return false;
 }

@@ -2150,9 +2150,29 @@ fn gen_ptradd(v: *mut ir.Value) void {
     raw3(ae.addsub_reg(1, false, false, 0, 0, 0, 0, 0), d, a, reg(off));
 }
 
+// Constants that take instructions to build (worth building once per loop).
+fn const_needs_reg(v: *ir.Value) bool {
+    let k = v.kind;
+    if k == ir.V_CINT {
+        let x = cval(v);
+        return (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64) and ((x > 0xffff) or (x < -0xffff));
+    }
+    if k == ir.V_CFP {
+        return not ir.is_zero(v);
+    }
+    if (k == ir.V_CAGG) and (v.ty.kind == ir.T_VEC) {
+        return not ir.is_zero(v);
+    }
+    return false;
+}
+
 fn gen_inst(v: *mut ir.Value) void {
     let o = v.op;
     let t = v.ty;
+    if o == ir.OP_COPY {
+        copy(vreg(v), reg(v.a), class_of(t));
+        return;
+    }
     if (o >= ir.OP_ADD) and (o <= ir.OP_ASHR) {
         if t.kind == ir.T_VEC {
             vec_binop(v);
@@ -2511,6 +2531,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
+    opt.hoist_constants(f, &order, const_needs_reg);
     opt.layout(&mut order);
     prepare(f);
     MF = mc.new_func();

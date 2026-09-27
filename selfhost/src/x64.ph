@@ -2755,6 +2755,10 @@ fn gen_ptradd(v: *mut ir.Value) void {
 fn gen_inst(v: *mut ir.Value) void {
     let o = v.op;
     let t = v.ty;
+    if o == ir.OP_COPY {
+        copy(vreg(v), reg(v.a), class_of(t));
+        return;
+    }
     if (o >= ir.OP_ADD) and (o <= ir.OP_ASHR) {
         if t.kind == ir.T_VEC {
             vec_binop(v);
@@ -3140,11 +3144,30 @@ fn mk4(a: mc.MOp, b: mc.MOp, c: mc.MOp, d: mc.MOp) [4]mc.MOp {
     return [a, b, c, d];
 }
 
+// Constants that take an instruction to build (worth building once per loop).
+fn const_needs_reg(v: *ir.Value) bool {
+    let k = v.kind;
+    if k == ir.V_CINT {
+        return (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64) and not fits32(cval(v));
+    }
+    if k == ir.V_CFP {
+        return not ir.is_zero(v);
+    }
+    if (k == ir.V_CAGG) and (v.ty.kind == ir.T_VEC) {
+        return not ir.is_zero(v);
+    }
+    return false;
+}
+
 // Instructions whose only effect is their register result (for mc.dce;
 // not loads: a volatile load must happen).
 fn pure_inst(i: *mc.MInst) bool {
     let op = i.op;
-    return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.IMUL_I);
+    if (op == xe.SHIFT) and (i.ops[2].kind == mc.K_IMM) {
+        return true;  // (nothing reads the flags of a constant shift)
+    }
+    return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.IMUL_I) or
+           (op == xe.SETCC);
 }
 
 fn compile_func(f: *mut ir.Func) void {
@@ -3156,6 +3179,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
+    opt.hoist_constants(f, &order, const_needs_reg);
     opt.layout(&mut order);
     prepare(f);
     MF = mc.new_func();
@@ -3850,6 +3874,96 @@ fn enc_inst(i: *mut mc.MInst) void {
     fail(u.f1("cannot encode machine op %s", u.idec(op)));
 }
 
+// After allocation: blocks that only jump (their phi copies became no-op
+// moves) are bypassed, and a branch to the block that follows becomes a
+// fall-through (`jcc next; jmp x` is `j!cc x`). Returns the skipped blocks.
+fn noop_move(i: *mc.MInst) bool {
+    return (i.op == xe.MOV_RR) and (P(i.ops[0].reg) == P(i.ops[1].reg));
+}
+
+fn jump_target(b: *mc.MBlock) i32 {
+    let mut i = b.first;
+    while u.notnil(i) and noop_move(i) {
+        i = i.next;
+    }
+    if u.notnil(i) and (i.op == xe.JMP) and u.isnil(i.next) and (i.ops[0].label < xe.LOCAL_BASE) {
+        return i.ops[0].label;
+    }
+    return -1;
+}
+
+fn ends_flow(b: *mc.MBlock) bool {
+    let l = b.last;
+    return u.notnil(l) and ((l.op == xe.JMP) or (l.op == xe.RET) or (l.op == xe.UD2));
+}
+
+fn tidy_branches() []mut bool {
+    let nb = MF.blocks.len;
+    let skip = u.newn.[bool](nb + 1);
+    let fin = u.newn.[i32](nb + 1);
+    for bi in 0..nb {
+        fin[bi] = @int_cast(i32, bi);
+    }
+    // where a jump to each block ends up
+    for bi in 1..nb {
+        let mut t = jump_target(MF.blocks.get(bi));
+        let mut steps: usize = 0;
+        while (t >= 0) and (steps < nb) {
+            fin[bi] = t;
+            t = jump_target(MF.blocks.get(@int_cast(usize, t)));
+            steps += 1;
+        }
+    }
+    for bi in 0..nb {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) {
+                i.ops[0].label = fin[@int_cast(usize, i.ops[0].label)];
+            }
+            i = i.next;
+        }
+    }
+    // bypassed blocks are left out (a block falling into one jumps instead)
+    for bi in 1..nb {
+        if fin[bi] == @int_cast(i32, bi) {
+            continue;
+        }
+        let prev = MF.blocks.get(bi - 1);
+        if not ends_flow(prev) {
+            let ops: [1]mc.MOp = [mc.label(fin[bi])];
+            mc.append(prev, mc.new_inst(xe.JMP, 0, ops[..]));
+        }
+        skip[bi] = true;
+    }
+    // fall-throughs
+    for bi in 0..nb {
+        if skip[bi] {
+            continue;
+        }
+        let mut next = bi + 1;
+        while (next < nb) and skip[next] {
+            next += 1;
+        }
+        let b = MF.blocks.get(bi);
+        let l = b.last;
+        if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
+            continue;
+        }
+        if @int_cast(usize, l.ops[0].label) == next {
+            mc.remove(b, l);
+            continue;
+        }
+        let pj = l.prev;
+        if u.notnil(pj) and (pj.op == xe.JCC) and (pj.ops[0].label < xe.LOCAL_BASE) and
+           (@int_cast(usize, pj.ops[0].label) == next) {
+            pj.cc = invert(pj.cc);
+            pj.ops[0].label = l.ops[0].label;
+            mc.remove(b, l);
+        }
+    }
+    return skip;
+}
+
 fn encode_func(f: *mut ir.Func) void {
     // callee-saved registers in use
     nsaved = 0;
@@ -3875,10 +3989,14 @@ fn encode_func(f: *mut ir.Func) void {
     local_off.clear();
     prologue(sub);
     let nb = MF.blocks.len;
+    let skip = tidy_branches();
     let boff = u.newn.[u64](nb + 1);
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
         boff[bi] = @as(u64, E.b.len());
+        if skip[bi] {
+            continue;
+        }
         let mut i = b.first;
         while u.notnil(i) {
             enc_inst(i);
