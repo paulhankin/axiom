@@ -1,0 +1,105 @@
+// =============================================================================
+// File: dot_product.ax
+// Build: axiom build dot_product.ax --target=wasm32-freestanding -O3 -o engine.wasm
+// =============================================================================
+
+import host "env" {
+    fn console_log(ptr: *u8, len: usize) void;
+}
+
+error { OutOfMemory, DimensionMismatch }
+
+// -----------------------------------------------------------------------------
+// Minimal bump arena over a caller-provided buffer
+// -----------------------------------------------------------------------------
+pub struct Arena {
+    memory: []mut u8,
+    offset: usize,
+
+    pub fn init(buffer: []mut u8) Arena {
+        return Arena.{ memory: buffer, offset: 0 };
+    }
+
+    /// `align` must be a power of two.
+    pub fn alloc(self: *mut Arena, size: usize, align: usize) ![]mut u8 {
+        let mask = align - 1;
+        let aligned = (self.offset + mask) & ~mask;
+
+        if (aligned + size) > self.memory.len {
+            return error.OutOfMemory;
+        }
+
+        let slice = self.memory[aligned..aligned + size];
+        self.offset = aligned + size;
+        return slice;
+    }
+
+    pub fn reset(self: *mut Arena) void {
+        self.offset = 0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SIMD dot product
+// -----------------------------------------------------------------------------
+pub fn dot_product_simd(a: []f32, b: []f32) !f32 {
+    if a.len != b.len {
+        return error.DimensionMismatch;
+    }
+
+    let n = a.len;
+    let chunks = n / 4;
+    let mut acc: f32x4 = @splat(0.0);
+
+    let mut i: usize = 0;
+    while i < chunks * 4 {
+        let va = @load(f32x4, a[i..i + 4]);
+        let vb = @load(f32x4, b[i..i + 4]);
+        acc = acc + va * vb;
+        i += 4;
+    }
+
+    // Pairwise horizontal sum: (l0 + l1) + (l2 + l3)
+    let mut total = @reduce_add(acc);
+
+    // Scalar tail
+    while i < n {
+        total += a[i] * b[i];
+        i += 1;
+    }
+
+    return total;
+}
+
+// -----------------------------------------------------------------------------
+// Exports
+// -----------------------------------------------------------------------------
+let mut HEAP_BYTES: [65536]u8 = [0; 65536];
+
+export fn compute(length: usize) f32 {
+    let mut arena = Arena.init(HEAP_BYTES[..]);
+    defer arena.reset();
+
+    let byte_size = length * @size_of(f32);
+    let raw_a = arena.alloc(byte_size, 16) catch return -1.0;
+    let raw_b = arena.alloc(byte_size, 16) catch return -1.0;
+
+    let vec_a = @cast_slice(f32, raw_a);
+    let vec_b = @cast_slice(f32, raw_b);
+
+    for i in 0..length {
+        vec_a[i] = 1.5;
+        vec_b[i] = 2.0;
+    }
+
+    let result = dot_product_simd(vec_a, vec_b) catch return -2.0;
+
+    let msg = "dot product computed";
+    console_log(msg.ptr, msg.len);
+
+    wasm {
+        nop
+    }
+
+    return result;
+}
