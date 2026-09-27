@@ -26,6 +26,7 @@ node tests/run.mjs                    # run the test suite
 | [`examples/dot_product.ph`](examples/dot_product.ph) | SIMD dot product with a bump arena and WASM exports |
 | [`examples/shapes.ph`](examples/shapes.ph) | Tagged unions, `match`, errors, inline WASM |
 | [`examples/generics.ph`](examples/generics.ph) | Generic functions and types, constraints, const parameters |
+| [`examples/c_interop/`](examples/c_interop/stats.ph) | A Phalange library called from C through a generated header |
 | [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |
 | [`std/`](std/README.md) | Standard library: `mem`, `vec`, `hash`, `map`, `matrix`, `io`, `net` |
 | [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native_host.c`) |

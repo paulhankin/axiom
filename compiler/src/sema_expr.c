@@ -997,7 +997,43 @@ static bool mentions(Type *t, Type **vars, int nv) {
     return false;
 }
 
+// Arguments in the variadic part of a C call undergo C's default argument
+// promotions, so only already-promoted types are accepted (spec §15.5).
+static void check_vararg(Expr **pe) {
+    Type *t = check_expr(*pe, NULL);
+    if (t->kind == TY_UNTYPED_INT) {
+        coerce(pe, fits_type((*pe)->cval, t_i32) ? t_i32 : t_i64);
+        return;
+    }
+    if (t->kind == TY_UNTYPED_FLOAT) {
+        coerce(pe, t_f64);
+        return;
+    }
+    bool ok = (t->kind == TY_INT && t->bits >= 32) || (t->kind == TY_FLOAT && t->bits == 64) || t->kind == TY_PTR ||
+              t->kind == TY_FN || t->kind == TY_INVALID;
+    if (ok) return;
+    Diag *d = diag_error((*pe)->span, "E0824",
+                         "C variadic arguments must be i32, u32, i64, u64, isize, usize, f64 or pointers "
+                         "(C's default argument promotions); found %s",
+                         type_str(t));
+    if (t->kind == TY_INT || t->kind == TY_FLOAT) {
+        SourceFile *f = g_files.data[(*pe)->span.file];
+        const char *txt = arena_strndup(f->text + (*pe)->span.start, (*pe)->span.end - (*pe)->span.start);
+        const char *to = t->kind == TY_FLOAT ? "f64" : (t->kind == TY_INT && t->is_signed) ? "i32" : "u32";
+        DiagFix *fx = diag_fix(d, "apply the promotion explicitly", "machine");
+        diag_fix_edit(fx, (*pe)->span, arena_printf("@as(%s, %s)", to, txt));
+    }
+}
+
 static void check_args_count(Expr *e, int want, Decl *fn) {
+    if (fn && fn->variadic) {
+        if (e->args.len < want) {
+            Diag *d = diag_error(e->span, "E0420", "expected at least %d argument%s, found %d", want, want == 1 ? "" : "s",
+                                 e->args.len);
+            diag_note(d, fn->name_span, "'%s' declared here", fn->name);
+        }
+        return;
+    }
     if (e->args.len != want) {
         Diag *d = diag_error(e->span, "E0420", "expected %d argument%s, found %d", want, want == 1 ? "" : "s",
                              e->args.len);
@@ -1036,7 +1072,8 @@ static Type *check_call(Expr *e, Type *expected) {
         int nargs = e->args.len < nparams ? e->args.len : nparams;
         for (int i = 0; i < e->args.len; i++) {
             if (i >= nparams) {
-                check_expr(e->args.data[i], NULL);
+                if (fn->variadic) check_vararg(&e->args.data[i]);
+                else check_expr(e->args.data[i], NULL);
                 continue;
             }
             Type *pt = type_subst(fn->param_types[first + i], owner_from, owner_to, nowner);

@@ -457,8 +457,14 @@ static void resolve_fn(Decl *d) {
             diag_error(d->params.data[0].te->span, "E0305", "'self' must have type Self, *Self or *mut Self, found %s",
                        type_str(pt));
     }
+    if (d->extern_c && d->abi && strcmp(d->abi, "C") != 0)
+        diag_error(d->abi_span, "E0306", "unknown ABI \"%s\" (only \"C\" is supported)", d->abi);
+    if (d->variadic && !d->extern_c)
+        diag_error(d->abi_span, "E0307", "'...' (C varargs) is only allowed in extern \"C\" declarations");
+    else if (d->variadic && d->params.len == 0)
+        diag_error(d->abi_span, "E0307", "a variadic C function needs at least one fixed parameter");
     if (d->is_export || d->kind == D_HOST_FN) {
-        const char *what = d->is_export ? "exported" : "imported";
+        const char *what = d->is_export ? "exported" : d->extern_c ? "C" : "imported";
         if (d->gparams.len) diag_error(d->name_span, "E0466", "%s functions cannot be generic", what);
         for (int i = 0; i < d->params.len; i++)
             if (!boundary_type_ok(d->param_types[i], false))

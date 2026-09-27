@@ -15,14 +15,14 @@ static const char *kw_names[] = {
 #undef X
 };
 
-static const char *reserved_future[] = {"async", "await", "comptime", "enum", "extern", "impl", "interface",
+static const char *reserved_future[] = {"async", "await", "comptime", "enum", "impl", "interface",
                                         "null", "test", "trait", "type", "unsafe", "yield"};
 
 const char *tok_kind_name(TokKind k) {
     static const char *punct[] = {
         "+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>",
         "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=",
-        "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", ",", ":", ";", "=>", "->",
+        "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>", "->",
         "(", ")", "{", "}", "[", "]",
     };
     switch (k) {
@@ -402,7 +402,7 @@ TokenVec lex_file(SourceFile *f) {
             const char *s;
             TokKind k;
         } ops[] = {
-            {"+%=", TK_PLUS_PCT_EQ}, {"-%=", TK_MINUS_PCT_EQ}, {"*%=", TK_STAR_PCT_EQ}, {"<<=", TK_SHL_EQ},
+            {"...", TK_ELLIPSIS},    {"+%=", TK_PLUS_PCT_EQ}, {"-%=", TK_MINUS_PCT_EQ}, {"*%=", TK_STAR_PCT_EQ}, {"<<=", TK_SHL_EQ},
             {">>=", TK_SHR_EQ},      {"+%", TK_PLUS_PCT},      {"-%", TK_MINUS_PCT},    {"*%", TK_STAR_PCT},
             {"<<", TK_SHL},          {">>", TK_SHR},           {"==", TK_EQEQ},         {"!=", TK_NE},
             {"<=", TK_LE},           {">=", TK_GE},            {"+=", TK_PLUS_EQ},      {"-=", TK_MINUS_EQ},

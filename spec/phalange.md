@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.4
+**Version:** 0.1-draft.5
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -109,9 +109,9 @@ A lone `_` is the **discard token** (§8.2). It is not an identifier.
 
 ```
 and       as        break     catch     const     continue  defer     else
-error     export    false     fn        for       host      if        import
-in        let       loop      match     mut       not       or        pub
-return    Self      struct    true      union     wasm      while
+error     export    extern    false     fn        for       host      if
+import    in        let       loop      match     mut       not       or
+pub       return    Self      struct    true      union     wasm      while
 ```
 
 **Reserved type names.** These lex as keywords:
@@ -124,7 +124,7 @@ i8x16  u8x16  i16x8  u16x8  i32x4  u32x4  i64x2  u64x2  f32x4  f64x2  v128
 **Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
 `UnsignedInt`, `Float`. These may not be declared as identifiers.
 
-**Reserved for future use:** `async`, `await`, `comptime`, `enum`, `extern`, `impl`,
+**Reserved for future use:** `async`, `await`, `comptime`, `enum`, `impl`,
 `interface`, `null`, `test`, `trait`, `type`, `unsafe`, `yield`.
 
 ### 2.5 Literals
@@ -143,7 +143,9 @@ ESCAPE     ::= "\n" | "\r" | "\t" | "\0" | "\\" | "\"" | "\'" | "\x" HEX HEX | "
 - A character literal has type `u8` and must be ASCII (a `\u{…}` escape above `0x7F` is
   `E0004`).
 - A string literal has type `[]u8`. Its bytes are the UTF-8 encoding of its contents,
-  stored in static read-only data. It has **no** NUL terminator.
+  stored in static read-only data. The slice does not include a terminator, but a NUL
+  byte always follows the literal in memory, so `"text".ptr` is a valid C string
+  (§15.5).
 - A leading `-` is never part of a literal. It is the unary minus operator (§7.5).
 
 ### 2.6 Operators and punctuation
@@ -155,7 +157,7 @@ The lexer uses **maximal munch**. The complete token set is:
 &   |   ^   ~   <<  >>
 ==  !=  <   <=  >   >=
 =   +=  -=  *=  /=  %=  +%= -%= *%= &=  |=  ^=  <<= >>=
-!   .   ..  ,   :   ;   =>  ->  @
+!   .   ..  ... ,   :   ;   =>  ->  @
 (   )   {   }   [   ]
 ```
 
@@ -191,6 +193,7 @@ Module        ::= TopDecl* EOF
 TopDecl       ::= ImportDecl
                 | ErrorDecl
                 | "pub"? Item
+                | "pub"? ExternDecl
                 | "export" FnDecl
 
 Item          ::= StructDecl | UnionDecl | FnDecl | ConstDecl | GlobalDecl
@@ -198,6 +201,10 @@ Item          ::= StructDecl | UnionDecl | FnDecl | ConstDecl | GlobalDecl
 ImportDecl    ::= "import" ( STRING_LIT "as" IDENT ";"
                            | "host" STRING_LIT? "{" HostFnDecl* "}" )
 HostFnDecl    ::= "fn" IDENT "(" ParamList? ")" Type ";"
+
+ExternDecl    ::= "extern" STRING_LIT STRING_LIT? "{" ExternFnDecl* "}"   (* §15.5 *)
+ExternFnDecl  ::= "fn" IDENT "(" ExternParams? ")" Type ";"
+ExternParams  ::= Param ( "," Param )* ( "," "..." )?
 
 ErrorDecl     ::= "error" "{" IDENT ( "," IDENT )* ","? "}"
 
@@ -1525,6 +1532,98 @@ index or wrong signature traps (`T0009`).
 
 ---
 
+### 15.5 C foreign function interface
+
+Phalange calls C, and C calls Phalange, with no glue code on either side.
+
+#### 15.5.1 Calling C
+
+```phalange
+extern "C" {
+    fn strlen(s: *u8) usize;
+    fn snprintf(buf: *mut u8, n: usize, fmt: *u8, ...) i32;
+    fn qsort(base: *mut void, n: usize, size: usize, cmp: fn(*void, *void) i32) void;
+}
+
+extern "C" "m" {          // optional second string: a library to link (-lm)
+    fn cos(x: f64) f64;
+}
+```
+
+- The ABI string must be `"C"` (`E0306`). The functions are ordinary C symbols,
+  resolved by the linker. `pub extern "C" { … }` makes them visible to importing
+  modules.
+- On **native targets** they link against object files, libraries and libc as usual.
+- On **WebAssembly** they link against C compiled for the same wasm target. C code
+  and Phalange code share the linear memory, the stack and the function table, so
+  pointers mean the same thing on both sides. Freestanding wasm has no libc unless one
+  is linked, for example wasi-libc.
+- `...` declares a **variadic** function. It is allowed only in `extern "C"`
+  (`E0307`), and only after at least one fixed parameter. The variadic arguments
+  undergo C's default argument promotions, and Phalange requires them to already have
+  a promoted type. They must be `i32`, `u32`, `i64`, `u64`, `isize`, `usize`, `f64`,
+  a pointer or a function pointer (`E0824`, with a fix that inserts the `@as`).
+  Untyped literals become `i32` (or `i64` if they don't fit) and `f64`.
+
+#### 15.5.2 Calling Phalange from C
+
+Every `export fn` is a C function with the same name. The one exception is `main` on
+WebAssembly, which C code cannot call. The compiler
+writes a C header for them with `--emit-header=<path>`. The header contains:
+
+- a prototype for every export, using `<stdint.h>` types and `const` for immutable
+  pointers;
+- a definition of every struct reachable from those signatures, with a
+  `_Static_assert` on its size;
+- a check of the target's pointer size, because layouts are target-specific.
+
+It compiles as C11 and as C++.
+
+#### 15.5.3 Types at the boundary
+
+| Phalange | C |
+|---|---|
+| `i8` … `i64`, `u8` … `u64` | `int8_t` … `uint64_t` (`int` is `i32` on every supported target) |
+| `isize`, `usize` | `ptrdiff_t` / `long`, `size_t` / `unsigned long` |
+| `f32`, `f64`, `bool` | `float`, `double`, `bool` |
+| `*T`, `*mut T` | `const T *`, `T *` (`*void` is `const void *`) |
+| `fn(A, B) R` | `R (*)(A, B)` |
+| SIMD types | `__attribute__((vector_size(16)))` vectors |
+
+**Structs cross the boundary by pointer only.** Phalange's struct layout rules (§5.9)
+are C's natural layout rules, so a `*Point` is a valid `Point *` in C. The header's
+`_Static_assert`s check this. Passing structs *by value* depends on each platform's C
+calling convention, and is not supported in v0.1 (`E0801`). Slices, error unions,
+tagged unions and `error` also can't appear in boundary signatures directly. Inside
+structs, a slice appears in C as `struct { const T *ptr; size_t len; }`. Tagged and
+error unions appear as opaque byte arrays of the right size and alignment, since C has
+no equivalent.
+
+**Small integers and `bool`** are sign- or zero-extended as C requires, on every
+function and every indirect call. Any Phalange function whose signature uses only
+boundary types can therefore be passed to C as a callback, with no annotation.
+
+#### 15.5.4 NULL and C strings
+
+- Phalange pointers are non-nullable, but C returns NULL. Check pointers that come from
+  C with `std/c.is_null` / `is_null_void`. Phalange never checks for NULL implicitly.
+- `std/c` provides `from_cstr` (a C string viewed as `[]u8`), `to_cstr` (a copy with a
+  NUL terminator) and `null_ptr`.
+- Because a NUL follows every string literal (§2.5), `"%d\n".ptr` can be passed directly
+  as a C format string.
+
+#### 15.5.5 The safety boundary
+
+The zero-undefined-behavior guarantee covers Phalange code. **C code, and whatever it
+does to memory, is outside it.** A C function that writes out of bounds or frees memory
+twice can corrupt the Phalange program, just as it could corrupt any C program. The
+`extern "C"` block is the visible marker of that boundary.
+
+- On WebAssembly, the damage is confined to the module's linear memory, like
+  everything else.
+- On native targets, Phalange's pointers are real addresses (see the compiler README),
+  which is what makes pointers interchangeable with C at no cost.
+
 ## 16. Standard Library Core
 
 Only the parts that the language semantics depend on are specified here.
@@ -1745,8 +1844,11 @@ Initial registry, not exhaustive:
 | E0650 | Undeclared error name |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |
+| E0306 | Unknown ABI in `extern` (only `"C"`) |
+| E0307 | `...` outside `extern "C"`, or with no fixed parameter |
 | E0801 | Type not allowed at the export or import boundary |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
+| E0824 | C variadic argument without a promoted type |
 | E0901 | Forbidden instruction in inline WASM |
 
 ### 17.4 Runtime trap reporting
@@ -2012,6 +2114,8 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C22 | For `!void`, a `catch` block may complete normally ("handle and continue") | Found while writing the standard library: without it, `f() catch \|e\| { log(e); }` could not be written |
 | C23 | Shared-memory threads (library-level), a race-tolerant memory model, and sequentially consistent atomic builtins (§12.8) | The user asked for threads and concurrency. §12.8.1 gives the reasoning |
 | C24 | Function pointers are allowed across the export/import boundary | Needed by `ph_thread_spawn`. On WebAssembly they are table indices |
+| C25 | C FFI: `extern "C"` blocks with varargs and libraries; `export fn` is C-callable; generated headers (§15.5) | The user asked for a C FFI in both directions |
+| C26 | A NUL byte follows every string literal (not part of the slice) | Found while testing the FFI: passing `"%s".ptr` to C read past the end of the literal |
 
 ---
 
@@ -2063,8 +2167,16 @@ Each question is followed by the options and the current leaning.
      advisory at first, as a lint.
    - **Thread-local storage.** It needs a TLS base per WebAssembly instance.
    - **64-bit `wait`/`notify`.**
-10. **Native-target pointers and FFI.** The linear-memory model makes calling C code awkward.
-    An `extern` boundary with explicit marshalling may be needed.
+10. **FFI follow-ups** (the FFI itself is §15.5):
+    - **Structs by value.** This needs each platform's C calling convention (x86-64
+      SysV, AArch64, the wasm C ABI) implemented in the compiler.
+    - **Native memory sandboxing vs. FFI.** A bounds-checked linear-memory region on
+      native targets (§12.1) would make Phalange pointers offsets rather than
+      addresses, which C can't use directly. Marshalling at the `extern` boundary
+      would then be needed.
+    - **Importing C headers** (`import c "stdio.h"`). This would need a C parser, which
+      conflicts with "context-compact". Generating `extern` blocks with a separate
+      tool is the likelier path.
 11. **Test blocks.** A `test "name" { … }` construct with `phalange test --format=agent-json`.
 12. **Loop labels.** v0.1 has none.
 13. **Relaxed SIMD.** Allow it in inline WASM with implementation-defined results, or forbid

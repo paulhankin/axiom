@@ -15,6 +15,7 @@
     X(ELSE, "else")          \
     X(ERROR, "error")        \
     X(EXPORT, "export")      \
+    X(EXTERN, "extern")      \
     X(FALSE, "false")        \
     X(FN, "fn")              \
     X(FOR, "for")            \
@@ -94,7 +95,7 @@ typedef enum TokKind {
     TK_EQ, TK_PLUS_EQ, TK_MINUS_EQ, TK_STAR_EQ, TK_SLASH_EQ, TK_PERCENT_EQ,
     TK_PLUS_PCT_EQ, TK_MINUS_PCT_EQ, TK_STAR_PCT_EQ,
     TK_AMP_EQ, TK_PIPE_EQ, TK_CARET_EQ, TK_SHL_EQ, TK_SHR_EQ,
-    TK_BANG, TK_DOT, TK_DOTDOT, TK_COMMA, TK_COLON, TK_SEMI, TK_FATARROW, TK_ARROW,
+    TK_BANG, TK_DOT, TK_DOTDOT, TK_ELLIPSIS, TK_COMMA, TK_COLON, TK_SEMI, TK_FATARROW, TK_ARROW,
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE, TK_LBRACKET, TK_RBRACKET,
     // inline-wasm mode
     TK_WASM_WORD,   // instruction name or immediate, raw text

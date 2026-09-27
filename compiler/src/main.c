@@ -11,7 +11,9 @@
 //   --emit=exe|obj|llvm|asm    output kind (default: exe = .wasm module / native executable)
 //   --format=human|agent-json  diagnostic format
 //   --std=<dir>                standard library directory
-//   --link=<file>             extra object/C file to link (repeatable)
+//   --link=<file>              extra C source, object or library to link (repeatable)
+//   -l<lib> -L<dir> -I<dir>    C libraries, library and include directories
+//   --emit-header=<path>       write a C header for the exported functions
 //   -o <path>                  output path
 #include <limits.h>
 #include <spawn.h>
@@ -20,6 +22,7 @@
 
 #include "codegen.h"
 #include "diag.h"
+#include "header.h"
 #include "sema.h"
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void);
@@ -105,6 +108,9 @@ int main(int argc, char **argv) {
     bool json = false;
     CgOptions co = {0};
     Vec(char *) link_inputs = {0};
+    Vec(char *) link_flags = {0};  // -l / -L
+    Vec(char *) inc_flags = {0};   // -I, for C sources
+    const char *header_path = NULL;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
@@ -119,6 +125,9 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--std=", 6)) std_dir = a + 6;
         else if (!strncmp(a, "--cpu=", 6)) co.cpu = a + 6;
         else if (!strncmp(a, "--link=", 7)) vec_push(link_inputs, (char *)a + 7);
+        else if (!strncmp(a, "--emit-header=", 14)) header_path = a + 14;
+        else if ((a[1] == 'l' || a[1] == 'L') && a[0] == '-' && a[2]) vec_push(link_flags, (char *)a);
+        else if (a[0] == '-' && a[1] == 'I' && a[2]) vec_push(inc_flags, (char *)a);
         else if (a[0] == '-') {
             diag_emit_fatal(json, "E9001", arena_printf("unknown option '%s'", a));
             return 2;
@@ -150,6 +159,18 @@ int main(int argc, char **argv) {
     types_init();
     SemaOptions so = {.std_dir = std_dir ? std_dir : find_std(argv[0])};
     bool ok = sema_run(input, &so);
+    if (ok && header_path) {
+        const char *base = strrchr(input, '/');
+        if (!emit_c_header(header_path, base ? base + 1 : input)) {
+            diag_emit_fatal(json, "E9005", arena_printf("cannot write %s", header_path));
+            return 2;
+        }
+        // C sources may include the generated header
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s", header_path);
+        char *sl = strrchr(dir, '/');
+        vec_push(inc_flags, sl ? arena_printf("-I%.*s", (int)(sl - dir), dir) : "-I.");
+    }
     if (!ok || !build) {
         diag_emit(json, json ? stdout : stderr);
         return ok ? 0 : 1;
@@ -217,17 +238,54 @@ int main(int argc, char **argv) {
             }
             for (int i = 0; i < g_export_names.len; i++) vec_push(av, arena_printf("--export=%s", g_export_names.data[i]));
             vec_push(av, objpath);
-            for (int i = 0; i < link_inputs.len; i++) vec_push(av, link_inputs.data[i]);
+            // C sources are compiled for wasm and linked into the same module
+            // (they share the linear memory and the stack).
+            Vec(char *) c_objs = {0};
+            rc = 0;
+            for (int i = 0; i < link_inputs.len && rc == 0; i++) {
+                const char *in = link_inputs.data[i];
+                size_t n = strlen(in);
+                if (n > 2 && !strcmp(in + n - 2, ".c")) {
+                    const char *cc_names[] = {"clang", "clang-18", "/usr/lib/llvm-18/bin/clang", NULL};
+                    const char *clang = find_tool(cc_names);
+                    if (!clang) {
+                        unlink(objpath);
+                        diag_emit_fatal(json, "E9003", "cannot find clang to compile C sources for wasm");
+                        return 2;
+                    }
+                    char *cobj = arena_printf("%s.c%d.%d.o", out, i, (int)getpid());
+                    Vec(char *) cv = {0};
+                    vec_push(cv, (char *)clang);
+                    vec_push(cv, g_target.ptr_bits == 64 ? "--target=wasm64-unknown-unknown" : "--target=wasm32-unknown-unknown");
+                    const char *copts[] = {"-O2", "-c", "-ffreestanding", "-mbulk-memory", "-msimd128", "-matomics",
+                                           "-mnontrapping-fptoint", "-msign-ext", "-mmutable-globals"};
+                    for (size_t k = 0; k < sizeof copts / sizeof *copts; k++) vec_push(cv, (char *)copts[k]);
+                    for (int k = 0; k < inc_flags.len; k++) vec_push(cv, inc_flags.data[k]);
+                    vec_push(cv, (char *)in);
+                    vec_push(cv, "-o");
+                    vec_push(cv, cobj);
+                    vec_push(cv, NULL);
+                    rc = run(cv.data);
+                    vec_push(c_objs, cobj);
+                    vec_push(av, cobj);
+                } else {
+                    vec_push(av, (char *)in);
+                }
+            }
+            for (int i = 0; i < link_flags.len; i++) vec_push(av, link_flags.data[i]);
+            for (int i = 0; i < g_link_libs.len; i++) vec_push(av, arena_printf("-l%s", g_link_libs.data[i]));
             vec_push(av, "-o");
             vec_push(av, (char *)out);
             vec_push(av, NULL);
-            rc = run(av.data);
+            if (rc == 0) rc = run(av.data);
+            for (int i = 0; i < c_objs.len; i++) unlink(c_objs.data[i]);
         } else {
             // Programs that use the Phalange host ABI (std/io, std/net) get the
             // native implementation of it linked in.
             bool uses_host_abi = false;
             for (int i = 0; i < g_prog.host_fns.len; i++)
-                if (!strcmp(g_prog.host_fns.data[i]->host_module, "phalange")) uses_host_abi = true;
+                if (g_prog.host_fns.data[i]->host_module && !strcmp(g_prog.host_fns.data[i]->host_module, "phalange"))
+                    uses_host_abi = true;
             if (uses_host_abi || g_needs_native_runtime) {
                 const char *rt = arena_printf("%s/../runtime/native_host.c", so.std_dir);
                 if (!file_exists(rt)) {
@@ -247,7 +305,10 @@ int main(int argc, char **argv) {
             Vec(char *) av = {0};
             vec_push(av, (char *)cc);
             vec_push(av, objpath);
+            for (int i = 0; i < inc_flags.len; i++) vec_push(av, inc_flags.data[i]);
             for (int i = 0; i < link_inputs.len; i++) vec_push(av, link_inputs.data[i]);
+            for (int i = 0; i < link_flags.len; i++) vec_push(av, link_flags.data[i]);
+            for (int i = 0; i < g_link_libs.len; i++) vec_push(av, arena_printf("-l%s", g_link_libs.data[i]));
             vec_push(av, "-o");
             vec_push(av, (char *)out);
             vec_push(av, "-lm");

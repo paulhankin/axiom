@@ -928,6 +928,11 @@ static void parse_generic_params(Parser *P, Decl *d) {
 static void parse_params(Parser *P, Decl *d) {
     expect(P, TK_LPAREN);
     while (pk(P) != TK_RPAREN && pk(P) != TK_EOF) {
+        if (pk(P) == TK_ELLIPSIS) {  // C varargs; only valid in extern "C" (checked by sema)
+            d->variadic = true;
+            d->abi_span = advance(P)->span;
+            break;
+        }
         Param p = {0};
         p.name = expect_ident(P, &p.span);
         expect(P, TK_COLON);
@@ -1034,6 +1039,35 @@ static void parse_top(Parser *P) {
         return;
     }
     bool is_pub = accept(P, KW_PUB);
+    if (pk(P) == KW_EXTERN) {
+        // ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" ExternFn* "}"
+        advance(P);
+        Token *abi = expect(P, TK_STRING);
+        Sym abi_s = abi->kind == TK_STRING ? intern(abi->str.bytes, abi->str.len) : intern_cstr("C");
+        Sym lib = NULL;
+        if (pk(P) == TK_STRING) {
+            Token *l = advance(P);
+            lib = intern(l->str.bytes, l->str.len);
+        }
+        expect(P, TK_LBRACE);
+        while (pk(P) == KW_FN) {
+            Span fs = advance(P)->span;
+            Decl *d = new_decl(P, D_HOST_FN, fs);
+            d->extern_c = true;
+            d->is_pub = is_pub;
+            d->abi = abi_s;
+            d->abi_span = abi->span;
+            d->link_lib = lib;
+            d->name = expect_ident(P, &d->name_span);
+            parse_params(P, d);
+            d->ret_te = parse_type(P);
+            expect(P, TK_SEMI);
+            d->span = sp_from(P, fs);
+            vec_push(P->mod->decls, d);
+        }
+        expect(P, TK_RBRACE);
+        return;
+    }
     switch (pk(P)) {
     case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
     case KW_STRUCT: {

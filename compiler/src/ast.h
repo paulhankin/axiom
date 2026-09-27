@@ -301,7 +301,12 @@ struct Decl {
     Sym import_path;
     Span import_path_span;
     Module *imported;
-    Sym host_module;
+    Sym host_module;   // D_HOST_FN from `import host "mod"`; NULL for extern "C"
+    bool extern_c;     // declared in an extern "C" block
+    bool variadic;     // C varargs: `...` after the fixed parameters
+    Sym link_lib;      // extern "C" "lib": library to link
+    Sym abi;
+    Span abi_span;
     Vec(Sym) error_names;
     Vec(Span) error_spans;
 

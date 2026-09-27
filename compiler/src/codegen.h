@@ -20,6 +20,8 @@ bool codegen_program(CgOptions *o);
 
 // Names of exported functions (for the linker).
 extern SymVec g_export_names;
+// Libraries named by extern "C" "lib" blocks (for the linker).
+extern SymVec g_link_libs;
 
 // Set before codegen: the program spawns threads (wasm: shared memory and a
 // thread entry export).

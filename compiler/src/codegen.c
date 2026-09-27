@@ -19,6 +19,7 @@
 bool is_place(Expr *e);
 
 SymVec g_export_names;
+SymVec g_link_libs;
 bool g_threads;
 
 static CgOptions *O;
@@ -76,6 +77,7 @@ static void gen_stmt(Stmt *s);
 static void gen_block(Stmt *b);
 static LLVMTypeRef lty(Type *t);
 static FnInst *get_inst(Decl *d, Type **gargs, int n);
+static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
 static LLVMValueRef gen_wasm(WasmInstrVec *ins, Type *result);
 
 static Type *ct(Type *t) {
@@ -333,8 +335,10 @@ static LLVMValueRef string_ptr(const char *bytes, uint32_t len) {
     Sym key = intern(bytes, len);
     LLVMValueRef g = symmap_get(&string_globals, key);
     if (!g) {
-        LLVMValueRef init = LLVMConstStringInContext(ctx, bytes, len, true);
-        g = LLVMAddGlobal(mod, LLVMArrayType2(T_i8, len), ".str");
+        // A NUL follows every literal (not part of the slice), so that
+        // "text".ptr is a valid C string (spec §2.5).
+        LLVMValueRef init = LLVMConstStringInContext(ctx, bytes, len, false);
+        g = LLVMAddGlobal(mod, LLVMArrayType2(T_i8, (uint64_t)len + 1), ".str");
         LLVMSetInitializer(g, init);
         LLVMSetLinkage(g, LLVMPrivateLinkage);
         LLVMSetGlobalConstant(g, true);
@@ -491,7 +495,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         // On wasm the symbol gets a private name and the export name comes
         // from the wasm-export-name attribute: LLVM treats a symbol called
         // `main` specially on wasm (it would add a second `main` export).
-        name = g_target.wasm ? arena_printf("phalange.export.%s", d->name) : d->name;
+        name = g_target.wasm && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
         vec_push(g_export_names, intern_cstr(name));
     } else {
         CharVec nb = {0};
@@ -526,10 +530,19 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         name = arena_strndup(nb.data, strlen(nb.data));
         free(nb.data);
     }
+    if (d->variadic) {
+        unsigned np = LLVMCountParamTypes(fi->llty);
+        LLVMTypeRef *pts = NEWN(LLVMTypeRef, np + 1);
+        LLVMGetParamTypes(fi->llty, pts);
+        fi->llty = LLVMFunctionType(LLVMGetReturnType(fi->llty), pts, np, true);
+    }
     LLVMValueRef existing = d->kind == D_HOST_FN ? LLVMGetNamedFunction(mod, name) : NULL;
     fi->fn = existing ? existing : LLVMAddFunction(mod, name, fi->llty);
+    add_ext_attrs(fi->fn, fi->fnty, fi->sret, false);
     if (d->kind == D_HOST_FN) {
-        if (g_target.wasm) {
+        if (d->extern_c) {
+            if (d->link_lib) vec_push(g_link_libs, d->link_lib);
+        } else if (g_target.wasm) {
             LLVMAddAttributeAtIndex(fi->fn, LLVMAttributeFunctionIndex,
                                     LLVMCreateStringAttribute(ctx, "wasm-import-module", 18, d->host_module,
                                                               (unsigned)strlen(d->host_module)));
@@ -549,6 +562,27 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
     }
     symmap_put(&inst_map, k, fi);
     return fi;
+}
+
+// C ABI detail: integers narrower than 32 bits and bool are passed and
+// returned sign- or zero-extended. Marking every function (and indirect call)
+// this way makes any Phalange function with a scalar signature callable from
+// C, and C function pointers callable from Phalange (spec §15.5).
+static void ext_attr(LLVMValueRef v, unsigned idx, Type *t, bool is_call) {
+    const char *kind = NULL;
+    if (t->kind == TY_BOOL) kind = "zeroext";
+    else if (t->kind == TY_INT && t->bits < 32) kind = t->is_signed ? "signext" : "zeroext";
+    if (!kind) return;
+    LLVMAttributeRef a = LLVMCreateEnumAttribute(ctx, LLVMGetEnumAttributeKindForName(kind, strlen(kind)), 0);
+    if (is_call) LLVMAddCallSiteAttribute(v, idx, a);
+    else LLVMAddAttributeAtIndex(v, idx, a);
+}
+
+static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call) {
+    if (!sret && fnty->ret->kind != TY_VOID) ext_attr(v, LLVMAttributeReturnIndex, fnty->ret, is_call);
+    unsigned first = sret ? 2 : 1;
+    for (int i = 0; i < fnty->nparams; i++)
+        if (!by_ptr(fnty->params[i])) ext_attr(v, first + (unsigned)i, fnty->params[i], is_call);
 }
 
 static Type **subst_gargs(Type **g, int n) {
@@ -901,6 +935,7 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
     }
     for (int i = 0; i < argc; i++) av[k++] = by_ptr(argt[i]) ? spill(argt[i], argv[i]) : argv[i];
     LLVMValueRef r = LLVMBuildCall2(B, fty, fn, av, (unsigned)n, "");
+    add_ext_attrs(r, fnty, sret, true);
     if (sret) return load(fnty->ret, ret_tmp, false);
     if (fnty->ret->kind == TY_VOID) return NULL;
     return r;
@@ -948,7 +983,13 @@ static LLVMValueRef gen_call(Expr *e) {
         }
     }
     for (int i = 0; i < e->args.len; i++) av[k++] = gen(e->args.data[i]);
-    return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, fi->fnty->params);
+    Type **argt = fi->fnty->params;
+    if (d->variadic) {  // types of the extra (promoted) arguments
+        argt = NEWN(Type *, n + 1);
+        for (int i = 0; i < n; i++)
+            argt[i] = i < fi->fnty->nparams ? fi->fnty->params[i] : ct(e->args.data[i - (e->b ? 1 : 0)]->type);
+    }
+    return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, argt);
 }
 
 // ---------------------------------------------------------------------------

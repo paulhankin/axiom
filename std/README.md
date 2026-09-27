@@ -13,6 +13,7 @@ Import with `import "std/<module>" as <name>;`. Everything that allocates takes 
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files; `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
 | [`thread`](thread.ph) | `spawn(alloc, f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
 | [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
+| [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
 | [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters); IPv4 parsing/formatting |
 
 ## Conventions

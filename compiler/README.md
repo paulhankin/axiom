@@ -31,7 +31,10 @@ phalange check <file.ph> [options]    parse and type-check only
   --overflow=trap|saturate        default: trap
   --emit=exe|obj|llvm|asm         default exe: a .wasm module or native executable
   --format=human|agent-json       diagnostics format (spec §17.2)
-  --link=<file>                   extra object/C file for the linker (repeatable)
+  --link=<file>                   C source, object or library to link in (repeatable). On wasm, C
+                                  sources are compiled with clang for the same target
+  -l<lib> -L<dir> -I<dir>         C libraries, library directories, include directories
+  --emit-header=<path>            write a C header for the `export fn`s (also works with `check`)
   --std=<dir>                     standard library directory (default: found next to the binary,
                                   or $PHALANGE_STD)
   -o <path>                       output file
@@ -44,6 +47,12 @@ With `--format=agent-json`, stdout holds exactly one JSON object in the spec's
 Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the host ABI
 used by `std/io` and `std/net` and calls the `main` export. Native programs that use
 the host ABI get `runtime/native_host.c` linked in automatically.
+
+**C interop** (spec §15.5):
+- `extern "C" { fn ...; }` calls C. On wasm, the C sources passed with `--link` are
+  compiled to wasm and share the module's memory.
+- `export fn` plus `--emit-header` makes Phalange callable from C. See
+  `examples/c_interop/`.
 
 Programs that use `std/thread` are linked with a shared, imported memory, and export
 `phalange_thread_start`. `runtime/host.mjs` creates the memory and runs each thread as

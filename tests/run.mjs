@@ -6,6 +6,9 @@
 //   // expect-error: E0412     compilation must fail with this code (repeatable)
 //   // flags: --release        extra compiler flags
 //   // wasm-only               skip on the native target
+//   // native-only             skip on wasm
+//   // link: file.c            C source (next to the test) compiled and linked in
+//   // header: name.h          generate a C header for the exports (for the C source)
 //
 // Usage: node tests/run.mjs [--native] [--filter=substr] [-O2]
 import { spawnSync } from 'child_process';
@@ -27,7 +30,7 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], flags: [], wasmOnly: false };
+  const d = { expect: [], trap: false, errors: [], flags: [], wasmOnly: false, nativeOnly: false, links: [], header: null };
   for (const line of src.split('\n')) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
@@ -35,6 +38,9 @@ function directives(src) {
     else if ((m = line.match(/\/\/ expect-error: (E\d+)/))) d.errors.push(m[1]);
     else if ((m = line.match(/\/\/ flags: (.*)$/))) d.flags.push(...m[1].trim().split(/\s+/));
     else if (/\/\/ wasm-only\b/.test(line)) d.wasmOnly = true;
+    else if (/\/\/ native-only\b/.test(line)) d.nativeOnly = true;
+    else if ((m = line.match(/\/\/ link: (\S+)/))) d.links.push(m[1]);
+    else if ((m = line.match(/\/\/ header: (\S+)/))) d.header = m[1];
   }
   return d;
 }
@@ -89,10 +95,12 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   const name = path.relative(root, f);
   if (filter && !name.includes(filter)) continue;
   const d = directives(fs.readFileSync(f, 'utf8'));
-  if (native && d.wasmOnly) { skip++; continue; }
+  if ((native && d.wasmOnly) || (!native && d.nativeOnly)) { skip++; continue; }
   const out = path.join(tmp, path.basename(f, '.ph') + (native ? '' : '.wasm'));
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
   if (native) args.push('--target=native', `--link=${path.join(root, 'tests/native_rt.c')}`);
+  for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
+  if (d.header) args.push(`--emit-header=${path.join(tmp, d.header)}`);
   const t0 = process.hrtime.bigint();
   const c = spawnSync(compiler, args, { encoding: 'utf8' });
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
