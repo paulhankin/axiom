@@ -17,12 +17,14 @@
 //   -o <path>                  output path
 #include <limits.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "codegen.h"
 #include "diag.h"
 #include "header.h"
+#include "package.h"
 #include "sema.h"
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void);
@@ -31,13 +33,18 @@ extern char **environ;
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: phalange <build|check|test> <file.ph> [options]\n"
+            "usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n"
+            "       phalange new <name>      create a package skeleton\n"
             "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
 }
 
 static bool file_exists(const char *p) { return access(p, R_OK) == 0; }
+static bool is_directory(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
 
 static const char *find_std(const char *argv0) {
     const char *env = getenv("PHALANGE_STD");
@@ -271,7 +278,15 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
+    if (argc >= 2 && !strcmp(argv[1], "new")) {
+        bool js = argc >= 4 && !strcmp(argv[3], "--format=agent-json");
+        if (argc < 3) {
+            usage();
+            return 2;
+        }
+        return pkg_new(argv[2], js) ? 0 : 1;
+    }
+    if (argc < 2) {
         usage();
         return 2;
     }
@@ -319,9 +334,26 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!input) {
-        diag_emit_fatal(json, "E9001", "no input file");
-        return 2;
+    // A package directory (or none: the current directory) builds the
+    // package's entry module; `test` also loads all of its sources.
+    StrVec pkg_files = {0};
+    if (!input || is_directory(input)) {
+        const char *dir = input ? input : ".";
+        char mf[PATH_MAX];
+        snprintf(mf, sizeof mf, "%s/phalange.toml", dir);
+        if (!file_exists(mf)) {
+            diag_emit_fatal(json, "E9001", input ? arena_printf("'%s' is a directory without a phalange.toml", input)
+                                                 : "no input file (and no phalange.toml in the current directory)");
+            return 2;
+        }
+        Package *pk = pkg_load_dir(dir, NULL);
+        if (diag_error_count() || !pk) {
+            diag_emit(json, json ? stdout : stderr);
+            return 1;
+        }
+        input = pk->entry;
+        if (testing) pkg_source_files(pk, &pkg_files);
+        if (!out && !testing) out = arena_printf("%s%s", pk->name, !strcmp(target, "native") ? "" : ".wasm");
     }
     if (!strcmp(target, "wasm32") || !strcmp(target, "wasm32-freestanding")) {
         g_target = (Target){32, true, "wasm32-unknown-unknown"};
@@ -339,7 +371,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     types_init();
-    SemaOptions so = {.std_dir = std_dir ? std_dir : find_std(argv[0])};
+    SemaOptions so = {.std_dir = std_dir ? std_dir : find_std(argv[0]),
+                      .extra_files = (const char *const *)pkg_files.data,
+                      .n_extra_files = pkg_files.len};
     bool ok = sema_run(input, &so);
     if (ok && header_path) {
         const char *base = strrchr(input, '/');

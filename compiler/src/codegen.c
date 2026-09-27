@@ -582,7 +582,8 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         // On wasm the symbol gets a private name and the export name comes
         // from the wasm-export-name attribute: LLVM treats a symbol called
         // `main` specially on wasm (it would add a second `main` export).
-        name = g_target.wasm && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
+        // Test binaries bring their own `main` (the test driver).
+        name = (g_target.wasm || g_test_mode) && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
         vec_push(g_export_names, intern_cstr(name));
     } else {
         CharVec nb = {0};

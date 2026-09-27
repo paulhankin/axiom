@@ -18,7 +18,7 @@ import os from 'os';
 import { createHost } from '../runtime/host.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const compiler = process.env.PHALANGE || path.join(root, 'compiler/build/phalange');
+const compiler = path.resolve(process.env.PHALANGE || path.join(root, 'compiler/build/phalange'));
 const argv = process.argv.slice(2);
 const native = argv.includes('--native');
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
@@ -72,7 +72,7 @@ async function runWasm(file) {
   mem = instance.exports.memory;
   const lines = () => { const o = text.split('\n'); if (o[o.length - 1] === '') o.pop(); return o; };
   try {
-    instance.exports.run();
+    (instance.exports.run || instance.exports.main)();
     return { out: lines(), trapped: false };
   } catch (e) {
     if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) return { out: lines(), trapped: true, msg: e.message };
@@ -155,6 +155,91 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
   if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
   else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
+}
+
+// Packages (spec §4.6): builds from a package directory, dependency
+// visibility, name conflicts, manifests, git dependencies, `phalange new`.
+{
+  const pk = path.join(root, 'tests/packages');
+  const env = { ...process.env, PHALANGE_CACHE: path.join(tmp, 'cache') };
+  const ph = (args, cwd) => spawnSync(compiler, [...args, ...extraFlags], { encoding: 'utf8', cwd: cwd || root, env });
+  const git = (args, cwd) => spawnSync('git', args, { encoding: 'utf8', cwd,
+    env: { ...env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  const tgt = native ? ['--target=native'] : [];
+  async function buildRun(dir, cwd) {
+    const out = path.join(tmp, 'pkg-' + path.basename(dir) + (native ? '' : '.wasm'));
+    const c = ph(['build', dir, '--format=agent-json', '-o', out, ...tgt], cwd);
+    if (c.status !== 0) return { problem: `compilation failed:\n${c.stdout}${c.stderr}` };
+    const r = native ? runNative(out) : await runWasm(out);
+    return { out: r.out.join('\n'), trapped: r.trapped };
+  }
+  function tested(dir, cwd) {
+    const c = ph(['test', dir, '--format=agent-json', ...tgt], cwd);
+    try { return JSON.parse(c.stdout); } catch { return { status: 'bad', output: c.stdout + c.stderr, tests: [] }; }
+  }
+  function errorCodes(dir) {
+    const c = ph(['check', dir, '--format=agent-json']);
+    try { return JSON.parse(c.stdout).diagnostics.map((x) => x.code); } catch { return [`bad output: ${c.stdout}${c.stderr}`]; }
+  }
+  const names = (j) => j.tests.map((t) => t.name).sort().join(',');
+  const cases = {
+    'build and run app': async () => {
+      const r = await buildRun(path.join(pk, 'app'));
+      return r.problem || (r.out !== '81 100 5 20' ? `output: ${r.out}` : null);
+    },
+    'test runs only the root package': async () => {
+      const j = tested('.', path.join(pk, 'app'));
+      return j.status === 'pass' && names(j) === 'app uses mathlib' ? null : JSON.stringify(j);
+    },
+    'test loads every source of the package': async () => {
+      const j = tested(path.join(pk, 'mathlib'));
+      return j.status === 'pass' && names(j) === 'square,sum' ? null : JSON.stringify(j);
+    },
+    'undeclared dependency': async () => (errorCodes(path.join(pk, 'errors/undeclared')).includes('E0214') ? null : errorCodes(path.join(pk, 'errors/undeclared')).join()),
+    'package name conflict': async () => (errorCodes(path.join(pk, 'errors/conflict')).includes('E0213') ? null : 'no E0213'),
+    'invalid manifest': async () => {
+      const c = errorCodes(path.join(pk, 'errors/badmanifest'));
+      return c.length === 3 && c.every((x) => x === 'E0215') ? null : c.join();
+    },
+    'git dependency': async () => {
+      const repo = path.join(tmp, 'gitutil');
+      fs.cpSync(path.join(pk, 'util'), repo, { recursive: true });
+      for (const a of [['init', '-q'], ['add', '.'], ['commit', '-q', '-m', 'util']]) {
+        const r = git(a, repo);
+        if (r.status !== 0) return `git ${a[0]}: ${r.stderr}`;
+      }
+      const rev = git(['rev-parse', 'HEAD'], repo).stdout.trim();
+      const app = path.join(tmp, 'gitapp');
+      fs.mkdirSync(path.join(app, 'src'), { recursive: true });
+      const manifest = (r) => `[package]\nname = "gitapp"\n\n[dependencies]\nutil = { git = "${repo}", rev = "${r}" }\n`;
+      fs.writeFileSync(path.join(app, 'phalange.toml'), manifest(rev));
+      fs.writeFileSync(path.join(app, 'src/main.ph'),
+        'import "pkg:util" as util;\nimport "std/io" as io;\n\nexport fn main() i32 {\n' +
+        '    io.stdout().print_i64(util.clamp(42, 0, 7)) catch return 1;\n    return 0;\n}\n');
+      for (let i = 0; i < 2; i++) {  // the second build uses the cache
+        const r = await buildRun(app);
+        if (r.problem || r.out !== '7') return r.problem || `output: ${r.out}`;
+      }
+      fs.writeFileSync(path.join(app, 'phalange.toml'), manifest('0'.repeat(40)));
+      const codes = errorCodes(app);
+      return codes.includes('E0216') ? null : `bad rev: ${codes.join()}`;
+    },
+    'phalange new': async () => {
+      const c = ph(['new', 'fresh'], tmp);
+      if (c.status !== 0) return `status ${c.status}: ${c.stdout}${c.stderr}${c.error || ''}`;
+      const j = tested('.', path.join(tmp, 'fresh'));
+      return j.status === 'pass' && names(j) === 'add' ? null : JSON.stringify(j);
+    },
+  };
+  for (const [cname, fn] of Object.entries(cases)) {
+    const name = `packages: ${cname}`;
+    if (filter && !name.includes(filter)) continue;
+    const t0 = process.hrtime.bigint();
+    const problem = await fn();
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
+  }
 }
 
 for (const f of failures) console.log('\n' + f);

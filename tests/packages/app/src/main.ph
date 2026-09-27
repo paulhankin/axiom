@@ -1,0 +1,21 @@
+import "pkg:mathlib" as mathlib;
+import "pkg:mathlib/extra/stats" as stats;
+import "std/io.ph" as io;
+
+export fn main() i32 {
+    let out = io.stdout();
+    let xs: [4]i64 = [2, 4, 6, 8];
+    out.print_i64(mathlib.square(9)) catch return 1;
+    out.print(" ") catch return 1;
+    out.print_i64(mathlib.clamped_square(11)) catch return 1;
+    out.print(" ") catch return 1;
+    out.print_i64(mathlib.mean(xs[..])) catch return 1;
+    out.print(" ") catch return 1;
+    out.print_i64(stats.sum(xs[..])) catch return 1;
+    out.println("") catch return 1;
+    return 0;
+}
+
+test "app uses mathlib" {
+    @expect_eq(mathlib.square(3), 9);
+}

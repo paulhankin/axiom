@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.6
+**Version:** 0.1-draft.7
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -387,7 +387,9 @@ See §14 for the permitted instruction set and typing.
 
 Each `.ph` file is a module. `import "path.ph" as name;` binds `name` to that module's `pub`
 declarations. Paths are relative to the importing file. A path beginning with `std/`
-resolves to the standard library, for example `import "std/mem" as mem;`.
+resolves to the standard library, for example `import "std/mem" as mem;`. A path beginning
+with `pkg:` names a module of another package (§4.6). The `.ph` extension may be left out.
+A path that doesn't resolve to a readable file is `E0211`.
 
 Import cycles are a compile error (`E0210`) in v0.1.
 
@@ -425,6 +427,87 @@ suggests a fresh name.
 
 Inside a `struct` or `union` body, `Self` refers to the enclosing type, both as a type and
 as an expression-level namespace (for example `Self.init(…)` or `Self.{ … }`).
+
+### 4.6 Packages
+
+A **package** is a directory with a `phalange.toml` manifest and its sources under `src/`.
+Packages are the unit of distribution and of dependency management. Modules stay the unit
+of naming and visibility: a package adds no new visibility level, and whatever a
+package's modules mark `pub` is visible to modules that import them.
+
+```
+geometry/
+  phalange.toml
+  src/
+    lib.ph            # entry module: import "pkg:geometry"
+    shapes/circle.ph  # import "pkg:geometry/shapes/circle"
+```
+
+`phalange new <name>` creates this layout, with a manifest, an entry module and a test.
+
+#### 4.6.1 The manifest
+
+The manifest is written in a small subset of TOML: `[section]` headers, `key = "string"`
+pairs, inline tables `{ key = "string", ... }`, and `#` comments. No other TOML syntax
+is accepted.
+
+```toml
+[package]
+name = "geometry"          # required: lower-case letters, digits and '_', not starting with a digit
+version = "0.1.0"          # optional; informational in v0.1
+entry = "src/lib.ph"       # optional; default src/lib.ph if it exists, otherwise src/main.ph
+
+[dependencies]
+vecmath = { path = "../vecmath" }
+json = { git = "https://example.com/json.git", rev = "3f1c2a9d0e5b7c4a8f6e2d1b0c9a8e7f6d5c4b3a" }
+```
+
+- An unknown section, an unknown key, a malformed line, an invalid name, or a duplicate
+  dependency is `E0215`.
+- A dependency's key is the name it is imported by. It MUST equal the `name` in the
+  dependency's own manifest (`E0215`). Packages can't be renamed on import.
+- A **path** dependency is a directory, relative to the manifest's directory. A missing
+  directory, or one without a manifest, is `E0217`.
+- A **git** dependency MUST pin a commit with `rev` (`E0215`). Branches and version ranges
+  aren't accepted, so a manifest names exactly one version of each source and builds are
+  reproducible without a lock file. The toolchain clones the repository once per
+  `(url, rev)` into a cache directory: `$PHALANGE_CACHE`, else
+  `$XDG_CACHE_HOME/phalange`, else `~/.cache/phalange`. A clone or checkout that fails is
+  `E0216`. A cached checkout is never updated in place, because its `rev` can't change.
+
+#### 4.6.2 Imports and visibility between packages
+
+- `import "pkg:name" as x;` imports package `name`'s entry module.
+  `import "pkg:name/sub/mod" as y;` imports `src/sub/mod.ph` of that package.
+- A module may import `pkg:` names only for its **own package** and the package's
+  **direct dependencies**. Anything else is `E0214`, including a dependency of a
+  dependency, and a `pkg:` import from a file that isn't in any package. A dependency
+  that's needed must be listed, so each manifest is a complete list of what the package
+  uses.
+- A module belongs to the package whose manifest is in the nearest directory above it.
+- Relative and `std/` imports work as in §4.1, inside packages too.
+
+#### 4.6.3 One source per name
+
+A build uses **at most one package per name** (`E0213`). If two dependencies (directly
+or through other packages) bring in different directories or commits that are both
+called `util`, the build fails and names both manifests. v0.1 has no version resolution:
+the author settles the conflict by pointing every manifest at the same source.
+
+Dependency cycles between packages are allowed by the manifest rules, but an import
+cycle between their modules is still `E0210`.
+
+#### 4.6.4 Building and testing packages
+
+- `phalange build|check|test <dir>`, or no path at all (meaning the current directory),
+  works on the package in `<dir>`. `build` compiles the entry module. By default the
+  output is named after the package.
+- `phalange test <dir>` loads **every** `.ph` file under the package's `src/`, so tests in
+  modules that the entry module doesn't import still run. Only the root package's tests
+  run; its dependencies' tests don't (§18).
+- Everything a program uses is still compiled together as one unit (§12), so
+  cross-package calls cost the same as calls within a package, and generics monomorphize
+  across packages. Separately compiled package artifacts are future work (Appendix D).
 
 ---
 
@@ -1719,7 +1802,12 @@ phalange check <file.ph>                  # parse and type-check only; no codege
 phalange fmt   <file.ph> [--check]        # canonical formatting; --check exits 1 if not canonical
 phalange run   <file.ph> [--export=name]  # build for wasm32 and execute in the reference runtime
 phalange explain <CODE>                   # long-form documentation for a diagnostic code
+phalange test  <file.ph> [--filter=text] [--timeout=ms]   # run test blocks (§18)
+phalange new   <name>                     # create a package skeleton (§4.6)
 ```
+
+`build`, `check` and `test` also accept a package directory, or no path at all for the
+package in the current directory (§4.6.4).
 
 Every command accepts `--format=human` (the default) or `--format=agent-json`.
 
@@ -1818,6 +1906,12 @@ Initial registry, not exhaustive:
 | E0150 | Operators require parentheses (§7.4) |
 | E0204 | Shadowing |
 | E0210 | Import cycle |
+| E0211 | Imported module not found |
+| E0213 | Two different packages with the same name in one build |
+| E0214 | `pkg:` import of a package that isn't a dependency (or outside any package) |
+| E0215 | Invalid `phalange.toml` |
+| E0216 | Git dependency can't be fetched |
+| E0217 | Package directory or manifest missing |
 | E0410 | Struct literal fields missing or out of order |
 | E0412 | Type mismatch |
 | E0460 | Generic type used without arguments |
@@ -1922,11 +2016,14 @@ test "indexing past the end traps" expect trap(T0001) {
 ### 18.2 Running tests
 
 ```
-phalange test file.ph [--target=wasm32|native] [--filter=text] [--timeout=ms] [--format=agent-json]
+phalange test file.ph|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--format=agent-json]
 ```
 
-- **Which tests run.** The tests in `file.ph` and in every non-standard-library module
-  it imports. Running `phalange test std/vec.ph` tests a standard library module.
+- **Which tests run.** The tests in `file.ph`, plus those of the modules it imports that
+  belong to the same package as `file.ph`, or, outside packages, that are not standard
+  library modules. Given a package directory, the tests of every module in the package
+  (§4.6.4). Dependencies' tests don't run. Running `phalange test std/vec.ph` tests a
+  standard library module.
 - **Isolation.** Each test runs in isolation: a fresh WebAssembly instance in its own
   worker, or a forked process on native targets. A trap, a hang or corrupted memory
   can't affect other tests. Independent tests run in parallel.
@@ -2206,6 +2303,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C25 | C FFI: `extern "C"` blocks with varargs and libraries; `export fn` is C-callable; generated headers (§15.5) | The user asked for a C FFI in both directions |
 | C26 | A NUL byte follows every string literal (not part of the slice) | Found while testing the FFI: passing `"%s".ptr` to C read past the end of the literal |
 | C27 | `test` blocks, `@expect`/`@expect_eq`, `phalange test`, and trap site records (§17.4, §18) | The user asked for testing support (formerly open question Q11) |
+| C28 | Packages: `phalange.toml`, `pkg:` imports, path and pinned-git dependencies, one source per name (§4.6) | The user asked for packages |
 
 ---
 

@@ -19,6 +19,10 @@ extern Program g_prog;
 
 typedef struct SemaOptions {
     const char *std_dir;
+    // Extra modules to load after the root (phalange test <package> loads
+    // every source file of the package).
+    const char *const *extra_files;
+    int n_extra_files;
 } SemaOptions;
 
 // Load, parse, resolve and type-check the program rooted at `path`.

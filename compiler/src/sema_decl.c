@@ -2,6 +2,7 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include "package.h"
 #include "sema_int.h"
 
 Program g_prog;
@@ -47,6 +48,7 @@ static Module *load_module(const char *fs_path, Span *from) {
     }
     m = parse_module(f);
     m->path = key;
+    m->pkg = pkg_for_file(rp);
     symmap_put(&mod_by_path, key, m);
     symmap_put(&mod_state, key, (void *)1);
     char dir[PATH_MAX];
@@ -58,7 +60,9 @@ static Module *load_module(const char *fs_path, Span *from) {
         if (d->kind != D_IMPORT || !d->import_path) continue;
         char path[PATH_MAX * 2];
         const char *ip = d->import_path;
-        if (strncmp(ip, "std/", 4) == 0) {
+        if (strncmp(ip, "pkg:", 4) == 0) {
+            if (!pkg_resolve_import(m->pkg, ip, d->import_path_span, path, sizeof path)) continue;
+        } else if (strncmp(ip, "std/", 4) == 0) {
             snprintf(path, sizeof path, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ph");
         } else if (ip[0] == '/') {
             snprintf(path, sizeof path, "%s%s", ip, has_ext(ip) ? "" : ".ph");
@@ -636,6 +640,7 @@ bool sema_run(const char *path, SemaOptions *opts) {
     Module *root = load_module(path, NULL);
     if (!root) return false;
     g_prog.root = root;
+    for (int i = 0; i < opts->n_extra_files; i++) load_module(opts->extra_files[i], NULL);
     for (int i = 0; i < g_prog.modules.len; i++) register_module(g_prog.modules.data[i]);
     assign_error_codes();
 
@@ -688,7 +693,11 @@ bool sema_run(const char *path, SemaOptions *opts) {
             case D_FN:
                 check_fn_body(d);
                 if (d->is_test) {
-                    if (m == g_prog.root || !is_std_module(m)) vec_push(g_prog.tests, d);
+                    // Tests run for the root module and, in a package, for the
+                    // root package's modules; outside packages, for every
+                    // non-std module.
+                    bool run = m == g_prog.root || (root->pkg ? m->pkg == root->pkg : !is_std_module(m));
+                    if (run) vec_push(g_prog.tests, d);
                 } else {
                     vec_push(g_prog.fns, d);
                 }

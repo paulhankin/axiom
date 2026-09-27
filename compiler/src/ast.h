@@ -335,6 +335,7 @@ struct Module {
     Vec(Decl *) decls;
     SymMap names;    // top-level names (items, not imports)
     SymMap imports;  // alias -> Decl(D_IMPORT)
+    struct Package *pkg;  // the package this module belongs to, or NULL
     bool checked;
 };
 

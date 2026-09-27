@@ -26,6 +26,10 @@ phalange build <file.ph> [options]    compile and link
 phalange check <file.ph> [options]    parse and type-check only
 phalange test  <file.ph> [options]    build and run the file's test blocks (spec §18)
                                       --filter=<text> --timeout=<ms> (default 10000)
+phalange new   <name>                 create a package (phalange.toml, src/lib.ph)
+
+build, check and test also take a package directory, or no path for the package in the
+current directory (spec §4.6).
 
   --target=wasm32|wasm64|native   default wasm32 (alias: wasm32-freestanding)
   -O0 | -O1 | -O2 | -O3           optimization level; never changes program behavior
@@ -56,6 +60,12 @@ instance in a node worker (`runtime/test_runner.mjs`) or a forked process
 (`runtime/test_main.c`). It reports human-readable text or `phalange-tests/1` JSON.
 Every trap reports its code, the failing expression and its location, in tests and in
 normal runs.
+
+**Packages** (spec §4.6, `src/package.c`): a `phalange.toml` manifest (a TOML subset)
+with path dependencies and git dependencies pinned to a commit, fetched once into
+`$PHALANGE_CACHE` (default `~/.cache/phalange`). Modules import them as `"pkg:name"` or
+`"pkg:name/sub/mod"`; only declared dependencies are visible, and a build uses one
+source per package name.
 
 **C interop** (spec §15.5):
 - `extern "C" { fn ...; }` calls C. On wasm, the C sources passed with `--link` are
