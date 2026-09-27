@@ -76,7 +76,13 @@ and `phalange profile` run them under `qemu-<arch>` (with the target's C library
 | `ir.ph` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
 | `codegen.ph` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces) |
 | `lower.ph` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates by pointer, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
-| `opt.ph` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting |
+| `passes.ph` | The optimization pipeline (below) |
+| `opt.ph` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting; code layout (loops contiguous, exit tests after the body, trap paths last) and constants hoisted out of loops for the native backends |
+| `combine.ph` | Instruction combining: algebraic identities, canonical forms, comparisons (constant ranges, extensions, the forms overflow checks take), narrowing, loads of constants |
+| `sroa.ph` | Scalar replacement of aggregates: stack slots split into scalar fields, copies of constants replaced by the constant |
+| `gvn.ph` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions and bounds between values (bounds and overflow checks), dead stores, shadow stack pushes and pops, loop-invariant code motion, memset idioms |
+| `thread.ph` | Jump threading and if-conversion (selects) |
+| `inline.ph` | Inlining bottom-up over the call graph, interprocedural constant propagation, dead functions |
 | `wasm.ph`, `wobj.ph` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
 | `wlink.ph` | The wasm linker: memory layout, function table, exports, shared memory for threads |
 | `mach.ph` | Machine IR shared by the native backends, liveness and linear-scan register allocation with spilling |
@@ -120,6 +126,27 @@ $ PHALANGE=selfhost/build/phalange PHALANGE_NATIVE_TARGET=aarch64 \
 (`apt install qemu-user libc6-arm64-cross gcc-aarch64-linux-gnu`; the C compiler is for
 the suite's C host functions.) `PHALANGE_DUMP_IR=<file>` makes the compiler write the
 optimized IR of each compilation, for debugging.
+
+## Optimization
+
+`-O0` runs mem2reg, constant folding, CFG simplification and dead code
+elimination. `-O1` adds, per function: instruction combining, jump threading,
+if-conversion, scalar replacement of aggregates, global value numbering,
+dead store elimination, shadow stack push/pop removal, memset idioms and
+loop-invariant code motion. `-O2` and `-O3` add interprocedural constant
+propagation and inlining (whole-program units by default), after which
+each function is simplified again. The backends then lay out loops, hoist
+constants and allocate registers with live ranges that have holes.
+
+The shadow stack for stack traces is ordinary memory to the optimizer, with
+two facts it may use: the program never computes a pointer to it, and every
+call leaves its depth as it found it. Traps, stack traces and error return
+traces are the same at every optimization level (tests/traces).
+
+`selfhost/bench.sh` compares the code with LLVM's: the compiler built by
+LLVM against the compiler built by itself on the same job, and the programs
+in `selfhost/bench/` (sieve, hash map, sorting, matrix and n-body, word
+counting) built by both compilers.
 
 ## Layout of the front end
 

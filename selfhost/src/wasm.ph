@@ -23,6 +23,7 @@ import "opt.ph" as opt;
 import "bin.ph" as bn;
 import "wobj.ph" as wo;
 import "target.ph" as tg;
+import "combine.ph" as cb;
 
 // flag values
 const FL_LOCAL: i32 = 0;
@@ -238,6 +239,9 @@ fn norm_s(bits: i32) void {
 fn push_ext(x: *mut ir.Value, sign: bool) void {
     push(x);
     let b = bits_of(x.ty);
+    if not sign and (x.kind == ir.V_INST) and (x.op == ir.OP_LOAD) and ((b == 8) or (b == 16)) {
+        return;  // loaded with load8_u / load16_u: already zero-extended
+    }
     if (x.ty.kind == ir.T_INT) and (b < 32) and not ir.is_const(x) {
         if sign {
             norm_s(b);
@@ -2419,6 +2423,21 @@ fn phi_copies(from: *mut ir.Block, to: *mut ir.Block) void {
     }
 }
 
+// Pushes the negation of i1 value c: an inlined integer comparison with the
+// inverse predicate, else c and i32.eqz.
+fn push_not(c: *mut ir.Value) void {
+    if (c.kind == ir.V_INST) and (c.op == ir.OP_ICMP) and (c.flag == FL_INLINE) and (c.a.ty.kind != ir.T_VEC) {
+        let p = cb.inv_pred(@truncate(i32, @bit_cast(i64, c.cv)));
+        let sg = is_signed_pred(p);
+        push_ext(c.a, sg);
+        push_ext(c.b, sg);
+        icmp_op(p, is64(c.a.ty));
+        return;
+    }
+    push(c);
+    op(0x45);  // i32.eqz
+}
+
 // Would a branch from `from` to `to` be just a `br` (no phi copies)?
 fn plain_branch(from: *mut ir.Block, to: *mut ir.Block) bool {
     if u.notnil(to.first) and (to.first.op == ir.OP_PHI) {
@@ -2525,8 +2544,7 @@ fn emit_block(x: *mut ir.Block) void {
         C.uleb(branch_depth(x, t.t1));
         do_branch(x, t.t2);
     } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t2) {
-        push(t.a);
-        op(0x45);  // i32.eqz
+        push_not(t.a);
         op(0x0d);
         C.uleb(branch_depth(x, t.t2));
         do_branch(x, t.t1);

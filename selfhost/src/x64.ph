@@ -1553,7 +1553,7 @@ fn gen_memop(v: *mut ir.Value) void {
         let n = cval(v.c);
         let dm = addr(v.a);
         let byte = cval(v.b) & 0xff;
-        let pat = byte * 0x0101_0101_0101_0101;
+        let pat = byte *% 0x0101_0101_0101_0101;
         let t = vgpr();
         _ = e2(xe.MOV_RI, 8, W(t), I(pat));
         let mut k: i64 = 0;

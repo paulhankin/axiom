@@ -1976,3 +1976,207 @@ fn hoist_ok(i: *mut ir.Value, tag: i64, in_header: bool) bool {
     }
     return licm_speculatable(i);
 }
+
+// -----------------------------------------------------------------------------
+// Loop idioms: a loop that only stores a loop-invariant value to consecutive
+// elements
+//     H: i = phi [start, pre], [i + 1, B];  condbr (i <u end) -> B, exit
+//     B: store v, base + i * size;  br H
+// is one memset before it (v a byte, or a constant whose bytes are equal),
+// when nothing after the loop uses its values.
+// -----------------------------------------------------------------------------
+fn same_bytes(v: *ir.Value) i64 {
+    if v.ty.kind != ir.T_INT {
+        if ir.is_zero(v) and (v.kind != ir.V_INST) {
+            return 0;
+        }
+        return -1;
+    }
+    if not cb.is_k(v) {
+        return -1;
+    }
+    let x = ir.cint_val(v);
+    let b = x & 0xff;
+    let n = @truncate(u32, v.ty.size);
+    for k in 1..n {
+        if ((x >> (k * 8)) & 0xff) != b {
+            return -1;
+        }
+    }
+    return @bit_cast(i64, b);
+}
+
+// The element index of an address base + i * size (or base + i for bytes).
+fn strided(p: *mut ir.Value, i: *mut ir.Value, size: u64) *mut ir.Value {
+    if not is_inst(p, ir.OP_PTRADD) {
+        return vnil();
+    }
+    let off = p.b;
+    if (size == 1) and (off == i) {
+        return p.a;
+    }
+    if is_inst(off, ir.OP_MUL) and (off.a == i) and cb.is_k(off.b) and (ir.cint_val(off.b) == size) {
+        return p.a;
+    }
+    if is_inst(off, ir.OP_SHL) and (off.a == i) and cb.is_k(off.b) and (ir.cint_val(off.b) < 8) and
+       ((@as(u64, 1) << @truncate(u32, ir.cint_val(off.b))) == size) {
+        return p.a;
+    }
+    return vnil();
+}
+
+fn used_outside(f: *mut ir.Func, tag: i64) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        if b.mark != tag {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+                for o in ops {
+                    if u.notnil(o) and (o.kind == ir.V_INST) and u.notnil(o.blk) and (o.blk.mark == tag) {
+                        return true;
+                    }
+                }
+                for k in 0..i.xs.len {
+                    let o = i.xs.get(k);
+                    if (o.kind == ir.V_INST) and u.notnil(o.blk) and (o.blk.mark == tag) {
+                        return true;
+                    }
+                }
+                i = i.next;
+            }
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+fn try_memset(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    if members.len != 2 {
+        return false;
+    }
+    let mut body = members.get(0);
+    if body == h {
+        body = members.get(1);
+    }
+    let ht = ir.terminator(h);
+    let bt = ir.terminator(body);
+    if u.isnil(ht) or u.isnil(bt) or (ht.op != ir.OP_CONDBR) or (bt.op != ir.OP_BR) or (bt.t1 != h) {
+        return false;
+    }
+    // header: one phi and the test
+    let i = h.first;
+    if u.isnil(i) or (i.op != ir.OP_PHI) or (i.xs.len != 2) or u.isnil(i.next) or (i.next.op == ir.OP_PHI) {
+        return false;
+    }
+    let c = ht.a;
+    if not is_inst(c, ir.OP_ICMP) or (c.a != i) or (c.blk != h) or (c.next != ht) or (i.next != c) {
+        return false;
+    }
+    let p = cb.pred_of(c);
+    let mut exit = ht.t2;
+    if (p == ir.IntULT) and (ht.t1 == body) {
+        exit = ht.t2;
+    } else if (p == ir.IntUGE) and (ht.t2 == body) {
+        exit = ht.t1;
+    } else {
+        return false;
+    }
+    let end = c.b;
+    if not invariant(end, tag) or (i.ty.kind != ir.T_INT) or (i.ty.bits > ir.isz().bits) {
+        return false;
+    }
+    let mut pre = ir.bnil();
+    let mut start = vnil();
+    let mut next = vnil();
+    for k in @as(usize, 0)..2 {
+        if i.bs.get(k) == body {
+            next = i.xs.get(k);
+        } else {
+            pre = i.bs.get(k);
+            start = i.xs.get(k);
+        }
+    }
+    if u.isnil(pre) or u.isnil(next) or not invariant(start, tag) or (ir.succ_count(ir.terminator(pre)) != 1) {
+        return false;
+    }
+    // body: the store, the address and i + 1 only
+    let mut st = vnil();
+    let mut x = body.first;
+    while u.notnil(x) and (x != bt) {
+        if x.op == ir.OP_STORE {
+            if u.notnil(st) {
+                return false;
+            }
+            st = x;
+        } else if not cse_able(x) {
+            return false;
+        }
+        x = x.next;
+    }
+    if u.isnil(st) or (st.flags != 0) or not invariant(st.a, tag) {
+        return false;
+    }
+    if not (is_inst(next, ir.OP_ADD) and (next.a == i) and cb.is_kv1(next.b)) {
+        return false;
+    }
+    let size = st.a.ty.size;
+    let mut byte = vnil();
+    if (size == 1) and (st.a.ty.kind == ir.T_INT) and (st.a.ty.bits == 8) {
+        byte = st.a;
+    } else {
+        let bv = same_bytes(st.a);
+        if bv < 0 {
+            return false;
+        }
+        byte = ir.cint(ir.t_int(8), @bit_cast(u64, bv));
+    }
+    let base = strided(st.b, i, size);
+    if u.isnil(base) or not invariant(base, tag) {
+        return false;
+    }
+    if used_outside(f, tag) or (u.notnil(exit.first) and (exit.first.op == ir.OP_PHI)) {
+        return false;
+    }
+    // memset(base + start * size, byte, (start < end ? end - start : 0) * size)
+    let bld = ir.new_builder();
+    let pt = ir.terminator(pre);
+    ir.at_before(bld, pt);
+    let isz = ir.isz();
+    let s = ir.cast(bld, ir.OP_ZEXT, start, isz);
+    let e = ir.cast(bld, ir.OP_ZEXT, end, isz);
+    let lt = ir.icmp(bld, ir.IntULT, s, e);
+    let n = ir.select(bld, lt, ir.sub(bld, e, s), ir.cint(isz, 0));
+    let bytes = ir.mul(bld, n, ir.cint(isz, size));
+    let dst = ir.ptradd(bld, base, ir.mul(bld, s, ir.cint(isz, size)));
+    _ = ir.memop(bld, ir.OP_MEMSET, dst, byte, bytes);
+    pt.t1 = exit;
+    return true;
+}
+
+// True if anything changed.
+pub fn loop_idioms(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    let hs = loop_headers(&order);
+    let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let mut any = false;
+    for k in 0..hs.len {
+        loop_mark += 1;
+        members_of(hs.get(k), loop_mark, &mut members);
+        if try_memset(f, hs.get(k), loop_mark, &members) {
+            any = true;
+            break;  // the CFG changed: again later
+        }
+    }
+    u.free(@ptr_cast(*mut void, members.data));
+    u.free(@ptr_cast(*mut void, order.data));
+    u.free(@ptr_cast(*mut void, hs.data));
+    if any {
+        ir.remove_unreachable(f);
+    }
+    return any;
+}

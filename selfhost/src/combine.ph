@@ -21,6 +21,10 @@ pub fn is_k(v: *ir.Value) bool {
     return (v.kind == ir.V_CINT) or ((v.kind == ir.V_ZERO) and ((v.ty.kind == ir.T_INT) or (v.ty.kind == ir.T_PTR)));
 }
 
+pub fn is_kv1(v: *ir.Value) bool {
+    return is_kv(v, 1);
+}
+
 fn kval(v: *ir.Value) u64 {
     return ir.cint_val(v);
 }

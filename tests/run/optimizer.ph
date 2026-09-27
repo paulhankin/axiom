@@ -218,6 +218,31 @@ fn use_checked(x: i64) i64 {
     return a + 1;
 }
 
+// Loops that only fill memory (they become memset).
+fn fill_bytes(xs: []mut u8, lo: usize, hi: usize, v: u8) u64 {
+    let mut i = lo;
+    while i < hi {
+        xs[i] = v;
+        i += 1;
+    }
+    let mut s: u64 = 0;
+    for k in 0..xs.len {
+        s = (s * 3) + @as(u64, xs[k]);
+    }
+    return s;
+}
+
+fn fill_words(xs: []mut u32, n: usize) u64 {
+    for i in 0..n {
+        xs[i] = 0xFFFF_FFFF;
+    }
+    let mut s: u64 = 0;
+    for k in 0..xs.len {
+        s = s + @as(u64, xs[k]);
+    }
+    return s;
+}
+
 export fn run() void {
     io.uint(digits(343073));                    // expect: 18000343073
     io.uint(digits(0));                         // expect: 23000000000
@@ -226,6 +251,13 @@ export fn run() void {
     io.uint(leading_spaces(""));                // expect: 0
     io.int(use_checked(5));                     // expect: 11
     io.int(use_checked(-3));                    // expect: 0
+    let mut bs: [8]u8 = [9; 8];
+    io.uint(fill_bytes(bs[..], 2, 6, 1));       // expect: 26640
+    io.uint(fill_bytes(bs[..], 5, 3, 7));       // expect: 26640
+    io.uint(fill_bytes(bs[..], 0, 8, 0));       // expect: 0
+    let mut ws: [4]u32 = [1, 2, 3, 4];
+    io.uint(fill_words(ws[..], 2));             // expect: 8589934597
+    io.uint(fill_words(ws[..], 0));             // expect: 8589934597
     let mut pa = Pair.{ a: 0, b: 0 };
     io.int(alias(&mut pa, &mut pa));            // expect: 2
     let mut pb = Pair.{ a: 0, b: 0 };

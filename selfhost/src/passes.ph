@@ -58,6 +58,11 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
         if gvn.ss_opt(f) {
             cleanup(f, level);
         }
+        rounds = 0;
+        while (rounds < 8) and gvn.loop_idioms(f) {
+            cleanup(f, level);
+            rounds += 1;
+        }
         if gvn.licm(f) {
             cleanup(f, level);
             _ = gvn.gvn(f);
