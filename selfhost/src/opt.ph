@@ -6,6 +6,7 @@
 // =============================================================================
 import "util.ph" as u;
 import "ir.ph" as ir;
+import "combine.ph" as cb;
 
 fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
@@ -512,7 +513,8 @@ fn is_ci(v: *ir.Value) bool {
 // A constant for i, or nil.
 fn fold(i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
-    let B = ir.new_builder();
+    let B = FB;
+    ir.at_before(B, i);
     if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) {
         if is_ci(i.a) and is_ci(i.b) {
             return ir.fold_int_bin(op, i.ty, i.a, i.b);
@@ -559,12 +561,61 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
-// Folds constants and trivial phis to a fixed point. True if anything changed.
+// Number of uses of each instruction (uses; user: the last user).
+pub fn count_uses(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.uses = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            use1(i.a, i);
+            use1(i.b, i);
+            use1(i.c, i);
+            for k in 0..i.xs.len {
+                use1(i.xs.get(k), i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+fn use1(o: *mut ir.Value, i: *mut ir.Value) void {
+    if u.notnil(o) and (o.kind == ir.V_INST) {
+        o.uses += 1;
+        o.user = i;
+    }
+}
+
+let mut FB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+
+// Folds constants and trivial phis to a fixed point; with `combine`, also
+// the rewrites of combine.ph. True if anything changed.
 pub fn fold_constants(f: *mut ir.Func) bool {
+    return fold_combine(f, false);
+}
+
+pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
+    if u.isnil(FB) {
+        FB = ir.new_builder();
+    }
     let mut any = false;
     let mut changed = true;
-    while changed {
+    let mut rounds: i32 = 0;
+    while changed and (rounds < 16) {
         changed = false;
+        rounds += 1;
+        if combine {
+            count_uses(f);
+        }
         let mut b = f.first;
         while u.notnil(b) {
             let mut i = b.first;
@@ -583,10 +634,21 @@ pub fn fold_constants(f: *mut ir.Func) bool {
                     i.xs.set(k, ir.resolve(i.xs.get(k)));
                 }
                 if not has_side_effects(i) {
-                    let r = fold(i);
+                    let mut r = vnil();
+                    if combine {
+                        r = cb.simplify(FB, i);
+                    }
+                    if u.isnil(r) {
+                        r = fold(i);
+                    }
                     if u.notnil(r) and (r != i) {
                         i.fwd = r;
                         ir.remove_inst(i);
+                        changed = true;
+                        any = true;
+                    }
+                } else if combine and (i.op == ir.OP_CONDBR) {
+                    if cb.simplify_branch(i) {
                         changed = true;
                         any = true;
                     }
@@ -806,7 +868,7 @@ pub fn optimize(f: *mut ir.Func, level: i32) void {
     mem2reg(f);
     let mut rounds: i32 = 0;
     loop {
-        let a = fold_constants(f);
+        let a = fold_combine(f, level > 0);
         let c = simplify_cfg(f);
         rounds += 1;
         if not (a or c) or (rounds > 8) {

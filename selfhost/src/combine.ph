@@ -1,0 +1,716 @@
+// =============================================================================
+// combine.ph - instruction combining: algebraic identities, canonical forms
+// (constants on the right, `sub x, c` as `add x, -c`), folding chains of
+// constant operations, strength reduction (multiplication and division by
+// powers of two), comparison simplification (including the forms the
+// overflow checks take) and boolean logic.
+//
+// simplify(i) returns the value i can be replaced by, or nil; it may insert
+// new instructions before i. Floating point is left alone (no rewrite may
+// change a result, spec §7.7), and so are vectors and 128-bit integers.
+// =============================================================================
+import "util.ph" as u;
+import "ir.ph" as ir;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+// An integer (or null pointer) constant.
+pub fn is_k(v: *ir.Value) bool {
+    return (v.kind == ir.V_CINT) or ((v.kind == ir.V_ZERO) and ((v.ty.kind == ir.T_INT) or (v.ty.kind == ir.T_PTR)));
+}
+
+fn kval(v: *ir.Value) u64 {
+    return ir.cint_val(v);
+}
+
+fn is_kv(v: *ir.Value, x: u64) bool {
+    return is_k(v) and (kval(v) == (x & ir.mask_bits(v.ty.bits)));
+}
+
+fn is_op(v: *ir.Value, op: i32) bool {
+    return (v.kind == ir.V_INST) and (v.op == op);
+}
+
+// A scalar integer of at most 64 bits.
+fn small_int(t: *ir.Ty) bool {
+    return (t.kind == ir.T_INT) and (t.bits <= 64);
+}
+
+// log2 of x when x is a power of two, else -1.
+pub fn log2(x: u64) i32 {
+    if (x == 0) or ((x & (x -% 1)) != 0) {
+        return -1;
+    }
+    let mut n: i32 = 0;
+    let mut y = x;
+    while y > 1 {
+        y = y >> 1;
+        n += 1;
+    }
+    return n;
+}
+
+fn commutative(op: i32) bool {
+    return (op == ir.OP_ADD) or (op == ir.OP_MUL) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR);
+}
+
+// The predicate with its operands swapped: a p b == b swap(p) a.
+pub fn swap_pred(p: i32) i32 {
+    if p == ir.IntUGT {
+        return ir.IntULT;
+    }
+    if p == ir.IntULT {
+        return ir.IntUGT;
+    }
+    if p == ir.IntUGE {
+        return ir.IntULE;
+    }
+    if p == ir.IntULE {
+        return ir.IntUGE;
+    }
+    if p == ir.IntSGT {
+        return ir.IntSLT;
+    }
+    if p == ir.IntSLT {
+        return ir.IntSGT;
+    }
+    if p == ir.IntSGE {
+        return ir.IntSLE;
+    }
+    if p == ir.IntSLE {
+        return ir.IntSGE;
+    }
+    return p;
+}
+
+// The negated predicate: not (a p b) == a inv(p) b.
+pub fn inv_pred(p: i32) i32 {
+    if p == ir.IntEQ {
+        return ir.IntNE;
+    }
+    if p == ir.IntNE {
+        return ir.IntEQ;
+    }
+    if p == ir.IntUGT {
+        return ir.IntULE;
+    }
+    if p == ir.IntULE {
+        return ir.IntUGT;
+    }
+    if p == ir.IntUGE {
+        return ir.IntULT;
+    }
+    if p == ir.IntULT {
+        return ir.IntUGE;
+    }
+    if p == ir.IntSGT {
+        return ir.IntSLE;
+    }
+    if p == ir.IntSLE {
+        return ir.IntSGT;
+    }
+    if p == ir.IntSGE {
+        return ir.IntSLT;
+    }
+    return ir.IntSGE;  // SLT
+}
+
+pub fn pred_of(v: *ir.Value) i32 {
+    return @truncate(i32, @bit_cast(i64, v.cv));
+}
+
+fn is_signed_pred(p: i32) bool {
+    return (p >= ir.IntSGT) and (p <= ir.IntSLE);
+}
+
+fn smax(bits: i32) u64 {
+    return ir.mask_bits(bits) >> 1;
+}
+
+fn smin(bits: i32) u64 {
+    return (ir.mask_bits(bits) >> 1) +% 1;
+}
+
+fn kt(t: *mut ir.Ty, x: u64) *mut ir.Value {
+    return ir.cint(t, x);
+}
+
+fn ktrue() *mut ir.Value {
+    return ir.cint(ir.t_int(1), 1);
+}
+
+fn kfalse() *mut ir.Value {
+    return ir.cint(ir.t_int(1), 0);
+}
+
+fn kbool(b: bool) *mut ir.Value {
+    if b {
+        return ktrue();
+    }
+    return kfalse();
+}
+
+// A new comparison before i.
+fn mk_icmp(B: *mut ir.Builder, p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.icmp(B, p, a, b);
+}
+
+// The value `not x` for an i1 x, when it exists without a new instruction
+// or x is a comparison (which is inverted).
+fn negate_bool(B: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    if x.kind == ir.V_CINT {
+        return kbool(x.cv == 0);
+    }
+    if is_op(x, ir.OP_XOR) and is_kv(x.b, 1) {
+        return x.a;
+    }
+    if is_op(x, ir.OP_ICMP) and (x.ty.kind == ir.T_INT) {
+        return mk_icmp(B, inv_pred(pred_of(x)), x.a, x.b);
+    }
+    return vnil();
+}
+
+// Is the comparison `x p k` (k a constant of x's width) always true or false?
+// 1: true, 0: false, -1: unknown.
+fn cmp_const_range(p: i32, bits: i32, k: u64) i32 {
+    let max = ir.mask_bits(bits);
+    let sk = k;
+    if (p == ir.IntULT) and (k == 0) {
+        return 0;
+    }
+    if (p == ir.IntUGE) and (k == 0) {
+        return 1;
+    }
+    if (p == ir.IntUGT) and (k == max) {
+        return 0;
+    }
+    if (p == ir.IntULE) and (k == max) {
+        return 1;
+    }
+    if (p == ir.IntSLT) and (sk == smin(bits)) {
+        return 0;
+    }
+    if (p == ir.IntSGE) and (sk == smin(bits)) {
+        return 1;
+    }
+    if (p == ir.IntSGT) and (sk == smax(bits)) {
+        return 0;
+    }
+    if (p == ir.IntSLE) and (sk == smax(bits)) {
+        return 1;
+    }
+    return -1;
+}
+
+fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let mut p = pred_of(i);
+    let mut a = i.a;
+    let mut b = i.b;
+    let at = a.ty;
+    if (at.kind != ir.T_INT) and (at.kind != ir.T_PTR) {
+        return vnil();
+    }
+    if at.bits > 64 {
+        return vnil();
+    }
+    if is_k(a) and is_k(b) {
+        return ir.icmp(B, p, a, b);
+    }
+    // constants on the right
+    if is_k(a) and not is_k(b) {
+        i.a = b;
+        i.b = a;
+        i.cv = @as(u64, @bit_cast(u32, swap_pred(p)));
+        p = pred_of(i);
+        a = i.a;
+        b = i.b;
+    }
+    if a == b {
+        return kbool((p == ir.IntEQ) or (p == ir.IntUGE) or (p == ir.IntULE) or (p == ir.IntSGE) or (p == ir.IntSLE));
+    }
+    let bits = at.bits;
+    if is_k(b) and (at.kind == ir.T_INT) {
+        let k = kval(b);
+        let r = cmp_const_range(p, bits, k);
+        if r >= 0 {
+            return kbool(r == 1);
+        }
+        // x <u 1 -> x == 0; x >u 0 -> x != 0 and friends
+        if (p == ir.IntULT) and (k == 1) {
+            return mk_icmp(B, ir.IntEQ, a, kt(at, 0));
+        }
+        if (p == ir.IntUGE) and (k == 1) {
+            return mk_icmp(B, ir.IntNE, a, kt(at, 0));
+        }
+        if (p == ir.IntUGT) and (k == 0) {
+            return mk_icmp(B, ir.IntNE, a, b);
+        }
+        if (p == ir.IntULE) and (k == 0) {
+            return mk_icmp(B, ir.IntEQ, a, b);
+        }
+        // i1 comparisons against constants
+        if bits == 1 {
+            if ((p == ir.IntNE) and (k == 0)) or ((p == ir.IntEQ) and (k == 1)) {
+                return a;
+            }
+            if ((p == ir.IntEQ) and (k == 0)) or ((p == ir.IntNE) and (k == 1)) {
+                let n = negate_bool(B, a);
+                if u.notnil(n) {
+                    return n;
+                }
+            }
+        }
+        // (zext x) == k  ->  x == trunc k (or a constant when k does not fit)
+        if (is_op(a, ir.OP_ZEXT) or is_op(a, ir.OP_SEXT)) and (a.a.ty.kind == ir.T_INT) {
+            let x = a.a;
+            let xb = x.ty.bits;
+            let xm = ir.mask_bits(xb);
+            let mut fits = false;
+            if a.op == ir.OP_ZEXT {
+                fits = (k & ~xm) == 0;
+            } else {
+                // k is the sign extension of its low xb bits
+                let low = k & xm;
+                let sext_low = @bit_cast(u64, ir.sval(ir.cint(x.ty, low)));
+                fits = (sext_low & ir.mask_bits(bits)) == k;
+            }
+            if (p == ir.IntEQ) or (p == ir.IntNE) {
+                if not fits {
+                    return kbool(p == ir.IntNE);
+                }
+                return mk_icmp(B, p, x, kt(x.ty, k & xm));
+            }
+            // unsigned comparisons of a zero extension with a fitting constant,
+            // signed ones of a sign extension
+            if fits and (((a.op == ir.OP_ZEXT) and not is_signed_pred(p)) or ((a.op == ir.OP_SEXT) and is_signed_pred(p))) {
+                return mk_icmp(B, p, x, kt(x.ty, k & xm));
+            }
+        }
+        // (x + c) == k  ->  x == k - c
+        if ((p == ir.IntEQ) or (p == ir.IntNE)) and is_op(a, ir.OP_ADD) and is_k(a.b) {
+            return mk_icmp(B, p, a.a, kt(at, k -% kval(a.b)));
+        }
+        // (x ^ c) == k  ->  x == k ^ c
+        if ((p == ir.IntEQ) or (p == ir.IntNE)) and is_op(a, ir.OP_XOR) and is_k(a.b) {
+            return mk_icmp(B, p, a.a, kt(at, k ^ kval(a.b)));
+        }
+        // (x - y) == 0  ->  x == y ; (x ^ y) == 0 -> x == y
+        if ((p == ir.IntEQ) or (p == ir.IntNE)) and (k == 0) and (is_op(a, ir.OP_SUB) or is_op(a, ir.OP_XOR)) {
+            return mk_icmp(B, p, a.a, a.b);
+        }
+        // ptrtoint p == 0  ->  p == null
+        if ((p == ir.IntEQ) or (p == ir.IntNE)) and (k == 0) and is_op(a, ir.OP_PTRTOINT) and
+           (bits == @int_cast(i32, ir.ptr_bytes * 8)) {
+            return mk_icmp(B, p, a.a, ir.czero(ir.t_ptr()));
+        }
+    }
+    // Overflow checks: (x + c) <u x is x >u MAX - c; (x + c) >=u x is x <=u MAX - c.
+    if at.kind == ir.T_INT {
+        let mut sum = vnil();
+        let mut q = p;
+        if is_op(a, ir.OP_ADD) and (a.a == b) and is_k(a.b) {
+            sum = a;
+        } else if is_op(b, ir.OP_ADD) and (b.a == a) and is_k(b.b) {
+            sum = b;
+            q = swap_pred(p);
+        }
+        if u.notnil(sum) and ((q == ir.IntULT) or (q == ir.IntUGE)) {
+            let c = kval(sum.b);
+            if c == 0 {
+                return kbool(q == ir.IntUGE);
+            }
+            let lim = kt(at, ir.mask_bits(bits) -% c);
+            if q == ir.IntULT {
+                return mk_icmp(B, ir.IntUGT, sum.a, lim);
+            }
+            return mk_icmp(B, ir.IntULE, sum.a, lim);
+        }
+        // (x - y) >u x  ->  y >u x  (x - y wraps below 0 exactly when y > x)
+        if is_op(a, ir.OP_SUB) and (a.a == b) and (p == ir.IntUGT) {
+            return mk_icmp(B, ir.IntUGT, a.b, b);
+        }
+        if is_op(a, ir.OP_SUB) and (a.a == b) and (p == ir.IntULE) {
+            return mk_icmp(B, ir.IntULE, a.b, b);
+        }
+    }
+    return vnil();
+}
+
+fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    let t = i.ty;
+    if is_k(i.a) and is_k(i.b) {
+        return ir.fold_int_bin(op, t, i.a, i.b);
+    }
+    if commutative(op) and is_k(i.a) {
+        let x = i.a;
+        i.a = i.b;
+        i.b = x;
+    }
+    let a = i.a;
+    let b = i.b;
+    let bits = t.bits;
+    let all = ir.mask_bits(bits);
+    let bk = is_k(b);
+    let k = kval(b);
+    if op == ir.OP_ADD {
+        if bk and (k == 0) {
+            return a;
+        }
+        // (x + c1) + c2
+        if bk and is_op(a, ir.OP_ADD) and is_k(a.b) {
+            i.a = a.a;
+            i.b = kt(t, k +% kval(a.b));
+            return simplify_bin(B, i);
+        }
+        // (x - y) + y
+        if is_op(a, ir.OP_SUB) and (a.b == b) {
+            return a.a;
+        }
+        if is_op(b, ir.OP_SUB) and (b.b == a) {
+            return b.a;
+        }
+        return vnil();
+    }
+    if op == ir.OP_SUB {
+        if a == b {
+            return kt(t, 0);
+        }
+        if bk {
+            // canonical: x + (-c)
+            if k == 0 {
+                return a;
+            }
+            return ir.add(B, a, kt(t, 0 -% k));
+        }
+        // (x + y) - y ; (x + y) - x
+        if is_op(a, ir.OP_ADD) and (a.b == b) {
+            return a.a;
+        }
+        if is_op(a, ir.OP_ADD) and (a.a == b) {
+            return a.b;
+        }
+        // (x + c) - x  = c ; x - (x - y) = y
+        if is_op(b, ir.OP_SUB) and (b.a == a) {
+            return b.b;
+        }
+        return vnil();
+    }
+    if op == ir.OP_MUL {
+        if bk {
+            if k == 0 {
+                return b;
+            }
+            if k == 1 {
+                return a;
+            }
+            // (x * c1) * c2
+            if is_op(a, ir.OP_MUL) and is_k(a.b) {
+                i.a = a.a;
+                i.b = kt(t, k *% kval(a.b));
+                return simplify_bin(B, i);
+            }
+            // (multiplication by a power of two stays: the backends fold it
+            // into scaled addressing and select shifts themselves)
+        }
+        return vnil();
+    }
+    if op == ir.OP_UDIV {
+        if bk {
+            if k == 1 {
+                return a;
+            }
+            let l = log2(k);
+            if l > 0 {
+                return ir.binop(B, ir.OP_LSHR, a, kt(t, @as(u64, @bit_cast(u32, l))));
+            }
+        }
+        return vnil();
+    }
+    if op == ir.OP_UREM {
+        if bk {
+            if k == 1 {
+                return kt(t, 0);
+            }
+            if log2(k) > 0 {
+                return ir.and_(B, a, kt(t, k - 1));
+            }
+        }
+        return vnil();
+    }
+    if op == ir.OP_SDIV {
+        if bk and (k == 1) {
+            return a;
+        }
+        return vnil();
+    }
+    if op == ir.OP_SREM {
+        if bk and ((k == 1) or (k == all)) {
+            return kt(t, 0);
+        }
+        return vnil();
+    }
+    if op == ir.OP_AND {
+        if bk {
+            if k == 0 {
+                return b;
+            }
+            if k == all {
+                return a;
+            }
+            if is_op(a, ir.OP_AND) and is_k(a.b) {
+                i.a = a.a;
+                i.b = kt(t, k & kval(a.b));
+                return simplify_bin(B, i);
+            }
+            // (zext x) & mask covering x's bits
+            if is_op(a, ir.OP_ZEXT) and (a.a.ty.kind == ir.T_INT) and ((ir.mask_bits(a.a.ty.bits) & ~k) == 0) {
+                return a;
+            }
+        }
+        if a == b {
+            return a;
+        }
+        return vnil();
+    }
+    if op == ir.OP_OR {
+        if bk {
+            if k == 0 {
+                return a;
+            }
+            if k == all {
+                return b;
+            }
+            if is_op(a, ir.OP_OR) and is_k(a.b) {
+                i.a = a.a;
+                i.b = kt(t, k | kval(a.b));
+                return simplify_bin(B, i);
+            }
+        }
+        if a == b {
+            return a;
+        }
+        return vnil();
+    }
+    if op == ir.OP_XOR {
+        if a == b {
+            return kt(t, 0);
+        }
+        if bk {
+            if k == 0 {
+                return a;
+            }
+            if is_op(a, ir.OP_XOR) and is_k(a.b) {
+                i.a = a.a;
+                i.b = kt(t, k ^ kval(a.b));
+                return simplify_bin(B, i);
+            }
+            // not of a comparison: the inverted comparison
+            if (bits == 1) and is_op(a, ir.OP_ICMP) and (a.uses <= 1) {
+                return negate_bool(B, a);
+            }
+        }
+        return vnil();
+    }
+    if (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) {
+        if bk and (k == 0) {
+            return a;
+        }
+        if is_kv(a, 0) {
+            return a;
+        }
+        // (x << c1) << c2 while the total stays below the width
+        if bk and is_op(a, op) and is_k(a.b) and (k < @as(u64, @bit_cast(u32, bits))) {
+            let tot = k + kval(a.b);
+            if tot < @as(u64, @bit_cast(u32, bits)) {
+                i.a = a.a;
+                i.b = kt(i.b.ty, tot);
+                return vnil();
+            }
+        }
+        return vnil();
+    }
+    return vnil();
+}
+
+fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let c = i.a;
+    if c.kind == ir.V_CINT {
+        if c.cv != 0 {
+            return i.b;
+        }
+        return i.c;
+    }
+    if i.b == i.c {
+        return i.b;
+    }
+    if c.ty.kind != ir.T_INT {
+        return vnil();  // vector masks
+    }
+    // select (not c), x, y  ->  select c, y, x
+    if is_op(c, ir.OP_XOR) and is_kv(c.b, 1) {
+        i.a = c.a;
+        let x = i.b;
+        i.b = i.c;
+        i.c = x;
+        return simplify_select(B, i);
+    }
+    let t = i.ty;
+    if (t.kind == ir.T_INT) and (t.bits == 1) {
+        if is_kv(i.b, 1) and is_kv(i.c, 0) {
+            return c;
+        }
+        if is_kv(i.b, 0) and is_kv(i.c, 1) {
+            return ir.xor(B, c, ktrue());
+        }
+        // c ? true : y  ->  c | y ; c ? x : false  ->  c & x
+        if is_kv(i.b, 1) {
+            return ir.or_(B, c, i.c);
+        }
+        if is_kv(i.c, 0) {
+            return ir.and_(B, c, i.b);
+        }
+    } else if small_int(t) {
+        if is_kv(i.b, 1) and is_kv(i.c, 0) {
+            return ir.zext(B, c, t);
+        }
+    }
+    return vnil();
+}
+
+fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    let a = i.a;
+    let t = i.ty;
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
+        if (t.kind != ir.T_INT) or (a.ty.kind != ir.T_INT) or (t.bits > 64) or (a.ty.bits > 64) {
+            return vnil();
+        }
+        if a.ty == t {
+            return a;
+        }
+        if is_k(a) {
+            return ir.cast(B, op, a, t);
+        }
+        if (op == ir.OP_ZEXT) and is_op(a, ir.OP_ZEXT) {
+            i.a = a.a;
+            return vnil();
+        }
+        if (op == ir.OP_SEXT) and (is_op(a, ir.OP_SEXT) or is_op(a, ir.OP_ZEXT)) {
+            // sext (zext x) = zext x: the top bit is 0
+            if a.op == ir.OP_ZEXT {
+                return ir.zext(B, a.a, t);
+            }
+            i.a = a.a;
+            return vnil();
+        }
+        if op == ir.OP_TRUNC {
+            if is_op(a, ir.OP_TRUNC) {
+                i.a = a.a;
+                return vnil();
+            }
+            if is_op(a, ir.OP_ZEXT) or is_op(a, ir.OP_SEXT) {
+                let x = a.a;
+                if x.ty == t {
+                    return x;
+                }
+                if x.ty.bits < t.bits {
+                    return ir.cast(B, a.op, x, t);
+                }
+                return ir.trunc(B, x, t);
+            }
+        }
+        return vnil();
+    }
+    if op == ir.OP_PTRTOINT {
+        if is_op(a, ir.OP_INTTOPTR) and (a.a.ty == t) {
+            return a.a;
+        }
+        return vnil();
+    }
+    if op == ir.OP_INTTOPTR {
+        if is_op(a, ir.OP_PTRTOINT) and (a.ty.bits == @int_cast(i32, ir.ptr_bytes * 8)) {
+            return a.a;
+        }
+        return vnil();
+    }
+    if op == ir.OP_BITCAST {
+        if a.ty == t {
+            return a;
+        }
+        if is_op(a, ir.OP_BITCAST) {
+            if a.a.ty == t {
+                return a.a;
+            }
+            i.a = a.a;
+        }
+        return vnil();
+    }
+    return vnil();
+}
+
+fn simplify_ptradd(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let off = i.b;
+    if is_kv(off, 0) {
+        return i.a;
+    }
+    let a = i.a;
+    if is_k(off) and is_op(a, ir.OP_PTRADD) and is_k(a.b) {
+        i.a = a.a;
+        i.b = ir.cint(off.ty, kval(off) +% kval(a.b));
+        return simplify_ptradd(B, i);
+    }
+    return vnil();
+}
+
+// The value i can be replaced by, or nil (i may have been rewritten in place).
+pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    ir.at_before(B, i);
+    if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) {
+        if small_int(i.ty) {
+            return simplify_bin(B, i);
+        }
+        return vnil();
+    }
+    if op == ir.OP_ICMP {
+        if i.ty.kind == ir.T_INT {
+            return simplify_icmp(B, i);
+        }
+        return vnil();
+    }
+    if op == ir.OP_SELECT {
+        return simplify_select(B, i);
+    }
+    if (op >= ir.OP_ZEXT) and (op <= ir.OP_INTTOPTR) {
+        return simplify_cast(B, i);
+    }
+    if op == ir.OP_PTRADD {
+        return simplify_ptradd(B, i);
+    }
+    if op == ir.OP_FNEG {
+        if is_op(i.a, ir.OP_FNEG) {
+            return i.a.a;
+        }
+        return vnil();
+    }
+    return vnil();
+}
+
+// condbr (not c), x, y  ->  condbr c, y, x. True if changed.
+pub fn simplify_branch(t: *mut ir.Value) bool {
+    if t.op != ir.OP_CONDBR {
+        return false;
+    }
+    let c = t.a;
+    if is_op(c, ir.OP_XOR) and is_kv(c.b, 1) {
+        t.a = c.a;
+        let x = t.t1;
+        t.t1 = t.t2;
+        t.t2 = x;
+        return true;
+    }
+    return false;
+}
