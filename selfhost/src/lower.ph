@@ -407,3 +407,100 @@ pub fn lower_module(m: *mut ir.Module) void {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Vector legalization: vector instructions the target cannot select become
+// lane-by-lane scalar code (extract, scalar operation, insert).
+// -----------------------------------------------------------------------------
+fn lane_of(x: *mut ir.Value, i: u64) *mut ir.Value {
+    if (x.kind == ir.V_INST) and (x.op == ir.OP_SPLAT) {
+        return x.a;
+    }
+    if x.kind == ir.V_CAGG {
+        return x.xs.get(@truncate(usize, i));
+    }
+    if x.kind == ir.V_ZERO {
+        return ir.czero(x.ty.elem);
+    }
+    return ir.extract_elem(B, x, i);
+}
+
+fn scalarize_one(v: *mut ir.Value) void {
+    ir.at_before(B, v);
+    let o = v.op;
+    let mut vt = v.ty;
+    if (o == ir.OP_INTR) and (vt.kind != ir.T_VEC) {
+        vt = v.xs.get(0).ty;
+    }
+    let n = @as(u64, @bit_cast(u32, vt.lanes));
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if (o == ir.OP_INTR) and (id == ir.IN_ALLTRUE) {
+        let x = v.xs.get(0);
+        let mut acc = ir.cint(ir.t_int(1), 1);
+        for i in @as(u64, 0)..n {
+            let l = lane_of(x, i);
+            acc = ir.and_(B, acc, ir.icmp(B, ir.IntNE, l, ir.czero(l.ty)));
+        }
+        v.fwd = acc;
+        ir.remove_inst(v);
+        return;
+    }
+    let mut r = ir.undef(v.ty);
+    for i in @as(u64, 0)..n {
+        let mut s = vnil();
+        if (o >= ir.OP_ADD) and (o <= ir.OP_FREM) {
+            s = ir.binop(B, o, lane_of(v.a, i), lane_of(v.b, i));
+        } else if o == ir.OP_FNEG {
+            s = ir.fneg(B, lane_of(v.a, i));
+        } else if (o == ir.OP_ICMP) or (o == ir.OP_FCMP) {
+            let p = @truncate(i32, @bit_cast(i64, v.cv));
+            let mut c = vnil();
+            if o == ir.OP_ICMP {
+                c = ir.icmp(B, p, lane_of(v.a, i), lane_of(v.b, i));
+            } else {
+                c = ir.fcmp(B, p, lane_of(v.a, i), lane_of(v.b, i));
+            }
+            s = ir.sext(B, c, v.ty.elem);
+        } else if (o >= ir.OP_ZEXT) and (o <= ir.OP_FPTOUI_SAT) {
+            s = ir.cast(B, o, lane_of(v.a, i), v.ty.elem);
+        } else if o == ir.OP_INTR {
+            let args = u.newn.[*mut ir.Value](v.xs.len + 1);
+            for k in 0..v.xs.len {
+                args[k] = lane_of(v.xs.get(k), i);
+            }
+            s = ir.intr(B, id, v.ty.elem, args[0..v.xs.len]);
+        } else if o == ir.OP_SELECT {
+            s = ir.select(B, v.a, lane_of(v.b, i), lane_of(v.c, i));
+        } else {
+            u.die(u.f1("internal compiler error: cannot split vector instruction %s", ir.inst_str(v)));
+        }
+        r = ir.insert_elem(B, r, s, i);
+    }
+    v.fwd = r;
+    ir.remove_inst(v);
+}
+
+pub fn scalarize(f: *mut ir.Func, legal: fn(*mut ir.Value) bool) void {
+    B = ir.new_builder();
+    F = f;
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            let vecish = (i.ty.kind == ir.T_VEC) or ((i.op == ir.OP_INTR) and (i.xs.len > 0) and
+                                                     (i.xs.get(0).ty.kind == ir.T_VEC)) or
+                         ((i.op == ir.OP_ICMP) and (i.a.ty.kind == ir.T_VEC));
+            if vecish and not legal(i) {
+                scalarize_one(i);
+                any = true;
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    if any {
+        ir.apply_forwarding(f);
+    }
+}

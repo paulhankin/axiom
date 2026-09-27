@@ -171,8 +171,30 @@ pub fn triple_of(a: i32) []u8 {
 }
 
 // Extensions of the machine we run on, from /proc/cpuinfo (Linux).
+// Reads a file to its end (for /proc files, whose size reads as 0).
+fn read_stream(path: []u8) []u8 {
+    let fd = u.open(u.cz(path), 0);
+    if fd < 0 {
+        return u.nosym();
+    }
+    let mut b = u.Buf.init();
+    let mut chunk: [4096]u8 = [0; 4096];
+    loop {
+        let n = u.read(fd, &mut chunk[0], 4096);
+        if n <= 0 {
+            break;
+        }
+        b.s(chunk[0..@int_cast(usize, n)]);
+        if b.len() > 65536 {
+            break;  // the first processor's flags are enough
+        }
+    }
+    _ = u.close(fd);
+    return b.done();
+}
+
 fn host_features(a: i32) u64 {
-    let info = u.read_file("/proc/cpuinfo");
+    let info = read_stream("/proc/cpuinfo");
     if u.isnos(info) {
         return 0;
     }

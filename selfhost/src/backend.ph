@@ -9,6 +9,8 @@ import "lower.ph" as lower;
 import "opt.ph" as opt;
 import "wasm.ph" as wa;
 import "wobj.ph" as wo;
+import "x64.ph" as x64;
+import "elf.ph" as elf;
 
 pub const EMIT_OBJ: i32 = 0;
 pub const EMIT_IR: i32 = 1;
@@ -38,6 +40,17 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
             return false;
         }
         if not u.write_file(path, wo.write_object(un)) {
+            u.eprint(u.f1("phalange: cannot write %s\n", path));
+            return false;
+        }
+        return true;
+    }
+    if tg.g_arch == tg.ARCH_X64 {
+        let o = x64.compile(m);
+        if u.isnil(o) {
+            return false;
+        }
+        if not u.write_file(path, elf.write(o)) {
             u.eprint(u.f1("phalange: cannot write %s\n", path));
             return false;
         }

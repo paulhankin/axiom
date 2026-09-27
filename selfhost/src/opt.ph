@@ -815,3 +815,44 @@ pub fn optimize(f: *mut ir.Func, level: i32) void {
     }
     dce(f);
 }
+
+// Splits edges from blocks with several successors to blocks with phis and
+// several predecessors, so phi copies can go at the end of the source.
+pub fn split_critical_edges(f: *mut ir.Func) void {
+    compute_preds(f);
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        let n = ir.succ_count(t);
+        if n >= 2 {
+            let mut made = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+            let mut targets = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+            for k in 0..n {
+                let s = ir.succ(t, k);
+                if (s.preds.len < 2) or not has_phis(s) {
+                    continue;
+                }
+                let mut nb = bnil();
+                for j in 0..targets.len {
+                    if targets.get(j) == s {
+                        nb = made.get(j);
+                    }
+                }
+                if u.isnil(nb) {
+                    nb = ir.append_block(f, "edge");
+                    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+                    br.t1 = s;
+                    ir.append_inst(nb, br);
+                    replace_phi_block(s, b, nb);
+                    made.push(nb);
+                    targets.push(s);
+                }
+                ir.set_succ(t, k, nb);
+            }
+            u.free(@ptr_cast(*mut void, made.data));
+            u.free(@ptr_cast(*mut void, targets.data));
+        }
+        b = b.next;
+    }
+    compute_preds(f);
+}

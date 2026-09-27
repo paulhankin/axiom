@@ -1,0 +1,486 @@
+// =============================================================================
+// elf.ph - ELF64 relocatable objects: the in-memory form produced by the
+// native code generators, its encoding as a .o file (for our linker, and for
+// the system linker when C code is linked in), and decoding of the objects
+// we write.
+// =============================================================================
+import "util.ph" as u;
+import "bin.ph" as bn;
+
+pub const EM_X86_64: u32 = 62;
+pub const EM_AARCH64: u32 = 183;
+
+// Section kinds
+pub const S_TEXT: i32 = 0;
+pub const S_RODATA: i32 = 1;
+pub const S_DATA: i32 = 2;
+pub const S_BSS: i32 = 3;
+pub const S_TDATA: i32 = 4;
+pub const S_TBSS: i32 = 5;
+
+// Symbol binding / type
+pub const B_LOCAL: u8 = 0;
+pub const B_GLOBAL: u8 = 1;
+pub const B_WEAK: u8 = 2;
+pub const T_NOTYPE: u8 = 0;
+pub const T_OBJECT: u8 = 1;
+pub const T_FUNC: u8 = 2;
+pub const T_TLS: u8 = 6;
+
+// x86-64 relocations
+pub const R_X86_64_64: u32 = 1;
+pub const R_X86_64_PC32: u32 = 2;
+pub const R_X86_64_PLT32: u32 = 4;
+pub const R_X86_64_GOTPCREL: u32 = 9;
+pub const R_X86_64_TPOFF32: u32 = 23;
+pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
+
+// AArch64 relocations
+pub const R_AARCH64_ABS64: u32 = 257;
+pub const R_AARCH64_PREL32: u32 = 261;
+pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
+pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+pub const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
+pub const R_AARCH64_JUMP26: u32 = 282;
+pub const R_AARCH64_CALL26: u32 = 283;
+pub const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
+pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
+pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
+pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
+pub const R_AARCH64_ADR_GOT_PAGE: u32 = 311;
+pub const R_AARCH64_LD64_GOT_LO12_NC: u32 = 312;
+pub const R_AARCH64_TLSLE_ADD_TPREL_HI12: u32 = 549;
+pub const R_AARCH64_TLSLE_ADD_TPREL_LO12_NC: u32 = 551;
+
+pub struct Rel {
+    off: u64,
+    ty: u32,
+    sym: u32,
+    addend: i64,
+}
+
+pub struct Sec {
+    name: []u8,
+    kind: i32,
+    data: bn.Bytes,
+    size: u64,        // BSS / TBSS size (no data)
+    align: u64,
+    relocs: u.List.[Rel],
+    index: u32,       // section header index when written
+}
+
+pub struct Sym {
+    name: []u8,
+    sec: i32,         // section index in Obj.secs, -1: undefined
+    value: u64,
+    size: u64,
+    bind: u8,
+    ty: u8,
+    hidden: bool,
+}
+
+pub struct Obj {
+    machine: u32,
+    secs: u.List.[*mut Sec],
+    syms: u.List.[Sym],
+    symmap: u.SymMap.[u32],   // non-local name -> symbol index + 1
+}
+
+pub fn new_obj(machine: u32) *mut Obj {
+    let o = u.new.[Obj]();
+    o.machine = machine;
+    return o;
+}
+
+pub fn add_sec(o: *mut Obj, name: []u8, kind: i32, align: u64) i32 {
+    let s = u.new.[Sec]();
+    s.name = name;
+    s.kind = kind;
+    s.align = align;
+    o.secs.push(s);
+    return @int_cast(i32, o.secs.len - 1);
+}
+
+pub fn sec_size(s: *Sec) u64 {
+    if (s.kind == S_BSS) or (s.kind == S_TBSS) {
+        return s.size;
+    }
+    return @as(u64, s.data.len());
+}
+
+pub fn add_sym(o: *mut Obj, s: Sym) u32 {
+    if (s.bind != B_LOCAL) and (s.name.len > 0) {
+        let k = u.intern(s.name);
+        let prev = o.symmap.get(k);
+        if prev != 0 {
+            // a declaration seen earlier: now defined
+            let p = o.syms.at(@as(usize, prev - 1));
+            if (p.sec < 0) and (s.sec >= 0) {
+                p.* = s;
+            }
+            return prev - 1;
+        }
+        o.syms.push(s);
+        o.symmap.put(k, @int_cast(u32, o.syms.len));
+        return @int_cast(u32, o.syms.len - 1);
+    }
+    o.syms.push(s);
+    return @int_cast(u32, o.syms.len - 1);
+}
+
+// An undefined (external) symbol, or the existing one of that name.
+pub fn ext_sym(o: *mut Obj, name: []u8, weak: bool) u32 {
+    let k = u.intern(name);
+    let prev = o.symmap.get(k);
+    if prev != 0 {
+        return prev - 1;
+    }
+    let mut b = B_GLOBAL;
+    if weak {
+        b = B_WEAK;
+    }
+    return add_sym(o, Sym.{ name: name, sec: -1, value: 0, size: 0, bind: b, ty: T_NOTYPE, hidden: false });
+}
+
+fn sec_flags(k: i32) u64 {
+    // SHF_WRITE 1, SHF_ALLOC 2, SHF_EXECINSTR 4, SHF_TLS 0x400
+    if k == S_TEXT {
+        return 6;
+    }
+    if k == S_RODATA {
+        return 2;
+    }
+    if (k == S_DATA) or (k == S_BSS) {
+        return 3;
+    }
+    return 0x403;
+}
+
+fn sec_type(k: i32) u32 {
+    // SHT_PROGBITS 1, SHT_NOBITS 8
+    if (k == S_BSS) or (k == S_TBSS) {
+        return 8;
+    }
+    return 1;
+}
+
+struct Shdr {
+    name: u32,
+    ty: u32,
+    flags: u64,
+    off: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    align: u64,
+    entsize: u64,
+}
+
+pub fn write(o: *mut Obj) []u8 {
+    let mut out = bn.new_bytes();
+    out.zeros(64);
+    let mut shstr = bn.new_bytes();
+    shstr.u8_(0);
+    let mut shdrs = u.List.[Shdr].{ data: u.nil.[Shdr](), len: 0, cap: 0 };
+    shdrs.push(Shdr.{ name: 0, ty: 0, flags: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 });
+    // content sections
+    for i in 0..o.secs.len {
+        let s = o.secs.get(i);
+        let nm = @int_cast(u32, shstr.len());
+        shstr.put(s.name);
+        shstr.u8_(0);
+        let a = s.align;
+        let mut al = a;
+        if al == 0 {
+            al = 1;
+        }
+        out.align(@truncate(usize, al));
+        let off = @as(u64, out.len());
+        if sec_type(s.kind) == 1 {
+            out.put(s.data.view());
+        }
+        s.index = @int_cast(u32, shdrs.len);
+        shdrs.push(Shdr.{ name: nm, ty: sec_type(s.kind), flags: sec_flags(s.kind), off: off, size: sec_size(s),
+                          link: 0, info: 0, align: al, entsize: 0 });
+    }
+    // symbol table: null, section symbols, locals, then globals
+    let mut strtab = bn.new_bytes();
+    strtab.u8_(0);
+    let mut symtab = bn.new_bytes();
+    symtab.zeros(24);
+    let nsym = o.syms.len;
+    let map = u.newn.[u32](nsym + 1);  // our index -> ELF index
+    let mut k: u32 = 1;
+    for pass in @as(i32, 0)..2 {
+        for i in 0..nsym {
+            let s = o.syms.at(i);
+            let local = s.bind == B_LOCAL;
+            if (pass == 0) != local {
+                continue;
+            }
+            let nm = @int_cast(u32, strtab.len());
+            strtab.put(s.name);
+            strtab.u8_(0);
+            symtab.u32_(@as(u64, nm));
+            let mut st_type = s.ty;
+            if (s.sec >= 0) and (st_type == T_NOTYPE) {
+                st_type = T_OBJECT;
+            }
+            symtab.u8_((s.bind << 4) | st_type);
+            if s.hidden {
+                symtab.u8_(2);
+            } else {
+                symtab.u8_(0);
+            }
+            if s.sec >= 0 {
+                symtab.u16_(@as(u64, o.secs.get(@int_cast(usize, s.sec)).index));
+            } else {
+                symtab.u16_(0);
+            }
+            symtab.u64_(s.value);
+            symtab.u64_(s.size);
+            map[i] = k;
+            k += 1;
+        }
+    }
+    let mut first_global: u32 = 1;
+    for i in 0..nsym {
+        if o.syms.at(i).bind == B_LOCAL {
+            first_global += 1;
+        }
+    }
+    // relocation sections
+    let mut nrel: u32 = 0;
+    for i in 0..o.secs.len {
+        if o.secs.get(i).relocs.len > 0 {
+            nrel += 1;
+        }
+    }
+    let symtab_index = @int_cast(u32, shdrs.len) + nrel;
+    for i in 0..o.secs.len {
+        let s = o.secs.get(i);
+        if s.relocs.len == 0 {
+            continue;
+        }
+        let nm = @int_cast(u32, shstr.len());
+        shstr.put(".rela");
+        shstr.put(s.name);
+        shstr.u8_(0);
+        out.align(8);
+        let off = @as(u64, out.len());
+        for j in 0..s.relocs.len {
+            let r = s.relocs.get(j);
+            out.u64_(r.off);
+            out.u64_((@as(u64, map[@as(usize, r.sym)]) << 32) | @as(u64, r.ty));
+            out.u64_(@bit_cast(u64, r.addend));
+        }
+        shdrs.push(Shdr.{ name: nm, ty: 4, flags: 0x40, off: off, size: @as(u64, s.relocs.len) * 24, link: symtab_index,
+                          info: s.index, align: 8, entsize: 24 });
+    }
+    // .symtab, .strtab, .note.GNU-stack, .shstrtab
+    let n_symtab = @int_cast(u32, shstr.len());
+    shstr.put(".symtab");
+    shstr.u8_(0);
+    out.align(8);
+    let so = @as(u64, out.len());
+    out.put(symtab.view());
+    shdrs.push(Shdr.{ name: n_symtab, ty: 2, flags: 0, off: so, size: @as(u64, symtab.len()), link: symtab_index + 1,
+                      info: first_global, align: 8, entsize: 24 });
+    let n_strtab = @int_cast(u32, shstr.len());
+    shstr.put(".strtab");
+    shstr.u8_(0);
+    let sto = @as(u64, out.len());
+    out.put(strtab.view());
+    shdrs.push(Shdr.{ name: n_strtab, ty: 3, flags: 0, off: sto, size: @as(u64, strtab.len()), link: 0, info: 0,
+                      align: 1, entsize: 0 });
+    let n_note = @int_cast(u32, shstr.len());
+    shstr.put(".note.GNU-stack");
+    shstr.u8_(0);
+    shdrs.push(Shdr.{ name: n_note, ty: 1, flags: 0, off: @as(u64, out.len()), size: 0, link: 0, info: 0, align: 1,
+                      entsize: 0 });
+    let n_shstr = @int_cast(u32, shstr.len());
+    shstr.put(".shstrtab");
+    shstr.u8_(0);
+    let sho = @as(u64, out.len());
+    out.put(shstr.view());
+    shdrs.push(Shdr.{ name: n_shstr, ty: 3, flags: 0, off: sho, size: @as(u64, shstr.len()), link: 0, info: 0,
+                      align: 1, entsize: 0 });
+    // section headers
+    out.align(8);
+    let shoff = @as(u64, out.len());
+    for i in 0..shdrs.len {
+        let h = shdrs.get(i);
+        out.u32_(@as(u64, h.name));
+        out.u32_(@as(u64, h.ty));
+        out.u64_(h.flags);
+        out.u64_(0);
+        out.u64_(h.off);
+        out.u64_(h.size);
+        out.u32_(@as(u64, h.link));
+        out.u32_(@as(u64, h.info));
+        out.u64_(h.align);
+        out.u64_(h.entsize);
+    }
+    // ELF header
+    let hdr = out.view();
+    let ident = "\x7fELF\x02\x01\x01";
+    for i in 0..ident.len {
+        hdr[i] = ident[i];
+    }
+    out.set_u32(16, 1 | (@as(u64, o.machine) << 16));  // e_type REL, e_machine
+    out.set_u32(20, 1);                                // e_version
+    out.set_u64(40, shoff);
+    out.set_u32(52, 64);                               // e_ehsize = 64, e_phentsize = 0
+    out.set_u32(56, 0 | (@as(u64, 64) << 16));         // e_phnum = 0, e_shentsize = 64
+    out.set_u32(60, @as(u64, shdrs.len) | (@as(u64, shdrs.len - 1) << 16));  // e_shnum, e_shstrndx
+    let r = u.dup(out.view());
+    out.free();
+    shstr.free();
+    strtab.free();
+    symtab.free();
+    u.free(@ptr_cast(*mut void, shdrs.data));
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Reading (objects this compiler wrote)
+// -----------------------------------------------------------------------------
+fn rd16(d: []u8, off: usize) u64 {
+    return @as(u64, d[off]) | (@as(u64, d[off + 1]) << 8);
+}
+
+fn rd32(d: []u8, off: usize) u64 {
+    return rd16(d, off) | (rd16(d, off + 2) << 16);
+}
+
+fn rd64(d: []u8, off: usize) u64 {
+    return rd32(d, off) | (rd32(d, off + 4) << 32);
+}
+
+fn cstr_at(d: []u8, off: usize) []u8 {
+    let mut e = off;
+    while (e < d.len) and (d[e] != 0) {
+        e += 1;
+    }
+    return d[off..e];
+}
+
+pub fn read(d: []u8) *mut Obj {
+    if (d.len < 64) or not u.str_eq(d[0..4], "\x7fELF") or (d[4] != 2) {
+        return u.nil.[Obj]();
+    }
+    let o = new_obj(@truncate(u32, rd16(d, 18)));
+    let shoff = @truncate(usize, rd64(d, 40));
+    let shnum = @truncate(usize, rd16(d, 60));
+    let shstrndx = @truncate(usize, rd16(d, 62));
+    let stroff = @truncate(usize, rd64(d, sh(shoff, shstrndx) + 24));
+    // content sections -> our sections
+    let secmap = u.newn.[i32](shnum + 1);
+    let mut symtab_sh: usize = 0;
+    for i in 0..shnum {
+        secmap[i] = -1;
+        let h = sh(shoff, i);
+        let ty = rd32(d, h + 4);
+        let flags = rd64(d, h + 8);
+        let name = cstr_at(d, stroff + @truncate(usize, rd32(d, h)));
+        if ty == 2 {
+            symtab_sh = i;
+        }
+        if ((ty != 1) and (ty != 8)) or ((flags & 2) == 0) {
+            continue;
+        }
+        let kind = classify(ty, flags);
+        let si = add_sec(o, u.dup(name), kind, rd64(d, h + 48));
+        let s = o.secs.get(@int_cast(usize, si));
+        let off = @truncate(usize, rd64(d, h + 24));
+        let size = rd64(d, h + 32);
+        if ty == 8 {
+            s.size = size;
+        } else {
+            s.data.put(d[off..off + @truncate(usize, size)]);
+        }
+        secmap[i] = si;
+    }
+    // symbols
+    let mut elf2us = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };
+    if symtab_sh != 0 {
+        let h = sh(shoff, symtab_sh);
+        let off = @truncate(usize, rd64(d, h + 24));
+        let size = @truncate(usize, rd64(d, h + 32));
+        let strsh = sh(shoff, @truncate(usize, rd32(d, h + 40)));
+        let soff = @truncate(usize, rd64(d, strsh + 24));
+        let n = size / 24;
+        for i in 0..n {
+            let e = off + (i * 24);
+            if i == 0 {
+                elf2us.push(0);
+                continue;
+            }
+            let name = cstr_at(d, soff + @truncate(usize, rd32(d, e)));
+            let info = d[e + 4];
+            let other = d[e + 5];
+            let shndx = @truncate(usize, rd16(d, e + 6));
+            let mut sec: i32 = -1;
+            if (shndx != 0) and (shndx < shnum) {
+                sec = secmap[shndx];
+            }
+            let s = Sym.{ name: u.dup(name), sec: sec, value: rd64(d, e + 8), size: rd64(d, e + 16), bind: info >> 4,
+                          ty: info & 15, hidden: (other & 3) == 2 };
+            o.syms.push(s);
+            let idx = @int_cast(u32, o.syms.len - 1);
+            if (s.bind != B_LOCAL) and (s.name.len > 0) {
+                o.symmap.put(u.intern(s.name), idx + 1);
+            }
+            elf2us.push(idx);
+        }
+    }
+    // relocations
+    for i in 0..shnum {
+        let h = sh(shoff, i);
+        if rd32(d, h + 4) != 4 {
+            continue;
+        }
+        let target = @truncate(usize, rd32(d, h + 44));
+        if (target >= shnum) or (secmap[target] < 0) {
+            continue;
+        }
+        let s = o.secs.get(@int_cast(usize, secmap[target]));
+        let off = @truncate(usize, rd64(d, h + 24));
+        let n = @truncate(usize, rd64(d, h + 32)) / 24;
+        for j in 0..n {
+            let e = off + (j * 24);
+            let info = rd64(d, e + 8);
+            let es = @truncate(usize, info >> 32);
+            let mut us: u32 = 0;
+            if es < elf2us.len {
+                us = elf2us.get(es);
+            }
+            s.relocs.push(Rel.{ off: rd64(d, e), ty: @truncate(u32, info), sym: us, addend: @bit_cast(i64, rd64(d, e + 16)) });
+        }
+    }
+    return o;
+}
+
+fn classify(ty: u64, flags: u64) i32 {
+    let tls = (flags & 0x400) != 0;
+    if ty == 8 {
+        if tls {
+            return S_TBSS;
+        }
+        return S_BSS;
+    }
+    if tls {
+        return S_TDATA;
+    }
+    if (flags & 4) != 0 {
+        return S_TEXT;
+    }
+    if (flags & 1) != 0 {
+        return S_DATA;
+    }
+    return S_RODATA;
+}
+
+fn sh(shoff: usize, i: usize) usize {
+    return shoff + (i * 64);
+}
