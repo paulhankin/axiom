@@ -249,14 +249,14 @@ pub fn int_width(t: *Ty) u32 {
 }
 
 pub fn field_ty(t: *mut Ty, i: usize) *mut Ty {
-    if t.kind == T_ARRAY {
+    if (t.kind == T_ARRAY) or (t.kind == T_VEC) {
         return t.elem;
     }
     return t.fields[i];
 }
 
 pub fn field_off(t: *mut Ty, i: usize) u64 {
-    if t.kind == T_ARRAY {
+    if (t.kind == T_ARRAY) or (t.kind == T_VEC) {
         return t.elem.size * @as(u64, i);
     }
     return t.offs[i];

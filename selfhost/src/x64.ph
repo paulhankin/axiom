@@ -253,6 +253,9 @@ fn is_inst(v: *ir.Value, op: i32) bool {
 // Constant integer value (sign-extended), if v is one.
 fn cval(v: *ir.Value) i64 {
     if v.kind == ir.V_CINT {
+        if v.ty.bits == 1 {
+            return @bit_cast(i64, v.cv);  // i1 is 0 or 1
+        }
         return ir.sval(v);
     }
     return 0;
