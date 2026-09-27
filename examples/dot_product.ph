@@ -1,6 +1,6 @@
 // =============================================================================
-// File: dot_product.ax
-// Build: axiom build dot_product.ax --target=wasm32-freestanding -O3 -o engine.wasm
+// File: dot_product.ph
+// Build: phalange build dot_product.ph --target=wasm32-freestanding -O3 -o engine.wasm
 // =============================================================================
 
 import host "env" {

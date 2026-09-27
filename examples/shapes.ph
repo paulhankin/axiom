@@ -1,7 +1,7 @@
 // =============================================================================
-// File: shapes.ax
+// File: shapes.ph
 // Tagged unions, match, methods, error handling, and inline WASM.
-// Build: axiom build shapes.ax --target=wasm32-freestanding -o shapes.wasm
+// Build: phalange build shapes.ph --target=wasm32-freestanding -o shapes.wasm
 // =============================================================================
 
 error { InvalidInput }

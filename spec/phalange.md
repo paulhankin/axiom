@@ -1,7 +1,7 @@
-# Axiom Language Specification
+# Phalange Language Specification
 
-**Version:** 0.1-draft.1
-**File extension:** `.ax`
+**Version:** 0.1-draft.2
+**File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
 and unresolved questions are in [Appendix D](#appendix-d-open-questions).
@@ -20,13 +20,15 @@ and unresolved questions are in [Appendix D](#appendix-d-open-questions).
 7. [Expressions](#7-expressions)
 8. [Statements](#8-statements)
 9. [Functions and Methods](#9-functions-and-methods)
-10. [Errors](#10-errors)
-11. [Memory Model](#11-memory-model)
-12. [SIMD](#12-simd)
-13. [Inline WebAssembly](#13-inline-webassembly)
-14. [Targets and ABI](#14-targets-and-abi)
-15. [Standard Library Core](#15-standard-library-core)
-16. [Toolchain and Agent Diagnostic Interface](#16-toolchain-and-agent-diagnostic-interface)
+10. [Generics](#10-generics)
+11. [Errors](#11-errors)
+12. [Memory Model](#12-memory-model)
+13. [SIMD](#13-simd)
+14. [Inline WebAssembly](#14-inline-webassembly)
+15. [Targets and ABI](#15-targets-and-abi)
+16. [Standard Library Core](#16-standard-library-core)
+17. [Toolchain and Agent Diagnostic Interface](#17-toolchain-and-agent-diagnostic-interface)
+18. [Complete Example](#18-complete-example)
 - [Appendix A: Builtin Functions](#appendix-a-builtin-functions)
 - [Appendix B: Trap Conditions](#appendix-b-trap-conditions)
 - [Appendix C: Changes from the Design Notes](#appendix-c-changes-from-the-design-notes)
@@ -38,10 +40,10 @@ and unresolved questions are in [Appendix D](#appendix-d-open-questions).
 
 - **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as in RFC 2119.
 - A **compile error** means a conforming implementation rejects the program with a
-  diagnostic. Every compile error has a stable code (§16.3).
+  diagnostic. Every compile error has a stable code (§17.3).
 - A **trap** ends execution immediately and deterministically. In WebAssembly it is the
   `unreachable` instruction or a native WASM trap. A trap is *defined behavior*: its
-  cause and location are part of the program's meaning (§11.7, Appendix B).
+  cause and location are part of the program's meaning (§12.7, Appendix B).
 - An **unspecified value** is some bit pattern of the correct type, chosen by the
   implementation and possibly different between runs. Reading one is **not** undefined
   behavior, and a compiler MUST NOT assume it never happens. (This is the difference from
@@ -59,20 +61,20 @@ zero or more, `+` means one or more, `( )` groups, and `"x"` is a literal token.
 
 ## 1. Design Mandate
 
-Axiom is a systems language whose main target is WebAssembly. It is designed for programs
+Phalange is a systems language whose main target is WebAssembly. It is designed for programs
 that machine agents write, read and repair. Each principle below is paired with the
 concrete rules that enforce it.
 
 | Principle | Enforced by |
 |---|---|
 | **Zero hidden control flow** | No exceptions, destructors, operator overloading, implicit calls, getters, or implicit allocation. The only non-local exits are `return`, `break`, `continue`, postfix `!`, `catch … return`, and traps. `defer` is written out at the point where it is registered. |
-| **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `axiom fmt`. |
-| **Zero undefined behavior** | Arithmetic, shifts, casts, and memory access all have defined results or traps. Memory is an abstract, bounds-checked linear byte array (§11). Compilers MUST NOT optimize on assumptions that the absence of UB would otherwise justify. |
-| **First-class WASM/SIMD** | 128-bit vector types are primitives. Inline WebAssembly is structured, typed, and validated (§13). WASM semantics are the reference semantics. |
+| **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `phalange fmt`. |
+| **Zero undefined behavior** | Arithmetic, shifts, casts, and memory access all have defined results or traps. Memory is an abstract, bounds-checked linear byte array (§12). Compilers MUST NOT optimize on assumptions that the absence of UB would otherwise justify. |
+| **First-class WASM/SIMD** | 128-bit vector types are primitives. Inline WebAssembly is structured, typed, and validated (§14). WASM semantics are the reference semantics. |
 | **Arena-centric memory** | There is no global allocator. Every allocation names an `Allocator`. The standard library is built around arenas and `defer`. |
 
 A secondary principle is **locality of reasoning**. The meaning of a line of code should
-follow from that line and the declarations it names. This is why Axiom forbids shadowing
+follow from that line and the declarations it names. This is why Phalange forbids shadowing
 (§4.4), forbids silently discarding results (§8.2), and allows only the short, closed list
 of implicit conversions in §6.1.
 
@@ -89,7 +91,7 @@ characters may appear only inside comments and string literals. Line terminators
 ### 2.2 Whitespace and comments
 
 Whitespace (space, tab, line terminators) separates tokens and is otherwise ignored.
-Tabs are allowed, but `axiom fmt` emits spaces.
+Tabs are allowed, but `phalange fmt` emits spaces.
 
 - `// …` runs to the end of the line.
 - `/// …` is a *doc comment* and attaches to the declaration that follows it.
@@ -118,6 +120,9 @@ return    Self      struct    true      union     wasm      while
 u8  u16  u32  u64  usize   i8  i16  i32  i64  isize   f32  f64   bool  void
 i8x16  u8x16  i16x8  u16x8  i32x4  u32x4  i64x2  u64x2  f32x4  f64x2  v128
 ```
+
+**Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
+`UnsignedInt`, `Float`. These may not be declared as identifiers.
 
 **Reserved for future use:** `async`, `await`, `comptime`, `enum`, `extern`, `impl`,
 `interface`, `null`, `test`, `trait`, `type`, `unsafe`, `yield`.
@@ -163,7 +168,7 @@ A **builtin name** `@` IDENT is a single token (for example `@splat`).
 ### 2.7 Inline-WASM lexical mode
 
 After `wasm {` or `wasm -> Type {`, the lexer switches to *WASM mode* until the matching
-`}` (§13.2). In WASM mode, tokens follow the WebAssembly text format: instruction names
+`}` (§14.2). In WASM mode, tokens follow the WebAssembly text format: instruction names
 like `i32.clz` and `v128.load`, `$`-prefixed names, integer and float immediates, and
 `offset=`/`align=` immediates. Mode switching is purely lexical and needs no parser
 feedback.
@@ -203,18 +208,22 @@ GlobalDecl    ::= "let" "mut"? IDENT ":" Type "=" Expr ";"
 ### 3.2 Aggregates and functions
 
 ```ebnf
-StructDecl    ::= "struct" IDENT "{" FieldList? MethodDecl* "}"
+StructDecl    ::= "struct" IDENT GenericParams? "{" FieldList? MethodDecl* "}"
 FieldList     ::= Field ( "," Field )* ","?
 Field         ::= IDENT ":" Type
 
-UnionDecl     ::= "union" IDENT "{" Variant ( "," Variant )* ","? MethodDecl* "}"
+UnionDecl     ::= "union" IDENT GenericParams? "{" Variant ( "," Variant )* ","? MethodDecl* "}"
 Variant       ::= IDENT ( ":" Type )?
 
 MethodDecl    ::= "pub"? FnDecl
 
-FnDecl        ::= "fn" IDENT "(" ParamList? ")" Type Block
+FnDecl        ::= "fn" IDENT GenericParams? "(" ParamList? ")" Type Block
 ParamList     ::= Param ( "," Param )* ","?
 Param         ::= IDENT ":" Type
+
+GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
+GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type
+Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
 ```
 
 The trailing-comma forms are LL(1). After a `,`, an `IDENT` begins another element, and
@@ -233,12 +242,20 @@ Type          ::= "!" Type                          (* error union *)
                 | "error"
                 | "Self"
                 | PrimType
-                | IDENT ( "." IDENT )?              (* named / module-qualified *)
+                | NamedType
+
+NamedType     ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )?
+GenericArgs   ::= "." "[" GenericArgList "]"
+GenericArgList::= GenericArg ( "," GenericArg )* ","?
+GenericArg    ::= Type | INT_LIT
 
 ArrayLen      ::= INT_LIT | IDENT ( "." IDENT )?    (* must name a const *)
 TypeList      ::= Type ( "," Type )* ","?
 PrimType      ::= (any reserved type name, §2.4)
 ```
+
+`NamedType` accepts `Name`, `module.Name`, `Name.[Args]` and `module.Name.[Args]`. After
+the `.`, the next token (`IDENT` or `[`) decides which form it is.
 
 ### 3.4 Statements
 
@@ -302,7 +319,7 @@ UnaryExpr     ::= ( "-" | "-%" | "~" | "not" | "&" "mut"? ) UnaryExpr
                 | PostfixExpr
 
 PostfixExpr   ::= PrimaryExpr PostfixOp*
-PostfixOp     ::= "." ( IDENT | "*" | "{" FieldInits "}" )
+PostfixOp     ::= "." ( IDENT | "*" | "{" FieldInits "}" | "[" GenericArgList "]" )
                 | "(" ArgList? ")"
                 | "[" IndexOrSlice "]"
                 | "!"
@@ -329,7 +346,7 @@ post-pass that needs no symbol information.
 
 **Why struct literals are `T.{ … }` and not `T { … }`.** A bare `IDENT {` is ambiguous in
 positions such as `if x == Point { … }`. It is unclear whether the `{` starts a struct
-literal or the `if` body. Rust resolves this with context-sensitive restrictions. Axiom
+literal or the `if` body. Rust resolves this with context-sensitive restrictions. Phalange
 avoids the problem at the token level: a struct literal always begins with `.{`.
 
 ### 3.6 Builtin calls
@@ -351,7 +368,7 @@ WasmImmediate ::= "$" IDENT | INT_LIT | FLOAT_LIT | ("offset" | "align") "=" INT
                 | "(" "result" WasmValType ")"
 ```
 
-See §13 for the permitted instruction set and typing.
+See §14 for the permitted instruction set and typing.
 
 ---
 
@@ -359,7 +376,7 @@ See §13 for the permitted instruction set and typing.
 
 ### 4.1 Modules
 
-Each `.ax` file is a module. `import "path.ax" as name;` binds `name` to that module's `pub`
+Each `.ph` file is a module. `import "path.ph" as name;` binds `name` to that module's `pub`
 declarations. Paths are relative to the importing file. A path beginning with `std/`
 resolves to the standard library, for example `import "std/mem" as mem;`.
 
@@ -370,7 +387,7 @@ Import cycles are a compile error (`E0210`) in v0.1.
 - `pub` makes a top-level item, or a method, visible to importing modules.
 - Struct and union **fields** are visible wherever the type is visible. v0.1 has no field
   privacy.
-- `export` makes a function a WebAssembly export (§14.2). An exported function is not
+- `export` makes a function a WebAssembly export (§15.2). An exported function is not
   automatically `pub`.
 
 ### 4.3 Declaration order
@@ -450,7 +467,7 @@ Through a `[]mut T`, they are readable and writable.
 
 ### 5.7 Raw pointers: `*T` and `*mut T`
 
-A raw pointer is an address in linear memory (§11). It has the same size as `usize`.
+A raw pointer is an address in linear memory (§12). It has the same size as `usize`.
 Pointers are **non-nullable in the type system**: the language has no `null` literal. The
 only operations on pointers are:
 
@@ -476,11 +493,11 @@ There is no pointer arithmetic operator. Write
 | `f64x2` | 2 × f64 |
 | `v128` | 128 raw bits (no lane interpretation) |
 
-All vector types are 16 bytes with 16-byte alignment. See §12.
+All vector types are 16 bytes with 16-byte alignment. See §13.
 
 ### 5.9 Structs
 
-```axiom
+```phalange
 struct Vec2 {
     x: f32,
     y: f32,
@@ -502,7 +519,7 @@ the same type when their field names and field types match exactly, in the same 
 
 ### 5.10 Tagged unions
 
-```axiom
+```phalange
 pub union Shape {
     Circle: struct { radius: f32 },
     Rect:   struct { width: f32, height: f32 },
@@ -511,7 +528,7 @@ pub union Shape {
 ```
 
 A union value holds exactly one variant. A variant without a `: Type` carries no payload.
-Unions are the only form of polymorphism. Axiom has no vtables, inheritance, or interfaces.
+Unions are the only form of polymorphism. Phalange has no vtables, inheritance, or interfaces.
 
 **Layout.**
 
@@ -528,21 +545,21 @@ happen after writing through raw pointers, the program traps (`T0007`).
 
 ### 5.11 Function pointer types: `fn(T1, T2) R`
 
-A function pointer is a value that refers to a top-level function or method. Axiom has no
+A function pointer is a value that refers to a top-level function or method. Phalange has no
 closures and no captured environment. A named function used as a value has function-pointer
-type. On WASM, the value is a table index of type `u32` (§14.3). Calling an invalid function
+type. On WASM, the value is a table index of type `u32` (§15.3). Calling an invalid function
 pointer traps (`T0009`), which follows WASM `call_indirect` semantics.
 
 ### 5.12 Error unions: `!T`
 
-`!T` holds either a value of type `T` or a value of type `error` (§10). Its layout is exactly
+`!T` holds either a value of type `T` or a value of type `error` (§11). Its layout is exactly
 `struct { code: u16, value: T }`. `code == 0` means success. When `code ≠ 0`, the contents
 of `value` are unspecified.
 
 ### 5.13 The `error` type
 
 `error` is a 16-bit code. Code 0 is reserved and never names an error. Every name declared
-in any `error { … }` block in the program is assigned a distinct non-zero code (§10.1).
+in any `error { … }` block in the program is assigned a distinct non-zero code (§11.1).
 
 ---
 
@@ -555,7 +572,7 @@ The following are the **only** conversions the compiler performs without being a
 1. **Untyped literal typing.** An integer, float or character literal takes the type the
    context expects. The value must be exactly representable (`E0503` otherwise). A float
    literal must round-trip exactly when the target is `f32`, or else be written with a
-   `@float_cast`. (See Appendix D, Q7.)
+   `@float_cast`. (See Appendix D, Q5.)
 2. **Mutability weakening.** `[]mut T → []T` and `*mut T → *T`.
 3. **Error-union wrapping.** A `T` or an `error` converts to `!T` in a `return` statement,
    an assignment, or an argument passed to a `!T` parameter.
@@ -579,7 +596,7 @@ All other conversions use builtins (Appendix A):
 | `@bit_cast(T, x)` | Reinterprets bits. Sizes must match | Size mismatch is a compile error (`E0512`) |
 | `@int_from_ptr(p)` | Address as `usize` | Never fails |
 | `@ptr_from_int(P, n)` | `usize` to pointer type `P` | Never fails. Any address is valid to form |
-| `@ptr_cast(P, p)` | Changes the pointee type | Never fails. Alignment is not semantic (§11.5) |
+| `@ptr_cast(P, p)` | Changes the pointee type | Never fails. Alignment is not semantic (§12.5) |
 
 ---
 
@@ -623,21 +640,21 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 |---|---|---|---|
 | **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0 |
 | **A**dditive | `+` `-` `+%` `-%` | int, float | `%`-suffixed forms wrap, int only |
-| **S**hift | `<<` `>>` | int | §7.6 |
+| **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
 | **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer | result `bool` |
 | Logical-**and** | `and` | bool | short-circuit |
 | Logical-**or** | `or` | bool | short-circuit |
 
 Both operands of a binary operator must have the **same type**, after literal typing
-(`E0412` otherwise). Axiom has no implicit widening, and mixed `u32 + u64` is an error.
+(`E0412` otherwise). Phalange has no implicit widening, and mixed `u32 + u64` is an error.
 
 Structs, unions, arrays and slices do not support `==`. Compare them field by field or
 with `@mem_eq` (Appendix A).
 
 ### 7.4 Operator precedence: a partial order
 
-Axiom does not use a total precedence table. Precedence is a **partial order**. The
+Phalange does not use a total precedence table. Precedence is a **partial order**. The
 relationships everyone agrees on are defined. Any other combination of operators must be
 **parenthesized**, and otherwise it is a compile error (`E0150`, with a machine-applicable
 fix that inserts the parentheses).
@@ -679,7 +696,7 @@ If neither holds, the program is rejected with `E0150`.
 | `x & mask == 0` | `(x & mask) == 0`. Unlike C, `&` binds tighter than `==`, so the classic C bug cannot occur |
 | `a << 2 + 1` | **E0150**: `<<` and `+` are unordered |
 | `a or b == c` | `a or (b == c)` |
-| `a and b or c` | **E0150**: `and` and `or` are unordered (Appendix D, Q3) |
+| `a and b or c` | **E0150**: `and` and `or` are unordered (Appendix D, Q2) |
 | `a < b == c` | **E0150** |
 
 Unary operators bind tighter than all binary operators. Postfix operators bind tighter
@@ -700,7 +717,7 @@ Applying `-` to an unsigned type is a compile error (`E0520`). Use `-%` or subtr
 
 ### 7.6 Integer arithmetic semantics
 
-**Overflow mode.** Each build has an *overflow mode*, chosen with a compiler flag (§16.1):
+**Overflow mode.** Each build has an *overflow mode*, chosen with a compiler flag (§17.1):
 
 - `trap` (the default): if the mathematical result of `+`, `-`, `*`, unary `-`, or
   `MIN / -1` is not representable, the program traps (`T0002`).
@@ -716,15 +733,25 @@ every mode.
 so `a == (a / b) * b + (a % b)` whenever `a / b` does not overflow. A divisor of 0 traps
 (`T0003`) in **every** mode. `MIN % -1` is `0`.
 
-**Shifts.** The shift count is taken as an unsigned value. If the left operand has `n`
-bits, the count is **clamped** to `n − 1`:
+**Shifts.** A shift has its mathematical meaning for **every** count, including counts at or
+above the bit width. Let `x` have `n` bits and let the count be `k`:
 
-- `x << k` is `x << min(k, n−1)`. Bits shifted out are discarded, so `<<` never traps.
-- `x >> k` is an arithmetic shift for signed `x` and a logical shift for unsigned `x`,
-  using the same clamp.
+- `x << k` is `x · 2ᵏ` reduced modulo `2ⁿ`: bits shifted out of the top are discarded.
+  When `k ≥ n` the result is `0`. `<<` never traps in either overflow mode.
+- For unsigned `x`, `x >> k` is `⌊x / 2ᵏ⌋`, so `k ≥ n` gives `0`.
+- For signed `x`, `x >> k` is the arithmetic shift `⌊x / 2ᵏ⌋`, which rounds toward −∞. When
+  `k ≥ n` the result is `0` if `x ≥ 0` and `-1` if `x < 0`.
 
-The count may be any integer type. A negative signed count is treated as clamped to
-`n − 1`. (See Appendix D, Q2.)
+For example, with `x: u32 = 0xFFFF_FFFF`, `x << 40` is `0` and `x >> 40` is `0`.
+
+The count may be any **unsigned** integer type, independently of `x`'s type. This is the
+one exception to the same-type rule in §7.3. An untyped literal count is typed as `u32`. A
+signed count is a compile error (`E0525`); converting it explicitly makes the negative case
+visible.
+
+*Codegen note:* WebAssembly's `i32.shl` family takes the count modulo the width. When `k` is
+not a constant known to be less than `n`, the compiler emits a compare-and-select. Raw shift
+instructions inside inline WASM (§14) keep WebAssembly semantics.
 
 **Constant evaluation.** In a `const` initializer or an array length, an overflow is a
 compile error (`E0530`) in every mode.
@@ -735,7 +762,7 @@ compile error (`E0530`) in every mode.
 - Division by zero produces ±∞ or NaN, per IEEE. It does not trap.
 - **No contraction.** `a * b + c` MUST NOT be fused into an FMA. Use `@fma` to request one.
 - **No reassociation.** Algebraic rewrites that could change a result are forbidden.
-  Axiom has no fast-math flag.
+  Phalange has no fast-math flag.
 - **NaN payloads** of results are unspecified, as in WebAssembly §4.3.3. NaN-ness itself
   is deterministic.
 - Comparisons follow IEEE: any comparison with NaN is `false`, except `!=`, which is `true`.
@@ -819,7 +846,7 @@ Discarding an error union with `_ =` is also rejected (`E0621`). Handle it with 
 
 ### 8.3 `if`
 
-The condition must be `bool`; Axiom has no truthiness. Braces are required. `else if`
+The condition must be `bool`; Phalange has no truthiness. Braces are required. `else if`
 chains are written as `else if …`.
 
 ### 8.4 `while` and `loop`
@@ -851,9 +878,9 @@ for `u8`), `bool`, or `error`.
 - Arms are tested in order. Each pattern may appear at most once (`E0631`).
 - The match must be **exhaustive** (`E0630`). A union match must list every variant or
   end with `else`. Integer and `error` matches always need `else`.
-- An arm body is a block. Axiom has no fall-through.
+- An arm body is a block. Phalange has no fall-through.
 
-```axiom
+```phalange
 fn area(s: Shape) f32 {
     match s {
         .Circle(c) => { return 3.14159265 * c.radius * c.radius; }
@@ -865,7 +892,8 @@ fn area(s: Shape) f32 {
 
 ### 8.7 `return`, `break`, `continue`
 
-- `return` with no value is allowed only in a `void` function.
+- `return` with no value is allowed only in a `void` or `!void` function. Such functions
+  may also finish by reaching the end of the body; for `!void`, that means success.
 - A non-`void` function must `return` on every path (`E0601`). Control-flow analysis
   treats `match`, `if`/`else`, `loop` without `break`, and `@trap()` precisely.
 
@@ -884,7 +912,7 @@ normal completion, `return`, `break`, `continue`, `e!` propagation, and `catch r
 
 ### 8.9 `wasm`
 
-See §13.
+See §14.
 
 ---
 
@@ -892,7 +920,7 @@ See §13.
 
 ### 9.1 Declarations
 
-```axiom
+```phalange
 fn name(p1: T1, p2: T2) R { … }
 ```
 
@@ -919,7 +947,7 @@ parameter of type `P`:
 | `*T` | `T.m(x.*, args)` | `T.m(x, args)` | `E0702` |
 | `*mut T` | `T.m(x.*, args)` | `T.m(x, args)` | `T.m(x, args)` |
 
-This table is the whole of method-call sugar. Axiom has no multi-level auto-deref, no
+This table is the whole of method-call sugar. Phalange has no multi-level auto-deref, no
 auto-ref of temporaries, and no trait lookup.
 
 ### 9.4 Function pointers
@@ -930,11 +958,197 @@ field access followed by a call, not a method call, because `alloc_fn` is a fiel
 
 ---
 
-## 10. Errors
+## 10. Generics
 
-### 10.1 Declaring errors
+### 10.1 Overview
 
-```axiom
+Functions, structs and unions may take **compile-time parameters**. These are either type
+parameters or integer constant parameters. Generics are **monomorphized**: each distinct
+set of arguments produces its own specialized copy, as if the programmer had written that
+copy out by hand. At run time there is no type information, boxing, vtable or dispatch.
+Phalange has no compile-time code execution. Instantiation is pure substitution.
+
+```phalange
+fn max[T: Ord](a: T, b: T) T {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+pub struct List[T] {
+    items: []mut T,
+    len: usize,
+
+    pub fn init(alloc: Allocator, capacity: usize) !Self {
+        let items = alloc.alloc.[T](capacity)!;
+        return Self.{ items: items, len: 0 };
+    }
+
+    pub fn push(self: *mut Self, x: T) !void {
+        if self.len == self.items.len {
+            return error.OutOfMemory;
+        }
+        self.items[self.len] = x;
+        self.len += 1;
+    }
+
+    pub fn get(self: *Self, i: usize) T {
+        return self.items[..self.len][i];
+    }
+}
+
+fn demo(alloc: Allocator) !void {
+    let mut xs = List.[u32].init(alloc, 16)!;
+    xs.push(7)!;
+    let a = max(xs.get(0), 3);       // T deduced as u32 from the first argument
+    let b = max.[f64](1.5, 2.0);     // explicit type argument
+}
+```
+
+### 10.2 Generic parameters
+
+```ebnf
+GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
+GenericParam  ::= IDENT ( ":" Constraint )?        (* type parameter *)
+                | "const" IDENT ":" Type           (* integer constant parameter *)
+Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
+```
+
+A parameter list may follow the name of a `fn`, a `struct` or a `union`. The parameters
+are in scope in the signature and the body, and also in every field, variant and method of
+a generic type. A method of a generic type may declare its own additional parameters, as
+in `fn map[U](…)`.
+
+A `const` parameter must have an integer type. Inside the body it is a constant of that
+type, so it can be used both as a value and as an array length. For example,
+`fn sum[const N: usize](a: [N]f32) f32` has a parameter of type `[N]f32`.
+
+### 10.3 Applying generic arguments: `Name.[Args]`
+
+```ebnf
+GenericArgs   ::= "." "[" GenericArg ( "," GenericArg )* ","? "]"
+GenericArg    ::= Type | INT_LIT
+```
+
+Generic arguments are written the same way in **type and expression position**:
+
+```phalange
+let xs: List.[u32] = List.[u32].init(alloc, 16)!;
+let p = max.[i64](a, b);
+let v: Grid.[f32, 4] = …;
+```
+
+**Why `.[`.** In expression position, `Name[` already means indexing and `Name<` already
+means less-than. The sequence `.[` is unused, so it keeps the grammar LL(1). It also joins
+the existing "dot introduces a special postfix form" family (`.{`, `.*`). Using the same
+spelling everywhere means there is one canonical form.
+
+A constant argument is an integer literal or the name of a `const`, including an enclosing
+`const` parameter. A name parses as a `Type` and is resolved to a constant during name
+resolution, so the parser still needs no symbol table. Arbitrary expressions are not
+allowed as arguments; declare a `const` for them.
+
+Other rules:
+
+- A generic type must always be fully applied. Writing a bare `List` as a type is
+  `E0460`.
+- Inside a generic type's body, `Self` is the instantiated type.
+- A generic function used as a value must be instantiated first: `max.[u32]` is a
+  function pointer, but `max` alone is `E0466`.
+- `export fn` and host imports cannot be generic (`E0466`).
+
+### 10.4 Argument deduction
+
+When calling a generic **function**, the argument list may be omitted if every parameter can
+be deduced from the argument types:
+
+- Each argument type is matched **structurally** against its parameter type. No implicit
+  conversions are applied during matching, with one exception: mutability weakening. For
+  example, `[]T` matches `[]mut u32` with `T = u32`.
+- Untyped literals do not contribute to deduction. If a parameter could only be deduced
+  from literals, the program is rejected with `E0463`. For example, `max(1, 2)` is
+  rejected; write `max.[u32](1, 2)`.
+- Conflicting deductions are `E0464`. For example, `max(x_u32, y_u64)` deduces two
+  different `T`s, and there is no widening to reconcile them.
+- The return type and the surrounding context **never** influence deduction.
+- Deduction is all-or-nothing: either every argument is given explicitly, or none is.
+- For methods, the enclosing type's parameters come from the receiver's type. The method's
+  own parameters are deduced from its arguments, or given explicitly:
+  `alloc.alloc.[T](n)`.
+
+Types (as opposed to functions) are never deduced. `List.[u32]` must always be written in
+full.
+
+### 10.5 Constraints
+
+A generic body is **type-checked once, at its definition**, against the constraints of its
+parameters. Any operation on a `T` that the constraint does not permit is a compile error in
+the generic itself (`E0461`), even if no instantiation ever uses it. At an instantiation site,
+the compiler checks only that the arguments satisfy the constraints (`E0462`).
+
+This means that an error can never surface *inside* a library generic because of the type
+argument a caller chose. This is a key property for agents: the error is always reported at
+the line the agent wrote.
+
+v0.1 has a closed set of builtin constraints. User-defined constraints are future work
+(Appendix D).
+
+| Constraint | Satisfied by | Additionally permits on values of `T` |
+|---|---|---|
+| *(none)* | any type except `void` | copy, assign, pass, return; `&`/`&mut`; using `T` in fields, arrays, slices and pointers; `@size_of(T)`, `@align_of(T)` |
+| `Eq` | integers, floats, `bool`, pointers, `error`, function pointers | `==`, `!=` |
+| `Ord` | integers, floats | everything `Eq` permits; `<` `<=` `>` `>=`; `@min`, `@max` |
+| `Num` | integers, floats | everything `Ord` permits; binary `+` `-` `*` `/` |
+| `Int` | all integer types | everything `Num` permits; `%`; `+%` `-%` `*%`; shifts; bitwise; `@clz` and similar; `@int_cast`/`@truncate` to or from `T`; `@min_value(T)`/`@max_value(T)` |
+| `SignedInt` | `i8` … `i64`, `isize` | everything `Int` permits; unary `-`; `@abs` |
+| `UnsignedInt` | `u8` … `u64`, `usize` | everything `Int` permits |
+| `Float` | `f32`, `f64` | everything `Num` permits; unary `-`; `@sqrt`, `@floor` and the other float builtins |
+
+**Literals in generic code.** An untyped literal is accepted as a value of type `T` only if
+it is representable in **every** type that satisfies `T`'s constraint:
+
+| Constraint | Literals accepted |
+|---|---|
+| `Num`, `Int` | integers `0` … `127` |
+| `SignedInt` | integers `-128` … `127` |
+| `UnsignedInt` | integers `0` … `255` |
+| `Float` | any float literal, and integers exactly representable in `f32` |
+
+For other values, convert explicitly, for example `@int_cast(T, @as(u32, 1000))`. This
+conversion traps at run time if `T` cannot hold the value.
+
+Semantics such as overflow behavior, NaN rules and shift behavior are those of the concrete
+instantiated type.
+
+### 10.6 Monomorphization
+
+- **Identity.** Two instantiations are the same when all their arguments are identical:
+  types by structural identity (§5), constants by value. `List.[u32]` written in two
+  different modules is a single type.
+- **Layout.** A generic type's layout is determined after substitution, by the rules in §5.
+- **Code.** Each distinct instantiation of a function is emitted exactly once per program.
+  Its debug and symbol name is its canonical spelling, for example `max.[u32]`.
+- **Termination.** Instantiation nesting deeper than 64 levels is `E0465`. An example that
+  would otherwise never terminate is `f.[T]` calling `f.[List.[T]]`.
+
+### 10.7 Deliberately absent
+
+Phalange generics have no specialization, overloading, variadic parameters, default
+arguments, higher-kinded parameters, compile-time execution, or dynamic dispatch. There are
+two ways to make code vary in behavior rather than in type:
+
+- pass a function pointer explicitly, as in
+  `fn sort[T](items: []mut T, less: fn(T, T) bool) void`, or
+- dispatch over a tagged union with `match`.
+
+---
+
+## 11. Errors
+
+### 11.1 Declaring errors
+
+```phalange
 error { OutOfMemory, DimensionMismatch, InvalidInput }
 ```
 
@@ -946,9 +1160,9 @@ Codes are assigned deterministically: all declared names are sorted by byte valu
 numbered starting at 1. `@error_name(e)` returns the name as a `[]u8`. For an unknown code
 it returns `"<unknown>"`.
 
-### 10.2 Returning and handling errors
+### 11.2 Returning and handling errors
 
-```axiom
+```phalange
 fn parse_digit(c: u8) !u32 {
     if (c < '0') or (c > '9') {
         return error.InvalidInput;
@@ -965,15 +1179,15 @@ fn sum_digits(s: []u8) !u32 {
 }
 ```
 
-Errors are ordinary values. Axiom has no stack unwinding and no exception tables, and it
+Errors are ordinary values. Phalange has no stack unwinding and no exception tables, and it
 does not capture stack traces implicitly. (Debug builds MAY record error return traces,
-§16.4.)
+§17.4.)
 
 ---
 
-## 11. Memory Model
+## 12. Memory Model
 
-### 11.1 Abstract linear memory
+### 12.1 Abstract linear memory
 
 All addressable data lives in a single **linear memory**: a byte array `M[0 .. size)` whose
 size may grow at run time (`@memory_grow`). A pointer is an index into `M`. This is the
@@ -995,7 +1209,7 @@ Because of this:
 - **Aliasing**: compilers MUST NOT assume that two pointers do not alias, whatever their
   types. There is no strict-aliasing rule and no implicit `restrict`.
 
-### 11.2 Where values live
+### 12.2 Where values live
 
 - **Globals** (`let`, `let mut` at module level) and **string literals** are in static
   regions of linear memory.
@@ -1004,50 +1218,50 @@ Because of this:
 - **Locals whose address is taken** (`&x`, `&mut x`, a slice of an array local, or an
   implicit `&` in a method call) live in a **shadow stack** in linear memory. After the
   function returns, their bytes may be reused. A pointer to them then reads unspecified
-  bytes (defined, per §11.1). The compiler SHOULD warn when such a pointer escapes
+  bytes (defined, per §12.1). The compiler SHOULD warn when such a pointer escapes
   (`W0710`).
 
-### 11.3 No uninitialized values
+### 12.3 No uninitialized values
 
 Every local and global has an initializer. Memory obtained from an allocator has
-unspecified contents (§11.1) but is never "poison".
+unspecified contents (§12.1) but is never "poison".
 
-### 11.4 Allocation
+### 12.4 Allocation
 
-Axiom has **no global allocator** and no implicit allocation. No language construct
-allocates heap memory. Allocation always names an `Allocator` (§15.1):
+Phalange has **no global allocator** and no implicit allocation. No language construct
+allocates heap memory. Allocation always names an `Allocator` (§16.1):
 
-```axiom
-let buf = @alloc(a, u32, 1024)!;   // ![]mut u32; a: Allocator
-defer @free(a, buf);
+```phalange
+let buf = a.alloc.[u32](1024)!;   // []mut u32; a: Allocator
+defer a.free(buf);                 // T deduced from the argument
 ```
 
-### 11.5 Alignment
+### 12.5 Alignment
 
 Alignment affects **layout only**. Misaligned loads and stores are defined, as in
 WebAssembly, and may simply be slower. `@ptr_cast` and `@cast_slice` therefore never trap
 on alignment. `@align_of(T)` reports the natural alignment used for layout.
 
-### 11.6 Concurrency
+### 12.6 Concurrency
 
 v0.1 is single-threaded. Shared-memory threads and atomics are future work (Appendix D).
 
-### 11.7 Traps
+### 12.7 Traps
 
-A trap stops the current WebAssembly instance, or the native process's Axiom context,
+A trap stops the current WebAssembly instance, or the native process's Phalange context,
 **immediately**:
 
 - `defer` blocks do not run.
 - The host observes the trap (in JavaScript, a `WebAssembly.RuntimeError`).
-- In debug builds, the trap site maps to a trap code and source span (§16.4).
+- In debug builds, the trap site maps to a trap code and source span (§17.4).
 
 Appendix B lists every trap condition.
 
 ---
 
-## 12. SIMD
+## 13. SIMD
 
-### 12.1 Operators on vectors
+### 13.1 Operators on vectors
 
 | Operator | Float vectors | Integer vectors | `v128` |
 |---|---|---|---|
@@ -1055,7 +1269,7 @@ Appendix B lists every trap condition.
 | `/` | lane-wise IEEE | no | no |
 | `+%` `-%` `*%` | no | lane-wise wrapping (`*%` not for 8-bit lanes; WASM has no `i8x16.mul`) | no |
 | `&` `\|` `^` `~` | no | yes | yes |
-| `<<` `>>` | no | scalar `u32` count, clamped to the lane width minus 1 | no |
+| `<<` `>>` | no | scalar unsigned count, with the §7.6 semantics applied per lane (`k ≥` lane width gives `0` or sign fill) | no |
 | unary `-` | yes | `-%` only | no |
 | `==` `<` … | no. Use `@lanes_eq`, `@lanes_lt`, … | no | no |
 
@@ -1064,7 +1278,7 @@ be expensive, and silently wrapping under the `+` symbol would contradict the sc
 
 Scalars are **never** broadcast implicitly. Write `@splat(x)`.
 
-### 12.2 Vector builtins
+### 13.2 Vector builtins
 
 Appendix A has full signatures.
 
@@ -1083,19 +1297,20 @@ Appendix A has full signatures.
 - Lane-wise math: `@min`, `@max`, `@abs`, `@sqrt`, `@floor`, `@ceil`, `@trunc`,
   `@nearest`, `@fma`.
 
-### 12.3 Native targets
+### 13.3 Native targets
 
 On native targets, vector types lower to 128-bit registers (SSE2/AVX or NEON). The
-semantics are the WASM SIMD semantics, including saturation behavior, NaN rules, and shift
-clamping. The compiler inserts fix-ups wherever host instructions differ.
+semantics are the WASM SIMD semantics, including saturation behavior and NaN rules, except
+that shift counts follow §7.6 rather than WASM's modulo rule. The compiler inserts fix-ups
+wherever host instructions differ.
 
 ---
 
-## 13. Inline WebAssembly
+## 14. Inline WebAssembly
 
-### 13.1 Forms
+### 14.1 Forms
 
-```axiom
+```phalange
 // Statement form: stack effect [] -> []
 wasm {
     nop
@@ -1110,16 +1325,16 @@ fn count_leading_zeros(val: u32) u32 {
 }
 ```
 
-### 13.2 Semantics
+### 14.2 Semantics
 
 An inline block is validated as a WebAssembly `block` with type `[] -> []` (statement form)
 or `[] -> [W(T)]` (expression form). `W(T)` is the WASM value type of `T`, defined in the
 table below. Validation errors are compile errors (`E09xx`) that point to the offending
 instruction.
 
-**Accessing Axiom variables.** `$name` names an in-scope Axiom local or parameter:
+**Accessing Phalange variables.** `$name` names an in-scope Phalange local or parameter:
 
-| Axiom type | WASM type | `local.get` | `local.set` / `local.tee` |
+| Phalange type | WASM type | `local.get` | `local.set` / `local.tee` |
 |---|---|---|---|
 | `i32` `u32` `usize`/`isize` (wasm32) | `i32` | yes | yes, if `let mut` |
 | `i64` `u64` `usize`/`isize` (wasm64) | `i64` | yes | yes, if `let mut` |
@@ -1127,7 +1342,7 @@ instruction.
 | SIMD types | `v128` | yes | yes, if `let mut` |
 | `*T`, `*mut T` | `i32`/`i64` | yes | yes, if `let mut` |
 | `bool`, 8-bit and 16-bit ints | `i32` | yes | **no**, because writing an out-of-range value would break the type's invariant |
-| structs, arrays, slices, unions | none | use `.field` in Axiom code before the block | no |
+| structs, arrays, slices, unions | none | use `.field` in Phalange code before the block | no |
 
 **Permitted instructions (v0.1).**
 
@@ -1143,9 +1358,9 @@ instruction.
 **Forbidden instructions** (`E0901`): `return`, `call`, `call_indirect`, `global.*`,
 `table.*`, `memory.grow`, `memory.init`, `data.drop`, and any branch that targets a label
 outside the block. These would create control flow or state changes that are invisible to
-the surrounding Axiom code.
+the surrounding Phalange code.
 
-### 13.3 Portability
+### 14.3 Portability
 
 Inline WASM is **not** target-specific assembly. On native targets, the compiler translates
 the block using WebAssembly semantics. An inline block therefore means the same thing on
@@ -1153,18 +1368,18 @@ every target, and is really a portable low-level IR escape hatch.
 
 ---
 
-## 14. Targets and ABI
+## 15. Targets and ABI
 
-### 14.1 Targets
+### 15.1 Targets
 
 | Target | `usize` | Notes |
 |---|---|---|
 | `wasm32-freestanding` | 32 | Primary target. No WASI and no imports except those declared |
 | `wasm32-wasi` | 32 | Standard library may use WASI imports |
 | `wasm64-freestanding` | 64 | memory64 |
-| native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a reserved virtual region with guard pages and bounds checks (§11.1). Future work |
+| native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a reserved virtual region with guard pages and bounds checks (§12.1). Future work |
 
-### 14.2 Exports
+### 15.2 Exports
 
 `export fn` produces a WebAssembly export with the same name. Parameter and return types
 must be one of the following (`E0801` otherwise):
@@ -1180,9 +1395,9 @@ must be one of the following (`E0801` otherwise):
 Exported functions MUST NOT return `!T`. Handle errors before the export boundary. The
 module exports its linear memory as `"memory"`.
 
-### 14.3 Imports
+### 15.3 Imports
 
-```axiom
+```phalange
 import host "env" {
     fn console_log(ptr: *u8, len: usize) void;
 }
@@ -1192,7 +1407,7 @@ This declares WASM function imports from module `"env"`, which is the default if
 is omitted. They are called like normal functions. Imported functions use the same type
 restrictions as exports.
 
-### 14.4 Function tables
+### 15.4 Function tables
 
 Every function used as a value is placed in table 0. A function pointer is its index
 (`u32`). Calling through a pointer uses `call_indirect` with a signature check, so a bad
@@ -1200,33 +1415,36 @@ index or wrong signature traps (`T0009`).
 
 ---
 
-## 15. Standard Library Core
+## 16. Standard Library Core
 
 Only the parts that the language semantics depend on are specified here.
 
-### 15.1 `std/mem.Allocator`
+### 16.1 `std/mem.Allocator`
 
-```axiom
+```phalange
 pub struct Allocator {
     ctx: *mut void,
     alloc_fn: fn(*mut void, usize, usize) !*mut u8,   // (ctx, size, align)
     free_fn:  fn(*mut void, *mut u8, usize) void,     // (ctx, ptr, size)
+
+    pub fn alloc[T](self: Allocator, n: usize) ![]mut T {
+        let bytes = @mul_checked(n, @size_of(T)) catch return error.OutOfMemory;
+        let p = self.alloc_fn(self.ctx, bytes, @align_of(T))!;
+        return @slice_from_ptr(@ptr_cast(*mut T, p), n);
+    }
+
+    pub fn free[T](self: Allocator, s: []mut T) void {
+        self.free_fn(self.ctx, @ptr_cast(*mut u8, s.ptr), s.len * @size_of(T));
+    }
 }
 ```
 
-Builtins `@alloc(a, T, n) ![]mut T` and `@free(a, s) void` call these hooks:
+These are ordinary generic methods (§10), not builtins. If the byte count overflows,
+`alloc` returns `error.OutOfMemory` without calling the hook.
 
-- `@alloc` computes `n * @size_of(T)`. If that overflows, it returns `error.OutOfMemory`
-  **without** calling the hook. Otherwise it calls
-  `a.alloc_fn(a.ctx, bytes, @align_of(T))` and wraps the result as a slice of length `n`.
-- `@free` calls `a.free_fn(a.ctx, @ptr_cast(*mut u8, s.ptr), s.len * @size_of(T))`.
+### 16.2 `std/mem.Arena`
 
-`@alloc` and `@free` are builtins, not generic functions, because v0.1 has no user-level
-generics (Appendix D, Q4).
-
-### 15.2 `std/mem.Arena`
-
-```axiom
+```phalange
 pub struct Arena {
     backing: Allocator,
     // … implementation fields …
@@ -1240,14 +1458,14 @@ pub struct Arena {
 
 Typical use:
 
-```axiom
+```phalange
 import "std/mem" as mem;
 
 fn work() !void {
     let mut arena = mem.Arena.init(mem.page_allocator);
     defer arena.deinit();
 
-    let list = @alloc(arena.allocator(), u32, 1024)!;
+    let list = arena.allocator().alloc.[u32](1024)!;
     // … use list …
 }
 ```
@@ -1256,30 +1474,30 @@ fn work() !void {
 from the old copy still point at the old location. The compiler SHOULD warn when an
 `Arena` whose `allocator()` has been called is later moved (`W0711`).
 
-### 15.3 `std/mem.page_allocator`
+### 16.3 `std/mem.page_allocator`
 
 `page_allocator` is a global `Allocator` backed by `memory.grow` on WASM and by the linear
 region reservation on native targets. On `wasm32-freestanding`, `free` is a no-op because
 WASM memory cannot shrink.
 
-### 15.4 `std/mem.FixedBuffer`
+### 16.4 `std/mem.FixedBuffer`
 
 `FixedBuffer` is a bump allocator over a caller-provided `[]mut u8`. It never grows and
 returns `error.OutOfMemory` when the buffer is full. It is intended for `static` arena
-patterns like the example in §17.
+patterns like the example in §18.
 
 ---
 
-## 16. Toolchain and Agent Diagnostic Interface
+## 17. Toolchain and Agent Diagnostic Interface
 
-### 16.1 Commands
+### 17.1 Commands
 
 ```
-axiom build <file.ax> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
-axiom check <file.ax>                  # parse and type-check only; no codegen
-axiom fmt   <file.ax> [--check]        # canonical formatting; --check exits 1 if not canonical
-axiom run   <file.ax> [--export=name]  # build for wasm32 and execute in the reference runtime
-axiom explain <CODE>                   # long-form documentation for a diagnostic code
+phalange build <file.ph> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
+phalange check <file.ph>                  # parse and type-check only; no codegen
+phalange fmt   <file.ph> [--check]        # canonical formatting; --check exits 1 if not canonical
+phalange run   <file.ph> [--export=name]  # build for wasm32 and execute in the reference runtime
+phalange explain <CODE>                   # long-form documentation for a diagnostic code
 ```
 
 Every command accepts `--format=human` (the default) or `--format=agent-json`.
@@ -1288,7 +1506,7 @@ Every command accepts `--format=human` (the default) or `--format=agent-json`.
   `.wasm` files and diagnostics.
 - Diagnostics are sorted by file, then by start byte, then by code.
 
-### 16.2 JSON output
+### 17.2 JSON output
 
 With `--format=agent-json`, the command writes **one** JSON object to **stdout** and nothing
 else. (Progress and log text, if any, go to stderr.) Exit codes are:
@@ -1299,14 +1517,14 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
 
 ```json
 {
-  "schema": "axiom-diagnostics/1",
+  "schema": "phalange-diagnostics/1",
   "status": "error",
   "diagnostics": [
     {
       "code": "E0412",
       "severity": "error",
       "message": "type mismatch in SIMD operation: expected f32x4, found f32",
-      "file": "dot_product.ax",
+      "file": "dot_product.ph",
       "span": {
         "start_line": 56, "start_col": 15, "end_line": 56, "end_col": 24,
         "start_byte": 1873, "end_byte": 1882
@@ -1317,7 +1535,7 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
       "notes": [
         {
           "message": "`va` declared here with type f32",
-          "file": "dot_product.ax",
+          "file": "dot_product.ph",
           "span": { "start_line": 54, "start_col": 13, "end_line": 54, "end_col": 15,
                     "start_byte": 1790, "end_byte": 1792 }
         }
@@ -1327,7 +1545,7 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
           "description": "broadcast the scalar to all lanes",
           "applicability": "machine",
           "edits": [
-            { "file": "dot_product.ax",
+            { "file": "dot_product.ph",
               "start_byte": 1880, "end_byte": 1882,
               "replacement": "@splat(va)" }
           ]
@@ -1350,7 +1568,7 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
 | `fixes[].applicability` | `"machine"`: applying every edit yields a program without this diagnostic, and the fix does not change intended semantics. `"suggestion"`: plausible, needs review. `"placeholder"`: the edit contains `<…>` holes that must be filled in |
 | `fixes[].edits` | Non-overlapping byte-range replacements, applied together atomically |
 
-### 16.3 Diagnostic codes
+### 17.3 Diagnostic codes
 
 Codes are stable. A code's meaning is never reused for something else.
 
@@ -1381,11 +1599,19 @@ Initial registry, not exhaustive:
 | E0210 | Import cycle |
 | E0410 | Struct literal fields missing or out of order |
 | E0412 | Type mismatch |
+| E0460 | Generic type used without arguments |
+| E0461 | Operation not permitted by the parameter's constraint |
+| E0462 | Generic argument does not satisfy the constraint |
+| E0463 | Cannot deduce generic argument (only literals, or not in any parameter type) |
+| E0464 | Conflicting deductions for a generic parameter |
+| E0465 | Instantiation depth limit exceeded |
+| E0466 | Generic used where a concrete function is required (value, `export`, import) |
 | E0502 | Cannot infer type of literal |
 | E0503 | Literal out of range for type, or untyped `.{}` with no context |
 | E0510 | `@as` conversion is lossy |
 | E0512 | `@bit_cast` size mismatch |
 | E0520 | Unary `-` on unsigned type |
+| E0525 | Signed shift count |
 | E0530 | Overflow in constant evaluation |
 | E0540 | Index is not `usize` |
 | E0601 | Missing return |
@@ -1402,32 +1628,32 @@ Initial registry, not exhaustive:
 | E0801 | Type not allowed at the export or import boundary |
 | E0901 | Forbidden instruction in inline WASM |
 
-### 16.4 Runtime trap reporting
+### 17.4 Runtime trap reporting
 
 Debug builds (`--overflow=trap`, no `--strip`) SHOULD emit a custom WASM section,
-`axiom.traps`, that maps each trap site's code offset to a trap code and source span.
-`axiom run --format=agent-json` then reports a trap as a diagnostic with `severity:
+`phalange.traps`, that maps each trap site's code offset to a trap code and source span.
+`phalange run --format=agent-json` then reports a trap as a diagnostic with `severity:
 "error"`, a `Txxxx` code, and the span of the failing expression. Debug builds MAY also
 record an **error return trace**: the list of `!` and `return error.X` sites an error
 passed through.
 
-### 16.5 Canonical formatting
+### 17.5 Canonical formatting
 
-`axiom fmt` defines the single canonical layout. Its output is the same no matter how the
-input was laid out, and running it twice changes nothing. Agents SHOULD run `axiom fmt`
+`phalange fmt` defines the single canonical layout. Its output is the same no matter how the
+input was laid out, and running it twice changes nothing. Agents SHOULD run `phalange fmt`
 before diffing or committing. Two programs that are equal after formatting are the same
 program.
 
 ---
 
-## 17. Complete Example
+## 18. Complete Example
 
-`examples/dot_product.ax`, the design-notes example updated to this specification:
+`examples/dot_product.ph`, the design-notes example updated to this specification:
 
-```axiom
+```phalange
 // =============================================================================
-// File: dot_product.ax
-// Build: axiom build dot_product.ax --target=wasm32-freestanding -O3 -o engine.wasm
+// File: dot_product.ph
+// Build: phalange build dot_product.ph --target=wasm32-freestanding -O3 -o engine.wasm
 // =============================================================================
 
 import host "env" {
@@ -1563,8 +1789,6 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
 | `@mem_eq(a, b)` | `[]T, []T → bool` | Bytewise. Lengths may differ, in which case the result is `false` |
-| `@alloc(a, T, n)` | `Allocator, type, usize → ![]mut T` | §15.1 |
-| `@free(a, s)` | `Allocator, []mut T → void` | §15.1 |
 | `@memory_size()` | `→ usize` | In 64 KiB pages |
 | `@memory_grow(pages)` | `usize → !usize` | Returns the previous size, or `error.OutOfMemory` |
 
@@ -1575,7 +1799,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@clz(x)`, `@ctz(x)`, `@popcount(x)` | Return the same type as `x` |
 | `@rotl(x, k)`, `@rotr(x, k)` | `k` is taken modulo the width |
 | `@add_sat(a, b)`, `@sub_sat(a, b)`, `@mul_sat(a, b)` | Saturating, in every overflow mode. Also lane-wise on 8/16-bit integer vectors (add/sub only) |
-| `@add_checked(a, b)` etc. | Returns `!T`, with `error.Overflow`, in every mode |
+| `@add_checked`, `@sub_checked`, `@mul_checked` | Returns `!T`, with `error.Overflow`, in every mode |
 | `@min(a, b)`, `@max(a, b)` | Floats: a NaN operand gives NaN, and `-0.0 < +0.0` (WASM semantics) |
 | `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6) |
 | `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@rem(a, b)`, `@copysign(a, b)` | Floats |
@@ -1588,14 +1812,14 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@vec(V, l0, l1, …)` | Construct a vector from exactly `lanes(V)` lane values |
 | `@extract_lane(v, const i)` | `Vec → lane` |
 | `@replace_lane(v, const i, x)` | `Vec → Vec` |
-| `@load(V, s)` / `@store(s, v)` | Slice-checked 16-byte load/store (§12.2) |
+| `@load(V, s)` / `@store(s, v)` | Slice-checked 16-byte load/store (§13.2) |
 | `@shuffle(a, b, const [i0, …])` | Two-input byte-granular or lane-granular shuffle. Indices must be in range (`E0820`) |
 | `@swizzle(a, idx)` | `u8x16` runtime indices. Out-of-range indices give 0 (WASM semantics) |
 | `@lanes_eq/ne/lt/le/gt/ge(a, b)` | Produce a mask vector |
 | `@select(mask, a, b)` | Bitwise select |
 | `@any_true(v)`, `@all_true(v)` | `→ bool` |
 | `@bitmask(v)` | `→ u32`, one bit per lane |
-| `@reduce_add(v)` | Pairwise order (§12.2). Integer lanes wrap |
+| `@reduce_add(v)` | Pairwise order (§13.2). Integer lanes wrap |
 | `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16x8`: WASM `i32x4.dot_i16x8_s` |
 | `@narrow`, `@widen_low`, `@widen_high` | Lane-width changes per WASM |
 
@@ -1643,60 +1867,69 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C5 | Return types are mandatory (`void` for none) | One canonical form. The notes' examples already wrote `void` |
 | C6 | Function-pointer types list parameter types only: `fn(*mut void, usize) T` | `fn(ctx: …)` needs two-token lookahead to tell `name:` from a type name |
 | C7 | Inline WASM has typed forms: `wasm { }` (`[]→[]`) and `wasm -> T { }` (`[]→[T]`) used as an expression | The notes' `count_leading_zeros` relied on an implicit fall-through return value, which is hidden control flow |
-| C8 | `@load_unaligned(f32x4, &a[i])` became `@load(f32x4, a[i..i + 4])` | The original only bounds-checked element `i` and then read 16 bytes, which is a bounds-check hole. Alignment is not semantic (§11.5), so `_unaligned` is redundant |
-| C9 | `arena.allocator().alloc(u32, 1024)` became `@alloc(arena.allocator(), u32, 1024)` | v0.1 has no user generics. Type-parameterized operations are builtins |
+| C8 | `@load_unaligned(f32x4, &a[i])` became `@load(f32x4, a[i..i + 4])` | The original only bounds-checked element `i` and then read 16 bytes, which is a bounds-check hole. Alignment is not semantic (§12.5), so `_unaligned` is redundant |
+| C9 | `arena.allocator().alloc(u32, 1024)` became `arena.allocator().alloc.[u32](1024)` | Type arguments are written `.[…]` (§10.3). A type passed as an ordinary argument would need types to be parseable as expressions |
 | C10 | `&mut HEAP_BYTES` passed as a slice became `HEAP_BYTES[..]` | Array-pointer-to-slice would be an implicit conversion |
 | C11 | `pub` (module visibility) and `export` (WASM export) are distinct. Top-level `let`/`let mut` globals and `error { }` declarations were added to the grammar | The notes used these without grammar support |
 | C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
-| C13 | Raw pointers are fully defined through the linear-memory model (§11) | "Zero UB" and "raw pointers" conflict unless memory itself has defined semantics. WASM's model provides this, and it is adopted on all targets |
+| C13 | Raw pointers are fully defined through the linear-memory model (§12) | "Zero UB" and "raw pointers" conflict unless memory itself has defined semantics. WASM's model provides this, and it is adopted on all targets |
 | C14 | Error names must be declared (`error { … }`) | Prevents typos in `error.X` from silently creating new errors |
 | C15 | Added `for`, `loop`, compound assignment, `_ =` discards, and a no-shadowing rule | Needed by the notes' examples, or by the agent-ergonomics goal |
 | C16 | The diagnostic `suggested_fix.confidence` float became `fixes[].applicability` (an enum) plus byte-range `edits` | A float confidence is hard to act on. Byte-range edits can be applied mechanically |
 | C17 | Horizontal float reductions have a fixed pairwise association order | Determinism across WASM and native |
+| C18 | Shift counts are **not** clamped. `x << k` and `x >> k` have their mathematical meaning for every `k`, so `k ≥ width` gives `0` or sign fill | Design review, draft 2. `x << 40` has a clear meaning, and clamping it to `x << 31` would be surprising |
+| C19 | Added monomorphized generics with builtin constraints (§10) | Design review, draft 2 |
+| C20 | The language was renamed from Axiom to Phalange, and the extension from `.ax` to `.ph` | Design review, draft 2 |
 
 ---
 
 ## Appendix D: Open Questions
 
-Each question is followed by the current leaning.
+Each question is followed by the options and the current leaning.
 
-1. **Overflow mode divergence.** With trap-in-debug and saturate-in-release, a program can
-   pass its tests and then behave differently in production. Saturation also silently
-   produces wrong answers (a length that saturates to `MAX`). *Leaning:* trap in all modes,
-   and add explicit saturating operators `+|`, `-|`, `*|` alongside `+%`. Keep
-   `--overflow=saturate` only as an opt-in escape hatch, or drop it.
-2. **Shift clamping vs. trapping.** Clamping `x << 40` on `u32` to `x << 31` is defined but
-   rarely what anyone means. Alternatives: trap in `trap` mode, or require the count to be
-   a `u8` or `u32` less than the width. *Leaning:* trap when the count is ≥ width in `trap`
-   mode, and clamp in `saturate` mode, consistent with Q1.
-3. **`and`/`or` mixing.** Should `a and b or c` be allowed as `(a and b) or c`? *Leaning:*
+1. **Integer overflow.** This is undecided. The current text (§7.6) traps in the default
+   mode and saturates under `--release`. The options are:
+
+   | Option | Pros | Cons |
+   |---|---|---|
+   | **(a)** Trap in debug, saturate in release (current) | Release builds never trap on overflow | Tested and shipped programs can differ. Saturation silently gives wrong answers (for example, a length stuck at `MAX`) |
+   | **(b)** Trap in every mode, plus explicit `+\|` `-\|` `*\|` saturating operators next to `+%` | One meaning everywhere. Bugs are loud. The chosen behavior is visible at each use | A check on every operation. WASM has no overflow flag, so a check costs an extra compare and branch, and multiplication needs a wider multiply |
+   | **(c)** Wrap in every mode (Go, Java) | Cheapest. Deterministic | Overflow bugs are silent. `+%` becomes redundant |
+   | **(d)** Trap in every mode, with a per-module or per-function attribute to opt into wrapping | Keeps (b)'s semantics with a performance escape hatch | Adds an attribute syntax that v0.1 otherwise does not have |
+
+   *Leaning:* (b). Measuring the cost of the checks on real WASM engines should settle it.
+2. **`and`/`or` mixing.** Should `a and b or c` be allowed as `(a and b) or c`? *Leaning:*
    no, keep requiring parentheses.
-4. **Generics.** v0.1 uses builtins (`@alloc`, `@cast_slice`) for type-parameterized
-   operations. Options range from none, to Zig-style `comptime T: type` parameters, to
-   explicit monomorphized type parameters `fn max[T: Int](a: T, b: T) T`. The last must
-   stay LL(1): `[` after a function name is unambiguous in declarations, but at call sites
-   `f[T](x)` conflicts with indexing.
-5. **Optional types.** With no `null`, how are "maybe" pointers written? Options are a
-   builtin `?T` or a stdlib union once generics exist.
-6. **Error sets.** A single program-wide error set is simple, but it does not let a function
+3. **Optionals.** This is undecided. Generics make an optional type possible as a library
+   type, so the question is how much language support it gets:
+
+   | Option | Notes |
+   |---|---|
+   | **(a)** Library only: `union Option[T] { Some: T, None }` | No new syntax. Unwrapping is a `match`. `Option.[*T]` is 8 bytes on wasm32 (tag plus pointer), where a nullable pointer would be 4 |
+   | **(b)** `?T` sugar for `Option.[T]` with an `orelse` operator | Shorter to write. Could use a niche layout for `?*T` (address 0 means "none"), but that needs address 0 to be reserved and `@ptr_from_int(0)` to be banned for `*T` |
+   | **(c)** No optionals; use sentinel values or `!T` | Simplest, but makes "absent" and "failed" look alike |
+
+   *Leaning:* (a) now, then revisit (b) once there is real code to measure against.
+4. **Error sets.** A single program-wide error set is simple, but it does not let a function
    say *which* errors it can return. Consider `fn f() FileError!T` with an inferred or
    declared set, and exhaustive `match` over it.
-7. **Float literal exactness.** Requiring `f32` literals to be exactly representable means
-   `let x: f32 = 0.1;` is an error. That is strict. The alternative is round-to-nearest
-   with warning `W0503`. *Leaning:* round-to-nearest with no warning, since that is what
-   everyone expects.
-8. **`errdefer`.** Useful for cleaning up partial allocations when a function fails. It is
-   not hidden control flow, since it is written at the registration site. *Leaning:* add
-   it.
-9. **Threads and atomics.** WASM threads (shared memory plus atomics) will need a memory
-   model. *Leaning:* sequentially consistent atomics only, and data races on non-atomic
-   locations produce unspecified values (not UB), matching the WASM threads proposal.
-10. **Native-target pointers and FFI.** The linear-memory model gives native targets zero UB
-    but makes calling C code awkward, since C pointers are real addresses. An `extern`
-    boundary with explicit marshalling may be needed.
-11. **Test blocks.** A `test "name" { … }` construct with `axiom test --format=agent-json`
-    would benefit agents directly.
-12. **Loop labels.** v0.1 has none. Breaking out of nested loops currently needs a flag
-    variable or a helper function.
-13. **Relaxed SIMD.** Its results are nondeterministic but bounded. Allow it in inline WASM
-    with implementation-defined results, or forbid it (the current rule)?
+5. **Float literal exactness.** Requiring `f32` literals to be exactly representable means
+   `let x: f32 = 0.1;` is an error. *Leaning:* round-to-nearest with no warning.
+6. **`errdefer`.** Useful for cleaning up partial allocations when a function fails.
+   *Leaning:* add it.
+7. **User-defined constraints.** v0.1 constraints are a closed builtin set (§10.5). Generic
+   containers such as a hash map currently need their hash and equality functions passed
+   as function pointers, which costs an indirect call. Options include static interfaces,
+   meaning named sets of required functions resolved at monomorphization time (not
+   vtables), or passing functions as `const` generic parameters.
+8. **Generics over SIMD.** Should there be constraints like `FloatVec` or `IntVec`, or a
+   `Vec[T, const N]` family, so that kernels can be written once for `f32x4` and `f64x2`?
+9. **Threads and atomics.** *Leaning:* sequentially consistent atomics only. Data races on
+   non-atomic locations produce unspecified values (not UB), matching the WASM threads
+   proposal.
+10. **Native-target pointers and FFI.** The linear-memory model makes calling C code awkward.
+    An `extern` boundary with explicit marshalling may be needed.
+11. **Test blocks.** A `test "name" { … }` construct with `phalange test --format=agent-json`.
+12. **Loop labels.** v0.1 has none.
+13. **Relaxed SIMD.** Allow it in inline WASM with implementation-defined results, or forbid
+    it (the current rule)?
