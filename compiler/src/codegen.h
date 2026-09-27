@@ -13,6 +13,7 @@ typedef struct CgOptions {
     EmitKind emit;
     const char *out_path;    // file to write
     bool stack_traces;       // shadow stack for traces and profiles (--stack-traces=on, default)
+    bool profile;            // phalange profile: the shadow stack is sampled concurrently
 } CgOptions;
 
 // Generates code for the checked program. Returns false on failure

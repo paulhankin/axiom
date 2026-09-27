@@ -337,19 +337,71 @@ export function createHost(opts = {}) {
   return host;
 }
 
+// Sampling profiler (spec §17.6): a worker samples the main thread's shadow
+// stack; the result is written in the raw format read by `phalange profile`
+// (see runtime/profile.c).
+function startProfiler(instance, memory, hz) {
+  if (!(memory.buffer instanceof SharedArrayBuffer)) throw new Error('--profile needs a program built by phalange profile (shared memory)');
+  const control = new SharedArrayBuffer(8);
+  const ss = Number(instance.exports.phalange_shadow_stack());
+  const w = new Worker(new URL('./profile_worker.mjs', import.meta.url),
+    { workerData: { memory, ss, wide: !!instance.exports.phalange_wasm64, hz, control } });
+  let ready;
+  const started = new Promise((resolve) => { ready = resolve; });
+  const result = new Promise((resolve, reject) => {
+    w.on('message', (m) => (m === 'ready' ? ready() : resolve(m)));
+    w.once('error', reject);
+  });
+  return {
+    started,
+    async stop(entry, outPath) {
+      const ctl = new Int32Array(control);
+      Atomics.store(ctl, 0, 1);
+      Atomics.store(ctl, 1, 1);
+      Atomics.notify(ctl, 1);
+      const samples = await result;
+      await w.terminate();
+      let text = `# phalange-profile-raw 1\nhz ${hz}\nclock wall\n`;
+      const cache = new Map();
+      const site = (a) => {
+        if (!cache.has(a)) {
+          let s = null;
+          try { s = readSite(instance, memory, a); } catch { s = null; }
+          cache.set(a, s && s.code === 255 ? s : null);
+        }
+        return cache.get(a);
+      };
+      for (const [key, count] of samples) {
+        const [depth, ...addrs] = key.split(',').filter((x) => x !== '').map(Number);
+        const sites = addrs.map(site);
+        if (sites.some((s) => !s)) continue;  // torn read
+        const leaf = sites.length ? (sites[0].callee || '<indirect call>') : entry;
+        text += `S\t${count}\t${depth}\t${leaf}` + sites.map((s) => `\t${s.fileId}\x1f${s.start}\x1f${s.end}\x1f${s.fn}`).join('') + '\n';
+      }
+      fs.writeFileSync(outPath, text);
+    },
+  };
+}
+
 async function main() {
-  const [file, entry] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const profile = (args.find((a) => a.startsWith('--profile=')) || '').slice(10);
+  const hz = Number((args.find((a) => a.startsWith('--profile-hz=')) || '--profile-hz=999').slice(13));
+  const [file, entry] = args.filter((a) => !a.startsWith('--'));
   if (!file) {
-    console.error('usage: node runtime/host.mjs program.wasm [export]');
+    console.error('usage: node runtime/host.mjs [--profile=out.raw [--profile-hz=N]] program.wasm [export]');
     process.exit(2);
   }
   const host = createHost();
   const instance = host.instantiate(fs.readFileSync(file));
-  const fn = instance.exports[entry || (instance.exports.main ? 'main' : 'run')];
+  const name = entry || (instance.exports.main ? 'main' : 'run');
+  const fn = instance.exports[name];
   if (typeof fn !== 'function') {
     console.error(`phalange: no export named '${entry || 'main'}'`);
     process.exit(2);
   }
+  const profiler = profile ? startProfiler(instance, host.memory(), hz) : null;
+  if (profiler) await profiler.started;
   let code = 0;
   try {
     const r = fn();
@@ -360,6 +412,7 @@ async function main() {
     console.error(formatTrap(t));
     code = 134;
   }
+  if (profiler) await profiler.stop(name, profile);
   host.close();
   process.exit(code);
 }

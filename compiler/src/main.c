@@ -34,6 +34,7 @@ extern char **environ;
 static void usage(void) {
     fprintf(stderr,
             "usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n"
+            "       phalange profile [<file.ph> | <package dir>] [--rate=<hz>] [--folded=<path>]\n"
             "       phalange new <name>      create a package skeleton\n"
             "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
@@ -375,6 +376,260 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
     return failed ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// phalange profile: run a program under the sampling profiler (spec §17.6)
+// and report where its time goes.
+// ---------------------------------------------------------------------------
+typedef struct ProfFn {
+    Sym name;
+    long self, total, stamp;
+} ProfFn;
+
+typedef struct ProfSite {
+    Span sp;
+    Sym caller, callee;
+    long total, stamp;
+} ProfSite;
+
+typedef struct ProfStack {
+    Sym key;
+    long count;
+} ProfStack;
+
+static int cmp_fn(const void *a, const void *b) {
+    const ProfFn *x = *(ProfFn *const *)a, *y = *(ProfFn *const *)b;
+    if (x->self != y->self) return x->self < y->self ? 1 : -1;
+    if (x->total != y->total) return x->total < y->total ? 1 : -1;
+    return strcmp(x->name, y->name);
+}
+static int cmp_site(const void *a, const void *b) {
+    const ProfSite *x = *(ProfSite *const *)a, *y = *(ProfSite *const *)b;
+    if (x->total != y->total) return x->total < y->total ? 1 : -1;
+    if (x->sp.file != y->sp.file) return x->sp.file - y->sp.file;
+    return (int)x->sp.start - (int)y->sp.start;
+}
+static int cmp_stack(const void *a, const void *b) { return strcmp((*(ProfStack *const *)a)->key, (*(ProfStack *const *)b)->key); }
+
+static int spawn_program(char *const argv[], char *const envp[], bool out_to_err) {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    if (out_to_err) posix_spawn_file_actions_adddup2(&fa, 2, 1);
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, envp);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) return -1;
+    int status;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+static int run_profile(const char *bin, const char *std_dir, const char *folded_path, int hz, bool json) {
+    const char *tmpdir = getenv("TMPDIR");
+    const char *raw = arena_printf("%s/phalange-profile-%d.raw", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid());
+    unlink(raw);
+    Vec(char *) av = {0};
+    Vec(char *) env = {0};
+    for (char **e = environ; *e; e++) vec_push(env, *e);
+    if (g_target.wasm) {
+        const char *names[] = {"node", NULL};
+        const char *node = find_tool(names);
+        if (!node) {
+            diag_emit_fatal(json, "E9003", "phalange profile needs node to run WebAssembly programs (or use --target=native)");
+            return 2;
+        }
+        vec_push(av, (char *)node);
+        vec_push(av, arena_printf("%s/../runtime/host.mjs", std_dir));
+        vec_push(av, arena_printf("--profile=%s", raw));
+        vec_push(av, arena_printf("--profile-hz=%d", hz));
+    } else {
+        vec_push(env, arena_printf("PHALANGE_PROFILE=%s", raw));
+        vec_push(env, arena_printf("PHALANGE_PROFILE_HZ=%d", hz));
+    }
+    vec_push(av, (char *)bin);
+    vec_push(av, NULL);
+    vec_push(env, NULL);
+    int status = spawn_program(av.data, env.data, json);
+    size_t len;
+    char *text = read_entire_file(raw, &len);
+    unlink(raw);
+    if (!text) {
+        diag_emit_fatal(json, "E9006",
+                        arena_printf("no profile was recorded (the program exited with status %d)", status));
+        return 2;
+    }
+
+    // Aggregate.
+    SymMap fns = {0}, sites = {0}, stacks = {0};
+    Vec(ProfFn *) fnv = {0};
+    Vec(ProfSite *) sitev = {0};
+    Vec(ProfStack *) stackv = {0};
+    long nsamples = 0, dropped = 0, stamp = 0, truncated = 0;
+    const char *clock = "cpu";
+    for (char *line = text; line && *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (!strncmp(line, "hz ", 3)) hz = atoi(line + 3);
+        else if (!strncmp(line, "clock ", 6)) clock = arena_strndup(line + 6, strlen(line + 6));
+        else if (!strncmp(line, "dropped ", 8)) dropped = atol(line + 8);
+        else if (!strncmp(line, "S\t", 2)) {
+            char *f[4 + 256];
+            int nf = 0;
+            for (char *p = line + 2; nf < 4 + 256;) {
+                f[nf++] = p;
+                char *t = strchr(p, '\t');
+                if (!t) break;
+                *t = 0;
+                p = t + 1;
+            }
+            if (nf >= 3) {
+                long count = atol(f[0]);
+                long depth = atol(f[1]);
+                int ns = nf - 3;
+                Sym leaf = intern_cstr(f[2]);
+                // Functions root first: the callers of each site, then the leaf.
+                Sym *chain = NEWN(Sym, ns + 2);
+                Span *spans = NEWN(Span, ns + 1);
+                int nc = 0;
+                bool ok = true;
+                for (int k = ns - 1; k >= 0; k--) {
+                    char *g[4];
+                    int ng = 0;
+                    for (char *p = f[3 + k]; ng < 4;) {
+                        g[ng++] = p;
+                        char *t = strchr(p, '\x1f');
+                        if (!t) break;
+                        *t = 0;
+                        p = t + 1;
+                    }
+                    if (ng < 4) {
+                        ok = false;
+                        break;
+                    }
+                    int fid = atoi(g[0]);
+                    spans[nc] = (Span){fid >= 0 && fid < g_files.len ? fid : -1, (uint32_t)strtoul(g[1], NULL, 10),
+                                       (uint32_t)strtoul(g[2], NULL, 10)};
+                    chain[nc++] = intern_cstr(g[3]);
+                }
+                if (!ok) goto next;
+                chain[nc] = leaf;
+                nsamples += count;
+                if (depth > ns) truncated += count;
+                stamp++;
+                for (int k = 0; k <= nc; k++) {
+                    ProfFn *pf = symmap_get(&fns, chain[k]);
+                    if (!pf) {
+                        pf = NEW(ProfFn);
+                        pf->name = chain[k];
+                        symmap_put(&fns, chain[k], pf);
+                        vec_push(fnv, pf);
+                    }
+                    if (pf->stamp != stamp) {  // once per sample, even under recursion
+                        pf->stamp = stamp;
+                        pf->total += count;
+                    }
+                    if (k == nc) pf->self += count;
+                }
+                for (int k = 0; k < nc; k++) {
+                    if (spans[k].file < 0) continue;
+                    Sym key = intern_cstr(arena_printf("%d:%u:%u:%s", spans[k].file, spans[k].start, spans[k].end, chain[k]));
+                    ProfSite *ps = symmap_get(&sites, key);
+                    if (!ps) {
+                        ps = NEW(ProfSite);
+                        ps->sp = spans[k];
+                        ps->caller = chain[k];
+                        ps->callee = chain[k + 1];
+                        symmap_put(&sites, key, ps);
+                        vec_push(sitev, ps);
+                    }
+                    if (ps->stamp != stamp) {
+                        ps->stamp = stamp;
+                        ps->total += count;
+                    }
+                }
+                CharVec fk = {0};
+                if (depth > ns)
+                    for (const char *q = "[truncated];"; *q; q++) vec_push(fk, *q);
+                for (int k = 0; k <= nc; k++) {
+                    for (const char *q = chain[k]; *q; q++) vec_push(fk, *q == ';' ? ':' : *q);
+                    if (k < nc) vec_push(fk, ';');
+                }
+                Sym skey = intern(fk.data, (size_t)fk.len);
+                free(fk.data);
+                ProfStack *st = symmap_get(&stacks, skey);
+                if (!st) {
+                    st = NEW(ProfStack);
+                    st->key = skey;
+                    symmap_put(&stacks, skey, st);
+                    vec_push(stackv, st);
+                }
+                st->count += count;
+            }
+        }
+    next:
+        line = nl ? nl + 1 : NULL;
+    }
+    qsort(fnv.data, (size_t)fnv.len, sizeof *fnv.data, cmp_fn);
+    qsort(sitev.data, (size_t)sitev.len, sizeof *sitev.data, cmp_site);
+    qsort(stackv.data, (size_t)stackv.len, sizeof *stackv.data, cmp_stack);
+    FILE *ff = fopen(folded_path, "w");
+    if (ff) {
+        for (int i = 0; i < stackv.len; i++) fprintf(ff, "%s %ld\n", stackv.data[i]->key, stackv.data[i]->count);
+        fclose(ff);
+    }
+    double n = nsamples ? (double)nsamples : 1.0;
+    int nfn = fnv.len < 25 ? fnv.len : 25, nsite = sitev.len < 15 ? sitev.len : 15;
+    if (json) {
+        printf("{\"schema\":\"phalange-profile/1\",\"samples\":%ld,\"hz\":%d,\"clock\":", nsamples, hz);
+        json_str_out(clock);
+        printf(",\"seconds\":%.3f,\"dropped\":%ld,\"truncated\":%ld,\"exit_status\":%d,\"folded\":", nsamples / (double)hz,
+               dropped, truncated, status);
+        json_str_out(ff ? folded_path : "");
+        printf(",\"functions\":[");
+        for (int i = 0; i < fnv.len; i++) {
+            ProfFn *pf = fnv.data[i];
+            printf("%s\n  {\"name\":", i ? "," : "");
+            json_str_out(pf->name);
+            printf(",\"self\":%ld,\"total\":%ld,\"self_pct\":%.1f,\"total_pct\":%.1f}", pf->self, pf->total,
+                   100.0 * pf->self / n, 100.0 * pf->total / n);
+        }
+        printf("],\"call_sites\":[");
+        for (int i = 0; i < sitev.len; i++) {
+            ProfSite *ps = sitev.data[i];
+            int sl, sc, el, ec;
+            span_linecol(ps->sp, &sl, &sc, &el, &ec);
+            printf("%s\n  {\"file\":", i ? "," : "");
+            json_str_out(g_files.data[ps->sp.file]->display);
+            printf(",\"line\":%d,\"col\":%d,\"caller\":", sl, sc);
+            json_str_out(ps->caller);
+            printf(",\"callee\":");
+            json_str_out(ps->callee);
+            printf(",\"total\":%ld,\"total_pct\":%.1f,\"context\":", ps->total, 100.0 * ps->total / n);
+            json_str_out(source_line(ps->sp));
+            printf("}");
+        }
+        printf("]}\n");
+    } else {
+        printf("profile: %ld samples at %d Hz (%s time, %.2f s)", nsamples, hz, clock, nsamples / (double)hz);
+        if (status) printf("; the program exited with status %d", status);
+        printf("\n\n  self%%  total%%  function\n");
+        for (int i = 0; i < nfn; i++)
+            printf("%7.1f %7.1f  %s\n", 100.0 * fnv.data[i]->self / n, 100.0 * fnv.data[i]->total / n, fnv.data[i]->name);
+        if (fnv.len > nfn) printf("  ... %d more functions\n", fnv.len - nfn);
+        if (nsite) printf("\n total%%  call site\n");
+        for (int i = 0; i < nsite; i++) {
+            ProfSite *ps = sitev.data[i];
+            int sl, sc, el, ec;
+            span_linecol(ps->sp, &sl, &sc, &el, &ec);
+            printf("%7.1f  %s:%d:%d  %s -> %s\n", 100.0 * ps->total / n, g_files.data[ps->sp.file]->display, sl, sc,
+                   ps->caller, ps->callee);
+        }
+        if (truncated) printf("\n%ld samples were deeper than 256 calls; their outer frames are not known\n", truncated);
+        if (dropped) printf("%ld samples were dropped (sample buffer full)\n", dropped);
+        if (ff) printf("\nfolded stacks: %s (for flamegraph.pl, inferno or speedscope)\n", folded_path);
+    }
+    return status == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "new")) {
         bool js = argc >= 4 && !strcmp(argv[3], "--format=agent-json");
@@ -390,7 +645,8 @@ int main(int argc, char **argv) {
     }
     const char *cmd = argv[1];
     bool testing = strcmp(cmd, "test") == 0;
-    bool build = strcmp(cmd, "build") == 0 || testing;
+    bool profiling = strcmp(cmd, "profile") == 0;
+    bool build = strcmp(cmd, "build") == 0 || testing || profiling;
     g_test_mode = testing;
     if (!build && strcmp(cmd, "check") != 0) {
         usage();
@@ -404,6 +660,8 @@ int main(int argc, char **argv) {
     Vec(char *) inc_flags = {0};   // -I, for C sources
     const char *header_path = NULL;
     const char *test_filter = NULL, *test_timeout = NULL;
+    int prof_hz = 999;
+    const char *folded_path = NULL;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
@@ -423,6 +681,8 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--emit-header=", 14)) header_path = a + 14;
         else if (testing && !strncmp(a, "--filter=", 9)) test_filter = a;
         else if (testing && !strncmp(a, "--timeout=", 10)) test_timeout = a;
+        else if (profiling && !strncmp(a, "--rate=", 7) && atoi(a + 7) > 0) prof_hz = atoi(a + 7);
+        else if (profiling && !strncmp(a, "--folded=", 9)) folded_path = a + 9;
         else if ((a[1] == 'l' || a[1] == 'L') && a[0] == '-' && a[2]) vec_push(link_flags, (char *)a);
         else if (a[0] == '-' && a[1] == 'I' && a[2]) vec_push(inc_flags, (char *)a);
         else if (a[0] == '-') {
@@ -453,7 +713,7 @@ int main(int argc, char **argv) {
         }
         input = pk->entry;
         if (testing) pkg_source_files(pk, &pkg_files);
-        if (!out && !testing) out = arena_printf("%s%s", pk->name, !strcmp(target, "native") ? "" : ".wasm");
+        if (!out && !testing && !profiling) out = arena_printf("%s%s", pk->name, !strcmp(target, "native") ? "" : ".wasm");
     }
     if (!strcmp(target, "wasm32") || !strcmp(target, "wasm32-freestanding")) {
         g_target = (Target){32, true, "wasm32-unknown-unknown"};
@@ -503,6 +763,37 @@ int main(int argc, char **argv) {
         return 2;
     }
     char test_bin[PATH_MAX];
+    if (profiling) {
+        if (!final_link) {
+            diag_emit_fatal(json, "E9001", "phalange profile builds and runs the program; --emit is not supported");
+            return 2;
+        }
+        co.stack_traces = true;  // the profiler samples the shadow stack
+        co.profile = true;
+        if (!folded_path) {
+            const char *base = strrchr(input, '/');
+            base = base ? base + 1 : input;
+            size_t n = strlen(base);
+            if (n > 3 && !strcmp(base + n - 3, ".ph")) n -= 3;
+            if (out) {  // -o names the folded output too
+                folded_path = out;
+            } else {
+                folded_path = arena_printf("%.*s.folded", (int)n, base);
+            }
+        }
+        const char *tmpdir = getenv("TMPDIR");
+        snprintf(test_bin, sizeof test_bin, "%s/phalange-profile-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
+                 g_target.wasm ? ".wasm" : "");
+        out = test_bin;
+        if (!g_target.wasm) {
+            const char *pr = arena_printf("%s/../runtime/profile.c", so.std_dir);
+            if (!file_exists(pr)) {
+                diag_emit_fatal(json, "E9003", arena_printf("cannot find the profiler runtime (%s)", pr));
+                return 2;
+            }
+            vec_push(link_inputs, (char *)pr);
+        }
+    }
     if (testing) {
         if (!final_link) {
             diag_emit_fatal(json, "E9001", "phalange test builds and runs a test binary; --emit is not supported");
@@ -532,6 +823,9 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < g_prog.host_fns.len; i++)
         if (!strcmp(g_prog.host_fns.data[i]->name, "ph_thread_spawn")) g_threads = true;
+    // The wasm profiler reads the shadow stack from another thread, so the
+    // program runs on a shared memory.
+    if (profiling && g_target.wasm) g_threads = true;
     char objpath[PATH_MAX + 64];
     if (final_link) {
         snprintf(objpath, sizeof objpath, "%s.tmp%d.o", out, (int)getpid());
@@ -655,6 +949,11 @@ int main(int argc, char **argv) {
     }
     if (testing) {
         int rc = run_tests(out, so.std_dir, test_filter, test_timeout, json);
+        unlink(out);
+        return rc;
+    }
+    if (profiling) {
+        int rc = run_profile(out, so.std_dir, folded_path, prof_hz, json);
         unlink(out);
         return rc;
     }

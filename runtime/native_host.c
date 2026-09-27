@@ -216,6 +216,9 @@ int32_t ph_notify32(uint32_t *p, int32_t count) {
     return r < 0 ? 0 : (int32_t)r;
 }
 
+// Defined by runtime/profile.c when profiling: writes the samples so far.
+__attribute__((weak)) void ph_profile_flush(void);
+
 // Default report for traps in native programs (test binaries override it).
 __attribute__((weak)) void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info,
                                       const struct ph_shadow_stack *ss) {
@@ -226,6 +229,7 @@ __attribute__((weak)) void ph_on_trap(const struct ph_trap_site *site, const str
     if (n < 0 || (size_t)n >= sizeof buf) n = 0;
     n += (int)ph_format_stack(buf + n, sizeof buf - (size_t)n, site, ss);
     (void)!write(2, buf, (size_t)n);
+    if (ph_profile_flush) ph_profile_flush();
 }
 
 // Crashes that are not Phalange traps (a stack overflow, or a fault in C code
@@ -255,6 +259,7 @@ static void ph_crash(int sig, siginfo_t *si, void *uc) {
     const struct ph_shadow_stack *ss = phalange_shadow_stack ? phalange_shadow_stack() : NULL;
     n += (int)ph_format_stack(buf + n, sizeof buf - (size_t)n, NULL, ss);
     (void)!write(2, buf, (size_t)n);
+    if (ph_profile_flush) ph_profile_flush();
     signal(sig, SIG_DFL);
     raise(sig);
 }

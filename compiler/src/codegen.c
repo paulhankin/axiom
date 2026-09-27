@@ -384,6 +384,15 @@ typedef struct SsFrame {
     LLVMValueRef ss, depth;
 } SsFrame;
 
+// In profiling builds another thread (or a signal handler) reads the stack at
+// any moment, so the stores must happen even where nothing in this thread
+// reads them (after inlining, an increment followed by the restore is
+// otherwise a dead store).
+static void ss_store(LLVMValueRef v, LLVMValueRef p) {
+    LLVMValueRef st = LLVMBuildStore(B, v, p);
+    if (O->profile) LLVMSetVolatile(st, true);
+}
+
 static SsFrame ss_push(const char *callee) {
     SsFrame f = {0};
     if (!stack_traces_on() || !F) return f;
@@ -391,13 +400,13 @@ static SsFrame ss_push(const char *callee) {
     LLVMValueRef dp = ss_field(f.ss, 0);
     f.depth = LLVMBuildLoad2(B, T_i32, dp, "depth");
     LLVMValueRef idx = LLVMBuildAnd(B, f.depth, LLVMConstInt(T_i32, SS_CAP - 1, false), "");
-    LLVMBuildStore(B, site_record_ex(SITE_CALL, g_cur_span, callee), ss_slot(f.ss, 2, idx));
-    LLVMBuildStore(B, LLVMBuildAdd(B, f.depth, LLVMConstInt(T_i32, 1, false), ""), dp);
+    ss_store(site_record_ex(SITE_CALL, g_cur_span, callee), ss_slot(f.ss, 2, idx));
+    ss_store(LLVMBuildAdd(B, f.depth, LLVMConstInt(T_i32, 1, false), ""), dp);
     return f;
 }
 
 static void ss_pop(SsFrame f) {
-    if (f.ss) LLVMBuildStore(B, f.depth, ss_field(f.ss, 0));
+    if (f.ss) ss_store(f.depth, ss_field(f.ss, 0));
 }
 
 // Appends an error-return record when `code` (an error code, i16) is nonzero.

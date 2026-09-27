@@ -34,7 +34,7 @@ static const char *const ph_trap_names[] = {
     "invalid function pointer", "misaligned atomic access", "expectation failed",
 };
 
-static void ph_format_value(char *out, size_t cap, uint64_t kind, uint64_t v, uint64_t len) {
+static inline void ph_format_value(char *out, size_t cap, uint64_t kind, uint64_t v, uint64_t len) {
     double d;
     switch (kind) {
     case 1: snprintf(out, cap, "%" PRId64, (int64_t)v); break;
@@ -49,7 +49,7 @@ static void ph_format_value(char *out, size_t cap, uint64_t kind, uint64_t v, ui
 
 // "trap T0001 (index out of bounds): <text>" or
 // "expected equal values, left: 3, right: 4: <text>"
-static void ph_format_trap(char *out, size_t cap, const struct ph_trap_site *s, const struct ph_trap_info *info) {
+static inline void ph_format_trap(char *out, size_t cap, const struct ph_trap_site *s, const struct ph_trap_info *info) {
     const char *name = s->code < sizeof ph_trap_names / sizeof *ph_trap_names ? ph_trap_names[s->code] : "trap";
     if (info && info->kind) {
         char a[256], b[256];
@@ -65,7 +65,7 @@ static void ph_format_trap(char *out, size_t cap, const struct ph_trap_site *s, 
 
 // Appends "stack trace" lines for a trap at `top` (may be NULL: location
 // unknown) to out. Returns the length written.
-static size_t ph_format_stack(char *out, size_t cap, const struct ph_trap_site *top, const struct ph_shadow_stack *ss) {
+static inline size_t ph_format_stack(char *out, size_t cap, const struct ph_trap_site *top, const struct ph_shadow_stack *ss) {
     size_t n = 0;
 #define PH_PUT(...)                                                               \
     do {                                                                          \
@@ -104,7 +104,7 @@ static size_t ph_format_stack(char *out, size_t cap, const struct ph_trap_site *
     return n;
 }
 
-static size_t ph_format_error_trace(char *out, size_t cap, const struct ph_shadow_stack *ss) {
+static inline size_t ph_format_error_trace(char *out, size_t cap, const struct ph_shadow_stack *ss) {
     size_t n = 0;
     if (cap) out[0] = 0;
     if (!ss || !ss->errors) return 0;

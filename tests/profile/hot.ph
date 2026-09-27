@@ -1,0 +1,26 @@
+// Profiled by tests/run.mjs (phalange profile): `spin` must dominate, and
+// the call path main -> work -> spin must be attributed to its call sites.
+fn spin(n: u64) u64 {
+    let mut s: u64 = 88172645463325252;
+    for i in @as(u64, 0)..n {
+        s = s ^ (s << 13);
+        s = s ^ (s >> 7);
+        s = (s ^ (s << 17)) +% i;
+    }
+    return s;
+}
+
+fn cold(n: u64) u64 {
+    return n + 1;
+}
+
+fn work() u64 {
+    return spin(60000000) +% cold(3);
+}
+
+export fn main() i32 {
+    if work() == 7 {
+        return 1;
+    }
+    return 0;
+}

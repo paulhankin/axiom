@@ -18,6 +18,7 @@ node runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
 phalange test mylib.ph                # run a file's `test` blocks
 phalange new geometry                 # a package: phalange.toml + src/lib.ph (spec §4.6)
 phalange test geometry                # build/check/test also take a package directory
+phalange profile prog.ph              # sampling profiler: hot functions, call sites, flame graph input
 node tests/run.mjs                    # run the test suite
 ```
 
@@ -32,7 +33,7 @@ node tests/run.mjs                    # run the test suite
 | [`examples/c_interop/`](examples/c_interop/stats.ph) | A Phalange library called from C through a generated header |
 | [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |
 | [`std/`](std/README.md) | Standard library: `mem`, `vec`, `hash`, `map`, `matrix`, `io`, `net` |
-| [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native_host.c`) |
+| [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native_host.c`); test runners; the profiler |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `phalange test`, packages |
 
 The spec's [Appendix C](spec/phalange.md#appendix-c-changes-from-the-design-notes) lists the

@@ -197,6 +197,30 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
 }
 
+// Profiling (spec §17.6).
+{
+  const name = 'tests/profile/hot.ph [phalange profile]';
+  if (!filter || name.includes(filter)) {
+    const folded = path.join(tmp, 'hot.folded');
+    const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ph'), '--format=agent-json', `--folded=${folded}`,
+      ...testTargets, ...extraFlags], { encoding: 'utf8' });
+    let problem = null;
+    let j = null;
+    try { j = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
+    if (j) {
+      const fn = (n) => j.functions.find((f) => f.name === n);
+      const site = (a, b) => j.call_sites.find((x) => x.caller === a && x.callee === b);
+      if (j.schema !== 'phalange-profile/1' || j.samples < 20) problem = `too few samples: ${c.stdout}`;
+      else if (!fn('spin') || fn('spin').self_pct < 50) problem = `spin is not the hot function: ${JSON.stringify(j.functions)}`;
+      else if (!fn('main') || fn('main').total_pct < 90) problem = `main should be on (almost) every stack: ${JSON.stringify(j.functions)}`;
+      else if (!site('work', 'spin') || site('work', 'spin').line !== 18) problem = `missing call site work -> spin: ${JSON.stringify(j.call_sites)}`;
+      else if (!/^main;work;spin \d+$/m.test(fs.readFileSync(folded, 'utf8'))) problem = `folded stacks lack main;work;spin:\n${fs.readFileSync(folded, 'utf8')}`;
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // Packages (spec §4.6): builds from a package directory, dependency
 // visibility, name conflicts, manifests, git dependencies, `phalange new`.
 {

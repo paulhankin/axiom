@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.7
+**Version:** 0.1-draft.8
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -1804,6 +1804,7 @@ phalange run   <file.ph> [--export=name]  # build for wasm32 and execute in the 
 phalange explain <CODE>                   # long-form documentation for a diagnostic code
 phalange test  <file.ph> [--filter=text] [--timeout=ms]   # run test blocks (§18)
 phalange new   <name>                     # create a package skeleton (§4.6)
+phalange profile <file.ph> [--rate=hz]    # sampling profiler (§17.6)
 ```
 
 `build`, `check` and `test` also accept a package directory, or no path at all for the
@@ -2033,6 +2034,65 @@ FAIL parse config (1 ms)
 input was laid out, and running it twice changes nothing. Agents SHOULD run `phalange fmt`
 before diffing or committing. Two programs that are equal after formatting are the same
 program.
+
+### 17.6 Profiling
+
+```
+phalange profile <file.ph> | <package dir> [--target=wasm32|native] [-O0..-O3]
+                 [--rate=<hz>] [--folded=<path>] [--format=human|agent-json]
+```
+
+`phalange profile` builds the program, runs its `main`, and reports where the time went.
+It is a **sampling profiler**. About `--rate` times a second (default 999) it copies the
+running thread's shadow stack (§17.4.1), so every sample is an exact source-level call
+path. It is not an estimate from machine addresses.
+
+```
+profile: 340 samples at 999 Hz (wall time, 0.34 s)
+
+  self%  total%  function
+   99.4    99.4  spin
+    0.6   100.0  main
+    0.0    99.4  work
+
+ total%  call site
+   99.4  hot.ph:18:12  work -> spin
+   99.4  hot.ph:22:8  main -> work
+
+folded stacks: hot.folded (for flamegraph.pl, inferno or speedscope)
+```
+
+- **self%** counts the samples in which the function was the innermost frame. **total%**
+  counts the samples in which it was anywhere on the stack, each sample counted once
+  even under recursion.
+- **call sites** attributes inclusive time to each call expression, so you can see
+  which calls inside a function are expensive, not just which functions are.
+- **Folded stacks** (`main;work;spin 338`, one line per distinct stack) are written to
+  `--folded` (default `<name>.folded`). They are the input format of common flame
+  graph tools.
+- With `--format=agent-json`, stdout holds one `phalange-profile/1` object with
+  `samples`, `hz`, `clock`, `seconds`, `functions` (`name`, `self`, `total`, and their
+  percentages), `call_sites` (`file`, `line`, `col`, `caller`, `callee`, `total`,
+  `context`) and `folded`. The program's own output goes to stderr.
+
+How samples are taken:
+
+| Target | Clock | Mechanism | Threads |
+|---|---|---|---|
+| native | process CPU time | a POSIX CPU-clock timer delivers `SIGPROF`, and the handler copies the interrupted thread's shadow stack (`runtime/profile.c`). Timer overruns weight each sample, so coarse kernel ticks don't skew totals | all threads |
+| wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`runtime/profile_worker.mjs`) | main thread only |
+
+Profile builds are otherwise identical to ordinary builds with stack traces on (the
+default), except that shadow-stack stores are volatile, so optimization can't remove
+them. A program's behavior never depends on whether it is being profiled.
+
+Limitations in v0.1:
+
+- Time is attributed to functions and call sites, not to individual lines inside the
+  innermost function.
+- On WebAssembly, only the main thread is sampled.
+- Stacks deeper than 256 calls lose their outermost frames. These samples are
+  counted and reported as truncated.
 
 ---
 
@@ -2364,6 +2424,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C27 | `test` blocks, `@expect`/`@expect_eq`, `phalange test`, and trap site records (§17.4, §18) | The user asked for testing support (formerly open question Q11) |
 | C28 | Packages: `phalange.toml`, `pkg:` imports, path and pinned-git dependencies, one source per name (§4.6) | The user asked for packages |
 | C29 | Stack traces from a per-thread shadow stack, and error return traces (§17.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
+| C30 | `phalange profile`: a sampling profiler over the shadow stack (§17.6) | The user asked for profiling support |
 
 ---
 

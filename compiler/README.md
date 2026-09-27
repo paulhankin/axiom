@@ -27,6 +27,8 @@ phalange check <file.ph> [options]    parse and type-check only
 phalange test  <file.ph> [options]    build and run the file's test blocks (spec §18)
                                       --filter=<text> --timeout=<ms> (default 10000)
 phalange new   <name>                 create a package (phalange.toml, src/lib.ph)
+phalange profile <file.ph> [options]  build, run under the sampling profiler, report (spec §17.6)
+                                      --rate=<hz> (default 999) --folded=<path>
 
 build, check and test also take a package directory, or no path for the package in the
 current directory (spec §4.6).
@@ -40,6 +42,7 @@ current directory (spec §4.6).
   --link=<file>                   C source, object or library to link in (repeatable). On wasm, C
                                   sources are compiled with clang for the same target
   -l<lib> -L<dir> -I<dir>         C libraries, library directories, include directories
+  --stack-traces=on|off           call-site shadow stack for crash traces and profiles (default on)
   --emit-header=<path>            write a C header for the `export fn`s (also works with `check`)
   --std=<dir>                     standard library directory (default: found next to the binary,
                                   or $PHALANGE_STD)
@@ -60,6 +63,17 @@ instance in a node worker (`runtime/test_runner.mjs`) or a forked process
 (`runtime/test_main.c`). It reports human-readable text or `phalange-tests/1` JSON.
 Every trap reports its code, the failing expression and its location, in tests and in
 normal runs.
+
+**Stack traces** (spec §17.4): every trap and crash (including stack overflow and
+faults in C code) prints the call path with source locations, and failing tests show
+it too, or, for a test that returned an error, the error return trace. They come
+from a per-thread shadow stack of call sites. Each call costs three stores and a
+load; `--stack-traces=off` removes them.
+
+**Profiling** (spec §17.6): `phalange profile` samples the shadow stack, using a
+CPU-clock `SIGPROF` natively (`runtime/profile.c`) or a worker reading shared memory
+on wasm (`runtime/profile_worker.mjs`). It reports self and total time per function,
+inclusive time per call site, and folded stacks for flame graphs.
 
 **Packages** (spec §4.6, `src/package.c`): a `phalange.toml` manifest (a TOML subset)
 with path dependencies and git dependencies pinned to a commit, fetched once into
