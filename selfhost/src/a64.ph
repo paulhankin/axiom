@@ -2150,6 +2150,10 @@ fn gen_ptradd(v: *mut ir.Value) void {
     raw3(ae.addsub_reg(1, false, false, 0, 0, 0, 0, 0), d, a, reg(off));
 }
 
+fn is_tls_global(v: *ir.Value) bool {
+    return (v.kind == ir.V_GLOBAL) and v.gv.tls;
+}
+
 // Constants that take instructions to build (worth building once per loop).
 fn const_needs_reg(v: *ir.Value) bool {
     let k = v.kind;
@@ -2532,6 +2536,7 @@ fn compile_func(f: *mut ir.Func) void {
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
     opt.hoist_constants(f, &order, const_needs_reg);
+    opt.hoist_to_entry(f, is_tls_global);
     opt.layout(&mut order);
     prepare(f);
     MF = mc.new_func();

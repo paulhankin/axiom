@@ -1099,6 +1099,38 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
     u.free(@ptr_cast(*mut void, made.data));
 }
 
+// Values `needs` picks (thread-local addresses on AArch64) are built once in
+// the entry block, for the whole function.
+pub fn hoist_to_entry(f: *mut ir.Func, needs: fn(*ir.Value) bool) void {
+    let e = f.first;
+    if u.isnil(e) or u.isnil(e.first) {
+        return;
+    }
+    // after the entry's phis (none) and allocas
+    let mut at = e.first;
+    while u.notnil(at.next) and (at.op == ir.OP_ALLOCA) {
+        at = at.next;
+    }
+    let mut made = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op != ir.OP_PHI) and (i.op != ir.OP_COPY) {
+                i.a = hoisted(f, i.a, at, &mut made, needs);
+                i.b = hoisted(f, i.b, at, &mut made, needs);
+                i.c = hoisted(f, i.c, at, &mut made, needs);
+                for k in 0..i.xs.len {
+                    i.xs.set(k, hoisted(f, i.xs.get(k), at, &mut made, needs));
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    u.free(@ptr_cast(*mut void, made.data));
+}
+
 fn hoisted(f: *mut ir.Func, v: *mut ir.Value, at: *mut ir.Value, made: *mut u.List.[*mut ir.Value], needs: fn(*ir.Value) bool) *mut ir.Value {
     if u.isnil(v) or not needs(v) {
         return v;
