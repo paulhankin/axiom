@@ -2506,13 +2506,15 @@ fn compile_func(f: *mut ir.Func) void {
     opt.split_critical_edges(f);
     lower.scalarize(f, legal);
     opt.compute_preds(f);
-    let order = opt.rpo(f);
+    let mut order = opt.dominators(f);
+    opt.loop_depths(f, &order);
     prepare(f);
     MF = mc.new_func();
     for i in 0..order.len {
         let b = order.get(i);
         b.aux = @int_cast(i64, i);
-        _ = mc.new_block(MF);
+        let mb = mc.new_block(MF);
+        mb.loop_depth = b.loop_depth;
     }
     let mut b = f.first;
     while u.notnil(b) {

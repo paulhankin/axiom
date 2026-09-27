@@ -11,9 +11,10 @@
 // 2i for instruction i's reads and 2i+1 for its writes). Physical registers
 // used explicitly (argument and result registers, division, shifts) and
 // registers clobbered by calls are fixed ranges an interval must avoid.
-// When registers run out, the interval ending last is spilled to a stack
-// slot and its uses and definitions are rewritten through short-lived
-// registers; allocation then runs again (those never spill).
+// When registers run out, the interval with the lowest spill weight (uses,
+// weighted by loop depth, per position covered) is spilled to a stack slot
+// and its uses and definitions are rewritten through short-lived registers;
+// allocation then runs again (those never spill).
 // =============================================================================
 import "util.ph" as u;
 
@@ -489,13 +490,32 @@ struct Interval {
     e: i32,
     reg: i32,
     spilled: bool,
+    uses: f64,    // uses and definitions, weighted by 10^loop depth
+}
+
+// The cost of spilling an interval: its (weighted) uses per position covered.
+fn weight(f: *MFunc, x: *Interval) f64 {
+    if f.nospill.get(@int_cast(usize, x.v)) {
+        return 1.0e300;
+    }
+    return x.uses / @float_from_int(f64, (x.e - x.s) + 1);
+}
+
+fn depth_weight(d: i32) f64 {
+    let mut w: f64 = 1.0;
+    let mut k: i32 = 0;
+    while (k < d) and (k < 6) {
+        w = w * 10.0;
+        k += 1;
+    }
+    return w;
 }
 
 fn build_intervals(f: *mut MFunc) []mut Interval {
     let nv = nvregs(f);
     let iv = u.newn.[Interval](nv + 1);
     for k in 0..nv {
-        iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false };
+        iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false, uses: 0.0 };
     }
     let w = words(nv);
     for bi in 0..f.blocks.len {
@@ -520,6 +540,7 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
                 }
             }
         }
+        let dw = depth_weight(b.loop_depth);
         let mut i = b.first;
         while u.notnil(i) {
             let p = i.pos;
@@ -528,6 +549,7 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
                 if o.kind == K_REG {
                     if is_vreg(o.reg) {
                         let x = @int_cast(usize, o.reg - VREG0);
+                        iv[x].uses += dw;
                         if (o.role & RU) != 0 {
                             extend(&mut iv[x], 2 * p);
                         }
@@ -541,9 +563,11 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
                 } else if o.kind == K_MEM {
                     if is_vreg(o.base) {
                         extend(&mut iv[@int_cast(usize, o.base - VREG0)], 2 * p);
+                        iv[@int_cast(usize, o.base - VREG0)].uses += dw;
                     }
                     if is_vreg(o.index) {
                         extend(&mut iv[@int_cast(usize, o.index - VREG0)], 2 * p);
+                        iv[@int_cast(usize, o.index - VREG0)].uses += dw;
                     }
                 }
             }
@@ -658,10 +682,10 @@ fn scan(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
             }
         }
         if pick < 0 {
-            // evict the active interval (of this class) ending last, if
-            // that ends later than cur (or cur must not spill)
+            // spill whichever of cur and the active intervals (of this
+            // class, whose register cur could take) is cheapest to spill
             let mut victim: i64 = -1;
-            let mut vend: i32 = -1;
+            let mut vw: f64 = 0.0;
             for j in 0..active.len {
                 let a = active.get(j);
                 if (f.vclass.get(@int_cast(usize, a.v)) != class) or f.nospill.get(@int_cast(usize, a.v)) {
@@ -670,13 +694,14 @@ fn scan(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
                 if fixed_conflict(a.reg, cur.s, cur.e) {
                     continue;
                 }
-                if a.e > vend {
-                    vend = a.e;
+                let w = weight(f, a);
+                if (victim < 0) or (w < vw) {
+                    vw = w;
                     victim = @int_cast(i64, j);
                 }
             }
             let must = f.nospill.get(@int_cast(usize, cur.v));
-            if (victim >= 0) and ((vend > cur.e) or must) {
+            if (victim >= 0) and ((vw < weight(f, cur)) or must) {
                 let a = active.get(@int_cast(usize, victim));
                 pick = a.reg;
                 a.spilled = true;
