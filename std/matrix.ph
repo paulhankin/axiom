@@ -253,3 +253,42 @@ pub struct Mat4 {
                              @shuffle(ab_hi, cd_hi, [0, 1, 4, 5]), @shuffle(ab_hi, cd_hi, [2, 3, 6, 7])] };
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/matrix.ph)
+// -----------------------------------------------------------------------------
+
+test "matrix product" {
+    let al = mem.page_allocator;
+    let av: [4]i32 = [1, 2, 3, 4];
+    let a = Matrix.[i32].from_slice(al, 2, 2, av[..])!;
+    let id = Matrix.[i32].identity(al, 2)!;
+    let p = a.mul(&id)!;
+    @expect(p.equals(&a));
+    let sq = a.mul(&a)!;
+    @expect_eq(sq.get(0, 0), 7);
+    @expect_eq(sq.get(1, 1), 22);
+}
+
+test "dimension mismatch" {
+    let al = mem.page_allocator;
+    let a = Matrix.[f64].init(al, 2, 3)!;
+    _ = a.mul(&a) catch |e| {
+        @expect_eq(e, error.DimensionMismatch);
+        return;
+    };
+    @trap();
+}
+
+test "Mat4 transform" {
+    let m = Mat4.translation(1.0, 2.0, 3.0).mul(Mat4.scaling(2.0, 2.0, 2.0));
+    let v = m.transform(@vec(f32x4, 1.0, 1.0, 1.0, 1.0));
+    @expect_eq(@extract_lane(v, 0), 3.0);
+    @expect_eq(@extract_lane(v, 3), 1.0);
+    @expect_eq(m.transpose().transpose().get(2, 3), 3.0);
+}
+
+test "SIMD dot with a tail" {
+    let a: [7]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    @expect_eq(dot(a[..], a[..])!, 140.0);
+}

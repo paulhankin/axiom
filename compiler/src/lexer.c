@@ -16,7 +16,7 @@ static const char *kw_names[] = {
 };
 
 static const char *reserved_future[] = {"async", "await", "comptime", "enum", "impl", "interface",
-                                        "null", "test", "trait", "type", "unsafe", "yield"};
+                                        "null", "trait", "type", "unsafe", "yield"};
 
 const char *tok_kind_name(TokKind k) {
     static const char *punct[] = {

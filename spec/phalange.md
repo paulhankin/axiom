@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.5
+**Version:** 0.1-draft.6
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -28,7 +28,8 @@ and unresolved questions are in [Appendix D](#appendix-d-open-questions).
 15. [Targets and ABI](#15-targets-and-abi)
 16. [Standard Library Core](#16-standard-library-core)
 17. [Toolchain and Agent Diagnostic Interface](#17-toolchain-and-agent-diagnostic-interface)
-18. [Complete Example](#18-complete-example)
+18. [Testing](#18-testing)
+19. [Complete Example](#19-complete-example)
 - [Appendix A: Builtin Functions](#appendix-a-builtin-functions)
 - [Appendix B: Trap Conditions](#appendix-b-trap-conditions)
 - [Appendix C: Changes from the Design Notes](#appendix-c-changes-from-the-design-notes)
@@ -111,7 +112,8 @@ A lone `_` is the **discard token** (§8.2). It is not an identifier.
 and       as        break     catch     const     continue  defer     else
 error     export    extern    false     fn        for       host      if
 import    in        let       loop      match     mut       not       or
-pub       return    Self      struct    true      union     wasm      while
+pub       return    Self      struct    test      true      union     wasm
+while
 ```
 
 **Reserved type names.** These lex as keywords:
@@ -125,7 +127,7 @@ i8x16  u8x16  i16x8  u16x8  i32x4  u32x4  i64x2  u64x2  f32x4  f64x2  v128
 `UnsignedInt`, `Float`. These may not be declared as identifiers.
 
 **Reserved for future use:** `async`, `await`, `comptime`, `enum`, `impl`,
-`interface`, `null`, `test`, `trait`, `type`, `unsafe`, `yield`.
+`interface`, `null`, `trait`, `type`, `unsafe`, `yield`.
 
 ### 2.5 Literals
 
@@ -1846,19 +1848,31 @@ Initial registry, not exhaustive:
 | E0702 | `*mut Self` method called through `*T` |
 | E0306 | Unknown ABI in `extern` (only `"C"`) |
 | E0307 | `...` outside `extern "C"`, or with no fixed parameter |
+| E0311 | Unknown trap code in `expect trap(...)` |
+| E0312 | Duplicate test name in a module |
 | E0801 | Type not allowed at the export or import boundary |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0824 | C variadic argument without a promoted type |
+| E0825 | `@expect_eq` operand type cannot be compared |
 | E0901 | Forbidden instruction in inline WASM |
 
 ### 17.4 Runtime trap reporting
 
-Debug builds (`--overflow=trap`, no `--strip`) SHOULD emit a custom WASM section,
-`phalange.traps`, that maps each trap site's code offset to a trap code and source span.
-`phalange run --format=agent-json` then reports a trap as a diagnostic with `severity:
-"error"`, a `Txxxx` code, and the span of the failing expression. Debug builds MAY also
-record an **error return trace**: the list of `!` and `return error.X` sites an error
-passed through.
+Every trap site carries a constant **site record**: trap code, source file, byte span,
+line, column, and the text of the failing expression. Before trapping, the program
+stores the record's address in a trap-info block, together with the compared values
+for `@expect_eq`.
+
+- On WebAssembly the block is reachable through the export `phalange_trap_info`.
+- On native targets it is passed to the weak hook `ph_on_trap`.
+
+Hosts use this to report, for example,
+`trap T0001 (index out of bounds): xs[i] at main.ph:3:12`. Traps raised by the engine
+itself are mapped to their codes: out-of-bounds memory is `T0005`, stack exhaustion
+`T0008`, and a bad `call_indirect` `T0009`.
+
+Debug builds MAY also record an **error return trace**: the list of `!` and
+`return error.X` sites an error passed through.
 
 ### 17.5 Canonical formatting
 
@@ -1869,7 +1883,79 @@ program.
 
 ---
 
-## 18. Complete Example
+## 18. Testing
+
+### 18.1 Test blocks and assertions
+
+```phalange
+test "parse accepts digits" {
+    @expect_eq(parse_u64("42")!, 42);
+    @expect(parse_u64("7")! < 10);      // any bool expression
+}
+
+test "indexing past the end traps" expect trap(T0001) {
+    let xs: [2]u8 = [1, 2];
+    let i: usize = 5;
+    _ = xs[i];
+}
+```
+
+- `test "name" Block` is a top-level declaration. Its body is checked like a function
+  returning `!void`, so `!` propagates errors out of it. Tests can use the module's
+  private items.
+- Test names must be unique within a module (`E0312`). Tests are not names: they can't
+  be called or referenced.
+- Tests are **type-checked in every build** but compiled only by `phalange test`. A
+  broken test fails the build, so tests never rot silently. They add nothing to
+  normal outputs.
+- A test **passes** if its body completes. It **fails** if it returns an error, traps,
+  or doesn't finish within the timeout.
+- `expect trap` inverts this: the test must trap. `expect trap(Tnnnn)` requires that
+  specific trap code (`E0311` for an unknown code). Traps are defined behavior (§12.7),
+  so they are testable.
+- `@expect(cond)` traps with `T0011` when `cond` is false.
+- `@expect_eq(a, b)` traps with `T0011` when `a != b`, and records both values. It
+  compares integers, floats, `bool`, `error`, pointers, and `[]u8` by content
+  (`E0825` for other types). Both builtins also work outside tests, as assertions
+  that stay on in every build.
+
+### 18.2 Running tests
+
+```
+phalange test file.ph [--target=wasm32|native] [--filter=text] [--timeout=ms] [--format=agent-json]
+```
+
+- **Which tests run.** The tests in `file.ph` and in every non-standard-library module
+  it imports. Running `phalange test std/vec.ph` tests a standard library module.
+- **Isolation.** Each test runs in isolation: a fresh WebAssembly instance in its own
+  worker, or a forked process on native targets. A trap, a hang or corrupted memory
+  can't affect other tests. Independent tests run in parallel.
+- **Output.** Each test's output (stdout and stderr) is captured and reported with it.
+- **Exit status.** `0` if every selected test passed, `1` if any failed, `2` if the tests
+  could not be built or run. Compile errors are reported as diagnostics (§17.2).
+
+With `--format=agent-json`, stdout holds one object:
+
+```json
+{"schema":"phalange-tests/1","status":"fail","passed":3,"failed":1,"tests":[
+  {"name":"parse accepts digits","file":"parse.ph","status":"fail","duration_ms":4,
+   "failure":{"code":"T0011","message":"expected equal values, left: 41, right: 42: @expect_eq(...)",
+              "file":"parse.ph","span":{"start_line":2,"start_col":5,"end_line":2,"end_col":36,
+              "start_byte":40,"end_byte":71},"context":"@expect_eq(parse_u64(\"42\")!, 42);"},
+   "output":""}]}
+```
+
+`failure.code` is one of:
+
+- a trap code (`T0000` to `T0011`);
+- `error`: the test returned an error, and the message names it;
+- `no_trap`: an `expect trap` test completed;
+- `timeout`.
+
+The span points at the failing expression, or at the test's name when there is no more
+precise location.
+
+## 19. Complete Example
 
 `examples/dot_product.ph`, the design-notes example updated to this specification:
 
@@ -2058,6 +2144,8 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 |---|---|
 | `@trap()` | Diverges and traps with `T0000`. Usable where any type is expected |
 | `@error_name(e)` | `error → []u8` |
+| `@expect(cond)` | Traps with `T0011` if `cond` is false (§18.1) |
+| `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§18.1) |
 
 ---
 
@@ -2078,6 +2166,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0008` | Stack exhaustion |
 | `T0009` | Invalid function pointer or signature mismatch (`call_indirect`) |
 | `T0010` | Misaligned atomic access (§12.8.3) |
+| `T0011` | Expectation failed: `@expect` / `@expect_eq` (§18.1) |
 
 Nothing else traps, and nothing is undefined.
 
@@ -2116,6 +2205,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C24 | Function pointers are allowed across the export/import boundary | Needed by `ph_thread_spawn`. On WebAssembly they are table indices |
 | C25 | C FFI: `extern "C"` blocks with varargs and libraries; `export fn` is C-callable; generated headers (§15.5) | The user asked for a C FFI in both directions |
 | C26 | A NUL byte follows every string literal (not part of the slice) | Found while testing the FFI: passing `"%s".ptr` to C read past the end of the literal |
+| C27 | `test` blocks, `@expect`/`@expect_eq`, `phalange test`, and trap site records (§17.4, §18) | The user asked for testing support (formerly open question Q11) |
 
 ---
 
@@ -2177,7 +2267,9 @@ Each question is followed by the options and the current leaning.
     - **Importing C headers** (`import c "stdio.h"`). This would need a C parser, which
       conflicts with "context-compact". Generating `extern` blocks with a separate
       tool is the likelier path.
-11. **Test blocks.** A `test "name" { … }` construct with `phalange test --format=agent-json`.
+11. ~~**Test blocks.**~~ Resolved: §18. Follow-ups: property-based tests (a
+    `std/testing` generator module), and benchmarks (`bench "name" { … }` with
+    `phalange test --bench`).
 12. **Loop labels.** v0.1 has none.
 13. **Relaxed SIMD.** Allow it in inline WASM with implementation-defined results, or forbid
     it (the current rule)?

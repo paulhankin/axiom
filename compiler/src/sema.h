@@ -12,6 +12,7 @@ typedef struct Program {
     Vec(Decl *) fns;       // every fn decl (including methods), for codegen
     Vec(Decl *) globals;
     Vec(Decl *) host_fns;
+    Vec(Decl *) tests;     // test blocks of non-std modules, in source order
 } Program;
 
 extern Program g_prog;

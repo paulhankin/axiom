@@ -16,6 +16,8 @@ Import with `import "std/<module>" as <name>;`. Everything that allocates takes 
 | [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
 | [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters); IPv4 parsing/formatting |
 
+Each module carries its own tests: `phalange test std/<module>.ph`.
+
 ## Conventions
 
 - **Interfaces are structs of function pointers.** `Allocator`, `Writer` and `Reader`

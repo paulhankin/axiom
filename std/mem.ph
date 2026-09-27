@@ -185,3 +185,34 @@ fn fixed_alloc(ctx: *mut void, size: usize, align: usize) !*mut u8 {
 }
 
 fn fixed_free(ctx: *mut void, p: *mut u8, size: usize) void {}
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/mem.ph)
+// -----------------------------------------------------------------------------
+
+test "FixedBuffer runs out" {
+    let mut storage: [64]u8 = [0; 64];
+    let mut fb = FixedBuffer.init(storage[..]);
+    let a = fb.allocator();
+    let xs = a.alloc.[u32](8)!;
+    @expect_eq(xs.len, 8);
+    _ = a.alloc.[u32](100) catch |e| {
+        @expect_eq(e, error.OutOfMemory);
+        return;
+    };
+    @trap();
+}
+
+test "Arena allocations are aligned and survive reset" {
+    let mut arena = Arena.init(page_allocator);
+    defer arena.deinit();
+    let al = arena.allocator();
+    for i in @as(u32, 0)..100 {
+        let big = al.alloc.[u64](1000)!;
+        @expect_eq(@int_from_ptr(big.ptr) % 8, 0);
+        big[999] = 7;
+    }
+    arena.reset();
+    let small = al.alloc.[u8](16)!;
+    small[15] = 1;
+}

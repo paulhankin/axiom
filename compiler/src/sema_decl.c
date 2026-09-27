@@ -87,6 +87,16 @@ static void register_module(Module *m) {
         Decl *d = m->decls.data[i];
         if (d->kind == D_ERROR) continue;
         if (!d->name) continue;
+        if (d->is_test) {  // tests are not names; their descriptions must be unique per module
+            for (int j = 0; j < i; j++) {
+                Decl *o = m->decls.data[j];
+                if (o->is_test && o->test_name == d->test_name) {
+                    Diag *dg = diag_error(d->name_span, "E0312", "duplicate test name \"%s\"", d->test_name);
+                    diag_note(dg, o->name_span, "first defined here");
+                }
+            }
+            continue;
+        }
         if (is_constraint_name(d->name)) {
             diag_error(d->name_span, "E0206", "'%s' is a reserved constraint name", d->name);
             continue;
@@ -613,6 +623,13 @@ static void check_global(Decl *d) {
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
+static bool is_std_module(Module *m) {
+    char rp[PATH_MAX];
+    if (!g_std_dir || !realpath(g_std_dir, rp)) return false;
+    size_t n = strlen(rp);
+    return strncmp(m->path, rp, n) == 0 && m->path[n] == '/';
+}
+
 bool sema_run(const char *path, SemaOptions *opts) {
     g_std_dir = opts->std_dir;
     if (!getcwd(g_cwd, sizeof g_cwd)) g_cwd[0] = 0;
@@ -670,7 +687,11 @@ bool sema_run(const char *path, SemaOptions *opts) {
                 break;
             case D_FN:
                 check_fn_body(d);
-                vec_push(g_prog.fns, d);
+                if (d->is_test) {
+                    if (m == g_prog.root || !is_std_module(m)) vec_push(g_prog.tests, d);
+                } else {
+                    vec_push(g_prog.fns, d);
+                }
                 break;
             case D_HOST_FN: vec_push(g_prog.host_fns, d); break;
             case D_STRUCT:

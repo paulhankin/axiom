@@ -65,3 +65,17 @@ pub fn to_cstr(alloc: mem.Allocator, s: []u8) !*mut u8 {
 pub fn free_cstr(alloc: mem.Allocator, p: *mut u8) void {
     alloc.free(@slice_from_ptr(p, cstr_len(p) + 1));
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/c.ph)
+// -----------------------------------------------------------------------------
+
+test "C strings" {
+    let al = mem.page_allocator;
+    let p = to_cstr(al, "hello")!;
+    @expect_eq(cstr_len(p), 5);
+    @expect_eq(from_cstr(p), "hello");
+    @expect_eq(cstr_len("literal".ptr), 7);  // literals are NUL-terminated
+    free_cstr(al, p);
+    @expect(is_null(null_ptr.[u8]()));
+}

@@ -17,6 +17,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "trap_format.h"
+
 // Error codes shared with runtime/host.mjs and std/net.ph.
 enum { PH_ERR = -1, PH_REFUSED = -2, PH_ADDR_IN_USE = -3, PH_BAD_ADDRESS = -4 };
 
@@ -208,4 +210,13 @@ int32_t ph_wait32(uint32_t *p, uint32_t expected, int64_t timeout_ns) {
 int32_t ph_notify32(uint32_t *p, int32_t count) {
     long r = syscall(SYS_futex, p, FUTEX_WAKE_PRIVATE, count < 0 ? 0x7fffffff : count, NULL, NULL, 0);
     return r < 0 ? 0 : (int32_t)r;
+}
+
+// Default report for traps in native programs (test binaries override it).
+__attribute__((weak)) void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info) {
+    char msg[1024];
+    ph_format_trap(msg, sizeof msg, site, info);
+    char line[1400];
+    int n = snprintf(line, sizeof line, "phalange: %s at %s:%u:%u\n", msg, site->file, site->line, site->col);
+    if (n > 0) (void)!write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
 }

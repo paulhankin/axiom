@@ -85,6 +85,8 @@
     X(ATOMIC_WAIT, "atomic_wait", "eee")      \
     X(ATOMIC_NOTIFY, "atomic_notify", "ee")   \
     X(FENCE, "fence", "")                     \
+    X(EXPECT, "expect", "e")                  \
+    X(EXPECT_EQ, "expect_eq", "ee")           \
     X(ERROR_NAME, "error_name", "e")
 
 typedef enum BuiltinId {

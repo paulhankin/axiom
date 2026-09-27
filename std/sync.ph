@@ -212,3 +212,65 @@ pub struct Channel[T] {
         _ = @atomic_notify(&self.not_full, NOTIFY_ALL);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/sync.ph)
+// -----------------------------------------------------------------------------
+
+import "thread.ph" as thread;
+
+struct Counter {
+    lock: Mutex,
+    n: u64,
+}
+
+fn bump(c: *mut Counter) void {
+    for i in @as(u32, 0)..5000 {
+        c.lock.lock();
+        c.n += 1;
+        c.lock.unlock();
+    }
+}
+
+fn feed(ch: *mut Channel.[u32]) void {
+    for i in @as(u32, 0)..100 {
+        ch.send(i) catch return;
+    }
+    ch.close();
+}
+
+test "mutex protects a counter across threads" {
+    let al = mem.page_allocator;
+    let mut c = Counter.{ lock: Mutex.init(), n: 0 };
+    let t1 = thread.spawn(al, bump, &mut c)!;
+    let t2 = thread.spawn(al, bump, &mut c)!;
+    bump(&mut c);
+    t1.join();
+    t2.join();
+    @expect_eq(c.n, 15000);
+}
+
+test "channel delivers in order, then Closed" {
+    let al = mem.page_allocator;
+    let mut ch = Channel.[u32].init(al, 4)!;
+    defer ch.deinit();
+    let t = thread.spawn(al, feed, &mut ch)!;
+    let mut expect: u32 = 0;
+    loop {
+        let v = ch.recv() catch |e| {
+            @expect_eq(e, error.Closed);
+            break;
+        };
+        @expect_eq(v, expect);
+        expect += 1;
+    }
+    t.join();
+    @expect_eq(expect, 100);
+}
+
+test "Atomic" {
+    let mut a = Atomic.[i32].init(5);
+    @expect_eq(a.add(2), 5);
+    @expect_eq(a.compare_exchange(7, 1), 7);
+    @expect_eq(a.load(), 1);
+}

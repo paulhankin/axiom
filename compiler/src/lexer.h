@@ -33,6 +33,7 @@
     X(RETURN, "return")      \
     X(SELF, "Self")          \
     X(STRUCT, "struct")      \
+    X(TEST, "test")          \
     X(TRUE, "true")          \
     X(UNION, "union")        \
     X(WASM, "wasm")          \

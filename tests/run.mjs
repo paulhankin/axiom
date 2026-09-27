@@ -123,6 +123,40 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
   else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
 }
+// `phalange test`: the standard library's own tests must pass, and the
+// self-tests in tests/testing/ must produce exactly the declared results.
+const testTargets = native ? ['--target=native'] : [];
+const stdFiles = files(path.join(root, 'std')).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
+for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
+  const name = path.relative(root, f) + ' [phalange test]';
+  if (filter && !name.includes(filter)) continue;
+  const src = fs.readFileSync(f, 'utf8');
+  const d = directives(src);
+  const t0 = process.hrtime.bigint();
+  const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...d.flags, ...extraFlags], { encoding: 'utf8' });
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  let problem = null;
+  let json = null;
+  try { json = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
+  if (json) {
+    const want = [...src.matchAll(/^\/\/ test-result: (.+?) \| (pass|fail)(?: \| (\S+))?(?: \| (\d+))?$/gm)];
+    if (!want.length) {
+      if (json.status !== 'pass') problem = `failures:\n${JSON.stringify(json.tests.filter((t) => t.status !== 'pass'), null, 1)}`;
+    } else {
+      for (const [, tname, status, code, line] of want) {
+        const t = json.tests.find((x) => x.name === tname);
+        if (!t) { problem = `missing result for "${tname}"`; break; }
+        if (t.status !== status) { problem = `"${tname}": expected ${status}, got ${t.status} ${JSON.stringify(t.failure)}`; break; }
+        if (code && t.failure.code !== code) { problem = `"${tname}": expected code ${code}, got ${t.failure.code}`; break; }
+        if (line && t.failure.span.start_line !== Number(line)) { problem = `"${tname}": expected line ${line}, got ${t.failure.span.start_line}`; break; }
+      }
+      if (!problem && json.tests.length !== want.length) problem = `expected ${want.length} tests, got ${json.tests.length}`;
+    }
+  }
+  if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+  else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
+}
+
 for (const f of failures) console.log('\n' + f);
 console.log(`\n${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
 fs.rmSync(tmp, { recursive: true, force: true });

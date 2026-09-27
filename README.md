@@ -15,6 +15,7 @@ Its main target is WebAssembly. Its design mandate is:
 make -C compiler                      # needs llvm-18-dev, lld
 ./compiler/build/phalange build examples/dot_product.ph -O2 -o engine.wasm
 node runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
+phalange test mylib.ph                # run a file's `test` blocks
 node tests/run.mjs                    # run the test suite
 ```
 

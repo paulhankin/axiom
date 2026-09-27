@@ -31,7 +31,8 @@ extern char **environ;
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: phalange <build|check> <file.ph> [options]\n"
+            "usage: phalange <build|check|test> <file.ph> [options]\n"
+            "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
 }
@@ -93,13 +94,191 @@ static const char *find_tool(const char **names) {
     return NULL;
 }
 
+// ---------------------------------------------------------------------------
+// phalange test: run the test binary and report (spec §18).
+// ---------------------------------------------------------------------------
+static int run_capture(char *const argv[], CharVec *out) {
+    int fds[2];
+    if (pipe(fds)) return -1;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (rc != 0) {
+        close(fds[0]);
+        return -1;
+    }
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof buf)) > 0)
+        for (ssize_t i = 0; i < n; i++) vec_push(*out, buf[i]);
+    close(fds[0]);
+    int status;
+    waitpid(pid, &status, 0);
+    vec_push(*out, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+static char *unescape(char *s) {
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (*r == '\\' && r[1]) {
+            r++;
+            *w++ = *r == 't' ? '\t' : *r == 'n' ? '\n' : *r == 'r' ? '\r' : *r;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = 0;
+    return s;
+}
+
+static void json_str_out(const char *s) {
+    putchar('"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"') fputs("\\\"", stdout);
+        else if (c == '\\') fputs("\\\\", stdout);
+        else if (c == '\n') fputs("\\n", stdout);
+        else if (c == '\r') fputs("\\r", stdout);
+        else if (c == '\t') fputs("\\t", stdout);
+        else if (c < 0x20) printf("\\u%04x", c);
+        else putchar(c);
+    }
+    putchar('"');
+}
+
+static const char *source_line(Span sp) {
+    SourceFile *f = g_files.data[sp.file];
+    uint32_t a = sp.start, b = sp.start;
+    while (a > 0 && f->text[a - 1] != '\n') a--;
+    while (b < f->len && f->text[b] != '\n') b++;
+    while (a < b && (f->text[a] == ' ' || f->text[a] == '\t')) a++;
+    return arena_strndup(f->text + a, b - a);
+}
+
+static int run_tests(const char *bin, const char *std_dir, const char *filter, const char *timeout, bool json) {
+    Vec(char *) av = {0};
+    if (g_target.wasm) {
+        const char *names[] = {"node", NULL};
+        const char *node = find_tool(names);
+        if (!node) {
+            diag_emit_fatal(json, "E9003", "phalange test needs node to run WebAssembly tests (or use --target=native)");
+            return 2;
+        }
+        vec_push(av, (char *)node);
+        vec_push(av, arena_printf("%s/../runtime/test_runner.mjs", std_dir));
+    }
+    vec_push(av, (char *)bin);
+    if (filter) vec_push(av, (char *)filter);
+    if (timeout) vec_push(av, (char *)timeout);
+    vec_push(av, NULL);
+    CharVec out = {0};
+    int rc = run_capture(av.data, &out);
+    if (rc != 0 || !out.data) {
+        if (out.data) fputs(out.data, stderr);
+        diag_emit_fatal(json, "E9006", "the test runner failed");
+        return 2;
+    }
+    int passed = 0, failed = 0;
+    if (json) printf("{\"schema\":\"phalange-tests/1\",\"tests\":[");
+    int nres = 0;
+    char *line = out.data;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strncmp(line, "PHT\t", 4) != 0) {  // stray output
+            fprintf(stderr, "%s\n", line);
+            line = nl ? nl + 1 : NULL;
+            continue;
+        }
+        char *f[11] = {0};
+        int nf = 0;
+        for (char *p = line; nf < 11;) {
+            f[nf++] = p;
+            char *t = strchr(p, '\t');
+            if (!t) break;
+            *t = 0;
+            p = t + 1;
+        }
+        line = nl ? nl + 1 : NULL;
+        if (nf < 10) continue;
+        int idx = atoi(f[1]);
+        if (idx < 0 || idx >= g_prog.tests.len) continue;
+        Decl *d = g_prog.tests.data[idx];
+        bool pass = !strcmp(f[2], "pass");
+        const char *code = f[3];
+        int file_id = atoi(f[4]);
+        Span sp = d->name_span;
+        if (file_id >= 0 && file_id < g_files.len)
+            sp = (Span){file_id, (uint32_t)strtoul(f[5], NULL, 10), (uint32_t)strtoul(f[6], NULL, 10)};
+        const char *ms = f[7];
+        char *msg = unescape(f[8]);
+        char *output = unescape(f[9] ? f[9] : (char *)"");
+        const char *tfile = g_files.data[d->name_span.file]->display;
+        int sl, sc, el, ec;
+        span_linecol(sp, &sl, &sc, &el, &ec);
+        pass ? passed++ : failed++;
+        if (json) {
+            printf("%s\n  {\"name\":", nres++ ? "," : "");
+            json_str_out(d->test_name);
+            printf(",\"file\":");
+            json_str_out(tfile);
+            printf(",\"status\":\"%s\",\"duration_ms\":%s", pass ? "pass" : "fail", ms);
+            if (!pass) {
+                printf(",\"failure\":{\"code\":");
+                json_str_out(code);
+                printf(",\"message\":");
+                json_str_out(msg);
+                printf(",\"file\":");
+                json_str_out(g_files.data[sp.file]->display);
+                printf(",\"span\":{\"start_line\":%d,\"start_col\":%d,\"end_line\":%d,\"end_col\":%d,"
+                       "\"start_byte\":%u,\"end_byte\":%u},\"context\":",
+                       sl, sc, el, ec, sp.start, sp.end);
+                json_str_out(source_line(sp));
+                printf("}");
+            }
+            printf(",\"output\":");
+            json_str_out(output);
+            printf("}");
+        } else {
+            printf("%s %s (%s ms)\n", pass ? "ok  " : "FAIL", d->test_name, ms);
+            if (!pass) {
+                printf("     %s:%d:%d: %s %s\n", g_files.data[sp.file]->display, sl, sc, code, msg);
+                printf("         %s\n", source_line(sp));
+                if (*output) {
+                    printf("     output:\n");
+                    for (char *o = output; *o;) {
+                        char *e = strchr(o, '\n');
+                        printf("       | %.*s\n", e ? (int)(e - o) : (int)strlen(o), o);
+                        if (!e) break;
+                        o = e + 1;
+                    }
+                }
+            }
+        }
+    }
+    if (json)
+        printf("%s],\"passed\":%d,\"failed\":%d,\"status\":\"%s\"}\n", nres ? "\n" : "", passed, failed,
+               failed ? "fail" : "pass");
+    else
+        printf("\n%d passed, %d failed\n", passed, failed);
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         usage();
         return 2;
     }
     const char *cmd = argv[1];
-    bool build = strcmp(cmd, "build") == 0;
+    bool testing = strcmp(cmd, "test") == 0;
+    bool build = strcmp(cmd, "build") == 0 || testing;
+    g_test_mode = testing;
     if (!build && strcmp(cmd, "check") != 0) {
         usage();
         return 2;
@@ -111,6 +290,7 @@ int main(int argc, char **argv) {
     Vec(char *) link_flags = {0};  // -l / -L
     Vec(char *) inc_flags = {0};   // -I, for C sources
     const char *header_path = NULL;
+    const char *test_filter = NULL, *test_timeout = NULL;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
@@ -126,6 +306,8 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--cpu=", 6)) co.cpu = a + 6;
         else if (!strncmp(a, "--link=", 7)) vec_push(link_inputs, (char *)a + 7);
         else if (!strncmp(a, "--emit-header=", 14)) header_path = a + 14;
+        else if (testing && !strncmp(a, "--filter=", 9)) test_filter = a;
+        else if (testing && !strncmp(a, "--timeout=", 10)) test_timeout = a;
         else if ((a[1] == 'l' || a[1] == 'L') && a[0] == '-' && a[2]) vec_push(link_flags, (char *)a);
         else if (a[0] == '-' && a[1] == 'I' && a[2]) vec_push(inc_flags, (char *)a);
         else if (a[0] == '-') {
@@ -186,6 +368,25 @@ int main(int argc, char **argv) {
         diag_emit_fatal(json, "E9001", arena_printf("unknown --emit kind '%s'", emit));
         return 2;
     }
+    char test_bin[PATH_MAX];
+    if (testing) {
+        if (!final_link) {
+            diag_emit_fatal(json, "E9001", "phalange test builds and runs a test binary; --emit is not supported");
+            return 2;
+        }
+        const char *tmpdir = getenv("TMPDIR");
+        snprintf(test_bin, sizeof test_bin, "%s/phalange-test-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
+                 g_target.wasm ? ".wasm" : "");
+        out = test_bin;
+        if (!g_target.wasm) {
+            const char *tm = arena_printf("%s/../runtime/test_main.c", so.std_dir);
+            if (!file_exists(tm)) {
+                diag_emit_fatal(json, "E9003", arena_printf("cannot find the test runtime (%s)", tm));
+                return 2;
+            }
+            vec_push(link_inputs, (char *)tm);
+        }
+    }
     if (!out) {
         const char *base = strrchr(input, '/');
         base = base ? base + 1 : input;
@@ -197,7 +398,7 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < g_prog.host_fns.len; i++)
         if (!strcmp(g_prog.host_fns.data[i]->name, "ph_thread_spawn")) g_threads = true;
-    char objpath[PATH_MAX];
+    char objpath[PATH_MAX + 64];
     if (final_link) {
         snprintf(objpath, sizeof objpath, "%s.tmp%d.o", out, (int)getpid());
         co.out_path = objpath;
@@ -321,6 +522,11 @@ int main(int argc, char **argv) {
             diag_emit_fatal(json, "E9004", "linking failed");
             return 1;
         }
+    }
+    if (testing) {
+        int rc = run_tests(out, so.std_dir, test_filter, test_timeout, json);
+        unlink(out);
+        return rc;
     }
     diag_emit(json, json ? stdout : stderr);
     return 0;

@@ -216,3 +216,68 @@ pub struct Iter[K, V] {
         return false;
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/map.ph)
+// -----------------------------------------------------------------------------
+
+import "hash.ph" as hash;
+
+test "put, get, overwrite, remove" {
+    let mut m = Map.[u64, u64].init(mem.page_allocator, hash.hash_u64, hash.eq_u64);
+    defer m.deinit();
+    for i in @as(u64, 0)..1000 {
+        m.put(i, i * 2)!;
+    }
+    @expect_eq(m.len(), 1000);
+    @expect_eq(m.get(500)!, 1000);
+    m.put(500, 1)!;
+    @expect_eq(m.get(500)!, 1);
+    @expect(m.remove(500));
+    @expect(not m.remove(500));
+    @expect(not m.contains(500));
+    @expect_eq(m.len(), 999);
+}
+
+test "missing key is NotFound" {
+    let mut m = Map.[u32, u32].init(mem.page_allocator, hash.hash_u32, hash.eq_u32);
+    _ = m.get(7) catch |e| {
+        @expect_eq(e, error.NotFound);
+        return;
+    };
+    @trap();
+}
+
+test "tombstones are reused" {
+    let mut m = Map.[u64, u8].init(mem.page_allocator, hash.hash_u64, hash.eq_u64);
+    defer m.deinit();
+    for round in @as(u64, 0)..50 {
+        for i in @as(u64, 0)..100 {
+            m.put((round * 1000) + i, 1)!;
+        }
+        for i in @as(u64, 0)..100 {
+            @expect(m.remove((round * 1000) + i));
+        }
+    }
+    @expect_eq(m.len(), 0);
+    @expect(m.capacity() <= 256);
+}
+
+test "iteration visits every entry once" {
+    let mut m = Map.[[]u8, u32].init(mem.page_allocator, hash.hash_bytes, hash.eq_bytes);
+    defer m.deinit();
+    m.put("a", 1)!;
+    m.put("b", 2)!;
+    m.put("c", 3)!;
+    let mut it = m.iter();
+    let mut k: []u8 = "";
+    let mut v: u32 = 0;
+    let mut sum: u32 = 0;
+    let mut n: u32 = 0;
+    while it.next(&mut k, &mut v) {
+        sum += v;
+        n += 1;
+    }
+    @expect_eq(n, 3);
+    @expect_eq(sum, 6);
+}

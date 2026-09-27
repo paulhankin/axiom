@@ -59,3 +59,16 @@ pub fn eq_usize(a: usize, b: usize) bool {
 pub fn eq_bytes(a: []u8, b: []u8) bool {
     return @mem_eq(a, b);
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/hash.ph)
+// -----------------------------------------------------------------------------
+
+test "hashes are deterministic and spread" {
+    @expect_eq(hash_u64(42), hash_u64(42));
+    @expect(hash_u64(1) != hash_u64(2));
+    @expect_eq(hash_bytes("abc"), hash_bytes("abc"));
+    @expect(hash_bytes("abc") != hash_bytes("abd"));
+    @expect(eq_bytes("xy", "xy"));
+    @expect(not eq_bytes("xy", "x"));
+}

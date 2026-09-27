@@ -15,6 +15,93 @@ import os from 'os';
 import { Worker } from 'worker_threads';
 
 const READ_CHUNK = 1 << 16;
+
+export const TRAP_NAMES = [
+  'trap', 'index out of bounds', 'integer overflow', 'division by zero', 'int_cast out of range',
+  'memory access out of bounds', 'length precondition failed', 'invalid union tag', 'stack exhausted',
+  'invalid function pointer', 'misaligned atomic access', 'expectation failed',
+];
+
+export function trapCodeName(n) { return 'T' + String(n).padStart(4, '0'); }
+
+// Describes a trap: the site recorded by the program (spec Appendix B), or
+// the engine's own trap mapped to its code.
+export function describeTrap(instance, memory, err) {
+  const msg = String(err && err.message || err);
+  let t = null;
+  const info = instance && instance.exports.phalange_trap_info;
+  if (info && memory) {
+    const dv = new DataView(memory.buffer);
+    const base = info() >>> 0;
+    const site = Number(dv.getBigUint64(base, true));
+    if (site) {
+      const cstr = (p) => {
+        const u = new Uint8Array(memory.buffer);
+        let e = p;
+        while (u[e]) e++;
+        return Buffer.from(u.subarray(p, e)).toString('utf8');
+      };
+      const wide = !!instance.exports.phalange_wasm64;
+      const code = dv.getUint32(site, true);
+      t = {
+        code, name: TRAP_NAMES[code] || 'trap',
+        fileId: dv.getUint32(site + 4, true), start: dv.getUint32(site + 8, true), end: dv.getUint32(site + 12, true),
+        line: dv.getUint32(site + 16, true), col: dv.getUint32(site + 20, true),
+        file: cstr(wide ? Number(dv.getBigUint64(site + 24, true)) : dv.getUint32(site + 24, true)),
+        text: cstr(wide ? Number(dv.getBigUint64(site + 32, true)) : dv.getUint32(site + 28, true)),
+      };
+      const kind = Number(dv.getBigUint64(base + 8, true));
+      if (kind) t.values = formatValues(kind, dv, base, memory, instance);
+      dv.setBigUint64(base, 0n, true);  // consumed
+    }
+  }
+  if (!t) {
+    let code = 0;
+    if (err instanceof RangeError || /stack/i.test(msg)) code = 8;
+    else if (/out of bounds memory|memory access out of bounds/i.test(msg)) code = 5;
+    else if (/table|signature|indirect|null function/i.test(msg)) code = 9;
+    else if (/divide by zero|division by zero/i.test(msg)) code = 3;
+    else if (/integer overflow|unrepresentable/i.test(msg)) code = 2;
+    else if (/unaligned/i.test(msg)) code = 10;
+    t = { code, name: TRAP_NAMES[code], engineMessage: msg };
+  }
+  t.codeName = trapCodeName(t.code);
+  return t;
+}
+
+function formatValues(kind, dv, base, memory, instance) {
+  const a = dv.getBigUint64(base + 16, true), b = dv.getBigUint64(base + 24, true);
+  const alen = Number(dv.getBigUint64(base + 32, true)), blen = Number(dv.getBigUint64(base + 40, true));
+  const f64 = (x) => { const d = new DataView(new ArrayBuffer(8)); d.setBigUint64(0, x, true); return String(d.getFloat64(0, true)); };
+  const bytes = (p, n) => JSON.stringify(Buffer.from(new Uint8Array(memory.buffer, Number(p), Math.min(n, 200))).toString('utf8'));
+  const errName = (x) => {
+    const f = instance.exports.phalange_error_name;
+    if (!f) return `error #${x}`;
+    const p = f(Number(x)) >>> 0;
+    const u = new Uint8Array(memory.buffer);
+    let e = p;
+    while (u[e]) e++;
+    return 'error.' + Buffer.from(u.subarray(p, e)).toString('utf8');
+  };
+  switch (kind) {
+    case 1: return [String(BigInt.asIntN(64, a)), String(BigInt.asIntN(64, b))];
+    case 2: return [String(a), String(b)];
+    case 3: return [f64(a), f64(b)];
+    case 4: return [a ? 'true' : 'false', b ? 'true' : 'false'];
+    case 5: return [bytes(a, alen), bytes(b, blen)];
+    case 6: return [errName(a), errName(b)];
+    default: return ['0x' + a.toString(16), '0x' + b.toString(16)];
+  }
+}
+
+export function trapMessage(t) {
+  let m = `trap ${t.codeName} (${t.name})`;
+  if (t.values) m = `expected equal values, left: ${t.values[0]}, right: ${t.values[1]}`;
+  else if (t.code === 11) m = 'expectation failed';
+  if (t.text) m += `: ${t.text}`;
+  if (t.engineMessage && t.code === 0) m += ` [${t.engineMessage}]`;
+  return m;
+}
 const THREAD_STACK = 1 << 20;
 
 // Limits of an imported memory, read from the module binary (the JS API does
@@ -135,6 +222,7 @@ export function createHost(opts = {}) {
   const host = {
     imports: { phalange },
     setMemory(m) { memory = m; },
+    memory() { return memory; },
     close() { if (netClient) netClient.close(); },
     // Builds the import object for `mod`: the host ABI, the shared memory if
     // the module imports one, `extra`, and trapping stubs for anything else
@@ -185,7 +273,8 @@ async function main() {
     if (typeof r === 'number') code = r;
   } catch (e) {
     if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError)) throw e;
-    console.error(`phalange: trap: ${e.message}`);
+    const t = describeTrap(instance, host.memory(), e);
+    console.error(`phalange: ${trapMessage(t)}${t.file ? ` at ${t.file}:${t.line}:${t.col}` : ''}`);
     code = 134;
   }
   host.close();

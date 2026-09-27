@@ -1,4 +1,6 @@
 // parser.c - LL(1) recursive-descent parser.
+#include <ctype.h>
+
 #include "ast.h"
 #include "builtins.h"
 #include "diag.h"
@@ -1024,6 +1026,54 @@ static void parse_top(Parser *P) {
             if (!accept(P, TK_COMMA)) break;
         }
         expect(P, TK_RBRACE);
+        d->span = sp_from(P, start);
+        vec_push(P->mod->decls, d);
+        return;
+    }
+    if (t->kind == KW_TEST) {
+        // TestDecl ::= "test" STRING_LIT ( "expect" "trap" ( "(" IDENT ")" )? )? Block
+        advance(P);
+        static int ntests;
+        Decl *d = new_decl(P, D_FN, start);
+        d->is_test = true;
+        d->test_trap = -1;
+        Token *nm = expect(P, TK_STRING);
+        d->test_name = nm->kind == TK_STRING ? intern(nm->str.bytes, nm->str.len) : intern_cstr("?");
+        d->name = intern_cstr(arena_printf("test.%d", ntests++));
+        d->name_span = nm->span;
+        if (pk(P) == TK_IDENT && !strcmp(peek(P)->name, "expect")) {
+            advance(P);
+            Token *tr = peek(P);
+            if (tr->kind == TK_IDENT && !strcmp(tr->name, "trap")) advance(P);
+            else syntax_error(P, "'trap' after 'expect'");
+            d->test_trap = -2;
+            if (accept(P, TK_LPAREN)) {
+                Token *code = peek(P);
+                if (code->kind == TK_IDENT) {
+                    advance(P);
+                    const char *c = code->name;
+                    int v = -1;
+                    if (c[0] == 'T' && strlen(c) == 5 && isdigit((unsigned char)c[1]) && isdigit((unsigned char)c[2]) &&
+                        isdigit((unsigned char)c[3]) && isdigit((unsigned char)c[4]))
+                        v = atoi(c + 1);
+                    if (v < 0 || v > 11)
+                        diag_error(code->span, "E0311", "unknown trap code '%s' (expected T0000 ... T0011)", c);
+                    else d->test_trap = v;
+                } else {
+                    syntax_error(P, "trap code such as T0001");
+                }
+                expect(P, TK_RPAREN);
+            }
+        }
+        TypeExpr *v = NEW(TypeExpr);
+        v->kind = TE_PRIM;
+        v->prim = PRIM_VOID;
+        v->span = start;
+        d->ret_te = NEW(TypeExpr);
+        d->ret_te->kind = TE_ERRUNION;
+        d->ret_te->elem = v;
+        d->ret_te->span = start;
+        d->body = parse_block(P);
         d->span = sp_from(P, start);
         vec_push(P->mod->decls, d);
         return;

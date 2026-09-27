@@ -26,6 +26,8 @@ extern SymVec g_link_libs;
 // Set before codegen: the program spawns threads (wasm: shared memory and a
 // thread entry export).
 extern bool g_threads;
+// Build a test binary (phalange test): tests become roots and are exported.
+extern bool g_test_mode;
 // Set by codegen: the output calls into runtime/native_host.c.
 extern bool g_needs_native_runtime;
 

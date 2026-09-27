@@ -180,3 +180,22 @@ fn stream_write(ctx: *mut void, bytes: []u8) !usize {
     let s = TcpStream.{ handle: @int_cast(i32, @int_from_ptr(ctx)) };
     return s.write(bytes);
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/net.ph)
+// -----------------------------------------------------------------------------
+
+test "ipv4 round trip" {
+    let a = parse_ipv4("10.0.255.1")!;
+    @expect_eq(a, 0x0A00FF01);
+    let mut buf: [15]u8 = [0; 15];
+    @expect_eq(format_ipv4(buf[..], a), "10.0.255.1");
+}
+
+test "ipv4 rejects malformed input" {
+    let bad: [5][]u8 = ["1.2.3", "1.2.3.4.5", "256.1.1.1", "01.2.3.4", "a.b.c.d"];
+    for s in bad {
+        _ = parse_ipv4(s) catch continue;
+        @trap();
+    }
+}

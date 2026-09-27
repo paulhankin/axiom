@@ -475,3 +475,45 @@ fn bufwriter_write(ctx: *mut void, bytes: []u8) !usize {
     w.len += bytes.len;
     return bytes.len;
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/io.ph)
+// -----------------------------------------------------------------------------
+
+test "integer formatting" {
+    let mut buf: [21]u8 = [0; 21];
+    @expect_eq(fmt_u64(buf[..], 0), "0");
+    @expect_eq(fmt_u64(buf[..], 18446744073709551615), "18446744073709551615");
+    @expect_eq(fmt_i64(buf[..], -9223372036854775807 - 1), "-9223372036854775808");
+    @expect_eq(fmt_hex(buf[..], 0xbeef), "beef");
+}
+
+test "integer parsing" {
+    @expect_eq(parse_u64("12345")!, 12345);
+    @expect_eq(parse_i64("-42")!, -42);
+    _ = parse_u64("18446744073709551616") catch |e| {
+        @expect_eq(e, error.IoError);
+        return;
+    };
+    @trap();
+}
+
+test "BufferWriter and print_f64" {
+    let mut storage: [64]u8 = [0; 64];
+    let mut bw = BufferWriter.init(storage[..]);
+    let w = bw.writer();
+    w.print_f64(2.5, 2)!;
+    w.print(" ")!;
+    w.print_f64(-0.125, 1)!;
+    w.print(" ")!;
+    w.print_f64(1.0e20, 0)!;
+    @expect_eq(bw.written(), "2.50 -0.1 1e20");
+}
+
+test "read_line over a SliceReader" {
+    let mut sr = SliceReader.init("a\r\nbc\n");
+    let r = sr.reader();
+    let mut buf: [8]u8 = [0; 8];
+    @expect_eq(r.read_line(buf[..])!, "a");
+    @expect_eq(r.read_line(buf[..])!, "bc");
+}

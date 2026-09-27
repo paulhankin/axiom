@@ -239,3 +239,63 @@ pub fn binary_search[T](xs: []T, x: T, less: fn(T, T) bool) !usize {
     }
     return error.NotFound;
 }
+
+// -----------------------------------------------------------------------------
+// Tests (phalange test std/vec.ph)
+// -----------------------------------------------------------------------------
+
+fn test_less(a: i32, b: i32) bool {
+    return a < b;
+}
+
+test "push, pop and grow" {
+    let mut v = Vec.[i32].init(mem.page_allocator);
+    defer v.deinit();
+    for i in @as(i32, 0)..100 {
+        v.push(i)!;
+    }
+    @expect_eq(v.len, 100);
+    @expect(v.capacity() >= 100);
+    @expect_eq(v.pop()!, 99);
+    @expect_eq(v.get(10), 10);
+}
+
+test "pop on empty fails" {
+    let mut v = Vec.[u8].init(mem.page_allocator);
+    _ = v.pop() catch |e| {
+        @expect_eq(e, error.Empty);
+        return;
+    };
+    @trap();
+}
+
+test "get out of range traps" expect trap(T0001) {
+    let mut v = Vec.[u8].init(mem.page_allocator);
+    v.push(1)!;
+    _ = v.get(1);
+}
+
+test "insert, remove, swap_remove" {
+    let mut v = Vec.[i32].init(mem.page_allocator);
+    defer v.deinit();
+    let xs: [4]i32 = [1, 2, 3, 4];
+    v.extend(xs[..])!;
+    v.insert(0, 0)!;
+    @expect_eq(v.remove(2), 2);
+    @expect_eq(v.swap_remove(0), 0);
+    @expect_eq(v.get(0), 4);
+    @expect_eq(v.len, 3);
+}
+
+test "sort and binary_search" {
+    let mut xs: [9]i32 = [5, -3, 8, 0, 8, 2, -7, 1, 9];
+    sort(xs[..], test_less);
+    for i in 1..xs.len {
+        @expect(xs[i - 1] <= xs[i]);
+    }
+    let found = binary_search(xs[..], 2, test_less)!;
+    @expect_eq(xs[found], 2);
+    reverse(xs[..]);
+    @expect_eq(xs[0], 9);
+    @expect_eq(index_of(xs[..], -7)!, 8);
+}

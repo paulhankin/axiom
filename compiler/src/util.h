@@ -64,6 +64,8 @@ typedef struct SourceFile {
     const char *text;
     size_t len;
     int id;
+    uint32_t *line_starts;  // built on first use
+    int nlines;
 } SourceFile;
 
 typedef struct Span {

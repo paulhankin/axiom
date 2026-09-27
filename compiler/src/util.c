@@ -183,17 +183,28 @@ SourceFile *load_file(const char *path, const char *display) {
 }
 
 static void offset_linecol(SourceFile *f, uint32_t off, int *line, int *col) {
-    int l = 1, c = 1;
-    for (uint32_t i = 0; i < off && i < f->len; i++) {
-        unsigned char ch = (unsigned char)f->text[i];
-        if (ch == '\n') {
-            l++;
-            c = 1;
-        } else if ((ch & 0xC0) != 0x80) {  // count Unicode scalar values
-            c++;
-        }
+    if (!f->line_starts) {
+        int n = 1;
+        for (size_t i = 0; i < f->len; i++)
+            if (f->text[i] == '\n') n++;
+        f->line_starts = NEWN(uint32_t, n);
+        f->line_starts[0] = 0;
+        int k = 1;
+        for (size_t i = 0; i < f->len; i++)
+            if (f->text[i] == '\n') f->line_starts[k++] = (uint32_t)i + 1;
+        f->nlines = n;
     }
-    *line = l;
+    if (off > f->len) off = (uint32_t)f->len;
+    int lo = 0, hi = f->nlines - 1;  // last line whose start <= off
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (f->line_starts[mid] <= off) lo = mid;
+        else hi = mid - 1;
+    }
+    int c = 1;
+    for (uint32_t i = f->line_starts[lo]; i < off; i++)
+        if (((unsigned char)f->text[i] & 0xC0) != 0x80) c++;  // count Unicode scalar values
+    *line = lo + 1;
     *col = c;
 }
 

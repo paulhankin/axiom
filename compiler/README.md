@@ -24,6 +24,8 @@ $ ./compiler/build/phalange check examples/shapes.ph --format=agent-json
 ```
 phalange build <file.ph> [options]    compile and link
 phalange check <file.ph> [options]    parse and type-check only
+phalange test  <file.ph> [options]    build and run the file's test blocks (spec §18)
+                                      --filter=<text> --timeout=<ms> (default 10000)
 
   --target=wasm32|wasm64|native   default wasm32 (alias: wasm32-freestanding)
   -O0 | -O1 | -O2 | -O3           optimization level; never changes program behavior
@@ -47,6 +49,13 @@ With `--format=agent-json`, stdout holds exactly one JSON object in the spec's
 Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the host ABI
 used by `std/io` and `std/net` and calls the `main` export. Native programs that use
 the host ABI get `runtime/native_host.c` linked in automatically.
+
+**Tests** (spec §18): `test "name" { … }` blocks with `@expect` / `@expect_eq`.
+`phalange test` runs each test isolated, with a timeout and captured output: a fresh
+instance in a node worker (`runtime/test_runner.mjs`) or a forked process
+(`runtime/test_main.c`). It reports human-readable text or `phalange-tests/1` JSON.
+Every trap reports its code, the failing expression and its location, in tests and in
+normal runs.
 
 **C interop** (spec §15.5):
 - `extern "C" { fn ...; }` calls C. On wasm, the C sources passed with `--link` are

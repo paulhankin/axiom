@@ -306,6 +306,9 @@ struct Decl {
     bool variadic;     // C varargs: `...` after the fixed parameters
     Sym link_lib;      // extern "C" "lib": library to link
     Sym abi;
+    bool is_test;      // `test "name" { }` (a D_FN returning !void)
+    Sym test_name;
+    int test_trap;     // -1: must not trap; -2: must trap; n >= 0: must trap with Tn
     Span abi_span;
     Vec(Sym) error_names;
     Vec(Span) error_spans;

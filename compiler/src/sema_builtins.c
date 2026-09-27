@@ -554,6 +554,44 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t_invalid;
     }
     case BI_TRAP: return e->type = t_never;
+    case BI_EXPECT:
+        check_expr_to(earg(e, 0), t_bool);
+        return e->type = t_void;
+    case BI_EXPECT_EQ: {
+        // []mut u8 and []u8 compare equal-typed (mutability weakening).
+        for (int k = 0; k < 2; k++) {
+            Type *at = check_expr(*earg(e, k), NULL);
+            if (at->kind == TY_SLICE && at->mut) coerce(earg(e, k), type_slice(at->elem, false));
+        }
+        Type *ta = (*earg(e, 0))->type, *tb = (*earg(e, 1))->type;
+        Type *t;
+        if (ty_is_untyped(ta) && !ty_is_untyped(tb)) {
+            coerce(earg(e, 0), tb);
+            t = tb;
+        } else if (ty_is_untyped(tb) && !ty_is_untyped(ta)) {
+            coerce(earg(e, 1), ta);
+            t = ta;
+        } else if (ty_is_untyped(ta)) {
+            finalize_untyped(earg(e, 0));
+            t = t_invalid;
+        } else {
+            t = ta;
+            if (ta != tb && ta->kind != TY_INVALID && tb->kind != TY_INVALID) {
+                Diag *d = diag_error(e->span, "E0412", "@expect_eq operands have different types: %s and %s",
+                                     type_str(ta), type_str(tb));
+                diag_types(d, type_str(ta), type_str(tb));
+                t = t_invalid;
+            }
+        }
+        bool ok = t->kind == TY_INT || t->kind == TY_FLOAT || t->kind == TY_BOOL || t->kind == TY_ERROR ||
+                  t->kind == TY_PTR || t->kind == TY_FN || t->kind == TY_INVALID ||
+                  (t->kind == TY_SLICE && t->elem == t_u8) || (t->kind == TY_PARAM && type_satisfies(t, C_EQ));
+        if (!ok)
+            diag_error(e->span, "E0825",
+                       "@expect_eq compares numbers, bool, error, pointers and []u8; found %s (use @expect(...))",
+                       type_str(t));
+        return e->type = t_void;
+    }
     case BI_FENCE: return e->type = t_void;
     case BI_ATOMIC_LOAD:
     case BI_ATOMIC_STORE:
