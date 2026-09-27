@@ -6,7 +6,7 @@ import "util.ph" as u;
 import "ir.ph" as ir;
 import "target.ph" as tg;
 import "lower.ph" as lower;
-import "opt.ph" as opt;
+import "passes.ph" as passes;
 import "wasm.ph" as wa;
 import "wobj.ph" as wo;
 import "x64.ph" as x64;
@@ -22,12 +22,7 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
     ir.merge_same_named(m);
     if not raw {
         lower.lower_module(m);
-        for i in 0..m.funcs.len {
-            let f = m.funcs.get(i);
-            if not ir.is_decl(f) {
-                opt.optimize(f, opt_level);
-            }
-        }
+        passes.optimize_module(m, opt_level);
     }
     let dump = u.env("PHALANGE_DUMP_IR");  // debugging: the optimized IR of every compilation
     if not u.isnos(dump) {
