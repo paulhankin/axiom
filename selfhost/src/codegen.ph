@@ -107,6 +107,12 @@ struct FnState {
     defers: u.List.[*mut ast.Stmt],
     loops: u.List.[LoopCtx],
     entry: *mut ir.Block,
+    // The shadow stack record and its depth, read once at the function's
+    // entry: every call restores the depth, so it is the same at every call.
+    ss_rec: *mut ir.Value,
+    ss_depth: *mut ir.Value,
+    ss_slot: *mut ir.Value,   // where this function's calls record their site
+    ss_next: *mut ir.Value,   // the depth during its calls
 }
 
 let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
@@ -793,12 +799,24 @@ fn ss_push(callee: []u8) SsFrame {
     if not stack_traces_on() or u.isnil(F) {
         return f;
     }
-    f.ss = ss_ptr();
-    let dp = ss_field(f.ss, 0);
-    f.depth = ir.load(B, T_i32, dp);
-    let idx = b_and(f.depth, ci32(SS_CAP - 1));
-    ss_store(site_record_ex(SITE_CALL, g_cur_span, callee), ss_slot(f.ss, 2, idx));
-    ss_store(b_add(f.depth, ci32(1)), dp);
+    if u.isnil(F.ss_depth) {
+        let cur = ir.insert_block(B);
+        let first = F.entry.first;
+        if u.notnil(first) {
+            ir.at_before(B, first);
+        } else {
+            at_end(F.entry);
+        }
+        F.ss_rec = ss_ptr();
+        F.ss_depth = ir.load(B, T_i32, ss_field(F.ss_rec, 0));
+        F.ss_slot = ss_slot(F.ss_rec, 2, b_and(F.ss_depth, ci32(SS_CAP - 1)));
+        F.ss_next = b_add(F.ss_depth, ci32(1));
+        at_end(cur);
+    }
+    f.ss = F.ss_rec;
+    f.depth = F.ss_depth;
+    ss_store(site_record_ex(SITE_CALL, g_cur_span, callee), F.ss_slot);
+    ss_store(F.ss_next, ss_field(f.ss, 0));
     return f;
 }
 
