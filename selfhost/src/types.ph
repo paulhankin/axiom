@@ -1,0 +1,899 @@
+// =============================================================================
+// types.ph - type construction, interning, substitution, printing, layout.
+// Types are hash-consed: equal types are the same pointer.
+// =============================================================================
+import "util.ph" as u;
+import "lexer.ph" as lx;
+import "ast.ph" as ast;
+
+pub let mut g_target: ast.Target = ast.Target.{ ptr_bits: 32, is_wasm: true, triple: "wasm32-unknown-unknown" };
+
+pub let mut t_invalid: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_void: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_bool: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_error: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_never: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_untyped_int: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_untyped_float: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_u8: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_u16: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_u32: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_u64: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_usize: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_i8: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_i16: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_i32: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_i64: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_isize: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_f32: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_f64: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+pub let mut t_v128: *mut ast.Type = @ptr_from_int(*mut ast.Type, 0);
+
+let mut next_type_id: i32 = 1;
+
+// A zeroed type of kind k (the prototype for interning).
+fn blank(k: i32) ast.Type {
+    return ast.Type.{
+        kind: k, id: 0, bits: 0, is_signed: false, is_size: false, lanes: 0, elem: u.nil.[ast.Type](), is_mut: false,
+        len: 0, len_param: u.nil.[ast.Type](), params: no_types(), ret: u.nil.[ast.Type](), decl: u.nil.[ast.Decl](),
+        args: no_types(), owner: u.nil.[ast.Decl](), pindex: 0, constraint: 0, is_const: false,
+        const_type: u.nil.[ast.Type](), name: u.nosym(), cval: 0, has_params: false, size: 0, align: 0,
+        layout_done: false, backend: u.vnil(),
+    };
+}
+
+pub fn no_types() []mut *mut ast.Type {
+    return @slice_from_ptr(u.nil.[*mut ast.Type](), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Interning: a hash table keyed on the structural fields.
+// ---------------------------------------------------------------------------
+let mut ttab: *mut *mut ast.Type = @ptr_from_int(*mut *mut ast.Type, 0);
+let mut ttab_cap: usize = 0;
+let mut ttab_len: usize = 0;
+
+fn mix(h: u64, v: u64) u64 {
+    return ((h ^ v) *% 0x100000001b3) +% (h >> 29);
+}
+
+fn pv(p: *ast.Type) u64 {
+    return @as(u64, @int_from_ptr(p));
+}
+
+fn bv(b: bool) u64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn type_hash(t: *ast.Type) u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    h = mix(h, @bit_cast(u64, @as(i64, t.kind)));
+    h = mix(h, @bit_cast(u64, @as(i64, t.bits)));
+    h = mix(h, (bv(t.is_signed) | (bv(t.is_size) << 1)) | (bv(t.is_mut) << 2));
+    h = mix(h, @bit_cast(u64, @as(i64, t.lanes)));
+    h = mix(h, pv(t.elem));
+    h = mix(h, @bit_cast(u64, t.len));
+    h = mix(h, pv(t.len_param));
+    h = mix(h, pv(t.ret));
+    h = mix(h, @as(u64, @int_from_ptr(t.decl)));
+    h = mix(h, @bit_cast(u64, t.cval));
+    for p in t.params {
+        h = mix(h, pv(p));
+    }
+    for a in t.args {
+        h = mix(h, pv(a));
+    }
+    return h;
+}
+
+fn type_eq_struct(a: *ast.Type, b: *ast.Type) bool {
+    if (a.kind != b.kind) or (a.bits != b.bits) or (a.is_signed != b.is_signed) or (a.is_size != b.is_size) or
+       (a.is_mut != b.is_mut) or (a.lanes != b.lanes) or (a.elem != b.elem) or (a.len != b.len) or
+       (a.len_param != b.len_param) or (a.ret != b.ret) or (a.decl != b.decl) or (a.cval != b.cval) or
+       (a.params.len != b.params.len) or (a.args.len != b.args.len) {
+        return false;
+    }
+    for i in 0..a.params.len {
+        if a.params[i] != b.params[i] {
+            return false;
+        }
+    }
+    for i in 0..a.args.len {
+        if a.args[i] != b.args[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn copy_types(xs: []mut *mut ast.Type) []mut *mut ast.Type {
+    if xs.len == 0 {
+        return no_types();
+    }
+    let r = u.newn.[*mut ast.Type](xs.len);
+    @mem_copy(r, xs);
+    return r;
+}
+
+fn intern_type(proto: *ast.Type) *mut ast.Type {
+    if (ttab_len * 2) >= ttab_cap {
+        let mut ncap: usize = 1024;
+        if ttab_cap != 0 {
+            ncap = ttab_cap * 2;
+        }
+        let nt = @slice_from_ptr(@ptr_cast(*mut *mut ast.Type, u.calloc(ncap, 8)), ncap);
+        let old = @slice_from_ptr(ttab, ttab_cap);
+        for i in 0..ttab_cap {
+            if u.isnil(old[i]) {
+                continue;
+            }
+            let mut j = @truncate(usize, type_hash(old[i])) & (ncap - 1);
+            while u.notnil(nt[j]) {
+                j = (j + 1) & (ncap - 1);
+            }
+            nt[j] = old[i];
+        }
+        u.free(@ptr_cast(*mut void, ttab));
+        ttab = nt.ptr;
+        ttab_cap = ncap;
+    }
+    let tab = @slice_from_ptr(ttab, ttab_cap);
+    let h = type_hash(proto);
+    let mut j = @truncate(usize, h) & (ttab_cap - 1);
+    while u.notnil(tab[j]) {
+        if type_eq_struct(tab[j], proto) {
+            return tab[j];
+        }
+        j = (j + 1) & (ttab_cap - 1);
+    }
+    let t = u.new.[ast.Type]();
+    t.* = proto.*;
+    t.params = copy_types(proto.params);
+    t.args = copy_types(proto.args);
+    t.id = next_type_id;
+    next_type_id += 1;
+    // has_params
+    let mut hp = t.kind == ast.TY_PARAM;
+    if u.notnil(t.elem) and t.elem.has_params {
+        hp = true;
+    }
+    if u.notnil(t.len_param) {
+        hp = true;
+    }
+    if u.notnil(t.ret) and t.ret.has_params {
+        hp = true;
+    }
+    for p in t.params {
+        if p.has_params {
+            hp = true;
+        }
+    }
+    for a in t.args {
+        if a.has_params {
+            hp = true;
+        }
+    }
+    t.has_params = hp;
+    tab[j] = t;
+    ttab_len += 1;
+    return t;
+}
+
+fn simple(k: i32) *mut ast.Type {
+    let p = blank(k);
+    return intern_type(&p);
+}
+
+pub fn type_int(bits: i32, is_signed: bool, is_size: bool) *mut ast.Type {
+    let mut p = blank(ast.TY_INT);
+    p.bits = bits;
+    p.is_signed = is_signed;
+    p.is_size = is_size;
+    return intern_type(&p);
+}
+
+pub fn type_float(bits: i32) *mut ast.Type {
+    let mut p = blank(ast.TY_FLOAT);
+    p.bits = bits;
+    return intern_type(&p);
+}
+
+pub fn type_vec(lane: *mut ast.Type, lanes: i32) *mut ast.Type {
+    let mut p = blank(ast.TY_VEC);
+    p.elem = lane;
+    p.lanes = lanes;
+    p.bits = lane.bits;
+    p.is_signed = lane.is_signed;
+    return intern_type(&p);
+}
+
+pub fn type_ptr(elem: *mut ast.Type, is_mut: bool) *mut ast.Type {
+    let mut p = blank(ast.TY_PTR);
+    p.elem = elem;
+    p.is_mut = is_mut;
+    return intern_type(&p);
+}
+
+pub fn type_slice(elem: *mut ast.Type, is_mut: bool) *mut ast.Type {
+    let mut p = blank(ast.TY_SLICE);
+    p.elem = elem;
+    p.is_mut = is_mut;
+    return intern_type(&p);
+}
+
+pub fn type_array(elem: *mut ast.Type, len: i64) *mut ast.Type {
+    let mut p = blank(ast.TY_ARRAY);
+    p.elem = elem;
+    p.len = len;
+    return intern_type(&p);
+}
+
+pub fn type_array_param(elem: *mut ast.Type, len_param: *mut ast.Type) *mut ast.Type {
+    let mut p = blank(ast.TY_ARRAY);
+    p.elem = elem;
+    p.len = -1;
+    p.len_param = len_param;
+    return intern_type(&p);
+}
+
+pub fn type_fn(params: []mut *mut ast.Type, ret: *mut ast.Type) *mut ast.Type {
+    let mut p = blank(ast.TY_FN);
+    p.params = params;
+    p.ret = ret;
+    return intern_type(&p);
+}
+
+pub fn type_named(d: *mut ast.Decl, args: []mut *mut ast.Type) *mut ast.Type {
+    let mut k = ast.TY_STRUCT;
+    if d.kind == ast.D_UNION {
+        k = ast.TY_UNION;
+    }
+    let mut p = blank(k);
+    p.decl = d;
+    p.args = args;
+    return intern_type(&p);
+}
+
+pub fn type_errunion(elem: *mut ast.Type) *mut ast.Type {
+    let mut p = blank(ast.TY_ERRUNION);
+    p.elem = elem;
+    return intern_type(&p);
+}
+
+pub fn type_constint(v: i64) *mut ast.Type {
+    let mut p = blank(ast.TY_CONSTINT);
+    p.cval = v;
+    return intern_type(&p);
+}
+
+pub fn type_param(owner: *mut ast.Decl, index: i32, name: []u8, c: i32, is_const: bool,
+                  const_type: *mut ast.Type) *mut ast.Type {
+    let t = u.new.[ast.Type]();
+    t.* = blank(ast.TY_PARAM);
+    t.id = next_type_id;
+    next_type_id += 1;
+    t.owner = owner;
+    t.pindex = index;
+    t.name = name;
+    t.constraint = c;
+    t.is_const = is_const;
+    t.const_type = const_type;
+    t.has_params = true;
+    return t;
+}
+
+pub fn types_init() void {
+    t_invalid = simple(ast.TY_INVALID);
+    t_void = simple(ast.TY_VOID);
+    t_bool = simple(ast.TY_BOOL);
+    t_error = simple(ast.TY_ERROR);
+    t_never = simple(ast.TY_NEVER);
+    t_untyped_int = simple(ast.TY_UNTYPED_INT);
+    t_untyped_float = simple(ast.TY_UNTYPED_FLOAT);
+    t_u8 = type_int(8, false, false);
+    t_u16 = type_int(16, false, false);
+    t_u32 = type_int(32, false, false);
+    t_u64 = type_int(64, false, false);
+    t_usize = type_int(g_target.ptr_bits, false, true);
+    t_i8 = type_int(8, true, false);
+    t_i16 = type_int(16, true, false);
+    t_i32 = type_int(32, true, false);
+    t_i64 = type_int(64, true, false);
+    t_isize = type_int(g_target.ptr_bits, true, true);
+    t_f32 = type_float(32);
+    t_f64 = type_float(64);
+    t_v128 = simple(ast.TY_V128);
+}
+
+pub fn type_prim(p: i32) *mut ast.Type {
+    if p == lx.PRIM_U8 {
+        return t_u8;
+    }
+    if p == lx.PRIM_U16 {
+        return t_u16;
+    }
+    if p == lx.PRIM_U32 {
+        return t_u32;
+    }
+    if p == lx.PRIM_U64 {
+        return t_u64;
+    }
+    if p == lx.PRIM_USIZE {
+        return t_usize;
+    }
+    if p == lx.PRIM_I8 {
+        return t_i8;
+    }
+    if p == lx.PRIM_I16 {
+        return t_i16;
+    }
+    if p == lx.PRIM_I32 {
+        return t_i32;
+    }
+    if p == lx.PRIM_I64 {
+        return t_i64;
+    }
+    if p == lx.PRIM_ISIZE {
+        return t_isize;
+    }
+    if p == lx.PRIM_F32 {
+        return t_f32;
+    }
+    if p == lx.PRIM_F64 {
+        return t_f64;
+    }
+    if p == lx.PRIM_BOOL {
+        return t_bool;
+    }
+    if p == lx.PRIM_VOID {
+        return t_void;
+    }
+    if p == lx.PRIM_I8X16 {
+        return type_vec(t_i8, 16);
+    }
+    if p == lx.PRIM_U8X16 {
+        return type_vec(t_u8, 16);
+    }
+    if p == lx.PRIM_I16X8 {
+        return type_vec(t_i16, 8);
+    }
+    if p == lx.PRIM_U16X8 {
+        return type_vec(t_u16, 8);
+    }
+    if p == lx.PRIM_I32X4 {
+        return type_vec(t_i32, 4);
+    }
+    if p == lx.PRIM_U32X4 {
+        return type_vec(t_u32, 4);
+    }
+    if p == lx.PRIM_I64X2 {
+        return type_vec(t_i64, 2);
+    }
+    if p == lx.PRIM_U64X2 {
+        return type_vec(t_u64, 2);
+    }
+    if p == lx.PRIM_F32X4 {
+        return type_vec(t_f32, 4);
+    }
+    if p == lx.PRIM_F64X2 {
+        return type_vec(t_f64, 2);
+    }
+    if p == lx.PRIM_V128 {
+        return t_v128;
+    }
+    return t_invalid;
+}
+
+// Anonymous struct decls are interned by (field names, field types).
+let mut anon_decls: u.List.[*mut ast.Decl] = u.List.[*mut ast.Decl].{
+    data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0, cap: 0 };
+
+pub fn anon_struct_decl(m: *mut ast.Module, fields: u.List.[ast.Field], sp: u.Span) *mut ast.Decl {
+    for i in 0..anon_decls.len {
+        let d = anon_decls.get(i);
+        if d.fields.len != fields.len {
+            continue;
+        }
+        let mut same = true;
+        for j in 0..fields.len {
+            if not same {
+                break;
+            }
+            let a = d.fields.at(j);
+            let b = fields.at(j);
+            if not u.same(a.name, b.name) or (a.ty != b.ty) {
+                same = false;
+            }
+        }
+        if same {
+            return d;
+        }
+    }
+    let d = u.new.[ast.Decl]();
+    d.kind = ast.D_STRUCT;
+    d.anon = true;
+    d.span = sp;
+    d.module = m;
+    d.name = u.intern("struct");
+    d.fields = fields;
+    d.state = 2;
+    d.ty = type_named(d, no_types());
+    anon_decls.push(d);
+    return d;
+}
+
+pub fn is_aggregate(t: *ast.Type) bool {
+    let k = t.kind;
+    return (k == ast.TY_STRUCT) or (k == ast.TY_UNION) or (k == ast.TY_ARRAY) or (k == ast.TY_SLICE) or
+           (k == ast.TY_ERRUNION);
+}
+
+pub fn is_int(t: *ast.Type) bool {
+    return t.kind == ast.TY_INT;
+}
+
+pub fn is_float(t: *ast.Type) bool {
+    return t.kind == ast.TY_FLOAT;
+}
+
+pub fn is_num(t: *ast.Type) bool {
+    return (t.kind == ast.TY_INT) or (t.kind == ast.TY_FLOAT);
+}
+
+pub fn is_untyped(t: *ast.Type) bool {
+    return (t.kind == ast.TY_UNTYPED_INT) or (t.kind == ast.TY_UNTYPED_FLOAT);
+}
+
+pub fn is_vec_float(t: *ast.Type) bool {
+    return (t.kind == ast.TY_VEC) and (t.elem.kind == ast.TY_FLOAT);
+}
+
+pub fn is_vec_int(t: *ast.Type) bool {
+    return (t.kind == ast.TY_VEC) and (t.elem.kind == ast.TY_INT);
+}
+
+pub fn is_simd(t: *ast.Type) bool {
+    return (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128);
+}
+
+// ---------------------------------------------------------------------------
+// Substitution
+// ---------------------------------------------------------------------------
+pub fn subst(t: *mut ast.Type, from: []mut *mut ast.Type, to: []mut *mut ast.Type) *mut ast.Type {
+    let n = to.len;
+    if u.isnil(t) or not t.has_params or (n == 0) {
+        return t;
+    }
+    let k = t.kind;
+    if k == ast.TY_PARAM {
+        for i in 0..n {
+            if from[i] == t {
+                return to[i];
+            }
+        }
+        return t;
+    }
+    if k == ast.TY_PTR {
+        return type_ptr(subst(t.elem, from, to), t.is_mut);
+    }
+    if k == ast.TY_SLICE {
+        return type_slice(subst(t.elem, from, to), t.is_mut);
+    }
+    if k == ast.TY_ERRUNION {
+        return type_errunion(subst(t.elem, from, to));
+    }
+    if k == ast.TY_ARRAY {
+        let e = subst(t.elem, from, to);
+        if u.notnil(t.len_param) {
+            let l = subst(t.len_param, from, to);
+            if l.kind == ast.TY_CONSTINT {
+                return type_array(e, l.cval);
+            }
+            if l.kind == ast.TY_PARAM {
+                return type_array_param(e, l);
+            }
+            return type_array(e, 0);
+        }
+        return type_array(e, t.len);
+    }
+    if k == ast.TY_FN {
+        let ps = u.newn.[*mut ast.Type](t.params.len);
+        for i in 0..t.params.len {
+            ps[i] = subst(t.params[i], from, to);
+        }
+        return type_fn(ps, subst(t.ret, from, to));
+    }
+    if (k == ast.TY_STRUCT) or (k == ast.TY_UNION) {
+        let xs = u.newn.[*mut ast.Type](t.args.len);
+        for i in 0..t.args.len {
+            xs[i] = subst(t.args[i], from, to);
+        }
+        return type_named(t.decl, xs);
+    }
+    return t;
+}
+
+fn inst_member(owner: *mut ast.Type, member: *mut ast.Type) *mut ast.Type {
+    let d = owner.decl;
+    if (d.gparams.len == 0) or not member.has_params {
+        return member;
+    }
+    let from = u.newn.[*mut ast.Type](d.gparams.len);
+    for i in 0..d.gparams.len {
+        from[i] = d.gparams.at(i).ty;
+    }
+    return subst(member, from, owner.args);
+}
+
+// Field type of a struct instance / payload type of a union variant instance.
+pub fn type_field(st: *mut ast.Type, i: usize) *mut ast.Type {
+    return inst_member(st, st.decl.fields.at(i).ty);
+}
+
+pub fn type_variant(ut: *mut ast.Type, i: usize) *mut ast.Type {
+    let p = ut.decl.variants.at(i).ty;
+    if u.isnil(p) {
+        return p;
+    }
+    return inst_member(ut, p);
+}
+
+// ---------------------------------------------------------------------------
+// Printing (canonical source syntax)
+// ---------------------------------------------------------------------------
+fn tstr(b: *mut u.Buf, t: *ast.Type) void {
+    let k = t.kind;
+    if k == ast.TY_INVALID {
+        b.s("<invalid>");
+    } else if k == ast.TY_VOID {
+        b.s("void");
+    } else if k == ast.TY_BOOL {
+        b.s("bool");
+    } else if k == ast.TY_INT {
+        if t.is_size {
+            b.s(u.pick(t.is_signed, "isize", "usize"));
+        } else {
+            b.s(u.pick(t.is_signed, "i", "u"));
+            b.s(u.idec(t.bits));
+        }
+    } else if k == ast.TY_FLOAT {
+        b.s("f");
+        b.s(u.idec(t.bits));
+    } else if k == ast.TY_VEC {
+        if t.elem.kind == ast.TY_FLOAT {
+            b.s("f");
+        } else {
+            b.s(u.pick(t.elem.is_signed, "i", "u"));
+        }
+        b.s(u.idec(t.elem.bits));
+        b.s("x");
+        b.s(u.idec(t.lanes));
+    } else if k == ast.TY_V128 {
+        b.s("v128");
+    } else if k == ast.TY_PTR {
+        b.s(u.pick(t.is_mut, "*mut ", "*"));
+        tstr(b, t.elem);
+    } else if k == ast.TY_SLICE {
+        b.s(u.pick(t.is_mut, "[]mut ", "[]"));
+        tstr(b, t.elem);
+    } else if k == ast.TY_ARRAY {
+        b.s("[");
+        if u.notnil(t.len_param) {
+            b.s(t.len_param.name);
+        } else {
+            b.s(u.dec(t.len));
+        }
+        b.s("]");
+        tstr(b, t.elem);
+    } else if k == ast.TY_FN {
+        b.s("fn(");
+        for i in 0..t.params.len {
+            if i != 0 {
+                b.s(", ");
+            }
+            tstr(b, t.params[i]);
+        }
+        b.s(") ");
+        tstr(b, t.ret);
+    } else if (k == ast.TY_STRUCT) or (k == ast.TY_UNION) {
+        if t.decl.anon {
+            b.s("struct { ");
+            for i in 0..t.decl.fields.len {
+                if i != 0 {
+                    b.s(", ");
+                }
+                let f = t.decl.fields.at(i);
+                b.s(f.name);
+                b.s(": ");
+                tstr(b, f.ty);
+            }
+            b.s(" }");
+            return;
+        }
+        b.s(t.decl.name);
+        if t.args.len != 0 {
+            b.s(".[");
+            for i in 0..t.args.len {
+                if i != 0 {
+                    b.s(", ");
+                }
+                tstr(b, t.args[i]);
+            }
+            b.s("]");
+        }
+    } else if k == ast.TY_ERRUNION {
+        b.s("!");
+        tstr(b, t.elem);
+    } else if k == ast.TY_ERROR {
+        b.s("error");
+    } else if k == ast.TY_PARAM {
+        b.s(t.name);
+    } else if k == ast.TY_CONSTINT {
+        b.s(u.dec(t.cval));
+    } else if k == ast.TY_UNTYPED_INT {
+        b.s("integer literal");
+    } else if k == ast.TY_UNTYPED_FLOAT {
+        b.s("float literal");
+    } else if k == ast.TY_NEVER {
+        b.s("noreturn");
+    }
+}
+
+pub fn type_str(t: *ast.Type) []u8 {
+    let mut b = u.Buf.init();
+    tstr(&mut b, t);
+    return b.done();
+}
+
+// ---------------------------------------------------------------------------
+// Layout (spec §5)
+// ---------------------------------------------------------------------------
+fn round_up(x: i64, a: i64) i64 {
+    if a <= 1 {
+        return x;
+    }
+    return ((x + a) - 1) / a * a;
+}
+
+pub fn type_size(t: *mut ast.Type) i64 {
+    layout(t);
+    return t.size;
+}
+
+pub fn type_align(t: *mut ast.Type) i64 {
+    layout(t);
+    return t.align;
+}
+
+pub fn union_tag_type(ut: *mut ast.Type) *mut ast.Type {
+    if ut.decl.variants.len <= 256 {
+        return t_u8;
+    }
+    return t_u16;
+}
+
+pub fn union_payload_align(ut: *mut ast.Type) i64 {
+    let mut a: i64 = 1;
+    for i in 0..ut.decl.variants.len {
+        let p = type_variant(ut, i);
+        if u.notnil(p) and (type_align(p) > a) {
+            a = type_align(p);
+        }
+    }
+    return a;
+}
+
+pub fn union_payload_size(ut: *mut ast.Type) i64 {
+    let mut s: i64 = 0;
+    for i in 0..ut.decl.variants.len {
+        let p = type_variant(ut, i);
+        if u.notnil(p) and (type_size(p) > s) {
+            s = type_size(p);
+        }
+    }
+    return s;
+}
+
+pub fn union_payload_offset(ut: *mut ast.Type) i64 {
+    return round_up(type_size(union_tag_type(ut)), union_payload_align(ut));
+}
+
+pub fn type_field_offset(st: *mut ast.Type, i: usize) i64 {
+    let mut off: i64 = 0;
+    for j in 0..i + 1 {
+        let ft = type_field(st, j);
+        off = round_up(off, type_align(ft));
+        if j == i {
+            return off;
+        }
+        off += type_size(ft);
+    }
+    return off;
+}
+
+fn layout(t: *mut ast.Type) void {
+    if t.layout_done {
+        return;
+    }
+    let ps = @as(i64, g_target.ptr_bits / 8);
+    let k = t.kind;
+    if k == ast.TY_BOOL {
+        t.size = 1;
+        t.align = 1;
+    } else if (k == ast.TY_INT) or (k == ast.TY_FLOAT) {
+        t.size = @as(i64, t.bits / 8);
+        t.align = t.size;
+    } else if (k == ast.TY_VEC) or (k == ast.TY_V128) {
+        t.size = 16;
+        t.align = 16;
+    } else if (k == ast.TY_PTR) or (k == ast.TY_FN) {
+        t.size = ps;
+        t.align = ps;
+    } else if k == ast.TY_SLICE {
+        t.size = 2 * ps;
+        t.align = ps;
+    } else if k == ast.TY_ERROR {
+        t.size = 2;
+        t.align = 2;
+    } else if k == ast.TY_ARRAY {
+        t.align = type_align(t.elem);
+        t.size = t.len * type_size(t.elem);
+    } else if k == ast.TY_ERRUNION {
+        let ev = t.elem.kind == ast.TY_VOID;
+        let mut a = type_align(t.elem);
+        if a < 2 {
+            a = 2;
+        }
+        t.align = a;
+        if ev {
+            t.align = 2;
+        }
+        let mut ea: i64 = 1;
+        let mut es: i64 = 0;
+        if not ev {
+            ea = type_align(t.elem);
+            es = type_size(t.elem);
+        }
+        let off = round_up(2, ea);
+        t.size = round_up(off + es, t.align);
+    } else if k == ast.TY_STRUCT {
+        let mut off: i64 = 0;
+        let mut al: i64 = 1;
+        t.layout_done = true;  // guard recursion (infinite-size types are rejected by sema)
+        for i in 0..t.decl.fields.len {
+            let ft = type_field(t, i);
+            let fa = type_align(ft);
+            off = round_up(off, fa) + type_size(ft);
+            if fa > al {
+                al = fa;
+            }
+        }
+        t.align = al;
+        t.size = round_up(off, al);
+    } else if k == ast.TY_UNION {
+        t.layout_done = true;
+        let tag = union_tag_type(t);
+        let pa = union_payload_align(t);
+        let mut al = pa;
+        if not (pa > tag.align) {
+            al = type_align(tag);
+        }
+        t.align = al;
+        t.size = round_up(union_payload_offset(t) + union_payload_size(t), al);
+    } else {
+        t.size = 0;
+        t.align = 1;
+    }
+    t.layout_done = true;
+}
+
+// ---------------------------------------------------------------------------
+// Constraints
+// ---------------------------------------------------------------------------
+// C_NONE for an absent name, -1 for an unknown one.
+pub fn constraint_from_name(s: []u8) i32 {
+    if u.isnos(s) {
+        return ast.C_NONE;
+    }
+    if u.str_eq(s, "Eq") {
+        return ast.C_EQ;
+    }
+    if u.str_eq(s, "Ord") {
+        return ast.C_ORD;
+    }
+    if u.str_eq(s, "Num") {
+        return ast.C_NUM;
+    }
+    if u.str_eq(s, "Int") {
+        return ast.C_INT;
+    }
+    if u.str_eq(s, "SignedInt") {
+        return ast.C_SIGNED;
+    }
+    if u.str_eq(s, "UnsignedInt") {
+        return ast.C_UNSIGNED;
+    }
+    if u.str_eq(s, "Float") {
+        return ast.C_FLOAT;
+    }
+    return -1;
+}
+
+pub fn constraint_name(c: i32) []u8 {
+    let n = ["(none)", "Eq", "Ord", "Num", "Int", "SignedInt", "UnsignedInt", "Float"];
+    return n[@int_cast(usize, c)];
+}
+
+// Does constraint a imply constraint b?
+fn implies(a: i32, b: i32) bool {
+    if (b == ast.C_NONE) or (a == b) {
+        return true;
+    }
+    if a == ast.C_ORD {
+        return b == ast.C_EQ;
+    }
+    if a == ast.C_NUM {
+        return (b == ast.C_EQ) or (b == ast.C_ORD);
+    }
+    if a == ast.C_INT {
+        return (b == ast.C_EQ) or (b == ast.C_ORD) or (b == ast.C_NUM);
+    }
+    if (a == ast.C_SIGNED) or (a == ast.C_UNSIGNED) {
+        return (b == ast.C_EQ) or (b == ast.C_ORD) or (b == ast.C_NUM) or (b == ast.C_INT);
+    }
+    if a == ast.C_FLOAT {
+        return (b == ast.C_EQ) or (b == ast.C_ORD) or (b == ast.C_NUM);
+    }
+    return false;
+}
+
+pub fn satisfies(t: *ast.Type, c: i32) bool {
+    let k = t.kind;
+    if k == ast.TY_INVALID {
+        return true;
+    }
+    if k == ast.TY_PARAM {
+        return not t.is_const and implies(t.constraint, c);
+    }
+    if c == ast.C_NONE {
+        return (k != ast.TY_VOID) and (k != ast.TY_CONSTINT) and (k != ast.TY_NEVER);
+    }
+    if c == ast.C_EQ {
+        return (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_BOOL) or (k == ast.TY_PTR) or
+               (k == ast.TY_ERROR) or (k == ast.TY_FN);
+    }
+    if (c == ast.C_ORD) or (c == ast.C_NUM) {
+        return (k == ast.TY_INT) or (k == ast.TY_FLOAT);
+    }
+    if c == ast.C_INT {
+        return k == ast.TY_INT;
+    }
+    if c == ast.C_SIGNED {
+        return (k == ast.TY_INT) and t.is_signed;
+    }
+    if c == ast.C_UNSIGNED {
+        return (k == ast.TY_INT) and not t.is_signed;
+    }
+    if c == ast.C_FLOAT {
+        return k == ast.TY_FLOAT;
+    }
+    return false;
+}
+
+pub struct Range {
+    lo: u.I128,
+    hi: u.I128,
+}
+
+// Integer range of a concrete integer type.
+pub fn int_range(t: *ast.Type) Range {
+    let b = @int_cast(u32, t.bits);
+    if t.is_signed {
+        let p = u.I128.pow2(b - 1);
+        return Range.{ lo: p.neg(), hi: p.sub(u.I128.of(1)) };
+    }
+    return Range.{ lo: u.I128.zero(), hi: u.I128.pow2(b).sub(u.I128.of(1)) };
+}

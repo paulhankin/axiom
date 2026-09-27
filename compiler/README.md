@@ -4,6 +4,10 @@ A small, fast compiler for [Phalange](../spec/phalange.md), written in C11 with 
 backend. It compiles `.ph` programs to WebAssembly modules (the primary target) or to
 native executables.
 
+[`selfhost/`](../selfhost/README.md) has a port of this compiler to Phalange, which this
+one bootstraps. The two produce identical output, so a change to one belongs in both;
+`selfhost/difftest.sh` compares them.
+
 ```
 $ make -C compiler
 $ ./compiler/build/phalange build examples/dot_product.ph -O2 -o engine.wasm

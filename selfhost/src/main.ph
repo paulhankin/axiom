@@ -1,0 +1,1339 @@
+// =============================================================================
+// main.ph - command-line driver.
+//
+//   phalange build <file.ph> [options] -o <out>
+//   phalange check <file.ph> [options]
+//
+// Options:
+//   --target=wasm32|native     (default wasm32; wasm32-freestanding accepted)
+//   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
+//   --release                  same as --overflow=saturate
+//   --overflow=trap|saturate   integer overflow mode (default trap)
+//   --emit=exe|obj|llvm|asm    output kind (default: exe = .wasm module / native executable)
+//   --format=human|agent-json  diagnostic format
+//   --std=<dir>                standard library directory
+//   --link=<file>              extra C source, object or library to link (repeatable)
+//   -l<lib> -L<dir> -I<dir>    C libraries, library and include directories
+//   --emit-header=<path>       write a C header for the exported functions
+//   -o <path>                  output path
+// =============================================================================
+import "util.ph" as u;
+import "diag.ph" as dg;
+import "ast.ph" as ast;
+import "types.ph" as ty;
+import "sema.ph" as sema;
+import "codegen.ph" as cg;
+import "header.ph" as header;
+import "units.ph" as units;
+import "package.ph" as pkg;
+
+fn usage() void {
+    u.eprint("usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n");
+    u.eprint("       phalange profile [<file.ph> | <package dir>] [--rate=<hz>] [--folded=<path>]\n");
+    u.eprint("       phalange new <name>      create a package skeleton\n");
+    u.eprint("       phalange cache [path|clean]   the compiled-module cache\n");
+    u.eprint("  test: --filter=<text> --timeout=<ms>\n");
+    u.eprint("  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n");
+    u.eprint("  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
+    u.eprint("  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
+    u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
+    u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
+}
+
+fn find_std(argv0: []u8) []u8 {
+    let e = u.env("PHALANGE_STD");
+    if not u.isnos(e) and (e.len > 0) {
+        return e;
+    }
+    let mut buf: [4096]u8 = [0; 4096];
+    let n = u.readlink("/proc/self/exe".ptr, &mut buf[0], 4095);
+    let mut exe = u.nosym();
+    if n <= 0 {
+        exe = u.real_path(argv0);
+        if u.isnos(exe) {
+            return "std";
+        }
+    } else {
+        exe = u.dup(buf[0..@int_cast(usize, n)]);
+    }
+    let slash = u.rfind(exe, '/');
+    if slash >= 0 {
+        exe = u.dup(exe[0..@int_cast(usize, slash)]);
+    }
+    let cands = ["/../../std", "/../std", "/std", "/../share/phalange/std"];
+    for c in cands {
+        if u.file_exists(u.f2("%s%s/mem.ph", exe, c)) {
+            let p = u.cat2(exe, c);
+            let r = u.real_path(p);
+            if u.isnos(r) {
+                return p;
+            }
+            return r;
+        }
+    }
+    return "std";
+}
+
+// Runs a command; its exit status, or -1.
+fn run(args: [][]u8) i32 {
+    let argv = u.c_argv(args);
+    u.flush_out();
+    let pid = u.fork();
+    if pid == 0 {
+        _ = u.execvp(argv.*, argv);
+        u._exit(127);
+    }
+    if pid < 0 {
+        return -1;
+    }
+    let mut status: i32 = 0;
+    if u.waitpid(pid, &mut status, 0) < 0 {
+        return -1;
+    }
+    if u.wifexited(status) {
+        return u.wexitstatus(status);
+    }
+    return -1;
+}
+
+fn find_tool(names: [][]u8) []u8 {
+    for name in names {
+        if u.find(name, '/') >= 0 {
+            if u.access(u.cz(name), 1) == 0 {
+                return name;
+            }
+            continue;
+        }
+        let path = u.env("PATH");
+        if u.isnos(path) {
+            continue;
+        }
+        let mut p: usize = 0;
+        while p < path.len {
+            let rest = path[p..];
+            let e = u.find(rest, ':');
+            let mut len = rest.len;
+            if e >= 0 {
+                len = @int_cast(usize, e);
+            }
+            if u.access(u.cz(u.f2("%s/%s", rest[0..len], name)), 1) == 0 {
+                return name;
+            }
+            if e < 0 {
+                break;
+            }
+            p += len + 1;
+        }
+    }
+    return u.nosym();
+}
+
+// ---------------------------------------------------------------------------
+// phalange test: run the test binary and report (spec §18).
+// ---------------------------------------------------------------------------
+struct Captured {
+    status: i32,
+    out: []u8,
+}
+
+fn run_capture(args: [][]u8) Captured {
+    let argv = u.c_argv(args);
+    let mut fds: [2]i32 = [0, 0];
+    if u.pipe(&mut fds[0]) != 0 {
+        return Captured.{ status: -1, out: "" };
+    }
+    u.flush_out();
+    let pid = u.fork();
+    if pid == 0 {
+        _ = u.dup2(fds[1], 1);
+        _ = u.close(fds[0]);
+        _ = u.execvp(argv.*, argv);
+        u._exit(127);
+    }
+    _ = u.close(fds[1]);
+    if pid < 0 {
+        _ = u.close(fds[0]);
+        return Captured.{ status: -1, out: "" };
+    }
+    let mut out = u.Buf.init();
+    let mut buf: [8192]u8 = [0; 8192];
+    loop {
+        let n = u.read(fds[0], &mut buf[0], 8192);
+        if n <= 0 {
+            break;
+        }
+        out.s(buf[0..@int_cast(usize, n)]);
+    }
+    _ = u.close(fds[0]);
+    let mut status: i32 = 0;
+    _ = u.waitpid(pid, &mut status, 0);
+    let mut rc = 128 + u.wtermsig(status);
+    if u.wifexited(status) {
+        rc = u.wexitstatus(status);
+    }
+    return Captured.{ status: rc, out: out.done() };
+}
+
+fn unescape(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c == '\\') and ((i + 1) < s.len) {
+            i += 1;
+            let d = s[i];
+            if d == 't' {
+                b.c('\t');
+            } else if d == 'n' {
+                b.c('\n');
+            } else if d == 'r' {
+                b.c('\r');
+            } else {
+                b.c(d);
+            }
+        } else {
+            b.c(c);
+        }
+        i += 1;
+    }
+    return b.done();
+}
+
+fn json_str_out(s: []u8) void {
+    let mut b = u.Buf.init();
+    dg.json_str(&mut b, s);
+    u.print(b.done());
+}
+
+fn source_line(sp: u.Span) []u8 {
+    let f = u.file_of(sp.file);
+    let t = f.text;
+    let mut a = @as(usize, sp.start);
+    let mut b = @as(usize, sp.start);
+    while (a > 0) and (t[a - 1] != '\n') {
+        a -= 1;
+    }
+    while (b < t.len) and (t[b] != '\n') {
+        b += 1;
+    }
+    while (a < b) and ((t[a] == ' ') or (t[a] == '\t')) {
+        a += 1;
+    }
+    return u.dup(t[a..b]);
+}
+
+// Site records name files by a stable key (codegen: file_key); -1 if none.
+fn file_from_key(text: []u8) i32 {
+    let r = u.c_strtoll(text);
+    if (r.end == 0) or (r.v < 0) or (r.v >= 0xFFFF_FFFF) {
+        return -1;
+    }
+    for i in 0..u.g_files.len {
+        if @as(i64, cg.file_key(@int_cast(i32, i))) == r.v {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+fn to_u32(s: []u8) u32 {
+    return @truncate(u32, @bit_cast(u64, u.atol(s)));
+}
+
+// Splits `s` at `sep`, into at most `max` fields (the last keeps the rest).
+fn split(s: []u8, sep: u8, max: usize) u.List.[[]u8] {
+    let mut out = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    let mut rest = s;
+    while out.len < max {
+        let t = u.find(rest, sep);
+        if (t < 0) or ((out.len + 1) == max) {
+            out.push(rest);
+            break;
+        }
+        out.push(rest[0..@int_cast(usize, t)]);
+        rest = rest[@int_cast(usize, t) + 1..];
+    }
+    return out;
+}
+
+// Stack frames from the test runner (see runtime/test_main.c: encode_stack).
+struct TFrame {
+    kind: u8,  // T trap site, C call, U innermost function (no location), E error return, R repeat, O omitted
+    count: i64,
+    sp: u.Span,
+    has_span: bool,
+    fname: []u8,
+}
+
+fn parse_frames(s: []u8, out: *mut u.List.[TFrame]) void {
+    let parts = split(s, 0x1e, 0xFFFF_FFFF);
+    for i in 0..parts.len {
+        if out.len >= 128 {
+            break;
+        }
+        let p = parts.get(i);
+        if (p.len == 0) and ((i + 1) == parts.len) {
+            break;
+        }
+        let f = split(p, 0x1f, 5);
+        if f.len != 5 {
+            continue;
+        }
+        let mut fr = TFrame.{ kind: 0, count: 0, sp: u.mkspan(0, 0, 0), has_span: false, fname: f.get(4) };
+        if f.get(0).len > 0 {
+            fr.kind = f.get(0)[0];
+        }
+        if (fr.kind == 'R') or (fr.kind == 'O') {
+            fr.count = u.atol(f.get(1));
+        } else {
+            let fid = file_from_key(f.get(1));
+            if fid >= 0 {
+                fr.sp = u.mkspan(fid, to_u32(f.get(2)), to_u32(f.get(3)));
+                fr.has_span = fr.kind != 'U';
+            }
+        }
+        out.push(fr);
+    }
+}
+
+fn print_frames_human(fr: *u.List.[TFrame], errors: bool) void {
+    if fr.len == 0 {
+        return;
+    }
+    u.print(u.pick(errors, "     error return trace (oldest first):\n", "     stack trace (innermost first):\n"));
+    for i in 0..fr.len {
+        let f = fr.at(i);
+        if f.kind == 'R' {
+            u.print(u.f2("       ... the frame above repeats %s more time%s\n", u.dec(f.count), u.pick(f.count == 1, "", "s")));
+        } else if f.kind == 'O' {
+            u.print(u.f1("       ... %s more frames\n", u.dec(f.count)));
+        } else if not f.has_span {
+            u.print(u.f1("       at %s\n", f.fname));
+        } else {
+            let lc = u.span_linecol(f.sp);
+            if errors {
+                u.print(u.f5("       %s:%s:%s in %s: %s\n", u.file_of(f.sp.file).display, u.idec(lc.sl), u.idec(lc.sc), f.fname,
+                             source_line(f.sp)));
+            } else {
+                u.print(u.f4("       at %s (%s:%s:%s)\n", f.fname, u.file_of(f.sp.file).display, u.idec(lc.sl), u.idec(lc.sc)));
+            }
+        }
+    }
+}
+
+fn print_frames_json(fr: *u.List.[TFrame]) void {
+    u.print("[");
+    for i in 0..fr.len {
+        let f = fr.at(i);
+        if i != 0 {
+            u.print(",");
+        }
+        if f.kind == 'R' {
+            u.print(u.f1("{\"repeat\":%s}", u.dec(f.count)));
+            continue;
+        }
+        if f.kind == 'O' {
+            u.print(u.f1("{\"omitted\":%s}", u.dec(f.count)));
+            continue;
+        }
+        u.print("{\"function\":");
+        json_str_out(f.fname);
+        if f.has_span {
+            let lc = u.span_linecol(f.sp);
+            u.print(",\"file\":");
+            json_str_out(u.file_of(f.sp.file).display);
+            u.print(u.f2(",\"line\":%s,\"col\":%s,\"context\":", u.idec(lc.sl), u.idec(lc.sc)));
+            json_str_out(source_line(f.sp));
+        }
+        u.print("}");
+    }
+    u.print("]");
+}
+
+fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool) i32 {
+    let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    if ty.g_target.is_wasm {
+        let names = ["node"];
+        let node = find_tool(names[..]);
+        if u.isnos(node) {
+            dg.emit_fatal(json, "E9003", "phalange test needs node to run WebAssembly tests (or use --target=native)");
+            return 2;
+        }
+        av.push(node);
+        av.push(u.f1("%s/../runtime/test_runner.mjs", std_dir));
+    }
+    av.push(bin);
+    if not u.isnos(filter) {
+        av.push(filter);
+    }
+    if not u.isnos(timeout) {
+        av.push(timeout);
+    }
+    let cap = run_capture(av.items());
+    if cap.status != 0 {
+        u.eprint(cap.out);
+        dg.emit_fatal(json, "E9006", "the test runner failed");
+        return 2;
+    }
+    let mut passed: i32 = 0;
+    let mut failed: i32 = 0;
+    if json {
+        u.print("{\"schema\":\"phalange-tests/1\",\"tests\":[");
+    }
+    let mut nres: i32 = 0;
+    let tests = sema.g_prog.tests;
+    let lines = split(cap.out, '\n', 0xFFFF_FFFF);
+    for li in 0..lines.len {
+        let line = lines.get(li);
+        if (line.len == 0) and ((li + 1) == lines.len) {
+            break;
+        }
+        if not u.starts(line, "PHT\t") {  // stray output
+            u.eprint(u.cat2(line, "\n"));
+            continue;
+        }
+        let f = split(line, '\t', 12);
+        if f.len < 10 {
+            continue;
+        }
+        let idx = u.atol(f.get(1));
+        if (idx < 0) or (idx >= @int_cast(i64, tests.len)) {
+            continue;
+        }
+        let d = tests.get(@int_cast(usize, idx));
+        let pass = u.str_eq(f.get(2), "pass");
+        let code = f.get(3);
+        let file_id = file_from_key(f.get(4));
+        let mut sp = d.name_span;
+        if (file_id >= 0) and (@int_cast(usize, file_id) < u.g_files.len) {
+            sp = u.mkspan(file_id, to_u32(f.get(5)), to_u32(f.get(6)));
+        }
+        let ms = f.get(7);
+        let msg = unescape(f.get(8));
+        let output = unescape(f.get(9));
+        let mut frames = u.List.[TFrame].{ data: u.nil.[TFrame](), len: 0, cap: 0 };
+        if f.len > 10 {
+            parse_frames(unescape(f.get(10)), &mut frames);
+        }
+        let etrace = (frames.len > 0) and (frames.get(0).kind == 'E');
+        let tfile = u.file_of(d.name_span.file).display;
+        let lc = u.span_linecol(sp);
+        if pass {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
+        if json {
+            u.print(u.pick(nres != 0, ",", ""));
+            nres += 1;
+            u.print("\n  {\"name\":");
+            json_str_out(d.test_name);
+            u.print(",\"file\":");
+            json_str_out(tfile);
+            u.print(u.f2(",\"status\":\"%s\",\"duration_ms\":%s", u.pick(pass, "pass", "fail"), ms));
+            if not pass {
+                u.print(",\"failure\":{\"code\":");
+                json_str_out(code);
+                u.print(",\"message\":");
+                json_str_out(msg);
+                u.print(",\"file\":");
+                json_str_out(u.file_of(sp.file).display);
+                u.print(u.f6(",\"span\":{\"start_line\":%s,\"start_col\":%s,\"end_line\":%s,\"end_col\":%s,\"start_byte\":%s,\"end_byte\":%s},\"context\":",
+                             u.idec(lc.sl), u.idec(lc.sc), u.idec(lc.el), u.idec(lc.ec), u.udec(@as(u64, sp.start)),
+                             u.udec(@as(u64, sp.end))));
+                json_str_out(source_line(sp));
+                if frames.len > 0 {
+                    u.print(u.pick(etrace, ",\"error_trace\":", ",\"stack\":"));
+                    print_frames_json(&frames);
+                }
+                u.print("}");
+            }
+            u.print(",\"output\":");
+            json_str_out(output);
+            u.print("}");
+        } else {
+            u.print(u.f3("%s %s (%s ms)\n", u.pick(pass, "ok  ", "FAIL"), d.test_name, ms));
+            if not pass {
+                u.print(u.f5("     %s:%s:%s: %s %s\n", u.file_of(sp.file).display, u.idec(lc.sl), u.idec(lc.sc), code, msg));
+                u.print(u.f1("         %s\n", source_line(sp)));
+                print_frames_human(&frames, etrace);
+                if output.len > 0 {
+                    u.print("     output:\n");
+                    let ol = split(output, '\n', 0xFFFF_FFFF);
+                    for k in 0..ol.len {
+                        if ((k + 1) == ol.len) and (ol.get(k).len == 0) {
+                            break;
+                        }
+                        u.print(u.f1("       | %s\n", ol.get(k)));
+                    }
+                }
+            }
+        }
+    }
+    if json {
+        u.print(u.f4("%s],\"passed\":%s,\"failed\":%s,\"status\":\"%s\"}\n", u.pick(nres != 0, "\n", ""), u.idec(passed),
+                     u.idec(failed), u.pick(failed != 0, "fail", "pass")));
+    } else {
+        u.print(u.f2("\n%s passed, %s failed\n", u.idec(passed), u.idec(failed)));
+    }
+    if failed != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// phalange profile: run a program under the sampling profiler (spec §17.6)
+// and report where its time goes.
+// ---------------------------------------------------------------------------
+struct ProfFn {
+    name: []u8,
+    self_: i64,
+    total: i64,
+    stamp: i64,
+}
+
+struct ProfSite {
+    sp: u.Span,
+    caller: []u8,
+    callee: []u8,
+    total: i64,
+    stamp: i64,
+}
+
+struct ProfStack {
+    key: []u8,
+    count: i64,
+}
+
+fn cmp_fn(x: *mut ProfFn, y: *mut ProfFn) i32 {
+    if x.self_ != y.self_ {
+        if x.self_ < y.self_ {
+            return 1;
+        }
+        return -1;
+    }
+    if x.total != y.total {
+        if x.total < y.total {
+            return 1;
+        }
+        return -1;
+    }
+    return u.str_cmp(x.name, y.name);
+}
+
+fn cmp_site(x: *mut ProfSite, y: *mut ProfSite) i32 {
+    if x.total != y.total {
+        if x.total < y.total {
+            return 1;
+        }
+        return -1;
+    }
+    if x.sp.file != y.sp.file {
+        return x.sp.file - y.sp.file;
+    }
+    return @bit_cast(i32, x.sp.start) - @bit_cast(i32, y.sp.start);
+}
+
+fn cmp_stack(x: *mut ProfStack, y: *mut ProfStack) i32 {
+    return u.str_cmp(x.key, y.key);
+}
+
+// Runs a program with extra environment variables; its exit status.
+fn spawn_program(args: [][]u8, env: [][]u8, out_to_err: bool) i32 {
+    let argv = u.c_argv(args);
+    u.flush_out();
+    let pid = u.fork();
+    if pid == 0 {
+        for kv in env {
+            let eq = u.find(kv, '=');
+            if eq > 0 {
+                let k = @int_cast(usize, eq);
+                _ = u.setenv(u.cz(kv[0..k]), u.cz(kv[k + 1..]), 1);
+            }
+        }
+        if out_to_err {
+            _ = u.dup2(2, 1);
+        }
+        _ = u.execvp(argv.*, argv);
+        u._exit(127);
+    }
+    if pid < 0 {
+        return -1;
+    }
+    let mut status: i32 = 0;
+    if u.waitpid(pid, &mut status, 0) < 0 {
+        return -1;
+    }
+    if u.wifexited(status) {
+        return u.wexitstatus(status);
+    }
+    return 128 + u.wtermsig(status);
+}
+
+fn tmp_dir() []u8 {
+    let t = u.env("TMPDIR");
+    if not u.isnos(t) and (t.len > 0) {
+        return t;
+    }
+    return "/tmp";
+}
+
+fn pct(a: i64, n: f64) f64 {
+    return (100.0 * @float_from_int(f64, a)) / n;
+}
+
+fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool) i32 {
+    let mut hz = hz0;
+    let raw = u.f2("%s/phalange-profile-%s.raw", tmp_dir(), u.idec(u.getpid()));
+    _ = u.unlink(u.cz(raw));
+    let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    let mut env = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    if ty.g_target.is_wasm {
+        let names = ["node"];
+        let node = find_tool(names[..]);
+        if u.isnos(node) {
+            dg.emit_fatal(json, "E9003", "phalange profile needs node to run WebAssembly programs (or use --target=native)");
+            return 2;
+        }
+        av.push(node);
+        av.push(u.f1("%s/../runtime/host.mjs", std_dir));
+        av.push(u.f1("--profile=%s", raw));
+        av.push(u.f1("--profile-hz=%s", u.idec(hz)));
+    } else {
+        env.push(u.f1("PHALANGE_PROFILE=%s", raw));
+        env.push(u.f1("PHALANGE_PROFILE_HZ=%s", u.idec(hz)));
+    }
+    av.push(bin);
+    let status = spawn_program(av.items(), env.items(), json);
+    let text = u.read_file(raw);
+    _ = u.unlink(u.cz(raw));
+    if u.isnos(text) {
+        dg.emit_fatal(json, "E9006", u.f1("no profile was recorded (the program exited with status %s)", u.idec(status)));
+        return 2;
+    }
+
+    // Aggregate.
+    let mut fns = u.SymMap.[*mut ProfFn].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfFn](), cap: 0, len: 0 };
+    let mut sites = u.SymMap.[*mut ProfSite].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfSite](), cap: 0, len: 0 };
+    let mut stacks = u.SymMap.[*mut ProfStack].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfStack](), cap: 0, len: 0 };
+    let mut fnv = u.List.[*mut ProfFn].{ data: u.nil.[*mut ProfFn](), len: 0, cap: 0 };
+    let mut sitev = u.List.[*mut ProfSite].{ data: u.nil.[*mut ProfSite](), len: 0, cap: 0 };
+    let mut stackv = u.List.[*mut ProfStack].{ data: u.nil.[*mut ProfStack](), len: 0, cap: 0 };
+    let mut nsamples: i64 = 0;
+    let mut dropped: i64 = 0;
+    let mut stamp: i64 = 0;
+    let mut truncated: i64 = 0;
+    let mut clock: []u8 = "cpu";
+    let lines = split(text, '\n', 0xFFFF_FFFF);
+    for li in 0..lines.len {
+        let line = lines.get(li);
+        if line.len == 0 {
+            continue;
+        }
+        if u.starts(line, "hz ") {
+            hz = @truncate(i32, u.atol(line[3..]));
+        } else if u.starts(line, "clock ") {
+            clock = u.dup(line[6..]);
+        } else if u.starts(line, "dropped ") {
+            dropped = u.atol(line[8..]);
+        } else if u.starts(line, "S\t") {
+            let f = split(line[2..], '\t', 4 + 256);
+            if f.len < 3 {
+                continue;
+            }
+            let count = u.atol(f.get(0));
+            let depth = u.atol(f.get(1));
+            let ns = f.len - 3;
+            let leaf = u.intern(f.get(2));
+            // Functions root first: the callers of each site, then the leaf.
+            let chain = u.newn.[[]u8](ns + 2);
+            let spans = u.newn.[u.Span](ns + 1);
+            let mut nc: usize = 0;
+            let mut ok = true;
+            let mut k = ns;
+            while k > 0 {
+                k -= 1;
+                let g = split(f.get(3 + k), 0x1f, 4);
+                if g.len < 4 {
+                    ok = false;
+                    break;
+                }
+                let fid = file_from_key(g.get(0));
+                let mut sf: i32 = -1;
+                if (fid >= 0) and (@int_cast(usize, fid) < u.g_files.len) {
+                    sf = fid;
+                }
+                spans[nc] = u.mkspan(sf, to_u32(g.get(1)), to_u32(g.get(2)));
+                chain[nc] = u.intern(g.get(3));
+                nc += 1;
+            }
+            if not ok {
+                continue;
+            }
+            chain[nc] = leaf;
+            nsamples += count;
+            if depth > @int_cast(i64, ns) {
+                truncated += count;
+            }
+            stamp += 1;
+            for kk in 0..nc + 1 {
+                let mut pf = fns.get(chain[kk]);
+                if u.isnil(pf) {
+                    pf = u.new.[ProfFn]();
+                    pf.name = chain[kk];
+                    fns.put(chain[kk], pf);
+                    fnv.push(pf);
+                }
+                if pf.stamp != stamp {  // once per sample, even under recursion
+                    pf.stamp = stamp;
+                    pf.total += count;
+                }
+                if kk == nc {
+                    pf.self_ += count;
+                }
+            }
+            for kk in 0..nc {
+                if spans[kk].file < 0 {
+                    continue;
+                }
+                let key = u.intern(u.f4("%s:%s:%s:%s", u.idec(spans[kk].file), u.udec(@as(u64, spans[kk].start)),
+                                        u.udec(@as(u64, spans[kk].end)), chain[kk]));
+                let mut ps = sites.get(key);
+                if u.isnil(ps) {
+                    ps = u.new.[ProfSite]();
+                    ps.sp = spans[kk];
+                    ps.caller = chain[kk];
+                    ps.callee = chain[kk + 1];
+                    sites.put(key, ps);
+                    sitev.push(ps);
+                }
+                if ps.stamp != stamp {
+                    ps.stamp = stamp;
+                    ps.total += count;
+                }
+            }
+            let mut fk = u.Buf.init();
+            if depth > @int_cast(i64, ns) {
+                fk.s("[truncated];");
+            }
+            for kk in 0..nc + 1 {
+                for c in chain[kk] {
+                    if c == ';' {
+                        fk.c(':');
+                    } else {
+                        fk.c(c);
+                    }
+                }
+                if kk < nc {
+                    fk.c(';');
+                }
+            }
+            let skey = u.intern(fk.done());
+            let mut stk = stacks.get(skey);
+            if u.isnil(stk) {
+                stk = u.new.[ProfStack]();
+                stk.key = skey;
+                stacks.put(skey, stk);
+                stackv.push(stk);
+            }
+            stk.count += count;
+        }
+    }
+    u.sort(fnv.items(), cmp_fn);
+    u.sort(sitev.items(), cmp_site);
+    u.sort(stackv.items(), cmp_stack);
+    let mut fb = u.Buf.init();
+    for i in 0..stackv.len {
+        fb.s(u.f2("%s %s\n", stackv.get(i).key, u.dec(stackv.get(i).count)));
+    }
+    let wrote = u.write_file(folded_path, fb.done());
+    let mut n: f64 = 1.0;
+    if nsamples != 0 {
+        n = @float_from_int(f64, nsamples);
+    }
+    let mut nfn = fnv.len;
+    if nfn > 25 {
+        nfn = 25;
+    }
+    let mut nsite = sitev.len;
+    if nsite > 15 {
+        nsite = 15;
+    }
+    let secs = @float_from_int(f64, nsamples) / @float_from_int(f64, hz);
+    if json {
+        u.print(u.f2("{\"schema\":\"phalange-profile/1\",\"samples\":%s,\"hz\":%s,\"clock\":", u.dec(nsamples), u.idec(hz)));
+        json_str_out(clock);
+        u.print(u.f4(",\"seconds\":%s,\"dropped\":%s,\"truncated\":%s,\"exit_status\":%s,\"folded\":", u.ffmt("%.3f", secs),
+                     u.dec(dropped), u.dec(truncated), u.idec(status)));
+        json_str_out(u.pick(wrote, folded_path, ""));
+        u.print(",\"functions\":[");
+        for i in 0..fnv.len {
+            let pf = fnv.get(i);
+            u.print(u.pick(i != 0, ",", ""));
+            u.print("\n  {\"name\":");
+            json_str_out(pf.name);
+            u.print(u.f4(",\"self\":%s,\"total\":%s,\"self_pct\":%s,\"total_pct\":%s}", u.dec(pf.self_), u.dec(pf.total),
+                         u.ffmt("%.1f", pct(pf.self_, n)), u.ffmt("%.1f", pct(pf.total, n))));
+        }
+        u.print("],\"call_sites\":[");
+        for i in 0..sitev.len {
+            let ps = sitev.get(i);
+            let lc = u.span_linecol(ps.sp);
+            u.print(u.pick(i != 0, ",", ""));
+            u.print("\n  {\"file\":");
+            json_str_out(u.file_of(ps.sp.file).display);
+            u.print(u.f2(",\"line\":%s,\"col\":%s,\"caller\":", u.idec(lc.sl), u.idec(lc.sc)));
+            json_str_out(ps.caller);
+            u.print(",\"callee\":");
+            json_str_out(ps.callee);
+            u.print(u.f2(",\"total\":%s,\"total_pct\":%s,\"context\":", u.dec(ps.total), u.ffmt("%.1f", pct(ps.total, n))));
+            json_str_out(source_line(ps.sp));
+            u.print("}");
+        }
+        u.print("]}\n");
+    } else {
+        u.print(u.f4("profile: %s samples at %s Hz (%s time, %s s)", u.dec(nsamples), u.idec(hz), clock, u.ffmt("%.2f", secs)));
+        if status != 0 {
+            u.print(u.f1("; the program exited with status %s", u.idec(status)));
+        }
+        u.print("\n\n  self%  total%  function\n");
+        for i in 0..nfn {
+            let pf = fnv.get(i);
+            u.print(u.f3("%s %s  %s\n", u.ffmt("%7.1f", pct(pf.self_, n)), u.ffmt("%7.1f", pct(pf.total, n)), pf.name));
+        }
+        if fnv.len > nfn {
+            u.print(u.f1("  ... %s more functions\n", u.zdec(fnv.len - nfn)));
+        }
+        if nsite != 0 {
+            u.print("\n total%  call site\n");
+        }
+        for i in 0..nsite {
+            let ps = sitev.get(i);
+            let lc = u.span_linecol(ps.sp);
+            u.print(u.f6("%s  %s:%s:%s  %s -> %s\n", u.ffmt("%7.1f", pct(ps.total, n)), u.file_of(ps.sp.file).display,
+                         u.idec(lc.sl), u.idec(lc.sc), ps.caller, ps.callee));
+        }
+        if truncated != 0 {
+            u.print(u.f1("\n%s samples were deeper than 256 calls; their outer frames are not known\n", u.dec(truncated)));
+        }
+        if dropped != 0 {
+            u.print(u.f1("%s samples were dropped (sample buffer full)\n", u.dec(dropped)));
+        }
+        if wrote {
+            u.print(u.f1("\nfolded stacks: %s (for flamegraph.pl, inferno or speedscope)\n", folded_path));
+        }
+    }
+    if status == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+fn arg_at(argv: *mut *mut u8, i: usize) []u8 {
+    let p = @ptr_from_int(*mut *mut u8, @int_from_ptr(argv) + (i * @size_of(*mut u8))).*;
+    return u.from_c(p);
+}
+
+fn strip_ph(base: []u8) []u8 {
+    if (base.len > 3) and u.ends(base, ".ph") {
+        return base[0..base.len - 3];
+    }
+    return base;
+}
+
+fn basename(p: []u8) []u8 {
+    let s = u.rfind(p, '/');
+    if s >= 0 {
+        return p[@int_cast(usize, s) + 1..];
+    }
+    return p;
+}
+
+fn now_ms() f64 {
+    let mut ts = u.Timespec.{ sec: 0, nsec: 0 };
+    _ = u.clock_gettime(1, &mut ts);  // CLOCK_MONOTONIC
+    return (@float_from_int(f64, ts.sec) * 1000.0) + (@float_from_int(f64, ts.nsec) / 1000000.0);
+}
+
+fn driver(args: [][]u8) i32 {
+    let argc = args.len;
+    if (argc >= 2) and u.str_eq(args[1], "cache") {
+        // phalange cache [path|clean]: the object cache of separate compilation
+        let dir = u.cat2(pkg.cache_dir(), "/obj");
+        if (argc >= 3) and u.str_eq(args[2], "clean") {
+            let rm = ["rm", "-rf", dir];
+            let rc = run(rm[..]);
+            if rc == 0 {
+                u.print(u.f1("removed %s\n", dir));
+                return 0;
+            }
+            return 1;
+        }
+        if (argc >= 3) and not u.str_eq(args[2], "path") {
+            usage();
+            return 2;
+        }
+        u.print(u.cat2(dir, "\n"));
+        return 0;
+    }
+    if (argc >= 2) and u.str_eq(args[1], "new") {
+        let js = (argc >= 4) and u.str_eq(args[3], "--format=agent-json");
+        if argc < 3 {
+            usage();
+            return 2;
+        }
+        if pkg.new_package(args[2], js) {
+            return 0;
+        }
+        return 1;
+    }
+    if argc < 2 {
+        usage();
+        return 2;
+    }
+    let cmd = args[1];
+    let testing = u.str_eq(cmd, "test");
+    let profiling = u.str_eq(cmd, "profile");
+    let build = u.str_eq(cmd, "build") or testing or profiling;
+    cg.g_test_mode = testing;
+    if not build and not u.str_eq(cmd, "check") {
+        usage();
+        return 2;
+    }
+    let mut input = u.nosym();
+    let mut out = u.nosym();
+    let mut std_dir = u.nosym();
+    let mut target: []u8 = "wasm32";
+    let mut emit: []u8 = "exe";
+    let mut json = false;
+    let co = u.new.[cg.CgOptions]();
+    co.stack_traces = true;
+    co.cpu = u.nosym();
+    let mut link_inputs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    let mut link_flags = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };  // -l / -L
+    let mut inc_flags = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };   // -I, for C sources
+    let mut header_path = u.nosym();
+    let mut test_filter = u.nosym();
+    let mut test_timeout = u.nosym();
+    let mut prof_hz: i32 = 999;
+    let mut units_mode: i32 = -1;  // -1: by optimization level
+    let mut verbose = false;
+    let mut folded_path = u.nosym();
+    let mut i: usize = 2;
+    while i < argc {
+        let a = args[i];
+        if u.str_eq(a, "-o") and ((i + 1) < argc) {
+            i += 1;
+            out = args[i];
+        } else if u.starts(a, "--target=") {
+            target = a[9..];
+        } else if u.str_eq(a, "-O0") or u.str_eq(a, "-O1") or u.str_eq(a, "-O2") or u.str_eq(a, "-O3") {
+            co.opt_level = @as(i32, a[2] - '0');
+        } else if u.str_eq(a, "--release") {
+            co.overflow_saturate = true;
+        } else if u.str_eq(a, "--overflow=trap") {
+            co.overflow_saturate = false;
+        } else if u.str_eq(a, "--overflow=saturate") {
+            co.overflow_saturate = true;
+        } else if u.starts(a, "--emit=") {
+            emit = a[7..];
+        } else if u.str_eq(a, "--stack-traces=on") {
+            co.stack_traces = true;
+        } else if u.str_eq(a, "--stack-traces=off") {
+            co.stack_traces = false;
+        } else if u.str_eq(a, "--units=module") {
+            units_mode = 1;
+        } else if u.str_eq(a, "--units=program") {
+            units_mode = 0;
+        } else if u.str_eq(a, "--verbose") {
+            verbose = true;
+        } else if u.str_eq(a, "--format=agent-json") {
+            json = true;
+        } else if u.str_eq(a, "--format=human") {
+            json = false;
+        } else if u.starts(a, "--std=") {
+            std_dir = a[6..];
+        } else if u.starts(a, "--cpu=") {
+            co.cpu = a[6..];
+        } else if u.starts(a, "--link=") {
+            link_inputs.push(a[7..]);
+        } else if u.starts(a, "--emit-header=") {
+            header_path = a[14..];
+        } else if testing and u.starts(a, "--filter=") {
+            test_filter = a;
+        } else if testing and u.starts(a, "--timeout=") {
+            test_timeout = a;
+        } else if profiling and u.starts(a, "--rate=") and (u.atol(a[7..]) > 0) {
+            prof_hz = @truncate(i32, u.atol(a[7..]));
+        } else if profiling and u.starts(a, "--folded=") {
+            folded_path = a[9..];
+        } else if (a.len > 2) and (a[0] == '-') and ((a[1] == 'l') or (a[1] == 'L')) {
+            link_flags.push(a);
+        } else if (a.len > 2) and (a[0] == '-') and (a[1] == 'I') {
+            inc_flags.push(a);
+        } else if (a.len > 0) and (a[0] == '-') {
+            dg.emit_fatal(json, "E9001", u.f1("unknown option '%s'", a));
+            return 2;
+        } else if u.isnos(input) {
+            input = a;
+        } else {
+            dg.emit_fatal(json, "E9001", u.f1("unexpected argument '%s'", a));
+            return 2;
+        }
+        i += 1;
+    }
+    // A package directory (or none: the current directory) builds the
+    // package's entry module; `test` also loads all of its sources.
+    let mut pkg_files = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    if u.isnos(input) or u.is_dir(input) {
+        let mut dir: []u8 = ".";
+        if not u.isnos(input) {
+            dir = input;
+        }
+        if not u.file_exists(u.cat2(dir, "/phalange.toml")) {
+            if not u.isnos(input) {
+                dg.emit_fatal(json, "E9001", u.f1("'%s' is a directory without a phalange.toml", input));
+            } else {
+                dg.emit_fatal(json, "E9001", "no input file (and no phalange.toml in the current directory)");
+            }
+            return 2;
+        }
+        let pk = pkg.load_dir(dir, u.nil.[u.Span]());
+        if (dg.error_count() != 0) or u.isnil(pk) {
+            dg.emit(json, json);
+            return 1;
+        }
+        input = pk.entry;
+        if testing {
+            pkg.source_files(pk, &mut pkg_files);
+        }
+        if u.isnos(out) and not testing and not profiling {
+            out = u.cat2(pk.name, u.pick(u.str_eq(target, "native"), "", ".wasm"));
+        }
+    }
+    if u.str_eq(target, "wasm32") or u.str_eq(target, "wasm32-freestanding") {
+        ty.g_target = ast.Target.{ ptr_bits: 32, is_wasm: true, triple: "wasm32-unknown-unknown" };
+    } else if u.str_eq(target, "wasm64") or u.str_eq(target, "wasm64-freestanding") {
+        ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: true, triple: "wasm64-unknown-unknown" };
+    } else if u.str_eq(target, "native") {
+        ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: false, triple: cg.default_triple() };
+    } else {
+        dg.emit_fatal(json, "E9002", u.f1("unknown target '%s' (expected wasm32, wasm64 or native)", target));
+        return 2;
+    }
+    if not u.file_exists(input) {
+        dg.emit_fatal(json, "E0211", u.f1("cannot read '%s'", input));
+        return 2;
+    }
+    ty.types_init();
+    if u.isnos(std_dir) {
+        std_dir = find_std(args[0]);
+    }
+    let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: pkg_files.items() };
+    let ok = sema.run(input, &so);
+    if ok and not u.isnos(header_path) {
+        if not header.emit_c_header(header_path, basename(input)) {
+            dg.emit_fatal(json, "E9005", u.f1("cannot write %s", header_path));
+            return 2;
+        }
+        // C sources may include the generated header
+        let sl = u.rfind(header_path, '/');
+        if sl >= 0 {
+            inc_flags.push(u.f1("-I%s", header_path[0..@int_cast(usize, sl)]));
+        } else {
+            inc_flags.push("-I.");
+        }
+    }
+    if not ok or not build {
+        dg.emit(json, json);
+        if ok {
+            return 0;
+        }
+        return 1;
+    }
+
+    // Decide output kind.
+    let final_link = u.str_eq(emit, "exe");
+    if u.str_eq(emit, "obj") {
+        co.emit = cg.EMIT_OBJ;
+    } else if u.str_eq(emit, "llvm") {
+        co.emit = cg.EMIT_LLVM;
+    } else if u.str_eq(emit, "asm") {
+        co.emit = cg.EMIT_ASM;
+    } else if final_link {
+        co.emit = cg.EMIT_OBJ;
+    } else {
+        dg.emit_fatal(json, "E9001", u.f1("unknown --emit kind '%s'", emit));
+        return 2;
+    }
+    let wext = u.pick(ty.g_target.is_wasm, ".wasm", "");
+    if profiling {
+        if not final_link {
+            dg.emit_fatal(json, "E9001", "phalange profile builds and runs the program; --emit is not supported");
+            return 2;
+        }
+        co.stack_traces = true;  // the profiler samples the shadow stack
+        co.profile = true;
+        if u.isnos(folded_path) {
+            if not u.isnos(out) {  // -o names the folded output too
+                folded_path = out;
+            } else {
+                folded_path = u.cat2(strip_ph(basename(input)), ".folded");
+            }
+        }
+        out = u.f3("%s/phalange-profile-%s%s", tmp_dir(), u.idec(u.getpid()), wext);
+        if not ty.g_target.is_wasm {
+            let pr = u.f1("%s/../runtime/profile.c", std_dir);
+            if not u.file_exists(pr) {
+                dg.emit_fatal(json, "E9003", u.f1("cannot find the profiler runtime (%s)", pr));
+                return 2;
+            }
+            link_inputs.push(pr);
+        }
+    }
+    if testing {
+        if not final_link {
+            dg.emit_fatal(json, "E9001", "phalange test builds and runs a test binary; --emit is not supported");
+            return 2;
+        }
+        out = u.f3("%s/phalange-test-%s%s", tmp_dir(), u.idec(u.getpid()), wext);
+        if not ty.g_target.is_wasm {
+            let tm = u.f1("%s/../runtime/test_main.c", std_dir);
+            if not u.file_exists(tm) {
+                dg.emit_fatal(json, "E9003", u.f1("cannot find the test runtime (%s)", tm));
+                return 2;
+            }
+            link_inputs.push(tm);
+        }
+    }
+    if u.isnos(out) {
+        let mut ext: []u8 = "";
+        if co.emit == cg.EMIT_LLVM {
+            ext = ".ll";
+        } else if co.emit == cg.EMIT_ASM {
+            ext = ".s";
+        } else if not final_link {
+            ext = ".o";
+        } else {
+            ext = wext;
+        }
+        out = u.cat2(strip_ph(basename(input)), ext);
+    }
+    let host_fns = sema.g_prog.host_fns;
+    for k in 0..host_fns.len {
+        if u.str_eq(host_fns.get(k).name, "ph_thread_spawn") {
+            cg.g_threads = true;
+        }
+    }
+    // The wasm profiler reads the shadow stack from another thread, so the
+    // program runs on a shared memory.
+    if profiling and ty.g_target.is_wasm {
+        cg.g_threads = true;
+    }
+    let mut objpath = out;
+    if final_link {
+        objpath = u.f2("%s.tmp%s.o", out, u.idec(u.getpid()));
+        co.out_path = objpath;
+    } else {
+        co.out_path = out;
+    }
+    cg.collect_link_names();
+    // Separate compilation (spec §17.7) applies to executables; --emit of a
+    // single object/IR/assembly file is always one unit.
+    let mut separate = final_link and (co.opt_level <= 1);
+    if units_mode >= 0 {
+        separate = final_link and (units_mode == 1);
+    }
+    if separate {
+        let mut objs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+        let mut us = units.UnitStats.{ total: 0, compiled: 0 };
+        let t0 = now_ms();
+        if not units.build_units(co, objpath, &mut objs, &mut us) {
+            dg.emit(json, json);
+            if dg.error_count() == 0 {
+                dg.emit_fatal(json, "E9007", "code generation failed");
+            }
+            _ = u.unlink(u.cz(objpath));
+            return 1;
+        }
+        let t1 = now_ms();
+        if verbose {
+            u.eprint(u.f4("phalange: %s modules, %s compiled, %s cached (%s ms)\n", u.zdec(us.total), u.zdec(us.compiled),
+                          u.zdec(us.total - us.compiled), u.ffmt("%.0f", t1 - t0)));
+        }
+        for k in 0..objs.len {
+            link_inputs.push(objs.get(k));
+        }
+    } else if not cg.codegen_program(co) {
+        dg.emit(json, json);
+        if final_link {
+            _ = u.unlink(u.cz(objpath));
+        }
+        return 1;
+    }
+    if final_link {
+        let mut rc: i32 = 0;
+        if ty.g_target.is_wasm {
+            let names = ["wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld"];
+            let ld = find_tool(names[..]);
+            if u.isnos(ld) {
+                _ = u.unlink(u.cz(objpath));
+                dg.emit_fatal(json, "E9003", "cannot find wasm-ld (install lld)");
+                return 2;
+            }
+            let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+            av.push(ld);
+            if u.str_eq(ld, "rust-lld") {
+                av.push("-flavor");
+                av.push("wasm");
+            }
+            av.push("--no-entry");
+            av.push("--stack-first");
+            av.push("-z");
+            av.push("stack-size=1048576");
+            av.push("--export-memory");
+            if cg.g_threads {
+                // Threads are instances sharing one memory, which the host creates.
+                av.push("--shared-memory");
+                av.push("--import-memory");
+                av.push("--max-memory=1073741824");
+            }
+            for k in 0..cg.g_export_names.len {
+                av.push(u.f1("--export=%s", cg.g_export_names.get(k)));
+            }
+            av.push(objpath);
+            // C sources are compiled for wasm and linked into the same module
+            // (they share the linear memory and the stack).
+            let mut c_objs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+            for k in 0..link_inputs.len {
+                if rc != 0 {
+                    break;
+                }
+                let inp = link_inputs.get(k);
+                if (inp.len > 2) and u.ends(inp, ".c") {
+                    let cc_names = ["clang", "clang-18", "/usr/lib/llvm-18/bin/clang"];
+                    let clang = find_tool(cc_names[..]);
+                    if u.isnos(clang) {
+                        _ = u.unlink(u.cz(objpath));
+                        dg.emit_fatal(json, "E9003", "cannot find clang to compile C sources for wasm");
+                        return 2;
+                    }
+                    let cobj = u.f3("%s.c%s.%s.o", out, u.zdec(k), u.idec(u.getpid()));
+                    let mut cv = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+                    cv.push(clang);
+                    cv.push(u.pick(ty.g_target.ptr_bits == 64, "--target=wasm64-unknown-unknown",
+                                   "--target=wasm32-unknown-unknown"));
+                    let copts = ["-O2", "-c", "-ffreestanding", "-mbulk-memory", "-msimd128", "-matomics",
+                                 "-mnontrapping-fptoint", "-msign-ext", "-mmutable-globals"];
+                    for c in copts {
+                        cv.push(c);
+                    }
+                    for j in 0..inc_flags.len {
+                        cv.push(inc_flags.get(j));
+                    }
+                    cv.push(inp);
+                    cv.push("-o");
+                    cv.push(cobj);
+                    rc = run(cv.items());
+                    c_objs.push(cobj);
+                    av.push(cobj);
+                } else {
+                    av.push(inp);
+                }
+            }
+            for k in 0..link_flags.len {
+                av.push(link_flags.get(k));
+            }
+            for k in 0..cg.g_link_libs.len {
+                av.push(u.f1("-l%s", cg.g_link_libs.get(k)));
+            }
+            av.push("-o");
+            av.push(out);
+            if rc == 0 {
+                rc = run(av.items());
+            }
+            for k in 0..c_objs.len {
+                _ = u.unlink(u.cz(c_objs.get(k)));
+            }
+        } else {
+            // Every native executable gets the native runtime: the host ABI
+            // (std/io, std/net, threads) and crash reporting (spec §17.4).
+            let rt = u.f1("%s/../runtime/native_host.c", std_dir);
+            if not u.file_exists(rt) {
+                _ = u.unlink(u.cz(objpath));
+                dg.emit_fatal(json, "E9003", u.f1("cannot find the native runtime (%s)", rt));
+                return 2;
+            }
+            link_inputs.push(rt);
+            let names = ["cc", "clang", "gcc"];
+            let cc = find_tool(names[..]);
+            if u.isnos(cc) {
+                _ = u.unlink(u.cz(objpath));
+                dg.emit_fatal(json, "E9003", "cannot find a C compiler to link with");
+                return 2;
+            }
+            // The toolchain's runtime sources are compiled once and cached.
+            let rtdir = u.f1("%s/../runtime/", std_dir);
+            for k in 0..link_inputs.len {
+                let inp = link_inputs.get(k);
+                if u.starts(inp, rtdir) {
+                    let o = units.cached_runtime_object(cc, inp);
+                    if not u.isnos(o) {
+                        link_inputs.set(k, o);
+                    }
+                }
+            }
+            let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+            av.push(cc);
+            av.push(objpath);
+            for k in 0..inc_flags.len {
+                av.push(inc_flags.get(k));
+            }
+            for k in 0..link_inputs.len {
+                av.push(link_inputs.get(k));
+            }
+            for k in 0..link_flags.len {
+                av.push(link_flags.get(k));
+            }
+            for k in 0..cg.g_link_libs.len {
+                av.push(u.f1("-l%s", cg.g_link_libs.get(k)));
+            }
+            av.push("-o");
+            av.push(out);
+            av.push("-lm");
+            av.push("-pthread");
+            rc = run(av.items());
+        }
+        _ = u.unlink(u.cz(objpath));
+        if rc != 0 {
+            dg.emit_fatal(json, "E9004", "linking failed");
+            return 1;
+        }
+    }
+    if testing {
+        let rc = run_tests(out, std_dir, test_filter, test_timeout, json);
+        _ = u.unlink(u.cz(out));
+        return rc;
+    }
+    if profiling {
+        let rc = run_profile(out, std_dir, folded_path, prof_hz, json);
+        _ = u.unlink(u.cz(out));
+        return rc;
+    }
+    dg.emit(json, json);
+    return 0;
+}
+
+export fn main(argc: i32, argv: *mut *mut u8) i32 {
+    let args = u.newn.[[]u8](@int_cast(usize, argc));
+    for i in 0..args.len {
+        args[i] = arg_at(argv, i);
+    }
+    let rc = driver(args);
+    u.flush_out();
+    return rc;
+}

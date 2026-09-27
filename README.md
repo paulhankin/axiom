@@ -21,6 +21,7 @@ phalange test geometry                # build/check/test also take a package dir
 phalange profile prog.ph              # sampling profiler: hot functions, call sites, flame graph input
 phalange build app --verbose          # modules compile separately and are cached (spec §17.7)
 node tests/run.mjs                    # run the test suite
+selfhost/bootstrap.sh                 # build the self-hosted compiler (stage 1, 2, 3)
 ```
 
 ## Contents
@@ -33,6 +34,7 @@ node tests/run.mjs                    # run the test suite
 | [`examples/generics.ph`](examples/generics.ph) | Generic functions and types, constraints, const parameters |
 | [`examples/c_interop/`](examples/c_interop/stats.ph) | A Phalange library called from C through a generated header |
 | [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |
+| [`selfhost/`](selfhost/README.md) | The same compiler written in Phalange, bootstrapped from the C one to a fixed point |
 | [`std/`](std/README.md) | Standard library: `mem`, `vec`, `hash`, `map`, `matrix`, `io`, `net` |
 | [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native_host.c`); test runners; the profiler |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `phalange test`, packages |

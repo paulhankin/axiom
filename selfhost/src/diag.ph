@@ -1,0 +1,325 @@
+// =============================================================================
+// diag.ph - diagnostics collection and emission (human / agent-json).
+// =============================================================================
+import "util.ph" as u;
+
+pub const SEV_ERROR: i32 = 0;
+pub const SEV_WARNING: i32 = 1;
+pub const SEV_NOTE: i32 = 2;
+
+pub struct DiagNote {
+    msg: []u8,
+    span: u.Span,
+}
+
+pub struct DiagEdit {
+    span: u.Span,
+    replacement: []u8,
+}
+
+pub struct DiagFix {
+    description: []u8,
+    applicability: []u8,  // "machine" | "suggestion" | "placeholder"
+    edits: u.List.[DiagEdit],
+}
+
+pub struct Diag {
+    code: []u8,
+    severity: i32,
+    msg: []u8,
+    span: u.Span,
+    expected: []u8,  // nil slices when absent
+    found: []u8,
+    notes: u.List.[DiagNote],
+    fixes: u.List.[*mut DiagFix],
+    seq: usize,
+}
+
+let mut diags: u.List.[*mut Diag] = u.List.[*mut Diag].{ data: @ptr_from_int(*mut *mut Diag, 0), len: 0, cap: 0 };
+let mut nerrors: i32 = 0;
+
+// Messages are limited to 1023 bytes (the C implementation's buffer).
+fn trunc(msg: []u8) []u8 {
+    if msg.len > 1023 {
+        return u.dup(msg[0..1023]);
+    }
+    return msg;
+}
+
+fn diag_new(sev: i32, sp: u.Span, code: []u8, msg: []u8) *mut Diag {
+    let d = u.new.[Diag]();
+    d.severity = sev;
+    d.span = sp;
+    d.code = code;
+    d.msg = trunc(msg);
+    d.seq = diags.len;
+    diags.push(d);
+    if sev == SEV_ERROR {
+        nerrors += 1;
+    }
+    return d;
+}
+
+pub fn err(sp: u.Span, code: []u8, msg: []u8) *mut Diag {
+    return diag_new(SEV_ERROR, sp, code, msg);
+}
+
+pub fn warning(sp: u.Span, code: []u8, msg: []u8) *mut Diag {
+    return diag_new(SEV_WARNING, sp, code, msg);
+}
+
+pub fn note(d: *mut Diag, sp: u.Span, msg: []u8) void {
+    if u.isnil(d) {
+        return;
+    }
+    d.notes.push(DiagNote.{ msg: trunc(msg), span: sp });
+}
+
+pub fn set_types(d: *mut Diag, expected: []u8, found: []u8) void {
+    if u.isnil(d) {
+        return;
+    }
+    d.expected = expected;
+    d.found = found;
+}
+
+pub fn fix(d: *mut Diag, description: []u8, applicability: []u8) *mut DiagFix {
+    let f = u.new.[DiagFix]();
+    f.description = description;
+    f.applicability = applicability;
+    if u.notnil(d) {
+        d.fixes.push(f);
+    }
+    return f;
+}
+
+pub fn edit(f: *mut DiagFix, sp: u.Span, replacement: []u8) void {
+    f.edits.push(DiagEdit.{ span: sp, replacement: replacement });
+}
+
+pub fn error_count() i32 {
+    return nerrors;
+}
+
+fn diag_cmp(x: *mut Diag, y: *mut Diag) i32 {
+    let fx = u.file_of(x.span.file).display;
+    let fy = u.file_of(y.span.file).display;
+    let c = u.str_cmp(fx, fy);
+    if c != 0 {
+        return c;
+    }
+    if x.span.start != y.span.start {
+        if x.span.start < y.span.start {
+            return -1;
+        }
+        return 1;
+    }
+    let c2 = u.str_cmp(x.code, y.code);
+    if c2 != 0 {
+        return c2;
+    }
+    if x.seq < y.seq {
+        return -1;
+    }
+    if x.seq > y.seq {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn json_str(b: *mut u.Buf, s: []u8) void {
+    b.c('"');
+    let hex = "0123456789abcdef";
+    for c in s {
+        if c == 0 {
+            break;
+        }
+        if c == '"' {
+            b.s("\\\"");
+        } else if c == '\\' {
+            b.s("\\\\");
+        } else if c == '\n' {
+            b.s("\\n");
+        } else if c == '\r' {
+            b.s("\\r");
+        } else if c == '\t' {
+            b.s("\\t");
+        } else if c < 0x20 {
+            b.s("\\u00");
+            b.c(hex[@as(usize, c >> 4)]);
+            b.c(hex[@as(usize, c & 15)]);
+        } else {
+            b.c(c);
+        }
+    }
+    b.c('"');
+}
+
+fn json_span(b: *mut u.Buf, sp: u.Span) void {
+    let lc = u.span_linecol(sp);
+    b.s(u.f6("{\"start_line\":%s,\"start_col\":%s,\"end_line\":%s,\"end_col\":%s,\"start_byte\":%s,\"end_byte\":%s}",
+             u.idec(lc.sl), u.idec(lc.sc), u.idec(lc.el), u.idec(lc.ec), u.udec(@as(u64, sp.start)),
+             u.udec(@as(u64, sp.end))));
+}
+
+// The full source line containing the start of the span.
+fn context_line(sp: u.Span) []u8 {
+    let f = u.file_of(sp.file);
+    let t = f.text;
+    let mut s = @as(usize, sp.start);
+    let mut e = @as(usize, sp.start);
+    while (s > 0) and (t[s - 1] != '\n') {
+        s -= 1;
+    }
+    while (e < t.len) and (t[e] != '\n') and (t[e] != '\r') {
+        e += 1;
+    }
+    while (s < e) and ((t[s] == ' ') or (t[s] == '\t')) {
+        s += 1;
+    }
+    return u.dup(t[s..e]);
+}
+
+fn sev_name(s: i32) []u8 {
+    if s == SEV_ERROR {
+        return "error";
+    }
+    if s == SEV_WARNING {
+        return "warning";
+    }
+    return "note";
+}
+
+// Writes all diagnostics, sorted, to stdout (to_stdout) or stderr.
+pub fn emit(json: bool, to_stdout: bool) void {
+    u.sort(diags.items(), diag_cmp);
+    let mut b = u.Buf.init();
+    if json {
+        b.s("{\"schema\":\"phalange-diagnostics/1\",\"status\":\"");
+        b.s(u.pick(nerrors != 0, "error", "ok"));
+        b.s("\",\"diagnostics\":[");
+        for i in 0..diags.len {
+            let d = diags.get(i);
+            if i != 0 {
+                b.c(',');
+            }
+            b.s("\n  {\"code\":");
+            json_str(&mut b, d.code);
+            b.s(",\"severity\":\"");
+            b.s(sev_name(d.severity));
+            b.s("\",\"message\":");
+            json_str(&mut b, d.msg);
+            b.s(",\"file\":");
+            json_str(&mut b, u.file_of(d.span.file).display);
+            b.s(",\"span\":");
+            json_span(&mut b, d.span);
+            b.s(",\"context\":");
+            json_str(&mut b, context_line(d.span));
+            if not u.isnos(d.expected) {
+                b.s(",\"expected\":");
+                json_str(&mut b, d.expected);
+            }
+            if not u.isnos(d.found) {
+                b.s(",\"found\":");
+                json_str(&mut b, d.found);
+            }
+            b.s(",\"notes\":[");
+            for j in 0..d.notes.len {
+                let n = d.notes.get(j);
+                if j != 0 {
+                    b.c(',');
+                }
+                b.s("{\"message\":");
+                json_str(&mut b, n.msg);
+                b.s(",\"file\":");
+                json_str(&mut b, u.file_of(n.span.file).display);
+                b.s(",\"span\":");
+                json_span(&mut b, n.span);
+                b.c('}');
+            }
+            b.s("],\"fixes\":[");
+            for j in 0..d.fixes.len {
+                let f = d.fixes.get(j);
+                if j != 0 {
+                    b.c(',');
+                }
+                b.s("{\"description\":");
+                json_str(&mut b, f.description);
+                b.s(",\"applicability\":\"");
+                b.s(f.applicability);
+                b.s("\",\"edits\":[");
+                for k in 0..f.edits.len {
+                    let ed = f.edits.get(k);
+                    if k != 0 {
+                        b.c(',');
+                    }
+                    b.s("{\"file\":");
+                    json_str(&mut b, u.file_of(ed.span.file).display);
+                    b.s(u.f2(",\"start_byte\":%s,\"end_byte\":%s,\"replacement\":", u.udec(@as(u64, ed.span.start)),
+                             u.udec(@as(u64, ed.span.end))));
+                    json_str(&mut b, ed.replacement);
+                    b.c('}');
+                }
+                b.s("]}");
+            }
+            b.s("]}");
+        }
+        b.s(u.pick(diags.len != 0, "\n", ""));
+        b.s("]}\n");
+    } else {
+        for i in 0..diags.len {
+            let d = diags.get(i);
+            let lc = u.span_linecol(d.span);
+            b.s(u.f5("%s:%s:%s: %s[%s]: ", u.file_of(d.span.file).display, u.idec(lc.sl), u.idec(lc.sc),
+                     sev_name(d.severity), d.code));
+            b.s(d.msg);
+            b.s("\n    ");
+            b.s(context_line(d.span));
+            b.s("\n");
+            if not u.isnos(d.expected) {
+                b.s("    expected: ");
+                b.s(d.expected);
+                b.s("\n       found: ");
+                b.s(u.pick(u.isnos(d.found), "?", d.found));
+                b.s("\n");
+            }
+            for j in 0..d.notes.len {
+                let n = d.notes.get(j);
+                let nl = u.span_linecol(n.span);
+                b.s(u.f3("  %s:%s:%s: note: ", u.file_of(n.span.file).display, u.idec(nl.sl), u.idec(nl.sc)));
+                b.s(n.msg);
+                b.s("\n");
+            }
+            for j in 0..d.fixes.len {
+                let f = d.fixes.get(j);
+                b.s(u.f2("  fix (%s): %s\n", f.applicability, f.description));
+            }
+        }
+    }
+    let text = b.done();
+    if to_stdout {
+        u.print(text);
+    } else {
+        u.eprint(text);
+    }
+}
+
+// A fatal error unrelated to source (bad invocation, missing file ...).
+pub fn emit_fatal(json: bool, code: []u8, msg: []u8) void {
+    let mut b = u.Buf.init();
+    if json {
+        b.s("{\"schema\":\"phalange-diagnostics/1\",\"status\":\"error\",\"diagnostics\":[{\"code\":");
+        json_str(&mut b, code);
+        b.s(",\"severity\":\"error\",\"message\":");
+        json_str(&mut b, msg);
+        b.s(",\"notes\":[],\"fixes\":[]}]}\n");
+        u.print(b.done());
+    } else {
+        b.s("phalange: error[");
+        b.s(code);
+        b.s("]: ");
+        b.s(msg);
+        b.s("\n");
+        u.eprint(b.done());
+    }
+}
