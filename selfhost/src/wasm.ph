@@ -130,14 +130,27 @@ fn new_local(t: u8) u32 {
     return nparams + @int_cast(u32, LT.len - 1);
 }
 
+// local.set x followed directly by local.get x is local.tee x
+let mut set_at: usize = 0;
+let mut set_end: usize = 0xffff_ffff;
+let mut set_idx: u32 = 0;
+
 fn local_get(i: u32) void {
+    if (C.len() == set_end) and (set_idx == i) {
+        C.set_u8(set_at, 0x22);
+        set_end = 0xffff_ffff;
+        return;
+    }
     op(0x20);
     C.uleb(@as(u64, i));
 }
 
 fn local_set(i: u32) void {
+    set_at = C.len();
     op(0x21);
     C.uleb(@as(u64, i));
+    set_end = C.len();
+    set_idx = i;
 }
 
 fn local_tee(i: u32) void {
@@ -2406,6 +2419,21 @@ fn phi_copies(from: *mut ir.Block, to: *mut ir.Block) void {
     }
 }
 
+// Would a branch from `from` to `to` be just a `br` (no phi copies)?
+fn plain_branch(from: *mut ir.Block, to: *mut ir.Block) bool {
+    if u.notnil(to.first) and (to.first.op == ir.OP_PHI) {
+        return false;
+    }
+    return (to.rpo <= from.rpo) or is_merge(to);
+}
+
+fn branch_depth(from: *mut ir.Block, to: *mut ir.Block) u64 {
+    if to.rpo <= from.rpo {
+        return depth_of(CTX_LOOP, to);
+    }
+    return depth_of(CTX_BLOCK, to);
+}
+
 fn do_branch(from: *mut ir.Block, to: *mut ir.Block) void {
     phi_copies(from, to);
     if to.rpo <= from.rpo {
@@ -2489,6 +2517,18 @@ fn emit_block(x: *mut ir.Block) void {
     let t = ir.terminator(x);
     let o = t.op;
     if o == ir.OP_BR {
+        do_branch(x, t.t1);
+    } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t1) {
+        // br_if to the target, then the other side inline
+        push(t.a);
+        op(0x0d);
+        C.uleb(branch_depth(x, t.t1));
+        do_branch(x, t.t2);
+    } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t2) {
+        push(t.a);
+        op(0x45);  // i32.eqz
+        op(0x0d);
+        C.uleb(branch_depth(x, t.t2));
         do_branch(x, t.t1);
     } else if o == ir.OP_CONDBR {
         push(t.a);
@@ -2626,6 +2666,7 @@ fn epilogue() void {
 fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     F = f;
     C = bn.new_bytes();
+    set_end = 0xffff_ffff;
     RL = u.List.[wo.Reloc].{ data: u.nil.[wo.Reloc](), len: 0, cap: 0 };
     LT = u.List.[u8].{ data: u.nil.[u8](), len: 0, cap: 0 };
     ctx.clear();

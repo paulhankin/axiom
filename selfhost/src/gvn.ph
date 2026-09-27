@@ -872,6 +872,132 @@ fn prove_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64) bool {
     return le_path(x, y, bound, 0);
 }
 
+// An upper bound of x (as an unsigned number), or -1 when none is known
+// below 2^62: from constants, the facts in scope, masks, shifts, divisions,
+// remainders, extensions, sums and products with constants, and phis (each
+// incoming value under its edge's condition).
+const UB_LIM: i64 = 0x4000_0000_0000_0000;
+
+fn ub(x: *mut ir.Value, depth: i32) i64 {
+    if small_k(x) {
+        return kv(x);
+    }
+    if u.isnil(x) or (x.ty.kind != ir.T_INT) or (depth > 6) or (prove_budget <= 0) {
+        return -1;
+    }
+    prove_budget -= 1;
+    let mut best: i64 = -1;
+    if x.ty.bits < 62 {
+        best = @bit_cast(i64, ir.mask_bits(x.ty.bits));
+    }
+    // facts x <= w + c
+    let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.at(@int_cast(usize, e));
+        if (en.kind == K_LE) and (en.key == x) {
+            let mut w: i64 = 0;
+            if u.notnil(en.val) {
+                w = ub(en.val, depth + 1);
+            }
+            if (w >= 0) and ((w + en.off) >= 0) and (((best < 0) or ((w + en.off) < best))) {
+                best = w + en.off;
+            }
+        }
+        e = en.next;
+    }
+    if x.kind != ir.V_INST {
+        return best;
+    }
+    let op = x.op;
+    let mut d: i64 = -1;
+    if (op == ir.OP_AND) and small_k(x.b) {
+        d = kv(x.b);
+    } else if (op == ir.OP_LSHR) and cb.is_k(x.b) and (ir.cint_val(x.b) < 63) {
+        let a = ub(x.a, depth + 1);
+        if a >= 0 {
+            d = a >> @truncate(u32, ir.cint_val(x.b));
+        } else if x.ty.bits == 64 {
+            d = @bit_cast(i64, ir.mask_bits(64) >> @truncate(u32, ir.cint_val(x.b)));
+            if d >= UB_LIM {
+                d = -1;
+            }
+        }
+    } else if (op == ir.OP_UDIV) and small_k(x.b) and (kv(x.b) > 0) {
+        let a = ub(x.a, depth + 1);
+        if a >= 0 {
+            d = a / kv(x.b);
+        }
+    } else if op == ir.OP_UREM {
+        let a = ub(x.b, depth + 1);
+        if a > 0 {
+            d = a - 1;
+        }
+    } else if (op == ir.OP_ZEXT) or (op == ir.OP_TRUNC) {
+        d = ub(x.a, depth + 1);
+    } else if (op == ir.OP_ADD) and small_k(x.b) and (kv(x.b) < 0x1_0000_0000) {
+        // no wrap when the bound stays below the type's maximum
+        let a = ub(x.a, depth + 1);
+        if (a >= 0) and fits_type(a + kv(x.b), x.ty) {
+            d = a + kv(x.b);
+        }
+    } else if op == ir.OP_ADD {
+        let a = ub(x.a, depth + 1);
+        let b = ub(x.b, depth + 1);
+        if (a >= 0) and (b >= 0) and fits_type(a + b, x.ty) {
+            d = a + b;
+        }
+    } else if (op == ir.OP_MUL) and small_k(x.b) and (kv(x.b) < 0x1_0000_0000) {
+        let a = ub(x.a, depth + 1);
+        if (a >= 0) and (a < 0x1_0000_0000) and fits_type(a * kv(x.b), x.ty) {
+            d = a * kv(x.b);
+        }
+    } else if (op == ir.OP_SHL) and cb.is_k(x.b) and (ir.cint_val(x.b) < 32) {
+        let a = ub(x.a, depth + 1);
+        if (a >= 0) and (a < 0x1_0000_0000) and fits_type(a << @truncate(u32, ir.cint_val(x.b)), x.ty) {
+            d = a << @truncate(u32, ir.cint_val(x.b));
+        }
+    } else if (op == ir.OP_SELECT) {
+        let a = ub(x.b, depth + 1);
+        let b = ub(x.c, depth + 1);
+        if (a >= 0) and (b >= 0) {
+            d = a;
+            if b > a {
+                d = b;
+            }
+        }
+    } else if (op == ir.OP_PHI) and (x.xs.len <= 4) {
+        d = 0;
+        for k in 0..x.xs.len {
+            let v = x.xs.get(k);
+            if v == x {
+                continue;
+            }
+            let mark = ents.len;
+            edge_assume(x.bs.get(k), x.blk);
+            let b = ub(v, depth + 1);
+            pop_to(mark);
+            if b < 0 {
+                d = -1;
+                break;
+            }
+            if b > d {
+                d = b;
+            }
+        }
+    }
+    if (d >= 0) and ((best < 0) or (d < best)) {
+        best = d;
+    }
+    return best;
+}
+
+fn fits_type(v: i64, t: *ir.Ty) bool {
+    if (v < 0) or (v >= UB_LIM) {
+        return false;
+    }
+    return @bit_cast(u64, v) <= ir.mask_bits(t.bits);
+}
+
 // The value of an unsigned comparison the bounds decide, or nil.
 fn decide(i: *mut ir.Value) *mut ir.Value {
     let p = cb.pred_of(i);
@@ -898,6 +1024,28 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             }
         }
         return vnil();
+    }
+    // bounds from the values' ranges: x < K when ub(x) < K; (x + y) >= x when
+    // the sum cannot wrap
+    prove_budget = 64;
+    if small_k(b) {
+        let m = ub(a, 0);
+        if m >= 0 {
+            if ((p == ir.IntULT) and (m < kv(b))) or ((p == ir.IntUGE) and (m < kv(b))) {
+                return kbool(p == ir.IntULT);
+            }
+            if ((p == ir.IntULE) and (m <= kv(b))) or ((p == ir.IntUGT) and (m <= kv(b))) {
+                return kbool(p == ir.IntULE);
+            }
+        }
+    }
+    if is_inst(a, ir.OP_ADD) and ((a.a == b) or (a.b == b)) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
+        prove_budget = 64;
+        let x = ub(a.a, 0);
+        let y = ub(a.b, 0);
+        if (x >= 0) and (y >= 0) and fits_type(x + y, a.ty) {
+            return kbool(p == ir.IntUGE);
+        }
     }
     if (p == ir.IntULT) or (p == ir.IntUGE) {
         // a < b: a <= b - 1; a >= b: b <= a

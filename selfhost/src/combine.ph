@@ -306,6 +306,41 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             return mk_icmp(B, p, a.a, ir.czero(ir.t_ptr()));
         }
     }
+    // Widening multiplication overflow (narrow types): ext(trunc p) != p for
+    // p = mul (ext x) c is a range check on x.
+    if ((p == ir.IntEQ) or (p == ir.IntNE)) and (at.kind == ir.T_INT) and (bits <= 64) {
+        let mut prod = b;
+        let mut back = a;
+        if not is_op(prod, ir.OP_MUL) {
+            prod = a;
+            back = b;
+        }
+        // (the truncated product may already be the narrow product x * c)
+        let mut narrow_ok = false;
+        if is_op(prod, ir.OP_MUL) and is_k(prod.b) and (is_op(back, ir.OP_ZEXT) or is_op(back, ir.OP_SEXT)) and
+           (back.op == prod.a.op) and (prod.a.a.ty == back.a.ty) {
+            let nb = back.a;
+            if is_op(nb, ir.OP_TRUNC) and (nb.a == prod) {
+                narrow_ok = true;
+            } else if is_op(nb, ir.OP_MUL) and (nb.a == prod.a.a) and is_k(nb.b) and
+                      (kval(nb.b) == (kval(prod.b) & ir.mask_bits(nb.ty.bits))) {
+                narrow_ok = true;
+            }
+        }
+        if narrow_ok {
+            let x = prod.a.a;
+            let w = x.ty.bits;
+            if (w < bits) and (w <= 32) and (w >= 8) {
+                let r = narrow_mul_overflow(B, x, prod.a.op == ir.OP_SEXT, ir.sval(prod.b), kval(prod.b));
+                if u.notnil(r) {
+                    if p == ir.IntNE {
+                        return r;
+                    }
+                    return negate_bool(B, r);
+                }
+            }
+        }
+    }
     // Overflow checks: (x + c) <u x and (x + c) <=u x are x >u MAX - c (for
     // c != 0); (x + c) >=u x and (x + c) >u x are x <=u MAX - c.
     if at.kind == ir.T_INT {
@@ -592,6 +627,18 @@ fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// v as a value of the narrower type t, when that is free: an extension from
+// t, or a constant.
+fn narrowed(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if (is_op(v, ir.OP_ZEXT) or is_op(v, ir.OP_SEXT)) and (v.a.ty == t) {
+        return v.a;
+    }
+    if (v.kind == ir.V_CINT) and (v.ty.bits <= 64) {
+        return kt(t, kval(v));
+    }
+    return vnil();
+}
+
 fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let a = i.a;
@@ -622,6 +669,17 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             if is_op(a, ir.OP_TRUNC) {
                 i.a = a.a;
                 return vnil();
+            }
+            // the low bits of +, -, *, &, |, ^ depend only on the operands' low
+            // bits: compute in the narrow type
+            let ao = a.op;
+            if (a.kind == ir.V_INST) and ((ao == ir.OP_ADD) or (ao == ir.OP_SUB) or (ao == ir.OP_MUL) or
+                (ao == ir.OP_AND) or (ao == ir.OP_OR) or (ao == ir.OP_XOR)) {
+                let x = narrowed(a.a, t);
+                let y = narrowed(a.b, t);
+                if u.notnil(x) and u.notnil(y) {
+                    return ir.binop(B, ao, x, y);
+                }
             }
             if is_op(a, ir.OP_ZEXT) or is_op(a, ir.OP_SEXT) {
                 let x = a.a;
@@ -675,6 +733,36 @@ fn simplify_ptradd(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         return simplify_ptradd(B, i);
     }
     return vnil();
+}
+
+// Does x * c overflow x's (narrow, w <= 32 bits) type? A comparison, or nil.
+fn narrow_mul_overflow(B: *mut ir.Builder, x: *mut ir.Value, signed: bool, sc: i64, uc: u64) *mut ir.Value {
+    let w = x.ty.bits;
+    let t = x.ty;
+    if not signed {
+        if uc <= 1 {
+            return kfalse();
+        }
+        let max = ir.mask_bits(w);
+        return mk_icmp(B, ir.IntUGT, x, kt(t, max / uc));
+    }
+    let max: i64 = @bit_cast(i64, ir.mask_bits(w) >> 1);
+    let min: i64 = -max - 1;
+    if (sc == 0) or (sc == 1) {
+        return kfalse();
+    }
+    if sc == -1 {
+        return mk_icmp(B, ir.IntEQ, x, kt(t, @bit_cast(u64, min)));
+    }
+    if (sc > 0x7fff_ffff) or (sc < -0x7fff_ffff) {
+        return vnil();
+    }
+    let hi = max / sc;
+    let lo = min / sc;
+    if sc > 1 {
+        return ir.or_(B, mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, lo))));
+    }
+    return ir.or_(B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
 }
 
 // Multiplication overflow with a constant factor is a range check.

@@ -347,6 +347,17 @@ fn thread_one(f: *mut ir.Func) bool {
         if (t.a.kind != ir.V_INST) or (t.a.blk != b) or (copy_cost(b) > MAX_COPY) {
             continue;
         }
+        // not through a loop header: that would peel iterations, one per round
+        let mut header = false;
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if (p.rpo >= 0) and opt.dominates(b, p) {
+                header = true;
+            }
+        }
+        if header {
+            continue;
+        }
         for k in 0..b.preds.len {
             let p = b.preds.get(k);
             if (p == b) or (p.rpo < 0) {
