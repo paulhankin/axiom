@@ -5,8 +5,9 @@
 //   -O1+  also instruction combining (combine.ph), jump threading
 //         (thread.ph), scalar replacement of aggregates (sroa.ph) and global
 //         value numbering (gvn.ph)
-//   -O2+  also inlining (inline.ph), bottom-up over the call graph, each
-//         function simplified again after its calls are inlined
+//   -O2+  also interprocedural constant propagation and inlining
+//         (inline.ph), bottom-up over the call graph, each function simplified
+//         again after its calls are inlined
 // =============================================================================
 import "util.ph" as u;
 import "ir.ph" as ir;
@@ -66,6 +67,14 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
         }
     }
     if level >= 2 {
-        inl.inline_module(m, resimplify);
+        // twice: inlining exposes constant arguments (a comparison function
+        // passed down through an inlined call), which make new direct calls
+        for _round in @as(i32, 0)..2 {
+            let consts = inl.ipcp(m);
+            for i in 0..consts.len {
+                optimize_func(consts.get(i), level);
+            }
+            inl.inline_module(m, resimplify);
+        }
     }
 }

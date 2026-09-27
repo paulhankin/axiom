@@ -511,3 +511,109 @@ fn remove_dead(m: *mut ir.Module) void {
         m.funcs = kept;
     }
 }
+
+// -----------------------------------------------------------------------------
+// Interprocedural constant propagation: a parameter of an internal function
+// (not address-taken) that every call passes the same constant for is that
+// constant. A function pointer argument (a comparison function passed to a
+// sort, say) becomes a direct call, which can then be inlined.
+// -----------------------------------------------------------------------------
+fn same_const(a: *ir.Value, b: *ir.Value) bool {
+    if a == b {
+        return true;
+    }
+    if (a.kind != b.kind) or (a.ty != b.ty) {
+        return false;
+    }
+    if a.kind == ir.V_CINT {
+        return a.cv == b.cv;
+    }
+    if a.kind == ir.V_ZERO {
+        return true;
+    }
+    if a.kind == ir.V_FUNC {
+        return a.fnp == b.fnp;
+    }
+    if a.kind == ir.V_GLOBAL {
+        return a.gv == b.gv;
+    }
+    if a.kind == ir.V_CFP {
+        return @bit_cast(u64, a.fv) == @bit_cast(u64, b.fv);
+    }
+    return false;
+}
+
+fn propagatable(v: *ir.Value) bool {
+    let k = v.kind;
+    return (k == ir.V_CINT) or (k == ir.V_ZERO) or (k == ir.V_FUNC) or (k == ir.V_GLOBAL) or (k == ir.V_CFP);
+}
+
+// Replaces constant parameters; returns the functions it changed.
+pub fn ipcp(m: *mut ir.Module) u.List.[*mut ir.Func] {
+    let mut changed = u.List.[*mut ir.Func].{ data: u.nil.[*mut ir.Func](), len: 0, cap: 0 };
+    build_graph(m);
+    // per function: the constant each parameter always gets (nil: none seen,
+    // the function's own val: varying)
+    let consts = u.newn.[[]mut *mut ir.Value](m.funcs.len + 1);
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        consts[i] = u.newn.[*mut ir.Value](f.params.len + 1);
+    }
+    for i in 0..m.funcs.len {
+        let mut b = m.funcs.get(i).first;
+        while u.notnil(b) {
+            let mut x = b.first;
+            while u.notnil(x) {
+                let g = callee_of(x);
+                if u.notnil(g) and (x.xs.len != g.params.len) {
+                    let cs = consts[@int_cast(usize, g.aux)];
+                    for k in 0..g.params.len {
+                        cs[k] = g.val;
+                    }
+                } else if u.notnil(g) {
+                    let cs = consts[@int_cast(usize, g.aux)];
+                    for k in 0..x.xs.len {
+                        let a = ir.resolve(x.xs.get(k));
+                        if cs[k] == g.val {
+                            continue;
+                        }
+                        if not propagatable(a) {
+                            cs[k] = g.val;
+                        } else if u.isnil(cs[k]) {
+                            cs[k] = a;
+                        } else if not same_const(cs[k], a) {
+                            cs[k] = g.val;
+                        }
+                    }
+                }
+                x = x.next;
+            }
+            b = b.next;
+        }
+    }
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        let n = nodes.get(i);
+        if ir.is_decl(f) or (f.linkage != ir.LINK_INTERNAL) or n.addr_taken or (n.calls == 0) or
+           (f.export_name.len > 0) {
+            continue;
+        }
+        let cs = consts[i];
+        let mut any = false;
+        for k in 0..f.params.len {
+            let c = cs[k];
+            if u.notnil(c) and (c != f.val) {
+                f.params[k].fwd = c;
+                any = true;
+            }
+        }
+        if any {
+            ir.apply_forwarding(f);
+            for k in 0..f.params.len {
+                f.params[k].fwd = vnil();
+            }
+            changed.push(f);
+        }
+    }
+    return changed;
+}
