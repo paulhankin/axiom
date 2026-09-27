@@ -1,6 +1,6 @@
 // runtime/native_host.c - the Phalange host ABI (import module "phalange")
-// for native targets, on POSIX. The compiler links this automatically when a
-// native program uses std/io or std/net.
+// for native targets, on POSIX, plus crash reporting (trap messages and stack
+// traces, spec §17.4). The compiler links it into every native executable.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -8,6 +8,7 @@
 #include <linux/futex.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <stdint.h>
@@ -148,9 +149,12 @@ struct thread_start {
     void *arg;
 };
 
+void ph_install_crash_stack(void);
+
 static void *thread_main(void *p) {
     struct thread_start st = *(struct thread_start *)p;
     free(p);
+    ph_install_crash_stack();
     st.entry(st.arg);
     return NULL;
 }
@@ -213,10 +217,61 @@ int32_t ph_notify32(uint32_t *p, int32_t count) {
 }
 
 // Default report for traps in native programs (test binaries override it).
-__attribute__((weak)) void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info) {
+__attribute__((weak)) void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info,
+                                      const struct ph_shadow_stack *ss) {
+    static char buf[16384];
     char msg[1024];
     ph_format_trap(msg, sizeof msg, site, info);
-    char line[1400];
-    int n = snprintf(line, sizeof line, "phalange: %s at %s:%u:%u\n", msg, site->file, site->line, site->col);
-    if (n > 0) (void)!write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+    int n = snprintf(buf, sizeof buf, "phalange: %s at %s:%u:%u\n", msg, site->file, site->line, site->col);
+    if (n < 0 || (size_t)n >= sizeof buf) n = 0;
+    n += (int)ph_format_stack(buf + n, sizeof buf - (size_t)n, site, ss);
+    (void)!write(2, buf, (size_t)n);
+}
+
+// Crashes that are not Phalange traps (a stack overflow, or a fault in C code
+// called through the FFI) are reported with the shadow stack, then the
+// signal is re-raised.
+__attribute__((weak)) const struct ph_shadow_stack *phalange_shadow_stack(void);
+
+static void ph_crash(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    static char buf[16384];
+    const char *what = sig == SIGSEGV ? "segmentation fault" : sig == SIGBUS ? "bus error" : "arithmetic fault";
+    int code = sig == SIGFPE ? 3 : 5;
+    uintptr_t addr = (uintptr_t)si->si_addr;
+    pthread_attr_t attr;
+    void *stk;
+    size_t stksz;
+    if (sig != SIGFPE && pthread_getattr_np(pthread_self(), &attr) == 0) {
+        if (pthread_attr_getstack(&attr, &stk, &stksz) == 0 && addr + 65536 >= (uintptr_t)stk &&
+            addr < (uintptr_t)stk + 65536)
+            code = 8;
+        pthread_attr_destroy(&attr);
+    }
+    int n;
+    if (code == 8) n = snprintf(buf, sizeof buf, "phalange: trap T0008 (stack exhausted)\n");
+    else n = snprintf(buf, sizeof buf, "phalange: crash: %s (address %p)\n", what, si->si_addr);
+    if (n < 0 || (size_t)n >= sizeof buf) n = 0;
+    const struct ph_shadow_stack *ss = phalange_shadow_stack ? phalange_shadow_stack() : NULL;
+    n += (int)ph_format_stack(buf + n, sizeof buf - (size_t)n, NULL, ss);
+    (void)!write(2, buf, (size_t)n);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// Each thread needs its own signal stack to report its stack overflow.
+void ph_install_crash_stack(void) {
+    stack_t st = {.ss_sp = malloc(65536), .ss_size = 65536};
+    if (st.ss_sp) sigaltstack(&st, NULL);
+}
+
+__attribute__((constructor)) static void ph_install_crash_handler(void) {
+    ph_install_crash_stack();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ph_crash;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
 }

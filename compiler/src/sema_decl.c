@@ -23,6 +23,11 @@ static bool has_ext(const char *p) {
 }
 
 static const char *display_path(const char *real) {
+    // Standard library modules show as std/<path> wherever the library lives.
+    static char std_real[PATH_MAX];
+    if (!std_real[0] && g_std_dir && !realpath(g_std_dir, std_real)) std_real[0] = 0;
+    size_t m = strlen(std_real);
+    if (m && strncmp(real, std_real, m) == 0 && real[m] == '/') return arena_printf("std/%s", real + m + 1);
     size_t n = strlen(g_cwd);
     if (n && strncmp(real, g_cwd, n) == 0 && real[n] == '/') return real + n + 1;
     return real;

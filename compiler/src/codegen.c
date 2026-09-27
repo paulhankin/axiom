@@ -44,6 +44,7 @@ typedef struct FnInst {
     LLVMValueRef fn;
     LLVMTypeRef llty;
     bool sret;
+    const char *display;  // user-facing name, for stack traces and profiles
     struct FnInst *next;
 } FnInst;
 
@@ -240,9 +241,11 @@ static LLVMValueRef intr2(const char *name, LLVMValueRef a, LLVMValueRef b) {
 enum {
     T_TRAP = 0, T_BOUNDS = 1, T_OVERFLOW = 2, T_DIVZERO = 3, T_INTCAST = 4, T_LENGTH = 6, T_UNIONTAG = 7,
     T_ATOMIC_ALIGN = 10, T_EXPECT = 11,
+    SITE_ERR_RETURN = 254, SITE_CALL = 255,  // not traps: shadow stack records
 };
 
 static LLVMValueRef string_ptr(const char *bytes, uint32_t len);
+static LLVMBasicBlockRef new_bb(const char *name);
 static Span g_cur_span;
 static LLVMValueRef trap_fn, trap_info, trap_hook;
 static LLVMTypeRef trap_fnty, site_ty;
@@ -265,13 +268,20 @@ static LLVMValueRef trap_info_slot(int i) {
     return LLVMBuildGEP2(B, LLVMArrayType2(T_i64, 6), trap_info_global(), ix, 2, "");
 }
 
-static LLVMValueRef site_record(int code, Span sp) {
-    Sym key = intern_cstr(arena_printf("%d:%d:%u:%u", code, sp.file, sp.start, sp.end));
+static const char *cur_fn_display(void) { return F && F->inst ? F->inst->display : ""; }
+
+// A constant site record {code, file id, start, end, line, col, file, text,
+// fn, callee}. `fn` is the enclosing function; `callee` is set for call sites.
+// Codes: a trap code, SITE_CALL for a call, SITE_ERR_RETURN for an error return.
+static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
+    const char *fn = cur_fn_display();
+    if (!callee) callee = "";
+    Sym key = intern_cstr(arena_printf("%d:%d:%u:%u:%s:%s", code, sp.file, sp.start, sp.end, fn, callee));
     LLVMValueRef g = symmap_get(&site_map, key);
     if (g) return g;
     if (!site_ty) {
-        LLVMTypeRef el[8] = {T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr};
-        site_ty = LLVMStructTypeInContext(ctx, el, 8, false);
+        LLVMTypeRef el[10] = {T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr};
+        site_ty = LLVMStructTypeInContext(ctx, el, 10, false);
     }
     int sl = 0, sc = 0, el_ = 0, ec = 0;
     const char *file = "";
@@ -281,21 +291,141 @@ static LLVMValueRef site_record(int code, Span sp) {
         SourceFile *f = g_files.data[sp.file];
         file = f->display;
         uint32_t n = sp.end - sp.start;
-        if (n > 200) n = 200;
+        uint32_t max = code >= SITE_ERR_RETURN ? 80 : 200;
+        if (n > max) n = max;
+        // one line of text only
+        for (uint32_t i = 0; i < n; i++)
+            if (f->text[sp.start + i] == '\n') {
+                n = i;
+                break;
+            }
         text = arena_strndup(f->text + sp.start, n);
     }
-    LLVMValueRef vals[8] = {
+    LLVMValueRef vals[10] = {
         LLVMConstInt(T_i32, (unsigned)code, false), LLVMConstInt(T_i32, (unsigned)sp.file, false),
         LLVMConstInt(T_i32, sp.start, false),       LLVMConstInt(T_i32, sp.end, false),
         LLVMConstInt(T_i32, (unsigned)sl, false),   LLVMConstInt(T_i32, (unsigned)sc, false),
         string_ptr(file, (uint32_t)strlen(file)),   string_ptr(text, (uint32_t)strlen(text)),
+        string_ptr(fn, (uint32_t)strlen(fn)),       string_ptr(callee, (uint32_t)strlen(callee)),
     };
-    g = LLVMAddGlobal(mod, site_ty, ".trapsite");
-    LLVMSetInitializer(g, LLVMConstStructInContext(ctx, vals, 8, false));
+    g = LLVMAddGlobal(mod, site_ty, ".site");
+    LLVMSetInitializer(g, LLVMConstStructInContext(ctx, vals, 10, false));
     LLVMSetLinkage(g, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(g, true);
+    LLVMSetAlignment(g, 8);
     symmap_put(&site_map, key, g);
     return g;
+}
+
+static LLVMValueRef site_record(int code, Span sp) { return site_record_ex(code, sp, NULL); }
+
+// ---------------------------------------------------------------------------
+// Shadow stack (spec §17.4): each thread has
+//     {u32 depth, u32 errors, [SS_CAP]*Site calls, [ET_CAP]*Site error_returns}
+// Every call stores its call-site record at calls[depth % SS_CAP] and bumps
+// depth for the duration of the call, so after a trap or crash the host can
+// print the innermost SS_CAP frames with exact source locations. Error
+// returns are appended to a ring the same way; `catch` clears it. On wasm the
+// record's address lives in a per-instance (so per-thread) wasm global; on
+// native targets the record is thread-local.
+// ---------------------------------------------------------------------------
+#define SS_CAP 256
+#define ET_CAP 32
+static LLVMTypeRef ss_ty;
+static LLVMValueRef ss_global, ss_main;
+
+static bool stack_traces_on(void) { return O && O->stack_traces; }
+
+static LLVMTypeRef ss_type(void) {
+    if (!ss_ty) {
+        LLVMTypeRef el[4] = {T_i32, T_i32, LLVMArrayType2(T_ptr, SS_CAP), LLVMArrayType2(T_ptr, ET_CAP)};
+        ss_ty = LLVMStructTypeInContext(ctx, el, 4, false);
+    }
+    return ss_ty;
+}
+
+static LLVMValueRef ss_ptr(void) {
+    LLVMTypeRef t = ss_type();
+    if (!ss_global) {
+        if (g_target.wasm) {
+            ss_main = LLVMAddGlobal(mod, t, "phalange.ss.main");
+            LLVMSetInitializer(ss_main, LLVMConstNull(t));
+            LLVMSetLinkage(ss_main, LLVMInternalLinkage);
+            LLVMSetAlignment(ss_main, 8);
+            // null means the main thread's record (wasm-ld does not relocate
+            // wasm global initializers); thread starts set their own.
+            ss_global = LLVMAddGlobalInAddressSpace(mod, T_ptr, "phalange.ss", 1);
+            LLVMSetInitializer(ss_global, LLVMConstNull(T_ptr));
+            LLVMSetLinkage(ss_global, LLVMInternalLinkage);
+        } else {
+            ss_global = LLVMAddGlobal(mod, t, "phalange.ss");
+            LLVMSetInitializer(ss_global, LLVMConstNull(t));
+            LLVMSetLinkage(ss_global, LLVMInternalLinkage);
+            LLVMSetThreadLocal(ss_global, true);
+            LLVMSetThreadLocalMode(ss_global, LLVMInitialExecTLSModel);
+            LLVMSetAlignment(ss_global, 8);
+        }
+    }
+    if (g_target.wasm) {
+        LLVMValueRef p = LLVMBuildLoad2(B, T_ptr, ss_global, "");
+        return LLVMBuildSelect(B, LLVMBuildIsNull(B, p, ""), ss_main, p, "ss");
+    }
+    return ss_global;
+}
+
+static LLVMValueRef ss_field(LLVMValueRef ss, unsigned i) { return LLVMBuildStructGEP2(B, ss_type(), ss, i, ""); }
+
+static LLVMValueRef ss_slot(LLVMValueRef ss, unsigned field, LLVMValueRef idx) {
+    LLVMValueRef ix[3] = {LLVMConstInt(T_i32, 0, false), LLVMConstInt(T_i32, field, false), idx};
+    return LLVMBuildGEP2(B, ss_type(), ss, ix, 3, "");
+}
+
+typedef struct SsFrame {
+    LLVMValueRef ss, depth;
+} SsFrame;
+
+static SsFrame ss_push(const char *callee) {
+    SsFrame f = {0};
+    if (!stack_traces_on() || !F) return f;
+    f.ss = ss_ptr();
+    LLVMValueRef dp = ss_field(f.ss, 0);
+    f.depth = LLVMBuildLoad2(B, T_i32, dp, "depth");
+    LLVMValueRef idx = LLVMBuildAnd(B, f.depth, LLVMConstInt(T_i32, SS_CAP - 1, false), "");
+    LLVMBuildStore(B, site_record_ex(SITE_CALL, g_cur_span, callee), ss_slot(f.ss, 2, idx));
+    LLVMBuildStore(B, LLVMBuildAdd(B, f.depth, LLVMConstInt(T_i32, 1, false), ""), dp);
+    return f;
+}
+
+static void ss_pop(SsFrame f) {
+    if (f.ss) LLVMBuildStore(B, f.depth, ss_field(f.ss, 0));
+}
+
+// Appends an error-return record when `code` (an error code, i16) is nonzero.
+static void etrace_push(LLVMValueRef code) {
+    if (!stack_traces_on() || !F) return;
+    if (LLVMIsAConstantInt(code) && LLVMConstIntGetZExtValue(code) == 0) return;
+    LLVMBasicBlockRef cont = NULL;
+    if (!LLVMIsAConstantInt(code)) {
+        LLVMBasicBlockRef rec = new_bb("etrace");
+        cont = new_bb("etrace.done");
+        LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstNull(LLVMTypeOf(code)), ""), rec, cont);
+        LLVMPositionBuilderAtEnd(B, rec);
+    }
+    LLVMValueRef ss = ss_ptr();
+    LLVMValueRef np = ss_field(ss, 1);
+    LLVMValueRef n = LLVMBuildLoad2(B, T_i32, np, "");
+    LLVMValueRef idx = LLVMBuildAnd(B, n, LLVMConstInt(T_i32, ET_CAP - 1, false), "");
+    LLVMBuildStore(B, site_record(SITE_ERR_RETURN, g_cur_span), ss_slot(ss, 3, idx));
+    LLVMBuildStore(B, LLVMBuildAdd(B, n, LLVMConstInt(T_i32, 1, false), ""), np);
+    if (cont) {
+        LLVMBuildBr(B, cont);
+        LLVMPositionBuilderAtEnd(B, cont);
+    }
+}
+
+static void etrace_clear(void) {
+    if (!stack_traces_on() || !F) return;
+    LLVMBuildStore(B, LLVMConstInt(T_i32, 0, false), ss_field(ss_ptr(), 1));
 }
 
 static void call_trap_site(LLVMValueRef site) {
@@ -315,8 +445,8 @@ static void call_trap_site(LLVMValueRef site) {
         LLVMBuildStore(B, LLVMBuildZExt(B, LLVMBuildPtrToInt(B, sp, T_isz, ""), T_i64, ""), trap_info_slot(0));
         if (!g_target.wasm) {
             // Optional host hook (runtime/native_host.c, runtime/test_main.c).
-            LLVMTypeRef ps[2] = {T_ptr, T_ptr};
-            LLVMTypeRef hty = LLVMFunctionType(T_void, ps, 2, false);
+            LLVMTypeRef ps[3] = {T_ptr, T_ptr, T_ptr};
+            LLVMTypeRef hty = LLVMFunctionType(T_void, ps, 3, false);
             trap_hook = LLVMAddFunction(mod, "ph_on_trap", hty);
             LLVMSetLinkage(trap_hook, LLVMExternalWeakLinkage);
             LLVMBasicBlockRef call_bb = LLVMAppendBasicBlockInContext(ctx, fn, "hook");
@@ -324,8 +454,8 @@ static void call_trap_site(LLVMValueRef site) {
             LLVMValueRef has = LLVMBuildICmp(B, LLVMIntNE, trap_hook, LLVMConstNull(T_ptr), "");
             LLVMBuildCondBr(B, has, call_bb, done_bb);
             LLVMPositionBuilderAtEnd(B, call_bb);
-            LLVMValueRef args[2] = {sp, trap_info_global()};
-            LLVMBuildCall2(B, hty, trap_hook, args, 2, "");
+            LLVMValueRef args[3] = {sp, trap_info_global(), stack_traces_on() ? ss_ptr() : LLVMConstNull(T_ptr)};
+            LLVMBuildCall2(B, hty, trap_hook, args, 3, "");
             LLVMBuildBr(B, done_bb);
             LLVMPositionBuilderAtEnd(B, done_bb);
         }
@@ -538,6 +668,44 @@ static const char *mangle_prefix(Decl *d) {
     return arena_strndup(base, n);
 }
 
+// Owner.[A].name.[B], or test "name".
+static const char *fn_display(Decl *d, Type **gargs, int n) {
+    if (d->is_test) return arena_printf("test \"%s\"", d->test_name);
+    CharVec b = {0};
+#define PUTS(str)                                    \
+    do {                                             \
+        for (const char *q_ = (str); *q_; q_++) vec_push(b, *q_); \
+    } while (0)
+    int nowner = d->owner ? d->owner->gparams.len : 0;
+    if (d->owner) {
+        PUTS(d->owner->name);
+        if (nowner) {
+            PUTS(".[");
+            for (int i = 0; i < nowner && i < n; i++) {
+                if (i) PUTS(", ");
+                PUTS(type_str(gargs[i]));
+            }
+            PUTS("]");
+        }
+        PUTS(".");
+    }
+    PUTS(d->name);
+    int nown = d->kind == D_HOST_FN ? 0 : d->gparams.len;
+    if (nown) {
+        PUTS(".[");
+        for (int i = n - nown; i < n; i++) {
+            if (i > n - nown) PUTS(", ");
+            PUTS(type_str(gargs[i]));
+        }
+        PUTS("]");
+    }
+#undef PUTS
+    vec_push(b, 0);
+    const char *r = arena_strndup(b.data, strlen(b.data));
+    free(b.data);
+    return r;
+}
+
 static LLVMValueRef global_ref(Decl *d) {
     Sym k = ptr_key(d);
     LLVMValueRef g = symmap_get(&global_vals, k);
@@ -575,6 +743,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         if (gargs[i]->has_params) internal_error("generic instance with unsubstituted arguments");
     fi->fnty = n ? type_subst(d->type, d->all_gparams, gargs, n) : d->type;
     fi->llty = fn_lty(fi->fnty, &fi->sret);
+    fi->display = fn_display(d, gargs, n);
     const char *name;
     if (d->kind == D_HOST_FN) {
         name = d->name;
@@ -719,6 +888,7 @@ static void gen_return(Expr *e) {
     if (e) {
         v = gen(e);
         if (terminated()) return;
+        if (F->ret->kind == TY_ERRUNION) etrace_push(LLVMBuildExtractValue(B, v, 0, ""));
     } else if (F->ret->kind == TY_ERRUNION) {
         v = errunion_value(F->ret, LLVMConstInt(T_i16, 0, false), NULL);
     }
@@ -1012,7 +1182,7 @@ static LLVMValueRef gen_addr_inner(Expr *e) {
 // Calls
 // ---------------------------------------------------------------------------
 static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool sret, LLVMValueRef *argv, int argc,
-                              Type **argt) {
+                              Type **argt, const char *callee) {
     int n = argc + (sret ? 1 : 0);
     LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
     int k = 0;
@@ -1022,7 +1192,9 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
         av[k++] = ret_tmp;
     }
     for (int i = 0; i < argc; i++) av[k++] = by_ptr(argt[i]) ? spill(argt[i], argv[i]) : argv[i];
+    SsFrame sf = ss_push(callee);
     LLVMValueRef r = LLVMBuildCall2(B, fty, fn, av, (unsigned)n, "");
+    ss_pop(sf);
     add_ext_attrs(r, fnty, sret, true);
     if (sret) return load(fnty->ret, ret_tmp, false);
     if (fnty->ret->kind == TY_VOID) return NULL;
@@ -1049,7 +1221,7 @@ static LLVMValueRef gen_call(Expr *e) {
         for (int i = 0; i < n; i++) av[i] = gen(e->args.data[i]);
         bool sret;
         LLVMTypeRef fty = fn_lty(ft, &sret);
-        return emit_call(fty, fp, ft, sret, av, n, ft->params);
+        return emit_call(fty, fp, ft, sret, av, n, ft->params, NULL);
     }
     Decl *d = e->decl;
     FnInst *fi = get_inst(d, subst_gargs(e->gargs, e->ngargs), e->ngargs);
@@ -1077,7 +1249,7 @@ static LLVMValueRef gen_call(Expr *e) {
         for (int i = 0; i < n; i++)
             argt[i] = i < fi->fnty->nparams ? fi->fnty->params[i] : ct(e->args.data[i - (e->b ? 1 : 0)]->type);
     }
-    return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, argt);
+    return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, argt, fi->display);
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1263,7 @@ static LLVMValueRef gen_try(Expr *e) {
     LLVMBasicBlockRef err_bb = new_bb("try.err"), ok_bb = new_bb("try.ok");
     LLVMBuildCondBr(B, is_err, err_bb, ok_bb);
     LLVMPositionBuilderAtEnd(B, err_bb);
+    etrace_push(code);
     LLVMValueRef rv = errunion_value(F->ret, code, NULL);
     emit_defers(0);
     if (!terminated()) emit_ret(rv);
@@ -1108,6 +1281,7 @@ static LLVMValueRef gen_catch(Expr *e) {
     LLVMBasicBlockRef err_bb = new_bb("catch.err"), ok_bb = new_bb("catch.ok"), merge = new_bb("catch.end");
     LLVMBuildCondBr(B, is_err, err_bb, ok_bb);
     LLVMPositionBuilderAtEnd(B, err_bb);
+    etrace_clear();
     if (e->capture_local) store(t_error, code, local_ptr(e->capture_local), false);
     LLVMValueRef hv = NULL;
     LLVMBasicBlockRef hbb = NULL;
@@ -1757,6 +1931,17 @@ static void emit_thread_start(void) {
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
     LLVMPositionBuilderAtEnd(B, bb);
     LLVMValueRef top = LLVMGetParam(fn, 2);
+    if (stack_traces_on()) {
+        // The thread's shadow stack sits at the top of its stack.
+        LLVMTypeRef t = ss_type();
+        unsigned long long size = (LLVMABISizeOfType(TD, t) + 15) & ~15ull;
+        LLVMValueRef neg = LLVMConstInt(T_isz, (unsigned long long)-(long long)size, true);
+        LLVMValueRef base = LLVMBuildGEP2(B, T_i8, top, &neg, 1, "");
+        LLVMBuildMemSet(B, base, LLVMConstInt(T_i8, 0, false), usz((int64_t)size), 16);
+        ss_ptr();
+        LLVMBuildStore(B, base, ss_global);
+        top = base;
+    }
     intrinsic("llvm.stackrestore", &T_ptr, 1, &top, 1);
     LLVMTypeRef ety = LLVMFunctionType(T_void, &T_ptr, 1, false);
     LLVMValueRef arg = LLVMGetParam(fn, 1);
@@ -2735,6 +2920,13 @@ static LLVMValueRef add_export(const char *name, LLVMTypeRef ret, LLVMTypeRef *p
     return fn;
 }
 
+// phalange_shadow_stack(): the calling thread's shadow stack record (see
+// ss_ptr), or null when built with --stack-traces=off.
+static void emit_shadow_stack_export(void) {
+    add_export("phalange_shadow_stack", T_ptr, NULL, 0);
+    LLVMBuildRet(B, stack_traces_on() ? ss_ptr() : LLVMConstNull(T_ptr));
+}
+
 // phalange_trap_info(): address of {site, kind, a, b, alen, blen} (64-bit
 // fields); `site` points at {code, file_id, start, end, line, col, file, text}.
 static void emit_trap_info_export(void) {
@@ -2836,6 +3028,7 @@ bool codegen_program(CgOptions *o) {
     }
     if (g_test_mode) emit_test_exports();
     if (g_target.wasm) emit_trap_info_export();
+    emit_shadow_stack_export();
     while (pending_head) {
         FnInst *fi = pending_head;
         pending_head = fi->next;

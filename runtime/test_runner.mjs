@@ -4,7 +4,8 @@
 //   node runtime/test_runner.mjs tests.wasm [--filter=text] [--timeout=ms]
 //
 // Prints one line per test in the protocol read by `phalange test`:
-//   PHT <index> <status> <code> <file_id> <start> <end> <ms> <message> <output>
+//   PHT <index> <status> <code> <file_id> <start> <end> <ms> <message> <output> <stack>
+// (<stack>: see test_main.c, encode_stack)
 // (tab-separated; tabs, newlines and backslashes in fields are escaped).
 import fs from 'fs';
 import os from 'os';
@@ -59,6 +60,6 @@ await Promise.all(Array.from({ length: width }, pool));
 for (const i of selected) {
   const r = results.get(i);
   process.stdout.write(['PHT', i, r.status, r.code || '', r.fileId ?? -1, r.start ?? 0, r.end ?? 0, r.ms,
-    esc(r.message), esc(r.output)].join('\t') + '\n');
+    esc(r.message), esc(r.output), esc(r.stack)].join('\t') + '\n');
 }
 module; // (compiled once above to validate the file early)

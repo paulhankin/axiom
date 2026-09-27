@@ -1345,7 +1345,7 @@ A trap stops the program **immediately**, including every other thread (§12.8):
 
 - `defer` blocks do not run.
 - The host observes the trap (in JavaScript, a `WebAssembly.RuntimeError`).
-- In debug builds, the trap site maps to a trap code and source span (§17.4).
+- The trap site maps to a trap code, a source span and a stack trace (§17.4).
 
 Appendix B lists every trap condition.
 
@@ -1950,23 +1950,82 @@ Initial registry, not exhaustive:
 | E0825 | `@expect_eq` operand type cannot be compared |
 | E0901 | Forbidden instruction in inline WASM |
 
-### 17.4 Runtime trap reporting
+### 17.4 Runtime trap reporting and stack traces
 
 Every trap site carries a constant **site record**: trap code, source file, byte span,
-line, column, and the text of the failing expression. Before trapping, the program
-stores the record's address in a trap-info block, together with the compared values
-for `@expect_eq`.
+line, column, the text of the failing expression, and the name of the enclosing
+function. Before trapping, the program stores the record's address in a trap-info
+block, together with the compared values for `@expect_eq`.
 
 - On WebAssembly the block is reachable through the export `phalange_trap_info`.
 - On native targets it is passed to the weak hook `ph_on_trap`.
 
-Hosts use this to report, for example,
-`trap T0001 (index out of bounds): xs[i] at main.ph:3:12`. Traps raised by the engine
-itself are mapped to their codes: out-of-bounds memory is `T0005`, stack exhaustion
-`T0008`, and a bad `call_indirect` `T0009`.
+Traps raised by the engine or the OS rather than by a check are mapped to their codes:
+out-of-bounds memory is `T0005`, stack exhaustion `T0008`, and a bad `call_indirect`
+`T0009`.
 
-Debug builds MAY also record an **error return trace**: the list of `!` and
-`return error.X` sites an error passed through.
+#### 17.4.1 Stack traces
+
+Every trap and crash is reported with a **stack trace**:
+
+```
+phalange: trap T0001 (index out of bounds): xs[i] at main.ph:4:12
+stack trace (innermost first):
+  at get (main.ph:4:12)
+  at sum (main.ph:10:14)
+  at main (main.ph:29:12)
+```
+
+The trace is built from a **shadow stack**, not by unwinding the machine stack:
+
+- Each thread has a small record: a call depth, a ring of the innermost 256
+  call-site records, and a ring of 32 error-return records.
+- Each call writes its call-site record (location, calling function, called
+  function) at `depth % 256` and increments `depth`. When the call returns, `depth`
+  goes back to its old value. No code runs at function entry or exit, and
+  inlining does not remove frames.
+- After a trap, the frames are still in place, because nothing unwinds them. A host
+  reads them through the export `phalange_shadow_stack()` (WebAssembly) or the third
+  argument of `ph_on_trap` (native).
+- Faults that aren't checks also get a trace: an engine trap on WebAssembly, or
+  `SIGSEGV`, `SIGBUS` or `SIGFPE` on native targets, which the native runtime catches
+  on an alternate signal stack. Stack exhaustion is reported as `T0008` on both
+  targets.
+- Consecutive identical frames are collapsed ("the frame above repeats N more
+  times"). Frames beyond the ring's 256 entries are counted, not shown.
+
+Why a shadow stack, when WebAssembly engines and native debuggers can already walk
+stacks:
+
+1. **Portability.** It works the same on every engine and OS and needs no debug
+   information in the binary.
+2. **Exact source locations.** A call site is recorded as a Phalange source span, not
+   as a machine address that must be mapped back to source.
+3. **It doubles as the profiler's stack sampler** (§17.6).
+
+The cost is three stores and one load per call. On call-heavy microbenchmarks (for
+example, a naive recursive Fibonacci) it roughly doubles run time. On typical code it
+is within measurement noise. Stack traces are on by default, and
+`--stack-traces=off` removes the instrumentation.
+
+Traces are diagnostics only: whether they are on never changes a program's
+behavior. Record contents and layouts are toolchain ABI, not language semantics.
+
+#### 17.4.2 Error return traces
+
+Every `return` of an error value and every `!` that propagates an error appends a
+site to the thread's error-return ring. A `catch` that handles an error clears the
+ring. When a test fails because it returned an error, the trace shows where the
+error started and the path it took:
+
+```
+FAIL parse config (1 ms)
+     config.ph:40:6: error test returned error.BadSyntax
+     error return trace (oldest first):
+       lexer.ph:88:13 in next_token: return error.BadSyntax;
+       config.ph:21:17 in parse: let t = lex.next_token()!;
+       config.ph:41:9 in test "parse config": _ = parse(text)!;
+```
 
 ### 17.5 Canonical formatting
 
@@ -2304,6 +2363,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C26 | A NUL byte follows every string literal (not part of the slice) | Found while testing the FFI: passing `"%s".ptr` to C read past the end of the literal |
 | C27 | `test` blocks, `@expect`/`@expect_eq`, `phalange test`, and trap site records (§17.4, §18) | The user asked for testing support (formerly open question Q11) |
 | C28 | Packages: `phalange.toml`, `pkg:` imports, path and pinned-git dependencies, one source per name (§4.6) | The user asked for packages |
+| C29 | Stack traces from a per-thread shadow stack, and error return traces (§17.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
 
 ---
 

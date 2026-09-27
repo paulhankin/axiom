@@ -37,7 +37,8 @@ static void usage(void) {
             "       phalange new <name>      create a package skeleton\n"
             "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
-            "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
+            "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
+            "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
 }
 
 static bool file_exists(const char *p) { return access(p, R_OK) == 0; }
@@ -168,6 +169,95 @@ static const char *source_line(Span sp) {
     return arena_strndup(f->text + a, b - a);
 }
 
+// Stack frames from the test runner (see runtime/test_main.c: encode_stack).
+typedef struct TFrame {
+    char kind;  // T trap site, C call, U innermost function (no location), E error return, R repeat, O omitted
+    long count;
+    Span sp;
+    bool has_span;
+    const char *fn;
+} TFrame;
+
+static int parse_frames(char *s, TFrame *out, int cap) {
+    int n = 0;
+    while (s && *s && n < cap) {
+        char *end = strchr(s, '\x1e');
+        if (end) *end = 0;
+        char *f[5] = {0};
+        int nf = 0;
+        for (char *p = s; nf < 5;) {
+            f[nf++] = p;
+            char *t = strchr(p, '\x1f');
+            if (!t) break;
+            *t = 0;
+            p = t + 1;
+        }
+        if (nf == 5) {
+            TFrame fr = {.kind = f[0][0], .fn = f[4]};
+            long a = strtol(f[1], NULL, 10);
+            if (fr.kind == 'R' || fr.kind == 'O') {
+                fr.count = a;
+            } else if (a >= 0 && a < g_files.len) {
+                fr.sp = (Span){(int)a, (uint32_t)strtoul(f[2], NULL, 10), (uint32_t)strtoul(f[3], NULL, 10)};
+                fr.has_span = fr.kind != 'U';
+            }
+            out[n++] = fr;
+        }
+        s = end ? end + 1 : NULL;
+    }
+    return n;
+}
+
+static void print_frames_human(TFrame *fr, int n, bool errors) {
+    if (!n) return;
+    printf(errors ? "     error return trace (oldest first):\n" : "     stack trace (innermost first):\n");
+    for (int i = 0; i < n; i++) {
+        TFrame *f = &fr[i];
+        if (f->kind == 'R') {
+            printf("       ... the frame above repeats %ld more time%s\n", f->count, f->count == 1 ? "" : "s");
+        } else if (f->kind == 'O') {
+            printf("       ... %ld more frames\n", f->count);
+        } else if (!f->has_span) {
+            printf("       at %s\n", f->fn);
+        } else {
+            int sl, sc, el, ec;
+            span_linecol(f->sp, &sl, &sc, &el, &ec);
+            if (errors)
+                printf("       %s:%d:%d in %s: %s\n", g_files.data[f->sp.file]->display, sl, sc, f->fn, source_line(f->sp));
+            else
+                printf("       at %s (%s:%d:%d)\n", f->fn, g_files.data[f->sp.file]->display, sl, sc);
+        }
+    }
+}
+
+static void print_frames_json(TFrame *fr, int n) {
+    printf("[");
+    for (int i = 0; i < n; i++) {
+        TFrame *f = &fr[i];
+        if (i) printf(",");
+        if (f->kind == 'R') {
+            printf("{\"repeat\":%ld}", f->count);
+            continue;
+        }
+        if (f->kind == 'O') {
+            printf("{\"omitted\":%ld}", f->count);
+            continue;
+        }
+        printf("{\"function\":");
+        json_str_out(f->fn);
+        if (f->has_span) {
+            int sl, sc, el, ec;
+            span_linecol(f->sp, &sl, &sc, &el, &ec);
+            printf(",\"file\":");
+            json_str_out(g_files.data[f->sp.file]->display);
+            printf(",\"line\":%d,\"col\":%d,\"context\":", sl, sc);
+            json_str_out(source_line(f->sp));
+        }
+        printf("}");
+    }
+    printf("]");
+}
+
 static int run_tests(const char *bin, const char *std_dir, const char *filter, const char *timeout, bool json) {
     Vec(char *) av = {0};
     if (g_target.wasm) {
@@ -203,9 +293,9 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
             line = nl ? nl + 1 : NULL;
             continue;
         }
-        char *f[11] = {0};
+        char *f[12] = {0};
         int nf = 0;
-        for (char *p = line; nf < 11;) {
+        for (char *p = line; nf < 12;) {
             f[nf++] = p;
             char *t = strchr(p, '\t');
             if (!t) break;
@@ -226,6 +316,9 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
         const char *ms = f[7];
         char *msg = unescape(f[8]);
         char *output = unescape(f[9] ? f[9] : (char *)"");
+        TFrame frames[128];
+        int nframes = parse_frames(f[10] ? unescape(f[10]) : NULL, frames, 128);
+        bool etrace = nframes && frames[0].kind == 'E';
         const char *tfile = g_files.data[d->name_span.file]->display;
         int sl, sc, el, ec;
         span_linecol(sp, &sl, &sc, &el, &ec);
@@ -247,6 +340,10 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
                        "\"start_byte\":%u,\"end_byte\":%u},\"context\":",
                        sl, sc, el, ec, sp.start, sp.end);
                 json_str_out(source_line(sp));
+                if (nframes) {
+                    printf(etrace ? ",\"error_trace\":" : ",\"stack\":");
+                    print_frames_json(frames, nframes);
+                }
                 printf("}");
             }
             printf(",\"output\":");
@@ -257,6 +354,7 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
             if (!pass) {
                 printf("     %s:%d:%d: %s %s\n", g_files.data[sp.file]->display, sl, sc, code, msg);
                 printf("         %s\n", source_line(sp));
+                print_frames_human(frames, nframes, etrace);
                 if (*output) {
                     printf("     output:\n");
                     for (char *o = output; *o;) {
@@ -300,7 +398,7 @@ int main(int argc, char **argv) {
     }
     const char *input = NULL, *out = NULL, *std_dir = NULL, *target = "wasm32", *emit = "exe";
     bool json = false;
-    CgOptions co = {0};
+    CgOptions co = {.stack_traces = true};
     Vec(char *) link_inputs = {0};
     Vec(char *) link_flags = {0};  // -l / -L
     Vec(char *) inc_flags = {0};   // -I, for C sources
@@ -315,6 +413,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--overflow=trap")) co.overflow_saturate = false;
         else if (!strcmp(a, "--overflow=saturate")) co.overflow_saturate = true;
         else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
+        else if (!strcmp(a, "--stack-traces=on")) co.stack_traces = true;
+        else if (!strcmp(a, "--stack-traces=off")) co.stack_traces = false;
         else if (!strcmp(a, "--format=agent-json")) json = true;
         else if (!strcmp(a, "--format=human")) json = false;
         else if (!strncmp(a, "--std=", 6)) std_dir = a + 6;
@@ -515,13 +615,9 @@ int main(int argc, char **argv) {
             if (rc == 0) rc = run(av.data);
             for (int i = 0; i < c_objs.len; i++) unlink(c_objs.data[i]);
         } else {
-            // Programs that use the Phalange host ABI (std/io, std/net) get the
-            // native implementation of it linked in.
-            bool uses_host_abi = false;
-            for (int i = 0; i < g_prog.host_fns.len; i++)
-                if (g_prog.host_fns.data[i]->host_module && !strcmp(g_prog.host_fns.data[i]->host_module, "phalange"))
-                    uses_host_abi = true;
-            if (uses_host_abi || g_needs_native_runtime) {
+            // Every native executable gets the native runtime: the host ABI
+            // (std/io, std/net, threads) and crash reporting (spec §17.4).
+            {
                 const char *rt = arena_printf("%s/../runtime/native_host.c", so.std_dir);
                 if (!file_exists(rt)) {
                     unlink(objpath);

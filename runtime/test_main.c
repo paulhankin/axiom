@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -21,12 +22,84 @@ const char *phalange_error_name(uint32_t code);
 
 static int result_fd = -1;
 
+const struct ph_shadow_stack *phalange_shadow_stack(void);
+
+// Stack frames in the PHT protocol: frames separated by \x1e, fields by \x1f:
+// kind (T trap site, C call, E error return, R repeat, O omitted), file id,
+// start, end, function.
+static size_t put_frame(char *out, size_t cap, char kind, const struct ph_trap_site *s, long count) {
+    int k = s ? snprintf(out, cap, "%c\x1f%u\x1f%u\x1f%u\x1f%s\x1e", kind, s->file_id, s->start, s->end, s->fn)
+              : snprintf(out, cap, "%c\x1f%ld\x1f" "0\x1f" "0\x1f\x1e", kind, count);
+    return k > 0 && (size_t)k < cap ? (size_t)k : 0;
+}
+
+static size_t encode_stack(char *out, size_t cap, const struct ph_trap_site *top, const struct ph_shadow_stack *ss) {
+    size_t n = 0;
+    if (cap) out[0] = 0;
+    if (top) n += put_frame(out + n, cap - n, 'T', top, 0);
+    if (!ss) return n;
+    uint32_t depth = ss->depth;
+    int shown = 0;
+    for (int64_t i = (int64_t)depth - 1; i >= 0 && i >= (int64_t)depth - PH_SS_CAP; i--) {
+        const struct ph_trap_site *c = ss->calls[i & (PH_SS_CAP - 1)];
+        if (!c) continue;
+        if (!top && n == 0) n += put_frame(out + n, cap - n, 'U', c, 0);  // innermost function, location unknown
+        if (shown >= 40) return n + put_frame(out + n, cap - n, 'O', NULL, (long)i + 1);
+        int64_t j = i;
+        while (j - 1 >= 0 && j - 1 >= (int64_t)depth - PH_SS_CAP && ss->calls[(j - 1) & (PH_SS_CAP - 1)] == c) j--;
+        n += put_frame(out + n, cap - n, 'C', c, 0);
+        shown++;
+        if (j < i) {
+            n += put_frame(out + n, cap - n, 'R', NULL, (long)(i - j));
+            i = j;
+        }
+    }
+    if (depth > PH_SS_CAP) n += put_frame(out + n, cap - n, 'O', NULL, (long)(depth - PH_SS_CAP));
+    return n;
+}
+
+static size_t encode_errors(char *out, size_t cap, const struct ph_shadow_stack *ss) {
+    size_t n = 0;
+    if (cap) out[0] = 0;
+    if (!ss) return 0;
+    uint32_t first = ss->errors > PH_ET_CAP ? ss->errors - PH_ET_CAP : 0;
+    for (uint32_t i = first; i < ss->errors; i++)
+        if (ss->error_returns[i & (PH_ET_CAP - 1)]) n += put_frame(out + n, cap - n, 'E', ss->error_returns[i & (PH_ET_CAP - 1)], 0);
+    return n;
+}
+
 // Called by the trapping test (in the child) before it dies.
-void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info) {
-    char msg[1024], rec[1400];
+void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info, const struct ph_shadow_stack *ss) {
+    static char rec[32768];
+    char msg[1024];
     ph_format_trap(msg, sizeof msg, site, info);
-    int n = snprintf(rec, sizeof rec, "TRAP\t%u\t%u\t%u\t%u\t%s", site->code, site->file_id, site->start, site->end, msg);
-    if (result_fd >= 0 && n > 0) (void)!write(result_fd, rec, (size_t)n < sizeof rec ? (size_t)n : sizeof rec - 1);
+    int n = snprintf(rec, sizeof rec, "TRAP\t%u\t%u\t%u\t%u\t%s\t", site->code, site->file_id, site->start, site->end, msg);
+    if (n < 0 || (size_t)n >= sizeof rec) return;
+    n += (int)encode_stack(rec + n, sizeof rec - (size_t)n, site, ss);
+    if (result_fd >= 0) (void)!write(result_fd, rec, (size_t)n);
+}
+
+// Crashes other than traps (stack overflow, faults in C code): report the
+// shadow stack, then die from the signal.
+static void on_crash(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    static char rec[32768];
+    int code = 5;  // memory access out of bounds, unless the fault is at the stack's end
+    pthread_attr_t attr;
+    void *stk;
+    size_t stksz;
+    uintptr_t addr = (uintptr_t)si->si_addr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        if (pthread_attr_getstack(&attr, &stk, &stksz) == 0 && addr + 65536 >= (uintptr_t)stk &&
+            addr < (uintptr_t)stk + 65536)
+            code = 8;
+        pthread_attr_destroy(&attr);
+    }
+    int n = snprintf(rec, sizeof rec, "CRASH\t%d\t", code);
+    n += (int)encode_stack(rec + n, sizeof rec - (size_t)n, NULL, phalange_shadow_stack());
+    if (result_fd >= 0) (void)!write(result_fd, rec, (size_t)n);
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static void put_escaped(const char *s, size_t n) {
@@ -70,9 +143,19 @@ int main(int argc, char **argv) {
             result_fd = res[1];
             struct itimerval it = {{0, 0}, {timeout_ms / 1000, (timeout_ms % 1000) * 1000}};
             setitimer(ITIMER_REAL, &it, NULL);
+            static char altstack[65536];
+            stack_t alt = {.ss_sp = altstack, .ss_size = sizeof altstack};
+            sigaltstack(&alt, NULL);
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_crash;
+            sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
+            sigaction(SIGSEGV, &sa, NULL);
+            sigaction(SIGBUS, &sa, NULL);
             uint32_t code = phalange_test_run(i);
-            char rec[64];
-            int k = snprintf(rec, sizeof rec, "DONE\t%u", code);
+            static char rec[8192];
+            int k = snprintf(rec, sizeof rec, "DONE\t%u\t", code);
+            if (code) k += (int)encode_errors(rec + k, sizeof rec - (size_t)k, phalange_shadow_stack());
             (void)!write(res[1], rec, (size_t)k);
             _exit(0);
         }
@@ -107,13 +190,16 @@ int main(int argc, char **argv) {
         waitpid(pid, &status, 0);
         double ms = now_ms() - t0;
         const char *st = "pass", *code = "";
+        const char *stack = "";
         char msg[1500] = "";
         unsigned file_id = (unsigned)-1, start = 0, end = 0;
         if (resbuf && !strncmp(resbuf, "DONE\t", 5)) {
-            unsigned ec = (unsigned)strtoul(resbuf + 5, NULL, 10);
+            char *endp;
+            unsigned ec = (unsigned)strtoul(resbuf + 5, &endp, 10);
             if (ec) {
                 st = "fail";
                 code = "error";
+                if (*endp == '\t') stack = endp + 1;
                 snprintf(msg, sizeof msg, "test returned error.%s", phalange_error_name(ec));
             } else if (expect != -1) {
                 st = "fail";
@@ -124,7 +210,10 @@ int main(int argc, char **argv) {
         } else if (resbuf && !strncmp(resbuf, "TRAP\t", 5)) {
             unsigned tc;
             char text[1400] = "";
-            sscanf(resbuf + 5, "%u\t%u\t%u\t%u\t%1399[^\n]", &tc, &file_id, &start, &end, text);
+            sscanf(resbuf + 5, "%u\t%u\t%u\t%u\t%1399[^\t]", &tc, &file_id, &start, &end, text);
+            char *tab = resbuf + 5;
+            for (int f = 0; f < 5 && tab; f++) tab = strchr(tab + (f ? 1 : 0), '\t');
+            if (tab) stack = tab + 1;
             if (expect == -2 || expect == (int)tc) {
                 file_id = (unsigned)-1;
             } else {
@@ -138,6 +227,11 @@ int main(int argc, char **argv) {
         } else if (WIFSIGNALED(status)) {
             int sig = WTERMSIG(status);
             int tc = sig == SIGSEGV || sig == SIGBUS ? 5 : 0;
+            if (resbuf && !strncmp(resbuf, "CRASH\t", 6)) {
+                tc = atoi(resbuf + 6);
+                char *tab = strchr(resbuf + 6, '\t');
+                if (tab) stack = tab + 1;
+            }
             if (sig == SIGALRM) {
                 st = "fail";
                 code = "timeout";
@@ -160,6 +254,8 @@ int main(int argc, char **argv) {
         put_escaped(msg, strlen(msg));
         putchar('\t');
         if (outbuf) put_escaped(outbuf, outlen);
+        putchar('\t');
+        if (strcmp(st, "pass")) put_escaped(stack, strlen(stack));
         putchar('\n');
         free(outbuf);
         free(resbuf);

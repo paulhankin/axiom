@@ -12,6 +12,7 @@ typedef struct CgOptions {
     const char *cpu;         // NULL = generic
     EmitKind emit;
     const char *out_path;    // file to write
+    bool stack_traces;       // shadow stack for traces and profiles (--stack-traces=on, default)
 } CgOptions;
 
 // Generates code for the checked program. Returns false on failure

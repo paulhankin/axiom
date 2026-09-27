@@ -157,6 +157,46 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
 }
 
+// Stack traces (spec §17.4): `// stack:` and `// errors:` lines in
+// tests/traces/traces.ph give the expected frames of each failing test, and
+// tests/traces/crash.ph must report a stack overflow with its stack.
+{
+  const f = path.join(root, 'tests/traces/traces.ph');
+  const name = 'tests/traces/traces.ph [stack traces]';
+  if (!filter || name.includes(filter)) {
+    const src = fs.readFileSync(f, 'utf8');
+    const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...extraFlags], { encoding: 'utf8' });
+    let problem = null;
+    let json = null;
+    try { json = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
+    const render = (frames) => frames.map((x) => (x.repeat ? `~${x.repeat}` : x.omitted ? null : x.line ? `${x.function}@${x.line}` : x.function))
+      .filter((x) => x !== null).join(' ');
+    for (const [, kind, tname, want] of json ? src.matchAll(/^\/\/ (stack|errors): (.+?) \| (.+)$/gm) : []) {
+      const t = json.tests.find((x) => x.name === tname);
+      const frames = t && t.failure && (kind === 'stack' ? t.failure.stack : t.failure.error_trace);
+      const got = frames ? render(frames) : '(none)';
+      if (got !== want.trim()) { problem = `"${tname}" ${kind}:\n  expected ${want.trim()}\n  got      ${got}`; break; }
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+  const cname = 'tests/traces/crash.ph [crash report]';
+  if (!filter || cname.includes(filter)) {
+    const out = path.join(tmp, 'crash' + (native ? '' : '.wasm'));
+    const b = spawnSync(compiler, ['build', path.join(root, 'tests/traces/crash.ph'), '-o', out, ...(native ? ['--target=native'] : []), ...extraFlags], { encoding: 'utf8' });
+    let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
+    if (!problem) {
+      const r = native ? spawnSync(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \(tests\/traces\/crash\.ph:4:12\)/,
+        /the frame above repeats 255 more times/, /\.\.\. \d+ more frames/];
+      for (const w of want) if (!w.test(r.stderr)) { problem = `stderr lacks ${w}:\n${r.stderr}`; break; }
+      if (!problem && r.status === 0) problem = 'the program exited normally';
+    }
+    if (problem) { fail++; failures.push(`FAIL ${cname}: ${problem}`); console.log(`FAIL ${cname}`); }
+    else { pass++; console.log(`ok   ${cname}`); }
+  }
+}
+
 // Packages (spec §4.6): builds from a package directory, dependency
 // visibility, name conflicts, manifests, git dependencies, `phalange new`.
 {

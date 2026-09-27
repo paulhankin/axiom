@@ -32,24 +32,11 @@ export function describeTrap(instance, memory, err) {
   const info = instance && instance.exports.phalange_trap_info;
   if (info && memory) {
     const dv = new DataView(memory.buffer);
-    const base = info() >>> 0;
+    const base = Number(info());
     const site = Number(dv.getBigUint64(base, true));
     if (site) {
-      const cstr = (p) => {
-        const u = new Uint8Array(memory.buffer);
-        let e = p;
-        while (u[e]) e++;
-        return Buffer.from(u.subarray(p, e)).toString('utf8');
-      };
-      const wide = !!instance.exports.phalange_wasm64;
-      const code = dv.getUint32(site, true);
-      t = {
-        code, name: TRAP_NAMES[code] || 'trap',
-        fileId: dv.getUint32(site + 4, true), start: dv.getUint32(site + 8, true), end: dv.getUint32(site + 12, true),
-        line: dv.getUint32(site + 16, true), col: dv.getUint32(site + 20, true),
-        file: cstr(wide ? Number(dv.getBigUint64(site + 24, true)) : dv.getUint32(site + 24, true)),
-        text: cstr(wide ? Number(dv.getBigUint64(site + 32, true)) : dv.getUint32(site + 28, true)),
-      };
+      t = readSite(instance, memory, site);
+      t.name = TRAP_NAMES[t.code] || 'trap';
       const kind = Number(dv.getBigUint64(base + 8, true));
       if (kind) t.values = formatValues(kind, dv, base, memory, instance);
       dv.setBigUint64(base, 0n, true);  // consumed
@@ -66,7 +53,103 @@ export function describeTrap(instance, memory, err) {
     t = { code, name: TRAP_NAMES[code], engineMessage: msg };
   }
   t.codeName = trapCodeName(t.code);
+  t.stack = readStack(instance, memory);
   return t;
+}
+
+// Site records (see codegen: site_record_ex):
+//   {u32 code, file_id, start, end, line, col; ptr file, text, fn, callee}
+function reader(instance, memory) {
+  const wide = !!(instance && instance.exports.phalange_wasm64);
+  const P = wide ? 8 : 4;
+  const dv = new DataView(memory.buffer);
+  const u = new Uint8Array(memory.buffer);
+  const ptr = (a) => (wide ? Number(dv.getBigUint64(a, true)) : dv.getUint32(a, true));
+  const cstr = (p) => {
+    if (!p || p >= u.length) return '';
+    let e = p;
+    while (e < u.length && u[e]) e++;
+    return Buffer.from(u.subarray(p, e)).toString('utf8');
+  };
+  return { P, dv, ptr, cstr };
+}
+
+export function readSite(instance, memory, addr) {
+  const { P, dv, ptr, cstr } = reader(instance, memory);
+  return {
+    code: dv.getUint32(addr, true), fileId: dv.getUint32(addr + 4, true),
+    start: dv.getUint32(addr + 8, true), end: dv.getUint32(addr + 12, true),
+    line: dv.getUint32(addr + 16, true), col: dv.getUint32(addr + 20, true),
+    file: cstr(ptr(addr + 24)), text: cstr(ptr(addr + 24 + P)),
+    fn: cstr(ptr(addr + 24 + 2 * P)), callee: cstr(ptr(addr + 24 + 3 * P)),
+  };
+}
+
+export const SS_CAP = 256, ET_CAP = 32;
+
+// The calling thread's shadow stack (spec §17.4): {depth, calls (innermost
+// first), errors (oldest first)}, or null if the program has none.
+export function readStack(instance, memory) {
+  const f = instance && instance.exports.phalange_shadow_stack;
+  if (!f || !memory) return null;
+  const base = Number(f());
+  if (!base) return null;
+  const { P, dv, ptr } = reader(instance, memory);
+  const depth = dv.getUint32(base, true), nerr = dv.getUint32(base + 4, true);
+  const calls = [], errors = [];
+  for (let i = depth - 1; i >= 0 && i >= depth - SS_CAP; i--) {
+    const a = ptr(base + 8 + (i & (SS_CAP - 1)) * P);
+    if (a) calls.push(readSite(instance, memory, a));
+  }
+  for (let i = Math.max(0, nerr - ET_CAP); i < nerr; i++) {
+    const a = ptr(base + 8 + SS_CAP * P + (i & (ET_CAP - 1)) * P);
+    if (a) errors.push(readSite(instance, memory, a));
+  }
+  return { depth, calls, errors };
+}
+
+// Frames, innermost first: {fn, file, line, col, fileId, start, end} (the
+// location is missing when it is unknown), plus {repeat: n} and
+// {omitted: n} markers. `top` is the trap site, if the program trapped.
+export function stackFrames(top, st, max = 40) {
+  const frames = [];
+  if (top && top.file) frames.push({ fn: top.fn, file: top.file, line: top.line, col: top.col, fileId: top.fileId, start: top.start, end: top.end });
+  else if (st && st.calls.length) frames.push({ fn: st.calls[0].callee || '<indirect call>' });
+  if (!st) return frames;
+  let shown = 0;
+  for (let i = 0; i < st.calls.length; i++) {
+    const c = st.calls[i];
+    let j = i;
+    while (j + 1 < st.calls.length && st.calls[j + 1].start === c.start && st.calls[j + 1].fileId === c.fileId && st.calls[j + 1].fn === c.fn) j++;
+    if (shown >= max) { frames.push({ omitted: st.depth - i }); return frames; }
+    frames.push({ fn: c.fn, file: c.file, line: c.line, col: c.col, fileId: c.fileId, start: c.start, end: c.end });
+    shown++;
+    if (j > i) { frames.push({ repeat: j - i }); i = j; }
+  }
+  if (st.depth > SS_CAP) frames.push({ omitted: st.depth - SS_CAP });
+  return frames;
+}
+
+export function formatFrames(frames, indent = '  ') {
+  return frames.map((f) => {
+    if (f.repeat) return `${indent}... the frame above repeats ${f.repeat} more time${f.repeat === 1 ? '' : 's'}`;
+    if (f.omitted) return `${indent}... ${f.omitted} more frame${f.omitted === 1 ? '' : 's'}`;
+    return `${indent}at ${f.fn || '?'}${f.file ? ` (${f.file}:${f.line}:${f.col})` : ''}`;
+  }).join('\n');
+}
+
+export function formatErrorTrace(st, indent = '  ') {
+  if (!st || !st.errors.length) return '';
+  return `${indent}error return trace (oldest first):\n` +
+    st.errors.map((e) => `${indent}  ${e.file}:${e.line}:${e.col} in ${e.fn}: ${e.text}`).join('\n');
+}
+
+// A full crash report: message, location and stack.
+export function formatTrap(t, where = '') {
+  let s = `phalange: ${trapMessage(t)}${where}${t.file ? ` at ${t.file}:${t.line}:${t.col}` : ''}`;
+  const frames = stackFrames(t, t.stack);
+  if (frames.length) s += '\nstack trace (innermost first):\n' + formatFrames(frames);
+  return s;
 }
 
 function formatValues(kind, dv, base, memory, instance) {
@@ -274,7 +357,7 @@ async function main() {
   } catch (e) {
     if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError)) throw e;
     const t = describeTrap(instance, host.memory(), e);
-    console.error(`phalange: ${trapMessage(t)}${t.file ? ` at ${t.file}:${t.line}:${t.col}` : ''}`);
+    console.error(formatTrap(t));
     code = 134;
   }
   host.close();

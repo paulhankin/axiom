@@ -6,7 +6,7 @@
 // the trapping thread ends the process itself.
 import fs from 'fs';
 import { workerData } from 'worker_threads';
-import { createHost, describeTrap, trapMessage } from './host.mjs';
+import { createHost, describeTrap, formatTrap } from './host.mjs';
 
 const { module, memory, entry, arg, stackTop } = workerData;
 const host = createHost({ memory });
@@ -16,7 +16,7 @@ try {
   instance.exports.phalange_thread_start(entry, arg, stackTop);
 } catch (e) {
   const t = describeTrap(instance, memory, e);
-  fs.writeSync(2, `phalange: ${trapMessage(t)} in thread${t.file ? ` at ${t.file}:${t.line}:${t.col}` : ''}\n`);
+  fs.writeSync(2, formatTrap(t, ' in thread') + '\n');
   process.kill(process.pid, 'SIGABRT');
 }
 host.close();
