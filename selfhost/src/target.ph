@@ -1,0 +1,330 @@
+// =============================================================================
+// target.ph - target architectures, CPUs and processor extensions.
+//
+//   --target=wasm32 | wasm64 | x86_64 | aarch64 | native
+//   --cpu=<name>          a preset set of extensions (see cpu_features)
+//   --features=+a,-b      add or remove individual extensions
+//
+// The backends consult has() to choose instructions; without an extension
+// they fall back to baseline sequences with the same results.
+// =============================================================================
+import "util.ph" as u;
+
+pub const ARCH_WASM32: i32 = 1;
+pub const ARCH_WASM64: i32 = 2;
+pub const ARCH_X64: i32 = 3;
+pub const ARCH_A64: i32 = 4;
+
+// x86-64 (SSE2 is always available)
+pub const X_SSE3: u64 = 0x1;
+pub const X_SSSE3: u64 = 0x2;
+pub const X_SSE41: u64 = 0x4;
+pub const X_SSE42: u64 = 0x8;
+pub const X_POPCNT: u64 = 0x10;
+pub const X_LZCNT: u64 = 0x20;
+pub const X_BMI1: u64 = 0x40;
+pub const X_BMI2: u64 = 0x80;
+pub const X_AVX: u64 = 0x100;
+pub const X_AVX2: u64 = 0x200;
+pub const X_FMA: u64 = 0x400;
+pub const X_CMPXCHG16B: u64 = 0x800;
+
+// AArch64 (FP and Advanced SIMD are always available)
+pub const A_LSE: u64 = 0x1;      // atomic memory operations (ARMv8.1)
+pub const A_RCPC: u64 = 0x2;     // load-acquire RCpc (ARMv8.3)
+pub const A_DOTPROD: u64 = 0x4;  // SDOT/UDOT (ARMv8.2)
+pub const A_CSSC: u64 = 0x8;     // common short sequence compression (abs, cnt, ctz, min/max on GPRs)
+
+// WebAssembly
+pub const W_SIMD128: u64 = 0x1;
+pub const W_BULK_MEMORY: u64 = 0x2;
+pub const W_NONTRAPPING_FPTOINT: u64 = 0x4;
+pub const W_SIGN_EXT: u64 = 0x8;
+pub const W_MUTABLE_GLOBALS: u64 = 0x10;
+pub const W_ATOMICS: u64 = 0x20;
+pub const W_MULTIVALUE: u64 = 0x40;
+pub const W_RELAXED_SIMD: u64 = 0x80;
+pub const W_TAIL_CALL: u64 = 0x100;
+
+pub let mut g_arch: i32 = 1;
+pub let mut g_features: u64 = 0;
+pub let mut g_cpu: []u8 = "";
+
+pub fn has(f: u64) bool {
+    return (g_features & f) == f;
+}
+
+// Fused multiply-add in hardware (otherwise @fma calls runtime/rt.ph).
+pub fn has_fma() bool {
+    if g_arch == ARCH_A64 {
+        return true;
+    }
+    if g_arch == ARCH_X64 {
+        return has(X_FMA);
+    }
+    return false;
+}
+
+pub fn is_wasm() bool {
+    return (g_arch == ARCH_WASM32) or (g_arch == ARCH_WASM64);
+}
+
+struct Feat {
+    name: []u8,
+    arch: i32,
+    bit: u64,
+}
+
+fn feats() []Feat {
+    let t = u.newn.[Feat](32);
+    let mut n: usize = 0;
+    let names = ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "lzcnt", "bmi", "bmi2", "avx", "avx2", "fma", "cx16",
+                 "lse", "rcpc", "dotprod", "cssc",
+                 "simd128", "bulk-memory", "nontrapping-fptoint", "sign-ext", "mutable-globals", "atomics", "multivalue",
+                 "relaxed-simd", "tail-call"];
+    let bits = [X_SSE3, X_SSSE3, X_SSE41, X_SSE42, X_POPCNT, X_LZCNT, X_BMI1, X_BMI2, X_AVX, X_AVX2, X_FMA, X_CMPXCHG16B,
+                A_LSE, A_RCPC, A_DOTPROD, A_CSSC,
+                W_SIMD128, W_BULK_MEMORY, W_NONTRAPPING_FPTOINT, W_SIGN_EXT, W_MUTABLE_GLOBALS, W_ATOMICS, W_MULTIVALUE,
+                W_RELAXED_SIMD, W_TAIL_CALL];
+    for i in 0..names.len {
+        let mut a = ARCH_X64;
+        if i >= 16 {
+            a = ARCH_WASM32;
+        } else if i >= 12 {
+            a = ARCH_A64;
+        }
+        t[n] = Feat.{ name: names[i], arch: a, bit: bits[i] };
+        n += 1;
+    }
+    return t[0..n];
+}
+
+fn same_family(a: i32, b: i32) bool {
+    if (a == ARCH_WASM32) or (a == ARCH_WASM64) {
+        return (b == ARCH_WASM32) or (b == ARCH_WASM64);
+    }
+    return a == b;
+}
+
+// Extension names for the current architecture (for messages).
+pub fn feature_names() []u8 {
+    let mut b = u.Buf.init();
+    for f in feats() {
+        if same_family(f.arch, g_arch) {
+            if b.len() > 0 {
+                b.s(", ");
+            }
+            b.s(f.name);
+        }
+    }
+    return b.done();
+}
+
+pub fn feature_bit(name: []u8) u64 {
+    for f in feats() {
+        if same_family(f.arch, g_arch) and u.str_eq(f.name, name) {
+            return f.bit;
+        }
+    }
+    return 0;
+}
+
+// The enabled extensions as "+a,+b".
+pub fn feature_string() []u8 {
+    let mut b = u.Buf.init();
+    for f in feats() {
+        if same_family(f.arch, g_arch) and has(f.bit) {
+            if b.len() > 0 {
+                b.s(",");
+            }
+            b.s("+");
+            b.s(f.name);
+        }
+    }
+    return b.done();
+}
+
+// The architecture this compiler runs on (from its own ELF header).
+pub fn host_arch() i32 {
+    let exe = u.read_file("/proc/self/exe");
+    if not u.isnos(exe) and (exe.len > 20) and (exe[18] == 183) {
+        return ARCH_A64;
+    }
+    return ARCH_X64;
+}
+
+pub fn host_triple() []u8 {
+    return triple_of(host_arch());
+}
+
+pub fn triple_of(a: i32) []u8 {
+    if a == ARCH_WASM32 {
+        return "wasm32-unknown-unknown";
+    }
+    if a == ARCH_WASM64 {
+        return "wasm64-unknown-unknown";
+    }
+    if a == ARCH_A64 {
+        return "aarch64-unknown-linux-gnu";
+    }
+    return "x86_64-unknown-linux-gnu";
+}
+
+// Extensions of the machine we run on, from /proc/cpuinfo (Linux).
+fn host_features(a: i32) u64 {
+    let info = u.read_file("/proc/cpuinfo");
+    if u.isnos(info) {
+        return 0;
+    }
+    // the first "flags" (x86) or "Features" (arm) line
+    let mut line: []u8 = "";
+    let mut i: usize = 0;
+    while i < info.len {
+        let mut j = i;
+        while (j < info.len) and (info[j] != '\n') {
+            j += 1;
+        }
+        let l = info[i..j];
+        if u.starts(l, "flags") or u.starts(l, "Features") {
+            line = l;
+            break;
+        }
+        i = j + 1;
+    }
+    let mut f: u64 = 0;
+    let mut k: usize = 0;
+    while k < line.len {
+        while (k < line.len) and ((line[k] == ' ') or (line[k] == '\t') or (line[k] == ':')) {
+            k += 1;
+        }
+        let st = k;
+        while (k < line.len) and (line[k] != ' ') and (line[k] != '\t') {
+            k += 1;
+        }
+        let w = line[st..k];
+        if a == ARCH_X64 {
+            if u.str_eq(w, "pni") {
+                f = f | X_SSE3;
+            } else if u.str_eq(w, "ssse3") {
+                f = f | X_SSSE3;
+            } else if u.str_eq(w, "sse4_1") {
+                f = f | X_SSE41;
+            } else if u.str_eq(w, "sse4_2") {
+                f = f | X_SSE42;
+            } else if u.str_eq(w, "popcnt") {
+                f = f | X_POPCNT;
+            } else if u.str_eq(w, "abm") {
+                f = f | X_LZCNT;
+            } else if u.str_eq(w, "bmi1") {
+                f = f | X_BMI1;
+            } else if u.str_eq(w, "bmi2") {
+                f = f | X_BMI2;
+            } else if u.str_eq(w, "avx") {
+                f = f | X_AVX;
+            } else if u.str_eq(w, "avx2") {
+                f = f | X_AVX2;
+            } else if u.str_eq(w, "fma") {
+                f = f | X_FMA;
+            } else if u.str_eq(w, "cx16") {
+                f = f | X_CMPXCHG16B;
+            }
+        } else {
+            if u.str_eq(w, "atomics") {
+                f = f | A_LSE;
+            } else if u.str_eq(w, "lrcpc") {
+                f = f | A_RCPC;
+            } else if u.str_eq(w, "asimddp") {
+                f = f | A_DOTPROD;
+            } else if u.str_eq(w, "cssc") {
+                f = f | A_CSSC;
+            }
+        }
+    }
+    return f;
+}
+
+// The extensions of a CPU preset; `ok` is false for an unknown name.
+pub struct CpuResult {
+    features: u64,
+    ok: bool,
+}
+
+pub fn cpu_features(a: i32, cpu: []u8) CpuResult {
+    let mut r = CpuResult.{ features: 0, ok: true };
+    if (a == ARCH_WASM32) or (a == ARCH_WASM64) {
+        let generic = W_SIMD128 | W_BULK_MEMORY | W_NONTRAPPING_FPTOINT | W_SIGN_EXT | W_MUTABLE_GLOBALS | W_ATOMICS |
+                      W_MULTIVALUE;
+        if u.str_eq(cpu, "mvp") {
+            r.features = W_MUTABLE_GLOBALS;
+        } else if u.str_eq(cpu, "generic") or (cpu.len == 0) {
+            r.features = generic;
+        } else if u.str_eq(cpu, "bleeding-edge") {
+            r.features = generic | W_RELAXED_SIMD | W_TAIL_CALL;
+        } else {
+            r.ok = false;
+        }
+        return r;
+    }
+    if a == ARCH_X64 {
+        let v2 = X_SSE3 | X_SSSE3 | X_SSE41 | X_SSE42 | X_POPCNT | X_CMPXCHG16B;
+        let v3 = v2 | X_AVX | X_AVX2 | X_BMI1 | X_BMI2 | X_FMA | X_LZCNT;
+        if u.str_eq(cpu, "x86-64") or u.str_eq(cpu, "generic") {
+            r.features = 0;
+        } else if u.str_eq(cpu, "x86-64-v2") {
+            r.features = v2;
+        } else if u.str_eq(cpu, "x86-64-v3") or u.str_eq(cpu, "x86-64-v4") {
+            r.features = v3;
+        } else if u.str_eq(cpu, "native") or (cpu.len == 0) {
+            r.features = host_features(a);
+        } else {
+            r.ok = false;
+        }
+        return r;
+    }
+    if u.str_eq(cpu, "generic") or u.str_eq(cpu, "armv8-a") {
+        r.features = 0;
+    } else if u.str_eq(cpu, "armv8.1-a") {
+        r.features = A_LSE;
+    } else if u.str_eq(cpu, "armv8.2-a") {
+        r.features = A_LSE | A_DOTPROD;
+    } else if u.str_eq(cpu, "armv8.3-a") or u.str_eq(cpu, "apple-m1") or u.str_eq(cpu, "neoverse-n1") {
+        r.features = A_LSE | A_DOTPROD | A_RCPC;
+    } else if u.str_eq(cpu, "native") or (cpu.len == 0) {
+        r.features = host_features(a);
+    } else {
+        r.ok = false;
+    }
+    return r;
+}
+
+// Applies "+a,-b,..." to g_features. Returns the first unknown name, or nil.
+pub fn apply_features(spec: []u8) []u8 {
+    let mut i: usize = 0;
+    while i < spec.len {
+        let mut j = i;
+        while (j < spec.len) and (spec[j] != ',') {
+            j += 1;
+        }
+        let item = spec[i..j];
+        i = j + 1;
+        if item.len == 0 {
+            continue;
+        }
+        let mut on = true;
+        let mut name = item;
+        if (item[0] == '+') or (item[0] == '-') {
+            on = item[0] == '+';
+            name = item[1..];
+        }
+        let bit = feature_bit(name);
+        if bit == 0 {
+            return u.dup(name);
+        }
+        if on {
+            g_features = g_features | bit;
+        } else {
+            g_features = g_features & ~bit;
+        }
+    }
+    return u.nosym();
+}

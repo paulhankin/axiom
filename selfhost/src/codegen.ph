@@ -12,7 +12,9 @@ import "ast.ph" as ast;
 import "types.ph" as ty;
 import "sema.ph" as sema;
 import "wasmops.ph" as wops;
-import "llvm.ph" as L;
+import "ir.ph" as ir;
+import "target.ph" as tg;
+import "backend.ph" as be;
 
 // What one codegen run produces (spec §17.7):
 //   CG_WHOLE   the whole program in one object (-O2 and above by default)
@@ -25,7 +27,7 @@ pub const CG_MODULE: i32 = 1;
 pub const CG_LINK: i32 = 2;
 
 pub const EMIT_OBJ: i32 = 0;
-pub const EMIT_LLVM: i32 = 1;
+pub const EMIT_IR: i32 = 1;
 pub const EMIT_ASM: i32 = 2;
 
 pub struct CgOptions {
@@ -53,23 +55,19 @@ pub let mut g_threads: bool = false;
 pub let mut g_needs_native_runtime: bool = false;
 
 let mut O: *mut CgOptions = @ptr_from_int(*mut CgOptions, 0);
-let mut ctx: *mut L.Context = @ptr_from_int(*mut L.Context, 0);
-let mut M: *mut L.Module = @ptr_from_int(*mut L.Module, 0);
-let mut B: *mut L.Builder = @ptr_from_int(*mut L.Builder, 0);
-let mut TM: *mut L.TargetMachine = @ptr_from_int(*mut L.TargetMachine, 0);
-let mut TD: *mut L.TargetData = @ptr_from_int(*mut L.TargetData, 0);
-let mut T_i1: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_i8: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_i16: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_i32: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_i64: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_i128: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_isz: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_ptr: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_void: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_f32: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_f64: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut T_v128: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
+let mut M: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+let mut T_i1: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_i8: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_i16: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_i32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_i64: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_isz: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_ptr: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_void: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_f32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_f64: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut T_v128: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 
 // ---------------------------------------------------------------------------
 // Function instances
@@ -78,8 +76,8 @@ struct FnInst {
     decl: *mut ast.Decl,
     gargs: []mut *mut ast.Type,
     fnty: *mut ast.Type,  // concrete TY_FN
-    fnv: *mut L.Value,
-    llty: *mut L.LType,
+    fnv: *mut ir.Value,
+    llty: *mut ir.Ty,
     sret: bool,
     display: []u8,  // user-facing name, for stack traces and profiles
     next: *mut FnInst,
@@ -91,8 +89,8 @@ let mut pending_head: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 let mut pending_tail: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 
 struct LoopCtx {
-    brk: *mut L.BB,
-    cont: *mut L.BB,
+    brk: *mut ir.Block,
+    cont: *mut ir.Block,
     defer_height: usize,
 }
 
@@ -101,13 +99,13 @@ struct FnState {
     decl: *mut ast.Decl,
     from: []mut *mut ast.Type,
     to: []mut *mut ast.Type,
-    fnv: *mut L.Value,
-    locals: []mut *mut L.Value,
-    sret_ptr: *mut L.Value,
+    fnv: *mut ir.Value,
+    locals: []mut *mut ir.Value,
+    sret_ptr: *mut ir.Value,
     ret: *mut ast.Type,  // concrete
     defers: u.List.[*mut ast.Stmt],
     loops: u.List.[LoopCtx],
-    entry: *mut L.BB,
+    entry: *mut ir.Block,
 }
 
 let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
@@ -115,168 +113,157 @@ let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
 // ---------------------------------------------------------------------------
 // Small wrappers (unnamed instructions)
 // ---------------------------------------------------------------------------
-fn vnil() *mut L.Value {
-    return u.nil.[L.Value]();
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
 }
 
 fn tnil() *mut ast.Type {
     return u.nil.[ast.Type]();
 }
 
-fn bbnil() *mut L.BB {
-    return u.nil.[L.BB]();
+fn bbnil() *mut ir.Block {
+    return u.nil.[ir.Block]();
 }
 
 fn NN() *u8 {
     return "".ptr;
 }
 
-fn ci(t: *mut L.LType, v: u64) *mut L.Value {
-    return L.LLVMConstInt(t, v, 0);
+fn ci(t: *mut ir.Ty, v: u64) *mut ir.Value {
+    return ir.cint(t, v);
 }
 
-fn ci32(v: u64) *mut L.Value {
-    return L.LLVMConstInt(T_i32, v, 0);
+fn ci32(v: u64) *mut ir.Value {
+    return ir.cint(T_i32, v);
 }
 
-fn b_add(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildAdd(B, a, b, NN());
+fn b_add(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.add(B, a, b);
 }
 
-fn b_sub(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildSub(B, a, b, NN());
+fn b_sub(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.sub(B, a, b);
 }
 
-fn b_mul(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildMul(B, a, b, NN());
+fn b_mul(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.mul(B, a, b);
 }
 
-fn b_and(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildAnd(B, a, b, NN());
+fn b_and(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.and_(B, a, b);
 }
 
-fn b_or(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildOr(B, a, b, NN());
+fn b_or(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.or_(B, a, b);
 }
 
-fn b_xor(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildXor(B, a, b, NN());
+fn b_xor(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.xor(B, a, b);
 }
 
-fn b_not(a: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildNot(B, a, NN());
+fn b_not(a: *mut ir.Value) *mut ir.Value {
+    return ir.not_(B, a);
 }
 
-fn icmp(p: i32, a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildICmp(B, p, a, b, NN());
+fn icmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.icmp(B, p, a, b);
 }
 
-fn fcmp(p: i32, a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildFCmp(B, p, a, b, NN());
+fn fcmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(B, p, a, b);
 }
 
-fn sel(c: *mut L.Value, a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildSelect(B, c, a, b, NN());
+fn sel(c: *mut ir.Value, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.select(B, c, a, b);
 }
 
-fn zext(v: *mut L.Value, t: *mut L.LType) *mut L.Value {
-    return L.LLVMBuildZExt(B, v, t, NN());
+fn zext(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.zext(B, v, t);
 }
 
-fn sext(v: *mut L.Value, t: *mut L.LType) *mut L.Value {
-    return L.LLVMBuildSExt(B, v, t, NN());
+fn sext(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.sext(B, v, t);
 }
 
-fn trunc(v: *mut L.Value, t: *mut L.LType) *mut L.Value {
-    return L.LLVMBuildTrunc(B, v, t, NN());
+fn trunc(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.trunc(B, v, t);
 }
 
-fn bitcast(v: *mut L.Value, t: *mut L.LType) *mut L.Value {
-    return L.LLVMBuildBitCast(B, v, t, NN());
+fn bitcast(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.bitcast(B, v, t);
 }
 
-fn ptrtoint(v: *mut L.Value, t: *mut L.LType) *mut L.Value {
-    return L.LLVMBuildPtrToInt(B, v, t, NN());
+fn ptrtoint(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.ptrtoint(B, v, t);
 }
 
-fn inttoptr(v: *mut L.Value, t: *mut L.LType) *mut L.Value {
-    return L.LLVMBuildIntToPtr(B, v, t, NN());
+fn inttoptr(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    return ir.inttoptr(B, v);
 }
 
-fn extract(v: *mut L.Value, i: u32) *mut L.Value {
-    return L.LLVMBuildExtractValue(B, v, i, NN());
+fn extract(v: *mut ir.Value, i: u32) *mut ir.Value {
+    return ir.extract(B, v, i);
 }
 
-fn insert(agg: *mut L.Value, v: *mut L.Value, i: u32) *mut L.Value {
-    return L.LLVMBuildInsertValue(B, agg, v, i, NN());
+fn insert(agg: *mut ir.Value, v: *mut ir.Value, i: u32) *mut ir.Value {
+    return ir.insert(B, agg, v, i);
 }
 
-fn ld(t: *mut L.LType, p: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildLoad2(B, t, p, NN());
+fn ld(t: *mut ir.Ty, p: *mut ir.Value) *mut ir.Value {
+    return ir.load(B, t, p);
 }
 
-fn st(v: *mut L.Value, p: *mut L.Value) *mut L.Value {
-    return L.LLVMBuildStore(B, v, p);
+fn st(v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    return ir.store(B, v, p);
 }
 
-fn br(bb: *mut L.BB) void {
-    _ = L.LLVMBuildBr(B, bb);
+fn br(bb: *mut ir.Block) void {
+    ir.br(B, bb);
 }
 
-fn condbr(c: *mut L.Value, t: *mut L.BB, e: *mut L.BB) void {
-    _ = L.LLVMBuildCondBr(B, c, t, e);
+fn condbr(c: *mut ir.Value, t: *mut ir.Block, e: *mut ir.Block) void {
+    ir.condbr(B, c, t, e);
 }
 
-fn at_end(bb: *mut L.BB) void {
-    L.LLVMPositionBuilderAtEnd(B, bb);
+fn at_end(bb: *mut ir.Block) void {
+    ir.at_end(B, bb);
 }
 
-fn gep1(t: *mut L.LType, p: *mut L.Value, i: *mut L.Value) *mut L.Value {
-    let mut ix: [1]*mut L.Value = [i];
-    return L.LLVMBuildGEP2(B, t, p, &mut ix[0], 1, NN());
+fn gep1(t: *mut ir.Ty, p: *mut ir.Value, i: *mut ir.Value) *mut ir.Value {
+    return ir.gep1(B, t, p, i);
 }
 
-fn gep2(t: *mut L.LType, p: *mut L.Value, i: *mut L.Value, j: *mut L.Value) *mut L.Value {
-    let mut ix: [2]*mut L.Value = [i, j];
-    return L.LLVMBuildGEP2(B, t, p, &mut ix[0], 2, NN());
+fn gep2(t: *mut ir.Ty, p: *mut ir.Value, i: *mut ir.Value, j: *mut ir.Value) *mut ir.Value {
+    let mut ix: [2]*mut ir.Value = [i, j];
+    return ir.gep(B, t, p, ix[..]);
 }
 
-fn sgep(t: *mut L.LType, p: *mut L.Value, i: u32) *mut L.Value {
-    return L.LLVMBuildStructGEP2(B, t, p, i, NN());
+fn sgep(t: *mut ir.Ty, p: *mut ir.Value, i: u32) *mut ir.Value {
+    return ir.struct_gep(B, t, p, i);
 }
 
-fn tint(bits: i32) *mut L.LType {
-    return L.LLVMIntTypeInContext(ctx, @int_cast(u32, bits));
+fn tint(bits: i32) *mut ir.Ty {
+    return ir.t_int(bits);
 }
 
-fn struct_ty(els: []mut *mut L.LType) *mut L.LType {
-    return L.LLVMStructTypeInContext(ctx, &mut els[0], @int_cast(u32, els.len), 0);
+fn struct_ty(els: []mut *mut ir.Ty) *mut ir.Ty {
+    return ir.t_struct(els);
 }
 
-fn const_struct(vals: []mut *mut L.Value) *mut L.Value {
-    return L.LLVMConstStructInContext(ctx, &mut vals[0], @int_cast(u32, vals.len), 0);
+fn const_struct(vals: []mut *mut ir.Value) *mut ir.Value {
+    return ir.cstruct(vals);
 }
 
-fn fn_type(ret: *mut L.LType, ps: []mut *mut L.LType, vararg: bool) *mut L.LType {
-    let mut va: i32 = 0;
-    if vararg {
-        va = 1;
-    }
-    if ps.len == 0 {
-        return L.LLVMFunctionType(ret, u.nil.[*mut L.LType](), 0, va);
-    }
-    return L.LLVMFunctionType(ret, &mut ps[0], @int_cast(u32, ps.len), va);
+fn fn_type(ret: *mut ir.Ty, ps: []mut *mut ir.Ty, vararg: bool) *mut ir.Ty {
+    return ir.t_fn(ret, ps, vararg);
 }
 
-fn call(fty: *mut L.LType, f: *mut L.Value, args: []mut *mut L.Value) *mut L.Value {
-    if args.len == 0 {
-        return L.LLVMBuildCall2(B, fty, f, u.nil.[*mut L.Value](), 0, NN());
-    }
-    return L.LLVMBuildCall2(B, fty, f, &mut args[0], @int_cast(u32, args.len), NN());
+fn call(fty: *mut ir.Ty, f: *mut ir.Value, args: []mut *mut ir.Value) *mut ir.Value {
+    return ir.call(B, fty, f, args);
 }
 
-fn is_const_int(v: *mut L.Value) bool {
-    return u.notnil(L.LLVMIsAConstantInt(v));
+fn is_const_int(v: *mut ir.Value) bool {
+    return v.kind == ir.V_CINT;
 }
 
 fn ct(t: *mut ast.Type) *mut ast.Type {
@@ -294,7 +281,7 @@ fn internal_error(msg: []u8) void {
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-fn align_unit(a: i64) *mut L.LType {
+fn align_unit(a: i64) *mut ir.Ty {
     if a == 1 {
         return T_i8;
     }
@@ -310,14 +297,14 @@ fn align_unit(a: i64) *mut L.LType {
     return T_v128;
 }
 
-fn lty(t: *mut ast.Type) *mut L.LType {
+fn lty(t: *mut ast.Type) *mut ir.Ty {
     if t.has_params {
         internal_error(u.f1("unsubstituted generic type %s", ty.type_str(t)));
     }
     if not u.isvnil(t.backend) {
-        return @ptr_cast(*mut L.LType, t.backend);
+        return @ptr_cast(*mut ir.Ty, t.backend);
     }
-    let mut r = u.nil.[L.LType]();
+    let mut r = u.nil.[ir.Ty]();
     let k = t.kind;
     if k == ast.TY_VOID {
         r = T_void;
@@ -338,7 +325,7 @@ fn lty(t: *mut ast.Type) *mut L.LType {
                 lane = T_f32;
             }
         }
-        r = L.LLVMVectorType(lane, @int_cast(u32, t.lanes));
+        r = ir.t_vec(lane, @int_cast(u32, t.lanes));
     } else if k == ast.TY_V128 {
         r = T_v128;
     } else if (k == ast.TY_PTR) or (k == ast.TY_FN) {
@@ -346,40 +333,40 @@ fn lty(t: *mut ast.Type) *mut L.LType {
     } else if k == ast.TY_ERROR {
         r = T_i16;
     } else if k == ast.TY_SLICE {
-        let mut el: [2]*mut L.LType = [T_ptr, T_isz];
+        let mut el: [2]*mut ir.Ty = [T_ptr, T_isz];
         r = struct_ty(el[..]);
     } else if k == ast.TY_ARRAY {
-        r = L.LLVMArrayType2(lty(t.elem), @bit_cast(u64, t.len));
+        r = ir.t_array(lty(t.elem), @bit_cast(u64, t.len));
     } else if k == ast.TY_ERRUNION {
         if t.elem.kind == ast.TY_VOID {
-            let mut el: [1]*mut L.LType = [T_i16];
+            let mut el: [1]*mut ir.Ty = [T_i16];
             r = struct_ty(el[..]);
         } else {
-            let mut el: [2]*mut L.LType = [T_i16, lty(t.elem)];
+            let mut el: [2]*mut ir.Ty = [T_i16, lty(t.elem)];
             r = struct_ty(el[..]);
         }
     } else if k == ast.TY_STRUCT {
-        r = L.LLVMStructCreateNamed(ctx, u.cz(ty.type_str(t)));
+        r = ir.t_named_struct(ty.type_str(t));
         t.backend = @ptr_cast(*mut void, r);
         let n = t.decl.fields.len;
-        let el = u.newn.[*mut L.LType](n + 1);
+        let el = u.newn.[*mut ir.Ty](n + 1);
         for i in 0..n {
             el[i] = lty(ty.type_field(t, i));
         }
-        L.LLVMStructSetBody(r, &mut el[0], @int_cast(u32, n), 0);
+        ir.struct_set_body(r, el[0..n]);
     } else if k == ast.TY_UNION {
-        r = L.LLVMStructCreateNamed(ctx, u.cz(ty.type_str(t)));
+        r = ir.t_named_struct(ty.type_str(t));
         t.backend = @ptr_cast(*mut void, r);
         let tag = lty(ty.union_tag_type(t));
         let psize = ty.union_payload_size(t);
         let palign = ty.union_payload_align(t);
         if psize == 0 {
-            let mut el: [1]*mut L.LType = [tag];
-            L.LLVMStructSetBody(r, &mut el[0], 1, 0);
+            let mut el: [1]*mut ir.Ty = [tag];
+            ir.struct_set_body(r, el[..]);
         } else {
-            let arr = L.LLVMArrayType2(align_unit(palign), @bit_cast(u64, ((psize + palign) - 1) / palign));
-            let mut el: [2]*mut L.LType = [tag, arr];
-            L.LLVMStructSetBody(r, &mut el[0], 2, 0);
+            let arr = ir.t_array(align_unit(palign), @bit_cast(u64, ((psize + palign) - 1) / palign));
+            let mut el: [2]*mut ir.Ty = [tag, arr];
+            ir.struct_set_body(r, el[..]);
         }
     } else {
         internal_error(u.f1("no LLVM type for %s", ty.type_str(t)));
@@ -389,7 +376,7 @@ fn lty(t: *mut ast.Type) *mut L.LType {
 }
 
 // SSA representation: bool is i1; everything else as in memory.
-fn vty(t: *mut ast.Type) *mut L.LType {
+fn vty(t: *mut ast.Type) *mut ir.Ty {
     if t.kind == ast.TY_BOOL {
         return T_i1;
     }
@@ -401,7 +388,7 @@ fn by_ptr(t: *mut ast.Type) bool {
 }
 
 struct FnLty {
-    t: *mut L.LType,
+    t: *mut ir.Ty,
     sret: bool,
 }
 
@@ -412,7 +399,7 @@ fn fn_lty(fnty: *mut ast.Type) FnLty {
     if sret {
         n += 1;
     }
-    let ps = u.newn.[*mut L.LType](n + 1);
+    let ps = u.newn.[*mut ir.Ty](n + 1);
     let mut k: usize = 0;
     if sret {
         ps[k] = T_ptr;
@@ -436,25 +423,21 @@ fn fn_lty(fnty: *mut ast.Type) FnLty {
 // ---------------------------------------------------------------------------
 // Small IR helpers
 // ---------------------------------------------------------------------------
-fn cint(t: *mut L.LType, v: u.I128) *mut L.Value {
-    if L.LLVMGetIntTypeWidth(t) <= 64 {
-        return L.LLVMConstInt(t, v.lo, 1);
-    }
-    let words: [2]u64 = [v.lo, v.hi];
-    return L.LLVMConstIntOfArbitraryPrecision(t, 2, &words[0]);
+fn cint(t: *mut ir.Ty, v: u.I128) *mut ir.Value {
+    return ir.cint(t, v.lo);
 }
 
-fn usz(v: i64) *mut L.Value {
-    return L.LLVMConstInt(T_isz, @bit_cast(u64, v), 0);
+fn usz(v: i64) *mut ir.Value {
+    return ir.cint(T_isz, @bit_cast(u64, v));
 }
 
 fn terminated() bool {
-    let bb = L.LLVMGetInsertBlock(B);
-    return u.notnil(L.LLVMGetBasicBlockTerminator(bb));
+    let bb = ir.insert_block(B);
+    return u.notnil(ir.terminator(bb));
 }
 
-fn new_bb(name: *u8) *mut L.BB {
-    return L.LLVMAppendBasicBlockInContext(ctx, F.fnv, name);
+fn new_bb(name: *u8) *mut ir.Block {
+    return ir.append_block(F.fnv.fnp, u.from_c(name));
 }
 
 // After a diverging instruction: continue in a fresh (unreachable) block.
@@ -462,37 +445,75 @@ fn dead_block() void {
     at_end(new_bb("dead".ptr));
 }
 
-fn intrinsic(name: []u8, tys: []mut *mut L.LType, args: []mut *mut L.Value) *mut L.Value {
-    let id = L.LLVMLookupIntrinsicID(u.cz(name), name.len);
-    if id == 0 {
-        internal_error(u.f1("unknown intrinsic %s", name));
+// The LLVM intrinsics codegen uses, as IR intrinsics (IN_*) or instructions.
+fn intrinsic(name: []u8, tys: []mut *mut ir.Ty, args: []mut *mut ir.Value) *mut ir.Value {
+    if u.str_eq(name, "llvm.fptosi.sat") {
+        return ir.cast(B, ir.OP_FPTOSI_SAT, args[0], tys[0]);
     }
-    let mut tp = u.nil.[*mut L.LType]();
-    if tys.len > 0 {
-        tp = &mut tys[0];
+    if u.str_eq(name, "llvm.fptoui.sat") {
+        return ir.cast(B, ir.OP_FPTOUI_SAT, args[0], tys[0]);
     }
-    let f = L.LLVMGetIntrinsicDeclaration(M, id, tp, tys.len);
-    let fty = L.LLVMIntrinsicGetType(ctx, id, tp, tys.len);
-    return call(fty, f, args);
+    if u.str_eq(name, "llvm.trap") {
+        return ir.intr(B, ir.IN_TRAP, T_void, no_vals());
+    }
+    if u.str_eq(name, "llvm.wasm.memory.size") {
+        return ir.intr(B, ir.IN_MEMSIZE, T_isz, no_vals());
+    }
+    if u.str_eq(name, "llvm.wasm.memory.grow") {
+        return ir.intr(B, ir.IN_MEMGROW, T_isz, args[1..2]);
+    }
+    if u.str_eq(name, "llvm.wasm.memory.atomic.wait32") {
+        return ir.intr(B, ir.IN_WAIT32, T_i32, args);
+    }
+    if u.str_eq(name, "llvm.wasm.memory.atomic.notify") {
+        return ir.intr(B, ir.IN_NOTIFY, T_i32, args);
+    }
+    if u.str_eq(name, "llvm.stackrestore") {
+        return ir.intr(B, ir.IN_SET_SP, T_void, args);
+    }
+    let names = ["llvm.ctlz", "llvm.cttz", "llvm.ctpop", "llvm.fshl", "llvm.fshr", "llvm.sadd.sat", "llvm.uadd.sat",
+                 "llvm.ssub.sat", "llvm.usub.sat", "llvm.smin", "llvm.smax", "llvm.umin", "llvm.umax", "llvm.minimum",
+                 "llvm.maximum", "llvm.fabs", "llvm.sqrt", "llvm.floor", "llvm.ceil", "llvm.trunc", "llvm.roundeven",
+                 "llvm.fma", "llvm.copysign", "llvm.abs"];
+    let ids = [ir.IN_CTLZ, ir.IN_CTTZ, ir.IN_CTPOP, ir.IN_ROTL, ir.IN_ROTR, ir.IN_SADD_SAT, ir.IN_UADD_SAT,
+               ir.IN_SSUB_SAT, ir.IN_USUB_SAT, ir.IN_SMIN, ir.IN_SMAX, ir.IN_UMIN, ir.IN_UMAX, ir.IN_FMIN, ir.IN_FMAX,
+               ir.IN_FABS, ir.IN_SQRT, ir.IN_FLOOR, ir.IN_CEIL, ir.IN_FTRUNC, ir.IN_NEAREST, ir.IN_FMA, ir.IN_COPYSIGN,
+               ir.IN_ABS];
+    for i in 0..names.len {
+        if u.str_eq(name, names[i]) {
+            let id = ids[i];
+            let mut n = args.len;
+            if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_ABS) {
+                n = 1;  // drop LLVM's is_zero_poison flag
+            }
+            if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
+                let mut rargs: [2]*mut ir.Value = [args[0], args[2]];
+                return ir.intr(B, id, args[0].ty, rargs[..]);
+            }
+            return ir.intr(B, id, args[0].ty, args[0..n]);
+        }
+    }
+    internal_error(u.f1("unknown intrinsic %s", name));
+    return vnil();
 }
 
-fn no_tys() []mut *mut L.LType {
-    return @slice_from_ptr(u.nil.[*mut L.LType](), 0);
+fn no_tys() []mut *mut ir.Ty {
+    return @slice_from_ptr(u.nil.[*mut ir.Ty](), 0);
 }
 
-fn no_vals() []mut *mut L.Value {
-    return @slice_from_ptr(u.nil.[*mut L.Value](), 0);
+fn no_vals() []mut *mut ir.Value {
+    return @slice_from_ptr(u.nil.[*mut ir.Value](), 0);
 }
 
-fn intr1(name: []u8, a: *mut L.Value) *mut L.Value {
-    let mut t: [1]*mut L.LType = [L.LLVMTypeOf(a)];
-    let mut args: [1]*mut L.Value = [a];
+fn intr1(name: []u8, a: *mut ir.Value) *mut ir.Value {
+    let mut t: [1]*mut ir.Ty = [a.ty];
+    let mut args: [1]*mut ir.Value = [a];
     return intrinsic(name, t[..], args[..]);
 }
 
-fn intr2(name: []u8, a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    let mut t: [1]*mut L.LType = [L.LLVMTypeOf(a)];
-    let mut args: [2]*mut L.Value = [a, b];
+fn intr2(name: []u8, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let mut t: [1]*mut ir.Ty = [a.ty];
+    let mut args: [2]*mut ir.Value = [a, b];
     return intrinsic(name, t[..], args[..]);
 }
 
@@ -519,26 +540,26 @@ const SITE_ERR_RETURN: i32 = 254;
 const SITE_CALL: i32 = 255;  // not traps: shadow stack records
 
 let mut g_cur_span: u.Span = u.Span.{ file: 0, start: 0, end: 0 };
-let mut trap_fn: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
-let mut trap_info: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
-let mut trap_hook: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
-let mut trap_fnty: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut site_ty: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut site_map: u.SymMap.[*mut L.Value] = u.SymMap.[*mut L.Value].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut L.Value, 0), cap: 0, len: 0 };
+let mut trap_fn: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut trap_info: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut trap_hook: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut trap_fnty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut site_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut site_map: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
 // phalange.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
-fn trap_info_global() *mut L.Value {
+fn trap_info_global() *mut ir.Value {
     if u.isnil(trap_info) {
-        let t = L.LLVMArrayType2(T_i64, 6);
-        trap_info = shared_global(t, "phalange.trap_info", L.LLVMConstNull(t), 0);
-        L.LLVMSetAlignment(trap_info, 8);
+        let t = ir.t_array(T_i64, 6);
+        trap_info = shared_global(t, "phalange.trap_info", ir.czero(t), 0);
+        set_align(trap_info, 8);
     }
     return trap_info;
 }
 
-fn trap_info_slot(i: u64) *mut L.Value {
-    return gep2(L.LLVMArrayType2(T_i64, 6), trap_info_global(), ci32(0), ci32(i));
+fn trap_info_slot(i: u64) *mut ir.Value {
+    return gep2(ir.t_array(T_i64, 6), trap_info_global(), ci32(0), ci32(i));
 }
 
 // Stable identity of a source file in site records (hash of its display path).
@@ -595,7 +616,7 @@ fn cur_fn_display() []u8 {
 // A constant site record {code, file id, start, end, line, col, file, text,
 // fn, callee}. `fn` is the enclosing function; `callee` is set for call sites.
 // Codes: a trap code, SITE_CALL for a call, SITE_ERR_RETURN for an error return.
-fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut L.Value {
+fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
     let fname = cur_fn_display();
     let mut callee = callee0;
     if u.isnos(callee) {
@@ -608,7 +629,7 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut L.Value {
         return found;
     }
     if u.isnil(site_ty) {
-        let mut el: [10]*mut L.LType = [T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr];
+        let mut el: [10]*mut ir.Ty = [T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr];
         site_ty = struct_ty(el[..]);
     }
     let mut lc = u.LineCol.{ sl: 0, sc: 0, el: 0, ec: 0 };
@@ -635,18 +656,18 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut L.Value {
         }
         text = u.dup(f.text[@as(usize, sp.start)..@as(usize, sp.start + n)]);
     }
-    let mut vals: [10]*mut L.Value = [
+    let mut vals: [10]*mut ir.Value = [
         ci32(@as(u64, @bit_cast(u32, code))), ci32(@as(u64, file_key(sp.file))),
         ci32(@as(u64, sp.start)), ci32(@as(u64, sp.end)),
         ci32(@as(u64, @bit_cast(u32, lc.sl))), ci32(@as(u64, @bit_cast(u32, lc.sc))),
         string_ptr(cstr_prefix(file)), string_ptr(cstr_prefix(text)),
         string_ptr(cstr_prefix(fname)), string_ptr(cstr_prefix(callee)),
     ];
-    let g = L.LLVMAddGlobal(M, site_ty, ".site".ptr);
-    L.LLVMSetInitializer(g, const_struct(vals[..]));
-    L.LLVMSetLinkage(g, L.PrivateLinkage);
-    L.LLVMSetGlobalConstant(g, 1);
-    L.LLVMSetAlignment(g, 8);
+    let g = ir.add_global(M, site_ty, ".site").val;
+    set_init(g, const_struct(vals[..]));
+    set_linkage(g, ir.LINK_INTERNAL);
+    g.gv.is_const = true;
+    set_align(g, 8);
     site_map.put(key, g);
     return g;
 }
@@ -660,7 +681,7 @@ fn cstr_prefix(s: []u8) []u8 {
     return s;
 }
 
-fn site_record(code: i32, sp: u.Span) *mut L.Value {
+fn site_record(code: i32, sp: u.Span) *mut ir.Value {
     return site_record_ex(code, sp, u.nosym());
 }
 
@@ -676,17 +697,17 @@ fn site_record(code: i32, sp: u.Span) *mut L.Value {
 // ---------------------------------------------------------------------------
 const SS_CAP: u64 = 256;
 const ET_CAP: u64 = 32;
-let mut ss_ty: *mut L.LType = @ptr_from_int(*mut L.LType, 0);
-let mut ss_global: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
-let mut ss_main: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
+let mut ss_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut ss_global: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut ss_main: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
 fn stack_traces_on() bool {
     return u.notnil(O) and O.stack_traces;
 }
 
-fn ss_type() *mut L.LType {
+fn ss_type() *mut ir.Ty {
     if u.isnil(ss_ty) {
-        let mut el: [4]*mut L.LType = [T_i32, T_i32, L.LLVMArrayType2(T_ptr, SS_CAP), L.LLVMArrayType2(T_ptr, ET_CAP)];
+        let mut el: [4]*mut ir.Ty = [T_i32, T_i32, ir.t_array(T_ptr, SS_CAP), ir.t_array(T_ptr, ET_CAP)];
         ss_ty = struct_ty(el[..]);
     }
     return ss_ty;
@@ -696,51 +717,50 @@ fn ss_globals() void {
     let t = ss_type();
     if u.isnil(ss_global) {
         if ty.g_target.is_wasm {
-            ss_main = shared_global(t, "phalange.ss.main", L.LLVMConstNull(t), 0);
-            L.LLVMSetAlignment(ss_main, 8);
+            ss_main = shared_global(t, "phalange.ss.main", ir.czero(t), 0);
+            set_align(ss_main, 8);
             // null means the main thread's record (wasm-ld does not relocate
             // wasm global initializers); thread starts set their own.
-            ss_global = shared_global(T_ptr, "phalange.ss", L.LLVMConstNull(T_ptr), 1);
+            ss_global = shared_global(T_ptr, "phalange.ss", ir.czero(T_ptr), 1);
         } else {
-            ss_global = shared_global(t, "phalange.ss", L.LLVMConstNull(t), 0);
-            L.LLVMSetThreadLocal(ss_global, 1);
-            L.LLVMSetThreadLocalMode(ss_global, L.InitialExecTLSModel);
-            L.LLVMSetAlignment(ss_global, 8);
+            ss_global = shared_global(t, "phalange.ss", ir.czero(t), 0);
+            ss_global.gv.tls = true;
+            set_align(ss_global, 8);
         }
     }
 }
 
-fn ss_ptr() *mut L.Value {
+fn ss_ptr() *mut ir.Value {
     ss_globals();
     if ty.g_target.is_wasm {
         let p = ld(T_ptr, ss_global);
-        return L.LLVMBuildSelect(B, L.LLVMBuildIsNull(B, p, NN()), ss_main, p, "ss".ptr);
+        return ir.select(B, ir.is_null(B, p), ss_main, p);
     }
     return ss_global;
 }
 
-fn ss_field(ss: *mut L.Value, i: u32) *mut L.Value {
+fn ss_field(ss: *mut ir.Value, i: u32) *mut ir.Value {
     return sgep(ss_type(), ss, i);
 }
 
-fn ss_slot(ss: *mut L.Value, field: u64, idx: *mut L.Value) *mut L.Value {
-    let mut ix: [3]*mut L.Value = [ci32(0), ci32(field), idx];
-    return L.LLVMBuildGEP2(B, ss_type(), ss, &mut ix[0], 3, NN());
+fn ss_slot(ss: *mut ir.Value, field: u64, idx: *mut ir.Value) *mut ir.Value {
+    let mut ix: [3]*mut ir.Value = [ci32(0), ci32(field), idx];
+    return ir.gep(B, ss_type(), ss, ix[..]);
 }
 
 struct SsFrame {
-    ss: *mut L.Value,
-    depth: *mut L.Value,
+    ss: *mut ir.Value,
+    depth: *mut ir.Value,
 }
 
 // In profiling builds another thread (or a signal handler) reads the stack at
 // any moment, so the stores must happen even where nothing in this thread
 // reads them (after inlining, an increment followed by the restore is
 // otherwise a dead store).
-fn ss_store(v: *mut L.Value, p: *mut L.Value) void {
+fn ss_store(v: *mut ir.Value, p: *mut ir.Value) void {
     let s = st(v, p);
     if O.profile {
-        L.LLVMSetVolatile(s, 1);
+        s.flags = s.flags | ir.F_VOLATILE;
     }
 }
 
@@ -751,7 +771,7 @@ fn ss_push(callee: []u8) SsFrame {
     }
     f.ss = ss_ptr();
     let dp = ss_field(f.ss, 0);
-    f.depth = L.LLVMBuildLoad2(B, T_i32, dp, "depth".ptr);
+    f.depth = ir.load(B, T_i32, dp);
     let idx = b_and(f.depth, ci32(SS_CAP - 1));
     ss_store(site_record_ex(SITE_CALL, g_cur_span, callee), ss_slot(f.ss, 2, idx));
     ss_store(b_add(f.depth, ci32(1)), dp);
@@ -765,18 +785,18 @@ fn ss_pop(f: SsFrame) void {
 }
 
 // Appends an error-return record when `code` (an error code, i16) is nonzero.
-fn etrace_push(code: *mut L.Value) void {
+fn etrace_push(code: *mut ir.Value) void {
     if not stack_traces_on() or u.isnil(F) {
         return;
     }
-    if is_const_int(code) and (L.LLVMConstIntGetZExtValue(code) == 0) {
+    if is_const_int(code) and (code.cv == 0) {
         return;
     }
     let mut cont = bbnil();
     if not is_const_int(code) {
         let rec = new_bb("etrace".ptr);
         cont = new_bb("etrace.done".ptr);
-        condbr(icmp(L.IntNE, code, L.LLVMConstNull(L.LLVMTypeOf(code))), rec, cont);
+        condbr(icmp(ir.IntNE, code, ir.czero(code.ty)), rec, cont);
         at_end(rec);
     }
     let ss = ss_ptr();
@@ -798,73 +818,132 @@ fn etrace_clear() void {
     _ = st(ci32(0), ss_field(ss_ptr(), 1));
 }
 
-fn add_fn_attr(f: *mut L.Value, name: []u8) void {
-    let k = L.LLVMGetEnumAttributeKindForName(u.cz(name), name.len);
-    L.LLVMAddAttributeAtIndex(f, L.FunctionIndex, L.LLVMCreateEnumAttribute(ctx, k, 0));
+fn add_fn_attr(f: *mut ir.Value, name: []u8) void {
+    if u.str_eq(name, "noreturn") {
+        f.fnp.noreturn = true;
+    } else if u.str_eq(name, "cold") {
+        f.fnp.cold = true;
+    } else if u.str_eq(name, "noinline") {
+        f.fnp.noinline = true;
+    }
 }
 
-fn add_str_attr(f: *mut L.Value, k: []u8, v: []u8) void {
-    L.LLVMAddAttributeAtIndex(f, L.FunctionIndex, L.LLVMCreateStringAttribute(ctx, u.cz(k), @int_cast(u32, k.len), u.cz(v),
-                                                                             @int_cast(u32, v.len)));
+fn add_str_attr(f: *mut ir.Value, k: []u8, v: []u8) void {
+    if u.str_eq(k, "wasm-export-name") {
+        f.fnp.export_name = v;
+    } else if u.str_eq(k, "wasm-import-module") {
+        f.fnp.import_module = v;
+    } else if u.str_eq(k, "wasm-import-name") {
+        f.fnp.import_name = v;
+    }
 }
 
-fn call_trap_site(site: *mut L.Value) void {
+// Global and function attributes
+fn set_align(v: *mut ir.Value, a: u32) void {
+    if v.kind == ir.V_GLOBAL {
+        v.gv.align = @as(u64, a);
+    } else {
+        v.align = a;
+    }
+}
+
+fn set_linkage(v: *mut ir.Value, l: i32) void {
+    if v.kind == ir.V_GLOBAL {
+        v.gv.linkage = l;
+    } else {
+        v.fnp.linkage = l;
+    }
+}
+
+fn set_init(g: *mut ir.Value, c: *mut ir.Value) void {
+    g.gv.init = c;
+}
+
+fn named_fn(name: []u8) *mut ir.Value {
+    let f = ir.get_function(M, name);
+    if u.isnil(f) {
+        return vnil();
+    }
+    return f.val;
+}
+
+fn named_global(name: []u8) *mut ir.Value {
+    let g = ir.get_global(M, name);
+    if u.isnil(g) {
+        return vnil();
+    }
+    return g.val;
+}
+
+fn param(f: *mut ir.Value, k: u32) *mut ir.Value {
+    return f.fnp.params[@as(usize, k)];
+}
+
+fn ext_elem(v: *mut ir.Value, idx: *mut ir.Value) *mut ir.Value {
+    return ir.extract_elem(B, v, idx.cv);
+}
+
+fn ins_elem(v: *mut ir.Value, x: *mut ir.Value, idx: *mut ir.Value) *mut ir.Value {
+    return ir.insert_elem(B, v, x, idx.cv);
+}
+
+fn call_trap_site(site: *mut ir.Value) void {
     if u.isnil(trap_fn) {
-        let mut ps: [1]*mut L.LType = [T_ptr];
+        let mut ps: [1]*mut ir.Ty = [T_ptr];
         trap_fnty = fn_type(T_void, ps[..], false);
-        trap_fn = L.LLVMAddFunction(M, "phalange.trap".ptr, trap_fnty);
-        L.LLVMSetLinkage(trap_fn, L.InternalLinkage);
+        trap_fn = ir.add_function(M, "phalange.trap", trap_fnty).val;
+        set_linkage(trap_fn, ir.LINK_INTERNAL);
         add_fn_attr(trap_fn, "noreturn");
         add_fn_attr(trap_fn, "cold");
         add_fn_attr(trap_fn, "nounwind");
         add_fn_attr(trap_fn, "noinline");
-        let cur = L.LLVMGetInsertBlock(B);
+        let cur = ir.insert_block(B);
         let f = trap_fn;
-        at_end(L.LLVMAppendBasicBlockInContext(ctx, f, "entry".ptr));
-        let sp = L.LLVMGetParam(f, 0);
+        at_end(ir.append_block(f.fnp, "entry"));
+        let sp = param(f, 0);
         _ = st(zext(ptrtoint(sp, T_isz), T_i64), trap_info_slot(0));
         if not ty.g_target.is_wasm {
             // Optional host hook (runtime/native_host.c, runtime/test_main.c).
-            let mut hps: [3]*mut L.LType = [T_ptr, T_ptr, T_ptr];
+            let mut hps: [3]*mut ir.Ty = [T_ptr, T_ptr, T_ptr];
             let hty = fn_type(T_void, hps[..], false);
-            trap_hook = L.LLVMAddFunction(M, "ph_on_trap".ptr, hty);
-            L.LLVMSetLinkage(trap_hook, L.ExternalWeakLinkage);
-            let call_bb = L.LLVMAppendBasicBlockInContext(ctx, f, "hook".ptr);
-            let done_bb = L.LLVMAppendBasicBlockInContext(ctx, f, "trap".ptr);
-            let has = icmp(L.IntNE, trap_hook, L.LLVMConstNull(T_ptr));
+            trap_hook = ir.add_function(M, "ph_on_trap", hty).val;
+            set_linkage(trap_hook, ir.LINK_EXTWEAK);
+            let call_bb = ir.append_block(f.fnp, "hook");
+            let done_bb = ir.append_block(f.fnp, "trap");
+            let has = icmp(ir.IntNE, trap_hook, ir.czero(T_ptr));
             condbr(has, call_bb, done_bb);
             at_end(call_bb);
-            let mut ssv = L.LLVMConstNull(T_ptr);
+            let mut ssv = ir.czero(T_ptr);
             if stack_traces_on() {
                 ssv = ss_ptr();
             }
-            let mut args: [3]*mut L.Value = [sp, trap_info_global(), ssv];
+            let mut args: [3]*mut ir.Value = [sp, trap_info_global(), ssv];
             _ = call(hty, trap_hook, args[..]);
             br(done_bb);
             at_end(done_bb);
         }
         _ = intrinsic("llvm.trap", no_tys(), no_vals());
-        _ = L.LLVMBuildUnreachable(B);
+        ir.unreachable(B);
         at_end(cur);
     }
-    let mut a: [1]*mut L.Value = [site];
+    let mut a: [1]*mut ir.Value = [site];
     _ = call(trap_fnty, trap_fn, a[..]);
 }
 
 // A block that traps with `code` at the current source span.
-fn trap_block(code: i32) *mut L.BB {
-    let cur = L.LLVMGetInsertBlock(B);
+fn trap_block(code: i32) *mut ir.Block {
+    let cur = ir.insert_block(B);
     let bb = new_bb("trap".ptr);
     at_end(bb);
     call_trap_site(site_record(code, g_cur_span));
-    _ = L.LLVMBuildUnreachable(B);
+    ir.unreachable(B);
     at_end(cur);
     return bb;
 }
 
 // Continue only if `ok` holds; otherwise trap with `code`.
-fn check_or_trap(ok: *mut L.Value, code: i32) void {
-    if is_const_int(ok) and (L.LLVMConstIntGetZExtValue(ok) == 1) {
+fn check_or_trap(ok: *mut ir.Value, code: i32) void {
+    if is_const_int(ok) and (ok.cv == 1) {
         return;
     }
     let cont = new_bb("ok".ptr);
@@ -874,71 +953,71 @@ fn check_or_trap(ok: *mut L.Value, code: i32) void {
 
 fn emit_trap(code: i32) void {
     call_trap_site(site_record(code, g_cur_span));
-    _ = L.LLVMBuildUnreachable(B);
+    ir.unreachable(B);
     dead_block();
 }
 
-fn alloca_in_entry(t: *mut L.LType, name: *u8) *mut L.Value {
-    let cur = L.LLVMGetInsertBlock(B);
-    let term = L.LLVMGetBasicBlockTerminator(F.entry);
+fn alloca_in_entry(t: *mut ir.Ty, name: *u8) *mut ir.Value {
+    let cur = ir.insert_block(B);
+    let term = ir.terminator(F.entry);
     if u.notnil(term) {
-        L.LLVMPositionBuilderBefore(B, term);
+        ir.at_before(B, term);
     } else {
         at_end(F.entry);
     }
-    let a = L.LLVMBuildAlloca(B, t, name);
+    let a = ir.alloca(B, t, u.from_c(name));
     at_end(cur);
     return a;
 }
 
-fn temp_alloca(t: *mut ast.Type) *mut L.Value {
+fn temp_alloca(t: *mut ast.Type) *mut ir.Value {
     let a = alloca_in_entry(lty(t), "tmp".ptr);
-    L.LLVMSetAlignment(a, @int_cast(u32, ty.type_align(t)));
+    set_align(a, @int_cast(u32, ty.type_align(t)));
     return a;
 }
 
-fn to_mem(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
+fn to_mem(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
     if t.kind == ast.TY_BOOL {
         return zext(v, T_i8);
     }
     return v;
 }
 
-fn from_mem(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
+fn from_mem(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
     if t.kind == ast.TY_BOOL {
-        return icmp(L.IntNE, v, ci(T_i8, 0));
+        return icmp(ir.IntNE, v, ci(T_i8, 0));
     }
     return v;
 }
 
 // unaligned: the storage may be misaligned (reached through pointers)
-fn load(t: *mut ast.Type, p: *mut L.Value, unaligned: bool) *mut L.Value {
+fn load(t: *mut ast.Type, p: *mut ir.Value, unaligned: bool) *mut ir.Value {
     let v = ld(lty(t), p);
     if unaligned {
-        L.LLVMSetAlignment(v, 1);
+        set_align(v, 1);
     }
     return from_mem(t, v);
 }
 
-fn store(t: *mut ast.Type, v: *mut L.Value, p: *mut L.Value, unaligned: bool) void {
+fn store(t: *mut ast.Type, v: *mut ir.Value, p: *mut ir.Value, unaligned: bool) void {
     let s = st(to_mem(t, v), p);
     if unaligned {
-        L.LLVMSetAlignment(s, 1);
+        set_align(s, 1);
     }
 }
 
-fn spill(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
+fn spill(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
     let a = temp_alloca(t);
     store(t, v, a, false);
     return a;
 }
 
-fn local_ptr(l: *mut ast.Local) *mut L.Value {
+fn local_ptr(l: *mut ast.Local) *mut ir.Value {
     let i = @int_cast(usize, l.index);
     if u.isnil(F.locals[i]) {
         let t = ct(l.ty);
         let a = alloca_in_entry(lty(t), u.cz(l.name));
-        L.LLVMSetAlignment(a, @int_cast(u32, ty.type_align(t)));
+        set_align(a, @int_cast(u32, ty.type_align(t)));
         F.locals[i] = a;
     }
     return F.locals[i];
@@ -947,47 +1026,46 @@ fn local_ptr(l: *mut ast.Local) *mut L.Value {
 // ---------------------------------------------------------------------------
 // Strings and globals
 // ---------------------------------------------------------------------------
-let mut string_globals: u.SymMap.[*mut L.Value] = u.SymMap.[*mut L.Value].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut L.Value, 0), cap: 0, len: 0 };
+let mut string_globals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
-fn string_ptr(bytes: []u8) *mut L.Value {
+fn string_ptr(bytes: []u8) *mut ir.Value {
     let key = u.intern(bytes);
     let mut g = string_globals.get(key);
     if u.isnil(g) {
         // A NUL follows every literal (not part of the slice), so that
         // "text".ptr is a valid C string (spec §2.5).
-        let init = L.LLVMConstStringInContext(ctx, key.ptr, @int_cast(u32, bytes.len), 0);
-        g = L.LLVMAddGlobal(M, L.LLVMArrayType2(T_i8, @as(u64, bytes.len) + 1), ".str".ptr);
-        L.LLVMSetInitializer(g, init);
-        L.LLVMSetLinkage(g, L.PrivateLinkage);
-        L.LLVMSetGlobalConstant(g, 1);
-        L.LLVMSetUnnamedAddress(g, L.GlobalUnnamedAddr);
-        L.LLVMSetAlignment(g, 1);
+        let init = ir.cstring(bytes);
+        g = ir.add_global(M, ir.t_array(T_i8, @as(u64, bytes.len) + 1), ".str").val;
+        set_init(g, init);
+        set_linkage(g, ir.LINK_INTERNAL);
+        g.gv.is_const = true;
+        set_align(g, 1);
         string_globals.put(key, g);
     }
     return g;
 }
 
-fn const_slice(ptr: *mut L.Value, len: i64) *mut L.Value {
-    let mut el: [2]*mut L.Value = [ptr, usz(len)];
+fn const_slice(ptr: *mut ir.Value, len: i64) *mut ir.Value {
+    let mut el: [2]*mut ir.Value = [ptr, usz(len)];
     return const_struct(el[..]);
 }
 
-let mut global_vals: u.SymMap.[*mut L.Value] = u.SymMap.[*mut L.Value].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut L.Value, 0), cap: 0, len: 0 };
+let mut global_vals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
-fn const_struct2(a: *mut L.Value, b: *mut L.Value) *mut L.Value {
-    let mut el: [2]*mut L.Value = [a, b];
+fn const_struct2(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let mut el: [2]*mut ir.Value = [a, b];
     return const_struct(el[..]);
 }
 
-fn const_struct1(a: *mut L.Value) *mut L.Value {
-    let mut el: [1]*mut L.Value = [a];
+fn const_struct1(a: *mut ir.Value) *mut ir.Value {
+    let mut el: [1]*mut ir.Value = [a];
     return const_struct(el[..]);
 }
 
 // Constant for a global initializer (spec: constant expressions only).
-fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut L.Value {
+fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut ir.Value {
     if e.kind == ast.E_CONV {
         if e.op == ast.CONV_NOOP {
             return gen_const(e.a, t);
@@ -1003,14 +1081,14 @@ fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut L.Value {
             if t.elem.kind == ast.TY_VOID {
                 return const_struct1(code);
             }
-            return const_struct2(code, L.LLVMConstNull(lty(t.elem)));
+            return const_struct2(code, ir.czero(lty(t.elem)));
         }
     }
     if e.is_const and (t.kind == ast.TY_INT) {
         return cint(lty(t), e.cval);
     }
     if e.is_const and (t.kind == ast.TY_FLOAT) {
-        return L.LLVMConstReal(lty(t), e.fval);
+        return ir.cfp(lty(t), e.fval);
     }
     if (t.kind == ast.TY_BOOL) and ((e.kind == ast.E_BOOL) or e.is_const) {
         let mut bv: u64 = 0;
@@ -1021,7 +1099,7 @@ fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut L.Value {
     }
     let k = e.kind;
     if k == ast.E_FLOAT {
-        return L.LLVMConstReal(lty(t), e.fval);
+        return ir.cfp(lty(t), e.fval);
     }
     if k == ast.E_STRING {
         return const_slice(string_ptr(e.str), @int_cast(i64, e.str.len));
@@ -1031,42 +1109,42 @@ fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut L.Value {
     }
     if k == ast.E_ARRAY_LIT {
         let n = e.args.len;
-        let vs = u.newn.[*mut L.Value](n + 1);
+        let vs = u.newn.[*mut ir.Value](n + 1);
         for i in 0..n {
             vs[i] = gen_const(e.args.get(i), t.elem);
         }
-        return L.LLVMConstArray2(lty(t.elem), &mut vs[0], @as(u64, n));
+        return ir.carray(lty(t.elem), vs[0..n]);
     }
     if k == ast.E_ARRAY_REPEAT {
         let v = gen_const(e.a, t.elem);
-        if L.LLVMIsNull(v) != 0 {
-            return L.LLVMConstNull(lty(t));
+        if ir.is_zero(v) {
+            return ir.czero(lty(t));
         }
         let n = @int_cast(usize, t.len);
-        let vs = u.newn.[*mut L.Value](n + 1);
+        let vs = u.newn.[*mut ir.Value](n + 1);
         for i in 0..n {
             vs[i] = v;
         }
-        return L.LLVMConstArray2(lty(t.elem), &mut vs[0], @as(u64, n));
+        return ir.carray(lty(t.elem), vs[0..n]);
     }
     if k == ast.E_STRUCT_LIT {
         let n = t.decl.fields.len;
-        let vs = u.newn.[*mut L.Value](n + 1);
+        let vs = u.newn.[*mut ir.Value](n + 1);
         for i in 0..n {
             vs[i] = gen_const(e.inits.at(i).value, ty.type_field(t, i));
         }
-        return L.LLVMConstNamedStruct(lty(t), &mut vs[0], @int_cast(u32, n));
+        return ir.cagg(lty(t), vs[0..n]);
     }
     if k == ast.E_FIELD {
         if e.op == ast.FK_VARIANT_UNIT {
             let ut = lty(t);
             let tag = ci(lty(ty.union_tag_type(t)), @int_cast(u64, e.index));
-            if L.LLVMCountStructElementTypes(ut) == 1 {
-                let mut one: [1]*mut L.Value = [tag];
-                return L.LLVMConstNamedStruct(ut, &mut one[0], 1);
+            if ir.field_count(ut) == 1 {
+                let mut one: [1]*mut ir.Value = [tag];
+                return ir.cagg(ut, one[..]);
             }
-            let mut el: [2]*mut L.Value = [tag, L.LLVMConstNull(L.LLVMStructGetTypeAtIndex(ut, 1))];
-            return L.LLVMConstNamedStruct(ut, &mut el[0], 2);
+            let mut el: [2]*mut ir.Value = [tag, ir.czero(ut.fields[1])];
+            return ir.cagg(ut, el[..]);
         }
         if (e.op == ast.FK_DECL) and u.notnil(e.decl) and (e.decl.kind == ast.D_FN) {
             return get_inst(e.decl, ty.no_types()).fnv;
@@ -1077,20 +1155,20 @@ fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut L.Value {
         }
     } else if k == ast.E_BUILTIN {
         if e.index == ast.BI_PTR_FROM_INT {
-            return L.LLVMConstIntToPtr(gen_const(e.bargs.at(1).e, ty.t_usize), T_ptr);
+            return ir.cinttoptr(gen_const(e.bargs.at(1).e, ty.t_usize));
         }
     } else if k == ast.E_UNARY {
         if (e.op == lx.TK_MINUS) and (t.kind == ast.TY_FLOAT) {
-            return L.LLVMConstReal(lty(t), -e.a.fval);
+            return ir.cfp(lty(t), -e.a.fval);
         }
     } else if k == ast.E_CALL {
         if e.op == ast.CALLK_VARIANT {
             _ = dg.err(e.span, "E0353", "union constants with a payload are not supported by this compiler yet");
-            return L.LLVMConstNull(lty(t));
+            return ir.czero(lty(t));
         }
     }
     _ = dg.err(e.span, "E0350", "global initializer must be a constant expression");
-    return L.LLVMConstNull(lty(t));
+    return ir.czero(lty(t));
 }
 
 // Symbols are prefixed with the module's path (without .ph), which is unique
@@ -1227,59 +1305,60 @@ fn export_symbol(d: *mut ast.Decl) []u8 {
 
 // Globals live in the link unit when units are compiled separately (their
 // initializers may contain error codes, which only the link unit knows).
-fn global_ref(d: *mut ast.Decl) *mut L.Value {
+fn global_ref(d: *mut ast.Decl) *mut ir.Value {
     let k = u.addr_key(@int_from_ptr(d));
     let found = global_vals.get(k);
     if u.notnil(found) {
         return found;
     }
     let t = d.ty;
-    let g = L.LLVMAddGlobal(M, lty(t), u.cz(u.f2("%s.%s", mangle_prefix(d), d.name)));
-    L.LLVMSetAlignment(g, @int_cast(u32, ty.type_align(t)));
+    let g = ir.add_global(M, lty(t), u.f2("%s.%s", mangle_prefix(d), d.name)).val;
+    set_align(g, @int_cast(u32, ty.type_align(t)));
     global_vals.put(k, g);
     if O.unit == CG_MODULE {
         return g;  // defined by the link unit
     }
     if O.unit == CG_WHOLE {
-        L.LLVMSetLinkage(g, L.InternalLinkage);
+        set_linkage(g, ir.LINK_INTERNAL);
     }
-    L.LLVMSetInitializer(g, gen_const(d.init, t));
+    set_init(g, gen_const(d.init, t));
     if not d.is_mut {
-        L.LLVMSetGlobalConstant(g, 1);
+        g.gv.is_const = true;
     }
     return g;
 }
 
 // Program-wide state shared by all units: defined (internal) in a whole
 // program, declared by module units, defined (external) by the link unit.
-fn shared_global(t: *mut L.LType, name: []u8, init: *mut L.Value, addrspace: u32) *mut L.Value {
+fn shared_global(t: *mut ir.Ty, name: []u8, init: *mut ir.Value, addrspace: u32) *mut ir.Value {
     let mut g = vnil();
     if addrspace != 0 {
-        g = L.LLVMAddGlobalInAddressSpace(M, t, u.cz(name), addrspace);
+        g = ir.add_global(M, t, name).val;
+        g.gv.wasm_global = true;
     } else {
-        g = L.LLVMAddGlobal(M, t, u.cz(name));
+        g = ir.add_global(M, t, name).val;
     }
     if O.unit == CG_MODULE {
         return g;
     }
-    L.LLVMSetInitializer(g, init);
+    set_init(g, init);
     if O.unit == CG_WHOLE {
-        L.LLVMSetLinkage(g, L.InternalLinkage);
+        set_linkage(g, ir.LINK_INTERNAL);
     }
     return g;
 }
 
 // An error code: a constant, except in module units, where the codes are
 // only known at link time (spec §11.1) and are loaded from the link unit.
-fn errcode_value(code: u32) *mut L.Value {
+fn errcode_value(code: u32) *mut ir.Value {
     if (O.unit != CG_MODULE) or (code == 0) or (@as(usize, code) > sema.g_prog.error_names.len) {
         return ci(T_i16, @as(u64, code));
     }
     let name = u.cz(u.f1("phalange.errcode.%s", sema.g_prog.error_names.get(@as(usize, code) - 1)));
-    let mut g = L.LLVMGetNamedGlobal(M, name);
+    let mut g = named_global(u.from_c(name));
     if u.isnil(g) {
-        g = L.LLVMAddGlobal(M, T_i16, name);
-        L.LLVMSetGlobalConstant(g, 1);
+        g = ir.add_global(M, T_i16, u.from_c(name)).val;
+        g.gv.is_const = true;
     }
     return ld(T_i16, g);
 }
@@ -1380,19 +1459,16 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
         name = nb.done();
     }
     if d.variadic {
-        let np = L.LLVMCountParamTypes(fi.llty);
-        let pts = u.newn.[*mut L.LType](@as(usize, np) + 1);
-        L.LLVMGetParamTypes(fi.llty, &mut pts[0]);
-        fi.llty = fn_type(L.LLVMGetReturnType(fi.llty), pts[0..@as(usize, np)], true);
+        fi.llty = fn_type(fi.llty.ret, fi.llty.params, true);
     }
     let mut existing = vnil();
     if d.kind == ast.D_HOST_FN {
-        existing = L.LLVMGetNamedFunction(M, u.cz(name));
+        existing = named_fn(name);
     }
     if u.notnil(existing) {
         fi.fnv = existing;
     } else {
-        fi.fnv = L.LLVMAddFunction(M, u.cz(name), fi.llty);
+        fi.fnv = ir.add_function(M, name, fi.llty).val;
     }
     add_ext_attrs(fi.fnv, fi.fnty, fi.sret, false);
     if d.kind == ast.D_HOST_FN {
@@ -1414,9 +1490,9 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
             define = d.module == O.module;
         }
         if (O.unit == CG_WHOLE) and not d.is_export {
-            L.LLVMSetLinkage(fi.fnv, L.InternalLinkage);
+            set_linkage(fi.fnv, ir.LINK_INTERNAL);
         } else if define and (n > 0) {
-            L.LLVMSetLinkage(fi.fnv, L.LinkOnceODRLinkage);
+            set_linkage(fi.fnv, ir.LINK_LINKONCE);
         }
         if define and d.is_export and ty.g_target.is_wasm {
             add_str_attr(fi.fnv, "wasm-export-name", d.name);
@@ -1438,7 +1514,7 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
 // returned sign- or zero-extended. Marking every function (and indirect call)
 // this way makes any Phalange function with a scalar signature callable from
 // C, and C function pointers callable from Phalange (spec §15.5).
-fn ext_attr(v: *mut L.Value, idx: u32, t: *mut ast.Type, is_call: bool) void {
+fn ext_attr(v: *mut ir.Value, idx: u32, t: *mut ast.Type, is_call: bool) void {
     let mut kind = u.nosym();
     if t.kind == ast.TY_BOOL {
         kind = "zeroext";
@@ -1448,17 +1524,22 @@ fn ext_attr(v: *mut L.Value, idx: u32, t: *mut ast.Type, is_call: bool) void {
     if u.isnos(kind) {
         return;
     }
-    let a = L.LLVMCreateEnumAttribute(ctx, L.LLVMGetEnumAttributeKindForName(kind.ptr, kind.len), 0);
+    let mut e: u8 = 1;
+    if u.str_eq(kind, "signext") {
+        e = 2;
+    }
     if is_call {
-        L.LLVMAddCallSiteAttribute(v, idx, a);
+        v.ext[@as(usize, idx)] = e;
+    } else if idx == 0 {
+        v.fnp.ret_ext = e;
     } else {
-        L.LLVMAddAttributeAtIndex(v, idx, a);
+        v.fnp.param_ext[@as(usize, idx - 1)] = e;
     }
 }
 
-fn add_ext_attrs(v: *mut L.Value, fnty: *mut ast.Type, sret: bool, is_call: bool) void {
+fn add_ext_attrs(v: *mut ir.Value, fnty: *mut ast.Type, sret: bool, is_call: bool) void {
     if not sret and (fnty.ret.kind != ast.TY_VOID) {
-        ext_attr(v, L.ReturnIndex, fnty.ret, is_call);
+        ext_attr(v, 0, fnty.ret, is_call);
     }
     let mut first: u32 = 1;
     if sret {
@@ -1500,26 +1581,26 @@ fn emit_defers(down_to: usize) void {
     }
 }
 
-fn emit_ret(v: *mut L.Value) void {
+fn emit_ret(v: *mut ir.Value) void {
     if u.notnil(F.sret_ptr) {
         store(F.ret, v, F.sret_ptr, false);
-        _ = L.LLVMBuildRetVoid(B);
+        ir.ret_void(B);
     } else if F.ret.kind == ast.TY_VOID {
-        _ = L.LLVMBuildRetVoid(B);
+        ir.ret_void(B);
     } else {
-        _ = L.LLVMBuildRet(B, v);
+        ir.ret(B, v);
     }
 }
 
-fn errunion_value(eu: *mut ast.Type, code: *mut L.Value, payload: *mut L.Value) *mut L.Value {
+fn errunion_value(eu: *mut ast.Type, code: *mut ir.Value, payload: *mut ir.Value) *mut ir.Value {
     let t = lty(eu);
-    let mut v = L.LLVMGetUndef(t);
+    let mut v = ir.undef(t);
     v = insert(v, code, 0);
     if eu.elem.kind != ast.TY_VOID {
         if u.notnil(payload) {
             v = insert(v, to_mem(eu.elem, payload), 1);
         } else {
-            v = insert(v, L.LLVMConstNull(lty(eu.elem)), 1);
+            v = insert(v, ir.czero(lty(eu.elem)), 1);
         }
     }
     return v;
@@ -1563,13 +1644,13 @@ fn gen_break(is_break: bool) void {
 // ---------------------------------------------------------------------------
 // Arithmetic
 // ---------------------------------------------------------------------------
-fn int_min(t: *mut L.LType) *mut L.Value {
-    let bits = L.LLVMGetIntTypeWidth(t);
+fn int_min(t: *mut ir.Ty) *mut ir.Value {
+    let bits = ir.int_width(t);
     return cint(t, u.I128.pow2(bits - 1).neg());
 }
 
-fn int_max(t: *mut L.LType, is_signed: bool) *mut L.Value {
-    let bits = L.LLVMGetIntTypeWidth(t);
+fn int_max(t: *mut ir.Ty, is_signed: bool) *mut ir.Value {
+    let bits = ir.int_width(t);
     if is_signed {
         return cint(t, u.I128.pow2(bits - 1).sub(u.I128.of(1)));
     }
@@ -1577,18 +1658,18 @@ fn int_max(t: *mut L.LType, is_signed: bool) *mut L.Value {
 }
 
 struct Ovf {
-    val: *mut L.Value,
-    ovf: *mut L.Value,
+    val: *mut ir.Value,
+    ovf: *mut ir.Value,
 }
 
 // Overflow-checked arithmetic, expressed with plain instructions only.
 // (The llvm.*.with.overflow intrinsics would force LLVM's slow SelectionDAG
 // path at -O0 on wasm; at -O1+ LLVM re-forms the intrinsics from these
 // patterns anyway.)
-fn mul_wide_overflow(is_signed: bool, l: *mut L.Value, r: *mut L.Value) Ovf {
-    let t = L.LLVMTypeOf(l);
-    let bits = L.LLVMGetIntTypeWidth(t);
-    let w = L.LLVMIntTypeInContext(ctx, bits * 2);
+fn mul_wide_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
+    let t = l.ty;
+    let bits = ir.int_width(t);
+    let w = ir.t_int(@int_cast(i32, bits * 2));
     let mut lw = vnil();
     let mut rw = vnil();
     if is_signed {
@@ -1606,90 +1687,90 @@ fn mul_wide_overflow(is_signed: bool, l: *mut L.Value, r: *mut L.Value) Ovf {
     } else {
         back = zext(val, w);
     }
-    return Ovf.{ val: val, ovf: icmp(L.IntNE, back, p) };
+    return Ovf.{ val: val, ovf: icmp(ir.IntNE, back, p) };
 }
 
 // 64-bit multiply: no 128-bit multiply needed (freestanding wasm has no
 // compiler-rt); overflow is detected by dividing back.
-fn mul64_overflow(is_signed: bool, l: *mut L.Value, r: *mut L.Value) Ovf {
-    let t = L.LLVMTypeOf(l);
-    let zero = L.LLVMConstNull(t);
+fn mul64_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
+    let t = l.ty;
+    let zero = ir.czero(t);
     let one = ci(t, 1);
     let prod = b_mul(l, r);
-    let lz = icmp(L.IntEQ, l, zero);
+    let lz = icmp(ir.IntEQ, l, zero);
     if not is_signed {
         let div = sel(lz, one, l);
-        let back = L.LLVMBuildUDiv(B, prod, div, NN());
-        let ne = icmp(L.IntNE, back, r);  // (right to left, as in the C implementation)
+        let back = ir.binop(B, ir.OP_UDIV, prod, div);
+        let ne = icmp(ir.IntNE, back, r);  // (right to left, as in the C implementation)
         let ovf = b_and(b_not(lz), ne);
         return Ovf.{ val: prod, ovf: ovf };
     }
-    let lm1 = icmp(L.IntEQ, l, L.LLVMConstAllOnes(t));
+    let lm1 = icmp(ir.IntEQ, l, ir.cones(t));
     let safe = b_or(lz, lm1);
     let div = sel(safe, one, l);
-    let back = L.LLVMBuildSDiv(B, prod, div, NN());
-    let ne = icmp(L.IntNE, back, r);  // (right to left, as in the C implementation)
+    let back = ir.binop(B, ir.OP_SDIV, prod, div);
+    let ne = icmp(ir.IntNE, back, r);  // (right to left, as in the C implementation)
     let general = b_and(b_not(safe), ne);
-    let m1case = b_and(lm1, icmp(L.IntEQ, r, int_min(t)));
+    let m1case = b_and(lm1, icmp(ir.IntEQ, r, int_min(t)));
     return Ovf.{ val: prod, ovf: b_or(general, m1case) };
 }
 
 // base: 0 add, 1 sub, 2 mul
-fn op_with_overflow(base: i32, is_signed: bool, l: *mut L.Value, r: *mut L.Value) Ovf {
-    let t = L.LLVMTypeOf(l);
-    let zero = L.LLVMConstNull(t);
+fn op_with_overflow(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
+    let t = l.ty;
+    let zero = ir.czero(t);
     if base == 0 {
         let val = b_add(l, r);
         if is_signed {
             let xr = b_xor(r, val);  // (right to left, as in the C implementation)
             let x = b_and(b_xor(l, val), xr);
-            return Ovf.{ val: val, ovf: icmp(L.IntSLT, x, zero) };
+            return Ovf.{ val: val, ovf: icmp(ir.IntSLT, x, zero) };
         }
-        return Ovf.{ val: val, ovf: icmp(L.IntULT, val, l) };
+        return Ovf.{ val: val, ovf: icmp(ir.IntULT, val, l) };
     }
     if base == 1 {
         let val = b_sub(l, r);
         if is_signed {
             let xv = b_xor(l, val);  // (right to left, as in the C implementation)
             let x = b_and(b_xor(l, r), xv);
-            return Ovf.{ val: val, ovf: icmp(L.IntSLT, x, zero) };
+            return Ovf.{ val: val, ovf: icmp(ir.IntSLT, x, zero) };
         }
-        return Ovf.{ val: val, ovf: icmp(L.IntULT, l, r) };
+        return Ovf.{ val: val, ovf: icmp(ir.IntULT, l, r) };
     }
-    if L.LLVMGetIntTypeWidth(t) <= 32 {
+    if ir.int_width(t) <= 32 {
         return mul_wide_overflow(is_signed, l, r);
     }
     return mul64_overflow(is_signed, l, r);
 }
 
-fn saturated(t: *mut L.LType, neg_direction: *mut L.Value) *mut L.Value {
+fn saturated(t: *mut ir.Ty, neg_direction: *mut ir.Value) *mut ir.Value {
     return sel(neg_direction, int_min(t), int_max(t, true));
 }
 
-fn overflow_op(base: i32, is_signed: bool, l: *mut L.Value, r: *mut L.Value) *mut L.Value {
-    let t = L.LLVMTypeOf(l);
+fn overflow_op(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    let t = l.ty;
     let o = op_with_overflow(base, is_signed, l, r);
     if not O.overflow_saturate {
         check_or_trap(b_not(o.ovf), T_OVERFLOW);
         return o.val;
     }
-    let zero = L.LLVMConstNull(t);
+    let zero = ir.czero(t);
     let mut s = vnil();
     if base == 2 {
         if is_signed {
-            s = saturated(t, icmp(L.IntSLT, b_xor(l, r), zero));
+            s = saturated(t, icmp(ir.IntSLT, b_xor(l, r), zero));
         } else {
             s = int_max(t, false);
         }
     } else if base == 0 {
         if is_signed {
-            s = saturated(t, icmp(L.IntSLT, l, zero));
+            s = saturated(t, icmp(ir.IntSLT, l, zero));
         } else {
             s = int_max(t, false);
         }
     } else {
         if is_signed {
-            s = saturated(t, icmp(L.IntSLT, l, zero));
+            s = saturated(t, icmp(ir.IntSLT, l, zero));
         } else {
             s = zero;
         }
@@ -1698,45 +1779,43 @@ fn overflow_op(base: i32, is_signed: bool, l: *mut L.Value, r: *mut L.Value) *mu
 }
 
 // Shift with mathematical semantics for every count (spec §7.6).
-fn gen_shift(op: i32, t: *mut ast.Type, x: *mut L.Value, k: *mut L.Value) *mut L.Value {
+fn gen_shift(op: i32, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut ir.Value {
     let mut lane = t;
     if t.kind == ast.TY_VEC {
         lane = t.elem;
     }
     let n = @int_cast(u32, lane.bits);
-    let kty = L.LLVMTypeOf(k);
-    let ge = icmp(L.IntUGE, k, ci(kty, @as(u64, n)));
-    let lane_ty = L.LLVMIntTypeInContext(ctx, n);
+    let kty = k.ty;
+    let ge = icmp(ir.IntUGE, k, ci(kty, @as(u64, n)));
+    let lane_ty = ir.t_int(@int_cast(i32, n));
     let arith = (op == lx.TK_SHR) and lane.is_signed;
     let mut fill: u64 = 0;
     if arith {
         fill = @as(u64, n - 1);
     }
     let mut kc = sel(ge, ci(kty, fill), k);
-    let kb = L.LLVMGetIntTypeWidth(kty);
+    let kb = ir.int_width(kty);
     if kb > n {
         kc = trunc(kc, lane_ty);
     } else if kb < n {
         kc = zext(kc, lane_ty);
     }
     if t.kind == ast.TY_VEC {
-        let vt = L.LLVMTypeOf(x);
-        let v = L.LLVMBuildInsertElement(B, L.LLVMGetUndef(vt), kc, ci32(0), NN());
-        let mask = L.LLVMConstNull(L.LLVMVectorType(T_i32, @int_cast(u32, t.lanes)));
-        kc = L.LLVMBuildShuffleVector(B, v, L.LLVMGetUndef(vt), mask, NN());
+        let vt = x.ty;
+        kc = ir.splat(B, vt, kc);
     }
     let mut r = vnil();
     if op == lx.TK_SHL {
-        r = L.LLVMBuildShl(B, x, kc, NN());
+        r = ir.binop(B, ir.OP_SHL, x, kc);
     } else if arith {
-        return L.LLVMBuildAShr(B, x, kc, NN());
+        return ir.binop(B, ir.OP_ASHR, x, kc);
     } else {
-        r = L.LLVMBuildLShr(B, x, kc, NN());
+        r = ir.binop(B, ir.OP_LSHR, x, kc);
     }
-    return sel(ge, L.LLVMConstNull(L.LLVMTypeOf(x)), r);
+    return sel(ge, ir.czero(x.ty), r);
 }
 
-fn gen_binop(op: i32, t: *mut ast.Type, l: *mut L.Value, r: *mut L.Value) *mut L.Value {
+fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
     let is_float = (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t);
     let mut sgn = false;
     if t.kind == ast.TY_INT {
@@ -1746,50 +1825,50 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut L.Value, r: *mut L.Value) *mut L
     }
     if op == lx.TK_PLUS {
         if is_float {
-            return L.LLVMBuildFAdd(B, l, r, NN());
+            return ir.binop(B, ir.OP_FADD, l, r);
         }
         return overflow_op(0, sgn, l, r);
     }
     if op == lx.TK_MINUS {
         if is_float {
-            return L.LLVMBuildFSub(B, l, r, NN());
+            return ir.binop(B, ir.OP_FSUB, l, r);
         }
         return overflow_op(1, sgn, l, r);
     }
     if op == lx.TK_STAR {
         if is_float {
-            return L.LLVMBuildFMul(B, l, r, NN());
+            return ir.binop(B, ir.OP_FMUL, l, r);
         }
         return overflow_op(2, sgn, l, r);
     }
     if op == lx.TK_SLASH {
         if is_float {
-            return L.LLVMBuildFDiv(B, l, r, NN());
+            return ir.binop(B, ir.OP_FDIV, l, r);
         }
-        let tt = L.LLVMTypeOf(l);
-        check_or_trap(icmp(L.IntNE, r, L.LLVMConstNull(tt)), T_DIVZERO);
+        let tt = l.ty;
+        check_or_trap(icmp(ir.IntNE, r, ir.czero(tt)), T_DIVZERO);
         if not sgn {
-            return L.LLVMBuildUDiv(B, l, r, NN());
+            return ir.binop(B, ir.OP_UDIV, l, r);
         }
-        let rm1 = icmp(L.IntEQ, r, L.LLVMConstAllOnes(tt));  // (right to left, as in the C implementation)
-        let ovf = b_and(icmp(L.IntEQ, l, int_min(tt)), rm1);
+        let rm1 = icmp(ir.IntEQ, r, ir.cones(tt));  // (right to left, as in the C implementation)
+        let ovf = b_and(icmp(ir.IntEQ, l, int_min(tt)), rm1);
         if not O.overflow_saturate {
             check_or_trap(b_not(ovf), T_OVERFLOW);
-            return L.LLVMBuildSDiv(B, l, r, NN());
+            return ir.binop(B, ir.OP_SDIV, l, r);
         }
         let r2 = sel(ovf, ci(tt, 1), r);
-        let q = L.LLVMBuildSDiv(B, l, r2, NN());
+        let q = ir.binop(B, ir.OP_SDIV, l, r2);
         return sel(ovf, int_max(tt, true), q);
     }
     if op == lx.TK_PERCENT {
-        let tt = L.LLVMTypeOf(l);
-        check_or_trap(icmp(L.IntNE, r, L.LLVMConstNull(tt)), T_DIVZERO);
+        let tt = l.ty;
+        check_or_trap(icmp(ir.IntNE, r, ir.czero(tt)), T_DIVZERO);
         if not sgn {
-            return L.LLVMBuildURem(B, l, r, NN());
+            return ir.binop(B, ir.OP_UREM, l, r);
         }
-        let m1 = icmp(L.IntEQ, r, L.LLVMConstAllOnes(tt));
+        let m1 = icmp(ir.IntEQ, r, ir.cones(tt));
         let r2 = sel(m1, ci(tt, 1), r);
-        return L.LLVMBuildSRem(B, l, r2, NN());
+        return ir.binop(B, ir.OP_SREM, l, r2);
     }
     if op == lx.TK_PLUS_PCT {
         return b_add(l, r);
@@ -1814,42 +1893,42 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut L.Value, r: *mut L.Value) *mut L
     }
     // comparisons
     if is_float {
-        let mut p = L.RealOGE;
+        let mut p = ir.RealOGE;
         if op == lx.TK_EQEQ {
-            p = L.RealOEQ;
+            p = ir.RealOEQ;
         } else if op == lx.TK_NE {
-            p = L.RealUNE;
+            p = ir.RealUNE;
         } else if op == lx.TK_LT {
-            p = L.RealOLT;
+            p = ir.RealOLT;
         } else if op == lx.TK_LE {
-            p = L.RealOLE;
+            p = ir.RealOLE;
         } else if op == lx.TK_GT {
-            p = L.RealOGT;
+            p = ir.RealOGT;
         }
         return fcmp(p, l, r);
     }
-    let mut p = L.IntUGE;
+    let mut p = ir.IntUGE;
     if sgn {
-        p = L.IntSGE;
+        p = ir.IntSGE;
     }
     if op == lx.TK_EQEQ {
-        p = L.IntEQ;
+        p = ir.IntEQ;
     } else if op == lx.TK_NE {
-        p = L.IntNE;
+        p = ir.IntNE;
     } else if op == lx.TK_LT {
-        p = L.IntULT;
+        p = ir.IntULT;
         if sgn {
-            p = L.IntSLT;
+            p = ir.IntSLT;
         }
     } else if op == lx.TK_LE {
-        p = L.IntULE;
+        p = ir.IntULE;
         if sgn {
-            p = L.IntSLE;
+            p = ir.IntSLE;
         }
     } else if op == lx.TK_GT {
-        p = L.IntUGT;
+        p = ir.IntUGT;
         if sgn {
-            p = L.IntSGT;
+            p = ir.IntSGT;
         }
     }
     return icmp(p, l, r);
@@ -1858,7 +1937,7 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut L.Value, r: *mut L.Value) *mut L
 // ---------------------------------------------------------------------------
 // Places
 // ---------------------------------------------------------------------------
-fn addr_or_spill(e: *mut ast.Expr) *mut L.Value {
+fn addr_or_spill(e: *mut ast.Expr) *mut ir.Value {
     if sema.is_place(e) {
         return gen_addr(e);
     }
@@ -1881,11 +1960,11 @@ fn via_pointer(e: *mut ast.Expr) bool {
     return false;
 }
 
-fn array_len_value(arr: *mut ast.Type) *mut L.Value {
+fn array_len_value(arr: *mut ast.Type) *mut ir.Value {
     return usz(arr.len);
 }
 
-fn gen_addr_inner(e: *mut ast.Expr) *mut L.Value {
+fn gen_addr_inner(e: *mut ast.Expr) *mut ir.Value {
     let k = e.kind;
     if k == ast.E_IDENT {
         if u.notnil(e.local) {
@@ -1917,7 +1996,7 @@ fn gen_addr_inner(e: *mut ast.Expr) *mut L.Value {
             let idx = gen(e.b);
             let ptr = extract(s, 0);
             let len = extract(s, 1);
-            check_or_trap(icmp(L.IntULT, idx, len), T_BOUNDS);
+            check_or_trap(icmp(ir.IntULT, idx, len), T_BOUNDS);
             return gep1(lty(at.elem), ptr, idx);
         }
         let mut arr = at;
@@ -1929,7 +2008,7 @@ fn gen_addr_inner(e: *mut ast.Expr) *mut L.Value {
             base = addr_or_spill(e.a);
         }
         let idx = gen(e.b);
-        check_or_trap(icmp(L.IntULT, idx, array_len_value(arr)), T_BOUNDS);
+        check_or_trap(icmp(ir.IntULT, idx, array_len_value(arr)), T_BOUNDS);
         return gep2(lty(arr), base, usz(0), idx);
     }
     // not a place: materialize
@@ -1940,14 +2019,14 @@ fn gen_addr_inner(e: *mut ast.Expr) *mut L.Value {
 // ---------------------------------------------------------------------------
 // Calls
 // ---------------------------------------------------------------------------
-fn emit_call(fty: *mut L.LType, fnv: *mut L.Value, fnty: *mut ast.Type, sret: bool, argv: []mut *mut L.Value,
-             argt: []mut *mut ast.Type, callee: []u8) *mut L.Value {
+fn emit_call(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: bool, argv: []mut *mut ir.Value,
+             argt: []mut *mut ast.Type, callee: []u8) *mut ir.Value {
     let argc = argv.len;
     let mut n = argc;
     if sret {
         n += 1;
     }
-    let av = u.newn.[*mut L.Value](n + 1);
+    let av = u.newn.[*mut ir.Value](n + 1);
     let mut k: usize = 0;
     let mut ret_tmp = vnil();
     if sret {
@@ -1976,7 +2055,7 @@ fn emit_call(fty: *mut L.LType, fnv: *mut L.Value, fnty: *mut ast.Type, sret: bo
     return r;
 }
 
-fn gen_call(e: *mut ast.Expr) *mut L.Value {
+fn gen_call(e: *mut ast.Expr) *mut ir.Value {
     if e.op == ast.CALLK_VARIANT {
         let ut = ct(e.tval);
         let tmp = temp_alloca(ut);
@@ -1992,7 +2071,7 @@ fn gen_call(e: *mut ast.Expr) *mut L.Value {
         let ft = ct(e.a.ty);
         let fp = gen(e.a);
         let n = e.args.len;
-        let av = u.newn.[*mut L.Value](n + 1);
+        let av = u.newn.[*mut ir.Value](n + 1);
         for i in 0..n {
             av[i] = gen(e.args.get(i));
         }
@@ -2006,7 +2085,7 @@ fn gen_call(e: *mut ast.Expr) *mut L.Value {
     if has_recv {
         n += 1;
     }
-    let av = u.newn.[*mut L.Value](n + 1);
+    let av = u.newn.[*mut ir.Value](n + 1);
     let mut k: usize = 0;
     if has_recv {
         let recv = e.b;
@@ -2046,11 +2125,11 @@ fn gen_call(e: *mut ast.Expr) *mut L.Value {
 // ---------------------------------------------------------------------------
 // catch / try
 // ---------------------------------------------------------------------------
-fn gen_try(e: *mut ast.Expr) *mut L.Value {
+fn gen_try(e: *mut ast.Expr) *mut ir.Value {
     let eu = ct(e.a.ty);
     let v = gen(e.a);
     let code = extract(v, 0);
-    let is_err = icmp(L.IntNE, code, ci(T_i16, 0));
+    let is_err = icmp(ir.IntNE, code, ci(T_i16, 0));
     let err_bb = new_bb("try.err".ptr);
     let ok_bb = new_bb("try.ok".ptr);
     condbr(is_err, err_bb, ok_bb);
@@ -2068,12 +2147,12 @@ fn gen_try(e: *mut ast.Expr) *mut L.Value {
     return from_mem(eu.elem, extract(v, 1));
 }
 
-fn gen_catch(e: *mut ast.Expr) *mut L.Value {
+fn gen_catch(e: *mut ast.Expr) *mut ir.Value {
     let eu = ct(e.a.ty);
     let vt = eu.elem;
     let v = gen(e.a);
     let code = extract(v, 0);
-    let is_err = icmp(L.IntNE, code, ci(T_i16, 0));
+    let is_err = icmp(ir.IntNE, code, ci(T_i16, 0));
     let err_bb = new_bb("catch.err".ptr);
     let ok_bb = new_bb("catch.ok".ptr);
     let merge = new_bb("catch.end".ptr);
@@ -2089,7 +2168,7 @@ fn gen_catch(e: *mut ast.Expr) *mut L.Value {
     if hk == ast.H_VALUE {
         hv = gen(e.hexpr);
         if not terminated() {
-            hbb = L.LLVMGetInsertBlock(B);
+            hbb = ir.insert_block(B);
             br(merge);
         }
     } else if hk == ast.H_RETURN {
@@ -2105,14 +2184,14 @@ fn gen_catch(e: *mut ast.Expr) *mut L.Value {
         }
     }
     if not terminated() {
-        _ = L.LLVMBuildUnreachable(B);
+        ir.unreachable(B);
     }
     at_end(ok_bb);
     let mut ov = vnil();
     if vt.kind != ast.TY_VOID {
         ov = from_mem(vt, extract(v, 1));
     }
-    let obb = L.LLVMGetInsertBlock(B);
+    let obb = ir.insert_block(B);
     br(merge);
     at_end(merge);
     if vt.kind == ast.TY_VOID {
@@ -2121,22 +2200,22 @@ fn gen_catch(e: *mut ast.Expr) *mut L.Value {
     if u.isnil(hbb) or u.isnil(hv) {
         return ov;
     }
-    let phi = L.LLVMBuildPhi(B, vty(vt), NN());
-    let mut vals: [2]*mut L.Value = [ov, hv];
-    let mut bbs: [2]*mut L.BB = [obb, hbb];
-    L.LLVMAddIncoming(phi, &mut vals[0], &mut bbs[0], 2);
+    let phi = ir.phi(B, vty(vt));
+    let mut vals: [2]*mut ir.Value = [ov, hv];
+    let mut bbs: [2]*mut ir.Block = [obb, hbb];
+    ir.add_incoming(phi, vals[0], bbs[0]);
+    ir.add_incoming(phi, vals[1], bbs[1]);
     return phi;
 }
 
 // ---------------------------------------------------------------------------
 // Builtins
 // ---------------------------------------------------------------------------
-fn splat(vt: *mut L.LType, x: *mut L.Value, lanes: u32) *mut L.Value {
-    let v = L.LLVMBuildInsertElement(B, L.LLVMGetUndef(vt), x, ci32(0), NN());
-    return L.LLVMBuildShuffleVector(B, v, L.LLVMGetUndef(vt), L.LLVMConstNull(L.LLVMVectorType(T_i32, lanes)), NN());
+fn splat(vt: *mut ir.Ty, x: *mut ir.Value, lanes: u32) *mut ir.Value {
+    return ir.splat(B, vt, x);
 }
 
-fn pairwise_sum(xs: []mut *mut L.Value, is_float: bool) *mut L.Value {
+fn pairwise_sum(xs: []mut *mut ir.Value, is_float: bool) *mut ir.Value {
     let n = xs.len;
     if n == 1 {
         return xs[0];
@@ -2145,23 +2224,23 @@ fn pairwise_sum(xs: []mut *mut L.Value, is_float: bool) *mut L.Value {
     let a = pairwise_sum(xs[0..h], is_float);
     let b = pairwise_sum(xs[h..n], is_float);
     if is_float {
-        return L.LLVMBuildFAdd(B, a, b, NN());
+        return ir.binop(B, ir.OP_FADD, a, b);
     }
     return b_add(a, b);
 }
 
-fn reduce_add(vt: *mut ast.Type, v: *mut L.Value) *mut L.Value {
+fn reduce_add(vt: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
     let n = @int_cast(usize, vt.lanes);
-    let xs = u.newn.[*mut L.Value](n);
+    let xs = u.newn.[*mut ir.Value](n);
     for i in 0..n {
-        xs[i] = L.LLVMBuildExtractElement(B, v, ci32(@as(u64, i)), NN());
+        xs[i] = ext_elem(v, ci32(@as(u64, i)));
     }
     return pairwise_sum(xs, vt.elem.kind == ast.TY_FLOAT);
 }
 
-fn ext_int(v: *mut L.Value, to: *mut L.LType, is_signed: bool) *mut L.Value {
-    let a = L.LLVMGetIntTypeWidth(L.LLVMTypeOf(v));
-    let b = L.LLVMGetIntTypeWidth(to);
+fn ext_int(v: *mut ir.Value, to: *mut ir.Ty, is_signed: bool) *mut ir.Value {
+    let a = ir.int_width(v.ty);
+    let b = ir.int_width(to);
     if a == b {
         return v;
     }
@@ -2178,7 +2257,7 @@ fn barg(e: *mut ast.Expr, i: usize) *mut ast.Expr {
     return e.bargs.at(i).e;
 }
 
-fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
+fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     let rt = ct(e.ty);
     let id = e.index;
     if id == ast.BI_SIZE_OF {
@@ -2207,13 +2286,13 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
             return ext_int(v, lty(rt), s.is_signed);
         }
         if (s.kind == ast.TY_FLOAT) and (rt.kind == ast.TY_FLOAT) {
-            return L.LLVMBuildFPExt(B, v, lty(rt), NN());
+            return ir.cast(B, ir.OP_FPEXT, v, lty(rt));
         }
         if (s.kind == ast.TY_INT) and (rt.kind == ast.TY_FLOAT) {
             if s.is_signed {
-                return L.LLVMBuildSIToFP(B, v, lty(rt), NN());
+                return ir.cast(B, ir.OP_SITOFP, v, lty(rt));
             }
-            return L.LLVMBuildUIToFP(B, v, lty(rt), NN());
+            return ir.cast(B, ir.OP_UITOFP, v, lty(rt));
         }
         return v;
     }
@@ -2224,15 +2303,15 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
             return v;
         }
         // Range check in the source type's width (no 128-bit arithmetic).
-        let stt = L.LLVMTypeOf(v);
+        let stt = v.ty;
         let sb = @int_cast(u32, s.bits);
         let tb = @int_cast(u32, rt.bits);
         let mut ok = ci(T_i1, 1);
         if s.is_signed {
             if not rt.is_signed {
-                ok = icmp(L.IntSGE, v, L.LLVMConstNull(stt));
+                ok = icmp(ir.IntSGE, v, ir.czero(stt));
             } else if tb < sb {
-                ok = icmp(L.IntSGE, v, cint(stt, u.I128.pow2(tb - 1).neg()));
+                ok = icmp(ir.IntSGE, v, cint(stt, u.I128.pow2(tb - 1).neg()));
             }
         }
         let mut tmax_bits = tb;  // T.max = 2^tmax_bits - 1
@@ -2245,9 +2324,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         }
         if tmax_bits < smax_bits {
             let hi = cint(stt, u.I128.pow2(tmax_bits).sub(u.I128.of(1)));
-            let mut p = L.IntULE;
+            let mut p = ir.IntULE;
             if s.is_signed {
-                p = L.IntSLE;
+                p = ir.IntSLE;
             }
             ok = b_and(ok, icmp(p, v, hi));
         }
@@ -2260,17 +2339,17 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
     }
     if id == ast.BI_INT_FROM_FLOAT {
         let v = gen(barg(e, 1));
-        let mut tys: [2]*mut L.LType = [lty(rt), L.LLVMTypeOf(v)];
-        let mut args: [1]*mut L.Value = [v];
+        let mut tys: [2]*mut ir.Ty = [lty(rt), v.ty];
+        let mut args: [1]*mut ir.Value = [v];
         return intrinsic(u.pick(rt.is_signed, "llvm.fptosi.sat", "llvm.fptoui.sat"), tys[..], args[..]);
     }
     if id == ast.BI_FLOAT_FROM_INT {
         let s = ct(barg(e, 1).ty);
         let v = gen(barg(e, 1));
         if s.is_signed {
-            return L.LLVMBuildSIToFP(B, v, lty(rt), NN());
+            return ir.cast(B, ir.OP_SITOFP, v, lty(rt));
         }
-        return L.LLVMBuildUIToFP(B, v, lty(rt), NN());
+        return ir.cast(B, ir.OP_UITOFP, v, lty(rt));
     }
     if id == ast.BI_FLOAT_CAST {
         let s = ct(barg(e, 1).ty);
@@ -2279,9 +2358,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
             return v;
         }
         if s.bits > rt.bits {
-            return L.LLVMBuildFPTrunc(B, v, lty(rt), NN());
+            return ir.cast(B, ir.OP_FPTRUNC, v, lty(rt));
         }
-        return L.LLVMBuildFPExt(B, v, lty(rt), NN());
+        return ir.cast(B, ir.OP_FPEXT, v, lty(rt));
     }
     if id == ast.BI_BIT_CAST {
         let s = ct(barg(e, 1).ty);
@@ -2312,7 +2391,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
     if id == ast.BI_SLICE_FROM_PTR {
         let p = gen(barg(e, 0));
         let n = gen(barg(e, 1));
-        let s = insert(L.LLVMGetUndef(lty(rt)), p, 0);
+        let s = insert(ir.undef(lty(rt)), p, 0);
         return insert(s, n, 1);
     }
     if id == ast.BI_CAST_SLICE {
@@ -2326,8 +2405,8 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         if to == 0 {
             nlen = usz(0);
         } else {
-            check_or_trap(icmp(L.IntEQ, L.LLVMBuildURem(B, bytes, usz(to), NN()), usz(0)), T_LENGTH);
-            nlen = L.LLVMBuildUDiv(B, bytes, usz(to), NN());
+            check_or_trap(icmp(ir.IntEQ, ir.binop(B, ir.OP_UREM, bytes, usz(to)), usz(0)), T_LENGTH);
+            nlen = ir.binop(B, ir.OP_UDIV, bytes, usz(to));
         }
         return insert(s, nlen, 1);
     }
@@ -2337,10 +2416,10 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let s = gen(barg(e, 1));
         let dl = extract(d, 1);
         let sl = extract(s, 1);
-        check_or_trap(icmp(L.IntEQ, dl, sl), T_LENGTH);
+        check_or_trap(icmp(ir.IntEQ, dl, sl), T_LENGTH);
         let bytes = b_mul(dl, usz(ty.type_size(dt.elem)));
         let sp0 = extract(s, 0);  // (right to left, as in the C implementation)
-        _ = L.LLVMBuildMemMove(B, extract(d, 0), 1, sp0, 1, bytes);
+        _ = ir.memop(B, ir.OP_MEMMOVE, extract(d, 0), sp0, bytes);
         return vnil();
     }
     if id == ast.BI_MEM_SET {
@@ -2350,7 +2429,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let ptr = extract(d, 0);
         let len = extract(d, 1);
         if (dt.elem.kind == ast.TY_INT) and (dt.elem.bits == 8) {
-            _ = L.LLVMBuildMemSet(B, ptr, v, len, 1);
+            _ = ir.memop(B, ir.OP_MEMSET, ptr, v, len);
             return vnil();
         }
         // generic loop
@@ -2362,7 +2441,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         br(cond);
         at_end(cond);
         let i = ld(T_isz, iv);
-        condbr(icmp(L.IntULT, i, len), body, end);
+        condbr(icmp(ir.IntULT, i, len), body, end);
         at_end(body);
         store(dt.elem, v, gep1(lty(dt.elem), ptr, i), true);
         _ = st(b_add(i, usz(1)), iv);
@@ -2381,7 +2460,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let bytes = b_mul(xl, usz(ty.type_size(stt.elem)));
         let res = alloca_in_entry(T_i1, "eq".ptr);
         let iv = alloca_in_entry(T_isz, "i".ptr);
-        _ = st(icmp(L.IntEQ, xl, yl), res);
+        _ = st(icmp(ir.IntEQ, xl, yl), res);
         _ = st(usz(0), iv);
         let cond = new_bb("memeq.cond".ptr);
         let body = new_bb("memeq.body".ptr);
@@ -2390,14 +2469,14 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         br(cond);
         at_end(cond);
         let i = ld(T_isz, iv);
-        let lt = icmp(L.IntULT, i, bytes);  // (right to left, as in the C implementation)
+        let lt = icmp(ir.IntULT, i, bytes);  // (right to left, as in the C implementation)
         let more = b_and(ld(T_i1, res), lt);
         condbr(more, body, end);
         at_end(body);
         let bx = ld(T_i8, gep1(T_i8, xp, i));
         let by = ld(T_i8, gep1(T_i8, yp, i));
         _ = st(b_add(i, usz(1)), iv);
-        condbr(icmp(L.IntEQ, bx, by), cond, neq);
+        condbr(icmp(ir.IntEQ, bx, by), cond, neq);
         at_end(neq);
         _ = st(ci(T_i1, 0), res);
         br(end);
@@ -2409,14 +2488,14 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
     }
     if id == ast.BI_MEMORY_GROW {
         let prev = mem_grow(gen(barg(e, 0)));
-        let failed = icmp(L.IntEQ, prev, L.LLVMConstAllOnes(T_isz));
+        let failed = icmp(ir.IntEQ, prev, ir.cones(T_isz));
         let code = sel(failed, errcode_value(sema.error_code_of(u.intern("OutOfMemory"))), ci(T_i16, 0));
         return errunion_value(rt, code, prev);
     }
     if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) {
         let v = gen(barg(e, 0));
-        let mut t: [1]*mut L.LType = [L.LLVMTypeOf(v)];
-        let mut args: [2]*mut L.Value = [v, ci(T_i1, 0)];
+        let mut t: [1]*mut ir.Ty = [v.ty];
+        let mut args: [2]*mut ir.Value = [v, ci(T_i1, 0)];
         return intrinsic(u.pick(id == ast.BI_CLZ, "llvm.ctlz", "llvm.cttz"), t[..], args[..]);
     }
     if id == ast.BI_POPCOUNT {
@@ -2425,9 +2504,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
     if (id == ast.BI_ROTL) or (id == ast.BI_ROTR) {
         let v = gen(barg(e, 0));
         let mut k = gen(barg(e, 1));
-        k = ext_int(k, L.LLVMTypeOf(v), false);
-        let mut t: [1]*mut L.LType = [L.LLVMTypeOf(v)];
-        let mut args: [3]*mut L.Value = [v, v, k];
+        k = ext_int(k, v.ty, false);
+        let mut t: [1]*mut ir.Ty = [v.ty];
+        let mut args: [3]*mut ir.Value = [v, v, k];
         return intrinsic(u.pick(id == ast.BI_ROTL, "llvm.fshl", "llvm.fshr"), t[..], args[..]);
     }
     if (id == ast.BI_ADD_SAT) or (id == ast.BI_SUB_SAT) {
@@ -2485,21 +2564,21 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         if (rt.kind == ast.TY_FLOAT) or ty.is_vec_float(rt) {
             return intr1("llvm.fabs", v);
         }
-        let t = L.LLVMTypeOf(v);
-        let mut tys: [1]*mut L.LType = [t];
+        let t = v.ty;
+        let mut tys: [1]*mut ir.Ty = [t];
         if rt.kind == ast.TY_INT {
-            let is_min = icmp(L.IntEQ, v, int_min(t));
+            let is_min = icmp(ir.IntEQ, v, int_min(t));
             if not O.overflow_saturate {
                 check_or_trap(b_not(is_min), T_OVERFLOW);
             }
-            let mut args: [2]*mut L.Value = [v, ci(T_i1, 0)];
+            let mut args: [2]*mut ir.Value = [v, ci(T_i1, 0)];
             let mut r = intrinsic("llvm.abs", tys[..], args[..]);
             if O.overflow_saturate {
                 r = sel(is_min, int_max(t, true), r);
             }
             return r;
         }
-        let mut args: [2]*mut L.Value = [v, ci(T_i1, 0)];
+        let mut args: [2]*mut ir.Value = [v, ci(T_i1, 0)];
         return intrinsic("llvm.abs", tys[..], args[..]);  // vectors wrap, as in WASM
     }
     if id == ast.BI_SQRT {
@@ -2521,14 +2600,17 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let x = gen(barg(e, 0));
         let y = gen(barg(e, 1));
         let z = gen(barg(e, 2));
-        let mut t: [1]*mut L.LType = [L.LLVMTypeOf(x)];
-        let mut args: [3]*mut L.Value = [x, y, z];
-        return intrinsic("llvm.fma", t[..], args[..]);
+        let mut args: [3]*mut ir.Value = [x, y, z];
+        if not tg.has_fma() {
+            return rt_call_lanes(u.pick(x.ty.bits == 32, "fma32", "fma64"), args[..]);
+        }
+        return ir.intr(B, ir.IN_FMA, x.ty, args[..]);
     }
     if id == ast.BI_REM {
         let x = gen(barg(e, 0));
         let y = gen(barg(e, 1));
-        return L.LLVMBuildFRem(B, x, y, NN());
+        let mut args: [2]*mut ir.Value = [x, y];
+        return rt_call_lanes(u.pick(x.ty.bits == 32, "fmod32", "fmod64"), args[..]);
     }
     if id == ast.BI_COPYSIGN {
         let x = gen(barg(e, 0));
@@ -2539,27 +2621,27 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         return splat(lty(rt), gen(barg(e, 0)), @int_cast(u32, rt.lanes));
     }
     if id == ast.BI_VEC {
-        let mut v = L.LLVMGetUndef(lty(rt));
+        let mut v = ir.undef(lty(rt));
         for i in 1..e.bargs.len {
-            v = L.LLVMBuildInsertElement(B, v, gen(barg(e, i)), ci32(@as(u64, i - 1)), NN());
+            v = ins_elem(v, gen(barg(e, i)), ci32(@as(u64, i - 1)));
         }
         return v;
     }
     if id == ast.BI_EXTRACT_LANE {
         let v = gen(barg(e, 0));
-        return L.LLVMBuildExtractElement(B, v, ci32(barg(e, 1).cval.lo), NN());
+        return ext_elem(v, ci32(barg(e, 1).cval.lo));
     }
     if id == ast.BI_REPLACE_LANE {
         let v = gen(barg(e, 0));
         let x = gen(barg(e, 2));
-        return L.LLVMBuildInsertElement(B, v, x, ci32(barg(e, 1).cval.lo), NN());
+        return ins_elem(v, x, ci32(barg(e, 1).cval.lo));
     }
     if id == ast.BI_LOAD {
         let stt = ct(barg(e, 1).ty);
         let s = gen(barg(e, 1));
         let len = extract(s, 1);
         let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
-        check_or_trap(icmp(L.IntUGE, bytes, usz(16)), T_LENGTH);
+        check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
         return load(rt, extract(s, 0), true);
     }
     if id == ast.BI_STORE {
@@ -2569,7 +2651,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let v = gen(barg(e, 1));
         let len = extract(s, 1);
         let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
-        check_or_trap(icmp(L.IntUGE, bytes, usz(16)), T_LENGTH);
+        check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
         store(vt, v, extract(s, 0), true);
         return vnil();
     }
@@ -2577,26 +2659,17 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let x = gen(barg(e, 0));
         let y = gen(barg(e, 1));
         let idx = barg(e, 2);
-        let m = u.newn.[*mut L.Value](idx.args.len + 1);
+        let m = u.newn.[i32](idx.args.len + 1);
         for i in 0..idx.args.len {
-            m[i] = ci32(idx.args.get(i).cval.lo);
+            m[i] = @truncate(i32, idx.args.get(i).cval.lo);
         }
-        return L.LLVMBuildShuffleVector(B, x, y, L.LLVMConstVector(&mut m[0], @int_cast(u32, idx.args.len)), NN());
+        return ir.shuffle(B, x, y, m[0..idx.args.len]);
     }
     if id == ast.BI_SWIZZLE {
         let x = gen(barg(e, 0));
         let idx = gen(barg(e, 1));
-        let mut r = L.LLVMConstNull(lty(rt));
-        for i in @as(u64, 0)..16 {
-            let li = ci32(i);
-            let k = L.LLVMBuildExtractElement(B, idx, li, NN());
-            let inb = icmp(L.IntULT, k, ci(T_i8, 16));
-            let kk = b_and(k, ci(T_i8, 15));
-            let mut el = L.LLVMBuildExtractElement(B, x, zext(kk, T_i32), NN());
-            el = sel(inb, el, ci(T_i8, 0));
-            r = L.LLVMBuildInsertElement(B, r, el, li, NN());
-        }
-        return r;
+        let mut sargs: [2]*mut ir.Value = [x, idx];
+        return ir.intr(B, ir.IN_SWIZZLE, lty(rt), sargs[..]);
     }
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let vt = ct(barg(e, 0).ty);
@@ -2610,7 +2683,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let m = gen(barg(e, 0));
         let x = gen(barg(e, 1));
         let y = gen(barg(e, 2));
-        let mt = L.LLVMTypeOf(m);
+        let mt = m.ty;
         let xm = bitcast(x, mt);
         let ym = bitcast(y, mt);
         let ynm = b_and(ym, b_not(m));  // (right to left, as in the C implementation)
@@ -2619,25 +2692,23 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
     }
     if id == ast.BI_ANY_TRUE {
         let v = gen(barg(e, 0));
-        let bits = bitcast(v, T_i128);
-        return icmp(L.IntNE, bits, L.LLVMConstNull(T_i128));
+        let mut aargs: [1]*mut ir.Value = [v];
+        return ir.intr(B, ir.IN_ANYTRUE, T_i1, aargs[..]);
     }
     if id == ast.BI_ALL_TRUE {
         let v = gen(barg(e, 0));
         let vt = ct(barg(e, 0).ty);
         let mut iv = v;
         if vt.elem.kind == ast.TY_FLOAT {
-            iv = bitcast(v, L.LLVMVectorType(tint(vt.elem.bits), @int_cast(u32, vt.lanes)));
+            iv = bitcast(v, ir.t_vec(tint(vt.elem.bits), @int_cast(u32, vt.lanes)));
         }
-        let nz = icmp(L.IntNE, iv, L.LLVMConstNull(L.LLVMTypeOf(iv)));
-        return intr1("llvm.vector.reduce.and", nz);
+        let mut aargs: [1]*mut ir.Value = [iv];
+        return ir.intr(B, ir.IN_ALLTRUE, T_i1, aargs[..]);
     }
     if id == ast.BI_BITMASK {
-        let vt = ct(barg(e, 0).ty);
         let v = gen(barg(e, 0));
-        let neg = icmp(L.IntSLT, v, L.LLVMConstNull(L.LLVMTypeOf(v)));
-        let bits = bitcast(neg, tint(vt.lanes));
-        return zext(bits, T_i32);
+        let mut bargs: [1]*mut ir.Value = [v];
+        return ir.intr(B, ir.IN_BITMASK, T_i32, bargs[..]);
     }
     if id == ast.BI_REDUCE_ADD {
         return reduce_add(ct(barg(e, 0).ty), gen(barg(e, 0)));
@@ -2647,16 +2718,10 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         let x = gen(barg(e, 0));
         let y = gen(barg(e, 1));
         if vt.elem.kind == ast.TY_FLOAT {
-            return reduce_add(vt, L.LLVMBuildFMul(B, x, y, NN()));
+            return reduce_add(vt, ir.binop(B, ir.OP_FMUL, x, y));
         }
-        let w = L.LLVMVectorType(T_i32, 8);
-        let sy = sext(y, w);  // (right to left, as in the C implementation)
-        let p = b_mul(sext(x, w), sy);
-        let mut ev: [4]*mut L.Value = [ci32(0), ci32(2), ci32(4), ci32(6)];
-        let mut od: [4]*mut L.Value = [ci32(1), ci32(3), ci32(5), ci32(7)];
-        let pe = L.LLVMBuildShuffleVector(B, p, L.LLVMGetUndef(w), L.LLVMConstVector(&mut ev[0], 4), NN());
-        let po = L.LLVMBuildShuffleVector(B, p, L.LLVMGetUndef(w), L.LLVMConstVector(&mut od[0], 4), NN());
-        return b_add(pe, po);
+        let mut dargs: [2]*mut ir.Value = [x, y];
+        return ir.intr(B, ir.IN_DOT_I16, lty(rt), dargs[..]);
     }
     if id == ast.BI_TRAP {
         emit_trap(T_TRAP);
@@ -2671,7 +2736,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
         return vnil();
     }
     if id == ast.BI_FENCE {
-        _ = L.LLVMBuildFence(B, L.SeqCst, 0, NN());
+        ir.fence(B);
         return vnil();
     }
     if (id >= ast.BI_ATOMIC_LOAD) and (id <= ast.BI_ATOMIC_NOTIFY) {
@@ -2680,20 +2745,51 @@ fn gen_builtin(e: *mut ast.Expr) *mut L.Value {
     if id == ast.BI_ERROR_NAME {
         let code = gen(barg(e, 0));
         let f = error_name_fn();
-        let mut args: [1]*mut L.Value = [code];
+        let mut args: [1]*mut ir.Value = [code];
         return call(error_name_fty(), f, args[..]);
     }
     internal_error(u.f1("builtin @%s not implemented", e.name));
     return vnil();
 }
 
+// A function of runtime/rt.ph (loaded with every program that is built).
+fn rt_fn(name: []u8) *mut FnInst {
+    let P = sema.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if u.str_eq(d.name, name) and u.notnil(d.module) and u.ends(u.file_of(d.module.file.id).display, "runtime/rt.ph") {
+            return get_inst(d, ty.no_types());
+        }
+    }
+    internal_error(u.f1("runtime function %s not found (is runtime/rt.ph missing?)", name));
+    return u.nil.[FnInst]();
+}
+
+// Calls rt function `name` on scalar arguments, or lane by lane on vectors.
+fn rt_call_lanes(name: []u8, args: []mut *mut ir.Value) *mut ir.Value {
+    let fi = rt_fn(name);
+    let t = args[0].ty;
+    if t.kind != ir.T_VEC {
+        return call(fi.llty, fi.fnv, args);
+    }
+    let mut r = ir.undef(t);
+    for lane in 0..@int_cast(u64, t.lanes) {
+        let ls = u.newn.[*mut ir.Value](args.len + 1);
+        for k in 0..args.len {
+            ls[k] = ir.extract_elem(B, args[k], lane);
+        }
+        r = ir.insert_elem(B, r, call(fi.llty, fi.fnv, ls[0..args.len]), lane);
+    }
+    return r;
+}
+
 // Atomics (spec §12.8): all sequentially consistent, naturally aligned.
 // A misaligned atomic access traps (as WebAssembly requires); on native
 // targets the check is explicit so behavior matches.
-fn native_rt_fn(name: []u8, fty: *mut L.LType) *mut L.Value {
-    let mut f = L.LLVMGetNamedFunction(M, u.cz(name));
+fn native_rt_fn(name: []u8, fty: *mut ir.Ty) *mut ir.Value {
+    let mut f = named_fn(name);
     if u.isnil(f) {
-        f = L.LLVMAddFunction(M, u.cz(name), fty);
+        f = ir.add_function(M, name, fty).val;
     }
     g_needs_native_runtime = true;
     return f;
@@ -2702,7 +2798,7 @@ fn native_rt_fn(name: []u8, fty: *mut L.LType) *mut L.Value {
 // @expect_eq(a, b): on failure, record both values (and how to show them) in
 // phalange.trap_info before trapping. kind: 1 signed, 2 unsigned, 3 float,
 // 4 bool, 5 bytes ([]u8), 6 error, 7 address.
-fn store_info(slot: u64, v: *mut L.Value) void {
+fn store_info(slot: u64, v: *mut ir.Value) void {
     _ = st(v, trap_info_slot(slot));
 }
 
@@ -2719,11 +2815,11 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
     let mut la = vnil();
     let mut lb = vnil();
     if t.kind == ast.TY_FLOAT {
-        eq = fcmp(L.RealOEQ, a, b);
+        eq = fcmp(ir.RealOEQ, a, b);
         kind = 3;
         if t.bits == 32 {
-            ia = bitcast(L.LLVMBuildFPExt(B, a, T_f64, NN()), T_i64);
-            ib = bitcast(L.LLVMBuildFPExt(B, b, T_f64, NN()), T_i64);
+            ia = bitcast(ir.cast(B, ir.OP_FPEXT, a, T_f64), T_i64);
+            ib = bitcast(ir.cast(B, ir.OP_FPEXT, b, T_f64), T_i64);
         } else {
             ia = bitcast(a, T_i64);
             ib = bitcast(b, T_i64);
@@ -2736,7 +2832,7 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
         // equal lengths and bytes
         let res = alloca_in_entry(T_i1, "eq".ptr);
         let iv = alloca_in_entry(T_isz, "i".ptr);
-        _ = st(icmp(L.IntEQ, la, lb), res);
+        _ = st(icmp(ir.IntEQ, la, lb), res);
         _ = st(usz(0), iv);
         let cond = new_bb("eq.cond".ptr);
         let body = new_bb("eq.body".ptr);
@@ -2745,14 +2841,14 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
         br(cond);
         at_end(cond);
         let i = ld(T_isz, iv);
-        let lt = icmp(L.IntULT, i, la);  // (right to left, as in the C implementation)
+        let lt = icmp(ir.IntULT, i, la);  // (right to left, as in the C implementation)
         let more = b_and(ld(T_i1, res), lt);
         condbr(more, body, end);
         at_end(body);
         let bx = ld(T_i8, gep1(T_i8, pa, i));
         let by = ld(T_i8, gep1(T_i8, pb, i));
         _ = st(b_add(i, usz(1)), iv);
-        condbr(icmp(L.IntEQ, bx, by), cond, neq);
+        condbr(icmp(ir.IntEQ, bx, by), cond, neq);
         at_end(neq);
         _ = st(ci(T_i1, 0), res);
         br(end);
@@ -2764,12 +2860,12 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
         la = zext(la, T_i64);
         lb = zext(lb, T_i64);
     } else if (t.kind == ast.TY_PTR) or (t.kind == ast.TY_FN) {
-        eq = icmp(L.IntEQ, a, b);
+        eq = icmp(ir.IntEQ, a, b);
         kind = 7;
         ia = zext(ptrtoint(a, T_isz), T_i64);
         ib = zext(ptrtoint(b, T_isz), T_i64);
     } else {  // integers, bool, error
-        eq = icmp(L.IntEQ, a, b);
+        eq = icmp(ir.IntEQ, a, b);
         let sg = (t.kind == ast.TY_INT) and t.is_signed;
         if t.kind == ast.TY_BOOL {
             kind = 4;
@@ -2780,14 +2876,14 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
         } else {
             kind = 2;
         }
-        if L.LLVMGetIntTypeWidth(L.LLVMTypeOf(a)) == 64 {
+        if ir.int_width(a.ty) == 64 {
             ia = a;
         } else if sg {
             ia = sext(a, T_i64);
         } else {
             ia = zext(a, T_i64);
         }
-        if L.LLVMGetIntTypeWidth(L.LLVMTypeOf(b)) == 64 {
+        if ir.int_width(b.ty) == 64 {
             ib = b;
         } else if sg {
             ib = sext(b, T_i64);
@@ -2813,11 +2909,11 @@ fn gen_expect_eq(e: *mut ast.Expr) void {
         store_info(5, ci(T_i64, 0));
     }
     call_trap_site(site_record(T_EXPECT, e.span));
-    _ = L.LLVMBuildUnreachable(B);
+    ir.unreachable(B);
     at_end(ok);
 }
 
-fn gen_atomic(e: *mut ast.Expr) *mut L.Value {
+fn gen_atomic(e: *mut ast.Expr) *mut ir.Value {
     let id = e.index;
     let pt = ct(barg(e, 0).ty);
     let t = pt.elem;
@@ -2826,78 +2922,77 @@ fn gen_atomic(e: *mut ast.Expr) *mut L.Value {
     let asz = @int_cast(u32, size);
     if size > 1 {
         let addr = ptrtoint(p, T_isz);
-        check_or_trap(icmp(L.IntEQ, b_and(addr, usz(size - 1)), usz(0)), T_ATOMIC_ALIGN);
+        check_or_trap(icmp(ir.IntEQ, b_and(addr, usz(size - 1)), usz(0)), T_ATOMIC_ALIGN);
     }
-    let sc = L.SeqCst;
     if id == ast.BI_ATOMIC_LOAD {
         let v = ld(lty(t), p);
-        L.LLVMSetOrdering(v, sc);
-        L.LLVMSetAlignment(v, asz);
+        v.flags = ir.F_ATOMIC;
+        set_align(v, asz);
         return v;
     }
     if id == ast.BI_ATOMIC_STORE {
         let v = gen(barg(e, 1));
         let s = st(v, p);
-        L.LLVMSetOrdering(s, sc);
-        L.LLVMSetAlignment(s, asz);
+        s.flags = ir.F_ATOMIC;
+        set_align(s, asz);
         return vnil();
     }
     if id == ast.BI_ATOMIC_CAS {
         let expv = gen(barg(e, 1));
         let newv = gen(barg(e, 2));
-        let r = L.LLVMBuildAtomicCmpXchg(B, p, expv, newv, sc, sc, 0);
-        L.LLVMSetAlignment(r, asz);
-        return extract(r, 0);
+        let r = ir.cmpxchg(B, p, expv, newv);
+        set_align(r, asz);
+        return r;
     }
     if id == ast.BI_ATOMIC_WAIT {
         let expv = gen(barg(e, 1));
         let timeout = gen(barg(e, 2));
-        let mut args: [3]*mut L.Value = [p, expv, timeout];
+        let mut args: [3]*mut ir.Value = [p, expv, timeout];
         if ty.g_target.is_wasm {
             return intrinsic("llvm.wasm.memory.atomic.wait32", no_tys(), args[..]);
         }
-        let mut ps: [3]*mut L.LType = [T_ptr, T_i32, T_i64];
+        let mut ps: [3]*mut ir.Ty = [T_ptr, T_i32, T_i64];
         let fty = fn_type(T_i32, ps[..], false);
         let f = native_rt_fn("ph_wait32", fty);
         return call(fty, f, args[..]);
     }
     if id == ast.BI_ATOMIC_NOTIFY {
         let count = gen(barg(e, 1));
-        let mut args: [2]*mut L.Value = [p, count];
+        let mut args: [2]*mut ir.Value = [p, count];
         if ty.g_target.is_wasm {
             return intrinsic("llvm.wasm.memory.atomic.notify", no_tys(), args[..]);
         }
-        let mut ps: [2]*mut L.LType = [T_ptr, T_i32];
+        let mut ps: [2]*mut ir.Ty = [T_ptr, T_i32];
         let fty = fn_type(T_i32, ps[..], false);
         let f = native_rt_fn("ph_notify32", fty);
         return call(fty, f, args[..]);
     }
     let sg = t.is_signed;
-    let mut op = L.RMWMax;
+    let mut op = ir.RMW_MAX;
     if not sg {
-        op = L.RMWUMax;
+        op = ir.RMW_UMAX;
     }
     if id == ast.BI_ATOMIC_ADD {
-        op = L.RMWAdd;
+        op = ir.RMW_ADD;
     } else if id == ast.BI_ATOMIC_SUB {
-        op = L.RMWSub;
+        op = ir.RMW_SUB;
     } else if id == ast.BI_ATOMIC_AND {
-        op = L.RMWAnd;
+        op = ir.RMW_AND;
     } else if id == ast.BI_ATOMIC_OR {
-        op = L.RMWOr;
+        op = ir.RMW_OR;
     } else if id == ast.BI_ATOMIC_XOR {
-        op = L.RMWXor;
+        op = ir.RMW_XOR;
     } else if id == ast.BI_ATOMIC_XCHG {
-        op = L.RMWXchg;
+        op = ir.RMW_XCHG;
     } else if id == ast.BI_ATOMIC_MIN {
-        op = L.RMWMin;
+        op = ir.RMW_MIN;
         if not sg {
-            op = L.RMWUMin;
+            op = ir.RMW_UMIN;
         }
     }
     let v = gen(barg(e, 1));
-    let r = L.LLVMBuildAtomicRMW(B, op, p, v, sc, 0);
-    L.LLVMSetAlignment(r, asz);
+    let r = ir.rmw(B, op, p, v);
+    set_align(r, asz);
     return r;
 }
 
@@ -2906,90 +3001,90 @@ fn gen_atomic(e: *mut ast.Expr) *mut L.Value {
 // argument and the top of a stack allocated for the thread. The function is
 // frameless, so it touches no stack memory before switching stacks.
 fn emit_thread_start() void {
-    let mut ps: [3]*mut L.LType = [T_ptr, T_ptr, T_ptr];
+    let mut ps: [3]*mut ir.Ty = [T_ptr, T_ptr, T_ptr];
     let fty = fn_type(T_void, ps[..], false);
-    let f = L.LLVMAddFunction(M, "phalange_thread_start".ptr, fty);
+    let f = ir.add_function(M, "phalange_thread_start", fty).val;
     add_str_attr(f, "wasm-export-name", "phalange_thread_start");
     g_export_names.push(u.intern("phalange_thread_start"));
-    let bb = L.LLVMAppendBasicBlockInContext(ctx, f, "entry".ptr);
-    let saved = L.LLVMGetInsertBlock(B);
+    let bb = ir.append_block(f.fnp, "entry");
+    let saved = ir.insert_block(B);
     at_end(bb);
-    let mut top = L.LLVMGetParam(f, 2);
+    let mut top = param(f, 2);
     if stack_traces_on() {
         // The thread's shadow stack sits at the top of its stack.
         let t = ss_type();
-        let size = (L.LLVMABISizeOfType(TD, t) + 15) & ~@as(u64, 15);
-        let neg = L.LLVMConstInt(T_isz, 0 -% size, 1);
+        let size = (t.size + 15) & ~@as(u64, 15);
+        let neg = ir.cint(T_isz, 0 -% size);
         let base = gep1(T_i8, top, neg);
-        _ = L.LLVMBuildMemSet(B, base, ci(T_i8, 0), usz(@bit_cast(i64, size)), 16);
+        _ = ir.memop(B, ir.OP_MEMSET, base, ci(T_i8, 0), usz(@bit_cast(i64, size)));
         ss_globals();
         _ = st(base, ss_global);
         top = base;
     }
-    let mut tys: [1]*mut L.LType = [T_ptr];
-    let mut targs: [1]*mut L.Value = [top];
+    let mut tys: [1]*mut ir.Ty = [T_ptr];
+    let mut targs: [1]*mut ir.Value = [top];
     _ = intrinsic("llvm.stackrestore", tys[..], targs[..]);
-    let mut eps: [1]*mut L.LType = [T_ptr];
+    let mut eps: [1]*mut ir.Ty = [T_ptr];
     let ety = fn_type(T_void, eps[..], false);
-    let mut args: [1]*mut L.Value = [L.LLVMGetParam(f, 1)];
-    _ = call(ety, L.LLVMGetParam(f, 0), args[..]);
-    _ = L.LLVMBuildRetVoid(B);
+    let mut args: [1]*mut ir.Value = [param(f, 1)];
+    _ = call(ety, param(f, 0), args[..]);
+    ir.ret_void(B);
     if u.notnil(saved) {
         at_end(saved);
     }
 }
 
-let mut g_errtab: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
+let mut g_errtab: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
-fn error_name_table() *mut L.Value {
+fn error_name_table() *mut ir.Value {
     if u.notnil(g_errtab) {
         return g_errtab;
     }
     let names = sema.g_prog.error_names;
     let n = names.len;
-    let vs = u.newn.[*mut L.Value](n + 1);
+    let vs = u.newn.[*mut ir.Value](n + 1);
     vs[0] = const_slice(string_ptr("<unknown>"), 9);
     for i in 0..n {
         let s = names.get(i);
         vs[i + 1] = const_slice(string_ptr(s), @int_cast(i64, s.len));
     }
     let stt = lty(ty.type_slice(ty.t_u8, false));
-    g_errtab = L.LLVMAddGlobal(M, L.LLVMArrayType2(stt, @as(u64, n) + 1), "phalange.error_names".ptr);
-    L.LLVMSetInitializer(g_errtab, L.LLVMConstArray2(stt, &mut vs[0], @as(u64, n) + 1));
-    L.LLVMSetLinkage(g_errtab, L.PrivateLinkage);
-    L.LLVMSetGlobalConstant(g_errtab, 1);
+    g_errtab = ir.add_global(M, ir.t_array(stt, @as(u64, n) + 1), "phalange.error_names").val;
+    set_init(g_errtab, ir.carray(stt, vs[0..n + 1]));
+    set_linkage(g_errtab, ir.LINK_INTERNAL);
+    g_errtab.gv.is_const = true;
     return g_errtab;
 }
 
-fn error_name_fty() *mut L.LType {
+fn error_name_fty() *mut ir.Ty {
     let stt = lty(ty.type_slice(ty.t_u8, false));
-    let mut ps: [1]*mut L.LType = [T_i16];
+    let mut ps: [1]*mut ir.Ty = [T_i16];
     return fn_type(stt, ps[..], false);
 }
 
 // phalange.error_name(code) []u8: the name table lives with the error codes
 // (in the link unit when units are compiled separately).
-fn error_name_fn() *mut L.Value {
+fn error_name_fn() *mut ir.Value {
     let stt = lty(ty.type_slice(ty.t_u8, false));
     let fty = error_name_fty();
-    let existing = L.LLVMGetNamedFunction(M, "phalange.error_name".ptr);
+    let existing = named_fn("phalange.error_name");
     if u.notnil(existing) {
         return existing;
     }
-    let f = L.LLVMAddFunction(M, "phalange.error_name".ptr, fty);
+    let f = ir.add_function(M, "phalange.error_name", fty).val;
     if O.unit == CG_MODULE {
         return f;
     }
     if O.unit == CG_WHOLE {
-        L.LLVMSetLinkage(f, L.InternalLinkage);
+        set_linkage(f, ir.LINK_INTERNAL);
     }
-    let saved = L.LLVMGetInsertBlock(B);
-    at_end(L.LLVMAppendBasicBlockInContext(ctx, f, "entry".ptr));
+    let saved = ir.insert_block(B);
+    at_end(ir.append_block(f.fnp, "entry"));
     let tab = error_name_table();
     let n = sema.g_prog.error_names.len;
-    let mut c = zext(L.LLVMGetParam(f, 0), T_isz);
-    c = sel(icmp(L.IntULE, c, usz(@int_cast(i64, n))), c, usz(0));
-    _ = L.LLVMBuildRet(B, ld(stt, gep2(L.LLVMArrayType2(stt, @as(u64, n) + 1), tab, usz(0), c)));
+    let mut c = zext(param(f, 0), T_isz);
+    c = sel(icmp(ir.IntULE, c, usz(@int_cast(i64, n))), c, usz(0));
+    ir.ret(B, ld(stt, gep2(ir.t_array(stt, @as(u64, n) + 1), tab, usz(0), c)));
     if u.notnil(saved) {
         at_end(saved);
     }
@@ -2999,52 +3094,52 @@ fn error_name_fn() *mut L.Value {
 // Linear memory growth. On wasm these are the real instructions; on native
 // targets a reserved, 64 KiB-aligned region emulates linear memory pages.
 const NATIVE_HEAP_PAGES: u64 = 4096;
-let mut native_heap: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
-let mut native_pages: *mut L.Value = @ptr_from_int(*mut L.Value, 0);
+let mut native_heap: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut native_pages: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
 fn ensure_native_heap() void {
     if u.notnil(native_heap) {
         return;
     }
-    let ht = L.LLVMArrayType2(T_i8, NATIVE_HEAP_PAGES * 65536);
-    native_heap = shared_global(ht, "phalange.heap", L.LLVMConstNull(ht), 0);
-    L.LLVMSetAlignment(native_heap, 65536);
+    let ht = ir.t_array(T_i8, NATIVE_HEAP_PAGES * 65536);
+    native_heap = shared_global(ht, "phalange.heap", ir.czero(ht), 0);
+    set_align(native_heap, 65536);
     native_pages = shared_global(T_isz, "phalange.heap_pages", usz(0), 0);
 }
 
-fn mem_size() *mut L.Value {
+fn mem_size() *mut ir.Value {
     if ty.g_target.is_wasm {
-        let mut t: [1]*mut L.LType = [T_isz];
-        let mut args: [1]*mut L.Value = [ci32(0)];
+        let mut t: [1]*mut ir.Ty = [T_isz];
+        let mut args: [1]*mut ir.Value = [ci32(0)];
         return intrinsic("llvm.wasm.memory.size", t[..], args[..]);
     }
     ensure_native_heap();
-    let base = L.LLVMBuildUDiv(B, ptrtoint(native_heap, T_isz), usz(65536), NN());
+    let base = ir.binop(B, ir.OP_UDIV, ptrtoint(native_heap, T_isz), usz(65536));
     return b_add(base, ld(T_isz, native_pages));
 }
 
-fn mem_grow(pages: *mut L.Value) *mut L.Value {
+fn mem_grow(pages: *mut ir.Value) *mut ir.Value {
     if ty.g_target.is_wasm {
-        let mut t: [1]*mut L.LType = [T_isz];
-        let mut args: [2]*mut L.Value = [ci32(0), pages];
+        let mut t: [1]*mut ir.Ty = [T_isz];
+        let mut args: [2]*mut ir.Value = [ci32(0), pages];
         return intrinsic("llvm.wasm.memory.grow", t[..], args[..]);
     }
     ensure_native_heap();
     let used = ld(T_isz, native_pages);
     let nu = b_add(used, pages);
-    let ge = icmp(L.IntUGE, nu, used);  // (right to left, as in the C implementation)
-    let ok = b_and(icmp(L.IntULE, nu, usz(@bit_cast(i64, NATIVE_HEAP_PAGES))), ge);
+    let ge = icmp(ir.IntUGE, nu, used);  // (right to left, as in the C implementation)
+    let ok = b_and(icmp(ir.IntULE, nu, usz(@bit_cast(i64, NATIVE_HEAP_PAGES))), ge);
     _ = st(sel(ok, nu, used), native_pages);
-    let base = L.LLVMBuildUDiv(B, ptrtoint(native_heap, T_isz), usz(65536), NN());
-    return sel(ok, b_add(base, used), L.LLVMConstAllOnes(T_isz));
+    let base = ir.binop(B, ir.OP_UDIV, ptrtoint(native_heap, T_isz), usz(65536));
+    return sel(ok, b_add(base, used), ir.cones(T_isz));
 }
 
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
-fn gen_struct_lit(e: *mut ast.Expr) *mut L.Value {
+fn gen_struct_lit(e: *mut ast.Expr) *mut ir.Value {
     let t = ct(e.ty);
-    let mut v = L.LLVMGetUndef(lty(t));
+    let mut v = ir.undef(lty(t));
     for i in 0..e.inits.len {
         let ft = ty.type_field(t, i);
         let fv = gen(e.inits.at(i).value);
@@ -3053,21 +3148,21 @@ fn gen_struct_lit(e: *mut ast.Expr) *mut L.Value {
     return v;
 }
 
-fn gen_array_lit(e: *mut ast.Expr) *mut L.Value {
+fn gen_array_lit(e: *mut ast.Expr) *mut ir.Value {
     let t = ct(e.ty);
     if e.kind == ast.E_ARRAY_LIT {
-        let mut v = L.LLVMGetUndef(lty(t));
+        let mut v = ir.undef(lty(t));
         for i in 0..e.args.len {
             v = insert(v, to_mem(t.elem, gen(e.args.get(i))), @int_cast(u32, i));
         }
         return v;
     }
     let x = gen(e.a);
-    if (L.LLVMIsConstant(x) != 0) and (L.LLVMIsNull(x) != 0) {
-        return L.LLVMConstNull(lty(t));
+    if (ir.is_const(x)) and (ir.is_zero(x)) {
+        return ir.czero(lty(t));
     }
     if t.len <= 16 {
-        let mut v = L.LLVMGetUndef(lty(t));
+        let mut v = ir.undef(lty(t));
         for i in 0..@int_cast(u32, t.len) {
             v = insert(v, to_mem(t.elem, x), i);
         }
@@ -3082,7 +3177,7 @@ fn gen_array_lit(e: *mut ast.Expr) *mut L.Value {
     br(cond);
     at_end(cond);
     let i = ld(T_isz, iv);
-    condbr(icmp(L.IntULT, i, usz(t.len)), body, end);
+    condbr(icmp(ir.IntULT, i, usz(t.len)), body, end);
     at_end(body);
     store(t.elem, x, gep2(lty(t), tmp, usz(0), i), false);
     _ = st(b_add(i, usz(1)), iv);
@@ -3091,7 +3186,7 @@ fn gen_array_lit(e: *mut ast.Expr) *mut L.Value {
     return load(t, tmp, false);
 }
 
-fn gen_unary(e: *mut ast.Expr) *mut L.Value {
+fn gen_unary(e: *mut ast.Expr) *mut ir.Value {
     let t = ct(e.ty);
     let op = e.op;
     if (op == lx.KW_NOT) or (op == lx.TK_TILDE) {
@@ -3101,24 +3196,24 @@ fn gen_unary(e: *mut ast.Expr) *mut L.Value {
         return gen_addr(e.a);
     }
     if op == lx.TK_MINUS_PCT {
-        return L.LLVMBuildNeg(B, gen(e.a), NN());
+        return ir.neg(B, gen(e.a));
     }
     if op == lx.TK_MINUS {
         let v = gen(e.a);
         if (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t) {
-            return L.LLVMBuildFNeg(B, v, NN());
+            return ir.fneg(B, v);
         }
-        return overflow_op(1, true, L.LLVMConstNull(L.LLVMTypeOf(v)), v);
+        return overflow_op(1, true, ir.czero(v.ty), v);
     }
     internal_error("bad unary");
     return vnil();
 }
 
-fn gen_binary(e: *mut ast.Expr) *mut L.Value {
+fn gen_binary(e: *mut ast.Expr) *mut ir.Value {
     if (e.op == lx.KW_AND) or (e.op == lx.KW_OR) {
         let is_and = e.op == lx.KW_AND;
         let l = gen(e.a);
-        let lbb = L.LLVMGetInsertBlock(B);
+        let lbb = ir.insert_block(B);
         let rhs = new_bb(u.pick(is_and, "and.rhs", "or.rhs").ptr);
         let end = new_bb(u.pick(is_and, "and.end", "or.end").ptr);
         if is_and {
@@ -3128,17 +3223,18 @@ fn gen_binary(e: *mut ast.Expr) *mut L.Value {
         }
         at_end(rhs);
         let r = gen(e.b);
-        let rbb = L.LLVMGetInsertBlock(B);
+        let rbb = ir.insert_block(B);
         br(end);
         at_end(end);
-        let phi = L.LLVMBuildPhi(B, T_i1, NN());
+        let phi = ir.phi(B, T_i1);
         let mut sc: u64 = 1;
         if is_and {
             sc = 0;
         }
-        let mut vals: [2]*mut L.Value = [ci(T_i1, sc), r];
-        let mut bbs: [2]*mut L.BB = [lbb, rbb];
-        L.LLVMAddIncoming(phi, &mut vals[0], &mut bbs[0], 2);
+        let mut vals: [2]*mut ir.Value = [ci(T_i1, sc), r];
+        let mut bbs: [2]*mut ir.Block = [lbb, rbb];
+        ir.add_incoming(phi, vals[0], bbs[0]);
+        ir.add_incoming(phi, vals[1], bbs[1]);
         return phi;
     }
     let lt = ct(e.a.ty);
@@ -3147,7 +3243,7 @@ fn gen_binary(e: *mut ast.Expr) *mut L.Value {
     return gen_binop(e.op, lt, l, r);
 }
 
-fn gen_slice(e: *mut ast.Expr) *mut L.Value {
+fn gen_slice(e: *mut ast.Expr) *mut ir.Value {
     let at = ct(e.a.ty);
     let rt = ct(e.ty);
     let mut ptr = vnil();
@@ -3174,15 +3270,15 @@ fn gen_slice(e: *mut ast.Expr) *mut L.Value {
     if u.notnil(e.c) {
         hi = gen(e.c);
     }
-    let hl = icmp(L.IntULE, hi, len);  // (right to left, as in the C implementation)
-    let ok = b_and(icmp(L.IntULE, lo, hi), hl);
+    let hl = icmp(ir.IntULE, hi, len);  // (right to left, as in the C implementation)
+    let ok = b_and(icmp(ir.IntULE, lo, hi), hl);
     check_or_trap(ok, T_BOUNDS);
     let np = gep1(lty(rt.elem), ptr, lo);
-    let s = insert(L.LLVMGetUndef(lty(rt)), np, 0);
+    let s = insert(ir.undef(lty(rt)), np, 0);
     return insert(s, b_sub(hi, lo), 1);
 }
 
-fn gen_inner(e: *mut ast.Expr) *mut L.Value {
+fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
     let t = ct(e.ty);
     if u.notnil(t) and (t.kind == ast.TY_NEVER) {
         // The expression diverges; generate it and hand back a placeholder.
@@ -3194,7 +3290,7 @@ fn gen_inner(e: *mut ast.Expr) *mut L.Value {
             want = ct(e.tval);
         }
         if u.notnil(want) and (want.kind != ast.TY_VOID) and (want.kind != ast.TY_NEVER) {
-            return L.LLVMGetPoison(vty(want));
+            return ir.undef(vty(want));
         }
         return vnil();
     }
@@ -3203,7 +3299,7 @@ fn gen_inner(e: *mut ast.Expr) *mut L.Value {
             return cint(lty(t), e.cval);
         }
         if t.kind == ast.TY_FLOAT {
-            return L.LLVMConstReal(lty(t), e.fval);
+            return ir.cfp(lty(t), e.fval);
         }
         if t.kind == ast.TY_BOOL {
             let mut bv: u64 = 0;
@@ -3248,7 +3344,7 @@ fn gen_inner(e: *mut ast.Expr) *mut L.Value {
     } else if k == ast.E_INT {
         return cint(lty(t), u.I128.ofu(e.ival));
     } else if k == ast.E_FLOAT {
-        return L.LLVMConstReal(lty(t), e.fval);
+        return ir.cfp(lty(t), e.fval);
     } else if k == ast.E_STRUCT_LIT {
         return gen_struct_lit(e);
     } else if (k == ast.E_ARRAY_LIT) or (k == ast.E_ARRAY_REPEAT) {
@@ -3375,7 +3471,7 @@ fn gen_if(s: *mut ast.Stmt) void {
     at_end(end);
 }
 
-fn push_loop(brk: *mut L.BB, cont: *mut L.BB) void {
+fn push_loop(brk: *mut ir.Block, cont: *mut ir.Block) void {
     F.loops.push(LoopCtx.{ brk: brk, cont: cont, defer_height: F.defers.len });
 }
 
@@ -3394,9 +3490,9 @@ fn gen_for(s: *mut ast.Stmt) void {
         br(cond);
         at_end(cond);
         let i = ld(lty(vt), iv);
-        let mut p = L.IntULT;
+        let mut p = ir.IntULT;
         if vt.is_signed {
-            p = L.IntSLT;
+            p = ir.IntSLT;
         }
         condbr(icmp(p, i, hi), body, end);
         at_end(body);
@@ -3430,7 +3526,7 @@ fn gen_for(s: *mut ast.Stmt) void {
     br(cond);
     at_end(cond);
     let i = ld(T_isz, iv);
-    condbr(icmp(L.IntULT, i, len), body, end);
+    condbr(icmp(ir.IntULT, i, len), body, end);
     at_end(body);
     let ep = gep1(lty(vt), ptr, i);
     store(vt, load(vt, ep, ctt.kind == ast.TY_SLICE), var, false);
@@ -3451,7 +3547,7 @@ fn gen_match(s: *mut ast.Stmt) void {
     let t = ct(s.e.ty);
     let end = new_bb("match.end".ptr);
     let n = s.arms.len;
-    let bbs = u.newn.[*mut L.BB](n + 1);
+    let bbs = u.newn.[*mut ir.Block](n + 1);
     let mut else_idx: i64 = -1;
     for i in 0..n {
         bbs[i] = new_bb("match.arm".ptr);
@@ -3463,23 +3559,23 @@ fn gen_match(s: *mut ast.Stmt) void {
     if t.kind == ast.TY_UNION {
         let up = addr_or_spill(s.e);
         let tag = ld(lty(ty.union_tag_type(t)), sgep(lty(t), up, 0));
-        if L.LLVMCountStructElementTypes(lty(t)) > 1 {
+        if ir.field_count(lty(t)) > 1 {
             payload_ptr = sgep(lty(t), up, 1);
         }
         let nv = t.decl.variants.len;
-        let sw = L.LLVMBuildSwitch(B, tag, trap_block(T_UNIONTAG), @int_cast(u32, nv));
+        let sw = ir.switch_(B, tag, trap_block(T_UNIONTAG));
         let covered = u.newn.[bool](nv + 1);
         for i in 0..n {
             let a = s.arms.at(i);
             if (a.kind == ast.P_VARIANT) and not covered[@int_cast(usize, a.variant)] {
                 covered[@int_cast(usize, a.variant)] = true;
-                L.LLVMAddCase(sw, ci(lty(ty.union_tag_type(t)), @int_cast(u64, a.variant)), bbs[i]);
+                ir.add_case(sw, ci(lty(ty.union_tag_type(t)), @int_cast(u64, a.variant)), bbs[i]);
             }
         }
         if else_idx >= 0 {
             for v in 0..nv {
                 if not covered[v] {
-                    L.LLVMAddCase(sw, ci(lty(ty.union_tag_type(t)), @as(u64, v)), bbs[@int_cast(usize, else_idx)]);
+                    ir.add_case(sw, ci(lty(ty.union_tag_type(t)), @as(u64, v)), bbs[@int_cast(usize, else_idx)]);
                 }
             }
         }
@@ -3492,7 +3588,7 @@ fn gen_match(s: *mut ast.Stmt) void {
                 continue;
             }
             let next = new_bb("match.next".ptr);
-            condbr(icmp(L.IntEQ, v, errcode_value(a.error_code)), bbs[i], next);
+            condbr(icmp(ir.IntEQ, v, errcode_value(a.error_code)), bbs[i], next);
             at_end(next);
         }
         if else_idx >= 0 {
@@ -3508,8 +3604,8 @@ fn gen_match(s: *mut ast.Stmt) void {
         } else {
             dflt = trap_block(T_TRAP);
         }
-        let sw = L.LLVMBuildSwitch(B, v, dflt, @int_cast(u32, n));
-        let vt_ = L.LLVMTypeOf(v);
+        let sw = ir.switch_(B, v, dflt);
+        let vt_ = v.ty;
         let mut seen = u.List.[u.I128].{ data: u.nil.[u.I128](), len: 0, cap: 0 };
         for i in 0..n {
             let a = s.arms.at(i);
@@ -3535,7 +3631,7 @@ fn gen_match(s: *mut ast.Stmt) void {
                 continue;
             }
             seen.push(key);
-            L.LLVMAddCase(sw, cint(vt_, key), bbs[i]);
+            ir.add_case(sw, cint(vt_, key), bbs[i]);
         }
         u.free(@ptr_cast(*mut void, seen.data));
     }
@@ -3631,7 +3727,7 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
 
 // Wrappers that track the source span of the code being generated, for
 // trap sites.
-fn gen(e: *mut ast.Expr) *mut L.Value {
+fn gen(e: *mut ast.Expr) *mut ir.Value {
     let saved = g_cur_span;
     g_cur_span = e.span;
     let v = gen_inner(e);
@@ -3639,7 +3735,7 @@ fn gen(e: *mut ast.Expr) *mut L.Value {
     return v;
 }
 
-fn gen_addr(e: *mut ast.Expr) *mut L.Value {
+fn gen_addr(e: *mut ast.Expr) *mut ir.Value {
     let saved = g_cur_span;
     g_cur_span = e.span;
     let v = gen_addr_inner(e);
@@ -3665,22 +3761,22 @@ fn gen_fn_body(fi: *mut FnInst) void {
     stt.from = d.all_gparams;
     stt.to = fi.gargs;
     stt.fnv = fi.fnv;
-    stt.locals = u.newn.[*mut L.Value](d.locals.len + 1);
+    stt.locals = u.newn.[*mut ir.Value](d.locals.len + 1);
     let saved = F;
     F = stt;
     stt.ret = fi.fnty.ret;
-    stt.entry = L.LLVMAppendBasicBlockInContext(ctx, fi.fnv, "entry".ptr);
-    let start = L.LLVMAppendBasicBlockInContext(ctx, fi.fnv, "start".ptr);
+    stt.entry = ir.append_block(fi.fnv.fnp, "entry");
+    let start = ir.append_block(fi.fnv.fnp, "start");
     at_end(start);
     let mut k: u32 = 0;
     if fi.sret {
-        stt.sret_ptr = L.LLVMGetParam(fi.fnv, k);
+        stt.sret_ptr = param(fi.fnv, k);
         k += 1;
     }
     for i in 0..d.params.len {
         let l = d.params.at(i).local;
         let pt = fi.fnty.params[i];
-        let p = L.LLVMGetParam(fi.fnv, k);
+        let p = param(fi.fnv, k);
         k += 1;
         if by_ptr(pt) {
             stt.locals[@int_cast(usize, l.index)] = p;  // params are immutable: use the caller's copy directly
@@ -3691,30 +3787,17 @@ fn gen_fn_body(fi: *mut FnInst) void {
     gen_block(d.body);
     if not terminated() {
         if stt.ret.kind == ast.TY_VOID {
-            _ = L.LLVMBuildRetVoid(B);
+            ir.ret_void(B);
         } else if (stt.ret.kind == ast.TY_ERRUNION) and (stt.ret.elem.kind == ast.TY_VOID) {
             emit_ret(errunion_value(stt.ret, ci(T_i16, 0), vnil()));
         } else {
-            _ = L.LLVMBuildUnreachable(B);
+            ir.unreachable(B);
         }
     }
     at_end(stt.entry);
     br(start);
     // Delete blocks with no predecessors (continuations after return/break/trap).
-    // Leaving them for the backend makes -O0 code generation several times slower.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut bb = L.LLVMGetNextBasicBlock(stt.entry);
-        while u.notnil(bb) {
-            let next = L.LLVMGetNextBasicBlock(bb);
-            if u.isnil(L.LLVMGetFirstUse(L.LLVMBasicBlockAsValue(bb))) {
-                L.LLVMDeleteBasicBlock(bb);
-                changed = true;
-            }
-            bb = next;
-        }
-    }
+    ir.remove_unreachable(stt.fnv.fnp);
     u.free(@ptr_cast(*mut void, stt.defers.data));
     u.free(@ptr_cast(*mut void, stt.loops.data));
     F = saved;
@@ -3723,7 +3806,7 @@ fn gen_fn_body(fi: *mut FnInst) void {
 // ---------------------------------------------------------------------------
 // Inline WebAssembly -> LLVM IR
 // ---------------------------------------------------------------------------
-fn wasm_llty(c: u8) *mut L.LType {
+fn wasm_llty(c: u8) *mut ir.Ty {
     if c == 'i' {
         return T_i32;
     }
@@ -3739,7 +3822,7 @@ fn wasm_llty(c: u8) *mut L.LType {
     return T_v128;
 }
 
-fn to_wasm_val(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
+fn to_wasm_val(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
     let k = t.kind;
     if k == ast.TY_BOOL {
         return zext(v, T_i32);
@@ -3762,10 +3845,10 @@ fn to_wasm_val(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
     return v;
 }
 
-fn from_wasm_val(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
+fn from_wasm_val(t: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
     let k = t.kind;
     if k == ast.TY_BOOL {
-        return icmp(L.IntNE, v, ci32(0));
+        return icmp(ir.IntNE, v, ci32(0));
     }
     if k == ast.TY_INT {
         if t.bits < 32 {
@@ -3782,24 +3865,24 @@ fn from_wasm_val(t: *mut ast.Type, v: *mut L.Value) *mut L.Value {
     return v;
 }
 
-fn shape_ty(prefix: []u8) *mut L.LType {
+fn shape_ty(prefix: []u8) *mut ir.Ty {
     if u.str_eq(prefix, "i8x16") {
-        return L.LLVMVectorType(T_i8, 16);
+        return ir.t_vec(T_i8, 16);
     }
     if u.str_eq(prefix, "i16x8") {
-        return L.LLVMVectorType(T_i16, 8);
+        return ir.t_vec(T_i16, 8);
     }
     if u.str_eq(prefix, "i32x4") {
-        return L.LLVMVectorType(T_i32, 4);
+        return ir.t_vec(T_i32, 4);
     }
     if u.str_eq(prefix, "i64x2") {
-        return L.LLVMVectorType(T_i64, 2);
+        return ir.t_vec(T_i64, 2);
     }
     if u.str_eq(prefix, "f32x4") {
-        return L.LLVMVectorType(T_f32, 4);
+        return ir.t_vec(T_f32, 4);
     }
     if u.str_eq(prefix, "f64x2") {
-        return L.LLVMVectorType(T_f64, 2);
+        return ir.t_vec(T_f64, 2);
     }
     return T_v128;
 }
@@ -3826,7 +3909,7 @@ fn imm_float(w: *mut ast.WasmInstr) f64 {
     return u.c_strtod(s).v;
 }
 
-fn mem_addr(w: *mut ast.WasmInstr, base: *mut L.Value) *mut L.Value {
+fn mem_addr(w: *mut ast.WasmInstr, base: *mut ir.Value) *mut ir.Value {
     let mut off: i64 = 0;
     for i in 0..w.imms.len {
         let s = w.imms.at(i).name;
@@ -3836,31 +3919,31 @@ fn mem_addr(w: *mut ast.WasmInstr, base: *mut L.Value) *mut L.Value {
     }
     let mut a = base;
     if off != 0 {
-        a = b_add(a, ci(L.LLVMTypeOf(a), @bit_cast(u64, off)));
+        a = b_add(a, ci(a.ty, @bit_cast(u64, off)));
     }
     return inttoptr(a, T_ptr);
 }
 
-fn bool_i32(c: *mut L.Value) *mut L.Value {
+fn bool_i32(c: *mut ir.Value) *mut ir.Value {
     return zext(c, T_i32);
 }
 
 struct WStack {
-    v: [256]*mut L.Value,
+    v: [256]*mut ir.Value,
     n: usize,
 }
 
-fn wpop(s: *mut WStack) *mut L.Value {
+fn wpop(s: *mut WStack) *mut ir.Value {
     s.n -= 1;
     return s.v[s.n];
 }
 
-fn wpush(s: *mut WStack, x: *mut L.Value) void {
+fn wpush(s: *mut WStack, x: *mut ir.Value) void {
     s.v[s.n] = x;
     s.n += 1;
 }
 
-fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Value {
+fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut ir.Value {
     let S = u.new.[WStack]();
     for ii in 0..ins.len {
         let w = ins.at(ii);
@@ -3873,7 +3956,7 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
         if u.str_eq(w.op, "unreachable") {
             emit_trap(T_TRAP);
             if u.notnil(result) and (result.kind != ast.TY_VOID) {
-                return L.LLVMGetPoison(vty(result));
+                return ir.undef(vty(result));
             }
             return vnil();
         }
@@ -3885,7 +3968,7 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             let c = wpop(S);
             let b = wpop(S);
             let a = wpop(S);
-            wpush(S, sel(icmp(L.IntNE, c, ci32(0)), a, b));
+            wpush(S, sel(icmp(ir.IntNE, c, ci32(0)), a, b));
             continue;
         }
         if u.str_eq(pre, "local") {
@@ -3904,7 +3987,7 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
         }
         let is_int = u.str_eq(pre, "i32") or u.str_eq(pre, "i64");
         let is_flt = u.str_eq(pre, "f32") or u.str_eq(pre, "f64");
-        let mut T = u.nil.[L.LType]();
+        let mut T = u.nil.[ir.Ty]();
         if is_int or is_flt {
             let mut own: u8 = 'd';
             if u.str_eq(pre, "i32") {
@@ -3920,15 +4003,15 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
                      u.starts(o, "le") or u.starts(o, "ge");
         if u.str_eq(o, "const") {
             if is_int {
-                wpush(S, L.LLVMConstInt(T, @bit_cast(u64, imm_int(w, 0)), 1));
+                wpush(S, ir.cint(T, @bit_cast(u64, imm_int(w, 0))));
             } else {
-                wpush(S, L.LLVMConstReal(T, imm_float(w)));
+                wpush(S, ir.cfp(T, imm_float(w)));
             }
             continue;
         }
         if op.imm == wops.WIMM_MEM {
             let is_store = u.starts(o, "store");
-            let mut memt = u.nil.[L.LType]();
+            let mut memt = u.nil.[ir.Ty]();
             if u.str_eq(pre, "v128") {
                 memt = T_v128;
             } else if op.mem_bytes == 1 {
@@ -3957,11 +4040,11 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
                     v = trunc(v, memt);
                 }
                 let s = st(v, mem_addr(w, base));
-                L.LLVMSetAlignment(s, 1);
+                set_align(s, 1);
             } else {
                 let base = wpop(S);
                 let mut v = ld(memt, mem_addr(w, base));
-                L.LLVMSetAlignment(v, 1);
+                set_align(v, 1);
                 if memt != valt {
                     if op.mem_signed {
                         v = sext(v, valt);
@@ -3995,32 +4078,32 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
                 } else if u.str_eq(o, "xor") {
                     r = b_xor(a, b);
                 } else if u.str_eq(o, "div_u") or u.str_eq(o, "rem_u") or u.str_eq(o, "div_s") or u.str_eq(o, "rem_s") {
-                    check_or_trap(icmp(L.IntNE, b, L.LLVMConstNull(T)), T_DIVZERO);
+                    check_or_trap(icmp(ir.IntNE, b, ir.czero(T)), T_DIVZERO);
                     if u.str_eq(o, "div_u") {
-                        r = L.LLVMBuildUDiv(B, a, b, NN());
+                        r = ir.binop(B, ir.OP_UDIV, a, b);
                     } else if u.str_eq(o, "rem_u") {
-                        r = L.LLVMBuildURem(B, a, b, NN());
+                        r = ir.binop(B, ir.OP_UREM, a, b);
                     } else {
-                        let m1 = icmp(L.IntEQ, b, L.LLVMConstAllOnes(T));
+                        let m1 = icmp(ir.IntEQ, b, ir.cones(T));
                         if u.str_eq(o, "div_s") {
-                            check_or_trap(b_not(b_and(m1, icmp(L.IntEQ, a, int_min(T)))), T_OVERFLOW);
-                            r = L.LLVMBuildSDiv(B, a, b, NN());
+                            check_or_trap(b_not(b_and(m1, icmp(ir.IntEQ, a, int_min(T)))), T_OVERFLOW);
+                            r = ir.binop(B, ir.OP_SDIV, a, b);
                         } else {
-                            r = L.LLVMBuildSRem(B, a, sel(m1, ci(T, 1), b), NN());
+                            r = ir.binop(B, ir.OP_SREM, a, sel(m1, ci(T, 1), b));
                         }
                     }
                 } else if u.str_eq(o, "shl") or u.str_eq(o, "shr_s") or u.str_eq(o, "shr_u") {
                     let k = b_and(b, ci(T, bits - 1));
                     if u.str_eq(o, "shl") {
-                        r = L.LLVMBuildShl(B, a, k, NN());
+                        r = ir.binop(B, ir.OP_SHL, a, k);
                     } else if u.str_eq(o, "shr_s") {
-                        r = L.LLVMBuildAShr(B, a, k, NN());
+                        r = ir.binop(B, ir.OP_ASHR, a, k);
                     } else {
-                        r = L.LLVMBuildLShr(B, a, k, NN());
+                        r = ir.binop(B, ir.OP_LSHR, a, k);
                     }
                 } else if u.str_eq(o, "rotl") or u.str_eq(o, "rotr") {
-                    let mut tys: [1]*mut L.LType = [T];
-                    let mut args: [3]*mut L.Value = [a, a, b];
+                    let mut tys: [1]*mut ir.Ty = [T];
+                    let mut args: [3]*mut ir.Value = [a, a, b];
                     r = intrinsic(u.pick(u.str_eq(o, "rotl"), "llvm.fshl", "llvm.fshr"), tys[..], args[..]);
                 }
                 if u.isnil(r) {
@@ -4032,27 +4115,27 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             if is_cmp {
                 let b = wpop(S);
                 let a = wpop(S);
-                let mut p = L.IntEQ;
+                let mut p = ir.IntEQ;
                 if u.str_eq(o, "eq") {
-                    p = L.IntEQ;
+                    p = ir.IntEQ;
                 } else if u.str_eq(o, "ne") {
-                    p = L.IntNE;
+                    p = ir.IntNE;
                 } else if u.str_eq(o, "lt_s") {
-                    p = L.IntSLT;
+                    p = ir.IntSLT;
                 } else if u.str_eq(o, "lt_u") {
-                    p = L.IntULT;
+                    p = ir.IntULT;
                 } else if u.str_eq(o, "gt_s") {
-                    p = L.IntSGT;
+                    p = ir.IntSGT;
                 } else if u.str_eq(o, "gt_u") {
-                    p = L.IntUGT;
+                    p = ir.IntUGT;
                 } else if u.str_eq(o, "le_s") {
-                    p = L.IntSLE;
+                    p = ir.IntSLE;
                 } else if u.str_eq(o, "le_u") {
-                    p = L.IntULE;
+                    p = ir.IntULE;
                 } else if u.str_eq(o, "ge_s") {
-                    p = L.IntSGE;
+                    p = ir.IntSGE;
                 } else if u.str_eq(o, "ge_u") {
-                    p = L.IntUGE;
+                    p = ir.IntUGE;
                 }
                 wpush(S, bool_i32(icmp(p, a, b)));
                 continue;
@@ -4060,13 +4143,13 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             let a = wpop(S);
             let mut r = vnil();
             if u.str_eq(o, "clz") or u.str_eq(o, "ctz") {
-                let mut tys: [1]*mut L.LType = [T];
-                let mut args: [2]*mut L.Value = [a, ci(T_i1, 0)];
+                let mut tys: [1]*mut ir.Ty = [T];
+                let mut args: [2]*mut ir.Value = [a, ci(T_i1, 0)];
                 r = intrinsic(u.pick(u.str_eq(o, "clz"), "llvm.ctlz", "llvm.cttz"), tys[..], args[..]);
             } else if u.str_eq(o, "popcnt") {
                 r = intr1("llvm.ctpop", a);
             } else if u.str_eq(o, "eqz") {
-                r = bool_i32(icmp(L.IntEQ, a, L.LLVMConstNull(L.LLVMTypeOf(a))));
+                r = bool_i32(icmp(ir.IntEQ, a, ir.czero(a.ty)));
             } else if u.str_eq(o, "extend8_s") {
                 r = sext(trunc(a, T_i8), T);
             } else if u.str_eq(o, "extend16_s") {
@@ -4082,8 +4165,8 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             } else if u.starts(o, "reinterpret") {
                 r = bitcast(a, T);
             } else if u.starts(o, "trunc_sat") {
-                let mut tys: [2]*mut L.LType = [T, L.LLVMTypeOf(a)];
-                let mut args: [1]*mut L.Value = [a];
+                let mut tys: [2]*mut ir.Ty = [T, a.ty];
+                let mut args: [1]*mut ir.Value = [a];
                 r = intrinsic(u.pick(o[o.len - 1] == 's', "llvm.fptosi.sat", "llvm.fptoui.sat"), tys[..], args[..]);
             }
             if u.isnil(r) {
@@ -4098,27 +4181,27 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
                 let a = wpop(S);
                 let mut r = vnil();
                 if op.out == 'i' {
-                    let mut p = L.RealOEQ;
+                    let mut p = ir.RealOEQ;
                     if u.str_eq(o, "ne") {
-                        p = L.RealUNE;
+                        p = ir.RealUNE;
                     } else if u.str_eq(o, "lt") {
-                        p = L.RealOLT;
+                        p = ir.RealOLT;
                     } else if u.str_eq(o, "gt") {
-                        p = L.RealOGT;
+                        p = ir.RealOGT;
                     } else if u.str_eq(o, "le") {
-                        p = L.RealOLE;
+                        p = ir.RealOLE;
                     } else if u.str_eq(o, "ge") {
-                        p = L.RealOGE;
+                        p = ir.RealOGE;
                     }
                     r = bool_i32(fcmp(p, a, b));
                 } else if u.str_eq(o, "add") {
-                    r = L.LLVMBuildFAdd(B, a, b, NN());
+                    r = ir.binop(B, ir.OP_FADD, a, b);
                 } else if u.str_eq(o, "sub") {
-                    r = L.LLVMBuildFSub(B, a, b, NN());
+                    r = ir.binop(B, ir.OP_FSUB, a, b);
                 } else if u.str_eq(o, "mul") {
-                    r = L.LLVMBuildFMul(B, a, b, NN());
+                    r = ir.binop(B, ir.OP_FMUL, a, b);
                 } else if u.str_eq(o, "div") {
-                    r = L.LLVMBuildFDiv(B, a, b, NN());
+                    r = ir.binop(B, ir.OP_FDIV, a, b);
                 } else if u.str_eq(o, "min") {
                     r = intr2("llvm.minimum", a, b);
                 } else if u.str_eq(o, "max") {
@@ -4137,7 +4220,7 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             if u.str_eq(o, "abs") {
                 r = intr1("llvm.fabs", a);
             } else if u.str_eq(o, "neg") {
-                r = L.LLVMBuildFNeg(B, a, NN());
+                r = ir.fneg(B, a);
             } else if u.str_eq(o, "sqrt") {
                 r = intr1("llvm.sqrt", a);
             } else if u.str_eq(o, "ceil") {
@@ -4149,16 +4232,16 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             } else if u.str_eq(o, "nearest") {
                 r = intr1("llvm.roundeven", a);
             } else if u.str_eq(o, "demote_f64") {
-                r = L.LLVMBuildFPTrunc(B, a, T_f32, NN());
+                r = ir.cast(B, ir.OP_FPTRUNC, a, T_f32);
             } else if u.str_eq(o, "promote_f32") {
-                r = L.LLVMBuildFPExt(B, a, T_f64, NN());
+                r = ir.cast(B, ir.OP_FPEXT, a, T_f64);
             } else if u.starts(o, "reinterpret") {
                 r = bitcast(a, T);
             } else if u.starts(o, "convert_") {
                 if o[o.len - 1] == 's' {
-                    r = L.LLVMBuildSIToFP(B, a, T, NN());
+                    r = ir.cast(B, ir.OP_SITOFP, a, T);
                 } else {
-                    r = L.LLVMBuildUIToFP(B, a, T, NN());
+                    r = ir.cast(B, ir.OP_UITOFP, a, T);
                 }
             }
             if u.isnil(r) {
@@ -4190,19 +4273,19 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             continue;
         }
         let vf = pre[0] == 'f';
-        let lane = L.LLVMGetElementType(vt);
+        let lane = vt.elem;
         if u.str_eq(o, "splat") {
             let mut x = wpop(S);
-            if not vf and (L.LLVMGetIntTypeWidth(lane) < 32) {
+            if not vf and (ir.int_width(lane) < 32) {
                 x = trunc(x, lane);
             }
-            wpush(S, bitcast(splat(vt, x, L.LLVMGetVectorSize(vt)), T_v128));
+            wpush(S, bitcast(splat(vt, x, @int_cast(u32, vt.lanes)), T_v128));
             continue;
         }
         if u.starts(o, "extract_lane") {
             let v = bitcast(wpop(S), vt);
-            let mut x = L.LLVMBuildExtractElement(B, v, ci32(@bit_cast(u64, imm_int(w, 0))), NN());
-            if not vf and (L.LLVMGetIntTypeWidth(lane) < 32) {
+            let mut x = ext_elem(v, ci32(@bit_cast(u64, imm_int(w, 0))));
+            if not vf and (ir.int_width(lane) < 32) {
                 if o[o.len - 1] == 's' {
                     x = sext(x, T_i32);
                 } else {
@@ -4215,10 +4298,10 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
         if u.str_eq(o, "replace_lane") {
             let mut x = wpop(S);
             let mut v = bitcast(wpop(S), vt);
-            if not vf and (L.LLVMGetIntTypeWidth(lane) < 32) {
+            if not vf and (ir.int_width(lane) < 32) {
                 x = trunc(x, lane);
             }
-            v = L.LLVMBuildInsertElement(B, v, x, ci32(@bit_cast(u64, imm_int(w, 0))), NN());
+            v = ins_elem(v, x, ci32(@bit_cast(u64, imm_int(w, 0))));
             wpush(S, bitcast(v, T_v128));
             continue;
         }
@@ -4227,9 +4310,9 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
             let mut r = vnil();
             if u.str_eq(o, "neg") {
                 if vf {
-                    r = L.LLVMBuildFNeg(B, a, NN());
+                    r = ir.fneg(B, a);
                 } else {
-                    r = L.LLVMBuildNeg(B, a, NN());
+                    r = ir.neg(B, a);
                 }
             } else if u.str_eq(o, "sqrt") {
                 r = intr1("llvm.sqrt", a);
@@ -4244,24 +4327,24 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
         let mut r = vnil();
         if u.str_eq(o, "add") {
             if vf {
-                r = L.LLVMBuildFAdd(B, a, b, NN());
+                r = ir.binop(B, ir.OP_FADD, a, b);
             } else {
                 r = b_add(a, b);
             }
         } else if u.str_eq(o, "sub") {
             if vf {
-                r = L.LLVMBuildFSub(B, a, b, NN());
+                r = ir.binop(B, ir.OP_FSUB, a, b);
             } else {
                 r = b_sub(a, b);
             }
         } else if u.str_eq(o, "mul") {
             if vf {
-                r = L.LLVMBuildFMul(B, a, b, NN());
+                r = ir.binop(B, ir.OP_FMUL, a, b);
             } else {
                 r = b_mul(a, b);
             }
         } else if u.str_eq(o, "div") {
-            r = L.LLVMBuildFDiv(B, a, b, NN());
+            r = ir.binop(B, ir.OP_FDIV, a, b);
         } else if u.str_eq(o, "min") {
             r = intr2("llvm.minimum", a, b);
         } else {
@@ -4278,116 +4361,15 @@ fn gen_wasm(ins: *mut u.List.[ast.WasmInstr], result: *mut ast.Type) *mut L.Valu
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
-fn host_is_aarch64() bool {
-    let t = u.from_c(L.LLVMGetDefaultTargetTriple());
-    return u.starts(t, "aarch64") or u.starts(t, "arm64");
-}
-
-fn setup_target() bool {
-    let triple = ty.g_target.triple;
-    if ty.g_target.is_wasm {
-        L.LLVMInitializeWebAssemblyTargetInfo();
-        L.LLVMInitializeWebAssemblyTarget();
-        L.LLVMInitializeWebAssemblyTargetMC();
-        L.LLVMInitializeWebAssemblyAsmPrinter();
-    } else if host_is_aarch64() {
-        L.LLVMInitializeAArch64TargetInfo();
-        L.LLVMInitializeAArch64Target();
-        L.LLVMInitializeAArch64TargetMC();
-        L.LLVMInitializeAArch64AsmPrinter();
-    } else {
-        L.LLVMInitializeX86TargetInfo();
-        L.LLVMInitializeX86Target();
-        L.LLVMInitializeX86TargetMC();
-        L.LLVMInitializeX86AsmPrinter();
-    }
-    let mut target = u.nil.[L.Target]();
-    let mut err = u.nil.[u8]();
-    if L.LLVMGetTargetFromTriple(u.cz(triple), &mut target, &mut err) != 0 {
-        u.eprint(u.f2("phalange: cannot find LLVM target '%s': %s\n", triple, u.from_c(err)));
-        L.LLVMDisposeMessage(err);
-        return false;
-    }
-    let mut features: []u8 = "";
-    if ty.g_target.is_wasm {
-        features = "+simd128,+bulk-memory,+nontrapping-fptoint,+sign-ext,+mutable-globals,+atomics";
-    }
-    let ol = O.opt_level;
-    let mut cpu = O.cpu;
-    if u.isnos(cpu) {
-        if ty.g_target.is_wasm {
-            cpu = "generic";
-        } else {
-            cpu = u.from_c(L.LLVMGetHostCPUName());
-        }
-    }
-    let mut reloc = L.RelocPIC;
-    if ty.g_target.is_wasm {
-        reloc = L.RelocStatic;
-    }
-    TM = L.LLVMCreateTargetMachine(target, u.cz(triple), u.cz(cpu), u.cz(features), ol, reloc, L.CodeModelDefault);
-    TD = L.LLVMCreateTargetDataLayout(TM);
-    L.LLVMSetTarget(M, u.cz(triple));
-    L.LLVMSetModuleDataLayout(M, TD);
-    return true;
-}
-
-// Freestanding wasm has no compiler-rt, but LLVM lowers 64-bit multiply
-// overflow checks (and other 128-bit multiplies) to the __multi3 libcall.
-// Provide it, built from 64-bit operations only and kept out of the
-// optimizer so it cannot be turned back into a 128-bit multiply.
-fn emit_multi3() void {
-    let mut ps: [5]*mut L.LType = [T_ptr, T_i64, T_i64, T_i64, T_i64];
-    let fty = fn_type(T_void, ps[..], false);
-    let f = L.LLVMAddFunction(M, "__multi3".ptr, fty);
-    L.LLVMSetLinkage(f, L.WeakAnyLinkage);
-    L.LLVMSetVisibility(f, L.HiddenVisibility);
-    add_fn_attr(f, "optnone");
-    add_fn_attr(f, "noinline");
-    let bb = L.LLVMAppendBasicBlockInContext(ctx, f, "entry".ptr);
-    at_end(bb);
-    let ret = L.LLVMGetParam(f, 0);
-    let al = L.LLVMGetParam(f, 1);
-    let ah = L.LLVMGetParam(f, 2);
-    let bl = L.LLVMGetParam(f, 3);
-    let bh = L.LLVMGetParam(f, 4);
-    let m32 = ci(T_i64, 0xffffffff);
-    let s32 = ci(T_i64, 32);
-    let a0 = b_and(al, m32);
-    let a1 = L.LLVMBuildLShr(B, al, s32, NN());
-    let b0 = b_and(bl, m32);
-    let b1 = L.LLVMBuildLShr(B, bl, s32, NN());
-    let p00 = b_mul(a0, b0);
-    let p01 = b_mul(a0, b1);
-    let p10 = b_mul(a1, b0);
-    let p11 = b_mul(a1, b1);
-    // (in the order the C implementation's compiler evaluates the arguments: right to left)
-    let q10 = b_and(p10, m32);
-    let q01 = b_and(p01, m32);
-    let mid = b_add(b_add(L.LLVMBuildLShr(B, p00, s32, NN()), q01), q10);
-    let smid = L.LLVMBuildLShr(B, mid, s32, NN());
-    let h2 = b_add(L.LLVMBuildLShr(B, p10, s32, NN()), smid);
-    let h1 = b_add(p11, L.LLVMBuildLShr(B, p01, s32, NN()));
-    let mut hi = b_add(h1, h2);
-    let shm = L.LLVMBuildShl(B, mid, s32, NN());
-    let lo = b_or(b_and(p00, m32), shm);
-    let m2 = b_mul(ah, bl);
-    let m1 = b_mul(al, bh);
-    hi = b_add(hi, b_add(m1, m2));
-    _ = st(lo, ret);
-    _ = st(hi, gep1(T_i8, ret, ci32(8)));
-    _ = L.LLVMBuildRetVoid(B);
-}
-
 // A small exported function whose body the caller builds.
-fn add_export(name: []u8, ret: *mut L.LType, ps: []mut *mut L.LType) *mut L.Value {
+fn add_export(name: []u8, ret: *mut ir.Ty, ps: []mut *mut ir.Ty) *mut ir.Value {
     let fty = fn_type(ret, ps, false);
-    let f = L.LLVMAddFunction(M, u.cz(name), fty);
+    let f = ir.add_function(M, name, fty).val;
     if ty.g_target.is_wasm {
         add_str_attr(f, "wasm-export-name", name);
     }
     g_export_names.push(u.intern(name));
-    at_end(L.LLVMAppendBasicBlockInContext(ctx, f, "entry".ptr));
+    at_end(ir.append_block(f.fnp, "entry"));
     return f;
 }
 
@@ -4396,9 +4378,9 @@ fn add_export(name: []u8, ret: *mut L.LType, ps: []mut *mut L.LType) *mut L.Valu
 fn emit_shadow_stack_export() void {
     _ = add_export("phalange_shadow_stack", T_ptr, no_tys());
     if stack_traces_on() {
-        _ = L.LLVMBuildRet(B, ss_ptr());
+        ir.ret(B, ss_ptr());
     } else {
-        _ = L.LLVMBuildRet(B, L.LLVMConstNull(T_ptr));
+        ir.ret(B, ir.czero(T_ptr));
     }
 }
 
@@ -4406,7 +4388,7 @@ fn emit_shadow_stack_export() void {
 // fields); `site` points at {code, file_id, start, end, line, col, file, text}.
 fn emit_trap_info_export() void {
     _ = add_export("phalange_trap_info", T_ptr, no_tys());
-    _ = L.LLVMBuildRet(B, trap_info_global());
+    ir.ret(B, trap_info_global());
 }
 
 // Test binaries (spec §18): tests are listed and run through exports.
@@ -4419,57 +4401,57 @@ fn emit_test_exports() void {
     let tests = sema.g_prog.tests;
     let n = tests.len;
     _ = add_export("phalange_test_count", T_i32, no_tys());
-    _ = L.LLVMBuildRet(B, ci32(@as(u64, n)));
+    ir.ret(B, ci32(@as(u64, n)));
 
-    let names = u.newn.[*mut L.Value](n + 1);
-    let expects = u.newn.[*mut L.Value](n + 1);
+    let names = u.newn.[*mut ir.Value](n + 1);
+    let expects = u.newn.[*mut ir.Value](n + 1);
     for i in 0..n {
         let d = tests.get(i);
         names[i] = string_ptr(cstr_prefix(d.test_name));
-        expects[i] = L.LLVMConstInt(T_i32, @bit_cast(u64, @as(i64, d.test_trap)), 1);
+        expects[i] = ir.cint(T_i32, @bit_cast(u64, @as(i64, d.test_trap)));
     }
-    let ntab = L.LLVMAddGlobal(M, L.LLVMArrayType2(T_ptr, @as(u64, n) + 1), "phalange.test_names".ptr);
-    names[n] = L.LLVMConstNull(T_ptr);
-    L.LLVMSetInitializer(ntab, L.LLVMConstArray2(T_ptr, &mut names[0], @as(u64, n) + 1));
-    L.LLVMSetLinkage(ntab, L.PrivateLinkage);
-    let etab = L.LLVMAddGlobal(M, L.LLVMArrayType2(T_i32, @as(u64, n) + 1), "phalange.test_expect".ptr);
+    let ntab = ir.add_global(M, ir.t_array(T_ptr, @as(u64, n) + 1), "phalange.test_names").val;
+    names[n] = ir.czero(T_ptr);
+    set_init(ntab, ir.carray(T_ptr, names[0..n + 1]));
+    set_linkage(ntab, ir.LINK_INTERNAL);
+    let etab = ir.add_global(M, ir.t_array(T_i32, @as(u64, n) + 1), "phalange.test_expect").val;
     expects[n] = ci32(0);
-    L.LLVMSetInitializer(etab, L.LLVMConstArray2(T_i32, &mut expects[0], @as(u64, n) + 1));
-    L.LLVMSetLinkage(etab, L.PrivateLinkage);
+    set_init(etab, ir.carray(T_i32, expects[0..n + 1]));
+    set_linkage(etab, ir.LINK_INTERNAL);
 
-    let mut pi: [1]*mut L.LType = [T_i32];
+    let mut pi: [1]*mut ir.Ty = [T_i32];
     let mut f = add_export("phalange_test_name", T_ptr, pi[..]);
-    _ = L.LLVMBuildRet(B, ld(T_ptr, gep2(L.LLVMArrayType2(T_ptr, @as(u64, n) + 1), ntab, ci32(0), L.LLVMGetParam(f, 0))));
+    ir.ret(B, ld(T_ptr, gep2(ir.t_array(T_ptr, @as(u64, n) + 1), ntab, ci32(0), param(f, 0))));
     f = add_export("phalange_test_expect", T_i32, pi[..]);
-    _ = L.LLVMBuildRet(B, ld(T_i32, gep2(L.LLVMArrayType2(T_i32, @as(u64, n) + 1), etab, ci32(0), L.LLVMGetParam(f, 0))));
+    ir.ret(B, ld(T_i32, gep2(ir.t_array(T_i32, @as(u64, n) + 1), etab, ci32(0), param(f, 0))));
 
     // phalange_test_run: a switch over the test functions.
     let run = add_export("phalange_test_run", T_i32, pi[..]);
-    let dflt = L.LLVMAppendBasicBlockInContext(ctx, run, "none".ptr);
-    let sw = L.LLVMBuildSwitch(B, L.LLVMGetParam(run, 0), dflt, @int_cast(u32, n));
+    let dflt = ir.append_block(run.fnp, "none");
+    let sw = ir.switch_(B, param(run, 0), dflt);
     for i in 0..n {
         let fi = get_inst(tests.get(i), ty.no_types());
-        let bb = L.LLVMAppendBasicBlockInContext(ctx, run, "test".ptr);
-        L.LLVMAddCase(sw, ci32(@as(u64, i)), bb);
+        let bb = ir.append_block(run.fnp, "test");
+        ir.add_case(sw, ci32(@as(u64, i)), bb);
         at_end(bb);
         let r = call(fi.llty, fi.fnv, no_vals());
-        _ = L.LLVMBuildRet(B, zext(extract(r, 0), T_i32));
+        ir.ret(B, zext(extract(r, 0), T_i32));
     }
     at_end(dflt);
-    _ = L.LLVMBuildRet(B, ci32(0xFFFF));
+    ir.ret(B, ci32(0xFFFF));
 
     let en = add_export("phalange_error_name", T_ptr, pi[..]);
     let tab = error_name_table();
     let ne = sema.g_prog.error_names.len;
-    let mut code = zext(L.LLVMGetParam(en, 0), T_isz);
-    code = sel(icmp(L.IntULE, code, usz(@int_cast(i64, ne))), code, usz(0));
+    let mut code = zext(param(en, 0), T_isz);
+    code = sel(icmp(ir.IntULE, code, usz(@int_cast(i64, ne))), code, usz(0));
     let stt = lty(ty.type_slice(ty.t_u8, false));
-    let sl = ld(stt, gep2(L.LLVMArrayType2(stt, @as(u64, ne) + 1), tab, usz(0), code));
-    _ = L.LLVMBuildRet(B, extract(sl, 0));
+    let sl = ld(stt, gep2(ir.t_array(stt, @as(u64, ne) + 1), tab, usz(0), code));
+    ir.ret(B, extract(sl, 0));
 }
 
 pub fn default_triple() []u8 {
-    return u.dup(u.from_c(L.LLVMGetDefaultTargetTriple()));
+    return tg.host_triple();
 }
 
 // Generates code for the checked program. False on failure (errors reported
@@ -4477,28 +4459,21 @@ pub fn default_triple() []u8 {
 pub fn codegen_program(o: *mut CgOptions) bool {
     O = o;
     let P = sema.g_prog;
-    ctx = L.LLVMContextCreate();
-    M = L.LLVMModuleCreateWithNameInContext(u.cz(u.file_of(P.root.file.id).display), ctx);
-    B = L.LLVMCreateBuilderInContext(ctx);
-    if not setup_target() {
-        return false;
-    }
-    T_i1 = L.LLVMInt1TypeInContext(ctx);
-    T_i8 = L.LLVMInt8TypeInContext(ctx);
-    T_i16 = L.LLVMInt16TypeInContext(ctx);
-    T_i32 = L.LLVMInt32TypeInContext(ctx);
-    T_i64 = L.LLVMInt64TypeInContext(ctx);
-    T_i128 = L.LLVMIntTypeInContext(ctx, 128);
+    ir.init_types(@int_cast(u64, ty.g_target.ptr_bits / 8));
+    M = ir.new_module(u.file_of(P.root.file.id).display);
+    B = ir.new_builder();
+    T_i1 = ir.t_int(1);
+    T_i8 = ir.t_int(8);
+    T_i16 = ir.t_int(16);
+    T_i32 = ir.t_int(32);
+    T_i64 = ir.t_int(64);
     T_isz = tint(ty.g_target.ptr_bits);
-    T_ptr = L.LLVMPointerTypeInContext(ctx, 0);
-    T_void = L.LLVMVoidTypeInContext(ctx);
-    T_f32 = L.LLVMFloatTypeInContext(ctx);
-    T_f64 = L.LLVMDoubleTypeInContext(ctx);
-    T_v128 = L.LLVMVectorType(T_i32, 4);
+    T_ptr = ir.t_ptr();
+    T_void = ir.t_void();
+    T_f32 = ir.t_float(32);
+    T_f64 = ir.t_float(64);
+    T_v128 = ir.t_vec(T_i32, 4);
 
-    if ty.g_target.is_wasm {
-        emit_multi3();
-    }
     let program_parts = O.unit != CG_MODULE;
     if program_parts and ty.g_target.is_wasm and g_threads {
         emit_thread_start();
@@ -4536,9 +4511,9 @@ pub fn codegen_program(o: *mut CgOptions) bool {
             _ = global_ref(P.globals.get(i));
         }
         for i in 0..P.error_names.len {
-            let g = L.LLVMAddGlobal(M, T_i16, u.cz(u.f1("phalange.errcode.%s", P.error_names.get(i))));
-            L.LLVMSetInitializer(g, ci(T_i16, @as(u64, i) + 1));
-            L.LLVMSetGlobalConstant(g, 1);
+            let g = ir.add_global(M, T_i16, u.f1("phalange.errcode.%s", P.error_names.get(i))).val;
+            set_init(g, ci(T_i16, @as(u64, i) + 1));
+            g.gv.is_const = true;
         }
         _ = error_name_fn();
         if stack_traces_on() {
@@ -4570,60 +4545,5 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         return false;
     }
 
-    let mut err = u.nil.[u8]();
-    if L.LLVMVerifyModule(M, L.ReturnStatusAction, &mut err) != 0 {
-        u.eprint(u.f1("phalange: internal compiler error: invalid LLVM IR generated:\n%s\n", u.from_c(err)));
-        L.LLVMDisposeMessage(err);
-        let dump = u.env("PHALANGE_DUMP_IR");
-        if not u.isnos(dump) {
-            _ = L.LLVMPrintModuleToFile(M, u.cz(dump), u.nil.[*mut u8]());
-        }
-        return false;
-    }
-    L.LLVMDisposeMessage(err);
-    // At -O0 a very cheap cleanup (promote locals to SSA, merge trivial
-    // blocks) makes the backend faster than skipping it.
-    let mut o0_pipeline = u.env("PHALANGE_O0_PIPELINE");
-    if u.isnos(o0_pipeline) {
-        o0_pipeline = "function(mem2reg,simplifycfg)";
-    }
-    if o0_pipeline.len == 0 {
-        o0_pipeline = u.nosym();
-    }
-    if (O.opt_level > 0) or not u.isnos(o0_pipeline) {
-        let po = L.LLVMCreatePassBuilderOptions();
-        let mut pipeline = o0_pipeline;
-        if O.opt_level == 1 {
-            pipeline = "default<O1>";
-        } else if O.opt_level == 2 {
-            pipeline = "default<O2>";
-        } else if O.opt_level == 3 {
-            pipeline = "default<O3>";
-        }
-        let pe = L.LLVMRunPasses(M, u.cz(pipeline), TM, po);
-        L.LLVMDisposePassBuilderOptions(po);
-        if u.notnil(pe) {
-            let m = L.LLVMGetErrorMessage(pe);
-            u.eprint(u.f1("phalange: optimization failed: %s\n", u.from_c(m)));
-            L.LLVMDisposeErrorMessage(m);
-            return false;
-        }
-    }
-    if O.emit == EMIT_LLVM {
-        if L.LLVMPrintModuleToFile(M, u.cz(O.out_path), &mut err) != 0 {
-            u.eprint(u.f2("phalange: cannot write %s: %s\n", O.out_path, u.from_c(err)));
-            return false;
-        }
-        return true;
-    }
-    let mut kind = L.ObjectFile;
-    if O.emit == EMIT_ASM {
-        kind = L.AssemblyFile;
-    }
-    if L.LLVMTargetMachineEmitToFile(TM, M, u.cz(O.out_path), kind, &mut err) != 0 {
-        u.eprint(u.f1("phalange: code generation failed: %s\n", u.from_c(err)));
-        L.LLVMDisposeMessage(err);
-        return false;
-    }
-    return true;
+    return be.emit_module(M, O.opt_level, O.emit, O.out_path);
 }

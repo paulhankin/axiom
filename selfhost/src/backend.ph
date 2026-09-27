@@ -1,0 +1,48 @@
+// =============================================================================
+// backend.ph - from IR to an object file: target-independent lowering and
+// optimization (lower.ph, opt.ph), then the target's code generator.
+// =============================================================================
+import "util.ph" as u;
+import "ir.ph" as ir;
+import "target.ph" as tg;
+import "lower.ph" as lower;
+import "opt.ph" as opt;
+import "wasm.ph" as wa;
+import "wobj.ph" as wo;
+
+pub const EMIT_OBJ: i32 = 0;
+pub const EMIT_IR: i32 = 1;
+pub const EMIT_ASM: i32 = 2;
+
+pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) bool {
+    let raw = (emit == EMIT_IR) and not u.isnos(u.env("PHALANGE_IR_RAW"));
+    if not raw {
+        lower.lower_module(m);
+        for i in 0..m.funcs.len {
+            let f = m.funcs.get(i);
+            if not ir.is_decl(f) {
+                opt.optimize(f, opt_level);
+            }
+        }
+    }
+    if emit == EMIT_IR {
+        if not u.write_file(path, ir.module_str(m)) {
+            u.eprint(u.f1("phalange: cannot write %s\n", path));
+            return false;
+        }
+        return true;
+    }
+    if tg.is_wasm() {
+        let un = wa.compile(m, tg.g_arch == tg.ARCH_WASM64);
+        if u.isnil(un) {
+            return false;
+        }
+        if not u.write_file(path, wo.write_object(un)) {
+            u.eprint(u.f1("phalange: cannot write %s\n", path));
+            return false;
+        }
+        return true;
+    }
+    u.eprint("phalange: code generation for this target is not implemented yet\n");
+    return false;
+}

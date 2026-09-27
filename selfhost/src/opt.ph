@@ -1,0 +1,817 @@
+// =============================================================================
+// opt.ph - analyses and transformations on the scalar IR (after lower.ph):
+// predecessors, reverse postorder, dominators, promotion of stack slots to
+// SSA values (mem2reg), constant folding, dead code elimination and CFG
+// simplification.
+// =============================================================================
+import "util.ph" as u;
+import "ir.ph" as ir;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+fn bnil() *mut ir.Block {
+    return u.nil.[ir.Block]();
+}
+
+// -----------------------------------------------------------------------------
+// CFG analyses
+// -----------------------------------------------------------------------------
+pub fn compute_preds(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        b.preds.clear();
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        for i in 0..ir.succ_count(t) {
+            let s = ir.succ(t, i);
+            let mut dup = false;
+            for k in 0..s.preds.len {
+                if s.preds.get(k) == b {
+                    dup = true;
+                }
+            }
+            if not dup {
+                s.preds.push(b);
+            }
+        }
+        b = b.next;
+    }
+}
+
+// Blocks in reverse postorder (entry first); sets b.rpo. Unreachable blocks
+// get rpo -1 and are not in the list.
+pub fn rpo(f: *mut ir.Func) u.List.[*mut ir.Block] {
+    let mut out = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let mut b = f.first;
+    let mut n: usize = 0;
+    while u.notnil(b) {
+        b.rpo = -1;
+        b.aux = 0;
+        n += 1;
+        b = b.next;
+    }
+    if u.isnil(f.first) {
+        return out;
+    }
+    // iterative DFS: stack of (block, next successor index)
+    let st = u.newn.[*mut ir.Block](n + 1);
+    let si = u.newn.[usize](n + 1);
+    let post = u.newn.[*mut ir.Block](n + 1);
+    let mut np: usize = 0;
+    let mut sp: usize = 0;
+    st[0] = f.first;
+    si[0] = 0;
+    f.first.aux = 1;
+    sp = 1;
+    while sp > 0 {
+        let x = st[sp - 1];
+        let t = ir.terminator(x);
+        let k = si[sp - 1];
+        if k < ir.succ_count(t) {
+            si[sp - 1] = k + 1;
+            let s = ir.succ(t, k);
+            if s.aux == 0 {
+                s.aux = 1;
+                st[sp] = s;
+                si[sp] = 0;
+                sp += 1;
+            }
+        } else {
+            post[np] = x;
+            np += 1;
+            sp -= 1;
+        }
+    }
+    let mut i = np;
+    while i > 0 {
+        i -= 1;
+        post[i].rpo = @int_cast(i32, out.len);
+        out.push(post[i]);
+    }
+    return out;
+}
+
+fn intersect(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
+    let mut a = a0;
+    let mut b = b0;
+    while a != b {
+        while a.rpo > b.rpo {
+            a = a.idom;
+        }
+        while b.rpo > a.rpo {
+            b = b.idom;
+        }
+    }
+    return a;
+}
+
+// Dominator tree (Cooper, Harvey and Kennedy). Needs compute_preds; returns
+// the reverse postorder.
+pub fn dominators(f: *mut ir.Func) u.List.[*mut ir.Block] {
+    let order = rpo(f);
+    for i in 0..order.len {
+        let b = order.get(i);
+        b.idom = bnil();
+        b.dom_kids.clear();
+    }
+    if order.len == 0 {
+        return order;
+    }
+    let entry = order.get(0);
+    entry.idom = entry;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 1..order.len {
+            let b = order.get(i);
+            let mut nd = bnil();
+            for k in 0..b.preds.len {
+                let p = b.preds.get(k);
+                if (p.rpo < 0) or u.isnil(p.idom) {
+                    continue;
+                }
+                if u.isnil(nd) {
+                    nd = p;
+                } else {
+                    nd = intersect(p, nd);
+                }
+            }
+            if nd != b.idom {
+                b.idom = nd;
+                changed = true;
+            }
+        }
+    }
+    entry.depth = 0;
+    for i in 1..order.len {
+        let b = order.get(i);
+        b.idom.dom_kids.push(b);
+    }
+    for i in 1..order.len {
+        let b = order.get(i);
+        b.depth = b.idom.depth + 1;
+    }
+    return order;
+}
+
+pub fn dominates(a: *mut ir.Block, b0: *mut ir.Block) bool {
+    let mut b = b0;
+    while b.depth > a.depth {
+        b = b.idom;
+    }
+    return b == a;
+}
+
+// Loop nesting depth of each block (from back edges: an edge to a block
+// that dominates its source). Needs dominators.
+pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
+    for i in 0..order.len {
+        order.get(i).loop_depth = 0;
+    }
+    for i in 0..order.len {
+        let h = order.get(i);
+        // back edges into h: collect the loop body by walking predecessors
+        let mut body = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+        for k in 0..h.preds.len {
+            let p = h.preds.get(k);
+            if (p.rpo >= 0) and dominates(h, p) {
+                body.push(p);
+            }
+        }
+        if body.len == 0 {
+            continue;
+        }
+        let mark = @int_cast(i64, i) + 1000000;
+        h.aux = mark;
+        let mut n: usize = 0;
+        let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+        members.push(h);
+        while body.len > 0 {
+            let x = body.pop();
+            if x.aux == mark {
+                continue;
+            }
+            x.aux = mark;
+            members.push(x);
+            for k in 0..x.preds.len {
+                let p = x.preds.get(k);
+                if (p.rpo >= 0) and (p.aux != mark) {
+                    body.push(p);
+                }
+            }
+            n += 1;
+        }
+        for k in 0..members.len {
+            members.get(k).loop_depth += 1;
+        }
+        u.free(@ptr_cast(*mut void, body.data));
+        u.free(@ptr_cast(*mut void, members.data));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// mem2reg
+// -----------------------------------------------------------------------------
+struct Slot {
+    a: *mut ir.Value,         // the alloca
+    stack: u.List.[*mut ir.Value],
+    defs: u.List.[*mut ir.Block],
+}
+
+fn promotable_use(i: *mut ir.Value, a: *mut ir.Value) bool {
+    let op = i.op;
+    if (op == ir.OP_LOAD) and (i.a == a) {
+        return (i.flags == 0) and (i.ty == a.aty);
+    }
+    if (op == ir.OP_STORE) and (i.b == a) and (i.a != a) {
+        return (i.flags == 0) and (i.a.ty == a.aty);
+    }
+    return false;
+}
+
+fn mark_escape(o: *mut ir.Value, i: *mut ir.Value) void {
+    if u.notnil(o) and (o.kind == ir.V_INST) and (o.op == ir.OP_ALLOCA) {
+        if not promotable_use(i, o) {
+            o.aux = -1;
+        }
+    }
+}
+
+pub fn mem2reg(f: *mut ir.Func) void {
+    let e = f.first;
+    if u.isnil(e) {
+        return;
+    }
+    // candidates: allocas of scalar types
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_ALLOCA {
+                i.aux = 0;
+                if ir.is_agg(i.aty) {
+                    i.aux = -1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            mark_escape(i.a, i);
+            mark_escape(i.b, i);
+            mark_escape(i.c, i);
+            for k in 0..i.xs.len {
+                let o = i.xs.get(k);
+                if (o.kind == ir.V_INST) and (o.op == ir.OP_ALLOCA) {
+                    o.aux = -1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut slots = u.List.[*mut Slot].{ data: u.nil.[*mut Slot](), len: 0, cap: 0 };
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_ALLOCA) and (i.aux == 0) {
+                let s = u.new.[Slot]();
+                s.a = i;
+                slots.push(s);
+                i.aux = @int_cast(i64, slots.len);  // slot index + 1
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if slots.len == 0 {
+        return;
+    }
+    compute_preds(f);
+    let order = dominators(f);
+    // definition blocks
+    for bi in 0..order.len {
+        let bb = order.get(bi);
+        let mut i = bb.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_STORE) and (i.b.kind == ir.V_INST) and (i.b.op == ir.OP_ALLOCA) and (i.b.aux > 0) {
+                let s = slots.get(@int_cast(usize, i.b.aux - 1));
+                if (s.defs.len == 0) or (s.defs.last() != bb) {
+                    s.defs.push(bb);
+                }
+            }
+            i = i.next;
+        }
+    }
+    // dominance frontiers
+    let n = order.len;
+    let df = u.newn.[u.List.[*mut ir.Block]](n + 1);
+    for bi in 0..n {
+        let bb = order.get(bi);
+        if bb.preds.len < 2 {
+            continue;
+        }
+        for k in 0..bb.preds.len {
+            let mut r = bb.preds.get(k);
+            if r.rpo < 0 {
+                continue;
+            }
+            while r != bb.idom {
+                let l = &mut df[@int_cast(usize, r.rpo)];
+                if (l.len == 0) or (l.last() != bb) {
+                    l.push(bb);
+                }
+                r = r.idom;
+            }
+        }
+    }
+    // phi placement (iterated dominance frontier)
+    let B = ir.new_builder();
+    let placed = u.newn.[i64](n + 1);
+    let inwork = u.newn.[i64](n + 1);
+    for si in 0..slots.len {
+        let s = slots.get(si);
+        let tag = @int_cast(i64, si) + 1;
+        let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+        for k in 0..s.defs.len {
+            let d = s.defs.get(k);
+            inwork[@int_cast(usize, d.rpo)] = tag;
+            work.push(d);
+        }
+        while work.len > 0 {
+            let x = work.pop();
+            let l = &df[@int_cast(usize, x.rpo)];
+            for k in 0..l.len {
+                let y = l.get(k);
+                let yi = @int_cast(usize, y.rpo);
+                if placed[yi] != tag {
+                    placed[yi] = tag;
+                    if u.notnil(y.first) {
+                        ir.at_before(B, y.first);
+                    } else {
+                        ir.at_end(B, y);
+                    }
+                    let p = ir.phi(B, s.a.aty);
+                    p.aux2 = tag;  // which slot
+                    if inwork[yi] != tag {
+                        inwork[yi] = tag;
+                        work.push(y);
+                    }
+                }
+            }
+        }
+        u.free(@ptr_cast(*mut void, work.data));
+    }
+    // renaming, over the dominator tree
+    struct_rename(f, order.get(0), slots.items());
+    // delete the promoted allocas
+    for si in 0..slots.len {
+        let s = slots.get(si);
+        ir.remove_inst(s.a);
+        u.free(@ptr_cast(*mut void, s.stack.data));
+        u.free(@ptr_cast(*mut void, s.defs.data));
+    }
+    for bi in 0..n {
+        u.free(@ptr_cast(*mut void, df[bi].data));
+    }
+    u.free(@ptr_cast(*mut void, slots.data));
+    ir.apply_forwarding(f);
+}
+
+fn slot_of_ptr(slots: []mut *mut Slot, p: *mut ir.Value) *mut Slot {
+    if (p.kind == ir.V_INST) and (p.op == ir.OP_ALLOCA) and (p.aux > 0) {
+        return slots[@int_cast(usize, p.aux - 1)];
+    }
+    return u.nil.[Slot]();
+}
+
+fn top(s: *mut Slot) *mut ir.Value {
+    if s.stack.len == 0 {
+        return ir.undef(s.a.aty);
+    }
+    return s.stack.last();
+}
+
+fn struct_rename(f: *mut ir.Func, entry: *mut ir.Block, slots: []mut *mut Slot) void {
+    // explicit DFS stack of (block, child index); on exit, pop what the block pushed
+    let mut blocks = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let mut kids = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    let mut pushed = u.List.[*mut Slot].{ data: u.nil.[*mut Slot](), len: 0, cap: 0 };
+    let mut marks = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    blocks.push(entry);
+    kids.push(0);
+    marks.push(0);
+    rename_block(entry, slots, &mut pushed);
+    while blocks.len > 0 {
+        let b = blocks.last();
+        let k = kids.last();
+        if k < b.dom_kids.len {
+            kids.set(kids.len - 1, k + 1);
+            let c = b.dom_kids.get(k);
+            marks.push(pushed.len);
+            rename_block(c, slots, &mut pushed);
+            blocks.push(c);
+            kids.push(0);
+        } else {
+            let m = marks.pop();
+            while pushed.len > m {
+                let s = pushed.pop();
+                s.stack.len -= 1;
+            }
+            _ = blocks.pop();
+            _ = kids.pop();
+        }
+    }
+    u.free(@ptr_cast(*mut void, blocks.data));
+    u.free(@ptr_cast(*mut void, kids.data));
+    u.free(@ptr_cast(*mut void, pushed.data));
+    u.free(@ptr_cast(*mut void, marks.data));
+}
+
+fn rename_block(b: *mut ir.Block, slots: []mut *mut Slot, pushed: *mut u.List.[*mut Slot]) void {
+    let mut i = b.first;
+    while u.notnil(i) {
+        let next = i.next;
+        if (i.op == ir.OP_PHI) and (i.aux2 > 0) {
+            let s = slots[@int_cast(usize, i.aux2 - 1)];
+            s.stack.push(i);
+            pushed.push(s);
+        } else if i.op == ir.OP_LOAD {
+            let s = slot_of_ptr(slots, i.a);
+            if u.notnil(s) {
+                i.fwd = top(s);
+                ir.remove_inst(i);
+            }
+        } else if i.op == ir.OP_STORE {
+            let s = slot_of_ptr(slots, i.b);
+            if u.notnil(s) {
+                s.stack.push(ir.resolve(i.a));
+                pushed.push(s);
+                ir.remove_inst(i);
+            }
+        }
+        i = next;
+    }
+    let t = ir.terminator(b);
+    for k in 0..ir.succ_count(t) {
+        let sb = ir.succ(t, k);
+        let mut p = sb.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            if p.aux2 > 0 {
+                let s = slots[@int_cast(usize, p.aux2 - 1)];
+                // one input per predecessor block
+                let mut dup = false;
+                for j in 0..p.bs.len {
+                    if p.bs.get(j) == b {
+                        dup = true;
+                    }
+                }
+                if not dup {
+                    ir.add_incoming(p, ir.resolve(top(s)), b);
+                }
+            }
+            p = p.next;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Constant folding and simplification
+// -----------------------------------------------------------------------------
+fn has_side_effects(i: *ir.Value) bool {
+    let op = i.op;
+    if (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
+       (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or ir.is_term(op) {
+        return true;
+    }
+    if op == ir.OP_LOAD {
+        return i.flags != 0;
+    }
+    if op == ir.OP_INTR {
+        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        return (id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_WAIT32) or (id == ir.IN_NOTIFY) or
+               (id == ir.IN_SET_SP) or (id == ir.IN_MEMSIZE);
+    }
+    return false;
+}
+
+fn is_ci(v: *ir.Value) bool {
+    return (v.kind == ir.V_CINT) or ((v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_INT));
+}
+
+// A constant for i, or nil.
+fn fold(i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    let B = ir.new_builder();
+    if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) {
+        if is_ci(i.a) and is_ci(i.b) {
+            return ir.fold_int_bin(op, i.ty, i.a, i.b);
+        }
+        return vnil();
+    }
+    if (op == ir.OP_ICMP) and (i.ty.kind == ir.T_INT) and is_ci(i.a) and is_ci(i.b) and (i.a.ty.kind == ir.T_INT) {
+        return ir.icmp(B, @truncate(i32, @bit_cast(i64, i.cv)), i.a, i.b);
+    }
+    if op == ir.OP_SELECT {
+        if i.a.kind == ir.V_CINT {
+            if i.a.cv != 0 {
+                return i.b;
+            }
+            return i.c;
+        }
+        if i.b == i.c {
+            return i.b;
+        }
+        return vnil();
+    }
+    if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC)) and is_ci(i.a) and (i.ty.kind == ir.T_INT) {
+        return ir.cast(B, op, i.a, i.ty);
+    }
+    if op == ir.OP_PHI {
+        // all inputs the same (ignoring the phi itself)
+        let mut same = vnil();
+        for k in 0..i.xs.len {
+            let x = i.xs.get(k);
+            if (x == i) or (x.kind == ir.V_UNDEF) {
+                continue;
+            }
+            if u.isnil(same) {
+                same = x;
+            } else if same != x {
+                return vnil();
+            }
+        }
+        if u.isnil(same) {
+            return ir.undef(i.ty);
+        }
+        return same;
+    }
+    return vnil();
+}
+
+// Folds constants and trivial phis to a fixed point. True if anything changed.
+pub fn fold_constants(f: *mut ir.Func) bool {
+    let mut any = false;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                if u.notnil(i.a) {
+                    i.a = ir.resolve(i.a);
+                }
+                if u.notnil(i.b) {
+                    i.b = ir.resolve(i.b);
+                }
+                if u.notnil(i.c) {
+                    i.c = ir.resolve(i.c);
+                }
+                for k in 0..i.xs.len {
+                    i.xs.set(k, ir.resolve(i.xs.get(k)));
+                }
+                if not has_side_effects(i) {
+                    let r = fold(i);
+                    if u.notnil(r) and (r != i) {
+                        i.fwd = r;
+                        ir.remove_inst(i);
+                        changed = true;
+                        any = true;
+                    }
+                }
+                i = next;
+            }
+            b = b.next;
+        }
+    }
+    ir.apply_forwarding(f);
+    return any;
+}
+
+fn mark_live(o: *mut ir.Value, work: *mut u.List.[*mut ir.Value]) void {
+    if u.notnil(o) and (o.kind == ir.V_INST) and (o.aux == 0) {
+        o.aux = 1;
+        work.push(o);
+    }
+}
+
+// Removes instructions whose results are unused and that have no effects
+// (including cycles of dead phis).
+pub fn dce(f: *mut ir.Func) void {
+    let mut work = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            if has_side_effects(i) or (i.op == ir.OP_ALLOCA) {
+                i.aux = 1;
+                work.push(i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    while work.len > 0 {
+        let i = work.pop();
+        mark_live(i.a, &mut work);
+        mark_live(i.b, &mut work);
+        mark_live(i.c, &mut work);
+        for k in 0..i.xs.len {
+            mark_live(i.xs.get(k), &mut work);
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if i.aux == 0 {
+                ir.remove_inst(i);
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+}
+
+fn remove_phi_input(s: *mut ir.Block, from: *mut ir.Block) void {
+    let mut p = s.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut k: usize = 0;
+        while k < p.bs.len {
+            if p.bs.get(k) == from {
+                p.bs.set(k, p.bs.get(p.bs.len - 1));
+                p.xs.set(k, p.xs.get(p.xs.len - 1));
+                p.bs.len -= 1;
+                p.xs.len -= 1;
+            } else {
+                k += 1;
+            }
+        }
+        p = p.next;
+    }
+}
+
+fn replace_phi_block(s: *mut ir.Block, old: *mut ir.Block, new: *mut ir.Block) void {
+    let mut p = s.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        for k in 0..p.bs.len {
+            if p.bs.get(k) == old {
+                p.bs.set(k, new);
+            }
+        }
+        p = p.next;
+    }
+}
+
+fn has_phis(b: *ir.Block) bool {
+    return u.notnil(b.first) and (b.first.op == ir.OP_PHI);
+}
+
+// Constant branches, unreachable blocks, jump threading through empty
+// blocks and merging of straight-line blocks. True if anything changed.
+pub fn simplify_cfg(f: *mut ir.Func) bool {
+    let mut any = false;
+    // constant conditions
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) {
+            let c = t.a;
+            if (c.kind == ir.V_CINT) or (t.t1 == t.t2) {
+                let mut keep = t.t1;
+                let mut drop = t.t2;
+                if (c.kind == ir.V_CINT) and (c.cv == 0) {
+                    keep = t.t2;
+                    drop = t.t1;
+                }
+                if drop != keep {
+                    remove_phi_input(drop, b);
+                }
+                t.op = ir.OP_BR;
+                t.a = vnil();
+                t.t1 = keep;
+                t.t2 = bnil();
+                any = true;
+            }
+        } else if u.notnil(t) and (t.op == ir.OP_SWITCH) and (t.a.kind == ir.V_CINT) {
+            let mut target = t.t1;
+            for k in 0..t.xs.len {
+                if t.xs.get(k).cv == t.a.cv {
+                    target = t.bs.get(k);
+                }
+            }
+            for k in 0..ir.succ_count(t) {
+                let s = ir.succ(t, k);
+                if s != target {
+                    remove_phi_input(s, b);
+                }
+            }
+            t.op = ir.OP_BR;
+            t.a = vnil();
+            t.t1 = target;
+            t.xs.clear();
+            t.bs.clear();
+            any = true;
+        }
+        b = b.next;
+    }
+    ir.remove_unreachable(f);
+    compute_preds(f);
+    // thread jumps through blocks that contain only `br X` (X without phis)
+    b = f.first.next;
+    while u.notnil(b) {
+        let next = b.next;
+        let t = ir.terminator(b);
+        if (b.first == t) and (t.op == ir.OP_BR) and (t.t1 != b) and not has_phis(t.t1) {
+            let x = t.t1;
+            for k in 0..b.preds.len {
+                let p = b.preds.get(k);
+                let pt = ir.terminator(p);
+                for j in 0..ir.succ_count(pt) {
+                    if ir.succ(pt, j) == b {
+                        ir.set_succ(pt, j, x);
+                    }
+                }
+            }
+            if b.preds.len > 0 {
+                any = true;
+            }
+        }
+        b = next;
+    }
+    ir.remove_unreachable(f);
+    compute_preds(f);
+    // merge b -> s when b ends in `br s` and s has no other predecessor
+    b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_BR) {
+            let s = t.t1;
+            if (s != b) and (s.preds.len == 1) and (s != f.first) {
+                // s's phis have one input
+                let mut p = s.first;
+                while u.notnil(p) and (p.op == ir.OP_PHI) {
+                    let nx = p.next;
+                    p.fwd = p.xs.get(0);
+                    ir.remove_inst(p);
+                    p = nx;
+                }
+                ir.remove_inst(t);
+                let mut i = s.first;
+                while u.notnil(i) {
+                    let nx = i.next;
+                    ir.remove_inst(i);
+                    ir.append_inst(b, i);
+                    i = nx;
+                }
+                let nt = ir.terminator(b);
+                for k in 0..ir.succ_count(nt) {
+                    let ss = ir.succ(nt, k);
+                    replace_phi_block(ss, s, b);
+                    // preds of the successor: s -> b
+                    for j in 0..ss.preds.len {
+                        if ss.preds.get(j) == s {
+                            ss.preds.set(j, b);
+                        }
+                    }
+                }
+                ir.remove_block(s);
+                any = true;
+                continue;  // b may merge again
+            }
+        }
+        b = b.next;
+    }
+    ir.apply_forwarding(f);
+    return any;
+}
+
+// The standard cleanup after lowering.
+pub fn optimize(f: *mut ir.Func, level: i32) void {
+    mem2reg(f);
+    let mut rounds: i32 = 0;
+    loop {
+        let a = fold_constants(f);
+        let c = simplify_cfg(f);
+        rounds += 1;
+        if not (a or c) or (rounds > 8) {
+            break;
+        }
+    }
+    dce(f);
+}

@@ -1,0 +1,1840 @@
+// =============================================================================
+// ir.ph - the compiler's intermediate representation: typed SSA in basic
+// blocks, in the style of LLVM IR, and the builder the code generator uses
+// to create it.
+//
+// Values are one struct (`Value`) for everything: constants, globals,
+// functions, parameters and instructions. Aggregates (structs and arrays) may
+// be SSA values when codegen builds the IR; lower.ph turns them into memory
+// before the target backends run, which only see scalars (integers, floats,
+// pointers and 128-bit vectors).
+//
+// The builder folds constant integer operations, like LLVM's IRBuilder, so a
+// check whose condition is a constant disappears when the IR is built.
+// =============================================================================
+import "util.ph" as u;
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+pub const T_VOID: i32 = 0;
+pub const T_INT: i32 = 1;    // bits: 1, 8, 16, 32, 64, 128
+pub const T_FLOAT: i32 = 2;  // bits: 32, 64
+pub const T_PTR: i32 = 3;
+pub const T_VEC: i32 = 4;    // elem (INT or FLOAT lane), lanes
+pub const T_ARRAY: i32 = 5;  // elem, count
+pub const T_STRUCT: i32 = 6; // fields, offs
+pub const T_FN: i32 = 7;     // ret, params, vararg
+
+pub struct Ty {
+    kind: i32,
+    bits: i32,
+    lanes: i32,
+    elem: *mut Ty,
+    count: u64,
+    fields: []mut *mut Ty,
+    offs: []mut u64,
+    ret: *mut Ty,
+    params: []mut *mut Ty,
+    vararg: bool,
+    size: u64,
+    align: u64,
+    name: []u8,
+    has_body: bool,
+    id: i32,
+}
+
+pub let mut ptr_bytes: u64 = 8;
+let mut ty_count: i32 = 0;
+let mut int_tys: [129]*mut Ty = [@ptr_from_int(*mut Ty, 0); 129];
+let mut t_void_: *mut Ty = @ptr_from_int(*mut Ty, 0);
+let mut t_ptr_: *mut Ty = @ptr_from_int(*mut Ty, 0);
+let mut t_f32_: *mut Ty = @ptr_from_int(*mut Ty, 0);
+let mut t_f64_: *mut Ty = @ptr_from_int(*mut Ty, 0);
+let mut derived: u.SymMap.[*mut Ty] = u.SymMap.[*mut Ty].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 };
+
+fn new_ty(k: i32) *mut Ty {
+    let t = u.new.[Ty]();
+    t.kind = k;
+    ty_count += 1;
+    t.id = ty_count;
+    return t;
+}
+
+// Must be called before any type is created (pointer width of the target).
+pub fn init_types(pbytes: u64) void {
+    ptr_bytes = pbytes;
+}
+
+pub fn t_int(bits: i32) *mut Ty {
+    let i = @int_cast(usize, bits);
+    if u.isnil(int_tys[i]) {
+        let t = new_ty(T_INT);
+        t.bits = bits;
+        let mut sz: u64 = 1;
+        if bits > 8 {
+            sz = @int_cast(u64, bits) / 8;
+        }
+        t.size = sz;
+        t.align = sz;
+        if sz > 8 {
+            t.align = 16;
+        }
+        int_tys[i] = t;
+    }
+    return int_tys[i];
+}
+
+pub fn t_void() *mut Ty {
+    if u.isnil(t_void_) {
+        t_void_ = new_ty(T_VOID);
+        t_void_.align = 1;
+    }
+    return t_void_;
+}
+
+pub fn t_ptr() *mut Ty {
+    if u.isnil(t_ptr_) {
+        t_ptr_ = new_ty(T_PTR);
+        t_ptr_.size = ptr_bytes;
+        t_ptr_.align = ptr_bytes;
+        t_ptr_.bits = @int_cast(i32, ptr_bytes * 8);
+    }
+    return t_ptr_;
+}
+
+pub fn t_float(bits: i32) *mut Ty {
+    if bits == 32 {
+        if u.isnil(t_f32_) {
+            t_f32_ = new_ty(T_FLOAT);
+            t_f32_.bits = 32;
+            t_f32_.size = 4;
+            t_f32_.align = 4;
+        }
+        return t_f32_;
+    }
+    if u.isnil(t_f64_) {
+        t_f64_ = new_ty(T_FLOAT);
+        t_f64_.bits = 64;
+        t_f64_.size = 8;
+        t_f64_.align = 8;
+    }
+    return t_f64_;
+}
+
+pub fn t_vec(lane: *mut Ty, nl: u32) *mut Ty {
+    let lanes = @int_cast(i32, nl);
+    let k = u.intern(u.f2("v%s.%s", u.idec(lane.id), u.idec(lanes)));
+    let found = derived.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    let t = new_ty(T_VEC);
+    t.elem = lane;
+    t.lanes = lanes;
+    t.bits = lane.bits;
+    t.size = lane.size * @int_cast(u64, lanes);
+    t.align = 16;
+    derived.put(k, t);
+    return t;
+}
+
+pub fn t_array(el: *mut Ty, n: u64) *mut Ty {
+    let k = u.intern(u.f2("a%s.%s", u.idec(el.id), u.udec(n)));
+    let found = derived.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    let t = new_ty(T_ARRAY);
+    t.elem = el;
+    t.count = n;
+    t.size = el.size * n;
+    t.align = el.align;
+    t.has_body = true;
+    derived.put(k, t);
+    return t;
+}
+
+fn layout_struct(t: *mut Ty) void {
+    let n = t.fields.len;
+    t.offs = u.newn.[u64](n + 1);
+    let mut off: u64 = 0;
+    let mut al: u64 = 1;
+    for i in 0..n {
+        let f = t.fields[i];
+        off = (off + f.align - 1) & ~(f.align - 1);
+        t.offs[i] = off;
+        off += f.size;
+        if f.align > al {
+            al = f.align;
+        }
+    }
+    t.size = (off + al - 1) & ~(al - 1);
+    t.align = al;
+    t.has_body = true;
+}
+
+// A literal (anonymous) struct type: interned by its field types.
+pub fn t_struct(fields: []mut *mut Ty) *mut Ty {
+    let mut b = u.Buf.init();
+    b.s("s");
+    for f in fields {
+        b.s(".");
+        b.s(u.idec(f.id));
+    }
+    let k = u.intern(b.done());
+    let found = derived.get(k);
+    if u.notnil(found) {
+        return found;
+    }
+    let t = new_ty(T_STRUCT);
+    let fs = u.newn.[*mut Ty](fields.len + 1);
+    for i in 0..fields.len {
+        fs[i] = fields[i];
+    }
+    t.fields = fs[0..fields.len];
+    layout_struct(t);
+    derived.put(k, t);
+    return t;
+}
+
+pub fn t_named_struct(name: []u8) *mut Ty {
+    let t = new_ty(T_STRUCT);
+    t.name = u.dup(name);
+    t.align = 1;
+    return t;
+}
+
+pub fn struct_set_body(t: *mut Ty, fields: []mut *mut Ty) void {
+    let fs = u.newn.[*mut Ty](fields.len + 1);
+    for i in 0..fields.len {
+        fs[i] = fields[i];
+    }
+    t.fields = fs[0..fields.len];
+    layout_struct(t);
+}
+
+pub fn t_fn(rt: *mut Ty, params: []mut *mut Ty, vararg: bool) *mut Ty {
+    let t = new_ty(T_FN);
+    t.ret = rt;
+    let ps = u.newn.[*mut Ty](params.len + 1);
+    for i in 0..params.len {
+        ps[i] = params[i];
+    }
+    t.params = ps[0..params.len];
+    t.vararg = vararg;
+    return t;
+}
+
+pub fn is_agg(t: *Ty) bool {
+    return (t.kind == T_STRUCT) or (t.kind == T_ARRAY);
+}
+
+pub fn is_int(t: *Ty) bool {
+    return t.kind == T_INT;
+}
+
+pub fn is_float(t: *Ty) bool {
+    return t.kind == T_FLOAT;
+}
+
+pub fn is_vec(t: *Ty) bool {
+    return t.kind == T_VEC;
+}
+
+// Integer width in bits (pointers: the pointer width).
+pub fn int_width(t: *Ty) u32 {
+    return @int_cast(u32, t.bits);
+}
+
+pub fn field_ty(t: *mut Ty, i: usize) *mut Ty {
+    if t.kind == T_ARRAY {
+        return t.elem;
+    }
+    return t.fields[i];
+}
+
+pub fn field_off(t: *mut Ty, i: usize) u64 {
+    if t.kind == T_ARRAY {
+        return t.elem.size * @as(u64, i);
+    }
+    return t.offs[i];
+}
+
+pub fn field_count(t: *mut Ty) usize {
+    if t.kind == T_ARRAY {
+        return @int_cast(usize, t.count);
+    }
+    return t.fields.len;
+}
+
+pub fn ty_str(t: *Ty) []u8 {
+    let k = t.kind;
+    if k == T_VOID {
+        return "void";
+    }
+    if k == T_INT {
+        return u.cat2("i", u.idec(t.bits));
+    }
+    if k == T_FLOAT {
+        return u.pick(t.bits == 32, "float", "double");
+    }
+    if k == T_PTR {
+        return "ptr";
+    }
+    if k == T_VEC {
+        return u.f2("<%s x %s>", u.idec(t.lanes), ty_str(t.elem));
+    }
+    if k == T_ARRAY {
+        return u.f2("[%s x %s]", u.udec(t.count), ty_str(t.elem));
+    }
+    if k == T_STRUCT {
+        if t.name.len > 0 {
+            return u.cat2("%", t.name);
+        }
+        let mut b = u.Buf.init();
+        b.s("{ ");
+        for i in 0..t.fields.len {
+            if i != 0 {
+                b.s(", ");
+            }
+            b.s(ty_str(t.fields[i]));
+        }
+        b.s(" }");
+        return b.done();
+    }
+    let mut b = u.Buf.init();
+    b.s(ty_str(t.ret));
+    b.s(" (");
+    for i in 0..t.params.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(ty_str(t.params[i]));
+    }
+    if t.vararg {
+        b.s(", ...");
+    }
+    b.s(")");
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Values
+// -----------------------------------------------------------------------------
+pub const V_INST: i32 = 0;
+pub const V_CINT: i32 = 1;    // cv (truncated to the width, zero-extended)
+pub const V_CFP: i32 = 2;     // fv
+pub const V_ZERO: i32 = 3;    // zero of any type (null pointer, zeroinitializer)
+pub const V_UNDEF: i32 = 4;
+pub const V_CAGG: i32 = 5;    // constant struct / array / vector: xs
+pub const V_GLOBAL: i32 = 6;  // address of gv
+pub const V_FUNC: i32 = 7;    // address of fnp
+pub const V_PARAM: i32 = 8;   // cv = index
+
+// Instructions
+pub const OP_ADD: i32 = 1;
+pub const OP_SUB: i32 = 2;
+pub const OP_MUL: i32 = 3;
+pub const OP_UDIV: i32 = 4;
+pub const OP_SDIV: i32 = 5;
+pub const OP_UREM: i32 = 6;
+pub const OP_SREM: i32 = 7;
+pub const OP_AND: i32 = 8;
+pub const OP_OR: i32 = 9;
+pub const OP_XOR: i32 = 10;
+pub const OP_SHL: i32 = 11;
+pub const OP_LSHR: i32 = 12;
+pub const OP_ASHR: i32 = 13;
+pub const OP_FADD: i32 = 14;
+pub const OP_FSUB: i32 = 15;
+pub const OP_FMUL: i32 = 16;
+pub const OP_FDIV: i32 = 17;
+pub const OP_FREM: i32 = 18;
+pub const OP_FNEG: i32 = 19;
+pub const OP_ICMP: i32 = 20;       // cv: predicate
+pub const OP_FCMP: i32 = 21;       // cv: predicate
+pub const OP_SELECT: i32 = 22;     // a ? b : c
+pub const OP_ZEXT: i32 = 23;
+pub const OP_SEXT: i32 = 24;
+pub const OP_TRUNC: i32 = 25;
+pub const OP_BITCAST: i32 = 26;
+pub const OP_PTRTOINT: i32 = 27;
+pub const OP_INTTOPTR: i32 = 28;
+pub const OP_FPEXT: i32 = 29;
+pub const OP_FPTRUNC: i32 = 30;
+pub const OP_SITOFP: i32 = 31;
+pub const OP_UITOFP: i32 = 32;
+pub const OP_FPTOSI_SAT: i32 = 33;
+pub const OP_FPTOUI_SAT: i32 = 34;
+pub const OP_ALLOCA: i32 = 35;     // aty: allocated type; align
+pub const OP_LOAD: i32 = 36;       // a: address
+pub const OP_STORE: i32 = 37;      // a: value, b: address
+pub const OP_PTRADD: i32 = 38;     // a: pointer, b: byte offset (pointer-sized int)
+pub const OP_MEMCPY: i32 = 39;     // a: dst, b: src, c: length (non-overlapping)
+pub const OP_MEMMOVE: i32 = 40;    // a: dst, b: src, c: length
+pub const OP_MEMSET: i32 = 41;     // a: dst, b: byte (i8), c: length
+pub const OP_RMW: i32 = 42;        // cv: RMW_*; a: address, b: value
+pub const OP_CMPXCHG: i32 = 43;    // a: address, b: expected, c: new; result: old value
+pub const OP_FENCE: i32 = 44;
+pub const OP_EXTRACTVALUE: i32 = 45;  // a: aggregate, cv: index
+pub const OP_INSERTVALUE: i32 = 46;   // a: aggregate, b: value, cv: index
+pub const OP_EXTRACTELEM: i32 = 47;   // a: vector, cv: lane
+pub const OP_INSERTELEM: i32 = 48;    // a: vector, b: scalar, cv: lane
+pub const OP_SHUFFLE: i32 = 49;       // a, b: vectors; mask: lane indices
+pub const OP_SPLAT: i32 = 50;         // a: scalar
+pub const OP_CALL: i32 = 51;          // a: callee; xs: arguments; fty: signature
+pub const OP_INTR: i32 = 52;          // cv: IN_*; xs: arguments
+pub const OP_PHI: i32 = 53;           // xs: values, bs: blocks
+pub const OP_BR: i32 = 54;            // t1
+pub const OP_CONDBR: i32 = 55;        // a: condition; t1 if true, t2 if false
+pub const OP_SWITCH: i32 = 56;        // a: value; t1: default; xs: case constants, bs: targets
+pub const OP_RET: i32 = 57;           // a: value (nil for void)
+pub const OP_UNREACHABLE: i32 = 58;
+pub const OP_COPY: i32 = 59;          // a (backend use)
+
+// Comparison predicates (LLVM's numbering)
+pub const IntEQ: i32 = 32;
+pub const IntNE: i32 = 33;
+pub const IntUGT: i32 = 34;
+pub const IntUGE: i32 = 35;
+pub const IntULT: i32 = 36;
+pub const IntULE: i32 = 37;
+pub const IntSGT: i32 = 38;
+pub const IntSGE: i32 = 39;
+pub const IntSLT: i32 = 40;
+pub const IntSLE: i32 = 41;
+pub const RealOEQ: i32 = 1;
+pub const RealOGT: i32 = 2;
+pub const RealOGE: i32 = 3;
+pub const RealOLT: i32 = 4;
+pub const RealOLE: i32 = 5;
+pub const RealUNE: i32 = 14;
+
+// Read-modify-write operations
+pub const RMW_XCHG: i32 = 0;
+pub const RMW_ADD: i32 = 1;
+pub const RMW_SUB: i32 = 2;
+pub const RMW_AND: i32 = 3;
+pub const RMW_OR: i32 = 5;
+pub const RMW_XOR: i32 = 6;
+pub const RMW_MAX: i32 = 7;
+pub const RMW_MIN: i32 = 8;
+pub const RMW_UMAX: i32 = 9;
+pub const RMW_UMIN: i32 = 10;
+
+// Intrinsics
+pub const IN_CTLZ: i32 = 1;
+pub const IN_CTTZ: i32 = 2;
+pub const IN_CTPOP: i32 = 3;
+pub const IN_ROTL: i32 = 4;
+pub const IN_ROTR: i32 = 5;
+pub const IN_SADD_SAT: i32 = 6;
+pub const IN_UADD_SAT: i32 = 7;
+pub const IN_SSUB_SAT: i32 = 8;
+pub const IN_USUB_SAT: i32 = 9;
+pub const IN_SMIN: i32 = 10;
+pub const IN_SMAX: i32 = 11;
+pub const IN_UMIN: i32 = 12;
+pub const IN_UMAX: i32 = 13;
+pub const IN_FMIN: i32 = 14;      // IEEE minimum: NaN-propagating, -0 < +0
+pub const IN_FMAX: i32 = 15;
+pub const IN_FABS: i32 = 16;
+pub const IN_SQRT: i32 = 17;
+pub const IN_FLOOR: i32 = 18;
+pub const IN_CEIL: i32 = 19;
+pub const IN_FTRUNC: i32 = 20;
+pub const IN_NEAREST: i32 = 21;   // round to nearest, ties to even
+pub const IN_FMA: i32 = 22;
+pub const IN_COPYSIGN: i32 = 23;
+pub const IN_ABS: i32 = 24;       // wrapping integer abs
+pub const IN_TRAP: i32 = 25;
+pub const IN_MEMSIZE: i32 = 26;   // wasm memory.size (pages)
+pub const IN_MEMGROW: i32 = 27;   // wasm memory.grow
+pub const IN_WAIT32: i32 = 28;    // wasm memory.atomic.wait32
+pub const IN_NOTIFY: i32 = 29;    // wasm memory.atomic.notify
+pub const IN_SET_SP: i32 = 30;    // set the stack pointer (thread entry on wasm)
+pub const IN_ANYTRUE: i32 = 31;   // i1: any bit of the vector set
+pub const IN_ALLTRUE: i32 = 32;   // i1: every lane nonzero
+pub const IN_BITMASK: i32 = 33;   // i32: top bit of each lane
+pub const IN_SWIZZLE: i32 = 34;   // i8x16 swizzle (out-of-range index: 0)
+pub const IN_DOT_I16: i32 = 35;   // i32x4 dot product of i16x8 lanes
+
+// Load/store flags
+pub const F_VOLATILE: u32 = 1;
+pub const F_ATOMIC: u32 = 2;   // sequentially consistent
+
+pub struct Value {
+    kind: i32,
+    op: i32,
+    ty: *mut Ty,
+    a: *mut Value,
+    b: *mut Value,
+    c: *mut Value,
+    xs: u.List.[*mut Value],
+    bs: u.List.[*mut Block],
+    t1: *mut Block,
+    t2: *mut Block,
+    cv: u64,
+    fv: f64,
+    flags: u32,
+    align: u32,
+    aty: *mut Ty,       // ALLOCA: allocated type
+    fty: *mut Ty,       // CALL: signature
+    mask: []mut i32,    // SHUFFLE
+    ext: []mut u8,      // CALL: argument extension (0 none, 1 zext, 2 sext)
+    blk: *mut Block,
+    prev: *mut Value,
+    next: *mut Value,
+    gv: *mut Global,
+    fnp: *mut Func,
+    id: i32,
+    uses: i32,
+    name: []u8,
+    aux: i64,           // pass / backend scratch
+    aux2: i64,
+    auxp: *mut void,
+    fwd: *mut Value,    // replacement (passes forward uses through resolve())
+    // backend scratch
+    pos: i32,           // position in its block
+    loc: i32,           // local / virtual register
+    flag: i32,
+    user: *mut Value,   // the only user (when uses == 1)
+}
+
+pub struct Block {
+    fnp: *mut Func,
+    first: *mut Value,
+    last: *mut Value,
+    prev: *mut Block,
+    next: *mut Block,
+    name: []u8,
+    id: i32,
+    preds: u.List.[*mut Block],
+    idom: *mut Block,
+    dom_kids: u.List.[*mut Block],
+    rpo: i32,
+    depth: i32,        // dominator tree depth
+    loop_depth: i32,
+    aux: i64,
+    auxp: *mut void,
+}
+
+pub const LINK_EXTERNAL: i32 = 0;
+pub const LINK_INTERNAL: i32 = 1;
+pub const LINK_LINKONCE: i32 = 2;   // a definition any unit may repeat; one is kept
+pub const LINK_EXTWEAK: i32 = 3;    // a weak reference: 0 when not defined
+pub const LINK_WEAK: i32 = 4;
+
+pub struct Func {
+    name: []u8,
+    ty: *mut Ty,
+    linkage: i32,
+    params: []mut *mut Value,
+    first: *mut Block,
+    last: *mut Block,
+    val: *mut Value,
+    noreturn: bool,
+    cold: bool,
+    noinline: bool,
+    ret_ext: u8,          // 0 none, 1 zext, 2 sext
+    param_ext: []mut u8,
+    export_name: []u8,    // wasm export
+    import_module: []u8,  // wasm import
+    import_name: []u8,
+    sret: bool,           // set by lowering: params[0] is the result address
+    nvals: i32,
+    nblocks: i32,
+    id: i32,
+    aux: i64,
+    auxp: *mut void,
+}
+
+pub struct Global {
+    name: []u8,
+    ty: *mut Ty,
+    init: *mut Value,   // nil: declaration
+    linkage: i32,
+    align: u64,
+    is_const: bool,
+    tls: bool,
+    wasm_global: bool,  // a wasm global (per instance) instead of memory
+    val: *mut Value,
+    id: i32,
+    aux: i64,
+}
+
+pub struct Module {
+    name: []u8,
+    funcs: u.List.[*mut Func],
+    globals: u.List.[*mut Global],
+    fmap: u.SymMap.[*mut Func],
+    gmap: u.SymMap.[*mut Global],
+}
+
+pub fn vnil() *mut Value {
+    return u.nil.[Value]();
+}
+
+pub fn bnil() *mut Block {
+    return u.nil.[Block]();
+}
+
+fn new_val(k: i32, t: *mut Ty) *mut Value {
+    let v = u.new.[Value]();
+    v.kind = k;
+    v.ty = t;
+    return v;
+}
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+pub fn mask_bits(bits: i32) u64 {
+    if bits >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    return (@as(u64, 1) << @int_cast(u32, bits)) - 1;
+}
+
+// The constant's value sign-extended from its width.
+pub fn sval(v: *Value) i64 {
+    let bits = v.ty.bits;
+    if bits >= 64 {
+        return @bit_cast(i64, v.cv);
+    }
+    let sh = @int_cast(u32, 64 - bits);
+    return @bit_cast(i64, v.cv << sh) >> sh;
+}
+
+pub fn cint(t: *mut Ty, v: u64) *mut Value {
+    let c = new_val(V_CINT, t);
+    c.cv = v & mask_bits(t.bits);
+    return c;
+}
+
+pub fn ci32(v: u64) *mut Value {
+    return cint(t_int(32), v);
+}
+
+pub fn cfp(t: *mut Ty, x: f64) *mut Value {
+    let c = new_val(V_CFP, t);
+    if t.bits == 32 {
+        c.fv = @float_cast(f64, @float_cast(f32, x));
+    } else {
+        c.fv = x;
+    }
+    return c;
+}
+
+pub fn czero(t: *mut Ty) *mut Value {
+    if t.kind == T_INT {
+        return cint(t, 0);
+    }
+    return new_val(V_ZERO, t);
+}
+
+pub fn cones(t: *mut Ty) *mut Value {
+    if t.kind == T_VEC {
+        let n = @int_cast(usize, t.lanes);
+        let xs = u.newn.[*mut Value](n);
+        for i in 0..n {
+            xs[i] = cint(t.elem, 0xFFFF_FFFF_FFFF_FFFF);
+        }
+        return cagg(t, xs);
+    }
+    return cint(t, 0xFFFF_FFFF_FFFF_FFFF);
+}
+
+pub fn undef(t: *mut Ty) *mut Value {
+    return new_val(V_UNDEF, t);
+}
+
+pub fn cagg(t: *mut Ty, xs: []mut *mut Value) *mut Value {
+    let c = new_val(V_CAGG, t);
+    for x in xs {
+        c.xs.push(x);
+    }
+    return c;
+}
+
+pub fn cstruct(xs: []mut *mut Value) *mut Value {
+    let ts = u.newn.[*mut Ty](xs.len + 1);
+    for i in 0..xs.len {
+        ts[i] = xs[i].ty;
+    }
+    return cagg(t_struct(ts[0..xs.len]), xs);
+}
+
+pub fn carray(el: *mut Ty, xs: []mut *mut Value) *mut Value {
+    return cagg(t_array(el, @as(u64, xs.len)), xs);
+}
+
+// The bytes of `s` followed by a NUL, as an [n+1 x i8] constant.
+pub fn cstring(s: []u8) *mut Value {
+    let t8 = t_int(8);
+    let xs = u.newn.[*mut Value](s.len + 1);
+    for i in 0..s.len {
+        xs[i] = cint(t8, @as(u64, s[i]));
+    }
+    xs[s.len] = cint(t8, 0);
+    return cagg(t_array(t8, @as(u64, s.len) + 1), xs);
+}
+
+pub fn cinttoptr(v: *mut Value) *mut Value {
+    if (v.kind == V_CINT) and (v.cv == 0) {
+        return czero(t_ptr());
+    }
+    return cint(t_ptr(), v.cv);
+}
+
+pub fn is_const(v: *Value) bool {
+    return (v.kind != V_INST) and (v.kind != V_PARAM);
+}
+
+pub fn is_cint(v: *Value) bool {
+    return (v.kind == V_CINT) or ((v.kind == V_ZERO) and ((v.ty.kind == T_INT) or (v.ty.kind == T_PTR)));
+}
+
+pub fn cint_val(v: *Value) u64 {
+    if v.kind == V_CINT {
+        return v.cv;
+    }
+    return 0;
+}
+
+pub fn is_zero(v: *Value) bool {
+    if v.kind == V_ZERO {
+        return true;
+    }
+    if v.kind == V_CINT {
+        return v.cv == 0;
+    }
+    if v.kind == V_CFP {
+        return (v.fv == 0.0) and (@bit_cast(u64, v.fv) == 0);
+    }
+    if v.kind == V_CAGG {
+        for i in 0..v.xs.len {
+            if not is_zero(v.xs.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Module, functions, globals
+// -----------------------------------------------------------------------------
+pub fn new_module(name: []u8) *mut Module {
+    let m = u.new.[Module]();
+    m.name = u.dup(name);
+    return m;
+}
+
+pub fn add_function(m: *mut Module, name: []u8, fty: *mut Ty) *mut Func {
+    let f = u.new.[Func]();
+    f.name = u.intern(name);
+    f.ty = fty;
+    f.id = @int_cast(i32, m.funcs.len);
+    let n = fty.params.len;
+    f.params = u.newn.[*mut Value](n + 1)[0..n];
+    for i in 0..n {
+        let p = new_val(V_PARAM, fty.params[i]);
+        p.cv = @as(u64, i);
+        p.fnp = f;
+        f.params[i] = p;
+    }
+    f.param_ext = u.newn.[u8](n + 1)[0..n];
+    let fv = new_val(V_FUNC, t_ptr());
+    fv.fnp = f;
+    f.val = fv;
+    m.funcs.push(f);
+    if not m.fmap.has(f.name) {
+        m.fmap.put(f.name, f);
+    }
+    return f;
+}
+
+pub fn new_param(f: *mut Func, t: *mut Ty, idx: usize) *mut Value {
+    let p = new_val(V_PARAM, t);
+    p.cv = @as(u64, idx);
+    p.fnp = f;
+    return p;
+}
+
+// The value `v` stands for after replacements.
+pub fn resolve(v: *mut Value) *mut Value {
+    let mut x = v;
+    while u.notnil(x) and u.notnil(x.fwd) {
+        x = x.fwd;
+    }
+    return x;
+}
+
+// Rewrites every operand of f's instructions through resolve().
+pub fn apply_forwarding(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if u.notnil(i.a) {
+                i.a = resolve(i.a);
+            }
+            if u.notnil(i.b) {
+                i.b = resolve(i.b);
+            }
+            if u.notnil(i.c) {
+                i.c = resolve(i.c);
+            }
+            for k in 0..i.xs.len {
+                i.xs.set(k, resolve(i.xs.get(k)));
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+pub fn get_function(m: *mut Module, name: []u8) *mut Func {
+    return m.fmap.get(u.intern(name));
+}
+
+pub fn add_global(m: *mut Module, t: *mut Ty, name: []u8) *mut Global {
+    let g = u.new.[Global]();
+    g.name = u.intern(name);
+    g.ty = t;
+    g.align = t.align;
+    g.id = @int_cast(i32, m.globals.len);
+    let gv = new_val(V_GLOBAL, t_ptr());
+    gv.gv = g;
+    g.val = gv;
+    m.globals.push(g);
+    if not m.gmap.has(g.name) {
+        m.gmap.put(g.name, g);
+    }
+    return g;
+}
+
+pub fn get_global(m: *mut Module, name: []u8) *mut Global {
+    return m.gmap.get(u.intern(name));
+}
+
+pub fn is_decl(f: *Func) bool {
+    return u.isnil(f.first);
+}
+
+pub fn append_block(f: *mut Func, name: []u8) *mut Block {
+    let b = u.new.[Block]();
+    b.fnp = f;
+    b.name = name;
+    b.id = f.nblocks;
+    f.nblocks += 1;
+    if u.isnil(f.last) {
+        f.first = b;
+    } else {
+        f.last.next = b;
+        b.prev = f.last;
+    }
+    f.last = b;
+    return b;
+}
+
+pub fn remove_block(b: *mut Block) void {
+    let f = b.fnp;
+    if u.notnil(b.prev) {
+        b.prev.next = b.next;
+    } else {
+        f.first = b.next;
+    }
+    if u.notnil(b.next) {
+        b.next.prev = b.prev;
+    } else {
+        f.last = b.prev;
+    }
+    b.prev = bnil();
+    b.next = bnil();
+}
+
+// Moves `b` to directly after `after`.
+pub fn move_block_after(b: *mut Block, after: *mut Block) void {
+    if b == after {
+        return;
+    }
+    remove_block(b);
+    let f = after.fnp;
+    b.prev = after;
+    b.next = after.next;
+    if u.notnil(after.next) {
+        after.next.prev = b;
+    } else {
+        f.last = b;
+    }
+    after.next = b;
+}
+
+pub fn terminator(b: *Block) *mut Value {
+    let l = b.last;
+    if u.notnil(l) and is_term(l.op) {
+        return l;
+    }
+    return vnil();
+}
+
+pub fn is_term(op: i32) bool {
+    return (op >= OP_BR) and (op <= OP_UNREACHABLE);
+}
+
+// Successor blocks of a terminator.
+pub fn succ_count(t: *Value) usize {
+    if u.isnil(t) {
+        return 0;
+    }
+    let op = t.op;
+    if op == OP_BR {
+        return 1;
+    }
+    if op == OP_CONDBR {
+        return 2;
+    }
+    if op == OP_SWITCH {
+        return 1 + t.bs.len;
+    }
+    return 0;
+}
+
+pub fn succ(t: *Value, i: usize) *mut Block {
+    if i == 0 {
+        return t.t1;
+    }
+    if t.op == OP_CONDBR {
+        return t.t2;
+    }
+    return t.bs.get(i - 1);
+}
+
+pub fn set_succ(t: *mut Value, i: usize, b: *mut Block) void {
+    if i == 0 {
+        t.t1 = b;
+    } else if t.op == OP_CONDBR {
+        t.t2 = b;
+    } else {
+        t.bs.set(i - 1, b);
+    }
+}
+
+// Instruction list editing.
+pub fn insert_before(pos: *mut Value, v: *mut Value) void {
+    let b = pos.blk;
+    v.blk = b;
+    v.next = pos;
+    v.prev = pos.prev;
+    if u.notnil(pos.prev) {
+        pos.prev.next = v;
+    } else {
+        b.first = v;
+    }
+    pos.prev = v;
+}
+
+pub fn append_inst(b: *mut Block, v: *mut Value) void {
+    v.blk = b;
+    v.prev = b.last;
+    v.next = vnil();
+    if u.notnil(b.last) {
+        b.last.next = v;
+    } else {
+        b.first = v;
+    }
+    b.last = v;
+}
+
+pub fn remove_inst(v: *mut Value) void {
+    let b = v.blk;
+    if u.notnil(v.prev) {
+        v.prev.next = v.next;
+    } else {
+        b.first = v.next;
+    }
+    if u.notnil(v.next) {
+        v.next.prev = v.prev;
+    } else {
+        b.last = v.prev;
+    }
+    v.prev = vnil();
+    v.next = vnil();
+    v.blk = bnil();
+}
+
+// Operands of an instruction, in order: a, b, c, then xs.
+pub fn nops(v: *Value) usize {
+    let mut n: usize = 0;
+    if u.notnil(v.a) {
+        n = 1;
+    }
+    if u.notnil(v.b) {
+        n = 2;
+    }
+    if u.notnil(v.c) {
+        n = 3;
+    }
+    return n;
+}
+
+// Replaces every use of `old` by `new` in function f (operands only).
+pub fn replace_uses(f: *mut Func, old: *mut Value, new: *mut Value) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            replace_in(i, old, new);
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+pub fn replace_in(i: *mut Value, old: *mut Value, new: *mut Value) void {
+    if i.a == old {
+        i.a = new;
+    }
+    if i.b == old {
+        i.b = new;
+    }
+    if i.c == old {
+        i.c = new;
+    }
+    for k in 0..i.xs.len {
+        if i.xs.get(k) == old {
+            i.xs.set(k, new);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Builder
+// -----------------------------------------------------------------------------
+pub struct Builder {
+    blk: *mut Block,
+    before: *mut Value,  // insert before this instruction; nil: at the end
+}
+
+pub fn new_builder() *mut Builder {
+    return u.new.[Builder]();
+}
+
+pub fn at_end(bd: *mut Builder, b: *mut Block) void {
+    bd.blk = b;
+    bd.before = vnil();
+}
+
+pub fn at_before(bd: *mut Builder, v: *mut Value) void {
+    bd.blk = v.blk;
+    bd.before = v;
+}
+
+pub fn insert_block(bd: *Builder) *mut Block {
+    return bd.blk;
+}
+
+fn emit(bd: *mut Builder, op: i32, t: *mut Ty) *mut Value {
+    let v = new_val(V_INST, t);
+    v.op = op;
+    let f = bd.blk.fnp;
+    v.id = f.nvals;
+    f.nvals += 1;
+    if u.notnil(bd.before) {
+        insert_before(bd.before, v);
+    } else {
+        append_inst(bd.blk, v);
+    }
+    return v;
+}
+
+// A new instruction that is not in any block (for passes).
+pub fn new_inst(f: *mut Func, op: i32, t: *mut Ty) *mut Value {
+    let v = new_val(V_INST, t);
+    v.op = op;
+    v.id = f.nvals;
+    f.nvals += 1;
+    return v;
+}
+
+pub fn fold_int_bin(op: i32, t: *mut Ty, x: *Value, y: *Value) *mut Value {
+    let a = cint_val(x);
+    let b = cint_val(y);
+    let bits = t.bits;
+    let mut r: u64 = 0;
+    if op == OP_ADD {
+        r = a +% b;
+    } else if op == OP_SUB {
+        r = a -% b;
+    } else if op == OP_MUL {
+        r = a *% b;
+    } else if op == OP_AND {
+        r = a & b;
+    } else if op == OP_OR {
+        r = a | b;
+    } else if op == OP_XOR {
+        r = a ^ b;
+    } else if op == OP_SHL {
+        if b >= @int_cast(u64, bits) {
+            return vnil();
+        }
+        r = a << @truncate(u32, b);
+    } else if op == OP_LSHR {
+        if b >= @int_cast(u64, bits) {
+            return vnil();
+        }
+        r = a >> @truncate(u32, b);
+    } else if op == OP_ASHR {
+        if b >= @int_cast(u64, bits) {
+            return vnil();
+        }
+        r = @bit_cast(u64, sval(x) >> @truncate(u32, b));
+    } else if op == OP_UDIV {
+        if b == 0 {
+            return vnil();
+        }
+        r = a / b;
+    } else if op == OP_UREM {
+        if b == 0 {
+            return vnil();
+        }
+        r = a % b;
+    } else if (op == OP_SDIV) or (op == OP_SREM) {
+        let sa = sval(x);
+        let sb = sval(y);
+        if (sb == 0) or ((sb == -1) and (a == (@as(u64, 1) << @int_cast(u32, bits - 1)))) {
+            return vnil();
+        }
+        if op == OP_SDIV {
+            r = @bit_cast(u64, sa / sb);
+        } else {
+            r = @bit_cast(u64, sa % sb);
+        }
+    } else {
+        return vnil();
+    }
+    return cint(t, r);
+}
+
+pub fn binop(bd: *mut Builder, op: i32, x: *mut Value, y: *mut Value) *mut Value {
+    let t = x.ty;
+    if (t.kind == T_INT) and is_cint(x) and is_cint(y) and (t.bits <= 64) {
+        let r = fold_int_bin(op, t, x, y);
+        if u.notnil(r) {
+            return r;
+        }
+    }
+    let v = emit(bd, op, t);
+    v.a = x;
+    v.b = y;
+    return v;
+}
+
+pub fn add(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_ADD, x, y);
+}
+
+pub fn sub(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_SUB, x, y);
+}
+
+pub fn mul(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_MUL, x, y);
+}
+
+pub fn and_(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_AND, x, y);
+}
+
+pub fn or_(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_OR, x, y);
+}
+
+pub fn xor(bd: *mut Builder, x: *mut Value, y: *mut Value) *mut Value {
+    return binop(bd, OP_XOR, x, y);
+}
+
+pub fn not_(bd: *mut Builder, x: *mut Value) *mut Value {
+    return binop(bd, OP_XOR, x, cones(x.ty));
+}
+
+pub fn neg(bd: *mut Builder, x: *mut Value) *mut Value {
+    return binop(bd, OP_SUB, czero(x.ty), x);
+}
+
+pub fn fneg(bd: *mut Builder, x: *mut Value) *mut Value {
+    if x.kind == V_CFP {
+        return cfp(x.ty, -x.fv);
+    }
+    let v = emit(bd, OP_FNEG, x.ty);
+    v.a = x;
+    return v;
+}
+
+fn cmp_fold(p: i32, x: *Value, y: *Value) i32 {
+    let a = cint_val(x);
+    let b = cint_val(y);
+    let sa = sval(x);
+    let sb = sval(y);
+    let mut r = false;
+    if p == IntEQ {
+        r = a == b;
+    } else if p == IntNE {
+        r = a != b;
+    } else if p == IntUGT {
+        r = a > b;
+    } else if p == IntUGE {
+        r = a >= b;
+    } else if p == IntULT {
+        r = a < b;
+    } else if p == IntULE {
+        r = a <= b;
+    } else if p == IntSGT {
+        r = sa > sb;
+    } else if p == IntSGE {
+        r = sa >= sb;
+    } else if p == IntSLT {
+        r = sa < sb;
+    } else if p == IntSLE {
+        r = sa <= sb;
+    }
+    if r {
+        return 1;
+    }
+    return 0;
+}
+
+// Comparisons: i1, or for vectors a lane mask (all ones / zeros) of the
+// operands' shape with integer lanes.
+fn cmp_ty(t: *mut Ty) *mut Ty {
+    if t.kind == T_VEC {
+        if t.elem.kind == T_FLOAT {
+            return t_vec(t_int(t.elem.bits), @int_cast(u32, t.lanes));
+        }
+        return t;
+    }
+    return t_int(1);
+}
+
+pub fn icmp(bd: *mut Builder, p: i32, x: *mut Value, y: *mut Value) *mut Value {
+    if (x.ty.kind != T_VEC) and is_cint(x) and is_cint(y) and (x.ty.bits <= 64) {
+        return cint(t_int(1), @as(u64, @bit_cast(u32, cmp_fold(p, x, y))));
+    }
+    let v = emit(bd, OP_ICMP, cmp_ty(x.ty));
+    v.cv = @as(u64, @bit_cast(u32, p));
+    v.a = x;
+    v.b = y;
+    return v;
+}
+
+pub fn fcmp(bd: *mut Builder, p: i32, x: *mut Value, y: *mut Value) *mut Value {
+    let v = emit(bd, OP_FCMP, cmp_ty(x.ty));
+    v.cv = @as(u64, @bit_cast(u32, p));
+    v.a = x;
+    v.b = y;
+    return v;
+}
+
+pub fn is_null(bd: *mut Builder, p: *mut Value) *mut Value {
+    return icmp(bd, IntEQ, p, czero(p.ty));
+}
+
+pub fn select(bd: *mut Builder, c: *mut Value, x: *mut Value, y: *mut Value) *mut Value {
+    if c.kind == V_CINT {
+        if c.cv != 0 {
+            return x;
+        }
+        return y;
+    }
+    if x == y {
+        return x;
+    }
+    let v = emit(bd, OP_SELECT, x.ty);
+    v.a = c;
+    v.b = x;
+    v.c = y;
+    return v;
+}
+
+pub fn cast(bd: *mut Builder, op: i32, x: *mut Value, t: *mut Ty) *mut Value {
+    if x.ty == t {
+        if (op == OP_ZEXT) or (op == OP_SEXT) or (op == OP_TRUNC) or (op == OP_BITCAST) {
+            return x;
+        }
+    }
+    if (x.kind == V_CINT) or ((x.kind == V_ZERO) and (x.ty.kind == T_INT)) {
+        if (op == OP_ZEXT) or (op == OP_TRUNC) {
+            return cint(t, cint_val(x));
+        }
+        if op == OP_SEXT {
+            return cint(t, @bit_cast(u64, sval(x)));
+        }
+        if op == OP_INTTOPTR {
+            return cinttoptr(x);
+        }
+    }
+    if (x.kind == V_ZERO) and (op == OP_PTRTOINT) {
+        return cint(t, 0);
+    }
+    if (x.kind == V_UNDEF) and (op != OP_FPTOSI_SAT) and (op != OP_FPTOUI_SAT) {
+        return undef(t);
+    }
+    let v = emit(bd, op, t);
+    v.a = x;
+    return v;
+}
+
+pub fn zext(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_ZEXT, x, t);
+}
+
+pub fn sext(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_SEXT, x, t);
+}
+
+pub fn trunc(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_TRUNC, x, t);
+}
+
+pub fn bitcast(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    return cast(bd, OP_BITCAST, x, t);
+}
+
+pub fn ptrtoint(bd: *mut Builder, x: *mut Value, t: *mut Ty) *mut Value {
+    let v = cast(bd, OP_PTRTOINT, x, t_int(@int_cast(i32, ptr_bytes * 8)));
+    if t.bits == @int_cast(i32, ptr_bytes * 8) {
+        return v;
+    }
+    if t.bits < @int_cast(i32, ptr_bytes * 8) {
+        return trunc(bd, v, t);
+    }
+    return zext(bd, v, t);
+}
+
+pub fn inttoptr(bd: *mut Builder, x: *mut Value) *mut Value {
+    let pt = t_int(@int_cast(i32, ptr_bytes * 8));
+    let mut y = x;
+    if x.ty.bits < pt.bits {
+        y = zext(bd, x, pt);
+    } else if x.ty.bits > pt.bits {
+        y = trunc(bd, x, pt);
+    }
+    return cast(bd, OP_INTTOPTR, y, t_ptr());
+}
+
+pub fn alloca(bd: *mut Builder, t: *mut Ty, name: []u8) *mut Value {
+    let v = emit(bd, OP_ALLOCA, t_ptr());
+    v.aty = t;
+    v.align = @int_cast(u32, t.align);
+    v.name = name;
+    return v;
+}
+
+pub fn load(bd: *mut Builder, t: *mut Ty, p: *mut Value) *mut Value {
+    let v = emit(bd, OP_LOAD, t);
+    v.a = p;
+    v.align = @int_cast(u32, t.align);
+    return v;
+}
+
+pub fn store(bd: *mut Builder, x: *mut Value, p: *mut Value) *mut Value {
+    let v = emit(bd, OP_STORE, t_void());
+    v.a = x;
+    v.b = p;
+    v.align = @int_cast(u32, x.ty.align);
+    return v;
+}
+
+pub fn isz() *mut Ty {
+    return t_int(@int_cast(i32, ptr_bytes * 8));
+}
+
+// p + off bytes (off: a pointer-sized integer)
+pub fn ptradd(bd: *mut Builder, p: *mut Value, off: *mut Value) *mut Value {
+    if is_cint(off) and (cint_val(off) == 0) {
+        return p;
+    }
+    if (p.kind == V_INST) and (p.op == OP_PTRADD) and is_cint(p.b) and is_cint(off) {
+        return ptradd(bd, p.a, cint(isz(), cint_val(p.b) +% cint_val(off)));
+    }
+    let v = emit(bd, OP_PTRADD, t_ptr());
+    v.a = p;
+    v.b = off;
+    return v;
+}
+
+fn index_isz(bd: *mut Builder, i: *mut Value) *mut Value {
+    let t = isz();
+    if i.ty.bits < t.bits {
+        return sext(bd, i, t);
+    }
+    if i.ty.bits > t.bits {
+        return trunc(bd, i, t);
+    }
+    return i;
+}
+
+fn scaled(bd: *mut Builder, i: *mut Value, size: u64) *mut Value {
+    let x = index_isz(bd, i);
+    if size == 1 {
+        return x;
+    }
+    return mul(bd, x, cint(isz(), size));
+}
+
+// LLVM-style GEP: the first index steps over whole `t`s; the rest index
+// into struct fields (constant) or array elements.
+pub fn gep(bd: *mut Builder, t: *mut Ty, p: *mut Value, idx: []mut *mut Value) *mut Value {
+    let mut off = scaled(bd, idx[0], t.size);
+    let mut cur = t;
+    for k in 1..idx.len {
+        let i = idx[k];
+        if cur.kind == T_STRUCT {
+            let fi = @truncate(usize, cint_val(i));
+            off = add(bd, off, cint(isz(), cur.offs[fi]));
+            cur = cur.fields[fi];
+        } else {
+            off = add(bd, off, scaled(bd, i, cur.elem.size));
+            cur = cur.elem;
+        }
+    }
+    return ptradd(bd, p, off);
+}
+
+pub fn gep1(bd: *mut Builder, t: *mut Ty, p: *mut Value, i: *mut Value) *mut Value {
+    return ptradd(bd, p, scaled(bd, i, t.size));
+}
+
+pub fn struct_gep(bd: *mut Builder, t: *mut Ty, p: *mut Value, i: u32) *mut Value {
+    return ptradd(bd, p, cint(isz(), field_off(t, @as(usize, i))));
+}
+
+pub fn memop(bd: *mut Builder, op: i32, d: *mut Value, s: *mut Value, n: *mut Value) *mut Value {
+    let v = emit(bd, op, t_void());
+    v.a = d;
+    v.b = s;
+    v.c = index_isz(bd, n);
+    return v;
+}
+
+pub fn rmw(bd: *mut Builder, op: i32, p: *mut Value, x: *mut Value) *mut Value {
+    let v = emit(bd, OP_RMW, x.ty);
+    v.cv = @as(u64, @bit_cast(u32, op));
+    v.a = p;
+    v.b = x;
+    v.align = @int_cast(u32, x.ty.size);
+    v.flags = F_ATOMIC;
+    return v;
+}
+
+pub fn cmpxchg(bd: *mut Builder, p: *mut Value, e: *mut Value, n: *mut Value) *mut Value {
+    let v = emit(bd, OP_CMPXCHG, e.ty);
+    v.a = p;
+    v.b = e;
+    v.c = n;
+    v.align = @int_cast(u32, e.ty.size);
+    v.flags = F_ATOMIC;
+    return v;
+}
+
+pub fn fence(bd: *mut Builder) void {
+    _ = emit(bd, OP_FENCE, t_void());
+}
+
+pub fn extract(bd: *mut Builder, agg: *mut Value, i: u32) *mut Value {
+    let ft = field_ty(agg.ty, @as(usize, i));
+    if agg.kind == V_CAGG {
+        return agg.xs.get(@as(usize, i));
+    }
+    if agg.kind == V_ZERO {
+        return czero(ft);
+    }
+    if agg.kind == V_UNDEF {
+        return undef(ft);
+    }
+    // extract(insert(x, v, i), i) = v
+    if (agg.kind == V_INST) and (agg.op == OP_INSERTVALUE) and (agg.cv == @as(u64, i)) {
+        return agg.b;
+    }
+    let v = emit(bd, OP_EXTRACTVALUE, ft);
+    v.a = agg;
+    v.cv = @as(u64, i);
+    return v;
+}
+
+pub fn insert(bd: *mut Builder, agg: *mut Value, x: *mut Value, i: u32) *mut Value {
+    let v = emit(bd, OP_INSERTVALUE, agg.ty);
+    v.a = agg;
+    v.b = x;
+    v.cv = @as(u64, i);
+    return v;
+}
+
+pub fn extract_elem(bd: *mut Builder, vec: *mut Value, i: u64) *mut Value {
+    let v = emit(bd, OP_EXTRACTELEM, vec.ty.elem);
+    v.a = vec;
+    v.cv = i;
+    return v;
+}
+
+pub fn insert_elem(bd: *mut Builder, vec: *mut Value, x: *mut Value, i: u64) *mut Value {
+    let v = emit(bd, OP_INSERTELEM, vec.ty);
+    v.a = vec;
+    v.b = x;
+    v.cv = i;
+    return v;
+}
+
+pub fn splat(bd: *mut Builder, vt: *mut Ty, x: *mut Value) *mut Value {
+    let v = emit(bd, OP_SPLAT, vt);
+    v.a = x;
+    return v;
+}
+
+// Result lanes pick from the concatenation of x and y (indices into 2n lanes).
+pub fn shuffle(bd: *mut Builder, x: *mut Value, y: *mut Value, mask: []i32) *mut Value {
+    let n = mask.len;
+    let v = emit(bd, OP_SHUFFLE, t_vec(x.ty.elem, @int_cast(u32, n)));
+    v.a = x;
+    v.b = y;
+    v.mask = u.newn.[i32](n + 1)[0..n];
+    for i in 0..n {
+        v.mask[i] = mask[i];
+    }
+    return v;
+}
+
+pub fn call(bd: *mut Builder, fty: *mut Ty, callee: *mut Value, args: []mut *mut Value) *mut Value {
+    let v = emit(bd, OP_CALL, fty.ret);
+    v.fty = fty;
+    v.a = callee;
+    for x in args {
+        v.xs.push(x);
+    }
+    v.ext = u.newn.[u8](args.len + 1)[0..args.len + 1];
+    return v;
+}
+
+pub fn intr(bd: *mut Builder, id: i32, t: *mut Ty, args: []mut *mut Value) *mut Value {
+    let v = emit(bd, OP_INTR, t);
+    v.cv = @as(u64, @bit_cast(u32, id));
+    for x in args {
+        v.xs.push(x);
+    }
+    return v;
+}
+
+pub fn intr1(bd: *mut Builder, id: i32, x: *mut Value) *mut Value {
+    let mut a: [1]*mut Value = [x];
+    return intr(bd, id, x.ty, a[..]);
+}
+
+pub fn intr2(bd: *mut Builder, id: i32, x: *mut Value, y: *mut Value) *mut Value {
+    let mut a: [2]*mut Value = [x, y];
+    return intr(bd, id, x.ty, a[..]);
+}
+
+pub fn phi(bd: *mut Builder, t: *mut Ty) *mut Value {
+    return emit(bd, OP_PHI, t);
+}
+
+pub fn add_incoming(p: *mut Value, x: *mut Value, b: *mut Block) void {
+    p.xs.push(x);
+    p.bs.push(b);
+}
+
+pub fn br(bd: *mut Builder, b: *mut Block) void {
+    let v = emit(bd, OP_BR, t_void());
+    v.t1 = b;
+}
+
+pub fn condbr(bd: *mut Builder, c: *mut Value, t: *mut Block, e: *mut Block) void {
+    if c.kind == V_CINT {
+        if c.cv != 0 {
+            br(bd, t);
+        } else {
+            br(bd, e);
+        }
+        return;
+    }
+    let v = emit(bd, OP_CONDBR, t_void());
+    v.a = c;
+    v.t1 = t;
+    v.t2 = e;
+}
+
+pub fn switch_(bd: *mut Builder, x: *mut Value, dflt: *mut Block) *mut Value {
+    let v = emit(bd, OP_SWITCH, t_void());
+    v.a = x;
+    v.t1 = dflt;
+    return v;
+}
+
+pub fn add_case(sw: *mut Value, c: *mut Value, b: *mut Block) void {
+    sw.xs.push(c);
+    sw.bs.push(b);
+}
+
+pub fn ret(bd: *mut Builder, x: *mut Value) void {
+    let v = emit(bd, OP_RET, t_void());
+    v.a = x;
+}
+
+pub fn ret_void(bd: *mut Builder) void {
+    _ = emit(bd, OP_RET, t_void());
+}
+
+pub fn unreachable(bd: *mut Builder) void {
+    _ = emit(bd, OP_UNREACHABLE, t_void());
+}
+
+// -----------------------------------------------------------------------------
+// Printing (for --emit=ir and debugging)
+// -----------------------------------------------------------------------------
+fn op_name(op: i32) []u8 {
+    let names = ["?", "add", "sub", "mul", "udiv", "sdiv", "urem", "srem", "and", "or", "xor", "shl", "lshr", "ashr",
+                 "fadd", "fsub", "fmul", "fdiv", "frem", "fneg", "icmp", "fcmp", "select", "zext", "sext", "trunc",
+                 "bitcast", "ptrtoint", "inttoptr", "fpext", "fptrunc", "sitofp", "uitofp", "fptosi.sat",
+                 "fptoui.sat", "alloca", "load", "store", "ptradd", "memcpy", "memmove", "memset", "atomicrmw",
+                 "cmpxchg", "fence", "extractvalue", "insertvalue", "extractelement", "insertelement", "shuffle",
+                 "splat", "call", "intr", "phi", "br", "condbr", "switch", "ret", "unreachable", "copy"];
+    if (op < 0) or (@int_cast(usize, op) >= names.len) {
+        return "?";
+    }
+    return names[@int_cast(usize, op)];
+}
+
+pub fn val_str(v: *Value) []u8 {
+    let k = v.kind;
+    if k == V_INST {
+        return u.cat2("%", u.idec(v.id));
+    }
+    if k == V_PARAM {
+        return u.cat2("%arg", u.udec(v.cv));
+    }
+    if k == V_CINT {
+        if v.ty.bits == 1 {
+            return u.pick(v.cv != 0, "true", "false");
+        }
+        return u.dec(sval(v));
+    }
+    if k == V_CFP {
+        return u.ffmt("%g", v.fv);
+    }
+    if k == V_ZERO {
+        return "zero";
+    }
+    if k == V_UNDEF {
+        return "undef";
+    }
+    if k == V_GLOBAL {
+        return u.cat2("@", v.gv.name);
+    }
+    if k == V_FUNC {
+        return u.cat2("@", v.fnp.name);
+    }
+    let mut b = u.Buf.init();
+    b.s("{");
+    for i in 0..v.xs.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(val_str(v.xs.get(i)));
+    }
+    b.s("}");
+    return b.done();
+}
+
+fn blk_str(b: *Block) []u8 {
+    return u.f2("%%%s.%s", b.name, u.idec(b.id));
+}
+
+pub fn inst_str(v: *Value) []u8 {
+    let mut b = u.Buf.init();
+    if v.ty.kind != T_VOID {
+        b.s(val_str(v));
+        b.s(" = ");
+    }
+    b.s(op_name(v.op));
+    if (v.op == OP_ICMP) or (v.op == OP_FCMP) or (v.op == OP_RMW) or (v.op == OP_INTR) or (v.op == OP_EXTRACTVALUE) or
+       (v.op == OP_INSERTVALUE) or (v.op == OP_EXTRACTELEM) or (v.op == OP_INSERTELEM) {
+        b.s(".");
+        b.s(u.udec(v.cv));
+    }
+    if (v.flags & F_ATOMIC) != 0 {
+        b.s(" atomic");
+    }
+    if (v.flags & F_VOLATILE) != 0 {
+        b.s(" volatile");
+    }
+    b.s(" ");
+    b.s(ty_str(v.ty));
+    if v.op == OP_ALLOCA {
+        b.s(" ");
+        b.s(ty_str(v.aty));
+    }
+    let ops: [3]*mut Value = [v.a, v.b, v.c];
+    for o in ops {
+        if u.notnil(o) {
+            b.s(" ");
+            b.s(val_str(o));
+        }
+    }
+    for i in 0..v.xs.len {
+        b.s(", ");
+        b.s(val_str(v.xs.get(i)));
+        if i < v.bs.len {
+            b.s(" ");
+            b.s(blk_str(v.bs.get(i)));
+        }
+    }
+    if u.notnil(v.t1) {
+        b.s(" -> ");
+        b.s(blk_str(v.t1));
+    }
+    if u.notnil(v.t2) {
+        b.s(", ");
+        b.s(blk_str(v.t2));
+    }
+    if v.mask.len > 0 {
+        b.s(" [");
+        for i in 0..v.mask.len {
+            if i != 0 {
+                b.s(",");
+            }
+            b.s(u.idec(v.mask[i]));
+        }
+        b.s("]");
+    }
+    if v.align != 0 {
+        b.s(", align ");
+        b.s(u.udec(@as(u64, v.align)));
+    }
+    return b.done();
+}
+
+pub fn func_str(f: *mut Func) []u8 {
+    let mut b = u.Buf.init();
+    b.s(u.pick(is_decl(f), "declare ", "define "));
+    b.s(ty_str(f.ty.ret));
+    b.s(" @");
+    b.s(f.name);
+    b.s("(");
+    for i in 0..f.params.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(ty_str(f.params[i].ty));
+    }
+    b.s(")");
+    if is_decl(f) {
+        b.s("\n");
+        return b.done();
+    }
+    b.s(" {\n");
+    let mut bb = f.first;
+    while u.notnil(bb) {
+        b.s(blk_str(bb));
+        b.s(":\n");
+        let mut i = bb.first;
+        while u.notnil(i) {
+            b.s("    ");
+            b.s(inst_str(i));
+            b.s("\n");
+            i = i.next;
+        }
+        bb = bb.next;
+    }
+    b.s("}\n");
+    return b.done();
+}
+
+pub fn module_str(m: *mut Module) []u8 {
+    let mut b = u.Buf.init();
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        b.s("@");
+        b.s(g.name);
+        b.s(" = ");
+        b.s(u.pick(g.is_const, "constant ", "global "));
+        b.s(ty_str(g.ty));
+        if u.notnil(g.init) {
+            b.s(" ");
+            b.s(val_str(g.init));
+        }
+        b.s("\n");
+    }
+    for i in 0..m.funcs.len {
+        b.s("\n");
+        b.s(func_str(m.funcs.get(i)));
+    }
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// CFG utilities
+// -----------------------------------------------------------------------------
+// Deletes the blocks not reachable from the entry, and the phi inputs that
+// came from them.
+pub fn remove_unreachable(f: *mut Func) void {
+    if u.isnil(f.first) {
+        return;
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        b.aux = 0;
+        b = b.next;
+    }
+    let mut work = u.List.[*mut Block].{ data: u.nil.[*mut Block](), len: 0, cap: 0 };
+    f.first.aux = 1;
+    work.push(f.first);
+    while work.len > 0 {
+        let x = work.pop();
+        let t = terminator(x);
+        for i in 0..succ_count(t) {
+            let s = succ(t, i);
+            if s.aux == 0 {
+                s.aux = 1;
+                work.push(s);
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+    b = f.first;
+    let mut any = false;
+    while u.notnil(b) {
+        let next = b.next;
+        if b.aux == 0 {
+            remove_block(b);
+            any = true;
+        }
+        b = next;
+    }
+    if not any {
+        return;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) and (i.op == OP_PHI) {
+            let mut k: usize = 0;
+            while k < i.bs.len {
+                if i.bs.get(k).aux == 0 {
+                    i.bs.set(k, i.bs.get(i.bs.len - 1));
+                    i.xs.set(k, i.xs.get(i.xs.len - 1));
+                    i.bs.len -= 1;
+                    i.xs.len -= 1;
+                } else {
+                    k += 1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}

@@ -5,11 +5,13 @@
 //   phalange check <file.ph> [options]
 //
 // Options:
-//   --target=wasm32|native     (default wasm32; wasm32-freestanding accepted)
+//   --target=wasm32|wasm64|x86_64|aarch64|native   (default wasm32)
+//   --cpu=<name>               processor preset (e.g. x86-64-v3, armv8.1-a, native, mvp)
+//   --features=+a,-b           enable / disable processor extensions
 //   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
 //   --release                  same as --overflow=saturate
 //   --overflow=trap|saturate   integer overflow mode (default trap)
-//   --emit=exe|obj|llvm|asm    output kind (default: exe = .wasm module / native executable)
+//   --emit=exe|obj|ir|asm      output kind (default: exe = .wasm module / native executable)
 //   --format=human|agent-json  diagnostic format
 //   --std=<dir>                standard library directory
 //   --link=<file>              extra C source, object or library to link (repeatable)
@@ -26,6 +28,9 @@ import "codegen.ph" as cg;
 import "header.ph" as header;
 import "units.ph" as units;
 import "package.ph" as pkg;
+import "target.ph" as tg;
+import "wobj.ph" as wo;
+import "wlink.ph" as wl;
 
 fn usage() void {
     u.eprint("usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n");
@@ -33,8 +38,9 @@ fn usage() void {
     u.eprint("       phalange new <name>      create a package skeleton\n");
     u.eprint("       phalange cache [path|clean]   the compiled-module cache\n");
     u.eprint("  test: --filter=<text> --timeout=<ms>\n");
-    u.eprint("  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n");
-    u.eprint("  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
+    u.eprint("  --target=wasm32|wasm64|x86_64|aarch64|native   --cpu=<name>   --features=+ext,-ext\n");
+    u.eprint("  -O0..-O3   --release | --overflow=trap|saturate\n");
+    u.eprint("  --emit=exe|obj|ir|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
     u.eprint("  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
     u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
@@ -859,6 +865,36 @@ fn now_ms() f64 {
     return (@float_from_int(f64, ts.sec) * 1000.0) + (@float_from_int(f64, ts.nsec) / 1000000.0);
 }
 
+// Links our wasm objects into a module (no external tools).
+fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
+    let mut us = u.List.[*mut wo.Unit].{ data: u.nil.[*mut wo.Unit](), len: 0, cap: 0 };
+    let mut paths = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    paths.push(objpath);
+    for p in unit_objs {
+        paths.push(p);
+    }
+    for k in 0..paths.len {
+        let d = u.read_file(paths.get(k));
+        let un = wo.read_object(d);
+        if u.isnos(d) or u.isnil(un) {
+            u.eprint(u.f1("phalange: cannot read object %s\n", paths.get(k)));
+            return 1;
+        }
+        us.push(un);
+    }
+    let o = wl.Options.{ stack_size: 1048576, shared_memory: cg.g_threads, max_pages: 16384,
+                         exports: cg.g_export_names.items() };
+    let bytes = wl.link(us.items(), &o);
+    if u.isnos(bytes) {
+        return 1;
+    }
+    if not u.write_file(out, bytes) {
+        u.eprint(u.f1("phalange: cannot write %s\n", out));
+        return 1;
+    }
+    return 0;
+}
+
 fn driver(args: [][]u8) i32 {
     let argc = args.len;
     if (argc >= 2) and u.str_eq(args[1], "cache") {
@@ -914,6 +950,7 @@ fn driver(args: [][]u8) i32 {
     co.stack_traces = true;
     co.cpu = u.nosym();
     let mut link_inputs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    let mut feature_args = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
     let mut link_flags = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };  // -l / -L
     let mut inc_flags = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };   // -I, for C sources
     let mut header_path = u.nosym();
@@ -959,6 +996,8 @@ fn driver(args: [][]u8) i32 {
             std_dir = a[6..];
         } else if u.starts(a, "--cpu=") {
             co.cpu = a[6..];
+        } else if u.starts(a, "--features=") {
+            feature_args.push(a[11..]);
         } else if u.starts(a, "--link=") {
             link_inputs.push(a[7..]);
         } else if u.starts(a, "--emit-header=") {
@@ -1012,18 +1051,52 @@ fn driver(args: [][]u8) i32 {
             pkg.source_files(pk, &mut pkg_files);
         }
         if u.isnos(out) and not testing and not profiling {
-            out = u.cat2(pk.name, u.pick(u.str_eq(target, "native"), "", ".wasm"));
+            out = u.cat2(pk.name, u.pick(u.starts(target, "wasm"), ".wasm", ""));
         }
     }
     if u.str_eq(target, "wasm32") or u.str_eq(target, "wasm32-freestanding") {
         ty.g_target = ast.Target.{ ptr_bits: 32, is_wasm: true, triple: "wasm32-unknown-unknown" };
     } else if u.str_eq(target, "wasm64") or u.str_eq(target, "wasm64-freestanding") {
         ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: true, triple: "wasm64-unknown-unknown" };
-    } else if u.str_eq(target, "native") {
-        ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: false, triple: cg.default_triple() };
+    } else if u.str_eq(target, "native") or u.str_eq(target, "x86_64") or u.str_eq(target, "aarch64") {
+        let mut arch = tg.host_arch();
+        if u.str_eq(target, "x86_64") {
+            arch = tg.ARCH_X64;
+        } else if u.str_eq(target, "aarch64") {
+            arch = tg.ARCH_A64;
+        }
+        ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: false, triple: tg.triple_of(arch) };
+        tg.g_arch = arch;
     } else {
-        dg.emit_fatal(json, "E9002", u.f1("unknown target '%s' (expected wasm32, wasm64 or native)", target));
+        dg.emit_fatal(json, "E9002", u.f1("unknown target '%s' (expected wasm32, wasm64, x86_64, aarch64 or native)",
+                                          target));
         return 2;
+    }
+    if ty.g_target.is_wasm {
+        tg.g_arch = tg.ARCH_WASM32;
+        if ty.g_target.ptr_bits == 64 {
+            tg.g_arch = tg.ARCH_WASM64;
+        }
+    }
+    // Processor extensions: a --cpu preset (default: the host for
+    // --target=native, a baseline otherwise), then --features edits.
+    let mut cpu = co.cpu;
+    if u.isnos(cpu) {
+        cpu = u.pick(u.str_eq(target, "native"), "native", "generic");
+    }
+    let cr = tg.cpu_features(tg.g_arch, cpu);
+    if not cr.ok {
+        dg.emit_fatal(json, "E9002", u.f2("unknown --cpu '%s' for target %s", cpu, target));
+        return 2;
+    }
+    tg.g_cpu = cpu;
+    tg.g_features = cr.features;
+    for k in 0..feature_args.len {
+        let bad = tg.apply_features(feature_args.get(k));
+        if not u.isnos(bad) {
+            dg.emit_fatal(json, "E9002", u.f2("unknown processor extension '%s' (known: %s)", bad, tg.feature_names()));
+            return 2;
+        }
     }
     if not u.file_exists(input) {
         dg.emit_fatal(json, "E0211", u.f1("cannot read '%s'", input));
@@ -1032,6 +1105,14 @@ fn driver(args: [][]u8) i32 {
     ty.types_init();
     if u.isnos(std_dir) {
         std_dir = find_std(args[0]);
+    }
+    // Builds include runtime/rt.ph: software versions of operations some
+    // targets lack (@rem, and @fma without hardware fused multiply-add).
+    if build {
+        let rtp = u.f1("%s/../runtime/rt.ph", std_dir);
+        if u.file_exists(rtp) {
+            pkg_files.push(rtp);
+        }
     }
     let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: pkg_files.items() };
     let ok = sema.run(input, &so);
@@ -1060,8 +1141,8 @@ fn driver(args: [][]u8) i32 {
     let final_link = u.str_eq(emit, "exe");
     if u.str_eq(emit, "obj") {
         co.emit = cg.EMIT_OBJ;
-    } else if u.str_eq(emit, "llvm") {
-        co.emit = cg.EMIT_LLVM;
+    } else if u.str_eq(emit, "ir") {
+        co.emit = cg.EMIT_IR;
     } else if u.str_eq(emit, "asm") {
         co.emit = cg.EMIT_ASM;
     } else if final_link {
@@ -1112,8 +1193,8 @@ fn driver(args: [][]u8) i32 {
     }
     if u.isnos(out) {
         let mut ext: []u8 = "";
-        if co.emit == cg.EMIT_LLVM {
-            ext = ".ll";
+        if co.emit == cg.EMIT_IR {
+            ext = ".ir";
         } else if co.emit == cg.EMIT_ASM {
             ext = ".s";
         } else if not final_link {
@@ -1148,6 +1229,8 @@ fn driver(args: [][]u8) i32 {
     if units_mode >= 0 {
         separate = final_link and (units_mode == 1);
     }
+    let n_user_inputs = link_inputs.len;
+    let mut unit_objs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
     if separate {
         let mut objs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
         let mut us = units.UnitStats.{ total: 0, compiled: 0 };
@@ -1167,6 +1250,7 @@ fn driver(args: [][]u8) i32 {
         }
         for k in 0..objs.len {
             link_inputs.push(objs.get(k));
+            unit_objs.push(objs.get(k));
         }
     } else if not cg.codegen_program(co) {
         dg.emit(json, json);
@@ -1177,7 +1261,11 @@ fn driver(args: [][]u8) i32 {
     }
     if final_link {
         let mut rc: i32 = 0;
-        if ty.g_target.is_wasm {
+        let own_link = (n_user_inputs == 0) and (link_flags.len == 0) and (cg.g_link_libs.len == 0);
+        if ty.g_target.is_wasm and own_link {
+            // our own linker; wasm-ld is only needed to link C code
+            rc = link_wasm(objpath, unit_objs.items(), out);
+        } else if ty.g_target.is_wasm {
             let names = ["wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld"];
             let ld = find_tool(names[..]);
             if u.isnos(ld) {

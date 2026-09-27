@@ -1,0 +1,418 @@
+// =============================================================================
+// runtime/rt.ph - operations some targets have no instruction for, used by
+// the self-hosted compiler's code generator:
+//
+//   fmod64, fmod32    @rem (IEEE-exact remainder with the sign of x)
+//   fma64, fma32      @fma (one rounding) on targets without fused multiply-add
+//
+// Ported from musl (MIT licence): src/math/fmod.c, fmodf.c, fma.c, fmaf.c,
+// scalbn.c. Floating-point exception flags are not modelled.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// fmod
+// -----------------------------------------------------------------------------
+pub fn fmod64(x: f64, y: f64) f64 {
+    let mut uxi = @bit_cast(u64, x);
+    let mut uyi = @bit_cast(u64, y);
+    let mut ex = @as(i32, @truncate(u16, (uxi >> 52) & 0x7ff));
+    let mut ey = @as(i32, @truncate(u16, (uyi >> 52) & 0x7ff));
+    let sx = uxi >> 63;
+    if ((uyi << 1) == 0) or (y != y) or (ex == 0x7ff) {
+        return (x * y) / (x * y);
+    }
+    if (uxi << 1) <= (uyi << 1) {
+        if (uxi << 1) == (uyi << 1) {
+            return 0.0 * x;
+        }
+        return x;
+    }
+    // normalize x and y
+    if ex == 0 {
+        let mut i = uxi << 12;
+        while (i >> 63) == 0 {
+            ex -= 1;
+            i = i << 1;
+        }
+        uxi = uxi << @int_cast(u32, 1 - ex);
+    } else {
+        uxi = uxi & (0xFFFF_FFFF_FFFF_FFFF >> 12);
+        uxi = uxi | (@as(u64, 1) << 52);
+    }
+    if ey == 0 {
+        let mut i = uyi << 12;
+        while (i >> 63) == 0 {
+            ey -= 1;
+            i = i << 1;
+        }
+        uyi = uyi << @int_cast(u32, 1 - ey);
+    } else {
+        uyi = uyi & (0xFFFF_FFFF_FFFF_FFFF >> 12);
+        uyi = uyi | (@as(u64, 1) << 52);
+    }
+    // x mod y
+    while ex > ey {
+        let i = uxi -% uyi;
+        if (i >> 63) == 0 {
+            if i == 0 {
+                return 0.0 * x;
+            }
+            uxi = i;
+        }
+        uxi = uxi << 1;
+        ex -= 1;
+    }
+    let i = uxi -% uyi;
+    if (i >> 63) == 0 {
+        if i == 0 {
+            return 0.0 * x;
+        }
+        uxi = i;
+    }
+    while (uxi >> 52) == 0 {
+        uxi = uxi << 1;
+        ex -= 1;
+    }
+    // scale result
+    if ex > 0 {
+        uxi -= @as(u64, 1) << 52;
+        uxi = uxi | (@as(u64, @bit_cast(u32, ex)) << 52);
+    } else {
+        uxi = uxi >> @int_cast(u32, 1 - ex);
+    }
+    uxi = uxi | (sx << 63);
+    return @bit_cast(f64, uxi);
+}
+
+pub fn fmod32(x: f32, y: f32) f32 {
+    let mut uxi = @bit_cast(u32, x);
+    let mut uyi = @bit_cast(u32, y);
+    let mut ex = @as(i32, @truncate(u16, (uxi >> 23) & 0xff));
+    let mut ey = @as(i32, @truncate(u16, (uyi >> 23) & 0xff));
+    let sx = uxi & 0x8000_0000;
+    if ((uyi << 1) == 0) or (y != y) or (ex == 0xff) {
+        return (x * y) / (x * y);
+    }
+    if (uxi << 1) <= (uyi << 1) {
+        if (uxi << 1) == (uyi << 1) {
+            return 0.0 * x;
+        }
+        return x;
+    }
+    if ex == 0 {
+        let mut i = uxi << 9;
+        while (i >> 31) == 0 {
+            ex -= 1;
+            i = i << 1;
+        }
+        uxi = uxi << @int_cast(u32, 1 - ex);
+    } else {
+        uxi = uxi & (0xFFFF_FFFF >> 9);
+        uxi = uxi | (@as(u32, 1) << 23);
+    }
+    if ey == 0 {
+        let mut i = uyi << 9;
+        while (i >> 31) == 0 {
+            ey -= 1;
+            i = i << 1;
+        }
+        uyi = uyi << @int_cast(u32, 1 - ey);
+    } else {
+        uyi = uyi & (0xFFFF_FFFF >> 9);
+        uyi = uyi | (@as(u32, 1) << 23);
+    }
+    while ex > ey {
+        let i = uxi -% uyi;
+        if (i >> 31) == 0 {
+            if i == 0 {
+                return 0.0 * x;
+            }
+            uxi = i;
+        }
+        uxi = uxi << 1;
+        ex -= 1;
+    }
+    let i = uxi -% uyi;
+    if (i >> 31) == 0 {
+        if i == 0 {
+            return 0.0 * x;
+        }
+        uxi = i;
+    }
+    while (uxi >> 23) == 0 {
+        uxi = uxi << 1;
+        ex -= 1;
+    }
+    if ex > 0 {
+        uxi -= @as(u32, 1) << 23;
+        uxi = uxi | (@bit_cast(u32, ex) << 23);
+    } else {
+        uxi = uxi >> @int_cast(u32, 1 - ex);
+    }
+    uxi = uxi | sx;
+    return @bit_cast(f32, uxi);
+}
+
+// -----------------------------------------------------------------------------
+// fma
+// -----------------------------------------------------------------------------
+fn pow2(e: i32) f64 {
+    return @bit_cast(f64, @as(u64, @bit_cast(u32, 0x3ff + e)) << 52);
+}
+
+fn scalbn(x: f64, n0: i32) f64 {
+    let mut y = x;
+    let mut n = n0;
+    if n > 1023 {
+        y = y * pow2(1023);
+        n -= 1023;
+        if n > 1023 {
+            y = y * pow2(1023);
+            n -= 1023;
+            if n > 1023 {
+                n = 1023;
+            }
+        }
+    } else if n < -1022 {
+        // keep n < -53 to avoid double rounding in the subnormal range
+        y = y * (pow2(-1022) * pow2(53));
+        n += 1022 - 53;
+        if n < -1022 {
+            y = y * (pow2(-1022) * pow2(53));
+            n += 1022 - 53;
+            if n < -1022 {
+                n = -1022;
+            }
+        }
+    }
+    return y * pow2(n);
+}
+
+struct Unpacked {
+    m: u64,
+    e: i32,
+    sign: i32,
+}
+
+const ZEROINFNAN: i32 = 0x7ff - 0x3ff - 52 - 1;
+
+fn normalize(x: f64) Unpacked {
+    let mut ix = @bit_cast(u64, x);
+    let mut e = @as(i32, @truncate(u16, ix >> 52));
+    let sign = e & 0x800;
+    e = e & 0x7ff;
+    if e == 0 {
+        ix = @bit_cast(u64, x * pow2(63));
+        e = @as(i32, @truncate(u16, (ix >> 52) & 0x7ff));
+        if e != 0 {
+            e = e - 63;
+        } else {
+            e = 0x800;
+        }
+    }
+    ix = ix & ((@as(u64, 1) << 52) - 1);
+    ix = ix | (@as(u64, 1) << 52);
+    ix = ix << 1;
+    e -= (0x3ff + 52) + 1;
+    return Unpacked.{ m: ix, e: e, sign: sign };
+}
+
+fn clz64(x: u64) i32 {
+    let mut n: i32 = 0;
+    let mut v = x;
+    if v == 0 {
+        return 64;
+    }
+    while (v >> 63) == 0 {
+        v = v << 1;
+        n += 1;
+    }
+    return n;
+}
+
+fn sticky(x: u64) u64 {
+    if x != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn fma64(x: f64, y: f64, z: f64) f64 {
+    // normalize so the top 10 bits and the last bit are 0
+    let nx = normalize(x);
+    let ny = normalize(y);
+    let nz = normalize(z);
+    if (nx.e >= ZEROINFNAN) or (ny.e >= ZEROINFNAN) {
+        return (x * y) + z;
+    }
+    if nz.e >= ZEROINFNAN {
+        if nz.e > ZEROINFNAN {  // z == 0
+            return (x * y) + z;
+        }
+        return z;
+    }
+    // r = x * y (128-bit)
+    let xlo = nx.m & 0xFFFF_FFFF;
+    let xhi = nx.m >> 32;
+    let ylo = ny.m & 0xFFFF_FFFF;
+    let yhi = ny.m >> 32;
+    let t1 = xlo * ylo;
+    let t2 = (xlo * yhi) + (xhi * ylo);
+    let t3 = xhi * yhi;
+    let mut rlo = t1 +% (t2 << 32);
+    let mut rhi = t3 + (t2 >> 32);
+    if t1 > rlo {
+        rhi += 1;
+    }
+    // align exponents
+    let mut e = nx.e + ny.e;
+    let mut d = nz.e - e;
+    let mut zlo: u64 = 0;
+    let mut zhi: u64 = 0;
+    if d > 0 {
+        if d < 64 {
+            zlo = nz.m << @int_cast(u32, d);
+            zhi = nz.m >> @int_cast(u32, 64 - d);
+        } else {
+            zlo = 0;
+            zhi = nz.m;
+            e = nz.e - 64;
+            d -= 64;
+            if d == 0 {
+            } else if d < 64 {
+                let sd = @int_cast(u32, d);
+                rlo = ((rhi << (64 - sd)) | (rlo >> sd)) | sticky(rlo << (64 - sd));
+                rhi = rhi >> sd;
+            } else {
+                rlo = 1;
+                rhi = 0;
+            }
+        }
+    } else {
+        zhi = 0;
+        d = -d;
+        if d == 0 {
+            zlo = nz.m;
+        } else if d < 64 {
+            let sd = @int_cast(u32, d);
+            zlo = (nz.m >> sd) | sticky(nz.m << (64 - sd));
+        } else {
+            zlo = 1;
+        }
+    }
+    // add
+    let mut sign = nx.sign ^ ny.sign;
+    let samesign = (sign ^ nz.sign) == 0;
+    let mut nonzero = true;
+    if samesign {
+        rlo = rlo +% zlo;
+        rhi = rhi +% zhi;
+        if rlo < zlo {
+            rhi = rhi +% 1;
+        }
+    } else {
+        let t = rlo;
+        rlo = rlo -% zlo;
+        rhi = rhi -% zhi;
+        if t < rlo {
+            rhi = rhi -% 1;
+        }
+        if (rhi >> 63) != 0 {
+            rlo = 0 -% rlo;
+            rhi = (0 -% rhi) -% sticky(rlo);
+            if sign != 0 {
+                sign = 0;
+            } else {
+                sign = 1;
+            }
+        }
+        nonzero = rhi != 0;
+    }
+    // rhi: the top 63 bits of the result (the last bit is sticky)
+    if nonzero {
+        e += 64;
+        d = clz64(rhi) - 1;
+        let sd = @int_cast(u32, d);
+        rhi = ((rhi << sd) | (rlo >> (64 - sd))) | sticky(rlo << sd);
+    } else if rlo != 0 {
+        d = clz64(rlo) - 1;
+        if d < 0 {
+            rhi = (rlo >> 1) | (rlo & 1);
+        } else {
+            rhi = rlo << @int_cast(u32, d);
+        }
+    } else {
+        // exact +-0
+        return (x * y) + z;
+    }
+    e -= d;
+    // convert to double
+    let mut i = @bit_cast(i64, rhi);  // in [1<<62, (1<<63)-1]
+    if sign != 0 {
+        i = -i;
+    }
+    let mut r = @float_from_int(f64, i);  // |r| in [0x1p62, 0x1p63]
+    if e < ((-1022) - 62) {
+        // the result is subnormal before rounding
+        if e == ((-1022) - 63) {
+            let mut c = pow2(63);
+            if sign != 0 {
+                c = -c;
+            }
+            if r == c {
+                // the minimum normal number after rounding
+                let dbl_min = pow2(-1022);
+                if sign != 0 {
+                    return -dbl_min;
+                }
+                return dbl_min;
+            }
+            // one bit is lost when scaled: add another top bit so the
+            // conversion rounds only once
+            if (rhi << 53) != 0 {
+                i = @bit_cast(i64, ((rhi >> 1) | (rhi & 1)) | (@as(u64, 1) << 62));
+                if sign != 0 {
+                    i = -i;
+                }
+                r = @float_from_int(f64, i);
+                r = (2.0 * r) - c;  // remove the top bit
+            }
+        } else {
+            // round only once when scaled
+            let sd: u32 = 10;
+            i = @bit_cast(i64, ((rhi >> sd) | sticky(rhi << (64 - sd))) << sd);
+            if sign != 0 {
+                i = -i;
+            }
+            r = @float_from_int(f64, i);
+        }
+    }
+    return scalbn(r, e);
+}
+
+pub fn fma32(x: f32, y: f32, z: f32) f32 {
+    let xy = @float_cast(f64, x) * @float_cast(f64, y);  // exact
+    let zd = @float_cast(f64, z);
+    let result = xy + zd;
+    let mut ui = @bit_cast(u64, result);
+    let e = (ui >> 52) & 0x7ff;
+    // the double result rounds correctly unless it lies exactly halfway
+    // between two floats and is inexact
+    if ((ui & 0x1fff_ffff) != 0x1000_0000) or (e == 0x7ff) or (((result - xy) == zd) and ((result - zd) == xy)) {
+        return @float_cast(f32, result);
+    }
+    // adjust the low bit in the direction of the error
+    let neg = (ui >> 63) != 0;
+    let mut err: f64 = 0.0;
+    if neg == (zd > xy) {
+        err = (xy - result) + zd;
+    } else {
+        err = (zd - result) + xy;
+    }
+    if neg == (err < 0.0) {
+        ui += 1;
+    } else {
+        ui -= 1;
+    }
+    return @float_cast(f32, @bit_cast(f64, ui));
+}
