@@ -504,3 +504,58 @@ pub fn scalarize(f: *mut ir.Func, legal: fn(*mut ir.Value) bool) void {
         ir.apply_forwarding(f);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Multiplication overflow checks for targets without a wide multiply (wasm):
+// the product divided back by one operand must give the other.
+// -----------------------------------------------------------------------------
+pub fn expand_mul_overflow(f: *mut ir.Func) void {
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if i.op == ir.OP_INTR {
+                let id = @truncate(i32, @bit_cast(i64, i.cv));
+                if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
+                    ir.at_before(B, i);
+                    i.fwd = mul_overflow(id == ir.IN_SMUL_OV, i.xs.get(0), i.xs.get(1));
+                    ir.remove_inst(i);
+                    any = true;
+                }
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    if any {
+        ir.apply_forwarding(f);
+    }
+}
+
+fn mul_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    let t = l.ty;
+    let zero = ir.czero(t);
+    let one = ir.cint(t, 1);
+    let prod = ir.mul(B, l, r);
+    let lz = ir.icmp(B, ir.IntEQ, l, zero);
+    if not is_signed {
+        let div = ir.select(B, lz, one, l);
+        let back = ir.binop(B, ir.OP_UDIV, prod, div);
+        let ne = ir.icmp(B, ir.IntNE, back, r);
+        return ir.and_(B, ir.not_(B, lz), ne);
+    }
+    let lm1 = ir.icmp(B, ir.IntEQ, l, ir.cones(t));
+    let safe = ir.or_(B, lz, lm1);
+    let div = ir.select(B, safe, one, l);
+    let back = ir.binop(B, ir.OP_SDIV, prod, div);
+    let ne = ir.icmp(B, ir.IntNE, back, r);
+    let general = ir.and_(B, ir.not_(B, safe), ne);
+    let min = ir.cint(t, @as(u64, 1) << @int_cast(u32, t.bits - 1));
+    let m1case = ir.and_(B, lm1, ir.icmp(B, ir.IntEQ, r, min));
+    return ir.or_(B, general, m1case);
+}

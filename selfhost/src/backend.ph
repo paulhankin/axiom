@@ -36,6 +36,12 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
         return true;
     }
     if tg.is_wasm() {
+        for i in 0..m.funcs.len {
+            let f = m.funcs.get(i);
+            if not ir.is_decl(f) {
+                lower.expand_mul_overflow(f);
+            }
+        }
         let un = wa.compile(m, tg.g_arch == tg.ARCH_WASM64);
         if u.isnil(un) {
             return false;

@@ -665,6 +665,47 @@ fn simplify_ptradd(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// Multiplication overflow with a constant factor is a range check.
+fn simplify_mul_ov(B: *mut ir.Builder, i: *mut ir.Value, signed: bool) *mut ir.Value {
+    if is_k(i.xs.get(0)) and not is_k(i.xs.get(1)) {
+        let x = i.xs.get(0);
+        i.xs.set(0, i.xs.get(1));
+        i.xs.set(1, x);
+    }
+    let x = i.xs.get(0);
+    let kc = i.xs.get(1);
+    let t = x.ty;
+    if not is_k(kc) or (t.kind != ir.T_INT) or (t.bits != 64) {
+        return vnil();
+    }
+    if not signed {
+        let c = kval(kc);
+        if c <= 1 {
+            return kfalse();
+        }
+        let lim = kt(t, 0xFFFF_FFFF_FFFF_FFFF / c);
+        if is_k(x) {
+            return kbool(kval(x) > kval(lim));
+        }
+        return mk_icmp(B, ir.IntUGT, x, lim);
+    }
+    let c = ir.sval(kc);
+    let max: i64 = 0x7FFF_FFFF_FFFF_FFFF;
+    let min: i64 = -max - 1;
+    if (c == 0) or (c == 1) {
+        return kfalse();
+    }
+    if c == -1 {
+        return mk_icmp(B, ir.IntEQ, x, kt(t, @bit_cast(u64, min)));
+    }
+    let hi = max / c;   // truncating
+    let lo = min / c;
+    if c > 1 {
+        return ir.or_(B, mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, lo))));
+    }
+    return ir.or_(B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
+}
+
 // The value i can be replaced by, or nil (i may have been rewritten in place).
 pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
@@ -689,6 +730,13 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     }
     if op == ir.OP_PTRADD {
         return simplify_ptradd(B, i);
+    }
+    if op == ir.OP_INTR {
+        let id = pred_of(i);
+        if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
+            return simplify_mul_ov(B, i, id == ir.IN_SMUL_OV);
+        }
+        return vnil();
     }
     if op == ir.OP_FNEG {
         if is_op(i.a, ir.OP_FNEG) {

@@ -171,6 +171,15 @@ pub fn madd(sf: u64, sub: bool, d: i32, n: i32, m: i32, a: i32) u64 {
     return (w | (r5(m) << 16)) | ((r5(a) << 10) | ((r5(n) << 5) | r5(d)));
 }
 
+// UMULH / SMULH: the high 64 bits of the 128-bit product
+pub fn mulh(signed: bool, d: i32, n: i32, m: i32) u64 {
+    let mut w: u64 = 0x9BC0_7C00;
+    if signed {
+        w = 0x9B40_7C00;
+    }
+    return (w | (r5(m) << 16)) | ((r5(n) << 5) | r5(d));
+}
+
 // Data-processing (1 source): RBIT 0, CLZ 4
 pub fn dp1(sf: u64, opc: u64, d: i32, n: i32) u64 {
     return ((0x5AC0_0000 | sfb(sf)) | (opc << 10)) | ((r5(n) << 5) | r5(d));

@@ -1714,10 +1714,21 @@ fn mul_wide_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
     return Ovf.{ val: val, ovf: icmp(ir.IntNE, back, p) };
 }
 
-// 64-bit multiply: no 128-bit multiply needed (freestanding wasm has no
-// compiler-rt); overflow is detected by dividing back.
+// 64-bit multiply: the overflow is an intrinsic the native backends compute
+// from the machine's multiply (and wasm by dividing back, lower.ph). Wider
+// types: no 128-bit multiply needed (freestanding wasm has no compiler-rt);
+// overflow is detected by dividing back.
 fn mul64_overflow(is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) Ovf {
     let t = l.ty;
+    if ir.int_width(t) == 64 {
+        let prod = b_mul(l, r);
+        let mut xs: [2]*mut ir.Value = [l, r];
+        let mut id = ir.IN_UMUL_OV;
+        if is_signed {
+            id = ir.IN_SMUL_OV;
+        }
+        return Ovf.{ val: prod, ovf: ir.intr(B, id, T_i1, xs[..]) };
+    }
     let zero = ir.czero(t);
     let one = ci(t, 1);
     let prod = b_mul(l, r);

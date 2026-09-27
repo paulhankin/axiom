@@ -1764,6 +1764,23 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
     let sz = isz(t);
     let d = vreg(v);
     let a0 = v.xs.get(0);
+    if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
+        // the flags of the 64-bit multiply: mul sets CF (and OF) when the
+        // high half is nonzero, imul sets OF when the product does not fit
+        let b = reg(v.xs.get(1));
+        if id == ir.IN_UMUL_OV {
+            _ = e2(xe.MOV_RR, 8, W(xe.RAX), R(reg(a0)));
+            let i = e4(xe.DIV, 8, RW(xe.RAX), W(xe.RDX), R(b), NONE());
+            i.cc = 4;
+            materialize_cc(d, xe.CC_B);
+        } else {
+            let p = vgpr();
+            copy(p, reg(a0), GPR);
+            _ = e2(xe.IMUL, 8, RW(p), R(b));
+            materialize_cc(d, xe.CC_O);
+        }
+        return;
+    }
     if id == ir.IN_CTLZ {
         let x = reg_ext(a0, false);
         if tg.has(tg.X_LZCNT) {

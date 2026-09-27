@@ -1528,6 +1528,23 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
     let sf = sfv(t);
     let d = vreg(v);
     let a0 = v.xs.get(0);
+    if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
+        // unsigned: the high half is nonzero; signed: the high half is not
+        // the sign extension of the low half
+        let a = reg(a0);
+        let b = reg(v.xs.get(1));
+        let h = vgpr();
+        raw3(ae.mulh(id == ir.IN_SMUL_OV, 0, 0, 0), h, a, b);
+        if id == ir.IN_UMUL_OV {
+            _ = cmp_imm(1, h, 0);
+        } else {
+            let l = vgpr();
+            raw3(ae.madd(1, false, 0, 0, 0, 31), l, a, b);
+            _ = raw(ae.addsub_reg(1, true, true, 31, 0, 0, 2, 63), NONE(), R(h), R(l), NONE());
+        }
+        cset(d, NE);
+        return;
+    }
     if id == ir.IN_CTLZ {
         let x = reg_ext(a0, false);
         if bits < 32 {
