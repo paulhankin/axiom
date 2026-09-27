@@ -62,9 +62,8 @@ async function runWasm(file) {
     print_str: (p, n) => line(dec.decode(new Uint8Array(mem.buffer, p >>> 0, n >>> 0))),
     print_bool: b => line(b ? 'true' : 'false'),
   };
-  const { instance } = await WebAssembly.instantiate(fs.readFileSync(file), { env, ...host.imports });
+  const instance = host.instantiate(fs.readFileSync(file), { env });
   mem = instance.exports.memory;
-  host.setMemory(mem);
   const lines = () => { const o = text.split('\n'); if (o[o.length - 1] === '') o.pop(); return o; };
   try {
     instance.exports.run();

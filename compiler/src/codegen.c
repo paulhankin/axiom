@@ -19,6 +19,7 @@
 bool is_place(Expr *e);
 
 SymVec g_export_names;
+bool g_threads;
 
 static CgOptions *O;
 static LLVMContextRef ctx;
@@ -1044,6 +1045,7 @@ static LLVMValueRef ext_int(LLVMValueRef v, LLVMTypeRef to, bool is_signed) {
 static LLVMValueRef mem_grow(LLVMValueRef pages);
 static LLVMValueRef mem_size(void);
 static LLVMValueRef error_name_table(void);
+static LLVMValueRef gen_atomic(Expr *e);
 
 static LLVMValueRef gen_builtin(Expr *e) {
     BuiltinArg *a = e->bargs.data;
@@ -1409,6 +1411,20 @@ static LLVMValueRef gen_builtin(Expr *e) {
         return LLVMBuildAdd(B, pe, po, "");
     }
     case BI_TRAP: emit_trap(); return NULL;
+    case BI_FENCE: LLVMBuildFence(B, LLVMAtomicOrderingSequentiallyConsistent, false, ""); return NULL;
+    case BI_ATOMIC_LOAD:
+    case BI_ATOMIC_STORE:
+    case BI_ATOMIC_ADD:
+    case BI_ATOMIC_SUB:
+    case BI_ATOMIC_AND:
+    case BI_ATOMIC_OR:
+    case BI_ATOMIC_XOR:
+    case BI_ATOMIC_XCHG:
+    case BI_ATOMIC_MIN:
+    case BI_ATOMIC_MAX:
+    case BI_ATOMIC_CAS:
+    case BI_ATOMIC_WAIT:
+    case BI_ATOMIC_NOTIFY: return gen_atomic(e);
     case BI_ERROR_NAME: {
         LLVMValueRef code = gen(a[0].e);
         LLVMValueRef tab = error_name_table();
@@ -1425,6 +1441,116 @@ static LLVMValueRef gen_builtin(Expr *e) {
     }
     internal_error(arena_printf("builtin @%s not implemented", e->name));
     return NULL;
+}
+
+// Atomics (spec §12.8): all sequentially consistent, naturally aligned.
+// A misaligned atomic access traps (as WebAssembly requires); on native
+// targets the check is explicit so behavior matches.
+bool g_needs_native_runtime;
+
+static LLVMValueRef native_rt_fn(const char *name, LLVMTypeRef ret, LLVMTypeRef *ps, int n, LLVMTypeRef *fty) {
+    *fty = LLVMFunctionType(ret, ps, (unsigned)n, false);
+    LLVMValueRef f = LLVMGetNamedFunction(mod, name);
+    if (!f) f = LLVMAddFunction(mod, name, *fty);
+    g_needs_native_runtime = true;
+    return f;
+}
+
+static LLVMValueRef gen_atomic(Expr *e) {
+    BuiltinArg *a = e->bargs.data;
+    BuiltinId id = (BuiltinId)e->index;
+    Type *pt = ct(a[0].e->type);
+    Type *t = pt->elem;
+    LLVMValueRef p = gen(a[0].e);
+    int64_t size = type_size(t);
+    if (size > 1) {
+        LLVMValueRef addr = LLVMBuildPtrToInt(B, p, T_isz, "");
+        check_or_trap(LLVMBuildICmp(B, LLVMIntEQ, LLVMBuildAnd(B, addr, usz(size - 1), ""), usz(0), ""));
+    }
+    LLVMAtomicOrdering sc = LLVMAtomicOrderingSequentiallyConsistent;
+    switch (id) {
+    case BI_ATOMIC_LOAD: {
+        LLVMValueRef v = LLVMBuildLoad2(B, lty(t), p, "");
+        LLVMSetOrdering(v, sc);
+        LLVMSetAlignment(v, (unsigned)size);
+        return v;
+    }
+    case BI_ATOMIC_STORE: {
+        LLVMValueRef v = gen(a[1].e);
+        LLVMValueRef st = LLVMBuildStore(B, v, p);
+        LLVMSetOrdering(st, sc);
+        LLVMSetAlignment(st, (unsigned)size);
+        return NULL;
+    }
+    case BI_ATOMIC_CAS: {
+        LLVMValueRef expv = gen(a[1].e), newv = gen(a[2].e);
+        LLVMValueRef r = LLVMBuildAtomicCmpXchg(B, p, expv, newv, sc, sc, false);
+        LLVMSetAlignment(r, (unsigned)size);
+        return LLVMBuildExtractValue(B, r, 0, "");
+    }
+    case BI_ATOMIC_WAIT: {
+        LLVMValueRef expv = gen(a[1].e), timeout = gen(a[2].e);
+        if (g_target.wasm) {
+            LLVMValueRef args[3] = {p, expv, timeout};
+            return intrinsic("llvm.wasm.memory.atomic.wait32", NULL, 0, args, 3);
+        }
+        LLVMTypeRef ps[3] = {T_ptr, T_i32, T_i64}, fty;
+        LLVMValueRef f = native_rt_fn("ph_wait32", T_i32, ps, 3, &fty);
+        LLVMValueRef args[3] = {p, expv, timeout};
+        return LLVMBuildCall2(B, fty, f, args, 3, "");
+    }
+    case BI_ATOMIC_NOTIFY: {
+        LLVMValueRef count = gen(a[1].e);
+        if (g_target.wasm) {
+            LLVMValueRef args[2] = {p, count};
+            return intrinsic("llvm.wasm.memory.atomic.notify", NULL, 0, args, 2);
+        }
+        LLVMTypeRef ps[2] = {T_ptr, T_i32}, fty;
+        LLVMValueRef f = native_rt_fn("ph_notify32", T_i32, ps, 2, &fty);
+        LLVMValueRef args[2] = {p, count};
+        return LLVMBuildCall2(B, fty, f, args, 2, "");
+    }
+    default: break;
+    }
+    LLVMAtomicRMWBinOp op;
+    bool sg = t->is_signed;
+    switch (id) {
+    case BI_ATOMIC_ADD: op = LLVMAtomicRMWBinOpAdd; break;
+    case BI_ATOMIC_SUB: op = LLVMAtomicRMWBinOpSub; break;
+    case BI_ATOMIC_AND: op = LLVMAtomicRMWBinOpAnd; break;
+    case BI_ATOMIC_OR: op = LLVMAtomicRMWBinOpOr; break;
+    case BI_ATOMIC_XOR: op = LLVMAtomicRMWBinOpXor; break;
+    case BI_ATOMIC_XCHG: op = LLVMAtomicRMWBinOpXchg; break;
+    case BI_ATOMIC_MIN: op = sg ? LLVMAtomicRMWBinOpMin : LLVMAtomicRMWBinOpUMin; break;
+    default: op = sg ? LLVMAtomicRMWBinOpMax : LLVMAtomicRMWBinOpUMax; break;
+    }
+    LLVMValueRef v = gen(a[1].e);
+    LLVMValueRef r = LLVMBuildAtomicRMW(B, op, p, v, sc, false);
+    LLVMSetAlignment(r, (unsigned)size);
+    return r;
+}
+
+// Entry point for threads on wasm: a new thread is a new instance sharing
+// the memory; the host calls this export with the thread function, its
+// argument and the top of a stack allocated for the thread. The function is
+// frameless, so it touches no stack memory before switching stacks.
+static void emit_thread_start(void) {
+    LLVMTypeRef ps[3] = {T_ptr, T_ptr, T_ptr};
+    LLVMTypeRef fty = LLVMFunctionType(T_void, ps, 3, false);
+    LLVMValueRef fn = LLVMAddFunction(mod, "phalange_thread_start", fty);
+    LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                            LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "phalange_thread_start", 21));
+    vec_push(g_export_names, intern_cstr("phalange_thread_start"));
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
+    LLVMPositionBuilderAtEnd(B, bb);
+    LLVMValueRef top = LLVMGetParam(fn, 2);
+    intrinsic("llvm.stackrestore", &T_ptr, 1, &top, 1);
+    LLVMTypeRef ety = LLVMFunctionType(T_void, &T_ptr, 1, false);
+    LLVMValueRef arg = LLVMGetParam(fn, 1);
+    LLVMBuildCall2(B, ety, LLVMGetParam(fn, 0), &arg, 1, "");
+    LLVMBuildRetVoid(B);
+    if (saved) LLVMPositionBuilderAtEnd(B, saved);
 }
 
 static LLVMValueRef g_errtab;
@@ -2310,7 +2436,7 @@ static bool setup_target(void) {
         LLVMDisposeMessage(err);
         return false;
     }
-    const char *features = g_target.wasm ? "+simd128,+bulk-memory,+nontrapping-fptoint,+sign-ext,+mutable-globals" : "";
+    const char *features = g_target.wasm ? "+simd128,+bulk-memory,+nontrapping-fptoint,+sign-ext,+mutable-globals,+atomics" : "";
     LLVMCodeGenOptLevel ol = O->opt_level == 0   ? LLVMCodeGenLevelNone
                              : O->opt_level == 1 ? LLVMCodeGenLevelLess
                              : O->opt_level == 2 ? LLVMCodeGenLevelDefault
@@ -2382,6 +2508,7 @@ bool codegen_program(CgOptions *o) {
     T_v128 = LLVMVectorType(T_i32, 4);
 
     if (g_target.wasm) emit_multi3();
+    if (g_target.wasm && g_threads) emit_thread_start();
 
     // Roots: exported functions. Everything else (functions, generic
     // instances, globals) is generated on first reference, so unreachable

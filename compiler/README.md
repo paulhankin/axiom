@@ -45,6 +45,10 @@ Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the hos
 used by `std/io` and `std/net` and calls the `main` export. Native programs that use
 the host ABI get `runtime/native_host.c` linked in automatically.
 
+Programs that use `std/thread` are linked with a shared, imported memory, and export
+`phalange_thread_start`. `runtime/host.mjs` creates the memory and runs each thread as
+a node worker. Native builds use pthreads. Atomics are always available.
+
 On wasm, `export fn` functions become WebAssembly exports, `import host "mod" { ... }`
 functions become imports from `mod`, and the linear memory is exported as `memory`.
 The shadow stack is placed first in memory (`--stack-first`), so a stack overflow
@@ -116,6 +120,7 @@ Implemented: the whole language described in spec v0.1-draft.3:
 - inline WASM, host imports and exports
 - the builtins in Appendix A
 - trapping for the conditions in Appendix B
+- threads and atomics (§12.8)
 
 Not yet implemented (reported with a diagnostic where relevant):
 
@@ -129,5 +134,13 @@ Not yet implemented (reported with a diagnostic where relevant):
   memory crashes with a signal instead of trapping deterministically. The
   bounds-checked linear-memory region of spec §12.1 is future work.
   `@memory_grow` / `@memory_size` are emulated on native with a 256 MiB reserved region.
+- **Data races at -O1 and above.** The spec (§12.8.2) forbids optimizations that are
+  valid only for race-free programs. At `-O0` the generated code honors this. At `-O1`
+  and above the compiler relies on LLVM, whose IR memory model formally treats a
+  racing non-atomic load as `undef`. In practice LLVM rarely exploits this, but it
+  isn't guaranteed. The planned fix is to lower accesses that may be shared as
+  `unordered` atomics in threaded builds.
+- `@atomic_wait` / `@atomic_notify` on native targets use Linux futexes. Other POSIX
+  systems aren't supported yet.
 - The prelude errors `OutOfMemory` and `Overflow` are always declared, because builtins
   and `std/mem` produce them.

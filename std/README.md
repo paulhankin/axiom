@@ -11,6 +11,8 @@ Import with `import "std/<module>" as <name>;`. Everything that allocates takes 
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
 | [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files; `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
+| [`thread`](thread.ph) | `spawn(alloc, f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
+| [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
 | [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters); IPv4 parsing/formatting |
 
 ## Conventions
@@ -23,6 +25,10 @@ Import with `import "std/<module>" as <name>;`. Everything that allocates takes 
 - **Errors, not sentinels.** Lookups that can fail return `!T` (for example
   `error.NotFound`, `error.Empty`). The idiom for "value or default" is
   `m.get(k) catch 0`.
+- **Threads share memory; synchronize it.** `spawn` copies its argument, so pass a
+  pointer to shared data and protect it with `std/sync`, or use `parallel_for`, which
+  hands each thread a disjoint range. `page_allocator` is thread-safe. `Arena`,
+  `Vec` and `Map` are not.
 - **Adapters point at their source.** `Arena.allocator()`, `BufferWriter.writer()`
   and similar return values that point at the object they came from, so don't move
   that object while the adapter is in use.
@@ -59,6 +65,8 @@ They call a small set of host functions imported from module `"phalange"`:
 | `ph_tcp_connect(name, len, port) i32`, `ph_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ph_tcp_accept(h) i32`, `ph_tcp_local_port(h) i32` | |
 | `ph_sock_read(h, p, n) isize`, `ph_sock_write(h, p, n) isize`, `ph_sock_close(h)` | |
+| `ph_thread_spawn(entry, arg, stack_top) i32`, `ph_thread_stack_size() usize` | threads (spec §12.8.5) |
+| `ph_cpu_count() u32`, `ph_sleep_ns(ns)` | |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection
 refused / not found, `-3` address in use, `-4` invalid address, and `-13` access denied.

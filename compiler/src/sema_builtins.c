@@ -554,6 +554,61 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t_invalid;
     }
     case BI_TRAP: return e->type = t_never;
+    case BI_FENCE: return e->type = t_void;
+    case BI_ATOMIC_LOAD:
+    case BI_ATOMIC_STORE:
+    case BI_ATOMIC_ADD:
+    case BI_ATOMIC_SUB:
+    case BI_ATOMIC_AND:
+    case BI_ATOMIC_OR:
+    case BI_ATOMIC_XOR:
+    case BI_ATOMIC_XCHG:
+    case BI_ATOMIC_MIN:
+    case BI_ATOMIC_MAX:
+    case BI_ATOMIC_CAS:
+    case BI_ATOMIC_WAIT:
+    case BI_ATOMIC_NOTIFY: {
+        // First argument: pointer to an integer (spec §12.8). Everything but
+        // load, wait and notify needs *mut.
+        BuiltinId id = (BuiltinId)e->index;
+        bool need_mut = id != BI_ATOMIC_LOAD && id != BI_ATOMIC_WAIT && id != BI_ATOMIC_NOTIFY;
+        Type *p = check_expr(*earg(e, 0), NULL);
+        Type *t = t_invalid;
+        if (p->kind == TY_PTR && (p->elem->kind == TY_INT || (p->elem->kind == TY_PARAM && type_satisfies(p->elem, C_INT)))) {
+            t = p->elem;
+            if (need_mut && !p->mut)
+                diag_error((*earg(e, 0))->span, "E0706", "@%s needs a *mut pointer, found %s", e->name, type_str(p));
+        } else if (p->kind != TY_INVALID) {
+            diag_error((*earg(e, 0))->span, "E0823", "@%s needs a pointer to an integer, found %s", e->name, type_str(p));
+        }
+        if ((id == BI_ATOMIC_WAIT || id == BI_ATOMIC_NOTIFY) && t->kind == TY_INT && t->bits != 32) {
+            diag_error((*earg(e, 0))->span, "E0823", "@%s works on 32-bit integers (*i32 or *u32), found %s", e->name,
+                       type_str(p));
+        }
+        if ((id == BI_ATOMIC_WAIT || id == BI_ATOMIC_NOTIFY) && t->kind == TY_PARAM) {
+            diag_error((*earg(e, 0))->span, "E0823", "@%s works on 32-bit integers (*i32 or *u32)", e->name);
+        }
+        switch (id) {
+        case BI_ATOMIC_LOAD: return e->type = t;
+        case BI_ATOMIC_STORE:
+            check_expr_to(earg(e, 1), t);
+            return e->type = t_void;
+        case BI_ATOMIC_CAS:
+            check_expr_to(earg(e, 1), t);
+            check_expr_to(earg(e, 2), t);
+            return e->type = t;
+        case BI_ATOMIC_WAIT:
+            check_expr_to(earg(e, 1), t);
+            check_expr_to(earg(e, 2), t_i64);
+            return e->type = t_u32;
+        case BI_ATOMIC_NOTIFY:
+            check_expr_to(earg(e, 1), t_u32);
+            return e->type = t_u32;
+        default:
+            check_expr_to(earg(e, 1), t);
+            return e->type = t;  // read-modify-write: the old value
+        }
+    }
     case BI_ERROR_NAME:
         check_expr_to(earg(e, 0), t_error);
         return e->type = type_slice(t_u8, false);

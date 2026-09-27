@@ -416,7 +416,8 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
 // ---------------------------------------------------------------------------
 static bool boundary_type_ok(Type *t, bool is_ret) {
     switch (t->kind) {
-    case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_VEC: case TY_V128: case TY_INVALID: return true;
+    case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_FN: case TY_VEC: case TY_V128: case TY_INVALID:
+        return true;
     case TY_VOID: return is_ret;
     default: return false;
     }

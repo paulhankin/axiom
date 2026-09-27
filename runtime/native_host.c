@@ -5,9 +5,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <linux/futex.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -130,3 +135,77 @@ intptr_t ph_sock_write(int32_t h, const uint8_t *p, size_t n) {
 }
 
 void ph_sock_close(int32_t h) { close(h); }
+
+// ---------------------------------------------------------------------------
+// Threads (std/thread) and wait/notify (@atomic_wait / @atomic_notify)
+// ---------------------------------------------------------------------------
+typedef void (*ph_entry)(void *);
+
+struct thread_start {
+    ph_entry entry;
+    void *arg;
+};
+
+static void *thread_main(void *p) {
+    struct thread_start st = *(struct thread_start *)p;
+    free(p);
+    st.entry(st.arg);
+    return NULL;
+}
+
+// stack_top is ignored: native threads get their stack from the OS.
+int32_t ph_thread_spawn(ph_entry entry, void *arg, size_t stack_top) {
+    (void)stack_top;
+    static int32_t next_id = 1;
+    struct thread_start *st = malloc(sizeof *st);
+    if (!st) return PH_ERR;
+    st->entry = entry;
+    st->arg = arg;
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&t, &attr, thread_main, st);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        free(st);
+        return PH_ERR;
+    }
+    return __atomic_fetch_add(&next_id, 1, __ATOMIC_SEQ_CST);
+}
+
+// Native threads need no stack from the program.
+size_t ph_thread_stack_size(void) { return 0; }
+
+uint32_t ph_cpu_count(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (uint32_t)n : 1;
+}
+
+void ph_sleep_ns(uint64_t ns) {
+    struct timespec ts = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+// Same results as WebAssembly memory.atomic.wait32: 0 woken, 1 not equal, 2 timed out.
+int32_t ph_wait32(uint32_t *p, uint32_t expected, int64_t timeout_ns) {
+    struct timespec ts, *tsp = NULL;
+    if (timeout_ns >= 0) {
+        ts.tv_sec = (time_t)(timeout_ns / 1000000000);
+        ts.tv_nsec = (long)(timeout_ns % 1000000000);
+        tsp = &ts;
+    }
+    for (;;) {
+        long r = syscall(SYS_futex, p, FUTEX_WAIT_PRIVATE, expected, tsp, NULL, 0);
+        if (r == 0) return 0;
+        if (errno == EAGAIN) return 1;
+        if (errno == ETIMEDOUT) return 2;
+        if (errno != EINTR) return 0;
+    }
+}
+
+int32_t ph_notify32(uint32_t *p, int32_t count) {
+    long r = syscall(SYS_futex, p, FUTEX_WAKE_PRIVATE, count < 0 ? 0x7fffffff : count, NULL, NULL, 0);
+    return r < 0 ? 0 : (int32_t)r;
+}

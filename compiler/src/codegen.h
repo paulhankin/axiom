@@ -21,4 +21,10 @@ bool codegen_program(CgOptions *o);
 // Names of exported functions (for the linker).
 extern SymVec g_export_names;
 
+// Set before codegen: the program spawns threads (wasm: shared memory and a
+// thread entry export).
+extern bool g_threads;
+// Set by codegen: the output calls into runtime/native_host.c.
+extern bool g_needs_native_runtime;
+
 #endif

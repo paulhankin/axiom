@@ -174,6 +174,8 @@ int main(int argc, char **argv) {
                           : g_target.wasm ? ".wasm" : "";
         out = arena_printf("%.*s%s", (int)n, base, ext);
     }
+    for (int i = 0; i < g_prog.host_fns.len; i++)
+        if (!strcmp(g_prog.host_fns.data[i]->name, "ph_thread_spawn")) g_threads = true;
     char objpath[PATH_MAX];
     if (final_link) {
         snprintf(objpath, sizeof objpath, "%s.tmp%d.o", out, (int)getpid());
@@ -207,6 +209,12 @@ int main(int argc, char **argv) {
             vec_push(av, "-z");
             vec_push(av, "stack-size=1048576");
             vec_push(av, "--export-memory");
+            if (g_threads) {
+                // Threads are instances sharing one memory, which the host creates.
+                vec_push(av, "--shared-memory");
+                vec_push(av, "--import-memory");
+                vec_push(av, "--max-memory=1073741824");
+            }
             for (int i = 0; i < g_export_names.len; i++) vec_push(av, arena_printf("--export=%s", g_export_names.data[i]));
             vec_push(av, objpath);
             for (int i = 0; i < link_inputs.len; i++) vec_push(av, link_inputs.data[i]);
@@ -220,7 +228,7 @@ int main(int argc, char **argv) {
             bool uses_host_abi = false;
             for (int i = 0; i < g_prog.host_fns.len; i++)
                 if (!strcmp(g_prog.host_fns.data[i]->host_module, "phalange")) uses_host_abi = true;
-            if (uses_host_abi) {
+            if (uses_host_abi || g_needs_native_runtime) {
                 const char *rt = arena_printf("%s/../runtime/native_host.c", so.std_dir);
                 if (!file_exists(rt)) {
                     unlink(objpath);
@@ -243,6 +251,7 @@ int main(int argc, char **argv) {
             vec_push(av, "-o");
             vec_push(av, (char *)out);
             vec_push(av, "-lm");
+            vec_push(av, "-pthread");
             vec_push(av, NULL);
             rc = run(av.data);
         }

@@ -24,12 +24,23 @@ pub struct Allocator {
 
 // -----------------------------------------------------------------------------
 // page_allocator: bump allocation from pages obtained with memory.grow.
-// WebAssembly memory cannot shrink, so free is a no-op.
+// WebAssembly memory cannot shrink, so free is a no-op. Thread-safe.
 // -----------------------------------------------------------------------------
 let mut page_next: usize = 0;
 let mut page_end: usize = 0;
+let mut page_lock: u32 = 0;  // page_allocator may be used from several threads
 
 fn page_alloc(ctx: *mut void, size: usize, align: usize) !*mut u8 {
+    while @atomic_xchg(&mut page_lock, 1) != 0 {
+        _ = @atomic_wait(&page_lock, 1, -1);
+    }
+    let r = page_alloc_locked(size, align);
+    @atomic_store(&mut page_lock, 0);
+    _ = @atomic_notify(&page_lock, 1);
+    return r;
+}
+
+fn page_alloc_locked(size: usize, align: usize) !*mut u8 {
     let mask = align - 1;
     let mut start = (page_next + mask) & ~mask;
     if (page_next == 0) or ((start + size) > page_end) {

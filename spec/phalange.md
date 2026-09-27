@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.3
+**Version:** 0.1-draft.4
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -1244,12 +1244,12 @@ on alignment. `@align_of(T)` reports the natural alignment used for layout.
 
 ### 12.6 Concurrency
 
-v0.1 is single-threaded. Shared-memory threads and atomics are future work (Appendix D).
+Programs may run several threads over the one linear memory. §12.8 defines threads,
+the memory model, and atomics.
 
 ### 12.7 Traps
 
-A trap stops the current WebAssembly instance, or the native process's Phalange context,
-**immediately**:
+A trap stops the program **immediately**, including every other thread (§12.8):
 
 - `defer` blocks do not run.
 - The host observes the trap (in JavaScript, a `WebAssembly.RuntimeError`).
@@ -1258,6 +1258,115 @@ A trap stops the current WebAssembly instance, or the native process's Phalange 
 Appendix B lists every trap condition.
 
 ---
+
+### 12.8 Threads and concurrency
+
+This section defines shared-memory concurrency. The design follows from three facts:
+
+- WebAssembly, the reference semantics, has shared memories, atomic instructions and
+  `wait`/`notify`, but no instruction that creates a thread. Hosts create threads by
+  instantiating the module again on the same memory.
+- The mandate forbids hidden control flow and undefined behavior.
+- The language has no borrow checker, and v0.1 does not add one.
+
+#### 12.8.1 Decisions
+
+| # | Decision | Reason |
+|---|---|---|
+| 1 | **Threads are a library, not syntax.** `std/thread` creates threads through the host ABI (§12.8.5). The language adds only atomic builtins. | Matches WebAssembly, where thread creation is a host operation. Keeps the language small. |
+| 2 | **A data race is not undefined behavior.** A read that races with a write returns, for each byte, a value some store wrote to that byte. Tearing is permitted (§12.8.2). | Keeps the zero-UB rule without a borrow checker or `Send`/`Sync` traits. This is WebAssembly's memory model, applied everywhere, just as §12.1 applies WebAssembly's bounds model. A race, like a dangling pointer, is a logic bug with a defined outcome. |
+| 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later (Appendix D). |
+| 4 | **Atomics are builtins on pointers to integers** (`@atomic_add(&mut x, 1)`), not special types. | Any integer in memory can be accessed atomically, as in WebAssembly. `std/sync.Atomic[T]` wraps them for convenience. |
+| 5 | **`wait`/`notify` operate on 32-bit integers only.** | Linux futexes, the native implementation, are 32-bit, and WebAssembly has `wait32`. 64-bit waiting would behave differently on different targets. |
+| 6 | **No `async`/`await`, no coroutines, no thread-local storage.** | An `await` is a suspension point that looks like an ordinary expression, which is hidden control flow. Blocking calls on threads are explicit. Thread-locals would need per-instance TLS setup on WebAssembly. Pass per-thread data explicitly instead. |
+| 7 | **A trap in any thread terminates the whole program.** | A trap means the program's state is no longer trustworthy. Letting other threads continue would let them observe that state. |
+| 8 | **Deadlock is not an error.** A thread blocked forever is simply blocked. | Detecting it would require a runtime scheduler. |
+
+#### 12.8.2 Memory model
+
+- All threads share the whole linear memory (§12.1). Each thread has its own stack.
+  Locals whose address is never taken are private to their thread.
+- **Atomic operations** (§12.8.3) on the same location are *sequentially consistent*.
+  All threads observe them in a single total order that is consistent with each
+  thread's program order. An atomic operation, together with every access that comes
+  before it in the same thread, happens-before any operation that observes its effect.
+- **Non-atomic accesses.** If a non-atomic access conflicts with another access to an
+  overlapping location (at least one is a write) and neither happens-before the other,
+  the accesses *race*. A racing read returns, for each byte, the value written by some
+  store to that byte that does not happen-after the read. Different bytes of one read
+  may come from different stores (tearing). A racing write stores its bytes, and
+  bytes of racing writes may interleave. Nothing else is affected, and a race is
+  never undefined behavior. This is the WebAssembly threads memory model.
+- **Implementation obligation.** A conforming implementation MUST NOT perform
+  optimizations that are sound only if the program has no races. For example, it MUST
+  NOT assume that two reads of a racing location return the same value, or turn a
+  racing read into an unrelated value.
+- `@fence()` is a sequentially consistent fence. Ordinary code does not need it,
+  because every atomic operation is already sequentially consistent.
+
+#### 12.8.3 Atomic builtins
+
+`p` is a pointer to an integer type (`*T` for reads, `*mut T` for writes). `T` may be
+8, 16, 32 or 64 bits, or a generic `T: Int`. Every operation is sequentially consistent.
+
+| Builtin | Result |
+|---|---|
+| `@atomic_load(p)` | `T` |
+| `@atomic_store(p, v)` | `void` |
+| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in either overflow mode |
+| `@atomic_cas(p, expected, desired)` | the previous value. The exchange happened iff it equals `expected` |
+| `@atomic_wait(p, expected, timeout_ns: i64)` | `u32`: `0` woken by a notify, `1` the value was not `expected`, `2` timed out. A negative timeout waits forever. `p: *i32` or `*u32` only |
+| `@atomic_notify(p, count: u32)` | `u32`: the number of threads woken. `p: *i32` or `*u32` only. `0xFFFF_FFFF` wakes all |
+| `@fence()` | `void` |
+
+The address must be aligned to `@size_of(T)`, otherwise the program traps (`T0010`),
+as in WebAssembly. Alignment is otherwise not semantic (§12.5), so this is the one
+place it matters.
+
+`@atomic_wait` blocks only when the value at `p` equals `expected`, checked atomically
+with going to sleep. `@atomic_notify` wakes up to `count` threads waiting on `p`.
+Together they are the building block for every blocking primitive in `std/sync`.
+Some hosts forbid blocking on the main thread (browsers do); there `@atomic_wait`
+traps (`T0000`). On a single-threaded WebAssembly program, whose memory is not
+shared, `@atomic_wait` also traps. Programs that never block don't notice either.
+
+#### 12.8.4 Threads
+
+`std/thread`:
+
+- `spawn(alloc, f, arg) !Thread[T]` runs `f(arg)` on a new thread. `arg: T` is copied.
+  To share data, pass a pointer, and synchronize access to it.
+- `Thread.join()` waits for `f` to return and releases the thread's resources.
+- `parallel_for(alloc, n, threads, body, ctx)` splits `0..n` into disjoint ranges,
+  runs `body(ctx, lo, hi)` for each in parallel, and returns when all are done. Bodies
+  that write only inside their own range cannot race.
+- `cpu_count()` and `sleep_ms(ms)`.
+
+`std/sync`: `Atomic[T: Int]`, `Mutex`, `WaitGroup`, and `Channel[T]` (bounded,
+multi-producer, multi-consumer, closable).
+
+When `main` returns, the program ends, even if other threads are still running. This
+matches C and most hosts.
+
+#### 12.8.5 Host ABI and the WebAssembly mapping
+
+Threads use host functions from module `"phalange"`:
+
+| Function | Meaning |
+|---|---|
+| `ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize) i32` | start a thread running `entry(arg)`; a negative result means failure |
+| `ph_thread_stack_size() usize` | the stack size the program must allocate for a new thread, or `0` if the host provides stacks (native) |
+| `ph_cpu_count() u32`, `ph_sleep_ns(ns: u64)` | |
+
+On WebAssembly, a program that uses threads is linked with a **shared, imported**
+memory. The compiler also exports `phalange_thread_start(entry, arg, stack_top)`. The
+host runs a new thread by instantiating the module again on the same memory, in a
+Web Worker or node worker, and calling that export. The export switches the new
+instance's stack pointer to `stack_top` and calls `entry(arg)`. Data segments are
+initialized only once, by the first instance. Programs that never spawn threads
+keep an unshared memory and need no worker support.
+
+On native targets, threads are POSIX threads, and `wait`/`notify` are futexes (Linux).
 
 ## 13. SIMD
 
@@ -1389,6 +1498,7 @@ must be one of the following (`E0801` otherwise):
 - `f32`, `f64`,
 - `usize`/`isize`,
 - a pointer,
+- a function pointer (a table index on WebAssembly),
 - a SIMD type,
 - `void` as the return type.
 
@@ -1636,6 +1746,7 @@ Initial registry, not exhaustive:
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |
 | E0801 | Type not allowed at the export or import boundary |
+| E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0901 | Forbidden instruction in inline WASM |
 
 ### 17.4 Runtime trap reporting
@@ -1833,7 +1944,13 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16x8`: WASM `i32x4.dot_i16x8_s` |
 | `@narrow`, `@widen_low`, `@widen_high` | Lane-width changes per WASM |
 
-### A.6 Control
+### A.6 Atomics
+
+See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
+`@atomic_and`, `@atomic_or`, `@atomic_xor`, `@atomic_xchg`, `@atomic_min`,
+`@atomic_max`, `@atomic_cas`, `@atomic_wait`, `@atomic_notify`, `@fence`.
+
+### A.7 Control
 
 | Builtin | Notes |
 |---|---|
@@ -1858,6 +1975,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0007` | Invalid union tag at `match` |
 | `T0008` | Stack exhaustion |
 | `T0009` | Invalid function pointer or signature mismatch (`call_indirect`) |
+| `T0010` | Misaligned atomic access (§12.8.3) |
 
 Nothing else traps, and nothing is undefined.
 
@@ -1892,6 +2010,8 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C20 | The language was renamed from Axiom to Phalange, and the extension from `.ax` to `.ph` | Design review, draft 2 |
 | C21 | Float literals round to the nearest value of their target type (formerly open question Q5) | The spec's own examples (`3.14159265` as `f32`) need it; found while implementing the compiler |
 | C22 | For `!void`, a `catch` block may complete normally ("handle and continue") | Found while writing the standard library: without it, `f() catch \|e\| { log(e); }` could not be written |
+| C23 | Shared-memory threads (library-level), a race-tolerant memory model, and sequentially consistent atomic builtins (§12.8) | The user asked for threads and concurrency. §12.8.1 gives the reasoning |
+| C24 | Function pointers are allowed across the export/import boundary | Needed by `ph_thread_spawn`. On WebAssembly they are table indices |
 
 ---
 
@@ -1935,9 +2055,14 @@ Each question is followed by the options and the current leaning.
    vtables), or passing functions as `const` generic parameters.
 8. **Generics over SIMD.** Should there be constraints like `FloatVec` or `IntVec`, or a
    `Vec[T, const N]` family, so that kernels can be written once for `f32x4` and `f64x2`?
-9. **Threads and atomics.** *Leaning:* sequentially consistent atomics only. Data races on
-   non-atomic locations produce unspecified values (not UB), matching the WASM threads
-   proposal.
+9. ~~**Threads and atomics.**~~ Resolved: see §12.8. New questions that follow from it:
+   - **Relaxed and acquire/release orderings**, for performance on ARM. They would be
+     added as extra builtins (`@atomic_load_acquire`, ...), never as defaults.
+   - **Static race prevention.** A lightweight rule could forbid passing `*mut`/`[]mut`
+     to `spawn` except through `std/sync` types or `parallel_for` ranges. It would be
+     advisory at first, as a lint.
+   - **Thread-local storage.** It needs a TLS base per WebAssembly instance.
+   - **64-bit `wait`/`notify`.**
 10. **Native-target pointers and FFI.** The linear-memory model makes calling C code awkward.
     An `extern` boundary with explicit marshalling may be needed.
 11. **Test blocks.** A `test "name" { … }` construct with `phalange test --format=agent-json`.

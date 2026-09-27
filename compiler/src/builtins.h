@@ -71,6 +71,20 @@
     X(REDUCE_ADD, "reduce_add", "e")          \
     X(DOT, "dot", "ee")                       \
     X(TRAP, "trap", "")                       \
+    X(ATOMIC_LOAD, "atomic_load", "e")        \
+    X(ATOMIC_STORE, "atomic_store", "ee")     \
+    X(ATOMIC_ADD, "atomic_add", "ee")         \
+    X(ATOMIC_SUB, "atomic_sub", "ee")         \
+    X(ATOMIC_AND, "atomic_and", "ee")         \
+    X(ATOMIC_OR, "atomic_or", "ee")           \
+    X(ATOMIC_XOR, "atomic_xor", "ee")         \
+    X(ATOMIC_XCHG, "atomic_xchg", "ee")       \
+    X(ATOMIC_MIN, "atomic_min", "ee")         \
+    X(ATOMIC_MAX, "atomic_max", "ee")         \
+    X(ATOMIC_CAS, "atomic_cas", "eee")        \
+    X(ATOMIC_WAIT, "atomic_wait", "eee")      \
+    X(ATOMIC_NOTIFY, "atomic_notify", "ee")   \
+    X(FENCE, "fence", "")                     \
     X(ERROR_NAME, "error_name", "e")
 
 typedef enum BuiltinId {
