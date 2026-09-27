@@ -1,0 +1,51 @@
+// Structs, methods and receiver adjustment (spec §9.3).
+import "../lib/io.ph" as io;
+
+struct Vec2 {
+    x: f64,
+    y: f64,
+
+    pub fn len_sq(self: Vec2) f64 {
+        return (self.x * self.x) + (self.y * self.y);
+    }
+
+    pub fn scale(self: *mut Vec2, k: f64) void {
+        self.x = self.x * k;
+        self.y *= k;
+    }
+
+    pub fn sum(self: *Vec2) f64 {
+        return self.x + self.y;
+    }
+}
+
+struct Particle {
+    pos: Vec2,
+    alive: bool,
+    id: u16,
+}
+
+fn make(id: u16) Particle {
+    return Particle.{ pos: Vec2.{ x: 1.0, y: 2.0 }, alive: true, id: id };
+}
+
+export fn run() void {
+    let mut v = Vec2.{ x: 3.0, y: 4.0 };
+    io.float(v.len_sq());          // expect: 25
+    v.scale(2.0);
+    io.float(v.x);                 // expect: 6
+    io.float(v.sum());             // expect: 14
+    let p = &mut v;
+    p.scale(0.5);
+    io.float(p.len_sq());          // expect: 25
+    let mut q = make(7);
+    q.pos.scale(10.0);
+    io.float(q.pos.y);             // expect: 20
+    io.boolean(q.alive);           // expect: true
+    io.int(@as(i64, q.id));        // expect: 7
+    io.uint(@as(u64, @size_of(Particle)));    // expect: 24
+    io.uint(@as(u64, @offset_of(Particle, id)));  // expect: 18
+    let pp = &mut q;
+    pp.alive = false;
+    io.boolean(q.alive);           // expect: false
+}

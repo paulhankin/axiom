@@ -1,6 +1,6 @@
 # Phalange Language Specification
 
-**Version:** 0.1-draft.2
+**Version:** 0.1-draft.3
 **File extension:** `.ph`
 **Status:** Working draft. Everything here may change. Decisions that differ from the
 original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
@@ -570,9 +570,9 @@ in any `error { … }` block in the program is assigned a distinct non-zero code
 The following are the **only** conversions the compiler performs without being asked:
 
 1. **Untyped literal typing.** An integer, float or character literal takes the type the
-   context expects. The value must be exactly representable (`E0503` otherwise). A float
-   literal must round-trip exactly when the target is `f32`, or else be written with a
-   `@float_cast`. (See Appendix D, Q5.)
+   context expects. An integer literal's value must be exactly representable (`E0503`
+   otherwise). A float literal is rounded to the nearest value of the target float type
+   (ties to even), so `let x: f32 = 0.1;` is valid.
 2. **Mutability weakening.** `[]mut T → []T` and `*mut T → *T`.
 3. **Error-union wrapping.** A `T` or an `error` converts to `!T` in a `return` statement,
    an assignment, or an argument passed to a `!T` parameter.
@@ -1880,6 +1880,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C18 | Shift counts are **not** clamped. `x << k` and `x >> k` have their mathematical meaning for every `k`, so `k ≥ width` gives `0` or sign fill | Design review, draft 2. `x << 40` has a clear meaning, and clamping it to `x << 31` would be surprising |
 | C19 | Added monomorphized generics with builtin constraints (§10) | Design review, draft 2 |
 | C20 | The language was renamed from Axiom to Phalange, and the extension from `.ax` to `.ph` | Design review, draft 2 |
+| C21 | Float literals round to the nearest value of their target type (formerly open question Q5) | The spec's own examples (`3.14159265` as `f32`) need it; found while implementing the compiler |
 
 ---
 
@@ -1913,8 +1914,7 @@ Each question is followed by the options and the current leaning.
 4. **Error sets.** A single program-wide error set is simple, but it does not let a function
    say *which* errors it can return. Consider `fn f() FileError!T` with an inferred or
    declared set, and exhaustive `match` over it.
-5. **Float literal exactness.** Requiring `f32` literals to be exactly representable means
-   `let x: f32 = 0.1;` is an error. *Leaning:* round-to-nearest with no warning.
+5. ~~**Float literal exactness.**~~ Resolved: float literals round to nearest (§6.1, C21).
 6. **`errdefer`.** Useful for cleaning up partial allocations when a function fails.
    *Leaning:* add it.
 7. **User-defined constraints.** v0.1 constraints are a closed builtin set (§10.5). Generic

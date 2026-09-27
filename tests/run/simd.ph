@@ -1,0 +1,53 @@
+// SIMD vectors (spec §13).
+import "../lib/io.ph" as io;
+
+fn dot(a: []f32, b: []f32) f32 {
+    let mut acc: f32x4 = @splat(0.0);
+    let mut i: usize = 0;
+    while (i + 4) <= a.len {
+        acc = acc + @load(f32x4, a[i..i + 4]) * @load(f32x4, b[i..i + 4]);
+        i += 4;
+    }
+    let mut total = @reduce_add(acc);
+    while i < a.len {
+        total += a[i] * b[i];
+        i += 1;
+    }
+    return total;
+}
+
+export fn run() void {
+    let a: [6]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: [6]f32 = [1.0, 1.0, 1.0, 1.0, 2.0, 2.0];
+    io.float(@as(f64, dot(a[..], b[..])));           // expect: 32
+    let v = @vec(i32x4, 1, -2, 3, -4);
+    let w = v *% @splat(3);
+    io.int(@as(i64, @extract_lane(w, 1)));           // expect: -6
+    io.int(@as(i64, @reduce_add(w)));                // expect: -6
+    let m = @lanes_lt(v, @splat(0));
+    io.uint(@as(u64, @bitmask(m)));                  // expect: 10
+    io.boolean(@any_true(m));                        // expect: true
+    io.boolean(@all_true(m));                        // expect: false
+    let s = @shuffle(v, w, [0, 4, 1, 5]);
+    io.int(@as(i64, @extract_lane(s, 1)));           // expect: 3
+    let sh = v << @as(u32, 40);
+    io.int(@as(i64, @reduce_add(sh)));               // expect: 0
+    let r = v >> @as(u32, 40);
+    io.int(@as(i64, @extract_lane(r, 3)));           // expect: -1
+    let mx = @max(v, @splat(0));
+    io.int(@as(i64, @reduce_add(mx)));               // expect: 4
+    let f = @vec(f32x4, 1.0, 4.0, 9.0, 16.0);
+    io.float(@as(f64, @reduce_add(@sqrt(f))));       // expect: 10
+    let d = @dot(@vec(f64x2, 1.5, 2.0), @vec(f64x2, 2.0, 4.0));
+    io.float(d);                                     // expect: 11
+    let mut out: [4]f32 = [0.0; 4];
+    @store(out[..], f + @splat(1.0));
+    io.float(@as(f64, out[3]));                      // expect: 17
+    let bytes = @vec(u8x16, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25);
+    let idx = @vec(u8x16, 15, 0, 200, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    let sw = @swizzle(bytes, idx);
+    io.int(@as(i64, @extract_lane(sw, 0)));          // expect: 25
+    io.int(@as(i64, @extract_lane(sw, 2)));          // expect: 0
+    let sat = @add_sat(@vec(u8x16, 250, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), @splat(10));
+    io.int(@as(i64, @extract_lane(sat, 0)));         // expect: 255
+}

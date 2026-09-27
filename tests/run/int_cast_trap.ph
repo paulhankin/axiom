@@ -1,0 +1,13 @@
+// @int_cast is checked; @truncate keeps low bits.
+// expect-trap
+// expect: 44
+// expect: 200
+import "../lib/io.ph" as io;
+
+export fn run() void {
+    let big: u32 = 300;
+    io.int(@as(i64, @truncate(u8, big)));
+    let ok: u32 = 200;
+    io.int(@as(i64, @int_cast(u8, ok)));
+    io.int(@as(i64, @int_cast(u8, big)));
+}

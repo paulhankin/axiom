@@ -1,0 +1,243 @@
+// main.c - command-line driver.
+//
+//   phalange build <file.ph> [options] -o <out>
+//   phalange check <file.ph> [options]
+//
+// Options:
+//   --target=wasm32|native     (default wasm32; wasm32-freestanding accepted)
+//   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
+//   --release                  same as --overflow=saturate
+//   --overflow=trap|saturate   integer overflow mode (default trap)
+//   --emit=exe|obj|llvm|asm    output kind (default: exe = .wasm module / native executable)
+//   --format=human|agent-json  diagnostic format
+//   --std=<dir>                standard library directory
+//   --link=<file>             extra object/C file to link (repeatable)
+//   -o <path>                  output path
+#include <limits.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "codegen.h"
+#include "diag.h"
+#include "sema.h"
+
+const char *LLVMGetDefaultTargetTriple_wrapper(void);
+
+extern char **environ;
+
+static void usage(void) {
+    fprintf(stderr,
+            "usage: phalange <build|check> <file.ph> [options]\n"
+            "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
+            "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n");
+}
+
+static bool file_exists(const char *p) { return access(p, R_OK) == 0; }
+
+static const char *find_std(const char *argv0) {
+    const char *env = getenv("PHALANGE_STD");
+    if (env && *env) return env;
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) {
+        if (!realpath(argv0, exe)) return "std";
+    } else {
+        exe[n] = 0;
+    }
+    char *slash = strrchr(exe, '/');
+    if (slash) *slash = 0;
+    static char buf[PATH_MAX + 32];
+    const char *cands[] = {"/../../std", "/../std", "/std", "/../share/phalange/std"};
+    for (size_t i = 0; i < sizeof cands / sizeof *cands; i++) {
+        snprintf(buf, sizeof buf, "%s%s/mem.ph", exe, cands[i]);
+        if (file_exists(buf)) {
+            snprintf(buf, sizeof buf, "%s%s", exe, cands[i]);
+            char *r = realpath(buf, NULL);
+            return r ? r : buf;
+        }
+    }
+    return "std";
+}
+
+static int run(char *const argv[]) {
+    pid_t pid;
+    if (posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) != 0) return -1;
+    int status;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static const char *find_tool(const char **names) {
+    for (int i = 0; names[i]; i++) {
+        if (strchr(names[i], '/')) {
+            if (access(names[i], X_OK) == 0) return names[i];
+            continue;
+        }
+        const char *path = getenv("PATH");
+        if (!path) continue;
+        char buf[PATH_MAX];
+        const char *p = path;
+        while (*p) {
+            const char *e = strchr(p, ':');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            snprintf(buf, sizeof buf, "%.*s/%s", (int)len, p, names[i]);
+            if (access(buf, X_OK) == 0) return names[i];
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        usage();
+        return 2;
+    }
+    const char *cmd = argv[1];
+    bool build = strcmp(cmd, "build") == 0;
+    if (!build && strcmp(cmd, "check") != 0) {
+        usage();
+        return 2;
+    }
+    const char *input = NULL, *out = NULL, *std_dir = NULL, *target = "wasm32", *emit = "exe";
+    bool json = false;
+    CgOptions co = {0};
+    Vec(char *) link_inputs = {0};
+    for (int i = 2; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
+        else if (!strncmp(a, "--target=", 9)) target = a + 9;
+        else if (!strcmp(a, "-O0") || !strcmp(a, "-O1") || !strcmp(a, "-O2") || !strcmp(a, "-O3")) co.opt_level = a[2] - '0';
+        else if (!strcmp(a, "--release")) co.overflow_saturate = true;
+        else if (!strcmp(a, "--overflow=trap")) co.overflow_saturate = false;
+        else if (!strcmp(a, "--overflow=saturate")) co.overflow_saturate = true;
+        else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
+        else if (!strcmp(a, "--format=agent-json")) json = true;
+        else if (!strcmp(a, "--format=human")) json = false;
+        else if (!strncmp(a, "--std=", 6)) std_dir = a + 6;
+        else if (!strncmp(a, "--cpu=", 6)) co.cpu = a + 6;
+        else if (!strncmp(a, "--link=", 7)) vec_push(link_inputs, (char *)a + 7);
+        else if (a[0] == '-') {
+            diag_emit_fatal(json, "E9001", arena_printf("unknown option '%s'", a));
+            return 2;
+        } else if (!input) input = a;
+        else {
+            diag_emit_fatal(json, "E9001", arena_printf("unexpected argument '%s'", a));
+            return 2;
+        }
+    }
+    if (!input) {
+        diag_emit_fatal(json, "E9001", "no input file");
+        return 2;
+    }
+    if (!strcmp(target, "wasm32") || !strcmp(target, "wasm32-freestanding")) {
+        g_target = (Target){32, true, "wasm32-unknown-unknown"};
+    } else if (!strcmp(target, "wasm64") || !strcmp(target, "wasm64-freestanding")) {
+        g_target = (Target){64, true, "wasm64-unknown-unknown"};
+    } else if (!strcmp(target, "native")) {
+        g_target = (Target){64, false, NULL};
+        g_target.triple = LLVMGetDefaultTargetTriple_wrapper();
+    } else {
+        diag_emit_fatal(json, "E9002", arena_printf("unknown target '%s' (expected wasm32, wasm64 or native)", target));
+        return 2;
+    }
+    if (!file_exists(input)) {
+        diag_emit_fatal(json, "E0211", arena_printf("cannot read '%s'", input));
+        return 2;
+    }
+    types_init();
+    SemaOptions so = {.std_dir = std_dir ? std_dir : find_std(argv[0])};
+    bool ok = sema_run(input, &so);
+    if (!ok || !build) {
+        diag_emit(json, json ? stdout : stderr);
+        return ok ? 0 : 1;
+    }
+
+    // Decide output kind.
+    bool final_link = !strcmp(emit, "exe");
+    if (!strcmp(emit, "obj")) co.emit = EMIT_OBJ;
+    else if (!strcmp(emit, "llvm")) co.emit = EMIT_LLVM;
+    else if (!strcmp(emit, "asm")) co.emit = EMIT_ASM;
+    else if (final_link) co.emit = EMIT_OBJ;
+    else {
+        diag_emit_fatal(json, "E9001", arena_printf("unknown --emit kind '%s'", emit));
+        return 2;
+    }
+    if (!out) {
+        const char *base = strrchr(input, '/');
+        base = base ? base + 1 : input;
+        size_t n = strlen(base);
+        if (n > 3 && !strcmp(base + n - 3, ".ph")) n -= 3;
+        const char *ext = co.emit == EMIT_LLVM ? ".ll" : co.emit == EMIT_ASM ? ".s" : !final_link ? ".o"
+                          : g_target.wasm ? ".wasm" : "";
+        out = arena_printf("%.*s%s", (int)n, base, ext);
+    }
+    char objpath[PATH_MAX];
+    if (final_link) {
+        snprintf(objpath, sizeof objpath, "%s.tmp%d.o", out, (int)getpid());
+        co.out_path = objpath;
+    } else {
+        co.out_path = out;
+    }
+    if (!codegen_program(&co)) {
+        diag_emit(json, json ? stdout : stderr);
+        if (final_link) unlink(objpath);
+        return 1;
+    }
+    if (final_link) {
+        int rc;
+        if (g_target.wasm) {
+            const char *names[] = {"wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld", NULL};
+            const char *ld = find_tool(names);
+            if (!ld) {
+                unlink(objpath);
+                diag_emit_fatal(json, "E9003", "cannot find wasm-ld (install lld)");
+                return 2;
+            }
+            Vec(char *) av = {0};
+            vec_push(av, (char *)ld);
+            if (!strcmp(ld, "rust-lld")) {
+                vec_push(av, "-flavor");
+                vec_push(av, "wasm");
+            }
+            vec_push(av, "--no-entry");
+            vec_push(av, "--stack-first");
+            vec_push(av, "-z");
+            vec_push(av, "stack-size=1048576");
+            vec_push(av, "--export-memory");
+            for (int i = 0; i < g_export_names.len; i++) vec_push(av, arena_printf("--export=%s", g_export_names.data[i]));
+            vec_push(av, objpath);
+            for (int i = 0; i < link_inputs.len; i++) vec_push(av, link_inputs.data[i]);
+            vec_push(av, "-o");
+            vec_push(av, (char *)out);
+            vec_push(av, NULL);
+            rc = run(av.data);
+        } else {
+            const char *names[] = {"cc", "clang", "gcc", NULL};
+            const char *cc = find_tool(names);
+            if (!cc) {
+                unlink(objpath);
+                diag_emit_fatal(json, "E9003", "cannot find a C compiler to link with");
+                return 2;
+            }
+            Vec(char *) av = {0};
+            vec_push(av, (char *)cc);
+            vec_push(av, objpath);
+            for (int i = 0; i < link_inputs.len; i++) vec_push(av, link_inputs.data[i]);
+            vec_push(av, "-o");
+            vec_push(av, (char *)out);
+            vec_push(av, "-lm");
+            vec_push(av, NULL);
+            rc = run(av.data);
+        }
+        unlink(objpath);
+        if (rc != 0) {
+            diag_emit_fatal(json, "E9004", "linking failed");
+            return 1;
+        }
+    }
+    diag_emit(json, json ? stdout : stderr);
+    return 0;
+}
