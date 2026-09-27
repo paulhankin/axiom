@@ -34,6 +34,7 @@ let mut AVX: bool = false;
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
+let mut IB: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // the IR block being selected
 let mut nlocal: i32 = 0;
 let mut out_area: u64 = 0;   // outgoing stack-argument bytes
 
@@ -496,7 +497,15 @@ fn gen_alu(v: *mut ir.Value) void {
     copy(d, ra, GPR);
     hint(d, ra);
     if o == ir.OP_MUL {
-        if imm_ok(b) {
+        let k = cval(b);
+        if imm_ok(b) and (k > 1) and ((k & (k - 1)) == 0) {
+            let mut n: i64 = 0;
+            while (@as(i64, 1) << @int_cast(u32, n)) < k {
+                n += 1;
+            }
+            let i = e3(xe.SHIFT, sz, RW(d), NONE(), I(n));
+            i.cc = 4;  // shl
+        } else if imm_ok(b) {
             let i = e3(xe.IMUL_I, sz, W(d), R(d), I(cval(b)));
             _ = i;
         } else {
@@ -782,6 +791,15 @@ fn cond_code(c: *mut ir.Value) i32 {
         }
         return float_compare(c);
     }
+    // a comparison in this block that other instructions use too: compare
+    // again rather than test its materialized result
+    if (c.kind == ir.V_INST) and (c.blk == IB) and ((c.op == ir.OP_ICMP) or (c.op == ir.OP_FCMP)) and
+       (c.a.ty.kind != ir.T_VEC) {
+        if c.op == ir.OP_ICMP {
+            return int_compare(c);
+        }
+        return float_compare(c);
+    }
     let r = reg(c);
     _ = e2(xe.TEST, 4, R(r), R(r));
     return xe.CC_NE;
@@ -874,6 +892,10 @@ fn gen_cast(v: *mut ir.Value) void {
         let r = reg(v.a);
         let fb = from.bits;
         let to64 = to.bits > 32;
+        if not sg and is_inst(v.a, ir.OP_LOAD) and (fb >= 8) and (fb <= 16) {
+            copy(d, r, GPR);  // byte and halfword loads zero-extend
+            return;
+        }
         if fb == 32 {
             let i = e2(xe.EXT, u.pick(sg, "\x08", "\x04")[0], W(d), R(r));
             i.cc = ext_kind(32, sg);
@@ -3197,6 +3219,7 @@ fn compile_func(f: *mut ir.Func) void {
     }
     for bi in 0..order.len {
         let ib = order.get(bi);
+        IB = ib;
         CB = MF.blocks.get(bi);
         let mut i = ib.first;
         while u.notnil(i) {
