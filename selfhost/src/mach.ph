@@ -359,20 +359,59 @@ struct Range {
 }
 
 let mut fixed: [64]u.List.[Range] = [u.List.[Range].{ data: @ptr_from_int(*mut Range, 0), len: 0, cap: 0 }; 64];
+// after build_fixed: each register's ranges sorted by start, and the
+// largest end among the first k+1 of them
+let mut fixed_maxe: [64]u.List.[i32] = [u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 }; 64];
 
 fn add_fixed(r: i32, s: i32, e: i32) void {
     fixed[@int_cast(usize, r)].push(Range.{ s: s, e: e });
 }
 
-fn fixed_conflict(r: i32, s: i32, e: i32) bool {
-    let l = &fixed[@int_cast(usize, r)];
-    for k in 0..l.len {
-        let x = l.get(k);
-        if (x.s <= e) and (s <= x.e) {
-            return true;
+fn range_before(a: Range, b: Range) i32 {
+    if a.s < b.s {
+        return -1;
+    }
+    if a.s > b.s {
+        return 1;
+    }
+    return 0;
+}
+
+fn sort_fixed() void {
+    for r in @as(usize, 0)..64 {
+        let l = &mut fixed[r];
+        u.sort.[Range](l.items(), range_before);
+        let m = &mut fixed_maxe[r];
+        m.clear();
+        let mut mx: i32 = -1;
+        for k in 0..l.len {
+            let x = l.get(k);
+            if x.e > mx {
+                mx = x.e;
+            }
+            m.push(mx);
         }
     }
-    return false;
+}
+
+// Does a fixed range of r overlap [s, e]?
+fn fixed_conflict(r: i32, s: i32, e: i32) bool {
+    let l = &fixed[@int_cast(usize, r)];
+    // the ranges starting at or before e: a prefix
+    let mut lo: usize = 0;
+    let mut hi = l.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if l.get(mid).s <= e {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return false;
+    }
+    return fixed_maxe[@int_cast(usize, r)].get(lo - 1) >= s;
 }
 
 fn build_fixed(f: *mut MFunc) void {
@@ -441,6 +480,7 @@ fn build_fixed(f: *mut MFunc) void {
             }
         }
     }
+    sort_fixed();
 }
 
 struct Interval {
@@ -457,23 +497,26 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
     for k in 0..nv {
         iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false };
     }
+    let w = words(nv);
     for bi in 0..f.blocks.len {
         let b = f.blocks.get(bi);
-        for k in 0..nv {
-            if bget(b.live_in, k) {
-                if b.start < iv[k].s {
-                    iv[k].s = b.start;
-                }
-                if b.start > iv[k].e {
-                    iv[k].e = b.start;
-                }
+        for j in 0..w {
+            let li = b.live_in[j];
+            let lo = b.live_out[j];
+            if (li | lo) == 0 {
+                continue;
             }
-            if bget(b.live_out, k) {
-                if b.end > iv[k].e {
-                    iv[k].e = b.end;
+            for bit in @as(usize, 0)..64 {
+                let m = @as(u64, 1) << @int_cast(u32, bit);
+                if ((li | lo) & m) == 0 {
+                    continue;
                 }
-                if b.end < iv[k].s {
-                    iv[k].s = b.end;
+                let k = (j * 64) + bit;
+                if (li & m) != 0 {
+                    extend(&mut iv[k], b.start);
+                }
+                if (lo & m) != 0 {
+                    extend(&mut iv[k], b.end);
                 }
             }
         }

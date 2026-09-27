@@ -560,6 +560,8 @@ pub struct Global {
     is_const: bool,
     tls: bool,
     wasm_global: bool,  // a wasm global (per instance) instead of memory
+    noalias: bool,      // compiler-managed: only accessed by name, never through
+                        // a pointer the program computes (the shadow stack)
     val: *mut Value,
     id: i32,
     aux: i64,

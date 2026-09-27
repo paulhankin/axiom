@@ -741,6 +741,7 @@ fn ss_globals() void {
         if ty.g_target.is_wasm {
             ss_main = shared_global(t, "phalange.ss.main", ir.czero(t), 0);
             set_align(ss_main, 8);
+            ss_main.gv.noalias = true;
             // null means the main thread's record (wasm-ld does not relocate
             // wasm global initializers); thread starts set their own.
             ss_global = shared_global(T_ptr, "phalange.ss", ir.czero(T_ptr), 1);
@@ -749,6 +750,7 @@ fn ss_globals() void {
             ss_global.gv.tls = true;
             set_align(ss_global, 8);
         }
+        ss_global.gv.noalias = true;
     }
 }
 

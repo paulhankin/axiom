@@ -17,8 +17,9 @@
 //
 // Alias analysis: a pointer is a base plus a constant offset; the object
 // under a chain of ptradds is identified when it is an alloca or a global.
-// Distinct identified objects never alias, and an alloca whose address never
-// escapes is not written by calls.
+// Distinct identified objects never alias, an alloca whose address never
+// escapes is not written by calls, and no computed pointer reaches a noalias
+// global (the shadow stack).
 // =============================================================================
 import "util.ph" as u;
 import "ir.ph" as ir;
@@ -253,8 +254,16 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     let mut obj = vnil();
     if is_obj(p) {
         obj = p;
+    } else if is_inst(p, ir.OP_SELECT) and noalias_global(p.b) {
+        // wasm: the thread's shadow stack record, or the main thread's
+        obj = p.b;
     }
     return Loc.{ base: base, obj: obj, off: off, size: size };
+}
+
+// Memory the program can only reach by the global's name (the shadow stack).
+fn noalias_global(o: *ir.Value) bool {
+    return u.notnil(o) and (o.kind == ir.V_GLOBAL) and o.gv.noalias;
 }
 
 // An alloca whose address is not visible to calls (aux2 == 1 after escapes()).
@@ -283,6 +292,9 @@ fn may_alias(x: *Loc, w: *Write) bool {
         return false;
     }
     if (private_obj(x.obj) and (w.obj != x.obj)) or (private_obj(w.obj) and (x.obj != w.obj)) {
+        return false;
+    }
+    if (noalias_global(x.obj) and (w.obj != x.obj)) or (noalias_global(w.obj) and (x.obj != w.obj)) {
         return false;
     }
     return true;
@@ -747,4 +759,145 @@ pub fn gvn(f: *mut ir.Func) bool {
     u.free(@ptr_cast(*mut void, order.data));
     ir.apply_forwarding(f);
     return changed;
+}
+
+// -----------------------------------------------------------------------------
+// Dead store elimination (within blocks): a store to memory that is written
+// again later in the block, with nothing in between that may read it, is
+// deleted; so is a store to a private alloca that nothing reads before the
+// function returns.
+// -----------------------------------------------------------------------------
+fn loc_write(l: *Loc) Write {
+    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size };
+}
+
+// Is a covered by b (both exact)?
+fn covers(b: *Loc, a: *Loc) bool {
+    return (a.base == b.base) and (a.size >= 0) and (b.size >= 0) and (a.off >= b.off) and ((a.off + a.size) <= (b.off + b.size));
+}
+
+// Removes the killed locations that the read of r may observe.
+fn read_loc(killed: *mut u.List.[Loc], r: *Loc) void {
+    let w = loc_write(r);
+    let mut k: usize = 0;
+    while k < killed.len {
+        if may_alias(killed.at(k), &w) {
+            killed.set(k, killed.get(killed.len - 1));
+            killed.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+}
+
+// Keeps only the locations in private allocas (a call or return reads the rest).
+fn read_nonprivate(killed: *mut u.List.[Loc]) void {
+    let mut k: usize = 0;
+    while k < killed.len {
+        if not private_obj(killed.get(k).obj) {
+            killed.set(k, killed.get(killed.len - 1));
+            killed.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+}
+
+fn has_obj(xs: *u.List.[*mut ir.Value], o: *mut ir.Value) bool {
+    for k in 0..xs.len {
+        if xs.get(k) == o {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List.[*mut ir.Value]) bool {
+    killed.clear();
+    read_objs.clear();
+    let mut any = false;
+    let t = ir.terminator(b);
+    // at a return, private allocas are dead unless read later in the block
+    let mut at_ret = u.notnil(t) and (t.op == ir.OP_RET);
+    let mut i = b.last;
+    while u.notnil(i) {
+        let prev = i.prev;
+        let op = i.op;
+        if op == ir.OP_STORE {
+            if i.flags != 0 {
+                killed.clear();
+                at_ret = false;
+            } else {
+                let l = loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+                let mut dead = at_ret and private_obj(l.obj) and not has_obj(read_objs, l.obj);
+                for k in 0..killed.len {
+                    if covers(killed.at(k), &l) {
+                        dead = true;
+                    }
+                }
+                if dead {
+                    ir.remove_inst(i);
+                    any = true;
+                } else if (killed.len < 32) and (l.size >= 0) {
+                    killed.push(l);
+                }
+            }
+        } else if op == ir.OP_LOAD {
+            if i.flags != 0 {
+                killed.clear();
+                at_ret = false;
+            } else {
+                let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+                read_loc(killed, &l);
+                if u.notnil(l.obj) {
+                    read_objs.push(l.obj);
+                }
+            }
+        } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+            let s = loc_of(i.b, size_of(i.c));
+            read_loc(killed, &s);
+            if u.notnil(s.obj) {
+                read_objs.push(s.obj);
+            }
+            let d = loc_of(i.a, size_of(i.c));
+            if (killed.len < 32) and (d.size >= 0) {
+                killed.push(d);
+            }
+        } else if op == ir.OP_MEMSET {
+            let d = loc_of(i.a, size_of(i.c));
+            if (killed.len < 32) and (d.size >= 0) {
+                killed.push(d);
+            }
+        } else if (op == ir.OP_CALL) or (op == ir.OP_RET) {
+            read_nonprivate(killed);
+        } else if (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
+            killed.clear();
+            at_ret = false;
+        } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
+            killed.clear();
+            at_ret = false;
+        }
+        i = prev;
+    }
+    return any;
+}
+
+pub fn dse(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    escapes(f);
+    let mut killed = u.List.[Loc].{ data: u.nil.[Loc](), len: 0, cap: 0 };
+    let mut read_objs = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        if dse_block(b, &mut killed, &mut read_objs) {
+            any = true;
+        }
+        b = b.next;
+    }
+    u.free(@ptr_cast(*mut void, killed.data));
+    u.free(@ptr_cast(*mut void, read_objs.data));
+    return any;
 }
