@@ -3833,6 +3833,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         if al == 0 {
             al = 1;
         }
+        if al > s.align {
+            s.align = al;  // the section is at least as aligned as its contents
+        }
         let mut off: u64 = 0;
         if (sec == bss) or (sec == tbss) {
             s.size = (s.size + al - 1) & ~(al - 1);

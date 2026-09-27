@@ -21,6 +21,10 @@ const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const compiler = path.resolve(process.env.PHALANGE || path.join(root, 'compiler/build/phalange'));
 const argv = process.argv.slice(2);
 const native = argv.includes('--native');
+// Cross testing: PHALANGE_NATIVE_TARGET=aarch64 PHALANGE_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+const nativeTarget = `--target=${process.env.PHALANGE_NATIVE_TARGET || 'native'}`;
+const execWrap = (process.env.PHALANGE_NATIVE_EXEC || '').split(' ').filter((x) => x);
+const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phalange-tests-'));
@@ -83,7 +87,7 @@ async function runWasm(file) {
 }
 
 function runNative(exe) {
-  const r = spawnSync(exe, [], { encoding: 'utf8' });
+  const r = spawnExe(exe, [], { encoding: 'utf8' });
   const out = r.stdout.split('\n');
   if (out[out.length - 1] === '') out.pop();
   return { out, trapped: r.status !== 0, msg: r.signal || `exit ${r.status}` };
@@ -98,7 +102,7 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   if ((native && d.wasmOnly) || (!native && d.nativeOnly)) { skip++; continue; }
   const out = path.join(tmp, path.basename(f, '.ph') + (native ? '' : '.wasm'));
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
-  if (native) args.push('--target=native', `--link=${path.join(root, 'tests/native_rt.c')}`);
+  if (native) args.push(nativeTarget, `--link=${path.join(root, 'tests/native_rt.c')}`);
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
   if (d.header) args.push(`--emit-header=${path.join(tmp, d.header)}`);
   const t0 = process.hrtime.bigint();
@@ -125,7 +129,7 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
 }
 // `phalange test`: the standard library's own tests must pass, and the
 // self-tests in tests/testing/ must produce exactly the declared results.
-const testTargets = native ? ['--target=native'] : [];
+const testTargets = native ? [nativeTarget] : [];
 const stdFiles = files(path.join(root, 'std')).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
 for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const name = path.relative(root, f) + ' [phalange test]';
@@ -183,10 +187,10 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const cname = 'tests/traces/crash.ph [crash report]';
   if (!filter || cname.includes(filter)) {
     const out = path.join(tmp, 'crash' + (native ? '' : '.wasm'));
-    const b = spawnSync(compiler, ['build', path.join(root, 'tests/traces/crash.ph'), '-o', out, ...(native ? ['--target=native'] : []), ...extraFlags], { encoding: 'utf8' });
+    const b = spawnSync(compiler, ['build', path.join(root, 'tests/traces/crash.ph'), '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags], { encoding: 'utf8' });
     let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
     if (!problem) {
-      const r = native ? spawnSync(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
       const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \(tests\/traces\/crash\.ph:4:12\)/,
         /the frame above repeats 255 more times/, /\.\.\. \d+ more frames/];
       for (const w of want) if (!w.test(r.stderr)) { problem = `stderr lacks ${w}:\n${r.stderr}`; break; }
@@ -243,11 +247,11 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
     for (const [what, edit, ok] of steps) {
       edit();
       const c = spawnSync(compiler, ['build', path.join(dir, 'main.ph'), '-o', out, '--verbose', '--units=module',
-        ...(native ? ['--target=native'] : [])], { encoding: 'utf8', env });
+        ...(native ? [nativeTarget] : [])], { encoding: 'utf8', env });
       const m = /(\d+) modules, (\d+) compiled/.exec(c.stderr);
       if (c.status !== 0 || !m) { problem = `${what}: build failed:\n${c.stdout}${c.stderr}`; break; }
       if (!ok(Number(m[2]), Number(m[1]))) { problem = `${what}: ${m[0]}`; break; }
-      const r = native ? spawnSync(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
       if (r.stdout.trim() !== want) { problem = `${what}: output\n${r.stdout}${r.stderr}`; break; }
     }
     if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
@@ -263,7 +267,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const ph = (args, cwd) => spawnSync(compiler, [...args, ...extraFlags], { encoding: 'utf8', cwd: cwd || root, env });
   const git = (args, cwd) => spawnSync('git', args, { encoding: 'utf8', cwd,
     env: { ...env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
-  const tgt = native ? ['--target=native'] : [];
+  const tgt = native ? [nativeTarget] : [];
   async function buildRun(dir, cwd) {
     const out = path.join(tmp, 'pkg-' + path.basename(dir) + (native ? '' : '.wasm'));
     const c = ph(['build', dir, '--format=agent-json', '-o', out, ...tgt], cwd);

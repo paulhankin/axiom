@@ -10,6 +10,7 @@ import "opt.ph" as opt;
 import "wasm.ph" as wa;
 import "wobj.ph" as wo;
 import "x64.ph" as x64;
+import "a64.ph" as a64;
 import "elf.ph" as elf;
 
 pub const EMIT_OBJ: i32 = 0;
@@ -27,6 +28,10 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
                 opt.optimize(f, opt_level);
             }
         }
+    }
+    let dump = u.env("PHALANGE_DUMP_IR");  // debugging: the optimized IR of every compilation
+    if not u.isnos(dump) {
+        _ = u.write_file(dump, ir.module_str(m));
     }
     if emit == EMIT_IR {
         if not u.write_file(path, ir.module_str(m)) {
@@ -48,6 +53,17 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
     }
     if tg.g_arch == tg.ARCH_X64 {
         let o = x64.compile(m);
+        if u.isnil(o) {
+            return false;
+        }
+        if not u.write_file(path, elf.write(o)) {
+            u.eprint(u.f1("phalange: cannot write %s\n", path));
+            return false;
+        }
+        return true;
+    }
+    if tg.g_arch == tg.ARCH_A64 {
+        let o = a64.compile(m);
         if u.isnil(o) {
             return false;
         }

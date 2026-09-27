@@ -145,12 +145,17 @@ pub fn feature_string() []u8 {
 }
 
 // The architecture this compiler runs on (from its own ELF header).
+let mut host_arch_: i32 = 0;
+
 pub fn host_arch() i32 {
-    let exe = u.read_file("/proc/self/exe");
-    if not u.isnos(exe) and (exe.len > 20) and (exe[18] == 183) {
-        return ARCH_A64;
+    if host_arch_ == 0 {
+        host_arch_ = ARCH_X64;
+        let exe = u.read_file("/proc/self/exe");
+        if not u.isnos(exe) and (exe.len > 20) and (exe[18] == 183) {
+            host_arch_ = ARCH_A64;
+        }
     }
-    return ARCH_X64;
+    return host_arch_;
 }
 
 pub fn host_triple() []u8 {

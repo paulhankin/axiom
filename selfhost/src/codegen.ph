@@ -706,6 +706,11 @@ fn stack_traces_on() bool {
     return u.notnil(O) and O.stack_traces and not (u.notnil(F) and F.no_trace);
 }
 
+// Stack traces in the program (shared helpers, globals and exports).
+fn program_traces() bool {
+    return u.notnil(O) and O.stack_traces;
+}
+
 // The native runtime (runtime/*.ph) reports stack traces; it is not part of
 // them.
 fn is_runtime_module(m: *ast.Module) bool {
@@ -931,7 +936,7 @@ fn call_trap_site(site: *mut ir.Value) void {
             condbr(has, call_bb, done_bb);
             at_end(call_bb);
             let mut ssv = ir.czero(T_ptr);
-            if stack_traces_on() {
+            if program_traces() {
                 ssv = ss_ptr();
             }
             let mut args: [3]*mut ir.Value = [sp, trap_info_global(), ssv];
@@ -3027,7 +3032,7 @@ fn emit_thread_start() void {
     let saved = ir.insert_block(B);
     at_end(bb);
     let mut top = param(f, 2);
-    if stack_traces_on() {
+    if program_traces() {
         // The thread's shadow stack sits at the top of its stack.
         let t = ss_type();
         let size = (t.size + 15) & ~@as(u64, 15);
@@ -4395,7 +4400,7 @@ fn add_export(name: []u8, ret: *mut ir.Ty, ps: []mut *mut ir.Ty) *mut ir.Value {
 // ss_ptr), or null when built with --stack-traces=off.
 fn emit_shadow_stack_export() void {
     _ = add_export("phalange_shadow_stack", T_ptr, no_tys());
-    if stack_traces_on() {
+    if program_traces() {
         ir.ret(B, ss_ptr());
     } else {
         ir.ret(B, ir.czero(T_ptr));
@@ -4585,7 +4590,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
             g.gv.is_const = true;
         }
         _ = error_name_fn();
-        if stack_traces_on() {
+        if program_traces() {
             ss_globals();
         }
         _ = trap_info_global();

@@ -358,8 +358,33 @@ fn print_frames_json(fr: *u.List.[TFrame]) void {
     u.print("]");
 }
 
+// Native programs for another architecture run under qemu's user mode
+// emulation (with the target's libraries from /usr/<triple>).
+fn push_emulator(av: *mut u.List.[[]u8]) void {
+    if ty.g_target.is_wasm or (tg.g_arch == tg.host_arch()) {
+        return;
+    }
+    let mut name: []u8 = "qemu-x86_64";
+    let mut root: []u8 = "/usr/x86_64-linux-gnu";
+    if tg.g_arch == tg.ARCH_A64 {
+        name = "qemu-aarch64";
+        root = "/usr/aarch64-linux-gnu";
+    }
+    let names = [name];
+    let q = find_tool(names[..]);
+    if u.isnos(q) {
+        return;
+    }
+    av.push(q);
+    if u.is_dir(root) {
+        av.push("-L");
+        av.push(root);
+    }
+}
+
 fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool) i32 {
     let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    push_emulator(&mut av);
     if ty.g_target.is_wasm {
         let names = ["node"];
         let node = find_tool(names[..]);
@@ -609,6 +634,7 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
         av.push(u.f1("--profile=%s", raw));
         av.push(u.f1("--profile-hz=%s", u.idec(hz)));
     } else {
+        push_emulator(&mut av);
         env.push(u.f1("PHALANGE_PROFILE=%s", raw));
         env.push(u.f1("PHALANGE_PROFILE_HZ=%s", u.idec(hz)));
     }
@@ -1394,7 +1420,15 @@ fn driver(args: [][]u8) i32 {
                 _ = u.unlink(u.cz(c_objs.get(k)));
             }
         } else {
-            let names = ["cc", "clang", "gcc"];
+            let mut names = ["cc", "clang", "gcc"];
+            if tg.g_arch != tg.host_arch() {
+                // a cross compiler for the target
+                if tg.g_arch == tg.ARCH_A64 {
+                    names = ["aarch64-linux-gnu-gcc", "aarch64-linux-gnu-cc", "aarch64-linux-gnu-gcc-13"];
+                } else {
+                    names = ["x86_64-linux-gnu-gcc", "x86_64-linux-gnu-cc", "x86_64-linux-gnu-gcc-13"];
+                }
+            }
             let cc = find_tool(names[..]);
             if u.isnos(cc) {
                 _ = u.unlink(u.cz(objpath));
