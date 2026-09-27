@@ -1289,3 +1289,206 @@ pub fn dse(f: *mut ir.Func) bool {
     u.free(@ptr_cast(*mut void, read_objs.data));
     return any;
 }
+
+// -----------------------------------------------------------------------------
+// Shadow stack pushes and pops across blocks. Every call leaves the depth as
+// it found it (it restores what it pushed), and slots at or above the depth
+// are never read. So:
+//   - a push (a call-site slot store, or a depth store) is dead when every
+//     path from it overwrites what it wrote (a slot: the depth its index came
+//     from is stored back; the depth: another depth store) before a call, a
+//     trap or a load of the shadow stack (for the depth also a return);
+//   - storing V to the depth is redundant when on every path back to it the
+//     last depth store stored V too, or V is the value the depth was loaded
+//     as, with only calls in between.
+// (Profiling builds make these stores volatile: they are left alone.)
+// -----------------------------------------------------------------------------
+fn ss_store_field(i: *ir.Value) i32 {
+    if (i.op != ir.OP_STORE) or (i.flags != 0) {
+        return -1;
+    }
+    let l = loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+    return ss_field(&l);
+}
+
+// Does i read the shadow stack (for the depth: returns too)?
+fn ss_reader(i: *mut ir.Value, depth: bool) bool {
+    let op = i.op;
+    if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
+        return true;
+    }
+    if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
+        return true;
+    }
+    if (op == ir.OP_RET) and depth {
+        return true;
+    }
+    if (op == ir.OP_STORE) and (i.flags != 0) {
+        return true;
+    }
+    if op == ir.OP_LOAD {
+        if i.flags != 0 {
+            return true;
+        }
+        let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+        return noalias_global(l.obj);
+    }
+    if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+        let l = loc_of(i.b, size_of(i.c));
+        return noalias_global(l.obj);
+    }
+    return false;
+}
+
+let mut ss_work: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut ss_one: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut ss_mark: i64 = 0;
+
+// Is the push store s dead (see above)? Forward over the paths from s.
+fn push_dead(s: *mut ir.Value, slot: bool) bool {
+    ss_mark += 1;
+    ss_work.clear();
+    ss_work.push(s.next);  // where to scan from
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let mut i = ss_work.pop();
+        loop {
+            if ss_store_field(i) == 0 {
+                // a depth store overwrites a depth push; a slot dies with the
+                // store of the depth its index came from
+                if not slot {
+                    break;
+                }
+                ss_one.clear();
+                ss_one.push(i.a);
+                if uses_any(s.b, &ss_one, 0) {
+                    break;
+                }
+            } else if ss_reader(i, not slot) {
+                return false;
+            } else if i.op == ir.OP_RET {
+                break;  // slots end with the function
+            }
+            if ir.is_term(i.op) {
+                for k in 0..ir.succ_count(i) {
+                    let sb = ir.succ(i, k);
+                    if sb.mark != ss_mark {
+                        sb.mark = ss_mark;
+                        blocks += 1;
+                        if u.isnil(sb.first) or (blocks > 64) {
+                            return false;
+                        }
+                        ss_work.push(sb.first);
+                    }
+                }
+                break;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// Is storing s.a to the depth redundant (see above)? Backward over the paths
+// to s: every path must reach a depth store of the same value, or the load
+// that produced it, with no other depth store on the way.
+fn restore_redundant(s: *mut ir.Value) bool {
+    let v = s.a;
+    ss_mark += 1;
+    ss_work.clear();
+    ss_work.push(s);  // scan backwards from before it
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let from = ss_work.pop();
+        let mut i = from.prev;
+        let b = from.blk;
+        let mut found = false;
+        while u.notnil(i) and not found {
+            if i == v {
+                // the load v (of the depth, when it is one) is the start
+                if (v.op == ir.OP_LOAD) and (v.flags == 0) {
+                    let l = loc_of(v.a, 4);
+                    if ss_field(&l) == 0 {
+                        found = true;
+                        continue;
+                    }
+                }
+                return false;
+            }
+            if ss_store_field(i) == 0 {
+                if i.a != v {
+                    return false;
+                }
+                found = true;
+                continue;
+            }
+            if (i.op == ir.OP_STORE) and (i.flags != 0) {
+                return false;  // profiling
+            }
+            i = i.prev;
+        }
+        if found {
+            continue;
+        }
+        // the start of b: every predecessor's end
+        if b.preds.len == 0 {
+            return false;  // the function's entry
+        }
+        for k in 0..b.preds.len {
+            let p = b.preds.get(k);
+            if p.mark != ss_mark {
+                p.mark = ss_mark;
+                blocks += 1;
+                if blocks > 64 {
+                    return false;
+                }
+                let t = ir.terminator(p);
+                if u.isnil(t) {
+                    return false;
+                }
+                ss_work.push(t);
+            }
+        }
+    }
+    return true;
+}
+
+// True if anything changed.
+pub fn ss_opt(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    opt.compute_preds(f);
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            let sf = ss_store_field(i);
+            if (sf == 2) and push_dead(i, true) {
+                ir.remove_inst(i);
+                any = true;
+            } else if (sf == 0) and push_dead(i, false) {
+                ir.remove_inst(i);
+                any = true;
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if (ss_store_field(i) == 0) and restore_redundant(i) {
+                ir.remove_inst(i);
+                any = true;
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    return any;
+}

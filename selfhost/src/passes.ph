@@ -54,6 +54,9 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
             _ = gvn.gvn(f);
             cleanup(f, level);
         }
+        if gvn.ss_opt(f) {
+            cleanup(f, level);
+        }
     }
     opt.dce(f);
 }
