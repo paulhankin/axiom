@@ -1779,6 +1779,9 @@ fn gen_call(v: *mut ir.Value) void {
     }
     let ci = emit(xe.CALL, 0, ops.items());
     ci.clobber = caller_saved();
+    if (v.a.kind == ir.V_FUNC) and v.a.fnp.noreturn {
+        ci.clobber = 0;  // nothing is live after it
+    }
     MF.has_calls = true;
     if has_ret {
         let d = vreg(v);
@@ -3115,6 +3118,13 @@ fn mk4(a: mc.MOp, b: mc.MOp, c: mc.MOp, d: mc.MOp) [4]mc.MOp {
     return [a, b, c, d];
 }
 
+// Instructions whose only effect is their register result (for mc.dce;
+// not loads: a volatile load must happen).
+fn pure_inst(i: *mc.MInst) bool {
+    let op = i.op;
+    return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.IMUL_I);
+}
+
 fn compile_func(f: *mut ir.Func) void {
     F = f;
     nlocal = 0;
@@ -3124,6 +3134,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
+    opt.layout(&mut order);
     prepare(f);
     MF = mc.new_func();
     for i in 0..order.len {
@@ -3206,6 +3217,7 @@ fn compile_func(f: *mut ir.Func) void {
     }
     let tgt = mc.Target.{ nclasses: 2, alloc_order: [gpr_order[..], xmm_order[..]], caller_saved: caller_saved(),
                           spill_load: spill_load, spill_store: spill_store };
+    mc.dce(MF, pure_inst);
     mc.allocate(MF, &tgt);
     encode_func(f);
 }

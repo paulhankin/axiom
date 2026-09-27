@@ -866,3 +866,90 @@ pub fn phys(f: *MFunc, r: i32) i32 {
     }
     return r;
 }
+
+// -----------------------------------------------------------------------------
+// Dead instructions: `pure` instructions (no effect but their register
+// results, no flags anything reads) whose virtual register results are never
+// read are deleted, repeatedly (address arithmetic folded into memory
+// operands leaves such chains behind).
+// -----------------------------------------------------------------------------
+fn reads_of(i: *MInst, v: i32) i32 {
+    let mut n: i32 = 0;
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and (o.reg == v) and ((o.role & RU) != 0) {
+            n += 1;
+        }
+        if o.kind == K_MEM {
+            if o.base == v {
+                n += 1;
+            }
+            if o.index == v {
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+fn count_reads(i: *MInst, cnt: []mut i32, delta: i32) void {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RU) != 0) {
+            cnt[@int_cast(usize, o.reg - VREG0)] += delta;
+        }
+        if o.kind == K_MEM {
+            if is_vreg(o.base) {
+                cnt[@int_cast(usize, o.base - VREG0)] += delta;
+            }
+            if is_vreg(o.index) {
+                cnt[@int_cast(usize, o.index - VREG0)] += delta;
+            }
+        }
+    }
+}
+
+fn dead(i: *MInst, cnt: []mut i32) bool {
+    let mut defs: i32 = 0;
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and ((o.role & RD) != 0) {
+            if not is_vreg(o.reg) {
+                return false;  // a physical register (an argument, say)
+            }
+            if (cnt[@int_cast(usize, o.reg - VREG0)] - reads_of(i, o.reg)) != 0 {
+                return false;
+            }
+            defs += 1;
+        }
+    }
+    return defs > 0;
+}
+
+pub fn dce(f: *mut MFunc, pure: fn(*MInst) bool) void {
+    let cnt = u.newn.[i32](nvregs(f) + 1);
+    for bi in 0..f.blocks.len {
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            count_reads(i, cnt, 1);
+            i = i.next;
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in 0..f.blocks.len {
+            let b = f.blocks.get(bi);
+            let mut i = b.last;
+            while u.notnil(i) {
+                let prev = i.prev;
+                if pure(i) and dead(i, cnt) {
+                    count_reads(i, cnt, -1);
+                    remove(b, i);
+                    changed = true;
+                }
+                i = prev;
+            }
+        }
+    }
+}

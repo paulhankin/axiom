@@ -885,6 +885,31 @@ pub fn optimize(f: *mut ir.Func, level: i32) void {
     dce(f);
 }
 
+// The layout order for code generation: reverse postorder with the blocks
+// that end in `unreachable` (trap paths) moved to the end, out of the way of
+// the hot code. Sets b.rpo to the new positions.
+pub fn layout(order: *mut u.List.[*mut ir.Block]) void {
+    let mut cold = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let mut n: usize = 0;
+    for i in 0..order.len {
+        let b = order.get(i);
+        let t = ir.terminator(b);
+        if (i > 0) and u.notnil(t) and (t.op == ir.OP_UNREACHABLE) {
+            cold.push(b);
+        } else {
+            order.set(n, b);
+            n += 1;
+        }
+    }
+    for k in 0..cold.len {
+        order.set(n + k, cold.get(k));
+    }
+    for i in 0..order.len {
+        order.get(i).rpo = @int_cast(i32, i);
+    }
+    u.free(@ptr_cast(*mut void, cold.data));
+}
+
 // Splits edges from blocks with several successors to blocks with phis and
 // several predecessors, so phi copies can go at the end of the source.
 pub fn split_critical_edges(f: *mut ir.Func) void {

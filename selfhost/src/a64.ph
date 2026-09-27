@@ -1495,6 +1495,9 @@ fn gen_call(v: *mut ir.Value) void {
     }
     let ci = emit(CALL, 0, ops.items());
     ci.clobber = caller_saved();
+    if (v.a.kind == ir.V_FUNC) and v.a.fnp.noreturn {
+        ci.clobber = 0;  // nothing is live after it
+    }
     MF.has_calls = true;
     if has_ret {
         copy(vreg(v), rreg, class_of(rt));
@@ -2508,6 +2511,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
+    opt.layout(&mut order);
     prepare(f);
     MF = mc.new_func();
     for i in 0..order.len {

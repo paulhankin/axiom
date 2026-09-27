@@ -403,3 +403,205 @@ pub fn jump_thread(f: *mut ir.Func) bool {
     }
     return n > 0;
 }
+
+// -----------------------------------------------------------------------------
+// If-conversion: a branch whose arms only compute a few cheap values that
+// cannot trap, merged by phis, becomes straight-line code with selects
+// (conditional moves). Sorting and searching branch unpredictably on data.
+// -----------------------------------------------------------------------------
+const MAX_SPEC: i32 = 4;
+const MAX_SELECTS: i32 = 4;
+
+fn speculatable(i: *ir.Value) bool {
+    let op = i.op;
+    if (op == ir.OP_UDIV) or (op == ir.OP_SDIV) or (op == ir.OP_UREM) or (op == ir.OP_SREM) {
+        return false;  // a zero divisor faults
+    }
+    if (op >= ir.OP_ADD) and (op <= ir.OP_FNEG) {
+        return (i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT) or (i.ty.kind == ir.T_PTR);
+    }
+    if (op == ir.OP_ICMP) or (op == ir.OP_FCMP) or (op == ir.OP_SELECT) or (op == ir.OP_PTRADD) {
+        return i.ty.kind != ir.T_VEC;
+    }
+    if (op >= ir.OP_ZEXT) and (op <= ir.OP_INTTOPTR) {
+        return true;
+    }
+    return false;
+}
+
+// Does arm block a (a single-predecessor block going to m) hold only a few
+// speculatable instructions? -1: no; else how many.
+fn arm_cost(a: *mut ir.Block, d: *mut ir.Block, m: *mut ir.Block) i32 {
+    if (a.preds.len != 1) or (a.preds.get(0) != d) {
+        return -1;
+    }
+    let t = ir.terminator(a);
+    if u.isnil(t) or (t.op != ir.OP_BR) or (t.t1 != m) {
+        return -1;
+    }
+    let mut n: i32 = 0;
+    let mut i = a.first;
+    while u.notnil(i) and (i != t) {
+        if (i.op == ir.OP_PHI) or not speculatable(i) {
+            return -1;
+        }
+        n += 1;
+        i = i.next;
+    }
+    return n;
+}
+
+fn phi_count(m: *ir.Block) i32 {
+    let mut n: i32 = 0;
+    let mut p = m.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        if p.ty.kind == ir.T_VEC {
+            return 1000;
+        }
+        n += 1;
+        p = p.next;
+    }
+    return n;
+}
+
+fn hoist(a: *mut ir.Block, before: *mut ir.Value) void {
+    let t = ir.terminator(a);
+    let mut i = a.first;
+    while u.notnil(i) and (i != t) {
+        let nx = i.next;
+        ir.remove_inst(i);
+        ir.insert_before(before, i);
+        i = nx;
+    }
+}
+
+// The value phi p gets over the edge from block `from` (nil: none).
+fn input(p: *mut ir.Value, from: *mut ir.Block) *mut ir.Value {
+    return incoming(p, from);
+}
+
+fn drop_input(p: *mut ir.Value, from: *mut ir.Block) void {
+    let mut k: usize = 0;
+    while k < p.bs.len {
+        if p.bs.get(k) == from {
+            p.bs.set(k, p.bs.get(p.bs.len - 1));
+            p.xs.set(k, p.xs.get(p.xs.len - 1));
+            p.bs.len -= 1;
+            p.xs.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+}
+
+// D ends in condbr c -> t, e. Converts the triangles d -> t -> e, d -> e
+// and d -> e -> t, d -> t, and the diamond d -> t -> m, d -> e -> m.
+fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
+    let br = ir.terminator(d);
+    let c = br.a;
+    let t = br.t1;
+    let e = br.t2;
+    if (t == e) or (t == d) or (e == d) {
+        return false;
+    }
+    // the join, and which arms are real blocks
+    let mut m = ir.bnil();
+    let mut via_t = false;
+    let mut via_e = false;
+    let tt = ir.terminator(t);
+    let et = ir.terminator(e);
+    if u.notnil(tt) and (tt.op == ir.OP_BR) and (tt.t1 == e) {
+        m = e;
+        via_t = true;          // triangle: d -> t -> e, d -> e
+    } else if u.notnil(et) and (et.op == ir.OP_BR) and (et.t1 == t) {
+        m = t;
+        via_e = true;          // triangle: d -> e -> t, d -> t
+    } else if u.notnil(tt) and u.notnil(et) and (tt.op == ir.OP_BR) and (et.op == ir.OP_BR) and (tt.t1 == et.t1) {
+        m = tt.t1;
+        via_t = true;
+        via_e = true;          // diamond
+    } else {
+        return false;
+    }
+    if (m == d) or not u.notnil(m.first) or (m.first.op != ir.OP_PHI) {
+        return false;          // nothing to select (a plain skip is left to simplify_cfg)
+    }
+    let mut cost: i32 = 0;
+    if via_t {
+        let x = arm_cost(t, d, m);
+        if x < 0 {
+            return false;
+        }
+        cost += x;
+    }
+    if via_e {
+        let x = arm_cost(e, d, m);
+        if x < 0 {
+            return false;
+        }
+        cost += x;
+    }
+    if (cost > MAX_SPEC) or (phi_count(m) > MAX_SELECTS) {
+        return false;
+    }
+    // the values arriving at m on the true and the false path
+    let mut tb = d;
+    if via_t {
+        tb = t;
+    }
+    let mut eb = d;
+    if via_e {
+        eb = e;
+    }
+    if via_t {
+        hoist(t, br);
+    }
+    if via_e {
+        hoist(e, br);
+    }
+    let bld = ir.new_builder();
+    ir.at_before(bld, br);
+    let mut p = m.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let vt = input(p, tb);
+        let ve = input(p, eb);
+        let s = ir.select(bld, c, vt, ve);
+        if via_t {
+            drop_input(p, t);
+        }
+        if via_e {
+            drop_input(p, e);
+        }
+        drop_input(p, d);
+        ir.add_incoming(p, s, d);
+        p = p.next;
+    }
+    br.op = ir.OP_BR;
+    br.a = vnil();
+    br.t1 = m;
+    br.t2 = ir.bnil();
+    return true;
+}
+
+pub fn if_convert(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    opt.compute_preds(f);
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a.ty.kind == ir.T_INT) {
+            if convert(f, b) {
+                any = true;
+                opt.compute_preds(f);
+            }
+        }
+        b = b.next;
+    }
+    if any {
+        ir.remove_unreachable(f);
+    }
+    return any;
+}

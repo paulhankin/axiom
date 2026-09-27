@@ -33,6 +33,7 @@ fn vnil() *mut ir.Value {
 const K_EXPR: i32 = 0;   // key: an instruction (representative), val: its value
 const K_MEM: i32 = 1;    // key: base pointer, off, ty; val: the value in memory
 const K_KNOWN: i32 = 2;  // key: a value, val: the constant it equals
+const K_LE: i32 = 3;     // key <= val + off (unsigned, as natural numbers; val nil: 0)
 
 struct Ent {
     kind: i32,
@@ -600,6 +601,7 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
         if not val {
             tp = cb.inv_pred(p);
         }
+        assume_bounds(tp, c.a, c.b);
         add_expr(synth_icmp(tp, c.a, c.b), kbool(true));
         add_expr(synth_icmp(cb.inv_pred(tp), c.a, c.b), kbool(false));
         add_expr(synth_icmp(cb.swap_pred(tp), c.b, c.a), kbool(true));
@@ -619,6 +621,239 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     } else if (c.op == ir.OP_XOR) and (c.ty.bits == 1) and cb.is_k(c.b) {
         assume(c.a, val != (ir.cint_val(c.b) != 0), depth + 1);
     }
+}
+
+// -----------------------------------------------------------------------------
+// Unsigned bounds: facts x <= y + c between values (and constants), from the
+// dominating conditions and from how values are computed; a comparison that
+// they decide is folded (bounds checks implied by loop conditions, a < mid
+// and mid <= n giving a < n, and so on).
+// -----------------------------------------------------------------------------
+fn le_hash(v: *ir.Value) u64 {
+    return mix(hp(v), 0x4c45);
+}
+
+// x <= y + c (y nil: x <= c)
+fn add_le(x: *mut ir.Value, y: *mut ir.Value, c: i64) void {
+    if ir.is_const(x) {
+        return;
+    }
+    push_ent(K_LE, le_hash(x), x, c, x.ty, y);
+}
+
+fn small_k(v: *ir.Value) bool {
+    return cb.is_k(v) and (v.ty.kind == ir.T_INT) and (ir.cint_val(v) < 0x4000_0000_0000_0000);
+}
+
+fn kv(v: *ir.Value) i64 {
+    return @bit_cast(i64, ir.cint_val(v));
+}
+
+// Unsigned comparison facts: tp holds for (a, b).
+fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
+    if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
+        return;
+    }
+    if tp == ir.IntULT {
+        if small_k(b) {
+            if kv(b) >= 1 {
+                add_le(a, vnil(), kv(b) - 1);
+            }
+        } else if not ir.is_const(b) {
+            add_le(a, b, -1);
+        }
+    } else if tp == ir.IntULE {
+        if small_k(b) {
+            add_le(a, vnil(), kv(b));
+        } else if not ir.is_const(b) {
+            add_le(a, b, 0);
+        }
+    } else if (tp == ir.IntUGT) or (tp == ir.IntUGE) {
+        let sw = cb.swap_pred(tp);
+        if not ir.is_const(b) {
+            assume_bounds(sw, b, a);
+        }
+    } else if tp == ir.IntEQ {
+        if not ir.is_const(a) and not ir.is_const(b) {
+            add_le(a, b, 0);
+            add_le(b, a, 0);
+        }
+    }
+}
+
+// Is x != 0 (or x >= c) known here?
+fn known_at_least(x: *mut ir.Value, c: i64) bool {
+    if small_k(x) {
+        return kv(x) >= c;
+    }
+    if c == 1 {
+        let r = find_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)));
+        if u.notnil(r) and cb.is_k(r) and (ir.cint_val(r) == 1) {
+            return true;
+        }
+    }
+    let r = find_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c))));
+    return u.notnil(r) and cb.is_k(r) and (ir.cint_val(r) == 1);
+}
+
+let mut prove_budget: i32 = 0;
+
+// Is x <= y + bound (y nil: x <= bound)? acc is the weight so far.
+fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
+    if x == y {
+        return bound >= 0;
+    }
+    if u.isnil(y) and small_k(x) {
+        return kv(x) <= bound;
+    }
+    if u.isnil(x) {
+        return bound >= 0;  // 0 <= y + bound
+    }
+    if (depth > 5) or (prove_budget <= 0) {
+        return false;
+    }
+    prove_budget -= 1;
+    // stored facts x <= w + c
+    let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.at(@int_cast(usize, e));
+        if (en.kind == K_LE) and (en.key == x) {
+            if le_path(en.val, y, bound - en.off, depth + 1) {
+                return true;
+            }
+        }
+        e = en.next;
+    }
+    if x.kind != ir.V_INST {
+        return false;
+    }
+    // facts from x's definition
+    let op = x.op;
+    if (op == ir.OP_LSHR) or (op == ir.OP_UDIV) {
+        return le_path(x.a, y, bound, depth + 1);
+    }
+    if op == ir.OP_AND {
+        if small_k(x.b) and le_path(vnil(), y, bound - kv(x.b), depth + 1) {
+            return true;
+        }
+        return le_path(x.a, y, bound, depth + 1);
+    }
+    if op == ir.OP_ZEXT {
+        return le_path(x.a, y, bound, depth + 1);
+    }
+    if (op == ir.OP_UREM) and not ir.is_const(x.b) {
+        return le_path(x.b, y, bound + 1, depth + 1);
+    }
+    if (op == ir.OP_ADD) and cb.is_k(x.b) and (x.ty.bits <= 64) and (x.ty.bits > 1) {
+        let c = ir.cint_val(x.b);
+        let half = ir.mask_bits(x.ty.bits) >> 1;
+        if c <= half {
+            if c < 0x1_0000_0000 {
+                return le_path(x.a, y, bound - @bit_cast(i64, c), depth + 1);  // a + c wraps only down
+            }
+            return false;
+        }
+        // a - d, exact when a >= d
+        let d = (ir.mask_bits(x.ty.bits) - c) + 1;
+        if (d < 0x1_0000_0000) and known_at_least(x.a, @bit_cast(i64, d)) {
+            return le_path(x.a, y, bound + @bit_cast(i64, d), depth + 1);
+        }
+    }
+    return false;
+}
+
+fn pick1(c: bool) i64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+// Is x <= MAX - d (d >= 1)? True when x <= w + c for some value w and c <= -d
+// (w is at most MAX), following the facts.
+fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
+    if small_k(x) {
+        return true;
+    }
+    if (depth > 5) or (prove_budget <= 0) or u.isnil(x) {
+        return false;
+    }
+    prove_budget -= 1;
+    let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.at(@int_cast(usize, e));
+        if (en.kind == K_LE) and (en.key == x) {
+            if (en.off <= -d) or u.isnil(en.val) {
+                return true;  // x <= w - d, or x <= a small constant
+            }
+            if below_max(en.val, d + en.off, depth + 1) {
+                return true;
+            }
+        }
+        e = en.next;
+    }
+    if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and cb.is_k(x.b) and (ir.cint_val(x.b) >= 2) {
+        return true;  // at most MAX / 2
+    }
+    return false;
+}
+
+// Is x <= y + bound?
+fn prove_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64) bool {
+    prove_budget = 64;
+    if small_k(y) {
+        return le_path(x, vnil(), bound + kv(y), 0);
+    }
+    if ir.is_const(y) {
+        return false;
+    }
+    return le_path(x, y, bound, 0);
+}
+
+// The value of an unsigned comparison the bounds decide, or nil.
+fn decide(i: *mut ir.Value) *mut ir.Value {
+    let p = cb.pred_of(i);
+    let a = i.a;
+    let b = i.b;
+    if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) or (i.ty.kind != ir.T_INT) {
+        return vnil();
+    }
+    // comparisons with constants near the top of the range (overflow checks)
+    if cb.is_k(b) and not small_k(b) and (a.ty.bits == 64) {
+        let d = @bit_cast(i64, ir.mask_bits(64) - ir.cint_val(b));  // b = MAX - d
+        if (d < 0x1_0000_0000) and (((p == ir.IntULE) and (d >= 1)) or ((p == ir.IntULT) and (d >= 0))) {
+            prove_budget = 64;
+            let need = d + pick1(p == ir.IntULT);
+            if below_max(a, need, 0) {
+                return kbool(true);
+            }
+        }
+        if (d < 0x1_0000_0000) and (((p == ir.IntUGT) and (d >= 1)) or ((p == ir.IntUGE) and (d >= 0))) {
+            prove_budget = 64;
+            let need = d + pick1(p == ir.IntUGE);
+            if below_max(a, need, 0) {
+                return kbool(false);
+            }
+        }
+        return vnil();
+    }
+    if (p == ir.IntULT) or (p == ir.IntUGE) {
+        // a < b: a <= b - 1; a >= b: b <= a
+        if prove_le(a, b, -1) {
+            return kbool(p == ir.IntULT);
+        }
+        if not ir.is_const(b) and prove_le(b, a, 0) {
+            return kbool(p == ir.IntUGE);
+        }
+    } else if (p == ir.IntULE) or (p == ir.IntUGT) {
+        if prove_le(a, b, 0) {
+            return kbool(p == ir.IntULE);
+        }
+        if not ir.is_const(b) and prove_le(b, a, -1) {
+            return kbool(p == ir.IntUGT);
+        }
+    }
+    return vnil();
 }
 
 // Facts on entry to b from its only predecessor.
@@ -745,7 +980,10 @@ fn visit_block(b: *mut ir.Block) void {
             i.xs.set(k, known_operand(i.xs.get(k)));
         }
         if cse_able(i) {
-            let r = find_expr(i);
+            let mut r = find_expr(i);
+            if u.isnil(r) and (op == ir.OP_ICMP) {
+                r = decide(i);
+            }
             if u.notnil(r) {
                 replace(i, r);
             } else {

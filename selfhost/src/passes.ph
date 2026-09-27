@@ -2,8 +2,8 @@
 // passes.ph - the optimization pipeline over a module's IR (after lowering).
 //
 //   -O0   mem2reg, constant folding, CFG simplification, dead code
-//   -O1+  also instruction combining (combine.ph), jump threading
-//         (thread.ph), scalar replacement of aggregates (sroa.ph) and global
+//   -O1+  also instruction combining (combine.ph), jump threading and
+//         if-conversion (thread.ph), scalar replacement of aggregates (sroa.ph) and global
 //         value numbering (gvn.ph)
 //   -O2+  also interprocedural constant propagation and inlining
 //         (inline.ph), bottom-up over the call graph, each function simplified
@@ -23,6 +23,9 @@ fn cleanup(f: *mut ir.Func, level: i32) void {
         let a = opt.fold_combine(f, level > 0);
         let mut c = opt.simplify_cfg(f);
         if (level > 0) and thr.jump_thread(f) {
+            c = true;
+        }
+        if (level > 0) and thr.if_convert(f) {
             c = true;
         }
         rounds += 1;
