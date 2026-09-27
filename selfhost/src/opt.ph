@@ -45,7 +45,9 @@ pub fn compute_preds(f: *mut ir.Func) void {
 }
 
 // Blocks in reverse postorder (entry first); sets b.rpo. Unreachable blocks
-// get rpo -1 and are not in the list.
+// get rpo -1 and are not in the list. Successors are visited last to first,
+// so a block's first successor (the then-block, a loop's body) comes right
+// after it: loops stay contiguous in the code layout.
 pub fn rpo(f: *mut ir.Func) u.List.[*mut ir.Block] {
     let mut out = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     let mut b = f.first;
@@ -73,9 +75,10 @@ pub fn rpo(f: *mut ir.Func) u.List.[*mut ir.Block] {
         let x = st[sp - 1];
         let t = ir.terminator(x);
         let k = si[sp - 1];
-        if k < ir.succ_count(t) {
+        let ns = ir.succ_count(t);
+        if k < ns {
             si[sp - 1] = k + 1;
-            let s = ir.succ(t, k);
+            let s = ir.succ(t, (ns - 1) - k);
             if s.aux == 0 {
                 s.aux = 1;
                 st[sp] = s;
