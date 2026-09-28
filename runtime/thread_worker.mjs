@@ -8,8 +8,8 @@ import fs from 'fs';
 import { workerData } from 'worker_threads';
 import { createHost, describeTrap, formatTrap } from './host.mjs';
 
-const { module, memory, entry, arg, stackTop, exited } = workerData;
-const host = createHost({ memory });
+const { module, memory, entry, arg, stackTop, exited, netPort } = workerData;
+const host = createHost({ memory, netPort });
 let instance = null;
 try {
   instance = host.instantiateModule(module);

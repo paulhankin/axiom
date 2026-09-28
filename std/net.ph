@@ -7,7 +7,7 @@
 
 import "io.ph" as io;
 
-error { ConnectionRefused, AddressInUse, InvalidAddress, NetError }
+error { ConnectionRefused, AddressInUse, InvalidAddress, NetError, TimedOut }
 
 import host "phalange" {
     fn ph_tcp_connect(name: *u8, name_len: usize, port: u32) i32;
@@ -17,12 +17,14 @@ import host "phalange" {
     fn ph_sock_read(handle: i32, p: *mut u8, n: usize) isize;
     fn ph_sock_write(handle: i32, p: *u8, n: usize) isize;
     fn ph_sock_close(handle: i32) void;
+    fn ph_sock_timeout(handle: i32, ms: u32) i32;
 }
 
 fn host_error(code: i32) error { match code {
     -2   => { return error.ConnectionRefused; }
     -3   => { return error.AddressInUse; }
     -4   => { return error.InvalidAddress; }
+    -5   => { return error.TimedOut; }
     else => { return error.NetError; }
 }
 }
@@ -96,7 +98,7 @@ pub struct TcpStream {
     pub fn read(self: TcpStream, buf: []mut u8) !usize {
         let n = ph_sock_read(self.handle, buf.ptr, buf.len);
         if n < 0 {
-            return error.NetError;
+            return host_error(@int_cast(i32, n));
         }
         return @int_cast(usize, n);
     }
@@ -104,7 +106,7 @@ pub struct TcpStream {
     pub fn write(self: TcpStream, bytes: []u8) !usize {
         let n = ph_sock_write(self.handle, bytes.ptr, bytes.len);
         if n < 0 {
-            return error.NetError;
+            return host_error(@int_cast(i32, n));
         }
         return @int_cast(usize, n);
     }
@@ -119,6 +121,14 @@ pub struct TcpStream {
 
     pub fn writer(self: TcpStream) io.Writer {
         return io.Writer.{ ctx: handle_ctx(self.handle), write_fn: stream_write };
+    }
+
+    /// Makes reads and writes that wait longer than `ms` milliseconds fail
+    /// with error.TimedOut; 0 means wait forever (the default).
+    pub fn set_timeout(self: TcpStream, ms: u32) !void {
+        if ph_sock_timeout(self.handle, ms) < 0 {
+            return error.NetError;
+        }
     }
 
     pub fn close(self: TcpStream) void {
@@ -143,6 +153,8 @@ pub struct TcpListener {
         return TcpStream.{ handle: h };
     }
 
+    /// Stops listening. A thread blocked in accept() on this listener
+    /// returns with an error.
     pub fn close(self: TcpListener) void {
         ph_sock_close(self.handle);
     }

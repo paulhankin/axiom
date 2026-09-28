@@ -67,11 +67,14 @@ They call a small set of host functions imported from module `"phalange"`:
 | `ph_tcp_connect(name, len, port) i32`, `ph_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ph_tcp_accept(h) i32`, `ph_tcp_local_port(h) i32` | |
 | `ph_sock_read(h, p, n) isize`, `ph_sock_write(h, p, n) isize`, `ph_sock_close(h)` | |
+| `ph_sock_timeout(h, ms) i32` | later reads and writes on `h` fail with `-5` after `ms` milliseconds (`0`: never) |
 | `ph_thread_spawn(entry, arg, stack_top, exited) i32`, `ph_thread_stack_size() usize` | threads (spec §12.8.5) |
 | `ph_cpu_count() u32`, `ph_sleep_ns(ns)` | |
+| `ph_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970) or `1` (monotonic) |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection
-refused / not found, `-3` address in use, `-4` invalid address, and `-13` access denied.
+refused / not found, `-3` address in use, `-4` invalid address, `-5` timed out, and `-13`
+access denied.
 
 Two implementations are provided:
 

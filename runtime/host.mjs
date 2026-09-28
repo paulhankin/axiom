@@ -12,7 +12,7 @@
 // instantiate() handles modules that import a shared memory (threaded programs).
 import fs from 'fs';
 import os from 'os';
-import { Worker } from 'worker_threads';
+import { MessageChannel, Worker } from 'worker_threads';
 
 const READ_CHUNK = 1 << 16;
 
@@ -224,23 +224,38 @@ function memoryImportLimits(bytes) {
 }
 
 // Blocking bridge to runtime/net_worker.mjs: the wasm thread posts a request
-// and sleeps in Atomics.wait until the worker has completed it.
+// and sleeps in Atomics.wait until the worker has completed it. The main
+// thread starts the worker; other threads talk to the same worker through a
+// MessagePort, so all threads share socket handles.
 class NetClient {
-  constructor() {
+  constructor(port) {
     this.ctrl = new Int32Array(new SharedArrayBuffer(8));
     this.data = new Uint8Array(new SharedArrayBuffer(READ_CHUNK));
-    this.worker = new Worker(new URL('./net_worker.mjs', import.meta.url), {
-      workerData: { ctrl: this.ctrl.buffer, data: this.data.buffer },
-    });
-    this.worker.unref();
+    if (port) {
+      this.port = port;
+      this.worker = null;
+    } else {
+      this.worker = new Worker(new URL('./net_worker.mjs', import.meta.url));
+      this.worker.unref();
+      this.port = this.worker;
+    }
   }
   call(op, args, payload) {
     Atomics.store(this.ctrl, 0, 0);
-    this.worker.postMessage({ op, args, payload });
+    this.port.postMessage({ op, args, payload, ctrl: this.ctrl.buffer, data: this.data.buffer });
     Atomics.wait(this.ctrl, 0, 0);
     return Atomics.load(this.ctrl, 1);
   }
-  close() { this.worker.terminate(); }
+  // A new port to the same worker, for another thread.
+  newPort() {
+    const ch = new MessageChannel();
+    this.port.postMessage({ op: 'port', port: ch.port2 }, [ch.port2]);
+    return ch.port1;
+  }
+  close() {
+    if (this.worker) this.worker.terminate();
+    else this.port.close();
+  }
 }
 
 export function createHost(opts = {}) {
@@ -251,7 +266,7 @@ export function createHost(opts = {}) {
   const writeFd = opts.write || ((fd, bytes) => fs.writeSync(fd, bytes));
   const bytes = (p, n) => new Uint8Array(memory.buffer, p >>> 0, n >>> 0);
   const str = (p, n) => Buffer.from(memory.buffer, p >>> 0, n >>> 0).toString('utf8');
-  const net = () => (netClient ||= new NetClient());
+  const net = () => (netClient ||= new NetClient(opts.netPort));
   const phalange = {
     ph_write(fd, p, n) {
       try { return writeFd(fd, bytes(p, n).slice()); } catch { return -1; }
@@ -284,9 +299,13 @@ export function createHost(opts = {}) {
     },
     ph_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ph_sock_close: (h) => { net().call('close', { h }); },
+    ph_sock_timeout: (h, ms) => net().call('timeout', { h, ms: ms >>> 0 }),
     ph_thread_spawn(entry, arg, stackTop, exited) {
+      // The new thread shares this program's sockets.
+      const netPort = net().newPort();
       const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
-        workerData: { module, memory, entry, arg, stackTop, exited },
+        workerData: { module, memory, entry, arg, stackTop, exited, netPort },
+        transferList: [netPort],
       });
       // A trap in any thread terminates the whole program (spec §12.8).
       w.on('error', (e) => {

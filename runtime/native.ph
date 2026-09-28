@@ -29,6 +29,7 @@ const PH_ERR: i32 = -1;
 const PH_REFUSED: i32 = -2;
 const PH_ADDR_IN_USE: i32 = -3;
 const PH_BAD_ADDRESS: i32 = -4;
+const PH_TIMED_OUT: i32 = -5;
 
 pub const SIGBUS: i32 = 7;
 pub const SIGFPE: i32 = 8;
@@ -557,6 +558,9 @@ export fn ph_sock_read(h: i32, p: *mut u8, n: usize) isize {
         if retry(r) {
             continue;
         }
+        if r == -sys.EAGAIN {
+            return @as(isize, PH_TIMED_OUT);
+        }
         if r < 0 {
             return -1;
         }
@@ -570,6 +574,9 @@ export fn ph_sock_write(h: i32, p: *u8, n: usize) isize {
         if retry(r) {
             continue;
         }
+        if r == -sys.EAGAIN {
+            return @as(isize, PH_TIMED_OUT);
+        }
         if r < 0 {
             return -1;
         }
@@ -577,7 +584,21 @@ export fn ph_sock_write(h: i32, p: *u8, n: usize) isize {
     }
 }
 
+// Reads and writes on h fail with PH_TIMED_OUT after ms milliseconds (0:
+// never).
+export fn ph_sock_timeout(h: i32, ms: u32) i32 {
+    let tv: [2]i64 = [@as(i64, ms / 1000), @as(i64, ms % 1000) * 1000];
+    let a = sys.setsockopt(h, 1, 20, @ptr_cast(*void, &tv), 16);  // SOL_SOCKET, SO_RCVTIMEO
+    let b = sys.setsockopt(h, 1, 21, @ptr_cast(*void, &tv), 16);  // SO_SNDTIMEO
+    if (a != 0) or (b != 0) {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+// Shutting the socket down first wakes a thread blocked in accept on it.
 export fn ph_sock_close(h: i32) void {
+    _ = sys.shutdown(h, 2);  // SHUT_RDWR
     _ = sys.close(h);
 }
 

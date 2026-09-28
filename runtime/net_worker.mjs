@@ -1,14 +1,21 @@
 // runtime/net_worker.mjs - owns node's (asynchronous) sockets on behalf of
-// the (synchronous) wasm thread; see NetClient in host.mjs.
-import { parentPort, workerData } from 'worker_threads';
+// the (synchronous) wasm threads; see NetClient in host.mjs.
+//
+// One worker serves every thread of a program, so socket handles are shared
+// between threads. Each request carries the caller's own shared buffers:
+// ctrl[0] is set to 1 (and notified) when the request completes, with its
+// result in ctrl[1]; read data goes into `data`. Threads reach the worker
+// through MessagePorts sent with a 'port' message.
+import { parentPort } from 'worker_threads';
 import net from 'net';
 
-const ctrl = new Int32Array(workerData.ctrl);
-const data = new Uint8Array(workerData.data);
 const handles = new Map();
 let nextHandle = 3;
 
-function done(result) {
+const ERR = -1, REFUSED = -2, ADDR_IN_USE = -3, BAD_ADDRESS = -4, TIMED_OUT = -5;
+
+function reply(req, result) {
+  const ctrl = new Int32Array(req.ctrl);
   Atomics.store(ctrl, 1, result);
   Atomics.store(ctrl, 0, 1);
   Atomics.notify(ctrl, 0);
@@ -16,21 +23,22 @@ function done(result) {
 
 function errCode(e) {
   switch (e && e.code) {
-    case 'ECONNREFUSED': return -2;
-    case 'EADDRINUSE': return -3;
-    case 'ENOTFOUND': case 'EAI_AGAIN': case 'ERR_INVALID_IP_ADDRESS': case 'ERR_INVALID_ADDRESS': return -4;
-    default: return -1;
+    case 'ECONNREFUSED': return REFUSED;
+    case 'EADDRINUSE': return ADDR_IN_USE;
+    case 'ENOTFOUND': case 'EAI_AGAIN': case 'ERR_INVALID_IP_ADDRESS': case 'ERR_INVALID_ADDRESS': return BAD_ADDRESS;
+    default: return ERR;
   }
 }
 
+// Runs the queued waiters that can now make progress.
 function wake(st) {
-  const w = st.waiter;
-  st.waiter = null;
-  if (w) w();
+  const ws = st.waiters;
+  st.waiters = [];
+  for (const w of ws) w();
 }
 
 function addSocket(sock) {
-  const st = { kind: 'sock', sock, chunks: [], ended: false, failed: false, waiter: null };
+  const st = { kind: 'sock', sock, chunks: [], ended: false, failed: false, waiters: [], timeout: 0 };
   sock.on('data', (b) => { st.chunks.push(b); wake(st); });
   sock.on('end', () => { st.ended = true; wake(st); });
   sock.on('close', () => { st.ended = true; wake(st); });
@@ -41,43 +49,48 @@ function addSocket(sock) {
 }
 
 const ops = {
-  connect({ host, port }) {
+  connect(req, { host, port }) {
     const sock = net.connect({ host: host || '127.0.0.1', port });
-    const onError = (e) => done(errCode(e));
+    const onError = (e) => reply(req, errCode(e));
     sock.once('error', onError);
-    sock.once('connect', () => { sock.off('error', onError); done(addSocket(sock)); });
+    sock.once('connect', () => { sock.off('error', onError); reply(req, addSocket(sock)); });
   },
-  listen({ host, port }) {
+  listen(req, { host, port }) {
     const srv = net.createServer();
-    const st = { kind: 'listener', srv, queue: [], waiter: null };
+    const st = { kind: 'listener', srv, queue: [], waiters: [], closed: false };
     srv.on('connection', (s) => { st.queue.push(s); wake(st); });
-    const onError = (e) => done(errCode(e));
+    const onError = (e) => reply(req, errCode(e));
     srv.once('error', onError);
     srv.listen(port, host || undefined, () => {
       srv.off('error', onError);
       const h = nextHandle++;
       handles.set(h, st);
-      done(h);
+      reply(req, h);
     });
   },
-  accept({ h }) {
+  accept(req, { h }) {
     const st = handles.get(h);
-    if (!st || st.kind !== 'listener') return done(-1);
+    if (!st || st.kind !== 'listener') return reply(req, ERR);
     const attempt = () => {
-      if (st.queue.length) done(addSocket(st.queue.shift()));
-      else st.waiter = attempt;
+      if (st.closed) reply(req, ERR);
+      else if (st.queue.length) reply(req, addSocket(st.queue.shift()));
+      else st.waiters.push(attempt);
     };
     attempt();
   },
-  local_port({ h }) {
+  local_port(req, { h }) {
     const st = handles.get(h);
-    if (!st) return done(-1);
-    done(st.kind === 'listener' ? st.srv.address().port : st.sock.localPort);
+    if (!st) return reply(req, ERR);
+    reply(req, st.kind === 'listener' ? st.srv.address().port : st.sock.localPort);
   },
-  read({ h, n }) {
+  read(req, { h, n }) {
     const st = handles.get(h);
-    if (!st || st.kind !== 'sock') return done(-1);
+    if (!st || st.kind !== 'sock') return reply(req, ERR);
+    const data = new Uint8Array(req.data);
+    let timer = null;
+    let done = false;
     const attempt = () => {
+      if (done) return;
       if (st.chunks.length) {
         let got = 0;
         while (got < n && st.chunks.length) {
@@ -88,27 +101,57 @@ const ops = {
           if (take === c.length) st.chunks.shift();
           else st.chunks[0] = c.subarray(take);
         }
-        done(got);
+        done = true;
+        if (timer) clearTimeout(timer);
+        reply(req, got);
       } else if (st.ended) {
-        done(st.failed ? -1 : 0);
+        done = true;
+        if (timer) clearTimeout(timer);
+        reply(req, st.failed ? ERR : 0);
       } else {
-        st.waiter = attempt;
+        st.waiters.push(attempt);
       }
     };
     attempt();
+    if (!done && st.timeout > 0) {
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        st.waiters = st.waiters.filter((w) => w !== attempt);
+        reply(req, TIMED_OUT);
+      }, st.timeout);
+    }
   },
-  write({ h }, payload) {
+  write(req, { h }, payload) {
     const st = handles.get(h);
-    if (!st || st.kind !== 'sock' || st.failed) return done(-1);
-    st.sock.write(payload, (err) => done(err ? -1 : payload.length));
+    if (!st || st.kind !== 'sock' || st.failed) return reply(req, ERR);
+    st.sock.write(payload, (err) => reply(req, err ? ERR : payload.length));
   },
-  close({ h }) {
+  timeout(req, { h, ms }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'sock') return reply(req, ERR);
+    st.timeout = ms;
+    reply(req, 0);
+  },
+  close(req, { h }) {
     const st = handles.get(h);
     handles.delete(h);
-    if (st && st.kind === 'listener') st.srv.close();
-    else if (st) st.sock.end();
-    done(0);
+    if (st && st.kind === 'listener') {
+      st.closed = true;
+      st.srv.close();
+      wake(st);
+    } else if (st) {
+      st.sock.end();
+    }
+    reply(req, 0);
   },
 };
 
-parentPort.on('message', (m) => ops[m.op](m.args || {}, m.payload));
+function serve(port) {
+  port.on('message', (m) => {
+    if (m.op === 'port') serve(m.port);
+    else ops[m.op](m, m.args || {}, m.payload);
+  });
+}
+
+serve(parentPort);

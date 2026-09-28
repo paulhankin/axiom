@@ -19,12 +19,13 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "trap_format.h"
 
 // Error codes shared with runtime/host.mjs and std/net.ph.
-enum { PH_ERR = -1, PH_REFUSED = -2, PH_ADDR_IN_USE = -3, PH_BAD_ADDRESS = -4 };
+enum { PH_ERR = -1, PH_REFUSED = -2, PH_ADDR_IN_USE = -3, PH_BAD_ADDRESS = -4, PH_TIMED_OUT = -5 };
 
 intptr_t ph_write(int32_t fd, const uint8_t *p, size_t n) {
     ssize_t r;
@@ -130,17 +131,31 @@ intptr_t ph_sock_read(int32_t h, uint8_t *p, size_t n) {
     ssize_t r;
     do r = recv(h, p, n, 0);
     while (r < 0 && errno == EINTR);
-    return r < 0 ? PH_ERR : (intptr_t)r;
+    if (r < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? PH_TIMED_OUT : PH_ERR;
+    return (intptr_t)r;
 }
 
 intptr_t ph_sock_write(int32_t h, const uint8_t *p, size_t n) {
     ssize_t r;
     do r = send(h, p, n, MSG_NOSIGNAL);
     while (r < 0 && errno == EINTR);
-    return r < 0 ? PH_ERR : (intptr_t)r;
+    if (r < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? PH_TIMED_OUT : PH_ERR;
+    return (intptr_t)r;
 }
 
-void ph_sock_close(int32_t h) { close(h); }
+// Reads and writes on h fail with PH_TIMED_OUT after ms milliseconds (0: never).
+int32_t ph_sock_timeout(int32_t h, uint32_t ms) {
+    struct timeval tv = {(time_t)(ms / 1000), (suseconds_t)(ms % 1000) * 1000};
+    if (setsockopt(h, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0) return PH_ERR;
+    if (setsockopt(h, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0) return PH_ERR;
+    return 0;
+}
+
+// Shutting the socket down first wakes a thread blocked in accept on it.
+void ph_sock_close(int32_t h) {
+    shutdown(h, SHUT_RDWR);
+    close(h);
+}
 
 // ---------------------------------------------------------------------------
 // Threads (std/thread) and wait/notify (@atomic_wait / @atomic_notify)
