@@ -130,7 +130,7 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
 // `phalange test`: the standard library's own tests must pass, and the
 // self-tests in tests/testing/ must produce exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
-const stdFiles = files(path.join(root, 'std')).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
+const stdFiles = [...files(path.join(root, 'std')), ...files(path.join(root, 'std/crypto'))].filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
 for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const name = path.relative(root, f) + ' [phalange test]';
   if (filter && !name.includes(filter)) continue;

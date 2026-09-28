@@ -63,6 +63,7 @@ let SYS_LISTEN: [2]i64 = [50, 201];
 let SYS_GETSOCKNAME: [2]i64 = [51, 204];
 let SYS_SETSOCKOPT: [2]i64 = [54, 208];
 let SYS_SHUTDOWN: [2]i64 = [48, 210];
+let SYS_GETRANDOM: [2]i64 = [318, 278];
 let SYS_CLONE: [2]i64 = [56, 220];
 let SYS_WAIT4: [2]i64 = [61, 260];
 let SYS_PIPE2: [2]i64 = [293, 59];
@@ -274,6 +275,10 @@ pub fn accept4(fd: i32, flags: i32) isize {
 
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: *void, len: u32) isize {
     return ph_syscall(nr(SYS_SETSOCKOPT), si(fd), si(level), si(name), ip(value), @as(usize, len), 0);
+}
+
+pub fn getrandom(p: *mut u8, n: usize) isize {
+    return sys3(SYS_GETRANDOM, @int_from_ptr(p), n, 0);
 }
 
 pub fn shutdown(fd: i32, how: i32) isize {

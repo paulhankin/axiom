@@ -320,6 +320,17 @@ export function createHost(opts = {}) {
     ph_sleep_ns(ns) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ns) / 1e6);
     },
+    // Cryptographically secure random bytes (at most 64 KiB per call to
+    // getRandomValues, which cannot fill shared memory directly).
+    ph_random(p, n) {
+      const out = bytes(p, n);
+      for (let at = 0; at < out.length; at += 65536) {
+        const chunk = new Uint8Array(Math.min(65536, out.length - at));
+        globalThis.crypto.getRandomValues(chunk);
+        out.set(chunk, at);
+      }
+      return 0;
+    },
     // Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
     ph_clock_ns(clock) {
       if (clock === 1) return process.hrtime.bigint();

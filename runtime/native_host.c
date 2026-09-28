@@ -216,6 +216,18 @@ void ph_sleep_ns(uint64_t ns) {
     }
 }
 
+// Fills p[0..n] with cryptographically secure random bytes; 0 on success.
+int32_t ph_random(uint8_t *p, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        long r = syscall(SYS_getrandom, p + done, n - done, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return PH_ERR;
+        done += (size_t)r;
+    }
+    return 0;
+}
+
 // Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
 int64_t ph_clock_ns(uint32_t clock) {
     struct timespec ts;

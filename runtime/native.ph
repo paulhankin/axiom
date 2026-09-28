@@ -761,6 +761,22 @@ export fn ph_sleep_ns(ns: u64) void {
     sys.nanosleep(ns);
 }
 
+// Fills p[0..n] with cryptographically secure random bytes; 0 on success.
+export fn ph_random(p: *mut u8, n: usize) i32 {
+    let mut done: usize = 0;
+    while done < n {
+        let r = sys.getrandom(@ptr_from_int(*mut u8, @int_from_ptr(p) + done), n - done);
+        if retry(r) {
+            continue;
+        }
+        if r <= 0 {
+            return PH_ERR;
+        }
+        done += @int_cast(usize, r);
+    }
+    return 0;
+}
+
 // Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
 export fn ph_clock_ns(clock: u32) i64 {
     let mut ts = sys.Timespec.{ sec: 0, nsec: 0 };
