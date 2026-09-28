@@ -2334,6 +2334,16 @@ fn count_uses(f: *mut ir.Func) void {
     }
 }
 
+// The block phi p takes v from (nil: none).
+fn phi_from(p: *ir.Value, v: *mut ir.Value) *mut ir.Block {
+    for k in 0..p.xs.len {
+        if p.xs.get(k) == v {
+            return p.bs.get(k);
+        }
+    }
+    return u.nil.[ir.Block]();
+}
+
 fn classify(f: *mut ir.Func) void {
     let mut b = f.first;
     while u.notnil(b) {
@@ -2345,6 +2355,10 @@ fn classify(f: *mut ir.Func) void {
             } else if (o == ir.OP_PTRADD) and (i.b.kind == ir.V_CINT) and (i.uses > 1) and
                       ((i.a.kind != ir.V_INST) or (i.a.flag == FL_LOCAL) or (i.a.flag == FL_REMAT)) {
                 i.flag = FL_REMAT;
+            } else if (i.uses == 1) and (o != ir.OP_PHI) and pure_op(i) and (i.user.op == ir.OP_PHI) and
+                      phi_from(i.user, i) == b {
+                // computed where the phi copy at the end of this block pushes it
+                i.flag = FL_INLINE;
             } else if (i.uses == 1) and (o != ir.OP_PHI) and not ir.is_term(o) and (i.user.blk == b) and
                       (i.user.op != ir.OP_PHI) and (i.user.pos > i.pos) {
                 if pure_op(i) {
