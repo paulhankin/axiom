@@ -488,7 +488,9 @@ fn gen_alu(v: *mut ir.Value) void {
     let sz = isz(v.ty);
     let mut a = v.a;
     let mut b = v.b;
-    if (is_c(a) and not is_c(b) and (o != ir.OP_SUB)) or (folded_load(a) and (o != ir.OP_SUB)) {
+    // commute so that a constant or a folded load ends up second (a folded
+    // load has no register: it must stay the memory operand)
+    if (o != ir.OP_SUB) and (folded_load(a) or (is_c(a) and not is_c(b) and not folded_load(b))) {
         a = v.b;
         b = v.a;
     }

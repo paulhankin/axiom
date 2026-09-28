@@ -1,5 +1,5 @@
 // =============================================================================
-// std/http.ph - an HTTP/1.1 server and client (plain HTTP; no TLS).
+// std/http.ph - an HTTP/1.1 server and client, over TCP or TLS.
 //
 // A server:
 //
@@ -37,6 +37,11 @@
 //     defer resp.deinit();
 //     io.stdout().print(resp.body)!;
 //
+// https:// URLs are fetched over TLS 1.3 (std/tls), checking the server's
+// certificate against the system's roots unless ClientOptions.with_tls
+// gives another configuration. A server serves HTTPS when made with
+// server_tls (or Router.serve_tls) and a tls.ServerConfig.
+//
 // The server and the client are threads and blocking sockets over std/net,
 // so they run natively and on WebAssembly under node alike.
 // =============================================================================
@@ -46,8 +51,10 @@ import "io.ph" as io;
 import "mem.ph" as mem;
 import "net.ph" as net;
 import "str.ph" as strs;
+import "sync.ph" as sync;
 import "thread.ph" as thread;
 import "time.ph" as time;
+import "tls.ph" as tls;
 import "vec.ph" as vec;
 
 error {
@@ -217,15 +224,52 @@ pub fn query_raw(query: []u8, name: []u8) ![]u8 {
 // Buffered connection reading (shared by the server and the client)
 // -----------------------------------------------------------------------------
 
+/// A connection, plain or TLS.
+struct Transport {
+    tcp: net.TcpStream,
+    tls: *mut tls.Conn,  // when secure
+    secure: bool,
+
+    fn plain(s: net.TcpStream) Transport {
+        return Transport.{ tcp: s, tls: @ptr_from_int(*mut tls.Conn, 8), secure: false };
+    }
+
+    fn over_tls(c: *mut tls.Conn) Transport {
+        return Transport.{ tcp: c.stream, tls: c, secure: true };
+    }
+
+    fn read(self: Transport, buf: []mut u8) !usize {
+        if self.secure {
+            return self.tls.read(buf);
+        }
+        return self.tcp.read(buf);
+    }
+
+    fn write_all(self: Transport, bytes: []u8) !void {
+        if self.secure {
+            return self.tls.write_all(bytes);
+        }
+        return self.tcp.write_all(bytes);
+    }
+
+    fn close(self: Transport) void {
+        if self.secure {
+            self.tls.close();
+        } else {
+            self.tcp.close();
+        }
+    }
+}
+
 struct Conn {
-    stream: net.TcpStream,
+    stream: Transport,
     buf: []mut u8,
     start: usize,  // unread data is buf[start..end]
     end: usize,
     pin: usize,    // buf[..pin] holds the current head: never moved
     limit: usize,  // the most buf may grow to
 
-    fn init(stream: net.TcpStream, limit: usize) !Conn {
+    fn init(stream: Transport, limit: usize) !Conn {
         let b = mem.alloc.[u8](@min(16384, limit))!;
         return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit };
     }
@@ -563,7 +607,7 @@ pub struct Request {
 const STREAM_THRESHOLD: usize = 65536;
 
 pub struct Response {
-    stream: net.TcpStream,
+    stream: Transport,
     status: u16,
     head: strs.String,  // "Name: value\r\n" for each header the handler set
     body: strs.String,  // buffered, not yet sent
@@ -751,6 +795,8 @@ pub struct Server[C] {
     ctx: *mut C,
     opts: Options,
     stopping: u32,
+    tls_config: *tls.ServerConfig,
+    secure: bool,
 
     /// The port it listens on (useful after listening on port 0).
     pub fn port(self: *Self) u16 {
@@ -789,7 +835,25 @@ pub struct Server[C] {
 pub fn server[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
                  opts: Options) !Server.[C] {
     let l = net.listen(hostname, port)!;
-    return Server.[C].{ listener: l, handler: handler, ctx: ctx, opts: opts, stopping: 0 };
+    return Server.[C].{
+        listener: l,
+        handler: handler,
+        ctx: ctx,
+        opts: opts,
+        stopping: 0,
+        tls_config: @ptr_from_int(*tls.ServerConfig, 8),
+        secure: false,
+    };
+}
+
+/// Like server, but serving HTTPS with the given certificate and key, which
+/// must outlive the server.
+pub fn server_tls[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
+                     opts: Options, cfg: *tls.ServerConfig) !Server.[C] {
+    let mut s = server(hostname, port, handler, ctx, opts)!;
+    s.tls_config = cfg;
+    s.secure = true;
+    return s;
 }
 
 /// Listens on hostname:port and serves forever.
@@ -812,13 +876,22 @@ fn accept_loop[C](s: *mut Server.[C]) void {
             conn.close();
             return;
         }
-        serve_connection(s, conn);
-        conn.close();
+        conn.set_timeout(s.opts.idle_timeout_ms) catch {
+            conn.close();
+            continue;
+        };
+        let mut t = Transport.plain(conn);
+        if s.secure {
+            // the handshake closes the socket if it fails
+            t = Transport.over_tls(tls.server(conn, s.tls_config) catch continue);
+        }
+        serve_connection(s, t);
+        t.close();
     }
 }
 
 /// Sends a short error response and returns false (close the connection).
-fn reject(stream: net.TcpStream, status: u16) bool {
+fn reject(stream: Transport, status: u16) bool {
     let mut b: [160]u8 = [0; 160];
     let msg = fmt.bufprint(b[..],
                            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}\n",
@@ -842,8 +915,7 @@ fn status_for(e: error) u16 {
     }
 }
 
-fn serve_connection[C](s: *mut Server.[C], stream: net.TcpStream) void {
-    stream.set_timeout(s.opts.idle_timeout_ms) catch return;
+fn serve_connection[C](s: *mut Server.[C], stream: Transport) void {
     let mut c = Conn.init(stream, s.opts.max_head_bytes) catch return;
     defer c.deinit();
     let mut body = strs.String.init();
@@ -1083,6 +1155,12 @@ pub struct Router[C] {
         let mut s = server(hostname, port, Self.handle, self, opts)!;
         s.run()!;
     }
+
+    /// Listens on hostname:port and serves HTTPS with this router forever.
+    pub fn serve_tls(self: *mut Self, hostname: []u8, port: u16, opts: Options, cfg: *tls.ServerConfig) !void {
+        let mut s = server_tls(hostname, port, Self.handle, self, opts, cfg)!;
+        s.run()!;
+    }
 }
 
 /// Whether path matches pattern; the parameters are stored (decoded) in
@@ -1133,21 +1211,24 @@ fn add_param(req: *mut Scratch, name: []u8, raw: []u8) !bool {
 // The client
 // -----------------------------------------------------------------------------
 
-/// The parts of an http:// URL.
+/// The parts of an http:// or https:// URL.
 pub struct Url {
     hostname: []u8,
     port: u16,
     target: []u8,  // path and query, "/" if empty
+    secure: bool,  // https
 }
 
-/// Parses "http://hostname[:port][/path][?query]".
+/// Parses "http[s]://hostname[:port][/path][?query]".
 pub fn parse_url(url: []u8) !Url {
-    let rest = strs.strip_prefix(url, "http://") catch {
-        if strs.starts_with(url, "https://") {
-            return error.Unsupported;
-        }
-        return error.BadUrl;
-    };
+    let mut secure = false;
+    let mut rest = url;
+    if strs.starts_with(url, "https://") {
+        secure = true;
+        rest = url[8..];
+    } else {
+        rest = strs.strip_prefix(url, "http://") catch return error.BadUrl;
+    }
     let slash = strs.index_of_any(rest, "/?") catch rest.len;
     let authority = rest[..slash];
     let mut target = rest[slash..];
@@ -1158,6 +1239,9 @@ pub fn parse_url(url: []u8) !Url {
     }
     let mut hostname = authority;
     let mut port: u16 = 80;
+    if secure {
+        port = 443;
+    }
     let colon = strs.last_index_of_byte(authority, ':') catch authority.len;
     if colon < authority.len {
         hostname = authority[..colon];
@@ -1167,7 +1251,7 @@ pub fn parse_url(url: []u8) !Url {
         return error.BadUrl;
     }
     let hash = strs.index_of_byte(target, '#') catch target.len;
-    return Url.{ hostname: hostname, port: port, target: target[..hash] };
+    return Url.{ hostname: hostname, port: port, target: target[..hash], secure: secure };
 }
 
 /// A response received by the client. It owns its memory: call deinit.
@@ -1195,10 +1279,46 @@ pub struct ClientResponse {
 pub struct ClientOptions {
     timeout_ms: u32,
     max_body_bytes: usize,
+    tls_config: *tls.ClientConfig,  // for https (see with_tls)
+    has_tls_config: bool,
 
     pub fn default() ClientOptions {
-        return ClientOptions.{ timeout_ms: 30000, max_body_bytes: 1073741824 };
+        return ClientOptions.{
+            timeout_ms: 30000,
+            max_body_bytes: 1073741824,
+            tls_config: @ptr_from_int(*tls.ClientConfig, 8),
+            has_tls_config: false,
+        };
     }
+
+    /// These options with https:// connections using cfg (which must
+    /// outlive the requests) rather than the system's root certificates.
+    pub fn with_tls(self: ClientOptions, cfg: *tls.ClientConfig) ClientOptions {
+        let mut o = self;
+        o.tls_config = cfg;
+        o.has_tls_config = true;
+        return o;
+    }
+}
+
+// The configuration for https:// by default, trusting the system's roots,
+// made the first time it is needed.
+let mut SYSTEM_TLS_LOCK: sync.Mutex = sync.Mutex.{ state: 0 };
+let mut SYSTEM_TLS: usize = 0;
+
+fn system_tls() !*tls.ClientConfig {
+    SYSTEM_TLS_LOCK.lock();
+    defer SYSTEM_TLS_LOCK.unlock();
+    if SYSTEM_TLS == 0 {
+        let cfg = tls.ClientConfig.system()!;
+        let p = mem.create(cfg) catch |e| {
+            let mut c = cfg;
+            c.deinit();
+            return e;
+        };
+        SYSTEM_TLS = @int_from_ptr(p);
+    }
+    return @ptr_from_int(*tls.ClientConfig, SYSTEM_TLS);
 }
 
 pub fn get(url: []u8) !ClientResponse {
@@ -1210,7 +1330,8 @@ pub fn post(url: []u8, content_type: []u8, body: []u8) !ClientResponse {
     return request("POST", url, hs[..], body, ClientOptions.default());
 }
 
-fn no_headers() []Header {
+/// An empty header list, for request().
+pub fn no_headers() []Header {
     return @slice_from_ptr(@ptr_from_int(*Header, 8), 0);
 }
 
@@ -1218,15 +1339,29 @@ fn no_headers() []Header {
 /// Host, Content-Length and "Connection: close" are added.
 pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: ClientOptions) !ClientResponse {
     let u = parse_url(url)!;
-    let stream = net.connect(u.hostname, u.port)!;
+    let tcp = net.connect(u.hostname, u.port)!;
+    tcp.set_timeout(opts.timeout_ms) catch |e| {
+        tcp.close();
+        return e;
+    };
+    let mut stream = Transport.plain(tcp);
+    if u.secure {
+        let mut cfg = opts.tls_config;
+        if not opts.has_tls_config {
+            cfg = system_tls() catch |e| {
+                tcp.close();
+                return e;
+            };
+        }
+        stream = Transport.over_tls(tls.client(tcp, u.hostname, cfg)!);  // closes tcp on failure
+    }
     defer stream.close();
-    stream.set_timeout(opts.timeout_ms)!;
     // the request head
     let mut h = strs.String.init();
     defer h.deinit();
     let w = h.writer();
     fmt.write(w, "{} {} HTTP/1.1\r\nHost: {}", [fmt.str(method), fmt.str(u.target), fmt.str(u.hostname)])!;
-    if u.port != 80 {
+    if ((u.port != 80) and not u.secure) or ((u.port != 443) and u.secure) {
         fmt.write(w, ":{}", [fmt.int(u.port)])!;
     }
     h.push_str("\r\nConnection: close\r\n")!;
@@ -1342,8 +1477,14 @@ test "urls and encoding" {
     @expect_eq(u.target, "/a/b?x=1");
     @expect_eq(parse_url("http://h")!.target, "/");
     @expect_eq(parse_url("http://h")!.port, 80);
-    _ = parse_url("https://h/") catch |e| {
-        @expect_eq(e, error.Unsupported);
+    @expect(not parse_url("http://h")!.secure);
+    let v = parse_url("https://h.example/x")!;
+    @expect(v.secure);
+    @expect_eq(v.port, 443);
+    @expect_eq(v.hostname, "h.example");
+    @expect_eq(parse_url("https://h:8443")!.port, 8443);
+    _ = parse_url("ftp://h/") catch |e| {
+        @expect_eq(e, error.BadUrl);
         let mut out: [32]u8 = [0; 32];
         @expect_eq(percent_decode("a%20b+c%2F", out[..], true)!, "a b c/");
         @expect_eq(percent_decode("a+b", out[..], false)!, "a+b");
@@ -1527,4 +1668,65 @@ test "server and client" {
     @expect_eq(@atomic_load(&app.hits), 3);
     srv.stop();
     th.join();
+}
+
+test "https" {
+    let cert = tls.test_certificate_pem()!;
+    defer mem.free(cert);
+    let key = tls.test_key_pem()!;
+    defer mem.free(key);
+    let mut scfg = tls.ServerConfig.from_pem(cert, key)!;
+    defer scfg.deinit();
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    r.post("/echo", t_echo)!;
+    r.get("/big", t_big)!;
+    let mut opts = Options.default();
+    opts.threads = 2;
+    let mut srv = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut ccfg = tls.ClientConfig.with_roots_pem(cert)!;
+    defer ccfg.deinit();
+    let copts = ClientOptions.default().with_tls(&ccfg);
+    let mut url: [128]u8 = [0; 128];
+
+    let mut a = request("GET", fmt.bufprint(url[..], "https://localhost:{}/hello?name=tls", [fmt.int(port)])!,
+                        no_headers(), "", copts)!;
+    @expect_eq(a.status, 200);
+    @expect_eq(a.body, "hello, tls");
+    a.deinit();
+
+    let mut b = request("POST", fmt.bufprint(url[..], "https://127.0.0.1:{}/echo", [fmt.int(port)])!, no_headers(),
+                        "over tls", copts)!;
+    @expect_eq(b.status, 201);
+    @expect_eq(b.body, "over tls");
+    b.deinit();
+
+    let mut c = request("GET", fmt.bufprint(url[..], "https://localhost:{}/big", [fmt.int(port)])!, no_headers(), "",
+                        copts)!;
+    @expect_eq(c.body.len, 110000);
+    c.deinit();
+
+    // a client that doesn't trust the certificate; plain HTTP to a TLS port
+    let mut other = tls.ClientConfig.with_roots_pem("")!;
+    defer other.deinit();
+    @expect(fails(request("GET", fmt.bufprint(url[..], "https://localhost:{}/hello", [fmt.int(port)])!, no_headers(),
+                          "", ClientOptions.default().with_tls(&other))));
+    // the system's roots don't include it either
+    @expect(fails(get(fmt.bufprint(url[..], "https://localhost:{}/hello", [fmt.int(port)])!)));
+    let mut plain_opts = ClientOptions.default();
+    plain_opts.timeout_ms = 5000;
+    @expect(fails(request("GET", fmt.bufprint(url[..], "http://localhost:{}/hello", [fmt.int(port)])!, no_headers(), "",
+                          plain_opts)));
+
+    srv.stop();
+    th.join();
+}
+
+fn fails[T](r: !T) bool {
+    _ = r catch return true;
+    return false;
 }

@@ -15,7 +15,27 @@ fn fill(xs: []mut u32, v: u32) void {
     }
 }
 
+struct Holder {
+    s: []u8,
+    n: u64,
+}
+
+// a constant on the left of an operation whose right operand is a load
+// that the x86-64 backend folds into a memory operand
+fn plus5(h: *Holder) usize {
+    return 5 + h.s.len;
+}
+
+fn mixed(h: *Holder) u64 {
+    return (7 * h.n) + (3 | h.n);
+}
+
 export fn run() void {
+    let hb: [3]u8 = [1, 2, 3];
+    let h = Holder.{ s: hb[..], n: 4 };
+    io.int(@int_cast(i64, plus5(&h)));  // expect: 8
+    io.int(@int_cast(i64, mixed(&h)));  // expect: 35
+
     let mut a: [8]u32 = [0; 8];
     fill(a[2..6], 10);
     io.int(@as(i64, total(a[..])));  // expect: 46

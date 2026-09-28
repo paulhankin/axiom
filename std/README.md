@@ -20,11 +20,31 @@ and a type that owns memory has `deinit`).
 | [`fmt`](fmt.ph) | Templates: `fmt.print("{} is {:>5.2}\n", [fmt.str(s), fmt.float(x)])`, also `write`, `alloc`, `bufprint`; `parse_int[T]`, `parse_float` (correctly rounded), `format_float` (shortest round trip), `format_int` |
 | [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`), RFC 3339 and HTTP dates, `sleep` |
 | [`json`](json.ph) | `parse` → `Document` (a `Value` tree: `get`, `at`, `as_str`, `as_i64`, …); `Writer` (streaming, compact or pretty); `stringify` |
-| [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies, `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`); percent-encoding |
+| [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies (HTTPS with `server_tls` / `Router.serve_tls`), `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`) for `http://` and `https://` URLs; percent-encoding |
+| [`tls`](tls.ph) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
+| [`base64`](base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets |
 | [`bigint`](bigint.ph) | `BigInt`: arbitrary-precision integers — arithmetic (Karatsuba multiplication), truncated and Euclidean division, shifts and bitwise operations, `pow`, `mod_pow` (Montgomery; `mod_pow_secret` in constant time), `gcd`, `mod_inverse`, `sqrt`, conversion to and from any base and bytes |
 | [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
 
-Each module carries its own tests: `phalange test std/<module>.ph`.
+Cryptography lives in `std/crypto/` (the primitives are written to run in constant
+time where secrets are involved):
+
+| Module | Contents |
+|---|---|
+| [`crypto/random`](crypto/random.ph) | Secure random bytes from the operating system: `fill`, `uint64`, `below` |
+| [`crypto/sha2`](crypto/sha2.ph) | SHA-256, SHA-384, SHA-512; a `Hasher` over any of them |
+| [`crypto/hmac`](crypto/hmac.ph) | HMAC; HKDF (`extract`, `expand`) |
+| [`crypto/subtle`](crypto/subtle.ph) | Constant-time comparison |
+| [`crypto/aes_gcm`](crypto/aes_gcm.ph) | AES-128/256 and AES-GCM (`seal`, `open`) |
+| [`crypto/chacha20poly1305`](crypto/chacha20poly1305.ph) | ChaCha20, Poly1305 and their AEAD |
+| [`crypto/curve25519`](crypto/curve25519.ph) | X25519 key agreement and Ed25519 signatures |
+| [`crypto/ec`](crypto/ec.ph) | P-256 and P-384: ECDH and ECDSA |
+| [`crypto/rsa`](crypto/rsa.ph) | RSA signatures, PKCS #1 v1.5 and PSS (over `bigint`) |
+| [`crypto/der`](crypto/der.ph) | Reading ASN.1 DER |
+| [`crypto/x509`](crypto/x509.ph) | X.509 certificates, PEM, private keys, `CertPool` (with the system's roots), chain verification |
+
+Each module carries its own tests: `phalange test std/<module>.ph`. The cryptography
+has not been audited: review it before relying on it.
 
 ## Conventions
 
