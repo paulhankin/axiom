@@ -1,5 +1,6 @@
 // =============================================================================
-// std/map.ph - hash maps (open addressing, linear probing).
+// std/map.ph - hash maps: Swiss tables (open addressing over groups of 16
+// slots, each slot with a control byte).
 //
 // Phalange has no traits, so a map is given its hash and equality functions
 // when it is created:
@@ -8,15 +9,27 @@
 //
 // Keys and values are stored by value. For []u8 keys only the slice is
 // stored, not the bytes it points to: keep the bytes alive (e.g. in an Arena).
+//
+// A control byte is EMPTY, DELETED, or for a full slot the top 7 bits of its
+// key's hash. A lookup starts at the group the hash's low bits pick and
+// compares the 16 control bytes with the key's 7 bits at once (a SIMD
+// compare and a bitmask): only the slots that match are compared as keys,
+// and a group with an EMPTY slot ends the search. Groups are probed in
+// triangular steps (1, 2, 3, ... groups on), which visit every group.
 // =============================================================================
 
 import "mem.ph" as mem;
 
 error { NotFound, OutOfMemory }
 
-const EMPTY: u8 = 0;
-const FULL: u8 = 1;
-const DELETED: u8 = 2;
+const GROUP: usize = 16;
+const EMPTY: u8 = 0x80;
+const DELETED: u8 = 0xFE;
+const NONE: usize = @max_value(usize);
+
+fn tag(h: u64) u8 {
+    return @truncate(u8, h >> 57);
+}
 
 pub struct Map[K, V] {
     alloc: mem.Allocator,
@@ -24,9 +37,9 @@ pub struct Map[K, V] {
     eq_fn: fn(K, K) bool,
     keys: []mut K,
     vals: []mut V,
-    states: []mut u8,  // capacity == states.len, always 0 or a power of two
-    count: usize,      // FULL slots
-    used: usize,       // FULL + DELETED slots
+    ctrl: []mut u8,    // capacity == ctrl.len: 0, or a power of two >= GROUP
+    count: usize,      // full slots
+    used: usize,       // full and DELETED slots
 
     pub fn init(alloc: mem.Allocator, hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
         return Self.{
@@ -35,21 +48,21 @@ pub struct Map[K, V] {
             eq_fn: eq_fn,
             keys: @slice_from_ptr(@ptr_from_int(*mut K, @align_of(K)), 0),
             vals: @slice_from_ptr(@ptr_from_int(*mut V, @align_of(V)), 0),
-            states: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0),
+            ctrl: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0),
             count: 0,
             used: 0,
         };
     }
 
     pub fn deinit(self: *mut Self) void {
-        if self.states.len > 0 {
+        if self.ctrl.len > 0 {
             self.alloc.free(self.keys);
             self.alloc.free(self.vals);
-            self.alloc.free(self.states);
+            self.alloc.free(self.ctrl);
         }
         self.keys = @slice_from_ptr(@ptr_from_int(*mut K, @align_of(K)), 0);
         self.vals = @slice_from_ptr(@ptr_from_int(*mut V, @align_of(V)), 0);
-        self.states = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        self.ctrl = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
         self.count = 0;
         self.used = 0;
     }
@@ -59,104 +72,124 @@ pub struct Map[K, V] {
     }
 
     pub fn capacity(self: *Self) usize {
-        return self.states.len;
+        return self.ctrl.len;
     }
 
-    fn start(self: *Self, k: K) usize {
-        return @truncate(usize, self.hash_fn(k)) & (self.states.len - 1);
+    // The slot holding k (hash h), or NONE.
+    fn slot_of(self: *Self, k: K, h: u64) usize {
+        if self.count == 0 {
+            return NONE;
+        }
+        let gmask = (self.ctrl.len / GROUP) - 1;
+        let t: u8x16 = @splat(tag(h));
+        let e: u8x16 = @splat(EMPTY);
+        let mut g = @truncate(usize, h) & gmask;
+        let mut step: usize = 0;
+        loop {
+            let base = g *% GROUP;  // (g is masked: no overflow)
+            let c = @load(u8x16, self.ctrl[base..base + GROUP]);
+            let mut m = @bitmask(@lanes_eq(c, t));
+            let empty = @bitmask(@lanes_eq(c, e));  // (no vector lives across the calls)
+            while m != 0 {
+                let i = base + @as(usize, @ctz(m));
+                if self.eq_fn(self.keys[i], k) {
+                    return i;
+                }
+                m = m & (m -% 1);
+            }
+            if empty != 0 {
+                return NONE;
+            }
+            step +%= 1;
+            g = (g +% step) & gmask;
+        }
     }
 
     fn find(self: *Self, k: K) !usize {
-        if self.count == 0 {
+        let i = self.slot_of(k, self.hash_fn(k));
+        if i == NONE {
             return error.NotFound;
         }
-        let mask = self.states.len - 1;
-        let mut i = self.start(k);
+        return i;
+    }
+
+    // A slot for a new key of hash h: the first EMPTY or DELETED slot on its
+    // probe sequence (there is one: the table is never full).
+    fn free_slot(self: *Self, h: u64) usize {
+        let gmask = (self.ctrl.len / GROUP) - 1;
+        let mut g = @truncate(usize, h) & gmask;
+        let mut step: usize = 0;
         loop {
-            let st = self.states[i];
-            if st == EMPTY {
-                return error.NotFound;
+            let base = g *% GROUP;
+            // EMPTY and DELETED have the high bit set, tags do not
+            let m = @bitmask(@load(u8x16, self.ctrl[base..base + GROUP]));
+            if m != 0 {
+                return base + @as(usize, @ctz(m));
             }
-            if (st == FULL) and self.eq_fn(self.keys[i], k) {
-                return i;
-            }
-            i = (i + 1) & mask;
+            step +%= 1;
+            g = (g +% step) & gmask;
         }
     }
 
-    // Rehash into a table of `cap` slots (a power of two > count).
+    // Rehash into a table of `cap` slots (a power of two >= GROUP, > count).
     fn rehash(self: *mut Self, cap: usize) !void {
         let nk = self.alloc.alloc.[K](cap)!;
         let nv = self.alloc.alloc.[V](cap) catch |e| {
             self.alloc.free(nk);
             return e;
         };
-        let ns = self.alloc.alloc.[u8](cap) catch |e| {
+        let nc = self.alloc.alloc.[u8](cap) catch |e| {
             self.alloc.free(nk);
             self.alloc.free(nv);
             return e;
         };
-        @mem_set(ns, EMPTY);
-        let mask = cap - 1;
-        for i in 0..self.states.len {
-            if self.states[i] == FULL {
-                let mut j = @truncate(usize, self.hash_fn(self.keys[i])) & mask;
-                while ns[j] != EMPTY {
-                    j = (j + 1) & mask;
-                }
-                nk[j] = self.keys[i];
-                nv[j] = self.vals[i];
-                ns[j] = FULL;
-            }
-        }
-        if self.states.len > 0 {
-            self.alloc.free(self.keys);
-            self.alloc.free(self.vals);
-            self.alloc.free(self.states);
-        }
+        @mem_set(nc, EMPTY);
+        let ok = self.keys;
+        let ov = self.vals;
+        let oc = self.ctrl;
         self.keys = nk;
         self.vals = nv;
-        self.states = ns;
+        self.ctrl = nc;
+        for i in 0..oc.len {
+            if oc[i] < 0x80 {
+                let h = self.hash_fn(ok[i]);
+                let j = self.free_slot(h);
+                nk[j] = ok[i];
+                nv[j] = ov[i];
+                nc[j] = tag(h);
+            }
+        }
+        if oc.len > 0 {
+            self.alloc.free(ok);
+            self.alloc.free(ov);
+            self.alloc.free(oc);
+        }
         self.used = self.count;
     }
 
     /// Inserts or replaces the value for `k`.
     pub fn put(self: *mut Self, k: K, v: V) !void {
-        if ((self.used + 1) * 4) > (self.states.len * 3) {
-            let mut cap = @max(self.states.len, 8);
+        let h = self.hash_fn(k);
+        let i = self.slot_of(k, h);
+        if i != NONE {
+            self.vals[i] = v;
+            return;
+        }
+        // at most 7/8 full (DELETED slots count: they lengthen searches)
+        if ((self.used + 1) * 8) > (self.ctrl.len * 7) {
+            let mut cap = @max(self.ctrl.len, GROUP);
             if ((self.count + 1) * 2) > cap {
                 cap = @mul_checked(cap, 2) catch return error.OutOfMemory;
             }
             self.rehash(cap)!;
         }
-        let mask = self.states.len - 1;
-        let mut i = self.start(k);
-        let mut tomb: usize = 0;
-        let mut have_tomb = false;
-        loop {
-            let st = self.states[i];
-            if st == EMPTY {
-                break;
-            }
-            if st == DELETED {
-                if not have_tomb {
-                    tomb = i;
-                    have_tomb = true;
-                }
-            } else if self.eq_fn(self.keys[i], k) {
-                self.vals[i] = v;
-                return;
-            }
-            i = (i + 1) & mask;
-        }
-        if have_tomb {
-            i = tomb;
-        } else {
+        let j = self.free_slot(h);
+        if self.ctrl[j] == EMPTY {
             self.used += 1;
         }
-        self.keys[i] = k;
-        self.vals[i] = v;
-        self.states[i] = FULL;
+        self.keys[j] = k;
+        self.vals[j] = v;
+        self.ctrl[j] = tag(h);
         self.count += 1;
     }
 
@@ -179,13 +212,22 @@ pub struct Map[K, V] {
     /// Removes `k`; returns whether it was present.
     pub fn remove(self: *mut Self, k: K) bool {
         let i = self.find(k) catch return false;
-        self.states[i] = DELETED;
+        // a group with an EMPTY slot ends every search that reaches it, so
+        // the slot can be EMPTY again; else searches must go on past it
+        let base = i & ~(GROUP - 1);
+        let e: u8x16 = @splat(EMPTY);
+        if @bitmask(@lanes_eq(@load(u8x16, self.ctrl[base..base + GROUP]), e)) != 0 {
+            self.ctrl[i] = EMPTY;
+            self.used -= 1;
+        } else {
+            self.ctrl[i] = DELETED;
+        }
         self.count -= 1;
         return true;
     }
 
     pub fn clear(self: *mut Self) void {
-        @mem_set(self.states, EMPTY);
+        @mem_set(self.ctrl, EMPTY);
         self.count = 0;
         self.used = 0;
     }
@@ -204,10 +246,10 @@ pub struct Iter[K, V] {
     /// Stores the next entry through `key` and `val` and returns true, or
     /// returns false when there are no more entries.
     pub fn next(self: *mut Self, key: *mut K, val: *mut V) bool {
-        while self.i < self.map.states.len {
+        while self.i < self.map.ctrl.len {
             let j = self.i;
             self.i += 1;
-            if self.map.states[j] == FULL {
+            if self.map.ctrl[j] < 0x80 {
                 key.* = self.map.keys[j];
                 val.* = self.map.vals[j];
                 return true;
@@ -280,4 +322,65 @@ test "iteration visits every entry once" {
     }
     @expect_eq(n, 3);
     @expect_eq(sum, 6);
+}
+
+test "random operations agree with an array" {
+    let mut m = Map.[u64, u64].init(mem.page_allocator, hash.hash_u64, hash.eq_u64);
+    defer m.deinit();
+    let mut ref: [512]u64 = [0; 512];  // 0: absent, else value + 1
+    let mut s: u64 = 0x9E3779B97F4A7C15;
+    for step in @as(u64, 0)..20000 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let k = s % 512;
+        let ki = @truncate(usize, k);
+        let op = (s >> 20) % 3;
+        if op == 0 {
+            m.put(k, step)!;
+            ref[ki] = step + 1;
+        } else if op == 1 {
+            @expect_eq(m.remove(k), ref[ki] != 0);
+            ref[ki] = 0;
+        } else {
+            let got = m.get(k) catch 0xFFFF_FFFF_FFFF_FFFF;
+            if ref[ki] == 0 {
+                @expect_eq(got, 0xFFFF_FFFF_FFFF_FFFF);
+            } else {
+                @expect_eq(got, ref[ki] - 1);
+            }
+        }
+    }
+    let mut n: usize = 0;
+    for k in 0..ref.len {
+        if ref[k] != 0 {
+            n += 1;
+        }
+    }
+    @expect_eq(m.len(), n);
+}
+
+fn same_hash(x: u64) u64 {
+    _ = x;
+    return 42;
+}
+
+test "keys with the same hash probe past full groups" {
+    let mut m = Map.[u64, u64].init(mem.page_allocator, same_hash, hash.eq_u64);
+    defer m.deinit();
+    for i in @as(u64, 0)..100 {
+        m.put(i, i + 7)!;
+    }
+    for i in @as(u64, 0)..100 {
+        @expect_eq(m.get(i)!, i + 7);
+    }
+    for i in @as(u64, 0)..50 {
+        @expect(m.remove(i * 2));
+    }
+    for i in @as(u64, 0)..100 {
+        @expect_eq(m.contains(i), (i % 2) == 1);
+    }
+    m.put(4, 1)!;
+    @expect_eq(m.get(4)!, 1);
+    @expect_eq(m.len(), 51);
 }

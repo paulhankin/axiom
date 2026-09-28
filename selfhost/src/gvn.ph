@@ -2746,6 +2746,15 @@ pub fn sink(f: *mut ir.Func) bool {
                     while (t != blk) and (t.loop_depth > blk.loop_depth) {
                         t = t.idom;
                     }
+                    // not past an inner loop (its operands would live across it)
+                    let mut up = t;
+                    while up != blk {
+                        if up.loop_depth > blk.loop_depth {
+                            t = blk;
+                            break;
+                        }
+                        up = up.idom;
+                    }
                     if is_load and (t != blk) {
                         // only into a successor reached from here alone, and
                         // nothing after the load here writes memory
