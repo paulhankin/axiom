@@ -1675,8 +1675,9 @@ a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 
 ### 15.2 Other modules and the host ABI
 
-The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `net`) is
-ordinary Phalange code; see `std/README.md`. It adds no language rules. Operating-system
+The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `str`, `fmt`,
+`time`, `thread`, `sync`, `net`, `http`, `json`, `regex`) is ordinary Phalange code; see
+`std/README.md`. It adds no language rules. Operating-system
 services are reached through host functions imported from module `"phalange"` (the
 *Phalange host ABI*). Implementations exist for node (`runtime/host.mjs`) and POSIX
 (`runtime/native_host.c` in C, `runtime/native.ph` in Phalange). A program that uses only the language and `std/mem`, `vec`,

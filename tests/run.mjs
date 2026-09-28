@@ -145,7 +145,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   if (json) {
     const want = [...src.matchAll(/^\/\/ test-result: (.+?) \| (pass|fail)(?: \| (\S+))?(?: \| (\d+))?$/gm)];
     if (!want.length) {
-      if (json.status !== 'pass') problem = `failures:\n${JSON.stringify(json.tests.filter((t) => t.status !== 'pass'), null, 1)}`;
+      if (json.status !== 'pass') problem = `failures:\n${JSON.stringify(json.tests ? json.tests.filter((t) => t.status !== 'pass') : json, null, 1)}`;
     } else {
       for (const [, tname, status, code, line] of want) {
         const t = json.tests.find((x) => x.name === tname);
@@ -191,7 +191,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
     let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
     if (!problem) {
       const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
-      const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \(tests\/traces\/crash\.ph:4:12\)/,
+      const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \((?:\S*\/)?tests\/traces\/crash\.ph:4:12\)/,
         /the frame above repeats 255 more times/, /\.\.\. \d+ more frames/];
       for (const w of want) if (!w.test(r.stderr)) { problem = `stderr lacks ${w}:\n${r.stderr}`; break; }
       if (!problem && r.status === 0) problem = 'the program exited normally';

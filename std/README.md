@@ -15,7 +15,13 @@ and a type that owns memory has `deinit`).
 | [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
 | [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
 | [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
-| [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters); IPv4 parsing/formatting |
+| [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters, timeouts); IPv4 parsing/formatting |
+| [`str`](str.ph) | Strings as `[]u8`: comparison, search, `trim`, `cut`, `split` / `lines` / `fields` iterators, ASCII case, `join` / `replace`, UTF-8 (`decode_rune`, `encode_rune`, `valid_utf8`, `runes`); `String`, a growable string with a `Writer` |
+| [`fmt`](fmt.ph) | Templates: `fmt.print("{} is {:>5.2}\n", [fmt.str(s), fmt.float(x)])`, also `write`, `alloc`, `bufprint`; `parse_int[T]`, `parse_float` (correctly rounded), `format_float` (shortest round trip), `format_int` |
+| [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`), RFC 3339 and HTTP dates, `sleep` |
+| [`json`](json.ph) | `parse` → `Document` (a `Value` tree: `get`, `at`, `as_str`, `as_i64`, …); `Writer` (streaming, compact or pretty); `stringify` |
+| [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies, `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`); percent-encoding |
+| [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
 
 Each module carries its own tests: `phalange test std/<module>.ph`.
 
@@ -53,7 +59,19 @@ export fn main() i32 {
 }
 ```
 
-See also [`examples/wordcount.ph`](../examples/wordcount.ph).
+See also [`examples/wordcount.ph`](../examples/wordcount.ph) and
+[`examples/http_server.ph`](../examples/http_server.ph), a JSON API over HTTP.
+
+Iterators (`str.split`, `regex.find_all`, …) have a `next()` that fails with
+`error.Done` after the last item:
+
+```phalange
+let mut it = str.split(line, ",");
+loop {
+    let field = it.next() catch break;
+    ...
+}
+```
 
 ## Host ABI
 

@@ -29,6 +29,7 @@ Phalange's choices differ and what each choice costs.
 | **Data races** | Defined (each byte reads some written value); sequentially consistent atomics only | Undefined; atomics with orderings | Prevented by `Send`/`Sync` in safe code | Undefined; atomics with orderings | Undefined; atomics with orderings |
 | **SIMD** | 128-bit vector primitives (`f32x4`, `i8x16`, …) with WebAssembly semantics everywhere | `@Vector(N, T)` of any width | Intrinsics (`core::arch`); portable `std::simd` is unstable | Intrinsics, vector extensions; `std::simd` in C++26 | Intrinsics, vector extensions |
 | **Grammar** | LL(1), context-free, no macros; operator precedence is a partial order | Simple, no macros | Large; macros | Very large, context-sensitive | Small, but the preprocessor sits on top |
+| **Standard library** | Small: containers, strings, `{}` formatting, time, threads, TCP, an HTTP/1.1 server and client (no TLS), JSON, linear-time regular expressions | Broad (containers, formatting, JSON, an HTTP client with TLS and a server, crypto); no regular expressions | Deliberately small (no JSON, HTTP or regex: crates) | Large (containers, algorithms, `std::format`, `<regex>`, `<chrono>`); no JSON or HTTP | Minimal (`stdio`, `string.h`, `time.h`) |
 | **Formatter** | `phalange fmt` (one canonical layout, imports tidied) | `zig fmt` | `rustfmt` | `clang-format` (configurable) | `clang-format` (configurable) |
 | **Toolchain** | One binary: build, check, test, profile, fmt, packages, C headers | One binary: build system, tests, fmt, C compiler | `cargo` and friends | Many tools, no standard build or package system | Many tools, no standard build or package system |
 | **Diagnostics** | Stable codes; `--format=agent-json` with machine-applicable fixes | Human-readable | Human-readable; JSON with suggestions | Human-readable; SARIF in some compilers | Human-readable; SARIF in some compilers |
@@ -340,8 +341,8 @@ weakly ordered CPUs such as ARM.
 - **One error set and no error payloads.** Less type information about failures than
   Zig or Rust.
 - **Only 128-bit SIMD.**
-- **Young.** Phalange is a v0.1 draft with a small standard library and no third-party
-  ecosystem. On native targets, the linear-memory bounds model of §12.1 is not yet
+- **Young.** Phalange is a v0.1 draft with a small standard library (no TLS, no time
+  zones, no Unicode case folding) and no third-party ecosystem. On native targets, the linear-memory bounds model of §12.1 is not yet
   implemented: a raw pointer outside mapped memory crashes with a signal instead of a
   deterministic trap (slices, arrays and the other checks behave as on wasm). On this
   repository's benchmarks, the self-hosted compiler's own backend produces code that takes

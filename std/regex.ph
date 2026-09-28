@@ -571,7 +571,7 @@ struct Parser {
             } else if c == ':' {
                 self.i += 1;
             } else {
-                // flags: (?imsU-imsU) or (?imsU-imsU:...)
+                // a flag group: (?imsU-imsU) or (?imsU-imsU:...)
                 let mut on = true;
                 let mut any = false;
                 loop {
