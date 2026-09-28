@@ -9,6 +9,22 @@ and Linux executables. The compiler, and the programs it builds, need nothing bu
 library: no LLVM, no C compiler, no `ld` or `wasm-ld`. (A C toolchain is used only to
 compile C sources that a program links in.)
 
+It also has the formatter, `phalange fmt` (spec §16.5), which the C compiler does not:
+
+```
+$ phalange fmt <file.ph | dir>... [--check] [--stdout]
+```
+
+It rewrites each file (every `.ph` file under a directory) in the canonical layout and
+tidies its imports: each run of imports is sorted by path, duplicate and unused imports
+are removed (except a package import, or a module with tests, since importing it runs
+them), and a standard library module used as `name.x` but never imported is added.
+`--check` changes nothing: it lists the files that are not canonical and exits with 1 if
+there are any. `--stdout` prints the result instead. A file with a syntax error is
+reported and left alone, and so is one whose formatted text would not lex to the same
+tokens and comments (an internal error). The repository's sources are kept canonical
+(`tests/run.mjs` checks them, and the examples in `tests/fmt`).
+
 ## Bootstrapping
 
 ```
@@ -178,6 +194,7 @@ types share a module.
 | `header.ph` | `header.c` | C headers for `export fn`s |
 | `units.ph` | `units.c` | separate compilation and the object cache |
 | `main.ph` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`; linking |
+| `fmt.ph` | | `phalange fmt`: canonical layout from the token stream, imports tidied |
 
 ## How C idioms map to Phalange
 

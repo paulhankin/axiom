@@ -182,8 +182,8 @@ Implemented: the whole language described in spec v0.1-draft.3:
 
 Not yet implemented (reported with a diagnostic where relevant):
 
-- `phalange fmt` (the self-hosted compiler has it), `phalange run` and `phalange explain`
-  (spec §16.1).
+- `phalange fmt` (only the self-hosted compiler has it: [`selfhost/`](../selfhost/README.md)),
+  `phalange run` and `phalange explain` (spec §16.1).
 - The debug trap map (`phalange.traps` custom section) and error-return traces
   (spec §16.4). Traps are plain `unreachable`, so the trap code isn't reported yet.
 - Global initializers containing union values with a payload (`E0353`).

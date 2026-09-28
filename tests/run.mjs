@@ -259,6 +259,59 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
 }
 
+// `phalange fmt` (spec §16.5; the self-hosted compiler only). Each
+// tests/fmt/<name>.ph formats to <name>.expected, which formats to itself;
+// --check lists what is not canonical; a file with a syntax error is left
+// alone; the repository's own sources are canonical.
+{
+  const fdir = path.join(root, 'tests/fmt');
+  const fmt = (args) => spawnSync(compiler, ['fmt', ...args], { encoding: 'utf8', cwd: root });
+  const probe = fmt(['--check', path.join(fdir, 'layout.expected')]);
+  const supported = !/usage:/.test(probe.stderr);
+  const cases = {};
+  for (const f of files(fdir)) {
+    const want = f.replace(/\.ph$/, '.expected');
+    cases[path.basename(f)] = () => {
+      const r = fmt(['--stdout', f]);
+      if (r.status !== 0) return `status ${r.status}: ${r.stderr}`;
+      if (r.stdout !== fs.readFileSync(want, 'utf8')) return `output differs from ${path.basename(want)}:\n${r.stdout}`;
+      const again = fmt(['--check', want]);
+      return again.status === 0 ? null : `${path.basename(want)} is not stable: ${again.stdout}${again.stderr}`;
+    };
+  }
+  cases['--check and rewriting'] = () => {
+    const f = path.join(tmp, 'messy.ph');
+    fs.writeFileSync(f, 'fn  f( ) i32 { return 1 ; }\n');
+    const c = fmt(['--check', f]);
+    if (c.status !== 1 || c.stdout.trim() !== f) return `--check: status ${c.status}, output ${c.stdout}`;
+    const w = fmt([f]);
+    if (w.status !== 0) return `rewrite: status ${w.status}: ${w.stderr}`;
+    const text = fs.readFileSync(f, 'utf8');
+    return text === 'fn f() i32 {\n    return 1;\n}\n' ? null : `rewritten as:\n${text}`;
+  };
+  cases['syntax errors are reported'] = () => {
+    const f = path.join(tmp, 'broken.ph');
+    const src = 'fn f() i32 { return 1 }\n';
+    fs.writeFileSync(f, src);
+    const r = fmt(['--format=agent-json', f]);
+    if (r.status !== 1 || !/E0100/.test(r.stdout)) return `status ${r.status}: ${r.stdout}${r.stderr}`;
+    return fs.readFileSync(f, 'utf8') === src ? null : 'the file was changed';
+  };
+  cases['the repository is canonical'] = () => {
+    const r = fmt(['--check', 'selfhost/src', 'selfhost/bench', 'std', 'examples', 'runtime', 'tests/run', 'tests/units',
+      'tests/lib', 'tests/packages', 'tests/profile']);
+    return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
+  };
+  for (const [cname, fn] of Object.entries(cases)) {
+    const name = `fmt: ${cname}`;
+    if (filter && !name.includes(filter)) continue;
+    if (!supported) { skip++; continue; }
+    const problem = fn();
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // Packages (spec §4.6): builds from a package directory, dependency
 // visibility, name conflicts, manifests, git dependencies, `phalange new`.
 {

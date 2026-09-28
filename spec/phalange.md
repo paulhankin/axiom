@@ -1706,7 +1706,7 @@ services are reached through host functions imported from module `"phalange"` (t
 ```
 phalange build <file.ph> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
 phalange check <file.ph>                  # parse and type-check only; no codegen
-phalange fmt   <file.ph> [--check]        # canonical formatting; --check exits 1 if not canonical
+phalange fmt   <file.ph|dir>... [--check] [--stdout]   # canonical layout (§16.5)
 phalange run   <file.ph> [--export=name]  # build for wasm32 and execute in the reference runtime
 phalange explain <CODE>                   # long-form documentation for a diagnostic code
 phalange test  <file.ph> [--filter=text] [--timeout=ms]   # run test blocks (§17)
@@ -1936,10 +1936,50 @@ FAIL parse config (1 ms)
 
 ### 16.5 Canonical formatting
 
-`phalange fmt` defines the single canonical layout. Its output is the same no matter how the
-input was laid out, and running it twice changes nothing. Agents SHOULD run `phalange fmt`
-before diffing or committing. Two programs that are equal after formatting are the same
-program.
+`phalange fmt` defines the single canonical layout. It rewrites each file given (every `.ph`
+file under a directory) in place; `--check` changes nothing and instead lists the files that
+are not canonical, exiting with status 1 if there are any; `--stdout` prints the result. A
+file with a syntax error is reported (with the usual diagnostics) and left alone. Running
+`fmt` twice changes nothing. Agents SHOULD run `phalange fmt` before diffing or committing.
+
+The layout is rebuilt from the tokens. The only things kept from the input's layout are
+comments, blank lines between statements and declarations, trailing commas, and the line
+breaks of a statement that has comments inside it. Two programs that are equal after
+formatting are the same program.
+
+- **Blocks.** Four spaces per level, one statement per line, `{` at the end of the line
+  that opens the block and `}` on a line of its own (or before `else`). An empty block is
+  `{}`. Several blank lines become one; a block has none at its start or end.
+- **Declarations.** One struct field or union variant per line, each followed by a comma.
+  The functions of `extern` and `import host` blocks one per line. Error sets and
+  anonymous struct types stay on one line: `error { NotFound, Empty }`,
+  `struct { x: f32, y: f32 }`.
+- **Spacing.** Binary and assignment operators, `=>`, keywords and `:` (after) are spaced;
+  prefix operators (`-x`, `not x`, `&mut x`, `*T`, `!T`, `[]u8`), `.`, `..`, calls,
+  indexing and postfix `!` are not. Struct literals are `.{ a: 1 }` and `.{}`; array
+  literals and argument lists are `[1, 2]` and `f(a, b)`; a capture is `catch |e|`.
+- **Match arms.** An arm whose block is one statement without a nested block goes on one
+  line if it fits: `.Circle(c) => { return c.r; }`. The `=>` of consecutive one-line arms
+  line up.
+- **Long lines.** A line longer than 120 columns is broken after `and` or `or` (when one is
+  no deeper in brackets than every `,`), otherwise after the last `,` that fits, otherwise
+  after another binary operator. The next line starts just inside the bracket the break
+  is in; outside any bracket, after the leading `if `, `while `, `return ` (and so on) or
+  the first `= `, or four columns in. If lining up with the bracket would leave too little
+  room, the break goes right after the bracket and the next line is indented four more.
+- **Trailing commas.** A bracketed list written with a trailing comma is laid out one item
+  per line, the closing bracket on a line of its own. Without one, items fill lines.
+- **Comments.** A comment on a line of its own is indented like the code that follows it.
+  Trailing comments on a run of consecutive lines (of about the same length, at the same
+  depth) line up two spaces after the longest line. A comment-only line indented past the
+  code, right after a line with a trailing comment, continues that comment and lines up
+  with it.
+
+`phalange fmt` also tidies imports. Each run of consecutive `import "…" as name;` lines is
+sorted by path; a duplicate import and an unused one are removed, except an import of a
+package (`pkg:`) or of a module that has tests (importing it runs them, §17); and a
+standard library module that the file uses as `name.x`, where `name` is declared nowhere,
+is imported as `std/name`.
 
 ### 16.6 Profiling
 

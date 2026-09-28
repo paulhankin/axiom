@@ -19,24 +19,26 @@
 //   --emit-header=<path>       write a C header for the exported functions
 //   -o <path>                  output path
 // =============================================================================
-import "util.ph" as u;
-import "diag.ph" as dg;
 import "ast.ph" as ast;
-import "types.ph" as ty;
-import "sema.ph" as sema;
 import "codegen.ph" as cg;
-import "header.ph" as header;
-import "units.ph" as units;
-import "package.ph" as pkg;
-import "target.ph" as tg;
-import "wobj.ph" as wo;
-import "wlink.ph" as wl;
+import "diag.ph" as dg;
 import "elf.ph" as elf;
 import "elink.ph" as el;
+import "fmt.ph" as fmt;
+import "header.ph" as header;
+import "package.ph" as pkg;
+import "sema.ph" as sema;
+import "target.ph" as tg;
+import "types.ph" as ty;
+import "units.ph" as units;
+import "util.ph" as u;
+import "wlink.ph" as wl;
+import "wobj.ph" as wo;
 
 fn usage() void {
     u.eprint("usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n");
     u.eprint("       phalange profile [<file.ph> | <package dir>] [--rate=<hz>] [--folded=<path>]\n");
+    u.eprint("       phalange fmt <file.ph | dir>... [--check] [--stdout]   canonical layout, tidy imports\n");
     u.eprint("       phalange new <name>      create a package skeleton\n");
     u.eprint("       phalange cache [path|clean]   the compiled-module cache\n");
     u.eprint("  test: --filter=<text> --timeout=<ms>\n");
@@ -312,7 +314,10 @@ fn print_frames_human(fr: *u.List.[TFrame], errors: bool) void {
     for i in 0..fr.len {
         let f = fr.at(i);
         if f.kind == 'R' {
-            u.print(u.f2("       ... the frame above repeats %s more time%s\n", u.dec(f.count), u.pick(f.count == 1, "", "s")));
+            u.print(
+                u.f2(
+                    "       ... the frame above repeats %s more time%s\n", u.dec(f.count), u.pick(
+                        f.count == 1, "", "s")));
         } else if f.kind == 'O' {
             u.print(u.f1("       ... %s more frames\n", u.dec(f.count)));
         } else if not f.has_span {
@@ -320,10 +325,11 @@ fn print_frames_human(fr: *u.List.[TFrame], errors: bool) void {
         } else {
             let lc = u.span_linecol(f.sp);
             if errors {
-                u.print(u.f5("       %s:%s:%s in %s: %s\n", u.file_of(f.sp.file).display, u.idec(lc.sl), u.idec(lc.sc), f.fname,
-                             source_line(f.sp)));
+                u.print(u.f5("       %s:%s:%s in %s: %s\n", u.file_of(f.sp.file).display, u.idec(lc.sl), u.idec(lc.sc),
+                             f.fname, source_line(f.sp)));
             } else {
-                u.print(u.f4("       at %s (%s:%s:%s)\n", f.fname, u.file_of(f.sp.file).display, u.idec(lc.sl), u.idec(lc.sc)));
+                u.print(u.f4("       at %s (%s:%s:%s)\n", f.fname, u.file_of(f.sp.file).display, u.idec(lc.sl),
+                             u.idec(lc.sc)));
             }
         }
     }
@@ -487,7 +493,8 @@ fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool) 
         } else {
             u.print(u.f3("%s %s (%s ms)\n", u.pick(pass, "ok  ", "FAIL"), d.test_name, ms));
             if not pass {
-                u.print(u.f5("     %s:%s:%s: %s %s\n", u.file_of(sp.file).display, u.idec(lc.sl), u.idec(lc.sc), code, msg));
+                u.print(u.f5("     %s:%s:%s: %s %s\n", u.file_of(sp.file).display, u.idec(lc.sl), u.idec(lc.sc), code,
+                             msg));
                 u.print(u.f1("         %s\n", source_line(sp)));
                 print_frames_human(&frames, etrace);
                 if output.len > 0 {
@@ -504,8 +511,8 @@ fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool) 
         }
     }
     if json {
-        u.print(u.f4("%s],\"passed\":%s,\"failed\":%s,\"status\":\"%s\"}\n", u.pick(nres != 0, "\n", ""), u.idec(passed),
-                     u.idec(failed), u.pick(failed != 0, "fail", "pass")));
+        u.print(u.f4("%s],\"passed\":%s,\"failed\":%s,\"status\":\"%s\"}\n", u.pick(nres != 0, "\n", ""),
+                     u.idec(passed), u.idec(failed), u.pick(failed != 0, "fail", "pass")));
     } else {
         u.print(u.f2("\n%s passed, %s failed\n", u.idec(passed), u.idec(failed)));
     }
@@ -626,7 +633,8 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
         let names = ["node"];
         let node = find_tool(names[..]);
         if u.isnos(node) {
-            dg.emit_fatal(json, "E9003", "phalange profile needs node to run WebAssembly programs (or use --target=native)");
+            dg.emit_fatal(json, "E9003",
+                          "phalange profile needs node to run WebAssembly programs (or use --target=native)");
             return 2;
         }
         av.push(node);
@@ -643,14 +651,16 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
     let text = u.read_file(raw);
     _ = u.unlink(u.cz(raw));
     if u.isnos(text) {
-        dg.emit_fatal(json, "E9006", u.f1("no profile was recorded (the program exited with status %s)", u.idec(status)));
+        dg.emit_fatal(json, "E9006", u.f1("no profile was recorded (the program exited with status %s)",
+                                          u.idec(status)));
         return 2;
     }
 
     // Aggregate.
     let mut fns = u.SymMap.[*mut ProfFn].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfFn](), cap: 0, len: 0 };
     let mut sites = u.SymMap.[*mut ProfSite].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfSite](), cap: 0, len: 0 };
-    let mut stacks = u.SymMap.[*mut ProfStack].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfStack](), cap: 0, len: 0 };
+    let mut stacks = u.SymMap.[*mut ProfStack].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfStack](), cap: 0,
+                                                 len: 0 };
     let mut fnv = u.List.[*mut ProfFn].{ data: u.nil.[*mut ProfFn](), len: 0, cap: 0 };
     let mut sitev = u.List.[*mut ProfSite].{ data: u.nil.[*mut ProfSite](), len: 0, cap: 0 };
     let mut stackv = u.List.[*mut ProfStack].{ data: u.nil.[*mut ProfStack](), len: 0, cap: 0 };
@@ -796,10 +806,12 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
     }
     let secs = @float_from_int(f64, nsamples) / @float_from_int(f64, hz);
     if json {
-        u.print(u.f2("{\"schema\":\"phalange-profile/1\",\"samples\":%s,\"hz\":%s,\"clock\":", u.dec(nsamples), u.idec(hz)));
+        u.print(u.f2("{\"schema\":\"phalange-profile/1\",\"samples\":%s,\"hz\":%s,\"clock\":", u.dec(nsamples),
+                     u.idec(hz)));
         json_str_out(clock);
-        u.print(u.f4(",\"seconds\":%s,\"dropped\":%s,\"truncated\":%s,\"exit_status\":%s,\"folded\":", u.ffmt("%.3f", secs),
-                     u.dec(dropped), u.dec(truncated), u.idec(status)));
+        u.print(
+            u.f4(",\"seconds\":%s,\"dropped\":%s,\"truncated\":%s,\"exit_status\":%s,\"folded\":", u.ffmt("%.3f", secs),
+                 u.dec(dropped), u.dec(truncated), u.idec(status)));
         json_str_out(u.pick(wrote, folded_path, ""));
         u.print(",\"functions\":[");
         for i in 0..fnv.len {
@@ -807,8 +819,8 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
             u.print(u.pick(i != 0, ",", ""));
             u.print("\n  {\"name\":");
             json_str_out(pf.name);
-            u.print(u.f4(",\"self\":%s,\"total\":%s,\"self_pct\":%s,\"total_pct\":%s}", u.dec(pf.self_), u.dec(pf.total),
-                         u.ffmt("%.1f", pct(pf.self_, n)), u.ffmt("%.1f", pct(pf.total, n))));
+            u.print(u.f4(",\"self\":%s,\"total\":%s,\"self_pct\":%s,\"total_pct\":%s}", u.dec(pf.self_),
+                         u.dec(pf.total), u.ffmt("%.1f", pct(pf.self_, n)), u.ffmt("%.1f", pct(pf.total, n))));
         }
         u.print("],\"call_sites\":[");
         for i in 0..sitev.len {
@@ -821,13 +833,17 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
             json_str_out(ps.caller);
             u.print(",\"callee\":");
             json_str_out(ps.callee);
-            u.print(u.f2(",\"total\":%s,\"total_pct\":%s,\"context\":", u.dec(ps.total), u.ffmt("%.1f", pct(ps.total, n))));
+            u.print(
+                u.f2(",\"total\":%s,\"total_pct\":%s,\"context\":", u.dec(ps.total), u.ffmt("%.1f", pct(ps.total, n))));
             json_str_out(source_line(ps.sp));
             u.print("}");
         }
         u.print("]}\n");
     } else {
-        u.print(u.f4("profile: %s samples at %s Hz (%s time, %s s)", u.dec(nsamples), u.idec(hz), clock, u.ffmt("%.2f", secs)));
+        u.print(
+            u.f4(
+                "profile: %s samples at %s Hz (%s time, %s s)", u.dec(nsamples), u.idec(hz), clock, u.ffmt(
+                    "%.2f", secs)));
         if status != 0 {
             u.print(u.f1("; the program exited with status %s", u.idec(status)));
         }
@@ -849,7 +865,8 @@ fn run_profile(bin: []u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool
                          u.idec(lc.sl), u.idec(lc.sc), ps.caller, ps.callee));
         }
         if truncated != 0 {
-            u.print(u.f1("\n%s samples were deeper than 256 calls; their outer frames are not known\n", u.dec(truncated)));
+            u.print(u.f1("\n%s samples were deeper than 256 calls; their outer frames are not known\n",
+                         u.dec(truncated)));
         }
         if dropped != 0 {
             u.print(u.f1("%s samples were dropped (sample buffer full)\n", u.dec(dropped)));
@@ -969,6 +986,9 @@ fn driver(args: [][]u8) i32 {
         }
         u.print(u.cat2(dir, "\n"));
         return 0;
+    }
+    if (argc >= 2) and u.str_eq(args[1], "fmt") {
+        return fmt.run_fmt(args[2..], find_std(args[0]));
     }
     if (argc >= 2) and u.str_eq(args[1], "new") {
         let js = (argc >= 4) and u.str_eq(args[3], "--format=agent-json");
@@ -1310,8 +1330,8 @@ fn driver(args: [][]u8) i32 {
         }
         let t1 = now_ms();
         if verbose {
-            u.eprint(u.f4("phalange: %s modules, %s compiled, %s cached (%s ms)\n", u.zdec(us.total), u.zdec(us.compiled),
-                          u.zdec(us.total - us.compiled), u.ffmt("%.0f", t1 - t0)));
+            u.eprint(u.f4("phalange: %s modules, %s compiled, %s cached (%s ms)\n", u.zdec(us.total),
+                          u.zdec(us.compiled), u.zdec(us.total - us.compiled), u.ffmt("%.0f", t1 - t0)));
         }
         for k in 0..objs.len {
             link_inputs.push(objs.get(k));

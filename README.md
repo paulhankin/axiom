@@ -23,6 +23,7 @@ phalange build app --verbose          # modules compile separately and are cache
 node tests/run.mjs                    # run the test suite
 selfhost/bootstrap.sh                 # build the self-hosted compiler (stage 1, 2, 3)
 selfhost/build/phalange build prog.ph --target=aarch64 --cpu=neoverse-n1 -o prog
+selfhost/build/phalange fmt src/      # canonical layout, imports tidied (spec §16.5)
 ```
 
 The self-hosted compiler (`selfhost/build/phalange`) has its own backends for
