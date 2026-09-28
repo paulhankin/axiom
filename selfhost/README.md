@@ -106,12 +106,15 @@ and `phalange profile` run them under `qemu-<arch>` (with the target's C library
 | `x64.ph`, `x64enc.ph` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding |
 | `a64.ph`, `a64enc.ph` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ph` | ELF relocatable objects: writing, and reading them back for the linker |
-| `elink.ph` | The ELF linker: a dynamically linked executable against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
+| `elink.ph` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
+| `lstub.ph` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ph` | Architectures, CPU presets, extensions, host detection |
 | `backend.ph` | Lowering, optimization and the target's code generator |
 
-Native programs include the runtime written in Phalange: `runtime/native.ph` (the host
-ABI used by `std/io`, `std/net` and threads, crash reports with stack traces),
+Native programs include the runtime written in Phalange, which uses no C library:
+`runtime/linux.ph` (system calls on x86-64 and AArch64), `runtime/native.ph` (the host
+ABI used by `std/io`, `std/net` and threads, a DNS resolver, crash reports with stack
+traces),
 `runtime/test_main.ph` (the forking test runner of `phalange test`),
 `runtime/profile.ph` (the sampling profiler of `phalange profile`) and `runtime/rt.ph`
 (software `fmod` and `fma` where the target has no instruction).
@@ -223,8 +226,11 @@ types share a module.
 
 ## Platform assumptions
 
-- Linux with glibc (2.34 or later, where `libpthread` is part of `libc.so.6`) on x86-64 or
-  AArch64: `/proc/self/exe`, `/proc/cpuinfo`, `readdir`'s `d_name` at offset 19, and the
-  glibc structure layouts the runtime uses (`sigaction`, `pthread_attr_t` sizes).
-- Executables use the dynamic loader at its standard path (`/lib64/ld-linux-x86-64.so.2`,
-  `/lib/ld-linux-aarch64.so.1`) and find `libc.so.6` in the usual library directories.
+- Linux on x86-64 or AArch64. The compiler itself uses glibc (2.34 or later, where
+  `libpthread` is part of `libc.so.6`): `/proc/self/exe`, `/proc/cpuinfo` and
+  `readdir`'s `d_name` at offset 19.
+- Programs it builds use only the Linux system call interface and are static, unless
+  they link C code or libraries (`-l`, `.c`/`.o` inputs). Those are dynamically linked:
+  they use the dynamic loader at its standard path (`/lib64/ld-linux-x86-64.so.2`,
+  `/lib/ld-linux-aarch64.so.1`), find `libc.so.6` in the usual library directories, and
+  start threads with `pthread_create`.

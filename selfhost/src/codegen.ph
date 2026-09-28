@@ -3974,6 +3974,9 @@ fn emit_native_entry() void {
     }
     let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
     let f = add_export("main", T_i32, pi[..]);
+    let aty = fn_type(T_void, pi[..], false);
+    let mut aargs: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
+    _ = call(aty, ir.add_function(M, "ph_rt_args", aty).val, aargs[..]);
     call_runtime("ph_rt_init");
     if O.profile {
         call_runtime("ph_profile_start");
@@ -3988,6 +3991,7 @@ fn emit_native_entry() void {
     let fty = fi.llty;
     let mut args: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
     let r = call(fty, fi.fnv, args[0..fty.params.len]);
+    call_runtime("ph_rt_fini");
     if fty.ret.kind == ir.T_VOID {
         ir.ret(B, ci32(0));
     } else if fty.ret.bits < 32 {

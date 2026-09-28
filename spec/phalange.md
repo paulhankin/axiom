@@ -1552,6 +1552,9 @@ extern "C" "m" {          // optional second string: a library to link (-lm)
   resolved by the linker. `pub extern "C" { … }` makes them visible to importing
   modules.
 - On **native targets** they link against object files, libraries and libc as usual.
+  A native program that declares no C functions of its own needs no C library: the
+  self-hosted toolchain then links a static executable that makes system calls
+  directly (§15.2).
 - On **WebAssembly** they link against C compiled for the same wasm target. C code
   and Phalange code share the linear memory, the stack and the function table, so
   pointers mean the same thing on both sides. Freestanding wasm has no libc unless one
@@ -1678,6 +1681,13 @@ services are reached through host functions imported from module `"phalange"` (t
 *Phalange host ABI*). Implementations exist for node (`runtime/host.mjs`) and POSIX
 (`runtime/native_host.c` in C, `runtime/native.ph` in Phalange). A program that uses only the language and `std/mem`, `vec`,
 `hash`, `map` and `matrix` needs no host at all.
+
+The Phalange runtime uses no C library. It reaches the kernel through system calls
+(`runtime/linux.ph`), starts threads with `clone` and sets up their thread-local
+storage itself, and resolves host names from `/etc/hosts` and by DNS queries to the
+servers in `/etc/resolv.conf`. So a native program built by the self-hosted toolchain
+is a static executable with no dynamic loader, unless it links C code or libraries,
+in which case it is linked against the C library as before.
 
 ---
 

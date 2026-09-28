@@ -1,9 +1,12 @@
 // =============================================================================
 // elink.ph - links ELF relocatable objects (from x64.ph / a64.ph, read with
-// elf.read) into a dynamically linked Linux executable: position-dependent,
-// eagerly bound (DF_BIND_NOW), needing libc.so.6 and the libraries the program
-// names. The entry point is our own _start, which calls
-// __libc_start_main(main, argc, argv, 0, 0, rtld_fini, stack_end).
+// elf.read) into a Linux executable, position-dependent. A program that uses
+// nothing from C is linked statically: no interpreter, no libraries, our own
+// _start, the system call stubs of lstub.ph. One that uses the C library
+// (extern "C" functions it does not define, -l) is dynamically linked,
+// eagerly bound (DF_BIND_NOW), needing libc.so.6 and the libraries it names;
+// its _start calls __libc_start_main(main, argc, argv, 0, 0, rtld_fini,
+// stack_end).
 //
 // Layout (one 64 KiB-aligned PT_LOAD per permission; file offsets and
 // addresses agree modulo the page size):
@@ -11,10 +14,13 @@
 //       .rodata
 //   RX  _start, .plt, .text
 //   RW  .dynamic, .got, .data (and .data.rel.ro), .tdata, then .bss
-// Thread-local .tdata/.tbss form the PT_TLS template (local-exec model).
+// Thread-local .tdata/.tbss form the PT_TLS template (local-exec model). A
+// static program's main thread uses a copy of it placed after it (with its
+// thread control block), which _start points the thread pointer at.
 // =============================================================================
 import "bin.ph" as bn;
 import "elf.ph" as elf;
+import "lstub.ph" as lstub;
 import "util.ph" as u;
 
 const C_TEXT: i32 = 0;
@@ -81,6 +87,7 @@ let mut tls_addr: u64 = 0;
 let mut tls_memsz: u64 = 0;
 let mut tls_align: u64 = 1;
 let mut got_addr: u64 = 0;
+let mut static_link: bool = false;
 let mut plt_addr: u64 = 0;
 
 fn err(msg: []u8) void {
@@ -759,29 +766,35 @@ fn phdr(h: *mut bn.Bytes, ty: u64, flags: u64, off: u64, vaddr: u64, filesz: u64
     h.u64_(al);
 }
 
-const START_SIZE: u64 = 64;
+const START_SIZE: u64 = 80;
 
-fn write_start(b: []mut u8, start: u64, main_addr: u64, lsm_got: u64) void {
+fn write_start(b: []mut u8, start: u64, main_addr: u64, lsm_got: u64, sp_word: u64) void {
     let fo = file_of(start);
     if is_x64() {
+        // mov [rip + sp_word], rsp; then the usual call of __libc_start_main
         let code =
-            "\x31\xed\x49\x89\xd1\x5e\x48\x89\xe2\x48\x83\xe4\xf0\x50\x54\x45\x31\xc0\x31\xc9\x48\x8d\x3d\x00\x00\x00\x00\xff\x15\x00\x00\x00\x00\xf4";
+            "\x48\x89\x25\x00\x00\x00\x00\x31\xed\x49\x89\xd1\x5e\x48\x89\xe2\x48\x83\xe4\xf0\x50\x54\x45\x31\xc0\x31\xc9\x48\x8d\x3d\x00\x00\x00\x00\xff\x15\x00\x00\x00\x00\xf4";
         for i in 0..code.len {
             b[@truncate(usize, fo) + i] = code[i];
         }
-        w32(b, fo + 23, (main_addr -% (start + 27)) & 0xFFFF_FFFF);
-        w32(b, fo + 29, (lsm_got -% (start + 33)) & 0xFFFF_FFFF);
+        w32(b, fo + 3, (sp_word -% (start + 7)) & 0xFFFF_FFFF);
+        w32(b, fo + 30, (main_addr -% (start + 34)) & 0xFFFF_FFFF);
+        w32(b, fo + 36, (lsm_got -% (start + 40)) & 0xFFFF_FFFF);
         return;
     }
-    let words: [14]u64 = [0xAA1F03FD, 0xAA1F03FE, 0xAA0003E5, 0xF94003E1, 0x910023E2, 0x910003E6, 0x90000000,
-                          0x91000000, 0xAA1F03E3, 0xAA1F03E4, 0x90000010, 0xF9400210, 0xD63F0200, 0xD4200000];
-    for i in @as(usize, 0)..14 {
+    // mov x9, sp; adrp x10, sp_word; str x9, [x10, lo12]; then the call
+    let words: [17]u64 = [0x910003E9, 0x9000000A, 0xF9000149, 0xAA1F03FD, 0xAA1F03FE, 0xAA0003E5, 0xF94003E1,
+                          0x910023E2, 0x910003E6, 0x90000000, 0x91000000, 0xAA1F03E3, 0xAA1F03E4, 0x90000010,
+                          0xF9400210, 0xD63F0200, 0xD4200000];
+    for i in @as(usize, 0)..17 {
         w32(b, fo + (@as(u64, i) * 4), words[i]);
     }
-    a64_adrp(b, fo + 24, start + 24, main_addr);
-    a64_imm12(b, fo + 28, main_addr & 0xfff);
-    a64_adrp(b, fo + 40, start + 40, lsm_got);
-    a64_imm12(b, fo + 44, (lsm_got & 0xfff) >> 3);
+    a64_adrp(b, fo + 4, start + 4, sp_word);
+    a64_imm12(b, fo + 8, (sp_word & 0xfff) >> 3);
+    a64_adrp(b, fo + 36, start + 36, main_addr);
+    a64_imm12(b, fo + 40, main_addr & 0xfff);
+    a64_adrp(b, fo + 52, start + 52, lsm_got);
+    a64_imm12(b, fo + 56, (lsm_got & 0xfff) >> 3);
 }
 
 fn write_plt(b: []mut u8) void {
@@ -810,6 +823,56 @@ fn write_plt(b: []mut u8) void {
     }
 }
 
+// Does the program need nothing from shared libraries? (Every symbol it
+// uses is defined by its objects or the stubs, or is one the runtime uses
+// only when the C library is there.)
+fn needs_nothing(lib_names: [][]u8) bool {
+    for name in lib_names {
+        let builtin = ["c", "m", "pthread", "dl", "rt"];
+        let mut known = false;
+        for x in builtin {
+            if u.str_eq(x, name) {
+                known = true;
+            }
+        }
+        if not known or u.str_eq(name, "c") or u.str_eq(name, "m") {
+            return false;  // (asked for explicitly)
+        }
+    }
+    let mut defined = u.SymMap.[u8].{ keys: u.nil.[usize](), vals: u.nil.[u8](), cap: 0, len: 0 };
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let sy = o.syms.get(si);
+            if (sy.sec >= 0) and (sy.bind != elf.B_LOCAL) and (sy.name.len > 0) {
+                defined.put(u.intern(sy.name), 1);
+            }
+        }
+    }
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let sy = o.syms.get(si);
+            if (sy.sec >= 0) or (sy.bind != elf.B_GLOBAL) or (sy.name.len == 0) {
+                continue;
+            }
+            let k = u.intern(sy.name);
+            if not defined.has(k) and not lstub.provides(k, M) and not lstub.libc_only(k) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn global_addr(name: []u8) u64 {
+    let g = gsyms.at(@as(usize, gsym_index(name)));
+    if g.obj < 0 {
+        return 0;
+    }
+    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+}
+
 // Links `inputs` into the executable `out`. `lib_names` are the libraries
 // the program names (-l). 0: done; 1: errors (reported); 2: a library is not
 // a plain shared object (the caller links with the system toolchain).
@@ -818,13 +881,17 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     for i in 0..inputs.len {
         objs.push(inputs[i]);
     }
-    let libc = add_lib("libc.so.6", "libc.so.6");
-    let libm = add_lib("libm.so.6", "libm.so.6");
-    if u.isnil(libc) or u.isnil(libm) {
-        err("cannot read the C library");
-        return 1;
+    static_link = needs_nothing(lib_names);
+    objs.push(lstub.build(machine, static_link));
+    if not static_link {
+        let libc = add_lib("libc.so.6", "libc.so.6");
+        let libm = add_lib("libm.so.6", "libm.so.6");
+        if u.isnil(libc) or u.isnil(libm) {
+            err("cannot read the C library");
+            return 1;
+        }
+        libc.used = true;
     }
-    libc.used = true;
     for name in lib_names {
         let builtin = ["c", "m", "pthread", "dl", "rt"];
         let mut skip = false;
@@ -850,8 +917,11 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         l.used = true;
         libs.push(l);
     }
-    let lsm = gsym_index("__libc_start_main");
-    gsyms.at(@as(usize, lsm)).weak = false;
+    let mut lsm: u32 = 0;
+    if not static_link {
+        lsm = gsym_index("__libc_start_main");
+        gsyms.at(@as(usize, lsm)).weak = false;
+    }
     let mn = gsym_index("main");
     gsyms.at(@as(usize, mn)).weak = false;
     collect_symbols();
@@ -866,7 +936,10 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     if errors != 0 {
         return 1;
     }
-    let lsm_slot = got_slot_g(lsm, 0, 0);
+    let mut lsm_slot: i32 = 0;
+    if not static_link {
+        lsm_slot = got_slot_g(lsm, 0, 0);
+    }
 
     // .dynstr
     let mut dynstr = bn.new_bytes();
@@ -929,12 +1002,18 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         dynstr.put(gsyms.at(@as(usize, dyn_syms.get(i))).name);
         dynstr.u8_(0);
     }
-    let interp = u.pick(is_x64(), "/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1");
+    let mut interp = u.pick(is_x64(), "/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1");
+    if static_link {
+        interp = "";
+    }
     let has_tls = (class_align(C_TDATA) > 1) or (class_align(C_TBSS) > 1) or (place(C_TDATA, 0) > 0) or
                   (place(C_TBSS, 0) > 0);
     let mut phnum: u64 = 7;
+    if static_link {
+        phnum = 5;  // no PT_INTERP, PT_DYNAMIC
+    }
     if has_tls {
-        phnum = 8;
+        phnum += 1;
     }
     let nsyms = @as(u64, dyn_syms.len) + 1;
     let n_rela = @as(u64, n_abs_dyn);
@@ -985,6 +1064,23 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     if has_tls {
         file_end3 = tdata_end;
     }
+    // a static program's main thread: its TLS block (a copy of the template)
+    // and thread control block; tp is the thread pointer
+    let mut main_tls: u64 = 0;
+    let mut main_tp: u64 = 0;
+    if static_link {
+        if is_x64() {
+            // variant II: the block ends at tp; the TCB (tp itself) follows
+            main_tls = align_up(file_end3, tls_align);
+            main_tp = main_tls + align_up(tls_memsz, tls_align);
+            file_end3 = main_tp + 16;
+        } else {
+            // variant I: the 16-byte TCB at tp, then the block
+            main_tp = align_up(file_end3, @max(tls_align, 16));
+            main_tls = main_tp + align_up(16, tls_align);
+            file_end3 = main_tls + tls_memsz;
+        }
+    }
     let bss_end = place(C_BSS, file_end3);
     segs[2].filesz = file_end3 - segs[2].vaddr;
     segs[2].memsz = bss_end - segs[2].vaddr;
@@ -1000,7 +1096,23 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     copy_class(b, C_DATA);
     copy_class(b, C_TDATA);
     let main_addr = sym_addr(@as(usize, @bit_cast(u32, gsyms.at(@as(usize, mn)).obj)), gsyms.at(@as(usize, mn)).sym);
-    write_start(b, start, main_addr, got_addr + (@as(u64, @bit_cast(u32, lsm_slot)) * 8));
+    if static_link {
+        lstub.write_start(b, file_of(start), start, global_addr("phalange.start_sp"), main_tp, main_addr, M);
+        // the main thread's TLS block starts as the template
+        let tsz = tdata_end - tls_addr;
+        for i in 0..@truncate(usize, tsz) {
+            b[@truncate(usize, file_of(main_tls)) + i] = b[@truncate(usize, file_of(tls_addr)) + i];
+        }
+    } else {
+        write_start(b, start, main_addr, got_addr + (@as(u64, @bit_cast(u32, lsm_slot)) * 8),
+                    global_addr("phalange.start_sp"));
+    }
+    // what the runtime needs to give a new thread its TLS block
+    let ti = file_of(global_addr("phalange.tls_info"));
+    w64(b, ti, tls_addr);
+    w64(b, ti + 8, tdata_end - tls_addr);
+    w64(b, ti + 16, tls_memsz);
+    w64(b, ti + 24, tls_align);
     write_plt(b);
     let mut rels = u.List.[DynRel].{ data: u.nil.[DynRel](), len: 0, cap: 0 };
     apply_relocs(b, &mut rels);
@@ -1146,13 +1258,17 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     h.u16_(0);
     h.u16_(0);
     phdr(&mut h, 6, 4, 64, BASE + 64, phnum * 56, phnum * 56, 8);  // PT_PHDR
-    phdr(&mut h, 3, 4, interp_off, BASE + interp_off, @as(u64, interp.len) + 1, @as(u64, interp.len) + 1, 1);
+    if not static_link {
+        phdr(&mut h, 3, 4, interp_off, BASE + interp_off, @as(u64, interp.len) + 1, @as(u64, interp.len) + 1, 1);
+    }
     let flags: [3]u64 = [4, 5, 6];
     for k in @as(usize, 0)..3 {
         let sg = segs[k];
         phdr(&mut h, 1, flags[k], sg.off, sg.vaddr, sg.filesz, sg.memsz, PAGE);
     }
-    phdr(&mut h, 2, 6, dfo, dyn_addr, n_dyn * 16, n_dyn * 16, 8);  // PT_DYNAMIC
+    if not static_link {
+        phdr(&mut h, 2, 6, dfo, dyn_addr, n_dyn * 16, n_dyn * 16, 8);  // PT_DYNAMIC
+    }
     if has_tls {
         phdr(&mut h, 7, 4, segs[2].off + (tls_addr - segs[2].vaddr), tls_addr, tdata_end - tls_addr, tls_memsz,
              tls_align);

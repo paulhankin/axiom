@@ -26,6 +26,7 @@ import "elf.ph" as elf;
 import "elink.ph" as el;
 import "fmt.ph" as fmt;
 import "header.ph" as header;
+import "lstub.ph" as lstub;
 import "package.ph" as pkg;
 import "sema.ph" as sema;
 import "target.ph" as tg;
@@ -1470,6 +1471,17 @@ fn driver(args: [][]u8) i32 {
             let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
             av.push(cc);
             av.push(objpath);
+            // the system call stubs the runtime uses (selfhost/src/lstub.ph)
+            let mut machine = elf.EM_X86_64;
+            if tg.g_arch == tg.ARCH_A64 {
+                machine = elf.EM_AARCH64;
+            }
+            let stub_path = u.cat2(objpath, ".stubs.o");
+            if not u.write_file(stub_path, elf.write(lstub.build(machine, false))) {
+                dg.emit_fatal(json, "E9004", u.f1("cannot write %s", stub_path));
+                return 1;
+            }
+            av.push(stub_path);
             for k in 0..inc_flags.len {
                 av.push(inc_flags.get(k));
             }
@@ -1487,6 +1499,7 @@ fn driver(args: [][]u8) i32 {
             av.push("-lm");
             av.push("-pthread");
             rc = run(av.items());
+            _ = u.unlink(u.cz(stub_path));
         }
         _ = u.unlink(u.cz(objpath));
         if rc != 0 {

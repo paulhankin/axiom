@@ -5,11 +5,6 @@
 // site_record, trap_info, the shadow stack).
 // =============================================================================
 
-pub extern "C" {
-    fn snprintf(buf: *mut u8, n: usize, fmt: *u8, ...) i32;
-    fn strlen(s: *u8) usize;
-}
-
 // A site record: a trap site, a call site (code 255) or an error return
 // (code 254). `fn_` is the enclosing function, `callee` the called one.
 pub struct Site {
@@ -53,7 +48,91 @@ pub fn cstr(p: *u8) []u8 {
     if @int_from_ptr(p) == 0 {
         return "";
     }
-    return @slice_from_ptr(p, strlen(p));
+    let mut n: usize = 0;
+    while @ptr_from_int(*u8, @int_from_ptr(p) + n).* != 0 {
+        n += 1;
+    }
+    return @slice_from_ptr(p, n);
+}
+
+// The exact decimal digits (values 0-9) of a finite, nonzero double with
+// biased exponent ex and fraction frac; *dexp is the decimal exponent of the
+// first digit. Big numbers in base 10^9 limbs, least significant first.
+fn exact_digits(frac: u64, ex: i32, out: []mut u8, dexp: *mut i32) usize {
+    let mut m = frac;
+    let mut e: i32 = ex - 1075;
+    if ex == 0 {
+        e = -1074;
+    } else {
+        m = m | (@as(u64, 1) << 52);
+    }
+    let mut limbs: [100]u64 = [0; 100];
+    limbs[0] = m % 1_000_000_000;
+    limbs[1] = (m / 1_000_000_000) % 1_000_000_000;
+    limbs[2] = m / 1_000_000_000_000_000_000;
+    let mut n: usize = 3;
+    // value = m * 2^e: for e >= 0 multiply by 2^e; else by 5^-e and divide
+    // by 10^-e (a shift of the decimal point)
+    let mut mul: u64 = 2;
+    let mut times = e;
+    let mut shift: i32 = 0;
+    if e < 0 {
+        mul = 5;
+        times = -e;
+        shift = e;
+    }
+    while times > 0 {
+        // multiply by mul^k with mul^k < 2^32
+        let mut k: i32 = 0;
+        let mut f: u64 = 1;
+        while (k < times) and (f < 100_000_000) {
+            f *= mul;
+            k += 1;
+        }
+        times -= k;
+        let mut carry: u64 = 0;
+        for i in 0..n {
+            let v = (limbs[i] * f) + carry;
+            limbs[i] = v % 1_000_000_000;
+            carry = v / 1_000_000_000;
+        }
+        while carry > 0 {
+            limbs[n] = carry % 1_000_000_000;
+            carry = carry / 1_000_000_000;
+            n += 1;
+        }
+    }
+    while (n > 1) and (limbs[n - 1] == 0) {
+        n -= 1;
+    }
+    // the digits, most significant first
+    let mut nd: usize = 0;
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        let v = limbs[i];
+        let mut d: [9]u8 = [0; 9];
+        let mut t = v;
+        for k in @as(usize, 0)..9 {
+            d[8 - k] = @truncate(u8, t % 10);
+            t = t / 10;
+        }
+        let mut k0: usize = 0;
+        if i == (n - 1) {
+            while (k0 < 8) and (d[k0] == 0) {
+                k0 += 1;
+            }
+        }
+        for k in k0..9 {
+            if nd < out.len {
+                out[nd] = d[k];
+                nd += 1;
+            }
+        }
+    }
+    dexp.* = (@int_cast(i32, nd) - 1) + shift;
+    // (trailing zeros make no difference)
+    return nd;
 }
 
 pub fn call_at(ss: *ShadowStack, i: u32) *Site {
@@ -133,11 +212,114 @@ pub struct Fmt {
         self.s(tmp[k..]);
     }
 
+    // x as C's printf("%.17g") writes it (17 significant digits, exact).
     pub fn g17(self: *mut Fmt, x: f64) void {
-        let mut tmp: [40]u8 = [0; 40];
-        let k = snprintf(&mut tmp[0], 40, "%.17g".ptr, x);
-        if k > 0 {
-            self.s(tmp[0..@int_cast(usize, k)]);
+        let bits = @bit_cast(u64, x);
+        let neg = (bits >> 63) != 0;
+        let ex = @truncate(i32, (bits >> 52) & 0x7ff);
+        let frac = bits & 0xF_FFFF_FFFF_FFFF;
+        if neg {
+            self.c('-');
+        }
+        if ex == 0x7ff {
+            if frac == 0 {
+                self.s("inf");
+            } else {
+                self.s("nan");
+            }
+            return;
+        }
+        if (ex == 0) and (frac == 0) {
+            self.c('0');
+            return;
+        }
+        let mut dig: [800]u8 = [0; 800];
+        let mut dexp: i32 = 0;
+        let nd = exact_digits(frac, ex, dig[..], &mut dexp);
+        // round to 17 significant digits (half to even); dexp: the decimal
+        // exponent of the first digit
+        let mut d17: [18]u8 = [0; 18];
+        for i in @as(usize, 0)..17 {
+            if i < nd {
+                d17[i] = dig[i];
+            }
+        }
+        if nd > 17 {
+            let mut up = dig[17] > 5;
+            if dig[17] == 5 {
+                up = (d17[16] & 1) == 1;
+                for i in 18..nd {
+                    if dig[i] != 0 {
+                        up = true;
+                    }
+                }
+            }
+            if up {
+                let mut k: usize = 17;
+                loop {
+                    if k == 0 {
+                        // 99...9 became 100...0
+                        d17[0] = 1;
+                        dexp += 1;
+                        break;
+                    }
+                    k -= 1;
+                    if d17[k] == 9 {
+                        d17[k] = 0;
+                    } else {
+                        d17[k] += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut last: usize = 16;  // the last nonzero digit
+        while (last > 0) and (d17[last] == 0) {
+            last -= 1;
+        }
+        if (dexp < -4) or (dexp >= 17) {
+            // d.ddde+XX
+            self.c('0' + d17[0]);
+            if last > 0 {
+                self.c('.');
+                for i in 1..last + 1 {
+                    self.c('0' + d17[i]);
+                }
+            }
+            self.c('e');
+            let mut e = dexp;
+            if e < 0 {
+                self.c('-');
+                e = -e;
+            } else {
+                self.c('+');
+            }
+            if e < 10 {
+                self.c('0');
+            }
+            self.u(@as(u64, @bit_cast(u32, e)));
+            return;
+        }
+        if dexp < 0 {
+            self.s("0.");
+            for i in 0..@as(usize, @bit_cast(u32, -dexp - 1)) {
+                _ = i;
+                self.c('0');
+            }
+            for i in 0..last + 1 {
+                self.c('0' + d17[i]);
+            }
+            return;
+        }
+        let int_digits = @as(usize, @bit_cast(u32, dexp)) + 1;
+        for i in 0..int_digits {
+            self.c('0' + d17[i]);
+        }
+        if last >= int_digits {
+            self.c('.');
+            for i in int_digits..last + 1 {
+                self.c('0' + d17[i]);
+            }
         }
     }
 

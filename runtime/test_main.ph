@@ -3,6 +3,7 @@
 // Each test runs in a forked child (isolation from traps, a timeout, and its
 // own captured output). Output protocol: see runtime/test_runner.mjs.
 // =============================================================================
+import "linux.ph" as sys;
 import "native.ph" as rt;
 import "trap_format.ph" as tf;
 
@@ -12,16 +13,6 @@ extern "C" {
     fn phalange_test_expect(i: u32) i32;
     fn phalange_test_run(i: u32) u32;
     fn phalange_error_name(code: u32) *u8;
-    fn pipe(fds: *mut i32) i32;
-    fn fork() i32;
-    fn dup2(a: i32, b: i32) i32;
-    fn _exit(code: i32) void;
-    fn setitimer(which: i32, nv: *ITimerVal, old: *mut ITimerVal) i32;
-    fn poll(fds: *mut PollFd, n: u64, timeout: i32) i32;
-    fn waitpid(pid: i32, status: *mut i32, options: i32) i32;
-    fn clock_gettime(clock: i32, ts: *mut rt.Timespec) i32;
-    fn realloc(p: *mut void, n: usize) *mut void;
-    fn atol(s: *u8) i64;
 }
 
 struct ITimerVal {
@@ -139,7 +130,7 @@ fn encode_errors(o: *mut tf.Fmt, ss: *tf.ShadowStack) void {
 fn emit(o: *tf.Fmt) void {
     if result_fd >= 0 {
         let t = o.text();
-        _ = rt.write(result_fd, t.ptr, t.len);
+        sys.write_all(result_fd, t);
     }
 }
 
@@ -169,7 +160,7 @@ fn on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {
 fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
     let addr = @ptr_cast(*usize, @ptr_from_int(*u8, @int_from_ptr(si) + 16)).*;
     let mut code: u64 = 5;  // memory access out of bounds, unless the fault is at the stack's end
-    if rt.at_stack_limit(addr) {
+    if rt.at_stack_limit(addr, rt.signal_sp(uc)) {
         code = 8;
     }
     let mut o = tf.fmt(rec[..]);
@@ -178,24 +169,48 @@ fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
     o.c('\t');
     encode_stack(&mut o, @ptr_from_int(*tf.Site, 0), rt.phalange_shadow_stack());
     emit(&o);
-    _ = rt.signal(sig, 0);
-    _ = rt.raise(sig);
+    _ = sys.sigdefault(sig);
+    _ = sys.raise(sig);
 }
 
-// A growable byte buffer for the drained pipes.
+// A growable byte buffer for the drained pipes (in pages from the system).
 struct Buf {
     p: *mut u8,
     n: usize,
+    cap: usize,
 }
 
 fn buf_add(b: *mut Buf, x: []u8) void {
-    b.p = @ptr_cast(*mut u8, realloc(@ptr_cast(*mut void, b.p), b.n + x.len + 1));
+    if (b.n + x.len + 1) > b.cap {
+        let mut cap = @max(b.cap * 2, 65536);
+        while cap < (b.n + x.len + 1) {
+            cap *= 2;
+        }
+        let q = sys.mmap_anon(cap);
+        if q == 0 {
+            return;
+        }
+        if b.n > 0 {
+            @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, q), b.n), @slice_from_ptr(b.p, b.n));
+        }
+        if b.cap > 0 {
+            _ = sys.munmap(@int_from_ptr(b.p), b.cap);
+        }
+        b.p = @ptr_from_int(*mut u8, q);
+        b.cap = cap;
+    }
     let d = @slice_from_ptr(b.p, b.n + x.len + 1);
     for k in 0..x.len {
         d[b.n + k] = x[k];
     }
     b.n += x.len;
     d[b.n] = 0;
+}
+
+fn buf_free(b: *mut Buf) void {
+    if b.cap > 0 {
+        _ = sys.munmap(@int_from_ptr(b.p), b.cap);
+    }
 }
 
 fn buf_text(b: *Buf) []u8 {
@@ -223,8 +238,8 @@ fn put_escaped(o: *mut Buf, s: []u8) void {
 }
 
 fn now_ns() i64 {
-    let mut ts = rt.Timespec.{ sec: 0, nsec: 0 };
-    _ = clock_gettime(1, &mut ts);  // CLOCK_MONOTONIC
+    let mut ts = sys.Timespec.{ sec: 0, nsec: 0 };
+    _ = sys.clock_gettime(1, &mut ts);  // CLOCK_MONOTONIC
     return (ts.sec * 1_000_000_000) + ts.nsec;
 }
 
@@ -293,16 +308,17 @@ fn drain(outfd: i32, resfd: i32, out: *mut Buf, res: *mut Buf) void {
     let mut open_fds: i32 = 2;
     let mut chunk: [4096]u8 = [0; 4096];
     while open_fds > 0 {
-        if (poll(&mut pf[0], 2, -1) < 0) and (rt.errno() != 4) {
+        let pr = sys.ppoll(@ptr_cast(*mut void, &mut pf[0]), 2, -1);
+        if (pr < 0) and (pr != -sys.EINTR) {
             break;
         }
         for k in @as(usize, 0)..2 {
             if (pf[k].fd < 0) or ((pf[k].revents & ((POLLIN | POLLHUP) | POLLERR)) == 0) {
                 continue;
             }
-            let r = rt.read(pf[k].fd, &mut chunk[0], 4096);
+            let r = sys.read(pf[k].fd, &mut chunk[0], 4096);
             if r <= 0 {
-                _ = rt.close(pf[k].fd);
+                _ = sys.close(pf[k].fd);
                 pf[k].fd = -1;
                 open_fds -= 1;
                 continue;
@@ -317,17 +333,16 @@ fn drain(outfd: i32, resfd: i32, out: *mut Buf, res: *mut Buf) void {
 }
 
 fn run_child(i: u32, resw: i32, outw: i32, timeout_ms: i64) void {
-    _ = dup2(outw, 1);
-    _ = dup2(outw, 2);
+    _ = sys.dup2(outw, 1);
+    _ = sys.dup2(outw, 2);
     result_fd = resw;
     rt.trap_hook = on_trap;
     rt.has_trap_hook = true;
     let it = ITimerVal.{ interval_sec: 0, interval_usec: 0, value_sec: timeout_ms / 1000,
                          value_usec: (timeout_ms % 1000) * 1000 };
-    _ = setitimer(0, &it, @ptr_from_int(*mut ITimerVal, 0));  // ITIMER_REAL
-    let st = rt.StackT.{ sp: @ptr_cast(*mut void, &mut altstack[0]), flags: 0, size: 65536 };
-    _ = rt.sigaltstack(&st, @ptr_from_int(*mut rt.StackT, 0));
-    let flags: i32 = 4 | 0x0800_0000;  // SA_SIGINFO | SA_ONSTACK
+    _ = sys.setitimer(0, @ptr_cast(*void, &it));  // ITIMER_REAL
+    _ = sys.sigaltstack(@int_from_ptr(&mut altstack[0]), 65536);
+    let flags: u64 = 4 | 0x0800_0000;  // SA_SIGINFO | SA_ONSTACK
     rt.set_handler(SIGSEGV, on_crash, flags);
     rt.set_handler(SIGBUS, on_crash, flags);
     let code = phalange_test_run(i);
@@ -339,7 +354,7 @@ fn run_child(i: u32, resw: i32, outw: i32, timeout_ms: i64) void {
         encode_errors(&mut o, rt.phalange_shadow_stack());
     }
     emit(&o);
-    _exit(0);
+    sys.exit(0);
 }
 
 export fn ph_test_main(argc: i32, argv: *mut *mut u8) i32 {
@@ -351,7 +366,8 @@ export fn ph_test_main(argc: i32, argv: *mut *mut u8) i32 {
         if starts(a, "--filter=") {
             filter = a[9..];
         } else if starts(a, "--timeout=") {
-            timeout_ms = atol(&a[10]);
+            let mut at: usize = 10;
+            timeout_ms = @bit_cast(i64, num(a, &mut at));
         }
     }
     let n = phalange_test_count();
@@ -362,23 +378,23 @@ export fn ph_test_main(argc: i32, argv: *mut *mut u8) i32 {
         let expect = phalange_test_expect(i);
         let mut res: [2]i32 = [0, 0];
         let mut outp: [2]i32 = [0, 0];
-        if (pipe(&mut res[0]) != 0) or (pipe(&mut outp[0]) != 0) {
+        if (sys.pipe2(&mut res[0], 0) != 0) or (sys.pipe2(&mut outp[0], 0) != 0) {
             return 2;
         }
         let t0 = now_ns();
-        let pid = fork();
+        let pid = @truncate(i32, sys.fork());
         if pid == 0 {
-            _ = rt.close(res[0]);
-            _ = rt.close(outp[0]);
+            _ = sys.close(res[0]);
+            _ = sys.close(outp[0]);
             run_child(i, res[1], outp[1], timeout_ms);
         }
-        _ = rt.close(res[1]);
-        _ = rt.close(outp[1]);
-        let mut outb = Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0 };
-        let mut resb = Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0 };
+        _ = sys.close(res[1]);
+        _ = sys.close(outp[1]);
+        let mut outb = Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0, cap: 0 };
+        let mut resb = Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0, cap: 0 };
         drain(outp[0], res[0], &mut outb, &mut resb);
         let mut status: i32 = 0;
-        _ = waitpid(pid, &mut status, 0);
+        while sys.wait4(pid, &mut status, 0) == -sys.EINTR {}
         let ms = @float_from_int(f64, now_ns() - t0) / 1e6;
 
         let r = buf_text(&resb);
@@ -475,7 +491,7 @@ export fn ph_test_main(argc: i32, argv: *mut *mut u8) i32 {
             msg.i(@as(i64, status));
             msg.s(")");
         }
-        let mut line = Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0 };
+        let mut line = Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0, cap: 0 };
         let mut hb: [256]u8 = [0; 256];
         let mut h = tf.fmt(hb[..]);
         h.s("PHT\t");
@@ -502,18 +518,10 @@ export fn ph_test_main(argc: i32, argv: *mut *mut u8) i32 {
             put_escaped(&mut line, stack);
         }
         buf_add(&mut line, "\n");
-        let t = buf_text(&line);
-        let mut off: usize = 0;
-        while off < t.len {
-            let w = rt.write(1, &t[off], t.len - off);
-            if w <= 0 {
-                break;
-            }
-            off += @int_cast(usize, w);
-        }
-        rt.free(@ptr_cast(*mut void, line.p));
-        rt.free(@ptr_cast(*mut void, outb.p));
-        rt.free(@ptr_cast(*mut void, resb.p));
+        sys.write_all(1, buf_text(&line));
+        buf_free(&mut line);
+        buf_free(&mut outb);
+        buf_free(&mut resb);
     }
     return 0;
 }

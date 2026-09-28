@@ -320,7 +320,8 @@ weakly ordered CPUs such as ARM.
 - **Phalange** targets WebAssembly first (`wasm32`, `wasm64`, freestanding or WASI), and
   x86-64 and AArch64 Linux natively. `extern "C"` blocks call C, `export fn` exposes
   functions, and the compiler generates a C header for them. The self-hosted compiler has
-  its own backends and linkers and needs only the C library.
+  its own backends and linkers. Programs it builds make Linux system calls directly and
+  are static executables with no C library, unless they link C code (as Zig's do).
 - **Zig** cross-compiles to almost anything, imports C headers directly (`@cImport`) and
   is also a C compiler (`zig cc`).
 - **Rust** targets everything LLVM does (and wasm well), with C interop through `extern`

@@ -82,4 +82,6 @@ Two implementations are provided:
 - **[`runtime/native_host.c`](../runtime/native_host.c)** for POSIX. The C compiler
   links it automatically when a native program uses the host ABI. The self-hosted
   compiler builds the same host ABI written in Phalange,
-  [`runtime/native.ph`](../runtime/native.ph), into every native program.
+  [`runtime/native.ph`](../runtime/native.ph), into every native program. It makes
+  Linux system calls directly ([`runtime/linux.ph`](../runtime/linux.ph)) and needs no
+  C library, so those programs are static executables.

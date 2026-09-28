@@ -15,21 +15,9 @@
 //
 // where each <site> is <file id>\x1f<start>\x1f<end>\x1f<function>.
 // =============================================================================
+import "linux.ph" as sys;
 import "native.ph" as rt;
 import "trap_format.ph" as tf;
-
-extern "C" {
-    fn getenv(name: *u8) *u8;
-    fn atoi(s: *u8) i32;
-    fn __cxa_atexit(f: fn(*mut void) void, arg: *mut void, dso: *mut void) i32;  // atexit is not in libc.so
-    fn mmap(addr: *mut void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *mut void;
-    fn calloc(n: usize, size: usize) *mut void;
-    fn gettid() i32;
-    fn getpid() i32;
-    fn timer_create(clock: i32, sev: *SigEvent, timer: *mut usize) i32;
-    fn timer_settime(timer: usize, flags: i32, nv: *ITimerSpec, old: *mut ITimerSpec) i32;
-    fn timer_delete(timer: usize) i32;
-}
 
 struct SigEvent {
     value: u64,
@@ -59,7 +47,7 @@ let mut buf_pos: usize = 0;
 let mut dropped: u64 = 0;
 let mut hz: i32 = 999;
 let mut out_path: *u8 = @ptr_from_int(*u8, 0);
-let mut timer: usize = 0;
+let mut timer: i32 = 0;
 let mut timer_ok: bool = false;
 let mut written: bool = false;
 
@@ -88,7 +76,7 @@ fn on_prof(sig: i32, si: *mut void, uc: *mut void) void {
     }
     let w = words();
     w[at] = @as(u64, depth);
-    if gettid() != getpid() {
+    if sys.gettid() != sys.getpid() {
         w[at] = w[at] | THREAD_BIT;
     }
     // siginfo: si_code at 8; for timers si_overrun at 20
@@ -130,7 +118,7 @@ struct Out {
 fn out_flush(o: *mut Out) void {
     let mut off: usize = 0;
     while off < o.n {
-        let w = rt.write(o.fd, &o.b[off], o.n - off);
+        let w = sys.write(o.fd, &o.b[off], o.n - off);
         if w <= 0 {
             break;
         }
@@ -186,18 +174,19 @@ fn write_profile() void {
     }
     written = true;
     if timer_ok {
-        _ = timer_delete(timer);
+        _ = sys.timer_delete(timer);
     }
-    _ = rt.signal(SIGPROF, 1);  // SIG_IGN
+    _ = sys.sigignore(SIGPROF);
     let mut end = @atomic_load(&buf_pos);
     if end > BUF_WORDS {
         end = BUF_WORDS;
     }
-    let fd = rt.open(out_path, 0x241, @as(u32, 0o644));  // O_WRONLY | O_CREAT | O_TRUNC
-    if fd < 0 {
+    let fd0 = sys.open(out_path, 0x80241, 0o644);  // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    if fd0 < 0 {
         return;
     }
-    let o = @ptr_cast(*mut Out, rt.malloc(@size_of(Out)));
+    let fd = @truncate(i32, fd0);
+    let o = @ptr_from_int(*mut Out, sys.mmap_anon(@size_of(Out)));
     o.fd = fd;
     o.n = 0;
     out_s(o, "# phalange-profile-raw 1\nhz ");
@@ -212,10 +201,10 @@ fn write_profile() void {
     while cap < (end / 4) {
         cap = cap << 1;
     }
-    let tp = @ptr_cast(*mut Entry, calloc(cap, @size_of(Entry)));
+    let tp = @ptr_from_int(*mut Entry, sys.mmap_anon(cap * @size_of(Entry)));  // (zeroed)
     if @int_from_ptr(tp) == 0 {
         out_flush(o);
-        _ = rt.close(fd);
+        _ = sys.close(fd);
         return;
     }
     let tab = @slice_from_ptr(tp, cap);
@@ -270,43 +259,46 @@ fn write_profile() void {
         out_s(o, "\n");
     }
     out_flush(o);
-    _ = rt.close(fd);
-    rt.free(@ptr_cast(*mut void, tp));
-    rt.free(@ptr_cast(*mut void, o));
-}
-
-fn at_exit(p: *mut void) void {
-    write_profile();
+    _ = sys.close(fd);
+    _ = sys.munmap(@int_from_ptr(tp), cap * @size_of(Entry));
+    _ = sys.munmap(@int_from_ptr(o), @size_of(Out));
 }
 
 export fn ph_profile_start() void {
-    out_path = getenv("PHALANGE_PROFILE".ptr);
-    if (@int_from_ptr(out_path) == 0) or (out_path.* == 0) {
+    let path = sys.getenv("PHALANGE_PROFILE");
+    if path.len == 0 {
         return;
     }
-    let r = getenv("PHALANGE_PROFILE_HZ".ptr);
-    if (@int_from_ptr(r) != 0) and (atoi(r) > 0) {
-        hz = atoi(r);
+    out_path = path.ptr;  // (NUL-terminated, in the environment)
+    let r = sys.getenv("PHALANGE_PROFILE_HZ");
+    let mut v: i32 = 0;
+    for c in r {
+        if (c < '0') or (c > '9') or (v > 1_000_000) {
+            break;
+        }
+        v = (v * 10) + @as(i32, c - '0');
     }
-    // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-    let p = mmap(@ptr_from_int(*mut void, 0), BUF_WORDS * 8, 3, 0x4022, -1, 0);
-    if @int_from_ptr(p) == @bit_cast(usize, @as(isize, -1)) {
+    if v > 0 {
+        hz = v;
+    }
+    let p = sys.mmap_anon(BUF_WORDS * 8);
+    if p == 0 {
         return;
     }
-    buf = @ptr_cast(*mut u64, p);
-    _ = __cxa_atexit(at_exit, @ptr_from_int(*mut void, 0), @ptr_from_int(*mut void, 0));
+    buf = @ptr_from_int(*mut u64, p);
+    // written when main returns (ph_rt_fini), or at a trap or crash
     rt.profile_flush = write_profile;
     rt.has_profile = true;
     rt.set_handler(SIGPROF, on_prof, 0x1000_0004);  // SA_RESTART | SA_SIGINFO
     // A timer on the process's CPU clock: unlike setitimer(ITIMER_PROF) it
     // is not limited to the scheduler tick.
     let sev = SigEvent.{ value: 0, signo: SIGPROF, notify: 0, pad: [0; 12] };  // SIGEV_SIGNAL
-    if timer_create(2, &sev, &mut timer) != 0 {  // CLOCK_PROCESS_CPUTIME_ID
+    if sys.timer_create(2, @ptr_cast(*void, &sev), &mut timer) != 0 {          // CLOCK_PROCESS_CPUTIME_ID
         return;
     }
     timer_ok = true;
     let ns = @as(i64, 1_000_000_000 / hz);
     let its = ITimerSpec.{ interval_sec: ns / 1_000_000_000, interval_nsec: ns % 1_000_000_000,
                            value_sec: ns / 1_000_000_000, value_nsec: ns % 1_000_000_000 };
-    _ = timer_settime(timer, 0, &its, @ptr_from_int(*mut ITimerSpec, 0));
+    _ = sys.timer_settime(timer, @ptr_cast(*void, &its));
 }

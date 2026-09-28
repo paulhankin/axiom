@@ -42,7 +42,7 @@ WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library
 | [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |
 | [`selfhost/`](selfhost/README.md) | The same compiler written in Phalange, bootstrapped from the C one to a fixed point, with its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers: no LLVM, no C toolchain |
 | [`std/`](std/README.md) | Standard library: `mem`, `vec`, `hash`, `map`, `matrix`, `io`, `net` |
-| [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ph` for the self-hosted compiler, `native_host.c` for the C one); test runners; the profiler |
+| [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ph` and `linux.ph`, libc-free, for the self-hosted compiler; `native_host.c` for the C one); test runners; the profiler |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `phalange test`, packages |
 
 The spec's [Appendix C](spec/phalange.md#appendix-c-changes-from-the-design-notes) lists the
