@@ -9,8 +9,8 @@
 // new instructions before i. Floating point is left alone (no rewrite may
 // change a result, spec §7.7), and so are vectors and 128-bit integers.
 // =============================================================================
-import "util.ph" as u;
 import "ir.ph" as ir;
+import "util.ph" as u;
 
 fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
@@ -288,7 +288,8 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             }
             // unsigned comparisons of a zero extension with a fitting constant,
             // signed ones of a sign extension
-            if fits and (((a.op == ir.OP_ZEXT) and not is_signed_pred(p)) or ((a.op == ir.OP_SEXT) and is_signed_pred(p))) {
+            if fits and
+               (((a.op == ir.OP_ZEXT) and not is_signed_pred(p)) or ((a.op == ir.OP_SEXT) and is_signed_pred(p))) {
                 return mk_icmp(B, p, x, kt(x.ty, k & xm));
             }
         }
@@ -677,8 +678,9 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             // the low bits of +, -, *, &, |, ^ depend only on the operands' low
             // bits: compute in the narrow type
             let ao = a.op;
-            if (a.kind == ir.V_INST) and ((ao == ir.OP_ADD) or (ao == ir.OP_SUB) or (ao == ir.OP_MUL) or
-                (ao == ir.OP_AND) or (ao == ir.OP_OR) or (ao == ir.OP_XOR)) {
+            if (a.kind == ir.V_INST) and
+               ((ao == ir.OP_ADD) or (ao == ir.OP_SUB) or (ao == ir.OP_MUL) or (ao == ir.OP_AND) or (ao == ir.OP_OR) or
+                (ao == ir.OP_XOR)) {
                 let x = narrowed(a.a, t);
                 let y = narrowed(a.b, t);
                 if u.notnil(x) and u.notnil(y) {
@@ -764,9 +766,12 @@ fn narrow_mul_overflow(B: *mut ir.Builder, x: *mut ir.Value, signed: bool, sc: i
     let hi = max / sc;
     let lo = min / sc;
     if sc > 1 {
-        return ir.or_(B, mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, lo))));
+        return ir.or_(
+            B, mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(
+                B, ir.IntSLT, x, kt(t, @bit_cast(u64, lo))));
     }
-    return ir.or_(B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
+    return ir.or_(
+        B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
 }
 
 // Multiplication overflow with a constant factor is a range check.
@@ -802,12 +807,15 @@ fn simplify_mul_ov(B: *mut ir.Builder, i: *mut ir.Value, signed: bool) *mut ir.V
     if c == -1 {
         return mk_icmp(B, ir.IntEQ, x, kt(t, @bit_cast(u64, min)));
     }
-    let hi = max / c;   // truncating
+    let hi = max / c;  // truncating
     let lo = min / c;
     if c > 1 {
-        return ir.or_(B, mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, lo))));
+        return ir.or_(
+            B, mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(
+                B, ir.IntSLT, x, kt(t, @bit_cast(u64, lo))));
     }
-    return ir.or_(B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
+    return ir.or_(
+        B, mk_icmp(B, ir.IntSLT, x, kt(t, @bit_cast(u64, hi))), mk_icmp(B, ir.IntSGT, x, kt(t, @bit_cast(u64, lo))));
 }
 
 // The scalar of type t at byte offset off in constant c, or nil.

@@ -356,8 +356,8 @@ fn open_with(path: []u8, flags: u32) !File {
         return File.{ fd: fd };
     }
     match fd {
-        -2 => { return error.NotFound; }
-        -13 => { return error.AccessDenied; }
+        -2   => { return error.NotFound; }
+        -13  => { return error.AccessDenied; }
         else => { return error.IoError; }
     }
 }

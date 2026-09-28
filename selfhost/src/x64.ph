@@ -8,15 +8,15 @@
 // bits extend first. Every function keeps a frame pointer (rbp); stack
 // slots are addressed from it.
 // =============================================================================
-import "util.ph" as u;
-import "ir.ph" as ir;
-import "opt.ph" as opt;
-import "mach.ph" as mc;
-import "x64enc.ph" as xe;
-import "elf.ph" as elf;
 import "bin.ph" as bn;
-import "target.ph" as tg;
+import "elf.ph" as elf;
+import "ir.ph" as ir;
 import "lower.ph" as lower;
+import "mach.ph" as mc;
+import "opt.ph" as opt;
+import "target.ph" as tg;
+import "util.ph" as u;
+import "x64enc.ph" as xe;
 
 const GPR: u8 = 0;
 const XMM: u8 = 1;
@@ -26,8 +26,8 @@ let mut TEXT: i32 = 0;
 let mut RODATA: i32 = 0;
 let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                  cap: 0, len: 0 };
 let mut errors: bool = false;
 let mut AVX: bool = false;
 
@@ -36,7 +36,7 @@ let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut IB: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // the IR block being selected
 let mut nlocal: i32 = 0;
-let mut out_area: u64 = 0;   // outgoing stack-argument bytes
+let mut out_area: u64 = 0;  // outgoing stack-argument bytes
 
 fn fail(msg: []u8) void {
     u.eprint(u.f2("phalange: x86-64 code generation: %s (in %s)\n", msg, F.name));
@@ -1143,13 +1143,13 @@ fn gen_float_to_int(v: *mut ir.Value, d: i32) void {
     // x < lo -> lo_i  (for unsigned: x <= -1 ... use x < 0 via compare with 0)
     let rlo = fconst_reg(lo, single);
     _ = sse2(cmp, R(rlo), R(x));
-    jcc(xe.CC_BE, not_low);   // lo <= x
+    jcc(xe.CC_BE, not_low);  // lo <= x
     _ = e2(xe.MOV_RI, osz, W(d), I(lo_i));
     jmp(done);
     place(not_low);
     let rhi = fconst_reg(hi, single);
     _ = sse2(cmp, R(x), R(rhi));
-    jcc(xe.CC_B, in_range);   // x < hi
+    jcc(xe.CC_B, in_range);  // x < hi
     _ = e2(xe.MOV_RI, osz, W(d), I(hi_i));
     jmp(done);
     place(in_range);
@@ -1441,8 +1441,8 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         sse3(orp, d, x, R(y));
         return;
     }
-    if ((id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST)) and
-       not has41() and not vec {
+    if ((id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or (id == ir.IN_NEAREST)) and not has41() and
+       not vec {
         round_sse2(d, a, id, single);
         return;
     }
@@ -1752,7 +1752,7 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
 // -----------------------------------------------------------------------------
 // Calls
 // -----------------------------------------------------------------------------
-let arg_gprs: [6]i32 = [7, 6, 2, 1, 8, 9];   // rdi rsi rdx rcx r8 r9
+let arg_gprs: [6]i32 = [7, 6, 2, 1, 8, 9];  // rdi rsi rdx rcx r8 r9
 
 fn caller_saved() u64 {
     // rax rcx rdx rsi rdi r8-r11, all xmm
@@ -3439,7 +3439,9 @@ fn enc_mem(rf: i32, o: mc.MOp, imm_after: i64) void {
         // [base + index*scale + sym@tpoff]: mod=10 with SIB
         let rfb = @as(u64, @bit_cast(u32, rf & 7)) << 3;
         b8((0x80 | rfb) | 4);
-        b8(((xe.scale_bits(m.scale) << 6) | (@as(u64, @bit_cast(u32, m.index & 7)) << 3)) | @as(u64, @bit_cast(u32, m.base & 7)));
+        b8(
+            ((xe.scale_bits(m.scale) << 6) | (@as(u64, @bit_cast(u32, m.index & 7)) << 3)) | @as(
+                u64, @bit_cast(u32, m.base & 7)));
         E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_TPOFF32, sym: m.sym, addend: m.disp });
         E.b.u32_(0);
         return;
@@ -3523,7 +3525,6 @@ fn enc_imm(x: i64, n: i64) void {
     xe.imm_n(&mut E, x, @truncate(u8, @bit_cast(u64, n)));
 }
 
-
 fn label_ref(l: i32) void {
     xe.rel32_fixup(&mut E, l);
 }
@@ -3546,8 +3547,9 @@ fn needs_frame() bool {
                 if (o.kind == mc.K_REG) and ((P(o.reg) == xe.RSP) or (P(o.reg) == xe.RBP)) {
                     return true;
                 }
-                if (o.kind == mc.K_MEM) and ((o.slot >= 0) or (o.base == xe.RBP) or (o.base == xe.RSP) or
-                                             (o.index == xe.RBP) or (o.index == xe.RSP)) {
+                if (o.kind == mc.K_MEM) and
+                   ((o.slot >= 0) or (o.base == xe.RBP) or (o.base == xe.RSP) or (o.index == xe.RBP) or
+                    (o.index == xe.RSP)) {
                     return true;
                 }
             }
@@ -3596,10 +3598,10 @@ fn prologue(sub: i64) void {
     if frameless {
         return;
     }
-    b8(0x55);            // push rbp
+    b8(0x55);  // push rbp
     b8(0x48);
     b8(0x89);
-    b8(0xe5);            // mov rbp, rsp
+    b8(0xe5);  // mov rbp, rsp
     for k in 0..@int_cast(usize, nsaved) {
         let r = saved[k];
         if r >= 8 {
@@ -3710,7 +3712,8 @@ fn enc_inst(i: *mut mc.MInst) void {
             b8(0x48 | (@as(u64, @bit_cast(u32, (d >> 3) & 1)) << 2));
             b8(0x8b);
             b8(0x05 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
-            E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_REX_GOTPCRELX, sym: m.sym, addend: -4 });
+            E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_REX_GOTPCRELX, sym: m.sym,
+                                     addend: -4 });
             E.b.u32_(0);
             return;
         }
@@ -3850,7 +3853,9 @@ fn enc_inst(i: *mut mc.MInst) void {
             w = 1;
         }
         b8(0xc4);
-        b8(((((~@as(u64, @bit_cast(u32, d >> 3))) & 1) << 7) | (1 << 6)) | ((((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2));
+        b8(
+            ((((~@as(u64, @bit_cast(u32, d >> 3))) & 1) << 7) | (1 << 6)) | (
+                (((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2));
         b8(((w << 7) | (((~@as(u64, @bit_cast(u32, c))) & 15) << 3)) | pp);
         b8(0xf7);
         xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, d)), @as(u64, @bit_cast(u32, s)));
@@ -4028,8 +4033,8 @@ fn enc_inst(i: *mut mc.MInst) void {
             b8(0x73);
             b8(0x10);  // jae +16 (over the backward copy)
             // lea rsi, [rsi+rcx-1]; lea rdi, [rdi+rcx-1]; std; rep movsb; cld; jmp done
-            let back: [17]u8 = [0x48, 0x8d, 0x74, 0x0e, 0xff, 0x48, 0x8d, 0x7c, 0x0f, 0xff, 0xfd, 0xf3, 0xa4, 0xfc, 0xeb,
-                                0x02, 0x90];
+            let back: [17]u8 = [0x48, 0x8d, 0x74, 0x0e, 0xff, 0x48, 0x8d, 0x7c, 0x0f, 0xff, 0xfd, 0xf3, 0xa4, 0xfc,
+                                0xeb, 0x02, 0x90];
             E.b.put(back[0..16]);
             // fwd: rep movsb
             b8(0xf3);
@@ -4325,8 +4330,8 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         if g.tls {
             ty = elf.T_TLS;
         }
-        gsym.push(elf.add_sym(OBJ, elf.Sym.{ name: g.name, sec: sec, value: off, size: g.ty.size, bind: bind_of(g.linkage),
-                                             ty: ty, hidden: false }));
+        gsym.push(elf.add_sym(OBJ, elf.Sym.{ name: g.name, sec: sec, value: off, size: g.ty.size,
+                                             bind: bind_of(g.linkage), ty: ty, hidden: false }));
     }
     for i in 0..m.globals.len {
         let g = m.globals.get(i);

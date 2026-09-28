@@ -17,13 +17,13 @@
 // unspecified, except i1, which is always 0 or 1; instructions that depend on
 // them (comparisons, division, right shifts, extensions) extend first.
 // =============================================================================
-import "util.ph" as u;
+import "bin.ph" as bn;
+import "combine.ph" as cb;
 import "ir.ph" as ir;
 import "opt.ph" as opt;
-import "bin.ph" as bn;
-import "wobj.ph" as wo;
 import "target.ph" as tg;
-import "combine.ph" as cb;
+import "util.ph" as u;
+import "wobj.ph" as wo;
 
 // flag values
 const FL_LOCAL: i32 = 0;
@@ -40,8 +40,8 @@ let mut errors: bool = false;
 // -----------------------------------------------------------------------------
 // Per-function state
 // -----------------------------------------------------------------------------
-const CTX_BLOCK: i32 = 0;   // `block` whose end precedes `target`
-const CTX_LOOP: i32 = 1;    // `loop` headed by `target`
+const CTX_BLOCK: i32 = 0;  // `block` whose end precedes `target`
+const CTX_LOOP: i32 = 1;   // `loop` headed by `target`
 const CTX_IF: i32 = 2;
 const CTX_OTHER: i32 = 3;
 
@@ -1206,8 +1206,7 @@ fn gen_rmw(v: *mut ir.Value) void {
     let o = @truncate(i32, @bit_cast(i64, v.cv));
     let t = v.ty;
     let sz = t.size;
-    if (o == ir.RMW_MIN) or (o == ir.RMW_MAX) or (o == ir.RMW_UMIN) or (o == ir.RMW_UMAX) or
-       not tg.has(tg.W_ATOMICS) {
+    if (o == ir.RMW_MIN) or (o == ir.RMW_MAX) or (o == ir.RMW_UMIN) or (o == ir.RMW_UMAX) or not tg.has(tg.W_ATOMICS) {
         rmw_loop(v, o);
         return;
     }
@@ -2911,8 +2910,8 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
     gsyms.clear();
     // __stack_pointer (always global import 0)
     UN.gimports.push(wo.Import.{ module: "env", name: "__stack_pointer", ty: @as(u32, ptr_vt()), mutable: true });
-    sp_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: wo.F_UNDEFINED, name: "__stack_pointer", index: 0, seg: 0,
-                                     off: 0, size: 0 });
+    sp_sym = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: wo.F_UNDEFINED, name: "__stack_pointer", index: 0,
+                                     seg: 0, off: 0, size: 0 });
     // globals: wasm globals (imports first), then data
     for i in 0..m.globals.len {
         gsyms.push(0);

@@ -16,13 +16,14 @@
 // Slots are never written after their value is complete, so aliasing a slot
 // (a field address, a select of two slots) is safe.
 // =============================================================================
-import "util.ph" as u;
 import "ir.ph" as ir;
+import "util.ph" as u;
 
 let mut M: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
 let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
-let mut sret_calls: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut sret_calls: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                      len: 0, cap: 0 };
 let mut const_globals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
@@ -581,8 +582,8 @@ pub fn scalarize(f: *mut ir.Func, legal: fn(*mut ir.Value) bool) void {
         let mut i = b.first;
         while u.notnil(i) {
             let next = i.next;
-            let vecish = (i.ty.kind == ir.T_VEC) or ((i.op == ir.OP_INTR) and (i.xs.len > 0) and
-                                                     (i.xs.get(0).ty.kind == ir.T_VEC)) or
+            let vecish = (i.ty.kind == ir.T_VEC) or
+                         ((i.op == ir.OP_INTR) and (i.xs.len > 0) and (i.xs.get(0).ty.kind == ir.T_VEC)) or
                          ((i.op == ir.OP_ICMP) and (i.a.ty.kind == ir.T_VEC));
             if vecish and not legal(i) {
                 scalarize_one(i);

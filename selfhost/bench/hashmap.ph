@@ -1,9 +1,9 @@
 // std/map: inserts, lookups and removals of integer keys (hashing, probing,
 // function pointers for hash and equality).
-import "std/mem" as mem;
-import "std/map" as map;
-import "std/hash" as hash;
 import "common.ph" as c;
+import "std/hash" as hash;
+import "std/map" as map;
+import "std/mem" as mem;
 
 export fn main() i32 {
     let mut arena = mem.Arena.init(mem.page_allocator);

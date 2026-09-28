@@ -2,16 +2,16 @@
 // backend.ph - from IR to an object file: target-independent lowering and
 // optimization (lower.ph, opt.ph), then the target's code generator.
 // =============================================================================
-import "util.ph" as u;
+import "a64.ph" as a64;
+import "elf.ph" as elf;
 import "ir.ph" as ir;
-import "target.ph" as tg;
 import "lower.ph" as lower;
 import "passes.ph" as passes;
+import "target.ph" as tg;
+import "util.ph" as u;
 import "wasm.ph" as wa;
 import "wobj.ph" as wo;
 import "x64.ph" as x64;
-import "a64.ph" as a64;
-import "elf.ph" as elf;
 
 pub const EMIT_OBJ: i32 = 0;
 pub const EMIT_IR: i32 = 1;

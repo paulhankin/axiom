@@ -2,8 +2,8 @@
 // WaitGroup, Channel, parallel_for, wait/notify timeouts.
 import "../lib/io.ph" as io;
 import "std/mem" as mem;
-import "std/thread" as thread;
 import "std/sync" as sync;
+import "std/thread" as thread;
 
 struct Shared {
     hits: sync.Atomic.[u64],
@@ -46,16 +46,15 @@ fn demo() !void {
     let mut shared = Shared.{ hits: sync.Atomic.[u64].init(0), lock: sync.Mutex.init(), plain: 0,
                               group: sync.WaitGroup.init() };
     shared.group.add(4);
-    let mut ts: [4]thread.Thread.[*mut Shared] = [thread.spawn(al, hammer, &mut shared)!,
-                                                   thread.spawn(al, hammer, &mut shared)!,
-                                                   thread.spawn(al, hammer, &mut shared)!,
-                                                   thread.spawn(al, hammer, &mut shared)!];
+    let mut ts: [4]thread.Thread.[*mut Shared] = [
+        thread.spawn(al, hammer, &mut shared)!, thread.spawn(al, hammer, &mut shared)!, thread.spawn(
+            al, hammer, &mut shared)!, thread.spawn(al, hammer, &mut shared)!];
     shared.group.wait();
     for t in ts {
         t.join();
     }
-    io.uint(shared.hits.load());          // expect: 40000
-    io.uint(shared.plain);                // expect: 40000
+    io.uint(shared.hits.load());  // expect: 40000
+    io.uint(shared.plain);        // expect: 40000
 
     // producer / consumer through a small channel
     let mut ch = sync.Channel.[u64].init(al, 8)!;
@@ -66,7 +65,7 @@ fn demo() !void {
         sum += v;
     }
     p.join();
-    io.uint(sum);                         // expect: 500500
+    io.uint(sum);  // expect: 500500
 
     // parallel_for over disjoint ranges
     let out = al.alloc.[u64](1000)!;
@@ -76,13 +75,13 @@ fn demo() !void {
     for v in out {
         total += v;
     }
-    io.uint(total);                       // expect: 332833500
+    io.uint(total);  // expect: 332833500
 
     // wait/notify results: 1 = value differs, 2 = timed out
     let mut word: u32 = 7;
-    io.uint(@as(u64, @atomic_wait(&word, 8, -1)));        // expect: 1
-    io.uint(@as(u64, @atomic_wait(&word, 7, 1000000)));   // expect: 2
-    io.boolean(thread.cpu_count() >= 1);                  // expect: true
+    io.uint(@as(u64, @atomic_wait(&word, 8, -1)));       // expect: 1
+    io.uint(@as(u64, @atomic_wait(&word, 7, 1000000)));  // expect: 2
+    io.boolean(thread.cpu_count() >= 1);                 // expect: true
 }
 
 export fn run() void {

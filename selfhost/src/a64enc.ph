@@ -134,7 +134,8 @@ pub fn movw(sf: u64, opc: u64, d: i32, imm16: u64, hw: u64) u64 {
 
 // SBFM (opc 0) / UBFM (2)
 pub fn bfm(sf: u64, opc: u64, d: i32, n: i32, immr: u64, imms: u64) u64 {
-    return ((((0x1300_0000 | (opc << 29)) | sfb(sf)) | (sf << 22)) | ((immr & 63) << 16)) | (((imms & 63) << 10) | ((r5(n) << 5) | r5(d)));
+    return ((((0x1300_0000 | (opc << 29)) | sfb(sf)) | (sf << 22)) | ((immr & 63) << 16)) |
+           (((imms & 63) << 10) | ((r5(n) << 5) | r5(d)));
 }
 
 pub fn lsl_imm(sf: u64, d: i32, n: i32, s: u64) u64 {
@@ -343,7 +344,8 @@ pub fn fcvt_int(sf: u64, ty: u64, rmode: u64, opcode: u64, d: i32, n: i32) u64 {
 // -----------------------------------------------------------------------------
 // Three registers of the same type
 pub fn v3(q: u64, u: u64, size: u64, opcode: u64, d: i32, n: i32, m: i32) u64 {
-    return ((((0x0E20_0400 | (q << 30)) | (u << 29)) | (size << 22)) | ((r5(m) << 16) | (opcode << 11))) | ((r5(n) << 5) | r5(d));
+    return ((((0x0E20_0400 | (q << 30)) | (u << 29)) | (size << 22)) | ((r5(m) << 16) | (opcode << 11))) |
+           ((r5(n) << 5) | r5(d));
 }
 
 // Two-register miscellaneous
@@ -363,7 +365,8 @@ pub fn vshift(q: u64, u: u64, opcode: u64, esize: u64, left: bool, sh: u64, d: i
     if left {
         immhb = esize + sh;
     }
-    return ((((0x0F00_0400 | (q << 30)) | (u << 29)) | ((immhb & 127) << 16)) | (opcode << 11)) | ((r5(n) << 5) | r5(d));
+    return ((((0x0F00_0400 | (q << 30)) | (u << 29)) | ((immhb & 127) << 16)) | (opcode << 11)) |
+           ((r5(n) << 5) | r5(d));
 }
 
 pub fn imm5(size: u64, index: u64) u64 {

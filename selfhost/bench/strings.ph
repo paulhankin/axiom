@@ -1,7 +1,7 @@
 // Byte scanning: tokenizing a generated text into words, hashing them
 // (FNV-1a) and counting in an open-addressing table of slices.
-import "std/mem" as mem;
 import "common.ph" as c;
+import "std/mem" as mem;
 
 fn fnv(s: []u8) u64 {
     let mut h: u64 = 0xcbf29ce484222325;

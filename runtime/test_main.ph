@@ -3,8 +3,8 @@
 // Each test runs in a forked child (isolation from traps, a timeout, and its
 // own captured output). Output protocol: see runtime/test_runner.mjs.
 // =============================================================================
-import "trap_format.ph" as tf;
 import "native.ph" as rt;
+import "trap_format.ph" as tf;
 
 extern "C" {
     fn phalange_test_count() u32;
@@ -288,7 +288,8 @@ fn field(s: []u8, k: u32) []u8 {
 }
 
 fn drain(outfd: i32, resfd: i32, out: *mut Buf, res: *mut Buf) void {
-    let mut pf: [2]PollFd = [PollFd.{ fd: outfd, events: POLLIN, revents: 0 }, PollFd.{ fd: resfd, events: POLLIN, revents: 0 }];
+    let mut pf: [2]PollFd = [
+        PollFd.{ fd: outfd, events: POLLIN, revents: 0 }, PollFd.{ fd: resfd, events: POLLIN, revents: 0 }];
     let mut open_fds: i32 = 2;
     let mut chunk: [4096]u8 = [0; 4096];
     while open_fds > 0 {
@@ -321,7 +322,8 @@ fn run_child(i: u32, resw: i32, outw: i32, timeout_ms: i64) void {
     result_fd = resw;
     rt.trap_hook = on_trap;
     rt.has_trap_hook = true;
-    let it = ITimerVal.{ interval_sec: 0, interval_usec: 0, value_sec: timeout_ms / 1000, value_usec: (timeout_ms % 1000) * 1000 };
+    let it = ITimerVal.{ interval_sec: 0, interval_usec: 0, value_sec: timeout_ms / 1000,
+                         value_usec: (timeout_ms % 1000) * 1000 };
     _ = setitimer(0, &it, @ptr_from_int(*mut ITimerVal, 0));  // ITIMER_REAL
     let st = rt.StackT.{ sp: @ptr_cast(*mut void, &mut altstack[0]), flags: 0, size: 65536 };
     _ = rt.sigaltstack(&st, @ptr_from_int(*mut rt.StackT, 0));

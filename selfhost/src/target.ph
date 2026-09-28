@@ -79,13 +79,11 @@ fn feats() []Feat {
     let t = u.newn.[Feat](32);
     let mut n: usize = 0;
     let names = ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "lzcnt", "bmi", "bmi2", "avx", "avx2", "fma", "cx16",
-                 "lse", "rcpc", "dotprod", "cssc",
-                 "simd128", "bulk-memory", "nontrapping-fptoint", "sign-ext", "mutable-globals", "atomics", "multivalue",
-                 "relaxed-simd", "tail-call"];
-    let bits = [X_SSE3, X_SSSE3, X_SSE41, X_SSE42, X_POPCNT, X_LZCNT, X_BMI1, X_BMI2, X_AVX, X_AVX2, X_FMA, X_CMPXCHG16B,
-                A_LSE, A_RCPC, A_DOTPROD, A_CSSC,
-                W_SIMD128, W_BULK_MEMORY, W_NONTRAPPING_FPTOINT, W_SIGN_EXT, W_MUTABLE_GLOBALS, W_ATOMICS, W_MULTIVALUE,
-                W_RELAXED_SIMD, W_TAIL_CALL];
+                 "lse", "rcpc", "dotprod", "cssc", "simd128", "bulk-memory", "nontrapping-fptoint", "sign-ext",
+                 "mutable-globals", "atomics", "multivalue", "relaxed-simd", "tail-call"];
+    let bits = [X_SSE3, X_SSSE3, X_SSE41, X_SSE42, X_POPCNT, X_LZCNT, X_BMI1, X_BMI2, X_AVX, X_AVX2, X_FMA,
+                X_CMPXCHG16B, A_LSE, A_RCPC, A_DOTPROD, A_CSSC, W_SIMD128, W_BULK_MEMORY, W_NONTRAPPING_FPTOINT,
+                W_SIGN_EXT, W_MUTABLE_GLOBALS, W_ATOMICS, W_MULTIVALUE, W_RELAXED_SIMD, W_TAIL_CALL];
     for i in 0..names.len {
         let mut a = ARCH_X64;
         if i >= 16 {

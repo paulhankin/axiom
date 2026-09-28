@@ -16,8 +16,8 @@
 // "pkg:name/sub/mod" (src/sub/mod.ph). Only a package's own dependencies are
 // visible to it, and each package name resolves to one source per build.
 // =============================================================================
-import "util.ph" as u;
 import "diag.ph" as dg;
+import "util.ph" as u;
 
 pub struct Package {
     name: []u8,
@@ -30,8 +30,9 @@ pub struct Package {
     dep_spans: u.List.[u.Span],
 }
 
-let mut pkg_by_dir: u.SymMap.[*mut Package] = u.SymMap.[*mut Package].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut Package, 0), cap: 0, len: 0 };
+let mut pkg_by_dir: u.SymMap.[*mut Package] = u.SymMap.[*mut Package].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut *mut Package, 0),
+                                                                        cap: 0, len: 0 };
 let mut pkg_by_name: u.SymMap.[*mut Package] = u.SymMap.[*mut Package].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut Package, 0), cap: 0, len: 0 };
 
@@ -405,7 +406,8 @@ pub fn load_dir(dir_in: []u8, from: *u.Span) *mut Package {
         if u.notnil(from) {
             sp = from.*;
         }
-        let d = dg.err(sp, "E0213", u.f1("two different packages are both named '%s'; a build can use only one", p.name));
+        let d = dg.err(sp, "E0213", u.f1("two different packages are both named '%s'; a build can use only one",
+                                         p.name));
         dg.note(d, u.mkspan(same.manifest_file, 0, 0), "one is here");
         dg.note(d, u.mkspan(f.id, 0, 0), "the other is here");
     } else {
@@ -490,8 +492,9 @@ pub fn resolve_import(importer: *mut Package, spec: []u8, sp: u.Span) []u8 {
         name = u.intern(rest[0..@int_cast(usize, slash)]);
     }
     if u.isnil(importer) {
-        _ = dg.err(sp, "E0214", u.f2("'%s' imports package '%s', but this file is not part of a package (no phalange.toml)",
-                                     spec, name));
+        _ = dg.err(sp, "E0214",
+                   u.f2("'%s' imports package '%s', but this file is not part of a package (no phalange.toml)", spec,
+                        name));
         return u.nosym();
     }
     let mut dep = importer.deps.get(name);
@@ -552,9 +555,11 @@ pub fn new_package(name: []u8, json: bool) bool {
         return false;
     }
     u.mkdirs(u.cat2(name, "/src"));
-    let m = u.f1("[package]\nname = \"%s\"\nversion = \"0.1.0\"\n\n[dependencies]\n# other = { path = \"../other\" }\n", name);
-    let s = u.f2("// %s: library entry module (import it as \"pkg:%s\").\n\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n\ntest \"add\" {\n    @expect_eq(add(2, 3), 5);\n}\n",
-                 name, name);
+    let m = u.f1("[package]\nname = \"%s\"\nversion = \"0.1.0\"\n\n[dependencies]\n# other = { path = \"../other\" }\n",
+                 name);
+    let s =
+        u.f2("// %s: library entry module (import it as \"pkg:%s\").\n\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n\ntest \"add\" {\n    @expect_eq(add(2, 3), 5);\n}\n",
+             name, name);
     if not u.write_file(u.cat2(name, "/phalange.toml"), m) or not u.write_file(u.cat2(name, "/src/lib.ph"), s) {
         dg.emit_fatal(json, "E9005", "cannot create the package files");
         return false;

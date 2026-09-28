@@ -11,9 +11,9 @@ export fn run() void {
     for i in 0..xs.len {
         xs[i] = @as(u64, i) * 3;
     }
-    io.uint(xs[7]);                                   // expect: 21
+    io.uint(xs[7]);  // expect: 21
     let too_big = a.alloc.[u64](100) catch |e| {
-        io.str(@error_name(e));                       // expect: OutOfMemory
+        io.str(@error_name(e));  // expect: OutOfMemory
         return;
     };
     _ = too_big;

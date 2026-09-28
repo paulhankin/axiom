@@ -14,9 +14,9 @@
 // predecessor was B), uses under B's other successor are unaffected (when B
 // is its only predecessor); any other use, and the edge stays.
 // =============================================================================
-import "util.ph" as u;
 import "ir.ph" as ir;
 import "opt.ph" as opt;
+import "util.ph" as u;
 
 fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
@@ -100,7 +100,8 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
         }
         return eval(v.c, b, p, depth + 1);
     }
-    if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC)) and (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64) {
+    if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC)) and (v.ty.kind == ir.T_INT) and
+       (v.ty.bits <= 64) {
         let x = eval(v.a, b, p, depth + 1);
         if u.isnil(x) {
             return vnil();
@@ -115,8 +116,8 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
 // -----------------------------------------------------------------------------
 struct Use {
     user: *mut ir.Value,
-    at: *mut ir.Block,    // where the value must be available
-    phi_from_b: bool,     // a phi input coming from B
+    at: *mut ir.Block,  // where the value must be available
+    phi_from_b: bool,   // a phi input coming from B
 }
 
 let mut uses: u.List.[Use] = u.List.[Use].{ data: @ptr_from_int(*mut Use, 0), len: 0, cap: 0 };
@@ -296,10 +297,12 @@ fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block)
     remove_phi_input(b, p);
 }
 
-let mut repaired: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut repaired: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                    cap: 0 };
 
 // The phi at S merging v (from B) and its copy (from N); made once per value.
-fn repair_phi(bld: *mut ir.Builder, v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, n: *mut ir.Block, s: *mut ir.Block) *mut ir.Value {
+fn repair_phi(bld: *mut ir.Builder, v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, n: *mut ir.Block,
+              s: *mut ir.Block) *mut ir.Value {
     for k in 0..repaired.len {
         let ph = repaired.get(k);
         if ph.xs.get(0) == v {
@@ -568,19 +571,19 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
     let et = ir.terminator(e);
     if u.notnil(tt) and (tt.op == ir.OP_BR) and (tt.t1 == e) {
         m = e;
-        via_t = true;          // triangle: d -> t -> e, d -> e
+        via_t = true;  // triangle: d -> t -> e, d -> e
     } else if u.notnil(et) and (et.op == ir.OP_BR) and (et.t1 == t) {
         m = t;
-        via_e = true;          // triangle: d -> e -> t, d -> t
+        via_e = true;  // triangle: d -> e -> t, d -> t
     } else if u.notnil(tt) and u.notnil(et) and (tt.op == ir.OP_BR) and (et.op == ir.OP_BR) and (tt.t1 == et.t1) {
         m = tt.t1;
         via_t = true;
-        via_e = true;          // diamond
+        via_e = true;  // diamond
     } else {
         return false;
     }
     if (m == d) or not u.notnil(m.first) or (m.first.op != ir.OP_PHI) {
-        return false;          // nothing to select (a plain skip is left to simplify_cfg)
+        return false;  // nothing to select (a plain skip is left to simplify_cfg)
     }
     let mut cost: i32 = 0;
     if via_t {

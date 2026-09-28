@@ -9,8 +9,8 @@ union Shape {
     pub fn area(self: Shape) f64 {
         match self {
             .Circle(c) => { return 3.0 * c.r * c.r; }
-            .Rect(r) => { return r.w * r.h; }
-            .Empty => { return 0.0; }
+            .Rect(r)   => { return r.w * r.h; }
+            .Empty     => { return 0.0; }
         }
     }
 }
@@ -18,15 +18,15 @@ union Shape {
 fn kind(s: Shape) []u8 {
     match s {
         .Circle => { return "circle"; }
-        else => { return "other"; }
+        else    => { return "other"; }
     }
 }
 
 fn classify(n: i32) []u8 {
     match n {
-        0 => { return "zero"; }
-        1 => { return "one"; }
-        -1 => { return "minus one"; }
+        0    => { return "zero"; }
+        1    => { return "one"; }
+        -1   => { return "minus one"; }
         else => { return "many"; }
     }
 }
@@ -43,12 +43,12 @@ export fn run() void {
     // expect: other
     // expect: 0
     // expect: other
-    io.str(classify(0));    // expect: zero
-    io.str(classify(-1));   // expect: minus one
-    io.str(classify(42));   // expect: many
+    io.str(classify(0));   // expect: zero
+    io.str(classify(-1));  // expect: minus one
+    io.str(classify(42));  // expect: many
     let b = true;
     match b {
-        true => { io.str("yes"); }
+        true  => { io.str("yes"); }
         false => { io.str("no"); }
     }
     // expect: yes

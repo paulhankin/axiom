@@ -122,8 +122,8 @@ pub struct Channel[T] {
 
     pub fn init(alloc: mem.Allocator, capacity: usize) !Self {
         let buf = alloc.alloc.[T](@max(capacity, 1))!;
-        return Self.{ alloc: alloc, buf: buf, head: 0, len: 0, closed: false, lock: Mutex.init(),
-                      not_empty: 0, not_full: 0 };
+        return Self.{ alloc: alloc, buf: buf, head: 0, len: 0, closed: false, lock: Mutex.init(), not_empty: 0,
+                      not_full: 0 };
     }
 
     /// Frees the buffer. No thread may be using the channel.

@@ -21,10 +21,10 @@ pub const T_VOID: i32 = 0;
 pub const T_INT: i32 = 1;    // bits: 1, 8, 16, 32, 64, 128
 pub const T_FLOAT: i32 = 2;  // bits: 32, 64
 pub const T_PTR: i32 = 3;
-pub const T_VEC: i32 = 4;    // elem (INT or FLOAT lane), lanes
-pub const T_ARRAY: i32 = 5;  // elem, count
-pub const T_STRUCT: i32 = 6; // fields, offs
-pub const T_FN: i32 = 7;     // ret, params, vararg
+pub const T_VEC: i32 = 4;     // elem (INT or FLOAT lane), lanes
+pub const T_ARRAY: i32 = 5;   // elem, count
+pub const T_STRUCT: i32 = 6;  // fields, offs
+pub const T_FN: i32 = 7;      // ret, params, vararg
 
 pub struct Ty {
     kind: i32,
@@ -51,8 +51,8 @@ let mut t_void_: *mut Ty = @ptr_from_int(*mut Ty, 0);
 let mut t_ptr_: *mut Ty = @ptr_from_int(*mut Ty, 0);
 let mut t_f32_: *mut Ty = @ptr_from_int(*mut Ty, 0);
 let mut t_f64_: *mut Ty = @ptr_from_int(*mut Ty, 0);
-let mut derived: u.SymMap.[*mut Ty] = u.SymMap.[*mut Ty].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 };
+let mut derived: u.SymMap.[*mut Ty] = u.SymMap.[*mut Ty].{ keys: @ptr_from_int(*mut usize, 0),
+                                                           vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 };
 
 fn new_ty(k: i32) *mut Ty {
     let t = u.new.[Ty]();
@@ -324,9 +324,9 @@ pub fn ty_str(t: *Ty) []u8 {
 // Values
 // -----------------------------------------------------------------------------
 pub const V_INST: i32 = 0;
-pub const V_CINT: i32 = 1;    // cv (truncated to the width, zero-extended)
-pub const V_CFP: i32 = 2;     // fv
-pub const V_ZERO: i32 = 3;    // zero of any type (null pointer, zeroinitializer)
+pub const V_CINT: i32 = 1;  // cv (truncated to the width, zero-extended)
+pub const V_CFP: i32 = 2;   // fv
+pub const V_ZERO: i32 = 3;  // zero of any type (null pointer, zeroinitializer)
 pub const V_UNDEF: i32 = 4;
 pub const V_CAGG: i32 = 5;    // constant struct / array / vector: xs
 pub const V_GLOBAL: i32 = 6;  // address of gv
@@ -353,9 +353,9 @@ pub const OP_FMUL: i32 = 16;
 pub const OP_FDIV: i32 = 17;
 pub const OP_FREM: i32 = 18;
 pub const OP_FNEG: i32 = 19;
-pub const OP_ICMP: i32 = 20;       // cv: predicate
-pub const OP_FCMP: i32 = 21;       // cv: predicate
-pub const OP_SELECT: i32 = 22;     // a ? b : c
+pub const OP_ICMP: i32 = 20;    // cv: predicate
+pub const OP_FCMP: i32 = 21;    // cv: predicate
+pub const OP_SELECT: i32 = 22;  // a ? b : c
 pub const OP_ZEXT: i32 = 23;
 pub const OP_SEXT: i32 = 24;
 pub const OP_TRUNC: i32 = 25;
@@ -368,15 +368,15 @@ pub const OP_SITOFP: i32 = 31;
 pub const OP_UITOFP: i32 = 32;
 pub const OP_FPTOSI_SAT: i32 = 33;
 pub const OP_FPTOUI_SAT: i32 = 34;
-pub const OP_ALLOCA: i32 = 35;     // aty: allocated type; align
-pub const OP_LOAD: i32 = 36;       // a: address
-pub const OP_STORE: i32 = 37;      // a: value, b: address
-pub const OP_PTRADD: i32 = 38;     // a: pointer, b: byte offset (pointer-sized int)
-pub const OP_MEMCPY: i32 = 39;     // a: dst, b: src, c: length (non-overlapping)
-pub const OP_MEMMOVE: i32 = 40;    // a: dst, b: src, c: length
-pub const OP_MEMSET: i32 = 41;     // a: dst, b: byte (i8), c: length
-pub const OP_RMW: i32 = 42;        // cv: RMW_*; a: address, b: value
-pub const OP_CMPXCHG: i32 = 43;    // a: address, b: expected, c: new; result: old value
+pub const OP_ALLOCA: i32 = 35;   // aty: allocated type; align
+pub const OP_LOAD: i32 = 36;     // a: address
+pub const OP_STORE: i32 = 37;    // a: value, b: address
+pub const OP_PTRADD: i32 = 38;   // a: pointer, b: byte offset (pointer-sized int)
+pub const OP_MEMCPY: i32 = 39;   // a: dst, b: src, c: length (non-overlapping)
+pub const OP_MEMMOVE: i32 = 40;  // a: dst, b: src, c: length
+pub const OP_MEMSET: i32 = 41;   // a: dst, b: byte (i8), c: length
+pub const OP_RMW: i32 = 42;      // cv: RMW_*; a: address, b: value
+pub const OP_CMPXCHG: i32 = 43;  // a: address, b: expected, c: new; result: old value
 pub const OP_FENCE: i32 = 44;
 pub const OP_EXTRACTVALUE: i32 = 45;  // a: aggregate, cv: index
 pub const OP_INSERTVALUE: i32 = 46;   // a: aggregate, b: value, cv: index
@@ -392,7 +392,7 @@ pub const OP_CONDBR: i32 = 55;        // a: condition; t1 if true, t2 if false
 pub const OP_SWITCH: i32 = 56;        // a: value; t1: default; xs: case constants, bs: targets
 pub const OP_RET: i32 = 57;           // a: value (nil for void)
 pub const OP_UNREACHABLE: i32 = 58;
-pub const OP_COPY: i32 = 59;          // a (backend use)
+pub const OP_COPY: i32 = 59;  // a (backend use)
 
 // Comparison predicates (LLVM's numbering)
 pub const IntEQ: i32 = 32;
@@ -438,34 +438,34 @@ pub const IN_SMIN: i32 = 10;
 pub const IN_SMAX: i32 = 11;
 pub const IN_UMIN: i32 = 12;
 pub const IN_UMAX: i32 = 13;
-pub const IN_FMIN: i32 = 14;      // IEEE minimum: NaN-propagating, -0 < +0
+pub const IN_FMIN: i32 = 14;  // IEEE minimum: NaN-propagating, -0 < +0
 pub const IN_FMAX: i32 = 15;
 pub const IN_FABS: i32 = 16;
 pub const IN_SQRT: i32 = 17;
 pub const IN_FLOOR: i32 = 18;
 pub const IN_CEIL: i32 = 19;
 pub const IN_FTRUNC: i32 = 20;
-pub const IN_NEAREST: i32 = 21;   // round to nearest, ties to even
+pub const IN_NEAREST: i32 = 21;  // round to nearest, ties to even
 pub const IN_FMA: i32 = 22;
 pub const IN_COPYSIGN: i32 = 23;
-pub const IN_ABS: i32 = 24;       // wrapping integer abs
+pub const IN_ABS: i32 = 24;  // wrapping integer abs
 pub const IN_TRAP: i32 = 25;
-pub const IN_MEMSIZE: i32 = 26;   // wasm memory.size (pages)
-pub const IN_MEMGROW: i32 = 27;   // wasm memory.grow
-pub const IN_WAIT32: i32 = 28;    // wasm memory.atomic.wait32
-pub const IN_NOTIFY: i32 = 29;    // wasm memory.atomic.notify
-pub const IN_SET_SP: i32 = 30;    // set the stack pointer (thread entry on wasm)
-pub const IN_ANYTRUE: i32 = 31;   // i1: any bit of the vector set
-pub const IN_ALLTRUE: i32 = 32;   // i1: every lane nonzero
-pub const IN_BITMASK: i32 = 33;   // i32: top bit of each lane
-pub const IN_SWIZZLE: i32 = 34;   // i8x16 swizzle (out-of-range index: 0)
-pub const IN_DOT_I16: i32 = 35;   // i32x4 dot product of i16x8 lanes
-pub const IN_UMUL_OV: i32 = 36;   // i1: the unsigned product of the two operands overflows
-pub const IN_SMUL_OV: i32 = 37;   // i1: the signed product overflows (64-bit operands)
+pub const IN_MEMSIZE: i32 = 26;  // wasm memory.size (pages)
+pub const IN_MEMGROW: i32 = 27;  // wasm memory.grow
+pub const IN_WAIT32: i32 = 28;   // wasm memory.atomic.wait32
+pub const IN_NOTIFY: i32 = 29;   // wasm memory.atomic.notify
+pub const IN_SET_SP: i32 = 30;   // set the stack pointer (thread entry on wasm)
+pub const IN_ANYTRUE: i32 = 31;  // i1: any bit of the vector set
+pub const IN_ALLTRUE: i32 = 32;  // i1: every lane nonzero
+pub const IN_BITMASK: i32 = 33;  // i32: top bit of each lane
+pub const IN_SWIZZLE: i32 = 34;  // i8x16 swizzle (out-of-range index: 0)
+pub const IN_DOT_I16: i32 = 35;  // i32x4 dot product of i16x8 lanes
+pub const IN_UMUL_OV: i32 = 36;  // i1: the unsigned product of the two operands overflows
+pub const IN_SMUL_OV: i32 = 37;  // i1: the signed product overflows (64-bit operands)
 
 // Load/store flags
 pub const F_VOLATILE: u32 = 1;
-pub const F_ATOMIC: u32 = 2;   // sequentially consistent
+pub const F_ATOMIC: u32 = 2;  // sequentially consistent
 
 pub struct Value {
     kind: i32,
@@ -482,10 +482,10 @@ pub struct Value {
     fv: f64,
     flags: u32,
     align: u32,
-    aty: *mut Ty,       // ALLOCA: allocated type
-    fty: *mut Ty,       // CALL: signature
-    mask: []mut i32,    // SHUFFLE
-    ext: []mut u8,      // CALL: argument extension (0 none, 1 zext, 2 sext)
+    aty: *mut Ty,     // ALLOCA: allocated type
+    fty: *mut Ty,     // CALL: signature
+    mask: []mut i32,  // SHUFFLE
+    ext: []mut u8,    // CALL: argument extension (0 none, 1 zext, 2 sext)
     blk: *mut Block,
     prev: *mut Value,
     next: *mut Value,
@@ -494,15 +494,15 @@ pub struct Value {
     id: i32,
     uses: i32,
     name: []u8,
-    aux: i64,           // pass / backend scratch
+    aux: i64,  // pass / backend scratch
     aux2: i64,
     auxp: *mut void,
-    fwd: *mut Value,    // replacement (passes forward uses through resolve())
+    fwd: *mut Value,  // replacement (passes forward uses through resolve())
     // backend scratch
-    pos: i32,           // position in its block
-    loc: i32,           // local / virtual register
+    pos: i32,  // position in its block
+    loc: i32,  // local / virtual register
     flag: i32,
-    user: *mut Value,   // the only user (when uses == 1)
+    user: *mut Value,  // the only user (when uses == 1)
 }
 
 pub struct Block {
@@ -517,18 +517,18 @@ pub struct Block {
     idom: *mut Block,
     dom_kids: u.List.[*mut Block],
     rpo: i32,
-    depth: i32,        // dominator tree depth
+    depth: i32,  // dominator tree depth
     loop_depth: i32,
     aux: i64,
     auxp: *mut void,
-    mark: i64,         // pass scratch that survives CFG analyses
-    split: bool,       // a loop header whose range was split (gvn.split_loops)
+    mark: i64,    // pass scratch that survives CFG analyses
+    split: bool,  // a loop header whose range was split (gvn.split_loops)
 }
 
 pub const LINK_EXTERNAL: i32 = 0;
 pub const LINK_INTERNAL: i32 = 1;
-pub const LINK_LINKONCE: i32 = 2;   // a definition any unit may repeat; one is kept
-pub const LINK_EXTWEAK: i32 = 3;    // a weak reference: 0 when not defined
+pub const LINK_LINKONCE: i32 = 2;  // a definition any unit may repeat; one is kept
+pub const LINK_EXTWEAK: i32 = 3;   // a weak reference: 0 when not defined
 pub const LINK_WEAK: i32 = 4;
 
 pub struct Func {
@@ -542,12 +542,12 @@ pub struct Func {
     noreturn: bool,
     cold: bool,
     noinline: bool,
-    ret_ext: u8,          // 0 none, 1 zext, 2 sext
+    ret_ext: u8,  // 0 none, 1 zext, 2 sext
     param_ext: []mut u8,
     export_name: []u8,    // wasm export
     import_module: []u8,  // wasm import
     import_name: []u8,
-    sret: bool,           // set by lowering: params[0] is the result address
+    sret: bool,                  // set by lowering: params[0] is the result address
     split: u.List.[*mut Value],  // lowering: aggregate parameters passed as their leaves
     nvals: i32,
     nblocks: i32,
@@ -559,7 +559,7 @@ pub struct Func {
 pub struct Global {
     name: []u8,
     ty: *mut Ty,
-    init: *mut Value,   // nil: declaration
+    init: *mut Value,  // nil: declaration
     linkage: i32,
     align: u64,
     is_const: bool,
@@ -1626,10 +1626,10 @@ pub fn unreachable(bd: *mut Builder) void {
 fn op_name(op: i32) []u8 {
     let names = ["?", "add", "sub", "mul", "udiv", "sdiv", "urem", "srem", "and", "or", "xor", "shl", "lshr", "ashr",
                  "fadd", "fsub", "fmul", "fdiv", "frem", "fneg", "icmp", "fcmp", "select", "zext", "sext", "trunc",
-                 "bitcast", "ptrtoint", "inttoptr", "fpext", "fptrunc", "sitofp", "uitofp", "fptosi.sat",
-                 "fptoui.sat", "alloca", "load", "store", "ptradd", "memcpy", "memmove", "memset", "atomicrmw",
-                 "cmpxchg", "fence", "extractvalue", "insertvalue", "extractelement", "insertelement", "shuffle",
-                 "splat", "call", "intr", "phi", "br", "condbr", "switch", "ret", "unreachable", "copy"];
+                 "bitcast", "ptrtoint", "inttoptr", "fpext", "fptrunc", "sitofp", "uitofp", "fptosi.sat", "fptoui.sat",
+                 "alloca", "load", "store", "ptradd", "memcpy", "memmove", "memset", "atomicrmw", "cmpxchg", "fence",
+                 "extractvalue", "insertvalue", "extractelement", "insertelement", "shuffle", "splat", "call", "intr",
+                 "phi", "br", "condbr", "switch", "ret", "unreachable", "copy"];
     if (op < 0) or (@int_cast(usize, op) >= names.len) {
         return "?";
     }

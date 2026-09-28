@@ -75,10 +75,10 @@ export fn demo() u32 {
     xs.push(10) catch return 0;
     xs.push(20) catch return 0;
 
-    insertion_sort(xs.items[..xs.len], u32_less);   // T deduced as u32
+    insertion_sort(xs.items[..xs.len], u32_less);  // T deduced as u32
 
     let lanes: [4]u32 = [1, 2, 3, 4];
-    let total = sum(lanes);                         // T = u32, N = 4
+    let total = sum(lanes);  // T = u32, N = 4
 
-    return max(xs.get(0), total);                   // 10 vs 10 -> 10
+    return max(xs.get(0), total);  // 10 vs 10 -> 10
 }

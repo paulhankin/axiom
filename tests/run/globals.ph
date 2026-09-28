@@ -27,12 +27,12 @@ fn bump() u32 {
 }
 
 export fn run() void {
-    io.int(@as(i64, TABLE[N - 1]));      // expect: 40
-    io.float(HALF * 3.0);                // expect: 1.5
+    io.int(@as(i64, TABLE[N - 1]));  // expect: 40
+    io.float(HALF * 3.0);            // expect: 1.5
     _ = bump();
     _ = bump();
-    io.int(@as(i64, bump()));            // expect: 3
-    io.str(GREETING);                    // expect: hi
+    io.int(@as(i64, bump()));  // expect: 3
+    io.str(GREETING);          // expect: hi
     for op in OPS {
         io.str(op.name);
         io.int(@as(i64, op.f(6, 7)));
@@ -43,5 +43,5 @@ export fn run() void {
     // expect: 42
     let g = &mut counter;
     g.* = 100;
-    io.int(@as(i64, counter));           // expect: 100
+    io.int(@as(i64, counter));  // expect: 100
 }

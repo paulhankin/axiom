@@ -14,18 +14,18 @@ fn smul(a: i64, b: i64) i64 {
 }
 
 export fn run() void {
-    io.uint(us[5] * 3);                          // expect: 18446744073709551615
-    io.uint(umul(us[5], us[3]));                 // expect: 18446744073709551615
-    io.uint(umul(us[4], us[4] + 2));             // expect: 18446744073709551615
-    io.uint(umul(us[0], 0xFFFF_FFFF_FFFF_FFFF)); // expect: 0
-    io.uint(us[1] * 0xFFFF_FFFF_FFFF_FFFF);      // expect: 18446744073709551615
-    io.int(ss[5] * 2);                           // expect: 9223372036854775806
-    io.int(smul(ss[5], ss[3]));                  // expect: 9223372036854775806
-    io.int(smul(ss[5] + 1, -ss[3]));             // expect: -9223372036854775808
-    io.int(smul(ss[2], 0x7FFF_FFFF_FFFF_FFFF));  // expect: -9223372036854775807
-    io.int(ss[3] * -0x4000_0000_0000_0000);      // expect: -9223372036854775808
-    io.int(smul(ss[0], -0x7FFF_FFFF_FFFF_FFFF - 1)); // expect: 0
-    io.int(ss[1] * (-0x7FFF_FFFF_FFFF_FFFF - 1));  // expect: -9223372036854775808
-    io.int(ss[5] * -2);                          // expect: -9223372036854775806
-    io.int(smul(ss[5], ss[4]));                  // expect: -9223372036854775806
+    io.uint(us[5] * 3);                               // expect: 18446744073709551615
+    io.uint(umul(us[5], us[3]));                      // expect: 18446744073709551615
+    io.uint(umul(us[4], us[4] + 2));                  // expect: 18446744073709551615
+    io.uint(umul(us[0], 0xFFFF_FFFF_FFFF_FFFF));      // expect: 0
+    io.uint(us[1] * 0xFFFF_FFFF_FFFF_FFFF);           // expect: 18446744073709551615
+    io.int(ss[5] * 2);                                // expect: 9223372036854775806
+    io.int(smul(ss[5], ss[3]));                       // expect: 9223372036854775806
+    io.int(smul(ss[5] + 1, -ss[3]));                  // expect: -9223372036854775808
+    io.int(smul(ss[2], 0x7FFF_FFFF_FFFF_FFFF));       // expect: -9223372036854775807
+    io.int(ss[3] * -0x4000_0000_0000_0000);           // expect: -9223372036854775808
+    io.int(smul(ss[0], -0x7FFF_FFFF_FFFF_FFFF - 1));  // expect: 0
+    io.int(ss[1] * (-0x7FFF_FFFF_FFFF_FFFF - 1));     // expect: -9223372036854775808
+    io.int(ss[5] * -2);                               // expect: -9223372036854775806
+    io.int(smul(ss[5], ss[4]));                       // expect: -9223372036854775806
 }

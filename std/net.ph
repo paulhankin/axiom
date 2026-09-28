@@ -19,13 +19,12 @@ import host "phalange" {
     fn ph_sock_close(handle: i32) void;
 }
 
-fn host_error(code: i32) error {
-    match code {
-        -2 => { return error.ConnectionRefused; }
-        -3 => { return error.AddressInUse; }
-        -4 => { return error.InvalidAddress; }
-        else => { return error.NetError; }
-    }
+fn host_error(code: i32) error { match code {
+    -2   => { return error.ConnectionRefused; }
+    -3   => { return error.AddressInUse; }
+    -4   => { return error.InvalidAddress; }
+    else => { return error.NetError; }
+}
 }
 
 // -----------------------------------------------------------------------------

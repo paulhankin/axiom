@@ -29,10 +29,10 @@ pub const K_SYM: u8 = 4;    // a symbol (call target, address)
 pub const K_LABEL: u8 = 5;  // block / local label
 
 // roles of register operands
-pub const RU: u8 = 1;       // read
-pub const RD: u8 = 2;       // written
+pub const RU: u8 = 1;  // read
+pub const RD: u8 = 2;  // written
 pub const RUD: u8 = 3;
-pub const RE: u8 = 4;       // written before all reads are done (early clobber)
+pub const RE: u8 = 4;  // written before all reads are done (early clobber)
 
 pub struct MOp {
     kind: u8,
@@ -52,13 +52,13 @@ pub struct MInst {
     sz: u8,
     cc: i32,
     ops: []mut MOp,
-    clobber: u64,     // physical registers clobbered (calls)
-    is_move: bool,    // register copy (for coalescing hints)
+    clobber: u64,   // physical registers clobbered (calls)
+    is_move: bool,  // register copy (for coalescing hints)
     next: *mut MInst,
     prev: *mut MInst,
     pos: i32,
     aux: i64,
-    spill: i32,       // 1: a reload, 2: a spill store (of `sreg`, slot `sslot`)
+    spill: i32,  // 1: a reload, 2: a spill store (of `sreg`, slot `sslot`)
     sreg: i32,
     sslot: i32,
 }
@@ -74,18 +74,18 @@ pub struct MBlock {
     live_out: []mut u64,
     start: i32,
     end: i32,
-    offset: u64,      // encoder: code offset
+    offset: u64,  // encoder: code offset
 }
 
 pub struct Slot {
     size: u64,
     align: u64,
-    offset: i64,      // assigned by the target's frame layout
+    offset: i64,  // assigned by the target's frame layout
 }
 
 pub struct Target {
     nclasses: i32,
-    alloc_order: [2][]i32,   // allocatable registers per class, in preference order
+    alloc_order: [2][]i32,  // allocatable registers per class, in preference order
     caller_saved: u64,
     // spill code: load/store of register r (class c) from/to a slot
     spill_load: fn(*mut MFunc, i32, i32, i32) *mut MInst,
@@ -94,12 +94,12 @@ pub struct Target {
 
 pub struct MFunc {
     blocks: u.List.[*mut MBlock],
-    vclass: u.List.[u8],      // class of each virtual register (index: vreg - VREG0)
+    vclass: u.List.[u8],  // class of each virtual register (index: vreg - VREG0)
     nospill: u.List.[bool],
     hint: u.List.[i32],
     slots: u.List.[Slot],
-    assign: []mut i32,        // after allocation: vreg - VREG0 -> physical register
-    used_regs: u64,           // physical registers used (for callee-saved saves)
+    assign: []mut i32,  // after allocation: vreg - VREG0 -> physical register
+    used_regs: u64,     // physical registers used (for callee-saved saves)
     ninst: i32,
     has_calls: bool,
 }
@@ -137,7 +137,8 @@ pub fn is_vreg(r: i32) bool {
 
 // Operand constructors
 pub fn reg(r: i32, role: u8) MOp {
-    return MOp.{ kind: K_REG, role: role, reg: r, base: -1, index: -1, scale: 0, disp: 0, sym: -1, slot: -1, label: -1 };
+    return MOp.{ kind: K_REG, role: role, reg: r, base: -1, index: -1, scale: 0, disp: 0, sym: -1, slot: -1,
+                 label: -1 };
 }
 
 pub fn imm(x: i64) MOp {
@@ -160,7 +161,8 @@ pub fn mem_sym(sym: i32, disp: i64) MOp {
 }
 
 pub fn symop(sym: i32, disp: i64) MOp {
-    return MOp.{ kind: K_SYM, role: 0, reg: -1, base: -1, index: -1, scale: 0, disp: disp, sym: sym, slot: -1, label: -1 };
+    return MOp.{ kind: K_SYM, role: 0, reg: -1, base: -1, index: -1, scale: 0, disp: disp, sym: sym, slot: -1,
+                 label: -1 };
 }
 
 pub fn label(l: i32) MOp {
@@ -488,15 +490,15 @@ fn build_fixed(f: *mut MFunc) void {
 }
 
 struct Interval {
-    v: i32,       // vreg index (vreg - VREG0)
-    s: i32,       // first position
-    e: i32,       // last position
+    v: i32,  // vreg index (vreg - VREG0)
+    s: i32,  // first position
+    e: i32,  // last position
     reg: i32,
     spilled: bool,
-    uses: f64,    // uses and definitions, weighted by 10^loop depth
+    uses: f64,               // uses and definitions, weighted by 10^loop depth
     ranges: u.List.[Range],  // the positions it is live at: sorted, disjoint, inclusive
-    cur: usize,   // scan cursor into ranges
-    size: i32,    // positions covered
+    cur: usize,              // scan cursor into ranges
+    size: i32,               // positions covered
 }
 
 // The cost of spilling an interval: its (weighted) uses per position covered.

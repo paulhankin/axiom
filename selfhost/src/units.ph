@@ -9,14 +9,14 @@
 // worker processes forked after type checking, then generates the small
 // per-program link unit (globals, error codes, runtime state, exports).
 // =============================================================================
-import "util.ph" as u;
-import "target.ph" as tg;
-import "diag.ph" as dg;
 import "ast.ph" as ast;
-import "types.ph" as ty;
-import "sema.ph" as sema;
 import "codegen.ph" as cg;
+import "diag.ph" as dg;
 import "package.ph" as pkg;
+import "sema.ph" as sema;
+import "target.ph" as tg;
+import "types.ph" as ty;
+import "util.ph" as u;
 
 pub struct UnitStats {
     total: usize,     // modules in the program

@@ -200,8 +200,9 @@ pub struct Mat4 {
     cols: [4]f32x4,
 
     pub fn identity() Mat4 {
-        return Mat4.{ cols: [@vec(f32x4, 1.0, 0.0, 0.0, 0.0), @vec(f32x4, 0.0, 1.0, 0.0, 0.0),
-                             @vec(f32x4, 0.0, 0.0, 1.0, 0.0), @vec(f32x4, 0.0, 0.0, 0.0, 1.0)] };
+        return Mat4.{
+            cols: [@vec(f32x4, 1.0, 0.0, 0.0, 0.0), @vec(f32x4, 0.0, 1.0, 0.0, 0.0), @vec(f32x4, 0.0, 0.0, 1.0, 0.0),
+                   @vec(f32x4, 0.0, 0.0, 0.0, 1.0)] };
     }
 
     pub fn translation(x: f32, y: f32, z: f32) Mat4 {
@@ -211,8 +212,9 @@ pub struct Mat4 {
     }
 
     pub fn scaling(x: f32, y: f32, z: f32) Mat4 {
-        return Mat4.{ cols: [@vec(f32x4, x, 0.0, 0.0, 0.0), @vec(f32x4, 0.0, y, 0.0, 0.0),
-                             @vec(f32x4, 0.0, 0.0, z, 0.0), @vec(f32x4, 0.0, 0.0, 0.0, 1.0)] };
+        return Mat4.{
+            cols: [@vec(f32x4, x, 0.0, 0.0, 0.0), @vec(f32x4, 0.0, y, 0.0, 0.0), @vec(f32x4, 0.0, 0.0, z, 0.0),
+                   @vec(f32x4, 0.0, 0.0, 0.0, 1.0)] };
     }
 
     /// Element at row r, column c (both < 4).
@@ -249,8 +251,10 @@ pub struct Mat4 {
         let ab_hi = @shuffle(a, b, [2, 6, 3, 7]);
         let cd_lo = @shuffle(c, d, [0, 4, 1, 5]);
         let cd_hi = @shuffle(c, d, [2, 6, 3, 7]);
-        return Mat4.{ cols: [@shuffle(ab_lo, cd_lo, [0, 1, 4, 5]), @shuffle(ab_lo, cd_lo, [2, 3, 6, 7]),
-                             @shuffle(ab_hi, cd_hi, [0, 1, 4, 5]), @shuffle(ab_hi, cd_hi, [2, 3, 6, 7])] };
+        return Mat4.{
+            cols: [
+                @shuffle(ab_lo, cd_lo, [0, 1, 4, 5]), @shuffle(ab_lo, cd_lo, [2, 3, 6, 7]), @shuffle(
+                    ab_hi, cd_hi, [0, 1, 4, 5]), @shuffle(ab_hi, cd_hi, [2, 3, 6, 7])] };
     }
 }
 

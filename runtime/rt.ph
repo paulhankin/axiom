@@ -278,8 +278,7 @@ pub fn fma64(x: f64, y: f64, z: f64) f64 {
             zhi = nz.m;
             e = nz.e - 64;
             d -= 64;
-            if d == 0 {
-            } else if d < 64 {
+            if d == 0 {} else if d < 64 {
                 let sd = @int_cast(u32, d);
                 rlo = ((rhi << (64 - sd)) | (rlo >> sd)) | sticky(rlo << (64 - sd));
                 rhi = rhi >> sd;

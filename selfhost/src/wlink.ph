@@ -8,15 +8,15 @@
 // whose slot 0 stays empty. Undefined functions with an explicit import
 // module (`import host`) become imports; other undefined symbols are errors.
 // =============================================================================
-import "util.ph" as u;
 import "bin.ph" as bn;
+import "util.ph" as u;
 import "wobj.ph" as wo;
 
 pub struct Options {
     stack_size: u64,
-    shared_memory: bool,   // threads: import a shared memory, initialize data once
+    shared_memory: bool,  // threads: import a shared memory, initialize data once
     max_pages: u64,
-    exports: [][]u8,       // extra symbol names to export (by symbol name)
+    exports: [][]u8,  // extra symbol names to export (by symbol name)
 }
 
 // A resolved symbol: unit index and symbol index there.
@@ -27,8 +27,8 @@ struct Ref {
 
 let mut units_p: *mut *mut wo.Unit = @ptr_from_int(*mut *mut wo.Unit, 0);
 let mut nunits: usize = 0;
-let mut defs: u.SymMap.[*mut Ref] = u.SymMap.[*mut Ref].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut Ref, 0), cap: 0, len: 0 };
+let mut defs: u.SymMap.[*mut Ref] = u.SymMap.[*mut Ref].{ keys: @ptr_from_int(*mut usize, 0),
+                                                          vals: @ptr_from_int(*mut *mut Ref, 0), cap: 0, len: 0 };
 let mut failed: bool = false;
 
 fn err(msg: []u8) void {
@@ -39,11 +39,11 @@ fn err(msg: []u8) void {
 // Per unit: final function index of each unit function index (imports and
 // definitions), liveness of definitions and segments, segment addresses.
 struct UnitMap {
-    fidx: []mut i64,     // unit function index -> final index (-1 unknown)
-    flive: []mut bool,   // defined functions (by definition number)
+    fidx: []mut i64,    // unit function index -> final index (-1 unknown)
+    flive: []mut bool,  // defined functions (by definition number)
     slive: []mut bool,
     saddr: []mut u64,
-    gidx: []mut i64,     // unit global index -> final global index
+    gidx: []mut i64,  // unit global index -> final global index
 }
 
 let mut maps_p: *mut UnitMap = @ptr_from_int(*mut UnitMap, 0);

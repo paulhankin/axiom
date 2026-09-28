@@ -18,11 +18,11 @@ fn show(xs: []u64, n: usize) u64 {
 
 export fn run() void {
     let xs: [3]u64 = [1, 2, 3];
-    io.uint(show(xs[..], g_n) * 100);   // expect: 1
-                                        // expect: 3
-                                        // expect: 300
+    io.uint(show(xs[..], g_n) * 100);  // expect: 1
+                                       // expect: 3
+                                       // expect: 300
     g_n = 5;
-    _ = show(xs[..], g_n);              // expect: 1
-                                        // expect: 3
-                                        // expect: 6
+    _ = show(xs[..], g_n);  // expect: 1
+                            // expect: 3
+                            // expect: 6
 }

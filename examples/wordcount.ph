@@ -6,11 +6,11 @@
 //   node runtime/host.mjs wc.wasm < some.txt          (or --target=native)
 // =============================================================================
 
-import "std/mem" as mem;
-import "std/io" as io;
-import "std/vec" as vec;
-import "std/map" as map;
 import "std/hash" as hash;
+import "std/io" as io;
+import "std/map" as map;
+import "std/mem" as mem;
+import "std/vec" as vec;
 
 struct Entry {
     word: []u8,

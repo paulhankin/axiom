@@ -60,7 +60,7 @@ export fn run() void {
     // expect: 0
     // expect: 1
     // expect: 2
-    io.int(@as(i64, d()));   // expect: 1
+    io.int(@as(i64, d()));  // expect: 1
     _ = e2() catch 0;
     // expect: b-cleanup
     // expect: e2-defer

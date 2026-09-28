@@ -453,10 +453,10 @@ pub fn atol(s: []u8) i64 {
 
 // C's strtoll / strtoull with base 0 (0x hex, leading-0 octal, decimal).
 pub struct CInt {
-    value: u64,     // magnitude, clamped to u64 max
+    value: u64,  // magnitude, clamped to u64 max
     neg: bool,
-    end: usize,     // bytes consumed (0: no conversion)
-    big: bool,      // magnitude exceeded u64
+    end: usize,  // bytes consumed (0: no conversion)
+    big: bool,   // magnitude exceeded u64
 }
 
 fn digit_val(c: u8) u32 {

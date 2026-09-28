@@ -1,8 +1,8 @@
 // std/map
 import "../lib/io.ph" as io;
-import "std/mem" as mem;
-import "std/map" as map;
 import "std/hash" as hash;
+import "std/map" as map;
+import "std/mem" as mem;
 
 fn err_of[T](r: !T) []u8 {
     _ = r catch |e| {
@@ -19,22 +19,22 @@ export fn run() void {
     for i in @as(u64, 0)..10000 {
         m.put(i, i * i) catch return;
     }
-    io.uint(@as(u64, m.len()));                 // expect: 10000
-    io.uint(m.get(77) catch 0);                 // expect: 5929
-    io.boolean(m.contains(9999));               // expect: true
-    io.boolean(m.contains(10000));              // expect: false
+    io.uint(@as(u64, m.len()));     // expect: 10000
+    io.uint(m.get(77) catch 0);     // expect: 5929
+    io.boolean(m.contains(9999));   // expect: true
+    io.boolean(m.contains(10000));  // expect: false
     for i in @as(u64, 0)..10000 {
         if (i % 2) == 0 {
             _ = m.remove(i);
         }
     }
-    io.uint(@as(u64, m.len()));                 // expect: 5000
-    io.boolean(m.contains(78));                 // expect: false
+    io.uint(@as(u64, m.len()));  // expect: 5000
+    io.boolean(m.contains(78));  // expect: false
     m.put(3, 1) catch return;
-    io.uint(m.get(3) catch 0);                  // expect: 1
+    io.uint(m.get(3) catch 0);  // expect: 1
     let p = m.get_ptr(5) catch return;
     p.* += 1;
-    io.uint(m.get(5) catch 0);                  // expect: 26
+    io.uint(m.get(5) catch 0);  // expect: 26
     let mut it = m.iter();
     let mut k: u64 = 0;
     let mut v: u64 = 0;
@@ -44,9 +44,9 @@ export fn run() void {
         n += 1;
         ksum += k;
     }
-    io.uint(n);                                 // expect: 5000
-    io.uint(ksum);                              // expect: 25000000
-    io.str(err_of(m.get(4)));                   // expect: NotFound
+    io.uint(n);                // expect: 5000
+    io.uint(ksum);             // expect: 25000000
+    io.str(err_of(m.get(4)));  // expect: NotFound
 
     // string keys
     let mut words = map.Map.[[]u8, u32].init(al, hash.hash_bytes, hash.eq_bytes);
@@ -56,7 +56,7 @@ export fn run() void {
         words.put(w, c + 1) catch return;
     }
     io.uint(@as(u64, words.get("the") catch 0));  // expect: 3
-    io.uint(@as(u64, words.len()));                // expect: 5
+    io.uint(@as(u64, words.len()));               // expect: 5
     m.clear();
-    io.uint(@as(u64, m.len()));                    // expect: 0
+    io.uint(@as(u64, m.len()));  // expect: 0
 }

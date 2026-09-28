@@ -4,8 +4,8 @@
 // the system linker when C code is linked in), and decoding of the objects
 // we write.
 // =============================================================================
-import "util.ph" as u;
 import "bin.ph" as bn;
+import "util.ph" as u;
 
 pub const EM_X86_64: u32 = 62;
 pub const EM_AARCH64: u32 = 183;
@@ -63,15 +63,15 @@ pub struct Sec {
     name: []u8,
     kind: i32,
     data: bn.Bytes,
-    size: u64,        // BSS / TBSS size (no data)
+    size: u64,  // BSS / TBSS size (no data)
     align: u64,
     relocs: u.List.[Rel],
-    index: u32,       // section header index when written
+    index: u32,  // section header index when written
 }
 
 pub struct Sym {
     name: []u8,
-    sec: i32,         // section index in Obj.secs, -1: undefined
+    sec: i32,  // section index in Obj.secs, -1: undefined
     value: u64,
     size: u64,
     bind: u8,
@@ -83,7 +83,7 @@ pub struct Obj {
     machine: u32,
     secs: u.List.[*mut Sec],
     syms: u.List.[Sym],
-    symmap: u.SymMap.[u32],   // non-local name -> symbol index + 1
+    symmap: u.SymMap.[u32],  // non-local name -> symbol index + 1
 }
 
 pub fn new_obj(machine: u32) *mut Obj {
@@ -303,8 +303,8 @@ pub fn write(o: *mut Obj) []u8 {
     shstr.u8_(0);
     let sho = @as(u64, out.len());
     out.put(shstr.view());
-    shdrs.push(Shdr.{ name: n_shstr, ty: 3, flags: 0, off: sho, size: @as(u64, shstr.len()), link: 0, info: 0,
-                      align: 1, entsize: 0 });
+    shdrs.push(Shdr.{ name: n_shstr, ty: 3, flags: 0, off: sho, size: @as(u64, shstr.len()), link: 0, info: 0, align: 1,
+                      entsize: 0 });
     // section headers
     out.align(8);
     let shoff = @as(u64, out.len());
@@ -328,10 +328,10 @@ pub fn write(o: *mut Obj) []u8 {
         hdr[i] = ident[i];
     }
     out.set_u32(16, 1 | (@as(u64, o.machine) << 16));  // e_type REL, e_machine
-    out.set_u32(20, 1);                                // e_version
+    out.set_u32(20, 1);  // e_version
     out.set_u64(40, shoff);
-    out.set_u32(52, 64);                               // e_ehsize = 64, e_phentsize = 0
-    out.set_u32(56, 0 | (@as(u64, 64) << 16));         // e_phnum = 0, e_shentsize = 64
+    out.set_u32(52, 64);  // e_ehsize = 64, e_phentsize = 0
+    out.set_u32(56, 0 | (@as(u64, 64) << 16));  // e_phnum = 0, e_shentsize = 64
     out.set_u32(60, @as(u64, shdrs.len) | (@as(u64, shdrs.len - 1) << 16));  // e_shnum, e_shstrndx
     let r = u.dup(out.view());
     out.free();
@@ -455,7 +455,8 @@ pub fn read(d: []u8) *mut Obj {
             if es < elf2us.len {
                 us = elf2us.get(es);
             }
-            s.relocs.push(Rel.{ off: rd64(d, e), ty: @truncate(u32, info), sym: us, addend: @bit_cast(i64, rd64(d, e + 16)) });
+            s.relocs.push(
+                Rel.{ off: rd64(d, e), ty: @truncate(u32, info), sym: us, addend: @bit_cast(i64, rd64(d, e + 16)) });
         }
     }
     return o;

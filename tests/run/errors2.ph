@@ -17,16 +17,16 @@ fn describe(n: u32) []u8 {
         match e {
             error.A => { return "A"; }
             error.B => { return "B"; }
-            else => { return "?"; }
+            else    => { return "?"; }
         }
     };
     return "ok";
 }
 
 export fn run() void {
-    io.str(describe(0));   // expect: ok
-    io.str(describe(1));   // expect: A
-    io.str(describe(2));   // expect: B
+    io.str(describe(0));  // expect: ok
+    io.str(describe(1));  // expect: A
+    io.str(describe(2));  // expect: B
     let big: u32 = 4000000000;
     let s = @add_checked(big, big) catch |e| {
         io.str(@error_name(e));  // expect: Overflow

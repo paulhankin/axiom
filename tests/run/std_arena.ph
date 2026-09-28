@@ -12,7 +12,7 @@ export fn run() void {
         block[999] = round;
         sum += block[999];
     }
-    io.uint(sum);              // expect: 1225
+    io.uint(sum);  // expect: 1225
     arena.reset();
     let again = al.alloc.[u8](10) catch return;
     again[0] = 42;

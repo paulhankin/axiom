@@ -172,8 +172,9 @@ fn resolve(name: *u8, len: usize, port: u32, passive: bool, res: *mut *mut AddrI
     }
     let mut serv: [16]u8 = [0; 16];
     _ = tf.snprintf(&mut serv[0], 16, "%u".ptr, port);
-    let mut hints = AddrInfo.{ flags: 0, family: 0, socktype: 1, protocol: 0, addrlen: 0, addr: @ptr_from_int(*mut void, 0),
-                               canonname: @ptr_from_int(*u8, 0), next: nil_ptr.[AddrInfo]() };
+    let mut hints = AddrInfo.{
+        flags: 0, family: 0, socktype: 1, protocol: 0, addrlen: 0, addr: @ptr_from_int(*mut void, 0),
+        canonname: @ptr_from_int(*u8, 0), next: nil_ptr.[AddrInfo]() };
     if passive {
         hints.flags = 1;  // AI_PASSIVE
     }
@@ -356,15 +357,14 @@ export fn ph_cpu_count() u32 {
 
 export fn ph_sleep_ns(ns: u64) void {
     let mut ts = Timespec.{ sec: @bit_cast(i64, ns / 1000000000), nsec: @bit_cast(i64, ns % 1000000000) };
-    while (nanosleep(&ts, &mut ts) != 0) and (errno() == EINTR) {
-    }
+    while (nanosleep(&ts, &mut ts) != 0) and (errno() == EINTR) {}
 }
 
 fn sys_futex() i64 {
     if phalange_target_arch() == 2 {
-        return 98;   // AArch64
+        return 98;  // AArch64
     }
-    return 202;      // x86-64
+    return 202;  // x86-64
 }
 
 // Same results as WebAssembly memory.atomic.wait32: 0 woken, 1 not equal, 2 timed out.

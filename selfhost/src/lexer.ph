@@ -1,8 +1,8 @@
 // =============================================================================
 // lexer.ph - tokens and the tokenizer (maximal munch, whole file up front).
 // =============================================================================
-import "util.ph" as u;
 import "diag.ph" as dg;
+import "util.ph" as u;
 
 pub const TK_EOF: i32 = 0;
 pub const TK_IDENT: i32 = 1;
@@ -122,15 +122,20 @@ pub const PRIM_V128: i32 = 24;
 pub const PRIM_COUNT: i32 = 25;
 
 pub fn prim_name(i: usize) []u8 {
-    let t = ["u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64", "bool", "void", "i8x16", "u8x16", "i16x8", "u16x8", "i32x4", "u32x4", "i64x2", "u64x2", "f32x4", "f64x2", "v128"];
+    let t = ["u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64", "bool", "void",
+             "i8x16", "u8x16", "i16x8", "u16x8", "i32x4", "u32x4", "i64x2", "u64x2", "f32x4", "f64x2", "v128"];
     return t[i];
 }
 pub fn kw_name(i: usize) []u8 {
-    let t = ["and", "as", "break", "catch", "const", "continue", "defer", "else", "error", "export", "extern", "false", "fn", "for", "host", "if", "import", "in", "let", "loop", "match", "mut", "not", "or", "pub", "return", "Self", "struct", "test", "true", "union", "while"];
+    let t = ["and", "as", "break", "catch", "const", "continue", "defer", "else", "error", "export", "extern", "false",
+             "fn", "for", "host", "if", "import", "in", "let", "loop", "match", "mut", "not", "or", "pub", "return",
+             "Self", "struct", "test", "true", "union", "while"];
     return t[i];
 }
 pub fn punct_name(i: usize) []u8 {
-    let t = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>", "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=", "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>", "(", ")", "{", "}", "[", "]"];
+    let t = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>", "==", "!=", "<", "<=", ">",
+             ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=", "&=", "|=", "^=", "<<=", ">>=", "!", ".",
+             "..", "...", ",", ":", ";", "=>", "(", ")", "{", "}", "[", "]"];
     return t[i];
 }
 
@@ -174,12 +179,12 @@ pub fn tok_kind_name(k: i32) []u8 {
 pub struct Token {
     kind: i32,
     span: u.Span,
-    ival: u64,          // TK_INT, TK_CHAR
-    fval: f64,          // TK_FLOAT
-    name: []u8,         // TK_IDENT, TK_BUILTIN
-    prim: i32,          // TK_PRIM
-    str: []u8,          // TK_STRING
-    float_text: []u8,   // TK_FLOAT: literal text without '_'
+    ival: u64,         // TK_INT, TK_CHAR
+    fval: f64,         // TK_FLOAT
+    name: []u8,        // TK_IDENT, TK_BUILTIN
+    prim: i32,         // TK_PRIM
+    str: []u8,         // TK_STRING
+    float_text: []u8,  // TK_FLOAT: literal text without '_'
 }
 
 fn tok(kind: i32, sp: u.Span) Token {
@@ -315,7 +320,8 @@ fn lex_escape(L: *mut Lexer, out: *mut u.Buf, ascii_only: bool) void {
                 break;
             }
         }
-        if (L.pos >= L.s.len) or (L.s[L.pos] != '}') or (nd == 0) or (cp > 0x10FFFF) or ((cp >= 0xD800) and (cp <= 0xDFFF)) {
+        if (L.pos >= L.s.len) or (L.s[L.pos] != '}') or (nd == 0) or (cp > 0x10FFFF) or
+           ((cp >= 0xD800) and (cp <= 0xDFFF)) {
             _ = dg.err(mkspan(L, start, L.pos), "E0006", "invalid \\u{...} escape");
             return;
         }
@@ -349,7 +355,8 @@ fn lex_number(L: *mut Lexer) void {
     let start = L.pos;
     let s = L.s;
     let mut base: u64 = 10;
-    if (s[L.pos] == '0') and ((L.pos + 1) < s.len) and ((s[L.pos + 1] == 'x') or (s[L.pos + 1] == 'b') or (s[L.pos + 1] == 'o')) {
+    if (s[L.pos] == '0') and ((L.pos + 1) < s.len) and
+       ((s[L.pos + 1] == 'x') or (s[L.pos + 1] == 'b') or (s[L.pos + 1] == 'o')) {
         if s[L.pos + 1] == 'x' {
             base = 16;
         } else if s[L.pos + 1] == 'b' {
@@ -391,7 +398,8 @@ fn lex_number(L: *mut Lexer) void {
             L.pos += 1;
             continue;
         }
-        if (base == 10) and (c == '.') and ((L.pos + 1) < s.len) and (s[L.pos + 1] >= '0') and (s[L.pos + 1] <= '9') and not is_float {
+        if (base == 10) and (c == '.') and ((L.pos + 1) < s.len) and (s[L.pos + 1] >= '0') and (s[L.pos + 1] <= '9') and
+           not is_float {
             is_float = true;
             if bl < 120 {
                 buf[bl] = c;
@@ -466,24 +474,23 @@ struct OpTok {
 
 fn op_table() [48]OpTok {
     return [
-        OpTok.{ s: "...", k: TK_ELLIPSIS }, OpTok.{ s: "+%=", k: TK_PLUS_PCT_EQ }, OpTok.{ s: "-%=", k: TK_MINUS_PCT_EQ },
-        OpTok.{ s: "*%=", k: TK_STAR_PCT_EQ }, OpTok.{ s: "<<=", k: TK_SHL_EQ }, OpTok.{ s: ">>=", k: TK_SHR_EQ },
-        OpTok.{ s: "+%", k: TK_PLUS_PCT }, OpTok.{ s: "-%", k: TK_MINUS_PCT }, OpTok.{ s: "*%", k: TK_STAR_PCT },
-        OpTok.{ s: "<<", k: TK_SHL }, OpTok.{ s: ">>", k: TK_SHR }, OpTok.{ s: "==", k: TK_EQEQ },
-        OpTok.{ s: "!=", k: TK_NE }, OpTok.{ s: "<=", k: TK_LE }, OpTok.{ s: ">=", k: TK_GE },
-        OpTok.{ s: "+=", k: TK_PLUS_EQ }, OpTok.{ s: "-=", k: TK_MINUS_EQ }, OpTok.{ s: "*=", k: TK_STAR_EQ },
-        OpTok.{ s: "/=", k: TK_SLASH_EQ }, OpTok.{ s: "%=", k: TK_PERCENT_EQ }, OpTok.{ s: "&=", k: TK_AMP_EQ },
-        OpTok.{ s: "|=", k: TK_PIPE_EQ }, OpTok.{ s: "^=", k: TK_CARET_EQ }, OpTok.{ s: "..", k: TK_DOTDOT },
-        OpTok.{ s: "=>", k: TK_FATARROW }, OpTok.{ s: "+", k: TK_PLUS },
-        OpTok.{ s: "-", k: TK_MINUS }, OpTok.{ s: "*", k: TK_STAR }, OpTok.{ s: "/", k: TK_SLASH },
-        OpTok.{ s: "%", k: TK_PERCENT }, OpTok.{ s: "&", k: TK_AMP }, OpTok.{ s: "|", k: TK_PIPE },
-        OpTok.{ s: "^", k: TK_CARET }, OpTok.{ s: "~", k: TK_TILDE }, OpTok.{ s: "<", k: TK_LT },
-        OpTok.{ s: ">", k: TK_GT }, OpTok.{ s: "=", k: TK_EQ }, OpTok.{ s: "!", k: TK_BANG },
-        OpTok.{ s: ".", k: TK_DOT }, OpTok.{ s: ",", k: TK_COMMA }, OpTok.{ s: ":", k: TK_COLON },
-        OpTok.{ s: ";", k: TK_SEMI }, OpTok.{ s: "(", k: TK_LPAREN }, OpTok.{ s: ")", k: TK_RPAREN },
-        OpTok.{ s: "{", k: TK_LBRACE }, OpTok.{ s: "}", k: TK_RBRACE }, OpTok.{ s: "[", k: TK_LBRACKET },
-        OpTok.{ s: "]", k: TK_RBRACKET },
-    ];
+        OpTok.{ s: "...", k: TK_ELLIPSIS }, OpTok.{ s: "+%=", k: TK_PLUS_PCT_EQ }, OpTok.{
+            s: "-%=", k: TK_MINUS_PCT_EQ }, OpTok.{ s: "*%=", k: TK_STAR_PCT_EQ }, OpTok.{ s: "<<=", k: TK_SHL_EQ },
+        OpTok.{ s: ">>=", k: TK_SHR_EQ }, OpTok.{ s: "+%", k: TK_PLUS_PCT }, OpTok.{ s: "-%", k: TK_MINUS_PCT },
+        OpTok.{ s: "*%", k: TK_STAR_PCT }, OpTok.{ s: "<<", k: TK_SHL }, OpTok.{ s: ">>", k: TK_SHR }, OpTok.{
+            s: "==", k: TK_EQEQ }, OpTok.{ s: "!=", k: TK_NE }, OpTok.{ s: "<=", k: TK_LE }, OpTok.{
+                s: ">=", k: TK_GE }, OpTok.{ s: "+=", k: TK_PLUS_EQ }, OpTok.{ s: "-=", k: TK_MINUS_EQ },
+        OpTok.{ s: "*=", k: TK_STAR_EQ }, OpTok.{ s: "/=", k: TK_SLASH_EQ }, OpTok.{ s: "%=", k: TK_PERCENT_EQ },
+        OpTok.{ s: "&=", k: TK_AMP_EQ }, OpTok.{ s: "|=", k: TK_PIPE_EQ }, OpTok.{ s: "^=", k: TK_CARET_EQ },
+        OpTok.{ s: "..", k: TK_DOTDOT }, OpTok.{ s: "=>", k: TK_FATARROW }, OpTok.{ s: "+", k: TK_PLUS },
+        OpTok.{ s: "-", k: TK_MINUS }, OpTok.{ s: "*", k: TK_STAR }, OpTok.{ s: "/", k: TK_SLASH }, OpTok.{
+            s: "%", k: TK_PERCENT }, OpTok.{ s: "&", k: TK_AMP }, OpTok.{ s: "|", k: TK_PIPE }, OpTok.{
+                s: "^", k: TK_CARET }, OpTok.{ s: "~", k: TK_TILDE }, OpTok.{ s: "<", k: TK_LT }, OpTok.{
+                    s: ">", k: TK_GT }, OpTok.{ s: "=", k: TK_EQ }, OpTok.{ s: "!", k: TK_BANG }, OpTok.{
+                        s: ".", k: TK_DOT }, OpTok.{ s: ",", k: TK_COMMA }, OpTok.{ s: ":", k: TK_COLON },
+        OpTok.{ s: ";", k: TK_SEMI }, OpTok.{ s: "(", k: TK_LPAREN }, OpTok.{ s: ")", k: TK_RPAREN }, OpTok.{
+            s: "{", k: TK_LBRACE }, OpTok.{ s: "}", k: TK_RBRACE }, OpTok.{ s: "[", k: TK_LBRACKET }, OpTok.{
+                s: "]", k: TK_RBRACKET }];
 }
 
 fn reserved_future(i: usize) []u8 {

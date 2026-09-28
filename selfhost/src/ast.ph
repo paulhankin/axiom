@@ -3,9 +3,8 @@
 // tree in place. (Types live here too because types and declarations refer
 // to each other, and modules cannot import each other cyclically.)
 // =============================================================================
-import "util.ph" as u;
-import "lexer.ph" as lx;
 import "package.ph" as pkg;
+import "util.ph" as u;
 
 pub const TE_PRIM: i32 = 0;
 pub const TE_NAMED: i32 = 1;
@@ -228,12 +227,25 @@ pub const BI_ERROR_NAME: i32 = 81;
 pub const BI_COUNT: i32 = 82;
 
 pub fn builtin_name(i: i32) []u8 {
-    let t = ["size_of", "align_of", "offset_of", "min_value", "max_value", "as", "int_cast", "truncate", "int_from_float", "float_from_int", "float_cast", "bit_cast", "int_from_ptr", "ptr_from_int", "ptr_cast", "slice_from_ptr", "cast_slice", "mem_copy", "mem_set", "mem_eq", "memory_size", "memory_grow", "clz", "ctz", "popcount", "rotl", "rotr", "add_sat", "sub_sat", "mul_sat", "add_checked", "sub_checked", "mul_checked", "min", "max", "abs", "sqrt", "floor", "ceil", "trunc", "nearest", "fma", "rem", "copysign", "splat", "vec", "extract_lane", "replace_lane", "load", "store", "shuffle", "swizzle", "lanes_eq", "lanes_ne", "lanes_lt", "lanes_le", "lanes_gt", "lanes_ge", "select", "any_true", "all_true", "bitmask", "reduce_add", "dot", "trap", "atomic_load", "atomic_store", "atomic_add", "atomic_sub", "atomic_and", "atomic_or", "atomic_xor", "atomic_xchg", "atomic_min", "atomic_max", "atomic_cas", "atomic_wait", "atomic_notify", "fence", "expect", "expect_eq", "error_name"];
+    let t = ["size_of", "align_of", "offset_of", "min_value", "max_value", "as", "int_cast", "truncate",
+             "int_from_float", "float_from_int", "float_cast", "bit_cast", "int_from_ptr", "ptr_from_int", "ptr_cast",
+             "slice_from_ptr", "cast_slice", "mem_copy", "mem_set", "mem_eq", "memory_size", "memory_grow", "clz",
+             "ctz", "popcount", "rotl", "rotr", "add_sat", "sub_sat", "mul_sat", "add_checked", "sub_checked",
+             "mul_checked", "min", "max", "abs", "sqrt", "floor", "ceil", "trunc", "nearest", "fma", "rem", "copysign",
+             "splat", "vec", "extract_lane", "replace_lane", "load", "store", "shuffle", "swizzle", "lanes_eq",
+             "lanes_ne", "lanes_lt", "lanes_le", "lanes_gt", "lanes_ge", "select", "any_true", "all_true", "bitmask",
+             "reduce_add", "dot", "trap", "atomic_load", "atomic_store", "atomic_add", "atomic_sub", "atomic_and",
+             "atomic_or", "atomic_xor", "atomic_xchg", "atomic_min", "atomic_max", "atomic_cas", "atomic_wait",
+             "atomic_notify", "fence", "expect", "expect_eq", "error_name"];
     return t[@int_cast(usize, i)];
 }
 
 pub fn builtin_sig(i: i32) []u8 {
-    let t = ["t", "t", "te", "t", "t", "te", "te", "te", "te", "te", "te", "te", "e", "te", "te", "ee", "te", "ee", "ee", "ee", "", "e", "e", "e", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "e", "e", "e", "e", "e", "e", "eee", "ee", "ee", "e", "t*", "ee", "eee", "te", "ee", "eee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "eee", "e", "e", "e", "e", "ee", "", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "eee", "eee", "ee", "", "e", "ee", "e"];
+    let t = ["t", "t", "te", "t", "t", "te", "te", "te", "te", "te", "te", "te", "e", "te", "te", "ee", "te", "ee",
+             "ee", "ee", "", "e", "e", "e", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "e", "e",
+             "e", "e", "e", "e", "eee", "ee", "ee", "e", "t*", "ee", "eee", "te", "ee", "eee", "ee", "ee", "ee", "ee",
+             "ee", "ee", "ee", "eee", "e", "e", "e", "e", "ee", "", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee",
+             "ee", "eee", "eee", "ee", "", "e", "ee", "e"];
     return t[@int_cast(usize, i)];
 }
 
@@ -317,8 +329,8 @@ pub struct Expr {
     // ---- sema annotations ----
     ty: *mut Type,
     cat: i32,
-    local: *mut Local,   // ident -> local
-    decl: *mut Decl,     // ident/field -> global/const/fn/type decl; call -> callee fn
+    local: *mut Local,  // ident -> local
+    decl: *mut Decl,    // ident/field -> global/const/fn/type decl; call -> callee fn
     module: *mut Module,
     gargs: []mut *mut Type,  // CAT_FUNC / call: generic args (owner args ++ own args)
     self_mode: i32,
@@ -432,21 +444,21 @@ pub struct Decl {
     variadic: bool,     // C varargs: `...` after the fixed parameters
     link_lib: []u8,     // extern "C" "lib": library to link
     abi: []u8,
-    is_test: bool,      // `test "name" { }` (a D_FN returning !void)
+    is_test: bool,  // `test "name" { }` (a D_FN returning !void)
     test_name: []u8,
-    test_trap: i32,     // -1: must not trap; -2: must trap; n >= 0: must trap with Tn
+    test_trap: i32,  // -1: must not trap; -2: must trap; n >= 0: must trap with Tn
     abi_span: u.Span,
     error_names: u.List.[[]u8],
     error_spans: u.List.[u.Span],
 
     // ---- sema ----
-    state: i32,          // 0 = unresolved, 1 = resolving, 2 = done
-    ty: *mut Type,       // fn: TY_FN signature; const/global: value type; struct/union: Self type
+    state: i32,     // 0 = unresolved, 1 = resolving, 2 = done
+    ty: *mut Type,  // fn: TY_FN signature; const/global: value type; struct/union: Self type
     ret_type: *mut Type,
     param_types: []mut *mut Type,
     locals: u.List.[*mut Local],
     all_gparams: []mut *mut Type,  // TY_PARAM types, owner's first
-    self_kind: i32,  // for methods: SELF_VALUE (Self), SELF_ADDR (*Self), SELF_PASS (*mut Self); NONE if not a method
+    self_kind: i32,                // for methods: SELF_VALUE (Self), SELF_ADDR (*Self), SELF_PASS (*mut Self); NONE if not a method
     self_mut: bool,
     checked: bool,
     layout_done: bool,
@@ -470,17 +482,17 @@ pub struct Module {
 pub struct Type {
     kind: i32,
     id: i32,
-    bits: i32,          // INT / FLOAT; VEC: lane bits
-    is_signed: bool,    // INT; VEC with int lanes
-    is_size: bool,      // usize / isize
-    lanes: i32,         // VEC
-    elem: *mut Type,    // PTR, SLICE, ARRAY, ERRUNION, VEC (lane type)
-    is_mut: bool,       // PTR, SLICE
-    len: i64,           // ARRAY
-    len_param: *mut Type,  // ARRAY whose length is a const generic parameter
+    bits: i32,                // INT / FLOAT; VEC: lane bits
+    is_signed: bool,          // INT; VEC with int lanes
+    is_size: bool,            // usize / isize
+    lanes: i32,               // VEC
+    elem: *mut Type,          // PTR, SLICE, ARRAY, ERRUNION, VEC (lane type)
+    is_mut: bool,             // PTR, SLICE
+    len: i64,                 // ARRAY
+    len_param: *mut Type,     // ARRAY whose length is a const generic parameter
     params: []mut *mut Type,  // FN
     ret: *mut Type,
-    decl: *mut Decl,    // STRUCT, UNION
+    decl: *mut Decl,  // STRUCT, UNION
     args: []mut *mut Type,
     // PARAM
     owner: *mut Decl,
@@ -489,8 +501,8 @@ pub struct Type {
     is_const: bool,
     const_type: *mut Type,
     name: []u8,
-    cval: i64,          // CONSTINT
-    has_params: bool,   // mentions a TY_PARAM somewhere
+    cval: i64,         // CONSTINT
+    has_params: bool,  // mentions a TY_PARAM somewhere
     // layout cache
     size: i64,
     align: i64,

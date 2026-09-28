@@ -28,8 +28,8 @@ pub fn largest(xs: []u32) !u32 {
 
 pub fn describe(e: error) []u8 {
     match e {
-        error.Empty => { return "empty"; }
+        error.Empty  => { return "empty"; }
         error.TooBig => { return "too big"; }
-        else => { return @error_name(e); }
+        else         => { return @error_name(e); }
     }
 }

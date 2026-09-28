@@ -41,10 +41,10 @@ fn fib(n: u32) u64 {
 }
 
 export fn run() void {
-    io.int(@as(i64, collatz(27)));        // expect: 111
-    io.str(sign(-5));                     // expect: neg
-    io.str(sign(0));                      // expect: zero
-    io.str(sign(9));                      // expect: pos
+    io.int(@as(i64, collatz(27)));  // expect: 111
+    io.str(sign(-5));               // expect: neg
+    io.str(sign(0));                // expect: zero
+    io.str(sign(9));                // expect: pos
     let r = side("a", false) and side("b", true);
     io.boolean(r);
     // expect: a
@@ -53,10 +53,10 @@ export fn run() void {
     io.boolean(r2);
     // expect: c
     // expect: true
-    io.uint(fib(30));                     // expect: 832040
+    io.uint(fib(30));  // expect: 832040
     let mut i: i32 = 10;
     while i > 0 {
         i -= 3;
     }
-    io.int(@as(i64, i));                  // expect: -2
+    io.int(@as(i64, i));  // expect: -2
 }

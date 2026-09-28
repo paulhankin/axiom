@@ -2,23 +2,23 @@
 // sema.ph - semantic analysis: module loading, name registration, type
 // resolution, expression and statement checking, builtins. (One module: its parts are mutually recursive.)
 // =============================================================================
-import "util.ph" as u;
+import "ast.ph" as ast;
 import "diag.ph" as dg;
 import "lexer.ph" as lx;
-import "ast.ph" as ast;
-import "types.ph" as ty;
-import "parser.ph" as parser;
 import "package.ph" as pkg;
+import "parser.ph" as parser;
+import "types.ph" as ty;
+import "util.ph" as u;
 
 pub struct Program {
     modules: u.List.[*mut ast.Module],
     root: *mut ast.Module,
     error_names: u.List.[[]u8],  // code = index + 1
     error_codes: u.SymMap.[i32],
-    fns: u.List.[*mut ast.Decl],       // every fn decl (including methods), for codegen
+    fns: u.List.[*mut ast.Decl],  // every fn decl (including methods), for codegen
     globals: u.List.[*mut ast.Decl],
     host_fns: u.List.[*mut ast.Decl],
-    tests: u.List.[*mut ast.Decl],     // test blocks of non-std modules, in source order
+    tests: u.List.[*mut ast.Decl],  // test blocks of non-std modules, in source order
 }
 
 pub let mut g_prog: *mut Program = @ptr_from_int(*mut Program, 0);
@@ -52,7 +52,7 @@ struct FnCtx {
     marks: u.List.[usize],
     loop_depth: i32,
     defer_depth: i32,
-    defer_loop_base: i32,  // loop_depth when the innermost defer began
+    defer_loop_base: i32,        // loop_depth when the innermost defer began
     loop_breaks: u.List.[bool],  // per enclosing loop: has a break targeting it
     const_ctx: bool,
 }
@@ -82,10 +82,14 @@ fn dnil() *mut ast.Decl {
 
 fn fn_ctx(tc: TypeCtx) FnCtx {
     return FnCtx.{
-        tc: tc, fnd: dnil(), ret: tnil(),
+        tc: tc,
+        fnd: dnil(),
+        ret: tnil(),
         scope: u.List.[ScopeEntry].{ data: u.nil.[ScopeEntry](), len: 0, cap: 0 },
         marks: u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 },
-        loop_depth: 0, defer_depth: 0, defer_loop_base: 0,
+        loop_depth: 0,
+        defer_depth: 0,
+        defer_loop_base: 0,
         loop_breaks: u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 },
         const_ctx: false,
     };
@@ -361,8 +365,8 @@ fn ensure_gparams(d: *mut ast.Decl) void {
             let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
             ct = resolve_type(g.const_te, &mut tc);
             if (ct.kind != ast.TY_INT) and (ct.kind != ast.TY_INVALID) {
-                _ = dg.err(g.const_te.span, "E0471",
-                           u.f1("const generic parameter must have an integer type, found %s", tstr(ct)));
+                _ = dg.err(g.const_te.span, "E0471", u.f1("const generic parameter must have an integer type, found %s",
+                                                          tstr(ct)));
                 ct = ty.t_usize;
             }
         } else if not u.isnos(g.constraint) {
@@ -482,7 +486,7 @@ fn check_generic_args(d: *mut ast.Decl, args: []mut *mut ast.Type, sp: u.Span, t
     if n != d.gparams.len {
         let gl = d.gparams.len;
         _ = dg.err(sp, "E0467", u.f5("'%s' takes %s generic argument%s, but %s %s given", d.name, u.zdec(gl),
-                                    u.pick(gl == 1, "", "s"), u.zdec(n), u.pick(n == 1, "was", "were")));
+                                     u.pick(gl == 1, "", "s"), u.zdec(n), u.pick(n == 1, "was", "were")));
         return false;
     }
     let mut ok = true;
@@ -499,13 +503,13 @@ fn check_generic_args(d: *mut ast.Decl, args: []mut *mut ast.Type, sp: u.Span, t
         if g.is_const {
             if a.kind == ast.TY_CONSTINT {
                 if not fits_type(u.I128.of(a.cval), g.ty.const_type) {
-                    _ = dg.err(asp, "E0462", u.f3("value %s does not fit const parameter '%s' of type %s", u.dec(a.cval),
-                                                 g.name, tstr(g.ty.const_type)));
+                    _ = dg.err(asp, "E0462", u.f3("value %s does not fit const parameter '%s' of type %s",
+                                                  u.dec(a.cval), g.name, tstr(g.ty.const_type)));
                     ok = false;
                 }
             } else if not ((a.kind == ast.TY_PARAM) and a.is_const and (a.const_type == g.ty.const_type)) {
                 _ = dg.err(asp, "E0462", u.f3("generic parameter '%s' expects a %s constant, found %s", g.name,
-                                             tstr(g.ty.const_type), tstr(a)));
+                                              tstr(g.ty.const_type), tstr(a)));
                 ok = false;
             }
         } else {
@@ -514,7 +518,7 @@ fn check_generic_args(d: *mut ast.Decl, args: []mut *mut ast.Type, sp: u.Span, t
                 ok = false;
             } else if not ty.satisfies(a, g.ty.constraint) {
                 let e = dg.err(asp, "E0462", u.f3("type %s does not satisfy constraint %s of parameter '%s'", tstr(a),
-                                                 ty.constraint_name(g.ty.constraint), g.name));
+                                                  ty.constraint_name(g.ty.constraint), g.name));
                 dg.note(e, g.span, u.f1("'%s' declared here", g.name));
                 ok = false;
             }
@@ -643,7 +647,8 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
             return d.ty;
         }
         if not te.has_args {
-            let g = dg.err(te.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", te.name, te.name));
+            let g = dg.err(te.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", te.name,
+                                                  te.name));
             dg.note(g, d.name_span, u.f1("'%s' declared here", d.name));
             return ty.t_invalid;
         }
@@ -730,8 +735,8 @@ fn resolve_fn(d: *mut ast.Decl) void {
                 d.self_kind = ast.SELF_ADDR;
             }
         } else if pt.kind != ast.TY_INVALID {
-            _ = dg.err(d.params.at(0).te.span, "E0305",
-                       u.f1("'self' must have type Self, *Self or *mut Self, found %s", tstr(pt)));
+            _ = dg.err(d.params.at(0).te.span, "E0305", u.f1("'self' must have type Self, *Self or *mut Self, found %s",
+                                                             tstr(pt)));
         }
     }
     if d.extern_c and not u.isnos(d.abi) and not u.str_eq(d.abi, "C") {
@@ -763,9 +768,10 @@ fn resolve_fn(d: *mut ast.Decl) void {
             if u.notnil(d.ret_te) {
                 sp = d.ret_te.span;
             }
-            _ = dg.err(sp, "E0801", u.f3("return type %s is not allowed at the %s function boundary%s", tstr(d.ret_type),
-                                        what, u.pick(d.ret_type.kind == ast.TY_ERRUNION,
-                                                     " (handle errors before the export boundary)", "")));
+            _ = dg.err(sp, "E0801", u.f3("return type %s is not allowed at the %s function boundary%s",
+                                         tstr(d.ret_type), what, u.pick(d.ret_type.kind == ast.TY_ERRUNION,
+                                                                        " (handle errors before the export boundary)",
+                                                                        "")));
         }
     }
 }
@@ -820,7 +826,7 @@ fn resolve_decl(d: *mut ast.Decl) void {
         let dk = d.ty.kind;
         if (dk != ast.TY_INT) and (dk != ast.TY_FLOAT) and (dk != ast.TY_BOOL) and (dk != ast.TY_INVALID) {
             _ = dg.err(d.te.span, "E0352", u.f1("constants must have an integer, float or bool type, found %s",
-                                               tstr(d.ty)));
+                                                tstr(d.ty)));
             d.ty = ty.t_invalid;
         }
         let mut ctx = fn_ctx(tc);
@@ -972,9 +978,9 @@ fn type_mismatch(e: *mut ast.Expr, expected: *mut ast.Type, found: *mut ast.Type
     } else if (expected.kind == ast.TY_INT) and (found.kind == ast.TY_INT) {
         let txt = u.span_text(e.span);
         let is_lossless = ((found.is_signed == expected.is_signed) and (found.bits < expected.bits)) or
-                       (not found.is_signed and expected.is_signed and (found.bits < expected.bits));
-        let fx = dg.fix(d, u.pick(is_lossless, "convert explicitly (lossless)", "convert explicitly (checked at run time)"),
-                        "suggestion");
+                          (not found.is_signed and expected.is_signed and (found.bits < expected.bits));
+        let fx = dg.fix(d, u.pick(is_lossless, "convert explicitly (lossless)",
+                                  "convert explicitly (checked at run time)"), "suggestion");
         dg.edit(fx, e.span, u.f2(u.pick(is_lossless, "@as(%s, %s)", "@int_cast(%s, %s)"), tstr(expected), txt));
     }
 }
@@ -1027,7 +1033,7 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
             if not fits_type(e.cval, target) {
                 let r = ty.int_range(target);
                 _ = dg.err(e.span, "E0503", u.f4("literal %s does not fit in %s (range %s..%s)", e.cval.str(),
-                                                tstr(target), r.lo.str(), r.hi.str()));
+                                                 tstr(target), r.lo.str(), r.hi.str()));
             }
             e.ty = target;
             return;
@@ -1039,8 +1045,9 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
         }
         if (target.kind == ast.TY_PARAM) and not target.is_const {
             if not lit_ok_for_param(e, target) {
-                _ = dg.err(e.span, "E0461", u.f2("literal %s is not representable in every type satisfying %s; convert explicitly",
-                                                e.cval.str(), ty.constraint_name(target.constraint)));
+                _ = dg.err(e.span, "E0461",
+                           u.f2("literal %s is not representable in every type satisfying %s; convert explicitly",
+                                e.cval.str(), ty.constraint_name(target.constraint)));
             }
             e.fval = e.cval.to_f64();
             e.ty = target;
@@ -1063,7 +1070,7 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
         if (target.kind == ast.TY_PARAM) and not target.is_const {
             if not lit_ok_for_param(e, target) {
                 _ = dg.err(e.span, "E0461", u.f1("float literal is not allowed for a parameter constrained by %s",
-                                                ty.constraint_name(target.constraint)));
+                                                 ty.constraint_name(target.constraint)));
             }
             e.ty = target;
             return;
@@ -1145,8 +1152,9 @@ fn func_to_value(e: *mut ast.Expr) void {
         return;
     }
     if e.gargs.len < f.all_gparams.len {
-        let d = dg.err(e.span, "E0466", u.f2("generic function '%s' must be instantiated before use as a value: %s.[...]",
-                                            f.name, f.name));
+        let d = dg.err(e.span, "E0466",
+                       u.f2("generic function '%s' must be instantiated before use as a value: %s.[...]", f.name,
+                            f.name));
         dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
         e.cat = ast.CAT_VALUE;
         e.ty = ty.t_invalid;
@@ -1267,7 +1275,8 @@ fn root_local(e0: *mut ast.Expr) *mut ast.Local {
         if e.kind == ast.E_IDENT {
             return e.local;
         }
-        if ((e.kind == ast.E_FIELD) and (e.self_mode != ast.SELF_DEREF)) or ((e.kind == ast.E_INDEX) and (e.op == ast.IDX_ARRAY)) {
+        if ((e.kind == ast.E_FIELD) and (e.self_mode != ast.SELF_DEREF)) or
+           ((e.kind == ast.E_INDEX) and (e.op == ast.IDX_ARRAY)) {
             e = e.a;
         } else {
             return u.nil.[ast.Local]();
@@ -1442,7 +1451,8 @@ fn check_arith_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
             if op == lx.TK_SLASH {
                 _ = dg.err(sp, "E0811", "integer vectors do not support '/'");
             } else {
-                _ = dg.err(sp, "E0811", u.f2("integer vectors use wrapping arithmetic: write '%s%%' instead of '%s'", opn, opn));
+                _ = dg.err(sp, "E0811", u.f2("integer vectors use wrapping arithmetic: write '%s%%' instead of '%s'",
+                                             opn, opn));
             }
             return false;
         }
@@ -1473,7 +1483,7 @@ fn check_arith_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
     }
     if t.kind == ast.TY_PARAM {
         _ = dg.err(sp, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)", opn, t.name,
-                                    ty.constraint_name(t.constraint)));
+                                     ty.constraint_name(t.constraint)));
     } else {
         _ = dg.err(sp, "E0513", u.f2("operator '%s' cannot be applied to %s", opn, tstr(t)));
     }
@@ -1497,14 +1507,15 @@ fn check_cmp_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
             return true;
         }
         _ = dg.err(sp, "E0461", u.f3("operator '%s' is not permitted on '%s' (constraint %s)", lx.tok_kind_name(op),
-                                    t.name, ty.constraint_name(t.constraint)));
+                                     t.name, ty.constraint_name(t.constraint)));
         return false;
     }
     if eq and ((t.kind == ast.TY_BOOL) or (t.kind == ast.TY_PTR) or (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_FN)) {
         return true;
     }
     if (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128) {
-        _ = dg.err(sp, "E0810", u.f1("vectors cannot be compared with '%s'; use @lanes_eq, @lanes_lt, ...", lx.tok_kind_name(op)));
+        _ = dg.err(sp, "E0810", u.f1("vectors cannot be compared with '%s'; use @lanes_eq, @lanes_lt, ...",
+                                     lx.tok_kind_name(op)));
     } else {
         _ = dg.err(sp, "E0513", u.f2("operator '%s' cannot be applied to %s", lx.tok_kind_name(op), tstr(t)));
     }
@@ -1546,7 +1557,8 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if is_shift_op(op) {
         let mut hint = tnil();
-        if u.notnil(expected) and ((expected.kind == ast.TY_INT) or ty.is_vec_int(expected) or (expected.kind == ast.TY_PARAM)) {
+        if u.notnil(expected) and
+           ((expected.kind == ast.TY_INT) or ty.is_vec_int(expected) or (expected.kind == ast.TY_PARAM)) {
             hint = expected;
         }
         let mut l = check_expr(e.a, hint);
@@ -1570,7 +1582,8 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                 return e.ty;
             }
         }
-        if (l.kind != ast.TY_INT) and not ty.is_vec_int(l) and not param_has(l, ast.C_INT) and (l.kind != ast.TY_INVALID) {
+        if (l.kind != ast.TY_INT) and not ty.is_vec_int(l) and not param_has(l, ast.C_INT) and
+           (l.kind != ast.TY_INVALID) {
             _ = dg.err(e.a.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(l)));
             e.ty = ty.t_invalid;
             return e.ty;
@@ -1623,8 +1636,8 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         t = l;
         if (l != r) and (l.kind != ast.TY_INVALID) and (r.kind != ast.TY_INVALID) and (l.kind != ast.TY_NEVER) and
            (r.kind != ast.TY_NEVER) {
-            let d = dg.err(e.span, "E0412", u.f3("operands of '%s' have different types: %s and %s", lx.tok_kind_name(op),
-                                                tstr(l), tstr(r)));
+            let d = dg.err(e.span, "E0412", u.f3("operands of '%s' have different types: %s and %s",
+                                                 lx.tok_kind_name(op), tstr(l), tstr(r)));
             dg.set_types(d, tstr(l), tstr(r));
             if (l.kind == ast.TY_VEC) and (r == l.elem) {
                 let txt = u.span_text(e.b.span);
@@ -1911,7 +1924,8 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
         return e.ty;
     }
     if ac == ast.CAT_GENERIC {
-        _ = dg.err(a.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", a.decl.name, a.decl.name));
+        _ = dg.err(a.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", a.decl.name,
+                                         a.decl.name));
         e.ty = ty.t_invalid;
         return e.ty;
     }
@@ -2206,8 +2220,9 @@ fn check_vararg(pe: *mut *mut ast.Expr) void {
     if ok {
         return;
     }
-    let d = dg.err(pe.*.span, "E0824", u.f1("C variadic arguments must be i32, u32, i64, u64, isize, usize, f64 or pointers (C's default argument promotions); found %s",
-                                           tstr(t)));
+    let d = dg.err(pe.*.span, "E0824",
+                   u.f1("C variadic arguments must be i32, u32, i64, u64, isize, usize, f64 or pointers (C's default argument promotions); found %s",
+                        tstr(t)));
     if (t.kind == ast.TY_INT) or (t.kind == ast.TY_FLOAT) {
         let txt = u.span_text(pe.*.span);
         let mut to: []u8 = "u32";
@@ -2226,14 +2241,15 @@ fn check_args_count(e: *mut ast.Expr, want: usize, f: *mut ast.Decl) void {
     if u.notnil(f) and f.variadic {
         if n < want {
             let d = dg.err(e.span, "E0420", u.f3("expected at least %s argument%s, found %s", u.zdec(want),
-                                                u.pick(want == 1, "", "s"), u.zdec(n)));
+                                                 u.pick(want == 1, "", "s"), u.zdec(n)));
             dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
         }
         return;
     }
     if n != want {
-        let d = dg.err(e.span, "E0420", u.f3("expected %s argument%s, found %s", u.zdec(want), u.pick(want == 1, "", "s"),
-                                            u.zdec(n)));
+        let d = dg.err(
+            e.span, "E0420", u.f3("expected %s argument%s, found %s", u.zdec(want), u.pick(want == 1, "", "s"),
+                                  u.zdec(n)));
         if u.notnil(f) {
             dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
         }
@@ -2257,7 +2273,7 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         let method = cc == ast.CAT_METHOD;
         if method and (f.self_kind == ast.SELF_NONE) {
             _ = dg.err(callee.span, "E0421", u.f3("'%s' has no 'self' parameter; call it as %s.%s(...)", f.name,
-                                                 f.owner.name, f.name));
+                                                  f.owner.name, f.name));
             check_all_args(e);
             e.ty = ty.t_invalid;
             return e.ty;
@@ -2332,8 +2348,9 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                             _ = unify(pt, arg.ty, own_vars[k..k + 1], tmp[..]);
                             if u.notnil(tmp[0]) and (tmp[0] != before[k]) {
                                 let gp = f.gparams.at(k);
-                                let d = dg.err(arg.span, "E0464", u.f3("conflicting types for generic parameter '%s': %s and %s",
-                                                                      gp.name, tstr(before[k]), tstr(tmp[0])));
+                                let d = dg.err(arg.span, "E0464",
+                                               u.f3("conflicting types for generic parameter '%s': %s and %s", gp.name,
+                                                    tstr(before[k]), tstr(tmp[0])));
                                 dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
                             }
                         }
@@ -2347,8 +2364,9 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                 }
                 if u.isnil(sol[k]) {
                     let gp = f.gparams.at(k);
-                    let d = dg.err(e.span, "E0463", u.f3("cannot deduce generic parameter '%s' of '%s'; give it explicitly: %s.[...](...)",
-                                                        gp.name, f.name, f.name));
+                    let d = dg.err(e.span, "E0463",
+                                   u.f3("cannot deduce generic parameter '%s' of '%s'; give it explicitly: %s.[...](...)",
+                                        gp.name, f.name, f.name));
                     dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
                     ok = false;
                 }
@@ -2388,8 +2406,8 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                 if via_ptr {
                     e.self_mode = ast.SELF_PASS;
                 } else if not is_place(recv) {
-                    _ = dg.err(recv.span, "E0703", u.f1("method '%s' needs the address of its receiver, but it is a temporary",
-                                                       f.name));
+                    _ = dg.err(recv.span, "E0703",
+                               u.f1("method '%s' needs the address of its receiver, but it is a temporary", f.name));
                 } else {
                     e.self_mode = ast.SELF_ADDR;
                     mark_addr_taken(recv);
@@ -2397,13 +2415,13 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             } else if sk == ast.SELF_PASS {
                 if via_ptr {
                     if not rt.is_mut {
-                        _ = dg.err(recv.span, "E0702", u.f2("method '%s' takes '*mut Self', but the receiver is %s", f.name,
-                                                           tstr(rt)));
+                        _ = dg.err(recv.span, "E0702", u.f2("method '%s' takes '*mut Self', but the receiver is %s",
+                                                            f.name, tstr(rt)));
                     }
                     e.self_mode = ast.SELF_PASS;
                 } else if not is_place(recv) {
-                    _ = dg.err(recv.span, "E0703", u.f1("method '%s' needs the address of its receiver, but it is a temporary",
-                                                       f.name));
+                    _ = dg.err(recv.span, "E0703",
+                               u.f1("method '%s' needs the address of its receiver, but it is a temporary", f.name));
                 } else {
                     if not is_mut_place(recv) {
                         not_mutable(recv, u.f1("call '%s' (it takes *mut Self)", f.name));
@@ -2437,7 +2455,7 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if cc == ast.CAT_TYPE {
         _ = dg.err(callee.span, "E0406", u.f2("%s is a type, not a function; use %s.{ ... } to construct a struct",
-                                             tstr(callee.tval), tstr(callee.tval)));
+                                              tstr(callee.tval), tstr(callee.tval)));
         e.ty = ty.t_invalid;
         return e.ty;
     }
@@ -2487,7 +2505,7 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             t = e.a.tval;
         } else if e.a.cat == ast.CAT_GENERIC {
             _ = dg.err(e.a.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", e.a.decl.name,
-                                              e.a.decl.name));
+                                               e.a.decl.name));
         } else if not ((e.a.cat == ast.CAT_TYPE) and (e.a.tval.kind == ast.TY_INVALID)) and
                   not (u.notnil(e.a.ty) and (e.a.ty.kind == ast.TY_INVALID)) {
             _ = dg.err(e.a.span, "E0408", "struct literal requires a struct type");
@@ -2533,7 +2551,7 @@ fn check_struct_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             b.s(d.fields.at(i).name);
         }
         let dgn = dg.err(e.span, "E0410", u.f2("struct literal of %s must list every field, in declaration order: %s",
-                                              tstr(t), b.done()));
+                                               tstr(t), b.done()));
         // machine fix: reorder when the set of names is exactly right
         let mut same_set = e.inits.len == nf;
         for i in 0..nf {
@@ -2728,8 +2746,9 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
         // For !void the block may complete normally: execution continues after
         // the expression. For !T there is no value to produce, so it must diverge.
         if not check_block(e.hblock) and (vt.kind != ast.TY_VOID) and (vt.kind != ast.TY_INVALID) {
-            _ = dg.err(e.hblock.span, "E0612", u.f1("this 'catch' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use 'catch <value>')",
-                                                   tstr(vt)));
+            _ = dg.err(e.hblock.span, "E0612",
+                       u.f1("this 'catch' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use 'catch <value>')",
+                            tstr(vt)));
         }
     }
     scope_pop();
@@ -2886,7 +2905,8 @@ fn check_operand(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if k == ast.E_ERROR_VAL {
         let code = error_code_of(e.name);
         if code == 0 {
-            _ = dg.err(e.name_span, "E0650", u.f1("'error.%s' is not declared; add it to an 'error { ... }' block", e.name));
+            _ = dg.err(e.name_span, "E0650", u.f1("'error.%s' is not declared; add it to an 'error { ... }' block",
+                                                  e.name));
         }
         e.cval = u.I128.ofu(@as(u64, code));
         e.ty = ty.t_error;
@@ -2983,8 +3003,9 @@ fn argc_ok(e: *mut ast.Expr) bool {
         }
     }
     if (e.bargs.len < want) or (not variadic and (e.bargs.len > want)) {
-        _ = dg.err(e.span, "E0420", u.f5("@%s expects %s%s argument%s, found %s", e.name, u.pick(variadic, "at least ", ""),
-                                        u.zdec(want), u.pick(want == 1, "", "s"), u.zdec(e.bargs.len)));
+        _ = dg.err(
+            e.span, "E0420", u.f5("@%s expects %s%s argument%s, found %s", e.name, u.pick(variadic, "at least ", ""),
+                                  u.zdec(want), u.pick(want == 1, "", "s"), u.zdec(e.bargs.len)));
         check_bargs(e, 0);
         return false;
     }
@@ -2992,7 +3013,8 @@ fn argc_ok(e: *mut ast.Expr) bool {
 }
 
 fn is_int_like(t: *ast.Type) bool {
-    return (t.kind == ast.TY_INT) or ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_INT)) or (t.kind == ast.TY_INVALID);
+    return (t.kind == ast.TY_INT) or ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_INT)) or
+           (t.kind == ast.TY_INVALID);
 }
 
 fn is_float_like(t: *ast.Type) bool {
@@ -3004,7 +3026,8 @@ fn is_float_like(t: *ast.Type) bool {
 fn operand(pe: *mut *mut ast.Expr, hint: *mut ast.Type) *mut ast.Type {
     let t = check_expr(pe.*, hint);
     if ty.is_untyped(t) {
-        if u.notnil(hint) and ((hint.kind == ast.TY_INT) or (hint.kind == ast.TY_FLOAT) or (hint.kind == ast.TY_PARAM)) {
+        if u.notnil(hint) and
+           ((hint.kind == ast.TY_INT) or (hint.kind == ast.TY_FLOAT) or (hint.kind == ast.TY_PARAM)) {
             coerce(pe, hint);
             return pe.*.ty;
         }
@@ -3104,7 +3127,8 @@ fn const_lane(e: *mut ast.Expr, pe: *mut *mut ast.Expr, lanes: i32) i64 {
         return 0;
     }
     if pe.*.cval.is_neg() or pe.*.cval.ge(u.I128.of(@as(i64, lanes))) {
-        _ = dg.err(pe.*.span, "E0820", u.f2("lane index %s out of range for %s lanes", u.dec(pe.*.cval.i64v()), u.idec(lanes)));
+        _ = dg.err(pe.*.span, "E0820", u.f2("lane index %s out of range for %s lanes", u.dec(pe.*.cval.i64v()),
+                                            u.idec(lanes)));
         return 0;
     }
     return pe.*.cval.i64v();
@@ -3209,7 +3233,7 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         if (s.kind != ast.TY_INVALID) and (t.kind != ast.TY_INVALID) and not lossless(s, t) {
             let d = dg.err(e.span, "E0510", u.f2("@as cannot convert %s to %s without possible loss of information",
-                                                tstr(s), tstr(t)));
+                                                 tstr(s), tstr(t)));
             if (s.kind == ast.TY_INT) and (t.kind == ast.TY_INT) {
                 let txt = u.span_text(barg(e, 1).span);
                 let fx = dg.fix(d, "use a checked conversion", "suggestion");
@@ -3295,7 +3319,7 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             }
         } else if ty.type_size(t) != ty.type_size(s) {
             _ = dg.err(e.span, "E0512", u.f4("@bit_cast size mismatch: %s is %s bytes, %s is %s bytes", tstr(s),
-                                            u.dec(ty.type_size(s)), tstr(t), u.dec(ty.type_size(t))));
+                                             u.dec(ty.type_size(s)), tstr(t), u.dec(ty.type_size(t))));
         }
         return set_ty(e, t);
     }
@@ -3365,7 +3389,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         let d = check_expr(barg(e, 0), tnil());
         if (d.kind != ast.TY_SLICE) or not d.is_mut {
             if d.kind != ast.TY_INVALID {
-                _ = dg.err(barg(e, 0).span, "E0822", u.f2("@%s destination must be a []mut slice, found %s", e.name, tstr(d)));
+                _ = dg.err(barg(e, 0).span, "E0822", u.f2("@%s destination must be a []mut slice, found %s", e.name,
+                                                          tstr(d)));
             }
             _ = check_expr(barg(e, 1), tnil());
             return set_ty(e, ty.t_void);
@@ -3421,7 +3446,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if (id == ast.BI_ADD_SAT) or (id == ast.BI_SUB_SAT) or (id == ast.BI_MUL_SAT) {
         let t = pair(e, x);
-        let ok = is_int_like(t) or ((id != ast.BI_MUL_SAT) and ty.is_vec_int(t) and ((t.elem.bits == 8) or (t.elem.bits == 16)));
+        let ok = is_int_like(t) or
+                 ((id != ast.BI_MUL_SAT) and ty.is_vec_int(t) and ((t.elem.bits == 8) or (t.elem.bits == 16)));
         if not ok {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires integers, found %s", e.name, tstr(t)));
         }
@@ -3456,7 +3482,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         return set_ty(e, t);
     }
-    if (id == ast.BI_SQRT) or (id == ast.BI_FLOOR) or (id == ast.BI_CEIL) or (id == ast.BI_TRUNC) or (id == ast.BI_NEAREST) {
+    if (id == ast.BI_SQRT) or (id == ast.BI_FLOOR) or (id == ast.BI_CEIL) or (id == ast.BI_TRUNC) or
+       (id == ast.BI_NEAREST) {
         let mut h = ty.t_f64;
         if u.notnil(x) and ((x.kind == ast.TY_FLOAT) or (x.kind == ast.TY_PARAM)) {
             h = x;
@@ -3506,8 +3533,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return set_ty(e, ty.t_invalid);
         }
         if (e.bargs.len - 1) != @int_cast(usize, v.lanes) {
-            _ = dg.err(e.span, "E0420", u.f3("@vec(%s, ...) needs exactly %s lane values, found %s", tstr(v), u.idec(v.lanes),
-                                            u.zdec(e.bargs.len - 1)));
+            _ = dg.err(e.span, "E0420", u.f3("@vec(%s, ...) needs exactly %s lane values, found %s", tstr(v),
+                                             u.idec(v.lanes), u.zdec(e.bargs.len - 1)));
         }
         for i in 1..e.bargs.len {
             _ = check_expr_to(earg(e, i), v.elem);
@@ -3565,7 +3592,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         let idx = barg(e, 2);
         if (idx.kind != ast.E_ARRAY_LIT) or (idx.args.len != @int_cast(usize, t.lanes)) {
-            _ = dg.err(idx.span, "E0820", u.f1("@shuffle needs an array literal of %s constant lane indices", u.idec(t.lanes)));
+            _ = dg.err(idx.span, "E0820", u.f1("@shuffle needs an array literal of %s constant lane indices",
+                                               u.idec(t.lanes)));
             _ = check_expr(idx, tnil());
             return set_ty(e, t);
         }
@@ -3573,7 +3601,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             let pi = idx.args.at(i);
             _ = check_expr(pi.*, ty.t_u32);
             if not pi.*.is_const or pi.*.cval.is_neg() or pi.*.cval.ge(u.I128.of(@as(i64, 2 * t.lanes))) {
-                _ = dg.err(pi.*.span, "E0820", u.f1("shuffle index must be a constant in 0..%s", u.idec((2 * t.lanes) - 1)));
+                _ = dg.err(pi.*.span, "E0820", u.f1("shuffle index must be a constant in 0..%s",
+                                                    u.idec((2 * t.lanes) - 1)));
             }
             if ty.is_untyped(pi.*.ty) {
                 coerce(pi, ty.t_u32);
@@ -3676,7 +3705,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         } else {
             t = ta;
             if (ta != tb) and (ta.kind != ast.TY_INVALID) and (tb.kind != ast.TY_INVALID) {
-                let d = dg.err(e.span, "E0412", u.f2("@expect_eq operands have different types: %s and %s", tstr(ta), tstr(tb)));
+                let d = dg.err(e.span, "E0412", u.f2("@expect_eq operands have different types: %s and %s", tstr(ta),
+                                                     tstr(tb)));
                 dg.set_types(d, tstr(ta), tstr(tb));
                 t = ty.t_invalid;
             }
@@ -3686,8 +3716,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                  (tk == ast.TY_PTR) or (tk == ast.TY_FN) or (tk == ast.TY_INVALID) or
                  ((tk == ast.TY_SLICE) and (t.elem == ty.t_u8)) or ((tk == ast.TY_PARAM) and ty.satisfies(t, ast.C_EQ));
         if not ok {
-            _ = dg.err(e.span, "E0825", u.f1("@expect_eq compares numbers, bool, error, pointers and []u8; found %s (use @expect(...))",
-                                            tstr(t)));
+            _ = dg.err(e.span, "E0825",
+                       u.f1("@expect_eq compares numbers, bool, error, pointers and []u8; found %s (use @expect(...))",
+                            tstr(t)));
         }
         return set_ty(e, ty.t_void);
     }
@@ -3700,7 +3731,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         let need_mut = (id != ast.BI_ATOMIC_LOAD) and (id != ast.BI_ATOMIC_WAIT) and (id != ast.BI_ATOMIC_NOTIFY);
         let p = check_expr(barg(e, 0), tnil());
         let mut t = ty.t_invalid;
-        if (p.kind == ast.TY_PTR) and ((p.elem.kind == ast.TY_INT) or ((p.elem.kind == ast.TY_PARAM) and ty.satisfies(p.elem, ast.C_INT))) {
+        if (p.kind == ast.TY_PTR) and
+           ((p.elem.kind == ast.TY_INT) or ((p.elem.kind == ast.TY_PARAM) and ty.satisfies(p.elem, ast.C_INT))) {
             t = p.elem;
             if need_mut and not p.is_mut {
                 _ = dg.err(barg(e, 0).span, "E0706", u.f2("@%s needs a *mut pointer, found %s", e.name, tstr(p)));
@@ -3710,7 +3742,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         let wn = (id == ast.BI_ATOMIC_WAIT) or (id == ast.BI_ATOMIC_NOTIFY);
         if wn and (t.kind == ast.TY_INT) and (t.bits != 32) {
-            _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s works on 32-bit integers (*i32 or *u32), found %s", e.name, tstr(p)));
+            _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s works on 32-bit integers (*i32 or *u32), found %s", e.name,
+                                                      tstr(p)));
         }
         if wn and (t.kind == ast.TY_PARAM) {
             _ = dg.err(barg(e, 0).span, "E0823", u.f1("@%s works on 32-bit integers (*i32 or *u32)", e.name));
@@ -3856,19 +3889,22 @@ fn check_assign(s: *mut ast.Stmt) void {
         return;
     }
     if not is_place(lhs) {
-        _ = dg.err(lhs.span, "E0706", "the left-hand side of an assignment must be a variable, field, element or dereference");
+        _ = dg.err(lhs.span, "E0706",
+                   "the left-hand side of an assignment must be a variable, field, element or dereference");
         _ = check_expr(s.e2, tnil());
         return;
     }
     if not is_mut_place(lhs) {
         let d = dg.err(lhs.span, "E0701", "cannot assign: this place is not mutable");
         let mut r = lhs;
-        while ((r.kind == ast.E_FIELD) and (r.self_mode != ast.SELF_DEREF)) or ((r.kind == ast.E_INDEX) and (r.op == 0)) {
+        while ((r.kind == ast.E_FIELD) and (r.self_mode != ast.SELF_DEREF)) or
+              ((r.kind == ast.E_INDEX) and (r.op == 0)) {
             r = r.a;
         }
         if (r.kind == ast.E_IDENT) and u.notnil(r.local) {
             if r.local.is_param {
-                dg.note(d, r.local.span, u.f1("parameters are immutable; copy '%s' into a 'let mut' first", r.local.name));
+                dg.note(d, r.local.span, u.f1("parameters are immutable; copy '%s' into a 'let mut' first",
+                                              r.local.name));
             } else {
                 dg.note(d, r.local.span, u.f1("'%s' is declared without 'mut'", r.local.name));
                 let fx = dg.fix(d, "declare the variable as mutable", "machine");
@@ -3922,7 +3958,8 @@ fn check_assign(s: *mut ast.Stmt) void {
                   not ((r.kind == ast.TY_PARAM) and ty.satisfies(r, ast.C_UNSIGNED)) {
             _ = dg.err(s.e2.span, "E0525", u.f1("shift count must be an unsigned integer, found %s", tstr(r)));
         }
-        if (lt.kind != ast.TY_INT) and not ty.is_vec_int(lt) and not ((lt.kind == ast.TY_PARAM) and ty.satisfies(lt, ast.C_INT)) {
+        if (lt.kind != ast.TY_INT) and not ty.is_vec_int(lt) and
+           not ((lt.kind == ast.TY_PARAM) and ty.satisfies(lt, ast.C_INT)) {
             _ = dg.err(s.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(lt)));
         }
         s.e3.b = s.e2;
@@ -4066,8 +4103,8 @@ fn check_match(s: *mut ast.Stmt) bool {
         }
     } else {
         if t.kind != ast.TY_INVALID {
-            _ = dg.err(s.e.span, "E0634", u.f1("cannot match on a value of type %s (only unions, integers, bool and error)",
-                                              tstr(t)));
+            _ = dg.err(s.e.span, "E0634",
+                       u.f1("cannot match on a value of type %s (only unions, integers, bool and error)", tstr(t)));
         }
         for i in 0..narms {
             scope_push();
@@ -4095,7 +4132,8 @@ fn check_stmt(s: *mut ast.Stmt) bool {
         } else {
             t = check_expr(s.e, tnil());
             if ty.is_untyped(t) {
-                let d = dg.err(s.e.span, "E0502", u.f1("cannot infer the type of '%s' from a literal; add a type annotation", s.name));
+                let d = dg.err(s.e.span, "E0502",
+                               u.f1("cannot infer the type of '%s' from a literal; add a type annotation", s.name));
                 let fx = dg.fix(d, "annotate the type", "placeholder");
                 dg.edit(fx, u.mkspan(s.name_span.file, s.name_span.end, s.name_span.end), ": <type>");
                 t = ty.t_invalid;
@@ -4120,7 +4158,8 @@ fn check_stmt(s: *mut ast.Stmt) bool {
                 let fx = dg.fix(d, "propagate the error", "suggestion");
                 dg.edit(fx, u.mkspan(s.e.span.file, s.e.span.end, s.e.span.end), "!");
             } else {
-                let d = dg.err(s.e.span, "E0620", u.f1("result of type %s is discarded; write '_ = ...' to discard it", tstr(t)));
+                let d = dg.err(s.e.span, "E0620", u.f1("result of type %s is discarded; write '_ = ...' to discard it",
+                                                       tstr(t)));
                 let fx = dg.fix(d, "discard explicitly", "machine");
                 dg.edit(fx, sp_at(s.e.span), "_ = ");
             }
@@ -4178,15 +4217,18 @@ fn check_stmt(s: *mut ast.Stmt) bool {
                 coerce(&mut s.e2, a);
                 b = a;
             } else if ty.is_untyped(a) and ty.is_untyped(b) {
-                _ = dg.err(s.e.span, "E0502", "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
+                _ = dg.err(s.e.span, "E0502",
+                           "cannot infer the type of the range; give a bound a type, e.g. @as(usize, 0)");
                 a = ty.t_invalid;
                 b = ty.t_invalid;
             }
             if (a != b) and (a.kind != ast.TY_INVALID) and (b.kind != ast.TY_INVALID) {
-                let d = dg.err(s.e2.span, "E0412", u.f2("range bounds have different types: %s and %s", tstr(a), tstr(b)));
+                let d = dg.err(s.e2.span, "E0412", u.f2("range bounds have different types: %s and %s", tstr(a),
+                                                        tstr(b)));
                 dg.set_types(d, tstr(a), tstr(b));
             }
-            if (a.kind != ast.TY_INT) and (a.kind != ast.TY_INVALID) and not ((a.kind == ast.TY_PARAM) and ty.satisfies(a, ast.C_INT)) {
+            if (a.kind != ast.TY_INT) and (a.kind != ast.TY_INVALID) and
+               not ((a.kind == ast.TY_PARAM) and ty.satisfies(a, ast.C_INT)) {
                 _ = dg.err(s.e.span, "E0412", u.f1("range bounds must be integers, found %s", tstr(a)));
             }
             vt = a;
@@ -4198,8 +4240,8 @@ fn check_stmt(s: *mut ast.Stmt) bool {
                 vt = t.elem;
             } else {
                 if t.kind != ast.TY_INVALID {
-                    _ = dg.err(s.e.span, "E0412", u.f1("'for x in' needs an array or slice, found %s (use lo..hi for ranges)",
-                                                      tstr(t)));
+                    _ = dg.err(s.e.span, "E0412",
+                               u.f1("'for x in' needs an array or slice, found %s (use lo..hi for ranges)", tstr(t)));
                 }
                 vt = ty.t_invalid;
             }
@@ -4281,8 +4323,8 @@ fn check_fn_body(f: *mut ast.Decl) void {
         if bs.end > 0 {
             st = bs.end - 1;
         }
-        let d = dg.err(u.mkspan(bs.file, st, bs.end), "E0601", u.f2("missing return: function '%s' must return %s on every path",
-                                                                   f.name, tstr(r)));
+        let d = dg.err(u.mkspan(bs.file, st, bs.end), "E0601",
+                       u.f2("missing return: function '%s' must return %s on every path", f.name, tstr(r)));
         dg.note(d, f.name_span, u.f1("'%s' declared here", f.name));
     }
     scope_pop();
@@ -4346,7 +4388,8 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
         for i in 0..m.decls.len {
             let d = m.decls.get(i);
             if ((d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION)) and contains_by_value(d.ty, d, 0) {
-                _ = dg.err(d.name_span, "E0403", u.f1("'%s' contains itself by value and would have infinite size", d.name));
+                _ = dg.err(d.name_span, "E0403", u.f1("'%s' contains itself by value and would have infinite size",
+                                                      d.name));
             }
         }
     }

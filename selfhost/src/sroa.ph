@@ -9,9 +9,9 @@
 //
 // Slots that are written but never read are deleted with their stores.
 // =============================================================================
-import "util.ph" as u;
 import "ir.ph" as ir;
 import "opt.ph" as opt;
+import "util.ph" as u;
 
 const MAX_LEAVES: usize = 16;
 const MAX_SIZE: u64 = 256;
@@ -24,10 +24,10 @@ struct Leaf {
 
 struct Part {
     a: *mut ir.Value,
-    escaped: bool,    // the address may be seen by anything but this pass's uses
-    split_ok: bool,   // every access matches the leaves
+    escaped: bool,   // the address may be seen by anything but this pass's uses
+    split_ok: bool,  // every access matches the leaves
     reads: bool,
-    skip: bool,       // a copy partner changed this round: next round
+    skip: bool,  // a copy partner changed this round: next round
     nwrites: i32,
     write: *mut ir.Value,  // the last write seen
     uses: u.List.[*mut ir.Value],
@@ -312,7 +312,8 @@ fn classify(i: *mut ir.Value) void {
                     let o = off_of(i.a);
                     for k in 0..p.leaves.len {
                         let l = p.leaves.get(k);
-                        if (@bit_cast(i64, l.off) >= o) and (l.off < (@bit_cast(u64, o) + cval(i.c))) and (l.ty.kind != ir.T_INT) {
+                        if (@bit_cast(i64, l.off) >= o) and (l.off < (@bit_cast(u64, o) + cval(i.c))) and
+                           (l.ty.kind != ir.T_INT) {
                             p.split_ok = false;
                         }
                     }

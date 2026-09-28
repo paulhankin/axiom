@@ -37,9 +37,9 @@ pub struct Map[K, V] {
     eq_fn: fn(K, K) bool,
     keys: []mut K,
     vals: []mut V,
-    ctrl: []mut u8,    // capacity == ctrl.len: 0, or a power of two >= GROUP
-    count: usize,      // full slots
-    used: usize,       // full and DELETED slots
+    ctrl: []mut u8,  // capacity == ctrl.len: 0, or a power of two >= GROUP
+    count: usize,    // full slots
+    used: usize,     // full and DELETED slots
 
     pub fn init(alloc: mem.Allocator, hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
         return Self.{

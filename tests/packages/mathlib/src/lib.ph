@@ -1,5 +1,5 @@
-import "pkg:util" as util;
 import "extra/stats.ph" as stats;
+import "pkg:util" as util;
 
 pub fn square(x: i64) i64 {
     return x * x;

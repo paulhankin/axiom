@@ -4,8 +4,8 @@
 // LLVM / wasm-ld format (tool-conventions/Linking.md), so that objects work
 // with our own linker (wlink.ph) and with wasm-ld (for linking C code).
 // =============================================================================
-import "util.ph" as u;
 import "bin.ph" as bn;
+import "util.ph" as u;
 
 // Value types
 pub const I32: u8 = 0x7f;
@@ -51,8 +51,8 @@ pub fn reloc_has_addend(t: u8) bool {
 
 pub struct Reloc {
     ty: u8,
-    off: u32,     // in the function body / segment data
-    sym: u32,     // symbol index (type index for R_TYPE_INDEX_LEB)
+    off: u32,  // in the function body / segment data
+    sym: u32,  // symbol index (type index for R_TYPE_INDEX_LEB)
     addend: i64,
 }
 
@@ -60,8 +60,8 @@ pub struct Sym {
     kind: u8,
     flags: u32,
     name: []u8,
-    index: u32,   // FUNC: function index; GLOBAL: global index; TABLE: table index
-    seg: u32,     // DATA (defined)
+    index: u32,  // FUNC: function index; GLOBAL: global index; TABLE: table index
+    seg: u32,    // DATA (defined)
     off: u64,
     size: u64,
 }
@@ -69,13 +69,13 @@ pub struct Sym {
 pub struct Import {
     module: []u8,
     name: []u8,
-    ty: u32,      // FUNC: type index; GLOBAL: value type
+    ty: u32,  // FUNC: type index; GLOBAL: value type
     mutable: bool,
 }
 
 pub struct Func {
     ty: u32,
-    body: bn.Bytes,        // locals and code, ending with `end` (no size prefix)
+    body: bn.Bytes,  // locals and code, ending with `end` (no size prefix)
     relocs: u.List.[Reloc],
     sym: u32,
     name: []u8,
@@ -89,7 +89,7 @@ pub struct Global {
 
 pub struct Seg {
     name: []u8,
-    align: u32,    // log2
+    align: u32,  // log2
     data: bn.Bytes,
     relocs: u.List.[Reloc],
     tls: bool,
@@ -97,14 +97,14 @@ pub struct Seg {
 
 pub struct Export {
     name: []u8,
-    func: u32,     // function index
+    func: u32,  // function index
 }
 
 pub struct Unit {
     wasm64: bool,
-    types: u.List.[[]u8],          // encoded function types (0x60 params results)
-    fimports: u.List.[Import],     // function imports: function indices 0..n-1
-    gimports: u.List.[Import],     // global imports
+    types: u.List.[[]u8],       // encoded function types (0x60 params results)
+    fimports: u.List.[Import],  // function imports: function indices 0..n-1
+    gimports: u.List.[Import],  // global imports
     funcs: u.List.[*mut Func],
     globals: u.List.[Global],
     segs: u.List.[*mut Seg],
@@ -112,7 +112,7 @@ pub struct Unit {
     exports: u.List.[Export],
     uses_table: bool,
     shared_memory: bool,
-    symmap: u.SymMap.[u32],        // name -> symbol index + 1 (non-local symbols)
+    symmap: u.SymMap.[u32],  // name -> symbol index + 1 (non-local symbols)
 }
 
 pub fn new_unit(wasm64: bool) *mut Unit {
@@ -618,7 +618,8 @@ pub fn read_object(d: []u8) *mut Unit {
             continue;
         }
         let f = un.funcs.get(k - 1);
-        f.relocs.push(Reloc.{ ty: x.ty, off: @int_cast(u32, off - body_offs.get(k - 1)), sym: x.sym, addend: x.addend });
+        f.relocs.push(Reloc.{ ty: x.ty, off: @int_cast(u32, off - body_offs.get(k - 1)), sym: x.sym,
+                              addend: x.addend });
     }
     for i in 0..data_relocs.len {
         let x = data_relocs.get(i);
@@ -631,7 +632,8 @@ pub fn read_object(d: []u8) *mut Unit {
             continue;
         }
         let sg = un.segs.get(k - 1);
-        sg.relocs.push(Reloc.{ ty: x.ty, off: @int_cast(u32, off - seg_offs.get(k - 1)), sym: x.sym, addend: x.addend });
+        sg.relocs.push(Reloc.{ ty: x.ty, off: @int_cast(u32, off - seg_offs.get(k - 1)), sym: x.sym,
+                               addend: x.addend });
     }
     for i in 0..un.segs.len {
         let sg = un.segs.get(i);

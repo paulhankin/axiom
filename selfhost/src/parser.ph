@@ -1,10 +1,10 @@
 // =============================================================================
 // parser.ph - LL(1) recursive-descent parser.
 // =============================================================================
-import "util.ph" as u;
+import "ast.ph" as ast;
 import "diag.ph" as dg;
 import "lexer.ph" as lx;
-import "ast.ph" as ast;
+import "util.ph" as u;
 
 struct Parser {
     f: *mut u.SourceFile,
@@ -90,7 +90,7 @@ fn expect_ident(P: *mut Parser) Ident {
             w = lx.prim_name(@int_cast(usize, t.prim));
         }
         _ = dg.err(t.span, "E0104", u.f2("'%s' is a reserved %s and cannot be used as a name", w,
-                                        u.pick(t.kind == lx.TK_PRIM, "type name", "keyword")));
+                                         u.pick(t.kind == lx.TK_PRIM, "type name", "keyword")));
         P.errors_at_pos = @int_cast(i64, P.pos);
         _ = advance(P);
         return Ident.{ name: u.intern(u.f1("<reserved %s>", w)), span: sp };
@@ -645,7 +645,7 @@ fn check_mix(parent: *mut ast.Expr, child: *mut ast.Expr, is_left: bool) void {
         return;
     }
     let d = dg.err(child.span, "E0150", u.f2("operators '%s' and '%s' cannot be mixed without parentheses",
-                                              lx.tok_kind_name(child.op), lx.tok_kind_name(parent.op)));
+                                             lx.tok_kind_name(child.op), lx.tok_kind_name(parent.op)));
     let fx = dg.fix(d, "add parentheses", "machine");
     dg.edit(fx, u.mkspan(child.span.file, child.span.start, child.span.start), "(");
     dg.edit(fx, u.mkspan(child.span.file, child.span.end, child.span.end), ")");
@@ -707,7 +707,7 @@ fn parse_expr(P: *mut Parser) *mut ast.Expr {
     let start = e.span;
     if (e.kind == ast.E_BINARY) and not e.parens {
         let d = dg.err(e.span, "E0150", u.f1("'catch' applies to the whole expression '... %s ...'; add parentheses",
-                                              lx.tok_kind_name(e.op)));
+                                             lx.tok_kind_name(e.op)));
         let fx = dg.fix(d, "catch only the right operand", "suggestion");
         dg.edit(fx, u.mkspan(e.b.span.file, e.b.span.start, e.b.span.start), "(");
     }
@@ -1256,7 +1256,8 @@ fn parse_top(P: *mut Parser) void {
         _ = expect(P, lx.TK_LBRACE);
         while pk(P) == lx.TK_IDENT {
             let vid = expect_ident(P);
-            let mut v = ast.Variant.{ name: vid.name, span: vid.span, te: u.nil.[ast.TypeExpr](), ty: u.nil.[ast.Type]() };
+            let mut v = ast.Variant.{ name: vid.name, span: vid.span, te: u.nil.[ast.TypeExpr](),
+                                      ty: u.nil.[ast.Type]() };
             if accept(P, lx.TK_COLON) {
                 v.te = parse_type(P);
             }

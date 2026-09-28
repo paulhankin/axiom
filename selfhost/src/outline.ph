@@ -12,13 +12,13 @@
 // ways out go to J; nothing computed in it is used after it (its effects are
 // on memory). The new function is internal, cold and never inlined back.
 // =============================================================================
-import "util.ph" as u;
+import "inline.ph" as inl;
 import "ir.ph" as ir;
 import "opt.ph" as opt;
-import "inline.ph" as inl;
+import "util.ph" as u;
 
-const REST_MAX: i32 = 30;     // what is left must be small enough to inline
-const REGION_MIN: i32 = 12;   // and the region worth a call
+const REST_MAX: i32 = 30;    // what is left must be small enough to inline
+const REGION_MIN: i32 = 12;  // and the region worth a call
 const MAX_ARGS: usize = 6;
 
 fn vnil() *mut ir.Value {
@@ -38,7 +38,7 @@ fn inst_cost(i: *ir.Value) i32 {
 
 struct Region {
     blocks: u.List.[*mut ir.Block],
-    ins: u.List.[*mut ir.Value],     // values from outside the region it uses
+    ins: u.List.[*mut ir.Value],  // values from outside the region it uses
     join: *mut ir.Block,
     tag: i64,
 }
@@ -338,8 +338,8 @@ fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) bool {
 // True if any function changed (those changed are listed in `changed`).
 pub fn outline_module(m: *mut ir.Module, changed: *mut u.List.[*mut ir.Func]) bool {
     let mut r = Region.{ blocks: u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 },
-                         ins: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 },
-                         join: ir.bnil(), tag: 0 };
+                         ins: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 }, join: ir.bnil(),
+                         tag: 0 };
     let mut any = false;
     let n = m.funcs.len;
     for i in 0..n {

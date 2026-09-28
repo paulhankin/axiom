@@ -2,9 +2,9 @@
 // types.ph - type construction, interning, substitution, printing, layout.
 // Types are hash-consed: equal types are the same pointer.
 // =============================================================================
-import "util.ph" as u;
-import "lexer.ph" as lx;
 import "ast.ph" as ast;
+import "lexer.ph" as lx;
+import "util.ph" as u;
 
 pub let mut g_target: ast.Target = ast.Target.{ ptr_bits: 32, is_wasm: true, triple: "wasm32-unknown-unknown" };
 
@@ -34,11 +34,32 @@ let mut next_type_id: i32 = 1;
 // A zeroed type of kind k (the prototype for interning).
 fn blank(k: i32) ast.Type {
     return ast.Type.{
-        kind: k, id: 0, bits: 0, is_signed: false, is_size: false, lanes: 0, elem: u.nil.[ast.Type](), is_mut: false,
-        len: 0, len_param: u.nil.[ast.Type](), params: no_types(), ret: u.nil.[ast.Type](), decl: u.nil.[ast.Decl](),
-        args: no_types(), owner: u.nil.[ast.Decl](), pindex: 0, constraint: 0, is_const: false,
-        const_type: u.nil.[ast.Type](), name: u.nosym(), cval: 0, has_params: false, size: 0, align: 0,
-        layout_done: false, backend: u.vnil(),
+        kind: k,
+        id: 0,
+        bits: 0,
+        is_signed: false,
+        is_size: false,
+        lanes: 0,
+        elem: u.nil.[ast.Type](),
+        is_mut: false,
+        len: 0,
+        len_param: u.nil.[ast.Type](),
+        params: no_types(),
+        ret: u.nil.[ast.Type](),
+        decl: u.nil.[ast.Decl](),
+        args: no_types(),
+        owner: u.nil.[ast.Decl](),
+        pindex: 0,
+        constraint: 0,
+        is_const: false,
+        const_type: u.nil.[ast.Type](),
+        name: u.nosym(),
+        cval: 0,
+        has_params: false,
+        size: 0,
+        align: 0,
+        layout_done: false,
+        backend: u.vnil(),
     };
 }
 
@@ -388,8 +409,8 @@ pub fn type_prim(p: i32) *mut ast.Type {
 }
 
 // Anonymous struct decls are interned by (field names, field types).
-let mut anon_decls: u.List.[*mut ast.Decl] = u.List.[*mut ast.Decl].{
-    data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0, cap: 0 };
+let mut anon_decls: u.List.[*mut ast.Decl] = u.List.[*mut ast.Decl].{ data: @ptr_from_int(*mut *mut ast.Decl, 0),
+                                                                      len: 0, cap: 0 };
 
 pub fn anon_struct_decl(m: *mut ast.Module, fields: u.List.[ast.Field], sp: u.Span) *mut ast.Decl {
     for i in 0..anon_decls.len {

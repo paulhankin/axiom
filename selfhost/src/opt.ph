@@ -4,9 +4,9 @@
 // SSA values (mem2reg), constant folding, dead code elimination and CFG
 // simplification.
 // =============================================================================
-import "util.ph" as u;
-import "ir.ph" as ir;
 import "combine.ph" as cb;
+import "ir.ph" as ir;
+import "util.ph" as u;
 
 fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
@@ -222,7 +222,7 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
 // mem2reg
 // -----------------------------------------------------------------------------
 struct Slot {
-    a: *mut ir.Value,         // the alloca
+    a: *mut ir.Value,  // the alloca
     stack: u.List.[*mut ir.Value],
     defs: u.List.[*mut ir.Block],
 }
@@ -1158,7 +1158,8 @@ pub fn hoist_to_entry(f: *mut ir.Func, needs: fn(*ir.Value) bool) void {
     u.free(@ptr_cast(*mut void, made.data));
 }
 
-fn hoisted(f: *mut ir.Func, v: *mut ir.Value, at: *mut ir.Value, made: *mut u.List.[*mut ir.Value], needs: fn(*ir.Value) bool) *mut ir.Value {
+fn hoisted(f: *mut ir.Func, v: *mut ir.Value, at: *mut ir.Value, made: *mut u.List.[*mut ir.Value],
+           needs: fn(*ir.Value) bool) *mut ir.Value {
     if u.isnil(v) or not needs(v) {
         return v;
     }

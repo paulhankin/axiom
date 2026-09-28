@@ -8,7 +8,7 @@ error { InvalidInput }
 
 pub union Shape {
     Circle: struct { radius: f32 },
-    Rect:   struct { width: f32, height: f32 },
+    Rect: struct { width: f32, height: f32 },
     Empty,
 
     pub fn area(self: Shape) f32 {

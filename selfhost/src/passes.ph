@@ -10,15 +10,15 @@
 //         (inline.ph), bottom-up over the call graph, each function simplified
 //         again after its calls are inlined
 // =============================================================================
-import "util.ph" as u;
-import "ir.ph" as ir;
-import "opt.ph" as opt;
-import "sroa.ph" as sroa;
 import "gvn.ph" as gvn;
 import "inline.ph" as inl;
-import "thread.ph" as thr;
+import "ir.ph" as ir;
+import "opt.ph" as opt;
 import "outline.ph" as outl;
+import "sroa.ph" as sroa;
 import "target.ph" as tg;
+import "thread.ph" as thr;
+import "util.ph" as u;
 
 fn cleanup(f: *mut ir.Func, level: i32) void {
     let mut rounds: i32 = 0;

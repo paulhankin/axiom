@@ -1,8 +1,8 @@
 // Calling the C library (native only: freestanding wasm has no libc).
 // native-only
 import "../lib/io.ph" as io;
-import "std/mem" as mem;
 import "std/c" as c;
+import "std/mem" as mem;
 
 extern "C" {
     fn strlen(s: *u8) usize;
@@ -30,11 +30,11 @@ fn cmp_i32(a: *void, b: *void) i32 {
 export fn run() void {
     let al = mem.page_allocator;
     let s = c.to_cstr(al, "phalange") catch return;
-    io.uint(@as(u64, strlen(s)));                      // expect: 8
+    io.uint(@as(u64, strlen(s)));  // expect: 8
     c.free_cstr(al, s);
     let mut buf: [64]u8 = [0; 64];
     let n = snprintf(&mut buf[0], buf.len, "%d-%s-%.2f".ptr, 42, "x".ptr, 0.5);
-    io.str(buf[..@int_cast(usize, n)]);                // expect: 42-x-0.50
+    io.str(buf[..@int_cast(usize, n)]);  // expect: 42-x-0.50
     let mut xs: [5]i32 = [5, -1, 3, 9, 0];
     qsort(@ptr_cast(*mut void, &mut xs), xs.len, @size_of(i32), cmp_i32);
     for x in xs {
@@ -45,6 +45,6 @@ export fn run() void {
     // expect: 3
     // expect: 5
     // expect: 9
-    io.float(cos(0.0));                                // expect: 1
+    io.float(cos(0.0));  // expect: 1
     io.boolean(c.is_null(getenv("PHALANGE_SURELY_UNSET_VARIABLE".ptr)));  // expect: true
 }

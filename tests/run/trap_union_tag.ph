@@ -3,7 +3,10 @@
 // expect: A
 import "../lib/io.ph" as io;
 
-union U { A, B }
+union U {
+    A,
+    B,
+}
 
 fn name(u: U) []u8 {
     match u {

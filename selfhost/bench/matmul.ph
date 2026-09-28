@@ -1,7 +1,7 @@
 // Dense f64 matrix multiplication and a small n-body style struct update:
 // floating point, nested loops, bounds checks on computed indices.
-import "std/mem" as mem;
 import "common.ph" as c;
+import "std/mem" as mem;
 
 struct Body {
     x: f64,

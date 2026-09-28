@@ -5,15 +5,15 @@
 // pair becomes one LLVM function, generated from the shared, already
 // type-checked body by substituting the type arguments.
 // =============================================================================
-import "util.ph" as u;
-import "diag.ph" as dg;
-import "lexer.ph" as lx;
 import "ast.ph" as ast;
-import "types.ph" as ty;
-import "sema.ph" as sema;
-import "ir.ph" as ir;
-import "target.ph" as tg;
 import "backend.ph" as be;
+import "diag.ph" as dg;
+import "ir.ph" as ir;
+import "lexer.ph" as lx;
+import "sema.ph" as sema;
+import "target.ph" as tg;
+import "types.ph" as ty;
+import "util.ph" as u;
 
 // What one codegen run produces (spec §16.7):
 //   CG_WHOLE   the whole program in one object (-O2 and above by default)
@@ -34,9 +34,9 @@ pub struct CgOptions {
     overflow_saturate: bool,  // --overflow=saturate (--release)
     cpu: []u8,                // nil = generic
     emit: i32,
-    out_path: []u8,           // file to write
-    stack_traces: bool,       // shadow stack for traces and profiles (--stack-traces=on, default)
-    profile: bool,            // phalange profile: the shadow stack is sampled concurrently
+    out_path: []u8,      // file to write
+    stack_traces: bool,  // shadow stack for traces and profiles (--stack-traces=on, default)
+    profile: bool,       // phalange profile: the shadow stack is sampled concurrently
     unit: i32,
     module: *mut ast.Module,  // CG_MODULE
 }
@@ -82,8 +82,9 @@ struct FnInst {
     next: *mut FnInst,
 }
 
-let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0, len: 0 };
+let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                    vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0,
+                                                                    len: 0 };
 let mut pending_head: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 let mut pending_tail: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 
@@ -110,8 +111,8 @@ struct FnState {
     // entry: every call restores the depth, so it is the same at every call.
     ss_rec: *mut ir.Value,
     ss_depth: *mut ir.Value,
-    ss_slot: *mut ir.Value,   // where this function's calls record their site
-    ss_next: *mut ir.Value,   // the depth during its calls
+    ss_slot: *mut ir.Value,  // where this function's calls record their site
+    ss_next: *mut ir.Value,  // the depth during its calls
 }
 
 let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
@@ -551,8 +552,9 @@ let mut trap_info: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 let mut trap_hook: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 let mut trap_fnty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 let mut site_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
-let mut site_map: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
+let mut site_map: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                        cap: 0, len: 0 };
 
 // phalange.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
 fn trap_info_global() *mut ir.Value {
@@ -663,11 +665,16 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
         text = u.dup(f.text[@as(usize, sp.start)..@as(usize, sp.start + n)]);
     }
     let mut vals: [10]*mut ir.Value = [
-        ci32(@as(u64, @bit_cast(u32, code))), ci32(@as(u64, file_key(sp.file))),
-        ci32(@as(u64, sp.start)), ci32(@as(u64, sp.end)),
-        ci32(@as(u64, @bit_cast(u32, lc.sl))), ci32(@as(u64, @bit_cast(u32, lc.sc))),
-        string_ptr(cstr_prefix(file)), string_ptr(cstr_prefix(text)),
-        string_ptr(cstr_prefix(fname)), string_ptr(cstr_prefix(callee)),
+        ci32(@as(u64, @bit_cast(u32, code))),
+        ci32(@as(u64, file_key(sp.file))),
+        ci32(@as(u64, sp.start)),
+        ci32(@as(u64, sp.end)),
+        ci32(@as(u64, @bit_cast(u32, lc.sl))),
+        ci32(@as(u64, @bit_cast(u32, lc.sc))),
+        string_ptr(cstr_prefix(file)),
+        string_ptr(cstr_prefix(text)),
+        string_ptr(cstr_prefix(fname)),
+        string_ptr(cstr_prefix(callee)),
     ];
     let g = ir.add_global(M, site_ty, ".site").val;
     set_init(g, const_struct(vals[..]));
@@ -2809,7 +2816,8 @@ fn rt_fn(name: []u8) *mut FnInst {
     let P = sema.g_prog;
     for i in 0..P.fns.len {
         let d = P.fns.get(i);
-        if u.str_eq(d.name, name) and u.notnil(d.module) and u.ends(u.file_of(d.module.file.id).display, "runtime/rt.ph") {
+        if u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.ends(u.file_of(d.module.file.id).display, "runtime/rt.ph") {
             return get_inst(d, ty.no_types());
         }
     }
@@ -4039,7 +4047,8 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         // any of them, directly or from a generic instance).
         for i in 0..P.fns.len {
             let d = P.fns.get(i);
-            if (d.module == O.module) and (d.gparams.len == 0) and not (u.notnil(d.owner) and (d.owner.gparams.len != 0)) {
+            if (d.module == O.module) and (d.gparams.len == 0) and
+               not (u.notnil(d.owner) and (d.owner.gparams.len != 0)) {
                 _ = get_inst(d, ty.no_types());
             }
         }

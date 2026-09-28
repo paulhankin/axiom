@@ -73,26 +73,26 @@ fn desc(a: i32, b: i32) bool {
 }
 
 export fn run() void {
-    io.int(@as(i64, max(3, @as(i32, 9))));       // expect: 9
-    io.float(max.[f64](1.5, -2.0));              // expect: 1.5
+    io.int(@as(i64, max(3, @as(i32, 9))));  // expect: 9
+    io.float(max.[f64](1.5, -2.0));         // expect: 1.5
     let arr: [4]u16 = [1, 2, 3, 4];
-    io.int(@as(i64, sum(arr)));                  // expect: 10
+    io.int(@as(i64, sum(arr)));  // expect: 10
     let fa: [2]f64 = [0.25, 0.5];
-    io.float(sum(fa));                           // expect: 0.75
+    io.float(sum(fa));  // expect: 0.75
     let empty = arr[0..0];
     io.int(@as(i64, first_or(empty, @as(u16, 77))));  // expect: 77
     let p = Pair.[u8, bool].{ a: 5, b: true };
     let q = p.swap();
-    io.boolean(q.a);                             // expect: true
-    io.int(@as(i64, q.b));                       // expect: 5
+    io.boolean(q.a);        // expect: true
+    io.int(@as(i64, q.b));  // expect: 5
 
     let mut arena = mem.Arena.init(mem.page_allocator);
     defer arena.deinit();
     let mut st = Stack.[i64].init(arena.allocator(), 4) catch return;
     st.push(10) catch return;
     st.push(20) catch return;
-    io.int(st.pop());                            // expect: 20
-    io.int(st.pop());                            // expect: 10
+    io.int(st.pop());  // expect: 20
+    io.int(st.pop());  // expect: 10
 
     let mut xs: [5]i32 = [3, -1, 4, 1, 5];
     insertion_sort(xs[..], desc);

@@ -2,9 +2,8 @@
 // x64enc.ph - x86-64 machine instructions: opcodes of the machine IR used by
 // x64.ph, and their binary encoding (legacy SSE or VEX when AVX is enabled).
 // =============================================================================
-import "util.ph" as u;
 import "bin.ph" as bn;
-import "mach.ph" as mc;
+import "util.ph" as u;
 
 // Physical registers: general purpose 0-15, xmm 16-31.
 pub const RAX: i32 = 0;
@@ -27,42 +26,42 @@ pub const XMM0: i32 = 16;
 
 // Machine opcodes. Operand conventions in comments: r register, m memory
 // (MOp K_MEM), i immediate; sz is the operand size in bytes.
-pub const MOV_RR: i32 = 1;      // r(D) <- r(U)          sz 4/8
-pub const MOV_RI: i32 = 2;      // r(D) <- i             sz 4/8 (8: any 64-bit constant)
-pub const LOAD: i32 = 3;        // r(D) <- m             sz 1/2/4/8, cc: 0 plain / 1 zero-extend / 2 sign-extend (to sz 4 or 8 in aux)
-pub const STORE: i32 = 4;       // m <- r(U)             sz 1/2/4/8
-pub const STORE_I: i32 = 5;     // m <- i                sz 1/2/4/8 (i sign-extended imm32)
-pub const LEA: i32 = 6;         // r(D) <- &m
-pub const ALU: i32 = 7;         // r(UD) op= r(U)|m|i    cc: /digit (0 add 1 or 4 and 5 sub 6 xor 7 cmp); sz 1/2/4/8
-pub const TEST: i32 = 8;        // r(U) & r(U)|i         sz 1/2/4/8
-pub const IMUL: i32 = 9;        // r(UD) *= r(U)|m
-pub const IMUL_I: i32 = 10;     // r(D) <- r(U) * i
-pub const SHIFT: i32 = 11;      // r(UD) shift by cl (ops[1] = rcx U) or imm; cc: /digit (0 rol 1 ror 4 shl 5 shr 7 sar)
-pub const UNARY: i32 = 12;      // r(UD); cc: /digit of F7 (2 not, 3 neg)
-pub const EXT: i32 = 13;        // r(D) <- r(U): cc 1 movzx8, 2 movzx16, 3 movsx8, 4 movsx16, 5 movsxd, 6 mov32 (zero-extend)
-pub const CQO: i32 = 14;        // rdx(D) <- sign of rax(U)   sz 4/8
-pub const DIV: i32 = 15;        // rax,rdx(UD) / r(U)   cc: 6 div, 7 idiv
-pub const SETCC: i32 = 16;      // r(D) (8-bit) <- cc
-pub const CMOV: i32 = 17;       // r(UD) <- r(U) if cc
-pub const BITSCAN: i32 = 18;    // r(D) <- op r(U): cc 0 bsf, 1 bsr, 2 tzcnt, 3 lzcnt, 4 popcnt
-pub const JMP: i32 = 19;        // label
-pub const JCC: i32 = 20;        // label, cc
-pub const LABEL: i32 = 21;      // local label (aux)
-pub const CALL: i32 = 22;       // sym or r(U); implicit register operands follow
-pub const RET: i32 = 23;        // epilogue and return; implicit uses
+pub const MOV_RR: i32 = 1;    // r(D) <- r(U)          sz 4/8
+pub const MOV_RI: i32 = 2;    // r(D) <- i             sz 4/8 (8: any 64-bit constant)
+pub const LOAD: i32 = 3;      // r(D) <- m             sz 1/2/4/8, cc: 0 plain / 1 zero-extend / 2 sign-extend (to sz 4 or 8 in aux)
+pub const STORE: i32 = 4;     // m <- r(U)             sz 1/2/4/8
+pub const STORE_I: i32 = 5;   // m <- i                sz 1/2/4/8 (i sign-extended imm32)
+pub const LEA: i32 = 6;       // r(D) <- &m
+pub const ALU: i32 = 7;       // r(UD) op= r(U)|m|i    cc: /digit (0 add 1 or 4 and 5 sub 6 xor 7 cmp); sz 1/2/4/8
+pub const TEST: i32 = 8;      // r(U) & r(U)|i         sz 1/2/4/8
+pub const IMUL: i32 = 9;      // r(UD) *= r(U)|m
+pub const IMUL_I: i32 = 10;   // r(D) <- r(U) * i
+pub const SHIFT: i32 = 11;    // r(UD) shift by cl (ops[1] = rcx U) or imm; cc: /digit (0 rol 1 ror 4 shl 5 shr 7 sar)
+pub const UNARY: i32 = 12;    // r(UD); cc: /digit of F7 (2 not, 3 neg)
+pub const EXT: i32 = 13;      // r(D) <- r(U): cc 1 movzx8, 2 movzx16, 3 movsx8, 4 movsx16, 5 movsxd, 6 mov32 (zero-extend)
+pub const CQO: i32 = 14;      // rdx(D) <- sign of rax(U)   sz 4/8
+pub const DIV: i32 = 15;      // rax,rdx(UD) / r(U)   cc: 6 div, 7 idiv
+pub const SETCC: i32 = 16;    // r(D) (8-bit) <- cc
+pub const CMOV: i32 = 17;     // r(UD) <- r(U) if cc
+pub const BITSCAN: i32 = 18;  // r(D) <- op r(U): cc 0 bsf, 1 bsr, 2 tzcnt, 3 lzcnt, 4 popcnt
+pub const JMP: i32 = 19;      // label
+pub const JCC: i32 = 20;      // label, cc
+pub const LABEL: i32 = 21;    // local label (aux)
+pub const CALL: i32 = 22;     // sym or r(U); implicit register operands follow
+pub const RET: i32 = 23;      // epilogue and return; implicit uses
 pub const UD2: i32 = 24;
-pub const XCHG: i32 = 25;       // m <-> r(UD)
-pub const XADD: i32 = 26;       // lock xadd m, r(UD)
-pub const CMPXCHG: i32 = 27;    // lock cmpxchg m, r(U); rax(UD)
+pub const XCHG: i32 = 25;     // m <-> r(UD)
+pub const XADD: i32 = 26;     // lock xadd m, r(UD)
+pub const CMPXCHG: i32 = 27;  // lock cmpxchg m, r(U); rax(UD)
 pub const MFENCE: i32 = 28;
-pub const TLSBASE: i32 = 29;    // r(D) <- fs:0
-pub const SSE: i32 = 30;        // descriptor cc; ops: [reg field, rm, vvvv (VEX only) | none, imm | none]
-pub const REP: i32 = 31;        // cc 0: rep movsb (rdi, rsi, rcx), 1: rep stosb (rdi, al, rcx); cld/std in aux
-pub const SHIFTX: i32 = 32;     // BMI2: r(D) <- r(U) shift r(U): cc 0 shlx 1 shrx 2 sarx
+pub const TLSBASE: i32 = 29;  // r(D) <- fs:0
+pub const SSE: i32 = 30;      // descriptor cc; ops: [reg field, rm, vvvv (VEX only) | none, imm | none]
+pub const REP: i32 = 31;      // cc 0: rep movsb (rdi, rsi, rcx), 1: rep stosb (rdi, al, rcx); cld/std in aux
+pub const SHIFTX: i32 = 32;   // BMI2: r(D) <- r(U) shift r(U): cc 0 shlx 1 shrx 2 sarx
 pub const NOP: i32 = 33;
-pub const PARAM: i32 = 34;      // pseudo: defines incoming argument registers at entry
-pub const CMP_M: i32 = 35;      // cmp m, r(U) / i
-pub const LEAVE_TRAP: i32 = 36; // unused
+pub const PARAM: i32 = 34;       // pseudo: defines incoming argument registers at entry
+pub const CMP_M: i32 = 35;       // cmp m, r(U) / i
+pub const LEAVE_TRAP: i32 = 36;  // unused
 
 // Condition codes
 pub const CC_O: i32 = 0;
@@ -86,14 +85,14 @@ pub const CC_G: i32 = 15;
 // SSE / AVX descriptors
 // -----------------------------------------------------------------------------
 pub struct SseDesc {
-    pfx: u8,      // 0, 0x66, 0xF2, 0xF3
-    map: u8,      // 1: 0F, 2: 0F38, 3: 0F3A
+    pfx: u8,  // 0, 0x66, 0xF2, 0xF3
+    map: u8,  // 1: 0F, 2: 0F38, 3: 0F3A
     opc: u8,
-    w: u8,        // REX.W / VEX.W
-    digit: i8,    // /digit in the reg field (shift-by-immediate forms), -1 none
-    gpr_reg: bool,  // the reg field is a general register (pextrw, movmsk, cvtt*2si)
-    gpr_rm: bool,   // the r/m operand is a general register (movd/q, cvtsi2*, pinsr*)
-    vex_only: bool, // no legacy encoding (FMA, blends with is4, BMI)
+    w: u8,           // REX.W / VEX.W
+    digit: i8,       // /digit in the reg field (shift-by-immediate forms), -1 none
+    gpr_reg: bool,   // the reg field is a general register (pextrw, movmsk, cvtt*2si)
+    gpr_rm: bool,    // the r/m operand is a general register (movd/q, cvtsi2*, pinsr*)
+    vex_only: bool,  // no legacy encoding (FMA, blends with is4, BMI)
 }
 
 fn d(pfx: u8, map: u8, opc: u8) SseDesc {
@@ -142,7 +141,7 @@ pub const SQRTPS: i32 = 38;
 pub const SQRTPD: i32 = 39;
 pub const CVTSS2SD: i32 = 40;
 pub const CVTSD2SS: i32 = 41;
-pub const CVTSI2SS: i32 = 42;   // w set by the encoder from sz
+pub const CVTSI2SS: i32 = 42;  // w set by the encoder from sz
 pub const CVTSI2SD: i32 = 43;
 pub const CVTTSS2SI: i32 = 44;
 pub const CVTTSD2SI: i32 = 45;
@@ -257,10 +256,10 @@ pub const VFMADD231SS: i32 = 153;
 pub const VFMADD231SD: i32 = 154;
 pub const VFMADD231PS: i32 = 155;
 pub const VFMADD231PD: i32 = 156;
-pub const MOVQ_XM: i32 = 157;   // movq xmm <- m64 (zero upper)
-pub const MOVQ_MX: i32 = 158;   // movq m64 <- xmm
-pub const MOVD_XM: i32 = 159;   // movd xmm <- m32
-pub const MOVD_MX: i32 = 160;   // movd m32 <- xmm
+pub const MOVQ_XM: i32 = 157;  // movq xmm <- m64 (zero upper)
+pub const MOVQ_MX: i32 = 158;  // movq m64 <- xmm
+pub const MOVD_XM: i32 = 159;  // movd xmm <- m32
+pub const MOVD_MX: i32 = 160;  // movd m32 <- xmm
 pub const PUNPCKHBW: i32 = 161;
 pub const PSRAD_I2: i32 = 162;
 pub const NSSE: i32 = 163;
@@ -459,8 +458,8 @@ pub struct Reloc {
 }
 
 pub struct Fixup {
-    off: u64,     // position of the rel32
-    label: i32,   // block id, or local label (>= LOCAL_BASE)
+    off: u64,    // position of the rel32
+    label: i32,  // block id, or local label (>= LOCAL_BASE)
 }
 
 pub const LOCAL_BASE: i32 = 1_000_000;
@@ -494,12 +493,12 @@ fn rex(e: *mut Enc, w: u64, r: u64, x: u64, b: u64, force: bool) void {
 
 // Memory operand components after register assignment.
 pub struct Mem {
-    base: i32,     // -1: none (rip-relative when sym >= 0)
+    base: i32,  // -1: none (rip-relative when sym >= 0)
     index: i32,
     scale: u8,
     disp: i64,
     sym: i32,
-    tpoff: bool,   // disp32 is a TLS offset of sym (absolute, no base)
+    tpoff: bool,  // disp32 is a TLS offset of sym (absolute, no base)
 }
 
 pub fn rm_x(m: *Mem) u64 {

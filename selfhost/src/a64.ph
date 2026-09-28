@@ -12,15 +12,15 @@
 // Most instructions are "raw": the selector computes the instruction word
 // and the encoder fills in the allocated registers.
 // =============================================================================
-import "util.ph" as u;
-import "ir.ph" as ir;
-import "opt.ph" as opt;
-import "mach.ph" as mc;
 import "a64enc.ph" as ae;
-import "elf.ph" as elf;
 import "bin.ph" as bn;
-import "target.ph" as tg;
+import "elf.ph" as elf;
+import "ir.ph" as ir;
 import "lower.ph" as lower;
+import "mach.ph" as mc;
+import "opt.ph" as opt;
+import "target.ph" as tg;
+import "util.ph" as u;
 
 const GPR: u8 = 0;
 const VR: u8 = 1;
@@ -78,10 +78,10 @@ let mut RODATA: i32 = 0;
 let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut galign: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
-let mut libsyms: u.SymMap.[u32] = u.SymMap.[u32].{
-    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                  cap: 0, len: 0 };
+let mut libsyms: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                   cap: 0, len: 0 };
 let mut errors: bool = false;
 let mut LSE_: bool = false;
 
@@ -89,7 +89,7 @@ let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut nlocal: i32 = 0;
-let mut out_area: u64 = 0;   // outgoing stack-argument bytes
+let mut out_area: u64 = 0;  // outgoing stack-argument bytes
 
 fn fail(msg: []u8) void {
     u.eprint(u.f2("phalange: AArch64 code generation: %s (in %s)\n", msg, F.name));
@@ -1580,7 +1580,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             raw2(ae.fcvt_int(0, 0, 0, 7, 0, 0), f, x);
         }
         let c = vvr();
-        raw2(ae.v2(0, 0, 0, 5, 0, 0), c, f);        // cnt v.8b
+        raw2(ae.v2(0, 0, 0, 5, 0, 0), c, f);  // cnt v.8b
         let s = vvr();
         raw2(ae.vacross(0, 0, 0, 0x1b, 0, 0), s, c);  // addv b, v.8b
         raw2(ae.umov(0, 0, 0, 0), d, s);
@@ -2015,7 +2015,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         }
         if k == 3 {
             let z = vvr();
-            raw2(ae.v2(1, 0, 3, 0x09, 0, 0), z, a);      // cmeq v.2d, #0
+            raw2(ae.v2(1, 0, 3, 0x09, 0, 0), z, a);       // cmeq v.2d, #0
             raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, z);  // any zero lane?
             raw2(ae.umov(0, 0, 0, 0), g, s);
             _ = cmp_imm(0, g, 0);
@@ -2499,7 +2499,6 @@ fn prepare(f: *mut ir.Func) void {
     }
 }
 
-
 // x9-x15 first (free temporaries), then the argument registers, then the
 // callee-saved x19-x28; v16-v31, v0-v7, then v8-v15
 let gpr_order: [25]i32 = [9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 19, 20, 21, 22, 23, 24, 25, 26, 27];
@@ -2639,7 +2638,7 @@ struct Rl {
 struct Fx {
     off: u64,
     label: i32,
-    kind: i32,   // 0: imm26, 1: imm19
+    kind: i32,  // 0: imm26, 1: imm19
 }
 
 let mut code: bn.Bytes = bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
@@ -2942,8 +2941,9 @@ fn needs_frame() bool {
                 if (o.kind == mc.K_REG) and ((P(o.reg) == FP) or (P(o.reg) == LR) or (P(o.reg) == SP)) {
                     return true;
                 }
-                if (o.kind == mc.K_MEM) and ((o.slot >= 0) or (o.base == FP) or (o.base == SP) or (o.base == LR) or
-                                             (o.index == FP) or (o.index == SP)) {
+                if (o.kind == mc.K_MEM) and
+                   ((o.slot >= 0) or (o.base == FP) or (o.base == SP) or (o.base == LR) or (o.index == FP) or
+                    (o.index == SP)) {
                     return true;
                 }
             }
@@ -2962,7 +2962,7 @@ fn prologue() void {
     let mut rem = frame;
     while rem > 4096 {
         w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));  // sub sp, sp, #4096
-        w32(ae.ldst_uimm(3, false, 0, 31, SP, 0));           // str xzr, [sp] (touch the page)
+        w32(ae.ldst_uimm(3, false, 0, 31, SP, 0));            // str xzr, [sp] (touch the page)
         rem -= 4096;
     }
     if rem == 4096 {
@@ -3192,7 +3192,8 @@ fn encode_func(f: *mut ir.Func) void {
         }
         let rel = (@bit_cast(i64, target) - @bit_cast(i64, x.off)) / 4;
         let o = @truncate(usize, x.off);
-        let mut w = @as(u64, cv[o]) | (@as(u64, cv[o + 1]) << 8) | (@as(u64, cv[o + 2]) << 16) | (@as(u64, cv[o + 3]) << 24);
+        let mut w = @as(u64, cv[o]) | (@as(u64, cv[o + 1]) << 8) | (@as(u64, cv[o + 2]) << 16) | (
+            @as(u64, cv[o + 3]) << 24);
         if x.kind == 0 {
             w = w | (@bit_cast(u64, rel) & 0x3ff_ffff);
         } else {
@@ -3234,11 +3235,13 @@ fn emit_data(s: *mut elf.Sec, base: u64, x: *mut ir.Value) void {
     let t = x.ty;
     let k = x.kind;
     if k == ir.V_GLOBAL {
-        s.relocs.push(elf.Rel.{ off: base, ty: elf.R_AARCH64_ABS64, sym: gsym.get(@int_cast(usize, x.gv.id)), addend: 0 });
+        s.relocs.push(elf.Rel.{ off: base, ty: elf.R_AARCH64_ABS64, sym: gsym.get(@int_cast(usize, x.gv.id)),
+                                addend: 0 });
         return;
     }
     if k == ir.V_FUNC {
-        s.relocs.push(elf.Rel.{ off: base, ty: elf.R_AARCH64_ABS64, sym: fsym.get(@int_cast(usize, x.fnp.id)), addend: 0 });
+        s.relocs.push(elf.Rel.{ off: base, ty: elf.R_AARCH64_ABS64, sym: fsym.get(@int_cast(usize, x.fnp.id)),
+                                addend: 0 });
         return;
     }
     if (k == ir.V_CAGG) and (t.kind != ir.T_VEC) {
@@ -3342,8 +3345,8 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         if g.tls {
             ty = elf.T_TLS;
         }
-        gsym.push(elf.add_sym(OBJ, elf.Sym.{ name: g.name, sec: sec, value: off, size: g.ty.size, bind: bind_of(g.linkage),
-                                             ty: ty, hidden: false }));
+        gsym.push(elf.add_sym(OBJ, elf.Sym.{ name: g.name, sec: sec, value: off, size: g.ty.size,
+                                             bind: bind_of(g.linkage), ty: ty, hidden: false }));
     }
     for i in 0..m.globals.len {
         let g = m.globals.get(i);

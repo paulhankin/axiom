@@ -21,10 +21,10 @@
 // escapes is not written by calls, and no computed pointer reaches a noalias
 // global (the shadow stack).
 // =============================================================================
-import "util.ph" as u;
+import "combine.ph" as cb;
 import "ir.ph" as ir;
 import "opt.ph" as opt;
-import "combine.ph" as cb;
+import "util.ph" as u;
 
 fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
@@ -46,16 +46,16 @@ struct Ent {
     bucket: usize,
 }
 
-const W_LOC: i32 = 0;     // a store / memory operation on one location
-const W_CALL: i32 = 1;    // everything but non-escaping allocas
-const W_ALL: i32 = 2;     // everything
+const W_LOC: i32 = 0;   // a store / memory operation on one location
+const W_CALL: i32 = 1;  // everything but non-escaping allocas
+const W_ALL: i32 = 2;   // everything
 
 struct Write {
     kind: i32,
     base: *mut ir.Value,
     obj: *mut ir.Value,
     off: i64,
-    size: i64,            // -1: unknown
+    size: i64,  // -1: unknown
     rok: bool,
     rlo: i64,
     rhi: i64,
@@ -63,10 +63,10 @@ struct Write {
 
 struct Loc {
     base: *mut ir.Value,
-    obj: *mut ir.Value,   // alloca or global under the ptradds, or nil
-    off: i64,             // from base
+    obj: *mut ir.Value,  // alloca or global under the ptradds, or nil
+    off: i64,            // from base
     size: i64,
-    rok: bool,            // the offset from obj is known to lie in [rlo, rhi]
+    rok: bool,  // the offset from obj is known to lie in [rlo, rhi]
     rlo: i64,
     rhi: i64,
 }
@@ -401,7 +401,8 @@ fn may_alias(x: *Loc, w: *Write) bool {
 }
 
 fn push_write(kind: i32, l: Loc) void {
-    writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo, rhi: l.rhi });
+    writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo,
+                        rhi: l.rhi });
 }
 
 fn nowhere() Loc {
@@ -597,7 +598,7 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     }
     if (c.op == ir.OP_ICMP) and (c.ty.kind == ir.T_INT) {
         let p = cb.pred_of(c);
-        let mut tp = p;         // the predicate that holds
+        let mut tp = p;  // the predicate that holds
         if not val {
             tp = cb.inv_pred(p);
         }
@@ -862,7 +863,8 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
         }
         e = en.next;
     }
-    if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and cb.is_k(x.b) and (ir.cint_val(x.b) >= 2) {
+    if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and cb.is_k(x.b) and
+       (ir.cint_val(x.b) >= 2) {
         return true;  // at most MAX / 2
     }
     if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
@@ -1329,12 +1331,14 @@ pub fn gvn(f: *mut ir.Func) bool {
 // function returns.
 // -----------------------------------------------------------------------------
 fn loc_write(l: *Loc) Write {
-    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo, rhi: l.rhi };
+    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo,
+                   rhi: l.rhi };
 }
 
 // Is a covered by b (both exact)?
 fn covers(b: *Loc, a: *Loc) bool {
-    return (a.base == b.base) and (a.size >= 0) and (b.size >= 0) and (a.off >= b.off) and ((a.off + a.size) <= (b.off + b.size));
+    return (a.base == b.base) and (a.size >= 0) and (b.size >= 0) and (a.off >= b.off) and
+           ((a.off + a.size) <= (b.off + b.size));
 }
 
 // Removes the killed locations that the read of r may observe.
@@ -1364,7 +1368,8 @@ fn read_nonprivate(killed: *mut u.List.[Loc]) void {
     }
 }
 
-let mut restored: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut restored: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                    cap: 0 };
 let mut ss_dead: bool = false;
 
 fn ss_reads() void {
@@ -1564,8 +1569,10 @@ fn ss_reader(i: *mut ir.Value, depth: bool) bool {
     return false;
 }
 
-let mut ss_work: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
-let mut ss_one: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut ss_work: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                   cap: 0 };
+let mut ss_one: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
 let mut ss_mark: i64 = 0;
 
 // Is the push store s dead (see above)? Forward over the paths from s.
@@ -1688,8 +1695,10 @@ fn restore_redundant(s: *mut ir.Value) bool {
 // forward from the store up to what overwrites it (see push_dead); each must
 // be in a block the store's block dominates, no deeper in loops, and not
 // reachable from an overwrite without passing the store's block again.
-let mut rd_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
-let mut ow_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut rd_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                    cap: 0 };
+let mut ow_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                    cap: 0 };
 
 // The readers of s forward from `from` (false: too far, or a return).
 fn readers_of(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
@@ -2367,7 +2376,7 @@ pub fn loop_idioms(f: *mut ir.Func) bool {
 // Every other way out of the loop must be to a block that traps and uses
 // nothing computed in the loop.
 // -----------------------------------------------------------------------------
-const SPLIT_MAX: i32 = 160;   // instructions in a loop that is copied
+const SPLIT_MAX: i32 = 160;  // instructions in a loop that is copied
 
 fn trap_exit(x: *mut ir.Block, tag: i64) bool {
     let t = ir.terminator(x);
@@ -2495,8 +2504,8 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     }
     let i = ir.resolve(c.a);
     let end = ir.resolve(c.b);
-    if not is_inst(i, ir.OP_PHI) or (i.blk != h) or (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or
-       (end.ty != i.ty) or not invariant(end, tag) {
+    if not is_inst(i, ir.OP_PHI) or (i.blk != h) or (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or (end.ty != i.ty) or
+       not invariant(end, tag) {
         return false;
     }
     let p = cb.pred_of(c);
@@ -2795,7 +2804,6 @@ pub fn sink(f: *mut ir.Func) bool {
     return any;
 }
 
-
 // -----------------------------------------------------------------------------
 // Strength reduction of addresses: in a loop, an address base + off where
 // base is invariant and off grows by a constant each iteration (an affine
@@ -2816,7 +2824,8 @@ let mut ivps: u.List.[IvPtr] = u.List.[IvPtr].{ data: @ptr_from_int(*mut IvPtr, 
 
 // The step of v per iteration of the loop at h (tag), when v is an affine
 // function of its counters; `ops` counts the operations that vary.
-fn iv_step(v0: *mut ir.Value, h: *mut ir.Block, tag: i64, ok: *mut bool, ops: *mut i32, mulk: *mut bool, depth: i32) i64 {
+fn iv_step(v0: *mut ir.Value, h: *mut ir.Block, tag: i64, ok: *mut bool, ops: *mut i32, mulk: *mut bool,
+           depth: i32) i64 {
     let v = ir.resolve(v0);
     if invariant(v, tag) {
         return 0;

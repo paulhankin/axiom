@@ -376,72 +376,72 @@ export fn run() void {
     for i in 0..mm.len {
         mm[i] = @truncate(u32, (i * 7) % 11);
     }
-    io.uint(walk(mm[..], 4));                  // expect: 6704864038
+    io.uint(walk(mm[..], 4));  // expect: 6704864038
     mm[9] = 999;
-    io.uint(walk(mm[..], 4));                  // expect: 40037593
-    io.uint(walk(mm[..], 0));                  // expect: 0
+    io.uint(walk(mm[..], 4));  // expect: 40037593
+    io.uint(walk(mm[..], 0));  // expect: 0
 
     let mut bf = Buf.{ data: [0; 16], len: 0, spills: 0 };
     let mut rs: u64 = 0;
     for i in @as(u64, 0)..40 {
         rs += buf_push(&mut bf, i, 3);
     }
-    io.uint(rs);                                // expect: 42
-    io.uint(bf.spills);                         // expect: 1536
-    io.uint(@as(u64, bf.len));                  // expect: 8
+    io.uint(rs);                // expect: 42
+    io.uint(bf.spills);         // expect: 1536
+    io.uint(@as(u64, bf.len));  // expect: 8
 
     io.uint(mem_ops(g_ma[..], g_mb[..], g_mc[..], 0));  // expect: 11024
     io.uint(mem_ops(g_ma[..], g_mb[..], g_mc[..], 1));  // expect: 268
 
     let src: [6]u32 = [1, 2, 3, 4, 5, 6];
     let mut dst: [4]u32 = [0; 4];
-    io.uint(copy_add(dst[..], src[..], 1, 4));  // expect: 12004
-    io.uint(copy_add(dst[..], src[..], 5, 2));  // expect: 5
-    io.uint(copy_add(dst[..], src[..], 0, 0));  // expect: 0
+    io.uint(copy_add(dst[..], src[..], 1, 4));     // expect: 12004
+    io.uint(copy_add(dst[..], src[..], 5, 2));     // expect: 5
+    io.uint(copy_add(dst[..], src[..], 0, 0));     // expect: 0
     io.uint(@as(u64, dst[0]) + @as(u64, dst[3]));  // expect: 5
     let mut es: [3]i64 = [0; 3];
-    io.int(store_either(es[..], true, 4));     // expect: 740
-    io.int(store_either(es[..], false, 4));    // expect: 787
+    io.int(store_either(es[..], true, 4));   // expect: 740
+    io.int(store_either(es[..], false, 4));  // expect: 787
     let hp: [7]u32 = [1, 5, 9, 2, 3, 8, 4];
-    io.uint(heap_path(hp[..], 7));             // expect: 11
-    io.uint(heap_path(hp[..], 2));             // expect: 6
+    io.uint(heap_path(hp[..], 7));  // expect: 11
+    io.uint(heap_path(hp[..], 2));  // expect: 6
 
-    io.uint(digits(343073));                    // expect: 18000343073
-    io.uint(digits(0));                         // expect: 23000000000
-    io.uint(leading_spaces("   ab "));          // expect: 3
-    io.uint(leading_spaces("    "));            // expect: 4
-    io.uint(leading_spaces(""));                // expect: 0
-    io.int(use_checked(5));                     // expect: 11
-    io.int(use_checked(-3));                    // expect: 0
+    io.uint(digits(343073));            // expect: 18000343073
+    io.uint(digits(0));                 // expect: 23000000000
+    io.uint(leading_spaces("   ab "));  // expect: 3
+    io.uint(leading_spaces("    "));    // expect: 4
+    io.uint(leading_spaces(""));        // expect: 0
+    io.int(use_checked(5));             // expect: 11
+    io.int(use_checked(-3));            // expect: 0
     let mut bs: [8]u8 = [9; 8];
-    io.uint(fill_bytes(bs[..], 2, 6, 1));       // expect: 26640
-    io.uint(fill_bytes(bs[..], 5, 3, 7));       // expect: 26640
-    io.uint(fill_bytes(bs[..], 0, 8, 0));       // expect: 0
+    io.uint(fill_bytes(bs[..], 2, 6, 1));  // expect: 26640
+    io.uint(fill_bytes(bs[..], 5, 3, 7));  // expect: 26640
+    io.uint(fill_bytes(bs[..], 0, 8, 0));  // expect: 0
     let mut ws: [4]u32 = [1, 2, 3, 4];
-    io.uint(fill_words(ws[..], 2));             // expect: 8589934597
-    io.uint(fill_words(ws[..], 0));             // expect: 8589934597
+    io.uint(fill_words(ws[..], 2));  // expect: 8589934597
+    io.uint(fill_words(ws[..], 0));  // expect: 8589934597
     let mut pa = Pair.{ a: 0, b: 0 };
-    io.int(alias(&mut pa, &mut pa));            // expect: 2
+    io.int(alias(&mut pa, &mut pa));  // expect: 2
     let mut pb = Pair.{ a: 0, b: 0 };
-    io.int(alias(&mut pa, &mut pb));            // expect: 1
-    io.int(across_call());                      // expect: 5105
-    io.int(read_global_twice());                // expect: 3
-    io.int(escaping_local());                   // expect: 42
-    io.int(copies());                           // expect: 343073
-    io.uint(bytes_of());                        // expect: 513
-    io.int(classify(3, 5));                     // expect: 1
-    io.int(classify(7, 5));                     // expect: 7
-    io.int(classify(8, 5));                     // expect: 2
-    io.int(edges(0, 0xFFFF_FFFF_FFFF_FFFF));    // expect: 100101
-    io.int(edges(255, 3));                      // expect: 1010010
-    io.int(edges(4, 10));                       // expect: 1000000
-    io.uint(fib(20));                           // expect: 6765
+    io.int(alias(&mut pa, &mut pb));          // expect: 1
+    io.int(across_call());                    // expect: 5105
+    io.int(read_global_twice());              // expect: 3
+    io.int(escaping_local());                 // expect: 42
+    io.int(copies());                         // expect: 343073
+    io.uint(bytes_of());                      // expect: 513
+    io.int(classify(3, 5));                   // expect: 1
+    io.int(classify(7, 5));                   // expect: 7
+    io.int(classify(8, 5));                   // expect: 2
+    io.int(edges(0, 0xFFFF_FFFF_FFFF_FFFF));  // expect: 100101
+    io.int(edges(255, 3));                    // expect: 1010010
+    io.int(edges(4, 10));                     // expect: 1000000
+    io.uint(fib(20));                         // expect: 6765
     let mut arr: [5]i64 = [0; 5];
-    io.int(loop_store(arr[..]));                // expect: 20
-    io.int(arr[4]);                             // expect: 8
-    io.int(sel(true, 1, 2));                    // expect: 1
-    io.int(sel(false, 1, 2));                   // expect: 2
+    io.int(loop_store(arr[..]));  // expect: 20
+    io.int(arr[4]);               // expect: 8
+    io.int(sel(true, 1, 2));      // expect: 1
+    io.int(sel(false, 1, 2));     // expect: 2
     let mut pc = Pair.{ a: 10, b: 0 };
-    io.int(modify_in_loop(&mut pc));            // expect: 46
-    io.int(pc.a);                               // expect: 14
+    io.int(modify_in_loop(&mut pc));  // expect: 46
+    io.int(pc.a);                     // expect: 14
 }

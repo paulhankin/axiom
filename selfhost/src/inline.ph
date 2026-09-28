@@ -11,8 +11,8 @@
 // The shadow stack records (stack traces) are explicit stores around each
 // call in the IR, so inlining keeps traces the same.
 // =============================================================================
-import "util.ph" as u;
 import "ir.ph" as ir;
+import "util.ph" as u;
 
 fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
@@ -23,9 +23,9 @@ fn bnil() *mut ir.Block {
 }
 
 // Cost limits (in instructions).
-const SMALL: i32 = 30;            // always worth inlining
-const ONE_CALLER: i32 = 1200;     // an internal function called once
-const CALLER_MAX: i32 = 20000;    // stop growing a caller beyond this
+const SMALL: i32 = 30;          // always worth inlining
+const ONE_CALLER: i32 = 1200;   // an internal function called once
+const CALLER_MAX: i32 = 20000;  // stop growing a caller beyond this
 
 pub fn callee_of(i: *ir.Value) *mut ir.Func {
     if (i.op == ir.OP_CALL) and (i.a.kind == ir.V_FUNC) {
@@ -268,7 +268,7 @@ struct Node {
     low: i32,
     on_stack: bool,
     scc: i32,
-    calls: i32,        // direct call sites in the module
+    calls: i32,  // direct call sites in the module
     addr_taken: bool,
 }
 

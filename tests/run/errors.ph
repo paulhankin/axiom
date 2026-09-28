@@ -28,10 +28,10 @@ fn check(x: u32) !void {
 }
 
 export fn run() void {
-    io.int(@as(i64, parse("123") catch 0));      // expect: 123
-    io.int(@as(i64, parse("12x") catch 7));      // expect: 7
+    io.int(@as(i64, parse("123") catch 0));  // expect: 123
+    io.int(@as(i64, parse("12x") catch 7));  // expect: 7
     let r = parse("99999") catch |e| {
-        io.str(@error_name(e));                  // expect: TooBig
+        io.str(@error_name(e));  // expect: TooBig
         return;
     };
     io.int(@as(i64, r));

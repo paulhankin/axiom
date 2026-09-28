@@ -1,6 +1,6 @@
 // Sieve of Eratosthenes: byte arrays, bounds-checked indexing, nested loops.
-import "std/mem" as mem;
 import "common.ph" as c;
+import "std/mem" as mem;
 
 export fn main() i32 {
     let n: usize = 20_000_000;

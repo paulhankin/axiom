@@ -13,9 +13,9 @@
 //   RW  .dynamic, .got, .data (and .data.rel.ro), .tdata, then .bss
 // Thread-local .tdata/.tbss form the PT_TLS template (local-exec model).
 // =============================================================================
-import "util.ph" as u;
 import "bin.ph" as bn;
 import "elf.ph" as elf;
+import "util.ph" as u;
 
 const C_TEXT: i32 = 0;
 const C_RODATA: i32 = 1;
@@ -31,17 +31,17 @@ const PAGE: u64 = 0x10000;
 // A global (non-local) symbol of the link.
 struct GSym {
     name: []u8,
-    obj: i32,      // defining object, -1: none
+    obj: i32,  // defining object, -1: none
     sym: u32,
-    weak: bool,    // every reference / the definition is weak
-    dynamic: bool, // from a shared library
-    dynidx: u32,   // .dynsym index
-    got: i32,      // GOT slot, -1: none
-    plt: i32,      // PLT stub, -1: none
-    is_data: bool, // a data object in its library
-    lib: i32,      // the library defining it
-    ver: []u8,     // its version there ("": unversioned)
-    vidx: u32,     // .gnu.version index (1: unversioned)
+    weak: bool,     // every reference / the definition is weak
+    dynamic: bool,  // from a shared library
+    dynidx: u32,    // .dynsym index
+    got: i32,       // GOT slot, -1: none
+    plt: i32,       // PLT stub, -1: none
+    is_data: bool,  // a data object in its library
+    lib: i32,       // the library defining it
+    ver: []u8,      // its version there ("": unversioned)
+    vidx: u32,      // .gnu.version index (1: unversioned)
 }
 
 struct Place {
@@ -54,24 +54,26 @@ struct Place {
 // A shared library: its SONAME and defined dynamic symbols.
 struct Lib {
     soname: []u8,
-    syms: u.SymMap.[u8],  // name -> 1 function/other, 2 data object
+    syms: u.SymMap.[u8],    // name -> 1 function/other, 2 data object
     vers: u.SymMap.[[]u8],  // name -> its default version (if versioned)
     used: bool,
-    known: bool,          // its symbols were read
+    known: bool,  // its symbols were read
 }
 
 let mut M: u32 = 0;
-let mut objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0, cap: 0 };
+let mut objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0,
+                                                              cap: 0 };
 let mut gsyms: u.List.[GSym] = u.List.[GSym].{ data: @ptr_from_int(*mut GSym, 0), len: 0, cap: 0 };
-let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                cap: 0, len: 0 };
 let mut libs: u.List.[*mut Lib] = u.List.[*mut Lib].{ data: @ptr_from_int(*mut *mut Lib, 0), len: 0, cap: 0 };
 let mut sec_addr: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0, cap: 0 };
 let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
-let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };    // the symbol of each slot
+let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // the symbol of each slot
 let mut got_sym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-let mut got_dyn: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };    // dynsym index + 1, 0: static
-let mut plt_syms: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };   // gsym index per stub
-let mut dyn_syms: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };   // gsym index per dynsym - 1
+let mut got_dyn: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };   // dynsym index + 1, 0: static
+let mut plt_syms: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // gsym index per stub
+let mut dyn_syms: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // gsym index per dynsym - 1
 let mut n_abs_dyn: usize = 0;
 let mut errors: u32 = 0;
 
@@ -264,7 +266,8 @@ fn gsym_index(name: []u8) u32 {
     if prev != 0 {
         return prev - 1;
     }
-    gsyms.push(GSym.{ name: k, obj: -1, sym: 0, weak: true, dynamic: false, dynidx: 0, got: -1, plt: -1, is_data: false, lib: -1, ver: "", vidx: 1 });
+    gsyms.push(GSym.{ name: k, obj: -1, sym: 0, weak: true, dynamic: false, dynidx: 0, got: -1, plt: -1, is_data: false,
+                      lib: -1, ver: "", vidx: 1 });
     gmap.put(k, @int_cast(u32, gsyms.len));
     return @int_cast(u32, gsyms.len - 1);
 }
@@ -761,7 +764,8 @@ const START_SIZE: u64 = 64;
 fn write_start(b: []mut u8, start: u64, main_addr: u64, lsm_got: u64) void {
     let fo = file_of(start);
     if is_x64() {
-        let code = "\x31\xed\x49\x89\xd1\x5e\x48\x89\xe2\x48\x83\xe4\xf0\x50\x54\x45\x31\xc0\x31\xc9\x48\x8d\x3d\x00\x00\x00\x00\xff\x15\x00\x00\x00\x00\xf4";
+        let code =
+            "\x31\xed\x49\x89\xd1\x5e\x48\x89\xe2\x48\x83\xe4\xf0\x50\x54\x45\x31\xc0\x31\xc9\x48\x8d\x3d\x00\x00\x00\x00\xff\x15\x00\x00\x00\x00\xf4";
         for i in 0..code.len {
             b[@truncate(usize, fo) + i] = code[i];
         }
@@ -1036,7 +1040,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     for i in 0..ds.len {
         b[@truncate(usize, dynstr_off) + i] = ds[i];
     }
-    w32(b, hash_off, 1);       // nbucket
+    w32(b, hash_off, 1);          // nbucket
     w32(b, hash_off + 4, nsyms);  // nchain (the buckets and chains stay empty)
     // .gnu.version, .gnu.version_r
     for i in 0..dyn_syms.len {
@@ -1099,8 +1103,8 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         dy.u64_(needed.get(i));
     }
     let tags: [9]u64 = [4, 5, 6, 10, 11, 7, 8, 9, 30];
-    let vals: [9]u64 = [BASE + hash_off, BASE + dynstr_off, BASE + dynsym_off, @as(u64, ds.len), 24,
-                        BASE + rela_off, @as(u64, rels.len) * 24, 24, 8];  // DF_BIND_NOW
+    let vals: [9]u64 = [BASE + hash_off, BASE + dynstr_off, BASE + dynsym_off, @as(u64, ds.len), 24, BASE + rela_off,
+                        @as(u64, rels.len) * 24, 24, 8];  // DF_BIND_NOW
     for i in @as(usize, 0)..9 {
         dy.u64_(tags[i]);
         dy.u64_(vals[i]);
@@ -1150,7 +1154,8 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     }
     phdr(&mut h, 2, 6, dfo, dyn_addr, n_dyn * 16, n_dyn * 16, 8);  // PT_DYNAMIC
     if has_tls {
-        phdr(&mut h, 7, 4, segs[2].off + (tls_addr - segs[2].vaddr), tls_addr, tdata_end - tls_addr, tls_memsz, tls_align);
+        phdr(&mut h, 7, 4, segs[2].off + (tls_addr - segs[2].vaddr), tls_addr, tdata_end - tls_addr, tls_memsz,
+             tls_align);
     }
     phdr(&mut h, 0x6474_e551, 6, 0, 0, 0, 0, 16);  // PT_GNU_STACK
     let hv = h.view();
@@ -1163,7 +1168,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     // a symbol table (for debuggers and profilers), with section headers
     // over the segments for its symbols to refer to
     let mut st = bn.new_bytes();
-    let mut stl = bn.new_bytes();   // the local symbols, then the others
+    let mut stl = bn.new_bytes();  // the local symbols, then the others
     let mut stg = bn.new_bytes();
     let mut str = bn.new_bytes();
     str.u8_(0);

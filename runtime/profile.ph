@@ -15,8 +15,8 @@
 //
 // where each <site> is <file id>\x1f<start>\x1f<end>\x1f<function>.
 // =============================================================================
-import "trap_format.ph" as tf;
 import "native.ph" as rt;
+import "trap_format.ph" as tf;
 
 extern "C" {
     fn getenv(name: *u8) *u8;
@@ -46,7 +46,7 @@ struct ITimerSpec {
 }
 
 struct Entry {
-    at: usize,     // offset of the sample in buf
+    at: usize,  // offset of the sample in buf
     count: u64,
 }
 
