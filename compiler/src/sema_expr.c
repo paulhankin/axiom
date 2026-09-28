@@ -1314,7 +1314,10 @@ static Type *check_array_lit(Expr *e, Type *expected) {
     Type *elem = x && x->kind == TY_ARRAY ? x->elem : NULL;
     if (e->kind == E_ARRAY_REPEAT) {
         check_expr_to(&e->b, t_usize);
-        if (!e->b->is_const && e->b->type->kind != TY_INVALID) {
+        // a const generic parameter gives an array of that (symbolic) length
+        Type *lenp = e->b->kind == E_IDENT && e->b->tval && e->b->tval->kind == TY_PARAM && e->b->tval->is_const
+                         ? e->b->tval : NULL;
+        if (!lenp && !e->b->is_const && e->b->type->kind != TY_INVALID) {
             diag_error(e->b->span, "E0350", "array repeat count must be a constant");
             return e->type = t_invalid;
         }
@@ -1327,6 +1330,7 @@ static Type *check_array_lit(Expr *e, Type *expected) {
                 return e->type = t_invalid;
             }
         }
+        if (lenp) return e->type = type_array_param(elem, lenp);
         Type *t = type_array(elem, n);
         if (x && x->kind == TY_ARRAY && !x->len_param && x->len != n && x->elem->kind != TY_INVALID)
             type_mismatch(e, x, t);

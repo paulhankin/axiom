@@ -103,4 +103,26 @@ export fn run() void {
     // expect: 3
     // expect: 1
     // expect: -1
+    repeat_demo();
+}
+
+// A const generic parameter as an array repeat count.
+fn zeros[const N: usize]() [N]u32 {
+    return [0; N];
+}
+
+fn sum_zeros_plus[const N: usize](k: u32) u32 {
+    let mut a: [N]u32 = [k; N];
+    a[0] = 1;
+    let mut s: u32 = 0;
+    for x in a {
+        s += x;
+    }
+    return s;
+}
+
+fn repeat_demo() void {
+    let z = zeros.[5]();
+    io.int(@int_cast(i64, z.len));            // expect: 5
+    io.int(@as(i64, sum_zeros_plus.[4](3)));  // expect: 10
 }

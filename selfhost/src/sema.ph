@@ -2622,7 +2622,12 @@ fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if e.kind == ast.E_ARRAY_REPEAT {
         _ = check_expr_to(&mut e.b, ty.t_usize);
-        if not e.b.is_const and (e.b.ty.kind != ast.TY_INVALID) {
+        // a const generic parameter gives an array of that (symbolic) length
+        let mut lenp = tnil();
+        if (e.b.kind == ast.E_IDENT) and u.notnil(e.b.tval) and (e.b.tval.kind == ast.TY_PARAM) and e.b.tval.is_const {
+            lenp = e.b.tval;
+        }
+        if u.isnil(lenp) and not e.b.is_const and (e.b.ty.kind != ast.TY_INVALID) {
             _ = dg.err(e.b.span, "E0350", "array repeat count must be a constant");
             e.ty = ty.t_invalid;
             return e.ty;
@@ -2637,6 +2642,10 @@ fn check_array_lit(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                 e.ty = ty.t_invalid;
                 return e.ty;
             }
+        }
+        if u.notnil(lenp) {
+            e.ty = ty.type_array_param(elem, lenp);
+            return e.ty;
         }
         let t = ty.type_array(elem, n);
         if u.notnil(x) and (x.kind == ast.TY_ARRAY) and u.isnil(x.len_param) and (x.len != n) and
