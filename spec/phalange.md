@@ -1676,8 +1676,8 @@ a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 ### 15.2 Other modules and the host ABI
 
 The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `str`, `fmt`,
-`time`, `thread`, `sync`, `net`, `http`, `tls`, `json`, `regex`, `bigint`, `base64`,
-and the `crypto/` modules) is ordinary Phalange
+`time`, `thread`, `sync`, `net`, `http`, `tls`, `json`, `regex`, `bigint`, `deflate`,
+`base64`, and the `crypto/` modules) is ordinary Phalange
 code; see
 `std/README.md`. It adds no language rules. Operating-system
 services are reached through host functions imported from module `"phalange"` (the

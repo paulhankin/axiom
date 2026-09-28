@@ -1,0 +1,1707 @@
+// =============================================================================
+// std/deflate.ph - DEFLATE compression (RFC 1951) in the raw, zlib (RFC 1950)
+// and gzip (RFC 1952) formats.
+//
+//     let packed = deflate.compress(data, deflate.GZIP, deflate.DEFAULT_LEVEL)!;
+//     defer mem.free(packed);
+//     let back = deflate.decompress(packed, deflate.GZIP, 1 << 30)!;  // at most 1 GiB
+//     defer mem.free(back);
+//
+// or, streaming:
+//
+//     let z = deflate.Compressor.init(file.writer(), deflate.ZLIB, 6)!;
+//     defer z.deinit();
+//     z.write_all(chunk)!;        // as often as needed; z.writer() is an io.Writer
+//     z.finish()!;                // the last block and the checksum
+//
+//     let d = deflate.Decompressor.init(file.reader(), deflate.GZIP)!;
+//     defer d.deinit();
+//     let n = d.read(buf[..])!;   // 0 at the end; d.reader() is an io.Reader
+//
+// Levels run from 0 (stored, no compression) through 1 (fastest) to 9
+// (smallest), as in zlib; the output is close to zlib's in size. Checksums
+// are verified when decompressing, and a gzip stream may hold several
+// members, which decompress as one. A Decompressor reads its input in
+// chunks, so it may consume bytes past the end of the compressed data.
+// =============================================================================
+
+import "io.ph" as io;
+import "mem.ph" as mem;
+import "str.ph" as strs;
+
+error { CorruptData, ChecksumMismatch, Truncated, TooLarge, OutOfMemory }
+
+/// Formats: bare DEFLATE data, or wrapped with a zlib or gzip header and
+/// checksum.
+pub const RAW: u8 = 0;
+pub const ZLIB: u8 = 1;
+pub const GZIP: u8 = 2;
+
+pub const DEFAULT_LEVEL: u32 = 6;
+pub const BEST_SPEED: u32 = 1;
+pub const BEST_COMPRESSION: u32 = 9;
+
+const WSIZE: usize = 32768;  // the window: how far back a match may reach
+const WMASK: usize = 32767;
+const MIN_MATCH: usize = 3;
+const MAX_MATCH: usize = 258;
+
+// Lengths 3..258 are symbols 257..285 plus extra bits; distances 1..32768
+// are symbols 0..29 plus extra bits.
+let LEN_BASE: [29]u16 = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+                         163, 195, 227, 258];
+let LEN_EXTRA: [29]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+let DIST_BASE: [30]u16 = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+                          2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+let DIST_EXTRA: [30]u8 = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+                          13];
+// the order in which code length code lengths are sent
+let CL_ORDER: [19]u8 = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+// -----------------------------------------------------------------------------
+// Checksums
+// -----------------------------------------------------------------------------
+
+let mut CRC_TABLE: [2048]u32 = [0; 2048];  // slicing by 8: eight tables of 256
+let mut CRC_READY: u32 = 0;
+
+fn crc_table() *[2048]u32 {
+    if @atomic_load(&CRC_READY) == 0 {
+        for n in @as(usize, 0)..256 {
+            let mut c = @as(u32, @truncate(u8, n));
+            for k in @as(usize, 0)..8 {
+                if (c & 1) != 0 {
+                    c = 0xedb88320 ^ (c >> 1);
+                } else {
+                    c = c >> 1;
+                }
+            }
+            CRC_TABLE[n] = c;
+        }
+        for n in @as(usize, 0)..256 {
+            let mut c = CRC_TABLE[n];
+            for t in @as(usize, 1)..8 {
+                c = CRC_TABLE[@as(usize, c & 0xff)] ^ (c >> 8);
+                CRC_TABLE[(t * 256) + n] = c;
+            }
+        }
+        @atomic_store(&mut CRC_READY, 1);
+    }
+    return &CRC_TABLE;
+}
+
+/// Updates a CRC-32 (as used by gzip, zip and PNG) with data; start from 0.
+pub fn crc32(crc: u32, data: []u8) u32 {
+    let t = crc_table();
+    let mut c = ~crc;
+    let mut i: usize = 0;
+    while (i + 8) <= data.len {
+        let one = c ^ (
+            ((@as(u32, data[i]) | (@as(u32, data[i + 1]) << 8)) | (@as(u32, data[i + 2]) << 16)) | (
+                @as(u32, data[i + 3]) << 24));
+        let two = ((@as(u32, data[i + 4]) | (@as(u32, data[i + 5]) << 8)) | (@as(u32, data[i + 6]) << 16)) | (
+            @as(u32, data[i + 7]) << 24);
+        c = (
+            (t[1792 + @as(usize, one & 0xff)] ^ t[1536 + @as(usize, (one >> 8) & 0xff)]) ^ (
+                t[1280 + @as(usize, (one >> 16) & 0xff)] ^ t[1024 + @as(usize, one >> 24)])) ^ (
+                    (t[768 + @as(usize, two & 0xff)] ^ t[512 + @as(usize, (two >> 8) & 0xff)]) ^ (
+                        t[256 + @as(usize, (two >> 16) & 0xff)] ^ t[@as(usize, two >> 24)]));
+        i += 8;
+    }
+    while i < data.len {
+        c = t[@as(usize, (c ^ @as(u32, data[i])) & 0xff)] ^ (c >> 8);
+        i += 1;
+    }
+    return ~c;
+}
+
+/// Updates an Adler-32 (as used by zlib) with data; start from 1.
+pub fn adler32(adler: u32, data: []u8) u32 {
+    let mut a = adler & 0xffff;
+    let mut b = adler >> 16;
+    let mut rest = data;
+    while rest.len > 0 {
+        let n = @min(rest.len, 5552);  // the most before b can overflow
+        for x in rest[..n] {
+            a += @as(u32, x);
+            b += a;
+        }
+        a = a % 65521;
+        b = b % 65521;
+        rest = rest[n..];
+    }
+    return (b << 16) | a;
+}
+
+fn reverse_bits(code: u32, len: u32) u32 {
+    let mut r: u32 = 0;
+    let mut c = code;
+    for i in 0..len {
+        r = (r << 1) | (c & 1);
+        c = c >> 1;
+    }
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Decompression
+// -----------------------------------------------------------------------------
+
+const FAST_BITS: u64 = 9;
+
+/// A decoding table for a canonical Huffman code.
+struct Huffman {
+    fast: [512]u16,    // by the next FAST_BITS bits: symbol << 4 | length, or 0
+    count: [16]u16,    // the number of codes of each length
+    symbol: [320]u16,  // the symbols ordered by code
+
+    /// Builds the table for code lengths (0 for unused symbols). As in
+    /// zlib, an incomplete code is accepted only if it is empty or a single
+    /// code of length 1.
+    fn build(self: *mut Huffman, lengths: []u8) !void {
+        for i in @as(usize, 0)..16 {
+            self.count[i] = 0;
+        }
+        for l in lengths {
+            self.count[@as(usize, l)] += 1;
+        }
+        let used = @as(usize, lengths.len) - @as(usize, self.count[0]);
+        let mut left: i32 = 1;
+        for len in @as(usize, 1)..16 {
+            left = (left * 2) - @as(i32, self.count[len]);
+            if left < 0 {
+                return error.CorruptData;  // over-subscribed
+            }
+        }
+        if (left > 0) and (used > 0) and not ((used == 1) and (self.count[1] == 1)) {
+            return error.CorruptData;  // incomplete
+        }
+        let mut offs: [16]u16 = [0; 16];
+        for len in @as(usize, 1)..15 {
+            offs[len + 1] = offs[len] + self.count[len];
+        }
+        for sym in 0..lengths.len {
+            let l = @as(usize, lengths[sym]);
+            if l != 0 {
+                self.symbol[@as(usize, offs[l])] = @truncate(u16, sym);
+                offs[l] += 1;
+            }
+        }
+        for i in @as(usize, 0)..512 {
+            self.fast[i] = 0;
+        }
+        let mut code: u32 = 0;
+        let mut idx: usize = 0;
+        for len in @as(usize, 1)..10 {
+            for i in 0..@as(usize, self.count[len]) {
+                let entry = (self.symbol[idx] << 4) | @truncate(u16, len);
+                let mut k = @as(usize, reverse_bits(code, @truncate(u32, len)));
+                while k < 512 {
+                    self.fast[k] = entry;
+                    k += @as(usize, 1) << len;
+                }
+                idx += 1;
+                code += 1;
+            }
+            code = code << 1;
+        }
+    }
+}
+
+const S_HEADER: u8 = 0;   // the zlib or gzip header
+const S_BLOCK: u8 = 1;    // a block header
+const S_STORED: u8 = 2;   // in a stored block
+const S_CODES: u8 = 3;    // in a compressed block
+const S_TRAILER: u8 = 4;  // the zlib or gzip trailer
+const S_END: u8 = 5;
+
+/// Reads compressed data from a Reader and returns it decompressed.
+pub struct Decompressor {
+    input: io.Reader,
+    has_input: bool,  // false: all the input is in src
+    eof: bool,
+    src: []u8,  // input not yet taken into bits
+    pos: usize,
+    bits: u64,  // input bits, least significant first
+    nbits: u64,
+    format: u8,
+    state: u8,
+    last_block: bool,
+    stored_left: usize,
+    copy_len: usize,  // a match still being copied out
+    copy_dist: u64,
+    out_count: u64,  // bytes produced (in this gzip member)
+    check: u32,      // the checksum of those bytes
+    lit: Huffman,
+    dist: Huffman,
+    lens: [320]u8,
+    window: [32768]u8,  // the last 32 KiB produced, at out_count & WMASK
+    inbuf: [16384]u8,
+
+    /// A Decompressor for data in format (RAW, ZLIB or GZIP) read from r.
+    /// Free it with deinit.
+    pub fn init(r: io.Reader, format: u8) !*mut Decompressor {
+        let d = new_decompressor(format)!;
+        d.input = r;
+        d.has_input = true;
+        return d;
+    }
+
+    pub fn deinit(self: *mut Decompressor) void {
+        mem.free(@slice_from_ptr(self, 1));
+    }
+
+    pub fn reader(self: *mut Decompressor) io.Reader {
+        return io.Reader.{ ctx: @ptr_cast(*mut void, self), read_fn: decompressor_read };
+    }
+
+    /// Decompresses into buf; returns the number of bytes, 0 at the end.
+    pub fn read(self: *mut Decompressor, buf: []mut u8) !usize {
+        let mut o: usize = 0;
+        let mut summed: usize = 0;  // buf[summed..o] is not yet in the checksum
+        while (o < buf.len) and (self.state != S_END) {
+            if self.state == S_CODES {
+                o = self.inflate_codes(buf, o)!;
+            } else if self.state == S_STORED {
+                o = self.copy_stored(buf, o)!;
+            } else if self.state == S_BLOCK {
+                self.block_header()!;
+            } else if self.state == S_HEADER {
+                self.read_header()!;
+                self.state = S_BLOCK;
+            } else {
+                self.update_check(buf[summed..o]);
+                summed = o;
+                self.read_trailer()!;
+            }
+        }
+        self.update_check(buf[summed..o]);
+        return o;
+    }
+
+    fn update_check(self: *mut Decompressor, b: []u8) void {
+        if self.format == GZIP {
+            self.check = crc32(self.check, b);
+        } else if self.format == ZLIB {
+            self.check = adler32(self.check, b);
+        }
+    }
+
+    // --- input ---------------------------------------------------------------
+
+    /// Reads more input into src; false at the end of the input.
+    fn more(self: *mut Decompressor) !bool {
+        if (not self.has_input) or self.eof {
+            return false;
+        }
+        let n = self.input.read(self.inbuf[..])!;
+        if n == 0 {
+            self.eof = true;
+            return false;
+        }
+        self.src = self.inbuf[..n];
+        self.pos = 0;
+        return true;
+    }
+
+    /// Takes as much input into bits as fits (less at the end of the input).
+    fn fill(self: *mut Decompressor) !void {
+        loop {
+            while (self.nbits <= 56) and (self.pos < self.src.len) {
+                self.bits = self.bits | (@as(u64, self.src[self.pos]) << self.nbits);
+                self.pos += 1;
+                self.nbits += 8;
+            }
+            if (self.nbits > 56) or not self.more()! {
+                return;
+            }
+        }
+    }
+
+    /// The next n bits (n <= 32).
+    fn take(self: *mut Decompressor, n: u64) !u32 {
+        if self.nbits < n {
+            self.fill()!;
+            if self.nbits < n {
+                return error.Truncated;
+            }
+        }
+        let v = self.bits & ((@as(u64, 1) << n) - 1);
+        self.bits = self.bits >> n;
+        self.nbits -= n;
+        return @truncate(u32, v);
+    }
+
+    fn byte(self: *mut Decompressor) !u8 {
+        return @truncate(u8, self.take(8)!);
+    }
+
+    /// Skips to a byte boundary.
+    fn align(self: *mut Decompressor) void {
+        let r = self.nbits % 8;
+        self.bits = self.bits >> r;
+        self.nbits -= r;
+    }
+
+    /// Whether any input is left (after a byte boundary).
+    fn at_end(self: *mut Decompressor) !bool {
+        if (self.nbits >= 8) or (self.pos < self.src.len) {
+            return false;
+        }
+        return not self.more()!;
+    }
+
+    fn decode(self: *mut Decompressor, h: *Huffman) !u32 {
+        if self.nbits < 15 {
+            self.fill()!;
+        }
+        let e = h.fast[@as(usize, @truncate(u16, self.bits & 511))];
+        if e != 0 {
+            let len = @as(u64, e & 15);
+            if len > self.nbits {
+                return error.Truncated;
+            }
+            self.bits = self.bits >> len;
+            self.nbits -= len;
+            return @as(u32, e >> 4);
+        }
+        // a code longer than FAST_BITS: decode it one bit at a time
+        let mut code: i32 = 0;
+        let mut first: i32 = 0;
+        let mut index: i32 = 0;
+        let mut b = self.bits;
+        for len in @as(usize, 1)..16 {
+            code = code | @as(i32, @truncate(u8, b & 1));
+            b = b >> 1;
+            let count = @as(i32, h.count[len]);
+            if (code - count) < first {
+                if @as(u64, len) > self.nbits {
+                    return error.Truncated;
+                }
+                self.bits = self.bits >> len;
+                self.nbits -= @as(u64, len);
+                return @as(u32, h.symbol[@as(usize, @truncate(u32, index + (code - first)))]);
+            }
+            index += count;
+            first = (first + count) * 2;
+            code = code * 2;
+        }
+        return error.CorruptData;
+    }
+
+    // --- framing -------------------------------------------------------------
+
+    fn read_header(self: *mut Decompressor) !void {
+        self.out_count = 0;
+        if self.format == ZLIB {
+            self.check = 1;
+            let cmf = self.byte()!;
+            let flg = self.byte()!;
+            if ((cmf & 15) != 8) or ((cmf >> 4) > 7) or ((((@as(u32, cmf) << 8) | @as(u32, flg)) % 31) != 0) {
+                return error.CorruptData;
+            }
+            if (flg & 0x20) != 0 {
+                return error.CorruptData;  // a preset dictionary
+            }
+        } else if self.format == GZIP {
+            self.check = 0;
+            if (self.byte()! != 0x1f) or (self.byte()! != 0x8b) or (self.byte()! != 8) {
+                return error.CorruptData;
+            }
+            let flg = self.byte()!;
+            if (flg & 0xe0) != 0 {
+                return error.CorruptData;
+            }
+            for i in @as(usize, 0)..6 {
+                _ = self.byte()!;  // time, extra flags, operating system
+            }
+            if (flg & 4) != 0 {
+                let xlen = self.take(16)!;
+                for i in 0..xlen {
+                    _ = self.byte()!;
+                }
+            }
+            if (flg & 8) != 0 {
+                while self.byte()! != 0 {}  // the file name
+            }
+            if (flg & 16) != 0 {
+                while self.byte()! != 0 {}  // a comment
+            }
+            if (flg & 2) != 0 {
+                _ = self.take(16)!;  // a header CRC
+            }
+        }
+    }
+
+    fn read_trailer(self: *mut Decompressor) !void {
+        self.align();
+        if self.format == ZLIB {
+            let mut v: u32 = 0;
+            for i in @as(usize, 0)..4 {
+                v = (v << 8) | @as(u32, self.byte()!);
+            }
+            if v != self.check {
+                return error.ChecksumMismatch;
+            }
+        } else if self.format == GZIP {
+            let crc = self.take(32)!;
+            let size = self.take(32)!;
+            if (crc != self.check) or (size != @truncate(u32, self.out_count)) {
+                return error.ChecksumMismatch;
+            }
+            if not self.at_end()! {
+                self.state = S_HEADER;  // another member
+                return;
+            }
+        }
+        self.state = S_END;
+    }
+
+    // --- blocks --------------------------------------------------------------
+
+    fn block_header(self: *mut Decompressor) !void {
+        let h = self.take(3)!;
+        self.last_block = (h & 1) != 0;
+        let kind = h >> 1;
+        if kind == 0 {
+            self.align();
+            let len = self.take(16)!;
+            let nlen = self.take(16)!;
+            if (len ^ nlen) != 0xffff {
+                return error.CorruptData;
+            }
+            self.stored_left = @as(usize, len);
+            self.state = S_STORED;
+        } else if kind == 1 {
+            for i in @as(usize, 0)..288 {
+                self.lens[i] = 8;
+                if (i >= 144) and (i < 256) {
+                    self.lens[i] = 9;
+                } else if (i >= 256) and (i < 280) {
+                    self.lens[i] = 7;
+                }
+            }
+            self.lit.build(self.lens[..288])!;
+            for i in @as(usize, 0)..32 {
+                self.lens[i] = 5;
+            }
+            self.dist.build(self.lens[..32])!;
+            self.state = S_CODES;
+        } else if kind == 2 {
+            self.read_tables()!;
+            self.state = S_CODES;
+        } else {
+            return error.CorruptData;
+        }
+    }
+
+    fn end_of_block(self: *mut Decompressor) void {
+        if self.last_block {
+            self.state = S_TRAILER;
+        } else {
+            self.state = S_BLOCK;
+        }
+    }
+
+    /// The code lengths of a dynamic block.
+    fn read_tables(self: *mut Decompressor) !void {
+        let nlit = @as(usize, self.take(5)!) + 257;
+        let ndist = @as(usize, self.take(5)!) + 1;
+        let ncode = @as(usize, self.take(4)!) + 4;
+        if (nlit > 286) or (ndist > 30) {
+            return error.CorruptData;
+        }
+        let mut cl: [19]u8 = [0; 19];
+        for i in 0..ncode {
+            cl[@as(usize, CL_ORDER[i])] = @truncate(u8, self.take(3)!);
+        }
+        self.lit.build(cl[..])!;
+        let total = nlit + ndist;
+        let mut i: usize = 0;
+        while i < total {
+            let sym = self.decode(&self.lit)!;
+            if sym < 16 {
+                self.lens[i] = @truncate(u8, sym);
+                i += 1;
+                continue;
+            }
+            let mut v: u8 = 0;
+            let mut rep: usize = 0;
+            if sym == 16 {
+                if i == 0 {
+                    return error.CorruptData;
+                }
+                v = self.lens[i - 1];
+                rep = 3 + @as(usize, self.take(2)!);
+            } else if sym == 17 {
+                rep = 3 + @as(usize, self.take(3)!);
+            } else {
+                rep = 11 + @as(usize, self.take(7)!);
+            }
+            if (i + rep) > total {
+                return error.CorruptData;
+            }
+            for k in 0..rep {
+                self.lens[i + k] = v;
+            }
+            i += rep;
+        }
+        if self.lens[256] == 0 {
+            return error.CorruptData;  // no end-of-block code
+        }
+        self.lit.build(self.lens[..nlit])!;
+        self.dist.build(self.lens[nlit..total])!;
+    }
+
+    fn copy_stored(self: *mut Decompressor, buf: []mut u8, start: usize) !usize {
+        let mut o = start;
+        if self.stored_left == 0 {
+            self.end_of_block();
+            return o;
+        }
+        // whole bytes still held as bits first
+        while (self.nbits >= 8) and (self.stored_left > 0) and (o < buf.len) {
+            let b = @truncate(u8, self.bits);
+            self.bits = self.bits >> 8;
+            self.nbits -= 8;
+            buf[o] = b;
+            self.window[@as(usize, @truncate(u16, self.out_count)) & WMASK] = b;
+            self.out_count += 1;
+            o += 1;
+            self.stored_left -= 1;
+        }
+        if (self.stored_left == 0) or (o == buf.len) {
+            return o;
+        }
+        if self.pos == self.src.len {
+            if not self.more()! {
+                return error.Truncated;
+            }
+        }
+        let n = @min(@min(self.stored_left, buf.len - o), self.src.len - self.pos);
+        let chunk = self.src[self.pos..self.pos + n];
+        @mem_copy(buf[o..o + n], chunk);
+        for b in chunk {
+            self.window[@as(usize, @truncate(u16, self.out_count)) & WMASK] = b;
+            self.out_count += 1;
+        }
+        self.pos += n;
+        self.stored_left -= n;
+        return o + n;
+    }
+
+    fn inflate_codes(self: *mut Decompressor, buf: []mut u8, start: usize) !usize {
+        let mut o = start;
+        let win = self.window[..];
+        let mut count = self.out_count;
+        while o < buf.len {
+            if self.copy_len > 0 {
+                let n = @min(self.copy_len, buf.len - o);
+                let d = self.copy_dist;
+                for k in 0..n {
+                    let b = win[@as(usize, @truncate(u16, count -% d)) & WMASK];
+                    buf[o + k] = b;
+                    win[@as(usize, @truncate(u16, count)) & WMASK] = b;
+                    count += 1;
+                }
+                o += n;
+                self.copy_len -= n;
+                continue;
+            }
+            if self.nbits < 48 {
+                self.fill()!;
+            }
+            let sym = self.decode(&self.lit) catch |e| {
+                self.out_count = count;
+                return e;
+            };
+            if sym < 256 {
+                let b = @truncate(u8, sym);
+                buf[o] = b;
+                win[@as(usize, @truncate(u16, count)) & WMASK] = b;
+                count += 1;
+                o += 1;
+                continue;
+            }
+            if sym == 256 {
+                self.end_of_block();
+                break;
+            }
+            let li = @as(usize, sym - 257);
+            if li >= 29 {
+                self.out_count = count;
+                return error.CorruptData;
+            }
+            let len = @as(usize, LEN_BASE[li]) + @as(usize, self.take(@as(u64, LEN_EXTRA[li]))!);
+            let ds = @as(usize, self.decode(&self.dist)!);
+            if ds >= 30 {
+                self.out_count = count;
+                return error.CorruptData;
+            }
+            let dist = @as(u64, DIST_BASE[ds]) + @as(u64, self.take(@as(u64, DIST_EXTRA[ds]))!);
+            if dist > count {
+                self.out_count = count;
+                return error.CorruptData;  // before the start of the data
+            }
+            self.copy_len = len;
+            self.copy_dist = dist;
+        }
+        self.out_count = count;
+        return o;
+    }
+}
+
+fn decompressor_read(ctx: *mut void, buf: []mut u8) !usize {
+    let d = @ptr_cast(*mut Decompressor, ctx);
+    return d.read(buf);
+}
+
+fn new_decompressor(format: u8) !*mut Decompressor {
+    let m = mem.alloc.[Decompressor](1)!;
+    @mem_set(@cast_slice(u8, m), 0);
+    let d = &mut m[0];
+    d.src = d.inbuf[..0];
+    d.format = format;
+    d.state = S_HEADER;
+    if format == RAW {
+        d.state = S_BLOCK;
+    }
+    return d;
+}
+
+/// Decompresses data in format into new memory (free it with mem.free).
+/// Fails with TooLarge if the result would be over max_size bytes.
+pub fn decompress(data: []u8, format: u8, max_size: usize) ![]mut u8 {
+    let d = new_decompressor(format)!;
+    defer d.deinit();
+    d.src = data;
+    let mut out = strs.String.init();
+    loop {
+        if out.len == out.capacity() {
+            out.reserve(@max(@min(data.len * 4, 1 << 20), out.len)) catch |e| {
+                out.deinit();
+                return e;
+            };
+        }
+        let n = d.read(out.buf[out.len..]) catch |e| {
+            out.deinit();
+            return e;
+        };
+        if n == 0 {
+            break;
+        }
+        out.len += n;
+        if out.len > max_size {
+            out.deinit();
+            return error.TooLarge;
+        }
+    }
+    return out.take();
+}
+
+// -----------------------------------------------------------------------------
+// Compression
+// -----------------------------------------------------------------------------
+
+const WIN_SIZE: usize = 65536;     // two windows: slides by WSIZE when full
+const MIN_LOOKAHEAD: usize = 262;  // MAX_MATCH + MIN_MATCH + 1
+const HASH_BITS: u32 = 15;
+const HASH_SIZE: usize = 32768;
+const NUM_TOKENS: usize = 16384;  // symbols per block
+const TOO_FAR: usize = 4096;      // a 3-byte match this far back isn't worth it
+
+// Symbol lookup for encoding: LEN_CODE[len - 3] and DIST_CODE (see dist_code).
+let mut LEN_CODE: [256]u8 = [0; 256];
+let mut DIST_CODE: [512]u8 = [0; 512];
+let mut CODES_READY: u32 = 0;
+
+fn init_codes() void {
+    if @atomic_load(&CODES_READY) != 0 {
+        return;
+    }
+    for c in @as(usize, 0)..29 {
+        let base = @as(usize, LEN_BASE[c]) - 3;
+        for k in 0..(@as(usize, 1) << LEN_EXTRA[c]) {
+            if (base + k) < 256 {
+                LEN_CODE[base + k] = @truncate(u8, c);
+            }
+        }
+    }
+    LEN_CODE[255] = 28;  // 258 has a symbol of its own
+    for c in @as(usize, 0)..30 {
+        let base = @as(usize, DIST_BASE[c]) - 1;
+        for k in 0..(@as(usize, 1) << DIST_EXTRA[c]) {
+            let d = base + k;
+            if d < 256 {
+                DIST_CODE[d] = @truncate(u8, c);
+            } else {
+                DIST_CODE[256 + (d >> 7)] = @truncate(u8, c);
+            }
+        }
+    }
+    @atomic_store(&mut CODES_READY, 1);
+}
+
+/// The symbol for distance d + 1.
+fn dist_code(d: usize) usize {
+    if d < 256 {
+        return @as(usize, DIST_CODE[d]);
+    }
+    return @as(usize, DIST_CODE[256 + (d >> 7)]);
+}
+
+/// Code lengths of at most max_bits for the frequencies (0 for unused
+/// symbols). There are always at least two codes, as some decoders need.
+fn build_lengths(freq: []u32, lens: []mut u8, max_bits: u32) void {
+    let n = freq.len;
+    let mut f: [286]u32 = [0; 286];
+    let mut syms: [286]u16 = [0; 286];
+    let mut used: usize = 0;
+    for i in 0..n {
+        f[i] = freq[i];
+        lens[i] = 0;
+        if f[i] != 0 {
+            used += 1;
+        }
+    }
+    if used < 2 {
+        // one or no symbols: give the first two that are used, or symbols 0
+        // and 1, codes of one bit
+        let mut given: usize = 0;
+        for i in 0..n {
+            if f[i] != 0 {
+                lens[i] = 1;
+                given += 1;
+            }
+        }
+        let mut i: usize = 0;
+        while given < 2 {
+            if lens[i] == 0 {
+                lens[i] = 1;
+                given += 1;
+            }
+            i += 1;
+        }
+        return;
+    }
+    let mut weight: [572]u32 = [0; 572];
+    let mut parent: [572]u16 = [0; 572];
+    let mut depth: [572]u8 = [0; 572];
+    loop {
+        // the leaves, by increasing frequency
+        let mut m: usize = 0;
+        for i in 0..n {
+            if f[i] != 0 {
+                let mut j = m;
+                while (j > 0) and (f[@as(usize, syms[j - 1])] > f[i]) {
+                    syms[j] = syms[j - 1];
+                    j -= 1;
+                }
+                syms[j] = @truncate(u16, i);
+                m += 1;
+            }
+        }
+        for i in 0..m {
+            weight[i] = f[@as(usize, syms[i])];
+        }
+        // two queues: the leaves and the internal nodes, made in order
+        let mut li: usize = 0;
+        let mut ni = m;
+        let mut next = m;
+        while next < ((2 * m) - 1) {
+            let mut pick: [2]usize = [0; 2];
+            for k in @as(usize, 0)..2 {
+                if (li < m) and ((ni >= next) or (weight[li] <= weight[ni])) {
+                    pick[k] = li;
+                    li += 1;
+                } else {
+                    pick[k] = ni;
+                    ni += 1;
+                }
+            }
+            weight[next] = weight[pick[0]] + weight[pick[1]];
+            parent[pick[0]] = @truncate(u16, next);
+            parent[pick[1]] = @truncate(u16, next);
+            next += 1;
+        }
+        let root = (2 * m) - 2;
+        depth[root] = 0;
+        let mut deepest: u8 = 0;
+        let mut x = root;
+        while x > 0 {
+            x -= 1;
+            depth[x] = depth[@as(usize, parent[x])] + 1;
+            if (x < m) and (depth[x] > deepest) {
+                deepest = depth[x];
+            }
+        }
+        if @as(u32, deepest) <= max_bits {
+            for i in 0..m {
+                lens[@as(usize, syms[i])] = depth[i];
+            }
+            return;
+        }
+        // too deep: flatten the frequencies and try again
+        for i in 0..n {
+            if f[i] != 0 {
+                f[i] = (f[i] >> 1) | 1;
+            }
+        }
+    }
+}
+
+/// The canonical codes (bit-reversed, to send least significant bit first)
+/// for code lengths.
+fn build_codes(lens: []u8, codes: []mut u16) void {
+    let mut count: [16]u32 = [0; 16];
+    for l in lens {
+        count[@as(usize, l)] += 1;
+    }
+    count[0] = 0;
+    let mut next: [16]u32 = [0; 16];
+    let mut code: u32 = 0;
+    for len in @as(usize, 1)..16 {
+        code = (code + count[len - 1]) << 1;
+        next[len] = code;
+    }
+    for i in 0..lens.len {
+        let l = @as(usize, lens[i]);
+        if l != 0 {
+            codes[i] = @truncate(u16, reverse_bits(next[l], @truncate(u32, l)));
+            next[l] += 1;
+        }
+    }
+}
+
+struct Level {
+    good: usize,   // a match this long cuts the search for a better one to 1/4
+    lazy: usize,   // (lazy) don't look for a better match than this; (greedy) insert matches up to this
+    nice: usize,   // stop searching at a match this long
+    chain: usize,  // the most candidates to try
+    greedy: bool,
+}
+
+let LEVELS: [10]Level = [
+    Level.{ good: 0, lazy: 0, nice: 0, chain: 0, greedy: true },
+    Level.{ good: 4, lazy: 4, nice: 8, chain: 4, greedy: true },
+    Level.{ good: 4, lazy: 5, nice: 16, chain: 8, greedy: true },
+    Level.{ good: 4, lazy: 6, nice: 32, chain: 32, greedy: true },
+    Level.{ good: 4, lazy: 4, nice: 16, chain: 16, greedy: false },
+    Level.{ good: 8, lazy: 16, nice: 32, chain: 32, greedy: false },
+    Level.{ good: 8, lazy: 16, nice: 128, chain: 128, greedy: false },
+    Level.{ good: 8, lazy: 32, nice: 128, chain: 256, greedy: false },
+    Level.{ good: 32, lazy: 128, nice: 258, chain: 1024, greedy: false },
+    Level.{ good: 32, lazy: 258, nice: 258, chain: 4096, greedy: false },
+];
+
+/// Compresses what is written to it and writes the result to an io.Writer.
+pub struct Compressor {
+    out: io.Writer,
+    format: u8,
+    level: u32,
+    params: Level,
+    started: bool,  // the header was written
+    finished: bool,
+    check: u32,
+    in_count: u64,
+    // the input: window[..end], of which window[..pos] has been matched
+    end: usize,
+    pos: usize,
+    block_start: usize,  // the input the next block starts at
+    // the lazy matcher's state
+    match_len: usize,  // the match found at pos - 1 (if >= 3)
+    match_dist: usize,
+    pending: bool,  // window[pos - 1] is not yet matched or emitted
+    // the symbols of the current block
+    ntokens: usize,
+    lit_freq: [286]u32,
+    dist_freq: [30]u32,
+    // output bits, least significant first, and bytes
+    bits: u64,
+    nbits: u64,
+    olen: usize,
+    // codes for the current block
+    lit_len: [286]u8,
+    lit_code: [286]u16,
+    dist_len: [30]u8,
+    dist_code: [30]u16,
+    fixed_lit_len: [286]u8,
+    fixed_lit_code: [286]u16,
+    fixed_dist_len: [30]u8,
+    fixed_dist_code: [30]u16,
+    head: [32768]i32,    // by hash: the latest position with it, or -1
+    prev: [32768]i32,    // by position & WMASK: the previous one with its hash
+    tokens: [16384]u32,  // a literal byte, or 1 << 31 | (len - 3) << 16 | (dist - 1)
+    obuf: [16384]u8,
+    window: [65536]u8,
+
+    /// A Compressor writing format (RAW, ZLIB or GZIP) at level (0 to 9)
+    /// to w. Call finish at the end, then deinit.
+    pub fn init(w: io.Writer, format: u8, level: u32) !*mut Compressor {
+        init_codes();
+        let m = mem.alloc.[Compressor](1)!;
+        @mem_set(@cast_slice(u8, m), 0);
+        let c = &mut m[0];
+        c.out = w;
+        c.format = format;
+        c.level = @min(level, 9);
+        c.params = LEVELS[@as(usize, c.level)];
+        if format == ZLIB {
+            c.check = 1;
+        }
+        for i in 0..HASH_SIZE {
+            c.head[i] = -1;
+        }
+        for i in @as(usize, 0)..286 {
+            c.fixed_lit_len[i] = 8;
+            if (i >= 144) and (i < 256) {
+                c.fixed_lit_len[i] = 9;
+            } else if (i >= 256) and (i < 280) {
+                c.fixed_lit_len[i] = 7;
+            }
+        }
+        // (symbols 286 and 287 are never sent, but share the fixed code)
+        let mut fl: [288]u8 = [0; 288];
+        @mem_copy(fl[..286], c.fixed_lit_len[..]);
+        fl[286] = 8;
+        fl[287] = 8;
+        let mut fc: [288]u16 = [0; 288];
+        build_codes(fl[..], fc[..]);
+        @mem_copy(c.fixed_lit_code[..], fc[..286]);
+        for i in @as(usize, 0)..30 {
+            c.fixed_dist_len[i] = 5;
+            c.fixed_dist_code[i] = @truncate(u16, reverse_bits(@truncate(u32, i), 5));
+        }
+        return c;
+    }
+
+    pub fn deinit(self: *mut Compressor) void {
+        mem.free(@slice_from_ptr(self, 1));
+    }
+
+    pub fn writer(self: *mut Compressor) io.Writer {
+        return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: compressor_write };
+    }
+
+    /// Compresses bytes (all of them).
+    pub fn write(self: *mut Compressor, bytes: []u8) !usize {
+        self.write_all(bytes)!;
+        return bytes.len;
+    }
+
+    pub fn write_all(self: *mut Compressor, bytes: []u8) !void {
+        if not self.started {
+            self.write_header()!;
+        }
+        if self.format == GZIP {
+            self.check = crc32(self.check, bytes);
+        } else if self.format == ZLIB {
+            self.check = adler32(self.check, bytes);
+        }
+        self.in_count += @as(u64, bytes.len);
+        let mut rest = bytes;
+        while rest.len > 0 {
+            if self.end == WIN_SIZE {
+                self.process(false)!;
+                self.slide()!;
+            }
+            let n = @min(rest.len, WIN_SIZE - self.end);
+            @mem_copy(self.window[self.end..self.end + n], rest[..n]);
+            self.end += n;
+            rest = rest[n..];
+        }
+    }
+
+    /// Writes out everything so far, so that it can all be decompressed
+    /// before any more is written (a "sync flush": it costs a few bytes).
+    pub fn flush(self: *mut Compressor) !void {
+        if not self.started {
+            self.write_header()!;
+        }
+        self.process(true)!;
+        self.emit_block(false)!;
+        self.write_stored(self.window[..0], false)!;
+        self.flush_bytes()!;
+    }
+
+    /// Writes the last block and the trailer. Nothing may be written after.
+    pub fn finish(self: *mut Compressor) !void {
+        if self.finished {
+            return;
+        }
+        if not self.started {
+            self.write_header()!;
+        }
+        self.process(true)!;
+        self.emit_block(true)!;
+        self.align_bits();
+        if self.format == ZLIB {
+            for i in @as(usize, 0)..4 {
+                self.put_bits((self.check >> @truncate(u32, 24 - (i * 8))) & 0xff, 8);
+            }
+        } else if self.format == GZIP {
+            self.put_bits(self.check & 0xffff, 16);
+            self.put_bits(self.check >> 16, 16);
+            let size = @truncate(u32, self.in_count);
+            self.put_bits(size & 0xffff, 16);
+            self.put_bits(size >> 16, 16);
+        }
+        self.flush_bytes()!;
+        self.finished = true;
+    }
+
+    fn write_header(self: *mut Compressor) !void {
+        self.started = true;
+        if self.format == ZLIB {
+            let mut flevel: u32 = 2;
+            if self.level < 2 {
+                flevel = 0;
+            } else if self.level < 6 {
+                flevel = 1;
+            } else if self.level > 6 {
+                flevel = 3;
+            }
+            let mut flg = flevel << 6;
+            flg += 31 - (((0x78 << 8) | flg) % 31);
+            self.put_bits(0x78, 8);
+            self.put_bits(flg, 8);
+        } else if self.format == GZIP {
+            let mut xfl: u32 = 0;
+            if self.level == 9 {
+                xfl = 2;
+            } else if self.level == 1 {
+                xfl = 4;
+            }
+            self.put_bits(0x8b1f, 16);
+            self.put_bits(8, 8);   // deflate
+            self.put_bits(0, 8);   // flags
+            self.put_bits(0, 16);  // no time
+            self.put_bits(0, 16);
+            self.put_bits(xfl, 8);
+            self.put_bits(255, 8);  // unknown operating system
+        }
+    }
+
+    // --- output bits ---------------------------------------------------------
+
+    /// Appends the low n bits of v (n <= 16).
+    fn put_bits(self: *mut Compressor, v: u32, n: u64) void {
+        self.bits = self.bits | (@as(u64, v) << self.nbits);
+        self.nbits += n;
+        if self.nbits >= 32 {
+            let o = self.olen;
+            self.obuf[o] = @truncate(u8, self.bits);
+            self.obuf[o + 1] = @truncate(u8, self.bits >> 8);
+            self.obuf[o + 2] = @truncate(u8, self.bits >> 16);
+            self.obuf[o + 3] = @truncate(u8, self.bits >> 24);
+            self.olen = o + 4;
+            self.bits = self.bits >> 32;
+            self.nbits -= 32;
+        }
+    }
+
+    /// Pads the bits to a byte boundary and moves them to obuf.
+    fn align_bits(self: *mut Compressor) void {
+        let pad = (8 - (self.nbits % 8)) % 8;
+        self.nbits += pad;
+        while self.nbits > 0 {
+            self.obuf[self.olen] = @truncate(u8, self.bits);
+            self.olen += 1;
+            self.bits = self.bits >> 8;
+            self.nbits -= 8;
+        }
+    }
+
+    /// Writes obuf out when it is nearly full (room is left for a block
+    /// header, some 600 bytes at most).
+    fn spill(self: *mut Compressor) !void {
+        if self.olen > (self.obuf.len - 1024) {
+            self.out.write_all(self.obuf[..self.olen])!;
+            self.olen = 0;
+        }
+    }
+
+    /// Writes out all whole bytes.
+    fn flush_bytes(self: *mut Compressor) !void {
+        while self.nbits >= 8 {
+            self.obuf[self.olen] = @truncate(u8, self.bits);
+            self.olen += 1;
+            self.bits = self.bits >> 8;
+            self.nbits -= 8;
+        }
+        if self.olen > 0 {
+            self.out.write_all(self.obuf[..self.olen])!;
+            self.olen = 0;
+        }
+    }
+
+    // --- matching ------------------------------------------------------------
+
+    /// Adds position p to the hash chains; returns the previous position
+    /// with the same hash (or -1).
+    fn insert(self: *mut Compressor, p: usize) i32 {
+        let w = self.window[..];
+        let v = ((@as(u32, w[p]) << 16) | (@as(u32, w[p + 1]) << 8)) | @as(u32, w[p + 2]);
+        let h = @as(usize, (v *% 2654435761) >> (32 - HASH_BITS));
+        let old = self.head[h];
+        self.prev[p & WMASK] = old;
+        self.head[h] = @truncate(i32, @truncate(i64, p));
+        return old;
+    }
+
+    /// The longest match for pos, starting from candidate cand, if longer
+    /// than best; its length is 0 otherwise.
+    fn longest_match(self: *mut Compressor, pos: usize, cand: i32, best_so_far: usize) Match {
+        let w = self.window[..];
+        let max_len = @min(MAX_MATCH, self.end - pos);
+        let mut found = Match.{ len: 0, dist: 0 };
+        if max_len < MIN_MATCH {
+            return found;
+        }
+        let mut best = @max(best_so_far, MIN_MATCH - 1);
+        if best >= max_len {
+            return found;
+        }
+        let mut chain = self.params.chain;
+        if best_so_far >= self.params.good {
+            chain = chain >> 2;
+        }
+        let nice = @min(self.params.nice, max_len);
+        let mut limit: usize = 0;
+        if pos > WSIZE {
+            limit = pos - WSIZE;
+        }
+        let mut c = cand;
+        while (c >= 0) and (chain > 0) {
+            let cp = @as(usize, @truncate(u32, c));
+            if (cp < limit) or (cp >= pos) {
+                break;
+            }
+            if (w[cp + best] == w[pos + best]) and (w[cp] == w[pos]) and (w[cp + 1] == w[pos + 1]) {
+                let mut l: usize = 2;
+                while (l < max_len) and (w[cp + l] == w[pos + l]) {
+                    l += 1;
+                }
+                if l > best {
+                    best = l;
+                    found = Match.{ len: l, dist: pos - cp };
+                    if l >= nice {
+                        break;
+                    }
+                }
+            }
+            c = self.prev[cp & WMASK];
+            chain -= 1;
+        }
+        return found;
+    }
+
+    fn tally_literal(self: *mut Compressor, b: u8) bool {
+        self.tokens[self.ntokens] = @as(u32, b);
+        self.ntokens += 1;
+        self.lit_freq[@as(usize, b)] += 1;
+        return self.ntokens == NUM_TOKENS;
+    }
+
+    fn tally_match(self: *mut Compressor, len: usize, dist: usize) bool {
+        self.tokens[self.ntokens] = ((@as(u32, 1) << 31) | (@truncate(u32, len - 3) << 16)) | @truncate(u32, dist - 1);
+        self.ntokens += 1;
+        self.lit_freq[257 + @as(usize, LEN_CODE[len - 3])] += 1;
+        self.dist_freq[dist_code(dist - 1)] += 1;
+        return self.ntokens == NUM_TOKENS;
+    }
+
+    /// Matches the input up to near the end of the window, or all of it if
+    /// flushing.
+    fn process(self: *mut Compressor, flush: bool) !void {
+        if self.level == 0 {
+            self.pos = self.end;
+            return;
+        }
+        let mut limit = self.end;
+        if not flush {
+            if self.end <= MIN_LOOKAHEAD {
+                return;
+            }
+            limit = self.end - MIN_LOOKAHEAD;
+        }
+        let end = self.end;
+        if self.params.greedy {
+            while self.pos < limit {
+                let pos = self.pos;
+                let mut m = Match.{ len: 0, dist: 0 };
+                if (pos + 2) < end {
+                    let h = self.insert(pos);
+                    if h >= 0 {
+                        m = self.longest_match(pos, h, 0);
+                    }
+                }
+                let mut full = false;
+                if m.len >= MIN_MATCH {
+                    full = self.tally_match(m.len, m.dist);
+                    if m.len <= self.params.lazy {
+                        for q in pos + 1..pos + m.len {
+                            if (q + 2) < end {
+                                _ = self.insert(q);
+                            }
+                        }
+                    }
+                    self.pos = pos + m.len;
+                } else {
+                    full = self.tally_literal(self.window[pos]);
+                    self.pos = pos + 1;
+                }
+                if full {
+                    self.emit_block(false)!;
+                }
+            }
+        } else {
+            while self.pos < limit {
+                let pos = self.pos;
+                let mut h: i32 = -1;
+                if (pos + 2) < end {
+                    h = self.insert(pos);
+                }
+                let prev_len = self.match_len;
+                let prev_dist = self.match_dist;
+                self.match_len = MIN_MATCH - 1;
+                if (h >= 0) and (prev_len < self.params.lazy) {
+                    let m = self.longest_match(pos, h, prev_len);
+                    if (m.len >= MIN_MATCH) and not ((m.len == MIN_MATCH) and (m.dist > TOO_FAR)) {
+                        self.match_len = m.len;
+                        self.match_dist = m.dist;
+                    }
+                }
+                if (prev_len >= MIN_MATCH) and (self.match_len <= prev_len) {
+                    // the match at pos - 1 is at least as good: take it
+                    let full = self.tally_match(prev_len, prev_dist);
+                    let next = (pos - 1) + prev_len;
+                    for q in pos + 1..next {
+                        if (q + 2) < end {
+                            _ = self.insert(q);
+                        }
+                    }
+                    self.pos = next;
+                    self.pending = false;
+                    self.match_len = MIN_MATCH - 1;
+                    if full {
+                        self.emit_block(false)!;
+                    }
+                } else if self.pending {
+                    let full = self.tally_literal(self.window[pos - 1]);
+                    self.pos = pos + 1;
+                    if full {
+                        self.emit_block(false)!;
+                    }
+                } else {
+                    self.pending = true;
+                    self.pos = pos + 1;
+                }
+            }
+            if flush and self.pending {
+                _ = self.tally_literal(self.window[self.pos - 1]);
+                self.pending = false;
+                self.match_len = MIN_MATCH - 1;
+            }
+        }
+    }
+
+    /// Moves the second half of the window down to make room.
+    fn slide(self: *mut Compressor) !void {
+        if self.block_start < WSIZE {
+            self.emit_block(false)!;
+        }
+        @mem_copy(self.window[..WIN_SIZE - WSIZE], self.window[WSIZE..]);
+        self.end -= WSIZE;
+        self.pos -= WSIZE;
+        self.block_start -= WSIZE;
+        for i in 0..HASH_SIZE {
+            self.head[i] = @max(self.head[i] - @as(i32, 32768), -1);
+            self.prev[i] = @max(self.prev[i] - @as(i32, 32768), -1);
+        }
+    }
+
+    // --- blocks --------------------------------------------------------------
+
+    /// Writes the symbols so far as a block, stored, fixed or dynamic,
+    /// whichever is smallest.
+    fn emit_block(self: *mut Compressor, last: bool) !void {
+        let mut covered = self.pos;
+        if self.pending {
+            covered -= 1;
+        }
+        if (covered == self.block_start) and not last {
+            return;
+        }
+        self.spill()!;
+        let raw = self.window[self.block_start..covered];
+        if self.level == 0 {
+            self.write_stored(raw, last)!;
+        } else {
+            self.lit_freq[256] += 1;
+            build_lengths(self.lit_freq[..], self.lit_len[..], 15);
+            build_lengths(self.dist_freq[..], self.dist_len[..], 15);
+            build_codes(self.lit_len[..], self.lit_code[..]);
+            build_codes(self.dist_len[..], self.dist_code[..]);
+            // the code lengths, run-length encoded
+            let mut nlit: usize = 286;
+            while self.lit_len[nlit - 1] == 0 {
+                nlit -= 1;
+            }
+            let mut ndist: usize = 30;
+            while (ndist > 1) and (self.dist_len[ndist - 1] == 0) {
+                ndist -= 1;
+            }
+            let mut all: [316]u8 = [0; 316];
+            @mem_copy(all[..nlit], self.lit_len[..nlit]);
+            @mem_copy(all[nlit..nlit + ndist], self.dist_len[..ndist]);
+            let mut rle: [316]u8 = [0; 316];
+            let mut rle_extra: [316]u8 = [0; 316];
+            let nrle = run_lengths(all[..nlit + ndist], rle[..], rle_extra[..]);
+            let mut cl_freq: [19]u32 = [0; 19];
+            for i in 0..nrle {
+                cl_freq[@as(usize, rle[i])] += 1;
+            }
+            let mut cl_len: [19]u8 = [0; 19];
+            let mut cl_code: [19]u16 = [0; 19];
+            build_lengths(cl_freq[..], cl_len[..], 7);
+            build_codes(cl_len[..], cl_code[..]);
+            let mut ncl: usize = 19;
+            while (ncl > 4) and (cl_len[@as(usize, CL_ORDER[ncl - 1])] == 0) {
+                ncl -= 1;
+            }
+            // the size of each kind of block, in bits
+            let mut dynamic_bits = @as(u64, 17 + (3 * ncl));
+            for i in @as(usize, 0)..19 {
+                dynamic_bits += @as(u64, cl_freq[i]) * @as(u64, cl_len[i]);
+            }
+            dynamic_bits += ((2 * @as(u64, cl_freq[16])) + (3 * @as(u64, cl_freq[17]))) + (7 * @as(u64, cl_freq[18]));
+            let mut fixed_bits: u64 = 3;
+            let mut extra_bits: u64 = 0;
+            for i in @as(usize, 0)..286 {
+                let f = @as(u64, self.lit_freq[i]);
+                dynamic_bits += f * @as(u64, self.lit_len[i]);
+                fixed_bits += f * @as(u64, self.fixed_lit_len[i]);
+                if i >= 257 {
+                    extra_bits += f * @as(u64, LEN_EXTRA[i - 257]);
+                }
+            }
+            for i in @as(usize, 0)..30 {
+                let f = @as(u64, self.dist_freq[i]);
+                dynamic_bits += f * @as(u64, self.dist_len[i]);
+                fixed_bits += f * 5;
+                extra_bits += f * @as(u64, DIST_EXTRA[i]);
+            }
+            dynamic_bits += extra_bits;
+            fixed_bits += extra_bits;
+            let chunks = @max((raw.len + 65534) / 65535, 1);
+            let stored_bits = (@as(u64, raw.len) * 8) + (@as(u64, chunks) * 42);
+            let mut fin: u32 = 0;
+            if last {
+                fin = 1;
+            }
+            if (stored_bits <= fixed_bits) and (stored_bits <= dynamic_bits) {
+                self.write_stored(raw, last)!;
+            } else if fixed_bits <= dynamic_bits {
+                self.put_bits(fin | 2, 3);
+                self.write_symbols(true)!;
+            } else {
+                self.put_bits(fin | 4, 3);
+                self.put_bits(@truncate(u32, nlit - 257), 5);
+                self.put_bits(@truncate(u32, ndist - 1), 5);
+                self.put_bits(@truncate(u32, ncl - 4), 4);
+                for i in 0..ncl {
+                    self.put_bits(@as(u32, cl_len[@as(usize, CL_ORDER[i])]), 3);
+                }
+                for i in 0..nrle {
+                    let s = @as(usize, rle[i]);
+                    self.put_bits(@as(u32, cl_code[s]), @as(u64, cl_len[s]));
+                    if s == 16 {
+                        self.put_bits(@as(u32, rle_extra[i]), 2);
+                    } else if s == 17 {
+                        self.put_bits(@as(u32, rle_extra[i]), 3);
+                    } else if s == 18 {
+                        self.put_bits(@as(u32, rle_extra[i]), 7);
+                    }
+                }
+                self.write_symbols(false)!;
+            }
+        }
+        for i in @as(usize, 0)..286 {
+            self.lit_freq[i] = 0;
+        }
+        for i in @as(usize, 0)..30 {
+            self.dist_freq[i] = 0;
+        }
+        self.ntokens = 0;
+        self.block_start = covered;
+        self.spill()!;
+    }
+
+    /// The block's symbols and end-of-block, with the fixed or the block's codes.
+    fn write_symbols(self: *mut Compressor, fixed: bool) !void {
+        let mut ll = self.lit_len[..];
+        let mut lc = self.lit_code[..];
+        let mut dl = self.dist_len[..];
+        let mut dc = self.dist_code[..];
+        if fixed {
+            ll = self.fixed_lit_len[..];
+            lc = self.fixed_lit_code[..];
+            dl = self.fixed_dist_len[..];
+            dc = self.fixed_dist_code[..];
+        }
+        for t in self.tokens[..self.ntokens] {
+            if t < 256 {
+                let s = @as(usize, t);
+                self.put_bits(@as(u32, lc[s]), @as(u64, ll[s]));
+            } else {
+                let len3 = @as(usize, (t >> 16) & 0xff);
+                let d1 = @as(usize, t & 0xffff);
+                let lcode = @as(usize, LEN_CODE[len3]);
+                let s = 257 + lcode;
+                self.put_bits(@as(u32, lc[s]), @as(u64, ll[s]));
+                let le = LEN_EXTRA[lcode];
+                if le > 0 {
+                    self.put_bits(@truncate(u32, len3 - (@as(usize, LEN_BASE[lcode]) - 3)), @as(u64, le));
+                }
+                let ds = dist_code(d1);
+                self.put_bits(@as(u32, dc[ds]), @as(u64, dl[ds]));
+                let de = DIST_EXTRA[ds];
+                if de > 0 {
+                    self.put_bits(@truncate(u32, d1 - (@as(usize, DIST_BASE[ds]) - 1)), @as(u64, de));
+                }
+            }
+            if self.olen > (self.obuf.len - 1024) {
+                self.spill()!;
+            }
+        }
+        self.put_bits(@as(u32, lc[256]), @as(u64, ll[256]));
+    }
+
+    /// raw as stored blocks (at least one).
+    fn write_stored(self: *mut Compressor, raw: []u8, last: bool) !void {
+        let mut rest = raw;
+        loop {
+            let n = @min(rest.len, 65535);
+            let mut fin: u32 = 0;
+            if last and (n == rest.len) {
+                fin = 1;
+            }
+            self.put_bits(fin, 3);
+            self.align_bits();
+            self.put_bits(@truncate(u32, n), 16);
+            self.put_bits(@truncate(u32, n) ^ 0xffff, 16);
+            self.flush_bytes()!;
+            self.out.write_all(rest[..n])!;
+            rest = rest[n..];
+            if rest.len == 0 {
+                return;
+            }
+        }
+    }
+}
+
+struct Match {
+    len: usize,
+    dist: usize,
+}
+
+fn compressor_write(ctx: *mut void, bytes: []u8) !usize {
+    let c = @ptr_cast(*mut Compressor, ctx);
+    return c.write(bytes);
+}
+
+/// Run-length encodes code lengths with the symbols 16 (repeat the previous
+/// length 3-6 times), 17 (3-10 zeros) and 18 (11-138 zeros).
+fn run_lengths(lens: []u8, syms: []mut u8, extra: []mut u8) usize {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < lens.len {
+        let v = lens[i];
+        let mut run: usize = 1;
+        while ((i + run) < lens.len) and (lens[i + run] == v) {
+            run += 1;
+        }
+        i += run;
+        if v == 0 {
+            while run >= 11 {
+                let k = @min(run, 138);
+                syms[n] = 18;
+                extra[n] = @truncate(u8, k - 11);
+                n += 1;
+                run -= k;
+            }
+            if run >= 3 {
+                syms[n] = 17;
+                extra[n] = @truncate(u8, run - 3);
+                n += 1;
+                run = 0;
+            }
+        } else {
+            syms[n] = v;
+            n += 1;
+            run -= 1;
+            while run >= 3 {
+                let k = @min(run, 6);
+                syms[n] = 16;
+                extra[n] = @truncate(u8, k - 3);
+                n += 1;
+                run -= k;
+            }
+        }
+        while run > 0 {
+            syms[n] = v;
+            n += 1;
+            run -= 1;
+        }
+    }
+    return n;
+}
+
+/// Compresses data into format at level (0 to 9) in new memory (free it
+/// with mem.free).
+pub fn compress(data: []u8, format: u8, level: u32) ![]mut u8 {
+    let mut out = strs.String.init();
+    let c = Compressor.init(out.writer(), format, level)!;
+    defer c.deinit();
+    c.write_all(data) catch |e| {
+        out.deinit();
+        return e;
+    };
+    c.finish() catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "checksums" {
+    @expect_eq(crc32(0, "123456789"), 0xcbf43926);
+    @expect_eq(crc32(crc32(0, "1234"), "56789"), 0xcbf43926);
+    @expect_eq(crc32(0, ""), 0);
+    @expect_eq(adler32(1, "Wikipedia"), 0x11e60398);
+    @expect_eq(adler32(1, ""), 1);
+}
+
+test "known streams" {
+    // gzip -n of "hello, world\n"; zlib.compress of "hello hello hello hello"
+    let g =
+        "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xcb\x48\xcd\xc9\xc9\xd7\x51\x28\xcf\x2f\xca\x49\xe1\x02\x00\x53\x74\x24\xf4\x0d\x00\x00\x00";
+    let a = decompress(g, GZIP, 100)!;
+    defer mem.free(a);
+    @expect_eq(a, "hello, world\n");
+    let z = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\xc8\x40\x27\x01\x68\x03\x08\xb1";
+    let b = decompress(z, ZLIB, 100)!;
+    defer mem.free(b);
+    @expect_eq(b, "hello hello hello hello");
+    // a stored raw block
+    let c = decompress("\x01\x03\x00\xfc\xffabc", RAW, 100)!;
+    defer mem.free(c);
+    @expect_eq(c, "abc");
+    let bad: [5][]u8 = [
+        "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\xc8\x40\x27\x01\x68\x03\x08\xb0",  // checksum
+        "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\xc8\x40",  // truncated
+        "\x78\x9d\xcb\x48",         // header check
+        "\x01\x03\x00\xfc\xfeabc",  // length check
+        "\x07",                     // block type 3
+    ];
+    for i in 0..bad.len {
+        let mut f = RAW;
+        if i < 3 {
+            f = ZLIB;
+        }
+        _ = decompress(bad[i], f, 100) catch continue;
+        @trap();
+    }
+    _ = decompress(g, GZIP, 5) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        return;
+    };
+    @trap();
+}
+
+fn sample(n: usize) ![]mut u8 {
+    // text-like data: words from a small vocabulary, with a pseudo-random
+    // choice, and a stretch of noise
+    let words: [8][]u8 = ["the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dogs\n"];
+    let mut s = strs.String.init();
+    let mut x: u32 = 12345;
+    while s.len < n {
+        x = (x *% 1103515245) +% 12345;
+        if (s.len > (n / 2)) and (s.len < ((n / 2) + 3000)) {
+            s.push(@truncate(u8, x >> 16))!;
+        } else {
+            s.push_str(words[@as(usize, (x >> 16) & 7)])!;
+        }
+    }
+    s.truncate(n);
+    return s.take();
+}
+
+test "round trips" {
+    let sizes: [7]usize = [0, 1, 2, 100, 40000, 70000, 300000];
+    for n in sizes {
+        let data = sample(n)!;
+        defer mem.free(data);
+        for level in @as(usize, 0)..10 {
+            for format in @as(usize, 0)..3 {
+                let c = compress(data, @truncate(u8, format), @truncate(u32, level))!;
+                defer mem.free(c);
+                if (level > 0) and (n > 1000) {
+                    @expect(c.len < (n / 2));
+                }
+                let d = decompress(c, @truncate(u8, format), n)!;
+                defer mem.free(d);
+                @expect_eq(d, data);
+            }
+        }
+    }
+}
+
+test "streaming" {
+    let data = sample(200000)!;
+    defer mem.free(data);
+    // written in odd pieces, with a flush in the middle
+    let mut packed = strs.String.init();
+    defer packed.deinit();
+    let c = Compressor.init(packed.writer(), GZIP, 6)!;
+    defer c.deinit();
+    let mut i: usize = 0;
+    let mut step: usize = 1;
+    while i < data.len {
+        let n = @min(step, data.len - i);
+        c.write_all(data[i..i + n])!;
+        i += n;
+        step = (step * 3) + 1;
+        if (i > 100000) and (step < 1000000) {
+            c.flush()!;
+            step = 1000000;
+        }
+    }
+    c.finish()!;
+    // two members, read back in small pieces through a Reader
+    let mut twice = strs.String.init();
+    defer twice.deinit();
+    twice.push_str(packed.bytes())!;
+    twice.push_str(packed.bytes())!;
+    let mut src = io.SliceReader.init(twice.bytes());
+    let d = Decompressor.init(src.reader(), GZIP)!;
+    defer d.deinit();
+    let mut back = strs.String.init();
+    defer back.deinit();
+    let mut buf: [777]u8 = [0; 777];
+    loop {
+        let n = d.read(buf[..])!;
+        if n == 0 {
+            break;
+        }
+        back.push_str(buf[..n])!;
+    }
+    @expect_eq(back.len, 2 * data.len);
+    @expect_eq(back.bytes()[..data.len], data);
+    @expect_eq(back.bytes()[data.len..], data);
+}
