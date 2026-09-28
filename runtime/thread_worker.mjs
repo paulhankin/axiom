@@ -8,12 +8,17 @@ import fs from 'fs';
 import { workerData } from 'worker_threads';
 import { createHost, describeTrap, formatTrap } from './host.mjs';
 
-const { module, memory, entry, arg, stackTop } = workerData;
+const { module, memory, entry, arg, stackTop, exited } = workerData;
 const host = createHost({ memory });
 let instance = null;
 try {
   instance = host.instantiateModule(module);
   instance.exports.phalange_thread_start(entry, arg, stackTop);
+  // Only now is the thread off its stack, which the program may then free.
+  const words = new Int32Array(memory.buffer);
+  const i = Number(exited) / 4;
+  Atomics.store(words, i, 1);
+  Atomics.notify(words, i, 1);
 } catch (e) {
   const t = describeTrap(instance, memory, e);
   fs.writeSync(2, formatTrap(t, ' in thread') + '\n');

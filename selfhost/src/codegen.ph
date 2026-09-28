@@ -2801,6 +2801,18 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if (id >= ast.BI_ATOMIC_LOAD) and (id <= ast.BI_ATOMIC_NOTIFY) {
         return gen_atomic(e);
     }
+    if id == ast.BI_MEMORY_DISCARD {
+        // WebAssembly memory cannot give pages back: nothing to do there
+        let addr = gen(barg(e, 0));
+        let len = gen(barg(e, 1));
+        if not ty.g_target.is_wasm {
+            let mut ps: [2]*mut ir.Ty = [T_isz, T_isz];
+            let fty = fn_type(T_void, ps[..], false);
+            let mut args: [2]*mut ir.Value = [addr, len];
+            _ = call(fty, native_rt_fn("ph_memory_discard", fty), args[..]);
+        }
+        return vnil();
+    }
     if id == ast.BI_ERROR_NAME {
         let code = gen(barg(e, 0));
         let f = error_name_fn();
@@ -3152,30 +3164,16 @@ fn error_name_fn() *mut ir.Value {
 }
 
 // Linear memory growth. On wasm these are the real instructions; on native
-// targets a reserved, 64 KiB-aligned region emulates linear memory pages.
-const NATIVE_HEAP_PAGES: u64 = 4096;
-let mut native_heap: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-let mut native_pages: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
-
-fn ensure_native_heap() void {
-    if u.notnil(native_heap) {
-        return;
-    }
-    let ht = ir.t_array(T_i8, NATIVE_HEAP_PAGES * 65536);
-    native_heap = shared_global(ht, "phalange.heap", ir.czero(ht), 0);
-    set_align(native_heap, 65536);
-    native_pages = shared_global(T_isz, "phalange.heap_pages", usz(0), 0);
-}
-
+// targets the runtime (ph_memory_size, ph_memory_grow) commits 64 KiB pages of
+// one large reserved region, so linear memory is contiguous there too.
 fn mem_size() *mut ir.Value {
     if ty.g_target.is_wasm {
         let mut t: [1]*mut ir.Ty = [T_isz];
         let mut args: [1]*mut ir.Value = [ci32(0)];
         return intrinsic("llvm.wasm.memory.size", t[..], args[..]);
     }
-    ensure_native_heap();
-    let base = ir.binop(B, ir.OP_UDIV, ptrtoint(native_heap, T_isz), usz(65536));
-    return b_add(base, ld(T_isz, native_pages));
+    let fty = fn_type(T_isz, no_tys(), false);
+    return call(fty, native_rt_fn("ph_memory_size", fty), no_vals());
 }
 
 fn mem_grow(pages: *mut ir.Value) *mut ir.Value {
@@ -3184,14 +3182,10 @@ fn mem_grow(pages: *mut ir.Value) *mut ir.Value {
         let mut args: [2]*mut ir.Value = [ci32(0), pages];
         return intrinsic("llvm.wasm.memory.grow", t[..], args[..]);
     }
-    ensure_native_heap();
-    let used = ld(T_isz, native_pages);
-    let nu = b_add(used, pages);
-    let ge = icmp(ir.IntUGE, nu, used);  // (right to left, as in the C implementation)
-    let ok = b_and(icmp(ir.IntULE, nu, usz(@bit_cast(i64, NATIVE_HEAP_PAGES))), ge);
-    _ = st(sel(ok, nu, used), native_pages);
-    let base = ir.binop(B, ir.OP_UDIV, ptrtoint(native_heap, T_isz), usz(65536));
-    return sel(ok, b_add(base, used), ir.cones(T_isz));
+    let mut ps: [1]*mut ir.Ty = [T_isz];
+    let fty = fn_type(T_isz, ps[..], false);
+    let mut args: [1]*mut ir.Value = [pages];
+    return call(fty, native_rt_fn("ph_memory_grow", fty), args[..]);
 }
 
 // ---------------------------------------------------------------------------
@@ -4074,9 +4068,6 @@ pub fn codegen_program(o: *mut CgOptions) bool {
             ss_globals();
         }
         _ = trap_info_global();
-        if not ty.g_target.is_wasm {
-            ensure_native_heap();
-        }
     }
     if program_parts {
         if g_test_mode {

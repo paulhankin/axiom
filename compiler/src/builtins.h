@@ -87,7 +87,8 @@
     X(FENCE, "fence", "")                     \
     X(EXPECT, "expect", "e")                  \
     X(EXPECT_EQ, "expect_eq", "ee")           \
-    X(ERROR_NAME, "error_name", "e")
+    X(ERROR_NAME, "error_name", "e")          \
+    X(MEMORY_DISCARD, "memory_discard", "ee")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

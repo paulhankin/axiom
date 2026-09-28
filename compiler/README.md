@@ -191,7 +191,8 @@ Not yet implemented (reported with a diagnostic where relevant):
   checked operations behave as on wasm, but a raw pointer that points outside mapped
   memory crashes with a signal instead of trapping deterministically. The
   bounds-checked linear-memory region of spec §12.1 is future work.
-  `@memory_grow` / `@memory_size` are emulated on native with a 256 MiB reserved region.
+  On native targets linear memory is a region of address space reserved at the first
+  `@memory_grow` (up to 1 TiB) and committed 64 KiB page at a time (runtime/native_host.c).
 - **Data races at -O1 and above.** The spec (§12.8.2) forbids optimizations that are
   valid only for race-free programs. At `-O0` the generated code honors this. At `-O1`
   and above the compiler relies on LLVM, whose IR memory model formally treats a

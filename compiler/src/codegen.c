@@ -1509,6 +1509,7 @@ static LLVMValueRef ext_int(LLVMValueRef v, LLVMTypeRef to, bool is_signed) {
 
 static LLVMValueRef mem_grow(LLVMValueRef pages);
 static LLVMValueRef mem_size(void);
+static LLVMValueRef native_rt_fn(const char *name, LLVMTypeRef ret, LLVMTypeRef *ps, int n, LLVMTypeRef *fty);
 static LLVMValueRef error_name_table(void);
 static void gen_expect_eq(Expr *e);
 static LLVMValueRef gen_atomic(Expr *e);
@@ -1893,6 +1894,17 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_ATOMIC_CAS:
     case BI_ATOMIC_WAIT:
     case BI_ATOMIC_NOTIFY: return gen_atomic(e);
+    case BI_MEMORY_DISCARD: {
+        // WebAssembly memory cannot give pages back: nothing to do there
+        LLVMValueRef args[2] = {gen(a[0].e), gen(a[1].e)};
+        if (!g_target.wasm) {
+            LLVMTypeRef fty;
+            LLVMTypeRef ps[2] = {T_isz, T_isz};
+            LLVMValueRef f = native_rt_fn("ph_memory_discard", T_void, ps, 2, &fty);
+            LLVMBuildCall2(B, fty, f, args, 2, "");
+        }
+        return NULL;
+    }
     case BI_ERROR_NAME: {
         LLVMValueRef code = gen(a[0].e);
         LLVMTypeRef fty;
@@ -2098,7 +2110,16 @@ static void emit_thread_start(void) {
         LLVMBuildStore(B, base, ss_global);
         top = base;
     }
-    intrinsic("llvm.stackrestore", &T_ptr, 1, &top, 1);
+    // The thread's stack: set the wasm global __stack_pointer (which the
+    // linker defines) directly; llvm.stackrestore in a function without a
+    // frame of its own is dropped, and the thread would run on the main
+    // thread's stack.
+    LLVMValueRef sp = LLVMGetNamedGlobal(mod, "__stack_pointer");
+    if (!sp) {
+        sp = LLVMAddGlobalInAddressSpace(mod, T_ptr, "__stack_pointer", 1);
+        LLVMSetLinkage(sp, LLVMExternalLinkage);
+    }
+    LLVMBuildStore(B, top, sp);
     LLVMTypeRef ety = LLVMFunctionType(T_void, &T_ptr, 1, false);
     LLVMValueRef arg = LLVMGetParam(fn, 1);
     LLVMBuildCall2(B, ety, LLVMGetParam(fn, 0), &arg, 1, "");
@@ -2148,26 +2169,16 @@ static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out) {
 }
 
 // Linear memory growth. On wasm these are the real instructions; on native
-// targets a reserved, 64 KiB-aligned region emulates linear memory pages.
-#define NATIVE_HEAP_PAGES 4096
-static LLVMValueRef native_heap, native_pages;
-
-static void ensure_native_heap(void) {
-    if (native_heap) return;
-    LLVMTypeRef ht = LLVMArrayType2(T_i8, (uint64_t)NATIVE_HEAP_PAGES * 65536);
-    native_heap = shared_global(ht, "phalange.heap", LLVMConstNull(ht), 0);
-    LLVMSetAlignment(native_heap, 65536);
-    native_pages = shared_global(T_isz, "phalange.heap_pages", usz(0), 0);
-}
-
+// targets the runtime (ph_memory_size, ph_memory_grow) commits 64 KiB pages of
+// one large reserved region, so linear memory is contiguous there too.
 static LLVMValueRef mem_size(void) {
     if (g_target.wasm) {
         LLVMValueRef zero = LLVMConstInt(T_i32, 0, false);
         return intrinsic("llvm.wasm.memory.size", &T_isz, 1, &zero, 1);
     }
-    ensure_native_heap();
-    LLVMValueRef base = LLVMBuildUDiv(B, LLVMBuildPtrToInt(B, native_heap, T_isz, ""), usz(65536), "");
-    return LLVMBuildAdd(B, base, LLVMBuildLoad2(B, T_isz, native_pages, ""), "");
+    LLVMTypeRef fty;
+    LLVMValueRef f = native_rt_fn("ph_memory_size", T_isz, NULL, 0, &fty);
+    return LLVMBuildCall2(B, fty, f, NULL, 0, "");
 }
 
 static LLVMValueRef mem_grow(LLVMValueRef pages) {
@@ -2175,14 +2186,10 @@ static LLVMValueRef mem_grow(LLVMValueRef pages) {
         LLVMValueRef args[2] = {LLVMConstInt(T_i32, 0, false), pages};
         return intrinsic("llvm.wasm.memory.grow", &T_isz, 1, args, 2);
     }
-    ensure_native_heap();
-    LLVMValueRef used = LLVMBuildLoad2(B, T_isz, native_pages, "");
-    LLVMValueRef nu = LLVMBuildAdd(B, used, pages, "");
-    LLVMValueRef ok = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntULE, nu, usz(NATIVE_HEAP_PAGES), ""),
-                                   LLVMBuildICmp(B, LLVMIntUGE, nu, used, ""), "");
-    LLVMBuildStore(B, LLVMBuildSelect(B, ok, nu, used, ""), native_pages);
-    LLVMValueRef base = LLVMBuildUDiv(B, LLVMBuildPtrToInt(B, native_heap, T_isz, ""), usz(65536), "");
-    return LLVMBuildSelect(B, ok, LLVMBuildAdd(B, base, used, ""), LLVMConstAllOnes(T_isz), "");
+    LLVMTypeRef fty;
+    LLVMTypeRef ps[1] = {T_isz};
+    LLVMValueRef f = native_rt_fn("ph_memory_grow", T_isz, ps, 1, &fty);
+    return LLVMBuildCall2(B, fty, f, &pages, 1, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -2910,7 +2917,6 @@ bool codegen_program(CgOptions *o) {
         error_name_fn(&fty);
         if (stack_traces_on()) ss_globals();
         trap_info_global();
-        if (!g_target.wasm) ensure_native_heap();
     }
     if (program_parts) {
         if (g_test_mode) emit_test_exports();

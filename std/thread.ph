@@ -6,7 +6,7 @@
 // WebAssembly each thread is a new instance of the module on the shared
 // memory (a Web Worker / node worker), on native targets a POSIX thread.
 //
-//     let t = thread.spawn(alloc, worker, arg)!;   // worker: fn(T) void
+//     let t = thread.spawn(worker, arg)!;   // worker: fn(T) void
 //     t.join();
 // =============================================================================
 
@@ -15,7 +15,8 @@ import "mem.ph" as mem;
 error { SpawnFailed, OutOfMemory }
 
 import host "phalange" {
-    fn ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize) i32;
+    // `exited` is set to 1 (and notified) once the thread has left its stack
+    fn ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32;
     fn ph_thread_stack_size() usize;  // 0: the host provides stacks
     fn ph_cpu_count() u32;
     fn ph_sleep_ns(ns: u64) void;
@@ -24,58 +25,54 @@ import host "phalange" {
 struct Start[T] {
     f: fn(T) void,
     arg: T,
-    done: u32,
+    exited: u32,  // set by the host once the thread is off its stack
     stack: []mut u8,
-    alloc: mem.Allocator,
 }
 
 fn trampoline[T](ctx: *mut void) void {
     let s = @ptr_cast(*mut Start.[T], ctx);
     s.f(s.arg);
-    @atomic_store(&mut s.done, 1);
-    _ = @atomic_notify(&s.done, 1);
 }
 
 /// A running thread. Call join() exactly once.
 pub struct Thread[T] {
     start: *mut Start.[T],
 
-    /// Blocks until the thread's function has returned, then releases the
-    /// thread's resources.
+    /// Blocks until the thread has finished, then releases its resources.
     pub fn join(self: Self) void {
-        while @atomic_load(&self.start.done) == 0 {
-            _ = @atomic_wait(&self.start.done, 0, -1);
+        while @atomic_load(&self.start.exited) == 0 {
+            _ = @atomic_wait(&self.start.exited, 0, -1);
         }
-        let alloc = self.start.alloc;
         if self.start.stack.len > 0 {
-            alloc.free(self.start.stack);
+            mem.free(self.start.stack);
         }
-        alloc.free(@slice_from_ptr(self.start, 1));
+        mem.free(@slice_from_ptr(self.start, 1));
     }
 }
 
 /// Runs `f(arg)` on a new thread. `arg` is copied to the new thread; to share
 /// data, pass a pointer (and synchronize, e.g. with std/sync).
-pub fn spawn[T](alloc: mem.Allocator, f: fn(T) void, arg: T) !Thread.[T] {
-    let cell = alloc.alloc.[Start.[T]](1)!;
+pub fn spawn[T](f: fn(T) void, arg: T) !Thread.[T] {
+    mem.enable_threads();
+    let cell = mem.alloc.[Start.[T]](1)!;
     let s = &mut cell[0];
     let stack_size = ph_thread_stack_size();
     let mut stack = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
     let mut top: usize = 0;
     if stack_size > 0 {
-        stack = alloc.alloc.[u8](stack_size) catch |e| {
-            alloc.free(cell);
+        stack = mem.alloc.[u8](stack_size) catch |e| {
+            mem.free(cell);
             return e;
         };
         top = (@int_from_ptr(stack.ptr) + stack_size) & ~@as(usize, 15);
     }
-    s.* = Start.[T].{ f: f, arg: arg, done: 0, stack: stack, alloc: alloc };
-    let id = ph_thread_spawn(trampoline.[T], @ptr_cast(*mut void, s), top);
+    s.* = Start.[T].{ f: f, arg: arg, exited: 0, stack: stack };
+    let id = ph_thread_spawn(trampoline.[T], @ptr_cast(*mut void, s), top, &mut s.exited);
     if id < 0 {
         if stack.len > 0 {
-            alloc.free(stack);
+            mem.free(stack);
         }
-        alloc.free(cell);
+        mem.free(cell);
         return error.SpawnFailed;
     }
     return Thread.[T].{ start: s };
@@ -109,11 +106,10 @@ fn run_chunk[C](c: Chunk.[C]) void {
 /// for each, in parallel; returns when all have finished. The ranges are
 /// disjoint, so bodies that only write elements in their own range do not
 /// race.
-pub fn parallel_for[C](alloc: mem.Allocator, n: usize, threads: usize, body: fn(*mut C, usize, usize) void,
-                       ctx: *mut C) !void {
+pub fn parallel_for[C](n: usize, threads: usize, body: fn(*mut C, usize, usize) void, ctx: *mut C) !void {
     let k = @max(@min(threads, n), 1);
-    let handles = alloc.alloc.[Thread.[Chunk.[C]]](k)!;
-    defer alloc.free(handles);
+    let handles = mem.alloc.[Thread.[Chunk.[C]]](k)!;
+    defer mem.free(handles);
     let per = n / k;
     let extra = n % k;
     let mut lo: usize = 0;
@@ -128,7 +124,7 @@ pub fn parallel_for[C](alloc: mem.Allocator, n: usize, threads: usize, body: fn(
         if i == (k - 1) {
             run_chunk(chunk);  // the calling thread takes the last range
         } else {
-            handles[i] = spawn(alloc, run_chunk.[C], chunk) catch |e| {
+            handles[i] = spawn(run_chunk.[C], chunk) catch |e| {
                 for j in 0..started {
                     handles[j].join();
                 }

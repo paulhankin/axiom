@@ -40,15 +40,13 @@ fn square_range(ctx: *mut Squares, lo: usize, hi: usize) void {
 }
 
 fn demo() !void {
-    let al = mem.page_allocator;
-
     // 4 threads x 10000 increments, atomically and under a mutex
     let mut shared = Shared.{ hits: sync.Atomic.[u64].init(0), lock: sync.Mutex.init(), plain: 0,
                               group: sync.WaitGroup.init() };
     shared.group.add(4);
     let mut ts: [4]thread.Thread.[*mut Shared] = [
-        thread.spawn(al, hammer, &mut shared)!, thread.spawn(al, hammer, &mut shared)!, thread.spawn(
-            al, hammer, &mut shared)!, thread.spawn(al, hammer, &mut shared)!];
+        thread.spawn(hammer, &mut shared)!, thread.spawn(hammer, &mut shared)!, thread.spawn(hammer, &mut shared)!,
+        thread.spawn(hammer, &mut shared)!];
     shared.group.wait();
     for t in ts {
         t.join();
@@ -57,8 +55,8 @@ fn demo() !void {
     io.uint(shared.plain);        // expect: 40000
 
     // producer / consumer through a small channel
-    let mut ch = sync.Channel.[u64].init(al, 8)!;
-    let p = thread.spawn(al, produce, &mut ch)!;
+    let mut ch = sync.Channel.[u64].init(8)!;
+    let p = thread.spawn(produce, &mut ch)!;
     let mut sum: u64 = 0;
     loop {
         let v = ch.recv() catch break;
@@ -68,9 +66,9 @@ fn demo() !void {
     io.uint(sum);  // expect: 500500
 
     // parallel_for over disjoint ranges
-    let out = al.alloc.[u64](1000)!;
+    let out = mem.alloc.[u64](1000)!;
     let mut sq = Squares.{ out: out };
-    thread.parallel_for(al, out.len, 4, square_range, &mut sq)!;
+    thread.parallel_for(out.len, 4, square_range, &mut sq)!;
     let mut total: u64 = 0;
     for v in out {
         total += v;

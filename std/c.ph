@@ -55,15 +55,15 @@ pub fn from_cstr(p: *u8) []u8 {
 
 /// Copies `s` into memory from `alloc`, adding a terminating NUL, for passing
 /// to C. Free it with free_cstr.
-pub fn to_cstr(alloc: mem.Allocator, s: []u8) !*mut u8 {
-    let buf = alloc.alloc.[u8](s.len + 1)!;
+pub fn to_cstr(s: []u8) !*mut u8 {
+    let buf = mem.alloc.[u8](s.len + 1)!;
     @mem_copy(buf[..s.len], s);
     buf[s.len] = 0;
     return buf.ptr;
 }
 
-pub fn free_cstr(alloc: mem.Allocator, p: *mut u8) void {
-    alloc.free(@slice_from_ptr(p, cstr_len(p) + 1));
+pub fn free_cstr(p: *mut u8) void {
+    mem.free(@slice_from_ptr(p, cstr_len(p) + 1));
 }
 
 // -----------------------------------------------------------------------------
@@ -71,11 +71,10 @@ pub fn free_cstr(alloc: mem.Allocator, p: *mut u8) void {
 // -----------------------------------------------------------------------------
 
 test "C strings" {
-    let al = mem.page_allocator;
-    let p = to_cstr(al, "hello")!;
+    let p = to_cstr("hello")!;
     @expect_eq(cstr_len(p), 5);
     @expect_eq(from_cstr(p), "hello");
     @expect_eq(cstr_len("literal".ptr), 7);  // literals are NUL-terminated
-    free_cstr(al, p);
+    free_cstr(p);
     @expect(is_null(null_ptr.[u8]()));
 }

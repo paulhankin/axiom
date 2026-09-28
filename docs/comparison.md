@@ -18,7 +18,7 @@ Phalange's choices differ and what each choice costs.
 | **Primary aim** | Code that agents can write and check locally; WebAssembly first | A better C: explicit, simple, fast to compile | Memory and thread safety without a garbage collector | Zero-cost abstraction on top of C | A portable assembler |
 | **Undefined behavior** | None: every operation has a defined result or traps | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
 | **Memory safety** | Bounds-checked slices and linear memory; a dangling pointer reads defined but stale bytes | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
-| **Allocation** | No global allocator; every allocation names an `Allocator` | The same: allocators are passed explicitly | Global allocator, implicit in `Box`/`Vec`/`String` | Global `new`, implicit in containers | `malloc` |
+| **Allocation** | One global allocator (`std/mem`, written in Phalange), always called explicitly | Allocators passed explicitly; no global one | Global allocator, implicit in `Box`/`Vec`/`String` | Global `new`, implicit in containers | `malloc` |
 | **Cleanup** | `defer` | `defer`, `errdefer` | Destructors (`Drop`) | Destructors (RAII) | By hand (or compiler extensions) |
 | **Errors** | `!T` with one program-wide error set; postfix `!` propagates; `catch` | Error unions with per-function error sets; `try`; `catch` | `Result<T, E>` and `?`; panics | Exceptions; `std::expected` (C++23) | Return codes, `errno` |
 | **Null** | No null; pointers are never optional | Non-null pointers; `?T` optionals | No null; `Option<T>` | `nullptr` | `NULL` (`nullptr` in C23) |
@@ -191,12 +191,17 @@ they are not part of the language's meaning.
 
 ## Memory and resources
 
-- **Phalange** has no global allocator, and nothing in the language allocates. The
-  standard library is built around `Allocator` values (arenas, fixed buffers, the page
-  allocator), `defer` for cleanup, and slices that carry their length. There are no
-  destructors and no RAII: releasing memory or closing a file is a statement you can see.
-- **Zig** takes the same approach: explicit allocators, `defer`/`errdefer`, no hidden
-  allocation. Phalange has no `errdefer` yet (it is an open question in Appendix D).
+- **Phalange** has one global allocator, `std/mem`, like Rust and C++, but nothing in the
+  language calls it for you: memory comes from `mem.alloc` and goes back through
+  `mem.free` (usually in a `defer`), and a type that owns memory has a `deinit` you call.
+  There are no destructors and no RAII: releasing memory or closing a file is a statement
+  you can see. The allocator itself is ordinary Phalange code (size-class spans for small
+  objects, boundary-tagged blocks for large ones, no locking until a second thread
+  starts), and `free` takes the slice, so objects carry no size header.
+- **Zig** is also explicit, but threads allocator values through every API instead of
+  having a global one: flexible (arenas, fixed buffers, testing allocators), at the cost
+  of an extra parameter on everything that allocates. Zig has `errdefer`; Phalange does
+  not yet (it is an open question in Appendix D).
 - **Rust** ties resources to ownership. `Drop` runs automatically at the end of a scope,
   which removes leaks and double frees but makes some calls invisible. Most standard
   containers use the global allocator (allocator parameters are still unstable).

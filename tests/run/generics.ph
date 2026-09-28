@@ -37,8 +37,8 @@ pub struct Stack[T] {
     items: []mut T,
     len: usize,
 
-    pub fn init(alloc: mem.Allocator, cap: usize) !Self {
-        let items = alloc.alloc.[T](cap)!;
+    pub fn init(cap: usize) !Self {
+        let items = mem.alloc.[T](cap)!;
         return Self.{ items: items, len: 0 };
     }
 
@@ -86,9 +86,8 @@ export fn run() void {
     io.boolean(q.a);        // expect: true
     io.int(@as(i64, q.b));  // expect: 5
 
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-    let mut st = Stack.[i64].init(arena.allocator(), 4) catch return;
+    let mut st = Stack.[i64].init(4) catch return;
+    defer mem.free(st.items);
     st.push(10) catch return;
     st.push(20) catch return;
     io.int(st.pop());  // expect: 20

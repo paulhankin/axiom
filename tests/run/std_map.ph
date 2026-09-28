@@ -2,7 +2,6 @@
 import "../lib/io.ph" as io;
 import "std/hash" as hash;
 import "std/map" as map;
-import "std/mem" as mem;
 
 fn err_of[T](r: !T) []u8 {
     _ = r catch |e| {
@@ -12,10 +11,8 @@ fn err_of[T](r: !T) []u8 {
 }
 
 export fn run() void {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-    let al = arena.allocator();
-    let mut m = map.Map.[u64, u64].init(al, hash.hash_u64, hash.eq_u64);
+    let mut m = map.Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);
+    defer m.deinit();
     for i in @as(u64, 0)..10000 {
         m.put(i, i * i) catch return;
     }
@@ -49,7 +46,8 @@ export fn run() void {
     io.str(err_of(m.get(4)));  // expect: NotFound
 
     // string keys
-    let mut words = map.Map.[[]u8, u32].init(al, hash.hash_bytes, hash.eq_bytes);
+    let mut words = map.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    defer words.deinit();
     let text: [7][]u8 = ["the", "cat", "sat", "on", "the", "mat", "the"];
     for w in text {
         let c = words.get(w) catch 0;

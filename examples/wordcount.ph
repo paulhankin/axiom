@@ -33,16 +33,14 @@ fn lower(c: u8) u8 {
 }
 
 fn count_words() !void {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-    let al = arena.allocator();
-
-    let text = io.stdin().read_all(al)!;
+    let text = io.stdin().read_all()!;
+    defer mem.free(text);
     for i in 0..text.len {
         text[i] = lower(text[i]);
     }
 
-    let mut counts = map.Map.[[]u8, u32].init(al, hash.hash_bytes, hash.eq_bytes);
+    let mut counts = map.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    defer counts.deinit();
     let mut start: usize = 0;
     for i in 0..text.len + 1 {
         let boundary = (i == text.len) or not is_letter(text[i]);
@@ -56,7 +54,8 @@ fn count_words() !void {
         }
     }
 
-    let mut entries = vec.Vec.[Entry].init(al);
+    let mut entries = vec.Vec.[Entry].init();
+    defer entries.deinit();
     let mut it = counts.iter();
     let mut w: []u8 = "";
     let mut c: u32 = 0;

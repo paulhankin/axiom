@@ -1,9 +1,8 @@
 // =============================================================================
 // std/io.ph - readers, writers, formatting, standard streams and files.
 //
-// Writer and Reader are interfaces in the same style as mem.Allocator: a
-// context pointer plus a function pointer. Anything can be a Writer by
-// providing a write function.
+// Writer and Reader are interfaces: a context pointer plus a function
+// pointer. Anything can be a Writer by providing a write function.
 //
 // Standard streams and files use the Phalange host ABI (import module
 // "phalange"), provided by runtime/host.mjs (WebAssembly under node) and
@@ -264,26 +263,26 @@ pub struct Reader {
         return buf[..n];
     }
 
-    /// Reads everything that is left into memory from `alloc`.
-    pub fn read_all(self: Reader, alloc: mem.Allocator) ![]mut u8 {
-        let mut buf = alloc.alloc.[u8](4096)!;
+    /// Reads everything that is left into new memory (free it with mem.free).
+    pub fn read_all(self: Reader) ![]mut u8 {
+        let mut buf = mem.alloc.[u8](4096)!;
         let mut len: usize = 0;
         loop {
             if len == buf.len {
-                let bigger = alloc.alloc.[u8](buf.len * 2) catch |e| {
-                    alloc.free(buf);
+                buf = mem.realloc(buf, buf.len * 2) catch |e| {
+                    mem.free(buf);
                     return e;
                 };
-                @mem_copy(bigger[..len], buf[..len]);
-                alloc.free(buf);
-                buf = bigger;
             }
             let n = self.read_fn(self.ctx, buf[len..]) catch |e| {
-                alloc.free(buf);
+                mem.free(buf);
                 return e;
             };
             if n == 0 {
-                return buf[..len];
+                return mem.realloc(buf, len) catch |e| {
+                    mem.free(buf);
+                    return e;
+                };
             }
             len += n;
         }

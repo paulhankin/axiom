@@ -7,7 +7,7 @@ Its main target is WebAssembly. Its design mandate is:
 - **context-compact grammar**: LL(1), context-free, no macros, one canonical form
 - **zero undefined behavior**: every operation has a defined result or a deterministic trap
 - **first-class WASM/SIMD**: 128-bit vector primitives with WebAssembly semantics
-- **arena-centric memory**: no global allocator; every allocation names an `Allocator`
+- **explicit allocation**: one global allocator (`std/mem`, written in Phalange), called explicitly; no language construct allocates
 
 ## Quick start
 
@@ -35,7 +35,7 @@ WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library
 |---|---|
 | [`spec/phalange.md`](spec/phalange.md) | Language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Phalange compared with Zig, Rust, C++ and C |
-| [`examples/dot_product.ph`](examples/dot_product.ph) | SIMD dot product with a bump arena and WASM exports |
+| [`examples/dot_product.ph`](examples/dot_product.ph) | SIMD dot product with the global allocator and WASM exports |
 | [`examples/shapes.ph`](examples/shapes.ph) | Tagged unions, `match`, errors |
 | [`examples/generics.ph`](examples/generics.ph) | Generic functions and types, constraints, const parameters |
 | [`examples/c_interop/`](examples/c_interop/stats.ph) | A Phalange library called from C through a generated header |

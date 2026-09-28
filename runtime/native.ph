@@ -35,6 +35,9 @@ pub extern "C" {
     fn sysconf(name: i32) isize;
     fn nanosleep(req: *Timespec, rem: *mut Timespec) i32;
     fn syscall(n: i64, ...) i64;
+    fn mmap(addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: i64) usize;
+    fn madvise(addr: usize, len: usize, advice: i32) i32;
+    fn sched_yield() i32;
     fn sigaction(sig: i32, act: *SigAction, old: *mut SigAction) i32;
     fn sigaltstack(st: *StackT, old: *mut StackT) i32;
     fn signal(sig: i32, handler: usize) usize;
@@ -306,6 +309,7 @@ export fn ph_sock_close(h: i32) void {
 struct ThreadStart {
     entry: fn(*mut void) void,
     arg: *mut void,
+    exited: *mut u32,
 }
 
 let mut next_thread_id: i32 = 1;
@@ -314,14 +318,17 @@ fn thread_main(p: *mut void) *mut void {
     let st = @ptr_cast(*mut ThreadStart, p);
     let entry = st.entry;
     let arg = st.arg;
+    let exited = st.exited;
     free(p);
     install_crash_stack();
     entry(arg);
+    @atomic_store(exited, 1);
+    _ = ph_notify32(exited, 1);
     return @ptr_from_int(*mut void, 0);
 }
 
 // stack_top is ignored: native threads get their stack from the OS.
-export fn ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize) i32 {
+export fn ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32 {
     let mem = malloc(@size_of(ThreadStart));
     if @int_from_ptr(mem) == 0 {
         return PH_ERR;
@@ -329,6 +336,7 @@ export fn ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: 
     let st = @ptr_cast(*mut ThreadStart, mem);
     st.entry = entry;
     st.arg = arg;
+    st.exited = exited;
     let mut t: u64 = 0;
     let mut attr: [64]u64 = [0; 64];
     _ = pthread_attr_init(@ptr_cast(*mut void, &mut attr[0]));
@@ -404,6 +412,76 @@ export fn ph_notify32(p: *mut u32, count: i32) i32 {
         return 0;
     }
     return @truncate(i32, r);
+}
+
+// -----------------------------------------------------------------------------
+// Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
+// region reserved at the first use. The region is as large as the system
+// allows (up to 1 TiB of address space); the kernel supplies physical pages
+// only when they are touched.
+// -----------------------------------------------------------------------------
+let mut mem_base: usize = 0;   // 64 KiB-aligned start of the region
+let mut mem_limit: usize = 0;  // its size in pages
+let mut mem_pages: usize = 0;  // pages handed out
+let mut mem_state: u32 = 0;    // 0: not reserved, 1: reserving, 2: ready, 3: failed
+
+fn mem_reserve() void {
+    if @atomic_cas(&mut mem_state, 0, 1) == 0 {
+        let mut size: usize = 1 << 40;
+        while size >= (1 << 28) {
+            // PROT_READ | PROT_WRITE; MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+            let p = mmap(0, size + 65536, 3, 0x4022, -1, 0);
+            if p != @max_value(usize) {
+                mem_base = (p + 65535) & ~@as(usize, 65535);
+                mem_limit = size / 65536;
+                @atomic_store(&mut mem_state, 2);
+                return;
+            }
+            size /= 2;
+        }
+        @atomic_store(&mut mem_state, 3);
+        return;
+    }
+    while @atomic_load(&mem_state) == 1 {
+        _ = sched_yield();
+    }
+}
+
+export fn ph_memory_size() isize {
+    if @atomic_load(&mem_state) != 2 {
+        mem_reserve();
+    }
+    return @bit_cast(isize, (mem_base / 65536) + @atomic_load(&mem_pages));
+}
+
+// The previous size in pages (as ph_memory_size counts them), or -1.
+export fn ph_memory_grow(n: isize) isize {
+    if @atomic_load(&mem_state) != 2 {
+        mem_reserve();
+    }
+    if (@atomic_load(&mem_state) != 2) or (n < 0) {
+        return -1;
+    }
+    let k = @bit_cast(usize, n);
+    loop {
+        let old = @atomic_load(&mem_pages);
+        if k > (mem_limit - old) {
+            return -1;
+        }
+        if @atomic_cas(&mut mem_pages, old, old + k) == old {
+            return @bit_cast(isize, (mem_base / 65536) + old);
+        }
+    }
+}
+
+// @memory_discard: the whole 64 KiB pages in the range go back to the system
+// (they stay mapped, and read as zero when next touched).
+export fn ph_memory_discard(addr: usize, len: usize) void {
+    let a = (addr + 65535) & ~@as(usize, 65535);
+    let b = (addr + len) & ~@as(usize, 65535);
+    if a < b {
+        _ = madvise(a, b - a, 4);  // MADV_DONTNEED
+    }
 }
 
 // -----------------------------------------------------------------------------

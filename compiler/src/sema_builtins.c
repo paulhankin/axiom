@@ -344,6 +344,10 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_MEMORY_GROW:
         check_expr_to(earg(e, 0), t_usize);
         return e->type = type_errunion(t_usize);
+    case BI_MEMORY_DISCARD:
+        check_expr_to(earg(e, 0), t_usize);
+        check_expr_to(earg(e, 1), t_usize);
+        return e->type = t_void;
     case BI_CLZ:
     case BI_CTZ:
     case BI_POPCOUNT: {

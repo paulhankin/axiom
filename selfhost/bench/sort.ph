@@ -45,8 +45,8 @@ fn merge_sort(xs: []mut u64, tmp: []mut u64) void {
 
 export fn main() i32 {
     let n: usize = 2_000_000;
-    let xs = mem.page_allocator.alloc.[u64](n) catch return 1;
-    let tmp = mem.page_allocator.alloc.[u64](n) catch return 1;
+    let xs = mem.alloc.[u64](n) catch return 1;
+    let tmp = mem.alloc.[u64](n) catch return 1;
     let mut s: u64 = 88172645463325252;
     for i in 0..n {
         s ^= s << 13;

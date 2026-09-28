@@ -3,41 +3,13 @@
 // Build: phalange build dot_product.ph --target=wasm32-freestanding -O3 -o engine.wasm
 // =============================================================================
 
+import "std/mem" as mem;
+
 import host "env" {
     fn console_log(ptr: *u8, len: usize) void;
 }
 
-error { OutOfMemory, DimensionMismatch }
-
-// -----------------------------------------------------------------------------
-// Minimal bump arena over a caller-provided buffer
-// -----------------------------------------------------------------------------
-pub struct Arena {
-    memory: []mut u8,
-    offset: usize,
-
-    pub fn init(buffer: []mut u8) Arena {
-        return Arena.{ memory: buffer, offset: 0 };
-    }
-
-    /// `align` must be a power of two.
-    pub fn alloc(self: *mut Arena, size: usize, align: usize) ![]mut u8 {
-        let mask = align - 1;
-        let aligned = (self.offset + mask) & ~mask;
-
-        if (aligned + size) > self.memory.len {
-            return error.OutOfMemory;
-        }
-
-        let slice = self.memory[aligned..aligned + size];
-        self.offset = aligned + size;
-        return slice;
-    }
-
-    pub fn reset(self: *mut Arena) void {
-        self.offset = 0;
-    }
-}
+error { DimensionMismatch }
 
 // -----------------------------------------------------------------------------
 // SIMD dot product
@@ -74,18 +46,11 @@ pub fn dot_product_simd(a: []f32, b: []f32) !f32 {
 // -----------------------------------------------------------------------------
 // Exports
 // -----------------------------------------------------------------------------
-let mut HEAP_BYTES: [65536]u8 = [0; 65536];
-
 export fn compute(length: usize) f32 {
-    let mut arena = Arena.init(HEAP_BYTES[..]);
-    defer arena.reset();
-
-    let byte_size = length * @size_of(f32);
-    let raw_a = arena.alloc(byte_size, 16) catch return -1.0;
-    let raw_b = arena.alloc(byte_size, 16) catch return -1.0;
-
-    let vec_a = @cast_slice(f32, raw_a);
-    let vec_b = @cast_slice(f32, raw_b);
+    let vec_a = mem.alloc.[f32](length) catch return -1.0;
+    defer mem.free(vec_a);
+    let vec_b = mem.alloc.[f32](length) catch return -1.0;
+    defer mem.free(vec_b);
 
     for i in 0..length {
         vec_a[i] = 1.5;

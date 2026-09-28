@@ -111,7 +111,6 @@ pub struct WaitGroup {
 
 /// A bounded, multi-producer multi-consumer FIFO channel.
 pub struct Channel[T] {
-    alloc: mem.Allocator,
     buf: []mut T,
     head: usize,  // next slot to receive from
     len: usize,
@@ -120,15 +119,14 @@ pub struct Channel[T] {
     not_empty: u32,  // bumped (and notified) whenever an item arrives or on close
     not_full: u32,   // bumped (and notified) whenever a slot frees or on close
 
-    pub fn init(alloc: mem.Allocator, capacity: usize) !Self {
-        let buf = alloc.alloc.[T](@max(capacity, 1))!;
-        return Self.{ alloc: alloc, buf: buf, head: 0, len: 0, closed: false, lock: Mutex.init(), not_empty: 0,
-                      not_full: 0 };
+    pub fn init(capacity: usize) !Self {
+        let buf = mem.alloc.[T](@max(capacity, 1))!;
+        return Self.{ buf: buf, head: 0, len: 0, closed: false, lock: Mutex.init(), not_empty: 0, not_full: 0 };
     }
 
     /// Frees the buffer. No thread may be using the channel.
     pub fn deinit(self: *mut Self) void {
-        self.alloc.free(self.buf);
+        mem.free(self.buf);
     }
 
     /// Blocks while the channel is full. Fails with Closed after close().
@@ -240,10 +238,9 @@ fn feed(ch: *mut Channel.[u32]) void {
 }
 
 test "mutex protects a counter across threads" {
-    let al = mem.page_allocator;
     let mut c = Counter.{ lock: Mutex.init(), n: 0 };
-    let t1 = thread.spawn(al, bump, &mut c)!;
-    let t2 = thread.spawn(al, bump, &mut c)!;
+    let t1 = thread.spawn(bump, &mut c)!;
+    let t2 = thread.spawn(bump, &mut c)!;
     bump(&mut c);
     t1.join();
     t2.join();
@@ -251,10 +248,9 @@ test "mutex protects a counter across threads" {
 }
 
 test "channel delivers in order, then Closed" {
-    let al = mem.page_allocator;
-    let mut ch = Channel.[u32].init(al, 4)!;
+    let mut ch = Channel.[u32].init(4)!;
     defer ch.deinit();
-    let t = thread.spawn(al, feed, &mut ch)!;
+    let t = thread.spawn(feed, &mut ch)!;
     let mut expect: u32 = 0;
     loop {
         let v = ch.recv() catch |e| {

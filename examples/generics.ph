@@ -27,9 +27,13 @@ pub struct List[T] {
     items: []mut T,
     len: usize,
 
-    pub fn init(alloc: mem.Allocator, capacity: usize) !Self {
-        let items = alloc.alloc.[T](capacity)!;
+    pub fn init(capacity: usize) !Self {
+        let items = mem.alloc.[T](capacity)!;
         return Self.{ items: items, len: 0 };
+    }
+
+    pub fn deinit(self: *mut Self) void {
+        mem.free(self.items);
     }
 
     pub fn push(self: *mut Self, x: T) !void {
@@ -67,10 +71,8 @@ fn u32_less(a: u32, b: u32) bool {
 }
 
 export fn demo() u32 {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-
-    let mut xs = List.[u32].init(arena.allocator(), 8) catch return 0;
+    let mut xs = List.[u32].init(8) catch return 0;
+    defer xs.deinit();
     xs.push(30) catch return 0;
     xs.push(10) catch return 0;
     xs.push(20) catch return 0;

@@ -1,17 +1,18 @@
 # Phalange standard library
 
-Import with `import "std/<module>" as <name>;`. Everything that allocates takes a
-`mem.Allocator`, and nothing allocates behind your back.
+Import with `import "std/<module>" as <name>;`. Memory comes from the global allocator
+in `mem`; nothing allocates behind your back (a function that allocates returns `!T`,
+and a type that owns memory has `deinit`).
 
 | Module | Contents |
 |---|---|
-| [`mem`](mem.ph) | `Allocator` (generic `alloc.[T](n)` / `free(s)`), `page_allocator`, `Arena`, `FixedBuffer` |
+| [`mem`](mem.ph) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `create(v)` / `destroy(p)`, `in_use()` |
 | [`vec`](vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
 | [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
 | [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files; `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
-| [`thread`](thread.ph) | `spawn(alloc, f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
+| [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
 | [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
 | [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
 | [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters); IPv4 parsing/formatting |
@@ -20,34 +21,32 @@ Each module carries its own tests: `phalange test std/<module>.ph`.
 
 ## Conventions
 
-- **Interfaces are structs of function pointers.** `Allocator`, `Writer` and `Reader`
+- **Interfaces are structs of function pointers.** `Writer` and `Reader`
   each hold a context pointer plus the functions that operate on it. This is how the
   language expresses polymorphism without traits or vtables.
 - **Maps take their hash and equality functions at construction.** For example:
-  `Map.[u64, V].init(al, hash.hash_u64, hash.eq_u64)`.
+  `Map.[u64, V].init(hash.hash_u64, hash.eq_u64)`.
 - **Errors, not sentinels.** Lookups that can fail return `!T` (for example
   `error.NotFound`, `error.Empty`). The idiom for "value or default" is
   `m.get(k) catch 0`.
 - **Threads share memory; synchronize it.** `spawn` copies its argument, so pass a
   pointer to shared data and protect it with `std/sync`, or use `parallel_for`, which
-  hands each thread a disjoint range. `page_allocator` is thread-safe. `Arena`,
-  `Vec` and `Map` are not.
-- **Adapters point at their source.** `Arena.allocator()`, `BufferWriter.writer()`
+  hands each thread a disjoint range. The allocator is thread-safe; `Vec` and `Map`
+  are not.
+- **Adapters point at their source.** `BufferWriter.writer()`
   and similar return values that point at the object they came from, so don't move
   that object while the adapter is in use.
 
 ## Example
 
 ```phalange
-import "std/mem" as mem;
+import "std/hash" as hash;
 import "std/io" as io;
 import "std/map" as map;
-import "std/hash" as hash;
 
 export fn main() i32 {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-    let mut ages = map.Map.[[]u8, u32].init(arena.allocator(), hash.hash_bytes, hash.eq_bytes);
+    let mut ages = map.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
+    defer ages.deinit();
     ages.put("ada", 36) catch return 1;
     io.stdout().print_u64(@as(u64, ages.get("ada") catch 0)) catch return 1;
     return 0;
@@ -68,7 +67,7 @@ They call a small set of host functions imported from module `"phalange"`:
 | `ph_tcp_connect(name, len, port) i32`, `ph_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ph_tcp_accept(h) i32`, `ph_tcp_local_port(h) i32` | |
 | `ph_sock_read(h, p, n) isize`, `ph_sock_write(h, p, n) isize`, `ph_sock_close(h)` | |
-| `ph_thread_spawn(entry, arg, stack_top) i32`, `ph_thread_stack_size() usize` | threads (spec §12.8.5) |
+| `ph_thread_spawn(entry, arg, stack_top, exited) i32`, `ph_thread_stack_size() usize` | threads (spec §12.8.5) |
 | `ph_cpu_count() u32`, `ph_sleep_ns(ns)` | |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection

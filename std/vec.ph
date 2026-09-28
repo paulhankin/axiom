@@ -6,28 +6,26 @@ import "mem.ph" as mem;
 
 error { Empty, NotFound, OutOfMemory }
 
-/// A growable array. Elements live in memory from `alloc`; `deinit` frees them.
+/// A growable array. Its elements live in memory from mem.alloc; `deinit`
+/// frees them.
 /// Slices returned by `items()` are invalidated by any operation that grows
 /// the vector.
 pub struct Vec[T] {
-    alloc: mem.Allocator,
     buf: []mut T,  // capacity == buf.len
     len: usize,
 
-    pub fn init(alloc: mem.Allocator) Self {
-        return Self.{ alloc: alloc, buf: @slice_from_ptr(@ptr_from_int(*mut T, @align_of(T)), 0), len: 0 };
+    pub fn init() Self {
+        return Self.{ buf: @slice_from_ptr(@ptr_from_int(*mut T, @align_of(T)), 0), len: 0 };
     }
 
-    pub fn with_capacity(alloc: mem.Allocator, cap: usize) !Self {
-        let mut v = Self.init(alloc);
+    pub fn with_capacity(cap: usize) !Self {
+        let mut v = Self.init();
         v.reserve(cap)!;
         return v;
     }
 
     pub fn deinit(self: *mut Self) void {
-        if self.buf.len > 0 {
-            self.alloc.free(self.buf);
-        }
+        mem.free(self.buf);
         self.buf = @slice_from_ptr(@ptr_from_int(*mut T, @align_of(T)), 0);
         self.len = 0;
     }
@@ -46,12 +44,7 @@ pub struct Vec[T] {
         while cap < need {
             cap = @mul_checked(cap, 2) catch return error.OutOfMemory;
         }
-        let nb = self.alloc.alloc.[T](cap)!;
-        @mem_copy(nb[0..self.len], self.buf[0..self.len]);
-        if self.buf.len > 0 {
-            self.alloc.free(self.buf);
-        }
-        self.buf = nb;
+        self.buf = mem.realloc(self.buf, cap)!;
     }
 
     pub fn push(self: *mut Self, x: T) !void {
@@ -249,7 +242,7 @@ fn test_less(a: i32, b: i32) bool {
 }
 
 test "push, pop and grow" {
-    let mut v = Vec.[i32].init(mem.page_allocator);
+    let mut v = Vec.[i32].init();
     defer v.deinit();
     for i in @as(i32, 0)..100 {
         v.push(i)!;
@@ -261,7 +254,7 @@ test "push, pop and grow" {
 }
 
 test "pop on empty fails" {
-    let mut v = Vec.[u8].init(mem.page_allocator);
+    let mut v = Vec.[u8].init();
     _ = v.pop() catch |e| {
         @expect_eq(e, error.Empty);
         return;
@@ -270,13 +263,13 @@ test "pop on empty fails" {
 }
 
 test "get out of range traps" expect trap(T0001) {
-    let mut v = Vec.[u8].init(mem.page_allocator);
+    let mut v = Vec.[u8].init();
     v.push(1)!;
     _ = v.get(1);
 }
 
 test "insert, remove, swap_remove" {
-    let mut v = Vec.[i32].init(mem.page_allocator);
+    let mut v = Vec.[i32].init();
     defer v.deinit();
     let xs: [4]i32 = [1, 2, 3, 4];
     v.extend(xs[..])!;

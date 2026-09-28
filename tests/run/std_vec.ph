@@ -1,6 +1,5 @@
 // std/vec
 import "../lib/io.ph" as io;
-import "std/mem" as mem;
 import "std/vec" as vec;
 
 fn less(a: i32, b: i32) bool {
@@ -8,9 +7,7 @@ fn less(a: i32, b: i32) bool {
 }
 
 export fn run() void {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-    let mut v = vec.Vec.[i32].init(arena.allocator());
+    let mut v = vec.Vec.[i32].init();
     defer v.deinit();
     for i in @as(i32, 0)..100 {
         v.push((i * 37) % 101) catch return;

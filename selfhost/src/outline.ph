@@ -9,8 +9,10 @@
 //     T ... (calls) ... -> J    =>   C: call f.cold(live-ins); br J
 //
 // The region is the blocks T dominates; it has one way in (from B) and all
-// ways out go to J; nothing computed in it is used after it (its effects are
-// on memory). The new function is internal, cold and never inlined back.
+// ways out go to J. Nothing computed in it is used after it (its effects are
+// on memory), except by one phi of J: the new function returns that value
+// (a slow path that computes the function's result). The new function is
+// internal, cold and never inlined back.
 // =============================================================================
 import "inline.ph" as inl;
 import "ir.ph" as ir;
@@ -40,6 +42,7 @@ struct Region {
     blocks: u.List.[*mut ir.Block],
     ins: u.List.[*mut ir.Value],  // values from outside the region it uses
     join: *mut ir.Block,
+    res: *mut ir.Value,  // the phi of the join the region computes, or nil
     tag: i64,
 }
 
@@ -145,26 +148,40 @@ fn region_of(f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Block, r: *mut Region
             }
         }
     }
-    if not calls or (cost < REGION_MIN) or u.isnil(r.join) or (r.ins.len > MAX_ARGS) {
+    if not calls or (cost < REGION_MIN) or u.isnil(r.join) {
         return false;
     }
-    if ((inl.cost(f) - cost) + 3 + @int_cast(i32, r.ins.len)) > REST_MAX {
-        return false;
-    }
-    // the join's phis: one value from the region, computed outside it
+    // the join's phis: one value from the region, computed outside it; or
+    // (for one of them) whatever the region computes, which it returns
+    r.res = vnil();
     let mut p = r.join.first;
     while u.notnil(p) and (p.op == ir.OP_PHI) {
         let mut v = vnil();
+        let mut one = true;
         for j in 0..p.bs.len {
             if in_region(r, p.bs.get(j)) {
                 let x = ir.resolve(p.xs.get(j));
                 if defined_in(r, x) or (u.notnil(v) and (v != x)) {
-                    return false;
+                    one = false;
                 }
                 v = x;
             }
         }
+        if not one {
+            if u.notnil(r.res) or not scalar(p.ty) {
+                return false;
+            }
+            r.res = p;
+            for j in 0..p.bs.len {
+                if in_region(r, p.bs.get(j)) and not note_in(r, ir.resolve(p.xs.get(j))) {
+                    return false;
+                }
+            }
+        }
         p = p.next;
+    }
+    if (r.ins.len > MAX_ARGS) or (((inl.cost(f) - cost) + 3 + @int_cast(i32, r.ins.len)) > REST_MAX) {
+        return false;
     }
     return true;
 }
@@ -201,7 +218,11 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
     for k in 0..r.ins.len {
         ptys[k] = r.ins.get(k).ty;
     }
-    let fty = ir.t_fn(ir.t_void(), ptys[0..r.ins.len], false);
+    let mut rty = ir.t_void();
+    if u.notnil(r.res) {
+        rty = r.res.ty;
+    }
+    let fty = ir.t_fn(rty, ptys[0..r.ins.len], false);
     let g = ir.add_function(m, u.f2("%s.cold%s", f.name, u.idec(n)), fty);
     g.linkage = ir.LINK_INTERNAL;
     g.cold = true;
@@ -211,7 +232,13 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
         x.auxp = @ptr_cast(*mut void, ir.append_block(g, x.name));
     }
     let ret = ir.append_block(g, "cold.ret");
+    let mut rphi = vnil();
+    if u.notnil(r.res) {
+        rphi = ir.new_inst(g, ir.OP_PHI, rty);
+        ir.append_inst(ret, rphi);
+    }
     let rv = ir.new_inst(g, ir.OP_RET, ir.t_void());
+    rv.a = rphi;
     ir.append_inst(ret, rv);
     for k in 0..r.blocks.len {
         let x = r.blocks.get(k);
@@ -262,6 +289,16 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
             y = y.next;
         }
     }
+    // the value returned: the result phi's value on each way out
+    if u.notnil(r.res) {
+        let rp = r.res;
+        for j in 0..rp.bs.len {
+            let x = rp.bs.get(j);
+            if in_region(r, x) {
+                ir.add_incoming(rphi, map_val(r, g, rp.xs.get(j)), @ptr_cast(*mut ir.Block, x.auxp));
+            }
+        }
+    }
     // in f: a call instead of the region
     let t = r.blocks.get(0);
     let c = ir.append_block(f, "cold.call");
@@ -271,7 +308,7 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
     for k in 0..r.ins.len {
         args[k] = r.ins.get(k);
     }
-    _ = ir.call(bld, fty, g.val, args[0..r.ins.len]);
+    let res = ir.call(bld, fty, g.val, args[0..r.ins.len]);
     ir.br(bld, r.join);
     let bt = ir.terminator(b);
     for j in 0..ir.succ_count(bt) {
@@ -294,7 +331,9 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
                 j += 1;
             }
         }
-        if u.notnil(v) {
+        if p == r.res {
+            ir.add_incoming(p, res, c);
+        } else if u.notnil(v) {
             ir.add_incoming(p, v, c);
         }
         p = p.next;
@@ -339,7 +378,7 @@ fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) bool {
 pub fn outline_module(m: *mut ir.Module, changed: *mut u.List.[*mut ir.Func]) bool {
     let mut r = Region.{ blocks: u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 },
                          ins: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 }, join: ir.bnil(),
-                         tag: 0 };
+                         res: vnil(), tag: 0 };
     let mut any = false;
     let n = m.funcs.len;
     for i in 0..n {

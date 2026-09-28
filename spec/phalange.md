@@ -71,7 +71,7 @@ concrete rules that enforce it.
 | **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `phalange fmt`. |
 | **Zero undefined behavior** | Arithmetic, shifts, casts, and memory access all have defined results or traps. Memory is an abstract, bounds-checked linear byte array (§12). Compilers MUST NOT optimize on assumptions that the absence of UB would otherwise justify. |
 | **First-class WASM/SIMD** | 128-bit vector types are primitives. WASM semantics are the reference semantics, on every target. |
-| **Arena-centric memory** | There is no global allocator. Every allocation names an `Allocator`. The standard library is built around arenas and `defer`. |
+| **Explicit allocation** | No language construct allocates. Heap memory comes from one global allocator, `std/mem` (§15.1), through calls you can see (`mem.alloc`, `mem.free`); `defer` releases it. |
 
 A secondary principle is **locality of reasoning**. The meaning of a line of code should
 follow from that line and the declarations it names. This is why Phalange forbids shadowing
@@ -1040,8 +1040,8 @@ pub struct List[T] {
     items: []mut T,
     len: usize,
 
-    pub fn init(alloc: Allocator, capacity: usize) !Self {
-        let items = alloc.alloc.[T](capacity)!;
+    pub fn init(capacity: usize) !Self {
+        let items = mem.alloc.[T](capacity)!;
         return Self.{ items: items, len: 0 };
     }
 
@@ -1058,8 +1058,8 @@ pub struct List[T] {
     }
 }
 
-fn demo(alloc: Allocator) !void {
-    let mut xs = List.[u32].init(alloc, 16)!;
+fn demo() !void {
+    let mut xs = List.[u32].init(16)!;
     xs.push(7)!;
     let a = max(xs.get(0), 3);       // T deduced as u32 from the first argument
     let b = max.[f64](1.5, 2.0);     // explicit type argument
@@ -1262,7 +1262,7 @@ WebAssembly memory model, adopted as the semantics on **every** target.
 
 Because of this:
 
-- A **dangling pointer** (use after free, or after an arena reset) reads whatever bytes
+- A **dangling pointer** (use after free) reads whatever bytes
   are currently at that address. The value is unspecified, but the behavior is defined.
   It is a logic bug, not UB.
 - **Type punning** through `@ptr_cast` is defined: it reads the bytes as the new type.
@@ -1284,18 +1284,24 @@ Because of this:
 
 ### 12.3 No uninitialized values
 
-Every local and global has an initializer. Memory obtained from an allocator has
+Every local and global has an initializer. Memory obtained from the allocator has
 unspecified contents (§12.1) but is never "poison".
 
 ### 12.4 Allocation
 
-Phalange has **no global allocator** and no implicit allocation. No language construct
-allocates heap memory. Allocation always names an `Allocator` (§15.1):
+No language construct allocates heap memory: there is no implicit allocation. Heap
+memory comes from the global allocator in `std/mem` (§15.1), which every part of a program
+shares, like `malloc` in C or the global allocator in Rust and C++. Allocation is an
+ordinary call:
 
 ```phalange
-let buf = a.alloc.[u32](1024)!;   // []mut u32; a: Allocator
-defer a.free(buf);                 // T deduced from the argument
+let buf = mem.alloc.[u32](1024)!;   // []mut u32
+defer mem.free(buf);                 // T deduced from the argument
 ```
+
+The allocator takes memory from the system with `@memory_grow` and can give it back with
+`@memory_discard` (Appendix A). Code that calls `@memory_grow` itself gets pages the
+allocator never touches.
 
 ### 12.5 Alignment
 
@@ -1415,7 +1421,7 @@ Threads use host functions from module `"phalange"`:
 
 | Function | Meaning |
 |---|---|
-| `ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize) i32` | start a thread running `entry(arg)`; a negative result means failure |
+| `ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32` | start a thread running `entry(arg)`; a negative result means failure. When the thread has returned from `entry` and no longer uses its stack, the host stores `1` to `*exited` and notifies it (so the stack can be freed) |
 | `ph_thread_stack_size() usize` | the stack size the program must allocate for a new thread, or `0` if the host provides stacks (native) |
 | `ph_cpu_count() u32`, `ph_sleep_ns(ns: u64)` | |
 
@@ -1485,7 +1491,7 @@ wherever host instructions differ.
 | `wasm32-freestanding` | 32 | Primary target. No WASI and no imports except those declared |
 | `wasm32-wasi` | 32 | Standard library may use WASI imports |
 | `wasm64-freestanding` | 64 | memory64 |
-| native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a reserved virtual region with guard pages and bounds checks (§12.1). Future work |
+| native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Bounds checks against it (§12.1) are future work |
 
 ### 14.2 Exports
 
@@ -1528,7 +1534,7 @@ index or wrong signature traps (`T0009`).
 
 Phalange calls C, and C calls Phalange, with no glue code on either side.
 
-#### 15.5.1 Calling C
+#### 14.5.1 Calling C
 
 ```phalange
 extern "C" {
@@ -1557,7 +1563,7 @@ extern "C" "m" {          // optional second string: a library to link (-lm)
   a pointer or a function pointer (`E0824`, with a fix that inserts the `@as`).
   Untyped literals become `i32` (or `i64` if they don't fit) and `f64`.
 
-#### 15.5.2 Calling Phalange from C
+#### 14.5.2 Calling Phalange from C
 
 Every `export fn` is a C function with the same name. The one exception is `main` on
 WebAssembly, which C code cannot call. The compiler
@@ -1571,7 +1577,7 @@ writes a C header for them with `--emit-header=<path>`. The header contains:
 
 It compiles as C11 and as C++.
 
-#### 15.5.3 Types at the boundary
+#### 14.5.3 Types at the boundary
 
 | Phalange | C |
 |---|---|
@@ -1595,7 +1601,7 @@ no equivalent.
 function and every indirect call. Any Phalange function whose signature uses only
 boundary types can therefore be passed to C as a callback, with no annotation.
 
-#### 15.5.4 NULL and C strings
+#### 14.5.4 NULL and C strings
 
 - Phalange pointers are non-nullable, but C returns NULL. Check pointers that come from
   C with `std/c.is_null` / `is_null_void`. Phalange never checks for NULL implicitly.
@@ -1604,7 +1610,7 @@ boundary types can therefore be passed to C as a callback, with no annotation.
 - Because a NUL follows every string literal (§2.5), `"%d\n".ptr` can be passed directly
   as a C format string.
 
-#### 15.5.5 The safety boundary
+#### 14.5.5 The safety boundary
 
 The zero-undefined-behavior guarantee covers Phalange code. **C code, and whatever it
 does to memory, is outside it.** A C function that writes out of bounds or frees memory
@@ -1620,75 +1626,51 @@ twice can corrupt the Phalange program, just as it could corrupt any C program. 
 
 Only the parts that the language semantics depend on are specified here.
 
-### 15.1 `std/mem.Allocator`
+### 15.1 `std/mem`: the global allocator
 
 ```phalange
-pub struct Allocator {
-    ctx: *mut void,
-    alloc_fn: fn(*mut void, usize, usize) !*mut u8,   // (ctx, size, align)
-    free_fn:  fn(*mut void, *mut u8, usize) void,     // (ctx, ptr, size)
-
-    pub fn alloc[T](self: Allocator, n: usize) ![]mut T {
-        let bytes = @mul_checked(n, @size_of(T)) catch return error.OutOfMemory;
-        let p = self.alloc_fn(self.ctx, bytes, @align_of(T))!;
-        return @slice_from_ptr(@ptr_cast(*mut T, p), n);
-    }
-
-    pub fn free[T](self: Allocator, s: []mut T) void {
-        self.free_fn(self.ctx, @ptr_cast(*mut u8, s.ptr), s.len * @size_of(T));
-    }
-}
+pub fn alloc[T](n: usize) ![]mut T          // contents unspecified
+pub fn alloc_zeroed[T](n: usize) ![]mut T   // every byte 0
+pub fn free[T](s: []mut T) void
+pub fn realloc[T](s: []mut T, n: usize) ![]mut T
+pub fn dup[T](s: []T) ![]mut T
+pub fn create[T](v: T) !*mut T             // one value, initialized to v
+pub fn destroy[T](p: *mut T) void
+pub fn alloc_bytes(size: usize) usize        // 0 if there is no memory (or size is 0)
+pub fn free_bytes(p: usize, size: usize) void
+pub fn realloc_bytes(p: usize, old: usize, size: usize) usize
+pub fn in_use() usize                        // bytes allocated and not freed
+pub fn enable_threads() void
 ```
 
-These are ordinary generic methods (§10), not builtins. If the byte count overflows,
-`alloc` returns `error.OutOfMemory` without calling the hook.
+These are ordinary functions (§10), not builtins. The rules:
 
-### 15.2 `std/mem.Arena`
+- **Sized free.** `free` takes the slice that `alloc` (or `realloc`) returned, so the
+  allocator knows the size without storing it. Freeing memory that did not come from the
+  allocator, or with the wrong size, traps (`T0000`) where the allocator can tell: always
+  for an address outside its spans and blocks, and for a large block freed twice. Other
+  double frees are logic bugs with defined behavior (§12.1).
+- **Failure.** `alloc`, `realloc`, `dup` and `create` return `error.OutOfMemory` when the
+  system has no more memory or the byte count overflows. `realloc` leaves the old slice
+  valid when it fails.
+- **Alignment.** Memory is aligned to 16 bytes, enough for every type (§12.5).
+- **Zero sizes.** `alloc.[T](0)` returns an empty slice that owns no memory; freeing it
+  does nothing.
+- **Threads.** The allocator is safe to use from every thread. `std/thread` calls
+  `enable_threads` before starting the program's second thread; code that starts threads
+  another way (from C) must call it first.
 
-```phalange
-pub struct Arena {
-    backing: Allocator,
-    // … implementation fields …
+The design is not normative: objects up to 8 KiB are rounded up to one of 32 size classes
+and carved from 64 KiB spans, one class per span, with no per-object header; larger ones are
+blocks of 4 KiB units that merge with free neighbours. A single-threaded program never
+locks; with threads, each thread uses one of 32 heaps (chosen by its stack address) with
+its own lock. Freed memory is reused, and past a budget, large free blocks are returned to
+the system with `@memory_discard`.
 
-    pub fn init(backing: Allocator) Arena;
-    pub fn allocator(self: *mut Arena) Allocator;  // ctx points at *this* Arena
-    pub fn reset(self: *mut Arena) void;           // O(1), keeps pages for reuse
-    pub fn deinit(self: *mut Arena) void;          // returns all pages to `backing`
-}
-```
+A program that wants arena or pool allocation writes it on top of `mem.alloc`: an arena is
+a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 
-Typical use:
-
-```phalange
-import "std/mem" as mem;
-
-fn work() !void {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-
-    let list = arena.allocator().alloc.[u32](1024)!;
-    // … use list …
-}
-```
-
-`arena.allocator()` stores a pointer to `arena`. If `arena` is copied, allocators obtained
-from the old copy still point at the old location. The compiler SHOULD warn when an
-`Arena` whose `allocator()` has been called is later moved (`W0711`).
-
-### 15.3 `std/mem.page_allocator`
-
-`page_allocator` is a global `Allocator` backed by `memory.grow` on WASM and by the linear
-region reservation on native targets. On `wasm32-freestanding`, `free` is a no-op because
-WASM memory cannot shrink.
-
-### 15.4 `std/mem.FixedBuffer`
-
-`FixedBuffer` is a bump allocator over a caller-provided `[]mut u8`. It never grows and
-returns `error.OutOfMemory` when the buffer is full. It is intended for `static` arena
-patterns like the example in §17.
-
-
-### 15.5 Other modules and the host ABI
+### 15.2 Other modules and the host ABI
 
 The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `net`) is
 ordinary Phalange code; see `std/README.md`. It adds no language rules. Operating-system
@@ -2180,41 +2162,13 @@ precise location.
 // Build: phalange build dot_product.ph --target=wasm32-freestanding -O3 -o engine.wasm
 // =============================================================================
 
+import "std/mem" as mem;
+
 import host "env" {
     fn console_log(ptr: *u8, len: usize) void;
 }
 
-error { OutOfMemory, DimensionMismatch }
-
-// -----------------------------------------------------------------------------
-// Minimal bump arena over a caller-provided buffer
-// -----------------------------------------------------------------------------
-pub struct Arena {
-    memory: []mut u8,
-    offset: usize,
-
-    pub fn init(buffer: []mut u8) Arena {
-        return Arena.{ memory: buffer, offset: 0 };
-    }
-
-    /// `align` must be a power of two.
-    pub fn alloc(self: *mut Arena, size: usize, align: usize) ![]mut u8 {
-        let mask = align - 1;
-        let aligned = (self.offset + mask) & ~mask;
-
-        if (aligned + size) > self.memory.len {
-            return error.OutOfMemory;
-        }
-
-        let slice = self.memory[aligned..aligned + size];
-        self.offset = aligned + size;
-        return slice;
-    }
-
-    pub fn reset(self: *mut Arena) void {
-        self.offset = 0;
-    }
-}
+error { DimensionMismatch }
 
 // -----------------------------------------------------------------------------
 // SIMD dot product
@@ -2251,18 +2205,11 @@ pub fn dot_product_simd(a: []f32, b: []f32) !f32 {
 // -----------------------------------------------------------------------------
 // Exports
 // -----------------------------------------------------------------------------
-let mut HEAP_BYTES: [65536]u8 = [0; 65536];
-
 export fn compute(length: usize) f32 {
-    let mut arena = Arena.init(HEAP_BYTES[..]);
-    defer arena.reset();
-
-    let byte_size = length * @size_of(f32);
-    let raw_a = arena.alloc(byte_size, 16) catch return -1.0;
-    let raw_b = arena.alloc(byte_size, 16) catch return -1.0;
-
-    let vec_a = @cast_slice(f32, raw_a);
-    let vec_b = @cast_slice(f32, raw_b);
+    let vec_a = mem.alloc.[f32](length) catch return -1.0;
+    defer mem.free(vec_a);
+    let vec_b = mem.alloc.[f32](length) catch return -1.0;
+    defer mem.free(vec_b);
 
     for i in 0..length {
         vec_a[i] = 1.5;
@@ -2311,6 +2258,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@mem_eq(a, b)` | `[]T, []T → bool` | Bytewise. Lengths may differ, in which case the result is `false` |
 | `@memory_size()` | `→ usize` | In 64 KiB pages |
 | `@memory_grow(pages)` | `usize → !usize` | Returns the previous size, or `error.OutOfMemory` |
+| `@memory_discard(addr, len)` | `usize, usize → void` | The whole 64 KiB pages in `[addr, addr + len)` may be returned to the system; their bytes become unspecified (on native targets they read as zero). WebAssembly memory cannot shrink, so there it does nothing |
 
 ### A.4 Scalar integer and float
 
@@ -2403,6 +2351,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C11 | `pub` (module visibility) and `export` (WASM export) are distinct. Top-level `let`/`let mut` globals and `error { }` declarations were added to the grammar | The notes used these without grammar support |
 | C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
 | C13 | Raw pointers are fully defined through the linear-memory model (§12) | "Zero UB" and "raw pointers" conflict unless memory itself has defined semantics. WASM's model provides this, and it is adopted on all targets |
+| C14 | The notes' arena-centric memory (no global allocator; every allocation names an `Allocator`; `Arena`, `FixedBuffer`, `page_allocator`) was replaced by one global allocator, `std/mem` (§12.4, §15.1) | An allocator parameter on every container and every function that allocates spread through all APIs, and choosing among allocators was a decision agents got wrong more often than they gained from it. Allocation stays explicit: a call, never a language construct |
 | C14 | Error names must be declared (`error { … }`) | Prevents typos in `error.X` from silently creating new errors |
 | C15 | Added `for`, `loop`, compound assignment, `_ =` discards, and a no-shadowing rule | Needed by the notes' examples, or by the agent-ergonomics goal |
 | C16 | The diagnostic `suggested_fix.confidence` float became `fixes[].applicability` (an enum) plus byte-range `edits` | A float confidence is hard to act on. Byte-range edits can be applied mechanically |

@@ -32,9 +32,9 @@ fn step(bs: []mut Body, dt: f64) void {
 
 export fn main() i32 {
     let n: usize = 300;
-    let a = mem.page_allocator.alloc.[f64](n * n) catch return 1;
-    let b = mem.page_allocator.alloc.[f64](n * n) catch return 1;
-    let r = mem.page_allocator.alloc.[f64](n * n) catch return 1;
+    let a = mem.alloc.[f64](n * n) catch return 1;
+    let b = mem.alloc.[f64](n * n) catch return 1;
+    let r = mem.alloc.[f64](n * n) catch return 1;
     for i in 0..(n * n) {
         a[i] = @float_from_int(f64, i % 17) * 0.5;
         b[i] = @float_from_int(f64, i % 13) - 3.0;
@@ -52,7 +52,7 @@ export fn main() i32 {
     for i in 0..(n * n) {
         sum += r[i];
     }
-    let bs = mem.page_allocator.alloc.[Body](400) catch return 1;
+    let bs = mem.alloc.[Body](400) catch return 1;
     for i in 0..bs.len {
         let f = @float_from_int(f64, i);
         bs[i] = Body.{ x: f * 0.37, y: f * 0.11, vx: 0.0, vy: 0.0, m: 1.0 + (f * 0.001) };

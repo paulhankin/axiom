@@ -3,12 +3,9 @@
 import "common.ph" as c;
 import "std/hash" as hash;
 import "std/map" as map;
-import "std/mem" as mem;
 
 export fn main() i32 {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    let al = arena.allocator();
-    let mut m = map.Map.[u64, u64].init(al, hash.hash_u64, hash.eq_u64);
+    let mut m = map.Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);
     let n: u64 = 1_000_000;
     for i in @as(u64, 0)..n {
         m.put(i *% 2654435761, i) catch return 1;

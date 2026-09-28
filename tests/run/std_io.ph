@@ -58,10 +58,9 @@ fn demo() !void {
     }
     buffered.flush()!;
     f.close();
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
     let g = io.open(path)!;
-    let all = g.reader().read_all(arena.allocator())!;
+    let all = g.reader().read_all()!;
+    defer mem.free(all);
     g.close();
     out.print_u64(@as(u64, all.len))!;
     out.print("\n")!;  // expect: 3890

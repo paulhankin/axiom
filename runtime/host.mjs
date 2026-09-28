@@ -284,9 +284,9 @@ export function createHost(opts = {}) {
     },
     ph_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ph_sock_close: (h) => { net().call('close', { h }); },
-    ph_thread_spawn(entry, arg, stackTop) {
+    ph_thread_spawn(entry, arg, stackTop, exited) {
       const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
-        workerData: { module, memory, entry, arg, stackTop },
+        workerData: { module, memory, entry, arg, stackTop, exited },
       });
       // A trap in any thread terminates the whole program (spec §12.8).
       w.on('error', (e) => {

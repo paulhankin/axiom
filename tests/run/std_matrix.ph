@@ -1,7 +1,6 @@
 // std/matrix
 import "../lib/io.ph" as io;
 import "std/matrix" as mx;
-import "std/mem" as mem;
 
 fn err_of[T](r: !T) []u8 {
     _ = r catch |e| {
@@ -11,13 +10,10 @@ fn err_of[T](r: !T) []u8 {
 }
 
 export fn run() void {
-    let mut arena = mem.Arena.init(mem.page_allocator);
-    defer arena.deinit();
-    let al = arena.allocator();
     let av: [6]i64 = [1, 2, 3, 4, 5, 6];
     let bv: [6]i64 = [7, 8, 9, 10, 11, 12];
-    let a = mx.Matrix.[i64].from_slice(al, 2, 3, av[..]) catch return;
-    let b = mx.Matrix.[i64].from_slice(al, 3, 2, bv[..]) catch return;
+    let a = mx.Matrix.[i64].from_slice(2, 3, av[..]) catch return;
+    let b = mx.Matrix.[i64].from_slice(3, 2, bv[..]) catch return;
     let c = a.mul(&b) catch return;
     io.int(c.get(0, 0));  // expect: 58
     io.int(c.get(0, 1));  // expect: 64
@@ -29,8 +25,8 @@ export fn run() void {
     let s = a.add(&bt) catch return;
     io.int(s.get(1, 2));        // expect: 18
     io.str(err_of(a.mul(&a)));  // expect: DimensionMismatch
-    let id = mx.Matrix.[f64].identity(al, 3) catch return;
-    let mut m = mx.Matrix.[f64].init(al, 3, 3) catch return;
+    let id = mx.Matrix.[f64].identity(3) catch return;
+    let mut m = mx.Matrix.[f64].init(3, 3) catch return;
     m.set(0, 2, 2.5);
     let p = m.mul(&id) catch return;
     io.boolean(p.equals(&m));  // expect: true

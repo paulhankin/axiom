@@ -2,7 +2,6 @@
 // native-only
 import "../lib/io.ph" as io;
 import "std/c" as c;
-import "std/mem" as mem;
 
 extern "C" {
     fn strlen(s: *u8) usize;
@@ -28,10 +27,9 @@ fn cmp_i32(a: *void, b: *void) i32 {
 }
 
 export fn run() void {
-    let al = mem.page_allocator;
-    let s = c.to_cstr(al, "phalange") catch return;
+    let s = c.to_cstr("phalange") catch return;
     io.uint(@as(u64, strlen(s)));  // expect: 8
-    c.free_cstr(al, s);
+    c.free_cstr(s);
     let mut buf: [64]u8 = [0; 64];
     let n = snprintf(&mut buf[0], buf.len, "%d-%s-%.2f".ptr, 42, "x".ptr, 0.5);
     io.str(buf[..@int_cast(usize, n)]);  // expect: 42-x-0.50

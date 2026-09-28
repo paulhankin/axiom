@@ -1,20 +1,61 @@
-// The standard allocators.
+// The global allocator (std/mem): small and large objects, realloc, create,
+// and memory accounted for after everything is freed.
 import "../lib/io.ph" as io;
 import "std/mem" as mem;
 
-let mut BUF: [256]u8 = [0; 256];
+struct Point {
+    x: i64,
+    y: i64,
+}
 
 export fn run() void {
-    let mut fb = mem.FixedBuffer.init(BUF[..]);
-    let a = fb.allocator();
-    let xs = a.alloc.[u64](8) catch return;
+    let base = mem.in_use();
+    let xs = mem.alloc.[u64](8) catch return;
     for i in 0..xs.len {
         xs[i] = @as(u64, i) * 3;
     }
     io.uint(xs[7]);  // expect: 21
-    let too_big = a.alloc.[u64](100) catch |e| {
+    // many small objects of many sizes, freed in another order
+    let ptrs = mem.alloc.[[]mut u8](2000) catch return;
+    for i in 0..ptrs.len {
+        ptrs[i] = mem.alloc.[u8](1 + ((i * 37) % 3000)) catch return;
+        ptrs[i][0] = @truncate(u8, i);
+    }
+    let mut ok = true;
+    let mut k: usize = 0;
+    while k < ptrs.len {
+        ok = ok and (ptrs[k][0] == @truncate(u8, k));
+        mem.free(ptrs[k]);
+        k += 2;
+    }
+    k = 1;
+    while k < ptrs.len {
+        ok = ok and (ptrs[k][0] == @truncate(u8, k));
+        mem.free(ptrs[k]);
+        k += 2;
+    }
+    mem.free(ptrs);
+    io.boolean(ok);  // expect: true
+    // a growing buffer
+    let mut buf = mem.alloc.[u32](1) catch return;
+    buf[0] = 7;
+    let mut n: usize = 1;
+    while n < 300000 {
+        n *= 2;
+        buf = mem.realloc(buf, n) catch return;
+        buf[n - 1] = @truncate(u32, n);
+    }
+    io.uint(@as(u64, buf[0]));      // expect: 7
+    io.uint(@as(u64, buf[n - 1]));  // expect: 524288
+    mem.free(buf);
+    let p = mem.create(Point.{ x: 3, y: 4 }) catch return;
+    io.int(p.x * p.y);  // expect: 12
+    mem.destroy(p);
+    mem.free(xs);
+    io.boolean(mem.in_use() == base);  // expect: true
+    // more than there is
+    _ = mem.alloc.[u64](@max_value(usize) / 4) catch |e| {
         io.str(@error_name(e));  // expect: OutOfMemory
         return;
     };
-    _ = too_big;
 }

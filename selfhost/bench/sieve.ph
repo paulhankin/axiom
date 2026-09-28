@@ -4,7 +4,7 @@ import "std/mem" as mem;
 
 export fn main() i32 {
     let n: usize = 20_000_000;
-    let flags = mem.page_allocator.alloc.[u8](n + 1) catch return 1;
+    let flags = mem.alloc.[u8](n + 1) catch return 1;
     let mut total: u64 = 0;
     for _round in 0..@as(usize, 5) {
         for i in 0..(n + 1) {

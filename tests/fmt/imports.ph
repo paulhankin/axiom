@@ -5,8 +5,10 @@ import "std/io" as io;
 import "std/hash" as hash;
 import "std/vec" as vec;
 
-fn make() vec.Vec.[i32] {
-    let v = vec.Vec.[i32].init(mem.page_allocator);
+fn make() !vec.Vec.[i32] {
+    let v = vec.Vec.[i32].init();
+    let scratch = mem.alloc.[u8](16)!;
+    mem.free(scratch);
     return v;
 }
 

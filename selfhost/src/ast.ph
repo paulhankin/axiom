@@ -223,8 +223,9 @@ pub const BI_FENCE: i32 = 78;
 pub const BI_EXPECT: i32 = 79;
 pub const BI_EXPECT_EQ: i32 = 80;
 pub const BI_ERROR_NAME: i32 = 81;
+pub const BI_MEMORY_DISCARD: i32 = 82;
 
-pub const BI_COUNT: i32 = 82;
+pub const BI_COUNT: i32 = 83;
 
 pub fn builtin_name(i: i32) []u8 {
     let t = ["size_of", "align_of", "offset_of", "min_value", "max_value", "as", "int_cast", "truncate",
@@ -236,7 +237,7 @@ pub fn builtin_name(i: i32) []u8 {
              "lanes_ne", "lanes_lt", "lanes_le", "lanes_gt", "lanes_ge", "select", "any_true", "all_true", "bitmask",
              "reduce_add", "dot", "trap", "atomic_load", "atomic_store", "atomic_add", "atomic_sub", "atomic_and",
              "atomic_or", "atomic_xor", "atomic_xchg", "atomic_min", "atomic_max", "atomic_cas", "atomic_wait",
-             "atomic_notify", "fence", "expect", "expect_eq", "error_name"];
+             "atomic_notify", "fence", "expect", "expect_eq", "error_name", "memory_discard"];
     return t[@int_cast(usize, i)];
 }
 
@@ -245,7 +246,7 @@ pub fn builtin_sig(i: i32) []u8 {
              "ee", "ee", "", "e", "e", "e", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "e", "e",
              "e", "e", "e", "e", "eee", "ee", "ee", "e", "t*", "ee", "eee", "te", "ee", "eee", "ee", "ee", "ee", "ee",
              "ee", "ee", "ee", "eee", "e", "e", "e", "e", "ee", "", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee",
-             "ee", "eee", "eee", "ee", "", "e", "ee", "e"];
+             "ee", "eee", "eee", "ee", "", "e", "ee", "e", "ee"];
     return t[@int_cast(usize, i)];
 }
 

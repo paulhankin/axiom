@@ -25,7 +25,7 @@ fn same(a: []u8, b: []u8) bool {
 
 export fn main() i32 {
     let n: usize = 30_000_000;
-    let text = mem.page_allocator.alloc.[u8](n) catch return 1;
+    let text = mem.alloc.[u8](n) catch return 1;
     let mut s: u32 = 12345;
     for i in 0..n {
         s = (s *% 1103515245) +% 12345;
@@ -37,8 +37,8 @@ export fn main() i32 {
         }
     }
     let cap: usize = 1 << 16;
-    let keys = mem.page_allocator.alloc.[[]u8](cap) catch return 1;
-    let counts = mem.page_allocator.alloc.[u64](cap) catch return 1;
+    let keys = mem.alloc.[[]u8](cap) catch return 1;
+    let counts = mem.alloc.[u64](cap) catch return 1;
     for i in 0..cap {
         keys[i] = text[0..0];
         counts[i] = 0;

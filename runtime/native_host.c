@@ -8,13 +8,16 @@
 #include <linux/futex.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <time.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -147,6 +150,7 @@ typedef void (*ph_entry)(void *);
 struct thread_start {
     ph_entry entry;
     void *arg;
+    uint32_t *exited;
 };
 
 void ph_install_crash_stack(void);
@@ -156,17 +160,20 @@ static void *thread_main(void *p) {
     free(p);
     ph_install_crash_stack();
     st.entry(st.arg);
+    __atomic_store_n(st.exited, 1, __ATOMIC_SEQ_CST);
+    ph_notify32(st.exited, 1);
     return NULL;
 }
 
 // stack_top is ignored: native threads get their stack from the OS.
-int32_t ph_thread_spawn(ph_entry entry, void *arg, size_t stack_top) {
+int32_t ph_thread_spawn(ph_entry entry, void *arg, size_t stack_top, uint32_t *exited) {
     (void)stack_top;
     static int32_t next_id = 1;
     struct thread_start *st = malloc(sizeof *st);
     if (!st) return PH_ERR;
     st->entry = entry;
     st->arg = arg;
+    st->exited = exited;
     pthread_t t;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -214,6 +221,56 @@ int32_t ph_wait32(uint32_t *p, uint32_t expected, int64_t timeout_ns) {
 int32_t ph_notify32(uint32_t *p, int32_t count) {
     long r = syscall(SYS_futex, p, FUTEX_WAKE_PRIVATE, count < 0 ? 0x7fffffff : count, NULL, NULL, 0);
     return r < 0 ? 0 : (int32_t)r;
+}
+
+// Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
+// region reserved at the first use. The region is as large as the system
+// allows (up to 1 TiB of address space); the kernel supplies physical pages
+// only when they are touched.
+static uintptr_t mem_base;       // 64 KiB-aligned start of the region
+static size_t mem_limit;         // its size in pages
+static size_t mem_pages;         // pages handed out
+static uint32_t mem_state;       // 0: not reserved, 1: reserving, 2: ready, 3: failed
+
+static void mem_reserve(void) {
+    uint32_t zero = 0;
+    if (__atomic_compare_exchange_n(&mem_state, &zero, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        for (size_t size = (size_t)1 << 40; size >= ((size_t)1 << 28); size /= 2) {
+            void *p = mmap(NULL, size + 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (p != MAP_FAILED) {
+                mem_base = ((uintptr_t)p + 65535) & ~(uintptr_t)65535;
+                mem_limit = size / 65536;
+                __atomic_store_n(&mem_state, 2, __ATOMIC_SEQ_CST);
+                return;
+            }
+        }
+        __atomic_store_n(&mem_state, 3, __ATOMIC_SEQ_CST);
+        return;
+    }
+    while (__atomic_load_n(&mem_state, __ATOMIC_SEQ_CST) == 1) sched_yield();
+}
+
+intptr_t ph_memory_size(void) {
+    if (__atomic_load_n(&mem_state, __ATOMIC_SEQ_CST) != 2) mem_reserve();
+    return (intptr_t)(mem_base / 65536 + __atomic_load_n(&mem_pages, __ATOMIC_SEQ_CST));
+}
+
+// The previous size in pages (as ph_memory_size counts them), or -1.
+intptr_t ph_memory_grow(intptr_t n) {
+    if (__atomic_load_n(&mem_state, __ATOMIC_SEQ_CST) != 2) mem_reserve();
+    if (mem_state != 2 || n < 0) return -1;
+    size_t old = __atomic_load_n(&mem_pages, __ATOMIC_SEQ_CST);
+    do {
+        if ((size_t)n > mem_limit - old) return -1;
+    } while (!__atomic_compare_exchange_n(&mem_pages, &old, old + (size_t)n, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    return (intptr_t)(mem_base / 65536 + old);
+}
+
+// @memory_discard: the whole 64 KiB pages in the range go back to the system
+// (they stay mapped, and read as zero when next touched).
+void ph_memory_discard(uintptr_t addr, size_t len) {
+    uintptr_t a = (addr + 65535) & ~(uintptr_t)65535, b = (addr + len) & ~(uintptr_t)65535;
+    if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);
 }
 
 // Defined by runtime/profile.c when profiling: writes the samples so far.

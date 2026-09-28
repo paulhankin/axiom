@@ -26,6 +26,7 @@ fn bnil() *mut ir.Block {
 const SMALL: i32 = 30;          // always worth inlining
 const ONE_CALLER: i32 = 1200;   // an internal function called once
 const CALLER_MAX: i32 = 20000;  // stop growing a caller beyond this
+const TAIL_MAX: i32 = 120;      // a callee called in tail position, from one place
 
 pub fn callee_of(i: *ir.Value) *mut ir.Func {
     if (i.op == ir.OP_CALL) and (i.a.kind == ir.V_FUNC) {
@@ -396,6 +397,45 @@ fn sccs(order: *mut u.List.[*mut Node]) void {
     u.free(@ptr_cast(*mut void, ci.data));
 }
 
+// Is c in tail position: its result (if any) returned straight away? Stores
+// that do not involve the result (the shadow stack's pop) may come between.
+fn tail_call(c: *mut ir.Value) bool {
+    let mut v = c;  // the value that must be returned
+    let mut from = c.blk;
+    let mut n = c.next;
+    let mut hops: i32 = 0;
+    loop {
+        while u.notnil(n) and (n.op == ir.OP_STORE) and (ir.resolve(n.a) != v) and (ir.resolve(n.b) != v) {
+            n = n.next;
+        }
+        if u.isnil(n) {
+            return false;
+        }
+        if n.op == ir.OP_RET {
+            if u.isnil(n.a) {
+                return c.ty.kind == ir.T_VOID;
+            }
+            return ir.resolve(n.a) == v;
+        }
+        if (n.op != ir.OP_BR) or u.isnil(n.t1) or (hops == 4) {
+            return false;
+        }
+        hops += 1;
+        let t = n.t1;
+        let mut x = t.first;
+        while u.notnil(x) and (x.op == ir.OP_PHI) {
+            for j in 0..x.bs.len {
+                if (x.bs.get(j) == from) and (ir.resolve(x.xs.get(j)) == v) {
+                    v = x;
+                }
+            }
+            x = x.next;
+        }
+        from = t;
+        n = x;
+    }
+}
+
 // Should call c (in f, whose current cost is fcost) be inlined?
 fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
     let g = callee_of(c);
@@ -414,6 +454,11 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
         return false;
     }
     if (g.linkage == ir.LINK_INTERNAL) and (gn.calls == 1) and not gn.addr_taken and (g.export_name.len == 0) {
+        // `return slow(x)` after a fast path: inlining saves only the call
+        // but makes the caller's fast path pay for the callee's frame
+        if tail_call(c) and (gc > TAIL_MAX) {
+            return false;
+        }
         return gc <= ONE_CALLER;
     }
     // constant arguments and addresses of the caller's stack slots enable

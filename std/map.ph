@@ -5,10 +5,10 @@
 // Phalange has no traits, so a map is given its hash and equality functions
 // when it is created:
 //
-//     let mut m = map.Map.[u64, u32].init(alloc, hash.hash_u64, hash.eq_u64);
+//     let mut m = map.Map.[u64, u32].init(hash.hash_u64, hash.eq_u64);
 //
 // Keys and values are stored by value. For []u8 keys only the slice is
-// stored, not the bytes it points to: keep the bytes alive (e.g. in an Arena).
+// stored, not the bytes it points to: keep the bytes alive for as long as the map.
 //
 // A control byte is EMPTY, DELETED, or for a full slot the top 7 bits of its
 // key's hash. A lookup starts at the group the hash's low bits pick and
@@ -32,7 +32,6 @@ fn tag(h: u64) u8 {
 }
 
 pub struct Map[K, V] {
-    alloc: mem.Allocator,
     hash_fn: fn(K) u64,
     eq_fn: fn(K, K) bool,
     keys: []mut K,
@@ -41,9 +40,8 @@ pub struct Map[K, V] {
     count: usize,    // full slots
     used: usize,     // full and DELETED slots
 
-    pub fn init(alloc: mem.Allocator, hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
+    pub fn init(hash_fn: fn(K) u64, eq_fn: fn(K, K) bool) Self {
         return Self.{
-            alloc: alloc,
             hash_fn: hash_fn,
             eq_fn: eq_fn,
             keys: @slice_from_ptr(@ptr_from_int(*mut K, @align_of(K)), 0),
@@ -56,9 +54,9 @@ pub struct Map[K, V] {
 
     pub fn deinit(self: *mut Self) void {
         if self.ctrl.len > 0 {
-            self.alloc.free(self.keys);
-            self.alloc.free(self.vals);
-            self.alloc.free(self.ctrl);
+            mem.free(self.keys);
+            mem.free(self.vals);
+            mem.free(self.ctrl);
         }
         self.keys = @slice_from_ptr(@ptr_from_int(*mut K, @align_of(K)), 0);
         self.vals = @slice_from_ptr(@ptr_from_int(*mut V, @align_of(V)), 0);
@@ -133,14 +131,14 @@ pub struct Map[K, V] {
 
     // Rehash into a table of `cap` slots (a power of two >= GROUP, > count).
     fn rehash(self: *mut Self, cap: usize) !void {
-        let nk = self.alloc.alloc.[K](cap)!;
-        let nv = self.alloc.alloc.[V](cap) catch |e| {
-            self.alloc.free(nk);
+        let nk = mem.alloc.[K](cap)!;
+        let nv = mem.alloc.[V](cap) catch |e| {
+            mem.free(nk);
             return e;
         };
-        let nc = self.alloc.alloc.[u8](cap) catch |e| {
-            self.alloc.free(nk);
-            self.alloc.free(nv);
+        let nc = mem.alloc.[u8](cap) catch |e| {
+            mem.free(nk);
+            mem.free(nv);
             return e;
         };
         @mem_set(nc, EMPTY);
@@ -160,9 +158,9 @@ pub struct Map[K, V] {
             }
         }
         if oc.len > 0 {
-            self.alloc.free(ok);
-            self.alloc.free(ov);
-            self.alloc.free(oc);
+            mem.free(ok);
+            mem.free(ov);
+            mem.free(oc);
         }
         self.used = self.count;
     }
@@ -266,7 +264,7 @@ pub struct Iter[K, V] {
 import "hash.ph" as hash;
 
 test "put, get, overwrite, remove" {
-    let mut m = Map.[u64, u64].init(mem.page_allocator, hash.hash_u64, hash.eq_u64);
+    let mut m = Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);
     defer m.deinit();
     for i in @as(u64, 0)..1000 {
         m.put(i, i * 2)!;
@@ -282,7 +280,7 @@ test "put, get, overwrite, remove" {
 }
 
 test "missing key is NotFound" {
-    let mut m = Map.[u32, u32].init(mem.page_allocator, hash.hash_u32, hash.eq_u32);
+    let mut m = Map.[u32, u32].init(hash.hash_u32, hash.eq_u32);
     _ = m.get(7) catch |e| {
         @expect_eq(e, error.NotFound);
         return;
@@ -291,7 +289,7 @@ test "missing key is NotFound" {
 }
 
 test "tombstones are reused" {
-    let mut m = Map.[u64, u8].init(mem.page_allocator, hash.hash_u64, hash.eq_u64);
+    let mut m = Map.[u64, u8].init(hash.hash_u64, hash.eq_u64);
     defer m.deinit();
     for round in @as(u64, 0)..50 {
         for i in @as(u64, 0)..100 {
@@ -306,7 +304,7 @@ test "tombstones are reused" {
 }
 
 test "iteration visits every entry once" {
-    let mut m = Map.[[]u8, u32].init(mem.page_allocator, hash.hash_bytes, hash.eq_bytes);
+    let mut m = Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);
     defer m.deinit();
     m.put("a", 1)!;
     m.put("b", 2)!;
@@ -325,7 +323,7 @@ test "iteration visits every entry once" {
 }
 
 test "random operations agree with an array" {
-    let mut m = Map.[u64, u64].init(mem.page_allocator, hash.hash_u64, hash.eq_u64);
+    let mut m = Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);
     defer m.deinit();
     let mut ref: [512]u64 = [0; 512];  // 0: absent, else value + 1
     let mut s: u64 = 0x9E3779B97F4A7C15;
@@ -366,7 +364,7 @@ fn same_hash(x: u64) u64 {
 }
 
 test "keys with the same hash probe past full groups" {
-    let mut m = Map.[u64, u64].init(mem.page_allocator, same_hash, hash.eq_u64);
+    let mut m = Map.[u64, u64].init(same_hash, hash.eq_u64);
     defer m.deinit();
     for i in @as(u64, 0)..100 {
         m.put(i, i + 7)!;

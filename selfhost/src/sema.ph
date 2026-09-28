@@ -3424,6 +3424,11 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         _ = check_expr_to(earg(e, 0), ty.t_usize);
         return set_ty(e, ty.type_errunion(ty.t_usize));
     }
+    if id == ast.BI_MEMORY_DISCARD {
+        _ = check_expr_to(earg(e, 0), ty.t_usize);
+        _ = check_expr_to(earg(e, 1), ty.t_usize);
+        return set_ty(e, ty.t_void);
+    }
     if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT) {
         let t = operand(earg(e, 0), x);
         if not is_int_like(t) {

@@ -11,21 +11,20 @@ import "mem.ph" as mem;
 error { DimensionMismatch, OutOfMemory }
 
 pub struct Matrix[T: Num] {
-    alloc: mem.Allocator,
     rows: usize,
     cols: usize,
     data: []mut T,  // row-major: element (r, c) is data[r * cols + c]
 
     /// A rows x cols matrix of zeros.
-    pub fn init(alloc: mem.Allocator, rows: usize, cols: usize) !Self {
+    pub fn init(rows: usize, cols: usize) !Self {
         let n = @mul_checked(rows, cols) catch return error.OutOfMemory;
-        let data = alloc.alloc.[T](n)!;
+        let data = mem.alloc.[T](n)!;
         @mem_set(data, 0);
-        return Self.{ alloc: alloc, rows: rows, cols: cols, data: data };
+        return Self.{ rows: rows, cols: cols, data: data };
     }
 
-    pub fn identity(alloc: mem.Allocator, n: usize) !Self {
-        let mut m = Self.init(alloc, n, n)!;
+    pub fn identity(n: usize) !Self {
+        let mut m = Self.init(n, n)!;
         for i in 0..n {
             m.data[(i * n) + i] = 1;
         }
@@ -33,19 +32,19 @@ pub struct Matrix[T: Num] {
     }
 
     /// Copies `xs` (row-major, rows * cols elements) into a new matrix.
-    pub fn from_slice(alloc: mem.Allocator, rows: usize, cols: usize, xs: []T) !Self {
+    pub fn from_slice(rows: usize, cols: usize, xs: []T) !Self {
         let n = @mul_checked(rows, cols) catch return error.DimensionMismatch;
         if n != xs.len {
             return error.DimensionMismatch;
         }
-        let m = Self.init(alloc, rows, cols)!;
+        let m = Self.init(rows, cols)!;
         @mem_copy(m.data, xs);
         return m;
     }
 
     pub fn deinit(self: *mut Self) void {
         if self.data.len > 0 {
-            self.alloc.free(self.data);
+            mem.free(self.data);
         }
         self.rows = 0;
         self.cols = 0;
@@ -75,7 +74,7 @@ pub struct Matrix[T: Num] {
     }
 
     pub fn clone(self: *Self) !Self {
-        return Self.from_slice(self.alloc, self.rows, self.cols, self.data);
+        return Self.from_slice(self.rows, self.cols, self.data);
     }
 
     /// self + other, as a new matrix.
@@ -83,7 +82,7 @@ pub struct Matrix[T: Num] {
         if (self.rows != other.rows) or (self.cols != other.cols) {
             return error.DimensionMismatch;
         }
-        let m = Self.init(self.alloc, self.rows, self.cols)!;
+        let m = Self.init(self.rows, self.cols)!;
         for i in 0..self.data.len {
             m.data[i] = self.data[i] + other.data[i];
         }
@@ -95,7 +94,7 @@ pub struct Matrix[T: Num] {
         if (self.rows != other.rows) or (self.cols != other.cols) {
             return error.DimensionMismatch;
         }
-        let m = Self.init(self.alloc, self.rows, self.cols)!;
+        let m = Self.init(self.rows, self.cols)!;
         for i in 0..self.data.len {
             m.data[i] = self.data[i] - other.data[i];
         }
@@ -114,7 +113,7 @@ pub struct Matrix[T: Num] {
         if self.cols != other.rows {
             return error.DimensionMismatch;
         }
-        let m = Self.init(self.alloc, self.rows, other.cols)!;
+        let m = Self.init(self.rows, other.cols)!;
         let n = other.cols;
         for r in 0..self.rows {
             for k in 0..self.cols {
@@ -130,7 +129,7 @@ pub struct Matrix[T: Num] {
     }
 
     pub fn transpose(self: *Self) !Self {
-        let m = Self.init(self.alloc, self.cols, self.rows)!;
+        let m = Self.init(self.cols, self.rows)!;
         for r in 0..self.rows {
             for c in 0..self.cols {
                 m.data[(c * self.rows) + r] = self.data[(r * self.cols) + c];
@@ -263,10 +262,9 @@ pub struct Mat4 {
 // -----------------------------------------------------------------------------
 
 test "matrix product" {
-    let al = mem.page_allocator;
     let av: [4]i32 = [1, 2, 3, 4];
-    let a = Matrix.[i32].from_slice(al, 2, 2, av[..])!;
-    let id = Matrix.[i32].identity(al, 2)!;
+    let a = Matrix.[i32].from_slice(2, 2, av[..])!;
+    let id = Matrix.[i32].identity(2)!;
     let p = a.mul(&id)!;
     @expect(p.equals(&a));
     let sq = a.mul(&a)!;
@@ -275,8 +273,7 @@ test "matrix product" {
 }
 
 test "dimension mismatch" {
-    let al = mem.page_allocator;
-    let a = Matrix.[f64].init(al, 2, 3)!;
+    let a = Matrix.[f64].init(2, 3)!;
     _ = a.mul(&a) catch |e| {
         @expect_eq(e, error.DimensionMismatch);
         return;
