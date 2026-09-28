@@ -243,7 +243,75 @@ fn fill_words(xs: []mut u32, n: usize) u64 {
     return s;
 }
 
+// Loops with bounds checks the loop condition does not imply (run in two
+// parts: without the checks up to the smallest bound, then with them).
+fn copy_add(dst: []mut u32, src: []u32, lo: usize, hi: usize) u64 {
+    let mut s: u64 = 0;
+    let mut i = lo;
+    while i < hi {
+        dst[i] = src[i] + 1;
+        s += @as(u64, dst[i]);
+        i += 1;
+    }
+    return (s * 1000) + @as(u64, i);
+}
+
+// Stores in both arms of a choice (one store of a selected value).
+fn store_either(xs: []mut i64, c: bool, v: i64) i64 {
+    if xs.len < 3 {
+        return -1;
+    }
+    if c {
+        xs[1] = v;
+    } else {
+        xs[1] = v * 2;
+    }
+    if c {
+        xs[0] = 7;
+    } else {
+        xs[2] = 7;
+    }
+    return (xs[0] * 100) + (xs[1] * 10) + xs[2];
+}
+
+// A choice whose result indexes the next load (kept as a branch).
+fn heap_path(xs: []u32, n: usize) u64 {
+    let mut root: usize = 0;
+    let mut s: u64 = 0;
+    loop {
+        let child = (2 * root) + 1;
+        if child >= n {
+            return s + @as(u64, root);
+        }
+        let mut top = root;
+        if xs[top] < xs[child] {
+            top = child;
+        }
+        if ((child + 1) < n) and (xs[top] < xs[child + 1]) {
+            top = child + 1;
+        }
+        if top == root {
+            return s + @as(u64, root);
+        }
+        s = (s * 10) + @as(u64, xs[top]);
+        root = top;
+    }
+}
+
 export fn run() void {
+    let src: [6]u32 = [1, 2, 3, 4, 5, 6];
+    let mut dst: [4]u32 = [0; 4];
+    io.uint(copy_add(dst[..], src[..], 1, 4));  // expect: 12004
+    io.uint(copy_add(dst[..], src[..], 5, 2));  // expect: 5
+    io.uint(copy_add(dst[..], src[..], 0, 0));  // expect: 0
+    io.uint(@as(u64, dst[0]) + @as(u64, dst[3]));  // expect: 5
+    let mut es: [3]i64 = [0; 3];
+    io.int(store_either(es[..], true, 4));     // expect: 740
+    io.int(store_either(es[..], false, 4));    // expect: 787
+    let hp: [7]u32 = [1, 5, 9, 2, 3, 8, 4];
+    io.uint(heap_path(hp[..], 7));             // expect: 11
+    io.uint(heap_path(hp[..], 2));             // expect: 6
+
     io.uint(digits(343073));                    // expect: 18000343073
     io.uint(digits(0));                         // expect: 23000000000
     io.uint(leading_spaces("   ab "));          // expect: 3

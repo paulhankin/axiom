@@ -93,5 +93,21 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
             }
             inl.inline_module(m, resimplify);
         }
+        for i in 0..m.funcs.len {
+            let f = m.funcs.get(i);
+            if not ir.is_decl(f) and gvn.split_loops(f) {
+                let mut rounds: i32 = 0;
+                while (rounds < 3) and gvn.gvn(f) {
+                    cleanup(f, level);
+                    rounds += 1;
+                }
+                if gvn.licm(f) {
+                    cleanup(f, level);
+                    _ = gvn.gvn(f);
+                    cleanup(f, level);
+                }
+                opt.dce(f);
+            }
+        }
     }
 }

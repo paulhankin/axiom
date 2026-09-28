@@ -522,6 +522,7 @@ pub struct Block {
     aux: i64,
     auxp: *mut void,
     mark: i64,         // pass scratch that survives CFG analyses
+    split: bool,       // a loop header whose range was split (gvn.split_loops)
 }
 
 pub const LINK_EXTERNAL: i32 = 0;

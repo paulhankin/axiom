@@ -507,6 +507,49 @@ fn drop_input(p: *mut ir.Value, from: *mut ir.Block) void {
     }
 }
 
+// Values that go into the address of a load (marked aux2 = addr_gen). A
+// select there puts the compare before it on the path to the load, where
+// a branch lets the processor predict and load early: loops walking a
+// heap or a tree by comparisons keep their branches.
+let mut addr_gen: i64 = 0;
+
+fn mark_addr(v: *mut ir.Value, depth: i32) void {
+    if (v.kind != ir.V_INST) or (depth > 4) or (v.aux2 == addr_gen) {
+        return;
+    }
+    v.aux2 = addr_gen;
+    let op = v.op;
+    if (op == ir.OP_PTRADD) or (op == ir.OP_ADD) or (op == ir.OP_SUB) {
+        mark_addr(ir.resolve(v.a), depth + 1);
+        mark_addr(ir.resolve(v.b), depth + 1);
+    } else if (op == ir.OP_MUL) or (op == ir.OP_SHL) or (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or
+              (op == ir.OP_TRUNC) {
+        mark_addr(ir.resolve(v.a), depth + 1);
+    } else if op == ir.OP_SELECT {
+        mark_addr(ir.resolve(v.b), depth + 1);
+        mark_addr(ir.resolve(v.c), depth + 1);
+    } else if (op == ir.OP_PHI) and (v.xs.len <= 4) {
+        for k in 0..v.xs.len {
+            mark_addr(ir.resolve(v.xs.get(k)), depth + 1);
+        }
+    }
+}
+
+fn mark_addrs(f: *mut ir.Func) void {
+    addr_gen += 1;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_LOAD {
+                mark_addr(ir.resolve(i.a), 0);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
 // D ends in condbr c -> t, e. Converts the triangles d -> t -> e, d -> e
 // and d -> e -> t, d -> t, and the diamond d -> t -> m, d -> e -> m.
 fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
@@ -556,6 +599,13 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
     }
     if (cost > MAX_SPEC) or (phi_count(m) > MAX_SELECTS) {
         return false;
+    }
+    let mut p0 = m.first;
+    while u.notnil(p0) and (p0.op == ir.OP_PHI) {
+        if p0.aux2 == addr_gen {
+            return false;
+        }
+        p0 = p0.next;
     }
     // the values arriving at m on the true and the false path
     let mut tb = d;
@@ -671,6 +721,7 @@ pub fn if_convert(f: *mut ir.Func) bool {
         return false;
     }
     opt.compute_preds(f);
+    mark_addrs(f);
     let mut any = false;
     let mut b = f.first;
     while u.notnil(b) {

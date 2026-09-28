@@ -735,6 +735,20 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     if (op == ir.OP_LSHR) or (op == ir.OP_UDIV) {
         return le_path(x.a, y, bound, depth + 1);
     }
+    if (op == ir.OP_SELECT) and (x.a.ty.kind == ir.T_INT) {
+        // each arm under its condition (min(a, b) <= a and <= b)
+        let mark = ents.len;
+        assume(x.a, true, 0);
+        let ok = le_path(x.b, y, bound, depth + 1);
+        pop_to(mark);
+        if not ok {
+            return false;
+        }
+        assume(x.a, false, 0);
+        let ok2 = le_path(x.c, y, bound, depth + 1);
+        pop_to(mark);
+        return ok2;
+    }
     if op == ir.OP_AND {
         if small_k(x.b) and le_path(vnil(), y, bound - kv(x.b), depth + 1) {
             return true;
@@ -2177,6 +2191,279 @@ pub fn loop_idioms(f: *mut ir.Func) bool {
     u.free(@ptr_cast(*mut void, hs.data));
     if any {
         ir.remove_unreachable(f);
+    }
+    return any;
+}
+
+// -----------------------------------------------------------------------------
+// Range splitting for bounds checks: a loop whose header leaves it when
+// i >= end, and whose body checks i < L (L invariant, the failing side
+// trapping), first runs as a copy that leaves when i >= min(end, L, ...), in
+// which the checks always pass (value numbering removes them), then as
+// itself from where the copy stopped: done at once when end <= L, else on to
+// the failing check.
+//     pre -> H' (the copy) ... H' -> mid -> H (the loop) ... H -> exit
+// Every other way out of the loop must be to a block that traps and uses
+// nothing computed in the loop.
+// -----------------------------------------------------------------------------
+const SPLIT_MAX: i32 = 160;   // instructions in a loop that is copied
+
+fn trap_exit(x: *mut ir.Block, tag: i64) bool {
+    let t = ir.terminator(x);
+    if (x.mark == tag) or u.isnil(t) or (t.op != ir.OP_UNREACHABLE) {
+        return false;
+    }
+    let mut i = x.first;
+    while u.notnil(i) {
+        if (i.op == ir.OP_PHI) or not invariant(i.a, tag) or not invariant(i.b, tag) or not invariant(i.c, tag) {
+            return false;
+        }
+        for k in 0..i.xs.len {
+            if not invariant(i.xs.get(k), tag) {
+                return false;
+            }
+        }
+        i = i.next;
+    }
+    return true;
+}
+
+// The bound L of a check i < L ending block x (trapping otherwise), or nil.
+fn check_bound(x: *mut ir.Block, i: *mut ir.Value, tag: i64) *mut ir.Value {
+    let t = ir.terminator(x);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) {
+        return vnil();
+    }
+    let c = ir.resolve(t.a);
+    if not is_inst(c, ir.OP_ICMP) or (ir.resolve(c.a) != i) {
+        return vnil();
+    }
+    let l = ir.resolve(c.b);
+    if (l.ty != i.ty) or not invariant(l, tag) {
+        return vnil();
+    }
+    let p = cb.pred_of(c);
+    if (p == ir.IntULT) and (t.t1.mark == tag) and trap_exit(t.t2, tag) {
+        return l;
+    }
+    if (p == ir.IntUGE) and (t.t2.mark == tag) and trap_exit(t.t1, tag) {
+        return l;
+    }
+    return vnil();
+}
+
+fn map_in(v: *mut ir.Value, tag: i64) *mut ir.Value {
+    if u.notnil(v) and (v.kind == ir.V_INST) and u.notnil(v.blk) and (v.blk.mark == tag) {
+        return @ptr_cast(*mut ir.Value, v.auxp);
+    }
+    return v;
+}
+
+fn map_blk_in(b: *mut ir.Block, tag: i64) *mut ir.Block {
+    if u.notnil(b) and (b.mark == tag) {
+        return @ptr_cast(*mut ir.Block, b.auxp);
+    }
+    return b;
+}
+
+fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    let ht = ir.terminator(h);
+    if h.split or u.isnil(ht) or (ht.op != ir.OP_CONDBR) {
+        return false;
+    }
+    // the header's test: i < end
+    let c = ir.resolve(ht.a);
+    if not is_inst(c, ir.OP_ICMP) {
+        return false;
+    }
+    let i = ir.resolve(c.a);
+    let end = ir.resolve(c.b);
+    if not is_inst(i, ir.OP_PHI) or (i.blk != h) or (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or
+       (end.ty != i.ty) or not invariant(end, tag) {
+        return false;
+    }
+    let p = cb.pred_of(c);
+    let mut exit = ir.bnil();
+    if (p == ir.IntULT) and (ht.t1.mark == tag) and (ht.t2.mark != tag) {
+        exit = ht.t2;
+    } else if (p == ir.IntUGE) and (ht.t2.mark == tag) and (ht.t1.mark != tag) {
+        exit = ht.t1;
+    } else {
+        return false;
+    }
+    // the checks, the other exits, the size
+    let mut bounds = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut n: i32 = 0;
+    let mut ok = true;
+    for k in 0..members.len {
+        let x = members.get(k);
+        let mut v = x.first;
+        while u.notnil(v) {
+            n += 1;
+            if v.op == ir.OP_ALLOCA {
+                ok = false;
+            }
+            v = v.next;
+        }
+        let t = ir.terminator(x);
+        for j in 0..ir.succ_count(t) {
+            let s = ir.succ(t, j);
+            if (s.mark != tag) and not ((x == h) and (s == exit)) and not trap_exit(s, tag) {
+                ok = false;
+            }
+        }
+        if x != h {
+            let l = check_bound(x, i, tag);
+            if u.notnil(l) {
+                let mut seen = false;
+                for j in 0..bounds.len {
+                    if bounds.get(j) == l {
+                        seen = true;
+                    }
+                }
+                if not seen {
+                    bounds.push(l);
+                }
+            }
+        }
+    }
+    if not ok or (n > SPLIT_MAX) or (bounds.len == 0) {
+        u.free(@ptr_cast(*mut void, bounds.data));
+        return false;
+    }
+    _ = make_preheader(f, h, tag);
+    let mut pre = ir.bnil();
+    for k in 0..h.preds.len {
+        if h.preds.get(k).mark != tag {
+            pre = h.preds.get(k);
+        }
+    }
+    // m = min(end, L...) before the loop
+    let bld = ir.new_builder();
+    let pt = ir.terminator(pre);
+    ir.at_before(bld, pt);
+    let mut m = end;
+    for k in 0..bounds.len {
+        let l = bounds.get(k);
+        m = ir.select(bld, ir.icmp(bld, ir.IntULT, m, l), m, l);
+    }
+    u.free(@ptr_cast(*mut void, bounds.data));
+    // the copy
+    for k in 0..members.len {
+        let x = members.get(k);
+        let cb2 = ir.append_block(f, x.name);
+        x.auxp = @ptr_cast(*mut void, cb2);
+        let mut v = x.first;
+        while u.notnil(v) {
+            let y = ir.new_inst(f, v.op, v.ty);
+            y.cv = v.cv;
+            y.fv = v.fv;
+            y.flags = v.flags;
+            y.align = v.align;
+            y.aty = v.aty;
+            y.fty = v.fty;
+            y.mask = v.mask;
+            y.ext = v.ext;
+            y.name = v.name;
+            y.a = v.a;
+            y.b = v.b;
+            y.c = v.c;
+            y.t1 = v.t1;
+            y.t2 = v.t2;
+            for j in 0..v.xs.len {
+                y.xs.push(v.xs.get(j));
+            }
+            for j in 0..v.bs.len {
+                y.bs.push(v.bs.get(j));
+            }
+            v.auxp = @ptr_cast(*mut void, y);
+            ir.append_inst(cb2, y);
+            v = v.next;
+        }
+    }
+    for k in 0..members.len {
+        let cb2 = @ptr_cast(*mut ir.Block, members.get(k).auxp);
+        let mut y = cb2.first;
+        while u.notnil(y) {
+            y.a = map_in(ir.resolve(y.a), tag);
+            y.b = map_in(ir.resolve(y.b), tag);
+            y.c = map_in(ir.resolve(y.c), tag);
+            for j in 0..y.xs.len {
+                y.xs.set(j, map_in(ir.resolve(y.xs.get(j)), tag));
+            }
+            for j in 0..y.bs.len {
+                y.bs.set(j, map_blk_in(y.bs.get(j), tag));
+            }
+            y.t1 = map_blk_in(y.t1, tag);
+            y.t2 = map_blk_in(y.t2, tag);
+            y = y.next;
+        }
+    }
+    // the copy leaves at i >= m for mid, which enters the loop
+    let h2 = @ptr_cast(*mut ir.Block, h.auxp);
+    let ht2 = ir.terminator(h2);
+    let mid = ir.append_block(f, "split");
+    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+    br.t1 = h;
+    ir.append_inst(mid, br);
+    ir.at_before(bld, ht2);
+    ht2.a = ir.icmp(bld, p, @ptr_cast(*mut ir.Value, i.auxp), m);
+    if ht2.t1 == exit {
+        ht2.t1 = mid;
+    } else {
+        ht2.t2 = mid;
+    }
+    let mut q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for k in 0..q.bs.len {
+            if q.bs.get(k) == pre {
+                q.bs.set(k, mid);
+                q.xs.set(k, @ptr_cast(*mut ir.Value, q.auxp));
+            }
+        }
+        q = q.next;
+    }
+    let t = ir.terminator(pre);
+    for j in 0..ir.succ_count(t) {
+        if ir.succ(t, j) == h {
+            ir.set_succ(t, j, h2);
+        }
+    }
+    h.split = true;
+    h2.split = true;
+    return true;
+}
+
+// True if anything changed. Once per function: after inlining.
+pub fn split_loops(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    let mut any = false;
+    let mut rounds: i32 = 0;
+    while rounds < 8 {
+        rounds += 1;
+        opt.compute_preds(f);
+        let order = opt.dominators(f);
+        let hs = loop_headers(&order);
+        let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+        let mut did = false;
+        for k in 0..hs.len {
+            loop_mark += 1;
+            members_of(hs.get(k), loop_mark, &mut members);
+            if try_split(f, hs.get(k), loop_mark, &members) {
+                did = true;
+                break;  // the CFG changed
+            }
+        }
+        u.free(@ptr_cast(*mut void, members.data));
+        u.free(@ptr_cast(*mut void, order.data));
+        u.free(@ptr_cast(*mut void, hs.data));
+        if not did {
+            break;
+        }
+        any = true;
     }
     return any;
 }

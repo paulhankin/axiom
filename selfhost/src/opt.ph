@@ -261,6 +261,8 @@ pub fn mem2reg(f: *mut ir.Func) void {
                 if ir.is_agg(i.aty) {
                     i.aux = -1;
                 }
+            } else if i.op == ir.OP_PHI {
+                i.aux2 = 0;  // (the phis this places are tagged with their slot)
             }
             i = i.next;
         }
