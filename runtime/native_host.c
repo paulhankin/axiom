@@ -1,6 +1,6 @@
 // runtime/native_host.c - the Phalange host ABI (import module "phalange")
 // for native targets, on POSIX, plus crash reporting (trap messages and stack
-// traces, spec §17.4). The compiler links it into every native executable.
+// traces, spec §16.4). The compiler links it into every native executable.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

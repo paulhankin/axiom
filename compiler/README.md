@@ -29,11 +29,11 @@ $ ./compiler/build/phalange check examples/shapes.ph --format=agent-json
 ```
 phalange build <file.ph> [options]    compile and link
 phalange check <file.ph> [options]    parse and type-check only
-phalange test  <file.ph> [options]    build and run the file's test blocks (spec §18)
+phalange test  <file.ph> [options]    build and run the file's test blocks (spec §17)
                                       --filter=<text> --timeout=<ms> (default 10000)
 phalange new   <name>                 create a package (phalange.toml, src/lib.ph)
 phalange cache [path|clean]           the compiled-module cache
-phalange profile <file.ph> [options]  build, run under the sampling profiler, report (spec §17.6)
+phalange profile <file.ph> [options]  build, run under the sampling profiler, report (spec §16.6)
                                       --rate=<hz> (default 999) --folded=<path>
 
 build, check and test also take a package directory, or no path for the package in the
@@ -44,7 +44,7 @@ current directory (spec §4.6).
   --release                       integer overflow saturates (= --overflow=saturate)
   --overflow=trap|saturate        default: trap
   --emit=exe|obj|llvm|asm         default exe: a .wasm module or native executable
-  --format=human|agent-json       diagnostics format (spec §17.2)
+  --format=human|agent-json       diagnostics format (spec §16.2)
   --link=<file>                   C source, object or library to link in (repeatable). On wasm, C
                                   sources are compiled with clang for the same target
   -l<lib> -L<dir> -I<dir>         C libraries, library directories, include directories
@@ -66,14 +66,14 @@ Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the hos
 used by `std/io` and `std/net` and calls the `main` export. Native programs that use
 the host ABI get `runtime/native_host.c` linked in automatically.
 
-**Tests** (spec §18): `test "name" { … }` blocks with `@expect` / `@expect_eq`.
+**Tests** (spec §17): `test "name" { … }` blocks with `@expect` / `@expect_eq`.
 `phalange test` runs each test isolated, with a timeout and captured output: a fresh
 instance in a node worker (`runtime/test_runner.mjs`) or a forked process
 (`runtime/test_main.c`). It reports human-readable text or `phalange-tests/1` JSON.
 Every trap reports its code, the failing expression and its location, in tests and in
 normal runs.
 
-**Separate compilation** (spec §17.7, `src/units.c`): each module becomes its own object,
+**Separate compilation** (spec §16.7, `src/units.c`): each module becomes its own object,
 cached under `~/.cache/phalange/obj` by a key that hashes the compiler, the options, the
 module's source and the keys of its imports. So an edit recompiles only that module and
 its importers, and those are compiled in parallel worker processes. Program-wide pieces
@@ -81,13 +81,13 @@ its importers, and those are compiled in parallel worker processes. Program-wide
 regenerated on every build. Error codes are link-time symbols in module objects, so
 adding an error name never invalidates the cache.
 
-**Stack traces** (spec §17.4): every trap and crash (including stack overflow and
+**Stack traces** (spec §16.4): every trap and crash (including stack overflow and
 faults in C code) prints the call path with source locations, and failing tests show
 it too, or, for a test that returned an error, the error return trace. They come
 from a per-thread shadow stack of call sites. Each call costs three stores and a
 load; `--stack-traces=off` removes them.
 
-**Profiling** (spec §17.6): `phalange profile` samples the shadow stack, using a
+**Profiling** (spec §16.6): `phalange profile` samples the shadow stack, using a
 CPU-clock `SIGPROF` natively (`runtime/profile.c`) or a worker reading shared memory
 on wasm (`runtime/profile_worker.mjs`). It reports self and total time per function,
 inclusive time per call site, and folded stacks for flame graphs.
@@ -98,7 +98,7 @@ with path dependencies and git dependencies pinned to a commit, fetched once int
 `"pkg:name/sub/mod"`; only declared dependencies are visible, and a build uses one
 source per package name.
 
-**C interop** (spec §15.5):
+**C interop** (spec §14.5):
 - `extern "C" { fn ...; }` calls C. On wasm, the C sources passed with `--link` are
   compiled to wasm and share the module's memory.
 - `export fn` plus `--emit-header` makes Phalange callable from C. See
@@ -130,12 +130,11 @@ passes on wasm32 and native at every optimization level, and under ASan/UBSan.
 ## Architecture
 
 ```
-lexer.c    whole-file tokenizer (maximal munch; lexical mode switch inside wasm { })
+lexer.c    whole-file tokenizer (maximal munch)
 parser.c   LL(1) recursive descent -> AST; operator partial order (§7.4) resolved
            after a flat parse; E0150 with machine fixes
 sema_*.c   module loading, name registration, type resolution (decl), expressions
-           and generics (expr), builtins, statements / match / defer / inline-wasm
-           validation (stmt)
+           and generics (expr), builtins, statements / match / defer (stmt)
 types.c    hash-consed types (type equality is pointer equality), substitution,
            layout (spec §5), constraints
 codegen.c  LLVM IR via the C API; monomorphization; LLVM passes; object emission
@@ -176,17 +175,17 @@ Implemented: the whole language described in spec v0.1-draft.3:
 - `defer`, `match` exhaustiveness, `!` / `catch`
 - generics with constraints, deduction and `const` parameters
 - SIMD types and builtins
-- inline WASM, host imports and exports
+- host imports and exports
 - the builtins in Appendix A
 - trapping for the conditions in Appendix B
 - threads and atomics (§12.8)
 
 Not yet implemented (reported with a diagnostic where relevant):
 
-- `phalange fmt`, `phalange run` and `phalange explain` (spec §17.1).
+- `phalange fmt` (the self-hosted compiler has it), `phalange run` and `phalange explain`
+  (spec §16.1).
 - The debug trap map (`phalange.traps` custom section) and error-return traces
-  (spec §17.4). Traps are plain `unreachable`, so the trap code isn't reported yet.
-- Structured control flow (`block` / `loop` / `if` / `br`) inside inline wasm (`E0903`).
+  (spec §16.4). Traps are plain `unreachable`, so the trap code isn't reported yet.
 - Global initializers containing union values with a payload (`E0353`).
 - **Native targets use real addresses for raw pointers.** Slices, arrays and all
   checked operations behave as on wasm, but a raw pointer that points outside mapped

@@ -1,7 +1,6 @@
 // =============================================================================
 // sema.ph - semantic analysis: module loading, name registration, type
-// resolution, expression and statement checking, builtins, inline wasm
-// validation. (One module: its parts are mutually recursive.)
+// resolution, expression and statement checking, builtins. (One module: its parts are mutually recursive.)
 // =============================================================================
 import "util.ph" as u;
 import "diag.ph" as dg;
@@ -10,7 +9,6 @@ import "ast.ph" as ast;
 import "types.ph" as ty;
 import "parser.ph" as parser;
 import "package.ph" as pkg;
-import "wasmops.ph" as wops;
 
 pub struct Program {
     modules: u.List.[*mut ast.Module],
@@ -2188,7 +2186,7 @@ fn mentions(t: *mut ast.Type, vars: []mut *mut ast.Type) bool {
 }
 
 // Arguments in the variadic part of a C call undergo C's default argument
-// promotions, so only already-promoted types are accepted (spec §15.5).
+// promotions, so only already-promoted types are accepted (spec §14.5).
 fn check_vararg(pe: *mut *mut ast.Expr) void {
     let t = check_expr(pe.*, tnil());
     if t.kind == ast.TY_UNTYPED_INT {
@@ -2896,12 +2894,6 @@ fn check_operand(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if k == ast.E_BUILTIN {
         return builtin_check(e, expected);
-    }
-    if k == ast.E_WASM {
-        let t = resolve_type(e.wasm_te, &mut C.tc);
-        _ = check_wasm_block(&mut e.wins, t, e.span);
-        e.ty = t;
-        return e.ty;
     }
     if k == ast.E_UNARY {
         return check_unary(e, expected);
@@ -4253,8 +4245,6 @@ fn check_stmt(s: *mut ast.Stmt) bool {
         }
         C.defer_depth -= 1;
         C.defer_loop_base = saved_base;
-    } else if k == ast.S_WASM {
-        _ = check_wasm_block(&mut s.wins, tnil(), s.span);
     } else if k == ast.S_BLOCK {
         div = check_block(s);
     }
@@ -4300,288 +4290,6 @@ fn check_fn_body(f: *mut ast.Decl) void {
     u.free(@ptr_cast(*mut void, ctx.marks.data));
     u.free(@ptr_cast(*mut void, ctx.loop_breaks.data));
     C = saved;
-}
-
-// ---------------------------------------------------------------------------
-// Inline WebAssembly validation (spec §14)
-// ---------------------------------------------------------------------------
-fn forbidden_op(op: []u8) bool {
-    let f = ["return", "call", "call_indirect", "global.get", "global.set", "table.get", "table.set", "table.size",
-             "table.grow", "table.fill", "table.copy", "table.init", "memory.grow", "memory.init", "data.drop", "elem.drop",
-             "br", "br_if", "br_table", "block", "loop", "if", "else", "end", "return_call", "return_call_indirect"];
-    for x in f {
-        if u.str_eq(x, op) {
-            return true;
-        }
-    }
-    return false;
-}
-
-struct WasmVt {
-    c: u8,
-    narrow: bool,
-}
-
-fn wasm_vt(t: *ast.Type) WasmVt {
-    let k = t.kind;
-    if k == ast.TY_BOOL {
-        return WasmVt.{ c: 'i', narrow: true };
-    }
-    if k == ast.TY_INT {
-        if t.bits == 64 {
-            return WasmVt.{ c: 'l', narrow: false };
-        }
-        return WasmVt.{ c: 'i', narrow: t.bits < 32 };
-    }
-    if k == ast.TY_FLOAT {
-        if t.bits == 64 {
-            return WasmVt.{ c: 'd', narrow: false };
-        }
-        return WasmVt.{ c: 'f', narrow: false };
-    }
-    if (k == ast.TY_VEC) or (k == ast.TY_V128) {
-        return WasmVt.{ c: 'v', narrow: false };
-    }
-    if k == ast.TY_PTR {
-        if ty.g_target.ptr_bits == 64 {
-            return WasmVt.{ c: 'l', narrow: false };
-        }
-        return WasmVt.{ c: 'i', narrow: false };
-    }
-    return WasmVt.{ c: 0, narrow: false };
-}
-
-fn vt_name(c: u8) []u8 {
-    if c == 'i' {
-        return "i32";
-    }
-    if c == 'l' {
-        return "i64";
-    }
-    if c == 'f' {
-        return "f32";
-    }
-    if c == 'd' {
-        return "f64";
-    }
-    if c == 'v' {
-        return "v128";
-    }
-    return "?";
-}
-
-// strtoll(s, &end, 0) with the ERANGE fallback to strtoull.
-fn parse_wasm_int(s: []u8) u.CStrtoll {
-    let r = u.c_strtoll(s);
-    if (r.end != s.len) or r.ovf {
-        let q = u.c_strtoull(s);
-        if q.end != s.len {
-            return u.CStrtoll.{ v: 0, end: 0, ovf: true };
-        }
-        return u.CStrtoll.{ v: q.v, end: q.end, ovf: false };
-    }
-    return r;
-}
-
-fn wasm_int_ok(s: []u8) bool {
-    return not parse_wasm_int(s).ovf;
-}
-
-fn check_wasm_block(instrs: *mut u.List.[ast.WasmInstr], result: *mut ast.Type, sp: u.Span) *mut ast.Type {
-    let mut want: u8 = 0;
-    if u.notnil(result) and (result.kind != ast.TY_VOID) and (result.kind != ast.TY_INVALID) {
-        want = wasm_vt(result).c;
-        if want == 0 {
-            _ = dg.err(sp, "E0904", u.f1("a wasm block cannot produce a value of type %s", tstr(result)));
-            return result;
-        }
-    }
-    let mut stack: [256]u8 = [0; 256];
-    let mut sp_: usize = 0;
-    let mut unreachable = false;
-    let mut addr: u8 = 'i';
-    if ty.g_target.ptr_bits == 64 {
-        addr = 'l';
-    }
-    for i in 0..instrs.len {
-        let w = instrs.at(i);
-        if forbidden_op(w.op) {
-            let structured = u.str_eq(w.op, "block") or u.str_eq(w.op, "loop") or u.str_eq(w.op, "if") or
-                             u.str_eq(w.op, "else") or u.str_eq(w.op, "end") or u.starts(w.op, "br");
-            let why = u.pick(structured, "structured control flow inside wasm blocks is not supported by this compiler yet",
-                             "it would create control flow or state invisible to the surrounding code");
-            _ = dg.err(w.span, u.pick(structured, "E0903", "E0901"), u.f2("'%s' is not allowed in inline wasm: %s", w.op, why));
-            return result;
-        }
-        let op = wops.lookup(w.op);
-        if u.isnil(op) {
-            _ = dg.err(w.span, "E0903", u.f1("unknown or unsupported wasm instruction '%s'", w.op));
-            return result;
-        }
-        // immediates
-        let ni = w.imms.len;
-        let mut lt: u8 = 0;
-        let im = op.imm;
-        if im == wops.WIMM_NONE {
-            if ni != 0 {
-                _ = dg.err(w.span, "E0906", u.f1("'%s' takes no immediates", w.op));
-                return result;
-            }
-        } else if im == wops.WIMM_LOCAL {
-            if (ni != 1) or (w.imms.at(0).kind != lx.TK_WASM_LOCAL) {
-                _ = dg.err(w.span, "E0906", u.f1("'%s' needs a $name immediate", w.op));
-                return result;
-            }
-            let name = w.imms.at(0).name;
-            let l = scope_lookup(name);
-            if u.isnil(l) {
-                _ = dg.err(w.imms.at(0).span, "E0202", u.f1("unknown local '$%s'", name));
-                return result;
-            }
-            w.local = l;
-            let vt = wasm_vt(l.ty);
-            lt = vt.c;
-            if lt == 0 {
-                _ = dg.err(w.imms.at(0).span, "E0904", u.f2("'$%s' has type %s, which has no wasm value type; read its fields in Phalange first",
-                                                           name, tstr(l.ty)));
-                return result;
-            }
-            if not u.str_eq(op.op, "get") {
-                if not l.is_mut {
-                    _ = dg.err(w.imms.at(0).span, "E0905", u.f2("'$%s' is not mutable ('let mut' required for %s)", name, w.op));
-                    return result;
-                }
-                if vt.narrow {
-                    _ = dg.err(w.imms.at(0).span, "E0905", u.f2("'$%s' has type %s; inline wasm cannot write narrow integer or bool locals",
-                                                               name, tstr(l.ty)));
-                    return result;
-                }
-            }
-        } else if (im == wops.WIMM_I32) or (im == wops.WIMM_I64) {
-            if (ni != 1) or (w.imms.at(0).kind != lx.TK_WASM_WORD) or not wasm_int_ok(w.imms.at(0).name) {
-                _ = dg.err(w.span, "E0906", u.f1("'%s' needs an integer immediate", w.op));
-                return result;
-            }
-        } else if (im == wops.WIMM_F32) or (im == wops.WIMM_F64) {
-            if (ni != 1) or (w.imms.at(0).kind != lx.TK_WASM_WORD) {
-                _ = dg.err(w.span, "E0906", u.f1("'%s' needs a float immediate", w.op));
-                return result;
-            }
-            let s = w.imms.at(0).name;
-            if not u.str_eq(s, "nan") and not u.str_eq(s, "inf") and not u.str_eq(s, "-inf") and not u.str_eq(s, "+inf") {
-                if u.c_strtod(s).end != s.len {
-                    _ = dg.err(w.imms.at(0).span, "E0906", u.f1("malformed float immediate '%s'", s));
-                    return result;
-                }
-            }
-        } else if im == wops.WIMM_MEM {
-            for k in 0..ni {
-                let tk = w.imms.at(k);
-                let s = tk.name;
-                let mut ok = false;
-                if tk.kind == lx.TK_WASM_WORD {
-                    if u.starts(s, "offset=") {
-                        let v = parse_wasm_int(s[7..]);
-                        ok = not v.ovf and (v.v >= 0);
-                    } else if u.starts(s, "align=") {
-                        let v = parse_wasm_int(s[6..]);
-                        ok = not v.ovf and (v.v > 0) and ((v.v & (v.v - 1)) == 0);
-                    }
-                }
-                if not ok {
-                    _ = dg.err(tk.span, "E0906", "expected offset=N or align=N");
-                    return result;
-                }
-            }
-        } else if im == wops.WIMM_LANE {
-            if (ni != 1) or (w.imms.at(0).kind != lx.TK_WASM_WORD) or not wasm_int_ok(w.imms.at(0).name) {
-                _ = dg.err(w.span, "E0906", u.f1("'%s' needs a lane index", w.op));
-                return result;
-            }
-            let v = parse_wasm_int(w.imms.at(0).name).v;
-            let mut lanes: i64 = 16;
-            if u.starts(op.prefix, "i16") {
-                lanes = 8;
-            } else if u.starts(op.prefix, "i32") or u.starts(op.prefix, "f32") {
-                lanes = 4;
-            } else if u.starts(op.prefix, "i64") or u.starts(op.prefix, "f64") {
-                lanes = 2;
-            }
-            if (v < 0) or (v >= lanes) {
-                _ = dg.err(w.imms.at(0).span, "E0906", "lane index out of range");
-                return result;
-            }
-        }
-        if unreachable {
-            continue;
-        }
-        // stack effect
-        if u.str_eq(w.op, "unreachable") {
-            unreachable = true;
-            continue;
-        }
-        let mut popped: [4]u8 = [0; 4];
-        let nin = op.ins.len;
-        let mut k = nin;
-        while k > 0 {
-            k -= 1;
-            let mut need = op.ins[k];
-            if need == 'p' {
-                need = addr;
-            }
-            if sp_ == 0 {
-                _ = dg.err(w.span, "E0907", u.f3("'%s' needs %s operand%s but the wasm stack has too few", w.op, u.zdec(nin),
-                                                u.pick(nin == 1, "", "s")));
-                return result;
-            }
-            sp_ -= 1;
-            let have = stack[sp_];
-            if need == '*' {
-                if u.str_eq(w.op, "local.set") or u.str_eq(w.op, "local.tee") {
-                    need = lt;
-                } else if u.str_eq(w.op, "select") and (k == 0) and (popped[1] != 0) and (popped[1] != have) {
-                    _ = dg.err(w.span, "E0907", "select operands have different types");
-                    return result;
-                } else {
-                    need = have;
-                }
-            }
-            if have != need {
-                _ = dg.err(w.span, "E0907", u.f3("'%s' expects %s on the stack, found %s", w.op, vt_name(need), vt_name(have)));
-                return result;
-            }
-            popped[k] = have;
-        }
-        if op.out != 0 {
-            let mut o = op.out;
-            if o == '*' {
-                if u.str_eq(w.op, "select") {
-                    o = popped[0];
-                } else {
-                    o = lt;
-                }
-            }
-            if sp_ >= 255 {
-                _ = dg.err(w.span, "E0907", "wasm stack too deep");
-                return result;
-            }
-            stack[sp_] = o;
-            sp_ += 1;
-        }
-    }
-    if unreachable {
-        return result;
-    }
-    if want != 0 {
-        if (sp_ != 1) or (stack[0] != want) {
-            _ = dg.err(sp, "E0907", u.f3("wasm block must leave exactly one %s on the stack, found %s value%s", vt_name(want),
-                                        u.zdec(sp_), u.pick(sp_ == 1, "", "s")));
-        }
-    } else if sp_ != 0 {
-        _ = dg.err(sp, "E0907", u.f2("wasm statement block must leave the stack empty, found %s value%s; use 'wasm -> T' or drop",
-                                    u.zdec(sp_), u.pick(sp_ == 1, "", "s")));
-    }
-    return result;
 }
 
 // ---------------------------------------------------------------------------

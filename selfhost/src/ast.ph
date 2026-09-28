@@ -30,7 +30,6 @@ pub const E_ARRAY_LIT: i32 = 7;
 pub const E_ARRAY_REPEAT: i32 = 8;
 pub const E_ERROR_VAL: i32 = 9;
 pub const E_BUILTIN: i32 = 10;
-pub const E_WASM: i32 = 11;
 pub const E_UNARY: i32 = 12;
 pub const E_BINARY: i32 = 13;
 pub const E_CATCH: i32 = 14;
@@ -92,7 +91,6 @@ pub const S_RETURN: i32 = 9;
 pub const S_BREAK: i32 = 10;
 pub const S_CONTINUE: i32 = 11;
 pub const S_DEFER: i32 = 12;
-pub const S_WASM: i32 = 13;
 pub const S_BLOCK: i32 = 14;
 
 pub const P_VARIANT: i32 = 0;
@@ -288,13 +286,6 @@ pub struct BuiltinArg {
     t: *mut TypeExpr,
 }
 
-pub struct WasmInstr {
-    op: []u8,
-    span: u.Span,
-    imms: u.List.[lx.Token],
-    local: *mut Local,  // resolved $name
-}
-
 pub struct Expr {
     kind: i32,
     span: u.Span,
@@ -322,9 +313,6 @@ pub struct Expr {
     hexpr: *mut Expr,
     hblock: *mut Stmt,
     capture_local: *mut Local,
-    // wasm expression
-    wasm_te: *mut TypeExpr,
-    wins: u.List.[WasmInstr],
 
     // ---- sema annotations ----
     ty: *mut Type,
@@ -374,7 +362,6 @@ pub struct Stmt {
     els: *mut Stmt,
     stmts: u.List.[*mut Stmt],
     arms: u.List.[MatchArm],
-    wins: u.List.[WasmInstr],
     // sema
     local: *mut Local,
     diverges: bool,

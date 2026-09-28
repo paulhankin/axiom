@@ -97,9 +97,5 @@ export fn compute(length: usize) f32 {
     let msg = "dot product computed";
     console_log(msg.ptr, msg.len);
 
-    wasm {
-        nop
-    }
-
     return result;
 }

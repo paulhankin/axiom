@@ -291,51 +291,6 @@ static void parse_field_inits(Parser *P, Expr *e) {
     expect(P, TK_RBRACE);
 }
 
-static bool is_wasm_imm(Token *t) {
-    if (t->kind == TK_WASM_LOCAL) return true;
-    if (t->kind != TK_WASM_WORD) return false;
-    const char *s = t->name;
-    char c = s[0];
-    if ((c >= '0' && c <= '9') || c == '-' || c == '+') return true;
-    if (strncmp(s, "offset=", 7) == 0 || strncmp(s, "align=", 6) == 0) return true;
-    if (strcmp(s, "nan") == 0 || strcmp(s, "inf") == 0 || strncmp(s, "nan:", 4) == 0) return true;
-    return false;
-}
-
-// WasmBody ::= "{" WasmInstr* "}"  (lexer already produced wasm-mode tokens)
-static void parse_wasm_body(Parser *P, WasmInstrVec *out) {
-    expect(P, TK_LBRACE);
-    while (pk(P) != TK_RBRACE && pk(P) != TK_EOF) {
-        Token *t = peek(P);
-        if (t->kind == TK_LPAREN) {
-            // (result T) annotations: skip whole group, record as immediate of previous instr
-            int depth = 0;
-            do {
-                if (pk(P) == TK_LPAREN) depth++;
-                if (pk(P) == TK_RPAREN) depth--;
-                if (out->len) vec_push(vec_last(*out).imms, *peek(P));
-                advance(P);
-            } while (depth > 0 && pk(P) != TK_EOF && pk(P) != TK_RBRACE);
-            continue;
-        }
-        if (t->kind != TK_WASM_WORD || is_wasm_imm(t)) {
-            diag_error(t->span, "E0902", "expected a WebAssembly instruction");
-            advance(P);
-            continue;
-        }
-        advance(P);
-        WasmInstr wi = {0};
-        wi.op = t->name;
-        wi.span = t->span;
-        while (is_wasm_imm(peek(P))) {
-            vec_push(wi.imms, *peek(P));
-            advance(P);
-        }
-        vec_push(*out, wi);
-    }
-    expect(P, TK_RBRACE);
-}
-
 static Expr *parse_builtin(Parser *P) {
     Token *t = advance(P);
     Expr *e = new_expr(E_BUILTIN, t->span);
@@ -443,15 +398,6 @@ static Expr *parse_primary(Parser *P) {
         return e;
     }
     case TK_BUILTIN: return parse_builtin(P);
-    case KW_WASM: {
-        advance(P);
-        Expr *e = new_expr(E_WASM, start);
-        expect(P, TK_ARROW);
-        e->wasm_te = parse_type(P);
-        parse_wasm_body(P, &e->wasm);
-        e->span = sp_from(P, start);
-        return e;
-    }
     default:
         syntax_error(P, "expression");
         if (pk(P) != TK_EOF && pk(P) != TK_RBRACE && pk(P) != TK_SEMI) advance(P);
@@ -868,19 +814,6 @@ static Stmt *parse_stmt(Parser *P) {
         advance(P);
         Stmt *s = new_stmt(S_DEFER, start);
         s->body = pk(P) == TK_LBRACE ? parse_block(P) : parse_expr_stmt(P);
-        s->span = sp_from(P, start);
-        return s;
-    }
-    case KW_WASM: {
-        advance(P);
-        Stmt *s = new_stmt(S_WASM, start);
-        if (pk(P) == TK_ARROW) {
-            diag_error(peek(P)->span, "E0101",
-                       "a value-producing 'wasm -> T' block cannot start a statement; use it after 'return' or '='");
-            advance(P);
-            parse_type(P);
-        }
-        parse_wasm_body(P, &s->wasm);
         s->span = sp_from(P, start);
         return s;
     }

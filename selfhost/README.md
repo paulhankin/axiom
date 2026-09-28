@@ -173,7 +173,6 @@ types share a module.
 | `parser.ph` | `parser.c` | LL(1) parser, operator partial order |
 | `types.ph` | `types.c` | hash-consed types, substitution, printing, layout, constraints |
 | `package.ph` | `package.c` | `phalange.toml`, `pkg:` imports, git dependencies |
-| `wasmops.ph` | `wasmops.c` | inline-wasm instruction table |
 | `sema.ph` | `sema_decl.c`, `sema_expr.c`, `sema_builtins.c`, `sema_stmt.c` | module loading, name resolution, type checking |
 | `codegen.ph` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ph` | `header.c` | C headers for `export fn`s |

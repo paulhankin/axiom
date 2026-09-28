@@ -137,7 +137,7 @@ fn find_tool(names: [][]u8) []u8 {
 }
 
 // ---------------------------------------------------------------------------
-// phalange test: run the test binary and report (spec §18).
+// phalange test: run the test binary and report (spec §17).
 // ---------------------------------------------------------------------------
 struct Captured {
     status: i32,
@@ -516,7 +516,7 @@ fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool) 
 }
 
 // ---------------------------------------------------------------------------
-// phalange profile: run a program under the sampling profiler (spec §17.6)
+// phalange profile: run a program under the sampling profiler (spec §16.6)
 // and report where its time goes.
 // ---------------------------------------------------------------------------
 struct ProfFn {
@@ -1288,7 +1288,7 @@ fn driver(args: [][]u8) i32 {
         co.out_path = out;
     }
     cg.collect_link_names();
-    // Separate compilation (spec §17.7) applies to executables; --emit of a
+    // Separate compilation (spec §16.7) applies to executables; --emit of a
     // single object/IR/assembly file is always one unit.
     let mut separate = final_link and (co.opt_level <= 1);
     if units_mode >= 0 {

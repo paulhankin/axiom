@@ -1,9 +1,9 @@
 // runtime/profile.c - sampling profiler for native Phalange programs (spec
-// §17.6). `phalange profile` links this in and runs the program with
+// §16.6). `phalange profile` links this in and runs the program with
 // PHALANGE_PROFILE=<raw output file> and PHALANGE_PROFILE_HZ=<rate>.
 //
 // A SIGPROF timer on the process CPU clock interrupts whichever thread
-// is running; the handler copies that thread's shadow stack (§17.4) into a
+// is running; the handler copies that thread's shadow stack (§16.4) into a
 // preallocated buffer. At exit the samples are aggregated and written in the
 // raw format read by `phalange profile`:
 //

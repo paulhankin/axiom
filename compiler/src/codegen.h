@@ -6,7 +6,7 @@
 
 typedef enum EmitKind { EMIT_OBJ, EMIT_LLVM, EMIT_ASM } EmitKind;
 
-// What one codegen run produces (spec §17.7):
+// What one codegen run produces (spec §16.7):
 //   CG_WHOLE   the whole program in one object (-O2 and above by default)
 //   CG_MODULE  one module's non-generic functions, plus the generic instances
 //              it uses (link-once); everything else is referenced by name

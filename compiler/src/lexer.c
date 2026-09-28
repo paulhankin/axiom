@@ -22,7 +22,7 @@ const char *tok_kind_name(TokKind k) {
     static const char *punct[] = {
         "+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>",
         "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=",
-        "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>", "->",
+        "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>",
         "(", ")", "{", "}", "[", "]",
     };
     switch (k) {
@@ -35,8 +35,6 @@ const char *tok_kind_name(TokKind k) {
     case TK_BUILTIN: return "builtin";
     case TK_DISCARD: return "_";
     case TK_PRIM: return "type name";
-    case TK_WASM_WORD: return "wasm instruction";
-    case TK_WASM_LOCAL: return "wasm local";
     default: break;
     }
     if (k >= KW_AND && k <= KW_WHILE) return kw_names[k - KW_AND];
@@ -49,7 +47,6 @@ typedef struct Lexer {
     const char *s;
     uint32_t pos, len;
     TokenVec toks;
-    bool wasm_pending;  // saw `wasm`, next `{` (not after `struct`) enters wasm mode
 } Lexer;
 
 static Span mkspan(Lexer *L, uint32_t a, uint32_t b) { return (Span){L->f->id, a, b}; }
@@ -233,55 +230,6 @@ static void lex_number(Lexer *L) {
     push(L, t);
 }
 
-// Tokens inside `wasm { ... }`.
-static void lex_wasm_body(Lexer *L) {
-    for (;;) {
-        skip_ws(L);
-        if (L->pos >= L->len) {
-            diag_error(mkspan(L, L->pos, L->pos), "E0007", "unterminated wasm block");
-            return;
-        }
-        char c = L->s[L->pos];
-        uint32_t start = L->pos;
-        if (c == '}') {
-            L->pos++;
-            push(L, (Token){.kind = TK_RBRACE, .span = mkspan(L, start, L->pos)});
-            return;
-        }
-        if (c == '(' || c == ')') {
-            L->pos++;
-            push(L, (Token){.kind = c == '(' ? TK_LPAREN : TK_RPAREN, .span = mkspan(L, start, L->pos)});
-            continue;
-        }
-        if (c == ';' && L->pos + 1 < L->len && L->s[L->pos + 1] == ';') {  // WAT line comment
-            while (L->pos < L->len && L->s[L->pos] != '\n') L->pos++;
-            continue;
-        }
-        if (c == '$') {
-            L->pos++;
-            while (L->pos < L->len && is_ident_char(L->s[L->pos])) L->pos++;
-            Token t = {.kind = TK_WASM_LOCAL, .span = mkspan(L, start, L->pos)};
-            t.name = intern(L->s + start + 1, L->pos - start - 1);
-            push(L, t);
-            continue;
-        }
-        while (L->pos < L->len) {
-            char d = L->s[L->pos];
-            if (d == ' ' || d == '\t' || d == '\n' || d == '\r' || d == '(' || d == ')' || d == '}' || d == '$') break;
-            if ((unsigned char)d >= 0x80) break;
-            L->pos++;
-        }
-        if (L->pos == start) {
-            diag_error(mkspan(L, start, start + 1), "E0002", "unexpected character in wasm block");
-            L->pos++;
-            continue;
-        }
-        Token t = {.kind = TK_WASM_WORD, .span = mkspan(L, start, L->pos)};
-        t.name = intern(L->s + start, L->pos - start);
-        push(L, t);
-    }
-}
-
 TokenVec lex_file(SourceFile *f) {
     Lexer L = {.f = f, .s = f->text, .len = (uint32_t)f->len};
     if (L.len >= 3 && (unsigned char)L.s[0] == 0xEF && (unsigned char)L.s[1] == 0xBB && (unsigned char)L.s[2] == 0xBF) {
@@ -327,7 +275,6 @@ TokenVec lex_file(SourceFile *f) {
                 }
                 t.name = intern(w, n);
             }
-            if (t.kind == KW_WASM) L.wasm_pending = true;
             push(&L, t);
             continue;
         }
@@ -408,7 +355,7 @@ TokenVec lex_file(SourceFile *f) {
             {"<=", TK_LE},           {">=", TK_GE},            {"+=", TK_PLUS_EQ},      {"-=", TK_MINUS_EQ},
             {"*=", TK_STAR_EQ},      {"/=", TK_SLASH_EQ},      {"%=", TK_PERCENT_EQ},   {"&=", TK_AMP_EQ},
             {"|=", TK_PIPE_EQ},      {"^=", TK_CARET_EQ},      {"..", TK_DOTDOT},       {"=>", TK_FATARROW},
-            {"->", TK_ARROW},        {"+", TK_PLUS},           {"-", TK_MINUS},         {"*", TK_STAR},
+            {"+", TK_PLUS},           {"-", TK_MINUS},         {"*", TK_STAR},
             {"/", TK_SLASH},         {"%", TK_PERCENT},        {"&", TK_AMP},           {"|", TK_PIPE},
             {"^", TK_CARET},         {"~", TK_TILDE},          {"<", TK_LT},            {">", TK_GT},
             {"=", TK_EQ},            {"!", TK_BANG},           {".", TK_DOT},           {",", TK_COMMA},
@@ -421,15 +368,8 @@ TokenVec lex_file(SourceFile *f) {
             if (L.pos + n <= L.len && memcmp(L.s + L.pos, ops[i].s, n) == 0) {
                 L.pos += (uint32_t)n;
                 Token t = {.kind = ops[i].k, .span = mkspan(&L, start, L.pos)};
-                bool prev_struct = L.toks.len && vec_last(L.toks).kind == KW_STRUCT;
                 push(&L, t);
                 matched = true;
-                if (t.kind == TK_LBRACE && L.wasm_pending && !prev_struct) {
-                    L.wasm_pending = false;
-                    lex_wasm_body(&L);
-                } else if (t.kind == TK_SEMI || t.kind == TK_RBRACE) {
-                    L.wasm_pending = false;
-                }
                 break;
             }
         }

@@ -1,4 +1,4 @@
-// C FFI in both directions (spec §15.5); runs on wasm and native.
+// C FFI in both directions (spec §14.5); runs on wasm and native.
 // link: ffi.c
 // header: ffi_generated.h
 import "../lib/io.ph" as io;

@@ -998,7 +998,7 @@ static bool mentions(Type *t, Type **vars, int nv) {
 }
 
 // Arguments in the variadic part of a C call undergo C's default argument
-// promotions, so only already-promoted types are accepted (spec §15.5).
+// promotions, so only already-promoted types are accepted (spec §14.5).
 static void check_vararg(Expr **pe) {
     Type *t = check_expr(*pe, NULL);
     if (t->kind == TY_UNTYPED_INT) {
@@ -1542,11 +1542,6 @@ static Type *check_operand(Expr *e, Type *expected) {
         return e->type = t_error;
     }
     case E_BUILTIN: return builtin_check(e, expected);
-    case E_WASM: {
-        Type *t = resolve_type(e->wasm_te, &C->tc);
-        check_wasm_block(&e->wasm, t, e->span);
-        return e->type = t;
-    }
     case E_UNARY: return check_unary(e, expected);
     case E_BINARY: return check_binary(e, expected);
     case E_CATCH: return check_catch(e);

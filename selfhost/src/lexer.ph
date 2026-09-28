@@ -44,60 +44,56 @@ pub const KW_STRUCT: i32 = 36;
 pub const KW_TEST: i32 = 37;
 pub const KW_TRUE: i32 = 38;
 pub const KW_UNION: i32 = 39;
-pub const KW_WASM: i32 = 40;
-pub const KW_WHILE: i32 = 41;
-pub const TK_PLUS: i32 = 42;
-pub const TK_MINUS: i32 = 43;
-pub const TK_STAR: i32 = 44;
-pub const TK_SLASH: i32 = 45;
-pub const TK_PERCENT: i32 = 46;
-pub const TK_PLUS_PCT: i32 = 47;
-pub const TK_MINUS_PCT: i32 = 48;
-pub const TK_STAR_PCT: i32 = 49;
-pub const TK_AMP: i32 = 50;
-pub const TK_PIPE: i32 = 51;
-pub const TK_CARET: i32 = 52;
-pub const TK_TILDE: i32 = 53;
-pub const TK_SHL: i32 = 54;
-pub const TK_SHR: i32 = 55;
-pub const TK_EQEQ: i32 = 56;
-pub const TK_NE: i32 = 57;
-pub const TK_LT: i32 = 58;
-pub const TK_LE: i32 = 59;
-pub const TK_GT: i32 = 60;
-pub const TK_GE: i32 = 61;
-pub const TK_EQ: i32 = 62;
-pub const TK_PLUS_EQ: i32 = 63;
-pub const TK_MINUS_EQ: i32 = 64;
-pub const TK_STAR_EQ: i32 = 65;
-pub const TK_SLASH_EQ: i32 = 66;
-pub const TK_PERCENT_EQ: i32 = 67;
-pub const TK_PLUS_PCT_EQ: i32 = 68;
-pub const TK_MINUS_PCT_EQ: i32 = 69;
-pub const TK_STAR_PCT_EQ: i32 = 70;
-pub const TK_AMP_EQ: i32 = 71;
-pub const TK_PIPE_EQ: i32 = 72;
-pub const TK_CARET_EQ: i32 = 73;
-pub const TK_SHL_EQ: i32 = 74;
-pub const TK_SHR_EQ: i32 = 75;
-pub const TK_BANG: i32 = 76;
-pub const TK_DOT: i32 = 77;
-pub const TK_DOTDOT: i32 = 78;
-pub const TK_ELLIPSIS: i32 = 79;
-pub const TK_COMMA: i32 = 80;
-pub const TK_COLON: i32 = 81;
-pub const TK_SEMI: i32 = 82;
-pub const TK_FATARROW: i32 = 83;
-pub const TK_ARROW: i32 = 84;
-pub const TK_LPAREN: i32 = 85;
-pub const TK_RPAREN: i32 = 86;
-pub const TK_LBRACE: i32 = 87;
-pub const TK_RBRACE: i32 = 88;
-pub const TK_LBRACKET: i32 = 89;
-pub const TK_RBRACKET: i32 = 90;
-pub const TK_WASM_WORD: i32 = 91;
-pub const TK_WASM_LOCAL: i32 = 92;
-pub const TK_COUNT: i32 = 93;
+pub const KW_WHILE: i32 = 40;
+pub const TK_PLUS: i32 = 41;
+pub const TK_MINUS: i32 = 42;
+pub const TK_STAR: i32 = 43;
+pub const TK_SLASH: i32 = 44;
+pub const TK_PERCENT: i32 = 45;
+pub const TK_PLUS_PCT: i32 = 46;
+pub const TK_MINUS_PCT: i32 = 47;
+pub const TK_STAR_PCT: i32 = 48;
+pub const TK_AMP: i32 = 49;
+pub const TK_PIPE: i32 = 50;
+pub const TK_CARET: i32 = 51;
+pub const TK_TILDE: i32 = 52;
+pub const TK_SHL: i32 = 53;
+pub const TK_SHR: i32 = 54;
+pub const TK_EQEQ: i32 = 55;
+pub const TK_NE: i32 = 56;
+pub const TK_LT: i32 = 57;
+pub const TK_LE: i32 = 58;
+pub const TK_GT: i32 = 59;
+pub const TK_GE: i32 = 60;
+pub const TK_EQ: i32 = 61;
+pub const TK_PLUS_EQ: i32 = 62;
+pub const TK_MINUS_EQ: i32 = 63;
+pub const TK_STAR_EQ: i32 = 64;
+pub const TK_SLASH_EQ: i32 = 65;
+pub const TK_PERCENT_EQ: i32 = 66;
+pub const TK_PLUS_PCT_EQ: i32 = 67;
+pub const TK_MINUS_PCT_EQ: i32 = 68;
+pub const TK_STAR_PCT_EQ: i32 = 69;
+pub const TK_AMP_EQ: i32 = 70;
+pub const TK_PIPE_EQ: i32 = 71;
+pub const TK_CARET_EQ: i32 = 72;
+pub const TK_SHL_EQ: i32 = 73;
+pub const TK_SHR_EQ: i32 = 74;
+pub const TK_BANG: i32 = 75;
+pub const TK_DOT: i32 = 76;
+pub const TK_DOTDOT: i32 = 77;
+pub const TK_ELLIPSIS: i32 = 78;
+pub const TK_COMMA: i32 = 79;
+pub const TK_COLON: i32 = 80;
+pub const TK_SEMI: i32 = 81;
+pub const TK_FATARROW: i32 = 82;
+pub const TK_LPAREN: i32 = 83;
+pub const TK_RPAREN: i32 = 84;
+pub const TK_LBRACE: i32 = 85;
+pub const TK_RBRACE: i32 = 86;
+pub const TK_LBRACKET: i32 = 87;
+pub const TK_RBRACKET: i32 = 88;
+pub const TK_COUNT: i32 = 89;
 pub const PRIM_U8: i32 = 0;
 pub const PRIM_U16: i32 = 1;
 pub const PRIM_U32: i32 = 2;
@@ -130,11 +126,11 @@ pub fn prim_name(i: usize) []u8 {
     return t[i];
 }
 pub fn kw_name(i: usize) []u8 {
-    let t = ["and", "as", "break", "catch", "const", "continue", "defer", "else", "error", "export", "extern", "false", "fn", "for", "host", "if", "import", "in", "let", "loop", "match", "mut", "not", "or", "pub", "return", "Self", "struct", "test", "true", "union", "wasm", "while"];
+    let t = ["and", "as", "break", "catch", "const", "continue", "defer", "else", "error", "export", "extern", "false", "fn", "for", "host", "if", "import", "in", "let", "loop", "match", "mut", "not", "or", "pub", "return", "Self", "struct", "test", "true", "union", "while"];
     return t[i];
 }
 pub fn punct_name(i: usize) []u8 {
-    let t = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>", "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=", "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>", "->", "(", ")", "{", "}", "[", "]"];
+    let t = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^", "~", "<<", ">>", "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=", "&=", "|=", "^=", "<<=", ">>=", "!", ".", "..", "...", ",", ":", ";", "=>", "(", ")", "{", "}", "[", "]"];
     return t[i];
 }
 
@@ -166,12 +162,6 @@ pub fn tok_kind_name(k: i32) []u8 {
     if k == TK_PRIM {
         return "type name";
     }
-    if k == TK_WASM_WORD {
-        return "wasm instruction";
-    }
-    if k == TK_WASM_LOCAL {
-        return "wasm local";
-    }
     if (k >= KW_AND) and (k <= KW_WHILE) {
         return kw_name(@int_cast(usize, k - KW_AND));
     }
@@ -186,7 +176,7 @@ pub struct Token {
     span: u.Span,
     ival: u64,          // TK_INT, TK_CHAR
     fval: f64,          // TK_FLOAT
-    name: []u8,         // TK_IDENT, TK_BUILTIN, TK_WASM_WORD, TK_WASM_LOCAL
+    name: []u8,         // TK_IDENT, TK_BUILTIN
     prim: i32,          // TK_PRIM
     str: []u8,          // TK_STRING
     float_text: []u8,   // TK_FLOAT: literal text without '_'
@@ -202,7 +192,6 @@ struct Lexer {
     s: []u8,
     pos: usize,
     toks: u.List.[Token],
-    wasm_pending: bool,  // saw `wasm`, next `{` (not after `struct`) enters wasm mode
 }
 
 fn mkspan(L: *Lexer, a: usize, b: usize) u.Span {
@@ -469,74 +458,13 @@ fn lex_number(L: *mut Lexer) void {
     L.toks.push(t);
 }
 
-// Tokens inside `wasm { ... }`.
-fn lex_wasm_body(L: *mut Lexer) void {
-    loop {
-        skip_ws(L);
-        if L.pos >= L.s.len {
-            _ = dg.err(mkspan(L, L.pos, L.pos), "E0007", "unterminated wasm block");
-            return;
-        }
-        let c = L.s[L.pos];
-        let start = L.pos;
-        if c == '}' {
-            L.pos += 1;
-            L.toks.push(tok(TK_RBRACE, mkspan(L, start, L.pos)));
-            return;
-        }
-        if (c == '(') or (c == ')') {
-            L.pos += 1;
-            let mut k = TK_RPAREN;
-            if c == '(' {
-                k = TK_LPAREN;
-            }
-            L.toks.push(tok(k, mkspan(L, start, L.pos)));
-            continue;
-        }
-        if (c == ';') and (at(L, L.pos + 1) == ';') {
-            while (L.pos < L.s.len) and (L.s[L.pos] != '\n') {
-                L.pos += 1;
-            }
-            continue;
-        }
-        if c == '$' {
-            L.pos += 1;
-            while (L.pos < L.s.len) and is_ident_char(L.s[L.pos]) {
-                L.pos += 1;
-            }
-            let mut t = tok(TK_WASM_LOCAL, mkspan(L, start, L.pos));
-            t.name = u.intern(L.s[start + 1..L.pos]);
-            L.toks.push(t);
-            continue;
-        }
-        while L.pos < L.s.len {
-            let d = L.s[L.pos];
-            if (d == ' ') or (d == '\t') or (d == '\n') or (d == '\r') or (d == '(') or (d == ')') or (d == '}') or (d == '$') {
-                break;
-            }
-            if d >= 0x80 {
-                break;
-            }
-            L.pos += 1;
-        }
-        if L.pos == start {
-            _ = dg.err(mkspan(L, start, start + 1), "E0002", "unexpected character in wasm block");
-            L.pos += 1;
-            continue;
-        }
-        let mut t = tok(TK_WASM_WORD, mkspan(L, start, L.pos));
-        t.name = u.intern(L.s[start..L.pos]);
-        L.toks.push(t);
-    }
-}
-
 // Operators for maximal munch, longest first.
 struct OpTok {
     s: []u8,
     k: i32,
 }
 
-fn op_table() [49]OpTok {
+fn op_table() [48]OpTok {
     return [
         OpTok.{ s: "...", k: TK_ELLIPSIS }, OpTok.{ s: "+%=", k: TK_PLUS_PCT_EQ }, OpTok.{ s: "-%=", k: TK_MINUS_PCT_EQ },
         OpTok.{ s: "*%=", k: TK_STAR_PCT_EQ }, OpTok.{ s: "<<=", k: TK_SHL_EQ }, OpTok.{ s: ">>=", k: TK_SHR_EQ },
@@ -546,7 +474,7 @@ fn op_table() [49]OpTok {
         OpTok.{ s: "+=", k: TK_PLUS_EQ }, OpTok.{ s: "-=", k: TK_MINUS_EQ }, OpTok.{ s: "*=", k: TK_STAR_EQ },
         OpTok.{ s: "/=", k: TK_SLASH_EQ }, OpTok.{ s: "%=", k: TK_PERCENT_EQ }, OpTok.{ s: "&=", k: TK_AMP_EQ },
         OpTok.{ s: "|=", k: TK_PIPE_EQ }, OpTok.{ s: "^=", k: TK_CARET_EQ }, OpTok.{ s: "..", k: TK_DOTDOT },
-        OpTok.{ s: "=>", k: TK_FATARROW }, OpTok.{ s: "->", k: TK_ARROW }, OpTok.{ s: "+", k: TK_PLUS },
+        OpTok.{ s: "=>", k: TK_FATARROW }, OpTok.{ s: "+", k: TK_PLUS },
         OpTok.{ s: "-", k: TK_MINUS }, OpTok.{ s: "*", k: TK_STAR }, OpTok.{ s: "/", k: TK_SLASH },
         OpTok.{ s: "%", k: TK_PERCENT }, OpTok.{ s: "&", k: TK_AMP }, OpTok.{ s: "|", k: TK_PIPE },
         OpTok.{ s: "^", k: TK_CARET }, OpTok.{ s: "~", k: TK_TILDE }, OpTok.{ s: "<", k: TK_LT },
@@ -565,8 +493,7 @@ fn reserved_future(i: usize) []u8 {
 
 // Tokenizes an entire file. Reports lexical errors through diag.
 pub fn lex_file(f: *mut u.SourceFile) u.List.[Token] {
-    let mut L = Lexer.{ f: f, s: f.text, pos: 0, toks: u.List.[Token].{ data: u.nil.[Token](), len: 0, cap: 0 },
-                        wasm_pending: false };
+    let mut L = Lexer.{ f: f, s: f.text, pos: 0, toks: u.List.[Token].{ data: u.nil.[Token](), len: 0, cap: 0 } };
     let ops = op_table();
     if (L.s.len >= 3) and (L.s[0] == 0xEF) and (L.s[1] == 0xBB) and (L.s[2] == 0xBF) {
         _ = dg.err(mkspan(&L, 0, 3), "E0001", "source file must not start with a byte-order mark");
@@ -590,7 +517,7 @@ pub fn lex_file(f: *mut u.SourceFile) u.List.[Token] {
                 L.toks.push(t);
                 continue;
             }
-            for i in 0..@as(usize, 33) {
+            for i in 0..@as(usize, 32) {
                 if u.str_eq(kw_name(i), w) {
                     t.kind = KW_AND + @int_cast(i32, i);
                     break;
@@ -612,9 +539,6 @@ pub fn lex_file(f: *mut u.SourceFile) u.List.[Token] {
                     }
                 }
                 t.name = u.intern(w);
-            }
-            if t.kind == KW_WASM {
-                L.wasm_pending = true;
             }
             L.toks.push(t);
             continue;
@@ -696,21 +620,14 @@ pub fn lex_file(f: *mut u.SourceFile) u.List.[Token] {
         }
         // operators: maximal munch
         let mut matched = false;
-        for i in @as(usize, 0)..49 {
+        for i in @as(usize, 0)..48 {
             let op = ops[i];
             let n = op.s.len;
             if ((L.pos + n) <= L.s.len) and @mem_eq(L.s[L.pos..L.pos + n], op.s) {
                 L.pos += n;
                 let t = tok(op.k, mkspan(&L, start, L.pos));
-                let prev_struct = (L.toks.len > 0) and (L.toks.last().kind == KW_STRUCT);
                 L.toks.push(t);
                 matched = true;
-                if (t.kind == TK_LBRACE) and L.wasm_pending and not prev_struct {
-                    L.wasm_pending = false;
-                    lex_wasm_body(&mut L);
-                } else if (t.kind == TK_SEMI) or (t.kind == TK_RBRACE) {
-                    L.wasm_pending = false;
-                }
                 break;
             }
         }

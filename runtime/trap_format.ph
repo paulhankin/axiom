@@ -28,7 +28,7 @@ pub struct Site {
 pub const SS_CAP: u32 = 256;
 pub const ET_CAP: u32 = 32;
 
-// A thread's shadow stack (spec §17.4).
+// A thread's shadow stack (spec §16.4).
 pub struct ShadowStack {
     depth: u32,
     errors: u32,

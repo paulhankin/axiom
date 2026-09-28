@@ -6,7 +6,7 @@ Its main target is WebAssembly. Its design mandate is:
 - **zero hidden control flow**: no exceptions, destructors, operator overloading, or implicit allocation
 - **context-compact grammar**: LL(1), context-free, no macros, one canonical form
 - **zero undefined behavior**: every operation has a defined result or a deterministic trap
-- **first-class WASM/SIMD**: 128-bit vector primitives and typed inline WebAssembly
+- **first-class WASM/SIMD**: 128-bit vector primitives with WebAssembly semantics
 - **arena-centric memory**: no global allocator; every allocation names an `Allocator`
 
 ## Quick start
@@ -19,7 +19,7 @@ phalange test mylib.ph                # run a file's `test` blocks
 phalange new geometry                 # a package: phalange.toml + src/lib.ph (spec §4.6)
 phalange test geometry                # build/check/test also take a package directory
 phalange profile prog.ph              # sampling profiler: hot functions, call sites, flame graph input
-phalange build app --verbose          # modules compile separately and are cached (spec §17.7)
+phalange build app --verbose          # modules compile separately and are cached (spec §16.7)
 node tests/run.mjs                    # run the test suite
 selfhost/bootstrap.sh                 # build the self-hosted compiler (stage 1, 2, 3)
 selfhost/build/phalange build prog.ph --target=aarch64 --cpu=neoverse-n1 -o prog
@@ -34,7 +34,7 @@ WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library
 |---|---|
 | [`spec/phalange.md`](spec/phalange.md) | Language specification (v0.1 working draft) |
 | [`examples/dot_product.ph`](examples/dot_product.ph) | SIMD dot product with a bump arena and WASM exports |
-| [`examples/shapes.ph`](examples/shapes.ph) | Tagged unions, `match`, errors, inline WASM |
+| [`examples/shapes.ph`](examples/shapes.ph) | Tagged unions, `match`, errors |
 | [`examples/generics.ph`](examples/generics.ph) | Generic functions and types, constraints, const parameters |
 | [`examples/c_interop/`](examples/c_interop/stats.ph) | A Phalange library called from C through a generated header |
 | [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |

@@ -161,7 +161,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
 }
 
-// Stack traces (spec §17.4): `// stack:` and `// errors:` lines in
+// Stack traces (spec §16.4): `// stack:` and `// errors:` lines in
 // tests/traces/traces.ph give the expected frames of each failing test, and
 // tests/traces/crash.ph must report a stack overflow with its stack.
 {
@@ -201,7 +201,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
 }
 
-// Profiling (spec §17.6).
+// Profiling (spec §16.6).
 {
   const name = 'tests/profile/hot.ph [phalange profile]';
   if (!filter || name.includes(filter)) {
@@ -225,7 +225,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
 }
 
-// Separate compilation (spec §17.7): the object cache is reused and
+// Separate compilation (spec §16.7): the object cache is reused and
 // invalidated along imports, and cached objects stay correct when the
 // program's error codes are renumbered.
 {

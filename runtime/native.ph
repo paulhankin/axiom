@@ -1,7 +1,7 @@
 // =============================================================================
 // runtime/native.ph - the Phalange host ABI (import module "phalange") for
 // native targets on Linux, and crash reporting (trap messages and stack
-// traces, spec §17.4). The self-hosted compiler builds it into every native
+// traces, spec §16.4). The self-hosted compiler builds it into every native
 // program; ph_rt_init runs before `main`.
 // =============================================================================
 import "trap_format.ph" as tf;

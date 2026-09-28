@@ -70,7 +70,6 @@ typedef enum ExprKind {
     E_ARRAY_REPEAT, // [a; b]
     E_ERROR_VAL,    // error.Name
     E_BUILTIN,
-    E_WASM,  // wasm -> T { ... }
     E_UNARY,
     E_BINARY,
     E_CATCH,
@@ -126,15 +125,7 @@ typedef struct BuiltinArg {
     TypeExpr *t;
 } BuiltinArg;
 
-typedef struct WasmInstr {
-    Sym op;
-    Span span;
-    Vec(Token) imms;
-    Local *local;  // resolved $name
-} WasmInstr;
-
 typedef Vec(Expr *) ExprVec;
-typedef Vec(WasmInstr) WasmInstrVec;
 
 struct Expr {
     ExprKind kind;
@@ -162,9 +153,6 @@ struct Expr {
     Expr *hexpr;
     Stmt *hblock;
     Local *capture_local;
-    // wasm expression
-    TypeExpr *wasm_te;
-    WasmInstrVec wasm;
 
     // ---- sema annotations ----
     Type *type;
@@ -199,7 +187,6 @@ typedef enum StmtKind {
     S_BREAK,
     S_CONTINUE,
     S_DEFER,
-    S_WASM,
     S_BLOCK,
 } StmtKind;
 
@@ -234,7 +221,6 @@ struct Stmt {
     Stmt *body, *els;
     StmtVec stmts;
     Vec(MatchArm) arms;
-    WasmInstrVec wasm;
     // sema
     Local *local;
     bool diverges;  // block never completes normally

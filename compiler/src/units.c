@@ -1,4 +1,4 @@
-// units.c - separate compilation (spec §17.7).
+// units.c - separate compilation (spec §16.7).
 //
 // Each module is compiled to its own object file, cached under
 // <cache>/obj/<key>.o, where the key hashes everything the object depends on:

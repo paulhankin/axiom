@@ -1,4 +1,4 @@
-// Stack traces and error return traces (spec §17.4), checked by tests/run.mjs:
+// Stack traces and error return traces (spec §16.4), checked by tests/run.mjs:
 //   // stack: <test> | <function>@<line> ...     innermost first; ~N = a repeat marker
 //   // errors: <test> | <function>@<line> ...    oldest first
 error { Bad }

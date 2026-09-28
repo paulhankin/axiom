@@ -36,7 +36,6 @@
     X(TEST, "test")          \
     X(TRUE, "true")          \
     X(UNION, "union")        \
-    X(WASM, "wasm")          \
     X(WHILE, "while")
 
 // Primitive type names (reserved; lex as TK_PRIM with a PrimKind).
@@ -96,11 +95,8 @@ typedef enum TokKind {
     TK_EQ, TK_PLUS_EQ, TK_MINUS_EQ, TK_STAR_EQ, TK_SLASH_EQ, TK_PERCENT_EQ,
     TK_PLUS_PCT_EQ, TK_MINUS_PCT_EQ, TK_STAR_PCT_EQ,
     TK_AMP_EQ, TK_PIPE_EQ, TK_CARET_EQ, TK_SHL_EQ, TK_SHR_EQ,
-    TK_BANG, TK_DOT, TK_DOTDOT, TK_ELLIPSIS, TK_COMMA, TK_COLON, TK_SEMI, TK_FATARROW, TK_ARROW,
+    TK_BANG, TK_DOT, TK_DOTDOT, TK_ELLIPSIS, TK_COMMA, TK_COLON, TK_SEMI, TK_FATARROW,
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE, TK_LBRACKET, TK_RBRACKET,
-    // inline-wasm mode
-    TK_WASM_WORD,   // instruction name or immediate, raw text
-    TK_WASM_LOCAL,  // $name
     TK_COUNT
 } TokKind;
 
@@ -110,7 +106,7 @@ typedef struct Token {
     union {
         uint64_t ival;  // TK_INT, TK_CHAR
         double fval;    // TK_FLOAT
-        Sym name;       // TK_IDENT, TK_BUILTIN, TK_WASM_WORD, TK_WASM_LOCAL
+        Sym name;       // TK_IDENT, TK_BUILTIN
         PrimKind prim;  // TK_PRIM
         struct {
             const char *bytes;

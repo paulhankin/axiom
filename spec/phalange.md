@@ -24,12 +24,11 @@ and unresolved questions are in [Appendix D](#appendix-d-open-questions).
 11. [Errors](#11-errors)
 12. [Memory Model](#12-memory-model)
 13. [SIMD](#13-simd)
-14. [Inline WebAssembly](#14-inline-webassembly)
-15. [Targets and ABI](#15-targets-and-abi)
-16. [Standard Library Core](#16-standard-library-core)
-17. [Toolchain and Agent Diagnostic Interface](#17-toolchain-and-agent-diagnostic-interface)
-18. [Testing](#18-testing)
-19. [Complete Example](#19-complete-example)
+14. [Targets and ABI](#14-targets-and-abi)
+15. [Standard Library Core](#15-standard-library-core)
+16. [Toolchain and Agent Diagnostic Interface](#16-toolchain-and-agent-diagnostic-interface)
+17. [Testing](#17-testing)
+18. [Complete Example](#18-complete-example)
 - [Appendix A: Builtin Functions](#appendix-a-builtin-functions)
 - [Appendix B: Trap Conditions](#appendix-b-trap-conditions)
 - [Appendix C: Changes from the Design Notes](#appendix-c-changes-from-the-design-notes)
@@ -41,7 +40,7 @@ and unresolved questions are in [Appendix D](#appendix-d-open-questions).
 
 - **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as in RFC 2119.
 - A **compile error** means a conforming implementation rejects the program with a
-  diagnostic. Every compile error has a stable code (§17.3).
+  diagnostic. Every compile error has a stable code (§16.3).
 - A **trap** ends execution immediately and deterministically. In WebAssembly it is the
   `unreachable` instruction or a native WASM trap. A trap is *defined behavior*: its
   cause and location are part of the program's meaning (§12.7, Appendix B).
@@ -71,7 +70,7 @@ concrete rules that enforce it.
 | **Zero hidden control flow** | No exceptions, destructors, operator overloading, implicit calls, getters, or implicit allocation. The only non-local exits are `return`, `break`, `continue`, postfix `!`, `catch … return`, and traps. `defer` is written out at the point where it is registered. |
 | **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `phalange fmt`. |
 | **Zero undefined behavior** | Arithmetic, shifts, casts, and memory access all have defined results or traps. Memory is an abstract, bounds-checked linear byte array (§12). Compilers MUST NOT optimize on assumptions that the absence of UB would otherwise justify. |
-| **First-class WASM/SIMD** | 128-bit vector types are primitives. Inline WebAssembly is structured, typed, and validated (§14). WASM semantics are the reference semantics. |
+| **First-class WASM/SIMD** | 128-bit vector types are primitives. WASM semantics are the reference semantics, on every target. |
 | **Arena-centric memory** | There is no global allocator. Every allocation names an `Allocator`. The standard library is built around arenas and `defer`. |
 
 A secondary principle is **locality of reasoning**. The meaning of a line of code should
@@ -112,8 +111,7 @@ A lone `_` is the **discard token** (§8.2). It is not an identifier.
 and       as        break     catch     const     continue  defer     else
 error     export    extern    false     fn        for       host      if
 import    in        let       loop      match     mut       not       or
-pub       return    Self      struct    test      true      union     wasm
-while
+pub       return    Self      struct    test      true      union     while
 ```
 
 **Reserved type names.** These lex as keywords:
@@ -147,7 +145,7 @@ ESCAPE     ::= "\n" | "\r" | "\t" | "\0" | "\\" | "\"" | "\'" | "\x" HEX HEX | "
 - A string literal has type `[]u8`. Its bytes are the UTF-8 encoding of its contents,
   stored in static read-only data. The slice does not include a terminator, but a NUL
   byte always follows the literal in memory, so `"text".ptr` is a valid C string
-  (§15.5).
+  (§14.5).
 - A leading `-` is never part of a literal. It is the unary minus operator (§7.5).
 
 ### 2.6 Operators and punctuation
@@ -159,7 +157,7 @@ The lexer uses **maximal munch**. The complete token set is:
 &   |   ^   ~   <<  >>
 ==  !=  <   <=  >   >=
 =   +=  -=  *=  /=  %=  +%= -%= *%= &=  |=  ^=  <<= >>=
-!   .   ..  ... ,   :   ;   =>  ->  @
+!   .   ..  ... ,   :   ;   =>  @
 (   )   {   }   [   ]
 ```
 
@@ -168,14 +166,6 @@ compare, write `(f()!) == x` or add whitespace: `f()! == x`. The formatter alway
 the spaced form.
 
 A **builtin name** `@` IDENT is a single token (for example `@splat`).
-
-### 2.7 Inline-WASM lexical mode
-
-After `wasm {` or `wasm -> Type {`, the lexer switches to *WASM mode* until the matching
-`}` (§14.2). In WASM mode, tokens follow the WebAssembly text format: instruction names
-like `i32.clz` and `v128.load`, `$`-prefixed names, integer and float immediates, and
-`offset=`/`align=` immediates. Mode switching is purely lexical and needs no parser
-feedback.
 
 ---
 
@@ -204,7 +194,7 @@ ImportDecl    ::= "import" ( STRING_LIT "as" IDENT ";"
                            | "host" STRING_LIT? "{" HostFnDecl* "}" )
 HostFnDecl    ::= "fn" IDENT "(" ParamList? ")" Type ";"
 
-ExternDecl    ::= "extern" STRING_LIT STRING_LIT? "{" ExternFnDecl* "}"   (* §15.5 *)
+ExternDecl    ::= "extern" STRING_LIT STRING_LIT? "{" ExternFnDecl* "}"   (* §14.5 *)
 ExternFnDecl  ::= "fn" IDENT "(" ExternParams? ")" Type ";"
 ExternParams  ::= Param ( "," Param )* ( "," "..." )?
 
@@ -274,7 +264,7 @@ Block         ::= "{" Stmt* "}"
 Stmt          ::= LetStmt
                 | IfStmt | WhileStmt | LoopStmt | ForStmt | MatchStmt
                 | ReturnStmt | BreakStmt | ContinueStmt
-                | DeferStmt | WasmStmt | DiscardStmt
+                | DeferStmt | DiscardStmt
                 | Block
                 | ExprStmt
 
@@ -299,16 +289,11 @@ ReturnStmt    ::= "return" Expr? ";"
 BreakStmt     ::= "break" ";"
 ContinueStmt  ::= "continue" ";"
 DeferStmt     ::= "defer" ( Block | ExprStmt )
-WasmStmt      ::= "wasm" WasmBody
 ```
 
 Assignment and expression statements share one production because both begin with an
 expression. Whether the left-hand side is assignable is checked afterwards (§7.2). This
 is the standard LL(1) factoring.
-
-A statement that starts with `wasm` is always a `WasmStmt`. The value-producing form
-`wasm -> T { … }` (§3.5) may appear only where an expression is expected in a non-initial
-position, for example after `return` or `=`.
 
 ### 3.5 Expressions
 
@@ -342,7 +327,6 @@ PrimaryExpr   ::= IDENT | "Self"
                 | "[" Expr ( ";" Expr | ( "," Expr )* ","? ) "]"   (* array literal *)
                 | "error" "." IDENT
                 | BuiltinCall
-                | "wasm" "->" Type WasmBody
 
 FieldInits    ::= ( FieldInit ( "," FieldInit )* ","? )?
 FieldInit     ::= IDENT ":" Expr
@@ -368,17 +352,6 @@ BuiltinArg    ::= Type | Expr        (* chosen by the builtin's signature, Appen
 
 An unknown builtin name is a compile error (`E0120`) raised by the parser.
 
-### 3.7 Inline WASM body
-
-```ebnf
-WasmBody      ::= "{" WasmInstr* "}"
-WasmInstr     ::= WASM_OPCODE WasmImmediate*
-WasmImmediate ::= "$" IDENT | INT_LIT | FLOAT_LIT | ("offset" | "align") "=" INT_LIT
-                | "(" "result" WasmValType ")"
-```
-
-See §14 for the permitted instruction set and typing.
-
 ---
 
 ## 4. Modules, Names and Scopes
@@ -398,7 +371,7 @@ Import cycles are a compile error (`E0210`) in v0.1.
 - `pub` makes a top-level item, or a method, visible to importing modules.
 - Struct and union **fields** are visible wherever the type is visible. v0.1 has no field
   privacy.
-- `export` makes a function a WebAssembly export (§15.2). An exported function is not
+- `export` makes a function a WebAssembly export (§14.2). An exported function is not
   automatically `pub`.
 
 ### 4.3 Declaration order
@@ -504,9 +477,9 @@ cycle between their modules is still `E0210`.
   output is named after the package.
 - `phalange test <dir>` loads **every** `.ph` file under the package's `src/`, so tests in
   modules that the entry module doesn't import still run. Only the root package's tests
-  run; its dependencies' tests don't (§18).
+  run; its dependencies' tests don't (§17).
 - Modules, not packages, are the unit of compilation, and they are compiled and cached
-  separately (§17.7). Generics monomorphize across packages as they do within one.
+  separately (§16.7). Generics monomorphize across packages as they do within one.
   Distributing precompiled packages is future work (Appendix D).
 
 ---
@@ -639,7 +612,7 @@ happen after writing through raw pointers, the program traps (`T0007`).
 
 A function pointer is a value that refers to a top-level function or method. Phalange has no
 closures and no captured environment. A named function used as a value has function-pointer
-type. On WASM, the value is a table index of type `u32` (§15.3). Calling an invalid function
+type. On WASM, the value is a table index of type `u32` (§14.3). Calling an invalid function
 pointer traps (`T0009`), which follows WASM `call_indirect` semantics.
 
 ### 5.12 Error unions: `!T`
@@ -809,7 +782,7 @@ Applying `-` to an unsigned type is a compile error (`E0520`). Use `-%` or subtr
 
 ### 7.6 Integer arithmetic semantics
 
-**Overflow mode.** Each build has an *overflow mode*, chosen with a compiler flag (§17.1):
+**Overflow mode.** Each build has an *overflow mode*, chosen with a compiler flag (§16.1):
 
 - `trap` (the default): if the mathematical result of `+`, `-`, `*`, unary `-`, or
   `MIN / -1` is not representable, the program traps (`T0002`).
@@ -842,8 +815,7 @@ signed count is a compile error (`E0525`); converting it explicitly makes the ne
 visible.
 
 *Codegen note:* WebAssembly's `i32.shl` family takes the count modulo the width. When `k` is
-not a constant known to be less than `n`, the compiler emits a compare-and-select. Raw shift
-instructions inside inline WASM (§14) keep WebAssembly semantics.
+not a constant known to be less than `n`, the compiler emits a compare-and-select.
 
 **Constant evaluation.** In a `const` initializer or an array length, an overflow is a
 compile error (`E0530`) in every mode.
@@ -1001,10 +973,6 @@ normal completion, `return`, `break`, `continue`, `e!` propagation, and `catch r
   a leaving handler (`E0640`). A deferred statement cannot change where control goes.
 - A `defer` inside a loop body runs at the end of **each** iteration.
 - On a **trap**, deferred statements do **not** run.
-
-### 8.9 `wasm`
-
-See §14.
 
 ---
 
@@ -1250,7 +1218,7 @@ declared anywhere in the program is `E0650`, which catches typos.
 
 Codes are assigned deterministically: all declared names are sorted by byte value and
 numbered starting at 1. Codes therefore depend on the whole program, so modules that
-are compiled separately refer to them by name, and they are fixed at link time (§17.7). `@error_name(e)` returns the name as a `[]u8`. For an unknown code
+are compiled separately refer to them by name, and they are fixed at link time (§16.7). `@error_name(e)` returns the name as a `[]u8`. For an unknown code
 it returns `"<unknown>"`.
 
 ### 11.2 Returning and handling errors
@@ -1274,7 +1242,7 @@ fn sum_digits(s: []u8) !u32 {
 
 Errors are ordinary values. Phalange has no stack unwinding and no exception tables, and it
 does not capture stack traces implicitly. (Debug builds MAY record error return traces,
-§17.4.)
+§16.4.)
 
 ---
 
@@ -1322,7 +1290,7 @@ unspecified contents (§12.1) but is never "poison".
 ### 12.4 Allocation
 
 Phalange has **no global allocator** and no implicit allocation. No language construct
-allocates heap memory. Allocation always names an `Allocator` (§16.1):
+allocates heap memory. Allocation always names an `Allocator` (§15.1):
 
 ```phalange
 let buf = a.alloc.[u32](1024)!;   // []mut u32; a: Allocator
@@ -1346,7 +1314,7 @@ A trap stops the program **immediately**, including every other thread (§12.8):
 
 - `defer` blocks do not run.
 - The host observes the trap (in JavaScript, a `WebAssembly.RuntimeError`).
-- The trap site maps to a trap code, a source span and a stack trace (§17.4).
+- The trap site maps to a trap code, a source span and a stack trace (§16.4).
 
 Appendix B lists every trap condition.
 
@@ -1508,71 +1476,9 @@ wherever host instructions differ.
 
 ---
 
-## 14. Inline WebAssembly
+## 14. Targets and ABI
 
-### 14.1 Forms
-
-```phalange
-// Statement form: stack effect [] -> []
-wasm {
-    nop
-}
-
-// Expression form: stack effect [] -> [T]
-fn count_leading_zeros(val: u32) u32 {
-    return wasm -> u32 {
-        local.get $val
-        i32.clz
-    };
-}
-```
-
-### 14.2 Semantics
-
-An inline block is validated as a WebAssembly `block` with type `[] -> []` (statement form)
-or `[] -> [W(T)]` (expression form). `W(T)` is the WASM value type of `T`, defined in the
-table below. Validation errors are compile errors (`E09xx`) that point to the offending
-instruction.
-
-**Accessing Phalange variables.** `$name` names an in-scope Phalange local or parameter:
-
-| Phalange type | WASM type | `local.get` | `local.set` / `local.tee` |
-|---|---|---|---|
-| `i32` `u32` `usize`/`isize` (wasm32) | `i32` | yes | yes, if `let mut` |
-| `i64` `u64` `usize`/`isize` (wasm64) | `i64` | yes | yes, if `let mut` |
-| `f32`, `f64` | `f32`, `f64` | yes | yes, if `let mut` |
-| SIMD types | `v128` | yes | yes, if `let mut` |
-| `*T`, `*mut T` | `i32`/`i64` | yes | yes, if `let mut` |
-| `bool`, 8-bit and 16-bit ints | `i32` | yes | **no**, because writing an out-of-range value would break the type's invariant |
-| structs, arrays, slices, unions | none | use `.field` in Phalange code before the block | no |
-
-**Permitted instructions (v0.1).**
-
-- all WASM 2.0 numeric instructions,
-- fixed-width SIMD instructions (not relaxed SIMD),
-- `nop`, `unreachable`, `drop`, `select`,
-- `local.get`/`set`/`tee` on captured variables,
-- loads and stores on memory 0 (these are bounds-trapped as usual),
-- `memory.size`, `memory.fill`, `memory.copy`,
-- structured `block`/`loop`/`if`/`else`/`end`, `br`, `br_if`, `br_table`, whose targets
-  must be labels **inside** the inline block.
-
-**Forbidden instructions** (`E0901`): `return`, `call`, `call_indirect`, `global.*`,
-`table.*`, `memory.grow`, `memory.init`, `data.drop`, and any branch that targets a label
-outside the block. These would create control flow or state changes that are invisible to
-the surrounding Phalange code.
-
-### 14.3 Portability
-
-Inline WASM is **not** target-specific assembly. On native targets, the compiler translates
-the block using WebAssembly semantics. An inline block therefore means the same thing on
-every target, and is really a portable low-level IR escape hatch.
-
----
-
-## 15. Targets and ABI
-
-### 15.1 Targets
+### 14.1 Targets
 
 | Target | `usize` | Notes |
 |---|---|---|
@@ -1581,7 +1487,7 @@ every target, and is really a portable low-level IR escape hatch.
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a reserved virtual region with guard pages and bounds checks (§12.1). Future work |
 
-### 15.2 Exports
+### 14.2 Exports
 
 `export fn` produces a WebAssembly export with the same name. Parameter and return types
 must be one of the following (`E0801` otherwise):
@@ -1598,7 +1504,7 @@ must be one of the following (`E0801` otherwise):
 Exported functions MUST NOT return `!T`. Handle errors before the export boundary. The
 module exports its linear memory as `"memory"`.
 
-### 15.3 Imports
+### 14.3 Imports
 
 ```phalange
 import host "env" {
@@ -1610,7 +1516,7 @@ This declares WASM function imports from module `"env"`, which is the default if
 is omitted. They are called like normal functions. Imported functions use the same type
 restrictions as exports.
 
-### 15.4 Function tables
+### 14.4 Function tables
 
 Every function used as a value is placed in table 0. A function pointer is its index
 (`u32`). Calling through a pointer uses `call_indirect` with a signature check, so a bad
@@ -1618,7 +1524,7 @@ index or wrong signature traps (`T0009`).
 
 ---
 
-### 15.5 C foreign function interface
+### 14.5 C foreign function interface
 
 Phalange calls C, and C calls Phalange, with no glue code on either side.
 
@@ -1710,11 +1616,11 @@ twice can corrupt the Phalange program, just as it could corrupt any C program. 
 - On native targets, Phalange's pointers are real addresses (see the compiler README),
   which is what makes pointers interchangeable with C at no cost.
 
-## 16. Standard Library Core
+## 15. Standard Library Core
 
 Only the parts that the language semantics depend on are specified here.
 
-### 16.1 `std/mem.Allocator`
+### 15.1 `std/mem.Allocator`
 
 ```phalange
 pub struct Allocator {
@@ -1737,7 +1643,7 @@ pub struct Allocator {
 These are ordinary generic methods (§10), not builtins. If the byte count overflows,
 `alloc` returns `error.OutOfMemory` without calling the hook.
 
-### 16.2 `std/mem.Arena`
+### 15.2 `std/mem.Arena`
 
 ```phalange
 pub struct Arena {
@@ -1769,20 +1675,20 @@ fn work() !void {
 from the old copy still point at the old location. The compiler SHOULD warn when an
 `Arena` whose `allocator()` has been called is later moved (`W0711`).
 
-### 16.3 `std/mem.page_allocator`
+### 15.3 `std/mem.page_allocator`
 
 `page_allocator` is a global `Allocator` backed by `memory.grow` on WASM and by the linear
 region reservation on native targets. On `wasm32-freestanding`, `free` is a no-op because
 WASM memory cannot shrink.
 
-### 16.4 `std/mem.FixedBuffer`
+### 15.4 `std/mem.FixedBuffer`
 
 `FixedBuffer` is a bump allocator over a caller-provided `[]mut u8`. It never grows and
 returns `error.OutOfMemory` when the buffer is full. It is intended for `static` arena
-patterns like the example in §18.
+patterns like the example in §17.
 
 
-### 16.5 Other modules and the host ABI
+### 15.5 Other modules and the host ABI
 
 The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `net`) is
 ordinary Phalange code; see `std/README.md`. It adds no language rules. Operating-system
@@ -1793,9 +1699,9 @@ services are reached through host functions imported from module `"phalange"` (t
 
 ---
 
-## 17. Toolchain and Agent Diagnostic Interface
+## 16. Toolchain and Agent Diagnostic Interface
 
-### 17.1 Commands
+### 16.1 Commands
 
 ```
 phalange build <file.ph> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
@@ -1803,10 +1709,10 @@ phalange check <file.ph>                  # parse and type-check only; no codege
 phalange fmt   <file.ph> [--check]        # canonical formatting; --check exits 1 if not canonical
 phalange run   <file.ph> [--export=name]  # build for wasm32 and execute in the reference runtime
 phalange explain <CODE>                   # long-form documentation for a diagnostic code
-phalange test  <file.ph> [--filter=text] [--timeout=ms]   # run test blocks (§18)
+phalange test  <file.ph> [--filter=text] [--timeout=ms]   # run test blocks (§17)
 phalange new   <name>                     # create a package skeleton (§4.6)
-phalange profile <file.ph> [--rate=hz]    # sampling profiler (§17.6)
-phalange cache [path|clean]               # the compiled-module cache (§17.7)
+phalange profile <file.ph> [--rate=hz]    # sampling profiler (§16.6)
+phalange cache [path|clean]               # the compiled-module cache (§16.7)
 ```
 
 `build`, `check` and `test` also accept a package directory, or no path at all for the
@@ -1818,7 +1724,7 @@ Every command accepts `--format=human` (the default) or `--format=agent-json`.
   `.wasm` files and diagnostics.
 - Diagnostics are sorted by file, then by start byte, then by code.
 
-### 17.2 JSON output
+### 16.2 JSON output
 
 With `--format=agent-json`, the command writes **one** JSON object to **stdout** and nothing
 else. (Progress and log text, if any, go to stderr.) Exit codes are:
@@ -1880,7 +1786,7 @@ else. (Progress and log text, if any, go to stderr.) Exit codes are:
 | `fixes[].applicability` | `"machine"`: applying every edit yields a program without this diagnostic, and the fix does not change intended semantics. `"suggestion"`: plausible, needs review. `"placeholder"`: the edit contains `<…>` holes that must be filled in |
 | `fixes[].edits` | Non-overlapping byte-range replacements, applied together atomically |
 
-### 17.3 Diagnostic codes
+### 16.3 Diagnostic codes
 
 Codes are stable. A code's meaning is never reused for something else.
 
@@ -1895,7 +1801,6 @@ Codes are stable. A code's meaning is never reused for something else.
 | `E06xx` | Control flow, returns, errors, discards |
 | `E07xx` | Places, mutability, pointers |
 | `E08xx` | ABI, exports, imports, SIMD, builtins |
-| `E09xx` | Inline WASM |
 | `Wxxxx` | Warnings, with ranges that mirror the `E` ranges |
 | `Txxxx` | Runtime traps (Appendix B) |
 
@@ -1951,9 +1856,8 @@ Initial registry, not exhaustive:
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0824 | C variadic argument without a promoted type |
 | E0825 | `@expect_eq` operand type cannot be compared |
-| E0901 | Forbidden instruction in inline WASM |
 
-### 17.4 Runtime trap reporting and stack traces
+### 16.4 Runtime trap reporting and stack traces
 
 Every trap site carries a constant **site record**: trap code, source file, byte span,
 line, column, the text of the failing expression, and the name of the enclosing
@@ -2004,7 +1908,7 @@ stacks:
    information in the binary.
 2. **Exact source locations.** A call site is recorded as a Phalange source span, not
    as a machine address that must be mapped back to source.
-3. **It doubles as the profiler's stack sampler** (§17.6).
+3. **It doubles as the profiler's stack sampler** (§16.6).
 
 The cost is three stores and one load per call. On call-heavy microbenchmarks (for
 example, a naive recursive Fibonacci) it roughly doubles run time. On typical code it
@@ -2030,14 +1934,14 @@ FAIL parse config (1 ms)
        config.ph:41:9 in test "parse config": _ = parse(text)!;
 ```
 
-### 17.5 Canonical formatting
+### 16.5 Canonical formatting
 
 `phalange fmt` defines the single canonical layout. Its output is the same no matter how the
 input was laid out, and running it twice changes nothing. Agents SHOULD run `phalange fmt`
 before diffing or committing. Two programs that are equal after formatting are the same
 program.
 
-### 17.6 Profiling
+### 16.6 Profiling
 
 ```
 phalange profile <file.ph> | <package dir> [--target=wasm32|native] [-O0..-O3]
@@ -2046,7 +1950,7 @@ phalange profile <file.ph> | <package dir> [--target=wasm32|native] [-O0..-O3]
 
 `phalange profile` builds the program, runs its `main`, and reports where the time went.
 It is a **sampling profiler**. About `--rate` times a second (default 999) it copies the
-running thread's shadow stack (§17.4.1), so every sample is an exact source-level call
+running thread's shadow stack (§16.4.1), so every sample is an exact source-level call
 path. It is not an estimate from machine addresses.
 
 ```
@@ -2096,7 +2000,7 @@ Limitations in v0.1:
 - Stacks deeper than 256 calls lose their outermost frames. These samples are
   counted and reported as truncated.
 
-### 17.7 Separate compilation
+### 16.7 Separate compilation
 
 Each **module** is a compilation unit. A build type-checks the whole program (sema is
 fast), then:
@@ -2135,7 +2039,7 @@ What makes modules independent:
 | Globals | Defined in the link unit (initializers may contain error codes) and referenced by name |
 | Generic instances | Defined link-once by every unit that uses them, under names built from module-qualified types, so the linker keeps one copy |
 | Private functions | Externally visible under their module-qualified names, because another unit's generic instance may call them |
-| Source locations in site records (§17.4) | A stable hash of the file's path, not a per-build file number |
+| Source locations in site records (§16.4) | A stable hash of the file's path, not a per-build file number |
 
 **When it is used.** Separate compilation is the default for executables at `-O0` and
 `-O1`. Those are the edit–build–test builds, where only changed modules are recompiled.
@@ -2151,9 +2055,9 @@ declared but never called must still exist at link time.
 
 ---
 
-## 18. Testing
+## 17. Testing
 
-### 18.1 Test blocks and assertions
+### 17.1 Test blocks and assertions
 
 ```phalange
 test "parse accepts digits" {
@@ -2187,7 +2091,7 @@ test "indexing past the end traps" expect trap(T0001) {
   (`E0825` for other types). Both builtins also work outside tests, as assertions
   that stay on in every build.
 
-### 18.2 Running tests
+### 17.2 Running tests
 
 ```
 phalange test file.ph|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--format=agent-json]
@@ -2203,7 +2107,7 @@ phalange test file.ph|<package dir> [--target=wasm32|native] [--filter=text] [--
   can't affect other tests. Independent tests run in parallel.
 - **Output.** Each test's output (stdout and stderr) is captured and reported with it.
 - **Exit status.** `0` if every selected test passed, `1` if any failed, `2` if the tests
-  could not be built or run. Compile errors are reported as diagnostics (§17.2).
+  could not be built or run. Compile errors are reported as diagnostics (§16.2).
 
 With `--format=agent-json`, stdout holds one object:
 
@@ -2226,7 +2130,7 @@ With `--format=agent-json`, stdout holds one object:
 The span points at the failing expression, or at the test's name when there is no more
 precise location.
 
-## 19. Complete Example
+## 18. Complete Example
 
 `examples/dot_product.ph`, the design-notes example updated to this specification:
 
@@ -2330,10 +2234,6 @@ export fn compute(length: usize) f32 {
     let msg = "dot product computed";
     console_log(msg.ptr, msg.len);
 
-    wasm {
-        nop
-    }
-
     return result;
 }
 ```
@@ -2415,8 +2315,8 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 |---|---|
 | `@trap()` | Diverges and traps with `T0000`. Usable where any type is expected |
 | `@error_name(e)` | `error → []u8` |
-| `@expect(cond)` | Traps with `T0011` if `cond` is false (§18.1) |
-| `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§18.1) |
+| `@expect(cond)` | Traps with `T0011` if `cond` is false (§17.1) |
+| `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§17.1) |
 
 ---
 
@@ -2437,7 +2337,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0008` | Stack exhaustion |
 | `T0009` | Invalid function pointer or signature mismatch (`call_indirect`) |
 | `T0010` | Misaligned atomic access (§12.8.3) |
-| `T0011` | Expectation failed: `@expect` / `@expect_eq` (§18.1) |
+| `T0011` | Expectation failed: `@expect` / `@expect_eq` (§17.1) |
 
 Nothing else traps, and nothing is undefined.
 
@@ -2456,7 +2356,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C4 | Assignment and expression statements are merged into one production | `AssignStmt` and `ExprStmt` share a FIRST set, so they are not LL(1) as written |
 | C5 | Return types are mandatory (`void` for none) | One canonical form. The notes' examples already wrote `void` |
 | C6 | Function-pointer types list parameter types only: `fn(*mut void, usize) T` | `fn(ctx: …)` needs two-token lookahead to tell `name:` from a type name |
-| C7 | Inline WASM has typed forms: `wasm { }` (`[]→[]`) and `wasm -> T { }` (`[]→[T]`) used as an expression | The notes' `count_leading_zeros` relied on an implicit fall-through return value, which is hidden control flow |
+| C7 | The notes' inline WebAssembly (`wasm { … }` blocks) is not part of the language | Builtins (Appendix A) cover what it was used for (`@clz`, SIMD), portably and type-checked; an escape hatch into another instruction set weakens every guarantee around it, and every target but one had to translate it |
 | C8 | `@load_unaligned(f32x4, &a[i])` became `@load(f32x4, a[i..i + 4])` | The original only bounds-checked element `i` and then read 16 bytes, which is a bounds-check hole. Alignment is not semantic (§12.5), so `_unaligned` is redundant |
 | C9 | `arena.allocator().alloc(u32, 1024)` became `arena.allocator().alloc.[u32](1024)` | Type arguments are written `.[…]` (§10.3). A type passed as an ordinary argument would need types to be parseable as expressions |
 | C10 | `&mut HEAP_BYTES` passed as a slice became `HEAP_BYTES[..]` | Array-pointer-to-slice would be an implicit conversion |
@@ -2474,13 +2374,13 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C22 | For `!void`, a `catch` block may complete normally ("handle and continue") | Found while writing the standard library: without it, `f() catch \|e\| { log(e); }` could not be written |
 | C23 | Shared-memory threads (library-level), a race-tolerant memory model, and sequentially consistent atomic builtins (§12.8) | The user asked for threads and concurrency. §12.8.1 gives the reasoning |
 | C24 | Function pointers are allowed across the export/import boundary | Needed by `ph_thread_spawn`. On WebAssembly they are table indices |
-| C25 | C FFI: `extern "C"` blocks with varargs and libraries; `export fn` is C-callable; generated headers (§15.5) | The user asked for a C FFI in both directions |
+| C25 | C FFI: `extern "C"` blocks with varargs and libraries; `export fn` is C-callable; generated headers (§14.5) | The user asked for a C FFI in both directions |
 | C26 | A NUL byte follows every string literal (not part of the slice) | Found while testing the FFI: passing `"%s".ptr` to C read past the end of the literal |
-| C27 | `test` blocks, `@expect`/`@expect_eq`, `phalange test`, and trap site records (§17.4, §18) | The user asked for testing support (formerly open question Q11) |
+| C27 | `test` blocks, `@expect`/`@expect_eq`, `phalange test`, and trap site records (§16.4, §17) | The user asked for testing support (formerly open question Q11) |
 | C28 | Packages: `phalange.toml`, `pkg:` imports, path and pinned-git dependencies, one source per name (§4.6) | The user asked for packages |
-| C29 | Stack traces from a per-thread shadow stack, and error return traces (§17.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
-| C30 | `phalange profile`: a sampling profiler over the shadow stack (§17.6) | The user asked for profiling support |
-| C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§17.7) | The user asked for independent compilation units |
+| C29 | Stack traces from a per-thread shadow stack, and error return traces (§16.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
+| C30 | `phalange profile`: a sampling profiler over the shadow stack (§16.6) | The user asked for profiling support |
+| C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§16.7) | The user asked for independent compilation units |
 
 ---
 
@@ -2532,7 +2432,7 @@ Each question is followed by the options and the current leaning.
      advisory at first, as a lint.
    - **Thread-local storage.** It needs a TLS base per WebAssembly instance.
    - **64-bit `wait`/`notify`.**
-10. **FFI follow-ups** (the FFI itself is §15.5):
+10. **FFI follow-ups** (the FFI itself is §14.5):
     - **Structs by value.** This needs each platform's C calling convention (x86-64
       SysV, AArch64, the wasm C ABI) implemented in the compiler.
     - **Native memory sandboxing vs. FFI.** A bounds-checked linear-memory region on
@@ -2542,13 +2442,13 @@ Each question is followed by the options and the current leaning.
     - **Importing C headers** (`import c "stdio.h"`). This would need a C parser, which
       conflicts with "context-compact". Generating `extern` blocks with a separate
       tool is the likelier path.
-11. ~~**Test blocks.**~~ Resolved: §18. Follow-ups: property-based tests (a
+11. ~~**Test blocks.**~~ Resolved: §17. Follow-ups: property-based tests (a
     `std/testing` generator module), and benchmarks (`bench "name" { … }` with
     `phalange test --bench`).
 12. **Loop labels.** v0.1 has none.
-13. **Relaxed SIMD.** Allow it in inline WASM with implementation-defined results, or forbid
-    it (the current rule)?
-14. **Separate compilation follow-ups** (§17.7):
+13. **Relaxed SIMD.** Offer relaxed-SIMD builtins with implementation-defined results, or
+    not (the current rule)?
+14. **Separate compilation follow-ups** (§16.7):
     - distributing precompiled packages (objects plus an interface, instead of sources);
     - cross-module inlining at `-O2` with separate units (ThinLTO, or exporting small
       function bodies in the interface);

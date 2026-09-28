@@ -1,4 +1,4 @@
-// header.c - C header for a program's exported functions (spec §15.5.4).
+// header.c - C header for a program's exported functions (spec §14.5.4).
 //
 // Every `export fn` gets a prototype. Structs reachable from the exported
 // signatures are defined with the same layout Phalange uses (spec §5.9 is

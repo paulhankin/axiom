@@ -1,4 +1,4 @@
-// units.h - separate compilation of modules, with an object cache (spec §17.7).
+// units.h - separate compilation of modules, with an object cache (spec §16.7).
 #ifndef PH_UNITS_H
 #define PH_UNITS_H
 

@@ -13,7 +13,6 @@
 
 #include "builtins.h"
 #include "diag.h"
-#include "wasmops.h"
 
 // sema helpers reused by codegen
 bool is_place(Expr *e);
@@ -88,7 +87,6 @@ static void gen_block(Stmt *b);
 static LLVMTypeRef lty(Type *t);
 static FnInst *get_inst(Decl *d, Type **gargs, int n);
 static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
-static LLVMValueRef gen_wasm(WasmInstrVec *ins, Type *result);
 
 static Type *ct(Type *t) {
     if (!t || !F || !t->has_params) return t;
@@ -349,7 +347,7 @@ static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
 static LLVMValueRef site_record(int code, Span sp) { return site_record_ex(code, sp, NULL); }
 
 // ---------------------------------------------------------------------------
-// Shadow stack (spec §17.4): each thread has
+// Shadow stack (spec §16.4): each thread has
 //     {u32 depth, u32 errors, [SS_CAP]*Site calls, [ET_CAP]*Site error_returns}
 // Every call stores its call-site record at calls[depth % SS_CAP] and bumps
 // depth for the duration of the call, so after a trap or crash the host can
@@ -988,7 +986,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
 // C ABI detail: integers narrower than 32 bits and bool are passed and
 // returned sign- or zero-extended. Marking every function (and indirect call)
 // this way makes any Phalange function with a scalar signature callable from
-// C, and C function pointers callable from Phalange (spec §15.5).
+// C, and C function pointers callable from Phalange (spec §14.5).
 static void ext_attr(LLVMValueRef v, unsigned idx, Type *t, bool is_call) {
     const char *kind = NULL;
     if (t->kind == TY_BOOL) kind = "zeroext";
@@ -2339,7 +2337,6 @@ static LLVMValueRef gen_inner(Expr *e) {
     case E_ARRAY_REPEAT: return gen_array_lit(e);
     case E_ERROR_VAL: return errcode_value((uint32_t)e->cval);
     case E_BUILTIN: return gen_builtin(e);
-    case E_WASM: return gen_wasm(&e->wasm, t);
     case E_UNARY: return gen_unary(e);
     case E_BINARY: return gen_binary(e);
     case E_CATCH: return gen_catch(e);
@@ -2609,7 +2606,6 @@ static void gen_stmt_inner(Stmt *s) {
     case S_BREAK: gen_break(true); return;
     case S_CONTINUE: gen_break(false); return;
     case S_DEFER: vec_push(F->defers, s->body); return;
-    case S_WASM: gen_wasm(&s->wasm, NULL); return;
     case S_BLOCK: gen_block(s); return;
     }
 }
@@ -2698,334 +2694,6 @@ static void gen_fn_body(FnInst *fi) {
     free(st.defers.data);
     free(st.loops.data);
     F = saved;
-}
-
-// ---------------------------------------------------------------------------
-// Inline WebAssembly -> LLVM IR
-// ---------------------------------------------------------------------------
-static LLVMTypeRef wasm_llty(char c) {
-    switch (c) {
-    case 'i': return T_i32;
-    case 'l': return T_i64;
-    case 'f': return T_f32;
-    case 'd': return T_f64;
-    default: return T_v128;
-    }
-}
-
-static LLVMValueRef to_wasm_val(Type *t, LLVMValueRef v) {
-    switch (t->kind) {
-    case TY_BOOL: return LLVMBuildZExt(B, v, T_i32, "");
-    case TY_INT:
-        if (t->bits < 32) return t->is_signed ? LLVMBuildSExt(B, v, T_i32, "") : LLVMBuildZExt(B, v, T_i32, "");
-        return v;
-    case TY_PTR: return LLVMBuildPtrToInt(B, v, T_isz, "");
-    case TY_VEC: return LLVMBuildBitCast(B, v, T_v128, "");
-    default: return v;
-    }
-}
-
-static LLVMValueRef from_wasm_val(Type *t, LLVMValueRef v) {
-    switch (t->kind) {
-    case TY_BOOL: return LLVMBuildICmp(B, LLVMIntNE, v, LLVMConstInt(T_i32, 0, false), "");
-    case TY_INT:
-        if (t->bits < 32) return LLVMBuildTrunc(B, v, lty(t), "");
-        return v;
-    case TY_PTR: return LLVMBuildIntToPtr(B, v, T_ptr, "");
-    case TY_VEC: return LLVMBuildBitCast(B, v, lty(t), "");
-    default: return v;
-    }
-}
-
-static LLVMTypeRef shape_ty(const char *prefix) {
-    if (!strcmp(prefix, "i8x16")) return LLVMVectorType(T_i8, 16);
-    if (!strcmp(prefix, "i16x8")) return LLVMVectorType(T_i16, 8);
-    if (!strcmp(prefix, "i32x4")) return LLVMVectorType(T_i32, 4);
-    if (!strcmp(prefix, "i64x2")) return LLVMVectorType(T_i64, 2);
-    if (!strcmp(prefix, "f32x4")) return LLVMVectorType(T_f32, 4);
-    if (!strcmp(prefix, "f64x2")) return LLVMVectorType(T_f64, 2);
-    return T_v128;
-}
-
-static int64_t imm_int(WasmInstr *w, int i) {
-    const char *s = w->imms.data[i].name;
-    return s[0] == '-' ? (int64_t)strtoll(s, NULL, 0) : (int64_t)strtoull(s, NULL, 0);
-}
-
-static double imm_float(WasmInstr *w) {
-    const char *s = w->imms.data[0].name;
-    if (!strcmp(s, "nan")) return __builtin_nan("");
-    if (!strcmp(s, "inf") || !strcmp(s, "+inf")) return __builtin_inf();
-    if (!strcmp(s, "-inf")) return -__builtin_inf();
-    return strtod(s, NULL);
-}
-
-static LLVMValueRef mem_addr(WasmInstr *w, LLVMValueRef base) {
-    int64_t off = 0;
-    for (int i = 0; i < w->imms.len; i++)
-        if (!strncmp(w->imms.data[i].name, "offset=", 7)) off = strtoll(w->imms.data[i].name + 7, NULL, 0);
-    LLVMValueRef a = base;
-    if (off) a = LLVMBuildAdd(B, a, LLVMConstInt(LLVMTypeOf(a), (unsigned long long)off, false), "");
-    return LLVMBuildIntToPtr(B, a, T_ptr, "");
-}
-
-static LLVMValueRef bool_i32(LLVMValueRef c) { return LLVMBuildZExt(B, c, T_i32, ""); }
-
-static LLVMValueRef gen_wasm(WasmInstrVec *ins, Type *result) {
-    LLVMValueRef stack[256];
-    int sp = 0;
-#define POP() (stack[--sp])
-#define PUSH(v)                     \
-    do {                            \
-        LLVMValueRef pushed_ = (v); \
-        stack[sp++] = pushed_;      \
-    } while (0)
-    for (int ii = 0; ii < ins->len; ii++) {
-        WasmInstr *w = &ins->data[ii];
-        const WasmOpInfo *op = wasm_op_lookup(w->op);
-        const char *pre = op->prefix, *o = op->op;
-        if (!strcmp(w->op, "nop")) continue;
-        if (!strcmp(w->op, "unreachable")) {
-            emit_trap(T_TRAP);
-            return result && result->kind != TY_VOID ? LLVMGetPoison(vty(result)) : NULL;
-        }
-        if (!strcmp(w->op, "drop")) {
-            sp--;
-            continue;
-        }
-        if (!strcmp(w->op, "select")) {
-            LLVMValueRef c = POP(), b = POP(), a = POP();
-            PUSH(LLVMBuildSelect(B, LLVMBuildICmp(B, LLVMIntNE, c, LLVMConstInt(T_i32, 0, false), ""), a, b, ""));
-            continue;
-        }
-        if (!strcmp(pre, "local")) {
-            Local *l = w->local;
-            Type *lt = ct(l->type);
-            if (!strcmp(o, "get")) {
-                PUSH(to_wasm_val(lt, load(lt, local_ptr(l), false)));
-            } else {
-                LLVMValueRef v = POP();
-                store(lt, from_wasm_val(lt, v), local_ptr(l), false);
-                if (!strcmp(o, "tee")) PUSH(v);
-            }
-            continue;
-        }
-        bool is_int = !strcmp(pre, "i32") || !strcmp(pre, "i64");
-        bool is_flt = !strcmp(pre, "f32") || !strcmp(pre, "f64");
-        LLVMTypeRef T = NULL;
-        if (is_int || is_flt) {
-            char own = !strcmp(pre, "i32") ? 'i' : !strcmp(pre, "i64") ? 'l' : !strcmp(pre, "f32") ? 'f' : 'd';
-            T = wasm_llty(own);
-        }
-        bool is_cmp = !strcmp(o, "eq") || !strcmp(o, "ne") || !strncmp(o, "lt", 2) || !strncmp(o, "gt", 2) ||
-                      !strncmp(o, "le", 2) || !strncmp(o, "ge", 2);
-        if (!strcmp(o, "const")) {
-            if (is_int) PUSH(LLVMConstInt(T, (unsigned long long)imm_int(w, 0), true));
-            else PUSH(LLVMConstReal(T, imm_float(w)));
-            continue;
-        }
-        if (op->imm == WIMM_MEM) {
-            bool is_store = !strncmp(o, "store", 5);
-            LLVMTypeRef memt;
-            if (!strcmp(pre, "v128")) memt = T_v128;
-            else if (op->mem_bytes == 1) memt = T_i8;
-            else if (op->mem_bytes == 2) memt = T_i16;
-            else if (op->mem_bytes == 4) memt = is_flt ? T_f32 : T_i32;
-            else memt = is_flt ? T_f64 : T_i64;
-            LLVMTypeRef valt = !strcmp(pre, "v128") ? T_v128 : T;
-            if (is_store) {
-                LLVMValueRef v = POP(), base = POP();
-                if (memt != valt) v = LLVMBuildTrunc(B, v, memt, "");
-                LLVMValueRef s = LLVMBuildStore(B, v, mem_addr(w, base));
-                LLVMSetAlignment(s, 1);
-            } else {
-                LLVMValueRef base = POP();
-                LLVMValueRef v = LLVMBuildLoad2(B, memt, mem_addr(w, base), "");
-                LLVMSetAlignment(v, 1);
-                if (memt != valt) v = op->mem_signed ? LLVMBuildSExt(B, v, valt, "") : LLVMBuildZExt(B, v, valt, "");
-                PUSH(v);
-            }
-            continue;
-        }
-        if (is_int) {
-            unsigned bits = !strcmp(pre, "i32") ? 32 : 64;
-            if (strlen(op->in) == 2 && !is_cmp) {
-                LLVMValueRef b = POP(), a = POP();
-                LLVMValueRef r = NULL;
-                if (!strcmp(o, "add")) r = LLVMBuildAdd(B, a, b, "");
-                else if (!strcmp(o, "sub")) r = LLVMBuildSub(B, a, b, "");
-                else if (!strcmp(o, "mul")) r = LLVMBuildMul(B, a, b, "");
-                else if (!strcmp(o, "and")) r = LLVMBuildAnd(B, a, b, "");
-                else if (!strcmp(o, "or")) r = LLVMBuildOr(B, a, b, "");
-                else if (!strcmp(o, "xor")) r = LLVMBuildXor(B, a, b, "");
-                else if (!strcmp(o, "div_u") || !strcmp(o, "rem_u") || !strcmp(o, "div_s") || !strcmp(o, "rem_s")) {
-                    check_or_trap(LLVMBuildICmp(B, LLVMIntNE, b, LLVMConstNull(T), ""), T_DIVZERO);
-                    if (!strcmp(o, "div_u")) r = LLVMBuildUDiv(B, a, b, "");
-                    else if (!strcmp(o, "rem_u")) r = LLVMBuildURem(B, a, b, "");
-                    else {
-                        LLVMValueRef m1 = LLVMBuildICmp(B, LLVMIntEQ, b, LLVMConstAllOnes(T), "");
-                        if (!strcmp(o, "div_s")) {
-                            check_or_trap(LLVMBuildNot(
-                                B, LLVMBuildAnd(B, m1, LLVMBuildICmp(B, LLVMIntEQ, a, int_min(T), ""), ""), ""), T_OVERFLOW);
-                            r = LLVMBuildSDiv(B, a, b, "");
-                        } else {
-                            r = LLVMBuildSRem(B, a, LLVMBuildSelect(B, m1, LLVMConstInt(T, 1, false), b, ""), "");
-                        }
-                    }
-                } else if (!strcmp(o, "shl") || !strcmp(o, "shr_s") || !strcmp(o, "shr_u")) {
-                    LLVMValueRef k = LLVMBuildAnd(B, b, LLVMConstInt(T, bits - 1, false), "");
-                    r = !strcmp(o, "shl") ? LLVMBuildShl(B, a, k, "")
-                        : !strcmp(o, "shr_s") ? LLVMBuildAShr(B, a, k, "")
-                                               : LLVMBuildLShr(B, a, k, "");
-                } else if (!strcmp(o, "rotl") || !strcmp(o, "rotr")) {
-                    LLVMValueRef args[3] = {a, a, b};
-                    r = intrinsic(!strcmp(o, "rotl") ? "llvm.fshl" : "llvm.fshr", &T, 1, args, 3);
-                }
-                if (!r) internal_error(arena_printf("wasm op %s", w->op));
-                PUSH(r);
-                continue;
-            }
-            if (is_cmp) {
-                LLVMValueRef b = POP(), a = POP();
-                LLVMIntPredicate p = LLVMIntEQ;
-                if (!strcmp(o, "eq")) p = LLVMIntEQ;
-                else if (!strcmp(o, "ne")) p = LLVMIntNE;
-                else if (!strcmp(o, "lt_s")) p = LLVMIntSLT;
-                else if (!strcmp(o, "lt_u")) p = LLVMIntULT;
-                else if (!strcmp(o, "gt_s")) p = LLVMIntSGT;
-                else if (!strcmp(o, "gt_u")) p = LLVMIntUGT;
-                else if (!strcmp(o, "le_s")) p = LLVMIntSLE;
-                else if (!strcmp(o, "le_u")) p = LLVMIntULE;
-                else if (!strcmp(o, "ge_s")) p = LLVMIntSGE;
-                else if (!strcmp(o, "ge_u")) p = LLVMIntUGE;
-                PUSH(bool_i32(LLVMBuildICmp(B, p, a, b, "")));
-                continue;
-            }
-            LLVMValueRef a = POP();
-            LLVMValueRef r = NULL;
-            if (!strcmp(o, "clz") || !strcmp(o, "ctz")) {
-                LLVMValueRef args[2] = {a, LLVMConstInt(T_i1, 0, false)};
-                r = intrinsic(!strcmp(o, "clz") ? "llvm.ctlz" : "llvm.cttz", &T, 1, args, 2);
-            } else if (!strcmp(o, "popcnt")) r = intr1("llvm.ctpop", a);
-            else if (!strcmp(o, "eqz")) r = bool_i32(LLVMBuildICmp(B, LLVMIntEQ, a, LLVMConstNull(LLVMTypeOf(a)), ""));
-            else if (!strcmp(o, "extend8_s")) r = LLVMBuildSExt(B, LLVMBuildTrunc(B, a, T_i8, ""), T, "");
-            else if (!strcmp(o, "extend16_s")) r = LLVMBuildSExt(B, LLVMBuildTrunc(B, a, T_i16, ""), T, "");
-            else if (!strcmp(o, "extend32_s")) r = LLVMBuildSExt(B, LLVMBuildTrunc(B, a, T_i32, ""), T, "");
-            else if (!strcmp(o, "wrap_i64")) r = LLVMBuildTrunc(B, a, T_i32, "");
-            else if (!strcmp(o, "extend_i32_s")) r = LLVMBuildSExt(B, a, T_i64, "");
-            else if (!strcmp(o, "extend_i32_u")) r = LLVMBuildZExt(B, a, T_i64, "");
-            else if (!strncmp(o, "reinterpret", 11)) r = LLVMBuildBitCast(B, a, T, "");
-            else if (!strncmp(o, "trunc_sat", 9)) {
-                LLVMTypeRef tys[2] = {T, LLVMTypeOf(a)};
-                r = intrinsic(o[strlen(o) - 1] == 's' ? "llvm.fptosi.sat" : "llvm.fptoui.sat", tys, 2, &a, 1);
-            }
-            if (!r) internal_error(arena_printf("wasm op %s", w->op));
-            PUSH(r);
-            continue;
-        }
-        if (is_flt) {
-            if (strlen(op->in) == 2) {
-                LLVMValueRef b = POP(), a = POP();
-                LLVMValueRef r = NULL;
-                if (op->out == 'i') {
-                    LLVMRealPredicate p = LLVMRealOEQ;
-                    if (!strcmp(o, "ne")) p = LLVMRealUNE;
-                    else if (!strcmp(o, "lt")) p = LLVMRealOLT;
-                    else if (!strcmp(o, "gt")) p = LLVMRealOGT;
-                    else if (!strcmp(o, "le")) p = LLVMRealOLE;
-                    else if (!strcmp(o, "ge")) p = LLVMRealOGE;
-                    r = bool_i32(LLVMBuildFCmp(B, p, a, b, ""));
-                } else if (!strcmp(o, "add")) r = LLVMBuildFAdd(B, a, b, "");
-                else if (!strcmp(o, "sub")) r = LLVMBuildFSub(B, a, b, "");
-                else if (!strcmp(o, "mul")) r = LLVMBuildFMul(B, a, b, "");
-                else if (!strcmp(o, "div")) r = LLVMBuildFDiv(B, a, b, "");
-                else if (!strcmp(o, "min")) r = intr2("llvm.minimum", a, b);
-                else if (!strcmp(o, "max")) r = intr2("llvm.maximum", a, b);
-                else if (!strcmp(o, "copysign")) r = intr2("llvm.copysign", a, b);
-                if (!r) internal_error(arena_printf("wasm op %s", w->op));
-                PUSH(r);
-                continue;
-            }
-            LLVMValueRef a = POP();
-            LLVMValueRef r = NULL;
-            if (!strcmp(o, "abs")) r = intr1("llvm.fabs", a);
-            else if (!strcmp(o, "neg")) r = LLVMBuildFNeg(B, a, "");
-            else if (!strcmp(o, "sqrt")) r = intr1("llvm.sqrt", a);
-            else if (!strcmp(o, "ceil")) r = intr1("llvm.ceil", a);
-            else if (!strcmp(o, "floor")) r = intr1("llvm.floor", a);
-            else if (!strcmp(o, "trunc")) r = intr1("llvm.trunc", a);
-            else if (!strcmp(o, "nearest")) r = intr1("llvm.roundeven", a);
-            else if (!strcmp(o, "demote_f64")) r = LLVMBuildFPTrunc(B, a, T_f32, "");
-            else if (!strcmp(o, "promote_f32")) r = LLVMBuildFPExt(B, a, T_f64, "");
-            else if (!strncmp(o, "reinterpret", 11)) r = LLVMBuildBitCast(B, a, T, "");
-            else if (!strncmp(o, "convert_", 8))
-                r = o[strlen(o) - 1] == 's' ? LLVMBuildSIToFP(B, a, T, "") : LLVMBuildUIToFP(B, a, T, "");
-            if (!r) internal_error(arena_printf("wasm op %s", w->op));
-            PUSH(r);
-            continue;
-        }
-        // SIMD
-        LLVMTypeRef vt = shape_ty(pre);
-        if (!strcmp(pre, "v128")) {
-            if (!strcmp(o, "not")) {
-                PUSH(LLVMBuildNot(B, POP(), ""));
-                continue;
-            }
-            LLVMValueRef b = POP(), a = POP();
-            LLVMValueRef r = !strcmp(o, "and")      ? LLVMBuildAnd(B, a, b, "")
-                             : !strcmp(o, "or")     ? LLVMBuildOr(B, a, b, "")
-                             : !strcmp(o, "xor")    ? LLVMBuildXor(B, a, b, "")
-                                                    : LLVMBuildAnd(B, a, LLVMBuildNot(B, b, ""), "");
-            PUSH(r);
-            continue;
-        }
-        bool vf = pre[0] == 'f';
-        LLVMTypeRef lane = LLVMGetElementType(vt);
-        if (!strcmp(o, "splat")) {
-            LLVMValueRef x = POP();
-            if (!vf && LLVMGetIntTypeWidth(lane) < 32) x = LLVMBuildTrunc(B, x, lane, "");
-            PUSH(LLVMBuildBitCast(B, splat(vt, x, LLVMGetVectorSize(vt)), T_v128, ""));
-            continue;
-        }
-        if (!strncmp(o, "extract_lane", 12)) {
-            LLVMValueRef v = LLVMBuildBitCast(B, POP(), vt, "");
-            LLVMValueRef x = LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, (unsigned long long)imm_int(w, 0), false), "");
-            if (!vf && LLVMGetIntTypeWidth(lane) < 32)
-                x = o[strlen(o) - 1] == 's' ? LLVMBuildSExt(B, x, T_i32, "") : LLVMBuildZExt(B, x, T_i32, "");
-            PUSH(x);
-            continue;
-        }
-        if (!strcmp(o, "replace_lane")) {
-            LLVMValueRef x = POP();
-            LLVMValueRef v = LLVMBuildBitCast(B, POP(), vt, "");
-            if (!vf && LLVMGetIntTypeWidth(lane) < 32) x = LLVMBuildTrunc(B, x, lane, "");
-            v = LLVMBuildInsertElement(B, v, x, LLVMConstInt(T_i32, (unsigned long long)imm_int(w, 0), false), "");
-            PUSH(LLVMBuildBitCast(B, v, T_v128, ""));
-            continue;
-        }
-        if (strlen(op->in) == 1) {
-            LLVMValueRef a = LLVMBuildBitCast(B, POP(), vt, "");
-            LLVMValueRef r = !strcmp(o, "neg") ? (vf ? LLVMBuildFNeg(B, a, "") : LLVMBuildNeg(B, a, ""))
-                             : !strcmp(o, "sqrt") ? intr1("llvm.sqrt", a)
-                                                  : intr1("llvm.fabs", a);
-            PUSH(LLVMBuildBitCast(B, r, T_v128, ""));
-            continue;
-        }
-        LLVMValueRef b = LLVMBuildBitCast(B, POP(), vt, "");
-        LLVMValueRef a = LLVMBuildBitCast(B, POP(), vt, "");
-        LLVMValueRef r;
-        if (!strcmp(o, "add")) r = vf ? LLVMBuildFAdd(B, a, b, "") : LLVMBuildAdd(B, a, b, "");
-        else if (!strcmp(o, "sub")) r = vf ? LLVMBuildFSub(B, a, b, "") : LLVMBuildSub(B, a, b, "");
-        else if (!strcmp(o, "mul")) r = vf ? LLVMBuildFMul(B, a, b, "") : LLVMBuildMul(B, a, b, "");
-        else if (!strcmp(o, "div")) r = LLVMBuildFDiv(B, a, b, "");
-        else if (!strcmp(o, "min")) r = intr2("llvm.minimum", a, b);
-        else r = intr2("llvm.maximum", a, b);
-        PUSH(LLVMBuildBitCast(B, r, T_v128, ""));
-    }
-#undef POP
-#undef PUSH
-    if (result && result->kind != TY_VOID && sp > 0) return from_wasm_val(result, stack[sp - 1]);
-    return NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,7 +2793,7 @@ static void emit_trap_info_export(void) {
     LLVMBuildRet(B, trap_info_global());
 }
 
-// Test binaries (spec §18): tests are listed and run through exports.
+// Test binaries (spec §17): tests are listed and run through exports.
 //   phalange_test_count() u32
 //   phalange_test_name(i) *u8        NUL-terminated
 //   phalange_test_expect(i) i32      -1 must not trap, -2 any trap, n: trap Tn

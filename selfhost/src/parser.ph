@@ -309,70 +309,6 @@ fn parse_field_inits(P: *mut Parser, e: *mut ast.Expr) void {
     _ = expect(P, lx.TK_RBRACE);
 }
 
-fn is_wasm_imm(t: *lx.Token) bool {
-    if t.kind == lx.TK_WASM_LOCAL {
-        return true;
-    }
-    if t.kind != lx.TK_WASM_WORD {
-        return false;
-    }
-    let s = t.name;
-    let c = s[0];
-    if ((c >= '0') and (c <= '9')) or (c == '-') or (c == '+') {
-        return true;
-    }
-    if u.starts(s, "offset=") or u.starts(s, "align=") {
-        return true;
-    }
-    if u.str_eq(s, "nan") or u.str_eq(s, "inf") or u.starts(s, "nan:") {
-        return true;
-    }
-    return false;
-}
-
-// WasmBody ::= "{" WasmInstr* "}"  (lexer already produced wasm-mode tokens)
-fn parse_wasm_body(P: *mut Parser, out: *mut u.List.[ast.WasmInstr]) void {
-    _ = expect(P, lx.TK_LBRACE);
-    while (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_EOF) {
-        let t = peek(P);
-        if t.kind == lx.TK_LPAREN {
-            // (result T) annotations: skip whole group, record as immediate of previous instr
-            let mut depth: i32 = 0;
-            loop {
-                if pk(P) == lx.TK_LPAREN {
-                    depth += 1;
-                }
-                if pk(P) == lx.TK_RPAREN {
-                    depth -= 1;
-                }
-                if out.len > 0 {
-                    out.at(out.len - 1).imms.push(peek(P).*);
-                }
-                _ = advance(P);
-                if not ((depth > 0) and (pk(P) != lx.TK_EOF) and (pk(P) != lx.TK_RBRACE)) {
-                    break;
-                }
-            }
-            continue;
-        }
-        if (t.kind != lx.TK_WASM_WORD) or is_wasm_imm(t) {
-            _ = dg.err(t.span, "E0902", "expected a WebAssembly instruction");
-            _ = advance(P);
-            continue;
-        }
-        _ = advance(P);
-        let mut wi = ast.WasmInstr.{ op: t.name, span: t.span,
-                                     imms: u.List.[lx.Token].{ data: u.nil.[lx.Token](), len: 0, cap: 0 },
-                                     local: u.nil.[ast.Local]() };
-        while is_wasm_imm(peek(P)) {
-            wi.imms.push(peek(P).*);
-            _ = advance(P);
-        }
-        out.push(wi);
-    }
-    _ = expect(P, lx.TK_RBRACE);
-}
-
 fn parse_builtin(P: *mut Parser) *mut ast.Expr {
     let t = advance(P);
     let e = ast.new_expr(ast.E_BUILTIN, t.span);
@@ -499,15 +435,6 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     }
     if k == lx.TK_BUILTIN {
         return parse_builtin(P);
-    }
-    if k == lx.KW_WASM {
-        _ = advance(P);
-        let e = ast.new_expr(ast.E_WASM, start);
-        _ = expect(P, lx.TK_ARROW);
-        e.wasm_te = parse_type(P);
-        parse_wasm_body(P, &mut e.wins);
-        e.span = sp_from(P, start);
-        return e;
     }
     syntax_error(P, "expression");
     if (pk(P) != lx.TK_EOF) and (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_SEMI) {
@@ -1021,19 +948,6 @@ fn parse_stmt(P: *mut Parser) *mut ast.Stmt {
         } else {
             s.body = parse_expr_stmt(P);
         }
-        s.span = sp_from(P, start);
-        return s;
-    }
-    if k == lx.KW_WASM {
-        _ = advance(P);
-        let s = ast.new_stmt(ast.S_WASM, start);
-        if pk(P) == lx.TK_ARROW {
-            _ = dg.err(peek(P).span, "E0101",
-                       "a value-producing 'wasm -> T' block cannot start a statement; use it after 'return' or '='");
-            _ = advance(P);
-            _ = parse_type(P);
-        }
-        parse_wasm_body(P, &mut s.wins);
         s.span = sp_from(P, start);
         return s;
     }

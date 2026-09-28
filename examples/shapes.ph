@@ -1,6 +1,6 @@
 // =============================================================================
 // File: shapes.ph
-// Tagged unions, match, methods, error handling, and inline WASM.
+// Tagged unions, match, methods and error handling.
 // Build: phalange build shapes.ph --target=wasm32-freestanding -o shapes.wasm
 // =============================================================================
 
@@ -32,10 +32,7 @@ fn make_shape(kind: u32, a: f32, b: f32) !Shape {
 }
 
 fn count_leading_zeros(val: u32) u32 {
-    return wasm -> u32 {
-        local.get $val
-        i32.clz
-    };
+    return @clz(val);
 }
 
 export fn shape_area(kind: u32, a: f32, b: f32) f32 {

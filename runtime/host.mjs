@@ -87,7 +87,7 @@ export function readSite(instance, memory, addr) {
 
 export const SS_CAP = 256, ET_CAP = 32;
 
-// The calling thread's shadow stack (spec §17.4): {depth, calls (innermost
+// The calling thread's shadow stack (spec §16.4): {depth, calls (innermost
 // first), errors (oldest first)}, or null if the program has none.
 export function readStack(instance, memory) {
   const f = instance && instance.exports.phalange_shadow_stack;
@@ -337,7 +337,7 @@ export function createHost(opts = {}) {
   return host;
 }
 
-// Sampling profiler (spec §17.6): a worker samples the main thread's shadow
+// Sampling profiler (spec §16.6): a worker samples the main thread's shadow
 // stack; the result is written in the raw format read by `phalange profile`
 // (see runtime/profile.c).
 function startProfiler(instance, memory, hz) {

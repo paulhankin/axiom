@@ -1,5 +1,5 @@
 // runtime/profile_worker.mjs - samples a Phalange program's shadow stack
-// (spec §17.4, §17.6) from another thread. The program runs with a shared
+// (spec §16.4, §16.6) from another thread. The program runs with a shared
 // memory, so this worker can read the main thread's call-site ring while the
 // program runs. Samples are wall-clock. See host.mjs --profile.
 import { parentPort, workerData } from 'worker_threads';

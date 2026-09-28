@@ -109,7 +109,7 @@ static const char *find_tool(const char **names) {
 }
 
 // ---------------------------------------------------------------------------
-// phalange test: run the test binary and report (spec §18).
+// phalange test: run the test binary and report (spec §17).
 // ---------------------------------------------------------------------------
 static int run_capture(char *const argv[], CharVec *out) {
     int fds[2];
@@ -391,7 +391,7 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
 }
 
 // ---------------------------------------------------------------------------
-// phalange profile: run a program under the sampling profiler (spec §17.6)
+// phalange profile: run a program under the sampling profiler (spec §16.6)
 // and report where its time goes.
 // ---------------------------------------------------------------------------
 typedef struct ProfFn {
@@ -869,7 +869,7 @@ int main(int argc, char **argv) {
         co.out_path = out;
     }
     collect_link_names();
-    // Separate compilation (spec §17.7) applies to executables; --emit of a
+    // Separate compilation (spec §16.7) applies to executables; --emit of a
     // single object/IR/assembly file is always one unit.
     bool separate = final_link && (units_mode >= 0 ? units_mode == 1 : co.opt_level <= 1);
     if (separate) {
@@ -965,7 +965,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < c_objs.len; i++) unlink(c_objs.data[i]);
         } else {
             // Every native executable gets the native runtime: the host ABI
-            // (std/io, std/net, threads) and crash reporting (spec §17.4).
+            // (std/io, std/net, threads) and crash reporting (spec §16.4).
             {
                 const char *rt = arena_printf("%s/../runtime/native_host.c", so.std_dir);
                 if (!file_exists(rt)) {

@@ -67,7 +67,6 @@ Local *declare_local(Sym name, Span sp, Type *t, bool mut, bool is_param);
 void scope_push(void);
 void scope_pop(void);
 Local *scope_lookup(Sym name);
-Type *check_wasm_block(WasmInstrVec *instrs, Type *result, Span sp);
 
 // helpers
 static inline Span expr_span(Expr *e) { return e->span; }

@@ -15,7 +15,7 @@ struct ph_trap_site {
     const char *file, *text, *fn, *callee;
 };
 
-// A thread's shadow stack (spec §17.4); see codegen: ss_ptr.
+// A thread's shadow stack (spec §16.4); see codegen: ss_ptr.
 #define PH_SS_CAP 256
 #define PH_ET_CAP 32
 struct ph_shadow_stack {
