@@ -58,6 +58,9 @@ pub struct MInst {
     prev: *mut MInst,
     pos: i32,
     aux: i64,
+    spill: i32,       // 1: a reload, 2: a spill store (of `sreg`, slot `sslot`)
+    sreg: i32,
+    sslot: i32,
 }
 
 pub struct MBlock {
@@ -957,10 +960,18 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                     }
                 }
                 if reads {
-                    insert_before(b, i, t.spill_load(f, nr, @as(i32, c), slot[x]));
+                    let ld = t.spill_load(f, nr, @as(i32, c), slot[x]);
+                    ld.spill = 1;
+                    ld.sreg = nr;
+                    ld.sslot = slot[x];
+                    insert_before(b, i, ld);
                 }
                 if writes {
-                    insert_after(b, i, t.spill_store(f, nr, @as(i32, c), slot[x]));
+                    let st = t.spill_store(f, nr, @as(i32, c), slot[x]);
+                    st.spill = 2;
+                    st.sreg = nr;
+                    st.sslot = slot[x];
+                    insert_after(b, i, st);
                 }
             }
             i = next;
@@ -1091,4 +1102,90 @@ pub fn dce(f: *mut MFunc, pure: fn(*MInst) bool) void {
             }
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// After allocation: a reload into a register that already holds the slot's
+// value (stored or reloaded earlier in the block, the register unchanged
+// since) is dropped, and so is a store of a value the slot already holds.
+// Spill slots are private to the spill code, so only register writes (and
+// calls' clobbers) end what a register holds.
+// -----------------------------------------------------------------------------
+pub fn drop_reloads(f: *mut MFunc, is_label: fn(*MInst) bool) void {
+    let holds = u.newn.[i32](64);  // physical register -> spill slot (when its bit is in `live`)
+    let mut pend = u.List.[*mut MInst].{ data: u.nil.[*mut MInst](), len: 0, cap: 0 };  // stores not read yet
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        let mut live: u64 = 0;
+        pend.clear();
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if is_label(i) {
+                live = 0;  // (reached by jumps too: nothing known)
+                i = next;
+                continue;
+            }
+            if i.spill != 0 {
+                let r = phys(f, i.sreg);
+                let bit = @as(u64, 1) << @int_cast(u32, r);
+                if ((live & bit) != 0) and (holds[@int_cast(usize, r)] == i.sslot) {
+                    remove(b, i);  // the register (or the slot) has it already
+                    i = next;
+                    continue;
+                }
+                if i.spill == 2 {
+                    let mut m = live;
+                    while m != 0 {
+                        let q = @int_cast(usize, @ctz(m));
+                        m = m & (m - 1);
+                        if holds[q] == i.sslot {
+                            live = live & ~(@as(u64, 1) << @int_cast(u32, q));
+                        }
+                    }
+                    // an earlier store to the slot nothing read is dead
+                    let mut k: usize = 0;
+                    while k < pend.len {
+                        if pend.get(k).sslot == i.sslot {
+                            remove(b, pend.get(k));
+                            pend.set(k, pend.get(pend.len - 1));
+                            pend.len -= 1;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    pend.push(i);
+                } else {
+                    let mut k: usize = 0;
+                    while k < pend.len {
+                        if pend.get(k).sslot == i.sslot {
+                            pend.set(k, pend.get(pend.len - 1));
+                            pend.len -= 1;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                }
+                holds[@int_cast(usize, r)] = i.sslot;
+                live = live | bit;
+                i = next;
+                continue;
+            }
+            live = live & ~i.clobber;
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == K_REG) and ((o.role & (RD | RE)) != 0) {
+                    let p = phys(f, o.reg);
+                    if (p >= 0) and (p < 64) {
+                        live = live & ~(@as(u64, 1) << @int_cast(u32, p));
+                    }
+                }
+                if o.kind == K_LABEL {
+                    pend.clear();  // (a jump: the slot may be read there)
+                }
+            }
+            i = next;
+        }
+    }
+    u.free(@ptr_cast(*mut void, pend.data));
 }

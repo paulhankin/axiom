@@ -2526,6 +2526,10 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     return mc.new_inst(FSTR, 16, ops[..]);
 }
 
+fn is_label(i: *mc.MInst) bool {
+    return i.op == LABEL;
+}
+
 fn compile_func(f: *mut ir.Func) void {
     F = f;
     nlocal = 0;
@@ -2618,6 +2622,7 @@ fn compile_func(f: *mut ir.Func) void {
     let tgt = mc.Target.{ nclasses: 2, alloc_order: [gpr_order[..], vr_order[..]], caller_saved: caller_saved(),
                           spill_load: spill_load, spill_store: spill_store };
     mc.allocate(MF, &tgt);
+    mc.drop_reloads(MF, is_label);
     encode_func(f);
 }
 

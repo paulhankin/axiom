@@ -3278,6 +3278,10 @@ fn const_needs_reg(v: *ir.Value) bool {
 
 // Instructions whose only effect is their register result (for mc.dce;
 // not loads: a volatile load must happen).
+fn is_label(i: *mc.MInst) bool {
+    return i.op == xe.LABEL;
+}
+
 fn pure_inst(i: *mc.MInst) bool {
     let op = i.op;
     if (op == xe.SHIFT) and (i.ops[2].kind == mc.K_IMM) {
@@ -3383,6 +3387,7 @@ fn compile_func(f: *mut ir.Func) void {
                           spill_load: spill_load, spill_store: spill_store };
     mc.dce(MF, pure_inst);
     mc.allocate(MF, &tgt);
+    mc.drop_reloads(MF, is_label);
     encode_func(f);
 }
 
