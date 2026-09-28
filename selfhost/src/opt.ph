@@ -661,6 +661,10 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
                         changed = true;
                         any = true;
                     }
+                } else if combine and (i.op == ir.OP_STORE) and (i.a.kind == ir.V_UNDEF) and (i.flags == 0) {
+                    ir.remove_inst(i);  // the memory may keep what it holds
+                    changed = true;
+                    any = true;
                 }
                 i = next;
             }

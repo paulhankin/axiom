@@ -3867,7 +3867,9 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.SSE {
-        enc_sse(i);
+        if not noop_move(i) {
+            enc_sse(i);
+        }
         return;
     }
     if op == xe.REP {
@@ -3904,6 +3906,9 @@ fn enc_inst(i: *mut mc.MInst) void {
 // moves) are bypassed, and a branch to the block that follows becomes a
 // fall-through (`jcc next; jmp x` is `j!cc x`). Returns the skipped blocks.
 fn noop_move(i: *mc.MInst) bool {
+    if (i.op == xe.SSE) and (i.cc == xe.MOVAPS) {
+        return (i.ops[0].kind == mc.K_REG) and (i.ops[1].kind == mc.K_REG) and (P(i.ops[0].reg) == P(i.ops[1].reg));
+    }
     return (i.op == xe.MOV_RR) and (P(i.ops[0].reg) == P(i.ops[1].reg));
 }
 

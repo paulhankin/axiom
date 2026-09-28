@@ -34,11 +34,18 @@ pub fn callee_of(i: *ir.Value) *mut ir.Func {
     return u.nil.[ir.Func]();
 }
 
-// The size of f in instructions (phis, branches and constant work are cheap).
+// The size of f in instructions (phis, branches and constant work are cheap;
+// trap paths are out of the way).
 pub fn cost(f: *ir.Func) i32 {
     let mut n: i32 = 0;
     let mut b = f.first;
     while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_UNREACHABLE) and (b != f.first) {
+            n += 1;
+            b = b.next;
+            continue;
+        }
         let mut i = b.first;
         while u.notnil(i) {
             let op = i.op;
@@ -425,34 +432,58 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
 fn inline_into(n: *mut Node) bool {
     let f = n.f;
     let mut calls = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
-    let mut b = f.first;
+    let mut fcost = cost(f);
+    let mut any = false;
+    // again over the calls that inlining brings in
+    for _round in @as(i32, 0)..3 {
+        calls.clear();
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut x = b.first;
+            while u.notnil(x) {
+                if u.notnil(callee_of(x)) {
+                    calls.push(x);
+                }
+                x = x.next;
+            }
+            b = b.next;
+        }
+        let mut did = false;
+        for k in 0..calls.len {
+            let c = calls.get(k);
+            if want(n, c, fcost) {
+                let g = callee_of(c);
+                fcost += cost(g);
+                node_of(g).calls -= 1;
+                count_calls(g);
+                inline_call(f, c);
+                did = true;
+            }
+        }
+        if not did {
+            break;
+        }
+        any = true;
+        ir.apply_forwarding(f);
+    }
+    u.free(@ptr_cast(*mut void, calls.data));
+    return any;
+}
+
+// The calls in g, copied by inlining it, are more calls of their callees.
+fn count_calls(g: *mut ir.Func) void {
+    let mut b = g.first;
     while u.notnil(b) {
         let mut x = b.first;
         while u.notnil(x) {
-            if u.notnil(callee_of(x)) {
-                calls.push(x);
+            let h = callee_of(x);
+            if u.notnil(h) {
+                node_of(h).calls += 1;
             }
             x = x.next;
         }
         b = b.next;
     }
-    let mut fcost = cost(f);
-    let mut any = false;
-    for k in 0..calls.len {
-        let c = calls.get(k);
-        if want(n, c, fcost) {
-            let g = callee_of(c);
-            fcost += cost(g);
-            node_of(g).calls -= 1;
-            inline_call(f, c);
-            any = true;
-        }
-    }
-    u.free(@ptr_cast(*mut void, calls.data));
-    if any {
-        ir.apply_forwarding(f);
-    }
-    return any;
 }
 
 // Inlines over the module bottom-up; `simplify` runs on every function after
