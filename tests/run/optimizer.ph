@@ -320,7 +320,47 @@ fn mem_ops(a: []u64, b: []u64, c: []u8, i: usize) u64 {
     return r;
 }
 
+// A short common path and an uncommon one that makes calls (the uncommon
+// region becomes a function of its own; what is left inlines).
+struct Buf {
+    data: [16]u64,
+    len: usize,
+    spills: u64,
+}
+
+fn note_spill(b: *mut Buf, x: u64) void {
+    b.spills += x;
+}
+
+fn buf_push(b: *mut Buf, x: u64, tag: u64) u64 {
+    let mut r: u64 = 1;
+    if b.len == b.data.len {
+        // flush: sum and restart
+        let mut s: u64 = 0;
+        for i in 0..b.data.len {
+            s += b.data[i] * tag;
+            b.data[i] = 0;
+        }
+        note_spill(b, s);
+        note_spill(b, x);
+        b.len = 0;
+        r = 2;
+    }
+    b.data[b.len] = x;
+    b.len += 1;
+    return r;
+}
+
 export fn run() void {
+    let mut bf = Buf.{ data: [0; 16], len: 0, spills: 0 };
+    let mut rs: u64 = 0;
+    for i in @as(u64, 0)..40 {
+        rs += buf_push(&mut bf, i, 3);
+    }
+    io.uint(rs);                                // expect: 42
+    io.uint(bf.spills);                         // expect: 1536
+    io.uint(@as(u64, bf.len));                  // expect: 8
+
     io.uint(mem_ops(g_ma[..], g_mb[..], g_mc[..], 0));  // expect: 11024
     io.uint(mem_ops(g_ma[..], g_mb[..], g_mc[..], 1));  // expect: 268
 

@@ -17,6 +17,7 @@ import "sroa.ph" as sroa;
 import "gvn.ph" as gvn;
 import "inline.ph" as inl;
 import "thread.ph" as thr;
+import "outline.ph" as outl;
 
 fn cleanup(f: *mut ir.Func, level: i32) void {
     let mut rounds: i32 = 0;
@@ -86,6 +87,14 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
         }
     }
     if level >= 2 {
+        // uncommon paths that make calls leave small functions (to inline)
+        let mut changed = u.List.[*mut ir.Func].{ data: u.nil.[*mut ir.Func](), len: 0, cap: 0 };
+        if outl.outline_module(m, &mut changed) {
+            for i in 0..changed.len {
+                optimize_func(changed.get(i), level);
+            }
+        }
+        u.free(@ptr_cast(*mut void, changed.data));
         // twice: inlining exposes constant arguments (a comparison function
         // passed down through an inlined call), which make new direct calls
         for _round in @as(i32, 0)..2 {

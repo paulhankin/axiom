@@ -1,0 +1,355 @@
+// =============================================================================
+// outline.ph - cold region outlining: in a function whose common path is
+// short (a list's push, an arena's allocation), the region that makes calls
+// on the uncommon path (growing the storage) moves into a function of its
+// own. What is left is small enough to inline, and needs no saved registers
+// or spills for values live across those calls.
+//
+//     B: condbr c -> T, ...          B: condbr c -> C, ...
+//     T ... (calls) ... -> J    =>   C: call f.cold(live-ins); br J
+//
+// The region is the blocks T dominates; it has one way in (from B) and all
+// ways out go to J; nothing computed in it is used after it (its effects are
+// on memory). The new function is internal, cold and never inlined back.
+// =============================================================================
+import "util.ph" as u;
+import "ir.ph" as ir;
+import "opt.ph" as opt;
+import "inline.ph" as inl;
+
+const REST_MAX: i32 = 30;     // what is left must be small enough to inline
+const REGION_MIN: i32 = 12;   // and the region worth a call
+const MAX_ARGS: usize = 6;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+fn inst_cost(i: *ir.Value) i32 {
+    let op = i.op;
+    if (op == ir.OP_PHI) or (op == ir.OP_BR) or (op == ir.OP_UNREACHABLE) or (op == ir.OP_ALLOCA) {
+        return 0;
+    }
+    if op == ir.OP_CALL {
+        return 3 + @int_cast(i32, i.xs.len);
+    }
+    return 1;
+}
+
+struct Region {
+    blocks: u.List.[*mut ir.Block],
+    ins: u.List.[*mut ir.Value],     // values from outside the region it uses
+    join: *mut ir.Block,
+    tag: i64,
+}
+
+let mut tag_gen: i64 = 0x2000_0000;
+
+fn in_region(r: *Region, b: *ir.Block) bool {
+    return u.notnil(b) and (b.mark == r.tag);
+}
+
+fn defined_in(r: *Region, v: *ir.Value) bool {
+    return u.notnil(v) and (v.kind == ir.V_INST) and u.notnil(v.blk) and in_region(r, v.blk);
+}
+
+fn scalar(t: *ir.Ty) bool {
+    return (t.kind == ir.T_INT) or (t.kind == ir.T_PTR) or (t.kind == ir.T_FLOAT);
+}
+
+// Notes operand v of the region; false when it cannot be passed in.
+fn note_in(r: *mut Region, v: *mut ir.Value) bool {
+    if u.isnil(v) or defined_in(r, v) {
+        return true;
+    }
+    if (v.kind != ir.V_INST) and (v.kind != ir.V_PARAM) {
+        return true;  // constants, globals, functions
+    }
+    for k in 0..r.ins.len {
+        if r.ins.get(k) == v {
+            return true;
+        }
+    }
+    if not scalar(v.ty) {
+        return false;
+    }
+    r.ins.push(v);
+    return true;
+}
+
+// The region under t (entered only from b), when it can be outlined.
+fn region_of(f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Block, r: *mut Region) bool {
+    if (t.preds.len != 1) or (t == b) or (u.notnil(t.first) and (t.first.op == ir.OP_PHI)) {
+        return false;
+    }
+    tag_gen += 1;
+    r.tag = tag_gen;
+    r.blocks.clear();
+    r.ins.clear();
+    r.join = ir.bnil();
+    // the blocks t dominates, t first
+    r.blocks.push(t);
+    t.mark = r.tag;
+    let mut k: usize = 0;
+    while k < r.blocks.len {
+        let x = r.blocks.get(k);
+        for j in 0..x.dom_kids.len {
+            let y = x.dom_kids.get(j);
+            y.mark = r.tag;
+            r.blocks.push(y);
+        }
+        k += 1;
+    }
+    let mut calls = false;
+    let mut cost: i32 = 0;
+    for bi in 0..r.blocks.len {
+        let x = r.blocks.get(bi);
+        let xt = ir.terminator(x);
+        let trap = u.notnil(xt) and (xt.op == ir.OP_UNREACHABLE);
+        if trap {
+            cost += 1;  // (as the inliner counts)
+        }
+        let mut i = x.first;
+        while u.notnil(i) {
+            let op = i.op;
+            if (op == ir.OP_RET) or (op == ir.OP_ALLOCA) or (op == ir.OP_SWITCH) {
+                return false;
+            }
+            if op == ir.OP_CALL {
+                calls = true;
+            }
+            if not trap {
+                cost += inst_cost(i);
+            }
+            if not note_in(r, i.a) or not note_in(r, i.b) or not note_in(r, i.c) {
+                return false;
+            }
+            for j in 0..i.xs.len {
+                if not note_in(r, i.xs.get(j)) {
+                    return false;
+                }
+            }
+            i = i.next;
+        }
+        // every way out goes to the join
+        let tm = ir.terminator(x);
+        for j in 0..ir.succ_count(tm) {
+            let s = ir.succ(tm, j);
+            if in_region(r, s) {
+                continue;
+            }
+            if u.isnil(r.join) {
+                r.join = s;
+            } else if r.join != s {
+                return false;
+            }
+        }
+    }
+    if not calls or (cost < REGION_MIN) or u.isnil(r.join) or (r.ins.len > MAX_ARGS) {
+        return false;
+    }
+    if ((inl.cost(f) - cost) + 3 + @int_cast(i32, r.ins.len)) > REST_MAX {
+        return false;
+    }
+    // the join's phis: one value from the region, computed outside it
+    let mut p = r.join.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut v = vnil();
+        for j in 0..p.bs.len {
+            if in_region(r, p.bs.get(j)) {
+                let x = ir.resolve(p.xs.get(j));
+                if defined_in(r, x) or (u.notnil(v) and (v != x)) {
+                    return false;
+                }
+                v = x;
+            }
+        }
+        p = p.next;
+    }
+    return true;
+}
+
+fn map_val(r: *Region, g: *mut ir.Func, v0: *mut ir.Value) *mut ir.Value {
+    let v = ir.resolve(v0);
+    if u.isnil(v) {
+        return v;
+    }
+    if defined_in(r, v) {
+        return @ptr_cast(*mut ir.Value, v.auxp);
+    }
+    for k in 0..r.ins.len {
+        if r.ins.get(k) == v {
+            return g.params[k];
+        }
+    }
+    return v;
+}
+
+fn map_blk(r: *Region, b: *mut ir.Block, ret: *mut ir.Block) *mut ir.Block {
+    if u.isnil(b) {
+        return b;
+    }
+    if in_region(r, b) {
+        return @ptr_cast(*mut ir.Block, b.auxp);
+    }
+    return ret;  // the join
+}
+
+fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region, n: i32) void {
+    // the new function
+    let ptys = u.newn.[*mut ir.Ty](r.ins.len + 1);
+    for k in 0..r.ins.len {
+        ptys[k] = r.ins.get(k).ty;
+    }
+    let fty = ir.t_fn(ir.t_void(), ptys[0..r.ins.len], false);
+    let g = ir.add_function(m, u.f2("%s.cold%s", f.name, u.idec(n)), fty);
+    g.linkage = ir.LINK_INTERNAL;
+    g.cold = true;
+    g.noinline = true;
+    for k in 0..r.blocks.len {
+        let x = r.blocks.get(k);
+        x.auxp = @ptr_cast(*mut void, ir.append_block(g, x.name));
+    }
+    let ret = ir.append_block(g, "cold.ret");
+    let rv = ir.new_inst(g, ir.OP_RET, ir.t_void());
+    ir.append_inst(ret, rv);
+    for k in 0..r.blocks.len {
+        let x = r.blocks.get(k);
+        let nb = @ptr_cast(*mut ir.Block, x.auxp);
+        let mut v = x.first;
+        while u.notnil(v) {
+            let y = ir.new_inst(g, v.op, v.ty);
+            y.cv = v.cv;
+            y.fv = v.fv;
+            y.flags = v.flags;
+            y.align = v.align;
+            y.aty = v.aty;
+            y.fty = v.fty;
+            y.mask = v.mask;
+            y.ext = v.ext;
+            y.name = v.name;
+            y.a = v.a;
+            y.b = v.b;
+            y.c = v.c;
+            y.t1 = v.t1;
+            y.t2 = v.t2;
+            for j in 0..v.xs.len {
+                y.xs.push(v.xs.get(j));
+            }
+            for j in 0..v.bs.len {
+                y.bs.push(v.bs.get(j));
+            }
+            v.auxp = @ptr_cast(*mut void, y);
+            ir.append_inst(nb, y);
+            v = v.next;
+        }
+    }
+    for k in 0..r.blocks.len {
+        let nb = @ptr_cast(*mut ir.Block, r.blocks.get(k).auxp);
+        let mut y = nb.first;
+        while u.notnil(y) {
+            y.a = map_val(r, g, y.a);
+            y.b = map_val(r, g, y.b);
+            y.c = map_val(r, g, y.c);
+            for j in 0..y.xs.len {
+                y.xs.set(j, map_val(r, g, y.xs.get(j)));
+            }
+            for j in 0..y.bs.len {
+                y.bs.set(j, map_blk(r, y.bs.get(j), ret));
+            }
+            y.t1 = map_blk(r, y.t1, ret);
+            y.t2 = map_blk(r, y.t2, ret);
+            y = y.next;
+        }
+    }
+    // in f: a call instead of the region
+    let t = r.blocks.get(0);
+    let c = ir.append_block(f, "cold.call");
+    let bld = ir.new_builder();
+    ir.at_end(bld, c);
+    let args = u.newn.[*mut ir.Value](r.ins.len + 1);
+    for k in 0..r.ins.len {
+        args[k] = r.ins.get(k);
+    }
+    _ = ir.call(bld, fty, g.val, args[0..r.ins.len]);
+    ir.br(bld, r.join);
+    let bt = ir.terminator(b);
+    for j in 0..ir.succ_count(bt) {
+        if ir.succ(bt, j) == t {
+            ir.set_succ(bt, j, c);
+        }
+    }
+    let mut p = r.join.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut v = vnil();
+        let mut j: usize = 0;
+        while j < p.bs.len {
+            if in_region(r, p.bs.get(j)) {
+                v = ir.resolve(p.xs.get(j));
+                p.bs.set(j, p.bs.get(p.bs.len - 1));
+                p.xs.set(j, p.xs.get(p.xs.len - 1));
+                p.bs.len -= 1;
+                p.xs.len -= 1;
+            } else {
+                j += 1;
+            }
+        }
+        if u.notnil(v) {
+            ir.add_incoming(p, v, c);
+        }
+        p = p.next;
+    }
+    for k in 0..r.blocks.len {
+        ir.remove_block(r.blocks.get(k));
+    }
+}
+
+// Outlines at most one region of f; true if it did.
+fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) bool {
+    if ir.is_decl(f) or f.cold or f.noinline or f.ty.vararg or (inl.cost(f) <= REST_MAX) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    let mut done = false;
+    for i in 0..order.len {
+        let b = order.get(i);
+        let t = ir.terminator(b);
+        if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+            continue;
+        }
+        for k in @as(usize, 0)..2 {
+            let s = ir.succ(t, k);
+            if region_of(f, b, s, r) {
+                outline(m, f, b, r, @int_cast(i32, i));
+                done = true;
+                break;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    u.free(@ptr_cast(*mut void, order.data));
+    return done;
+}
+
+// True if any function changed (those changed are listed in `changed`).
+pub fn outline_module(m: *mut ir.Module, changed: *mut u.List.[*mut ir.Func]) bool {
+    let mut r = Region.{ blocks: u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 },
+                         ins: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 },
+                         join: ir.bnil(), tag: 0 };
+    let mut any = false;
+    let n = m.funcs.len;
+    for i in 0..n {
+        let f = m.funcs.get(i);
+        if outline_func(m, f, &mut r) {
+            changed.push(f);
+            any = true;
+        }
+    }
+    u.free(@ptr_cast(*mut void, r.blocks.data));
+    u.free(@ptr_cast(*mut void, r.ins.data));
+    return any;
+}
