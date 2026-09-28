@@ -2427,6 +2427,62 @@ fn map_blk_in(b: *mut ir.Block, tag: i64) *mut ir.Block {
     return b;
 }
 
+// Copies the blocks of `members` (marked `tag`) into new blocks of f:
+// x.auxp is the copy of each block and instruction; operands and targets
+// inside the members are mapped to the copies.
+fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64) void {
+    for k in 0..members.len {
+        let x = members.get(k);
+        let cb2 = ir.append_block(f, x.name);
+        x.auxp = @ptr_cast(*mut void, cb2);
+        let mut v = x.first;
+        while u.notnil(v) {
+            let y = ir.new_inst(f, v.op, v.ty);
+            y.cv = v.cv;
+            y.fv = v.fv;
+            y.flags = v.flags;
+            y.align = v.align;
+            y.aty = v.aty;
+            y.fty = v.fty;
+            y.mask = v.mask;
+            y.ext = v.ext;
+            y.name = v.name;
+            y.a = v.a;
+            y.b = v.b;
+            y.c = v.c;
+            y.t1 = v.t1;
+            y.t2 = v.t2;
+            for j in 0..v.xs.len {
+                y.xs.push(v.xs.get(j));
+            }
+            for j in 0..v.bs.len {
+                y.bs.push(v.bs.get(j));
+            }
+            v.auxp = @ptr_cast(*mut void, y);
+            ir.append_inst(cb2, y);
+            v = v.next;
+        }
+    }
+    for k in 0..members.len {
+        let cb2 = @ptr_cast(*mut ir.Block, members.get(k).auxp);
+        let mut y = cb2.first;
+        while u.notnil(y) {
+            y.a = map_in(ir.resolve(y.a), tag);
+            y.b = map_in(ir.resolve(y.b), tag);
+            y.c = map_in(ir.resolve(y.c), tag);
+            for j in 0..y.xs.len {
+                y.xs.set(j, map_in(ir.resolve(y.xs.get(j)), tag));
+            }
+            for j in 0..y.bs.len {
+                y.bs.set(j, map_blk_in(y.bs.get(j), tag));
+            }
+            y.t1 = map_blk_in(y.t1, tag);
+            y.t2 = map_blk_in(y.t2, tag);
+            y = y.next;
+        }
+    }
+}
+
 fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
     let ht = ir.terminator(h);
     if h.split or u.isnil(ht) or (ht.op != ir.OP_CONDBR) {
@@ -2510,56 +2566,7 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     }
     u.free(@ptr_cast(*mut void, bounds.data));
     // the copy
-    for k in 0..members.len {
-        let x = members.get(k);
-        let cb2 = ir.append_block(f, x.name);
-        x.auxp = @ptr_cast(*mut void, cb2);
-        let mut v = x.first;
-        while u.notnil(v) {
-            let y = ir.new_inst(f, v.op, v.ty);
-            y.cv = v.cv;
-            y.fv = v.fv;
-            y.flags = v.flags;
-            y.align = v.align;
-            y.aty = v.aty;
-            y.fty = v.fty;
-            y.mask = v.mask;
-            y.ext = v.ext;
-            y.name = v.name;
-            y.a = v.a;
-            y.b = v.b;
-            y.c = v.c;
-            y.t1 = v.t1;
-            y.t2 = v.t2;
-            for j in 0..v.xs.len {
-                y.xs.push(v.xs.get(j));
-            }
-            for j in 0..v.bs.len {
-                y.bs.push(v.bs.get(j));
-            }
-            v.auxp = @ptr_cast(*mut void, y);
-            ir.append_inst(cb2, y);
-            v = v.next;
-        }
-    }
-    for k in 0..members.len {
-        let cb2 = @ptr_cast(*mut ir.Block, members.get(k).auxp);
-        let mut y = cb2.first;
-        while u.notnil(y) {
-            y.a = map_in(ir.resolve(y.a), tag);
-            y.b = map_in(ir.resolve(y.b), tag);
-            y.c = map_in(ir.resolve(y.c), tag);
-            for j in 0..y.xs.len {
-                y.xs.set(j, map_in(ir.resolve(y.xs.get(j)), tag));
-            }
-            for j in 0..y.bs.len {
-                y.bs.set(j, map_blk_in(y.bs.get(j), tag));
-            }
-            y.t1 = map_blk_in(y.t1, tag);
-            y.t2 = map_blk_in(y.t2, tag);
-            y = y.next;
-        }
-    }
+    clone_members(f, members, tag);
     // the copy leaves at i >= m for mid, which enters the loop
     let h2 = @ptr_cast(*mut ir.Block, h.auxp);
     let ht2 = ir.terminator(h2);
@@ -2778,3 +2785,4 @@ pub fn sink(f: *mut ir.Func) bool {
     u.free(@ptr_cast(*mut void, order.data));
     return any;
 }
+

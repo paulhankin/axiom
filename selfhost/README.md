@@ -75,21 +75,22 @@ and `phalange profile` run them under `qemu-<arch>` (with the target's C library
 |---|---|
 | `ir.ph` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
 | `codegen.ph` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces) |
-| `lower.ph` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates by pointer, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
+| `lower.ph` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ph` | The optimization pipeline (below) |
 | `opt.ph` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting; code layout (loops contiguous, exit tests after the body, trap paths last) and constants hoisted out of loops for the native backends |
 | `combine.ph` | Instruction combining: algebraic identities, canonical forms, comparisons (constant ranges, extensions, the forms overflow checks take), narrowing, loads of constants |
 | `sroa.ph` | Scalar replacement of aggregates: stack slots split into scalar fields, copies of constants replaced by the constant |
-| `gvn.ph` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions and bounds between values (bounds and overflow checks), dead stores, shadow stack pushes and pops, loop-invariant code motion, memset idioms |
-| `thread.ph` | Jump threading and if-conversion (selects) |
-| `inline.ph` | Inlining bottom-up over the call graph, interprocedural constant propagation, dead functions |
+| `gvn.ph` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions and bounds between values (bounds and overflow checks), dead stores, shadow stack pushes and pops (and their records moved to the paths that read them), loop-invariant code motion, memset idioms, loop ranges split at bounds checks, code sinking |
+| `thread.ph` | Jump threading and if-conversion (selects; stores in both arms merged) |
+| `inline.ph` | Inlining bottom-up over the call graph (and the calls inlining brings in), interprocedural constant propagation, dead functions |
+| `outline.ph` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own |
 | `wasm.ph`, `wobj.ph` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
 | `wlink.ph` | The wasm linker: memory layout, function table, exports, shared memory for threads |
-| `mach.ph` | Machine IR shared by the native backends, liveness and linear-scan register allocation with spilling |
-| `x64.ph`, `x64enc.ph` | x86-64 instruction selection (System V ABI), frame layout, encoding |
+| `mach.ph` | Machine IR shared by the native backends, liveness and linear-scan register allocation with spilling, redundant reloads and spill stores removed |
+| `x64.ph`, `x64enc.ph` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding |
 | `a64.ph`, `a64enc.ph` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ph` | ELF relocatable objects: writing, and reading them back for the linker |
-| `elink.ph` | The ELF linker: a dynamically linked executable against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage) |
+| `elink.ph` | The ELF linker: a dynamically linked executable against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
 | `target.ph` | Architectures, CPU presets, extensions, host detection |
 | `backend.ph` | Lowering, optimization and the target's code generator |
 
@@ -132,16 +133,25 @@ optimized IR of each compilation, for debugging.
 `-O0` runs mem2reg, constant folding, CFG simplification and dead code
 elimination. `-O1` adds, per function: instruction combining, jump threading,
 if-conversion, scalar replacement of aggregates, global value numbering,
-dead store elimination, shadow stack push/pop removal, memset idioms and
-loop-invariant code motion. `-O2` and `-O3` add interprocedural constant
-propagation and inlining (whole-program units by default), after which
-each function is simplified again. The backends then lay out loops, hoist
-constants and allocate registers with live ranges that have holes.
+dead store elimination, shadow stack push/pop removal, memset idioms,
+loop-invariant code motion and code sinking. `-O2` and `-O3` add cold
+region outlining, interprocedural constant propagation and inlining
+(whole-program units by default), after which each function is simplified
+again, and then split loop ranges at their bounds checks. The backends
+then lay out loops, hoist constants, fold loads into memory operands
+(x86-64) and allocate registers with live ranges that have holes.
+
+If-conversion keeps a branch when the chosen value goes into the address of
+a load (a heap or tree walk), where a predicted branch lets the load start
+early.
 
 The shadow stack for stack traces is ordinary memory to the optimizer, with
 two facts it may use: the program never computes a pointer to it, and every
-call leaves its depth as it found it. Traps, stack traces and error return
-traces are the same at every optimization level (tests/traces).
+call leaves its depth as it found it. A call site's record is written just
+before the calls and traps that can read it, so the common path of an
+inlined function with a slow path writes none. Traps, stack traces and
+error return traces are the same at every optimization level
+(tests/traces).
 
 `selfhost/bench.sh` compares the code with LLVM's: the compiler built by
 LLVM against the compiler built by itself on the same job, and the programs
