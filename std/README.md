@@ -21,6 +21,7 @@ and a type that owns memory has `deinit`).
 | [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`), RFC 3339 and HTTP dates, `sleep` |
 | [`json`](json.ph) | `parse` → `Document` (a `Value` tree: `get`, `at`, `as_str`, `as_i64`, …); `Writer` (streaming, compact or pretty); `stringify` |
 | [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies, `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`); percent-encoding |
+| [`bigint`](bigint.ph) | `BigInt`: arbitrary-precision integers — arithmetic (Karatsuba multiplication), truncated and Euclidean division, shifts and bitwise operations, `pow`, `mod_pow` (Montgomery; `mod_pow_secret` in constant time), `gcd`, `mod_inverse`, `sqrt`, conversion to and from any base and bytes |
 | [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
 
 Each module carries its own tests: `phalange test std/<module>.ph`.
@@ -88,6 +89,7 @@ They call a small set of host functions imported from module `"phalange"`:
 | `ph_sock_timeout(h, ms) i32` | later reads and writes on `h` fail with `-5` after `ms` milliseconds (`0`: never) |
 | `ph_thread_spawn(entry, arg, stack_top, exited) i32`, `ph_thread_stack_size() usize` | threads (spec §12.8.5) |
 | `ph_cpu_count() u32`, `ph_sleep_ns(ns)` | |
+| `ph_random(p, n) i32` | fills `p[0..n]` with cryptographically secure random bytes |
 | `ph_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970) or `1` (monotonic) |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection
