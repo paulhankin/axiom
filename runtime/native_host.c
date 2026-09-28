@@ -201,6 +201,13 @@ void ph_sleep_ns(uint64_t ns) {
     }
 }
 
+// Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+int64_t ph_clock_ns(uint32_t clock) {
+    struct timespec ts;
+    clock_gettime(clock == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
 // Same results as WebAssembly memory.atomic.wait32: 0 woken, 1 not equal, 2 timed out.
 int32_t ph_wait32(uint32_t *p, uint32_t expected, int64_t timeout_ns) {
     struct timespec ts, *tsp = NULL;

@@ -301,6 +301,11 @@ export function createHost(opts = {}) {
     ph_sleep_ns(ns) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ns) / 1e6);
     },
+    // Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+    ph_clock_ns(clock) {
+      if (clock === 1) return process.hrtime.bigint();
+      return BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000)) * 1000n;  // microseconds
+    },
   };
   const host = {
     imports: { phalange },

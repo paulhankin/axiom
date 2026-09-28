@@ -1450,7 +1450,9 @@ static LLVMValueRef gen_catch(Expr *e) {
     switch (e->hkind) {
     case H_VALUE:
         hv = gen(e->hexpr);
-        if (!terminated()) {
+        // a diverging handler (@trap()) leaves the builder in a dead block
+        // that is deleted later: it must not feed the phi
+        if (!terminated() && (LLVMGetInsertBlock(B) == err_bb || LLVMGetFirstUse(LLVMBasicBlockAsValue(LLVMGetInsertBlock(B))))) {
             hbb = LLVMGetInsertBlock(B);
             LLVMBuildBr(B, merge);
         }

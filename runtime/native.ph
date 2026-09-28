@@ -740,6 +740,17 @@ export fn ph_sleep_ns(ns: u64) void {
     sys.nanosleep(ns);
 }
 
+// Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+export fn ph_clock_ns(clock: u32) i64 {
+    let mut ts = sys.Timespec.{ sec: 0, nsec: 0 };
+    let mut id: i32 = 0;  // CLOCK_REALTIME
+    if clock == 1 {
+        id = 1;  // CLOCK_MONOTONIC
+    }
+    _ = sys.clock_gettime(id, &mut ts);
+    return (ts.sec * 1000000000) + ts.nsec;
+}
+
 // Same results as WebAssembly memory.atomic.wait32: 0 woken, 1 not equal, 2 timed out.
 export fn ph_wait32(p: *mut u32, expected: u32, timeout_ns: i64) i32 {
     let mut ts = sys.Timespec.{ sec: 0, nsec: 0 };
