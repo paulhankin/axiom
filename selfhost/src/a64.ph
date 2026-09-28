@@ -2923,7 +2923,40 @@ fn save_restore(load: bool) void {
     }
 }
 
+// A leaf with nothing on the stack needs no frame (a call that does not
+// return may still clobber the link register).
+let mut frameless: bool = false;
+
+fn needs_frame() bool {
+    if (frame != 0) or (nsaved > 0) {
+        return true;
+    }
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.clobber != 0 {
+                return true;
+            }
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == mc.K_REG) and ((P(o.reg) == FP) or (P(o.reg) == LR) or (P(o.reg) == SP)) {
+                    return true;
+                }
+                if (o.kind == mc.K_MEM) and ((o.slot >= 0) or (o.base == FP) or (o.base == SP) or (o.base == LR) or
+                                             (o.index == FP) or (o.index == SP)) {
+                    return true;
+                }
+            }
+            i = i.next;
+        }
+    }
+    return false;
+}
+
 fn prologue() void {
+    if frameless {
+        return;
+    }
     w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
     w32(0x9100_03FD);  // mov x29, sp
     let mut rem = frame;
@@ -2941,6 +2974,10 @@ fn prologue() void {
 }
 
 fn epilogue() void {
+    if frameless {
+        w32(ae.RET);
+        return;
+    }
     save_restore(true);
     w32(0x9100_03BF);  // mov sp, x29
     w32(0xA8C1_7BFD);  // ldp x29, x30, [sp], #16
@@ -3130,6 +3167,7 @@ fn encode_func(f: *mut ir.Func) void {
     rls.clear();
     fxs.clear();
     local_off.clear();
+    frameless = not needs_frame();
     prologue();
     let nb = MF.blocks.len;
     let boff = u.newn.[u64](nb + 1);
