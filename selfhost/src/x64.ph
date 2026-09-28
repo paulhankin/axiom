@@ -3528,7 +3528,40 @@ fn label_ref(l: i32) void {
     xe.rel32_fixup(&mut E, l);
 }
 
+// A leaf with nothing on the stack needs no frame.
+let mut frameless: bool = false;
+
+fn needs_frame() bool {
+    if (nsaved > 0) or (MF.slots.len > 0) or (out_area != 0) {
+        return true;
+    }
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.clobber != 0 {
+                return true;  // a call that returns (a noreturn one only needs the stack aligned)
+            }
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == mc.K_REG) and ((P(o.reg) == xe.RSP) or (P(o.reg) == xe.RBP)) {
+                    return true;
+                }
+                if (o.kind == mc.K_MEM) and ((o.slot >= 0) or (o.base == xe.RBP) or (o.base == xe.RSP) or
+                                             (o.index == xe.RBP) or (o.index == xe.RSP)) {
+                    return true;
+                }
+            }
+            i = i.next;
+        }
+    }
+    return false;
+}
+
 fn epilogue() void {
+    if frameless {
+        b8(0xc3);
+        return;
+    }
     if nsaved > 0 {
         // lea rsp, [rbp - 8*nsaved]
         b8(0x48);
@@ -3560,6 +3593,9 @@ fn epilogue() void {
 }
 
 fn prologue(sub: i64) void {
+    if frameless {
+        return;
+    }
     b8(0x55);            // push rbp
     b8(0x48);
     b8(0x89);
@@ -3901,6 +3937,13 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == xe.CALL {
         let t = i.ops[0];
+        if frameless {
+            // sub rsp, 8: the call (which does not return) needs rsp aligned
+            b8(0x48);
+            b8(0x83);
+            b8(0xec);
+            b8(0x08);
+        }
         if t.kind == mc.K_SYM {
             b8(0xe8);
             E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
@@ -4116,6 +4159,7 @@ fn encode_func(f: *mut ir.Func) void {
     E = xe.Enc.{ b: bn.new_bytes(), relocs: u.List.[xe.Reloc].{ data: u.nil.[xe.Reloc](), len: 0, cap: 0 },
                  fixups: u.List.[xe.Fixup].{ data: u.nil.[xe.Fixup](), len: 0, cap: 0 }, avx: AVX };
     local_off.clear();
+    frameless = not needs_frame();
     prologue(sub);
     let nb = MF.blocks.len;
     let skip = tidy_branches();
