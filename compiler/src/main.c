@@ -766,7 +766,13 @@ int main(int argc, char **argv) {
         return 2;
     }
     types_init();
-    SemaOptions so = {.std_dir = std_dir ? std_dir : find_std(argv[0]),
+    const char *std_path = std_dir ? std_dir : find_std(argv[0]);
+    // WebAssembly builds include runtime/rt.ph: software @fma and @rem.
+    if (g_target.wasm && strcmp(cmd, "check") != 0) {
+        const char *rtp = arena_printf("%s/../runtime/rt.ph", std_path);
+        if (file_exists(rtp)) vec_push(pkg_files, (char *)rtp);
+    }
+    SemaOptions so = {.std_dir = std_path,
                       .extra_files = (const char *const *)pkg_files.data,
                       .n_extra_files = pkg_files.len};
     bool ok = sema_run(input, &so);

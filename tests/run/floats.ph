@@ -24,4 +24,17 @@ export fn run() void {
     io.float(@fma(2.0, 3.0, 1.0));              // expect: 7
     let bits = @bit_cast(u64, @as(f64, 1.0));
     io.uint(bits);  // expect: 4607182418800017408
+    runtime_values(0.1, 10.0, -1.0, 7.5);
+}
+
+// @fma and @rem on values the compiler cannot fold (WebAssembly has no
+// instructions for them: they are software on that target).
+fn runtime_values(a: f64, b: f64, c: f64, d: f64) void {
+    io.boolean(@fma(a, b, c) != 0.0);                              // expect: true
+    io.boolean(@fma(a, b, c) == 5.551115123125783e-17);            // expect: true
+    io.float(@rem(d, -2.0));                                       // expect: 1.5
+    io.float(@rem(-d, 2.0));                                       // expect: -1.5
+    io.float(@as(f64, @rem(@float_cast(f32, d), @as(f32, 2.0))));  // expect: 1.5
+    let x = @float_cast(f32, a);
+    io.boolean(@fma(x, @float_cast(f32, b), @float_cast(f32, c)) != @as(f32, 0.0));  // expect: true
 }

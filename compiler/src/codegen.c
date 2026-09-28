@@ -1363,6 +1363,45 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
     return r;
 }
 
+// A function of runtime/rt.ph, which is loaded into every WebAssembly build:
+// software versions of the operations WebAssembly has no instruction for
+// (@rem, and @fma, whose libm calls would have nothing to link against).
+static FnInst *rt_fn(const char *name) {
+    for (int i = 0; i < g_prog.fns.len; i++) {
+        Decl *d = g_prog.fns.data[i];
+        if (strcmp(d->name, name) != 0 || !d->module) continue;
+        const char *f = g_files.data[d->module->file->id]->display;
+        size_t n = strlen(f);
+        if (n >= 13 && !strcmp(f + n - 13, "runtime/rt.ph")) return get_inst(d, NULL, 0);
+    }
+    fprintf(stderr, "phalange: internal error: runtime function %s not found (is runtime/rt.ph missing?)\n", name);
+    exit(3);
+}
+
+static bool is_f32_type(LLVMTypeRef t) {
+    if (LLVMGetTypeKind(t) == LLVMVectorTypeKind) t = LLVMGetElementType(t);
+    return LLVMGetTypeKind(t) == LLVMFloatTypeKind;
+}
+
+// Calls rt function `name` on scalar arguments, or lane by lane on vectors.
+static LLVMValueRef rt_call_lanes(const char *name, LLVMValueRef *args, int n) {
+    FnInst *fi = rt_fn(name);
+    LLVMTypeRef t = LLVMTypeOf(args[0]);
+    if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) {
+        return emit_call(fi->llty, fi->fn, fi->fnty, false, args, n, fi->fnty->params, NULL);
+    }
+    unsigned lanes = LLVMGetVectorSize(t);
+    LLVMValueRef r = LLVMGetUndef(t);
+    for (unsigned l = 0; l < lanes; l++) {
+        LLVMValueRef ls[3];
+        LLVMValueRef ix = LLVMConstInt(T_i32, l, false);
+        for (int k = 0; k < n; k++) ls[k] = LLVMBuildExtractElement(B, args[k], ix, "");
+        LLVMValueRef v = emit_call(fi->llty, fi->fn, fi->fnty, false, ls, n, fi->fnty->params, NULL);
+        r = LLVMBuildInsertElement(B, r, v, ix, "");
+    }
+    return r;
+}
+
 static LLVMValueRef gen_call(Expr *e) {
     if (e->op == CALLK_VARIANT) {
         Type *ut = ct(e->tval);
@@ -1756,10 +1795,15 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e), z = gen(a[2].e);
         LLVMTypeRef t = LLVMTypeOf(x);
         LLVMValueRef args[3] = {x, y, z};
+        if (g_target.wasm) return rt_call_lanes(is_f32_type(t) ? "fma32" : "fma64", args, 3);
         return intrinsic("llvm.fma", &t, 1, args, 3);
     }
     case BI_REM: {
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e);
+        if (g_target.wasm) {
+            LLVMValueRef args[2] = {x, y};
+            return rt_call_lanes(is_f32_type(LLVMTypeOf(x)) ? "fmod32" : "fmod64", args, 2);
+        }
         return LLVMBuildFRem(B, x, y, "");
     }
     case BI_COPYSIGN: {
