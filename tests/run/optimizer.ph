@@ -298,7 +298,32 @@ fn heap_path(xs: []u32, n: usize) u64 {
     }
 }
 
+let mut g_ma: [5]u64 = [5, 6, 7, 2, 4];
+let mut g_mb: [5]u64 = [9, 3, 1, 8, 0];
+let mut g_mc: [3]u8 = [7, 0, 7];
+
+// Operations on values loaded from memory (memory operands on x86-64: each
+// load here has one use).
+fn mem_ops(a: []u64, b: []u64, c: []u8, i: usize) u64 {
+    let mut r = a[i] | b[i];
+    r += a[i + 1] * b[i + 1];
+    r = r - a[i + 2];
+    if a[i + 3] < b[i + 2] {
+        r ^= 0x100;
+    }
+    if c[i] == 7 {
+        r += 1000;
+    }
+    if b[i + 3] > 5 {
+        r += 10000;
+    }
+    return r;
+}
+
 export fn run() void {
+    io.uint(mem_ops(g_ma[..], g_mb[..], g_mc[..], 0));  // expect: 11024
+    io.uint(mem_ops(g_ma[..], g_mb[..], g_mc[..], 1));  // expect: 268
+
     let src: [6]u32 = [1, 2, 3, 4, 5, 6];
     let mut dst: [4]u32 = [0; 4];
     io.uint(copy_add(dst[..], src[..], 1, 4));  // expect: 12004

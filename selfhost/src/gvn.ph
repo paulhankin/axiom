@@ -2467,3 +2467,153 @@ pub fn split_loops(f: *mut ir.Func) bool {
     }
     return any;
 }
+
+// -----------------------------------------------------------------------------
+// Code sinking: an instruction computed only for some paths moves down to
+// the nearest block dominating all its uses (not into a deeper loop), so
+// the other paths skip it: the shadow stack's slot for the calls of a slow
+// path, values only a trap reports. A load moves into a successor reached
+// only from its block when nothing after it there writes memory.
+// -----------------------------------------------------------------------------
+fn lca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
+    if u.isnil(a0) {
+        return b0;
+    }
+    let mut a = a0;
+    let mut b = b0;
+    while a.depth > b.depth {
+        a = a.idom;
+    }
+    while b.depth > a.depth {
+        b = b.idom;
+    }
+    while a != b {
+        a = a.idom;
+        b = b.idom;
+    }
+    return a;
+}
+
+fn writes_mem(x: *ir.Value) bool {
+    let op = x.op;
+    return (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
+           (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
+           ((op == ir.OP_INTR) and not cse_able(x)) or ((op == ir.OP_LOAD) and (x.flags != 0));
+}
+
+// The blocks using v: their common dominator (nil: no uses).
+fn use_block(users: *u.List.[*mut ir.Value], v: *mut ir.Value) *mut ir.Block {
+    let mut l = ir.bnil();
+    for k in 0..users.len {
+        let x = users.get(k);
+        if x.op == ir.OP_PHI {
+            for j in 0..x.xs.len {
+                if (ir.resolve(x.xs.get(j)) == v) and (x.bs.get(j).rpo >= 0) {
+                    l = lca(l, x.bs.get(j));
+                }
+            }
+        } else {
+            l = lca(l, x.blk);
+        }
+    }
+    return l;
+}
+
+fn note_use(uses: *mut u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, x: *mut ir.Value) void {
+    if u.notnil(o) and (o.kind == ir.V_INST) and (o.aux >= 0) {
+        uses.at(@bit_cast(usize, o.aux)).push(x);
+    }
+}
+
+pub fn sink(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    opt.loop_depths(f, &order);
+    // users of each instruction (reachable ones)
+    let mut uses = u.List.[u.List.[*mut ir.Value]].{ data: u.nil.[u.List.[*mut ir.Value]](), len: 0, cap: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = -1;
+            if b.rpo >= 0 {
+                i.aux = @int_cast(i64, uses.len);
+                uses.push(u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 });
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    for bi in 0..order.len {
+        let mut i = order.get(bi).first;
+        while u.notnil(i) {
+            note_use(&mut uses, i.a, i);
+            note_use(&mut uses, i.b, i);
+            note_use(&mut uses, i.c, i);
+            for k in 0..i.xs.len {
+                note_use(&mut uses, i.xs.get(k), i);
+            }
+            i = i.next;
+        }
+    }
+    // bottom-up: users move before what they use is considered
+    let mut any = false;
+    let mut bi = order.len;
+    while bi > 0 {
+        bi -= 1;
+        let blk = order.get(bi);
+        let mut i = blk.last;
+        while u.notnil(i) {
+            let prev = i.prev;
+            let is_load = (i.op == ir.OP_LOAD) and (i.flags == 0);
+            if (i.op != ir.OP_PHI) and (cse_able(i) or is_load) {
+                let l = use_block(uses.at(@bit_cast(usize, i.aux)), i);
+                if u.notnil(l) and (l != blk) and (l.rpo >= 0) and opt.dominates(blk, l) {
+                    // the deepest block on the way down not in a deeper loop
+                    let mut t = l;
+                    while (t != blk) and (t.loop_depth > blk.loop_depth) {
+                        t = t.idom;
+                    }
+                    if is_load and (t != blk) {
+                        // only into a successor reached from here alone, and
+                        // nothing after the load here writes memory
+                        while (t != blk) and (t.idom != blk) {
+                            t = t.idom;
+                        }
+                        let mut quiet = (t.preds.len == 1);
+                        let mut x = i.next;
+                        while quiet and u.notnil(x) {
+                            if writes_mem(x) {
+                                quiet = false;
+                            }
+                            x = x.next;
+                        }
+                        if not quiet {
+                            t = blk;
+                        }
+                    }
+                    if t != blk {
+                        let mut at = t.first;
+                        while at.op == ir.OP_PHI {
+                            at = at.next;
+                        }
+                        ir.remove_inst(i);
+                        ir.insert_before(at, i);
+                        any = true;
+                    }
+                }
+            }
+            i = prev;
+        }
+    }
+    for k in 0..uses.len {
+        u.free(@ptr_cast(*mut void, uses.at(k).data));
+    }
+    u.free(@ptr_cast(*mut void, uses.data));
+    u.free(@ptr_cast(*mut void, order.data));
+    return any;
+}

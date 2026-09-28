@@ -488,7 +488,7 @@ fn gen_alu(v: *mut ir.Value) void {
     let sz = isz(v.ty);
     let mut a = v.a;
     let mut b = v.b;
-    if is_c(a) and not is_c(b) and (o != ir.OP_SUB) {
+    if (is_c(a) and not is_c(b) and (o != ir.OP_SUB)) or (folded_load(a) and (o != ir.OP_SUB)) {
         a = v.b;
         b = v.a;
     }
@@ -496,6 +496,16 @@ fn gen_alu(v: *mut ir.Value) void {
     let ra = reg(a);
     copy(d, ra, GPR);
     hint(d, ra);
+    if folded_load(b) {
+        // op d, [m]
+        if o == ir.OP_MUL {
+            _ = e2(xe.IMUL, sz, RW(d), addr(b.a));
+        } else {
+            let i = e2(xe.ALU, sz, RW(d), addr(b.a));
+            i.cc = @truncate(i32, alu_digit(o));
+        }
+        return;
+    }
     if o == ir.OP_MUL {
         let k = cval(b);
         if imm_ok(b) and (k > 1) and ((k & (k - 1)) == 0) {
@@ -690,6 +700,21 @@ fn icc(p: i32) i32 {
     return xe.CC_GE;
 }
 
+// A load computed by the instruction that uses it (a memory operand).
+fn folded_load(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.op == ir.OP_LOAD) and ((v.flag & 8) != 0);
+}
+
+fn narrow_imm(x: i64, sz: u8) i64 {
+    if sz == 1 {
+        return @as(i64, @truncate(i8, x));
+    }
+    if sz == 2 {
+        return @as(i64, @truncate(i16, x));
+    }
+    return x;
+}
+
 // Emits the comparison for an icmp and returns the condition code.
 fn int_compare(v: *mut ir.Value) i32 {
     let p = @truncate(i32, @bit_cast(i64, v.cv));
@@ -701,6 +726,17 @@ fn int_compare(v: *mut ir.Value) i32 {
         } else if t.bits == 16 {
             sz = 2;
         }
+    }
+    // a load folded into the comparison: cmp [m], k or cmp a, [m]
+    if folded_load(v.a) and imm_ok(v.b) {
+        let i = e2(xe.ALU, sz, addr(v.a.a), I(narrow_imm(cval(v.b), sz)));
+        i.cc = 7;
+        return icc(p);
+    }
+    if folded_load(v.b) {
+        let i = e2(xe.ALU, sz, R(reg(v.a)), addr(v.b.a));
+        i.cc = 7;
+        return icc(p);
     }
     if is_c(v.b) and (cval(v.b) == 0) {
         // test sets the flags as a compare with 0 does (clearing CF and OF)
@@ -1451,6 +1487,9 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
 // Memory
 // -----------------------------------------------------------------------------
 fn gen_load(v: *mut ir.Value) void {
+    if (v.flag & 8) != 0 {
+        return;  // a memory operand of its user
+    }
     let t = v.ty;
     let d = vreg(v);
     let m = addr(v.a);
@@ -3135,6 +3174,58 @@ fn prepare(f: *mut ir.Func) void {
         }
         b = b.next;
     }
+    // loads that are memory operands of their only user (a compare, or an
+    // add, sub, and, or, xor, mul) when nothing between writes memory
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_INT) and
+               u.notnil(i.user) and (i.user.blk == b) {
+                let us = i.user;
+                let bits = i.ty.bits;
+                let mut ok = false;
+                let mut end = us;
+                if (us.op == ir.OP_ICMP) and (us.uses == 1) and
+                   ((bits == 8) or (bits == 16) or (bits == 32) or (bits == 64)) {
+                    ok = ((us.a == i) and (us.b != i) and imm_ok(us.b)) or ((us.b == i) and (us.a != i));
+                    if fused(us) {
+                        end = us.user;
+                    }
+                } else if ((bits == 32) or (bits == 64)) and ((us.flag & 4) == 0) and (us.a != us.b) and
+                          ((us.op == ir.OP_ADD) or (us.op == ir.OP_SUB) or (us.op == ir.OP_AND) or
+                           (us.op == ir.OP_OR) or (us.op == ir.OP_XOR) or (us.op == ir.OP_MUL)) {
+                    ok = (us.b == i) or ((us.a == i) and (us.op != ir.OP_SUB));
+                    if folded_load(us.a) or folded_load(us.b) {
+                        ok = false;  // (one memory operand)
+                    }
+                    if (us.op == ir.OP_MUL) and is_c(us.b) {
+                        ok = false;  // (x * 1/2/4/8 may be an index: addresses use x itself)
+                    }
+                }
+                if ok and quiet_between(i, end) {
+                    i.flag = i.flag | 8;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Does nothing after `from` and before `to` (in its block) write memory?
+fn quiet_between(from: *mut ir.Value, to: *mut ir.Value) bool {
+    let mut x = from.next;
+    while u.notnil(x) and (x != to) {
+        let op = x.op;
+        if (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
+           (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
+           (op == ir.OP_INTR) or ((op == ir.OP_LOAD) and (x.flags != 0)) {
+            return false;
+        }
+        x = x.next;
+    }
+    return u.notnil(x);
 }
 
 let gpr_order: [14]i32 = [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 12, 13, 14, 15];
@@ -3627,15 +3718,17 @@ fn enc_inst(i: *mut mc.MInst) void {
         let d = P(i.ops[0].reg);
         let s = i.ops[1];
         if s.kind == mc.K_IMM {
+            // (the destination may be memory: cmp [m], k)
             let x = s.disp;
+            let rm = i.ops[0];
             if sz == 1 {
-                enc_op(1, 1, 0x80, 0, digit, R(i.ops[0].reg), 1, true);
+                enc_op(1, 1, 0x80, 0, digit, rm, 1, true);
                 enc_imm(x, 1);
             } else if (x >= -128) and (x <= 127) {
-                enc_op(sz, 1, 0x83, 0, digit, R(i.ops[0].reg), 1, false);
+                enc_op(sz, 1, 0x83, 0, digit, rm, 1, false);
                 enc_imm(x, 1);
             } else {
-                enc_op(sz, 1, 0x81, 0, digit, R(i.ops[0].reg), imm_len(sz), false);
+                enc_op(sz, 1, 0x81, 0, digit, rm, imm_len(sz), false);
                 enc_imm(x, imm_len(sz));
             }
             return;

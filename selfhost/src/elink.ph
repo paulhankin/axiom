@@ -1160,7 +1160,104 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     if errors != 0 {
         return 1;
     }
-    if not u.write_file(out, b) {
+    // a symbol table (for debuggers and profilers), with section headers
+    // over the segments for its symbols to refer to
+    let mut st = bn.new_bytes();
+    let mut stl = bn.new_bytes();   // the local symbols, then the others
+    let mut stg = bn.new_bytes();
+    let mut str = bn.new_bytes();
+    str.u8_(0);
+    stl.zeros(24);
+    let mut nlocal: u64 = 1;
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let sy = o.syms.at(si);
+            if (sy.sec < 0) or (sy.name.len == 0) or (sy.name[0] == '.') or
+               ((sy.ty != elf.T_FUNC) and (sy.ty != elf.T_OBJECT)) {
+                continue;
+            }
+            let k = o.secs.get(@as(usize, @bit_cast(u32, sy.sec))).kind;
+            if (k == elf.S_TDATA) or (k == elf.S_TBSS) {
+                continue;
+            }
+            let gi = global_of(oi, @int_cast(u32, si));
+            if (gi >= 0) and (gsyms.at(@int_cast(usize, gi)).obj != @int_cast(i32, oi)) {
+                continue;  // a copy the link did not keep
+            }
+            let a = sym_addr_in(oi, @int_cast(u32, si));
+            let mut shndx: u64 = 0xfff1;
+            if (a >= segs[1].vaddr) and (a < (segs[1].vaddr + segs[1].memsz)) {
+                shndx = 1;
+            } else if (a >= segs[0].vaddr) and (a < (segs[0].vaddr + segs[0].memsz)) {
+                shndx = 2;
+            } else if (a >= segs[2].vaddr) and (a < (segs[2].vaddr + segs[2].filesz)) {
+                shndx = 3;
+            } else if (a >= segs[2].vaddr) and (a < (segs[2].vaddr + segs[2].memsz)) {
+                shndx = 4;
+            }
+            let mut e = &mut stg;
+            if sy.bind == elf.B_LOCAL {
+                e = &mut stl;
+                nlocal += 1;
+            }
+            e.u32_(@as(u64, str.len()));
+            e.u8_((sy.bind << 4) | sy.ty);
+            e.u8_(0);
+            e.u16_(shndx);
+            e.u64_(a);
+            e.u64_(sy.size);
+            str.put(sy.name);
+            str.u8_(0);
+        }
+    }
+    st.put(stl.view());
+    st.put(stg.view());
+    let mut shs = bn.new_bytes();
+    shs.put("\x00.text\x00.rodata\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.dynamic\x00");
+    let mut tail = bn.new_bytes();
+    tail.put(b);
+    let sym_off = align_up(@as(u64, tail.len()), 8);
+    tail.zeros(@truncate(usize, sym_off) - tail.len());
+    tail.put(st.view());
+    let str_off = @as(u64, tail.len());
+    tail.put(str.view());
+    let shs_off = @as(u64, tail.len());
+    tail.put(shs.view());
+    let sh_off = align_up(@as(u64, tail.len()), 8);
+    tail.zeros(@truncate(usize, sh_off) - tail.len());
+    // name, type, flags, addr, off, size, link, info, align, entsize
+    let shdr: [9][10]u64 = [
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [1, 1, 6, segs[1].vaddr, segs[1].off, segs[1].filesz, 0, 0, 16, 0],
+        [7, 1, 2, segs[0].vaddr, segs[0].off, segs[0].filesz, 0, 0, 8, 0],
+        [15, 1, 3, segs[2].vaddr, segs[2].off, segs[2].filesz, 0, 0, 8, 0],
+        [21, 8, 3, segs[2].vaddr + segs[2].filesz, segs[2].off + segs[2].filesz, segs[2].memsz - segs[2].filesz, 0, 0,
+         8, 0],
+        [26, 2, 0, 0, sym_off, @as(u64, st.len()), 6, nlocal, 8, 24],
+        [34, 3, 0, 0, str_off, @as(u64, str.len()), 0, 0, 1, 0],
+        [42, 3, 0, 0, shs_off, @as(u64, shs.len()), 0, 0, 1, 0],
+        [52, 6, 3, dyn_addr, dfo, n_dyn * 16, 0, 0, 8, 16],
+    ];
+    for k in @as(usize, 0)..9 {
+        let x = shdr[k];
+        tail.u32_(x[0]);
+        tail.u32_(x[1]);
+        tail.u64_(x[2]);
+        tail.u64_(x[3]);
+        tail.u64_(x[4]);
+        tail.u64_(x[5]);
+        tail.u32_(x[6]);
+        tail.u32_(x[7]);
+        tail.u64_(x[8]);
+        tail.u64_(x[9]);
+    }
+    let tb = tail.view();
+    w64(tb, 40, sh_off);  // e_shoff
+    w16(tb, 58, 64);      // e_shentsize
+    w16(tb, 60, 9);       // e_shnum
+    w16(tb, 62, 7);       // e_shstrndx
+    if not u.write_file(out, tb) {
         err(u.f1("cannot write %s", out));
         return 1;
     }

@@ -68,6 +68,8 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
             _ = gvn.gvn(f);
             cleanup(f, level);
         }
+        opt.dce(f);
+        _ = gvn.sink(f);
     }
     opt.dce(f);
 }
