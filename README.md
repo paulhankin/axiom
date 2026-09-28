@@ -34,6 +34,7 @@ WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library
 | Path | What |
 |---|---|
 | [`spec/phalange.md`](spec/phalange.md) | Language specification (v0.1 working draft) |
+| [`docs/comparison.md`](docs/comparison.md) | Phalange compared with Zig, Rust, C++ and C |
 | [`examples/dot_product.ph`](examples/dot_product.ph) | SIMD dot product with a bump arena and WASM exports |
 | [`examples/shapes.ph`](examples/shapes.ph) | Tagged unions, `match`, errors |
 | [`examples/generics.ph`](examples/generics.ph) | Generic functions and types, constraints, const parameters |
