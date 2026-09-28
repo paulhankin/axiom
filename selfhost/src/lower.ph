@@ -38,18 +38,64 @@ fn isz(v: u64) *mut ir.Value {
     return ir.cint(ir.isz(), v);
 }
 
-// The signature with aggregates passed by address and returned through sret.
+// A small aggregate (a slice, a pair) is passed as its scalar leaves: their
+// types and offsets, or false when it has more than MAX_LEAVES of them.
+const MAX_LEAVES: usize = 4;
+
+struct Leaves {
+    tys: [4]*mut ir.Ty,
+    offs: [4]u64,
+    n: usize,
+}
+
+fn leaves_of(t: *mut ir.Ty, off: u64, l: *mut Leaves) bool {
+    let k = t.kind;
+    if ((k == ir.T_INT) and (t.bits <= 64)) or (k == ir.T_FLOAT) or (k == ir.T_PTR) {
+        if l.n >= MAX_LEAVES {
+            return false;
+        }
+        l.tys[l.n] = t;
+        l.offs[l.n] = off;
+        l.n += 1;
+        return true;
+    }
+    if (k == ir.T_STRUCT) or (k == ir.T_ARRAY) {
+        let n = ir.field_count(t);
+        if n > MAX_LEAVES {
+            return false;
+        }
+        for i in 0..n {
+            if not leaves_of(ir.field_ty(t, i), off + ir.field_off(t, i), l) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+fn split(t: *mut ir.Ty, l: *mut Leaves) bool {
+    l.n = 0;
+    return agg(t) and leaves_of(t, 0, l);
+}
+
+// The signature with aggregates passed by address (small ones as their
+// leaves) and returned through sret.
 fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
     let mut any = agg(t.ret);
+    let mut n = t.params.len;
+    let mut l = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
     for p in t.params {
         if agg(p) {
             any = true;
+            if split(p, &mut l) {
+                n += l.n;
+            }
         }
     }
     if not any {
         return t;
     }
-    let n = t.params.len;
     let ps = u.newn.[*mut ir.Ty](n + 2);
     let mut k: usize = 0;
     let mut rt = t.ret;
@@ -59,12 +105,18 @@ fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
         rt = ir.t_void();
     }
     for p in t.params {
-        if agg(p) {
+        if split(p, &mut l) {
+            for j in 0..l.n {
+                ps[k] = l.tys[j];
+                k += 1;
+            }
+        } else if agg(p) {
             ps[k] = ir.t_ptr();
+            k += 1;
         } else {
             ps[k] = p;
+            k += 1;
         }
-        k += 1;
     }
     return ir.t_fn(rt, ps[0..k], t.vararg);
 }
@@ -75,7 +127,7 @@ fn lower_sig(f: *mut ir.Func) void {
         return;
     }
     let sret = agg(f.ty.ret);
-    let n = f.params.len;
+    let n = nt.params.len;
     let mut k: usize = 0;
     let ps = u.newn.[*mut ir.Value](n + 2);
     let ext = u.newn.[u8](n + 2);
@@ -83,18 +135,33 @@ fn lower_sig(f: *mut ir.Func) void {
         ps[0] = ir.new_param(f, ir.t_ptr(), 0);
         k = 1;
     }
-    for i in 0..n {
+    let mut l = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+    for i in 0..f.params.len {
         let p = f.params[i];
-        if agg(p.ty) {
+        if split(p.ty, &mut l) {
+            // the leaves arrive as parameters; the body stores them into a
+            // slot (scalar replacement takes it apart again)
+            let s = u.newn.[*mut ir.Value](MAX_LEAVES);
+            for j in 0..l.n {
+                s[j] = ir.new_param(f, l.tys[j], k);
+                ps[k] = s[j];
+                ext[k] = 0;
+                k += 1;
+            }
+            p.auxp = @ptr_cast(*mut void, s.ptr);  // (the leaves, until lower_body makes the slot)
+            f.split.push(p);
+        } else if agg(p.ty) {
             let np = ir.new_param(f, ir.t_ptr(), k);
             p.auxp = @ptr_cast(*mut void, np);  // the slot of the aggregate parameter
             ps[k] = np;
+            ext[k] = f.param_ext[i];
+            k += 1;
         } else {
             p.cv = @as(u64, k);
             ps[k] = p;
+            ext[k] = f.param_ext[i];
+            k += 1;
         }
-        ext[k] = f.param_ext[i];
-        k += 1;
     }
     f.params = ps[0..k];
     f.param_ext = ext[0..k];
@@ -249,7 +316,7 @@ fn lower_call(v: *mut ir.Value) void {
     let sret = agg(old.ret);
     let n = v.xs.len;
     let mut args = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
-    let ext = u.newn.[u8](n + 3);
+    let ext = u.newn.[u8](nt.params.len + 3);
     let mut k: usize = 1;
     if sret {
         let s = entry_alloca(old.ret);
@@ -258,8 +325,19 @@ fn lower_call(v: *mut ir.Value) void {
         v.aux2 = 1;
         k = 2;
     }
+    let mut l = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
     for i in 0..n {
         let x = v.xs.get(i);
+        if split(x.ty, &mut l) {
+            let s = slot_of(x);
+            for j in 0..l.n {
+                let ld = ir.load(B, l.tys[j], ir.ptradd(B, s, isz(l.offs[j])));
+                ld.align = @int_cast(u32, l.tys[j].align);
+                args.push(ld);
+                k += 1;
+            }
+            continue;
+        }
         if agg(x.ty) {
             args.push(slot_of(x));
         } else {
@@ -281,6 +359,20 @@ fn lower_call(v: *mut ir.Value) void {
 fn lower_body(f: *mut ir.Func) void {
     F = f;
     count_uses(f);
+    // aggregate parameters passed as leaves: stored into a slot on entry
+    let mut lp = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+    for i in 0..f.split.len {
+        let p = f.split.get(i);
+        _ = split(p.ty, &mut lp);
+        let lv = @slice_from_ptr(@ptr_cast(*mut *mut ir.Value, p.auxp), MAX_LEAVES);
+        let s = entry_alloca(p.ty);
+        ir.at_before(B, s.next);
+        for j in 0..lp.n {
+            let st = ir.store(B, lv[j], ir.ptradd(B, s, isz(lp.offs[j])));
+            st.align = @int_cast(u32, lp.tys[j].align);
+        }
+        set_slot(p, s);
+    }
     let mut phis = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
     // aggregate phis get their slots first (their inputs may come later)
     let mut b = f.first;

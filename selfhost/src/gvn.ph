@@ -1570,9 +1570,14 @@ let mut ss_mark: i64 = 0;
 
 // Is the push store s dead (see above)? Forward over the paths from s.
 fn push_dead(s: *mut ir.Value, slot: bool) bool {
+    return dead_from(s.next, s, slot);
+}
+
+// ... over the paths from instruction `from` on.
+fn dead_from(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
     ss_mark += 1;
     ss_work.clear();
-    ss_work.push(s.next);  // where to scan from
+    ss_work.push(from);  // where to scan from
     let mut blocks: i32 = 0;
     while ss_work.len > 0 {
         let mut i = ss_work.pop();
@@ -1677,42 +1682,198 @@ fn restore_redundant(s: *mut ir.Value) bool {
     return true;
 }
 
+// A store of the shadow stack read only on uncommon paths (the calls and
+// traps of an inlined function's slow path and checks) moves to just before
+// each instruction that reads it, off the common path. The readers are found
+// forward from the store up to what overwrites it (see push_dead); each must
+// be in a block the store's block dominates, no deeper in loops, and not
+// reachable from an overwrite without passing the store's block again.
+let mut rd_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+let mut ow_found: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0, cap: 0 };
+
+// The readers of s forward from `from` (false: too far, or a return).
+fn readers_of(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
+    rd_found.clear();
+    ow_found.clear();
+    ss_mark += 1;
+    ss_work.clear();
+    ss_work.push(from);
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let mut i = ss_work.pop();
+        loop {
+            if ss_store_field(i) == 0 {
+                let mut over = not slot;
+                if slot {
+                    ss_one.clear();
+                    ss_one.push(i.a);
+                    over = uses_any(s.b, &ss_one, 0);
+                }
+                if over {
+                    ow_found.push(i);
+                    break;
+                }
+            } else if i.op == ir.OP_RET {
+                if not slot {
+                    return false;  // (the depth must be restored before)
+                }
+                break;
+            } else if ss_reader(i, not slot) {
+                rd_found.push(i);
+                break;  // (a copy goes before it; beyond, the path has it)
+            }
+            if ir.is_term(i.op) {
+                for k in 0..ir.succ_count(i) {
+                    let sb = ir.succ(i, k);
+                    if sb.mark != ss_mark {
+                        sb.mark = ss_mark;
+                        blocks += 1;
+                        if u.isnil(sb.first) or (blocks > 64) or (sb.rpo < 0) {
+                            return false;
+                        }
+                        ss_work.push(sb.first);
+                    }
+                }
+                break;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// Can an overwrite reach one of the readers without passing through b?
+fn overwrite_reaches(b: *mut ir.Block) bool {
+    ss_mark += 1;
+    b.mark = ss_mark;
+    ss_work.clear();
+    for k in 0..ow_found.len {
+        ss_work.push(ow_found.get(k).next);
+    }
+    let mut blocks: i32 = 0;
+    while ss_work.len > 0 {
+        let mut i = ss_work.pop();
+        while u.notnil(i) {
+            for k in 0..rd_found.len {
+                if rd_found.get(k) == i {
+                    return true;
+                }
+            }
+            if ir.is_term(i.op) {
+                for k in 0..ir.succ_count(i) {
+                    let sb = ir.succ(i, k);
+                    if sb.mark != ss_mark {
+                        sb.mark = ss_mark;
+                        blocks += 1;
+                        if blocks > 128 {
+                            return true;
+                        }
+                        ss_work.push(sb.first);
+                    }
+                }
+                break;
+            }
+            i = i.next;
+        }
+    }
+    return false;
+}
+
+fn sink_ss_store(s: *mut ir.Value, sf: i32) bool {
+    let slot = sf != 0;
+    let b = s.blk;
+    if not readers_of(s.next, s, slot) or (rd_found.len == 0) {
+        return false;
+    }
+    for k in 0..rd_found.len {
+        let q = rd_found.get(k).blk;
+        if (q == b) or not opt.dominates(b, q) or (q.loop_depth > b.loop_depth) {
+            return false;
+        }
+    }
+    if overwrite_reaches(b) {
+        return false;
+    }
+    for k in 0..rd_found.len {
+        let r = rd_found.get(k);
+        let c = ir.new_inst(b.fnp, ir.OP_STORE, s.ty);
+        c.a = s.a;
+        c.b = s.b;
+        c.align = s.align;
+        c.flags = s.flags;
+        ir.insert_before(r, c);
+    }
+    ir.remove_inst(s);
+    return true;
+}
+
 // True if anything changed.
 pub fn ss_opt(f: *mut ir.Func) bool {
     if u.isnil(f.first) {
         return false;
     }
-    opt.compute_preds(f);
     let mut any = false;
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            let next = i.next;
-            let sf = ss_store_field(i);
-            if (sf == 2) and push_dead(i, true) {
-                ir.remove_inst(i);
-                any = true;
-            } else if (sf == 0) and push_dead(i, false) {
-                ir.remove_inst(i);
-                any = true;
+    let mut rounds: i32 = 0;
+    loop {
+        opt.compute_preds(f);
+        let mut moved = false;
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                let sf = ss_store_field(i);
+                if (sf == 2) and push_dead(i, true) {
+                    ir.remove_inst(i);
+                    moved = true;
+                } else if (sf == 0) and push_dead(i, false) {
+                    ir.remove_inst(i);
+                    moved = true;
+                }
+                i = next;
             }
-            i = next;
+            b = b.next;
         }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            let next = i.next;
-            if (ss_store_field(i) == 0) and restore_redundant(i) {
-                ir.remove_inst(i);
-                any = true;
+        b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                if (ss_store_field(i) == 0) and restore_redundant(i) {
+                    ir.remove_inst(i);
+                    moved = true;
+                }
+                i = next;
             }
-            i = next;
+            b = b.next;
         }
-        b = b.next;
+        // stores read on some paths only: to their readers
+        rounds += 1;
+        if rounds <= 2 {
+            let order = opt.dominators(f);
+            opt.loop_depths(f, &order);
+            u.free(@ptr_cast(*mut void, order.data));
+            b = f.first;
+            while u.notnil(b) {
+                let mut i = b.last;
+                while u.notnil(i) {
+                    let prev = i.prev;
+                    let sf = ss_store_field(i);
+                    if ((sf == 0) or (sf == 2)) and sink_ss_store(i, sf) {
+                        moved = true;
+                    }
+                    i = prev;
+                }
+                b = b.next;
+            }
+        }
+        if not moved {
+            break;
+        }
+        any = true;
+        if rounds > 8 {
+            break;
+        }
     }
     return any;
 }

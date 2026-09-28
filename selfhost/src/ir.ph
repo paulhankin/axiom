@@ -548,6 +548,7 @@ pub struct Func {
     import_module: []u8,  // wasm import
     import_name: []u8,
     sret: bool,           // set by lowering: params[0] is the result address
+    split: u.List.[*mut Value],  // lowering: aggregate parameters passed as their leaves
     nvals: i32,
     nblocks: i32,
     id: i32,

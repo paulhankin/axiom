@@ -90,3 +90,30 @@ test "nested inlining" {
     let xs: [2]i32 = [1, 2];
     _ = mid(xs[..], 4);
 }
+
+fn note(n: *mut u64) void {
+    n.* += 1;
+}
+
+// A call on an uncommon path, then a check (inlined into the tests: the
+// call's record is written only where something reads it)
+fn bump(xs: []u64, n: *mut u64, i: usize) u64 {
+    if n.* == 7 {
+        note(n);
+    }
+    return xs[i];
+}
+
+// stack: slow path not taken | bump@104 test "slow path not taken"@111
+test "slow path not taken" {
+    let xs: [2]u64 = [1, 2];
+    let mut n: u64 = 0;
+    _ = bump(xs[..], &mut n, 5);
+}
+
+// stack: slow path taken | bump@104 test "slow path taken"@118
+test "slow path taken" {
+    let xs: [2]u64 = [1, 2];
+    let mut n: u64 = 7;
+    _ = bump(xs[..], &mut n, 5);
+}
