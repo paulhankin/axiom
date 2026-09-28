@@ -18,6 +18,7 @@ import "gvn.ph" as gvn;
 import "inline.ph" as inl;
 import "thread.ph" as thr;
 import "outline.ph" as outl;
+import "target.ph" as tg;
 
 fn cleanup(f: *mut ir.Func, level: i32) void {
     let mut rounds: i32 = 0;
@@ -106,7 +107,11 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
         }
         for i in 0..m.funcs.len {
             let f = m.funcs.get(i);
-            if not ir.is_decl(f) and gvn.split_loops(f) {
+            if ir.is_decl(f) {
+                continue;
+            }
+            let split = gvn.split_loops(f);
+            if split or gvn.reduce_addresses(f, tg.is_wasm()) {
                 let mut rounds: i32 = 0;
                 while (rounds < 3) and gvn.gvn(f) {
                     cleanup(f, level);

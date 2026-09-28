@@ -2786,3 +2786,218 @@ pub fn sink(f: *mut ir.Func) bool {
     return any;
 }
 
+
+// -----------------------------------------------------------------------------
+// Strength reduction of addresses: in a loop, an address base + off where
+// base is invariant and off grows by a constant each iteration (an affine
+// function of the loop's counters, as (i * 300 + k) * 8) becomes a pointer
+// of its own, started before the loop and advanced at its latch. Worth it
+// for wasm (no addressing modes) whenever off takes work; for native code
+// when it takes a multiplication or more than one operation per access.
+// Addresses a constant apart share the pointer.
+// -----------------------------------------------------------------------------
+struct IvPtr {
+    base: *mut ir.Value,
+    step: i64,
+    off0: *mut ir.Value,
+    q: *mut ir.Value,
+}
+
+let mut ivps: u.List.[IvPtr] = u.List.[IvPtr].{ data: @ptr_from_int(*mut IvPtr, 0), len: 0, cap: 0 };
+
+// The step of v per iteration of the loop at h (tag), when v is an affine
+// function of its counters; `ops` counts the operations that vary.
+fn iv_step(v0: *mut ir.Value, h: *mut ir.Block, tag: i64, ok: *mut bool, ops: *mut i32, mulk: *mut bool, depth: i32) i64 {
+    let v = ir.resolve(v0);
+    if invariant(v, tag) {
+        return 0;
+    }
+    if (depth > 6) or (v.ty != ir.isz()) {
+        ok.* = false;
+        return 0;
+    }
+    if (v.op == ir.OP_PHI) and (v.blk == h) {
+        // a counter: [init from outside, v + c from the latch]
+        if v.xs.len != 2 {
+            ok.* = false;
+            return 0;
+        }
+        for k in @as(usize, 0)..2 {
+            if v.bs.get(k).mark == tag {
+                let n = ir.resolve(v.xs.get(k));
+                if is_inst(n, ir.OP_ADD) and (ir.resolve(n.a) == v) and cb.is_k(ir.resolve(n.b)) {
+                    return @bit_cast(i64, ir.cint_val(ir.resolve(n.b)));
+                }
+            }
+        }
+        ok.* = false;
+        return 0;
+    }
+    let op = v.op;
+    if (op == ir.OP_ADD) or (op == ir.OP_SUB) {
+        let a = iv_step(v.a, h, tag, ok, ops, mulk, depth + 1);
+        let b = iv_step(v.b, h, tag, ok, ops, mulk, depth + 1);
+        ops.* += 1;
+        if op == ir.OP_ADD {
+            return a +% b;
+        }
+        return a -% b;
+    }
+    if ((op == ir.OP_MUL) or (op == ir.OP_SHL)) and cb.is_k(ir.resolve(v.b)) {
+        let a = iv_step(v.a, h, tag, ok, ops, mulk, depth + 1);
+        let k = @bit_cast(i64, ir.cint_val(ir.resolve(v.b)));
+        ops.* += 1;
+        if op == ir.OP_SHL {
+            if (k < 0) or (k > 3) {
+                mulk.* = true;
+            }
+            return a << @truncate(u32, @bit_cast(u64, k) & 63);
+        }
+        if (k != 1) and (k != 2) and (k != 4) and (k != 8) {
+            mulk.* = true;
+        }
+        return a *% k;
+    }
+    ok.* = false;
+    return 0;
+}
+
+// v's value in the loop's first iteration, built before it.
+fn iv_start(bld: *mut ir.Builder, v0: *mut ir.Value, h: *mut ir.Block, tag: i64, pre: *mut ir.Block) *mut ir.Value {
+    let v = ir.resolve(v0);
+    if invariant(v, tag) {
+        return v;
+    }
+    if (v.op == ir.OP_PHI) and (v.blk == h) {
+        for k in 0..v.bs.len {
+            if v.bs.get(k) == pre {
+                return ir.resolve(v.xs.get(k));
+            }
+        }
+    }
+    let a = iv_start(bld, v.a, h, tag, pre);
+    let b = iv_start(bld, v.b, h, tag, pre);
+    if v.op == ir.OP_ADD {
+        return ir.add(bld, a, b);
+    }
+    if v.op == ir.OP_SUB {
+        return ir.sub(bld, a, b);
+    }
+    if v.op == ir.OP_MUL {
+        return ir.mul(bld, a, b);
+    }
+    return ir.binop(bld, ir.OP_SHL, a, b);
+}
+
+fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], no_modes: bool) bool {
+    // one latch
+    let mut latch = ir.bnil();
+    for k in 0..h.preds.len {
+        let p = h.preds.get(k);
+        if p.mark == tag {
+            if u.notnil(latch) {
+                return false;
+            }
+            latch = p;
+        }
+    }
+    if u.isnil(latch) or (ir.terminator(latch).op != ir.OP_BR) {
+        return false;
+    }
+    let mut pre = ir.bnil();
+    ivps.clear();
+    let mut any = false;
+    for mi in 0..members.len {
+        let x = members.get(mi);
+        let mut p = x.first;
+        while u.notnil(p) {
+            let next = p.next;
+            if (p.op == ir.OP_PTRADD) and invariant(ir.resolve(p.a), tag) and not invariant(ir.resolve(p.b), tag) {
+                let mut ok = true;
+                let mut ops: i32 = 0;
+                let mut mulk = false;
+                let st = iv_step(p.b, h, tag, &mut ok, &mut ops, &mut mulk, 0);
+                let worth = (no_modes and (ops >= 1)) or mulk or (ops >= 2);
+                if ok and (st != 0) and worth {
+                    if u.isnil(pre) {
+                        _ = make_preheader(f, h, tag);
+                        for k in 0..h.preds.len {
+                            if h.preds.get(k).mark != tag {
+                                pre = h.preds.get(k);
+                            }
+                        }
+                    }
+                    let bld = ir.new_builder();
+                    ir.at_before(bld, ir.terminator(pre));
+                    let base = ir.resolve(p.a);
+                    let off0 = iv_start(bld, p.b, h, tag, pre);
+                    // a pointer already made for this base and step, a constant away?
+                    let mut q = vnil();
+                    let mut d: i64 = 0;
+                    for k in 0..ivps.len {
+                        let e = ivps.at(k);
+                        if (e.base == base) and (e.step == st) {
+                            if e.off0 == off0 {
+                                q = e.q;
+                            } else if cb.is_k(e.off0) and cb.is_k(off0) {
+                                q = e.q;
+                                d = @bit_cast(i64, ir.cint_val(off0)) -% @bit_cast(i64, ir.cint_val(e.off0));
+                            }
+                        }
+                    }
+                    if u.isnil(q) {
+                        let start = ir.ptradd(bld, base, off0);
+                        ir.at_before(bld, h.first);
+                        q = ir.phi(bld, ir.t_ptr());
+                        ir.add_incoming(q, start, pre);
+                        ir.at_before(bld, ir.terminator(latch));
+                        let qn = ir.ptradd(bld, q, ir.cint(ir.isz(), @bit_cast(u64, st)));
+                        ir.add_incoming(q, qn, latch);
+                        ivps.push(IvPtr.{ base: base, step: st, off0: off0, q: q });
+                    }
+                    if d != 0 {
+                        ir.at_before(bld, p);
+                        p.fwd = ir.ptradd(bld, q, ir.cint(ir.isz(), @bit_cast(u64, d)));
+                    } else {
+                        p.fwd = q;
+                    }
+                    ir.remove_inst(p);
+                    any = true;
+                }
+            }
+            p = next;
+        }
+    }
+    if any {
+        ir.apply_forwarding(f);
+    }
+    return any;
+}
+
+// True if anything changed.
+pub fn reduce_addresses(f: *mut ir.Func, no_modes: bool) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    let mut any = false;
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    let hs = loop_headers(&order);
+    let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    // inner loops first (their pointers' starts are then reduced in the outer ones)
+    let mut k = hs.len;
+    while k > 0 {
+        k -= 1;
+        loop_mark += 1;
+        members_of(hs.get(k), loop_mark, &mut members);
+        if try_reduce(f, hs.get(k), loop_mark, &members, no_modes) {
+            any = true;
+            opt.compute_preds(f);  // (a preheader may be new)
+        }
+    }
+    u.free(@ptr_cast(*mut void, members.data));
+    u.free(@ptr_cast(*mut void, order.data));
+    u.free(@ptr_cast(*mut void, hs.data));
+    return any;
+}

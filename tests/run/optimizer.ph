@@ -351,7 +351,36 @@ fn buf_push(b: *mut Buf, x: u64, tag: u64) u64 {
     return r;
 }
 
+// Addresses that advance by a constant each iteration (they become
+// pointers of their own): nested loops, a step down, neighbours, an exit.
+fn walk(m: []u32, n: usize) u64 {
+    let mut s: u64 = 0;
+    for i in 0..n {
+        for j in 0..n {
+            s += @as(u64, m[(i * n) + j]) * @as(u64, m[(j * n) + i]);
+        }
+    }
+    let mut k = n * n;
+    while k > 1 {
+        k -= 1;
+        s = (s * 3) + @as(u64, m[k]) + @as(u64, m[k - 1]);
+        if m[k] == 999 {
+            break;
+        }
+    }
+    return s;
+}
+
 export fn run() void {
+    let mut mm: [16]u32 = [0; 16];
+    for i in 0..mm.len {
+        mm[i] = @truncate(u32, (i * 7) % 11);
+    }
+    io.uint(walk(mm[..], 4));                  // expect: 6704864038
+    mm[9] = 999;
+    io.uint(walk(mm[..], 4));                  // expect: 40037593
+    io.uint(walk(mm[..], 0));                  // expect: 0
+
     let mut bf = Buf.{ data: [0; 16], len: 0, spills: 0 };
     let mut rs: u64 = 0;
     for i in @as(u64, 0)..40 {
