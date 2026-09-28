@@ -965,8 +965,29 @@ fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
         // one successor in the loop, one outside; the loop contiguous
         let in1 = t.t1.aux == tag;
         let in2 = t.t2.aux == tag;
-        if (in1 == in2) or (last == h.rpo) or ((last - h.rpo) + 1 != members) {
+        if (in1 == in2) or (last == h.rpo) {
             continue;
+        }
+        if (last - h.rpo) + 1 != members {
+            // blocks that leave the loop placed among its blocks go after it
+            let mut w = @int_cast(usize, h.rpo);
+            body.clear();
+            for i in @int_cast(usize, h.rpo)..(@int_cast(usize, last) + 1) {
+                let x = order.get(i);
+                if x.aux == tag {
+                    order.set(w, x);
+                    x.rpo = @int_cast(i32, w);
+                    w += 1;
+                } else {
+                    body.push(x);
+                }
+            }
+            last = @int_cast(i32, w) - 1;
+            for k in 0..body.len {
+                let x = body.get(k);
+                order.set(w + k, x);
+                x.rpo = @int_cast(i32, w + k);
+            }
         }
         let from = @int_cast(usize, h.rpo);
         let to = @int_cast(usize, last);

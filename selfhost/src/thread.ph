@@ -456,7 +456,9 @@ fn arm_cost(a: *mut ir.Block, d: *mut ir.Block, m: *mut ir.Block) i32 {
         if (i.op == ir.OP_PHI) or not speculatable(i) {
             return -1;
         }
-        n += 1;
+        if i.op != ir.OP_PTRADD {
+            n += 1;  // addresses mostly fold into addressing modes
+        }
         i = i.next;
     }
     return n;
@@ -594,6 +596,76 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
     return true;
 }
 
+// d -> t -> m, d -> e -> m, with m reached only from t and e: stores of
+// scalars at the ends of both arms become one store in m of a phi of the
+// values (and of the addresses when they differ), which the conversion
+// below turns into a select.
+fn from_alloca(p0: *mut ir.Value) bool {
+    let mut p = p0;
+    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        p = p.a;
+    }
+    return (p.kind == ir.V_INST) and (p.op == ir.OP_ALLOCA);
+}
+
+fn sink_stores(d: *mut ir.Block) bool {
+    let br = ir.terminator(d);
+    let t = br.t1;
+    let e = br.t2;
+    if (t == e) or (t.preds.len != 1) or (e.preds.len != 1) {
+        return false;
+    }
+    let tt = ir.terminator(t);
+    let et = ir.terminator(e);
+    if u.isnil(tt) or u.isnil(et) or (tt.op != ir.OP_BR) or (et.op != ir.OP_BR) {
+        return false;
+    }
+    let m = tt.t1;
+    if (et.t1 != m) or (m == d) or (m == t) or (m == e) or (m.preds.len != 2) {
+        return false;
+    }
+    let mut any = false;
+    loop {
+        let s1 = ir.terminator(t).prev;
+        let s2 = ir.terminator(e).prev;
+        if u.isnil(s1) or u.isnil(s2) or (s1.op != ir.OP_STORE) or (s2.op != ir.OP_STORE) {
+            return any;
+        }
+        let ty = s1.a.ty;
+        if (ty != s2.a.ty) or (s1.flags != s2.flags) or (s1.align != s2.align) {
+            return any;
+        }
+        if (ty.kind != ir.T_INT) and (ty.kind != ir.T_FLOAT) and (ty.kind != ir.T_PTR) {
+            return any;
+        }
+        let bld = ir.new_builder();
+        ir.at_before(bld, m.first);
+        let v = ir.phi(bld, ty);
+        ir.add_incoming(v, s1.a, t);
+        ir.add_incoming(v, s2.a, e);
+        let mut addr = s1.b;
+        if (s2.b != addr) and (from_alloca(s1.b) or from_alloca(s2.b)) {
+            return any;  // keeps stack slots promotable
+        }
+        if s2.b != addr {
+            addr = ir.phi(bld, s1.b.ty);
+            ir.add_incoming(addr, s1.b, t);
+            ir.add_incoming(addr, s2.b, e);
+        }
+        let mut at = m.first;
+        while at.op == ir.OP_PHI {
+            at = at.next;
+        }
+        ir.at_before(bld, at);
+        let st = ir.store(bld, v, addr);
+        st.flags = s1.flags;
+        st.align = s1.align;
+        ir.remove_inst(s1);
+        ir.remove_inst(s2);
+        any = true;
+    }
+}
+
 pub fn if_convert(f: *mut ir.Func) bool {
     if u.isnil(f.first) {
         return false;
@@ -604,6 +676,9 @@ pub fn if_convert(f: *mut ir.Func) bool {
     while u.notnil(b) {
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a.ty.kind == ir.T_INT) {
+            if sink_stores(b) {
+                any = true;
+            }
             if convert(f, b) {
                 any = true;
                 opt.compute_preds(f);

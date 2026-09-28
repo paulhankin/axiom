@@ -702,6 +702,22 @@ fn int_compare(v: *mut ir.Value) i32 {
             sz = 2;
         }
     }
+    if is_c(v.b) and (cval(v.b) == 0) {
+        // test sets the flags as a compare with 0 does (clearing CF and OF)
+        let x = v.a;
+        if (x.kind == ir.V_INST) and ((x.flag & 4) != 0) {
+            if imm_ok(x.b) {
+                let i = e2(xe.TEST, sz, R(reg(x.a)), I(cval(x.b)));
+                i.cc = 0;
+            } else {
+                _ = e2(xe.TEST, sz, R(reg(x.a)), R(reg(x.b)));
+            }
+        } else {
+            let r = reg(x);
+            _ = e2(xe.TEST, sz, R(r), R(r));
+        }
+        return icc(p);
+    }
     let a = reg(v.a);
     if imm_ok(v.b) {
         let mut x = cval(v.b);
@@ -2760,6 +2776,9 @@ fn gen_inst(v: *mut ir.Value) void {
         return;
     }
     if (o >= ir.OP_ADD) and (o <= ir.OP_ASHR) {
+        if (v.flag & 4) != 0 {
+            return;  // an `and` computed by the test of its comparison
+        }
         if t.kind == ir.T_VEC {
             vec_binop(v);
         } else if (o == ir.OP_UDIV) or (o == ir.OP_SDIV) or (o == ir.OP_UREM) or (o == ir.OP_SREM) {
@@ -3100,9 +3119,16 @@ fn prepare(f: *mut ir.Func) void {
             if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
                 let us = i.user;
                 if (us.blk == b) and (us.a == i) {
-                    if (us.op == ir.OP_CONDBR) or ((us.op == ir.OP_SELECT) and (i.next == us)) {
+                    if (us.op == ir.OP_CONDBR) or (us.op == ir.OP_SELECT) {
                         i.flag = i.flag | 2;
                     }
+                }
+                // (x & y) cmp 0: test x, y
+                let x = i.a;
+                if (i.op == ir.OP_ICMP) and is_c(i.b) and (cval(i.b) == 0) and (x.kind == ir.V_INST) and
+                   (x.op == ir.OP_AND) and (x.uses == 1) and (x.blk == b) and (x.ty.kind == ir.T_INT) and
+                   (x.ty.bits <= 64) {
+                    x.flag = x.flag | 4;
                 }
             }
             i = i.next;
