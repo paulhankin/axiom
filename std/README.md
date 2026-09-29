@@ -10,6 +10,11 @@ and a type that owns memory has `deinit`).
 | [`vec`](vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
 | [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
+| [`set`](set.ph) | `Set[K]`: hash set with union, intersection and difference in place |
+| [`treemap`](treemap.ph) | `TreeMap[K, V]`: ordered map (AVL tree): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
+| [`deque`](deque.ph) | `Deque[T]`: double-ended queue on a ring buffer |
+| [`heap`](heap.ph) | `Heap[T]`: priority queue (binary heap), built from a slice in linear time |
+| [`bitset`](bitset.ph) | `BitSet`: fixed-size sets of bits, `next_set`/`next_clear`, union/intersection |
 | [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
 | [`path`](path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |

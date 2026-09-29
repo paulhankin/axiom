@@ -1,0 +1,225 @@
+// =============================================================================
+// std/bitset.ph - sets of small integers as bits.
+//
+//     let mut b = bitset.BitSet.init(1000)!;   // bits 0..999, all clear
+//     defer b.deinit();
+//     b.set(3);
+//     if b.get(3) { ... }
+//     let mut i = b.next_set(0) catch ...;     // the first set bit from 0
+//
+// Indexing past the end traps, as for slices.
+// =============================================================================
+
+import "mem.ph" as mem;
+
+error { NotFound, OutOfMemory }
+
+pub struct BitSet {
+    words: []mut u64,
+    len: usize,  // bits
+
+    pub fn init(n: usize) !BitSet {
+        let words = mem.alloc_zeroed.[u64]((n + 63) / 64)!;
+        return BitSet.{ words: words, len: n };
+    }
+
+    pub fn deinit(self: *mut BitSet) void {
+        mem.free(self.words);
+        self.len = 0;
+    }
+
+    fn check(self: *BitSet, i: usize) void {
+        if i >= self.len {
+            @trap();
+        }
+    }
+
+    pub fn get(self: *BitSet, i: usize) bool {
+        self.check(i);
+        return ((self.words[i / 64] >> @truncate(u64, i % 64)) & 1) == 1;
+    }
+
+    pub fn set(self: *mut BitSet, i: usize) void {
+        self.check(i);
+        self.words[i / 64] |= @as(u64, 1) << @truncate(u64, i % 64);
+    }
+
+    pub fn unset(self: *mut BitSet, i: usize) void {
+        self.check(i);
+        self.words[i / 64] &= ~(@as(u64, 1) << @truncate(u64, i % 64));
+    }
+
+    pub fn toggle(self: *mut BitSet, i: usize) void {
+        self.check(i);
+        self.words[i / 64] ^= @as(u64, 1) << @truncate(u64, i % 64);
+    }
+
+    pub fn put(self: *mut BitSet, i: usize, v: bool) void {
+        if v {
+            self.set(i);
+        } else {
+            self.unset(i);
+        }
+    }
+
+    /// How many bits are set.
+    pub fn count(self: *BitSet) usize {
+        let mut n: usize = 0;
+        for w in self.words {
+            n += @truncate(usize, @popcount(w));
+        }
+        return n;
+    }
+
+    /// Clears every bit.
+    pub fn clear(self: *mut BitSet) void {
+        @mem_set(self.words, 0);
+    }
+
+    /// Sets every bit.
+    pub fn fill(self: *mut BitSet) void {
+        @mem_set(self.words, @max_value(u64));
+        self.trim();
+    }
+
+    // Clears the bits past len in the last word.
+    fn trim(self: *mut BitSet) void {
+        let r = self.len % 64;
+        if r != 0 {
+            self.words[self.words.len - 1] &= (@as(u64, 1) << @truncate(u64, r)) - 1;
+        }
+    }
+
+    /// Changes the length; new bits are clear.
+    pub fn resize(self: *mut BitSet, n: usize) !void {
+        let nw = (n + 63) / 64;
+        let old = self.words.len;
+        if nw != old {
+            let w = mem.realloc(self.words, nw)!;
+            self.words = w;
+            if nw > old {
+                @mem_set(self.words[old..], 0);
+            }
+        }
+        self.len = n;
+        self.trim();
+    }
+
+    /// The first set bit at or after i, or NotFound.
+    pub fn next_set(self: *BitSet, i: usize) !usize {
+        if i >= self.len {
+            return error.NotFound;
+        }
+        let mut wi = i / 64;
+        let mut w = self.words[wi] & (@max_value(u64) << @truncate(u64, i % 64));
+        loop {
+            if w != 0 {
+                return (wi * 64) + @truncate(usize, @ctz(w));
+            }
+            wi += 1;
+            if wi >= self.words.len {
+                return error.NotFound;
+            }
+            w = self.words[wi];
+        }
+    }
+
+    /// The first clear bit at or after i, or NotFound.
+    pub fn next_clear(self: *BitSet, i: usize) !usize {
+        if i >= self.len {
+            return error.NotFound;
+        }
+        let mut wi = i / 64;
+        let mut w = ~self.words[wi] & (@max_value(u64) << @truncate(u64, i % 64));
+        loop {
+            if w != 0 {
+                let k = (wi * 64) + @truncate(usize, @ctz(w));
+                if k >= self.len {
+                    return error.NotFound;
+                }
+                return k;
+            }
+            wi += 1;
+            if wi >= self.words.len {
+                return error.NotFound;
+            }
+            w = ~self.words[wi];
+        }
+    }
+
+    /// self |= other (the same length, or the program traps).
+    pub fn union_with(self: *mut BitSet, other: *BitSet) void {
+        self.same(other);
+        for i in @as(usize, 0)..self.words.len {
+            self.words[i] |= other.words[i];
+        }
+    }
+
+    /// self &= other.
+    pub fn intersect_with(self: *mut BitSet, other: *BitSet) void {
+        self.same(other);
+        for i in @as(usize, 0)..self.words.len {
+            self.words[i] &= other.words[i];
+        }
+    }
+
+    /// self &= ~other.
+    pub fn difference_with(self: *mut BitSet, other: *BitSet) void {
+        self.same(other);
+        for i in @as(usize, 0)..self.words.len {
+            self.words[i] &= ~other.words[i];
+        }
+    }
+
+    fn same(self: *BitSet, other: *BitSet) void {
+        if self.len != other.len {
+            @trap();
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn not_found(r: !usize) bool {
+    _ = r catch |e| {
+        return e == error.NotFound;
+    };
+    return false;
+}
+
+test "bit sets" {
+    let mut b = BitSet.init(130)!;
+    defer b.deinit();
+    b.set(0);
+    b.set(64);
+    b.set(129);
+    @expect(b.get(64));
+    @expect(not b.get(65));
+    @expect_eq(b.count(), 3);
+    @expect_eq(b.next_set(1)!, 64);
+    @expect_eq(b.next_set(65)!, 129);
+    @expect_eq(b.next_clear(0)!, 1);
+    b.toggle(64);
+    @expect(not b.get(64));
+    b.fill();
+    @expect_eq(b.count(), 130);
+    @expect(not_found(b.next_clear(0)));
+    b.resize(200)!;
+    @expect_eq(b.count(), 130);
+    @expect_eq(b.next_clear(0)!, 130);
+    let mut c = BitSet.init(200)!;
+    defer c.deinit();
+    c.set(5);
+    c.set(150);
+    b.intersect_with(&c);
+    @expect_eq(b.count(), 1);
+    b.union_with(&c);
+    @expect_eq(b.count(), 2);
+    b.difference_with(&c);
+    @expect_eq(b.count(), 0);
+    b.resize(10)!;
+    b.fill();
+    @expect_eq(b.count(), 10);
+}
