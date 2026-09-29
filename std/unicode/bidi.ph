@@ -1,0 +1,1066 @@
+// =============================================================================
+// std/unicode/bidi.ph - the Unicode Bidirectional Algorithm (UAX #9),
+// Unicode 15.1: embedding levels of mixed left-to-right and right-to-left
+// text, and the visual order of a line.
+//
+//     let mut p = bidi.Paragraph.init(cps, bidi.AUTO)!;   // one paragraph's code points
+//     defer p.deinit();
+//     // p.level: the paragraph's level (0 left to right, 1 right to left)
+//     // p.levels[i]: each character's level (odd: right to left)
+//     let order = p.visual_order(0, cps.len)!;             // mem.free it
+//
+// Explicit formatting characters (embeddings, overrides and BN) take no
+// part in the display: visual_order leaves them out.
+// =============================================================================
+
+import "../mem.ph" as mem;
+import "../str.ph" as strs;
+import "../unicode.ph" as uni;
+import "../vec.ph" as vec;
+import "tables.ph" as t;
+
+error { OutOfMemory, Done }
+
+/// Paragraph directions.
+pub const AUTO: i32 = -1;  // from the first strong character (else left to right)
+pub const LTR: i32 = 0;
+pub const RTL: i32 = 1;
+
+const MAX_DEPTH: u32 = 125;
+
+// the classes, as u8
+const L: u8 = 0;
+const R: u8 = 1;
+const AL: u8 = 2;
+const EN: u8 = 3;
+const ES: u8 = 4;
+const ET: u8 = 5;
+const AN: u8 = 6;
+const CS: u8 = 7;
+const NSM: u8 = 8;
+const BN: u8 = 9;
+const B: u8 = 10;
+const S: u8 = 11;
+const WS: u8 = 12;
+const ON: u8 = 13;
+const LRE: u8 = 14;
+const LRO: u8 = 15;
+const RLE: u8 = 16;
+const RLO: u8 = 17;
+const PDF: u8 = 18;
+const LRI: u8 = 19;
+const RLI: u8 = 20;
+const FSI: u8 = 21;
+const PDI: u8 = 22;
+
+fn removed(c: u8) bool {
+    return (c == LRE) or (c == LRO) or (c == RLE) or (c == RLO) or (c == PDF) or (c == BN);
+}
+
+fn is_isolate_init(c: u8) bool {
+    return (c == LRI) or (c == RLI) or (c == FSI);
+}
+
+/// Neutral or isolate formatting (NI in the specification).
+fn is_ni(c: u8) bool {
+    return (c == B) or (c == S) or (c == WS) or (c == ON) or (c == LRI) or (c == RLI) or (c == FSI) or (c == PDI);
+}
+
+/// A paragraph's resolved levels.
+pub struct Paragraph {
+    cps: []mut u32,       // the code points (empty when built from classes)
+    orig: []mut u8,       // the original classes
+    cls: []mut u8,        // the resolved classes
+    levels: []mut u8,     // the resolved levels
+    level: u8,            // the paragraph level
+    matching: []mut i64,  // each isolate initiator's matching PDI (-1: none)
+    emb: []mut u8,        // the embedding levels (before the implicit rules)
+
+    /// Resolves the levels of one paragraph of code points; dir is AUTO,
+    /// LTR or RTL.
+    pub fn init(cps: []u32, dir: i32) !Paragraph {
+        let mut p = empty(cps.len)!;
+        for i in @as(usize, 0)..cps.len {
+            p.cps[i] = cps[i];
+            p.orig[i] = @truncate(u8, uni.bidi_class(cps[i]));
+        }
+        p.resolve(dir) catch |e| {
+            p.deinit();
+            return e;
+        };
+        return p;
+    }
+
+    /// Resolves levels from bidi classes alone (no bracket pairs).
+    pub fn from_classes(classes: []u8, dir: i32) !Paragraph {
+        let mut p = empty(classes.len)!;
+        mem.free(p.cps);
+        p.cps = mem.alloc.[u32](0)!;
+        @mem_copy(p.orig, classes);
+        p.resolve(dir) catch |e| {
+            p.deinit();
+            return e;
+        };
+        return p;
+    }
+
+    pub fn deinit(self: *mut Paragraph) void {
+        mem.free(self.cps);
+        mem.free(self.orig);
+        mem.free(self.cls);
+        mem.free(self.levels);
+        mem.free(self.matching);
+        mem.free(self.emb);
+    }
+
+    /// Whether character i is a formatting character that is not shown.
+    pub fn is_removed(self: *Paragraph, i: usize) bool {
+        return removed(self.orig[i]);
+    }
+
+    fn resolve(self: *mut Paragraph, dir: i32) !void {
+        let n = self.orig.len;
+        @mem_copy(self.cls, self.orig);
+        self.find_matching_pdis();
+        if dir == AUTO {
+            self.level = 0;
+            if self.first_strong(0, n) == 1 {
+                self.level = 1;
+            }
+        } else {
+            self.level = @truncate(u8, @bit_cast(u32, dir));
+        }
+        self.explicit();
+        @mem_copy(self.emb, self.levels);
+        self.runs()!;
+    }
+
+    /// BD9: each isolate initiator's matching PDI.
+    fn find_matching_pdis(self: *mut Paragraph) void {
+        let n = self.orig.len;
+        for i in @as(usize, 0)..n {
+            self.matching[i] = -1;
+            if not is_isolate_init(self.orig[i]) {
+                continue;
+            }
+            let mut depth: usize = 1;
+            let mut j = i + 1;
+            while j < n {
+                let c = self.orig[j];
+                if is_isolate_init(c) {
+                    depth += 1;
+                } else if c == PDI {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.matching[i] = @as(i64, @truncate(u32, j));
+                        break;
+                    }
+                } else if c == B {
+                    break;
+                }
+                j += 1;
+            }
+        }
+    }
+
+    /// P2/P3: 0 if the first strong character in [start, end) (skipping
+    /// isolates) is L, 1 if R or AL, -1 if none.
+    fn first_strong(self: *Paragraph, start: usize, end: usize) i32 {
+        let mut i = start;
+        while i < end {
+            let c = self.orig[i];
+            if c == L {
+                return 0;
+            }
+            if (c == R) or (c == AL) {
+                return 1;
+            }
+            if is_isolate_init(c) {
+                let m = self.matching[i];
+                if m < 0 {
+                    return -1;
+                }
+                i = @truncate(usize, @bit_cast(u64, m));
+            } else if c == B {
+                return -1;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    /// X1-X8: the explicit levels (and overrides).
+    fn explicit(self: *mut Paragraph) void {
+        let n = self.orig.len;
+        // the directional status stack: level, override (0 none, 1 L, 2 R), isolate
+        let mut lvl: [128]u8 = [0; 128];
+        let mut ovr: [128]u8 = [0; 128];
+        let mut iso: [128]bool = [false; 128];
+        let mut sp: usize = 1;
+        lvl[0] = self.level;
+        let mut over_iso: u32 = 0;
+        let mut over_emb: u32 = 0;
+        let mut valid_iso: u32 = 0;
+        for i in @as(usize, 0)..n {
+            let c = self.orig[i];
+            let top = sp - 1;
+            if (c == RLE) or (c == LRE) or (c == RLO) or (c == LRO) {
+                let mut nl = @as(u32, lvl[top]) + 1;
+                if (c == RLE) or (c == RLO) {
+                    nl = (@as(u32, lvl[top]) + 1) | 1;
+                } else {
+                    nl = (@as(u32, lvl[top]) + 2) & ~@as(u32, 1);
+                }
+                if (nl <= MAX_DEPTH) and (over_iso == 0) and (over_emb == 0) {
+                    lvl[sp] = @truncate(u8, nl);
+                    ovr[sp] = 0;
+                    if c == RLO {
+                        ovr[sp] = 2;
+                    } else if c == LRO {
+                        ovr[sp] = 1;
+                    }
+                    iso[sp] = false;
+                    sp += 1;
+                } else if over_iso == 0 {
+                    over_emb += 1;
+                }
+                self.levels[i] = lvl[sp - 1];
+                continue;
+            }
+            if is_isolate_init(c) {
+                self.levels[i] = lvl[top];
+                if ovr[top] == 1 {
+                    self.cls[i] = L;
+                } else if ovr[top] == 2 {
+                    self.cls[i] = R;
+                }
+                let mut rtl = c == RLI;
+                if c == FSI {
+                    let mut end = n;
+                    if self.matching[i] >= 0 {
+                        end = @truncate(usize, @bit_cast(u64, self.matching[i]));
+                    }
+                    rtl = self.first_strong(i + 1, end) == 1;
+                }
+                let mut nl: u32 = 0;
+                if rtl {
+                    nl = (@as(u32, lvl[top]) + 1) | 1;
+                } else {
+                    nl = (@as(u32, lvl[top]) + 2) & ~@as(u32, 1);
+                }
+                if (nl <= MAX_DEPTH) and (over_iso == 0) and (over_emb == 0) {
+                    valid_iso += 1;
+                    lvl[sp] = @truncate(u8, nl);
+                    ovr[sp] = 0;
+                    iso[sp] = true;
+                    sp += 1;
+                } else {
+                    over_iso += 1;
+                }
+                continue;
+            }
+            if c == PDI {
+                if over_iso > 0 {
+                    over_iso -= 1;
+                } else if valid_iso > 0 {
+                    over_emb = 0;
+                    while not iso[sp - 1] {
+                        sp -= 1;
+                    }
+                    sp -= 1;
+                    valid_iso -= 1;
+                }
+                let tp = sp - 1;
+                self.levels[i] = lvl[tp];
+                if ovr[tp] == 1 {
+                    self.cls[i] = L;
+                } else if ovr[tp] == 2 {
+                    self.cls[i] = R;
+                }
+                continue;
+            }
+            if c == PDF {
+                if over_iso > 0 {
+                    // nothing
+                } else if over_emb > 0 {
+                    over_emb -= 1;
+                } else if not iso[top] and (sp >= 2) {
+                    sp -= 1;
+                }
+                self.levels[i] = lvl[sp - 1];
+                continue;
+            }
+            if c == B {
+                self.levels[i] = self.level;
+                continue;
+            }
+            self.levels[i] = lvl[top];
+            if c == BN {
+                continue;
+            }
+            if ovr[top] == 1 {
+                self.cls[i] = L;
+            } else if ovr[top] == 2 {
+                self.cls[i] = R;
+            }
+        }
+    }
+
+    /// X10, then the weak, neutral and implicit rules per isolating run
+    /// sequence.
+    fn runs(self: *mut Paragraph) !void {
+        let n = self.orig.len;
+        // level runs (of characters that are not removed)
+        let mut run_start = vec.Vec.[usize].init();
+        defer run_start.deinit();
+        let mut run_end = vec.Vec.[usize].init();  // index of the run's last character
+        defer run_end.deinit();
+        let mut i: usize = 0;
+        while i < n {
+            if removed(self.orig[i]) {
+                i += 1;
+                continue;
+            }
+            let lv = self.levels[i];
+            let s = i;
+            let mut last = i;
+            i += 1;
+            while i < n {
+                if removed(self.orig[i]) {
+                    i += 1;
+                    continue;
+                }
+                if self.levels[i] != lv {
+                    break;
+                }
+                last = i;
+                i += 1;
+            }
+            run_start.push(s)!;
+            run_end.push(last)!;
+        }
+        // which run each character starts (for chaining at PDIs)
+        let run_of = mem.alloc.[i64](@max(n, 1))!;
+        defer mem.free(run_of);
+        for k in @as(usize, 0)..n {
+            run_of[k] = -1;
+        }
+        for r in @as(usize, 0)..run_start.len {
+            run_of[run_start.get(r)] = @as(i64, @truncate(u32, r));
+        }
+        let used = mem.alloc_zeroed.[bool](@max(run_start.len, 1))!;
+        defer mem.free(used);
+        let mut seq = vec.Vec.[usize].init();  // the character indices of a sequence
+        defer seq.deinit();
+        for r0 in @as(usize, 0)..run_start.len {
+            if used[r0] {
+                continue;
+            }
+            // a run starting with a PDI that matches an initiator joins that sequence
+            seq.clear();
+            let mut r = r0;
+            loop {
+                used[r] = true;
+                let mut k = run_start.get(r);
+                let e = run_end.get(r);
+                while k <= e {
+                    if not removed(self.orig[k]) {
+                        seq.push(k)!;
+                    }
+                    k += 1;
+                }
+                let last = e;
+                if is_isolate_init(self.orig[last]) and (self.matching[last] >= 0) {
+                    let pdi = @truncate(usize, @bit_cast(u64, self.matching[last]));
+                    let nr = run_of[pdi];
+                    if (nr >= 0) and not used[@truncate(usize, @bit_cast(u64, nr))] {
+                        r = @truncate(usize, @bit_cast(u64, nr));
+                        continue;
+                    }
+                }
+                break;
+            }
+            self.resolve_sequence(seq.items())!;
+        }
+        // removed characters: the level of the character before them (for display)
+        for k in @as(usize, 0)..n {
+            if removed(self.orig[k]) {
+                if k > 0 {
+                    self.levels[k] = self.levels[k - 1];
+                } else {
+                    self.levels[k] = self.level;
+                }
+            }
+        }
+    }
+
+    fn resolve_sequence(self: *mut Paragraph, seq: []usize) !void {
+        if seq.len == 0 {
+            return;
+        }
+        let n = self.orig.len;
+        let first = seq[0];
+        let last = seq[seq.len - 1];
+        let level = self.levels[first];
+        // sos and eos
+        let mut before = self.level;
+        let mut k = first;
+        while k > 0 {
+            k -= 1;
+            if not removed(self.orig[k]) {
+                before = self.emb[k];
+                break;
+            }
+        }
+        let mut after = self.level;
+        if not (is_isolate_init(self.orig[last])) {
+            let mut j = last + 1;
+            while j < n {
+                if not removed(self.orig[j]) {
+                    after = self.emb[j];
+                    break;
+                }
+                j += 1;
+            }
+        }
+        let mut sos = L;
+        if (@max(level, before) & 1) == 1 {
+            sos = R;
+        }
+        let mut eos = L;
+        if (@max(level, after) & 1) == 1 {
+            eos = R;
+        }
+        let c = self.cls;
+        // W1
+        let mut prev = sos;
+        for i in seq {
+            if c[i] == NSM {
+                if is_isolate_init(prev) or (prev == PDI) {
+                    c[i] = ON;
+                } else {
+                    c[i] = prev;
+                }
+            }
+            prev = c[i];
+        }
+        // W2, W3
+        let mut strong = sos;
+        for i in seq {
+            let x = c[i];
+            if (x == L) or (x == R) or (x == AL) {
+                strong = x;
+            } else if (x == EN) and (strong == AL) {
+                c[i] = AN;
+            }
+        }
+        for i in seq {
+            if c[i] == AL {
+                c[i] = R;
+            }
+        }
+        // W4
+        for k2 in @as(usize, 1)..seq.len {
+            if (k2 + 1) >= seq.len {
+                break;
+            }
+            let x = c[seq[k2]];
+            let a = c[seq[k2 - 1]];
+            let b = c[seq[k2 + 1]];
+            if (x == ES) and (a == EN) and (b == EN) {
+                c[seq[k2]] = EN;
+            } else if (x == CS) and (a == EN) and (b == EN) {
+                c[seq[k2]] = EN;
+            } else if (x == CS) and (a == AN) and (b == AN) {
+                c[seq[k2]] = AN;
+            }
+        }
+        // W5: runs of ET next to EN
+        let mut k3: usize = 0;
+        while k3 < seq.len {
+            if c[seq[k3]] != ET {
+                k3 += 1;
+                continue;
+            }
+            let s = k3;
+            while (k3 < seq.len) and (c[seq[k3]] == ET) {
+                k3 += 1;
+            }
+            let touch = ((s > 0) and (c[seq[s - 1]] == EN)) or ((k3 < seq.len) and (c[seq[k3]] == EN));
+            if touch {
+                for m in s..k3 {
+                    c[seq[m]] = EN;
+                }
+            }
+        }
+        // W6
+        for i in seq {
+            let x = c[i];
+            if (x == ES) or (x == ET) or (x == CS) {
+                c[i] = ON;
+            }
+        }
+        // W7
+        strong = sos;
+        for i in seq {
+            let x = c[i];
+            if (x == L) or (x == R) {
+                strong = x;
+            } else if (x == EN) and (strong == L) {
+                c[i] = L;
+            }
+        }
+        // N0: bracket pairs
+        if self.cps.len > 0 {
+            self.brackets(seq, level, sos)!;
+        }
+        // N1, N2
+        let e = if_odd(level);
+        let mut k4: usize = 0;
+        while k4 < seq.len {
+            if not is_ni(c[seq[k4]]) {
+                k4 += 1;
+                continue;
+            }
+            let s = k4;
+            while (k4 < seq.len) and is_ni(c[seq[k4]]) {
+                k4 += 1;
+            }
+            let mut lead = sos;
+            if s > 0 {
+                lead = as_strong(c[seq[s - 1]]);
+            }
+            let mut trail = eos;
+            if k4 < seq.len {
+                trail = as_strong(c[seq[k4]]);
+            }
+            let mut v = e;
+            if (lead == trail) and ((lead == L) or (lead == R)) {
+                v = lead;
+            }
+            for m in s..k4 {
+                c[seq[m]] = v;
+            }
+        }
+        // I1, I2
+        for i in seq {
+            let x = c[i];
+            let lv = self.levels[i];
+            if (lv & 1) == 0 {
+                if x == R {
+                    self.levels[i] = lv + 1;
+                } else if (x == AN) or (x == EN) {
+                    self.levels[i] = lv + 2;
+                }
+            } else if (x == L) or (x == EN) or (x == AN) {
+                self.levels[i] = lv + 1;
+            }
+        }
+    }
+
+    /// N0: brackets take a direction from what they enclose or surround.
+    fn brackets(self: *mut Paragraph, seq: []usize, level: u8, sos: u8) !void {
+        let c = self.cls;
+        // BD16: the pairs, in order of their opening brackets
+        let mut open_pos: [63]usize = [0; 63];
+        let mut open_cp: [63]u32 = [0; 63];
+        let mut depth: usize = 0;
+        let mut pairs = vec.Vec.[[2]usize].init();  // positions in seq
+        defer pairs.deinit();
+        for k in @as(usize, 0)..seq.len {
+            let i = seq[k];
+            if c[i] != ON {
+                continue;
+            }
+            let cp = canonical_bracket(self.cps[i]);
+            let bi = bracket_index(cp);
+            if bi < 0 {
+                continue;
+            }
+            let bx = @truncate(usize, @bit_cast(u64, bi));
+            if t.BRACKET_OPEN[bx] == 1 {
+                if depth == 63 {
+                    break;  // BD16: stop at overflow
+                }
+                open_pos[depth] = k;
+                open_cp[depth] = canonical_bracket(t.BRACKET_PAIR[bx]);
+                depth += 1;
+            } else {
+                // find the matching opener, discarding those above it
+                let mut d = depth;
+                while d > 0 {
+                    d -= 1;
+                    if open_cp[d] == cp {
+                        pairs.push([open_pos[d], k])!;
+                        depth = d;
+                        break;
+                    }
+                }
+            }
+        }
+        // in order of openings
+        let ps = pairs.items();
+        for a in @as(usize, 1)..ps.len {
+            let v = ps[a];
+            let mut b = a;
+            while (b > 0) and (ps[b - 1][0] > v[0]) {
+                ps[b] = ps[b - 1];
+                b -= 1;
+            }
+            ps[b] = v;
+        }
+        let e = if_odd(level);
+        for p in ps {
+            let o = p[0];
+            let cl = p[1];
+            let mut found_e = false;
+            let mut found_o = false;
+            for m in o + 1..cl {
+                let x = as_strong(c[seq[m]]);
+                if x == e {
+                    found_e = true;
+                } else if (x == L) or (x == R) {
+                    found_o = true;
+                }
+            }
+            let mut dir: u8 = 0xff;
+            if found_e {
+                dir = e;
+            } else if found_o {
+                // the context before the opening bracket
+                let mut ctx = sos;
+                let mut m = o;
+                while m > 0 {
+                    m -= 1;
+                    let x = as_strong(c[seq[m]]);
+                    if (x == L) or (x == R) {
+                        ctx = x;
+                        break;
+                    }
+                }
+                if ctx != e {
+                    dir = ctx;
+                } else {
+                    dir = e;
+                }
+            }
+            if dir != 0xff {
+                c[seq[o]] = dir;
+                c[seq[cl]] = dir;
+                // NSMs after a bracket take its new type
+                let mut m = o + 1;
+                while (m < seq.len) and (self.orig[seq[m]] == NSM) {
+                    c[seq[m]] = dir;
+                    m += 1;
+                }
+                m = cl + 1;
+                while (m < seq.len) and (self.orig[seq[m]] == NSM) {
+                    c[seq[m]] = dir;
+                    m += 1;
+                }
+            }
+        }
+    }
+
+    /// The levels of a line [start, end) after rule L1 (whitespace at the
+    /// ends of lines and before separators takes the paragraph level).
+    pub fn line_levels(self: *Paragraph, start: usize, end: usize) ![]mut u8 {
+        let out = mem.alloc.[u8](end - start)!;
+        @mem_copy(out, self.levels[start..end]);
+        let mut trailing = true;
+        let mut k = end;
+        while k > start {
+            k -= 1;
+            let c = self.orig[k];
+            if (c == S) or (c == B) {
+                out[k - start] = self.level;
+                trailing = true;
+                continue;
+            }
+            if trailing and ((c == WS) or is_isolate_init(c) or (c == PDI) or removed(c)) {
+                out[k - start] = self.level;
+                continue;
+            }
+            trailing = false;
+        }
+        return out;
+    }
+
+    /// The characters of a line [start, end) in visual order, left to
+    /// right (L1, L2); removed formatting characters are left out.
+    pub fn visual_order(self: *Paragraph, start: usize, end: usize) ![]mut usize {
+        let lv = self.line_levels(start, end)!;
+        defer mem.free(lv);
+        let mut idx = vec.Vec.[usize].init();
+        let mut lvls = vec.Vec.[u8].init();
+        defer lvls.deinit();
+        for k in start..end {
+            if removed(self.orig[k]) {
+                continue;
+            }
+            idx.push(k) catch |e| {
+                idx.deinit();
+                return e;
+            };
+            lvls.push(lv[k - start]) catch |e| {
+                idx.deinit();
+                return e;
+            };
+        }
+        let order = idx.items();
+        let ls = lvls.items();
+        reorder(order, ls);
+        let out = mem.dup(order[..]) catch |e| {
+            idx.deinit();
+            return e;
+        };
+        idx.deinit();
+        return out;
+    }
+}
+
+/// L2: reverses runs from the highest level down to the lowest odd one.
+pub fn reorder(order: []mut usize, levels: []mut u8) void {
+    let mut hi: u8 = 0;
+    let mut lo_odd: u8 = 255;
+    for l in levels {
+        hi = @max(hi, l);
+        if ((l & 1) == 1) and (l < lo_odd) {
+            lo_odd = l;
+        }
+    }
+    let mut lv = hi;
+    while (lv >= lo_odd) and (lv > 0) {
+        let mut i: usize = 0;
+        while i < levels.len {
+            if levels[i] < lv {
+                i += 1;
+                continue;
+            }
+            let s = i;
+            while (i < levels.len) and (levels[i] >= lv) {
+                i += 1;
+            }
+            // reverse [s, i)
+            let mut a = s;
+            let mut b = i - 1;
+            while a < b {
+                let x = order[a];
+                order[a] = order[b];
+                order[b] = x;
+                let y = levels[a];
+                levels[a] = levels[b];
+                levels[b] = y;
+                a += 1;
+                b -= 1;
+            }
+        }
+        lv -= 1;
+    }
+}
+
+fn empty(n: usize) !Paragraph {
+    let cps = mem.alloc.[u32](n)!;
+    let orig = mem.alloc.[u8](n) catch |e| {
+        mem.free(cps);
+        return e;
+    };
+    let cls = mem.alloc.[u8](n) catch |e| {
+        mem.free(cps);
+        mem.free(orig);
+        return e;
+    };
+    let levels = mem.alloc.[u8](n) catch |e| {
+        mem.free(cps);
+        mem.free(orig);
+        mem.free(cls);
+        return e;
+    };
+    let matching = mem.alloc.[i64](n) catch |e| {
+        mem.free(cps);
+        mem.free(orig);
+        mem.free(cls);
+        mem.free(levels);
+        return e;
+    };
+    let emb = mem.alloc.[u8](n) catch |e| {
+        mem.free(cps);
+        mem.free(orig);
+        mem.free(cls);
+        mem.free(levels);
+        mem.free(matching);
+        return e;
+    };
+    return Paragraph.{ cps: cps, orig: orig, cls: cls, levels: levels, level: 0, matching: matching, emb: emb };
+}
+
+fn if_odd(level: u8) u8 {
+    if (level & 1) == 1 {
+        return R;
+    }
+    return L;
+}
+
+/// EN and AN count as R for the neutral and bracket rules.
+fn as_strong(c: u8) u8 {
+    if (c == EN) or (c == AN) {
+        return R;
+    }
+    return c;
+}
+
+fn canonical_bracket(cp: u32) u32 {
+    if cp == 0x2329 {
+        return 0x3008;
+    }
+    if cp == 0x232a {
+        return 0x3009;
+    }
+    return cp;
+}
+
+fn bracket_index(cp: u32) i64 {
+    let a = t.BRACKET_FROM[..];
+    let mut lo: usize = 0;
+    let mut hi = a.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if a[mid] < cp {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < a.len) and (a[lo] == cp) {
+        return @as(i64, @truncate(u32, lo));
+    }
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+import "../io.ph" as io;
+
+fn read_optional(p: []u8) ![]mut u8 {
+    let f = io.open(p)!;
+    defer f.close();
+    return f.reader().read_all();
+}
+
+fn class_by_name(s: []u8) u8 {
+    let names = t.BIDI_NAMES[..];
+    for k in @as(usize, 0)..names.len {
+        if @mem_eq(names[k], s) {
+            return @truncate(u8, k);
+        }
+    }
+    return 255;
+}
+
+fn parse_uint(s: []u8) usize {
+    let mut v: usize = 0;
+    for c in s {
+        v = (v * 10) + @as(usize, c - '0');
+    }
+    return v;
+}
+
+fn parse_hex(s: []u8) u32 {
+    let mut v: u32 = 0;
+    for c in s {
+        let mut d: u32 = 0;
+        if (c >= '0') and (c <= '9') {
+            d = @as(u32, c - '0');
+        } else if (c >= 'A') and (c <= 'F') {
+            d = @as(u32, c - 'A') + 10;
+        } else if (c >= 'a') and (c <= 'f') {
+            d = @as(u32, c - 'a') + 10;
+        }
+        v = (v * 16) + d;
+    }
+    return v;
+}
+
+/// Checks a paragraph's levels and order against the expected ones (level
+/// 255 for "x": removed).
+fn check(p: *Paragraph, want_levels: []u8, want_order: []usize) !bool {
+    let n = p.orig.len;
+    let lv = p.line_levels(0, n)!;
+    defer mem.free(lv);
+    for k in @as(usize, 0)..n {
+        if want_levels[k] == 255 {
+            continue;
+        }
+        if lv[k] != want_levels[k] {
+            return false;
+        }
+    }
+    let ord = p.visual_order(0, n)!;
+    defer mem.free(ord);
+    if ord.len != want_order.len {
+        return false;
+    }
+    for k in @as(usize, 0)..ord.len {
+        if ord[k] != want_order[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// BidiTest.txt: [cases, failures].
+fn run_bidi_test(file: []u8) ![2]usize {
+    let data = read_optional(file) catch return [@as(usize, 0), 0];
+    defer mem.free(data);
+    let mut cases: usize = 0;
+    let mut failures: usize = 0;
+    let mut levels = vec.Vec.[u8].init();
+    defer levels.deinit();
+    let mut order = vec.Vec.[usize].init();
+    defer order.deinit();
+    let mut lines = strs.lines(data);
+    loop {
+        let raw = lines.next() catch break;
+        let line = strs.trim(raw);
+        if (line.len == 0) or (line[0] == '#') {
+            continue;
+        }
+        if strs.starts_with(line, "@Levels:") {
+            levels.clear();
+            let mut f = strs.fields(line[8..]);
+            loop {
+                let tok = f.next() catch break;
+                if @mem_eq(tok, "x") {
+                    levels.push(255)!;
+                } else {
+                    levels.push(@truncate(u8, parse_uint(tok)))!;
+                }
+            }
+            continue;
+        }
+        if strs.starts_with(line, "@Reorder:") {
+            order.clear();
+            let mut f = strs.fields(line[9..]);
+            loop {
+                let tok = f.next() catch break;
+                order.push(parse_uint(tok))!;
+            }
+            continue;
+        }
+        if line[0] == '@' {
+            continue;
+        }
+        let semi = strs.index_of(line, ";")!;
+        let mut classes = vec.Vec.[u8].init();
+        defer classes.deinit();
+        let mut f = strs.fields(line[..semi]);
+        loop {
+            let tok = f.next() catch break;
+            classes.push(class_by_name(tok))!;
+        }
+        let bits = parse_uint(strs.trim(line[semi + 1..]));
+        let dirs: [3]i32 = [AUTO, LTR, RTL];
+        for k in @as(usize, 0)..3 {
+            if ((bits >> @as(usize, k)) & 1) == 0 {
+                continue;
+            }
+            cases += 1;
+            let mut p = Paragraph.from_classes(classes.items(), dirs[k])!;
+            defer p.deinit();
+            if not check(&p, levels.items(), order.items())! {
+                failures += 1;
+            }
+        }
+    }
+    return [cases, failures];
+}
+
+/// BidiCharacterTest.txt: [cases, failures].
+fn run_char_test(file: []u8) ![2]usize {
+    let data = read_optional(file) catch return [@as(usize, 0), 0];
+    defer mem.free(data);
+    let mut cases: usize = 0;
+    let mut failures: usize = 0;
+    let mut lines = strs.lines(data);
+    loop {
+        let raw = lines.next() catch break;
+        let line = strs.trim(raw);
+        if (line.len == 0) or (line[0] == '#') {
+            continue;
+        }
+        let mut parts = strs.split(line, ";");
+        let f_cps = parts.next()!;
+        let f_dir = parts.next()!;
+        let f_level = parts.next()!;
+        let f_levels = parts.next()!;
+        let f_order = parts.next()!;
+        let mut cps = vec.Vec.[u32].init();
+        defer cps.deinit();
+        let mut f = strs.fields(f_cps);
+        loop {
+            let tok = f.next() catch break;
+            cps.push(parse_hex(tok))!;
+        }
+        let mut want = vec.Vec.[u8].init();
+        defer want.deinit();
+        f = strs.fields(f_levels);
+        loop {
+            let tok = f.next() catch break;
+            if @mem_eq(tok, "x") {
+                want.push(255)!;
+            } else {
+                want.push(@truncate(u8, parse_uint(tok)))!;
+            }
+        }
+        let mut order = vec.Vec.[usize].init();
+        defer order.deinit();
+        f = strs.fields(f_order);
+        loop {
+            let tok = f.next() catch break;
+            order.push(parse_uint(tok))!;
+        }
+        let d = parse_uint(strs.trim(f_dir));
+        let mut dir = AUTO;
+        if d == 0 {
+            dir = LTR;
+        } else if d == 1 {
+            dir = RTL;
+        }
+        cases += 1;
+        let mut p = Paragraph.init(cps.items(), dir)!;
+        defer p.deinit();
+        let ok = (@as(usize, p.level) == parse_uint(strs.trim(f_level))) and check(&p, want.items(), order.items())!;
+        if not ok {
+            failures += 1;
+        }
+    }
+    return [cases, failures];
+}
+
+test "conformance (BidiTest.txt, BidiCharacterTest.txt, when installed)" {
+    let a = run_bidi_test("/usr/share/unicode/BidiTest.txt")!;
+    @expect_eq(a[1], 0);
+    let b = run_char_test("/usr/share/unicode/BidiCharacterTest.txt")!;
+    @expect_eq(b[1], 0);
+}
+
+test "mixed text" {
+    // "abc" then Hebrew alef bet gimel then "1 2"
+    let cps: [9]u32 = ['a', 'b', 'c', ' ', 0x5d0, 0x5d1, 0x5d2, ' ', '1'];
+    let mut p = Paragraph.init(cps[..], AUTO)!;
+    defer p.deinit();
+    @expect_eq(p.level, 0);
+    @expect_eq(p.levels[4], 1);
+    let ord = p.visual_order(0, 9)!;
+    defer mem.free(ord);
+    let want: [9]usize = [0, 1, 2, 3, 8, 7, 6, 5, 4];  // the 1 joins the right-to-left run
+    for k in @as(usize, 0)..9 {
+        @expect_eq(ord[k], want[k]);
+    }
+    let rtl: [3]u32 = [0x5d0, ' ', 'x'];
+    let mut q = Paragraph.init(rtl[..], AUTO)!;
+    defer q.deinit();
+    @expect_eq(q.level, 1);
+}

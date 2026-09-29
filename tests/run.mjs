@@ -240,7 +240,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   if (!filter || name.includes(filter)) {
     const folded = path.join(tmp, 'hot.folded');
     const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ph'), '--format=agent-json', `--folded=${folded}`,
-      ...testTargets, ...testTimeout, ...extraFlags], { encoding: 'utf8' });
+      ...testTargets, ...extraFlags], { encoding: 'utf8' });
     let problem = null;
     let j = null;
     try { j = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
