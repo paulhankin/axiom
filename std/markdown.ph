@@ -39,7 +39,7 @@ import "fs.ph" as fs;
 import "hash.ph" as hash;
 import "io.ph" as io;
 import "map.ph" as maps;
-import "markdown/entities.ph" as ent;
+import "html/entities.ph" as ent;
 import "mem.ph" as mem;
 import "str.ph" as strs;
 import "unicode.ph" as uni;

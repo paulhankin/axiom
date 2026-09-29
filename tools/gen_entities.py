@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# Generates std/markdown/entities.ph: the HTML5 named character references
-# (from Python's html.entities.html5, the WHATWG list), for std/markdown.
+# Generates std/html/entities.ph: the HTML5 named character references
+# (from Python's html.entities.html5, the WHATWG list), for std/html and
+# std/markdown.
 import html.entities
 import os
 import subprocess
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'markdown', 'entities.ph')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'html', 'entities.ph')
 ents = sorted((k[:-1], v) for k, v in html.entities.html5.items() if k.endswith(';'))
 names = ''.join(k for k, _ in ents)
 offs = [0]
@@ -30,6 +31,8 @@ parts = [
     '/// The code points each name stands for (a second one, or 0).',
     arr('FIRST', 'u32', [ord(v[0]) for _, v in ents]),
     arr('SECOND', 'u32', [ord(v[1]) if len(v) > 1 else 0 for _, v in ents]),
+    '/// The names that may also appear without a semicolon (in legacy\n/// content), as sorted indexes.',
+    arr('LEGACY', 'u16', [i for i, (k, _) in enumerate(ents) if k in html.entities.html5]),
 ]
 with open(OUT, 'w') as f:
     f.write('\n\n'.join(parts) + '\n')
