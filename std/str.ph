@@ -700,8 +700,20 @@ pub struct String {
     }
 
     pub fn push_str(self: *mut String, s: []u8) !void {
-        self.reserve(s.len)!;
-        @mem_copy(self.buf[self.len..self.len + s.len], s);
+        if s.len == 0 {
+            return;
+        }
+        // s may be part of this String, which growing moves: copy from where it went
+        let base = @int_from_ptr(self.buf.ptr);
+        let at = @int_from_ptr(s.ptr);
+        if (at >= base) and (at - base < self.buf.len) {
+            let off = at - base;
+            self.reserve(s.len)!;
+            @mem_copy(self.buf[self.len..self.len + s.len], self.buf[off..off + s.len]);
+        } else {
+            self.reserve(s.len)!;
+            @mem_copy(self.buf[self.len..self.len + s.len], s);
+        }
         self.len += s.len;
     }
 
@@ -861,4 +873,13 @@ test "String" {
     defer mem.free(owned);
     @expect_eq(owned.len, 15);
     @expect_eq(s.len, 0);
+}
+
+test "push_str from itself" {
+    let mut s = String.init();
+    defer s.deinit();
+    s.push_str("abcd")!;
+    s.push_str(s.bytes())!;
+    s.push_str(s.bytes()[2..5])!;
+    @expect(eq(s.bytes(), "abcdabcdcda"));
 }

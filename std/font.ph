@@ -84,6 +84,9 @@ pub struct Font {
     cff: Cff,
     is_cff: bool,
     start: usize,  // the table directory (a collection holds several)
+    // the GPOS PairPos subtables of the kern feature, found once at load
+    kern_subs: [MAX_KERN_SUBTABLES]usize,
+    n_kern_subs: usize,
 
     /// A font from the bytes of a font file (the first font of a
     /// collection). The bytes must outlive the Font.
@@ -126,6 +129,8 @@ pub struct Font {
             cff: Cff.{ charstrings: 0, gsubrs: 0, subrs: 0, fdarray: 0, fdselect: 0, base: 0 },
             is_cff: false,
             start: start,
+            kern_subs: [0; MAX_KERN_SUBTABLES],
+            n_kern_subs: 0,
         };
         let n = @as(usize, u16at(data, start + 4));
         let mut head = Table.{ off: 0, len: 0 };
@@ -181,6 +186,9 @@ pub struct Font {
             return error.Unsupported;  // bitmap-only or CFF2 fonts
         }
         f.cmap = choose_cmap(data, cmap);
+        if f.gpos.len > 0 {
+            f.n_kern_subs = gpos_kern_subtables(data, f.gpos, &mut f.kern_subs);
+        }
         return f;
     }
 
@@ -322,8 +330,14 @@ pub struct Font {
     /// The kerning between two glyphs, in font units (GPOS pair
     /// adjustments if the font has them, else the kern table).
     pub fn kerning(self: *Font, left: u32, right: u32) i32 {
-        if self.gpos.len > 0 {
-            return gpos_kern(self.data, self.gpos.off, left, right);
+        if self.n_kern_subs > 0 {
+            for k in @as(usize, 0)..self.n_kern_subs {
+                let r = pair_pos(self.data, self.kern_subs[k], left, right);
+                if r[0] != 0 {
+                    return @truncate(i32, r[1]);
+                }
+            }
+            return 0;
         }
         if self.kern.len > 0 {
             return kern_table(self.data, self.kern.off, left, right);
@@ -795,18 +809,28 @@ fn x_advance(d: []u8, v: usize, f: u32) i32 {
     return i16at(d, v + off);
 }
 
-fn gpos_kern(d: []u8, t: usize, left: u32, right: u32) i32 {
+/// At most this many PairPos subtables serve kerning (fonts have a few).
+const MAX_KERN_SUBTABLES: usize = 32;
+
+/// The PairPos subtables of the GPOS "kern" feature, in lookup order,
+/// without repeats. Counts are clamped to what fits in the table, and the
+/// walk is bounded, whatever the table says.
+fn gpos_kern_subtables(d: []u8, gpos: Table, out: *mut [MAX_KERN_SUBTABLES]usize) usize {
+    let t = gpos.off;
+    let end = gpos.off + gpos.len;
     let features = t + @as(usize, u16at(d, t + 6));
     let lookups = t + @as(usize, u16at(d, t + 8));
-    let nf = @as(usize, u16at(d, features));
-    let nl = @as(usize, u16at(d, lookups));
+    let nf = @min(@as(usize, u16at(d, features)), @sub_sat(end, features) / 6);
+    let nl = @min(@as(usize, u16at(d, lookups)), @sub_sat(end, lookups) / 2);
+    let mut n: usize = 0;
+    let mut budget: usize = 1 << 16;
     for fi in @as(usize, 0)..nf {
         let rec = features + 2 + (6 * fi);
         if not tag_is(d, rec, "kern") {
             continue;
         }
         let ft = features + @as(usize, u16at(d, rec + 4));
-        let count = @as(usize, u16at(d, ft + 2));
+        let count = @min(@as(usize, u16at(d, ft + 2)), @sub_sat(end, ft) / 2);
         for k in @as(usize, 0)..count {
             let li = @as(usize, u16at(d, ft + 4 + (2 * k)));
             if li >= nl {
@@ -814,26 +838,39 @@ fn gpos_kern(d: []u8, t: usize, left: u32, right: u32) i32 {
             }
             let lk = lookups + @as(usize, u16at(d, lookups + 2 + (2 * li)));
             let ty = u16at(d, lk);
-            let nsub = @as(usize, u16at(d, lk + 4));
+            let nsub = @min(@as(usize, u16at(d, lk + 4)), @sub_sat(end, lk) / 2);
             for s in @as(usize, 0)..nsub {
+                if budget == 0 {
+                    return n;
+                }
+                budget -= 1;
                 let mut st = lk + @as(usize, u16at(d, lk + 6 + (2 * s)));
                 let mut sty = ty;
                 if ty == 9 {
                     sty = u16at(d, st + 2);
                     st = st + @as(usize, u32at(d, st + 4));
                 }
-                if sty != 2 {
+                if (sty != 2) or (st >= end) {
                     continue;
                 }
-                let r = pair_pos(d, st, left, right);
-                if r[0] != 0 {
-                    return @truncate(i32, r[1]);
+                let mut dup = false;
+                for j in @as(usize, 0)..n {
+                    if out[j] == st {
+                        dup = true;
+                    }
+                }
+                if not dup {
+                    out[n] = st;
+                    n += 1;
+                    if n == MAX_KERN_SUBTABLES {
+                        return n;
+                    }
                 }
             }
         }
         // on to the next kern feature: scripts may list different lookups
     }
-    return 0;
+    return n;
 }
 
 /// [found, value] for a PairPos subtable.

@@ -169,8 +169,14 @@ fn parse_header(data: []u8, pos: *mut usize) !Header {
             }
             h.xmin = xmin;
             h.ymin = ymin;
-            h.width = @as(usize, @bit_cast(u32, xmax -% xmin)) + 1;
-            h.height = @as(usize, @bit_cast(u32, ymax -% ymin)) + 1;
+            // (in 64 bits: a window can span 2^32 pixels, more than a 32-bit usize holds)
+            let w64 = @as(u64, @bit_cast(u32, xmax -% xmin)) + 1;
+            let h64 = @as(u64, @bit_cast(u32, ymax -% ymin)) + 1;
+            if (w64 > @as(u64, image.MAX_PIXELS)) or (h64 > @as(u64, image.MAX_PIXELS)) {
+                return error.InvalidImage;
+            }
+            h.width = @truncate(usize, w64);
+            h.height = @truncate(usize, h64);
             have_window = true;
         } else if @mem_eq(name, "lineOrder") and (size == 1) {
             h.decreasing = v[0] == 1;
@@ -184,7 +190,8 @@ fn parse_header(data: []u8, pos: *mut usize) !Header {
     if not have_window or (h.nch == 0) or (h.compression == 255) {
         return error.InvalidImage;
     }
-    if (h.width * h.height) > image.MAX_PIXELS {
+    let px = @mul_checked(h.width, h.height) catch return error.InvalidImage;
+    if px > image.MAX_PIXELS {
         return error.InvalidImage;
     }
     if h.compression > PXR24 {
@@ -234,6 +241,17 @@ pub fn decode(data: []u8) !image.Image {
         chans = 1;
         h.channels[0].target = 0;
     }
+    // no compression method expands data more than about 2000 times (the
+    // best case, PIZ's run codes, is ~450): a file too small for the image
+    // it declares is broken, and must not cost gigabytes to find out
+    let mut bpp: usize = 0;
+    for i in @as(usize, 0)..h.nch {
+        bpp += type_size(h.channels[i].kind);
+    }
+    let raw = @mul_checked(h.width * h.height, bpp) catch return error.InvalidImage;
+    if (raw / 2048) > data.len {
+        return error.InvalidImage;
+    }
     let mut img = image.Image.init(h.width, h.height, chans, image.F32)!;
     // gray from R alone etc.: channels not present stay 0; alpha defaults to 1
     if (chans == 4) or (chans == 2) {
@@ -281,14 +299,23 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
     for i in @as(usize, 0)..h.nch {
         bpp += type_size(h.channels[i].kind);
     }
+    // a block is never bigger than the image
     let mut max_w = h.width;
-    let mut max_h = lines;
+    let mut max_h = @min(lines, h.height);
     if h.tiled {
-        max_w = h.tile_w;
-        max_h = h.tile_h;
+        max_w = @min(h.tile_w, h.width);
+        max_h = @min(h.tile_h, h.height);
     }
-    let raw = mem.alloc.[u8]((max_w * max_h) * bpp)!;
+    let rawn = @mul_checked(@mul_checked(max_w, max_h) catch return error.InvalidImage,
+                            bpp) catch return error.InvalidImage;
+    let raw = mem.alloc.[u8](rawn)!;
     defer mem.free(raw);
+    // each block is decoded once at most (the offsets could all point at one)
+    let seen = mem.alloc_zeroed.[u8](nblocks)!;
+    defer mem.free(seen);
+    let tiles_x = (h.width + h.tile_w - 1) / @max(h.tile_w, 1);
+    let mut piz = PizScratch.init(h.compression == PIZ)!;
+    defer piz.deinit();
     for bi in @as(usize, 0)..nblocks {
         let off = le64(data, start + (bi * 8));
         if off > @as(u64, data.len) {
@@ -308,6 +335,14 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
             if (le32(data, p + 8) != 0) or (le32(data, p + 12) != 0) {
                 continue;  // a smaller level
             }
+            if (tx >= tiles_x) or (ty * tiles_x + tx >= nblocks) {
+                return error.InvalidImage;
+            }
+            let block = (ty * tiles_x) + tx;
+            if seen[block] != 0 {
+                return error.InvalidImage;
+            }
+            seen[block] = 1;
             x0 = tx * h.tile_w;
             y0 = ty * h.tile_h;
             if (x0 >= h.width) or (y0 >= h.height) {
@@ -325,6 +360,13 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
                 return error.InvalidImage;
             }
             y0 = @truncate(usize, @bit_cast(u64, yy));
+            if (y0 % lines) != 0 {
+                return error.InvalidImage;
+            }
+            if seen[y0 / lines] != 0 {
+                return error.InvalidImage;
+            }
+            seen[y0 / lines] = 1;
             bh = @min(lines, h.height - y0);
             p += 4;
         }
@@ -359,7 +401,7 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
             if size == n {
                 @mem_copy(out, packed);
             } else {
-                piz_decode(packed, out, h, bw, bh)!;
+                piz_decode(packed, out, h, bw, bh, &mut piz)!;
             }
         }
         store(out, h, img, x0, y0, bw, bh);
@@ -497,15 +539,61 @@ fn store(raw: []u8, h: *Header, img: *mut image.Image, x0: usize, y0: usize, bw:
 const USHORT_RANGE: usize = 65536;
 const BITMAP_SIZE: usize = 8192;
 
-fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !void {
+/// PIZ's tables, allocated once per image (they are large, and a file can
+/// have many small blocks).
+struct PizScratch {
+    bitmap: []mut u8,
+    lut: []mut u16,
+    hcode: []mut u64,
+    dec: []mut HufDec,
+
+    fn init(needed: bool) !PizScratch {
+        let mut p = PizScratch.{
+            bitmap: mem.alloc.[u8](0)!,
+            lut: mem.alloc.[u16](0)!,
+            hcode: mem.alloc.[u64](0)!,
+            dec: mem.alloc.[HufDec](0)!,
+        };
+        if not needed {
+            return p;
+        }
+        p.deinit();
+        p.bitmap = mem.alloc.[u8](BITMAP_SIZE)!;
+        p.lut = mem.alloc.[u16](USHORT_RANGE) catch |e| {
+            mem.free(p.bitmap);
+            return e;
+        };
+        p.hcode = mem.alloc.[u64](HUF_ENCSIZE) catch |e| {
+            mem.free(p.bitmap);
+            mem.free(p.lut);
+            return e;
+        };
+        p.dec = mem.alloc.[HufDec](HUF_DECSIZE) catch |e| {
+            mem.free(p.bitmap);
+            mem.free(p.lut);
+            mem.free(p.hcode);
+            return e;
+        };
+        return p;
+    }
+
+    fn deinit(self: *mut PizScratch) void {
+        mem.free(self.bitmap);
+        mem.free(self.lut);
+        mem.free(self.hcode);
+        mem.free(self.dec);
+    }
+}
+
+fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize, sc: *mut PizScratch) !void {
     if src.len < 4 {
         return error.InvalidImage;
     }
     let min_nz = @as(usize, src[0]) | (@as(usize, src[1]) << 8);
     let max_nz = @as(usize, src[2]) | (@as(usize, src[3]) << 8);
     let mut p: usize = 4;
-    let bitmap = mem.alloc_zeroed.[u8](BITMAP_SIZE)!;
-    defer mem.free(bitmap);
+    let bitmap = sc.bitmap;
+    @mem_set(bitmap, 0);
     if max_nz >= BITMAP_SIZE {
         return error.InvalidImage;
     }
@@ -518,13 +606,16 @@ fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !void 
         p += n;
     }
     // the reverse lookup table
-    let lut = mem.alloc_zeroed.[u16](USHORT_RANGE)!;
-    defer mem.free(lut);
-    let mut k: usize = 0;
-    for i in @as(usize, 0)..USHORT_RANGE {
-        if (i == 0) or ((bitmap[i >> 3] & (@as(u8, 1) << @truncate(u8, i & 7))) != 0) {
-            lut[k] = @truncate(u16, i);
-            k += 1;
+    let lut = sc.lut;
+    lut[0] = 0;
+    let mut k: usize = 1;
+    if min_nz <= max_nz {
+        // (bits outside the bitmap's range are all clear)
+        for i in @max(min_nz * 8, 1)..(max_nz + 1) * 8 {
+            if (bitmap[i >> 3] & (@as(u8, 1) << @truncate(u8, i & 7))) != 0 {
+                lut[k] = @truncate(u16, i);
+                k += 1;
+            }
         }
     }
     let max_value = @truncate(u16, k - 1);
@@ -539,7 +630,7 @@ fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !void 
     let nshorts = out.len / 2;
     let tmp = mem.alloc.[u16](nshorts)!;
     defer mem.free(tmp);
-    huf_uncompress(src[p..p + length], tmp)!;
+    huf_uncompress(src[p..p + length], tmp, sc)!;
     // wavelet decoding, channel by channel (planar in tmp)
     let mut at: usize = 0;
     for c in @as(usize, 0)..h.nch {
@@ -695,7 +786,7 @@ struct BitIn {
     }
 }
 
-fn huf_uncompress(src: []u8, out: []mut u16) !void {
+fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) !void {
     if src.len == 0 {
         if out.len != 0 {
             return error.InvalidImage;
@@ -711,8 +802,8 @@ fn huf_uncompress(src: []u8, out: []mut u16) !void {
     if (im >= HUF_ENCSIZE) or (i_m >= HUF_ENCSIZE) or (im > i_m) {
         return error.InvalidImage;
     }
-    let hcode = mem.alloc_zeroed.[u64](HUF_ENCSIZE)!;
-    defer mem.free(hcode);
+    // (only [im, i_m] is used: every entry there is written below)
+    let hcode = sc.hcode;
     // the code lengths
     let mut bi = BitIn.{ d: src, pos: 20, c: 0, lc: 0 };
     let mut s = im;
@@ -744,7 +835,7 @@ fn huf_uncompress(src: []u8, out: []mut u16) !void {
     let table_end = bi.pos;
     // canonical codes: the longest codes are numerically lowest
     let mut count: [59]u64 = [0; 59];
-    for i in @as(usize, 0)..HUF_ENCSIZE {
+    for i in im..i_m + 1 {
         count[@truncate(usize, hcode[i])] += 1;
     }
     let mut c: u64 = 0;
@@ -755,7 +846,7 @@ fn huf_uncompress(src: []u8, out: []mut u16) !void {
         c = nc;
         i -= 1;
     }
-    for j in @as(usize, 0)..HUF_ENCSIZE {
+    for j in im..i_m + 1 {
         let l = hcode[j];
         if l > 0 {
             hcode[j] = l | (count[@truncate(usize, l)] << 6);
@@ -763,8 +854,8 @@ fn huf_uncompress(src: []u8, out: []mut u16) !void {
         }
     }
     // the decoding table
-    let dec = mem.alloc_zeroed.[HufDec](HUF_DECSIZE)!;
-    defer mem.free(dec);
+    let dec = sc.dec;
+    @mem_set(@cast_slice(u8, dec), 0);
     // first pass: count long codes per prefix
     for sym in im..i_m + 1 {
         let code = hcode[sym] >> 6;

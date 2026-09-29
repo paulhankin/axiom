@@ -16,6 +16,7 @@ import "../base64.ph" as base64;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
+import "../vec.ph" as vec;
 import "ogg.ph" as ogg;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
@@ -333,21 +334,36 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) !void {
                 fill += step;
             }
         }
-        // sort the keys for the slow path (insertion sort: they are nearly sorted)
+        // sort the keys for the slow path (codewords are distinct: prefix-free)
+        let mut sorted = true;
         for i in @as(usize, 1)..used {
-            let key = book.keys[i];
-            let id = book.ids[i];
-            let len = book.lens[i];
-            let mut j = i;
-            while (j > 0) and (book.keys[j - 1] > key) {
-                book.keys[j] = book.keys[j - 1];
-                book.ids[j] = book.ids[j - 1];
-                book.lens[j] = book.lens[j - 1];
-                j -= 1;
+            if book.keys[i - 1] > book.keys[i] {
+                sorted = false;
+                break;
             }
-            book.keys[j] = key;
-            book.ids[j] = id;
-            book.lens[j] = len;
+        }
+        if not sorted {
+            // O(n log n) whatever the order: key << 32 | old position
+            let order = mem.alloc.[u64](used)!;
+            defer mem.free(order);
+            for i in @as(usize, 0)..used {
+                order[i] = (@as(u64, book.keys[i]) << 32) | @as(u64, @truncate(u32, i));
+            }
+            vec.sort(order, less_u64);
+            let ids = mem.alloc.[u32](used)!;
+            defer mem.free(ids);
+            let lens = mem.alloc.[u8](used)!;
+            defer mem.free(lens);
+            for i in @as(usize, 0)..used {
+                let at = @truncate(usize, order[i] & 0xffffffff);
+                ids[i] = book.ids[at];
+                lens[i] = book.lens[at];
+            }
+            for i in @as(usize, 0)..used {
+                book.keys[i] = @truncate(u32, order[i] >> 32);
+                book.ids[i] = ids[i];
+                book.lens[i] = lens[i];
+            }
         }
         // the fast table holds positions in the sorted arrays
         for i in @as(usize, 0)..book.fast.len {
@@ -1707,4 +1723,8 @@ test "decodes like the reference decoder" {
     @expect(@abs(s.get(500, 1) - 0.09827262163162231) < 1e-5);
     @expect(@abs(s.get(1003, 0) - 0.8854621648788452) < 1e-5);
     @expect(@abs(s.get(1003, 1) - -0.11724459379911423) < 1e-5);
+}
+
+fn less_u64(a: u64, b: u64) bool {
+    return a < b;
 }

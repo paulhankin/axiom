@@ -103,6 +103,11 @@ let mut heap_bytes: [32]usize = [0; 32];  // bytes of small objects in use, per 
 let mut pool_lock: u32 = 0;
 let mut wild_lo: usize = 0;  // [wild_lo, wild_hi): memory never used
 let mut wild_hi: usize = 0;
+// [clean, wild_hi) has never been handed out, so it is still zero (as the
+// system gives it); [wild_lo, clean) is memory freed back to the wilderness.
+let mut clean: usize = 0;
+// where the fresh (zero) part of the last block_alloc starts
+let mut fresh_at: usize = 0;
 let mut bins: [160]usize = [0; 160];
 let mut bin_bits: [3]u64 = [0; 3];
 let mut span_cache: usize = 0;
@@ -344,6 +349,7 @@ fn grow(pages: usize) bool {
             retained += rest;
         }
         wild_lo = base;
+        clean = base;
     }
     wild_hi = base + (n * PAGE);
     return true;
@@ -353,6 +359,7 @@ fn grow(pages: usize) bool {
 fn block_alloc(size: usize) usize {
     let mut s = take_free(size);
     if s != 0 {
+        fresh_at = s + size;  // (none of it is known to be zero)
         took(block(s).size);
         let rest = block(s).size - size;
         if rest >= UNIT {
@@ -375,6 +382,8 @@ fn block_alloc(size: usize) usize {
         }
         s = wild_lo;
         wild_lo += size;
+        fresh_at = @max(s, clean);
+        clean = @max(clean, wild_lo);
         let b = block(s);
         b.size = size;
         b.prev_free = 0;
@@ -408,6 +417,7 @@ fn span_take() usize {
         retained += gap;
     }
     wild_lo = a + PAGE;
+    clean = @max(clean, wild_lo);
     let sp = span(a);
     sp.magic = tag(MAGIC_SPAN, a);
     sp.size = PAGE;
@@ -557,12 +567,18 @@ fn small_free(p: usize, c: usize) void {
 // -----------------------------------------------------------------------------
 // Large objects
 // -----------------------------------------------------------------------------
+/// Requests beyond what any machine has fail (with OutOfMemory) before
+/// their sizes are rounded, binned or added to (which could overflow).
+fn too_big(size: usize) bool {
+    return (size > (@max_value(usize) / 2)) or (@as(u64, size) > (@as(u64, 1) << 40));
+}
+
 fn block_size_for(size: usize) usize {
     return ((size + HDR) + UNIT - 1) & ~(UNIT - 1);
 }
 
 fn large_alloc(size: usize) usize {
-    if size > (@max_value(usize) / 2) {
+    if too_big(size) {
         return 0;
     }
     let bs = block_size_for(size);
@@ -576,6 +592,32 @@ fn large_alloc(size: usize) usize {
         return 0;
     }
     return s + HDR;
+}
+
+/// A large object whose bytes are all zero: only the part that is not
+/// fresh from the system needs clearing (so a huge zeroed buffer costs
+/// nothing until it is used).
+fn large_alloc_zeroed(size: usize) usize {
+    if too_big(size) {
+        return 0;
+    }
+    let bs = block_size_for(size);
+    pool_enter();
+    let s = block_alloc(bs);
+    let f = fresh_at;
+    if s != 0 {
+        large_bytes += block(s).size;
+    }
+    pool_leave();
+    if s == 0 {
+        return 0;
+    }
+    let p = s + HDR;
+    if f > p {
+        let n = @min(f - p, size);
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, p), n), 0);
+    }
+    return p;
 }
 
 fn large_check(s: usize) void {
@@ -595,6 +637,9 @@ fn large_free(p: usize) void {
 
 // Resizes the large object at p in place if it can; true if it did.
 fn large_resize(p: usize, size: usize) bool {
+    if too_big(size) {
+        return false;
+    }
     let s = p - HDR;
     let need = block_size_for(size);
     pool_enter();
@@ -1108,7 +1153,7 @@ fn as_total(size: usize) usize {
 }
 
 fn asan_alloc(size: usize) usize {
-    if size == 0 {
+    if (size == 0) or too_big(size) {
         return 0;
     }
     as_enter();
@@ -1421,6 +1466,14 @@ pub fn alloc[T](n: usize) ![]mut T {
 
 /// `n` values of type T, every byte zero.
 pub fn alloc_zeroed[T](n: usize) ![]mut T {
+    let bytes = @mul_checked(n, @size_of(T)) catch return error.OutOfMemory;
+    if (bytes > SMALL_MAX) and not @sanitize_address() {
+        let p = large_alloc_zeroed(bytes);
+        if p == 0 {
+            return error.OutOfMemory;
+        }
+        return @slice_from_ptr(@ptr_from_int(*mut T, p), n);
+    }
     let s = alloc.[T](n)!;
     @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, s.ptr), n * @size_of(T)), 0);
     return s;
@@ -1659,4 +1712,41 @@ test "freeing a large block twice traps" expect trap {
 test "freeing what did not come from alloc traps" expect trap {
     let big = alloc.[u8](200000)!;
     free(big[70000..70016]);
+}
+
+test "huge requests fail cleanly" {
+    @expect(huge_fails((@max_value(usize) / 2) + 1));
+    @expect(huge_fails(@max_value(usize) - 10));
+    let a = alloc.[u8](100000)!;
+    let r = realloc(a, @max_value(usize) - 10) catch {
+        free(a);
+        return;
+    };
+    free(r);
+    @expect(false);
+}
+
+fn huge_fails(n: usize) bool {
+    let a = alloc.[u8](n) catch return true;
+    free(a);
+    return false;
+}
+
+test "zeroed memory is zero, fresh or reused" {
+    for round in @as(usize, 0)..3 {
+        let a = alloc.[u8](200000)!;
+        @mem_set(a, 0xab);
+        free(a);
+        let z = alloc_zeroed.[u8](200000 + round)!;
+        for b in z {
+            @expect_eq(b, 0);
+        }
+        @mem_set(z, 0xcd);
+        free(z);
+        let big = alloc_zeroed.[u64](1 << 20)!;
+        @expect_eq(big[0], 0);
+        @expect_eq(big[big.len - 1], 0);
+        @expect_eq(big[12345], 0);
+        free(big);
+    }
 }

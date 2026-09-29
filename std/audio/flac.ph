@@ -29,7 +29,7 @@ pub const FAST: u32 = 0;
 pub const DEFAULT: u32 = 5;
 pub const BEST: u32 = 8;
 
-const MAX_BLOCK: usize = 65535;
+const MAX_BLOCK: usize = 65536;  // (a frame header can say 65536)
 const MAX_LPC: usize = 32;
 
 /// Where the "fLaC" marker is (after an ID3v2 tag, if any), or none.
@@ -548,9 +548,11 @@ pub fn decode(data: []u8) !audio.Sound {
     }
     let format = format_for(info.bps);
     let nch = info.channels;
+    // the declared length sizes the buffer, within reason: a tiny file can
+    // claim a billion samples (it grows as frames really arrive)
     let mut cap: usize = 4096;
     if (info.total > 0) and (info.total < @as(u64, audio.MAX_SAMPLES)) {
-        cap = @truncate(usize, info.total);
+        cap = @min(@truncate(usize, info.total), 1 << 20);
     }
     let mut s = audio.Sound.init(cap, nch, info.rate, format)!;
     decode_frames(data, p, &info, &mut s) catch |e| {

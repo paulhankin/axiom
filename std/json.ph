@@ -200,7 +200,7 @@ struct Arena {
             };
             return big;
         }
-        let size = @min(@max(self.cur.len * 2, 4096), 1048576);
+        let size = @max(@min(@max(self.cur.len * 2, 4096), 1048576), n);
         let c = mem.alloc.[u8](size)!;
         self.chunks.push(c) catch |e| {
             mem.free(c);
@@ -1076,4 +1076,32 @@ test "a larger document" {
     let again = stringify(doc.root)!;
     defer mem.free(again);
     @expect_eq(again, s.bytes());
+}
+
+test "values of every size" {
+    // arrays and strings of 4 KiB to 16 KiB land in the arena's chunks
+    for n in @as(usize, 1)..40 {
+        let mut t = strs.String.init();
+        defer t.deinit();
+        t.push_str("[")!;
+        for i in @as(usize, 0)..n * 25 {
+            if i > 0 {
+                t.push(',')!;
+            }
+            t.push('0')!;
+        }
+        t.push_str("], \"")!;
+        for _i in @as(usize, 0)..n * 300 {
+            t.push('x')!;
+        }
+        t.push_str("\"]")!;
+        let mut src = strs.String.init();
+        defer src.deinit();
+        src.push('[')!;
+        src.push_str(t.bytes())!;
+        let mut doc = parse(src.bytes())!;
+        defer doc.deinit();
+        @expect_eq(doc.root.at(0)!.len(), n * 25);
+        @expect_eq(doc.root.at(1)!.len(), n * 300);
+    }
 }

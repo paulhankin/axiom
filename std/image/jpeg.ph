@@ -124,6 +124,9 @@ let DEZIGZAG: [80]u8 = [
 
 const FAST_BITS: u32 = 9;
 
+/// More scans than this is not a real image (progressive files use a dozen or so).
+const MAX_SCANS: usize = 256;
+
 struct Huffman {
     fast: [512]u8,  // by the next 9 bits: the code's index, or 255
     code: [256]u16,
@@ -205,6 +208,8 @@ struct Decoder {
     code_bits: u32,
     marker: u8,  // a marker met inside entropy-coded data, or 0
     nomore: bool,
+    fake: usize,  // zero bytes supplied past the end of the scan's data
+    scans: usize,
     // frame
     width: usize,
     height: usize,
@@ -249,7 +254,9 @@ struct Decoder {
     fn grow_buffer(self: *mut Decoder) void {
         while self.code_bits <= 24 {
             let mut b: u32 = 0;
-            if not self.nomore {
+            if self.nomore {
+                self.fake += 1;
+            } else {
                 b = @as(u32, self.get8());
                 if b == 0xff {
                     let mut c = self.get8();
@@ -334,6 +341,7 @@ struct Decoder {
         self.code_bits = 0;
         self.code_buffer = 0;
         self.nomore = false;
+        self.fake = 0;
         for i in @as(usize, 0)..self.ncomp {
             self.comp[i].dc_pred = 0;
         }
@@ -535,6 +543,11 @@ struct Decoder {
 
     /// Counts down the restart interval; false once the scan has ended.
     fn after_mcu(self: *mut Decoder) !bool {
+        // a scan whose data ran out long ago is over (a truncated or
+        // hostile file must not cost a full decode per scan)
+        if self.fake > 1024 {
+            return false;
+        }
         self.todo -= 1;
         if self.todo == 0 {
             if self.code_bits < 24 {
@@ -682,6 +695,19 @@ struct Decoder {
             };
             self.hmax = @max(self.hmax, h);
             self.vmax = @max(self.vmax, v);
+        }
+        // every block costs at least a bit (its DC code in the first scan), so
+        // a file too small for the frame it declares is broken: stop before
+        // allocating and decoding gigabytes for it
+        let px = @mul_checked(self.width, self.height) catch return error.InvalidImage;
+        if (px / 512) > self.data.len {
+            return error.InvalidImage;
+        }
+        // (as libjpeg: fractional sampling ratios are not supported)
+        for i in @as(usize, 0)..self.ncomp {
+            if ((self.hmax % self.comp[i].h) != 0) or ((self.vmax % self.comp[i].v) != 0) {
+                return error.Unsupported;
+            }
         }
         self.mcux = (self.width + (8 * self.hmax) - 1) / (8 * self.hmax);
         self.mcuy = (self.height + (8 * self.vmax) - 1) / (8 * self.vmax);
@@ -938,6 +964,10 @@ pub fn decode(data: []u8) !image.Image {
             }
             d.restart_interval = (@as(usize, s[0]) << 8) | @as(usize, s[1]);
         } else if m == 0xda {
+            d.scans += 1;
+            if d.scans > MAX_SCANS {
+                return error.InvalidImage;
+            }
             d.read_sos(d.segment()!)!;
             d.decode_scan()!;
         } else if m == 0xee {

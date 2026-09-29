@@ -99,8 +99,21 @@ pub struct Vec[T] {
     }
 
     pub fn extend(self: *mut Self, xs: []T) !void {
-        self.reserve(xs.len)!;
-        @mem_copy(self.buf[self.len..self.len + xs.len], xs);
+        if xs.len == 0 {
+            return;
+        }
+        // xs may be part of this Vec, which growing moves: copy from where it went
+        let base = @int_from_ptr(self.buf.ptr);
+        let at = @int_from_ptr(xs.ptr);
+        let size = @max(@size_of(T), 1);
+        if (at >= base) and ((at - base) / size < self.buf.len) {
+            let off = (at - base) / size;
+            self.reserve(xs.len)!;
+            @mem_copy(self.buf[self.len..self.len + xs.len], self.buf[off..off + xs.len]);
+        } else {
+            self.reserve(xs.len)!;
+            @mem_copy(self.buf[self.len..self.len + xs.len], xs);
+        }
         self.len += xs.len;
     }
 
@@ -291,4 +304,20 @@ test "sort and binary_search" {
     reverse(xs[..]);
     @expect_eq(xs[0], 9);
     @expect_eq(index_of(xs[..], -7)!, 8);
+}
+
+test "extend from itself" {
+    let mut v = Vec.[u32].init();
+    defer v.deinit();
+    for i in @as(u32, 0)..4 {
+        v.push(100 + i)!;
+    }
+    // growing moves the buffer the argument points into
+    v.extend(v.items())!;
+    v.extend(v.items()[1..3])!;
+    let want: [10]u32 = [100, 101, 102, 103, 100, 101, 102, 103, 101, 102];
+    @expect_eq(v.len, 10);
+    for k in @as(usize, 0)..10 {
+        @expect_eq(v.get(k), want[k]);
+    }
 }
