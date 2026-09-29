@@ -26,7 +26,8 @@ and a type that owns memory has `deinit`).
 | [`os`](os.ph) | The process: `args`/`arg`/`arg_count`, `getenv`/`has_env`, `exit` |
 | [`log`](log.ph) | Structured logging: levels (`DEBUG`, `INFO`, `WARN`, `ERROR`), typed key-value fields, text (logfmt) or JSON lines, `Logger` with its own fields (`with`), a default logger (`log.info(...)`, `set_level`, `level_from_env`), size-rotated log files (`open_file`); whole lines, safe across threads |
 | [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
-| [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
+| [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `Condvar` (with timeouts), `RwLock` (writer-preferring), `Semaphore`, `Once`, `Barrier`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
+| [`pool`](pool.ph) | A thread pool: `submit(f, arg)` → `Future[A, R]` (`join`, `done`), fire-and-forget `run`, `wait` for all |
 | [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
 | [`net`](net.ph) | TCP: `connect`, `listen` → `TcpStream` / `TcpListener` (with `io.Reader`/`io.Writer` adapters, timeouts); IPv4 parsing/formatting |
 | [`str`](str.ph) | Strings as `[]u8`: comparison, search, `trim`, `cut`, `split` / `lines` / `fields` iterators, ASCII case, `join` / `replace`, UTF-8 (`decode_rune`, `encode_rune`, `valid_utf8`, `runes`); `String`, a growable string with a `Writer` |
