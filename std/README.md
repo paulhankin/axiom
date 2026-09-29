@@ -148,8 +148,9 @@ They call a small set of host functions imported from module `"phalange"`:
 | `ph_open(path, len, flags) i32`, `ph_close(fd)` | `flags`: `0` read, `1` create/truncate, `2` append |
 | `ph_seek(fd, off, whence) i64` | moves a file's position (`whence`: `0` start, `1` current, `2` end); returns the new position |
 | `ph_stat(path, len, follow, out) i32` | `out[0..4]` (`i64`): kind (`1` file, `2` directory, `3` symbolic link, `4` other), size, modification time in ns, permission bits; `follow = 0` does not follow a final symbolic link |
-| `ph_mkdir(path, len) i32`, `ph_remove(path, len, dir) i32`, `ph_rename(from, flen, to, tlen) i32` | `dir = 1` removes an (empty) directory |
+| `ph_mkdir(path, len, mode) i32`, `ph_remove(path, len, dir) i32`, `ph_rename(from, flen, to, tlen) i32` | `mode`: permission bits for the new directory; `dir = 1` removes an (empty) directory |
 | `ph_readdir(path, len, buf, cap) isize` | the entries (not `.`, `..`) as a kind byte (`0` unknown), the name and a `0` byte each; returns the bytes needed, which may exceed `cap` |
+| `ph_dir_open(dir, name, len) i32`, `ph_dir_read(dir, buf, cap) isize`, `ph_dir_remove(dir, name, len, isdir) i32`, `ph_dir_close(dir)` | directory handles (`dir = -1`: the working directory) for walking trees: opening never follows a symbolic link (`-40`) and fails with `-20` on a non-directory; the entries are as `ph_readdir`'s. The JavaScript host keeps paths, so it cannot stop a link swapped in meanwhile |
 | `ph_getcwd(buf, cap) isize` | the working directory; returns its length |
 | `ph_argc() i32`, `ph_arg(i, buf, cap) isize` | the program's arguments (argument 0 is its name); returns the length |
 | `ph_getenv(name, len, buf, cap) isize` | an environment variable; `-2` if unset |

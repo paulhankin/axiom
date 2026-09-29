@@ -404,9 +404,26 @@ fn fit(cs: []Cell, a: usize, bs: []usize, bi: *mut usize, width: f64, tab: f64) 
     }
     let mut best: usize = 0;
     let mut k = bi.*;
+    // the width of [a, b) without trailing white space, carried forward
+    // break by break (recomputing it from a each time is quadratic)
+    let mut x: f64 = 0.0;        // pen position after cells [a, done)
+    let mut visible: f64 = 0.0;  // x after the last cell that is not trailing space
+    let mut done = a;
     while k < bs.len {
         let b = bs[k];
-        if visible_width(cs, a, b, tab) > width {
+        while done < b {
+            let c = cs[done];
+            if (c.cp == '\t') and (tab > 0.0) {
+                x = (@floor(x / tab) + 1.0) * tab;
+            } else {
+                x += c.advance;
+            }
+            if not (trailing_space(c.cp) or is_newline(c.cp)) {
+                visible = x;
+            }
+            done += 1;
+        }
+        if visible > width {
             break;
         }
         best = b;

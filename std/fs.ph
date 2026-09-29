@@ -32,6 +32,10 @@ import host "phalange" {
     fn ph_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
     fn ph_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
     fn ph_getcwd(buf: *mut u8, cap: usize) isize;
+    fn ph_dir_open(dir: i32, name: *u8, len: usize) i32;
+    fn ph_dir_read(dir: i32, buf: *mut u8, cap: usize) isize;
+    fn ph_dir_remove(dir: i32, name: *u8, len: usize, isdir: u32) i32;
+    fn ph_dir_close(dir: i32) void;
 }
 
 /// Kinds of file.
@@ -220,6 +224,11 @@ pub fn remove(p: []u8) !void {
 
 /// Removes p and, if it is a directory, everything in it (symbolic links
 /// are removed, not followed). Fine if p does not exist.
+///
+/// Directories are opened relative to their parents without following
+/// symbolic links, so replacing one with a link while this runs cannot
+/// make it remove files elsewhere (except on the JavaScript host, which
+/// has no way to do that).
 pub fn remove_all(p: []u8) !void {
     let i = lstat(p) catch |e| {
         if e == error.NotFound {
@@ -228,15 +237,60 @@ pub fn remove_all(p: []u8) !void {
         return e;
     };
     if i.kind == DIR {
-        let mut d = read_dir(p)!;
-        defer d.deinit();
-        for e in d.entries.items() {
-            let child = path.join2(p, e.name)!;
-            defer mem.free(child);
-            remove_all(child)!;
+        let h = ph_dir_open(-1, p.ptr, p.len);
+        if h >= 0 {
+            defer ph_dir_close(h);
+            empty_dir(h)!;
+        } else if (h != -20) and (h != -40) {
+            return fail(@as(i64, h));
         }
     }
-    remove(p)!;
+    remove(p) catch |e| {
+        if e == error.NotFound {
+            return;
+        }
+        return e;
+    };
+}
+
+// Removes everything in the open directory h.
+fn empty_dir(h: i32) !void {
+    let mut d = read_dir_at(h)!;
+    defer d.deinit();
+    for e in d.entries.items() {
+        remove_at(h, e.name, e.kind)!;
+    }
+}
+
+// Removes the entry `name` of the open directory h, and what is in it.
+fn remove_at(h: i32, name: []u8, kind: u8) !void {
+    if (kind == DIR) or (kind == 0) {
+        let c = ph_dir_open(h, name.ptr, name.len);
+        if c >= 0 {
+            let r = empty_dir(c);
+            ph_dir_close(c);
+            r!;
+            let q = ph_dir_remove(h, name.ptr, name.len, 1);
+            if (q < 0) and (q != -2) {
+                return fail(@as(i64, q));
+            }
+            return;
+        }
+        if c == -2 {
+            return;
+        }
+        if (c != -20) and (c != -40) {
+            return fail(@as(i64, c));
+        }
+    }
+    // a file or link (or a directory that was one a moment ago)
+    let r = ph_dir_remove(h, name.ptr, name.len, 0);
+    if r == -21 {
+        return remove_at(h, name, DIR);
+    }
+    if (r < 0) and (r != -2) {
+        return fail(@as(i64, r));
+    }
 }
 
 /// Moves (renames) a file or directory, replacing a file at `to`.
@@ -269,10 +323,24 @@ fn entry_less(a: Entry, b: Entry) bool {
 
 /// The entries of the directory at p.
 pub fn read_dir(p: []u8) !Dir {
+    return entries_of(p, -1);
+}
+
+// The entries of the open directory h.
+fn read_dir_at(h: i32) !Dir {
+    return entries_of("", h);
+}
+
+fn entries_of(p: []u8, h: i32) !Dir {
     let mut cap: usize = 4096;
     loop {
         let buf = mem.alloc.[u8](cap)!;
-        let n = ph_readdir(p.ptr, p.len, buf.ptr, buf.len);
+        let mut n: isize = 0;
+        if h < 0 {
+            n = ph_readdir(p.ptr, p.len, buf.ptr, buf.len);
+        } else {
+            n = ph_dir_read(h, buf.ptr, buf.len);
+        }
         if n < 0 {
             mem.free(buf);
             return fail(@as(i64, n));
@@ -387,10 +455,26 @@ pub fn make_temp_dir(prefix: []u8) ![]mut u8 {
 /// call) and returns whether to go into it, if it is a directory.
 /// Symbolic links are reported, not followed.
 pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, u8) bool) !void {
-    let mut d = read_dir(root)!;
+    // "root/." so that a root that is a link to a directory is followed
+    let mut dot = mem.alloc.[u8](root.len + 2)!;
+    defer mem.free(dot);
+    @mem_copy(dot[..root.len], root);
+    dot[root.len] = '/';
+    dot[root.len + 1] = '.';
+    let h = ph_dir_open(-1, dot.ptr, dot.len);
+    if h < 0 {
+        return fail(@as(i64, h));
+    }
+    defer ph_dir_close(h);
+    return walk_at(h, root, ctx, visit);
+}
+
+// walk, for the open directory h, whose path is `at`.
+fn walk_at[C](h: i32, at: []u8, ctx: C, visit: fn(C, []u8, u8) bool) !void {
+    let mut d = read_dir_at(h)!;
     defer d.deinit();
     for e in d.entries.items() {
-        let child = path.join2(root, e.name)!;
+        let child = path.join2(at, e.name)!;
         defer mem.free(child);
         let mut kind = e.kind;
         if kind == 0 {
@@ -398,7 +482,16 @@ pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, u8) bool) !void {
             kind = i.kind;
         }
         if visit(ctx, child, kind) and (kind == DIR) {
-            walk(child, ctx, visit)!;
+            let c = ph_dir_open(h, e.name.ptr, e.name.len);
+            if c < 0 {
+                if (c == -2) or (c == -20) or (c == -40) {
+                    continue;  // gone or replaced meanwhile
+                }
+                return fail(@as(i64, c));
+            }
+            let r = walk_at(c, child, ctx, visit);
+            ph_dir_close(c);
+            r!;
         }
     }
 }

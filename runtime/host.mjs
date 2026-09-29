@@ -296,11 +296,28 @@ export function createHost(opts = {}) {
   const shared = opts.shared || { args: opts.args || [], pos: new SharedArrayBuffer(POS_FDS * 8) };
   const programArgs = shared.args;
   const pos = new SharedPositions(shared.pos);
-  const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39 })[e && e.code] || -1;
+  const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, ELOOP: -40 })[e && e.code] || -1;
+  // Directory handles (see ph_dir_open). Node has no openat, so these hold
+  // paths: a symbolic link swapped in between lstat and use is followed.
+  const dirs = new Map();
+  let nextDir = 1;
+  const dirPath = (d, name) => (d < 0 ? name : dirs.get(d) + '/' + name);
   // Copies `buf` to p[0..cap] if it fits; returns its length.
   const give = (buf, p, cap) => {
     if (buf.length <= Number(cap)) bytes(Number(p), buf.length).set(buf);
     return buf.length;
+  };
+  const readdirPath = (dir, out, cap) => {
+    try {
+      const parts = [];
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const kind = e.isFile() ? 1 : e.isDirectory() ? 2 : e.isSymbolicLink() ? 3 : 4;
+        parts.push(Buffer.from([kind]), Buffer.from(e.name, 'utf8'), Buffer.from([0]));
+      }
+      return give(Buffer.concat(parts), out, cap);
+    } catch (e) {
+      return fsErr(e);
+    }
   };
   const phalange = {
     ph_write(fd, p, n) {
@@ -382,18 +399,37 @@ export function createHost(opts = {}) {
     ph_rename(a, an, b, bn) {
       try { fs.renameSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_readdir(p, n, out, cap) {
+    ph_readdir(p, n, out, cap) { return readdirPath(str(p, n), out, cap); },
+    ph_dir_open(d, p, n) {
       try {
-        const parts = [];
-        for (const e of fs.readdirSync(str(p, n), { withFileTypes: true })) {
-          const kind = e.isFile() ? 1 : e.isDirectory() ? 2 : e.isSymbolicLink() ? 3 : 4;
-          parts.push(Buffer.from([kind]), Buffer.from(e.name, 'utf8'), Buffer.from([0]));
-        }
-        return give(Buffer.concat(parts), out, cap);
+        if (d >= 0 && !dirs.has(d)) return -1;
+        const full = dirPath(d, str(p, n));
+        const st = fs.lstatSync(full);
+        if (st.isSymbolicLink()) return -40;
+        if (!st.isDirectory()) return -20;
+        const h = nextDir++;
+        dirs.set(h, full);
+        return h;
       } catch (e) {
         return fsErr(e);
       }
     },
+    ph_dir_read(d, out, cap) {
+      if (!dirs.has(d)) return -1;
+      return readdirPath(dirs.get(d), out, cap);
+    },
+    ph_dir_remove(d, p, n, dir) {
+      try {
+        if (d >= 0 && !dirs.has(d)) return -1;
+        const full = dirPath(d, str(p, n));
+        if (dir) fs.rmdirSync(full);
+        else fs.unlinkSync(full);
+        return 0;
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
+    ph_dir_close(d) { dirs.delete(d); },
     ph_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
     ph_argc: () => programArgs.length,
     ph_arg(i, p, cap) {

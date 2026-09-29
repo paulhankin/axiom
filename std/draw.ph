@@ -611,15 +611,20 @@ fn rasterize[C](
                 if c.len < 2 {
                     continue;
                 }
-                // sort by x (insertion: the lists are short and nearly sorted)
-                for i in @as(usize, 1)..c.len {
-                    let v = c[i];
-                    let mut k = i;
-                    while (k > 0) and (c[k - 1].x > v.x) {
-                        c[k] = c[k - 1];
-                        k -= 1;
+                // sort by x (insertion when the lists are short, as they
+                // usually are; many crossings on a line get O(n log n))
+                if c.len > 32 {
+                    vec.sort(c, crossing_less);
+                } else {
+                    for i in @as(usize, 1)..c.len {
+                        let v = c[i];
+                        let mut k = i;
+                        while (k > 0) and (c[k - 1].x > v.x) {
+                            c[k] = c[k - 1];
+                            k -= 1;
+                        }
+                        c[k] = v;
                     }
-                    c[k] = v;
                 }
                 let mut wind: i32 = 0;
                 for i in @as(usize, 0)..c.len - 1 {
@@ -855,20 +860,41 @@ fn dedupe(xs: []f64, out: *mut vec.Vec.[f64]) !void {
     }
 }
 
+fn crossing_less(a: Crossing, b: Crossing) bool {
+    return a.x < b.x;
+}
+
 /// Splits a polyline into its dashes, stroking each.
 fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) !void {
     let dash = sk.style.dash;
     let mut total: f64 = 0.0;
+    let mut valid = true;
     for d in dash {
+        // (a negative, infinite or NaN length is not a pattern: solid)
+        if not (d >= 0.0) or not (d < 1.0e300) {
+            valid = false;
+        }
         total += @max(d, 0.0);
     }
-    if not (total > 0.0) {
+    if not valid or not (total > 0.0) {
         return sk.polyline(xs, closed);
     }
     let n = xs.len / 2;
     let mut nseg = n - 1;
     if closed {
         nseg = n;
+    }
+    // a pattern too fine for the path (millions of dashes, or lengths that
+    // do not move the position in floating point) is drawn solid
+    let mut path_len: f64 = 0.0;
+    for i in @as(usize, 0)..nseg {
+        let j = (i + 1) % n;
+        let dx = xs[2 * j] - xs[2 * i];
+        let dy = xs[(2 * j) + 1] - xs[(2 * i) + 1];
+        path_len += @sqrt((dx * dx) + (dy * dy));
+    }
+    if not ((path_len / total) * @float_from_int(f64, dash.len) < 1.0e6) or (total < (path_len * 1.0e-12)) {
+        return sk.polyline(xs, closed);
     }
     // where in the pattern the line starts
     let mut phase = @rem(sk.style.dash_offset, total);

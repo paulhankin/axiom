@@ -28,7 +28,10 @@
 // starting at the leftmost position, the one a backtracking engine would
 // find first is chosen (leftmost-first, as in Perl, RE2 and Go). The
 // matcher is a Pike VM: time is proportional to the length of the text
-// times the size of the pattern, whatever either contains.
+// times the size of the pattern, whatever either contains. (Each search
+// is linear; find_all and replace_all search again after each match, so
+// like RE2's, they can take time quadratic in the text for patterns such
+// as `a*b|a` on long runs of a.)
 // =============================================================================
 
 import "mem.ph" as mem;
@@ -779,6 +782,10 @@ struct Compiler {
     p: *Parser,
     prog: vec.Vec.[Inst],
     reverse: bool,  // for the reversed text: concatenations backwards, no captures
+    // (repetitions of empty things emit nothing, and stacked ones nest:
+    // bound the work and the recursion, not just the instructions)
+    work: usize,
+    depth: u32,
 
     fn emit(self: *mut Compiler, op: u8, a: u32, b: u32) !u32 {
         if self.prog.len >= MAX_PROGRAM {
@@ -801,6 +808,17 @@ struct Compiler {
     }
 
     fn compile(self: *mut Compiler, ni: u32) !void {
+        self.work += 1;
+        if (self.work > (4 * MAX_PROGRAM)) or (self.depth >= 1000) {
+            return error.TooBig;
+        }
+        self.depth += 1;
+        let r = self.compile_node(ni);
+        self.depth -= 1;
+        return r;
+    }
+
+    fn compile_node(self: *mut Compiler, ni: u32) !void {
         let n = self.p.nodes.get(@as(usize, ni));
         match n.kind {
             0 => {}
@@ -1268,7 +1286,7 @@ pub fn compile_with(pattern: []u8, info: *mut ErrorInfo) !Regex {
     };
     defer p.nodes.deinit();
     defer p.kids.deinit();
-    let mut c = Compiler.{ p: &p, prog: vec.Vec.[Inst].init(), reverse: false };
+    let mut c = Compiler.{ p: &p, prog: vec.Vec.[Inst].init(), reverse: false, work: 0, depth: 0 };
     let re = build(&mut p, &mut c, pat) catch |e| {
         info.offset = p.i;
         info.message = p.message;
@@ -1320,7 +1338,7 @@ fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) !Regex {
         }
     }
     if plain {
-        let mut rc = Compiler.{ p: p, prog: vec.Vec.[Inst].init(), reverse: true };
+        let mut rc = Compiler.{ p: p, prog: vec.Vec.[Inst].init(), reverse: true, work: 0, depth: 0 };
         rc.compile(root) catch |e| {
             rc.prog.deinit();
             re.forget_parts();
@@ -1706,6 +1724,8 @@ fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) !
 // -----------------------------------------------------------------------------
 
 const DFA_MAX_STATES: usize = 4096;
+// (and at most this many program counters in all its states: 16 MiB)
+const DFA_MAX_PCS: usize = 1 << 22;
 
 /// The DFAs of a Regex. The lock keeps threads that share the Regex from
 /// using them at once (a thread that finds them busy uses the Pike VM).
@@ -1836,7 +1856,7 @@ struct Dfa {
             }
             b = (b + 1) & mask;
         }
-        if self.states.len >= DFA_MAX_STATES {
+        if (self.states.len >= DFA_MAX_STATES) or ((self.pcs.len + list.len) > DFA_MAX_PCS) {
             return error.TooBig;
         }
         let idx = self.states.len;
@@ -2215,4 +2235,23 @@ test "find_all and replace" {
         total += m.end - m.start;
     }
     @expect_eq(total, 11);
+}
+
+test "hostile patterns are refused quickly" {
+    // empty things repeated, stacked repetitions, huge counts
+    let bad: [3][]u8 = ["(?:){1000}{1000}{1000}{1000}", "(?:a{0}){1000}{1000}{1000}", "a{1000}{1000}"];
+    for p in bad {
+        let mut r = compile(p) catch continue;
+        r.deinit();
+        @expect(false);
+    }
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    deep.push('a')!;
+    for _k in @as(usize, 0)..8000 {
+        deep.push_str("{1}")!;
+    }
+    let mut r2 = compile(deep.bytes()) catch return;
+    r2.deinit();
+    @expect(false);
 }

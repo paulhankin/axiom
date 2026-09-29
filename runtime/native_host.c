@@ -72,6 +72,7 @@ static int32_t fs_err(void) {
     case ENOTDIR: return -20;
     case EISDIR: return -21;
     case ENOTEMPTY: return -39;
+    case ELOOP: return -40;
     default: return PH_ERR;
     }
 }
@@ -110,11 +111,7 @@ int32_t ph_rename(const uint8_t *from, size_t flen, const uint8_t *to, size_t tl
     return rename(a, b) == 0 ? 0 : fs_err();
 }
 
-intptr_t ph_readdir(const uint8_t *path, size_t len, uint8_t *buf, size_t cap) {
-    char name[4096];
-    if (copy_cstr(name, sizeof name, path, len)) return PH_ERR;
-    DIR *d = opendir(name);
-    if (!d) return fs_err();
+static intptr_t read_entries(DIR *d, uint8_t *buf, size_t cap) {
     size_t need = 0;
     struct dirent *e;
     while ((e = readdir(d))) {
@@ -128,9 +125,47 @@ intptr_t ph_readdir(const uint8_t *path, size_t len, uint8_t *buf, size_t cap) {
         }
         need += n + 2;
     }
-    closedir(d);
     return (intptr_t)need;
 }
+
+intptr_t ph_readdir(const uint8_t *path, size_t len, uint8_t *buf, size_t cap) {
+    char name[4096];
+    if (copy_cstr(name, sizeof name, path, len)) return PH_ERR;
+    DIR *d = opendir(name);
+    if (!d) return fs_err();
+    intptr_t r = read_entries(d, buf, cap);
+    closedir(d);
+    return r;
+}
+
+int32_t ph_dir_open(int32_t dir, const uint8_t *name, size_t len) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, name, len)) return PH_ERR;
+    int fd = openat(dir < 0 ? AT_FDCWD : dir, buf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    return fd < 0 ? fs_err() : fd;
+}
+
+intptr_t ph_dir_read(int32_t dir, uint8_t *buf, size_t cap) {
+    int fd = dup(dir);
+    if (fd < 0) return fs_err();
+    DIR *d = fdopendir(fd);
+    if (!d) {
+        close(fd);
+        return fs_err();
+    }
+    rewinddir(d);
+    intptr_t r = read_entries(d, buf, cap);
+    closedir(d);
+    return r;
+}
+
+int32_t ph_dir_remove(int32_t dir, const uint8_t *name, size_t len, uint32_t isdir) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, name, len)) return PH_ERR;
+    return unlinkat(dir < 0 ? AT_FDCWD : dir, buf, isdir ? AT_REMOVEDIR : 0) == 0 ? 0 : fs_err();
+}
+
+void ph_dir_close(int32_t dir) { close(dir); }
 
 intptr_t ph_getcwd(uint8_t *buf, size_t cap) {
     char tmp[4096];

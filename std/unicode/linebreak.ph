@@ -34,7 +34,8 @@ pub struct Breaks {
     eff: vec.Vec.[u8],        // after LB9 and LB10 (combining marks take their base's)
     base: vec.Vec.[usize],    // each character's base (itself unless it is a combining mark)
     cps: vec.Vec.[u32],
-    k: usize,  // the next boundary to test (between k - 1 and k)
+    ri: vec.Vec.[u32],  // regional indicators in the run ending at each base (for LB30a)
+    k: usize,           // the next boundary to test (between k - 1 and k)
 
     pub fn init(s: []u8) !Breaks {
         let mut b = Breaks.{
@@ -44,6 +45,7 @@ pub struct Breaks {
             eff: vec.Vec.[u8].init(),
             base: vec.Vec.[usize].init(),
             cps: vec.Vec.[u32].init(),
+            ri: vec.Vec.[u32].init(),
             k: 1,
         };
         b.classify() catch |e| {
@@ -59,6 +61,7 @@ pub struct Breaks {
         self.eff.deinit();
         self.base.deinit();
         self.cps.deinit();
+        self.ri.deinit();
     }
 
     fn classify(self: *mut Breaks) !void {
@@ -109,6 +112,19 @@ pub struct Breaks {
             } else {
                 self.eff.push(@truncate(u8, c))!;
             }
+        }
+        // LB30a counts the regional indicators before a position: from the
+        // run lengths here, in constant time (a long run would be quadratic)
+        for k in @as(usize, 0)..n {
+            let mut v: u32 = 0;
+            if self.ec(k) == t.LB_RI {
+                v = 1;
+                let pb = self.prev_base(k);
+                if (pb >= 0) and (self.ec(@truncate(usize, @bit_cast(u64, pb))) == t.LB_RI) {
+                    v = self.ri.get(@truncate(usize, @bit_cast(u64, pb))) + 1;
+                }
+            }
+            self.ri.push(v)!;
         }
     }
 
@@ -461,12 +477,7 @@ pub struct Breaks {
         }
         // LB30a: pairs of regional indicators
         if (ea == t.LB_RI) and (eb == t.LB_RI) {
-            let mut count: usize = 0;
-            let mut p = @as(i64, @truncate(u32, pa));
-            while (p >= 0) and (self.ec(@truncate(usize, @bit_cast(u64, p))) == t.LB_RI) {
-                count += 1;
-                p = self.prev_base(@truncate(usize, @bit_cast(u64, p)));
-            }
+            let count = self.ri.get(pa);
             if (count % 2) == 1 {
                 return NO;
             }

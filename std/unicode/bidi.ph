@@ -121,7 +121,7 @@ pub struct Paragraph {
     fn resolve(self: *mut Paragraph, dir: i32) !void {
         let n = self.orig.len;
         @mem_copy(self.cls, self.orig);
-        self.find_matching_pdis();
+        self.find_matching_pdis()!;
         if dir == AUTO {
             self.level = 0;
             if self.first_strong(0, n) == 1 {
@@ -136,29 +136,22 @@ pub struct Paragraph {
     }
 
     /// BD9: each isolate initiator's matching PDI.
-    fn find_matching_pdis(self: *mut Paragraph) void {
+    fn find_matching_pdis(self: *mut Paragraph) !void {
+        // one pass with a stack of open initiators (scanning forward from
+        // each would be quadratic in the number of initiators)
         let n = self.orig.len;
+        let mut open = vec.Vec.[usize].init();
+        defer open.deinit();
         for i in @as(usize, 0)..n {
             self.matching[i] = -1;
-            if not is_isolate_init(self.orig[i]) {
-                continue;
-            }
-            let mut depth: usize = 1;
-            let mut j = i + 1;
-            while j < n {
-                let c = self.orig[j];
-                if is_isolate_init(c) {
-                    depth += 1;
-                } else if c == PDI {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.matching[i] = @as(i64, @truncate(u32, j));
-                        break;
-                    }
-                } else if c == B {
-                    break;
-                }
-                j += 1;
+            let c = self.orig[i];
+            if is_isolate_init(c) {
+                open.push(i)!;
+            } else if c == PDI {
+                let o = open.pop() catch continue;
+                self.matching[o] = @as(i64, @truncate(u32, i));
+            } else if c == B {
+                open.clear();  // (a paragraph separator ends every isolate)
             }
         }
     }

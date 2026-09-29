@@ -366,16 +366,18 @@ pub struct Time {
         return self.sec;
     }
 
+    /// (Saturates beyond what an i64 holds, about 292 million years.)
     pub fn unix_millis(self: Time) i64 {
-        return (self.sec * 1000) + @as(i64, self.nsec / 1000000);
+        return @add_sat(@mul_sat(self.sec, 1000), @as(i64, self.nsec / 1000000));
     }
 
+    /// (Saturates beyond what an i64 holds: before 1677 and after 2262.)
     pub fn unix_nanos(self: Time) i64 {
-        return (self.sec * NS_PER_S) + @as(i64, self.nsec);
+        return @add_sat(@mul_sat(self.sec, NS_PER_S), @as(i64, self.nsec));
     }
 
     pub fn add(self: Time, d: Duration) Time {
-        let mut sec = self.sec + (d.ns / NS_PER_S);
+        let mut sec = @add_sat(self.sec, d.ns / NS_PER_S);
         let mut ns = @as(i64, self.nsec) + (d.ns % NS_PER_S);
         if ns < 0 {
             ns += NS_PER_S;
@@ -387,9 +389,10 @@ pub struct Time {
         return Time.{ sec: sec, nsec: @int_cast(u32, ns) };
     }
 
-    /// self - other.
+    /// self - other (saturating: a Duration holds about 292 years either way).
     pub fn sub(self: Time, other: Time) Duration {
-        return Duration.{ ns: ((self.sec - other.sec) * NS_PER_S) + (@as(i64, self.nsec) - @as(i64, other.nsec)) };
+        let s = @mul_sat(@sub_sat(self.sec, other.sec), NS_PER_S);
+        return Duration.{ ns: @add_sat(s, @as(i64, self.nsec) - @as(i64, other.nsec)) };
     }
 
     /// Negative if self is earlier than other, 0 if equal, positive if later.
@@ -781,4 +784,13 @@ test "clocks" {
     let d = a.elapsed();
     @expect(d.ns >= 2000000);
     @expect(Instant.now().since(a).ns >= d.ns);
+}
+
+test "far times saturate instead of trapping" {
+    let far = parse_rfc3339("9999-12-31T23:59:59Z")!;
+    let old = parse_rfc3339("0001-01-01T00:00:00Z")!;
+    @expect_eq(far.unix_nanos(), @max_value(i64));
+    @expect_eq(old.unix_nanos(), @min_value(i64));
+    @expect_eq(far.sub(old).ns, @max_value(i64));
+    @expect_eq(old.sub(far).ns, @min_value(i64));
 }

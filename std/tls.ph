@@ -1246,6 +1246,9 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
     ch.s.deinit();
     let mut msg = c.expect_message(HS_SERVER_HELLO)!;
     let mut sh = parse_server_hello(msg)!;
+    if not @mem_eq(sh.session_id, sid[..]) {
+        return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);  // must echo ours
+    }
     if sh.hrr {
         // HelloRetryRequest: the transcript restarts from a hash of the
         // first ClientHello, and a second ClientHello carries the one share
@@ -1270,9 +1273,15 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
         c.send_handshake(ch2.bytes())!;
         ch2.s.deinit();
         msg = c.expect_message(HS_SERVER_HELLO)!;
+        let hrr_suite = sh.suite;
+        let hrr_group = sh.group;
         sh = parse_server_hello(msg)!;
         if sh.hrr {
             return c.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+        }
+        // the ServerHello must keep what the retry chose
+        if (sh.suite != hrr_suite) or (sh.group != hrr_group) or not @mem_eq(sh.session_id, sid[..]) {
+            return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
         }
     }
     if sh.version != 0x0304 {

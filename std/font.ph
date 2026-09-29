@@ -302,7 +302,12 @@ pub struct Font {
                 let g = t + 16 + (12 * lo);
                 let s = u32at(d, g);
                 if cp >= s {
-                    return u32at(d, g + 8) + (cp - s);
+                    // (a crafted table can point past the glyphs, or overflow)
+                    let gid = u32at(d, g + 8) +% (cp - s);
+                    if gid >= self.num_glyphs {
+                        return 0;
+                    }
+                    return gid;
                 }
             }
             return 0;
@@ -945,13 +950,15 @@ fn off_at(d: []u8, p: usize, size: usize) usize {
 /// [start, end) of item i of the INDEX at `at`.
 fn index_item(d: []u8, at: usize, i: usize) [2]usize {
     let n = index_count(d, at);
-    if i >= n {
-        return [0, 0];
-    }
     let size = @as(usize, u8at(d, at + 2));
+    if (i >= n) or (size < 1) or (size > 4) {
+        return [0, 0];  // (offsets are 1 to 4 bytes)
+    }
     let offs = at + 3;
     let data = offs + ((n + 1) * size) - 1;
-    return [data + off_at(d, offs + (i * size), size), data + off_at(d, offs + ((i + 1) * size), size)];
+    // (offsets past the end are harmless: reads there see zeros)
+    return [
+        @add_sat(data, off_at(d, offs + (i * size), size)), @add_sat(data, off_at(d, offs + ((i + 1) * size), size))];
 }
 
 /// Where the INDEX at `at` ends.
@@ -961,8 +968,11 @@ fn index_end(d: []u8, at: usize) usize {
         return at + 2;
     }
     let size = @as(usize, u8at(d, at + 2));
+    if (size < 1) or (size > 4) {
+        return d.len;
+    }
     let offs = at + 3;
-    return (offs + ((n + 1) * size) - 1) + off_at(d, offs + (n * size), size);
+    return @add_sat((offs + ((n + 1) * size) - 1), off_at(d, offs + (n * size), size));
 }
 
 /// DICT values: operators to their (last) operands.

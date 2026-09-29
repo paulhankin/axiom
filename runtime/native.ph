@@ -140,6 +140,9 @@ fn fs_err(r: isize) i32 {
     if e == sys.ENOTEMPTY {
         return -39;
     }
+    if e == sys.ELOOP {
+        return -40;
+    }
     return PH_ERR;
 }
 
@@ -243,13 +246,23 @@ export fn ph_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
     if fd < 0 {
         return @as(isize, fs_err(fd));
     }
+    let r = read_entries(@truncate(i32, fd), buf, cap);
+    _ = sys.close(@truncate(i32, fd));
+    return r;
+}
+
+// ph_readdir's work on an open directory, from its start.
+fn read_entries(fd: i32, buf: *mut u8, cap: usize) isize {
+    let s = sys.lseek(fd, 0, 0);
+    if s < 0 {
+        return @as(isize, fs_err(s));
+    }
     let out = @slice_from_ptr(buf, cap);
     let mut need: usize = 0;
     let mut d: [8192]u8 = [0; 8192];
     loop {
-        let n = sys.getdents64(@truncate(i32, fd), &mut d[0], d.len);
+        let n = sys.getdents64(fd, &mut d[0], d.len);
         if n < 0 {
-            _ = sys.close(@truncate(i32, fd));
             return @as(isize, fs_err(n));
         }
         if n == 0 {
@@ -286,8 +299,59 @@ export fn ph_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
             p += reclen;
         }
     }
-    _ = sys.close(@truncate(i32, fd));
     return @bit_cast(isize, need);
+}
+
+// Directory handles, for walking trees without following symbolic links
+// that are swapped in meanwhile. dir is a handle from ph_dir_open, or -1
+// for the working directory; name is a path (from -1) or a single entry.
+
+// Opens a directory, failing with -40 if name is a symbolic link and -20
+// if it is something else.
+export fn ph_dir_open(dir: i32, name: *u8, len: usize) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], name, len) {
+        return PH_ERR;
+    }
+    let mut at = dir;
+    if dir < 0 {
+        at = -100;  // AT_FDCWD
+    }
+    let r = sys.open_dir_at(at, &buf[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return @truncate(i32, r);
+}
+
+// As ph_readdir, for a handle.
+export fn ph_dir_read(dir: i32, buf: *mut u8, cap: usize) isize {
+    return read_entries(dir, buf, cap);
+}
+
+// Removes an entry (a directory if dir != 0) of a directory.
+export fn ph_dir_remove(dir: i32, name: *u8, len: usize, isdir: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], name, len) {
+        return PH_ERR;
+    }
+    let mut at = dir;
+    if dir < 0 {
+        at = -100;
+    }
+    let mut flags: i32 = 0;
+    if isdir != 0 {
+        flags = 0x200;  // AT_REMOVEDIR
+    }
+    let r = sys.unlink_at(at, &buf[0], flags);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+export fn ph_dir_close(dir: i32) void {
+    _ = sys.close(dir);
 }
 
 export fn ph_getcwd(buf: *mut u8, cap: usize) isize {

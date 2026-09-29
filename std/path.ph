@@ -430,35 +430,47 @@ pub fn matches(pattern: []u8, p: []u8) bool {
     return match_from(pattern, 0, p, 0);
 }
 
+/// Elements of the pattern from pi0 against the path from xi0. "**" first
+/// matches no elements; on a mismatch only the most recent "**" takes one
+/// more (the others need not: it can absorb whatever they would), so the
+/// work is at most elements times elements, however many "**" there are.
 fn match_from(pat: []u8, pi0: usize, p: []u8, xi0: usize) bool {
     let mut pi = pi0;
     let mut xi = xi0;
+    let mut star = false;
+    let mut star_pi: usize = 0;  // the pattern just after the last "**"
+    let mut star_xi: usize = 0;  // where the path resumes after what it took
     loop {
         let mut pj = pi;
         let pe = next_element(pat, &mut pj);
+        if (pe.len == 2) and (pe[0] == '*') and (pe[1] == '*') {
+            star = true;
+            star_pi = pj;
+            star_xi = xi;
+            pi = pj;
+            continue;
+        }
         let mut xj = xi;
         let xe = next_element(p, &mut xj);
-        if pe.len == 0 {
-            return xe.len == 0;
+        if (pe.len == 0) and (xe.len == 0) {
+            return true;
         }
-        if (pe.len == 2) and (pe[0] == '*') and (pe[1] == '*') {
-            // try "**" as zero elements, then as one more each time
-            let mut at = xi;
-            loop {
-                if match_from(pat, pj, p, at) {
-                    return true;
-                }
-                let skipped = next_element(p, &mut at);
-                if skipped.len == 0 {
-                    return false;
-                }
-            }
+        if (pe.len != 0) and (xe.len != 0) and match_element(pe, xe) {
+            pi = pj;
+            xi = xj;
+            continue;
         }
-        if (xe.len == 0) or not match_element(pe, xe) {
+        if not star {
             return false;
         }
-        pi = pj;
-        xi = xj;
+        let mut at = star_xi;
+        let skipped = next_element(p, &mut at);
+        if skipped.len == 0 {
+            return false;
+        }
+        star_xi = at;
+        pi = star_pi;
+        xi = at;
     }
 }
 
@@ -589,4 +601,22 @@ test "globs" {
     @expect(not matches("a/*", "a"));
     @expect(has_glob("a/*.c"));
     @expect(not has_glob("a/b.c"));
+}
+
+test "many double stars stay fast" {
+    let mut pat = strs.String.init();
+    defer pat.deinit();
+    for _k in @as(usize, 0)..12 {
+        pat.push_str("**/")!;
+    }
+    pat.push_str("z")!;
+    let mut p = strs.String.init();
+    defer p.deinit();
+    for _k in @as(usize, 0)..60 {
+        p.push_str("a/")!;
+    }
+    p.push_str("y")!;
+    @expect(not matches(pat.bytes(), p.bytes()));
+    p.push_str("/z")!;
+    @expect(matches(pat.bytes(), p.bytes()));
 }

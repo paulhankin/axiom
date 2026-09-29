@@ -327,12 +327,26 @@ fn text_key(line: *mut strs.String, k: []u8) !void {
         line.push('_')!;
         return;
     }
-    for c in k {
+    let mut i: usize = 0;
+    while i < k.len {
+        let c = k[i];
+        if c >= 0x80 {
+            // (invalid UTF-8 and line-breaking characters become '_' too)
+            let r = strs.decode_rune(k[i..]);
+            if ((r.value == strs.REPLACEMENT) and (r.len == 1)) or breaks_lines(r.value) {
+                line.push('_')!;
+            } else {
+                line.push_str(k[i..i + r.len])!;
+            }
+            i += r.len;
+            continue;
+        }
         if (c <= ' ') or (c == '=') or (c == '"') or (c == 127) {
             line.push('_')!;
         } else {
             line.push(c)!;
         }
+        i += 1;
     }
 }
 
@@ -348,12 +362,35 @@ fn needs_quotes(s: []u8) bool {
     if s.len == 0 {
         return true;
     }
+    let mut high = false;
     for c in s {
         if (c <= ' ') or (c == '=') or (c == '"') or (c == 127) or (c == '\\') {
             return true;
         }
+        if c >= 0x80 {
+            high = true;
+        }
     }
-    return not strs.valid_utf8(s);
+    if not high {
+        return false;
+    }
+    if not strs.valid_utf8(s) {
+        return true;
+    }
+    let mut it = strs.runes(s);
+    while true {
+        let r = it.next() catch break;
+        if breaks_lines(r) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// C1 controls (NEL, CSI, ...) and the Unicode line and paragraph
+/// separators: terminals and log viewers act on them, so they are escaped.
+fn breaks_lines(cp: u32) bool {
+    return ((cp >= 0x80) and (cp <= 0x9f)) or (cp == 0x2028) or (cp == 0x2029);
 }
 
 /// A double-quoted string with JSON's escapes (invalid UTF-8 as �).
@@ -371,6 +408,11 @@ fn json_string(line: *mut strs.String, s: []u8) !void {
             let r = strs.decode_rune(s[i..]);
             if (r.value == strs.REPLACEMENT) and (r.len == 1) {
                 line.push_str("\\ufffd")!;
+            } else if breaks_lines(r.value) {
+                line.push_str("\\u")!;
+                for k in @as(usize, 0)..4 {
+                    line.push(hex[@as(usize, (r.value >> @truncate(u32, 12 - (4 * k))) & 15)])!;
+                }
             } else {
                 line.push_str(s[i..i + r.len])!;
             }
@@ -495,19 +537,25 @@ pub struct FileSink {
     max_bytes: u64,  // 0: never rotate
     keep: u32,
     lock: sync.Mutex,
+    is_open: bool,  // false after a rotation failed to create the new file
 
     pub fn writer(self: *mut FileSink) io.Writer {
         return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: sink_write };
     }
 
     pub fn close(self: *mut FileSink) void {
-        self.file.close();
+        if self.is_open {
+            self.file.close();
+        }
         mem.free(self.path);
         mem.free(@slice_from_ptr(self, 1));
     }
 
     fn rotate(self: *mut FileSink) !void {
-        self.file.close();
+        if self.is_open {
+            self.file.close();
+            self.is_open = false;  // (its descriptor may be reused by anyone now)
+        }
         let mut k = self.keep;
         while k > 0 {
             let from = numbered(self.path, k - 1)!;
@@ -521,6 +569,7 @@ pub struct FileSink {
             remove_quiet(self.path);
         }
         self.file = io.create(self.path)!;
+        self.is_open = true;
         self.size = 0;
     }
 }
@@ -550,6 +599,12 @@ fn sink_write(ctx: *mut void, bytes: []u8) !usize {
     let s = @ptr_cast(*mut FileSink, ctx);
     s.lock.lock();
     defer s.lock.unlock();
+    if not s.is_open {
+        // (the last rotation could not create the file: try again)
+        s.file = io.append(s.path)!;
+        s.is_open = true;
+        s.size = s.file.size() catch 0;
+    }
     if (s.max_bytes > 0) and (s.size > 0) and ((s.size + @as(u64, bytes.len)) > s.max_bytes) {
         s.rotate()!;
     }
@@ -578,6 +633,7 @@ pub fn open_file(p: []u8, max_bytes: u64, keep: u32) !*mut FileSink {
         max_bytes: max_bytes,
         keep: keep,
         lock: sync.Mutex.init(),
+        is_open: true,
     };
     return &mut mem_[0];
 }
@@ -691,4 +747,17 @@ test "lines from threads do not interleave" {
         n += 1;
     }
     @expect_eq(n, 800);
+}
+
+test "line-breaking characters are escaped" {
+    let mut buf = strs.String.init();
+    defer buf.deinit();
+    let mut lg = Logger.init(buf.writer(), DEBUG, TEXT);
+    lg.with_time = false;
+    lg.info("m", [str("k\xe2\x80\xa8", "a\xc2\x85b\xe2\x80\xa9c")]);
+    @expect(strs.contains(buf.bytes(), "k_=\"a\\u0085b\\u2029c\""));
+    lg.format = JSON;
+    buf.clear();
+    lg.info("m", [str("k", "\xc2\x9b31m")]);
+    @expect(strs.contains(buf.bytes(), "\"k\":\"\\u009b31m\""));
 }

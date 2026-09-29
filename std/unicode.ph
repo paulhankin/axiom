@@ -624,7 +624,7 @@ fn decompose_cp(cp: u32, compat: bool, out: *mut vec.Vec.[u32]) !void {
 }
 
 /// Puts runs of non-starters in canonical order (stable by combining class).
-fn reorder(cps: []mut u32) void {
+fn reorder(cps: []mut u32) !void {
     let mut i: usize = 0;
     while i < cps.len {
         if combining_class(cps[i]) == 0 {
@@ -634,6 +634,26 @@ fn reorder(cps: []mut u32) void {
         let start = i;
         while (i < cps.len) and (combining_class(cps[i]) != 0) {
             i += 1;
+        }
+        if (i - start) > 32 {
+            // a long run (only hostile text has them): a stable counting sort
+            let run = cps[start..i];
+            let tmp = mem.alloc.[u32](run.len)!;
+            defer mem.free(tmp);
+            let mut at: [257]usize = [0; 257];
+            for c in run {
+                at[@as(usize, combining_class(c)) + 1] += 1;
+            }
+            for k in @as(usize, 1)..257 {
+                at[k] += at[k - 1];
+            }
+            for c in run {
+                let cc = @as(usize, combining_class(c));
+                tmp[at[cc]] = c;
+                at[cc] += 1;
+            }
+            @mem_copy(run, tmp);
+            continue;
         }
         // insertion sort: runs are short
         for k in (start + 1)..i {
@@ -740,7 +760,7 @@ pub fn normalize(s: []u8, form: u8) ![]mut u8 {
         i += r.len;
     }
     let all = cps.items();
-    reorder(all);
+    reorder(all)!;
     let mut n = all.len;
     if composed {
         n = compose(all);
@@ -1003,7 +1023,7 @@ fn wb_after(s: []u8, i: usize, after: *mut usize) u32 {
 }
 
 /// Whether there is a word boundary at position i (0 < i < s.len).
-fn word_boundary(s: []u8, i: usize) bool {
+fn word_boundary(s: []u8, i: usize, floor: usize) bool {
     let pstart = prev_start(s, i);
     let prev_cp = strs.decode_rune(s[pstart..]).value;
     let a_raw = (word_break(prev_cp));
@@ -1085,10 +1105,16 @@ fn word_boundary(s: []u8, i: usize) bool {
         return false;  // WB13b
     }
     if (a == t.WB_REGIONAL_INDICATOR) and (b == t.WB_REGIONAL_INDICATOR) {
-        // WB15/16: an odd number of RI before
+        // WB15/16: an odd number of RI before (counted back to floor, the
+        // start of the current segment: a boundary inside a run of RIs
+        // only ever falls after a pair, so the parity is the same, and a
+        // long run costs linear time, not quadratic)
         let mut n: usize = 0;
         let mut k = i;
         loop {
+            if k <= floor {
+                break;
+            }
             let mut at: usize = 0;
             let w = wb_before(s, k, &mut at);
             if w != t.WB_REGIONAL_INDICATOR {
@@ -1117,7 +1143,7 @@ pub struct Words {
         }
         let start = self.pos;
         let mut i = start + strs.decode_rune(self.s[start..]).len;
-        while (i < self.s.len) and not word_boundary(self.s, i) {
+        while (i < self.s.len) and not word_boundary(self.s, i, start) {
             i += strs.decode_rune(self.s[i..]).len;
         }
         self.pos = i;
@@ -1189,7 +1215,71 @@ fn sb_before(s: []u8, i: usize, at: *mut usize) u32 {
     return 0xff;
 }
 
-fn sentence_boundary(s: []u8, i: usize) bool {
+/// What precedes a position, for SB8-SB11: SATerm Close* Sp* (term is
+/// 0xff if the text before does not end so).
+struct Suffix {
+    term: u32,
+    close_seen: bool,
+    sp_seen: bool,
+}
+
+/// The suffix before i, scanning back (used once per sentence).
+fn suffix_before(s: []u8, i: usize) Suffix {
+    let mut k = i;
+    let mut sp_seen = false;
+    let mut close_seen = false;
+    loop {
+        let mut at: usize = 0;
+        let v = sb_before(s, k, &mut at);
+        if v == 0xff {
+            break;
+        }
+        if (v == t.SB_SP) and not close_seen {
+            sp_seen = true;
+            k = at;
+            continue;
+        }
+        if v == t.SB_CLOSE {
+            close_seen = true;
+            k = at;
+            continue;
+        }
+        if saterm(v) {
+            return Suffix.{ term: v, close_seen: close_seen, sp_seen: sp_seen };
+        }
+        break;
+    }
+    return Suffix.{ term: 0xff, close_seen: false, sp_seen: false };
+}
+
+/// The suffix after one more character of class v (as suffix_before would
+/// find it, in constant time).
+fn suffix_step(st: Suffix, v: u32) Suffix {
+    if sb_ignorable(v) {
+        return st;
+    }
+    if saterm(v) {
+        return Suffix.{ term: v, close_seen: false, sp_seen: false };
+    }
+    if (st.term != 0xff) and (v == t.SB_CLOSE) and not st.sp_seen {
+        return Suffix.{ term: st.term, close_seen: true, sp_seen: false };
+    }
+    if (st.term != 0xff) and (v == t.SB_SP) {
+        return Suffix.{ term: st.term, close_seen: st.close_seen, sp_seen: true };
+    }
+    return Suffix.{ term: 0xff, close_seen: false, sp_seen: false };
+}
+
+/// SB8's look ahead from `from` stopped at `to` and found a Lower or not;
+/// the answer holds for every position in between.
+struct Sb8Cache {
+    from: usize,
+    to: usize,
+    lower: bool,
+    valid: bool,
+}
+
+fn sentence_boundary(s: []u8, i: usize, suf: Suffix, sb8: *mut Sb8Cache) bool {
     let pstart = prev_start(s, i);
     let a_raw = sb_at(s, pstart);
     let b = sb_at(s, i);
@@ -1214,47 +1304,32 @@ fn sentence_boundary(s: []u8, i: usize) bool {
             return false;  // SB7
         }
     }
-    // find SATerm Close* Sp* before i
-    let mut k = i;
-    let mut sp_seen = false;
-    let mut close_seen = false;
-    let mut term: u32 = 0xff;
-    loop {
-        let mut at: usize = 0;
-        let v = sb_before(s, k, &mut at);
-        if v == 0xff {
-            break;
-        }
-        if (v == t.SB_SP) and not close_seen {
-            sp_seen = true;
-            k = at;
-            continue;
-        }
-        if v == t.SB_CLOSE {
-            close_seen = true;
-            k = at;
-            continue;
-        }
-        if saterm(v) {
-            term = v;
-        }
-        break;
-    }
+    // SATerm Close* Sp* before i (kept up to date by the caller)
+    let term = suf.term;
+    let sp_seen = suf.sp_seen;
     if term == 0xff {
         return false;  // SB998
     }
     if term == t.SB_ATERM {
         // SB8: ( ¬(OLetter | Upper | Lower | ParaSep | SATerm) )* Lower
-        let mut j = i;
-        while j < s.len {
-            let v = sb_at(s, j);
-            if v == t.SB_LOWER {
-                return false;
+        if not (sb8.valid and (sb8.from <= i) and (i <= sb8.to)) {
+            let mut j = i;
+            let mut found = false;
+            while j < s.len {
+                let v = sb_at(s, j);
+                if v == t.SB_LOWER {
+                    found = true;
+                    break;
+                }
+                if (v == t.SB_OLETTER) or (v == t.SB_UPPER) or para_sep(v) or saterm(v) {
+                    break;
+                }
+                j += strs.decode_rune(s[j..]).len;
             }
-            if (v == t.SB_OLETTER) or (v == t.SB_UPPER) or para_sep(v) or saterm(v) {
-                break;
-            }
-            j += strs.decode_rune(s[j..]).len;
+            sb8.* = Sb8Cache.{ from: i, to: j, lower: found, valid: true };
+        }
+        if sb8.lower {
+            return false;
         }
     }
     if (b == t.SB_SCONTINUE) or saterm(b) {
@@ -1279,8 +1354,13 @@ pub struct Sentences {
             return error.Done;
         }
         let start = self.pos;
-        let mut i = start + strs.decode_rune(self.s[start..]).len;
-        while (i < self.s.len) and not sentence_boundary(self.s, i) {
+        let first = strs.decode_rune(self.s[start..]).len;
+        let mut i = start + first;
+        // the SATerm Close* Sp* state, carried forward a character at a time
+        let mut suf = suffix_before(self.s, i);
+        let mut sb8 = Sb8Cache.{ from: 0, to: 0, lower: false, valid: false };
+        while (i < self.s.len) and not sentence_boundary(self.s, i, suf, &mut sb8) {
+            suf = suffix_step(suf, sb_at(self.s, i));
             i += strs.decode_rune(self.s[i..]).len;
         }
         self.pos = i;

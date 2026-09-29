@@ -39,6 +39,7 @@ pub const EEXIST: isize = 17;
 pub const ENOTDIR: isize = 20;
 pub const EISDIR: isize = 21;
 pub const ENOTEMPTY: isize = 39;
+pub const ELOOP: isize = 40;
 pub const ERANGE: isize = 34;
 
 // System call numbers: [x86-64, AArch64]
@@ -154,6 +155,22 @@ pub fn write_all(fd: i32, s: []u8) void {
 // path: NUL-terminated
 pub fn open(path: *u8, flags: i32, mode: i32) isize {
     return sys4(SYS_OPENAT, si(-100), @int_from_ptr(path), si(flags), si(mode));  // AT_FDCWD
+}
+
+// Opens the directory `name` in the directory dirfd (-100 for the working
+// directory) without following a symbolic link there.
+pub fn open_dir_at(dirfd: i32, name: *u8) isize {
+    // O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC; the first two differ on AArch64
+    let mut flags: usize = 0x10000 | 0x20000 | 0x80000;
+    if phalange_target_arch() == 2 {
+        flags = 0x4000 | 0x8000 | 0x80000;
+    }
+    return sys4(SYS_OPENAT, si(dirfd), @int_from_ptr(name), flags, 0);
+}
+
+// flags 0x200 (AT_REMOVEDIR) removes a directory
+pub fn unlink_at(dirfd: i32, name: *u8, flags: i32) isize {
+    return sys3(SYS_UNLINKAT, si(dirfd), @int_from_ptr(name), si(flags));
 }
 
 pub fn close(fd: i32) isize {
