@@ -24,6 +24,8 @@ const native = argv.includes('--native');
 // Cross testing: PHALANGE_NATIVE_TARGET=aarch64 PHALANGE_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
 const nativeTarget = `--target=${process.env.PHALANGE_NATIVE_TARGET || 'native'}`;
 const execWrap = (process.env.PHALANGE_NATIVE_EXEC || '').split(' ').filter((x) => x);
+// Emulated tests run several times slower: give each test a minute.
+const testTimeout = execWrap.length ? ['--timeout=60000'] : [];
 const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a));
@@ -139,7 +141,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
   const t0 = process.hrtime.bigint();
-  const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...d.flags, ...extraFlags], { encoding: 'utf8' });
+  const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...d.flags, ...extraFlags], { encoding: 'utf8' });
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   let problem = null;
   let json = null;
@@ -171,7 +173,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const name = 'tests/traces/traces.ph [stack traces]';
   if (!filter || name.includes(filter)) {
     const src = fs.readFileSync(f, 'utf8');
-    const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...extraFlags], { encoding: 'utf8' });
+    const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...extraFlags], { encoding: 'utf8' });
     let problem = null;
     let json = null;
     try { json = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
@@ -238,7 +240,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   if (!filter || name.includes(filter)) {
     const folded = path.join(tmp, 'hot.folded');
     const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ph'), '--format=agent-json', `--folded=${folded}`,
-      ...testTargets, ...extraFlags], { encoding: 'utf8' });
+      ...testTargets, ...testTimeout, ...extraFlags], { encoding: 'utf8' });
     let problem = null;
     let j = null;
     try { j = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }

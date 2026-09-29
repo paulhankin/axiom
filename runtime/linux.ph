@@ -34,6 +34,12 @@ pub const EAGAIN: isize = 11;
 pub const ETIMEDOUT: isize = 110;
 pub const ECONNREFUSED: isize = 111;
 pub const EADDRINUSE: isize = 98;
+pub const EPERM: isize = 1;
+pub const EEXIST: isize = 17;
+pub const ENOTDIR: isize = 20;
+pub const EISDIR: isize = 21;
+pub const ENOTEMPTY: isize = 39;
+pub const ERANGE: isize = 34;
 
 // System call numbers: [x86-64, AArch64]
 let SYS_READ: [2]i64 = [0, 63];
@@ -75,6 +81,13 @@ let SYS_SCHED_GETAFFINITY: [2]i64 = [204, 123];
 let SYS_TIMER_CREATE: [2]i64 = [222, 107];
 let SYS_TIMER_SETTIME: [2]i64 = [223, 110];
 let SYS_TIMER_DELETE: [2]i64 = [226, 111];
+let SYS_STATX: [2]i64 = [332, 291];
+let SYS_MKDIRAT: [2]i64 = [258, 34];
+let SYS_UNLINKAT: [2]i64 = [263, 35];
+let SYS_RENAMEAT2: [2]i64 = [316, 276];
+let SYS_GETDENTS64: [2]i64 = [217, 61];
+let SYS_GETCWD: [2]i64 = [79, 17];
+let SYS_LSEEK: [2]i64 = [8, 62];
 
 fn nr(t: [2]i64) i64 {
     if phalange_target_arch() == 2 {
@@ -145,6 +158,39 @@ pub fn open(path: *u8, flags: i32, mode: i32) isize {
 
 pub fn close(fd: i32) isize {
     return sys1(SYS_CLOSE, si(fd));
+}
+
+// Files and directories. Paths are NUL-terminated and relative to the
+// working directory (AT_FDCWD).
+
+// buf: a struct statx (256 bytes); flags 0x100 is AT_SYMLINK_NOFOLLOW
+pub fn statx(path: *u8, flags: i32, buf: *mut u8) isize {
+    return sys6(SYS_STATX, si(-100), @int_from_ptr(path), si(flags), 0x7ff, @int_from_ptr(buf), 0);
+}
+
+pub fn mkdir(path: *u8, mode: i32) isize {
+    return sys3(SYS_MKDIRAT, si(-100), @int_from_ptr(path), si(mode));
+}
+
+// flags 0x200 (AT_REMOVEDIR) removes a directory
+pub fn unlink(path: *u8, flags: i32) isize {
+    return sys3(SYS_UNLINKAT, si(-100), @int_from_ptr(path), si(flags));
+}
+
+pub fn rename(from: *u8, to: *u8) isize {
+    return sys6(SYS_RENAMEAT2, si(-100), @int_from_ptr(from), si(-100), @int_from_ptr(to), 0, 0);
+}
+
+pub fn getdents64(fd: i32, buf: *mut u8, n: usize) isize {
+    return sys3(SYS_GETDENTS64, si(fd), @int_from_ptr(buf), n);
+}
+
+pub fn getcwd(buf: *mut u8, n: usize) isize {
+    return sys2(SYS_GETCWD, @int_from_ptr(buf), n);
+}
+
+pub fn lseek(fd: i32, off: i64, whence: i32) isize {
+    return sys3(SYS_LSEEK, si(fd), @bit_cast(usize, @truncate(isize, off)), si(whence));
 }
 
 // Anonymous read-write memory, or 0.
@@ -376,6 +422,35 @@ fn cstr_len(p: usize) usize {
 // library's _start ran instead of ours (a program linked by the C toolchain)
 pub let mut main_argc: usize = 0;
 pub let mut main_argv: usize = 0;
+
+// Argument i of the program, or an empty slice with a 0 pointer if there is
+// no such argument.
+pub fn arg(i: usize) []u8 {
+    let none = @slice_from_ptr(@ptr_from_int(*u8, 0), 0);
+    let sp = ph_start_sp();
+    let mut argc: usize = 0;
+    let mut argv: usize = 0;
+    if sp != 0 {
+        argc = @ptr_from_int(*usize, sp).*;
+        argv = sp + @size_of(usize);
+    } else if main_argv != 0 {
+        argc = main_argc;
+        argv = main_argv;
+    }
+    if i >= argc {
+        return none;
+    }
+    let p = @ptr_from_int(*usize, argv + (i * @size_of(usize))).*;
+    return @slice_from_ptr(@ptr_from_int(*u8, p), cstr_len(p));
+}
+
+pub fn arg_count() usize {
+    let sp = ph_start_sp();
+    if sp != 0 {
+        return @ptr_from_int(*usize, sp).*;
+    }
+    return main_argc;
+}
 
 // The value of environment variable `name`, or nosym (a 0 pointer) if unset.
 pub fn getenv(name: []u8) []u8 {

@@ -110,6 +110,242 @@ export fn ph_close(fd: i32) void {
 }
 
 // -----------------------------------------------------------------------------
+// Files, directories and the process
+// -----------------------------------------------------------------------------
+
+// The host ABI's code for a failed call's -errno.
+fn fs_err(r: isize) i32 {
+    let e = -r;
+    if e == sys.ENOENT {
+        return -2;
+    }
+    if (e == sys.EACCES) or (e == sys.EPERM) {
+        return -13;
+    }
+    if e == sys.EEXIST {
+        return -17;
+    }
+    if e == sys.ENOTDIR {
+        return -20;
+    }
+    if e == sys.EISDIR {
+        return -21;
+    }
+    if e == sys.ENOTEMPTY {
+        return -39;
+    }
+    return PH_ERR;
+}
+
+fn rd16(b: []u8, i: usize) u32 {
+    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8);
+}
+
+fn rd32(b: []u8, i: usize) u32 {
+    return rd16(b, i) | (rd16(b, i + 2) << 16);
+}
+
+fn rd64(b: []u8, i: usize) u64 {
+    return @as(u64, rd32(b, i)) | (@as(u64, rd32(b, i + 4)) << 32);
+}
+
+// out: kind (1 file, 2 directory, 3 symbolic link, 4 other), size,
+// modification time (ns since 1970), permission bits
+export fn ph_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return PH_ERR;
+    }
+    let mut st: [256]u8 = [0; 256];
+    let mut flags: i32 = 0x100;  // AT_SYMLINK_NOFOLLOW
+    if follow != 0 {
+        flags = 0;
+    }
+    let r = sys.statx(&buf[0], flags, &mut st[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    let mode = rd16(st[..], 28);
+    let fmt = mode & 0o170000;
+    let mut kind: i64 = 4;
+    if fmt == 0o100000 {
+        kind = 1;
+    } else if fmt == 0o040000 {
+        kind = 2;
+    } else if fmt == 0o120000 {
+        kind = 3;
+    }
+    let o = @slice_from_ptr(out, 4);
+    o[0] = kind;
+    o[1] = @bit_cast(i64, rd64(st[..], 40));
+    o[2] = (@bit_cast(i64, rd64(st[..], 112)) * 1000000000) + @as(i64, rd32(st[..], 120));
+    o[3] = @as(i64, mode & 0o7777);
+    return 0;
+}
+
+export fn ph_mkdir(path: *u8, len: usize) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return PH_ERR;
+    }
+    let r = sys.mkdir(&buf[0], 0o777);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+export fn ph_remove(path: *u8, len: usize, dir: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return PH_ERR;
+    }
+    let mut flags: i32 = 0;
+    if dir != 0 {
+        flags = 0x200;  // AT_REMOVEDIR
+    }
+    let r = sys.unlink(&buf[0], flags);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+export fn ph_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32 {
+    let mut a: [4096]u8 = [0; 4096];
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(a[..], from, flen) or not copy_cstr(b[..], to, tlen) {
+        return PH_ERR;
+    }
+    let r = sys.rename(&a[0], &b[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+// Writes the directory's entries (not . and ..) to buf as a kind byte
+// (as ph_stat's, 0 if unknown), the name and a 0 byte each; returns the
+// bytes all of them need (more than cap: call again with more room).
+export fn ph_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut name: [4096]u8 = [0; 4096];
+    if not copy_cstr(name[..], path, len) {
+        return @as(isize, PH_ERR);
+    }
+    let fd = sys.open(&name[0], 0x80000, 0);  // O_RDONLY | O_CLOEXEC
+    if fd < 0 {
+        return @as(isize, fs_err(fd));
+    }
+    let out = @slice_from_ptr(buf, cap);
+    let mut need: usize = 0;
+    let mut d: [8192]u8 = [0; 8192];
+    loop {
+        let n = sys.getdents64(@truncate(i32, fd), &mut d[0], d.len);
+        if n < 0 {
+            _ = sys.close(@truncate(i32, fd));
+            return @as(isize, fs_err(n));
+        }
+        if n == 0 {
+            break;
+        }
+        let mut p: usize = 0;
+        while p < @bit_cast(usize, n) {
+            let reclen = @as(usize, rd16(d[..], p + 16));
+            let ty = d[p + 18];
+            let mut e = p + 19;
+            while (e < (p + reclen)) and (d[e] != 0) {
+                e += 1;
+            }
+            let nm = d[p + 19..e];
+            let dots = ((nm.len == 1) and (nm[0] == '.')) or ((nm.len == 2) and (nm[0] == '.') and (nm[1] == '.'));
+            if not dots {
+                let mut kind: u8 = 0;
+                if ty == 8 {
+                    kind = 1;  // DT_REG
+                } else if ty == 4 {
+                    kind = 2;  // DT_DIR
+                } else if ty == 10 {
+                    kind = 3;  // DT_LNK
+                } else if ty != 0 {
+                    kind = 4;
+                }
+                if (need + nm.len + 2) <= cap {
+                    out[need] = kind;
+                    @mem_copy(out[need + 1..need + 1 + nm.len], nm);
+                    out[need + 1 + nm.len] = 0;
+                }
+                need += nm.len + 2;
+            }
+            p += reclen;
+        }
+    }
+    _ = sys.close(@truncate(i32, fd));
+    return @bit_cast(isize, need);
+}
+
+export fn ph_getcwd(buf: *mut u8, cap: usize) isize {
+    let mut tmp: [4096]u8 = [0; 4096];
+    let r = sys.getcwd(&mut tmp[0], tmp.len);
+    if r < 0 {
+        return @as(isize, fs_err(r));
+    }
+    let mut n: usize = 0;
+    while (n < tmp.len) and (tmp[n] != 0) {
+        n += 1;
+    }
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), tmp[..n]);
+    }
+    return @bit_cast(isize, n);
+}
+
+// whence: 0 from the start, 1 from the current position, 2 from the end
+export fn ph_seek(fd: i32, off: i64, whence: u32) i64 {
+    let r = sys.lseek(fd, off, @bit_cast(i32, whence));
+    if r < 0 {
+        return @as(i64, fs_err(r));
+    }
+    return @as(i64, r);
+}
+
+export fn ph_argc() i32 {
+    return @truncate(i32, @bit_cast(isize, sys.arg_count()));
+}
+
+// Copies argument i to buf; returns its length (-1 if there is none).
+export fn ph_arg(i: i32, buf: *mut u8, cap: usize) isize {
+    if i < 0 {
+        return @as(isize, PH_ERR);
+    }
+    let a = sys.arg(@as(usize, @bit_cast(u32, i)));
+    if (a.len == 0) and (@int_from_ptr(a.ptr) == 0) {
+        return @as(isize, PH_ERR);
+    }
+    if a.len <= cap {
+        @mem_copy(@slice_from_ptr(buf, a.len), a);
+    }
+    return @bit_cast(isize, a.len);
+}
+
+// Copies environment variable name's value to buf; returns its length (-2
+// if it is not set).
+export fn ph_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let v = sys.getenv(@slice_from_ptr(name, len));
+    if (v.len == 0) and (@int_from_ptr(v.ptr) == 0) {
+        return -2;
+    }
+    if v.len <= cap {
+        @mem_copy(@slice_from_ptr(buf, v.len), v);
+    }
+    return @bit_cast(isize, v.len);
+}
+
+export fn ph_exit(code: i32) void {
+    ph_rt_fini();
+    sys.exit(code);
+}
+
+// -----------------------------------------------------------------------------
 // Host names (IPv4)
 // -----------------------------------------------------------------------------
 // An IPv4 address, as its four bytes in network order (a in the low byte).

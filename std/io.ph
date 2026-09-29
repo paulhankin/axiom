@@ -11,13 +11,14 @@
 
 import "mem.ph" as mem;
 
-error { IoError, EndOfStream, NoSpaceLeft, NotFound, AccessDenied, OutOfMemory }
+error { IoError, EndOfStream, NoSpaceLeft, NotFound, AccessDenied, IsDirectory, OutOfMemory }
 
 import host "phalange" {
     fn ph_write(fd: i32, p: *u8, n: usize) isize;
     fn ph_read(fd: i32, p: *mut u8, n: usize) isize;
     fn ph_open(path: *u8, len: usize, flags: u32) i32;
     fn ph_close(fd: i32) void;
+    fn ph_seek(fd: i32, off: i64, whence: u32) i64;
 }
 
 // -----------------------------------------------------------------------------
@@ -343,7 +344,35 @@ pub struct File {
     pub fn close(self: File) void {
         ph_close(self.fd);
     }
+
+    /// Moves the position for the next read or write to `off` bytes from
+    /// the start (whence 0: SEEK_SET), the current position (1) or the end
+    /// (2); returns the new position.
+    pub fn seek(self: File, off: i64, whence: u32) !u64 {
+        let r = ph_seek(self.fd, off, whence);
+        if r < 0 {
+            return error.IoError;
+        }
+        return @bit_cast(u64, r);
+    }
+
+    /// The current position.
+    pub fn position(self: File) !u64 {
+        return self.seek(0, SEEK_CUR);
+    }
+
+    /// The file's size (the position is kept).
+    pub fn size(self: File) !u64 {
+        let here = self.seek(0, SEEK_CUR)!;
+        let end = self.seek(0, SEEK_END)!;
+        _ = self.seek(@bit_cast(i64, here), SEEK_SET)!;
+        return end;
+    }
 }
+
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
 
 const OPEN_READ: u32 = 0;
 const OPEN_WRITE: u32 = 1;   // create or truncate
@@ -357,6 +386,7 @@ fn open_with(path: []u8, flags: u32) !File {
     match fd {
         -2   => { return error.NotFound; }
         -13  => { return error.AccessDenied; }
+        -21  => { return error.IsDirectory; }
         else => { return error.IoError; }
     }
 }

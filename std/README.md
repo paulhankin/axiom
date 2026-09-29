@@ -11,7 +11,10 @@ and a type that owns memory has `deinit`).
 | [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
 | [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
-| [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files; `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
+| [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
+| [`path`](path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |
+| [`fs`](fs.ph) | The file system: `read_file`, `write_file`, `append_file`, `copy_file`; `stat`/`lstat` (`Info`: kind, size, modification time, mode), `exists`; `mkdir`, `mkdir_all`, `remove`, `remove_all`, `rename`; `read_dir` (sorted), `walk`, `glob`; `cwd`, `absolute`, `temp_dir`, `make_temp_dir` |
+| [`os`](os.ph) | The process: `args`/`arg`/`arg_count`, `getenv`/`has_env`, `exit` |
 | [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
 | [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
 | [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
@@ -136,6 +139,14 @@ They call a small set of host functions imported from module `"phalange"`:
 |---|---|
 | `ph_write(fd, p, n) isize`, `ph_read(fd, p, n) isize` | read and write file descriptors; `0` from read means end of file |
 | `ph_open(path, len, flags) i32`, `ph_close(fd)` | `flags`: `0` read, `1` create/truncate, `2` append |
+| `ph_seek(fd, off, whence) i64` | moves a file's position (`whence`: `0` start, `1` current, `2` end); returns the new position |
+| `ph_stat(path, len, follow, out) i32` | `out[0..4]` (`i64`): kind (`1` file, `2` directory, `3` symbolic link, `4` other), size, modification time in ns, permission bits; `follow = 0` does not follow a final symbolic link |
+| `ph_mkdir(path, len) i32`, `ph_remove(path, len, dir) i32`, `ph_rename(from, flen, to, tlen) i32` | `dir = 1` removes an (empty) directory |
+| `ph_readdir(path, len, buf, cap) isize` | the entries (not `.`, `..`) as a kind byte (`0` unknown), the name and a `0` byte each; returns the bytes needed, which may exceed `cap` |
+| `ph_getcwd(buf, cap) isize` | the working directory; returns its length |
+| `ph_argc() i32`, `ph_arg(i, buf, cap) isize` | the program's arguments (argument 0 is its name); returns the length |
+| `ph_getenv(name, len, buf, cap) isize` | an environment variable; `-2` if unset |
+| `ph_exit(code)` | ends the process |
 | `ph_tcp_connect(name, len, port) i32`, `ph_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ph_tcp_accept(h) i32`, `ph_tcp_local_port(h) i32` | |
 | `ph_sock_read(h, p, n) isize`, `ph_sock_write(h, p, n) isize`, `ph_sock_close(h)` | |
@@ -146,8 +157,11 @@ They call a small set of host functions imported from module `"phalange"`:
 | `ph_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970) or `1` (monotonic) |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection
-refused / not found, `-3` address in use, `-4` invalid address, `-5` timed out, and `-13`
-access denied.
+refused / not found, `-3` address in use, `-4` invalid address, `-5` timed out, `-13`
+access denied, `-17` already exists, `-20` not a directory, `-21` is a directory and `-39`
+directory not empty. Functions that fill a buffer return the length the whole result
+needs; when that is more than `cap`, the buffer was not written and the caller retries
+with more room.
 
 Two implementations are provided:
 

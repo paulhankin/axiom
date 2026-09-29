@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -58,6 +60,120 @@ int32_t ph_open(const uint8_t *path, size_t len, uint32_t flags) {
 }
 
 void ph_close(int32_t fd) { close(fd); }
+
+// Files, directories and the process (see runtime/native.ph for the
+// contract of each).
+static int32_t fs_err(void) {
+    switch (errno) {
+    case ENOENT: return -2;
+    case EACCES: case EPERM: return -13;
+    case EEXIST: return -17;
+    case ENOTDIR: return -20;
+    case EISDIR: return -21;
+    case ENOTEMPTY: return -39;
+    default: return PH_ERR;
+    }
+}
+
+int32_t ph_stat(const uint8_t *path, size_t len, uint32_t follow, int64_t *out) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
+    struct stat st;
+    if ((follow ? stat(buf, &st) : lstat(buf, &st)) != 0) return fs_err();
+    out[0] = S_ISREG(st.st_mode) ? 1 : S_ISDIR(st.st_mode) ? 2 : S_ISLNK(st.st_mode) ? 3 : 4;
+    out[1] = (int64_t)st.st_size;
+    out[2] = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+    out[3] = st.st_mode & 07777;
+    return 0;
+}
+
+int32_t ph_mkdir(const uint8_t *path, size_t len) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
+    return mkdir(buf, 0777) == 0 ? 0 : fs_err();
+}
+
+int32_t ph_remove(const uint8_t *path, size_t len, uint32_t dir) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
+    return (dir ? rmdir(buf) : unlink(buf)) == 0 ? 0 : fs_err();
+}
+
+int32_t ph_rename(const uint8_t *from, size_t flen, const uint8_t *to, size_t tlen) {
+    char a[4096], b[4096];
+    if (copy_cstr(a, sizeof a, from, flen) || copy_cstr(b, sizeof b, to, tlen)) return PH_ERR;
+    return rename(a, b) == 0 ? 0 : fs_err();
+}
+
+intptr_t ph_readdir(const uint8_t *path, size_t len, uint8_t *buf, size_t cap) {
+    char name[4096];
+    if (copy_cstr(name, sizeof name, path, len)) return PH_ERR;
+    DIR *d = opendir(name);
+    if (!d) return fs_err();
+    size_t need = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        size_t n = strlen(e->d_name);
+        uint8_t kind = e->d_type == DT_REG ? 1 : e->d_type == DT_DIR ? 2 : e->d_type == DT_LNK ? 3 : e->d_type == DT_UNKNOWN ? 0 : 4;
+        if (need + n + 2 <= cap) {
+            buf[need] = kind;
+            memcpy(buf + need + 1, e->d_name, n);
+            buf[need + 1 + n] = 0;
+        }
+        need += n + 2;
+    }
+    closedir(d);
+    return (intptr_t)need;
+}
+
+intptr_t ph_getcwd(uint8_t *buf, size_t cap) {
+    char tmp[4096];
+    if (!getcwd(tmp, sizeof tmp)) return fs_err();
+    size_t n = strlen(tmp);
+    if (n <= cap) memcpy(buf, tmp, n);
+    return (intptr_t)n;
+}
+
+int64_t ph_seek(int32_t fd, int64_t off, uint32_t whence) {
+    off_t r = lseek(fd, (off_t)off, whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET);
+    return r < 0 ? fs_err() : (int64_t)r;
+}
+
+static int g_argc;
+static char **g_argv;
+
+// glibc passes main's arguments to constructors too.
+__attribute__((constructor)) static void grab_args(int argc, char **argv) {
+    g_argc = argc;
+    g_argv = argv;
+}
+
+int32_t ph_argc(void) { return g_argc; }
+
+intptr_t ph_arg(int32_t i, uint8_t *buf, size_t cap) {
+    if (i < 0 || i >= g_argc || !g_argv) return PH_ERR;
+    size_t n = strlen(g_argv[i]);
+    if (n <= cap) memcpy(buf, g_argv[i], n);
+    return (intptr_t)n;
+}
+
+intptr_t ph_getenv(const uint8_t *name, size_t len, uint8_t *buf, size_t cap) {
+    char k[1024];
+    if (copy_cstr(k, sizeof k, name, len)) return -2;
+    const char *v = getenv(k);
+    if (!v) return -2;
+    size_t n = strlen(v);
+    if (n <= cap) memcpy(buf, v, n);
+    return (intptr_t)n;
+}
+
+__attribute__((weak)) void ph_profile_flush(void);
+
+void ph_exit(int32_t code) {
+    if (ph_profile_flush) ph_profile_flush();
+    exit(code);
+}
 
 static int resolve(const uint8_t *name, size_t len, uint32_t port, int passive, struct addrinfo **res) {
     char host[256], serv[16];

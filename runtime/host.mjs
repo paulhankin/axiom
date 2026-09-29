@@ -1,10 +1,11 @@
 // runtime/host.mjs - the Phalange host ABI (import module "phalange") for
 // WebAssembly under node, plus a runner:
 //
-//   node runtime/host.mjs program.wasm [export]
+//   node runtime/host.mjs program.wasm [export] [-- args...]
 //
 // calls `export` (default: main, else run). If it returns a number, that is
-// the process exit code. A trap exits with status 134.
+// the process exit code. A trap exits with status 134. Arguments after `--`
+// are the program's (its argument 0 is program.wasm).
 //
 // As a library: createHost(opts) returns
 //   { imports, instantiate(bytes, extraImports), instantiateModule(module, extraImports),
@@ -267,14 +268,32 @@ export function createHost(opts = {}) {
   const bytes = (p, n) => new Uint8Array(memory.buffer, p >>> 0, n >>> 0);
   const str = (p, n) => Buffer.from(memory.buffer, p >>> 0, n >>> 0).toString('utf8');
   const net = () => (netClient ||= new NetClient(opts.netPort));
+  const programArgs = opts.args || [];
+  // Positions of the files this host opened: node has no lseek, so reads
+  // and writes of them are positioned explicitly.
+  const pos = new Map();
+  const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39 })[e && e.code] || -1;
+  // Copies `buf` to p[0..cap] if it fits; returns its length.
+  const give = (buf, p, cap) => {
+    if (buf.length <= Number(cap)) bytes(Number(p), buf.length).set(buf);
+    return buf.length;
+  };
   const phalange = {
     ph_write(fd, p, n) {
-      try { return writeFd(fd, bytes(p, n).slice()); } catch { return -1; }
+      try {
+        if (!pos.has(fd)) return writeFd(fd, bytes(p, n).slice());
+        const at = pos.get(fd);
+        const w = fs.writeSync(fd, bytes(p, n).slice(), 0, n >>> 0, at < 0 ? null : at);
+        if (at >= 0) pos.set(fd, at + w);
+        return w;
+      } catch { return -1; }
     },
     ph_read(fd, p, n) {
       try {
         const buf = Buffer.alloc(Math.min(n >>> 0, READ_CHUNK));
-        const got = fs.readSync(fd, buf, 0, buf.length, null);
+        const at = pos.has(fd) ? pos.get(fd) : -1;
+        const got = fs.readSync(fd, buf, 0, buf.length, at < 0 ? null : at);
+        if (at >= 0) pos.set(fd, at + got);
         bytes(p, got).set(buf.subarray(0, got));
         return got;
       } catch (e) {
@@ -282,11 +301,87 @@ export function createHost(opts = {}) {
       }
     },
     ph_open(p, n, flags) {
-      try { return fs.openSync(str(p, n), ['r', 'w', 'a'][flags] || 'r'); } catch (e) {
-        return e.code === 'ENOENT' ? -2 : e.code === 'EACCES' ? -13 : -1;
+      try {
+        const fd = fs.openSync(str(p, n), ['r', 'w', 'a'][flags] || 'r');
+        pos.set(fd, flags === 2 ? -1 : 0);  // appends go to the end
+        return fd;
+      } catch (e) {
+        return fsErr(e);
       }
     },
-    ph_close(fd) { try { fs.closeSync(fd); } catch { /* ignore */ } },
+    ph_close(fd) {
+      pos.delete(fd);
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    },
+    ph_seek(fd, off, whence) {
+      if (!pos.has(fd)) return -1n;
+      try {
+        let base = 0;
+        if (whence === 1) base = Math.max(pos.get(fd), 0);
+        else if (whence === 2) base = fs.fstatSync(fd).size;
+        const at = base + Number(off);
+        if (at < 0) return -1n;
+        if (pos.get(fd) >= 0) pos.set(fd, at);
+        return BigInt(at);
+      } catch (e) {
+        return BigInt(fsErr(e));
+      }
+    },
+    ph_stat(p, n, follow, out) {
+      try {
+        const path = str(p, n);
+        const st = follow ? fs.statSync(path, { bigint: true }) : fs.lstatSync(path, { bigint: true });
+        const kind = st.isFile() ? 1n : st.isDirectory() ? 2n : st.isSymbolicLink() ? 3n : 4n;
+        const dv = new DataView(memory.buffer);
+        const o = Number(out);
+        dv.setBigInt64(o, kind, true);
+        dv.setBigInt64(o + 8, st.size, true);
+        dv.setBigInt64(o + 16, st.mtimeNs, true);
+        dv.setBigInt64(o + 24, st.mode & 0o7777n, true);
+        return 0;
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
+    ph_mkdir(p, n) {
+      try { fs.mkdirSync(str(p, n)); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_remove(p, n, dir) {
+      try {
+        if (dir) fs.rmdirSync(str(p, n));
+        else fs.unlinkSync(str(p, n));
+        return 0;
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
+    ph_rename(a, an, b, bn) {
+      try { fs.renameSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_readdir(p, n, out, cap) {
+      try {
+        const parts = [];
+        for (const e of fs.readdirSync(str(p, n), { withFileTypes: true })) {
+          const kind = e.isFile() ? 1 : e.isDirectory() ? 2 : e.isSymbolicLink() ? 3 : 4;
+          parts.push(Buffer.from([kind]), Buffer.from(e.name, 'utf8'), Buffer.from([0]));
+        }
+        return give(Buffer.concat(parts), out, cap);
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
+    ph_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
+    ph_argc: () => programArgs.length,
+    ph_arg(i, p, cap) {
+      if (i < 0 || i >= programArgs.length) return -1;
+      return give(Buffer.from(programArgs[i], 'utf8'), p, cap);
+    },
+    ph_getenv(p, n, out, cap) {
+      const v = process.env[str(p, n)];
+      if (v === undefined) return -2;
+      return give(Buffer.from(v, 'utf8'), out, cap);
+    },
+    ph_exit(code) { process.exit(code); },
     ph_tcp_connect: (p, n, port) => net().call('connect', { host: str(p, n), port }),
     ph_tcp_listen: (p, n, port) => net().call('listen', { host: str(p, n), port }),
     ph_tcp_accept: (h) => net().call('accept', { h }),
@@ -422,12 +517,14 @@ async function main() {
   const args = process.argv.slice(2);
   const profile = (args.find((a) => a.startsWith('--profile=')) || '').slice(10);
   const hz = Number((args.find((a) => a.startsWith('--profile-hz=')) || '--profile-hz=999').slice(13));
-  const [file, entry] = args.filter((a) => !a.startsWith('--'));
+  const dash = args.indexOf('--');
+  const own = dash < 0 ? args : args.slice(0, dash);
+  const [file, entry] = own.filter((a) => !a.startsWith('--'));
   if (!file) {
-    console.error('usage: node runtime/host.mjs [--profile=out.raw [--profile-hz=N]] program.wasm [export]');
+    console.error('usage: node runtime/host.mjs [--profile=out.raw [--profile-hz=N]] program.wasm [export] [-- args...]');
     process.exit(2);
   }
-  const host = createHost();
+  const host = createHost({ args: [file, ...(dash < 0 ? [] : args.slice(dash + 1))] });
   const instance = host.instantiate(fs.readFileSync(file));
   const name = entry || (instance.exports.main ? 'main' : 'run');
   const fn = instance.exports[name];
