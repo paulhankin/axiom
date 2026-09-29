@@ -426,6 +426,180 @@ int64_t ph_signal_take(int64_t timeout_ns) {
 }
 
 // -----------------------------------------------------------------------------
+// Addresses, IPv6, UDP, Unix sockets and polling (see runtime/native.ph for
+// the address records and the contract of each)
+// -----------------------------------------------------------------------------
+
+#include <poll.h>
+#include <sys/un.h>
+
+static socklen_t rec_sockaddr(const uint8_t *r, struct sockaddr_storage *ss) {
+    memset(ss, 0, sizeof *ss);
+    if (r[0] == 4) {
+        struct sockaddr_in *a = (struct sockaddr_in *)ss;
+        a->sin_family = AF_INET;
+        memcpy(&a->sin_port, r + 2, 2);
+        memcpy(&a->sin_addr, r + 4, 4);
+        return sizeof *a;
+    }
+    if (r[0] == 6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)ss;
+        a->sin6_family = AF_INET6;
+        memcpy(&a->sin6_port, r + 2, 2);
+        memcpy(&a->sin6_addr, r + 4, 16);
+        uint32_t scope;
+        memcpy(&scope, r + 20, 4);
+        a->sin6_scope_id = scope;
+        return sizeof *a;
+    }
+    return 0;
+}
+
+static int sockaddr_rec(const struct sockaddr *sa, uint8_t *r) {
+    memset(r, 0, 24);
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+        r[0] = 4;
+        memcpy(r + 2, &a->sin_port, 2);
+        memcpy(r + 4, &a->sin_addr, 4);
+        return 1;
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+        r[0] = 6;
+        memcpy(r + 2, &a->sin6_port, 2);
+        memcpy(r + 4, &a->sin6_addr, 16);
+        uint32_t scope = a->sin6_scope_id;
+        memcpy(r + 20, &scope, 4);
+        return 1;
+    }
+    return 0;
+}
+
+int32_t ph_resolve(const uint8_t *name, size_t len, uint8_t *out, uint32_t max) {
+    char host[256];
+    if (copy_cstr(host, sizeof host, name, len) || !len) return PH_BAD_ADDRESS;
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res)) return PH_BAD_ADDRESS;
+    uint32_t n = 0;
+    for (struct addrinfo *a = res; a && n < max; a = a->ai_next)
+        if (sockaddr_rec(a->ai_addr, out + 24 * n)) n++;
+    freeaddrinfo(res);
+    return n ? (int32_t)n : PH_BAD_ADDRESS;
+}
+
+int32_t ph_tcp_connect_addr(const uint8_t *r) {
+    struct sockaddr_storage ss;
+    socklen_t sl = rec_sockaddr(r, &ss);
+    if (!sl) return PH_BAD_ADDRESS;
+    int fd = socket(ss.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return PH_ERR;
+    int c;
+    do c = connect(fd, (struct sockaddr *)&ss, sl);
+    while (c < 0 && errno == EINTR);
+    if (c == 0) return fd;
+    int e = errno;
+    close(fd);
+    return e == ECONNREFUSED ? PH_REFUSED : PH_ERR;
+}
+
+int32_t ph_tcp_listen_addr(const uint8_t *r) {
+    struct sockaddr_storage ss;
+    socklen_t sl = rec_sockaddr(r, &ss);
+    if (!sl) return PH_BAD_ADDRESS;
+    int fd = socket(ss.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return PH_ERR;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(fd, (struct sockaddr *)&ss, sl) == 0 && listen(fd, 128) == 0) return fd;
+    int e = errno;
+    close(fd);
+    return e == EADDRINUSE ? PH_ADDR_IN_USE : PH_ERR;
+}
+
+int32_t ph_sock_addr(int32_t h, uint32_t peer, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if ((peer ? getpeername : getsockname)(h, (struct sockaddr *)&ss, &sl)) return PH_ERR;
+    return sockaddr_rec((struct sockaddr *)&ss, out) ? 0 : PH_ERR;
+}
+
+int32_t ph_udp_open(const uint8_t *r) {
+    struct sockaddr_storage ss;
+    socklen_t sl = rec_sockaddr(r, &ss);
+    if (!sl) return PH_BAD_ADDRESS;
+    int fd = socket(ss.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return PH_ERR;
+    if (bind(fd, (struct sockaddr *)&ss, sl) == 0) return fd;
+    int e = errno;
+    close(fd);
+    return e == EADDRINUSE ? PH_ADDR_IN_USE : PH_ERR;
+}
+
+intptr_t ph_udp_send(int32_t h, const uint8_t *p, size_t n, const uint8_t *r) {
+    struct sockaddr_storage ss;
+    socklen_t sl = rec_sockaddr(r, &ss);
+    if (!sl) return PH_BAD_ADDRESS;
+    ssize_t k;
+    do k = sendto(h, p, n, MSG_NOSIGNAL, (struct sockaddr *)&ss, sl);
+    while (k < 0 && errno == EINTR);
+    if (k < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? PH_TIMED_OUT : PH_ERR;
+    return (intptr_t)k;
+}
+
+intptr_t ph_udp_recv(int32_t h, uint8_t *p, size_t n, uint8_t *from) {
+    struct sockaddr_storage ss;
+    ssize_t k;
+    do {
+        socklen_t sl = sizeof ss;
+        k = recvfrom(h, p, n, 0, (struct sockaddr *)&ss, &sl);
+    } while (k < 0 && errno == EINTR);
+    if (k < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? PH_TIMED_OUT : PH_ERR;
+    sockaddr_rec((struct sockaddr *)&ss, from);
+    return (intptr_t)k;
+}
+
+static int unix_addr(const uint8_t *path, size_t len, struct sockaddr_un *a) {
+    if (!len || len >= sizeof a->sun_path || memchr(path, 0, len)) return 0;
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    memcpy(a->sun_path, path, len);
+    return 1;
+}
+
+int32_t ph_unix_connect(const uint8_t *path, size_t len) {
+    struct sockaddr_un a;
+    if (!unix_addr(path, len, &a)) return PH_BAD_ADDRESS;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return PH_ERR;
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) return fd;
+    int e = errno;
+    close(fd);
+    return e == ECONNREFUSED || e == ENOENT ? PH_REFUSED : PH_ERR;
+}
+
+int32_t ph_unix_listen(const uint8_t *path, size_t len) {
+    struct sockaddr_un a;
+    if (!unix_addr(path, len, &a)) return PH_BAD_ADDRESS;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return PH_ERR;
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) == 0 && listen(fd, 128) == 0) return fd;
+    int e = errno;
+    close(fd);
+    return e == EADDRINUSE ? PH_ADDR_IN_USE : PH_ERR;
+}
+
+int32_t ph_poll(uint8_t *entries, uint32_t n, int32_t timeout_ms) {
+    int r;
+    do r = poll((struct pollfd *)entries, n, timeout_ms);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : r;
+}
+
+// -----------------------------------------------------------------------------
 // More of the file system (see runtime/native.ph for the contract of each)
 // -----------------------------------------------------------------------------
 

@@ -93,6 +93,7 @@ let SYS_EXECVE: [2]i64 = [59, 221];
 let SYS_CHDIR: [2]i64 = [80, 49];
 let SYS_KILL: [2]i64 = [62, 129];
 let SYS_IOCTL: [2]i64 = [16, 29];
+let SYS_GETPEERNAME: [2]i64 = [52, 205];
 let SYS_FCHMODAT: [2]i64 = [268, 53];
 let SYS_SYMLINKAT: [2]i64 = [266, 36];
 let SYS_READLINKAT: [2]i64 = [267, 78];
@@ -376,6 +377,15 @@ pub fn getsockname(fd: i32, addr: *mut void, len: *mut u32) isize {
 
 pub fn sendto(fd: i32, p: *u8, n: usize, flags: i32, addr: usize, alen: u32) isize {
     return ph_syscall(nr(SYS_SENDTO), si(fd), @int_from_ptr(p), n, si(flags), addr, @as(usize, alen));
+}
+
+pub fn getpeername(fd: i32, addr: *mut void, len: *mut u32) isize {
+    return sys3(SYS_GETPEERNAME, si(fd), @int_from_ptr(addr), @int_from_ptr(len));
+}
+
+// recvfrom, with the sender's address
+pub fn recvfrom_addr(fd: i32, p: *mut u8, n: usize, addr: *mut void, len: *mut u32) isize {
+    return ph_syscall(nr(SYS_RECVFROM), si(fd), @int_from_ptr(p), n, 0, @int_from_ptr(addr), @int_from_ptr(len));
 }
 
 pub fn recvfrom(fd: i32, p: *mut u8, n: usize, flags: i32) isize {

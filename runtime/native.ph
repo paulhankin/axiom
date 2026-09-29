@@ -1729,6 +1729,422 @@ export fn ph_signal_take(timeout_ns: i64) i64 {
 }
 
 // -----------------------------------------------------------------------------
+// Addresses, IPv6, UDP, Unix sockets and polling
+//
+// An address record is 24 bytes: [0] the family (4 or 6), [2..4] the port
+// (big-endian), [4..20] the address (IPv4 in the first 4 bytes), [20..24]
+// the IPv6 scope id (little-endian).
+// -----------------------------------------------------------------------------
+
+fn rec_port(r: []u8) u32 {
+    return (@as(u32, r[2]) << 8) | @as(u32, r[3]);
+}
+
+// The record as a struct sockaddr; returns its length (0: bad family).
+fn rec_sockaddr(r: []u8, sa: []mut u8) u32 {
+    @mem_set(sa[..28], 0);
+    if r[0] == 4 {
+        sa[0] = 2;  // AF_INET
+        sa[2] = r[2];
+        sa[3] = r[3];
+        @mem_copy(sa[4..8], r[4..8]);
+        return 16;
+    }
+    if r[0] == 6 {
+        sa[0] = 10;  // AF_INET6
+        sa[2] = r[2];
+        sa[3] = r[3];
+        @mem_copy(sa[8..24], r[4..20]);
+        @mem_copy(sa[24..28], r[20..24]);
+        return 28;
+    }
+    return 0;
+}
+
+fn sockaddr_rec(sa: []u8, r: []mut u8) bool {
+    @mem_set(r[..24], 0);
+    let family = @as(u32, sa[0]) | (@as(u32, sa[1]) << 8);
+    if family == 2 {
+        r[0] = 4;
+        r[2] = sa[2];
+        r[3] = sa[3];
+        @mem_copy(r[4..8], sa[4..8]);
+        return true;
+    }
+    if family == 10 {
+        r[0] = 6;
+        r[2] = sa[2];
+        r[3] = sa[3];
+        @mem_copy(r[4..20], sa[8..24]);
+        @mem_copy(r[20..24], sa[24..28]);
+        return true;
+    }
+    return false;
+}
+
+fn hexval(c: u8) i32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(i32, c - '0');
+    }
+    let l = lower(c);
+    if (l >= 'a') and (l <= 'f') {
+        return @as(i32, l - 'a') + 10;
+    }
+    return -1;
+}
+
+// An IPv6 literal (without brackets or a zone) into 16 bytes.
+fn parse_ipv6(s: []u8, out: []mut u8) bool {
+    let mut groups: [8]u32 = [0; 8];
+    let mut n: usize = 0;
+    let mut gap: usize = 9;  // where "::" is (9: none)
+    let mut i: usize = 0;
+    if (s.len >= 2) and (s[0] == ':') and (s[1] == ':') {
+        gap = 0;
+        i = 2;
+    }
+    while i < s.len {
+        if n == 8 {
+            return false;
+        }
+        let mut v: u32 = 0;
+        let mut d: usize = 0;
+        while (i < s.len) and (hexval(s[i]) >= 0) and (d < 4) {
+            v = (v << 4) | @bit_cast(u32, hexval(s[i]));
+            i += 1;
+            d += 1;
+        }
+        if d == 0 {
+            return false;
+        }
+        groups[n] = v;
+        n += 1;
+        if i == s.len {
+            break;
+        }
+        if s[i] != ':' {
+            return false;
+        }
+        i += 1;
+        if (i < s.len) and (s[i] == ':') {
+            if gap != 9 {
+                return false;
+            }
+            gap = n;
+            i += 1;
+        } else if i == s.len {
+            return false;
+        }
+    }
+    if (gap == 9) and (n != 8) {
+        return false;
+    }
+    if (gap != 9) and (n > 7) {
+        return false;
+    }
+    @mem_set(out[..16], 0);
+    let mut at: usize = 0;
+    for k in @as(usize, 0)..n {
+        if k == gap {
+            at = 8 - (n - gap);
+        }
+        out[2 * at] = @truncate(u8, groups[k] >> 8);
+        out[(2 * at) + 1] = @truncate(u8, groups[k]);
+        at += 1;
+    }
+    return true;
+}
+
+// IPv6 addresses for name from /etc/hosts
+fn hosts_v6(name: []u8, out: []mut u8, max: usize) usize {
+    let mut buf: [16384]u8 = [0; 16384];
+    let mut ls = lines(read_small("/etc/hosts", buf[..]));
+    let mut n: usize = 0;
+    while ls.next() and (n < max) {
+        if ls.n < 2 {
+            continue;
+        }
+        let mut a: [16]u8 = [0; 16];
+        if not parse_ipv6(ls.words[0], a[..]) {
+            continue;
+        }
+        for k in 1..ls.n {
+            if same_name(ls.words[k], name) and (n < max) {
+                let r = out[n * 24..(n + 1) * 24];
+                @mem_set(r, 0);
+                r[0] = 6;
+                @mem_copy(r[4..20], a[..]);
+                n += 1;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
+// The addresses of a name: IPv4 ones (as ph_tcp_connect finds them) and
+// IPv6 literals and /etc/hosts entries. Returns how many.
+export fn ph_resolve(name: *u8, len: usize, out: *mut u8, max: u32) i32 {
+    let s = @slice_from_ptr(name, len);
+    let o = @slice_from_ptr(out, @as(usize, max) * 24);
+    let m = @as(usize, max);
+    if m == 0 {
+        return 0;
+    }
+    let mut a6: [16]u8 = [0; 16];
+    if parse_ipv6(s, a6[..]) {
+        @mem_set(o[..24], 0);
+        o[0] = 6;
+        @mem_copy(o[4..20], a6[..]);
+        return 1;
+    }
+    let mut n: usize = 0;
+    let mut v4: [8]u32 = [0; 8];
+    let k = resolve(s, v4[..]);
+    for i in @as(usize, 0)..k {
+        if n == m {
+            break;
+        }
+        let r = o[n * 24..(n + 1) * 24];
+        @mem_set(r, 0);
+        r[0] = 4;
+        // (resolve gives them in network byte order, as sockaddr_in has them)
+        r[4] = @truncate(u8, v4[i]);
+        r[5] = @truncate(u8, v4[i] >> 8);
+        r[6] = @truncate(u8, v4[i] >> 16);
+        r[7] = @truncate(u8, v4[i] >> 24);
+        n += 1;
+    }
+    if n < m {
+        n += hosts_v6(s, o[n * 24..], m - n);
+    }
+    if n == 0 {
+        return PH_BAD_ADDRESS;
+    }
+    return @truncate(i32, @bit_cast(isize, n));
+}
+
+fn socket_for(r: []u8, ty: i32) isize {
+    let mut family: i32 = 2;
+    if r[0] == 6 {
+        family = 10;
+    }
+    return sys.socket(family, ty | 0x80000, 0);
+}
+
+export fn ph_tcp_connect_addr(a: *u8) i32 {
+    let r = @slice_from_ptr(a, 24);
+    let mut sa: [28]u8 = [0; 28];
+    let sl = rec_sockaddr(r, sa[..]);
+    if sl == 0 {
+        return PH_BAD_ADDRESS;
+    }
+    let fd = socket_for(r, 1);
+    if fd < 0 {
+        return PH_ERR;
+    }
+    let sock = @truncate(i32, fd);
+    loop {
+        let c = sys.connect(sock, @ptr_cast(*void, &sa[0]), sl);
+        if retry(c) {
+            continue;
+        }
+        if c == 0 {
+            return sock;
+        }
+        _ = sys.close(sock);
+        if c == -sys.ECONNREFUSED {
+            return PH_REFUSED;
+        }
+        return PH_ERR;
+    }
+}
+
+export fn ph_tcp_listen_addr(a: *u8) i32 {
+    let r = @slice_from_ptr(a, 24);
+    let mut sa: [28]u8 = [0; 28];
+    let sl = rec_sockaddr(r, sa[..]);
+    if sl == 0 {
+        return PH_BAD_ADDRESS;
+    }
+    let fd = socket_for(r, 1);
+    if fd < 0 {
+        return PH_ERR;
+    }
+    let sock = @truncate(i32, fd);
+    let one: i32 = 1;
+    _ = sys.setsockopt(sock, 1, 2, @ptr_cast(*void, &one), 4);  // SO_REUSEADDR
+    let b = sys.bind(sock, @ptr_cast(*void, &sa[0]), sl);
+    if (b == 0) and (sys.listen(sock, 128) == 0) {
+        return sock;
+    }
+    _ = sys.close(sock);
+    if b == -sys.EADDRINUSE {
+        return PH_ADDR_IN_USE;
+    }
+    return PH_ERR;
+}
+
+// The socket's own address (peer 0) or its peer's.
+export fn ph_sock_addr(h: i32, peer: u32, out: *mut u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let mut sl: u32 = 128;
+    let mut r: isize = 0;
+    if peer != 0 {
+        r = sys.getpeername(h, @ptr_cast(*mut void, &mut ss[0]), &mut sl);
+    } else {
+        r = sys.getsockname(h, @ptr_cast(*mut void, &mut ss[0]), &mut sl);
+    }
+    if r != 0 {
+        return PH_ERR;
+    }
+    if not sockaddr_rec(ss[..], @slice_from_ptr(out, 24)) {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+// A UDP socket bound to the address (port 0: any).
+export fn ph_udp_open(a: *u8) i32 {
+    let r = @slice_from_ptr(a, 24);
+    let mut sa: [28]u8 = [0; 28];
+    let sl = rec_sockaddr(r, sa[..]);
+    if sl == 0 {
+        return PH_BAD_ADDRESS;
+    }
+    let fd = socket_for(r, 2);  // SOCK_DGRAM
+    if fd < 0 {
+        return PH_ERR;
+    }
+    let sock = @truncate(i32, fd);
+    let b = sys.bind(sock, @ptr_cast(*void, &sa[0]), sl);
+    if b != 0 {
+        _ = sys.close(sock);
+        if b == -sys.EADDRINUSE {
+            return PH_ADDR_IN_USE;
+        }
+        return PH_ERR;
+    }
+    return sock;
+}
+
+export fn ph_udp_send(h: i32, p: *u8, n: usize, a: *u8) isize {
+    let mut sa: [28]u8 = [0; 28];
+    let sl = rec_sockaddr(@slice_from_ptr(a, 24), sa[..]);
+    if sl == 0 {
+        return @as(isize, PH_BAD_ADDRESS);
+    }
+    loop {
+        let r = sys.sendto(h, p, n, 0x4000, @int_from_ptr(&sa[0]), sl);
+        if retry(r) {
+            continue;
+        }
+        if r == -sys.EAGAIN {
+            return @as(isize, PH_TIMED_OUT);
+        }
+        if r < 0 {
+            return @as(isize, PH_ERR);
+        }
+        return r;
+    }
+}
+
+// Receives a datagram (waiting at most the socket's timeout); its sender
+// goes to from.
+export fn ph_udp_recv(h: i32, p: *mut u8, n: usize, from: *mut u8) isize {
+    let mut ss: [128]u8 = [0; 128];
+    loop {
+        let mut sl: u32 = 128;
+        let r = sys.recvfrom_addr(h, p, n, @ptr_cast(*mut void, &mut ss[0]), &mut sl);
+        if retry(r) {
+            continue;
+        }
+        if r == -sys.EAGAIN {
+            return @as(isize, PH_TIMED_OUT);
+        }
+        if r < 0 {
+            return @as(isize, PH_ERR);
+        }
+        _ = sockaddr_rec(ss[..], @slice_from_ptr(from, 24));
+        return r;
+    }
+}
+
+fn unix_addr(path: *u8, len: usize, sa: []mut u8) bool {
+    if (len == 0) or (len > 107) {
+        return false;
+    }
+    @mem_set(sa[..110], 0);
+    sa[0] = 1;  // AF_UNIX
+    @mem_copy(sa[2..2 + len], @slice_from_ptr(path, len));
+    for c in sa[2..2 + len] {
+        if c == 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+export fn ph_unix_connect(path: *u8, len: usize) i32 {
+    let mut sa: [110]u8 = [0; 110];
+    if not unix_addr(path, len, sa[..]) {
+        return PH_BAD_ADDRESS;
+    }
+    let fd = sys.socket(1, 1 | 0x80000, 0);
+    if fd < 0 {
+        return PH_ERR;
+    }
+    let sock = @truncate(i32, fd);
+    let c = sys.connect(sock, @ptr_cast(*void, &sa[0]), @truncate(u32, len + 3));
+    if c == 0 {
+        return sock;
+    }
+    _ = sys.close(sock);
+    if (c == -sys.ECONNREFUSED) or (c == -sys.ENOENT) {
+        return PH_REFUSED;
+    }
+    return PH_ERR;
+}
+
+export fn ph_unix_listen(path: *u8, len: usize) i32 {
+    let mut sa: [110]u8 = [0; 110];
+    if not unix_addr(path, len, sa[..]) {
+        return PH_BAD_ADDRESS;
+    }
+    let fd = sys.socket(1, 1 | 0x80000, 0);
+    if fd < 0 {
+        return PH_ERR;
+    }
+    let sock = @truncate(i32, fd);
+    let b = sys.bind(sock, @ptr_cast(*void, &sa[0]), @truncate(u32, len + 3));
+    if (b == 0) and (sys.listen(sock, 128) == 0) {
+        return sock;
+    }
+    _ = sys.close(sock);
+    if b == -sys.EADDRINUSE {
+        return PH_ADDR_IN_USE;
+    }
+    return PH_ERR;
+}
+
+// entries: n of (handle i32, events u16, revents u16), events 1 readable
+// (or a connection to accept), 4 writable; revents also 8 error, 16 hung
+// up. Waits up to timeout_ms (-1: for ever); returns how many are ready.
+export fn ph_poll(entries: *mut u8, n: u32, timeout_ms: i32) i32 {
+    // struct pollfd has the same layout
+    loop {
+        let r = sys.ppoll(@ptr_cast(*mut void, entries), @as(u64, n), timeout_ms);
+        if retry(r) {
+            continue;
+        }
+        if r < 0 {
+            return PH_ERR;
+        }
+        return @truncate(i32, r);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // More of the file system: permissions, links, times, locks, mappings and
 // watching
 // -----------------------------------------------------------------------------

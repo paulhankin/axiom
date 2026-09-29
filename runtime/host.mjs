@@ -281,6 +281,16 @@ class SharedPositions {
   }
 }
 
+// An address record (see runtime/native.ph) as node's host and port.
+function addrOf(r) {
+  const port = (r[2] << 8) | r[3];
+  if (r[0] === 4) return { host: `${r[4]}.${r[5]}.${r[6]}.${r[7]}`, port, family: 4 };
+  if (r[0] !== 6) return null;
+  const g = [];
+  for (let i = 0; i < 8; i++) g.push(((r[4 + 2 * i] << 8) | r[5 + 2 * i]).toString(16));
+  return { host: g.join(':'), port, family: 6 };
+}
+
 export function createHost(opts = {}) {
   let memory = opts.memory || null;
   let module = null;
@@ -529,6 +539,58 @@ export function createHost(opts = {}) {
     ph_pipe_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ph_pipe_close: (h) => { net().call('close', { h }); },
     ph_signal: () => -2,  // unsupported
+    // Addresses, IPv6, UDP, Unix sockets and polling (on the net worker).
+    ph_resolve(p, n, out, max) {
+      const c = net();
+      const k = c.call('resolve', { name: str(p, n), max: Math.min(max >>> 0, READ_CHUNK / 24) });
+      if (k > 0) bytes(out, 24 * k).set(c.data.subarray(0, 24 * k));
+      return k;
+    },
+    ph_tcp_connect_addr(r) {
+      const a = addrOf(bytes(r, 24));
+      return a ? net().call('connect_addr', a) : -4;
+    },
+    ph_tcp_listen_addr(r) {
+      const a = addrOf(bytes(r, 24));
+      return a ? net().call('listen_addr', a) : -4;
+    },
+    ph_sock_addr(h, peer, out) {
+      const c = net();
+      const r = c.call('sock_addr', { h, peer });
+      if (r === 0) bytes(out, 24).set(c.data.subarray(0, 24));
+      return r;
+    },
+    ph_udp_open(r) {
+      const a = addrOf(bytes(r, 24));
+      return a ? net().call('udp_open', a) : -4;
+    },
+    ph_udp_send(h, p, n, r) {
+      const a = addrOf(bytes(r, 24));
+      return a ? net().call('udp_send', { h, host: a.host, port: a.port }, bytes(p, n).slice()) : -4;
+    },
+    ph_udp_recv(h, p, n, from) {
+      const c = net();
+      const k = c.call('udp_recv', { h, n: Math.min(n >>> 0, READ_CHUNK - 24) });
+      if (k >= 0) {
+        bytes(from, 24).set(c.data.subarray(0, 24));
+        bytes(p, k).set(c.data.subarray(24, 24 + k));
+      }
+      return k;
+    },
+    ph_unix_connect: (p, n) => net().call('unix_connect', { path: str(p, n) }),
+    ph_unix_listen: (p, n) => net().call('listen_addr', { path: str(p, n) }),
+    ph_poll(ep, n, timeout) {
+      const view = new DataView(memory.buffer, ep >>> 0, 8 * n);
+      const entries = [];
+      for (let k = 0; k < n; k++) entries.push({ h: view.getInt32(8 * k, true), events: view.getUint16(8 * k + 4, true) });
+      const c = net();
+      const r = c.call('poll', { entries, timeout });
+      if (r >= 0) {
+        const rev = new Uint16Array(c.data.buffer, 0, n);
+        for (let k = 0; k < n; k++) view.setUint16(8 * k + 6, rev[k], true);
+      }
+      return r;
+    },
     // More of the file system. Node has no flock and cannot map files into
     // the program's memory: ph_flock reports -95 (not supported) and ph_mmap
     // 0, for std/fs to fall back on. Watching runs on the net worker.

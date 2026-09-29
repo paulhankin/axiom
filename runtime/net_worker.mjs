@@ -8,6 +8,8 @@
 // through MessagePorts sent with a 'port' message.
 import { parentPort } from 'worker_threads';
 import child_process from 'child_process';
+import dgram from 'dgram';
+import dns from 'dns';
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -133,7 +135,7 @@ const ops = {
   },
   timeout(req, { h, ms }) {
     const st = handles.get(h);
-    if (!st || st.kind !== 'sock') return reply(req, ERR);
+    if (!st || (st.kind !== 'sock' && st.kind !== 'udp')) return reply(req, ERR);
     st.timeout = ms;
     reply(req, 0);
   },
@@ -147,6 +149,10 @@ const ops = {
     } else if (st && st.kind === 'watch') {
       for (const w of st.watches.values()) w.close();
       st.closed = true;
+      wake(st);
+    } else if (st && st.kind === 'udp') {
+      st.closed = true;
+      st.sock.close();
       wake(st);
     } else if (st && st.kind === 'sock') {
       if (st.readOnly) st.sock.destroy();
@@ -182,6 +188,168 @@ const ops = {
       for (let k = 0; k < 3; k++) if (modes[k] === 1) out[k] = addSocket(pipes[k], k !== 0);
       reply(req, h);
     });
+  },
+  // Addresses (records of 24 bytes: family, port, address, scope; see
+  // runtime/native.ph), written to data.
+  resolve(req, { name, max }) {
+    dns.lookup(name, { all: true }, (err, addrs) => {
+      if (err || !addrs.length) return reply(req, BAD_ADDRESS);
+      const data = new Uint8Array(req.data);
+      let n = 0;
+      for (const a of addrs) {
+        if (n >= max) break;
+        data.set(addrRecord(a.address, 0), 24 * n);
+        n++;
+      }
+      reply(req, n);
+    });
+  },
+  connect_addr(req, { host, port }) {
+    const sock = net.connect({ host, port });
+    const onError = (e) => reply(req, errCode(e));
+    sock.once('error', onError);
+    sock.once('connect', () => { sock.off('error', onError); reply(req, addSocket(sock)); });
+  },
+  listen_addr(req, { host, port, path: p }) {
+    const srv = net.createServer();
+    const st = { kind: 'listener', srv, queue: [], waiters: [], closed: false };
+    srv.on('connection', (c) => { st.queue.push(c); wake(st); });
+    const onError = (e) => reply(req, errCode(e));
+    srv.once('error', onError);
+    const done = () => {
+      srv.off('error', onError);
+      const h = nextHandle++;
+      handles.set(h, st);
+      reply(req, h);
+    };
+    if (p) srv.listen(p, done);
+    else srv.listen(port, host, done);
+  },
+  unix_connect(req, { path: p }) {
+    const sock = net.connect({ path: p });
+    const onError = (e) => reply(req, e && e.code === 'ENOENT' ? REFUSED : errCode(e));
+    sock.once('error', onError);
+    sock.once('connect', () => { sock.off('error', onError); reply(req, addSocket(sock)); });
+  },
+  sock_addr(req, { h, peer }) {
+    const st = handles.get(h);
+    if (!st) return reply(req, ERR);
+    let host, port;
+    if (st.kind === 'listener') ({ address: host, port } = st.srv.address() || {});
+    else if (st.kind === 'udp') ({ address: host, port } = st.sock.address());
+    else if (peer) { host = st.sock.remoteAddress; port = st.sock.remotePort; }
+    else { host = st.sock.localAddress; port = st.sock.localPort; }
+    if (!host) return reply(req, ERR);
+    new Uint8Array(req.data).set(addrRecord(host, port), 0);
+    reply(req, 0);
+  },
+  udp_open(req, { host, port, family }) {
+    const sock = dgram.createSocket(family === 6 ? 'udp6' : 'udp4');
+    const st = { kind: 'udp', sock, msgs: [], waiters: [], timeout: 0, closed: false };
+    sock.on('message', (m, rinfo) => { st.msgs.push({ m, rinfo }); wake(st); });
+    const onError = (e) => reply(req, errCode(e));
+    sock.once('error', onError);
+    sock.bind(port, host, () => {
+      sock.off('error', onError);
+      sock.on('error', () => {});
+      const h = nextHandle++;
+      handles.set(h, st);
+      reply(req, h);
+    });
+  },
+  udp_send(req, { h, host, port }, payload) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'udp') return reply(req, ERR);
+    st.sock.send(payload, port, host, (err) => reply(req, err ? ERR : payload.length));
+  },
+  // the sender's record, then the datagram, in data
+  udp_recv(req, { h, n }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'udp') return reply(req, ERR);
+    const data = new Uint8Array(req.data);
+    let timer = null;
+    let done = false;
+    const attempt = () => {
+      if (done) return;
+      if (st.msgs.length) {
+        const { m, rinfo } = st.msgs.shift();
+        const k = Math.min(m.length, n);
+        data.set(addrRecord(rinfo.address, rinfo.port), 0);
+        data.set(m.subarray(0, k), 24);
+        done = true;
+        if (timer) clearTimeout(timer);
+        reply(req, k);
+      } else if (st.closed) {
+        done = true;
+        reply(req, ERR);
+      } else {
+        st.waiters.push(attempt);
+      }
+    };
+    attempt();
+    if (!done && st.timeout > 0) {
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        st.waiters = st.waiters.filter((w) => w !== attempt);
+        reply(req, TIMED_OUT);
+      }, st.timeout);
+    }
+  },
+  // readiness of the program's own handles: revents (u16 each) in data
+  poll(req, { entries, timeout }) {
+    const data = new Uint16Array(req.data, 0, entries.length);
+    let timer = null;
+    let done = false;
+    const check = () => {
+      let ready = 0;
+      entries.forEach(({ h, events }, k) => {
+        const st = handles.get(h);
+        let r = 0;
+        if (!st) r = 8;
+        else if (st.kind === 'sock') {
+          if ((events & 1) && (st.chunks.length || st.ended)) r |= 1;
+          if (events & 4) r |= 4;
+          if (st.failed) r |= 8;
+          else if (st.ended && !st.chunks.length) r |= 16;
+        } else if (st.kind === 'listener') {
+          if ((events & 1) && st.queue.length) r |= 1;
+        } else if (st.kind === 'udp') {
+          if ((events & 1) && st.msgs.length) r |= 1;
+          if (events & 4) r |= 4;
+        } else if (st.kind === 'watch') {
+          if ((events & 1) && st.queue.length) r |= 1;
+        }
+        data[k] = r;
+        if (r) ready++;
+      });
+      return ready;
+    };
+    const attempt = () => {
+      if (done) return;
+      const n = check();
+      if (n || timeout === 0) {
+        done = true;
+        if (timer) clearTimeout(timer);
+        return reply(req, n);
+      }
+      for (const { h } of entries) {
+        const st = handles.get(h);
+        if (st && st.waiters && !st.waiters.includes(attempt)) st.waiters.push(attempt);
+      }
+    };
+    attempt();
+    if (!done && timeout > 0) {
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        for (const { h } of entries) {
+          const st = handles.get(h);
+          if (st && st.waiters) st.waiters = st.waiters.filter((w) => w !== attempt);
+        }
+        reply(req, 0);
+      }, timeout);
+    }
   },
   // Watching, as inotify would report it (records of wd, mask, cookie,
   // len, name): 'change' is IN_MODIFY; 'rename' is IN_CREATE or IN_DELETE
@@ -287,6 +455,38 @@ const ops = {
     reply(req, st.exited || st.child.kill(sig) ? 0 : ERR);
   },
 };
+
+// An address record for a textual address and a port.
+function addrRecord(host, port) {
+  const r = new Uint8Array(24);
+  r[2] = (port >> 8) & 0xff;
+  r[3] = port & 0xff;
+  if (net.isIPv4(host)) {
+    r[0] = 4;
+    host.split('.').forEach((p, i) => { r[4 + i] = Number(p); });
+    return r;
+  }
+  r[0] = 6;
+  let h = host;
+  const pct = h.indexOf('%');
+  if (pct >= 0) h = h.slice(0, pct);
+  if (h.includes('.')) {
+    // ::ffff:1.2.3.4
+    const k = h.lastIndexOf(':');
+    const v4 = h.slice(k + 1).split('.').map(Number);
+    h = h.slice(0, k + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16);
+  }
+  const [a, b] = h.split('::');
+  const left = a ? a.split(':') : [];
+  const right = b !== undefined && b ? b.split(':') : [];
+  const groups = b === undefined ? left : [...left, ...Array(8 - left.length - right.length).fill('0'), ...right];
+  groups.forEach((g, i) => {
+    const v = parseInt(g || '0', 16);
+    r[4 + 2 * i] = v >> 8;
+    r[5 + 2 * i] = v & 0xff;
+  });
+  return r;
+}
 
 function spawnErr(e) {
   switch (e && e.code) {
