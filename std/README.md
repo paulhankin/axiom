@@ -15,6 +15,7 @@ and a type that owns memory has `deinit`).
 | [`deque`](deque.ph) | `Deque[T]`: double-ended queue on a ring buffer |
 | [`heap`](heap.ph) | `Heap[T]`: priority queue (binary heap), built from a slice in linear time |
 | [`bitset`](bitset.ph) | `BitSet`: fixed-size sets of bits, `next_set`/`next_clear`, union/intersection |
+| [`rand`](rand.ph) | Seedable pseudo-random numbers (xoshiro256\*\*): integers in ranges without bias, floats, normal, exponential, Poisson and weighted choices, `shuffle`, `choose`, `jump` for parallel streams; not for secrets (see `crypto/random`) |
 | [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
 | [`path`](path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |
@@ -36,6 +37,9 @@ and a type that owns memory has `deinit`).
 | [`tls`](tls.ph) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
 | [`deflate`](deflate.ph) | Compression and decompression: DEFLATE in the raw, zlib and gzip formats (levels 0–9, output within a fraction of a percent of zlib's size), whole-buffer (`compress`, `decompress`) or streaming (`Compressor` as an `io.Writer`, `Decompressor` as an `io.Reader`); `crc32`, `adler32` |
 | [`base64`](base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets |
+| [`base32`](base32.ph) | Base32 (RFC 4648), standard and extended-hex alphabets, padded or not |
+| [`hex`](hex.ph) | Hexadecimal encoding and decoding; `xxd`-style hex dumps |
+| [`mime`](mime.ph) | Media types by extension, `Content-Type` parsing, header parameters (quoted strings, RFC 2231 `name*`), quoted-printable, multipart bodies (`Multipart` reader, `MultipartWriter` for form-data) |
 | [`math`](math.ph) | Elementary functions on `f64` (and `f32`, suffixed `f`): `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `pow`, `cbrt`, `hypot`, `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `ldexp`, `frexp`; constants. Within 1 ulp (2 for `tan`, `expm1`, `sinh`, `tanh`), trigonometry of huge arguments included |
 | [`color`](color.ph) | `Color` (linear-light RGB + alpha, HDR-capable), `Rgba8`/`Rgba16` (sRGB-encoded); sRGB encoding (exact 8-bit tables), HSV, HSL, CIE XYZ, L\*a\*b\*, LCh, Oklab, Oklch, YCbCr; Display P3 and Rec. 2020 gamuts; PQ and HLG transfer functions, tone mapping; CIE76 / CIEDE2000 differences, WCAG contrast; `mix`, `over`, premultiplied alpha; CSS-style parsing and hex formatting |
 | [`image`](image.ph) | `Image`: 1–4 channels of U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
