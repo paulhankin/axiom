@@ -425,6 +425,39 @@ int64_t ph_signal_take(int64_t timeout_ns) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Terminals
+// -----------------------------------------------------------------------------
+
+#include <sys/ioctl.h>
+#include <termios.h>
+
+int32_t ph_isatty(int32_t fd) { return isatty(fd) ? 1 : 0; }
+
+int32_t ph_term_size(int32_t fd, uint32_t *out) {
+    struct winsize ws;
+    if (ioctl(fd, TIOCGWINSZ, &ws)) return PH_ERR;
+    out[0] = ws.ws_col;
+    out[1] = ws.ws_row;
+    return 0;
+}
+
+static struct termios saved_termios;
+static int saved_fd = -1;
+
+int32_t ph_term_raw(int32_t fd, uint32_t enable) {
+    if (!enable) {
+        if (saved_fd != fd) return PH_ERR;
+        saved_fd = -1;
+        return tcsetattr(fd, TCSADRAIN, &saved_termios) ? PH_ERR : 0;
+    }
+    struct termios t;
+    if (tcgetattr(fd, &t)) return PH_ERR;
+    if (saved_fd < 0) { saved_termios = t; saved_fd = fd; }
+    cfmakeraw(&t);
+    return tcsetattr(fd, TCSADRAIN, &t) ? PH_ERR : 0;
+}
+
 static int resolve(const uint8_t *name, size_t len, uint32_t port, int passive, struct addrinfo **res) {
     char host[256], serv[16];
     if (copy_cstr(host, sizeof host, name, len)) return PH_BAD_ADDRESS;

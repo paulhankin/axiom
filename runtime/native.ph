@@ -1727,6 +1727,86 @@ export fn ph_signal_take(timeout_ns: i64) i64 {
 }
 
 // -----------------------------------------------------------------------------
+// Terminals
+// -----------------------------------------------------------------------------
+
+const TCGETS: u64 = 0x5401;
+const TCSETSW: u64 = 0x5403;
+const TIOCGWINSZ: u64 = 0x5413;
+
+export fn ph_isatty(fd: i32) i32 {
+    let mut t: [64]u8 = [0; 64];
+    if sys.ioctl(fd, TCGETS, @int_from_ptr(&t[0])) == 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// out: columns, rows
+export fn ph_term_size(fd: i32, out: *mut u32) i32 {
+    let mut ws: [4]u16 = [0; 4];
+    if sys.ioctl(fd, TIOCGWINSZ, @int_from_ptr(&ws[0])) != 0 {
+        return PH_ERR;
+    }
+    let o = @slice_from_ptr(out, 2);
+    o[0] = @as(u32, ws[1]);
+    o[1] = @as(u32, ws[0]);
+    return 0;
+}
+
+// The terminal settings before raw mode (the kernel's struct termios: four
+// u32 flag words, the line discipline and 19 control characters).
+let mut saved_termios: [64]u8 = [0; 64];
+let mut saved_fd: i32 = -1;
+
+// enable 1: raw mode (no echo, no line editing, no signals from keys, no
+// output processing), saving the settings; 0: back to them.
+export fn ph_term_raw(fd: i32, enable: u32) i32 {
+    if enable == 0 {
+        if saved_fd != fd {
+            return PH_ERR;
+        }
+        saved_fd = -1;
+        if sys.ioctl(fd, TCSETSW, @int_from_ptr(&saved_termios[0])) != 0 {
+            return PH_ERR;
+        }
+        return 0;
+    }
+    let mut t: [64]u8 = [0; 64];
+    if sys.ioctl(fd, TCGETS, @int_from_ptr(&t[0])) != 0 {
+        return PH_ERR;
+    }
+    if saved_fd < 0 {
+        saved_termios = t;
+        saved_fd = fd;
+    }
+    let mut w: [4]u32 = [0; 4];
+    for k in @as(usize, 0)..4 {
+        w[k] = @as(u32, t[4 * k]) | (@as(u32, t[(4 * k) + 1]) << 8) | (@as(u32, t[(4 * k) + 2]) << 16) | (
+            @as(u32, t[(4 * k) + 3]) << 24);
+    }
+    // cfmakeraw
+    w[0] &= ~@as(u32, 0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x400);  // IGNBRK BRKINT PARMRK ISTRIP INLCR IGNCR ICRNL IXON
+    w[1] &= ~@as(u32, 0x1);  // OPOST
+    w[3] &= ~@as(u32, 0x8 | 0x40 | 0x2 | 0x1 | 0x8000);  // ECHO ECHONL ICANON ISIG IEXTEN
+    w[2] &= ~@as(u32, 0x30 | 0x100);                     // CSIZE PARENB
+    w[2] |= 0x30;                                        // CS8
+    for k in @as(usize, 0)..4 {
+        t[4 * k] = @truncate(u8, w[k]);
+        t[(4 * k) + 1] = @truncate(u8, w[k] >> 8);
+        t[(4 * k) + 2] = @truncate(u8, w[k] >> 16);
+        t[(4 * k) + 3] = @truncate(u8, w[k] >> 24);
+    }
+    // c_cc starts after the flags and c_line: VTIME is 5, VMIN 6
+    t[17 + 5] = 0;
+    t[17 + 6] = 1;
+    if sys.ioctl(fd, TCSETSW, @int_from_ptr(&t[0])) != 0 {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
 // Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
 // region reserved at the first use. The region is as large as the system
 // allows (up to 1 TiB of address space); the kernel supplies physical pages

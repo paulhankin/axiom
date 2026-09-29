@@ -92,6 +92,7 @@ let SYS_LSEEK: [2]i64 = [8, 62];
 let SYS_EXECVE: [2]i64 = [59, 221];
 let SYS_CHDIR: [2]i64 = [80, 49];
 let SYS_KILL: [2]i64 = [62, 129];
+let SYS_IOCTL: [2]i64 = [16, 29];
 
 fn nr(t: [2]i64) i64 {
     if phalange_target_arch() == 2 {
@@ -380,6 +381,10 @@ pub fn wait4(pid: i32, status: *mut i32, options: i32) isize {
 
 pub fn execve(path: *u8, argv: usize, envp: usize) isize {
     return sys3(SYS_EXECVE, @int_from_ptr(path), argv, envp);
+}
+
+pub fn ioctl(fd: i32, req: u64, p: usize) isize {
+    return sys3(SYS_IOCTL, si(fd), @truncate(usize, req), p);
 }
 
 pub fn chdir(path: *u8) isize {

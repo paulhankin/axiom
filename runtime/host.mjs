@@ -14,6 +14,7 @@
 import fs from 'fs';
 import os from 'os';
 import { MessageChannel, Worker } from 'worker_threads';
+import tty from 'tty';
 
 const READ_CHUNK = 1 << 16;
 
@@ -528,6 +529,22 @@ export function createHost(opts = {}) {
     ph_pipe_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ph_pipe_close: (h) => { net().call('close', { h }); },
     ph_signal: () => -2,  // unsupported
+    // Terminals: the size of stdout's and stderr's, raw mode for stdin (on
+    // the main thread only).
+    ph_isatty: (fd) => (tty.isatty(fd) ? 1 : 0),
+    ph_term_size(fd, out) {
+      const s = fd === 1 ? process.stdout : fd === 2 ? process.stderr : null;
+      if (!s || !s.isTTY || !s.getWindowSize) return -1;
+      const [cols, rows] = s.getWindowSize();
+      const o = new Uint32Array(memory.buffer, out >>> 0, 2);
+      o[0] = cols;
+      o[1] = rows;
+      return 0;
+    },
+    ph_term_raw(fd, enable) {
+      if (fd !== 0 || !process.stdin.isTTY || !process.stdin.setRawMode) return -1;
+      try { process.stdin.setRawMode(enable !== 0); return 0; } catch { return -1; }
+    },
     ph_signal_take: () => -1n,
     ph_thread_spawn(entry, arg, stackTop, exited) {
       // The new thread shares this program's sockets.
