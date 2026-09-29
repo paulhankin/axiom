@@ -118,11 +118,13 @@ pub struct Affine {
 // Paths
 // -----------------------------------------------------------------------------
 
-const V_MOVE: u8 = 0;
-const V_LINE: u8 = 1;
-const V_QUAD: u8 = 2;
-const V_CUBIC: u8 = 3;
-const V_CLOSE: u8 = 4;
+// A Path's verbs, for code that walks `verbs` and `pts` (move and line
+// take one point, quad two, cubic three, close none).
+pub const V_MOVE: u8 = 0;
+pub const V_LINE: u8 = 1;
+pub const V_QUAD: u8 = 2;
+pub const V_CUBIC: u8 = 3;
+pub const V_CLOSE: u8 = 4;
 
 /// A sequence of subpaths, each starting with move_to.
 pub struct Path {

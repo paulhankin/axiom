@@ -83,6 +83,7 @@ pub struct Font {
     gpos: Table,
     cff: Cff,
     is_cff: bool,
+    start: usize,  // the table directory (a collection holds several)
 
     /// A font from the bytes of a font file (the first font of a
     /// collection). The bytes must outlive the Font.
@@ -124,6 +125,7 @@ pub struct Font {
             gpos: Table.{ off: 0, len: 0 },
             cff: Cff.{ charstrings: 0, gsubrs: 0, subrs: 0, fdarray: 0, fdselect: 0, base: 0 },
             is_cff: false,
+            start: start,
         };
         let n = @as(usize, u16at(data, start + 4));
         let mut head = Table.{ off: 0, len: 0 };
@@ -193,6 +195,37 @@ pub struct Font {
         };
         f.owned = bytes;
         return f;
+    }
+
+    /// The bytes of a table ("head", "glyf", "CFF ", ...), empty if the
+    /// font has none: for code that reads what Font does not, or embeds
+    /// the font (std/pdf).
+    pub fn table(self: *Font, tag: []u8) []u8 {
+        let n = @as(usize, u16at(self.data, self.start + 4));
+        for i in @as(usize, 0)..n {
+            let r = self.start + 12 + (16 * i);
+            if (tag.len == 4) and tag_is(self.data, r, tag) {
+                let off = @as(usize, u32at(self.data, r + 8));
+                let len = @as(usize, u32at(self.data, r + 12));
+                if (off <= self.data.len) and (len <= self.data.len - off) {
+                    return self.data[off..off + len];
+                }
+            }
+        }
+        return self.data[..0];
+    }
+
+    /// The tags of the font's tables, in order ("head", "glyf", ...).
+    pub fn table_count(self: *Font) usize {
+        return @as(usize, u16at(self.data, self.start + 4));
+    }
+
+    pub fn table_tag(self: *Font, i: usize) []u8 {
+        let r = self.start + 12 + (16 * i);
+        if r + 4 > self.data.len {
+            return self.data[..0];
+        }
+        return self.data[r..r + 4];
     }
 
     pub fn deinit(self: *mut Font) void {
