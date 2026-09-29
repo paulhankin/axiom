@@ -2129,9 +2129,11 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
 
 The allocator and the runtime are not instrumented. Memory that is not from the heap
 (globals, locals, memory from `@memory_grow`) is not checked. Allocation sites come from
-the shadow stack, so they need `--stack-traces=on` (the default). Programs run several
-times slower and use more memory. In code, `@sanitize_address()` is a constant: whether
-the program is being built with the sanitizer.
+the shadow stack, so they need `--stack-traces=on` (the default). Each checked access
+looks its shadow byte up inline and calls into `std/mem.ph` only when that test fails, so
+programs typically run three to four times slower, and use more memory. In code,
+`@sanitize_address()` is a constant: whether the program is being built with the
+sanitizer.
 
 ## 17. Testing
 

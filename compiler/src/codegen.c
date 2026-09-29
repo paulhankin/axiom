@@ -1418,12 +1418,64 @@ static FnInst *mem_fn(const char *name) {
     exit(3);
 }
 
+static LLVMValueRef mem_global(const char *name) {
+    for (int i = 0; i < g_prog.globals.len; i++) {
+        Decl *d = g_prog.globals.data[i];
+        if (strcmp(d->name, name) != 0 || !d->module) continue;
+        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ph")) return global_ref(d);
+    }
+    fprintf(stderr, "phalange: internal error: std/mem.ph has no %s (is --std right?)\n", name);
+    exit(3);
+}
+
+// The check is inline for the common cases: an access of at most 8 bytes
+// within one granule of tracked (heap) memory whose shadow byte is 0, or an
+// access within one 64 KiB page that the sanitizer does not track (stack,
+// globals). It walks std/mem.ph's shadow tables (as_base, as_l1, then the
+// page's table and its shadow bytes) and calls mem.asan_check, which
+// reports, only when that fails.
 static void asan_check(LLVMValueRef addr, LLVMValueRef size) {
     if (!asan_on()) return;
+    LLVMValueRef a = LLVMBuildPtrToInt(B, addr, T_isz, "");
+    LLVMValueRef sz = size;
+    LLVMBasicBlockRef l1_bb = new_bb("asan.l1"), l2_bb = new_bb("asan.l2"), sh_bb = new_bb("asan.shadow");
+    LLVMBasicBlockRef untracked = new_bb("asan.untracked"), slow = new_bb("asan.slow"), done = new_bb("asan.ok");
+    LLVMValueRef base = LLVMBuildLoad2(B, T_isz, mem_global("as_base"), "");
+    LLVMValueRef rel = LLVMBuildSub(B, LLVMBuildLShr(B, a, usz(16), ""), base, "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, rel, usz(1 << 24), ""), l1_bb, untracked);
+    // the page's table
+    LLVMPositionBuilderAtEnd(B, l1_bb);
+    LLVMValueRef l1 = mem_global("as_l1");
+    LLVMValueRef idx[2] = {usz(0), LLVMBuildLShr(B, rel, usz(12), "")};
+    LLVMValueRef l2 = LLVMBuildLoad2(B, T_isz, LLVMBuildInBoundsGEP2(B, LLVMArrayType(T_isz, 4096), l1, idx, 2, ""), "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntNE, l2, usz(0), ""), l2_bb, untracked);
+    // the page's shadow
+    LLVMPositionBuilderAtEnd(B, l2_bb);
+    LLVMValueRef slot = LLVMBuildAdd(B, l2, LLVMBuildMul(B, LLVMBuildAnd(B, rel, usz(4095), ""), usz(8), ""), "");
+    LLVMValueRef sp64 = LLVMBuildLoad2(B, T_i64, LLVMBuildIntToPtr(B, slot, T_ptr, ""), "");
+    LLVMValueRef sp = LLVMBuildTruncOrBitCast(B, sp64, T_isz, "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntNE, sp, usz(0), ""), sh_bb, untracked);
+    // the granule: all 8 bytes usable, and the access within it
+    LLVMPositionBuilderAtEnd(B, sh_bb);
+    LLVMValueRef sa = LLVMBuildAdd(B, sp, LLVMBuildLShr(B, LLVMBuildAnd(B, a, usz(0xffff), ""), usz(3), ""), "");
+    LLVMValueRef sb = LLVMBuildLoad2(B, T_i8, LLVMBuildIntToPtr(B, sa, T_ptr, ""), "");
+    LLVMValueRef in_granule = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntULE, sz, usz(8), ""),
+        LLVMBuildICmp(B, LLVMIntULE, LLVMBuildAdd(B, LLVMBuildAnd(B, a, usz(7), ""), sz, ""), usz(8), ""), "");
+    LLVMValueRef ok1 = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntEQ, sb, LLVMConstInt(T_i8, 0, false), ""), in_granule, "");
+    LLVMBuildCondBr(B, ok1, done, slow);
+    // memory the sanitizer does not track: fine within one page
+    LLVMPositionBuilderAtEnd(B, untracked);
+    LLVMValueRef in_page = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntULE, sz, usz(0x10000), ""),
+        LLVMBuildICmp(B, LLVMIntULE, LLVMBuildAdd(B, LLVMBuildAnd(B, a, usz(0xffff), ""), sz, ""), usz(0x10000), ""), "");
+    LLVMBuildCondBr(B, in_page, done, slow);
+    // everything else: the full check, which reports
+    LLVMPositionBuilderAtEnd(B, slow);
     FnInst *fi = mem_fn("asan_check");
-    LLVMValueRef args[2] = {LLVMBuildPtrToInt(B, addr, T_isz, ""), size};
+    LLVMValueRef args[2] = {a, sz};
     LLVMValueRef ok = emit_call(fi->llty, fi->fn, fi->fnty, false, args, 2, fi->fnty->params, NULL);
     check_or_trap(LLVMBuildICmp(B, LLVMIntNE, ok, LLVMConstInt(LLVMTypeOf(ok), 0, false), ""), T_MEMORY);
+    LLVMBuildBr(B, done);
+    LLVMPositionBuilderAtEnd(B, done);
 }
 
 // Checks the memory of a slice value (all of its elements).

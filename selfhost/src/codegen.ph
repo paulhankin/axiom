@@ -2889,14 +2889,72 @@ fn mem_fn(name: []u8) *mut FnInst {
     return u.nil.[FnInst]();
 }
 
+fn mem_global(name: []u8) *mut ir.Value {
+    let P = sema.g_prog;
+    for i in 0..P.globals.len {
+        let d = P.globals.get(i);
+        if u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.str_eq(u.file_of(d.module.file.id).display, "std/mem.ph") {
+            return global_ref(d);
+        }
+    }
+    internal_error(u.f1("std/mem.ph has no %s (is --std right?)", name));
+    return u.nil.[ir.Value]();
+}
+
+// The check is inline for the common cases: an access of at most 8 bytes
+// within one granule of tracked (heap) memory whose shadow byte is 0, or an
+// access within one 64 KiB page that the sanitizer does not track (stack,
+// globals). It walks std/mem.ph's shadow tables (as_base, as_l1, then the
+// page's table and its shadow bytes) and calls mem.asan_check, which
+// reports, only when that fails.
 fn asan_check(addr: *mut ir.Value, size: *mut ir.Value) void {
     if not asan_on() {
         return;
     }
+    let a = ptrtoint(addr, T_isz);
+    let l1_bb = new_bb("asan.l1".ptr);
+    let l2_bb = new_bb("asan.l2".ptr);
+    let sh_bb = new_bb("asan.shadow".ptr);
+    let untracked = new_bb("asan.untracked".ptr);
+    let slow = new_bb("asan.slow".ptr);
+    let done = new_bb("asan.ok".ptr);
+    let base = ld(T_isz, mem_global("as_base"));
+    let rel = b_sub(ir.binop(B, ir.OP_LSHR, a, usz(16)), base);
+    condbr(icmp(ir.IntULT, rel, usz(1 << 24)), l1_bb, untracked);
+    // the page's table
+    at_end(l1_bb);
+    let entry = gep1(T_isz, mem_global("as_l1"), ir.binop(B, ir.OP_LSHR, rel, usz(12)));
+    let l2 = ld(T_isz, entry);
+    condbr(icmp(ir.IntNE, l2, usz(0)), l2_bb, untracked);
+    // the page's shadow
+    at_end(l2_bb);
+    let slot = b_add(l2, b_mul(b_and(rel, usz(4095)), usz(8)));
+    let sp64 = ld(T_i64, inttoptr(slot, T_ptr));
+    let mut sp = sp64;
+    if T_isz != T_i64 {
+        sp = trunc(sp64, T_isz);
+    }
+    condbr(icmp(ir.IntNE, sp, usz(0)), sh_bb, untracked);
+    // the granule: all 8 bytes usable, and the access within it
+    at_end(sh_bb);
+    let sa = b_add(sp, ir.binop(B, ir.OP_LSHR, b_and(a, usz(0xffff)), usz(3)));
+    let sb = ld(T_i8, inttoptr(sa, T_ptr));
+    let in_granule = b_and(icmp(ir.IntULE, size, usz(8)), icmp(ir.IntULE, b_add(b_and(a, usz(7)), size), usz(8)));
+    condbr(b_and(icmp(ir.IntEQ, sb, ir.czero(T_i8)), in_granule), done, slow);
+    // memory the sanitizer does not track: fine within one page
+    at_end(untracked);
+    let in_page = b_and(
+        icmp(ir.IntULE, size, usz(0x10000)), icmp(ir.IntULE, b_add(b_and(a, usz(0xffff)), size), usz(0x10000)));
+    condbr(in_page, done, slow);
+    // everything else: the full check, which reports
+    at_end(slow);
     let fi = mem_fn("asan_check");
-    let mut args: [2]*mut ir.Value = [ptrtoint(addr, T_isz), size];
+    let mut args: [2]*mut ir.Value = [a, size];
     let ok = call(fi.llty, fi.fnv, args[..]);
     check_or_trap(icmp(ir.IntNE, ok, ir.czero(ok.ty)), T_MEMORY);
+    br(done);
+    at_end(done);
 }
 
 // Checks the memory of a slice value (all of its elements).
