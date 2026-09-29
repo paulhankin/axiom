@@ -47,9 +47,12 @@
 // =============================================================================
 
 import "fmt.ph" as fmt;
+import "hpack.ph" as hpack;
+import "http2.ph" as http2;
 import "io.ph" as io;
 import "mem.ph" as mem;
 import "net.ph" as net;
+import "process.ph" as process;
 import "str.ph" as strs;
 import "sync.ph" as sync;
 import "thread.ph" as thread;
@@ -272,10 +275,11 @@ struct Conn {
     pin: usize,     // buf[..pin] holds the current head: never moved
     limit: usize,   // the most buf may grow to
     deadline: i64,  // monotonic ns by which the current message must arrive (0: none)
+    h2: bool,       // the client sent HTTP/2's preface
 
     fn init(stream: Transport, limit: usize) !Conn {
         let b = mem.alloc.[u8](@min(16384, limit))!;
-        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0 };
+        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0, h2: false };
     }
 
     fn deinit(self: *mut Conn) void {
@@ -670,7 +674,10 @@ pub struct Response {
     started: bool,  // the status line and headers have been sent
     chunked: bool,
     has_type: bool,
-    upgraded: bool,  // the handler took the connection over
+    upgraded: bool,       // the handler took the connection over
+    h2: *mut http2.Conn,  // for HTTP/2 (is_h2): the connection and stream
+    h2_id: u32,
+    is_h2: bool,
 
     pub fn set_status(self: *mut Response, status: u16) void {
         self.status = status;
@@ -734,6 +741,16 @@ pub struct Response {
 
     /// Sends what is buffered now and streams the rest of the body.
     pub fn flush(self: *mut Response) !void {
+        if self.is_h2 {
+            if not self.started {
+                self.h2_head(false, 0, false)!;
+            }
+            if (self.body.len > 0) and not self.head_only {
+                self.h2.send_data(self.h2_id, self.body.bytes(), false)!;
+            }
+            self.body.clear();
+            return;
+        }
         if not self.started {
             if self.version == 0 {
                 // no chunked encoding in HTTP/1.0: the body ends at close
@@ -770,7 +787,7 @@ pub struct Response {
     /// and returns the connection. The handler then speaks the new protocol
     /// on it until it returns, when the server closes it.
     pub fn upgrade(self: *mut Response) !Transport {
-        if self.started {
+        if self.started or self.is_h2 {
             return error.InvalidHeader;
         }
         self.status = 101;
@@ -816,8 +833,84 @@ pub struct Response {
         self.stream.write_all(h.bytes())!;
     }
 
+    // HTTP/2: the status and headers as a HEADERS frame (the connection's
+    // own headers do not exist in HTTP/2, and names are lower-case)
+    fn h2_head(self: *mut Response, with_length: bool, length: usize, end: bool) !void {
+        let mut store = strs.String.init();
+        defer store.deinit();
+        let mut spans = vec.Vec.[[4]usize].init();
+        defer spans.deinit();
+        let mut sb: [8]u8 = [0; 8];
+        let st = fmt.format_int(sb[..], self.status);
+        store.push_str(":status")!;
+        store.push_str(st)!;
+        spans.push([0, 7, 7, st.len])!;
+        let mut lines = strs.lines(self.head.bytes());
+        while true {
+            let line = lines.next() catch break;
+            let c = strs.index_of(line, ": ") catch continue;
+            let name = line[..c];
+            if strs.eq_ignore_case(name, "Connection") or strs.eq_ignore_case(name, "Keep-Alive") or
+               strs.eq_ignore_case(name, "Upgrade") or strs.eq_ignore_case(name, "Transfer-Encoding") {
+                continue;
+            }
+            let na = store.len;
+            for ch in name {
+                store.push(strs.to_lower_byte(ch))!;
+            }
+            let va = store.len;
+            store.push_str(strs.trim_right(line[c + 2..]))!;
+            spans.push([na, name.len, va, store.len - va])!;
+        }
+        let mut db: [32]u8 = [0; 32];
+        let date = time.now().format_http(db[..]);
+        let da = store.len;
+        store.push_str("date")!;
+        store.push_str(date)!;
+        spans.push([da, 4, da + 4, date.len])!;
+        if not self.has_type and (with_length and (length > 0)) {
+            let ta = store.len;
+            store.push_str("content-typetext/plain; charset=utf-8")!;
+            spans.push([ta, 12, ta + 12, 25])!;
+        }
+        if with_length {
+            let mut lb: [24]u8 = [0; 24];
+            let l = fmt.format_int(lb[..], length);
+            let la = store.len;
+            store.push_str("content-length")!;
+            store.push_str(l)!;
+            spans.push([la, 14, la + 14, l.len])!;
+        }
+        let mut hs = vec.Vec.[hpack.Header].init();
+        defer hs.deinit();
+        let b = store.bytes();
+        for sp in spans.items() {
+            hs.push(hpack.Header.{ name: b[sp[0]..sp[0] + sp[1]], value: b[sp[2]..sp[2] + sp[3]] })!;
+        }
+        self.h2.send_headers(self.h2_id, hs.items(), end)!;
+        self.started = true;
+    }
+
     /// Completes the response after the handler returns.
     fn finish(self: *mut Response) !void {
+        if self.is_h2 {
+            let no_body = (self.status == 204) or (self.status == 304) or self.head_only;
+            if not self.started {
+                let n = self.body.len;
+                self.h2_head(true, n, no_body or (n == 0))!;
+                if not no_body and (n > 0) {
+                    self.h2.send_data(self.h2_id, self.body.bytes(), true)!;
+                }
+            } else {
+                let mut rest: []u8 = "";
+                if not no_body {
+                    rest = self.body.bytes();
+                }
+                self.h2.send_data(self.h2_id, rest, true)!;
+            }
+            self.body.clear();
+            return;
+        }
         if not self.started {
             let n = self.body.len;
             let no_body = (self.status == 204) or (self.status == 304);
@@ -961,7 +1054,11 @@ fn accept_loop[C](s: *mut Server.[C]) void {
             // the handshake closes the socket if it fails
             t = Transport.over_tls(tls.server(conn, s.tls_config) catch continue);
         }
-        serve_connection(s, t);
+        if s.secure and strs.eq(t.tls.protocol(), "h2") {
+            serve_h2(s, t, "");
+        } else {
+            serve_connection(s, t);
+        }
         t.close();
     }
 }
@@ -1001,6 +1098,15 @@ fn serve_connection[C](s: *mut Server.[C], stream: Transport) void {
     loop {
         let keep = serve_request(s, &mut c, &mut body, &mut scratch) catch false;
         scratch.clear();
+        if c.h2 {
+            // the preface was read as a request head: give HTTP/2 all of it
+            let mut pre = strs.String.init();
+            defer pre.deinit();
+            pre.push_str("PRI * HTTP/2.0\r\n\r\n") catch return;
+            pre.push_str(c.buf[c.start..c.end]) catch return;
+            serve_h2(s, c.stream, pre.bytes());
+            return;
+        }
         if (not keep) or (@atomic_load(&s.stopping) != 0) {
             return;
         }
@@ -1009,6 +1115,99 @@ fn serve_connection[C](s: *mut Server.[C], stream: Transport) void {
             body.deinit();
         }
         body.clear();
+    }
+}
+
+fn transport_read(ctx: *mut void, buf: []mut u8) !usize {
+    let t = @ptr_cast(*mut Transport, ctx);
+    return t.read(buf)!;
+}
+
+fn transport_write(ctx: *mut void, bytes: []u8) !usize {
+    let t = @ptr_cast(*mut Transport, ctx);
+    t.write_all(bytes)!;
+    return bytes.len;
+}
+
+// HTTP/2: the requests of a connection, one at a time (the others wait,
+// their frames handled meanwhile).
+fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
+    let mut t = stream;
+    let r = io.Reader.{ ctx: @ptr_cast(*mut void, &mut t), read_fn: transport_read };
+    let w = io.Writer.{ ctx: @ptr_cast(*mut void, &mut t), write_fn: transport_write };
+    let mut h = http2.Conn.init(r, w, true, prefill) catch return;
+    defer h.deinit();
+    h.max_body = s.opts.max_body_bytes;
+    h.handshake() catch return;
+    let mut scratch = new_scratch();
+    defer scratch.blocks.deinit();
+    let mut hs = vec.Vec.[Header].init();
+    defer hs.deinit();
+    loop {
+        if @atomic_load(&s.stopping) != 0 {
+            h.goaway(http2.NO_ERROR) catch {};
+            return;
+        }
+        let id = h.step() catch return;
+        if id == 0 {
+            // the client said goodbye, and nothing is left to answer
+            if h.got_goaway and (h.streams.len == 0) {
+                return;
+            }
+            continue;
+        }
+        let st = h.stream(id) catch continue;
+        if st.reset {
+            h.drop_stream(id);
+            continue;
+        }
+        let method = st.header(":method");
+        let target = st.header(":path");
+        if (method.len == 0) or (target.len == 0) or strs.eq(method, "CONNECT") {
+            h.reset_stream(id, http2.PROTOCOL_ERROR) catch return;
+            h.drop_stream(id);
+            continue;
+        }
+        // the headers as HTTP/1's (with Host from :authority)
+        hs.clear();
+        let authority = st.header(":authority");
+        if authority.len > 0 {
+            hs.push(Header.{ name: "host", value: authority }) catch return;
+        }
+        for x in st.headers() {
+            if (x.name.len > 0) and (x.name[0] != ':') {
+                hs.push(Header.{ name: x.name, value: x.value }) catch return;
+            }
+        }
+        let q = strs.index_of_byte(target, '?') catch target.len;
+        let mut query: []u8 = "";
+        if q < target.len {
+            query = target[q + 1..];
+        }
+        let req = Request.{ method: method, target: target, path: target[..q], query: query, version: 1,
+                            headers: hs.items(), body: st.body.bytes(), scratch: &mut scratch };
+        let mut res = Response.{ stream: t, status: 200, head: strs.String.init(), body: strs.String.init(), version: 1,
+                                 head_only: @mem_eq(method, "HEAD"), keep_alive: true, started: false, chunked: false,
+                                 has_type: false, upgraded: false, h2: &mut h, h2_id: id, is_h2: true };
+        s.handler(s.ctx, &req, &mut res) catch {
+            if not res.started {
+                res.status = 500;
+                res.head.clear();
+                res.body.clear();
+                res.has_type = false;
+                res.write("Internal Server Error\n") catch {};
+            }
+        };
+        let ok = res.finish();
+        res.head.deinit();
+        res.body.deinit();
+        scratch.clear();
+        h.drop_stream(id);
+        ok catch |e| {
+            if e != error.StreamReset {
+                return;
+            }
+        };
     }
 }
 
@@ -1054,6 +1253,10 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
         if (ch <= 0x20) or (ch == 0x7F) {
             return reject(c.stream, 400);
         }
+    }
+    if @mem_eq(method, "PRI") and @mem_eq(target, "*") and @mem_eq(proto, "HTTP/2.0") {
+        c.h2 = true;  // (serve_connection continues in HTTP/2)
+        return false;
     }
     let mut version: u8 = 1;
     if @mem_eq(proto, "HTTP/1.0") {
@@ -1134,6 +1337,9 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
         chunked: false,
         has_type: false,
         upgraded: false,
+        h2: @ptr_from_int(*mut http2.Conn, 8),
+        h2_id: 0,
+        is_h2: false,
     };
     defer res.head.deinit();
     defer res.body.deinit();
@@ -1367,6 +1573,71 @@ pub fn parse_url(url: []u8) !Url {
     return Url.{ hostname: hostname, port: port, target: target[..hash], secure: secure };
 }
 
+let H2_ALPN: [2][]u8 = ["h2", "http/1.1"];
+
+fn request_h2(t: *mut Transport, u: Url, method: []u8, headers: []Header, body: []u8,
+              opts: ClientOptions) !ClientResponse {
+    let r = io.Reader.{ ctx: @ptr_cast(*mut void, t), read_fn: transport_read };
+    let w = io.Writer.{ ctx: @ptr_cast(*mut void, t), write_fn: transport_write };
+    let mut auth = strs.String.init();
+    defer auth.deinit();
+    auth.push_str(u.hostname)!;
+    if ((u.port != 80) and not u.secure) or ((u.port != 443) and u.secure) {
+        fmt.write(auth.writer(), ":{}", [fmt.int(u.port)])!;
+    }
+    let mut scheme: []u8 = "http";
+    if u.secure {
+        scheme = "https";
+    }
+    let mut c = http2.Client.init(r, w, auth.bytes(), scheme)!;
+    defer c.deinit();
+    c.conn.max_body = opts.max_body_bytes;
+    // names in lower case, for HTTP/2
+    let mut store = strs.String.init();
+    defer store.deinit();
+    for x in headers {
+        for ch in x.name {
+            store.push(strs.to_lower_byte(ch))!;
+        }
+    }
+    let mut hs = vec.Vec.[hpack.Header].init();
+    defer hs.deinit();
+    let mut at: usize = 0;
+    let lower = store.bytes();
+    for x in headers {
+        hs.push(hpack.Header.{ name: lower[at..at + x.name.len], value: x.value })!;
+        at += x.name.len;
+    }
+    let mut resp = c.request(method, u.target, hs.items(), body)!;
+    defer resp.deinit();
+    // a ClientResponse owning copies
+    let mut total: usize = 0;
+    for x in resp.headers {
+        total += x.name.len + x.value.len;
+    }
+    let hm = mem.alloc.[u8](total)!;
+    let hdrs = mem.alloc.[Header](resp.headers.len) catch |e| {
+        mem.free(hm);
+        return e;
+    };
+    let mut k: usize = 0;
+    for i in @as(usize, 0)..resp.headers.len {
+        let x = resp.headers[i];
+        @mem_copy(hm[k..k + x.name.len], x.name);
+        @mem_copy(hm[k + x.name.len..k + x.name.len + x.value.len], x.value);
+        hdrs[i] = Header.{ name: hm[k..k + x.name.len], value: hm[k + x.name.len..k + x.name.len + x.value.len] };
+        k += x.name.len + x.value.len;
+    }
+    let mut rb = strs.String.init();
+    rb.push_str(resp.body) catch |e| {
+        mem.free(hm);
+        mem.free(hdrs);
+        return e;
+    };
+    return ClientResponse.{ status: resp.status, reason: reason_phrase(resp.status), headers: hdrs, body: rb.bytes(),
+                            head_mem: hm, header_mem: hdrs, body_mem: rb };
+}
+
 /// A response received by the client. It owns its memory: call deinit.
 pub struct ClientResponse {
     status: u16,
@@ -1394,6 +1665,7 @@ pub struct ClientOptions {
     max_body_bytes: usize,
     tls_config: *tls.ClientConfig,  // for https (see with_tls)
     has_tls_config: bool,
+    http2: bool,  // offer HTTP/2 (ALPN "h2"; for http://, assume it)
 
     pub fn default() ClientOptions {
         return ClientOptions.{
@@ -1401,7 +1673,17 @@ pub struct ClientOptions {
             max_body_bytes: 1073741824,
             tls_config: @ptr_from_int(*tls.ClientConfig, 8),
             has_tls_config: false,
+            http2: false,
         };
+    }
+
+    /// These options, with HTTP/2 when the server speaks it: https://
+    /// servers that agree to "h2" by ALPN; http:// ones are assumed to
+    /// speak it ("prior knowledge"), so use this only for those that do.
+    pub fn with_http2(self: ClientOptions) ClientOptions {
+        let mut o = self;
+        o.http2 = true;
+        return o;
     }
 
     /// These options with https:// connections using cfg (which must
@@ -1486,6 +1768,7 @@ pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: Cli
         return e;
     };
     let mut stream = Transport.plain(tcp);
+    let mut use_h2 = opts.http2 and not u.secure;
     if u.secure {
         let mut cfg = opts.tls_config;
         if not opts.has_tls_config {
@@ -1494,9 +1777,18 @@ pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: Cli
                 return e;
             };
         }
-        stream = Transport.over_tls(tls.client(tcp, u.hostname, cfg)!);  // closes tcp on failure
+        // (offering h2 by ALPN on a copy of the configuration)
+        let mut c2 = cfg.*;
+        if opts.http2 {
+            c2.alpn = H2_ALPN[..];
+        }
+        stream = Transport.over_tls(tls.client(tcp, u.hostname, &c2)!);  // closes tcp on failure
+        use_h2 = opts.http2 and strs.eq(stream.tls.protocol(), "h2");
     }
     defer stream.close();
+    if use_h2 {
+        return request_h2(&mut stream, u, method, headers, body, opts)!;
+    }
     // the request head
     let mut h = strs.String.init();
     defer h.deinit();
@@ -1909,4 +2201,134 @@ test "https" {
 fn fails[T](r: !T) bool {
     _ = r catch return true;
     return false;
+}
+
+fn stream_read(ctx: *mut void, buf: []mut u8) !usize {
+    let t = @ptr_cast(*mut net.TcpStream, ctx);
+    return t.read(buf)!;
+}
+
+fn stream_write(ctx: *mut void, bytes: []u8) !usize {
+    let t = @ptr_cast(*mut net.TcpStream, ctx);
+    return t.write(bytes)!;
+}
+
+test "HTTP/2" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    r.post("/echo", t_echo)!;
+    r.get("/big", t_big)!;
+    let mut opts = Options.default();
+    opts.threads = 2;
+    opts.max_body_bytes = 8388608;
+    let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut url: [128]u8 = [0; 128];
+    let h2 = ClientOptions.default().with_http2();
+    // prior knowledge, on a plain connection
+    let mut a = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/hello?name=h2", [fmt.int(port)])!,
+                        no_headers(), "", h2)!;
+    @expect_eq(a.status, 200);
+    @expect_eq(a.body, "hello, h2");
+    @expect_eq(a.header("content-type")!, "text/plain; charset=utf-8");
+    a.deinit();
+    let mut c = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/big", [fmt.int(port)])!, no_headers(), "",
+                        h2)!;
+    @expect_eq(c.body.len, 110000);
+    c.deinit();
+    // a body bigger than the windows: flow control has to open them
+    let big = mem.alloc.[u8](3000000)!;
+    defer mem.free(big);
+    for k in @as(usize, 0)..big.len {
+        big[k] = @truncate(u8, k * 13);
+    }
+    let mut e = request("POST", fmt.bufprint(url[..], "http://127.0.0.1:{}/echo", [fmt.int(port)])!, no_headers(), big,
+                        h2)!;
+    @expect(e.status == 201);
+    @expect(@mem_eq(e.body, big));
+    @expect_eq(e.header("x-length")!, "3000000");
+    e.deinit();
+    // several requests on one connection
+    let mut tcp = net.connect("127.0.0.1", port)!;
+    let rd = io.Reader.{ ctx: @ptr_cast(*mut void, &mut tcp), read_fn: stream_read };
+    let wr = io.Writer.{ ctx: @ptr_cast(*mut void, &mut tcp), write_fn: stream_write };
+    let mut cl = http2.Client.init(rd, wr, "127.0.0.1", "http")!;
+    for k in @as(usize, 0)..5 {
+        let mut resp = cl.request("GET", "/hello?name=again", no_h2_headers(), "")!;
+        @expect((resp.status == 200) and strs.eq(resp.body, "hello, again"));
+        resp.deinit();
+        _ = k;
+    }
+    let mut nf = cl.request("GET", "/nowhere", no_h2_headers(), "")!;
+    @expect(nf.status == 404);
+    nf.deinit();
+    cl.deinit();
+    tcp.close();
+    // curl, where it is installed (nghttp2's HTTP/2)
+    let cargs: [6][]u8 = [
+        "curl", "-s", "--http2-prior-knowledge", "-w", " %{http_version}", fmt.bufprint(
+            url[..], "http://127.0.0.1:{}/hello?name=curl", [fmt.int(port)])!];
+    let mut out = process.run(cargs[..]) catch process.Output.{ status: process.Status.{ code: -1, signal: 0 },
+                                                                stdout: mem.alloc.[u8](0)!,
+                                                                stderr: mem.alloc.[u8](0)! };
+    if out.status.success() {
+        @expect_eq(out.stdout, "hello, curl 2");
+    }
+    out.deinit();
+    srv.stop();
+    th.join();
+}
+
+fn no_h2_headers() []hpack.Header {
+    return NO_H2[..0];
+}
+
+let NO_H2: [1]hpack.Header = [hpack.Header.{ name: "", value: "" }];
+
+let H2_SERVER_ALPN: [2][]u8 = ["h2", "http/1.1"];
+
+test "HTTP/2 over TLS" {
+    let cert = tls.test_certificate_pem()!;
+    defer mem.free(cert);
+    let key = tls.test_key_pem()!;
+    defer mem.free(key);
+    let mut scfg = tls.ServerConfig.from_pem(cert, key)!;
+    defer scfg.deinit();
+    scfg.alpn = H2_SERVER_ALPN[..];
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/hello", t_hello)!;
+    let mut opts = Options.default();
+    opts.threads = 2;
+    let mut srv = server_tls("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts, &scfg)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut ccfg = tls.ClientConfig.with_roots_pem(cert)!;
+    defer ccfg.deinit();
+    let mut url: [128]u8 = [0; 128];
+    // with and without h2 offered
+    let mut a = request("GET", fmt.bufprint(url[..], "https://localhost:{}/hello?name=alpn", [fmt.int(port)])!,
+                        no_headers(), "", ClientOptions.default().with_tls(&ccfg).with_http2())!;
+    @expect_eq(a.body, "hello, alpn");
+    a.deinit();
+    let mut b = request("GET", fmt.bufprint(url[..], "https://localhost:{}/hello?name=h1", [fmt.int(port)])!,
+                        no_headers(), "", ClientOptions.default().with_tls(&ccfg))!;
+    @expect_eq(b.body, "hello, h1");
+    b.deinit();
+    let cargs2: [6][]u8 = [
+        "curl", "-sk", "--http2", "-w", " %{http_version}", fmt.bufprint(
+            url[..], "https://localhost:{}/hello?name=curl", [fmt.int(port)])!];
+    let mut out = process.run(cargs2[..]) catch process.Output.{ status: process.Status.{ code: -1, signal: 0 },
+                                                                 stdout: mem.alloc.[u8](0)!,
+                                                                 stderr: mem.alloc.[u8](0)! };
+    if out.status.success() {
+        @expect_eq(out.stdout, "hello, curl 2");
+    }
+    out.deinit();
+    srv.stop();
+    th.join();
 }
