@@ -8,6 +8,7 @@ and a type that owns memory has `deinit`).
 |---|---|
 | [`mem`](mem.ph) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `create(v)` / `destroy(p)`, `in_use()`; under `--sanitize=address`, shadow memory, quarantine and leak reports (`leaks_ignored`) |
 | [`vec`](vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
+| [`arena`](arena.ph) | `Arena`: bump allocation freed all at once (`bytes`, `dup`, `copy[T]`), for parsed documents |
 | [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
 | [`set`](set.ph) | `Set[K]`: hash set with union, intersection and difference in place |
@@ -32,6 +33,9 @@ and a type that owns memory has `deinit`).
 | [`fmt`](fmt.ph) | Templates: `fmt.print("{} is {:>5.2}\n", [fmt.str(s), fmt.float(x)])`, also `write`, `alloc`, `bufprint`; `parse_int[T]`, `parse_float` (correctly rounded), `format_float` (shortest round trip), `format_int` |
 | [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`), RFC 3339 and HTTP dates, `sleep` |
 | [`json`](json.ph) | `parse` → `Document` (a `Value` tree: `get`, `at`, `as_str`, `as_i64`, …); `Writer` (streaming, compact or pretty); `stringify` |
+| [`toml`](toml.ph) | TOML 1.0.0: `parse` → `Document` (`Value`: strings, integers, floats, booleans, `DateTime` of four kinds, arrays, tables; `get`, `path("a.b")`, `at`, typed accessors), `stringify`. Passes toml-test's 709 TOML 1.0 cases ([`toml/testdata`](toml/testdata), from [`tools/gen_toml_tests.py`](../tools/gen_toml_tests.py)) |
+| [`csv`](csv.ph) | CSV (RFC 4180): a `Reader` of records (quoted fields with delimiters, quotes and line breaks; other delimiters, comments, trimming, lazy quotes, a field limit) and a `Writer` that quotes only when needed |
+| [`ini`](ini.ph) | INI files: sections, `key = value` / `key: value`, comments, continuation lines; case-insensitive lookups with typed getters; a `Writer` |
 | [`markdown`](markdown.ph) | Markdown: CommonMark 0.31.2 (passes all 652 specification examples) with the GitHub extensions (tables, strikethrough, extended autolinks, task lists, tag filter); `parse` → `Document` (a tree of nodes with `walk`, `text`, `url`, `plain_text`), `to_html`. Safe for untrusted input by default (raw HTML omitted, dangerous URLs dropped), linear time on hostile input. Entities from [`tools/gen_entities.py`](../tools/gen_entities.py) |
 | [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies (HTTPS with `server_tls` / `Router.serve_tls`), `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`) for `http://` and `https://` URLs; percent-encoding |
 | [`tls`](tls.ph) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
