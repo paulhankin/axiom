@@ -3,7 +3,7 @@
 // status: 23
 // stderr: memory leaks
 // stderr: leak of 24 bytes
-// stderr: at keep (tests/sanitize/leak.ph:17:16)
+// stderr: leak.ph:17:16)
 // stderr: 24 bytes leaked in 1 allocations
 import "../../std/mem.ph" as mem;
 

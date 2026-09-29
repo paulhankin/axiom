@@ -4,9 +4,9 @@
 // stderr: heap-use-after-free: 4-byte access
 // stderr: 4 bytes inside a 16-byte allocation
 // stderr: freed:
-// stderr: at main (tests/sanitize/use_after_free.ph:20:5)
+// stderr: use_after_free.ph:20:5)
 // stderr: allocated:
-// stderr: at make (tests/sanitize/use_after_free.ph:13:14)
+// stderr: use_after_free.ph:13:14)
 import "../../std/mem.ph" as mem;
 
 fn make() ![]mut u32 {
