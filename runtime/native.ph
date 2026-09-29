@@ -77,6 +77,12 @@ fn copy_cstr(buf: []mut u8, s: *u8, n: usize) bool {
     if n > 0 {
         @mem_copy(buf[0..n], @slice_from_ptr(s, n));
     }
+    // a NUL would silently cut the name short
+    for i in @as(usize, 0)..n {
+        if buf[i] == 0 {
+            return false;
+        }
+    }
     buf[n] = 0;
     return true;
 }
@@ -178,17 +184,18 @@ export fn ph_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
     let o = @slice_from_ptr(out, 4);
     o[0] = kind;
     o[1] = @bit_cast(i64, rd64(st[..], 40));
-    o[2] = (@bit_cast(i64, rd64(st[..], 112)) * 1000000000) + @as(i64, rd32(st[..], 120));
+    // (nanoseconds overflow 64 bits for times past 2262: saturate)
+    o[2] = @add_sat(@mul_sat(@bit_cast(i64, rd64(st[..], 112)), 1000000000), @as(i64, rd32(st[..], 120)));
     o[3] = @as(i64, mode & 0o7777);
     return 0;
 }
 
-export fn ph_mkdir(path: *u8, len: usize) i32 {
+export fn ph_mkdir(path: *u8, len: usize, mode: u32) i32 {
     let mut buf: [4096]u8 = [0; 4096];
     if not copy_cstr(buf[..], path, len) {
         return PH_ERR;
     }
-    let r = sys.mkdir(&buf[0], 0o777);
+    let r = sys.mkdir(&buf[0], @bit_cast(i32, mode & 0o7777));
     if r < 0 {
         return fs_err(r);
     }
@@ -516,9 +523,16 @@ fn sockaddr(a: u32, port: u32) SockAddrIn {
 // One DNS query for the A records of `name`, to name server `ns`.
 fn dns_query(name: []u8, ns: u32, out: []mut u32) usize {
     let mut q: [512]u8 = [0; 512];
-    let mut ts = sys.Timespec.{ sec: 0, nsec: 0 };
-    _ = sys.clock_gettime(1, &mut ts);
-    let id = @truncate(u16, @bit_cast(u64, ts.nsec) ^ @bit_cast(u64, ts.sec));
+    // a random query id (with the source check below, a spoofed answer
+    // must guess it)
+    let mut rid: [2]u8 = [0, 0];
+    if sys.getrandom(&mut rid[0], 2) != 2 {
+        let mut ts = sys.Timespec.{ sec: 0, nsec: 0 };
+        _ = sys.clock_gettime(1, &mut ts);
+        rid[0] = @truncate(u8, @bit_cast(u64, ts.nsec) >> 8);
+        rid[1] = @truncate(u8, @bit_cast(u64, ts.nsec ^ ts.sec));
+    }
+    let id = (@as(u16, rid[0]) << 8) | @as(u16, rid[1]);
     q[0] = @truncate(u8, id >> 8);
     q[1] = @truncate(u8, id);
     q[2] = 1;  // recursion desired
@@ -547,10 +561,15 @@ fn dns_query(name: []u8, ns: u32, out: []mut u32) usize {
     }
     let sock = @truncate(i32, fd);
     let sa = sockaddr(ns, 53);
+    // connected: the kernel drops datagrams from anyone but the name server
+    if sys.connect(sock, @ptr_cast(*void, &sa), 16) < 0 {
+        _ = sys.close(sock);
+        return 0;
+    }
     let mut got: usize = 0;
     let mut r: [1024]u8 = [0; 1024];
     for _attempt in @as(u32, 0)..2 {
-        if sys.sendto(sock, &q[0], n, 0, @int_from_ptr(&sa), 16) < 0 {
+        if sys.sendto(sock, &q[0], n, 0, 0, 0) < 0 {
             break;
         }
         let mut pfd: [2]u32 = [@bit_cast(u32, sock), 1];  // POLLIN
@@ -561,7 +580,7 @@ fn dns_query(name: []u8, ns: u32, out: []mut u32) usize {
         if len < 12 {
             continue;
         }
-        got = parse_answer(r[0..@bit_cast(usize, len)], id, out);
+        got = parse_answer(r[0..@bit_cast(usize, len)], id, q[12..n], out);
         break;
     }
     _ = sys.close(sock);
@@ -588,16 +607,17 @@ fn be16(m: []u8, i: usize) usize {
     return (@as(usize, m[i]) << 8) | @as(usize, m[i + 1]);
 }
 
-fn parse_answer(m: []u8, id: u16, out: []mut u32) usize {
+fn parse_answer(m: []u8, id: u16, question: []u8, out: []mut u32) usize {
     if (be16(m, 0) != @as(usize, id)) or ((m[3] & 15) != 0) {
         return 0;
     }
     let qd = be16(m, 4);
     let an = be16(m, 6);
-    let mut i: usize = 12;
-    for _q in 0..qd {
-        i = skip_name(m, i) + 4;
+    // the answer is to our question
+    if (qd != 1) or ((12 + question.len) > m.len) or not u_eq(m[12..12 + question.len], question) {
+        return 0;
     }
+    let mut i: usize = 12 + question.len;
     let mut n: usize = 0;
     for _a in 0..an {
         i = skip_name(m, i);
@@ -873,9 +893,16 @@ fn thread_run(p: *mut void) void {
     _ = ph_notify32(st.exited, 1);
 }
 
-// (pthread_create's calling convention: returns a pointer)
+// (pthread_create's calling convention: returns a pointer.) The thread
+// frees its own mapping (record and signal stack) when it is done: its
+// stack is the C library's.
 fn thread_main(p: *mut void) *mut void {
+    let st = @ptr_cast(*mut ThreadStart, p);
+    let base = st.base;
+    let size = st.size;
     thread_run(p);
+    _ = sys.sigaltstack_disable();
+    _ = sys.munmap(base, size);
     return @ptr_from_int(*mut void, 0);
 }
 
@@ -962,7 +989,7 @@ export fn ph_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: 
 
 // With the C library linked: its threads (and its own thread-local storage),
 // so that C code runs on them too. The mapping holds the record and signal
-// stack; it is kept for the life of the program.
+// stack; the thread unmaps it as it ends.
 fn spawn_pthread(entry: fn(*mut void) void, arg: *mut void, exited: *mut u32) i32 {
     let size = align_up(ALT + @size_of(ThreadStart) + 64, 65536);
     let base = sys.mmap_anon(size);

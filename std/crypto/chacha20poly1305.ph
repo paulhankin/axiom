@@ -12,6 +12,11 @@ import "subtle.ph" as subtle;
 
 error { AuthFailed, InvalidLength }
 
+/// The block counter (from 1) is 32 bits: at most 2^32 - 1 blocks of 64 bytes.
+fn too_long(n: usize) bool {
+    return @as(u64, n) > (((@as(u64, 1) << 32) - 1) * 64);
+}
+
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
@@ -293,7 +298,8 @@ fn compute_tag(key: []u8, nonce: []u8, aad: []u8, ct: []u8, tag: []mut u8) void 
 /// Encrypts plaintext into out (plaintext.len + 16 bytes: the ciphertext,
 /// then the tag), authenticating aad as well.
 pub fn seal(key: []u8, nonce: []u8, aad: []u8, plaintext: []u8, out: []mut u8) !void {
-    if (key.len != KEY_LEN) or (nonce.len != NONCE_LEN) or (out.len != (plaintext.len + TAG_LEN)) {
+    if (key.len != KEY_LEN) or (nonce.len != NONCE_LEN) or (out.len != (plaintext.len + TAG_LEN)) or
+       too_long(plaintext.len) {
         return error.InvalidLength;
     }
     let ct = out[..plaintext.len];
@@ -306,7 +312,7 @@ pub fn seal(key: []u8, nonce: []u8, aad: []u8, plaintext: []u8, out: []mut u8) !
 /// anything was altered.
 pub fn open(key: []u8, nonce: []u8, aad: []u8, sealed: []u8, out: []mut u8) !void {
     if (key.len != KEY_LEN) or (nonce.len != NONCE_LEN) or (sealed.len < TAG_LEN) or
-       (out.len != (sealed.len - TAG_LEN)) {
+       (out.len != (sealed.len - TAG_LEN)) or too_long(sealed.len - TAG_LEN) {
         return error.InvalidLength;
     }
     let ct = sealed[..sealed.len - TAG_LEN];

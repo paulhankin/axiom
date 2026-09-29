@@ -263,6 +263,12 @@ pub fn sigaltstack(sp: usize, size: usize) isize {
     return sys2(SYS_SIGALTSTACK, @int_from_ptr(&st), 0);
 }
 
+/// Stops using an alternate signal stack (SS_DISABLE).
+pub fn sigaltstack_disable() isize {
+    let st = StackT.{ sp: 0, flags: 2, size: 0 };
+    return sys2(SYS_SIGALTSTACK, @int_from_ptr(&st), 0);
+}
+
 pub fn getpid() i32 {
     return @truncate(i32, sys0(SYS_GETPID));
 }

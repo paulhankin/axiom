@@ -68,6 +68,9 @@ pub fn extract(kind: u8, salt: []u8, ikm: []u8, prk: []mut u8) void {
 /// and context info.
 pub fn expand(kind: u8, prk: []u8, info: []u8, out: []mut u8) void {
     let n = sha2.digest_size(kind);
+    if out.len > (255 * n) {
+        @trap();  // more than HKDF can make (RFC 5869): a caller's mistake
+    }
     let mut t: [64]u8 = [0; 64];
     let mut tlen: usize = 0;
     let mut done: usize = 0;

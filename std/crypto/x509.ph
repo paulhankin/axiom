@@ -320,6 +320,9 @@ pub struct Certificate {
         let alg_el = cert.expect(der.SEQUENCE)!;
         parse_sig_alg(alg_el.raw, &mut self.sig_alg, &mut self.sig_hash)!;
         self.signature = cert.bit_string()!;
+        if not cert.empty() {
+            return error.InvalidCertificate;  // (DER: nothing may follow)
+        }
         let mut t = der.Reader.init(tbs_el.content);
         // version [0] EXPLICIT INTEGER (v3 = 2), optional
         if t.peek_tag() == der.context(0, true) {
@@ -350,9 +353,21 @@ pub struct Certificate {
         if t.peek_tag() == der.context(3, true) {
             let mut ex = t.nested(der.context(3, true))!;
             let mut exts = ex.sequence()!;
+            let mut seen: [32][]u8 = [""; 32];
+            let mut nseen: usize = 0;
             while not exts.empty() {
                 let mut e = exts.sequence()!;
                 let oid = e.oid()!;
+                // an extension may appear only once (RFC 5280 4.2)
+                for k in @as(usize, 0)..nseen {
+                    if @mem_eq(seen[k], oid) {
+                        return error.InvalidCertificate;
+                    }
+                }
+                if nseen < 32 {
+                    seen[nseen] = oid;
+                    nseen += 1;
+                }
                 let mut critical = false;
                 if e.peek_tag() == der.BOOLEAN {
                     critical = e.boolean()!;
@@ -547,6 +562,18 @@ fn within_dns(name: []u8, base: []u8) bool {
            strs.eq_ignore_case(name[name.len - base.len..], base);
 }
 
+/// Whether name is exactly one label under domain ("www.x.test" under "x.test").
+fn one_label_under(name: []u8, domain: []u8) bool {
+    if name.len <= domain.len + 1 {
+        return false;
+    }
+    let cut = name.len - domain.len - 1;
+    if (name[cut] != '.') or not strs.eq_ignore_case(name[cut + 1..], domain) {
+        return false;
+    }
+    return (strs.index_of_byte(name[..cut], '.') catch cut) == cut;
+}
+
 /// Whether an IP address is within an address+mask constraint.
 fn within_ip(ip: []u8, base: []u8) bool {
     if (base.len != (2 * ip.len)) or (ip.len == 0) {
@@ -566,13 +593,25 @@ fn names_allowed(ca: *Certificate, leaf: *Certificate) bool {
     if not ca.has_constraints {
         return true;
     }
-    for n in leaf.dns_names.items() {
+    for n0 in leaf.dns_names.items() {
+        // names as matches_host sees them ("a.example." is "a.example"); a
+        // wildcard "*.d" is judged by a name it matches ("a.d"), and is
+        // excluded if any name it could match is
+        let n = strs.trim_bytes(n0, ".");
+        let mut rep: [260]u8 = [0; 260];
+        let mut name = n;
+        let wild = strs.starts_with(n, "*.") and (n.len < 250);
+        if wild {
+            rep[0] = 'a';
+            @mem_copy(rep[1..n.len], n[1..]);
+            name = rep[..n.len];
+        }
         let mut permitted_any = false;
         let mut has_dns_permits = false;
         for p in ca.permitted.items() {
             if p[0] == 'd' {
                 has_dns_permits = true;
-                if within_dns(n, p[1..]) {
+                if within_dns(name, p[1..]) {
                     permitted_any = true;
                 }
             }
@@ -581,7 +620,10 @@ fn names_allowed(ca: *Certificate, leaf: *Certificate) bool {
             return false;
         }
         for x in ca.excluded.items() {
-            if (x[0] == 'd') and within_dns(n, x[1..]) {
+            if x[0] != 'd' {
+                continue;
+            }
+            if within_dns(name, x[1..]) or (wild and one_label_under(strs.trim_bytes(x[1..], "."), n[2..])) {
                 return false;
             }
         }
@@ -878,12 +920,26 @@ pub fn verify_chain(chain: []Certificate, roots: *CertPool, hostname: []u8, now:
         }
     }
     let mut used: [16]bool = [false; 16];
-    return extend(chain, leaf, roots, now, 0, &mut used);
+    let mut budget: u32 = MAX_SIGNATURE_CHECKS;
+    return extend(chain, leaf, roots, now, 0, &mut used, &mut budget);
+}
+
+/// Chain building gives up after this many signature checks: a peer's
+/// pile of look-alike intermediates must not cost more (real chains need
+/// a handful).
+const MAX_SIGNATURE_CHECKS: u32 = 64;
+
+fn check_signature(cert: *Certificate, issuer: *Certificate, budget: *mut u32) !bool {
+    if budget.* == 0 {
+        return error.PathTooLong;
+    }
+    budget.* -= 1;
+    return cert.signed_by(issuer);
 }
 
 /// Finds an issuer for `cert` among the roots, then the intermediates.
-fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.Time, depth: u32,
-          used: *mut [16]bool) !void {
+fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.Time, depth: u32, used: *mut [16]bool,
+          budget: *mut u32) !void {
     if depth > 8 {
         return error.PathTooLong;
     }
@@ -893,7 +949,7 @@ fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.
         if not @mem_eq(r.subject, cert.issuer) {
             continue;
         }
-        if not cert.signed_by(&r) {
+        if not check_signature(cert, &r, budget)! {
             last = error.BadSignature;
             continue;
         }
@@ -940,13 +996,16 @@ fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.
             last = error.NameConstraint;
             continue;
         }
-        if not cert.signed_by(ca) {
+        if not check_signature(cert, ca, budget)! {
             last = error.BadSignature;
             continue;
         }
         used[i] = true;
-        extend(chain, ca, roots, now, depth + 1, used) catch |e| {
+        extend(chain, ca, roots, now, depth + 1, used, budget) catch |e| {
             used[i] = false;
+            if budget.* == 0 {
+                return e;
+            }
             last = e;
             continue;
         };
@@ -1158,6 +1217,28 @@ fn fails_with(r: !void, want: error) bool {
     return false;
 }
 
+// A root excluding the subtree evil.test, and a leaf it signed for "evil.test."
+// (a trailing dot must not slip past the constraint).
+let NC_ROOT_PEM: [8][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBEDCBw6ADAgECAgEGMAUGAytlcDARMQ8wDQYDVQQDDAZOQ1Jvb3QwHhcNMjYw\n",
+    "MTAxMDAwMDAwWhcNMzAwMTAxMDAwMDAwWjARMQ8wDQYDVQQDDAZOQ1Jvb3QwKjAF\n",
+    "BgMrZXADIQD1elxuzR5lsQJH29sWLdOsynA6jWOK/HrD4BuUmgyhk6NAMD4wDwYD\n",
+    "VR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwGwYDVR0eAQH/BBEwD6ENMAuC\n",
+    "CWV2aWwudGVzdDAFBgMrZXADQQBhGv/5tFrlJV4DicitgJszHMG2vKg7S5CU9Lvb\n",
+    "9Q+aMrvWUjkPk+FqT86plcbek022ixsVw+EvSiWPW+OxWCYK\n",
+    "-----END CERTIFICATE-----\n",
+];
+let NC_DOT_LEAF_PEM: [7][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIHnMIGaoAMCAQICAQcwBQYDK2VwMBExDzANBgNVBAMMBk5DUm9vdDAeFw0yNjAx\n",
+    "MDEwMDAwMDBaFw0zMDAxMDEwMDAwMDBaMA8xDTALBgNVBAMMBGxlYWYwKjAFBgMr\n",
+    "ZXADIQDurLn1y3Pq0lBpzx5L4oGdA7Lc5Z5F7bHseWPJtZYxcaMZMBcwFQYDVR0R\n",
+    "BA4wDIIKZXZpbC50ZXN0LjAFBgMrZXADQQATAv0sqhomumnpTGbj1Kte+Wlnpfg2\n",
+    "YfeCMNpbeUD1IJVHcZWTXHZlIXVxcLnhUGKhjLnpwjE6JkClY2j9QbgB\n",
+    "-----END CERTIFICATE-----\n",
+];
+
 test "parse certificates" {
     let mut leaf = cert_of(LEAF_PEM[..])!;
     defer leaf.deinit();
@@ -1223,6 +1304,18 @@ test "verify chains" {
     defer bad[0].deinit();
     defer bad[1].deinit();
     @expect(fails_with(verify_chain(bad[..], &roots, "www.evil.test", now), error.NameConstraint));
+    let mut nroots = CertPool.init();
+    defer nroots.deinit();
+    let nr = join(NC_ROOT_PEM[..])!;
+    defer mem.free(nr);
+    @expect_eq(nroots.add_pem(nr)!, 1);
+    let mut dot: [1]Certificate = [cert_of(NC_DOT_LEAF_PEM[..])!];
+    defer dot[0].deinit();
+    @expect(fails_with(verify_chain(dot[..], &nroots, "evil.test", time.date(2027, 1, 1, 0, 0, 0)!),
+                       error.NameConstraint));
+    @expect_eq(one_label_under("www.x.test", "x.test"), true);
+    @expect_eq(one_label_under("a.www.x.test", "x.test"), false);
+    @expect_eq(one_label_under("x.test", "x.test"), false);
 }
 
 test "private keys" {

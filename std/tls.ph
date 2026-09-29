@@ -52,6 +52,8 @@ error {
     BadCertificate,
     Closed,
     NoCertificate,
+    InvalidArgument,
+    TimedOut,
     OutOfMemory,
 }
 
@@ -110,6 +112,7 @@ const ALERT_BAD_RECORD_MAC: u8 = 20;
 const ALERT_HANDSHAKE_FAILURE: u8 = 40;
 const ALERT_BAD_CERTIFICATE: u8 = 42;
 const ALERT_ILLEGAL_PARAMETER: u8 = 47;
+const ALERT_RECORD_OVERFLOW: u8 = 22;
 const ALERT_DECODE_ERROR: u8 = 50;
 const ALERT_DECRYPT_ERROR: u8 = 51;
 const ALERT_PROTOCOL_VERSION: u8 = 70;
@@ -532,6 +535,8 @@ pub struct Conn {
     alpn_len: usize,
     sni: [256]u8,  // the server name (client: requested; server: received)
     sni_len: usize,
+    established: bool,  // the handshake is over
+    deadline: i64,      // monotonic ns by which the handshake must be done (0: none)
 
     /// Reads decrypted application data; 0 means the peer closed the
     /// connection (with close_notify).
@@ -644,6 +649,10 @@ pub struct Conn {
     /// Reads bytes until inbuf holds at least n.
     fn fill(self: *mut Conn, n: usize) !void {
         while self.inlen < n {
+            // (a peer dripping a byte at a time must not hold a handshake open)
+            if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
+                return error.TimedOut;
+            }
             let got = self.stream.read(self.inbuf[self.inlen..])!;
             if got == 0 {
                 return error.Closed;
@@ -668,7 +677,11 @@ pub struct Conn {
             let mut real_type = ty;
             let mut plen: usize = 0;
             if ty == CT_CHANGE_CIPHER_SPEC {
-                // compatibility mode: ignored (RFC 8446 5)
+                // compatibility mode: a single 0x01, dropped, and only during
+                // the handshake (RFC 8446 5)
+                if self.established or (len != 1) or (body[0] != 1) {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+                }
                 self.consume(5 + len);
                 continue;
             }
@@ -692,6 +705,9 @@ pub struct Conn {
                 }
                 real_type = self.plain[k - 1];
                 plen = k - 1;
+                if plen > MAX_PLAINTEXT {
+                    return self.fail(ALERT_RECORD_OVERFLOW, error.RecordOverflow);
+                }
             } else {
                 if len > MAX_PLAINTEXT {
                     return self.fail(ALERT_DECODE_ERROR, error.RecordOverflow);
@@ -797,18 +813,25 @@ pub struct Conn {
             }
             let b = self.hs.bytes()[self.hs_start..];
             let len = ((@as(usize, b[1]) << 16) | (@as(usize, b[2]) << 8)) | @as(usize, b[3]);
+            if len > 65536 {
+                return self.fail(ALERT_DECODE_ERROR, error.DecodeError);
+            }
             if avail < (4 + len) {
                 break;
             }
             let ty = b[0];
             let body = b[4..4 + len];
             self.hs_start += 4 + len;
-            if ty == HS_NEW_SESSION_TICKET {
-                continue;  // no resumption
+            if (ty == HS_NEW_SESSION_TICKET) and self.is_client {
+                continue;  // no resumption (and only servers send tickets)
             }
             if ty == HS_KEY_UPDATE {
-                if len != 1 {
+                if (len != 1) or (body[0] > 1) {
                     return self.fail(ALERT_DECODE_ERROR, error.DecodeError);
+                }
+                // the key changes here: nothing more may share its record
+                if self.hs_start != self.hs.len {
+                    return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
                 }
                 let requested = body[0] == 1;
                 self.update_read_key()!;
@@ -821,10 +844,23 @@ pub struct Conn {
             }
             return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
         }
-        if self.hs_start == self.hs.len {
-            self.hs.clear();
-            self.hs_start = 0;
+        // keep only the unfinished message (the buffer cannot grow without bound)
+        let rest = self.hs.len - self.hs_start;
+        if (self.hs_start > 0) and (rest > 0) {
+            let bytes = self.hs.bytes();
+            @mem_copy(bytes[..rest], bytes[self.hs_start..self.hs.len]);
         }
+        self.hs.truncate(rest);
+        self.hs_start = 0;
+    }
+
+    /// Switches to new read keys during the handshake: handshake messages
+    /// must not straddle the change (RFC 8446 5.1).
+    fn handshake_read_key(self: *mut Conn, secret: []u8) !void {
+        if self.hs_start != self.hs.len {
+            return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+        }
+        self.rd.set(self.suite, secret)!;
     }
 
     fn update_read_key(self: *mut Conn) !void {
@@ -1043,16 +1079,24 @@ pub fn connect(hostname: []u8, port: u16, cfg: *ClientConfig) !*mut Conn {
 /// SNI (unless it is an IP address) and checked against the certificate.
 /// The stream belongs to the Conn afterwards (on failure too).
 pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) !*mut Conn {
+    // (longer than any DNS name; and with no name, the certificate could
+    // belong to anyone: verification needs one)
+    if (hostname.len > 255) or ((hostname.len == 0) and cfg.verify) {
+        stream.close();
+        return error.InvalidArgument;
+    }
     let c = new_conn(stream, true)!;
-    let n = @min(hostname.len, 255);
+    let n = hostname.len;
     @mem_copy(c.sni[..n], hostname[..n]);
     c.sni_len = n;
+    c.deadline = time.Instant.now().ns + (HANDSHAKE_TIMEOUT_MS * 1000000);
     client_handshake(c, cfg) catch |e| {
         stream.close();
         c.hs.deinit();
         mem.destroy(c);
         return e;
     };
+    c.deadline = 0;
     return c;
 }
 
@@ -1246,11 +1290,11 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
     let mut ks = KeySchedule.init(hash);
     let mut th: [48]u8 = [0; 48];
     ks.handshake(shared, tr.current(th[..]));
-    c.rd.set(c.suite, ks.server_hs[..hl])!;
+    c.handshake_read_key(ks.server_hs[..hl])!;
     // encrypted handshake messages
     let ee = c.expect_message(HS_ENCRYPTED_EXTENSIONS)!;
     tr.add(ee)!;
-    read_encrypted_extensions(c, ee)!;
+    read_encrypted_extensions(c, ee, cfg.alpn)!;
     let mut next = c.next_message()!;
     let mut cert_requested = false;
     if next[0] == HS_CERTIFICATE_REQUEST {
@@ -1307,13 +1351,14 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
     mine[3] = @truncate(u8, hl);
     finished_mac(hash, ks.client_hs[..hl], tr.current(th[..]), mine[4..4 + hl]);
     c.send_handshake(mine[..4 + hl])!;
-    c.rd.set(c.suite, ks.server_ap[..hl])!;
+    c.handshake_read_key(ks.server_ap[..hl])!;
     c.wr.set(c.suite, ks.client_ap[..hl])!;
+    c.established = true;
     @mem_copy(c.secret_rd[..hl], ks.server_ap[..hl]);
     @mem_copy(c.secret_wr[..hl], ks.client_ap[..hl]);
 }
 
-fn read_encrypted_extensions(c: *mut Conn, ee: []u8) !void {
+fn read_encrypted_extensions(c: *mut Conn, ee: []u8, offered: [][]u8) !void {
     let mut r = cur(ee[4..]);
     let mut e = cur(r.vec16()!);
     while not e.done() {
@@ -1324,6 +1369,16 @@ fn read_encrypted_extensions(c: *mut Conn, ee: []u8) !void {
             let mut l = cur(a.vec16()!);
             let p = l.vec8()!;
             if (p.len == 0) or (p.len > 32) {
+                return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
+            }
+            // the server must pick one of ours
+            let mut ok = false;
+            for o in offered {
+                if @mem_eq(o, p) {
+                    ok = true;
+                }
+            }
+            if not ok {
                 return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
             }
             @mem_copy(c.alpn_selected[..p.len], p);
@@ -1437,14 +1492,20 @@ struct KeySchedule {
 /// belongs to the Conn afterwards (and is closed if the handshake fails).
 pub fn server(stream: net.TcpStream, cfg: *ServerConfig) !*mut Conn {
     let c = new_conn(stream, false)!;
+    c.deadline = time.Instant.now().ns + (HANDSHAKE_TIMEOUT_MS * 1000000);
     server_handshake(c, cfg) catch |e| {
         stream.close();
         c.hs.deinit();
         mem.destroy(c);
         return e;
     };
+    c.deadline = 0;
     return c;
 }
+
+/// A handshake must finish within this long (whatever the socket's own
+/// timeout, which limits each read).
+pub const HANDSHAKE_TIMEOUT_MS: i64 = 20000;
 
 /// What the server takes from a ClientHello.
 struct Hello {
@@ -1652,7 +1713,7 @@ fn server_handshake(c: *mut Conn, cfg: *ServerConfig) !void {
     let mut th: [48]u8 = [0; 48];
     ks.handshake(shared, tr.current(th[..]));
     c.wr.set(c.suite, ks.server_hs[..hl])!;
-    c.rd.set(c.suite, ks.client_hs[..hl])!;
+    c.handshake_read_key(ks.client_hs[..hl])!;
     // EncryptedExtensions, with the ALPN choice
     let mut ee = out();
     defer ee.s.deinit();
@@ -1727,7 +1788,8 @@ fn server_handshake(c: *mut Conn, cfg: *ServerConfig) !void {
     if (cf.len != (4 + hl)) or not subtle.equal(cf[4..], want[..hl]) {
         return c.fail(ALERT_DECRYPT_ERROR, error.HandshakeFailure);
     }
-    c.rd.set(c.suite, ks.client_ap[..hl])!;
+    c.handshake_read_key(ks.client_ap[..hl])!;
+    c.established = true;
     @mem_copy(c.secret_rd[..hl], ks.client_ap[..hl]);
     @mem_copy(c.secret_wr[..hl], ks.server_ap[..hl]);
 }

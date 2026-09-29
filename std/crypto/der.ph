@@ -157,6 +157,10 @@ pub struct Reader {
         if (c.len == 0) or (c.len > 8) {
             return error.InvalidDer;
         }
+        // DER: the shortest encoding (no redundant leading 00 or ff byte)
+        if (c.len > 1) and (((c[0] == 0) and ((c[1] & 0x80) == 0)) or ((c[0] == 0xff) and ((c[1] & 0x80) != 0))) {
+            return error.InvalidDer;
+        }
         let mut v: i64 = 0;
         if (c[0] & 0x80) != 0 {
             v = -1;

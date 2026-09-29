@@ -34,7 +34,10 @@ pub struct PublicKey {
             return err;
         };
         let bits = nn.bit_len();
-        if (bits < 1024) or (bits > 8192) or (not nn.is_odd()) or (ee.cmp_i64(3) < 0) or not ee.is_odd() {
+        // (a huge public exponent would make every verification slow: real
+        // keys use 65537, and nothing uses more than 32 bits)
+        if (bits < 1024) or (bits > 8192) or (not nn.is_odd()) or (ee.cmp_i64(3) < 0) or not ee.is_odd() or
+           (ee.bit_len() > 32) {
             nn.deinit();
             ee.deinit();
             return error.InvalidKey;

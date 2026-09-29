@@ -259,6 +259,27 @@ class NetClient {
   }
 }
 
+// File positions shared by the threads: a table in shared memory for the
+// first POS_FDS descriptors (stored as position + 2; 0 means untracked, 1
+// means append), a plain map beyond (those are not shared).
+const POS_FDS = 4096;
+class SharedPositions {
+  constructor(buf) {
+    this.table = new Float64Array(buf);
+    this.more = new Map();
+  }
+  has(fd) { return fd >= 0 && fd < POS_FDS ? this.table[fd] !== 0 : this.more.has(fd); }
+  get(fd) { return fd >= 0 && fd < POS_FDS ? this.table[fd] - 2 : this.more.get(fd); }
+  set(fd, v) {
+    if (fd >= 0 && fd < POS_FDS) this.table[fd] = v + 2;
+    else this.more.set(fd, v);
+  }
+  delete(fd) {
+    if (fd >= 0 && fd < POS_FDS) this.table[fd] = 0;
+    else this.more.delete(fd);
+  }
+}
+
 export function createHost(opts = {}) {
   let memory = opts.memory || null;
   let module = null;
@@ -268,10 +289,13 @@ export function createHost(opts = {}) {
   const bytes = (p, n) => new Uint8Array(memory.buffer, p >>> 0, n >>> 0);
   const str = (p, n) => Buffer.from(memory.buffer, p >>> 0, n >>> 0).toString('utf8');
   const net = () => (netClient ||= new NetClient(opts.netPort));
-  const programArgs = opts.args || [];
-  // Positions of the files this host opened: node has no lseek, so reads
-  // and writes of them are positioned explicitly.
-  const pos = new Map();
+  // State every thread of the program shares: its arguments, and the
+  // positions of the files it opened (node has no lseek, so reads and
+  // writes of them are positioned explicitly). Threads get it through
+  // workerData.
+  const shared = opts.shared || { args: opts.args || [], pos: new SharedArrayBuffer(POS_FDS * 8) };
+  const programArgs = shared.args;
+  const pos = new SharedPositions(shared.pos);
   const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39 })[e && e.code] || -1;
   // Copies `buf` to p[0..cap] if it fits; returns its length.
   const give = (buf, p, cap) => {
@@ -343,8 +367,8 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_mkdir(p, n) {
-      try { fs.mkdirSync(str(p, n)); return 0; } catch (e) { return fsErr(e); }
+    ph_mkdir(p, n, mode) {
+      try { fs.mkdirSync(str(p, n), { mode: mode & 0o7777 }); return 0; } catch (e) { return fsErr(e); }
     },
     ph_remove(p, n, dir) {
       try {
@@ -399,7 +423,7 @@ export function createHost(opts = {}) {
       // The new thread shares this program's sockets.
       const netPort = net().newPort();
       const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
-        workerData: { module, memory, entry, arg, stackTop, exited, netPort },
+        workerData: { module, memory, entry, arg, stackTop, exited, netPort, shared },
         transferList: [netPort],
       });
       // A trap in any thread terminates the whole program (spec §12.8).

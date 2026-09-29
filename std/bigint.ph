@@ -932,6 +932,7 @@ pub struct BigInt {
         }
         if x.n == 0 {
             self.n = 0;
+            self.neg = false;
             return;
         }
         // Newton's method from a power of two above the root

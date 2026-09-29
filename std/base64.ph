@@ -110,6 +110,7 @@ pub fn decode(text: []u8, out: []mut u8, enc: Encoding) ![]u8 {
     let mut nbits: u32 = 0;
     let mut o: usize = 0;
     let mut padding: u32 = 0;
+    let mut chars: usize = 0;
     for c in text {
         if (c == ' ') or (c == '\n') or (c == '\r') or (c == '\t') {
             continue;
@@ -125,6 +126,7 @@ pub fn decode(text: []u8, out: []mut u8, enc: Encoding) ![]u8 {
         if v > 63 {
             return error.InvalidBase64;
         }
+        chars += 1;
         acc = (acc << 6) | v;
         nbits += 6;
         if nbits >= 8 {
@@ -138,6 +140,10 @@ pub fn decode(text: []u8, out: []mut u8, enc: Encoding) ![]u8 {
     }
     // leftover bits must be zero and fewer than a byte
     if (nbits >= 6) or ((acc & ((@as(u32, 1) << nbits) - 1)) != 0) or (padding > 2) {
+        return error.InvalidBase64;
+    }
+    // padding, if any, is exactly what completes the last group
+    if (padding > 0) and (@as(usize, padding) != ((4 - (chars % 4)) % 4)) {
         return error.InvalidBase64;
     }
     return out[..o];
@@ -177,4 +183,18 @@ test "rfc 4648 vectors" {
     let owned = decode_alloc("aGVsbG8=", STANDARD)!;
     defer mem.free(owned);
     @expect_eq(owned, "hello");
+}
+
+test "padding must be exact" {
+    let mut out: [16]u8 = [0; 16];
+    @expect(@mem_eq(decode("Zm8=", out[..], STANDARD)!, "fo"));
+    @expect(@mem_eq(decode("Zm8", out[..], STANDARD)!, "fo"));
+    @expect(@mem_eq(decode("Zm9v", out[..], STANDARD)!, "foo"));
+    _ = decode("Zm8==", out[..], STANDARD) catch |e| {
+        @expect(e == error.InvalidBase64);
+        _ = decode("Zm9v==", out[..], STANDARD) catch return;
+        @expect(false);
+        return;
+    };
+    @expect(false);
 }

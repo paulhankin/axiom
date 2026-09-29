@@ -18,7 +18,17 @@ struct Entry {
 }
 
 fn more_frequent(a: Entry, b: Entry) bool {
-    return a.count > b.count;
+    // (ties in word order: the map's order changes from run to run)
+    if a.count != b.count {
+        return a.count > b.count;
+    }
+    let n = @min(a.word.len, b.word.len);
+    for i in 0..n {
+        if a.word[i] != b.word[i] {
+            return a.word[i] < b.word[i];
+        }
+    }
+    return a.word.len < b.word.len;
 }
 
 fn is_letter(c: u8) bool {

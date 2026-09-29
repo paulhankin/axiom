@@ -17,6 +17,12 @@ import "subtle.ph" as subtle;
 
 error { AuthFailed, InvalidLength }
 
+/// GCM takes at most 2^32 - 2 blocks per message (the counter would wrap
+/// into the tag's block).
+fn too_long(n: usize) bool {
+    return @as(u64, n) > ((@as(u64, 1) << 36) - 32);
+}
+
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 
@@ -556,7 +562,7 @@ pub struct AesGcm {
     /// Encrypts plaintext into out (plaintext.len + 16 bytes: ciphertext,
     /// then tag), authenticating aad too.
     pub fn seal(self: *AesGcm, nonce: []u8, aad: []u8, plaintext: []u8, out: []mut u8) !void {
-        if (nonce.len != NONCE_LEN) or (out.len != (plaintext.len + TAG_LEN)) {
+        if (nonce.len != NONCE_LEN) or (out.len != (plaintext.len + TAG_LEN)) or too_long(plaintext.len) {
             return error.InvalidLength;
         }
         let j0 = counter0(nonce);
@@ -568,7 +574,8 @@ pub struct AesGcm {
     /// Checks and decrypts sealed (ciphertext then tag) into out
     /// (sealed.len - 16 bytes); AuthFailed, with out zeroed, if altered.
     pub fn open(self: *AesGcm, nonce: []u8, aad: []u8, sealed: []u8, out: []mut u8) !void {
-        if (nonce.len != NONCE_LEN) or (sealed.len < TAG_LEN) or (out.len != (sealed.len - TAG_LEN)) {
+        if (nonce.len != NONCE_LEN) or (sealed.len < TAG_LEN) or (out.len != (sealed.len - TAG_LEN)) or
+           too_long(sealed.len - TAG_LEN) {
             return error.InvalidLength;
         }
         let ct = sealed[..sealed.len - TAG_LEN];

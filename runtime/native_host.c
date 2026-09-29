@@ -45,6 +45,7 @@ intptr_t ph_read(int32_t fd, uint8_t *p, size_t n) {
 
 static int copy_cstr(char *dst, size_t cap, const uint8_t *s, size_t n) {
     if (n + 1 > cap) return -1;
+    if (memchr(s, 0, n)) return -1;  /* a NUL would silently cut the name short */
     memcpy(dst, s, n);
     dst[n] = 0;
     return 0;
@@ -82,15 +83,19 @@ int32_t ph_stat(const uint8_t *path, size_t len, uint32_t follow, int64_t *out) 
     if ((follow ? stat(buf, &st) : lstat(buf, &st)) != 0) return fs_err();
     out[0] = S_ISREG(st.st_mode) ? 1 : S_ISDIR(st.st_mode) ? 2 : S_ISLNK(st.st_mode) ? 3 : 4;
     out[1] = (int64_t)st.st_size;
-    out[2] = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+    /* (nanoseconds overflow 64 bits for times past 2262: clamp) */
+    int64_t sec = (int64_t)st.st_mtim.tv_sec;
+    if (sec > 9223372035) sec = 9223372035;
+    if (sec < -9223372035) sec = -9223372035;
+    out[2] = sec * 1000000000 + st.st_mtim.tv_nsec;
     out[3] = st.st_mode & 07777;
     return 0;
 }
 
-int32_t ph_mkdir(const uint8_t *path, size_t len) {
+int32_t ph_mkdir(const uint8_t *path, size_t len, uint32_t mode) {
     char buf[4096];
     if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
-    return mkdir(buf, 0777) == 0 ? 0 : fs_err();
+    return mkdir(buf, (mode_t)(mode & 07777)) == 0 ? 0 : fs_err();
 }
 
 int32_t ph_remove(const uint8_t *path, size_t len, uint32_t dir) {
@@ -288,13 +293,19 @@ void ph_install_crash_stack(void);
 
 int32_t ph_notify32(uint32_t *p, int32_t count);
 
+static void *install_alt_stack(void);
+
 static void *thread_main(void *p) {
     struct thread_start st = *(struct thread_start *)p;
     free(p);
-    ph_install_crash_stack();
+    void *alt = install_alt_stack();
     st.entry(st.arg);
     __atomic_store_n(st.exited, 1, __ATOMIC_SEQ_CST);
     ph_notify32(st.exited, 1);
+    /* the signal stack goes with the thread */
+    stack_t off = {.ss_flags = SS_DISABLE};
+    sigaltstack(&off, NULL);
+    free(alt);
     return NULL;
 }
 
@@ -474,9 +485,14 @@ static void ph_crash(int sig, siginfo_t *si, void *uc) {
 }
 
 // Each thread needs its own signal stack to report its stack overflow.
-void ph_install_crash_stack(void) {
+static void *install_alt_stack(void) {
     stack_t st = {.ss_sp = malloc(65536), .ss_size = 65536};
     if (st.ss_sp) sigaltstack(&st, NULL);
+    return st.ss_sp;
+}
+
+void ph_install_crash_stack(void) {
+    (void)install_alt_stack();
 }
 
 __attribute__((constructor)) static void ph_install_crash_handler(void) {

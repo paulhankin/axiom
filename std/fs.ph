@@ -27,7 +27,7 @@ error { NotFound, AccessDenied, Exists, NotADirectory, IsDirectory, NotEmpty, Io
 
 import host "phalange" {
     fn ph_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32;
-    fn ph_mkdir(path: *u8, len: usize) i32;
+    fn ph_mkdir(path: *u8, len: usize, mode: u32) i32;
     fn ph_remove(path: *u8, len: usize, dir: u32) i32;
     fn ph_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
     fn ph_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
@@ -177,7 +177,12 @@ pub fn copy_file(from: []u8, to: []u8) !void {
 
 /// Creates a directory (error.Exists if there is something at p).
 pub fn mkdir(p: []u8) !void {
-    let r = ph_mkdir(p.ptr, p.len);
+    mkdir_mode(p, 0o777)!;
+}
+
+/// Creates a directory with the given permissions (less the umask).
+pub fn mkdir_mode(p: []u8, mode: u32) !void {
+    let r = ph_mkdir(p.ptr, p.len, mode);
     if r < 0 {
         return fail(@as(i64, r));
     }
@@ -361,7 +366,7 @@ pub fn make_temp_dir(prefix: []u8) ![]mut u8 {
             name.push(digits[@as(usize, b) % 36])!;
         }
         let p = path.join2(base, name.bytes())!;
-        mkdir(p) catch |e| {
+        mkdir_mode(p, 0o700) catch |e| {
             mem.free(p);
             if e == error.Exists {
                 continue;
@@ -585,4 +590,20 @@ test "files and directories" {
     defer mem.free(abs);
     @expect(path.is_abs(abs));
     @expect(strs.ends_with(abs, "/y"));
+}
+
+test "temporary directories are private; names cannot hide a NUL" {
+    let d = make_temp_dir("phfs")!;
+    defer mem.free(d);
+    let info = stat(d)!;
+    @expect_eq(info.mode & 0o077, 0);
+    let mut p = strs.String.init();
+    defer p.deinit();
+    p.push_str(d)!;
+    p.push_str("/a.txt")!;
+    write_file(p.bytes(), "x")!;
+    // "a.txt\0.png" must not open a.txt
+    p.push_str("\x00.png")!;
+    @expect(failed_with(read_file(p.bytes()), error.IoError) or failed_with(read_file(p.bytes()), error.NotFound));
+    remove_all(d)!;
 }

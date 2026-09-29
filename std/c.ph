@@ -15,7 +15,7 @@
 
 import "mem.ph" as mem;
 
-error { OutOfMemory }
+error { OutOfMemory, InvalidArgument }
 
 /// A null pointer, for passing NULL to C. Never dereference it.
 pub fn null_ptr[T]() *T {
@@ -56,14 +56,36 @@ pub fn from_cstr(p: *u8) []u8 {
 /// Copies `s` into memory from `alloc`, adding a terminating NUL, for passing
 /// to C. Free it with free_cstr.
 pub fn to_cstr(s: []u8) !*mut u8 {
-    let buf = mem.alloc.[u8](s.len + 1)!;
-    @mem_copy(buf[..s.len], s);
-    buf[s.len] = 0;
-    return buf.ptr;
+    // (a NUL inside would end the C string early)
+    for b in s {
+        if b == 0 {
+            return error.InvalidArgument;
+        }
+    }
+    // the allocation's size goes in a hidden header, so free_cstr is right
+    // even if C code shortens the string in place
+    let total = @add_checked(s.len, CSTR_HEADER + 1) catch return error.OutOfMemory;
+    let buf = mem.alloc.[u8](total)!;
+    let n = @as(u64, total);
+    for k in @as(usize, 0)..8 {
+        buf[k] = @truncate(u8, n >> @as(u64, 8 * k));
+    }
+    @mem_copy(buf[CSTR_HEADER..CSTR_HEADER + s.len], s);
+    buf[CSTR_HEADER + s.len] = 0;
+    return @ptr_from_int(*mut u8, @int_from_ptr(buf.ptr) + CSTR_HEADER);
 }
 
+const CSTR_HEADER: usize = 8;
+
+/// Frees a string from to_cstr (and only those).
 pub fn free_cstr(p: *mut u8) void {
-    mem.free(@slice_from_ptr(p, cstr_len(p) + 1));
+    let base = @ptr_from_int(*mut u8, @int_from_ptr(p) - CSTR_HEADER);
+    let h = @slice_from_ptr(base, CSTR_HEADER);
+    let mut n: u64 = 0;
+    for k in @as(usize, 0)..8 {
+        n |= @as(u64, h[k]) << @as(u64, 8 * k);
+    }
+    mem.free(@slice_from_ptr(base, @truncate(usize, n)));
 }
 
 // -----------------------------------------------------------------------------
@@ -77,4 +99,14 @@ test "C strings" {
     @expect_eq(cstr_len("literal".ptr), 7);  // literals are NUL-terminated
     free_cstr(p);
     @expect(is_null(null_ptr.[u8]()));
+    // C may shorten a string in place; interior NULs cannot be passed
+    let q = to_cstr("hello world")!;
+    @slice_from_ptr(q, 12)[5] = 0;
+    @expect_eq(from_cstr(q), "hello");
+    free_cstr(q);
+    _ = to_cstr("a\x00b") catch |e| {
+        @expect(e == error.InvalidArgument);
+        return;
+    };
+    @expect(false);
 }

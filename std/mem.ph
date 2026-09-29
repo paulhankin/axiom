@@ -74,6 +74,23 @@ struct Span {
     cls: u32,
     heap: u32,
     state: u32,
+    // for checking that an offset is a multiple of osize without dividing:
+    // osize = odd << dshift, dinv * odd == 1 (mod 2^32), dlim = (2^32 - 1) / odd
+    dshift: u32,
+    dinv: u32,
+    dlim: u32,
+}
+
+/// Whether p is the start of an object of span sp (at s).
+fn is_object_start(sp: *mut Span, s: usize, p: usize) bool {
+    if (p < s + HDR) or (p >= sp.bump) {
+        return false;
+    }
+    let n = @truncate(u32, p - (s + HDR));  // (< PAGE)
+    if (n & ((@as(u32, 1) << sp.dshift) - 1)) != 0 {
+        return false;
+    }
+    return ((n >> sp.dshift) *% sp.dinv) <= sp.dlim;
 }
 
 /// The header of a large block, used or free. A free block also has its size
@@ -481,6 +498,19 @@ fn refill(h: usize, c: usize) usize {
         sp.bump = s + HDR;
         sp.end = s + HDR + (((PAGE - HDR) / osize) * osize);
         sp.osize = class_size[c];
+        let mut odd = class_size[c];
+        let mut sh: u32 = 0;
+        while (odd & 1) == 0 {
+            odd >>= 1;
+            sh += 1;
+        }
+        let mut inv = odd;
+        for _k in @as(usize, 0)..5 {
+            inv = inv *% (2 -% (odd *% inv));
+        }
+        sp.dshift = sh;
+        sp.dinv = inv;
+        sp.dlim = 0xffffffff / odd;
         sp.used = 0;
         sp.cls = @truncate(u32, c);
         sp.heap = @truncate(u32, h);
@@ -534,6 +564,11 @@ fn small_free(p: usize, c: usize) void {
     let sp = span(s);
     if (sp.magic != tag(MAGIC_SPAN, s)) or (sp.cls != @truncate(u32, c)) or (sp.state == CACHED) {
         @trap();  // not an object of this size from the allocator
+    }
+    // the start of an object handed out (not inside one), and not the one
+    // freed last (a double free would put it on the list twice)
+    if not is_object_start(sp, s, p) or (p == sp.free) {
+        @trap();
     }
     let h = @as(usize, sp.heap);
     let m = multi;
@@ -1393,8 +1428,8 @@ pub fn free_bytes(p: usize, size: usize) void {
         let c = small_class[(size +% 15) >> 4];
         let s = p & ~(PAGE - 1);
         let sp = span(s);
-        if (sp.magic == tag(MAGIC_SPAN, s)) and (sp.cls == @as(u32, c)) and
-           ((sp.state == ACTIVE) or ((sp.state == PARTIAL) and (sp.used > 1))) {
+        if (sp.magic == tag(MAGIC_SPAN, s)) and (sp.cls == @as(u32, c)) and is_object_start(sp, s, p) and
+           (p != sp.free) and ((sp.state == ACTIVE) or ((sp.state == PARTIAL) and (sp.used > 1))) {
             word(p).* = sp.free;
             sp.free = p;
             sp.used -%= 1;

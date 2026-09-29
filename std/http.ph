@@ -58,6 +58,7 @@ import "tls.ph" as tls;
 import "vec.ph" as vec;
 
 error {
+    InvalidArgument,
     BadRequest,
     BadResponse,
     BadUrl,
@@ -266,12 +267,13 @@ struct Conn {
     buf: []mut u8,
     start: usize,  // unread data is buf[start..end]
     end: usize,
-    pin: usize,    // buf[..pin] holds the current head: never moved
-    limit: usize,  // the most buf may grow to
+    pin: usize,     // buf[..pin] holds the current head: never moved
+    limit: usize,   // the most buf may grow to
+    deadline: i64,  // monotonic ns by which the current message must arrive (0: none)
 
     fn init(stream: Transport, limit: usize) !Conn {
         let b = mem.alloc.[u8](@min(16384, limit))!;
-        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit };
+        return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0 };
     }
 
     fn deinit(self: *mut Conn) void {
@@ -292,6 +294,11 @@ struct Conn {
             } else {
                 return error.HeadTooLarge;
             }
+        }
+        // (a peer dripping bytes must not hold the connection forever: each
+        // read has the socket's timeout, the whole message has this)
+        if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
+            return error.TimedOut;
         }
         let n = self.stream.read(self.buf[self.end..])!;
         self.end += n;
@@ -357,6 +364,17 @@ struct Conn {
         return out;
     }
 
+    /// Appends exactly n bytes to out, growing it as they arrive (a peer
+    /// announcing a large body must send it before we allocate it).
+    fn read_into(self: *mut Conn, out: *mut strs.String, n: usize) !void {
+        let mut left = n;
+        while left > 0 {
+            let part = self.take(@min(left, 65536))!;
+            out.push_str(part)!;
+            left -= part.len;
+        }
+    }
+
     /// Reads exactly dst.len bytes.
     fn read_exact(self: *mut Conn, dst: []mut u8) !void {
         let mut got: usize = 0;
@@ -392,16 +410,19 @@ struct Conn {
     /// Everything until the peer closes the connection, appended to out.
     fn read_to_end(self: *mut Conn, out: *mut strs.String, max: usize) !void {
         loop {
-            let part = self.take(65536) catch |e| {
-                if e == error.Closed {
-                    return;
+            if self.start < self.end {
+                let part = self.buf[self.start..self.end];
+                if (out.len + part.len) > max {
+                    return error.TooLarge;
                 }
-                return e;
-            };
-            if (out.len + part.len) > max {
-                return error.TooLarge;
+                out.push_str(part)!;
+                self.start = self.end;
             }
-            out.push_str(part)!;
+            // only a clean close ends the body: a TLS connection cut without
+            // close_notify fails here (it may be a truncation attack)
+            if self.fill()! == 0 {
+                return;
+            }
         }
     }
 
@@ -411,8 +432,9 @@ struct Conn {
         loop {
             let line = self.read_line()!;
             let semi = strs.index_of_byte(line, ';') catch line.len;
-            let size_text = strs.trim(line[..semi]);
-            if (size_text.len == 0) or (size_text.len > 15) {
+            // chunk-size = 1*HEXDIG, then optional whitespace before extensions
+            let size_text = trim_trailing_blanks(line[..semi]);
+            if (size_text.len == 0) or (size_text.len > ((2 * @size_of(usize)) - 1)) {
                 return error.BadRequest;
             }
             let mut size: usize = 0;
@@ -424,21 +446,19 @@ struct Conn {
                 size = (size * 16) + @as(usize, d);
             }
             if size == 0 {
-                // trailers until a blank line
-                loop {
+                // trailers until a blank line (a bounded number)
+                for _k in @as(usize, 0)..MAX_TRAILERS {
                     let t = self.read_line()!;
                     if t.len == 0 {
                         return;
                     }
                 }
+                return error.HeadTooLarge;
             }
             if (out.len + size) > max {
                 return error.TooLarge;
             }
-            let at = out.len;
-            out.reserve(size)!;
-            out.len += size;
-            self.read_exact(out.bytes()[at..])!;
+            self.read_into(out, size)!;
             if self.read_line()!.len != 0 {
                 return error.BadRequest;
             }
@@ -484,11 +504,30 @@ fn parse_headers(lines: []u8, out: []mut Header) !usize {
         if n == out.len {
             return error.HeadTooLarge;
         }
-        out[n] = Header.{ name: name, value: strs.trim_bytes(line[colon + 1..], " \t") };
+        let value = strs.trim_bytes(line[colon + 1..], " \t");
+        for c in value {
+            // (a CR, NUL or other control byte can be read differently
+            // by a proxy in front: reject it)
+            if ((c < 0x20) and (c != '\t')) or (c == 0x7f) {
+                return error.BadRequest;
+            }
+        }
+        out[n] = Header.{ name: name, value: value };
         n += 1;
     }
     return n;
 }
+
+fn trim_trailing_blanks(s: []u8) []u8 {
+    let mut e = s.len;
+    while (e > 0) and ((s[e - 1] == ' ') or (s[e - 1] == '\t')) {
+        e -= 1;
+    }
+    return s[..e];
+}
+
+/// Trailer lines accepted after a chunked body.
+const MAX_TRAILERS: usize = 100;
 
 /// How a message body is delimited.
 struct Framing {
@@ -502,13 +541,25 @@ fn framing(headers: []Header) !Framing {
     for h in headers {
         if strs.eq_ignore_case(h.name, "Transfer-Encoding") {
             // chunked must be the last coding; no others are supported
-            if not strs.eq_ignore_case(strs.trim(h.value), "chunked") {
+            if f.chunked or not strs.eq_ignore_case(h.value, "chunked") {
                 return error.Unsupported;
             }
             f.chunked = true;
         } else if strs.eq_ignore_case(h.name, "Content-Length") {
+            // 1*DIGIT: no sign, no spaces
+            if (h.value.len == 0) or (h.value.len > 18) {
+                return error.BadRequest;
+            }
+            for c in h.value {
+                if (c < '0') or (c > '9') {
+                    return error.BadRequest;
+                }
+            }
             let v = fmt.parse_int.[u64](h.value) catch return error.BadRequest;
-            let len = @int_cast(usize, @min(v, @as(u64, 1) << 40));
+            if v > @as(u64, @max_value(usize) / 2) {
+                return error.TooLarge;
+            }
+            let len = @truncate(usize, v);
             if f.has_length and (len != f.length) {
                 return error.BadRequest;
             }
@@ -781,10 +832,17 @@ pub struct Options {
     threads: u32,           // connections served at once, one per thread
     max_head_bytes: usize,  // request line and headers
     max_body_bytes: usize,
-    idle_timeout_ms: u32,  // how long to wait for (the rest of) a request
+    idle_timeout_ms: u32,     // how long any one read may wait
+    request_timeout_ms: u32,  // how long a whole request may take to arrive
 
     pub fn default() Options {
-        return Options.{ threads: 8, max_head_bytes: 65536, max_body_bytes: 8388608, idle_timeout_ms: 30000 };
+        return Options.{
+            threads: 8,
+            max_head_bytes: 65536,
+            max_body_bytes: 8388608,
+            idle_timeout_ms: 30000,
+            request_timeout_ms: 60000,
+        };
     }
 }
 
@@ -938,6 +996,7 @@ fn serve_connection[C](s: *mut Server.[C], stream: Transport) void {
 
 /// Serves one request; false if the connection should close.
 fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, scratch: *mut Scratch) !bool {
+    c.deadline = time.Instant.now().ns + (@as(i64, s.opts.request_timeout_ms) * 1000000);
     let head_len = c.read_head() catch |e| {
         if (e == error.Closed) or (e == error.NetError) {
             return false;
@@ -992,12 +1051,22 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
         return reject(c.stream, status_for(e));
     };
     let headers = hs[..nh];
-    if (version == 1) and not has_header(headers, "Host") {
+    // exactly one Host (RFC 9112 3.2)
+    let mut hosts: usize = 0;
+    for h in headers {
+        if strs.eq_ignore_case(h.name, "Host") {
+            hosts += 1;
+        }
+    }
+    if (hosts > 1) or ((version == 1) and (hosts == 0)) {
         return reject(c.stream, 400);
     }
     let fr = framing(headers) catch |e| {
         return reject(c.stream, status_for(e));
     };
+    if fr.chunked and (version == 0) {
+        return reject(c.stream, 400);  // (HTTP/1.0 has no transfer codings: faulty framing)
+    }
     // the body
     if fr.has_length and (fr.length > s.opts.max_body_bytes) {
         return reject(c.stream, 413);
@@ -1010,9 +1079,7 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
             return reject(c.stream, status_for(e));
         };
     } else if fr.length > 0 {
-        body.reserve(fr.length)!;
-        body.len = fr.length;
-        c.read_exact(body.bytes()) catch return false;
+        c.read_into(body, fr.length) catch return false;
     }
     // keep-alive
     let conn_hdr = find_header(headers, "Connection") catch "";
@@ -1202,6 +1269,18 @@ fn add_param(req: *mut Scratch, name: []u8, raw: []u8) !bool {
     }
     let out = req.alloc(raw.len)!;
     let v = percent_decode(raw, out, false) catch return false;
+    // a parameter names something inside its place: no NUL, no "..", and
+    // (except for "*") no "/" smuggled in as %2F
+    if strs.contains(v, "\x00") or (not @mem_eq(name, "*") and strs.contains(v, "/")) {
+        return false;
+    }
+    let mut segs = strs.split(v, "/");
+    loop {
+        let seg = segs.next() catch break;
+        if @mem_eq(seg, "..") {
+            return false;
+        }
+    }
     req.params[req.nparams] = Param.{ name: name, value: v };
     req.nparams += 1;
     return true;
@@ -1221,6 +1300,12 @@ pub struct Url {
 
 /// Parses "http[s]://hostname[:port][/path][?query]".
 pub fn parse_url(url: []u8) !Url {
+    // no spaces or control characters anywhere (they would split the request)
+    for ch in url {
+        if (ch <= 0x20) or (ch == 0x7f) {
+            return error.BadUrl;
+        }
+    }
     let mut secure = false;
     let mut rest = url;
     if strs.starts_with(url, "https://") {
@@ -1247,8 +1332,14 @@ pub fn parse_url(url: []u8) !Url {
         hostname = authority[..colon];
         port = fmt.parse_int.[u16](authority[colon + 1..]) catch return error.BadUrl;
     }
-    if (hostname.len == 0) or strs.contains(hostname, "@") {
+    if hostname.len == 0 {
         return error.BadUrl;
+    }
+    // a host name or an IPv4 address: letters, digits, '-' and '.'
+    for ch in hostname {
+        if not (strs.is_alnum(ch) or (ch == '-') or (ch == '.')) {
+            return error.BadUrl;
+        }
     }
     let hash = strs.index_of_byte(target, '#') catch target.len;
     return Url.{ hostname: hostname, port: port, target: target[..hash], secure: secure };
@@ -1342,6 +1433,31 @@ pub fn no_headers() []Header {
 /// Host, Content-Length and "Connection: close" are added.
 pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: ClientOptions) !ClientResponse {
     let u = parse_url(url)!;
+    // nothing a caller passes may change the request's framing
+    if method.len == 0 {
+        return error.InvalidArgument;
+    }
+    for ch in method {
+        if not is_token_char(ch) {
+            return error.InvalidArgument;
+        }
+    }
+    for x in headers {
+        if (x.name.len == 0) or strs.eq_ignore_case(x.name, "Host") or strs.eq_ignore_case(x.name, "Content-Length") or
+           strs.eq_ignore_case(x.name, "Transfer-Encoding") or strs.eq_ignore_case(x.name, "Connection") {
+            return error.InvalidArgument;
+        }
+        for ch in x.name {
+            if not is_token_char(ch) {
+                return error.InvalidArgument;
+            }
+        }
+        for ch in x.value {
+            if ((ch < 0x20) and (ch != '\t')) or (ch == 0x7f) {
+                return error.InvalidArgument;
+            }
+        }
+    }
     let tcp = net.connect(u.hostname, u.port)!;
     tcp.set_timeout(opts.timeout_ms) catch |e| {
         tcp.close();
@@ -1449,9 +1565,7 @@ fn read_response_body(c: *mut Conn, headers: []Header, out: *mut strs.String, ma
         if fr.length > max {
             return error.TooLarge;
         }
-        out.reserve(fr.length)!;
-        out.len = fr.length;
-        c.read_exact(out.bytes())!;
+        c.read_into(out, fr.length)!;
     } else {
         c.read_to_end(out, max)!;
     }
@@ -1668,9 +1782,50 @@ test "server and client" {
     defer mem.free(o7);
     @expect(strs.starts_with(o7, "HTTP/1.1 400 "));
 
+    // framing that a proxy could read differently is refused (request smuggling)
+    let smuggles: [9][]u8 = [
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: +3\r\n\r\nabc",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3 3\r\n\r\nabc",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \x0bchunked\r\n\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n 3\r\nabc\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\n",
+        "POST /echo HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "GET /hello HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+        "GET /hello HTTP/1.1\r\nHost: x\r\nX-A: a\rb\r\n\r\n",
+        "GET /hello HTTP/1.1\r\nHost: x\r\nX-A: a\x00b\r\n\r\n",
+    ];
+    for sm in smuggles {
+        let o = raw_exchange(port, sm)!;
+        defer mem.free(o);
+        @expect(strs.starts_with(o, "HTTP/1.1 4") or strs.starts_with(o, "HTTP/1.1 501"));
+    }
+    // route parameters cannot climb out of their place
+    let o8 = raw_exchange(port, "GET /users/..%2Fetc HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
+    defer mem.free(o8);
+    @expect(strs.starts_with(o8, "HTTP/1.1 404 "));
+    let o9 = raw_exchange(port, "GET /users/%2E%2E HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
+    defer mem.free(o9);
+    @expect(strs.starts_with(o9, "HTTP/1.1 404 "));
+    // the client will not send requests its caller could have split
+    let bad_url = fmt.bufprint(url[..], "{}/a HTTP/1.1\r\nX: 1\r\n\r\nGET /b", [fmt.str(base)])!;
+    @expect(failed(get(bad_url)));
+    let hdrs: [1]Header = [Header.{ name: "X-Evil", value: "1\r\nContent-Length: 0" }];
+    @expect(failed(request("GET", fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, hdrs[..], "",
+                           ClientOptions.default())));
+    let hdrs2: [1]Header = [Header.{ name: "Transfer-Encoding", value: "chunked" }];
+    @expect(failed(request("GET", fmt.bufprint(url[..], "{}/hello", [fmt.str(base)])!, hdrs2[..], "",
+                           ClientOptions.default())));
+    @expect(failed(get("http://internal\x00.example.com/")));
+
     @expect_eq(@atomic_load(&app.hits), 3);
     srv.stop();
     th.join();
+}
+
+fn failed(r: !ClientResponse) bool {
+    let mut v = r catch return true;
+    v.deinit();
+    return false;
 }
 
 test "https" {
