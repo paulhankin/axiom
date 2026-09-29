@@ -9,8 +9,8 @@
 //     let img2 = formats.decode(bytes)!;
 //     let out = formats.encode(&img, formats.PNG, formats.Options.default())!;
 //
-// Formats: PNG, JPEG, BMP, QOI, PNM (PBM, PGM, PPM, PAM, PFM), Radiance HDR
-// and OpenEXR. HDR and EXR hold linear floating point (F32) images; the
+// Formats: PNG, JPEG, BMP, QOI, PNM (PBM, PGM, PPM, PAM, PFM), Radiance HDR,
+// OpenEXR and GIF. HDR and EXR hold linear floating point (F32) images; the
 // others 8 or 16 bits per sample. Encoding converts as the format needs.
 // =============================================================================
 
@@ -20,6 +20,7 @@ import "../mem.ph" as mem;
 import "../str.ph" as strs;
 import "bmp.ph" as bmp;
 import "exr.ph" as exr;
+import "gif.ph" as gif;
 import "hdr.ph" as hdr;
 import "jpeg.ph" as jpeg;
 import "png.ph" as png;
@@ -36,6 +37,7 @@ pub const QOI: u8 = 4;
 pub const PNM: u8 = 5;
 pub const HDR: u8 = 6;
 pub const EXR: u8 = 7;
+pub const GIF: u8 = 8;
 
 /// Settings for encoders (each uses the ones that apply to it).
 pub struct Options {
@@ -59,6 +61,9 @@ pub fn detect(data: []u8) u8 {
     }
     if exr.is_exr(data) {
         return EXR;
+    }
+    if gif.is_gif(data) {
+        return GIF;
     }
     if qoi.is_qoi(data) {
         return QOI;
@@ -109,6 +114,9 @@ pub fn from_extension(path: []u8) u8 {
     if @mem_eq(e, "exr") {
         return EXR;
     }
+    if @mem_eq(e, "gif") {
+        return GIF;
+    }
     return UNKNOWN;
 }
 
@@ -136,6 +144,9 @@ pub fn decode(data: []u8) !image.Image {
     if f == EXR {
         return exr.decode(data);
     }
+    if f == GIF {
+        return gif.decode(data);
+    }
     return error.Unsupported;
 }
 
@@ -161,6 +172,9 @@ pub fn encode(img: *image.Image, format: u8, opts: Options) ![]mut u8 {
     }
     if format == EXR {
         return exr.encode(img, opts.exr);
+    }
+    if format == GIF {
+        return gif.encode(img);
     }
     return error.Unsupported;
 }
@@ -195,7 +209,7 @@ test "every format" {
     for i in @as(usize, 0)..px.len {
         px[i] = @truncate(u8, (i % 30) * 8);
     }
-    let formats: [7]u8 = [PNG, JPEG, BMP, QOI, PNM, HDR, EXR];
+    let formats: [8]u8 = [PNG, JPEG, BMP, QOI, PNM, HDR, EXR, GIF];
     for f in formats {
         let enc = encode(&img, f, Options.default())!;
         defer mem.free(enc);

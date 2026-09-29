@@ -32,6 +32,7 @@ import "http.ph" as http;
 import "mem.ph" as mem;
 import "net.ph" as net;
 import "str.ph" as strs;
+import "thread.ph" as thread;
 import "tls.ph" as tls;
 
 error { HandshakeFailed, ProtocolError, MessageTooBig, Closed, BadUrl, NetError, TimedOut, OutOfMemory,
@@ -514,8 +515,6 @@ fn handshake(c: *mut Conn, u: http.Url) !void {
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
-
-import "thread.ph" as thread;
 
 // a Conn reading from bytes given in advance (writes go nowhere useful)
 fn fed(bytes: []u8, client: bool) !Conn {

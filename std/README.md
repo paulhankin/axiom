@@ -99,6 +99,7 @@ Image files are read and written by `std/image/`:
 | [`image/pnm`](image/pnm.ph) | PBM, PGM, PPM (ASCII and binary), PAM, PFM (float) |
 | [`image/hdr`](image/hdr.ph) | Radiance RGBE (HDR) |
 | [`image/exr`](image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
+| [`image/gif`](image/gif.ph) | GIF 87a/89a: interlacing, transparency, animation (`decode_all` → frames composited with each disposal method, delays, loop count); writes single images and animations with median-cut palettes. Checked against files made by Pillow ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
 
 Sound files are read and written by `std/audio/`:
 
