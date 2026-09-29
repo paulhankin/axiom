@@ -462,6 +462,20 @@ fn map_into(s: []u8, mode: u8, out: *mut strs.String) !void {
     out.reserve(s.len)!;
     let mut i: usize = 0;
     while i < s.len {
+        let b = s[i];
+        if b < 0x80 {
+            // ASCII maps only between A-Z and a-z
+            let mut c = b;
+            let up = (mode == UPPER_MODE) or (mode == TITLE_MODE);
+            if up and (b >= 'a') and (b <= 'z') {
+                c = b - 32;
+            } else if not up and (b >= 'A') and (b <= 'Z') {
+                c = b + 32;
+            }
+            out.push(c)!;
+            i += 1;
+            continue;
+        }
         let r = strs.decode_rune(s[i..]);
         if (mode == LOWER_MODE) and (r.value == 0x3a3) and final_sigma(s, i, r.len) {
             push_cp(out, 0x3c2)!;
@@ -852,6 +866,14 @@ pub struct Graphemes {
         }
         let start = self.pos;
         let s = self.s;
+        // two ASCII characters always break, except CR LF (no ASCII
+        // character extends or prepends)
+        let b0 = s[start];
+        if (b0 < 0x80) and
+           (((start + 1) == s.len) or ((s[start + 1] < 0x80) and not ((b0 == '\r') and (s[start + 1] == '\n')))) {
+            self.pos = start + 1;
+            return s[start..start + 1];
+        }
         let first = strs.decode_rune(s[start..]);
         let mut i = start + first.len;
         let mut prev = rec(first.value);

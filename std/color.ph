@@ -350,6 +350,7 @@ pub fn srgb_decode(v: f32) f32 {
 
 let mut DECODE8: [256]f32 = [0.0; 256];  // encoded byte -> linear
 let mut THRESH8: [255]f32 = [0.0; 255];  // linear values where the encoded byte steps up
+let mut BUCKET8: [4096]u8 = [0; 4096];   // srgb8(k / 4096): where to start looking
 let mut TABLES_READY: u32 = 0;
 
 fn decode_table() *[256]f32 {
@@ -359,6 +360,9 @@ fn decode_table() *[256]f32 {
         }
         for i in @as(usize, 0)..255 {
             THRESH8[i] = srgb_decode_f64((@float_from_int(f64, i) + 0.5) / 255.0);
+        }
+        for k in @as(usize, 0)..4096 {
+            BUCKET8[k] = search8(@float_from_int(f32, k) / 4096.0);
         }
         @atomic_store(&mut TABLES_READY, 1);
     }
@@ -376,6 +380,22 @@ fn srgb_decode_f64(v: f64) f32 {
 /// 255 * srgb_encode(v), by binary search over the steps.
 pub fn srgb8(v: f32) u8 {
     _ = decode_table();
+    if not (v > 0.0) {
+        return 0;
+    }
+    if v >= 1.0 {
+        return 255;
+    }
+    // v * 4096 is exact, so v is at least its bucket's start; from there
+    // the answer is at most a step or two up
+    let mut r = @as(usize, BUCKET8[@int_from_float(usize, v * 4096.0)]);
+    while (r < 255) and (THRESH8[r] <= v) {
+        r += 1;
+    }
+    return @truncate(u8, r);
+}
+
+fn search8(v: f32) u8 {
     if not (v > 0.0) {
         return 0;
     }
@@ -1115,4 +1135,18 @@ test "parsing" {
     @expect_eq(format_hex(Rgba8.from_u32(0x01020304), buf[..]), "#01020304");
     let c = parse("#808080")!;
     @expect(near(c.r, 0.2158605, 1.0e-6));
+}
+
+test "srgb8 agrees with the exact search" {
+    let mut v: f32 = 0.0;
+    while v < 1.001 {
+        @expect_eq(srgb8(v), search8(v));
+        v = @bit_cast(f32, @bit_cast(u32, v) + 997) + 0.00001;
+    }
+    for i in @as(usize, 0)..255 {
+        let t = THRESH8[i];
+        @expect_eq(srgb8(t), search8(t));
+        let below = @bit_cast(f32, @bit_cast(u32, t) - 1);
+        @expect_eq(srgb8(below), search8(below));
+    }
 }

@@ -355,6 +355,12 @@ fn expand_row(e: *Expand, row: []u8, w: usize, img: *mut image.Image, x0: usize,
         return;
     }
     let out = img.samples8();
+    if (h.color_type != 3) and (h.depth == 8) and (ch == h.samples) and (dx == 1) {
+        // the samples as they are
+        let o = ((y * img.width) + x0) * ch;
+        @mem_copy(out[o..o + (w * ch)], row[..w * ch]);
+        return;
+    }
     for k in @as(usize, 0)..w {
         let o = ((y * img.width) + x0 + (k * dx)) * ch;
         if h.color_type == 3 {

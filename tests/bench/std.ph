@@ -61,6 +61,14 @@ fn report_ops(name: []u8, ops: usize, t0: time.Instant) void {
     fmt.print("{:<28} {:>10.3} Mop/s  ({:.3} s)\n", [fmt.str(name), fmt.float(r / 1.0e6), fmt.float(s)]) catch {};
 }
 
+/// Prints a result for slow operations: milliseconds each.
+fn report_ms(name: []u8, ops: usize, t0: time.Instant) void {
+    let s = t0.elapsed().as_seconds();
+    fmt.print(
+        "{:<28} {:>10.3} ms each ({:.3} s)\n", [fmt.str(name), fmt.float((s * 1000.0) / @float_from_int(f64, ops)),
+                                                fmt.float(s)]) catch {};
+}
+
 let WORDS: [24][]u8 = [
     "the",
     "quick",
@@ -339,7 +347,7 @@ fn run() !void {
             path.circle(x, y, 5.0 + @float_from_int(f64, i % 40))!;
             cv.fill(&path, draw.Paint.solid(color.Color.rgb(0.2, 0.4, 0.8)), draw.NONZERO)!;
         }
-        report_ops("draw fill circles", n, t0);
+        report_ms("draw fill circles", n, t0);
         let t1 = time.Instant.now();
         for _i in @as(usize, 0)..n {
             path.clear();
@@ -347,7 +355,7 @@ fn run() !void {
             path.cubic_to(100.0, 100.0, 700.0, 500.0, @float_from_int(f64, rand() % 800), 300.0)!;
             cv.stroke(&path, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)), draw.Stroke.width(3.0))!;
         }
-        report_ops("draw stroke curves", n, t1);
+        report_ms("draw stroke curves", n, t1);
     }
     if wanted("text") {
         let mut f = font.Font.load("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") catch return;
@@ -477,7 +485,7 @@ fn run() !void {
         for _k in @as(usize, 0)..10 {
             r.mod_pow(&x, &e, &m)!;
         }
-        report_ops("bigint mod_pow 2048", 10, t1);
+        report_ms("bigint mod_pow 2048", 10, t1);
         _ = a;
     }
 }

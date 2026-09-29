@@ -485,7 +485,10 @@ struct Edge {
 struct Crossing {
     x: f64,
     dir: i32,
+    e: usize,  // the edge
 }
+
+const FAR: f64 = 1.0e300;  // the x of a crossing that isn't there
 
 /// The pixel rectangle [x0, x1) x [y0, y1) to rasterize: the polygons' bounds
 /// within the canvas.
@@ -559,61 +562,108 @@ fn rasterize[C](
     defer mem.free(cov);
     let run = mem.alloc.[f32](bw + 2)!;
     defer mem.free(run);
+    @mem_set(cov, 0.0);  // each row clears what it used
+    @mem_set(run, 0.0);
     let mut edges = vec.Vec.[Edge].init();
     defer edges.deinit();
+    let mut row_edges = vec.Vec.[Edge].init();
+    defer row_edges.deinit();
     let mut xs = vec.Vec.[Crossing].init();
     defer xs.deinit();
     let wsub = 1.0 / @float_from_int(f32, SUB);
+    // every edge (every polygon closed for filling), top first
+    let mut by_top = vec.Vec.[Edge].init();
+    defer by_top.deinit();
+    for pi in @as(usize, 0)..p.starts.len {
+        let r = p.range(pi);
+        if (r[1] - r[0]) < 2 {
+            continue;
+        }
+        let pts = p.pts.items();
+        for i in r[0]..r[1] {
+            let mut j = i + 1;
+            if j == r[1] {
+                j = r[0];
+            }
+            let ax = pts[2 * i];
+            let ay = pts[(2 * i) + 1];
+            let bx = pts[2 * j];
+            let by = pts[(2 * j) + 1];
+            if ay < by {
+                by_top.push(Edge.{ x0: ax - ox, y0: ay, y1: by, dxdy: (bx - ax) / (by - ay), dir: 1 })!;
+            } else if by < ay {
+                by_top.push(Edge.{ x0: bx - ox, y0: by, y1: ay, dxdy: (ax - bx) / (ay - by), dir: -1 })!;
+            }
+        }
+    }
+    vec.sort(by_top.items(), edge_less);
+    let mut next: usize = 0;
     let mut y0 = b.y0;
     while y0 < b.y1 {
         let bh = @min(BAND, b.y1 - y0);
         let top = @float_from_int(f64, y0);
         let bot = top + @float_from_int(f64, bh);
-        // the edges this band's sample lines may cross
-        edges.clear();
-        for pi in @as(usize, 0)..p.starts.len {
-            let r = p.range(pi);
-            if (r[1] - r[0]) < 2 {
-                continue;
-            }
-            for i in r[0]..r[1] {
-                let mut j = i + 1;
-                if j == r[1] {
-                    j = r[0];  // every polygon is closed for filling
-                }
-                let ay = p.y(i);
-                let by = p.y(j);
-                if (ay == by) or ((ay < top) and (by < top)) or ((ay >= bot) and (by >= bot)) {
-                    continue;
-                }
-                if ay < by {
-                    edges.push(Edge.{ x0: p.x(i) - ox, y0: ay, y1: by, dxdy: (p.x(j) - p.x(i)) / (by - ay), dir: 1 })!;
-                } else {
-                    edges.push(Edge.{ x0: p.x(j) - ox, y0: by, y1: ay, dxdy: (p.x(i) - p.x(j)) / (ay - by), dir: -1 })!;
-                }
+        // the edges this band's sample lines may cross: drop those that
+        // ended above it, take on those that start in it
+        let mut kept: usize = 0;
+        for k in @as(usize, 0)..edges.len {
+            let e = edges.get(k);
+            if e.y1 > top {
+                edges.set(kept, e);
+                kept += 1;
             }
         }
-        let es = edges.items();
+        edges.truncate(kept);
+        while (next < by_top.len) and (by_top.get(next).y0 < bot) {
+            let e = by_top.get(next);
+            if e.y1 > top {
+                edges.push(e)!;
+            }
+            next += 1;
+        }
         for row in @as(usize, 0)..bh {
-            @mem_set(cov, 0.0);
-            @mem_set(run, 0.0);
             let yrow = top + @float_from_int(f64, row);
+            // this row's edges, so each sample line looks at few
+            row_edges.clear();
+            for e in edges.items() {
+                if (e.y1 > yrow) and (e.y0 < (yrow + 1.0)) {
+                    row_edges.push(e)!;
+                }
+            }
+            let es = row_edges.items();
+            if es.len < 2 {
+                continue;
+            }
             let mut any = false;
+            let mut minx = FAR;  // the columns the spans touch
+            let mut maxx = -FAR;
+            // one crossing per edge, kept in x order from line to line
+            // (it changes little, so insertion sort is quick); edges a
+            // line misses sort last with no direction
+            xs.clear();
+            for i in @as(usize, 0)..es.len {
+                xs.push(Crossing.{ x: FAR, dir: 0, e: i })!;
+            }
+            let c = xs.items();
+            let mut sorted = false;
             for sub in @as(usize, 0)..SUB {
                 let ys = yrow + ((@float_from_int(f64, sub) + 0.5) / @float_from_int(f64, SUB));
-                xs.clear();
-                for e in es {
+                let mut active: usize = 0;
+                for k in @as(usize, 0)..c.len {
+                    let e = es[c[k].e];
                     if (ys >= e.y0) and (ys < e.y1) {
-                        xs.push(Crossing.{ x: e.x0 + ((ys - e.y0) * e.dxdy), dir: e.dir })!;
+                        c[k].x = e.x0 + ((ys - e.y0) * e.dxdy);
+                        c[k].dir = e.dir;
+                        active += 1;
+                    } else {
+                        c[k].x = FAR;
+                        c[k].dir = 0;
                     }
                 }
-                let c = xs.items();
-                if c.len < 2 {
+                if active < 2 {
                     continue;
                 }
-                // sort by x (insertion when the lists are short, as they
-                // usually are; many crossings on a line get O(n log n))
-                if c.len > 32 {
+                if (not sorted) and (c.len > 32) {
                     vec.sort(c, crossing_less);
                 } else {
                     for i in @as(usize, 1)..c.len {
@@ -626,12 +676,24 @@ fn rasterize[C](
                         c[k] = v;
                     }
                 }
+                sorted = true;
+                // one span for each stretch inside (overlapping pieces
+                // of a stroke cross inside it often)
                 let mut wind: i32 = 0;
-                for i in @as(usize, 0)..c.len - 1 {
+                let mut start: f64 = 0.0;
+                for i in @as(usize, 0)..c.len {
+                    if c[i].x >= FAR {
+                        break;
+                    }
+                    let was = (rule == EVEN_ODD and ((wind & 1) != 0)) or ((rule != EVEN_ODD) and (wind != 0));
                     wind += c[i].dir;
-                    let inside = (rule == EVEN_ODD and ((wind & 1) != 0)) or ((rule != EVEN_ODD) and (wind != 0));
-                    if inside and (c[i + 1].x > c[i].x) {
-                        add_span(cov, run, bw, c[i].x, c[i + 1].x, wsub);
+                    let now = (rule == EVEN_ODD and ((wind & 1) != 0)) or ((rule != EVEN_ODD) and (wind != 0));
+                    if now and not was {
+                        start = c[i].x;
+                    } else if was and not now and (c[i].x > start) {
+                        add_span(cov, run, bw, start, c[i].x, wsub);
+                        minx = @min(minx, start);
+                        maxx = @max(maxx, c[i].x);
                         any = true;
                     }
                 }
@@ -639,12 +701,19 @@ fn rasterize[C](
             if not any {
                 continue;
             }
+            let fw = @float_from_int(f64, bw);
+            let lo = @int_from_float(usize, @floor(@min(@max(minx, 0.0), fw)));
+            let hi = @min(@int_from_float(usize, @floor(@min(@max(maxx, 0.0), fw))) + 1, bw);
             let mut acc: f32 = 0.0;
-            for x in @as(usize, 0)..bw {
+            for x in lo..hi {
                 acc += run[x];
                 cov[x] = @min(cov[x] + acc, 1.0);
             }
-            visit(ctx, b.x0, y0 + row, cov[..bw]);
+            if lo < hi {
+                visit(ctx, b.x0 + lo, y0 + row, cov[lo..hi]);
+            }
+            @mem_set(cov[lo..hi + 1], 0.0);
+            @mem_set(run[lo..hi + 2], 0.0);
         }
         y0 += bh;
     }
@@ -858,6 +927,10 @@ fn dedupe(xs: []f64, out: *mut vec.Vec.[f64]) !void {
         }
         i += 2;
     }
+}
+
+fn edge_less(a: Edge, b: Edge) bool {
+    return a.y0 < b.y0;
 }
 
 fn crossing_less(a: Crossing, b: Crossing) bool {
@@ -1608,8 +1681,26 @@ fn fill_row(fc: *mut FillCtx, x0: usize, y: usize, cov: []f32) void {
     let cv = fc.cv;
     let img = cv.img;
     let has_clip = cv.clip.len > 0;
+    // an opaque solid colour drawn over or in place of 8-bit pixels: a
+    // fully covered pixel just takes its bytes (written once the slow way)
+    let fast = (fc.sh.paint.kind == PAINT_SOLID) and (fc.sh.solid.a >= 1.0) and ((cv.op == OVER) or (cv.op == SRC)) and
+               (img.depth == image.U8) and (cv.alpha >= 1.0);
+    let ch = img.channels;
+    let mut tpl: [4]u8 = [0; 4];
+    let mut have_tpl = false;
     for i in @as(usize, 0)..cov.len {
         let mut c = cov[i];
+        if fast and (c >= 1.0) and (not has_clip or (cv.clip[(y * img.width) + x0 + i] >= 1.0)) {
+            let o = ((y * img.width) + x0 + i) * ch;
+            if have_tpl {
+                @mem_copy(img.data[o..o + ch], tpl[..ch]);
+            } else {
+                write_px(img, x0 + i, y, fc.sh.solid);
+                @mem_copy(tpl[..ch], img.data[o..o + ch]);
+                have_tpl = true;
+            }
+            continue;
+        }
         if not cv.antialias {
             c = threshold(c);
         }

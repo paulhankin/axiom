@@ -825,13 +825,7 @@ const F2562: i32 = 20995;
 const F3072: i32 = 25172;
 
 fn clamp8(v: i32) u8 {
-    if v < 0 {
-        return 0;
-    }
-    if v > 255 {
-        return 255;
-    }
-    return @truncate(u8, @bit_cast(u32, v));
+    return @truncate(u8, @bit_cast(u32, @min(@max(v, 0), 255)));
 }
 
 /// Dequantizes and inverse-transforms a block into out (row stride given).
@@ -1119,7 +1113,7 @@ fn upsample_row(d: *Decoder, ci: usize, y: usize, out: []mut u8) void {
                 bias = 1;
             }
             for x in @as(usize, 0)..w {
-                out[x] = @truncate(u8, (((@as(u32, row[x]) * 3) + @as(u32, nrow[x])) + bias) >> 2);
+                out[x] = @truncate(u8, (((@as(u32, row[x]) *% 3) +% @as(u32, nrow[x])) +% bias) >> 2);
             }
             return;
         }
@@ -1131,10 +1125,11 @@ fn upsample_row(d: *Decoder, ci: usize, y: usize, out: []mut u8) void {
         put(out, 1, (((this * 3) + next) + 7) >> 4);
         let mut last = this;
         this = next;
+        // (inside the loop, 2i + 1 <= 2n - 3 < w: always in out)
         for i in @as(usize, 1)..n - 1 {
-            next = (@as(u32, row[i + 1]) * 3) + @as(u32, nrow[i + 1]);
-            put(out, 2 * i, (((this * 3) + last) + 8) >> 4);
-            put(out, (2 * i) + 1, (((this * 3) + next) + 7) >> 4);
+            next = (@as(u32, row[i + 1]) *% 3) +% @as(u32, nrow[i + 1]);
+            out[2 * i] = @truncate(u8, (((this *% 3) +% last) +% 8) >> 4);
+            out[(2 * i) + 1] = @truncate(u8, (((this *% 3) +% next) +% 7) >> 4);
             last = this;
             this = next;
         }
@@ -1147,9 +1142,9 @@ fn upsample_row(d: *Decoder, ci: usize, y: usize, out: []mut u8) void {
         put(out, 0, @as(u32, row[0]));
         put(out, 1, (((@as(u32, row[0]) * 3) + @as(u32, row[1])) + 2) >> 2);
         for i in @as(usize, 1)..n - 1 {
-            let v = @as(u32, row[i]) * 3;
-            put(out, 2 * i, ((v + @as(u32, row[i - 1])) + 1) >> 2);
-            put(out, (2 * i) + 1, ((v + @as(u32, row[i + 1])) + 2) >> 2);
+            let v = @as(u32, row[i]) *% 3;
+            out[2 * i] = @truncate(u8, ((v +% @as(u32, row[i - 1])) +% 1) >> 2);
+            out[(2 * i) + 1] = @truncate(u8, ((v +% @as(u32, row[i + 1])) +% 2) >> 2);
         }
         put(out, 2 * (n - 1), (((@as(u32, row[n - 1]) * 3) + @as(u32, row[n - 2])) + 1) >> 2);
         put(out, (2 * (n - 1)) + 1, @as(u32, row[n - 1]));
@@ -1176,14 +1171,16 @@ const FIX_1_77200: i32 = 116130;
 const FIX_0_71414: i32 = 46802;
 const FIX_0_34414: i32 = 22554;
 
-fn ycc_to_rgb(ys: []u8, cbs: []u8, crs: []u8, out: []mut u8) void {
+fn ycc_to_rgb(ys: []u8, cbs: []u8, crs: []u8, out_all: []mut u8) void {
+    let out = out_all[..ys.len * 3];
     for x in @as(usize, 0)..ys.len {
         let y = @as(i32, ys[x]);
         let cb = @as(i32, cbs[x]) - 128;
         let cr = @as(i32, crs[x]) - 128;
-        let r = y + (((FIX_1_40200 * cr) + ONE_HALF) >> SCALEBITS);
-        let g = y + ((((-FIX_0_34414) * cb) + (((-FIX_0_71414) * cr) + ONE_HALF)) >> SCALEBITS);
-        let b = y + (((FIX_1_77200 * cb) + ONE_HALF) >> SCALEBITS);
+        // (no overflow: the products fit in 25 bits)
+        let r = y +% (((FIX_1_40200 *% cr) +% ONE_HALF) >> SCALEBITS);
+        let g = y +% ((((-FIX_0_34414) *% cb) +% (((-FIX_0_71414) *% cr) +% ONE_HALF)) >> SCALEBITS);
+        let b = y +% (((FIX_1_77200 *% cb) +% ONE_HALF) >> SCALEBITS);
         out[x * 3] = clamp8(r);
         out[(x * 3) + 1] = clamp8(g);
         out[(x * 3) + 2] = clamp8(b);
@@ -1345,27 +1342,38 @@ fn scaled_table(base: *[64]u8, quality: u32) [64]u16 {
 /// Forward DCT (float, separable) of an 8x8 block of samples - 128, then
 /// quantization; the result is in zigzag order.
 fn fdct_quantize(block: *[64]f32, q: *[64]u16, out: []mut i16) void {
-    let cos = dct_table();
+    _ = dct_table();
+    let ct = &DCT_COS_T;
+    let cos = &DCT_COS;
+    // rows: tmp[y][u] = sum over x of block[y][x] cos[u][x], four u at a time
     let mut tmp: [64]f32 = [0.0; 64];
     for y in @as(usize, 0)..8 {
-        for u in @as(usize, 0)..8 {
-            let mut s: f32 = 0.0;
-            for x in @as(usize, 0)..8 {
-                s += block[(y * 8) + x] * cos[(u * 8) + x];
-            }
-            tmp[(y * 8) + u] = s;
+        let mut a0: f32x4 = @splat(@as(f32, 0.0));
+        let mut a1: f32x4 = @splat(@as(f32, 0.0));
+        for x in @as(usize, 0)..8 {
+            let b: f32x4 = @splat(block[(y * 8) + x]);
+            a0 = a0 + (b * @load(f32x4, ct[x * 8..(x * 8) + 4]));
+            a1 = a1 + (b * @load(f32x4, ct[(x * 8) + 4..(x * 8) + 8]));
         }
+        @store(tmp[y * 8..(y * 8) + 4], a0);
+        @store(tmp[(y * 8) + 4..(y * 8) + 8], a1);
     }
+    // columns: sum over y of tmp[y][u] cos[v][y]
+    let mut res: [64]f32 = [0.0; 64];
     for v in @as(usize, 0)..8 {
-        for u in @as(usize, 0)..8 {
-            let mut s: f32 = 0.0;
-            for y in @as(usize, 0)..8 {
-                s += tmp[(y * 8) + u] * cos[(v * 8) + y];
-            }
-            let n = (v * 8) + u;
-            out[@as(usize, ZIGZAG_OF[n])] = @truncate(
-                i16, @int_from_float(i32, @nearest(s / @float_from_int(f32, q[n]))));
+        let mut a0: f32x4 = @splat(@as(f32, 0.0));
+        let mut a1: f32x4 = @splat(@as(f32, 0.0));
+        for y in @as(usize, 0)..8 {
+            let c: f32x4 = @splat(cos[(v * 8) + y]);
+            a0 = a0 + (@load(f32x4, tmp[y * 8..(y * 8) + 4]) * c);
+            a1 = a1 + (@load(f32x4, tmp[(y * 8) + 4..(y * 8) + 8]) * c);
         }
+        @store(res[v * 8..(v * 8) + 4], a0);
+        @store(res[(v * 8) + 4..(v * 8) + 8], a1);
+    }
+    for n in @as(usize, 0)..64 {
+        out[@as(usize, ZIGZAG_OF[n])] = @truncate(
+            i16, @int_from_float(i32, @nearest(res[n] / @float_from_int(f32, q[n]))));
     }
 }
 
@@ -1437,7 +1445,8 @@ let ZIGZAG_OF: [64]u8 = [
     63,
 ];
 
-let mut DCT_COS: [64]f32 = [0.0; 64];  // c(u) cos((2x + 1) u pi / 16) / 2
+let mut DCT_COS: [64]f32 = [0.0; 64];    // c(u) cos((2x + 1) u pi / 16) / 2
+let mut DCT_COS_T: [64]f32 = [0.0; 64];  // transposed
 let mut DCT_READY: u32 = 0;
 
 fn dct_table() *[64]f32 {
@@ -1450,6 +1459,7 @@ fn dct_table() *[64]f32 {
             for x in @as(usize, 0)..8 {
                 let a = (@float_from_int(f64, (2 * x) + 1) * @float_from_int(f64, u)) * (3.14159265358979323846 / 16.0);
                 DCT_COS[(u * 8) + x] = @float_cast(f32, cu * math.cos(a));
+                DCT_COS_T[(x * 8) + u] = DCT_COS[(u * 8) + x];
             }
         }
         @atomic_store(&mut DCT_READY, 1);
@@ -1459,7 +1469,7 @@ fn dct_table() *[64]f32 {
 
 /// Encodes as baseline JPEG (free the result with mem.free).
 pub fn encode(img: *image.Image, quality: u32, subsample: u8) ![]mut u8 {
-    if (img.depth != image.U8) or (img.channels == 2) or (img.channels == 4) {
+    if img.depth != image.U8 {
         let mut ch: usize = 3;
         if img.channels <= 2 {
             ch = 1;
@@ -1473,7 +1483,7 @@ pub fn encode(img: *image.Image, quality: u32, subsample: u8) ![]mut u8 {
     if (w > 65535) or (h > 65535) or (w == 0) or (h == 0) {
         return error.Unsupported;
     }
-    let gray = img.channels == 1;
+    let gray = img.channels <= 2;  // alpha is dropped
     let mut ncomp: usize = 3;
     if gray {
         ncomp = 1;
@@ -1495,41 +1505,102 @@ pub fn encode(img: *image.Image, quality: u32, subsample: u8) ![]mut u8 {
     let nblocks = (mcux * mcuy) * blocks_per_mcu;
     let coefs = mem.alloc.[i16](nblocks * 64)!;
     defer mem.free(coefs);
+    // the components at full resolution, padded to whole MCUs by
+    // repeating the last column and row
+    let pw = mcux * 8 * hs;
+    let ph = mcuy * 8 * vs;
+    let full = mem.alloc.[f32]((pw * ph) * ncomp)!;
+    defer mem.free(full);
+    let px = img.samples8();
+    let sc = img.channels;
+    for y in @as(usize, 0)..h {
+        for x in @as(usize, 0)..w {
+            let i = ((y * w) + x) * sc;
+            let o = (y * pw) + x;
+            if gray {
+                full[o] = @float_from_int(f32, px[i]);
+            } else {
+                let r = @float_from_int(f32, px[i]);
+                let g = @float_from_int(f32, px[i + 1]);
+                let b = @float_from_int(f32, px[i + 2]);
+                full[o] = ((0.299 * r) + (0.587 * g)) + (0.114 * b);
+                full[(pw * ph) + o] = ((128.0 - (0.168736 * r)) - (0.331264 * g)) + (0.5 * b);
+                full[(2 * (pw * ph)) + o] = ((128.0 + (0.5 * r)) - (0.418688 * g)) - (0.081312 * b);
+            }
+        }
+    }
+    for c in @as(usize, 0)..ncomp {
+        let pl = full[(c * pw) * ph..((c + 1) * pw) * ph];
+        for y in @as(usize, 0)..h {
+            let last = pl[(y * pw) + w - 1];
+            for x in w..pw {
+                pl[(y * pw) + x] = last;
+            }
+        }
+        for y in h..ph {
+            @mem_copy(pl[y * pw..(y + 1) * pw], pl[(h - 1) * pw..h * pw]);
+        }
+    }
+    // chroma: the average of the hs x vs pixels each sample covers
+    let cw = mcux * 8;
+    let chh = mcuy * 8;
+    let mut nd: usize = 0;
+    if not gray {
+        nd = (cw * chh) * 2;
+    }
+    let down = mem.alloc.[f32](nd)!;
+    defer mem.free(down);
+    if not gray {
+        for c in @as(usize, 1)..3 {
+            let pl = full[(c * pw) * ph..((c + 1) * pw) * ph];
+            let dp = down[((c - 1) * cw) * chh..(c * cw) * chh];
+            for y in @as(usize, 0)..chh {
+                if (hs == 2) and (vs == 2) {
+                    let r0 = pl[(2 * y) * pw..((2 * y) + 1) * pw];
+                    let r1 = pl[((2 * y) + 1) * pw..((2 * y) + 2) * pw];
+                    let d = dp[y * cw..(y + 1) * cw];
+                    for x in @as(usize, 0)..cw {
+                        d[x] = (((r0[2 * x] + r0[(2 * x) + 1]) + r1[2 * x]) + r1[(2 * x) + 1]) / 4.0;
+                    }
+                    continue;
+                }
+                for x in @as(usize, 0)..cw {
+                    let mut sum: f32 = 0.0;
+                    for sy in @as(usize, 0)..vs {
+                        for sx in @as(usize, 0)..hs {
+                            sum += pl[(((y * vs) + sy) * pw) + (x * hs) + sx];
+                        }
+                    }
+                    dp[(y * cw) + x] = sum / @float_from_int(f32, hs * vs);
+                }
+            }
+        }
+    }
     // transform every block, in MCU order
     let mut blk: usize = 0;
     let mut samples: [64]f32 = [0.0; 64];
-    let px = img.samples8();
     for my in @as(usize, 0)..mcuy {
         for mx in @as(usize, 0)..mcux {
             for c in @as(usize, 0)..ncomp {
                 let mut bh: usize = 1;
                 let mut bv: usize = 1;
+                let mut pl = full[..pw * ph];
+                let mut stride = pw;
                 if c == 0 {
                     bh = hs;
                     bv = vs;
+                } else {
+                    pl = down[((c - 1) * cw) * chh..(c * cw) * chh];
+                    stride = cw;
                 }
                 for by in @as(usize, 0)..bv {
                     for bx in @as(usize, 0)..bh {
+                        let x0 = ((mx * bh) + bx) * 8;
+                        let y0 = ((my * bv) + by) * 8;
                         for yy in @as(usize, 0)..8 {
+                            let row = pl[((y0 + yy) * stride) + x0..((y0 + yy) * stride) + x0 + 8];
                             for xx in @as(usize, 0)..8 {
-                                let mut v: f32 = 0.0;
-                                if c == 0 {
-                                    let x = @min((((mx * hs) + bx) * 8) + xx, w - 1);
-                                    let y = @min((((my * vs) + by) * 8) + yy, h - 1);
-                                    v = sample(px, x, y, w, ncomp, 0);
-                                } else {
-                                    // chroma: the average of the hs x vs pixels it covers
-                                    let mut sum: f32 = 0.0;
-                                    for sy in @as(usize, 0)..vs {
-                                        for sx in @as(usize, 0)..hs {
-                                            let x = @min((((mx * 8) + xx) * hs) + sx, w - 1);
-                                            let y = @min((((my * 8) + yy) * vs) + sy, h - 1);
-                                            sum += sample(px, x, y, w, ncomp, c);
-                                        }
-                                    }
-                                    v = sum / @float_from_int(f32, hs * vs);
-                                }
-                                samples[(yy * 8) + xx] = v - 128.0;
+                                samples[(yy * 8) + xx] = row[xx] - 128.0;
                             }
                         }
                         let mut t: usize = 0;
@@ -1574,23 +1645,6 @@ pub fn encode(img: *image.Image, quality: u32, subsample: u8) ![]mut u8 {
         return e;
     };
     return bw.out.take();
-}
-
-fn sample(px: []u8, x: usize, y: usize, w: usize, ncomp: usize, c: usize) f32 {
-    let i = ((y * w) + x) * ncomp;
-    if ncomp == 1 {
-        return @float_from_int(f32, px[i]);
-    }
-    let r = @float_from_int(f32, px[i]);
-    let g = @float_from_int(f32, px[i + 1]);
-    let b = @float_from_int(f32, px[i + 2]);
-    if c == 0 {
-        return ((0.299 * r) + (0.587 * g)) + (0.114 * b);
-    }
-    if c == 1 {
-        return ((128.0 - (0.168736 * r)) - (0.331264 * g)) + (0.5 * b);
-    }
-    return ((128.0 + (0.5 * r)) - (0.418688 * g)) - (0.081312 * b);
 }
 
 struct HuffTable {

@@ -668,6 +668,11 @@ pub struct Conn {
             self.fill(5)!;
             let ty = self.inbuf[0];
             let len = (@as(usize, self.inbuf[3]) << 8) | @as(usize, self.inbuf[4]);
+            // not TLS at all (plain HTTP, say): say so now rather than wait
+            // for a body that isn't coming
+            if (ty < CT_CHANGE_CIPHER_SPEC) or (ty > CT_APPLICATION_DATA) or (self.inbuf[1] != 3) {
+                return self.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
+            }
             if len > MAX_CIPHERTEXT {
                 return self.fail(ALERT_DECODE_ERROR, error.RecordOverflow);
             }

@@ -209,6 +209,70 @@ struct Cell {
     advance: f64,
 }
 
+/// Font lookups remembered for one layout: kerning pairs (direct-mapped)
+/// and the glyphs of ASCII characters for the last style.
+struct Memo {
+    kern_font: [1024]usize,  // 0: empty
+    kern_pair: [1024]u32,
+    kern_val: [1024]i32,
+    ascii_font: usize,  // the style's font and fallbacks the ASCII table is for
+    ascii_fallbacks: usize,
+    ascii_nfb: usize,
+    ascii_gid: [128]u32,
+    ascii_which: [128]u8,  // 0: the style's font; k + 1: fallback k; 255: not looked up
+
+    fn kerning(self: *mut Memo, f: *font.Font, a: u32, b: u32) i32 {
+        if (a > 0xffff) or (b > 0xffff) {
+            return f.kerning(a, b);
+        }
+        let pair = (a << 16) | b;
+        let fp = @int_from_ptr(f);
+        let slot = @as(usize, ((pair *% 0x9e3779b1) ^ @truncate(u32, fp >> 4)) >> 22);
+        if (self.kern_font[slot] == fp) and (self.kern_pair[slot] == pair) {
+            return self.kern_val[slot];
+        }
+        let v = f.kerning(a, b);
+        self.kern_font[slot] = fp;
+        self.kern_pair[slot] = pair;
+        self.kern_val[slot] = v;
+        return v;
+    }
+
+    fn pick_font(self: *mut Memo, st: *Style, cp: u32, gid: *mut u32) *font.Font {
+        if cp >= 128 {
+            return pick_font(st, cp, gid);
+        }
+        let ff = @int_from_ptr(st.font);
+        let fb = @int_from_ptr(st.fallbacks.ptr);
+        if (self.ascii_font != ff) or (self.ascii_fallbacks != fb) or (self.ascii_nfb != st.fallbacks.len) {
+            self.ascii_font = ff;
+            self.ascii_fallbacks = fb;
+            self.ascii_nfb = st.fallbacks.len;
+            @mem_set(self.ascii_which[..], 255);
+        }
+        let i = @as(usize, cp);
+        let w = self.ascii_which[i];
+        if w == 255 {
+            let f = pick_font(st, cp, gid);
+            self.ascii_gid[i] = gid.*;
+            let mut which: u8 = 0;
+            for k in @as(usize, 0)..st.fallbacks.len {
+                if (@int_from_ptr(f) != ff) and (@int_from_ptr(f) == @int_from_ptr(st.fallbacks[k])) and (k < 254) {
+                    which = @truncate(u8, k + 1);
+                    break;
+                }
+            }
+            self.ascii_which[i] = which;
+            return f;
+        }
+        gid.* = self.ascii_gid[i];
+        if w == 0 {
+            return st.font;
+        }
+        return st.fallbacks[@as(usize, w) - 1];
+    }
+}
+
 fn pick_font(st: *Style, cp: u32, gid: *mut u32) *font.Font {
     let g = st.font.glyph_index(cp);
     if g != 0 {
@@ -261,6 +325,17 @@ fn layout_into(spans: []Span, opts: Options, out: *mut Layout) !void {
         }
     }
     let s = all.bytes();
+    let memo = mem.create(Memo.{
+        kern_font: [0; 1024],
+        kern_pair: [0; 1024],
+        kern_val: [0; 1024],
+        ascii_font: 0,
+        ascii_fallbacks: 0,
+        ascii_nfb: 0,
+        ascii_gid: [0; 128],
+        ascii_which: [255; 128],
+    })!;
+    defer mem.destroy(memo);
     // paragraphs end after a paragraph or line separator
     let mut y: f64 = 0.0;
     let mut start: usize = 0;
@@ -277,7 +352,7 @@ fn layout_into(spans: []Span, opts: Options, out: *mut Layout) !void {
                 break;
             }
         }
-        y = paragraph(s, start, end, span_of.items(), spans, opts, y, out)!;
+        y = paragraph(s, start, end, span_of.items(), spans, opts, y, out, memo)!;
         start = end;
     }
     out.height = y;
@@ -289,7 +364,7 @@ fn layout_into(spans: []Span, opts: Options, out: *mut Layout) !void {
 /// Lays out the paragraph s[start..end] with its first line's top at y;
 /// returns where the next paragraph starts.
 fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span, opts: Options, y0: f64,
-             out: *mut Layout) !f64 {
+             out: *mut Layout, memo: *mut Memo) !f64 {
     // measure each code point
     let mut cells = vec.Vec.[Cell].init();
     defer cells.deinit();
@@ -301,7 +376,7 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
         let sp = span_of[i];
         let st = &spans[sp].style;
         let mut gid: u32 = 0;
-        let f = pick_font(st, r.value, &mut gid);
+        let f = memo.pick_font(st, r.value, &mut gid);
         let scale = font.scale_for(f, st.size);
         let mut adv = (@float_from_int(f64, f.advance(gid)) * scale) + st.letter_spacing;
         if is_newline(r.value) or (uni.category(r.value) == uni.GC_CC) {
@@ -353,7 +428,7 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
         if opts.width > 0.0 {
             line_end = fit(cs, line_start, bs, &mut bi, opts.width, tab)!;
         }
-        y = place_line(cs, &bp, line_start, line_end, (line_end == n), rtl, spans, opts, y, tab, out)!;
+        y = place_line(cs, &bp, line_start, line_end, (line_end == n), rtl, spans, opts, y, tab, out, memo)!;
         line_start = line_end;
     }
     if n == 0 {
@@ -458,7 +533,8 @@ fn fit(cs: []Cell, a: usize, bs: []usize, bi: *mut usize, width: f64, tab: f64) 
 
 /// The width of a line's cells in visual order, with kerning and tabs,
 /// leaving out the trailing white space from cell `e` on.
-fn kerned_width(cs: []Cell, bp: *bidi.Paragraph, order: []usize, e: usize, spans: []Span, tab: f64) f64 {
+fn kerned_width(cs: []Cell, bp: *bidi.Paragraph, order: []usize, e: usize, spans: []Span, tab: f64,
+                memo: *mut Memo) f64 {
     let mut x: f64 = 0.0;
     let mut prev_font: usize = 0;
     let mut prev_gid: u32 = 0;
@@ -471,7 +547,7 @@ fn kerned_width(cs: []Cell, bp: *bidi.Paragraph, order: []usize, e: usize, spans
         }
         if (prev_span == c.span) and (prev_font == @int_from_ptr(c.font)) and (prev_level == bp.levels[k]) and
            (prev_gid != 0) and (c.gid != 0) {
-            x += @float_from_int(f64, c.font.kerning(prev_gid, c.gid)) * font.scale_for(
+            x += @float_from_int(f64, memo.kerning(c.font, prev_gid, c.gid)) * font.scale_for(
                 c.font, spans[c.span].style.size);
         }
         if (c.cp == '\t') and (tab > 0.0) {
@@ -489,7 +565,7 @@ fn kerned_width(cs: []Cell, bp: *bidi.Paragraph, order: []usize, e: usize, spans
 
 /// Places cells [a, b) as a line whose top is at y; returns the next line's top.
 fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, rtl: bool, spans: []Span, opts: Options,
-              y: f64, tab: f64, out: *mut Layout) !f64 {
+              y: f64, tab: f64, out: *mut Layout, memo: *mut Memo) !f64 {
     // metrics: the largest of the fonts on the line
     let mut asc: f64 = 0.0;
     let mut desc: f64 = 0.0;
@@ -512,7 +588,7 @@ fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, r
     // visual order
     let order = bp.visual_order(a, b)!;
     defer mem.free(order);
-    let lw = kerned_width(cs, bp, order, e, spans, tab);
+    let lw = kerned_width(cs, bp, order, e, spans, tab, memo);
     // justification: extra room shared among the spaces
     let mut extra: f64 = 0.0;
     let ends_para = last or ((b > a) and is_newline(cs[b - 1].cp));
@@ -568,7 +644,7 @@ fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, r
         // kerning with the glyph to the left, within a run of one font and direction
         if (prev_span == c.span) and (prev_font == @int_from_ptr(c.font)) and (prev_level == bp.levels[k]) and
            (prev_gid != 0) and (c.gid != 0) {
-            x += @float_from_int(f64, c.font.kerning(prev_gid, c.gid)) * font.scale_for(c.font, st.size);
+            x += @float_from_int(f64, memo.kerning(c.font, prev_gid, c.gid)) * font.scale_for(c.font, st.size);
         }
         let mut adv = c.advance;
         if (c.cp == '\t') and (tab > 0.0) {

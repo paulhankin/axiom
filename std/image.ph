@@ -288,53 +288,145 @@ pub struct Image {
     /// averaging all covered pixels when shrinking), in linear light.
     pub fn resize(self: *Image, width: usize, height: usize) !Image {
         let mut out = Image.init(width, height, self.channels, self.depth)!;
-        if (self.width == 0) or (self.height == 0) {
+        if (self.width == 0) or (self.height == 0) or (width == 0) or (height == 0) {
             return out;
         }
-        let sx = @float_from_int(f32, self.width) / @float_from_int(f32, @max(width, 1));
-        let sy = @float_from_int(f32, self.height) / @float_from_int(f32, @max(height, 1));
-        let rx = @max(sx, 1.0);
-        let ry = @max(sy, 1.0);
-        for y in @as(usize, 0)..height {
-            let cy = ((@float_from_int(f32, y) + 0.5) * sy) - 0.5;
-            let y0 = @max(@floor(cy - ry) + 1.0, 0.0);
-            let y1 = @min(@floor(cy + ry), @float_from_int(f32, self.height - 1));
-            for x in @as(usize, 0)..width {
-                let cx = ((@float_from_int(f32, x) + 0.5) * sx) - 0.5;
-                let x0 = @max(@floor(cx - rx) + 1.0, 0.0);
-                let x1 = @min(@floor(cx + rx), @float_from_int(f32, self.width - 1));
-                let mut acc: [4]f32 = [0.0, 0.0, 0.0, 0.0];
-                let mut wsum: f32 = 0.0;
-                let mut yy = y0;
-                while yy <= y1 {
-                    let wy = 1.0 - (@abs(yy - cy) / ry);
-                    let mut xx = x0;
-                    while xx <= x1 {
-                        let w = wy * (1.0 - (@abs(xx - cx) / rx));
-                        if w > 0.0 {
-                            let c = self.get(@int_from_float(usize, xx), @int_from_float(usize, yy));
-                            // weight colour by alpha so transparent pixels don't bleed
-                            acc[0] += (c.r * c.a) * w;
-                            acc[1] += (c.g * c.a) * w;
-                            acc[2] += (c.b * c.a) * w;
-                            acc[3] += c.a * w;
-                            wsum += w;
-                        }
-                        xx += 1.0;
-                    }
-                    yy += 1.0;
+        self.resize_into(&mut out) catch |e| {
+            out.deinit();
+            return e;
+        };
+        return out;
+    }
+
+    // The filter is separable: each source row the vertical filter needs
+    // is filtered horizontally once (premultiplied linear RGBA and the
+    // weight sum, five values a pixel), in a ring of the last few rows.
+    fn resize_into(self: *Image, out: *mut Image) !void {
+        let width = out.width;
+        let mut xs = Taps.init(self.width, width)!;
+        defer xs.deinit();
+        let mut ys = Taps.init(self.height, out.height)!;
+        defer ys.deinit();
+        let k = ys.k;
+        let rw = width * 5;
+        let ring = mem.alloc.[f32](k * rw)!;
+        defer mem.free(ring);
+        let ring_row = mem.alloc.[usize](k)!;
+        defer mem.free(ring_row);
+        @mem_set(ring_row, NO_ROW);
+        let line = mem.alloc.[f32](self.width * 4)!;
+        defer mem.free(line);
+        let acc = mem.alloc.[f32](rw)!;
+        defer mem.free(acc);
+        for y in @as(usize, 0)..out.height {
+            @mem_set(acc, 0.0);
+            let sy0 = ys.start[y];
+            for t in @as(usize, 0)..k {
+                let wy = ys.w[(y * k) + t];
+                if not (wy > 0.0) {
+                    continue;
                 }
+                let sy = sy0 + t;
+                let slot = sy % k;
+                let row = ring[slot * rw..(slot + 1) * rw];
+                if ring_row[slot] != sy {
+                    self.filter_row(sy, &xs, line, row);
+                    ring_row[slot] = sy;
+                }
+                for i in @as(usize, 0)..rw {
+                    acc[i] += wy * row[i];
+                }
+            }
+            for x in @as(usize, 0)..width {
+                let p = acc[x * 5..(x * 5) + 5];
+                let wsum = p[4];
                 if wsum > 0.0 {
-                    let a = acc[3] / wsum;
+                    let a = p[3] / wsum;
                     let mut c = color.Color.{ r: 0.0, g: 0.0, b: 0.0, a: a };
-                    if acc[3] > 0.0 {
-                        c = color.Color.{ r: acc[0] / acc[3], g: acc[1] / acc[3], b: acc[2] / acc[3], a: a };
+                    if p[3] > 0.0 {
+                        c = color.Color.{ r: p[0] / p[3], g: p[1] / p[3], b: p[2] / p[3], a: a };
                     }
                     out.set(x, y, c);
                 }
             }
         }
-        return out;
+    }
+
+    // Source row sy, filtered horizontally into row.
+    fn filter_row(self: *Image, sy: usize, xs: *Taps, line: []mut f32, row: []mut f32) void {
+        for x in @as(usize, 0)..self.width {
+            let c = self.get(x, sy);
+            // weight colour by alpha so transparent pixels don't bleed
+            line[x * 4] = c.r * c.a;
+            line[(x * 4) + 1] = c.g * c.a;
+            line[(x * 4) + 2] = c.b * c.a;
+            line[(x * 4) + 3] = c.a;
+        }
+        let k = xs.k;
+        for x in @as(usize, 0)..xs.n {
+            let mut v: [5]f32 = [0.0; 5];
+            let s0 = xs.start[x];
+            for t in @as(usize, 0)..k {
+                let w = xs.w[(x * k) + t];
+                if w > 0.0 {
+                    let q = (s0 + t) * 4;
+                    v[0] += w * line[q];
+                    v[1] += w * line[q + 1];
+                    v[2] += w * line[q + 2];
+                    v[3] += w * line[q + 3];
+                    v[4] += w;
+                }
+            }
+            @mem_copy(row[x * 5..(x * 5) + 5], v[..]);
+        }
+    }
+}
+
+const NO_ROW: usize = 0xffffffff;
+
+/// The weights of a triangle filter from n_in samples to n: output i takes
+/// input start[i] + t with weight w[i * k + t] (0 past the filter's end).
+struct Taps {
+    n: usize,
+    k: usize,
+    start: []mut usize,
+    w: []mut f32,
+
+    fn init(n_in: usize, n: usize) !Taps {
+        let s = @float_from_int(f32, n_in) / @float_from_int(f32, n);
+        let r = @max(s, 1.0);
+        let k = @int_from_float(usize, 2.0 * r) + 2;
+        let start = mem.alloc.[usize](n)!;
+        let w = mem.alloc.[f32](@mul_checked(n, k) catch {
+            mem.free(start);
+            return error.OutOfMemory;
+        }) catch |e| {
+            mem.free(start);
+            return e;
+        };
+        @mem_set(w, 0.0);
+        let last = @float_from_int(f32, n_in - 1);
+        for i in @as(usize, 0)..n {
+            let c = ((@float_from_int(f32, i) + 0.5) * s) - 0.5;
+            let lo = @max(@floor(c - r) + 1.0, 0.0);
+            let hi = @min(@floor(c + r), last);
+            let first = @int_from_float(usize, lo);
+            start[i] = first;
+            let mut j = lo;
+            while j <= hi {
+                let t = @int_from_float(usize, j) - first;
+                if t < k {
+                    w[(i * k) + t] = @max(1.0 - (@abs(j - c) / r), 0.0);
+                }
+                j += 1.0;
+            }
+        }
+        return Taps.{ n: n, k: k, start: start, w: w };
+    }
+
+    fn deinit(self: *mut Taps) void {
+        mem.free(self.start);
+        mem.free(self.w);
     }
 }
 

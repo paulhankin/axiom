@@ -76,12 +76,12 @@ fn nat_cmp(x: []u32, y: []u32) i32 {
 fn nat_add(z: []mut u32, x: []u32, y: []u32) u32 {
     let mut c: u64 = 0;
     for i in 0..y.len {
-        let s = (@as(u64, x[i]) + @as(u64, y[i])) + c;
+        let s = (@as(u64, x[i]) +% @as(u64, y[i])) +% c;
         z[i] = @truncate(u32, s);
         c = s >> 32;
     }
     for i in y.len..x.len {
-        let s = @as(u64, x[i]) + c;
+        let s = @as(u64, x[i]) +% c;
         z[i] = @truncate(u32, s);
         c = s >> 32;
     }
@@ -112,19 +112,19 @@ fn nat_mul_add_small(z: []mut u32, x: []u32, m: u32) u32 {
     let n = x.len;
     let mut i: usize = 0;
     while (i + 4) <= n {
-        let t0 = ((@as(u64, x[i]) * mm) + @as(u64, zz[i])) + c;
+        let t0 = ((@as(u64, x[i]) *% mm) +% @as(u64, zz[i])) +% c;
         zz[i] = @truncate(u32, t0);
-        let t1 = ((@as(u64, x[i + 1]) * mm) + @as(u64, zz[i + 1])) + (t0 >> 32);
+        let t1 = ((@as(u64, x[i + 1]) *% mm) +% @as(u64, zz[i + 1])) +% (t0 >> 32);
         zz[i + 1] = @truncate(u32, t1);
-        let t2 = ((@as(u64, x[i + 2]) * mm) + @as(u64, zz[i + 2])) + (t1 >> 32);
+        let t2 = ((@as(u64, x[i + 2]) *% mm) +% @as(u64, zz[i + 2])) +% (t1 >> 32);
         zz[i + 2] = @truncate(u32, t2);
-        let t3 = ((@as(u64, x[i + 3]) * mm) + @as(u64, zz[i + 3])) + (t2 >> 32);
+        let t3 = ((@as(u64, x[i + 3]) *% mm) +% @as(u64, zz[i + 3])) +% (t2 >> 32);
         zz[i + 3] = @truncate(u32, t3);
         c = t3 >> 32;
         i += 4;
     }
     while i < n {
-        let t = ((@as(u64, x[i]) * mm) + @as(u64, zz[i])) + c;
+        let t = ((@as(u64, x[i]) *% mm) +% @as(u64, zz[i])) +% c;
         zz[i] = @truncate(u32, t);
         c = t >> 32;
         i += 1;
@@ -146,13 +146,13 @@ fn nat_mul_basic(z: []mut u32, x: []u32, y: []u32) void {
 fn nat_add_into(z: []mut u32, x: []u32) u32 {
     let mut c: u64 = 0;
     for i in 0..x.len {
-        let s = (@as(u64, z[i]) + @as(u64, x[i])) + c;
+        let s = (@as(u64, z[i]) +% @as(u64, x[i])) +% c;
         z[i] = @truncate(u32, s);
         c = s >> 32;
     }
     let mut i = x.len;
     while (c != 0) and (i < z.len) {
-        let s = @as(u64, z[i]) + c;
+        let s = @as(u64, z[i]) +% c;
         z[i] = @truncate(u32, s);
         c = s >> 32;
         i += 1;
@@ -1226,33 +1226,38 @@ fn mont_inv(m0: u32) u32 {
 /// z = a * b * R^-1 mod m (CIOS). a, b < m; z, t scratch of m.len and
 /// m.len + 2 limbs. The final subtraction is done with masks, so the time
 /// does not depend on the values.
-fn mont_mul(z: []mut u32, a: []u32, b: []u32, m: []u32, minv: u32, t: []mut u32) void {
-    let n = m.len;
+fn mont_mul(z: []mut u32, a0: []u32, b: []u32, m0: []u32, minv: u32, t0: []mut u32) void {
+    let n = m0.len;
+    // (the same lengths throughout, so the loops need no bounds checks;
+    // no sum below can pass 2^64 - 1, so they wrap without checks)
+    let a = a0[..n];
+    let m = m0[..n];
+    let t = t0[..n + 2];
     @mem_set(t, 0);
     for i in 0..n {
         // t += a * b[i]
         let mut c: u64 = 0;
         let bi = @as(u64, b[i]);
         for j in 0..n {
-            let s = ((@as(u64, a[j]) * bi) + @as(u64, t[j])) + c;
+            let s = ((@as(u64, a[j]) *% bi) +% @as(u64, t[j])) +% c;
             t[j] = @truncate(u32, s);
             c = s >> 32;
         }
-        let s1 = @as(u64, t[n]) + c;
+        let s1 = @as(u64, t[n]) +% c;
         t[n] = @truncate(u32, s1);
         t[n + 1] = @truncate(u32, s1 >> 32);
         // t = (t + u * m) / 2^32 with u making the low limb zero
         let u = @as(u64, t[0] *% minv);
-        let s2 = (u * @as(u64, m[0])) + @as(u64, t[0]);
+        let s2 = (u *% @as(u64, m[0])) +% @as(u64, t[0]);
         c = s2 >> 32;
         for j in 1..n {
-            let s = ((u * @as(u64, m[j])) + @as(u64, t[j])) + c;
+            let s = ((u *% @as(u64, m[j])) +% @as(u64, t[j])) +% c;
             t[j - 1] = @truncate(u32, s);
             c = s >> 32;
         }
-        let s3 = @as(u64, t[n]) + c;
+        let s3 = @as(u64, t[n]) +% c;
         t[n - 1] = @truncate(u32, s3);
-        t[n] = t[n + 1] + @truncate(u32, s3 >> 32);
+        t[n] = t[n + 1] +% @truncate(u32, s3 >> 32);
     }
     // z = t - m if t >= m, else t, without branching on the values
     let mut borrow: u64 = 0;

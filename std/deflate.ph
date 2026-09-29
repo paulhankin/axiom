@@ -1179,6 +1179,17 @@ pub struct Compressor {
             }
             if (w[cp + best] == w[pos + best]) and (w[cp] == w[pos]) and (w[cp + 1] == w[pos + 1]) {
                 let mut l: usize = 2;
+                // 16 bytes at a time, then byte by byte
+                while (l + 16) <= max_len {
+                    let ne = ~@bitmask(
+                        @lanes_eq(
+                            @load(u8x16, w[cp + l..cp + l + 16]), @load(u8x16, w[pos + l..pos + l + 16]))) & 0xffff;
+                    if ne != 0 {
+                        l += @as(usize, @ctz(ne));
+                        break;
+                    }
+                    l += 16;
+                }
                 while (l < max_len) and (w[cp + l] == w[pos + l]) {
                     l += 1;
                 }

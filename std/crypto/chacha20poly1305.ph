@@ -36,56 +36,103 @@ fn put_le32(b: []mut u8, v: u32) void {
 // ChaCha20
 // -----------------------------------------------------------------------------
 
-fn quarter(s: *mut [16]u32, a: usize, b: usize, c: usize, d: usize) void {
-    s[a] +%= s[b];
-    s[d] = @rotl(s[d] ^ s[a], 16);
-    s[c] +%= s[d];
-    s[b] = @rotl(s[b] ^ s[c], 12);
-    s[a] +%= s[b];
-    s[d] = @rotl(s[d] ^ s[a], 8);
-    s[c] +%= s[d];
-    s[b] = @rotl(s[b] ^ s[c], 7);
+// The state as four rows of four words, so that a quarter round works on
+// the four columns at once; the diagonals are the rows rotated by lanes.
+
+/// The starting rows for a key and nonce (the counter goes in row 3, lane 0).
+fn start(key: []u8, nonce: []u8) [4]u32x4 {
+    let mut w: [16]u32 = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for i in @as(usize, 0)..8 {
+        w[4 + i] = le32(key[4 * i..(4 * i) + 4]);
+    }
+    w[13] = le32(nonce[0..4]);
+    w[14] = le32(nonce[4..8]);
+    w[15] = le32(nonce[8..12]);
+    return [@load(u32x4, w[0..4]), @load(u32x4, w[4..8]), @load(u32x4, w[8..12]), @load(u32x4, w[12..16])];
+}
+
+/// The keystream block for rows s as bytes.
+fn keystream(s: *[4]u32x4) [4]u8x16 {
+    let mut a = s[0];
+    let mut b = s[1];
+    let mut c = s[2];
+    let mut d = s[3];
+    for _r in @as(u32, 0)..10 {
+        // columns
+        a = a +% b;
+        d = d ^ a;
+        d = (d << 16) | (d >> 16);
+        c = c +% d;
+        b = b ^ c;
+        b = (b << 12) | (b >> 20);
+        a = a +% b;
+        d = d ^ a;
+        d = (d << 8) | (d >> 24);
+        c = c +% d;
+        b = b ^ c;
+        b = (b << 7) | (b >> 25);
+        // diagonals
+        b = @shuffle(b, b, [1, 2, 3, 0]);
+        c = @shuffle(c, c, [2, 3, 0, 1]);
+        d = @shuffle(d, d, [3, 0, 1, 2]);
+        a = a +% b;
+        d = d ^ a;
+        d = (d << 16) | (d >> 16);
+        c = c +% d;
+        b = b ^ c;
+        b = (b << 12) | (b >> 20);
+        a = a +% b;
+        d = d ^ a;
+        d = (d << 8) | (d >> 24);
+        c = c +% d;
+        b = b ^ c;
+        b = (b << 7) | (b >> 25);
+        b = @shuffle(b, b, [3, 0, 1, 2]);
+        c = @shuffle(c, c, [2, 3, 0, 1]);
+        d = @shuffle(d, d, [1, 2, 3, 0]);
+    }
+    // little-endian words, as every target is
+    return [
+        @bit_cast(u8x16, a +% s[0]), @bit_cast(u8x16, b +% s[1]), @bit_cast(u8x16, c +% s[2]), @bit_cast(
+            u8x16, d +% s[3])];
 }
 
 /// One 64-byte keystream block.
 pub fn block(key: []u8, counter: u32, nonce: []u8, out: []mut u8) void {
-    let mut init: [16]u32 = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    for i in @as(usize, 0)..8 {
-        init[4 + i] = le32(key[4 * i..(4 * i) + 4]);
-    }
-    init[12] = counter;
-    init[13] = le32(nonce[0..4]);
-    init[14] = le32(nonce[4..8]);
-    init[15] = le32(nonce[8..12]);
-    let mut s = init;
-    for r in @as(u32, 0)..10 {
-        quarter(&mut s, 0, 4, 8, 12);
-        quarter(&mut s, 1, 5, 9, 13);
-        quarter(&mut s, 2, 6, 10, 14);
-        quarter(&mut s, 3, 7, 11, 15);
-        quarter(&mut s, 0, 5, 10, 15);
-        quarter(&mut s, 1, 6, 11, 12);
-        quarter(&mut s, 2, 7, 8, 13);
-        quarter(&mut s, 3, 4, 9, 14);
-    }
-    for i in @as(usize, 0)..16 {
-        put_le32(out[4 * i..(4 * i) + 4], s[i] +% init[i]);
+    let mut s = start(key, nonce);
+    s[3] = @replace_lane(s[3], 0, counter);
+    let ks = keystream(&s);
+    for r in @as(usize, 0)..4 {
+        @store(out[16 * r..(16 * r) + 16], ks[r]);
     }
 }
 
 /// XORs data with the keystream starting at block `counter` into out.
 pub fn xor_stream(key: []u8, counter: u32, nonce: []u8, data: []u8, out: []mut u8) void {
-    let mut ks: [64]u8 = [0; 64];
+    let mut s = start(key, nonce);
     let mut c = counter;
     let mut i: usize = 0;
+    let mut tail: [64]u8 = [0; 64];
     while i < data.len {
-        block(key, c, nonce, ks[..]);
+        s[3] = @replace_lane(s[3], 0, c);
+        let ks = keystream(&s);
         c +%= 1;
-        let n = @min(64, data.len - i);
-        for j in 0..n {
-            out[i + j] = data[i + j] ^ ks[j];
+        if (i + 64) <= data.len {
+            for r in @as(usize, 0)..4 {
+                let o = i + (16 * r);
+                @store(out[o..o + 16], @load(u8x16, data[o..o + 16]) ^ ks[r]);
+            }
+            i += 64;
+        } else {
+            for r in @as(usize, 0)..4 {
+                @store(tail[16 * r..(16 * r) + 16], ks[r]);
+            }
+            let n = data.len - i;
+            for j in 0..n {
+                out[i + j] = data[i + j] ^ tail[j];
+            }
+            i += n;
         }
-        i += n;
     }
 }
 
@@ -138,35 +185,35 @@ pub struct Poly1305 {
             h3 +%= (le32(b[9..13]) >> 6) & 0x3ffffff;
             h4 +%= (le32(b[12..16]) >> 8) | hibit;
             let d0 = (
-                (((@as(u64, h0) * r0) + (@as(u64, h1) * s4)) + (@as(u64, h2) * s3)) + (@as(u64, h3) * s2)) + (
-                    @as(u64, h4) * s1);
+                (((@as(u64, h0) *% r0) +% (@as(u64, h1) *% s4)) +% (@as(u64, h2) *% s3)) +% (
+                    @as(u64, h3) *% s2)) +% (@as(u64, h4) *% s1);
             let mut d1 = (
-                (((@as(u64, h0) * r1) + (@as(u64, h1) * r0)) + (@as(u64, h2) * s4)) + (@as(u64, h3) * s3)) + (
-                    @as(u64, h4) * s2);
+                (((@as(u64, h0) *% r1) +% (@as(u64, h1) *% r0)) +% (@as(u64, h2) *% s4)) +% (
+                    @as(u64, h3) *% s3)) +% (@as(u64, h4) *% s2);
             let mut d2 = (
-                (((@as(u64, h0) * r2) + (@as(u64, h1) * r1)) + (@as(u64, h2) * r0)) + (@as(u64, h3) * s4)) + (
-                    @as(u64, h4) * s3);
+                (((@as(u64, h0) *% r2) +% (@as(u64, h1) *% r1)) +% (@as(u64, h2) *% r0)) +% (
+                    @as(u64, h3) *% s4)) +% (@as(u64, h4) *% s3);
             let mut d3 = (
-                (((@as(u64, h0) * r3) + (@as(u64, h1) * r2)) + (@as(u64, h2) * r1)) + (@as(u64, h3) * r0)) + (
-                    @as(u64, h4) * s4);
+                (((@as(u64, h0) *% r3) +% (@as(u64, h1) *% r2)) +% (@as(u64, h2) *% r1)) +% (
+                    @as(u64, h3) *% r0)) +% (@as(u64, h4) *% s4);
             let mut d4 = (
-                (((@as(u64, h0) * r4) + (@as(u64, h1) * r3)) + (@as(u64, h2) * r2)) + (@as(u64, h3) * r1)) + (
-                    @as(u64, h4) * r0);
+                (((@as(u64, h0) *% r4) +% (@as(u64, h1) *% r3)) +% (@as(u64, h2) *% r2)) +% (
+                    @as(u64, h3) *% r1)) +% (@as(u64, h4) *% r0);
             let mut c = d0 >> 26;
             h0 = @truncate(u32, d0) & 0x3ffffff;
-            d1 += c;
+            d1 +%= c;
             c = d1 >> 26;
             h1 = @truncate(u32, d1) & 0x3ffffff;
-            d2 += c;
+            d2 +%= c;
             c = d2 >> 26;
             h2 = @truncate(u32, d2) & 0x3ffffff;
-            d3 += c;
+            d3 +%= c;
             c = d3 >> 26;
             h3 = @truncate(u32, d3) & 0x3ffffff;
-            d4 += c;
+            d4 +%= c;
             c = d4 >> 26;
             h4 = @truncate(u32, d4) & 0x3ffffff;
-            h0 +%= @truncate(u32, c * 5);
+            h0 +%= @truncate(u32, c *% 5);
             let c2 = h0 >> 26;
             h0 = h0 & 0x3ffffff;
             h1 +%= c2;

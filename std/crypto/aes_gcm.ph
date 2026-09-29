@@ -289,20 +289,41 @@ let SBOX: [256]u8 = [
 // AES (encryption only: GCM needs no more)
 // -----------------------------------------------------------------------------
 
-/// SubBytes on 16 bytes: for each high nibble h, a shuffle looks up row h
-/// of the S-box by the low nibble, kept only in lanes whose high nibble is
-/// h. Every row is read, whatever the data.
+/// SubBytes on 16 bytes: for each high nibble h, a swizzle looks up row h
+/// of the S-box by x ^ (h << 4), which is below 16 (a valid index) only in
+/// lanes whose high nibble is h; the others give 0. Every row is read,
+/// whatever the data.
 fn sub_bytes(x: u8x16) u8x16 {
-    let lo = x & @splat(@as(u8, 0x0f));
-    let hi = x >> 4;
     let mut r: u8x16 = @splat(@as(u8, 0));
     for h in @as(usize, 0)..16 {
         let row = @load(u8x16, SBOX[16 * h..(16 * h) + 16]);
-        let t = @swizzle(row, lo);
-        let m = @bit_cast(u8x16, @lanes_eq(hi, @splat(@truncate(u8, h))));
-        r = r | (t & m);
+        r = r | @swizzle(row, x ^ @splat(@truncate(u8, h << 4)));
     }
     return r;
+}
+
+/// sub_bytes on four blocks at once, sharing the row loads.
+fn sub_bytes4(x: *mut [4]u8x16) void {
+    let x0 = x[0];
+    let x1 = x[1];
+    let x2 = x[2];
+    let x3 = x[3];
+    let mut r0: u8x16 = @splat(@as(u8, 0));
+    let mut r1: u8x16 = @splat(@as(u8, 0));
+    let mut r2: u8x16 = @splat(@as(u8, 0));
+    let mut r3: u8x16 = @splat(@as(u8, 0));
+    for h in @as(usize, 0)..16 {
+        let row = @load(u8x16, SBOX[16 * h..(16 * h) + 16]);
+        let m: u8x16 = @splat(@truncate(u8, h << 4));
+        r0 = r0 | @swizzle(row, x0 ^ m);
+        r1 = r1 | @swizzle(row, x1 ^ m);
+        r2 = r2 | @swizzle(row, x2 ^ m);
+        r3 = r3 | @swizzle(row, x3 ^ m);
+    }
+    x[0] = r0;
+    x[1] = r1;
+    x[2] = r2;
+    x[3] = r3;
 }
 
 fn shift_rows(s: u8x16) u8x16 {
@@ -376,6 +397,23 @@ pub struct Aes {
         }
         return shift_rows(sub_bytes(s)) ^ self.rk[self.rounds];
     }
+
+    /// encrypt_block on four blocks, in place.
+    pub fn encrypt4(self: *Aes, b: *mut [4]u8x16) void {
+        for i in @as(usize, 0)..4 {
+            b[i] = b[i] ^ self.rk[0];
+        }
+        for r in 1..self.rounds {
+            sub_bytes4(b);
+            for i in @as(usize, 0)..4 {
+                b[i] = mix_columns(shift_rows(b[i])) ^ self.rk[r];
+            }
+        }
+        sub_bytes4(b);
+        for i in @as(usize, 0)..4 {
+            b[i] = shift_rows(b[i]) ^ self.rk[self.rounds];
+        }
+    }
 }
 
 fn sub_word(w: u32) u32 {
@@ -427,17 +465,6 @@ fn bmul64(x: u64, y: u64) u64 {
     return (((z0 & m0) | (z1 & m1)) | (z2 & m2)) | (z3 & m3);
 }
 
-struct Wide {
-    hi: u64,
-    lo: u64,
-}
-
-/// The full 128-bit carry-less product: the high half comes from the
-/// product of the bit-reversed operands.
-fn clmul(a: u64, b: u64) Wide {
-    return Wide.{ hi: rev64(bmul64(rev64(a), rev64(b))) >> 1, lo: bmul64(a, b) };
-}
-
 fn rev64(x: u64) u64 {
     let mut v = x;
     v = ((v & 0x5555555555555555) << 1) | ((v >> 1) & 0x5555555555555555);
@@ -448,50 +475,63 @@ fn rev64(x: u64) u64 {
     return (v << 32) | (v >> 32);
 }
 
+/// GHASH in constant time (as BearSSL's ctmul64). GCM numbers bits from the
+/// most significant end, so the carry-less products of the words give the
+/// low halves directly and the high halves from the products of the
+/// bit-reversed words; y = y1:y0 and H = h1:h0, first word first.
 struct Ghash {
     y0: u64,
     y1: u64,
     h0: u64,
     h1: u64,
-    buf: [16]u8,
-    nbuf: usize,
+    h2: u64,
+    h0r: u64,
+    h1r: u64,
+    h2r: u64,
 
     fn init(h: []u8) Ghash {
-        return Ghash.{ y0: 0, y1: 0, h0: be64(h[0..8]), h1: be64(h[8..16]), buf: [0; 16], nbuf: 0 };
+        let h1 = be64(h[0..8]);
+        let h0 = be64(h[8..16]);
+        let h0r = rev64(h0);
+        let h1r = rev64(h1);
+        return Ghash.{ y0: 0, y1: 0, h0: h0, h1: h1, h2: h0 ^ h1, h0r: h0r, h1r: h1r, h2r: h0r ^ h1r };
     }
 
-    /// y = (y ^ block) * H in GF(2^128). GCM numbers bits from the most
-    /// significant end, so both operands are bit-reversed into ordinary
-    /// polynomial order, multiplied, reduced by x^128 + x^7 + x^2 + x + 1,
-    /// and reversed back.
+    /// y = (y ^ block) * H in GF(2^128), reduced by x^128 + x^7 + x^2 + x + 1.
     fn block(self: *mut Ghash, src: []u8) void {
-        let v1 = self.y0 ^ be64(src[0..8]);
-        let v0 = self.y1 ^ be64(src[8..16]);
-        // a = a1 x^64 + a0 in ordinary order
-        let a0 = rev64(v1);
-        let a1 = rev64(v0);
-        let b0 = rev64(self.h0);
-        let b1 = rev64(self.h1);
-        // Karatsuba: three 64x64 carry-less products
-        let lo = clmul(a0, b0);
-        let hi = clmul(a1, b1);
-        let mid = clmul(a0 ^ a1, b0 ^ b1);
-        let m0 = (mid.lo ^ lo.lo) ^ hi.lo;
-        let m1 = (mid.hi ^ lo.hi) ^ hi.hi;
-        let r0 = lo.lo;
-        let r1 = lo.hi ^ m0;
-        let r2 = hi.lo ^ m1;
-        let r3 = hi.hi;
-        // reduce: (r3 r2) x^128 = (r3 r2)(x^7 + x^2 + x + 1)
-        let t0 = ((r2 ^ (r2 << 1)) ^ (r2 << 2)) ^ (r2 << 7);
-        let t1 = ((((r3 ^ (r3 << 1)) ^ (r3 << 2)) ^ (r3 << 7)) ^ (((r2 >> 63) ^ (r2 >> 62)) ^ (r2 >> 57)));
-        // the bits pushed past x^128 come round once more
-        let o = ((r3 >> 63) ^ (r3 >> 62)) ^ (r3 >> 57);
-        let t0b = t0 ^ (((o ^ (o << 1)) ^ (o << 2)) ^ (o << 7));
-        let n0 = r0 ^ t0b;
-        let n1 = r1 ^ t1;
-        self.y0 = rev64(n0);
-        self.y1 = rev64(n1);
+        let y1 = self.y1 ^ be64(src[0..8]);
+        let y0 = self.y0 ^ be64(src[8..16]);
+        let y0r = rev64(y0);
+        let y1r = rev64(y1);
+        let y2 = y0 ^ y1;
+        let y2r = y0r ^ y1r;
+        // Karatsuba: three products for each half
+        let z0 = bmul64(y0, self.h0);
+        let z1 = bmul64(y1, self.h1);
+        let mut z2 = bmul64(y2, self.h2);
+        let mut z0h = bmul64(y0r, self.h0r);
+        let mut z1h = bmul64(y1r, self.h1r);
+        let mut z2h = bmul64(y2r, self.h2r);
+        z2 = (z2 ^ z0) ^ z1;
+        z2h = (z2h ^ z0h) ^ z1h;
+        z0h = rev64(z0h) >> 1;
+        z1h = rev64(z1h) >> 1;
+        z2h = rev64(z2h) >> 1;
+        let mut v0 = z0;
+        let mut v1 = z0h ^ z2;
+        let mut v2 = z1 ^ z2h;
+        let mut v3 = z1h;
+        // one bit left (the reflected order), then reduce
+        v3 = (v3 << 1) | (v2 >> 63);
+        v2 = (v2 << 1) | (v1 >> 63);
+        v1 = (v1 << 1) | (v0 >> 63);
+        v0 = v0 << 1;
+        v2 = v2 ^ (((v0 ^ (v0 >> 1)) ^ (v0 >> 2)) ^ (v0 >> 7));
+        v1 = v1 ^ (((v0 << 63) ^ (v0 << 62)) ^ (v0 << 57));
+        v3 = v3 ^ (((v1 ^ (v1 >> 1)) ^ (v1 >> 2)) ^ (v1 >> 7));
+        v2 = v2 ^ (((v1 << 63) ^ (v1 << 62)) ^ (v1 << 57));
+        self.y0 = v2;
+        self.y1 = v3;
     }
 
     /// Absorbs data, zero-padded to a whole block.
@@ -529,6 +569,19 @@ pub struct AesGcm {
     fn ctr(self: *AesGcm, j: *mut [16]u8, data: []u8, out: []mut u8) void {
         let mut i: usize = 0;
         let mut ks: [16]u8 = [0; 16];
+        let mut four: [4]u8x16 = [@splat(@as(u8, 0)); 4];
+        while (i + 64) <= data.len {
+            for k in @as(usize, 0)..4 {
+                inc32(j);
+                four[k] = @load(u8x16, j[..]);
+            }
+            self.aes.encrypt4(&mut four);
+            for k in @as(usize, 0)..4 {
+                let o = i + (16 * k);
+                @store(out[o..o + 16], @load(u8x16, data[o..o + 16]) ^ four[k]);
+            }
+            i += 64;
+        }
         while i < data.len {
             inc32(j);
             @store(ks[..], self.aes.encrypt_block(@load(u8x16, j[..])));
@@ -553,8 +606,8 @@ pub struct AesGcm {
         put_be64(lens[8..16], @as(u64, ct.len) * 8);
         g.block(lens[..]);
         let mut s: [16]u8 = [0; 16];
-        put_be64(s[0..8], g.y0);
-        put_be64(s[8..16], g.y1);
+        put_be64(s[0..8], g.y1);
+        put_be64(s[8..16], g.y0);
         let e = self.aes.encrypt_block(@load(u8x16, j0[..]));
         @store(out[..16], @load(u8x16, s[..]) ^ e);
     }
@@ -680,4 +733,29 @@ test "gcm" {
         return;
     };
     @trap();
+}
+
+test "gcm on several blocks at once" {
+    let mut key: [16]u8 = [0; 16];
+    let mut nonce: [12]u8 = [0; 12];
+    let mut pt: [200]u8 = [0; 200];
+    for i in @as(usize, 0)..16 {
+        key[i] = @truncate(u8, i);
+    }
+    for i in @as(usize, 0)..12 {
+        nonce[i] = @truncate(u8, i);
+    }
+    for i in @as(usize, 0)..200 {
+        pt[i] = @truncate(u8, (i * 7) + 3);
+    }
+    let g = AesGcm.init(key[..])!;
+    let mut o: [216]u8 = [0; 216];
+    g.seal(nonce[..], "hdr", pt[..], o[..])!;
+    let mut want: [216]u8 = [0; 216];
+    @expect_eq(o[..],
+               unhex("9066b6d6793dda60709028da61fd1564c05c9b6edc7b60524d9348edd38a77b0664e2a0f0b86baf75bd620d7f7b792de9fc575986bf14bffa5dceb720de2a35859c4249680aa27ead832784f6b242d775b96c42346cac0a69d8fbe573bc71f94c38ffaaca9cd12a07bbd972f0417d317c8c99ac88c7b37bd6eeec712ab848905ed3e115b20f18f2c4f6a4d8588b7c2826057723a9582f4e2078cabf812db696ef48c09a315e3825e065c9b99381733cd06bba6e5f0ff9eb7411de9c29b2bc0af4b1bfd568ec72f0587ceee16d9c6a90d21bb459811e7938f",
+                     want[..]));
+    let mut back: [200]u8 = [0; 200];
+    g.open(nonce[..], "hdr", o[..], back[..])!;
+    @expect_eq(back[..], pt[..]);
 }

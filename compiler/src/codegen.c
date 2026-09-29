@@ -215,6 +215,9 @@ static LLVMBasicBlockRef new_bb(const char *name) { return LLVMAppendBasicBlockI
 // After a diverging instruction: continue in a fresh (unreachable) block.
 static void dead_block(void) { LLVMPositionBuilderAtEnd(B, new_bb("dead")); }
 
+// Set by setup_target: the native CPU can do @swizzle with pshufb.
+static bool g_has_ssse3;
+
 static LLVMValueRef intrinsic(const char *name, LLVMTypeRef *tys, int ntys, LLVMValueRef *args, int nargs) {
     unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
     if (!id) internal_error(arena_printf("unknown intrinsic %s", name));
@@ -1963,6 +1966,21 @@ static LLVMValueRef gen_builtin(Expr *e) {
     }
     case BI_SWIZZLE: {
         LLVMValueRef x = gen(a[0].e), idx = gen(a[1].e);
+        if (g_target.wasm) {
+            LLVMValueRef args[2] = {x, idx};
+            return intrinsic("llvm.wasm.swizzle", NULL, 0, args, 2);
+        }
+        if (g_has_ssse3) {
+            // pshufb zeroes lanes whose index has its top bit set; adding
+            // 0x70 with saturation sets it exactly for indices >= 16
+            LLVMTypeRef vt = LLVMTypeOf(idx);
+            LLVMValueRef c70[16];
+            for (int i = 0; i < 16; i++) c70[i] = LLVMConstInt(T_i8, 0x70, false);
+            LLVMValueRef sat[2] = {idx, LLVMConstVector(c70, 16)};
+            LLVMValueRef k = intrinsic("llvm.uadd.sat", &vt, 1, sat, 2);
+            LLVMValueRef args[2] = {x, k};
+            return intrinsic("llvm.x86.ssse3.pshuf.b.128", NULL, 0, args, 2);
+        }
         LLVMValueRef r = LLVMConstNull(lty(rt));
         for (unsigned i = 0; i < 16; i++) {
             LLVMValueRef li = LLVMConstInt(T_i32, i, false);
@@ -2890,6 +2908,13 @@ static bool setup_target(void) {
                              : O->opt_level == 2 ? LLVMCodeGenLevelDefault
                                                  : LLVMCodeGenLevelAggressive;
     const char *cpu = O->cpu ? O->cpu : (g_target.wasm ? "generic" : LLVMGetHostCPUName());
+    // @swizzle becomes pshufb when the host has it (for its own CPU only:
+    // the features of a named --cpu are not known here)
+    if (!g_target.wasm && !O->cpu && strstr(triple, "x86_64")) {
+        char *hf = LLVMGetHostCPUFeatures();
+        g_has_ssse3 = hf && strstr(hf, "+ssse3") != NULL;
+        LLVMDisposeMessage(hf);
+    }
     TM = LLVMCreateTargetMachine(target, triple, cpu, features, ol, g_target.wasm ? LLVMRelocStatic : LLVMRelocPIC,
                                  LLVMCodeModelDefault);
     TD = LLVMCreateTargetDataLayout(TM);

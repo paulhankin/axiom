@@ -111,7 +111,34 @@ pub fn decode(text: []u8, out: []mut u8, enc: Encoding) ![]u8 {
     let mut o: usize = 0;
     let mut padding: u32 = 0;
     let mut chars: usize = 0;
-    for c in text {
+    // whole groups of four go through a table; anything else (white space,
+    // padding, errors) the careful way below, a character at a time
+    let mut rev: [256]u8 = [0xff; 256];
+    if text.len >= 64 {
+        for k in @as(usize, 0)..256 {
+            rev[k] = @truncate(u8, @min(value_of(@truncate(u8, k), &enc), 0xff));
+        }
+    }
+    let mut i: usize = 0;
+    while i < text.len {
+        if (nbits == 0) and (padding == 0) and ((i + 4) <= text.len) and ((o + 3) <= out.len) {
+            let a = @as(u32, rev[@as(usize, text[i])]);
+            let b = @as(u32, rev[@as(usize, text[i + 1])]);
+            let c3 = @as(u32, rev[@as(usize, text[i + 2])]);
+            let d = @as(u32, rev[@as(usize, text[i + 3])]);
+            if (((a | b) | c3) | d) <= 63 {
+                let v = (((a << 18) | (b << 12)) | (c3 << 6)) | d;
+                out[o] = @truncate(u8, v >> 16);
+                out[o + 1] = @truncate(u8, v >> 8);
+                out[o + 2] = @truncate(u8, v);
+                o += 3;
+                chars += 4;
+                i += 4;
+                continue;
+            }
+        }
+        let c = text[i];
+        i += 1;
         if (c == ' ') or (c == '\n') or (c == '\r') or (c == '\t') {
             continue;
         }
@@ -197,4 +224,41 @@ test "padding must be exact" {
         return;
     };
     @expect(false);
+}
+
+test "long input, with line breaks, padding and errors" {
+    let mut data: [301]u8 = [0; 301];
+    for i in @as(usize, 0)..data.len {
+        data[i] = @truncate(u8, (i * 167) + 13);
+    }
+    let mut e: [404]u8 = [0; 404];
+    let enc = encode(data[..], e[..encoded_len(data.len)], STANDARD);
+    let mut d: [310]u8 = [0; 310];
+    @expect_eq(decode(enc, d[..], STANDARD)!, data[..]);
+    // a line break every 76 characters
+    let mut wrapped: [420]u8 = [0; 420];
+    let mut n: usize = 0;
+    for i in @as(usize, 0)..enc.len {
+        if (i > 0) and ((i % 76) == 0) {
+            wrapped[n] = '\n';
+            n += 1;
+        }
+        wrapped[n] = enc[i];
+        n += 1;
+    }
+    @expect_eq(decode(wrapped[..n], d[..], STANDARD)!, data[..]);
+    // a bad character deep inside, and data after the padding
+    wrapped[200] = '*';
+    @expect(failed(decode(wrapped[..n], d[..], STANDARD)));
+    let mut padded: [410]u8 = [0; 410];
+    @mem_copy(padded[..enc.len], enc);
+    @mem_copy(padded[enc.len..enc.len + 4], "Zm9v");
+    @expect(failed(decode(padded[..enc.len + 4], d[..], STANDARD)));
+    // too little room
+    @expect(failed(decode(enc, d[..300], STANDARD)));
+}
+
+fn failed(r: ![]u8) bool {
+    _ = r catch return true;
+    return false;
 }
