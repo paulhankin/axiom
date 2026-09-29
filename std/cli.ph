@@ -1,0 +1,774 @@
+// =============================================================================
+// std/cli.ph - command-line arguments: options, positionals, subcommands,
+// help text.
+//
+//     let mut p = cli.Parser.init("grep", "Search files for a pattern.");
+//     defer p.deinit();
+//     p.flag("ignore-case", 'i', "match without regard to case")!;
+//     p.option("max-count", 'm', "NUM", "stop after NUM matches")!;
+//     p.positional("PATTERN", "what to look for", cli.REQUIRED)!;
+//     p.positional("FILE", "where to look", cli.MANY)!;
+//     let mut args = os.args()!;
+//     defer args.deinit();
+//     let m = p.parse(args.items.items()[1..]) catch {
+//         fmt.eprint("{}\n", [fmt.str(p.message())])!;   // what was wrong
+//         os.exit(2);
+//     };
+//     if m.has("ignore-case") { ... }
+//     let n = m.int("max-count", 10)!;                    // 10 if not given
+//     for f in m.all("FILE") { ... }
+//
+// Parsing follows GNU conventions: short options may be bundled (-in 5,
+// -in5), take a value attached or separate (-m5, -m 5); long ones take
+// --name=value or --name value, and may be abbreviated to any unique
+// prefix; "--" ends the options, and "-" is a positional. Options may come
+// after positionals. "--help" and "-h" are recognized unless defined
+// otherwise: parse fails with HelpRequested, and help() writes the text.
+//
+// Subcommands (git-style) are parsers of their own: p.command("add", ...)
+// returns one to define; parse then picks it by the first positional, and
+// m.command() and m.sub() give its name and matches.
+//
+// A Parser owns its definitions and the results of the last parse; the
+// argument strings are borrowed.
+// =============================================================================
+
+import "fmt.ph" as fmt;
+import "io.ph" as io;
+import "mem.ph" as mem;
+import "str.ph" as strs;
+import "vec.ph" as vec;
+
+error { UnknownOption, AmbiguousOption, MissingValue, UnexpectedValue, MissingArgument, TooManyArguments,
+        UnknownCommand, InvalidNumber, HelpRequested, DuplicateName, OutOfMemory }
+
+/// How many values a positional takes.
+pub const OPTIONAL: u8 = 0;
+pub const REQUIRED: u8 = 1;
+pub const MANY: u8 = 2;  // any number
+pub const AT_LEAST_ONE: u8 = 3;
+
+struct Opt {
+    name: []u8,  // long name ("" for none)
+    short: u8,   // 0 for none
+    meta: []u8,  // "" for a flag
+    help: []u8,
+    multiple: bool,  // may be given more than once
+}
+
+struct Pos {
+    name: []u8,
+    help: []u8,
+    arity: u8,
+}
+
+// an option (opt) or positional, by index
+struct Key {
+    opt: bool,
+    index: usize,
+}
+
+// what parse found: option or positional index, and the value
+struct Hit {
+    opt: bool,
+    index: usize,
+    value: []u8,
+}
+
+pub struct Parser {
+    prog: []u8,
+    about: []u8,
+    opts: vec.Vec.[Opt],
+    pos: vec.Vec.[Pos],
+    cmds: vec.Vec.[*mut Parser],
+    cmd_help: vec.Vec.[[]u8],
+    hits: vec.Vec.[Hit],
+    scratch: vec.Vec.[[]u8],  // for Matches.all
+    chosen: usize,            // the subcommand parsed (cmds.len: none)
+    msg: strs.String,         // why the last parse failed
+
+    pub fn init(prog: []u8, about: []u8) Parser {
+        return Parser.{ prog: prog, about: about, opts: vec.Vec.[Opt].init(), pos: vec.Vec.[Pos].init(),
+                        cmds: vec.Vec.[*mut Parser].init(), cmd_help: vec.Vec.[[]u8].init(), hits: vec.Vec.[Hit].init(),
+                        scratch: vec.Vec.[[]u8].init(), chosen: 0, msg: strs.String.init() };
+    }
+
+    pub fn deinit(self: *mut Parser) void {
+        for c in self.cmds.items() {
+            c.deinit();
+            mem.free(@slice_from_ptr(c, 1));
+        }
+        self.opts.deinit();
+        self.pos.deinit();
+        self.cmds.deinit();
+        self.cmd_help.deinit();
+        self.hits.deinit();
+        self.scratch.deinit();
+        self.msg.deinit();
+    }
+
+    /// An option without a value: --name, or -s (short 0: none).
+    pub fn flag(self: *mut Parser, name: []u8, short: u8, help: []u8) !void {
+        self.add(Opt.{ name: name, short: short, meta: "", help: help, multiple: true })!;
+    }
+
+    /// An option with a value, shown as META in the help; the last one
+    /// given wins (m.all gives every one).
+    pub fn option(self: *mut Parser, name: []u8, short: u8, meta: []u8, help: []u8) !void {
+        let mut m = meta;
+        if m.len == 0 {
+            m = "VALUE";
+        }
+        self.add(Opt.{ name: name, short: short, meta: m, help: help, multiple: true })!;
+    }
+
+    fn add(self: *mut Parser, o: Opt) !void {
+        for x in self.opts.items() {
+            if ((o.name.len > 0) and strs.eq(x.name, o.name)) or ((o.short != 0) and (x.short == o.short)) {
+                return error.DuplicateName;
+            }
+        }
+        if (o.name.len == 0) and (o.short == 0) {
+            return error.DuplicateName;
+        }
+        self.opts.push(o)!;
+    }
+
+    /// A positional argument. Positionals are filled in order; one of
+    /// arity MANY or AT_LEAST_ONE takes all that the later ones leave.
+    pub fn positional(self: *mut Parser, name: []u8, help: []u8, arity: u8) !void {
+        for x in self.pos.items() {
+            if strs.eq(x.name, name) {
+                return error.DuplicateName;
+            }
+        }
+        self.pos.push(Pos.{ name: name, help: help, arity: arity })!;
+    }
+
+    /// A subcommand, to be defined through the returned parser (owned by
+    /// this one).
+    pub fn command(self: *mut Parser, name: []u8, help: []u8) !*mut Parser {
+        for c in self.cmds.items() {
+            if strs.eq(c.prog, name) {
+                return error.DuplicateName;
+            }
+        }
+        let cell = mem.alloc.[Parser](1)!;
+        cell[0] = Parser.init(name, help);
+        self.cmds.push(&mut cell[0]) catch |e| {
+            mem.free(cell);
+            return e;
+        };
+        self.cmd_help.push(help)!;
+        return &mut cell[0];
+    }
+
+    /// Why the last parse failed, for the user ("unknown option '--x'").
+    pub fn message(self: *Parser) []u8 {
+        return self.msg.bytes();
+    }
+
+    /// Parses the arguments (without the program's name). The matches point
+    /// into this parser, and into args.
+    pub fn parse(self: *mut Parser, args: [][]u8) !Matches {
+        self.hits.clear();
+        self.msg.clear();
+        self.chosen = self.cmds.len;
+        let mut positionals = vec.Vec.[[]u8].init();
+        defer positionals.deinit();
+        let mut i: usize = 0;
+        let mut only_pos = false;
+        while i < args.len {
+            let a = args[i];
+            i += 1;
+            if only_pos or (a.len < 2) or (a[0] != '-') {
+                if (self.cmds.len > 0) and (positionals.len == 0) and (self.pos.len == 0) {
+                    // a subcommand, which parses the rest
+                    return self.subcommand(a, args[i..])!;
+                }
+                positionals.push(a)!;
+                continue;
+            }
+            if strs.eq(a, "--") {
+                only_pos = true;
+                continue;
+            }
+            if a[1] == '-' {
+                // --name, --name=value
+                let body = a[2..];
+                let eq = strs.index_of_byte(body, '=') catch body.len;
+                let name = body[..eq];
+                let k = self.find_long(name)!;
+                if k == self.opts.len {
+                    // help, unless defined
+                    self.note("", "");
+                    return error.HelpRequested;
+                }
+                let o = self.opts.get(k);
+                if o.meta.len == 0 {
+                    if eq < body.len {
+                        self.note("option '--%' takes no value", o.name);
+                        return error.UnexpectedValue;
+                    }
+                    self.hits.push(Hit.{ opt: true, index: k, value: "" })!;
+                } else if eq < body.len {
+                    self.hits.push(Hit.{ opt: true, index: k, value: body[eq + 1..] })!;
+                } else {
+                    if i >= args.len {
+                        self.note("option '--%' needs a value", o.name);
+                        return error.MissingValue;
+                    }
+                    self.hits.push(Hit.{ opt: true, index: k, value: args[i] })!;
+                    i += 1;
+                }
+                continue;
+            }
+            // -abc, -ovalue, -o value
+            let mut j: usize = 1;
+            while j < a.len {
+                let c = a[j];
+                let k = self.find_short(c);
+                if k == self.opts.len {
+                    if c == 'h' {
+                        self.note("", "");
+                        return error.HelpRequested;
+                    }
+                    self.note("unknown option '-%'", a[j..j + 1]);
+                    return error.UnknownOption;
+                }
+                let o = self.opts.get(k);
+                j += 1;
+                if o.meta.len == 0 {
+                    self.hits.push(Hit.{ opt: true, index: k, value: "" })!;
+                    continue;
+                }
+                if j < a.len {
+                    self.hits.push(Hit.{ opt: true, index: k, value: a[j..] })!;
+                } else {
+                    if i >= args.len {
+                        self.note("option '-%' needs a value", a[j - 1..j]);
+                        return error.MissingValue;
+                    }
+                    self.hits.push(Hit.{ opt: true, index: k, value: args[i] })!;
+                    i += 1;
+                }
+                break;
+            }
+        }
+        self.assign(positionals.items())!;
+        return Matches.{ p: self };
+    }
+
+    fn subcommand(self: *mut Parser, name: []u8, rest: [][]u8) !Matches {
+        for k in @as(usize, 0)..self.cmds.len {
+            let c = self.cmds.get(k);
+            if strs.eq(c.prog, name) {
+                self.chosen = k;
+                _ = c.parse(rest) catch |e| {
+                    self.msg.clear();
+                    self.msg.push_str(c.msg.bytes())!;
+                    return e;
+                };
+                return Matches.{ p: self };
+            }
+        }
+        self.note("unknown command '%'", name);
+        return error.UnknownCommand;
+    }
+
+    // Deals the positionals out: the fixed ones first, the rest to a MANY.
+    fn assign(self: *mut Parser, xs: [][]u8) !void {
+        let ps = self.pos.items();
+        let mut fixed: usize = 0;
+        let mut many = ps.len;
+        let mut required: usize = 0;
+        for k in @as(usize, 0)..ps.len {
+            if (ps[k].arity == MANY) or (ps[k].arity == AT_LEAST_ONE) {
+                if many == ps.len {
+                    many = k;
+                }
+                if ps[k].arity == AT_LEAST_ONE {
+                    required += 1;
+                }
+            } else {
+                fixed += 1;
+                if ps[k].arity == REQUIRED {
+                    required += 1;
+                }
+            }
+        }
+        if xs.len < required {
+            // the first required one missing
+            let mut have = xs.len;
+            for p in ps {
+                if (p.arity == REQUIRED) or (p.arity == AT_LEAST_ONE) {
+                    if have == 0 {
+                        self.note("missing argument %", p.name);
+                        return error.MissingArgument;
+                    }
+                    have -= 1;
+                }
+            }
+            self.note("missing arguments", "");
+            return error.MissingArgument;
+        }
+        if (many == ps.len) and (xs.len > fixed) {
+            self.note("unexpected argument '%'", xs[fixed]);
+            return error.TooManyArguments;
+        }
+        // optional fixed ones get values only when there are spare ones
+        let mut spare = xs.len - required;
+        let mut x: usize = 0;
+        for k in @as(usize, 0)..ps.len {
+            let p = ps[k];
+            if (p.arity == REQUIRED) or ((p.arity == OPTIONAL) and (spare > 0) and (x < xs.len)) {
+                if p.arity == OPTIONAL {
+                    spare -= 1;
+                }
+                self.hits.push(Hit.{ opt: false, index: k, value: xs[x] })!;
+                x += 1;
+            } else if (p.arity == MANY) or (p.arity == AT_LEAST_ONE) {
+                // all but what the later fixed ones need
+                let mut later: usize = 0;
+                for q in ps[k + 1..] {
+                    if q.arity == REQUIRED {
+                        later += 1;
+                    }
+                }
+                // (optional ones after it get nothing)
+                let take = (xs.len - x) - later;
+                for _t in @as(usize, 0)..take {
+                    self.hits.push(Hit.{ opt: false, index: k, value: xs[x] })!;
+                    x += 1;
+                }
+                spare = 0;
+            }
+        }
+    }
+
+    // The option with this long name or unique prefix; opts.len for
+    // "help" when it is not defined.
+    fn find_long(self: *mut Parser, name: []u8) !usize {
+        let os = self.opts.items();
+        for k in @as(usize, 0)..os.len {
+            if strs.eq(os[k].name, name) {
+                return k;
+            }
+        }
+        let mut found = os.len;
+        let mut count: usize = 0;
+        if name.len > 0 {
+            for k in @as(usize, 0)..os.len {
+                if strs.starts_with(os[k].name, name) {
+                    found = k;
+                    count += 1;
+                }
+            }
+        }
+        if count == 1 {
+            return found;
+        }
+        if count > 1 {
+            self.note("option '--%' is ambiguous", name);
+            return error.AmbiguousOption;
+        }
+        if strs.eq(name, "help") {
+            return os.len;
+        }
+        self.note("unknown option '--%'", name);
+        return error.UnknownOption;
+    }
+
+    fn find_short(self: *Parser, c: u8) usize {
+        let os = self.opts.items();
+        for k in @as(usize, 0)..os.len {
+            if os[k].short == c {
+                return k;
+            }
+        }
+        return os.len;
+    }
+
+    // Records the message for the user, with % replaced by what.
+    fn note(self: *mut Parser, text: []u8, what: []u8) void {
+        self.msg.clear();
+        let at = strs.index_of_byte(text, '%') catch text.len;
+        self.msg.push_str(text[..at]) catch {};
+        if at < text.len {
+            self.msg.push_str(what) catch {};
+            self.msg.push_str(text[at + 1..]) catch {};
+        }
+    }
+
+    /// Writes the usage line and a description of each argument.
+    pub fn help(self: *Parser, w: io.Writer) !void {
+        w.write_all("Usage: ")!;
+        w.write_all(self.prog)!;
+        if self.opts.len > 0 {
+            w.write_all(" [OPTIONS]")!;
+        }
+        if self.cmds.len > 0 {
+            w.write_all(" COMMAND [ARGS]")!;
+        }
+        for p in self.pos.items() {
+            w.write_all(" ")!;
+            if (p.arity == OPTIONAL) or (p.arity == MANY) {
+                w.write_all("[")!;
+            }
+            w.write_all(p.name)!;
+            if (p.arity == MANY) or (p.arity == AT_LEAST_ONE) {
+                w.write_all("...")!;
+            }
+            if (p.arity == OPTIONAL) or (p.arity == MANY) {
+                w.write_all("]")!;
+            }
+        }
+        w.write_all("\n")!;
+        if self.about.len > 0 {
+            w.write_all("\n")!;
+            w.write_all(self.about)!;
+            w.write_all("\n")!;
+        }
+        // the left column's width
+        let mut width: usize = 10;
+        for o in self.opts.items() {
+            width = @max(width, opt_label_len(o));
+        }
+        for p in self.pos.items() {
+            width = @max(width, p.name.len);
+        }
+        for c in self.cmds.items() {
+            width = @max(width, c.prog.len);
+        }
+        width = @min(width, 30);
+        if self.pos.len > 0 {
+            w.write_all("\nArguments:\n")!;
+            for p in self.pos.items() {
+                row(w, p.name, p.help, width)!;
+            }
+        }
+        if self.cmds.len > 0 {
+            w.write_all("\nCommands:\n")!;
+            for c in self.cmds.items() {
+                row(w, c.prog, c.about, width)!;
+            }
+        }
+        w.write_all("\nOptions:\n")!;
+        let mut label = strs.String.init();
+        defer label.deinit();
+        for o in self.opts.items() {
+            label.clear();
+            opt_label(o, &mut label)!;
+            row(w, label.bytes(), o.help, width)!;
+        }
+        if (self.find_short('h') == self.opts.len) and not self.has_long("help") {
+            row(w, "-h, --help", "show this help", width)!;
+        }
+    }
+
+    fn has_long(self: *Parser, name: []u8) bool {
+        for o in self.opts.items() {
+            if strs.eq(o.name, name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// help, into a new string the caller frees.
+    pub fn help_text(self: *Parser) ![]mut u8 {
+        let mut s = strs.String.init();
+        self.help(s.writer()) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+}
+
+fn opt_label(o: Opt, out: *mut strs.String) !void {
+    if o.short != 0 {
+        out.push('-')!;
+        out.push(o.short)!;
+        if o.name.len > 0 {
+            out.push_str(", ")!;
+        }
+    } else {
+        out.push_str("    ")!;
+    }
+    if o.name.len > 0 {
+        out.push_str("--")!;
+        out.push_str(o.name)!;
+    }
+    if o.meta.len > 0 {
+        out.push(' ')!;
+        out.push_str(o.meta)!;
+    }
+}
+
+fn opt_label_len(o: Opt) usize {
+    let mut n: usize = 4;
+    if o.name.len > 0 {
+        n += 2 + o.name.len;
+    }
+    if o.meta.len > 0 {
+        n += 1 + o.meta.len;
+    }
+    return n;
+}
+
+// "  label   help", with the help on the next line if the label is wide
+fn row(w: io.Writer, label: []u8, help: []u8, width: usize) !void {
+    w.write_all("  ")!;
+    w.write_all(label)!;
+    if help.len == 0 {
+        w.write_all("\n")!;
+        return;
+    }
+    if label.len > width {
+        w.write_all("\n")!;
+        pad(w, width + 4)!;
+    } else {
+        pad(w, (width - label.len) + 2)!;
+    }
+    w.write_all(help)!;
+    w.write_all("\n")!;
+}
+
+fn pad(w: io.Writer, n: usize) !void {
+    for _k in @as(usize, 0)..n {
+        w.write_all(" ")!;
+    }
+}
+
+/// The result of a parse: views into the Parser (valid until its next
+/// parse or deinit).
+pub struct Matches {
+    p: *mut Parser,
+
+    /// Whether an option (by long name, or a positional by name) was given.
+    pub fn has(self: Matches, name: []u8) bool {
+        return self.count(name) > 0;
+    }
+
+    /// How many times an option was given (-vvv is 3).
+    pub fn count(self: Matches, name: []u8) usize {
+        let mut n: usize = 0;
+        let key = self.lookup(name);
+        for h in self.p.hits.items() {
+            if (h.opt == key.opt) and (h.index == key.index) {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// The value of an option or positional (the last, if given more than
+    /// once), or `default` if it was not given.
+    pub fn get(self: Matches, name: []u8, default: []u8) []u8 {
+        let key = self.lookup(name);
+        let mut v = default;
+        for h in self.p.hits.items() {
+            if (h.opt == key.opt) and (h.index == key.index) {
+                v = h.value;
+            }
+        }
+        return v;
+    }
+
+    /// Every value of an option or positional, in order (valid until the
+    /// next call of all).
+    pub fn all(self: Matches, name: []u8) [][]u8 {
+        let key = self.lookup(name);
+        self.p.scratch.clear();
+        for h in self.p.hits.items() {
+            if (h.opt == key.opt) and (h.index == key.index) {
+                self.p.scratch.push(h.value) catch {};
+            }
+        }
+        return self.p.scratch.items();
+    }
+
+    /// The value as an integer, or `default` if not given; InvalidNumber
+    /// if it is not one.
+    pub fn int(self: Matches, name: []u8, default: i64) !i64 {
+        if not self.has(name) {
+            return default;
+        }
+        let v = self.get(name, "");
+        return fmt.parse_int.[i64](v) catch {
+            self.p.note("invalid number '%'", v);
+            return error.InvalidNumber;
+        };
+    }
+
+    /// The value as a float, or `default` if not given.
+    pub fn float(self: Matches, name: []u8, default: f64) !f64 {
+        if not self.has(name) {
+            return default;
+        }
+        let v = self.get(name, "");
+        return fmt.parse_float(v) catch {
+            self.p.note("invalid number '%'", v);
+            return error.InvalidNumber;
+        };
+    }
+
+    /// The subcommand given ("" for none).
+    pub fn command(self: Matches) []u8 {
+        if self.p.chosen >= self.p.cmds.len {
+            return "";
+        }
+        return self.p.cmds.get(self.p.chosen).prog;
+    }
+
+    /// The subcommand's matches.
+    pub fn sub(self: Matches) Matches {
+        if self.p.chosen >= self.p.cmds.len {
+            return self;
+        }
+        return Matches.{ p: self.p.cmds.get(self.p.chosen) };
+    }
+
+    // (an option by long name, else a positional)
+    fn lookup(self: Matches, name: []u8) Key {
+        let os = self.p.opts.items();
+        for k in @as(usize, 0)..os.len {
+            if strs.eq(os[k].name, name) or ((name.len == 1) and (os[k].short == name[0])) {
+                return Key.{ opt: true, index: k };
+            }
+        }
+        let ps = self.p.pos.items();
+        for k in @as(usize, 0)..ps.len {
+            if strs.eq(ps[k].name, name) {
+                return Key.{ opt: false, index: k };
+            }
+        }
+        return Key.{ opt: true, index: os.len + ps.len + 1 };
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn grep_parser() !Parser {
+    let mut p = Parser.init("grep", "Search files for a pattern.");
+    p.flag("ignore-case", 'i', "match without regard to case")!;
+    p.flag("verbose", 'v', "say more (repeat for more still)")!;
+    p.option("max-count", 'm', "NUM", "stop after NUM matches")!;
+    p.option("context", 0, "LINES", "")!;
+    p.option("color", 0, "WHEN", "use colour: always, never or auto")!;
+    p.positional("PATTERN", "what to look for", REQUIRED)!;
+    p.positional("FILE", "where to look", MANY)!;
+    return p;
+}
+
+fn fails(p: *mut Parser, args: [][]u8, want: error, msg: []u8) bool {
+    _ = p.parse(args) catch |e| return (e == want) and strs.eq(p.message(), msg);
+    return false;
+}
+
+test "options and positionals" {
+    let mut p = grep_parser()!;
+    defer p.deinit();
+    let a: [9][]u8 = ["-ivv", "--max-count=5", "needle", "a.txt", "--color", "never", "-m", "7", "b.txt"];
+    let m = p.parse(a[..])!;
+    @expect(m.has("ignore-case") and m.has("i") and (m.count("verbose") == 2));
+    @expect(m.int("max-count", 0)! == 7);
+    @expect_eq(m.get("color", "auto"), "never");
+    @expect_eq(m.get("context", "3"), "3");
+    @expect_eq(m.get("PATTERN", ""), "needle");
+    let files = m.all("FILE");
+    @expect((files.len == 2) and strs.eq(files[0], "a.txt") and strs.eq(files[1], "b.txt"));
+    let ms = m.all("max-count");
+    @expect((ms.len == 2) and strs.eq(ms[0], "5"));
+    // attached short values, abbreviations, "--" and "-"
+    let b: [6][]u8 = ["-m3", "--max", "4", "--", "-v", "-"];
+    let n = p.parse(b[..])!;
+    @expect(n.int("max-count", 0)! == 4);
+    @expect(not n.has("verbose"));
+    @expect_eq(n.get("PATTERN", ""), "-v");
+    @expect((n.all("FILE").len == 1) and strs.eq(n.all("FILE")[0], "-"));
+    // errors, with messages
+    let e1: [2][]u8 = ["--nope", "x"];
+    @expect(fails(&mut p, e1[..], error.UnknownOption, "unknown option '--nope'"));
+    let e2: [2][]u8 = ["-q", "x"];
+    @expect(fails(&mut p, e2[..], error.UnknownOption, "unknown option '-q'"));
+    let e3: [2][]u8 = ["x", "--max-count"];
+    @expect(fails(&mut p, e3[..], error.MissingValue, "option '--max-count' needs a value"));
+    let e4: [2][]u8 = ["--verbose=yes", "x"];
+    @expect(fails(&mut p, e4[..], error.UnexpectedValue, "option '--verbose' takes no value"));
+    let e5: [1][]u8 = ["-v"];
+    @expect(fails(&mut p, e5[..], error.MissingArgument, "missing argument PATTERN"));
+    let e6: [2][]u8 = ["--co", "x"];
+    @expect(fails(&mut p, e6[..], error.AmbiguousOption, "option '--co' is ambiguous"));
+    let e7: [2][]u8 = ["x", "--help"];
+    @expect(fails(&mut p, e7[..], error.HelpRequested, ""));
+    let e8: [3][]u8 = ["-m", "many", "x"];
+    let bad = p.parse(e8[..])!;
+    @expect(invalid_number(bad.int("max-count", 0)));
+    @expect_eq(p.message(), "invalid number 'many'");
+    @expect(duplicate(p.flag("verbose", 0, "")) and duplicate(p.flag("other", 'v', "")));
+}
+
+fn invalid_number(r: !i64) bool {
+    _ = r catch |e| return e == error.InvalidNumber;
+    return false;
+}
+
+fn duplicate(r: !void) bool {
+    r catch |e| return e == error.DuplicateName;
+    return false;
+}
+
+test "positional arities" {
+    // cp-like: SOURCE... DEST
+    let mut p = Parser.init("cp", "");
+    defer p.deinit();
+    p.positional("SOURCE", "", AT_LEAST_ONE)!;
+    p.positional("DEST", "", REQUIRED)!;
+    let a: [3][]u8 = ["a", "b", "dir"];
+    let m = p.parse(a[..])!;
+    @expect((m.all("SOURCE").len == 2) and strs.eq(m.get("DEST", ""), "dir"));
+    let one: [1][]u8 = ["a"];
+    @expect(fails(&mut p, one[..], error.MissingArgument, "missing argument DEST"));
+    // an optional one, and too many
+    let mut q = Parser.init("head", "");
+    defer q.deinit();
+    q.positional("FILE", "", OPTIONAL)!;
+    let two: [2][]u8 = ["x", "y"];
+    @expect(not q.parse(two[..0])!.has("FILE"));
+    @expect(fails(&mut q, two[..], error.TooManyArguments, "unexpected argument 'y'"));
+}
+
+test "subcommands and help" {
+    let mut p = Parser.init("tool", "Does things.");
+    defer p.deinit();
+    p.flag("quiet", 'q', "say nothing")!;
+    let add = p.command("add", "add files")!;
+    add.flag("force", 'f', "even ignored ones")!;
+    add.positional("PATH", "files to add", MANY)!;
+    let rm = p.command("rm", "remove files")!;
+    rm.positional("PATH", "", AT_LEAST_ONE)!;
+    let a: [4][]u8 = ["-q", "add", "-f", "x.c"];
+    let m = p.parse(a[..])!;
+    @expect(m.has("quiet"));
+    @expect_eq(m.command(), "add");
+    @expect(m.sub().has("force") and strs.eq(m.sub().get("PATH", ""), "x.c"));
+    let b: [1][]u8 = ["rm"];
+    @expect(fails(&mut p, b[..], error.MissingArgument, "missing argument PATH"));
+    let c: [1][]u8 = ["mv"];
+    @expect(fails(&mut p, c[..], error.UnknownCommand, "unknown command 'mv'"));
+    let h = p.help_text()!;
+    defer mem.free(h);
+    @expect_eq(h,
+               "Usage: tool [OPTIONS] COMMAND [ARGS]\n\nDoes things.\n\nCommands:\n  add          add files\n  rm           remove files\n\nOptions:\n  -q, --quiet  say nothing\n  -h, --help   show this help\n");
+    let mut g = grep_parser()!;
+    defer g.deinit();
+    let gh = g.help_text()!;
+    defer mem.free(gh);
+    @expect(strs.contains(gh, "Usage: grep [OPTIONS] PATTERN [FILE...]\n"));
+    @expect(strs.contains(gh, "  -m, --max-count NUM  stop after NUM matches\n"));
+    @expect(strs.contains(gh, "      --color WHEN     use colour: always, never or auto\n"));
+}
