@@ -29,6 +29,7 @@ and a type that owns memory has `deinit`).
 | [`image`](image.ph) | `Image`: 1–4 channels of U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
 | [`draw`](draw.ph) | 2D vector drawing onto an `Image`: `Path` (lines, quadratic and cubic Béziers, arcs, rectangles, rounded rectangles, ellipses), `Canvas` with affine transforms, fills (nonzero, even-odd), strokes (width, miter/round/bevel joins, butt/round/square caps, dashes), paints (solid, linear and radial gradients, images), Porter-Duff operators and blend modes in linear light, global alpha, clipping, save/restore; exact anti-aliasing |
 | [`font`](font.ph) | TrueType and OpenType (CFF) fonts and collections: `Font` (cmap formats 0/4/6/12, advances, GPOS and `kern` kerning, simple, composite and Type 2 charstring outlines as `draw.Path`s), text `layout` with word wrapping, `measure`, `draw_text`, `draw_text_box`; unhinted, no shaping beyond kerning |
+| [`audio`](audio.ph) | `Sound`: interleaved frames of U8, S16, S24, S32, F32 or F64 samples; `get`/`set` as floats, `convert` (exact integer ↔ float), `remix` (channel counts), `slice`, `gain`, `peak`, `resample` (Kaiser-windowed sinc, > 90 dB rejection) |
 | [`bigint`](bigint.ph) | `BigInt`: arbitrary-precision integers — arithmetic (Karatsuba multiplication), truncated and Euclidean division, shifts and bitwise operations, `pow`, `mod_pow` (Montgomery; `mod_pow_secret` in constant time), `gcd`, `mod_inverse`, `sqrt`, conversion to and from any base and bytes |
 | [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
 
@@ -45,6 +46,15 @@ Image files are read and written by `std/image/`:
 | [`image/hdr`](image/hdr.ph) | Radiance RGBE (HDR) |
 | [`image/exr`](image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
 
+Sound files are read and written by `std/audio/`:
+
+| Module | Contents |
+|---|---|
+| [`audio/formats`](audio/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
+| [`audio/wav`](audio/wav.ph) | WAV: PCM 8–32 bits, float, A-law, µ-law, WAVE_FORMAT_EXTENSIBLE, RF64 |
+| [`audio/aiff`](audio/aiff.ph) | AIFF and AIFF-C: big- and little-endian PCM, float, A-law, µ-law |
+| [`audio/flac`](audio/flac.ph) | FLAC: decodes every stream (4–32 bits, 1–8 channels; CRCs and MD5 checked); encodes at levels 0–8, about as small as the reference encoder |
+
 Cryptography lives in `std/crypto/` (the primitives are written to run in constant
 time where secrets are involved):
 
@@ -52,6 +62,7 @@ time where secrets are involved):
 |---|---|
 | [`crypto/random`](crypto/random.ph) | Secure random bytes from the operating system: `fill`, `uint64`, `below` |
 | [`crypto/sha2`](crypto/sha2.ph) | SHA-256, SHA-384, SHA-512; a `Hasher` over any of them |
+| [`crypto/md5`](crypto/md5.ph) | MD5, for formats that use it as a checksum (not for security) |
 | [`crypto/hmac`](crypto/hmac.ph) | HMAC; HKDF (`extract`, `expand`) |
 | [`crypto/subtle`](crypto/subtle.ph) | Constant-time comparison |
 | [`crypto/aes_gcm`](crypto/aes_gcm.ph) | AES-128/256 and AES-GCM (`seal`, `open`) |

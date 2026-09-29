@@ -1,0 +1,549 @@
+// =============================================================================
+// std/audio.ph - sound in memory: sample formats, conversion, channel
+// mixing and resampling.
+//
+//     let mut s = audio.Sound.init(44100, 2, 48000, audio.S16)!;  // 44100 frames, stereo, 48 kHz
+//     defer s.deinit();
+//     s.set(0, 1, 0.5);                                  // frame 0, right channel
+//     let v = s.get(0, 1);                               // -1.0 to 1.0
+//     let mut f = s.convert(audio.F32)!;                 // float samples
+//     let mut m = s.remix(1)!;                           // mono
+//     let mut r = s.resample(44100)!;                    // to 44.1 kHz
+//
+// A Sound is frames of interleaved samples (channel 0 of frame 0, channel
+// 1 of frame 0, ...), each U8 (unsigned, 128 is silence), S16, S24 (held
+// in 32 bits, sign-extended), S32, F32 or F64 (nominally -1.0 to 1.0, not
+// clipped), in the machine's byte order. Integer samples map to -1.0..1.0
+// by dividing by 2^(bits-1), so every integer converts to float and back
+// exactly; floats convert to integers rounded and clipped.
+//
+// Reading and writing files: std/audio/formats (any format, by content or
+// file extension), or the codecs std/audio/wav, aiff and flac.
+// =============================================================================
+
+import "math.ph" as math;
+import "mem.ph" as mem;
+
+error { InvalidAudio, Unsupported, TooLarge, OutOfMemory }
+
+/// Sample formats.
+pub const U8: u8 = 1;
+pub const S16: u8 = 2;
+pub const S24: u8 = 3;
+pub const S32: u8 = 4;
+pub const F32: u8 = 5;
+pub const F64: u8 = 6;
+
+/// Sounds with more samples than this (frames times channels) are refused
+/// by the decoders (a guard against hostile headers): 2^30, an hour and a
+/// half of 48 kHz audio in 8 channels.
+pub const MAX_SAMPLES: usize = 1073741824;
+
+/// The bytes a sample of a format takes in memory.
+pub fn bytes_per_sample(format: u8) usize {
+    if format == U8 {
+        return 1;
+    }
+    if format == S16 {
+        return 2;
+    }
+    if format == F64 {
+        return 8;
+    }
+    return 4;
+}
+
+/// The bits of precision of a format (24 for S24, 32 for F32, 64 for F64).
+pub fn bits(format: u8) u32 {
+    if format == U8 {
+        return 8;
+    }
+    if format == S16 {
+        return 16;
+    }
+    if format == S24 {
+        return 24;
+    }
+    if format == F64 {
+        return 64;
+    }
+    return 32;
+}
+
+pub fn is_float(format: u8) bool {
+    return (format == F32) or (format == F64);
+}
+
+fn valid_format(format: u8) bool {
+    return (format >= U8) and (format <= F64);
+}
+
+pub struct Sound {
+    frames: usize,
+    channels: usize,
+    rate: u32,  // frames per second
+    format: u8,
+    data: []mut u8,
+
+    /// A new sound, all silence. Free it with deinit.
+    pub fn init(frames: usize, channels: usize, rate: u32, format: u8) !Sound {
+        if (channels < 1) or (channels > 255) or not valid_format(format) or (rate == 0) {
+            return error.Unsupported;
+        }
+        let n = @mul_checked(frames, channels) catch return error.TooLarge;
+        if n > MAX_SAMPLES {
+            return error.TooLarge;
+        }
+        let data = mem.alloc_zeroed.[u8](@max(n * bytes_per_sample(format), 1))!;
+        if format == U8 {
+            @mem_set(data, 128);
+        }
+        return Sound.{ frames: frames, channels: channels, rate: rate, format: format, data: data };
+    }
+
+    pub fn deinit(self: *mut Sound) void {
+        mem.free(self.data);
+    }
+
+    pub fn clone(self: *Sound) !Sound {
+        let mut c = Sound.init(self.frames, self.channels, self.rate, self.format)!;
+        @mem_copy(c.data, self.data);
+        return c;
+    }
+
+    /// The length in seconds.
+    pub fn duration(self: *Sound) f64 {
+        return @float_from_int(f64, self.frames) / @float_from_int(f64, self.rate);
+    }
+
+    /// The number of samples (frames times channels).
+    pub fn len(self: *Sound) usize {
+        return self.frames * self.channels;
+    }
+
+    /// The samples of a U8 sound.
+    pub fn samples_u8(self: *Sound) []mut u8 {
+        return self.data[..self.len()];
+    }
+
+    /// The samples of an S16 sound.
+    pub fn samples_i16(self: *Sound) []mut i16 {
+        return @cast_slice(i16, self.data[..self.len() * 2]);
+    }
+
+    /// The samples of an S24 or S32 sound.
+    pub fn samples_i32(self: *Sound) []mut i32 {
+        return @cast_slice(i32, self.data[..self.len() * 4]);
+    }
+
+    /// The samples of an F32 sound.
+    pub fn samples_f32(self: *Sound) []mut f32 {
+        return @cast_slice(f32, self.data[..self.len() * 4]);
+    }
+
+    /// The samples of an F64 sound.
+    pub fn samples_f64(self: *Sound) []mut f64 {
+        return @cast_slice(f64, self.data[..self.len() * 8]);
+    }
+
+    /// Sample i (frame i / channels) as a float.
+    pub fn sample(self: *Sound, i: usize) f64 {
+        let f = self.format;
+        if f == U8 {
+            return @float_from_int(f64, @as(i32, self.data[i]) - 128) * (1.0 / 128.0);
+        }
+        if f == S16 {
+            return @float_from_int(f64, self.samples_i16()[i]) * (1.0 / 32768.0);
+        }
+        if f == S24 {
+            return @float_from_int(f64, self.samples_i32()[i]) * (1.0 / 8388608.0);
+        }
+        if f == S32 {
+            return @float_from_int(f64, self.samples_i32()[i]) * (1.0 / 2147483648.0);
+        }
+        if f == F32 {
+            return @float_cast(f64, self.samples_f32()[i]);
+        }
+        return self.samples_f64()[i];
+    }
+
+    /// Sets sample i from a float (rounded and clipped for integer formats).
+    pub fn set_sample(self: *mut Sound, i: usize, v: f64) void {
+        let f = self.format;
+        if f == U8 {
+            self.data[i] = @truncate(u8, @bit_cast(u32, to_int(v, 8) + 128));
+        } else if f == S16 {
+            self.samples_i16()[i] = @truncate(i16, to_int(v, 16));
+        } else if f == S24 {
+            self.samples_i32()[i] = to_int(v, 24);
+        } else if f == S32 {
+            self.samples_i32()[i] = to_int(v, 32);
+        } else if f == F32 {
+            self.samples_f32()[i] = @float_cast(f32, v);
+        } else {
+            self.samples_f64()[i] = v;
+        }
+    }
+
+    /// Channel ch of a frame, as a float.
+    pub fn get(self: *Sound, frame: usize, ch: usize) f64 {
+        return self.sample((frame * self.channels) + ch);
+    }
+
+    /// Sets channel ch of a frame from a float.
+    pub fn set(self: *mut Sound, frame: usize, ch: usize, v: f64) void {
+        self.set_sample((frame * self.channels) + ch, v);
+    }
+
+    /// Integer sample i as a signed value of the format's bits (U8 centred
+    /// on 0); for integer formats only.
+    fn int_sample(self: *Sound, i: usize) i32 {
+        let f = self.format;
+        if f == U8 {
+            return @as(i32, self.data[i]) - 128;
+        }
+        if f == S16 {
+            return @as(i32, self.samples_i16()[i]);
+        }
+        return self.samples_i32()[i];
+    }
+
+    /// A copy in another sample format.
+    pub fn convert(self: *Sound, format: u8) !Sound {
+        let mut out = Sound.init(self.frames, self.channels, self.rate, format)!;
+        let n = self.len();
+        if is_float(self.format) or is_float(format) {
+            for i in @as(usize, 0)..n {
+                out.set_sample(i, self.sample(i));
+            }
+            return out;
+        }
+        // integer to integer: exact shifts, rounding when narrowing
+        let from = bits(self.format);
+        let to = bits(format);
+        for i in @as(usize, 0)..n {
+            let v = self.int_sample(i);
+            let mut w: i32 = 0;
+            if to >= from {
+                w = v << (to - from);
+            } else {
+                let sh = from - to;
+                let r = (@as(i64, v) + (@as(i64, 1) << (sh - 1))) >> sh;
+                let hi = (@as(i64, 1) << (to - 1)) - 1;
+                w = @truncate(i32, @min(r, hi));
+            }
+            if format == U8 {
+                out.data[i] = @truncate(u8, @bit_cast(u32, w + 128));
+            } else if format == S16 {
+                out.samples_i16()[i] = @truncate(i16, w);
+            } else {
+                out.samples_i32()[i] = w;
+            }
+        }
+        return out;
+    }
+
+    /// A copy with a different number of channels: to mono, the average of
+    /// the channels; from mono, the channel repeated; otherwise the first
+    /// channels kept and any new ones silent.
+    pub fn remix(self: *Sound, channels: usize) !Sound {
+        let mut out = Sound.init(self.frames, channels, self.rate, self.format)!;
+        let ci = self.channels;
+        for fr in @as(usize, 0)..self.frames {
+            if channels == 1 {
+                let mut sum: f64 = 0.0;
+                for c in @as(usize, 0)..ci {
+                    sum += self.get(fr, c);
+                }
+                out.set(fr, 0, sum / @float_from_int(f64, ci));
+            } else if ci == 1 {
+                let v = self.get(fr, 0);
+                for c in @as(usize, 0)..channels {
+                    out.set(fr, c, v);
+                }
+            } else {
+                for c in @as(usize, 0)..@min(ci, channels) {
+                    out.set(fr, c, self.get(fr, c));
+                }
+            }
+        }
+        return out;
+    }
+
+    /// Frames start..end (clamped to the sound) as a new sound.
+    pub fn slice(self: *Sound, start: usize, end: usize) !Sound {
+        let e = @min(end, self.frames);
+        let s = @min(start, e);
+        let mut out = Sound.init(e - s, self.channels, self.rate, self.format)!;
+        let fb = self.channels * bytes_per_sample(self.format);
+        @mem_copy(out.data[..(e - s) * fb], self.data[s * fb..e * fb]);
+        return out;
+    }
+
+    /// The largest absolute sample value, as a float (1.0 is full scale).
+    pub fn peak(self: *Sound) f64 {
+        let mut m: f64 = 0.0;
+        for i in @as(usize, 0)..self.len() {
+            m = @max(m, @abs(self.sample(i)));
+        }
+        return m;
+    }
+
+    /// Multiplies every sample by g (clipping integer formats).
+    pub fn gain(self: *mut Sound, g: f64) void {
+        for i in @as(usize, 0)..self.len() {
+            self.set_sample(i, self.sample(i) * g);
+        }
+    }
+
+    /// A copy at another sample rate, by band-limited interpolation: a
+    /// Kaiser-windowed sinc filter 64 zero crossings wide, cutting off at
+    /// 95% of the lower Nyquist frequency with better than 90 dB of
+    /// stop-band rejection. The format is kept.
+    pub fn resample(self: *Sound, rate: u32) !Sound {
+        if rate == 0 {
+            return error.Unsupported;
+        }
+        let in_rate = @as(u64, self.rate);
+        let out_rate = @as(u64, rate);
+        let out_frames_64 = ((@as(u64, self.frames) * out_rate) + in_rate - 1) / in_rate;
+        if out_frames_64 > @as(u64, MAX_SAMPLES) {
+            return error.TooLarge;
+        }
+        let out_frames = @truncate(usize, out_frames_64);
+        let mut out = Sound.init(out_frames, self.channels, rate, self.format)!;
+        if rate == self.rate {
+            @mem_copy(out.data, self.data);
+            return out;
+        }
+        resample_into(self, &mut out) catch |e| {
+            out.deinit();
+            return e;
+        };
+        return out;
+    }
+}
+
+/// v in -1.0..1.0 as a signed integer of b bits, rounded and clipped.
+fn to_int(v: f64, b: u32) i32 {
+    let scale = @float_from_int(f64, @as(i64, 1) << (b - 1));
+    let x = @nearest(v * scale);
+    if not (x < (scale - 1.0)) {
+        if x != x {
+            return 0;  // NaN
+        }
+        return @truncate(i32, (@as(i64, 1) << (b - 1)) - 1);
+    }
+    if x < -scale {
+        return @truncate(i32, -(@as(i64, 1) << (b - 1)));
+    }
+    return @int_from_float(i32, x);
+}
+
+// -----------------------------------------------------------------------------
+// Resampling
+// -----------------------------------------------------------------------------
+
+const ZEROS: usize = 32;    // zero crossings on each side of the centre
+const PHASES: usize = 256;  // table entries per zero crossing
+const BETA: f64 = 9.5;      // Kaiser window shape
+const ROLLOFF: f64 = 0.95;  // cutoff, as a fraction of the lower Nyquist frequency
+
+/// The zeroth-order modified Bessel function of the first kind.
+fn bessel_i0(x: f64) f64 {
+    let mut sum: f64 = 1.0;
+    let mut term: f64 = 1.0;
+    let q = (x * x) / 4.0;
+    let mut k: f64 = 1.0;
+    while term > (sum * 1e-17) {
+        term = (term * q) / (k * k);
+        sum += term;
+        k += 1.0;
+    }
+    return sum;
+}
+
+/// The windowed sinc, sampled at 1/PHASES from 0 to ZEROS zero crossings
+/// (plus one entry for interpolation).
+fn filter_table() ![]mut f64 {
+    let n = (ZEROS * PHASES) + 2;
+    let t = mem.alloc.[f64](n)!;
+    let norm = bessel_i0(BETA);
+    for i in @as(usize, 0)..n {
+        let x = @float_from_int(f64, i) / @float_from_int(f64, PHASES);
+        let r = x / @float_from_int(f64, ZEROS);
+        let mut w: f64 = 0.0;
+        if r < 1.0 {
+            w = bessel_i0(BETA * @sqrt(1.0 - (r * r))) / norm;
+        }
+        let mut s: f64 = 1.0;
+        if i > 0 {
+            s = math.sin(math.PI * x) / (math.PI * x);
+        }
+        t[i] = s * w;
+    }
+    return t;
+}
+
+fn resample_into(src: *Sound, out: *mut Sound) !void {
+    let table = filter_table()!;
+    defer mem.free(table);
+    let in_rate = @as(u64, src.rate);
+    let out_rate = @as(u64, out.rate);
+    let nch = src.channels;
+    // the filter runs at the lower of the two rates
+    let mut fc = ROLLOFF;
+    if out_rate < in_rate {
+        fc = (ROLLOFF * @float_from_int(f64, out_rate)) / @float_from_int(f64, in_rate);
+    }
+    let half = @float_from_int(f64, ZEROS) / fc;  // the filter's half-width, in input samples
+    let reach = @int_from_float(i64, half) + 1;
+    let step = fc * @float_from_int(f64, PHASES);  // table entries per input sample
+    let nin = @bit_cast(i64, @as(u64, src.frames));
+    // the input as floats, one channel after another, for speed
+    let flat = mem.alloc.[f64](@max(src.len(), 1))!;
+    defer mem.free(flat);
+    for c in @as(usize, 0)..nch {
+        for fr in @as(usize, 0)..src.frames {
+            flat[(c * src.frames) + fr] = src.get(fr, c);
+        }
+    }
+    let wts = mem.alloc.[f64](@truncate(usize, @bit_cast(u64, (2 * reach) + 1)))!;
+    defer mem.free(wts);
+    let acc = mem.alloc.[f64](nch)!;
+    defer mem.free(acc);
+    for n in @as(usize, 0)..out.frames {
+        // the output sample's time, in input samples: whole part and fraction
+        let pos = @as(u64, n) * in_rate;
+        let whole = @bit_cast(i64, pos / out_rate);
+        let frac = @float_from_int(f64, pos % out_rate) / @float_from_int(f64, out_rate);
+        let lo = @max(whole - reach + 1, 0);
+        let hi = @min(whole + reach, nin - 1);
+        if lo > hi {
+            continue;
+        }
+        let mut nw: usize = 0;
+        let mut k = lo;
+        while k <= hi {
+            let dist = @abs(@float_from_int(f64, k - whole) - frac);
+            let x = dist * step;
+            let mut w: f64 = 0.0;
+            if dist < half {
+                let i = @int_from_float(usize, x);
+                let t = x - @float_from_int(f64, i);
+                w = table[i] + ((table[i + 1] - table[i]) * t);
+            }
+            wts[nw] = w * fc;
+            nw += 1;
+            k += 1;
+        }
+        let first = @truncate(usize, @bit_cast(u64, lo));
+        for c in @as(usize, 0)..nch {
+            let row = flat[(c * src.frames) + first..];
+            let mut s: f64 = 0.0;
+            for j in @as(usize, 0)..nw {
+                s += row[j] * wts[j];
+            }
+            acc[c] = s;
+        }
+        for c in @as(usize, 0)..nch {
+            out.set(n, c, acc[c]);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "formats convert exactly" {
+    let fmts: [6]u8 = [U8, S16, S24, S32, F32, F64];
+    let mut s = Sound.init(7, 2, 8000, S16)!;
+    defer s.deinit();
+    let vals: [7]i16 = [-32768, -32767, -1, 0, 1, 12345, 32767];
+    for i in @as(usize, 0)..7 {
+        s.samples_i16()[2 * i] = vals[i];
+        s.samples_i16()[(2 * i) + 1] = vals[6 - i];
+    }
+    for f in fmts {
+        let mut a = s.convert(f)!;
+        defer a.deinit();
+        let mut b = a.convert(S16)!;
+        defer b.deinit();
+        if f == U8 {
+            @expect_eq(b.samples_i16()[0], -32768);
+            @expect_eq(b.samples_i16()[12], 32512);  // 8 bits keep the top byte, rounded
+            continue;
+        }
+        @expect_eq(b.data[..], s.data[..]);
+    }
+    @expect_eq(s.get(0, 0), -1.0);
+    @expect_eq(s.get(3, 0), 0.0);
+    let mut f = s.convert(F32)!;
+    defer f.deinit();
+    f.set(0, 0, 2.0);
+    f.set(1, 0, -3.0);
+    let mut back = f.convert(S24)!;
+    defer back.deinit();
+    @expect_eq(back.samples_i32()[0], 8388607);  // clipped
+    @expect_eq(back.samples_i32()[2], -8388608);
+    let mut u = Sound.init(1, 1, 8000, U8)!;
+    defer u.deinit();
+    @expect_eq(u.data[0], 128);  // silence
+    @expect_eq(u.get(0, 0), 0.0);
+}
+
+test "remix and slice" {
+    let mut s = Sound.init(4, 2, 100, F32)!;
+    defer s.deinit();
+    for i in @as(usize, 0)..4 {
+        s.set(i, 0, 0.5);
+        s.set(i, 1, -0.25);
+    }
+    let mut m = s.remix(1)!;
+    defer m.deinit();
+    @expect_eq(m.get(2, 0), 0.125);
+    let mut st = m.remix(2)!;
+    defer st.deinit();
+    @expect_eq(st.get(3, 1), 0.125);
+    let mut q = s.remix(4)!;
+    defer q.deinit();
+    @expect_eq(q.get(1, 1), -0.25);
+    @expect_eq(q.get(1, 3), 0.0);
+    let mut sl = s.slice(1, 99)!;
+    defer sl.deinit();
+    @expect_eq(sl.frames, 3);
+    @expect_eq(sl.peak(), 0.5);
+    @expect_eq(s.duration(), 0.04);
+}
+
+test "resampling keeps tones and removes aliases" {
+    // a 1 kHz tone at 48 kHz to 44.1 kHz and back: amplitude kept
+    let n: usize = 4800;
+    let mut s = Sound.init(n, 1, 48000, F64)!;
+    defer s.deinit();
+    for i in @as(usize, 0)..n {
+        s.set(i, 0, 0.5 * math.sin((2.0 * math.PI * 1000.0 * @float_from_int(f64, i)) / 48000.0));
+    }
+    let mut r = s.resample(44100)!;
+    defer r.deinit();
+    @expect_eq(r.frames, 4410);
+    @expect_eq(r.rate, 44100);
+    let mut err: f64 = 0.0;
+    for i in @as(usize, 500)..3900 {
+        let want = 0.5 * math.sin((2.0 * math.PI * 1000.0 * @float_from_int(f64, i)) / 44100.0);
+        err = @max(err, @abs(r.get(i, 0) - want));
+    }
+    @expect(err < 1e-4);
+    // a 20 kHz tone downsampled to 16 kHz is above the new Nyquist: removed
+    for i in @as(usize, 0)..n {
+        s.set(i, 0, 0.5 * math.sin((2.0 * math.PI * 20000.0 * @float_from_int(f64, i)) / 48000.0));
+    }
+    let mut d = s.resample(16000)!;
+    defer d.deinit();
+    let mut m: f64 = 0.0;
+    for i in @as(usize, 200)..1400 {
+        m = @max(m, @abs(d.get(i, 0)));
+    }
+    @expect(m < 1e-4);
+}

@@ -1,0 +1,272 @@
+// =============================================================================
+// std/crypto/md5.ph - MD5 (RFC 1321).
+//
+//     let mut h = md5.Md5.init();
+//     h.update("abc");
+//     let mut out: [16]u8 = [0; 16];
+//     h.final(out[..]);
+//
+// or md5.md5(data, out[..]) in one call. MD5 is broken for security (it is
+// easy to make collisions); it is here for the formats that use it as a
+// checksum, such as FLAC's audio signature.
+// =============================================================================
+
+let S: [64]u32 = [
+    7,
+    12,
+    17,
+    22,
+    7,
+    12,
+    17,
+    22,
+    7,
+    12,
+    17,
+    22,
+    7,
+    12,
+    17,
+    22,
+    5,
+    9,
+    14,
+    20,
+    5,
+    9,
+    14,
+    20,
+    5,
+    9,
+    14,
+    20,
+    5,
+    9,
+    14,
+    20,
+    4,
+    11,
+    16,
+    23,
+    4,
+    11,
+    16,
+    23,
+    4,
+    11,
+    16,
+    23,
+    4,
+    11,
+    16,
+    23,
+    6,
+    10,
+    15,
+    21,
+    6,
+    10,
+    15,
+    21,
+    6,
+    10,
+    15,
+    21,
+    6,
+    10,
+    15,
+    21,
+];
+
+// floor(abs(sin(i + 1)) * 2^32)
+let K: [64]u32 = [
+    0xd76aa478,
+    0xe8c7b756,
+    0x242070db,
+    0xc1bdceee,
+    0xf57c0faf,
+    0x4787c62a,
+    0xa8304613,
+    0xfd469501,
+    0x698098d8,
+    0x8b44f7af,
+    0xffff5bb1,
+    0x895cd7be,
+    0x6b901122,
+    0xfd987193,
+    0xa679438e,
+    0x49b40821,
+    0xf61e2562,
+    0xc040b340,
+    0x265e5a51,
+    0xe9b6c7aa,
+    0xd62f105d,
+    0x02441453,
+    0xd8a1e681,
+    0xe7d3fbc8,
+    0x21e1cde6,
+    0xc33707d6,
+    0xf4d50d87,
+    0x455a14ed,
+    0xa9e3e905,
+    0xfcefa3f8,
+    0x676f02d9,
+    0x8d2a4c8a,
+    0xfffa3942,
+    0x8771f681,
+    0x6d9d6122,
+    0xfde5380c,
+    0xa4beea44,
+    0x4bdecfa9,
+    0xf6bb4b60,
+    0xbebfbc70,
+    0x289b7ec6,
+    0xeaa127fa,
+    0xd4ef3085,
+    0x04881d05,
+    0xd9d4d039,
+    0xe6db99e5,
+    0x1fa27cf8,
+    0xc4ac5665,
+    0xf4292244,
+    0x432aff97,
+    0xab9423a7,
+    0xfc93a039,
+    0x655b59c3,
+    0x8f0ccc92,
+    0xffeff47d,
+    0x85845dd1,
+    0x6fa87e4f,
+    0xfe2ce6e0,
+    0xa3014314,
+    0x4e0811a1,
+    0xf7537e82,
+    0xbd3af235,
+    0x2ad7d2bb,
+    0xeb86d391,
+];
+
+pub struct Md5 {
+    h: [4]u32,
+    buf: [64]u8,
+    nbuf: usize,
+    total: u64,
+
+    pub fn init() Md5 {
+        return Md5.{ h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476], buf: [0; 64], nbuf: 0, total: 0 };
+    }
+
+    fn block(self: *mut Md5, p: []u8) void {
+        let mut m: [16]u32 = [0; 16];
+        for i in @as(usize, 0)..16 {
+            m[i] = (
+                (@as(u32, p[4 * i]) | (@as(u32, p[(4 * i) + 1]) << 8)) | (@as(u32, p[(4 * i) + 2]) << 16)) | (
+                    @as(u32, p[(4 * i) + 3]) << 24);
+        }
+        let mut a = self.h[0];
+        let mut b = self.h[1];
+        let mut c = self.h[2];
+        let mut d = self.h[3];
+        for i in @as(usize, 0)..64 {
+            let mut f: u32 = 0;
+            let mut g: usize = 0;
+            if i < 16 {
+                f = (b & c) | (~b & d);
+                g = i;
+            } else if i < 32 {
+                f = (d & b) | (~d & c);
+                g = ((5 * i) + 1) % 16;
+            } else if i < 48 {
+                f = (b ^ c) ^ d;
+                g = ((3 * i) + 5) % 16;
+            } else {
+                f = c ^ (b | ~d);
+                g = (7 * i) % 16;
+            }
+            let t = d;
+            d = c;
+            c = b;
+            b = b +% @rotl(((a +% f) +% K[i]) +% m[g], S[i]);
+            a = t;
+        }
+        self.h[0] +%= a;
+        self.h[1] +%= b;
+        self.h[2] +%= c;
+        self.h[3] +%= d;
+    }
+
+    pub fn update(self: *mut Md5, data: []u8) void {
+        self.total +%= @as(u64, data.len);
+        let mut d = data;
+        if self.nbuf > 0 {
+            let k = @min(64 - self.nbuf, d.len);
+            @mem_copy(self.buf[self.nbuf..self.nbuf + k], d[..k]);
+            self.nbuf += k;
+            d = d[k..];
+            if self.nbuf < 64 {
+                return;
+            }
+            let b = self.buf;
+            self.block(b[..]);
+            self.nbuf = 0;
+        }
+        while d.len >= 64 {
+            self.block(d[..64]);
+            d = d[64..];
+        }
+        @mem_copy(self.buf[..d.len], d);
+        self.nbuf = d.len;
+    }
+
+    /// Writes the 16-byte digest to out. The hasher is finished afterwards.
+    pub fn final(self: *mut Md5, out: []mut u8) void {
+        let bits = self.total *% 8;
+        let mut pad: [72]u8 = [0; 72];
+        pad[0] = 0x80;
+        let mut n = 64 - ((self.nbuf + 8) % 64);
+        if n == 0 {
+            n = 64;
+        }
+        self.update(pad[..n]);
+        let mut len: [8]u8 = [0; 8];
+        for i in @as(usize, 0)..8 {
+            len[i] = @truncate(u8, bits >> @as(u64, 8 * i));
+        }
+        self.update(len[..]);
+        for i in @as(usize, 0)..16 {
+            out[i] = @truncate(u8, self.h[i / 4] >> @truncate(u32, 8 * (i % 4)));
+        }
+    }
+}
+
+pub fn md5(data: []u8, out: []mut u8) void {
+    let mut h = Md5.init();
+    h.update(data);
+    h.final(out);
+}
+
+fn hex(d: []u8, out: []mut u8) []u8 {
+    let digits = "0123456789abcdef";
+    for i in @as(usize, 0)..d.len {
+        out[2 * i] = digits[@as(usize, d[i] >> 4)];
+        out[(2 * i) + 1] = digits[@as(usize, d[i] & 15)];
+    }
+    return out[..2 * d.len];
+}
+
+test "RFC 1321 vectors" {
+    let mut d: [16]u8 = [0; 16];
+    let mut h: [32]u8 = [0; 32];
+    md5("", d[..]);
+    @expect_eq(hex(d[..], h[..]), "d41d8cd98f00b204e9800998ecf8427e");
+    md5("abc", d[..]);
+    @expect_eq(hex(d[..], h[..]), "900150983cd24fb0d6963f7d28e17f72");
+    md5("12345678901234567890123456789012345678901234567890123456789012345678901234567890", d[..]);
+    @expect_eq(hex(d[..], h[..]), "57edf4a22be3c955ac49da2e2107b67a");
+    // in pieces
+    let mut m = Md5.init();
+    m.update("message ");
+    m.update("digest");
+    m.final(d[..]);
+    @expect_eq(hex(d[..], h[..]), "f96b697d7cb7938d525a2f31aaf161d0");
+}
