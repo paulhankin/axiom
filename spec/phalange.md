@@ -1675,7 +1675,7 @@ a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 
 ### 15.2 Other modules and the host ABI
 
-The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `path`, `fs`, `os`, `str`, `fmt`,
+The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `path`, `fs`, `os`, `log`, `str`, `fmt`,
 `time`, `thread`, `sync`, `net`, `math`, `color`, `image` and its codecs, `draw`, `font`, `audio` and its codecs, `http`, `tls`, `json`, `regex`, `bigint`, `deflate`,
 `base64`, and the `crypto/` modules) is ordinary Phalange
 code; see
