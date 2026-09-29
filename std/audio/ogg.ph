@@ -1,0 +1,298 @@
+// =============================================================================
+// std/audio/ogg.ph - the Ogg container (RFC 3533): pages and packets.
+//
+//     let serial = ogg.find_stream(bytes, "\x01vorbis")!;  // the first such stream
+//     let mut ps = ogg.packets(bytes, serial)!;
+//     defer ps.deinit();
+//     for p in ps.items.items() { ... p.data ... }
+//
+// Pages are checked (their CRC must match); packets are reassembled across
+// pages. A packet's granule is its page's granule position when the packet
+// is the last to end on that page, and -1 otherwise.
+// =============================================================================
+
+import "../mem.ph" as mem;
+import "../vec.ph" as vec;
+
+error { InvalidAudio, OutOfMemory }
+
+pub struct Packet {
+    data: []u8,
+    granule: i64,
+}
+
+/// A logical stream's packets. Packets that span pages are copied into
+/// memory the list owns.
+pub struct Packets {
+    items: vec.Vec.[Packet],
+    owned: vec.Vec.[[]mut u8],
+
+    pub fn deinit(self: *mut Packets) void {
+        for b in self.owned.items() {
+            mem.free(b);
+        }
+        self.owned.deinit();
+        self.items.deinit();
+    }
+}
+
+let mut crc_table: [256]u32 = [0; 256];
+let mut crc_ready: bool = false;
+
+/// Ogg's CRC-32 (polynomial 0x04c11db7, not reflected, initial 0).
+pub fn crc32(d: []u8) u32 {
+    if not crc_ready {
+        for i in @as(u32, 0)..256 {
+            let mut c = i << 24;
+            for _k in @as(u32, 0)..8 {
+                if (c & 0x80000000) != 0 {
+                    c = (c << 1) ^ 0x04c11db7;
+                } else {
+                    c = c << 1;
+                }
+            }
+            crc_table[@as(usize, i)] = c;
+        }
+        crc_ready = true;
+    }
+    let mut c: u32 = 0;
+    for b in d {
+        c = (c << 8) ^ crc_table[@as(usize, (c >> 24) ^ @as(u32, b))];
+    }
+    return c;
+}
+
+fn le32(b: []u8, i: usize) u32 {
+    return ((@as(u32, b[i]) | (@as(u32, b[i + 1]) << 8)) | (@as(u32, b[i + 2]) << 16)) | (@as(u32, b[i + 3]) << 24);
+}
+
+/// A page's layout.
+struct Page {
+    flags: u8,
+    granule: i64,
+    serial: u32,
+    nseg: usize,
+    body: usize,  // where the data starts
+    len: usize,   // the whole page's length
+}
+
+/// The page at p, checked; or an error.
+fn page_at(d: []u8, p: usize) !Page {
+    if ((p + 27) > d.len) or not @mem_eq(d[p..p + 4], "OggS") or (d[p + 4] != 0) {
+        return error.InvalidAudio;
+    }
+    let nseg = @as(usize, d[p + 26]);
+    if (p + 27 + nseg) > d.len {
+        return error.InvalidAudio;
+    }
+    let mut body_len: usize = 0;
+    for i in @as(usize, 0)..nseg {
+        body_len += @as(usize, d[p + 27 + i]);
+    }
+    let len = 27 + nseg + body_len;
+    if (p + len) > d.len {
+        return error.InvalidAudio;
+    }
+    // the CRC, computed with its own field as zero
+    let want = le32(d, p + 22);
+    let mut c = crc32(d[p..p + 22]);
+    let zero: [4]u8 = [0; 4];
+    c = crc_continue(c, zero[..]);
+    c = crc_continue(c, d[p + 26..p + len]);
+    if c != want {
+        return error.InvalidAudio;
+    }
+    let g = @bit_cast(i64, @as(u64, le32(d, p + 6)) | (@as(u64, le32(d, p + 10)) << 32));
+    return Page.{ flags: d[p + 5], granule: g, serial: le32(d, p + 14), nseg: nseg, body: p + 27 + nseg, len: len };
+}
+
+fn crc_continue(c0: u32, d: []u8) u32 {
+    let mut c = c0;
+    for b in d {
+        c = (c << 8) ^ crc_table[@as(usize, (c >> 24) ^ @as(u32, b))];
+    }
+    return c;
+}
+
+/// The next valid page at or after p (skipping garbage), or d.len.
+fn next_page(d: []u8, p: usize) usize {
+    let mut q = p;
+    while (q + 4) <= d.len {
+        if (d[q] == 'O') and @mem_eq(d[q..q + 4], "OggS") {
+            let ok = page_at(d, q) catch Page.{ flags: 0, granule: 0, serial: 0, nseg: 0, body: 0, len: 0 };
+            if ok.len > 0 {
+                return q;
+            }
+        }
+        q += 1;
+    }
+    return d.len;
+}
+
+pub fn is_ogg(d: []u8) bool {
+    return (d.len >= 4) and @mem_eq(d[..4], "OggS");
+}
+
+/// The serial number of the first logical stream whose first packet
+/// starts with magic.
+pub fn find_stream(d: []u8, magic: []u8) !u32 {
+    let mut p = next_page(d, 0);
+    while p < d.len {
+        let pg = page_at(d, p)!;
+        if ((pg.flags & 2) != 0) and ((pg.body + magic.len) <= d.len) and
+           @mem_eq(d[pg.body..pg.body + magic.len], magic) {
+            return pg.serial;
+        }
+        p = next_page(d, p + pg.len);
+    }
+    return error.InvalidAudio;
+}
+
+/// The packets of the logical stream with the given serial number.
+pub fn packets(d: []u8, serial: u32) !Packets {
+    let mut out = Packets.{ items: vec.Vec.[Packet].init(), owned: vec.Vec.[[]mut u8].init() };
+    collect(d, serial, &mut out) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out;
+}
+
+fn collect(d: []u8, serial: u32, out: *mut Packets) !void {
+    let mut partial = vec.Vec.[u8].init();  // a packet continuing onto the next page
+    defer partial.deinit();
+    let mut in_partial = false;
+    let mut p = next_page(d, 0);
+    while p < d.len {
+        let pg = page_at(d, p)!;
+        p = next_page(d, p + pg.len);
+        if pg.serial != serial {
+            continue;
+        }
+        let cont = (pg.flags & 1) != 0;
+        // the rest of a packet whose start we never saw is skipped; a
+        // packet whose continuation is missing is dropped
+        let mut skipping = cont and not in_partial;
+        if not cont and in_partial {
+            partial.clear();
+            in_partial = false;
+        }
+        let seg_base = pg.body - pg.nseg;
+        let last = last_index_below_255(d, seg_base, pg.nseg);
+        let mut at = pg.body;
+        let mut start = at;
+        for i in @as(usize, 0)..pg.nseg {
+            let l = @as(usize, d[seg_base + i]);
+            at += l;
+            if l == 255 {
+                continue;
+            }
+            // a packet ends here
+            let mut g: i64 = -1;
+            if i == last {
+                g = pg.granule;
+            }
+            if skipping {
+                skipping = false;
+            } else if in_partial {
+                partial.extend(d[start..at])!;
+                let copy = mem.dup(partial.items()[..])!;
+                out.owned.push(copy) catch |e| {
+                    mem.free(copy);
+                    return e;
+                };
+                out.items.push(Packet.{ data: copy, granule: g })!;
+                partial.clear();
+                in_partial = false;
+            } else {
+                out.items.push(Packet.{ data: d[start..at], granule: g })!;
+            }
+            start = at;
+        }
+        if (pg.nseg > 0) and (d[seg_base + pg.nseg - 1] == 255) and not skipping {
+            // an unfinished packet: it continues on the next page
+            partial.extend(d[start..at])!;
+            in_partial = true;
+        }
+    }
+}
+
+fn last_index_below_255(d: []u8, seg_base: usize, nseg: usize) usize {
+    let mut k = nseg;
+    while k > 0 {
+        k -= 1;
+        if d[seg_base + k] < 255 {
+            return k;
+        }
+    }
+    return @max_value(usize);
+}
+
+/// Writes a page (for tests): its header, lacing values and body, with
+/// the CRC filled in; returns its length.
+fn write_page(out: []mut u8, flags: u8, granule: u64, serial: u32, lacing: []u8, body: []u8) usize {
+    @mem_copy(out[..4], "OggS");
+    out[4] = 0;
+    out[5] = flags;
+    for i in @as(usize, 0)..8 {
+        out[6 + i] = @truncate(u8, granule >> @as(u64, 8 * i));
+    }
+    for i in @as(usize, 0)..4 {
+        out[14 + i] = @truncate(u8, serial >> @as(u32, 8 * @as(u32, @truncate(u8, i))));
+        out[18 + i] = 0;
+        out[22 + i] = 0;
+    }
+    out[26] = @truncate(u8, lacing.len);
+    @mem_copy(out[27..27 + lacing.len], lacing);
+    let n = 27 + lacing.len + body.len;
+    @mem_copy(out[27 + lacing.len..n], body);
+    let c = crc32(out[..n]);
+    for i in @as(usize, 0)..4 {
+        out[22 + i] = @truncate(u8, c >> @as(u32, 8 * @as(u32, @truncate(u8, i))));
+    }
+    return n;
+}
+
+test "pages and packets" {
+    // stream 5: packet A (3 bytes) and packet B (300 bytes, split over two
+    // pages); stream 9 interleaved; then packet C
+    let mut buf: [1000]u8 = [0; 1000];
+    let mut body: [300]u8 = [0; 300];
+    for i in @as(usize, 0)..300 {
+        body[i] = @truncate(u8, i);
+    }
+    let mut n: usize = 0;
+    let lace1: [2]u8 = [3, 255];
+    let mut p1: [258]u8 = [0; 258];
+    p1[0] = 'A';
+    p1[1] = 'A';
+    p1[2] = 'A';
+    @mem_copy(p1[3..], body[..255]);
+    n += write_page(buf[n..], 2, 0, 5, lace1[..], p1[..]);
+    let lace_other: [1]u8 = [4];
+    n += write_page(buf[n..], 2, 0, 9, lace_other[..], "junk");
+    let lace2: [2]u8 = [45, 1];
+    let mut p2: [46]u8 = [0; 46];
+    @mem_copy(p2[..45], body[255..]);
+    p2[45] = 'C';
+    n += write_page(buf[n..], 1 | 4, 777, 5, lace2[..], p2[..]);
+    let d = buf[..n];
+    @expect(is_ogg(d));
+    @expect_eq(find_stream(d, "AAA")!, 5);
+    @expect_eq(find_stream(d, "junk")!, 9);
+    let mut ps = packets(d, 5)!;
+    defer ps.deinit();
+    @expect_eq(ps.items.len, 3);
+    @expect_eq(ps.items.get(0).data, "AAA");
+    @expect_eq(ps.items.get(0).granule, 0);
+    @expect_eq(ps.items.get(1).data, body[..]);
+    @expect_eq(ps.items.get(1).granule, -1);
+    @expect_eq(ps.items.get(2).data, "C");
+    @expect_eq(ps.items.get(2).granule, 777);
+    // a corrupted page is skipped
+    buf[40] ^= 1;
+    let mut ps2 = packets(d, 5)!;
+    defer ps2.deinit();
+    @expect_eq(ps2.items.len, 1);  // "C": the rest of B, whose start was lost, is skipped
+    @expect_eq(ps2.items.get(0).data, "C");
+}

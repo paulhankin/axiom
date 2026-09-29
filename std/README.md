@@ -50,10 +50,13 @@ Sound files are read and written by `std/audio/`:
 
 | Module | Contents |
 |---|---|
-| [`audio/formats`](audio/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
+| [`audio/formats`](audio/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension); WAV, AIFF and FLAC are written, all five read |
 | [`audio/wav`](audio/wav.ph) | WAV: PCM 8–32 bits, float, A-law, µ-law, WAVE_FORMAT_EXTENSIBLE, RF64 |
 | [`audio/aiff`](audio/aiff.ph) | AIFF and AIFF-C: big- and little-endian PCM, float, A-law, µ-law |
 | [`audio/flac`](audio/flac.ph) | FLAC: decodes every stream (4–32 bits, 1–8 channels; CRCs and MD5 checked); encodes at levels 0–8, about as small as the reference encoder |
+| [`audio/vorbis`](audio/vorbis.ph) | Ogg Vorbis decoding: any channel count and rate, floor 1, residues 0–2, coupling; trimmed to the granule positions; output within 3·10⁻⁷ of libvorbis |
+| [`audio/mp3`](audio/mp3.ph) | MP3 decoding (MPEG-1/2/2.5 layer III): CBR and VBR, joint stereo (mid/side, intensity), short and mixed blocks, the bit reservoir, LAME gapless trimming; output within 10⁻⁶ of libmpg123 |
+| [`audio/ogg`](audio/ogg.ph) | The Ogg container: pages (CRC-checked) and packets |
 
 Cryptography lives in `std/crypto/` (the primitives are written to run in constant
 time where secrets are involved):

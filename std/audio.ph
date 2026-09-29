@@ -18,7 +18,8 @@
 // exactly; floats convert to integers rounded and clipped.
 //
 // Reading and writing files: std/audio/formats (any format, by content or
-// file extension), or the codecs std/audio/wav, aiff and flac.
+// file extension), or the codecs std/audio/wav, aiff, flac (read and
+// write), vorbis (Ogg Vorbis) and mp3 (read).
 // =============================================================================
 
 import "math.ph" as math;
