@@ -76,6 +76,7 @@ and a type that owns memory has `deinit`).
 | [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
 | [`diff`](diff.ph) | Differences between texts (or token sequences) by Myers's algorithm in linear space, minimal but bounded on pathological input as in GNU diff; `lines`, `tokens`, `unified` (byte-for-byte `diff -u` format, `\ No newline at end of file` included), `apply` (strict patching). Patches applied by GNU `patch` |
 | [`template`](template.ph) | Mustache templates over `json.Value` data: escaped and raw interpolation, dotted names, sections, inverted sections, comments, partials, set-delimiter tags, standalone-line rules; compile once and render often. Passes the 136 tests of the Mustache specification's required modules ([`template/testdata`](template/testdata)); safe for untrusted templates |
+| [`hyphen`](hyphen.ph) | Hyphenation by Liang's algorithm (TeX's): `Hyphenator` from patterns and exceptions in TeX's format (UTF-8), `breaks`, `hyphenate`; American English built in ([`hyphen/en_us.ph`](hyphen/en_us.ph), TeX's ushyphmax patterns). Checked against the TeXbook and a reference implementation ([`tools/gen_hyphen.py`](../tools/gen_hyphen.py)) |
 
 Image files are read and written by `std/image/`:
 

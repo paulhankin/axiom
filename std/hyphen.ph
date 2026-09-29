@@ -1,0 +1,348 @@
+// =============================================================================
+// std/hyphen.ph - hyphenation by Liang's algorithm (as in TeX).
+//
+//     let mut h = hyphen.Hyphenator.en_us()!;
+//     defer h.deinit();
+//     let s = h.hyphenate("hyphenation", "-")!;      // "hy-phen-ation"; mem.free
+//     let n = h.breaks("typesetting", offsets[..])!;  // byte offsets of hyphens
+//
+// Patterns such as "hy3ph" give, between the letters they match, numbers
+// whose odd values allow a hyphen and even values forbid one; the largest
+// number from any matching pattern wins. Exceptions list whole words with
+// their hyphens. Hyphenator.init takes patterns and exceptions in TeX's
+// format (whitespace-separated), so other languages' patterns from the
+// hyph-utf8 package work too; en_us has American English (TeX's
+// ushyphmax patterns, std/hyphen/en_us.ph), with at least 2 letters
+// before a hyphen and 3 after.
+//
+// Words are matched in lower case (ASCII letters are folded here; fold
+// others first). Letters are UTF-8 characters, counted as such for the
+// minimums.
+// =============================================================================
+
+import "fs.ph" as fs;
+import "hyphen/en_us.ph" as en;
+import "mem.ph" as mem;
+import "str.ph" as strs;
+import "vec.ph" as vec;
+
+error { InvalidPattern, TooLong, OutOfMemory }
+
+/// The longest word hyphenated (longer ones are left whole).
+pub const MAX_WORD: usize = 256;
+
+struct Pattern {
+    key: []u8,     // the letters
+    digits: []u8,  // key.len + 1 numbers, one before each byte and one after
+}
+
+fn pattern_less(a: Pattern, b: Pattern) bool {
+    return strs.less(a.key, b.key);
+}
+
+pub struct Hyphenator {
+    pats: []mut Pattern,  // sorted by key
+    excs: []mut Pattern,  // exceptions: digits 1 where a hyphen goes
+    store: []mut u8,      // the bytes the keys and digits point into
+    max_len: usize,
+    left_min: usize,
+    right_min: usize,
+
+    /// American English.
+    pub fn en_us() !Hyphenator {
+        return Hyphenator.init(en.PATTERNS, en.EXCEPTIONS, en.LEFT_MIN, en.RIGHT_MIN)!;
+    }
+
+    /// Patterns ("a1b", ".ex5") and exceptions ("as-so-ciate"), separated
+    /// by whitespace; left_min and right_min are the fewest letters to keep
+    /// before and after a hyphen.
+    pub fn init(patterns: []u8, exceptions: []u8, left_min: usize, right_min: usize) !Hyphenator {
+        // room for every key and digit string: at most twice the text
+        let store = mem.alloc.[u8](((patterns.len + exceptions.len) * 2) + 2)!;
+        let mut used: usize = 0;
+        let mut ps = vec.Vec.[Pattern].init();
+        let mut es = vec.Vec.[Pattern].init();
+        let mut max_len: usize = 0;
+        let r = read_all(patterns, exceptions, store, &mut used, &mut ps, &mut es, &mut max_len);
+        r catch |e| {
+            ps.deinit();
+            es.deinit();
+            mem.free(store);
+            return e;
+        };
+        vec.sort.[Pattern](ps.items(), pattern_less);
+        vec.sort.[Pattern](es.items(), pattern_less);
+        let pats = owned(&mut ps) catch |e| {
+            es.deinit();
+            mem.free(store);
+            return e;
+        };
+        let excs = owned(&mut es) catch |e| {
+            mem.free(pats);
+            mem.free(store);
+            return e;
+        };
+        return Hyphenator.{ pats: pats, excs: excs, store: store, max_len: max_len, left_min: left_min,
+                            right_min: right_min };
+    }
+
+    pub fn deinit(self: *mut Hyphenator) void {
+        mem.free(self.pats);
+        mem.free(self.excs);
+        mem.free(self.store);
+    }
+
+    /// Writes into out the byte offsets in word where a hyphen may go (in
+    /// increasing order), and returns how many; out needs at most
+    /// word.len entries. Words longer than MAX_WORD bytes get none.
+    pub fn breaks(self: *Hyphenator, word: []u8, out: []mut usize) !usize {
+        if (word.len == 0) or (word.len > MAX_WORD) {
+            return 0;
+        }
+        // ".word.", lower-cased
+        let mut work: [258]u8 = [0; 258];
+        work[0] = '.';
+        for k in @as(usize, 0)..word.len {
+            work[k + 1] = strs.to_lower_byte(word[k]);
+        }
+        work[word.len + 1] = '.';
+        let n = word.len + 2;
+        // points[k]: the number before work[k]
+        let mut points: [259]u8 = [0; 259];
+        let ex = self.find(self.excs, work[1..n - 1]);
+        if ex < self.excs.len {
+            let d = self.excs[ex].digits;
+            for k in @as(usize, 0)..d.len {
+                points[k + 1] = d[k];
+            }
+        } else {
+            for i in @as(usize, 0)..n {
+                let top = @min(n, i + self.max_len);
+                for j in i + 1..top + 1 {
+                    let p = self.find(self.pats, work[i..j]);
+                    if p == self.pats.len {
+                        continue;
+                    }
+                    let d = self.pats[p].digits;
+                    for k in @as(usize, 0)..d.len {
+                        points[i + k] = @max(points[i + k], d[k]);
+                    }
+                }
+            }
+        }
+        // a hyphen before byte k of the word is points[k + 1]; count
+        // characters for the minimums, and skip continuation bytes
+        let chars = char_count(word);
+        let mut before: usize = 0;
+        let mut count: usize = 0;
+        for k in @as(usize, 0)..word.len {
+            if (word[k] & 0xc0) == 0x80 {
+                continue;
+            }
+            if ((before >= self.left_min) and ((chars - before) >= self.right_min)) and ((points[k + 1] & 1) == 1) {
+                if count >= out.len {
+                    return error.TooLong;
+                }
+                out[count] = k;
+                count += 1;
+            }
+            before += 1;
+        }
+        return count;
+    }
+
+    /// The word with sep at each place a hyphen may go; the caller frees it.
+    pub fn hyphenate(self: *Hyphenator, word: []u8, sep: []u8) ![]mut u8 {
+        let mut at: [256]usize = [0; 256];
+        let n = self.breaks(word, at[..])!;
+        let mut s = strs.String.init();
+        let mut prev: usize = 0;
+        for k in @as(usize, 0)..n {
+            s.push_str(word[prev..at[k]]) catch |e| {
+                s.deinit();
+                return e;
+            };
+            s.push_str(sep) catch |e| {
+                s.deinit();
+                return e;
+            };
+            prev = at[k];
+        }
+        s.push_str(word[prev..]) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+
+    // The index of key in xs (sorted), or xs.len.
+    fn find(self: *Hyphenator, xs: []Pattern, key: []u8) usize {
+        _ = self;
+        let mut lo: usize = 0;
+        let mut hi = xs.len;
+        while lo < hi {
+            let mid = lo + ((hi - lo) / 2);
+            let c = strs.compare(xs[mid].key, key);
+            if c == 0 {
+                return mid;
+            }
+            if c < 0 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return xs.len;
+    }
+}
+
+fn char_count(s: []u8) usize {
+    let mut n: usize = 0;
+    for c in s {
+        if (c & 0xc0) != 0x80 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn owned(v: *mut vec.Vec.[Pattern]) ![]mut Pattern {
+    let r = mem.alloc.[Pattern](v.len) catch |e| {
+        v.deinit();
+        return e;
+    };
+    @mem_copy(r, v.items());
+    v.deinit();
+    return r;
+}
+
+fn read_all(patterns: []u8, exceptions: []u8, store: []mut u8, used: *mut usize, ps: *mut vec.Vec.[Pattern],
+            es: *mut vec.Vec.[Pattern], max_len: *mut usize) !void {
+    let mut f = strs.fields(patterns);
+    while true {
+        let p = f.next() catch break;
+        // the letters, and a number before each and after the last
+        let key_at = used.*;
+        for c in p {
+            if not strs.is_digit(c) {
+                store[used.*] = strs.to_lower_byte(c);
+                used.* += 1;
+            }
+        }
+        let key = store[key_at..used.*];
+        if key.len == 0 {
+            return error.InvalidPattern;
+        }
+        let dig_at = used.*;
+        @mem_set(store[dig_at..dig_at + key.len + 1], 0);
+        let mut k: usize = 0;
+        for c in p {
+            if strs.is_digit(c) {
+                store[dig_at + k] = c - '0';
+            } else {
+                k += 1;
+            }
+        }
+        used.* += key.len + 1;
+        ps.push(Pattern.{ key: key, digits: store[dig_at..used.*] })!;
+        max_len.* = @max(max_len.*, key.len);
+    }
+    let mut g = strs.fields(exceptions);
+    while true {
+        let x = g.next() catch break;
+        let key_at = used.*;
+        for c in x {
+            if c != '-' {
+                store[used.*] = strs.to_lower_byte(c);
+                used.* += 1;
+            }
+        }
+        let key = store[key_at..used.*];
+        let dig_at = used.*;
+        // digits[k] = 1: a hyphen before byte k of the word
+        @mem_set(store[dig_at..dig_at + key.len + 1], 0);
+        let mut k: usize = 0;
+        for c in x {
+            if c == '-' {
+                store[dig_at + k] = 1;
+            } else {
+                k += 1;
+            }
+        }
+        used.* += key.len + 1;
+        es.push(Pattern.{ key: key, digits: store[dig_at..used.*] })!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "TeX's examples" {
+    let mut h = Hyphenator.en_us()!;
+    defer h.deinit();
+    // The TeXbook, appendix H
+    let a = h.hyphenate("hyphenation", "-")!;
+    defer mem.free(a);
+    @expect_eq(a, "hy-phen-ation");
+    let b = h.hyphenate("supercalifragilisticexpialidocious", "-")!;
+    defer mem.free(b);
+    @expect_eq(b, "su-per-cal-ifrag-ilis-tic-ex-pi-ali-do-cious");
+    // exceptions, and short words
+    let c = h.hyphenate("Associate", "\u{ad}")!;
+    defer mem.free(c);
+    @expect_eq(c, "As\u{ad}so\u{ad}ciate");
+    let d = h.hyphenate("present", "-")!;
+    defer mem.free(d);
+    @expect_eq(d, "present");
+    let e = h.hyphenate("cat", "-")!;
+    defer mem.free(e);
+    @expect_eq(e, "cat");
+    let mut at: [4]usize = [0; 4];
+    @expect(h.breaks("", at[..])! == 0);
+    @expect(h.breaks("typesetting", at[..])! == 2);
+    @expect((at[0] == 4) and (at[1] == 7));
+}
+
+test "a reference implementation" {
+    let data = fs.read_file("std/hyphen/testdata/words.txt") catch return;
+    defer mem.free(data);
+    let mut h = Hyphenator.en_us()!;
+    defer h.deinit();
+    let mut lines = strs.lines(data);
+    let mut n: usize = 0;
+    let mut word: [256]u8 = [0; 256];
+    while true {
+        let want = lines.next() catch break;
+        let mut k: usize = 0;
+        for c in want {
+            if c != '-' {
+                word[k] = c;
+                k += 1;
+            }
+        }
+        let got = h.hyphenate(word[..k], "-")!;
+        defer mem.free(got);
+        if not strs.eq(got, want) {
+            @expect_eq(got, want);
+        }
+        n += 1;
+    }
+    @expect(n == 1705);
+}
+
+test "other languages' patterns" {
+    // UTF-8 letters are counted as characters
+    let mut h = Hyphenator.init("1ä1 é1", "", 1, 1)!;
+    defer h.deinit();
+    let s = h.hyphenate("aäbéc", "-")!;
+    defer mem.free(s);
+    @expect_eq(s, "a-ä-bé-c");
+    @expect(invalid(Hyphenator.init("12 a", "", 1, 1)));
+}
+
+fn invalid(r: !Hyphenator) bool {
+    let mut h = r catch |e| return e == error.InvalidPattern;
+    h.deinit();
+    return false;
+}
