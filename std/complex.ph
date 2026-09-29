@@ -1,0 +1,469 @@
+// =============================================================================
+// std/complex.ph - complex numbers on f64.
+//
+//     let z = complex.Complex.init(1.0, 2.0);
+//     let w = z.mul(z.conj()).add(complex.Complex.polar(2.0, math.PI / 3.0));
+//     let r = z.sqrt().abs();
+//
+// Values are plain structs passed by value; every operation returns a new
+// one. Division uses Smith's algorithm and abs uses hypot, so neither
+// overflows for large finite parts. The elementary functions follow the
+// principal branches of C99 (Annex G): log, sqrt and the inverse functions
+// have their branch cuts on the axes, continuous from above for the cuts
+// on the negative real axis.
+// =============================================================================
+
+import "fmt.ph" as fmt;
+import "io.ph" as io;
+import "math.ph" as math;
+
+pub struct Complex {
+    re: f64,
+    im: f64,
+
+    pub fn init(re: f64, im: f64) Complex {
+        return Complex.{ re: re, im: im };
+    }
+
+    /// r (cos t + i sin t).
+    pub fn polar(r: f64, t: f64) Complex {
+        let sc = math.sincos(t);
+        return Complex.{ re: r * sc.cos, im: r * sc.sin };
+    }
+
+    /// e^(it), a point on the unit circle.
+    pub fn cis(t: f64) Complex {
+        let sc = math.sincos(t);
+        return Complex.{ re: sc.cos, im: sc.sin };
+    }
+
+    pub fn add(self: Complex, o: Complex) Complex {
+        return Complex.{ re: self.re + o.re, im: self.im + o.im };
+    }
+
+    pub fn sub(self: Complex, o: Complex) Complex {
+        return Complex.{ re: self.re - o.re, im: self.im - o.im };
+    }
+
+    pub fn mul(self: Complex, o: Complex) Complex {
+        return Complex.{ re: (self.re * o.re) - (self.im * o.im), im: (self.re * o.im) + (self.im * o.re) };
+    }
+
+    /// Multiplies by a real number.
+    pub fn scale(self: Complex, k: f64) Complex {
+        return Complex.{ re: self.re * k, im: self.im * k };
+    }
+
+    pub fn div(self: Complex, o: Complex) Complex {
+        // Smith's algorithm: divide through by the larger part of o
+        if @abs(o.re) >= @abs(o.im) {
+            if o.re == 0.0 {
+                // o is zero: an infinity (or NaN for 0 / 0), as for reals
+                return Complex.{ re: self.re / 0.0, im: self.im / 0.0 };
+            }
+            let r = o.im / o.re;
+            let d = o.re + (o.im * r);
+            return Complex.{ re: (self.re + (self.im * r)) / d, im: (self.im - (self.re * r)) / d };
+        }
+        let r = o.re / o.im;
+        let d = (o.re * r) + o.im;
+        return Complex.{ re: ((self.re * r) + self.im) / d, im: ((self.im * r) - self.re) / d };
+    }
+
+    pub fn recip(self: Complex) Complex {
+        return Complex.init(1.0, 0.0).div(self);
+    }
+
+    pub fn neg(self: Complex) Complex {
+        return Complex.{ re: -self.re, im: -self.im };
+    }
+
+    pub fn conj(self: Complex) Complex {
+        return Complex.{ re: self.re, im: -self.im };
+    }
+
+    /// The modulus |z|.
+    pub fn abs(self: Complex) f64 {
+        return math.hypot(self.re, self.im);
+    }
+
+    /// |z| squared.
+    pub fn norm(self: Complex) f64 {
+        return (self.re * self.re) + (self.im * self.im);
+    }
+
+    /// The argument, in [-pi, pi].
+    pub fn arg(self: Complex) f64 {
+        return math.atan2(self.im, self.re);
+    }
+
+    pub fn eq(self: Complex, o: Complex) bool {
+        return (self.re == o.re) and (self.im == o.im);
+    }
+
+    /// Whether the two are within `tol` of each other.
+    pub fn near(self: Complex, o: Complex, tol: f64) bool {
+        return self.sub(o).abs() <= tol;
+    }
+
+    pub fn is_nan(self: Complex) bool {
+        return math.is_nan(self.re) or math.is_nan(self.im);
+    }
+
+    pub fn exp(self: Complex) Complex {
+        let sc = math.sincos(self.im);
+        if self.im == 0.0 {
+            return Complex.{ re: math.exp(self.re), im: self.im };
+        }
+        // e^re may overflow while e^re cos(im) does not
+        if self.re > 709.0 {
+            let h = math.exp(self.re * 0.5);
+            return Complex.{ re: (h * sc.cos) * h, im: (h * sc.sin) * h };
+        }
+        let e = math.exp(self.re);
+        return Complex.{ re: e * sc.cos, im: e * sc.sin };
+    }
+
+    /// The principal logarithm.
+    pub fn log(self: Complex) Complex {
+        let a = @abs(self.re);
+        let b = @abs(self.im);
+        let hi = @max(a, b);
+        let lo = @min(a, b);
+        let mut re: f64 = 0.0;
+        if (hi > 0.5) and (hi < 3.0) {
+            // log |z| near 1: log1p keeps the digits that log(hypot) loses
+            re = 0.5 * math.log1p(((hi - 1.0) * (hi + 1.0)) + (lo * lo));
+        } else {
+            re = math.log(math.hypot(a, b));
+        }
+        return Complex.{ re: re, im: math.atan2(self.im, self.re) };
+    }
+
+    /// The principal square root, with a non-negative real part.
+    pub fn sqrt(self: Complex) Complex {
+        if (self.re == 0.0) and (self.im == 0.0) {
+            return Complex.{ re: 0.0, im: self.im };
+        }
+        if math.is_inf(self.im) {
+            return Complex.{ re: math.inf(), im: self.im };
+        }
+        // halve first so |z| + |re| cannot overflow
+        let t = @sqrt((math.hypot(self.re * 0.5, self.im * 0.5)) + (@abs(self.re) * 0.5));
+        if self.re >= 0.0 {
+            return Complex.{ re: t, im: self.im / (2.0 * t) };
+        }
+        return Complex.{ re: @abs(self.im) / (2.0 * t), im: @copysign(t, self.im) };
+    }
+
+    /// z^w, as exp(w log z); 0^w is 0 for w with a positive real part.
+    pub fn pow(self: Complex, w: Complex) Complex {
+        if (self.re == 0.0) and (self.im == 0.0) {
+            if (w.re == 0.0) and (w.im == 0.0) {
+                return Complex.init(1.0, 0.0);
+            }
+            if (w.re > 0.0) and (w.im == 0.0) {
+                return Complex.init(0.0, 0.0);
+            }
+        }
+        if w.im == 0.0 {
+            return self.powf(w.re);
+        }
+        return w.mul(self.log()).exp();
+    }
+
+    /// z^x for real x, as |z|^x e^(i x arg z) (exact for real results of
+    /// real z where the real power is).
+    pub fn powf(self: Complex, x: f64) Complex {
+        if (self.im == 0.0) and (self.re >= 0.0) {
+            return Complex.{ re: math.pow(self.re, x), im: 0.0 };
+        }
+        if x == 2.0 {
+            return self.mul(self);
+        }
+        let r = self.abs();
+        if r == 0.0 {
+            return Complex.init(0.0, 0.0);
+        }
+        return Complex.polar(math.pow(r, x), x * self.arg());
+    }
+
+    /// z^n for integers n, by repeated squaring.
+    pub fn powi(self: Complex, n: i32) Complex {
+        let mut k: u32 = @truncate(u32, @as(i64, n));
+        if n < 0 {
+            k = @truncate(u32, -@as(i64, n));
+        }
+        let mut b = self;
+        let mut r = Complex.init(1.0, 0.0);
+        while k > 0 {
+            if (k & 1) != 0 {
+                r = r.mul(b);
+            }
+            b = b.mul(b);
+            k >>= 1;
+        }
+        if n < 0 {
+            return r.recip();
+        }
+        return r;
+    }
+
+    pub fn sin(self: Complex) Complex {
+        let sc = math.sincos(self.re);
+        return Complex.{ re: sc.sin * math.cosh(self.im), im: sc.cos * math.sinh(self.im) };
+    }
+
+    pub fn cos(self: Complex) Complex {
+        let sc = math.sincos(self.re);
+        return Complex.{ re: sc.cos * math.cosh(self.im), im: -(sc.sin * math.sinh(self.im)) };
+    }
+
+    pub fn tan(self: Complex) Complex {
+        // tanh(iz) / i
+        let t = Complex.{ re: -self.im, im: self.re }.tanh();
+        return Complex.{ re: t.im, im: -t.re };
+    }
+
+    pub fn sinh(self: Complex) Complex {
+        let sc = math.sincos(self.im);
+        return Complex.{ re: math.sinh(self.re) * sc.cos, im: math.cosh(self.re) * sc.sin };
+    }
+
+    pub fn cosh(self: Complex) Complex {
+        let sc = math.sincos(self.im);
+        return Complex.{ re: math.cosh(self.re) * sc.cos, im: math.sinh(self.re) * sc.sin };
+    }
+
+    pub fn tanh(self: Complex) Complex {
+        // Kahan's formula: with t = tan(im), b = 1 + t^2, s = sinh(re),
+        // tanh z = (b s sqrt(1 + s^2) + i t) / (1 + b s^2)
+        if @abs(self.re) > 22.0 {
+            // tanh re is 1 to within an ulp; the imaginary part underflows
+            let e = math.exp(-2.0 * @abs(self.re));
+            let sc = math.sincos(self.im);
+            return Complex.{ re: @copysign(1.0, self.re), im: (4.0 * sc.sin) * sc.cos * e };
+        }
+        let t = math.tan(self.im);
+        let b = 1.0 + (t * t);
+        let s = math.sinh(self.re);
+        let rho = @sqrt(1.0 + (s * s));
+        let den = 1.0 + ((b * s) * s);
+        return Complex.{ re: ((b * s) * rho) / den, im: t / den };
+    }
+
+    /// The principal inverse sine.
+    pub fn asin(self: Complex) Complex {
+        // Kahan's formulas, which cancel nowhere
+        // (1 - z and 1 + z from the parts, keeping the signs of zeros)
+        let s1 = Complex.{ re: 1.0 - self.re, im: -self.im }.sqrt();
+        let s2 = Complex.{ re: 1.0 + self.re, im: self.im }.sqrt();
+        return Complex.{ re: math.atan2(self.re, (s1.re * s2.re) - (s1.im * s2.im)),
+                         im: asinh_real((s1.re * s2.im) - (s1.im * s2.re)) };
+    }
+
+    /// The principal inverse cosine.
+    pub fn acos(self: Complex) Complex {
+        // (1 - z and 1 + z from the parts, keeping the signs of zeros)
+        let s1 = Complex.{ re: 1.0 - self.re, im: -self.im }.sqrt();
+        let s2 = Complex.{ re: 1.0 + self.re, im: self.im }.sqrt();
+        return Complex.{ re: 2.0 * math.atan2(s1.re, s2.re), im: asinh_real((s2.re * s1.im) - (s2.im * s1.re)) };
+    }
+
+    /// The principal inverse tangent.
+    pub fn atan(self: Complex) Complex {
+        // atanh(iz) / i
+        let a = Complex.{ re: -self.im, im: self.re }.atanh();
+        return Complex.{ re: a.im, im: -a.re };
+    }
+
+    /// The principal inverse hyperbolic sine.
+    pub fn asinh(self: Complex) Complex {
+        // asin(iz) / i
+        let a = Complex.{ re: -self.im, im: self.re }.asin();
+        return Complex.{ re: a.im, im: -a.re };
+    }
+
+    /// The principal inverse hyperbolic cosine.
+    pub fn acosh(self: Complex) Complex {
+        let s1 = Complex.{ re: self.re - 1.0, im: self.im }.sqrt();
+        let s2 = Complex.{ re: self.re + 1.0, im: self.im }.sqrt();
+        return Complex.{ re: asinh_real((s1.re * s2.re) + (s1.im * s2.im)), im: 2.0 * math.atan2(s1.im, s2.re) };
+    }
+
+    /// The principal inverse hyperbolic tangent: log((1 + z) / (1 - z)) / 2.
+    pub fn atanh(self: Complex) Complex {
+        let a = @abs(self.re);
+        let b = @abs(self.im);
+        if (a > 1.0e150) or (b > 1.0e150) {
+            // 1 / z to within rounding
+            let r = self.recip();
+            return Complex.{ re: r.re, im: @copysign(math.PI * 0.5, self.im) };
+        }
+        // re = log1p(4a / ((1 - a)^2 + b^2)) / 4
+        let d = ((1.0 - a) * (1.0 - a)) + (b * b);
+        let mut re: f64 = 0.0;
+        if d == 0.0 {
+            re = math.inf();
+        } else {
+            re = 0.25 * math.log1p((4.0 * a) / d);
+        }
+        let im = 0.5 * math.atan2(2.0 * self.im, ((1.0 - a) * (1.0 + a)) - (b * b));
+        return Complex.{ re: @copysign(re, self.re), im: im };
+    }
+
+    /// Writes the number as `a+bi` or `a-bi`, with the shortest digits that
+    /// read back to the same parts.
+    pub fn format(self: Complex, w: io.Writer) !void {
+        let mut buf: [32]u8 = [0; 32];
+        w.write_all(fmt.format_float(buf[..], self.re)!)!;
+        if (self.im >= 0.0) or math.is_nan(self.im) {
+            w.write_all("+")!;
+        }
+        w.write_all(fmt.format_float(buf[..], self.im)!)!;
+        w.write_all("i")!;
+    }
+}
+
+// asinh of a real, without cancellation for negative x
+fn asinh_real(x: f64) f64 {
+    let a = @abs(x);
+    if a > 1.0e150 {
+        return @copysign(math.log(a) + math.LN2, x);
+    }
+    return @copysign(math.log1p(a + ((a * a) / (1.0 + @sqrt(1.0 + (a * a))))), x);
+}
+
+fn c(re: f64, im: f64) Complex {
+    return Complex.init(re, im);
+}
+
+// relative closeness in both parts
+fn close(a: Complex, b: Complex, tol: f64) bool {
+    let scale = @max(b.abs(), 1.0e-300);
+    return a.sub(b).abs() <= (tol * scale);
+}
+
+test "arithmetic" {
+    let z = c(3.0, 4.0);
+    @expect(z.abs() == 5.0);
+    @expect(z.norm() == 25.0);
+    @expect(z.conj().eq(c(3.0, -4.0)));
+    @expect(z.mul(c(1.0, -2.0)).eq(c(11.0, -2.0)));
+    @expect(c(11.0, -2.0).div(c(1.0, -2.0)).near(z, 1.0e-15));
+    @expect(c(1.0, 1.0).div(c(1.0e300, 1.0e300)).near(c(1.0e-300, 0.0), 1.0e-310));
+    @expect(c(1.0e300, 1.0e300).abs() == (1.0e300 * math.SQRT2));
+    @expect(z.recip().mul(z).near(c(1.0, 0.0), 1.0e-16));
+    @expect(c(0.0, 1.0).powi(2).eq(c(-1.0, 0.0)));
+    @expect(z.powi(-3).mul(z.powi(3)).near(c(1.0, 0.0), 1.0e-15));
+    @expect(Complex.polar(2.0, math.PI / 2.0).near(c(0.0, 2.0), 1.0e-15));
+    @expect(c(-1.0, 0.0).arg() == math.PI);
+    @expect(c(-1.0, -0.0).arg() == -math.PI);
+}
+
+test "elementary functions" {
+    // e^(i pi) = -1
+    @expect(c(0.0, math.PI).exp().near(c(-1.0, 0.0), 1.0e-15));
+    @expect(c(-4.0, 0.0).sqrt().eq(c(0.0, 2.0)));
+    @expect(c(-4.0, -0.0).sqrt().eq(c(0.0, -2.0)));
+    @expect(c(3.0, 4.0).sqrt().eq(c(2.0, 1.0)));
+    @expect(c(-3.0, 4.0).sqrt().eq(c(1.0, 2.0)));
+    @expect(c(1.0e308, 1.0e308).sqrt().is_nan() == false);
+    @expect(c(-1.0, 0.0).log().eq(c(0.0, math.PI)));
+    // values from Python's cmath
+    let zs: [10]Complex = [
+        c(0.5, 0.25), c(-1.5, 2.0), c(3.0, -0.75), c(-0.2, -0.9), c(1.0, 0.5), c(0.0, 2.0), c(2.0, 0.0), c(-3.0, 0.0),
+        c(0.0, -1.5), c(1e-09, 2e-09)];
+    let want: [10][30]f64 = [
+        [0.494485780933195, 0.22168816414957482, 0.9051501505596068, -0.12110879604381165, 0.504500702698564,
+         0.31242069250258875, 0.5016088532755008, 0.28139605624529274, 1.069187473519396, -0.28139605624529274,
+         0.4842544903299662, 0.20058661813123432, 0.504895714387995, 0.2789791283502615, 1.0925708047319176,
+         0.12892104172809826, 0.4854872810241353, 0.19805544995134958, 0.4926756834207706, 0.2243284526346675,
+         0.28139605624529274, 1.069187473519396, 0.5003700000525311, 0.3143981432077165, 1.5974665191199127,
+         0.4079001700783598, -0.5815754049028404, 0.4636476090008061, 0.7276733451126774, 0.17178037486125622],
+        [-3.752771340479298, 0.2565539560904818, 0.26612719531354573, 3.6177750739401375, -0.005362060922003057,
+         1.036920282100185, -0.6065115181997547, 1.6224941488715938, 2.1773078449946515, -1.6224941488715938,
+         -1.311223269671635, 0.3104282830771958, 0.8860929093625314, 2.139040009980677, -0.9789478196465577,
+         -1.936148329510507, -1.064144399176537, -0.08039101531016819, -1.6004100552346137, 0.887765146183905,
+         1.6224941488715938, 2.1773078449946515, -0.22008968066202295, 1.2452579660726568, -0.09285491028402633,
+         0.2028916804701695, 0.9162907318741551, 2.214297435588181, 0.7071067811865475, 1.4142135623730951],
+        [0.1827057155685717, 0.8140873944454715, -1.2817267373040948, 0.11604534383854799, -0.084349813883493,
+         -0.6427858400872473, 1.3126000435075036, -1.7984283835761978, 0.258196283287393, 1.7984283835761978,
+         1.2651884866374963, -0.0714891116210778, 7.329967574155963, -6.862508639136001, 7.366396217894588,
+         -6.828571843588534, 0.9996371610597968, -0.004943321841667708, 1.8445760096309898, -0.23347144902560832,
+         1.7984283835761978, -0.258196283287393, 0.32231759620945777, -1.4840849666574578, 14.69636379205055,
+         -13.691080482724535, 1.128924599576327, -0.24497866312686414, 1.745326505157881, -0.21485951132454598],
+        [-0.28471031316862117, -1.006054734461608, 1.404520069537655, -0.2039373909463806, -0.0966650215300775,
+         -0.7303337054385374, -0.1484650785139924, -0.8162893832975435, 1.719261405308889, 0.8162893832975435,
+         -0.6060128282621623, -1.0726148602870977, -0.12515246615131187, -0.7990457392928241, 0.6340836635943333,
+         0.15771190866726634, -0.48104769166579936, -1.1405100481233894, -0.36418633756944097, -1.0036644842544817,
+         0.8162893832975435, -1.719261405308889, -0.10984166494596143, -0.7438275474532278, 0.5089311974430214,
+         -0.6413338306255577, -0.08125946474888743, -1.7894652726688385, 0.6008138004944996, -0.748984127244793],
+        [0.948864531437168, 0.28154899513533443, 0.6092589091577942, -0.4384865798925953, 0.8068774121630852,
+         1.0428307283443612, 0.8959074812088902, 0.7328576759736453, 0.6748888455860064, -0.7328576759736453,
+         0.847575660670829, 0.23887786125685911, 1.0313360742545512, 0.7397922644560138, 1.3541806567045842,
+         0.5634214652309818, 0.8429662048457831, 0.19557731006593404, 0.9261330313501823, 0.3494390628572133,
+         0.7328576759736453, 0.6748888455860064, 0.708303336014054, 0.9078874949608804, 2.3855167309591354,
+         1.3032137296869954, 0.11157177565710488, 0.4636476090008061, 1.0290855136357462, 0.24293413587832283],
+        [0.0, 3.626860407847019, 3.7621956910836314, -0.0, 0.0, 0.9640275800758169, 0.0, 1.4436354751788103,
+         1.5707963267948966, -1.4436354751788103, 1.5707963267948966, 0.5493061443340549, -0.0, 0.9092974268256817,
+         -0.4161468365471424, 0.0, 0.0, -2.185039863261519, 1.3169578969248166, 1.5707963267948966, 1.4436354751788103,
+         1.5707963267948966, 0.0, 1.1071487177940904, -0.4161468365471424, 0.9092974268256817, 0.6931471805599453,
+         1.5707963267948966, 1.0, 1.0],
+        [0.9092974268256817, -0.0, -0.4161468365471424, -0.0, -2.185039863261519, 0.0, 1.5707963267948966,
+         1.3169578969248166, 0.0, -1.3169578969248166, 1.1071487177940904, 0.0, 3.626860407847019, 0.0,
+         3.7621956910836314, 0.0, 0.9640275800758169, 0.0, 1.4436354751788103, 0.0, 1.3169578969248166, 0.0,
+         0.5493061443340549, 1.5707963267948966, 7.38905609893065, 0.0, 0.6931471805599453, 0.0, 1.4142135623730951,
+         0.0],
+        [-0.1411200080598672, -0.0, -0.9899924966004454, 0.0, 0.1425465430742778, 0.0, -1.5707963267948966,
+         1.762747174039086, 3.141592653589793, -1.762747174039086, -1.2490457723982544, 0.0, -10.017874927409903, 0.0,
+         10.067661995777765, -0.0, -0.9950547536867305, 0.0, -1.8184464592320668, 0.0, 1.762747174039086,
+         3.141592653589793, -0.34657359027997264, 1.5707963267948966, 0.049787068367863944, 0.0, 1.0986122886681098,
+         3.141592653589793, 0.0, 1.7320508075688772],
+        [0.0, -2.1292794550948173, 2.352409615243247, 0.0, 0.0, -0.9051482536448664, 0.0, -1.1947632172871094,
+         1.5707963267948966, 1.1947632172871094, 1.5707963267948966, -0.8047189562170501, 0.0, -0.9974949866040544,
+         0.0707372016677029, -0.0, 0.0, -14.101419947171719, 0.9624236501192069, -1.5707963267948966,
+         1.1947632172871094, -1.5707963267948966, 0.0, -0.982793723247329, 0.0707372016677029, -0.9974949866040544,
+         0.4054651081081644, -1.5707963267948966, 0.8660254037844386, -0.8660254037844387],
+        [1e-09, 2e-09, 1.0, -2e-18, 1e-09, 1.9999999999999997e-09, 1e-09, 2e-09, 1.5707963257948965, -2e-09,
+         1.0000000000000003e-09, 2.0000000000000005e-09, 1e-09, 2e-09, 1.0, 2e-18, 1e-09, 2e-09, 1e-09,
+         2.0000000000000005e-09, 2e-09, 1.5707963257948965, 9.999999999999999e-10, 2e-09, 1.000000001,
+         2.0000000020000004e-09, -19.918546880729362, 1.1071487177940904, 4.022479320953552e-05, 2.486028939392892e-05],
+    ];
+    for k in @as(usize, 0)..10 {
+        let z = zs[k];
+        let got: [15]Complex = [z.sin(), z.cos(), z.tan(), z.asin(), z.acos(), z.atan(), z.sinh(), z.cosh(), z.tanh(),
+                                z.asinh(), z.acosh(), z.atanh(), z.exp(), z.log(), z.sqrt()];
+        for j in @as(usize, 0)..15 {
+            if not close(got[j], c(want[k][2 * j], want[k][(2 * j) + 1]), 4.0e-16) {
+                @expect_eq((k * 100) + j, 0);
+            }
+        }
+    }
+    // inverses and identities
+    let zz: [5]Complex = [c(0.3, 0.1), c(-2.0, 0.6), c(0.9, -0.01), c(5.0, 0.7), c(-0.5, -0.4)];
+    for z in zz {
+        @expect(close(z.sinh().asinh(), z, 1.0e-13));
+        @expect(close(z.cosh().acosh(), z.scale(@copysign(1.0, z.re)), 1.0e-12));
+        @expect(close(z.tanh().atanh(), z, 1.0e-12));
+        @expect(close(z.exp().log(), z, 1.0e-15));
+        @expect(close(z.sqrt().mul(z.sqrt()), z, 1.0e-15));
+        @expect(close(z.pow(c(0.5, 0.0)), z.sqrt(), 1.0e-15));
+        @expect(close(z.sin().mul(z.sin()).add(z.cos().mul(z.cos())), c(1.0, 0.0), 1.0e-12));
+    }
+    // large arguments do not overflow on the way
+    @expect(c(800.0, 0.5).tanh().near(c(1.0, 0.0), 1.0e-300));
+    @expect(c(0.5, 800.0).tan().near(c(0.0, 1.0), 1.0e-300));
+    @expect(close(c(709.9, 0.8).exp(), c(1.4083243747866555e+308, 1.4500650771141882e+308), 1.0e-14));
+    @expect(close(c(1.0e200, 1.0e200).asinh(), c(461.55673936964905, 0.7853981633974483), 1.0e-15));
+    @expect(close(c(1.0e300, -1.0e300).acos(), c(0.7853981633974483, 691.8152486690535), 1.0e-15));
+    @expect(close(c(1.0e300, 0.5).atanh(), c(1.0e-300, 1.5707963267948966), 1.0e-15));
+}
+
+test "format" {
+    let mut buf: [64]u8 = [0; 64];
+    let mut bw = io.BufferWriter.init(buf[..]);
+    c(1.5, -2.0).format(bw.writer())!;
+    c(0.1, 3.0).format(bw.writer())!;
+    @expect_eq(bw.written(), "1.5-2i0.1+3i");
+}
