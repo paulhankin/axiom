@@ -10,6 +10,7 @@ and a type that owns memory has `deinit`).
 | [`vec`](vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
 | [`arena`](arena.ph) | `Arena`: bump allocation freed all at once (`bytes`, `dup`, `copy[T]`), for parsed documents |
 | [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
+| [`xxhash`](xxhash.ph) | XXH32 and XXH64, one-shot and streaming (the checksums of LZ4 and Zstandard) |
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
 | [`set`](set.ph) | `Set[K]`: hash set with union, intersection and difference in place |
 | [`treemap`](treemap.ph) | `TreeMap[K, V]`: ordered map (AVL tree): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
@@ -46,6 +47,7 @@ and a type that owns memory has `deinit`).
 | [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies (HTTPS with `server_tls` / `Router.serve_tls`), `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`) for `http://` and `https://` URLs; percent-encoding |
 | [`tls`](tls.ph) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
 | [`deflate`](deflate.ph) | Compression and decompression: DEFLATE in the raw, zlib and gzip formats (levels 0–9, output within a fraction of a percent of zlib's size), whole-buffer (`compress`, `decompress`) or streaming (`Compressor` as an `io.Writer`, `Decompressor` as an `io.Reader`); `crc32`, `adler32` |
+| [`lz4`](lz4.ph) | LZ4: `decompress` (frames with any block size, linked blocks, checksums, content sizes; skippable and legacy frames; size-limited), `compress` (frames; levels 1–12 with hash chains), raw `compress_block`/`decompress_block`. Checked against the lz4 library ([`lz4/testdata`](lz4/testdata), from [`tools/gen_compress_tests.py`](../tools/gen_compress_tests.py)) |
 | [`zip`](zip.ph) | ZIP archives: `Archive.open` (central directory, ZIP64, comments, UTF-8 names), `extract` (stored and deflated; CRC and declared sizes enforced, so no zip bombs), `extract_all` (refuses zip-slip names and links), `safe_name`; `Writer` (deflate or store, Unix modes and times, ZIP64 when needed). Checked against Python's zipfile ([`zip/testdata`](zip/testdata), from [`tools/gen_archive_tests.py`](../tools/gen_archive_tests.py)) |
 | [`tar`](tar.ph) | tar archives: `Reader` (ustar with prefixes, pax extended and global headers, GNU long names and base-256 numbers, checksums verified), `extract_all` (safe names only), `Writer` (ustar, with pax records for long or non-ASCII names, big sizes and negative times). Checked against Python's tarfile in all three formats ([`tar/testdata`](tar/testdata)) |
 | [`base64`](base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets |
