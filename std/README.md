@@ -19,6 +19,7 @@ and a type that owns memory has `deinit`).
 | [`bitset`](bitset.ph) | `BitSet`: fixed-size sets of bits, `next_set`/`next_clear`, union/intersection |
 | [`rand`](rand.ph) | Seedable pseudo-random numbers (xoshiro256\*\*): integers in ranges without bias, floats, normal, exponential, Poisson and weighted choices, `shuffle`, `choose`, `jump` for parallel streams; not for secrets (see `crypto/random`) |
 | [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
+| [`linalg`](linalg.ph) | Linear algebra on `Matrix[f64]`: LU with partial pivoting (`solve`, `det`, `inverse`), Cholesky, Householder QR and least squares (`lstsq`), symmetric eigenproblems (Jacobi), the SVD (one-sided Jacobi), `rank`, `cond`, `norm`, `trace`. Checked against NumPy |
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
 | [`path`](path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |
 | [`fs`](fs.ph) | The file system: `read_file`, `write_file`, `append_file`, `copy_file`; `stat`/`lstat` (`Info`: kind, size, modification time, mode), `exists`; `mkdir`, `mkdir_all`, `remove`, `remove_all`, `rename`; `read_dir` (sorted), `walk`, `glob`; `cwd`, `absolute`, `temp_dir`, `make_temp_dir` |
