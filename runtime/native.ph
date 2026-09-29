@@ -401,6 +401,9 @@ export fn ph_arg(i: i32, buf: *mut u8, cap: usize) isize {
 // Copies environment variable name's value to buf; returns its length (-2
 // if it is not set).
 export fn ph_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    if @atomic_load(&env_blob) != 0 {
+        return env_get(@slice_from_ptr(name, len), buf, cap);
+    }
     let v = sys.getenv(@slice_from_ptr(name, len));
     if (v.len == 0) and (@int_from_ptr(v.ptr) == 0) {
         return -2;
@@ -1151,6 +1154,576 @@ export fn ph_notify32(p: *mut u32, count: i32) i32 {
         return 0;
     }
     return @truncate(i32, r);
+}
+
+// -----------------------------------------------------------------------------
+// Processes, the environment and signals
+// -----------------------------------------------------------------------------
+
+// The environment once the program has changed it: "K=V\0" entries in a
+// mapping of env_cap bytes (0 until the first change: then the initial
+// environment is read from the stack).
+let mut env_blob: usize = 0;
+let mut env_len: usize = 0;
+let mut env_cap: usize = 0;
+let mut env_lock: u32 = 0;
+
+fn lock_env() void {
+    while @atomic_cas(&mut env_lock, 0, 1) != 0 {
+        _ = ph_wait32(&mut env_lock, 1, -1);
+    }
+}
+
+fn unlock_env() void {
+    @atomic_store(&mut env_lock, 0);
+    _ = ph_notify32(&mut env_lock, 1);
+}
+
+fn env_bytes() []mut u8 {
+    return @slice_from_ptr(@ptr_from_int(*mut u8, env_blob), env_cap);
+}
+
+// Makes room for `more` bytes, copying the initial environment first.
+fn env_reserve(more: usize) bool {
+    if env_blob == 0 {
+        // the initial environment
+        let mut total: usize = 0;
+        let mut k: usize = 0;
+        loop {
+            let e = sys.env_entry(k);
+            if @int_from_ptr(e.ptr) == 0 {
+                break;
+            }
+            total += e.len + 1;
+            k += 1;
+        }
+        let cap = align_up(total + more + 4096, 4096);
+        let p = sys.mmap_anon(cap);
+        if p == 0 {
+            return false;
+        }
+        env_blob = p;
+        env_cap = cap;
+        env_len = 0;
+        let b = env_bytes();
+        k = 0;
+        loop {
+            let e = sys.env_entry(k);
+            if @int_from_ptr(e.ptr) == 0 {
+                break;
+            }
+            @mem_copy(b[env_len..env_len + e.len], e);
+            b[env_len + e.len] = 0;
+            env_len += e.len + 1;
+            k += 1;
+        }
+    }
+    if (env_len + more) <= env_cap {
+        return true;
+    }
+    let cap = align_up((env_len + more) * 2, 4096);
+    let p = sys.mmap_anon(cap);
+    if p == 0 {
+        return false;
+    }
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p), env_len), env_bytes()[..env_len]);
+    _ = sys.munmap(env_blob, env_cap);
+    env_blob = p;
+    env_cap = cap;
+    return true;
+}
+
+// The entry for name in the changed environment: where it starts and ends
+// (end == start: none).
+fn env_find(name: []u8, start: *mut usize, end: *mut usize) void {
+    let b = env_bytes();
+    let mut i: usize = 0;
+    while i < env_len {
+        let mut j = i;
+        while b[j] != 0 {
+            j += 1;
+        }
+        let e = b[i..j];
+        if (e.len > name.len) and (e[name.len] == '=') and @mem_eq(e[..name.len], name) {
+            start.* = i;
+            end.* = j + 1;
+            return;
+        }
+        i = j + 1;
+    }
+    start.* = 0;
+    end.* = 0;
+}
+
+fn env_remove(name: []u8) void {
+    let mut a: usize = 0;
+    let mut e: usize = 0;
+    env_find(name, &mut a, &mut e);
+    if e > a {
+        let b = env_bytes();
+        let n = env_len - e;
+        for k in @as(usize, 0)..n {
+            b[a + k] = b[e + k];
+        }
+        env_len -= e - a;
+    }
+}
+
+fn env_name_ok(name: []u8) bool {
+    if name.len == 0 {
+        return false;
+    }
+    for c in name {
+        if (c == '=') or (c == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+export fn ph_setenv(k: *u8, kn: usize, v: *u8, vn: usize) i32 {
+    let name = @slice_from_ptr(k, kn);
+    let value = @slice_from_ptr(v, vn);
+    if not env_name_ok(name) {
+        return PH_ERR;
+    }
+    for c in value {
+        if c == 0 {
+            return PH_ERR;
+        }
+    }
+    lock_env();
+    if not env_reserve(kn + vn + 2) {
+        unlock_env();
+        return PH_ERR;
+    }
+    env_remove(name);
+    let b = env_bytes();
+    @mem_copy(b[env_len..env_len + kn], name);
+    b[env_len + kn] = '=';
+    @mem_copy(b[env_len + kn + 1..env_len + kn + 1 + vn], value);
+    b[env_len + kn + 1 + vn] = 0;
+    env_len += kn + vn + 2;
+    unlock_env();
+    return 0;
+}
+
+export fn ph_unsetenv(k: *u8, kn: usize) i32 {
+    let name = @slice_from_ptr(k, kn);
+    if not env_name_ok(name) {
+        return PH_ERR;
+    }
+    lock_env();
+    if not env_reserve(0) {
+        unlock_env();
+        return PH_ERR;
+    }
+    env_remove(name);
+    unlock_env();
+    return 0;
+}
+
+// The whole environment, as "K=V\0" entries; returns its length.
+export fn ph_environ(buf: *mut u8, cap: usize) isize {
+    lock_env();
+    if not env_reserve(0) {
+        unlock_env();
+        return @as(isize, PH_ERR);
+    }
+    let n = env_len;
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), env_bytes()[..n]);
+    }
+    unlock_env();
+    return @bit_cast(isize, n);
+}
+
+// (getenv for the host ABI, after any changes)
+fn env_get(name: []u8, buf: *mut u8, cap: usize) isize {
+    lock_env();
+    let mut a: usize = 0;
+    let mut e: usize = 0;
+    env_find(name, &mut a, &mut e);
+    if e == a {
+        unlock_env();
+        return -2;
+    }
+    let v = env_bytes()[a + name.len + 1..e - 1];
+    if v.len <= cap {
+        @mem_copy(@slice_from_ptr(buf, v.len), v);
+    }
+    unlock_env();
+    return @bit_cast(isize, v.len);
+}
+
+export fn ph_getpid() i32 {
+    return sys.getpid();
+}
+
+export fn ph_chdir(path: *u8, len: usize) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return PH_ERR;
+    }
+    let r = sys.chdir(&buf[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+// The spec: argv strings, each ending in 0, then a 0; the environment
+// ("K=V" strings, each ending in 0), then a 0; then the directory to run in
+// (empty: this one). stdio[i] is 0 to inherit stream i, 1 for a pipe, 2 for
+// /dev/null; it is replaced by the pipe's handle, or -1.
+export fn ph_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
+    let s = @slice_from_ptr(spec, len);
+    let modes = @slice_from_ptr(stdio, 3);
+    // count the strings
+    let mut i: usize = 0;
+    let mut argc: usize = 0;
+    while (i < s.len) and (s[i] != 0) {
+        while (i < s.len) and (s[i] != 0) {
+            i += 1;
+        }
+        i += 1;
+        argc += 1;
+    }
+    i += 1;
+    let env_at = i;
+    let mut envc: usize = 0;
+    while (i < s.len) and (s[i] != 0) {
+        while (i < s.len) and (s[i] != 0) {
+            i += 1;
+        }
+        i += 1;
+        envc += 1;
+    }
+    i += 1;
+    if (argc == 0) or (i > s.len) {
+        return PH_ERR;
+    }
+    let cwd = s[i..];
+    // the pointer arrays, and room for the directory and the program's
+    // paths along $PATH, in one mapping
+    let ptrs = (argc + envc + 2) * @size_of(usize);
+    let room = align_up(ptrs + cwd.len + 1 + 65536, 4096);
+    let m = sys.mmap_anon(room);
+    if m == 0 {
+        return PH_ERR;
+    }
+    let argv = m;
+    let envp = m + ((argc + 1) * @size_of(usize));
+    let mut j: usize = 0;
+    for k in @as(usize, 0)..argc {
+        @ptr_from_int(*mut usize, argv + (k * @size_of(usize))).* = @int_from_ptr(spec) + j;
+        while s[j] != 0 {
+            j += 1;
+        }
+        j += 1;
+    }
+    @ptr_from_int(*mut usize, argv + (argc * @size_of(usize))).* = 0;
+    j = env_at;
+    let mut path_var = s[0..0];
+    for k in @as(usize, 0)..envc {
+        @ptr_from_int(*mut usize, envp + (k * @size_of(usize))).* = @int_from_ptr(spec) + j;
+        let st = j;
+        while s[j] != 0 {
+            j += 1;
+        }
+        if ((j - st) > 5) and @mem_eq(s[st..st + 5], "PATH=") {
+            path_var = s[st + 5..j];
+        }
+        j += 1;
+    }
+    @ptr_from_int(*mut usize, envp + (envc * @size_of(usize))).* = 0;
+    let extra = @slice_from_ptr(@ptr_from_int(*mut u8, m + ptrs), room - ptrs);
+    @mem_copy(extra[..cwd.len], cwd);
+    extra[cwd.len] = 0;
+    // the program: as given if it has a "/", else each directory of PATH
+    // in turn ("dir/prog\0" strings, then a 0)
+    let mut plen: usize = 0;
+    while s[plen] != 0 {
+        plen += 1;
+    }
+    let pname = s[..plen];
+    let cands = extra[cwd.len + 1..];
+    let mut c: usize = 0;
+    let mut has_slash = false;
+    for ch in pname {
+        if ch == '/' {
+            has_slash = true;
+        }
+    }
+    if has_slash {
+        @mem_copy(cands[..plen], pname);
+        cands[plen] = 0;
+        c = plen + 1;
+    } else {
+        let mut pv = path_var;
+        if pv.len == 0 {
+            pv = "/usr/local/bin:/usr/bin:/bin";
+        }
+        let mut a: usize = 0;
+        while a <= pv.len {
+            let mut b = a;
+            while (b < pv.len) and (pv[b] != ':') {
+                b += 1;
+            }
+            let mut dir = pv[a..b];
+            if dir.len == 0 {
+                dir = ".";
+            }
+            if (c + dir.len + plen + 2) < cands.len {
+                @mem_copy(cands[c..c + dir.len], dir);
+                cands[c + dir.len] = '/';
+                @mem_copy(cands[c + dir.len + 1..c + dir.len + 1 + plen], pname);
+                cands[c + dir.len + 1 + plen] = 0;
+                c += dir.len + plen + 2;
+            }
+            a = b + 1;
+        }
+    }
+    cands[c] = 0;
+    // the pipes: [ours, theirs] for each stream, and one for exec's error
+    let mut fds: [6]i32 = [-1, -1, -1, -1, -1, -1];
+    let mut err: [2]i32 = [-1, -1];
+    let mut ok = sys.pipe2(&mut err[0], 0x80000) >= 0;  // O_CLOEXEC
+    for k in @as(usize, 0)..3 {
+        if not ok {
+            break;
+        }
+        if modes[k] == 1 {
+            let mut p: [2]i32 = [-1, -1];
+            ok = sys.pipe2(&mut p[0], 0x80000) >= 0;
+            // stdin: the child reads; stdout and stderr: we read
+            if k == 0 {
+                fds[0] = p[1];
+                fds[1] = p[0];
+            } else {
+                fds[2 * k] = p[0];
+                fds[(2 * k) + 1] = p[1];
+            }
+        } else if modes[k] == 2 {
+            let mut dn: [10]u8 = [0; 10];
+            @mem_copy(dn[..9], "/dev/null");
+            let fd = sys.open(&dn[0], 2 | 0x80000, 0);  // O_RDWR | O_CLOEXEC
+            ok = fd >= 0;
+            fds[(2 * k) + 1] = @truncate(i32, fd);
+        }
+    }
+    let mut pid: isize = -1;
+    if ok {
+        pid = sys.fork();
+    }
+    if pid == 0 {
+        // the child: system calls only
+        for k in @as(usize, 0)..3 {
+            let fd = fds[(2 * k) + 1];
+            if fd >= 0 {
+                _ = sys.dup2(fd, @truncate(i32, @bit_cast(isize, k)));
+            }
+        }
+        _ = sys.sigdefault(13);  // SIGPIPE, which the parent may ignore
+        let mut e: isize = 0;
+        if cwd.len > 0 {
+            e = sys.chdir(&extra[0]);
+        }
+        if e >= 0 {
+            e = -sys.ENOENT;
+            let mut a: usize = 0;
+            while cands[a] != 0 {
+                let r = sys.execve(&cands[a], argv, envp);
+                // keep the most telling error (EACCES over ENOENT)
+                if (r != -sys.ENOENT) and (r != -sys.ENOTDIR) {
+                    e = r;
+                }
+                while cands[a] != 0 {
+                    a += 1;
+                }
+                a += 1;
+            }
+        }
+        let mut code: i32 = @truncate(i32, -e);
+        _ = sys.write(err[1], @ptr_cast(*u8, &code), 4);
+        sys.exit(127);
+    }
+    // the parent: close the child's ends, and learn whether exec worked
+    _ = sys.close(err[1]);
+    for k in @as(usize, 0)..3 {
+        if fds[(2 * k) + 1] >= 0 {
+            _ = sys.close(fds[(2 * k) + 1]);
+        }
+    }
+    let mut result: i32 = PH_ERR;
+    if pid > 0 {
+        let mut code: i32 = 0;
+        let mut got: isize = 0;
+        loop {
+            got = sys.read(err[0], @ptr_cast(*mut u8, &mut code), 4);
+            if not retry(got) {
+                break;
+            }
+        }
+        if got == 4 {
+            let mut st: i32 = 0;
+            _ = sys.wait4(@truncate(i32, pid), &mut st, 0);
+            result = PH_ERR;
+            if code == @truncate(i32, sys.ENOENT) {
+                result = -2;
+            } else if (code == @truncate(i32, sys.EACCES)) or (code == @truncate(i32, sys.EPERM)) {
+                result = -13;
+            }
+        } else {
+            result = @truncate(i32, pid);
+        }
+    }
+    if err[0] >= 0 {
+        _ = sys.close(err[0]);
+    }
+    for k in @as(usize, 0)..3 {
+        if (result >= 0) and (modes[k] == 1) {
+            modes[k] = fds[2 * k];
+        } else {
+            if fds[2 * k] >= 0 {
+                _ = sys.close(fds[2 * k]);
+            }
+            modes[k] = -1;
+        }
+    }
+    _ = sys.munmap(m, room);
+    return result;
+}
+
+// 0: still running (block 0); 1: exited, with *status its code; 2: killed
+// by signal *status.
+export fn ph_proc_wait(h: i32, block: u32, status: *mut i32) i32 {
+    let mut st: i32 = 0;
+    let mut opts: i32 = 1;  // WNOHANG
+    if block != 0 {
+        opts = 0;
+    }
+    loop {
+        let r = sys.wait4(h, &mut st, opts);
+        if retry(r) {
+            continue;
+        }
+        if r < 0 {
+            return PH_ERR;
+        }
+        if r == 0 {
+            return 0;
+        }
+        break;
+    }
+    if (st & 0x7f) == 0 {
+        status.* = (st >> 8) & 0xff;
+        return 1;
+    }
+    status.* = st & 0x7f;
+    return 2;
+}
+
+export fn ph_proc_kill(h: i32, sig: i32) i32 {
+    if sys.kill(h, sig) < 0 {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+export fn ph_pipe_read(h: i32, p: *mut u8, n: usize) isize {
+    loop {
+        let r = sys.read(h, p, n);
+        if retry(r) {
+            continue;
+        }
+        if r < 0 {
+            return @as(isize, PH_ERR);
+        }
+        return r;
+    }
+}
+
+export fn ph_pipe_write(h: i32, p: *u8, n: usize) isize {
+    ignore_sigpipe();
+    loop {
+        let r = sys.write(h, p, n);
+        if retry(r) {
+            continue;
+        }
+        if r < 0 {
+            return @as(isize, PH_ERR);
+        }
+        return r;
+    }
+}
+
+export fn ph_pipe_close(h: i32) void {
+    _ = sys.close(h);
+}
+
+// Writing to a pipe whose reader has gone should fail, not kill the program.
+let mut sigpipe_ignored: u32 = 0;
+
+fn ignore_sigpipe() void {
+    if @atomic_xchg(&mut sigpipe_ignored, 1) == 0 {
+        if sig_actions[13] != 2 {
+            _ = sys.sigignore(13);
+        }
+    }
+}
+
+// Signals the program catches: their bits, set by the handler; sig_seq is
+// bumped (and woken) on each.
+let mut sig_pending: u64 = 0;
+let mut sig_seq: u32 = 0;
+let mut sig_actions: [65]u8 = [0; 65];
+
+fn on_signal(sig: i32, si: *mut void, uc: *mut void) void {
+    _ = si;
+    _ = uc;
+    _ = @atomic_or(&mut sig_pending, @as(u64, 1) << @truncate(u64, @bit_cast(u64, @as(i64, sig))));
+    _ = @atomic_add(&mut sig_seq, 1);
+    _ = ph_notify32(&mut sig_seq, -1);
+}
+
+// action: 0 the default, 1 ignore, 2 catch (for ph_signal_take).
+export fn ph_signal(sig: i32, action: u32) i32 {
+    // not the ones the runtime uses, nor SIGKILL and SIGSTOP
+    if (((sig < 1) or (sig > 64)) or ((sig == 9) or (sig == 19))) or
+       (((sig == SIGSEGV) or (sig == SIGBUS)) or (sig == SIGFPE)) {
+        return PH_ERR;
+    }
+    let mut r: isize = 0;
+    if action == 0 {
+        r = sys.sigdefault(sig);
+    } else if action == 1 {
+        r = sys.sigignore(sig);
+    } else if action == 2 {
+        r = sys.sigaction(sig, on_signal, 4 | 0x1000_0000);  // SA_SIGINFO | SA_RESTART
+    } else {
+        return PH_ERR;
+    }
+    if r < 0 {
+        return PH_ERR;
+    }
+    sig_actions[@as(usize, @bit_cast(u32, sig))] = @truncate(u8, action);
+    return 0;
+}
+
+// The signals caught since the last call, as bits; waits up to timeout_ns
+// (-1: for ever) for one if there are none.
+export fn ph_signal_take(timeout_ns: i64) i64 {
+    loop {
+        let seq = @atomic_load(&sig_seq);
+        let got = @atomic_xchg(&mut sig_pending, 0);
+        if (got != 0) or (timeout_ns == 0) {
+            return @bit_cast(i64, got);
+        }
+        if ph_wait32(&mut sig_seq, seq, timeout_ns) == 2 {
+            return @bit_cast(i64, @atomic_xchg(&mut sig_pending, 0));
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -7,7 +7,9 @@
 // result in ctrl[1]; read data goes into `data`. Threads reach the worker
 // through MessagePorts sent with a 'port' message.
 import { parentPort } from 'worker_threads';
+import child_process from 'child_process';
 import net from 'net';
+import os from 'os';
 
 const handles = new Map();
 let nextHandle = 3;
@@ -37,8 +39,8 @@ function wake(st) {
   for (const w of ws) w();
 }
 
-function addSocket(sock) {
-  const st = { kind: 'sock', sock, chunks: [], ended: false, failed: false, waiters: [], timeout: 0 };
+function addSocket(sock, readOnly = false) {
+  const st = { kind: 'sock', sock, chunks: [], ended: false, failed: false, waiters: [], timeout: 0, readOnly };
   sock.on('data', (b) => { st.chunks.push(b); wake(st); });
   sock.on('end', () => { st.ended = true; wake(st); });
   sock.on('close', () => { st.ended = true; wake(st); });
@@ -140,12 +142,72 @@ const ops = {
       st.closed = true;
       st.srv.close();
       wake(st);
-    } else if (st) {
-      st.sock.end();
+    } else if (st && st.kind === 'sock') {
+      if (st.readOnly) st.sock.destroy();
+      else st.sock.end();
     }
     reply(req, 0);
   },
+  // Child processes (see ph_proc_spawn): the handle, and pipe handles in
+  // data as three i32s.
+  spawn(req, { argv, env, cwd, modes }) {
+    const out = new Int32Array(req.data, 0, 3);
+    out.fill(-1);
+    const stdio = modes.map((m, k) => (m === 1 ? 'pipe' : m === 2 ? 'ignore' : k));
+    let child;
+    try {
+      child = child_process.spawn(argv[0], argv.slice(1), { env, cwd: cwd || undefined, stdio });
+    } catch (e) {
+      return reply(req, spawnErr(e));
+    }
+    const st = { kind: 'proc', child, exited: false, code: 0, signal: 0, waiters: [] };
+    child.on('exit', (code, signal) => {
+      st.exited = true;
+      st.code = code === null ? 0 : code;
+      st.signal = signal ? os.constants.signals[signal] || 0 : 0;
+      wake(st);
+    });
+    child.once('error', (e) => { if (!st.started) reply(req, spawnErr(e)); });
+    child.once('spawn', () => {
+      st.started = true;
+      const h = nextHandle++;
+      handles.set(h, st);
+      const pipes = [child.stdin, child.stdout, child.stderr];
+      for (let k = 0; k < 3; k++) if (modes[k] === 1) out[k] = addSocket(pipes[k], k !== 0);
+      reply(req, h);
+    });
+  },
+  wait(req, { h, block }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'proc') return reply(req, ERR);
+    const out = new Int32Array(req.data, 0, 1);
+    const attempt = () => {
+      if (st.exited) {
+        handles.delete(h);
+        out[0] = st.signal || st.code;
+        reply(req, st.signal ? 2 : 1);
+      } else if (!block) {
+        reply(req, 0);
+      } else {
+        st.waiters.push(attempt);
+      }
+    };
+    attempt();
+  },
+  kill(req, { h, sig }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'proc') return reply(req, ERR);
+    reply(req, st.exited || st.child.kill(sig) ? 0 : ERR);
+  },
 };
+
+function spawnErr(e) {
+  switch (e && e.code) {
+    case 'ENOENT': return -2;
+    case 'EACCES': case 'EPERM': return -13;
+    default: return ERR;
+  }
+}
 
 function serve(port) {
   port.on('message', (m) => {

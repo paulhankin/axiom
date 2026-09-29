@@ -455,6 +455,80 @@ export function createHost(opts = {}) {
     ph_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ph_sock_close: (h) => { net().call('close', { h }); },
     ph_sock_timeout: (h, ms) => net().call('timeout', { h, ms: ms >>> 0 }),
+    // Processes and the environment. process.env and the directory are the
+    // calling thread's (node gives each worker its own copy of the
+    // environment, and only the main thread may change directory). Signals
+    // are not supported: node delivers them only to the main thread's event
+    // loop, which a running program does not return to.
+    ph_getpid: () => process.pid,
+    ph_chdir(p, n) {
+      try { process.chdir(str(p, n)); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_setenv(k, kn, v, vn) {
+      const name = str(k, kn), value = str(v, vn);
+      if (!name || name.includes('=') || name.includes('\0') || value.includes('\0')) return -1;
+      process.env[name] = value;
+      return 0;
+    },
+    ph_unsetenv(k, kn) {
+      const name = str(k, kn);
+      if (!name || name.includes('=') || name.includes('\0')) return -1;
+      delete process.env[name];
+      return 0;
+    },
+    ph_environ(p, cap) {
+      const b = Buffer.from(Object.entries(process.env).map(([k, v]) => `${k}=${v}\0`).join(''));
+      if (b.length <= cap >>> 0) bytes(p, b.length).set(b);
+      return b.length;
+    },
+    ph_proc_spawn(p, n, stdio) {
+      // argv and the environment (0-terminated strings, each list ending in
+      // an empty one), then the directory
+      const b = Buffer.from(bytes(p, n));
+      let i = 0;
+      const list = () => {
+        const xs = [];
+        while (i < b.length && b[i] !== 0) {
+          const j = b.indexOf(0, i);
+          xs.push(b.toString('utf8', i, j));
+          i = j + 1;
+        }
+        i++;
+        return xs;
+      };
+      const argv = list();
+      const envList = list();
+      const cwd = b.toString('utf8', Math.min(i, b.length));
+      const env = {};
+      for (const e of envList) {
+        const k = e.indexOf('=');
+        if (k > 0) env[e.slice(0, k)] = e.slice(k + 1);
+      }
+      const view = new Int32Array(memory.buffer, stdio >>> 0, 3);
+      const modes = Array.from(view);
+      const c = net();
+      const h = c.call('spawn', { argv, env, cwd, modes });
+      const got = new Int32Array(c.data.buffer, 0, 3);
+      for (let k = 0; k < 3; k++) view[k] = h >= 0 ? got[k] : -1;
+      return h;
+    },
+    ph_proc_wait(h, block, status) {
+      const c = net();
+      const r = c.call('wait', { h, block });
+      if (r > 0) new Int32Array(memory.buffer, status >>> 0, 1)[0] = new Int32Array(c.data.buffer, 0, 1)[0];
+      return r;
+    },
+    ph_proc_kill: (h, sig) => net().call('kill', { h, sig }),
+    ph_pipe_read(h, p, n) {
+      const c = net();
+      const got = c.call('read', { h, n: Math.min(n >>> 0, READ_CHUNK) });
+      if (got > 0) bytes(p, got).set(c.data.subarray(0, got));
+      return got;
+    },
+    ph_pipe_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
+    ph_pipe_close: (h) => { net().call('close', { h }); },
+    ph_signal: () => -2,  // unsupported
+    ph_signal_take: () => -1n,
     ph_thread_spawn(entry, arg, stackTop, exited) {
       // The new thread shares this program's sockets.
       const netPort = net().newPort();

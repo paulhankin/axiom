@@ -23,7 +23,8 @@ and a type that owns memory has `deinit`).
 | [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
 | [`path`](path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |
 | [`fs`](fs.ph) | The file system: `read_file`, `write_file`, `append_file`, `copy_file`; `stat`/`lstat` (`Info`: kind, size, modification time, mode), `exists`; `mkdir`, `mkdir_all`, `remove`, `remove_all`, `rename`; `read_dir` (sorted), `walk`, `glob`; `cwd`, `absolute`, `temp_dir`, `make_temp_dir` |
-| [`os`](os.ph) | The process: `args`/`arg`/`arg_count`, `getenv`/`has_env`, `exit` |
+| [`os`](os.ph) | The process: `args`/`arg`/`arg_count`, `getenv`/`has_env`/`setenv`/`unsetenv`/`environ`, `pid`, `cwd`/`chdir`, signals (`signal_catch`/`ignore`/`default`, `signal_poll`, `signal_wait`; not on the node host), `exit` |
+| [`process`](process.ph) | Child processes: `Command` (arguments, environment changes, directory, each stream inherited, piped or `/dev/null`), `spawn` → `Child` (`Pipe`s with readers and writers, `wait`, `try_wait`, `kill`), `output` (captured without deadlock), `status`, `run` |
 | [`log`](log.ph) | Structured logging: levels (`DEBUG`, `INFO`, `WARN`, `ERROR`), typed key-value fields, text (logfmt) or JSON lines, `Logger` with its own fields (`with`), a default logger (`log.info(...)`, `set_level`, `level_from_env`), size-rotated log files (`open_file`); whole lines, safe across threads |
 | [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
 | [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `Condvar` (with timeouts), `RwLock` (writer-preferring), `Semaphore`, `Once`, `Barrier`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |

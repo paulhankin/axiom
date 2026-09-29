@@ -1675,11 +1675,7 @@ a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 
 ### 15.2 Other modules and the host ABI
 
-The rest of the standard library (`vec`, `hash`, `map`, `matrix`, `io`, `path`, `fs`, `os`, `log`, `str`, `unicode`, `fmt`,
-`time`, `thread`, `sync`, `net`, `math`, `color`, `image` and its codecs, `draw`, `font`, `text`, `pdf`, `audio` and its codecs, `http`, `tls`, `json`, `markdown`, `regex`, `bigint`, `deflate`,
-`base64`, and the `crypto/` modules) is ordinary Phalange
-code; see
-`std/README.md`. It adds no language rules. Operating-system
+The rest of the standard library, listed in `std/README.md`, is ordinary Phalange code. It adds no language rules. Operating-system
 services are reached through host functions imported from module `"phalange"` (the
 *Phalange host ABI*). Implementations exist for node (`runtime/host.mjs`) and POSIX
 (`runtime/native_host.c` in C, `runtime/native.ph` in Phalange). A program that uses only the language and `std/mem`, `vec`,
@@ -1687,7 +1683,7 @@ services are reached through host functions imported from module `"phalange"` (t
 
 The Phalange runtime uses no C library. It reaches the kernel through system calls
 (`runtime/linux.ph`), starts threads with `clone` and sets up their thread-local
-storage itself, and resolves host names from `/etc/hosts` and by DNS queries to the
+storage itself, starts processes with `fork` and `execve` (searching `PATH` itself), and resolves host names from `/etc/hosts` and by DNS queries to the
 servers in `/etc/resolv.conf`. So a native program built by the self-hosted toolchain
 is a static executable with no dynamic loader, unless it links C code or libraries,
 in which case it is linked against the C library as before.

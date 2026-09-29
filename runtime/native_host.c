@@ -215,6 +215,216 @@ void ph_exit(int32_t code) {
     exit(code);
 }
 
+// -----------------------------------------------------------------------------
+// Processes, the environment and signals (see runtime/native.ph for the
+// contract of each)
+// -----------------------------------------------------------------------------
+
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+int32_t ph_getpid(void) { return (int32_t)getpid(); }
+
+int32_t ph_chdir(const uint8_t *path, size_t len) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
+    return chdir(buf) == 0 ? 0 : fs_err();
+}
+
+static int env_name_ok(const uint8_t *k, size_t n) {
+    if (n == 0) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (k[i] == '=' || k[i] == 0) return 0;
+    return 1;
+}
+
+int32_t ph_setenv(const uint8_t *k, size_t kn, const uint8_t *v, size_t vn) {
+    if (!env_name_ok(k, kn) || memchr(v, 0, vn)) return PH_ERR;
+    char *name = strndup((const char *)k, kn), *value = strndup((const char *)v, vn);
+    int r = name && value ? setenv(name, value, 1) : -1;
+    free(name);
+    free(value);
+    return r == 0 ? 0 : PH_ERR;
+}
+
+int32_t ph_unsetenv(const uint8_t *k, size_t kn) {
+    if (!env_name_ok(k, kn)) return PH_ERR;
+    char *name = strndup((const char *)k, kn);
+    int r = name ? unsetenv(name) : -1;
+    free(name);
+    return r == 0 ? 0 : PH_ERR;
+}
+
+intptr_t ph_environ(uint8_t *buf, size_t cap) {
+    size_t n = 0;
+    for (char **e = environ; e && *e; e++) {
+        size_t l = strlen(*e) + 1;
+        if (n + l <= cap) memcpy(buf + n, *e, l);
+        n += l;
+    }
+    return (intptr_t)n;
+}
+
+// Writing to a pipe whose reader has gone should fail, not kill the program.
+static uint8_t sig_actions[65];
+static void ignore_sigpipe(void) {
+    static int done;
+    if (!__atomic_exchange_n(&done, 1, __ATOMIC_SEQ_CST) && sig_actions[SIGPIPE] != 2) signal(SIGPIPE, SIG_IGN);
+}
+
+int32_t ph_proc_spawn(const uint8_t *spec, size_t len, int32_t *stdio) {
+    // argv, then the environment, each a list of 0-terminated strings ending
+    // in an empty one; then the directory
+    size_t i = 0, argc = 0, envc = 0;
+    while (i < len && spec[i]) { i += strnlen((const char *)spec + i, len - i) + 1; argc++; }
+    i++;
+    size_t env_at = i;
+    while (i < len && spec[i]) { i += strnlen((const char *)spec + i, len - i) + 1; envc++; }
+    i++;
+    if (argc == 0 || i > len) return PH_ERR;
+    char **argv = calloc(argc + 1, sizeof *argv), **envp = calloc(envc + 1, sizeof *envp);
+    char *cwd = strndup((const char *)spec + i, len - i);
+    const char *path_var = NULL;
+    int32_t result = PH_ERR;
+    int fds[6] = {-1, -1, -1, -1, -1, -1};
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&attr);
+    if (!argv || !envp || !cwd) goto out;
+    i = 0;
+    for (size_t k = 0; k < argc; k++) { argv[k] = (char *)spec + i; i += strlen(argv[k]) + 1; }
+    i = env_at;
+    for (size_t k = 0; k < envc; k++) {
+        envp[k] = (char *)spec + i;
+        if (!strncmp(envp[k], "PATH=", 5)) path_var = envp[k] + 5;
+        i += strlen(envp[k]) + 1;
+    }
+    for (int k = 0; k < 3; k++) {
+        if (stdio[k] == 1) {
+            int p[2];
+            if (pipe2(p, O_CLOEXEC)) goto out;
+            fds[2 * k] = k == 0 ? p[1] : p[0];
+            fds[2 * k + 1] = k == 0 ? p[0] : p[1];
+            posix_spawn_file_actions_adddup2(&fa, fds[2 * k + 1], k);
+        } else if (stdio[k] == 2) {
+            posix_spawn_file_actions_addopen(&fa, k, "/dev/null", O_RDWR, 0);
+        }
+    }
+    if (*cwd) posix_spawn_file_actions_addchdir_np(&fa, cwd);
+    sigset_t def;
+    sigemptyset(&def);
+    sigaddset(&def, SIGPIPE);
+    posix_spawnattr_setsigdefault(&attr, &def);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
+    pid_t pid = -1;
+    int err = ENOENT;
+    if (strchr(argv[0], '/')) {
+        err = posix_spawn(&pid, argv[0], &fa, &attr, argv, envp);
+    } else {
+        // each directory of the child's PATH in turn
+        const char *pv = path_var && *path_var ? path_var : "/usr/local/bin:/usr/bin:/bin";
+        char cand[4096];
+        for (const char *a = pv;; ) {
+            const char *b = strchr(a, ':');
+            size_t dl = b ? (size_t)(b - a) : strlen(a);
+            int n = snprintf(cand, sizeof cand, "%.*s/%s", (int)(dl ? dl : 1), dl ? a : ".", argv[0]);
+            if (n > 0 && (size_t)n < sizeof cand) {
+                int e = posix_spawn(&pid, cand, &fa, &attr, argv, envp);
+                if (e == 0) { err = 0; break; }
+                if (e != ENOENT && e != ENOTDIR) err = e;
+            }
+            if (!b) break;
+            a = b + 1;
+        }
+    }
+    if (err == 0) result = (int32_t)pid;
+    else result = err == ENOENT ? -2 : (err == EACCES || err == EPERM) ? -13 : PH_ERR;
+out:
+    for (int k = 0; k < 3; k++) {
+        if (fds[2 * k + 1] >= 0) close(fds[2 * k + 1]);
+        if (result >= 0 && stdio[k] == 1) {
+            stdio[k] = fds[2 * k];
+        } else {
+            if (fds[2 * k] >= 0) close(fds[2 * k]);
+            stdio[k] = -1;
+        }
+    }
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    free(argv);
+    free(envp);
+    free(cwd);
+    return result;
+}
+
+int32_t ph_proc_wait(int32_t h, uint32_t block, int32_t *status) {
+    int st = 0;
+    pid_t r;
+    do r = waitpid(h, &st, block ? 0 : WNOHANG);
+    while (r < 0 && errno == EINTR);
+    if (r < 0) return PH_ERR;
+    if (r == 0) return 0;
+    if (WIFEXITED(st)) { *status = WEXITSTATUS(st); return 1; }
+    *status = WTERMSIG(st);
+    return 2;
+}
+
+int32_t ph_proc_kill(int32_t h, int32_t sig) { return kill(h, sig) == 0 ? 0 : PH_ERR; }
+
+intptr_t ph_pipe_read(int32_t h, uint8_t *p, size_t n) {
+    ssize_t r;
+    do r = read(h, p, n);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : (intptr_t)r;
+}
+
+intptr_t ph_pipe_write(int32_t h, const uint8_t *p, size_t n) {
+    ignore_sigpipe();
+    ssize_t r;
+    do r = write(h, p, n);
+    while (r < 0 && errno == EINTR);
+    return r < 0 ? PH_ERR : (intptr_t)r;
+}
+
+void ph_pipe_close(int32_t h) { close(h); }
+
+static uint64_t sig_pending;
+static uint32_t sig_seq;
+
+static void on_signal(int sig) {
+    __atomic_fetch_or(&sig_pending, (uint64_t)1 << sig, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&sig_seq, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &sig_seq, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL, NULL, 0);
+}
+
+int32_t ph_signal(int32_t sig, uint32_t action) {
+    if (sig < 1 || sig > 64 || sig == SIGKILL || sig == SIGSTOP || sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE)
+        return PH_ERR;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    if (action == 0) sa.sa_handler = SIG_DFL;
+    else if (action == 1) sa.sa_handler = SIG_IGN;
+    else if (action == 2) { sa.sa_handler = on_signal; sa.sa_flags = SA_RESTART; }
+    else return PH_ERR;
+    if (sigaction(sig, &sa, NULL)) return PH_ERR;
+    sig_actions[sig] = (uint8_t)action;
+    return 0;
+}
+
+int64_t ph_signal_take(int64_t timeout_ns) {
+    for (;;) {
+        uint32_t seq = __atomic_load_n(&sig_seq, __ATOMIC_SEQ_CST);
+        uint64_t got = __atomic_exchange_n(&sig_pending, 0, __ATOMIC_SEQ_CST);
+        if (got || timeout_ns == 0) return (int64_t)got;
+        struct timespec ts = {timeout_ns / 1000000000, timeout_ns % 1000000000};
+        long r = syscall(SYS_futex, &sig_seq, FUTEX_WAIT_PRIVATE, seq, timeout_ns < 0 ? NULL : &ts, NULL, 0);
+        if (r < 0 && errno == ETIMEDOUT) return (int64_t)__atomic_exchange_n(&sig_pending, 0, __ATOMIC_SEQ_CST);
+    }
+}
+
 static int resolve(const uint8_t *name, size_t len, uint32_t port, int passive, struct addrinfo **res) {
     char host[256], serv[16];
     if (copy_cstr(host, sizeof host, name, len)) return PH_BAD_ADDRESS;

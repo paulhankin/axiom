@@ -89,6 +89,9 @@ let SYS_RENAMEAT2: [2]i64 = [316, 276];
 let SYS_GETDENTS64: [2]i64 = [217, 61];
 let SYS_GETCWD: [2]i64 = [79, 17];
 let SYS_LSEEK: [2]i64 = [8, 62];
+let SYS_EXECVE: [2]i64 = [59, 221];
+let SYS_CHDIR: [2]i64 = [80, 49];
+let SYS_KILL: [2]i64 = [62, 129];
 
 fn nr(t: [2]i64) i64 {
     if phalange_target_arch() == 2 {
@@ -375,6 +378,18 @@ pub fn wait4(pid: i32, status: *mut i32, options: i32) isize {
     return sys4(SYS_WAIT4, si(pid), @int_from_ptr(status), si(options), 0);
 }
 
+pub fn execve(path: *u8, argv: usize, envp: usize) isize {
+    return sys3(SYS_EXECVE, @int_from_ptr(path), argv, envp);
+}
+
+pub fn chdir(path: *u8) isize {
+    return sys1(SYS_CHDIR, @int_from_ptr(path));
+}
+
+pub fn kill(pid: i32, sig: i32) isize {
+    return sys2(SYS_KILL, si(pid), si(sig));
+}
+
 pub fn pipe2(fds: *mut i32, flags: i32) isize {
     return sys2(SYS_PIPE2, @int_from_ptr(fds), si(flags));
 }
@@ -473,6 +488,33 @@ pub fn arg_count() usize {
         return @ptr_from_int(*usize, sp).*;
     }
     return main_argc;
+}
+
+// Entry k ("NAME=value") of the environment the program started with, or
+// an empty slice with a 0 pointer past the last.
+pub fn env_entry(k: usize) []u8 {
+    let none = @slice_from_ptr(@ptr_from_int(*u8, 0), 0);
+    let sp = ph_start_sp();
+    let mut e: usize = 0;
+    if sp != 0 {
+        let argc = @ptr_from_int(*usize, sp).*;
+        e = sp + ((argc + 2) * @size_of(usize));
+    } else if main_argv != 0 {
+        e = main_argv + ((main_argc + 1) * @size_of(usize));
+    } else {
+        return none;
+    }
+    for _i in @as(usize, 0)..k {
+        if @ptr_from_int(*usize, e).* == 0 {
+            return none;
+        }
+        e += @size_of(usize);
+    }
+    let p = @ptr_from_int(*usize, e).*;
+    if p == 0 {
+        return none;
+    }
+    return @slice_from_ptr(@ptr_from_int(*u8, p), cstr_len(p));
 }
 
 // The value of environment variable `name`, or nosym (a 0 pointer) if unset.
