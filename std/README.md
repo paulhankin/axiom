@@ -75,6 +75,7 @@ and a type that owns memory has `deinit`).
 | [`decimal`](decimal.ph) | `Decimal`: arbitrary-precision decimal numbers (a `BigInt` times a power of ten) — exact `add`, `sub`, `mul`; `div` and `sqrt` to a precision; `quantize`, `round`, `round_sig` with seven rounding modes; `cmp`, `normalize`; parsing and Python's string format; bounded against hostile exponents. Checked against Python's `decimal` ([`decimal/testdata`](decimal/testdata)) |
 | [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
 | [`diff`](diff.ph) | Differences between texts (or token sequences) by Myers's algorithm in linear space, minimal but bounded on pathological input as in GNU diff; `lines`, `tokens`, `unified` (byte-for-byte `diff -u` format, `\ No newline at end of file` included), `apply` (strict patching). Patches applied by GNU `patch` |
+| [`template`](template.ph) | Mustache templates over `json.Value` data: escaped and raw interpolation, dotted names, sections, inverted sections, comments, partials, set-delimiter tags, standalone-line rules; compile once and render often. Passes the 136 tests of the Mustache specification's required modules ([`template/testdata`](template/testdata)); safe for untrusted templates |
 
 Image files are read and written by `std/image/`:
 
