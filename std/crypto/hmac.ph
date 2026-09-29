@@ -144,3 +144,11 @@ test "hkdf (RFC 5869 case 1)" {
     @expect_eq(okm[..], unhex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
                               want[..]));
 }
+
+test "hmac-sha1 (rfc 2202)" {
+    let mut out: [20]u8 = [0; 20];
+    hmac(sha2.SHA1, "Jefe", "what do ya want for nothing?", out[..]);
+    let want: [20]u8 = [0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74, 0x16, 0xd5, 0xf1, 0x84, 0xdf, 0x9c,
+                        0x25, 0x9a, 0x7c, 0x79];
+    @expect_eq(out[..], want[..]);
+}

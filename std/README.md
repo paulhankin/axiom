@@ -83,11 +83,17 @@ time where secrets are involved):
 | Module | Contents |
 |---|---|
 | [`crypto/random`](crypto/random.ph) | Secure random bytes from the operating system: `fill`, `uint64`, `below` |
-| [`crypto/sha2`](crypto/sha2.ph) | SHA-256, SHA-384, SHA-512; a `Hasher` over any of them |
+| [`crypto/sha2`](crypto/sha2.ph) | SHA-256, SHA-384, SHA-512; a `Hasher` over any of them (and SHA-1) |
+| [`crypto/sha1`](crypto/sha1.ph) | SHA-1, for protocols that require it (WebSocket, HMAC-SHA1 in TOTP); not for new signatures |
+| [`crypto/sha3`](crypto/sha3.ph) | SHA3-224/256/384/512 and SHAKE128/256 (Keccak) |
+| [`crypto/blake2`](crypto/blake2.ph) | BLAKE2b and BLAKE2s, keyed or not, any digest size |
+| [`crypto/kdf`](crypto/kdf.ph) | Password-based key derivation: PBKDF2 (over any `Hasher`), scrypt |
+| [`crypto/argon2`](crypto/argon2.ph) | Argon2id, Argon2i, Argon2d (RFC 9106); PHC strings (`hash_encoded`, `verify_encoded`) |
 | [`crypto/md5`](crypto/md5.ph) | MD5, for formats that use it as a checksum (not for security) |
 | [`crypto/hmac`](crypto/hmac.ph) | HMAC; HKDF (`extract`, `expand`) |
-| [`crypto/subtle`](crypto/subtle.ph) | Constant-time comparison |
-| [`crypto/aes_gcm`](crypto/aes_gcm.ph) | AES-128/256 and AES-GCM (`seal`, `open`) |
+| [`crypto/subtle`](crypto/subtle.ph) | Constant-time comparison; `zero` for secrets |
+| [`crypto/aes_gcm`](crypto/aes_gcm.ph) | AES-128/192/256 (encryption and decryption) and AES-GCM (`seal`, `open`) |
+| [`crypto/aes`](crypto/aes.ph) | AES in CBC (PKCS#7 padding, checked in constant time) and CTR modes, for formats that need them |
 | [`crypto/chacha20poly1305`](crypto/chacha20poly1305.ph) | ChaCha20, Poly1305 and their AEAD |
 | [`crypto/curve25519`](crypto/curve25519.ph) | X25519 key agreement and Ed25519 signatures |
 | [`crypto/ec`](crypto/ec.ph) | P-256 and P-384: ECDH and ECDSA |

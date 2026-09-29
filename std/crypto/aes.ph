@@ -1,0 +1,244 @@
+// =============================================================================
+// std/crypto/aes.ph - AES block encryption in CBC and CTR modes (NIST SP
+// 800-38A), for compatibility with formats that use them.
+//
+// Neither mode authenticates: an attacker can change the ciphertext
+// undetected. For new designs use AES-GCM (aes_gcm) or ChaCha20-Poly1305.
+// CBC decryption of attacker-controlled data with a padding error visible to
+// them is the classic padding-oracle hole: check a MAC over the ciphertext
+// first (encrypt-then-MAC).
+//
+//     let c = aes.Cipher.init(key)!;                // 16, 24 or 32 bytes
+//     let n = aes.cbc_encrypt(&c, iv, plain, out)!;  // PKCS#7 padded
+//     let p = aes.cbc_decrypt(&c, iv, ct, out)!;
+//     aes.ctr_xor(&c, counter_block, data, out);    // encrypt = decrypt
+//
+// The AES implementation is aes_gcm's constant-time one.
+// =============================================================================
+
+import "aes_gcm.ph" as gcm;
+
+error { InvalidLength, InvalidPadding, NoSpaceLeft }
+
+pub struct Cipher {
+    aes: gcm.Aes,
+
+    /// A cipher for a 16-, 24- or 32-byte key.
+    pub fn init(key: []u8) !Cipher {
+        let a = gcm.Aes.init(key) catch return error.InvalidLength;
+        return Cipher.{ aes: a };
+    }
+
+    /// Encrypts one 16-byte block.
+    pub fn encrypt_block(self: *Cipher, input: []u8, out: []mut u8) void {
+        @store(out[..16], self.aes.encrypt_block(@load(u8x16, input[..16])));
+    }
+
+    /// Decrypts one 16-byte block.
+    pub fn decrypt_block(self: *Cipher, input: []u8, out: []mut u8) void {
+        @store(out[..16], self.aes.decrypt_block(@load(u8x16, input[..16])));
+    }
+}
+
+/// The CBC ciphertext length for n bytes of plaintext (with PKCS#7 padding:
+/// always at least one byte of it).
+pub fn cbc_len(n: usize) usize {
+    return ((n / 16) + 1) * 16;
+}
+
+/// Encrypts plain with CBC and PKCS#7 padding into out (cbc_len(plain.len)
+/// bytes); returns the ciphertext. The IV (16 bytes) must be unpredictable.
+pub fn cbc_encrypt(c: *Cipher, iv: []u8, plain: []u8, out: []mut u8) ![]u8 {
+    if iv.len != 16 {
+        return error.InvalidLength;
+    }
+    let n = cbc_len(plain.len);
+    if out.len < n {
+        return error.NoSpaceLeft;
+    }
+    let mut prev = @load(u8x16, iv);
+    let mut i: usize = 0;
+    while i < n {
+        let mut blk: [16]u8 = [0; 16];
+        if (i + 16) <= plain.len {
+            @mem_copy(blk[..], plain[i..i + 16]);
+        } else {
+            let rest = plain.len - i;
+            @mem_copy(blk[..rest], plain[i..]);
+            @mem_set(blk[rest..], @truncate(u8, 16 - rest));
+        }
+        prev = c.aes.encrypt_block(@load(u8x16, blk[..]) ^ prev);
+        @store(out[i..i + 16], prev);
+        i += 16;
+    }
+    return out[..n];
+}
+
+/// Decrypts CBC ciphertext and checks and removes the PKCS#7 padding;
+/// returns the plaintext in out (at least ct.len bytes).
+pub fn cbc_decrypt(c: *Cipher, iv: []u8, ct: []u8, out: []mut u8) ![]u8 {
+    let raw = cbc_decrypt_raw(c, iv, ct, out)!;
+    // check the padding without branching on its bytes
+    let pad = raw[raw.len - 1];
+    let mut bad: u32 = @as(u32, @truncate(u8, (@as(u32, pad) -% 1) >> 31));  // pad == 0
+    bad |= (16 -% @as(u32, pad)) >> 31;  // pad > 16
+    for k in @as(usize, 1)..17 {
+        // bytes within the padding must equal it
+        let inside = (@as(u32, @truncate(u8, k)) -% (@as(u32, pad) +% 1)) >> 31;  // k <= pad
+        let differs = @as(u32, raw[raw.len - k] ^ pad);
+        bad |= inside & ((0 -% differs) >> 31);
+    }
+    if bad != 0 {
+        return error.InvalidPadding;
+    }
+    return raw[..raw.len - @as(usize, pad)];
+}
+
+/// Decrypts CBC ciphertext (whole blocks) without looking at padding.
+pub fn cbc_decrypt_raw(c: *Cipher, iv: []u8, ct: []u8, out: []mut u8) ![]u8 {
+    if (iv.len != 16) or (ct.len == 0) or ((ct.len % 16) != 0) {
+        return error.InvalidLength;
+    }
+    if out.len < ct.len {
+        return error.NoSpaceLeft;
+    }
+    let mut prev = @load(u8x16, iv);
+    let mut i: usize = 0;
+    while i < ct.len {
+        let cur = @load(u8x16, ct[i..i + 16]);
+        @store(out[i..i + 16], c.aes.decrypt_block(cur) ^ prev);
+        prev = cur;
+        i += 16;
+    }
+    return out[..ct.len];
+}
+
+/// XORs data with the CTR keystream starting at the 16-byte counter block
+/// (incremented as a 128-bit big-endian number) into out. Never reuse a
+/// counter value with the same key.
+pub fn ctr_xor(c: *Cipher, counter: []u8, data: []u8, out: []mut u8) void {
+    let mut ctr: [16]u8 = [0; 16];
+    @mem_copy(ctr[..], counter[..16]);
+    let mut i: usize = 0;
+    let mut ks: [16]u8 = [0; 16];
+    while i < data.len {
+        @store(ks[..], c.aes.encrypt_block(@load(u8x16, ctr[..])));
+        let n = @min(16, data.len - i);
+        for k in @as(usize, 0)..n {
+            out[i + k] = data[i + k] ^ ks[k];
+        }
+        i += n;
+        let mut j: usize = 16;
+        while j > 0 {
+            j -= 1;
+            ctr[j] +%= 1;
+            if ctr[j] != 0 {
+                break;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn unhex(s: []u8, out: []mut u8) []mut u8 {
+    for i in @as(usize, 0)..s.len / 2 {
+        out[i] = (hv(s[2 * i]) << 4) | hv(s[(2 * i) + 1]);
+    }
+    return out[..s.len / 2];
+}
+
+fn hv(c: u8) u8 {
+    if c <= '9' {
+        return c - '0';
+    }
+    return (c - 'a') + 10;
+}
+
+test "block decryption inverts encryption" {
+    let mut kb: [32]u8 = [0; 32];
+    for n in [@as(usize, 16), 24, 32]{
+        for i in @as(usize, 0)..n {
+            kb[i] = @truncate(u8, (i * 37) + n);
+        }
+        let c = Cipher.init(kb[..n])!;
+        let mut b: [16]u8 = [0; 16];
+        let mut e: [16]u8 = [0; 16];
+        let mut d: [16]u8 = [0; 16];
+        for t in @as(usize, 0)..50 {
+            for i in @as(usize, 0)..16 {
+                b[i] = @truncate(u8, (t * 131) + (i * 7));
+            }
+            c.encrypt_block(b[..], e[..]);
+            c.decrypt_block(e[..], d[..]);
+            @expect_eq(d[..], b[..]);
+        }
+    }
+}
+
+test "sp 800-38a and padding" {
+    let mut kb: [32]u8 = [0; 32];
+    let mut pb: [64]u8 = [0; 64];
+    let mut wb: [80]u8 = [0; 80];
+    let mut out: [80]u8 = [0; 80];
+    let c = Cipher.init(unhex("2b7e151628aed2a6abf7158809cf4f3c", kb[..]))!;
+    let iv: [16]u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let pt =
+        unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
+              pb[..]);
+    let raw = cbc_encrypt(&c, iv[..], pt, out[..])!;
+    // the first 64 bytes are the standard's; 16 more of padding follow
+    @expect_eq(raw[..64],
+               unhex("7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b273bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7",
+                     wb[..]));
+    let mut back: [80]u8 = [0; 80];
+    @expect_eq(cbc_decrypt(&c, iv[..], raw, back[..])!, pt);
+    let ctr: [16]u8 = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff];
+    ctr_xor(&c, ctr[..], pt, out[..64]);
+    @expect_eq(out[..64],
+               unhex("874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee",
+                     wb[..]));
+    // AES-192 (SP 800-38A F.1.3)
+    let c3 = Cipher.init(unhex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b", kb[..]))!;
+    c3.encrypt_block(pt[..16], out[..16]);
+    @expect_eq(out[..16], unhex("bd334f1d6e45f25ff712a214571fa5cc", wb[..]));
+    // AES-256, a short message, and a counter that wraps
+    for i in @as(usize, 0)..32 {
+        kb[i] = @truncate(u8, i);
+    }
+    let c2 = Cipher.init(kb[..32])!;
+    let ct = cbc_encrypt(&c2, iv[..], "attack at dawn!!!", out[..])!;
+    @expect_eq(ct, unhex("3563589f5a947b4cb90b00c2435e7cede7d2a9c483a728ac5ae1a81e39abde3b", wb[..]));
+    @expect_eq(cbc_decrypt(&c2, iv[..], ct, back[..])!, "attack at dawn!!!");
+    let ff: [16]u8 = [0xff; 16];
+    let xs: [40]u8 = ['x'; 40];
+    ctr_xor(&c2, ff[..], xs[..], out[..40]);
+    @expect_eq(out[..40], unhex("91e19c6534df08a22bff690325f72f968ae878ce5231e7a8d18be212a5560ff888250ed632c1e79d",
+                                wb[..]));
+    // bad padding and lengths
+    let mut tampered: [32]u8 = [0; 32];
+    @mem_copy(tampered[..], ct);
+    tampered[31] ^= 1;
+    @expect(fails(cbc_decrypt(&c2, iv[..], tampered[..], back[..])));
+    @expect(fails(cbc_decrypt(&c2, iv[..], ct[..20], back[..])));
+    @expect(fails(cbc_decrypt(&c2, iv[..8], ct, back[..])));
+    // raw decryption of a block whose last byte is 0 or 17 fails as padding
+    let zero: [16]u8 = [0; 16];
+    let mut enc: [16]u8 = [0; 16];
+    let mut chain: [16]u8 = [0; 16];
+    c2.encrypt_block(zero[..], enc[..]);  // with a zero IV, decrypts to zero
+    @expect(fails(cbc_decrypt(&c2, chain[..], enc[..], back[..])));
+    chain[15] = 17;
+    @expect(fails(cbc_decrypt(&c2, chain[..], enc[..], back[..])));
+    chain[15] = 16;  // sixteen 16s would be needed: only the last is
+    @expect(fails(cbc_decrypt(&c2, chain[..], enc[..], back[..])));
+    @mem_set(chain[..], 16);
+    @expect_eq(cbc_decrypt(&c2, chain[..], enc[..], back[..])!.len, 0);
+}
+
+fn fails(r: ![]u8) bool {
+    _ = r catch return true;
+    return false;
+}

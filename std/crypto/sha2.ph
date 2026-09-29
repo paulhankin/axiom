@@ -10,6 +10,8 @@
 // run time, for code (HMAC, HKDF, TLS) that works with several.
 // =============================================================================
 
+import "sha1.ph" as sha1;
+
 let K256: [64]u32 = [
     0x428a2f98,
     0x71374491,
@@ -439,19 +441,21 @@ pub fn sha512(data: []u8, out: []mut u8) void {
 pub const SHA256: u8 = 1;
 pub const SHA384: u8 = 2;
 pub const SHA512: u8 = 3;
+pub const SHA1: u8 = 4;  // for protocols that need it (HMAC-SHA1): see sha1.ph
 
 /// One of the functions above, chosen at run time.
 pub struct Hasher {
     kind: u8,
     s256: Sha256,
     s512: Sha512,
+    s1: sha1.Sha1,
 
     pub fn init(kind: u8) Hasher {
         let mut s = Sha512.init();
         if kind == SHA384 {
             s = Sha512.init384();
         }
-        return Hasher.{ kind: kind, s256: Sha256.init(), s512: s };
+        return Hasher.{ kind: kind, s256: Sha256.init(), s512: s, s1: sha1.Sha1.init() };
     }
 
     /// The digest size in bytes.
@@ -460,14 +464,16 @@ pub struct Hasher {
     }
 
     pub fn block_size(self: *Hasher) usize {
-        if self.kind == SHA256 {
+        if (self.kind == SHA256) or (self.kind == SHA1) {
             return 64;
         }
         return 128;
     }
 
     pub fn update(self: *mut Hasher, data: []u8) void {
-        if self.kind == SHA256 {
+        if self.kind == SHA1 {
+            self.s1.update(data);
+        } else if self.kind == SHA256 {
             self.s256.update(data);
         } else {
             self.s512.update(data);
@@ -476,7 +482,9 @@ pub struct Hasher {
 
     /// Writes size() bytes to out.
     pub fn final(self: *mut Hasher, out: []mut u8) void {
-        if self.kind == SHA256 {
+        if self.kind == SHA1 {
+            self.s1.final(out);
+        } else if self.kind == SHA256 {
             self.s256.final(out);
         } else {
             self.s512.final(out);
@@ -488,6 +496,7 @@ pub fn digest_size(kind: u8) usize {
     match kind {
         1    => { return 32; }
         2    => { return 48; }
+        4    => { return 20; }
         else => { return 64; }
     }
 }

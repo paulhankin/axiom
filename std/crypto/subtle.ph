@@ -20,6 +20,11 @@ pub fn is_zero32(x: u32) u32 {
     return @truncate(u32, (@as(u64, x) -% 1) >> 63);
 }
 
+/// Overwrites a secret with zeros (before its memory is freed or reused).
+pub fn zero(b: []mut u8) void {
+    @mem_set(b, 0);
+}
+
 test "equal" {
     @expect(equal("abc", "abc"));
     @expect(not equal("abc", "abd"));
