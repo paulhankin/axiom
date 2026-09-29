@@ -28,6 +28,14 @@ static const char *display_path(const char *real) {
     if (!std_real[0] && g_std_dir && !realpath(g_std_dir, std_real)) std_real[0] = 0;
     size_t m = strlen(std_real);
     if (m && strncmp(real, std_real, m) == 0 && real[m] == '/') return arena_printf("std/%s", real + m + 1);
+    // ... and the runtime next to it as runtime/<path>, so that symbol names
+    // (prefixed with the display path) are the same from any directory
+    const char *slash = m ? strrchr(std_real, '/') : NULL;
+    if (slash) {
+        size_t k = (size_t)(slash - std_real);
+        if (strncmp(real, std_real, k) == 0 && strncmp(real + k, "/runtime/", 9) == 0)
+            return arena_printf("runtime/%s", real + k + 9);
+    }
     size_t n = strlen(g_cwd);
     if (n && strncmp(real, g_cwd, n) == 0 && real[n] == '/') return real + n + 1;
     return real;

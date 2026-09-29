@@ -19,7 +19,7 @@ const READ_CHUNK = 1 << 16;
 export const TRAP_NAMES = [
   'trap', 'index out of bounds', 'integer overflow', 'division by zero', 'int_cast out of range',
   'memory access out of bounds', 'length precondition failed', 'invalid union tag', 'stack exhausted',
-  'invalid function pointer', 'misaligned atomic access', 'expectation failed',
+  'invalid function pointer', 'misaligned atomic access', 'expectation failed', 'memory error',
 ];
 
 export function trapCodeName(n) { return 'T' + String(n).padStart(4, '0'); }

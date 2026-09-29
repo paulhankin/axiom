@@ -43,6 +43,7 @@ static void usage(void) {
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
             "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n"
+            "  --sanitize=address|none  check heap accesses: use after free, overflows, double frees, leaks\n"
             "  --units=module|program   compile modules separately (cached) or as one unit\n"
             "                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
 }
@@ -705,6 +706,8 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
         else if (!strcmp(a, "--stack-traces=on")) co.stack_traces = true;
         else if (!strcmp(a, "--stack-traces=off")) co.stack_traces = false;
+        else if (!strcmp(a, "--sanitize=address")) co.sanitize_address = true;
+        else if (!strcmp(a, "--sanitize=none")) co.sanitize_address = false;
         else if (!strcmp(a, "--units=module")) units_mode = 1;
         else if (!strcmp(a, "--units=program")) units_mode = 0;
         else if (!strcmp(a, "--verbose")) verbose = true;
@@ -772,6 +775,8 @@ int main(int argc, char **argv) {
         const char *rtp = arena_printf("%s/../runtime/rt.ph", std_path);
         if (file_exists(rtp)) vec_push(pkg_files, (char *)rtp);
     }
+    // --sanitize=address checks accesses with std/mem.ph's shadow memory
+    if (co.sanitize_address) vec_push(pkg_files, (char *)arena_printf("%s/mem.ph", std_path));
     SemaOptions so = {.std_dir = std_path,
                       .extra_files = (const char *const *)pkg_files.data,
                       .n_extra_files = pkg_files.len};
@@ -874,7 +879,7 @@ int main(int argc, char **argv) {
     } else {
         co.out_path = out;
     }
-    collect_link_names();
+    collect_link_names(&co);
     // Separate compilation (spec §16.7) applies to executables; --emit of a
     // single object/IR/assembly file is always one unit.
     bool separate = final_link && (units_mode >= 0 ? units_mode == 1 : co.opt_level <= 1);

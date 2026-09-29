@@ -203,6 +203,35 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
 }
 
+// The address sanitizer (spec §16.8): the programs in tests/sanitize/ are
+// built with --sanitize=address. Each states its exit status ("// status: N",
+// or "trap" for T0012) and lines its stderr must contain ("// stderr: ...");
+// "// status: 0" programs must not report anything.
+for (const f of files(path.join(root, 'tests/sanitize'))) {
+  const name = path.relative(root, f) + ' [--sanitize=address]';
+  if (filter && !name.includes(filter)) continue;
+  const src = fs.readFileSync(f, 'utf8');
+  const st = (src.match(/^\/\/ status: (\w+)/m) || [null, '0'])[1];
+  const wants = [...src.matchAll(/^\/\/ stderr: (.+)$/gm)].map((m) => m[1].trim());
+  const out = path.join(tmp, 'asan-' + path.basename(f, '.ph') + (native ? '' : '.wasm'));
+  const b = spawnSync(compiler, ['build', f, '--sanitize=address', '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags],
+    { encoding: 'utf8' });
+  let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
+  if (!problem) {
+    const r = native ? spawnExe(out, [], { encoding: 'utf8' })
+      : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+    if (st === 'trap') {
+      if (r.status === 0 || !/trap T0012 \(memory error\)/.test(r.stderr)) problem = `expected trap T0012, got status ${r.status}:\n${r.stderr}`;
+    } else if (r.status !== Number(st)) {
+      problem = `expected status ${st}, got ${r.status} ${r.signal || ''}:\n${r.stderr}`;
+    }
+    if (!problem && st === '0' && /AddressSanitizer/.test(r.stderr)) problem = `unexpected report:\n${r.stderr}`;
+    for (const w of wants) if (!problem && !r.stderr.includes(w)) problem = `stderr lacks "${w}":\n${r.stderr}`;
+  }
+  if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+  else { pass++; console.log(`ok   ${name}`); }
+}
+
 // Profiling (spec §16.6).
 {
   const name = 'tests/profile/hot.ph [phalange profile]';
@@ -227,7 +256,7 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   }
 }
 
-// Separate compilation (spec §16.7): the object cache is reused and
+// Separate compilation (spec §16.8): the object cache is reused and
 // invalidated along imports, and cached objects stay correct when the
 // program's error codes are renumbered.
 {

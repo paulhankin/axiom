@@ -80,6 +80,7 @@ fn options_id(o: *cg.CgOptions) []u8 {
     b.s(u.pick(o.overflow_saturate, "|1", "|0"));
     b.s(u.pick(o.stack_traces, "|1", "|0"));
     b.s(u.pick(o.profile, "|1", "|0"));
+    b.s(u.pick(o.sanitize_address, "|1", "|0"));
     b.s(u.pick(cg.g_test_mode, "|1", "|0"));
     b.s("|");
     b.s(u.idec(o.emit));

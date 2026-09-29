@@ -170,6 +170,8 @@ struct thread_start {
 
 void ph_install_crash_stack(void);
 
+int32_t ph_notify32(uint32_t *p, int32_t count);
+
 static void *thread_main(void *p) {
     struct thread_start st = *(struct thread_start *)p;
     free(p);

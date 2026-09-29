@@ -142,7 +142,7 @@ pub fn call_at(ss: *ShadowStack, i: u32) *Site {
 pub fn trap_name(code: u32) []u8 {
     let names = ["trap", "index out of bounds", "integer overflow", "division by zero", "int_cast out of range",
                  "memory access out of bounds", "length precondition failed", "invalid union tag", "stack exhausted",
-                 "invalid function pointer", "misaligned atomic access", "expectation failed"];
+                 "invalid function pointer", "misaligned atomic access", "expectation failed", "memory error"];
     if code < @int_cast(u32, names.len) {
         return names[@as(usize, code)];
     }

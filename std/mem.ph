@@ -646,10 +646,662 @@ fn large_resize(p: usize, size: usize) bool {
 }
 
 // -----------------------------------------------------------------------------
+// The address sanitizer (phalange build --sanitize=address, spec §16.8)
+//
+// When @sanitize_address() is true, every allocation gets a 64-byte header
+// in front (its size, links in a list of live allocations, where it was
+// made) and a redzone of at least 32 bytes behind it, and shadow memory
+// records which heap bytes may be used: one byte per 8 bytes of heap, 0 if
+// all 8 may, k (1-7) if the first k may, or a poison kind. The compiler
+// checks every access through a pointer or slice against it (asan_check).
+// Freed memory stays poisoned in a quarantine (64 MiB) before it is really
+// freed, so that late uses of it are caught; frees are checked; and at exit
+// (asan_exit) the allocations never freed are reported as leaks.
+// -----------------------------------------------------------------------------
+
+const AS_HDR: usize = 64;
+const AS_RZ: usize = 32;
+const AS_QUARANTINE: usize = 64 << 20;
+const AS_SITES: usize = 3;
+const SH_LEFT: u8 = 0xfa;   // a header (the left redzone)
+const SH_RIGHT: u8 = 0xfb;  // the right redzone
+const SH_FREED: u8 = 0xfd;  // freed memory
+const MAGIC_ALIVE: u64 = 0x4153_414E_A11C_E5ED;
+const MAGIC_DEAD: u64 = 0x4153_414E_DEAD_F4EE;
+
+let mut as_lock_word: u32 = 0;
+let mut as_ready: bool = false;
+let mut as_base: usize = 0;              // the first 64 KiB page tracked
+let mut as_l1: [4096]usize = [0; 4096];  // page tables: 4096 x 4096 pages (1 TiB)
+let mut as_meta: usize = 0;              // [as_meta, as_meta_end): zeroed memory for tables
+let mut as_meta_end: usize = 0;
+let mut as_live: usize = 0;     // the newest live allocation's header
+let mut as_q_first: usize = 0;  // the quarantine, oldest first
+let mut as_q_last: usize = 0;
+let mut as_q_bytes: usize = 0;
+let mut as_ignoring: u32 = 0;      // leaks_ignored depth
+let mut as_live_bytes: usize = 0;  // requested bytes of live allocations
+
+// The header's fields (u64 on every target).
+fn hfield(raw: usize, i: usize) *mut u64 {
+    return @ptr_from_int(*mut u64, raw + (8 * i));
+}
+
+const H_MAGIC: usize = 0;
+const H_SIZE: usize = 1;
+const H_PREV: usize = 2;
+const H_NEXT: usize = 3;
+const H_SITE: usize = 4;   // 4, 5, 6: innermost call sites outside this module
+const H_FLAGS: usize = 7;  // 1: not a leak
+
+fn as_enter() void {
+    if multi {
+        lock(&mut as_lock_word);
+    }
+}
+
+fn as_leave() void {
+    if multi {
+        unlock(&mut as_lock_word);
+    }
+}
+
+/// Zeroed memory for shadow tables, taken straight from the system.
+fn as_meta_alloc(bytes: usize) usize {
+    if (as_meta + bytes) > as_meta_end {
+        let prev = @memory_grow(1) catch return 0;
+        as_meta = prev * PAGE;
+        as_meta_end = as_meta + PAGE;
+    }
+    let r = as_meta;
+    as_meta += bytes;
+    return r;
+}
+
+/// The shadow byte of addr, or 0 if its page is not tracked (and make is
+/// false, or memory ran out).
+fn as_shadow(addr: usize, make: bool) usize {
+    let rel = (addr >> 16) -% as_base;
+    if rel >= (1 << 24) {
+        return 0;
+    }
+    let mut l2 = as_l1[rel >> 12];
+    if l2 == 0 {
+        if not make {
+            return 0;
+        }
+        l2 = as_meta_alloc(4096 * 8);
+        if l2 == 0 {
+            return 0;
+        }
+        as_l1[rel >> 12] = l2;
+    }
+    let slot = hfield(l2, rel & 4095);
+    let mut sp = @truncate(usize, slot.*);
+    if sp == 0 {
+        if not make {
+            return 0;
+        }
+        sp = as_meta_alloc(PAGE / 8);
+        if sp == 0 {
+            return 0;
+        }
+        slot.* = @as(u64, sp);
+    }
+    return sp + ((addr & (PAGE - 1)) >> 3);
+}
+
+fn sbyte(s: usize) *mut u8 {
+    return @ptr_from_int(*mut u8, s);
+}
+
+/// Sets the shadow of [addr, addr + len), both multiples of 8, to v.
+fn as_set(addr: usize, len: usize, v: u8) void {
+    let mut a = addr;
+    while a < (addr + len) {
+        let s = as_shadow(a, true);
+        if s != 0 {
+            sbyte(s).* = v;
+        }
+        a += 8;
+    }
+}
+
+/// Marks size bytes at addr (a multiple of 8) usable.
+fn as_unpoison(addr: usize, size: usize) void {
+    as_set(addr, size & ~@as(usize, 7), 0);
+    if (size & 7) != 0 {
+        let s = as_shadow(addr + (size & ~@as(usize, 7)), true);
+        if s != 0 {
+            sbyte(s).* = @truncate(u8, size & 7);
+        }
+    }
+}
+
+/// Whether size bytes at addr may be used; if not, reports why (the
+/// compiler then traps with T0012 at the access).
+pub fn asan_check(addr: usize, size: usize) bool {
+    if (size == 0) or not as_ready {
+        return true;
+    }
+    let s = as_shadow(addr, false);
+    if s != 0 {
+        if (sbyte(s).* == 0) and (((addr & 7) + size) <= 8) {
+            return true;
+        }
+    } else if ((addr & (PAGE - 1)) + size) <= PAGE {
+        return true;  // not heap memory
+    }
+    return as_check_slow(addr, size);
+}
+
+fn as_check_slow(addr: usize, size: usize) bool {
+    let end = addr +% size;
+    if end < addr {
+        as_report_access(addr, size, addr, SH_RIGHT);
+        return false;
+    }
+    let mut a = addr & ~@as(usize, 7);
+    while a < end {
+        let s = as_shadow(a, false);
+        if s == 0 {
+            a = (a | (PAGE - 1)) +% 1;  // the next page
+            if a == 0 {
+                return true;
+            }
+            continue;
+        }
+        let v = sbyte(s).*;
+        if v != 0 {
+            // the bytes of this granule the access uses: [lo, hi)
+            let lo = @max(a, addr) - a;
+            let hi = @min(a + 8, end) - a;
+            if (v >= 8) or (hi > @as(usize, v)) {
+                let mut bad = a + @max(lo, @as(usize, v));
+                if v >= 8 {
+                    bad = a + lo;
+                }
+                as_report_access(addr, size, bad, v);
+                return false;
+            }
+        }
+        a += 8;
+    }
+    return true;
+}
+
+/// The header of the allocation whose redzones or body contain addr, or 0.
+fn as_find(addr: usize) usize {
+    let mut a = addr & ~@as(usize, 7);
+    let limit = a -% (16 << 20);
+    // back over the body (and right redzone) to the header
+    loop {
+        let s = as_shadow(a, false);
+        if (s == 0) or (a == limit) {
+            return 0;
+        }
+        if sbyte(s).* == SH_LEFT {
+            break;
+        }
+        a -= 8;
+    }
+    // back to the header's start
+    loop {
+        let s = as_shadow(a - 8, false);
+        if (s == 0) or (sbyte(s).* != SH_LEFT) {
+            break;
+        }
+        a -= 8;
+    }
+    // a hit in a left redzone may be after the header's start: headers are
+    // exactly AS_HDR bytes, aligned to 16, so step back to one
+    let m = hfield(a, H_MAGIC).*;
+    if (m == tag(MAGIC_ALIVE, a)) or (m == tag(MAGIC_DEAD, a)) {
+        return a;
+    }
+    return 0;
+}
+
+// --- reports ------------------------------------------------------------------
+
+struct AsSite {
+    code: u32,
+    file_id: u32,
+    start: u32,
+    end: u32,
+    line: u32,
+    col: u32,
+    file: *u8,
+    text: *u8,
+    fn_: *u8,
+    callee: *u8,
+}
+
+struct AsStack {
+    depth: u32,
+    errors: u32,
+    calls: [256]*AsSite,
+}
+
+extern "C" {
+    fn phalange_shadow_stack() *AsStack;
+}
+
+import host "phalange" {
+    fn ph_write(fd: i32, p: *u8, n: usize) isize;
+}
+
+/// Messages to stderr, built in a fixed buffer.
+struct AsOut {
+    buf: [1024]u8,
+    n: usize,
+
+    fn s(self: *mut AsOut, t: []u8) void {
+        for c in t {
+            if self.n == self.buf.len {
+                self.flush();
+            }
+            self.buf[self.n] = c;
+            self.n += 1;
+        }
+    }
+
+    fn dec(self: *mut AsOut, v: u64) void {
+        let mut d: [20]u8 = [0; 20];
+        let mut i: usize = 20;
+        let mut x = v;
+        loop {
+            i -= 1;
+            d[i] = '0' + @truncate(u8, x % 10);
+            x = x / 10;
+            if x == 0 {
+                break;
+            }
+        }
+        self.s(d[i..]);
+    }
+
+    fn hex(self: *mut AsOut, v: u64) void {
+        let digits = "0123456789abcdef";
+        self.s("0x");
+        let mut started = false;
+        let mut k: u32 = 64;
+        while k > 0 {
+            k -= 4;
+            let dgt = @truncate(usize, (v >> k) & 15);
+            if (dgt != 0) or started or (k == 0) {
+                self.buf[self.n] = digits[dgt];
+                self.n += 1;
+                if self.n == self.buf.len {
+                    self.flush();
+                }
+                started = true;
+            }
+        }
+    }
+
+    fn cs(self: *mut AsOut, p: *u8) void {
+        let mut a = @int_from_ptr(p);
+        if a == 0 {
+            return;
+        }
+        while @ptr_from_int(*u8, a).* != 0 {
+            let one: [1]u8 = [@ptr_from_int(*u8, a).*];
+            self.s(one[..]);
+            a += 1;
+        }
+    }
+
+    fn flush(self: *mut AsOut) void {
+        _ = ph_write(2, &self.buf[0], self.n);
+        self.n = 0;
+    }
+}
+
+fn is_mem_site(site: *AsSite) bool {
+    let f = @int_from_ptr(site.file);
+    if f == 0 {
+        return false;
+    }
+    let want = "std/mem.ph";
+    for i in 0..want.len {
+        if @ptr_from_int(*u8, f + i).* != want[i] {
+            return false;
+        }
+    }
+    return @ptr_from_int(*u8, f + want.len).* == 0;
+}
+
+/// Records where an allocation is made: the innermost call sites outside
+/// this module.
+fn as_record_sites(raw: usize) void {
+    as_record_sites_at(raw + (8 * H_SITE));
+}
+
+/// AS_SITES call sites (u64 each) at `at`.
+fn as_record_sites_at(at: usize) void {
+    let ss = phalange_shadow_stack();
+    let mut k: usize = 0;
+    if @int_from_ptr(ss) != 0 {
+        let mut i = @as(usize, @min(ss.depth, 256));
+        while (i > 0) and (k < AS_SITES) {
+            i -= 1;
+            let site = ss.calls[i];
+            if (@int_from_ptr(site) != 0) and not is_mem_site(site) {
+                hfield(at, k).* = @as(u64, @int_from_ptr(site));
+                k += 1;
+            }
+        }
+    }
+    while k < AS_SITES {
+        hfield(at, k).* = 0;
+        k += 1;
+    }
+}
+
+fn as_print_sites(o: *mut AsOut, raw: usize, what: []u8) void {
+    as_print_sites_at(o, raw + (8 * H_SITE), what);
+}
+
+/// The sites recorded where a freed allocation's right redzone starts.
+fn as_free_sites(raw: usize) usize {
+    let n = @truncate(usize, hfield(raw, H_SIZE).*);
+    return (raw + AS_HDR) + ((n + 7) & ~@as(usize, 7));
+}
+
+fn as_print_sites_at(o: *mut AsOut, at: usize, what: []u8) void {
+    if hfield(at, 0).* == 0 {
+        return;
+    }
+    o.s(what);
+    o.s(":\n");
+    for k in 0..AS_SITES {
+        let a = @truncate(usize, hfield(at, k).*);
+        if a == 0 {
+            break;
+        }
+        let site = @ptr_from_int(*AsSite, a);
+        o.s("  at ");
+        o.cs(site.fn_);
+        o.s(" (");
+        o.cs(site.file);
+        o.s(":");
+        o.dec(@as(u64, site.line));
+        o.s(":");
+        o.dec(@as(u64, site.col));
+        o.s(")\n");
+    }
+}
+
+fn as_report_access(addr: usize, size: usize, bad: usize, v: u8) void {
+    let mut o = AsOut.{ buf: [0; 1024], n: 0 };
+    o.s("phalange: AddressSanitizer: ");
+    if v == SH_FREED {
+        o.s("heap-use-after-free");
+    } else {
+        o.s("heap-buffer-overflow");
+    }
+    o.s(": ");
+    o.dec(@as(u64, size));
+    o.s("-byte access at ");
+    o.hex(@as(u64, addr));
+    let raw = as_find(bad);
+    if raw != 0 {
+        let p = raw + AS_HDR;
+        let n = @truncate(usize, hfield(raw, H_SIZE).*);
+        o.s(": ");
+        if bad < p {
+            o.dec(@as(u64, p - bad));
+            o.s(" bytes before");
+        } else if bad >= (p + n) {
+            o.dec(@as(u64, bad - (p + n)));
+            o.s(" bytes after the end of");
+        } else {
+            o.dec(@as(u64, bad - p));
+            o.s(" bytes inside");
+        }
+        o.s(" a ");
+        o.dec(@as(u64, n));
+        o.s("-byte allocation at ");
+        o.hex(@as(u64, p));
+        let dead = hfield(raw, H_MAGIC).* == tag(MAGIC_DEAD, raw);
+        if dead {
+            o.s(", freed");
+        }
+        o.s("\n");
+        if dead {
+            as_print_sites_at(&mut o, as_free_sites(raw), "freed");
+        }
+        as_print_sites(&mut o, raw, "allocated");
+    } else {
+        o.s("\n");
+    }
+    o.flush();
+}
+
+fn as_report_free(p: usize, size: usize, what: []u8, raw: usize) void {
+    let mut o = AsOut.{ buf: [0; 1024], n: 0 };
+    o.s("phalange: AddressSanitizer: ");
+    o.s(what);
+    o.s(" of ");
+    o.dec(@as(u64, size));
+    o.s(" bytes at ");
+    o.hex(@as(u64, p));
+    if raw != 0 {
+        o.s(" (a ");
+        o.dec(hfield(raw, H_SIZE).*);
+        o.s("-byte allocation)\n");
+        if hfield(raw, H_MAGIC).* == tag(MAGIC_DEAD, raw) {
+            as_print_sites_at(&mut o, as_free_sites(raw), "first freed");
+        }
+        as_print_sites(&mut o, raw, "allocated");
+    } else {
+        o.s("\n");
+    }
+    o.flush();
+}
+
+// --- allocation -------------------------------------------------------------
+
+fn as_total(size: usize) usize {
+    return (AS_HDR + ((size + 7) & ~@as(usize, 7))) + AS_RZ;
+}
+
+fn asan_alloc(size: usize) usize {
+    if size == 0 {
+        return 0;
+    }
+    as_enter();
+    if not as_ready {
+        as_base = @memory_size();
+        as_ready = true;
+    }
+    let total = as_total(size);
+    let raw = alloc_slow(total);
+    if raw == 0 {
+        as_leave();
+        return 0;
+    }
+    let p = raw + AS_HDR;
+    let body = (size + 7) & ~@as(usize, 7);
+    as_set(raw, AS_HDR, SH_LEFT);
+    as_unpoison(p, size);
+    as_set(p + body, total - (AS_HDR + body), SH_RIGHT);
+    hfield(raw, H_MAGIC).* = tag(MAGIC_ALIVE, raw);
+    hfield(raw, H_SIZE).* = @as(u64, size);
+    hfield(raw, H_PREV).* = 0;
+    hfield(raw, H_NEXT).* = @as(u64, as_live);
+    if as_live != 0 {
+        hfield(as_live, H_PREV).* = @as(u64, raw);
+    }
+    as_live = raw;
+    as_live_bytes += size;
+    hfield(raw, H_FLAGS).* = 0;
+    if as_ignoring > 0 {
+        hfield(raw, H_FLAGS).* = 1;
+    }
+    as_record_sites(raw);
+    as_leave();
+    return p;
+}
+
+/// Checks that p and size are an allocation that may be freed; reports and
+/// traps (T0012) if not.
+fn as_check_free(p: usize, size: usize) void {
+    let raw = p -% AS_HDR;
+    let s = as_shadow(raw, false);
+    let ok_place = ((p & 15) == 0) and (s != 0) and (sbyte(s).* == SH_LEFT) and (as_shadow(p - 8, false) != 0);
+    if ok_place {
+        let m = hfield(raw, H_MAGIC).*;
+        if m == tag(MAGIC_DEAD, raw) {
+            as_report_free(p, size, "double free", raw);
+            @memory_error();
+        }
+        if m == tag(MAGIC_ALIVE, raw) {
+            if hfield(raw, H_SIZE).* != @as(u64, size) {
+                as_report_free(p, size, "free with the wrong size", raw);
+                @memory_error();
+            }
+            return;
+        }
+    }
+    as_report_free(p, size, "free of memory that was not allocated", 0);
+    @memory_error();
+}
+
+fn asan_free(p: usize, size: usize) void {
+    if size == 0 {
+        return;
+    }
+    as_enter();
+    as_check_free(p, size);
+    let raw = p - AS_HDR;
+    // out of the live list
+    let prev = @truncate(usize, hfield(raw, H_PREV).*);
+    let next = @truncate(usize, hfield(raw, H_NEXT).*);
+    if prev != 0 {
+        hfield(prev, H_NEXT).* = @as(u64, next);
+    } else {
+        as_live = next;
+    }
+    if next != 0 {
+        hfield(next, H_PREV).* = @as(u64, prev);
+    }
+    hfield(raw, H_MAGIC).* = tag(MAGIC_DEAD, raw);
+    as_live_bytes -= size;
+    as_set(p, (size + 7) & ~@as(usize, 7), SH_FREED);
+    as_record_sites_at(as_free_sites(raw));
+    // into the quarantine; the oldest out of it
+    hfield(raw, H_NEXT).* = 0;
+    if as_q_last != 0 {
+        hfield(as_q_last, H_NEXT).* = @as(u64, raw);
+    } else {
+        as_q_first = raw;
+    }
+    as_q_last = raw;
+    as_q_bytes += as_total(size);
+    while as_q_bytes > AS_QUARANTINE {
+        let old = as_q_first;
+        let n = as_total(@truncate(usize, hfield(old, H_SIZE).*));
+        as_q_first = @truncate(usize, hfield(old, H_NEXT).*);
+        if as_q_first == 0 {
+            as_q_last = 0;
+        }
+        as_q_bytes -= n;
+        free_slow(old, n);
+    }
+    as_leave();
+}
+
+fn asan_realloc(p: usize, old: usize, size: usize) usize {
+    if old == 0 {
+        return asan_alloc(size);
+    }
+    if size == 0 {
+        asan_free(p, old);
+        return 0;
+    }
+    as_enter();
+    as_check_free(p, old);
+    as_leave();
+    // always moves, so that stale pointers to the old memory are caught
+    let q = asan_alloc(size);
+    if q == 0 {
+        return 0;
+    }
+    let n = @min(old, size);
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, q), n), @slice_from_ptr(@ptr_from_int(*u8, p), n));
+    asan_free(p, old);
+    return q;
+}
+
+/// Leak checking: allocations made while this is on (calls nest) are not
+/// reported as leaks at exit, for memory kept on purpose until the program
+/// ends (a cache in a global, say). Does nothing without --sanitize=address.
+pub fn leaks_ignored(on: bool) void {
+    if not @sanitize_address() {
+        return;
+    }
+    as_enter();
+    if on {
+        as_ignoring += 1;
+    } else if as_ignoring > 0 {
+        as_ignoring -= 1;
+    }
+    as_leave();
+}
+
+/// Called when main returns (--sanitize=address): reports the allocations
+/// never freed and returns the exit status, 23 if there were leaks and main
+/// returned 0.
+pub fn asan_exit(code: i32) i32 {
+    as_enter();
+    let mut count: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut o = AsOut.{ buf: [0; 1024], n: 0 };
+    let mut a = as_live;
+    while a != 0 {
+        if hfield(a, H_FLAGS).* == 0 {
+            count += 1;
+            bytes += hfield(a, H_SIZE).*;
+            if count <= 10 {
+                if count == 1 {
+                    o.s("phalange: AddressSanitizer: memory leaks\n");
+                }
+                o.s("leak of ");
+                o.dec(hfield(a, H_SIZE).*);
+                o.s(" bytes at ");
+                o.hex(@as(u64, a + AS_HDR));
+                o.s("\n");
+                as_print_sites(&mut o, a, "allocated");
+            }
+        }
+        a = @truncate(usize, hfield(a, H_NEXT).*);
+    }
+    as_leave();
+    if count == 0 {
+        return code;
+    }
+    o.s("phalange: AddressSanitizer: ");
+    o.dec(bytes);
+    o.s(" bytes leaked in ");
+    o.dec(count);
+    o.s(" allocations\n");
+    o.flush();
+    if code == 0 {
+        return 23;
+    }
+    return code;
+}
+
+// -----------------------------------------------------------------------------
 // The interface
 // -----------------------------------------------------------------------------
 /// `size` bytes, aligned to 16; 0 if memory is exhausted (or size is 0).
 pub fn alloc_bytes(size: usize) usize {
+    if @sanitize_address() {
+        return asan_alloc(size);
+    }
     // the common case, without calls: one thread, and an object in the
     // current span of the class
     if ((size -% 1) < 1024) and not multi {
@@ -686,6 +1338,10 @@ fn alloc_slow(size: usize) usize {
 /// Frees memory from alloc_bytes; `size` must be the size it was allocated
 /// with (or resized to).
 pub fn free_bytes(p: usize, size: usize) void {
+    if @sanitize_address() {
+        asan_free(p, size);
+        return;
+    }
     // the common case, without calls: one thread, and the span stays in the
     // list it is in
     if ((size -% 1) < 1024) and not multi {
@@ -719,6 +1375,9 @@ fn free_slow(p: usize, size: usize) void {
 /// size); moves it if it must. 0 if memory is exhausted (the old memory is
 /// then still valid).
 pub fn realloc_bytes(p: usize, old: usize, size: usize) usize {
+    if @sanitize_address() {
+        return asan_realloc(p, old, size);
+    }
     if old == 0 {
         return alloc_bytes(size);
     }
@@ -810,8 +1469,12 @@ pub fn destroy[T](p: *mut T) void {
 }
 
 /// Bytes handed out and not yet freed (small objects count their size class;
-/// large ones whole 4 KiB units, header included).
+/// large ones whole 4 KiB units, header included). With --sanitize=address,
+/// the bytes of the allocations not yet freed, as requested.
 pub fn in_use() usize {
+    if @sanitize_address() {
+        return as_live_bytes;  // what the program asked for: not headers or the quarantine
+    }
     let mut n = large_bytes;
     for h in 0..NHEAPS {
         n += heap_bytes[h];
@@ -864,6 +1527,9 @@ test "small objects are distinct, aligned and reused" {
     }
     free(ptrs);
     @expect_eq(in_use(), base);
+    if @sanitize_address() {
+        return;  // freed memory is quarantined, not reused at once
+    }
     // freed memory comes back
     let a = alloc.[u64](4)!;
     free(a);
@@ -873,6 +1539,9 @@ test "small objects are distinct, aligned and reused" {
 }
 
 test "large objects merge and are reused" {
+    if @sanitize_address() {
+        return;  // freed memory is quarantined, not reused at once
+    }
     let base = in_use();
     let a = alloc.[u8](100000)!;
     let b = alloc.[u8](200000)!;

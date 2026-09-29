@@ -1310,6 +1310,9 @@ fn system_tls() !*tls.ClientConfig {
     SYSTEM_TLS_LOCK.lock();
     defer SYSTEM_TLS_LOCK.unlock();
     if SYSTEM_TLS == 0 {
+        // kept until the program ends: not a leak
+        mem.leaks_ignored(true);
+        defer mem.leaks_ignored(false);
         let cfg = tls.ClientConfig.system()!;
         let p = mem.create(cfg) catch |e| {
             let mut c = cfg;

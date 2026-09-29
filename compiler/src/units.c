@@ -56,8 +56,9 @@ static const char *compiler_id(void) {
 }
 
 static const char *options_id(CgOptions *o) {
-    return arena_printf("unit-v1|%s|%d|%d|%d|%d|%d|%d|%d|%s", g_target.triple, g_target.ptr_bits, o->opt_level,
-                        o->overflow_saturate, o->stack_traces, o->profile, g_test_mode, o->emit, o->cpu ? o->cpu : "");
+    return arena_printf("unit-v1|%s|%d|%d|%d|%d|%d|%d|%d|%d|%s", g_target.triple, g_target.ptr_bits, o->opt_level,
+                        o->overflow_saturate, o->stack_traces, o->profile, o->sanitize_address, g_test_mode, o->emit,
+                        o->cpu ? o->cpu : "");
 }
 
 typedef struct Unit {

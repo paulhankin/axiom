@@ -75,6 +75,7 @@ static FnState *F;
 static LLVMValueRef errcode_value(uint32_t code);
 static bool type_mentions_error(Type *t);
 static const char *export_symbol(Decl *d);
+static bool g_sanitize_main;  // --sanitize=address: main is wrapped (emit_asan_main)
 static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out);
 static LLVMValueRef shared_global(LLVMTypeRef t, const char *name, LLVMValueRef init, unsigned addrspace);
 
@@ -244,7 +245,7 @@ static LLVMValueRef intr2(const char *name, LLVMValueRef a, LLVMValueRef b) {
 // ---------------------------------------------------------------------------
 enum {
     T_TRAP = 0, T_BOUNDS = 1, T_OVERFLOW = 2, T_DIVZERO = 3, T_INTCAST = 4, T_LENGTH = 6, T_UNIONTAG = 7,
-    T_ATOMIC_ALIGN = 10, T_EXPECT = 11,
+    T_ATOMIC_ALIGN = 10, T_EXPECT = 11, T_MEMORY = 12,
     SITE_ERR_RETURN = 254, SITE_CALL = 255,  // not traps: shadow stack records
 };
 
@@ -277,7 +278,8 @@ uint32_t file_key(int file_id) {
     return h == 0xFFFFFFFFu ? 0 : h;
 }
 
-void collect_link_names(void) {
+void collect_link_names(const CgOptions *o) {
+    g_sanitize_main = o->sanitize_address;
     SymMap seen = {0};
     for (int i = 0; i < g_prog.fns.len; i++) {
         Decl *d = g_prog.fns.data[i];
@@ -815,6 +817,7 @@ static const char *fn_display(Decl *d, Type **gargs, int n) {
 // The symbol of an exported function. On wasm (and in test binaries, which
 // have their own main) `main` is renamed; the export name is an attribute.
 static const char *export_symbol(Decl *d) {
+    if (g_sanitize_main && !g_test_mode && !strcmp(d->name, "main")) return "phalange.asan.main";
     return (g_target.wasm || g_test_mode) && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
 }
 
@@ -969,7 +972,8 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         else if (O->unit == CG_MODULE && n == 0) define = d->module == O->module;
         if (O->unit == CG_WHOLE && !d->is_export) LLVMSetLinkage(fi->fn, LLVMInternalLinkage);
         else if (define && n > 0) LLVMSetLinkage(fi->fn, LLVMLinkOnceODRLinkage);
-        if (define && d->is_export && g_target.wasm)
+        bool asan_main = O->sanitize_address && !g_test_mode && !strcmp(d->name, "main");
+        if (define && d->is_export && g_target.wasm && !asan_main)
             LLVMAddAttributeAtIndex(fi->fn, LLVMAttributeFunctionIndex,
                                     LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, d->name,
                                                               (unsigned)strlen(d->name)));
@@ -1293,6 +1297,17 @@ static bool via_pointer(Expr *e) {
 
 static LLVMValueRef array_len_value(Type *arr) { return usz(arr->len); }
 
+static bool asan_on(void);
+static void asan_check(LLVMValueRef addr, LLVMValueRef size);
+
+// --sanitize=address: a place reached through a pointer or slice is checked
+// where it is loaded or stored (the whole value; not the aggregates on the
+// way to it).
+static LLVMValueRef asan_place(Expr *e, LLVMValueRef addr) {
+    if (asan_on() && via_pointer(e)) asan_check(addr, usz(type_size(ct(e->type))));
+    return addr;
+}
+
 static LLVMValueRef gen_addr_inner(Expr *e) {
     switch (e->kind) {
     case E_IDENT:
@@ -1381,6 +1396,41 @@ static FnInst *rt_fn(const char *name) {
 static bool is_f32_type(LLVMTypeRef t) {
     if (LLVMGetTypeKind(t) == LLVMVectorTypeKind) t = LLVMGetElementType(t);
     return LLVMGetTypeKind(t) == LLVMFloatTypeKind;
+}
+
+// --sanitize=address (spec §16.8): an access of `size` bytes at `addr` is
+// checked against std/mem.ph's shadow memory (mem.asan_check), trapping with
+// T0012 when it touches memory that is not allocated. The allocator itself
+// and the runtime are not checked.
+static bool asan_on(void) {
+    if (!O->sanitize_address || !F || !F->decl || !F->decl->module) return false;
+    const char *f = g_files.data[F->decl->module->file->id]->display;
+    return strcmp(f, "std/mem.ph") != 0 && strncmp(f, "runtime/", 8) != 0;
+}
+
+static FnInst *mem_fn(const char *name) {
+    for (int i = 0; i < g_prog.fns.len; i++) {
+        Decl *d = g_prog.fns.data[i];
+        if (strcmp(d->name, name) != 0 || !d->module) continue;
+        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ph")) return get_inst(d, NULL, 0);
+    }
+    fprintf(stderr, "phalange: internal error: std/mem.ph has no %s (is --std right?)\n", name);
+    exit(3);
+}
+
+static void asan_check(LLVMValueRef addr, LLVMValueRef size) {
+    if (!asan_on()) return;
+    FnInst *fi = mem_fn("asan_check");
+    LLVMValueRef args[2] = {LLVMBuildPtrToInt(B, addr, T_isz, ""), size};
+    LLVMValueRef ok = emit_call(fi->llty, fi->fn, fi->fnty, false, args, 2, fi->fnty->params, NULL);
+    check_or_trap(LLVMBuildICmp(B, LLVMIntNE, ok, LLVMConstInt(LLVMTypeOf(ok), 0, false), ""), T_MEMORY);
+}
+
+// Checks the memory of a slice value (all of its elements).
+static void asan_check_slice(LLVMValueRef s, Type *elem) {
+    if (!asan_on()) return;
+    LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
+    asan_check(LLVMBuildExtractValue(B, s, 0, ""), LLVMBuildMul(B, len, usz(type_size(elem)), ""));
 }
 
 // Calls rt function `name` on scalar arguments, or lane by lane on vectors.
@@ -1659,6 +1709,8 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef dl = LLVMBuildExtractValue(B, d, 1, ""), sl = LLVMBuildExtractValue(B, s, 1, "");
         check_or_trap(LLVMBuildICmp(B, LLVMIntEQ, dl, sl, ""), T_LENGTH);
         LLVMValueRef bytes = LLVMBuildMul(B, dl, usz(type_size(dt->elem)), "");
+        asan_check_slice(d, dt->elem);
+        asan_check_slice(s, dt->elem);
         LLVMBuildMemMove(B, LLVMBuildExtractValue(B, d, 0, ""), 1, LLVMBuildExtractValue(B, s, 0, ""), 1, bytes);
         return NULL;
     }
@@ -1666,6 +1718,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         Type *dt = ct(a[0].e->type);
         LLVMValueRef d = gen(a[0].e), v = gen(a[1].e);
         LLVMValueRef ptr = LLVMBuildExtractValue(B, d, 0, ""), len = LLVMBuildExtractValue(B, d, 1, "");
+        asan_check_slice(d, dt->elem);
         if (dt->elem->kind == TY_INT && dt->elem->bits == 8) {
             LLVMBuildMemSet(B, ptr, v, len, 1);
             return NULL;
@@ -1691,6 +1744,8 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef xl = LLVMBuildExtractValue(B, x, 1, ""), yl = LLVMBuildExtractValue(B, y, 1, "");
         LLVMValueRef xp = LLVMBuildExtractValue(B, x, 0, ""), yp = LLVMBuildExtractValue(B, y, 0, "");
         LLVMValueRef bytes = LLVMBuildMul(B, xl, usz(type_size(st->elem)), "");
+        asan_check_slice(x, st->elem);
+        asan_check_slice(y, ct(a[1].e->type)->elem);
         LLVMValueRef res = alloca_in_entry(T_i1, "eq");
         LLVMValueRef iv = alloca_in_entry(T_isz, "i");
         LLVMBuildStore(B, LLVMBuildICmp(B, LLVMIntEQ, xl, yl, ""), res);
@@ -1832,6 +1887,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
         LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(st->elem)), "");
         check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, bytes, usz(16), ""), T_LENGTH);
+        asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(16));
         return load(rt, LLVMBuildExtractValue(B, s, 0, ""), true);
     }
     case BI_STORE: {
@@ -1842,6 +1898,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
         LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(st->elem)), "");
         check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, bytes, usz(16), ""), T_LENGTH);
+        asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(16));
         store(vt, v, LLVMBuildExtractValue(B, s, 0, ""), true);
         return NULL;
     }
@@ -1924,6 +1981,8 @@ static LLVMValueRef gen_builtin(Expr *e) {
         return LLVMBuildAdd(B, pe, po, "");
     }
     case BI_TRAP: emit_trap(T_TRAP); return NULL;
+    case BI_MEMORY_ERROR: emit_trap(T_MEMORY); return NULL;
+    case BI_SANITIZE_ADDRESS: return LLVMConstInt(T_i1, O->sanitize_address ? 1 : 0, false);
     case BI_EXPECT: check_or_trap(gen(a[0].e), T_EXPECT); return NULL;
     case BI_EXPECT_EQ: gen_expect_eq(e); return NULL;
     case BI_FENCE: LLVMBuildFence(B, LLVMAtomicOrderingSequentiallyConsistent, false, ""); return NULL;
@@ -2067,6 +2126,7 @@ static LLVMValueRef gen_atomic(Expr *e) {
         LLVMValueRef addr = LLVMBuildPtrToInt(B, p, T_isz, "");
         check_or_trap(LLVMBuildICmp(B, LLVMIntEQ, LLVMBuildAnd(B, addr, usz(size - 1), ""), usz(0), ""), T_ATOMIC_ALIGN);
     }
+    asan_check(p, usz(size));
     LLVMAtomicOrdering sc = LLVMAtomicOrderingSequentiallyConsistent;
     switch (id) {
     case BI_ATOMIC_LOAD: {
@@ -2398,8 +2458,8 @@ static LLVMValueRef gen_inner(Expr *e) {
     case E_FIELD:
         switch ((FieldKind)e->op) {
         case FK_STRUCT:
-            if (is_place(e)) return load(t, gen_addr(e), via_pointer(e));
-            if (e->self_mode == SELF_DEREF) return load(t, gen_addr(e), true);
+            if (is_place(e)) return load(t, asan_place(e, gen_addr(e)), via_pointer(e));
+            if (e->self_mode == SELF_DEREF) return load(t, asan_place(e, gen_addr(e)), true);
             return from_mem(t, LLVMBuildExtractValue(B, gen(e->a), (unsigned)e->index, ""));
         case FK_SLICE_LEN: return LLVMBuildExtractValue(B, gen(e->a), 1, "");
         case FK_SLICE_PTR: return LLVMBuildExtractValue(B, gen(e->a), 0, "");
@@ -2416,8 +2476,8 @@ static LLVMValueRef gen_inner(Expr *e) {
             return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
         }
         break;
-    case E_DEREF: return load(t, gen(e->a), true);
-    case E_INDEX: return load(t, gen_addr(e), via_pointer(e) || e->op != IDX_ARRAY);
+    case E_DEREF: return load(t, asan_place(e, gen_addr(e)), true);
+    case E_INDEX: return load(t, asan_place(e, gen_addr(e)), via_pointer(e) || e->op != IDX_ARRAY);
     case E_SLICE: return gen_slice(e);
     case E_APPLY: return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
     case E_CONV:
@@ -2516,6 +2576,7 @@ static void gen_for(Stmt *s) {
     LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, len, ""), body, end);
     LLVMPositionBuilderAtEnd(B, body);
     LLVMValueRef ep = LLVMBuildGEP2(B, lty(vt), ptr, &i, 1, "");
+    if (ct_->kind == TY_SLICE) asan_check(ep, usz(type_size(vt)));
     store(vt, load(vt, ep, ct_->kind == TY_SLICE), var, false);
     push_loop(end, step);
     gen_block(s->body);
@@ -2618,9 +2679,10 @@ static void gen_stmt_inner(Stmt *s) {
         if (s->op == TK_EQ) {
             LLVMValueRef v = gen(s->e2);
             if (!v) return;
-            store(t, v, addr, un);
+            store(t, v, asan_place(s->e, addr), un);
             return;
         }
+        asan_place(s->e, addr);
         LLVMValueRef old = load(t, addr, un);
         LLVMValueRef r = gen(s->e2);
         LLVMValueRef nv = gen_binop(s->e3->op, t, old, r, ct(s->e2->type));
@@ -2832,6 +2894,39 @@ static LLVMValueRef add_export(const char *name, LLVMTypeRef ret, LLVMTypeRef *p
     return fn;
 }
 
+// --sanitize=address: `main` is the user's main followed by the leak check
+// (mem.asan_exit), which decides the exit status.
+static void emit_asan_main(void) {
+    Decl *user_main = NULL;
+    for (int i = 0; i < g_prog.fns.len; i++) {
+        Decl *d = g_prog.fns.data[i];
+        if (d->is_export && !strcmp(d->name, "main")) user_main = d;
+    }
+    if (!user_main) return;
+    FnInst *fi = get_inst(user_main, NULL, 0);
+    LLVMTypeRef ps[2] = {T_i32, T_ptr};
+    LLVMTypeRef fty = LLVMFunctionType(T_i32, ps, 2, false);
+    LLVMValueRef fn = LLVMAddFunction(mod, g_target.wasm ? "phalange.export.main" : "main", fty);
+    if (g_target.wasm) {
+        LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "main", 4));
+        vec_push(g_export_names, intern_cstr("phalange.export.main"));
+    }
+    LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+    unsigned np = LLVMCountParamTypes(fi->llty);
+    LLVMValueRef args[2] = {LLVMGetParam(fn, 0), LLVMGetParam(fn, 1)};
+    LLVMValueRef r = LLVMBuildCall2(B, fi->llty, fi->fn, args, np, "");
+    LLVMTypeRef rt = LLVMGetReturnType(fi->llty);
+    LLVMValueRef code = LLVMConstInt(T_i32, 0, false);
+    if (LLVMGetTypeKind(rt) == LLVMIntegerTypeKind) {
+        unsigned bits = LLVMGetIntTypeWidth(rt);
+        code = bits < 32 ? LLVMBuildZExt(B, r, T_i32, "") : bits > 32 ? LLVMBuildTrunc(B, r, T_i32, "") : r;
+    }
+    FnInst *ex = mem_fn("asan_exit");
+    LLVMValueRef c = LLVMBuildCall2(B, ex->llty, ex->fn, &code, 1, "");
+    LLVMBuildRet(B, c);
+}
+
 // phalange_shadow_stack(): the calling thread's shadow stack record (see
 // ss_ptr), or null when built with --stack-traces=off.
 static void emit_shadow_stack_export(void) {
@@ -2968,6 +3063,7 @@ bool codegen_program(CgOptions *o) {
         if (g_test_mode) emit_test_exports();
         if (g_target.wasm) emit_trap_info_export();
         emit_shadow_stack_export();
+        if (O->sanitize_address && !g_test_mode) emit_asan_main();
     }
     while (pending_head) {
         FnInst *fi = pending_head;

@@ -15,7 +15,7 @@ import "target.ph" as tg;
 import "types.ph" as ty;
 import "util.ph" as u;
 
-// What one codegen run produces (spec §16.7):
+// What one codegen run produces (spec §16.8):
 //   CG_WHOLE   the whole program in one object (-O2 and above by default)
 //   CG_MODULE  one module's non-generic functions, plus the generic instances
 //              it uses (link-once); everything else is referenced by name
@@ -34,9 +34,10 @@ pub struct CgOptions {
     overflow_saturate: bool,  // --overflow=saturate (--release)
     cpu: []u8,                // nil = generic
     emit: i32,
-    out_path: []u8,      // file to write
-    stack_traces: bool,  // shadow stack for traces and profiles (--stack-traces=on, default)
-    profile: bool,       // phalange profile: the shadow stack is sampled concurrently
+    out_path: []u8,          // file to write
+    stack_traces: bool,      // shadow stack for traces and profiles (--stack-traces=on, default)
+    profile: bool,           // phalange profile: the shadow stack is sampled concurrently
+    sanitize_address: bool,  // --sanitize=address: heap accesses are checked (spec §16.8)
     unit: i32,
     module: *mut ast.Module,  // CG_MODULE
 }
@@ -543,6 +544,7 @@ const T_LENGTH: i32 = 6;
 const T_UNIONTAG: i32 = 7;
 const T_ATOMIC_ALIGN: i32 = 10;
 const T_EXPECT: i32 = 11;
+const T_MEMORY: i32 = 12;
 const SITE_ERR_RETURN: i32 = 254;
 const SITE_CALL: i32 = 255;  // not traps: shadow stack records
 
@@ -587,7 +589,8 @@ pub fn file_key(file_id: i32) u32 {
 
 // Exported symbol names of the whole program (for the linker), and libraries
 // named by extern "C" blocks: computed from the checked program.
-pub fn collect_link_names() void {
+pub fn collect_link_names(o: *CgOptions) void {
+    g_sanitize_main = o.sanitize_address;
     let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     let P = sema.g_prog;
     for i in 0..P.fns.len {
@@ -1346,10 +1349,16 @@ fn fn_display(d: *mut ast.Decl, gargs: []mut *mut ast.Type) []u8 {
 // have their own main) `main` is renamed; the export name is an attribute.
 fn export_symbol(d: *mut ast.Decl) []u8 {
     if d.is_export and u.str_eq(d.name, "main") {
+        if g_sanitize_main and not g_test_mode {
+            return "phalange.asan.main";  // wrapped: see emit_asan_main
+        }
         return "phalange.export.main";
     }
     return d.name;
 }
+
+// --sanitize=address: main is wrapped (emit_asan_main)
+let mut g_sanitize_main: bool = false;
 
 // Globals live in the link unit when units are compiled separately (their
 // initializers may contain error codes, which only the link unit knows).
@@ -1542,7 +1551,8 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
         } else if define and (n > 0) {
             set_linkage(fi.fnv, ir.LINK_LINKONCE);
         }
-        if define and d.is_export and ty.g_target.is_wasm {
+        let asan_main = g_sanitize_main and not g_test_mode and u.str_eq(d.name, "main");
+        if define and d.is_export and ty.g_target.is_wasm and not asan_main {
             add_str_attr(fi.fnv, "wasm-export-name", d.name);
         }
         if define {
@@ -2477,6 +2487,8 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let sl = extract(s, 1);
         check_or_trap(icmp(ir.IntEQ, dl, sl), T_LENGTH);
         let bytes = b_mul(dl, usz(ty.type_size(dt.elem)));
+        asan_check_slice(d, dt.elem);
+        asan_check_slice(s, dt.elem);
         let sp0 = extract(s, 0);  // (right to left, as in the C implementation)
         _ = ir.memop(B, ir.OP_MEMMOVE, extract(d, 0), sp0, bytes);
         return vnil();
@@ -2487,6 +2499,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let v = gen(barg(e, 1));
         let ptr = extract(d, 0);
         let len = extract(d, 1);
+        asan_check_slice(d, dt.elem);
         if (dt.elem.kind == ast.TY_INT) and (dt.elem.bits == 8) {
             _ = ir.memop(B, ir.OP_MEMSET, ptr, v, len);
             return vnil();
@@ -2517,6 +2530,8 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let xp = extract(x, 0);
         let yp = extract(y, 0);
         let bytes = b_mul(xl, usz(ty.type_size(stt.elem)));
+        asan_check_slice(x, stt.elem);
+        asan_check_slice(y, ct(barg(e, 1).ty).elem);
         let res = alloca_in_entry(T_i1, "eq".ptr);
         let iv = alloca_in_entry(T_isz, "i".ptr);
         _ = st(icmp(ir.IntEQ, xl, yl), res);
@@ -2701,6 +2716,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let len = extract(s, 1);
         let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
         check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
+        asan_check(extract(s, 0), usz(16));
         return load(rt, extract(s, 0), true);
     }
     if id == ast.BI_STORE {
@@ -2711,6 +2727,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let len = extract(s, 1);
         let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
         check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
+        asan_check(extract(s, 0), usz(16));
         store(vt, v, extract(s, 0), true);
         return vnil();
     }
@@ -2786,6 +2803,16 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         emit_trap(T_TRAP);
         return vnil();
     }
+    if id == ast.BI_MEMORY_ERROR {
+        emit_trap(T_MEMORY);
+        return vnil();
+    }
+    if id == ast.BI_SANITIZE_ADDRESS {
+        if O.sanitize_address {
+            return ci(T_i1, 1);
+        }
+        return ci(T_i1, 0);
+    }
     if id == ast.BI_EXPECT {
         check_or_trap(gen(barg(e, 0)), T_EXPECT);
         return vnil();
@@ -2835,6 +2862,99 @@ fn rt_fn(name: []u8) *mut FnInst {
     }
     internal_error(u.f1("runtime function %s not found (is runtime/rt.ph missing?)", name));
     return u.nil.[FnInst]();
+}
+
+// --sanitize=address (spec §16.8): an access of `size` bytes at `addr` is
+// checked against std/mem.ph's shadow memory (mem.asan_check), trapping with
+// T0012 when it touches memory that is not allocated. The allocator itself
+// and the runtime are not checked.
+fn asan_on() bool {
+    if not O.sanitize_address or u.isnil(F) or u.isnil(F.decl) or u.isnil(F.decl.module) {
+        return false;
+    }
+    let f = u.file_of(F.decl.module.file.id).display;
+    return not u.str_eq(f, "std/mem.ph") and not u.starts(f, "runtime/");
+}
+
+fn mem_fn(name: []u8) *mut FnInst {
+    let P = sema.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.str_eq(u.file_of(d.module.file.id).display, "std/mem.ph") {
+            return get_inst(d, ty.no_types());
+        }
+    }
+    internal_error(u.f1("std/mem.ph has no %s (is --std right?)", name));
+    return u.nil.[FnInst]();
+}
+
+fn asan_check(addr: *mut ir.Value, size: *mut ir.Value) void {
+    if not asan_on() {
+        return;
+    }
+    let fi = mem_fn("asan_check");
+    let mut args: [2]*mut ir.Value = [ptrtoint(addr, T_isz), size];
+    let ok = call(fi.llty, fi.fnv, args[..]);
+    check_or_trap(icmp(ir.IntNE, ok, ir.czero(ok.ty)), T_MEMORY);
+}
+
+// Checks the memory of a slice value (all of its elements).
+fn asan_check_slice(s: *mut ir.Value, elem: *mut ast.Type) void {
+    if not asan_on() {
+        return;
+    }
+    asan_check(extract(s, 0), b_mul(extract(s, 1), usz(ty.type_size(elem))));
+}
+
+// A place reached through a pointer or slice is checked where it is loaded
+// or stored (the whole value; not the aggregates on the way to it).
+fn asan_place(e: *mut ast.Expr, addr: *mut ir.Value) *mut ir.Value {
+    if asan_on() and via_pointer(e) {
+        asan_check(addr, usz(ty.type_size(ct(e.ty))));
+    }
+    return addr;
+}
+
+// --sanitize=address: the user's main followed by the leak check
+// (mem.asan_exit), which decides the exit status. On wasm this is the
+// exported main; natively the entry point calls it.
+fn asan_call_main(user_main: *mut ast.Decl, args: []mut *mut ir.Value) *mut ir.Value {
+    let fi = get_inst(user_main, ty.no_types());
+    let fty = fi.llty;
+    let r = call(fty, fi.fnv, args[0..fty.params.len]);
+    let mut code = ci32(0);
+    if fty.ret.kind != ir.T_VOID {
+        if fty.ret.bits < 32 {
+            code = zext(r, T_i32);
+        } else {
+            code = r;
+        }
+    }
+    let ex = mem_fn("asan_exit");
+    let mut cargs: [1]*mut ir.Value = [code];
+    return call(ex.llty, ex.fnv, cargs[..]);
+}
+
+fn emit_asan_main_wasm() void {
+    let mut user_main = u.nil.[ast.Decl]();
+    for i in 0..sema.g_prog.fns.len {
+        let d = sema.g_prog.fns.get(i);
+        if d.is_export and u.str_eq(d.name, "main") {
+            user_main = d;
+        }
+    }
+    if u.isnil(user_main) {
+        return;
+    }
+    let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
+    let fty = fn_type(T_i32, pi[..], false);
+    let f = ir.add_function(M, "phalange.export.main", fty).val;
+    add_str_attr(f, "wasm-export-name", "main");
+    g_export_names.push(u.intern("phalange.export.main"));
+    at_end(ir.append_block(f.fnp, "entry"));
+    let mut args: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
+    ir.ret(B, asan_call_main(user_main, args[..]));
 }
 
 // Calls rt function `name` on scalar arguments, or lane by lane on vectors.
@@ -2996,6 +3116,7 @@ fn gen_atomic(e: *mut ast.Expr) *mut ir.Value {
         let addr = ptrtoint(p, T_isz);
         check_or_trap(icmp(ir.IntEQ, b_and(addr, usz(size - 1)), usz(0)), T_ATOMIC_ALIGN);
     }
+    asan_check(p, usz(size));
     if id == ast.BI_ATOMIC_LOAD {
         let v = ld(lty(t), p);
         v.flags = ir.F_ATOMIC;
@@ -3421,10 +3542,10 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
         let fk = e.op;
         if fk == ast.FK_STRUCT {
             if sema.is_place(e) {
-                return load(t, gen_addr(e), via_pointer(e));
+                return load(t, asan_place(e, gen_addr(e)), via_pointer(e));
             }
             if e.self_mode == ast.SELF_DEREF {
-                return load(t, gen_addr(e), true);
+                return load(t, asan_place(e, gen_addr(e)), true);
             }
             return from_mem(t, extract(gen(e.a), @int_cast(u32, e.index)));
         }
@@ -3452,9 +3573,9 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
             return get_inst(e.decl, subst_gargs(e.gargs)).fnv;
         }
     } else if k == ast.E_DEREF {
-        return load(t, gen(e.a), true);
+        return load(t, asan_place(e, gen_addr(e)), true);
     } else if k == ast.E_INDEX {
-        return load(t, gen_addr(e), via_pointer(e) or (e.op != ast.IDX_ARRAY));
+        return load(t, asan_place(e, gen_addr(e)), via_pointer(e) or (e.op != ast.IDX_ARRAY));
     } else if k == ast.E_SLICE {
         return gen_slice(e);
     } else if k == ast.E_APPLY {
@@ -3581,6 +3702,9 @@ fn gen_for(s: *mut ast.Stmt) void {
     condbr(icmp(ir.IntULT, i, len), body, end);
     at_end(body);
     let ep = gep1(lty(vt), ptr, i);
+    if ctt.kind == ast.TY_SLICE {
+        asan_check(ep, usz(ty.type_size(vt)));
+    }
     store(vt, load(vt, ep, ctt.kind == ast.TY_SLICE), var, false);
     push_loop(end, step);
     gen_block(s.body);
@@ -3721,9 +3845,10 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
             if u.isnil(v) {
                 return;
             }
-            store(t, v, addr, un);
+            store(t, v, asan_place(s.e, addr), un);
             return;
         }
+        _ = asan_place(s.e, addr);
         let old = load(t, addr, un);
         let r = gen(s.e2);
         let nv = gen_binop(s.e3.op, t, old, r);
@@ -3987,6 +4112,13 @@ fn emit_native_entry() void {
         ir.ret(B, call(tty, ir.add_function(M, "ph_test_main", tty).val, args[..]));
         return;
     }
+    if O.sanitize_address {
+        let mut sargs: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
+        let code = asan_call_main(user_main, sargs[..]);
+        call_runtime("ph_rt_fini");
+        ir.ret(B, code);
+        return;
+    }
     let fi = get_inst(user_main, ty.no_types());
     let fty = fi.llty;
     let mut args: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
@@ -4088,6 +4220,8 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         emit_shadow_stack_export();
         if not ty.g_target.is_wasm {
             emit_native_entry();
+        } else if O.sanitize_address and not g_test_mode {
+            emit_asan_main_wasm();
         }
     }
     while u.notnil(pending_head) {

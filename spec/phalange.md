@@ -1700,6 +1700,7 @@ in which case it is linked against the C library as before.
 
 ```
 phalange build <file.ph> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
+                          [--sanitize=address]    # check heap accesses (§16.8)
 phalange check <file.ph>                  # parse and type-check only; no codegen
 phalange fmt   <file.ph|dir>... [--check] [--stdout]   # canonical layout (§16.5)
 phalange run   <file.ph> [--export=name]  # build for wasm32 and execute in the reference runtime
@@ -2090,6 +2091,48 @@ declared but never called must still exist at link time.
 
 ---
 
+### 16.8 The address sanitizer
+
+Slices, arrays and integer arithmetic are checked by the language itself (Appendix B),
+so the errors a sanitizer adds are those of memory *lifetime*: using memory after it is
+freed, freeing it twice or with the wrong size, reaching outside an allocation through a
+pointer made from an address, and never freeing it. `--sanitize=address` (accepted by
+`build`, `test` and `profile`) checks for them:
+
+- The global allocator (`std/mem`) puts a header before each allocation and a redzone
+  after it, and keeps *shadow memory*: one byte per 8 bytes of heap, saying how many of
+  them may be used or why they may not (redzone, freed).
+- The compiler checks every load and store through a pointer or slice, `@mem_copy`,
+  `@mem_set`, `@mem_eq`, `@load`, `@store`, the atomics, and `for` over a slice,
+  against the shadow memory. An access to memory that is not allocated traps with
+  `T0012` at the access, after a report on stderr of what was accessed and where it was
+  allocated and freed:
+
+  ```
+  phalange: AddressSanitizer: heap-use-after-free: 4-byte access at 0x1100c4: 4 bytes inside a 16-byte allocation at 0x1100c0, freed
+  freed:
+    at main (uaf.ph:20:5)
+  allocated:
+    at make (uaf.ph:13:14)
+    at main (uaf.ph:19:14)
+  phalange: trap T0012 (memory error): xs[1] at uaf.ph:21:27
+  ```
+
+- Freed memory is kept poisoned in a quarantine (64 MiB) before the allocator reuses it,
+  so late uses of it are caught for a while. `realloc` always moves.
+- `free` checks its argument: a double free, a size other than the allocation's, or
+  memory the allocator did not hand out traps with `T0012`.
+- When `main` returns, the allocations never freed are reported as leaks, and the exit
+  status becomes 23 if it was 0. Memory kept on purpose until the end can be excluded:
+  allocations made between `mem.leaks_ignored(true)` and `mem.leaks_ignored(false)`
+  are not reported. Test binaries do not check for leaks.
+
+The allocator and the runtime are not instrumented. Memory that is not from the heap
+(globals, locals, memory from `@memory_grow`) is not checked. Allocation sites come from
+the shadow stack, so they need `--stack-traces=on` (the default). Programs run several
+times slower and use more memory. In code, `@sanitize_address()` is a constant: whether
+the program is being built with the sanitizer.
+
 ## 17. Testing
 
 ### 17.1 Test blocks and assertions
@@ -2157,7 +2200,7 @@ With `--format=agent-json`, stdout holds one object:
 
 `failure.code` is one of:
 
-- a trap code (`T0000` to `T0011`);
+- a trap code (`T0000` to `T0012`);
 - `error`: the test returned an error, and the message names it;
 - `no_trap`: an `expect trap` test completed;
 - `timeout`.
@@ -2318,6 +2361,8 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 | `@error_name(e)` | `error → []u8` |
 | `@expect(cond)` | Traps with `T0011` if `cond` is false (§17.1) |
 | `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§17.1) |
+| `@memory_error()` | Diverges and traps with `T0012`: how `std/mem` reports a bad `free` under the address sanitizer (§16.8) |
+| `@sanitize_address()` | `→ bool`, a constant: whether the build uses `--sanitize=address` (§16.8) |
 
 ---
 
@@ -2339,6 +2384,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0009` | Invalid function pointer or signature mismatch (`call_indirect`) |
 | `T0010` | Misaligned atomic access (§12.8.3) |
 | `T0011` | Expectation failed: `@expect` / `@expect_eq` (§17.1) |
+| `T0012` | Memory error found by the address sanitizer (§16.8) |
 
 Nothing else traps, and nothing is undefined.
 

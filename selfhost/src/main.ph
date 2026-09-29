@@ -47,6 +47,7 @@ fn usage() void {
     u.eprint("  -O0..-O3   --release | --overflow=trap|saturate\n");
     u.eprint("  --emit=exe|obj|ir  --format=human|agent-json  --std=<dir>  -o <out>\n");
     u.eprint("  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
+    u.eprint("  --sanitize=address|none  check heap accesses: use after free, overflows, double frees, leaks\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
     u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
 }
@@ -1057,6 +1058,10 @@ fn driver(args: [][]u8) i32 {
             co.stack_traces = true;
         } else if u.str_eq(a, "--stack-traces=off") {
             co.stack_traces = false;
+        } else if u.str_eq(a, "--sanitize=address") {
+            co.sanitize_address = true;
+        } else if u.str_eq(a, "--sanitize=none") {
+            co.sanitize_address = false;
         } else if u.str_eq(a, "--units=module") {
             units_mode = 1;
         } else if u.str_eq(a, "--units=program") {
@@ -1188,6 +1193,10 @@ fn driver(args: [][]u8) i32 {
         if u.file_exists(rtp) {
             pkg_files.push(rtp);
         }
+        // --sanitize=address checks accesses with std/mem.ph's shadow memory
+        if co.sanitize_address {
+            pkg_files.push(u.f1("%s/mem.ph", std_dir));
+        }
         // Native programs: the host ABI, crash reports, the test runner and
         // the profiler are Phalange code too.
         if not ty.g_target.is_wasm {
@@ -1308,7 +1317,7 @@ fn driver(args: [][]u8) i32 {
     } else {
         co.out_path = out;
     }
-    cg.collect_link_names();
+    cg.collect_link_names(co);
     // Separate compilation (spec §16.7) applies to executables; --emit of a
     // single object/IR/assembly file is always one unit.
     let mut separate = final_link and (co.opt_level <= 1);

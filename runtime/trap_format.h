@@ -31,7 +31,7 @@ struct ph_trap_info {
 static const char *const ph_trap_names[] = {
     "trap", "index out of bounds", "integer overflow", "division by zero", "int_cast out of range",
     "memory access out of bounds", "length precondition failed", "invalid union tag", "stack exhausted",
-    "invalid function pointer", "misaligned atomic access", "expectation failed",
+    "invalid function pointer", "misaligned atomic access", "expectation failed", "memory error",
 };
 
 static inline void ph_format_value(char *out, size_t cap, uint64_t kind, uint64_t v, uint64_t len) {

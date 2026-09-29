@@ -558,6 +558,8 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t_invalid;
     }
     case BI_TRAP: return e->type = t_never;
+    case BI_MEMORY_ERROR: return e->type = t_never;
+    case BI_SANITIZE_ADDRESS: return e->type = t_bool;
     case BI_EXPECT:
         check_expr_to(earg(e, 0), t_bool);
         return e->type = t_void;

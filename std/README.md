@@ -6,7 +6,7 @@ and a type that owns memory has `deinit`).
 
 | Module | Contents |
 |---|---|
-| [`mem`](mem.ph) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `create(v)` / `destroy(p)`, `in_use()` |
+| [`mem`](mem.ph) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `create(v)` / `destroy(p)`, `in_use()`; under `--sanitize=address`, shadow memory, quarantine and leak reports (`leaks_ignored`) |
 | [`vec`](vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
 | [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
 | [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |

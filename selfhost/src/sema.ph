@@ -131,6 +131,20 @@ fn display_path(real: []u8) []u8 {
     if (m > 0) and (real.len > m) and u.starts(real, std_real) and (real[m] == '/') {
         return u.f1("std/%s", real[m + 1..]);
     }
+    // ... and the runtime next to it as runtime/<path>, so that symbol names
+    // (prefixed with the display path) are the same from any directory
+    if m > 0 {
+        let mut k = m;
+        while (k > 0) and (std_real[k - 1] != '/') {
+            k -= 1;
+        }
+        if k > 0 {
+            let rt_dir = u.f1("%sruntime/", std_real[..k]);
+            if (real.len > rt_dir.len) and u.starts(real, rt_dir) {
+                return u.f1("runtime/%s", real[rt_dir.len..]);
+            }
+        }
+    }
     let n = g_cwd.len;
     if (n > 0) and (real.len > n) and u.starts(real, g_cwd) and (real[n] == '/') {
         return u.dup(real[n + 1..]);
@@ -3689,8 +3703,11 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         _ = dg.err(e.span, "E0812", u.f1("@dot requires float vectors or i16x8, found %s", tstr(t)));
         return set_ty(e, ty.t_invalid);
     }
-    if id == ast.BI_TRAP {
+    if (id == ast.BI_TRAP) or (id == ast.BI_MEMORY_ERROR) {
         return set_ty(e, ty.t_never);
+    }
+    if id == ast.BI_SANITIZE_ADDRESS {
+        return set_ty(e, ty.t_bool);
     }
     if id == ast.BI_EXPECT {
         _ = check_expr_to(earg(e, 0), ty.t_bool);
