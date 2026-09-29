@@ -2944,8 +2944,8 @@ fn asan_check(addr: *mut ir.Value, size: *mut ir.Value) void {
     condbr(b_and(icmp(ir.IntEQ, sb, ir.czero(T_i8)), in_granule), done, slow);
     // memory the sanitizer does not track: fine within one page
     at_end(untracked);
-    let in_page = b_and(
-        icmp(ir.IntULE, size, usz(0x10000)), icmp(ir.IntULE, b_add(b_and(a, usz(0xffff)), size), usz(0x10000)));
+    let in_page = b_and(icmp(ir.IntULE, size, usz(0x10000)), icmp(ir.IntULE, b_add(b_and(a, usz(0xffff)), size),
+                                                                  usz(0x10000)));
     condbr(in_page, done, slow);
     // everything else: the full check, which reports
     at_end(slow);
