@@ -1,0 +1,2414 @@
+// =============================================================================
+// std/xml.ph - XML 1.0 (fifth edition) with namespaces: a pull parser, a
+// tree, a writer, and canonical output.
+//
+//     let mut doc = xml.parse(text)!;
+//     defer doc.deinit();
+//     let root = doc.root;                          // *xml.Element
+//     let id = root.attr("id")!;
+//     for c in root.elements() { ... c.local ... c.ns ... c.text_alloc()! }
+//
+//     let mut r = xml.Reader.init(text, xml.Options.default())!;   // streaming
+//     defer r.deinit();
+//     loop { let t = r.next()!; if t.kind == xml.T_END_DOCUMENT { break; } ... }
+//
+//     let mut w = xml.Writer.init(out);             // writing
+//     w.start("item")!; w.attr("id", "7")!; w.text("a < b")!; w.end()!;
+//
+// The parser is non-validating and checks well-formedness: matching tags,
+// unique attributes, legal names and characters, and namespace rules.
+// Input may be UTF-8, UTF-16 (with a byte-order mark) or ISO-8859-1 (when
+// declared); line ends are normalized. The internal DTD subset is read for
+// entity declarations and attribute defaults; external entities and DTDs
+// are never loaded (no XXE), and a reference to one is an error. Entity
+// expansion is limited (MAX_EXPANSION bytes), which defeats "billion
+// laughs" documents.
+// =============================================================================
+
+import "arena.ph" as arena;
+import "fmt.ph" as fmt;
+import "fs.ph" as fs;
+import "hash.ph" as hash;
+import "io.ph" as io;
+import "map.ph" as maps;
+import "mem.ph" as mem;
+import "str.ph" as strs;
+import "vec.ph" as vec;
+
+error { SyntaxError, TooDeep, TooLarge, Unsupported, NotFound, OutOfMemory, BadNesting }
+
+/// Elements nested deeper than this are refused.
+pub const MAX_DEPTH: usize = 1024;
+
+/// The most text that entity references may expand to, in all.
+pub const MAX_EXPANSION: usize = 10 * 1024 * 1024;
+
+pub let XML_NS: []u8 = "http://www.w3.org/XML/1998/namespace";
+pub let XMLNS_NS: []u8 = "http://www.w3.org/2000/xmlns/";
+
+// -----------------------------------------------------------------------------
+// Characters and names
+// -----------------------------------------------------------------------------
+
+fn is_char(c: u32) bool {
+    return (c == 0x9) or (c == 0xa) or (c == 0xd) or ((c >= 0x20) and (c <= 0xd7ff)) or
+           ((c >= 0xe000) and (c <= 0xfffd)) or ((c >= 0x10000) and (c <= 0x10ffff));
+}
+
+fn is_name_start(c: u32) bool {
+    if c < 0x80 {
+        return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c == '_') or (c == ':');
+    }
+    return ((c >= 0xc0) and (c <= 0xd6)) or ((c >= 0xd8) and (c <= 0xf6)) or ((c >= 0xf8) and (c <= 0x2ff)) or
+           ((c >= 0x370) and (c <= 0x37d)) or ((c >= 0x37f) and (c <= 0x1fff)) or ((c >= 0x200c) and (c <= 0x200d)) or
+           ((c >= 0x2070) and (c <= 0x218f)) or ((c >= 0x2c00) and (c <= 0x2fef)) or
+           ((c >= 0x3001) and (c <= 0xd7ff)) or ((c >= 0xf900) and (c <= 0xfdcf)) or
+           ((c >= 0xfdf0) and (c <= 0xfffd)) or ((c >= 0x10000) and (c <= 0xeffff));
+}
+
+fn is_name_char(c: u32) bool {
+    return is_name_start(c) or ((c >= '0') and (c <= '9')) or (c == '-') or (c == '.') or (c == 0xb7) or
+           ((c >= 0x300) and (c <= 0x36f)) or ((c >= 0x203f) and (c <= 0x2040));
+}
+
+fn is_space(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r');
+}
+
+/// Whether s is an XML Name.
+pub fn is_name(s: []u8) bool {
+    if s.len == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    let mut first = true;
+    while i < s.len {
+        let r = strs.decode_rune(s[i..]);
+        if first {
+            if not is_name_start(r.value) {
+                return false;
+            }
+        } else if not is_name_char(r.value) {
+            return false;
+        }
+        first = false;
+        i += r.len;
+    }
+    return true;
+}
+
+fn is_nmtoken(s: []u8) bool {
+    if s.len == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < s.len {
+        let r = strs.decode_rune(s[i..]);
+        if not is_name_char(r.value) {
+            return false;
+        }
+        i += r.len;
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Input: encodings and line ends
+// -----------------------------------------------------------------------------
+
+// The document as UTF-8 with normalized line ends, in the arena.
+fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) ![]u8 {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    if (text.len >= 2) and (((text[0] == 0xfe) and (text[1] == 0xff)) or ((text[0] == 0xff) and (text[1] == 0xfe))) {
+        // UTF-16 with a byte-order mark
+        let be = text[0] == 0xfe;
+        let mut i: usize = 2;
+        let mut b: [4]u8 = [0; 4];
+        while (i + 1) < text.len {
+            let mut u = @as(u32, text[i + 1]) | (@as(u32, text[i]) << 8);
+            if not be {
+                u = @as(u32, text[i]) | (@as(u32, text[i + 1]) << 8);
+            }
+            i += 2;
+            if (u >= 0xd800) and (u <= 0xdbff) {
+                if (i + 1) >= text.len {
+                    msg.* = "truncated UTF-16";
+                    return error.SyntaxError;
+                }
+                let mut l = @as(u32, text[i + 1]) | (@as(u32, text[i]) << 8);
+                if not be {
+                    l = @as(u32, text[i]) | (@as(u32, text[i + 1]) << 8);
+                }
+                if (l < 0xdc00) or (l > 0xdfff) {
+                    msg.* = "invalid UTF-16";
+                    return error.SyntaxError;
+                }
+                i += 2;
+                u = 0x10000 + (((u - 0xd800) << 10) | (l - 0xdc00));
+            } else if (u >= 0xdc00) and (u <= 0xdfff) {
+                msg.* = "invalid UTF-16";
+                return error.SyntaxError;
+            }
+            s.push_str(strs.encode_rune(b[..], u))!;
+        }
+        if i < text.len {
+            msg.* = "truncated UTF-16";
+            return error.SyntaxError;
+        }
+    } else {
+        let mut t = text;
+        if (t.len >= 3) and (t[0] == 0xef) and (t[1] == 0xbb) and (t[2] == 0xbf) {
+            t = t[3..];
+        }
+        if declares_latin1(t) {
+            let mut b: [4]u8 = [0; 4];
+            for c in t {
+                s.push_str(strs.encode_rune(b[..], @as(u32, c)))!;
+            }
+        } else {
+            if not strs.valid_utf8(t) {
+                msg.* = "invalid UTF-8";
+                return error.SyntaxError;
+            }
+            s.push_str(t)!;
+        }
+    }
+    // line ends: CR LF and lone CR become LF
+    let src = s.bytes();
+    let out = a.bytes(src.len)!;
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < src.len {
+        let c = src[i];
+        if c == '\r' {
+            out[n] = '\n';
+            n += 1;
+            i += 1;
+            if (i < src.len) and (src[i] == '\n') {
+                i += 1;
+            }
+            continue;
+        }
+        out[n] = c;
+        n += 1;
+        i += 1;
+    }
+    // every character must be allowed
+    let r = out[..n];
+    let mut k: usize = 0;
+    while k < r.len {
+        let q = strs.decode_rune(r[k..]);
+        if not is_char(q.value) {
+            msg.* = "a character that XML does not allow";
+            return error.SyntaxError;
+        }
+        k += q.len;
+    }
+    return r;
+}
+
+fn declares_latin1(t: []u8) bool {
+    if not strs.starts_with(t, "<?xml") {
+        return false;
+    }
+    let end = strs.index_of(t, "?>") catch return false;
+    let decl = t[..end];
+    let at = strs.index_of(decl, "encoding") catch return false;
+    let rest = decl[at + 8..];
+    for enc in ["ISO-8859-1", "iso-8859-1", "latin1", "Latin1", "ISO_8859-1", "ISO-Latin-1"]{
+        if strs.contains(rest, enc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// The pull parser
+// -----------------------------------------------------------------------------
+
+pub const T_START: u8 = 1;    // name, attrs; self_closing if <x/>
+pub const T_END: u8 = 2;      // name
+pub const T_TEXT: u8 = 3;     // text (character data, references resolved)
+pub const T_CDATA: u8 = 4;    // text
+pub const T_COMMENT: u8 = 5;  // text
+pub const T_PI: u8 = 6;       // name (target), text (data)
+pub const T_DOCTYPE: u8 = 7;  // name
+pub const T_END_DOCUMENT: u8 = 8;
+
+pub struct Attr {
+    name: []u8,   // as written: "p:x"
+    local: []u8,  // "x"
+    ns: []u8,     // the namespace name ("" for none)
+    value: []u8,  // normalized, references resolved
+}
+
+pub struct Token {
+    kind: u8,
+    name: []u8,
+    local: []u8,
+    ns: []u8,
+    attrs: []Attr,
+    text: []u8,
+    self_closing: bool,
+}
+
+pub struct Options {
+    namespaces: bool,       // resolve prefixes and check the namespace rules
+    keep_whitespace: bool,  // report text of white space only outside elements? (never in the tree)
+
+    pub fn default() Options {
+        return Options.{ namespaces: true, keep_whitespace: false };
+    }
+}
+
+struct Source {
+    text: []u8,
+    pos: usize,
+    entity: []u8,  // the entity being expanded ("" for the document)
+    in_attr: bool,
+}
+
+struct Entity {
+    value: []u8,
+    external: bool,  // SYSTEM or PUBLIC: never loaded
+    unparsed: bool,  // with NDATA
+}
+
+struct AttDef {
+    element: []u8,
+    name: []u8,
+    cdata: bool,
+    has_default: bool,
+    value: []u8,
+}
+
+struct Binding {
+    prefix: []u8,
+    uri: []u8,
+    depth: usize,  // the element depth that declared it
+}
+
+/// A streaming parser over a document.
+pub struct Reader {
+    ar: arena.Arena,
+    opts: Options,
+    src: vec.Vec.[Source],
+    general: maps.Map.[[]u8, Entity],
+    params: maps.Map.[[]u8, Entity],
+    attdefs: vec.Vec.[AttDef],
+    open: vec.Vec.[[]u8],       // names of open elements
+    open_src: vec.Vec.[usize],  // the source depth each was opened in
+    bindings: vec.Vec.[Binding],
+    attrs: vec.Vec.[Attr],
+    buf: strs.String,
+    buf2: strs.String,
+    pending_end: bool,  // after <x/>: the END token comes next
+    pending_name: []u8,
+    pending_local: []u8,
+    pending_ns: []u8,
+    pending_depth: usize,
+    seen_root: bool,
+    seen_doctype: bool,
+    done: bool,
+    expanded: usize,
+    has_external_subset: bool,
+    standalone: bool,
+    msg: []u8,
+    err_pos: usize,
+    line: u32,
+
+    /// A reader over text (copied and decoded, so text may be freed).
+    pub fn init(text: []u8, opts: Options) !Reader {
+        let mut m: []u8 = "";
+        return Reader.init_info(text, opts, &mut m);
+    }
+
+    /// As init; on failure, msg says why.
+    pub fn init_info(text: []u8, opts: Options, msg: *mut []u8) !Reader {
+        let mut r = Reader.{
+            ar: arena.Arena.init(),
+            opts: opts,
+            src: vec.Vec.[Source].init(),
+            general: maps.Map.[[]u8, Entity].init(hash.hash_bytes, hash.eq_bytes),
+            params: maps.Map.[[]u8, Entity].init(hash.hash_bytes, hash.eq_bytes),
+            attdefs: vec.Vec.[AttDef].init(),
+            open: vec.Vec.[[]u8].init(),
+            open_src: vec.Vec.[usize].init(),
+            bindings: vec.Vec.[Binding].init(),
+            attrs: vec.Vec.[Attr].init(),
+            buf: strs.String.init(),
+            buf2: strs.String.init(),
+            pending_end: false,
+            pending_name: "",
+            pending_local: "",
+            pending_ns: "",
+            pending_depth: 0,
+            seen_root: false,
+            seen_doctype: false,
+            done: false,
+            expanded: 0,
+            has_external_subset: false,
+            standalone: false,
+            msg: "",
+            err_pos: 0,
+            line: 0,
+        };
+        let mut m: []u8 = "";
+        let t = decode_input(text, &mut r.ar, &mut m) catch |e| {
+            msg.* = m;
+            r.deinit();
+            return e;
+        };
+        r.src.push(Source.{ text: t, pos: 0, entity: "", in_attr: false }) catch |e| {
+            r.deinit();
+            return e;
+        };
+        r.xml_decl() catch |e| {
+            msg.* = r.msg;
+            r.deinit();
+            return e;
+        };
+        return r;
+    }
+
+    pub fn deinit(self: *mut Reader) void {
+        self.ar.deinit();
+        self.src.deinit();
+        self.general.deinit();
+        self.params.deinit();
+        self.attdefs.deinit();
+        self.open.deinit();
+        self.open_src.deinit();
+        self.bindings.deinit();
+        self.attrs.deinit();
+        self.buf.deinit();
+        self.buf2.deinit();
+    }
+
+    /// Why the last SyntaxError happened.
+    pub fn error_message(self: *Reader) []u8 {
+        return self.msg;
+    }
+
+    /// The line (from 1) of the document where the last error happened.
+    pub fn error_line(self: *Reader) u32 {
+        return self.line;
+    }
+
+    fn fail(self: *mut Reader, m: []u8) error { if self.msg.len == 0 {
+        self.msg = m;
+        let doc = self.src.get(0);
+        let p = @min(doc.pos, doc.text.len);
+        let mut l: u32 = 1;
+        for c in doc.text[..p] {
+            if c == '\n' {
+                l += 1;
+            }
+        }
+        self.line = l;
+    }
+    return error.SyntaxError; }
+
+    // --- the current source ----------------------------------------------------------
+
+    fn cur(self: *mut Reader) *mut Source {
+        return self.src.get_ptr(self.src.len - 1);
+    }
+
+    fn at(self: *mut Reader, k: usize) u8 {
+        let s = self.cur();
+        let i = s.pos + k;
+        if i < s.text.len {
+            return s.text[i];
+        }
+        return 0;
+    }
+
+    fn eof(self: *mut Reader) bool {
+        let s = self.cur();
+        return s.pos >= s.text.len;
+    }
+
+    fn looking_at(self: *mut Reader, w: []u8) bool {
+        let s = self.cur();
+        return ((s.pos + w.len) <= s.text.len) and @mem_eq(s.text[s.pos..s.pos + w.len], w);
+    }
+
+    fn advance(self: *mut Reader, n: usize) void {
+        self.cur().pos += n;
+    }
+
+    fn expect(self: *mut Reader, w: []u8, m: []u8) !void {
+        if not self.looking_at(w) {
+            return self.fail(m);
+        }
+        self.advance(w.len);
+    }
+
+    fn skip_space(self: *mut Reader) bool {
+        let mut any = false;
+        while not self.eof() and is_space(self.at(0)) {
+            self.advance(1);
+            any = true;
+        }
+        return any;
+    }
+
+    fn name(self: *mut Reader) ![]u8 {
+        let s = self.cur();
+        let st = s.pos;
+        let mut i = st;
+        let mut first = true;
+        while i < s.text.len {
+            let r = strs.decode_rune(s.text[i..]);
+            let ok = (first and is_name_start(r.value)) or (not first and is_name_char(r.value));
+            if not ok {
+                break;
+            }
+            first = false;
+            i += r.len;
+        }
+        if i == st {
+            return self.fail("expected a name");
+        }
+        s.pos = i;
+        return s.text[st..i];
+    }
+
+    // --- the XML declaration -----------------------------------------------------------
+
+    fn xml_decl(self: *mut Reader) !void {
+        if not (self.looking_at("<?xml") and is_space(self.at(5))) {
+            return;
+        }
+        self.advance(5);
+        _ = self.skip_space();
+        let mut seen_version = false;
+        let mut seen_encoding = false;
+        let mut seen_standalone = false;
+        let mut order: u32 = 0;
+        loop {
+            if self.looking_at("?>") {
+                self.advance(2);
+                break;
+            }
+            let n = self.name()!;
+            _ = self.skip_space();
+            self.expect("=", "expected = in the XML declaration")!;
+            _ = self.skip_space();
+            let q = self.at(0);
+            if (q != '"') and (q != '\'') {
+                return self.fail("expected a quoted value in the XML declaration");
+            }
+            self.advance(1);
+            let st = self.cur().pos;
+            while not self.eof() and (self.at(0) != q) {
+                self.advance(1);
+            }
+            if self.eof() {
+                return self.fail("unterminated XML declaration");
+            }
+            let v = self.cur().text[st..self.cur().pos];
+            self.advance(1);
+            if strs.eq(n, "version") and (order == 0) {
+                if not (strs.starts_with(v, "1.") and (v.len > 2) and all_digits(v[2..])) {
+                    return self.fail("bad version in the XML declaration");
+                }
+                seen_version = true;
+                order = 1;
+            } else if strs.eq(n, "encoding") and (order == 1) and not seen_encoding {
+                if (v.len == 0) or not (((v[0] >= 'a') and (v[0] <= 'z')) or ((v[0] >= 'A') and (v[0] <= 'Z'))) {
+                    return self.fail("bad encoding name");
+                }
+                seen_encoding = true;
+                order = 2;
+            } else if strs.eq(n, "standalone") and (order >= 1) and not seen_standalone {
+                if strs.eq(v, "yes") {
+                    self.standalone = true;
+                } else if not strs.eq(v, "no") {
+                    return self.fail("standalone must be yes or no");
+                }
+                seen_standalone = true;
+                order = 3;
+            } else {
+                return self.fail("bad XML declaration");
+            }
+            let sp = self.skip_space();
+            if not sp and not self.looking_at("?>") {
+                return self.fail("expected white space in the XML declaration");
+            }
+        }
+        if not seen_version {
+            return self.fail("the XML declaration needs a version");
+        }
+    }
+
+    // --- tokens ---------------------------------------------------------------------------
+
+    fn token(kind: u8) Token {
+        return Token.{ kind: kind, name: "", local: "", ns: "", attrs: @slice_from_ptr(@ptr_from_int(*Attr, 8), 0),
+                       text: "", self_closing: false };
+    }
+
+    /// The next token; T_END_DOCUMENT at the end. Strings live as long as
+    /// the Reader.
+    pub fn next(self: *mut Reader) !Token {
+        if self.pending_end {
+            self.pending_end = false;
+            self.close_scope(self.pending_depth);
+            let mut t = Reader.token(T_END);
+            t.name = self.pending_name;
+            t.local = self.pending_local;
+            t.ns = self.pending_ns;
+            return t;
+        }
+        if self.done {
+            return Reader.token(T_END_DOCUMENT);
+        }
+        loop {
+            // entity ends
+            if self.eof() {
+                if self.src.len > 1 {
+                    if (self.open_src.len > 0) and (self.open_src.get(self.open_src.len - 1) == (self.src.len - 1)) {
+                        return self.fail("an element starts in an entity and ends outside it");
+                    }
+                    _ = self.src.pop()!;
+                    continue;
+                }
+                if self.open.len > 0 {
+                    return self.fail("unexpected end of document: an element is not closed");
+                }
+                if not self.seen_root {
+                    return self.fail("the document has no root element");
+                }
+                self.done = true;
+                return Reader.token(T_END_DOCUMENT);
+            }
+            let inside = self.open.len > 0;
+            let c = self.at(0);
+            if c == '<' {
+                let d = self.at(1);
+                if d == '/' {
+                    return self.end_tag();
+                }
+                if d == '?' {
+                    return self.pi();
+                }
+                if self.looking_at("<!--") {
+                    return self.comment();
+                }
+                if self.looking_at("<![CDATA[") {
+                    if not inside {
+                        return self.fail("CDATA outside the root element");
+                    }
+                    return self.cdata();
+                }
+                if self.looking_at("<!DOCTYPE") {
+                    if inside or self.seen_root or self.seen_doctype {
+                        return self.fail("misplaced DOCTYPE");
+                    }
+                    return self.doctype();
+                }
+                if d == '!' {
+                    return self.fail("unexpected markup");
+                }
+                if not inside and self.seen_root {
+                    return self.fail("content after the root element");
+                }
+                return self.start_tag();
+            }
+            if not inside {
+                // outside the root: white space only
+                if is_space(c) {
+                    self.advance(1);
+                    continue;
+                }
+                if self.src.len > 1 {
+                    return self.fail("text in an entity outside the root element");
+                }
+                return self.fail("text outside the root element");
+            }
+            let t = self.char_data()!;
+            if t.text.len > 0 {
+                return t;
+            }
+        }
+    }
+
+    // Text up to the next markup, with references resolved (entity
+    // references with markup push their text as a new source).
+    fn char_data(self: *mut Reader) !Token {
+        self.buf.clear();
+        loop {
+            if self.eof() {
+                break;
+            }
+            let c = self.at(0);
+            if c == '<' {
+                break;
+            }
+            if c == '&' {
+                if self.reference_in_content()! {
+                    break;  // a new source: return what we have
+                }
+                continue;
+            }
+            if (c == ']') and self.looking_at("]]>") {
+                return self.fail("]]> in text");
+            }
+            self.buf.push(c)!;
+            self.advance(1);
+        }
+        let mut t = Reader.token(T_TEXT);
+        t.text = self.ar.dup(self.buf.bytes())!;
+        return t;
+    }
+
+    // At '&' in content: appends a character or predefined entity to buf, or
+    // pushes an entity's text (returns true).
+    fn reference_in_content(self: *mut Reader) !bool {
+        if self.at(1) == '#' {
+            self.char_ref(&mut self.buf)!;
+            return false;
+        }
+        self.advance(1);
+        let n = self.name()!;
+        self.expect(";", "expected ; after an entity name")!;
+        let p = predefined(n);
+        if (p.len > 0) and not self.general.contains(n) {
+            self.buf.push_str(p)!;
+            return false;
+        }
+        let e = self.general.get(n) catch {
+            if (p.len > 0) {
+                self.buf.push_str(p)!;
+                return false;
+            }
+            return self.fail("reference to an undeclared entity");
+        };
+        if e.unparsed {
+            return self.fail("reference to an unparsed entity");
+        }
+        if e.external {
+            return self.fail("reference to an external entity (not loaded)");
+        }
+        self.push_entity(n, e.value, false)!;
+        return true;
+    }
+
+    fn push_entity(self: *mut Reader, name: []u8, value: []u8, in_attr: bool) !void {
+        for s in self.src.items() {
+            if strs.eq(s.entity, name) {
+                return self.fail("recursive entity reference");
+            }
+        }
+        if self.src.len > 64 {
+            return error.TooDeep;
+        }
+        self.expanded += value.len;
+        if self.expanded > MAX_EXPANSION {
+            return error.TooLarge;
+        }
+        self.src.push(Source.{ text: value, pos: 0, entity: name, in_attr: in_attr })!;
+    }
+
+    fn char_ref(self: *mut Reader, out: *mut strs.String) !void {
+        self.advance(2);
+        let mut v: u32 = 0;
+        let mut digits: usize = 0;
+        if self.at(0) == 'x' {
+            self.advance(1);
+            loop {
+                let h = hexv(self.at(0));
+                if h > 15 {
+                    break;
+                }
+                v = @min((v << 4) | h, 0x110000);
+                digits += 1;
+                self.advance(1);
+            }
+        } else {
+            while (self.at(0) >= '0') and (self.at(0) <= '9') {
+                v = @min((v * 10) + @as(u32, self.at(0) - '0'), 0x110000);
+                digits += 1;
+                self.advance(1);
+            }
+        }
+        if (digits == 0) or (self.at(0) != ';') {
+            return self.fail("malformed character reference");
+        }
+        self.advance(1);
+        if not is_char(v) {
+            return self.fail("a character reference to a character XML does not allow");
+        }
+        let mut b: [4]u8 = [0; 4];
+        out.push_str(strs.encode_rune(b[..], v))!;
+    }
+
+    fn comment(self: *mut Reader) !Token {
+        self.advance(4);
+        let s = self.cur();
+        let st = s.pos;
+        let end = strs.index_of_from(s.text, "--", st) catch return self.fail("unterminated comment");
+        if (end + 2 >= s.text.len) or (s.text[end + 2] != '>') {
+            return self.fail("-- in a comment");
+        }
+        s.pos = end + 3;
+        let mut t = Reader.token(T_COMMENT);
+        t.text = s.text[st..end];
+        return t;
+    }
+
+    fn cdata(self: *mut Reader) !Token {
+        self.advance(9);
+        let s = self.cur();
+        let st = s.pos;
+        let end = strs.index_of_from(s.text, "]]>", st) catch return self.fail("unterminated CDATA section");
+        s.pos = end + 3;
+        let mut t = Reader.token(T_CDATA);
+        t.text = s.text[st..end];
+        return t;
+    }
+
+    fn pi(self: *mut Reader) !Token {
+        self.advance(2);
+        let target = self.name()!;
+        if (target.len == 3) and ((target[0] | 32) == 'x') and ((target[1] | 32) == 'm') and ((target[2] | 32) == 'l') {
+            return self.fail("a processing instruction named xml (a misplaced XML declaration?)");
+        }
+        if self.opts.namespaces and strs.contains(target, ":") {
+            return self.fail("a colon in a processing instruction target");
+        }
+        let mut data: []u8 = "";
+        if not self.looking_at("?>") {
+            if not self.skip_space() {
+                return self.fail("expected white space after the target");
+            }
+            let s = self.cur();
+            let st = s.pos;
+            let end = strs.index_of_from(s.text, "?>",
+                                         st) catch return self.fail("unterminated processing instruction");
+            data = s.text[st..end];
+            s.pos = end;
+        }
+        self.advance(2);
+        let mut t = Reader.token(T_PI);
+        t.name = target;
+        t.local = target;
+        t.text = data;
+        return t;
+    }
+
+    // --- elements ------------------------------------------------------------------------
+
+    fn start_tag(self: *mut Reader) !Token {
+        self.advance(1);
+        let qname = self.name()!;
+        self.attrs.clear();
+        loop {
+            let sp = self.skip_space();
+            if self.looking_at("/>") or (self.at(0) == '>') {
+                break;
+            }
+            if not sp {
+                return self.fail("expected white space before an attribute");
+            }
+            let an = self.name()!;
+            _ = self.skip_space();
+            self.expect("=", "expected = after an attribute name")!;
+            _ = self.skip_space();
+            let v = self.attr_value(qname, an)!;
+            for a in self.attrs.items() {
+                if strs.eq(a.name, an) {
+                    return self.fail("duplicate attribute");
+                }
+            }
+            self.attrs.push(Attr.{ name: an, local: an, ns: "", value: v })!;
+        }
+        let empty = self.looking_at("/>");
+        if empty {
+            self.advance(2);
+        } else {
+            self.advance(1);
+        }
+        // attribute defaults from the DTD
+        for d in self.attdefs.items() {
+            if d.has_default and strs.eq(d.element, qname) {
+                let mut have = false;
+                for a in self.attrs.items() {
+                    if strs.eq(a.name, d.name) {
+                        have = true;
+                    }
+                }
+                if not have {
+                    self.attrs.push(Attr.{ name: d.name, local: d.name, ns: "", value: d.value })!;
+                }
+            }
+        }
+        if self.open.len >= MAX_DEPTH {
+            return error.TooDeep;
+        }
+        let depth = self.open.len + 1;
+        let mut t = Reader.token(T_START);
+        t.name = qname;
+        t.local = qname;
+        if self.opts.namespaces {
+            self.namespaces(qname, depth, &mut t)!;
+        }
+        t.attrs = self.ar.copy.[Attr](self.attrs.items())!;
+        t.self_closing = empty;
+        self.seen_root = true;
+        if empty {
+            // the END token comes next, and closes the namespace scope
+            self.pending_end = true;
+            self.pending_name = qname;
+            self.pending_local = t.local;
+            self.pending_ns = t.ns;
+            self.pending_depth = depth;
+        } else {
+            self.open.push(qname)!;
+            self.open_src.push(self.src.len - 1)!;
+        }
+        return t;
+    }
+
+    fn end_tag(self: *mut Reader) !Token {
+        self.advance(2);
+        let n = self.name()!;
+        _ = self.skip_space();
+        self.expect(">", "expected > to end an end tag")!;
+        if self.open.len == 0 {
+            return self.fail("an end tag with no open element");
+        }
+        let top = self.open.get(self.open.len - 1);
+        if not strs.eq(top, n) {
+            return self.fail("an end tag does not match its start tag");
+        }
+        if self.open_src.get(self.open_src.len - 1) != (self.src.len - 1) {
+            return self.fail("an element starts in one entity and ends in another");
+        }
+        let depth = self.open.len;
+        _ = self.open.pop()!;
+        _ = self.open_src.pop()!;
+        let mut t = Reader.token(T_END);
+        t.name = n;
+        t.local = n;
+        if self.opts.namespaces {
+            let c = strs.index_of_byte(n, ':') catch n.len;
+            if c < n.len {
+                t.local = n[c + 1..];
+                t.ns = self.lookup(n[..c]);
+            } else {
+                t.ns = self.lookup("");
+            }
+        }
+        self.close_scope(depth);
+        return t;
+    }
+    // --- attribute values ----------------------------------------------------------------
+
+    // A quoted attribute value, normalized (white space to spaces;
+    // references resolved; for non-CDATA declared types, trimmed and
+    // collapsed).
+    fn attr_value(self: *mut Reader, element: []u8, name: []u8) ![]u8 {
+        let q = self.at(0);
+        if (q != '"') and (q != '\'') {
+            return self.fail("expected a quoted attribute value");
+        }
+        self.advance(1);
+        self.buf2.clear();
+        let base = self.src.len;
+        loop {
+            if self.eof() {
+                if self.src.len > base {
+                    _ = self.src.pop()!;
+                    continue;
+                }
+                return self.fail("unterminated attribute value");
+            }
+            let c = self.at(0);
+            if (c == q) and (self.src.len == base) {
+                self.advance(1);
+                break;
+            }
+            if c == '<' {
+                return self.fail("< in an attribute value");
+            }
+            if c == '&' {
+                if self.at(1) == '#' {
+                    self.char_ref(&mut self.buf2)!;
+                    continue;
+                }
+                self.advance(1);
+                let n = self.name()!;
+                self.expect(";", "expected ; after an entity name")!;
+                let p = predefined(n);
+                if (p.len > 0) and not self.general.contains(n) {
+                    self.buf2.push_str(p)!;
+                    continue;
+                }
+                let e = self.general.get(n) catch {
+                    if p.len > 0 {
+                        self.buf2.push_str(p)!;
+                        continue;
+                    }
+                    return self.fail("reference to an undeclared entity in an attribute value");
+                };
+                if e.external or e.unparsed {
+                    return self.fail("reference to an external entity in an attribute value");
+                }
+                self.push_entity(n, e.value, true)!;
+                continue;
+            }
+            if is_space(c) {
+                self.buf2.push(' ')!;
+            } else {
+                self.buf2.push(c)!;
+            }
+            self.advance(1);
+        }
+        let mut v: []u8 = self.buf2.bytes();
+        // declared non-CDATA types: trim and collapse spaces
+        for d in self.attdefs.items() {
+            if not d.cdata and strs.eq(d.element, element) and strs.eq(d.name, name) {
+                v = collapse(v, &mut self.buf);
+                break;
+            }
+        }
+        return self.ar.dup(v);
+    }
+
+    // --- namespaces -----------------------------------------------------------------------
+
+    fn lookup(self: *Reader, prefix: []u8) []u8 {
+        if strs.eq(prefix, "xml") {
+            return XML_NS;
+        }
+        let mut i = self.bindings.len;
+        while i > 0 {
+            i -= 1;
+            let b = self.bindings.get(i);
+            if strs.eq(b.prefix, prefix) {
+                return b.uri;
+            }
+        }
+        return "";
+    }
+
+    fn bound(self: *Reader, prefix: []u8) bool {
+        if strs.eq(prefix, "xml") {
+            return true;
+        }
+        let mut i = self.bindings.len;
+        while i > 0 {
+            i -= 1;
+            let b = self.bindings.get(i);
+            if strs.eq(b.prefix, prefix) {
+                return b.uri.len > 0;
+            }
+        }
+        return false;
+    }
+
+    fn close_scope(self: *mut Reader, depth: usize) void {
+        while (self.bindings.len > 0) and (self.bindings.get(self.bindings.len - 1).depth >= depth) {
+            _ = self.bindings.pop() catch self.bindings.get(0);
+        }
+    }
+
+    // Declares the element's namespaces and resolves its names.
+    fn namespaces(self: *mut Reader, qname: []u8, depth: usize, t: *mut Token) !void {
+        let attrs = self.attrs.items();
+        for i in @as(usize, 0)..attrs.len {
+            let a = attrs[i];
+            let mut prefix: []u8 = "\x00";
+            if strs.eq(a.name, "xmlns") {
+                prefix = "";
+            } else if strs.starts_with(a.name, "xmlns:") {
+                prefix = a.name[6..];
+            }
+            if (prefix.len == 1) and (prefix[0] == 0) {
+                continue;
+            }
+            if strs.eq(prefix, "xmlns") {
+                return self.fail("the xmlns prefix cannot be declared");
+            }
+            if strs.eq(prefix, "xml") != strs.eq(a.value, XML_NS) {
+                return self.fail("the xml prefix is bound only to its own namespace");
+            }
+            if strs.eq(a.value, XMLNS_NS) {
+                return self.fail("the xmlns namespace cannot be bound");
+            }
+            if (prefix.len > 0) and (a.value.len == 0) {
+                return self.fail("a prefix cannot be undeclared (namespaces 1.0)");
+            }
+            if (prefix.len > 0) and (strs.contains(prefix, ":") or not is_name(prefix)) {
+                return self.fail("a bad namespace prefix");
+            }
+            for c in a.value {
+                if (strs.index_of_byte(" <>\"{}|\\^`\t\n", c) catch 99) != 99 {
+                    return self.fail("a namespace name is not a URI reference");
+                }
+            }
+            self.bindings.push(Binding.{ prefix: prefix, uri: a.value, depth: depth })!;
+        }
+        // the element
+        let p = qprefix(qname);
+        let l = qlocal(qname);
+        if not self.valid_qname(qname) {
+            return self.fail("a malformed qualified name");
+        }
+        if (p.len > 0) and not self.bound(p) {
+            return self.fail("an unbound namespace prefix");
+        }
+        if strs.eq(p, "xmlns") {
+            return self.fail("an element cannot have the xmlns prefix");
+        }
+        t.local = l;
+        t.ns = self.lookup(p);
+        // the attributes
+        for i in @as(usize, 0)..attrs.len {
+            let a = attrs[i];
+            if not self.valid_qname(a.name) {
+                return self.fail("a malformed qualified name");
+            }
+            let ap = qprefix(a.name);
+            let al = qlocal(a.name);
+            let mut ns: []u8 = "";
+            if strs.eq(a.name, "xmlns") or strs.eq(ap, "xmlns") {
+                ns = XMLNS_NS;
+            } else if ap.len > 0 {
+                if not self.bound(ap) {
+                    return self.fail("an unbound namespace prefix on an attribute");
+                }
+                ns = self.lookup(ap);
+            }
+            attrs[i].local = al;
+            if strs.eq(a.name, "xmlns") {
+                attrs[i].local = "xmlns";
+            }
+            attrs[i].ns = ns;
+        }
+        // no two attributes with the same expanded name
+        for i in @as(usize, 0)..attrs.len {
+            for j in i + 1..attrs.len {
+                if (attrs[i].ns.len > 0) and strs.eq(attrs[i].ns, attrs[j].ns) and
+                   strs.eq(attrs[i].local, attrs[j].local) {
+                    return self.fail("two attributes with the same namespace and local name");
+                }
+            }
+        }
+    }
+
+    fn valid_qname(self: *Reader, n: []u8) bool {
+        let c = strs.index_of_byte(n, ':') catch return true;
+        if (c == 0) or ((c + 1) == n.len) {
+            return false;
+        }
+        let rest = n[c + 1..];
+        if strs.contains(rest, ":") {
+            return false;
+        }
+        return is_name(rest);
+    }
+
+    // --- the DOCTYPE --------------------------------------------------------------------
+
+    fn doctype(self: *mut Reader) !Token {
+        self.advance(9);
+        if not self.skip_space() {
+            return self.fail("expected white space after DOCTYPE");
+        }
+        let n = self.name()!;
+        self.seen_doctype = true;
+        let sp = self.skip_space();
+        if self.looking_at("SYSTEM") or self.looking_at("PUBLIC") {
+            if not sp {
+                return self.fail("expected white space before the external ID");
+            }
+            self.external_id(false)!;
+            self.has_external_subset = true;
+            _ = self.skip_space();
+        }
+        if self.at(0) == '[' {
+            self.advance(1);
+            self.internal_subset()!;
+            _ = self.skip_space();
+        }
+        self.expect(">", "expected > to end the DOCTYPE")!;
+        let mut t = Reader.token(T_DOCTYPE);
+        t.name = n;
+        t.local = n;
+        return t;
+    }
+
+    fn quoted(self: *mut Reader) ![]u8 {
+        let q = self.at(0);
+        if (q != '"') and (q != '\'') {
+            return self.fail("expected a quoted literal");
+        }
+        self.advance(1);
+        let s = self.cur();
+        let st = s.pos;
+        while (s.pos < s.text.len) and (s.text[s.pos] != q) {
+            s.pos += 1;
+        }
+        if s.pos >= s.text.len {
+            return self.fail("unterminated literal");
+        }
+        let v = s.text[st..s.pos];
+        s.pos += 1;
+        return v;
+    }
+
+    // SYSTEM "uri" or PUBLIC "id" "uri" (the URI optional for notations).
+    fn external_id(self: *mut Reader, notation: bool) !void {
+        if self.looking_at("SYSTEM") {
+            self.advance(6);
+            if not self.skip_space() {
+                return self.fail("expected white space after SYSTEM");
+            }
+            _ = self.quoted()!;
+            return;
+        }
+        self.advance(6);
+        if not self.skip_space() {
+            return self.fail("expected white space after PUBLIC");
+        }
+        let id = self.quoted()!;
+        for c in id {
+            let ok = ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or
+                     ((strs.index_of_byte(" \n-'()+,./:=?;!*#@$_%", c) catch 99) != 99);
+            if not ok {
+                return self.fail("a bad character in a public identifier");
+            }
+        }
+        let sp = self.skip_space();
+        if notation and ((self.at(0) != '"') and (self.at(0) != '\'')) {
+            return;
+        }
+        if not sp {
+            return self.fail("expected white space between the public and system IDs");
+        }
+        _ = self.quoted()!;
+    }
+
+    fn internal_subset(self: *mut Reader) !void {
+        let base = self.src.len;
+        loop {
+            _ = self.skip_space();
+            if self.eof() {
+                if self.src.len > base {
+                    _ = self.src.pop()!;
+                    continue;
+                }
+                return self.fail("unterminated internal subset");
+            }
+            let c = self.at(0);
+            if (c == ']') and (self.src.len == base) {
+                self.advance(1);
+                return;
+            }
+            if c == '%' {
+                // a parameter entity reference: its text holds declarations
+                self.advance(1);
+                let n = self.name()!;
+                self.expect(";", "expected ; after a parameter entity name")!;
+                let e = self.params.get(n) catch return self.fail("reference to an undeclared parameter entity");
+                if e.external {
+                    // not loaded: the rest of the subset can't be trusted for defaults
+                    continue;
+                }
+                self.push_entity(n, e.value, false)!;
+                continue;
+            }
+            if self.looking_at("<!--") {
+                _ = self.comment()!;
+                continue;
+            }
+            if self.looking_at("<?") {
+                _ = self.pi()!;
+                continue;
+            }
+            if self.looking_at("<!ENTITY") {
+                self.entity_decl()!;
+                continue;
+            }
+            if self.looking_at("<!ATTLIST") {
+                self.attlist_decl()!;
+                continue;
+            }
+            if self.looking_at("<!ELEMENT") {
+                self.element_decl()!;
+                continue;
+            }
+            if self.looking_at("<!NOTATION") {
+                self.skip_decl()!;
+                continue;
+            }
+            return self.fail("unexpected content in the internal subset");
+        }
+    }
+
+    // Skips a declaration to its >, over quoted literals.
+    fn skip_decl(self: *mut Reader) !void {
+        let notation = self.looking_at("<!NOTATION");
+        self.advance(2);
+        let _kw = self.name()!;
+        if not self.skip_space() {
+            return self.fail("expected white space in a declaration");
+        }
+        let _n = self.name()!;
+        if notation {
+            _ = self.skip_space();
+            if self.looking_at("SYSTEM") or self.looking_at("PUBLIC") {
+                self.external_id(true)!;
+            } else {
+                return self.fail("a notation needs an external ID");
+            }
+            _ = self.skip_space();
+            self.expect(">", "expected > to end a declaration")!;
+            return;
+        }
+        let mut depth: i32 = 0;
+        loop {
+            if self.eof() {
+                return self.fail("unterminated declaration");
+            }
+            let c = self.at(0);
+            if (c == '"') or (c == '\'') {
+                _ = self.quoted()!;
+                continue;
+            }
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            } else if (c == '>') and (depth == 0) {
+                self.advance(1);
+                return;
+            } else if (c == '<') or (c == '&') {
+                return self.fail("unexpected markup in a declaration");
+            }
+            self.advance(1);
+        }
+    }
+
+    // <!ELEMENT name contentspec>: checked, not kept (the parser does not
+    // validate).
+    fn element_decl(self: *mut Reader) !void {
+        self.advance(9);
+        if not self.skip_space() {
+            return self.fail("expected white space after ELEMENT");
+        }
+        _ = self.name()!;
+        if not self.skip_space() {
+            return self.fail("expected white space after the element name");
+        }
+        if self.looking_at("EMPTY") {
+            self.advance(5);
+        } else if self.looking_at("ANY") {
+            self.advance(3);
+        } else if self.at(0) == '(' {
+            let s = self.cur();
+            let save = s.pos;
+            self.advance(1);
+            _ = self.skip_space();
+            if self.looking_at("#PCDATA") {
+                // Mixed: (#PCDATA) or (#PCDATA | a | b)*
+                self.advance(7);
+                let mut names: usize = 0;
+                loop {
+                    _ = self.skip_space();
+                    if self.at(0) == ')' {
+                        self.advance(1);
+                        break;
+                    }
+                    if self.at(0) != '|' {
+                        return self.fail("expected | or ) in mixed content");
+                    }
+                    self.advance(1);
+                    _ = self.skip_space();
+                    _ = self.name()!;
+                    names += 1;
+                }
+                if self.at(0) == '*' {
+                    self.advance(1);
+                } else if names > 0 {
+                    return self.fail("mixed content with names must end with )*");
+                }
+            } else {
+                self.cur().pos = save;
+                self.content_particle(0)!;
+            }
+        } else {
+            return self.fail("expected a content specification");
+        }
+        _ = self.skip_space();
+        self.expect(">", "expected > to end an element declaration")!;
+    }
+
+    // A choice or sequence (or a name), with an optional ?, * or +.
+    fn content_particle(self: *mut Reader, depth: usize) !void {
+        if depth > 64 {
+            return error.TooDeep;
+        }
+        if self.at(0) == '(' {
+            self.advance(1);
+            let mut sep: u8 = 0;
+            let mut count: usize = 0;
+            loop {
+                _ = self.skip_space();
+                self.content_particle(depth + 1)!;
+                count += 1;
+                _ = self.skip_space();
+                let c = self.at(0);
+                if c == ')' {
+                    self.advance(1);
+                    break;
+                }
+                if (c != '|') and (c != ',') {
+                    return self.fail("expected | , or ) in a content model");
+                }
+                if (sep != 0) and (sep != c) {
+                    return self.fail("mixed | and , in a content model");
+                }
+                sep = c;
+                self.advance(1);
+            }
+        } else {
+            if self.looking_at("#PCDATA") {
+                return self.fail("#PCDATA in a content model");
+            }
+            _ = self.name()!;
+        }
+        let q = self.at(0);
+        if (q == '?') or (q == '*') or (q == '+') {
+            self.advance(1);
+        }
+    }
+
+    fn entity_decl(self: *mut Reader) !void {
+        self.advance(8);
+        if not self.skip_space() {
+            return self.fail("expected white space after ENTITY");
+        }
+        let mut param = false;
+        if self.at(0) == '%' {
+            self.advance(1);
+            if not self.skip_space() {
+                return self.fail("expected white space after %");
+            }
+            param = true;
+        }
+        let n = self.name()!;
+        if self.opts.namespaces and strs.contains(n, ":") {
+            return self.fail("a colon in an entity name");
+        }
+        if not self.skip_space() {
+            return self.fail("expected white space after the entity name");
+        }
+        let mut e = Entity.{ value: "", external: false, unparsed: false };
+        if (self.at(0) == '"') or (self.at(0) == '\'') {
+            e.value = self.entity_value()!;
+        } else if self.looking_at("SYSTEM") or self.looking_at("PUBLIC") {
+            self.external_id(false)!;
+            e.external = true;
+            let sp = self.skip_space();
+            if self.looking_at("NDATA") {
+                if param or not sp {
+                    return self.fail("bad NDATA");
+                }
+                self.advance(5);
+                if not self.skip_space() {
+                    return self.fail("expected white space after NDATA");
+                }
+                _ = self.name()!;
+                e.unparsed = true;
+            }
+        } else {
+            return self.fail("expected an entity value or external ID");
+        }
+        _ = self.skip_space();
+        self.expect(">", "expected > to end an entity declaration")!;
+        // the first declaration counts
+        let mut table = &mut self.general;
+        if param {
+            table = &mut self.params;
+        }
+        if not table.contains(n) {
+            if not param and (predefined(n).len > 0) and not e.external {
+                // a predefined entity may be declared, as the escaped character
+                table.put(n, e)!;
+            } else {
+                table.put(n, e)!;
+            }
+        }
+    }
+
+    // An entity's literal value: character references expanded, general
+    // entity references kept as they are (and checked).
+    fn entity_value(self: *mut Reader) ![]u8 {
+        let q = self.at(0);
+        self.advance(1);
+        self.buf2.clear();
+        loop {
+            if self.eof() {
+                return self.fail("unterminated entity value");
+            }
+            let c = self.at(0);
+            if c == q {
+                self.advance(1);
+                break;
+            }
+            if c == '%' {
+                return self.fail("a parameter entity reference in an entity value of the internal subset");
+            }
+            if c == '&' {
+                if self.at(1) == '#' {
+                    self.char_ref(&mut self.buf2)!;
+                    continue;
+                }
+                self.advance(1);
+                let n = self.name()!;
+                if self.at(0) != ';' {
+                    return self.fail("expected ; after an entity name");
+                }
+                self.advance(1);
+                self.buf2.push('&')!;
+                self.buf2.push_str(n)!;
+                self.buf2.push(';')!;
+                continue;
+            }
+            self.buf2.push(c)!;
+            self.advance(1);
+        }
+        return self.ar.dup(self.buf2.bytes());
+    }
+
+    fn attlist_decl(self: *mut Reader) !void {
+        self.advance(9);
+        if not self.skip_space() {
+            return self.fail("expected white space after ATTLIST");
+        }
+        let element = self.name()!;
+        loop {
+            let sp = self.skip_space();
+            if self.at(0) == '>' {
+                self.advance(1);
+                return;
+            }
+            if not sp {
+                return self.fail("expected white space in an attribute list");
+            }
+            let an = self.name()!;
+            if not self.skip_space() {
+                return self.fail("expected white space after the attribute name");
+            }
+            let mut cdata = false;
+            if self.at(0) == '(' {
+                self.enumeration()!;
+            } else {
+                let ty = self.name()!;
+                if strs.eq(ty, "CDATA") {
+                    cdata = true;
+                } else if strs.eq(ty, "NOTATION") {
+                    if not self.skip_space() {
+                        return self.fail("expected white space after NOTATION");
+                    }
+                    self.enumeration()!;
+                } else {
+                    let known = ["ID", "IDREF", "IDREFS", "ENTITY", "ENTITIES", "NMTOKEN", "NMTOKENS"];
+                    let mut ok = false;
+                    for k in known {
+                        if strs.eq(ty, k) {
+                            ok = true;
+                        }
+                    }
+                    if not ok {
+                        return self.fail("an unknown attribute type");
+                    }
+                }
+            }
+            if not self.skip_space() {
+                return self.fail("expected white space before the default");
+            }
+            let mut has_default = false;
+            let mut value: []u8 = "";
+            if self.looking_at("#REQUIRED") {
+                self.advance(9);
+            } else if self.looking_at("#IMPLIED") {
+                self.advance(8);
+            } else {
+                if self.looking_at("#FIXED") {
+                    self.advance(6);
+                    if not self.skip_space() {
+                        return self.fail("expected white space after #FIXED");
+                    }
+                }
+                value = self.attr_value(element, an)!;
+                if not cdata {
+                    value = self.ar.dup(collapse(value, &mut self.buf))!;
+                }
+                has_default = true;
+            }
+            // the first declaration of an attribute counts
+            let mut dup = false;
+            for d in self.attdefs.items() {
+                if strs.eq(d.element, element) and strs.eq(d.name, an) {
+                    dup = true;
+                }
+            }
+            if not dup {
+                self.attdefs.push(AttDef.{ element: element, name: an, cdata: cdata, has_default: has_default,
+                                           value: value })!;
+            }
+        }
+    }
+
+    fn enumeration(self: *mut Reader) !void {
+        self.advance(1);
+        loop {
+            _ = self.skip_space();
+            let s = self.cur();
+            let st = s.pos;
+            while (s.pos < s.text.len) and not is_space(s.text[s.pos]) and (s.text[s.pos] != '|') and
+                  (s.text[s.pos] != ')') {
+                s.pos += 1;
+            }
+            if not is_nmtoken(s.text[st..s.pos]) {
+                return self.fail("a bad token in an enumeration");
+            }
+            _ = self.skip_space();
+            if self.at(0) == ')' {
+                self.advance(1);
+                return;
+            }
+            if self.at(0) != '|' {
+                return self.fail("expected | or ) in an enumeration");
+            }
+            self.advance(1);
+        }
+    }
+}
+
+fn hexv(c: u8) u32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u32, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(u32, c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return @as(u32, c - 'A') + 10;
+    }
+    return 99;
+}
+
+fn all_digits(s: []u8) bool {
+    for c in s {
+        if (c < '0') or (c > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn predefined(n: []u8) []u8 {
+    if strs.eq(n, "lt") {
+        return "<";
+    }
+    if strs.eq(n, "gt") {
+        return ">";
+    }
+    if strs.eq(n, "amp") {
+        return "&";
+    }
+    if strs.eq(n, "apos") {
+        return "'";
+    }
+    if strs.eq(n, "quot") {
+        return "\"";
+    }
+    return "";
+}
+
+// "p:local" -> "p" and "local"; "local" -> "" and "local".
+fn qprefix(n: []u8) []u8 {
+    let c = strs.index_of_byte(n, ':') catch return "";
+    return n[..c];
+}
+
+fn qlocal(n: []u8) []u8 {
+    let c = strs.index_of_byte(n, ':') catch return n;
+    return n[c + 1..];
+}
+
+// Trims spaces and collapses runs of them (into buf; returns a view of it).
+fn collapse(v: []u8, buf: *mut strs.String) []u8 {
+    buf.clear();
+    let mut space = false;
+    for c in v {
+        if c == ' ' {
+            space = buf.len > 0;
+            continue;
+        }
+        if space {
+            buf.push(' ') catch {};
+            space = false;
+        }
+        buf.push(c) catch {};
+    }
+    return buf.bytes();
+}
+
+// -----------------------------------------------------------------------------
+// The tree
+// -----------------------------------------------------------------------------
+
+pub struct PI {
+    target: []u8,
+    data: []u8,
+}
+
+pub union Node {
+    Element: *Element,
+    Text: []u8,  // character data (CDATA sections included)
+    Comment: []u8,
+    PI: PI,
+}
+
+pub struct Element {
+    name: []u8,  // as written
+    local: []u8,
+    ns: []u8,  // the namespace name ("" for none)
+    attrs: []Attr,
+    children: []Node,
+
+    /// An attribute's value by its name as written ("id", "p:x").
+    pub fn attr(self: *Element, name: []u8) ![]u8 {
+        for a in self.attrs {
+            if strs.eq(a.name, name) {
+                return a.value;
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// An attribute's value by namespace and local name.
+    pub fn attr_ns(self: *Element, ns: []u8, local: []u8) ![]u8 {
+        for a in self.attrs {
+            if strs.eq(a.ns, ns) and strs.eq(a.local, local) {
+                return a.value;
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// The first child element with this local name.
+    pub fn child(self: *Element, local: []u8) !*Element {
+        for c in self.children {
+            match c {
+                .Element(e) => {
+                    if strs.eq(e.local, local) {
+                        return e;
+                    }
+                }
+                else => {}
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// The child elements, in order.
+    pub fn elements(self: *Element) Elements {
+        return Elements.{ e: self, i: 0 };
+    }
+
+    /// All the text inside the element (free it with mem.free).
+    pub fn text_alloc(self: *Element) ![]mut u8 {
+        let mut s = strs.String.init();
+        collect_text(self, &mut s, 0) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+}
+
+fn collect_text(e: *Element, s: *mut strs.String, depth: usize) !void {
+    if depth > MAX_DEPTH {
+        return error.TooDeep;
+    }
+    for c in e.children {
+        match c {
+            .Text(t)    => { s.push_str(t)!; }
+            .Element(x) => { collect_text(x, s, depth + 1)!; }
+            else => {}
+        }
+    }
+}
+
+pub struct Elements {
+    e: *Element,
+    i: usize,
+
+    /// The next child element, or NotFound.
+    pub fn next(self: *mut Elements) !*Element {
+        while self.i < self.e.children.len {
+            let c = self.e.children[self.i];
+            self.i += 1;
+            match c {
+                .Element(x) => { return x; }
+                else => {}
+            }
+        }
+        return error.NotFound;
+    }
+}
+
+/// A parsed document.
+pub struct Document {
+    root: *Element,
+    prolog: []Node,  // comments and processing instructions before the root
+    epilog: []Node,  // and after it
+    doctype: []u8,   // the DOCTYPE's name, if there was one
+    reader: Reader,  // (owns the memory)
+
+    pub fn deinit(self: *mut Document) void {
+        self.reader.deinit();
+    }
+}
+
+/// Where and why parsing failed.
+pub struct ErrorInfo {
+    line: u32,
+    message: []u8,
+}
+
+struct Frame {
+    el: *mut Element,
+    kids: vec.Vec.[Node],
+}
+
+pub fn parse(text: []u8) !Document {
+    let mut info = ErrorInfo.{ line: 0, message: "" };
+    return parse_with(text, Options.default(), &mut info);
+}
+
+pub fn parse_with(text: []u8, opts: Options, info: *mut ErrorInfo) !Document {
+    let mut m: []u8 = "";
+    let mut r = Reader.init_info(text, opts, &mut m) catch |e| {
+        info.message = m;
+        info.line = 1;
+        return e;
+    };
+    let mut doc = Document.{ root: @ptr_from_int(*Element, 8), prolog: @slice_from_ptr(@ptr_from_int(*Node, 8), 0),
+                             epilog: @slice_from_ptr(@ptr_from_int(*Node, 8), 0), doctype: "", reader: r };
+    build(&mut doc) catch |e| {
+        info.message = doc.reader.error_message();
+        info.line = doc.reader.error_line();
+        doc.reader.deinit();
+        return e;
+    };
+    return doc;
+}
+
+fn build(doc: *mut Document) !void {
+    let r = &mut doc.reader;
+    let mut frames = vec.Vec.[Frame].init();
+    defer {
+        for f in frames.items() {
+            let mut g = f;
+            g.kids.deinit();
+        }
+        frames.deinit();
+    }
+    let mut top = vec.Vec.[Node].init();  // prolog, then epilog
+    defer top.deinit();
+    let mut prolog_len: usize = 0;
+    let mut text = strs.String.init();
+    defer text.deinit();
+    loop {
+        let t = r.next()!;
+        // adjacent text (and CDATA) becomes one node
+        if (t.kind == T_TEXT) or (t.kind == T_CDATA) {
+            text.push_str(t.text)!;
+            continue;
+        }
+        if (text.len > 0) and (frames.len > 0) {
+            let f = frames.get_ptr(frames.len - 1);
+            f.kids.push(Node.Text(r.ar.dup(text.bytes())!))!;
+            text.clear();
+        }
+        match t.kind {
+            1 => {
+                let el = @cast_slice(Element, r.ar.bytes(@size_of(Element))!);
+                el[0] = Element.{ name: t.name, local: t.local, ns: t.ns, attrs: t.attrs,
+                                  children: @slice_from_ptr(@ptr_from_int(*Node, 8), 0) };
+                frames.push(Frame.{ el: &mut el[0], kids: vec.Vec.[Node].init() })!;
+            }
+            2 => {
+                let mut f = frames.pop()!;
+                f.el.children = r.ar.copy.[Node](f.kids.items()) catch |e| {
+                    f.kids.deinit();
+                    return e;
+                };
+                f.kids.deinit();
+                if frames.len == 0 {
+                    doc.root = f.el;
+                    prolog_len = top.len;
+                } else {
+                    frames.get_ptr(frames.len - 1).kids.push(Node.Element(f.el))!;
+                }
+            }
+            5 => { add_node(&mut frames, &mut top, Node.Comment(t.text))!; }
+            6 => { add_node(&mut frames, &mut top, Node.PI(PI.{ target: t.name, data: t.text }))!; }
+            7 => { doc.doctype = t.name; }
+            8 => { break; }
+            else => {}
+        }
+    }
+    let all = r.ar.copy.[Node](top.items())!;
+    doc.prolog = all[..prolog_len];
+    doc.epilog = all[prolog_len..];
+}
+
+fn add_node(frames: *mut vec.Vec.[Frame], top: *mut vec.Vec.[Node], n: Node) !void {
+    if frames.len > 0 {
+        frames.get_ptr(frames.len - 1).kids.push(n)!;
+    } else {
+        top.push(n)!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+/// Writes text escaped for XML content (&, <, >).
+pub fn escape_text(w: io.Writer, s: []u8) !void {
+    let mut st: usize = 0;
+    for i in @as(usize, 0)..s.len {
+        let c = s[i];
+        let mut rep: []u8 = "";
+        if c == '&' {
+            rep = "&amp;";
+        } else if c == '<' {
+            rep = "&lt;";
+        } else if c == '>' {
+            rep = "&gt;";
+        } else if c == '\r' {
+            rep = "&#xD;";
+        }
+        if rep.len > 0 {
+            w.write_all(s[st..i])!;
+            w.write_all(rep)!;
+            st = i + 1;
+        }
+    }
+    w.write_all(s[st..])!;
+}
+
+/// Writes text escaped for a double-quoted attribute value.
+pub fn escape_attr(w: io.Writer, s: []u8) !void {
+    let mut st: usize = 0;
+    for i in @as(usize, 0)..s.len {
+        let c = s[i];
+        let mut rep: []u8 = "";
+        if c == '&' {
+            rep = "&amp;";
+        } else if c == '<' {
+            rep = "&lt;";
+        } else if c == '"' {
+            rep = "&quot;";
+        } else if c == '\t' {
+            rep = "&#x9;";
+        } else if c == '\n' {
+            rep = "&#xA;";
+        } else if c == '\r' {
+            rep = "&#xD;";
+        }
+        if rep.len > 0 {
+            w.write_all(s[st..i])!;
+            w.write_all(rep)!;
+            st = i + 1;
+        }
+    }
+    w.write_all(s[st..])!;
+}
+
+/// An XML writer: start, attr, text, end; pretty() indents elements that
+/// hold only elements.
+pub struct Writer {
+    out: io.Writer,
+    names: vec.Vec.[[]u8],
+    mixed: vec.Vec.[bool],  // per open element: text was written in it
+    in_start: bool,         // the start tag is still open (attributes may follow)
+    indent: u32,            // 0: no indentation
+    wrote_any: bool,
+
+    pub fn init(out: io.Writer) Writer {
+        return Writer.{ out: out, names: vec.Vec.[[]u8].init(), mixed: vec.Vec.[bool].init(), in_start: false,
+                        indent: 0, wrote_any: false };
+    }
+
+    pub fn pretty(out: io.Writer, indent: u32) Writer {
+        let mut w = Writer.init(out);
+        w.indent = indent;
+        return w;
+    }
+
+    pub fn deinit(self: *mut Writer) void {
+        self.names.deinit();
+        self.mixed.deinit();
+    }
+
+    /// <?xml version="1.0" encoding="UTF-8"?>
+    pub fn declaration(self: *mut Writer) !void {
+        self.out.write_all("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")!;
+        self.wrote_any = true;
+    }
+
+    fn close_start(self: *mut Writer) !void {
+        if self.in_start {
+            self.out.write_all(">")!;
+            self.in_start = false;
+        }
+    }
+
+    fn newline(self: *mut Writer, depth: usize) !void {
+        if (self.indent == 0) or not self.wrote_any {
+            return;
+        }
+        if (self.mixed.len > 0) and self.mixed.get(self.mixed.len - 1) {
+            return;
+        }
+        self.out.write_all("\n")!;
+        for _k in @as(usize, 0)..depth * @as(usize, self.indent) {
+            self.out.write_all(" ")!;
+        }
+    }
+
+    pub fn start(self: *mut Writer, name: []u8) !void {
+        if not is_name(name) {
+            return error.SyntaxError;
+        }
+        self.close_start()!;
+        self.newline(self.names.len)!;
+        self.out.write_all("<")!;
+        self.out.write_all(name)!;
+        self.names.push(name)!;
+        self.mixed.push(false)!;
+        self.in_start = true;
+        self.wrote_any = true;
+    }
+
+    pub fn attr(self: *mut Writer, name: []u8, value: []u8) !void {
+        if not self.in_start or not is_name(name) {
+            return error.SyntaxError;
+        }
+        self.out.write_all(" ")!;
+        self.out.write_all(name)!;
+        self.out.write_all("=\"")!;
+        escape_attr(self.out, value)!;
+        self.out.write_all("\"")!;
+    }
+
+    pub fn text(self: *mut Writer, s: []u8) !void {
+        self.close_start()!;
+        if self.mixed.len > 0 {
+            self.mixed.set(self.mixed.len - 1, true);
+        }
+        escape_text(self.out, s)!;
+    }
+
+    /// A CDATA section (split where s contains "]]>").
+    pub fn cdata(self: *mut Writer, s: []u8) !void {
+        self.close_start()!;
+        if self.mixed.len > 0 {
+            self.mixed.set(self.mixed.len - 1, true);
+        }
+        self.out.write_all("<![CDATA[")!;
+        let mut st: usize = 0;
+        loop {
+            let at = strs.index_of_from(s, "]]>", st) catch break;
+            self.out.write_all(s[st..at + 2])!;
+            self.out.write_all("]]><![CDATA[")!;
+            st = at + 2;
+        }
+        self.out.write_all(s[st..])!;
+        self.out.write_all("]]>")!;
+    }
+
+    pub fn comment(self: *mut Writer, s: []u8) !void {
+        if strs.contains(s, "--") or strs.ends_with(s, "-") {
+            return error.SyntaxError;
+        }
+        self.close_start()!;
+        self.newline(self.names.len)!;
+        self.out.write_all("<!--")!;
+        self.out.write_all(s)!;
+        self.out.write_all("-->")!;
+        self.wrote_any = true;
+    }
+
+    pub fn pi(self: *mut Writer, target: []u8, data: []u8) !void {
+        if not is_name(target) or strs.contains(data, "?>") {
+            return error.SyntaxError;
+        }
+        self.close_start()!;
+        self.newline(self.names.len)!;
+        self.out.write_all("<?")!;
+        self.out.write_all(target)!;
+        if data.len > 0 {
+            self.out.write_all(" ")!;
+            self.out.write_all(data)!;
+        }
+        self.out.write_all("?>")!;
+        self.wrote_any = true;
+    }
+
+    /// Ends the innermost element (as <x/> if it is empty).
+    pub fn end(self: *mut Writer) !void {
+        let name = self.names.pop() catch return error.BadNesting;
+        let was_mixed = self.mixed.pop() catch false;
+        if self.in_start {
+            self.out.write_all("/>")!;
+            self.in_start = false;
+            return;
+        }
+        if not was_mixed {
+            self.newline(self.names.len)!;
+        }
+        self.out.write_all("</")!;
+        self.out.write_all(name)!;
+        self.out.write_all(">")!;
+    }
+
+    /// Writes a whole element (and what it holds).
+    pub fn element(self: *mut Writer, e: *Element) !void {
+        self.start(e.name)!;
+        for a in e.attrs {
+            self.attr(a.name, a.value)!;
+        }
+        for c in e.children {
+            match c {
+                .Element(x) => { self.element(x)!; }
+                .Text(t)    => { self.text(t)!; }
+                .Comment(t) => { self.comment(t)!; }
+                .PI(p)      => { self.pi(p.target, p.data)!; }
+            }
+        }
+        self.end()!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Canonical XML (1.0, with comments)
+// -----------------------------------------------------------------------------
+
+/// The document's canonical form (W3C Canonical XML 1.0 with comments; free
+/// it with mem.free): no declaration or DOCTYPE, attributes sorted,
+/// namespace declarations only where they change something, empty elements
+/// as start-end pairs, and fixed escaping.
+pub fn canonicalize(doc: *Document) ![]mut u8 {
+    let mut s = strs.String.init();
+    let mut rendered = vec.Vec.[Binding].init();
+    defer rendered.deinit();
+    canon_doc(doc, s.writer(), &mut rendered) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+fn canon_doc(doc: *Document, w: io.Writer, rendered: *mut vec.Vec.[Binding]) !void {
+    for n in doc.prolog {
+        canon_node(n, w, rendered, 0)!;
+        w.write_all("\n")!;
+    }
+    canon_element(doc.root, w, rendered, 1)!;
+    for n in doc.epilog {
+        w.write_all("\n")!;
+        canon_node(n, w, rendered, 0)!;
+    }
+}
+
+fn canon_node(n: Node, w: io.Writer, rendered: *mut vec.Vec.[Binding], depth: usize) !void {
+    match n {
+        .Element(e) => { canon_element(e, w, rendered, depth + 1)!; }
+        .Text(t)    => { escape_text(w, t)!; }
+        .Comment(t) => {
+            w.write_all("<!--")!;
+            w.write_all(t)!;
+            w.write_all("-->")!;
+        }
+        .PI(p) => {
+            w.write_all("<?")!;
+            w.write_all(p.target)!;
+            if p.data.len > 0 {
+                w.write_all(" ")!;
+                w.write_all(p.data)!;
+            }
+            w.write_all("?>")!;
+        }
+    }
+}
+
+fn rendered_uri(rendered: *vec.Vec.[Binding], prefix: []u8) []u8 {
+    let mut i = rendered.len;
+    while i > 0 {
+        i -= 1;
+        let b = rendered.get(i);
+        if strs.eq(b.prefix, prefix) {
+            return b.uri;
+        }
+    }
+    return "";
+}
+
+fn attr_less(a: Attr, b: Attr) bool {
+    let c = strs.compare(a.ns, b.ns);
+    if c != 0 {
+        return c < 0;
+    }
+    return strs.compare(a.local, b.local) < 0;
+}
+
+fn ns_less(a: Attr, b: Attr) bool {
+    // xmlns first, then by prefix
+    if strs.eq(a.name, "xmlns") {
+        return not strs.eq(b.name, "xmlns");
+    }
+    if strs.eq(b.name, "xmlns") {
+        return false;
+    }
+    return strs.compare(a.local, b.local) < 0;
+}
+
+fn canon_element(e: *Element, w: io.Writer, rendered: *mut vec.Vec.[Binding], depth: usize) !void {
+    if depth > (MAX_DEPTH + 1) {
+        return error.TooDeep;
+    }
+    let mark = rendered.len;
+    let mut decls = vec.Vec.[Attr].init();
+    defer decls.deinit();
+    let mut plain = vec.Vec.[Attr].init();
+    defer plain.deinit();
+    for a in e.attrs {
+        if strs.eq(a.ns, XMLNS_NS) {
+            let mut prefix = a.local;
+            if strs.eq(a.name, "xmlns") {
+                prefix = "";
+            }
+            // only what changes the namespaces in effect (xml is always in effect)
+            if strs.eq(rendered_uri(rendered, prefix), a.value) or strs.eq(prefix, "xml") {
+                continue;
+            }
+            decls.push(a)!;
+            rendered.push(Binding.{ prefix: prefix, uri: a.value, depth: depth })!;
+        } else {
+            plain.push(a)!;
+        }
+    }
+    vec.sort(decls.items(), ns_less);
+    vec.sort(plain.items(), attr_less);
+    w.write_all("<")!;
+    w.write_all(e.name)!;
+    for a in decls.items() {
+        w.write_all(" ")!;
+        w.write_all(a.name)!;
+        w.write_all("=\"")!;
+        escape_attr(w, a.value)!;
+        w.write_all("\"")!;
+    }
+    for a in plain.items() {
+        w.write_all(" ")!;
+        w.write_all(a.name)!;
+        w.write_all("=\"")!;
+        escape_attr(w, a.value)!;
+        w.write_all("\"")!;
+    }
+    w.write_all(">")!;
+    for c in e.children {
+        canon_node(c, w, rendered, depth)!;
+    }
+    w.write_all("</")!;
+    w.write_all(e.name)!;
+    w.write_all(">")!;
+    rendered.truncate(mark);
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn next_line(data: []u8, at: *mut usize) []u8 {
+    let st = at.*;
+    let nl = strs.index_of_from(data, "\n", st) catch data.len;
+    at.* = nl + 1;
+    return data[st..nl];
+}
+
+test "a corpus against libxml2's canonical forms" {
+    let data = fs.read_file("std/xml/testdata/cases.txt") catch return;
+    defer mem.free(data);
+    let mut at: usize = 0;
+    _ = next_line(data, &mut at);
+    let mut failed: usize = 0;
+    let mut n: usize = 0;
+    while at < data.len {
+        let head = next_line(data, &mut at);
+        let mut f = strs.fields(head);
+        _ = f.next() catch break;
+        let id = f.next() catch break;
+        let ilen = fmt.parse_int.[usize](f.next() catch break) catch break;
+        let elen = fmt.parse_int.[i64](f.next() catch break) catch break;
+        let input = data[at..at + ilen];
+        at += ilen + 1;
+        let mut want: []u8 = "";
+        if elen >= 0 {
+            let k = @truncate(usize, @bit_cast(u64, elen));
+            want = data[at..at + k];
+            at += k + 1;
+        }
+        n += 1;
+        let mut info = ErrorInfo.{ line: 0, message: "" };
+        let got = parse_with(input, Options.default(), &mut info);
+        let mut ok = false;
+        let mut doc = got catch |e| {
+            _ = e;
+            if elen >= 0 {
+                fmt.print(
+                    "case {}: rejected ({}) but libxml2 accepts it\n", [fmt.str(id), fmt.str(info.message)]) catch {};
+                failed += 1;
+            }
+            continue;
+        };
+        if elen < 0 {
+            fmt.print("case {}: accepted but libxml2 rejects it\n", [fmt.str(id)]) catch {};
+        } else {
+            let c = canonicalize(&doc)!;
+            ok = strs.eq(c, want);
+            if not ok {
+                fmt.print("case {}: got {} want {}\n", [fmt.str(id), fmt.str(c), fmt.str(want)]) catch {};
+            }
+            mem.free(c);
+        }
+        doc.deinit();
+        if not ok {
+            failed += 1;
+        }
+    }
+    @expect(n > 80);
+    @expect_eq(failed, 0);
+}
+
+test "the tree and the reader" {
+    let text =
+        "<?xml version=\"1.0\"?>\n<!-- top -->\n<lib xmlns=\"http://lib\" xmlns:x=\"http://x\"><book id=\"1\" x:rare=\"yes\"><title>A &amp; B</title></book><book id=\"2\"><title>C<![CDATA[<d>]]></title></book></lib>";
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    @expect_eq(doc.root.local, "lib");
+    @expect_eq(doc.root.ns, "http://lib");
+    @expect_eq(doc.prolog.len, 1);
+    let mut it = doc.root.elements();
+    let b1 = it.next()!;
+    @expect_eq(b1.attr("id")!, "1");
+    @expect_eq(b1.attr_ns("http://x", "rare")!, "yes");
+    let t1 = b1.child("title")!.text_alloc()!;
+    defer mem.free(t1);
+    @expect_eq(t1, "A & B");
+    let b2 = it.next()!;
+    let t2 = b2.text_alloc()!;
+    defer mem.free(t2);
+    @expect_eq(t2, "C<d>");
+    @expect(fails_el(it.next()));
+    // streaming
+    let mut r = Reader.init("<a x='1'><b/>t</a>", Options.default())!;
+    defer r.deinit();
+    let kinds: [6]u8 = [T_START, T_START, T_END, T_TEXT, T_END, T_END_DOCUMENT];
+    for k in kinds {
+        let t = r.next()!;
+        @expect_eq(t.kind, k);
+    }
+}
+
+fn fails_el(r: !*Element) bool {
+    _ = r catch return true;
+    return false;
+}
+
+test "writing" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut w = Writer.pretty(s.writer(), 2);
+    defer w.deinit();
+    w.declaration()!;
+    w.start("list")!;
+    w.attr("kind", "a\"b<c")!;
+    w.start("item")!;
+    w.text("x & y")!;
+    w.end()!;
+    w.start("empty")!;
+    w.end()!;
+    w.comment(" note ")!;
+    w.end()!;
+    @expect_eq(s.bytes(),
+               "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<list kind=\"a&quot;b&lt;c\">\n  <item>x &amp; y</item>\n  <empty/>\n  <!-- note -->\n</list>");
+    let mut doc = parse(s.bytes())!;
+    defer doc.deinit();
+    @expect_eq(doc.root.attr("kind")!, "a\"b<c");
+    @expect(fails_void(w.end()));
+    @expect(fails_void(w.comment("a--b")));
+}
+
+fn fails_void(r: !void) bool {
+    r catch return true;
+    return false;
+}
+
+test "encodings and hostile input" {
+    // UTF-16 little-endian with a byte-order mark
+    let u16le: [18]u8 = [0xff, 0xfe, '<', 0, 'a', 0, '>', 0, 0xe9, 0, '<', 0, '/', 0, 'a', 0, '>', 0];
+    let mut d1 = parse(u16le[..])!;
+    defer d1.deinit();
+    let t1 = d1.root.text_alloc()!;
+    defer mem.free(t1);
+    @expect_eq(t1, "\xc3\xa9");
+    let latin = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>\xe9</a>";
+    let mut d2 = parse(latin)!;
+    defer d2.deinit();
+    let t = d2.root.text_alloc()!;
+    defer mem.free(t);
+    @expect_eq(t, "\xc3\xa9");
+    // billion laughs
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("<!DOCTYPE a [<!ENTITY l0 \"hahahahahahahahahahahahahahahahahahahahahahahahahahahahahahahahaha\">")!;
+    for k in @as(usize, 1)..10 {
+        fmt.write(s.writer(), "<!ENTITY l{} \"", [fmt.int(k)])!;
+        for _j in @as(usize, 0)..10 {
+            fmt.write(s.writer(), "&l{};", [fmt.int(k - 1)])!;
+        }
+        s.push_str("\">")!;
+    }
+    s.push_str("]><a>&l9;</a>")!;
+    @expect(fails_doc(parse(s.bytes())));
+    // deep nesting
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    for _k in @as(usize, 0)..5000 {
+        deep.push_str("<a>")!;
+    }
+    @expect(fails_doc(parse(deep.bytes())));
+}
+
+fn fails_doc(r: !Document) bool {
+    let mut d = r catch return true;
+    d.deinit();
+    return false;
+}
