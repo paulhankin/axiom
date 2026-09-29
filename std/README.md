@@ -26,8 +26,22 @@ and a type that owns memory has `deinit`).
 | [`base64`](base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets |
 | [`math`](math.ph) | Elementary functions on `f64` (and `f32`, suffixed `f`): `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `pow`, `cbrt`, `hypot`, `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `ldexp`, `frexp`; constants. Within 1 ulp (2 for `tan`, `expm1`, `sinh`, `tanh`), trigonometry of huge arguments included |
 | [`color`](color.ph) | `Color` (linear-light RGB + alpha, HDR-capable), `Rgba8`/`Rgba16` (sRGB-encoded); sRGB encoding (exact 8-bit tables), HSV, HSL, CIE XYZ, L\*a\*b\*, LCh, Oklab, Oklch, YCbCr; Display P3 and Rec. 2020 gamuts; PQ and HLG transfer functions, tone mapping; CIE76 / CIEDE2000 differences, WCAG contrast; `mix`, `over`, premultiplied alpha; CSS-style parsing and hex formatting |
+| [`image`](image.ph) | `Image`: 1–4 channels of U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
 | [`bigint`](bigint.ph) | `BigInt`: arbitrary-precision integers — arithmetic (Karatsuba multiplication), truncated and Euclidean division, shifts and bitwise operations, `pow`, `mod_pow` (Montgomery; `mod_pow_secret` in constant time), `gcd`, `mod_inverse`, `sqrt`, conversion to and from any base and bytes |
 | [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
+
+Image files are read and written by `std/image/`:
+
+| Module | Contents |
+|---|---|
+| [`image/formats`](image/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
+| [`image/png`](image/png.ph) | PNG: every colour type and bit depth, interlacing, transparency; writes 8/16-bit with per-row filters |
+| [`image/jpeg`](image/jpeg.ph) | JPEG: baseline and progressive, any sampling, restart markers, gray/YCbCr/RGB/CMYK/YCCK, output identical to libjpeg's; writes baseline with optimized Huffman tables |
+| [`image/bmp`](image/bmp.ph) | BMP: 1–32 bits, palettes, bit fields, RLE4/RLE8, all header versions |
+| [`image/qoi`](image/qoi.ph) | QOI |
+| [`image/pnm`](image/pnm.ph) | PBM, PGM, PPM (ASCII and binary), PAM, PFM (float) |
+| [`image/hdr`](image/hdr.ph) | Radiance RGBE (HDR) |
+| [`image/exr`](image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
 
 Cryptography lives in `std/crypto/` (the primitives are written to run in constant
 time where secrets are involved):
