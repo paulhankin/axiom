@@ -377,6 +377,7 @@ pub const SEEK_END: u32 = 2;
 const OPEN_READ: u32 = 0;
 const OPEN_WRITE: u32 = 1;   // create or truncate
 const OPEN_APPEND: u32 = 2;  // create or append
+const OPEN_UPDATE: u32 = 3;  // read and write, neither creating nor truncating
 
 fn open_with(path: []u8, flags: u32) !File {
     let fd = ph_open(path.ptr, path.len, flags);
@@ -404,6 +405,11 @@ pub fn create(path: []u8) !File {
 /// Opens a file for appending, creating it if needed.
 pub fn append(path: []u8) !File {
     return open_with(path, OPEN_APPEND);
+}
+
+/// Opens an existing file for reading and writing, without truncating it.
+pub fn open_update(path: []u8) !File {
+    return open_with(path, OPEN_UPDATE);
 }
 
 // -----------------------------------------------------------------------------

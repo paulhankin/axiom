@@ -23,7 +23,8 @@ import "path.ph" as path;
 import "str.ph" as strs;
 import "vec.ph" as vec;
 
-error { NotFound, AccessDenied, Exists, NotADirectory, IsDirectory, NotEmpty, IoError, OutOfMemory, BadPattern }
+error { NotFound, AccessDenied, Exists, NotADirectory, IsDirectory, NotEmpty, IoError, OutOfMemory, BadPattern,
+        Unsupported }
 
 import host "phalange" {
     fn ph_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32;
@@ -36,6 +37,23 @@ import host "phalange" {
     fn ph_dir_read(dir: i32, buf: *mut u8, cap: usize) isize;
     fn ph_dir_remove(dir: i32, name: *u8, len: usize, isdir: u32) i32;
     fn ph_dir_close(dir: i32) void;
+    fn ph_seek(fd: i32, off: i64, whence: u32) i64;
+    fn ph_chmod(path: *u8, len: usize, mode: u32) i32;
+    fn ph_symlink(target: *u8, tlen: usize, link: *u8, llen: usize) i32;
+    fn ph_link(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
+    fn ph_readlink(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
+    fn ph_utimes(path: *u8, len: usize, atime_ns: i64, mtime_ns: i64) i32;
+    fn ph_ftruncate(fd: i32, size: i64) i32;
+    fn ph_fsync(fd: i32) i32;
+    fn ph_flock(fd: i32, op: u32) i32;
+    fn ph_mmap(fd: i32, off: i64, len: usize, writable: u32) usize;
+    fn ph_munmap(addr: usize, len: usize) i32;
+    fn ph_msync(addr: usize, len: usize) i32;
+    fn ph_watch_open() i32;
+    fn ph_watch_add(h: i32, path: *u8, len: usize) i32;
+    fn ph_watch_remove(h: i32, wd: i32) i32;
+    fn ph_watch_read(h: i32, buf: *mut u8, cap: usize, timeout_ms: i32) isize;
+    fn ph_watch_close(h: i32) void;
 }
 
 /// Kinds of file.
@@ -596,6 +614,326 @@ fn glob_into(pattern: []u8, out: *mut Paths) !void {
 }
 
 // -----------------------------------------------------------------------------
+// Permissions, links, times, locks, mappings and watching
+// -----------------------------------------------------------------------------
+
+/// Sets the permission bits (0o644 and so on).
+pub fn chmod(p: []u8, mode: u32) !void {
+    let r = ph_chmod(p.ptr, p.len, mode);
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+}
+
+/// Makes link a symbolic link to target (which need not exist).
+pub fn symlink(target: []u8, link: []u8) !void {
+    let r = ph_symlink(target.ptr, target.len, link.ptr, link.len);
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+}
+
+/// The target of a symbolic link (free it with mem.free).
+pub fn read_link(p: []u8) ![]mut u8 {
+    let mut cap: usize = 256;
+    loop {
+        let buf = mem.alloc.[u8](cap)!;
+        let n = ph_readlink(p.ptr, p.len, buf.ptr, buf.len);
+        if n < 0 {
+            mem.free(buf);
+            return fail(@as(i64, n));
+        }
+        let need = @bit_cast(usize, n);
+        if need <= cap {
+            return mem.realloc(buf, need) catch |e| {
+                mem.free(buf);
+                return e;
+            };
+        }
+        mem.free(buf);
+        cap = need;
+    }
+}
+
+/// Makes `link` another name for the existing file (a hard link).
+pub fn hard_link(existing: []u8, link: []u8) !void {
+    let r = ph_link(existing.ptr, existing.len, link.ptr, link.len);
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+}
+
+/// Sets when a file was last read and modified, in nanoseconds since 1970
+/// (the node host keeps microseconds).
+pub fn set_times(p: []u8, atime_ns: i64, mtime_ns: i64) !void {
+    let r = ph_utimes(p.ptr, p.len, atime_ns, mtime_ns);
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+}
+
+/// Cuts an open file to `size` bytes, or extends it with zeros.
+pub fn truncate(f: io.File, size: u64) !void {
+    let r = ph_ftruncate(f.fd, @bit_cast(i64, size));
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+}
+
+/// Waits until what was written to the file is on the disk.
+pub fn sync(f: io.File) !void {
+    if ph_fsync(f.fd) != 0 {
+        return error.IoError;
+    }
+}
+
+/// Lock kinds, for lock and try_lock.
+pub const SHARED: u8 = 1;
+pub const EXCLUSIVE: u8 = 2;
+
+/// Takes an advisory lock on the whole file (flock), waiting while another
+/// process holds a conflicting one. Unsupported on the node host.
+pub fn lock(f: io.File, kind: u8) !void {
+    let r = ph_flock(f.fd, @as(u32, kind & 3));
+    if r == -95 {
+        return error.Unsupported;
+    }
+    if r < 0 {
+        return error.IoError;
+    }
+}
+
+/// lock, without waiting: false if another process holds a conflicting one.
+pub fn try_lock(f: io.File, kind: u8) !bool {
+    let r = ph_flock(f.fd, @as(u32, kind & 3) | 4);
+    if r == -95 {
+        return error.Unsupported;
+    }
+    if r == -11 {
+        return false;
+    }
+    if r < 0 {
+        return error.IoError;
+    }
+    return true;
+}
+
+pub fn unlock(f: io.File) void {
+    _ = ph_flock(f.fd, 8);
+}
+
+/// A file's contents in memory: mapped, so reading data reads the file
+/// and (if writable) writing it writes the file; where mapping is not
+/// possible (the node host, WebAssembly), a copy that flush and deinit
+/// write back. The file's size does not change.
+pub struct Mapping {
+    data: []mut u8,
+    file: io.File,
+    mapped: bool,
+    writable: bool,
+
+    /// Makes the changes reach the file (and the disk).
+    pub fn flush(self: *mut Mapping) !void {
+        if not self.writable or (self.data.len == 0) {
+            return;
+        }
+        if self.mapped {
+            if ph_msync(@int_from_ptr(self.data.ptr), self.data.len) != 0 {
+                return error.IoError;
+            }
+            return;
+        }
+        _ = ph_seek(self.file.fd, 0, 0);
+        self.file.writer().write_all(self.data) catch return error.IoError;
+    }
+
+    /// Flushes (ignoring failures: call flush first to see them), unmaps
+    /// and closes the file.
+    pub fn deinit(self: *mut Mapping) void {
+        self.flush() catch {};
+        if self.mapped {
+            _ = ph_munmap(@int_from_ptr(self.data.ptr), self.data.len);
+        } else {
+            mem.free(self.data);
+        }
+        self.file.close();
+    }
+}
+
+/// Maps the whole of the file at p (read-only unless writable).
+pub fn map(p: []u8, writable: bool) !Mapping {
+    let info = stat(p)!;
+    if info.kind != FILE {
+        return error.IsDirectory;
+    }
+    let mut f = io.open(p) catch |e| return fail_io(e);
+    if writable {
+        f.close();
+        f = io.open_update(p) catch |e| return fail_io(e);
+    }
+    let n = @truncate(usize, info.size);
+    if (n == 0) or (@as(u64, n) != info.size) {
+        if @as(u64, n) != info.size {
+            f.close();
+            return error.OutOfMemory;
+        }
+        return Mapping.{ data: mem.alloc.[u8](0)!, file: f, mapped: false, writable: writable };
+    }
+    let mut w: u32 = 0;
+    if writable {
+        w = 1;
+    }
+    let addr = ph_mmap(f.fd, 0, n, w);
+    if addr != 0 {
+        return Mapping.{ data: @slice_from_ptr(@ptr_from_int(*mut u8, addr), n), file: f, mapped: true,
+                         writable: writable };
+    }
+    // a copy
+    let data = mem.alloc.[u8](n) catch |e| {
+        f.close();
+        return e;
+    };
+    f.reader().read_exact(data) catch {
+        mem.free(data);
+        f.close();
+        return error.IoError;
+    };
+    return Mapping.{ data: data, file: f, mapped: false, writable: writable };
+}
+
+fn fail_io(e: error) error { if e == error.NotFound {
+    return error.NotFound;
+}
+if e == error.AccessDenied {
+    return error.AccessDenied;
+}
+return error.IoError; }
+
+/// Kinds of change a Watcher reports.
+pub const MODIFIED: u8 = 1;
+pub const ATTRIBUTES: u8 = 2;  // permissions, times, ...
+pub const CREATED: u8 = 3;
+pub const REMOVED: u8 = 4;
+pub const MOVED_FROM: u8 = 5;    // renamed away (in a watched directory)
+pub const MOVED_TO: u8 = 6;      // renamed to here
+pub const SELF_REMOVED: u8 = 7;  // the watched file or directory itself
+pub const SELF_MOVED: u8 = 8;
+
+/// A change: in watched file or directory `watch` (as add returned it),
+/// to its entry `name` (empty for the watched file itself).
+pub struct Event {
+    watch: i32,
+    kind: u8,
+    name: []u8,
+}
+
+/// Watches files and directories for changes (inotify on Linux; fs.watch
+/// on the node host, which reports less exactly).
+pub struct Watcher {
+    h: i32,
+    buf: []mut u8,
+    events: vec.Vec.[Event],
+
+    pub fn init() !Watcher {
+        let h = ph_watch_open();
+        if h < 0 {
+            return error.IoError;
+        }
+        let buf = mem.alloc.[u8](65536) catch |e| {
+            ph_watch_close(h);
+            return e;
+        };
+        return Watcher.{ h: h, buf: buf, events: vec.Vec.[Event].init() };
+    }
+
+    pub fn deinit(self: *mut Watcher) void {
+        ph_watch_close(self.h);
+        mem.free(self.buf);
+        self.events.deinit();
+    }
+
+    /// Starts watching a file, or a directory's entries (not its
+    /// subdirectories'); returns the watch's id.
+    pub fn add(self: *mut Watcher, p: []u8) !i32 {
+        let r = ph_watch_add(self.h, p.ptr, p.len);
+        if r < 0 {
+            return fail(@as(i64, r));
+        }
+        return r;
+    }
+
+    pub fn remove(self: *mut Watcher, id: i32) void {
+        _ = ph_watch_remove(self.h, id);
+    }
+
+    /// Waits up to timeout_ms milliseconds (-1: for ever) for changes;
+    /// returns those that came (none if it timed out), valid until the
+    /// next call.
+    pub fn wait(self: *mut Watcher, timeout_ms: i32) ![]Event {
+        self.events.clear();
+        let n = ph_watch_read(self.h, self.buf.ptr, self.buf.len, timeout_ms);
+        if n < 0 {
+            return error.IoError;
+        }
+        let b = self.buf[..@bit_cast(usize, n)];
+        let mut i: usize = 0;
+        while (i + 16) <= b.len {
+            let wd = @bit_cast(i32, le32(b, i));
+            let mask = le32(b, i + 4);
+            let len = @as(usize, le32(b, i + 12));
+            if (i + 16 + len) > b.len {
+                break;
+            }
+            let mut name = b[i + 16..i + 16 + len];
+            let mut k: usize = 0;
+            while (k < name.len) and (name[k] != 0) {
+                k += 1;
+            }
+            name = name[..k];
+            i += 16 + len;
+            let kind = event_kind(mask);
+            if kind != 0 {
+                self.events.push(Event.{ watch: wd, kind: kind, name: name })!;
+            }
+        }
+        return self.events.items();
+    }
+}
+
+fn le32(b: []u8, i: usize) u32 {
+    return ((@as(u32, b[i]) | (@as(u32, b[i + 1]) << 8)) | (@as(u32, b[i + 2]) << 16)) | (@as(u32, b[i + 3]) << 24);
+}
+
+// inotify's mask bits to a kind (0: an event not reported)
+fn event_kind(mask: u32) u8 {
+    if (mask & 0x2) != 0 {
+        return MODIFIED;
+    }
+    if (mask & 0x4) != 0 {
+        return ATTRIBUTES;
+    }
+    if (mask & 0x100) != 0 {
+        return CREATED;
+    }
+    if (mask & 0x200) != 0 {
+        return REMOVED;
+    }
+    if (mask & 0x40) != 0 {
+        return MOVED_FROM;
+    }
+    if (mask & 0x80) != 0 {
+        return MOVED_TO;
+    }
+    if (mask & 0x400) != 0 {
+        return SELF_REMOVED;
+    }
+    if (mask & 0x800) != 0 {
+        return SELF_MOVED;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -699,4 +1037,148 @@ test "temporary directories are private; names cannot hide a NUL" {
     p.push_str("\x00.png")!;
     @expect(failed_with(read_file(p.bytes()), error.IoError) or failed_with(read_file(p.bytes()), error.NotFound));
     remove_all(d)!;
+}
+
+test "permissions, links and times" {
+    let dir = make_temp_dir("fsx")!;
+    defer mem.free(dir);
+    defer remove_all(dir) catch {};
+    let f = path.join2(dir, "a.txt")!;
+    defer mem.free(f);
+    write_file(f, "hello")!;
+    chmod(f, 0o600)!;
+    @expect(stat(f)!.mode == 0o600);
+    chmod(f, 0o644)!;
+    @expect(stat(f)!.mode == 0o644);
+    let l = path.join2(dir, "link")!;
+    defer mem.free(l);
+    symlink("a.txt", l)!;
+    let t = read_link(l)!;
+    defer mem.free(t);
+    @expect_eq(t, "a.txt");
+    @expect((lstat(l)!.kind == SYMLINK) and (stat(l)!.kind == FILE));
+    let h = path.join2(dir, "hard")!;
+    defer mem.free(h);
+    hard_link(f, h)!;
+    let hc = read_file(h)!;
+    defer mem.free(hc);
+    @expect_eq(hc, "hello");
+    @expect(exists_err(symlink("x", l)));
+    set_times(f, 1000000000000000000, 1500000000123456000)!;
+    let m = stat(f)!.mtime_ns;
+    @expect((m >= 1500000000123000000) and (m <= 1500000000123456000));
+    let mut file = io.open_update(f)!;
+    truncate(file, 2)!;
+    sync(file)!;
+    file.close();
+    let cut = read_file(f)!;
+    defer mem.free(cut);
+    @expect_eq(cut, "he");
+    @expect(not_found(read_link("/surely/not/there")));
+}
+
+fn exists_err(r: !void) bool {
+    r catch |e| return e == error.Exists;
+    return false;
+}
+
+fn not_found(r: ![]mut u8) bool {
+    let x = r catch |e| return e == error.NotFound;
+    mem.free(x);
+    return false;
+}
+
+test "locks and mappings" {
+    let dir = make_temp_dir("fsm")!;
+    defer mem.free(dir);
+    defer remove_all(dir) catch {};
+    let f = path.join2(dir, "data")!;
+    defer mem.free(f);
+    write_file(f, "abcdefgh")!;
+    let a = io.open(f)!;
+    defer a.close();
+    let b = io.open(f)!;
+    defer b.close();
+    let mut supported = true;
+    lock(a, EXCLUSIVE) catch |e| {
+        @expect(e == error.Unsupported);
+        supported = false;
+    };
+    if supported {
+        // (separate opens of a file have separate locks)
+        @expect(not try_lock(b, SHARED)!);
+        unlock(a);
+        @expect(try_lock(b, SHARED)!);
+        @expect(try_lock(a, SHARED)!);
+        unlock(a);
+        unlock(b);
+    }
+    let mut m = map(f, true)!;
+    @expect_eq(m.data, "abcdefgh");
+    m.data[0] = 'X';
+    m.flush()!;
+    let now = read_file(f)!;
+    defer mem.free(now);
+    @expect_eq(now, "Xbcdefgh");
+    m.data[7] = 'Y';
+    m.deinit();
+    let after = read_file(f)!;
+    defer mem.free(after);
+    @expect_eq(after, "XbcdefgY");
+    let mut r = map(f, false)!;
+    @expect(r.data.len == 8);
+    r.deinit();
+    let e = path.join2(dir, "empty")!;
+    defer mem.free(e);
+    write_file(e, "")!;
+    let mut z = map(e, false)!;
+    @expect(z.data.len == 0);
+    z.deinit();
+}
+
+test "watching" {
+    let dir = make_temp_dir("fsw")!;
+    defer mem.free(dir);
+    defer remove_all(dir) catch {};
+    let mut w = Watcher.init()!;
+    defer w.deinit();
+    let id = w.add(dir)!;
+    let f = path.join2(dir, "new.txt")!;
+    defer mem.free(f);
+    write_file(f, "x")!;
+    // collect for a while: creation (and modification) of new.txt
+    let mut created = false;
+    for _k in @as(usize, 0)..20 {
+        let evs = w.wait(200)!;
+        for ev in evs {
+            if (ev.watch == id) and strs.eq(ev.name, "new.txt") and (ev.kind == CREATED) {
+                created = true;
+            }
+        }
+        if created {
+            break;
+        }
+    }
+    @expect(created);
+    remove(f)!;
+    let mut removed = false;
+    for _k in @as(usize, 0)..20 {
+        let evs = w.wait(200)!;
+        for ev in evs {
+            if strs.eq(ev.name, "new.txt") and (ev.kind == REMOVED) {
+                removed = true;
+            }
+        }
+        if removed {
+            break;
+        }
+    }
+    @expect(removed);
+    @expect((w.wait(10)!).len == 0);
+    @expect(not_found_i32(w.add("/surely/not/there")));
+}
+
+fn not_found_i32(r: !i32) bool {
+    _ = r catch |e| return e == error.NotFound;
+    return false;
 }

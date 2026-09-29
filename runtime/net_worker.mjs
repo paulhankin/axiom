@@ -8,8 +8,10 @@
 // through MessagePorts sent with a 'port' message.
 import { parentPort } from 'worker_threads';
 import child_process from 'child_process';
+import fs from 'fs';
 import net from 'net';
 import os from 'os';
+import path from 'path';
 
 const handles = new Map();
 let nextHandle = 3;
@@ -142,6 +144,10 @@ const ops = {
       st.closed = true;
       st.srv.close();
       wake(st);
+    } else if (st && st.kind === 'watch') {
+      for (const w of st.watches.values()) w.close();
+      st.closed = true;
+      wake(st);
     } else if (st && st.kind === 'sock') {
       if (st.readOnly) st.sock.destroy();
       else st.sock.end();
@@ -176,6 +182,87 @@ const ops = {
       for (let k = 0; k < 3; k++) if (modes[k] === 1) out[k] = addSocket(pipes[k], k !== 0);
       reply(req, h);
     });
+  },
+  // Watching, as inotify would report it (records of wd, mask, cookie,
+  // len, name): 'change' is IN_MODIFY; 'rename' is IN_CREATE or IN_DELETE
+  // (IN_DELETE_SELF for a watched file), by whether the path exists.
+  watch_open(req) {
+    const st = { kind: 'watch', watches: new Map(), queue: [], waiters: [], nextWd: 1, closed: false };
+    const h = nextHandle++;
+    handles.set(h, st);
+    reply(req, h);
+  },
+  watch_add(req, { h, path: p }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'watch') return reply(req, ERR);
+    let isDir;
+    try { isDir = fs.statSync(p).isDirectory(); } catch (e) { return reply(req, e.code === 'ENOENT' ? -2 : ERR); }
+    const wd = st.nextWd++;
+    const record = (mask, name) => {
+      const nb = Buffer.from(name || '');
+      const len = nb.length ? (nb.length + 4) & ~3 : 0;
+      const r = Buffer.alloc(16 + len);
+      r.writeInt32LE(wd, 0);
+      r.writeUInt32LE(mask, 4);
+      r.writeUInt32LE(len, 12);
+      nb.copy(r, 16);
+      st.queue.push(r);
+      wake(st);
+    };
+    let w;
+    try {
+      w = fs.watch(p, (type, filename) => {
+        const name = isDir ? filename || '' : '';
+        if (type === 'change') return record(0x2, name);
+        const exists = fs.existsSync(isDir && name ? path.join(p, name) : p);
+        record(exists ? 0x100 : isDir ? 0x200 : 0x400, name);
+      });
+    } catch (e) {
+      return reply(req, ERR);
+    }
+    w.on('error', () => {});
+    st.watches.set(wd, w);
+    reply(req, wd);
+  },
+  watch_remove(req, { h, wd }) {
+    const st = handles.get(h);
+    const w = st && st.kind === 'watch' && st.watches.get(wd);
+    if (!w) return reply(req, ERR);
+    w.close();
+    st.watches.delete(wd);
+    reply(req, 0);
+  },
+  watch_read(req, { h, n, timeout }) {
+    const st = handles.get(h);
+    if (!st || st.kind !== 'watch') return reply(req, ERR);
+    const data = new Uint8Array(req.data);
+    let timer = null;
+    let done = false;
+    const attempt = () => {
+      if (done) return;
+      if (st.queue.length || st.closed) {
+        let got = 0;
+        while (st.queue.length && got + st.queue[0].length <= n) {
+          const r = st.queue.shift();
+          data.set(r, got);
+          got += r.length;
+        }
+        done = true;
+        if (timer) clearTimeout(timer);
+        reply(req, got);
+      } else {
+        st.waiters.push(attempt);
+      }
+    };
+    attempt();
+    if (!done && timeout >= 0) {
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        st.waiters = st.waiters.filter((w) => w !== attempt);
+        reply(req, 0);
+      }, timeout);
+    }
   },
   wait(req, { h, block }) {
     const st = handles.get(h);

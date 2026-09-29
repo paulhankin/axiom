@@ -93,6 +93,18 @@ let SYS_EXECVE: [2]i64 = [59, 221];
 let SYS_CHDIR: [2]i64 = [80, 49];
 let SYS_KILL: [2]i64 = [62, 129];
 let SYS_IOCTL: [2]i64 = [16, 29];
+let SYS_FCHMODAT: [2]i64 = [268, 53];
+let SYS_SYMLINKAT: [2]i64 = [266, 36];
+let SYS_READLINKAT: [2]i64 = [267, 78];
+let SYS_LINKAT: [2]i64 = [265, 37];
+let SYS_UTIMENSAT: [2]i64 = [280, 88];
+let SYS_FTRUNCATE: [2]i64 = [77, 46];
+let SYS_FSYNC: [2]i64 = [74, 82];
+let SYS_FLOCK: [2]i64 = [73, 32];
+let SYS_MSYNC: [2]i64 = [26, 227];
+let SYS_INOTIFY_INIT1: [2]i64 = [294, 26];
+let SYS_INOTIFY_ADD_WATCH: [2]i64 = [254, 27];
+let SYS_INOTIFY_RM_WATCH: [2]i64 = [255, 28];
 
 fn nr(t: [2]i64) i64 {
     if phalange_target_arch() == 2 {
@@ -385,6 +397,62 @@ pub fn execve(path: *u8, argv: usize, envp: usize) isize {
 
 pub fn ioctl(fd: i32, req: u64, p: usize) isize {
     return sys3(SYS_IOCTL, si(fd), @truncate(usize, req), p);
+}
+
+const AT_FDCWD: usize = 0xffff_ffff_ffff_ff9c;  // -100
+
+pub fn chmod(path: *u8, mode: u32) isize {
+    return sys4(SYS_FCHMODAT, AT_FDCWD, @int_from_ptr(path), @as(usize, mode), 0);
+}
+
+pub fn symlink(target: *u8, name: *u8) isize {
+    return sys3(SYS_SYMLINKAT, @int_from_ptr(target), AT_FDCWD, @int_from_ptr(name));
+}
+
+pub fn readlink(path: *u8, buf: *mut u8, n: usize) isize {
+    return sys4(SYS_READLINKAT, AT_FDCWD, @int_from_ptr(path), @int_from_ptr(buf), n);
+}
+
+pub fn link(from: *u8, to: *u8) isize {
+    return sys6(SYS_LINKAT, AT_FDCWD, @int_from_ptr(from), AT_FDCWD, @int_from_ptr(to), 0, 0);
+}
+
+// times: [atime, mtime] as seconds and nanoseconds
+pub fn utimens(path: *u8, times: *[2]Timespec) isize {
+    return sys4(SYS_UTIMENSAT, AT_FDCWD, @int_from_ptr(path), @int_from_ptr(times), 0);
+}
+
+pub fn ftruncate(fd: i32, size: i64) isize {
+    return sys2(SYS_FTRUNCATE, si(fd), @truncate(usize, @bit_cast(u64, size)));
+}
+
+pub fn fsync(fd: i32) isize {
+    return sys1(SYS_FSYNC, si(fd));
+}
+
+pub fn flock(fd: i32, op: i32) isize {
+    return sys2(SYS_FLOCK, si(fd), si(op));
+}
+
+// A shared mapping of a file (prot: 1 read, 3 read and write).
+pub fn mmap_file(len: usize, prot: i32, fd: i32, off: i64) isize {
+    return sys6(SYS_MMAP, 0, len, si(prot), 1, si(fd), @truncate(usize, @bit_cast(u64, off)));
+}
+
+pub fn msync(addr: usize, len: usize) isize {
+    return sys3(SYS_MSYNC, addr, len, 4);  // MS_SYNC
+}
+
+pub fn inotify_init() isize {
+    return sys1(SYS_INOTIFY_INIT1, 0x80000 | 0x800);  // IN_CLOEXEC | IN_NONBLOCK
+}
+
+pub fn inotify_add_watch(fd: i32, path: *u8, mask: u32) isize {
+    return sys3(SYS_INOTIFY_ADD_WATCH, si(fd), @int_from_ptr(path), @as(usize, mask));
+}
+
+pub fn inotify_rm_watch(fd: i32, wd: i32) isize {
+    return sys2(SYS_INOTIFY_RM_WATCH, si(fd), si(wd));
 }
 
 pub fn chdir(path: *u8) isize {

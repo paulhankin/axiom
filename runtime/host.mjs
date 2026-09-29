@@ -344,7 +344,7 @@ export function createHost(opts = {}) {
     },
     ph_open(p, n, flags) {
       try {
-        const fd = fs.openSync(str(p, n), ['r', 'w', 'a'][flags] || 'r');
+        const fd = fs.openSync(str(p, n), ['r', 'w', 'a', 'r+'][flags] || 'r');
         pos.set(fd, flags === 2 ? -1 : 0);  // appends go to the end
         return fd;
       } catch (e) {
@@ -529,6 +529,50 @@ export function createHost(opts = {}) {
     ph_pipe_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
     ph_pipe_close: (h) => { net().call('close', { h }); },
     ph_signal: () => -2,  // unsupported
+    // More of the file system. Node has no flock and cannot map files into
+    // the program's memory: ph_flock reports -95 (not supported) and ph_mmap
+    // 0, for std/fs to fall back on. Watching runs on the net worker.
+    ph_chmod(p, n, mode) {
+      try { fs.chmodSync(str(p, n), mode & 0o7777); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_symlink(t, tn, l, ln) {
+      try { fs.symlinkSync(str(t, tn), str(l, ln)); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_link(a, an, b, bn) {
+      try { fs.linkSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_readlink(p, n, buf, cap) {
+      try {
+        const b = fs.readlinkSync(str(p, n), { encoding: 'buffer' });
+        if (b.length <= cap >>> 0) bytes(buf, b.length).set(b);
+        return b.length;
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
+    ph_utimes(p, n, atime, mtime) {
+      try { fs.utimesSync(str(p, n), Number(atime) / 1e9, Number(mtime) / 1e9); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_ftruncate(fd, size) {
+      try { fs.ftruncateSync(fd, Number(size)); return 0; } catch (e) { return fsErr(e); }
+    },
+    ph_fsync(fd) {
+      try { fs.fsyncSync(fd); return 0; } catch { return -1; }
+    },
+    ph_flock: () => -95,
+    ph_mmap: () => 0,
+    ph_munmap: () => -1,
+    ph_msync: () => -1,
+    ph_watch_open: () => net().call('watch_open', {}),
+    ph_watch_add: (h, p, n) => net().call('watch_add', { h, path: str(p, n) }),
+    ph_watch_remove: (h, wd) => net().call('watch_remove', { h, wd }),
+    ph_watch_read(h, buf, cap, timeout) {
+      const c = net();
+      const got = c.call('watch_read', { h, n: Math.min(cap >>> 0, READ_CHUNK), timeout });
+      if (got > 0) bytes(buf, got).set(c.data.subarray(0, got));
+      return got;
+    },
+    ph_watch_close: (h) => { net().call('close', { h }); },
     // Terminals: the size of stdout's and stderr's, raw mode for stdin (on
     // the main thread only).
     ph_isatty: (fd) => (tty.isatty(fd) ? 1 : 0),

@@ -97,6 +97,8 @@ export fn ph_open(path: *u8, len: usize, flags: u32) i32 {
         f = (1 | 0x40) | 0x200;  // O_WRONLY | O_CREAT | O_TRUNC
     } else if flags == 2 {
         f = (1 | 0x40) | 0x400;  // O_WRONLY | O_CREAT | O_APPEND
+    } else if flags == 3 {
+        f = 2;  // O_RDWR
     }
     let fd = sys.open(&buf[0], f | 0x80000, 0o644);  // O_CLOEXEC
     if fd >= 0 {
@@ -1724,6 +1726,211 @@ export fn ph_signal_take(timeout_ns: i64) i64 {
             return @bit_cast(i64, @atomic_xchg(&mut sig_pending, 0));
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// More of the file system: permissions, links, times, locks, mappings and
+// watching
+// -----------------------------------------------------------------------------
+
+export fn ph_chmod(path: *u8, len: usize, mode: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return PH_ERR;
+    }
+    let r = sys.chmod(&buf[0], mode & 0o7777);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+export fn ph_symlink(target: *u8, tlen: usize, link: *u8, llen: usize) i32 {
+    let mut a: [4096]u8 = [0; 4096];
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(a[..], target, tlen) or not copy_cstr(b[..], link, llen) {
+        return PH_ERR;
+    }
+    let r = sys.symlink(&a[0], &b[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+export fn ph_link(from: *u8, flen: usize, to: *u8, tlen: usize) i32 {
+    let mut a: [4096]u8 = [0; 4096];
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(a[..], from, flen) or not copy_cstr(b[..], to, tlen) {
+        return PH_ERR;
+    }
+    let r = sys.link(&a[0], &b[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+// The target of a symbolic link; returns its length.
+export fn ph_readlink(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut p: [4096]u8 = [0; 4096];
+    if not copy_cstr(p[..], path, len) {
+        return @as(isize, PH_ERR);
+    }
+    let mut tmp: [4096]u8 = [0; 4096];
+    let r = sys.readlink(&p[0], &mut tmp[0], tmp.len);
+    if r < 0 {
+        return @as(isize, fs_err(r));
+    }
+    let n = @bit_cast(usize, r);
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), tmp[..n]);
+    }
+    return r;
+}
+
+// Sets the access and modification times (nanoseconds since 1970).
+export fn ph_utimes(path: *u8, len: usize, atime_ns: i64, mtime_ns: i64) i32 {
+    let mut p: [4096]u8 = [0; 4096];
+    if not copy_cstr(p[..], path, len) {
+        return PH_ERR;
+    }
+    let ts: [2]sys.Timespec = [split_ns(atime_ns), split_ns(mtime_ns)];
+    let r = sys.utimens(&p[0], &ts);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+fn split_ns(ns: i64) sys.Timespec {
+    let mut s = ns / 1000000000;
+    let mut n = ns % 1000000000;
+    if n < 0 {
+        n += 1000000000;
+        s -= 1;
+    }
+    return sys.Timespec.{ sec: s, nsec: n };
+}
+
+export fn ph_ftruncate(fd: i32, size: i64) i32 {
+    let r = sys.ftruncate(fd, size);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return 0;
+}
+
+export fn ph_fsync(fd: i32) i32 {
+    if sys.fsync(fd) < 0 {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+// op: 1 shared, 2 exclusive, 8 unlock; | 4 not to wait (then -11 if it
+// would have to).
+export fn ph_flock(fd: i32, op: u32) i32 {
+    loop {
+        let r = sys.flock(fd, @bit_cast(i32, op));
+        if retry(r) {
+            continue;
+        }
+        if r == -sys.EAGAIN {
+            return -11;
+        }
+        if r < 0 {
+            return PH_ERR;
+        }
+        return 0;
+    }
+}
+
+// A shared mapping of len bytes of the file at off; 0 if it cannot be made.
+export fn ph_mmap(fd: i32, off: i64, len: usize, writable: u32) usize {
+    let mut prot: i32 = 1;
+    if writable != 0 {
+        prot = 3;
+    }
+    let r = sys.mmap_file(len, prot, fd, off);
+    if (r < 0) and (r > -4096) {
+        return 0;
+    }
+    return @bit_cast(usize, r);
+}
+
+export fn ph_munmap(addr: usize, len: usize) i32 {
+    if sys.munmap(addr, len) < 0 {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+export fn ph_msync(addr: usize, len: usize) i32 {
+    if sys.msync(addr, len) < 0 {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+// Watching: an inotify instance. Events are read as the kernel's struct
+// inotify_event records (wd, mask, cookie, len, name).
+export fn ph_watch_open() i32 {
+    let r = sys.inotify_init();
+    if r < 0 {
+        return PH_ERR;
+    }
+    return @truncate(i32, r);
+}
+
+export fn ph_watch_add(h: i32, path: *u8, len: usize) i32 {
+    let mut p: [4096]u8 = [0; 4096];
+    if not copy_cstr(p[..], path, len) {
+        return PH_ERR;
+    }
+    // modify, attrib, moved from/to, create, delete, delete self, move self
+    let r = sys.inotify_add_watch(h, &p[0], 0xfc6);
+    if r < 0 {
+        return fs_err(r);
+    }
+    return @truncate(i32, r);
+}
+
+export fn ph_watch_remove(h: i32, wd: i32) i32 {
+    if sys.inotify_rm_watch(h, wd) < 0 {
+        return PH_ERR;
+    }
+    return 0;
+}
+
+// Waits up to timeout_ms (-1: for ever) for events; returns the bytes read
+// (0: none came).
+export fn ph_watch_read(h: i32, buf: *mut u8, cap: usize, timeout_ms: i32) isize {
+    let mut pfd: [2]i32 = [h, 1];  // struct pollfd: fd, events POLLIN (revents 0)
+    loop {
+        let r = sys.read(h, buf, cap);
+        if r >= 0 {
+            return r;
+        }
+        if retry(r) {
+            continue;
+        }
+        if r != -sys.EAGAIN {
+            return @as(isize, PH_ERR);
+        }
+        let p = sys.ppoll(@ptr_cast(*mut void, &mut pfd[0]), 1, timeout_ms);
+        if p == 0 {
+            return 0;
+        }
+        if (p < 0) and not retry(p) {
+            return @as(isize, PH_ERR);
+        }
+        pfd[1] = 1;
+    }
+}
+
+export fn ph_watch_close(h: i32) void {
+    _ = sys.close(h);
 }
 
 // -----------------------------------------------------------------------------

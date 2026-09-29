@@ -54,7 +54,7 @@ static int copy_cstr(char *dst, size_t cap, const uint8_t *s, size_t n) {
 int32_t ph_open(const uint8_t *path, size_t len, uint32_t flags) {
     char buf[4096];
     if (copy_cstr(buf, sizeof buf, path, len)) return PH_ERR;
-    int f = flags == 1 ? O_WRONLY | O_CREAT | O_TRUNC : flags == 2 ? O_WRONLY | O_CREAT | O_APPEND : O_RDONLY;
+    int f = flags == 1 ? O_WRONLY | O_CREAT | O_TRUNC : flags == 2 ? O_WRONLY | O_CREAT | O_APPEND : flags == 3 ? O_RDWR : O_RDONLY;
     int fd = open(buf, f | O_CLOEXEC, 0644);
     if (fd >= 0) return fd;
     return errno == ENOENT ? -2 : errno == EACCES ? -13 : PH_ERR;
@@ -424,6 +424,105 @@ int64_t ph_signal_take(int64_t timeout_ns) {
         if (r < 0 && errno == ETIMEDOUT) return (int64_t)__atomic_exchange_n(&sig_pending, 0, __ATOMIC_SEQ_CST);
     }
 }
+
+// -----------------------------------------------------------------------------
+// More of the file system (see runtime/native.ph for the contract of each)
+// -----------------------------------------------------------------------------
+
+#include <poll.h>
+#include <sys/file.h>
+#include <sys/inotify.h>
+
+int32_t ph_chmod(const uint8_t *path, size_t len, uint32_t mode) {
+    char b[4096];
+    if (copy_cstr(b, sizeof b, path, len)) return PH_ERR;
+    return chmod(b, mode & 07777) ? fs_err() : 0;
+}
+
+int32_t ph_symlink(const uint8_t *target, size_t tlen, const uint8_t *link, size_t llen) {
+    char a[4096], b[4096];
+    if (copy_cstr(a, sizeof a, target, tlen) || copy_cstr(b, sizeof b, link, llen)) return PH_ERR;
+    return symlink(a, b) ? fs_err() : 0;
+}
+
+int32_t ph_link(const uint8_t *from, size_t flen, const uint8_t *to, size_t tlen) {
+    char a[4096], b[4096];
+    if (copy_cstr(a, sizeof a, from, flen) || copy_cstr(b, sizeof b, to, tlen)) return PH_ERR;
+    return link(a, b) ? fs_err() : 0;
+}
+
+intptr_t ph_readlink(const uint8_t *path, size_t len, uint8_t *buf, size_t cap) {
+    char p[4096], tmp[4096];
+    if (copy_cstr(p, sizeof p, path, len)) return PH_ERR;
+    ssize_t n = readlink(p, tmp, sizeof tmp);
+    if (n < 0) return fs_err();
+    if ((size_t)n <= cap) memcpy(buf, tmp, (size_t)n);
+    return (intptr_t)n;
+}
+
+static struct timespec split_ns(int64_t ns) {
+    int64_t s = ns / 1000000000, n = ns % 1000000000;
+    if (n < 0) { n += 1000000000; s--; }
+    return (struct timespec){s, n};
+}
+
+int32_t ph_utimes(const uint8_t *path, size_t len, int64_t atime_ns, int64_t mtime_ns) {
+    char p[4096];
+    if (copy_cstr(p, sizeof p, path, len)) return PH_ERR;
+    struct timespec ts[2] = {split_ns(atime_ns), split_ns(mtime_ns)};
+    return utimensat(AT_FDCWD, p, ts, 0) ? fs_err() : 0;
+}
+
+int32_t ph_ftruncate(int32_t fd, int64_t size) { return ftruncate(fd, size) ? fs_err() : 0; }
+
+int32_t ph_fsync(int32_t fd) { return fsync(fd) ? PH_ERR : 0; }
+
+int32_t ph_flock(int32_t fd, uint32_t op) {
+    int r;
+    do r = flock(fd, (int)op);
+    while (r < 0 && errno == EINTR);
+    if (r < 0) return errno == EWOULDBLOCK ? -11 : PH_ERR;
+    return 0;
+}
+
+uintptr_t ph_mmap(int32_t fd, int64_t off, size_t len, uint32_t writable) {
+    void *p = mmap(NULL, len, writable ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, off);
+    return p == MAP_FAILED ? 0 : (uintptr_t)p;
+}
+
+int32_t ph_munmap(uintptr_t addr, size_t len) { return munmap((void *)addr, len) ? PH_ERR : 0; }
+
+int32_t ph_msync(uintptr_t addr, size_t len) { return msync((void *)addr, len, MS_SYNC) ? PH_ERR : 0; }
+
+int32_t ph_watch_open(void) {
+    int fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    return fd < 0 ? PH_ERR : fd;
+}
+
+int32_t ph_watch_add(int32_t h, const uint8_t *path, size_t len) {
+    char p[4096];
+    if (copy_cstr(p, sizeof p, path, len)) return PH_ERR;
+    int wd = inotify_add_watch(h, p, IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE |
+                                         IN_DELETE_SELF | IN_MOVE_SELF);
+    return wd < 0 ? fs_err() : wd;
+}
+
+int32_t ph_watch_remove(int32_t h, int32_t wd) { return inotify_rm_watch(h, wd) ? PH_ERR : 0; }
+
+intptr_t ph_watch_read(int32_t h, uint8_t *buf, size_t cap, int32_t timeout_ms) {
+    for (;;) {
+        ssize_t r = read(h, buf, cap);
+        if (r >= 0) return (intptr_t)r;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN) return PH_ERR;
+        struct pollfd pfd = {h, POLLIN, 0};
+        int p = poll(&pfd, 1, timeout_ms);
+        if (p == 0) return 0;
+        if (p < 0 && errno != EINTR) return PH_ERR;
+    }
+}
+
+void ph_watch_close(int32_t h) { close(h); }
 
 // -----------------------------------------------------------------------------
 // Terminals
