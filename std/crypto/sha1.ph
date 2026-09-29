@@ -97,9 +97,13 @@ pub struct Sha1 {
         let pad: [64]u8 = [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                            0, 0, 0];
-        let mut n = 56 - self.nbuf;
+        // pad to 56 bytes past a block boundary (into the next block if
+        // there is no room for the length in this one)
+        let mut n: usize = 0;
         if self.nbuf >= 56 {
             n = 120 - self.nbuf;
+        } else {
+            n = 56 - self.nbuf;
         }
         let total = self.total;
         self.update(pad[..@min(n, 64)]);
@@ -161,4 +165,17 @@ test "sha-1 vectors" {
     }
     s.final(d[..]);
     @expect_eq(hex(d[..], h[..]), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+    // every length from 0 to 130 (all the ways the padding falls), hashed
+    // together; from Python's hashlib
+    let mut all = Sha1.init();
+    let mut data: [130]u8 = [0; 130];
+    for k in @as(usize, 0)..130 {
+        data[k] = @truncate(u8, k * 7);
+    }
+    for n in @as(usize, 0)..131 {
+        sha1(data[..n], d[..]);
+        all.update(d[..]);
+    }
+    all.final(d[..]);
+    @expect_eq(hex(d[..], h[..]), "c49ada15a78f955989fc22bd889719c249fc3041");
 }

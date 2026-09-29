@@ -226,34 +226,36 @@ pub fn query_raw(query: []u8, name: []u8) ![]u8 {
 // -----------------------------------------------------------------------------
 
 /// A connection, plain or TLS.
-struct Transport {
+/// A connection, plain or over TLS (for std/websocket, and upgraded
+/// connections).
+pub struct Transport {
     tcp: net.TcpStream,
     tls: *mut tls.Conn,  // when secure
     secure: bool,
 
-    fn plain(s: net.TcpStream) Transport {
+    pub fn plain(s: net.TcpStream) Transport {
         return Transport.{ tcp: s, tls: @ptr_from_int(*mut tls.Conn, 8), secure: false };
     }
 
-    fn over_tls(c: *mut tls.Conn) Transport {
+    pub fn over_tls(c: *mut tls.Conn) Transport {
         return Transport.{ tcp: c.stream, tls: c, secure: true };
     }
 
-    fn read(self: Transport, buf: []mut u8) !usize {
+    pub fn read(self: Transport, buf: []mut u8) !usize {
         if self.secure {
             return self.tls.read(buf);
         }
         return self.tcp.read(buf);
     }
 
-    fn write_all(self: Transport, bytes: []u8) !void {
+    pub fn write_all(self: Transport, bytes: []u8) !void {
         if self.secure {
             return self.tls.write_all(bytes);
         }
         return self.tcp.write_all(bytes);
     }
 
-    fn close(self: Transport) void {
+    pub fn close(self: Transport) void {
         if self.secure {
             self.tls.close();
         } else {
@@ -480,7 +482,7 @@ fn is_token_char(c: u8) bool {
 }
 
 /// Parses header lines ("Name: value") into out; returns how many.
-fn parse_headers(lines: []u8, out: []mut Header) !usize {
+pub fn parse_headers(lines: []u8, out: []mut Header) !usize {
     let mut n: usize = 0;
     let mut it = strs.lines(lines);
     loop {
@@ -668,6 +670,7 @@ pub struct Response {
     started: bool,  // the status line and headers have been sent
     chunked: bool,
     has_type: bool,
+    upgraded: bool,  // the handler took the connection over
 
     pub fn set_status(self: *mut Response, status: u16) void {
         self.status = status;
@@ -760,6 +763,21 @@ pub struct Response {
             self.stream.write_all(self.body.bytes())!;
         }
         self.body.clear();
+    }
+
+    /// Takes the connection over for another protocol (as std/websocket
+    /// does): sends "101 Switching Protocols" with the headers set so far,
+    /// and returns the connection. The handler then speaks the new protocol
+    /// on it until it returns, when the server closes it.
+    pub fn upgrade(self: *mut Response) !Transport {
+        if self.started {
+            return error.InvalidHeader;
+        }
+        self.status = 101;
+        self.keep_alive = true;
+        self.send_head(0, false, "")!;
+        self.upgraded = true;
+        return self.stream;
     }
 
     /// Sends the status line and headers, followed by `body` in the same
@@ -1115,6 +1133,7 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
         started: false,
         chunked: false,
         has_type: false,
+        upgraded: false,
     };
     defer res.head.deinit();
     defer res.body.deinit();
@@ -1128,6 +1147,9 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
         res.has_type = false;
         res.write("Internal Server Error\n") catch return false;
     };
+    if res.upgraded {
+        return false;  // the handler has had the connection
+    }
     res.finish() catch return false;
     return res.keep_alive;
 }
@@ -1397,7 +1419,7 @@ pub struct ClientOptions {
 let mut SYSTEM_TLS_LOCK: sync.Mutex = sync.Mutex.{ state: 0 };
 let mut SYSTEM_TLS: usize = 0;
 
-fn system_tls() !*tls.ClientConfig {
+pub fn system_tls() !*tls.ClientConfig {
     SYSTEM_TLS_LOCK.lock();
     defer SYSTEM_TLS_LOCK.unlock();
     if SYSTEM_TLS == 0 {
