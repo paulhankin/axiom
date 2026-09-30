@@ -90,6 +90,14 @@ static Type *intern_type(Type *proto) {
     for (int i = 0; i < t->nargs; i++)
         if (t->args[i]->has_params) hp = true;
     t->has_params = hp;
+    bool he = t->kind == TY_ENUM;
+    if (t->elem && t->elem->has_enum) he = true;
+    if (t->ret && t->ret->has_enum) he = true;
+    for (int i = 0; i < t->nparams; i++)
+        if (t->params[i]->has_enum) he = true;
+    for (int i = 0; i < t->nargs; i++)
+        if (t->args[i]->has_enum) he = true;
+    t->has_enum = he;
     ttab[j] = t;
     ttab_len++;
     return t;
@@ -282,6 +290,31 @@ Type *type_subst(Type *t, Type **from, Type **to, int n) {
     case TY_UNION: {
         Type **as = NEWN(Type *, t->nargs + 1);
         for (int i = 0; i < t->nargs; i++) as[i] = type_subst(t->args[i], from, to, n);
+        return type_named(t->decl, as, t->nargs);
+    }
+    default: return t;
+    }
+}
+
+Type *type_lower_enums(Type *t) {
+    if (!t || !t->has_enum) return t;
+    switch (t->kind) {
+    case TY_ENUM: return t->elem;
+    case TY_PTR: return type_ptr(type_lower_enums(t->elem), t->mut);
+    case TY_SLICE: return type_slice(type_lower_enums(t->elem), t->mut);
+    case TY_ERRUNION: return type_errunion(type_lower_enums(t->elem));
+    case TY_ARRAY:
+        if (t->len_param) return type_array_param(type_lower_enums(t->elem), t->len_param);
+        return type_array(type_lower_enums(t->elem), t->len);
+    case TY_FN: {
+        Type **ps = NEWN(Type *, t->nparams + 1);
+        for (int i = 0; i < t->nparams; i++) ps[i] = type_lower_enums(t->params[i]);
+        return type_fn(ps, t->nparams, type_lower_enums(t->ret));
+    }
+    case TY_STRUCT:
+    case TY_UNION: {
+        Type **as = NEWN(Type *, t->nargs + 1);
+        for (int i = 0; i < t->nargs; i++) as[i] = type_lower_enums(t->args[i]);
         return type_named(t->decl, as, t->nargs);
     }
     default: return t;

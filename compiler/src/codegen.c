@@ -92,9 +92,8 @@ static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
 // The concrete type of t in the function being generated. An enum is its
 // representation from here on: code generation never needs to tell them apart.
 static Type *ct(Type *t) {
-    if (t && t->kind == TY_ENUM) return t->elem;
-    if (!t || !F || !t->has_params) return t;
-    return type_subst(t, F->from, F->to, F->nsub);
+    if (t && t->has_params && F) t = type_subst(t, F->from, F->to, F->nsub);
+    return type_lower_enums(t);
 }
 
 static void internal_error(const char *msg) {
@@ -118,12 +117,12 @@ static LLVMTypeRef align_unit(int64_t a) {
 static LLVMTypeRef lty(Type *t) {
     if (t->has_params) internal_error(arena_printf("unsubstituted generic type %s", type_str(t)));
     if (t->backend) return t->backend;
+    if (t->has_enum) return t->backend = lty(type_lower_enums(t));
     LLVMTypeRef r = NULL;
     switch (t->kind) {
     case TY_VOID: r = T_void; break;
     case TY_BOOL: r = T_i8; break;
     case TY_INT: r = LLVMIntTypeInContext(ctx, (unsigned)t->bits); break;
-    case TY_ENUM: r = lty(t->elem); break;
     case TY_FLOAT: r = t->bits == 32 ? T_f32 : T_f64; break;
     case TY_VEC: {
         LLVMTypeRef lane = t->elem->kind == TY_FLOAT ? (t->elem->bits == 32 ? T_f32 : T_f64)

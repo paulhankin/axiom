@@ -57,6 +57,7 @@ struct Type {
     Sym name;
     int64_t cval;    // CONSTINT
     bool has_params; // mentions a TY_PARAM somewhere
+    bool has_enum;   // mentions a TY_ENUM somewhere
     // layout cache
     int64_t size, align;
     bool layout_done;
@@ -93,6 +94,8 @@ Decl *anon_struct_decl(Module *m, FieldVec fields, Span sp);  // interned by fie
 
 // Substitute generic parameters: every TY_PARAM from[i] becomes to[i].
 Type *type_subst(Type *t, Type **from, Type **to, int n);
+// t with every enum replaced by its representation (for code generation).
+Type *type_lower_enums(Type *t);
 // Field type of a struct instance / payload type of a union variant instance.
 Type *type_field(Type *st, int i);
 Type *type_variant(Type *ut, int i);

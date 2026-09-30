@@ -46,6 +46,21 @@ let CELLS: [3]Cell = [
 ];
 let mut current: Align = Align.START;
 
+struct Pair[T] {
+    a: T,
+    b: T,
+
+    pub fn init(a: T, b: T) Pair.[T] {
+        return Pair.[T].{ a: a, b: b };
+    }
+}
+
+// An enum inside a generic instance, built by a generic function.
+struct Held {
+    pair: Pair.[Align],
+    n: u32,
+}
+
 fn same[T: Eq](a: T, b: T) bool {
     return a == b;
 }
@@ -122,4 +137,9 @@ export fn run() void {
         .POS  => { io.str("positive"); }
     }
     // expect: zero
+    let h = Held.{ pair: Pair.[Align].init(Align.LEFT, Align.END), n: 1 };
+    io.str(h.pair.a.name());
+    io.str(h.pair.b.name());
+    // expect: left
+    // expect: end
 }
