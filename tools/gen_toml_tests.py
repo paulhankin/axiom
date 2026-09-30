@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundles the TOML 1.0.0 cases of toml-test into std/toml/testdata/toml-test.txt.
+"""Bundles the TOML 1.0.0 cases of toml-test into std/encoding/toml/testdata/toml-test.txt.
 
     git clone https://github.com/toml-lang/toml-test
     tools/gen_toml_tests.py path/to/toml-test
@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 src = os.path.join(sys.argv[1], 'tests')
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'toml', 'testdata', 'toml-test.txt')
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'encoding', 'toml', 'testdata', 'toml-test.txt')
 commit = subprocess.run(['git', '-C', sys.argv[1], 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
 names = [l.strip() for l in open(os.path.join(src, 'files-toml-1.0.0')) if l.strip().endswith('.toml')]
 os.makedirs(os.path.dirname(out), exist_ok=True)

@@ -19,16 +19,16 @@
 // written is dropped.
 // =============================================================================
 
+import "collections/vec.ph" as vec;
 import "fmt.ph" as fmt;
-import "fs.ph" as fs;
 import "io.ph" as io;
 import "mem.ph" as mem;
 import "os.ph" as os;
+import "os/fs.ph" as fs;
 import "str.ph" as strs;
 import "sync.ph" as sync;
 import "thread.ph" as thread;
 import "time.ph" as time;
-import "vec.ph" as vec;
 
 error { OutOfMemory, IoError, BadLevel }
 

@@ -1,6 +1,6 @@
-// std/vec
+// std/collections/vec
 import "../lib/io.ph" as io;
-import "std/vec" as vec;
+import "std/collections/vec" as vec;
 
 fn less(a: i32, b: i32) bool {
     return a < b;

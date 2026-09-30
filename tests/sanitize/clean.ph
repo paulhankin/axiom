@@ -1,13 +1,13 @@
 // A correct program that uses much of std, from several threads: nothing
 // is reported.
 // status: 0
+import "../../std/collections/map.ph" as map;
+import "../../std/collections/vec.ph" as vec;
+import "../../std/encoding/json.ph" as json;
 import "../../std/fmt.ph" as fmt;
 import "../../std/hash.ph" as hash;
-import "../../std/json.ph" as json;
-import "../../std/map.ph" as map;
 import "../../std/str.ph" as strs;
 import "../../std/thread.ph" as thread;
-import "../../std/vec.ph" as vec;
 
 struct Job {
     seed: u64,

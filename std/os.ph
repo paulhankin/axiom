@@ -14,15 +14,15 @@
 //     os.exit(2);
 //
 // Argument 0 is the program's name as it was run. Child processes are in
-// std/process.
+// std/os/process.
 //
 // On the node host (WebAssembly) each thread has its own copy of the
 // environment, only the main thread can change directory, and signals are
 // not supported (Unsupported): node delivers them only to its event loop.
 // =============================================================================
 
+import "collections/vec.ph" as vec;
 import "mem.ph" as mem;
-import "vec.ph" as vec;
 
 error { NotFound, OutOfMemory, InvalidArgument, PermissionDenied, Unsupported, Failed }
 

@@ -132,8 +132,12 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
 // `phalange test`: the standard library's own tests must pass, and the
 // self-tests in tests/testing/ must produce exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
-const stdDirs = [path.join(root, 'std'), ...fs.readdirSync(path.join(root, 'std'), { withFileTypes: true })
-  .filter((e) => e.isDirectory()).map((e) => path.join(root, 'std', e.name)).sort()];
+function dirsUnder(dir) {
+  return [dir, ...fs.readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name !== 'testdata').map((e) => e.name).sort()
+    .flatMap((n) => dirsUnder(path.join(dir, n)))];
+}
+const stdDirs = dirsUnder(path.join(root, 'std'));
 const stdFiles = stdDirs.flatMap(files).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
 for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
   const name = path.relative(root, f) + ' [phalange test]';

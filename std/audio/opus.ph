@@ -14,8 +14,8 @@
 // =============================================================================
 
 import "../audio.ph" as audio;
+import "../collections/vec.ph" as vec;
 import "../mem.ph" as mem;
-import "../vec.ph" as vec;
 import "ogg.ph" as ogg;
 import "opus/decoder.ph" as dec;
 
@@ -216,7 +216,7 @@ pub fn decode(data: []u8) !audio.Sound {
 // Tests
 // -----------------------------------------------------------------------------
 
-import "../fs.ph" as fs;
+import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
 
 fn field(line: []u8, n: usize) []u8 {

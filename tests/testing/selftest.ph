@@ -81,6 +81,5 @@ test "wrong trap code" expect trap(T0001) {
 }
 
 test "infinite loop" {
-    loop {
-    }
+    loop {}
 }

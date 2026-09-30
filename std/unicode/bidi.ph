@@ -13,10 +13,10 @@
 // part in the display: visual_order leaves them out.
 // =============================================================================
 
+import "../collections/vec.ph" as vec;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
 import "../unicode.ph" as uni;
-import "../vec.ph" as vec;
 import "tables.ph" as t;
 
 error { OutOfMemory, Done }

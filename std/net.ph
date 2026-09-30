@@ -13,13 +13,13 @@
 // waits for any of several sockets to be ready.
 // =============================================================================
 
+import "collections/vec.ph" as vec;
 import "fmt.ph" as fmt;
-import "fs.ph" as fs;
 import "io.ph" as io;
 import "mem.ph" as mem;
-import "path.ph" as path;
+import "os/fs.ph" as fs;
+import "os/path.ph" as path;
 import "str.ph" as strs;
-import "vec.ph" as vec;
 
 error { ConnectionRefused, AddressInUse, InvalidAddress, NetError, TimedOut, OutOfMemory }
 
@@ -549,7 +549,7 @@ fn parse_ip6(s0: []u8) !Addr {
 
 /// The addresses of a host name (or a literal address), with port 0; the
 /// caller frees them. The system's resolver, or /etc/hosts and DNS for A
-/// records; std/dns asks DNS servers for any kind of record.
+/// records; std/net/dns asks DNS servers for any kind of record.
 pub fn resolve(name: []u8) ![]mut Addr {
     let mut recs: [384]u8 = [0; 384];  // 16 records
     let n = ph_resolve(name.ptr, name.len, &mut recs[0], 16);

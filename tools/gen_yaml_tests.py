@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundles the yaml-test-suite into std/yaml/testdata/yaml-test-suite.txt.
+"""Bundles the yaml-test-suite into std/encoding/yaml/testdata/yaml-test-suite.txt.
 
     git clone -b data-2022-01-17 https://github.com/yaml/yaml-test-suite
     tools/gen_yaml_tests.py path/to/yaml-test-suite
@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 src = sys.argv[1]
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'yaml', 'testdata', 'yaml-test-suite.txt')
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'encoding', 'yaml', 'testdata', 'yaml-test-suite.txt')
 commit = subprocess.run(['git', '-C', src, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
 cases = []
 for d in sorted(os.listdir(src)):

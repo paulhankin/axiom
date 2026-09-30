@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/decimal/testdata/cases.txt: random operations on decimals
+"""Generates std/math/decimal/testdata/cases.txt: random operations on decimals
 with the results Python's decimal module gives.
 
 Each line is: op a b n mode result
@@ -71,7 +71,7 @@ for i in range(600):
         r = a.compare(b)
     lines.append('%s %s %s %d %d %s' % (op, plain(a), plain(b), n, m, plain(r)))
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'decimal', 'testdata', 'cases.txt')
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'math', 'decimal', 'testdata', 'cases.txt')
 with open(out, 'w') as f:
     f.write('\n'.join(lines) + '\n')
 print(out, len(lines))

@@ -1,6 +1,6 @@
-// std/matrix
+// std/math/matrix
 import "../lib/io.ph" as io;
-import "std/matrix" as mx;
+import "std/math/matrix" as mx;
 
 fn err_of[T](r: !T) []u8 {
     _ = r catch |e| {

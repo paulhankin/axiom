@@ -1,8 +1,8 @@
-// std/map: inserts, lookups and removals of integer keys (hashing, probing,
+// std/collections/map: inserts, lookups and removals of integer keys (hashing, probing,
 // function pointers for hash and equality).
 import "common.ph" as c;
+import "std/collections/map" as map;
 import "std/hash" as hash;
-import "std/map" as map;
 
 export fn main() i32 {
     let mut m = map.Map.[u64, u64].init(hash.hash_u64, hash.eq_u64);

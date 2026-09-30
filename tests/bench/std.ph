@@ -4,35 +4,35 @@
 // OpenSSL, ...). Build with -O2:
 //
 //     phalange build --target=native -O2 tests/bench/std.ph -o build/bench/std && build/bench/std [filter]
-import "std/base64" as base64;
-import "std/bigint" as bigint;
-import "std/color" as color;
+import "std/collections/map" as maps;
+import "std/collections/vec" as vec;
+import "std/compress/deflate" as deflate;
 import "std/crypto/aes_gcm" as aes_gcm;
 import "std/crypto/chacha20poly1305" as chacha;
 import "std/crypto/md5" as md5;
 import "std/crypto/sha2" as sha2;
-import "std/deflate" as deflate;
-import "std/draw" as draw;
+import "std/encoding/base64" as base64;
+import "std/encoding/json" as json;
 import "std/fmt" as fmt;
-import "std/font" as font;
-import "std/fs" as fs;
+import "std/graphics/color" as color;
+import "std/graphics/draw" as draw;
+import "std/graphics/font" as font;
+import "std/graphics/image" as image;
+import "std/graphics/image/jpeg" as jpeg;
+import "std/graphics/image/png" as png;
+import "std/graphics/pdf" as pdf;
+import "std/graphics/pdf/read" as pdf_read;
+import "std/graphics/text" as text;
 import "std/hash" as hash;
-import "std/image" as image;
-import "std/image/jpeg" as jpeg;
-import "std/image/png" as png;
-import "std/json" as json;
-import "std/map" as maps;
-import "std/markdown" as markdown;
+import "std/math/bigint" as bigint;
 import "std/mem" as mem;
 import "std/os" as os;
-import "std/pdf" as pdf;
-import "std/pdf/read" as pdf_read;
-import "std/regex" as regex;
+import "std/os/fs" as fs;
 import "std/str" as strs;
-import "std/text" as text;
+import "std/text/markdown" as markdown;
+import "std/text/regex" as regex;
 import "std/time" as time;
 import "std/unicode" as uni;
-import "std/vec" as vec;
 
 let mut filter: []u8 = "";
 let mut rng: u64 = 0x2545f4914f6cdd1d;

@@ -1,8 +1,8 @@
-// std/vec heapsort through a comparison function pointer, and a hand
+// std/collections/vec heapsort through a comparison function pointer, and a hand
 // written insertion + merge sort on slices.
 import "common.ph" as c;
+import "std/collections/vec" as vec;
 import "std/mem" as mem;
-import "std/vec" as vec;
 
 fn less(a: u64, b: u64) bool {
     return a < b;

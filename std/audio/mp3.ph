@@ -14,7 +14,7 @@
 // =============================================================================
 
 import "../audio.ph" as audio;
-import "../base64.ph" as base64;
+import "../encoding/base64.ph" as base64;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;

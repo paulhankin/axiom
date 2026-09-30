@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Bundles conformance vectors for std/msgpack and std/cbor.
+"""Bundles conformance vectors for std/encoding/msgpack and std/encoding/cbor.
 
     git clone https://github.com/kawanet/msgpack-test-suite
     git clone https://github.com/cbor/test-vectors
     tools/gen_binary_tests.py path/to/msgpack-test-suite path/to/test-vectors
 
-std/msgpack/testdata/suite.txt: one case per line, `<expected>\t<hex> <hex>...`
+std/encoding/msgpack/testdata/suite.txt: one case per line, `<expected>\t<hex> <hex>...`
 where every encoding decodes to the expected value (the first is the
-shortest, which encoding must reproduce). std/cbor/testdata/appendix_a.txt
+shortest, which encoding must reproduce). std/encoding/cbor/testdata/appendix_a.txt
 (RFC 8949 Appendix A): `<hex>\t<roundtrip 0/1>\t<diagnostic notation>`.
 
 The expected values use a small dump format: nil, true, false, integers
@@ -22,7 +22,7 @@ import struct
 import subprocess
 import sys
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'encoding')
 
 
 def commit(path):
@@ -94,7 +94,7 @@ with open(os.path.join(root, 'msgpack', 'testdata', 'suite.txt'), 'w') as f:
 print('msgpack:', len(lines), 'cases')
 
 
-# CBOR diagnostic notation, as std/cbor writes it
+# CBOR diagnostic notation, as std/encoding/cbor writes it
 def diag_float(x):
     if math.isnan(x):
         return 'NaN'

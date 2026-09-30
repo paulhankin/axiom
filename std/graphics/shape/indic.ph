@@ -1,0 +1,899 @@
+// =============================================================================
+// std/graphics/shape/indic.ph - the Indic shaper (Bengali, Devanagari, Gujarati,
+// Gurmukhi, Kannada, Malayalam, Oriya, Tamil, Telugu): text splits into
+// syllables, and within each the base consonant is found, pre-base matras
+// move before it, reph moves after it, and features apply to the parts they
+// are for (HarfBuzz's hb-ot-shaper-indic).
+// =============================================================================
+
+import "buffer.ph" as buf;
+import "layout.ph" as layout;
+import "plan.ph" as plan;
+import "tables.ph" as t;
+
+// Categories
+pub const X: u8 = 0;
+pub const C: u8 = 1;
+pub const V: u8 = 2;
+pub const N: u8 = 3;
+pub const H: u8 = 4;
+pub const ZWNJ: u8 = 5;
+pub const ZWJ: u8 = 6;
+pub const M: u8 = 7;
+pub const SM: u8 = 8;
+pub const A: u8 = 9;
+pub const PLACEHOLDER: u8 = 10;
+pub const DOTTEDCIRCLE: u8 = 11;
+pub const RS: u8 = 12;
+pub const MPST: u8 = 13;
+pub const REPHA: u8 = 14;
+pub const RA: u8 = 15;
+pub const CM: u8 = 16;
+pub const SYMBOL: u8 = 17;
+pub const CS: u8 = 18;
+pub const SMPST: u8 = 57;
+
+// Positions
+pub const POS_START: u8 = 0;
+pub const POS_RA_TO_BECOME_REPH: u8 = 1;
+pub const POS_PRE_M: u8 = 2;
+pub const POS_PRE_C: u8 = 3;
+pub const POS_BASE_C: u8 = 4;
+pub const POS_AFTER_MAIN: u8 = 5;
+pub const POS_ABOVE_C: u8 = 6;
+pub const POS_BEFORE_SUB: u8 = 7;
+pub const POS_BELOW_C: u8 = 8;
+pub const POS_AFTER_SUB: u8 = 9;
+pub const POS_BEFORE_POST: u8 = 10;
+pub const POS_POST_C: u8 = 11;
+pub const POS_AFTER_POST: u8 = 12;
+pub const POS_SMVD: u8 = 13;
+pub const POS_END: u8 = 14;
+
+// Syllable types
+const CONSONANT_SYLLABLE: u8 = 0;
+const VOWEL_SYLLABLE: u8 = 1;
+const STANDALONE_CLUSTER: u8 = 2;
+const SYMBOL_CLUSTER: u8 = 3;
+const BROKEN_CLUSTER: u8 = 4;
+const NON_INDIC_CLUSTER: u8 = 5;
+
+// The features (HarfBuzz's indic_features), with their flags
+pub let FEATURE_TAGS: [17][]u8 = [
+    "nukt",
+    "akhn",
+    "rphf",
+    "rkrf",
+    "pref",
+    "blwf",
+    "abvf",
+    "half",
+    "pstf",
+    "vatu",
+    "cjct",
+    "init",
+    "pres",
+    "abvs",
+    "blws",
+    "psts",
+    "haln",
+];
+pub let FEATURE_GLOBAL: [17]bool = [
+    true,
+    true,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+];
+
+fn flag(c: u8) u64 {
+    if c >= 64 {
+        return 0;
+    }
+    return @as(u64, 1) << @as(u64, c);
+}
+
+const CONSONANT_FLAGS: u64 = (1 << 1) | (1 << 18) | (1 << 15) | (1 << 16) | (1 << 2) | (1 << 10) | (1 << 11);
+const JOINER_FLAGS: u64 = (1 << 5) | (1 << 6);
+
+fn is_one_of(i: *buf.Info, flags: u64) bool {
+    if layout.ligated(i) {
+        return false;
+    }
+    return (flag(i.cat) & flags) != 0;
+}
+
+fn is_consonant(i: *buf.Info) bool {
+    return is_one_of(i, CONSONANT_FLAGS);
+}
+
+fn is_joiner(i: *buf.Info) bool {
+    return is_one_of(i, JOINER_FLAGS);
+}
+
+fn is_halant(i: *buf.Info) bool {
+    return is_one_of(i, flag(H));
+}
+
+/// The category (low byte) and position (high byte) of a character.
+fn categories(u: u32) u16 {
+    let cps = t.INDIC_CP[..];
+    let mut lo: usize = 0;
+    let mut hi = cps.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cps[mid] < u {
+            lo = mid + 1;
+        } else if cps[mid] > u {
+            hi = mid;
+        } else {
+            return t.INDIC_VALUE[mid];
+        }
+    }
+    return @as(u16, POS_END) << 8;
+}
+
+pub fn setup_masks(b: *mut buf.Buffer) void {
+    for i in @as(usize, 0)..b.len {
+        let v = categories(b.info[i].cp);
+        b.info[i].cat = @truncate(u8, v);
+        b.info[i].ipos = @truncate(u8, v >> 8);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Vowel constraints: dotted circles where a vowel sequence would look like
+// a different letter
+// -----------------------------------------------------------------------------
+
+fn output_with_dotted_circle(b: *mut buf.Buffer) void {
+    _ = b.output_glyph(0x25cc);
+    b.prev().uprops &= ~buf.UP_CONTINUATION;
+    _ = b.next_glyph();
+}
+
+fn vowel_pair(p: *plan.Plan, a: u32, bb: u32) bool {
+    let firsts = t.VOWEL_FIRST[..];
+    for i in @as(usize, 0)..firsts.len {
+        if (firsts[i] == a) and (t.VOWEL_SECOND[i] == bb) {
+            return plan.script_of(a) == p.script;
+        }
+    }
+    return false;
+}
+
+pub fn preprocess_text(p: *plan.Plan, b: *mut buf.Buffer) void {
+    b.clear_output();
+    let count = b.len;
+    b.idx = 0;
+    while ((b.idx + 1) < count) and b.successful {
+        let mut matched = false;
+        let u = b.info[b.idx].cp;
+        let u1 = b.info[b.idx + 1].cp;
+        if (u == 0x0930) and (p.script == plan.tag("Deva")) {
+            if (u1 == 0x094d) and ((b.idx + 2) < count) and (b.info[b.idx + 2].cp == 0x0907) {
+                _ = b.next_glyph();
+                matched = true;
+            }
+        } else {
+            matched = vowel_pair(p, u, u1);
+        }
+        _ = b.next_glyph();
+        if matched {
+            output_with_dotted_circle(b);
+        }
+    }
+    _ = b.sync();
+}
+
+// -----------------------------------------------------------------------------
+// Syllables
+// -----------------------------------------------------------------------------
+
+fn symbol_of(c: u8) usize {
+    if c < 19 {
+        return @as(usize, c);
+    }
+    if c == SMPST {
+        return 19;
+    }
+    return 20;
+}
+
+pub fn find_syllables(b: *mut buf.Buffer) void {
+    let n = b.len;
+    let mut serial: u8 = 1;
+    let mut ts: usize = 0;
+    while ts < n {
+        let mut state: usize = 0;
+        let mut p = ts;
+        let mut te = ts + 1;
+        let mut typ = NON_INDIC_CLUSTER;
+        while p < n {
+            let s = t.INDIC_DFA[(state * 21) + symbol_of(b.info[p].cat)];
+            if s == 255 {
+                break;
+            }
+            state = @as(usize, s);
+            p += 1;
+            let acc = t.INDIC_ACCEPT[state];
+            if acc != 255 {
+                te = p;
+                typ = acc;
+            }
+        }
+        if typ == BROKEN_CLUSTER {
+            b.scratch |= buf.SF_HAS_BROKEN_SYLLABLE;
+        }
+        for i in ts..te {
+            b.info[i].syl = (serial << 4) | typ;
+        }
+        serial += 1;
+        if serial == 16 {
+            serial = 1;
+        }
+        ts = te;
+    }
+}
+
+fn next_syllable(b: *buf.Buffer, start: usize) usize {
+    let syl = b.info[start].syl;
+    let limit = start + @min(b.len - start, 64);
+    let mut i = start + 1;
+    while (i < limit) and (b.info[i].syl == syl) {
+        i += 1;
+    }
+    return i;
+}
+
+/// Inserts dotted circles for broken clusters (HarfBuzz's
+/// hb_syllabic_insert_dotted_circles).
+fn insert_dotted_circles(p: *plan.Plan, b: *mut buf.Buffer) bool {
+    if (b.scratch & buf.SF_HAS_BROKEN_SYLLABLE) == 0 {
+        return false;
+    }
+    let dc = p.glyph(0x25cc);
+    if dc == 0 {
+        return false;
+    }
+    let mut dot = buf.zero_info();
+    dot.cp = dc;
+    dot.cat = DOTTEDCIRCLE;
+    dot.ipos = POS_END;
+    dot.uprops = @truncate(u16, plan.GC_CC);  // HarfBuzz leaves its category 0 (control)
+    b.clear_output();
+    b.idx = 0;
+    let mut last_syllable: u8 = 0;
+    while (b.idx < b.len) and b.successful {
+        let syl = b.info[b.idx].syl;
+        if (last_syllable != syl) and ((syl & 0x0f) == BROKEN_CLUSTER) {
+            last_syllable = syl;
+            let mut g = dot;
+            g.cluster = b.info[b.idx].cluster;
+            g.mask = b.info[b.idx].mask;
+            g.syl = syl;
+            while (b.idx < b.len) and b.successful and (last_syllable == b.info[b.idx].syl) and
+                  (b.info[b.idx].cat == REPHA) {
+                _ = b.next_glyph();
+            }
+            _ = b.output_info(g);
+        } else {
+            _ = b.next_glyph();
+        }
+    }
+    _ = b.sync();
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Initial reordering
+// -----------------------------------------------------------------------------
+
+fn load_virama_glyph(p: *mut plan.Plan) u32 {
+    if p.virama_glyph < 0 {
+        let mut g: u32 = 0;
+        if p.indic.virama != 0 {
+            g = p.glyph(p.indic.virama);
+        }
+        p.virama_glyph = @as(i64, g);
+    }
+    return @truncate(u32, @bit_cast(u64, p.virama_glyph));
+}
+
+fn consonant_position_from_face(p: *plan.Plan, consonant: u32, virama: u32) u8 {
+    let g: [3]u32 = [virama, consonant, virama];
+    if p.would_substitute(plan.WOULD_BLWF, g[0..2]) or p.would_substitute(plan.WOULD_BLWF, g[1..3]) or
+       p.would_substitute(plan.WOULD_VATU, g[0..2]) or p.would_substitute(plan.WOULD_VATU, g[1..3]) {
+        return POS_BELOW_C;
+    }
+    if p.would_substitute(plan.WOULD_PSTF, g[0..2]) or p.would_substitute(plan.WOULD_PSTF, g[1..3]) {
+        return POS_POST_C;
+    }
+    if p.would_substitute(plan.WOULD_PREF, g[0..2]) or p.would_substitute(plan.WOULD_PREF, g[1..3]) {
+        return POS_POST_C;
+    }
+    return POS_BASE_C;
+}
+
+fn update_consonant_positions(p: *mut plan.Plan, b: *mut buf.Buffer) void {
+    let virama = load_virama_glyph(p);
+    if virama == 0 {
+        return;
+    }
+    for i in @as(usize, 0)..b.len {
+        if b.info[i].ipos == POS_BASE_C {
+            b.info[i].ipos = consonant_position_from_face(p, b.info[i].cp, virama);
+        }
+    }
+}
+
+fn swap(b: *mut buf.Buffer, i: usize, j: usize) void {
+    let x = b.info[i];
+    b.info[i] = b.info[j];
+    b.info[j] = x;
+}
+
+/// Moves info[from] to position to (to > from), shifting the ones between
+/// back.
+fn move_forward(b: *mut buf.Buffer, from: usize, to: usize) void {
+    let x = b.info[from];
+    for k in from..to {
+        b.info[k] = b.info[k + 1];
+    }
+    b.info[to] = x;
+}
+
+/// Moves info[from] to position to (to < from), shifting the ones between
+/// on.
+fn move_back(b: *mut buf.Buffer, from: usize, to: usize) void {
+    let x = b.info[from];
+    let mut k = from;
+    while k > to {
+        b.info[k] = b.info[k - 1];
+        k -= 1;
+    }
+    b.info[to] = x;
+}
+
+fn initial_reordering_consonant_syllable(p: *mut plan.Plan, b: *mut buf.Buffer, start: usize, end: usize) void {
+    let info = b.info;
+    if (p.script == plan.tag("Knda")) and ((start + 3) <= end) and is_one_of(&info[start], flag(RA)) and
+       is_one_of(&info[start + 1], flag(H)) and is_one_of(&info[start + 2], flag(ZWJ)) {
+        b.merge_clusters(start + 1, start + 3);
+        swap(b, start + 1, start + 2);
+    }
+    // find the base consonant
+    let mut base = end;
+    let mut has_reph = false;
+    {
+        let mut limit = start;
+        let rm = p.indic.reph_mode;
+        if (p.indic_mask[plan.INDIC_RPHF] != 0) and ((start + 3) <= end) and
+           (((rm == plan.REPH_IMPLICIT) and not is_joiner(&info[start + 2])) or
+            ((rm == plan.REPH_EXPLICIT) and (info[start + 2].cat == ZWJ))) {
+            let mut g: [3]u32 = [info[start].cp, info[start + 1].cp, 0];
+            if rm == plan.REPH_EXPLICIT {
+                g[2] = info[start + 2].cp;
+            }
+            if p.would_substitute(plan.WOULD_RPHF, g[0..2]) or
+               ((rm == plan.REPH_EXPLICIT) and p.would_substitute(plan.WOULD_RPHF, g[0..3])) {
+                limit += 2;
+                while (limit < end) and is_joiner(&info[limit]) {
+                    limit += 1;
+                }
+                base = start;
+                has_reph = true;
+            }
+        } else if (rm == plan.REPH_LOG_REPHA) and (info[start].cat == REPHA) {
+            limit += 1;
+            while (limit < end) and is_joiner(&info[limit]) {
+                limit += 1;
+            }
+            base = start;
+            has_reph = true;
+        }
+        {
+            let mut i = end;
+            let mut seen_below = false;
+            loop {
+                i -= 1;
+                if is_consonant(&info[i]) {
+                    if (info[i].ipos != POS_BELOW_C) and ((info[i].ipos != POS_POST_C) or seen_below) {
+                        base = i;
+                        break;
+                    }
+                    if info[i].ipos == POS_BELOW_C {
+                        seen_below = true;
+                    }
+                    base = i;
+                } else {
+                    if (start < i) and (info[i].cat == ZWJ) and (info[i - 1].cat == H) {
+                        break;
+                    }
+                }
+                if i <= limit {
+                    break;
+                }
+            }
+        }
+        if has_reph and (base == start) and ((limit - base) <= 2) {
+            has_reph = false;
+        }
+    }
+    for i in start..base {
+        info[i].ipos = @min(POS_PRE_C, info[i].ipos);
+    }
+    if base < end {
+        info[base].ipos = POS_BASE_C;
+    }
+    if has_reph {
+        info[start].ipos = POS_RA_TO_BECOME_REPH;
+    }
+    if p.indic_old_spec {
+        let disallow_double_halants = p.script == plan.tag("Knda");
+        let mut i = base + 1;
+        while i < end {
+            if info[i].cat == H {
+                let mut j = end - 1;
+                while j > i {
+                    if is_consonant(&info[j]) or (disallow_double_halants and (info[j].cat == H)) {
+                        break;
+                    }
+                    j -= 1;
+                }
+                if (info[j].cat != H) and (j > i) {
+                    move_forward(b, i, j);
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    // attach misc marks to the previous character
+    {
+        let mut last_pos = POS_START;
+        for i in start..end {
+            if (flag(info[i].cat) & (JOINER_FLAGS | flag(N) | flag(RS) | flag(CM) | flag(H))) != 0 {
+                info[i].ipos = last_pos;
+                if (info[i].cat == H) and (info[i].ipos == POS_PRE_M) {
+                    let mut j = i;
+                    while j > start {
+                        if info[j - 1].ipos != POS_PRE_M {
+                            info[i].ipos = info[j - 1].ipos;
+                            break;
+                        }
+                        j -= 1;
+                    }
+                }
+            } else if info[i].ipos != POS_SMVD {
+                if (info[i].cat == MPST) and (i > start) and (info[i - 1].cat == SM) {
+                    info[i - 1].ipos = info[i].ipos;
+                }
+                last_pos = info[i].ipos;
+            }
+        }
+    }
+    // post-base consonants: things after them go with them
+    if base < end {
+        let mut last = base;
+        for i in (base + 1)..end {
+            if is_consonant(&info[i]) {
+                for j in (last + 1)..i {
+                    if info[j].ipos < POS_SMVD {
+                        info[j].ipos = info[i].ipos;
+                    }
+                }
+                last = i;
+            } else if (flag(info[i].cat) & (flag(M) | flag(MPST))) != 0 {
+                last = i;
+            }
+        }
+    }
+    {
+        let syllable = info[start].syl;
+        for i in start..end {
+            info[i].syl = @truncate(u8, i - start);
+        }
+        stable_sort_by_pos(b, start, end);
+        let mut first_left_matra = end;
+        let mut last_left_matra = end;
+        base = end;
+        for i in start..end {
+            if info[i].ipos == POS_BASE_C {
+                base = i;
+                break;
+            } else if info[i].ipos == POS_PRE_M {
+                if first_left_matra == end {
+                    first_left_matra = i;
+                }
+                last_left_matra = i;
+            }
+        }
+        if first_left_matra < last_left_matra {
+            b.reverse_range(first_left_matra, last_left_matra + 1);
+            let mut i = first_left_matra;
+            for j in first_left_matra..(last_left_matra + 1) {
+                if (flag(info[j].cat) & (flag(M) | flag(MPST))) != 0 {
+                    b.reverse_range(i, j + 1);
+                    i = j + 1;
+                }
+            }
+        }
+        if p.indic_old_spec or ((end - start) > 127) {
+            b.merge_clusters(base, end);
+        } else {
+            for i in base..end {
+                if info[i].syl != 255 {
+                    let mut min = i;
+                    let mut max = i;
+                    let mut j = start + @as(usize, info[i].syl);
+                    while j != i {
+                        min = @min(min, j);
+                        max = @max(max, j);
+                        let next = start + @as(usize, info[j].syl);
+                        info[j].syl = 255;
+                        j = next;
+                    }
+                    b.merge_clusters(@max(base, min), max + 1);
+                }
+            }
+        }
+        for i in start..end {
+            info[i].syl = syllable;
+        }
+    }
+    // masks
+    {
+        let mut i = start;
+        while (i < end) and (info[i].ipos == POS_RA_TO_BECOME_REPH) {
+            info[i].mask |= p.indic_mask[plan.INDIC_RPHF];
+            i += 1;
+        }
+        let mut mask = p.indic_mask[plan.INDIC_HALF];
+        if not p.indic_old_spec and (p.indic.blwf_mode == plan.BLWF_PRE_AND_POST) {
+            mask |= p.indic_mask[plan.INDIC_BLWF];
+        }
+        for k in start..base {
+            info[k].mask |= mask;
+        }
+        mask = p.indic_mask[plan.INDIC_BLWF] | p.indic_mask[plan.INDIC_ABVF] | p.indic_mask[plan.INDIC_PSTF];
+        if base < end {
+            for k in (base + 1)..end {
+                info[k].mask |= mask;
+            }
+        }
+    }
+    if p.indic_old_spec and (p.script == plan.tag("Deva")) {
+        let mut i = start;
+        while (i + 1) < base {
+            if (info[i].cat == RA) and (info[i + 1].cat == H) and (((i + 2) == base) or (info[i + 2].cat != ZWJ)) {
+                info[i].mask |= p.indic_mask[plan.INDIC_BLWF];
+                info[i + 1].mask |= p.indic_mask[plan.INDIC_BLWF];
+            }
+            i += 1;
+        }
+    }
+    let pref_len: usize = 2;
+    if (p.indic_mask[plan.INDIC_PREF] != 0) and ((base + pref_len) < end) {
+        let mut i = base + 1;
+        while ((i + pref_len) - 1) < end {
+            let g: [2]u32 = [info[i].cp, info[i + 1].cp];
+            if p.would_substitute(plan.WOULD_PREF, g[..]) {
+                info[i].mask |= p.indic_mask[plan.INDIC_PREF];
+                info[i + 1].mask |= p.indic_mask[plan.INDIC_PREF];
+                break;
+            }
+            i += 1;
+        }
+    }
+    // ZWNJ stops the half forms before it
+    for i in (start + 1)..end {
+        if is_joiner(&info[i]) {
+            let non_joiner = info[i].cat == ZWNJ;
+            let mut j = i;
+            loop {
+                j -= 1;
+                if non_joiner {
+                    info[j].mask &= ~p.indic_mask[plan.INDIC_HALF];
+                }
+                if not ((j > start) and not is_consonant(&info[j])) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Stable sort of [start, end) by position (no cluster merging).
+fn stable_sort_by_pos(b: *mut buf.Buffer, start: usize, end: usize) void {
+    if end <= start {
+        return;
+    }
+    for i in (start + 1)..end {
+        let x = b.info[i];
+        let mut j = i;
+        while (j > start) and (b.info[j - 1].ipos > x.ipos) {
+            b.info[j] = b.info[j - 1];
+            j -= 1;
+        }
+        b.info[j] = x;
+    }
+}
+
+pub fn initial_reordering(p: *mut plan.Plan, b: *mut buf.Buffer) void {
+    update_consonant_positions(p, b);
+    _ = insert_dotted_circles(p, b);
+    let mut start: usize = 0;
+    while start < b.len {
+        let end = next_syllable(b, start);
+        let typ = b.info[start].syl & 0x0f;
+        if (typ == VOWEL_SYLLABLE) or (typ == CONSONANT_SYLLABLE) or (typ == BROKEN_CLUSTER) or
+           (typ == STANDALONE_CLUSTER) {
+            initial_reordering_consonant_syllable(p, b, start, end);
+        }
+        start = end;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Final reordering
+// -----------------------------------------------------------------------------
+
+fn ligated_and_didnt_multiply(i: *buf.Info) bool {
+    return layout.ligated(i) and not layout.multiplied(i);
+}
+
+fn final_reordering_syllable(p: *mut plan.Plan, b: *mut buf.Buffer, start: usize, end: usize) void {
+    let info = b.info;
+    let vg = p.virama_glyph;
+    if vg > 0 {
+        let virama = @truncate(u32, @bit_cast(u64, vg));
+        for i in start..end {
+            if (info[i].cp == virama) and layout.ligated(&info[i]) and layout.multiplied(&info[i]) {
+                info[i].cat = H;
+                info[i].gprops &= ~(buf.GP_LIGATED | buf.GP_MULTIPLIED);
+            }
+        }
+    }
+    let pref_mask = p.indic_mask[plan.INDIC_PREF];
+    let mut try_pref = pref_mask != 0;
+    let mut base = start;
+    while base < end {
+        if info[base].ipos >= POS_BASE_C {
+            if try_pref and ((base + 1) < end) {
+                for i in (base + 1)..end {
+                    if (info[i].mask & pref_mask) != 0 {
+                        if not (layout.substituted(&info[i]) and ligated_and_didnt_multiply(&info[i])) {
+                            base = i;
+                            while (base < end) and is_halant(&info[base]) {
+                                base += 1;
+                            }
+                            if base < end {
+                                info[base].ipos = POS_BASE_C;
+                            }
+                            try_pref = false;
+                        }
+                        break;
+                    }
+                }
+                if base == end {
+                    break;
+                }
+            }
+            if p.script == plan.tag("Mlym") {
+                let mut i = base + 1;
+                while i < end {
+                    while (i < end) and is_joiner(&info[i]) {
+                        i += 1;
+                    }
+                    if (i == end) or not is_halant(&info[i]) {
+                        break;
+                    }
+                    i += 1;
+                    while (i < end) and is_joiner(&info[i]) {
+                        i += 1;
+                    }
+                    if (i < end) and is_consonant(&info[i]) and (info[i].ipos == POS_BELOW_C) {
+                        base = i;
+                        info[base].ipos = POS_BASE_C;
+                    }
+                    i += 1;
+                }
+            }
+            if (start < base) and (info[base].ipos > POS_BASE_C) {
+                base -= 1;
+            }
+            break;
+        }
+        base += 1;
+    }
+    if (base == end) and (start < base) and is_one_of(&info[base - 1], flag(ZWJ)) {
+        base -= 1;
+    }
+    if base < end {
+        while (start < base) and is_one_of(&info[base], flag(N) | flag(H)) {
+            base -= 1;
+        }
+    }
+    // pre-base matras move to just before the base
+    if ((start + 1) < end) and (start < base) {
+        let mut new_pos = base - 1;
+        if base == end {
+            new_pos = base - 2;
+        }
+        if (p.script != plan.tag("Mlym")) and (p.script != plan.tag("Taml")) {
+            loop {
+                while (new_pos > start) and not is_one_of(&info[new_pos], flag(M) | flag(MPST) | flag(H)) {
+                    new_pos -= 1;
+                }
+                if is_halant(&info[new_pos]) and (info[new_pos].ipos != POS_PRE_M) {
+                    if ((new_pos + 1) < end) and (info[new_pos + 1].cat == ZWJ) and (new_pos > start) {
+                        new_pos -= 1;
+                        continue;
+                    }
+                } else {
+                    new_pos = start;
+                }
+                break;
+            }
+        }
+        if (start < new_pos) and (info[new_pos].ipos != POS_PRE_M) {
+            let mut i = new_pos;
+            while i > start {
+                if info[i - 1].ipos == POS_PRE_M {
+                    let old_pos = i - 1;
+                    if (old_pos < base) and (base <= new_pos) {
+                        base -= 1;
+                    }
+                    move_forward(b, old_pos, new_pos);
+                    b.merge_clusters(new_pos, @min(end, base + 1));
+                    new_pos -= 1;
+                }
+                i -= 1;
+            }
+        } else {
+            for i in start..base {
+                if info[i].ipos == POS_PRE_M {
+                    b.merge_clusters(i, @min(end, base + 1));
+                    break;
+                }
+            }
+        }
+    }
+    // reph moves to its place
+    if ((start + 1) < end) and (info[start].ipos == POS_RA_TO_BECOME_REPH) and
+       ((info[start].cat == REPHA) != ligated_and_didnt_multiply(&info[start])) {
+        let reph_pos = p.indic.reph_pos;
+        let mut new_reph_pos: usize = 0;
+        let mut found = false;
+        if reph_pos != plan.REPH_AFTER_POST {
+            // 2: before the first explicit halant after the reph
+            new_reph_pos = start + 1;
+            while (new_reph_pos < base) and not is_halant(&info[new_reph_pos]) {
+                new_reph_pos += 1;
+            }
+            if (new_reph_pos < base) and is_halant(&info[new_reph_pos]) {
+                if ((new_reph_pos + 1) < base) and is_joiner(&info[new_reph_pos + 1]) {
+                    new_reph_pos += 1;
+                }
+                found = true;
+            }
+            if not found and (reph_pos == plan.REPH_AFTER_MAIN) {
+                new_reph_pos = base;
+                while ((new_reph_pos + 1) < end) and (info[new_reph_pos + 1].ipos <= POS_AFTER_MAIN) {
+                    new_reph_pos += 1;
+                }
+                if new_reph_pos < end {
+                    found = true;
+                }
+            }
+            if not found and (reph_pos == plan.REPH_AFTER_SUB) {
+                new_reph_pos = base;
+                while ((new_reph_pos + 1) < end) and
+                      ((flag(info[new_reph_pos + 1].ipos) &
+                        (flag(POS_POST_C) | flag(POS_AFTER_POST) | flag(POS_SMVD))) == 0) {
+                    new_reph_pos += 1;
+                }
+                if new_reph_pos < end {
+                    found = true;
+                }
+            }
+        }
+        if not found {
+            // 5
+            new_reph_pos = start + 1;
+            while (new_reph_pos < base) and not is_halant(&info[new_reph_pos]) {
+                new_reph_pos += 1;
+            }
+            if (new_reph_pos < base) and is_halant(&info[new_reph_pos]) {
+                if ((new_reph_pos + 1) < base) and is_joiner(&info[new_reph_pos + 1]) {
+                    new_reph_pos += 1;
+                }
+                found = true;
+            }
+        }
+        if not found {
+            // 6: at the end, before syllable modifiers
+            new_reph_pos = end - 1;
+            while (new_reph_pos > start) and (info[new_reph_pos].ipos == POS_SMVD) {
+                new_reph_pos -= 1;
+            }
+            if is_halant(&info[new_reph_pos]) {
+                let mut i = base + 1;
+                while i < new_reph_pos {
+                    if (flag(info[i].cat) & (flag(M) | flag(MPST))) != 0 {
+                        new_reph_pos -= 1;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        b.merge_clusters(start, new_reph_pos + 1);
+        move_forward(b, start, new_reph_pos);
+        if (start < base) and (base <= new_reph_pos) {
+            base -= 1;
+        }
+    }
+    // pre-base reordering forms move before the base
+    if try_pref and ((base + 1) < end) {
+        for i in (base + 1)..end {
+            if (info[i].mask & pref_mask) != 0 {
+                if ligated_and_didnt_multiply(&info[i]) {
+                    let mut new_pos = base;
+                    if (p.script != plan.tag("Mlym")) and (p.script != plan.tag("Taml")) {
+                        while (new_pos > start) and not is_one_of(&info[new_pos - 1], flag(M) | flag(MPST) | flag(H)) {
+                            new_pos -= 1;
+                        }
+                    }
+                    if (new_pos > start) and is_halant(&info[new_pos - 1]) {
+                        if (new_pos < end) and is_joiner(&info[new_pos]) {
+                            new_pos += 1;
+                        }
+                    }
+                    let old_pos = i;
+                    b.merge_clusters(new_pos, old_pos + 1);
+                    move_back(b, old_pos, new_pos);
+                    if (new_pos <= base) and (base < old_pos) {
+                        base += 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    // init applies to pre-base matras at the start of a word
+    if info[start].ipos == POS_PRE_M {
+        let mut word_start = start == 0;
+        if not word_start {
+            let gc = layout.gen_cat(&info[start - 1]);
+            // HarfBuzz's range Cf..Mn in its own category order
+            word_start = not ((gc == plan.GC_CF) or (gc == plan.GC_CN) or (gc == plan.GC_CO) or (gc == plan.GC_CS) or
+                              (gc == plan.GC_LL) or (gc == plan.GC_LM) or (gc == plan.GC_LO) or (gc == plan.GC_LT) or
+                              (gc == plan.GC_LU) or (gc == plan.GC_MC) or (gc == plan.GC_ME) or (gc == plan.GC_MN));
+        }
+        if word_start {
+            info[start].mask |= p.indic_mask[plan.INDIC_INIT];
+        }
+    }
+}
+
+pub fn final_reordering(p: *mut plan.Plan, b: *mut buf.Buffer) void {
+    let mut start: usize = 0;
+    while start < b.len {
+        let end = next_syllable(b, start);
+        final_reordering_syllable(p, b, start, end);
+        start = end;
+    }
+}

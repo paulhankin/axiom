@@ -12,12 +12,12 @@
 // =============================================================================
 
 import "../audio.ph" as audio;
-import "../base64.ph" as base64;
+import "../collections/vec.ph" as vec;
+import "../encoding/base64.ph" as base64;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
 import "../sync.ph" as sync;
-import "../vec.ph" as vec;
 import "ogg.ph" as ogg;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }

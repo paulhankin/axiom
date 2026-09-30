@@ -1,0 +1,2886 @@
+// =============================================================================
+// std/encoding/yaml.ph - YAML 1.2: parsing into json.Value trees, events, and writing.
+//
+//     let mut doc = yaml.parse(text)!;               // one document
+//     defer doc.deinit();
+//     let name = doc.root.get("name")!.as_str()!;    // a json.Value
+//
+//     let mut all = yaml.parse_all(text)!;           // a stream of documents
+//     for v in all.documents { ... }
+//
+//     let s = yaml.stringify(value)!;                // block-style YAML (mem.free)
+//
+// Scalars are resolved with the YAML 1.2 core schema: null (~, null, empty),
+// booleans (true/false in three cases), integers (decimal, 0o octal, 0x
+// hex), floats (with .inf and .nan) and strings; quoted scalars are always
+// strings, and the !!str, !!int, !!float, !!bool and !!null tags are
+// honoured. Mapping keys must be scalars (they become strings); duplicate
+// keys are an error. Aliases share the anchored value (the tree is a DAG),
+// and the expanded size is limited so that "billion laughs" documents are
+// refused rather than exploding in code that walks the tree.
+//
+// For everything the tree can't show (tags, styles, anchors, complex keys)
+// there is the event interface: `Events` gives the stream as libyaml does.
+// Passes all 402 cases of the yaml-test-suite (std/encoding/yaml/testdata, from
+// tools/gen_yaml_tests.py), as events and, where the suite gives JSON, as
+// trees.
+// =============================================================================
+
+import "../collections/arena.ph" as arena;
+import "../collections/map.ph" as maps;
+import "../collections/vec.ph" as vec;
+import "../fmt.ph" as fmt;
+import "../hash.ph" as hash;
+import "../io.ph" as io;
+import "../mem.ph" as mem;
+import "../os/fs.ph" as fs;
+import "../str.ph" as strs;
+import "json.ph" as json;
+
+error { SyntaxError, TooDeep, TooLarge, DuplicateKey, Unsupported, NotFound, WrongType, OutOfMemory, MultipleDocuments,
+        BadNesting }
+
+/// Collections nested deeper than this are refused.
+pub const MAX_DEPTH: usize = 512;
+
+// -----------------------------------------------------------------------------
+// Marks and tokens
+// -----------------------------------------------------------------------------
+
+pub struct Mark {
+    index: usize,
+    line: u32,    // from 0
+    column: u32,  // from 0, in characters
+}
+
+const T_NONE: u8 = 0;
+const T_STREAM_START: u8 = 1;
+const T_STREAM_END: u8 = 2;
+const T_VERSION_DIRECTIVE: u8 = 3;
+const T_TAG_DIRECTIVE: u8 = 4;
+const T_DOCUMENT_START: u8 = 5;
+const T_DOCUMENT_END: u8 = 6;
+const T_BLOCK_SEQUENCE_START: u8 = 7;
+const T_BLOCK_MAPPING_START: u8 = 8;
+const T_BLOCK_END: u8 = 9;
+const T_FLOW_SEQUENCE_START: u8 = 10;
+const T_FLOW_SEQUENCE_END: u8 = 11;
+const T_FLOW_MAPPING_START: u8 = 12;
+const T_FLOW_MAPPING_END: u8 = 13;
+const T_BLOCK_ENTRY: u8 = 14;
+const T_FLOW_ENTRY: u8 = 15;
+const T_KEY: u8 = 16;
+const T_VALUE: u8 = 17;
+const T_ALIAS: u8 = 18;
+const T_ANCHOR: u8 = 19;
+const T_TAG: u8 = 20;
+const T_SCALAR: u8 = 21;
+
+/// Scalar styles.
+pub const PLAIN: u8 = 1;
+pub const SINGLE_QUOTED: u8 = 2;
+pub const DOUBLE_QUOTED: u8 = 3;
+pub const LITERAL: u8 = 4;
+pub const FOLDED: u8 = 5;
+
+struct Token {
+    kind: u8,
+    start: Mark,
+    end: Mark,
+    value: []u8,   // scalar text, anchor or alias name, directive value
+    handle: []u8,  // tag handle, or %TAG handle
+    style: u8,
+}
+
+struct SimpleKey {
+    possible: bool,
+    required: bool,
+    token_number: usize,
+    mark: Mark,
+}
+
+// -----------------------------------------------------------------------------
+// The scanner
+// -----------------------------------------------------------------------------
+
+fn is_break(c: u8) bool {
+    return (c == '\n') or (c == '\r');
+}
+
+fn is_blank(c: u8) bool {
+    return (c == ' ') or (c == '\t');
+}
+
+fn is_flow_indicator(c: u8) bool {
+    return (c == ',') or (c == '[') or (c == ']') or (c == '{') or (c == '}');
+}
+
+fn is_word(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or (c == '-') or
+           (c == '_');
+}
+
+fn hexv(c: u8) u32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u32, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(u32, c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return @as(u32, c - 'A') + 10;
+    }
+    return 99;
+}
+
+// "---" or "..." at the start of a line, then a blank or the end.
+fn is_doc_marker(sc: *Scanner) bool {
+    let a = sc.at(0);
+    return (sc.m.column == 0) and ((a == '-') or (a == '.')) and (sc.at(1) == a) and (sc.at(2) == a) and sc.blankz(3);
+}
+
+struct Scanner {
+    s: []u8,
+    m: Mark,
+    ar: *mut arena.Arena,
+    tokens: vec.Vec.[Token],
+    head: usize,    // the next token to hand out, in tokens
+    parsed: usize,  // tokens handed out so far
+    started: bool,
+    ended: bool,
+    indent: i32,
+    indents: vec.Vec.[i32],
+    allowed: bool,  // a simple key may start here
+    keys: vec.Vec.[SimpleKey],
+    flow: u32,
+    flow_maps: vec.Vec.[bool],  // for each open flow collection: is it a mapping
+    line_start: usize,          // where the current line starts
+    token_line: u32,            // the line where the last token ended
+    last_kind: u8,              // the last token queued, and its style
+    last_style: u8,
+    last_end: usize,
+    buf: strs.String,
+    lead: strs.String,   // scalar folding: the leading line break
+    trail: strs.String,  // and the ones after it
+    ws: strs.String,     // and white space
+    err: []u8,
+    err_mark: Mark,
+
+    fn fail(self: *mut Scanner, msg: []u8) error { if self.err.len == 0 {
+        self.err = msg;
+        self.err_mark = self.m;
+    }
+    return error.SyntaxError; }
+
+    fn at(self: *Scanner, k: usize) u8 {
+        let i = self.m.index + k;
+        if i < self.s.len {
+            return self.s[i];
+        }
+        return 0;
+    }
+
+    fn eof(self: *Scanner) bool {
+        return self.m.index >= self.s.len;
+    }
+
+    fn blankz(self: *Scanner, k: usize) bool {
+        let i = self.m.index + k;
+        if i >= self.s.len {
+            return true;
+        }
+        let c = self.s[i];
+        return is_blank(c) or is_break(c);
+    }
+
+    fn breakz(self: *Scanner, k: usize) bool {
+        let i = self.m.index + k;
+        return (i >= self.s.len) or is_break(self.s[i]);
+    }
+
+    // One character (a whole UTF-8 sequence).
+    fn skip(self: *mut Scanner) void {
+        let c = self.s[self.m.index];
+        let mut n: usize = 1;
+        if c >= 0xf0 {
+            n = 4;
+        } else if c >= 0xe0 {
+            n = 3;
+        } else if c >= 0xc0 {
+            n = 2;
+        }
+        self.m.index = @min(self.m.index + n, self.s.len);
+        self.m.column += 1;
+    }
+
+    fn skip_line(self: *mut Scanner) void {
+        if (self.at(0) == '\r') and (self.at(1) == '\n') {
+            self.m.index += 2;
+        } else {
+            self.m.index += 1;
+        }
+        self.m.line += 1;
+        self.m.column = 0;
+        self.line_start = self.m.index;
+    }
+
+    // Copies one character to b.
+    fn copy(self: *mut Scanner, b: *mut strs.String) !void {
+        let st = self.m.index;
+        self.skip();
+        b.push_str(self.s[st..self.m.index])!;
+    }
+
+    // A line break into b, as \n.
+    fn read_line(self: *mut Scanner, b: *mut strs.String) !void {
+        self.skip_line();
+        b.push('\n')!;
+    }
+
+    fn token(self: *Scanner, kind: u8, start: Mark) Token {
+        return Token.{ kind: kind, start: start, end: self.m, value: "", handle: "", style: 0 };
+    }
+
+    fn push(self: *mut Scanner, t: Token) !void {
+        self.tokens.push(t)!;
+        self.last_kind = t.kind;
+        self.last_style = t.style;
+        self.last_end = t.end.index;
+        self.token_line = t.end.line;
+    }
+
+    // --- the token queue ---------------------------------------------------------
+
+    /// The next token (not consumed).
+    fn peek_token(self: *mut Scanner) !*mut Token {
+        self.fetch_more()!;
+        return self.tokens.get_ptr(self.head);
+    }
+
+    fn take_token(self: *mut Scanner) void {
+        self.head += 1;
+        self.parsed += 1;
+        if (self.head > 256) and ((self.head * 2) > self.tokens.len) {
+            // drop the handed-out tokens
+            let rest = self.tokens.len - self.head;
+            let items = self.tokens.items();
+            @mem_copy(items[..rest], items[self.head..]);
+            self.tokens.truncate(rest);
+            self.head = 0;
+        }
+    }
+
+    fn fetch_more(self: *mut Scanner) !void {
+        loop {
+            let mut need = self.head >= self.tokens.len;
+            if not need {
+                self.stale_keys()!;
+                for k in self.keys.items() {
+                    if k.possible and (k.token_number == self.parsed) {
+                        need = true;
+                    }
+                }
+            }
+            if not need {
+                return;
+            }
+            if self.ended and (self.head >= self.tokens.len) {
+                return self.fail("unexpected end of stream");
+            }
+            self.fetch_next()!;
+        }
+    }
+
+    // --- simple keys ---------------------------------------------------------------
+
+    fn stale_keys(self: *mut Scanner) !void {
+        for i in @as(usize, 0)..self.keys.len {
+            let k = self.keys.get_ptr(i);
+            let multiline_ok = (i > 0) and (i <= self.flow_maps.len) and self.flow_maps.get(i - 1);
+            if k.possible and
+               (((k.mark.line < self.m.line) and not multiline_ok) or ((self.m.index - k.mark.index) > 1024)) {
+                if k.required {
+                    return self.fail("could not find expected ':'");
+                }
+                k.possible = false;
+            }
+        }
+    }
+
+    fn save_key(self: *mut Scanner) !void {
+        let required = (self.flow == 0) and (self.indent == @bit_cast(i32, self.m.column));
+        if self.allowed {
+            self.remove_key()!;
+            let k = self.keys.get_ptr(self.keys.len - 1);
+            k.possible = true;
+            k.required = required;
+            k.token_number = self.parsed + (self.tokens.len - self.head);
+            k.mark = self.m;
+        }
+    }
+
+    fn remove_key(self: *mut Scanner) !void {
+        let k = self.keys.get_ptr(self.keys.len - 1);
+        if k.possible and k.required {
+            return self.fail("could not find expected ':'");
+        }
+        k.possible = false;
+    }
+
+    fn flow_in(self: *mut Scanner, mapping: bool) !void {
+        if self.keys.len > MAX_DEPTH {
+            return error.TooDeep;
+        }
+        self.keys.push(SimpleKey.{ possible: false, required: false, token_number: 0, mark: self.m })!;
+        self.flow_maps.push(mapping)!;
+        self.flow += 1;
+    }
+
+    fn flow_out(self: *mut Scanner) void {
+        if self.flow > 0 {
+            self.flow -= 1;
+            _ = self.keys.pop() catch self.keys.get(0);
+            _ = self.flow_maps.pop() catch false;
+        }
+    }
+
+    // --- indentation -------------------------------------------------------------------
+
+    // Opens a block collection at column (its start token goes at token
+    // number `number`, or at the end).
+    fn roll(self: *mut Scanner, column: i32, number: usize, at_end: bool, kind: u8, mark: Mark) !void {
+        if self.flow > 0 {
+            return;
+        }
+        if self.indent < column {
+            if self.indents.len > MAX_DEPTH {
+                return error.TooDeep;
+            }
+            // the white space before a block collection's first token
+            // (indentation or separation) must not hold a tab
+            let mut k = mark.index;
+            while (k > 0) and is_blank(self.s[k - 1]) {
+                if self.s[k - 1] == '\t' {
+                    return self.fail("a tab cannot separate or indent a block collection");
+                }
+                k -= 1;
+            }
+            self.indents.push(self.indent)!;
+            self.indent = column;
+            let t = Token.{ kind: kind, start: mark, end: mark, value: "", handle: "", style: 0 };
+            if at_end {
+                self.push(t)!;
+            } else {
+                self.tokens.insert(self.head + (number - self.parsed), t)!;
+            }
+        }
+    }
+
+    fn unroll(self: *mut Scanner, column: i32) !void {
+        if self.flow > 0 {
+            return;
+        }
+        while self.indent > column {
+            self.push(self.token(T_BLOCK_END, self.m))!;
+            self.indent = self.indents.pop() catch -1;
+        }
+    }
+
+    // --- dispatch --------------------------------------------------------------------------
+
+    fn fetch_next(self: *mut Scanner) !void {
+        if not self.started {
+            self.started = true;
+            self.indent = -1;
+            self.allowed = true;
+            self.keys.push(SimpleKey.{ possible: false, required: false, token_number: 0, mark: self.m })!;
+            self.push(self.token(T_STREAM_START, self.m))!;
+            return;
+        }
+        self.skip_to_token()!;
+        self.stale_keys()!;
+        self.unroll(@bit_cast(i32, self.m.column))!;
+        if self.eof() {
+            return self.fetch_stream_end();
+        }
+        let c = self.at(0);
+        let col0 = self.m.column == 0;
+        // flow content on a new line must be indented past the block around it
+        if (self.flow > 0) and (self.m.line > self.token_line) and
+           (@bit_cast(i32, self.line_spaces()) <= self.indent) and not (col0 and is_doc_marker(self)) {
+            return self.fail("wrong indentation in a flow collection");
+        }
+        if col0 and (c == '%') and (self.flow == 0) {
+            return self.fetch_directive();
+        }
+        if col0 and (c == '-') and (self.at(1) == '-') and (self.at(2) == '-') and self.blankz(3) {
+            return self.fetch_document_indicator(T_DOCUMENT_START);
+        }
+        if col0 and (c == '.') and (self.at(1) == '.') and (self.at(2) == '.') and self.blankz(3) {
+            return self.fetch_document_indicator(T_DOCUMENT_END);
+        }
+        if c == '[' {
+            return self.fetch_flow_start(T_FLOW_SEQUENCE_START, false);
+        }
+        if c == '{' {
+            return self.fetch_flow_start(T_FLOW_MAPPING_START, true);
+        }
+        if c == ']' {
+            return self.fetch_flow_end(T_FLOW_SEQUENCE_END);
+        }
+        if c == '}' {
+            return self.fetch_flow_end(T_FLOW_MAPPING_END);
+        }
+        if c == ',' {
+            return self.fetch_flow_entry();
+        }
+        if (c == '-') and self.blankz(1) {
+            return self.fetch_block_entry();
+        }
+        if (c == '?') and self.blankz(1) {
+            return self.fetch_key();
+        }
+        if (c == ':') and
+           (self.blankz(1) or ((self.flow > 0) and (is_flow_indicator(self.at(1)) or self.after_json_node()))) {
+            return self.fetch_value();
+        }
+        if c == '*' {
+            return self.fetch_anchor(T_ALIAS);
+        }
+        if c == '&' {
+            return self.fetch_anchor(T_ANCHOR);
+        }
+        if c == '!' {
+            return self.fetch_tag();
+        }
+        if ((c == '|') or (c == '>')) and (self.flow == 0) {
+            return self.fetch_block_scalar(c == '|');
+        }
+        if c == '\'' {
+            return self.fetch_flow_scalar(true);
+        }
+        if c == '"' {
+            return self.fetch_flow_scalar(false);
+        }
+        // a plain scalar starts with anything but an indicator; - ? : start
+        // one when followed by a non-space
+        let indicator = (strs.index_of_byte("-?:,[]{}#&*!|>'\"%@`", c) catch 99) != 99;
+        let flow_safe = not ((self.flow > 0) and is_flow_indicator(self.at(1)));
+        if (not indicator and not self.blankz(0)) or ((c == '-') and not self.blankz(1) and flow_safe) or
+           ((self.flow == 0) and ((c == '?') or (c == ':')) and not self.blankz(1)) or
+           ((self.flow > 0) and ((c == '?') or (c == ':')) and not self.blankz(1) and
+            not is_flow_indicator(self.at(1))) {
+            return self.fetch_plain_scalar();
+        }
+        return self.fail("found a character that cannot start any token");
+    }
+
+    // Spaces (not tabs) at the start of the current line.
+    fn line_spaces(self: *Scanner) u32 {
+        let mut k = self.line_start;
+        while (k < self.s.len) and (self.s[k] == ' ') {
+            k += 1;
+        }
+        return @truncate(u32, k - self.line_start);
+    }
+
+    // In a flow collection, ':' after a quoted key or a JSON-like node is
+    // a value indicator even without a space after it ("a":b).
+    fn after_json_node(self: *Scanner) bool {
+        let k = self.last_kind;
+        return ((k == T_SCALAR) and ((self.last_style == SINGLE_QUOTED) or (self.last_style == DOUBLE_QUOTED))) or
+               (k == T_FLOW_SEQUENCE_END) or (k == T_FLOW_MAPPING_END);
+    }
+
+    fn skip_to_token(self: *mut Scanner) !void {
+        loop {
+            if (self.m.index == 0) and (self.at(0) == 0xef) and (self.at(1) == 0xbb) and (self.at(2) == 0xbf) {
+                self.m.index = 3;
+            }
+            while is_blank(self.at(0)) {
+                self.skip();
+            }
+            if self.at(0) == '#' {
+                if (self.m.index > 0) and not is_blank(self.s[self.m.index - 1]) and
+                   not is_break(self.s[self.m.index - 1]) {
+                    return self.fail("a comment must follow white space");
+                }
+                while not self.breakz(0) {
+                    self.skip();
+                }
+            }
+            if not self.eof() and is_break(self.at(0)) {
+                self.skip_line();
+                if self.flow == 0 {
+                    self.allowed = true;
+                }
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn fetch_stream_end(self: *mut Scanner) !void {
+        if self.m.column != 0 {
+            self.m.column = 0;
+            self.m.line += 1;
+        }
+        self.unroll(-1)!;
+        self.remove_key()!;
+        self.allowed = false;
+        self.push(self.token(T_STREAM_END, self.m))!;
+        self.ended = true;
+    }
+
+    fn fetch_directive(self: *mut Scanner) !void {
+        self.unroll(-1)!;
+        self.remove_key()!;
+        self.allowed = false;
+        let start = self.m;
+        self.skip();
+        let ns = self.m.index;
+        while is_word(self.at(0)) {
+            self.skip();
+        }
+        let name = self.s[ns..self.m.index];
+        if name.len == 0 {
+            return self.fail("expected a directive name");
+        }
+        if not self.blankz(0) {
+            return self.fail("unexpected character after the directive name");
+        }
+        while is_blank(self.at(0)) {
+            self.skip();
+        }
+        if strs.eq(name, "YAML") {
+            let vs = self.m.index;
+            while not self.blankz(0) {
+                self.skip();
+            }
+            let v = self.s[vs..self.m.index];
+            let dot = strs.index_of_byte(v, '.') catch return self.fail("bad %YAML version");
+            let major = fmt.parse_int.[u32](v[..dot]) catch return self.fail("bad %YAML version");
+            _ = fmt.parse_int.[u32](v[dot + 1..]) catch return self.fail("bad %YAML version");
+            if major != 1 {
+                return self.fail("unsupported YAML version");
+            }
+            self.directive_end()!;
+            let mut t = self.token(T_VERSION_DIRECTIVE, start);
+            t.value = v;
+            self.push(t)!;
+            return;
+        }
+        if strs.eq(name, "TAG") {
+            let hs = self.m.index;
+            while not self.blankz(0) {
+                self.skip();
+            }
+            let handle = self.s[hs..self.m.index];
+            while is_blank(self.at(0)) {
+                self.skip();
+            }
+            let ps = self.m.index;
+            while not self.blankz(0) {
+                self.skip();
+            }
+            let prefix = self.s[ps..self.m.index];
+            if (handle.len == 0) or (handle[0] != '!') or ((handle.len > 1) and (handle[handle.len - 1] != '!')) or
+               (prefix.len == 0) {
+                return self.fail("bad %TAG directive");
+            }
+            self.directive_end()!;
+            let mut t = self.token(T_TAG_DIRECTIVE, start);
+            t.handle = handle;
+            t.value = prefix;
+            self.push(t)!;
+            return;
+        }
+        // an unknown directive: ignored
+        while not self.breakz(0) {
+            self.skip();
+        }
+    }
+
+    fn directive_end(self: *mut Scanner) !void {
+        while is_blank(self.at(0)) {
+            self.skip();
+        }
+        if self.at(0) == '#' {
+            while not self.breakz(0) {
+                self.skip();
+            }
+        }
+        if not self.breakz(0) {
+            return self.fail("did not find expected comment or line break after a directive");
+        }
+    }
+
+    fn fetch_document_indicator(self: *mut Scanner, kind: u8) !void {
+        self.unroll(-1)!;
+        self.remove_key()!;
+        self.allowed = false;
+        let start = self.m;
+        self.skip();
+        self.skip();
+        self.skip();
+        if kind == T_DOCUMENT_END {
+            // nothing but a comment may follow ... on its line
+            let mut k: usize = 0;
+            while is_blank(self.at(k)) {
+                k += 1;
+            }
+            if not self.breakz(k) and (self.at(k) != '#') {
+                return self.fail("found content after a document end marker");
+            }
+        }
+        self.push(self.token(kind, start))!;
+    }
+
+    fn fetch_flow_start(self: *mut Scanner, kind: u8, mapping: bool) !void {
+        self.save_key()!;
+        self.flow_in(mapping)!;
+        self.allowed = true;
+        let start = self.m;
+        self.skip();
+        self.push(self.token(kind, start))!;
+    }
+
+    fn fetch_flow_end(self: *mut Scanner, kind: u8) !void {
+        self.remove_key()!;
+        self.flow_out();
+        self.allowed = false;
+        let start = self.m;
+        self.skip();
+        self.push(self.token(kind, start))!;
+    }
+
+    fn fetch_flow_entry(self: *mut Scanner) !void {
+        self.remove_key()!;
+        self.allowed = true;
+        let start = self.m;
+        self.skip();
+        self.push(self.token(T_FLOW_ENTRY, start))!;
+    }
+
+    fn fetch_block_entry(self: *mut Scanner) !void {
+        if self.flow == 0 {
+            if not self.allowed {
+                return self.fail("block sequence entries are not allowed in this context");
+            }
+            self.roll(@bit_cast(i32, self.m.column), 0, true, T_BLOCK_SEQUENCE_START, self.m)!;
+        }
+        self.remove_key()!;
+        self.allowed = true;
+        let start = self.m;
+        self.skip();
+        self.push(self.token(T_BLOCK_ENTRY, start))!;
+    }
+
+    fn fetch_key(self: *mut Scanner) !void {
+        if self.flow == 0 {
+            if not self.allowed {
+                return self.fail("mapping keys are not allowed in this context");
+            }
+            self.roll(@bit_cast(i32, self.m.column), 0, true, T_BLOCK_MAPPING_START, self.m)!;
+        }
+        self.remove_key()!;
+        self.allowed = self.flow == 0;
+        let start = self.m;
+        self.skip();
+        self.push(self.token(T_KEY, start))!;
+    }
+
+    fn fetch_value(self: *mut Scanner) !void {
+        let k = self.keys.get(self.keys.len - 1);
+        if k.possible {
+            // the simple key becomes a KEY token (and maybe opens a mapping)
+            let t = Token.{ kind: T_KEY, start: k.mark, end: k.mark, value: "", handle: "", style: 0 };
+            self.tokens.insert(self.head + (k.token_number - self.parsed), t)!;
+            self.roll(@bit_cast(i32, k.mark.column), k.token_number, false, T_BLOCK_MAPPING_START, k.mark)!;
+            self.keys.get_ptr(self.keys.len - 1).possible = false;
+            self.allowed = false;
+        } else {
+            if self.flow == 0 {
+                if not self.allowed {
+                    return self.fail("mapping values are not allowed in this context");
+                }
+                self.roll(@bit_cast(i32, self.m.column), 0, true, T_BLOCK_MAPPING_START, self.m)!;
+            }
+            self.allowed = self.flow == 0;
+        }
+        let start = self.m;
+        self.skip();
+        self.push(self.token(T_VALUE, start))!;
+    }
+
+    fn fetch_anchor(self: *mut Scanner, kind: u8) !void {
+        self.save_key()!;
+        self.allowed = false;
+        let start = self.m;
+        self.skip();
+        let ns = self.m.index;
+        while not self.blankz(0) and not is_flow_indicator(self.at(0)) {
+            self.skip();
+        }
+        if self.m.index == ns {
+            return self.fail("did not find expected alphabetic or numeric character after & or *");
+        }
+        let mut t = self.token(kind, start);
+        t.value = self.s[ns..self.m.index];
+        self.push(t)!;
+    }
+
+    fn fetch_tag(self: *mut Scanner) !void {
+        self.save_key()!;
+        self.allowed = false;
+        let start = self.m;
+        let mut handle: []u8 = "";
+        self.buf.clear();
+        if self.at(1) == '<' {
+            // !<verbatim>
+            self.skip();
+            self.skip();
+            self.tag_uri(false)!;
+            if self.at(0) != '>' {
+                return self.fail("did not find the expected '>'");
+            }
+            self.skip();
+            if self.buf.len == 0 {
+                return self.fail("empty verbatim tag");
+            }
+        } else {
+            // !, !suffix, !!suffix or !handle!suffix
+            let hs = self.m.index;
+            self.skip();
+            while is_word(self.at(0)) {
+                self.skip();
+            }
+            if self.at(0) == '!' {
+                self.skip();
+                handle = self.s[hs..self.m.index];
+                self.tag_uri(true)!;
+            } else {
+                // "!word...": the primary handle, with the word as the suffix's start
+                handle = "!";
+                self.m = Mark.{ index: hs + 1, line: start.line, column: start.column + 1 };
+                self.tag_uri(true)!;
+                if self.buf.len == 0 {
+                    handle = "";  // the non-specific tag "!"
+                    self.buf.push('!')!;
+                }
+            }
+        }
+        if not self.blankz(0) and not ((self.flow > 0) and is_flow_indicator(self.at(0))) {
+            return self.fail("did not find expected whitespace or line break after a tag");
+        }
+        let mut t = self.token(T_TAG, start);
+        t.handle = handle;
+        t.value = self.ar.dup(self.buf.bytes())!;
+        self.push(t)!;
+    }
+
+    // Tag URI characters into buf (%XX decoded).
+    fn tag_uri(self: *mut Scanner, allow_empty: bool) !void {
+        loop {
+            let c = self.at(0);
+            if self.eof() {
+                break;
+            }
+            let ok = is_word(c) or ((strs.index_of_byte(";/?:@&=+$.!~*'()%#", c) catch 99) != 99) or
+                     (not allow_empty and ((c == ',') or (c == '[') or (c == ']')));
+            if not ok {
+                break;
+            }
+            if c == '%' {
+                let h = hexv(self.at(1));
+                let l = hexv(self.at(2));
+                if (h > 15) or (l > 15) {
+                    return self.fail("bad URI escape in a tag");
+                }
+                self.buf.push(@truncate(u8, (h << 4) | l))!;
+                self.skip();
+                self.skip();
+                self.skip();
+                continue;
+            }
+            self.copy(&mut self.buf)!;
+        }
+        if (self.buf.len == 0) and not allow_empty {
+            return self.fail("did not find expected tag URI");
+        }
+    }
+
+    // --- scalars ------------------------------------------------------------------------
+
+    fn fetch_block_scalar(self: *mut Scanner, literal: bool) !void {
+        self.remove_key()!;
+        self.allowed = true;
+        let start = self.m;
+        self.skip();
+        let mut chomp: i32 = 0;
+        let mut increment: i32 = 0;
+        let c = self.at(0);
+        if (c == '+') or (c == '-') {
+            chomp = 1;
+            if c == '-' {
+                chomp = -1;
+            }
+            self.skip();
+            if (self.at(0) >= '0') and (self.at(0) <= '9') {
+                if self.at(0) == '0' {
+                    return self.fail("found an indentation indicator equal to 0");
+                }
+                increment = @as(i32, self.at(0) - '0');
+                self.skip();
+            }
+        } else if (c >= '0') and (c <= '9') {
+            if c == '0' {
+                return self.fail("found an indentation indicator equal to 0");
+            }
+            increment = @as(i32, c - '0');
+            self.skip();
+            let d = self.at(0);
+            if (d == '+') or (d == '-') {
+                chomp = 1;
+                if d == '-' {
+                    chomp = -1;
+                }
+                self.skip();
+            }
+        }
+        let had_space = is_blank(self.at(0));
+        while is_blank(self.at(0)) {
+            self.skip();
+        }
+        if self.at(0) == '#' {
+            if not had_space {
+                return self.fail("a comment needs white space before it");
+            }
+            while not self.breakz(0) {
+                self.skip();
+            }
+        }
+        if not self.breakz(0) {
+            return self.fail("did not find expected comment or line break");
+        }
+        if not self.eof() {
+            self.skip_line();
+        }
+        let mut indent: i32 = -1;
+        if increment > 0 {
+            indent = increment;
+            if self.indent >= 0 {
+                indent = self.indent + increment;
+            }
+        }
+        self.buf.clear();
+        self.lead.clear();
+        self.trail.clear();
+        self.block_breaks(&mut indent)!;
+        let mut leading_blank = false;
+        while (@bit_cast(i32, self.m.column) == indent) and not self.eof() and not is_doc_marker(self) {
+            let trailing_blank = is_blank(self.at(0));
+            if not literal and (self.lead.len > 0) and (self.lead.bytes()[0] == '\n') and not leading_blank and
+               not trailing_blank {
+                if self.trail.len == 0 {
+                    self.buf.push(' ')!;
+                }
+                self.lead.clear();
+            } else {
+                self.buf.push_str(self.lead.bytes())!;
+                self.lead.clear();
+            }
+            self.buf.push_str(self.trail.bytes())!;
+            self.trail.clear();
+            leading_blank = is_blank(self.at(0));
+            while not self.breakz(0) {
+                self.copy(&mut self.buf)!;
+            }
+            if self.eof() {
+                self.lead.push('\n')!;  // the end of the input ends the line
+                break;
+            }
+            self.read_line(&mut self.lead)!;
+            self.block_breaks(&mut indent)!;
+        }
+        if chomp != -1 {
+            self.buf.push_str(self.lead.bytes())!;
+        }
+        if chomp == 1 {
+            self.buf.push_str(self.trail.bytes())!;
+        }
+        let mut t = self.token(T_SCALAR, start);
+        t.value = self.ar.dup(self.buf.bytes())!;
+        t.style = FOLDED;
+        if literal {
+            t.style = LITERAL;
+        }
+        self.push(t)!;
+    }
+
+    // Empty lines at the start of a block scalar (or between its lines),
+    // working out the indentation (from the first line with content) if it
+    // is not known yet (-1).
+    fn block_breaks(self: *mut Scanner, indent: *mut i32) !void {
+        let mut empty_max: i32 = 0;
+        loop {
+            while ((indent.* < 0) or (@bit_cast(i32, self.m.column) < indent.*)) and (self.at(0) == ' ') {
+                self.skip();
+            }
+            let col = @bit_cast(i32, self.m.column);
+            if (indent.* >= 0) and (col < indent.*) and (self.at(0) == '\t') {
+                // a tab inside the indentation: only on a line of white space
+                let mut k: usize = 0;
+                while is_blank(self.at(k)) {
+                    k += 1;
+                }
+                if not self.breakz(k) {
+                    return self.fail("found a tab character where an indentation space is expected");
+                }
+                while is_blank(self.at(0)) {
+                    self.skip();
+                }
+            }
+            if self.eof() {
+                if (col > 0) and (indent.* < 0) {
+                    self.trail.push('\n')!;  // a last line of spaces
+                }
+                if col > empty_max {
+                    empty_max = col;
+                }
+                break;
+            }
+            if not is_break(self.at(0)) {
+                if indent.* < 0 {
+                    // the first line with content (a tab counts) sets the indentation
+                    if (self.at(0) == '\t') and (col <= self.indent) {
+                        return self.fail("found a tab character where an indentation space is expected");
+                    }
+                    if is_doc_marker(self) {
+                        break;
+                    }
+                    let ind = @max(col, self.indent + 1);
+                    if empty_max > ind {
+                        return self.fail("a leading empty line has more spaces than the first line with content");
+                    }
+                    indent.* = ind;
+                }
+                break;
+            }
+            if col > empty_max {
+                empty_max = col;
+            }
+            self.read_line(&mut self.trail)!;
+        }
+        if indent.* < 0 {
+            indent.* = @max(empty_max, self.indent + 1);
+        }
+    }
+
+    fn fetch_flow_scalar(self: *mut Scanner, single: bool) !void {
+        self.save_key()!;
+        self.allowed = false;
+        let start = self.m;
+        let mut q: u8 = '"';
+        if single {
+            q = '\'';
+        }
+        self.skip();
+        self.buf.clear();
+        loop {
+            if (self.m.column == 0) and
+               ((((self.at(0) == '-') and (self.at(1) == '-') and (self.at(2) == '-')) or
+                 ((self.at(0) == '.') and (self.at(1) == '.') and (self.at(2) == '.'))) and self.blankz(3)) {
+                return self.fail("found unexpected document indicator in a quoted scalar");
+            }
+            if self.eof() {
+                return self.fail("found unexpected end of stream in a quoted scalar");
+            }
+            let mut leading_blanks = false;
+            let mut spaces: i32 = 0;
+            let mut counting = false;
+            while not self.blankz(0) {
+                let c = self.at(0);
+                if single and (c == '\'') and (self.at(1) == '\'') {
+                    self.buf.push('\'')!;
+                    self.skip();
+                    self.skip();
+                } else if c == q {
+                    break;
+                } else if not single and (c == '\\') and is_break(self.at(1)) {
+                    self.skip();
+                    self.skip_line();
+                    leading_blanks = true;
+                    counting = true;
+                    break;
+                } else if not single and (c == '\\') {
+                    self.escape()!;
+                } else {
+                    self.copy(&mut self.buf)!;
+                }
+            }
+            if self.at(0) == q {
+                break;
+            }
+            // white space and line breaks, folded
+            self.ws.clear();
+            self.lead.clear();
+            self.trail.clear();
+            while is_blank(self.at(0)) or (not self.eof() and is_break(self.at(0))) {
+                if is_blank(self.at(0)) {
+                    if counting and (self.at(0) == ' ') {
+                        spaces += 1;
+                    } else {
+                        counting = false;
+                    }
+                    if not leading_blanks {
+                        self.copy(&mut self.ws)!;
+                    } else {
+                        self.skip();
+                    }
+                } else if not leading_blanks {
+                    self.ws.clear();
+                    self.read_line(&mut self.lead)!;
+                    leading_blanks = true;
+                    spaces = 0;
+                    counting = true;
+                } else {
+                    self.read_line(&mut self.trail)!;
+                    spaces = 0;
+                    counting = true;
+                }
+                if self.eof() {
+                    return self.fail("found unexpected end of stream in a quoted scalar");
+                }
+            }
+            if leading_blanks {
+                // continuation lines of a block-context scalar must be indented (with spaces)
+                if (self.flow == 0) and (spaces <= self.indent) and not self.eof() {
+                    return self.fail("a quoted scalar's continuation line is not indented enough");
+                }
+                if (self.lead.len > 0) and (self.lead.bytes()[0] == '\n') {
+                    if self.trail.len == 0 {
+                        self.buf.push(' ')!;
+                    } else {
+                        self.buf.push_str(self.trail.bytes())!;
+                    }
+                } else {
+                    self.buf.push_str(self.lead.bytes())!;
+                    self.buf.push_str(self.trail.bytes())!;
+                }
+            } else {
+                self.buf.push_str(self.ws.bytes())!;
+            }
+        }
+        self.skip();
+        let mut t = self.token(T_SCALAR, start);
+        t.value = self.ar.dup(self.buf.bytes())!;
+        t.style = DOUBLE_QUOTED;
+        if single {
+            t.style = SINGLE_QUOTED;
+        }
+        self.push(t)!;
+    }
+
+    fn escape(self: *mut Scanner) !void {
+        let c = self.at(1);
+        let mut n: usize = 0;
+        let mut out: u32 = 0;
+        match c {
+            '0'  => { out = 0; }
+            'a'  => { out = 7; }
+            'b'  => { out = 8; }
+            't'  => { out = 9; }
+            '\t' => { out = 9; }
+            'n'  => { out = 10; }
+            'v'  => { out = 11; }
+            'f'  => { out = 12; }
+            'r'  => { out = 13; }
+            'e'  => { out = 27; }
+            ' '  => { out = 32; }
+            '"'  => { out = 34; }
+            '/'  => { out = 47; }
+            '\\' => { out = 92; }
+            'N'  => { out = 0x85; }
+            '_'  => { out = 0xa0; }
+            'L'  => { out = 0x2028; }
+            'P'  => { out = 0x2029; }
+            'x'  => { n = 2; }
+            'u'  => { n = 4; }
+            'U'  => { n = 8; }
+            else => { return self.fail("found unknown escape character"); }
+        }
+        self.skip();
+        self.skip();
+        if n > 0 {
+            for k in @as(usize, 0)..n {
+                let h = hexv(self.at(k));
+                if h > 15 {
+                    return self.fail("did not find expected hexadecimal number");
+                }
+                out = (out << 4) | h;
+            }
+            if ((out >= 0xd800) and (out <= 0xdfff)) or (out > 0x10ffff) {
+                return self.fail("found invalid Unicode character escape code");
+            }
+            for _k in @as(usize, 0)..n {
+                self.skip();
+            }
+        }
+        let mut b: [4]u8 = [0; 4];
+        self.buf.push_str(strs.encode_rune(b[..], out))!;
+    }
+
+    fn fetch_plain_scalar(self: *mut Scanner) !void {
+        self.save_key()!;
+        self.allowed = false;
+        let start = self.m;
+        let mut end = self.m;
+        let indent = self.indent + 1;
+        let mut leading_blanks = false;
+        self.buf.clear();
+        self.ws.clear();
+        self.lead.clear();
+        self.trail.clear();
+        loop {
+            if (self.m.column == 0) and
+               ((((self.at(0) == '-') and (self.at(1) == '-') and (self.at(2) == '-')) or
+                 ((self.at(0) == '.') and (self.at(1) == '.') and (self.at(2) == '.'))) and self.blankz(3)) {
+                break;
+            }
+            if self.at(0) == '#' {
+                break;
+            }
+            while not self.blankz(0) {
+                let c = self.at(0);
+                if (c == ':') and (self.blankz(1) or ((self.flow > 0) and is_flow_indicator(self.at(1)))) {
+                    break;
+                }
+                if (self.flow > 0) and is_flow_indicator(c) {
+                    break;
+                }
+                if leading_blanks or (self.ws.len > 0) {
+                    if leading_blanks {
+                        if (self.lead.len > 0) and (self.lead.bytes()[0] == '\n') {
+                            if self.trail.len == 0 {
+                                self.buf.push(' ')!;
+                            } else {
+                                self.buf.push_str(self.trail.bytes())!;
+                                self.trail.clear();
+                            }
+                            self.lead.clear();
+                        } else {
+                            self.buf.push_str(self.lead.bytes())!;
+                            self.buf.push_str(self.trail.bytes())!;
+                            self.lead.clear();
+                            self.trail.clear();
+                        }
+                        leading_blanks = false;
+                    } else {
+                        self.buf.push_str(self.ws.bytes())!;
+                        self.ws.clear();
+                    }
+                }
+                self.copy(&mut self.buf)!;
+                end = self.m;
+            }
+            if not (is_blank(self.at(0)) or (not self.eof() and is_break(self.at(0)))) {
+                break;
+            }
+            while is_blank(self.at(0)) or (not self.eof() and is_break(self.at(0))) {
+                if is_blank(self.at(0)) {
+                    if leading_blanks and (@bit_cast(i32, self.m.column) < indent) and (self.at(0) == '\t') {
+                        let mut k: usize = 0;
+                        while is_blank(self.at(k)) {
+                            k += 1;
+                        }
+                        if not self.breakz(k) {
+                            return self.fail("found a tab character that violates indentation");
+                        }
+                    }
+                    if not leading_blanks {
+                        self.copy(&mut self.ws)!;
+                    } else {
+                        self.skip();
+                    }
+                } else if not leading_blanks {
+                    self.ws.clear();
+                    self.read_line(&mut self.lead)!;
+                    leading_blanks = true;
+                } else {
+                    self.read_line(&mut self.trail)!;
+                }
+            }
+            if (self.flow == 0) and (@bit_cast(i32, self.m.column) < indent) {
+                break;
+            }
+        }
+        let mut t = Token.{ kind: T_SCALAR, start: start, end: end, value: self.ar.dup(self.buf.bytes())!, handle: "",
+                            style: PLAIN };
+        self.push(t)!;
+        if leading_blanks {
+            self.allowed = true;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Events
+// -----------------------------------------------------------------------------
+
+pub const E_STREAM_START: u8 = 1;
+pub const E_STREAM_END: u8 = 2;
+pub const E_DOCUMENT_START: u8 = 3;
+pub const E_DOCUMENT_END: u8 = 4;
+pub const E_ALIAS: u8 = 5;
+pub const E_SCALAR: u8 = 6;
+pub const E_SEQUENCE_START: u8 = 7;
+pub const E_SEQUENCE_END: u8 = 8;
+pub const E_MAPPING_START: u8 = 9;
+pub const E_MAPPING_END: u8 = 10;
+
+pub struct Event {
+    kind: u8,
+    start: Mark,
+    end: Mark,
+    anchor: []u8,    // for nodes (the name, for aliases)
+    tag: []u8,       // resolved: "tag:yaml.org,2002:str", "!" (non-specific), "" (none)
+    value: []u8,     // scalars
+    style: u8,       // scalars
+    flow: bool,      // collections written in flow style
+    explicit: bool,  // documents with --- (start) or ... (end)
+}
+
+const S_STREAM_START: u8 = 0;
+const S_IMPLICIT_DOCUMENT_START: u8 = 1;
+const S_DOCUMENT_START: u8 = 2;
+const S_DOCUMENT_CONTENT: u8 = 3;
+const S_DOCUMENT_END: u8 = 4;
+const S_BLOCK_NODE: u8 = 5;
+const S_BLOCK_NODE_OR_INDENTLESS_SEQUENCE: u8 = 6;
+const S_FLOW_NODE: u8 = 7;
+const S_BLOCK_SEQUENCE_FIRST_ENTRY: u8 = 8;
+const S_BLOCK_SEQUENCE_ENTRY: u8 = 9;
+const S_INDENTLESS_SEQUENCE_ENTRY: u8 = 10;
+const S_BLOCK_MAPPING_FIRST_KEY: u8 = 11;
+const S_BLOCK_MAPPING_KEY: u8 = 12;
+const S_BLOCK_MAPPING_VALUE: u8 = 13;
+const S_FLOW_SEQUENCE_FIRST_ENTRY: u8 = 14;
+const S_FLOW_SEQUENCE_ENTRY: u8 = 15;
+const S_FLOW_SEQUENCE_ENTRY_MAPPING_KEY: u8 = 16;
+const S_FLOW_SEQUENCE_ENTRY_MAPPING_VALUE: u8 = 17;
+const S_FLOW_SEQUENCE_ENTRY_MAPPING_END: u8 = 18;
+const S_FLOW_MAPPING_FIRST_KEY: u8 = 19;
+const S_FLOW_MAPPING_KEY: u8 = 20;
+const S_FLOW_MAPPING_VALUE: u8 = 21;
+const S_FLOW_MAPPING_EMPTY_VALUE: u8 = 22;
+const S_END: u8 = 23;
+
+struct TagDirective {
+    handle: []u8,
+    prefix: []u8,
+}
+
+/// The event stream of a YAML text. Strings in events live as long as the
+/// Events (or the arena it was given).
+pub struct Events {
+    sc: Scanner,
+    own: *mut arena.Arena,
+    state: u8,
+    states: vec.Vec.[u8],
+    tags: vec.Vec.[TagDirective],
+    had_doc: bool,     // a document has been seen
+    open_ended: bool,  // the last document ended without ... and may not be followed by directives
+    last_explicit: bool,
+
+    /// Events for text, with strings in a (the caller's) arena.
+    pub fn with_arena(text: []u8, a: *mut arena.Arena) Events {
+        return Events.{
+            sc: Scanner.{
+                s: text,
+                m: Mark.{ index: 0, line: 0, column: 0 },
+                ar: a,
+                tokens: vec.Vec.[Token].init(),
+                head: 0,
+                parsed: 0,
+                started: false,
+                ended: false,
+                indent: -1,
+                indents: vec.Vec.[i32].init(),
+                allowed: false,
+                keys: vec.Vec.[SimpleKey].init(),
+                flow: 0,
+                flow_maps: vec.Vec.[bool].init(),
+                line_start: 0,
+                token_line: 0,
+                last_kind: T_NONE,
+                last_style: 0,
+                last_end: 0,
+                buf: strs.String.init(),
+                lead: strs.String.init(),
+                trail: strs.String.init(),
+                ws: strs.String.init(),
+                err: "",
+                err_mark: Mark.{ index: 0, line: 0, column: 0 },
+            },
+            own: a,
+            state: S_STREAM_START,
+            states: vec.Vec.[u8].init(),
+            tags: vec.Vec.[TagDirective].init(),
+            had_doc: false,
+            open_ended: false,
+            last_explicit: false,
+        };
+    }
+
+    pub fn deinit(self: *mut Events) void {
+        self.sc.tokens.deinit();
+        self.sc.indents.deinit();
+        self.sc.keys.deinit();
+        self.sc.flow_maps.deinit();
+        self.sc.buf.deinit();
+        self.sc.lead.deinit();
+        self.sc.trail.deinit();
+        self.sc.ws.deinit();
+        self.states.deinit();
+        self.tags.deinit();
+    }
+
+    /// Why the last SyntaxError happened, and where.
+    pub fn error_message(self: *Events) []u8 {
+        return self.sc.err;
+    }
+
+    pub fn error_mark(self: *Events) Mark {
+        return self.sc.err_mark;
+    }
+
+    fn fail(self: *mut Events, msg: []u8) error { return self.sc.fail(msg); }
+
+    fn tok(self: *mut Events) !Token {
+        return (self.sc.peek_token()!).*;
+    }
+
+    fn skip(self: *mut Events) void {
+        self.sc.take_token();
+    }
+
+    fn push_state(self: *mut Events, s: u8) !void {
+        if self.states.len > (2 * MAX_DEPTH) {
+            return error.TooDeep;
+        }
+        self.states.push(s)!;
+    }
+
+    fn pop_state(self: *mut Events) u8 {
+        return self.states.pop() catch S_END;
+    }
+
+    fn ev(kind: u8, start: Mark, end: Mark) Event {
+        return Event.{ kind: kind, start: start, end: end, anchor: "", tag: "", value: "", style: 0, flow: false,
+                       explicit: false };
+    }
+
+    fn empty_scalar(self: *mut Events, m: Mark) Event {
+        let mut e = Events.ev(E_SCALAR, m, m);
+        e.style = PLAIN;
+        return e;
+    }
+
+    /// The next event; E_STREAM_END is the last.
+    pub fn next(self: *mut Events) !Event {
+        match self.state {
+            0 => {
+                let t = self.tok()!;
+                if t.kind != T_STREAM_START {
+                    return self.fail("did not find expected <stream-start>");
+                }
+                self.skip();
+                self.state = S_IMPLICIT_DOCUMENT_START;
+                return Events.ev(E_STREAM_START, t.start, t.end);
+            }
+            1  => { return self.document_start(true); }
+            2  => { return self.document_start(false); }
+            3  => { return self.document_content(); }
+            4  => { return self.document_end(); }
+            5  => { return self.node(true, false); }
+            6  => { return self.node(true, true); }
+            7  => { return self.node(false, false); }
+            8  => { return self.block_sequence_entry(true); }
+            9  => { return self.block_sequence_entry(false); }
+            10 => { return self.indentless_sequence_entry(); }
+            11 => { return self.block_mapping_key(true); }
+            12 => { return self.block_mapping_key(false); }
+            13 => { return self.block_mapping_value(); }
+            14 => { return self.flow_sequence_entry(true); }
+            15 => { return self.flow_sequence_entry(false); }
+            16 => { return self.flow_sequence_entry_mapping_key(); }
+            17 => { return self.flow_sequence_entry_mapping_value(); }
+            18 => {
+                self.state = S_FLOW_SEQUENCE_ENTRY;
+                let t = self.tok()!;
+                return Events.ev(E_MAPPING_END, t.start, t.start);
+            }
+            19   => { return self.flow_mapping_key(true); }
+            20   => { return self.flow_mapping_key(false); }
+            21   => { return self.flow_mapping_value(false); }
+            22   => { return self.flow_mapping_value(true); }
+            else => { return error.NotFound; }
+        }
+    }
+
+    fn document_start(self: *mut Events, implicit: bool) !Event {
+        let mut t = self.tok()!;
+        while t.kind == T_DOCUMENT_END {
+            self.skip();
+            self.open_ended = false;
+            t = self.tok()!;
+        }
+        let bare = (t.kind != T_VERSION_DIRECTIVE) and (t.kind != T_TAG_DIRECTIVE) and (t.kind != T_DOCUMENT_START) and
+                   (t.kind != T_STREAM_END);
+        // a document may start without --- at the start of the stream or after ...
+        if bare and (implicit or not self.open_ended) {
+            self.default_tags()!;
+            self.push_state(S_DOCUMENT_END)!;
+            self.state = S_BLOCK_NODE;
+            self.had_doc = true;
+            return Events.ev(E_DOCUMENT_START, t.start, t.start);
+        }
+        if t.kind != T_STREAM_END {
+            if not implicit and bare {
+                // after an implicit end, a document needs --- (unless it is empty)
+                return self.fail("did not find expected <document start>");
+            }
+            let start = t.start;
+            let mut version = false;
+            self.tags.clear();
+            loop {
+                t = self.tok()!;
+                if t.kind == T_VERSION_DIRECTIVE {
+                    if version {
+                        return self.fail("found duplicate %YAML directive");
+                    }
+                    if self.open_ended {
+                        return self.fail("a directive follows a document without an explicit end");
+                    }
+                    version = true;
+                    self.skip();
+                } else if t.kind == T_TAG_DIRECTIVE {
+                    if self.open_ended {
+                        return self.fail("a directive follows a document without an explicit end");
+                    }
+                    for d in self.tags.items() {
+                        if strs.eq(d.handle, t.handle) {
+                            return self.fail("found duplicate %TAG directive");
+                        }
+                    }
+                    self.tags.push(TagDirective.{ handle: t.handle, prefix: t.value })!;
+                    self.skip();
+                } else {
+                    break;
+                }
+            }
+            self.default_tags()!;
+            if t.kind != T_DOCUMENT_START {
+                return self.fail("did not find expected <document start>");
+            }
+            self.skip();
+            self.push_state(S_DOCUMENT_END)!;
+            self.state = S_DOCUMENT_CONTENT;
+            self.had_doc = true;
+            let mut e = Events.ev(E_DOCUMENT_START, start, t.end);
+            e.explicit = true;
+            return e;
+        }
+        self.skip();
+        self.state = S_END;
+        return Events.ev(E_STREAM_END, t.start, t.end);
+    }
+
+    fn default_tags(self: *mut Events) !void {
+        let mut have1 = false;
+        let mut have2 = false;
+        for d in self.tags.items() {
+            if strs.eq(d.handle, "!") {
+                have1 = true;
+            }
+            if strs.eq(d.handle, "!!") {
+                have2 = true;
+            }
+        }
+        if not have1 {
+            self.tags.push(TagDirective.{ handle: "!", prefix: "!" })!;
+        }
+        if not have2 {
+            self.tags.push(TagDirective.{ handle: "!!", prefix: "tag:yaml.org,2002:" })!;
+        }
+    }
+
+    fn document_content(self: *mut Events) !Event {
+        let t = self.tok()!;
+        if (t.kind == T_VERSION_DIRECTIVE) or (t.kind == T_TAG_DIRECTIVE) or (t.kind == T_DOCUMENT_START) or
+           (t.kind == T_DOCUMENT_END) or (t.kind == T_STREAM_END) {
+            self.state = self.pop_state();
+            return self.empty_scalar(t.start);
+        }
+        return self.node(true, false);
+    }
+
+    fn document_end(self: *mut Events) !Event {
+        let t = self.tok()!;
+        let mut e = Events.ev(E_DOCUMENT_END, t.start, t.start);
+        if t.kind == T_DOCUMENT_END {
+            self.skip();
+            e.explicit = true;
+            self.open_ended = false;
+        } else {
+            self.open_ended = true;
+            if (t.kind != T_DOCUMENT_START) and (t.kind != T_STREAM_END) {
+                return self.fail("did not find expected <document end>");
+            }
+        }
+        self.tags.clear();
+        self.state = S_DOCUMENT_START;
+        return e;
+    }
+
+    fn resolve_tag(self: *mut Events, t: Token) ![]u8 {
+        if t.handle.len == 0 {
+            return t.value;  // verbatim, or the non-specific "!"
+        }
+        for d in self.tags.items() {
+            if strs.eq(d.handle, t.handle) {
+                let out = self.own.bytes(d.prefix.len + t.value.len)!;
+                @mem_copy(out[..d.prefix.len], d.prefix);
+                @mem_copy(out[d.prefix.len..], t.value);
+                return out;
+            }
+        }
+        return self.fail("found undefined tag handle");
+    }
+
+    fn node(self: *mut Events, block: bool, indentless: bool) !Event {
+        let mut t = self.tok()!;
+        if t.kind == T_ALIAS {
+            self.state = self.pop_state();
+            self.skip();
+            let mut e = Events.ev(E_ALIAS, t.start, t.end);
+            e.anchor = t.value;
+            return e;
+        }
+        let start = t.start;
+        let mut anchor: []u8 = "";
+        let mut tag: []u8 = "";
+        let mut have_props = false;
+        if t.kind == T_ANCHOR {
+            anchor = t.value;
+            have_props = true;
+            self.skip();
+            t = self.tok()!;
+            if t.kind == T_TAG {
+                tag = self.resolve_tag(t)!;
+                self.skip();
+                t = self.tok()!;
+            }
+        } else if t.kind == T_TAG {
+            tag = self.resolve_tag(t)!;
+            have_props = true;
+            self.skip();
+            t = self.tok()!;
+            if t.kind == T_ANCHOR {
+                anchor = t.value;
+                self.skip();
+                t = self.tok()!;
+            }
+        }
+        let mut e = Events.ev(E_SCALAR, start, t.end);
+        e.anchor = anchor;
+        e.tag = tag;
+        if indentless and (t.kind == T_BLOCK_ENTRY) {
+            self.state = S_INDENTLESS_SEQUENCE_ENTRY;
+            e.kind = E_SEQUENCE_START;
+            return e;
+        }
+        if t.kind == T_SCALAR {
+            self.state = self.pop_state();
+            self.skip();
+            e.value = t.value;
+            e.style = t.style;
+            return e;
+        }
+        if t.kind == T_FLOW_SEQUENCE_START {
+            self.state = S_FLOW_SEQUENCE_FIRST_ENTRY;
+            e.kind = E_SEQUENCE_START;
+            e.flow = true;
+            return e;
+        }
+        if t.kind == T_FLOW_MAPPING_START {
+            self.state = S_FLOW_MAPPING_FIRST_KEY;
+            e.kind = E_MAPPING_START;
+            e.flow = true;
+            return e;
+        }
+        if block and (t.kind == T_BLOCK_SEQUENCE_START) {
+            self.state = S_BLOCK_SEQUENCE_FIRST_ENTRY;
+            e.kind = E_SEQUENCE_START;
+            return e;
+        }
+        if block and (t.kind == T_BLOCK_MAPPING_START) {
+            self.state = S_BLOCK_MAPPING_FIRST_KEY;
+            e.kind = E_MAPPING_START;
+            return e;
+        }
+        if have_props {
+            self.state = self.pop_state();
+            e.style = PLAIN;
+            return e;
+        }
+        return self.fail("did not find expected node content");
+    }
+
+    fn block_sequence_entry(self: *mut Events, first: bool) !Event {
+        if first {
+            self.skip();
+        }
+        let t = self.tok()!;
+        if t.kind == T_BLOCK_ENTRY {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != T_BLOCK_ENTRY) and (n.kind != T_BLOCK_END) {
+                self.push_state(S_BLOCK_SEQUENCE_ENTRY)!;
+                return self.node(true, false);
+            }
+            self.state = S_BLOCK_SEQUENCE_ENTRY;
+            return self.empty_scalar(m);
+        }
+        if t.kind == T_BLOCK_END {
+            self.state = self.pop_state();
+            self.skip();
+            return Events.ev(E_SEQUENCE_END, t.start, t.end);
+        }
+        return self.fail("did not find expected '-' indicator");
+    }
+
+    fn indentless_sequence_entry(self: *mut Events) !Event {
+        let t = self.tok()!;
+        if t.kind == T_BLOCK_ENTRY {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != T_BLOCK_ENTRY) and (n.kind != T_KEY) and (n.kind != T_VALUE) and (n.kind != T_BLOCK_END) {
+                self.push_state(S_INDENTLESS_SEQUENCE_ENTRY)!;
+                return self.node(true, false);
+            }
+            self.state = S_INDENTLESS_SEQUENCE_ENTRY;
+            return self.empty_scalar(m);
+        }
+        self.state = self.pop_state();
+        return Events.ev(E_SEQUENCE_END, t.start, t.start);
+    }
+
+    fn block_mapping_key(self: *mut Events, first: bool) !Event {
+        if first {
+            self.skip();
+        }
+        let t = self.tok()!;
+        if t.kind == T_KEY {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != T_KEY) and (n.kind != T_VALUE) and (n.kind != T_BLOCK_END) {
+                self.push_state(S_BLOCK_MAPPING_VALUE)!;
+                return self.node(true, true);
+            }
+            self.state = S_BLOCK_MAPPING_VALUE;
+            return self.empty_scalar(m);
+        }
+        if t.kind == T_BLOCK_END {
+            self.state = self.pop_state();
+            self.skip();
+            return Events.ev(E_MAPPING_END, t.start, t.end);
+        }
+        if t.kind == T_VALUE {
+            // ": value" with an empty key
+            self.state = S_BLOCK_MAPPING_VALUE;
+            return self.empty_scalar(t.start);
+        }
+        return self.fail("did not find expected key");
+    }
+
+    fn block_mapping_value(self: *mut Events) !Event {
+        let t = self.tok()!;
+        if t.kind == T_VALUE {
+            let m = t.end;
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != T_KEY) and (n.kind != T_VALUE) and (n.kind != T_BLOCK_END) {
+                self.push_state(S_BLOCK_MAPPING_KEY)!;
+                return self.node(true, true);
+            }
+            self.state = S_BLOCK_MAPPING_KEY;
+            return self.empty_scalar(m);
+        }
+        self.state = S_BLOCK_MAPPING_KEY;
+        return self.empty_scalar(t.start);
+    }
+
+    fn flow_sequence_entry(self: *mut Events, first: bool) !Event {
+        if first {
+            self.skip();
+        }
+        let mut t = self.tok()!;
+        if t.kind != T_FLOW_SEQUENCE_END {
+            if not first {
+                if t.kind != T_FLOW_ENTRY {
+                    return self.fail("did not find expected ',' or ']'");
+                }
+                self.skip();
+                t = self.tok()!;
+            }
+            if (t.kind == T_KEY) or (t.kind == T_VALUE) {
+                // a single-pair mapping (": x" has an empty key)
+                self.state = S_FLOW_SEQUENCE_ENTRY_MAPPING_KEY;
+                if t.kind == T_KEY {
+                    self.skip();
+                }
+                let mut e = Events.ev(E_MAPPING_START, t.start, t.end);
+                e.flow = true;
+                return e;
+            }
+            if t.kind != T_FLOW_SEQUENCE_END {
+                self.push_state(S_FLOW_SEQUENCE_ENTRY)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = self.pop_state();
+        self.skip();
+        return Events.ev(E_SEQUENCE_END, t.start, t.end);
+    }
+
+    fn flow_sequence_entry_mapping_key(self: *mut Events) !Event {
+        let t = self.tok()!;
+        if (t.kind != T_VALUE) and (t.kind != T_FLOW_ENTRY) and (t.kind != T_FLOW_SEQUENCE_END) {
+            self.push_state(S_FLOW_SEQUENCE_ENTRY_MAPPING_VALUE)!;
+            return self.node(false, false);
+        }
+        self.state = S_FLOW_SEQUENCE_ENTRY_MAPPING_VALUE;
+        return self.empty_scalar(t.start);
+    }
+
+    fn flow_sequence_entry_mapping_value(self: *mut Events) !Event {
+        let t = self.tok()!;
+        if t.kind == T_VALUE {
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != T_FLOW_ENTRY) and (n.kind != T_FLOW_SEQUENCE_END) {
+                self.push_state(S_FLOW_SEQUENCE_ENTRY_MAPPING_END)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = S_FLOW_SEQUENCE_ENTRY_MAPPING_END;
+        return self.empty_scalar(t.start);
+    }
+
+    fn flow_mapping_key(self: *mut Events, first: bool) !Event {
+        if first {
+            self.skip();
+        }
+        let mut t = self.tok()!;
+        if t.kind != T_FLOW_MAPPING_END {
+            if not first {
+                if t.kind != T_FLOW_ENTRY {
+                    return self.fail("did not find expected ',' or '}'");
+                }
+                self.skip();
+                t = self.tok()!;
+            }
+            if t.kind == T_KEY {
+                self.skip();
+                let n = self.tok()!;
+                if (n.kind != T_VALUE) and (n.kind != T_FLOW_ENTRY) and (n.kind != T_FLOW_MAPPING_END) {
+                    self.push_state(S_FLOW_MAPPING_VALUE)!;
+                    return self.node(false, false);
+                }
+                self.state = S_FLOW_MAPPING_VALUE;
+                return self.empty_scalar(n.start);
+            }
+            if t.kind == T_VALUE {
+                self.state = S_FLOW_MAPPING_VALUE;
+                return self.empty_scalar(t.start);  // an empty key
+            }
+            if t.kind != T_FLOW_MAPPING_END {
+                self.push_state(S_FLOW_MAPPING_EMPTY_VALUE)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = self.pop_state();
+        self.skip();
+        return Events.ev(E_MAPPING_END, t.start, t.end);
+    }
+
+    fn flow_mapping_value(self: *mut Events, empty: bool) !Event {
+        let t = self.tok()!;
+        if empty {
+            self.state = S_FLOW_MAPPING_KEY;
+            return self.empty_scalar(t.start);
+        }
+        if t.kind == T_VALUE {
+            self.skip();
+            let n = self.tok()!;
+            if (n.kind != T_FLOW_ENTRY) and (n.kind != T_FLOW_MAPPING_END) {
+                self.push_state(S_FLOW_MAPPING_KEY)!;
+                return self.node(false, false);
+            }
+        }
+        self.state = S_FLOW_MAPPING_KEY;
+        return self.empty_scalar(t.start);
+    }
+}
+
+/// An event in yaml-test-suite's text form ("+MAP {}", "=VAL :text", ...).
+pub fn format_event(e: Event, w: io.Writer) !void {
+    match e.kind {
+        1 => { w.write_all("+STR")!; }
+        2 => { w.write_all("-STR")!; }
+        3 => {
+            w.write_all("+DOC")!;
+            if e.explicit {
+                w.write_all(" ---")!;
+            }
+        }
+        4 => {
+            w.write_all("-DOC")!;
+            if e.explicit {
+                w.write_all(" ...")!;
+            }
+        }
+        5 => {
+            w.write_all("=ALI *")!;
+            w.write_all(e.anchor)!;
+        }
+        6 => {
+            w.write_all("=VAL")!;
+            props(e, w)!;
+            let sigils = " :'\"|>";
+            let one: [2]u8 = [' ', sigils[@as(usize, e.style)]];
+            w.write_all(one[..])!;
+            for c in e.value {
+                if c == '\\' {
+                    w.write_all("\\\\")!;
+                } else if c == '\n' {
+                    w.write_all("\\n")!;
+                } else if c == '\t' {
+                    w.write_all("\\t")!;
+                } else if c == '\r' {
+                    w.write_all("\\r")!;
+                } else if c == 8 {
+                    w.write_all("\\b")!;
+                } else {
+                    let b: [1]u8 = [c];
+                    w.write_all(b[..])!;
+                }
+            }
+        }
+        7 => {
+            w.write_all("+SEQ")!;
+            if e.flow {
+                w.write_all(" []")!;
+            }
+            props(e, w)!;
+        }
+        8 => { w.write_all("-SEQ")!; }
+        9 => {
+            w.write_all("+MAP")!;
+            if e.flow {
+                w.write_all(" {}")!;
+            }
+            props(e, w)!;
+        }
+        10 => { w.write_all("-MAP")!; }
+        else => {}
+    }
+}
+
+fn props(e: Event, w: io.Writer) !void {
+    if e.anchor.len > 0 {
+        w.write_all(" &")!;
+        w.write_all(e.anchor)!;
+    }
+    if e.tag.len > 0 {
+        w.write_all(" <")!;
+        w.write_all(e.tag)!;
+        w.write_all(">")!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Composing documents: events into json.Value trees
+// -----------------------------------------------------------------------------
+
+/// A parsed document: its root and the memory behind it.
+pub struct Document {
+    root: json.Value,
+    arena: arena.Arena,
+
+    pub fn deinit(self: *mut Document) void {
+        self.arena.deinit();
+        self.root = json.Value.Null;
+    }
+}
+
+/// All the documents of a stream.
+pub struct Stream {
+    documents: []json.Value,
+    arena: arena.Arena,
+
+    pub fn deinit(self: *mut Stream) void {
+        self.arena.deinit();
+    }
+}
+
+/// Where and why parsing failed.
+pub struct ErrorInfo {
+    line: u32,    // from 1
+    column: u32,  // from 1
+    message: []u8,
+}
+
+struct Frame {
+    seq: bool,
+    items: vec.Vec.[json.Value],
+    members: vec.Vec.[json.Member],
+    key: []u8,
+    has_key: bool,
+    anchor: []u8,
+    size: u64,
+}
+
+struct Anchored {
+    value: json.Value,
+    size: u64,
+}
+
+struct Composer {
+    ev: *mut Events,
+    ar: *mut arena.Arena,
+    frames: vec.Vec.[Frame],
+    anchors: maps.Map.[[]u8, Anchored],
+    total: u64,
+    limit: u64,
+    msg: []u8,
+
+    fn fail(self: *mut Composer, m: []u8, e: error) error { if self.msg.len == 0 {
+        self.msg = m;
+    }
+    return e; }
+
+    // Adds a finished value (of `size` nodes) to the current collection,
+    // or returns true when it is the document's root.
+    fn add(self: *mut Composer, v: json.Value, size: u64, root: *mut json.Value) !bool {
+        self.total +%= size;
+        if self.total > self.limit {
+            return self.fail("aliases expand beyond the size limit", error.TooLarge);
+        }
+        if self.frames.len == 0 {
+            root.* = v;
+            return true;
+        }
+        let f = self.frames.get_ptr(self.frames.len - 1);
+        f.size +%= size;
+        if f.seq {
+            f.items.push(v)!;
+            return false;
+        }
+        if not f.has_key {
+            let k = v.as_str() catch "";
+            match v {
+                .Array(_x)  => { return self.fail("a mapping key is not a scalar", error.Unsupported); }
+                .Object(_y) => { return self.fail("a mapping key is not a scalar", error.Unsupported); }
+                else => {}
+            }
+            f.key = scalar_text(self.ar, v, k)!;
+            f.has_key = true;
+            return false;
+        }
+        f.members.push(json.Member.{ key: f.key, value: v })!;
+        f.has_key = false;
+        return false;
+    }
+
+    fn remember(self: *mut Composer, anchor: []u8, v: json.Value, size: u64) !void {
+        if anchor.len > 0 {
+            self.anchors.put(anchor, Anchored.{ value: v, size: size })!;
+        }
+    }
+
+    // The next document's root, or NotFound at the end of the stream.
+    fn document(self: *mut Composer) !json.Value {
+        loop {
+            let e = self.ev.next()!;
+            if e.kind == E_STREAM_START {
+                continue;
+            }
+            if e.kind == E_STREAM_END {
+                return error.NotFound;
+            }
+            if e.kind == E_DOCUMENT_START {
+                break;
+            }
+        }
+        self.anchors.clear();
+        let mut root = json.Value.Null;
+        loop {
+            let e = self.ev.next()!;
+            match e.kind {
+                5 => {
+                    let a = self.anchors.get(e.anchor) catch return self.fail(
+                        "an alias to an unknown anchor", error.SyntaxError);
+                    if self.add(a.value, a.size, &mut root)! {
+                        break;
+                    }
+                }
+                6 => {
+                    let v = resolve(self.ar, e) catch |err| {
+                        return self.fail("a scalar does not match its tag", err);
+                    };
+                    self.remember(e.anchor, v, 1)!;
+                    if self.add(v, 1, &mut root)! {
+                        break;
+                    }
+                }
+                7 => {
+                    self.frames.push(Frame.{ seq: true, items: vec.Vec.[json.Value].init(),
+                                             members: vec.Vec.[json.Member].init(), key: "", has_key: false,
+                                             anchor: e.anchor, size: 1 })!;
+                }
+                9 => {
+                    self.frames.push(Frame.{ seq: false, items: vec.Vec.[json.Value].init(),
+                                             members: vec.Vec.[json.Member].init(), key: "", has_key: false,
+                                             anchor: e.anchor, size: 1 })!;
+                }
+                8 => {
+                    let mut f = self.frames.pop()!;
+                    let xs = self.ar.copy.[json.Value](f.items.items()) catch |err| {
+                        f.items.deinit();
+                        f.members.deinit();
+                        return err;
+                    };
+                    f.items.deinit();
+                    f.members.deinit();
+                    let v = json.Value.Array(xs);
+                    self.remember(f.anchor, v, f.size)!;
+                    self.total -%= f.size - 1;  // (counted as the children were added)
+                    if self.add(v, f.size, &mut root)! {
+                        break;
+                    }
+                }
+                10 => {
+                    let mut f = self.frames.pop()!;
+                    let dup = has_duplicates(f.members.items());
+                    let ms = self.ar.copy.[json.Member](f.members.items()) catch |err| {
+                        f.items.deinit();
+                        f.members.deinit();
+                        return err;
+                    };
+                    f.items.deinit();
+                    f.members.deinit();
+                    if dup {
+                        return self.fail("duplicate mapping key", error.DuplicateKey);
+                    }
+                    let v = json.Value.Object(ms);
+                    self.remember(f.anchor, v, f.size)!;
+                    self.total -%= f.size - 1;
+                    if self.add(v, f.size, &mut root)! {
+                        break;
+                    }
+                }
+                else => {}
+            }
+        }
+        // the document's end
+        let e = self.ev.next()!;
+        if e.kind != E_DOCUMENT_END {
+            return self.fail("expected the end of the document", error.SyntaxError);
+        }
+        return root;
+    }
+}
+
+fn scalar_text(a: *mut arena.Arena, v: json.Value, s: []u8) ![]u8 {
+    match v {
+        .String(x) => { return x; }
+        .Null      => { return ""; }
+        .Bool(b) => {
+            if b {
+                return "true";
+            }
+            return "false";
+        }
+        .Int(i) => {
+            let mut buf: [24]u8 = [0; 24];
+            return a.dup(fmt.bufprint(buf[..], "{}", [fmt.int(i)])!);
+        }
+        .Float(x) => {
+            let mut buf: [40]u8 = [0; 40];
+            return a.dup(fmt.format_float(buf[..], x)!);
+        }
+        else => { return s; }
+    }
+}
+
+fn str_less(a: []u8, b: []u8) bool {
+    return strs.compare(a, b) < 0;
+}
+
+fn has_duplicates(ms: []json.Member) bool {
+    if ms.len <= 16 {
+        for i in @as(usize, 0)..ms.len {
+            for j in i + 1..ms.len {
+                if @mem_eq(ms[i].key, ms[j].key) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    let mut keys = vec.Vec.[[]u8].with_capacity(ms.len) catch return false;
+    defer keys.deinit();
+    for m in ms {
+        keys.push(m.key) catch return false;
+    }
+    let ks = keys.items();
+    vec.sort(ks, str_less);
+    for i in @as(usize, 1)..ks.len {
+        if @mem_eq(ks[i - 1], ks[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+let CORE: []u8 = "tag:yaml.org,2002:";
+
+// A scalar's value under the core schema (or its tag).
+fn resolve(a: *mut arena.Arena, e: Event) !json.Value {
+    let s = e.value;
+    let t = e.tag;
+    if strs.starts_with(t, CORE) {
+        let k = t[CORE.len..];
+        if strs.eq(k, "str") {
+            return json.Value.String(s);
+        }
+        if strs.eq(k, "null") {
+            return json.Value.Null;
+        }
+        if strs.eq(k, "bool") {
+            let v = plain_value(s);
+            match v {
+                .Bool(_b) => { return v; }
+                else      => { return error.WrongType; }
+            }
+        }
+        if strs.eq(k, "int") {
+            let v = plain_value(s);
+            match v {
+                .Int(_i) => { return v; }
+                else     => { return error.WrongType; }
+            }
+        }
+        if strs.eq(k, "float") {
+            let v = plain_value(s);
+            match v {
+                .Float(_f) => { return v; }
+                .Int(i)    => { return json.Value.Float(@float_from_int(f64, i)); }
+                else       => { return error.WrongType; }
+            }
+        }
+    }
+    if (t.len > 0) or (e.style != PLAIN) {
+        return json.Value.String(s);  // quoted, "!" or another tag: a string
+    }
+    return plain_value(s);
+}
+
+fn plain_value(s: []u8) json.Value {
+    for n in ["", "~", "null", "Null", "NULL"]{
+        if strs.eq(s, n) {
+            return json.Value.Null;
+        }
+    }
+    for b in ["true", "True", "TRUE"]{
+        if strs.eq(s, b) {
+            return json.Value.Bool(true);
+        }
+    }
+    for b in ["false", "False", "FALSE"]{
+        if strs.eq(s, b) {
+            return json.Value.Bool(false);
+        }
+    }
+    if is_int(s) {
+        let v = fmt.parse_int.[i64](strs.strip_prefix(s,
+                                                      "+") catch s) catch return json.Value.Float(fmt.parse_float(s) catch 0.0);
+        return json.Value.Int(v);
+    }
+    if (s.len > 2) and (s[0] == '0') and ((s[1] == 'o') or (s[1] == 'x')) {
+        let mut base: u64 = 8;
+        if s[1] == 'x' {
+            base = 16;
+        }
+        let mut v: u64 = 0;
+        let mut ok = true;
+        for c in s[2..] {
+            let d = @as(u64, hexv(c));
+            if d >= base {
+                ok = false;
+                break;
+            }
+            v = @mul_checked(v, base) catch 0xffffffffffffffff;
+            v = @add_checked(v, d) catch 0xffffffffffffffff;
+        }
+        if ok and (v <= 0x7fffffffffffffff) {
+            return json.Value.Int(@bit_cast(i64, v));
+        }
+    }
+    let mut body = s;
+    let mut neg = false;
+    if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
+        body = s[1..];
+        neg = s[0] == '-';
+    }
+    for inf in [".inf", ".Inf", ".INF"]{
+        if strs.eq(body, inf) {
+            if neg {
+                return json.Value.Float(-1.0 / 0.0);
+            }
+            return json.Value.Float(1.0 / 0.0);
+        }
+    }
+    for nan in [".nan", ".NaN", ".NAN"]{
+        if strs.eq(s, nan) {
+            return json.Value.Float(0.0 / 0.0);
+        }
+    }
+    if is_float(body) {
+        let f = fmt.parse_float(s) catch return json.Value.String(s);
+        return json.Value.Float(f);
+    }
+    return json.Value.String(s);
+}
+
+fn is_int(s: []u8) bool {
+    let mut i: usize = 0;
+    if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
+        i = 1;
+    }
+    if i >= s.len {
+        return false;
+    }
+    for c in s[i..] {
+        if (c < '0') or (c > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ( \. [0-9]+ | [0-9]+ ( \. [0-9]* )? ) ( [eE] [-+]? [0-9]+ )?
+fn is_float(s: []u8) bool {
+    let mut i: usize = 0;
+    let mut digits: usize = 0;
+    while (i < s.len) and (s[i] >= '0') and (s[i] <= '9') {
+        i += 1;
+        digits += 1;
+    }
+    if (i < s.len) and (s[i] == '.') {
+        i += 1;
+        while (i < s.len) and (s[i] >= '0') and (s[i] <= '9') {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if (i < s.len) and ((s[i] == 'e') or (s[i] == 'E')) {
+        i += 1;
+        if (i < s.len) and ((s[i] == '-') or (s[i] == '+')) {
+            i += 1;
+        }
+        let st = i;
+        while (i < s.len) and (s[i] >= '0') and (s[i] <= '9') {
+            i += 1;
+        }
+        if i == st {
+            return false;
+        }
+    }
+    return i == s.len;
+}
+
+fn compose_all(text: []u8, a: *mut arena.Arena, docs: *mut vec.Vec.[json.Value], info: *mut ErrorInfo,
+               one: bool) !void {
+    let mut ev = Events.with_arena(text, a);
+    defer ev.deinit();
+    let mut c = Composer.{
+        ev: &mut ev,
+        ar: a,
+        frames: vec.Vec.[Frame].init(),
+        anchors: maps.Map.[[]u8, Anchored].init(hash.hash_bytes, hash.eq_bytes),
+        total: 0,
+        limit: (100 * @as(u64, text.len)) + 100000,
+        msg: "",
+    };
+    defer c.anchors.deinit();
+    let r = compose_loop(&mut c, docs, one);
+    for f in c.frames.items() {
+        let mut g = f;
+        g.items.deinit();
+        g.members.deinit();
+    }
+    c.frames.deinit();
+    r catch |e| {
+        let mut m = ev.error_mark();
+        info.message = ev.error_message();
+        if info.message.len == 0 {
+            info.message = c.msg;
+            m = ev.sc.m;
+        }
+        if (info.message.len == 0) and (e == error.TooDeep) {
+            info.message = "nesting too deep";
+        }
+        info.line = m.line + 1;
+        info.column = m.column + 1;
+        return e;
+    };
+}
+
+fn compose_loop(c: *mut Composer, docs: *mut vec.Vec.[json.Value], one: bool) !void {
+    loop {
+        let v = c.document() catch |e| {
+            if e == error.NotFound {
+                return;
+            }
+            return e;
+        };
+        if one and (docs.len == 1) {
+            return c.fail("more than one document", error.MultipleDocuments);
+        }
+        docs.push(v)!;
+    }
+}
+
+/// Parses a stream holding (at most) one document; an empty stream gives
+/// null. MultipleDocuments if there are more.
+pub fn parse(text: []u8) !Document {
+    let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
+    return parse_with(text, &mut info);
+}
+
+pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
+    let mut d = Document.{ root: json.Value.Null, arena: arena.Arena.init() };
+    let mut docs = vec.Vec.[json.Value].init();
+    defer docs.deinit();
+    compose_all(text, &mut d.arena, &mut docs, info, true) catch |e| {
+        d.arena.deinit();
+        return e;
+    };
+    if docs.len > 0 {
+        d.root = docs.get(0);
+    }
+    return d;
+}
+
+/// Parses every document of a stream.
+pub fn parse_all(text: []u8) !Stream {
+    let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
+    return parse_all_with(text, &mut info);
+}
+
+pub fn parse_all_with(text: []u8, info: *mut ErrorInfo) !Stream {
+    let mut s = Stream.{ documents: @slice_from_ptr(@ptr_from_int(*json.Value, 8), 0), arena: arena.Arena.init() };
+    let mut docs = vec.Vec.[json.Value].init();
+    defer docs.deinit();
+    compose_all(text, &mut s.arena, &mut docs, info, false) catch |e| {
+        s.arena.deinit();
+        return e;
+    };
+    s.documents = s.arena.copy.[json.Value](docs.items()) catch |e| {
+        s.arena.deinit();
+        return e;
+    };
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+/// A value as block-style YAML (free it with mem.free). Strings are plain
+/// when that reads back as the same string, and double-quoted otherwise.
+pub fn stringify(v: json.Value) ![]mut u8 {
+    let mut s = strs.String.init();
+    write_block(s.writer(), v, 0, 0) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+fn nonempty_collection(v: json.Value) bool {
+    match v {
+        .Array(xs)  => { return xs.len > 0; }
+        .Object(ms) => { return ms.len > 0; }
+        else        => { return false; }
+    }
+}
+
+fn indent_to(w: io.Writer, n: usize) !void {
+    for _k in @as(usize, 0)..n {
+        w.write_all(" ")!;
+    }
+}
+
+// v, starting where a block node may begin, at column ind.
+fn write_block(w: io.Writer, v: json.Value, ind: usize, depth: usize) !void {
+    if depth > MAX_DEPTH {
+        return error.TooDeep;
+    }
+    match v {
+        .Object(ms) => {
+            if ms.len == 0 {
+                w.write_all("{}\n")!;
+                return;
+            }
+            for k in @as(usize, 0)..ms.len {
+                if k > 0 {
+                    indent_to(w, ind)!;
+                }
+                write_scalar_text(w, ms[k].key)!;
+                w.write_all(":")!;
+                let x = ms[k].value;
+                if nonempty_collection(x) {
+                    w.write_all("\n")!;
+                    indent_to(w, ind + 2)!;
+                    write_block(w, x, ind + 2, depth + 1)!;
+                } else {
+                    w.write_all(" ")!;
+                    write_block(w, x, ind + 2, depth + 1)!;
+                }
+            }
+        }
+        .Array(xs) => {
+            if xs.len == 0 {
+                w.write_all("[]\n")!;
+                return;
+            }
+            for k in @as(usize, 0)..xs.len {
+                if k > 0 {
+                    indent_to(w, ind)!;
+                }
+                w.write_all("- ")!;
+                write_block(w, xs[k], ind + 2, depth + 1)!;
+            }
+        }
+        .Null => { w.write_all("null\n")!; }
+        .Bool(b) => {
+            if b {
+                w.write_all("true\n")!;
+            } else {
+                w.write_all("false\n")!;
+            }
+        }
+        .Int(i) => { fmt.write(w, "{}\n", [fmt.int(i)])!; }
+        .Float(x) => {
+            if x != x {
+                w.write_all(".nan\n")!;
+            } else if x == (1.0 / 0.0) {
+                w.write_all(".inf\n")!;
+            } else if x == (-1.0 / 0.0) {
+                w.write_all("-.inf\n")!;
+            } else {
+                let mut buf: [40]u8 = [0; 40];
+                let t = fmt.format_float(buf[..], x)!;
+                w.write_all(t)!;
+                if (strs.index_of_any(t, ".eE") catch 999) == 999 {
+                    w.write_all(".0")!;
+                }
+                w.write_all("\n")!;
+            }
+        }
+        .String(t) => {
+            write_scalar_text(w, t)!;
+            w.write_all("\n")!;
+        }
+    }
+}
+
+// Whether t can be written plain and read back as the same string.
+fn plain_ok(t: []u8) bool {
+    if (t.len == 0) or is_blank(t[0]) or is_blank(t[t.len - 1]) {
+        return false;
+    }
+    match plain_value(t) {
+        .String(_x) => {}
+        else => { return false; }
+    }
+    let c0 = t[0];
+    if (strs.index_of_byte("-?:,[]{}#&*!|>'\"%@`", c0) catch 99) != 99 {
+        return false;
+    }
+    for k in @as(usize, 0)..t.len {
+        let c = t[k];
+        if (c < 0x20) or (c == 0x7f) {
+            return false;
+        }
+        if ((c == ':') and (((k + 1) == t.len) or (t[k + 1] == ' '))) or ((c == '#') and (t[k - 1] == ' ')) {
+            return false;
+        }
+    }
+    return strs.valid_utf8(t) and not strs.eq(t, "---") and not strs.eq(t, "...");
+}
+
+fn write_scalar_text(w: io.Writer, t: []u8) !void {
+    if plain_ok(t) {
+        w.write_all(t)!;
+        return;
+    }
+    let digits = "0123456789ABCDEF";
+    w.write_all("\"")!;
+    for c in t {
+        if c == '"' {
+            w.write_all("\\\"")!;
+        } else if c == '\\' {
+            w.write_all("\\\\")!;
+        } else if c == '\n' {
+            w.write_all("\\n")!;
+        } else if c == '\t' {
+            w.write_all("\\t")!;
+        } else if (c < 0x20) or (c == 0x7f) {
+            let e: [4]u8 = ['\\', 'x', digits[@as(usize, c >> 4)], digits[@as(usize, c & 15)]];
+            w.write_all(e[..])!;
+        } else {
+            let b: [1]u8 = [c];
+            w.write_all(b[..])!;
+        }
+    }
+    w.write_all("\"")!;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn next_line(data: []u8, at: *mut usize) []u8 {
+    let st = at.*;
+    let nl = strs.index_of_from(data, "\n", st) catch data.len;
+    at.* = nl + 1;
+    return data[st..nl];
+}
+
+// The event stream of text in test-suite form, or an error.
+fn events_text(text: []u8, out: *mut strs.String) !void {
+    let mut a = arena.Arena.init();
+    defer a.deinit();
+    let mut ev = Events.with_arena(text, &mut a);
+    defer ev.deinit();
+    loop {
+        let e = ev.next()!;
+        format_event(e, out.writer())!;
+        out.push('\n')!;
+        if e.kind == E_STREAM_END {
+            return;
+        }
+    }
+}
+
+test "yaml-test-suite: events" {
+    let data = fs.read_file("std/encoding/yaml/testdata/yaml-test-suite.txt") catch return;
+    defer mem.free(data);
+    let mut at: usize = 0;
+    _ = next_line(data, &mut at);
+    let mut passed: usize = 0;
+    let mut failed: usize = 0;
+    let mut got = strs.String.init();
+    defer got.deinit();
+    while at < data.len {
+        let head = next_line(data, &mut at);
+        let mut f = strs.fields(head);
+        _ = f.next() catch break;
+        let name = f.next() catch break;
+        let is_err = strs.eq(f.next() catch break, "1");
+        let ylen = fmt.parse_int.[usize](f.next() catch break) catch break;
+        let elen = fmt.parse_int.[usize](f.next() catch break) catch break;
+        let jlen = fmt.parse_int.[i64](f.next() catch break) catch break;
+        let text = data[at..at + ylen];
+        at += ylen + 1;
+        let want = data[at..at + elen];
+        at += elen + 1;
+        if jlen >= 0 {
+            at += @truncate(usize, @bit_cast(u64, jlen)) + 1;
+        }
+        got.clear();
+        let r = events_text(text, &mut got);
+        let mut ok = false;
+        if is_err {
+            ok = fails(r);
+        } else {
+            ok = not fails(r) and strs.eq(got.bytes(), want);
+        }
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            if failed <= 60 {
+                fmt.print("FAIL {}\n", [fmt.str(name)]) catch {};
+            }
+        }
+    }
+    fmt.print("yaml-test-suite events: {} passed, {} failed\n", [fmt.int(passed), fmt.int(failed)]) catch {};
+    @expect_eq(failed, 0);
+}
+
+fn fails(r: !void) bool {
+    r catch return true;
+    return false;
+}
+
+// The top-level JSON values of text (the suite's in.json holds one per document).
+fn json_values(text: []u8, out: *mut vec.Vec.[[]u8]) !void {
+    let mut i: usize = 0;
+    while i < text.len {
+        while (i < text.len) and ((text[i] == ' ') or (text[i] == '\n') or (text[i] == '\t') or (text[i] == '\r')) {
+            i += 1;
+        }
+        if i >= text.len {
+            return;
+        }
+        let st = i;
+        let mut depth: usize = 0;
+        let mut in_str = false;
+        while i < text.len {
+            let c = text[i];
+            if in_str {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    in_str = false;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+            } else if c == '"' {
+                in_str = true;
+            } else if (c == '[') or (c == '{') {
+                depth += 1;
+            } else if (c == ']') or (c == '}') {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            } else if (depth == 0) and ((c == ' ') or (c == '\n')) {
+                break;
+            }
+            i += 1;
+        }
+        out.push(text[st..i])!;
+    }
+}
+
+fn same(a: json.Value, b: json.Value) bool {
+    match b {
+        .Null      => { return a.is_null(); }
+        .Bool(x)   => { return (a.as_bool() catch return false) == x; }
+        .Int(x)    => { return (a.as_f64() catch return false) == @float_from_int(f64, x); }
+        .Float(x)  => { return (a.as_f64() catch return false) == x; }
+        .String(x) => { return strs.eq(a.as_str() catch return false, x); }
+        .Array(xs) => {
+            let ys = a.as_array() catch return false;
+            if xs.len != ys.len {
+                return false;
+            }
+            for k in @as(usize, 0)..xs.len {
+                if not same(ys[k], xs[k]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        .Object(ms) => {
+            let ns = a.as_object() catch return false;
+            if ns.len != ms.len {
+                return false;
+            }
+            for m in ms {
+                if not same(a.get(m.key) catch return false, m.value) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+}
+
+test "yaml-test-suite: documents against in.json" {
+    let data = fs.read_file("std/encoding/yaml/testdata/yaml-test-suite.txt") catch return;
+    defer mem.free(data);
+    let mut at: usize = 0;
+    _ = next_line(data, &mut at);
+    let mut passed: usize = 0;
+    let mut failed: usize = 0;
+    let mut vals = vec.Vec.[[]u8].init();
+    defer vals.deinit();
+    while at < data.len {
+        let head = next_line(data, &mut at);
+        let mut f = strs.fields(head);
+        _ = f.next() catch break;
+        let name = f.next() catch break;
+        let is_err = strs.eq(f.next() catch break, "1");
+        let ylen = fmt.parse_int.[usize](f.next() catch break) catch break;
+        let elen = fmt.parse_int.[usize](f.next() catch break) catch break;
+        let jlen = fmt.parse_int.[i64](f.next() catch break) catch break;
+        let text = data[at..at + ylen];
+        at += ylen + 1 + elen + 1;
+        if jlen < 0 {
+            continue;
+        }
+        let jn = @truncate(usize, @bit_cast(u64, jlen));
+        let jtext = data[at..at + jn];
+        at += jn + 1;
+        if is_err {
+            continue;  // (a few error cases carry JSON of what came before the error)
+        }
+        vals.clear();
+        json_values(jtext, &mut vals)!;
+        let mut ok = true;
+        let mut st = parse_all(text) catch |e| {
+            fmt.print("FAIL {} ({})\n", [fmt.str(name), fmt.str(@error_name(e))]) catch {};
+            failed += 1;
+            continue;
+        };
+        if st.documents.len != vals.len {
+            ok = false;
+        } else {
+            for k in @as(usize, 0)..vals.len {
+                let mut want = json.parse(vals.get(k)) catch @trap();
+                if not same(st.documents[k], want.root) {
+                    ok = false;
+                }
+                want.deinit();
+            }
+        }
+        st.deinit();
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            fmt.print("FAIL {}\n", [fmt.str(name)]) catch {};
+        }
+    }
+    fmt.print("yaml-test-suite documents: {} passed, {} failed\n", [fmt.int(passed), fmt.int(failed)]) catch {};
+    @expect_eq(failed, 0);
+    @expect(passed > 250);
+}
+
+test "trees, tags and errors" {
+    let mut d =
+        parse("name: Ada\nborn: 1815\nratio: 0.5\nlangs: [en, fr]\nnothing: ~\nyes: true\nhex: 0x1F\nquoted: '42'\ntagged: !!str 7\nfloat: !!float 3\n")!;
+    defer d.deinit();
+    @expect_eq(d.root.get("name")!.as_str()!, "Ada");
+    @expect_eq(d.root.get("born")!.as_i64()!, 1815);
+    @expect_eq(d.root.get("ratio")!.as_f64()!, 0.5);
+    @expect_eq(d.root.get("langs")!.at(1)!.as_str()!, "fr");
+    @expect(d.root.get("nothing")!.is_null());
+    @expect(d.root.get("yes")!.as_bool()!);
+    @expect_eq(d.root.get("hex")!.as_i64()!, 31);
+    @expect_eq(d.root.get("quoted")!.as_str()!, "42");
+    @expect_eq(d.root.get("tagged")!.as_str()!, "7");
+    @expect_eq(d.root.get("float")!.as_f64()!, 3.0);
+    // anchors share their value
+    let mut a = parse("base: &b {x: 1}\nuse: *b\n")!;
+    defer a.deinit();
+    @expect_eq(a.root.get("use")!.get("x")!.as_i64()!, 1);
+    // errors
+    let mut info = ErrorInfo.{ line: 0, column: 0, message: "" };
+    _ = parse_with("a: 1\nb: [1, 2\n", &mut info) catch |e| {
+        @expect_eq(e, error.SyntaxError);
+        @expect(info.line >= 2);
+        @expect(info.message.len > 0);
+        @expect(fails_doc(parse("a: 1\na: 2\n")));
+        @expect(fails_doc(parse("--- 1\n--- 2\n")));
+        @expect(fails_doc(parse("x: !!int abc\n")));
+        @expect(fails_doc(parse("x: *nope\n")));
+        return;
+    };
+    @trap();
+}
+
+fn fails_doc(r: !Document) bool {
+    let mut d = r catch return true;
+    d.deinit();
+    return false;
+}
+
+test "hostile input" {
+    // billion laughs: refused, not expanded
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("a: &a [x, x, x, x, x, x, x, x, x, x]\n")!;
+    let names = "abcdefghij";
+    for k in @as(usize, 1)..10 {
+        let c = names[k..k + 1];
+        let p = names[k - 1..k];
+        s.push_str(c)!;
+        s.push_str(": &")!;
+        s.push_str(c)!;
+        s.push_str(" [")!;
+        for q in @as(usize, 0)..10 {
+            if q > 0 {
+                s.push_str(", ")!;
+            }
+            s.push('*')!;
+            s.push_str(p)!;
+        }
+        s.push_str("]\n")!;
+    }
+    _ = parse(s.bytes()) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        // deep nesting
+        let mut deep = strs.String.init();
+        defer deep.deinit();
+        for _k in @as(usize, 0)..100000 {
+            deep.push('[')!;
+        }
+        _ = parse(deep.bytes()) catch |e2| {
+            @expect_eq(e2, error.TooDeep);
+            let mut blk = strs.String.init();
+            defer blk.deinit();
+            for k in @as(usize, 0)..2000 {
+                indent_to(blk.writer(), k)!;
+                blk.push_str("- \n")!;
+            }
+            _ = parse(blk.bytes()) catch return;
+            @trap();
+        };
+        @trap();
+    };
+    @trap();
+}
+
+test "writing round trips" {
+    let src =
+        "title: \"true\"\ncount: 3\nitems:\n- plain text\n- 'with: colon'\n- \"line\\nbreak\"\n- {a: 1, b: [x, y]}\n- []\nempty: {}\nweird: \" padded \"\nnum_str: \"012\"\nf: 2.0\nn: null\n";
+    let mut d = parse(src)!;
+    defer d.deinit();
+    let out = stringify(d.root)!;
+    defer mem.free(out);
+    let mut back = parse(out)!;
+    defer back.deinit();
+    @expect(same(back.root, d.root));
+    @expect(strs.contains(out, "title: \"true\"\n"));
+    @expect(strs.contains(out, "- plain text\n"));
+    @expect(strs.contains(out, "f: 2.0\n"));
+}

@@ -1,0 +1,247 @@
+// =============================================================================
+// std/thread/pool.ph - a thread pool, with futures.
+//
+//     let p = pool.Pool.create(thread.cpu_count())!;
+//     defer p.destroy();
+//     let f = p.submit(square, @as(i64, 12))!;       // square: fn(i64) i64
+//     ...
+//     let r = f.join();                               // 144 (and frees f)
+//
+//     p.run(work, item)!;                              // fire and forget
+//     p.wait();                                        // until all have run
+//
+// A Pool has a fixed number of worker threads taking jobs from a bounded
+// queue (submit and run wait while it is full). A Future holds a job's
+// argument and, once it has run, its result: join blocks until then,
+// returns the result and frees the future; done tells without blocking.
+// Every future must be joined. Jobs run in the order they were submitted,
+// but finish in any order.
+// =============================================================================
+
+import "../mem.ph" as mem;
+import "../sync.ph" as sync;
+import "../thread.ph" as thread;
+
+error { OutOfMemory, SpawnFailed, Closed }
+
+/// Jobs a pool queues before submit and run wait.
+pub const QUEUE: usize = 1024;
+
+struct Job {
+    run: fn(*mut void) void,
+    ctx: *mut void,
+}
+
+pub struct Pool {
+    queue: sync.Channel.[Job],
+    workers: []mut thread.Thread.[*mut Pool],
+    pending: sync.WaitGroup,
+
+    /// A pool of `threads` workers (at least one), on the heap.
+    pub fn create(threads: usize) !*mut Pool {
+        let cell = mem.alloc.[Pool](1)!;
+        let p = &mut cell[0];
+        let n = @max(threads, 1);
+        let q = sync.Channel.[Job].init(QUEUE) catch |e| {
+            mem.free(cell);
+            return e;
+        };
+        let ws = mem.alloc.[thread.Thread.[*mut Pool]](n) catch |e| {
+            let mut qq = q;
+            qq.deinit();
+            mem.free(cell);
+            return e;
+        };
+        p.* = Pool.{ queue: q, workers: ws, pending: sync.WaitGroup.init() };
+        for k in @as(usize, 0)..n {
+            p.workers[k] = thread.spawn(worker, p) catch |e| {
+                // stop the ones that started
+                p.queue.close();
+                for j in @as(usize, 0)..k {
+                    p.workers[j].join();
+                }
+                p.queue.deinit();
+                mem.free(p.workers);
+                mem.free(cell);
+                return e;
+            };
+        }
+        return p;
+    }
+
+    /// Waits for the queued jobs to finish, stops the workers and frees the
+    /// pool.
+    pub fn destroy(self: *mut Pool) void {
+        self.queue.close();
+        for w in self.workers {
+            w.join();
+        }
+        self.queue.deinit();
+        mem.free(self.workers);
+        mem.free(@slice_from_ptr(self, 1));
+    }
+
+    /// The number of worker threads.
+    pub fn size(self: *Pool) usize {
+        return self.workers.len;
+    }
+
+    /// Runs f(arg) on a worker; the future gives its result.
+    pub fn submit[A, R](self: *mut Pool, f: fn(A) R, arg: A) !*mut Future.[A, R] {
+        let cell = mem.alloc.[Future.[A, R]](1)!;
+        let fut = &mut cell[0];
+        fut.f = f;
+        fut.arg = arg;
+        fut.state = 0;
+        self.push(Job.{ run: run_future.[A, R], ctx: @ptr_cast(*mut void, fut) }) catch |e| {
+            mem.free(cell);
+            return e;
+        };
+        return fut;
+    }
+
+    /// Runs f(arg) on a worker, with nothing to wait for (but see wait).
+    pub fn run[A](self: *mut Pool, f: fn(A) void, arg: A) !void {
+        let cell = mem.alloc.[Task.[A]](1)!;
+        cell[0] = Task.[A].{ f: f, arg: arg };
+        self.push(Job.{ run: run_task.[A], ctx: @ptr_cast(*mut void, &mut cell[0]) }) catch |e| {
+            mem.free(cell);
+            return e;
+        };
+    }
+
+    /// Blocks until every job submitted so far has finished.
+    pub fn wait(self: *mut Pool) void {
+        self.pending.wait();
+    }
+
+    fn push(self: *mut Pool, j: Job) !void {
+        self.pending.add(1);
+        self.queue.send(j) catch |e| {
+            self.pending.done();
+            return e;
+        };
+    }
+}
+
+fn worker(p: *mut Pool) void {
+    loop {
+        let j = p.queue.recv() catch return;
+        j.run(j.ctx);
+        p.pending.done();
+    }
+}
+
+/// The result of a job, to come.
+pub struct Future[A, R] {
+    f: fn(A) R,
+    arg: A,
+    result: R,
+    state: u32,  // 0 queued or running, 1 done
+
+    /// Whether the job has finished (so join will not block).
+    pub fn done(self: *Self) bool {
+        return @atomic_load(&self.state) == 1;
+    }
+
+    /// Waits for the job, frees the future and returns the result.
+    pub fn join(self: *mut Self) R {
+        while @atomic_load(&self.state) == 0 {
+            _ = @atomic_wait(&self.state, 0, -1);
+        }
+        let r = self.result;
+        mem.free(@slice_from_ptr(self, 1));
+        return r;
+    }
+}
+
+fn run_future[A, R](ctx: *mut void) void {
+    let fut = @ptr_cast(*mut Future.[A, R], ctx);
+    fut.result = fut.f(fut.arg);
+    @atomic_store(&mut fut.state, 1);
+    _ = @atomic_notify(&fut.state, 1);
+}
+
+struct Task[A] {
+    f: fn(A) void,
+    arg: A,
+}
+
+fn run_task[A](ctx: *mut void) void {
+    let t = @ptr_cast(*mut Task.[A], ctx);
+    let f = t.f;
+    let arg = t.arg;
+    mem.free(@slice_from_ptr(t, 1));
+    f(arg);
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn square(x: i64) i64 {
+    return x * x;
+}
+
+// a job that takes a while
+fn collatz(n: u64) u64 {
+    let mut x = n;
+    let mut steps: u64 = 0;
+    while x != 1 {
+        if (x % 2) == 0 {
+            x /= 2;
+        } else {
+            x = (3 * x) + 1;
+        }
+        steps += 1;
+    }
+    return steps;
+}
+
+struct Tally {
+    sum: u64,
+}
+
+fn add_to(t: *mut Tally) void {
+    _ = @atomic_add(&mut t.sum, 1);
+}
+
+test "futures" {
+    let p = Pool.create(4)!;
+    defer p.destroy();
+    @expect(p.size() == 4);
+    let f = p.submit(square, @as(i64, 12))!;
+    @expect(f.join() == 144);
+    // more jobs than the queue holds, joined in order
+    let n: usize = 3000;
+    let futs = mem.alloc.[*mut Future.[u64, u64]](n)!;
+    defer mem.free(futs);
+    for k in @as(usize, 0)..n {
+        futs[k] = p.submit(collatz, @as(u64, k) + 1)!;
+    }
+    let mut total: u64 = 0;
+    for k in @as(usize, 0)..n {
+        total += futs[k].join();
+    }
+    let mut want: u64 = 0;
+    for k in @as(usize, 0)..n {
+        want += collatz(@as(u64, k) + 1);
+    }
+    @expect(total == want);
+}
+
+test "fire and forget, then wait" {
+    let p = Pool.create(3)!;
+    let mut t = Tally.{ sum: 0 };
+    for _k in @as(usize, 0)..5000 {
+        p.run(add_to, &mut t)!;
+    }
+    p.wait();
+    @expect(@atomic_load(&t.sum) == 5000);
+    // destroy finishes what is queued
+    for _k in @as(usize, 0)..100 {
+        p.run(add_to, &mut t)!;
+    }
+    p.destroy();
+    @expect(@atomic_load(&t.sum) == 5100);
+}

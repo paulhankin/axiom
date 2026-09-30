@@ -13,7 +13,7 @@
 // Instant is monotonic: it never goes backwards, so use it to measure
 // intervals. Time is the real (wall-clock) time, which can jump when the
 // system clock is set. Dates use the proleptic Gregorian calendar, in UTC or
-// at a fixed offset from it; std/tz has time zones and local time.
+// at a fixed offset from it; std/time/tz has time zones and local time.
 //
 // The clocks use the Phalange host ABI (import module "phalange").
 // =============================================================================

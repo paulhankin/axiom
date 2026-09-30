@@ -13,7 +13,7 @@
 // so a stored hash cannot make verification allocate without limit.
 // =============================================================================
 
-import "../base64.ph" as base64;
+import "../encoding/base64.ph" as base64;
 import "../fmt.ph" as fmt;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/tz/testdata: TZif files of a few zones (copied from the
+"""Generates std/time/tz/testdata: TZif files of a few zones (copied from the
 system's time-zone database, which is in the public domain), TZif files
 holding only a POSIX TZ rule, and cases.txt with what Python's zoneinfo
 says of them.
@@ -15,7 +15,7 @@ import shutil
 import struct
 import zoneinfo
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'tz', 'testdata')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'time', 'tz', 'testdata')
 os.makedirs(root, exist_ok=True)
 ZONES = ['America/New_York', 'Europe/London', 'Europe/Dublin', 'Australia/Lord_Howe', 'Asia/Kolkata',
          'Pacific/Apia', 'America/Sao_Paulo', 'Africa/Casablanca', 'Asia/Tehran', 'Pacific/Chatham', 'UTC']

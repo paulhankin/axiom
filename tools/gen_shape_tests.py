@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generates std/shape/testdata/cases.txt: text shaped by HarfBuzz (through
-uharfbuzz), which std/shape's tests must reproduce glyph for glyph.
+"""Generates std/graphics/shape/testdata/cases.txt: text shaped by HarfBuzz (through
+uharfbuzz), which std/graphics/shape's tests must reproduce glyph for glyph.
 
     pip install uharfbuzz
     python3 tools/gen_shape_tests.py
@@ -18,7 +18,7 @@ import unicodedata
 
 import uharfbuzz as hb
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'shape', 'testdata', 'cases.txt')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'graphics', 'shape', 'testdata', 'cases.txt')
 
 DEJAVU = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 DEJAVU_SERIF = '/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf'

@@ -1,109 +1,170 @@
 # Phalange standard library
 
-Import with `import "std/<module>" as <name>;`. Memory comes from the global allocator
-in `mem`; nothing allocates behind your back (a function that allocates returns `!T`,
-and a type that owns memory has `deinit`).
+Import with `import "std/<path>" as <name>;`, for example
+`import "std/collections/vec" as vec;`. The core modules are at the top of `std/`; the
+rest are grouped in subdirectories. Memory comes from the global allocator in `mem`;
+nothing allocates behind your back (a function that allocates returns `!T`, and a type
+that owns memory has `deinit`).
+
+## Core
 
 | Module | Contents |
 |---|---|
 | [`mem`](mem.ph) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `create(v)` / `destroy(p)`, `in_use()`; under `--sanitize=address`, shadow memory, quarantine and leak reports (`leaks_ignored`) |
-| [`vec`](vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
-| [`arena`](arena.ph) | `Arena`: bump allocation freed all at once (`bytes`, `dup`, `copy[T]`), for parsed documents |
-| [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
-| [`xxhash`](xxhash.ph) | XXH32 and XXH64, one-shot and streaming (the checksums of LZ4 and Zstandard) |
-| [`map`](map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
-| [`set`](set.ph) | `Set[K]`: hash set with union, intersection and difference in place |
-| [`treemap`](treemap.ph) | `TreeMap[K, V]`: ordered map (AVL tree): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
-| [`deque`](deque.ph) | `Deque[T]`: double-ended queue on a ring buffer |
-| [`heap`](heap.ph) | `Heap[T]`: priority queue (binary heap), built from a slice in linear time |
-| [`bitset`](bitset.ph) | `BitSet`: fixed-size sets of bits, `next_set`/`next_clear`, union/intersection |
-| [`rand`](rand.ph) | Seedable pseudo-random numbers (xoshiro256\*\*): integers in ranges without bias, floats, normal, exponential, Poisson and weighted choices, `shuffle`, `choose`, `jump` for parallel streams; not for secrets (see `crypto/random`) |
-| [`matrix`](matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
-| [`linalg`](linalg.ph) | Linear algebra on `Matrix[f64]`: LU with partial pivoting (`solve`, `det`, `inverse`), Cholesky, Householder QR and least squares (`lstsq`), symmetric eigenproblems (Jacobi), the SVD (one-sided Jacobi), `rank`, `cond`, `norm`, `trace`. Checked against NumPy |
-| [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
-| [`path`](path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |
-| [`fs`](fs.ph) | The file system: `read_file`, `write_file`, `append_file`, `copy_file`; `stat`/`lstat` (`Info`: kind, size, modification time, mode), `exists`; `mkdir`, `mkdir_all`, `remove`, `remove_all`, `rename`; `read_dir` (sorted), `walk`, `glob`; `cwd`, `absolute`, `temp_dir`, `make_temp_dir`; `chmod`, `symlink`, `read_link`, `hard_link`, `set_times`, `truncate`, `sync`; advisory locks (`lock`, `try_lock`, `unlock`; not on node); `map` (memory-mapped files, or a copy written back where mapping is impossible); `Watcher` (inotify, or `fs.watch` on node) |
-| [`os`](os.ph) | The process: `args`/`arg`/`arg_count`, `getenv`/`has_env`/`setenv`/`unsetenv`/`environ`, `pid`, `cwd`/`chdir`, signals (`signal_catch`/`ignore`/`default`, `signal_poll`, `signal_wait`; not on the node host), `exit` |
-| [`process`](process.ph) | Child processes: `Command` (arguments, environment changes, directory, each stream inherited, piped or `/dev/null`), `spawn` → `Child` (`Pipe`s with readers and writers, `wait`, `try_wait`, `kill`), `output` (captured without deadlock), `status`, `run` |
-| [`cli`](cli.ph) | Command-line parsing, GNU style: flags and options (bundled short ones, `--name=value`, unique prefixes, `--`), positionals (optional, required, many), subcommands, typed getters, generated `help`, precise error messages |
-| [`term`](term.ph) | Terminals: `is_tty`, `size`, raw mode, `color_enabled` (`NO_COLOR`, `FORCE_COLOR`, `TERM`), `Style` (attributes; basic, 256 and RGB colours), cursor and screen control, `decode_key` (arrows, function keys, modifiers, UTF-8) |
-| [`log`](log.ph) | Structured logging: levels (`DEBUG`, `INFO`, `WARN`, `ERROR`), typed key-value fields, text (logfmt) or JSON lines, `Logger` with its own fields (`with`), a default logger (`log.info(...)`, `set_level`, `level_from_env`), size-rotated log files (`open_file`); whole lines, safe across threads |
-| [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
-| [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `Condvar` (with timeouts), `RwLock` (writer-preferring), `Semaphore`, `Once`, `Barrier`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
-| [`pool`](pool.ph) | A thread pool: `submit(f, arg)` → `Future[A, R]` (`join`, `done`), fire-and-forget `run`, `wait` for all |
-| [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
-| [`net`](net.ph) | Sockets: TCP (`connect`, `listen` by name; `connect_addr`, `listen_addr`; local and peer addresses), UDP (`UdpSocket`), Unix sockets; `Addr` (IPv4 and IPv6, parsing and RFC 5952 formatting), `resolve`; `Poller` (readiness of many sockets, for event loops); timeouts |
-| [`dns`](dns.ph) | A DNS client: `Resolver` (the system's servers, public ones, or any), `query` for any record type (A, AAAA, CNAME, NS, PTR, MX, TXT, SRV, SOA) with decoded fields, `lookup_ip`, `reverse`; EDNS0, TCP after truncation, forged-reply and hostile-packet resistance |
 | [`str`](str.ph) | Strings as `[]u8`: comparison, search, `trim`, `cut`, `split` / `lines` / `fields` iterators, ASCII case, `join` / `replace`, UTF-8 (`decode_rune`, `encode_rune`, `valid_utf8`, `runes`); `String`, a growable string with a `Writer` |
+| [`fmt`](fmt.ph) | Templates: `fmt.print("{} is {:>5.2}\n", [fmt.str(s), fmt.float(x)])`, also `write`, `alloc`, `bufprint`; `parse_int[T]`, `parse_float` (correctly rounded), `format_float` (shortest round trip), `format_int` |
+| [`io`](io.ph) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
+| [`os`](os.ph) | The process: `args`/`arg`/`arg_count`, `getenv`/`has_env`/`setenv`/`unsetenv`/`environ`, `pid`, `cwd`/`chdir`, signals (`signal_catch`/`ignore`/`default`, `signal_poll`, `signal_wait`; not on the node host), `exit` |
+| [`c`](c.ph) | C interop helpers: `from_cstr`, `to_cstr`, `cstr_len`, `null_ptr`, `is_null`; the C↔Phalange type table |
+| [`log`](log.ph) | Structured logging: levels (`DEBUG`, `INFO`, `WARN`, `ERROR`), typed key-value fields, text (logfmt) or JSON lines, `Logger` with its own fields (`with`), a default logger (`log.info(...)`, `set_level`, `level_from_env`), size-rotated log files (`open_file`); whole lines, safe across threads |
+| [`hash`](hash.ph) | Hash and equality functions for integers and `[]u8` (`hash_u64`, `hash_bytes`, `eq_bytes`, …) |
+| [`hash/xxhash`](hash/xxhash.ph) | XXH32 and XXH64, one-shot and streaming (the checksums of LZ4 and Zstandard) |
 | [`unicode`](unicode.ph) | Unicode 15.1: general categories and other properties (`is_letter`, `is_space`, `combining_class`, bidi and line-break classes, ...), terminal display width (`width`, `string_width`), simple and full case mapping (`upper`, `lower`, `title`, `case_fold`, `equal_fold`), normalization (NFC, NFD, NFKC, NFKD; single steps `decompose_step`, `compose_step`), grapheme, word and sentence segmentation (UAX #29), UTF-16. Passes the UCD's conformance tests. The tables ([`unicode/tables`](unicode/tables.ph)) are generated by [`tools/gen_unicode.py`](../tools/gen_unicode.py) |
 | [`unicode/linebreak`](unicode/linebreak.ph), [`unicode/bidi`](unicode/bidi.ph) | Line breaking (UAX #14: break opportunities and mandatory breaks) and the bidirectional algorithm (UAX #9: embedding levels, line levels, visual order, mirroring); both pass the UCD conformance tests |
-| [`fmt`](fmt.ph) | Templates: `fmt.print("{} is {:>5.2}\n", [fmt.str(s), fmt.float(x)])`, also `write`, `alloc`, `bufprint`; `parse_int[T]`, `parse_float` (correctly rounded), `format_float` (shortest round trip), `format_int` |
-| [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`), RFC 3339 and HTTP dates, `sleep` |
-| [`tz`](tz.ph) | Time zones: TZif files (RFC 8536, v1–v4) from the system's database (`Zone.load`, safe names) or bytes, POSIX TZ rules, `Zone.local` (`$TZ`, `/etc/localtime`); `lookup` (offset, DST, abbreviation), `to_local`, and `from_local` with PEP 495 folds for repeated and skipped times. Checked against Python's `zoneinfo` ([`tz/testdata`](tz/testdata)) |
-| [`json`](json.ph) | `parse` → `Document` (a `Value` tree: `get`, `at`, `as_str`, `as_i64`, …); `Writer` (streaming, compact or pretty); `stringify` |
-| [`msgpack`](msgpack.ph) | MessagePack: `Value` (nil, bool, int64/uint64, float, str, bin, array, map with any keys, ext), `Timestamp` (extension -1), streaming `Writer` (smallest encodings; `json` writes a JSON value), `encode`, `decode`/`decode_prefix` (checked lengths, UTF-8 and depth, no recursion), `to_json`. Passes the msgpack-test-suite ([`msgpack/testdata`](msgpack/testdata), from [`tools/gen_binary_tests.py`](../tools/gen_binary_tests.py)) |
-| [`cbor`](cbor.ph) | CBOR (RFC 8949): `Value` (the whole data model: 65-bit integers, bytes, text, arrays, maps, tags, simple values, half/single/double floats), `Writer` (preferred serialization; indefinite lengths), `encode`, `encode_canonical` (sorted keys), strict `decode` (well-formedness, UTF-8, depth; CBOR sequences via `decode_prefix`), `diagnostic` notation, `to_json`. Passes RFC 8949 Appendix A ([`cbor/testdata`](cbor/testdata)) |
-| [`protobuf`](protobuf.ph) | Protocol Buffers wire format: `Encoder` (every scalar type, nested messages, packed fields), `Reader`/`Field` (typed accessors, `last`, `count`, packed `varints`/`fixed`, groups skipped), `decode_raw` (as `protoc --decode_raw`). Checked against the protobuf library's encoder and a real `FileDescriptorProto` ([`protobuf/testdata`](protobuf/testdata), from [`tools/gen_protobuf_tests.py`](../tools/gen_protobuf_tests.py)) |
-| [`toml`](toml.ph) | TOML 1.0.0: `parse` → `Document` (`Value`: strings, integers, floats, booleans, `DateTime` of four kinds, arrays, tables; `get`, `path("a.b")`, `at`, typed accessors), `stringify`. Passes toml-test's 709 TOML 1.0 cases ([`toml/testdata`](toml/testdata), from [`tools/gen_toml_tests.py`](../tools/gen_toml_tests.py)) |
-| [`yaml`](yaml.ph) | YAML 1.2: `parse` / `parse_all` → `json.Value` trees (core schema: null, booleans, integers, floats, strings; anchors and aliases shared, with a size limit against alias bombs), `Events` (the libyaml-style event stream with tags, anchors and styles), `stringify` (block style). Passes all 402 cases of the yaml-test-suite ([`yaml/testdata`](yaml/testdata), from [`tools/gen_yaml_tests.py`](../tools/gen_yaml_tests.py)) |
-| [`xml`](xml.ph) | XML 1.0 with namespaces: `Reader` (pull tokens; UTF-8/UTF-16/Latin-1 input, internal DTD subset with entities and attribute defaults, expansion limits against billion laughs, no external entities), `parse` → `Document`/`Element` DOM (`attr`, `attr_ns`, `elements()`, `text_alloc`), `Writer` (pretty printing), `escape_text`/`escape_attr`, `canonicalize` (C14N). Checked against libxml2 on an 88-case corpus ([`xml/testdata`](xml/testdata), from [`tools/gen_xml_tests.py`](../tools/gen_xml_tests.py)) |
-| [`html`](html.ph) | HTML per the WHATWG Living Standard: `parse` / `parse_fragment` / `parse_bytes` (UTF-16 and windows-1252 sniffing) → `Document` (numbered nodes with parent/child/sibling links; `root`, `head`, `body`, `title`, `find`, `children`, `walk`, `attr`, `text_content`; editing with `create_element`, `set_attr`, `append_child`, `insert_before`, `remove`, `clone_tree`), CSS selectors (`query`, `query_all`, `matches`, `compile`), serialization (`to_html`, `inner_html`, `escape`), and the `Tokenizer` alone. Passes all 1,792 html5lib-tests tree construction cases and all 7,028 tokenizer cases ([`html/testdata`](html/testdata), from [`tools/gen_html_tests.py`](../tools/gen_html_tests.py)); linear time on hostile input. [`html/entities.ph`](html/entities.ph) holds the named character references (from [`tools/gen_entities.py`](../tools/gen_entities.py)) |
-| [`csv`](csv.ph) | CSV (RFC 4180): a `Reader` of records (quoted fields with delimiters, quotes and line breaks; other delimiters, comments, trimming, lazy quotes, a field limit) and a `Writer` that quotes only when needed |
-| [`ini`](ini.ph) | INI files: sections, `key = value` / `key: value`, comments, continuation lines; case-insensitive lookups with typed getters; a `Writer` |
-| [`markdown`](markdown.ph) | Markdown: CommonMark 0.31.2 (passes all 652 specification examples) with the GitHub extensions (tables, strikethrough, extended autolinks, task lists, tag filter); `parse` → `Document` (a tree of nodes with `walk`, `text`, `url`, `plain_text`), `to_html`. Safe for untrusted input by default (raw HTML omitted, dangerous URLs dropped), linear time on hostile input. Entities from [`tools/gen_entities.py`](../tools/gen_entities.py) |
-| [`http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies (HTTPS with `server_tls` / `Router.serve_tls`), `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`) for `http://` and `https://` URLs; percent-encoding; HTTP/2 served to clients that ask (ALPN `h2`, or the preface), and requested with `ClientOptions.with_http2` |
-| [`websocket`](websocket.ph) | WebSocket (RFC 6455): `connect` (ws://, wss://), `accept` in an `http` handler; text, binary, ping, close; fragmentation, automatic pongs, strict validation (masking, UTF-8, close codes, message size) |
-| [`http2`](http2.ph) | HTTP/2 (RFC 9113): `Conn` (framing, streams, flow control, settings, ping, goaway; strict checks and limits), `Client` for requests over any connection |
-| [`hpack`](hpack.ph) | HPACK (RFC 7541): `Encoder` and `Decoder` with dynamic tables and Huffman coding; byte-for-byte as Python's hpack ([`hpack/testdata`](hpack/testdata)) |
-| [`tls`](tls.ph) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
-| [`deflate`](deflate.ph) | Compression and decompression: DEFLATE in the raw, zlib and gzip formats (levels 0–9, output within a fraction of a percent of zlib's size), whole-buffer (`compress`, `decompress`) or streaming (`Compressor` as an `io.Writer`, `Decompressor` as an `io.Reader`); `crc32`, `adler32` |
-| [`lz4`](lz4.ph) | LZ4: `decompress` (frames with any block size, linked blocks, checksums, content sizes; skippable and legacy frames; size-limited), `compress` (frames; levels 1–12 with hash chains), raw `compress_block`/`decompress_block`. Checked against the lz4 library ([`lz4/testdata`](lz4/testdata), from [`tools/gen_compress_tests.py`](../tools/gen_compress_tests.py)) |
-| [`bzip2`](bzip2.ph) | bzip2: `decompress` (concatenated streams, block and stream CRCs, size-limited), `compress` (block sizes 1–9: RLE, BWT by prefix doubling, MTF, multi-table Huffman; output as small as bzip2's). Checked against the bz2 library and the bzip2 tool ([`bzip2/testdata`](bzip2/testdata)) |
-| [`xz`](xz.ph) | xz and LZMA: `decompress` (.xz streams, concatenated and padded; every block and index record checked; CRC-32/CRC-64/SHA-256; LZMA2 with the delta and BCJ filters for x86, ARM, ARM-Thumb, ARM64, PowerPC and SPARC), `decompress_lzma` (.lzma), `decompress_lzma2`; `compress`/`compress_lzma` (an LZMA encoder with hash chains, repeat matches and lazy parsing, levels 1–9); `crc64`. Checked against liblzma and the xz tool ([`xz/testdata`](xz/testdata)) |
-| [`zstd`](zstd.ph) | Zstandard (RFC 8878): `decompress` (frames and skippable frames; raw, RLE and compressed blocks; Huffman literals with direct or FSE-coded trees; FSE sequences in all table modes; repeat offsets; XXH64 checksums; size-limited), `compress` (levels 1–19: hash chains with repeat offsets and lazy matching, Huffman literals, FSE tables fitted per block; smaller than the reference at levels 1–3). Checked against the zstd library ([`zstd/testdata`](zstd/testdata)) |
-| [`brotli`](brotli.ph) | Brotli (RFC 7932): `decompress` (all block, context and distance modes; the static dictionary with its 121 transforms; size-limited), `compress` (qualities 1–11: hash chains with the last distance tried first, per-meta-block prefix codes, stored when that is smaller). Checked against the brotli library ([`brotli/testdata`](brotli/testdata)) |
-| [`zip`](zip.ph) | ZIP archives: `Archive.open` (central directory, ZIP64, comments, UTF-8 names), `extract` (stored and deflated; CRC and declared sizes enforced, so no zip bombs), `extract_all` (refuses zip-slip names and links), `safe_name`; `Writer` (deflate or store, Unix modes and times, ZIP64 when needed). Checked against Python's zipfile ([`zip/testdata`](zip/testdata), from [`tools/gen_archive_tests.py`](../tools/gen_archive_tests.py)) |
-| [`tar`](tar.ph) | tar archives: `Reader` (ustar with prefixes, pax extended and global headers, GNU long names and base-256 numbers, checksums verified), `extract_all` (safe names only), `Writer` (ustar, with pax records for long or non-ASCII names, big sizes and negative times). Checked against Python's tarfile in all three formats ([`tar/testdata`](tar/testdata)) |
-| [`base64`](base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets |
-| [`base32`](base32.ph) | Base32 (RFC 4648), standard and extended-hex alphabets, padded or not |
-| [`hex`](hex.ph) | Hexadecimal encoding and decoding; `xxd`-style hex dumps |
-| [`mime`](mime.ph) | Media types by extension, `Content-Type` parsing, header parameters (quoted strings, RFC 2231 `name*`), quoted-printable, multipart bodies (`Multipart` reader, `MultipartWriter` for form-data) |
-| [`math`](math.ph) | Elementary functions on `f64` (and `f32`, suffixed `f`): `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `pow`, `cbrt`, `hypot`, `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `ldexp`, `frexp`; the special functions `erf`, `erfc`, `gamma`, `lgamma`; constants. Within 1 ulp (2 for `tan`, `expm1`, `sinh`, `tanh`; 2–8 for the special functions), trigonometry of huge arguments included |
-| [`complex`](complex.ph) | `Complex` numbers on `f64`: arithmetic (Smith's division), `abs`, `arg`, `polar`, `exp`, `log`, `sqrt`, `pow`, trigonometric and hyperbolic functions and their inverses on the principal branches of C99 (Kahan's formulas, signed zeros respected); `format`. Checked against Python's `cmath` |
-| [`fft`](fft.ph) | Fast Fourier transforms of any length in O(n log n): radix-2, and Bluestein's algorithm otherwise; `forward`, `inverse`, reusable `Plan`s, real `rfft`/`irfft`, `convolve` |
-| [`stats`](stats.ph) | Statistics on `[]f64`: compensated `sum`, `mean`, sample and population variance and deviation, `median`, `quantile` (R/NumPy's default), geometric and harmonic means, `covariance`, Pearson and Spearman correlation, `ranks`, `linear_regression`, `histogram`; one-pass `Running` statistics (Welford, mergeable); the normal `pdf`, `cdf`, `sf` and `quantile` |
-| [`color`](color.ph) | `Color` (linear-light RGB + alpha, HDR-capable), `Rgba8`/`Rgba16` (sRGB-encoded); sRGB encoding (exact 8-bit tables), HSV, HSL, CIE XYZ, L\*a\*b\*, LCh, Oklab, Oklch, YCbCr; Display P3 and Rec. 2020 gamuts; PQ and HLG transfer functions, tone mapping; CIE76 / CIEDE2000 differences, WCAG contrast; `mix`, `over`, premultiplied alpha; CSS-style parsing and hex formatting |
-| [`image`](image.ph) | `Image`: 1–4 channels of U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
-| [`draw`](draw.ph) | 2D vector drawing onto an `Image`: `Path` (lines, quadratic and cubic Béziers, arcs, rectangles, rounded rectangles, ellipses), `Canvas` with affine transforms, fills (nonzero, even-odd), strokes (width, miter/round/bevel joins, butt/round/square caps, dashes), paints (solid, linear and radial gradients, images), Porter-Duff operators and blend modes in linear light, global alpha, clipping, save/restore; exact anti-aliasing |
-| [`font`](font.ph) | TrueType and OpenType (CFF) fonts and collections: `Font` (cmap formats 0/4/6/12, advances, GPOS and `kern` kerning, simple, composite and Type 2 charstring outlines as `draw.Path`s), text `layout` with word wrapping, `measure`, `draw_text`, `draw_text_box` (one glyph per character: `shape` shapes); unhinted; HarfBuzz-compatible `glyph_extents` |
-| [`shape`](shape.ph) | OpenType text shaping, a port of HarfBuzz's: GSUB (all lookup types: ligatures, contextual and chained substitution, reverse chaining) and GPOS (kerning, mark-to-base/ligature/mark, cursive attachment) with the feature map, stages and mark filtering; normalization against the font's cmap; shapers for Arabic and Syriac (joining, stretching, presentation-form fallback), Hebrew, and Indic scripts (syllables, reph, pre-base matras and forms, from HarfBuzz's own tables); fallback mark positioning; `Shaper` caches plans. Matches HarfBuzz glyph for glyph on the test fonts (Latin, Arabic, Hebrew, nine Indic scripts, CFF and fonts without GPOS). Tables from [`tools/gen_shape_tables.py`](../tools/gen_shape_tables.py), tests from [`tools/gen_shape_tests.py`](../tools/gen_shape_tests.py) |
-| [`text`](text.ph) | Rich text layout: styled spans (font, fallback fonts, size, colour, underline, strike-through, letter spacing), UAX #14 line breaking with grapheme-safe emergency breaks, bidirectional text, shaping (std/shape, per run of one font, style, level and script; lines reshaped as placed), OpenType feature settings, tabs, alignment (start, end, left, right, centre, justify), line spacing; `Layout` with glyph and line positions, hit testing (`offset_at`), `draw` onto a canvas, `measure` |
-| [`pdf`](pdf.ph) | Writing PDF: pages of vector graphics (`draw.Path`s filled and stroked with solid colours, alpha and linear/radial gradients; clipping; transforms), text in embedded TrueType (subset) and OpenType CFF fonts with ToUnicode maps, `draw_layout` for `text.Layout`s, images (Flate with soft-mask alpha, or JPEG as is), links, bookmarks, metadata; compressed |
-| [`pdf/read`](pdf/read.ph) | Reading PDF: cross-reference tables and streams, object streams, incremental updates, repair of damaged files; objects and decoded streams (Flate with predictors, LZW, ASCIIHex, ASCII85, RunLength); pages, metadata, and text extraction (ToUnicode maps, simple-font encodings and glyph names, layout into lines and words). Hardened against hostile files. Tables from [`tools/gen_pdf_tables.py`](../tools/gen_pdf_tables.py) |
-| [`audio`](audio.ph) | `Sound`: interleaved frames of U8, S16, S24, S32, F32 or F64 samples; `get`/`set` as floats, `convert` (exact integer ↔ float), `remix` (channel counts), `slice`, `gain`, `peak`, `resample` (Kaiser-windowed sinc, > 90 dB rejection) |
-| [`bigint`](bigint.ph) | `BigInt`: arbitrary-precision integers — arithmetic (Karatsuba multiplication), truncated and Euclidean division, shifts and bitwise operations, `pow`, `mod_pow` (Montgomery; `mod_pow_secret` in constant time), `gcd`, `mod_inverse`, `sqrt`, conversion to and from any base and bytes |
-| [`decimal`](decimal.ph) | `Decimal`: arbitrary-precision decimal numbers (a `BigInt` times a power of ten) — exact `add`, `sub`, `mul`; `div` and `sqrt` to a precision; `quantize`, `round`, `round_sig` with seven rounding modes; `cmp`, `normalize`; parsing and Python's string format; bounded against hostile exponents. Checked against Python's `decimal` ([`decimal/testdata`](decimal/testdata)) |
-| [`regex`](regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
-| [`diff`](diff.ph) | Differences between texts (or token sequences) by Myers's algorithm in linear space, minimal but bounded on pathological input as in GNU diff; `lines`, `tokens`, `unified` (byte-for-byte `diff -u` format, `\ No newline at end of file` included), `apply` (strict patching). Patches applied by GNU `patch` |
-| [`template`](template.ph) | Mustache templates over `json.Value` data: escaped and raw interpolation, dotted names, sections, inverted sections, comments, partials, set-delimiter tags, standalone-line rules; compile once and render often. Passes the 136 tests of the Mustache specification's required modules ([`template/testdata`](template/testdata)); safe for untrusted templates |
-| [`hyphen`](hyphen.ph) | Hyphenation by Liang's algorithm (TeX's): `Hyphenator` from patterns and exceptions in TeX's format (UTF-8), `breaks`, `hyphenate`; American English built in ([`hyphen/en_us.ph`](hyphen/en_us.ph), TeX's ushyphmax patterns). Checked against the TeXbook and a reference implementation ([`tools/gen_hyphen.py`](../tools/gen_hyphen.py)) |
 
-Image files are read and written by `std/image/`:
+## Collections
 
 | Module | Contents |
 |---|---|
-| [`image/formats`](image/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
-| [`image/png`](image/png.ph) | PNG: every colour type and bit depth, interlacing, transparency; writes 8/16-bit with per-row filters |
-| [`image/jpeg`](image/jpeg.ph) | JPEG: baseline and progressive, any sampling, restart markers, gray/YCbCr/RGB/CMYK/YCCK, output identical to libjpeg's; writes baseline with optimized Huffman tables |
-| [`image/bmp`](image/bmp.ph) | BMP: 1–32 bits, palettes, bit fields, RLE4/RLE8, all header versions |
-| [`image/qoi`](image/qoi.ph) | QOI |
-| [`image/pnm`](image/pnm.ph) | PBM, PGM, PPM (ASCII and binary), PAM, PFM (float) |
-| [`image/hdr`](image/hdr.ph) | Radiance RGBE (HDR) |
-| [`image/exr`](image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
-| [`image/gif`](image/gif.ph) | GIF 87a/89a: interlacing, transparency, animation (`decode_all` → frames composited with each disposal method, delays, loop count); writes single images and animations with median-cut palettes. Checked against files made by Pillow ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
-| [`image/tiff`](image/tiff.ph) | TIFF and BigTIFF, either byte order: strips or tiles, planar or not; none, LZW, Deflate, PackBits, CCITT fax (group 3 1D/2D, group 4), JPEG; both predictors; 1–64-bit integers and 16/32/64-bit floats; gray, RGB, palette, CMYK, YCbCr; associated or unassociated alpha; `page_count`, `decode_page`. Writes U8/U16/F32 pages with LZW, Deflate or PackBits. Checked against files from tifffile and libtiff ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
-| [`image/webp`](image/webp.ph) | WebP: lossy (VP8, [`webp/vp8.ph`](image/webp/vp8.ph): intra prediction, both loop filters, libwebp's fancy upsampling), lossless (VP8L: every transform, colour caches, meta prefix codes), alpha (each filter), animations composited as libwebp's `WebPAnimDecoder` does: pixels identical to libwebp's. Writes lossless stills and animations (palette or subtract-green and predictors, LZ77). Checked against files from libwebp ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
-| [`image/avif`](image/avif.ph) | AVIF (reading): the HEIF container (items in the file or `idat`, grids, alpha auxiliary images, `nclx` colour, clean aperture, rotation, mirroring) and an AV1 decoder of still (key and intra-only) frames ([`av1/`](image/av1/decode.ph)): every profile, 8/10/12 bits, 4:0:0/4:2:0/4:2:2/4:4:4, every intra coding tool (palettes, filter intra, CfL, intra edge filtering, quantizer matrices, delta q/lf, segmentation, lossless), deblocking, CDEF and loop restoration, following dav1d, whose planes it reproduces exactly (`decode_yuv`). RGB conversion by the matrix coefficients, full or limited range. Checked against files from libaom, rav1e and SVT-AV1 and libavif ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
+| [`collections/vec`](collections/vec.ph) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
+| [`collections/arena`](collections/arena.ph) | `Arena`: bump allocation freed all at once (`bytes`, `dup`, `copy[T]`), for parsed documents |
+| [`collections/map`](collections/map.ph) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
+| [`collections/set`](collections/set.ph) | `Set[K]`: hash set with union, intersection and difference in place |
+| [`collections/treemap`](collections/treemap.ph) | `TreeMap[K, V]`: ordered map (AVL tree): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
+| [`collections/deque`](collections/deque.ph) | `Deque[T]`: double-ended queue on a ring buffer |
+| [`collections/heap`](collections/heap.ph) | `Heap[T]`: priority queue (binary heap), built from a slice in linear time |
+| [`collections/bitset`](collections/bitset.ph) | `BitSet`: fixed-size sets of bits, `next_set`/`next_clear`, union/intersection |
+
+## Operating system
+
+`os` is the process itself; `std/os/` has the file system and the rest.
+
+| Module | Contents |
+|---|---|
+| [`os/path`](os/path.ph) | File paths as text: `join`, `clean`, `dir`, `base`, `ext`, `stem`, `with_ext`, `rel`, element iteration; glob matching (`*`, `?`, `[a-z]`, `**`) |
+| [`os/fs`](os/fs.ph) | The file system: `read_file`, `write_file`, `append_file`, `copy_file`; `stat`/`lstat` (`Info`: kind, size, modification time, mode), `exists`; `mkdir`, `mkdir_all`, `remove`, `remove_all`, `rename`; `read_dir` (sorted), `walk`, `glob`; `cwd`, `absolute`, `temp_dir`, `make_temp_dir`; `chmod`, `symlink`, `read_link`, `hard_link`, `set_times`, `truncate`, `sync`; advisory locks (`lock`, `try_lock`, `unlock`; not on node); `map` (memory-mapped files, or a copy written back where mapping is impossible); `Watcher` (inotify, or `fs.watch` on node) |
+| [`os/process`](os/process.ph) | Child processes: `Command` (arguments, environment changes, directory, each stream inherited, piped or `/dev/null`), `spawn` → `Child` (`Pipe`s with readers and writers, `wait`, `try_wait`, `kill`), `output` (captured without deadlock), `status`, `run` |
+| [`os/cli`](os/cli.ph) | Command-line parsing, GNU style: flags and options (bundled short ones, `--name=value`, unique prefixes, `--`), positionals (optional, required, many), subcommands, typed getters, generated `help`, precise error messages |
+| [`os/term`](os/term.ph) | Terminals: `is_tty`, `size`, raw mode, `color_enabled` (`NO_COLOR`, `FORCE_COLOR`, `TERM`), `Style` (attributes; basic, 256 and RGB colours), cursor and screen control, `decode_key` (arrows, function keys, modifiers, UTF-8) |
+
+## Concurrency
+
+| Module | Contents |
+|---|---|
+| [`thread`](thread.ph) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
+| [`sync`](sync.ph) | `Atomic[T: Int]`, `Mutex`, `Condvar` (with timeouts), `RwLock` (writer-preferring), `Semaphore`, `Once`, `Barrier`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
+| [`thread/pool`](thread/pool.ph) | A thread pool: `submit(f, arg)` → `Future[A, R]` (`join`, `done`), fire-and-forget `run`, `wait` for all |
+
+## Time
+
+| Module | Contents |
+|---|---|
+| [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`), RFC 3339 and HTTP dates, `sleep` |
+| [`time/tz`](time/tz.ph) | Time zones: TZif files (RFC 8536, v1–v4) from the system's database (`Zone.load`, safe names) or bytes, POSIX TZ rules, `Zone.local` (`$TZ`, `/etc/localtime`); `lookup` (offset, DST, abbreviation), `to_local`, and `from_local` with PEP 495 folds for repeated and skipped times. Checked against Python's `zoneinfo` ([`time/tz/testdata`](time/tz/testdata)) |
+
+## Networking
+
+| Module | Contents |
+|---|---|
+| [`net`](net.ph) | Sockets: TCP (`connect`, `listen` by name; `connect_addr`, `listen_addr`; local and peer addresses), UDP (`UdpSocket`), Unix sockets; `Addr` (IPv4 and IPv6, parsing and RFC 5952 formatting), `resolve`; `Poller` (readiness of many sockets, for event loops); timeouts |
+| [`net/dns`](net/dns.ph) | A DNS client: `Resolver` (the system's servers, public ones, or any), `query` for any record type (A, AAAA, CNAME, NS, PTR, MX, TXT, SRV, SOA) with decoded fields, `lookup_ip`, `reverse`; EDNS0, TCP after truncation, forged-reply and hostile-packet resistance |
+| [`net/http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies (HTTPS with `server_tls` / `Router.serve_tls`), `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`) for `http://` and `https://` URLs; percent-encoding; HTTP/2 served to clients that ask (ALPN `h2`, or the preface), and requested with `ClientOptions.with_http2` |
+| [`net/websocket`](net/websocket.ph) | WebSocket (RFC 6455): `connect` (ws://, wss://), `accept` in an `http` handler; text, binary, ping, close; fragmentation, automatic pongs, strict validation (masking, UTF-8, close codes, message size) |
+| [`net/http2`](http2.ph) | HTTP/2 (RFC 9113): `Conn` (framing, streams, flow control, settings, ping, goaway; strict checks and limits), `Client` for requests over any connection |
+| [`net/hpack`](net/hpack.ph) | HPACK (RFC 7541): `Encoder` and `Decoder` with dynamic tables and Huffman coding; byte-for-byte as Python's hpack ([`net/hpack/testdata`](net/hpack/testdata)) |
+| [`net/tls`](net/tls.ph) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
+
+## Encodings and data formats
+
+| Module | Contents |
+|---|---|
+| [`encoding/json`](encoding/json.ph) | `parse` → `Document` (a `Value` tree: `get`, `at`, `as_str`, `as_i64`, …); `Writer` (streaming, compact or pretty); `stringify` |
+| [`encoding/msgpack`](encoding/msgpack.ph) | MessagePack: `Value` (nil, bool, int64/uint64, float, str, bin, array, map with any keys, ext), `Timestamp` (extension -1), streaming `Writer` (smallest encodings; `json` writes a JSON value), `encode`, `decode`/`decode_prefix` (checked lengths, UTF-8 and depth, no recursion), `to_json`. Passes the msgpack-test-suite ([`encoding/msgpack/testdata`](encoding/msgpack/testdata), from [`tools/gen_binary_tests.py`](../tools/gen_binary_tests.py)) |
+| [`encoding/cbor`](encoding/cbor.ph) | CBOR (RFC 8949): `Value` (the whole data model: 65-bit integers, bytes, text, arrays, maps, tags, simple values, half/single/double floats), `Writer` (preferred serialization; indefinite lengths), `encode`, `encode_canonical` (sorted keys), strict `decode` (well-formedness, UTF-8, depth; CBOR sequences via `decode_prefix`), `diagnostic` notation, `to_json`. Passes RFC 8949 Appendix A ([`encoding/cbor/testdata`](encoding/cbor/testdata)) |
+| [`encoding/protobuf`](encoding/protobuf.ph) | Protocol Buffers wire format: `Encoder` (every scalar type, nested messages, packed fields), `Reader`/`Field` (typed accessors, `last`, `count`, packed `varints`/`fixed`, groups skipped), `decode_raw` (as `protoc --decode_raw`). Checked against the protobuf library's encoder and a real `FileDescriptorProto` ([`encoding/protobuf/testdata`](encoding/protobuf/testdata), from [`tools/gen_protobuf_tests.py`](../tools/gen_protobuf_tests.py)) |
+| [`encoding/toml`](encoding/toml.ph) | TOML 1.0.0: `parse` → `Document` (`Value`: strings, integers, floats, booleans, `DateTime` of four kinds, arrays, tables; `get`, `path("a.b")`, `at`, typed accessors), `stringify`. Passes toml-test's 709 TOML 1.0 cases ([`encoding/toml/testdata`](encoding/toml/testdata), from [`tools/gen_toml_tests.py`](../tools/gen_toml_tests.py)) |
+| [`encoding/yaml`](encoding/yaml.ph) | YAML 1.2: `parse` / `parse_all` → `json.Value` trees (core schema: null, booleans, integers, floats, strings; anchors and aliases shared, with a size limit against alias bombs), `Events` (the libyaml-style event stream with tags, anchors and styles), `stringify` (block style). Passes all 402 cases of the yaml-test-suite ([`encoding/yaml/testdata`](encoding/yaml/testdata), from [`tools/gen_yaml_tests.py`](../tools/gen_yaml_tests.py)) |
+| [`encoding/xml`](encoding/xml.ph) | XML 1.0 with namespaces: `Reader` (pull tokens; UTF-8/UTF-16/Latin-1 input, internal DTD subset with entities and attribute defaults, expansion limits against billion laughs, no external entities), `parse` → `Document`/`Element` DOM (`attr`, `attr_ns`, `elements()`, `text_alloc`), `Writer` (pretty printing), `escape_text`/`escape_attr`, `canonicalize` (C14N). Checked against libxml2 on an 88-case corpus ([`encoding/xml/testdata`](encoding/xml/testdata), from [`tools/gen_xml_tests.py`](../tools/gen_xml_tests.py)) |
+| [`encoding/csv`](encoding/csv.ph) | CSV (RFC 4180): a `Reader` of records (quoted fields with delimiters, quotes and line breaks; other delimiters, comments, trimming, lazy quotes, a field limit) and a `Writer` that quotes only when needed |
+| [`encoding/ini`](encoding/ini.ph) | INI files: sections, `key = value` / `key: value`, comments, continuation lines; case-insensitive lookups with typed getters; a `Writer` |
+| [`encoding/base64`](encoding/base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets |
+| [`encoding/base32`](encoding/base32.ph) | Base32 (RFC 4648), standard and extended-hex alphabets, padded or not |
+| [`encoding/hex`](encoding/hex.ph) | Hexadecimal encoding and decoding; `xxd`-style hex dumps |
+| [`encoding/mime`](encoding/mime.ph) | Media types by extension, `Content-Type` parsing, header parameters (quoted strings, RFC 2231 `name*`), quoted-printable, multipart bodies (`Multipart` reader, `MultipartWriter` for form-data) |
+
+## Text
+
+| Module | Contents |
+|---|---|
+| [`text/regex`](text/regex.ph) | Linear-time regular expressions (RE2 syntax): `find`, `captures` (named groups), `find_all`, `replace_all`; a lazy DFA with a Pike VM for captures |
+| [`text/diff`](text/diff.ph) | Differences between texts (or token sequences) by Myers's algorithm in linear space, minimal but bounded on pathological input as in GNU diff; `lines`, `tokens`, `unified` (byte-for-byte `diff -u` format, `\ No newline at end of file` included), `apply` (strict patching). Patches applied by GNU `patch` |
+| [`text/template`](text/template.ph) | Mustache templates over `json.Value` data: escaped and raw interpolation, dotted names, sections, inverted sections, comments, partials, set-delimiter tags, standalone-line rules; compile once and render often. Passes the 136 tests of the Mustache specification's required modules ([`text/template/testdata`](text/template/testdata)); safe for untrusted templates |
+| [`text/hyphen`](text/hyphen.ph) | Hyphenation by Liang's algorithm (TeX's): `Hyphenator` from patterns and exceptions in TeX's format (UTF-8), `breaks`, `hyphenate`; American English built in ([`hyphen/en_us.ph`](text/hyphen/en_us.ph), TeX's ushyphmax patterns). Checked against the TeXbook and a reference implementation ([`tools/gen_hyphen.py`](../tools/gen_hyphen.py)) |
+| [`text/html`](text/html.ph) | HTML per the WHATWG Living Standard: `parse` / `parse_fragment` / `parse_bytes` (UTF-16 and windows-1252 sniffing) → `Document` (numbered nodes with parent/child/sibling links; `root`, `head`, `body`, `title`, `find`, `children`, `walk`, `attr`, `text_content`; editing with `create_element`, `set_attr`, `append_child`, `insert_before`, `remove`, `clone_tree`), CSS selectors (`query`, `query_all`, `matches`, `compile`), serialization (`to_html`, `inner_html`, `escape`), and the `Tokenizer` alone. Passes all 1,792 html5lib-tests tree construction cases and all 7,028 tokenizer cases ([`text/html/testdata`](text/html/testdata), from [`tools/gen_html_tests.py`](../tools/gen_html_tests.py)); linear time on hostile input. [`html/entities.ph`](text/html/entities.ph) holds the named character references (from [`tools/gen_entities.py`](../tools/gen_entities.py)) |
+| [`text/markdown`](text/markdown.ph) | Markdown: CommonMark 0.31.2 (passes all 652 specification examples) with the GitHub extensions (tables, strikethrough, extended autolinks, task lists, tag filter); `parse` → `Document` (a tree of nodes with `walk`, `text`, `url`, `plain_text`), `to_html`. Safe for untrusted input by default (raw HTML omitted, dangerous URLs dropped), linear time on hostile input. Entities from [`tools/gen_entities.py`](../tools/gen_entities.py) |
+
+## Compression and archives
+
+| Module | Contents |
+|---|---|
+| [`compress/deflate`](compress/deflate.ph) | Compression and decompression: DEFLATE in the raw, zlib and gzip formats (levels 0–9, output within a fraction of a percent of zlib's size), whole-buffer (`compress`, `decompress`) or streaming (`Compressor` as an `io.Writer`, `Decompressor` as an `io.Reader`); `crc32`, `adler32` |
+| [`compress/lz4`](compress/lz4.ph) | LZ4: `decompress` (frames with any block size, linked blocks, checksums, content sizes; skippable and legacy frames; size-limited), `compress` (frames; levels 1–12 with hash chains), raw `compress_block`/`decompress_block`. Checked against the lz4 library ([`compress/lz4/testdata`](compress/lz4/testdata), from [`tools/gen_compress_tests.py`](../tools/gen_compress_tests.py)) |
+| [`compress/bzip2`](compress/bzip2.ph) | bzip2: `decompress` (concatenated streams, block and stream CRCs, size-limited), `compress` (block sizes 1–9: RLE, BWT by prefix doubling, MTF, multi-table Huffman; output as small as bzip2's). Checked against the bz2 library and the bzip2 tool ([`compress/bzip2/testdata`](compress/bzip2/testdata)) |
+| [`compress/xz`](compress/xz.ph) | xz and LZMA: `decompress` (.xz streams, concatenated and padded; every block and index record checked; CRC-32/CRC-64/SHA-256; LZMA2 with the delta and BCJ filters for x86, ARM, ARM-Thumb, ARM64, PowerPC and SPARC), `decompress_lzma` (.lzma), `decompress_lzma2`; `compress`/`compress_lzma` (an LZMA encoder with hash chains, repeat matches and lazy parsing, levels 1–9); `crc64`. Checked against liblzma and the xz tool ([`compress/xz/testdata`](compress/xz/testdata)) |
+| [`compress/zstd`](compress/zstd.ph) | Zstandard (RFC 8878): `decompress` (frames and skippable frames; raw, RLE and compressed blocks; Huffman literals with direct or FSE-coded trees; FSE sequences in all table modes; repeat offsets; XXH64 checksums; size-limited), `compress` (levels 1–19: hash chains with repeat offsets and lazy matching, Huffman literals, FSE tables fitted per block; smaller than the reference at levels 1–3). Checked against the zstd library ([`compress/zstd/testdata`](compress/zstd/testdata)) |
+| [`compress/brotli`](compress/brotli.ph) | Brotli (RFC 7932): `decompress` (all block, context and distance modes; the static dictionary with its 121 transforms; size-limited), `compress` (qualities 1–11: hash chains with the last distance tried first, per-meta-block prefix codes, stored when that is smaller). Checked against the brotli library ([`compress/brotli/testdata`](compress/brotli/testdata)) |
+| [`archive/zip`](archive/zip.ph) | ZIP archives: `Archive.open` (central directory, ZIP64, comments, UTF-8 names), `extract` (stored and deflated; CRC and declared sizes enforced, so no zip bombs), `extract_all` (refuses zip-slip names and links), `safe_name`; `Writer` (deflate or store, Unix modes and times, ZIP64 when needed). Checked against Python's zipfile ([`archive/zip/testdata`](archive/zip/testdata), from [`tools/gen_archive_tests.py`](../tools/gen_archive_tests.py)) |
+| [`archive/tar`](archive/tar.ph) | tar archives: `Reader` (ustar with prefixes, pax extended and global headers, GNU long names and base-256 numbers, checksums verified), `extract_all` (safe names only), `Writer` (ustar, with pax records for long or non-ASCII names, big sizes and negative times). Checked against Python's tarfile in all three formats ([`archive/tar/testdata`](archive/tar/testdata)) |
+
+## Mathematics
+
+| Module | Contents |
+|---|---|
+| [`math`](math.ph) | Elementary functions on `f64` (and `f32`, suffixed `f`): `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `pow`, `cbrt`, `hypot`, `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `ldexp`, `frexp`; the special functions `erf`, `erfc`, `gamma`, `lgamma`; constants. Within 1 ulp (2 for `tan`, `expm1`, `sinh`, `tanh`; 2–8 for the special functions), trigonometry of huge arguments included |
+| [`math/complex`](math/complex.ph) | `Complex` numbers on `f64`: arithmetic (Smith's division), `abs`, `arg`, `polar`, `exp`, `log`, `sqrt`, `pow`, trigonometric and hyperbolic functions and their inverses on the principal branches of C99 (Kahan's formulas, signed zeros respected); `format`. Checked against Python's `cmath` |
+| [`math/fft`](math/fft.ph) | Fast Fourier transforms of any length in O(n log n): radix-2, and Bluestein's algorithm otherwise; `forward`, `inverse`, reusable `Plan`s, real `rfft`/`irfft`, `convolve` |
+| [`math/stats`](math/stats.ph) | Statistics on `[]f64`: compensated `sum`, `mean`, sample and population variance and deviation, `median`, `quantile` (R/NumPy's default), geometric and harmonic means, `covariance`, Pearson and Spearman correlation, `ranks`, `linear_regression`, `histogram`; one-pass `Running` statistics (Welford, mergeable); the normal `pdf`, `cdf`, `sf` and `quantile` |
+| [`math/matrix`](math/matrix.ph) | `Matrix[T: Num]` (heap, row-major); `Mat4` (4×4 `f32` on `f32x4` columns); SIMD `dot`, `axpy` |
+| [`math/linalg`](math/linalg.ph) | Linear algebra on `Matrix[f64]`: LU with partial pivoting (`solve`, `det`, `inverse`), Cholesky, Householder QR and least squares (`lstsq`), symmetric eigenproblems (Jacobi), the SVD (one-sided Jacobi), `rank`, `cond`, `norm`, `trace`. Checked against NumPy |
+| [`math/bigint`](math/bigint.ph) | `BigInt`: arbitrary-precision integers — arithmetic (Karatsuba multiplication), truncated and Euclidean division, shifts and bitwise operations, `pow`, `mod_pow` (Montgomery; `mod_pow_secret` in constant time), `gcd`, `mod_inverse`, `sqrt`, conversion to and from any base and bytes |
+| [`math/decimal`](math/decimal.ph) | `Decimal`: arbitrary-precision decimal numbers (a `BigInt` times a power of ten) — exact `add`, `sub`, `mul`; `div` and `sqrt` to a precision; `quantize`, `round`, `round_sig` with seven rounding modes; `cmp`, `normalize`; parsing and Python's string format; bounded against hostile exponents. Checked against Python's `decimal` ([`math/decimal/testdata`](math/decimal/testdata)) |
+| [`math/rand`](math/rand.ph) | Seedable pseudo-random numbers (xoshiro256\*\*): integers in ranges without bias, floats, normal, exponential, Poisson and weighted choices, `shuffle`, `choose`, `jump` for parallel streams; not for secrets (see `crypto/random`) |
+
+## Graphics
+
+| Module | Contents |
+|---|---|
+| [`graphics/color`](graphics/color.ph) | `Color` (linear-light RGB + alpha, HDR-capable), `Rgba8`/`Rgba16` (sRGB-encoded); sRGB encoding (exact 8-bit tables), HSV, HSL, CIE XYZ, L\*a\*b\*, LCh, Oklab, Oklch, YCbCr; Display P3 and Rec. 2020 gamuts; PQ and HLG transfer functions, tone mapping; CIE76 / CIEDE2000 differences, WCAG contrast; `mix`, `over`, premultiplied alpha; CSS-style parsing and hex formatting |
+| [`graphics/image`](graphics/image.ph) | `Image`: 1–4 channels of U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
+| [`graphics/draw`](graphics/draw.ph) | 2D vector drawing onto an `Image`: `Path` (lines, quadratic and cubic Béziers, arcs, rectangles, rounded rectangles, ellipses), `Canvas` with affine transforms, fills (nonzero, even-odd), strokes (width, miter/round/bevel joins, butt/round/square caps, dashes), paints (solid, linear and radial gradients, images), Porter-Duff operators and blend modes in linear light, global alpha, clipping, save/restore; exact anti-aliasing |
+| [`graphics/font`](graphics/font.ph) | TrueType and OpenType (CFF) fonts and collections: `Font` (cmap formats 0/4/6/12, advances, GPOS and `kern` kerning, simple, composite and Type 2 charstring outlines as `draw.Path`s), text `layout` with word wrapping, `measure`, `draw_text`, `draw_text_box` (one glyph per character: `shape` shapes); unhinted; HarfBuzz-compatible `glyph_extents` |
+| [`graphics/shape`](graphics/shape.ph) | OpenType text shaping, a port of HarfBuzz's: GSUB (all lookup types: ligatures, contextual and chained substitution, reverse chaining) and GPOS (kerning, mark-to-base/ligature/mark, cursive attachment) with the feature map, stages and mark filtering; normalization against the font's cmap; shapers for Arabic and Syriac (joining, stretching, presentation-form fallback), Hebrew, and Indic scripts (syllables, reph, pre-base matras and forms, from HarfBuzz's own tables); fallback mark positioning; `Shaper` caches plans. Matches HarfBuzz glyph for glyph on the test fonts (Latin, Arabic, Hebrew, nine Indic scripts, CFF and fonts without GPOS). Tables from [`tools/gen_shape_tables.py`](../tools/gen_shape_tables.py), tests from [`tools/gen_shape_tests.py`](../tools/gen_shape_tests.py) |
+| [`graphics/text`](graphics/text.ph) | Rich text layout: styled spans (font, fallback fonts, size, colour, underline, strike-through, letter spacing), UAX #14 line breaking with grapheme-safe emergency breaks, bidirectional text, shaping (std/graphics/shape, per run of one font, style, level and script; lines reshaped as placed), OpenType feature settings, tabs, alignment (start, end, left, right, centre, justify), line spacing; `Layout` with glyph and line positions, hit testing (`offset_at`), `draw` onto a canvas, `measure` |
+| [`graphics/pdf`](graphics/pdf.ph) | Writing PDF: pages of vector graphics (`draw.Path`s filled and stroked with solid colours, alpha and linear/radial gradients; clipping; transforms), text in embedded TrueType (subset) and OpenType CFF fonts with ToUnicode maps, `draw_layout` for `text.Layout`s, images (Flate with soft-mask alpha, or JPEG as is), links, bookmarks, metadata; compressed |
+| [`graphics/pdf/read`](graphics/pdf/read.ph) | Reading PDF: cross-reference tables and streams, object streams, incremental updates, repair of damaged files; objects and decoded streams (Flate with predictors, LZW, ASCIIHex, ASCII85, RunLength); pages, metadata, and text extraction (ToUnicode maps, simple-font encodings and glyph names, layout into lines and words). Hardened against hostile files. Tables from [`tools/gen_pdf_tables.py`](../tools/gen_pdf_tables.py) |
+
+Image files are read and written by `std/graphics/image/`:
+
+| Module | Contents |
+|---|---|
+| [`graphics/image/formats`](graphics/image/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
+| [`graphics/image/png`](graphics/image/png.ph) | PNG: every colour type and bit depth, interlacing, transparency; writes 8/16-bit with per-row filters |
+| [`graphics/image/jpeg`](graphics/image/jpeg.ph) | JPEG: baseline and progressive, any sampling, restart markers, gray/YCbCr/RGB/CMYK/YCCK, output identical to libjpeg's; writes baseline with optimized Huffman tables |
+| [`graphics/image/bmp`](graphics/image/bmp.ph) | BMP: 1–32 bits, palettes, bit fields, RLE4/RLE8, all header versions |
+| [`graphics/image/qoi`](graphics/image/qoi.ph) | QOI |
+| [`graphics/image/pnm`](graphics/image/pnm.ph) | PBM, PGM, PPM (ASCII and binary), PAM, PFM (float) |
+| [`graphics/image/hdr`](graphics/image/hdr.ph) | Radiance RGBE (HDR) |
+| [`graphics/image/exr`](graphics/image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
+| [`graphics/image/gif`](graphics/image/gif.ph) | GIF 87a/89a: interlacing, transparency, animation (`decode_all` → frames composited with each disposal method, delays, loop count); writes single images and animations with median-cut palettes. Checked against files made by Pillow ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
+| [`graphics/image/tiff`](graphics/image/tiff.ph) | TIFF and BigTIFF, either byte order: strips or tiles, planar or not; none, LZW, Deflate, PackBits, CCITT fax (group 3 1D/2D, group 4), JPEG; both predictors; 1–64-bit integers and 16/32/64-bit floats; gray, RGB, palette, CMYK, YCbCr; associated or unassociated alpha; `page_count`, `decode_page`. Writes U8/U16/F32 pages with LZW, Deflate or PackBits. Checked against files from tifffile and libtiff ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
+| [`graphics/image/webp`](graphics/image/webp.ph) | WebP: lossy (VP8, [`webp/vp8.ph`](graphics/image/webp/vp8.ph): intra prediction, both loop filters, libwebp's fancy upsampling), lossless (VP8L: every transform, colour caches, meta prefix codes), alpha (each filter), animations composited as libwebp's `WebPAnimDecoder` does: pixels identical to libwebp's. Writes lossless stills and animations (palette or subtract-green and predictors, LZ77). Checked against files from libwebp ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
+| [`graphics/image/avif`](graphics/image/avif.ph) | AVIF (reading): the HEIF container (items in the file or `idat`, grids, alpha auxiliary images, `nclx` colour, clean aperture, rotation, mirroring) and an AV1 decoder of still (key and intra-only) frames ([`av1/`](graphics/image/av1/decode.ph)): every profile, 8/10/12 bits, 4:0:0/4:2:0/4:2:2/4:4:4, every intra coding tool (palettes, filter intra, CfL, intra edge filtering, quantizer matrices, delta q/lf, segmentation, lossless), deblocking, CDEF and loop restoration, following dav1d, whose planes it reproduces exactly (`decode_yuv`). RGB conversion by the matrix coefficients, full or limited range. Checked against files from libaom, rav1e and SVT-AV1 and libavif ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
+
+## Sound
+
+| Module | Contents |
+|---|---|
+| [`audio`](audio.ph) | `Sound`: interleaved frames of U8, S16, S24, S32, F32 or F64 samples; `get`/`set` as floats, `convert` (exact integer ↔ float), `remix` (channel counts), `slice`, `gain`, `peak`, `resample` (Kaiser-windowed sinc, > 90 dB rejection) |
 
 Sound files are read and written by `std/audio/`:
 
@@ -119,8 +180,10 @@ Sound files are read and written by `std/audio/`:
 | [`audio/aac`](audio/aac.ph) | AAC decoding: AAC Main (prediction), LC and LTP ([`aac/`](audio/aac/decoder.ph)): M/S and intensity stereo, noise substitution, TNS, pulses, both window shapes and sequences, up to 64 channels (the standard configurations in FFmpeg's channel order, or a program configuration element); HE-AAC ([spectral band replication](audio/aac/sbr.ph)) and HE-AAC v2 ([parametric stereo](audio/aac/ps.ph)), signalled explicitly or implicitly; ADTS streams (ID3 skipped) and MP4/M4A files, trimmed by the edit list or iTunSMPB. Output within 2·10⁻⁷ of FFmpeg (HE-AAC: 3·10⁻⁵, as close as FFmpeg's own C and SIMD code are to each other), checked against streams from FFmpeg's and Fraunhofer's encoders ([`tools/gen_audio_tests.py`](../tools/gen_audio_tests.py)) |
 | [`audio/ogg`](audio/ogg.ph) | The Ogg container: pages (CRC-checked) and packets |
 
-Cryptography lives in `std/crypto/` (the primitives are written to run in constant
-time where secrets are involved):
+## Cryptography
+
+In `std/crypto/`. The primitives are written to run in constant time where secrets are
+involved.
 
 | Module | Contents |
 |---|---|
@@ -143,7 +206,7 @@ time where secrets are involved):
 | [`crypto/der`](crypto/der.ph) | Reading ASN.1 DER |
 | [`crypto/x509`](crypto/x509.ph) | X.509 certificates, PEM, private keys, `CertPool` (with the system's roots), chain verification |
 
-Each module carries its own tests: `phalange test std/<module>.ph`. The cryptography
+Each module carries its own tests: `phalange test std/<path>.ph`. The cryptography
 has not been audited: review it before relying on it.
 
 ## Conventions
@@ -167,9 +230,9 @@ has not been audited: review it before relying on it.
 ## Example
 
 ```phalange
+import "std/collections/map" as map;
 import "std/hash" as hash;
 import "std/io" as io;
-import "std/map" as map;
 
 export fn main() i32 {
     let mut ages = map.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes);

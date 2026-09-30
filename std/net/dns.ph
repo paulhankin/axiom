@@ -1,0 +1,850 @@
+// =============================================================================
+// std/net/dns.ph - a DNS client (RFC 1035): any kind of record, from the
+// system's servers or public ones.
+//
+//     let mut r = dns.Resolver.system()!;              // /etc/resolv.conf
+//     let mut resp = r.query("example.com", dns.MX)!;
+//     defer resp.deinit();
+//     for rec in resp.answers.items() { ... rec.target, rec.priority ... }
+//
+//     let ips = r.lookup_ip("example.com")!;           // A and AAAA; mem.free
+//     let name = r.reverse(net.Addr.v4(8, 8, 8, 8, 0))!;   // PTR; mem.free
+//
+//     let mut p = dns.Resolver.public();               // 1.1.1.1, 8.8.8.8, 9.9.9.9
+//
+// Queries go over UDP, with EDNS0 (1232-byte answers), and are repeated
+// over TCP when the answer is truncated. A reply is accepted only from the
+// server asked, with the query's random id and question, so that forged
+// replies are hard to slip in; its parsing is bounded (compression
+// pointers may only point backwards, names are at most 255 bytes).
+// =============================================================================
+
+import "../collections/vec.ph" as vec;
+import "../crypto/random.ph" as random;
+import "../mem.ph" as mem;
+import "../net.ph" as net;
+import "../os/fs.ph" as fs;
+import "../str.ph" as strs;
+
+error { NameNotFound, ServerFailure, Refused, FormatError, BadName, BadResponse, TimedOut, NoServers, NetError,
+        OutOfMemory }
+
+/// Record types.
+pub const A: u16 = 1;
+pub const NS: u16 = 2;
+pub const CNAME: u16 = 5;
+pub const SOA: u16 = 6;
+pub const PTR: u16 = 12;
+pub const MX: u16 = 15;
+pub const TXT: u16 = 16;
+pub const AAAA: u16 = 28;
+pub const SRV: u16 = 33;
+pub const ANY: u16 = 255;
+
+/// A resource record. The decoded fields that apply to its type are set:
+/// addr (A, AAAA); target (CNAME, NS, PTR, MX's exchange, SRV's target,
+/// SOA's primary server); priority (MX's preference, SRV's priority),
+/// weight and port (SRV); text (TXT's strings run together). data is the
+/// raw record data.
+pub struct Record {
+    name: []u8,
+    rtype: u16,
+    class: u16,
+    ttl: u32,
+    data: []u8,
+    addr: net.Addr,
+    target: []u8,
+    priority: u16,
+    weight: u16,
+    port: u16,
+    text: []u8,
+}
+
+/// A reply. Its records point into memory it owns (deinit frees it).
+pub struct Response {
+    rcode: u8,
+    authoritative: bool,
+    answers: vec.Vec.[Record],
+    authority: vec.Vec.[Record],
+    additional: vec.Vec.[Record],
+    store: strs.String,  // the names and texts the records point to
+    packet: []mut u8,
+
+    pub fn deinit(self: *mut Response) void {
+        self.answers.deinit();
+        self.authority.deinit();
+        self.additional.deinit();
+        self.store.deinit();
+        mem.free(self.packet);
+    }
+}
+
+pub struct Resolver {
+    servers: [4]net.Addr,
+    count: usize,
+    timeout_ms: u32,  // per attempt
+    attempts: u32,    // per server
+
+    /// The name servers of /etc/resolv.conf (NoServers if it names none).
+    pub fn system() !Resolver {
+        let mut r = Resolver.{ servers: [net.Addr.any(4, 0); 4], count: 0, timeout_ms: 2000, attempts: 2 };
+        let text = fs.read_file("/etc/resolv.conf") catch return error.NoServers;
+        defer mem.free(text);
+        let mut ls = strs.lines(text);
+        while r.count < 4 {
+            let line = ls.next() catch break;
+            let mut f = strs.fields(line);
+            let key = f.next() catch continue;
+            if not strs.eq(key, "nameserver") {
+                continue;
+            }
+            let v = f.next() catch continue;
+            let mut a = net.Addr.parse(v) catch continue;
+            a.port = 53;
+            r.servers[r.count] = a;
+            r.count += 1;
+        }
+        if r.count == 0 {
+            return error.NoServers;
+        }
+        return r;
+    }
+
+    /// Public resolvers: Cloudflare, Google and Quad9.
+    pub fn public() Resolver {
+        let mut r = Resolver.{ servers: [net.Addr.any(4, 0); 4], count: 3, timeout_ms: 2000, attempts: 2 };
+        r.servers[0] = net.Addr.v4(1, 1, 1, 1, 53);
+        r.servers[1] = net.Addr.v4(8, 8, 8, 8, 53);
+        r.servers[2] = net.Addr.v4(9, 9, 9, 9, 53);
+        return r;
+    }
+
+    /// One server (a port of 0 means 53).
+    pub fn with_server(a: net.Addr) Resolver {
+        let mut r = Resolver.{ servers: [net.Addr.any(4, 0); 4], count: 1, timeout_ms: 2000, attempts: 2 };
+        r.servers[0] = a;
+        if a.port == 0 {
+            r.servers[0].port = 53;
+        }
+        return r;
+    }
+
+    /// Asks for the records of a type for a name, from each server in turn
+    /// until one answers. NameNotFound if the name does not exist (an
+    /// empty answer list if it exists without such records).
+    pub fn query(self: *Resolver, name: []u8, rtype: u16) !Response {
+        let mut q = strs.String.init();
+        defer q.deinit();
+        let mut idb: [2]u8 = [0; 2];
+        random.fill(idb[..]) catch {};
+        let id = (@as(u16, idb[0]) << 8) | @as(u16, idb[1]);
+        build_query(&mut q, id, name, rtype)!;
+        let mut last: error = error.NoServers;
+        for k in @as(usize, 0)..self.count {
+            for _t in @as(u32, 0)..@max(self.attempts, 1) {
+                let resp = self.ask(self.servers[k], q.bytes(), id) catch |e| {
+                    last = e;
+                    if e == error.TimedOut {
+                        continue;
+                    }
+                    break;
+                };
+                return resp;
+            }
+        }
+        return last;
+    }
+
+    fn ask(self: *Resolver, server: net.Addr, q: []u8, id: u16) !Response {
+        let sock = net.UdpSocket.bind(net.Addr.any(server.family, 0)) catch return error.NetError;
+        defer sock.close();
+        sock.set_timeout(@max(self.timeout_ms, 1)) catch return error.NetError;
+        sock.send_to(q, server) catch return error.NetError;
+        let mut buf: [1232]u8 = [0; 1232];
+        // (ignore stray and forged datagrams until the timeout)
+        for _k in @as(usize, 0)..16 {
+            let mut from = net.Addr.any(4, 0);
+            let n = sock.recv_from(buf[..], &mut from) catch |e| {
+                if e == error.TimedOut {
+                    return error.TimedOut;
+                }
+                return error.NetError;
+            };
+            if not from.eq(server) or not matches(buf[..n], q, id) {
+                continue;
+            }
+            if (buf[2] & 2) != 0 {
+                // truncated: again over TCP
+                return tcp_query(server, q, id, self.timeout_ms)!;
+            }
+            return parse_response(buf[..n])!;
+        }
+        return error.TimedOut;
+    }
+
+    /// The IPv4 and IPv6 addresses of a name (following CNAMEs); the
+    /// caller frees them. NameNotFound if it has none.
+    pub fn lookup_ip(self: *Resolver, name: []u8) ![]mut net.Addr {
+        let mut out = vec.Vec.[net.Addr].init();
+        defer out.deinit();
+        let types: [2]u16 = [A, AAAA];
+        let mut missing: usize = 0;
+        for t in types {
+            let mut resp = self.query(name, t) catch |e| {
+                if e == error.NameNotFound {
+                    missing += 1;
+                    continue;
+                }
+                return e;
+            };
+            defer resp.deinit();
+            for rec in resp.answers.items() {
+                if rec.rtype == t {
+                    out.push(rec.addr)!;
+                }
+            }
+        }
+        if out.len == 0 {
+            return error.NameNotFound;
+        }
+        let r = mem.alloc.[net.Addr](out.len)!;
+        @mem_copy(r, out.items());
+        return r;
+    }
+
+    /// The name of an address (its PTR record); the caller frees it.
+    pub fn reverse(self: *Resolver, a: net.Addr) ![]mut u8 {
+        let mut name = strs.String.init();
+        defer name.deinit();
+        reverse_name(a, &mut name)!;
+        let mut resp = self.query(name.bytes(), PTR)!;
+        defer resp.deinit();
+        for rec in resp.answers.items() {
+            if rec.rtype == PTR {
+                return strs.dup(rec.target)!;
+            }
+        }
+        return error.NameNotFound;
+    }
+}
+
+/// The name to look up an address's PTR record by: 4.3.2.1.in-addr.arpa,
+/// or the nibbles of an IPv6 address under ip6.arpa.
+pub fn reverse_name(a: net.Addr, out: *mut strs.String) !void {
+    let hex = "0123456789abcdef";
+    let mut buf: [4]u8 = [0; 4];
+    if a.family == 4 {
+        let mut k: usize = 4;
+        while k > 0 {
+            k -= 1;
+            out.push_str(dec(buf[..], a.ip[k]))!;
+            out.push('.')!;
+        }
+        out.push_str("in-addr.arpa")!;
+        return;
+    }
+    let mut k: usize = 16;
+    while k > 0 {
+        k -= 1;
+        out.push(hex[@as(usize, a.ip[k] & 15)])!;
+        out.push('.')!;
+        out.push(hex[@as(usize, a.ip[k] >> 4)])!;
+        out.push('.')!;
+    }
+    out.push_str("ip6.arpa")!;
+}
+
+fn dec(buf: []mut u8, v: u8) []u8 {
+    if v >= 100 {
+        buf[0] = '0' + (v / 100);
+        buf[1] = '0' + ((v / 10) % 10);
+        buf[2] = '0' + (v % 10);
+        return buf[..3];
+    }
+    if v >= 10 {
+        buf[0] = '0' + (v / 10);
+        buf[1] = '0' + (v % 10);
+        return buf[..2];
+    }
+    buf[0] = '0' + v;
+    return buf[..1];
+}
+
+// -----------------------------------------------------------------------------
+// The wire format
+// -----------------------------------------------------------------------------
+
+fn put16(s: *mut strs.String, v: u16) !void {
+    s.push(@truncate(u8, v >> 8))!;
+    s.push(@truncate(u8, v))!;
+}
+
+/// Appends a name in wire format (labels; a final "." is optional).
+pub fn encode_name(s: *mut strs.String, name: []u8) !void {
+    let mut n = name;
+    if (n.len > 0) and (n[n.len - 1] == '.') {
+        n = n[..n.len - 1];
+    }
+    if n.len > 253 {
+        return error.BadName;
+    }
+    if n.len > 0 {
+        let mut parts = strs.split(n, ".");
+        while true {
+            let label = parts.next() catch break;
+            if (label.len == 0) or (label.len > 63) {
+                return error.BadName;
+            }
+            s.push(@truncate(u8, label.len))!;
+            s.push_str(label)!;
+        }
+    }
+    s.push(0)!;
+}
+
+fn build_query(s: *mut strs.String, id: u16, name: []u8, rtype: u16) !void {
+    put16(s, id)!;
+    put16(s, 0x0100)!;  // a query, recursion desired
+    put16(s, 1)!;       // one question
+    put16(s, 0)!;
+    put16(s, 0)!;
+    put16(s, 1)!;  // one additional record: EDNS0's OPT
+    encode_name(s, name)!;
+    put16(s, rtype)!;
+    put16(s, 1)!;  // IN
+    // OPT: root name, type 41, UDP size 1232, no extended flags, no data
+    s.push(0)!;
+    put16(s, 41)!;
+    put16(s, 1232)!;
+    put16(s, 0)!;
+    put16(s, 0)!;
+    put16(s, 0)!;
+}
+
+fn rd16(b: []u8, i: usize) u16 {
+    return (@as(u16, b[i]) << 8) | @as(u16, b[i + 1]);
+}
+
+fn rd32(b: []u8, i: usize) u32 {
+    return (@as(u32, rd16(b, i)) << 16) | @as(u32, rd16(b, i + 2));
+}
+
+// Whether a reply answers the query: its id, and the same question.
+fn matches(r: []u8, q: []u8, id: u16) bool {
+    if (r.len < 12) or (rd16(r, 0) != id) or ((r[2] & 0x80) == 0) or (rd16(r, 4) != 1) {
+        return false;
+    }
+    // the question: the query's bytes from 12 up to the OPT record
+    let qlen = q.len - 12 - 11;
+    if r.len < (12 + qlen) {
+        return false;
+    }
+    for k in @as(usize, 0)..qlen {
+        if strs.to_lower_byte(r[12 + k]) != strs.to_lower_byte(q[12 + k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reads the name at i into out (dotted, without a final dot); returns the
+// position after it where it was read from (not after any pointer).
+fn read_name(b: []u8, i0: usize, out: *mut strs.String) !usize {
+    let mut i = i0;
+    let mut end: usize = 0;
+    let mut jumped = false;
+    let mut jumps: usize = 0;
+    let mut len: usize = 0;
+    loop {
+        if i >= b.len {
+            return error.BadResponse;
+        }
+        let c = b[i];
+        if c == 0 {
+            if not jumped {
+                end = i + 1;
+            }
+            break;
+        }
+        if (c & 0xc0) == 0xc0 {
+            if (i + 1) >= b.len {
+                return error.BadResponse;
+            }
+            let target = @as(usize, rd16(b, i) & 0x3fff);
+            // only backwards, and not for ever
+            jumps += 1;
+            if (target >= i) or (jumps > 64) {
+                return error.BadResponse;
+            }
+            if not jumped {
+                end = i + 2;
+                jumped = true;
+            }
+            i = target;
+            continue;
+        }
+        if (c & 0xc0) != 0 {
+            return error.BadResponse;
+        }
+        let n = @as(usize, c);
+        if (i + 1 + n) > b.len {
+            return error.BadResponse;
+        }
+        len += n + 1;
+        if len > 255 {
+            return error.BadResponse;
+        }
+        if out.len > 0 {
+            out.push('.')!;
+        }
+        out.push_str(b[i + 1..i + 1 + n])!;
+        i += 1 + n;
+    }
+    return end;
+}
+
+fn store_name(b: []u8, i: usize, store: *mut strs.String, at: *mut usize, span: *mut usize) !usize {
+    let mut tmp = strs.String.init();
+    defer tmp.deinit();
+    let next = read_name(b, i, &mut tmp)!;
+    at.* = store.len;
+    span.* = tmp.len;
+    store.push_str(tmp.bytes())!;
+    return next;
+}
+
+// Offsets into the store, turned into slices once it stops growing.
+struct Pending {
+    name_at: usize,
+    name_len: usize,
+    target_at: usize,
+    target_len: usize,
+    text_at: usize,
+    text_len: usize,
+    section: u8,
+}
+
+fn parse_response(b: []u8) !Response {
+    let rcode = b[3] & 15;
+    if rcode == 3 {
+        return error.NameNotFound;
+    }
+    if rcode == 2 {
+        return error.ServerFailure;
+    }
+    if rcode == 5 {
+        return error.Refused;
+    }
+    if rcode == 1 {
+        return error.FormatError;
+    }
+    let packet = mem.alloc.[u8](b.len)!;
+    @mem_copy(packet, b);
+    let mut r = Response.{ rcode: rcode, authoritative: (b[2] & 4) != 0, answers: vec.Vec.[Record].init(),
+                           authority: vec.Vec.[Record].init(), additional: vec.Vec.[Record].init(),
+                           store: strs.String.init(), packet: packet };
+    parse_records(&mut r) catch |e| {
+        r.deinit();
+        return e;
+    };
+    return r;
+}
+
+fn parse_records(r: *mut Response) !void {
+    let b = r.packet;
+    let qd = rd16(b, 4);
+    let counts: [3]u16 = [rd16(b, 6), rd16(b, 8), rd16(b, 10)];
+    let mut i: usize = 12;
+    let mut skip = strs.String.init();
+    defer skip.deinit();
+    for _q in @as(u16, 0)..qd {
+        skip.clear();
+        i = read_name(b, i, &mut skip)!;
+        i += 4;
+    }
+    let mut recs = vec.Vec.[Record].init();
+    defer recs.deinit();
+    let mut pend = vec.Vec.[Pending].init();
+    defer pend.deinit();
+    for sec in @as(usize, 0)..3 {
+        for _k in @as(u16, 0)..counts[sec] {
+            let mut p = Pending.{ name_at: 0, name_len: 0, target_at: 0, target_len: 0, text_at: 0, text_len: 0,
+                                  section: @truncate(u8, sec) };
+            i = store_name(b, i, &mut r.store, &mut p.name_at, &mut p.name_len)!;
+            if (i + 10) > b.len {
+                return error.BadResponse;
+            }
+            let rtype = rd16(b, i);
+            let class = rd16(b, i + 2);
+            let ttl = rd32(b, i + 4);
+            let rdlen = @as(usize, rd16(b, i + 8));
+            i += 10;
+            if (i + rdlen) > b.len {
+                return error.BadResponse;
+            }
+            let data = b[i..i + rdlen];
+            let mut rec = Record.{ name: "", rtype: rtype, class: class, ttl: ttl, data: data, addr: net.Addr.any(4, 0),
+                                   target: "", priority: 0, weight: 0, port: 0, text: "" };
+            if (rtype == A) and (rdlen == 4) {
+                rec.addr = net.Addr.v4(data[0], data[1], data[2], data[3], 0);
+            } else if (rtype == AAAA) and (rdlen == 16) {
+                let mut ip: [16]u8 = [0; 16];
+                for k in @as(usize, 0)..16 {
+                    ip[k] = data[k];
+                }
+                rec.addr = net.Addr.v6(ip, 0);
+            } else if (((rtype == CNAME) or (rtype == NS)) or ((rtype == PTR) or (rtype == SOA))) and (rdlen > 0) {
+                _ = store_name(b, i, &mut r.store, &mut p.target_at, &mut p.target_len)!;
+            } else if (rtype == MX) and (rdlen >= 3) {
+                rec.priority = rd16(data, 0);
+                _ = store_name(b, i + 2, &mut r.store, &mut p.target_at, &mut p.target_len)!;
+            } else if (rtype == SRV) and (rdlen >= 7) {
+                rec.priority = rd16(data, 0);
+                rec.weight = rd16(data, 2);
+                rec.port = rd16(data, 4);
+                _ = store_name(b, i + 6, &mut r.store, &mut p.target_at, &mut p.target_len)!;
+            } else if rtype == TXT {
+                p.text_at = r.store.len;
+                let mut j: usize = 0;
+                while j < data.len {
+                    let n = @as(usize, data[j]);
+                    if (j + 1 + n) > data.len {
+                        return error.BadResponse;
+                    }
+                    r.store.push_str(data[j + 1..j + 1 + n])!;
+                    j += 1 + n;
+                }
+                p.text_len = r.store.len - p.text_at;
+            }
+            i += rdlen;
+            if rtype == 41 {
+                continue;  // EDNS0's OPT is not a record
+            }
+            recs.push(rec)!;
+            pend.push(p)!;
+        }
+    }
+    // the store no longer grows: point into it
+    let st = r.store.bytes();
+    let rs = recs.items();
+    let ps = pend.items();
+    for k in @as(usize, 0)..rs.len {
+        let p = ps[k];
+        let mut rec = rs[k];
+        rec.name = st[p.name_at..p.name_at + p.name_len];
+        rec.target = st[p.target_at..p.target_at + p.target_len];
+        rec.text = st[p.text_at..p.text_at + p.text_len];
+        if p.section == 0 {
+            r.answers.push(rec)!;
+        } else if p.section == 1 {
+            r.authority.push(rec)!;
+        } else {
+            r.additional.push(rec)!;
+        }
+    }
+}
+
+fn tcp_query(server: net.Addr, q: []u8, id: u16, timeout_ms: u32) !Response {
+    let s = net.connect_addr(server) catch return error.NetError;
+    defer s.close();
+    s.set_timeout(@max(timeout_ms, 1)) catch return error.NetError;
+    let mut len: [2]u8 = [@truncate(u8, q.len >> 8), @truncate(u8, q.len)];
+    s.write_all(len[..]) catch return error.NetError;
+    s.write_all(q) catch return error.NetError;
+    let r = s.reader();
+    r.read_exact(len[..]) catch return error.BadResponse;
+    let n = (@as(usize, len[0]) << 8) | @as(usize, len[1]);
+    let buf = mem.alloc.[u8](n)!;
+    defer mem.free(buf);
+    r.read_exact(buf) catch return error.BadResponse;
+    if not matches(buf, q, id) {
+        return error.BadResponse;
+    }
+    return parse_response(buf)!;
+}
+
+// -----------------------------------------------------------------------------
+// Tests: a small server on the loopback interface
+// -----------------------------------------------------------------------------
+
+import "../thread.ph" as thread;
+
+struct Server {
+    udp: net.UdpSocket,
+    tcp: net.TcpListener,
+    port: u16,
+    served: u32,
+}
+
+// the answer records for a question name and type (the name is at 12:
+// pointer 0xc00c)
+fn answers(qname: []u8, qtype: u16, out: *mut strs.String, count: *mut u16, rcode: *mut u8, tc: *mut bool) !void {
+    let ptr: [2]u8 = [0xc0, 0x0c];
+    if strs.eq(qname, "missing.test") {
+        rcode.* = 3;
+        return;
+    }
+    if strs.eq(qname, "big.test") {
+        tc.* = true;
+        return;
+    }
+    if strs.eq(qname, "alias.test") {
+        // alias.test CNAME example.test, then example.test's address
+        out.push_str(ptr[..])!;
+        put16(out, CNAME)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 60)!;
+        let mut t = strs.String.init();
+        defer t.deinit();
+        encode_name(&mut t, "example.test")!;
+        put16(out, @truncate(u16, t.len))!;
+        out.push_str(t.bytes())!;
+        count.* += 1;
+    }
+    let name_ptr = ptr;
+    if (qtype == A) or ((qtype == AAAA) and not strs.eq(qname, "alias.test")) {
+        out.push_str(name_ptr[..])!;
+        put16(out, qtype)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 300)!;
+        if qtype == A {
+            put16(out, 4)!;
+            let ip: [4]u8 = [93, 184, 216, 34];
+            out.push_str(ip[..])!;
+        } else {
+            put16(out, 16)!;
+            let ip: [16]u8 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            out.push_str(ip[..])!;
+        }
+        count.* += 1;
+    } else if qtype == MX {
+        // 10 mail.<the question's name>, compressed
+        out.push_str(ptr[..])!;
+        put16(out, MX)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 300)!;
+        put16(out, 9)!;
+        put16(out, 10)!;
+        out.push(4)!;
+        out.push_str("mail")!;
+        out.push_str(ptr[..])!;
+        count.* += 1;
+    } else if qtype == TXT {
+        out.push_str(ptr[..])!;
+        put16(out, TXT)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 300)!;
+        put16(out, 13)!;
+        out.push(7)!;
+        out.push_str("v=spf1 ")!;
+        out.push(4)!;
+        out.push_str("-all")!;
+        count.* += 1;
+    } else if qtype == SRV {
+        out.push_str(ptr[..])!;
+        put16(out, SRV)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 300)!;
+        let mut t = strs.String.init();
+        defer t.deinit();
+        encode_name(&mut t, "sip.example.test")!;
+        put16(out, @truncate(u16, 6 + t.len))!;
+        put16(out, 5)!;
+        put16(out, 20)!;
+        put16(out, 5060)!;
+        out.push_str(t.bytes())!;
+        count.* += 1;
+    } else if qtype == PTR {
+        out.push_str(ptr[..])!;
+        put16(out, PTR)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 300)!;
+        let mut t = strs.String.init();
+        defer t.deinit();
+        encode_name(&mut t, "host.example.test")!;
+        put16(out, @truncate(u16, t.len))!;
+        out.push_str(t.bytes())!;
+        count.* += 1;
+    }
+}
+
+// The reply to a query (with TC set, or not, and a chosen id).
+fn reply_to(q: []u8, full: bool, id: u16, out: *mut strs.String) !bool {
+    let mut name = strs.String.init();
+    defer name.deinit();
+    let qend = read_name(q, 12, &mut name)!;
+    let qtype = rd16(q, qend);
+    let mut body = strs.String.init();
+    defer body.deinit();
+    let mut count: u16 = 0;
+    let mut rcode: u8 = 0;
+    let mut tc = false;
+    let mut qn: []u8 = name.bytes();
+    if full and strs.eq(qn, "big.test") {
+        qn = "example.test";
+    }
+    answers(qn, qtype, &mut body, &mut count, &mut rcode, &mut tc)!;
+    put16(out, id)!;
+    let mut flags: u16 = 0x8180 | @as(u16, rcode);
+    if tc and not full {
+        flags |= 0x0200;
+    }
+    put16(out, flags)!;
+    put16(out, 1)!;
+    put16(out, count)!;
+    put16(out, 0)!;
+    put16(out, 0)!;
+    out.push_str(q[12..qend + 4])!;
+    out.push_str(body.bytes())!;
+    return strs.eq(name.bytes(), "quit.test");
+}
+
+fn serve(s: *mut Server) void {
+    let mut buf: [512]u8 = [0; 512];
+    loop {
+        let mut from = net.Addr.any(4, 0);
+        let n = s.udp.recv_from(buf[..], &mut from) catch return;
+        let q = buf[..n];
+        let mut name = strs.String.init();
+        _ = read_name(q, 12, &mut name) catch 0;
+        let spoof = strs.eq(name.bytes(), "spoof.test");
+        let big = strs.eq(name.bytes(), "big.test");
+        name.deinit();
+        let mut out = strs.String.init();
+        if spoof {
+            // first a reply with the wrong id, which must be ignored
+            _ = reply_to(q, true, rd16(q, 0) ^ 0x5555, &mut out) catch false;
+            s.udp.send_to(out.bytes(), from) catch {};
+            out.clear();
+        }
+        let quit = reply_to(q, false, rd16(q, 0), &mut out) catch false;
+        s.udp.send_to(out.bytes(), from) catch {};
+        out.deinit();
+        s.served += 1;
+        if big {
+            // the same question over TCP
+            let c = s.tcp.accept() catch return;
+            let mut lb: [2]u8 = [0; 2];
+            c.reader().read_exact(lb[..]) catch {};
+            let len = (@as(usize, lb[0]) << 8) | @as(usize, lb[1]);
+            let mut tq: [512]u8 = [0; 512];
+            c.reader().read_exact(tq[..len]) catch {};
+            let mut o = strs.String.init();
+            _ = reply_to(tq[..len], true, rd16(tq[..len], 0), &mut o) catch false;
+            let hdr: [2]u8 = [@truncate(u8, o.len >> 8), @truncate(u8, o.len)];
+            c.write_all(hdr[..]) catch {};
+            c.write_all(o.bytes()) catch {};
+            o.deinit();
+            c.close();
+        }
+        if quit {
+            return;
+        }
+    }
+}
+
+test "queries against a server" {
+    let udp = net.UdpSocket.bind(net.Addr.loopback(4, 0))!;
+    defer udp.close();
+    let port = udp.local_addr()!.port;
+    let tcp = net.listen_addr(net.Addr.loopback(4, port))!;
+    defer tcp.close();
+    let mut srv = Server.{ udp: udp, tcp: tcp, port: port, served: 0 };
+    let t = thread.spawn(serve, &mut srv)!;
+    let mut r = Resolver.with_server(net.Addr.loopback(4, port));
+    r.timeout_ms = 1000;
+    let mut a = r.query("example.test", A)!;
+    @expect((a.answers.len == 1) and a.answers.get(0).addr.eq(net.Addr.v4(93, 184, 216, 34, 0)));
+    @expect(strs.eq(a.answers.get(0).name, "example.test") and (a.answers.get(0).ttl == 300));
+    a.deinit();
+    let mut mx = r.query("Example.TEST.", MX)!;
+    @expect((mx.answers.get(0).priority == 10) and strs.eq(mx.answers.get(0).target, "mail.Example.TEST"));
+    mx.deinit();
+    let mut txt = r.query("example.test", TXT)!;
+    @expect_eq(txt.answers.get(0).text, "v=spf1 -all");
+    txt.deinit();
+    let mut srvr = r.query("_sip._tcp.example.test", SRV)!;
+    let s0 = srvr.answers.get(0);
+    @expect((s0.priority == 5) and (s0.weight == 20) and (s0.port == 5060) and strs.eq(s0.target, "sip.example.test"));
+    srvr.deinit();
+    // a CNAME, then the address
+    let ips = r.lookup_ip("alias.test")!;
+    @expect((ips.len == 1) and ips[0].eq(net.Addr.v4(93, 184, 216, 34, 0)));
+    mem.free(ips);
+    let both = r.lookup_ip("example.test")!;
+    @expect((both.len == 2) and (both[1].family == 6));
+    mem.free(both);
+    @expect(not_found(r.query("missing.test", A)));
+    // a truncated answer, then over TCP
+    let mut big = r.query("big.test", A)!;
+    @expect(big.answers.len == 1);
+    big.deinit();
+    // a forged reply is skipped
+    let mut sp = r.query("spoof.test", A)!;
+    @expect(sp.answers.len == 1);
+    sp.deinit();
+    let who = r.reverse(net.Addr.v4(1, 2, 3, 4, 0))!;
+    @expect_eq(who, "host.example.test");
+    mem.free(who);
+    let mut q = r.query("quit.test", A)!;
+    q.deinit();
+    t.join();
+    @expect(srv.served == 13);
+}
+
+fn not_found(r: !Response) bool {
+    let mut x = r catch |e| return e == error.NameNotFound;
+    x.deinit();
+    return false;
+}
+
+test "names and hostile replies" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_name(&mut s, "a.bc.")!;
+    @expect_eq(s.bytes(), "\x01a\x02bc\x00");
+    s.clear();
+    @expect(bad_name(encode_name(&mut s, "a..b")));
+    let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    @expect(bad_name(encode_name(&mut s, long)));
+    let mut rn = strs.String.init();
+    defer rn.deinit();
+    reverse_name(net.Addr.v4(192, 0, 2, 1, 0), &mut rn)!;
+    @expect_eq(rn.bytes(), "1.2.0.192.in-addr.arpa");
+    rn.clear();
+    reverse_name(net.Addr.parse("2001:db8::567:89ab")!, &mut rn)!;
+    @expect_eq(rn.bytes(), "b.a.9.8.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa");
+    // a pointer to itself, one forwards, and a name running off the end
+    let loops =
+        "\x00\x01\x81\x80\x00\x00\x00\x01\x00\x00\x00\x00\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04\x01\x02\x03\x04";
+    @expect(bad(parse_response(loops)));
+    let fwd =
+        "\x00\x01\x81\x80\x00\x00\x00\x01\x00\x00\x00\x00\xc0\x20\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04\x01\x02\x03\x04";
+    @expect(bad(parse_response(fwd)));
+    let cut = "\x00\x01\x81\x80\x00\x00\x00\x01\x00\x00\x00\x00\x05ab";
+    @expect(bad(parse_response(cut)));
+    let rdlen = "\x00\x01\x81\x80\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x01\xff\xff\x01";
+    @expect(bad(parse_response(rdlen)));
+    let ok =
+        "\x00\x01\x81\x80\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04\x01\x02\x03\x04";
+    let mut good = parse_response(ok)!;
+    @expect(good.answers.get(0).addr.eq(net.Addr.v4(1, 2, 3, 4, 0)));
+    good.deinit();
+}
+
+fn bad_name(r: !void) bool {
+    r catch |e| return e == error.BadName;
+    return false;
+}
+
+fn bad(r: !Response) bool {
+    let mut x = r catch |e| return e == error.BadResponse;
+    x.deinit();
+    return false;
+}

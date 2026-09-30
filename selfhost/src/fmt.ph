@@ -199,6 +199,50 @@ fn same_dir(a: []u8, b: []u8) bool {
     return not u.isnos(ra) and not u.isnos(rb) and u.str_eq(ra, rb);
 }
 
+// Where directory `dir` is within the standard library: "" for std itself,
+// "graphics/shape" for a subdirectory, or no string when it is outside.
+fn std_subdir(dir: []u8, std_dir: []u8) []u8 {
+    let ra = u.real_path(dir);
+    let rb = u.real_path(std_dir);
+    if u.isnos(ra) or u.isnos(rb) {
+        return u.nosym();
+    }
+    if u.str_eq(ra, rb) {
+        return "";
+    }
+    if u.starts(ra, rb) and (ra.len > rb.len) and (ra[rb.len] == '/') {
+        return ra[rb.len + 1..];
+    }
+    return u.nosym();
+}
+
+// The standard library module `name`, as a path within std ("vec" is
+// "collections/vec"): std/<name>.ph, else the one std/<group>/<name>.ph.
+// No string when there is none, or more than one.
+fn std_module(name: []u8, std_dir: []u8) []u8 {
+    if u.is_file(u.f3("%s/%s%s", std_dir, name, ".ph")) {
+        return name;
+    }
+    let mut ents = str_list();
+    if not u.list_dir(std_dir, &mut ents) {
+        return u.nosym();
+    }
+    let mut found = u.nosym();
+    for i in 0..ents.len {
+        let g = ents.get(i);
+        if (g.len == 0) or (g[0] == '.') {
+            continue;
+        }
+        if u.is_file(u.f3("%s/%s%s", u.cat3(std_dir, "/", g), u.cat2("/", name), ".ph")) {
+            if not u.isnos(found) {
+                return u.nosym();
+            }
+            found = u.cat3(g, "/", name);
+        }
+    }
+    return found;
+}
+
 // True if a module's text declares a test.
 fn has_tests(text: []u8) bool {
     let mut i: usize = 0;
@@ -228,7 +272,7 @@ fn removable(path: []u8, file_dir: []u8, std_dir: []u8) bool {
     if not u.ends(p, ".ph") {
         p = u.cat2(p, ".ph");
     }
-    if same_dir(dir_of(p), std_dir) {
+    if not u.isnos(std_subdir(dir_of(p), std_dir)) {
         return true;
     }
     let text = u.read_file(p);
@@ -276,7 +320,8 @@ fn push_tok(out: *mut u.List.[El], kind: i32, text: []u8, nl: i32) void {
 // Sorts, dedupes, removes and adds imports; returns the new elements.
 fn fix_imports(els: []El, path: []u8, std_dir: []u8) u.List.[El] {
     let file_dir = dir_of(path);
-    let in_std = same_dir(file_dir, std_dir);
+    let sub = std_subdir(file_dir, std_dir);
+    let in_std = not u.isnos(sub);
     // the imports, with their runs
     let mut imps = imp_list();
     let mut depth: i32 = 0;
@@ -380,12 +425,13 @@ fn fix_imports(els: []El, path: []u8, std_dir: []u8) u.List.[El] {
         if known or (in_std and u.str_eq(u.cat2(name, ".ph"), basename_of(path))) {
             continue;
         }
-        if not u.is_file(u.f3("%s/%s%s", std_dir, name, ".ph")) {
+        let module = std_module(name, std_dir);
+        if u.isnos(module) {
             continue;
         }
-        let mut ip = u.cat2("std/", name);
+        let mut ip = u.cat2("std/", module);
         if in_std {
-            ip = u.cat2(name, ".ph");
+            ip = u.cat2(rel_to(module, sub), ".ph");
         }
         adds.push(Imp.{ a: NONE, b: NONE, path: ip, alias: name, run: NONE });
     }
@@ -470,6 +516,36 @@ fn first_run_of(imps: *u.List.[Imp]) usize {
         return NONE;
     }
     return imps.get(0).run;
+}
+
+// `target`, a path within std, relative to the std subdirectory `from`.
+fn rel_to(target: []u8, from: []u8) []u8 {
+    let mut t = target;
+    let mut f = from;
+    // drop the directories they share
+    while f.len > 0 {
+        let kt = u.find(t, '/');
+        if kt < 0 {
+            break;
+        }
+        let head = t[0..@int_cast(usize, kt) + 1];
+        if u.str_eq(f, head[0..head.len - 1]) {
+            t = t[head.len..];
+            f = "";
+        } else if u.starts(f, head) {
+            t = t[head.len..];
+            f = f[head.len..];
+        } else {
+            break;
+        }
+    }
+    let mut out = t;
+    for i in 0..f.len {
+        if (i == 0) or (f[i - 1] == '/') {
+            out = u.cat2("../", out);
+        }
+    }
+    return out;
 }
 
 fn basename_of(p: []u8) []u8 {

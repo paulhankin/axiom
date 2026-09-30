@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundles html5lib-tests into std/html/testdata.
+"""Bundles html5lib-tests into std/text/html/testdata.
 
     git clone https://github.com/html5lib/html5lib-tests
     git -C html5lib-tests checkout 9329e64   # the last commit with tree-construction
@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 src = sys.argv[1]
-out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'html', 'testdata')
+out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'text', 'html', 'testdata')
 commit = subprocess.run(['git', '-C', src, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
 os.makedirs(out_dir, exist_ok=True)
 

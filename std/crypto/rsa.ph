@@ -14,7 +14,7 @@
 // does not depend on the key.
 // =============================================================================
 
-import "../bigint.ph" as big;
+import "../math/bigint.ph" as big;
 import "random.ph" as random;
 import "sha2.ph" as sha2;
 import "subtle.ph" as subtle;

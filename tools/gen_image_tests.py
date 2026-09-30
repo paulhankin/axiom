@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/image/testdata: images in GIF, TIFF, WebP and AVIF made
+"""Generates std/graphics/image/testdata: images in GIF, TIFF, WebP and AVIF made
 with Pillow (and its libraries: libtiff, libwebp, libavif), each with the
 pixels Pillow decodes from it as PNG files to compare with.
 
@@ -11,7 +11,7 @@ import sys
 
 from PIL import Image, ImageDraw, ImageOps, ImageSequence
 
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'image', 'testdata')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'graphics', 'image', 'testdata')
 rng = random.Random(1987)
 
 
@@ -79,7 +79,7 @@ def gif():
 def tiff():
     """TIFF files from tifffile (every layout and compression) and Pillow's
     libtiff (CCITT fax, JPEG). Each case has the pixels expected, as the raw
-    samples of a std/image Image (little-endian), listed in cases.txt."""
+    samples of a std/graphics/image Image (little-endian), listed in cases.txt."""
     import numpy as np
     import tifffile
     d = os.path.join(root, 'tiff')

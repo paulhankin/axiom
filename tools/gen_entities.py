@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# Generates std/html/entities.ph: the HTML5 named character references
-# (from Python's html.entities.html5, the WHATWG list), for std/html and
-# std/markdown.
+# Generates std/text/html/entities.ph: the HTML5 named character references
+# (from Python's html.entities.html5, the WHATWG list), for std/text/html and
+# std/text/markdown.
 import html.entities
 import os
 import subprocess
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'html', 'entities.ph')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'text', 'html', 'entities.ph')
 ents = sorted((k[:-1], v) for k, v in html.entities.html5.items() if k.endswith(';'))
 names = ''.join(k for k, _ in ents)
 offs = [0]

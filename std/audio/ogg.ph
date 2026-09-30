@@ -11,9 +11,9 @@
 // is the last to end on that page, and -1 otherwise.
 // =============================================================================
 
+import "../collections/vec.ph" as vec;
 import "../mem.ph" as mem;
 import "../sync.ph" as sync;
-import "../vec.ph" as vec;
 
 error { InvalidAudio, OutOfMemory }
 

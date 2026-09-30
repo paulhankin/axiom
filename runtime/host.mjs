@@ -593,7 +593,7 @@ export function createHost(opts = {}) {
     },
     // More of the file system. Node has no flock and cannot map files into
     // the program's memory: ph_flock reports -95 (not supported) and ph_mmap
-    // 0, for std/fs to fall back on. Watching runs on the net worker.
+    // 0, for std/os/fs to fall back on. Watching runs on the net worker.
     ph_chmod(p, n, mode) {
       try { fs.chmodSync(str(p, n), mode & 0o7777); return 0; } catch (e) { return fsErr(e); }
     },

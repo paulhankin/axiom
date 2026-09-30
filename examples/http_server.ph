@@ -12,15 +12,15 @@
 //   curl -X DELETE localhost:8080/notes/1
 // =============================================================================
 
+import "std/collections/vec" as vec;
+import "std/encoding/json" as json;
 import "std/fmt" as fmt;
-import "std/http" as http;
 import "std/io" as io;
-import "std/json" as json;
 import "std/mem" as mem;
+import "std/net/http" as http;
 import "std/str" as str;
 import "std/sync" as sync;
 import "std/time" as time;
-import "std/vec" as vec;
 
 struct Note {
     id: i64,

@@ -1,7 +1,7 @@
-// std/map
+// std/collections/map
 import "../lib/io.ph" as io;
+import "std/collections/map" as map;
 import "std/hash" as hash;
-import "std/map" as map;
 
 fn err_of[T](r: !T) []u8 {
     _ = r catch |e| {

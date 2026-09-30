@@ -1971,7 +1971,8 @@ formatting are the same program.
 sorted by path; a duplicate import and an unused one are removed, except an import of a
 package (`pkg:`) or of a module that has tests (importing it runs them, §17); and a
 standard library module that the file uses as `name.x`, where `name` is declared nowhere,
-is imported as `std/name`.
+is imported: `std/name`, or `std/group/name` when that is the only module of that name one
+directory down (`vec` is `std/collections/vec`).
 
 ### 16.6 Profiling
 
@@ -2176,8 +2177,8 @@ phalange test file.ph|<package dir> [--target=wasm32|native] [--filter=text] [--
 - **Which tests run.** The tests in `file.ph`, plus those of the modules it imports that
   belong to the same package as `file.ph`, or, outside packages, that are not standard
   library modules. Given a package directory, the tests of every module in the package
-  (§4.6.4). Dependencies' tests don't run. Running `phalange test std/vec.ph` tests a
-  standard library module.
+  (§4.6.4). Dependencies' tests don't run. Running `phalange test std/collections/vec.ph`
+  tests a standard library module.
 - **Isolation.** Each test runs in isolation: a fresh WebAssembly instance in its own
   worker, or a forked process on native targets. A trap, a hang or corrupted memory
   can't affect other tests. Independent tests run in parallel.

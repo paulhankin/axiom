@@ -1,5 +1,5 @@
 // =============================================================================
-// std/hash.ph - hash and equality functions for std/map.
+// std/hash.ph - hash and equality functions for std/collections/map.
 //
 // The hashes are keyed with a random key chosen once per process, so that
 // whoever supplies a Map's keys (a JSON document, HTTP headers, ...) cannot

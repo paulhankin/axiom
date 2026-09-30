@@ -20,13 +20,13 @@
 // with SHA-256, SHA-384 or SHA-512. SHA-1 signatures are refused.
 // =============================================================================
 
-import "../base64.ph" as base64;
+import "../collections/vec.ph" as vec;
+import "../encoding/base64.ph" as base64;
 import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../net.ph" as net;
 import "../str.ph" as strs;
 import "../time.ph" as time;
-import "../vec.ph" as vec;
 import "curve25519.ph" as curve25519;
 import "der.ph" as der;
 import "ec.ph" as ec;

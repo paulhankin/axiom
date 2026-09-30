@@ -1,0 +1,1935 @@
+// =============================================================================
+// std/compress/zstd.ph - Zstandard compression (RFC 8878).
+//
+//     let packed = zstd.compress(data, 3)!;          // level 1..19; the caller frees
+//     let back = zstd.decompress(packed, 1 << 30)!;  // at most 1 GiB out
+//
+// decompress reads Zstandard frames one after another, and skips skippable
+// frames: raw, RLE and compressed blocks, Huffman-coded literals (one or
+// four streams, trees given directly or FSE-compressed, or repeated),
+// FSE-coded sequences in all four table modes, repeat offsets, and the
+// XXH64 content checksum. Frames that need a dictionary fail with
+// Unsupported.
+//
+// compress writes one frame with the content size and checksum. Matches
+// come from hash chains (with the repeat offsets tried first and one step
+// of lazy matching); literals are Huffman coded and sequences FSE coded
+// with tables fitted to each block, or kept raw when that is smaller.
+//
+// Decompression checks every table, size and offset against the format's
+// limits and stops at max_size, so hostile input fails cleanly.
+// =============================================================================
+
+import "../collections/vec.ph" as vec;
+import "../hash/xxhash.ph" as xxhash;
+import "../mem.ph" as mem;
+import "../os/fs.ph" as fs;
+import "../str.ph" as strs;
+
+error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory }
+
+const MAGIC: u32 = 0xfd2fb528;
+const BLOCK_MAX: usize = 128 << 10;
+const MAX_WINDOW: u64 = 1 << 31;
+
+fn le16(b: []u8, i: usize) u32 {
+    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8);
+}
+
+fn le24(b: []u8, i: usize) u32 {
+    return le16(b, i) | (@as(u32, b[i + 2]) << 16);
+}
+
+fn le32(b: []u8, i: usize) u32 {
+    return le16(b, i) | (le16(b, i + 2) << 16);
+}
+
+fn highbit(v: u32) u32 {
+    return 31 - @truncate(u32, @clz(v));
+}
+
+// -----------------------------------------------------------------------------
+// Bit readers
+// -----------------------------------------------------------------------------
+
+// Reads a stream backwards, from the bit below its end marker.
+struct Back {
+    s: []u8,
+    pos: i64,  // bits left above the start (negative: read past it)
+
+    fn init(s: []u8) !Back {
+        if (s.len == 0) or (s[s.len - 1] == 0) {
+            return error.Corrupt;
+        }
+        let top = highbit(@as(u32, s[s.len - 1]));
+        return Back.{ s: s, pos: (@as(i64, @truncate(u32, s.len)) * 8) - 8 + @as(i64, top) };
+    }
+
+    fn read(self: *mut Back, n: u32) u64 {
+        if n == 0 {
+            return 0;
+        }
+        self.pos -= @as(i64, n);
+        let mut from = self.pos;
+        let mut want = n;
+        let mut pad: u32 = 0;  // low bits below the start: zeros
+        if from < 0 {
+            let under = @truncate(u32, @bit_cast(u64, -from));
+            if under >= n {
+                return 0;
+            }
+            pad = under;
+            want = n - under;
+            from = 0;
+        }
+        let f = @truncate(usize, @bit_cast(u64, from));
+        let bi = f >> 3;
+        let mut word: u64 = 0;
+        for k in @as(usize, 0)..5 {
+            if (bi + k) < self.s.len {
+                word |= @as(u64, self.s[bi + k]) << @as(u64, 8 * k);
+            }
+        }
+        let v = (word >> @as(u64, f & 7)) & ((@as(u64, 1) << @as(u64, want)) - 1);
+        return v << @as(u64, pad);
+    }
+}
+
+// Reads a stream forwards (for table descriptions).
+struct Fwd {
+    s: []u8,
+    pos: usize,  // in bits
+
+    fn read(self: *mut Fwd, n: u32) !u32 {
+        let mut v: u32 = 0;
+        for k in @as(u32, 0)..n {
+            let p = self.pos + @as(usize, k);
+            if (p >> 3) >= self.s.len {
+                return error.Corrupt;
+            }
+            v |= @as(u32, (self.s[p >> 3] >> @truncate(u8, p & 7)) & 1) << k;
+        }
+        self.pos += @as(usize, n);
+        return v;
+    }
+
+    fn peek(self: *Fwd, n: u32) u32 {
+        let mut v: u32 = 0;
+        for k in @as(usize, 0)..@as(usize, n) {
+            let p = self.pos + k;
+            if (p >> 3) < self.s.len {
+                v |= @as(u32, (self.s[p >> 3] >> @truncate(u8, p & 7)) & 1) << @truncate(u32, k);
+            }
+        }
+        return v;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// FSE
+// -----------------------------------------------------------------------------
+
+struct FseEntry {
+    symbol: u8,
+    bits: u8,
+    base: u16,
+}
+
+struct Fse {
+    log: u32,
+    table: [512]FseEntry,
+}
+
+fn empty_fse() Fse {
+    return Fse.{ log: 0, table: [FseEntry.{ symbol: 0, bits: 0, base: 0 }; 512] };
+}
+
+// Builds a decoding table from normalized counts (-1: "less than one").
+fn fse_build(f: *mut Fse, counts: []i32, log: u32) !void {
+    let size = @as(usize, 1) << @truncate(u32, log);
+    let mut next: [256]u32 = [0; 256];
+    let mut high = size - 1;
+    let mut total: i64 = 0;
+    for s in @as(usize, 0)..counts.len {
+        let c = counts[s];
+        if c == -1 {
+            f.table[high].symbol = @truncate(u8, s);
+            if high == 0 {
+                return error.Corrupt;
+            }
+            high -= 1;
+            next[s] = 1;
+            total += 1;
+        } else if c < 0 {
+            return error.Corrupt;
+        } else {
+            next[s] = @bit_cast(u32, c);
+            total += @as(i64, c);
+        }
+    }
+    if total != @as(i64, @truncate(u32, size)) {
+        return error.Corrupt;
+    }
+    let step = (size >> 1) + (size >> 3) + 3;
+    let mask = size - 1;
+    let mut pos: usize = 0;
+    for s in @as(usize, 0)..counts.len {
+        let c = counts[s];
+        if c <= 0 {
+            continue;
+        }
+        for _k in @as(i32, 0)..c {
+            f.table[pos].symbol = @truncate(u8, s);
+            pos = (pos + step) & mask;
+            while pos > high {
+                pos = (pos + step) & mask;
+            }
+        }
+    }
+    if pos != 0 {
+        return error.Corrupt;
+    }
+    for u in @as(usize, 0)..size {
+        let s = @as(usize, f.table[u].symbol);
+        let ns = next[s];
+        next[s] += 1;
+        let nb = log - highbit(ns);
+        f.table[u].bits = @truncate(u8, nb);
+        f.table[u].base = @truncate(u16, (ns << nb) - @truncate(u32, size));
+    }
+    f.log = log;
+}
+
+// Reads a table description (normalized counts): returns its length in
+// bytes.
+fn read_ncount(src: []u8, counts: []mut i32, max_symbol: usize, max_log: u32, log_out: *mut u32,
+               nsym: *mut usize) !usize {
+    let mut r = Fwd.{ s: src, pos: 0 };
+    let log = r.read(4)! + 5;
+    if log > max_log {
+        return error.Corrupt;
+    }
+    let mut remaining = (@as(i32, 1) << @truncate(u32, log)) + 1;
+    let mut threshold = @as(i32, 1) << @truncate(u32, log);
+    let mut nbits = log + 1;
+    let mut s: usize = 0;
+    for k in @as(usize, 0)..counts.len {
+        counts[k] = 0;
+    }
+    while (remaining > 1) and (s <= max_symbol) {
+        let max = (2 * threshold) - 1 - remaining;
+        let mut v: i32 = 0;
+        let low = @bit_cast(i32, r.peek(nbits - 1));
+        if low < max {
+            v = low;
+            r.pos += @as(usize, nbits - 1);
+        } else {
+            v = @bit_cast(i32, r.peek(nbits));
+            if v >= threshold {
+                v -= max;
+            }
+            r.pos += @as(usize, nbits);
+        }
+        if (r.pos >> 3) > src.len {
+            return error.Corrupt;
+        }
+        let c = v - 1;
+        if c < 0 {
+            remaining -= 1;
+        } else {
+            remaining -= c;
+        }
+        counts[s] = c;
+        s += 1;
+        if c == 0 {
+            // repeat flags: runs of zero counts
+            loop {
+                let rep = r.read(2)!;
+                s += @as(usize, rep);
+                if s > (max_symbol + 1) {
+                    return error.Corrupt;
+                }
+                if rep != 3 {
+                    break;
+                }
+            }
+        }
+        while (remaining < threshold) and (threshold > 1) {
+            nbits -= 1;
+            threshold >>= 1;
+        }
+    }
+    if (remaining != 1) or (s > (max_symbol + 1)) {
+        return error.Corrupt;
+    }
+    log_out.* = log;
+    nsym.* = s;
+    return (r.pos + 7) / 8;
+}
+
+// -----------------------------------------------------------------------------
+// Huffman
+// -----------------------------------------------------------------------------
+
+struct Huff {
+    max_bits: u32,
+    table: [2048]u16,  // symbol << 8 | length, for every max_bits-bit prefix
+
+    fn decode(self: *Huff, b: *mut Back) u8 {
+        // peek max_bits (bits past the start read as zeros)
+        let saved = b.pos;
+        let v = @truncate(usize, b.read(self.max_bits));
+        let e = self.table[v];
+        b.pos = saved - @as(i64, e & 0xff);
+        return @truncate(u8, e >> 8);
+    }
+}
+
+// Builds a decoding table from weights (the last symbol's is implied).
+fn huff_build(h: *mut Huff, weights: []u8) !void {
+    if (weights.len == 0) or (weights.len > 255) {
+        return error.Corrupt;
+    }
+    let mut total: u32 = 0;
+    for w in weights {
+        if w > 11 {
+            return error.Corrupt;
+        }
+        if w > 0 {
+            total += @as(u32, 1) << @as(u32, w - 1);
+        }
+    }
+    if total == 0 {
+        return error.Corrupt;
+    }
+    let max_bits = highbit(total) + 1;
+    if max_bits > 11 {
+        return error.Corrupt;
+    }
+    let rest = (@as(u32, 1) << max_bits) - total;
+    if (rest & (rest - 1)) != 0 {
+        return error.Corrupt;
+    }
+    let last_w = @truncate(u8, highbit(rest) + 1);
+    let mut all: [256]u8 = [0; 256];
+    for k in @as(usize, 0)..weights.len {
+        all[k] = weights[k];
+    }
+    all[weights.len] = last_w;
+    let n = weights.len + 1;
+    // cells, in order of weight and then symbol
+    let mut cell: usize = 0;
+    for w in @as(u8, 1)..12 {
+        for s in @as(usize, 0)..n {
+            if all[s] != w {
+                continue;
+            }
+            let len = max_bits + 1 - @as(u32, w);
+            let span = @as(usize, 1) << @as(u32, w - 1);
+            for k in cell..cell + span {
+                h.table[k] = @truncate(u16, (s << 8) | @as(usize, len));
+            }
+            cell += span;
+        }
+    }
+    if cell != (@as(usize, 1) << max_bits) {
+        return error.Corrupt;
+    }
+    h.max_bits = max_bits;
+}
+
+// Reads a Huffman tree description: returns its length.
+fn read_huff(src: []u8, h: *mut Huff) !usize {
+    if src.len == 0 {
+        return error.Corrupt;
+    }
+    let hb = @as(usize, src[0]);
+    let mut weights: [256]u8 = [0; 256];
+    let mut n: usize = 0;
+    if hb >= 128 {
+        n = hb - 127;
+        let bytes = (n + 1) / 2;
+        if (1 + bytes) > src.len {
+            return error.Corrupt;
+        }
+        for k in @as(usize, 0)..n {
+            let b = src[1 + (k / 2)];
+            if (k % 2) == 0 {
+                weights[k] = b >> 4;
+            } else {
+                weights[k] = b & 15;
+            }
+        }
+        huff_build(h, weights[..n])!;
+        return 1 + bytes;
+    }
+    // FSE-compressed weights, two interleaved states
+    if (1 + hb) > src.len {
+        return error.Corrupt;
+    }
+    let body = src[1..1 + hb];
+    let mut counts: [256]i32 = [0; 256];
+    let mut log: u32 = 0;
+    let mut nsym: usize = 0;
+    let used = read_ncount(body, counts[..], 11, 6, &mut log, &mut nsym)!;
+    let mut f = empty_fse();
+    fse_build(&mut f, counts[..nsym], log)!;
+    if used >= body.len {
+        return error.Corrupt;
+    }
+    let mut b = Back.init(body[used..])!;
+    let mut s1 = @truncate(usize, b.read(log));
+    let mut s2 = @truncate(usize, b.read(log));
+    loop {
+        if n >= 255 {
+            return error.Corrupt;
+        }
+        weights[n] = f.table[s1].symbol;
+        n += 1;
+        s1 = @as(usize, f.table[s1].base) + @truncate(usize, b.read(@as(u32, f.table[s1].bits)));
+        if b.pos < 0 {
+            weights[n] = f.table[s2].symbol;
+            n += 1;
+            break;
+        }
+        if n >= 255 {
+            return error.Corrupt;
+        }
+        weights[n] = f.table[s2].symbol;
+        n += 1;
+        s2 = @as(usize, f.table[s2].base) + @truncate(usize, b.read(@as(u32, f.table[s2].bits)));
+        if b.pos < 0 {
+            weights[n] = f.table[s1].symbol;
+            n += 1;
+            break;
+        }
+    }
+    huff_build(h, weights[..n])!;
+    return 1 + hb;
+}
+
+fn huff_stream(h: *Huff, src: []u8, out: []mut u8) !void {
+    let mut b = Back.init(src)!;
+    for k in @as(usize, 0)..out.len {
+        out[k] = h.decode(&mut b);
+    }
+    if b.pos != 0 {
+        return error.Corrupt;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sequences
+// -----------------------------------------------------------------------------
+
+let LL_BASE: [36]u32 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+                        128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+let LL_BITS: [36]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+                       12, 13, 14, 15, 16];
+let ML_BASE: [53]u32 = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+                        29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051,
+                        4099, 8195, 16387, 32771, 65539];
+let ML_BITS: [53]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                       1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+let LL_DEFAULT: [36]i32 = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1,
+                           1, -1, -1, -1, -1];
+let ML_DEFAULT: [53]i32 = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1];
+let OF_DEFAULT: [29]i32 = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1];
+
+// The per-frame decoding state that blocks share.
+struct Frame {
+    huff: Huff,
+    have_huff: bool,
+    ll: Fse,
+    of: Fse,
+    ml: Fse,
+    have: [3]bool,  // the last tables of each kind (for repeat mode)
+    reps: [3]u64,
+    lits: vec.Vec.[u8],
+}
+
+fn new_frame() Frame {
+    return Frame.{ huff: Huff.{ max_bits: 0, table: [0; 2048] }, have_huff: false, ll: empty_fse(), of: empty_fse(),
+                   ml: empty_fse(), have: [false, false, false], reps: [1, 4, 8], lits: vec.Vec.[u8].init() };
+}
+
+// Reads a sequence table in one of the four modes: returns its length.
+fn read_table(src: []u8, mode: u32, f: *mut Fse, have: *mut bool, max_symbol: usize, max_log: u32, deflt: []i32,
+              deflt_log: u32) !usize {
+    if mode == 0 {
+        fse_build(f, deflt, deflt_log)!;
+        have.* = true;
+        return 0;
+    }
+    if mode == 1 {
+        if (src.len < 1) or (@as(usize, src[0]) > max_symbol) {
+            return error.Corrupt;
+        }
+        f.log = 0;
+        f.table[0] = FseEntry.{ symbol: src[0], bits: 0, base: 0 };
+        have.* = true;
+        return 1;
+    }
+    if mode == 2 {
+        let mut counts: [64]i32 = [0; 64];
+        let mut log: u32 = 0;
+        let mut nsym: usize = 0;
+        let used = read_ncount(src, counts[..], max_symbol, max_log, &mut log, &mut nsym)!;
+        fse_build(f, counts[..nsym], log)!;
+        have.* = true;
+        return used;
+    }
+    if not have.* {
+        return error.Corrupt;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Blocks and frames
+// -----------------------------------------------------------------------------
+
+// Decodes a compressed block onto out (frame_start: where the frame's
+// output began, for checking offsets).
+fn compressed_block(src: []u8, fr: *mut Frame, out: *mut strs.String, frame_start: usize, max_size: usize) !void {
+    if src.len == 0 {
+        return error.Corrupt;
+    }
+    // literals
+    let b0 = src[0];
+    let ltype = b0 & 3;
+    let sf = (b0 >> 2) & 3;
+    let mut hsize: usize = 1;
+    let mut regen: usize = 0;
+    let mut csize: usize = 0;
+    let mut streams: usize = 1;
+    if ltype < 2 {
+        if (sf & 1) == 0 {
+            regen = @as(usize, b0 >> 3);
+        } else if sf == 1 {
+            if src.len < 2 {
+                return error.Corrupt;
+            }
+            hsize = 2;
+            regen = @as(usize, le16(src, 0) >> 4);
+        } else {
+            if src.len < 3 {
+                return error.Corrupt;
+            }
+            hsize = 3;
+            regen = @as(usize, le24(src, 0) >> 4);
+        }
+    } else {
+        let mut bits: u32 = 10;
+        if sf == 0 {
+            hsize = 3;
+        } else if sf == 1 {
+            hsize = 3;
+            streams = 4;
+        } else if sf == 2 {
+            hsize = 4;
+            bits = 14;
+            streams = 4;
+        } else {
+            hsize = 5;
+            bits = 18;
+            streams = 4;
+        }
+        if src.len < hsize {
+            return error.Corrupt;
+        }
+        let mut v: u64 = 0;
+        for k in @as(usize, 0)..hsize {
+            v |= @as(u64, src[k]) << @as(u64, 8 * k);
+        }
+        let mask = (@as(u64, 1) << @as(u64, bits)) - 1;
+        regen = @truncate(usize, (v >> 4) & mask);
+        csize = @truncate(usize, (v >> @as(u64, 4 + bits)) & mask);
+    }
+    if regen > BLOCK_MAX {
+        return error.Corrupt;
+    }
+    let mut i = hsize;
+    fr.lits.clear();
+    fr.lits.reserve(regen)!;
+    if ltype == 0 {
+        if (src.len - i) < regen {
+            return error.Corrupt;
+        }
+        fr.lits.extend(src[i..i + regen])!;
+        i += regen;
+    } else if ltype == 1 {
+        if i >= src.len {
+            return error.Corrupt;
+        }
+        for _k in @as(usize, 0)..regen {
+            fr.lits.push(src[i])!;
+        }
+        i += 1;
+    } else {
+        if (src.len - i) < csize {
+            return error.Corrupt;
+        }
+        let mut body = src[i..i + csize];
+        i += csize;
+        if ltype == 2 {
+            let used = read_huff(body, &mut fr.huff)!;
+            fr.have_huff = true;
+            body = body[used..];
+        } else if not fr.have_huff {
+            return error.Corrupt;
+        }
+        for _k in @as(usize, 0)..regen {
+            fr.lits.push(0)!;
+        }
+        let lits = fr.lits.items();
+        if streams == 1 {
+            huff_stream(&fr.huff, body, lits)!;
+        } else {
+            if body.len < 6 {
+                return error.Corrupt;
+            }
+            let s1 = @as(usize, le16(body, 0));
+            let s2 = @as(usize, le16(body, 2));
+            let s3 = @as(usize, le16(body, 4));
+            let rest = body[6..];
+            if (s1 + s2 + s3) > rest.len {
+                return error.Corrupt;
+            }
+            let seg = (regen + 3) / 4;
+            if (3 * seg) > regen {
+                return error.Corrupt;
+            }
+            huff_stream(&fr.huff, rest[..s1], lits[..seg])!;
+            huff_stream(&fr.huff, rest[s1..s1 + s2], lits[seg..2 * seg])!;
+            huff_stream(&fr.huff, rest[s1 + s2..s1 + s2 + s3], lits[2 * seg..3 * seg])!;
+            huff_stream(&fr.huff, rest[s1 + s2 + s3..], lits[3 * seg..])!;
+        }
+    }
+    // sequences
+    if i >= src.len {
+        return error.Corrupt;
+    }
+    let mut nseq = @as(usize, src[i]);
+    i += 1;
+    if nseq >= 128 {
+        if nseq < 255 {
+            if i >= src.len {
+                return error.Corrupt;
+            }
+            nseq = ((nseq - 128) << 8) + @as(usize, src[i]);
+            i += 1;
+        } else {
+            if (src.len - i) < 2 {
+                return error.Corrupt;
+            }
+            nseq = @as(usize, le16(src, i)) + 0x7f00;
+            i += 2;
+        }
+    }
+    let lits = fr.lits.items();
+    if nseq == 0 {
+        if i != src.len {
+            return error.Corrupt;
+        }
+        if (out.len + lits.len) > max_size {
+            return error.TooLarge;
+        }
+        out.push_str(lits)!;
+        return;
+    }
+    if i >= src.len {
+        return error.Corrupt;
+    }
+    let modes = src[i];
+    i += 1;
+    if (modes & 3) != 0 {
+        return error.Corrupt;
+    }
+    i += read_table(src[i..], @as(u32, modes >> 6), &mut fr.ll, &mut fr.have[0], 35, 9, LL_DEFAULT[..], 6)!;
+    i += read_table(src[i..], @as(u32, (modes >> 4) & 3), &mut fr.of, &mut fr.have[1], 31, 8, OF_DEFAULT[..], 5)!;
+    i += read_table(src[i..], @as(u32, (modes >> 2) & 3), &mut fr.ml, &mut fr.have[2], 52, 9, ML_DEFAULT[..], 6)!;
+    if i >= src.len {
+        return error.Corrupt;
+    }
+    let mut b = Back.init(src[i..])!;
+    let mut sll = @truncate(usize, b.read(fr.ll.log));
+    let mut sof = @truncate(usize, b.read(fr.of.log));
+    let mut sml = @truncate(usize, b.read(fr.ml.log));
+    let mut lp: usize = 0;  // literals used
+    for n in @as(usize, 0)..nseq {
+        let ofc = @as(u32, fr.of.table[sof].symbol);
+        let mlc = @as(usize, fr.ml.table[sml].symbol);
+        let llc = @as(usize, fr.ll.table[sll].symbol);
+        if (ofc > 31) or (mlc > 52) or (llc > 35) {
+            return error.Corrupt;
+        }
+        let mut ofv = (@as(u64, 1) << @as(u64, ofc)) + b.read(ofc);
+        let ml = @as(usize, ML_BASE[mlc]) + @truncate(usize, b.read(@as(u32, ML_BITS[mlc])));
+        let ll = @as(usize, LL_BASE[llc]) + @truncate(usize, b.read(@as(u32, LL_BITS[llc])));
+        if (n + 1) < nseq {
+            let e1 = fr.ll.table[sll];
+            sll = @as(usize, e1.base) + @truncate(usize, b.read(@as(u32, e1.bits)));
+            let e2 = fr.ml.table[sml];
+            sml = @as(usize, e2.base) + @truncate(usize, b.read(@as(u32, e2.bits)));
+            let e3 = fr.of.table[sof];
+            sof = @as(usize, e3.base) + @truncate(usize, b.read(@as(u32, e3.bits)));
+        }
+        // the offset (with the three repeat offsets)
+        let mut off: u64 = 0;
+        if ofv > 3 {
+            off = ofv - 3;
+            fr.reps[2] = fr.reps[1];
+            fr.reps[1] = fr.reps[0];
+            fr.reps[0] = off;
+        } else {
+            if ll == 0 {
+                ofv += 1;
+            }
+            if ofv == 1 {
+                off = fr.reps[0];
+            } else if ofv == 2 {
+                off = fr.reps[1];
+                fr.reps[1] = fr.reps[0];
+                fr.reps[0] = off;
+            } else if ofv == 3 {
+                off = fr.reps[2];
+                fr.reps[2] = fr.reps[1];
+                fr.reps[1] = fr.reps[0];
+                fr.reps[0] = off;
+            } else {
+                off = fr.reps[0] -% 1;
+                fr.reps[2] = fr.reps[1];
+                fr.reps[1] = fr.reps[0];
+                fr.reps[0] = off;
+            }
+        }
+        // literals, then the match
+        if (lits.len - lp) < ll {
+            return error.Corrupt;
+        }
+        if ((out.len + ll) + ml) > max_size {
+            return error.TooLarge;
+        }
+        out.push_str(lits[lp..lp + ll])!;
+        lp += ll;
+        if (off == 0) or (off > @as(u64, out.len - frame_start)) {
+            return error.Corrupt;
+        }
+        let back = @truncate(usize, off);
+        out.reserve(ml)!;
+        let buf = out.buf;
+        let mut at = out.len;
+        for _k in @as(usize, 0)..ml {
+            buf[at] = buf[at - back];
+            at += 1;
+        }
+        out.len = at;
+    }
+    if b.pos != 0 {
+        return error.Corrupt;
+    }
+    if (out.len + (lits.len - lp)) > max_size {
+        return error.TooLarge;
+    }
+    out.push_str(lits[lp..])!;
+}
+
+/// Decompresses Zstandard frames (skipping skippable ones); the caller frees
+/// the result.
+pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+    let mut out = strs.String.init();
+    decode_frames(data, &mut out, max_size) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+fn decode_frames(d: []u8, out: *mut strs.String, max_size: usize) !void {
+    let mut i: usize = 0;
+    if d.len == 0 {
+        return error.Corrupt;
+    }
+    let mut fr = new_frame();
+    defer fr.lits.deinit();
+    while i < d.len {
+        if (d.len - i) < 4 {
+            return error.Corrupt;
+        }
+        let magic = le32(d, i);
+        if (magic & 0xfffffff0) == 0x184d2a50 {
+            if (d.len - i) < 8 {
+                return error.Corrupt;
+            }
+            let n = @as(usize, le32(d, i + 4));
+            if n > (d.len - i - 8) {
+                return error.Corrupt;
+            }
+            i += 8 + n;
+            continue;
+        }
+        if magic != MAGIC {
+            return error.Corrupt;
+        }
+        i = frame(d, i + 4, &mut fr, out, max_size)!;
+    }
+}
+
+fn frame(d: []u8, at: usize, fr: *mut Frame, out: *mut strs.String, max_size: usize) !usize {
+    let mut i = at;
+    if i >= d.len {
+        return error.Corrupt;
+    }
+    let fhd = d[i];
+    i += 1;
+    let fcs_flag = fhd >> 6;
+    let single = (fhd & 0x20) != 0;
+    let checksum = (fhd & 4) != 0;
+    let did_flag = fhd & 3;
+    if (fhd & 8) != 0 {
+        return error.Corrupt;  // reserved
+    }
+    let mut window: u64 = 0;
+    if not single {
+        if i >= d.len {
+            return error.Corrupt;
+        }
+        let wd = d[i];
+        i += 1;
+        let exp = @as(u64, wd >> 3);
+        let base = @as(u64, 1) << (10 + exp);
+        window = base + ((base / 8) * @as(u64, wd & 7));
+    }
+    let did_sizes: [4]usize = [0, 1, 2, 4];
+    let dsz = did_sizes[@as(usize, did_flag)];
+    if (d.len - i) < dsz {
+        return error.Corrupt;
+    }
+    let mut dict_id: u32 = 0;
+    for k in @as(usize, 0)..dsz {
+        dict_id |= @as(u32, d[i + k]) << @truncate(u32, 8 * k);
+    }
+    i += dsz;
+    if dict_id != 0 {
+        return error.Unsupported;
+    }
+    let mut fcs_size: usize = 0;
+    if fcs_flag == 0 {
+        if single {
+            fcs_size = 1;
+        }
+    } else {
+        fcs_size = @as(usize, 1) << @as(u32, fcs_flag);
+    }
+    if (d.len - i) < fcs_size {
+        return error.Corrupt;
+    }
+    let mut fcs: u64 = 0;
+    for k in @as(usize, 0)..fcs_size {
+        fcs |= @as(u64, d[i + k]) << @as(u64, 8 * k);
+    }
+    if fcs_size == 2 {
+        fcs += 256;
+    }
+    i += fcs_size;
+    let has_fcs = fcs_size > 0;
+    if single {
+        window = fcs;
+    }
+    if window > MAX_WINDOW {
+        return error.Unsupported;
+    }
+    if has_fcs and (fcs > @as(u64, max_size - @min(max_size, out.len))) {
+        return error.TooLarge;
+    }
+    let block_max = @min(BLOCK_MAX, @truncate(usize, @max(window, 1)));
+    let start = out.len;
+    fr.have_huff = false;
+    fr.have = [false, false, false];
+    fr.reps = [1, 4, 8];
+    loop {
+        if (d.len - i) < 3 {
+            return error.Corrupt;
+        }
+        let bh = le24(d, i);
+        i += 3;
+        let last = (bh & 1) != 0;
+        let btype = (bh >> 1) & 3;
+        let bsize = @as(usize, bh >> 3);
+        if btype == 1 {
+            // RLE: one byte, repeated
+            if (i >= d.len) or (bsize > block_max) {
+                return error.Corrupt;
+            }
+            if (out.len + bsize) > max_size {
+                return error.TooLarge;
+            }
+            let c = d[i];
+            i += 1;
+            out.reserve(bsize)!;
+            for _k in @as(usize, 0)..bsize {
+                out.push(c)!;
+            }
+        } else {
+            if ((d.len - i) < bsize) or (bsize > block_max) {
+                return error.Corrupt;
+            }
+            let body = d[i..i + bsize];
+            i += bsize;
+            if btype == 0 {
+                if (out.len + bsize) > max_size {
+                    return error.TooLarge;
+                }
+                out.push_str(body)!;
+            } else if btype == 2 {
+                let before = out.len;
+                compressed_block(body, fr, out, start, max_size)!;
+                if (out.len - before) > block_max {
+                    return error.Corrupt;
+                }
+            } else {
+                return error.Corrupt;
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    if has_fcs and (@as(u64, out.len - start) != fcs) {
+        return error.Corrupt;
+    }
+    if checksum {
+        if (d.len - i) < 4 {
+            return error.Corrupt;
+        }
+        let h = @truncate(u32, xxhash.xxh64(out.bytes()[start..], 0));
+        if h != le32(d, i) {
+            return error.ChecksumMismatch;
+        }
+        i += 4;
+    }
+    return i;
+}
+
+// -----------------------------------------------------------------------------
+// Compression: bits, FSE and Huffman
+// -----------------------------------------------------------------------------
+
+struct BitW {
+    out: *mut strs.String,
+    acc: u64,
+    n: u32,
+
+    fn add(self: *mut BitW, v: u64, k: u32) !void {
+        if k == 0 {
+            return;
+        }
+        self.acc |= (v & ((@as(u64, 1) << @as(u64, k)) - 1)) << @as(u64, self.n);
+        self.n += k;
+        while self.n >= 8 {
+            self.out.push(@truncate(u8, self.acc))!;
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+
+    // The end marker, and the last partial byte.
+    fn close(self: *mut BitW) !void {
+        self.add(1, 1)!;
+        if self.n > 0 {
+            self.out.push(@truncate(u8, self.acc))!;
+            self.acc = 0;
+            self.n = 0;
+        }
+    }
+}
+
+struct CTable {
+    log: u32,
+    states: [512]u16,
+    delta_bits: [64]i32,
+    delta_state: [64]i32,
+}
+
+fn empty_ctable() CTable {
+    return CTable.{ log: 0, states: [0; 512], delta_bits: [0; 64], delta_state: [0; 64] };
+}
+
+// The encoding table for normalized counts (the same spread as fse_build).
+fn ctable_build(t: *mut CTable, norm: []i32, log: u32) void {
+    let size = @as(usize, 1) << @truncate(u32, log);
+    let mut symbols: [512]u8 = [0; 512];
+    let mut cumul: [65]u32 = [0; 65];
+    let mut high = size - 1;
+    for s in @as(usize, 0)..norm.len {
+        if norm[s] == -1 {
+            cumul[s + 1] = cumul[s] + 1;
+            symbols[high] = @truncate(u8, s);
+            high -= 1;
+        } else {
+            cumul[s + 1] = cumul[s] + @bit_cast(u32, @max(norm[s], 0));
+        }
+    }
+    let step = (size >> 1) + (size >> 3) + 3;
+    let mask = size - 1;
+    let mut pos: usize = 0;
+    for s in @as(usize, 0)..norm.len {
+        for _k in @as(i32, 0)..@max(norm[s], 0) {
+            symbols[pos] = @truncate(u8, s);
+            pos = (pos + step) & mask;
+            while pos > high {
+                pos = (pos + step) & mask;
+            }
+        }
+    }
+    let mut next: [65]u32 = cumul;
+    for u in @as(usize, 0)..size {
+        let s = @as(usize, symbols[u]);
+        t.states[@as(usize, next[s])] = @truncate(u16, size + u);
+        next[s] += 1;
+    }
+    let mut total: i32 = 0;
+    for s in @as(usize, 0)..norm.len {
+        let c = norm[s];
+        if c == 0 {
+            t.delta_bits[s] = (@bit_cast(i32, log + 1) << 16) - (@as(i32, 1) << @truncate(u32, log));
+        } else if (c == -1) or (c == 1) {
+            t.delta_bits[s] = (@bit_cast(i32, log) << 16) - (@as(i32, 1) << @truncate(u32, log));
+            t.delta_state[s] = total - 1;
+            total += 1;
+        } else {
+            let max_out = log - highbit(@bit_cast(u32, c - 1));
+            let min_plus = c << @truncate(u32, max_out);
+            t.delta_bits[s] = (@bit_cast(i32, max_out) << 16) - min_plus;
+            t.delta_state[s] = total - c;
+            total += c;
+        }
+    }
+    t.log = log;
+}
+
+// A table for a single symbol (RLE mode).
+fn ctable_rle(t: *mut CTable, sym: usize) void {
+    t.log = 0;
+    t.states[0] = 0;
+    t.delta_bits[sym] = 0;
+    t.delta_state[sym] = 0;
+}
+
+fn fse_init(t: *CTable, sym: usize) u32 {
+    let db = t.delta_bits[sym];
+    let nb = @bit_cast(u32, (db + (1 << 15)) >> 16);
+    let value = @bit_cast(i32, nb << 16) - db;
+    let idx = (value >> @truncate(u32, nb)) + t.delta_state[sym];
+    return @as(u32, t.states[@as(usize, @bit_cast(u32, idx))]);
+}
+
+fn fse_encode(w: *mut BitW, t: *CTable, state: *mut u32, sym: usize) !void {
+    let nb = @bit_cast(u32, (@bit_cast(i32, state.*) + t.delta_bits[sym]) >> 16);
+    w.add(@as(u64, state.*), nb)!;
+    let idx = @bit_cast(i32, state.* >> nb) + t.delta_state[sym];
+    state.* = @as(u32, t.states[@as(usize, @bit_cast(u32, idx))]);
+}
+
+// Normalizes counts to sum to 1 << log (each present symbol at least 1).
+fn normalize(counts: []u32, total: u32, log: u32, norm: []mut i32) void {
+    let size = @as(i64, 1) << @truncate(u32, log);
+    let mut sum: i64 = 0;
+    let mut biggest: usize = 0;
+    for s in @as(usize, 0)..counts.len {
+        norm[s] = 0;
+        if counts[s] == 0 {
+            continue;
+        }
+        let v = @max((@as(i64, counts[s]) * size) / @as(i64, total), 1);
+        norm[s] = @truncate(i32, v);
+        sum += v;
+        if counts[s] > counts[biggest] {
+            biggest = s;
+        }
+    }
+    let mut diff = size - sum;
+    if diff >= 0 {
+        norm[biggest] += @truncate(i32, diff);
+        return;
+    }
+    // too many: take from the largest ones that can spare it
+    while diff < 0 {
+        let mut best: usize = 0;
+        let mut bv: i32 = 1;
+        for s in @as(usize, 0)..counts.len {
+            if norm[s] > bv {
+                bv = norm[s];
+                best = s;
+            }
+        }
+        let take = @min(-diff, @as(i64, bv - 1) - (@as(i64, bv) / 2) + 1);
+        norm[best] -= @truncate(i32, @max(take, 1));
+        diff += @max(take, 1);
+    }
+}
+
+// Writes a table description (normalized counts).
+fn write_ncount(w: *mut BitW, norm: []i32, log: u32) !void {
+    let size = @as(i32, 1) << @truncate(u32, log);
+    w.add(@as(u64, log - 5), 4)!;
+    let mut remaining = size + 1;
+    let mut threshold = size;
+    let mut nbits = log + 1;
+    let mut s: usize = 0;
+    let mut prev0 = false;
+    let n = norm.len;
+    while (s < n) and (remaining > 1) {
+        if prev0 {
+            let mut st = s;
+            while (s < n) and (norm[s] == 0) {
+                s += 1;
+            }
+            while s >= (st + 3) {
+                st += 3;
+                w.add(3, 2)!;
+            }
+            w.add(@as(u64, s - st), 2)!;
+            if s >= n {
+                break;
+            }
+        }
+        let c = norm[s];
+        s += 1;
+        let max = (2 * threshold) - 1 - remaining;
+        if c < 0 {
+            remaining -= 1;
+        } else {
+            remaining -= c;
+        }
+        let mut v = c + 1;
+        if v >= threshold {
+            v += max;
+        }
+        if v < max {
+            w.add(@as(u64, @bit_cast(u32, v)), nbits - 1)!;
+        } else {
+            w.add(@as(u64, @bit_cast(u32, v)), nbits)!;
+        }
+        prev0 = c == 0;
+        while remaining < threshold {
+            nbits -= 1;
+            threshold >>= 1;
+        }
+    }
+}
+
+// Code lengths of at most max_len bits (Huffman, flattened until it fits).
+fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) !void {
+    let n = freq.len;
+    let mut shift: u32 = 0;
+    loop {
+        // (a simple O(n^2) Huffman build: n <= 256)
+        let total = (2 * n) - 1;
+        let w = mem.alloc.[u64](total)!;
+        defer mem.free(w);
+        let parent = mem.alloc.[u32](total)!;
+        defer mem.free(parent);
+        let alive = mem.alloc.[bool](total)!;
+        defer mem.free(alive);
+        let mut live: usize = 0;
+        for k in @as(usize, 0)..n {
+            alive[k] = freq[k] > 0;
+            w[k] = @max(@as(u64, freq[k]) >> @as(u64, shift), 1);
+            if alive[k] {
+                live += 1;
+            }
+        }
+        let mut next = n;
+        while live > 1 {
+            let mut a: usize = total;
+            let mut b: usize = total;
+            for k in @as(usize, 0)..next {
+                if not alive[k] {
+                    continue;
+                }
+                if (a == total) or (w[k] < w[a]) {
+                    b = a;
+                    a = k;
+                } else if (b == total) or (w[k] < w[b]) {
+                    b = k;
+                }
+            }
+            w[next] = w[a] + w[b];
+            alive[a] = false;
+            alive[b] = false;
+            alive[next] = true;
+            parent[a] = @truncate(u32, next);
+            parent[b] = @truncate(u32, next);
+            next += 1;
+            live -= 1;
+        }
+        let root = next - 1;
+        let mut longest: u32 = 0;
+        for k in @as(usize, 0)..n {
+            lens[k] = 0;
+            if freq[k] == 0 {
+                continue;
+            }
+            let mut d: u32 = 0;
+            let mut p = k;
+            while p != root {
+                p = @as(usize, parent[p]);
+                d += 1;
+            }
+            lens[k] = @truncate(u8, d);
+            longest = @max(longest, d);
+        }
+        if longest <= max_len {
+            return;
+        }
+        shift += 1;
+    }
+}
+
+// Huffman-codes literals: the literals section (header included), or
+// nothing (returns false) if raw literals would be as small.
+fn huff_literals(lits: []u8, out: *mut strs.String) !bool {
+    let mut freq: [256]u32 = [0; 256];
+    for c in lits {
+        freq[@as(usize, c)] += 1;
+    }
+    let mut max_sym: usize = 0;
+    let mut distinct: usize = 0;
+    for s in @as(usize, 0)..256 {
+        if freq[s] > 0 {
+            max_sym = s;
+            distinct += 1;
+        }
+    }
+    if distinct < 2 {
+        return false;
+    }
+    let mut lens: [256]u8 = [0; 256];
+    code_lengths(freq[..max_sym + 1], lens[..max_sym + 1], 11)!;
+    let mut max_bits: u32 = 0;
+    for l in lens[..max_sym + 1] {
+        max_bits = @max(max_bits, @as(u32, l));
+    }
+    let mut weights: [256]u8 = [0; 256];
+    for s in @as(usize, 0)..max_sym + 1 {
+        if lens[s] > 0 {
+            weights[s] = @truncate(u8, max_bits + 1 - @as(u32, lens[s]));
+        }
+    }
+    // codes: cells in order of weight, then symbol
+    let mut codes: [256]u32 = [0; 256];
+    let mut cell: u32 = 0;
+    for w in @as(u8, 1)..12 {
+        for s in @as(usize, 0)..max_sym + 1 {
+            if weights[s] == w {
+                let l = @as(u32, lens[s]);
+                codes[s] = cell >> (max_bits - l);
+                cell += @as(u32, 1) << @as(u32, w - 1);
+            }
+        }
+    }
+    // the tree description: FSE-compressed weights, or direct ones
+    let mut tree = strs.String.init();
+    defer tree.deinit();
+    let nw = max_sym;  // (the last symbol's weight is implied)
+    let mut fse_ok = false;
+    if nw >= 2 {
+        let mut wf: [13]u32 = [0; 13];
+        for k in @as(usize, 0)..nw {
+            wf[@as(usize, weights[k])] += 1;
+        }
+        let mut top: usize = 0;
+        for k in @as(usize, 0)..13 {
+            if wf[k] > 0 {
+                top = k;
+            }
+        }
+        let mut norm: [13]i32 = [0; 13];
+        normalize(wf[..top + 1], @truncate(u32, nw), 6, norm[..top + 1]);
+        let mut ct = empty_ctable();
+        ctable_build(&mut ct, norm[..top + 1], 6);
+        let mut body = strs.String.init();
+        defer body.deinit();
+        let mut w = BitW.{ out: &mut body, acc: 0, n: 0 };
+        write_ncount(&mut w, norm[..top + 1], 6)!;
+        if w.n > 0 {
+            body.push(@truncate(u8, w.acc))!;
+            w.acc = 0;
+            w.n = 0;
+        }
+        // two interleaved states, symbols from the end
+        let mut w2 = BitW.{ out: &mut body, acc: 0, n: 0 };
+        let mut k = nw;
+        let mut s1: u32 = 0;
+        let mut s2: u32 = 0;
+        if (nw % 2) == 1 {
+            k -= 1;
+            s1 = fse_init(&ct, @as(usize, weights[k]));
+            k -= 1;
+            s2 = fse_init(&ct, @as(usize, weights[k]));
+            k -= 1;
+            fse_encode(&mut w2, &ct, &mut s1, @as(usize, weights[k]))!;
+        } else {
+            k -= 1;
+            s2 = fse_init(&ct, @as(usize, weights[k]));
+            k -= 1;
+            s1 = fse_init(&ct, @as(usize, weights[k]));
+        }
+        while k > 0 {
+            k -= 1;
+            fse_encode(&mut w2, &ct, &mut s2, @as(usize, weights[k]))!;
+            k -= 1;
+            fse_encode(&mut w2, &ct, &mut s1, @as(usize, weights[k]))!;
+        }
+        w2.add(@as(u64, s2), 6)!;
+        w2.add(@as(u64, s1), 6)!;
+        w2.close()!;
+        if body.len < 128 {
+            tree.push(@truncate(u8, body.len))!;
+            tree.push_str(body.bytes())!;
+            fse_ok = true;
+        }
+    }
+    if nw <= 128 {
+        let direct = 1 + ((nw + 1) / 2);
+        if not fse_ok or (direct < tree.len) {
+            tree.clear();
+            tree.push(@truncate(u8, 127 + nw))!;
+            let mut k: usize = 0;
+            while k < nw {
+                let hi = weights[k];
+                let mut lo: u8 = 0;
+                if (k + 1) < nw {
+                    lo = weights[k + 1];
+                }
+                tree.push((hi << 4) | lo)!;
+                k += 2;
+            }
+            fse_ok = true;
+        }
+    }
+    if not fse_ok {
+        return false;
+    }
+    // the streams
+    let mut streams = strs.String.init();
+    defer streams.deinit();
+    let mut four = lits.len > 1023;
+    if not four {
+        huff_stream_encode(lits, lens[..], codes[..], &mut streams)!;
+        if (tree.len + streams.len) > 1023 {
+            four = true;
+            streams.clear();
+        }
+    }
+    if four {
+        let seg = (lits.len + 3) / 4;
+        let mut parts: [4]strs.String = [strs.String.init(), strs.String.init(), strs.String.init(),
+                                         strs.String.init()];
+        defer {
+            for k in @as(usize, 0)..4 {
+                parts[k].deinit();
+            }
+        }
+        for k in @as(usize, 0)..4 {
+            let a = @min(k * seg, lits.len);
+            let b = @min((k + 1) * seg, lits.len);
+            if k == 3 {
+                huff_stream_encode(lits[a..], lens[..], codes[..], &mut parts[k])!;
+            } else {
+                huff_stream_encode(lits[a..b], lens[..], codes[..], &mut parts[k])!;
+            }
+        }
+        for k in @as(usize, 0)..3 {
+            if parts[k].len > 65535 {
+                return false;
+            }
+            streams.push(@truncate(u8, parts[k].len))!;
+            streams.push(@truncate(u8, parts[k].len >> 8))!;
+        }
+        for k in @as(usize, 0)..4 {
+            streams.push_str(parts[k].bytes())!;
+        }
+    }
+    let csize = tree.len + streams.len;
+    if (csize + 5) >= lits.len {
+        return false;
+    }
+    // the header: type 2, the size format, and the two sizes
+    let regen = @as(u64, lits.len);
+    let c = @as(u64, csize);
+    let mut sf: u64 = 0;
+    let mut bits: u64 = 10;
+    let mut hsize: usize = 3;
+    if four {
+        sf = 1;
+        if @max(regen, c) > 16383 {
+            sf = 3;
+            bits = 18;
+            hsize = 5;
+        } else if @max(regen, c) > 1023 {
+            sf = 2;
+            bits = 14;
+            hsize = 4;
+        }
+    }
+    if @max(regen, c) >= (@as(u64, 1) << bits) {
+        return false;
+    }
+    let v = 2 | (sf << 2) | (regen << 4) | (c << (4 + bits));
+    for k in @as(usize, 0)..hsize {
+        out.push(@truncate(u8, v >> @as(u64, 8 * k)))!;
+    }
+    out.push_str(tree.bytes())!;
+    out.push_str(streams.bytes())!;
+    return true;
+}
+
+fn huff_stream_encode(lits: []u8, lens: []u8, codes: []u32, out: *mut strs.String) !void {
+    let mut w = BitW.{ out: out, acc: 0, n: 0 };
+    let mut k = lits.len;
+    while k > 0 {
+        k -= 1;
+        let s = @as(usize, lits[k]);
+        w.add(@as(u64, codes[s]), @as(u32, lens[s]))!;
+    }
+    w.close()!;
+}
+
+// -----------------------------------------------------------------------------
+// Compression: matches, sequences, blocks and the frame
+// -----------------------------------------------------------------------------
+
+struct Seq {
+    ll: u32,
+    ml: u32,
+    ofv: u32,  // the offset value (repeat codes 1-3, or offset + 3)
+}
+
+const MIN_MATCH: usize = 3;
+const MAX_MATCH: usize = 131074;
+const ZHASH: usize = 1 << 17;
+
+struct Matcher {
+    data: []u8,
+    head: []mut u32,
+    chain: []mut u32,
+    depth: u32,
+    window: usize,
+
+    fn hash(self: *Matcher, i: usize) usize {
+        let d = self.data;
+        let v = (@as(u32, d[i]) << 16) | (@as(u32, d[i + 1]) << 8) | @as(u32, d[i + 2]);
+        return @as(usize, (v *% 2654435761) >> 15) & (ZHASH - 1);
+    }
+
+    fn insert(self: *mut Matcher, i: usize) void {
+        if (i + MIN_MATCH) > self.data.len {
+            return;
+        }
+        let h = self.hash(i);
+        self.chain[i] = self.head[h];
+        self.head[h] = @truncate(u32, i);
+    }
+
+    fn len_at(self: *Matcher, i: usize, back: usize, limit: usize) usize {
+        let d = self.data;
+        let mut l: usize = 0;
+        while (l < limit) and (d[i + l] == d[i + l - back]) {
+            l += 1;
+        }
+        return l;
+    }
+
+    // The longest match at i (from positions >= lo): its distance, and
+    // its length in len.
+    fn find(self: *Matcher, i: usize, lo: usize, len: *mut usize) usize {
+        len.* = 0;
+        if (i + MIN_MATCH) > self.data.len {
+            return 0;
+        }
+        let limit = @min(MAX_MATCH, self.data.len - i);
+        let mut best: usize = 0;
+        let mut best_d: usize = 0;
+        let mut c = self.head[self.hash(i)];
+        let mut tries = self.depth;
+        while (c != 0xffffffff) and (tries > 0) and (@as(usize, c) >= lo) {
+            let back = i - @as(usize, c);
+            if back > self.window {
+                break;
+            }
+            if best >= limit {
+                break;
+            }
+            if (best == 0) or (self.data[@as(usize, c) + best] == self.data[i + best]) {
+                let l = self.len_at(i, back, limit);
+                if l > best {
+                    best = l;
+                    best_d = back;
+                }
+            }
+            c = self.chain[@as(usize, c)];
+            tries -= 1;
+        }
+        if best < MIN_MATCH {
+            return 0;
+        }
+        len.* = best;
+        return best_d;
+    }
+}
+
+fn ll_code(v: u32) usize {
+    let mut c: usize = 35;
+    while LL_BASE[c] > v {
+        c -= 1;
+    }
+    return c;
+}
+
+fn ml_code(v: u32) usize {
+    let mut c: usize = 52;
+    while ML_BASE[c] > v {
+        c -= 1;
+    }
+    return c;
+}
+
+// The offset value for a match at distance d after ll literals, updating
+// the repeat offsets as the decoder will.
+fn offset_value(d: u64, ll: u32, reps: *mut [3]u64) u32 {
+    let r = reps.*;
+    let mut v: u32 = 0;
+    if ll > 0 {
+        if d == r[0] {
+            return 1;
+        }
+        if d == r[1] {
+            v = 2;
+        } else if d == r[2] {
+            v = 3;
+        }
+    } else {
+        if d == r[1] {
+            v = 1;
+        } else if d == r[2] {
+            v = 2;
+        } else if d == (r[0] -% 1) {
+            v = 3;
+        }
+    }
+    if (v == 0) or ((ll == 0) and (d == r[0])) {
+        reps.* = [d, r[0], r[1]];
+        return @truncate(u32, d) + 3;
+    }
+    // (the same updates as decoding)
+    if ((ll > 0) and (v == 2)) or ((ll == 0) and (v == 1)) {
+        reps.* = [d, r[0], r[2]];
+    } else {
+        reps.* = [d, r[0], r[1]];
+    }
+    return v;
+}
+
+// Chooses the sequences of a block (data[start..end]) with hash chains and
+// one step of lazy matching.
+fn find_sequences(m: *mut Matcher, start: usize, end: usize, reps: *mut [3]u64, seqs: *mut vec.Vec.[Seq],
+                  lits: *mut vec.Vec.[u8], lazy: bool) !void {
+    let mut i = start;
+    let mut anchor = start;
+    let limit = end;
+    while (i + MIN_MATCH) <= limit {
+        // the repeat offsets first: they are cheap
+        let r = reps.*;
+        let mut best_len: usize = 0;
+        let mut best_d: usize = 0;
+        for k in @as(usize, 0)..3 {
+            let d = @truncate(usize, r[k]);
+            if (d == 0) or (d > (i - 0)) or (d > m.window) {
+                continue;
+            }
+            let l = m.len_at(i, d, @min(MAX_MATCH, limit - i));
+            if l > best_len {
+                best_len = l;
+                best_d = d;
+            }
+        }
+        let mut ml: usize = 0;
+        let md = m.find(i, 0, &mut ml);
+        if (ml > (best_len + 2)) or ((best_len < MIN_MATCH) and (ml >= MIN_MATCH)) {
+            best_len = ml;
+            best_d = md;
+        }
+        best_len = @min(best_len, limit - i);
+        if best_len < MIN_MATCH {
+            m.insert(i);
+            i += 1;
+            continue;
+        }
+        if lazy and ((i + 1 + MIN_MATCH) <= limit) {
+            m.insert(i);
+            let mut nl: usize = 0;
+            _ = m.find(i + 1, 0, &mut nl);
+            if nl > (best_len + 1) {
+                i += 1;
+                continue;
+            }
+        } else {
+            m.insert(i);
+        }
+        let ll = @truncate(u32, i - anchor);
+        lits.extend(m.data[anchor..i])!;
+        let ofv = offset_value(@as(u64, best_d), ll, reps);
+        seqs.push(Seq.{ ll: ll, ml: @truncate(u32, best_len), ofv: ofv })!;
+        for k in i + 1..i + best_len {
+            m.insert(k);
+        }
+        i += best_len;
+        anchor = i;
+    }
+    lits.extend(m.data[anchor..end])!;
+}
+
+// Chooses a table for one kind of code: returns its mode, and writes its
+// description.
+fn choose_table(codes: []u8, max_symbol: usize, max_log: u32, deflt: []i32, deflt_log: u32, t: *mut CTable,
+                desc: *mut strs.String) !u32 {
+    let mut counts: [64]u32 = [0; 64];
+    let mut top: usize = 0;
+    let mut distinct: usize = 0;
+    for c in codes {
+        if counts[@as(usize, c)] == 0 {
+            distinct += 1;
+        }
+        counts[@as(usize, c)] += 1;
+        top = @max(top, @as(usize, c));
+    }
+    if distinct == 1 {
+        ctable_rle(t, top);
+        desc.push(@truncate(u8, top))!;
+        return 1;
+    }
+    let fits_default = top < deflt.len;
+    if (codes.len < 64) and fits_default {
+        ctable_build(t, deflt, deflt_log);
+        return 0;
+    }
+    let mut log = @max(@min(highbit(@truncate(u32, codes.len)) + 1, max_log), 5);
+    while (@as(usize, 1) << @truncate(u32, log)) < (distinct * 2) {
+        log += 1;
+    }
+    log = @min(log, max_log);
+    let mut norm: [64]i32 = [0; 64];
+    normalize(counts[..top + 1], @truncate(u32, codes.len), log, norm[..top + 1]);
+    ctable_build(t, norm[..top + 1], log);
+    let mut w = BitW.{ out: desc, acc: 0, n: 0 };
+    write_ncount(&mut w, norm[..top + 1], log)!;
+    if w.n > 0 {
+        desc.push(@truncate(u8, w.acc))!;
+    }
+    _ = max_symbol;
+    return 2;
+}
+
+// A compressed block's body, or nothing (false) if it would not be smaller.
+fn compress_block(block: []u8, seqs: []Seq, lits: []u8, out: *mut strs.String) !bool {
+    // literals
+    if not huff_literals(lits, out)! {
+        let n = lits.len;
+        let mut rle = n > 0;
+        for c in lits {
+            if c != lits[0] {
+                rle = false;
+                break;
+            }
+        }
+        let mut ty: usize = 0;
+        if rle and (n > 1) {
+            ty = 1;
+        }
+        if n <= 31 {
+            out.push(@truncate(u8, (n << 3) | ty))!;
+        } else if n <= 4095 {
+            out.push(@truncate(u8, (n << 4) | ty | 4))!;
+            out.push(@truncate(u8, n >> 4))!;
+        } else {
+            out.push(@truncate(u8, (n << 4) | ty | 12))!;
+            out.push(@truncate(u8, n >> 4))!;
+            out.push(@truncate(u8, n >> 12))!;
+        }
+        if ty == 1 {
+            out.push(lits[0])!;
+        } else {
+            out.push_str(lits)!;
+        }
+    }
+    // sequences
+    let n = seqs.len;
+    if n < 128 {
+        out.push(@truncate(u8, n))!;
+    } else if n < 0x7f00 {
+        out.push(@truncate(u8, (n >> 8) + 128))!;
+        out.push(@truncate(u8, n))!;
+    } else {
+        out.push(255)!;
+        out.push(@truncate(u8, n - 0x7f00))!;
+        out.push(@truncate(u8, (n - 0x7f00) >> 8))!;
+    }
+    if n > 0 {
+        let mut llc = vec.Vec.[u8].init();
+        defer llc.deinit();
+        let mut mlc = vec.Vec.[u8].init();
+        defer mlc.deinit();
+        let mut ofc = vec.Vec.[u8].init();
+        defer ofc.deinit();
+        for q in seqs {
+            llc.push(@truncate(u8, ll_code(q.ll)))!;
+            mlc.push(@truncate(u8, ml_code(q.ml)))!;
+            ofc.push(@truncate(u8, highbit(q.ofv)))!;
+        }
+        let mut tll = empty_ctable();
+        let mut tof = empty_ctable();
+        let mut tml = empty_ctable();
+        let mut dll = strs.String.init();
+        defer dll.deinit();
+        let mut dof = strs.String.init();
+        defer dof.deinit();
+        let mut dml = strs.String.init();
+        defer dml.deinit();
+        let mll = choose_table(llc.items(), 35, 9, LL_DEFAULT[..], 6, &mut tll, &mut dll)!;
+        let mof = choose_table(ofc.items(), 31, 8, OF_DEFAULT[..], 5, &mut tof, &mut dof)!;
+        let mml = choose_table(mlc.items(), 52, 9, ML_DEFAULT[..], 6, &mut tml, &mut dml)!;
+        out.push(@truncate(u8, (mll << 6) | (mof << 4) | (mml << 2)))!;
+        out.push_str(dll.bytes())!;
+        out.push_str(dof.bytes())!;
+        out.push_str(dml.bytes())!;
+        // the bitstream, from the last sequence back
+        let mut w = BitW.{ out: out, acc: 0, n: 0 };
+        let last = n - 1;
+        let lc = llc.items();
+        let mc = mlc.items();
+        let oc = ofc.items();
+        let mut sml = fse_init(&tml, @as(usize, mc[last]));
+        let mut sof = fse_init(&tof, @as(usize, oc[last]));
+        let mut sll = fse_init(&tll, @as(usize, lc[last]));
+        seq_bits(&mut w, seqs[last], lc[last], mc[last], oc[last])!;
+        let mut k = last;
+        while k > 0 {
+            k -= 1;
+            fse_encode(&mut w, &tof, &mut sof, @as(usize, oc[k]))!;
+            fse_encode(&mut w, &tml, &mut sml, @as(usize, mc[k]))!;
+            fse_encode(&mut w, &tll, &mut sll, @as(usize, lc[k]))!;
+            seq_bits(&mut w, seqs[k], lc[k], mc[k], oc[k])!;
+        }
+        w.add(@as(u64, sml), tml.log)!;
+        w.add(@as(u64, sof), tof.log)!;
+        w.add(@as(u64, sll), tll.log)!;
+        w.close()!;
+    }
+    return out.len < block.len;
+}
+
+fn seq_bits(w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) !void {
+    w.add(@as(u64, q.ll - LL_BASE[@as(usize, lc)]), @as(u32, LL_BITS[@as(usize, lc)]))!;
+    w.add(@as(u64, q.ml - ML_BASE[@as(usize, mc)]), @as(u32, ML_BITS[@as(usize, mc)]))!;
+    w.add(@as(u64, q.ofv - (@as(u32, 1) << @as(u32, oc))), @as(u32, oc))!;
+}
+
+/// Compresses data as one Zstandard frame (with its size and checksum);
+/// level 1 (fastest) to 19 (smallest). The caller frees the result.
+pub fn compress(data: []u8, level: u32) ![]mut u8 {
+    let mut out = strs.String.init();
+    encode_frame(data, level, &mut out) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+fn encode_frame(data: []u8, level: u32, out: *mut strs.String) !void {
+    let lv = @max(@min(level, 19), 1);
+    let n = @as(u64, data.len);
+    // the header: single segment, the content size, a checksum
+    let mut fcs_flag: u8 = 0;
+    let mut fcs_bytes: usize = 1;
+    let mut fcs = n;
+    if n >= 256 {
+        if n < (65536 + 256) {
+            fcs_flag = 1;
+            fcs_bytes = 2;
+            fcs = n - 256;
+        } else if n <= 0xffffffff {
+            fcs_flag = 2;
+            fcs_bytes = 4;
+        } else {
+            fcs_flag = 3;
+            fcs_bytes = 8;
+        }
+    }
+    let magic: [4]u8 = [0x28, 0xb5, 0x2f, 0xfd];
+    out.push_str(magic[..])!;
+    out.push((fcs_flag << 6) | 0x20 | 4)!;
+    for k in @as(usize, 0)..fcs_bytes {
+        out.push(@truncate(u8, fcs >> @as(u64, 8 * k)))!;
+    }
+    // the blocks
+    let depths: [20]u32 = [0, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024];
+    let mut m = Matcher.{ data: data, head: mem.alloc.[u32](ZHASH)!, chain: mem.alloc.[u32](@max(data.len, 1))!,
+                          depth: depths[@as(usize, lv)], window: @min(data.len, 8 << 20) };
+    defer mem.free(m.head);
+    defer mem.free(m.chain);
+    @mem_set(@cast_slice(u8, m.head), 0xff);
+    let mut reps: [3]u64 = [1, 4, 8];
+    let mut seqs = vec.Vec.[Seq].init();
+    defer seqs.deinit();
+    let mut lits = vec.Vec.[u8].init();
+    defer lits.deinit();
+    let mut body = strs.String.init();
+    defer body.deinit();
+    let mut i: usize = 0;
+    loop {
+        let end = @min(i + BLOCK_MAX, data.len);
+        let block = data[i..end];
+        let last = end == data.len;
+        let mut hdr: u32 = 0;
+        if last {
+            hdr = 1;
+        }
+        let mut all_same = block.len > 0;
+        for c in block {
+            if c != block[0] {
+                all_same = false;
+                break;
+            }
+        }
+        seqs.clear();
+        lits.clear();
+        body.clear();
+        let saved = reps;
+        find_sequences(&mut m, i, end, &mut reps, &mut seqs, &mut lits, lv >= 3)!;
+        if all_same and (block.len > 1) {
+            hdr |= (1 << 1) | (@truncate(u32, block.len) << 3);
+            put24(out, hdr)!;
+            out.push(block[0])!;
+        } else if (block.len > 0) and compress_block(block, seqs.items(), lits.items(), &mut body)! {
+            hdr |= (2 << 1) | (@truncate(u32, body.len) << 3);
+            put24(out, hdr)!;
+            out.push_str(body.bytes())!;
+        } else {
+            reps = saved;  // (a raw block leaves the repeat offsets as they were)
+            hdr |= @truncate(u32, block.len) << 3;
+            put24(out, hdr)!;
+            out.push_str(block)!;
+        }
+        if all_same and (block.len > 1) {
+            reps = saved;
+        }
+        i = end;
+        if last {
+            break;
+        }
+    }
+    let h = @truncate(u32, xxhash.xxh64(data, 0));
+    put24(out, h)!;
+    out.push(@truncate(u8, h >> 24))!;
+}
+
+fn put24(out: *mut strs.String, v: u32) !void {
+    out.push(@truncate(u8, v))!;
+    out.push(@truncate(u8, v >> 8))!;
+    out.push(@truncate(u8, v >> 16))!;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn fails(r: ![]mut u8) bool {
+    let x = r catch return true;
+    mem.free(x);
+    return false;
+}
+
+test "files made by the zstd library" {
+    let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
+    defer mem.free(corpus);
+    let mut dir = fs.read_dir("std/compress/zstd/testdata")!;
+    defer dir.deinit();
+    let mut n: usize = 0;
+    for e in dir.entries.items() {
+        let mut p = strs.String.init();
+        defer p.deinit();
+        p.push_str("std/compress/zstd/testdata/")!;
+        p.push_str(e.name)!;
+        let data = fs.read_file(p.bytes())!;
+        defer mem.free(data);
+        let got = decompress(data, 1 << 24)!;
+        defer mem.free(got);
+        if strs.starts_with(e.name, "corpus") {
+            @expect_eq(got, corpus);
+        } else if strs.starts_with(e.name, "short") {
+            @expect_eq(got, "Hello, Hello, Hello, world!\n");
+        } else {
+            @expect_eq(got.len, 0);
+        }
+        n += 1;
+    }
+    @expect(n >= 9);
+}
+
+test "round trips" {
+    let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
+    defer mem.free(corpus);
+    for level in [@as(u32, 1), 3, 9, 19]{
+        let c = compress(corpus, level)!;
+        defer mem.free(c);
+        @expect(c.len < (corpus.len / 2));
+        let d = decompress(c, corpus.len)!;
+        defer mem.free(d);
+        @expect_eq(d, corpus);
+        @expect(fails(decompress(c, corpus.len - 1)));
+    }
+    let mut big = strs.String.init();
+    defer big.deinit();
+    let mut x: u32 = 7;
+    for k in @as(usize, 0)..400000 {
+        x = (x *% 1103515245) +% 12345;
+        if (k % 1000) < 700 {
+            big.push('a' + @truncate(u8, (x >> 16) % 7))!;
+        } else {
+            big.push(@truncate(u8, x >> 16))!;
+        }
+    }
+    for input in ["", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abcabcabcabcabcabcabcabxabc", big.bytes()]{
+        let c = compress(input, 3)!;
+        defer mem.free(c);
+        let d = decompress(c, 1 << 24)!;
+        defer mem.free(d);
+        @expect_eq(d, input);
+    }
+}
+
+test "damaged input" {
+    let c = compress("hello hello hello hello hello hello, world", 3)!;
+    defer mem.free(c);
+    for n in @as(usize, 0)..c.len {
+        @expect(fails(decompress(c[..n], 1000)));
+    }
+    let mut b = strs.String.from(c)!;
+    defer b.deinit();
+    for k in @as(usize, 0)..(c.len * 8) {
+        let bit = @truncate(u8, @as(u32, 1) << @as(u32, @truncate(u8, k % 8)));
+        b.bytes()[k / 8] ^= bit;
+        // (bit 4 of the frame header descriptor is unused, and clearing bit 5
+        // turns the size byte into an equally valid window size; the checksum
+        // covers everything else)
+        if (k != 36) and (k != 37) {
+            @expect(fails(decompress(b.bytes(), 1000)));
+        }
+        b.bytes()[k / 8] ^= bit;
+    }
+}

@@ -5,7 +5,7 @@
 //   cc main.c stats.o -o demo && ./demo
 // =============================================================================
 
-import "std/vec" as vec;
+import "std/collections/vec" as vec;
 
 pub struct Summary {
     count: usize,

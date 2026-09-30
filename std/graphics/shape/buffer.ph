@@ -1,0 +1,636 @@
+// =============================================================================
+// std/graphics/shape/buffer.ph - the shaping buffer: characters, then glyphs, with
+// their clusters and per-glyph shaping state, and an output side that
+// substitutions write to (HarfBuzz's hb_buffer_t, which this follows
+// closely: clusters merge exactly as HarfBuzz merges them).
+// =============================================================================
+
+import "../../mem.ph" as mem;
+
+// Unicode properties (Info.uprops): HarfBuzz's layout
+pub const UP_GEN_CAT: u16 = 0x1f;
+pub const UP_IGNORABLE: u16 = 0x20;
+pub const UP_HIDDEN: u16 = 0x40;
+pub const UP_CONTINUATION: u16 = 0x80;
+pub const UP_ZWJ: u16 = 0x100;
+pub const UP_ZWNJ: u16 = 0x200;
+pub const UP_VS: u16 = 0x400;
+
+// Glyph properties (Info.gprops)
+pub const GP_BASE_GLYPH: u16 = 0x02;
+pub const GP_LIGATURE: u16 = 0x04;
+pub const GP_MARK: u16 = 0x08;
+pub const GP_SUBSTITUTED: u16 = 0x10;
+pub const GP_LIGATED: u16 = 0x20;
+pub const GP_MULTIPLIED: u16 = 0x40;
+pub const GP_PRESERVE: u16 = 0x70;
+
+// Scratch flags
+pub const SF_HAS_DEFAULT_IGNORABLES: u32 = 0x02;
+pub const SF_HAS_SPACE_FALLBACK: u32 = 0x04;
+pub const SF_HAS_GPOS_ATTACHMENT: u32 = 0x08;
+pub const SF_HAS_CGJ: u32 = 0x10;
+pub const SF_HAS_BROKEN_SYLLABLE: u32 = 0x20;
+pub const SF_HAS_VS_FALLBACK: u32 = 0x40;
+pub const SF_HAS_CONTINUATIONS: u32 = 0x80;
+pub const SF_HAS_FRACTION_SLASH: u32 = 0x100;
+pub const SF_ARABIC_HAS_STCH: u32 = 0x10000;
+
+// Attachment types (Pos.atype)
+pub const ATTACH_MARK: u8 = 1;
+pub const ATTACH_CURSIVE: u8 = 2;
+
+pub struct Info {
+    cp: u32,    // the character, then the glyph
+    mask: u32,  // the features that apply
+    cluster: u32,
+    uprops: u16,  // general category and flags; the (modified) combining class above
+    gprops: u16,  // glyph class and substitution flags
+    lig: u8,      // ligature id << 5 | is-ligature-base 0x10 | component
+    syl: u8,      // syllable serial << 4 | type (Indic)
+    cat: u8,      // shaper category (Indic) or joining action (Arabic)
+    ipos: u8,     // shaper position (Indic)
+    gid: u32,     // the glyph the normalizer chose
+}
+
+pub struct Pos {
+    xa: i32,
+    ya: i32,
+    xo: i32,
+    yo: i32,
+    chain: i32,  // offset to the glyph this one attaches to
+    atype: u8,
+}
+
+pub fn zero_info() Info {
+    return Info.{ cp: 0, mask: 0, cluster: 0, uprops: 0, gprops: 0, lig: 0, syl: 0, cat: 0, ipos: 0, gid: 0 };
+}
+
+pub fn zero_pos() Pos {
+    return Pos.{ xa: 0, ya: 0, xo: 0, yo: 0, chain: 0, atype: 0 };
+}
+
+pub fn sat_add(a: i32, b: i32) i32 {
+    return @add_sat(a, b);
+}
+
+pub fn sat_sub(a: i32, b: i32) i32 {
+    return @sub_sat(a, b);
+}
+
+pub struct Buffer {
+    info: []mut Info,
+    out: []mut Info,
+    pos: []mut Pos,
+    len: usize,
+    idx: usize,
+    out_len: usize,
+    have_output: bool,
+    have_positions: bool,
+    successful: bool,
+    oom: bool,
+    max_ops: i64,
+    max_len: usize,
+    serial: u8,
+    scratch: u32,
+    rtl: bool,
+
+    pub fn init() Buffer {
+        let e = @slice_from_ptr(@ptr_from_int(*mut Info, 8), 0);
+        let p = @slice_from_ptr(@ptr_from_int(*mut Pos, 8), 0);
+        return Buffer.{
+            info: e,
+            out: e,
+            pos: p,
+            len: 0,
+            idx: 0,
+            out_len: 0,
+            have_output: false,
+            have_positions: false,
+            successful: true,
+            oom: false,
+            max_ops: 16384,
+            max_len: 16384,
+            serial: 0,
+            scratch: 0,
+            rtl: false,
+        };
+    }
+
+    pub fn deinit(self: *mut Buffer) void {
+        if self.info.len > 0 {
+            mem.free(self.info);
+            mem.free(self.out);
+            mem.free(self.pos);
+        }
+        self.* = Buffer.init();
+    }
+
+    /// Sets the operation and length limits from the input length (as
+    /// HarfBuzz does, to bound the work hostile fonts can cause).
+    pub fn enter(self: *mut Buffer) void {
+        self.max_len = @max(self.len * 256, 65536);
+        self.max_ops = @bit_cast(i64, @as(u64, @max(self.len * 4096, 65536)));
+        self.serial = 0;
+        self.scratch = 0;
+        self.successful = true;
+    }
+
+    /// Room for size glyphs on both sides.
+    pub fn ensure(self: *mut Buffer, size: usize) bool {
+        if size <= self.info.len {
+            return true;
+        }
+        if not self.successful {
+            return false;
+        }
+        if (size > self.max_len) and (self.info.len > 0) {
+            self.successful = false;
+            return false;
+        }
+        let mut cap = @max(self.info.len, 32);
+        while cap < size {
+            cap = cap + (cap / 2) + 8;
+        }
+        if self.info.len == 0 {
+            self.info = mem.alloc.[Info](cap) catch {
+                self.fail_oom();
+                return false;
+            };
+            self.out = mem.alloc.[Info](cap) catch {
+                mem.free(self.info);
+                self.info = @slice_from_ptr(@ptr_from_int(*mut Info, 8), 0);
+                self.fail_oom();
+                return false;
+            };
+            self.pos = mem.alloc.[Pos](cap) catch {
+                mem.free(self.info);
+                mem.free(self.out);
+                self.info = @slice_from_ptr(@ptr_from_int(*mut Info, 8), 0);
+                self.fail_oom();
+                return false;
+            };
+            return true;
+        }
+        let ni = mem.realloc(self.info, cap) catch {
+            self.fail_oom();
+            return false;
+        };
+        self.info = ni;
+        let no = mem.realloc(self.out, cap) catch {
+            self.fail_oom();
+            return false;
+        };
+        self.out = no;
+        let np = mem.realloc(self.pos, cap) catch {
+            self.fail_oom();
+            return false;
+        };
+        self.pos = np;
+        return true;
+    }
+
+    fn fail_oom(self: *mut Buffer) void {
+        self.successful = false;
+        self.oom = true;
+    }
+
+    /// Appends a character.
+    pub fn add(self: *mut Buffer, cp: u32, cluster: u32) void {
+        if not self.ensure(self.len + 1) {
+            return;
+        }
+        let mut i = zero_info();
+        i.cp = cp;
+        i.cluster = cluster;
+        self.info[self.len] = i;
+        self.len += 1;
+    }
+
+    pub fn cur(self: *mut Buffer) *mut Info {
+        return &mut self.info[self.idx];
+    }
+
+    /// The last output glyph.
+    pub fn prev(self: *mut Buffer) *mut Info {
+        if self.out_len == 0 {
+            return &mut self.out[0];
+        }
+        return &mut self.out[self.out_len - 1];
+    }
+
+    /// The glyphs before idx: the output side while there is one.
+    pub fn back(self: *mut Buffer) []mut Info {
+        if self.have_output {
+            return self.out;
+        }
+        return self.info;
+    }
+
+    pub fn backtrack_len(self: *Buffer) usize {
+        if self.have_output {
+            return self.out_len;
+        }
+        return self.idx;
+    }
+
+    pub fn lookahead_len(self: *Buffer) usize {
+        return self.len - self.idx;
+    }
+
+    pub fn next_serial(self: *mut Buffer) u8 {
+        self.serial +%= 1;
+        if self.serial == 0 {
+            self.serial = 1;
+        }
+        return self.serial;
+    }
+
+    pub fn clear_output(self: *mut Buffer) void {
+        self.have_output = true;
+        self.have_positions = false;
+        self.idx = 0;
+        self.out_len = 0;
+    }
+
+    pub fn clear_positions(self: *mut Buffer) void {
+        self.have_output = false;
+        self.have_positions = true;
+        self.out_len = 0;
+        for i in @as(usize, 0)..self.len {
+            self.pos[i] = zero_pos();
+        }
+    }
+
+    /// Makes the output side the buffer.
+    pub fn sync(self: *mut Buffer) bool {
+        let mut ret = false;
+        if self.successful and self.next_glyphs(self.len - self.idx) {
+            let t = self.info;
+            self.info = self.out;
+            self.out = t;
+            self.len = self.out_len;
+            ret = true;
+        }
+        self.have_output = false;
+        self.out_len = 0;
+        self.idx = 0;
+        return ret;
+    }
+
+    pub fn next_glyph(self: *mut Buffer) bool {
+        if self.have_output {
+            if not self.ensure(self.out_len + 1) {
+                return false;
+            }
+            self.out[self.out_len] = self.info[self.idx];
+            self.out_len += 1;
+        }
+        self.idx += 1;
+        return true;
+    }
+
+    pub fn next_glyphs(self: *mut Buffer, n: usize) bool {
+        if self.have_output {
+            if not self.ensure(self.out_len + n) {
+                return false;
+            }
+            for k in @as(usize, 0)..n {
+                self.out[self.out_len + k] = self.info[self.idx + k];
+            }
+            self.out_len += n;
+        }
+        self.idx += n;
+        return true;
+    }
+
+    pub fn skip_glyph(self: *mut Buffer) void {
+        self.idx += 1;
+    }
+
+    pub fn output_info(self: *mut Buffer, i: Info) bool {
+        if not self.ensure(self.out_len + 1) {
+            return false;
+        }
+        self.out[self.out_len] = i;
+        self.out_len += 1;
+        return true;
+    }
+
+    /// Replaces num_in glyphs at idx by the num_out glyphs gs.
+    pub fn replace_glyphs(self: *mut Buffer, num_in: usize, gs: []u32) bool {
+        if not self.ensure(self.out_len + gs.len) {
+            return false;
+        }
+        self.merge_clusters(self.idx, self.idx + num_in);
+        let mut orig = zero_info();
+        if self.idx < self.len {
+            orig = self.info[self.idx];
+        } else {
+            orig = self.prev().*;
+        }
+        for k in @as(usize, 0)..gs.len {
+            let mut i = orig;
+            i.cp = gs[k];
+            self.out[self.out_len + k] = i;
+        }
+        self.idx += num_in;
+        self.out_len += gs.len;
+        return true;
+    }
+
+    pub fn replace_glyph(self: *mut Buffer, g: u32) bool {
+        let gs: [1]u32 = [g];
+        return self.replace_glyphs(1, gs[..]);
+    }
+
+    pub fn output_glyph(self: *mut Buffer, g: u32) bool {
+        let gs: [1]u32 = [g];
+        return self.replace_glyphs(0, gs[..]);
+    }
+
+    /// Moves the input position so that i glyphs come before it.
+    pub fn move_to(self: *mut Buffer, i: usize) bool {
+        if not self.have_output {
+            self.idx = i;
+            return true;
+        }
+        if not self.successful {
+            return false;
+        }
+        if self.out_len < i {
+            let count = i - self.out_len;
+            if not self.ensure(self.out_len + count) {
+                return false;
+            }
+            self.max_ops -= @bit_cast(i64, @as(u64, count));
+            if self.max_ops < 0 {
+                self.successful = false;
+                return false;
+            }
+            for k in @as(usize, 0)..count {
+                self.out[self.out_len + k] = self.info[self.idx + k];
+            }
+            self.idx += count;
+            self.out_len += count;
+        } else if self.out_len > i {
+            let count = self.out_len - i;
+            if (self.idx < count) and not self.shift_forward(count - self.idx) {
+                return false;
+            }
+            self.max_ops -= @bit_cast(i64, @as(u64, count));
+            if self.max_ops < 0 {
+                self.successful = false;
+                return false;
+            }
+            self.idx -= count;
+            self.out_len -= count;
+            for k in @as(usize, 0)..count {
+                self.info[self.idx + k] = self.out[self.out_len + k];
+            }
+        }
+        return true;
+    }
+
+    fn shift_forward(self: *mut Buffer, count: usize) bool {
+        if not self.ensure(self.len + count) {
+            return false;
+        }
+        self.max_ops -= @bit_cast(i64, @as(u64, self.len - self.idx));
+        if self.max_ops < 0 {
+            self.successful = false;
+            return false;
+        }
+        let mut k = self.len;
+        while k > self.idx {
+            k -= 1;
+            self.info[k + count] = self.info[k];
+        }
+        if (self.idx + count) > self.len {
+            for j in self.len..(self.idx + count) {
+                self.info[j] = zero_info();
+            }
+        }
+        self.len += count;
+        self.idx += count;
+        return true;
+    }
+
+    pub fn set_masks(self: *mut Buffer, value: u32, mask: u32, cluster_start: u32, cluster_end: u32) void {
+        if mask == 0 {
+            return;
+        }
+        let v = value & mask;
+        for i in @as(usize, 0)..self.len {
+            let c = self.info[i].cluster;
+            if (cluster_start <= c) and (c < cluster_end) {
+                self.info[i].mask = (self.info[i].mask & ~mask) | v;
+            }
+        }
+    }
+
+    pub fn merge_clusters(self: *mut Buffer, start: usize, end: usize) void {
+        if (end - start) < 2 {
+            return;
+        }
+        self.merge_clusters_impl(start, end);
+    }
+
+    fn merge_clusters_impl(self: *mut Buffer, start0: usize, end0: usize) void {
+        let mut start = start0;
+        let mut end = end0;
+        self.max_ops -= @bit_cast(i64, @as(u64, end - start));
+        if self.max_ops < 0 {
+            self.successful = false;
+        }
+        let mut cluster = self.info[start].cluster;
+        for i in (start + 1)..end {
+            cluster = @min(cluster, self.info[i].cluster);
+        }
+        if cluster != self.info[end - 1].cluster {
+            while (end < self.len) and (self.info[end - 1].cluster == self.info[end].cluster) {
+                end += 1;
+            }
+        }
+        if cluster != self.info[start].cluster {
+            while (self.idx < start) and (self.info[start - 1].cluster == self.info[start].cluster) {
+                start -= 1;
+            }
+        }
+        if (self.idx == start) and (self.info[start].cluster != cluster) {
+            let old = self.info[start].cluster;
+            let mut i = self.out_len;
+            while (i > 0) and (self.out[i - 1].cluster == old) {
+                self.out[i - 1].cluster = cluster;
+                i -= 1;
+            }
+        }
+        for i in start..end {
+            self.info[i].cluster = cluster;
+        }
+    }
+
+    pub fn merge_out_clusters(self: *mut Buffer, start0: usize, end0: usize) void {
+        if (end0 - start0) < 2 {
+            return;
+        }
+        let mut start = start0;
+        let mut end = end0;
+        self.max_ops -= @bit_cast(i64, @as(u64, end - start));
+        if self.max_ops < 0 {
+            self.successful = false;
+        }
+        let mut cluster = self.out[start].cluster;
+        for i in (start + 1)..end {
+            cluster = @min(cluster, self.out[i].cluster);
+        }
+        while (start > 0) and (self.out[start - 1].cluster == self.out[start].cluster) {
+            start -= 1;
+        }
+        while (end < self.out_len) and (self.out[end - 1].cluster == self.out[end].cluster) {
+            end += 1;
+        }
+        if end == self.out_len {
+            let last = self.out[end - 1].cluster;
+            let mut i = self.idx;
+            while (i < self.len) and (self.info[i].cluster == last) {
+                self.info[i].cluster = cluster;
+                i += 1;
+            }
+        }
+        for i in start..end {
+            self.out[i].cluster = cluster;
+        }
+    }
+
+    /// Drops the glyph at idx, keeping its cluster in a neighbour.
+    pub fn delete_glyph(self: *mut Buffer) void {
+        let cluster = self.info[self.idx].cluster;
+        if ((self.idx + 1) < self.len) and (cluster == self.info[self.idx + 1].cluster) {
+            self.skip_glyph();
+            return;
+        }
+        if (self.out_len > 0) and (cluster == self.out[self.out_len - 1].cluster) {
+            self.skip_glyph();
+            return;
+        }
+        if self.out_len > 0 {
+            if cluster < self.out[self.out_len - 1].cluster {
+                let old = self.out[self.out_len - 1].cluster;
+                let mut i = self.out_len;
+                while (i > 0) and (self.out[i - 1].cluster == old) {
+                    self.out[i - 1].cluster = cluster;
+                    i -= 1;
+                }
+            }
+            self.skip_glyph();
+            return;
+        }
+        if (self.idx + 1) < self.len {
+            self.merge_clusters(self.idx, self.idx + 2);
+        }
+        self.skip_glyph();
+    }
+
+    /// Removes the glyphs keep says to drop, keeping clusters whole.
+    pub fn delete_glyphs_inplace[K](self: *mut Buffer, ctx: K, drop: fn(K, *Info) bool) void {
+        let mut j: usize = 0;
+        let count = self.len;
+        for i in @as(usize, 0)..count {
+            if drop(ctx, &self.info[i]) {
+                let cluster = self.info[i].cluster;
+                if ((i + 1) < count) and (cluster == self.info[i + 1].cluster) {
+                    continue;
+                }
+                if j > 0 {
+                    if cluster < self.info[j - 1].cluster {
+                        let old = self.info[j - 1].cluster;
+                        let mut k = j;
+                        while (k > 0) and (self.info[k - 1].cluster == old) {
+                            self.info[k - 1].cluster = cluster;
+                            k -= 1;
+                        }
+                    }
+                    continue;
+                }
+                if (i + 1) < count {
+                    self.merge_clusters(i, i + 2);
+                }
+                continue;
+            }
+            if j != i {
+                self.info[j] = self.info[i];
+                self.pos[j] = self.pos[i];
+            }
+            j += 1;
+        }
+        self.len = j;
+    }
+
+    pub fn reverse_range(self: *mut Buffer, start: usize, end: usize) void {
+        if end <= start {
+            return;
+        }
+        let mut a = start;
+        let mut b = end - 1;
+        while a < b {
+            let t = self.info[a];
+            self.info[a] = self.info[b];
+            self.info[b] = t;
+            if self.have_positions {
+                let p = self.pos[a];
+                self.pos[a] = self.pos[b];
+                self.pos[b] = p;
+            }
+            a += 1;
+            b -= 1;
+        }
+    }
+
+    pub fn reverse(self: *mut Buffer) void {
+        self.reverse_range(0, self.len);
+    }
+
+    /// Reverses the order of grapheme groups (a glyph and its continuations),
+    /// keeping each group's inner order.
+    pub fn reverse_graphemes(self: *mut Buffer) void {
+        if self.len == 0 {
+            return;
+        }
+        let mut start: usize = 0;
+        for i in @as(usize, 1)..self.len {
+            if (self.info[i].uprops & UP_CONTINUATION) == 0 {
+                self.reverse_range(start, i);
+                start = i;
+            }
+        }
+        self.reverse_range(start, self.len);
+        self.reverse();
+    }
+
+    /// Stable insertion sort of [start, end) by key (merging clusters of
+    /// what moves), as HarfBuzz sorts marks and Indic syllables.
+    pub fn sort_by[K](self: *mut Buffer, start: usize, end: usize, ctx: K, key: fn(K, *Info) u32) void {
+        if end <= start {
+            return;
+        }
+        for i in (start + 1)..end {
+            let ki = key(ctx, &self.info[i]);
+            let mut j = i;
+            while (j > start) and (key(ctx, &self.info[j - 1]) > ki) {
+                j -= 1;
+            }
+            if i == j {
+                continue;
+            }
+            self.merge_clusters(j, i + 1);
+            let t = self.info[i];
+            let mut k = i;
+            while k > j {
+                self.info[k] = self.info[k - 1];
+                k -= 1;
+            }
+            self.info[j] = t;
+        }
+    }
+}

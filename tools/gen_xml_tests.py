@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/xml/testdata/cases.txt: XML documents, each with libxml2's
+"""Generates std/encoding/xml/testdata/cases.txt: XML documents, each with libxml2's
 canonical form of it (xmllint --c14n), or "error" when libxml2 rejects it.
 
     tools/gen_xml_tests.py
@@ -14,7 +14,7 @@ import os
 import subprocess
 import tempfile
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'xml', 'testdata', 'cases.txt')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'encoding', 'xml', 'testdata', 'cases.txt')
 docs = [
  '<a/>', '<a></a>', '<a>text</a>', '<a b="1" c=\'2\'>x</a>', '<?xml version="1.0"?><a/>',
  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<a/>', '<a><b><c/></b>tail</a>',

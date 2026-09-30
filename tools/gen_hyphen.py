@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generates std/hyphen/en_us.ph, the American English hyphenation patterns
+"""Generates std/text/hyphen/en_us.ph, the American English hyphenation patterns
 and exceptions of the hyph-utf8 package (TeX's ushyphmax: Knuth's patterns
-with Gerard D.C. Kuiken's additions), and std/hyphen/testdata/words.txt,
+with Gerard D.C. Kuiken's additions), and std/text/hyphen/testdata/words.txt,
 words from the CommonMark specification hyphenated by a reference
 implementation of Liang's algorithm.
 
@@ -45,7 +45,7 @@ def lines(words, per):
     return out
 
 
-with open(os.path.join(root, 'std', 'hyphen', 'en_us.ph'), 'w') as f:
+with open(os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ph'), 'w') as f:
     f.write(NOTICE + '\n')
     f.write('/// The %d patterns, separated by spaces.\n' % len(pats))
     f.write('pub let PATTERNS: []u8 = "%s";\n\n' % ' '.join(pats))
@@ -55,7 +55,7 @@ with open(os.path.join(root, 'std', 'hyphen', 'en_us.ph'), 'w') as f:
     f.write('pub const LEFT_MIN: usize = 2;\npub const RIGHT_MIN: usize = 3;\n')
 exe = os.path.join(root, 'selfhost', 'build', 'phalange')
 if os.path.exists(exe):
-    subprocess.run([exe, 'fmt', os.path.join(root, 'std', 'hyphen', 'en_us.ph')], check=False)
+    subprocess.run([exe, 'fmt', os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ph')], check=False)
 
 # the reference implementation
 tree = {}
@@ -94,11 +94,11 @@ def hyphenate(word):
     return out
 
 
-text = open(os.path.join(root, 'std', 'markdown', 'testdata', 'commonmark-0.31.2.txt')).read()
+text = open(os.path.join(root, 'std', 'text', 'markdown', 'testdata', 'commonmark-0.31.2.txt')).read()
 words = sorted(set(w for w in re.findall(r'[A-Za-z]+', text) if len(w) >= 3))
 words += ['hyphenation', 'supercalifragilisticexpialidocious', 'associate', 'present', 'table', 'Hyphenation']
-os.makedirs(os.path.join(root, 'std', 'hyphen', 'testdata'), exist_ok=True)
-with open(os.path.join(root, 'std', 'hyphen', 'testdata', 'words.txt'), 'w') as f:
+os.makedirs(os.path.join(root, 'std', 'text', 'hyphen', 'testdata'), exist_ok=True)
+with open(os.path.join(root, 'std', 'text', 'hyphen', 'testdata', 'words.txt'), 'w') as f:
     for w in words:
         f.write(hyphenate(w) + '\n')
 print(len(pats), len(exc), len(words), hyphenate('hyphenation'), hyphenate('supercalifragilisticexpialidocious'))

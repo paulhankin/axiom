@@ -14,10 +14,10 @@
 // Functions returning new text return memory to free with mem.free.
 // =============================================================================
 
+import "collections/vec.ph" as vec;
 import "mem.ph" as mem;
 import "str.ph" as strs;
 import "unicode/tables.ph" as t;
-import "vec.ph" as vec;
 
 error { OutOfMemory, Done }
 

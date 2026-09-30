@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test data for std/protobuf, from the Python protobuf package.
+"""Test data for std/encoding/protobuf, from the Python protobuf package.
 
     pip install protobuf
     tools/gen_protobuf_tests.py
@@ -14,7 +14,7 @@ from google.protobuf import __version__
 from google.protobuf import descriptor_pb2
 from google.protobuf.internal import encoder
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'protobuf', 'testdata')
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'encoding', 'protobuf', 'testdata')
 os.makedirs(out, exist_ok=True)
 
 fd = descriptor_pb2.FileDescriptorProto()

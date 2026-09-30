@@ -1,0 +1,3505 @@
+// =============================================================================
+// std/graphics/image/av1/decode.ph - decoding an AV1 key (or intra-only) frame:
+// tiles, superblocks, partitions, modes, palettes, transform sizes and
+// types, coefficients and reconstruction, then deblocking, CDEF and loop
+// restoration, following dav1d (via rav1d) so the output is bit-exact.
+// (dav1d is Copyright VideoLAN and dav1d authors, BSD 2-clause.)
+// =============================================================================
+
+import "../../../mem.ph" as mem;
+import "cdf.ph" as c;
+import "itx.ph" as itx;
+import "msac.ph" as ms;
+import "obu.ph" as obu;
+import "pred.ph" as pred;
+import "tables.ph" as t;
+
+error { InvalidImage, Unsupported, OutOfMemory }
+
+// -----------------------------------------------------------------------------
+// Tables
+// -----------------------------------------------------------------------------
+
+// block sizes: [w4, h4, log2 w4, log2 h4]
+let BLOCK_DIMS: [88]u32 = [32, 32, 5, 5, 32, 16, 5, 4, 16, 32, 4, 5, 16, 16, 4, 4, 16, 8, 4, 3, 16, 4, 4, 2, 8, 16, 3,
+                           4, 8, 8, 3, 3, 8, 4, 3, 2, 8, 2, 3, 1, 4, 16, 2, 4, 4, 8, 2, 3, 4, 4, 2, 2, 4, 2, 2, 1, 4, 1,
+                           2, 0, 2, 8, 1, 3, 2, 4, 1, 2, 2, 2, 1, 1, 2, 1, 1, 0, 1, 4, 0, 2, 1, 2, 0, 1, 1, 1, 0, 0];
+
+// transform sizes: [w4, h4, lw, lh, min, max, sub, ctx]
+let TX_DIMS: [152]u32 = [1, 1, 0, 0, 0, 0, 0, 0, 2, 2, 1, 1, 1, 1, 0, 1, 4, 4, 2, 2, 2, 2, 1, 2, 8, 8, 3, 3, 3, 3, 2, 3,
+                         16, 16, 4, 4, 4, 4, 3, 4, 1, 2, 0, 1, 0, 1, 0, 1, 2, 1, 1, 0, 0, 1, 0, 1, 2, 4, 1, 2, 1, 2, 1,
+                         2, 4, 2, 2, 1, 1, 2, 1, 2, 4, 8, 2, 3, 2, 3, 2, 3, 8, 4, 3, 2, 2, 3, 2, 3, 8, 16, 3, 4, 3, 4,
+                         3, 4, 16, 8, 4, 3, 3, 4, 3, 4, 1, 4, 0, 2, 0, 2, 5, 1, 4, 1, 2, 0, 0, 2, 6, 1, 2, 8, 1, 3, 1,
+                         3, 7, 2, 8, 2, 3, 1, 1, 3, 8, 2, 4, 16, 2, 4, 2, 4, 9, 3, 16, 4, 4, 2, 2, 4, 10, 3];
+
+const S4X4: u32 = 0;
+const S64X64: u32 = 4;
+
+// [block size][layout]: the largest transform
+let MAX_TX_FOR_BS: [88]u32 = [4, 3, 3, 3, 4, 3, 3, 3, 4, 3, 0, 3, 4, 3, 3, 3, 12, 10, 3, 3, 18, 16, 10, 10, 11, 9, 0, 3,
+                              3, 2, 9, 3, 10, 8, 2, 10, 16, 14, 8, 16, 17, 15, 0, 9, 9, 7, 0, 9, 2, 1, 7, 2, 8, 6, 1, 8,
+                              14, 6, 6, 14, 15, 13, 0, 15, 7, 5, 0, 7, 1, 0, 5, 1, 6, 0, 0, 6, 13, 5, 0, 13, 5, 0, 0, 5,
+                              0, 0, 0, 0];
+
+// [direction][level][partition]
+let AL_PART_CTX: [100]u32 = [0x00, 0x00, 0x10, 0xff, 0x00, 0x10, 0x10, 0x10, 0xff, 0xff, 0x10, 0x10, 0x18, 0xff, 0x10,
+                             0x18, 0x18, 0x18, 0x10, 0x1c, 0x18, 0x18, 0x1c, 0xff, 0x18, 0x1c, 0x1c, 0x1c, 0x18, 0x1e,
+                             0x1c, 0x1c, 0x1e, 0xff, 0x1c, 0x1e, 0x1e, 0x1e, 0x1c, 0x1f, 0x1e, 0x1e, 0x1f, 0x1f, 0xff,
+                             0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0xff, 0x10, 0x10, 0x00, 0x10, 0xff, 0xff,
+                             0x10, 0x18, 0x10, 0xff, 0x18, 0x18, 0x10, 0x18, 0x1c, 0x10, 0x18, 0x1c, 0x18, 0xff, 0x1c,
+                             0x1c, 0x18, 0x1c, 0x1e, 0x18, 0x1c, 0x1e, 0x1c, 0xff, 0x1e, 0x1e, 0x1c, 0x1e, 0x1f, 0x1c,
+                             0x1e, 0x1f, 0x1e, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+
+// [level][partition][2]: the block sizes of each part
+let BLOCK_SIZES: [100]u32 = [0, 0, 1, 0, 2, 0, 0, 0, 3, 1, 1, 3, 3, 2, 2, 3, 0, 0, 0, 0, 3, 0, 4, 0, 6, 0, 0, 0, 7, 4,
+                             4, 7, 7, 6, 6, 7, 5, 0, 10, 0, 7, 0, 8, 0, 11, 0, 0, 0, 12, 8, 8, 12, 12, 11, 11, 12, 9, 0,
+                             15, 0, 12, 0, 13, 0, 16, 0, 0, 0, 17, 13, 13, 17, 17, 16, 16, 17, 14, 0, 19, 0, 17, 0, 18,
+                             0, 20, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+let PARTITION_SYMBOLS: [5]u32 = [7, 9, 9, 9, 3];
+
+let TXTP_FROM_UVMODE: [14]u32 = [0, 1, 2, 0, 3, 1, 2, 2, 1, 3, 1, 2, 3, 0];
+
+let TX_TYPES_PER_SET: [40]u32 = [9, 0, 3, 1, 2, 9, 0, 10, 11, 3, 1, 2, 9, 10, 11, 0, 1, 2, 4, 5, 3, 6, 7, 8, 9, 10, 11,
+                                 12, 13, 14, 15, 0, 1, 2, 4, 5, 3, 6, 7, 8];
+
+let INTRA_MODE_CONTEXT: [13]u32 = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+
+let FILTER_MODE_TO_Y_MODE: [5]u32 = [0, 1, 2, 6, 0];
+
+const CFL_ALLOWED_MASK: u32 = 0x3ffb80;
+
+// transform classes: 0 two-dimensional, 1 horizontal, 2 vertical
+let TX_CLASS: [17]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 0];
+
+let LO_CTX_OFFSETS: [75]u32 = [0, 1, 6, 6, 21, 1, 6, 6, 21, 21, 6, 6, 21, 21, 21, 6, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+                               0, 16, 6, 6, 21, 16, 16, 6, 21, 21, 16, 16, 21, 21, 21, 16, 16, 21, 21, 21, 16, 16, 21,
+                               21, 21, 0, 11, 11, 11, 11, 11, 11, 11, 11, 11, 6, 6, 21, 21, 21, 6, 21, 21, 21, 21, 21,
+                               21, 21, 21, 21];
+
+let SKIP_CTX: [25]u32 = [1, 2, 2, 2, 3, 2, 4, 4, 4, 5, 2, 4, 4, 4, 5, 2, 4, 4, 4, 5, 3, 5, 5, 5, 6];
+
+// edge flags
+const TR_444: u32 = 1;
+const TR_422: u32 = 2;
+const TR_420: u32 = 4;
+const BL_444: u32 = 8;
+const BL_422: u32 = 16;
+const BL_420: u32 = 32;
+const ALL_TR: u32 = 7;
+const ALL_BL: u32 = 56;
+
+fn bdim(bs: u32, k: usize) u32 {
+    return BLOCK_DIMS[(@as(usize, bs) * 4) + k];
+}
+
+fn txd(tx: u32, k: usize) u32 {
+    return TX_DIMS[(@as(usize, tx) * 8) + k];
+}
+
+fn iclip(v: i32, lo: i32, hi: i32) i32 {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
+
+fn us(v: i32) usize {
+    return @as(usize, @bit_cast(u32, v));
+}
+
+fn si(v: usize) i32 {
+    return @bit_cast(i32, @truncate(u32, v));
+}
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+
+pub struct LrUnit {
+    typ: u32,  // RT_NONE, RT_WIENER or RT_SGRPROJ
+    filter_v: [3]i32,
+    filter_h: [3]i32,
+    sgr_idx: u32,
+    sgr_weights: [2]i32,
+}
+
+/// A decoded frame (planes of u16, cropped by w/h)
+pub struct Frame {
+    width: usize,
+    height: usize,
+    bitdepth: u32,
+    layout: u32,
+    planes: [3]pred.Plane,
+    pw: [3]usize,  // plane sizes
+    ph: [3]usize,
+    full_range: bool,
+    matrix: u32,
+    primaries: u32,
+    transfer: u32,
+
+    pub fn deinit(self: *mut Frame) void {
+        for i in @as(usize, 0)..3 {
+            if self.planes[i].data.len > 0 {
+                mem.free(self.planes[i].data);
+            }
+        }
+    }
+}
+
+pub struct Dec {
+    seq: obu.SeqHdr,
+    hdr: obu.FrameHdr,
+    bitdepth: u32,
+    maxv: i32,
+    layout: u32,
+    ss_hor: u32,
+    ss_ver: u32,
+    w4: i32,  // frame size in 4x4 blocks
+    h4: i32,
+    bw: i32,  // frame size in 4x4 blocks (a multiple of 2)
+    bh: i32,
+    sb_shift: u32,  // superblock size in 4x4 blocks, log2
+    sb_step: i32,
+    planes: [3]pred.Plane,
+    // tile
+    col_start: i32,
+    col_end: i32,
+    row_start: i32,
+    row_end: i32,
+    msac: ms.Msac,
+    mode_cdf: []mut u16,
+    coef_cdf: []mut u16,
+    last_qidx: i32,
+    last_delta_lf: [4]i32,
+    dq: [48]u32,  // [segment][plane][dc, ac]
+    qm_on: bool,
+    qm: []mut u8,  // [plane][tx] tables, at qm_off
+    qm_off: [57]u32,
+    lflvl: [32]u32,  // [segment][y vertical, y horizontal, u, v]
+    // above (frame-wide, in 4x4 units) and left (32 entries) contexts
+    a_mode: []mut u8,
+    a_lcoef: []mut u8,
+    a_ccoef: []mut u8,  // two planes, a_w apart
+    a_seg_pred: []mut u8,
+    a_skip: []mut u8,
+    a_intra: []mut u8,
+    a_tx_intra: []mut i32,
+    a_partition: []mut u8,
+    a_uvmode: []mut u8,
+    a_pal_sz: []mut u8,
+    a_pal_sz_uv: []mut u8,
+    a_pal: []mut u16,  // [x][plane][8]
+    a_w: usize,
+    l_mode: [32]u8,
+    l_lcoef: [32]u8,
+    l_ccoef: [64]u8,
+    l_seg_pred: [32]u8,
+    l_skip: [32]u8,
+    l_intra: [32]u8,
+    l_tx_intra: [32]i32,
+    l_partition: [16]u8,
+    l_uvmode: [32]u8,
+    l_pal_sz: [32]u8,
+    l_pal_sz_uv: [32]u8,
+    l_pal: [768]u16,
+    // frame-wide
+    seg_map: []mut u8,
+    noskip: []mut u8,     // per 4x4: in a block with coefficients
+    cdef_idx: []mut i32,  // per 64x64
+    cdef_w: usize,
+    lr: [3][]mut LrUnit,
+    lr_w: [3]usize,
+    lr_h: [3]usize,
+    lr_ref: [3]LrUnit,
+    // per 4x4 (luma units): filter levels, transform sizes of y and uv
+    b4_stride: usize,
+    lvl: []mut u8,   // [4] per 4x4
+    txy: []mut u8,   // luma transform size
+    txuv: []mut u8,  // chroma transform size (at chroma 4x4 positions)
+    // scratch
+    bx: i32,
+    by: i32,
+    cf: [1024]i32,
+    tmp: [4096]i32,
+    levels: [2560]u8,
+    edge: [257]u16,
+    ac: [1024]i32,
+    pal: [24]u16,  // current block palettes [plane][8]
+    pal_idx_y: [4096]u8,
+    pal_idx_uv: [4096]u8,
+    pal_order: [512]u8,  // [64][8]
+    pal_ctx: [64]u8,
+}
+
+fn alloc_zeroed_u8(n: usize) ![]mut u8 {
+    return mem.alloc_zeroed.[u8](@max(n, 1));
+}
+
+// -----------------------------------------------------------------------------
+// Quantizers, loop filter levels, quantizer matrices
+// -----------------------------------------------------------------------------
+
+fn clip_u8(v: i32) u32 {
+    return @bit_cast(u32, iclip(v, 0, 255));
+}
+
+fn init_quant(d: *mut Dec, qidx: i32) void {
+    let h = &d.hdr;
+    let mut hbd: usize = 0;
+    if d.bitdepth == 10 {
+        hbd = 1;
+    } else if d.bitdepth == 12 {
+        hbd = 2;
+    }
+    let tbl = hbd * 512;
+    let mut n: usize = 1;
+    if h.seg_enabled {
+        n = 8;
+    }
+    for i in @as(usize, 0)..n {
+        let mut yac = qidx;
+        if h.seg_enabled {
+            yac = @bit_cast(i32, clip_u8(qidx + h.seg_delta_q[i]));
+        }
+        let ydc = clip_u8(yac + h.ydc_delta);
+        let uac = clip_u8(yac + h.uac_delta);
+        let udc = clip_u8(yac + h.udc_delta);
+        let vac = clip_u8(yac + h.vac_delta);
+        let vdc = clip_u8(yac + h.vdc_delta);
+        let o = i * 6;
+        d.dq[o] = @as(u32, t.DQ_TBL[tbl + (@as(usize, ydc) * 2)]);
+        d.dq[o + 1] = @as(u32, t.DQ_TBL[tbl + (us(yac) * 2) + 1]);
+        d.dq[o + 2] = @as(u32, t.DQ_TBL[tbl + (@as(usize, udc) * 2)]);
+        d.dq[o + 3] = @as(u32, t.DQ_TBL[tbl + (@as(usize, uac) * 2) + 1]);
+        d.dq[o + 4] = @as(u32, t.DQ_TBL[tbl + (@as(usize, vdc) * 2)]);
+        d.dq[o + 5] = @as(u32, t.DQ_TBL[tbl + (@as(usize, vac) * 2) + 1]);
+    }
+}
+
+fn lf_value(base_lvl: u32, lf_delta: i32, seg_delta: i32, h: *obu.FrameHdr) u32 {
+    let base = iclip(iclip(@bit_cast(i32, base_lvl) + lf_delta, 0, 63) + seg_delta, 0, 63);
+    if h.lf_mode_ref_delta_enabled {
+        let mut sh: i32 = 0;
+        if base >= 32 {
+            sh = 1;
+        }
+        return @bit_cast(u32, iclip(base + (h.lf_ref_delta[0] * (@as(i32, 1) << @bit_cast(u32, sh))), 0, 63));
+    }
+    return @bit_cast(u32, base);
+}
+
+fn calc_lf(d: *mut Dec) void {
+    let h = &d.hdr;
+    let mut n: usize = 1;
+    if h.seg_enabled {
+        n = 8;
+    }
+    let dl = d.last_delta_lf;
+    for s in @as(usize, 0)..n {
+        let o = s * 4;
+        if (h.lf_level_y[0] == 0) and (h.lf_level_y[1] == 0) {
+            d.lflvl[o] = 0;
+            d.lflvl[o + 1] = 0;
+            d.lflvl[o + 2] = 0;
+            d.lflvl[o + 3] = 0;
+            continue;
+        }
+        let mut sd: [4]i32 = [0; 4];
+        if h.seg_enabled {
+            for k in @as(usize, 0)..4 {
+                sd[k] = h.seg_delta_lf[(s * 4) + k];
+            }
+        }
+        let mut m1: usize = 0;
+        let mut m2: usize = 0;
+        let mut m3: usize = 0;
+        if h.delta_lf_multi {
+            m1 = 1;
+            m2 = 2;
+            m3 = 3;
+        }
+        d.lflvl[o] = lf_value(h.lf_level_y[0], dl[0], sd[0], h);
+        d.lflvl[o + 1] = lf_value(h.lf_level_y[1], dl[m1], sd[1], h);
+        d.lflvl[o + 2] = 0;
+        if h.lf_level_u != 0 {
+            d.lflvl[o + 2] = lf_value(h.lf_level_u, dl[m2], sd[2], h);
+        }
+        d.lflvl[o + 3] = 0;
+        if h.lf_level_v != 0 {
+            d.lflvl[o + 3] = lf_value(h.lf_level_v, dl[m3], sd[3], h);
+        }
+    }
+}
+
+// a quantizer matrix of a transform size, derived as dav1d derives them from
+// the 32x16 and (triangular) 32x32 tables
+fn build_qm(level: usize, chroma: usize, tx: u32, out: []mut u8) usize {
+    let b16 = ((level * 2) + chroma) * 512;
+    let b32 = ((level * 2) + chroma) * 528;
+    // the 32x32 table, untriangled
+    let mut full: [1024]u8 = [0; 1024];
+    let mut so: usize = 0;
+    for y in @as(usize, 0)..32 {
+        for x in @as(usize, 0)..(y + 1) {
+            full[(y * 32) + x] = t.QM_32X32_T[b32 + so + x];
+        }
+        let mut sp = y;
+        for x in (y + 1)..32 {
+            sp += x;
+            full[(y * 32) + x] = t.QM_32X32_T[b32 + so + sp];
+        }
+        so += y + 1;
+    }
+    // the tables, by what they are made from (note the swapped w and h)
+    let mut src32 = true;
+    let mut rows: usize = 32;
+    let mut hstep: usize = 1;
+    let mut vstep: usize = 1;
+    let mut transpose = false;
+    if tx == 0 {
+        hstep = 8;
+        vstep = 8;
+    } else if tx == 1 {
+        hstep = 4;
+        vstep = 4;
+    } else if tx == 2 {
+        hstep = 2;
+        vstep = 2;
+    } else if (tx == 3) or (tx == 4) or (tx == 11) or (tx == 12) {} else {
+        src32 = false;
+        rows = 16;
+        // 32x16-derived: 8x4, 16x4, 16x8, 32x8 and 32x16, and transposes
+        let mut w: usize = 0;
+        let mut h: usize = 0;
+        if tx == 5 {
+            w = 8;
+            h = 4;  // R4x8 <- 8x4
+        } else if tx == 6 {
+            w = 8;
+            h = 4;
+            transpose = true;  // R8x4 <- 4x8
+        } else if tx == 13 {
+            w = 16;
+            h = 4;  // R4x16 <- 16x4
+        } else if tx == 14 {
+            w = 16;
+            h = 4;
+            transpose = true;
+        } else if tx == 7 {
+            w = 16;
+            h = 8;  // R8x16 <- 16x8
+        } else if tx == 8 {
+            w = 16;
+            h = 8;
+            transpose = true;
+        } else if tx == 15 {
+            w = 32;
+            h = 8;  // R8x32 <- 32x8
+        } else if tx == 16 {
+            w = 32;
+            h = 8;
+            transpose = true;
+        } else if (tx == 9) or (tx == 17) {
+            w = 32;
+            h = 16;  // R16x32 <- 32x16
+        } else {
+            w = 32;
+            h = 16;
+            transpose = true;  // R32x16, R64x16 <- 16x32
+        }
+        hstep = 32 / w;
+        vstep = 16 / h;
+    }
+    // subsample
+    let mut sub: [1024]u8 = [0; 1024];
+    let mut n: usize = 0;
+    let src_off = (((vstep - 1) / 2) * 32) + ((hstep - 1) / 2);
+    let mut y: usize = 0;
+    while y < rows {
+        let mut x: usize = 0;
+        while x < 32 {
+            if src32 {
+                sub[n] = full[src_off + (y * 32) + x];
+            } else {
+                sub[n] = t.QM_32X16[b16 + src_off + (y * 32) + x];
+            }
+            n += 1;
+            x += hstep;
+        }
+        y += vstep;
+    }
+    let w = 32 / hstep;
+    let h = rows / vstep;
+    if transpose {
+        for yy in @as(usize, 0)..h {
+            for xx in @as(usize, 0)..w {
+                out[(xx * h) + yy] = sub[(yy * w) + xx];
+            }
+        }
+    } else {
+        @mem_copy(out[..n], sub[..n]);
+    }
+    return n;
+}
+
+fn init_qm(d: *mut Dec) !void {
+    let h = &d.hdr;
+    d.qm_on = h.qm;
+    if not h.qm {
+        return;
+    }
+    d.qm = mem.alloc.[u8](3 * 19 * 1024)!;
+    let levels: [3]u32 = [h.qm_y, h.qm_u, h.qm_v];
+    let mut off: usize = 0;
+    for p in @as(usize, 0)..3 {
+        for tx in @as(u32, 0)..19 {
+            let i = (p * 19) + @as(usize, tx);
+            if levels[p] >= 15 {
+                d.qm_off[i] = 0xffffffff;
+                continue;
+            }
+            let mut ch: usize = 0;
+            if p > 0 {
+                ch = 1;
+            }
+            d.qm_off[i] = @truncate(u32, off);
+            off += build_qm(@as(usize, levels[p]), ch, tx, d.qm[off..]);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Contexts
+// -----------------------------------------------------------------------------
+
+fn reset_left(d: *mut Dec) void {
+    @mem_set(d.l_intra[..], 1);
+    @mem_set(d.l_uvmode[..], 0);
+    @mem_set(d.l_mode[..], 0);
+    @mem_set(d.l_partition[..], 0);
+    @mem_set(d.l_skip[..], 0);
+    for i in @as(usize, 0)..32 {
+        d.l_tx_intra[i] = -1;
+    }
+    @mem_set(d.l_lcoef[..], 0x40);
+    @mem_set(d.l_ccoef[..], 0x40);
+    @mem_set(d.l_seg_pred[..], 0);
+    @mem_set(d.l_pal_sz[..], 0);
+    @mem_set(d.l_pal_sz_uv[..], 0);
+}
+
+fn reset_above(d: *mut Dec) void {
+    @mem_set(d.a_intra, 1);
+    @mem_set(d.a_uvmode, 0);
+    @mem_set(d.a_mode, 0);
+    @mem_set(d.a_partition, 0);
+    @mem_set(d.a_skip, 0);
+    for i in @as(usize, 0)..d.a_tx_intra.len {
+        d.a_tx_intra[i] = -1;
+    }
+    @mem_set(d.a_lcoef, 0x40);
+    @mem_set(d.a_ccoef, 0x40);
+    @mem_set(d.a_seg_pred, 0);
+    @mem_set(d.a_pal_sz, 0);
+}
+
+fn set_run(a: []mut u8, start: usize, n: usize, v: u8) void {
+    @mem_set(a[start..start + n], v);
+}
+
+fn mcdf(d: *mut Dec, off: usize, len: usize) []mut u16 {
+    return d.mode_cdf[off..off + len];
+}
+
+fn ccdf(d: *mut Dec, off: usize, len: usize) []mut u16 {
+    return d.coef_cdf[off..off + len];
+}
+
+// -----------------------------------------------------------------------------
+// Loop restoration coefficients
+// -----------------------------------------------------------------------------
+
+let SGR_PARAMS_R: [32]u32 = [2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 0,
+                             2, 0];
+
+fn lr_subexp(d: *mut Dec, rf: i32, k: u32, adj: i32) i32 {
+    return d.msac.subexp(@bit_cast(u32, rf + adj), @as(u32, 8) << k, k) - adj;
+}
+
+fn read_lr(d: *mut Dec, p: usize, u: *mut LrUnit, frame_type: u32) void {
+    let rf = d.lr_ref[p];
+    if frame_type == obu.RT_SWITCHABLE {
+        let f = d.msac.symbol(mcdf(d, c.RESTORE_SWITCHABLE, 3), 2);
+        u.typ = obu.RT_NONE;
+        if f == 1 {
+            u.typ = obu.RT_WIENER;
+        } else if f == 2 {
+            u.typ = obu.RT_SGRPROJ;
+        }
+    } else {
+        let mut off = c.RESTORE_SGRPROJ;
+        if frame_type == obu.RT_WIENER {
+            off = c.RESTORE_WIENER;
+        }
+        u.typ = obu.RT_NONE;
+        if d.msac.bool_adapt(mcdf(d, off, 2)) {
+            u.typ = frame_type;
+        }
+    }
+    if u.typ == obu.RT_WIENER {
+        u.filter_v[0] = 0;
+        u.filter_h[0] = 0;
+        if p == 0 {
+            u.filter_v[0] = lr_subexp(d, rf.filter_v[0], 1, 5);
+        }
+        u.filter_v[1] = lr_subexp(d, rf.filter_v[1], 2, 23);
+        u.filter_v[2] = lr_subexp(d, rf.filter_v[2], 3, 17);
+        if p == 0 {
+            u.filter_h[0] = lr_subexp(d, rf.filter_h[0], 1, 5);
+        }
+        u.filter_h[1] = lr_subexp(d, rf.filter_h[1], 2, 23);
+        u.filter_h[2] = lr_subexp(d, rf.filter_h[2], 3, 17);
+        u.sgr_weights = rf.sgr_weights;
+        u.sgr_idx = rf.sgr_idx;
+        d.lr_ref[p] = u.*;
+    } else if u.typ == obu.RT_SGRPROJ {
+        let idx = d.msac.bools(4);
+        u.sgr_idx = idx;
+        u.sgr_weights[0] = 0;
+        if t.SGR_PARAMS[@as(usize, idx) * 2] != 0 {
+            u.sgr_weights[0] = lr_subexp(d, rf.sgr_weights[0], 4, 96);
+        }
+        u.sgr_weights[1] = 95;
+        if t.SGR_PARAMS[(@as(usize, idx) * 2) + 1] != 0 {
+            u.sgr_weights[1] = lr_subexp(d, rf.sgr_weights[1], 4, 32);
+        }
+        u.filter_v = rf.filter_v;
+        u.filter_h = rf.filter_h;
+        d.lr_ref[p] = u.*;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tiles and superblocks
+// -----------------------------------------------------------------------------
+
+fn decode_tile(d: *mut Dec, data: []u8, tile_row: usize, tile_col: usize) !void {
+    let h = &d.hdr;
+    let sb_shift = d.sb_shift;
+    d.col_start = @bit_cast(i32, h.col_start_sb[tile_col] << sb_shift);
+    d.col_end = @min(@bit_cast(i32, h.col_start_sb[tile_col + 1] << sb_shift), d.bw);
+    d.row_start = @bit_cast(i32, h.row_start_sb[tile_row] << sb_shift);
+    d.row_end = @min(@bit_cast(i32, h.row_start_sb[tile_row + 1] << sb_shift), d.bh);
+    // every tile starts from the default CDFs
+    let mut qcat: usize = 0;
+    if h.yac > 20 {
+        qcat += 1;
+    }
+    if h.yac > 60 {
+        qcat += 1;
+    }
+    if h.yac > 120 {
+        qcat += 1;
+    }
+    @mem_copy(d.coef_cdf, c.COEF_DEFAULTS[qcat * c.COEF_SIZE..(qcat + 1) * c.COEF_SIZE]);
+    @mem_copy(d.mode_cdf, c.MODE_DEFAULTS[..]);
+    d.msac = ms.Msac.init(data, h.disable_cdf_update);
+    d.last_qidx = @bit_cast(i32, h.yac);
+    d.last_delta_lf = [0; 4];
+    init_quant(d, d.last_qidx);
+    calc_lf(d);
+    for p in @as(usize, 0)..3 {
+        d.lr_ref[p].filter_v = [3, -7, 15];
+        d.lr_ref[p].filter_h = [3, -7, 15];
+        d.lr_ref[p].sgr_weights = [-32, 31];
+        d.lr_ref[p].sgr_idx = 0;
+    }
+    let mut by = d.row_start;
+    while by < d.row_end {
+        d.by = by;
+        reset_left(d);
+        let mut bx = d.col_start;
+        while bx < d.col_end {
+            d.bx = bx;
+            // cdef indices of the superblock: unknown yet
+            let cx = us(bx >> 4);
+            let cy = us(by >> 4);
+            d.cdef_idx[(cy * d.cdef_w) + cx] = -1;
+            if d.seq.sb128 {
+                d.cdef_idx[(cy * d.cdef_w) + cx + 1] = -1;
+                d.cdef_idx[((cy + 1) * d.cdef_w) + cx] = -1;
+                d.cdef_idx[((cy + 1) * d.cdef_w) + cx + 1] = -1;
+            }
+            read_lr_units(d, bx, by);
+            let mut root: u32 = 1;
+            if d.seq.sb128 {
+                root = 0;
+            }
+            decode_sb(d, root, true, false)!;
+            bx += d.sb_step;
+        }
+        by += d.sb_step;
+        if d.msac.cnt < -15 {
+            return error.InvalidImage;
+        }
+    }
+}
+
+fn read_lr_units(d: *mut Dec, bx: i32, by: i32) void {
+    let h = &d.hdr;
+    for p in @as(usize, 0)..3 {
+        let ft = h.lr_type[p];
+        if ft == obu.RT_NONE {
+            continue;
+        }
+        let mut ssv: u32 = 0;
+        let mut ssh: u32 = 0;
+        if p != 0 {
+            ssv = d.ss_ver;
+            ssh = d.ss_hor;
+        }
+        let mut k: usize = 0;
+        if p != 0 {
+            k = 1;
+        }
+        let log2 = h.lr_unit_size[k];
+        let y = (by * 4) >> ssv;
+        let ph = (@bit_cast(i32, h.height) + @bit_cast(i32, ssv)) >> ssv;
+        let unit = @as(i32, 1) << log2;
+        let half = unit >> 1;
+        if (y & (unit - 1)) != 0 {
+            continue;
+        }
+        if (y != 0) and ((y + half) > ph) {
+            continue;
+        }
+        let x = (bx * 4) >> ssh;
+        if (x & (unit - 1)) != 0 {
+            continue;
+        }
+        let pw = (@bit_cast(i32, h.width) + @bit_cast(i32, ssh)) >> ssh;
+        if (x != 0) and ((x + half) > pw) {
+            continue;
+        }
+        let ui = (us(y >> log2) * d.lr_w[p]) + us(x >> log2);
+        let mut u = d.lr[p][ui];
+        read_lr(d, p, &mut u, ft);
+        d.lr[p][ui] = u;
+    }
+}
+
+// the edge flags of a node of the partition tree, from whether its top has
+// a right neighbour and its left a bottom one
+fn edge_flags(tr: bool, lb: bool) u32 {
+    let mut f: u32 = 0;
+    if tr {
+        f |= ALL_TR;
+    }
+    if lb {
+        f |= ALL_BL;
+    }
+    return f;
+}
+
+fn child_tr(n: u32, tr: bool) bool {
+    return not ((n == 3) or ((n == 1) and not tr));
+}
+
+fn child_lb(n: u32, lb: bool) bool {
+    return (n == 0) or ((n == 2) and lb);
+}
+
+fn decode_sb(d: *mut Dec, bl: u32, tr: bool, lb: bool) !void {
+    let hsz = @as(i32, 16) >> bl;
+    let have_h_split = d.bw > (d.bx + hsz);
+    let have_v_split = d.bh > (d.by + hsz);
+    let ef = edge_flags(tr, lb);
+    if (not have_h_split) and not have_v_split {
+        return decode_sb(d, bl + 1, child_tr(0, tr), child_lb(0, lb));
+    }
+    // the node's flags (a branch above 8x8, a tip at 8x8)
+    let tip = bl == 4;
+    let o = ef;
+    let h0 = ef | ALL_BL;
+    let v0 = ef | ALL_TR;
+    let mut h1 = ef & ALL_BL;
+    let mut v1 = ef & ALL_TR;
+    if tip {
+        h1 = ef & (ALL_BL | TR_420);
+        v1 = ef & ((ALL_TR | BL_420) | BL_422);
+    }
+    let mut h4 = ALL_BL;
+    let mut v4 = ALL_TR;
+    if bl == 3 {
+        h4 |= ef & TR_420;
+        v4 |= ef & (BL_420 | BL_422);
+    }
+    let bx8 = us(d.bx >> 1);
+    let by8 = us((d.by & 31) >> 1);
+    let shift = @truncate(u8, 4 - bl);
+    let ctx = @as(usize, (d.a_partition[bx8] >> shift) & 1) + (2 * @as(usize, (d.l_partition[by8] >> shift) & 1));
+    let pc = c.PARTITION + (((@as(usize, bl) * 4) + ctx) * c.PARTITION_STRIDE);
+    let mut bp: u32 = 0;
+    if have_h_split and have_v_split {
+        bp = d.msac.symbol(mcdf(d, pc, 10), PARTITION_SYMBOLS[@as(usize, bl)]);
+        if (d.layout == obu.I422) and ((bp == 2) or (bp == 9) or (bp == 6) or (bp == 7)) {
+            return error.InvalidImage;
+        }
+        let bs0 = BLOCK_SIZES[(((@as(usize, bl) * 10) + @as(usize, bp)) * 2)];
+        let bs1 = BLOCK_SIZES[(((@as(usize, bl) * 10) + @as(usize, bp)) * 2) + 1];
+        if bp == 0 {
+            decode_b(d, bl, bs0, bp, o)!;
+        } else if bp == 1 {
+            decode_b(d, bl, bs0, bp, h0)!;
+            d.by += hsz;
+            decode_b(d, bl, bs0, bp, h1)!;
+            d.by -= hsz;
+        } else if bp == 2 {
+            decode_b(d, bl, bs0, bp, v0)!;
+            d.bx += hsz;
+            decode_b(d, bl, bs0, bp, v1)!;
+            d.bx -= hsz;
+        } else if bp == 3 {
+            if tip {
+                // four 4x4 blocks
+                let s0 = (ef & ALL_TR) | BL_422;
+                let s1 = ef | TR_444;
+                let s2 = ef & ((TR_420 | BL_420) | BL_422);
+                decode_b(d, bl, 21, bp, ALL_TR | ALL_BL)!;
+                d.bx += 1;
+                decode_b(d, bl, 21, bp, s0)!;
+                d.bx -= 1;
+                d.by += 1;
+                decode_b(d, bl, 21, bp, s1)!;
+                d.bx += 1;
+                decode_b(d, bl, 21, bp, s2)!;
+                d.bx -= 1;
+                d.by -= 1;
+            } else {
+                decode_sb(d, bl + 1, child_tr(0, tr), child_lb(0, lb))!;
+                d.bx += hsz;
+                decode_sb(d, bl + 1, child_tr(1, tr), child_lb(1, lb))!;
+                d.bx -= hsz;
+                d.by += hsz;
+                decode_sb(d, bl + 1, child_tr(2, tr), child_lb(2, lb))!;
+                d.bx += hsz;
+                decode_sb(d, bl + 1, child_tr(3, tr), child_lb(3, lb))!;
+                d.bx -= hsz;
+                d.by -= hsz;
+            }
+        } else if bp == 4 {
+            decode_b(d, bl, bs0, bp, ALL_TR | ALL_BL)!;
+            d.bx += hsz;
+            decode_b(d, bl, bs0, bp, v1)!;
+            d.bx -= hsz;
+            d.by += hsz;
+            decode_b(d, bl, bs1, bp, h1)!;
+            d.by -= hsz;
+        } else if bp == 5 {
+            decode_b(d, bl, bs0, bp, h0)!;
+            d.by += hsz;
+            decode_b(d, bl, bs1, bp, v0)!;
+            d.bx += hsz;
+            decode_b(d, bl, bs1, bp, 0)!;
+            d.bx -= hsz;
+            d.by -= hsz;
+        } else if bp == 6 {
+            decode_b(d, bl, bs0, bp, ALL_TR | ALL_BL)!;
+            d.by += hsz;
+            decode_b(d, bl, bs0, bp, h1)!;
+            d.by -= hsz;
+            d.bx += hsz;
+            decode_b(d, bl, bs1, bp, v1)!;
+            d.bx -= hsz;
+        } else if bp == 7 {
+            decode_b(d, bl, bs0, bp, v0)!;
+            d.bx += hsz;
+            decode_b(d, bl, bs1, bp, h0)!;
+            d.by += hsz;
+            decode_b(d, bl, bs1, bp, 0)!;
+            d.by -= hsz;
+            d.bx -= hsz;
+        } else if bp == 8 {
+            let q = hsz >> 1;
+            decode_b(d, bl, bs0, bp, h0)!;
+            d.by += q;
+            decode_b(d, bl, bs0, bp, h4)!;
+            d.by += q;
+            decode_b(d, bl, bs0, bp, ALL_BL)!;
+            d.by += q;
+            if d.by < d.bh {
+                decode_b(d, bl, bs0, bp, h1)!;
+            }
+            d.by -= q * 3;
+        } else {
+            let q = hsz >> 1;
+            decode_b(d, bl, bs0, bp, v0)!;
+            d.bx += q;
+            decode_b(d, bl, bs0, bp, v4)!;
+            d.bx += q;
+            decode_b(d, bl, bs0, bp, ALL_TR)!;
+            d.bx += q;
+            if d.bx < d.bw {
+                decode_b(d, bl, bs0, bp, v1)!;
+            }
+            d.bx -= q * 3;
+        }
+    } else if have_h_split {
+        let p = mcdf(d, pc, 10);
+        let mut prob = (@as(i32, p[2 - 1]) - @as(i32, p[4])) + @as(i32, p[6 - 1]);
+        if bl != 0 {
+            prob += @as(i32, p[9 - 1]) - @as(i32, p[7]);
+        }
+        let is_split = d.msac.bool_prob(@bit_cast(u32, prob));
+        if is_split {
+            bp = 3;
+            decode_sb(d, bl + 1, child_tr(0, tr), child_lb(0, lb))!;
+            d.bx += hsz;
+            decode_sb(d, bl + 1, child_tr(1, tr), child_lb(1, lb))!;
+            d.bx -= hsz;
+        } else {
+            bp = 1;
+            decode_b(d, bl, BLOCK_SIZES[((@as(usize, bl) * 10) + 1) * 2], bp, h0)!;
+        }
+    } else {
+        let p = mcdf(d, pc, 10);
+        let mut prob = (@as(i32, p[1 - 1]) - @as(i32, p[1])) + (@as(i32, p[3 - 1]) - @as(i32, p[6]));
+        if bl != 0 {
+            prob += @as(i32, p[8 - 1]) - @as(i32, p[8]);
+        }
+        let is_split = d.msac.bool_prob(@bit_cast(u32, prob));
+        if (d.layout == obu.I422) and not is_split {
+            return error.InvalidImage;
+        }
+        if is_split {
+            bp = 3;
+            decode_sb(d, bl + 1, child_tr(0, tr), child_lb(0, lb))!;
+            d.by += hsz;
+            decode_sb(d, bl + 1, child_tr(2, tr), child_lb(2, lb))!;
+            d.by -= hsz;
+        } else {
+            bp = 2;
+            decode_b(d, bl, BLOCK_SIZES[((@as(usize, bl) * 10) + 2) * 2], bp, v0)!;
+        }
+    }
+    if (bp != 3) or (bl == 4) {
+        let n = us(hsz);
+        let av = @truncate(u8, AL_PART_CTX[(@as(usize, bl) * 10) + @as(usize, bp)]);
+        let lv = @truncate(u8, AL_PART_CTX[50 + (@as(usize, bl) * 10) + @as(usize, bp)]);
+        set_run(d.a_partition, bx8, n, av);
+        set_run(d.l_partition[..], by8, @min(n, 16 - by8), lv);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Blocks
+// -----------------------------------------------------------------------------
+
+fn neg_deinterleave(diff: u32, r: u32, max: u32) u32 {
+    if r == 0 {
+        return diff;
+    }
+    if (r + 1) >= max {
+        return (max -% (diff + 1)) & 0xff;
+    }
+    if (2 * r) < max {
+        if diff <= (2 * r) {
+            if (diff & 1) != 0 {
+                return r + ((diff + 1) >> 1);
+            }
+            return r - (diff >> 1);
+        }
+        return diff;
+    }
+    if diff <= (2 * ((max - r) - 1)) {
+        if (diff & 1) != 0 {
+            return r + ((diff + 1) >> 1);
+        }
+        return r - (diff >> 1);
+    }
+    return (max -% (diff + 1)) & 0xff;
+}
+
+// the predicted segment id and its context
+fn cur_segid(d: *mut Dec, have_top: bool, have_left: bool, ctx: *mut u32) u32 {
+    let st = d.b4_stride;
+    let x = us(d.bx);
+    let y = us(d.by);
+    ctx.* = 0;
+    if have_left and have_top {
+        let l = @as(u32, d.seg_map[(y * st) + x - 1]);
+        let a = @as(u32, d.seg_map[((y - 1) * st) + x]);
+        let al = @as(u32, d.seg_map[((y - 1) * st) + x - 1]);
+        if (l == a) and (al == l) {
+            ctx.* = 2;
+        } else if (l == a) or (al == l) or (a == al) {
+            ctx.* = 1;
+        }
+        if a == al {
+            return a;
+        }
+        return l;
+    }
+    if have_left {
+        return @as(u32, d.seg_map[(y * st) + x - 1]);
+    }
+    if have_top {
+        return @as(u32, d.seg_map[((y - 1) * st) + x]);
+    }
+    return 0;
+}
+
+fn read_segid(d: *mut Dec, have_top: bool, have_left: bool) u32 {
+    let mut ctx: u32 = 0;
+    let pred_id = cur_segid(d, have_top, have_left, &mut ctx);
+    let diff = d.msac.symbol(mcdf(d, c.SEG_ID + (@as(usize, ctx) * c.SEG_ID_STRIDE), 8), 7);
+    let last = @bit_cast(u32, d.hdr.seg_last_active + 1);
+    let mut id = neg_deinterleave(diff, pred_id, last);
+    if id >= last {
+        id = 0;
+    }
+    if id > 7 {
+        id = 0;
+    }
+    return id;
+}
+
+fn read_delta(d: *mut Dec, off: usize, res_log2: u32) i32 {
+    let mut v = @bit_cast(i32, d.msac.symbol(mcdf(d, off, 4), 3));
+    if v == 3 {
+        let n = 1 + d.msac.bools(3);
+        v = @bit_cast(i32, (d.msac.bools(n) + 1) + (@as(u32, 1) << n));
+    }
+    if v != 0 {
+        if d.msac.bool_equi() {
+            v = -v;
+        }
+        v *= @as(i32, 1) << res_log2;
+    }
+    return v;
+}
+
+struct Blk {
+    bs: u32,
+    bw4: i32,
+    bh4: i32,
+    lw: u32,
+    lh: u32,
+    w4: i32,
+    h4: i32,
+    cbw4: i32,
+    cbh4: i32,
+    cw4: i32,
+    ch4: i32,
+    has_chroma: bool,
+    seg: usize,
+    skip: bool,
+    y_mode: u32,
+    y_angle: i32,
+    uv_mode: u32,
+    uv_angle: i32,
+    cfl_alpha: [2]i32,
+    pal_sz: [2]u32,
+    tx: u32,
+    uvtx: u32,
+}
+
+fn decode_b(d: *mut Dec, bl: u32, bs: u32, bp: u32, edge: u32) !void {
+    let h = &d.hdr;
+    let mut b = obu.zeroed.[Blk]()!;
+    b.bs = bs;
+    b.bw4 = @bit_cast(i32, bdim(bs, 0));
+    b.bh4 = @bit_cast(i32, bdim(bs, 1));
+    b.lw = bdim(bs, 2);
+    b.lh = bdim(bs, 3);
+    let ssh = @bit_cast(i32, d.ss_hor);
+    let ssv = @bit_cast(i32, d.ss_ver);
+    b.w4 = @min(b.bw4, d.bw - d.bx);
+    b.h4 = @min(b.bh4, d.bh - d.by);
+    b.cbw4 = (b.bw4 + ssh) >> @bit_cast(u32, ssh);
+    b.cbh4 = (b.bh4 + ssv) >> @bit_cast(u32, ssv);
+    b.cw4 = (b.w4 + ssh) >> @bit_cast(u32, ssh);
+    b.ch4 = (b.h4 + ssv) >> @bit_cast(u32, ssv);
+    let bx = us(d.bx);
+    let by4 = us(d.by & 31);
+    let have_left = d.bx > d.col_start;
+    let have_top = d.by > d.row_start;
+    b.has_chroma = (d.layout != obu.I400) and ((b.bw4 > ssh) or ((d.bx & 1) != 0)) and
+                   ((b.bh4 > ssv) or ((d.by & 1) != 0));
+    // segment
+    let mut seg_pred: u8 = 0;
+    if h.seg_enabled and h.seg_preskip {
+        b.seg = @as(usize, read_segid(d, have_top, have_left));
+    }
+    if h.seg_enabled and h.seg_skip[b.seg] {
+        b.skip = true;
+    } else {
+        let sctx = @as(usize, d.a_skip[bx] + d.l_skip[by4]);
+        b.skip = d.msac.bool_adapt(mcdf(d, c.SKIP + (sctx * c.SKIP_STRIDE), 2));
+    }
+    if h.seg_enabled and not h.seg_preskip {
+        if b.skip {
+            let mut ctx: u32 = 0;
+            b.seg = @as(usize, cur_segid(d, have_top, have_left, &mut ctx));
+        } else {
+            b.seg = @as(usize, read_segid(d, have_top, have_left));
+        }
+    }
+    // cdef index
+    if not b.skip {
+        let cx = us(d.bx >> 4);
+        let cy = us(d.by >> 4);
+        let ci = (cy * d.cdef_w) + cx;
+        if d.cdef_idx[ci] == -1 {
+            let v = @bit_cast(i32, d.msac.bools(h.cdef_bits));
+            d.cdef_idx[ci] = v;
+            if b.bw4 > 16 {
+                d.cdef_idx[ci + 1] = v;
+            }
+            if b.bh4 > 16 {
+                d.cdef_idx[ci + d.cdef_w] = v;
+            }
+            if (b.bw4 == 32) and (b.bh4 == 32) {
+                d.cdef_idx[ci + d.cdef_w + 1] = v;
+            }
+        }
+    }
+    // delta q and loop filter
+    let mut sbm: i32 = 15;
+    if d.seq.sb128 {
+        sbm = 31;
+    }
+    if ((d.bx & sbm) == 0) and ((d.by & sbm) == 0) {
+        let prev_q = d.last_qidx;
+        let prev_lf = d.last_delta_lf;
+        let mut sb_bs: u32 = 3;
+        if d.seq.sb128 {
+            sb_bs = 0;
+        }
+        if h.delta_q_present and ((bs != sb_bs) or not b.skip) {
+            let dq = read_delta(d, c.DELTA_Q, h.delta_q_res_log2);
+            d.last_qidx = iclip(d.last_qidx + dq, 1, 255);
+            if h.delta_lf_present {
+                let mut n: usize = 1;
+                if h.delta_lf_multi {
+                    n = 2;
+                    if d.layout != obu.I400 {
+                        n = 4;
+                    }
+                }
+                for i in @as(usize, 0)..n {
+                    let mut k = i;
+                    if h.delta_lf_multi {
+                        k += 1;
+                    }
+                    let dl = read_delta(d, c.DELTA_LF + (k * c.DELTA_LF_STRIDE), h.delta_lf_res_log2);
+                    d.last_delta_lf[i] = iclip(d.last_delta_lf[i] + dl, -63, 63);
+                }
+            }
+        }
+        if d.last_qidx != prev_q {
+            init_quant(d, d.last_qidx);
+        }
+        let dl = d.last_delta_lf;
+        if (dl[0] != prev_lf[0]) or (dl[1] != prev_lf[1]) or (dl[2] != prev_lf[2]) or (dl[3] != prev_lf[3]) {
+            calc_lf(d);
+        }
+    }
+    if h.allow_intrabc {
+        if not d.msac.bool_adapt(mcdf(d, c.INTRABC, 2)) {
+            return error.Unsupported;  // intra block copy
+        }
+    }
+    // modes
+    let am = INTRA_MODE_CONTEXT[@as(usize, d.a_mode[bx])];
+    let lm = INTRA_MODE_CONTEXT[@as(usize, d.l_mode[by4])];
+    let yc = c.KFYM + (((@as(usize, am) * 5) + @as(usize, lm)) * c.KFYM_STRIDE);
+    b.y_mode = d.msac.symbol(mcdf(d, yc, 13), 12);
+    if ((b.lw + b.lh) >= 2) and (b.y_mode >= pred.VERT_PRED) and (b.y_mode <= pred.VERT_LEFT_PRED) {
+        let ac = c.ANGLE_DELTA + (@as(usize, b.y_mode - 1) * c.ANGLE_DELTA_STRIDE);
+        b.y_angle = @bit_cast(i32, d.msac.symbol(mcdf(d, ac, 7), 6)) - 3;
+    }
+    if b.has_chroma {
+        let mut cfl_allowed = (CFL_ALLOWED_MASK & (@as(u32, 1) << bs)) != 0;
+        if h.lossless[b.seg] {
+            cfl_allowed = (b.cbw4 == 1) and (b.cbh4 == 1);
+        }
+        let mut ca: usize = 0;
+        let mut n: u32 = 12;
+        if cfl_allowed {
+            ca = 1;
+            n = 13;
+        }
+        let uc = c.UV_MODE + (((ca * 13) + @as(usize, b.y_mode)) * c.UV_MODE_STRIDE);
+        b.uv_mode = d.msac.symbol(mcdf(d, uc, 14), n);
+        if b.uv_mode == pred.CFL_PRED {
+            let sign = d.msac.symbol(mcdf(d, c.CFL_SIGN, 8), 7) + 1;
+            let su = (sign * 0x56) >> 8;
+            let sv = sign - (su * 3);
+            let signs: [2]u32 = [su, sv];
+            for i in @as(usize, 0)..2 {
+                if signs[i] == 0 {
+                    continue;
+                }
+                let mut ctx = @as(usize, signs[1 - i]);
+                if signs[i] == 2 {
+                    ctx += 3;
+                }
+                let a = @bit_cast(i32, d.msac.symbol(mcdf(d, c.CFL_ALPHA + (ctx * c.CFL_ALPHA_STRIDE), 16), 15)) + 1;
+                b.cfl_alpha[i] = a;
+                if signs[i] == 1 {
+                    b.cfl_alpha[i] = -a;
+                }
+            }
+        } else if ((b.lw + b.lh) >= 2) and (b.uv_mode >= pred.VERT_PRED) and (b.uv_mode <= pred.VERT_LEFT_PRED) {
+            let ac = c.ANGLE_DELTA + (@as(usize, b.uv_mode - 1) * c.ANGLE_DELTA_STRIDE);
+            b.uv_angle = @bit_cast(i32, d.msac.symbol(mcdf(d, ac, 7), 6)) - 3;
+        }
+    }
+    // palettes
+    if h.allow_screen_content_tools and (@max(b.bw4, b.bh4) <= 16) and ((b.bw4 + b.bh4) >= 4) {
+        let sz_ctx = @as(usize, (b.lw + b.lh) - 2);
+        if b.y_mode == pred.DC_PRED {
+            let mut pctx: usize = 0;
+            if d.a_pal_sz[bx] > 0 {
+                pctx += 1;
+            }
+            if d.l_pal_sz[by4] > 0 {
+                pctx += 1;
+            }
+            if d.msac.bool_adapt(mcdf(d, c.PAL_Y + (((sz_ctx * 3) + pctx) * c.PAL_Y_STRIDE), 2)) {
+                b.pal_sz[0] = read_pal_plane(d, false, sz_ctx);
+            }
+        }
+        if b.has_chroma and (b.uv_mode == pred.DC_PRED) {
+            let mut pctx: usize = 0;
+            if b.pal_sz[0] > 0 {
+                pctx = 1;
+            }
+            if d.msac.bool_adapt(mcdf(d, c.PAL_UV + (pctx * c.PAL_UV_STRIDE), 2)) {
+                b.pal_sz[1] = read_pal_uv(d, sz_ctx);
+            }
+        }
+    }
+    if (b.y_mode == pred.DC_PRED) and (b.pal_sz[0] == 0) and (@max(b.lw, b.lh) <= 3) and d.seq.filter_intra {
+        if d.msac.bool_adapt(mcdf(d, c.USE_FILTER_INTRA + (@as(usize, bs) * c.USE_FILTER_INTRA_STRIDE), 2)) {
+            b.y_mode = pred.FILTER_PRED;
+            b.y_angle = @bit_cast(i32, d.msac.symbol(mcdf(d, c.FILTER_INTRA, 5), 4));
+        }
+    }
+    if b.pal_sz[0] != 0 {
+        read_pal_indices(d, false, b.pal_sz[0], us(b.w4), us(b.h4), us(b.bw4), us(b.bh4));
+    }
+    if b.has_chroma and (b.pal_sz[1] != 0) {
+        read_pal_indices(d, true, b.pal_sz[1], us(b.cw4), us(b.ch4), us(b.cbw4), us(b.cbh4));
+    }
+    // transform size
+    if h.lossless[b.seg] {
+        b.tx = S4X4;
+        b.uvtx = S4X4;
+    } else {
+        b.tx = MAX_TX_FOR_BS[@as(usize, bs) * 4];
+        b.uvtx = MAX_TX_FOR_BS[(@as(usize, bs) * 4) + @as(usize, d.layout)];
+        if (h.txfm_mode == obu.TX_SWITCHABLE) and (txd(b.tx, 5) > 0) {
+            let mx = txd(b.tx, 5);
+            let mut tctx: usize = 0;
+            if d.l_tx_intra[by4] >= @bit_cast(i32, txd(b.tx, 3)) {
+                tctx += 1;
+            }
+            if d.a_tx_intra[bx] >= @bit_cast(i32, txd(b.tx, 2)) {
+                tctx += 1;
+            }
+            let tc = c.TXSZ + (((@as(usize, mx - 1) * 3) + tctx) * c.TXSZ_STRIDE);
+            let depth = d.msac.symbol(mcdf(d, tc, 3), @min(mx, 2));
+            for _q in @as(u32, 0)..depth {
+                b.tx = txd(b.tx, 6);
+            }
+        }
+    }
+    recon_intra(d, &b, edge)!;
+    store_filter_info(d, &b);
+    if not b.skip {
+        for y in @as(usize, 0)..us(b.bh4) {
+            set_run(d.noskip, ((us(d.by) + y) * d.b4_stride) + bx, us(b.bw4), 1);
+        }
+    }
+    // contexts
+    let mut ymn = b.y_mode;
+    if ymn == pred.FILTER_PRED {
+        ymn = pred.DC_PRED;
+    }
+    let bw4 = us(b.bw4);
+    let bh4 = us(@min(b.bh4, 32 - (d.by & 31)));
+    for i in @as(usize, 0)..bh4 {
+        d.l_tx_intra[by4 + i] = @bit_cast(i32, txd(b.tx, 3));
+    }
+    for i in @as(usize, 0)..bw4 {
+        d.a_tx_intra[bx + i] = @bit_cast(i32, txd(b.tx, 2));
+    }
+    let mut skip: u8 = 0;
+    if b.skip {
+        skip = 1;
+    }
+    let mut uvps: u8 = 0;
+    if b.has_chroma {
+        uvps = @truncate(u8, b.pal_sz[1]);
+    }
+    set_run(d.a_mode, bx, bw4, @truncate(u8, ymn));
+    set_run(d.l_mode[..], by4, bh4, @truncate(u8, ymn));
+    set_run(d.a_pal_sz, bx, bw4, @truncate(u8, b.pal_sz[0]));
+    set_run(d.l_pal_sz[..], by4, bh4, @truncate(u8, b.pal_sz[0]));
+    set_run(d.a_seg_pred, bx, bw4, seg_pred);
+    set_run(d.l_seg_pred[..], by4, bh4, seg_pred);
+    set_run(d.a_intra, bx, bw4, 1);
+    set_run(d.l_intra[..], by4, bh4, 1);
+    set_run(d.a_skip, bx, bw4, skip);
+    set_run(d.l_skip[..], by4, bh4, skip);
+    set_run(d.a_pal_sz_uv, bx, bw4, uvps);
+    set_run(d.l_pal_sz_uv[..], by4, bh4, uvps);
+    if b.pal_sz[0] != 0 {
+        for i in @as(usize, 0)..bw4 {
+            for k in @as(usize, 0)..8 {
+                d.a_pal[((bx + i) * 24) + k] = d.pal[k];
+            }
+        }
+        for i in @as(usize, 0)..bh4 {
+            for k in @as(usize, 0)..8 {
+                d.l_pal[((by4 + i) * 24) + k] = d.pal[k];
+            }
+        }
+    }
+    if b.has_chroma {
+        let cbx = us(d.bx >> @bit_cast(u32, ssh));
+        let cby = us((d.by & 31) >> @bit_cast(u32, ssv));
+        set_run(d.a_uvmode, cbx, us(b.cbw4), @truncate(u8, b.uv_mode));
+        set_run(d.l_uvmode[..], cby, @min(us(b.cbh4), 32 - cby), @truncate(u8, b.uv_mode));
+        if b.pal_sz[1] != 0 {
+            for pl in @as(usize, 1)..3 {
+                for i in @as(usize, 0)..bw4 {
+                    for k in @as(usize, 0)..8 {
+                        d.a_pal[((bx + i) * 24) + (pl * 8) + k] = d.pal[(pl * 8) + k];
+                    }
+                }
+                for i in @as(usize, 0)..bh4 {
+                    for k in @as(usize, 0)..8 {
+                        d.l_pal[((by4 + i) * 24) + (pl * 8) + k] = d.pal[(pl * 8) + k];
+                    }
+                }
+            }
+        }
+    }
+    if h.seg_enabled {
+        let st = d.b4_stride;
+        for y in @as(usize, 0)..us(b.h4) {
+            for x in @as(usize, 0)..us(b.w4) {
+                d.seg_map[((us(d.by) + y) * st) + bx + x] = @truncate(u8, b.seg);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Palettes
+// -----------------------------------------------------------------------------
+
+fn read_pal_plane(d: *mut Dec, uv: bool, sz_ctx: usize) u32 {
+    let mut pli: usize = 0;
+    let mut not_pl: u32 = 1;
+    if uv {
+        pli = 1;
+        not_pl = 0;
+    }
+    let pal_sz = d.msac.symbol(mcdf(d, c.PAL_SZ + (((pli * 7) + sz_ctx) * c.PAL_SZ_STRIDE), 7), 6) + 2;
+    let bx = us(d.bx);
+    let by4 = us(d.by & 31);
+    let mut cache: [16]u16 = [0; 16];
+    let mut used: [8]u16 = [0; 8];
+    let mut l_n = @as(u32, d.l_pal_sz[by4]);
+    if uv {
+        l_n = @as(u32, d.l_pal_sz_uv[by4]);
+    }
+    let mut a_n: u32 = 0;
+    if (by4 & 15) != 0 {
+        a_n = @as(u32, d.a_pal_sz[bx]);
+        if uv {
+            a_n = @as(u32, d.a_pal_sz_uv[bx]);
+        }
+    }
+    let lo = (by4 * 24) + (pli * 8);
+    let ao = (bx * 24) + (pli * 8);
+    let mut li: usize = 0;
+    let mut ai: usize = 0;
+    let mut n: usize = 0;
+    while (l_n != 0) and (a_n != 0) {
+        let lv = d.l_pal[lo + li];
+        let av = d.a_pal[ao + ai];
+        if lv < av {
+            if (n == 0) or (cache[n - 1] != lv) {
+                cache[n] = lv;
+                n += 1;
+            }
+            li += 1;
+            l_n -= 1;
+        } else {
+            if av == lv {
+                li += 1;
+                l_n -= 1;
+            }
+            if (n == 0) or (cache[n - 1] != av) {
+                cache[n] = av;
+                n += 1;
+            }
+            ai += 1;
+            a_n -= 1;
+        }
+    }
+    while l_n != 0 {
+        let lv = d.l_pal[lo + li];
+        if (n == 0) or (cache[n - 1] != lv) {
+            cache[n] = lv;
+            n += 1;
+        }
+        li += 1;
+        l_n -= 1;
+    }
+    while a_n != 0 {
+        let av = d.a_pal[ao + ai];
+        if (n == 0) or (cache[n - 1] != av) {
+            cache[n] = av;
+            n += 1;
+        }
+        ai += 1;
+        a_n -= 1;
+    }
+    let psz = @as(usize, pal_sz);
+    let mut i: usize = 0;
+    for k in @as(usize, 0)..n {
+        if i >= psz {
+            break;
+        }
+        if d.msac.bool_equi() {
+            used[i] = cache[k];
+            i += 1;
+        }
+    }
+    let nused = i;
+    let po = pli * 8;
+    if i < psz {
+        let bpc = d.bitdepth;
+        let mut prev = d.msac.bools(bpc);
+        d.pal[po + i] = @truncate(u16, prev);
+        i += 1;
+        if i < psz {
+            let mut bits = (bpc + d.msac.bools(2)) - 3;
+            let max = (@as(u32, 1) << bpc) - 1;
+            loop {
+                let delta = d.msac.bools(bits);
+                prev = @min((prev + delta) + not_pl, max);
+                d.pal[po + i] = @truncate(u16, prev);
+                i += 1;
+                if (prev + not_pl) >= max {
+                    while i < psz {
+                        d.pal[po + i] = @truncate(u16, max);
+                        i += 1;
+                    }
+                    break;
+                }
+                bits = @min(bits, 1 + obu.ulog2((max - prev) - not_pl));
+                if i >= psz {
+                    break;
+                }
+            }
+        }
+        // merge with the used cache entries, in order
+        let mut merged: [8]u16 = [0; 8];
+        let mut nn: usize = 0;
+        let mut m = nused;
+        for k in @as(usize, 0)..psz {
+            if (nn < nused) and ((m >= psz) or (used[nn] <= d.pal[po + m])) {
+                merged[k] = used[nn];
+                nn += 1;
+            } else {
+                merged[k] = d.pal[po + m];
+                m += 1;
+            }
+        }
+        for k in @as(usize, 0)..psz {
+            d.pal[po + k] = merged[k];
+        }
+    } else {
+        for k in @as(usize, 0)..nused {
+            d.pal[po + k] = used[k];
+        }
+    }
+    return pal_sz;
+}
+
+fn read_pal_uv(d: *mut Dec, sz_ctx: usize) u32 {
+    let pal_sz = read_pal_plane(d, true, sz_ctx);
+    let psz = @as(usize, pal_sz);
+    let bpc = d.bitdepth;
+    if d.msac.bool_equi() {
+        let bits = (bpc + d.msac.bools(2)) - 4;
+        let mut prev = d.msac.bools(bpc);
+        d.pal[16] = @truncate(u16, prev);
+        let max = (@as(u32, 1) << bpc) - 1;
+        for k in @as(usize, 1)..psz {
+            let mut delta = @bit_cast(i32, d.msac.bools(bits));
+            if (delta != 0) and d.msac.bool_equi() {
+                delta = -delta;
+            }
+            prev = @bit_cast(u32, @bit_cast(i32, prev) + delta) & max;
+            d.pal[16 + k] = @truncate(u16, prev);
+        }
+    } else {
+        for k in @as(usize, 0)..psz {
+            d.pal[16 + k] = @truncate(u16, d.msac.bools(bpc));
+        }
+    }
+    return pal_sz;
+}
+
+fn order_palette(d: *mut Dec, idx: []u8, stride: usize, i: usize, first: usize, last: usize) void {
+    let mut have_top = i > first;
+    let mut off = first + ((i - first) * stride);
+    let mut m: usize = 0;
+    let mut j = first + 1;
+    while j > last {
+        j -= 1;
+        let have_left = j > 0;
+        let mut mask: u32 = 0;
+        let mut o: usize = 0;
+        let ob = m * 8;
+        if not have_left {
+            d.pal_ctx[m] = 0;
+            let v = idx[off - stride];
+            d.pal_order[ob + o] = v;
+            o += 1;
+            mask |= @as(u32, 1) << @as(u32, v);
+        } else if not have_top {
+            d.pal_ctx[m] = 0;
+            let v = idx[off - 1];
+            d.pal_order[ob + o] = v;
+            o += 1;
+            mask |= @as(u32, 1) << @as(u32, v);
+        } else {
+            let l = idx[off - 1];
+            let tt = idx[off - stride];
+            let tl = idx[off - (stride + 1)];
+            let same_t_l = tt == l;
+            let same_t_tl = tt == tl;
+            let same_l_tl = l == tl;
+            let mut vals: [3]u8 = [0; 3];
+            let mut nv: usize = 0;
+            if same_t_l and same_t_tl and same_l_tl {
+                d.pal_ctx[m] = 4;
+                vals[0] = tt;
+                nv = 1;
+            } else if same_t_l {
+                d.pal_ctx[m] = 3;
+                vals[0] = tt;
+                vals[1] = tl;
+                nv = 2;
+            } else if same_t_tl or same_l_tl {
+                d.pal_ctx[m] = 2;
+                vals[0] = tl;
+                vals[1] = l;
+                if same_t_tl {
+                    vals[1] = l;
+                } else {
+                    vals[1] = tt;
+                }
+                nv = 2;
+            } else {
+                d.pal_ctx[m] = 1;
+                vals[0] = @min(tt, l);
+                vals[1] = @max(tt, l);
+                vals[2] = tl;
+                nv = 3;
+            }
+            for k in @as(usize, 0)..nv {
+                d.pal_order[ob + o] = vals[k];
+                o += 1;
+                mask |= @as(u32, 1) << @as(u32, vals[k]);
+            }
+        }
+        for bit in @as(u32, 0)..8 {
+            if (mask & (@as(u32, 1) << bit)) == 0 {
+                d.pal_order[ob + o] = @truncate(u8, bit);
+                o += 1;
+            }
+        }
+        have_top = true;
+        off += stride - 1;
+        m += 1;
+    }
+}
+
+fn read_pal_indices(d: *mut Dec, uv: bool, pal_sz: u32, w4: usize, h4: usize, bw4: usize, bh4: usize) void {
+    let stride = bw4 * 4;
+    let mut pli: usize = 0;
+    if uv {
+        pli = 1;
+    }
+    let idx = d.pal_idx_uv[..];
+    let mut dst = d.pal_idx_uv[..];
+    if not uv {
+        dst = d.pal_idx_y[..];
+    }
+    // (the indices are read into dst directly)
+    _ = idx;
+    dst[0] = @truncate(u8, d.msac.uniform(pal_sz));
+    let cm = c.COLOR_MAP + ((((pli * 7) + @as(usize, pal_sz - 2)) * 5) * c.COLOR_MAP_STRIDE);
+    for i in @as(usize, 1)..((4 * (w4 + h4)) - 1) {
+        let first = @min(i, (w4 * 4) - 1);
+        let mut last: usize = 0;
+        if (i + 1) > (h4 * 4) {
+            last = (i + 1) - (h4 * 4);
+        }
+        order_palette(d, dst, stride, i, first, last);
+        let mut m: usize = 0;
+        let mut j = first + 1;
+        while j > last {
+            j -= 1;
+            let ctx = @as(usize, d.pal_ctx[m]);
+            let ci = d.msac.symbol(mcdf(d, cm + (ctx * c.COLOR_MAP_STRIDE), 8), pal_sz - 1);
+            dst[((i - j) * stride) + j] = d.pal_order[(m * 8) + @as(usize, ci)];
+            m += 1;
+        }
+    }
+    // pad to the whole block
+    let w = w4 * 4;
+    let h = h4 * 4;
+    for y in @as(usize, 0)..h {
+        for x in w..stride {
+            dst[(y * stride) + x] = dst[((y * stride) + w) - 1];
+        }
+    }
+    for y in h..(bh4 * 4) {
+        for x in @as(usize, 0)..stride {
+            dst[(y * stride) + x] = dst[((h - 1) * stride) + x];
+        }
+    }
+}
+
+fn pal_pred(d: *mut Dec, p: usize, dst: usize, uv: bool, w: usize, h: usize) void {
+    let pl = &d.planes[p];
+    let idx = d.pal_idx_y[..];
+    let mut src = idx;
+    if uv {
+        src = d.pal_idx_uv[..];
+    }
+    for y in @as(usize, 0)..h {
+        for x in @as(usize, 0)..w {
+            pl.data[dst + (y * pl.stride) + x] = d.pal[(p * 8) + @as(usize, src[(y * w) + x])];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Coefficients
+// -----------------------------------------------------------------------------
+
+fn or_ctx(a: []u8, n: usize) u32 {
+    let mut v: u32 = 0;
+    for i in @as(usize, 0)..n {
+        v |= @as(u32, a[i]);
+    }
+    return v;
+}
+
+fn any_coded(a: []u8, n: usize) u32 {
+    for i in @as(usize, 0)..n {
+        if a[i] != 0x40 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// the context of a coefficient's level from its neighbours (which are below
+// and right of it in levels[])
+fn lo_ctx(lv: []u8, off: usize, two_d: bool, hi_mag: *mut u32, tbl: usize, x: u32, y: u32, stride: usize) u32 {
+    let mut mag = @as(u32, lv[off + 1]) + @as(u32, lv[off + stride]);
+    let mut o: u32 = 0;
+    if two_d {
+        mag += @as(u32, lv[off + stride + 1]);
+        hi_mag.* = mag;
+        mag += @as(u32, lv[off + 2]) + @as(u32, lv[off + (2 * stride)]);
+        o = LO_CTX_OFFSETS[(tbl * 25) + (@as(usize, @min(y, 4)) * 5) + @as(usize, @min(x, 4))];
+    } else {
+        mag += @as(u32, lv[off + 2]);
+        hi_mag.* = mag;
+        mag += @as(u32, lv[off + 3]) + @as(u32, lv[off + 4]);
+        o = 26 + (y * 5);
+        if y > 1 {
+            o = 36;
+        }
+    }
+    if mag > 512 {
+        return o + 4;
+    }
+    return o + ((mag + 64) >> 7);
+}
+
+// reads a transform block's coefficients into d.cf (column-major, dequantized)
+// and returns its end of block (-1 if it has none)
+fn decode_coefs(d: *mut Dec, a: []mut u8, l: []mut u8, tx: u32, b: *Blk, plane: usize, txtp_out: *mut u32,
+                res_ctx: *mut u8) i32 {
+    let h = &d.hdr;
+    let chroma = plane != 0;
+    let lossless = h.lossless[b.seg];
+    let tw = @as(usize, txd(tx, 0));
+    let th = @as(usize, txd(tx, 1));
+    let tlw = txd(tx, 2);
+    let tlh = txd(tx, 3);
+    let tmin = txd(tx, 4);
+    let tmax = txd(tx, 5);
+    let tctx = @as(usize, txd(tx, 7));
+    let mut ch: usize = 0;
+    if chroma {
+        ch = 1;
+    }
+    // does it have any coefficients
+    let mut sctx: usize = 0;
+    if chroma {
+        let mut bw = b.lw;
+        if (bw != 0) and (d.layout != obu.I444) {
+            bw -= 1;
+        }
+        let mut bh = b.lh;
+        if (bh != 0) and (d.layout == obu.I420) {
+            bh -= 1;
+        }
+        sctx = 7 + @as(usize, any_coded(a, tw) + any_coded(l, th));
+        if (bw > tlw) or (bh > tlh) {
+            sctx += 3;
+        }
+    } else if (b.lw != tlw) or (b.lh != tlh) {
+        let la = @min(or_ctx(a, tw) & 0x3f, 4);
+        let ll = @min(or_ctx(l, th) & 0x3f, 4);
+        sctx = @as(usize, SKIP_CTX[(@as(usize, la) * 5) + @as(usize, ll)]);
+    }
+    if d.msac.bool_adapt(ccdf(d, c.COEF_SKIP + (((tctx * 13) + sctx) * c.COEF_SKIP_STRIDE), 2)) {
+        res_ctx.* = 0x40;
+        txtp_out.* = itx.DCT_DCT;
+        if lossless {
+            txtp_out.* = itx.WHT_WHT;
+        }
+        return -1;
+    }
+    // transform type
+    let mut txtp = itx.DCT_DCT;
+    if lossless {
+        txtp = itx.WHT_WHT;
+    } else if tmax >= 3 {
+        txtp = itx.DCT_DCT;
+    } else if chroma {
+        txtp = TXTP_FROM_UVMODE[@as(usize, b.uv_mode)];
+    } else if h.seg_qidx[b.seg] == 0 {
+        txtp = itx.DCT_DCT;
+    } else {
+        let mut ym = b.y_mode;
+        if ym == pred.FILTER_PRED {
+            ym = FILTER_MODE_TO_Y_MODE[us(b.y_angle)];
+        }
+        if h.reduced_txtp_set or (tmin == 2) {
+            let o = c.TXTP_INTRA2 + (((@as(usize, tmin) * 13) + @as(usize, ym)) * c.TXTP_INTRA2_STRIDE);
+            txtp = TX_TYPES_PER_SET[@as(usize, d.msac.symbol(mcdf(d, o, 5), 4))];
+        } else {
+            let o = c.TXTP_INTRA1 + (((@as(usize, tmin) * 13) + @as(usize, ym)) * c.TXTP_INTRA1_STRIDE);
+            txtp = TX_TYPES_PER_SET[@as(usize, d.msac.symbol(mcdf(d, o, 7), 6)) + 5];
+        }
+    }
+    txtp_out.* = txtp;
+    // end of block
+    let tx2 = @min(tlw, 3) + @min(tlh, 3);
+    let tclass = TX_CLASS[@as(usize, txtp)];
+    let two_d = tclass == 0;
+    let mut is1d: usize = 1;
+    if two_d {
+        is1d = 0;
+    }
+    let n = 4 + tx2;
+    let mut eo: usize = 0;
+    if tx2 == 0 {
+        eo = c.COEF_EOB_BIN_16 + (((ch * 2) + is1d) * c.COEF_EOB_BIN_16_STRIDE);
+    } else if tx2 == 1 {
+        eo = c.COEF_EOB_BIN_32 + (((ch * 2) + is1d) * c.COEF_EOB_BIN_32_STRIDE);
+    } else if tx2 == 2 {
+        eo = c.COEF_EOB_BIN_64 + (((ch * 2) + is1d) * c.COEF_EOB_BIN_64_STRIDE);
+    } else if tx2 == 3 {
+        eo = c.COEF_EOB_BIN_128 + (((ch * 2) + is1d) * c.COEF_EOB_BIN_128_STRIDE);
+    } else if tx2 == 4 {
+        eo = c.COEF_EOB_BIN_256 + (((ch * 2) + is1d) * c.COEF_EOB_BIN_256_STRIDE);
+    } else if tx2 == 5 {
+        eo = c.COEF_EOB_BIN_512 + (ch * c.COEF_EOB_BIN_512_STRIDE);
+    } else {
+        eo = c.COEF_EOB_BIN_1024 + (ch * c.COEF_EOB_BIN_1024_STRIDE);
+    }
+    let eob_bin = d.msac.symbol(ccdf(d, eo, @as(usize, n) + 1), n);
+    let mut eob = eob_bin;
+    if eob_bin > 1 {
+        let ho = c.COEF_EOB_HI_BIT + (((((tctx * 2) + ch) * 11) + @as(usize, eob_bin)) * c.COEF_EOB_HI_BIT_STRIDE);
+        let mut hi: u32 = 0;
+        if d.msac.bool_adapt(ccdf(d, ho, 2)) {
+            hi = 1;
+        }
+        eob = ((hi | 2) << (eob_bin - 2)) | d.msac.bools(eob_bin - 2);
+    }
+    // tokens
+    let eob_cdf = c.COEF_EOB_BASE_TOK + (((tctx * 2) + ch) * 4 * c.COEF_EOB_BASE_TOK_STRIDE);
+    let hi_cdf = c.COEF_BR_TOK + (((@min(tctx, 3) * 2) + ch) * 21 * c.COEF_BR_TOK_STRIDE);
+    let lo_cdf = c.COEF_BASE_TOK + (((tctx * 2) + ch) * 41 * c.COEF_BASE_TOK_STRIDE);
+    let cf = d.cf[..];
+    let mut rc: u32 = 0;
+    let mut dc_tok: u32 = 0;
+    if eob != 0 {
+        let sw = @min(@truncate(u32, tw), 8);
+        let sh = @min(@truncate(u32, th), 8);
+        let mut ctx: u32 = 1;
+        if eob > ((sw * sh) * 2) {
+            ctx += 1;
+        }
+        if eob > ((sw * sh) * 4) {
+            ctx += 1;
+        }
+        let eob_tok = d.msac.symbol(ccdf(d, eob_cdf + (@as(usize, ctx) * 3), 3), 2);
+        let mut tok = eob_tok + 1;
+        let mut level_tok = tok * 0x41;
+        let mut mag: u32 = 0;
+        let mut stride: usize = 16;
+        let mut shift: u32 = 0;
+        let mut shift2: u32 = 0;
+        let mut mask: u32 = 0;
+        let mut swh_zero: u32 = 0;
+        let mut tbl: usize = 0;
+        let mut scan: usize = 0;
+        if two_d {
+            if tlw != tlh {
+                tbl = 1 + @as(usize, tx & 1);
+            }
+            scan = @as(usize, t.SCAN_OFF[@as(usize, tx)]);
+            stride = @as(usize, 4 * sh);
+            shift = 5;
+            if tlh < 4 {
+                shift = tlh + 2;
+            }
+            mask = (4 * sh) - 1;
+            swh_zero = sw;
+        } else if tclass == 1 {
+            shift = tlh + 2;
+            mask = (4 * sh) - 1;
+            swh_zero = sh;
+        } else {
+            shift = tlw + 2;
+            shift2 = tlh + 2;
+            mask = (4 * sw) - 1;
+            swh_zero = sw;
+        }
+        let lv = d.levels[..];
+        @mem_set(lv[..stride * ((4 * @as(usize, swh_zero)) + 2)], 0);
+        let mut x: u32 = 0;
+        let mut y: u32 = 0;
+        if two_d {
+            rc = @as(u32, t.SCANS[scan + @as(usize, eob)]);
+            x = rc >> shift;
+            y = rc & mask;
+        } else if tclass == 1 {
+            x = eob & mask;
+            y = eob >> shift;
+            rc = eob;
+        } else {
+            x = eob & mask;
+            y = eob >> shift;
+            rc = (x << shift2) | y;
+        }
+        if eob_tok == 2 {
+            let mut far = y != 0;
+            if two_d {
+                far = (x | y) > 1;
+            }
+            ctx = 7;
+            if far {
+                ctx = 14;
+            }
+            tok = d.msac.hi_tok(ccdf(d, hi_cdf + (@as(usize, ctx) * 4), 4));
+            level_tok = tok + (3 << 6);
+        }
+        cf[@as(usize, rc)] = @bit_cast(i32, tok << 11);
+        lv[(@as(usize, x) * stride) + @as(usize, y)] = @truncate(u8, level_tok);
+        let mut i = eob;
+        while i > 1 {
+            i -= 1;
+            let mut rc_i: u32 = 0;
+            if two_d {
+                rc_i = @as(u32, t.SCANS[scan + @as(usize, i)]);
+                x = rc_i >> shift;
+                y = rc_i & mask;
+            } else if tclass == 1 {
+                x = i & mask;
+                y = i >> shift;
+                rc_i = i;
+            } else {
+                x = i & mask;
+                y = i >> shift;
+                rc_i = (x << shift2) | y;
+            }
+            let off = (@as(usize, x) * stride) + @as(usize, y);
+            ctx = lo_ctx(lv, off, two_d, &mut mag, tbl, x, y, stride);
+            if two_d {
+                y |= x;
+            }
+            tok = d.msac.symbol(ccdf(d, lo_cdf + (@as(usize, ctx) * 4), 4), 3);
+            if tok == 3 {
+                let m = mag & 63;
+                ctx = 7;
+                let mut lim: u32 = 0;
+                if two_d {
+                    lim = 1;
+                }
+                if y > lim {
+                    ctx = 14;
+                }
+                if m > 12 {
+                    ctx += 6;
+                } else {
+                    ctx += (m + 1) >> 1;
+                }
+                tok = d.msac.hi_tok(ccdf(d, hi_cdf + (@as(usize, ctx) * 4), 4));
+                lv[off] = @truncate(u8, tok + (3 << 6));
+                cf[@as(usize, rc_i)] = @bit_cast(i32, (tok << 11) | rc);
+                rc = rc_i;
+            } else {
+                lv[off] = @truncate(u8, tok * 0x41);
+                if tok != 0 {
+                    cf[@as(usize, rc_i)] = @bit_cast(i32, (tok << 11) | rc);
+                    rc = rc_i;
+                } else {
+                    cf[@as(usize, rc_i)] = 0;
+                }
+            }
+        }
+        // dc
+        ctx = 0;
+        if not two_d {
+            ctx = lo_ctx(lv, 0, false, &mut mag, 0, 0, 0, stride);
+        }
+        dc_tok = d.msac.symbol(ccdf(d, lo_cdf + (@as(usize, ctx) * 4), 4), 3);
+        if dc_tok == 3 {
+            if two_d {
+                mag = (@as(u32, lv[1]) + @as(u32, lv[stride])) + @as(u32, lv[stride + 1]);
+            }
+            let m = mag & 63;
+            ctx = (m + 1) >> 1;
+            if m > 12 {
+                ctx = 6;
+            }
+            dc_tok = d.msac.hi_tok(ccdf(d, hi_cdf + (@as(usize, ctx) * 4), 4));
+        }
+    } else {
+        let tok_br = d.msac.symbol(ccdf(d, eob_cdf, 3), 2);
+        dc_tok = 1 + tok_br;
+        if tok_br == 2 {
+            dc_tok = d.msac.hi_tok(ccdf(d, hi_cdf, 4));
+        }
+        rc = 0;
+    }
+    // signs, residuals and dequantization
+    let dqo = (b.seg * 6) + (plane * 2);
+    let mut use_qm = false;
+    let mut qo: usize = 0;
+    if d.qm_on and (txtp < itx.IDTX) {
+        let q = d.qm_off[(plane * 19) + @as(usize, tx)];
+        if q != 0xffffffff {
+            use_qm = true;
+            qo = @as(usize, q);
+        }
+    }
+    let mut dq_shift: u32 = 0;
+    if tctx > 2 {
+        dq_shift = @truncate(u32, tctx - 2);
+    }
+    let cf_max = @bit_cast(i32, ~(~@as(u32, 127) << d.bitdepth));
+    let mut cul: u32 = 0;
+    let mut dc_sign_level: u32 = 1 << 6;
+    let mut do_ac = true;
+    if dc_tok != 0 {
+        let mut s: i32 = 0;
+        for k in @as(usize, 0)..tw {
+            s += @as(i32, a[k] >> 6);
+        }
+        for k in @as(usize, 0)..th {
+            s += @as(i32, l[k] >> 6);
+        }
+        s -= si(tw + th);
+        let mut sc: usize = 0;
+        if s != 0 {
+            sc += 1;
+        }
+        if s > 0 {
+            sc += 1;
+        }
+        let mut dc_sign: i32 = 0;
+        if d.msac.bool_adapt(ccdf(d, c.COEF_DC_SIGN + (((ch * 3) + sc) * c.COEF_DC_SIGN_STRIDE), 2)) {
+            dc_sign = 1;
+        }
+        dc_sign_level = @bit_cast(u32, (dc_sign - 1) & (2 << 6));
+        let mut dc_dq = d.dq[dqo];
+        if use_qm {
+            dc_dq = ((dc_dq * @as(u32, d.qm[qo])) + 16) >> 5;
+        }
+        if dc_tok == 15 {
+            dc_tok = d.msac.golomb() +% 15;
+            dc_tok &= 0xfffff;
+            dc_dq = (dc_dq *% dc_tok) & 0xffffff;
+        } else {
+            dc_dq = dc_dq * dc_tok;
+        }
+        cul = dc_tok;
+        let v = @min(@bit_cast(i32, dc_dq >> dq_shift), cf_max + dc_sign);
+        cf[0] = v;
+        if dc_sign != 0 {
+            cf[0] = -v;
+        }
+        do_ac = rc != 0;
+    }
+    if do_ac {
+        let ac_dq = d.dq[dqo + 1];
+        loop {
+            let mut sign: i32 = 0;
+            if d.msac.bool_equi() {
+                sign = 1;
+            }
+            let ri = @as(usize, rc);
+            let rc_tok = @bit_cast(u32, cf[ri]);
+            let mut dq = ac_dq;
+            if use_qm {
+                dq = ((dq *% @as(u32, d.qm[qo + ri])) +% 16) >> 5;
+            }
+            let mut tok: u32 = 0;
+            if rc_tok >= (15 << 11) {
+                tok = d.msac.golomb() +% 15;
+                tok &= 0xfffff;
+                dq = (dq *% tok) & 0xffffff;
+            } else {
+                tok = rc_tok >> 11;
+                dq = dq * tok;
+            }
+            cul +%= tok;
+            let v = @min(@bit_cast(i32, dq >> dq_shift), cf_max + sign);
+            cf[ri] = v;
+            if sign != 0 {
+                cf[ri] = -v;
+            }
+            rc = rc_tok & 0x3ff;
+            if rc == 0 {
+                break;
+            }
+        }
+    }
+    res_ctx.* = @truncate(u8, @min(cul, 63) | dc_sign_level);
+    return @bit_cast(i32, eob);
+}
+
+// -----------------------------------------------------------------------------
+// Reconstruction
+// -----------------------------------------------------------------------------
+
+fn is_smooth(m: u8) bool {
+    return (m == 9) or (m == 10) or (m == 11);
+}
+
+fn sm_flag(d: *Dec, ax: usize, ly: usize) i32 {
+    let mut f: i32 = 0;
+    if (d.a_intra[ax] != 0) and is_smooth(d.a_mode[ax]) {
+        f = 512;
+    }
+    if (d.l_intra[ly] != 0) and is_smooth(d.l_mode[ly]) {
+        f = 512;
+    }
+    return f;
+}
+
+fn sm_uv_flag(d: *Dec, ax: usize, ly: usize) i32 {
+    if is_smooth(d.a_uvmode[ax]) or is_smooth(d.l_uvmode[ly]) {
+        return 512;
+    }
+    return 0;
+}
+
+fn recon_intra(d: *mut Dec, b: *Blk, edge: u32) !void {
+    let ssh = @bit_cast(i32, d.ss_hor);
+    let ssv = @bit_cast(i32, d.ss_ver);
+    let ush = d.ss_hor;
+    let usv = d.ss_ver;
+    let bx = d.bx;
+    let by = d.by;
+    let by4 = by & 31;
+    let cby4 = by4 >> usv;
+    let tx = b.tx;
+    let tw = @bit_cast(i32, txd(tx, 0));
+    let th = @bit_cast(i32, txd(tx, 1));
+    let uvtw = @bit_cast(i32, txd(b.uvtx, 0));
+    let uvth = @bit_cast(i32, txd(b.uvtx, 1));
+    let ief = d.seq.intra_edge_filter;
+    let mut ief_flag: i32 = 0;
+    if ief {
+        ief_flag = 1 << 10;
+    }
+    let bd = d.bitdepth;
+    let w4 = b.w4;
+    let h4 = b.h4;
+    let cw4 = b.cw4;
+    let ch4 = b.ch4;
+    let ys = d.planes[0].stride;
+    let mut init_y: i32 = 0;
+    while init_y < h4 {
+        let sub_h4 = @min(h4, 16 + init_y);
+        let sub_ch4 = @min(ch4, (init_y + 16) >> usv);
+        let mut init_x: i32 = 0;
+        while init_x < w4 {
+            if b.pal_sz[0] != 0 {
+                pal_pred(d, 0, (us(by) * 4 * ys) + (us(bx) * 4), false, us(b.bw4) * 4, us(b.bh4) * 4);
+            }
+            let intra_flags = (sm_flag(d, us(bx), us(by4)) | ief_flag);
+            let mut sb_has_tr = (edge & TR_444) != 0;
+            if (init_x + 16) < w4 {
+                sb_has_tr = true;
+            } else if init_y != 0 {
+                sb_has_tr = false;
+            }
+            let mut sb_has_bl = (edge & BL_444) != 0;
+            if init_x != 0 {
+                sb_has_bl = false;
+            } else if (init_y + 16) < h4 {
+                sb_has_bl = true;
+            }
+            let sub_w4 = @min(w4, init_x + 16);
+            let mut y = init_y;
+            while y < sub_h4 {
+                let mut x = init_x;
+                while x < sub_w4 {
+                    let px = bx + x;
+                    let py = by + y;
+                    let dst = (us(py) * 4 * ys) + (us(px) * 4);
+                    if b.pal_sz[0] == 0 {
+                        let mut angle = b.y_angle;
+                        let mut ef: u32 = 0;
+                        if not (((y > init_y) or not sb_has_tr) and ((x + tw) >= sub_w4)) {
+                            ef |= pred.TOP_HAS_RIGHT;
+                        }
+                        if not ((x > init_x) or ((not sb_has_bl) and ((y + th) >= sub_h4))) {
+                            ef |= pred.LEFT_HAS_BOTTOM;
+                        }
+                        let m = pred.prepare_edges(&d.planes[0], px, px > d.col_start, py, py > d.row_start, d.col_end,
+                                                   d.row_end, ef, b.y_mode, &mut angle, tw, th, ief, d.edge[..], bd);
+                        pred.predict(&d.planes[0], dst, d.edge[..], m, @bit_cast(u32, tw * 4), @bit_cast(u32, th * 4),
+                                     angle | intra_flags, (4 * d.bw) - (4 * px), (4 * d.bh) - (4 * py), bd);
+                    }
+                    let ao = us(px);
+                    let lo = us(by4 + y);
+                    if not b.skip {
+                        let mut txtp: u32 = 0;
+                        let mut cf_ctx: u8 = 0;
+                        let eob = decode_coefs(d, d.a_lcoef[ao..ao + us(tw)], d.l_lcoef[lo..lo + us(th)], tx, b, 0,
+                                               &mut txtp, &mut cf_ctx);
+                        set_run(d.l_lcoef[..], lo, us(@min(th, d.bh - py)), cf_ctx);
+                        set_run(d.a_lcoef, ao, us(@min(tw, d.bw - px)), cf_ctx);
+                        if eob >= 0 {
+                            itx.add(d.planes[0].data, dst, ys, d.cf[..], eob, us(tw) * 4, us(th) * 4, txtp, bd,
+                                    d.tmp[..]);
+                        }
+                    } else {
+                        set_run(d.l_lcoef[..], lo, us(th), 0x40);
+                        set_run(d.a_lcoef, ao, us(tw), 0x40);
+                    }
+                    x += tw;
+                }
+                y += th;
+            }
+            if not b.has_chroma {
+                init_x += 16;
+                continue;
+            }
+            let us_ = d.planes[1].stride;
+            if b.uv_mode == pred.CFL_PRED {
+                let ysrc = (us(by & ~ssv) * 4 * ys) + (us(bx & ~ssh) * 4);
+                let furthest_r = ((cw4 << ush) + tw - 1) & ~(tw - 1);
+                let furthest_b = ((ch4 << usv) + th - 1) & ~(th - 1);
+                pred.cfl_ac(
+                    d.ac[..], &d.planes[0], ysrc, @bit_cast(u32, b.cbw4 - (furthest_r >> ush)), @bit_cast(
+                        u32, b.cbh4 - (furthest_b >> usv)), us(b.cbw4) * 4, us(b.cbh4) * 4, ssh != 0, ssv != 0);
+                for pl in @as(usize, 0)..2 {
+                    if b.cfl_alpha[pl] == 0 {
+                        continue;
+                    }
+                    let mut angle: i32 = 0;
+                    let xpos = bx >> ush;
+                    let ypos = by >> usv;
+                    let m = pred.prepare_edges(&d.planes[1 + pl], xpos, xpos > (d.col_start >> ush), ypos,
+                                               ypos > (d.row_start >> usv), d.col_end >> ush, d.row_end >> usv, 0,
+                                               pred.DC_PRED, &mut angle, uvtw, uvth, false, d.edge[..], bd);
+                    pred.cfl_pred(&d.planes[1 + pl], (us(ypos) * 4 * us_) + (us(xpos) * 4), d.edge[..], m,
+                                  @bit_cast(u32, uvtw * 4), @bit_cast(u32, uvth * 4), d.ac[..], b.cfl_alpha[pl], bd);
+                }
+            } else if b.pal_sz[1] != 0 {
+                let o = (us(by >> usv) * 4 * us_) + (us(bx >> ush) * 4);
+                pal_pred(d, 1, o, true, us(b.cbw4) * 4, us(b.cbh4) * 4);
+                pal_pred(d, 2, o, true, us(b.cbw4) * 4, us(b.cbh4) * 4);
+            }
+            let sm_uv = sm_uv_flag(d, us(bx >> ush), us(cby4));
+            let lsh = d.layout - 1;
+            let mut uv_tr = (edge & (TR_420 >> lsh)) != 0;
+            if ((init_x + 16) >> ush) < cw4 {
+                uv_tr = true;
+            } else if init_y != 0 {
+                uv_tr = false;
+            }
+            let mut uv_bl = (edge & (BL_420 >> lsh)) != 0;
+            if init_x != 0 {
+                uv_bl = false;
+            } else if ((init_y + 16) >> usv) < ch4 {
+                uv_bl = true;
+            }
+            let sub_cw4 = @min(cw4, (init_x + 16) >> ush);
+            for pl in @as(usize, 0)..2 {
+                let p = &d.planes[1 + pl];
+                let mut cy = init_y >> usv;
+                while cy < sub_ch4 {
+                    let mut cx = init_x >> ush;
+                    while cx < sub_cw4 {
+                        let tbx = bx + init_x + ((cx - (init_x >> ush)) << ush);
+                        let tby = by + init_y + ((cy - (init_y >> usv)) << usv);
+                        let xpos = (bx >> ush) + cx;
+                        let ypos = (by >> usv) + cy;
+                        let dst = (us(ypos) * 4 * p.stride) + (us(xpos) * 4);
+                        if not (((b.uv_mode == pred.CFL_PRED) and (b.cfl_alpha[pl] != 0)) or (b.pal_sz[1] != 0)) {
+                            let mut angle = b.uv_angle;
+                            let mut ef: u32 = 0;
+                            if not (((cy > (init_y >> usv)) or not uv_tr) and ((cx + uvtw) >= sub_cw4)) {
+                                ef |= pred.TOP_HAS_RIGHT;
+                            }
+                            if not ((cx > (init_x >> ush)) or ((not uv_bl) and ((cy + uvth) >= sub_ch4))) {
+                                ef |= pred.LEFT_HAS_BOTTOM;
+                            }
+                            let mut uvm = b.uv_mode;
+                            if uvm == pred.CFL_PRED {
+                                uvm = pred.DC_PRED;
+                            }
+                            let m = pred.prepare_edges(p, xpos, xpos > (d.col_start >> ush), ypos,
+                                                       ypos > (d.row_start >> usv), d.col_end >> ush, d.row_end >> usv,
+                                                       ef, uvm, &mut angle, uvtw, uvth, ief, d.edge[..], bd);
+                            angle |= ief_flag;
+                            pred.predict(p, dst, d.edge[..], m, @bit_cast(u32, uvtw * 4), @bit_cast(u32, uvth * 4),
+                                         angle | sm_uv, (((4 * d.bw) + ssh) - (4 * (tbx & ~ssh))) >> ush,
+                                         (((4 * d.bh) + ssv) - (4 * (tby & ~ssv))) >> usv, bd);
+                        }
+                        let ao = (pl * d.a_w) + us(bx >> ush) + us(cx);
+                        let lo = (pl * 32) + us(cby4 + cy);
+                        if not b.skip {
+                            let mut txtp: u32 = 0;
+                            let mut cf_ctx: u8 = 0;
+                            let eob = decode_coefs(d, d.a_ccoef[ao..ao + us(uvtw)], d.l_ccoef[lo..lo + us(uvth)],
+                                                   b.uvtx, b, 1 + pl, &mut txtp, &mut cf_ctx);
+                            set_run(d.l_ccoef[..], lo, us(@min(uvth, ((d.bh - tby) + ssv) >> usv)), cf_ctx);
+                            set_run(d.a_ccoef, ao, us(@min(uvtw, ((d.bw - tbx) + ssh) >> ush)), cf_ctx);
+                            if eob >= 0 {
+                                itx.add(p.data, dst, p.stride, d.cf[..], eob, us(uvtw) * 4, us(uvth) * 4, txtp, bd,
+                                        d.tmp[..]);
+                            }
+                        } else {
+                            set_run(d.l_ccoef[..], lo, us(uvth), 0x40);
+                            set_run(d.a_ccoef, ao, us(uvtw), 0x40);
+                        }
+                        cx += uvtw;
+                    }
+                    cy += uvth;
+                }
+            }
+            init_x += 16;
+        }
+        init_y += 16;
+    }
+}
+
+// the loop filter levels and transform edges of a block
+fn store_filter_info(d: *mut Dec, b: *Blk) void {
+    let h = &d.hdr;
+    if (h.lf_level_y[0] == 0) and (h.lf_level_y[1] == 0) {
+        return;
+    }
+    let st = d.b4_stride;
+    let lo = b.seg * 4;
+    let bw4 = @min(d.w4 - d.bx, b.bw4);
+    let bh4 = @min(d.h4 - d.by, b.bh4);
+    if (bw4 > 0) and (bh4 > 0) {
+        let tw = @bit_cast(i32, txd(b.tx, 0));
+        let th = @bit_cast(i32, txd(b.tx, 1));
+        let cls = @truncate(u8, @min(txd(b.tx, 2), 2) | (@min(txd(b.tx, 3), 2) << 2));
+        for y in @as(i32, 0)..bh4 {
+            for x in @as(i32, 0)..bw4 {
+                let i = (us(d.by + y) * st) + us(d.bx + x);
+                d.lvl[i * 4] = @truncate(u8, d.lflvl[lo]);
+                d.lvl[(i * 4) + 1] = @truncate(u8, d.lflvl[lo + 1]);
+                let mut v = cls;
+                if (x % tw) == 0 {
+                    v |= 16;
+                }
+                if (y % th) == 0 {
+                    v |= 32;
+                }
+                d.txy[i] = v;
+            }
+        }
+    }
+    if not b.has_chroma {
+        return;
+    }
+    let ush = d.ss_hor;
+    let usv = d.ss_ver;
+    let ssh = @bit_cast(i32, ush);
+    let ssv = @bit_cast(i32, usv);
+    let cbw4 = @min(((d.w4 + ssh) >> ush) - (d.bx >> ush), (b.bw4 + ssh) >> ush);
+    let cbh4 = @min(((d.h4 + ssv) >> usv) - (d.by >> usv), (b.bh4 + ssv) >> usv);
+    if (cbw4 <= 0) or (cbh4 <= 0) {
+        return;
+    }
+    let tw = @bit_cast(i32, txd(b.uvtx, 0));
+    let th = @bit_cast(i32, txd(b.uvtx, 1));
+    let mut cls: u8 = 0;
+    if txd(b.uvtx, 2) != 0 {
+        cls |= 1;
+    }
+    if txd(b.uvtx, 3) != 0 {
+        cls |= 4;
+    }
+    let cbx = d.bx >> ush;
+    let cby = d.by >> usv;
+    for y in @as(i32, 0)..cbh4 {
+        for x in @as(i32, 0)..cbw4 {
+            let i = (us(cby + y) * st) + us(cbx + x);
+            d.lvl[(i * 4) + 2] = @truncate(u8, d.lflvl[lo + 2]);
+            d.lvl[(i * 4) + 3] = @truncate(u8, d.lflvl[lo + 3]);
+            let mut v = cls;
+            if (x % tw) == 0 {
+                v |= 16;
+            }
+            if (y % th) == 0 {
+                v |= 32;
+            }
+            d.txuv[i] = v;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Frames
+// -----------------------------------------------------------------------------
+
+fn free_u8(s: []mut u8) void {
+    if s.len > 0 {
+        mem.free(s);
+    }
+}
+
+fn deinit_dec(d: *mut Dec) void {
+    if d.mode_cdf.len > 0 {
+        mem.free(d.mode_cdf);
+    }
+    if d.coef_cdf.len > 0 {
+        mem.free(d.coef_cdf);
+    }
+    if d.qm.len > 0 {
+        mem.free(d.qm);
+    }
+    free_u8(d.a_mode);
+    free_u8(d.a_lcoef);
+    free_u8(d.a_ccoef);
+    free_u8(d.a_seg_pred);
+    free_u8(d.a_skip);
+    free_u8(d.a_intra);
+    if d.a_tx_intra.len > 0 {
+        mem.free(d.a_tx_intra);
+    }
+    free_u8(d.a_partition);
+    free_u8(d.a_uvmode);
+    free_u8(d.a_pal_sz);
+    free_u8(d.a_pal_sz_uv);
+    if d.a_pal.len > 0 {
+        mem.free(d.a_pal);
+    }
+    free_u8(d.seg_map);
+    free_u8(d.noskip);
+    if d.cdef_idx.len > 0 {
+        mem.free(d.cdef_idx);
+    }
+    for p in @as(usize, 0)..3 {
+        if d.lr[p].len > 0 {
+            mem.free(d.lr[p]);
+        }
+        if d.planes[p].data.len > 0 {
+            mem.free(d.planes[p].data);
+        }
+    }
+    free_u8(d.lvl);
+    free_u8(d.txy);
+    free_u8(d.txuv);
+}
+
+fn setup(d: *mut Dec) !void {
+    let h = &d.hdr;
+    let s = &d.seq;
+    d.bitdepth = s.bitdepth;
+    d.maxv = @bit_cast(i32, (@as(u32, 1) << s.bitdepth) - 1);
+    d.layout = s.layout;
+    d.ss_hor = s.ss_hor;
+    d.ss_ver = s.ss_ver;
+    let width = @bit_cast(i32, h.width);
+    let height = @bit_cast(i32, h.height);
+    d.w4 = (width + 3) >> 2;
+    d.h4 = (height + 3) >> 2;
+    d.bw = ((width + 7) >> 3) << 1;
+    d.bh = ((height + 7) >> 3) << 1;
+    d.sb_shift = 4;
+    if s.sb128 {
+        d.sb_shift = 5;
+    }
+    d.sb_step = @as(i32, 1) << d.sb_shift;
+    // everything is allocated in whole 128x128 areas (and a little more)
+    let aw4 = us(((d.bw + 31) >> 5) << 5);
+    let ah4 = us(((d.bh + 31) >> 5) << 5);
+    let mut np: usize = 3;
+    if d.layout == obu.I400 {
+        np = 1;
+    }
+    for p in @as(usize, 0)..np {
+        let mut pw = aw4 * 4;
+        let mut ph = (ah4 * 4) + 8;
+        if p > 0 {
+            pw = pw >> d.ss_hor;
+            ph = ph >> d.ss_ver;
+        }
+        d.planes[p].stride = pw;
+        d.planes[p].data = mem.alloc_zeroed.[u16](pw * ph)!;
+    }
+    d.a_w = aw4 + 32;
+    d.a_mode = alloc_zeroed_u8(d.a_w)!;
+    d.a_lcoef = alloc_zeroed_u8(d.a_w)!;
+    d.a_ccoef = alloc_zeroed_u8(d.a_w * 2)!;
+    d.a_seg_pred = alloc_zeroed_u8(d.a_w)!;
+    d.a_skip = alloc_zeroed_u8(d.a_w)!;
+    d.a_intra = alloc_zeroed_u8(d.a_w)!;
+    d.a_tx_intra = mem.alloc_zeroed.[i32](d.a_w)!;
+    d.a_partition = alloc_zeroed_u8(d.a_w)!;
+    d.a_uvmode = alloc_zeroed_u8(d.a_w)!;
+    d.a_pal_sz = alloc_zeroed_u8(d.a_w)!;
+    d.a_pal_sz_uv = alloc_zeroed_u8(d.a_w)!;
+    d.a_pal = mem.alloc_zeroed.[u16](d.a_w * 24)!;
+    d.b4_stride = aw4;
+    d.seg_map = alloc_zeroed_u8(aw4 * ah4)!;
+    d.noskip = alloc_zeroed_u8(aw4 * ah4)!;
+    d.lvl = alloc_zeroed_u8(aw4 * ah4 * 4)!;
+    d.txy = alloc_zeroed_u8(aw4 * ah4)!;
+    d.txuv = alloc_zeroed_u8(aw4 * ah4)!;
+    d.cdef_w = aw4 >> 4;
+    d.cdef_idx = mem.alloc_zeroed.[i32](d.cdef_w * (ah4 >> 4))!;
+    for p in @as(usize, 0)..np {
+        if h.lr_type[p] == obu.RT_NONE {
+            continue;
+        }
+        let mut ssh: u32 = 0;
+        let mut ssv: u32 = 0;
+        let mut k: usize = 0;
+        if p > 0 {
+            ssh = d.ss_hor;
+            ssv = d.ss_ver;
+            k = 1;
+        }
+        let log2 = h.lr_unit_size[k];
+        let half = (@as(u32, 1) << log2) >> 1;
+        let pw = (h.width + ssh) >> ssh;
+        let ph = (h.height + ssv) >> ssv;
+        d.lr_w[p] = @as(usize, @max((pw + half) >> log2, 1));
+        d.lr_h[p] = @as(usize, @max((ph + half) >> log2, 1));
+        d.lr[p] = mem.alloc_zeroed.[LrUnit](d.lr_w[p] * d.lr_h[p])!;
+    }
+    d.mode_cdf = mem.alloc.[u16](c.MODE_SIZE)!;
+    d.coef_cdf = mem.alloc.[u16](c.COEF_SIZE)!;
+    init_qm(d)!;
+}
+
+fn read_le(data: []u8, pos: usize, n: usize) usize {
+    let mut v: usize = 0;
+    for i in @as(usize, 0)..n {
+        v |= @as(usize, data[pos + i]) << @as(usize, i * 8);
+    }
+    return v;
+}
+
+// the tiles of a tile group
+fn tile_group(d: *mut Dec, data: []u8, next: *mut usize) !void {
+    let h = &d.hdr;
+    let n = @as(usize, h.tile_cols * h.tile_rows);
+    let mut first: usize = 0;
+    let mut last = n - 1;
+    let mut b = obu.Bits.init(data);
+    if n > 1 {
+        if b.flag() {
+            let nb = h.log2_cols + h.log2_rows;
+            first = @as(usize, b.bits(nb));
+            last = @as(usize, b.bits(nb));
+        }
+    }
+    b.byte_align();
+    if b.err or (first != next.*) or (last < first) or (last >= n) {
+        return error.InvalidImage;
+    }
+    let mut pos = b.byte_pos();
+    let tn = @as(usize, h.tile_n_bytes);
+    for ti in first..(last + 1) {
+        let mut size: usize = 0;
+        if ti == last {
+            if pos > data.len {
+                return error.InvalidImage;
+            }
+            size = data.len - pos;
+        } else {
+            if (pos + tn) > data.len {
+                return error.InvalidImage;
+            }
+            size = read_le(data, pos, tn) + 1;
+            pos += tn;
+            if size > (data.len - pos) {
+                return error.InvalidImage;
+            }
+        }
+        let col = ti % @as(usize, h.tile_cols);
+        let row = ti / @as(usize, h.tile_cols);
+        if col == 0 {
+            reset_above(d);
+        }
+        decode_tile(d, data[pos..pos + size], row, col)!;
+        pos += size;
+    }
+    next.* = last + 1;
+}
+
+/// Decodes the (first) frame of a stream of OBUs, which must be a key or
+/// intra-only frame.
+pub fn decode(data: []u8) !Frame {
+    let dp = mem.alloc_zeroed.[Dec](1)!;
+    defer mem.free(dp);
+    let d = &mut dp[0];
+    defer deinit_dec(d);
+    let mut have_seq = false;
+    let mut have_frame = false;
+    let mut next_tile: usize = 0;
+    let mut pos: usize = 0;
+    while pos < data.len {
+        let hb = data[pos];
+        if (hb & 0x80) != 0 {
+            return error.InvalidImage;
+        }
+        let typ = @as(u32, (hb >> 3) & 15);
+        pos += 1;
+        if (hb & 4) != 0 {
+            pos += 1;
+        }
+        let mut size = data.len - @min(pos, data.len);
+        if (hb & 2) != 0 {
+            size = 0;
+            let mut sh: usize = 0;
+            loop {
+                if (pos >= data.len) or (sh > 56) {
+                    return error.InvalidImage;
+                }
+                let v = data[pos];
+                pos += 1;
+                size |= @as(usize, v & 0x7f) << sh;
+                sh += 7;
+                if (v & 0x80) == 0 {
+                    break;
+                }
+            }
+        }
+        if (pos > data.len) or (size > (data.len - pos)) {
+            return error.InvalidImage;
+        }
+        let payload = data[pos..pos + size];
+        pos += size;
+        if typ == obu.OBU_SEQ_HDR {
+            let mut b = obu.Bits.init(payload);
+            d.seq = obu.parse_seq_hdr(&mut b)!;
+            have_seq = true;
+        } else if (typ == obu.OBU_FRAME_HDR) or (typ == obu.OBU_FRAME) {
+            if have_frame {
+                if typ == obu.OBU_FRAME {
+                    break;  // a second frame
+                }
+                continue;  // a redundant copy
+            }
+            if not have_seq {
+                return error.InvalidImage;
+            }
+            let mut b = obu.Bits.init(payload);
+            d.hdr = obu.parse_frame_hdr(&d.seq, &mut b)!;
+            have_frame = true;
+            setup(d)!;
+            if typ == obu.OBU_FRAME {
+                b.byte_align();
+                if b.err {
+                    return error.InvalidImage;
+                }
+                tile_group(d, payload[b.byte_pos()..], &mut next_tile)!;
+            }
+        } else if typ == obu.OBU_TILE_GRP {
+            if not have_frame {
+                return error.InvalidImage;
+            }
+            tile_group(d, payload, &mut next_tile)!;
+        }
+        if have_frame and (next_tile == @as(usize, d.hdr.tile_cols * d.hdr.tile_rows)) {
+            break;
+        }
+    }
+    if (not have_frame) or (next_tile != @as(usize, d.hdr.tile_cols * d.hdr.tile_rows)) {
+        return error.InvalidImage;
+    }
+    filters(d)!;
+    let mut f = obu.zeroed.[Frame]()!;
+    f.width = @as(usize, d.hdr.width);
+    f.height = @as(usize, d.hdr.height);
+    f.bitdepth = d.bitdepth;
+    f.layout = d.layout;
+    f.full_range = d.seq.full_range;
+    f.matrix = d.seq.matrix;
+    f.primaries = d.seq.primaries;
+    f.transfer = d.seq.transfer;
+    for p in @as(usize, 0)..3 {
+        f.planes[p] = d.planes[p];
+        d.planes[p].data = d.planes[p].data[..0];
+        f.pw[p] = f.width;
+        f.ph[p] = f.height;
+        if p > 0 {
+            f.pw[p] = (f.width + @as(usize, d.ss_hor)) >> @as(usize, d.ss_hor);
+            f.ph[p] = (f.height + @as(usize, d.ss_ver)) >> @as(usize, d.ss_ver);
+        }
+        if (p > 0) and (d.layout == obu.I400) {
+            f.pw[p] = 0;
+            f.ph[p] = 0;
+        }
+    }
+    return f;
+}
+
+// -----------------------------------------------------------------------------
+// Post-filters (applied to the whole frame in the order of the
+// specification: deblocking, CDEF, loop restoration)
+// -----------------------------------------------------------------------------
+
+fn iabs(v: i32) i32 {
+    if v < 0 {
+        return -v;
+    }
+    return v;
+}
+
+fn at(pix: []u16, base: usize, step: usize, k: i32) i32 {
+    if k < 0 {
+        return @as(i32, pix[base - (us(-k) * step)]);
+    }
+    return @as(i32, pix[base + (us(k) * step)]);
+}
+
+fn put(pix: []mut u16, base: usize, step: usize, k: i32, v: i32) void {
+    if k < 0 {
+        pix[base - (us(-k) * step)] = @truncate(u16, @bit_cast(u32, v));
+    } else {
+        pix[base + (us(k) * step)] = @truncate(u16, @bit_cast(u32, v));
+    }
+}
+
+fn put_clip(pix: []mut u16, base: usize, step: usize, k: i32, v: i32, maxv: i32) void {
+    put(pix, base, step, k, iclip(v, 0, maxv));
+}
+
+// filters 4 lines across an edge: stridea steps along the edge, strideb
+// across it
+fn loop_filter(pix: []mut u16, pos: usize, e0: u32, i0: u32, h0: u32, stridea: usize, strideb: usize, wd: u32,
+               bd: u32) void {
+    let sh = bd - 8;
+    let f = @as(i32, 1) << sh;
+    let e = @bit_cast(i32, e0 << sh);
+    let i = @bit_cast(i32, i0 << sh);
+    let h = @bit_cast(i32, h0 << sh);
+    let maxv = @bit_cast(i32, (@as(u32, 1) << bd) - 1);
+    let lo = -128 * (@as(i32, 1) << sh);
+    let hi = (128 * (@as(i32, 1) << sh)) - 1;
+    for idx in @as(usize, 0)..4 {
+        let b = pos + (idx * stridea);
+        let s = strideb;
+        let p1 = at(pix, b, s, -2);
+        let p0 = at(pix, b, s, -1);
+        let q0 = at(pix, b, s, 0);
+        let q1 = at(pix, b, s, 1);
+        let mut p2: i32 = 0;
+        let mut p3: i32 = 0;
+        let mut q2: i32 = 0;
+        let mut q3: i32 = 0;
+        let mut fm = (iabs(p1 - p0) <= i) and (iabs(q1 - q0) <= i) and
+                     (((iabs(p0 - q0) * 2) + (iabs(p1 - q1) >> 1)) <= e);
+        if wd > 4 {
+            p2 = at(pix, b, s, -3);
+            q2 = at(pix, b, s, 2);
+            fm = fm and (iabs(p2 - p1) <= i) and (iabs(q2 - q1) <= i);
+            if wd > 6 {
+                p3 = at(pix, b, s, -4);
+                q3 = at(pix, b, s, 3);
+                fm = fm and (iabs(p3 - p2) <= i) and (iabs(q3 - q2) <= i);
+            }
+        }
+        if not fm {
+            continue;
+        }
+        let mut flat8out = false;
+        let mut flat8in = false;
+        let mut p6: i32 = 0;
+        let mut p5: i32 = 0;
+        let mut p4: i32 = 0;
+        let mut q4: i32 = 0;
+        let mut q5: i32 = 0;
+        let mut q6: i32 = 0;
+        if wd >= 16 {
+            p6 = at(pix, b, s, -7);
+            p5 = at(pix, b, s, -6);
+            p4 = at(pix, b, s, -5);
+            q4 = at(pix, b, s, 4);
+            q5 = at(pix, b, s, 5);
+            q6 = at(pix, b, s, 6);
+            flat8out = (iabs(p6 - p0) <= f) and (iabs(p5 - p0) <= f) and (iabs(p4 - p0) <= f) and
+                       (iabs(q4 - q0) <= f) and (iabs(q5 - q0) <= f) and (iabs(q6 - q0) <= f);
+        }
+        if wd >= 6 {
+            flat8in = (iabs(p2 - p0) <= f) and (iabs(p1 - p0) <= f) and (iabs(q1 - q0) <= f) and (iabs(q2 - q0) <= f);
+        }
+        if wd >= 8 {
+            flat8in = flat8in and (iabs(p3 - p0) <= f) and (iabs(q3 - q0) <= f);
+        }
+        if (wd >= 16) and flat8out and flat8in {
+            put(pix, b, s, -6, ((((p6 * 7) + (p5 * 2) + (p4 * 2) + p3 + p2 + p1 + p0 + q0) + 8) >> 4));
+            put(pix, b, s, -5, ((((p6 * 5) + (p5 * 2) + (p4 * 2) + (p3 * 2) + p2 + p1 + p0 + q0 + q1) + 8) >> 4));
+            put(pix, b, s, -4, ((((p6 * 4) + p5 + (p4 * 2) + (p3 * 2) + (p2 * 2) + p1 + p0 + q0 + q1 + q2) + 8) >> 4));
+            put(pix, b, s, -3,
+                ((((p6 * 3) + p5 + p4 + (p3 * 2) + (p2 * 2) + (p1 * 2) + p0 + q0 + q1 + q2 + q3) + 8) >> 4));
+            put(pix, b, s, -2,
+                ((((p6 * 2) + p5 + p4 + p3 + (p2 * 2) + (p1 * 2) + (p0 * 2) + q0 + q1 + q2 + q3 + q4) + 8) >> 4));
+            put(pix, b, s, -1,
+                (((p6 + p5 + p4 + p3 + p2 + (p1 * 2) + (p0 * 2) + (q0 * 2) + q1 + q2 + q3 + q4 + q5) + 8) >> 4));
+            put(pix, b, s, 0,
+                (((p5 + p4 + p3 + p2 + p1 + (p0 * 2) + (q0 * 2) + (q1 * 2) + q2 + q3 + q4 + q5 + q6) + 8) >> 4));
+            put(pix, b, s, 1,
+                (((p4 + p3 + p2 + p1 + p0 + (q0 * 2) + (q1 * 2) + (q2 * 2) + q3 + q4 + q5 + (q6 * 2)) + 8) >> 4));
+            put(pix, b, s, 2,
+                (((p3 + p2 + p1 + p0 + q0 + (q1 * 2) + (q2 * 2) + (q3 * 2) + q4 + q5 + (q6 * 3)) + 8) >> 4));
+            put(pix, b, s, 3, (((p2 + p1 + p0 + q0 + q1 + (q2 * 2) + (q3 * 2) + (q4 * 2) + q5 + (q6 * 4)) + 8) >> 4));
+            put(pix, b, s, 4, (((p1 + p0 + q0 + q1 + q2 + (q3 * 2) + (q4 * 2) + (q5 * 2) + (q6 * 5)) + 8) >> 4));
+            put(pix, b, s, 5, (((p0 + q0 + q1 + q2 + q3 + (q4 * 2) + (q5 * 2) + (q6 * 7)) + 8) >> 4));
+        } else if (wd >= 8) and flat8in {
+            put(pix, b, s, -3, (((p3 * 3) + (2 * p2) + p1 + p0 + q0) + 4) >> 3);
+            put(pix, b, s, -2, (((p3 * 2) + p2 + (2 * p1) + p0 + q0 + q1) + 4) >> 3);
+            put(pix, b, s, -1, ((p3 + p2 + p1 + (2 * p0) + q0 + q1 + q2) + 4) >> 3);
+            put(pix, b, s, 0, ((p2 + p1 + p0 + (2 * q0) + q1 + q2 + q3) + 4) >> 3);
+            put(pix, b, s, 1, ((p1 + p0 + q0 + (2 * q1) + q2 + (q3 * 2)) + 4) >> 3);
+            put(pix, b, s, 2, ((p0 + q0 + q1 + (2 * q2) + (q3 * 3)) + 4) >> 3);
+        } else if (wd == 6) and flat8in {
+            put(pix, b, s, -2, ((p2 + (2 * p2) + (2 * p1) + (2 * p0) + q0) + 4) >> 3);
+            put(pix, b, s, -1, ((p2 + (2 * p1) + (2 * p0) + (2 * q0) + q1) + 4) >> 3);
+            put(pix, b, s, 0, ((p1 + (2 * p0) + (2 * q0) + (2 * q1) + q2) + 4) >> 3);
+            put(pix, b, s, 1, ((p0 + (2 * q0) + (2 * q1) + (2 * q2) + q2) + 4) >> 3);
+        } else {
+            let hev = (iabs(p1 - p0) > h) or (iabs(q1 - q0) > h);
+            let lim = (@as(i32, 128) << sh) - 1;
+            if hev {
+                let mut fv = iclip(p1 - q1, lo, hi);
+                fv = iclip((3 * (q0 - p0)) + fv, lo, hi);
+                let f1 = @min(fv + 4, lim) >> 3;
+                let f2 = @min(fv + 3, lim) >> 3;
+                put_clip(pix, b, s, -1, p0 + f2, maxv);
+                put_clip(pix, b, s, 0, q0 - f1, maxv);
+            } else {
+                let fv = iclip(3 * (q0 - p0), lo, hi);
+                let f1 = @min(fv + 4, lim) >> 3;
+                let f2 = @min(fv + 3, lim) >> 3;
+                put_clip(pix, b, s, -1, p0 + f2, maxv);
+                put_clip(pix, b, s, 0, q0 - f1, maxv);
+                let f3 = (f1 + 1) >> 1;
+                put_clip(pix, b, s, -2, p1 + f3, maxv);
+                put_clip(pix, b, s, 1, q1 - f3, maxv);
+            }
+        }
+    }
+}
+
+fn deblock_plane(d: *mut Dec, p: usize, tx: []u8, k: usize, w4: i32, h4: i32, lut_e: []u8, lut_i: []u8,
+                 chroma: bool) void {
+    let st = d.b4_stride;
+    let pl = &d.planes[p];
+    let stride = pl.stride;
+    let bd = d.bitdepth;
+    // vertical edges
+    for y in @as(usize, 0)..us(h4) {
+        for x in @as(usize, 1)..us(w4) {
+            let i = (y * st) + x;
+            let v = tx[i];
+            if (v & 16) == 0 {
+                continue;
+            }
+            let cls = @min(v & 3, tx[i - 1] & 3);
+            let mut l = d.lvl[(i * 4) + k];
+            if l == 0 {
+                l = d.lvl[((i - 1) * 4) + k];
+            }
+            if l == 0 {
+                continue;
+            }
+            let mut wd = @as(u32, 4) << @as(u32, cls);
+            if chroma {
+                wd = 4 + (2 * @as(u32, cls));
+            }
+            loop_filter(
+                pl.data, (y * 4 * stride) + (x * 4), @as(u32, lut_e[@as(usize, l)]), @as(u32, lut_i[@as(usize, l)]),
+                @as(u32, l >> 4), stride, 1, wd, bd);
+        }
+    }
+    // horizontal edges
+    for y in @as(usize, 1)..us(h4) {
+        for x in @as(usize, 0)..us(w4) {
+            let i = (y * st) + x;
+            let v = tx[i];
+            if (v & 32) == 0 {
+                continue;
+            }
+            let cls = @min((v >> 2) & 3, (tx[i - st] >> 2) & 3);
+            let mut l = d.lvl[(i * 4) + k + 1];
+            if chroma {
+                l = d.lvl[(i * 4) + k];
+            }
+            if l == 0 {
+                l = d.lvl[((i - st) * 4) + k];
+                if not chroma {
+                    l = d.lvl[((i - st) * 4) + k + 1];
+                }
+            }
+            if l == 0 {
+                continue;
+            }
+            let mut wd = @as(u32, 4) << @as(u32, cls);
+            if chroma {
+                wd = 4 + (2 * @as(u32, cls));
+            }
+            loop_filter(
+                pl.data, (y * 4 * stride) + (x * 4), @as(u32, lut_e[@as(usize, l)]), @as(u32, lut_i[@as(usize, l)]),
+                @as(u32, l >> 4), 1, stride, wd, bd);
+        }
+    }
+}
+
+fn deblock(d: *mut Dec) void {
+    let h = &d.hdr;
+    if (h.lf_level_y[0] == 0) and (h.lf_level_y[1] == 0) {
+        return;
+    }
+    let mut lut_e: [64]u8 = [0; 64];
+    let mut lut_i: [64]u8 = [0; 64];
+    let sharp = h.lf_sharpness;
+    for level in @as(u32, 0)..64 {
+        let mut limit = level;
+        if sharp > 0 {
+            limit = limit >> ((sharp + 3) >> 2);
+            limit = @min(limit, 9 - sharp);
+        }
+        limit = @max(limit, 1);
+        lut_i[@as(usize, level)] = @truncate(u8, limit);
+        lut_e[@as(usize, level)] = @truncate(u8, (2 * (level + 2)) + limit);
+    }
+    deblock_plane(d, 0, d.txy, 0, d.w4, d.h4, lut_e[..], lut_i[..], false);
+    if (d.layout == obu.I400) or ((h.lf_level_u == 0) and (h.lf_level_v == 0)) {
+        return;
+    }
+    let ssh = @bit_cast(i32, d.ss_hor);
+    let ssv = @bit_cast(i32, d.ss_ver);
+    let cw4 = (d.w4 + ssh) >> d.ss_hor;
+    let ch4 = (d.h4 + ssv) >> d.ss_ver;
+    deblock_plane(d, 1, d.txuv, 2, cw4, ch4, lut_e[..], lut_i[..], true);
+    deblock_plane(d, 2, d.txuv, 3, cw4, ch4, lut_e[..], lut_i[..], true);
+}
+
+// CDEF
+
+fn constrain(diff: i32, threshold: i32, shift: i32) i32 {
+    let adiff = iabs(diff);
+    let v = @min(adiff, @max(0, threshold - (adiff >> @bit_cast(u32, shift))));
+    if diff < 0 {
+        return -v;
+    }
+    return v;
+}
+
+fn ilog2(v: i32) i32 {
+    return 31 - @as(i32, @truncate(u8, @clz(@bit_cast(u32, v))));
+}
+
+let CDEF_DIV: [7]i32 = [840, 420, 280, 210, 168, 140, 120];
+
+fn cdef_find_dir(src: []u16, pos: usize, stride: usize, bd: u32, variance: *mut u32) u32 {
+    let sh = bd - 8;
+    let mut hv: [16]i32 = [0; 16];
+    let mut diag: [30]i32 = [0; 30];
+    let mut alt: [44]i32 = [0; 44];
+    for y in @as(usize, 0)..8 {
+        for x in @as(usize, 0)..8 {
+            let px = (@as(i32, src[pos + (y * stride) + x]) >> sh) - 128;
+            diag[y + x] += px;
+            alt[y + (x >> 1)] += px;
+            hv[y] += px;
+            alt[11 + 3 + y - (x >> 1)] += px;
+            diag[15 + 7 + y - x] += px;
+            alt[22 + 3 - (y >> 1) + x] += px;
+            hv[8 + x] += px;
+            alt[33 + (y >> 1) + x] += px;
+        }
+    }
+    let mut cost: [8]u32 = [0; 8];
+    for n in @as(usize, 0)..8 {
+        cost[2] +%= @bit_cast(u32, hv[n] * hv[n]);
+        cost[6] +%= @bit_cast(u32, hv[8 + n] * hv[8 + n]);
+    }
+    cost[2] *%= 105;
+    cost[6] *%= 105;
+    for n in @as(usize, 0)..7 {
+        let dv = CDEF_DIV[n];
+        cost[0] +%= @bit_cast(u32, ((diag[n] * diag[n]) + (diag[14 - n] * diag[14 - n])) * dv);
+        cost[4] +%= @bit_cast(u32, ((diag[15 + n] * diag[15 + n]) + (diag[15 + 14 - n] * diag[15 + 14 - n])) * dv);
+    }
+    cost[0] +%= @bit_cast(u32, diag[7] * diag[7] * 105);
+    cost[4] +%= @bit_cast(u32, diag[15 + 7] * diag[15 + 7] * 105);
+    for n in @as(usize, 0)..4 {
+        let a = n * 11;
+        let ci = (n * 2) + 1;
+        for m in @as(usize, 0)..5 {
+            cost[ci] +%= @bit_cast(u32, alt[a + 3 + m] * alt[a + 3 + m]);
+        }
+        cost[ci] *%= 105;
+        for m in @as(usize, 0)..3 {
+            let dv = CDEF_DIV[(2 * m) + 1];
+            cost[ci] +%= @bit_cast(u32, ((alt[a + m] * alt[a + m]) + (alt[a + 10 - m] * alt[a + 10 - m])) * dv);
+        }
+    }
+    let mut best: usize = 0;
+    let mut best_cost = cost[0];
+    for n in @as(usize, 0)..8 {
+        if cost[n] > best_cost {
+            best_cost = cost[n];
+            best = n;
+        }
+    }
+    variance.* = (best_cost -% cost[best ^ 4]) >> 10;
+    return @truncate(u32, best);
+}
+
+const CDEF_T: usize = 12;
+const CDEF_NONE: i32 = -32768;
+
+// filters a w x h block (at x, y in a plane of pw x ph pixels that exist)
+// from src into dst
+fn cdef_block(src: []u16, dst: []mut u16, stride: usize, x0: usize, y0: usize, w: usize, h: usize, pw: usize, ph: usize,
+              pri: i32, sec: i32, dir: usize, damping: i32, bd: u32) void {
+    let mut tmp: [144]i32 = [0; 144];
+    for ty in @as(usize, 0)..(h + 4) {
+        for tx in @as(usize, 0)..(w + 4) {
+            let yy = si(y0 + ty) - 2;
+            let xx = si(x0 + tx) - 2;
+            let mut v = CDEF_NONE;
+            if (yy >= 0) and (xx >= 0) and (yy < si(ph)) and (xx < si(pw)) {
+                v = @as(i32, src[(us(yy) * stride) + us(xx)]);
+            }
+            tmp[(ty * CDEF_T) + tx] = v;
+        }
+    }
+    let base = (2 * CDEF_T) + 2;
+    let mut pri_tap: i32 = 0;
+    let mut pri_shift: i32 = 0;
+    if pri != 0 {
+        pri_tap = 4 - ((pri >> @bit_cast(u32, @as(i32, @bit_cast(i32, bd)) - 8)) & 1);
+        pri_shift = @max(0, damping - ilog2(pri));
+    }
+    let mut sec_shift: i32 = 0;
+    if sec != 0 {
+        sec_shift = damping - ilog2(sec);
+    }
+    for y in @as(usize, 0)..h {
+        for x in @as(usize, 0)..w {
+            let cc = base + (y * CDEF_T) + x;
+            let px = tmp[cc];
+            let mut sum: i32 = 0;
+            let mut max = px;
+            let mut min = px;
+            let mut tap = pri_tap;
+            for k in @as(usize, 0)..2 {
+                if pri != 0 {
+                    let o = cdef_off(dir + 2, k);
+                    let p0 = tmp[ioff(cc, o)];
+                    let p1 = tmp[ioff(cc, -o)];
+                    sum += tap * constrain(p0 - px, pri, pri_shift);
+                    sum += tap * constrain(p1 - px, pri, pri_shift);
+                    tap = (tap & 3) | 2;
+                    min = umin(p0, min);
+                    max = @max(p0, max);
+                    min = umin(p1, min);
+                    max = @max(p1, max);
+                }
+                if sec != 0 {
+                    let o2 = cdef_off(dir + 4, k);
+                    let o3 = cdef_off(dir, k);
+                    let s0 = tmp[ioff(cc, o2)];
+                    let s1 = tmp[ioff(cc, -o2)];
+                    let s2 = tmp[ioff(cc, o3)];
+                    let s3 = tmp[ioff(cc, -o3)];
+                    let st = 2 - si(k);
+                    sum += st * constrain(s0 - px, sec, sec_shift);
+                    sum += st * constrain(s1 - px, sec, sec_shift);
+                    sum += st * constrain(s2 - px, sec, sec_shift);
+                    sum += st * constrain(s3 - px, sec, sec_shift);
+                    min = umin(s0, min);
+                    max = @max(s0, max);
+                    min = umin(s1, min);
+                    max = @max(s1, max);
+                    min = umin(s2, min);
+                    max = @max(s2, max);
+                    min = umin(s3, min);
+                    max = @max(s3, max);
+                }
+            }
+            let mut neg: i32 = 0;
+            if sum < 0 {
+                neg = 1;
+            }
+            let mut v = px + (((sum - neg) + 8) >> 4);
+            if (pri != 0) and (sec != 0) {
+                v = iclip(v, min, max);
+            }
+            dst[((y0 + y) * stride) + x0 + x] = @truncate(u16, @bit_cast(u32, v));
+        }
+    }
+}
+
+fn umin(a: i32, b: i32) i32 {
+    if @bit_cast(u32, a) < @bit_cast(u32, b) {
+        return a;
+    }
+    return b;
+}
+
+fn cdef_off(dir: usize, k: usize) i32 {
+    let i = ((dir * 2) + k) * 2;
+    return (t.CDEF_DIRECTIONS[i] * si(CDEF_T)) + t.CDEF_DIRECTIONS[i + 1];
+}
+
+fn ioff(cc: usize, o: i32) usize {
+    return us(si(cc) + o);
+}
+
+let UV_DIRS: [16]u32 = [0, 1, 2, 3, 4, 5, 6, 7, 7, 0, 2, 4, 5, 6, 6, 6];
+
+fn adjust_strength(strength: i32, var: u32) i32 {
+    if var == 0 {
+        return 0;
+    }
+    let mut i: i32 = 0;
+    if (var >> 6) != 0 {
+        i = @min(@bit_cast(i32, obu.ulog2(var >> 6)), 12);
+    }
+    return ((strength * (4 + i)) + 8) >> 4;
+}
+
+fn cdef(d: *mut Dec, pre: *[3][]mut u16) void {
+    let h = &d.hdr;
+    let bd = d.bitdepth;
+    let sh = bd - 8;
+    let damping = @bit_cast(i32, h.cdef_damping + sh);
+    let st = d.b4_stride;
+    let ush = d.ss_hor;
+    let usv = d.ss_ver;
+    let bw = us(d.bw);
+    let bh = us(d.bh);
+    let mut by: usize = 0;
+    while by < bh {
+        let mut bx: usize = 0;
+        while bx < bw {
+            let ci = d.cdef_idx[((by >> 4) * d.cdef_w) + (bx >> 4)];
+            if ci < 0 {
+                bx += 2;
+                continue;
+            }
+            let y_lvl = @bit_cast(i32, h.cdef_y[us(ci)]);
+            let uv_lvl = @bit_cast(i32, h.cdef_uv[us(ci)]);
+            let o = (by * st) + bx;
+            let coded = (d.noskip[o] | d.noskip[o + 1] | d.noskip[o + st] | d.noskip[o + st + 1]) != 0;
+            if ((y_lvl == 0) and (uv_lvl == 0)) or not coded {
+                bx += 2;
+                continue;
+            }
+            let y_pri = (y_lvl >> 2) << sh;
+            let mut y_sec = y_lvl & 3;
+            if y_sec == 3 {
+                y_sec += 1;
+            }
+            y_sec = y_sec << sh;
+            let uv_pri = (uv_lvl >> 2) << sh;
+            let mut uv_sec = uv_lvl & 3;
+            if uv_sec == 3 {
+                uv_sec += 1;
+            }
+            uv_sec = uv_sec << sh;
+            let ys = d.planes[0].stride;
+            let mut variance: u32 = 0;
+            let mut dir: u32 = 0;
+            if (y_pri != 0) or (uv_pri != 0) {
+                dir = cdef_find_dir(pre.*[0], (by * 4 * ys) + (bx * 4), ys, bd, &mut variance);
+            }
+            let pw = bw * 4;
+            let ph = bh * 4;
+            if y_pri != 0 {
+                let adj = adjust_strength(y_pri, variance);
+                if (adj != 0) or (y_sec != 0) {
+                    cdef_block(
+                        pre.*[0], d.planes[0].data, ys, bx * 4, by * 4, 8, 8, pw, ph, adj, y_sec, @as(usize, dir),
+                        damping, bd);
+                }
+            } else if y_sec != 0 {
+                cdef_block(pre.*[0], d.planes[0].data, ys, bx * 4, by * 4, 8, 8, pw, ph, 0, y_sec, 0, damping, bd);
+            }
+            if (uv_lvl != 0) and (d.layout != obu.I400) {
+                let mut uvdir: u32 = 0;
+                if uv_pri != 0 {
+                    let mut k: usize = 0;
+                    if d.layout == obu.I422 {
+                        k = 8;
+                    }
+                    uvdir = UV_DIRS[k + @as(usize, dir)];
+                }
+                for pl in @as(usize, 1)..3 {
+                    let cs = d.planes[pl].stride;
+                    cdef_block(pre.*[pl], d.planes[pl].data, cs, (bx * 4) >> ush, (by * 4) >> usv, 8 >> ush, 8 >> usv,
+                               pw >> ush, ph >> usv, uv_pri, uv_sec, @as(usize, uvdir), damping - 1, bd);
+                }
+            }
+            bx += 2;
+        }
+        by += 2;
+    }
+}
+
+// Loop restoration
+
+const REST_STRIDE: usize = 390;
+
+struct LrScratch {
+    tmp: [27300]u16,  // (64 + 6) x REST_STRIDE
+    hor: [27300]i32,
+    sumsq: [26520]i32,  // (64 + 4) x REST_STRIDE
+    sum: [26520]i32,
+    dst0: [24576]i32,  // 64 x 384
+    dst1: [24576]i32,
+}
+
+fn lr_plane(d: *mut Dec, p: usize, pre: []u16, cdf: []u16, s: *mut LrScratch) void {
+    let h = &d.hdr;
+    let mut ssh: u32 = 0;
+    let mut ssv: u32 = 0;
+    let mut k: usize = 0;
+    if p > 0 {
+        ssh = d.ss_hor;
+        ssv = d.ss_ver;
+        k = 1;
+    }
+    let pw = us((@bit_cast(i32, h.width) + @bit_cast(i32, ssh)) >> ssh);
+    let ph = us((@bit_cast(i32, h.height) + @bit_cast(i32, ssv)) >> ssv);
+    let log2 = h.lr_unit_size[k];
+    let unit = @as(usize, 1) << @as(usize, log2);
+    let stride = d.planes[p].stride;
+    let dst = d.planes[p].data;
+    let stripe_full = @as(i32, 64) >> ssv;
+    let off = @as(i32, 8) >> ssv;
+    let mut stripe_start: i32 = -off;
+    while stripe_start < si(ph) {
+        let stripe_end = (stripe_start + stripe_full) - 1;  // inclusive
+        let y0 = us(@max(stripe_start, 0));
+        let y1 = @min(us(stripe_end + 1), ph);
+        let urow = @min(d.lr_h[p] - 1, ((y0 + us(off)) >> @as(usize, log2)));
+        for uc in @as(usize, 0)..d.lr_w[p] {
+            let x0 = uc * unit;
+            let mut x1 = x0 + unit;
+            if (uc + 1) == d.lr_w[p] {
+                x1 = pw;
+            }
+            if x0 >= pw {
+                break;
+            }
+            let u = d.lr[p][(urow * d.lr_w[p]) + uc];
+            if u.typ == obu.RT_NONE {
+                continue;
+            }
+            let w = x1 - x0;
+            let sh = y1 - y0;
+            // the padded source
+            for r in @as(usize, 0)..(sh + 6) {
+                let mut yy = @min(@max(si(y0 + r) - 3, 0), si(ph) - 1);
+                let mut src = cdf;
+                if yy < stripe_start {
+                    yy = @max(stripe_start - 2, yy);
+                    src = pre;
+                } else if yy > stripe_end {
+                    yy = @min(stripe_end + 2, yy);
+                    src = pre;
+                }
+                let row = us(yy) * stride;
+                for cc in @as(usize, 0)..(w + 6) {
+                    let xx = @min(@max(si(x0 + cc) - 3, 0), si(pw) - 1);
+                    s.tmp[(r * REST_STRIDE) + cc] = src[row + us(xx)];
+                }
+            }
+            if u.typ == obu.RT_WIENER {
+                wiener(s, dst, (y0 * stride) + x0, stride, w, sh, &u, d.bitdepth);
+            } else {
+                sgr(s, dst, (y0 * stride) + x0, stride, w, sh, &u, d.bitdepth);
+            }
+        }
+        stripe_start += stripe_full;
+    }
+}
+
+fn wiener(s: *mut LrScratch, dst: []mut u16, pos: usize, stride: usize, w: usize, h: usize, u: *LrUnit, bd: u32) void {
+    let mut fh: [7]i32 = [0; 7];
+    let mut fv: [7]i32 = [0; 7];
+    for k in @as(usize, 0)..3 {
+        fh[k] = u.filter_h[k];
+        fh[6 - k] = u.filter_h[k];
+        fv[k] = u.filter_v[k];
+        fv[6 - k] = u.filter_v[k];
+    }
+    fh[3] = (-(fh[0] + fh[1] + fh[2]) * 2) + 128;
+    fv[3] = 128 - ((fv[0] + fv[1] + fv[2]) * 2);
+    let bdi = @bit_cast(i32, bd);
+    let mut rbh: i32 = 3;
+    let mut rbv: i32 = 11;
+    if bd == 12 {
+        rbh = 5;
+        rbv = 9;
+    }
+    let roh = @as(i32, 1) << @bit_cast(u32, rbh - 1);
+    let clip = @as(i32, 1) << @bit_cast(u32, ((bdi + 1) + 7) - rbh);
+    for r in @as(usize, 0)..(h + 6) {
+        let row = r * REST_STRIDE;
+        for i in @as(usize, 0)..w {
+            let mut sum = @as(i32, 1) << @bit_cast(u32, bdi + 6);
+            for k in @as(usize, 0)..7 {
+                sum += @as(i32, s.tmp[row + i + k]) * fh[k];
+            }
+            s.hor[row + i] = iclip((sum + roh) >> @bit_cast(u32, rbh), 0, clip - 1);
+        }
+    }
+    let rov = @as(i32, 1) << @bit_cast(u32, rbv - 1);
+    let round_offset = @as(i32, 1) << @bit_cast(u32, bdi + (rbv - 1));
+    let maxv = (@as(i32, 1) << bd) - 1;
+    for j in @as(usize, 0)..h {
+        for i in @as(usize, 0)..w {
+            let mut sum = -round_offset;
+            for k in @as(usize, 0)..7 {
+                sum += s.hor[((j + k) * REST_STRIDE) + i] * fv[k];
+            }
+            dst[pos + (j * stride) + i] = @truncate(
+                u16, @bit_cast(u32, iclip((sum + rov) >> @bit_cast(u32, rbv), 0, maxv)));
+        }
+    }
+}
+
+fn boxsum3(s: *mut LrScratch, w: usize, h: usize) void {
+    let src = REST_STRIDE;
+    for x in @as(usize, 1)..(w - 1) {
+        let mut a = @as(i32, s.tmp[src + x]);
+        let mut a2 = a * a;
+        let mut b = @as(i32, s.tmp[src + REST_STRIDE + x]);
+        let mut b2 = b * b;
+        let mut sp = src + x;
+        let mut dp = x;
+        for _q in @as(usize, 2)..(h - 2) {
+            sp += REST_STRIDE;
+            let cc = @as(i32, s.tmp[sp + REST_STRIDE]);
+            let c2 = cc * cc;
+            dp += REST_STRIDE;
+            s.sum[dp] = a + b + cc;
+            s.sumsq[dp] = a2 + b2 + c2;
+            a = b;
+            a2 = b2;
+            b = cc;
+            b2 = c2;
+        }
+    }
+    let mut o = REST_STRIDE;
+    for _q in @as(usize, 2)..(h - 2) {
+        let mut a = s.sum[o + 1];
+        let mut a2 = s.sumsq[o + 1];
+        let mut b = s.sum[o + 2];
+        let mut b2 = s.sumsq[o + 2];
+        for x in @as(usize, 2)..(w - 2) {
+            let cc = s.sum[o + x + 1];
+            let c2 = s.sumsq[o + x + 1];
+            s.sum[o + x] = a + b + cc;
+            s.sumsq[o + x] = a2 + b2 + c2;
+            a = b;
+            a2 = b2;
+            b = cc;
+            b2 = c2;
+        }
+        o += REST_STRIDE;
+    }
+}
+
+fn boxsum5(s: *mut LrScratch, w: usize, h: usize) void {
+    for x in @as(usize, 0)..w {
+        let mut a = @as(i32, s.tmp[x]);
+        let mut b = @as(i32, s.tmp[REST_STRIDE + x]);
+        let mut cc = @as(i32, s.tmp[(2 * REST_STRIDE) + x]);
+        let mut dd = @as(i32, s.tmp[(3 * REST_STRIDE) + x]);
+        let mut a2 = a * a;
+        let mut b2 = b * b;
+        let mut c2 = cc * cc;
+        let mut d2 = dd * dd;
+        let mut sp = (3 * REST_STRIDE) + x;
+        let mut dp = x;
+        for _q in @as(usize, 2)..(h - 2) {
+            sp += REST_STRIDE;
+            let e = @as(i32, s.tmp[sp]);
+            let e2 = e * e;
+            dp += REST_STRIDE;
+            s.sum[dp] = a + b + cc + dd + e;
+            s.sumsq[dp] = a2 + b2 + c2 + d2 + e2;
+            a = b;
+            b = cc;
+            cc = dd;
+            dd = e;
+            a2 = b2;
+            b2 = c2;
+            c2 = d2;
+            d2 = e2;
+        }
+    }
+    let mut o = REST_STRIDE;
+    for _q in @as(usize, 2)..(h - 2) {
+        let mut a = s.sum[o];
+        let mut a2 = s.sumsq[o];
+        let mut b = s.sum[o + 1];
+        let mut b2 = s.sumsq[o + 1];
+        let mut cc = s.sum[o + 2];
+        let mut c2 = s.sumsq[o + 2];
+        let mut dd = s.sum[o + 3];
+        let mut d2 = s.sumsq[o + 3];
+        for x in @as(usize, 2)..(w - 2) {
+            let e = s.sum[o + x + 2];
+            let e2 = s.sumsq[o + x + 2];
+            s.sum[o + x] = a + b + cc + dd + e;
+            s.sumsq[o + x] = a2 + b2 + c2 + d2 + e2;
+            a = b;
+            b = cc;
+            cc = dd;
+            dd = e;
+            a2 = b2;
+            b2 = c2;
+            c2 = d2;
+            d2 = e2;
+        }
+        o += REST_STRIDE;
+    }
+}
+
+// the self-guided filter of n = 25 (5x5) or 9 (3x3) into out (stride 384)
+fn selfguided(s: *mut LrScratch, out: []mut i32, w: usize, h: usize, n: i32, sv: u32, bd: u32) void {
+    let mut one_by_x: u32 = 455;
+    if n == 25 {
+        one_by_x = 164;
+        boxsum5(s, w + 6, h + 6);
+    } else {
+        boxsum3(s, w + 6, h + 6);
+    }
+    let sh = bd - 8;
+    let mut step: usize = 1;
+    if n == 25 {
+        step = 2;
+    }
+    let rs = si(REST_STRIDE);
+    // aa = sumsq, bb = sum, based 2 rows and 3 columns in, starting a row above
+    let base = (2 * REST_STRIDE) + 3;
+    let mut row = si(base) - rs;
+    let mut j: i32 = -1;
+    while j < (si(h) + 1) {
+        let mut i: i32 = -1;
+        while i < (si(w) + 1) {
+            let idx = us(row + i);
+            let a = (s.sumsq[idx] + ((@as(i32, 1) << (2 * sh)) >> 1)) >> (2 * sh);
+            let b = (s.sum[idx] + ((@as(i32, 1) << sh) >> 1)) >> sh;
+            let p = @bit_cast(u32, @max((a * n) - (b * b), 0));
+            let z = ((p *% sv) +% (1 << 19)) >> 20;
+            let x = @as(u32, t.SGR_X_BY_X[@as(usize, @min(z, 255))]);
+            s.sumsq[idx] = @bit_cast(i32, (((x *% @bit_cast(u32, s.sum[idx])) *% one_by_x) +% (1 << 11)) >> 12);
+            s.sum[idx] = @bit_cast(i32, x);
+            i += 1;
+        }
+        row += si(step) * rs;
+        j += si(step);
+    }
+    let rsu = REST_STRIDE;
+    let mut src = (3 * REST_STRIDE) + 3;
+    let mut cc = base;
+    let mut o: usize = 0;
+    if n == 25 {
+        let mut jj: usize = 0;
+        while (jj + 1) < h {
+            for i in @as(usize, 0)..w {
+                let k = cc + i;
+                let bsum = ((s.sum[k - rsu] + s.sum[k + rsu]) * 6) +
+                           ((s.sum[k - 1 - rsu] + s.sum[k - 1 + rsu] + s.sum[k + 1 - rsu] + s.sum[k + 1 + rsu]) * 5);
+                let asum = ((s.sumsq[k - rsu] + s.sumsq[k + rsu]) * 6) +
+                           ((s.sumsq[k - 1 - rsu] + s.sumsq[k - 1 + rsu] + s.sumsq[k + 1 - rsu] +
+                             s.sumsq[k + 1 + rsu]) * 5);
+                out[o + i] = ((asum - (bsum * @as(i32, s.tmp[src + i]))) + (1 << 8)) >> 9;
+            }
+            o += 384;
+            src += rsu;
+            cc += rsu;
+            for i in @as(usize, 0)..w {
+                let k = cc + i;
+                let bsum = (s.sum[k] * 6) + ((s.sum[k - 1] + s.sum[k + 1]) * 5);
+                let asum = (s.sumsq[k] * 6) + ((s.sumsq[k - 1] + s.sumsq[k + 1]) * 5);
+                out[o + i] = ((asum - (bsum * @as(i32, s.tmp[src + i]))) + (1 << 7)) >> 8;
+            }
+            o += 384;
+            src += rsu;
+            cc += rsu;
+            jj += 2;
+        }
+        if (jj + 1) == h {
+            for i in @as(usize, 0)..w {
+                let k = cc + i;
+                let bsum = ((s.sum[k - rsu] + s.sum[k + rsu]) * 6) +
+                           ((s.sum[k - 1 - rsu] + s.sum[k - 1 + rsu] + s.sum[k + 1 - rsu] + s.sum[k + 1 + rsu]) * 5);
+                let asum = ((s.sumsq[k - rsu] + s.sumsq[k + rsu]) * 6) +
+                           ((s.sumsq[k - 1 - rsu] + s.sumsq[k - 1 + rsu] + s.sumsq[k + 1 - rsu] +
+                             s.sumsq[k + 1 + rsu]) * 5);
+                out[o + i] = ((asum - (bsum * @as(i32, s.tmp[src + i]))) + (1 << 8)) >> 9;
+            }
+        }
+    } else {
+        for _q in @as(usize, 0)..h {
+            for i in @as(usize, 0)..w {
+                let k = cc + i;
+                let bsum = ((s.sum[k] + s.sum[k - 1] + s.sum[k + 1] + s.sum[k - rsu] + s.sum[k + rsu]) * 4) +
+                           ((s.sum[k - 1 - rsu] + s.sum[k - 1 + rsu] + s.sum[k + 1 - rsu] + s.sum[k + 1 + rsu]) * 3);
+                let asum = ((s.sumsq[k] + s.sumsq[k - 1] + s.sumsq[k + 1] + s.sumsq[k - rsu] + s.sumsq[k + rsu]) * 4) +
+                           ((s.sumsq[k - 1 - rsu] + s.sumsq[k - 1 + rsu] + s.sumsq[k + 1 - rsu] +
+                             s.sumsq[k + 1 + rsu]) * 3);
+                out[o + i] = ((asum - (bsum * @as(i32, s.tmp[src + i]))) + (1 << 8)) >> 9;
+            }
+            o += 384;
+            src += rsu;
+            cc += rsu;
+        }
+    }
+}
+
+fn sgr(s: *mut LrScratch, dst: []mut u16, pos: usize, stride: usize, w: usize, h: usize, u: *LrUnit, bd: u32) void {
+    let s0 = @as(u32, t.SGR_PARAMS[@as(usize, u.sgr_idx) * 2]);
+    let s1 = @as(u32, t.SGR_PARAMS[(@as(usize, u.sgr_idx) * 2) + 1]);
+    let w0 = u.sgr_weights[0];
+    let w1 = 128 - (u.sgr_weights[0] + u.sgr_weights[1]);
+    let maxv = (@as(i32, 1) << bd) - 1;
+    if s0 != 0 {
+        selfguided(s, s.dst0[..], w, h, 25, s0, bd);
+    }
+    if s1 != 0 {
+        selfguided(s, s.dst1[..], w, h, 9, s1, bd);
+    }
+    for j in @as(usize, 0)..h {
+        for i in @as(usize, 0)..w {
+            let mut v: i32 = 0;
+            if s0 != 0 {
+                v += w0 * s.dst0[(j * 384) + i];
+            }
+            if s1 != 0 {
+                v += w1 * s.dst1[(j * 384) + i];
+            }
+            let q = pos + (j * stride) + i;
+            dst[q] = @truncate(u16, @bit_cast(u32, iclip(@as(i32, dst[q]) + ((v + (1 << 10)) >> 11), 0, maxv)));
+        }
+    }
+}
+
+fn copy_planes(d: *Dec, out: *mut [3][]mut u16, np: usize) !void {
+    for p in @as(usize, 0)..np {
+        out.*[p] = mem.alloc.[u16](d.planes[p].data.len)!;
+        @mem_copy(out.*[p], d.planes[p].data);
+    }
+}
+
+fn free_planes(a: *mut [3][]mut u16) void {
+    for p in @as(usize, 0)..3 {
+        if a.*[p].len > 0 {
+            mem.free(a.*[p]);
+        }
+    }
+}
+
+fn filters(d: *mut Dec) !void {
+    let h = &d.hdr;
+    let mut np: usize = 3;
+    if d.layout == obu.I400 {
+        np = 1;
+    }
+    deblock(d);
+    let mut any_cdef = false;
+    for i in @as(usize, 0)..8 {
+        if (h.cdef_y[i] != 0) or (h.cdef_uv[i] != 0) {
+            any_cdef = true;
+        }
+    }
+    let any_lr = (h.lr_type[0] != obu.RT_NONE) or (h.lr_type[1] != obu.RT_NONE) or (h.lr_type[2] != obu.RT_NONE);
+    if (not any_cdef) and not any_lr {
+        return;
+    }
+    // the deblocked planes (CDEF's input, and loop restoration's above and
+    // below its stripes)
+    let mut pre: [3][]mut u16 = [d.planes[0].data[..0], d.planes[0].data[..0], d.planes[0].data[..0]];
+    defer free_planes(&mut pre);
+    copy_planes(d, &mut pre, np)!;
+    if any_cdef {
+        cdef(d, &pre);
+    }
+    if not any_lr {
+        return;
+    }
+    let mut post: [3][]mut u16 = [d.planes[0].data[..0], d.planes[0].data[..0], d.planes[0].data[..0]];
+    defer free_planes(&mut post);
+    copy_planes(d, &mut post, np)!;
+    let sp = mem.alloc_zeroed.[LrScratch](1)!;
+    defer mem.free(sp);
+    for p in @as(usize, 0)..np {
+        if h.lr_type[p] != obu.RT_NONE {
+            lr_plane(d, p, pre[p], post[p], &mut sp[0]);
+        }
+    }
+}

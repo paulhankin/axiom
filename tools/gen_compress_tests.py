@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Compressed test files for std/lz4, std/bzip2, std/xz, std/zstd and
-std/brotli, made by the reference libraries.
+"""Compressed test files for std/compress/lz4, bzip2, xz, zstd and brotli,
+made by the reference libraries.
 
     pip install lz4 zstandard brotli
     tools/gen_compress_tests.py
 
-std/testdata/corpus.bin is the input (text, random bytes, runs and UTF-8;
-it is kept, and made only if missing). Each std/<format>/testdata/ gets
+std/compress/testdata/corpus.bin is the input (text, random bytes, runs and UTF-8;
+it is kept, and made only if missing). Each std/compress/<format>/testdata/ gets
 corpus-<variant>.<ext> files that decompress to it, empty.<ext> for empty
 input and short.<ext> for SHORT below.
 """
@@ -19,14 +19,14 @@ import brotli
 import lz4.frame
 import zstandard
 
-std = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std')
+std = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'compress')
 SHORT = b'Hello, Hello, Hello, world!\n'
 
 cpath = os.path.join(std, 'testdata', 'corpus.bin')
 if not os.path.exists(cpath):
     os.makedirs(os.path.dirname(cpath), exist_ok=True)
     rnd = random.Random(1)
-    readme = open(os.path.join(std, 'README.md'), 'rb').read()[:30000]
+    readme = open(os.path.join(std, '..', 'README.md'), 'rb').read()[:30000]
     parts = [readme, bytes(rnd.getrandbits(8) for _ in range(8000)), b'abcabcabd' * 1200, bytes(4000),
              ('été ☃ \U0001f600 中文 ' * 100).encode(), readme[:5000]]
     open(cpath, 'wb').write(b''.join(parts))
