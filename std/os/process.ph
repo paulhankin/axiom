@@ -10,8 +10,8 @@
 //     defer cmd.deinit();
 //     cmd.arg("-r")!;
 //     cmd.set_env("LC_ALL", "C")!;
-//     cmd.stdin(process.PIPE);
-//     cmd.stdout(process.PIPE);
+//     cmd.stdin(process.Stdio.PIPE);
+//     cmd.stdout(process.Stdio.PIPE);
 //     let mut child = cmd.spawn()!;
 //     child.stdin.write_all("b\na\n")!;
 //     child.stdin.close();                          // (wait closes it too)
@@ -48,9 +48,11 @@ import host "phalange" {
 }
 
 /// What to connect a child's stream to.
-pub const INHERIT: u8 = 0;  // this process's
-pub const PIPE: u8 = 1;     // a pipe to this process (Child.stdin, stdout, stderr)
-pub const NULL: u8 = 2;     // /dev/null
+pub enum Stdio: u8 {
+    INHERIT = 0,  // this process's
+    PIPE = 1,     // a pipe to this process (Child.stdin, stdout, stderr)
+    NULL = 2,     // /dev/null
+}
 
 /// How a child ended.
 pub struct Status {
@@ -240,12 +242,12 @@ pub struct Command {
     removes: vec.Vec.[[]u8],
     clear: bool,
     cwd: []u8,
-    modes: [3]u8,
+    modes: [3]Stdio,
 
     /// A command running `program` (argument 0).
     pub fn init(program: []u8) Command {
         let mut c = Command.{ argv: vec.Vec.[[]u8].init(), sets: vec.Vec.[[]u8].init(), removes: vec.Vec.[[]u8].init(),
-                              clear: false, cwd: "", modes: [0; 3] };
+                              clear: false, cwd: "", modes: [Stdio.INHERIT; 3] };
         c.argv.push(program) catch {};
         return c;
     }
@@ -287,15 +289,15 @@ pub struct Command {
         self.cwd = path;
     }
 
-    pub fn stdin(self: *mut Command, mode: u8) void {
+    pub fn stdin(self: *mut Command, mode: Stdio) void {
         self.modes[0] = mode;
     }
 
-    pub fn stdout(self: *mut Command, mode: u8) void {
+    pub fn stdout(self: *mut Command, mode: Stdio) void {
         self.modes[1] = mode;
     }
 
-    pub fn stderr(self: *mut Command, mode: u8) void {
+    pub fn stderr(self: *mut Command, mode: Stdio) void {
         self.modes[2] = mode;
     }
 
@@ -304,7 +306,11 @@ pub struct Command {
         let mut spec = strs.String.init();
         defer spec.deinit();
         self.build(&mut spec)!;
-        let mut sio: [3]i32 = [@as(i32, self.modes[0]), @as(i32, self.modes[1]), @as(i32, self.modes[2])];
+        let mut sio: [3]i32 = [
+            @as(i32, @int_from_enum(self.modes[0])),
+            @as(i32, @int_from_enum(self.modes[1])),
+            @as(i32, @int_from_enum(self.modes[2])),
+        ];
         let bytes = spec.bytes();
         let h = ph_proc_spawn(bytes.ptr, bytes.len, &mut sio[0]);
         if h < 0 {
@@ -324,8 +330,8 @@ pub struct Command {
     /// (whatever those modes were set to; stdin stays as set).
     pub fn output(self: *mut Command) !Output {
         let saved = self.modes;
-        self.modes[1] = PIPE;
-        self.modes[2] = PIPE;
+        self.modes[1] = Stdio.PIPE;
+        self.modes[2] = Stdio.PIPE;
         let r = self.spawn();
         self.modes = saved;
         let mut child = r!;
@@ -514,8 +520,8 @@ test "running programs" {
     let mut c = Command.init("sort");
     defer c.deinit();
     c.arg("-r")!;
-    c.stdin(PIPE);
-    c.stdout(PIPE);
+    c.stdin(Stdio.PIPE);
+    c.stdout(Stdio.PIPE);
     let mut child = c.spawn()!;
     child.stdin.write_all("b\nc\na\n")!;
     child.stdin.close();

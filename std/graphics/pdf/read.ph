@@ -1092,12 +1092,12 @@ pub struct Reader {
     fn apply_filter(self: *mut Reader, f: []u8, data: []u8, parms: Object) ![]mut u8 {
         let limit = @min(self.max_stream, self.budget);
         if strs.eq(f, "FlateDecode") or strs.eq(f, "Fl") {
-            let out = deflate.decompress(data, deflate.ZLIB, limit) catch |e| {
+            let out = deflate.decompress(data, deflate.Format.ZLIB, limit) catch |e| {
                 if (e == error.OutOfMemory) or (e == error.TooLarge) {
                     return e;
                 }
                 // raw deflate?
-                let raw = deflate.decompress(data, deflate.RAW, limit) catch |e2| {
+                let raw = deflate.decompress(data, deflate.Format.RAW, limit) catch |e2| {
                     if (e2 == error.OutOfMemory) or (e2 == error.TooLarge) {
                         return e2;
                     }
@@ -2696,14 +2696,14 @@ test "object streams and compressed cross-reference streams" {
     body.push_str(o3)!;
     body.push(' ')!;
     body.push_str(o4)!;
-    let packed = deflate.compress(body.bytes(), deflate.ZLIB, 6)!;
+    let packed = deflate.compress(body.bytes(), deflate.Format.ZLIB, 6)!;
     defer mem.free(packed);
     let mut sdict = strs.String.init();
     defer sdict.deinit();
     sdict.push_str("/Type /ObjStm /N 2 /Filter /FlateDecode /First ")!;
     put_dec(&mut sdict, hdr.len)!;
     let content = "BT /F1 10 Tf 10 50 Td (packed) Tj ET";
-    let cpacked = deflate.compress(content, deflate.ZLIB, 6)!;
+    let cpacked = deflate.compress(content, deflate.Format.ZLIB, 6)!;
     defer mem.free(cpacked);
     let mut out = strs.String.init();
     defer out.deinit();
@@ -2756,7 +2756,7 @@ test "object streams and compressed cross-reference streams" {
         }
         prev = row;
     }
-    let xpacked = deflate.compress(rows.bytes(), deflate.ZLIB, 6)!;
+    let xpacked = deflate.compress(rows.bytes(), deflate.Format.ZLIB, 6)!;
     defer mem.free(xpacked);
     let xref_at = out.len;
     let o7 =

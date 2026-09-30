@@ -22,9 +22,12 @@ import "subtle.ph" as subtle;
 
 error { InvalidArgument, TooExpensive, InvalidEncoding, OutOfMemory, NoSpaceLeft, InvalidBase64 }
 
-pub const ARGON2D: u8 = 0;
-pub const ARGON2I: u8 = 1;
-pub const ARGON2ID: u8 = 2;
+/// Argon2d, Argon2i and Argon2id.
+pub enum Variant: u8 {
+    D = 0,
+    I = 1,
+    ID = 2,
+}
 
 /// The most memory parameters may ask for: 4 GiB.
 pub const MAX_MEMORY_KIB: u32 = 4 * 1024 * 1024;
@@ -33,7 +36,7 @@ const WORDS: usize = 128;  // u64 words in a 1 KiB block
 const SYNC_POINTS: usize = 4;
 
 pub struct Params {
-    variant: u8,   // ARGON2ID, ARGON2I or ARGON2D
+    variant: Variant,
     t: u32,        // passes over memory (>= 1)
     m: u32,        // memory in KiB (>= 8 * p)
     p: u32,        // lanes (1..=2^24 - 1)
@@ -42,7 +45,7 @@ pub struct Params {
 
     /// Argon2id with 19 MiB, 2 passes and 1 lane (OWASP's minimum).
     pub fn default() Params {
-        return Params.{ variant: ARGON2ID, t: 2, m: 19 * 1024, p: 1, secret: "", ad: "" };
+        return Params.{ variant: Variant.ID, t: 2, m: 19 * 1024, p: 1, secret: "", ad: "" };
     }
 }
 
@@ -147,7 +150,7 @@ struct Instance {
     seg_len: usize,
     passes: u32,
     blocks: usize,
-    variant: u8,
+    variant: Variant,
 
     fn block(self: *Instance, i: usize) []mut u64 {
         return self.mem[i * WORDS..(i + 1) * WORDS];
@@ -183,7 +186,7 @@ struct Instance {
     }
 
     fn fill_segment(self: *mut Instance, pass: u32, lane: usize, slice: usize) void {
-        let independent = (self.variant == ARGON2I) or ((self.variant == ARGON2ID) and (pass == 0) and (slice < 2));
+        let independent = (self.variant == Variant.I) or ((self.variant == Variant.ID) and (pass == 0) and (slice < 2));
         let zero: [WORDS]u64 = [0; WORDS];
         let mut input: [WORDS]u64 = [0; WORDS];
         let mut addr: [WORDS]u64 = [0; WORDS];
@@ -193,7 +196,7 @@ struct Instance {
             input[2] = @as(u64, slice);
             input[3] = @as(u64, self.blocks);
             input[4] = @as(u64, self.passes);
-            input[5] = @as(u64, self.variant);
+            input[5] = @as(u64, @int_from_enum(self.variant));
         }
         let mut start: usize = 0;
         if (pass == 0) and (slice == 0) {
@@ -247,9 +250,6 @@ fn check(p: *Params, salt: []u8, out_len: usize) !void {
     if (p.t == 0) or (p.p == 0) or (p.p > 0xffffff) or (out_len < 4) or (salt.len < 8) or (salt.len > 0xffffffff) {
         return error.InvalidArgument;
     }
-    if (p.variant != ARGON2ID) and (p.variant != ARGON2I) and (p.variant != ARGON2D) {
-        return error.InvalidArgument;
-    }
     if @as(u64, p.m) < (8 * @as(u64, p.p)) {
         return error.InvalidArgument;
     }
@@ -269,7 +269,7 @@ pub fn hash(password: []u8, salt: []u8, p: Params, out: []mut u8) !void {
     le32(w[8..12], p.m);
     le32(w[12..16], p.t);
     le32(w[16..20], 0x13);
-    le32(w[20..24], @as(u32, p.variant));
+    le32(w[20..24], @as(u32, @int_from_enum(p.variant)));
     let mut h = blake2.Blake2b.init(64, "") catch @trap();
     h.update(w[..]);
     let mut len: [4]u8 = [0; 4];
@@ -344,11 +344,11 @@ let B64: base64.Encoding = base64.Encoding.{
     pad: false,
 };
 
-fn variant_name(v: u8) []u8 {
-    if v == ARGON2I {
+fn variant_name(v: Variant) []u8 {
+    if v == Variant.I {
         return "argon2i";
     }
-    if v == ARGON2D {
+    if v == Variant.D {
         return "argon2d";
     }
     return "argon2id";
@@ -408,11 +408,11 @@ pub fn verify_with(encoded: []u8, password: []u8, secret: []u8, ad: []u8) !bool 
     p.secret = secret;
     p.ad = ad;
     if strs.eq(parts[1], "argon2id") {
-        p.variant = ARGON2ID;
+        p.variant = Variant.ID;
     } else if strs.eq(parts[1], "argon2i") {
-        p.variant = ARGON2I;
+        p.variant = Variant.I;
     } else if strs.eq(parts[1], "argon2d") {
-        p.variant = ARGON2D;
+        p.variant = Variant.D;
     } else {
         return error.InvalidEncoding;
     }
@@ -470,22 +470,22 @@ fn hex(d: []u8, out: []mut u8) []u8 {
 test "argon2 reference values" {
     let mut k: [40]u8 = [0; 40];
     let mut h: [80]u8 = [0; 80];
-    let mut p = Params.{ variant: ARGON2ID, t: 2, m: 64, p: 1, secret: "", ad: "" };
+    let mut p = Params.{ variant: Variant.ID, t: 2, m: 64, p: 1, secret: "", ad: "" };
     hash("password", "somesalt", p, k[..32])!;
     @expect_eq(hex(k[..32], h[..]), "16a1a498734609dd01456da406de9f3d9da93e6c86c300a12fc1465214ce4922");
-    p.variant = ARGON2I;
+    p.variant = Variant.I;
     hash("password", "somesalt", p, k[..32])!;
     @expect_eq(hex(k[..32], h[..]), "989da65458e8be1440ae555d0b3c8ac3a6584e0d2290b9dcc915a68a71e41c1e");
-    p.variant = ARGON2D;
+    p.variant = Variant.D;
     hash("password", "somesalt", p, k[..32])!;
     @expect_eq(hex(k[..32], h[..]), "f920d95538648465abeeba6ae06ea532ed26df314aff60150237d8fe116f62cd");
-    let q = Params.{ variant: ARGON2ID, t: 3, m: 256, p: 4, secret: "", ad: "" };
+    let q = Params.{ variant: Variant.ID, t: 3, m: 256, p: 4, secret: "", ad: "" };
     hash("pw", "saltsaltsalt", q, k[..])!;
     @expect_eq(hex(k[..], h[..]), "4fb6852ad09221e5daa74ef8cad8a587112e3b3992ef45aa8c3a8d7e35ce366ba1930234e6f0c325");
 }
 
 test "argon2 encoded strings" {
-    let p = Params.{ variant: ARGON2ID, t: 2, m: 64, p: 1, secret: "", ad: "" };
+    let p = Params.{ variant: Variant.ID, t: 2, m: 64, p: 1, secret: "", ad: "" };
     let s = hash_encoded("password", "somesalt", p)!;
     defer mem.free(s);
     @expect_eq(s, "$argon2id$v=19$m=64,t=2,p=1$c29tZXNhbHQ$FqGkmHNGCd0BRW2kBt6fPZ2pPmyGwwChL8FGUhTOSSI");
@@ -501,7 +501,7 @@ test "argon2 encoded strings" {
     for b in bad {
         @expect(fails(verify_encoded(b, "password")));
     }
-    let tiny = Params.{ variant: ARGON2ID, t: 1, m: 7, p: 1, secret: "", ad: "" };
+    let tiny = Params.{ variant: Variant.ID, t: 1, m: 7, p: 1, secret: "", ad: "" };
     let mut k: [32]u8 = [0; 32];
     @expect(fails_void(hash("pw", "saltsalt", tiny, k[..])));
     @expect(fails_void(hash("pw", "short", Params.default(), k[..])));

@@ -292,6 +292,17 @@ fn floor_div(a: i64, b: i64) i64 {
 // DateTime: a broken-down time
 // -----------------------------------------------------------------------------
 
+/// Days of the week.
+pub enum Weekday: u32 {
+    SUNDAY = 0,
+    MONDAY = 1,
+    TUESDAY = 2,
+    WEDNESDAY = 3,
+    THURSDAY = 4,
+    FRIDAY = 5,
+    SATURDAY = 6,
+}
+
 /// Calendar fields of a Time at some offset from UTC.
 pub struct DateTime {
     year: i64,
@@ -301,9 +312,9 @@ pub struct DateTime {
     minute: u32,      // 0 to 59
     second: u32,      // 0 to 59
     nanosecond: u32,  // 0 to 999_999_999
-    weekday: u32,     // 0 Sunday to 6 Saturday
-    yearday: u32,     // 1 to 366
-    offset: i32,      // seconds east of UTC
+    weekday: Weekday,
+    yearday: u32,  // 1 to 366
+    offset: i32,   // seconds east of UTC
 
     /// The Time these fields name. Fails with InvalidTime if a field is out
     /// of range (weekday and yearday are ignored).
@@ -335,7 +346,7 @@ pub fn date(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32
         minute: minute,
         second: second,
         nanosecond: 0,
-        weekday: 0,
+        weekday: Weekday.SUNDAY,
         yearday: 0,
         offset: 0,
     };
@@ -440,7 +451,7 @@ pub struct Time {
             minute: @int_cast(u32, (rem / 60) % 60),
             second: @int_cast(u32, rem % 60),
             nanosecond: self.nsec,
-            weekday: @int_cast(u32, (days + 4) - (floor_div(days + 4, 7) * 7)),
+            weekday: @enum_from_int(Weekday, (days + 4) - (floor_div(days + 4, 7) * 7)),  // 0 to 6
             yearday: @int_cast(u32, (days - jan1) + 1),
             offset: offset,
         };
@@ -499,7 +510,7 @@ pub struct Time {
     pub fn format_http(self: Time, buf: []mut u8) []u8 {
         let dt = self.utc();
         let mut b = Buf.{ buf: buf, n: 0 };
-        let wd = dt.weekday * 3;
+        let wd = @int_from_enum(dt.weekday) * 3;
         b.puts(DAY_NAMES[@as(usize, wd)..@as(usize, wd + 3)]);
         b.puts(", ");
         b.padded(@as(u64, dt.day), 2);
@@ -650,7 +661,7 @@ pub fn parse_rfc3339(s: []u8) !Time {
         minute: minute,
         second: sec,
         nanosecond: nsec,
-        weekday: 0,
+        weekday: Weekday.SUNDAY,
         yearday: 0,
         offset: offset,
     };
@@ -742,7 +753,7 @@ test "times and dates" {
     @expect_eq(dt.hour, 23);
     @expect_eq(dt.minute, 31);
     @expect_eq(dt.second, 30);
-    @expect_eq(dt.weekday, 5);
+    @expect(dt.weekday == Weekday.FRIDAY);
     @expect_eq(dt.yearday, 44);
     @expect_eq(dt.to_time()!.unix(), 1234567890);
     let mut b: [40]u8 = [0; 40];
@@ -752,7 +763,7 @@ test "times and dates" {
     @expect_eq(Time.from_unix(784111777, 0).format_http(b[..]), "Sun, 06 Nov 1994 08:49:37 GMT");
     let before = Time.from_unix(-1, 500000000);
     @expect_eq(before.format_rfc3339(b[..]), "1969-12-31T23:59:59.5Z");
-    @expect_eq(before.utc().weekday, 3);
+    @expect(before.utc().weekday == Weekday.WEDNESDAY);
     @expect_eq(Time.from_unix_millis(-1).nsec, 999000000);
     @expect_eq(Time.from_unix_millis(-1).sec, -1);
     @expect_eq(t.sub(before).as_millis(), 1234567890500);

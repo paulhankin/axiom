@@ -396,7 +396,7 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
             rle_decode(packed, out)!;
             unpredict(out)!;
         } else if (h.compression == Compression.ZIPS) or (h.compression == Compression.ZIP) {
-            let z = deflate.decompress(packed, deflate.ZLIB, n) catch return error.InvalidImage;
+            let z = deflate.decompress(packed, deflate.Format.ZLIB, n) catch return error.InvalidImage;
             defer mem.free(z);
             if z.len != n {
                 return error.InvalidImage;
@@ -466,7 +466,7 @@ fn rle_decode(src: []u8, out: []mut u8) !void {
 
 fn pxr24_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !void {
     let n = out.len;
-    let z = deflate.decompress(src, deflate.ZLIB, n) catch return error.InvalidImage;
+    let z = deflate.decompress(src, deflate.Format.ZLIB, n) catch return error.InvalidImage;
     defer mem.free(z);
     let mut t: usize = 0;
     let mut o: usize = 0;
@@ -1141,7 +1141,7 @@ fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
         if opts.compression == Compression.RLE {
             packed = rle_encode(pre)!;
         } else {
-            packed = deflate.compress(pre, deflate.ZLIB, 6)!;
+            packed = deflate.compress(pre, deflate.Format.ZLIB, 6)!;
         }
         defer mem.free(packed);
         if packed.len < block.len {

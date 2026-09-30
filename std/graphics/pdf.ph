@@ -312,7 +312,7 @@ pub struct Document {
         let mut flate = false;
         if may_compress and self.compress and (data.len > 64) {
             mem.free(packed);
-            packed = deflate.compress(data, deflate.ZLIB, 6)!;
+            packed = deflate.compress(data, deflate.Format.ZLIB, 6)!;
             if packed.len < data.len {
                 payload = packed;
                 flate = true;

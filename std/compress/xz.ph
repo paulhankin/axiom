@@ -30,11 +30,14 @@ import "deflate.ph" as deflate;
 
 error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory }
 
-// Check types
-pub const CHECK_NONE: u8 = 0;
-pub const CHECK_CRC32: u8 = 1;
-pub const CHECK_CRC64: u8 = 4;
-pub const CHECK_SHA256: u8 = 10;
+/// The integrity checks compress can write. (A stream being decompressed
+/// may name others, which are skipped rather than checked.)
+pub enum Check: u8 {
+    NONE = 0,
+    CRC32 = 1,
+    CRC64 = 4,
+    SHA256 = 10,
+}
 
 let CRC64_TABLE: [256]u64 = [
     0x0000000000000000,
@@ -1035,19 +1038,8 @@ fn put_le32(b: []mut u8, i: usize, v: u32) void {
 
 let HEADER_MAGIC: []u8 = "\xfd7zXZ\x00";
 
+// The size of the check with ID `check` in a stream header.
 fn check_size(check: u8) !usize {
-    if check == CHECK_NONE {
-        return 0;
-    }
-    if check == CHECK_CRC32 {
-        return 4;
-    }
-    if check == CHECK_CRC64 {
-        return 8;
-    }
-    if check == CHECK_SHA256 {
-        return 32;
-    }
     if check <= 15 {
         let sizes: [16]usize = [0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64];
         return sizes[@as(usize, check)];  // (unknown kinds: skipped, not checked)
@@ -1281,15 +1273,15 @@ fn block(d: []u8, at: usize, check: u8, csize: usize, out: *mut strs.String, max
         return error.Corrupt;
     }
     let body = out.buf[start..out.len];
-    if check == CHECK_CRC32 {
+    if check == @int_from_enum(Check.CRC32) {
         if deflate.crc32(0, body) != le32(d, e) {
             return error.ChecksumMismatch;
         }
-    } else if check == CHECK_CRC64 {
+    } else if check == @int_from_enum(Check.CRC64) {
         if crc64(0, body) != le64(d, e) {
             return error.ChecksumMismatch;
         }
-    } else if check == CHECK_SHA256 {
+    } else if check == @int_from_enum(Check.SHA256) {
         let mut h: [32]u8 = [0; 32];
         sha2.sha256(body, h[..]);
         if not strs.eq(h[..], d[e..e + 32]) {
@@ -1631,11 +1623,11 @@ struct Encoder {
 }
 
 pub struct Options {
-    level: u32,  // 1 (fastest) to 9 (smallest)
-    check: u8,   // CHECK_CRC64 (default), CHECK_CRC32, CHECK_SHA256 or CHECK_NONE
+    level: u32,    // 1 (fastest) to 9 (smallest)
+    check: Check,  // CRC64 by default
 
     pub fn default() Options {
-        return Options.{ level: 6, check: CHECK_CRC64 };
+        return Options.{ level: 6, check: Check.CRC64 };
     }
 }
 
@@ -1795,7 +1787,7 @@ fn put_varint(out: *mut strs.String, v: u64) !void {
 }
 
 fn xz_encode(data: []u8, o: Options, out: *mut strs.String) !void {
-    let check = o.check;
+    let check = @int_from_enum(o.check);
     let csize = check_size(check)!;
     // the stream header
     out.push_str(HEADER_MAGIC)!;
@@ -1815,18 +1807,19 @@ fn xz_encode(data: []u8, o: Options, out: *mut strs.String) !void {
     while ((out.len - bh) % 4) != 0 {
         out.push(0)!;
     }
-    if check == CHECK_CRC32 {
-        put32(out, deflate.crc32(0, data))!;
-    } else if check == CHECK_CRC64 {
-        let c = crc64(0, data);
-        put32(out, @truncate(u32, c))!;
-        put32(out, @truncate(u32, c >> 32))!;
-    } else if check == CHECK_SHA256 {
-        let mut h: [32]u8 = [0; 32];
-        sha2.sha256(data, h[..]);
-        out.push_str(h[..])!;
-    } else if check != CHECK_NONE {
-        return error.Unsupported;
+    match o.check {
+        .NONE => {}
+        .CRC32 => { put32(out, deflate.crc32(0, data))!; }
+        .CRC64 => {
+            let c = crc64(0, data);
+            put32(out, @truncate(u32, c))!;
+            put32(out, @truncate(u32, c >> 32))!;
+        }
+        .SHA256 => {
+            let mut h: [32]u8 = [0; 32];
+            sha2.sha256(data, h[..]);
+            out.push_str(h[..])!;
+        }
     }
     // the index
     let ix = out.len;
@@ -1938,7 +1931,7 @@ test "round trips" {
         defer mem.free(d);
         @expect_eq(d, corpus);
     }
-    for chk in [CHECK_NONE, CHECK_CRC32, CHECK_SHA256]{
+    for chk in [Check.NONE, Check.CRC32, Check.SHA256]{
         o.check = chk;
         for input in ["", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abcabcabcabcabcabcabcabxabc"]{
             let c = compress(input, o)!;

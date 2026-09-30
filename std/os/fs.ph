@@ -5,7 +5,7 @@
 //     let text = fs.read_file("notes.txt")!;           // mem.free it
 //     fs.write_file("out/copy.txt", text)!;
 //     fs.mkdir_all("out/a/b")!;
-//     let info = fs.stat("out")!;                      // info.kind == fs.DIR
+//     let info = fs.stat("out")!;                      // info.kind == fs.Kind.DIR
 //     let mut d = fs.read_dir("out")!;                 // sorted entries
 //     defer d.deinit();
 //     let mut g = fs.glob("src/**/*.ph")!;             // matching paths
@@ -57,10 +57,24 @@ import host "phalange" {
 }
 
 /// Kinds of file.
-pub const FILE: u8 = 1;
-pub const DIR: u8 = 2;
-pub const SYMLINK: u8 = 3;
-pub const OTHER: u8 = 4;  // devices, pipes, sockets
+pub enum Kind: u8 {
+    UNKNOWN = 0,  // in a directory entry: the system did not say
+    FILE = 1,
+    DIR = 2,
+    SYMLINK = 3,
+    OTHER = 4,  // devices, pipes, sockets
+}
+
+// A kind as the host reports it (anything unexpected is OTHER).
+fn kind_from_host(k: u64) Kind {
+    match k {
+        0    => { return Kind.UNKNOWN; }
+        1    => { return Kind.FILE; }
+        2    => { return Kind.DIR; }
+        3    => { return Kind.SYMLINK; }
+        else => { return Kind.OTHER; }
+    }
+}
 
 fn fail(code: i64) error { if code == -2 {
     return error.NotFound;
@@ -84,17 +98,17 @@ return error.IoError; }
 
 /// What stat says about a file.
 pub struct Info {
-    kind: u8,
+    kind: Kind,
     size: u64,
     mtime_ns: i64,  // last modified, in nanoseconds since 1970
     mode: u32,      // permission bits (0o755 and so on)
 
     pub fn is_dir(self: Info) bool {
-        return self.kind == DIR;
+        return self.kind == Kind.DIR;
     }
 
     pub fn is_file(self: Info) bool {
-        return self.kind == FILE;
+        return self.kind == Kind.FILE;
     }
 }
 
@@ -105,7 +119,7 @@ fn stat_with(p: []u8, follow: u32) !Info {
         return fail(@as(i64, r));
     }
     return Info.{
-        kind: @truncate(u8, @bit_cast(u64, out[0])),
+        kind: kind_from_host(@bit_cast(u64, out[0])),
         size: @bit_cast(u64, out[1]),
         mtime_ns: out[2],
         mode: @truncate(u32, @bit_cast(u64, out[3])),
@@ -129,12 +143,12 @@ pub fn exists(p: []u8) bool {
 
 pub fn is_dir(p: []u8) bool {
     let i = stat(p) catch return false;
-    return i.kind == DIR;
+    return i.kind == Kind.DIR;
 }
 
 pub fn is_file(p: []u8) bool {
     let i = stat(p) catch return false;
-    return i.kind == FILE;
+    return i.kind == Kind.FILE;
 }
 
 // -----------------------------------------------------------------------------
@@ -231,7 +245,7 @@ pub fn mkdir_all(p: []u8) !void {
 pub fn remove(p: []u8) !void {
     let i = lstat(p)!;
     let mut dir: u32 = 0;
-    if i.kind == DIR {
+    if i.kind == Kind.DIR {
         dir = 1;
     }
     let r = ph_remove(p.ptr, p.len, dir);
@@ -254,7 +268,7 @@ pub fn remove_all(p: []u8) !void {
         }
         return e;
     };
-    if i.kind == DIR {
+    if i.kind == Kind.DIR {
         let h = ph_dir_open(-1, p.ptr, p.len);
         if h >= 0 {
             defer ph_dir_close(h);
@@ -281,8 +295,8 @@ fn empty_dir(h: i32) !void {
 }
 
 // Removes the entry `name` of the open directory h, and what is in it.
-fn remove_at(h: i32, name: []u8, kind: u8) !void {
-    if (kind == DIR) or (kind == 0) {
+fn remove_at(h: i32, name: []u8, kind: Kind) !void {
+    if (kind == Kind.DIR) or (kind == Kind.UNKNOWN) {
         let c = ph_dir_open(h, name.ptr, name.len);
         if c >= 0 {
             let r = empty_dir(c);
@@ -304,7 +318,7 @@ fn remove_at(h: i32, name: []u8, kind: u8) !void {
     // a file or link (or a directory that was one a moment ago)
     let r = ph_dir_remove(h, name.ptr, name.len, 0);
     if r == -21 {
-        return remove_at(h, name, DIR);
+        return remove_at(h, name, Kind.DIR);
     }
     if (r < 0) and (r != -2) {
         return fail(@as(i64, r));
@@ -321,7 +335,7 @@ pub fn rename(from: []u8, to: []u8) !void {
 
 pub struct Entry {
     name: []u8,
-    kind: u8,  // FILE, DIR, SYMLINK, OTHER, or 0 if the system did not say
+    kind: Kind,  // UNKNOWN if the system did not say
 }
 
 /// A directory's entries, sorted by name (not "." and "..").
@@ -372,7 +386,7 @@ fn entries_of(p: []u8, h: i32) !Dir {
         let mut d = Dir.{ entries: vec.Vec.[Entry].init(), buf: buf };
         let mut i: usize = 0;
         while i < need {
-            let kind = buf[i];
+            let kind = kind_from_host(@as(u64, buf[i]));
             let mut e = i + 1;
             while (e < need) and (buf[e] != 0) {
                 e += 1;
@@ -472,7 +486,7 @@ pub fn make_temp_dir(prefix: []u8) ![]mut u8 {
 /// order: visit(ctx, path, kind) gets each path (valid only during the
 /// call) and returns whether to go into it, if it is a directory.
 /// Symbolic links are reported, not followed.
-pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, u8) bool) !void {
+pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
     // "root/." so that a root that is a link to a directory is followed
     let mut dot = mem.alloc.[u8](root.len + 2)!;
     defer mem.free(dot);
@@ -488,18 +502,18 @@ pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, u8) bool) !void {
 }
 
 // walk, for the open directory h, whose path is `at`.
-fn walk_at[C](h: i32, at: []u8, ctx: C, visit: fn(C, []u8, u8) bool) !void {
+fn walk_at[C](h: i32, at: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
     let mut d = read_dir_at(h)!;
     defer d.deinit();
     for e in d.entries.items() {
         let child = path.join2(at, e.name)!;
         defer mem.free(child);
         let mut kind = e.kind;
-        if kind == 0 {
+        if kind == Kind.UNKNOWN {
             let i = lstat(child) catch continue;
             kind = i.kind;
         }
-        if visit(ctx, child, kind) and (kind == DIR) {
+        if visit(ctx, child, kind) and (kind == Kind.DIR) {
             let c = ph_dir_open(h, e.name.ptr, e.name.len);
             if c < 0 {
                 if (c == -2) or (c == -20) or (c == -40) {
@@ -532,7 +546,7 @@ struct GlobState {
     failed: bool,
 }
 
-fn glob_visit(s: *mut GlobState, p: []u8, kind: u8) bool {
+fn glob_visit(s: *mut GlobState, p: []u8, kind: Kind) bool {
     if s.failed {
         return false;
     }
@@ -688,13 +702,15 @@ pub fn sync(f: io.File) !void {
 }
 
 /// Lock kinds, for lock and try_lock.
-pub const SHARED: u8 = 1;
-pub const EXCLUSIVE: u8 = 2;
+pub enum Lock: u8 {
+    SHARED = 1,
+    EXCLUSIVE = 2,
+}
 
 /// Takes an advisory lock on the whole file (flock), waiting while another
 /// process holds a conflicting one. Unsupported on the node host.
-pub fn lock(f: io.File, kind: u8) !void {
-    let r = ph_flock(f.fd, @as(u32, kind & 3));
+pub fn lock(f: io.File, kind: Lock) !void {
+    let r = ph_flock(f.fd, @as(u32, @int_from_enum(kind)));
     if r == -95 {
         return error.Unsupported;
     }
@@ -704,8 +720,8 @@ pub fn lock(f: io.File, kind: u8) !void {
 }
 
 /// lock, without waiting: false if another process holds a conflicting one.
-pub fn try_lock(f: io.File, kind: u8) !bool {
-    let r = ph_flock(f.fd, @as(u32, kind & 3) | 4);
+pub fn try_lock(f: io.File, kind: Lock) !bool {
+    let r = ph_flock(f.fd, @as(u32, @int_from_enum(kind)) | 4);
     if r == -95 {
         return error.Unsupported;
     }
@@ -763,7 +779,7 @@ pub struct Mapping {
 /// Maps the whole of the file at p (read-only unless writable).
 pub fn map(p: []u8, writable: bool) !Mapping {
     let info = stat(p)!;
-    if info.kind != FILE {
+    if info.kind != Kind.FILE {
         return error.IsDirectory;
     }
     let mut f = io.open(p) catch |e| return fail_io(e);
@@ -810,20 +826,22 @@ if e == error.AccessDenied {
 return error.IoError; }
 
 /// Kinds of change a Watcher reports.
-pub const MODIFIED: u8 = 1;
-pub const ATTRIBUTES: u8 = 2;  // permissions, times, ...
-pub const CREATED: u8 = 3;
-pub const REMOVED: u8 = 4;
-pub const MOVED_FROM: u8 = 5;    // renamed away (in a watched directory)
-pub const MOVED_TO: u8 = 6;      // renamed to here
-pub const SELF_REMOVED: u8 = 7;  // the watched file or directory itself
-pub const SELF_MOVED: u8 = 8;
+pub enum Change: u8 {
+    MODIFIED = 1,
+    ATTRIBUTES = 2,  // permissions, times, ...
+    CREATED = 3,
+    REMOVED = 4,
+    MOVED_FROM = 5,    // renamed away (in a watched directory)
+    MOVED_TO = 6,      // renamed to here
+    SELF_REMOVED = 7,  // the watched file or directory itself
+    SELF_MOVED = 8,
+}
 
 /// A change: in watched file or directory `watch` (as add returned it),
 /// to its entry `name` (empty for the watched file itself).
 pub struct Event {
     watch: i32,
-    kind: u8,
+    kind: Change,
     name: []u8,
 }
 
@@ -891,9 +909,8 @@ pub struct Watcher {
             }
             name = name[..k];
             i += 16 + len;
-            let kind = event_kind(mask);
-            if kind != 0 {
-                self.events.push(Event.{ watch: wd, kind: kind, name: name })!;
+            if (mask & REPORTED) != 0 {
+                self.events.push(Event.{ watch: wd, kind: event_kind(mask), name: name })!;
             }
         }
         return self.events.items();
@@ -904,40 +921,40 @@ fn le32(b: []u8, i: usize) u32 {
     return ((@as(u32, b[i]) | (@as(u32, b[i + 1]) << 8)) | (@as(u32, b[i + 2]) << 16)) | (@as(u32, b[i + 3]) << 24);
 }
 
-// inotify's mask bits to a kind (0: an event not reported)
-fn event_kind(mask: u32) u8 {
+// inotify's mask bits of the events reported.
+const REPORTED: u32 = 0xfc6;
+
+// inotify's mask bits to a kind (mask has one of the REPORTED bits).
+fn event_kind(mask: u32) Change {
     if (mask & 0x2) != 0 {
-        return MODIFIED;
+        return Change.MODIFIED;
     }
     if (mask & 0x4) != 0 {
-        return ATTRIBUTES;
+        return Change.ATTRIBUTES;
     }
     if (mask & 0x100) != 0 {
-        return CREATED;
+        return Change.CREATED;
     }
     if (mask & 0x200) != 0 {
-        return REMOVED;
+        return Change.REMOVED;
     }
     if (mask & 0x40) != 0 {
-        return MOVED_FROM;
+        return Change.MOVED_FROM;
     }
     if (mask & 0x80) != 0 {
-        return MOVED_TO;
+        return Change.MOVED_TO;
     }
     if (mask & 0x400) != 0 {
-        return SELF_REMOVED;
+        return Change.SELF_REMOVED;
     }
-    if (mask & 0x800) != 0 {
-        return SELF_MOVED;
-    }
-    return 0;
+    return Change.SELF_MOVED;  // 0x800
 }
 
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
-fn count_visit(n: *mut u32, p: []u8, kind: u8) bool {
+fn count_visit(n: *mut u32, p: []u8, kind: Kind) bool {
     n.* += 1;
     _ = p;
     _ = kind;
@@ -974,7 +991,7 @@ test "files and directories" {
     // seek and size
     let h = io.open(f)!;
     @expect_eq(h.size()!, 12);
-    _ = h.seek(7, io.SEEK_SET)!;
+    _ = h.seek(7, io.Whence.SET)!;
     let mut buf: [5]u8 = [0; 5];
     h.reader().read_exact(buf[..])!;
     @expect_eq(buf[..], "world");
@@ -1004,7 +1021,7 @@ test "files and directories" {
     defer d.deinit();
     @expect_eq(d.entries.len, 2);
     @expect_eq(d.entries.get(0).name, "a");
-    @expect_eq(d.entries.get(0).kind, DIR);
+    @expect(d.entries.get(0).kind == Kind.DIR);
     @expect_eq(d.entries.get(1).name, "moved.txt");
     let mut n: u32 = 0;
     walk(tmp, &mut n, count_visit)!;
@@ -1056,7 +1073,7 @@ test "permissions, links and times" {
     let t = read_link(l)!;
     defer mem.free(t);
     @expect_eq(t, "a.txt");
-    @expect((lstat(l)!.kind == SYMLINK) and (stat(l)!.kind == FILE));
+    @expect((lstat(l)!.kind == Kind.SYMLINK) and (stat(l)!.kind == Kind.FILE));
     let h = path.join2(dir, "hard")!;
     defer mem.free(h);
     hard_link(f, h)!;
@@ -1100,16 +1117,16 @@ test "locks and mappings" {
     let b = io.open(f)!;
     defer b.close();
     let mut supported = true;
-    lock(a, EXCLUSIVE) catch |e| {
+    lock(a, Lock.EXCLUSIVE) catch |e| {
         @expect(e == error.Unsupported);
         supported = false;
     };
     if supported {
         // (separate opens of a file have separate locks)
-        @expect(not try_lock(b, SHARED)!);
+        @expect(not try_lock(b, Lock.SHARED)!);
         unlock(a);
-        @expect(try_lock(b, SHARED)!);
-        @expect(try_lock(a, SHARED)!);
+        @expect(try_lock(b, Lock.SHARED)!);
+        @expect(try_lock(a, Lock.SHARED)!);
         unlock(a);
         unlock(b);
     }
@@ -1151,7 +1168,7 @@ test "watching" {
     for _k in @as(usize, 0)..20 {
         let evs = w.wait(200)!;
         for ev in evs {
-            if (ev.watch == id) and strs.eq(ev.name, "new.txt") and (ev.kind == CREATED) {
+            if (ev.watch == id) and strs.eq(ev.name, "new.txt") and (ev.kind == Change.CREATED) {
                 created = true;
             }
         }
@@ -1165,7 +1182,7 @@ test "watching" {
     for _k in @as(usize, 0)..20 {
         let evs = w.wait(200)!;
         for ev in evs {
-            if strs.eq(ev.name, "new.txt") and (ev.kind == REMOVED) {
+            if strs.eq(ev.name, "new.txt") and (ev.kind == Change.REMOVED) {
                 removed = true;
             }
         }

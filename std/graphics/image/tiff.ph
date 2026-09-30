@@ -535,7 +535,7 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
         } else if comp == 5 {
             _ = lzw_decode(src, out)!;
         } else if (comp == 8) or (comp == 32946) {
-            let z = deflate.decompress(src, deflate.ZLIB, out.len + 65536) catch |e| {
+            let z = deflate.decompress(src, deflate.Format.ZLIB, out.len + 65536) catch |e| {
                 if e == error.OutOfMemory {
                     return e;
                 }
@@ -1473,7 +1473,7 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
             } else if comp == Compression.LZW {
                 lzw_encode(sb, &mut packed)!;
             } else {
-                let z = deflate.compress(sb, deflate.ZLIB, deflate.DEFAULT_LEVEL)!;
+                let z = deflate.compress(sb, deflate.Format.ZLIB, deflate.DEFAULT_LEVEL)!;
                 defer mem.free(z);
                 packed.push_str(z)!;
             }

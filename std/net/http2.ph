@@ -860,7 +860,7 @@ fn swrite(ctx: *mut void, bytes: []u8) !usize {
 }
 
 fn pair(p: *mut Pair) !void {
-    let l = net.listen_addr(net.Addr.loopback(4, 0))!;
+    let l = net.listen_addr(net.Addr.loopback(net.Family.V4, 0))!;
     defer l.close();
     p.a = net.connect_addr(l.local_addr()!)!;
     p.b = l.accept()!;

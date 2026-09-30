@@ -346,10 +346,10 @@ pub struct File {
     }
 
     /// Moves the position for the next read or write to `off` bytes from
-    /// the start (whence 0: SEEK_SET), the current position (1) or the end
-    /// (2); returns the new position.
-    pub fn seek(self: File, off: i64, whence: u32) !u64 {
-        let r = ph_seek(self.fd, off, whence);
+    /// the start (Whence.SET), the current position (Whence.CUR) or the end
+    /// (Whence.END); returns the new position.
+    pub fn seek(self: File, off: i64, whence: Whence) !u64 {
+        let r = ph_seek(self.fd, off, @int_from_enum(whence));
         if r < 0 {
             return error.IoError;
         }
@@ -358,21 +358,24 @@ pub struct File {
 
     /// The current position.
     pub fn position(self: File) !u64 {
-        return self.seek(0, SEEK_CUR);
+        return self.seek(0, Whence.CUR);
     }
 
     /// The file's size (the position is kept).
     pub fn size(self: File) !u64 {
-        let here = self.seek(0, SEEK_CUR)!;
-        let end = self.seek(0, SEEK_END)!;
-        _ = self.seek(@bit_cast(i64, here), SEEK_SET)!;
+        let here = self.seek(0, Whence.CUR)!;
+        let end = self.seek(0, Whence.END)!;
+        _ = self.seek(@bit_cast(i64, here), Whence.SET)!;
         return end;
     }
 }
 
-pub const SEEK_SET: u32 = 0;
-pub const SEEK_CUR: u32 = 1;
-pub const SEEK_END: u32 = 2;
+/// Where File.seek counts from.
+pub enum Whence: u32 {
+    SET = 0,  // the start
+    CUR = 1,  // the current position
+    END = 2,
+}
 
 const OPEN_READ: u32 = 0;
 const OPEN_WRITE: u32 = 1;   // create or truncate

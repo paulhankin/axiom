@@ -8,8 +8,8 @@
 //     let mut c = decimal.Decimal.init();
 //     defer c.deinit();
 //     c.add(&a, &b)!;                          // exactly 0.3
-//     c.div(&a, &b, 28, decimal.HALF_EVEN)!;   // 28 significant digits
-//     c.round(&c, 2, decimal.HALF_UP)!;        // two decimal places
+//     c.div(&a, &b, 28, decimal.Rounding.HALF_EVEN)!;  // 28 significant digits
+//     c.round(&c, 2, decimal.Rounding.HALF_UP)!;       // two decimal places
 //     let s = c.to_string()!;                  // mem.free(s)
 //
 // A Decimal is a coefficient (a BigInt) times a power of ten, so decimal
@@ -38,20 +38,16 @@ import "bigint.ph" as bigint;
 
 error { InvalidNumber, Overflow, DivisionByZero, OutOfRange, OutOfMemory }
 
-/// Rounding modes: to the nearest, ties to even (banker's rounding) ...
-pub const HALF_EVEN: u8 = 0;
-/// ... to the nearest, ties away from zero (school rounding) ...
-pub const HALF_UP: u8 = 1;
-/// ... to the nearest, ties toward zero ...
-pub const HALF_DOWN: u8 = 2;
-/// ... toward zero (truncation) ...
-pub const DOWN: u8 = 3;
-/// ... away from zero ...
-pub const UP: u8 = 4;
-/// ... toward minus infinity ...
-pub const FLOOR: u8 = 5;
-/// ... and toward plus infinity.
-pub const CEILING: u8 = 6;
+/// Rounding modes.
+pub enum Rounding: u8 {
+    HALF_EVEN = 0,  // to the nearest, ties to even (banker's rounding)
+    HALF_UP = 1,    // to the nearest, ties away from zero (school rounding)
+    HALF_DOWN = 2,  // to the nearest, ties toward zero
+    DOWN = 3,       // toward zero (truncation)
+    UP = 4,         // away from zero
+    FLOOR = 5,      // toward minus infinity
+    CEILING = 6,    // toward plus infinity
+}
 
 /// The most digits a result may have.
 pub const MAX_DIGITS: u64 = 1000000;
@@ -289,7 +285,7 @@ pub struct Decimal {
     /// self = x / y, rounded to prec significant digits (1 or more). An
     /// exact quotient keeps no more trailing zeros than it needs to reach
     /// the exponent x.exp - y.exp (so 1.00 / 4 is 0.25 and 10 / 5 is 2).
-    pub fn div(self: *mut Decimal, x: *Decimal, y: *Decimal, prec: u32, mode: u8) !void {
+    pub fn div(self: *mut Decimal, x: *Decimal, y: *Decimal, prec: u32, mode: Rounding) !void {
         if y.coef.is_zero() {
             return error.DivisionByZero;
         }
@@ -341,7 +337,7 @@ pub struct Decimal {
             e += @as(i64, @int_cast(u32, k));
             // rounding up can make a digit more (999 -> 1000)
             if digit_count(&q)! > @as(usize, prec) {
-                round_drop(&mut q, 1, DOWN)!;
+                round_drop(&mut q, 1, Rounding.DOWN)!;
                 e += 1;
             }
         }
@@ -394,10 +390,10 @@ pub struct Decimal {
         let nd = digit_count(&r)!;
         if nd > @as(usize, prec) {
             let k = nd - @as(usize, prec);
-            round_drop(&mut r, @as(u64, k), HALF_EVEN)!;
+            round_drop(&mut r, @as(u64, k), Rounding.HALF_EVEN)!;
             e += @as(i64, @int_cast(u32, k));
             if digit_count(&r)! > @as(usize, prec) {
-                round_drop(&mut r, 1, DOWN)!;
+                round_drop(&mut r, 1, Rounding.DOWN)!;
                 e += 1;
             }
         }
@@ -410,7 +406,7 @@ pub struct Decimal {
 
     /// self = x rounded to the exponent exp (so to -exp decimal places);
     /// a larger x.exp adds trailing zeros.
-    pub fn quantize(self: *mut Decimal, x: *Decimal, exp: i64, mode: u8) !void {
+    pub fn quantize(self: *mut Decimal, x: *Decimal, exp: i64, mode: Rounding) !void {
         if (exp > MAX_EXP) or (exp < -MAX_EXP) {
             return error.Overflow;
         }
@@ -423,7 +419,9 @@ pub struct Decimal {
                 let s = x.coef.sign();
                 self.coef.set_i64(0)!;
                 // (x is below half a unit, so only UP, CEILING and FLOOR round it up)
-                if (s != 0) and (((mode == UP) or ((mode == CEILING) and (s > 0))) or ((mode == FLOOR) and (s < 0))) {
+                if (s != 0) and
+                   (((mode == Rounding.UP) or ((mode == Rounding.CEILING) and (s > 0))) or
+                    ((mode == Rounding.FLOOR) and (s < 0))) {
                     self.coef.set_i64(@as(i64, s))!;
                 }
             } else {
@@ -444,13 +442,13 @@ pub struct Decimal {
 
     /// self = x rounded to `places` decimal places (negative: to tens,
     /// hundreds, ...).
-    pub fn round(self: *mut Decimal, x: *Decimal, places: i64, mode: u8) !void {
+    pub fn round(self: *mut Decimal, x: *Decimal, places: i64, mode: Rounding) !void {
         self.quantize(x, -places, mode)!;
     }
 
     /// self = x rounded to prec significant digits (unchanged if it has
     /// no more).
-    pub fn round_sig(self: *mut Decimal, x: *Decimal, prec: u32, mode: u8) !void {
+    pub fn round_sig(self: *mut Decimal, x: *Decimal, prec: u32, mode: Rounding) !void {
         if prec == 0 {
             return error.OutOfRange;
         }
@@ -463,7 +461,7 @@ pub struct Decimal {
         round_drop(&mut self.coef, @as(u64, k), mode)!;
         self.exp = clamp_exp(x.exp + @as(i64, @int_cast(u32, k)))!;
         if digit_count(&self.coef)! > @as(usize, prec) {
-            round_drop(&mut self.coef, 1, DOWN)!;
+            round_drop(&mut self.coef, 1, Rounding.DOWN)!;
             self.exp = clamp_exp(self.exp + 1)!;
         }
     }
@@ -490,7 +488,7 @@ pub struct Decimal {
             }
             return error.Overflow;
         }
-        t.quantize(self, 0, DOWN)!;
+        t.quantize(self, 0, Rounding.DOWN)!;
         return t.coef.to_i64() catch return error.Overflow;
     }
 
@@ -680,7 +678,7 @@ fn align(a: *bigint.BigInt, ea: i64, b: *bigint.BigInt, eb: i64, u: *mut bigint.
 }
 
 // q = q / 10^k, rounded by mode (k >= 1).
-fn round_drop(q: *mut bigint.BigInt, k: u64, mode: u8) !void {
+fn round_drop(q: *mut bigint.BigInt, k: u64, mode: Rounding) !void {
     let neg = q.sign() < 0;
     let mut d = pow10(k)!;
     defer d.deinit();
@@ -697,17 +695,17 @@ fn round_drop(q: *mut bigint.BigInt, k: u64, mode: u8) !void {
         r2.shl(&r2, 1)!;
         let half = r2.cmp_abs(&d);  // <0: below half, 0: exactly half
         let mut up = false;
-        if mode == UP {
+        if mode == Rounding.UP {
             up = true;
-        } else if mode == CEILING {
+        } else if mode == Rounding.CEILING {
             up = not neg;
-        } else if mode == FLOOR {
+        } else if mode == Rounding.FLOOR {
             up = neg;
-        } else if mode == HALF_UP {
+        } else if mode == Rounding.HALF_UP {
             up = half >= 0;
-        } else if mode == HALF_DOWN {
+        } else if mode == Rounding.HALF_DOWN {
             up = half > 0;
-        } else if mode == HALF_EVEN {
+        } else if mode == Rounding.HALF_EVEN {
             up = (half > 0) or ((half == 0) and quo.is_odd());
         }
         if up {
@@ -895,7 +893,7 @@ test "division and roots" {
         defer b.deinit();
         let mut q = Decimal.init();
         defer q.deinit();
-        q.div(&a, &b, fmt.parse_int.[u32](cs[2])!, HALF_EVEN)!;
+        q.div(&a, &b, fmt.parse_int.[u32](cs[2])!, Rounding.HALF_EVEN)!;
         if not is(&q, cs[3]) {
             @expect_eq(k, 99);
         }
@@ -906,7 +904,7 @@ test "division and roots" {
     defer o.deinit();
     let mut q = Decimal.init();
     defer q.deinit();
-    @expect(fails(q.div(&o, &z, 10, HALF_EVEN)));
+    @expect(fails(q.div(&o, &z, 10, Rounding.HALF_EVEN)));
     // Python: getcontext().prec = p; str(Decimal(a).sqrt())
     let roots: [7][3][]u8 = [
         ["2", "28", "1.414213562373095048801688724"],
@@ -949,7 +947,7 @@ test "rounding" {
         let mut v = dec(vs[k]);
         defer v.deinit();
         for m in @as(usize, 0)..7 {
-            r.round(&v, 1, @truncate(u8, m))!;
+            r.round(&v, 1, @enum_from_int(Rounding, m))!;
             if not is(&r, want[k][m]) {
                 @expect_eq((k * 10) + m, 99);
             }
@@ -958,23 +956,23 @@ test "rounding" {
     // rounding far past every digit, and adding places
     let mut v = dec("0.0004");
     defer v.deinit();
-    r.round(&v, 1, UP)!;
+    r.round(&v, 1, Rounding.UP)!;
     @expect(is(&r, "0.1"));
-    r.round(&v, 1, HALF_UP)!;
+    r.round(&v, 1, Rounding.HALF_UP)!;
     @expect(is(&r, "0.0"));
-    r.round(&v, 6, HALF_UP)!;
+    r.round(&v, 6, Rounding.HALF_UP)!;
     @expect(is(&r, "0.000400"));
     let mut w = dec("1234.5");
     defer w.deinit();
-    r.round(&w, -2, HALF_EVEN)!;
+    r.round(&w, -2, Rounding.HALF_EVEN)!;
     @expect(is(&r, "1.2E+3"));
-    r.round_sig(&w, 3, HALF_EVEN)!;
+    r.round_sig(&w, 3, Rounding.HALF_EVEN)!;
     @expect(is(&r, "1.23E+3"));
     let mut nines = dec("9.99");
     defer nines.deinit();
-    r.round_sig(&nines, 2, HALF_UP)!;
+    r.round_sig(&nines, 2, Rounding.HALF_UP)!;
     @expect(is(&r, "10"));
-    r.round(&nines, 1, HALF_UP)!;
+    r.round(&nines, 1, Rounding.HALF_UP)!;
     @expect(is(&r, "10.0"));
 }
 
@@ -992,7 +990,7 @@ test "against Python's decimal" {
         let mut b = Decimal.parse(f.next()!)!;
         defer b.deinit();
         let n = fmt.parse_int.[i64](f.next()!)!;
-        let mode = fmt.parse_int.[u8](f.next()!)!;
+        let mode = @enum_from_int(Rounding, fmt.parse_int.[u8](f.next()!)!);
         let want = f.next()!;
         let mut r = Decimal.init();
         defer r.deinit();

@@ -87,44 +87,52 @@ let OID_COMMON_NAME: []u8 = "\x55\x04\x03";
 // Public keys and signatures
 // -----------------------------------------------------------------------------
 
-pub const KEY_RSA: u8 = 1;
-pub const KEY_P256: u8 = 2;
-pub const KEY_P384: u8 = 3;
-pub const KEY_ED25519: u8 = 4;
+/// Kinds of public key.
+pub enum KeyKind: u8 {
+    UNSUPPORTED = 0,
+    RSA = 1,
+    P256 = 2,
+    P384 = 3,
+    ED25519 = 4,
+}
 
-pub const SIG_RSA_PKCS1: u8 = 1;
-pub const SIG_RSA_PSS: u8 = 2;
-pub const SIG_ECDSA: u8 = 3;
-pub const SIG_ED25519: u8 = 4;
+/// Signature algorithms (the hash is separate: a sha2.Algorithm).
+pub enum SigAlg: u8 {
+    UNSUPPORTED = 0,
+    RSA_PKCS1 = 1,
+    RSA_PSS = 2,
+    ECDSA = 3,
+    ED25519 = 4,
+}
 
 /// A public key, as views into the certificate or buffer it came from.
 pub struct PublicKey {
-    kind: u8,     // KEY_*, or 0 if unsupported
+    kind: KeyKind,
     point: []u8,  // an EC point or Ed25519 key
     n: []u8,      // RSA modulus
     e: []u8,      // RSA exponent
 
     /// Whether sig is a signature of message with the given algorithm
-    /// (SIG_*) and hash (sha2.SHA256, ...; ignored for Ed25519).
-    pub fn verify(self: *PublicKey, alg: u8, hash: u8, message: []u8, sig: []u8) bool {
-        if alg == SIG_ED25519 {
-            return (self.kind == KEY_ED25519) and curve25519.ed25519_verify(self.point, message, sig);
+    /// and hash (ignored for Ed25519).
+    pub fn verify(self: *PublicKey, alg: SigAlg, hash: sha2.Algorithm, message: []u8, sig: []u8) bool {
+        if alg == SigAlg.ED25519 {
+            return (self.kind == KeyKind.ED25519) and curve25519.ed25519_verify(self.point, message, sig);
         }
         let mut digest: [64]u8 = [0; 64];
         let dl = sha2.digest_size(hash);
         sha2.hash(hash, message, digest[..]);
-        if (alg == SIG_RSA_PKCS1) or (alg == SIG_RSA_PSS) {
-            if self.kind != KEY_RSA {
+        if (alg == SigAlg.RSA_PKCS1) or (alg == SigAlg.RSA_PSS) {
+            if self.kind != KeyKind.RSA {
                 return false;
             }
             let mut pk = rsa.PublicKey.from_bytes(self.n, self.e) catch return false;
             defer pk.deinit();
-            if alg == SIG_RSA_PKCS1 {
+            if alg == SigAlg.RSA_PKCS1 {
                 return rsa.verify_pkcs1v15(&pk, hash, digest[..dl], sig);
             }
             return rsa.verify_pss(&pk, hash, digest[..dl], sig);
         }
-        if alg == SIG_ECDSA {
+        if alg == SigAlg.ECDSA {
             return self.verify_ecdsa_raw(digest[..dl], sig);
         }
         return false;
@@ -133,9 +141,9 @@ pub struct PublicKey {
     /// ECDSA with a DER signature (SEQUENCE { r, s }) over a digest.
     fn verify_ecdsa_raw(self: *PublicKey, digest: []u8, sig: []u8) bool {
         let mut size: usize = 32;
-        if self.kind == KEY_P384 {
+        if self.kind == KeyKind.P384 {
             size = 48;
-        } else if self.kind != KEY_P256 {
+        } else if self.kind != KeyKind.P256 {
             return false;
         }
         let mut rs: [96]u8 = [0; 96];
@@ -148,7 +156,7 @@ pub struct PublicKey {
         }
         @mem_copy(rs[size - r.len..size], r);
         @mem_copy(rs[(2 * size) - s.len..2 * size], s);
-        if self.kind == KEY_P256 {
+        if self.kind == KeyKind.P256 {
             return ec.verify_p256(self.point, digest, rs[..64]);
         }
         return ec.verify_p384(self.point, digest, rs[..96]);
@@ -162,53 +170,54 @@ pub fn parse_spki(spki: []u8) !PublicKey {
     let mut alg = seq.sequence()!;
     let oid = alg.oid()!;
     let bits = seq.bit_string()!;
-    let mut k = PublicKey.{ kind: 0, point: bits, n: "", e: "" };
+    let mut k = PublicKey.{ kind: KeyKind.UNSUPPORTED, point: bits, n: "", e: "" };
     if @mem_eq(oid, OID_RSA) {
         let mut kr = der.Reader.init(bits);
         let mut ks = kr.sequence()!;
         k.n = ks.integer()!;
         k.e = ks.integer()!;
-        k.kind = KEY_RSA;
+        k.kind = KeyKind.RSA;
     } else if @mem_eq(oid, OID_EC) {
         let curve = alg.oid() catch "";
         if @mem_eq(curve, OID_P256) and (bits.len == 65) {
-            k.kind = KEY_P256;
+            k.kind = KeyKind.P256;
         } else if @mem_eq(curve, OID_P384) and (bits.len == 97) {
-            k.kind = KEY_P384;
+            k.kind = KeyKind.P384;
         }
     } else if @mem_eq(oid, OID_ED25519) and (bits.len == 32) {
-        k.kind = KEY_ED25519;
+        k.kind = KeyKind.ED25519;
     }
     return k;
 }
 
 /// The algorithm and hash of an AlgorithmIdentifier for a signature.
-fn parse_sig_alg(alg_der: []u8, alg: *mut u8, hash: *mut u8) !void {
+/// (The hash is SHA-256, and ignored, for Ed25519 and unsupported ones.)
+fn parse_sig_alg(alg_der: []u8, alg: *mut SigAlg, hash: *mut sha2.Algorithm) !void {
     let mut r = der.Reader.init(alg_der);
     let mut seq = r.sequence()!;
     let oid = seq.oid()!;
-    alg.* = 0;
-    hash.* = 0;
+    alg.* = SigAlg.UNSUPPORTED;
+    hash.* = sha2.Algorithm.SHA256;
     if @mem_eq(oid, OID_RSA_SHA256) {
-        alg.* = SIG_RSA_PKCS1;
-        hash.* = sha2.SHA256;
+        alg.* = SigAlg.RSA_PKCS1;
+        hash.* = sha2.Algorithm.SHA256;
     } else if @mem_eq(oid, OID_RSA_SHA384) {
-        alg.* = SIG_RSA_PKCS1;
-        hash.* = sha2.SHA384;
+        alg.* = SigAlg.RSA_PKCS1;
+        hash.* = sha2.Algorithm.SHA384;
     } else if @mem_eq(oid, OID_RSA_SHA512) {
-        alg.* = SIG_RSA_PKCS1;
-        hash.* = sha2.SHA512;
+        alg.* = SigAlg.RSA_PKCS1;
+        hash.* = sha2.Algorithm.SHA512;
     } else if @mem_eq(oid, OID_ECDSA_SHA256) {
-        alg.* = SIG_ECDSA;
-        hash.* = sha2.SHA256;
+        alg.* = SigAlg.ECDSA;
+        hash.* = sha2.Algorithm.SHA256;
     } else if @mem_eq(oid, OID_ECDSA_SHA384) {
-        alg.* = SIG_ECDSA;
-        hash.* = sha2.SHA384;
+        alg.* = SigAlg.ECDSA;
+        hash.* = sha2.Algorithm.SHA384;
     } else if @mem_eq(oid, OID_ECDSA_SHA512) {
-        alg.* = SIG_ECDSA;
-        hash.* = sha2.SHA512;
+        alg.* = SigAlg.ECDSA;
+        hash.* = sha2.Algorithm.SHA512;
     } else if @mem_eq(oid, OID_ED25519) {
-        alg.* = SIG_ED25519;
+        alg.* = SigAlg.ED25519;
     } else if @mem_eq(oid, OID_RSA_PSS) {
         // RSASSA-PSS-params: [0] hashAlgorithm (the default, SHA-1, is refused)
         let mut params = seq.sequence()!;
@@ -217,14 +226,14 @@ fn parse_sig_alg(alg_der: []u8, alg: *mut u8, hash: *mut u8) !void {
             let mut ha = h0.sequence()!;
             let hoid = ha.oid()!;
             if @mem_eq(hoid, OID_SHA256) {
-                hash.* = sha2.SHA256;
+                alg.* = SigAlg.RSA_PSS;
+                hash.* = sha2.Algorithm.SHA256;
             } else if @mem_eq(hoid, OID_SHA384) {
-                hash.* = sha2.SHA384;
+                alg.* = SigAlg.RSA_PSS;
+                hash.* = sha2.Algorithm.SHA384;
             } else if @mem_eq(hoid, OID_SHA512) {
-                hash.* = sha2.SHA512;
-            }
-            if hash.* != 0 {
-                alg.* = SIG_RSA_PSS;
+                alg.* = SigAlg.RSA_PSS;
+                hash.* = sha2.Algorithm.SHA512;
             }
         }
     }
@@ -248,8 +257,8 @@ pub struct Certificate {
     not_after: time.Time,
     key: PublicKey,
     spki: []u8,
-    sig_alg: u8,  // SIG_* (0: unsupported)
-    sig_hash: u8,
+    sig_alg: SigAlg,
+    sig_hash: sha2.Algorithm,
     signature: []u8,
     is_ca: bool,
     max_path_len: i32,  // -1: unlimited
@@ -275,10 +284,10 @@ pub struct Certificate {
             common_name: "",
             not_before: time.Time.from_unix(0, 0),
             not_after: time.Time.from_unix(0, 0),
-            key: PublicKey.{ kind: 0, point: "", n: "", e: "" },
+            key: PublicKey.{ kind: KeyKind.UNSUPPORTED, point: "", n: "", e: "" },
             spki: "",
-            sig_alg: 0,
-            sig_hash: 0,
+            sig_alg: SigAlg.UNSUPPORTED,
+            sig_hash: sha2.Algorithm.SHA256,
             signature: "",
             is_ca: false,
             max_path_len: -1,
@@ -479,7 +488,7 @@ pub struct Certificate {
 
     /// Whether issuer's key made this certificate's signature.
     pub fn signed_by(self: *Certificate, issuer: *Certificate) bool {
-        if self.sig_alg == 0 {
+        if self.sig_alg == SigAlg.UNSUPPORTED {
             return false;
         }
         return issuer.key.verify(self.sig_alg, self.sig_hash, self.tbs, self.signature);
@@ -1243,9 +1252,9 @@ test "parse certificates" {
     let mut leaf = cert_of(LEAF_PEM[..])!;
     defer leaf.deinit();
     @expect_eq(leaf.common_name, "example.test");
-    @expect_eq(leaf.key.kind, KEY_P256);
-    @expect_eq(leaf.sig_alg, SIG_ECDSA);
-    @expect_eq(leaf.sig_hash, sha2.SHA384);
+    @expect(leaf.key.kind == KeyKind.P256);
+    @expect(leaf.sig_alg == SigAlg.ECDSA);
+    @expect(leaf.sig_hash == sha2.Algorithm.SHA384);
     @expect(not leaf.is_ca);
     @expect_eq(leaf.dns_names.len, 2);
     @expect(leaf.matches_host("example.test"));
@@ -1257,20 +1266,20 @@ test "parse certificates" {
     @expect(not leaf.matches_host("127.0.0.2"));
     let mut inter = cert_of(INTER_PEM[..])!;
     defer inter.deinit();
-    @expect_eq(inter.key.kind, KEY_P384);
+    @expect(inter.key.kind == KeyKind.P384);
     @expect(inter.is_ca);
     @expect_eq(inter.max_path_len, 0);
     @expect(leaf.signed_by(&inter));
     let mut root = cert_of(ROOT_PEM[..])!;
     defer root.deinit();
-    @expect_eq(root.key.kind, KEY_RSA);
+    @expect(root.key.kind == KeyKind.RSA);
     @expect(inter.signed_by(&root));
     @expect(not leaf.signed_by(&root));
     @expect(root.signed_by(&root));
     let mut ed = cert_of(ED_PEM[..])!;
     defer ed.deinit();
-    @expect_eq(ed.key.kind, KEY_ED25519);
-    @expect_eq(ed.sig_alg, SIG_RSA_PSS);
+    @expect(ed.key.kind == KeyKind.ED25519);
+    @expect(ed.sig_alg == SigAlg.RSA_PSS);
     @expect(ed.signed_by(&root));
 }
 
@@ -1354,8 +1363,8 @@ test "private keys" {
             let mut digest: [32]u8 = [0; 32];
             sha2.sha256("msg", digest[..]);
             let mut sig: [256]u8 = [0; 256];
-            s.sign_pss(sha2.SHA256, digest[..], sig[..])!;
-            @expect(root.key.verify(SIG_RSA_PSS, sha2.SHA256, "msg", sig[..]));
+            s.sign_pss(sha2.Algorithm.SHA256, digest[..], sig[..])!;
+            @expect(root.key.verify(SigAlg.RSA_PSS, sha2.Algorithm.SHA256, "msg", sig[..]));
         }
         else => { @trap(); }
     }

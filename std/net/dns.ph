@@ -87,7 +87,7 @@ pub struct Resolver {
 
     /// The name servers of /etc/resolv.conf (NoServers if it names none).
     pub fn system() !Resolver {
-        let mut r = Resolver.{ servers: [net.Addr.any(4, 0); 4], count: 0, timeout_ms: 2000, attempts: 2 };
+        let mut r = Resolver.{ servers: [net.Addr.any(net.Family.V4, 0); 4], count: 0, timeout_ms: 2000, attempts: 2 };
         let text = fs.read_file("/etc/resolv.conf") catch return error.NoServers;
         defer mem.free(text);
         let mut ls = strs.lines(text);
@@ -112,7 +112,7 @@ pub struct Resolver {
 
     /// Public resolvers: Cloudflare, Google and Quad9.
     pub fn public() Resolver {
-        let mut r = Resolver.{ servers: [net.Addr.any(4, 0); 4], count: 3, timeout_ms: 2000, attempts: 2 };
+        let mut r = Resolver.{ servers: [net.Addr.any(net.Family.V4, 0); 4], count: 3, timeout_ms: 2000, attempts: 2 };
         r.servers[0] = net.Addr.v4(1, 1, 1, 1, 53);
         r.servers[1] = net.Addr.v4(8, 8, 8, 8, 53);
         r.servers[2] = net.Addr.v4(9, 9, 9, 9, 53);
@@ -121,7 +121,7 @@ pub struct Resolver {
 
     /// One server (a port of 0 means 53).
     pub fn with_server(a: net.Addr) Resolver {
-        let mut r = Resolver.{ servers: [net.Addr.any(4, 0); 4], count: 1, timeout_ms: 2000, attempts: 2 };
+        let mut r = Resolver.{ servers: [net.Addr.any(net.Family.V4, 0); 4], count: 1, timeout_ms: 2000, attempts: 2 };
         r.servers[0] = a;
         if a.port == 0 {
             r.servers[0].port = 53;
@@ -163,7 +163,7 @@ pub struct Resolver {
         let mut buf: [1232]u8 = [0; 1232];
         // (ignore stray and forged datagrams until the timeout)
         for _k in @as(usize, 0)..16 {
-            let mut from = net.Addr.any(4, 0);
+            let mut from = net.Addr.any(net.Family.V4, 0);
             let n = sock.recv_from(buf[..], &mut from) catch |e| {
                 if e == error.TimedOut {
                     return error.TimedOut;
@@ -233,7 +233,7 @@ pub struct Resolver {
 pub fn reverse_name(a: net.Addr, out: *mut strs.String) !void {
     let hex = "0123456789abcdef";
     let mut buf: [4]u8 = [0; 4];
-    if a.family == 4 {
+    if a.family == net.Family.V4 {
         let mut k: usize = 4;
         while k > 0 {
             k -= 1;
@@ -483,8 +483,9 @@ fn parse_records(r: *mut Response) !void {
                 return error.BadResponse;
             }
             let data = b[i..i + rdlen];
-            let mut rec = Record.{ name: "", rtype: rtype, class: class, ttl: ttl, data: data, addr: net.Addr.any(4, 0),
-                                   target: "", priority: 0, weight: 0, port: 0, text: "" };
+            let mut rec = Record.{ name: "", rtype: rtype, class: class, ttl: ttl, data: data,
+                                   addr: net.Addr.any(net.Family.V4, 0), target: "", priority: 0, weight: 0, port: 0,
+                                   text: "" };
             if (rtype == A) and (rdlen == 4) {
                 rec.addr = net.Addr.v4(data[0], data[1], data[2], data[3], 0);
             } else if (rtype == AAAA) and (rdlen == 16) {
@@ -708,7 +709,7 @@ fn reply_to(q: []u8, full: bool, id: u16, out: *mut strs.String) !bool {
 fn serve(s: *mut Server) void {
     let mut buf: [512]u8 = [0; 512];
     loop {
-        let mut from = net.Addr.any(4, 0);
+        let mut from = net.Addr.any(net.Family.V4, 0);
         let n = s.udp.recv_from(buf[..], &mut from) catch return;
         let q = buf[..n];
         let mut name = strs.String.init();
@@ -750,14 +751,14 @@ fn serve(s: *mut Server) void {
 }
 
 test "queries against a server" {
-    let udp = net.UdpSocket.bind(net.Addr.loopback(4, 0))!;
+    let udp = net.UdpSocket.bind(net.Addr.loopback(net.Family.V4, 0))!;
     defer udp.close();
     let port = udp.local_addr()!.port;
-    let tcp = net.listen_addr(net.Addr.loopback(4, port))!;
+    let tcp = net.listen_addr(net.Addr.loopback(net.Family.V4, port))!;
     defer tcp.close();
     let mut srv = Server.{ udp: udp, tcp: tcp, port: port, served: 0 };
     let t = thread.spawn(serve, &mut srv)!;
-    let mut r = Resolver.with_server(net.Addr.loopback(4, port));
+    let mut r = Resolver.with_server(net.Addr.loopback(net.Family.V4, port));
     r.timeout_ms = 1000;
     let mut a = r.query("example.test", A)!;
     @expect((a.answers.len == 1) and a.answers.get(0).addr.eq(net.Addr.v4(93, 184, 216, 34, 0)));
@@ -778,7 +779,7 @@ test "queries against a server" {
     @expect((ips.len == 1) and ips[0].eq(net.Addr.v4(93, 184, 216, 34, 0)));
     mem.free(ips);
     let both = r.lookup_ip("example.test")!;
-    @expect((both.len == 2) and (both[1].family == 6));
+    @expect((both.len == 2) and (both[1].family == net.Family.V6));
     mem.free(both);
     @expect(not_found(r.query("missing.test", A)));
     // a truncated answer, then over TCP

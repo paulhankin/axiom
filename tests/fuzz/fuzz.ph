@@ -70,13 +70,13 @@ fn run(t: []u8, d: []u8) !void {
         let mut s = audio_formats.decode(d)!;
         s.deinit();
     } else if strs.eq(t, "deflate") {
-        let formats: [3]u8 = [deflate.RAW, deflate.ZLIB, deflate.GZIP];
+        let formats: [3]deflate.Format = [deflate.Format.RAW, deflate.Format.ZLIB, deflate.Format.GZIP];
         for f in formats {
             let out = deflate.decompress(d, f, 1 << 24) catch continue;
             mem.free(out);
         }
         let mut sr = io.SliceReader.init(d);
-        let dec = deflate.Decompressor.init(sr.reader(), deflate.GZIP)!;
+        let dec = deflate.Decompressor.init(sr.reader(), deflate.Format.GZIP)!;
         let mut buf: [4096]u8 = [0; 4096];
         let mut total: usize = 0;
         while total < (1 << 24) {
@@ -262,7 +262,7 @@ fn seeds(dir: []u8) !void {
     // compressed data
     let text =
         "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog again, and again: 0123456789 abcdefghijklmnopqrstuvwxyz";
-    let dfmts: [3]u8 = [deflate.RAW, deflate.ZLIB, deflate.GZIP];
+    let dfmts: [3]deflate.Format = [deflate.Format.RAW, deflate.Format.ZLIB, deflate.Format.GZIP];
     let dnames: [3][]u8 = ["raw", "zlib", "gzip"];
     for k in @as(usize, 0)..3 {
         let levels: [2]u32 = [1, 9];
