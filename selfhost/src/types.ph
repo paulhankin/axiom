@@ -278,6 +278,13 @@ pub fn type_named(d: *mut ast.Decl, args: []mut *mut ast.Type) *mut ast.Type {
     return intern_type(&p);
 }
 
+pub fn type_enum(d: *mut ast.Decl, repr: *mut ast.Type) *mut ast.Type {
+    let mut p = blank(ast.TY_ENUM);
+    p.decl = d;
+    p.elem = repr;
+    return intern_type(&p);
+}
+
 pub fn type_errunion(elem: *mut ast.Type) *mut ast.Type {
     let mut p = blank(ast.TY_ERRUNION);
     p.elem = elem;
@@ -645,6 +652,8 @@ fn tstr(b: *mut u.Buf, t: *ast.Type) void {
             }
             b.s("]");
         }
+    } else if k == ast.TY_ENUM {
+        b.s(t.decl.name);
     } else if k == ast.TY_ERRUNION {
         b.s("!");
         tstr(b, t.elem);
@@ -759,6 +768,9 @@ fn layout(t: *mut ast.Type) void {
     } else if k == ast.TY_ERROR {
         t.size = 2;
         t.align = 2;
+    } else if k == ast.TY_ENUM {
+        t.size = @as(i64, t.elem.bits / 8);
+        t.align = t.size;
     } else if k == ast.TY_ARRAY {
         t.align = type_align(t.elem);
         t.size = t.len * type_size(t.elem);
@@ -884,7 +896,7 @@ pub fn satisfies(t: *ast.Type, c: i32) bool {
     }
     if c == ast.C_EQ {
         return (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_BOOL) or (k == ast.TY_PTR) or
-               (k == ast.TY_ERROR) or (k == ast.TY_FN);
+               (k == ast.TY_ERROR) or (k == ast.TY_FN) or (k == ast.TY_ENUM);
     }
     if (c == ast.C_ORD) or (c == ast.C_NUM) {
         return (k == ast.TY_INT) or (k == ast.TY_FLOAT);

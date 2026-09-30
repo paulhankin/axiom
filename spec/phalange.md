@@ -109,9 +109,10 @@ A lone `_` is the **discard token** (§8.2). It is not an identifier.
 
 ```
 and       as        break     catch     const     continue  defer     else
-error     export    extern    false     fn        for       host      if
-import    in        let       loop      match     mut       not       or
-pub       return    Self      struct    test      true      union     while
+enum      error     export    extern    false     fn        for       host
+if        import    in        let       loop      match     mut       not
+or        pub       return    Self      struct    test      true      union
+while
 ```
 
 **Reserved type names.** These lex as keywords:
@@ -124,8 +125,8 @@ i8x16  u8x16  i16x8  u16x8  i32x4  u32x4  i64x2  u64x2  f32x4  f64x2  v128
 **Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
 `UnsignedInt`, `Float`. These may not be declared as identifiers.
 
-**Reserved for future use:** `async`, `await`, `comptime`, `enum`, `impl`,
-`interface`, `null`, `trait`, `type`, `unsafe`, `yield`.
+**Reserved for future use:** `async`, `await`, `comptime`, `impl`, `interface`,
+`null`, `trait`, `type`, `unsafe`, `yield`.
 
 ### 2.5 Literals
 
@@ -188,7 +189,7 @@ TopDecl       ::= ImportDecl
                 | "pub"? ExternDecl
                 | "export" FnDecl
 
-Item          ::= StructDecl | UnionDecl | FnDecl | ConstDecl | GlobalDecl
+Item          ::= StructDecl | UnionDecl | EnumDecl | FnDecl | ConstDecl | GlobalDecl
 
 ImportDecl    ::= "import" ( STRING_LIT "as" IDENT ";"
                            | "host" STRING_LIT? "{" HostFnDecl* "}" )
@@ -213,6 +214,9 @@ Field         ::= IDENT ":" Type
 
 UnionDecl     ::= "union" IDENT GenericParams? "{" Variant ( "," Variant )* ","? MethodDecl* "}"
 Variant       ::= IDENT ( ":" Type )?
+
+EnumDecl      ::= "enum" IDENT ( ":" PrimType )? "{" Member ( "," Member )* ","? MethodDecl* "}"
+Member        ::= IDENT ( "=" "-"? ( INT_LIT | CHAR_LIT ) )?
 
 MethodDecl    ::= "pub"? FnDecl
 
@@ -626,6 +630,48 @@ of `value` are unspecified.
 `error` is a 16-bit code. Code 0 is reserved and never names an error. Every name declared
 in any `error { … }` block in the program is assigned a distinct non-zero code (§11.1).
 
+### 5.14 Enums
+
+```phalange
+pub enum Align: u8 {
+    START,
+    END,
+    LEFT = 5,
+    RIGHT,
+
+    pub fn is_side(self: Align) bool {
+        return (self == Align.LEFT) or (self == Align.RIGHT);
+    }
+}
+```
+
+An enum is a distinct type whose values are its **members**, named constants of an integer
+**representation**. `Align.START` is a member (with a module: `text.Align.START`). Enums
+name one choice among several: an alignment, a mode, a kind. A set of bit flags stays a
+plain integer, because the flags combine with `|`.
+
+- **Values.** A member without `= value` is one more than the member before it, and the
+  first is `0`. Values must be distinct (`E0309`), and an enum has at least one member
+  (`E0304`).
+- **Representation.** `enum Name: T` stores members as the integer type `T` (`E0308` for
+  any other type; `E0503` if a value does not fit). Without `: T`, it is the smallest of
+  `u8`, `u16`, `u32`, `u64` that holds every value, or of `i8` … `i64` if one is negative.
+  Size and alignment are those of the representation, so an enum can stand in a struct
+  laid out for a file format or a C API.
+- **Operations.** `==` and `!=` between two values of the same enum (§7.3), and `match`
+  with `.MEMBER` arms (§8.6). Nothing else: no arithmetic, no ordering, no integer
+  literal in place of a member, and `@as`, `@int_cast`, `@truncate` and `@bit_cast` do not
+  apply. An enum satisfies `Eq` (§10.5).
+- **Conversions.** `@int_from_enum(x)` is the member's value, in the representation type.
+  `@enum_from_int(E, n)` takes any integer and gives the member whose value is `n`; it
+  traps (`T0007`) if there is none, and a constant `n` that names no member is `E0826`.
+- **Methods** are declared inside the braces, after the members, as in structs (§9.2).
+- **Constants.** `const DEFAULT: Align = Align.LEFT;` is allowed, and members are constant
+  expressions in global initializers.
+
+Only writes through raw pointers can give an enum a value that is not a member. A `match`
+without `else` on such a value traps (`T0007`), as for unions (§5.10).
+
 ---
 
 ## 6. Conversions
@@ -659,6 +705,8 @@ All other conversions use builtins (Appendix A):
 | `@float_from_int(T, x)` | Rounds to nearest, ties to even | Never fails |
 | `@float_cast(T, x)` | `f64 → f32` with round-to-nearest-even | Never fails |
 | `@bit_cast(T, x)` | Reinterprets bits. Sizes must match | Size mismatch is a compile error (`E0512`) |
+| `@int_from_enum(x)` | An enum member's value, in the representation type (§5.14) | Never fails |
+| `@enum_from_int(E, n)` | The member of enum `E` whose value is `n` | Traps if there is none (`T0007`) |
 | `@int_from_ptr(p)` | Address as `usize` | Never fails |
 | `@ptr_from_int(P, n)` | `usize` to pointer type `P` | Never fails. Any address is valid to form |
 | `@ptr_cast(P, p)` | Changes the pointee type | Never fails. Alignment is not semantic (§12.5) |
@@ -707,7 +755,7 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 | **A**dditive | `+` `-` `+%` `-%` | int, float | `%`-suffixed forms wrap, int only |
 | **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
-| **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer | result `bool` |
+| **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer, enum | result `bool` |
 | Logical-**and** | `and` | bool | short-circuit |
 | Logical-**or** | `or` | bool | short-circuit |
 
@@ -862,6 +910,7 @@ level deep. `e.len` and `e.ptr` on slices and `e.len` on arrays are built-in fie
 
 - `U.Variant(payload)` constructs a variant that has a payload.
 - `U.Variant` constructs a variant without one.
+- `E.MEMBER` is a member of enum `E` (§5.14).
 - The payload expression is typed by the variant, so `.{ … }` works:
   `Shape.Circle(.{ radius: 1.0 })`.
 
@@ -933,15 +982,16 @@ reaches a `break` or `return`.
 
 ### 8.6 `match`
 
-The scrutinee of a `match` must be a union, an integer (character patterns are allowed
-for `u8`), `bool`, or `error`.
+The scrutinee of a `match` must be a union, an enum, an integer (character patterns are
+allowed for `u8`), `bool`, or `error`.
 
 - **Union**: each arm is `.Variant` or `.Variant(name)`. `name` binds a copy of the
   payload.
+- **Enum**: each arm is `.MEMBER`.
 - **Integer**, `bool`, or `error`: each arm is a literal or `error.Name`.
 - Arms are tested in order. Each pattern may appear at most once (`E0631`).
-- The match must be **exhaustive** (`E0630`). A union match must list every variant or
-  end with `else`. Integer and `error` matches always need `else`.
+- The match must be **exhaustive** (`E0630`). A union or enum match must list every variant
+  (member) or end with `else`. Integer and `error` matches always need `else`.
 - An arm body is a block. Phalange has no fall-through.
 
 ```phalange
@@ -992,7 +1042,7 @@ fn name(p1: T1, p2: T2) R { … }
 
 ### 9.2 Methods
 
-A function declared inside a `struct` or `union` body is an **associated function**, called
+A function declared inside a `struct`, `union` or `enum` body is an **associated function**, called
 as `Type.name(…)`. If its first parameter is named `self` and has type `Self`, `*Self`, or
 `*mut Self`, it is also a **method**.
 
@@ -1157,7 +1207,7 @@ v0.1 has a closed set of builtin constraints. User-defined constraints are futur
 | Constraint | Satisfied by | Additionally permits on values of `T` |
 |---|---|---|
 | *(none)* | any type except `void` | copy, assign, pass, return; `&`/`&mut`; using `T` in fields, arrays, slices and pointers; `@size_of(T)`, `@align_of(T)` |
-| `Eq` | integers, floats, `bool`, pointers, `error`, function pointers | `==`, `!=` |
+| `Eq` | integers, floats, `bool`, pointers, `error`, function pointers, enums | `==`, `!=` |
 | `Ord` | integers, floats | everything `Eq` permits; `<` `<=` `>` `>=`; `@min`, `@max` |
 | `Num` | integers, floats | everything `Ord` permits; binary `+` `-` `*` `/` |
 | `Int` | all integer types | everything `Num` permits; `%`; `+%` `-%` `*%`; shifts; bitwise; `@clz` and similar; `@int_cast`/`@truncate` to or from `T`; `@min_value(T)`/`@max_value(T)` |
@@ -1840,14 +1890,18 @@ Initial registry, not exhaustive:
 | E0650 | Undeclared error name |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |
+| E0304 | Union or enum without variants (members) |
 | E0306 | Unknown ABI in `extern` (only `"C"`) |
 | E0307 | `...` outside `extern "C"`, or with no fixed parameter |
+| E0308 | Enum representation is not an integer type |
+| E0309 | Two enum members with the same value |
 | E0311 | Unknown trap code in `expect trap(...)` |
 | E0312 | Duplicate test name in a module |
 | E0801 | Type not allowed at the export or import boundary |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0824 | C variadic argument without a promoted type |
 | E0825 | `@expect_eq` operand type cannot be compared |
+| E0826 | `@enum_from_int` of a constant that is no member |
 
 ### 16.4 Runtime trap reporting and stack traces
 
@@ -2300,7 +2354,8 @@ expression.
 ### A.2 Conversions
 
 See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`,
-`@float_cast`, `@bit_cast`, `@int_from_ptr`, `@ptr_from_int`, `@ptr_cast`.
+`@float_cast`, `@bit_cast`, `@int_from_enum`, `@enum_from_int`, `@int_from_ptr`,
+`@ptr_from_int`, `@ptr_cast`.
 
 ### A.3 Slices and memory
 
@@ -2378,7 +2433,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0004` | `@int_cast` value out of range |
 | `T0005` | Linear-memory access out of bounds |
 | `T0006` | Length precondition failed (`@load`, `@store`, `@cast_slice`, `@mem_copy`) |
-| `T0007` | Invalid union tag at `match` |
+| `T0007` | Invalid union tag or enum value at `match`; `@enum_from_int` of a value that is no member |
 | `T0008` | Stack exhaustion |
 | `T0009` | Invalid function pointer or signature mismatch (`call_indirect`) |
 | `T0010` | Misaligned atomic access (§12.8.3) |
@@ -2428,6 +2483,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C29 | Stack traces from a per-thread shadow stack, and error return traces (§16.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
 | C30 | `phalange profile`: a sampling profiler over the shadow stack (§16.6) | The user asked for profiling support |
 | C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§16.7) | The user asked for independent compilation units |
+| C32 | Enums: distinct types over an integer representation, with members, methods, exhaustive `match`, `==`/`!=` and checked conversions (§5.14); `enum` is no longer reserved | The standard library passed alignments, modes and kinds as bare `u8`/`u32` constants, which any integer could be confused with |
 
 ---
 

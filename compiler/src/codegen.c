@@ -89,7 +89,10 @@ static LLVMTypeRef lty(Type *t);
 static FnInst *get_inst(Decl *d, Type **gargs, int n);
 static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
 
+// The concrete type of t in the function being generated. An enum is its
+// representation from here on: code generation never needs to tell them apart.
 static Type *ct(Type *t) {
+    if (t && t->kind == TY_ENUM) return t->elem;
     if (!t || !F || !t->has_params) return t;
     return type_subst(t, F->from, F->to, F->nsub);
 }
@@ -120,6 +123,7 @@ static LLVMTypeRef lty(Type *t) {
     case TY_VOID: r = T_void; break;
     case TY_BOOL: r = T_i8; break;
     case TY_INT: r = LLVMIntTypeInContext(ctx, (unsigned)t->bits); break;
+    case TY_ENUM: r = lty(t->elem); break;
     case TY_FLOAT: r = t->bits == 32 ? T_f32 : T_f64; break;
     case TY_VEC: {
         LLVMTypeRef lane = t->elem->kind == TY_FLOAT ? (t->elem->bits == 32 ? T_f32 : T_f64)
@@ -618,6 +622,7 @@ static LLVMValueRef global_ref(Decl *d);
 
 // Constant for a global initializer (spec: constant expressions only).
 static LLVMValueRef gen_const(Expr *e, Type *t) {
+    t = ct(t);
     if (e->kind == E_CONV) {
         switch ((ConvKind)e->op) {
         case CONV_NOOP: return gen_const(e->a, t);
@@ -996,6 +1001,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
 // C, and C function pointers callable from Phalange (spec §14.5).
 static void ext_attr(LLVMValueRef v, unsigned idx, Type *t, bool is_call) {
     const char *kind = NULL;
+    t = ct(t);
     if (t->kind == TY_BOOL) kind = "zeroext";
     else if (t->kind == TY_INT && t->bits < 32) kind = t->is_signed ? "signext" : "zeroext";
     if (!kind) return;
@@ -1703,6 +1709,24 @@ static LLVMValueRef gen_builtin(Expr *e) {
             ok = LLVMBuildAnd(B, ok, le, "");
         }
         check_or_trap(ok, T_INTCAST);
+        return ext_int(v, lty(rt), s->is_signed);
+    }
+    case BI_INT_FROM_ENUM: return gen(a[0].e);
+    case BI_ENUM_FROM_INT: {
+        // Trap unless the value is one of the enum's members.
+        Type *et = e->tval;
+        Type *s = ct(a[1].e->type);
+        LLVMValueRef v = gen(a[1].e);
+        Decl *d = et->decl;
+        LLVMBasicBlockRef ok = new_bb("enum.ok");
+        LLVMValueRef sw = LLVMBuildSwitch(B, v, trap_block(T_UNIONTAG), (unsigned)d->variants.len);
+        i128 lo, hi;
+        int_range(s, &lo, &hi);
+        for (int i = 0; i < d->variants.len; i++) {
+            i128 x = d->variants.data[i].value;
+            if (x >= lo && x <= hi) LLVMAddCase(sw, cint(LLVMTypeOf(v), x), ok);
+        }
+        LLVMPositionBuilderAtEnd(B, ok);
         return ext_int(v, lty(rt), s->is_signed);
     }
     case BI_TRUNCATE: {
@@ -2699,8 +2723,11 @@ static void gen_match(Stmt *s) {
         }
         LLVMBuildBr(B, else_idx >= 0 ? bbs[else_idx] : trap_block(T_TRAP));
     } else {
+        // integers, bool, error, enum (an enum match without 'else' covers every member)
         LLVMValueRef v = gen(s->e);
-        LLVMValueRef sw = LLVMBuildSwitch(B, v, else_idx >= 0 ? bbs[else_idx] : trap_block(T_TRAP), (unsigned)n);
+        int trap = s->e->type->kind == TY_ENUM ? T_UNIONTAG : T_TRAP;
+        LLVMBasicBlockRef dflt = else_idx >= 0 ? bbs[else_idx] : trap_block(trap);
+        LLVMValueRef sw = LLVMBuildSwitch(B, v, dflt, (unsigned)n);
         LLVMTypeRef vt_ = LLVMTypeOf(v);
         Vec(i128) seen = {0};
         for (int i = 0; i < n; i++) {
@@ -2709,6 +2736,7 @@ static void gen_match(Stmt *s) {
             if (a->kind == P_INT) key = a->ival;
             else if (a->kind == P_BOOL) key = a->bval ? 1 : 0;
             else if (a->kind == P_ERROR) key = a->error_code;
+            else if (a->kind == P_VARIANT) key = a->ival;
             else continue;
             bool dup = false;
             for (int k = 0; k < seen.len; k++)

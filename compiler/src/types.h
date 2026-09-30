@@ -19,6 +19,7 @@ typedef enum TypeKind {
     TY_FN,
     TY_STRUCT,
     TY_UNION,
+    TY_ENUM,   // elem: the representation (an integer type)
     TY_ERRUNION,
     TY_ERROR,
     TY_PARAM,     // generic parameter (type or const)
@@ -37,14 +38,14 @@ struct Type {
     bool is_signed;  // INT; VEC with int lanes
     bool is_size;    // usize / isize
     int lanes;       // VEC
-    Type *elem;      // PTR, SLICE, ARRAY, ERRUNION, VEC (lane type)
+    Type *elem;      // PTR, SLICE, ARRAY, ERRUNION, VEC (lane type), ENUM (representation)
     bool mut;        // PTR, SLICE
     int64_t len;     // ARRAY
     Type *len_param; // ARRAY whose length is a const generic parameter
     Type **params;   // FN
     int nparams;
     Type *ret;
-    Decl *decl;      // STRUCT, UNION
+    Decl *decl;      // STRUCT, UNION, ENUM
     Type **args;
     int nargs;
     // PARAM
@@ -84,6 +85,7 @@ Type *type_array(Type *elem, int64_t len);
 Type *type_array_param(Type *elem, Type *len_param);
 Type *type_fn(Type **params, int n, Type *ret);
 Type *type_named(Decl *d, Type **args, int n);  // struct or union instance
+Type *type_enum(Decl *d, Type *repr);
 Type *type_errunion(Type *elem);
 Type *type_constint(int64_t v);
 Type *type_param(Decl *owner, int index, Sym name, Constraint c, bool is_const, Type *const_type);

@@ -126,7 +126,7 @@ static void register_module(Module *m) {
         }
         if (d->kind == D_IMPORT) symmap_put(&m->imports, d->name, d);
         else symmap_put(&m->names, d->name, d);
-        if (d->kind == D_STRUCT || d->kind == D_UNION) {
+        if (d->kind == D_STRUCT || d->kind == D_UNION || d->kind == D_ENUM) {
             for (int j = 0; j < d->methods.len; j++) {
                 Decl *md = d->methods.data[j];
                 md->module = m;
@@ -414,7 +414,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         }
         Decl *d = resolve_named_decl(te, tc, true);
         if (!d) return t_invalid;
-        if (d->kind != D_STRUCT && d->kind != D_UNION) {
+        if (d->kind != D_STRUCT && d->kind != D_UNION && d->kind != D_ENUM) {
             diag_error(te->name_span, "E0400", "'%s' is not a type", te->name);
             return t_invalid;
         }
@@ -504,6 +504,61 @@ static void resolve_fn(Decl *d) {
     }
 }
 
+// An enum's representation and its members' values: each member without
+// `= value` is one more than the member before it (the first is 0). Without
+// a representation type, the smallest unsigned type that holds every value
+// (or signed, when one is negative).
+static void resolve_enum(Decl *d) {
+    TypeCtx tc = {d->module, NULL, NULL, NULL};
+    Type *repr = NULL;
+    if (d->te) {
+        repr = resolve_type(d->te, &tc);
+        if (repr->kind != TY_INT) {
+            if (repr->kind != TY_INVALID)
+                diag_error(d->te->span, "E0308", "an enum's representation must be an integer type, found %s",
+                           type_str(repr));
+            repr = NULL;
+        }
+    }
+    if (d->variants.len == 0) diag_error(d->name_span, "E0304", "enum '%s' must have at least one member", d->name);
+    i128 next = 0, lo = 0, hi = 0;
+    for (int i = 0; i < d->variants.len; i++) {
+        Variant *v = &d->variants.data[i];
+        if (!v->has_value) v->value = next;
+        next = v->value + 1;
+        if (v->value < lo) lo = v->value;
+        if (v->value > hi) hi = v->value;
+        for (int j = 0; j < i; j++)
+            if (d->variants.data[j].value == v->value) {
+                Diag *dg = diag_error(v->has_value ? v->value_span : v->span, "E0309",
+                                      "enum member '%s' has the same value as '%s'", v->name, d->variants.data[j].name);
+                diag_note(dg, d->variants.data[j].span, "'%s' declared here", d->variants.data[j].name);
+                break;
+            }
+    }
+    if (!repr) {
+        Type *cands[] = {t_u8, t_u16, t_u32, t_u64, t_i8, t_i16, t_i32, t_i64};
+        repr = t_i64;
+        for (int k = lo < 0 ? 4 : 0; k < 8; k++) {
+            i128 clo, chi;
+            int_range(cands[k], &clo, &chi);
+            if (lo >= clo && hi <= chi) {
+                repr = cands[k];
+                break;
+            }
+        }
+    }
+    i128 rlo, rhi;
+    int_range(repr, &rlo, &rhi);
+    for (int i = 0; i < d->variants.len; i++) {
+        Variant *v = &d->variants.data[i];
+        if (v->value < rlo || v->value > rhi)
+            diag_error(v->has_value ? v->value_span : v->span, "E0503", "the value of '%s' does not fit in %s", v->name,
+                       type_str(repr));
+    }
+    d->type = type_enum(d, repr);
+}
+
 void resolve_decl(Decl *d) {
     if (d->state == 2) return;
     if (d->state == 1) {
@@ -539,14 +594,15 @@ void resolve_decl(Decl *d) {
             diag_error(d->name_span, "E0304", "union '%s' has too many variants", d->name);
         return;
     }
+    case D_ENUM: resolve_enum(d); break;
     case D_FN:
     case D_HOST_FN: resolve_fn(d); break;
     case D_CONST: {
         TypeCtx tc = {d->module, NULL, NULL, NULL};
         d->type = resolve_type(d->te, &tc);
         if (d->type->kind != TY_INT && d->type->kind != TY_FLOAT && d->type->kind != TY_BOOL &&
-            d->type->kind != TY_INVALID) {
-            diag_error(d->te->span, "E0352", "constants must have an integer, float or bool type, found %s",
+            d->type->kind != TY_ENUM && d->type->kind != TY_INVALID) {
+            diag_error(d->te->span, "E0352", "constants must have an integer, float, bool or enum type, found %s",
                        type_str(d->type));
             d->type = t_invalid;
         }
@@ -718,6 +774,7 @@ bool sema_run(const char *path, SemaOptions *opts) {
             case D_HOST_FN: vec_push(g_prog.host_fns, d); break;
             case D_STRUCT:
             case D_UNION:
+            case D_ENUM:
                 for (int j = 0; j < d->methods.len; j++) {
                     check_fn_body(d->methods.data[j]);
                     vec_push(g_prog.fns, d->methods.data[j]);

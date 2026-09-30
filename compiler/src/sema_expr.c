@@ -438,7 +438,8 @@ static bool check_cmp_op(int op, Type *t, Span sp) {
                    t->name, constraint_name(t->constraint));
         return false;
     }
-    if (eq && (t->kind == TY_BOOL || t->kind == TY_PTR || t->kind == TY_ERROR || t->kind == TY_FN)) return true;
+    if (eq && (t->kind == TY_BOOL || t->kind == TY_PTR || t->kind == TY_ERROR || t->kind == TY_FN || t->kind == TY_ENUM))
+        return true;
     if (t->kind == TY_VEC || t->kind == TY_V128)
         diag_error(sp, "E0810", "vectors cannot be compared with '%s'; use @lanes_eq, @lanes_lt, ...",
                    tok_kind_name((TokKind)op));
@@ -696,6 +697,7 @@ static void decl_ref(Expr *e, Decl *d) {
         return;
     case D_STRUCT:
     case D_UNION:
+    case D_ENUM:
         if (d->gparams.len) {
             e->cat = CAT_GENERIC;
         } else {
@@ -780,7 +782,7 @@ static Type *check_field(Expr *e) {
     }
     case CAT_TYPE: {
         Type *t = a->tval;
-        if (t->kind != TY_STRUCT && t->kind != TY_UNION) {
+        if (t->kind != TY_STRUCT && t->kind != TY_UNION && t->kind != TY_ENUM) {
             diag_error(e->name_span, "E0404", "type %s has no member '%s'", type_str(t), name);
             e->type = t_invalid;
             return e->type;
@@ -809,6 +811,20 @@ static Type *check_field(Expr *e) {
                 return e->type = t;
             }
         }
+        if (t->kind == TY_ENUM) {
+            int v = find_variant(t->decl, name);
+            if (v >= 0) {
+                e->index = v;
+                e->cat = CAT_VALUE;
+                e->op = FK_CONST;
+                e->is_const = true;
+                e->cval = t->decl->variants.data[v].value;
+                return e->type = t;
+            }
+            diag_error(e->name_span, "E0404", "enum %s has no member or method '%s'", type_str(t), name);
+            e->type = t_invalid;
+            return e->type;
+        }
         diag_error(e->name_span, "E0404", "type %s has no method or variant '%s'", type_str(t), name);
         e->type = t_invalid;
         return e->type;
@@ -823,7 +839,7 @@ static Type *check_field(Expr *e) {
     Type *t = a->type;
     if (!t || t->kind == TY_INVALID) return e->type = t_invalid;
     Type *base = t;
-    if (t->kind == TY_PTR && (t->elem->kind == TY_STRUCT || t->elem->kind == TY_UNION)) {
+    if (t->kind == TY_PTR && (t->elem->kind == TY_STRUCT || t->elem->kind == TY_UNION || t->elem->kind == TY_ENUM)) {
         base = t->elem;
         e->self_mode = SELF_DEREF;
     }
@@ -835,7 +851,7 @@ static Type *check_field(Expr *e) {
             return e->type = type_field(base, fi);
         }
     }
-    if (base->kind == TY_STRUCT || base->kind == TY_UNION) {
+    if (base->kind == TY_STRUCT || base->kind == TY_UNION || base->kind == TY_ENUM) {
         Decl *m = find_method(base->decl, name);
         if (m) {
             resolve_decl(m);

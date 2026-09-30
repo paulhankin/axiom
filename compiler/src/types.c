@@ -136,6 +136,10 @@ Type *type_named(Decl *d, Type **args, int n) {
     Type p = {.kind = d->kind == D_UNION ? TY_UNION : TY_STRUCT, .decl = d, .args = args, .nargs = n};
     return intern_type(&p);
 }
+Type *type_enum(Decl *d, Type *repr) {
+    Type p = {.kind = TY_ENUM, .decl = d, .elem = repr};
+    return intern_type(&p);
+}
 Type *type_errunion(Type *elem) {
     Type p = {.kind = TY_ERRUNION, .elem = elem};
     return intern_type(&p);
@@ -372,6 +376,7 @@ static void tstr(CharVec *b, Type *t) {
             puts_b(b, "]");
         }
         return;
+    case TY_ENUM: puts_b(b, t->decl->name); return;
     case TY_ERRUNION: puts_b(b, "!"); tstr(b, t->elem); return;
     case TY_ERROR: puts_b(b, "error"); return;
     case TY_PARAM: puts_b(b, t->name); return;
@@ -452,6 +457,7 @@ static void layout(Type *t) {
     case TY_FN: t->size = t->align = ps; break;
     case TY_SLICE: t->size = 2 * ps; t->align = ps; break;
     case TY_ERROR: t->size = t->align = 2; break;
+    case TY_ENUM: t->size = t->align = t->elem->bits / 8; break;
     case TY_ARRAY:
         t->align = type_align(t->elem);
         t->size = t->len * type_size(t->elem);
@@ -532,7 +538,7 @@ bool type_satisfies(Type *t, Constraint c) {
     case C_NONE: return t->kind != TY_VOID && t->kind != TY_CONSTINT && t->kind != TY_NEVER;
     case C_EQ:
         return t->kind == TY_INT || t->kind == TY_FLOAT || t->kind == TY_BOOL || t->kind == TY_PTR ||
-               t->kind == TY_ERROR || t->kind == TY_FN;
+               t->kind == TY_ERROR || t->kind == TY_FN || t->kind == TY_ENUM;
     case C_ORD:
     case C_NUM: return t->kind == TY_INT || t->kind == TY_FLOAT;
     case C_INT: return t->kind == TY_INT;

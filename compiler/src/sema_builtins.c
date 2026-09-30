@@ -204,6 +204,47 @@ Type *builtin_check(Expr *e, Type *expected) {
         }
         return e->type = t;
     }
+    case BI_INT_FROM_ENUM: {
+        Type *s = check_expr(*earg(e, 0), NULL);
+        if (s->kind == TY_INVALID) return e->type = t_invalid;
+        if (s->kind != TY_ENUM) {
+            diag_error((*earg(e, 0))->span, "E0822", "@int_from_enum requires an enum operand, found %s", type_str(s));
+            return e->type = t_invalid;
+        }
+        Expr *a = *earg(e, 0);
+        e->is_const = a->is_const;
+        e->cval = a->cval;
+        return e->type = s->elem;
+    }
+    case BI_ENUM_FROM_INT: {
+        Type *t = targ(e, 0);
+        e->tval = t;
+        if (t->kind != TY_ENUM) {
+            if (t->kind != TY_INVALID)
+                diag_error(e->span, "E0822", "@enum_from_int requires an enum target type, found %s", type_str(t));
+            check_expr(*earg(e, 1), NULL);
+            return e->type = t_invalid;
+        }
+        Type *s = check_expr(*earg(e, 1), t->elem);
+        if (s->kind == TY_UNTYPED_INT) coerce(earg(e, 1), t->elem);
+        else if (ty_is_untyped(s)) finalize_untyped(earg(e, 1));
+        else if (s->kind != TY_INT && s->kind != TY_INVALID)
+            diag_error((*earg(e, 1))->span, "E0822", "@enum_from_int requires an integer operand, found %s",
+                       type_str(s));
+        Expr *a = *earg(e, 1);
+        if (a->is_const && a->type->kind == TY_INT) {
+            int v = -1;
+            for (int i = 0; i < t->decl->variants.len && v < 0; i++)
+                if (t->decl->variants.data[i].value == a->cval) v = i;
+            if (v < 0) {
+                diag_error(a->span, "E0826", "%s has no member with this value", type_str(t));
+            } else {
+                e->is_const = true;
+                e->cval = a->cval;
+            }
+        }
+        return e->type = t;
+    }
     case BI_INT_CAST:
     case BI_TRUNCATE: {
         Type *t = targ(e, 0);
@@ -253,7 +294,7 @@ Type *builtin_check(Expr *e, Type *expected) {
         Type *s = operand(earg(e, 1), t);
         if (t->kind == TY_INVALID || s->kind == TY_INVALID) return e->type = t;
         bool ok_kinds = !ty_is_aggregate(t) && !ty_is_aggregate(s) && t->kind != TY_VOID && s->kind != TY_BOOL &&
-                        t->kind != TY_BOOL;
+                        t->kind != TY_BOOL && t->kind != TY_ENUM && s->kind != TY_ENUM;
         if (!ok_kinds) {
             diag_error(e->span, "E0512", "@bit_cast supports numeric, pointer and vector types only");
         } else if (t->has_params || s->has_params) {

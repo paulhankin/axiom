@@ -15,7 +15,7 @@ static const char *kw_names[] = {
 #undef X
 };
 
-static const char *reserved_future[] = {"async", "await", "comptime", "enum", "impl", "interface",
+static const char *reserved_future[] = {"async", "await", "comptime", "impl", "interface",
                                         "null", "trait", "type", "unsafe", "yield"};
 
 const char *tok_kind_name(TokKind k) {

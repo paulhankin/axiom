@@ -274,7 +274,12 @@ fn is_const_int(v: *mut ir.Value) bool {
     return v.kind == ir.V_CINT;
 }
 
+// The concrete type of t in the function being generated. An enum is its
+// representation from here on: code generation never needs to tell them apart.
 fn ct(t: *mut ast.Type) *mut ast.Type {
+    if u.notnil(t) and (t.kind == ast.TY_ENUM) {
+        return t.elem;
+    }
     if u.isnil(t) or u.isnil(F) or not t.has_params {
         return t;
     }
@@ -320,6 +325,8 @@ fn lty(t: *mut ast.Type) *mut ir.Ty {
         r = T_i8;
     } else if k == ast.TY_INT {
         r = tint(t.bits);
+    } else if k == ast.TY_ENUM {
+        r = lty(t.elem);
     } else if k == ast.TY_FLOAT {
         r = T_f64;
         if t.bits == 32 {
@@ -1116,7 +1123,8 @@ fn const_struct1(a: *mut ir.Value) *mut ir.Value {
 }
 
 // Constant for a global initializer (spec: constant expressions only).
-fn gen_const(e: *mut ast.Expr, t: *mut ast.Type) *mut ir.Value {
+fn gen_const(e: *mut ast.Expr, t0: *mut ast.Type) *mut ir.Value {
+    let t = ct(t0);
     if e.kind == ast.E_CONV {
         if e.op == ast.CONV_NOOP {
             return gen_const(e.a, t);
@@ -1572,7 +1580,8 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
 // returned sign- or zero-extended. Marking every function (and indirect call)
 // this way makes any Phalange function with a scalar signature callable from
 // C, and C function pointers callable from Phalange (spec §14.5).
-fn ext_attr(v: *mut ir.Value, idx: u32, t: *mut ast.Type, is_call: bool) void {
+fn ext_attr(v: *mut ir.Value, idx: u32, t0: *mut ast.Type, is_call: bool) void {
+    let t = ct(t0);
     let mut kind = u.nosym();
     if t.kind == ast.TY_BOOL {
         kind = "zeroext";
@@ -2364,6 +2373,26 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
             return ir.cast(B, ir.OP_UITOFP, v, lty(rt));
         }
         return v;
+    }
+    if id == ast.BI_INT_FROM_ENUM {
+        return gen(barg(e, 0));
+    }
+    if id == ast.BI_ENUM_FROM_INT {
+        // Trap unless the value is one of the enum's members.
+        let d = e.tval.decl;
+        let s = ct(barg(e, 1).ty);
+        let v = gen(barg(e, 1));
+        let ok = new_bb("enum.ok".ptr);
+        let sw = ir.switch_(B, v, trap_block(T_UNIONTAG));
+        let r = ty.int_range(s);
+        for i in 0..d.variants.len {
+            let x = d.variants.at(i).value;
+            if x.ge(r.lo) and x.le(r.hi) {
+                ir.add_case(sw, cint(v.ty, x), ok);
+            }
+        }
+        at_end(ok);
+        return ext_int(v, lty(rt), s.is_signed);
     }
     if id == ast.BI_INT_CAST {
         let s = ct(barg(e, 1).ty);
@@ -3831,10 +3860,13 @@ fn gen_match(s: *mut ast.Stmt) void {
             br(trap_block(T_TRAP));
         }
     } else {
+        // integers, bool, error, enum (an enum match without 'else' covers every member)
         let v = gen(s.e);
         let mut dflt = bbnil();
         if else_idx >= 0 {
             dflt = bbs[@int_cast(usize, else_idx)];
+        } else if s.e.ty.kind == ast.TY_ENUM {
+            dflt = trap_block(T_UNIONTAG);
         } else {
             dflt = trap_block(T_TRAP);
         }
@@ -3852,6 +3884,8 @@ fn gen_match(s: *mut ast.Stmt) void {
                 }
             } else if a.kind == ast.P_ERROR {
                 key = u.I128.ofu(@as(u64, a.error_code));
+            } else if a.kind == ast.P_VARIANT {
+                key = a.ival;
             } else {
                 continue;
             }

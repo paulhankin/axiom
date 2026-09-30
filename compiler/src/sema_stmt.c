@@ -173,8 +173,9 @@ static void check_match(Stmt *s, bool *diverges) {
     bool all_div = true;
     bool has_else = false;
     int narms = s->arms.len;
-    if (t->kind == TY_UNION) {
+    if (t->kind == TY_UNION || t->kind == TY_ENUM) {
         Decl *u = t->decl;
+        bool is_enum = t->kind == TY_ENUM;
         bool *seen = NEWN(bool, u->variants.len + 1);
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
@@ -185,19 +186,25 @@ static void check_match(Stmt *s, bool *diverges) {
             } else if (a->kind == P_VARIANT) {
                 int v = find_variant(u, a->name);
                 if (v < 0) {
-                    diag_error(a->span, "E0632", "%s has no variant '%s'", type_str(t), a->name);
+                    diag_error(a->span, "E0632", "%s has no %s '%s'", type_str(t), is_enum ? "member" : "variant", a->name);
                 } else {
                     a->variant = v;
-                    if (seen[v]) diag_error(a->span, "E0631", "variant '%s' is matched more than once", a->name);
+                    a->ival = u->variants.data[v].value;
+                    if (seen[v])
+                        diag_error(a->span, "E0631", "%s '%s' is matched more than once", is_enum ? "member" : "variant",
+                                   a->name);
                     seen[v] = true;
-                    Type *pt = type_variant(t, v);
+                    Type *pt = is_enum ? NULL : type_variant(t, v);
                     if (a->bind) {
-                        if (!pt) diag_error(a->bind_span, "E0633", "variant '%s' has no payload to bind", a->name);
+                        if (!pt)
+                            diag_error(a->bind_span, "E0633", "%s '%s' has no payload to bind",
+                                       is_enum ? "enum member" : "variant", a->name);
                         else a->bind_local = declare_local(a->bind, a->bind_span, pt, false, false);
                     }
                 }
             } else {
-                diag_error(a->span, "E0634", "this pattern cannot match a value of union type %s", type_str(t));
+                diag_error(a->span, "E0634", "this pattern cannot match a value of %s type %s", is_enum ? "enum" : "union",
+                           type_str(t));
             }
             if (!check_block(a->body)) all_div = false;
             scope_pop();
@@ -263,7 +270,8 @@ static void check_match(Stmt *s, bool *diverges) {
         if (!exhaustive) diag_error(s->span, "E0630", "non-exhaustive match: add an 'else' arm");
     } else {
         if (t->kind != TY_INVALID)
-            diag_error(s->e->span, "E0634", "cannot match on a value of type %s (only unions, integers, bool and error)",
+            diag_error(s->e->span, "E0634",
+                       "cannot match on a value of type %s (only unions, enums, integers, bool and error)",
                        type_str(t));
         for (int i = 0; i < narms; i++) {
             scope_push();

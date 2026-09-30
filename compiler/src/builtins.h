@@ -90,7 +90,9 @@
     X(ERROR_NAME, "error_name", "e")          \
     X(MEMORY_DISCARD, "memory_discard", "ee") \
     X(SANITIZE_ADDRESS, "sanitize_address", "") \
-    X(MEMORY_ERROR, "memory_error", "")
+    X(MEMORY_ERROR, "memory_error", "")       \
+    X(INT_FROM_ENUM, "int_from_enum", "e")    \
+    X(ENUM_FROM_INT, "enum_from_int", "te")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

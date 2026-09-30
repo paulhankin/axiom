@@ -41,7 +41,7 @@ const NONE: usize = @max_value(usize);
 
 // What a pair of braces holds.
 const BR_BLOCK: i32 = 1;   // statements (also the top level)
-const BR_FIELDS: i32 = 2;  // struct and union members, one per line
+const BR_FIELDS: i32 = 2;  // struct, union and enum members, one per line
 const BR_DECLS: i32 = 3;   // the functions of extern and import host
 const BR_MATCH: i32 = 4;   // match arms
 const BR_INLINE: i32 = 5;  // struct literals, anonymous struct types, error lists
@@ -671,7 +671,7 @@ fn classify(els: []mut El) void {
             pending = BR_FIELDS;
         } else if (k == lx.KW_STRUCT) and (nk == lx.TK_LBRACE) {
             pending = BR_INLINE;
-        } else if k == lx.KW_UNION {
+        } else if (k == lx.KW_UNION) or (k == lx.KW_ENUM) {
             pending = BR_FIELDS;
         } else if (k == lx.KW_ERROR) and (nk == lx.TK_LBRACE) {
             pending = BR_INLINE;

@@ -229,7 +229,7 @@ struct Stmt {
 // ---------------------------------------------------------------------------
 // Declarations
 // ---------------------------------------------------------------------------
-typedef enum DeclKind { D_IMPORT, D_HOST_FN, D_ERROR, D_STRUCT, D_UNION, D_FN, D_CONST, D_GLOBAL } DeclKind;
+typedef enum DeclKind { D_IMPORT, D_HOST_FN, D_ERROR, D_STRUCT, D_UNION, D_ENUM, D_FN, D_CONST, D_GLOBAL } DeclKind;
 
 typedef struct GenericParam {
     Sym name;
@@ -253,6 +253,10 @@ typedef struct Variant {
     Span span;
     TypeExpr *te;  // NULL: no payload
     Type *type;
+    // enum members
+    bool has_value;  // `= value` given
+    i128 value;      // after sema: the member's value
+    Span value_span;
 } Variant;
 
 struct Local {
@@ -277,11 +281,11 @@ struct Decl {
     Vec(Variant) variants;
     Vec(Decl *) methods;
     SymMap method_map;
-    Decl *owner;  // method -> struct/union decl
+    Decl *owner;  // method -> struct/union/enum decl
     Vec(Param) params;
     TypeExpr *ret_te;
     Stmt *body;
-    TypeExpr *te;  // const / global type
+    TypeExpr *te;  // const / global type; enum representation type (NULL: default)
     Expr *init;
     bool mut;
     Sym import_path;

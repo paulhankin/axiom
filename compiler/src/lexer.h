@@ -13,6 +13,7 @@
     X(CONTINUE, "continue")  \
     X(DEFER, "defer")        \
     X(ELSE, "else")          \
+    X(ENUM, "enum")          \
     X(ERROR, "error")        \
     X(EXPORT, "export")      \
     X(EXTERN, "extern")      \

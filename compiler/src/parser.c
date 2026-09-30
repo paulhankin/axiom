@@ -1087,6 +1087,38 @@ static void parse_top(Parser *P) {
         vec_push(P->mod->decls, d);
         return;
     }
+    case KW_ENUM: {
+        advance(P);
+        Decl *d = new_decl(P, D_ENUM, start);
+        d->is_pub = is_pub;
+        d->name = expect_ident(P, &d->name_span);
+        if (accept(P, TK_COLON)) d->te = parse_type(P);
+        expect(P, TK_LBRACE);
+        while (pk(P) == TK_IDENT) {
+            Variant v = {0};
+            v.name = expect_ident(P, &v.span);
+            if (accept(P, TK_EQ)) {
+                Span vs = peek(P)->span;
+                bool neg = accept(P, TK_MINUS);
+                Token *n = peek(P);
+                if (n->kind == TK_INT || n->kind == TK_CHAR) {
+                    advance(P);
+                    v.has_value = true;
+                    v.value = neg ? -(i128)n->ival : (i128)n->ival;
+                } else {
+                    syntax_error(P, "integer literal");
+                }
+                v.value_span = sp_from(P, vs);
+            }
+            vec_push(d->variants, v);
+            if (!accept(P, TK_COMMA)) break;
+        }
+        parse_methods(P, d);
+        expect(P, TK_RBRACE);
+        d->span = sp_from(P, start);
+        vec_push(P->mod->decls, d);
+        return;
+    }
     case KW_CONST: {
         advance(P);
         Decl *d = new_decl(P, D_CONST, start);

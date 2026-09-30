@@ -1050,6 +1050,11 @@ fn parse_fn(P: *mut Parser, start: u.Span, is_pub: bool, is_export: bool) *mut a
     return d;
 }
 
+fn new_variant(name: []u8, span: u.Span) ast.Variant {
+    return ast.Variant.{ name: name, span: span, te: u.nil.[ast.TypeExpr](), ty: u.nil.[ast.Type](), has_value: false,
+                         value: u.I128.zero(), value_span: span };
+}
+
 fn parse_methods(P: *mut Parser, owner: *mut ast.Decl) void {
     while (pk(P) == lx.KW_PUB) or (pk(P) == lx.KW_FN) {
         let ms = peek(P).span;
@@ -1256,10 +1261,50 @@ fn parse_top(P: *mut Parser) void {
         _ = expect(P, lx.TK_LBRACE);
         while pk(P) == lx.TK_IDENT {
             let vid = expect_ident(P);
-            let mut v = ast.Variant.{ name: vid.name, span: vid.span, te: u.nil.[ast.TypeExpr](),
-                                      ty: u.nil.[ast.Type]() };
+            let mut v = new_variant(vid.name, vid.span);
             if accept(P, lx.TK_COLON) {
                 v.te = parse_type(P);
+            }
+            d.variants.push(v);
+            if not accept(P, lx.TK_COMMA) {
+                break;
+            }
+        }
+        parse_methods(P, d);
+        _ = expect(P, lx.TK_RBRACE);
+        d.span = sp_from(P, start);
+        mdecls.push(d);
+        return;
+    }
+    if k == lx.KW_ENUM {
+        _ = advance(P);
+        let d = new_decl(P, ast.D_ENUM, start);
+        d.is_pub = is_pub;
+        let id = expect_ident(P);
+        d.name = id.name;
+        d.name_span = id.span;
+        if accept(P, lx.TK_COLON) {
+            d.te = parse_type(P);
+        }
+        _ = expect(P, lx.TK_LBRACE);
+        while pk(P) == lx.TK_IDENT {
+            let vid = expect_ident(P);
+            let mut v = new_variant(vid.name, vid.span);
+            if accept(P, lx.TK_EQ) {
+                let vs = peek(P).span;
+                let neg = accept(P, lx.TK_MINUS);
+                let n = peek(P);
+                if (n.kind == lx.TK_INT) or (n.kind == lx.TK_CHAR) {
+                    _ = advance(P);
+                    v.has_value = true;
+                    v.value = u.I128.ofu(n.ival);
+                    if neg {
+                        v.value = v.value.neg();
+                    }
+                } else {
+                    syntax_error(P, "integer literal");
+                }
+                v.value_span = sp_from(P, vs);
             }
             d.variants.push(v);
             if not accept(P, lx.TK_COMMA) {

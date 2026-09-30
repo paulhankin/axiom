@@ -261,7 +261,7 @@ fn register_module(m: *mut ast.Module) void {
         } else {
             m.names.put(d.name, d);
         }
-        if (d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) {
+        if (d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) or (d.kind == ast.D_ENUM) {
             for j in 0..d.methods.len {
                 let md = d.methods.get(j);
                 md.module = m;
@@ -649,7 +649,7 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
         if u.isnil(d) {
             return ty.t_invalid;
         }
-        if (d.kind != ast.D_STRUCT) and (d.kind != ast.D_UNION) {
+        if (d.kind != ast.D_STRUCT) and (d.kind != ast.D_UNION) and (d.kind != ast.D_ENUM) {
             _ = dg.err(te.name_span, "E0400", u.f1("'%s' is not a type", te.name));
             return ty.t_invalid;
         }
@@ -790,6 +790,86 @@ fn resolve_fn(d: *mut ast.Decl) void {
     }
 }
 
+fn pick_span(c: bool, a: u.Span, b: u.Span) u.Span {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// An enum's representation and its members' values: each member without
+// `= value` is one more than the member before it (the first is 0). Without
+// a representation type, the smallest unsigned type that holds every value
+// (or signed, when one is negative).
+fn resolve_enum(d: *mut ast.Decl) void {
+    let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
+    let mut repr = tnil();
+    if u.notnil(d.te) {
+        repr = resolve_type(d.te, &mut tc);
+        if repr.kind != ast.TY_INT {
+            if repr.kind != ast.TY_INVALID {
+                _ = dg.err(d.te.span, "E0308", u.f1("an enum's representation must be an integer type, found %s",
+                                                    tstr(repr)));
+            }
+            repr = tnil();
+        }
+    }
+    if d.variants.len == 0 {
+        _ = dg.err(d.name_span, "E0304", u.f1("enum '%s' must have at least one member", d.name));
+    }
+    let one = u.I128.of(1);
+    let mut next = u.I128.zero();
+    let mut lo = u.I128.zero();
+    let mut hi = u.I128.zero();
+    for i in 0..d.variants.len {
+        let v = d.variants.at(i);
+        if not v.has_value {
+            v.value = next;
+        }
+        next = v.value.add(one);
+        if v.value.lt(lo) {
+            lo = v.value;
+        }
+        if v.value.gt(hi) {
+            hi = v.value;
+        }
+        for j in 0..i {
+            let w = d.variants.at(j);
+            if w.value.eq(v.value) {
+                let dd = dg.err(pick_span(v.has_value, v.value_span, v.span), "E0309",
+                                u.f2("enum member '%s' has the same value as '%s'", v.name, w.name));
+                dg.note(dd, w.span, u.f1("'%s' declared here", w.name));
+                break;
+            }
+        }
+    }
+    if u.isnil(repr) {
+        let cands = [ty.t_u8, ty.t_u16, ty.t_u32, ty.t_u64, ty.t_i8, ty.t_i16, ty.t_i32, ty.t_i64];
+        repr = ty.t_i64;
+        let mut k: usize = 0;
+        if lo.is_neg() {
+            k = 4;
+        }
+        while k < cands.len {
+            let r = ty.int_range(cands[k]);
+            if lo.ge(r.lo) and hi.le(r.hi) {
+                repr = cands[k];
+                break;
+            }
+            k += 1;
+        }
+    }
+    let r = ty.int_range(repr);
+    for i in 0..d.variants.len {
+        let v = d.variants.at(i);
+        if v.value.lt(r.lo) or v.value.gt(r.hi) {
+            _ = dg.err(pick_span(v.has_value, v.value_span, v.span), "E0503",
+                       u.f2("the value of '%s' does not fit in %s", v.name, tstr(repr)));
+        }
+    }
+    d.ty = ty.type_enum(d, repr);
+}
+
 fn resolve_decl(d: *mut ast.Decl) void {
     if d.state == 2 {
         return;
@@ -831,15 +911,18 @@ fn resolve_decl(d: *mut ast.Decl) void {
         }
         return;
     }
-    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+    if k == ast.D_ENUM {
+        resolve_enum(d);
+    } else if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
         resolve_fn(d);
     } else if k == ast.D_CONST {
         let tc = type_ctx(d.module, dnil(), dnil(), tnil());
         let mut tc2 = tc;
         d.ty = resolve_type(d.te, &mut tc2);
         let dk = d.ty.kind;
-        if (dk != ast.TY_INT) and (dk != ast.TY_FLOAT) and (dk != ast.TY_BOOL) and (dk != ast.TY_INVALID) {
-            _ = dg.err(d.te.span, "E0352", u.f1("constants must have an integer, float or bool type, found %s",
+        if (dk != ast.TY_INT) and (dk != ast.TY_FLOAT) and (dk != ast.TY_BOOL) and (dk != ast.TY_ENUM) and
+           (dk != ast.TY_INVALID) {
+            _ = dg.err(d.te.span, "E0352", u.f1("constants must have an integer, float, bool or enum type, found %s",
                                                 tstr(d.ty)));
             d.ty = ty.t_invalid;
         }
@@ -1524,7 +1607,8 @@ fn check_cmp_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
                                      t.name, ty.constraint_name(t.constraint)));
         return false;
     }
-    if eq and ((t.kind == ast.TY_BOOL) or (t.kind == ast.TY_PTR) or (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_FN)) {
+    if eq and ((t.kind == ast.TY_BOOL) or (t.kind == ast.TY_PTR) or (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_FN) or
+               (t.kind == ast.TY_ENUM)) {
         return true;
     }
     if (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128) {
@@ -1857,7 +1941,7 @@ fn decl_ref(e: *mut ast.Expr, d: *mut ast.Decl) void {
         }
         return;
     }
-    if (k == ast.D_STRUCT) or (k == ast.D_UNION) {
+    if (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM) {
         if d.gparams.len != 0 {
             e.cat = ast.CAT_GENERIC;
         } else {
@@ -1945,7 +2029,7 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
     }
     if ac == ast.CAT_TYPE {
         let t = a.tval;
-        if (t.kind != ast.TY_STRUCT) and (t.kind != ast.TY_UNION) {
+        if (t.kind != ast.TY_STRUCT) and (t.kind != ast.TY_UNION) and (t.kind != ast.TY_ENUM) {
             _ = dg.err(e.name_span, "E0404", u.f2("type %s has no member '%s'", tstr(t), name));
             e.ty = ty.t_invalid;
             return e.ty;
@@ -1974,6 +2058,21 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
                 return e.ty;
             }
         }
+        if t.kind == ast.TY_ENUM {
+            let v = find_variant(t.decl, name);
+            if v >= 0 {
+                e.index = v;
+                e.cat = ast.CAT_VALUE;
+                e.op = ast.FK_CONST;
+                e.is_const = true;
+                e.cval = t.decl.variants.at(@int_cast(usize, v)).value;
+                e.ty = t;
+                return e.ty;
+            }
+            _ = dg.err(e.name_span, "E0404", u.f2("enum %s has no member or method '%s'", tstr(t), name));
+            e.ty = ty.t_invalid;
+            return e.ty;
+        }
         _ = dg.err(e.name_span, "E0404", u.f2("type %s has no method or variant '%s'", tstr(t), name));
         e.ty = ty.t_invalid;
         return e.ty;
@@ -1987,7 +2086,8 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
         return e.ty;
     }
     let mut base = t;
-    if (t.kind == ast.TY_PTR) and ((t.elem.kind == ast.TY_STRUCT) or (t.elem.kind == ast.TY_UNION)) {
+    if (t.kind == ast.TY_PTR) and ((t.elem.kind == ast.TY_STRUCT) or (t.elem.kind == ast.TY_UNION) or
+                                   (t.elem.kind == ast.TY_ENUM)) {
         base = t.elem;
         e.self_mode = ast.SELF_DEREF;
     }
@@ -2000,7 +2100,7 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
             return e.ty;
         }
     }
-    if (base.kind == ast.TY_STRUCT) or (base.kind == ast.TY_UNION) {
+    if (base.kind == ast.TY_STRUCT) or (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM) {
         let m = find_method(base.decl, name);
         if u.notnil(m) {
             resolve_decl(m);
@@ -3265,6 +3365,56 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         return set_ty(e, t);
     }
+    if id == ast.BI_INT_FROM_ENUM {
+        let s = check_expr(barg(e, 0), tnil());
+        if s.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if s.kind != ast.TY_ENUM {
+            _ = dg.err(barg(e, 0).span, "E0822", u.f1("@int_from_enum requires an enum operand, found %s", tstr(s)));
+            return set_ty(e, ty.t_invalid);
+        }
+        let a = barg(e, 0);
+        e.is_const = a.is_const;
+        e.cval = a.cval;
+        return set_ty(e, s.elem);
+    }
+    if id == ast.BI_ENUM_FROM_INT {
+        let t = targ(e, 0);
+        e.tval = t;
+        if t.kind != ast.TY_ENUM {
+            if t.kind != ast.TY_INVALID {
+                _ = dg.err(e.span, "E0822", u.f1("@enum_from_int requires an enum target type, found %s", tstr(t)));
+            }
+            _ = check_expr(barg(e, 1), tnil());
+            return set_ty(e, ty.t_invalid);
+        }
+        let s = check_expr(barg(e, 1), t.elem);
+        if s.kind == ast.TY_UNTYPED_INT {
+            coerce(earg(e, 1), t.elem);
+        } else if ty.is_untyped(s) {
+            _ = finalize_untyped(earg(e, 1));
+        } else if (s.kind != ast.TY_INT) and (s.kind != ast.TY_INVALID) {
+            _ = dg.err(barg(e, 1).span, "E0822", u.f1("@enum_from_int requires an integer operand, found %s",
+                                                      tstr(s)));
+        }
+        let a = barg(e, 1);
+        if a.is_const and (a.ty.kind == ast.TY_INT) {
+            let mut found = false;
+            for i in 0..t.decl.variants.len {
+                if t.decl.variants.at(i).value.eq(a.cval) {
+                    found = true;
+                }
+            }
+            if found {
+                e.is_const = true;
+                e.cval = a.cval;
+            } else {
+                _ = dg.err(a.span, "E0826", u.f1("%s has no member with this value", tstr(t)));
+            }
+        }
+        return set_ty(e, t);
+    }
     if (id == ast.BI_INT_CAST) or (id == ast.BI_TRUNCATE) {
         let t = targ(e, 0);
         e.tval = t;
@@ -3333,7 +3483,8 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return set_ty(e, t);
         }
         let ok_kinds = not ty.is_aggregate(t) and not ty.is_aggregate(s) and (t.kind != ast.TY_VOID) and
-                       (s.kind != ast.TY_BOOL) and (t.kind != ast.TY_BOOL);
+                       (s.kind != ast.TY_BOOL) and (t.kind != ast.TY_BOOL) and (t.kind != ast.TY_ENUM) and
+                       (s.kind != ast.TY_ENUM);
         if not ok_kinds {
             _ = dg.err(e.span, "E0512", "@bit_cast supports numeric, pointer and vector types only");
         } else if t.has_params or s.has_params {
@@ -4015,8 +4166,10 @@ fn check_match(s: *mut ast.Stmt) bool {
     let mut all_div = true;
     let mut has_else = false;
     let narms = s.arms.len;
-    if t.kind == ast.TY_UNION {
+    if (t.kind == ast.TY_UNION) or (t.kind == ast.TY_ENUM) {
         let ud = t.decl;
+        let is_enum = t.kind == ast.TY_ENUM;
+        let what = u.pick(is_enum, "member", "variant");
         let seen = u.newn.[bool](ud.variants.len);
         for i in 0..narms {
             let a = s.arms.at(i);
@@ -4029,25 +4182,31 @@ fn check_match(s: *mut ast.Stmt) bool {
             } else if a.kind == ast.P_VARIANT {
                 let v = find_variant(ud, a.name);
                 if v < 0 {
-                    _ = dg.err(a.span, "E0632", u.f2("%s has no variant '%s'", tstr(t), a.name));
+                    _ = dg.err(a.span, "E0632", u.f3("%s has no %s '%s'", tstr(t), what, a.name));
                 } else {
                     let vi = @int_cast(usize, v);
                     a.variant = v;
+                    a.ival = ud.variants.at(vi).value;
                     if seen[vi] {
-                        _ = dg.err(a.span, "E0631", u.f1("variant '%s' is matched more than once", a.name));
+                        _ = dg.err(a.span, "E0631", u.f2("%s '%s' is matched more than once", what, a.name));
                     }
                     seen[vi] = true;
-                    let pt = ty.type_variant(t, vi);
+                    let mut pt = tnil();
+                    if not is_enum {
+                        pt = ty.type_variant(t, vi);
+                    }
                     if not u.isnos(a.bind) {
                         if u.isnil(pt) {
-                            _ = dg.err(a.bind_span, "E0633", u.f1("variant '%s' has no payload to bind", a.name));
+                            _ = dg.err(a.bind_span, "E0633", u.f2("%s '%s' has no payload to bind",
+                                                                  u.pick(is_enum, "enum member", "variant"), a.name));
                         } else {
                             a.bind_local = declare_local(a.bind, a.bind_span, pt, false, false);
                         }
                     }
                 }
             } else {
-                _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of union type %s", tstr(t)));
+                _ = dg.err(a.span, "E0634", u.f2("this pattern cannot match a value of %s type %s",
+                                                 u.pick(is_enum, "enum", "union"), tstr(t)));
             }
             if not check_block(a.body) {
                 all_div = false;
@@ -4135,7 +4294,8 @@ fn check_match(s: *mut ast.Stmt) bool {
     } else {
         if t.kind != ast.TY_INVALID {
             _ = dg.err(s.e.span, "E0634",
-                       u.f1("cannot match on a value of type %s (only unions, integers, bool and error)", tstr(t)));
+                       u.f1("cannot match on a value of type %s (only unions, enums, integers, bool and error)",
+                            tstr(t)));
         }
         for i in 0..narms {
             scope_push();
@@ -4472,7 +4632,7 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
                 }
             } else if k == ast.D_HOST_FN {
                 g_prog.host_fns.push(d);
-            } else if (k == ast.D_STRUCT) or (k == ast.D_UNION) {
+            } else if (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM) {
                 for j in 0..d.methods.len {
                     check_fn_body(d.methods.get(j));
                     g_prog.fns.push(d.methods.get(j));

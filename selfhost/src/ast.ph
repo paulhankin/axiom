@@ -106,6 +106,7 @@ pub const D_UNION: i32 = 4;
 pub const D_FN: i32 = 5;
 pub const D_CONST: i32 = 6;
 pub const D_GLOBAL: i32 = 7;
+pub const D_ENUM: i32 = 8;
 
 pub const IDX_ARRAY: i32 = 0;
 pub const IDX_SLICE: i32 = 1;
@@ -131,6 +132,7 @@ pub const TY_CONSTINT: i32 = 16;
 pub const TY_UNTYPED_INT: i32 = 17;
 pub const TY_UNTYPED_FLOAT: i32 = 18;
 pub const TY_NEVER: i32 = 19;
+pub const TY_ENUM: i32 = 20;  // elem: the representation (an integer type)
 
 pub const C_NONE: i32 = 0;
 pub const C_EQ: i32 = 1;
@@ -226,8 +228,10 @@ pub const BI_ERROR_NAME: i32 = 81;
 pub const BI_MEMORY_DISCARD: i32 = 82;
 pub const BI_SANITIZE_ADDRESS: i32 = 83;
 pub const BI_MEMORY_ERROR: i32 = 84;
+pub const BI_INT_FROM_ENUM: i32 = 85;
+pub const BI_ENUM_FROM_INT: i32 = 86;
 
-pub const BI_COUNT: i32 = 85;
+pub const BI_COUNT: i32 = 87;
 
 pub fn builtin_name(i: i32) []u8 {
     let t = ["size_of", "align_of", "offset_of", "min_value", "max_value", "as", "int_cast", "truncate",
@@ -240,7 +244,7 @@ pub fn builtin_name(i: i32) []u8 {
              "reduce_add", "dot", "trap", "atomic_load", "atomic_store", "atomic_add", "atomic_sub", "atomic_and",
              "atomic_or", "atomic_xor", "atomic_xchg", "atomic_min", "atomic_max", "atomic_cas", "atomic_wait",
              "atomic_notify", "fence", "expect", "expect_eq", "error_name", "memory_discard", "sanitize_address",
-             "memory_error"];
+             "memory_error", "int_from_enum", "enum_from_int"];
     return t[@int_cast(usize, i)];
 }
 
@@ -249,7 +253,7 @@ pub fn builtin_sig(i: i32) []u8 {
              "ee", "ee", "", "e", "e", "e", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "e", "e",
              "e", "e", "e", "e", "eee", "ee", "ee", "e", "t*", "ee", "eee", "te", "ee", "eee", "ee", "ee", "ee", "ee",
              "ee", "ee", "ee", "eee", "e", "e", "e", "e", "ee", "", "e", "ee", "ee", "ee", "ee", "ee", "ee", "ee", "ee",
-             "ee", "eee", "eee", "ee", "", "e", "ee", "e", "ee", "", ""];
+             "ee", "eee", "eee", "ee", "", "e", "ee", "e", "ee", "", "", "e", "te"];
     return t[@int_cast(usize, i)];
 }
 
@@ -408,6 +412,10 @@ pub struct Variant {
     span: u.Span,
     te: *mut TypeExpr,  // nil: no payload
     ty: *mut Type,
+    // enum members
+    has_value: bool,  // `= value` given
+    value: u.I128,    // after sema: the member's value
+    value_span: u.Span,
 }
 
 pub struct Local {
@@ -433,11 +441,11 @@ pub struct Decl {
     variants: u.List.[Variant],
     methods: u.List.[*mut Decl],
     method_map: u.SymMap.[*mut Decl],
-    owner: *mut Decl,  // method -> struct/union decl
+    owner: *mut Decl,  // method -> struct/union/enum decl
     params: u.List.[Param],
     ret_te: *mut TypeExpr,
     body: *mut Stmt,
-    te: *mut TypeExpr,  // const / global type
+    te: *mut TypeExpr,  // const / global type; enum representation type (nil: default)
     init: *mut Expr,
     is_mut: bool,
     import_path: []u8,

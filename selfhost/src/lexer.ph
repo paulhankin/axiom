@@ -21,79 +21,80 @@ pub const KW_CONST: i32 = 13;
 pub const KW_CONTINUE: i32 = 14;
 pub const KW_DEFER: i32 = 15;
 pub const KW_ELSE: i32 = 16;
-pub const KW_ERROR: i32 = 17;
-pub const KW_EXPORT: i32 = 18;
-pub const KW_EXTERN: i32 = 19;
-pub const KW_FALSE: i32 = 20;
-pub const KW_FN: i32 = 21;
-pub const KW_FOR: i32 = 22;
-pub const KW_HOST: i32 = 23;
-pub const KW_IF: i32 = 24;
-pub const KW_IMPORT: i32 = 25;
-pub const KW_IN: i32 = 26;
-pub const KW_LET: i32 = 27;
-pub const KW_LOOP: i32 = 28;
-pub const KW_MATCH: i32 = 29;
-pub const KW_MUT: i32 = 30;
-pub const KW_NOT: i32 = 31;
-pub const KW_OR: i32 = 32;
-pub const KW_PUB: i32 = 33;
-pub const KW_RETURN: i32 = 34;
-pub const KW_SELF: i32 = 35;
-pub const KW_STRUCT: i32 = 36;
-pub const KW_TEST: i32 = 37;
-pub const KW_TRUE: i32 = 38;
-pub const KW_UNION: i32 = 39;
-pub const KW_WHILE: i32 = 40;
-pub const TK_PLUS: i32 = 41;
-pub const TK_MINUS: i32 = 42;
-pub const TK_STAR: i32 = 43;
-pub const TK_SLASH: i32 = 44;
-pub const TK_PERCENT: i32 = 45;
-pub const TK_PLUS_PCT: i32 = 46;
-pub const TK_MINUS_PCT: i32 = 47;
-pub const TK_STAR_PCT: i32 = 48;
-pub const TK_AMP: i32 = 49;
-pub const TK_PIPE: i32 = 50;
-pub const TK_CARET: i32 = 51;
-pub const TK_TILDE: i32 = 52;
-pub const TK_SHL: i32 = 53;
-pub const TK_SHR: i32 = 54;
-pub const TK_EQEQ: i32 = 55;
-pub const TK_NE: i32 = 56;
-pub const TK_LT: i32 = 57;
-pub const TK_LE: i32 = 58;
-pub const TK_GT: i32 = 59;
-pub const TK_GE: i32 = 60;
-pub const TK_EQ: i32 = 61;
-pub const TK_PLUS_EQ: i32 = 62;
-pub const TK_MINUS_EQ: i32 = 63;
-pub const TK_STAR_EQ: i32 = 64;
-pub const TK_SLASH_EQ: i32 = 65;
-pub const TK_PERCENT_EQ: i32 = 66;
-pub const TK_PLUS_PCT_EQ: i32 = 67;
-pub const TK_MINUS_PCT_EQ: i32 = 68;
-pub const TK_STAR_PCT_EQ: i32 = 69;
-pub const TK_AMP_EQ: i32 = 70;
-pub const TK_PIPE_EQ: i32 = 71;
-pub const TK_CARET_EQ: i32 = 72;
-pub const TK_SHL_EQ: i32 = 73;
-pub const TK_SHR_EQ: i32 = 74;
-pub const TK_BANG: i32 = 75;
-pub const TK_DOT: i32 = 76;
-pub const TK_DOTDOT: i32 = 77;
-pub const TK_ELLIPSIS: i32 = 78;
-pub const TK_COMMA: i32 = 79;
-pub const TK_COLON: i32 = 80;
-pub const TK_SEMI: i32 = 81;
-pub const TK_FATARROW: i32 = 82;
-pub const TK_LPAREN: i32 = 83;
-pub const TK_RPAREN: i32 = 84;
-pub const TK_LBRACE: i32 = 85;
-pub const TK_RBRACE: i32 = 86;
-pub const TK_LBRACKET: i32 = 87;
-pub const TK_RBRACKET: i32 = 88;
-pub const TK_COUNT: i32 = 89;
+pub const KW_ENUM: i32 = 17;
+pub const KW_ERROR: i32 = 18;
+pub const KW_EXPORT: i32 = 19;
+pub const KW_EXTERN: i32 = 20;
+pub const KW_FALSE: i32 = 21;
+pub const KW_FN: i32 = 22;
+pub const KW_FOR: i32 = 23;
+pub const KW_HOST: i32 = 24;
+pub const KW_IF: i32 = 25;
+pub const KW_IMPORT: i32 = 26;
+pub const KW_IN: i32 = 27;
+pub const KW_LET: i32 = 28;
+pub const KW_LOOP: i32 = 29;
+pub const KW_MATCH: i32 = 30;
+pub const KW_MUT: i32 = 31;
+pub const KW_NOT: i32 = 32;
+pub const KW_OR: i32 = 33;
+pub const KW_PUB: i32 = 34;
+pub const KW_RETURN: i32 = 35;
+pub const KW_SELF: i32 = 36;
+pub const KW_STRUCT: i32 = 37;
+pub const KW_TEST: i32 = 38;
+pub const KW_TRUE: i32 = 39;
+pub const KW_UNION: i32 = 40;
+pub const KW_WHILE: i32 = 41;
+pub const TK_PLUS: i32 = 42;
+pub const TK_MINUS: i32 = 43;
+pub const TK_STAR: i32 = 44;
+pub const TK_SLASH: i32 = 45;
+pub const TK_PERCENT: i32 = 46;
+pub const TK_PLUS_PCT: i32 = 47;
+pub const TK_MINUS_PCT: i32 = 48;
+pub const TK_STAR_PCT: i32 = 49;
+pub const TK_AMP: i32 = 50;
+pub const TK_PIPE: i32 = 51;
+pub const TK_CARET: i32 = 52;
+pub const TK_TILDE: i32 = 53;
+pub const TK_SHL: i32 = 54;
+pub const TK_SHR: i32 = 55;
+pub const TK_EQEQ: i32 = 56;
+pub const TK_NE: i32 = 57;
+pub const TK_LT: i32 = 58;
+pub const TK_LE: i32 = 59;
+pub const TK_GT: i32 = 60;
+pub const TK_GE: i32 = 61;
+pub const TK_EQ: i32 = 62;
+pub const TK_PLUS_EQ: i32 = 63;
+pub const TK_MINUS_EQ: i32 = 64;
+pub const TK_STAR_EQ: i32 = 65;
+pub const TK_SLASH_EQ: i32 = 66;
+pub const TK_PERCENT_EQ: i32 = 67;
+pub const TK_PLUS_PCT_EQ: i32 = 68;
+pub const TK_MINUS_PCT_EQ: i32 = 69;
+pub const TK_STAR_PCT_EQ: i32 = 70;
+pub const TK_AMP_EQ: i32 = 71;
+pub const TK_PIPE_EQ: i32 = 72;
+pub const TK_CARET_EQ: i32 = 73;
+pub const TK_SHL_EQ: i32 = 74;
+pub const TK_SHR_EQ: i32 = 75;
+pub const TK_BANG: i32 = 76;
+pub const TK_DOT: i32 = 77;
+pub const TK_DOTDOT: i32 = 78;
+pub const TK_ELLIPSIS: i32 = 79;
+pub const TK_COMMA: i32 = 80;
+pub const TK_COLON: i32 = 81;
+pub const TK_SEMI: i32 = 82;
+pub const TK_FATARROW: i32 = 83;
+pub const TK_LPAREN: i32 = 84;
+pub const TK_RPAREN: i32 = 85;
+pub const TK_LBRACE: i32 = 86;
+pub const TK_RBRACE: i32 = 87;
+pub const TK_LBRACKET: i32 = 88;
+pub const TK_RBRACKET: i32 = 89;
+pub const TK_COUNT: i32 = 90;
 pub const PRIM_U8: i32 = 0;
 pub const PRIM_U16: i32 = 1;
 pub const PRIM_U32: i32 = 2;
@@ -127,9 +128,9 @@ pub fn prim_name(i: usize) []u8 {
     return t[i];
 }
 pub fn kw_name(i: usize) []u8 {
-    let t = ["and", "as", "break", "catch", "const", "continue", "defer", "else", "error", "export", "extern", "false",
-             "fn", "for", "host", "if", "import", "in", "let", "loop", "match", "mut", "not", "or", "pub", "return",
-             "Self", "struct", "test", "true", "union", "while"];
+    let t = ["and", "as", "break", "catch", "const", "continue", "defer", "else", "enum", "error", "export", "extern",
+             "false", "fn", "for", "host", "if", "import", "in", "let", "loop", "match", "mut", "not", "or", "pub",
+             "return", "Self", "struct", "test", "true", "union", "while"];
     return t[i];
 }
 pub fn punct_name(i: usize) []u8 {
@@ -494,7 +495,7 @@ fn op_table() [48]OpTok {
 }
 
 fn reserved_future(i: usize) []u8 {
-    let t = ["async", "await", "comptime", "enum", "impl", "interface", "null", "trait", "type", "unsafe", "yield"];
+    let t = ["async", "await", "comptime", "impl", "interface", "null", "trait", "type", "unsafe", "yield"];
     return t[i];
 }
 
@@ -524,7 +525,7 @@ pub fn lex_file(f: *mut u.SourceFile) u.List.[Token] {
                 L.toks.push(t);
                 continue;
             }
-            for i in 0..@as(usize, 32) {
+            for i in 0..@as(usize, 33) {
                 if u.str_eq(kw_name(i), w) {
                     t.kind = KW_AND + @int_cast(i32, i);
                     break;
@@ -540,7 +541,7 @@ pub fn lex_file(f: *mut u.SourceFile) u.List.[Token] {
                 }
             }
             if t.kind == TK_IDENT {
-                for i in 0..@as(usize, 11) {
+                for i in 0..@as(usize, 10) {
                     if u.str_eq(reserved_future(i), w) {
                         _ = dg.err(t.span, "E0003", u.f1("'%s' is reserved for future use", reserved_future(i)));
                     }
