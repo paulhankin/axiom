@@ -10,14 +10,15 @@
 //     let out = formats.encode(&img, formats.PNG, formats.Options.default())!;
 //
 // Formats: PNG, JPEG, BMP, QOI, PNM (PBM, PGM, PPM, PAM, PFM), Radiance HDR,
-// OpenEXR, GIF, TIFF and WebP (lossless when writing). HDR and EXR hold linear floating point (F32) images; the
-// others 8 or 16 bits per sample. Encoding converts as the format needs.
+// OpenEXR, GIF, TIFF, WebP (lossless when writing) and AVIF (reading). HDR and EXR hold linear floating point
+// (F32) images; the others 8 or 16 bits per sample. Encoding converts as the format needs.
 // =============================================================================
 
 import "../image.ph" as image;
 import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
+import "avif.ph" as avif;
 import "bmp.ph" as bmp;
 import "exr.ph" as exr;
 import "gif.ph" as gif;
@@ -42,6 +43,7 @@ pub const EXR: u8 = 7;
 pub const GIF: u8 = 8;
 pub const TIFF: u8 = 9;
 pub const WEBP: u8 = 10;
+pub const AVIF: u8 = 11;
 
 /// Settings for encoders (each uses the ones that apply to it).
 pub struct Options {
@@ -76,6 +78,9 @@ pub fn detect(data: []u8) u8 {
     }
     if webp.is_webp(data) {
         return WEBP;
+    }
+    if avif.is_avif(data) {
+        return AVIF;
     }
     if qoi.is_qoi(data) {
         return QOI;
@@ -135,6 +140,9 @@ pub fn from_extension(path: []u8) u8 {
     if @mem_eq(e, "webp") {
         return WEBP;
     }
+    if @mem_eq(e, "avif") {
+        return AVIF;
+    }
     return UNKNOWN;
 }
 
@@ -170,6 +178,9 @@ pub fn decode(data: []u8) !image.Image {
     }
     if f == WEBP {
         return webp.decode(data);
+    }
+    if f == AVIF {
+        return avif.decode(data);
     }
     return error.Unsupported;
 }
@@ -255,4 +266,12 @@ test "every format" {
     @expect_eq(from_extension("a/b.JPG"), JPEG);
     @expect_eq(from_extension("x.exr"), EXR);
     @expect_eq(from_extension("noext"), UNKNOWN);
+    @expect_eq(from_extension("p.avif"), AVIF);
+    // AVIF is read only
+    let out = encode(&img, AVIF, Options.default()) catch |e| {
+        @expect(e == error.Unsupported);
+        return;
+    };
+    mem.free(out);
+    @expect(false);
 }
