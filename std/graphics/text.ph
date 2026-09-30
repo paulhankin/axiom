@@ -297,7 +297,7 @@ fn is_newline(cp: u32) bool {
 
 fn is_mark(cp: u32) bool {
     let gc = uni.category(cp);
-    return (gc == uni.GC_MN) or (gc == uni.GC_MC) or (gc == uni.GC_ME);
+    return (gc == uni.Category.MN) or (gc == uni.Category.MC) or (gc == uni.Category.ME);
 }
 
 /// Lays out spans of text.
@@ -425,7 +425,7 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
                 }
             }
         }
-        let special = (r.value == '\t') or is_newline(r.value) or (uni.category(r.value) == uni.GC_CC);
+        let special = (r.value == '\t') or is_newline(r.value) or (uni.category(r.value) == uni.Category.CC);
         let mut adv: f64 = 0.0;
         if r.value == '\t' {
             adv = @float_from_int(f64, f.advance(gid)) * font.scale_for(f, st.size);
@@ -517,7 +517,7 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
         }
     }
     for j in @as(usize, 0)..n {
-        if not (is_newline(cs[j].cp) or (uni.category(cs[j].cp) == uni.GC_CC)) {
+        if not (is_newline(cs[j].cp) or (uni.category(cs[j].cp) == uni.Category.CC)) {
             cs[j].advance += spans[cs[j].span].style.letter_spacing;
         }
     }

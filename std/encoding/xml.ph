@@ -10,7 +10,7 @@
 //
 //     let mut r = xml.Reader.init(text, xml.Options.default())!;   // streaming
 //     defer r.deinit();
-//     loop { let t = r.next()!; if t.kind == xml.T_END_DOCUMENT { break; } ... }
+//     loop { let t = r.next()!; if t.kind == xml.TokenKind.END_DOCUMENT { break; } ... }
 //
 //     let mut w = xml.Writer.init(out);             // writing
 //     w.start("item")!; w.attr("id", "7")!; w.text("a < b")!; w.end()!;
@@ -228,14 +228,17 @@ fn declares_latin1(t: []u8) bool {
 // The pull parser
 // -----------------------------------------------------------------------------
 
-pub const T_START: u8 = 1;    // name, attrs; self_closing if <x/>
-pub const T_END: u8 = 2;      // name
-pub const T_TEXT: u8 = 3;     // text (character data, references resolved)
-pub const T_CDATA: u8 = 4;    // text
-pub const T_COMMENT: u8 = 5;  // text
-pub const T_PI: u8 = 6;       // name (target), text (data)
-pub const T_DOCTYPE: u8 = 7;  // name
-pub const T_END_DOCUMENT: u8 = 8;
+/// Token kinds, with the Token fields each fills in.
+pub enum TokenKind: u8 {
+    START = 1,  // name, attrs; self_closing if <x/>
+    END,        // name
+    TEXT,       // text (character data, references resolved)
+    CDATA,      // text
+    COMMENT,    // text
+    PI,         // name (target), text (data)
+    DOCTYPE,    // name
+    END_DOCUMENT,
+}
 
 pub struct Attr {
     name: []u8,   // as written: "p:x"
@@ -245,7 +248,7 @@ pub struct Attr {
 }
 
 pub struct Token {
-    kind: u8,
+    kind: TokenKind,
     name: []u8,
     local: []u8,
     ns: []u8,
@@ -547,25 +550,25 @@ pub struct Reader {
 
     // --- tokens ---------------------------------------------------------------------------
 
-    fn token(kind: u8) Token {
+    fn token(kind: TokenKind) Token {
         return Token.{ kind: kind, name: "", local: "", ns: "", attrs: @slice_from_ptr(@ptr_from_int(*Attr, 8), 0),
                        text: "", self_closing: false };
     }
 
-    /// The next token; T_END_DOCUMENT at the end. Strings live as long as
+    /// The next token; TokenKind.END_DOCUMENT at the end. Strings live as long as
     /// the Reader.
     pub fn next(self: *mut Reader) !Token {
         if self.pending_end {
             self.pending_end = false;
             self.close_scope(self.pending_depth);
-            let mut t = Reader.token(T_END);
+            let mut t = Reader.token(TokenKind.END);
             t.name = self.pending_name;
             t.local = self.pending_local;
             t.ns = self.pending_ns;
             return t;
         }
         if self.done {
-            return Reader.token(T_END_DOCUMENT);
+            return Reader.token(TokenKind.END_DOCUMENT);
         }
         loop {
             // entity ends
@@ -584,7 +587,7 @@ pub struct Reader {
                     return self.fail("the document has no root element");
                 }
                 self.done = true;
-                return Reader.token(T_END_DOCUMENT);
+                return Reader.token(TokenKind.END_DOCUMENT);
             }
             let inside = self.open.len > 0;
             let c = self.at(0);
@@ -661,7 +664,7 @@ pub struct Reader {
             self.buf.push(c)!;
             self.advance(1);
         }
-        let mut t = Reader.token(T_TEXT);
+        let mut t = Reader.token(TokenKind.TEXT);
         t.text = self.ar.dup(self.buf.bytes())!;
         return t;
     }
@@ -756,7 +759,7 @@ pub struct Reader {
             return self.fail("-- in a comment");
         }
         s.pos = end + 3;
-        let mut t = Reader.token(T_COMMENT);
+        let mut t = Reader.token(TokenKind.COMMENT);
         t.text = s.text[st..end];
         return t;
     }
@@ -767,7 +770,7 @@ pub struct Reader {
         let st = s.pos;
         let end = strs.index_of_from(s.text, "]]>", st) catch return self.fail("unterminated CDATA section");
         s.pos = end + 3;
-        let mut t = Reader.token(T_CDATA);
+        let mut t = Reader.token(TokenKind.CDATA);
         t.text = s.text[st..end];
         return t;
     }
@@ -794,7 +797,7 @@ pub struct Reader {
             s.pos = end;
         }
         self.advance(2);
-        let mut t = Reader.token(T_PI);
+        let mut t = Reader.token(TokenKind.PI);
         t.name = target;
         t.local = target;
         t.text = data;
@@ -851,7 +854,7 @@ pub struct Reader {
             return error.TooDeep;
         }
         let depth = self.open.len + 1;
-        let mut t = Reader.token(T_START);
+        let mut t = Reader.token(TokenKind.START);
         t.name = qname;
         t.local = qname;
         if self.opts.namespaces {
@@ -892,7 +895,7 @@ pub struct Reader {
         let depth = self.open.len;
         _ = self.open.pop()!;
         _ = self.open_src.pop()!;
-        let mut t = Reader.token(T_END);
+        let mut t = Reader.token(TokenKind.END);
         t.name = n;
         t.local = n;
         if self.opts.namespaces {
@@ -1138,7 +1141,7 @@ pub struct Reader {
             _ = self.skip_space();
         }
         self.expect(">", "expected > to end the DOCTYPE")!;
-        let mut t = Reader.token(T_DOCTYPE);
+        let mut t = Reader.token(TokenKind.DOCTYPE);
         t.name = n;
         t.local = n;
         return t;
@@ -1834,7 +1837,7 @@ fn build(doc: *mut Document) !void {
     loop {
         let t = r.next()!;
         // adjacent text (and CDATA) becomes one node
-        if (t.kind == T_TEXT) or (t.kind == T_CDATA) {
+        if (t.kind == TokenKind.TEXT) or (t.kind == TokenKind.CDATA) {
             text.push_str(t.text)!;
             continue;
         }
@@ -1844,13 +1847,13 @@ fn build(doc: *mut Document) !void {
             text.clear();
         }
         match t.kind {
-            1 => {
+            .START => {
                 let el = @cast_slice(Element, r.ar.bytes(@size_of(Element))!);
                 el[0] = Element.{ name: t.name, local: t.local, ns: t.ns, attrs: t.attrs,
                                   children: @slice_from_ptr(@ptr_from_int(*Node, 8), 0) };
                 frames.push(Frame.{ el: &mut el[0], kids: vec.Vec.[Node].init() })!;
             }
-            2 => {
+            .END => {
                 let mut f = frames.pop()!;
                 f.el.children = r.ar.copy.[Node](f.kids.items()) catch |e| {
                     f.kids.deinit();
@@ -1864,10 +1867,10 @@ fn build(doc: *mut Document) !void {
                     frames.get_ptr(frames.len - 1).kids.push(Node.Element(f.el))!;
                 }
             }
-            5 => { add_node(&mut frames, &mut top, Node.Comment(t.text))!; }
-            6 => { add_node(&mut frames, &mut top, Node.PI(PI.{ target: t.name, data: t.text }))!; }
-            7 => { doc.doctype = t.name; }
-            8 => { break; }
+            .COMMENT      => { add_node(&mut frames, &mut top, Node.Comment(t.text))!; }
+            .PI           => { add_node(&mut frames, &mut top, Node.PI(PI.{ target: t.name, data: t.text }))!; }
+            .DOCTYPE      => { doc.doctype = t.name; }
+            .END_DOCUMENT => { break; }
             else => {}
         }
     }
@@ -2330,10 +2333,11 @@ test "the tree and the reader" {
     // streaming
     let mut r = Reader.init("<a x='1'><b/>t</a>", Options.default())!;
     defer r.deinit();
-    let kinds: [6]u8 = [T_START, T_START, T_END, T_TEXT, T_END, T_END_DOCUMENT];
+    let kinds: [6]TokenKind = [TokenKind.START, TokenKind.START, TokenKind.END, TokenKind.TEXT, TokenKind.END,
+                               TokenKind.END_DOCUMENT];
     for k in kinds {
         let t = r.next()!;
-        @expect_eq(t.kind, k);
+        @expect(t.kind == k);
     }
 }
 

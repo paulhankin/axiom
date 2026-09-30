@@ -11,7 +11,7 @@
 //     let mut w = doc.walk();
 //     while w.next() {
 //         let n = doc.node(w.id);
-//         if w.entering and (n.kind == markdown.HEADING) { ... doc.text(child) ... }
+//         if w.entering and (n.kind == markdown.Kind.HEADING) { ... doc.text(child) ... }
 //     }
 //
 // parse() builds a tree of Nodes (blocks: paragraphs, headings, lists, code,
@@ -43,39 +43,51 @@ import "../mem.ph" as mem;
 import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
 import "../unicode.ph" as uni;
-import "../unicode/tables.ph" as ut;
 import "html/entities.ph" as ent;
 
 error { TooLarge, OutOfMemory }
 
 pub const NONE: u32 = 0xffffffff;
 
-// Block nodes
-pub const DOCUMENT: u8 = 0;
-pub const BLOCK_QUOTE: u8 = 1;
-pub const LIST: u8 = 2;
-pub const ITEM: u8 = 3;
-pub const CODE_BLOCK: u8 = 4;
-pub const HTML_BLOCK: u8 = 5;
-pub const PARAGRAPH: u8 = 6;
-pub const HEADING: u8 = 7;
-pub const THEMATIC_BREAK: u8 = 8;
-pub const TABLE: u8 = 9;
-pub const TABLE_ROW: u8 = 10;
-pub const TABLE_CELL: u8 = 11;
-// Inline nodes
-pub const TEXT: u8 = 12;
-pub const SOFT_BREAK: u8 = 13;
-pub const HARD_BREAK: u8 = 14;
-pub const CODE: u8 = 15;
-pub const HTML_INLINE: u8 = 16;
-pub const EMPH: u8 = 17;
-pub const STRONG: u8 = 18;
-pub const STRIKETHROUGH: u8 = 19;
-pub const LINK: u8 = 20;
-pub const IMAGE: u8 = 21;
+/// The kinds of node: blocks (DOCUMENT to TABLE_CELL), then inlines.
+pub enum Kind: u8 {
+    // Block nodes
+    DOCUMENT,
+    BLOCK_QUOTE,
+    LIST,
+    ITEM,
+    CODE_BLOCK,
+    HTML_BLOCK,
+    PARAGRAPH,
+    HEADING,
+    THEMATIC_BREAK,
+    TABLE,
+    TABLE_ROW,
+    TABLE_CELL,
+    // Inline nodes
+    TEXT,
+    SOFT_BREAK,
+    HARD_BREAK,
+    CODE,
+    HTML_INLINE,
+    EMPH,
+    STRONG,
+    STRIKETHROUGH,
+    LINK,
+    IMAGE,
 
-pub let KIND_NAMES: [22][]u8 = [
+    /// The name cmark uses ("block_quote", "softbreak", ...).
+    pub fn name(self: Kind) []u8 {
+        return KIND_NAMES[@as(usize, @int_from_enum(self))];
+    }
+
+    /// Whether this is an inline (TEXT and after) rather than a block.
+    pub fn is_inline(self: Kind) bool {
+        return @int_from_enum(self) >= @int_from_enum(Kind.TEXT);
+    }
+}
+
+let KIND_NAMES: [22][]u8 = [
     "document",
     "block_quote",
     "list",
@@ -100,16 +112,20 @@ pub let KIND_NAMES: [22][]u8 = [
     "image",
 ];
 
-// Table cell alignment
-pub const ALIGN_NONE: u8 = 0;
-pub const ALIGN_LEFT: u8 = 1;
-pub const ALIGN_CENTER: u8 = 2;
-pub const ALIGN_RIGHT: u8 = 3;
+/// Table cell alignment.
+pub enum Align: u8 {
+    NONE,
+    LEFT,
+    CENTER,
+    RIGHT,
+}
 
-// Task list items
-pub const TASK_NONE: u8 = 0;
-pub const TASK_OPEN: u8 = 1;
-pub const TASK_DONE: u8 = 2;
+/// Task list items: not one, "[ ]" or "[x]".
+pub enum Task: u8 {
+    NONE,
+    OPEN,
+    DONE,
+}
 
 pub struct Options {
     /// The GitHub extensions: tables, strikethrough, extended autolinks, task lists.
@@ -146,7 +162,7 @@ fn no_ref() Ref {
 }
 
 pub struct Node {
-    kind: u8,
+    kind: Kind,
     parent: u32,
     first: u32,
     last: u32,
@@ -163,11 +179,11 @@ pub struct Node {
     delim: u8,
     bullet: u8,
     start: u32,
-    /// TABLE_CELL: ALIGN_*. TABLE_ROW: header row or not.
-    align: u8,
+    /// TABLE_CELL: its Align. TABLE_ROW: header row or not.
+    align: Align,
     header: bool,
-    /// ITEM: TASK_*.
-    task: u8,
+    /// ITEM: its Task.
+    task: Task,
     /// CODE_BLOCK: fenced (``` or ~~~) or indented.
     fenced: bool,
     // TEXT, CODE, HTML_*, CODE_BLOCK: the literal; LINK, IMAGE: the destination
@@ -187,7 +203,7 @@ pub struct Node {
     eb_val: bool,
 }
 
-fn new_node(kind: u8, line: u32) Node {
+fn new_node(kind: Kind, line: u32) Node {
     return Node.{
         kind: kind,
         parent: NONE,
@@ -202,9 +218,9 @@ fn new_node(kind: u8, line: u32) Node {
         delim: 0,
         bullet: 0,
         start: 0,
-        align: ALIGN_NONE,
+        align: Align.NONE,
         header: false,
-        task: TASK_NONE,
+        task: Task.NONE,
         fenced: false,
         text: no_ref(),
         info: no_ref(),
@@ -222,8 +238,8 @@ fn new_node(kind: u8, line: u32) Node {
 }
 
 /// Whether a node is an inline (TEXT and after) rather than a block.
-pub fn is_inline(kind: u8) bool {
-    return kind >= TEXT;
+pub fn is_inline(kind: Kind) bool {
+    return kind.is_inline();
 }
 
 pub struct Document {
@@ -358,9 +374,10 @@ pub struct Walker {
 }
 
 /// Containers are visited twice by a Walker, leaves once.
-pub fn has_exit(kind: u8) bool {
-    return (kind != THEMATIC_BREAK) and (kind != CODE_BLOCK) and (kind != HTML_BLOCK) and (kind != TEXT) and
-           (kind != SOFT_BREAK) and (kind != HARD_BREAK) and (kind != CODE) and (kind != HTML_INLINE);
+pub fn has_exit(kind: Kind) bool {
+    return (kind != Kind.THEMATIC_BREAK) and (kind != Kind.CODE_BLOCK) and (kind != Kind.HTML_BLOCK) and
+           (kind != Kind.TEXT) and (kind != Kind.SOFT_BREAK) and (kind != Kind.HARD_BREAK) and (kind != Kind.CODE) and
+           (kind != Kind.HTML_INLINE);
 }
 
 /// Parses Markdown text. The input need not be valid UTF-8 (bad bytes
@@ -439,7 +456,7 @@ fn is_unicode_space(cp: u32) bool {
     if cp < 128 {
         return (cp == ' ') or (cp == '\t') or (cp == '\n') or (cp == 12) or (cp == '\r');
     }
-    return uni.category(cp) == ut.GC_ZS;
+    return uni.category(cp) == uni.Category.ZS;
 }
 
 /// Unicode punctuation in CommonMark's sense: the P and S categories.
@@ -500,7 +517,7 @@ struct Parser {
     current: u32,
     /// Bytes of destinations and titles that reference links may still expand to.
     ref_budget: usize,
-    /// Column alignments of the tables (each TABLE's `start` columns from its `fence_offset`).
+    /// Column alignments (Align values) of the tables (each TABLE's `start` columns from its `fence_offset`).
     aligns: vec.Vec.[u8],
     scratch: strs.String,
     // the inline parser's subject: s is raw[sbase..], inside `block`
@@ -584,7 +601,7 @@ struct Parser {
         return self.doc.nodes.get_ptr(@as(usize, id));
     }
 
-    fn kind(self: *mut Parser, id: u32) u8 {
+    fn kind(self: *mut Parser, id: u32) Kind {
         return self.doc.nodes.get(@as(usize, id)).kind;
     }
 
@@ -598,7 +615,7 @@ struct Parser {
     // --- the tree ---
 
     /// A new node, appended to `parent`'s children.
-    fn append(self: *mut Parser, parent: u32, kind: u8) !u32 {
+    fn append(self: *mut Parser, parent: u32, kind: Kind) !u32 {
         let id = @truncate(u32, self.doc.nodes.len);
         let mut n = new_node(kind, self.line_number);
         n.parent = parent;
@@ -617,7 +634,7 @@ struct Parser {
     }
 
     /// Adds a block, first closing the open blocks that cannot hold it.
-    fn add_block(self: *mut Parser, parent: u32, kind: u8) !u32 {
+    fn add_block(self: *mut Parser, parent: u32, kind: Kind) !u32 {
         let mut p = parent;
         while not can_contain(self.kind(p), kind) {
             p = self.finalize(p)!;
@@ -717,7 +734,7 @@ struct Parser {
     // --- the document ---
 
     fn document(self: *mut Parser, src: []u8) !void {
-        let root = self.append(NONE, DOCUMENT)!;
+        let root = self.append(NONE, Kind.DOCUMENT)!;
         _ = root;
         self.current = 0;
         let mut i: usize = 0;
@@ -781,7 +798,7 @@ struct Parser {
             container = last;
             self.find_first_nonspace();
             let k = self.kind(container);
-            if k == BLOCK_QUOTE {
+            if k == Kind.BLOCK_QUOTE {
                 matched = (self.indent <= 3) and (self.ch(self.first_nonspace) == '>');
                 if matched {
                     self.advance(self.indent + 1, true);
@@ -789,7 +806,7 @@ struct Parser {
                         self.advance(1, true);
                     }
                 }
-            } else if k == ITEM {
+            } else if k == Kind.ITEM {
                 let n = self.nd(container);
                 let need = @as(usize, n.marker_offset + n.padding);
                 if self.indent >= need {
@@ -799,7 +816,7 @@ struct Parser {
                 } else {
                     matched = false;
                 }
-            } else if k == CODE_BLOCK {
+            } else if k == Kind.CODE_BLOCK {
                 let n = self.nd(container);
                 if not n.fenced {
                     if self.indent >= 4 {
@@ -825,12 +842,12 @@ struct Parser {
                         i -= 1;
                     }
                 }
-            } else if k == HEADING {
+            } else if k == Kind.HEADING {
                 matched = false;
-            } else if k == HTML_BLOCK {
+            } else if k == Kind.HTML_BLOCK {
                 let t = self.nd(container).html_type;
                 matched = (t <= 5) or not self.blank;
-            } else if (k == PARAGRAPH) or (k == TABLE) {
+            } else if (k == Kind.PARAGRAPH) or (k == Kind.TABLE) {
                 matched = not self.blank;
             }
             if not matched {
@@ -841,9 +858,9 @@ struct Parser {
         let last_matched = container;
 
         // 2. new blocks
-        let mut maybe_lazy = self.kind(self.current) == PARAGRAPH;
+        let mut maybe_lazy = self.kind(self.current) == Kind.PARAGRAPH;
         let mut ck = self.kind(container);
-        while (ck != CODE_BLOCK) and (ck != HTML_BLOCK) {
+        while (ck != Kind.CODE_BLOCK) and (ck != Kind.HTML_BLOCK) {
             self.find_first_nonspace();
             let indented = self.indent >= 4;
             let fc = self.ch(self.first_nonspace);
@@ -856,41 +873,42 @@ struct Parser {
                 if is_space_or_tab(self.ch(self.offset)) {
                     self.advance(1, true);
                 }
-                container = self.add_block(container, BLOCK_QUOTE)!;
+                container = self.add_block(container, Kind.BLOCK_QUOTE)!;
             } else if not indented and scan_atx(line, self.first_nonspace, &mut m, &mut level) {
                 self.advance(self.first_nonspace + m - self.offset, false);
-                container = self.add_block(container, HEADING)!;
+                container = self.add_block(container, Kind.HEADING)!;
                 self.nd(container).level = level;
             } else if not indented and scan_open_fence(line, self.first_nonspace, &mut m) {
                 let fo = self.first_nonspace - self.offset;
-                container = self.add_block(container, CODE_BLOCK)!;
+                container = self.add_block(container, Kind.CODE_BLOCK)!;
                 let n = self.nd(container);
                 n.fenced = true;
                 n.fence_char = fc;
                 n.fence_len = @truncate(u32, m);
                 n.fence_offset = @truncate(u32, fo);
                 self.advance(self.first_nonspace + m - self.offset, false);
-            } else if not indented and scan_html_start(line, self.first_nonspace, ck != PARAGRAPH, &mut html_type) {
-                container = self.add_block(container, HTML_BLOCK)!;
+            } else if not indented and
+                      scan_html_start(line, self.first_nonspace, ck != Kind.PARAGRAPH, &mut html_type) {
+                container = self.add_block(container, Kind.HTML_BLOCK)!;
                 self.nd(container).html_type = html_type;
-            } else if not indented and (ck == PARAGRAPH) and scan_setext(line, self.first_nonspace, &mut level) {
+            } else if not indented and (ck == Kind.PARAGRAPH) and scan_setext(line, self.first_nonspace, &mut level) {
                 if resolve_refs(self, container)! {
                     let n = self.nd(container);
-                    n.kind = HEADING;
+                    n.kind = Kind.HEADING;
                     n.level = level;
                     self.advance(self.line.len - 1 - self.offset, false);
                 }
-            } else if not indented and not ((ck == PARAGRAPH) and not all_matched) and
+            } else if not indented and not ((ck == Kind.PARAGRAPH) and not all_matched) and
                       (self.break_kill <= self.first_nonspace) and
                       scan_thematic_break(line, self.first_nonspace, &mut self.break_kill) {
-                container = self.add_block(container, THEMATIC_BREAK)!;
+                container = self.add_block(container, Kind.THEMATIC_BREAK)!;
                 self.advance(self.line.len - 1 - self.offset, false);
-            } else if not indented and self.list_start(&mut container, ck == PARAGRAPH)! {
+            } else if not indented and self.list_start(&mut container, ck == Kind.PARAGRAPH)! {
                 // (container is the new item)
             } else if indented and not maybe_lazy and not self.blank {
                 self.advance(4, true);
-                container = self.add_block(container, CODE_BLOCK)!;
-            } else if not indented and (ck == PARAGRAPH) and self.opts.gfm and all_matched and
+                container = self.add_block(container, Kind.CODE_BLOCK)!;
+            } else if not indented and (ck == Kind.PARAGRAPH) and self.opts.gfm and all_matched and
                       table_start(self, container)! {
                 // (the paragraph is now the table's header)
                 self.advance(self.line.len - 1 - self.offset, false);
@@ -898,7 +916,7 @@ struct Parser {
                 break;
             }
             ck = self.kind(container);
-            if (ck == PARAGRAPH) or (ck == HEADING) or (ck == CODE_BLOCK) or (ck == TABLE) {
+            if (ck == Kind.PARAGRAPH) or (ck == Kind.HEADING) or (ck == Kind.CODE_BLOCK) or (ck == Kind.TABLE) {
                 break;
             }
             maybe_lazy = false;
@@ -915,9 +933,9 @@ struct Parser {
         }
         let ck2 = self.kind(container);
         let cn = self.nd(container);
-        let llb = self.blank and (ck2 != BLOCK_QUOTE) and (ck2 != HEADING) and (ck2 != THEMATIC_BREAK) and
-                  not ((ck2 == CODE_BLOCK) and cn.fenced) and
-                  not ((ck2 == ITEM) and (cn.first == NONE) and (cn.line == self.line_number));
+        let llb = self.blank and (ck2 != Kind.BLOCK_QUOTE) and (ck2 != Kind.HEADING) and
+                  (ck2 != Kind.THEMATIC_BREAK) and not ((ck2 == Kind.CODE_BLOCK) and cn.fenced) and
+                  not ((ck2 == Kind.ITEM) and (cn.first == NONE) and (cn.line == self.line_number));
         cn.last_line_blank = llb;
         let mut up = cn.parent;
         while up != NONE {
@@ -927,7 +945,7 @@ struct Parser {
         }
 
         if (self.current != last_matched) and (container == last_matched) and not self.blank and
-           (self.kind(self.current) == PARAGRAPH) {
+           (self.kind(self.current) == Kind.PARAGRAPH) {
             // lazy continuation of a paragraph
             self.add_line(self.current)!;
             return;
@@ -936,9 +954,9 @@ struct Parser {
             self.current = self.finalize(self.current)!;
         }
         let k = self.kind(container);
-        if k == CODE_BLOCK {
+        if k == Kind.CODE_BLOCK {
             self.add_line(container)!;
-        } else if k == HTML_BLOCK {
+        } else if k == Kind.HTML_BLOCK {
             self.add_line(container)!;
             let t = self.nd(container).html_type;
             if html_block_ends(t, self.line.bytes(), self.first_nonspace) {
@@ -946,17 +964,17 @@ struct Parser {
             }
         } else if self.blank {
             // nothing
-        } else if k == TABLE {
+        } else if k == Kind.TABLE {
             table_row(self, container)!;
-        } else if (k == PARAGRAPH) or (k == HEADING) {
-            if k == HEADING {
+        } else if (k == Kind.PARAGRAPH) or (k == Kind.HEADING) {
+            if k == Kind.HEADING {
                 // (a setext heading's underline leaves the line blank, so this is ATX)
                 self.chop_closing_hashes();
             }
             self.advance(self.first_nonspace - self.offset, false);
             self.add_line(container)!;
         } else {
-            container = self.add_block(container, PARAGRAPH)!;
+            container = self.add_block(container, Kind.PARAGRAPH)!;
             self.advance(self.first_nonspace - self.offset, false);
             self.add_line(container)!;
         }
@@ -1056,8 +1074,9 @@ struct Parser {
         let marker_offset = self.indent;
         let mut cont = container.*;
         let cn = self.nd(cont);
-        if (cn.kind != LIST) or (cn.ordered != ordered) or (cn.delim != delim) or (not ordered and (cn.bullet != c)) {
-            cont = self.add_block(cont, LIST)!;
+        if (cn.kind != Kind.LIST) or (cn.ordered != ordered) or (cn.delim != delim) or
+           (not ordered and (cn.bullet != c)) {
+            cont = self.add_block(cont, Kind.LIST)!;
             let l = self.nd(cont);
             l.ordered = ordered;
             l.delim = delim;
@@ -1067,7 +1086,7 @@ struct Parser {
             l.start = start;
             l.tight = false;
         }
-        cont = self.add_block(cont, ITEM)!;
+        cont = self.add_block(cont, Kind.ITEM)!;
         let it = self.nd(cont);
         it.marker_offset = @truncate(u32, marker_offset);
         it.padding = @truncate(u32, padding);
@@ -1084,11 +1103,11 @@ struct Parser {
         let parent = n.parent;
         n.open = false;
         let k = n.kind;
-        if k == PARAGRAPH {
+        if k == Kind.PARAGRAPH {
             if not resolve_refs(self, id)! {
                 self.unlink(id);
             }
-        } else if k == CODE_BLOCK {
+        } else if k == Kind.CODE_BLOCK {
             if self.nd(id).fenced {
                 // the first line is the info string
                 let c = self.content(id);
@@ -1122,7 +1141,7 @@ struct Parser {
                 }
                 self.nd(id).text.len = @truncate(u32, e);
             }
-        } else if k == HEADING {
+        } else if k == Kind.HEADING {
             let c = self.content(id);
             let t = trim_ascii(c);
             let r = self.nd(id).text;
@@ -1131,7 +1150,7 @@ struct Parser {
             if c.len > 0 {
                 n2.text = Ref.{ off: r.off + lead, len: @truncate(u32, t.len), raw: true };
             }
-        } else if k == LIST {
+        } else if k == Kind.LIST {
             self.nd(id).tight = self.list_is_tight(id);
         }
         return parent;
@@ -1152,7 +1171,7 @@ struct Parser {
                 result = true;
                 break;
             }
-            if (n.kind == LIST) or (n.kind == ITEM) {
+            if (n.kind == Kind.LIST) or (n.kind == Kind.ITEM) {
                 cur = n.last;
             } else {
                 cur = NONE;
@@ -1164,7 +1183,7 @@ struct Parser {
             let n = self.nd(k);
             n.eb_epoch = self.epoch;
             n.eb_val = result;
-            if (n.kind == LIST) or (n.kind == ITEM) {
+            if (n.kind == Kind.LIST) or (n.kind == Kind.ITEM) {
                 k = n.last;
             } else {
                 k = NONE;
@@ -1198,11 +1217,11 @@ struct Parser {
     fn task_items(self: *mut Parser) void {
         for i in 0..self.doc.nodes.len {
             let n = self.doc.nodes.get(i);
-            if (n.kind != ITEM) or (n.first == NONE) {
+            if (n.kind != Kind.ITEM) or (n.first == NONE) {
                 continue;
             }
             let p = self.doc.nodes.get(@as(usize, n.first));
-            if p.kind != PARAGRAPH {
+            if p.kind != Kind.PARAGRAPH {
                 continue;
             }
             let c = self.content(n.first);
@@ -1218,9 +1237,9 @@ struct Parser {
                 skip += 1;
             }
             let item = self.doc.nodes.get_ptr(i);
-            item.task = TASK_OPEN;
+            item.task = Task.OPEN;
             if x != ' ' {
-                item.task = TASK_DONE;
+                item.task = Task.DONE;
             }
             let pp = self.nd(n.first);
             pp.text.off += @truncate(u32, skip);
@@ -1229,18 +1248,19 @@ struct Parser {
     }
 }
 
-fn can_contain(parent: u8, child: u8) bool {
-    if (parent == DOCUMENT) or (parent == BLOCK_QUOTE) or (parent == ITEM) {
-        return (child != ITEM) and (child != TABLE_ROW) and (child != TABLE_CELL) and not is_inline(child);
+fn can_contain(parent: Kind, child: Kind) bool {
+    if (parent == Kind.DOCUMENT) or (parent == Kind.BLOCK_QUOTE) or (parent == Kind.ITEM) {
+        return (child != Kind.ITEM) and (child != Kind.TABLE_ROW) and (child != Kind.TABLE_CELL) and
+               not is_inline(child);
     }
-    if parent == LIST {
-        return child == ITEM;
+    if parent == Kind.LIST {
+        return child == Kind.ITEM;
     }
-    if parent == TABLE {
-        return child == TABLE_ROW;
+    if parent == Kind.TABLE {
+        return child == Kind.TABLE_ROW;
     }
-    if parent == TABLE_ROW {
-        return child == TABLE_CELL;
+    if parent == Kind.TABLE_ROW {
+        return child == Kind.TABLE_CELL;
     }
     return false;
 }
@@ -2103,15 +2123,15 @@ fn table_start(p: *mut Parser, para: u32) !bool {
                 return false;
             }
         }
-        let mut al = ALIGN_NONE;
+        let mut al = Align.NONE;
         if left and right {
-            al = ALIGN_CENTER;
+            al = Align.CENTER;
         } else if left {
-            al = ALIGN_LEFT;
+            al = Align.LEFT;
         } else if right {
-            al = ALIGN_RIGHT;
+            al = Align.RIGHT;
         }
-        p.aligns.push(al)!;
+        p.aligns.push(@int_from_enum(al))!;
     }
     let ncols = cells.len;
     // the paragraph's last line
@@ -2129,7 +2149,7 @@ fn table_start(p: *mut Parser, para: u32) !bool {
     let r = p.nd(para).text;
     if ls > 0 {
         // the lines before stay a paragraph
-        let before = p.append(NONE, PARAGRAPH)!;
+        let before = p.append(NONE, Kind.PARAGRAPH)!;
         let bn = p.nd(before);
         bn.text = Ref.{ off: r.off, len: @truncate(u32, ls), raw: true };
         bn.line = p.nd(para).line;
@@ -2137,7 +2157,7 @@ fn table_start(p: *mut Parser, para: u32) !bool {
         _ = p.finalize(before)!;
     }
     let t = p.nd(para);
-    t.kind = TABLE;
+    t.kind = Kind.TABLE;
     t.start = @truncate(u32, ncols);
     t.fence_offset = @truncate(u32, first_align);
     t.text = Ref.{ off: r.off + @truncate(u32, ls), len: r.len - @truncate(u32, ls), raw: true };
@@ -2148,16 +2168,16 @@ fn table_start(p: *mut Parser, para: u32) !bool {
 
 fn add_row(p: *mut Parser, table: u32, off: u32, cells: *vec.Vec.[Cell], header: bool) !void {
     let t = p.doc.nodes.get(@as(usize, table));
-    let row = p.append(table, TABLE_ROW)!;
+    let row = p.append(table, Kind.TABLE_ROW)!;
     let rn = p.nd(row);
     rn.open = false;
     rn.header = header;
     let ncols = @as(usize, t.start);
     for k in 0..ncols {
-        let cell = p.append(row, TABLE_CELL)!;
+        let cell = p.append(row, Kind.TABLE_CELL)!;
         let cn = p.nd(cell);
         cn.open = false;
-        cn.align = p.aligns.get(@as(usize, t.fence_offset) + k);
+        cn.align = @enum_from_int(Align, p.aligns.get(@as(usize, t.fence_offset) + k));
         if k < cells.len {
             let c = cells.get(k);
             cn.text = Ref.{ off: off + @truncate(u32, c.a), len: @truncate(u32, c.b - c.a), raw: true };
@@ -2255,12 +2275,12 @@ fn inlines_all(p: *mut Parser) !void {
         if n.parent == NONE and (i != 0) {
             continue;  // removed
         }
-        if (n.kind != PARAGRAPH) and (n.kind != HEADING) and (n.kind != TABLE_CELL) {
+        if (n.kind != Kind.PARAGRAPH) and (n.kind != Kind.HEADING) and (n.kind != Kind.TABLE_CELL) {
             continue;
         }
         let id = @truncate(u32, i);
         let mut r = n.text;
-        if n.kind == TABLE_CELL {
+        if n.kind == Kind.TABLE_CELL {
             // \| stands for a pipe in a cell, even inside code
             let c = p.doc.str(r);
             if strs.contains(c, "\\|") {
@@ -2324,13 +2344,13 @@ fn parse_inlines(p: *mut Parser, block: u32, r: Ref) !void {
 }
 
 fn text_node(p: *mut Parser, a: usize, b: usize) !u32 {
-    let id = p.append(p.block, TEXT)!;
+    let id = p.append(p.block, Kind.TEXT)!;
     p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, a), len: @truncate(u32, b - a), raw: true };
     return id;
 }
 
 fn text_node_buf(p: *mut Parser, r: Ref) !u32 {
-    let id = p.append(p.block, TEXT)!;
+    let id = p.append(p.block, Kind.TEXT)!;
     p.nd(id).text = r;
     return id;
 }
@@ -2360,9 +2380,9 @@ fn parse_inline(p: *mut Parser) !void {
             p.pos += 1;
         }
         if (nl > 1) and (p.s[nl - 1] == ' ') and (p.s[nl - 2] == ' ') {
-            _ = p.append(p.block, HARD_BREAK)!;
+            _ = p.append(p.block, Kind.HARD_BREAK)!;
         } else {
-            _ = p.append(p.block, SOFT_BREAK)!;
+            _ = p.append(p.block, Kind.SOFT_BREAK)!;
         }
     } else if c == '`' {
         handle_backticks(p)!;
@@ -2382,7 +2402,7 @@ fn parse_inline(p: *mut Parser) !void {
             while is_space_or_tab(peek(p)) {
                 p.pos += 1;
             }
-            _ = p.append(p.block, HARD_BREAK)!;
+            _ = p.append(p.block, Kind.HARD_BREAK)!;
         } else {
             _ = text_node(p, p.pos - 1, p.pos)!;
         }
@@ -2488,7 +2508,7 @@ fn handle_backticks(p: *mut Parser) !void {
             e -= 1;
         }
     }
-    let id = p.append(p.block, CODE)!;
+    let id = p.append(p.block, Kind.CODE)!;
     p.nd(id).text = Ref.{ off: @truncate(u32, a), len: @truncate(u32, e - a), raw: false };
 }
 
@@ -2666,7 +2686,7 @@ fn handle_pointy(p: *mut Parser) !void {
     if n > 0 {
         let contents = p.s[start + 1..start + n];
         p.pos = start + 1 + n;
-        let link = p.append(p.block, LINK)!;
+        let link = p.append(p.block, Kind.LINK)!;
         let off = p.doc.buf.len;
         if email {
             p.doc.buf.push_str("mailto:")!;
@@ -2675,7 +2695,7 @@ fn handle_pointy(p: *mut Parser) !void {
         p.nd(link).text = Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len - off), raw: false };
         let toff = p.doc.buf.len;
         unescape_entities_to(&mut p.doc.buf, contents)!;
-        let t = p.append(link, TEXT)!;
+        let t = p.append(link, Kind.TEXT)!;
         p.nd(t).text = Ref.{ off: @truncate(u32, toff), len: @truncate(u32, p.doc.buf.len - toff), raw: false };
         return;
     }
@@ -2685,7 +2705,7 @@ fn handle_pointy(p: *mut Parser) !void {
     }
     if h > 0 {
         p.pos = start + h;
-        let id = p.append(p.block, HTML_INLINE)!;
+        let id = p.append(p.block, Kind.HTML_INLINE)!;
         p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, start), len: @truncate(u32, h), raw: true };
         return;
     }
@@ -2880,9 +2900,9 @@ fn insert_emph(p: *mut Parser, opener: u32, closer: u32) !u32 {
         remove_delim(p, d);
         d = prev;
     }
-    let mut kind = EMPH;
+    let mut kind = Kind.EMPH;
     if use == 2 {
-        kind = STRONG;
+        kind = Kind.STRONG;
     }
     let emph = p.append(NONE, kind)!;
     let mut t = p.nd(od.node).next;
@@ -2910,7 +2930,7 @@ fn insert_strike(p: *mut Parser, opener: u32, closer: u32) !u32 {
     let cd = p.delims.get(@as(usize, closer));
     let res = cd.next;
     if p.nd(od.node).text.len == p.nd(cd.node).text.len {
-        let st = p.append(NONE, STRIKETHROUGH)!;
+        let st = p.append(NONE, Kind.STRIKETHROUGH)!;
         let mut t = p.nd(od.node).next;
         while (t != NONE) and (t != cd.node) {
             let nx = p.nd(t).next;
@@ -3023,9 +3043,9 @@ fn handle_close_bracket(p: *mut Parser) !void {
         _ = text_node(p, initial - 1, initial)!;
         return;
     }
-    let mut kind = LINK;
+    let mut kind = Kind.LINK;
     if opener.image {
-        kind = IMAGE;
+        kind = Kind.IMAGE;
     }
     let link = p.append(NONE, kind)!;
     let ln = p.nd(link);
@@ -3072,7 +3092,7 @@ fn merge_children(p: *mut Parser, parent: u32) !void {
     let mut c = p.nd(parent).first;
     while c != NONE {
         let n = p.doc.nodes.get(@as(usize, c));
-        if (n.kind != TEXT) or (n.next == NONE) or (p.kind(n.next) != TEXT) {
+        if (n.kind != Kind.TEXT) or (n.next == NONE) or (p.kind(n.next) != Kind.TEXT) {
             c = n.next;
             continue;
         }
@@ -3080,7 +3100,7 @@ fn merge_children(p: *mut Parser, parent: u32) !void {
         let mut contiguous = true;
         let mut end = n.text.off + n.text.len;
         let mut e = n.next;
-        while (e != NONE) and (p.kind(e) == TEXT) {
+        while (e != NONE) and (p.kind(e) == Kind.TEXT) {
             let t = p.nd(e).text;
             if (t.raw != n.text.raw) or (t.off != end) {
                 contiguous = false;
@@ -3297,10 +3317,10 @@ fn autolink_block(p: *mut Parser, block: u32) !void {
     let mut links: usize = 0;
     while id != NONE {
         let n = p.doc.nodes.get(@as(usize, id));
-        if (n.kind == LINK) or (n.kind == IMAGE) {
+        if (n.kind == Kind.LINK) or (n.kind == Kind.IMAGE) {
             links += 1;
         }
-        if (n.kind == TEXT) and (links == 0) {
+        if (n.kind == Kind.TEXT) and (links == 0) {
             autolink_text(p, id)!;
         }
         // next node: down, else along, else up
@@ -3309,7 +3329,7 @@ fn autolink_block(p: *mut Parser, block: u32) !void {
             id = first_child;
             continue;
         }
-        if (n.kind == LINK) or (n.kind == IMAGE) {
+        if (n.kind == Kind.LINK) or (n.kind == Kind.IMAGE) {
             links -= 1;
         }
         while (id != block) and (p.nd(id).next == NONE) {
@@ -3318,7 +3338,7 @@ fn autolink_block(p: *mut Parser, block: u32) !void {
                 break;
             }
             let k = p.kind(id);
-            if (k == LINK) or (k == IMAGE) {
+            if (k == Kind.LINK) or (k == Kind.IMAGE) {
                 links -= 1;
             }
         }
@@ -3333,7 +3353,7 @@ fn autolink_block(p: *mut Parser, block: u32) !void {
 /// traversal then visits the link and the rest).
 fn autolink_text(p: *mut Parser, id: u32) !void {
     let n = p.doc.nodes.get(@as(usize, id));
-    let start_ok = (n.prev == NONE) or (p.kind(n.prev) != TEXT);
+    let start_ok = (n.prev == NONE) or (p.kind(n.prev) != Kind.TEXT);
     let s = p.doc.str(n.text);
     let mut a: usize = 0;
     let mut b: usize = 0;
@@ -3342,7 +3362,7 @@ fn autolink_text(p: *mut Parser, id: u32) !void {
         return;
     }
     let r = n.text;
-    let link = p.append(NONE, LINK)!;
+    let link = p.append(NONE, Kind.LINK)!;
     let off = p.doc.buf.len;
     p.doc.buf.push_str(prefix)!;
     // (s may point into buf, so copy through scratch)
@@ -3351,10 +3371,10 @@ fn autolink_text(p: *mut Parser, id: u32) !void {
     p.doc.buf.push_str(p.scratch.bytes())!;
     p.nd(link).text = Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len - off), raw: false };
     insert_after(p.doc, id, link);
-    let t = p.append(link, TEXT)!;
+    let t = p.append(link, Kind.TEXT)!;
     p.nd(t).text = Ref.{ off: r.off + @truncate(u32, a), len: @truncate(u32, b - a), raw: r.raw };
     if b < s.len {
-        let rest = p.append(NONE, TEXT)!;
+        let rest = p.append(NONE, Kind.TEXT)!;
         p.nd(rest).text = Ref.{ off: r.off + @truncate(u32, b), len: r.len - @truncate(u32, b), raw: r.raw };
         insert_after(p.doc, link, rest);
     }
@@ -3486,7 +3506,7 @@ fn in_tight_list(doc: *Document, id: u32) bool {
         return false;
     }
     let g = doc.node(gp);
-    return (g.kind == LIST) and g.tight;
+    return (g.kind == Kind.LIST) and g.tight;
 }
 
 /// The plain text of a node's descendants (for alt text).
@@ -3502,9 +3522,9 @@ fn plain_into(doc: *Document, id: u32, out: *mut strs.String) !void {
     while true {
         let n = doc.node(w.id);
         if w.entering {
-            if (n.kind == TEXT) or (n.kind == CODE) or (n.kind == HTML_INLINE) {
+            if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) {
                 out.push_str(doc.text(w.id))!;
-            } else if (n.kind == SOFT_BREAK) or (n.kind == HARD_BREAK) {
+            } else if (n.kind == Kind.SOFT_BREAK) or (n.kind == Kind.HARD_BREAK) {
                 out.push(' ')!;
             }
         }
@@ -3540,9 +3560,9 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                 // falls through to close the image
             } else {
                 if entering {
-                    if (n.kind == TEXT) or (n.kind == CODE) or (n.kind == HTML_INLINE) {
+                    if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) {
                         escape_html(out, doc.text(id))!;
-                    } else if (n.kind == SOFT_BREAK) or (n.kind == HARD_BREAK) {
+                    } else if (n.kind == Kind.SOFT_BREAK) or (n.kind == Kind.HARD_BREAK) {
                         out.push(' ')!;
                     }
                 }
@@ -3550,16 +3570,16 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
             }
         }
         let k = n.kind;
-        if k == DOCUMENT {
+        if k == Kind.DOCUMENT {
             // nothing
-        } else if k == BLOCK_QUOTE {
+        } else if k == Kind.BLOCK_QUOTE {
             cr(out)!;
             if entering {
                 out.push_str("<blockquote>\n")!;
             } else {
                 out.push_str("</blockquote>\n")!;
             }
-        } else if k == LIST {
+        } else if k == Kind.LIST {
             cr(out)!;
             if entering {
                 if n.ordered {
@@ -3578,19 +3598,19 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
             } else {
                 out.push_str("</ul>\n")!;
             }
-        } else if k == ITEM {
+        } else if k == Kind.ITEM {
             if entering {
                 cr(out)!;
                 out.push_str("<li>")!;
-                if n.task == TASK_OPEN {
+                if n.task == Task.OPEN {
                     out.push_str("<input disabled=\"\" type=\"checkbox\"> ")!;
-                } else if n.task == TASK_DONE {
+                } else if n.task == Task.DONE {
                     out.push_str("<input checked=\"\" disabled=\"\" type=\"checkbox\"> ")!;
                 }
             } else {
                 out.push_str("</li>\n")!;
             }
-        } else if k == HEADING {
+        } else if k == Kind.HEADING {
             if entering {
                 cr(out)!;
                 out.push_str("<h")!;
@@ -3601,7 +3621,7 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                 out.push('0' + n.level)!;
                 out.push_str(">\n")!;
             }
-        } else if k == CODE_BLOCK {
+        } else if k == Kind.CODE_BLOCK {
             cr(out)!;
             let info = doc.info(id);
             if info.len == 0 {
@@ -3617,7 +3637,7 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
             }
             escape_html(out, doc.text(id))!;
             out.push_str("</code></pre>\n")!;
-        } else if k == HTML_BLOCK {
+        } else if k == Kind.HTML_BLOCK {
             cr(out)!;
             if opts.unsafe_html {
                 raw_html(out, doc.text(id), opts.tagfilter)!;
@@ -3625,10 +3645,10 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                 out.push_str("<!-- raw HTML omitted -->")!;
             }
             cr(out)!;
-        } else if k == THEMATIC_BREAK {
+        } else if k == Kind.THEMATIC_BREAK {
             cr(out)!;
             out.push_str("<hr />\n")!;
-        } else if k == PARAGRAPH {
+        } else if k == Kind.PARAGRAPH {
             if not in_tight_list(doc, id) {
                 if entering {
                     cr(out)!;
@@ -3637,7 +3657,7 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                     out.push_str("</p>\n")!;
                 }
             }
-        } else if k == TABLE {
+        } else if k == Kind.TABLE {
             if entering {
                 cr(out)!;
                 out.push_str("<table>\n")!;
@@ -3649,7 +3669,7 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                 }
                 out.push_str("</table>\n")!;
             }
-        } else if k == TABLE_ROW {
+        } else if k == Kind.TABLE_ROW {
             if entering {
                 if n.header {
                     out.push_str("<thead>\n")!;
@@ -3663,7 +3683,7 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                     out.push_str("</thead>\n")!;
                 }
             }
-        } else if k == TABLE_CELL {
+        } else if k == Kind.TABLE_CELL {
             let header = doc.node(n.parent).header;
             if entering {
                 if header {
@@ -3671,11 +3691,11 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
                 } else {
                     out.push_str("<td")!;
                 }
-                if n.align == ALIGN_LEFT {
+                if n.align == Align.LEFT {
                     out.push_str(" align=\"left\"")!;
-                } else if n.align == ALIGN_CENTER {
+                } else if n.align == Align.CENTER {
                     out.push_str(" align=\"center\"")!;
-                } else if n.align == ALIGN_RIGHT {
+                } else if n.align == Align.RIGHT {
                     out.push_str(" align=\"right\"")!;
                 }
                 out.push('>')!;
@@ -3684,45 +3704,45 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
             } else {
                 out.push_str("</td>\n")!;
             }
-        } else if k == TEXT {
+        } else if k == Kind.TEXT {
             escape_html(out, doc.text(id))!;
-        } else if k == SOFT_BREAK {
+        } else if k == Kind.SOFT_BREAK {
             if opts.hard_breaks {
                 out.push_str("<br />\n")!;
             } else {
                 out.push('\n')!;
             }
-        } else if k == HARD_BREAK {
+        } else if k == Kind.HARD_BREAK {
             out.push_str("<br />\n")!;
-        } else if k == CODE {
+        } else if k == Kind.CODE {
             out.push_str("<code>")!;
             escape_html(out, doc.text(id))!;
             out.push_str("</code>")!;
-        } else if k == HTML_INLINE {
+        } else if k == Kind.HTML_INLINE {
             if opts.unsafe_html {
                 raw_html(out, doc.text(id), opts.tagfilter)!;
             } else {
                 out.push_str("<!-- raw HTML omitted -->")!;
             }
-        } else if k == EMPH {
+        } else if k == Kind.EMPH {
             if entering {
                 out.push_str("<em>")!;
             } else {
                 out.push_str("</em>")!;
             }
-        } else if k == STRONG {
+        } else if k == Kind.STRONG {
             if entering {
                 out.push_str("<strong>")!;
             } else {
                 out.push_str("</strong>")!;
             }
-        } else if k == STRIKETHROUGH {
+        } else if k == Kind.STRIKETHROUGH {
             if entering {
                 out.push_str("<del>")!;
             } else {
                 out.push_str("</del>")!;
             }
-        } else if k == LINK {
+        } else if k == Kind.LINK {
             if entering {
                 out.push_str("<a href=\"")!;
                 let url = doc.url(id);
@@ -3740,7 +3760,7 @@ fn render_html(doc: *Document, out: *mut strs.String) !void {
             } else {
                 out.push_str("</a>")!;
             }
-        } else if k == IMAGE {
+        } else if k == Kind.IMAGE {
             if entering {
                 out.push_str("<img src=\"")!;
                 let url = doc.url(id);
@@ -3883,20 +3903,20 @@ test "tree" {
     let mut doc = parse("# Title *em*\n\n- [x] done\n- [ ] todo\n\n```go\nfmt.Println()\n```\n", Options.init())!;
     defer doc.deinit();
     let root = doc.node(doc.root());
-    @expect_eq(root.kind, DOCUMENT);
+    @expect(root.kind == Kind.DOCUMENT);
     let h = doc.node(root.first);
-    @expect_eq(h.kind, HEADING);
+    @expect(h.kind == Kind.HEADING);
     @expect_eq(h.level, 1);
     let t = doc.plain_text(root.first)!;
     defer mem.free(t);
     @expect(strs.eq(t, "Title em"));
     let list = doc.node(h.next);
-    @expect_eq(list.kind, LIST);
+    @expect(list.kind == Kind.LIST);
     @expect(list.tight);
-    @expect_eq(doc.node(list.first).task, TASK_DONE);
-    @expect_eq(doc.node(doc.node(list.first).next).task, TASK_OPEN);
+    @expect(doc.node(list.first).task == Task.DONE);
+    @expect(doc.node(doc.node(list.first).next).task == Task.OPEN);
     let code = list.next;
-    @expect_eq(doc.node(code).kind, CODE_BLOCK);
+    @expect(doc.node(code).kind == Kind.CODE_BLOCK);
     @expect(strs.eq(doc.info(code), "go"));
     @expect(strs.eq(doc.text(code), "fmt.Println()\n"));
     // a walk enters and leaves containers, and enters leaves once

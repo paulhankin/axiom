@@ -439,7 +439,7 @@ pub fn is_mark_gc(gc: u32) bool {
 /// _hb_glyph_info_set_unicode_props).
 pub fn set_unicode_props(b: *mut buf.Buffer, i: *mut buf.Info) void {
     let u = i.cp;
-    let gc = uni.category(u);
+    let gc = uni.category_code(u);
     let mut props = @truncate(u16, gc);
     if u >= 0x80 {
         if is_default_ignorable(u) {

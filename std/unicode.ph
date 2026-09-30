@@ -2,7 +2,7 @@
 // std/unicode.ph - Unicode: character properties, case mapping and folding,
 // normalization, text segmentation (UAX #29), display width, UTF-16.
 //
-//     unicode.category(cp) == unicode.GC_LU        // an uppercase letter
+//     unicode.category(cp) == unicode.Category.LU  // an uppercase letter
 //     let up = unicode.upper("straße")!;           // "STRASSE"; mem.free it
 //     unicode.equal_fold("Straße", "STRASSE")      // true
 //     let n = unicode.nfc(bytes)!;                 // composed form; mem.free it
@@ -27,45 +27,55 @@ pub let VERSION: []u8 = "15.1.0";
 // Properties
 // -----------------------------------------------------------------------------
 
-/// General categories (as category() returns them).
-pub const GC_CN: u32 = 0;
-pub const GC_LU: u32 = 1;
-pub const GC_LL: u32 = 2;
-pub const GC_LT: u32 = 3;
-pub const GC_LM: u32 = 4;
-pub const GC_LO: u32 = 5;
-pub const GC_MN: u32 = 6;
-pub const GC_MC: u32 = 7;
-pub const GC_ME: u32 = 8;
-pub const GC_ND: u32 = 9;
-pub const GC_NL: u32 = 10;
-pub const GC_NO: u32 = 11;
-pub const GC_PC: u32 = 12;
-pub const GC_PD: u32 = 13;
-pub const GC_PS: u32 = 14;
-pub const GC_PE: u32 = 15;
-pub const GC_PI: u32 = 16;
-pub const GC_PF: u32 = 17;
-pub const GC_PO: u32 = 18;
-pub const GC_SM: u32 = 19;
-pub const GC_SC: u32 = 20;
-pub const GC_SK: u32 = 21;
-pub const GC_SO: u32 = 22;
-pub const GC_ZS: u32 = 23;
-pub const GC_ZL: u32 = 24;
-pub const GC_ZP: u32 = 25;
-pub const GC_CC: u32 = 26;
-pub const GC_CF: u32 = 27;
-pub const GC_CS: u32 = 28;
-pub const GC_CO: u32 = 29;
+/// General categories (as category() returns them). The values are the
+/// std/unicode/tables codes (t.GC_*).
+pub enum Category: u32 {
+    CN,
+    LU,
+    LL,
+    LT,
+    LM,
+    LO,
+    MN,
+    MC,
+    ME,
+    ND,
+    NL,
+    NO,
+    PC,
+    PD,
+    PS,
+    PE,
+    PI,
+    PF,
+    PO,
+    SM,
+    SC,
+    SK,
+    SO,
+    ZS,
+    ZL,
+    ZP,
+    CC,
+    CF,
+    CS,
+    CO,
+
+    /// The two-letter name ("Lu", "Nd", ...).
+    pub fn name(self: Category) []u8 {
+        return t.GC_NAMES[@as(usize, @int_from_enum(self))];
+    }
+}
 
 /// East Asian widths (east_asian_width).
-pub const EA_N: u32 = 0;
-pub const EA_A: u32 = 1;
-pub const EA_H: u32 = 2;
-pub const EA_W: u32 = 3;
-pub const EA_F: u32 = 4;
-pub const EA_NA: u32 = 5;
+pub enum EastAsianWidth: u32 {
+    N,
+    A,
+    H,
+    W,
+    F,
+    NA,
+}
 
 /// The property record of a code point.
 fn rec(cp: u32) u64 {
@@ -95,48 +105,54 @@ fn flag(cp: u32, off: u32) bool {
     return field(rec(cp), off, 1) == 1;
 }
 
-/// The general category (GC_*).
-pub fn category(cp: u32) u32 {
+/// The general category.
+pub fn category(cp: u32) Category {
+    return @enum_from_int(Category, category_code(cp));
+}
+
+/// The general category as its std/unicode/tables code (t.GC_*), for
+/// table-driven code that indexes or ranges over categories.
+pub fn category_code(cp: u32) u32 {
     return field(rec(cp), t.F_GC, t.W_GC);
 }
 
 /// The two-letter name of a category ("Lu", "Nd", ...).
-pub fn category_name(gc: u32) []u8 {
-    return t.GC_NAMES[@as(usize, gc) % t.GC_NAMES.len];
+pub fn category_name(gc: Category) []u8 {
+    return gc.name();
 }
 
 pub fn is_letter(cp: u32) bool {
-    let c = category(cp);
-    return (c >= GC_LU) and (c <= GC_LO);
+    let c = category_code(cp);
+    return (c >= t.GC_LU) and (c <= t.GC_LO);
 }
 
 pub fn is_mark(cp: u32) bool {
-    let c = category(cp);
-    return (c >= GC_MN) and (c <= GC_ME);
+    let c = category_code(cp);
+    return (c >= t.GC_MN) and (c <= t.GC_ME);
 }
 
 /// A decimal digit (category Nd) in any script.
 pub fn is_digit(cp: u32) bool {
-    return category(cp) == GC_ND;
+    return category_code(cp) == t.GC_ND;
 }
 
 pub fn is_number(cp: u32) bool {
-    let c = category(cp);
-    return (c >= GC_ND) and (c <= GC_NO);
+    let c = category_code(cp);
+    return (c >= t.GC_ND) and (c <= t.GC_NO);
 }
 
 pub fn is_punct(cp: u32) bool {
-    let c = category(cp);
-    return (c >= GC_PC) and (c <= GC_PO);
+    let c = category_code(cp);
+    return (c >= t.GC_PC) and (c <= t.GC_PO);
 }
 
 pub fn is_symbol(cp: u32) bool {
-    let c = category(cp);
-    return (c >= GC_SM) and (c <= GC_SO);
+    let c = category_code(cp);
+    return (c >= t.GC_SM) and (c <= t.GC_SO);
 }
 
 pub fn is_control(cp: u32) bool {
-    return category(cp) == GC_CC;
+    return category_code(cp) == t.GC_CC;
 }
 
 /// The White_Space property.
@@ -162,8 +178,8 @@ pub fn is_lower(cp: u32) bool {
 /// Letters, marks, numbers, punctuation, symbols and spaces (not controls,
 /// formats, surrogates, private use or unassigned).
 pub fn is_graphic(cp: u32) bool {
-    let c = category(cp);
-    return (c >= GC_LU) and (c <= GC_ZS);
+    let c = category_code(cp);
+    return (c >= t.GC_LU) and (c <= t.GC_ZS);
 }
 
 /// Whether cp may start an identifier (ID_Start) or continue one
@@ -181,9 +197,9 @@ pub fn combining_class(cp: u32) u32 {
     return field(rec(cp), t.F_CCC, t.W_CCC);
 }
 
-/// The East Asian Width property (EA_*).
-pub fn east_asian_width(cp: u32) u32 {
-    return field(rec(cp), t.F_EA, t.W_EA);
+/// The East Asian Width property.
+pub fn east_asian_width(cp: u32) EastAsianWidth {
+    return @enum_from_int(EastAsianWidth, field(rec(cp), t.F_EA, t.W_EA));
 }
 
 /// The Bidi_Class property (see std/unicode/tables: BIDI_*).
@@ -257,14 +273,14 @@ pub fn width(cp: u32) i32 {
     }
     let r = rec(cp);
     let gc = field(r, t.F_GC, t.W_GC);
-    if (gc == GC_MN) or (gc == GC_ME) or (gc == GC_CF) or (field(r, t.F_IGNORABLE, 1) == 1) {
+    if (gc == t.GC_MN) or (gc == t.GC_ME) or (gc == t.GC_CF) or (field(r, t.F_IGNORABLE, 1) == 1) {
         return 0;
     }
     if ((cp >= 0x1160) and (cp <= 0x11ff)) or ((cp >= 0xd7b0) and (cp <= 0xd7ff)) {
         return 0;  // Hangul medial vowels and final consonants join the syllable
     }
     let ea = field(r, t.F_EA, t.W_EA);
-    if (ea == EA_W) or (ea == EA_F) or (field(r, t.F_EMOJI_PRES, 1) == 1) {
+    if (ea == t.EA_W) or (ea == t.EA_F) or (field(r, t.F_EMOJI_PRES, 1) == 1) {
         return 2;
     }
     return 1;
@@ -367,16 +383,18 @@ fn push_cp(out: *mut strs.String, cp: u32) !void {
     out.push_str(strs.encode_rune(b[..], cp))!;
 }
 
-const UPPER_MODE: u8 = 0;
-const LOWER_MODE: u8 = 1;
-const FOLD_MODE: u8 = 2;
-const TITLE_MODE: u8 = 3;
+enum CaseMode: u8 {
+    UPPER,
+    LOWER,
+    FOLD,
+    TITLE,
+}
 
 /// Appends the full mapping of cp in a mode.
-fn map_full(out: *mut strs.String, cp: u32, mode: u8) !void {
+fn map_full(out: *mut strs.String, cp: u32, mode: CaseMode) !void {
     if cp < 0x80 {
         let mut c = cp;
-        if (mode == UPPER_MODE) or (mode == TITLE_MODE) {
+        if (mode == CaseMode.UPPER) or (mode == CaseMode.TITLE) {
             c = to_upper(cp);
         } else {
             c = to_lower(cp);
@@ -385,11 +403,11 @@ fn map_full(out: *mut strs.String, cp: u32, mode: u8) !void {
         return;
     }
     let mut seq: []u32 = t.SPECIAL_UPPER_POOL[..0];
-    if mode == UPPER_MODE {
+    if mode == CaseMode.UPPER {
         seq = seq_lookup(t.SPECIAL_UPPER_KEYS[..], t.SPECIAL_UPPER_SEQ[..], t.SPECIAL_UPPER_POOL[..], cp);
-    } else if mode == LOWER_MODE {
+    } else if mode == CaseMode.LOWER {
         seq = seq_lookup(t.SPECIAL_LOWER_KEYS[..], t.SPECIAL_LOWER_SEQ[..], t.SPECIAL_LOWER_POOL[..], cp);
-    } else if mode == TITLE_MODE {
+    } else if mode == CaseMode.TITLE {
         seq = seq_lookup(t.SPECIAL_TITLE_KEYS[..], t.SPECIAL_TITLE_SEQ[..], t.SPECIAL_TITLE_POOL[..], cp);
     } else {
         seq = seq_lookup(t.FULL_FOLD_KEYS[..], t.FULL_FOLD_SEQ[..], t.FULL_FOLD_POOL[..], cp);
@@ -401,11 +419,11 @@ fn map_full(out: *mut strs.String, cp: u32, mode: u8) !void {
         return;
     }
     let mut c = cp;
-    if mode == UPPER_MODE {
+    if mode == CaseMode.UPPER {
         c = to_upper(cp);
-    } else if mode == LOWER_MODE {
+    } else if mode == CaseMode.LOWER {
         c = to_lower(cp);
-    } else if mode == TITLE_MODE {
+    } else if mode == CaseMode.TITLE {
         c = to_title(cp);
     } else {
         c = fold(cp);
@@ -449,7 +467,7 @@ fn final_sigma(s: []u8, i: usize, len: usize) bool {
     return true;
 }
 
-fn map_string(s: []u8, mode: u8) ![]mut u8 {
+fn map_string(s: []u8, mode: CaseMode) ![]mut u8 {
     let mut out = strs.String.init();
     map_into(s, mode, &mut out) catch |e| {
         out.deinit();
@@ -458,7 +476,7 @@ fn map_string(s: []u8, mode: u8) ![]mut u8 {
     return out.take();
 }
 
-fn map_into(s: []u8, mode: u8, out: *mut strs.String) !void {
+fn map_into(s: []u8, mode: CaseMode, out: *mut strs.String) !void {
     out.reserve(s.len)!;
     let mut i: usize = 0;
     while i < s.len {
@@ -466,7 +484,7 @@ fn map_into(s: []u8, mode: u8, out: *mut strs.String) !void {
         if b < 0x80 {
             // ASCII maps only between A-Z and a-z
             let mut c = b;
-            let up = (mode == UPPER_MODE) or (mode == TITLE_MODE);
+            let up = (mode == CaseMode.UPPER) or (mode == CaseMode.TITLE);
             if up and (b >= 'a') and (b <= 'z') {
                 c = b - 32;
             } else if not up and (b >= 'A') and (b <= 'Z') {
@@ -477,7 +495,7 @@ fn map_into(s: []u8, mode: u8, out: *mut strs.String) !void {
             continue;
         }
         let r = strs.decode_rune(s[i..]);
-        if (mode == LOWER_MODE) and (r.value == 0x3a3) and final_sigma(s, i, r.len) {
+        if (mode == CaseMode.LOWER) and (r.value == 0x3a3) and final_sigma(s, i, r.len) {
             push_cp(out, 0x3c2)!;
         } else {
             map_full(out, r.value, mode)!;
@@ -488,19 +506,19 @@ fn map_into(s: []u8, mode: u8, out: *mut strs.String) !void {
 
 /// Text in uppercase, with the full mappings ("ß" becomes "SS").
 pub fn upper(s: []u8) ![]mut u8 {
-    return map_string(s, UPPER_MODE);
+    return map_string(s, CaseMode.UPPER);
 }
 
 /// Text in lowercase, with the full mappings and the final-sigma rule
 /// ("ΟΔΟΣ" becomes "οδος").
 pub fn lower(s: []u8) ![]mut u8 {
-    return map_string(s, LOWER_MODE);
+    return map_string(s, CaseMode.LOWER);
 }
 
 /// Full case folding, for caseless matching ("Straße" and "STRASSE" fold
 /// alike).
 pub fn case_fold(s: []u8) ![]mut u8 {
-    return map_string(s, FOLD_MODE);
+    return map_string(s, CaseMode.FOLD);
 }
 
 /// Title case: in each word (UAX #29), the first cased character in
@@ -524,12 +542,12 @@ fn title_into(s: []u8, out: *mut strs.String) !void {
         while i < word.len {
             let r = strs.decode_rune(word[i..]);
             if not seen and is_cased(r.value) {
-                map_full(out, r.value, TITLE_MODE)!;
+                map_full(out, r.value, CaseMode.TITLE)!;
                 seen = true;
             } else if (r.value == 0x3a3) and final_sigma(s, base + i, r.len) {
                 push_cp(out, 0x3c2)!;
             } else {
-                map_full(out, r.value, LOWER_MODE)!;
+                map_full(out, r.value, CaseMode.LOWER)!;
             }
             i += r.len;
         }
@@ -602,10 +620,12 @@ const N_COUNT: u32 = 588;    // V_COUNT * T_COUNT
 const S_COUNT: u32 = 11172;  // L_COUNT * N_COUNT
 
 /// The normalization forms.
-pub const NFC: u8 = 0;
-pub const NFD: u8 = 1;
-pub const NFKC: u8 = 2;
-pub const NFKD: u8 = 3;
+pub enum Form: u8 {
+    NFC,
+    NFD,
+    NFKC,
+    NFKD,
+}
 
 /// Appends the full decomposition of cp.
 fn decompose_cp(cp: u32, compat: bool, out: *mut vec.Vec.[u32]) !void {
@@ -780,9 +800,9 @@ fn compose(cps: []mut u32) usize {
 }
 
 /// Text in a normalization form (NFC, NFD, NFKC or NFKD).
-pub fn normalize(s: []u8, form: u8) ![]mut u8 {
-    let compat = (form == NFKC) or (form == NFKD);
-    let composed = (form == NFC) or (form == NFKC);
+pub fn normalize(s: []u8, form: Form) ![]mut u8 {
+    let compat = (form == Form.NFKC) or (form == Form.NFKD);
+    let composed = (form == Form.NFC) or (form == Form.NFKC);
     // ASCII is in every form
     let mut ascii = true;
     for b in s {
@@ -823,23 +843,23 @@ pub fn normalize(s: []u8, form: u8) ![]mut u8 {
 }
 
 pub fn nfc(s: []u8) ![]mut u8 {
-    return normalize(s, NFC);
+    return normalize(s, Form.NFC);
 }
 
 pub fn nfd(s: []u8) ![]mut u8 {
-    return normalize(s, NFD);
+    return normalize(s, Form.NFD);
 }
 
 pub fn nfkc(s: []u8) ![]mut u8 {
-    return normalize(s, NFKC);
+    return normalize(s, Form.NFKC);
 }
 
 pub fn nfkd(s: []u8) ![]mut u8 {
-    return normalize(s, NFKD);
+    return normalize(s, Form.NFKD);
 }
 
 /// Whether text is already in a normalization form.
-pub fn is_normalized(s: []u8, form: u8) !bool {
+pub fn is_normalized(s: []u8, form: Form) !bool {
     let n = normalize(s, form)!;
     defer mem.free(n);
     return @mem_eq(n, s);
@@ -1497,13 +1517,15 @@ fn read_optional(p: []u8) ![]mut u8 {
     return f.reader().read_all();
 }
 
-const SEG_GRAPHEME: u8 = 0;
-const SEG_WORD: u8 = 1;
-const SEG_SENTENCE: u8 = 2;
+enum Segmentation: u8 {
+    GRAPHEME,
+    WORD,
+    SENTENCE,
+}
 
 /// Runs a UCD segmentation test file (lines like "÷ 0020 × 0308 ÷"):
 /// returns [cases, failures], or [0, 0] if the file is missing.
-fn run_seg_test(file: []u8, kind: u8) ![2]usize {
+fn run_seg_test(file: []u8, kind: Segmentation) ![2]usize {
     let data = read_optional(file) catch return [@as(usize, 0), 0];
     defer mem.free(data);
     let mut cases: usize = 0;
@@ -1538,7 +1560,7 @@ fn run_seg_test(file: []u8, kind: u8) ![2]usize {
         let mut got = vec.Vec.[usize].init();
         defer got.deinit();
         got.push(0)!;
-        if kind == SEG_GRAPHEME {
+        if kind == Segmentation.GRAPHEME {
             let mut it = graphemes(s);
             let mut at: usize = 0;
             loop {
@@ -1546,7 +1568,7 @@ fn run_seg_test(file: []u8, kind: u8) ![2]usize {
                 at += piece.len;
                 got.push(at)!;
             }
-        } else if kind == SEG_WORD {
+        } else if kind == Segmentation.WORD {
             let mut it = words(s);
             let mut at: usize = 0;
             loop {
@@ -1595,20 +1617,20 @@ fn fmt_parse_hex(s: []u8) u32 {
 }
 
 test "segmentation conformance (UCD test files, when installed)" {
-    let g = run_seg_test("/usr/share/unicode/auxiliary/GraphemeBreakTest.txt", SEG_GRAPHEME)!;
+    let g = run_seg_test("/usr/share/unicode/auxiliary/GraphemeBreakTest.txt", Segmentation.GRAPHEME)!;
     @expect_eq(g[1], 0);
-    let w = run_seg_test("/usr/share/unicode/auxiliary/WordBreakTest.txt", SEG_WORD)!;
+    let w = run_seg_test("/usr/share/unicode/auxiliary/WordBreakTest.txt", Segmentation.WORD)!;
     @expect_eq(w[1], 0);
-    let s = run_seg_test("/usr/share/unicode/auxiliary/SentenceBreakTest.txt", SEG_SENTENCE)!;
+    let s = run_seg_test("/usr/share/unicode/auxiliary/SentenceBreakTest.txt", Segmentation.SENTENCE)!;
     @expect_eq(s[1], 0);
 }
 
 test "properties" {
-    @expect_eq(category('A'), GC_LU);
-    @expect_eq(category(0x3b1), GC_LL);  // α
-    @expect_eq(category(0x662), GC_ND);  // Arabic-Indic two
-    @expect_eq(category(0x10ffff), GC_CN);
-    @expect_eq(category(0xe000), GC_CO);
+    @expect(category('A') == Category.LU);
+    @expect(category(0x3b1) == Category.LL);  // α
+    @expect(category(0x662) == Category.ND);  // Arabic-Indic two
+    @expect(category(0x10ffff) == Category.CN);
+    @expect(category(0xe000) == Category.CO);
     @expect_eq(category_name(category(0x20ac)), "Sc");  // €
     @expect(is_space(0x3000));
     @expect(not is_space('x'));
@@ -1616,7 +1638,7 @@ test "properties" {
     @expect(is_alphabetic(0x4e2d));
     @expect(is_upper(0x10400));
     @expect_eq(combining_class(0x301), 230);
-    @expect_eq(east_asian_width(0x4e2d), EA_W);
+    @expect(east_asian_width(0x4e2d) == EastAsianWidth.W);
     @expect_eq(mirror('('), ')');
     @expect(is_id_start('_') == false);
     @expect(is_id_continue('_'));
@@ -1663,8 +1685,8 @@ test "normalization" {
     // canonical ordering: dot below (220) before acute (230)
     expect_map(nfd, "a\xcc\x81\xcc\xa3", "a\xcc\xa3\xcc\x81")!;
     expect_map(nfc, "a\xcc\x81\xcc\xa3", "\xe1\xba\xa1\xcc\x81")!;
-    @expect(is_normalized("caf\xc3\xa9", NFC)!);
-    @expect(not is_normalized("cafe\xcc\x81", NFC)!);
+    @expect(is_normalized("caf\xc3\xa9", Form.NFC)!);
+    @expect(not is_normalized("cafe\xcc\x81", Form.NFC)!);
 }
 
 test "segmentation" {

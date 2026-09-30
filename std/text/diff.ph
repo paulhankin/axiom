@@ -31,17 +31,19 @@ import "../str.ph" as strs;
 error { InvalidPatch, Conflict, OutOfMemory }
 
 /// Edit operations.
-pub const EQUAL: u8 = 0;
-pub const DELETE: u8 = 1;   // a[a_start..a_end] is removed
-pub const INSERT: u8 = 2;   // b[b_start..b_end] is added
-pub const REPLACE: u8 = 3;  // a[a_start..a_end] becomes b[b_start..b_end]
+pub enum Op: u8 {
+    EQUAL,
+    DELETE,   // a[a_start..a_end] is removed
+    INSERT,   // b[b_start..b_end] is added
+    REPLACE,  // a[a_start..a_end] becomes b[b_start..b_end]
+}
 
 /// A run of one operation: the lines (or tokens) a[a_start..a_end] of the
-/// old sequence and b[b_start..b_end] of the new. For EQUAL they are the
-/// same; for DELETE the b range is empty (at the place of the deletion),
-/// and for INSERT the a range is.
+/// old sequence and b[b_start..b_end] of the new. For Op.EQUAL they are the
+/// same; for Op.DELETE the b range is empty (at the place of the deletion),
+/// and for Op.INSERT the a range is.
 pub struct Edit {
-    op: u8,
+    op: Op,
     a_start: usize,
     a_end: usize,
     b_start: usize,
@@ -49,8 +51,8 @@ pub struct Edit {
 }
 
 /// The line-by-line differences of two texts, as a list of runs covering
-/// both (so the EQUAL, DELETE and REPLACE runs cover a in order, and the
-/// EQUAL, INSERT and REPLACE runs cover b). The caller frees the result.
+/// both (so the Op.EQUAL, Op.DELETE and Op.REPLACE runs cover a in order, and the
+/// Op.EQUAL, Op.INSERT and Op.REPLACE runs cover b). The caller frees the result.
 pub fn lines(a: []u8, b: []u8) ![]mut Edit {
     let mut la = split_lines(a)!;
     defer la.deinit();
@@ -146,7 +148,7 @@ fn runs(ca: []bool, cb: []bool) ![]mut Edit {
             j += 1;
         }
         if i > i0 {
-            out.push(Edit.{ op: EQUAL, a_start: i0, a_end: i, b_start: j0, b_end: j }) catch |e| {
+            out.push(Edit.{ op: Op.EQUAL, a_start: i0, a_end: i, b_start: j0, b_end: j }) catch |e| {
                 out.deinit();
                 return e;
             };
@@ -158,11 +160,11 @@ fn runs(ca: []bool, cb: []bool) ![]mut Edit {
         while (j < cb.len) and cb[j] {
             j += 1;
         }
-        let mut op = REPLACE;
+        let mut op = Op.REPLACE;
         if j == j0 {
-            op = DELETE;
+            op = Op.DELETE;
         } else if i == i0 {
-            op = INSERT;
+            op = Op.INSERT;
         }
         out.push(Edit.{ op: op, a_start: i0, a_end: i, b_start: j0, b_end: j }) catch |e| {
             out.deinit();
@@ -410,14 +412,14 @@ pub fn unified(a: []u8, b: []u8, name_a: []u8, name_b: []u8, context: usize, w: 
     let mut k: usize = 0;
     let mut header = false;
     while k < edits.len {
-        if edits[k].op == EQUAL {
+        if edits[k].op == Op.EQUAL {
             k += 1;
             continue;
         }
         // a hunk: changes separated by at most 2 context lines of equality
         let mut end = k + 1;
         while end < edits.len {
-            if edits[end].op != EQUAL {
+            if edits[end].op != Op.EQUAL {
                 end += 1;
                 continue;
             }
@@ -450,7 +452,7 @@ pub fn unified(a: []u8, b: []u8, name_a: []u8, name_b: []u8, context: usize, w: 
             put_line(w, " ", al[i])!;
         }
         for e in edits[k..end] {
-            if e.op == EQUAL {
+            if e.op == Op.EQUAL {
                 for i in e.a_start..e.a_end {
                     put_line(w, " ", al[i])!;
                 }
@@ -769,7 +771,7 @@ test "minimal, and patches apply" {
         let mut kept: usize = 0;
         for e in edits {
             @expect((e.a_start == ai) and (e.b_start == bi));
-            if e.op == EQUAL {
+            if e.op == Op.EQUAL {
                 for k in @as(usize, 0)..(e.a_end - e.a_start) {
                     @expect(ta[e.a_start + k] == tb[e.b_start + k]);
                 }

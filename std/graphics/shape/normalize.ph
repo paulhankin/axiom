@@ -113,7 +113,7 @@ fn compose_hebrew(a: u32, b: u32) u32 {
 
 fn compose_pair(p: *plan.Plan, a: u32, b: u32) u32 {
     if p.shaper == plan.SHAPER_INDIC {
-        if plan.is_mark_gc(uni.category(a)) {
+        if plan.is_mark_gc(uni.category_code(a)) {
             return 0;
         }
         if (a == 0x09af) and (b == 0x09bc) {

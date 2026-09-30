@@ -636,23 +636,23 @@ struct Decoder {
             let mut v = Value.Nil;
             let mut n: usize = 0;
             let kind = self.item(&mut v, &mut n)!;
-            if (kind != K_SCALAR) and (n > 0) {
+            if (kind != ItemKind.SCALAR) and (n > 0) {
                 if frames.len >= @as(usize, MAX_DEPTH) {
                     return error.TooDeep;
                 }
                 let mut need = n;
-                if kind == K_MAP {
+                if kind == ItemKind.MAP {
                     need = n * 2;
                 }
                 if need > (self.s.len - self.i) {
                     return error.Truncated;  // (each value takes a byte at least)
                 }
-                frames.push(Frame.{ is_map: kind == K_MAP, left: need, start: vals.len })!;
+                frames.push(Frame.{ is_map: kind == ItemKind.MAP, left: need, start: vals.len })!;
                 continue;
             }
-            if kind == K_ARRAY {
+            if kind == ItemKind.ARRAY {
                 v = Value.Array(@slice_from_ptr(@ptr_from_int(*Value, 8), 0));
-            } else if kind == K_MAP {
+            } else if kind == ItemKind.MAP {
                 v = Value.Map(@slice_from_ptr(@ptr_from_int(*Pair, 8), 0));
             }
             // v is complete: add it to the open containers, closing those that fill up
@@ -684,49 +684,49 @@ struct Decoder {
 
     // Reads one item: a scalar into v, or the header of an array or map
     // (its length into n).
-    fn item(self: *mut Decoder, v: *mut Value, n: *mut usize) !u8 {
+    fn item(self: *mut Decoder, v: *mut Value, n: *mut usize) !ItemKind {
         let b = self.take(1)![0];
         if b < 0x80 {
             v.* = Value.Int(@as(i64, b));
-            return K_SCALAR;
+            return ItemKind.SCALAR;
         }
         if b >= 0xe0 {
             v.* = Value.Int(@as(i64, @bit_cast(i8, b)));
-            return K_SCALAR;
+            return ItemKind.SCALAR;
         }
         if b < 0x90 {
             n.* = @as(usize, b & 15);
-            return K_MAP;
+            return ItemKind.MAP;
         }
         if b < 0xa0 {
             n.* = @as(usize, b & 15);
-            return K_ARRAY;
+            return ItemKind.ARRAY;
         }
         if b < 0xc0 {
             v.* = self.string(@as(usize, b & 31))!;
-            return K_SCALAR;
+            return ItemKind.SCALAR;
         }
         match b {
             0xdc => {
                 n.* = self.len_n(2)!;
-                return K_ARRAY;
+                return ItemKind.ARRAY;
             }
             0xdd => {
                 n.* = self.len_n(4)!;
-                return K_ARRAY;
+                return ItemKind.ARRAY;
             }
             0xde => {
                 n.* = self.len_n(2)!;
-                return K_MAP;
+                return ItemKind.MAP;
             }
             0xdf => {
                 n.* = self.len_n(4)!;
-                return K_MAP;
+                return ItemKind.MAP;
             }
             else => {}
         }
         v.* = self.scalar(b)!;
-        return K_SCALAR;
+        return ItemKind.SCALAR;
     }
 
     fn scalar(self: *mut Decoder, b: u8) !Value {
@@ -769,9 +769,11 @@ struct Decoder {
     }
 }
 
-const K_SCALAR: u8 = 0;
-const K_ARRAY: u8 = 1;
-const K_MAP: u8 = 2;
+enum ItemKind: u8 {
+    SCALAR,
+    ARRAY,
+    MAP,
+}
 
 struct Frame {
     is_map: bool,
@@ -789,24 +791,24 @@ struct Frame {
 pub fn to_json(out: io.Writer, v: Value) !void {
     let mut work = vec.Vec.[Item].init();
     defer work.deinit();
-    work.push(Item.{ v: v, op: OP_VALUE })!;
+    work.push(Item.{ v: v, op: Step.VALUE })!;
     while work.len > 0 {
         let it = work.pop()!;
         let op = it.op;
-        if op == OP_CLOSE_ARRAY {
+        if op == Step.CLOSE_ARRAY {
             out.write_all("]")!;
             continue;
         }
-        if op == OP_CLOSE_MAP {
+        if op == Step.CLOSE_MAP {
             out.write_all("}")!;
             continue;
         }
-        if (op == OP_COMMA_VALUE) or (op == OP_COMMA_KEY) {
+        if (op == Step.COMMA_VALUE) or (op == Step.COMMA_KEY) {
             out.write_all(",")!;
-        } else if op == OP_COLON_VALUE {
+        } else if op == Step.COLON_VALUE {
             out.write_all(":")!;
         }
-        if (op == OP_KEY) or (op == OP_COMMA_KEY) {
+        if (op == Step.KEY) or (op == Step.COMMA_KEY) {
             match it.v {
                 .Str(s) => { json.write_string(out, s)!; }
                 else => {
@@ -847,27 +849,27 @@ pub fn to_json(out: io.Writer, v: Value) !void {
             }
             .Array(xs) => {
                 out.write_all("[")!;
-                work.push(Item.{ v: Value.Nil, op: OP_CLOSE_ARRAY })!;
+                work.push(Item.{ v: Value.Nil, op: Step.CLOSE_ARRAY })!;
                 let mut k = xs.len;
                 while k > 0 {
                     k -= 1;
-                    let mut o = OP_COMMA_VALUE;
+                    let mut o = Step.COMMA_VALUE;
                     if k == 0 {
-                        o = OP_VALUE;
+                        o = Step.VALUE;
                     }
                     work.push(Item.{ v: xs[k], op: o })!;
                 }
             }
             .Map(ps) => {
                 out.write_all("{")!;
-                work.push(Item.{ v: Value.Nil, op: OP_CLOSE_MAP })!;
+                work.push(Item.{ v: Value.Nil, op: Step.CLOSE_MAP })!;
                 let mut k = ps.len;
                 while k > 0 {
                     k -= 1;
-                    work.push(Item.{ v: ps[k].value, op: OP_COLON_VALUE })!;
-                    let mut o = OP_COMMA_KEY;
+                    work.push(Item.{ v: ps[k].value, op: Step.COLON_VALUE })!;
+                    let mut o = Step.COMMA_KEY;
                     if k == 0 {
-                        o = OP_KEY;
+                        o = Step.KEY;
                     }
                     work.push(Item.{ v: ps[k].key, op: o })!;
                 }
@@ -876,17 +878,19 @@ pub fn to_json(out: io.Writer, v: Value) !void {
     }
 }
 
-const OP_VALUE: u8 = 0;
-const OP_COMMA_VALUE: u8 = 1;
-const OP_COLON_VALUE: u8 = 2;
-const OP_KEY: u8 = 3;
-const OP_COMMA_KEY: u8 = 4;
-const OP_CLOSE_ARRAY: u8 = 5;
-const OP_CLOSE_MAP: u8 = 6;
+enum Step: u8 {
+    VALUE,
+    COMMA_VALUE,
+    COLON_VALUE,
+    KEY,
+    COMMA_KEY,
+    CLOSE_ARRAY,
+    CLOSE_MAP,
+}
 
 struct Item {
     v: Value,
-    op: u8,
+    op: Step,
 }
 
 fn bytes_json(out: io.Writer, b: []u8) !void {
