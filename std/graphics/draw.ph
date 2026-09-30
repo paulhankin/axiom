@@ -140,10 +140,8 @@ pub struct Path {
     open: bool,  // a subpath has begun
 
     pub fn init() Path {
-        // (a local: the bootstrap compiler mistypes Vec.[an enum].init() in a struct literal)
-        let verbs = vec.Vec.[Verb].init();
         return Path.{
-            verbs: verbs,
+            verbs: vec.Vec.[Verb].init(),
             pts: vec.Vec.[f64].init(),
             start_x: 0.0,
             start_y: 0.0,
