@@ -201,8 +201,11 @@ struct FontUse {
     font: *font.Font,
     obj: u32,                // the Type0 font
     used: vec.Vec.[u8],      // per glyph: 1 if drawn
-    unicode: vec.Vec.[u32],  // per glyph: the character it was drawn for (0: unknown)
+    unicode: vec.Vec.[u32],  // per glyph: the character it was drawn for (0: unknown; MULTI: in multi)
+    multi: vec.Vec.[u32],    // glyphs drawn for several characters (ligatures): gid, count, characters
 }
+
+const MULTI: u32 = 0xffffffff;
 
 struct Mark {
     level: u32,
@@ -256,6 +259,8 @@ pub struct Document {
             u.deinit();
             let mut c = f.unicode;
             c.deinit();
+            let mut m = f.multi;
+            m.deinit();
         }
         self.fonts.deinit();
         self.images.deinit();
@@ -414,7 +419,7 @@ pub struct Document {
             used.push(0)!;
             uni.push(0)!;
         }
-        self.fonts.push(FontUse.{ font: f, obj: obj, used: used, unicode: uni })!;
+        self.fonts.push(FontUse.{ font: f, obj: obj, used: used, unicode: uni, multi: vec.Vec.[u32].init() })!;
         return self.fonts.len - 1;
     }
 
@@ -996,46 +1001,44 @@ pub struct Page {
 
     // --- text ---
 
-    /// Draws a line of text with its baseline starting at (x, y).
+    /// Draws a line of text with its baseline starting at (x, y), shaped
+    /// (std/shape) and in bidirectional order, as std/text lays it out.
     pub fn text(self: *mut Page, f: *font.Font, size: f64, x: f64, y: f64, s: []u8, c: color.Color) !void {
-        if not self.paint(draw.Paint.solid(c), false)! {
+        let st = text.Style.init(f, size, c);
+        let sp: [1]text.Span = [text.Span.{ text: s, style: st }];
+        let mut l = text.layout(sp[..], text.Options.init(0.0))!;
+        defer l.deinit();
+        if l.lines.len == 0 {
             return;
         }
-        let fi = self.doc.font_use(f)!;
-        self.op("BT /F")!;
-        put_u64(&mut self.content, @as(u64, fi + 1))!;
-        self.op(" ")!;
-        self.num(size)!;
-        self.op("Tf 1 0 0 -1 ")!;
-        self.num(x)!;
-        self.num(y)!;
-        self.op("Tm [<")!;
-        let upem = @float_from_int(f64, f.units_per_em);
-        let mut prev: u32 = 0;
-        let mut it = strs.runes(s);
-        while true {
-            let cp = it.next() catch break;
-            let g = f.glyph_index(cp);
-            if prev != 0 {
-                let k = f.kerning(prev, g);
-                if k != 0 {
-                    self.op("> ")!;
-                    self.num(-@float_from_int(f64, k) * 1000.0 / upem)!;
-                    self.op("<")!;
-                }
-            }
-            self.glyph(fi, g, cp)!;
-            prev = g;
-        }
-        self.op(">] TJ ET\n")!;
+        self.draw_layout(&l, x, y - l.lines.get(0).baseline)!;
     }
 
-    fn glyph(self: *mut Page, fi: usize, g: u32, cp: u32) !void {
+    /// Records glyph g of font fi as drawn for the characters of text (its
+    /// cluster: one character, or several for a ligature), and writes it.
+    fn glyph(self: *mut Page, fi: usize, g: u32, chars: []u8) !void {
         let fu = self.doc.fonts.get_ptr(fi);
         if @as(usize, g) < fu.used.len {
             fu.used.set(@as(usize, g), 1);
             if fu.unicode.get(@as(usize, g)) == 0 {
-                fu.unicode.set(@as(usize, g), cp);
+                let mut cps: [16]u32 = [0; 16];
+                let mut n: usize = 0;
+                let mut it = strs.runes(chars);
+                while n < 16 {
+                    let cp = it.next() catch break;
+                    cps[n] = cp;
+                    n += 1;
+                }
+                if n == 1 {
+                    fu.unicode.set(@as(usize, g), cps[0]);
+                } else if n > 1 {
+                    fu.unicode.set(@as(usize, g), MULTI);
+                    fu.multi.push(g)!;
+                    fu.multi.push(@truncate(u32, n))!;
+                    for k in @as(usize, 0)..n {
+                        fu.multi.push(cps[k])!;
+                    }
+                }
             }
         }
         put_hex4(&mut self.content, g & 0xffff)!;
@@ -1086,13 +1089,16 @@ pub struct Page {
                     self.num(-d * 1000.0 / g.size)!;
                     self.op("<")!;
                 }
+                // the characters it stands for (one, several for a
+                // ligature, none for the later glyphs of a cluster)
                 let sp = spans[g.span];
                 let off = g.offset - starts.get(g.span);
-                let mut cp: u32 = 0;
-                if off < sp.text.len {
-                    cp = strs.decode_rune(sp.text[off..]).value;
+                let e = @min(sp.text.len, off + g.length);
+                let mut cluster = sp.text[..0];
+                if off < e {
+                    cluster = sp.text[off..e];
                 }
-                self.glyph(fi, g.id, cp)!;
+                self.glyph(fi, g.id, cluster)!;
                 pen = g.x + (@float_from_int(f64, f.advance(g.id)) * scale);
                 i += 1;
             }
@@ -1815,6 +1821,7 @@ fn embed_font(doc: *mut Document, i: usize) !void {
     let mut pending: usize = 0;
     let mut block = strs.String.init();
     defer block.deinit();
+    let multi = fu.multi.items();
     for gi in 0..uni.len {
         if (uni[gi] == 0) or (used[gi] == 0) or (gi > 0xffff) {
             continue;
@@ -1822,7 +1829,23 @@ fn embed_font(doc: *mut Document, i: usize) !void {
         block.push('<')!;
         put_hex4(&mut block, @truncate(u32, gi))!;
         block.push_str("> <")!;
-        put_utf16(&mut block, uni[gi])!;
+        if uni[gi] == MULTI {
+            let mut m: usize = 0;
+            while (m + 1) < multi.len {
+                let n = @as(usize, multi[m + 1]);
+                if @as(usize, multi[m]) == gi {
+                    for q in @as(usize, 0)..n {
+                        if (m + 2 + q) < multi.len {
+                            put_utf16(&mut block, multi[m + 2 + q])!;
+                        }
+                    }
+                    break;
+                }
+                m += 2 + n;
+            }
+        } else {
+            put_utf16(&mut block, uni[gi])!;
+        }
         block.push_str(">\n")!;
         pending += 1;
         if pending == 100 {

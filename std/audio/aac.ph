@@ -38,8 +38,8 @@ fn be64(d: []u8, o: usize) u64 {
 
 fn id3_skip(data: []u8) usize {
     if (data.len >= 10) and @mem_eq(data[..3], "ID3") {
-        let size = (@as(usize, data[6] & 0x7f) << 21) | (@as(usize, data[7] & 0x7f) << 14) |
-                   (@as(usize, data[8] & 0x7f) << 7) | @as(usize, data[9] & 0x7f);
+        let size = (@as(usize, data[6] & 0x7f) << 21) | (@as(usize, data[7] & 0x7f) << 14) | (
+            @as(usize, data[8] & 0x7f) << 7) | @as(usize, data[9] & 0x7f);
         let mut n = 10 + size;
         if (data[5] & 0x10) != 0 {
             n += 10;
@@ -57,7 +57,8 @@ fn is_adts_at(data: []u8, o: usize) bool {
 pub fn is_aac(data: []u8) bool {
     let o = id3_skip(data);
     if is_adts_at(data, o) {
-        let len = ((@as(usize, data[o + 3]) & 3) << 11) | (@as(usize, data[o + 4]) << 3) | (@as(usize, data[o + 5]) >> 5);
+        let len = ((@as(usize, data[o + 3]) & 3) << 11) | (@as(usize, data[o + 4]) << 3) | (
+            @as(usize, data[o + 5]) >> 5);
         // one frame, then another header (or the end)
         return (len >= 7) and (((o + len) == data.len) or is_adts_at(data, o + len) or ((o + len) > data.len));
     }
@@ -126,7 +127,7 @@ fn decode_adts(data: []u8) !audio.Sound {
     while (o + 7) <= data.len {
         if not is_adts_at(data, o) {
             if out.frames > 0 {
-                break; // trailing junk (an ID3v1 tag, say)
+                break;  // trailing junk (an ID3v1 tag, say)
             }
             return error.InvalidAudio;
         }
@@ -139,7 +140,7 @@ fn decode_adts(data: []u8) !audio.Sound {
         let nblocks = @as(usize, h[6] & 3) + 1;
         if (len < 7) or ((o + len) > data.len) or (rate_index > 12) {
             if (out.frames > 0) and ((o + len) > data.len) {
-                break; // a truncated last frame
+                break;  // a truncated last frame
             }
             return error.InvalidAudio;
         }
@@ -172,7 +173,7 @@ fn decode_adts(data: []u8) !audio.Sound {
             first_rate = rate_index;
             first_chan = chan;
         } else if ((profile + 1) != first_aot) or (rate_index != first_rate) or (chan != first_chan) {
-            return error.Unsupported; // the format changes mid-stream
+            return error.Unsupported;  // the format changes mid-stream
         }
         let mut b = bitio.Bits.init(data[o + hl..o + len]);
         for _k in @as(usize, 0)..nblocks {
@@ -265,8 +266,8 @@ struct Track {
     co64: bool,
     timescale: u32,
     duration: u64,
-    edit_skip: i64,     // media time of the first edit, or -1
-    edit_len: u64,      // its length, in the movie timescale
+    edit_skip: i64,  // media time of the first edit, or -1
+    edit_len: u64,   // its length, in the movie timescale
 }
 
 fn desc_len(data: []u8, o: *mut usize, end: usize) usize {
@@ -317,7 +318,7 @@ fn esds_asc(data: []u8, bx: *Box) ![]u8 {
             }
             let oti = data[o];
             if (oti != 0x40) and (oti != 0x66) and (oti != 0x67) and (oti != 0x68) {
-                return error.Unsupported; // not AAC
+                return error.Unsupported;  // not AAC
             }
             o += 13;
         } else if tag == 5 {

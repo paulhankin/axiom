@@ -37,9 +37,9 @@
 
 import "fs.ph" as fs;
 import "hash.ph" as hash;
+import "html/entities.ph" as ent;
 import "io.ph" as io;
 import "map.ph" as maps;
-import "html/entities.ph" as ent;
 import "mem.ph" as mem;
 import "str.ph" as strs;
 import "unicode.ph" as uni;

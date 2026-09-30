@@ -45,8 +45,8 @@ fn read_head(p: []u8) !Head {
         return error.InvalidAudio;
     }
     let mut h = Head.{ channels: @as(usize, p[9]), pre_skip: @as(usize, p[10]) | (@as(usize, p[11]) << 8),
-                       gain: @as(i32, @bit_cast(i16, @as(u16, p[16]) | (@as(u16, p[17]) << 8))), streams: 1,
-                       coupled: 0, mapping: [0; 255] };
+                       gain: @as(i32, @bit_cast(i16, @as(u16, p[16]) | (@as(u16, p[17]) << 8))), streams: 1, coupled: 0,
+                       mapping: [0; 255] };
     if h.channels == 0 {
         return error.InvalidAudio;
     }

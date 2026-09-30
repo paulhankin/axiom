@@ -643,7 +643,7 @@ fn resampler_init(s: *mut Resampler, fs_in: i32, fs_out: i32) bool {
         return false;
     }
     if fs_out < fs_in {
-        return false; // downsampling is never needed here: the API rate is 48 kHz
+        return false;  // downsampling is never needed here: the API rate is 48 kHz
     }
     s.input_delay = @as(i32, DELAY_MATRIX_DEC[us((rate_id(fs_in) * 5) + rate_id(fs_out))]);
     s.fs_in_khz = fs_in / 1000;
@@ -1268,8 +1268,9 @@ fn decode_core(ch: *mut Chan, ctrl: *mut Ctrl, xq: []mut i32, pulses: []i32) voi
     let sub = us(ch.subfr_length);
     let ltp_mem = ch.ltp_mem_length;
     let order = ch.lpc_order;
-    let offset_q10 = @as(i32, t.SILK_QUANTIZATION_OFFSETS_Q10[us(((ch.indices.signal_type >> 1) * 2) +
-                                                                  ch.indices.quant_offset_type)]);
+    let offset_q10 = @as(i32,
+                         t.SILK_QUANTIZATION_OFFSETS_Q10[us(((ch.indices.signal_type >> 1) * 2) +
+                                                            ch.indices.quant_offset_type)]);
     let interp = ch.indices.nlsf_interp_q2 < 4;
     let mut seed = ch.indices.seed;
     for i in @as(usize, 0)..us(ch.frame_length) {
@@ -1781,7 +1782,8 @@ fn stereo_ms_to_lr(st: *mut Silk, x1: []mut i32, x2: []mut i32, pred_q13: []i32,
 
 /// Decodes one SILK frame (10 or 20 ms) into out (interleaved at the API
 /// rate). lost: 0 decode, 1 conceal, 2 decode the redundant (LBRR) copy.
-pub fn decode(st: *mut Silk, ctl: *mut Control, lost: i32, first: bool, d: *mut rc.Dec, out: []mut i16, n: *mut i32) bool {
+pub fn decode(st: *mut Silk, ctl: *mut Control, lost: i32, first: bool, d: *mut rc.Dec, out: []mut i16,
+              n: *mut i32) bool {
     n.* = 0;
     let nci = ctl.channels_internal;
     if (nci != 1) and (nci != 2) {
@@ -1797,7 +1799,8 @@ pub fn decode(st: *mut Silk, ctl: *mut Control, lost: i32, first: bool, d: *mut 
     if nci > st.n_channels_internal {
         init_chan(&mut st.ch[1]);
     }
-    let stereo_to_mono = (nci == 1) and (st.n_channels_internal == 2) and (ctl.internal_rate == (1000 * st.ch[0].fs_khz));
+    let stereo_to_mono = (nci == 1) and (st.n_channels_internal == 2) and
+                         (ctl.internal_rate == (1000 * st.ch[0].fs_khz));
     if st.ch[0].n_frames_decoded == 0 {
         for k in @as(usize, 0)..us(nci) {
             let ch = &mut st.ch[k];

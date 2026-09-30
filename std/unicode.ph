@@ -711,6 +711,35 @@ fn compose_pair(a: u32, b: u32) u32 {
     return 0;
 }
 
+/// One step of canonical decomposition: cp's mapping as [a, b] (b = 0 for a
+/// singleton), or [0, 0] when cp has none. Hangul LVT syllables split into
+/// an LV syllable and a trailing consonant.
+pub fn decompose_step(cp: u32) [2]u32 {
+    if (cp >= S_BASE) and (cp < (S_BASE + S_COUNT)) {
+        let s = cp - S_BASE;
+        if (s % T_COUNT) != 0 {
+            return [cp - (s % T_COUNT), T_BASE + (s % T_COUNT)];
+        }
+        return [L_BASE + (s / N_COUNT), V_BASE + ((s % N_COUNT) / T_COUNT)];
+    }
+    if cp < 0xc0 {
+        return [0, 0];
+    }
+    let seq = seq_lookup(t.CANON_KEYS[..], t.CANON_SEQ[..], t.CANON_POOL[..], cp);
+    if seq.len == 1 {
+        return [seq[0], 0];
+    }
+    if seq.len == 2 {
+        return [seq[0], seq[1]];
+    }
+    return [0, 0];
+}
+
+/// The primary composite of a followed by b, or 0 if there is none.
+pub fn compose_step(a: u32, b: u32) u32 {
+    return compose_pair(a, b);
+}
+
 /// Canonical composition, in place; returns the new length.
 fn compose(cps: []mut u32) usize {
     if cps.len == 0 {

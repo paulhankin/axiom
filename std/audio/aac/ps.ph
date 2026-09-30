@@ -10,7 +10,7 @@ import "bits.ph" as bitio;
 import "tables.ph" as t;
 
 const MAX_NUM_ENV: usize = 5;
-const NR: usize = 34; // PS_MAX_NR_IIDICC
+const NR: usize = 34;  // PS_MAX_NR_IIDICC
 const SLOTS: usize = 32;
 const MAX_DELAY: usize = 14;
 const AP_LINKS: usize = 3;
@@ -403,7 +403,7 @@ fn hybrid_analysis(ps: *mut Ps, x: *[2][2][38][64]f32, is34: bool) void {
         for pair in @as(usize, 0)..2 {
             let inb = &ps.in_buf[1 + pair];
             let o = 6 + (2 * pair);
-            let rev = 1 - pair; // band 1 is reversed
+            let rev = 1 - pair;  // band 1 is reversed
             for i in @as(usize, 0)..SLOTS {
                 let re_in = G1_Q2[6] * inb[i + 6][0];
                 let im_in = G1_Q2[6] * inb[i + 6][1];
@@ -528,7 +528,7 @@ fn decorrelation(ps: *mut Ps, is34: bool) void {
             ps.peak_decay_nrg[i] = @max(decayed, power[i][n]);
             ps.power_smooth[i] += a_smooth * (power[i][n] - ps.power_smooth[i]);
             ps.peak_decay_diff_smooth[i] += a_smooth *
-                ((ps.peak_decay_nrg[i] - power[i][n]) - ps.peak_decay_diff_smooth[i]);
+                                            ((ps.peak_decay_nrg[i] - power[i][n]) - ps.peak_decay_diff_smooth[i]);
             let denom = transient_impact * ps.peak_decay_diff_smooth[i];
             if denom > ps.power_smooth[i] {
                 transient_gain[i][n] = ps.power_smooth[i] / denom;
@@ -652,8 +652,8 @@ fn map_idx_34_to_20(out: *mut [34]i32, p: *[34]i32, full: bool) void {
     }
 }
 
-let MAP_10_TO_34: [34]u8 = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9,
-                           9, 9];
+let MAP_10_TO_34: [34]u8 = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9,
+                            9, 9, 9];
 
 fn map_idx_10_to_34(out: *mut [34]i32, p: *[34]i32, full: bool) void {
     let mut n: usize = 16;
@@ -667,8 +667,8 @@ fn map_idx_10_to_34(out: *mut [34]i32, p: *[34]i32, full: bool) void {
     }
 }
 
-let MAP_20_TO_34: [34]u8 = [0, 0, 1, 2, 0, 3, 4, 4, 5, 5, 6, 7, 8, 8, 9, 9, 10, 11, 12, 13, 14, 14, 15, 15, 16, 16, 17, 17,
-                           18, 18, 18, 18, 19, 19];
+let MAP_20_TO_34: [34]u8 = [0, 0, 1, 2, 0, 3, 4, 4, 5, 5, 6, 7, 8, 8, 9, 9, 10, 11, 12, 13, 14, 14, 15, 15, 16, 16, 17,
+                            17, 18, 18, 18, 18, 19, 19];
 
 fn map_idx_20_to_34(out: *mut [34]i32, p: *[34]i32, full: bool) void {
     let mut n: usize = 17;

@@ -75,8 +75,8 @@ pub struct Config {
 }
 
 pub fn empty_config() Config {
-    return Config.{ object_type: 0, sampling_index: 0, sample_rate: 0, chan_config: 0, sbr: -1, ps: -1, ext_rate: 0, nelems: 0,
-                    elems: [Elem.{ typ: 0, id: 0 }; 64] };
+    return Config.{ object_type: 0, sampling_index: 0, sample_rate: 0, chan_config: 0, sbr: -1, ps: -1, ext_rate: 0,
+                    nelems: 0, elems: [Elem.{ typ: 0, id: 0 }; 64] };
 }
 
 fn get_aot(b: *mut bitio.Bits) i32 {
@@ -169,7 +169,7 @@ fn decode_pce(b: *mut bitio.Bits, cfg: *mut Config, align_ref: usize) !void {
     }
     b.skip(@as(usize, 4 * nassoc));
     for _i in @as(u32, 0)..ncc {
-        b.skip(5); // coupling channels are not output
+        b.skip(5);  // coupling channels are not output
     }
     // byte alignment relative to the start of the raw data block
     let rel = (b.pos - align_ref) & 7;
@@ -248,7 +248,7 @@ pub fn parse_asc(data: []u8, cfg: *mut Config) !void {
     }
     // GASpecificConfig
     if b.get1() != 0 {
-        return error.Unsupported; // 960-sample frames
+        return error.Unsupported;  // 960-sample frames
     }
     if b.get1() != 0 {
         b.skip(14);
@@ -284,7 +284,7 @@ struct Ics {
     group_len: [8]i32,
     num_windows: i32,
     num_swb: i32,
-    swb: usize, // start of the band offsets in t.SWB_OFFSET_1024 or _128
+    swb: usize,  // start of the band offsets in t.SWB_OFFSET_1024 or _128
     short: bool,
     tns_max_bands: i32,
     predictor_present: bool,
@@ -547,36 +547,36 @@ fn configure(d: *mut Decoder) !void {
             d.order[0] = 0;
             d.order[1] = 1;
         } else {
-            add_chan(d, TYPE_SCE, 0, &mut n)!; // FC: 0
-            add_chan(d, TYPE_CPE, 0, &mut n)!; // 1, 2
+            add_chan(d, TYPE_SCE, 0, &mut n)!;  // FC: 0
+            add_chan(d, TYPE_CPE, 0, &mut n)!;  // 1, 2
             if c == 3 {
                 let o: [3]usize = [1, 2, 0];
                 for i in @as(usize, 0)..3 {
                     d.order[i] = o[i];
                 }
             } else if c == 4 {
-                add_chan(d, TYPE_SCE, 1, &mut n)!; // BC: 3
+                add_chan(d, TYPE_SCE, 1, &mut n)!;  // BC: 3
                 let o: [4]usize = [1, 2, 0, 3];
                 for i in @as(usize, 0)..4 {
                     d.order[i] = o[i];
                 }
             } else if c == 5 {
-                add_chan(d, TYPE_CPE, 1, &mut n)!; // BL BR: 3, 4
+                add_chan(d, TYPE_CPE, 1, &mut n)!;  // BL BR: 3, 4
                 let o: [5]usize = [1, 2, 0, 3, 4];
                 for i in @as(usize, 0)..5 {
                     d.order[i] = o[i];
                 }
             } else if c == 6 {
-                add_chan(d, TYPE_CPE, 1, &mut n)!; // 3, 4
-                add_chan(d, 2, 0, &mut n)!; // LFE: 5
+                add_chan(d, TYPE_CPE, 1, &mut n)!;  // 3, 4
+                add_chan(d, 2, 0, &mut n)!;         // LFE: 5
                 let o: [6]usize = [1, 2, 0, 5, 3, 4];
                 for i in @as(usize, 0)..6 {
                     d.order[i] = o[i];
                 }
             } else if c == 7 {
-                add_chan(d, TYPE_CPE, 1, &mut n)!; // FL FR: 3, 4 (FLC FRC are 1, 2)
-                add_chan(d, TYPE_CPE, 2, &mut n)!; // BL BR: 5, 6
-                add_chan(d, 2, 0, &mut n)!; // LFE: 7
+                add_chan(d, TYPE_CPE, 1, &mut n)!;  // FL FR: 3, 4 (FLC FRC are 1, 2)
+                add_chan(d, TYPE_CPE, 2, &mut n)!;  // BL BR: 5, 6
+                add_chan(d, 2, 0, &mut n)!;         // LFE: 7
                 let o: [8]usize = [3, 4, 0, 7, 5, 6, 1, 2];
                 for i in @as(usize, 0)..8 {
                     d.order[i] = o[i];
@@ -616,7 +616,7 @@ fn decode_ltp(ltp: *mut Ltp, b: *mut bitio.Bits, max_sfb: i32) void {
 fn decode_ics_info(d: *mut Decoder, ics: *mut Ics, b: *mut bitio.Bits) !void {
     let aot = d.cfg.object_type;
     let si_ = us(d.cfg.sampling_index);
-    _ = b.get1(); // reserved
+    _ = b.get1();  // reserved
     ics.window_sequence[1] = ics.window_sequence[0];
     ics.window_sequence[0] = b.geti(2);
     ics.use_kb_window[1] = ics.use_kb_window[0];
@@ -994,7 +994,8 @@ fn decode_spectrum(d: *mut Decoder, ch: *mut Chan, b: *mut bitio.Bits, pulse_pre
                 let mut ico = -@float_from_int(f32, pulse.amp[i]);
                 if co != 0.0 {
                     co = co / sfv;
-                    let s4 = @float_cast(f32, @sqrt(@float_cast(f64, @float_cast(f32, @sqrt(@float_cast(f64, @abs(co)))))));
+                    let s4 = @float_cast(
+                        f32, @sqrt(@float_cast(f64, @float_cast(f32, @sqrt(@float_cast(f64, @abs(co)))))));
                     if co > 0.0 {
                         ico = (co / s4) - ico;
                     } else {
@@ -1726,10 +1727,11 @@ pub fn decode_block(d: *mut Decoder, b: *mut bitio.Bits, out: []mut f32) !usize 
         for e in @as(usize, 0)..d.nelems {
             let c = d.elem_ch[e];
             let typ = d.elem_typ[e];
-            let two = (typ == TYPE_CPE) or (ps_mode and (typ == TYPE_SCE) and ((c + 1) < d.nchans) and
-                                            (d.cfg.chan_config <= 1));
+            let two = (typ == TYPE_CPE) or
+                      (ps_mode and (typ == TYPE_SCE) and ((c + 1) < d.nchans) and (d.cfg.chan_config <= 1));
             if two {
-                sbr.apply(&mut d.sbrs[e], &mut d.tw64, typ, d.chans[c].ret[..], d.chans[c + 1].ret[..], ps_mode, downsampled);
+                sbr.apply(&mut d.sbrs[e], &mut d.tw64, typ, d.chans[c].ret[..], d.chans[c + 1].ret[..], ps_mode,
+                          downsampled);
             } else {
                 sbr.apply(&mut d.sbrs[e], &mut d.tw64, typ, d.chans[c].ret[..], d.dummy[..], ps_mode, downsampled);
             }

@@ -38,8 +38,8 @@ let TRIM_ICDF: [11]u8 = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
 let SPREAD_ICDF: [4]u8 = [25, 23, 2, 0];
 let TAPSET_ICDF: [3]u8 = [2, 1, 0];
 let SMALL_ENERGY_ICDF: [3]u8 = [2, 1, 0];
-let TF_SELECT_TABLE: [32]i8 = [0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -2, 1, 0, 1, -1, 0, -2, 0, -3, 2, 0, 1, -1, 0, -2, 0,
-                               -3, 3, 0, 1, -1];
+let TF_SELECT_TABLE: [32]i8 = [0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -2, 1, 0, 1, -1, 0, -2, 0, -3, 2, 0, 1, -1, 0, -2,
+                               0, -3, 3, 0, 1, -1];
 let LOG2_FRAC_TABLE: [24]u8 = [0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37,
                                37];
 let PRED_COEF: [4]f32 = [0.8984375, 0.796875, 0.6484375, 0.5];
@@ -47,11 +47,11 @@ let BETA_COEF: [4]f32 = [0.920013427734375, 0.67999267578125, 0.3699951171875, 0
 const BETA_INTRA: f32 = 0.149993896484375;
 let COMB_GAINS: [9]f32 = [0.3066406250, 0.2170410156, 0.1296386719, 0.4638671875, 0.2680664062, 0.0, 0.7998046875,
                           0.1000976562, 0.0];
-let ORDERY_TABLE: [30]i32 = [1, 0, 3, 0, 2, 1, 7, 0, 4, 3, 6, 1, 5, 2, 15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2, 10,
-                             5];
+let ORDERY_TABLE: [30]i32 = [1, 0, 3, 0, 2, 1, 7, 0, 4, 3, 6, 1, 5, 2, 15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2,
+                             10, 5];
 let BIT_INTERLEAVE: [16]u32 = [0, 1, 1, 1, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3];
-let BIT_DEINTERLEAVE: [16]u32 = [0x00, 0x03, 0x0C, 0x0F, 0x30, 0x33, 0x3C, 0x3F, 0xC0, 0xC3, 0xCC, 0xCF, 0xF0, 0xF3, 0xFC,
-                                 0xFF];
+let BIT_DEINTERLEAVE: [16]u32 = [0x00, 0x03, 0x0C, 0x0F, 0x30, 0x33, 0x3C, 0x3F, 0xC0, 0xC3, 0xCC, 0xCF, 0xF0, 0xF3,
+                                 0xFC, 0xFF];
 let EXP2_TABLE8: [8]i32 = [16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048];
 let SPREAD_FACTOR: [3]i32 = [15, 10, 5];
 
@@ -127,8 +127,8 @@ fn bitexact_log2tan(isin0: i32, icos0: i32) i32 {
     let ls = rc.ilog(@bit_cast(u32, isin0));
     let icos = icos0 << @bit_cast(u32, 15 - lc);
     let isin = isin0 << @bit_cast(u32, 15 - ls);
-    return (((ls - lc) * (1 << 11)) + frac_mul16(isin, frac_mul16(isin, -2597) + 7932)) -
-           frac_mul16(icos, frac_mul16(icos, -2597) + 7932);
+    return (((ls - lc) * (1 << 11)) + frac_mul16(isin, frac_mul16(isin, -2597) + 7932)) - frac_mul16(
+        icos, frac_mul16(icos, -2597) + 7932);
 }
 
 fn isqrt32(v0: u32) u32 {
@@ -681,11 +681,13 @@ fn quant_partition(ctx: *mut Band, x: []mut f32, n0: i32, b0: i32, bb0: i32, low
             if (rebalance > (3 << 3)) and (itheta != 0) {
                 sbits += rebalance - (3 << 3);
             }
-            cm |= quant_partition(ctx, y, n, sbits, bb, next_lowband2, lm, gain * side, fill >> @bit_cast(u32, bb)) <<
-                  @bit_cast(u32, b_0 >> 1);
+            cm |= quant_partition(
+                ctx, y, n, sbits, bb, next_lowband2, lm, gain * side, fill >> @bit_cast(u32, bb)) << @bit_cast(
+                    u32, b_0 >> 1);
         } else {
-            cm = quant_partition(ctx, y, n, sbits, bb, next_lowband2, lm, gain * side, fill >> @bit_cast(u32, bb)) <<
-                 @bit_cast(u32, b_0 >> 1);
+            cm = quant_partition(
+                ctx, y, n, sbits, bb, next_lowband2, lm, gain * side, fill >> @bit_cast(u32, bb)) << @bit_cast(
+                    u32, b_0 >> 1);
             rebalance = sbits - (rebalance - ctx.remaining_bits);
             if (rebalance > (3 << 3)) and (itheta != 16384) {
                 mbits += rebalance - (3 << 3);
@@ -920,8 +922,8 @@ fn quant_band_stereo(ctx: *mut Band, x: []mut f32, y: []mut f32, n: i32, b0: i32
 
 // the shapes of every band (X, and Y when stereo)
 fn quant_all_bands(st: *mut Celt, start: i32, end: i32, xb: []mut f32, yb: []mut f32, collapse: []mut u8, pulses: []i32,
-                   short_blocks: bool, spread: i32, dual_stereo0: bool, intensity: i32, tf_res: []i32,
-                   total_bits: i32, balance0: i32, d: *mut rc.Dec, lm: i32, coded_bands: i32, seed: *mut u32) void {
+                   short_blocks: bool, spread: i32, dual_stereo0: bool, intensity: i32, tf_res: []i32, total_bits: i32,
+                   balance0: i32, d: *mut rc.Dec, lm: i32, coded_bands: i32, seed: *mut u32) void {
     let mut dual_stereo = dual_stereo0;
     let mut balance = balance0;
     let m: i32 = 1 << @bit_cast(u32, lm);
@@ -1196,7 +1198,8 @@ fn unquant_coarse_energy(old: []mut f32, start: i32, end: i32, intra: bool, d: *
             let mut qi: i32 = 0;
             if (budget - tell) >= 15 {
                 let pi = us(2 * imin(i, 20));
-                qi = laplace_decode(d, @as(u32, t.E_PROB_MODEL[pm + pi]) << 7, @as(i32, t.E_PROB_MODEL[pm + pi + 1]) << 6);
+                qi = laplace_decode(
+                    d, @as(u32, t.E_PROB_MODEL[pm + pi]) << 7, @as(i32, t.E_PROB_MODEL[pm + pi + 1]) << 6);
             } else if (budget - tell) >= 2 {
                 qi = d.icdf(SMALL_ENERGY_ICDF[..], 2);
                 qi = (qi >> 1) ^ -(qi & 1);
@@ -1223,8 +1226,10 @@ fn unquant_fine_energy(old: []mut f32, start: i32, end: i32, fine_quant: []i32, 
         }
         for ch in @as(usize, 0)..us(c) {
             let q2 = d.bits(@bit_cast(u32, fq));
-            let offset = (((@float_from_int(f32, q2) + 0.5) * @float_from_int(f32, 1 << @bit_cast(u32, 14 - fq))) *
-                          (1.0 / 16384.0)) - 0.5;
+            let offset = (
+                ((@float_from_int(f32, q2) + 0.5) * @float_from_int(f32, 1 << @bit_cast(u32,
+                                                                                        14 - fq))) * (1.0 / 16384.0)) -
+                         0.5;
             old[us(i) + (ch * NB_EBANDS)] += offset;
         }
     }
@@ -1243,8 +1248,9 @@ fn unquant_energy_finalise(old: []mut f32, start: i32, end: i32, fine_quant: []i
             }
             for ch in @as(usize, 0)..us(c) {
                 let q2 = d.bits(1);
-                let offset = ((@float_from_int(f32, q2) - 0.5) * @float_from_int(f32, 1 << @bit_cast(u32, (14 - fq) - 1))) *
-                             (1.0 / 16384.0);
+                let offset = (
+                    (@float_from_int(f32, q2) - 0.5) * @float_from_int(
+                        f32, 1 << @bit_cast(u32, (14 - fq) - 1))) * (1.0 / 16384.0);
                 old[us(i) + (ch * NB_EBANDS)] += offset;
                 bits_left -= 1;
             }
@@ -1265,7 +1271,8 @@ struct Alloc {
 
 fn interp_bits2pulses(start: i32, end: i32, skip_start: i32, bits1: []i32, bits2: []i32, thresh: []i32, cap: []i32,
                       total0: i32, skip_rsv: i32, intensity_rsv0: i32, dual_stereo_rsv0: i32, bits: []mut i32,
-                      ebits: []mut i32, fine_priority: []mut i32, c: i32, lm: i32, d: *mut rc.Dec, out: *mut Alloc) i32 {
+                      ebits: []mut i32, fine_priority: []mut i32, c: i32, lm: i32, d: *mut rc.Dec,
+                      out: *mut Alloc) i32 {
     let mut total = total0;
     let mut intensity_rsv = intensity_rsv0;
     let mut dual_stereo_rsv = dual_stereo_rsv0;
@@ -1433,7 +1440,8 @@ fn interp_bits2pulses(start: i32, end: i32, skip_start: i32, bits1: []i32, bits2
 }
 
 fn compute_allocation(start: i32, end: i32, offsets: []i32, cap: []i32, alloc_trim: i32, total0: i32, pulses: []mut i32,
-                      ebits: []mut i32, fine_priority: []mut i32, c: i32, lm: i32, d: *mut rc.Dec, out: *mut Alloc) i32 {
+                      ebits: []mut i32, fine_priority: []mut i32, c: i32, lm: i32, d: *mut rc.Dec,
+                      out: *mut Alloc) i32 {
     let mut total = imax(total0, 0);
     let len = si(NB_EBANDS);
     let mut skip_start = start;
@@ -1463,8 +1471,8 @@ fn compute_allocation(start: i32, end: i32, offsets: []i32, cap: []i32, alloc_tr
     for j in start..end {
         let w = eb(us(j + 1)) - eb(us(j));
         thresh[us(j)] = imax(c << 3, ((3 * w) << @bit_cast(u32, lm + 3)) >> 4);
-        trim_offset[us(j)] = ((((c * w) * ((alloc_trim - 5) - lm)) * ((end - j) - 1)) *
-                              (1 << @bit_cast(u32, lm + 3))) >> 6;
+        trim_offset[us(j)] = (
+            (((c * w) * ((alloc_trim - 5) - lm)) * ((end - j) - 1)) * (1 << @bit_cast(u32, lm + 3))) >> 6;
         if (w << @bit_cast(u32, lm)) == 1 {
             trim_offset[us(j)] -= c << 3;
         }
@@ -1526,8 +1534,8 @@ fn compute_allocation(start: i32, end: i32, offsets: []i32, cap: []i32, alloc_tr
         bits1[us(j)] = bits1j;
         bits2[us(j)] = bits2j;
     }
-    return interp_bits2pulses(start, end, skip_start, bits1[..], bits2[..], thresh[..], cap, total, skip_rsv, intensity_rsv,
-                              dual_stereo_rsv, pulses, ebits, fine_priority, c, lm, d, out);
+    return interp_bits2pulses(start, end, skip_start, bits1[..], bits2[..], thresh[..], cap, total, skip_rsv,
+                              intensity_rsv, dual_stereo_rsv, pulses, ebits, fine_priority, c, lm, d, out);
 }
 
 // -----------------------------------------------------------------------------
@@ -1921,9 +1929,15 @@ fn comb_filter(buf: []mut f32, o: usize, t0_: i32, t1_: i32, n: i32, g0: f32, g1
     while i < overlap {
         let x0 = xg(buf, io, (i - t1) + 2);
         let f = t.WINDOW[us(i)] * t.WINDOW[us(i)];
-        let v = ((((((xg(buf, io, i) + (((1.0 - f) * g00) * xg(buf, io, i - t0))) + (((1.0 - f) * g01) * (xg(buf, io, (i - t0) + 1) + xg(buf, io, (i - t0) - 1)))) +
-                    (((1.0 - f) * g02) * (xg(buf, io, (i - t0) + 2) + xg(buf, io, (i - t0) - 2)))) + ((f * g10) * x2)) +
-                  ((f * g11) * (x1 + x3))) + ((f * g12) * (x0 + x4)));
+        let v = (
+            (((((xg(buf, io, i) + (((1.0 - f) * g00) * xg(buf, io, i - t0))) + (((1.0 - f) * g01) * (xg(buf, io,
+                                                                                                        (i - t0) + 1) +
+                                                                                                     xg(buf, io,
+                                                                                                        (i - t0) -
+                                                                                                        1)))) +
+               (((1.0 - f) * g02) * (xg(buf, io, (i - t0) + 2) + xg(buf, io,
+                                                                    (i - t0) - 2)))) + ((f * g10) * x2)) +
+             ((f * g11) * (x1 + x3))) + ((f * g12) * (x0 + x4)));
         buf[us(io + i)] = v;
         x4 = x3;
         x3 = x2;
@@ -2049,7 +2063,8 @@ fn tf_decode(start: i32, end: i32, is_transient: bool, tf_res: []mut i32, lm: i3
     }
     let mut tf_select: i32 = 0;
     let base = us(lm) * 8;
-    if tf_select_rsv and (TF_SELECT_TABLE[base + us((4 * it) + tf_changed)] != TF_SELECT_TABLE[base + us(((4 * it) + 2) + tf_changed)]) {
+    if tf_select_rsv and
+       (TF_SELECT_TABLE[base + us((4 * it) + tf_changed)] != TF_SELECT_TABLE[base + us(((4 * it) + 2) + tf_changed)]) {
         tf_select = d.bit_logp_int(1);
     }
     for i in start..end {
@@ -2134,7 +2149,8 @@ pub fn decode(st: *mut Celt, len: i32, pcm: []mut f32, frame_size: i32, d: *mut 
     if (start == 0) and ((tell + 16) <= total_bits) {
         if d.bit_logp(1) {
             let octave = @bit_cast(i32, d.uint(6));
-            postfilter_pitch = ((16 << @bit_cast(u32, octave)) + @bit_cast(i32, d.bits(@bit_cast(u32, 4 + octave)))) - 1;
+            postfilter_pitch = (
+                (16 << @bit_cast(u32, octave)) + @bit_cast(i32, d.bits(@bit_cast(u32, 4 + octave)))) - 1;
             let qg = @bit_cast(i32, d.bits(3));
             if (d.tell() + 2) <= total_bits {
                 postfilter_tapset = d.icdf(TAPSET_ICDF[..], 2);
@@ -2228,10 +2244,11 @@ pub fn decode(st: *mut Celt, len: i32, pcm: []mut f32, frame_size: i32, d: *mut 
     if anti_collapse_rsv > 0 {
         anti_collapse_on = d.bits(1) != 0;
     }
-    unquant_energy_finalise(st.old_band_e[..], start, end, fine_quant[..], fine_priority[..], (len * 8) - d.tell(), d, c);
+    unquant_energy_finalise(st.old_band_e[..], start, end, fine_quant[..], fine_priority[..], (len * 8) - d.tell(), d,
+                            c);
     if anti_collapse_on {
-        anti_collapse(xb, collapse[..], lm, c, si(n), start, end, st.old_band_e[..], st.old_log_e[..], st.old_log_e2[..],
-                      pulses[..], st.rng);
+        anti_collapse(xb, collapse[..], lm, c, si(n), start, end, st.old_band_e[..], st.old_log_e[..],
+                      st.old_log_e2[..], pulses[..], st.rng);
     }
     if silence {
         for i in @as(usize, 0)..(us(c) * NB_EBANDS) {
@@ -2344,7 +2361,8 @@ fn synthesis(st: *mut Celt, syn: [2]usize, start: i32, eff_end: i32, c: i32, cc:
         return;
     }
     for ch in @as(usize, 0)..us(cc) {
-        denormalise_bands(st.x[ch * n..], freq, st.old_band_e[ch * NB_EBANDS..], start, eff_end, m, downsample, silence);
+        denormalise_bands(st.x[ch * n..], freq, st.old_band_e[ch * NB_EBANDS..], start, eff_end, m, downsample,
+                          silence);
         for bi in @as(usize, 0)..b {
             mdct_backward(freq[bi..], st.decode_mem[syn[ch] + (nb * bi)..], shift, b);
         }

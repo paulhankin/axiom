@@ -13,8 +13,10 @@
 // files or collections (.ttc). Characters map to glyphs through cmap
 // (formats 0, 4, 6, 12); kerning comes from GPOS pair adjustments or the
 // kern table. Glyphs are drawn from their outlines, unhinted, with
-// std/draw's exact anti-aliasing. There is no shaping beyond kerning (no
-// ligatures, no complex scripts) and text runs left to right.
+// std/draw's exact anti-aliasing. The layout, measure and draw_text here
+// map characters one to one with kerning, left to right; std/shape shapes
+// text (ligatures, marks, Arabic, Indic and other complex scripts, and its
+// own draw_text and measure), and std/text lays out shaped paragraphs.
 // =============================================================================
 
 import "color.ph" as color;
@@ -223,6 +225,15 @@ pub struct Font {
         return self.data[..0];
     }
 
+    /// Where a table starts in the font's bytes (0 if the font has none).
+    pub fn table_offset(self: *Font, tag: []u8) usize {
+        let t = self.table(tag);
+        if t.len == 0 {
+            return 0;
+        }
+        return @int_from_ptr(t.ptr) - @int_from_ptr(self.data.ptr);
+    }
+
     /// The tags of the font's tables, in order ("head", "glyf", ...).
     pub fn table_count(self: *Font) usize {
         return @as(usize, u16at(self.data, self.start + 4));
@@ -356,11 +367,93 @@ pub struct Font {
         if gid >= self.num_glyphs {
             return;
         }
-        let mut pen = Pen.{ path: path, x: x, y: y, s: scale, open: false, work: 1 << 20 };
+        let mut pen = Pen.{
+            path: path,
+            x: x,
+            y: y,
+            s: scale,
+            open: false,
+            work: 1 << 20,
+            measure: false,
+            drawing: false,
+            cx: 0.0,
+            cy: 0.0,
+            bounds: [0.0; 4],
+            has_bounds: false,
+        };
         if self.is_cff {
             return cff_glyph(self, gid, &mut pen);
         }
         return self.glyf_glyph(gid, &mut pen, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0);
+    }
+
+    /// The glyph's extents as HarfBuzz reports them, in font units (y up):
+    /// [x_bearing, y_bearing (the top), width, height (negative)]. TrueType
+    /// glyphs use their header's box with the hmtx left side bearing; CFF
+    /// glyphs the rounded box of their points, control points included.
+    pub fn glyph_extents(self: *Font, gid: u32) ![4]i32 {
+        if self.is_cff {
+            if gid >= self.num_glyphs {
+                return error.InvalidFont;
+            }
+            let mut pen = Pen.{
+                path: @ptr_from_int(*mut draw.Path, 8),
+                x: 0.0,
+                y: 0.0,
+                s: 1.0,
+                open: false,
+                work: 1 << 20,
+                measure: true,
+                drawing: false,
+                cx: 0.0,
+                cy: 0.0,
+                bounds: [0.0; 4],
+                has_bounds: false,
+            };
+            cff_glyph(self, gid, &mut pen)!;
+            let mut e: [4]i32 = [0, 0, 0, 0];
+            let bd = pen.bounds;
+            if pen.has_bounds and (bd[0] < bd[2]) {
+                let xb = @nearest(bd[0]);
+                e[0] = @int_from_float(i32, xb);
+                e[2] = @int_from_float(i32, @nearest(bd[2]) - xb);
+            }
+            if pen.has_bounds and (bd[1] < bd[3]) {
+                let yb = @nearest(bd[3]);
+                e[1] = @int_from_float(i32, yb);
+                e[3] = @int_from_float(i32, @nearest(bd[1]) - yb);
+            }
+            return e;
+        }
+        if gid >= self.num_glyphs {
+            return [0, 0, 0, 0];
+        }
+        let r = self.glyf_range(gid);
+        if r[1] == r[0] {
+            return [0, 0, 0, 0];
+        }
+        if (r[1] - r[0]) < 10 {
+            return error.InvalidFont;
+        }
+        let d = self.data;
+        let g = r[0];
+        let x0 = i16at(d, g + 2);
+        let y0 = i16at(d, g + 4);
+        let x1 = i16at(d, g + 6);
+        let y1 = i16at(d, g + 8);
+        let mut lsb = @min(x0, x1);
+        let nh = self.num_hmetrics;
+        if (self.hmtx.len > 0) and (nh > 0) {
+            if gid < nh {
+                lsb = i16at(d, self.hmtx.off + (4 * @as(usize, gid)) + 2);
+            } else {
+                let k = self.hmtx.off + (4 * @as(usize, nh)) + (2 * @as(usize, gid - nh));
+                if (k + 2) <= (self.hmtx.off + self.hmtx.len) {
+                    lsb = i16at(d, k);
+                }
+            }
+        }
+        return [lsb, @max(y0, y1), @max(x0, x1) - @min(x0, x1), @min(y0, y1) - @max(y0, y1)];
     }
 
     fn glyf_range(self: *Font, gid: u32) [2]usize {
@@ -554,6 +647,14 @@ struct Pen {
     s: f64,
     open: bool,
     work: usize,  // left of the glyph's budget (a malformed font can nest subroutines or components exponentially)
+    // measuring instead of drawing: the bounds of the points drawn
+    // (control points included), as HarfBuzz measures CFF glyphs
+    measure: bool,
+    drawing: bool,
+    cx: f64,
+    cy: f64,
+    bounds: [4]f64,  // min x, min y, max x, max y
+    has_bounds: bool,
 
     fn spend(self: *mut Pen, n: usize) !void {
         if n > self.work {
@@ -562,7 +663,32 @@ struct Pen {
         self.work -= n;
     }
 
+    fn add_point(self: *mut Pen, x: f64, y: f64) void {
+        if not self.has_bounds {
+            self.bounds = [x, y, x, y];
+            self.has_bounds = true;
+            return;
+        }
+        self.bounds[0] = @min(self.bounds[0], x);
+        self.bounds[1] = @min(self.bounds[1], y);
+        self.bounds[2] = @max(self.bounds[2], x);
+        self.bounds[3] = @max(self.bounds[3], y);
+    }
+
+    fn start_drawing(self: *mut Pen) void {
+        if not self.drawing {
+            self.drawing = true;
+            self.add_point(self.cx, self.cy);
+        }
+    }
+
     fn move_to(self: *mut Pen, x: f64, y: f64) !void {
+        if self.measure {
+            self.drawing = false;
+            self.cx = x;
+            self.cy = y;
+            return;
+        }
         if self.open {
             self.path.close()!;
         }
@@ -571,20 +697,48 @@ struct Pen {
     }
 
     fn line_to(self: *mut Pen, x: f64, y: f64) !void {
+        if self.measure {
+            self.start_drawing();
+            self.add_point(x, y);
+            self.cx = x;
+            self.cy = y;
+            return;
+        }
         self.path.line_to(self.x + (x * self.s), self.y - (y * self.s))!;
     }
 
     fn quad_to(self: *mut Pen, cx: f64, cy: f64, x: f64, y: f64) !void {
+        if self.measure {
+            self.start_drawing();
+            self.add_point(cx, cy);
+            self.add_point(x, y);
+            self.cx = x;
+            self.cy = y;
+            return;
+        }
         self.path.quad_to(self.x + (cx * self.s), self.y - (cy * self.s), self.x + (x * self.s),
                           self.y - (y * self.s))!;
     }
 
     fn cubic_to(self: *mut Pen, ax: f64, ay: f64, bx: f64, by: f64, x: f64, y: f64) !void {
+        if self.measure {
+            self.start_drawing();
+            self.add_point(ax, ay);
+            self.add_point(bx, by);
+            self.add_point(x, y);
+            self.cx = x;
+            self.cy = y;
+            return;
+        }
         self.path.cubic_to(self.x + (ax * self.s), self.y - (ay * self.s), self.x + (bx * self.s),
                            self.y - (by * self.s), self.x + (x * self.s), self.y - (y * self.s))!;
     }
 
     fn close(self: *mut Pen) !void {
+        if self.measure {
+            self.drawing = false;
+            return;
+        }
         if self.open {
             self.path.close()!;
             self.open = false;

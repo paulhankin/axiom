@@ -272,7 +272,7 @@ pub struct Stream {
     prev_redundancy: bool,
     last_packet_duration: i32,
     decode_gain: i32,
-    pcm_silk: [5760]i16,       // up to 60 ms of 48 kHz stereo
+    pcm_silk: [5760]i16,  // up to 60 ms of 48 kHz stereo
     transition: [480]f32,
     redundant: [480]f32,
 

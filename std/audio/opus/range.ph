@@ -35,7 +35,8 @@ pub struct Dec {
 
     pub fn init(buf: []u8) Dec {
         let mut d = Dec.{ buf: buf, storage: @truncate(u32, buf.len), end_offs: 0, end_window: 0, nend_bits: 0,
-                          nbits_total: @bit_cast(i32, (CODE_BITS + 1) - (((CODE_BITS - CODE_EXTRA) / SYM_BITS) * SYM_BITS)),
+                          nbits_total: @bit_cast(i32,
+                                                 (CODE_BITS + 1) - (((CODE_BITS - CODE_EXTRA) / SYM_BITS) * SYM_BITS)),
                           offs: 0, rng: @as(u32, 1) << CODE_EXTRA, val: 0, ext: 0, rem: 0, err: false };
         d.rem = d.read_byte();
         d.val = (d.rng - 1) - (d.rem >> (SYM_BITS - CODE_EXTRA));

@@ -14,16 +14,19 @@
 //     l.draw(&mut canvas, 20.0, 40.0)!;          // top left of the text box
 //
 // Each code point is drawn with the first font of its style (then its
-// fallbacks) that has a glyph for it; glyphs come from the fonts'
-// outlines with kerning, without further shaping (no ligatures and no
-// contextual forms, so scripts that need them, such as Arabic, show their
-// isolated letters).
+// fallbacks) that has a glyph for it (a combining mark stays with its
+// base's font when it can). Runs of one font, style, direction and script
+// are shaped with std/shape: ligatures, kerning, mark positioning, Arabic
+// joining and Indic reordering as the fonts' OpenType features say (lines
+// are measured shaped, then each line is shaped again as it is placed, so
+// forms at line ends are right).
 // =============================================================================
 
 import "color.ph" as color;
 import "draw.ph" as draw;
 import "font.ph" as font;
 import "mem.ph" as mem;
+import "shape.ph" as shape;
 import "str.ph" as strs;
 import "unicode.ph" as uni;
 import "unicode/bidi.ph" as bidi;
@@ -48,7 +51,8 @@ pub struct Style {
     color: color.Color,
     underline: bool,
     strike: bool,
-    letter_spacing: f64,  // extra pixels after each character
+    letter_spacing: f64,        // extra pixels after each character
+    features: []shape.Feature,  // OpenType feature settings (std/shape), such as shape.feature("-liga")
 
     pub fn init(f: *font.Font, size: f64, c: color.Color) Style {
         return Style.{
@@ -59,6 +63,7 @@ pub struct Style {
             underline: false,
             strike: false,
             letter_spacing: 0.0,
+            features: shape.options().features,
         };
     }
 }
@@ -94,6 +99,8 @@ pub struct Glyph {
     size: f64,
     span: usize,    // which span it came from
     offset: usize,  // the byte offset of its character in the concatenated text
+    length: usize,  // the bytes of text it stands for (several for a ligature; 0 for the
+                    // second and later glyphs of a cluster)
     advance: f64,
 }
 
@@ -207,36 +214,27 @@ struct Cell {
     gid: u32,
     font: *font.Font,
     advance: f64,
+    run: usize,     // the shaping run it belongs to
+    special: bool,  // a tab, newline or control character: not shaped or drawn
 }
 
-/// Font lookups remembered for one layout: kerning pairs (direct-mapped)
-/// and the glyphs of ASCII characters for the last style.
+/// A run of cells shaped together: one span, font, bidi level and script.
+struct Run {
+    start: usize,  // cells [start, end)
+    end: usize,
+    level: u8,
+    script: u32,
+}
+
+/// Font lookups remembered for one layout: the glyphs of ASCII characters
+/// for the last style, and the shaping plans.
 struct Memo {
-    kern_font: [1024]usize,  // 0: empty
-    kern_pair: [1024]u32,
-    kern_val: [1024]i32,
     ascii_font: usize,  // the style's font and fallbacks the ASCII table is for
     ascii_fallbacks: usize,
     ascii_nfb: usize,
     ascii_gid: [128]u32,
     ascii_which: [128]u8,  // 0: the style's font; k + 1: fallback k; 255: not looked up
-
-    fn kerning(self: *mut Memo, f: *font.Font, a: u32, b: u32) i32 {
-        if (a > 0xffff) or (b > 0xffff) {
-            return f.kerning(a, b);
-        }
-        let pair = (a << 16) | b;
-        let fp = @int_from_ptr(f);
-        let slot = @as(usize, ((pair *% 0x9e3779b1) ^ @truncate(u32, fp >> 4)) >> 22);
-        if (self.kern_font[slot] == fp) and (self.kern_pair[slot] == pair) {
-            return self.kern_val[slot];
-        }
-        let v = f.kerning(a, b);
-        self.kern_font[slot] = fp;
-        self.kern_pair[slot] = pair;
-        self.kern_val[slot] = v;
-        return v;
-    }
+    shaper: shape.Shaper,
 
     fn pick_font(self: *mut Memo, st: *Style, cp: u32, gid: *mut u32) *font.Font {
         if cp >= 128 {
@@ -295,6 +293,11 @@ fn is_newline(cp: u32) bool {
            (cp == 0x2029);
 }
 
+fn is_mark(cp: u32) bool {
+    let gc = uni.category(cp);
+    return (gc == uni.GC_MN) or (gc == uni.GC_MC) or (gc == uni.GC_ME);
+}
+
 /// Lays out spans of text.
 pub fn layout(spans: []Span, opts: Options) !Layout {
     let mut out = Layout.{
@@ -326,16 +329,17 @@ fn layout_into(spans: []Span, opts: Options, out: *mut Layout) !void {
     }
     let s = all.bytes();
     let memo = mem.create(Memo.{
-        kern_font: [0; 1024],
-        kern_pair: [0; 1024],
-        kern_val: [0; 1024],
         ascii_font: 0,
         ascii_fallbacks: 0,
         ascii_nfb: 0,
         ascii_gid: [0; 128],
         ascii_which: [255; 128],
+        shaper: shape.Shaper.init(),
     })!;
-    defer mem.destroy(memo);
+    defer {
+        memo.shaper.deinit();
+        mem.destroy(memo);
+    }
     // paragraphs end after a paragraph or line separator
     let mut y: f64 = 0.0;
     let mut start: usize = 0;
@@ -361,11 +365,42 @@ fn layout_into(spans: []Span, opts: Options, out: *mut Layout) !void {
     }
 }
 
+/// Shapes cells [a, b) of run r (their text is s[cs[a].offset..]): the
+/// glyphs, in visual order.
+fn shape_cells(s: []u8, cs: []Cell, r: Run, a: usize, b: usize, spans: []Span, memo: *mut Memo) ![]mut shape.Glyph {
+    let c0 = cs[a];
+    let from = c0.offset;
+    let to = cs[b - 1].offset + cs[b - 1].len;
+    let mut o = shape.options();
+    o.script = r.script;
+    o.direction = shape.DIR_LTR;
+    if (r.level & 1) == 1 {
+        o.direction = shape.DIR_RTL;
+    }
+    o.features = spans[c0.span].style.features;
+    return memo.shaper.shape(c0.font, s[from..to], o);
+}
+
+/// The cell of cells [a, b) at byte offset off (the last one at or before it).
+fn cell_at(cs: []Cell, a: usize, b: usize, off: usize) usize {
+    let mut lo = a;
+    let mut hi = b;
+    while (hi - lo) > 1 {
+        let mid = (lo + hi) / 2;
+        if cs[mid].offset <= off {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 /// Lays out the paragraph s[start..end] with its first line's top at y;
 /// returns where the next paragraph starts.
 fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span, opts: Options, y0: f64,
              out: *mut Layout, memo: *mut Memo) !f64 {
-    // measure each code point
+    // the code points and their fonts
     let mut cells = vec.Vec.[Cell].init();
     defer cells.deinit();
     let mut cps = vec.Vec.[u32].init();
@@ -376,14 +411,37 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
         let sp = span_of[i];
         let st = &spans[sp].style;
         let mut gid: u32 = 0;
-        let f = memo.pick_font(st, r.value, &mut gid);
-        let scale = font.scale_for(f, st.size);
-        let mut adv = (@float_from_int(f64, f.advance(gid)) * scale) + st.letter_spacing;
-        if is_newline(r.value) or (uni.category(r.value) == uni.GC_CC) {
-            adv = 0.0;
+        let mut f = memo.pick_font(st, r.value, &mut gid);
+        // a mark stays with its base's font when that font has it
+        if (cells.len > 0) and is_mark(r.value) {
+            let prev = cells.get(cells.len - 1);
+            if (prev.span == sp) and not prev.special and (@int_from_ptr(prev.font) != @int_from_ptr(f)) {
+                let g = prev.font.glyph_index(r.value);
+                if g != 0 {
+                    f = prev.font;
+                    gid = g;
+                }
+            }
+        }
+        let special = (r.value == '\t') or is_newline(r.value) or (uni.category(r.value) == uni.GC_CC);
+        let mut adv: f64 = 0.0;
+        if r.value == '\t' {
+            adv = @float_from_int(f64, f.advance(gid)) * font.scale_for(f, st.size);
+        }
+        if special and (r.value != '\t') {
             gid = 0;
         }
-        cells.push(Cell.{ cp: r.value, offset: i, len: r.len, span: sp, gid: gid, font: f, advance: adv })!;
+        cells.push(Cell.{
+            cp: r.value,
+            offset: i,
+            len: r.len,
+            span: sp,
+            gid: gid,
+            font: f,
+            advance: adv,
+            run: 0,
+            special: special,
+        })!;
         cps.push(r.value)!;
         i += r.len;
     }
@@ -393,18 +451,76 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
     let mut bp = bidi.Paragraph.init(cps.items(), opts.direction)!;
     defer bp.deinit();
     let rtl = (bp.level & 1) == 1;
-    // mirrored glyphs in right-to-left runs
+    // scripts: common and inherited characters take their neighbours'
+    let mut scripts = vec.Vec.[u32].init();
+    defer scripts.deinit();
+    let mut last_script: u32 = 0;
     for k in @as(usize, 0)..n {
-        if ((bp.levels[k] & 1) == 1) and uni.is_bidi_mirrored(cs[k].cp) {
-            let m = uni.mirror(cs[k].cp);
-            let g = cs[k].font.glyph_index(m);
-            if g != 0 {
-                cs[k].gid = g;
+        let sc = shape.script_of(cs[k].cp);
+        if (sc == shape.tag("Zyyy")) or (sc == shape.tag("Zinh")) or (sc == shape.tag("Zzzz")) {
+            scripts.push(last_script)!;
+        } else {
+            scripts.push(sc)!;
+            last_script = sc;
+        }
+    }
+    let scs = scripts.items();
+    // leading common characters take the first real script
+    {
+        let mut first: u32 = 0;
+        for k in @as(usize, 0)..n {
+            if scs[k] != 0 {
+                first = scs[k];
+                break;
             }
+        }
+        for k in @as(usize, 0)..n {
+            if scs[k] != 0 {
+                break;
+            }
+            scs[k] = first;
+        }
+    }
+    // runs: one span, font, level and script, without special characters
+    let mut runs = vec.Vec.[Run].init();
+    defer runs.deinit();
+    let mut k: usize = 0;
+    while k < n {
+        let mut e = k + 1;
+        if not cs[k].special {
+            while (e < n) and not cs[e].special and (cs[e].span == cs[k].span) and
+                  (@int_from_ptr(cs[e].font) == @int_from_ptr(cs[k].font)) and (bp.levels[e] == bp.levels[k]) and
+                  (scs[e] == scs[k]) {
+                e += 1;
+            }
+        }
+        for j in k..e {
+            cs[j].run = runs.len;
+        }
+        runs.push(Run.{ start: k, end: e, level: bp.levels[k], script: scs[k] })!;
+        k = e;
+    }
+    // measure: each cluster's advance goes to its first cell
+    for r in runs.items() {
+        if cs[r.start].special {
+            continue;
+        }
+        let gs = shape_cells(s, cs, r, r.start, r.end, spans, memo)!;
+        defer mem.free(gs);
+        let f = cs[r.start].font;
+        let scale = font.scale_for(f, spans[cs[r.start].span].style.size);
+        for g in gs {
+            let c = cell_at(cs, r.start, r.end, cs[r.start].offset + @as(usize, g.cluster));
+            cs[c].advance += @float_from_int(f64, g.x_advance) * scale;
+        }
+    }
+    for j in @as(usize, 0)..n {
+        if not (is_newline(cs[j].cp) or (uni.category(cs[j].cp) == uni.GC_CC)) {
+            cs[j].advance += spans[cs[j].span].style.letter_spacing;
         }
     }
     // tabs: to the next stop (measured from the line start when placed)
-    let mut tab = opts.tab_stops;
+    let tab = opts.tab_stops;
     // break opportunities, as code point indices where a line may end
     let mut breaks = vec.Vec.[usize].init();
     defer breaks.deinit();
@@ -428,7 +544,8 @@ fn paragraph(s: []u8, start: usize, end: usize, span_of: []usize, spans: []Span,
         if opts.width > 0.0 {
             line_end = fit(cs, line_start, bs, &mut bi, opts.width, tab)!;
         }
-        y = place_line(cs, &bp, line_start, line_end, (line_end == n), rtl, spans, opts, y, tab, out, memo)!;
+        y = place_line(s, cs, runs.items(), &bp, line_start, line_end, (line_end == n), rtl, spans, opts, y, tab, out,
+                       memo)!;
         line_start = line_end;
     }
     if n == 0 {
@@ -451,23 +568,6 @@ fn blank_height(spans: []Span, span_of: []usize, at: usize, opts: Options) f64 {
 
 fn trailing_space(cp: u32) bool {
     return uni.is_space(cp) and (cp != 0xa0) and (cp != 0x202f);
-}
-
-/// The width of cells [a, b) without trailing white space.
-fn visible_width(cs: []Cell, a: usize, b: usize, tab: f64) f64 {
-    let mut e = b;
-    while (e > a) and (trailing_space(cs[e - 1].cp) or is_newline(cs[e - 1].cp)) {
-        e -= 1;
-    }
-    let mut w: f64 = 0.0;
-    for k in a..e {
-        if (cs[k].cp == '\t') and (tab > 0.0) {
-            w = (@floor(w / tab) + 1.0) * tab;
-        } else {
-            w += cs[k].advance;
-        }
-    }
-    return w;
 }
 
 /// Where the line starting at cell `a` ends: the last break opportunity
@@ -523,49 +623,165 @@ fn fit(cs: []Cell, a: usize, bs: []usize, bi: *mut usize, width: f64, tab: f64) 
         }
         w = nw;
         e += 1;
-        // keep combining marks with their base
-        while (e < limit) and (uni.width(cs[e].cp) == 0) and (cs[e].advance == 0.0) {
+        // keep combining marks (and the rest of a cluster) with their base
+        while (e < limit) and (((uni.width(cs[e].cp) == 0) and (cs[e].advance == 0.0)) or is_mark(cs[e].cp)) {
             e += 1;
         }
     }
     return e;
 }
 
-/// The width of a line's cells in visual order, with kerning and tabs,
-/// leaving out the trailing white space from cell `e` on.
-fn kerned_width(cs: []Cell, bp: *bidi.Paragraph, order: []usize, e: usize, spans: []Span, tab: f64,
-                memo: *mut Memo) f64 {
-    let mut x: f64 = 0.0;
-    let mut prev_font: usize = 0;
-    let mut prev_gid: u32 = 0;
-    let mut prev_span: usize = @max_value(usize);
-    let mut prev_level: u8 = 255;
-    for k in order {
-        let c = cs[k];
+/// A glyph of a line being placed: positions relative to the pen.
+struct Placed {
+    id: u32,
+    font: *font.Font,
+    span: usize,
+    offset: usize,
+    length: usize,
+    advance: f64,  // with letter spacing
+    dx: f64,
+    dy: f64,      // y down
+    space: bool,  // a space justification may widen
+    tab: bool,    // a tab: advances to the next stop
+    draw: bool,
+}
+
+/// Shapes the line's cells [a, e) in visual order.
+fn shape_line(s: []u8, cs: []Cell, runs: []Run, order: []usize, e: usize, spans: []Span, memo: *mut Memo,
+              placed: *mut vec.Vec.[Placed]) !void {
+    let mut i: usize = 0;
+    while i < order.len {
+        let k = order[i];
         if k >= e {
+            i += 1;
+            continue;  // trailing white space
+        }
+        let c = cs[k];
+        if c.special {
+            if c.cp == '\t' {
+                placed.push(Placed.{
+                    id: 0,
+                    font: c.font,
+                    span: c.span,
+                    offset: c.offset,
+                    length: c.len,
+                    advance: c.advance,
+                    dx: 0.0,
+                    dy: 0.0,
+                    space: false,
+                    tab: true,
+                    draw: false,
+                })!;
+            }
+            i += 1;
             continue;
         }
-        if (prev_span == c.span) and (prev_font == @int_from_ptr(c.font)) and (prev_level == bp.levels[k]) and
-           (prev_gid != 0) and (c.gid != 0) {
-            x += @float_from_int(f64, memo.kerning(c.font, prev_gid, c.gid)) * font.scale_for(
-                c.font, spans[c.span].style.size);
+        // the cells of this run that follow in visual order
+        let mut lo = k;
+        let mut hi = k;
+        let mut j = i + 1;
+        while (j < order.len) and (order[j] < e) and not cs[order[j]].special and (cs[order[j]].run == c.run) {
+            lo = @min(lo, order[j]);
+            hi = @max(hi, order[j]);
+            j += 1;
         }
-        if (c.cp == '\t') and (tab > 0.0) {
+        let r = runs[c.run];
+        let gs = shape_cells(s, cs, r, lo, hi + 1, spans, memo)!;
+        defer mem.free(gs);
+        let st = spans[c.span].style;
+        let scale = font.scale_for(c.font, st.size);
+        let base = cs[lo].offset;
+        for g in gs {
+            let cell = cell_at(cs, lo, hi + 1, base + @as(usize, g.cluster));
+            placed.push(Placed.{
+                id: g.id,
+                font: c.font,
+                span: c.span,
+                offset: base + @as(usize, g.cluster),
+                length: 0,
+                advance: @float_from_int(f64, g.x_advance) * scale,
+                dx: @float_from_int(f64, g.x_offset) * scale,
+                dy: -@float_from_int(f64, g.y_offset) * scale,
+                space: (cs[cell].cp == ' ') or (cs[cell].cp == 0x3000),
+                tab: false,
+                draw: g.id != 0,
+            })!;
+        }
+        // the text each cluster stands for (from its start to the next
+        // cluster's), given to its first glyph
+        {
+            let ps = placed.items();
+            let first = ps.len - gs.len;
+            let seg_end = cs[hi].offset + cs[hi].len;
+            for m in first..ps.len {
+                let mut seen = false;
+                for q in first..m {
+                    if ps[q].offset == ps[m].offset {
+                        seen = true;
+                    }
+                }
+                if seen {
+                    continue;
+                }
+                let mut next = seg_end;
+                for q in first..ps.len {
+                    if (ps[q].offset > ps[m].offset) and (ps[q].offset < next) {
+                        next = ps[q].offset;
+                    }
+                }
+                ps[m].length = next - ps[m].offset;
+            }
+        }
+        // letter spacing: after each cluster, per character in it
+        if st.letter_spacing != 0.0 {
+            let ps = placed.items();
+            let first = ps.len - gs.len;
+            for m in first..ps.len {
+                let mut last_of_cluster = true;
+                if (m + 1) < ps.len {
+                    last_of_cluster = ps[m + 1].offset != ps[m].offset;
+                }
+                if last_of_cluster {
+                    // the characters from this cluster's start to the next larger cluster start
+                    let mut next = cs[hi].offset + cs[hi].len;
+                    for q in first..ps.len {
+                        if (ps[q].offset > ps[m].offset) and (ps[q].offset < next) {
+                            next = ps[q].offset;
+                        }
+                    }
+                    let mut count: usize = 0;
+                    for q in lo..(hi + 1) {
+                        if (cs[q].offset >= ps[m].offset) and (cs[q].offset < next) {
+                            count += 1;
+                        }
+                    }
+                    ps[m].advance += st.letter_spacing * @float_from_int(f64, count);
+                }
+            }
+        }
+        i = j;
+    }
+}
+
+/// The width of placed glyphs with tabs and extra space per space glyph.
+fn placed_width(ps: []Placed, tab: f64, extra: f64) f64 {
+    let mut x: f64 = 0.0;
+    for p in ps {
+        if p.tab and (tab > 0.0) {
             x = (@floor(x / tab) + 1.0) * tab;
         } else {
-            x += c.advance;
+            x += p.advance;
         }
-        prev_font = @int_from_ptr(c.font);
-        prev_gid = c.gid;
-        prev_span = c.span;
-        prev_level = bp.levels[k];
+        if p.space {
+            x += extra;
+        }
     }
     return x;
 }
 
 /// Places cells [a, b) as a line whose top is at y; returns the next line's top.
-fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, rtl: bool, spans: []Span, opts: Options,
-              y: f64, tab: f64, out: *mut Layout, memo: *mut Memo) !f64 {
+fn place_line(s: []u8, cs: []Cell, runs: []Run, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, rtl: bool,
+              spans: []Span, opts: Options, y: f64, tab: f64, out: *mut Layout, memo: *mut Memo) !f64 {
     // metrics: the largest of the fonts on the line
     let mut asc: f64 = 0.0;
     let mut desc: f64 = 0.0;
@@ -585,17 +801,21 @@ fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, r
     while (e > a) and (trailing_space(cs[e - 1].cp) or is_newline(cs[e - 1].cp)) {
         e -= 1;
     }
-    // visual order
+    // the line's glyphs, shaped, in visual order
     let order = bp.visual_order(a, b)!;
     defer mem.free(order);
-    let lw = kerned_width(cs, bp, order, e, spans, tab, memo);
+    let mut placed = vec.Vec.[Placed].init();
+    defer placed.deinit();
+    shape_line(s, cs, runs, order, e, spans, memo, &mut placed)!;
+    let ps = placed.items();
+    let lw = placed_width(ps, tab, 0.0);
     // justification: extra room shared among the spaces
     let mut extra: f64 = 0.0;
     let ends_para = last or ((b > a) and is_newline(cs[b - 1].cp));
     if (opts.align == JUSTIFY) and not ends_para and (opts.width > lw) {
         let mut spaces: usize = 0;
-        for k in a..e {
-            if (cs[k].cp == ' ') or (cs[k].cp == 0x3000) {
+        for p in ps {
+            if p.space {
                 spaces += 1;
             }
         }
@@ -631,52 +851,34 @@ fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, r
     }
     let left = x;
     let first = out.glyphs.len;
-    let mut prev_font: usize = 0;
-    let mut prev_gid: u32 = 0;
-    let mut prev_span: usize = @max_value(usize);
-    let mut prev_level: u8 = 255;
-    for k in order {
-        let c = cs[k];
-        if k >= e {
-            continue;  // trailing white space
-        }
-        let st = spans[c.span].style;
-        // kerning with the glyph to the left, within a run of one font and direction
-        if (prev_span == c.span) and (prev_font == @int_from_ptr(c.font)) and (prev_level == bp.levels[k]) and
-           (prev_gid != 0) and (c.gid != 0) {
-            x += @float_from_int(f64, memo.kerning(c.font, prev_gid, c.gid)) * font.scale_for(c.font, st.size);
-        }
-        let mut adv = c.advance;
-        if (c.cp == '\t') and (tab > 0.0) {
+    for p in ps {
+        let st = spans[p.span].style;
+        let mut adv = p.advance;
+        if p.tab and (tab > 0.0) {
             adv = ((@floor((x - left) / tab) + 1.0) * tab) - (x - left);
         }
-        if ((c.cp == ' ') or (c.cp == 0x3000)) and (extra > 0.0) {
+        if p.space {
             adv += extra;
         }
-        if (c.gid != 0) and (c.cp != '\t') and not is_newline(c.cp) {
+        if p.draw {
             out.glyphs.push(Glyph.{
-                id: c.gid,
-                font: c.font,
-                x: x,
-                y: baseline,
+                id: p.id,
+                font: p.font,
+                x: x + p.dx,
+                y: baseline + p.dy,
                 size: st.size,
-                span: c.span,
-                offset: c.offset,
+                span: p.span,
+                offset: p.offset,
+                length: p.length,
                 advance: adv,
             })!;
         }
         x += adv;
-        prev_font = @int_from_ptr(c.font);
-        prev_gid = c.gid;
-        prev_span = c.span;
-        prev_level = bp.levels[k];
     }
-    let mut ls = cs[a].offset;
-    let mut le = ls;
+    let mut le = cs[a].offset;
     if b > a {
         le = cs[b - 1].offset + cs[b - 1].len;
     }
-    _ = ls;
     out.lines.push(Line.{
         start: cs[a].offset,
         end: le,
@@ -690,7 +892,6 @@ fn place_line(cs: []Cell, bp: *bidi.Paragraph, a: usize, b: usize, last: bool, r
         rtl: rtl,
     })!;
     out.width = @max(out.width, x);
-    ls = 0;
     return y + natural;
 }
 
@@ -809,4 +1010,80 @@ test "font fallback" {
     @expect_eq(gs.len, 5);  // H, i, space, 中, 文
     @expect_eq(@int_from_ptr(gs[0].font), @int_from_ptr(&latin));
     @expect_eq(@int_from_ptr(gs[3].font), @int_from_ptr(&cjk));
+}
+
+test "shaped text" {
+    let mut f = try_font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") catch return;
+    defer f.deinit();
+    let st = Style.init(&f, 20.0, color.Color.rgb(0.0, 0.0, 0.0));
+    // ligatures: "ffi" is one glyph, placed as std/shape places it
+    let sp: [1]Span = [Span.{ text: "office", style: st }];
+    let mut l = layout(sp[..], Options.init(0.0))!;
+    defer l.deinit();
+    let gs = l.glyphs.items();
+    @expect_eq(gs.len, 4);
+    let sh = shape.shape(&f, "office", shape.options())!;
+    defer mem.free(sh);
+    let scale = font.scale_for(&f, 20.0);
+    let mut pen: f64 = 0.0;
+    for k in @as(usize, 0)..4 {
+        @expect_eq(gs[k].id, sh[k].id);
+        @expect(@abs(gs[k].x - pen) < 0.0001);
+        pen += @float_from_int(f64, sh[k].x_advance) * scale;
+    }
+    // features: no ligatures
+    let mut plain = st;
+    let noliga: [1]shape.Feature = [shape.feature("-liga")!];
+    plain.features = noliga[..];
+    let ps: [1]Span = [Span.{ text: "office", style: plain }];
+    let mut p = layout(ps[..], Options.init(0.0))!;
+    defer p.deinit();
+    @expect_eq(p.glyphs.len, 6);
+    // letter spacing goes after each character, ligated or not
+    let mut spaced = st;
+    spaced.letter_spacing = 2.0;
+    let ss: [1]Span = [Span.{ text: "office", style: spaced }];
+    let mut sl = layout(ss[..], Options.init(0.0))!;
+    defer sl.deinit();
+    @expect(@abs((sl.lines.get(0).right - l.lines.get(0).right) - 12.0) < 0.0001);
+    // Arabic joins, right to left: lam alef is one glyph
+    let ar: [1]Span = [Span.{ text: "\u{633}\u{644}\u{627}\u{645}", style: st }];
+    let mut a = layout(ar[..], Options.init(0.0))!;
+    defer a.deinit();
+    @expect(a.lines.get(0).rtl);
+    let ags = a.glyphs.items();
+    @expect_eq(ags.len, 3);
+    @expect_eq(ags[0].offset, 6);                // meem, at the left
+    @expect_eq(ags[2].offset, 0);                // seen, at the right
+    @expect(ags[2].id != f.glyph_index(0x633));  // its initial form
+    // a line break between Arabic words reshapes each line
+    let words: [1]Span = [Span.{ text: "\u{628}\u{628} \u{628}\u{628}", style: st }];
+    let whole = measure(words[..], Options.init(0.0))!;
+    let mut w = layout(words[..], Options.init(whole[0] * 0.7))!;
+    defer w.deinit();
+    @expect_eq(w.lines.len, 2);
+    // each line ends in a final form (as its own word would): the same
+    // glyphs as the first word shaped alone
+    let one = shape.shape(&f, "\u{628}\u{628}", shape.options())!;
+    defer mem.free(one);
+    let wg = w.glyphs.items();
+    @expect_eq(wg.len, 4);
+    @expect_eq(wg[0].id, one[0].id);
+    @expect_eq(wg[1].id, one[1].id);
+    @expect_eq(wg[2].id, one[0].id);
+}
+
+test "Indic reordering" {
+    let mut f = try_font("/usr/share/fonts/truetype/freefont/FreeSerif.ttf") catch return;
+    defer f.deinit();
+    let st = Style.init(&f, 20.0, color.Color.rgb(0.0, 0.0, 0.0));
+    // "ki": the vowel sign i is drawn before (left of) ka
+    let sp: [1]Span = [Span.{ text: "\u{915}\u{93f}", style: st }];
+    let mut l = layout(sp[..], Options.init(0.0))!;
+    defer l.deinit();
+    let gs = l.glyphs.items();
+    @expect_eq(gs.len, 2);
+    @expect(gs[0].id == f.glyph_index(0x93f));
+    @expect(gs[1].id == f.glyph_index(0x915));
+    @expect(gs[0].x < gs[1].x);
 }

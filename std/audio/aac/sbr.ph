@@ -16,8 +16,8 @@ import "tables.ph" as t;
 const TYPE_SCE: i32 = 0;
 const TYPE_CPE: i32 = 1;
 const TYPE_CCE: i32 = 2;
-const ENV_OFF: usize = 2; // ENVELOPE_ADJUSTMENT_OFFSET
-const SYN_BUF: usize = 2304; // SBR_SYNTHESIS_BUF_SIZE
+const ENV_OFF: usize = 2;     // ENVELOPE_ADJUSTMENT_OFFSET
+const SYN_BUF: usize = 2304;  // SBR_SYNTHESIS_BUF_SIZE
 const NOISE_FLOOR_OFFSET: i32 = 6;
 const FIXFIX: i32 = 0;
 const FIXVAR: i32 = 1;
@@ -201,7 +201,8 @@ fn in_table(table: []i32, last_el: i32, needle: i32) bool {
 }
 
 fn make_bands(bands: []mut i32, start: i32, stop: i32, num_bands: i32) void {
-    let base = math.powf(@float_from_int(f32, stop) / @float_from_int(f32, start), 1.0 / @float_from_int(f32, num_bands));
+    let base = math.powf(
+        @float_from_int(f32, stop) / @float_from_int(f32, start), 1.0 / @float_from_int(f32, num_bands));
     let mut prod = @float_from_int(f32, start);
     let mut previous = start;
     for k in @as(usize, 0)..us(num_bands - 1) {
@@ -392,8 +393,9 @@ fn make_f_master(s: *mut Sbr) bool {
         } else {
             s.k[1] = s.k[2];
         }
-        let num_bands_0 = lrintf(@float_from_int(f32, half_bands) *
-                                 math.log2f(@float_from_int(f32, s.k[1]) / @float_from_int(f32, s.k[0]))) * 2;
+        let num_bands_0 = lrintf(
+            @float_from_int(f32, half_bands) * math.log2f(
+                @float_from_int(f32, s.k[1]) / @float_from_int(f32, s.k[0]))) * 2;
         if (num_bands_0 <= 0) or (num_bands_0 > 48) {
             return false;
         }
@@ -414,8 +416,9 @@ fn make_f_master(s: *mut Sbr) bool {
             if s.spectrum[4] != 0 {
                 invwarp = 0.76923076923076923077;
             }
-            let num_bands_1 = lrintf((@float_from_int(f32, half_bands) * invwarp) *
-                                     math.log2f(@float_from_int(f32, s.k[2]) / @float_from_int(f32, s.k[1]))) * 2;
+            let num_bands_1 = lrintf(
+                (@float_from_int(f32, half_bands) * invwarp) * math.log2f(
+                    @float_from_int(f32, s.k[2]) / @float_from_int(f32, s.k[1]))) * 2;
             if (num_bands_1 <= 0) or ((num_bands_0 + num_bands_1) > 48) {
                 return false;
             }
@@ -542,8 +545,10 @@ fn make_f_derived(s: *mut Sbr) bool {
     for k in @as(usize, 1)..(us(s.n[0]) + 1) {
         s.f_tablelow[k] = s.f_tablehigh[us(((2 * si(k)) - odd))];
     }
-    s.n_q = @max(1, lrintf(@float_from_int(f32, s.spectrum[5]) *
-                           math.log2f(@float_from_int(f32, s.k[2]) / @float_from_int(f32, s.kx[1]))));
+    s.n_q = @max(
+        1, lrintf(
+            @float_from_int(f32, s.spectrum[5]) * math.log2f(
+                @float_from_int(f32, s.k[2]) / @float_from_int(f32, s.kx[1]))));
     if s.n_q > 5 {
         return false;
     }
@@ -1152,7 +1157,7 @@ fn qmf_synthesis(s: *mut Sbr, tw: *mut bitio.Tw, out: []mut f32, xc: usize, dc: 
         let syn = s.data[dc].synthesis[v..];
         let offs: [10]usize = [0, 192, 256, 448, 512, 704, 768, 960, 1024, 1216];
         let w = t.SBR_QMF_WINDOW[..];
-        let wstep = @as(usize, 64) << sh; // the analysis window is every other value
+        let wstep = @as(usize, 64) << sh;  // the analysis window is every other value
         let ws = @as(usize, 1) << sh;
         for k in @as(usize, 0)..n {
             let mut acc = syn[k] * w[k * ws];
@@ -1289,10 +1294,12 @@ fn hf_gen(s: *mut Sbr, c: usize) bool {
             for i in start..end {
                 let ii = i + ENV_OFF;
                 let lo = &s.x_low[p];
-                let re = ((((lo[ii - 2][0] * a0) - (lo[ii - 2][1] * a1)) + (lo[ii - 1][0] * a2)) - (lo[ii - 1][1] * a3)) +
-                         lo[ii][0];
-                let im = ((((lo[ii - 2][1] * a0) + (lo[ii - 2][0] * a1)) + (lo[ii - 1][1] * a2)) + (lo[ii - 1][0] * a3)) +
-                         lo[ii][1];
+                let re =
+                    ((((lo[ii - 2][0] * a0) - (lo[ii - 2][1] * a1)) + (lo[ii - 1][0] * a2)) - (lo[ii - 1][1] * a3)) +
+                    lo[ii][0];
+                let im =
+                    ((((lo[ii - 2][1] * a0) + (lo[ii - 2][0] * a1)) + (lo[ii - 1][1] * a2)) + (lo[ii - 1][0] * a3)) +
+                    lo[ii][1];
                 s.x_high[k][ii] = [re, im];
             }
             k += 1;
@@ -1310,7 +1317,7 @@ fn hf_gen(s: *mut Sbr, c: usize) bool {
 
 fn x_gen(s: *mut Sbr, c: usize) void {
     let ypos = s.data[c].ypos;
-    let y0 = 1 - ypos; // the previous frame's Y
+    let y0 = 1 - ypos;  // the previous frame's Y
     let i_temp = us(@max((2 * s.data[c].t_env_num_env_old) - 32, 0));
     for a in @as(usize, 0)..2 {
         for i in @as(usize, 0)..38 {
@@ -1382,8 +1389,8 @@ fn mapping(s: *mut Sbr, c: usize) bool {
         for i in @as(usize, 0)..us(s.n[1]) {
             if s.data[c].bs_add_harmonic_flag {
                 let mid = us(((s.f_tablehigh[i] + s.f_tablehigh[i + 1]) >> 1) - kx1);
-                s.data[c].s_indexmapped[e + 1][mid] = s.data[c].bs_add_harmonic[i] *
-                    b2i((si(e) >= e_a1) or (s.data[c].s_indexmapped[0][mid] == 1));
+                s.data[c].s_indexmapped[e + 1][mid] = s.data[c].bs_add_harmonic[i] * b2i(
+                    (si(e) >= e_a1) or (s.data[c].s_indexmapped[0][mid] == 1));
             }
         }
         for i in @as(usize, 0)..ilim {
@@ -1476,11 +1483,13 @@ fn gain_calc(s: *mut Sbr, c: usize) void {
                 s.q_m[e][m] = sqrtf(temp * s.q_mapped[e][m]);
                 s.s_m[e][m] = sqrtf(temp * @float_from_int(f32, d.s_indexmapped[e + 1][m]));
                 if s.s_mapped[e][m] == 0 {
-                    s.gain[e][m] = sqrtf(s.e_origmapped[e][m] /
-                                         ((1.0 + s.e_curr[e][m]) * (1.0 + (s.q_mapped[e][m] * @float_from_int(f32, delta)))));
+                    s.gain[e][m] =
+                        sqrtf(s.e_origmapped[e][m] /
+                              ((1.0 + s.e_curr[e][m]) * (1.0 + (s.q_mapped[e][m] * @float_from_int(f32, delta)))));
                 } else {
-                    s.gain[e][m] = sqrtf((s.e_origmapped[e][m] * s.q_mapped[e][m]) /
-                                         ((1.0 + s.e_curr[e][m]) * (1.0 + s.q_mapped[e][m])));
+                    s.gain[e][m] =
+                        sqrtf((s.e_origmapped[e][m] * s.q_mapped[e][m]) /
+                              ((1.0 + s.e_curr[e][m]) * (1.0 + s.q_mapped[e][m])));
                 }
                 s.gain[e][m] += FLT_MIN;
             }
@@ -1635,7 +1644,8 @@ fn hf_assemble(s: *mut Sbr, c: usize) void {
 /// Replicates the high band of l (and r, for a channel pair) in place:
 /// 1024 samples in, 2048 out (1024 when downsampled). ps_mode: parametric
 /// stereo makes r from l.
-pub fn apply(s: *mut Sbr, tw: *mut bitio.Tw, id_aac: i32, l: []mut f32, r: []mut f32, ps_mode: bool, downsampled: bool) void {
+pub fn apply(s: *mut Sbr, tw: *mut bitio.Tw, id_aac: i32, l: []mut f32, r: []mut f32, ps_mode: bool,
+             downsampled: bool) void {
     let mut nch: usize = 1;
     if id_aac == TYPE_CPE {
         nch = 2;
