@@ -2,19 +2,19 @@
 // std/compress/deflate.ph - DEFLATE compression (RFC 1951) in the raw, zlib (RFC 1950)
 // and gzip (RFC 1952) formats.
 //
-//     let packed = deflate.compress(data, deflate.GZIP, deflate.DEFAULT_LEVEL)!;
+//     let packed = deflate.compress(data, deflate.Format.GZIP, deflate.DEFAULT_LEVEL)!;
 //     defer mem.free(packed);
-//     let back = deflate.decompress(packed, deflate.GZIP, 1 << 30)!;  // at most 1 GiB
+//     let back = deflate.decompress(packed, deflate.Format.GZIP, 1 << 30)!;  // at most 1 GiB
 //     defer mem.free(back);
 //
 // or, streaming:
 //
-//     let z = deflate.Compressor.init(file.writer(), deflate.ZLIB, 6)!;
+//     let z = deflate.Compressor.init(file.writer(), deflate.Format.ZLIB, 6)!;
 //     defer z.deinit();
 //     z.write_all(chunk)!;        // as often as needed; z.writer() is an io.Writer
 //     z.finish()!;                // the last block and the checksum
 //
-//     let d = deflate.Decompressor.init(file.reader(), deflate.GZIP)!;
+//     let d = deflate.Decompressor.init(file.reader(), deflate.Format.GZIP)!;
 //     defer d.deinit();
 //     let n = d.read(buf[..])!;   // 0 at the end; d.reader() is an io.Reader
 //
@@ -34,9 +34,11 @@ error { CorruptData, ChecksumMismatch, Truncated, TooLarge, OutOfMemory }
 
 /// Formats: bare DEFLATE data, or wrapped with a zlib or gzip header and
 /// checksum.
-pub const RAW: u8 = 0;
-pub const ZLIB: u8 = 1;
-pub const GZIP: u8 = 2;
+pub enum Format: u8 {
+    RAW = 0,
+    ZLIB = 1,
+    GZIP = 2,
+}
 
 pub const DEFAULT_LEVEL: u32 = 6;
 pub const BEST_SPEED: u32 = 1;
@@ -226,7 +228,7 @@ pub struct Decompressor {
     pos: usize,
     bits: u64,  // input bits, least significant first
     nbits: u64,
-    format: u8,
+    format: Format,
     state: u8,
     last_block: bool,
     stored_left: usize,
@@ -242,7 +244,7 @@ pub struct Decompressor {
 
     /// A Decompressor for data in format (RAW, ZLIB or GZIP) read from r.
     /// Free it with deinit.
-    pub fn init(r: io.Reader, format: u8) !*mut Decompressor {
+    pub fn init(r: io.Reader, format: Format) !*mut Decompressor {
         let d = new_decompressor(format)!;
         d.input = r;
         d.has_input = true;
@@ -282,9 +284,9 @@ pub struct Decompressor {
     }
 
     fn update_check(self: *mut Decompressor, b: []u8) void {
-        if self.format == GZIP {
+        if self.format == Format.GZIP {
             self.check = crc32(self.check, b);
-        } else if self.format == ZLIB {
+        } else if self.format == Format.ZLIB {
             self.check = adler32(self.check, b);
         }
     }
@@ -395,7 +397,7 @@ pub struct Decompressor {
 
     fn read_header(self: *mut Decompressor) !void {
         self.out_count = 0;
-        if self.format == ZLIB {
+        if self.format == Format.ZLIB {
             self.check = 1;
             let cmf = self.byte()!;
             let flg = self.byte()!;
@@ -405,7 +407,7 @@ pub struct Decompressor {
             if (flg & 0x20) != 0 {
                 return error.CorruptData;  // a preset dictionary
             }
-        } else if self.format == GZIP {
+        } else if self.format == Format.GZIP {
             self.check = 0;
             if (self.byte()! != 0x1f) or (self.byte()! != 0x8b) or (self.byte()! != 8) {
                 return error.CorruptData;
@@ -437,7 +439,7 @@ pub struct Decompressor {
 
     fn read_trailer(self: *mut Decompressor) !void {
         self.align();
-        if self.format == ZLIB {
+        if self.format == Format.ZLIB {
             let mut v: u32 = 0;
             for i in @as(usize, 0)..4 {
                 v = (v << 8) | @as(u32, self.byte()!);
@@ -445,7 +447,7 @@ pub struct Decompressor {
             if v != self.check {
                 return error.ChecksumMismatch;
             }
-        } else if self.format == GZIP {
+        } else if self.format == Format.GZIP {
             let crc = self.take(32)!;
             let size = self.take(32)!;
             if (crc != self.check) or (size != @truncate(u32, self.out_count)) {
@@ -658,14 +660,14 @@ fn decompressor_read(ctx: *mut void, buf: []mut u8) !usize {
     return d.read(buf);
 }
 
-fn new_decompressor(format: u8) !*mut Decompressor {
+fn new_decompressor(format: Format) !*mut Decompressor {
     let m = mem.alloc.[Decompressor](1)!;
     @mem_set(@cast_slice(u8, m), 0);
     let d = &mut m[0];
     d.src = d.inbuf[..0];
     d.format = format;
     d.state = S_HEADER;
-    if format == RAW {
+    if format == Format.RAW {
         d.state = S_BLOCK;
     }
     return d;
@@ -673,7 +675,7 @@ fn new_decompressor(format: u8) !*mut Decompressor {
 
 /// Decompresses data in format into new memory (free it with mem.free).
 /// Fails with TooLarge if the result would be over max_size bytes.
-pub fn decompress(data: []u8, format: u8, max_size: usize) ![]mut u8 {
+pub fn decompress(data: []u8, format: Format, max_size: usize) ![]mut u8 {
     let d = new_decompressor(format)!;
     defer d.deinit();
     d.src = data;
@@ -899,7 +901,7 @@ let LEVELS: [10]Level = [
 /// Compresses what is written to it and writes the result to an io.Writer.
 pub struct Compressor {
     out: io.Writer,
-    format: u8,
+    format: Format,
     level: u32,
     params: Level,
     started: bool,  // the header was written
@@ -939,7 +941,7 @@ pub struct Compressor {
 
     /// A Compressor writing format (RAW, ZLIB or GZIP) at level (0 to 9)
     /// to w. Call finish at the end, then deinit.
-    pub fn init(w: io.Writer, format: u8, level: u32) !*mut Compressor {
+    pub fn init(w: io.Writer, format: Format, level: u32) !*mut Compressor {
         init_codes();
         let m = mem.alloc.[Compressor](1)!;
         @mem_set(@cast_slice(u8, m), 0);
@@ -948,7 +950,7 @@ pub struct Compressor {
         c.format = format;
         c.level = @min(level, 9);
         c.params = LEVELS[@as(usize, c.level)];
-        if format == ZLIB {
+        if format == Format.ZLIB {
             c.check = 1;
         }
         for i in 0..HASH_SIZE {
@@ -995,9 +997,9 @@ pub struct Compressor {
         if not self.started {
             self.write_header()!;
         }
-        if self.format == GZIP {
+        if self.format == Format.GZIP {
             self.check = crc32(self.check, bytes);
-        } else if self.format == ZLIB {
+        } else if self.format == Format.ZLIB {
             self.check = adler32(self.check, bytes);
         }
         self.in_count += @as(u64, bytes.len);
@@ -1037,11 +1039,11 @@ pub struct Compressor {
         self.process(true)!;
         self.emit_block(true)!;
         self.align_bits();
-        if self.format == ZLIB {
+        if self.format == Format.ZLIB {
             for i in @as(usize, 0)..4 {
                 self.put_bits((self.check >> @truncate(u32, 24 - (i * 8))) & 0xff, 8);
             }
-        } else if self.format == GZIP {
+        } else if self.format == Format.GZIP {
             self.put_bits(self.check & 0xffff, 16);
             self.put_bits(self.check >> 16, 16);
             let size = @truncate(u32, self.in_count);
@@ -1054,7 +1056,7 @@ pub struct Compressor {
 
     fn write_header(self: *mut Compressor) !void {
         self.started = true;
-        if self.format == ZLIB {
+        if self.format == Format.ZLIB {
             let mut flevel: u32 = 2;
             if self.level < 2 {
                 flevel = 0;
@@ -1067,7 +1069,7 @@ pub struct Compressor {
             flg += 31 - (((0x78 << 8) | flg) % 31);
             self.put_bits(0x78, 8);
             self.put_bits(flg, 8);
-        } else if self.format == GZIP {
+        } else if self.format == Format.GZIP {
             let mut xfl: u32 = 0;
             if self.level == 9 {
                 xfl = 2;
@@ -1573,7 +1575,7 @@ fn run_lengths(lens: []u8, syms: []mut u8, extra: []mut u8) usize {
 
 /// Compresses data into format at level (0 to 9) in new memory (free it
 /// with mem.free).
-pub fn compress(data: []u8, format: u8, level: u32) ![]mut u8 {
+pub fn compress(data: []u8, format: Format, level: u32) ![]mut u8 {
     let mut out = strs.String.init();
     let c = Compressor.init(out.writer(), format, level)!;
     defer c.deinit();
@@ -1604,15 +1606,15 @@ test "known streams" {
     // gzip -n of "hello, world\n"; zlib.compress of "hello hello hello hello"
     let g =
         "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xcb\x48\xcd\xc9\xc9\xd7\x51\x28\xcf\x2f\xca\x49\xe1\x02\x00\x53\x74\x24\xf4\x0d\x00\x00\x00";
-    let a = decompress(g, GZIP, 100)!;
+    let a = decompress(g, Format.GZIP, 100)!;
     defer mem.free(a);
     @expect_eq(a, "hello, world\n");
     let z = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\xc8\x40\x27\x01\x68\x03\x08\xb1";
-    let b = decompress(z, ZLIB, 100)!;
+    let b = decompress(z, Format.ZLIB, 100)!;
     defer mem.free(b);
     @expect_eq(b, "hello hello hello hello");
     // a stored raw block
-    let c = decompress("\x01\x03\x00\xfc\xffabc", RAW, 100)!;
+    let c = decompress("\x01\x03\x00\xfc\xffabc", Format.RAW, 100)!;
     defer mem.free(c);
     @expect_eq(c, "abc");
     let bad: [5][]u8 = [
@@ -1623,14 +1625,14 @@ test "known streams" {
         "\x07",                     // block type 3
     ];
     for i in 0..bad.len {
-        let mut f = RAW;
+        let mut f = Format.RAW;
         if i < 3 {
-            f = ZLIB;
+            f = Format.ZLIB;
         }
         _ = decompress(bad[i], f, 100) catch continue;
         @trap();
     }
-    _ = decompress(g, GZIP, 5) catch |e| {
+    _ = decompress(g, Format.GZIP, 5) catch |e| {
         @expect_eq(e, error.TooLarge);
         return;
     };
@@ -1661,13 +1663,13 @@ test "round trips" {
         let data = sample(n)!;
         defer mem.free(data);
         for level in @as(usize, 0)..10 {
-            for format in @as(usize, 0)..3 {
-                let c = compress(data, @truncate(u8, format), @truncate(u32, level))!;
+            for format in [Format.RAW, Format.ZLIB, Format.GZIP]{
+                let c = compress(data, format, @truncate(u32, level))!;
                 defer mem.free(c);
                 if (level > 0) and (n > 1000) {
                     @expect(c.len < (n / 2));
                 }
-                let d = decompress(c, @truncate(u8, format), n)!;
+                let d = decompress(c, format, n)!;
                 defer mem.free(d);
                 @expect_eq(d, data);
             }
@@ -1681,7 +1683,7 @@ test "streaming" {
     // written in odd pieces, with a flush in the middle
     let mut packed = strs.String.init();
     defer packed.deinit();
-    let c = Compressor.init(packed.writer(), GZIP, 6)!;
+    let c = Compressor.init(packed.writer(), Format.GZIP, 6)!;
     defer c.deinit();
     let mut i: usize = 0;
     let mut step: usize = 1;
@@ -1702,7 +1704,7 @@ test "streaming" {
     twice.push_str(packed.bytes())!;
     twice.push_str(packed.bytes())!;
     let mut src = io.SliceReader.init(twice.bytes());
-    let d = Decompressor.init(src.reader(), GZIP)!;
+    let d = Decompressor.init(src.reader(), Format.GZIP)!;
     defer d.deinit();
     let mut back = strs.String.init();
     defer back.deinit();

@@ -144,12 +144,12 @@ fn run() !void {
 
     if wanted("deflate") {
         let t0 = time.Instant.now();
-        let z = deflate.compress(text4, deflate.ZLIB, 6)!;
+        let z = deflate.compress(text4, deflate.Format.ZLIB, 6)!;
         report("deflate compress -6", text4.len, t0);
         save("text.z", z)!;
         let t1 = time.Instant.now();
         for _k in @as(usize, 0)..4 {
-            let d = deflate.decompress(z, deflate.ZLIB, 1 << 30)!;
+            let d = deflate.decompress(z, deflate.Format.ZLIB, 1 << 30)!;
             mem.free(d);
         }
         report("deflate decompress", text4.len * 4, t1);

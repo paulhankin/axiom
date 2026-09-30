@@ -3,11 +3,11 @@
 //
 //     let mut pk = rsa.PublicKey.from_bytes(modulus, exponent)!;
 //     defer pk.deinit();
-//     rsa.verify_pss(&pk, sha2.SHA256, digest, sig)          // bool
-//     rsa.verify_pkcs1v15(&pk, sha2.SHA256, digest, sig)     // bool
+//     rsa.verify_pss(&pk, sha2.Algorithm.SHA256, digest, sig)          // bool
+//     rsa.verify_pkcs1v15(&pk, sha2.Algorithm.SHA256, digest, sig)     // bool
 //
 //     let mut sk = rsa.PrivateKey.from_bytes(n, e, d)!;
-//     sk.sign_pss(sha2.SHA256, digest, sig)!;                 // sig: size bytes
+//     sk.sign_pss(sha2.Algorithm.SHA256, digest, sig)!;                 // sig: size bytes
 //
 // Keys come from X.509 certificates or PKCS #1 / PKCS #8 files through
 // std/x509. Private-key operations use BigInt.mod_pow_secret, whose time
@@ -75,16 +75,16 @@ fn public_op(pk: *PublicKey, sig: []u8, em: []mut u8) !bool {
 }
 
 /// The DER DigestInfo prefixes of PKCS #1 v1.5 for each hash.
-fn digest_info(kind: u8) []u8 {
+fn digest_info(kind: sha2.Algorithm) []u8 {
     match kind {
-        1    => { return "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"; }
-        2    => { return "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"; }
-        else => { return "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"; }
+        .SHA256 => { return "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"; }
+        .SHA384 => { return "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"; }
+        else    => { return "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"; }
     }
 }
 
 /// EMSA-PKCS1-v1_5: 00 01 FF..FF 00 DigestInfo digest.
-fn pkcs1_encode(kind: u8, digest: []u8, em: []mut u8) !void {
+fn pkcs1_encode(kind: sha2.Algorithm, digest: []u8, em: []mut u8) !void {
     let prefix = digest_info(kind);
     let t = prefix.len + digest.len;
     if (digest.len != sha2.digest_size(kind)) or (em.len < (t + 11)) {
@@ -99,7 +99,7 @@ fn pkcs1_encode(kind: u8, digest: []u8, em: []mut u8) !void {
 }
 
 /// Whether sig is a PKCS #1 v1.5 signature of digest (made with hash kind).
-pub fn verify_pkcs1v15(pk: *PublicKey, kind: u8, digest: []u8, sig: []u8) bool {
+pub fn verify_pkcs1v15(pk: *PublicKey, kind: sha2.Algorithm, digest: []u8, sig: []u8) bool {
     let mut em: [1024]u8 = [0; 1024];
     let mut want: [1024]u8 = [0; 1024];
     let n = pk.size;
@@ -111,7 +111,7 @@ pub fn verify_pkcs1v15(pk: *PublicKey, kind: u8, digest: []u8, sig: []u8) bool {
 }
 
 /// MGF1: xors mask(seed) into out.
-fn mgf1_xor(kind: u8, seed: []u8, out: []mut u8) void {
+fn mgf1_xor(kind: sha2.Algorithm, seed: []u8, out: []mut u8) void {
     let hl = sha2.digest_size(kind);
     let mut counter: u32 = 0;
     let mut done: usize = 0;
@@ -133,7 +133,7 @@ fn mgf1_xor(kind: u8, seed: []u8, out: []mut u8) void {
 }
 
 /// H(00 x 8 || digest || salt).
-fn pss_hash(kind: u8, digest: []u8, salt: []u8, out: []mut u8) void {
+fn pss_hash(kind: sha2.Algorithm, digest: []u8, salt: []u8, out: []mut u8) void {
     let zeros: [8]u8 = [0; 8];
     let mut h = sha2.Hasher.init(kind);
     h.update(zeros[..]);
@@ -144,7 +144,7 @@ fn pss_hash(kind: u8, digest: []u8, salt: []u8, out: []mut u8) void {
 
 /// Whether sig is an RSASSA-PSS signature of digest, with MGF1 over the
 /// same hash; any salt length is accepted.
-pub fn verify_pss(pk: *PublicKey, kind: u8, digest: []u8, sig: []u8) bool {
+pub fn verify_pss(pk: *PublicKey, kind: sha2.Algorithm, digest: []u8, sig: []u8) bool {
     let hl = sha2.digest_size(kind);
     if digest.len != hl {
         return false;
@@ -226,7 +226,7 @@ pub struct PrivateKey {
 
     /// An RSASSA-PSS signature of digest (salt as long as the hash); sig
     /// must be the modulus size.
-    pub fn sign_pss(self: *PrivateKey, kind: u8, digest: []u8, sig: []mut u8) !void {
+    pub fn sign_pss(self: *PrivateKey, kind: sha2.Algorithm, digest: []u8, sig: []mut u8) !void {
         let hl = sha2.digest_size(kind);
         let n = self.public.size;
         if (digest.len != hl) or (sig.len != n) {
@@ -258,7 +258,7 @@ pub struct PrivateKey {
     }
 
     /// A PKCS #1 v1.5 signature of digest; sig must be the modulus size.
-    pub fn sign_pkcs1v15(self: *PrivateKey, kind: u8, digest: []u8, sig: []mut u8) !void {
+    pub fn sign_pkcs1v15(self: *PrivateKey, kind: sha2.Algorithm, digest: []u8, sig: []mut u8) !void {
         let n = self.public.size;
         if sig.len != n {
             return error.InvalidLength;
@@ -327,13 +327,13 @@ test "rsa signatures" {
     let mut digest: [32]u8 = [0; 32];
     sha2.sha256("hello", digest[..]);
     let theirs = join_hex(TEST_SIG[..], sb[..]);
-    @expect(verify_pkcs1v15(&sk.public, sha2.SHA256, digest[..], theirs));
+    @expect(verify_pkcs1v15(&sk.public, sha2.Algorithm.SHA256, digest[..], theirs));
     let mut sig: [256]u8 = [0; 256];
-    sk.sign_pkcs1v15(sha2.SHA256, digest[..], sig[..])!;
+    sk.sign_pkcs1v15(sha2.Algorithm.SHA256, digest[..], sig[..])!;
     @expect_eq(sig[..], theirs);  // v1.5 is deterministic
-    sk.sign_pss(sha2.SHA256, digest[..], sig[..])!;
-    @expect(verify_pss(&sk.public, sha2.SHA256, digest[..], sig[..]));
+    sk.sign_pss(sha2.Algorithm.SHA256, digest[..], sig[..])!;
+    @expect(verify_pss(&sk.public, sha2.Algorithm.SHA256, digest[..], sig[..]));
     sig[100] ^= 4;
-    @expect(not verify_pss(&sk.public, sha2.SHA256, digest[..], sig[..]));
-    @expect(not verify_pkcs1v15(&sk.public, sha2.SHA384, digest[..], theirs));
+    @expect(not verify_pss(&sk.public, sha2.Algorithm.SHA256, digest[..], sig[..]));
+    @expect(not verify_pkcs1v15(&sk.public, sha2.Algorithm.SHA384, digest[..], theirs));
 }

@@ -615,12 +615,18 @@ struct Scratch {
     }
 }
 
+/// HTTP versions of a request (HTTP/2 requests are served as HTTP_1_1).
+pub enum Version: u8 {
+    HTTP_1_0 = 0,
+    HTTP_1_1 = 1,
+}
+
 pub struct Request {
     method: []u8,  // "GET", "POST", ...
     target: []u8,  // as sent: "/search?q=x"
     path: []u8,    // the target before any '?', still percent-encoded
     query: []u8,   // the target after '?', or ""
-    version: u8,   // 0 for HTTP/1.0, 1 for HTTP/1.1
+    version: Version,
     headers: []Header,
     body: []u8,
     scratch: *mut Scratch,
@@ -668,7 +674,7 @@ pub struct Response {
     status: u16,
     head: strs.String,  // "Name: value\r\n" for each header the handler set
     body: strs.String,  // buffered, not yet sent
-    version: u8,
+    version: Version,
     head_only: bool,  // a HEAD request: no body is sent
     keep_alive: bool,
     started: bool,  // the status line and headers have been sent
@@ -752,7 +758,7 @@ pub struct Response {
             return;
         }
         if not self.started {
-            if self.version == 0 {
+            if self.version == Version.HTTP_1_0 {
                 // no chunked encoding in HTTP/1.0: the body ends at close
                 self.keep_alive = false;
             } else {
@@ -803,7 +809,7 @@ pub struct Response {
         let mut h = strs.String.with_capacity(256 + self.head.len + body.len)!;
         defer h.deinit();
         let w = h.writer();
-        if self.version == 0 {
+        if self.version == Version.HTTP_1_0 {
             h.push_str("HTTP/1.0 ")!;
         } else {
             h.push_str("HTTP/1.1 ")!;
@@ -824,7 +830,7 @@ pub struct Response {
         }
         if not self.keep_alive {
             h.push_str("Connection: close\r\n")!;
-        } else if self.version == 0 {
+        } else if self.version == Version.HTTP_1_0 {
             h.push_str("Connection: keep-alive\r\n")!;
         }
         h.push_str("\r\n")!;
@@ -1184,11 +1190,12 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
         if q < target.len {
             query = target[q + 1..];
         }
-        let req = Request.{ method: method, target: target, path: target[..q], query: query, version: 1,
+        let req = Request.{ method: method, target: target, path: target[..q], query: query, version: Version.HTTP_1_1,
                             headers: hs.items(), body: st.body.bytes(), scratch: &mut scratch };
-        let mut res = Response.{ stream: t, status: 200, head: strs.String.init(), body: strs.String.init(), version: 1,
-                                 head_only: @mem_eq(method, "HEAD"), keep_alive: true, started: false, chunked: false,
-                                 has_type: false, upgraded: false, h2: &mut h, h2_id: id, is_h2: true };
+        let mut res = Response.{ stream: t, status: 200, head: strs.String.init(), body: strs.String.init(),
+                                 version: Version.HTTP_1_1, head_only: @mem_eq(method, "HEAD"), keep_alive: true,
+                                 started: false, chunked: false, has_type: false, upgraded: false, h2: &mut h,
+                                 h2_id: id, is_h2: true };
         s.handler(s.ctx, &req, &mut res) catch {
             if not res.started {
                 res.status = 500;
@@ -1258,9 +1265,9 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
         c.h2 = true;  // (serve_connection continues in HTTP/2)
         return false;
     }
-    let mut version: u8 = 1;
+    let mut version = Version.HTTP_1_1;
     if @mem_eq(proto, "HTTP/1.0") {
-        version = 0;
+        version = Version.HTTP_1_0;
     } else if not @mem_eq(proto, "HTTP/1.1") {
         if strs.starts_with(proto, "HTTP/") {
             return reject(c.stream, 505);
@@ -1279,13 +1286,13 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
             hosts += 1;
         }
     }
-    if (hosts > 1) or ((version == 1) and (hosts == 0)) {
+    if (hosts > 1) or ((version == Version.HTTP_1_1) and (hosts == 0)) {
         return reject(c.stream, 400);
     }
     let fr = framing(headers) catch |e| {
         return reject(c.stream, status_for(e));
     };
-    if fr.chunked and (version == 0) {
+    if fr.chunked and (version == Version.HTTP_1_0) {
         return reject(c.stream, 400);  // (HTTP/1.0 has no transfer codings: faulty framing)
     }
     // the body
@@ -1304,10 +1311,10 @@ fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, sc
     }
     // keep-alive
     let conn_hdr = find_header(headers, "Connection") catch "";
-    let mut keep = version == 1;
+    let mut keep = version == Version.HTTP_1_1;
     if has_token(conn_hdr, "close") {
         keep = false;
-    } else if (version == 0) and has_token(conn_hdr, "keep-alive") {
+    } else if (version == Version.HTTP_1_0) and has_token(conn_hdr, "keep-alive") {
         keep = true;
     }
     let q = strs.index_of_byte(target, '?') catch target.len;
@@ -1939,7 +1946,7 @@ test "patterns" {
         target: "",
         path: "",
         query: "",
-        version: 1,
+        version: Version.HTTP_1_1,
         headers: no_headers(),
         body: "",
         scratch: &mut sc,

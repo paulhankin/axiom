@@ -219,7 +219,7 @@ pub struct Archive {
             out = mem.alloc.[u8](n)!;
             @mem_copy(out, src);
         } else if e.method == DEFLATE {
-            out = deflate.decompress(src, deflate.RAW, n) catch |err| {
+            out = deflate.decompress(src, deflate.Format.RAW, n) catch |err| {
                 if err == error.TooLarge {
                     return error.Corrupt;  // more than it declares
                 }
@@ -404,7 +404,7 @@ pub struct Writer {
         let mut method = opts.method;
         let mut packed: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
         if method == DEFLATE {
-            packed = deflate.compress(data, deflate.RAW, opts.level)!;
+            packed = deflate.compress(data, deflate.Format.RAW, opts.level)!;
             if packed.len >= data.len {
                 mem.free(packed);
                 packed = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);

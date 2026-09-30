@@ -5,7 +5,7 @@
 //     let s = net.connect("example.com", 80)!;           // by name
 //     let a = net.Addr.parse("[::1]:8080")!;
 //     let l = net.listen_addr(a)!;                        // by address
-//     let u = net.UdpSocket.bind(net.Addr.any(4, 0))!;
+//     let u = net.UdpSocket.bind(net.Addr.any(net.Family.V4, 0))!;
 //     u.send_to("ping", net.Addr.parse("127.0.0.1:9999")!)!;
 //
 // Sockets use the Phalange host ABI (import module "phalange"); see
@@ -219,10 +219,16 @@ pub fn listen(hostname: []u8, port: u16) !TcpListener {
 // Addresses: IPv4 and IPv6, with a port
 // -----------------------------------------------------------------------------
 
-/// An IP address and port. For IPv4 (family 4) the address is ip[0..4];
-/// for IPv6 (family 6) all of ip, and scope is the zone (interface) index.
+/// IP versions.
+pub enum Family: u8 {
+    V4 = 4,
+    V6 = 6,
+}
+
+/// An IP address and port. For IPv4 (Family.V4) the address is ip[0..4];
+/// for IPv6 (Family.V6) all of ip, and scope is the zone (interface) index.
 pub struct Addr {
-    family: u8,
+    family: Family,
     port: u16,
     ip: [16]u8,
     scope: u32,
@@ -233,17 +239,17 @@ pub struct Addr {
         ip[1] = b;
         ip[2] = c;
         ip[3] = d;
-        return Addr.{ family: 4, port: port, ip: ip, scope: 0 };
+        return Addr.{ family: Family.V4, port: port, ip: ip, scope: 0 };
     }
 
     /// An IPv6 address from its 16 bytes.
     pub fn v6(bytes: [16]u8, port: u16) Addr {
-        return Addr.{ family: 6, port: port, ip: bytes, scope: 0 };
+        return Addr.{ family: Family.V6, port: port, ip: bytes, scope: 0 };
     }
 
     /// 127.0.0.1 and ::1.
-    pub fn loopback(family: u8, port: u16) Addr {
-        if family == 6 {
+    pub fn loopback(family: Family, port: u16) Addr {
+        if family == Family.V6 {
             let mut ip: [16]u8 = [0; 16];
             ip[15] = 1;
             return Addr.v6(ip, port);
@@ -252,8 +258,8 @@ pub struct Addr {
     }
 
     /// 0.0.0.0 and :: (every interface, for binding).
-    pub fn any(family: u8, port: u16) Addr {
-        if family == 6 {
+    pub fn any(family: Family, port: u16) Addr {
+        if family == Family.V6 {
             return Addr.v6([0; 16], port);
         }
         return Addr.v4(0, 0, 0, 0, port);
@@ -287,7 +293,7 @@ pub struct Addr {
     }
 
     pub fn is_loopback(self: Addr) bool {
-        if self.family == 4 {
+        if self.family == Family.V4 {
             return self.ip[0] == 127;
         }
         for k in @as(usize, 0)..15 {
@@ -315,7 +321,7 @@ pub struct Addr {
     /// ("2001:db8::1", the longest run of zero groups shortened).
     pub fn format_ip(self: Addr, w: io.Writer) !void {
         let mut buf: [48]u8 = [0; 48];
-        if self.family == 4 {
+        if self.family == Family.V4 {
             let v = (
                 ((@as(u32, self.ip[0]) << 24) | (@as(u32, self.ip[1]) << 16)) | (@as(u32, self.ip[2]) << 8)) | @as(
                     u32, self.ip[3]);
@@ -397,11 +403,11 @@ pub struct Addr {
 
     /// Writes "1.2.3.4:80" or "[::1]:80".
     pub fn format(self: Addr, w: io.Writer) !void {
-        if self.family == 6 {
+        if self.family == Family.V6 {
             w.write_all("[")!;
         }
         self.format_ip(w)!;
-        if self.family == 6 {
+        if self.family == Family.V6 {
             w.write_all("]")!;
         }
         let mut buf: [8]u8 = [0; 8];
@@ -412,7 +418,7 @@ pub struct Addr {
     // the host ABI's 24-byte record
     fn record(self: Addr) [24]u8 {
         let mut r: [24]u8 = [0; 24];
-        r[0] = self.family;
+        r[0] = @int_from_enum(self.family);
         r[2] = @truncate(u8, self.port >> 8);
         r[3] = @truncate(u8, self.port);
         for k in @as(usize, 0)..16 {
@@ -430,14 +436,18 @@ pub struct Addr {
         for k in @as(usize, 0)..16 {
             ip[k] = r[4 + k];
         }
+        let mut family = Family.V4;
+        if r[0] == 6 {
+            family = Family.V6;
+        }
         return Addr.{
-            family: r[0], port: (@as(u16, r[2]) << 8) | @as(u16, r[3]), ip: ip, scope: (
+            family: family, port: (@as(u16, r[2]) << 8) | @as(u16, r[3]), ip: ip, scope: (
                 (@as(u32, r[20]) | (@as(u32, r[21]) << 8)) | (@as(u32, r[22]) << 16)) | (@as(u32, r[23]) << 24) };
     }
 }
 
-fn if_v4(family: u8) usize {
-    if family == 4 {
+fn if_v4(family: Family) usize {
+    if family == Family.V4 {
         return 4;
     }
     return 16;
@@ -544,7 +554,7 @@ fn parse_ip6(s0: []u8) !Addr {
         ip[(2 * at) + 1] = @truncate(u8, groups[k]);
         at += 1;
     }
-    return Addr.{ family: 6, port: 0, ip: ip, scope: scope };
+    return Addr.{ family: Family.V6, port: 0, ip: ip, scope: scope };
 }
 
 /// The addresses of a host name (or a literal address), with port 0; the
@@ -829,7 +839,7 @@ test "addresses" {
     let qt = addr_text(q, true)!;
     defer mem.free(qt);
     @expect_eq(qt, "10.1.2.3:443");
-    @expect(Addr.parse("::1")!.is_loopback() and Addr.loopback(4, 0).is_loopback());
+    @expect(Addr.parse("::1")!.is_loopback() and Addr.loopback(Family.V4, 0).is_loopback());
     @expect(Addr.parse("127.0.0.1:5")!.eq(Addr.v4(127, 0, 0, 1, 5)));
     let bad: [9][]u8 = ["1:2:3:4:5:6:7:8:9", "1::2::3", "12345::", "::g", "[::1", "[::1]:", "1.2.3.4:x", "1.2.3", ":1"];
     for b in bad {
@@ -845,7 +855,7 @@ test "resolving and TCP by address" {
     let one = resolve("127.0.0.1")!;
     defer mem.free(one);
     @expect((one.len == 1) and one[0].eq(Addr.v4(127, 0, 0, 1, 0)));
-    let l = listen_addr(Addr.loopback(4, 0))!;
+    let l = listen_addr(Addr.loopback(Family.V4, 0))!;
     defer l.close();
     let la = l.local_addr()!;
     @expect((la.port != 0) and (la.port == l.port()));
@@ -858,23 +868,23 @@ test "resolving and TCP by address" {
     let mut buf: [4]u8 = [0; 4];
     @expect(s.read(buf[..])! == 2);
     // IPv6, where there is any
-    let l6 = listen_addr(Addr.loopback(6, 0)) catch return;
+    let l6 = listen_addr(Addr.loopback(Family.V6, 0)) catch return;
     defer l6.close();
     let c6 = connect_addr(l6.local_addr()!)!;
     defer c6.close();
     let s6 = l6.accept()!;
     defer s6.close();
-    @expect(s6.peer_addr()!.family == 6);
+    @expect(s6.peer_addr()!.family == Family.V6);
 }
 
 test "UDP, Unix sockets and polling" {
-    let a = UdpSocket.bind(Addr.loopback(4, 0))!;
+    let a = UdpSocket.bind(Addr.loopback(Family.V4, 0))!;
     defer a.close();
-    let b = UdpSocket.bind(Addr.loopback(4, 0))!;
+    let b = UdpSocket.bind(Addr.loopback(Family.V4, 0))!;
     defer b.close();
     a.send_to("hello", b.local_addr()!)!;
     let mut buf: [16]u8 = [0; 16];
-    let mut from = Addr.any(4, 0);
+    let mut from = Addr.any(Family.V4, 0);
     let n = b.recv_from(buf[..], &mut from)!;
     @expect_eq(buf[..n], "hello");
     @expect(from.eq(a.local_addr()!));
@@ -898,7 +908,7 @@ test "UDP, Unix sockets and polling" {
     @expect_eq(ub[..un], "over unix");
     @expect(refused(connect_unix("/surely/no/socket")));
     // polling: nothing ready, then a datagram and a connection
-    let l = listen_addr(Addr.loopback(4, 0))!;
+    let l = listen_addr(Addr.loopback(Family.V4, 0))!;
     defer l.close();
     let mut p = Poller.init();
     defer p.deinit();

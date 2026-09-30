@@ -276,25 +276,25 @@ fn out() Out {
 
 struct Suite {
     id: u16,
-    hash: u8,  // sha2.SHA256 or sha2.SHA384
+    hash: sha2.Algorithm,  // SHA256 or SHA384
     key_len: usize,
 }
 
 fn suite_of(id: u16) !Suite {
     if id == TLS_CHACHA20_POLY1305_SHA256 {
-        return Suite.{ id: id, hash: sha2.SHA256, key_len: 32 };
+        return Suite.{ id: id, hash: sha2.Algorithm.SHA256, key_len: 32 };
     }
     if id == TLS_AES_128_GCM_SHA256 {
-        return Suite.{ id: id, hash: sha2.SHA256, key_len: 16 };
+        return Suite.{ id: id, hash: sha2.Algorithm.SHA256, key_len: 16 };
     }
     if id == TLS_AES_256_GCM_SHA384 {
-        return Suite.{ id: id, hash: sha2.SHA384, key_len: 32 };
+        return Suite.{ id: id, hash: sha2.Algorithm.SHA384, key_len: 32 };
     }
     return error.HandshakeFailure;
 }
 
 /// HKDF-Expand-Label (RFC 8446 7.1).
-fn expand_label(hash: u8, secret: []u8, label: []u8, context: []u8, out_buf: []mut u8) void {
+fn expand_label(hash: sha2.Algorithm, secret: []u8, label: []u8, context: []u8, out_buf: []mut u8) void {
     let mut info: [300]u8 = [0; 300];
     let n = out_buf.len;
     info[0] = @truncate(u8, n >> 8);
@@ -373,7 +373,7 @@ struct Transcript {
     h: sha2.Hasher,
 
     fn init() Transcript {
-        return Transcript.{ started: false, pending: strs.String.init(), h: sha2.Hasher.init(sha2.SHA256) };
+        return Transcript.{ started: false, pending: strs.String.init(), h: sha2.Hasher.init(sha2.Algorithm.SHA256) };
     }
 
     fn deinit(self: *mut Transcript) void {
@@ -388,7 +388,7 @@ struct Transcript {
         }
     }
 
-    fn start(self: *mut Transcript, hash: u8) void {
+    fn start(self: *mut Transcript, hash: sha2.Algorithm) void {
         self.h = sha2.Hasher.init(hash);
         self.h.update(self.pending.bytes());
         self.started = true;
@@ -451,7 +451,7 @@ fn no_protocols() [][]u8 {
 pub struct ServerConfig {
     chain: vec.Vec.[[]mut u8],  // DER certificates
     key: x509.PrivateKey,
-    key_kind: u8,  // x509.KEY_*
+    key_kind: x509.KeyKind,
     alpn: [][]u8,  // protocols accepted, in order of preference
 
     /// From PEM texts: the certificates (leaf first) and the private key.
@@ -480,12 +480,12 @@ pub struct ServerConfig {
             free_chain(&mut chain);
             return e;
         };
-        let mut kind: u8 = 0;
+        let mut kind = x509.KeyKind.UNSUPPORTED;
         match key {
-            .Rsa(k)     => { kind = x509.KEY_RSA; }
-            .P256(k)    => { kind = x509.KEY_P256; }
-            .P384(k)    => { kind = x509.KEY_P384; }
-            .Ed25519(k) => { kind = x509.KEY_ED25519; }
+            .Rsa(k)     => { kind = x509.KeyKind.RSA; }
+            .P256(k)    => { kind = x509.KeyKind.P256; }
+            .P384(k)    => { kind = x509.KeyKind.P384; }
+            .Ed25519(k) => { kind = x509.KeyKind.ED25519; }
         }
         return ServerConfig.{ chain: chain, key: key, key_kind: kind, alpn: no_protocols() };
     }
@@ -909,7 +909,7 @@ fn new_conn(stream: net.TcpStream, is_client: bool) !*mut Conn {
     @mem_set(@cast_slice(u8, c), 0);
     p.stream = stream;
     p.is_client = is_client;
-    p.suite = Suite.{ id: 0, hash: sha2.SHA256, key_len: 0 };
+    p.suite = Suite.{ id: 0, hash: sha2.Algorithm.SHA256, key_len: 0 };
     p.rd = Cipher.none();
     p.wr = Cipher.none();
     p.hs = strs.String.init();
@@ -970,12 +970,18 @@ fn verify_content(is_server: bool, th: []u8, out_buf: []mut u8) []u8 {
 /// Checks a CertificateVerify signature with the leaf certificate's key.
 fn check_signature(key: *x509.PublicKey, scheme: u16, content: []u8, sig: []u8) bool {
     match scheme {
-        0x0807 => { return key.verify(x509.SIG_ED25519, 0, content, sig); }
-        0x0403 => { return (key.kind == x509.KEY_P256) and key.verify(x509.SIG_ECDSA, sha2.SHA256, content, sig); }
-        0x0503 => { return (key.kind == x509.KEY_P384) and key.verify(x509.SIG_ECDSA, sha2.SHA384, content, sig); }
-        0x0804 => { return key.verify(x509.SIG_RSA_PSS, sha2.SHA256, content, sig); }
-        0x0805 => { return key.verify(x509.SIG_RSA_PSS, sha2.SHA384, content, sig); }
-        0x0806 => { return key.verify(x509.SIG_RSA_PSS, sha2.SHA512, content, sig); }
+        0x0807 => { return key.verify(x509.SigAlg.ED25519, sha2.Algorithm.SHA256, content, sig); }
+        0x0403 => {
+            return (key.kind == x509.KeyKind.P256) and
+                   key.verify(x509.SigAlg.ECDSA, sha2.Algorithm.SHA256, content, sig);
+        }
+        0x0503 => {
+            return (key.kind == x509.KeyKind.P384) and
+                   key.verify(x509.SigAlg.ECDSA, sha2.Algorithm.SHA384, content, sig);
+        }
+        0x0804 => { return key.verify(x509.SigAlg.RSA_PSS, sha2.Algorithm.SHA256, content, sig); }
+        0x0805 => { return key.verify(x509.SigAlg.RSA_PSS, sha2.Algorithm.SHA384, content, sig); }
+        0x0806 => { return key.verify(x509.SigAlg.RSA_PSS, sha2.Algorithm.SHA512, content, sig); }
         else   => { return false; }
     }
 }
@@ -1052,7 +1058,7 @@ fn sign_content(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8,
             let mut d: [32]u8 = [0; 32];
             sha2.sha256(content, d[..]);
             let n = k.public.size;
-            k.sign_pss(sha2.SHA256, d[..], sig[..n])!;
+            k.sign_pss(sha2.Algorithm.SHA256, d[..], sig[..n])!;
             scheme.* = SIG_RSA_PSS_SHA256;
             return sig[..n];
         }
@@ -1436,7 +1442,7 @@ fn free_certs(list: *mut vec.Vec.[x509.Certificate]) void {
 }
 
 /// HMAC(finished_key, transcript hash).
-fn finished_mac(hash: u8, base: []u8, th: []u8, out_buf: []mut u8) void {
+fn finished_mac(hash: sha2.Algorithm, base: []u8, th: []u8, out_buf: []mut u8) void {
     let hl = sha2.digest_size(hash);
     let mut fk: [48]u8 = [0; 48];
     expand_label(hash, base, "finished", "", fk[..hl]);
@@ -1445,7 +1451,7 @@ fn finished_mac(hash: u8, base: []u8, th: []u8, out_buf: []mut u8) void {
 
 /// The TLS 1.3 key schedule without pre-shared keys.
 struct KeySchedule {
-    hash: u8,
+    hash: sha2.Algorithm,
     hl: usize,
     handshake_secret: [48]u8,
     client_hs: [48]u8,
@@ -1453,7 +1459,7 @@ struct KeySchedule {
     client_ap: [48]u8,
     server_ap: [48]u8,
 
-    fn init(hash: u8) KeySchedule {
+    fn init(hash: sha2.Algorithm) KeySchedule {
         return KeySchedule.{ hash: hash, hl: sha2.digest_size(hash), handshake_secret: [0; 48], client_hs: [0; 48],
                              server_hs: [0; 48], client_ap: [0; 48], server_ap: [0; 48] };
     }

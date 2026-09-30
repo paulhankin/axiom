@@ -6,8 +6,8 @@
 //     defer p.deinit();
 //     p.flag("ignore-case", 'i', "match without regard to case")!;
 //     p.option("max-count", 'm', "NUM", "stop after NUM matches")!;
-//     p.positional("PATTERN", "what to look for", cli.REQUIRED)!;
-//     p.positional("FILE", "where to look", cli.MANY)!;
+//     p.positional("PATTERN", "what to look for", cli.Arity.REQUIRED)!;
+//     p.positional("FILE", "where to look", cli.Arity.MANY)!;
 //     let mut args = os.args()!;
 //     defer args.deinit();
 //     let m = p.parse(args.items.items()[1..]) catch {
@@ -43,10 +43,12 @@ error { UnknownOption, AmbiguousOption, MissingValue, UnexpectedValue, MissingAr
         UnknownCommand, InvalidNumber, HelpRequested, DuplicateName, OutOfMemory }
 
 /// How many values a positional takes.
-pub const OPTIONAL: u8 = 0;
-pub const REQUIRED: u8 = 1;
-pub const MANY: u8 = 2;  // any number
-pub const AT_LEAST_ONE: u8 = 3;
+pub enum Arity: u8 {
+    OPTIONAL = 0,
+    REQUIRED = 1,
+    MANY = 2,  // any number
+    AT_LEAST_ONE = 3,
+}
 
 struct Opt {
     name: []u8,  // long name ("" for none)
@@ -59,7 +61,7 @@ struct Opt {
 struct Pos {
     name: []u8,
     help: []u8,
-    arity: u8,
+    arity: Arity,
 }
 
 // an option (opt) or positional, by index
@@ -136,7 +138,7 @@ pub struct Parser {
 
     /// A positional argument. Positionals are filled in order; one of
     /// arity MANY or AT_LEAST_ONE takes all that the later ones leave.
-    pub fn positional(self: *mut Parser, name: []u8, help: []u8, arity: u8) !void {
+    pub fn positional(self: *mut Parser, name: []u8, help: []u8, arity: Arity) !void {
         for x in self.pos.items() {
             if strs.eq(x.name, name) {
                 return error.DuplicateName;
@@ -283,16 +285,16 @@ pub struct Parser {
         let mut many = ps.len;
         let mut required: usize = 0;
         for k in @as(usize, 0)..ps.len {
-            if (ps[k].arity == MANY) or (ps[k].arity == AT_LEAST_ONE) {
+            if (ps[k].arity == Arity.MANY) or (ps[k].arity == Arity.AT_LEAST_ONE) {
                 if many == ps.len {
                     many = k;
                 }
-                if ps[k].arity == AT_LEAST_ONE {
+                if ps[k].arity == Arity.AT_LEAST_ONE {
                     required += 1;
                 }
             } else {
                 fixed += 1;
-                if ps[k].arity == REQUIRED {
+                if ps[k].arity == Arity.REQUIRED {
                     required += 1;
                 }
             }
@@ -301,7 +303,7 @@ pub struct Parser {
             // the first required one missing
             let mut have = xs.len;
             for p in ps {
-                if (p.arity == REQUIRED) or (p.arity == AT_LEAST_ONE) {
+                if (p.arity == Arity.REQUIRED) or (p.arity == Arity.AT_LEAST_ONE) {
                     if have == 0 {
                         self.note("missing argument %", p.name);
                         return error.MissingArgument;
@@ -321,17 +323,17 @@ pub struct Parser {
         let mut x: usize = 0;
         for k in @as(usize, 0)..ps.len {
             let p = ps[k];
-            if (p.arity == REQUIRED) or ((p.arity == OPTIONAL) and (spare > 0) and (x < xs.len)) {
-                if p.arity == OPTIONAL {
+            if (p.arity == Arity.REQUIRED) or ((p.arity == Arity.OPTIONAL) and (spare > 0) and (x < xs.len)) {
+                if p.arity == Arity.OPTIONAL {
                     spare -= 1;
                 }
                 self.hits.push(Hit.{ opt: false, index: k, value: xs[x] })!;
                 x += 1;
-            } else if (p.arity == MANY) or (p.arity == AT_LEAST_ONE) {
+            } else if (p.arity == Arity.MANY) or (p.arity == Arity.AT_LEAST_ONE) {
                 // all but what the later fixed ones need
                 let mut later: usize = 0;
                 for q in ps[k + 1..] {
-                    if q.arity == REQUIRED {
+                    if q.arity == Arity.REQUIRED {
                         later += 1;
                     }
                 }
@@ -412,14 +414,14 @@ pub struct Parser {
         }
         for p in self.pos.items() {
             w.write_all(" ")!;
-            if (p.arity == OPTIONAL) or (p.arity == MANY) {
+            if (p.arity == Arity.OPTIONAL) or (p.arity == Arity.MANY) {
                 w.write_all("[")!;
             }
             w.write_all(p.name)!;
-            if (p.arity == MANY) or (p.arity == AT_LEAST_ONE) {
+            if (p.arity == Arity.MANY) or (p.arity == Arity.AT_LEAST_ONE) {
                 w.write_all("...")!;
             }
-            if (p.arity == OPTIONAL) or (p.arity == MANY) {
+            if (p.arity == Arity.OPTIONAL) or (p.arity == Arity.MANY) {
                 w.write_all("]")!;
             }
         }
@@ -659,8 +661,8 @@ fn grep_parser() !Parser {
     p.option("max-count", 'm', "NUM", "stop after NUM matches")!;
     p.option("context", 0, "LINES", "")!;
     p.option("color", 0, "WHEN", "use colour: always, never or auto")!;
-    p.positional("PATTERN", "what to look for", REQUIRED)!;
-    p.positional("FILE", "where to look", MANY)!;
+    p.positional("PATTERN", "what to look for", Arity.REQUIRED)!;
+    p.positional("FILE", "where to look", Arity.MANY)!;
     return p;
 }
 
@@ -726,8 +728,8 @@ test "positional arities" {
     // cp-like: SOURCE... DEST
     let mut p = Parser.init("cp", "");
     defer p.deinit();
-    p.positional("SOURCE", "", AT_LEAST_ONE)!;
-    p.positional("DEST", "", REQUIRED)!;
+    p.positional("SOURCE", "", Arity.AT_LEAST_ONE)!;
+    p.positional("DEST", "", Arity.REQUIRED)!;
     let a: [3][]u8 = ["a", "b", "dir"];
     let m = p.parse(a[..])!;
     @expect((m.all("SOURCE").len == 2) and strs.eq(m.get("DEST", ""), "dir"));
@@ -736,7 +738,7 @@ test "positional arities" {
     // an optional one, and too many
     let mut q = Parser.init("head", "");
     defer q.deinit();
-    q.positional("FILE", "", OPTIONAL)!;
+    q.positional("FILE", "", Arity.OPTIONAL)!;
     let two: [2][]u8 = ["x", "y"];
     @expect(not q.parse(two[..0])!.has("FILE"));
     @expect(fails(&mut q, two[..], error.TooManyArguments, "unexpected argument 'y'"));
@@ -748,9 +750,9 @@ test "subcommands and help" {
     p.flag("quiet", 'q', "say nothing")!;
     let add = p.command("add", "add files")!;
     add.flag("force", 'f', "even ignored ones")!;
-    add.positional("PATH", "files to add", MANY)!;
+    add.positional("PATH", "files to add", Arity.MANY)!;
     let rm = p.command("rm", "remove files")!;
-    rm.positional("PATH", "", AT_LEAST_ONE)!;
+    rm.positional("PATH", "", Arity.AT_LEAST_ONE)!;
     let a: [4][]u8 = ["-q", "add", "-f", "x.c"];
     let m = p.parse(a[..])!;
     @expect(m.has("quiet"));

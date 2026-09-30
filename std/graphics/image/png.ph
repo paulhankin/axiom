@@ -138,7 +138,7 @@ pub fn decode(data: []u8) !image.Image {
             break;
         }
     }
-    let raw = deflate.decompress(idat.bytes(), deflate.ZLIB, expected) catch |e| {
+    let raw = deflate.decompress(idat.bytes(), deflate.Format.ZLIB, expected) catch |e| {
         if e == error.TooLarge {
             return error.InvalidImage;
         }
@@ -475,7 +475,7 @@ pub fn encode(img: *image.Image, level: u32) ![]mut u8 {
         raw.push_str(best)!;
         @mem_copy(prev, cur);
     }
-    let z = deflate.compress(raw.bytes(), deflate.ZLIB, level)!;
+    let z = deflate.compress(raw.bytes(), deflate.Format.ZLIB, level)!;
     defer mem.free(z);
     let mut out = strs.String.init();
     out.push_str(SIGNATURE[..]) catch |e| {

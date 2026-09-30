@@ -3,7 +3,7 @@
 // and scrypt (RFC 7914). For new password storage prefer Argon2id
 // (std/crypto/argon2), or scrypt; PBKDF2 is here for compatibility.
 //
-//     kdf.pbkdf2(sha2.SHA256, password, salt, 600000, key[..32]);
+//     kdf.pbkdf2(sha2.Algorithm.SHA256, password, salt, 600000, key[..32]);
 //     kdf.scrypt(password, salt, 1 << 15, 8, 1, key[..32])!;
 // =============================================================================
 
@@ -13,9 +13,9 @@ import "sha2.ph" as sha2;
 
 error { InvalidArgument, TooExpensive, OutOfMemory }
 
-/// PBKDF2 with HMAC over a sha2.Hasher kind (SHA1, SHA256, SHA384, SHA512):
+/// PBKDF2 with HMAC over a sha2.Algorithm (SHA1, SHA256, SHA384, SHA512):
 /// fills out with derived key bytes. iterations >= 1.
-pub fn pbkdf2(kind: u8, password: []u8, salt: []u8, iterations: u32, out: []mut u8) void {
+pub fn pbkdf2(kind: sha2.Algorithm, password: []u8, salt: []u8, iterations: u32, out: []mut u8) void {
     if iterations == 0 {
         @trap();
     }
@@ -150,7 +150,7 @@ pub fn scrypt(password: []u8, salt: []u8, n: u64, r: u32, p: u32, out: []mut u8)
     let w = 32 * rr;
     let bytes = mem.alloc.[u8](128 * rr * @as(usize, p))!;
     defer mem.free(bytes);
-    pbkdf2(sha2.SHA256, password, salt, 1, bytes);
+    pbkdf2(sha2.Algorithm.SHA256, password, salt, 1, bytes);
     let b = mem.alloc.[u32](w * @as(usize, p))!;
     defer mem.free(b);
     for i in @as(usize, 0)..b.len {
@@ -170,7 +170,7 @@ pub fn scrypt(password: []u8, salt: []u8, n: u64, r: u32, p: u32, out: []mut u8)
         bytes[(4 * i) + 2] = @truncate(u8, b[i] >> 16);
         bytes[(4 * i) + 3] = @truncate(u8, b[i] >> 24);
     }
-    pbkdf2(sha2.SHA256, password, bytes, 1, out);
+    pbkdf2(sha2.Algorithm.SHA256, password, bytes, 1, out);
 }
 
 // -----------------------------------------------------------------------------
@@ -189,11 +189,11 @@ fn hex(d: []u8, out: []mut u8) []u8 {
 test "pbkdf2" {
     let mut k: [100]u8 = [0; 100];
     let mut h: [200]u8 = [0; 200];
-    pbkdf2(sha2.SHA256, "password", "salt", 4096, k[..32]);
+    pbkdf2(sha2.Algorithm.SHA256, "password", "salt", 4096, k[..32]);
     @expect_eq(hex(k[..32], h[..]), "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
-    pbkdf2(sha2.SHA1, "password", "salt", 2, k[..20]);
+    pbkdf2(sha2.Algorithm.SHA1, "password", "salt", 2, k[..20]);
     @expect_eq(hex(k[..20], h[..]), "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");
-    pbkdf2(sha2.SHA512, "passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 1000, k[..]);
+    pbkdf2(sha2.Algorithm.SHA512, "passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 1000, k[..]);
     @expect_eq(hex(k[..], h[..]),
                "0e28f3efa802a2f0cd3b4ace5e3d9afadb7c2dccc5ef10eedb8a6564dfb0c9a63b6f46b1e150587b9fe7875cfaf999d00b454bb7d74295c60df1bbe5f8f36da188271db22110efda5cc9eeafb0ab29697849379903421d54eee3949344c72873d6ce9742");
 }

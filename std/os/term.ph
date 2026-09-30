@@ -2,14 +2,14 @@
 // std/os/term.ph - terminals: detection, size, raw mode, styles, keys.
 //
 //     let color = term.color_enabled(term.STDOUT);
-//     let red = term.Style.fg(term.Color.basic(1)).bold();
+//     let red = term.Style.fg(term.Color.basic(term.BasicColor.RED)).bold();
 //     red.write(w, "error", color)!;                 // plain when !color
 //     let sz = term.size(term.STDOUT)!;              // sz.cols, sz.rows
 //
 //     term.enable_raw(term.STDIN)!;                  // keys as they are typed
 //     defer term.disable_raw(term.STDIN);
 //     let n = stdin.read(buf[..])!;
-//     let k = term.decode_key(buf[..n])!;            // k.code, k.rune, k.mods, k.len
+//     let k = term.decode_key(buf[..n])!;            // k.code (a KeyCode), k.rune, k.mods, k.len
 //
 // Output uses ANSI (ECMA-48) escape sequences, which every current
 // terminal understands. color_enabled follows the usual conventions:
@@ -89,40 +89,54 @@ pub fn color_enabled(fd: i32) bool {
 // Styles
 // -----------------------------------------------------------------------------
 
-/// A colour: none (the terminal's default), one of the 16 basic ones (0
-/// black, 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan, 7 white,
-/// 8-15 their bright forms), one of the 256 indexed ones, or RGB.
+/// The 8 basic colours (each also has a bright form: Color.bright).
+pub enum BasicColor: u8 {
+    BLACK = 0,
+    RED = 1,
+    GREEN = 2,
+    YELLOW = 3,
+    BLUE = 4,
+    MAGENTA = 5,
+    CYAN = 6,
+    WHITE = 7,
+}
+
+/// Which kind of colour a Color is.
+pub enum ColorKind: u8 {
+    NONE = 0,  // the terminal's default
+    BASIC = 1,
+    INDEXED = 2,
+    RGB = 3,
+}
+
+/// A colour: none (the terminal's default), one of the 16 basic ones (a
+/// BasicColor or its bright form), one of the 256 indexed ones, or RGB.
 pub struct Color {
-    kind: u8,  // 0 none, 1 basic, 2 indexed, 3 rgb
-    r: u8,     // the index, or red
+    kind: ColorKind,
+    r: u8,  // the index (bright basic colours are 8-15), or red
     g: u8,
     b: u8,
 
     pub fn none() Color {
-        return Color.{ kind: 0, r: 0, g: 0, b: 0 };
+        return Color.{ kind: ColorKind.NONE, r: 0, g: 0, b: 0 };
     }
 
-    pub fn basic(n: u8) Color {
-        return Color.{ kind: 1, r: n & 15, g: 0, b: 0 };
+    pub fn basic(c: BasicColor) Color {
+        return Color.{ kind: ColorKind.BASIC, r: @int_from_enum(c), g: 0, b: 0 };
+    }
+
+    pub fn bright(c: BasicColor) Color {
+        return Color.{ kind: ColorKind.BASIC, r: @int_from_enum(c) + 8, g: 0, b: 0 };
     }
 
     pub fn indexed(n: u8) Color {
-        return Color.{ kind: 2, r: n, g: 0, b: 0 };
+        return Color.{ kind: ColorKind.INDEXED, r: n, g: 0, b: 0 };
     }
 
     pub fn rgb(r: u8, g: u8, b: u8) Color {
-        return Color.{ kind: 3, r: r, g: g, b: b };
+        return Color.{ kind: ColorKind.RGB, r: r, g: g, b: b };
     }
 }
-
-pub const BLACK: u8 = 0;
-pub const RED: u8 = 1;
-pub const GREEN: u8 = 2;
-pub const YELLOW: u8 = 3;
-pub const BLUE: u8 = 4;
-pub const MAGENTA: u8 = 5;
-pub const CYAN: u8 = 6;
-pub const WHITE: u8 = 7;
 
 /// Text attributes and colours.
 pub struct Style {
@@ -195,7 +209,7 @@ pub struct Style {
     /// Writes text in the style (and resets it after), or just the text
     /// when enabled is false.
     pub fn write(self: Style, w: io.Writer, text: []u8, enabled: bool) !void {
-        if enabled and ((self.attrs != 0) or (self.fg_.kind != 0) or (self.bg_.kind != 0)) {
+        if enabled and ((self.attrs != 0) or (self.fg_.kind != ColorKind.NONE) or (self.bg_.kind != ColorKind.NONE)) {
             self.start(w)!;
             w.write_all(text)!;
             w.write_all(RESET)!;
@@ -241,17 +255,17 @@ fn num(buf: []mut u8, n: *mut usize, v: u32) void {
 
 // 30-37/90-97 (40-47/100-107), 38;5;n (48;5;n), 38;2;r;g;b (48;2;r;g;b)
 fn color_codes(buf: []mut u8, n: *mut usize, first: *mut bool, c: Color, base: u32) void {
-    if c.kind == 0 {
+    if c.kind == ColorKind.NONE {
         return;
     }
     sep(buf, n, first);
-    if c.kind == 1 {
+    if c.kind == ColorKind.BASIC {
         if c.r < 8 {
             num(buf, n, base + @as(u32, c.r));
         } else {
             num(buf, n, (base + 60) + @as(u32, c.r - 8));
         }
-    } else if c.kind == 2 {
+    } else if c.kind == ColorKind.INDEXED {
         num(buf, n, base + 8);
         put(buf, n, ";5;");
         num(buf, n, @as(u32, c.r));
@@ -352,23 +366,52 @@ pub fn set_title(w: io.Writer, title: []u8) !void {
 // -----------------------------------------------------------------------------
 
 /// Key codes: CHAR (a character, in rune), or a named key.
-pub const CHAR: u16 = 0;
-pub const ENTER: u16 = 1;
-pub const TAB: u16 = 2;
-pub const BACKSPACE: u16 = 3;
-pub const ESCAPE: u16 = 4;
-pub const UP: u16 = 5;
-pub const DOWN: u16 = 6;
-pub const RIGHT: u16 = 7;
-pub const LEFT: u16 = 8;
-pub const HOME: u16 = 9;
-pub const END: u16 = 10;
-pub const PAGE_UP: u16 = 11;
-pub const PAGE_DOWN: u16 = 12;
-pub const INSERT: u16 = 13;
-pub const DELETE: u16 = 14;
-pub const F1: u16 = 21;  // F1 to F12 are 21 to 32
-pub const UNKNOWN: u16 = 99;
+pub enum KeyCode: u16 {
+    CHAR = 0,
+    ENTER = 1,
+    TAB = 2,
+    BACKSPACE = 3,
+    ESCAPE = 4,
+    UP = 5,
+    DOWN = 6,
+    RIGHT = 7,
+    LEFT = 8,
+    HOME = 9,
+    END = 10,
+    PAGE_UP = 11,
+    PAGE_DOWN = 12,
+    INSERT = 13,
+    DELETE = 14,
+    F1 = 21,
+    F2 = 22,
+    F3 = 23,
+    F4 = 24,
+    F5 = 25,
+    F6 = 26,
+    F7 = 27,
+    F8 = 28,
+    F9 = 29,
+    F10 = 30,
+    F11 = 31,
+    F12 = 32,
+    UNKNOWN = 99,
+}
+
+// F1 to F12, in order.
+let FKEYS: [12]KeyCode = [
+    KeyCode.F1,
+    KeyCode.F2,
+    KeyCode.F3,
+    KeyCode.F4,
+    KeyCode.F5,
+    KeyCode.F6,
+    KeyCode.F7,
+    KeyCode.F8,
+    KeyCode.F9,
+    KeyCode.F10,
+    KeyCode.F11,
+    KeyCode.F12,
+];
 
 /// Modifier bits.
 pub const SHIFT: u8 = 1;
@@ -376,8 +419,8 @@ pub const ALT: u8 = 2;
 pub const CTRL: u8 = 4;
 
 pub struct Key {
-    code: u16,
-    rune: u32,  // for CHAR: the character (with CTRL, the letter: Ctrl-A is 'a')
+    code: KeyCode,
+    rune: u32,  // for KeyCode.CHAR: the character (with CTRL, the letter: Ctrl-A is 'a')
     mods: u8,
     len: usize,  // the bytes it took
 }
@@ -392,7 +435,7 @@ pub fn decode_key(b: []u8) !Key {
     let c = b[0];
     if c == 0x1b {
         if b.len == 1 {
-            return Key.{ code: ESCAPE, rune: 0, mods: 0, len: 1 };
+            return Key.{ code: KeyCode.ESCAPE, rune: 0, mods: 0, len: 1 };
         }
         if (b[1] == '[') or (b[1] == 'O') {
             return escape_sequence(b);
@@ -404,20 +447,20 @@ pub fn decode_key(b: []u8) !Key {
         return k;
     }
     if (c == '\r') or (c == '\n') {
-        return Key.{ code: ENTER, rune: 0, mods: 0, len: 1 };
+        return Key.{ code: KeyCode.ENTER, rune: 0, mods: 0, len: 1 };
     }
     if c == '\t' {
-        return Key.{ code: TAB, rune: 0, mods: 0, len: 1 };
+        return Key.{ code: KeyCode.TAB, rune: 0, mods: 0, len: 1 };
     }
     if (c == 0x7f) or (c == 0x08) {
-        return Key.{ code: BACKSPACE, rune: 0, mods: 0, len: 1 };
+        return Key.{ code: KeyCode.BACKSPACE, rune: 0, mods: 0, len: 1 };
     }
     if c == 0 {
-        return Key.{ code: CHAR, rune: ' ', mods: CTRL, len: 1 };
+        return Key.{ code: KeyCode.CHAR, rune: ' ', mods: CTRL, len: 1 };
     }
     if c < 0x20 {
         // Ctrl-A to Ctrl-Z (and a few more)
-        return Key.{ code: CHAR, rune: @as(u32, c) + 0x60, mods: CTRL, len: 1 };
+        return Key.{ code: KeyCode.CHAR, rune: @as(u32, c) + 0x60, mods: CTRL, len: 1 };
     }
     // a UTF-8 character
     let mut need: usize = 1;
@@ -432,32 +475,32 @@ pub fn decode_key(b: []u8) !Key {
         return error.Incomplete;
     }
     let r = strs.decode_rune(b[..need]);
-    return Key.{ code: CHAR, rune: r.value, mods: 0, len: @max(r.len, 1) };
+    return Key.{ code: KeyCode.CHAR, rune: r.value, mods: 0, len: @max(r.len, 1) };
 }
 
 // ESC [ n ~: 1 and 7 Home, 2 Insert, 3 Delete, 4 and 8 End, 5 PgUp, 6 PgDn,
 // 11-15 F1-F5, 17-21 F6-F10, 23-24 F11-F12
-fn tilde_key(n: u32) u16 {
+fn tilde_key(n: u32) KeyCode {
     if (n == 1) or (n == 7) {
-        return HOME;
+        return KeyCode.HOME;
     }
     if (n == 4) or (n == 8) {
-        return END;
+        return KeyCode.END;
     }
     if (n >= 2) and (n <= 6) {
-        let ks: [5]u16 = [INSERT, DELETE, END, PAGE_UP, PAGE_DOWN];
+        let ks: [5]KeyCode = [KeyCode.INSERT, KeyCode.DELETE, KeyCode.END, KeyCode.PAGE_UP, KeyCode.PAGE_DOWN];
         return ks[@as(usize, n - 2)];
     }
     if (n >= 11) and (n <= 15) {
-        return F1 + @truncate(u16, n - 11);
+        return FKEYS[@as(usize, n - 11)];
     }
     if (n >= 17) and (n <= 21) {
-        return F1 + 5 + @truncate(u16, n - 17);
+        return FKEYS[5 + @as(usize, n - 17)];
     }
     if (n == 23) or (n == 24) {
-        return F1 + 10 + @truncate(u16, n - 23);
+        return FKEYS[10 + @as(usize, n - 23)];
     }
-    return UNKNOWN;
+    return KeyCode.UNKNOWN;
 }
 
 fn escape_sequence(b: []u8) !Key {
@@ -494,23 +537,23 @@ fn escape_sequence(b: []u8) !Key {
     if (np >= 1) and (params[1] > 1) {
         mods = @truncate(u8, (params[1] - 1) & 7);
     }
-    let mut code = UNKNOWN;
+    let mut code = KeyCode.UNKNOWN;
     if final == 'A' {
-        code = UP;
+        code = KeyCode.UP;
     } else if final == 'B' {
-        code = DOWN;
+        code = KeyCode.DOWN;
     } else if final == 'C' {
-        code = RIGHT;
+        code = KeyCode.RIGHT;
     } else if final == 'D' {
-        code = LEFT;
+        code = KeyCode.LEFT;
     } else if final == 'H' {
-        code = HOME;
+        code = KeyCode.HOME;
     } else if final == 'F' {
-        code = END;
+        code = KeyCode.END;
     } else if (final == 'Z') and not ss3 {
-        return Key.{ code: TAB, rune: 0, mods: SHIFT, len: len };
+        return Key.{ code: KeyCode.TAB, rune: 0, mods: SHIFT, len: len };
     } else if (final >= 'P') and (final <= 'S') {
-        code = F1 + @as(u16, final - 'P');
+        code = FKEYS[@as(usize, final - 'P')];
     } else if (final == '~') and have {
         code = tilde_key(params[0]);
     }
@@ -531,16 +574,16 @@ fn styled(s: Style, text: []u8, enabled: bool) ![]mut u8 {
 }
 
 test "styles" {
-    let a = styled(Style.fg(Color.basic(RED)).bold(), "hi", true)!;
+    let a = styled(Style.fg(Color.basic(BasicColor.RED)).bold(), "hi", true)!;
     defer mem.free(a);
     @expect_eq(a, "\x1b[1;31mhi\x1b[0m");
-    let b = styled(Style.fg(Color.basic(9)).on(Color.indexed(236)).underline(), "x", true)!;
+    let b = styled(Style.fg(Color.bright(BasicColor.RED)).on(Color.indexed(236)).underline(), "x", true)!;
     defer mem.free(b);
     @expect_eq(b, "\x1b[4;91;48;5;236mx\x1b[0m");
     let c = styled(Style.fg(Color.rgb(255, 128, 0)), "x", true)!;
     defer mem.free(c);
     @expect_eq(c, "\x1b[38;2;255;128;0mx\x1b[0m");
-    let d = styled(Style.fg(Color.basic(RED)).bold(), "hi", false)!;
+    let d = styled(Style.fg(Color.basic(BasicColor.RED)).bold(), "hi", false)!;
     defer mem.free(d);
     @expect_eq(d, "hi");
     let e = styled(Style.plain(), "hi", true)!;
@@ -556,36 +599,36 @@ test "styles" {
 }
 
 fn key(b: []u8) Key {
-    return decode_key(b) catch Key.{ code: 999, rune: 0, mods: 0, len: 0 };
+    return decode_key(b) catch Key.{ code: KeyCode.UNKNOWN, rune: 0, mods: 0, len: 0 };
 }
 
 test "keys" {
     let k1 = key("a");
-    @expect((k1.code == CHAR) and (k1.rune == 'a') and (k1.len == 1));
+    @expect((k1.code == KeyCode.CHAR) and (k1.rune == 'a') and (k1.len == 1));
     let k2 = key("\x03");
-    @expect((k2.code == CHAR) and (k2.rune == 'c') and (k2.mods == CTRL));
+    @expect((k2.code == KeyCode.CHAR) and (k2.rune == 'c') and (k2.mods == CTRL));
     let k3 = key("\x1b[A");
-    @expect((k3.code == UP) and (k3.len == 3));
+    @expect((k3.code == KeyCode.UP) and (k3.len == 3));
     let k4 = key("\x1b[1;5C");
-    @expect((k4.code == RIGHT) and (k4.mods == CTRL) and (k4.len == 6));
+    @expect((k4.code == KeyCode.RIGHT) and (k4.mods == CTRL) and (k4.len == 6));
     let k5 = key("\x1bOP");
-    @expect(k5.code == F1);
+    @expect(k5.code == KeyCode.F1);
     let k6 = key("\x1b[15~");
-    @expect(k6.code == (F1 + 4));
+    @expect(k6.code == KeyCode.F5);
     let k7 = key("\x1b[3~x");
-    @expect((k7.code == DELETE) and (k7.len == 4));
+    @expect((k7.code == KeyCode.DELETE) and (k7.len == 4));
     let k8 = key("\x1bx");
-    @expect((k8.code == CHAR) and (k8.rune == 'x') and (k8.mods == ALT) and (k8.len == 2));
+    @expect((k8.code == KeyCode.CHAR) and (k8.rune == 'x') and (k8.mods == ALT) and (k8.len == 2));
     let k9 = key("\xc3\xa9!");
-    @expect((k9.code == CHAR) and (k9.rune == 0xe9) and (k9.len == 2));
+    @expect((k9.code == KeyCode.CHAR) and (k9.rune == 0xe9) and (k9.len == 2));
     let k10 = key("\x1b");
-    @expect(k10.code == ESCAPE);
+    @expect(k10.code == KeyCode.ESCAPE);
     let k11 = key("\x7f");
-    @expect(k11.code == BACKSPACE);
+    @expect(k11.code == KeyCode.BACKSPACE);
     let k12 = key("\x1b[Z");
-    @expect((k12.code == TAB) and (k12.mods == SHIFT));
+    @expect((k12.code == KeyCode.TAB) and (k12.mods == SHIFT));
     let k13 = key("\x1b[24~");
-    @expect(k13.code == (F1 + 11));
+    @expect(k13.code == KeyCode.F12);
     @expect(incomplete(decode_key("\x1b[1;5")) and incomplete(decode_key("\xe2\x82")) and incomplete(decode_key("")));
 }
 

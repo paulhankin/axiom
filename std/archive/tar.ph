@@ -14,8 +14,8 @@
 //     w.add_dir("docs/", tar.Options.default())!;
 //     w.finish()!;
 //
-// For .tar.gz, run the bytes through deflate.decompress(data, deflate.GZIP,
-// limit) first (or deflate.compress(tar, deflate.GZIP, level) after).
+// For .tar.gz, run the bytes through deflate.decompress(data, deflate.Format.GZIP,
+// limit) first (or deflate.compress(tar, deflate.Format.GZIP, level) after).
 //
 // Reading understands ustar headers (with the name prefix), pax extended
 // and global headers (path, linkpath, size, mtime, uid, gid, uname,
@@ -652,7 +652,7 @@ test "archives made by Python's tarfile" {
         fmt.write(p.writer(), "std/archive/tar/testdata/{}.tar.gz", [fmt.str(name)])!;
         let gz = fs.read_file(p.bytes()) catch return;
         defer mem.free(gz);
-        let data = deflate.decompress(gz, deflate.GZIP, 1 << 24)!;
+        let data = deflate.decompress(gz, deflate.Format.GZIP, 1 << 24)!;
         defer mem.free(data);
         p.truncate(p.len - 6);
         p.push_str("txt")!;

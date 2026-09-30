@@ -438,21 +438,24 @@ pub fn sha512(data: []u8, out: []mut u8) void {
     h.final(out);
 }
 
-pub const SHA256: u8 = 1;
-pub const SHA384: u8 = 2;
-pub const SHA512: u8 = 3;
-pub const SHA1: u8 = 4;  // for protocols that need it (HMAC-SHA1): see sha1.ph
+/// The hash functions a Hasher can compute.
+pub enum Algorithm: u8 {
+    SHA256 = 1,
+    SHA384 = 2,
+    SHA512 = 3,
+    SHA1 = 4,  // for protocols that need it (HMAC-SHA1): see sha1.ph
+}
 
 /// One of the functions above, chosen at run time.
 pub struct Hasher {
-    kind: u8,
+    kind: Algorithm,
     s256: Sha256,
     s512: Sha512,
     s1: sha1.Sha1,
 
-    pub fn init(kind: u8) Hasher {
+    pub fn init(kind: Algorithm) Hasher {
         let mut s = Sha512.init();
-        if kind == SHA384 {
+        if kind == Algorithm.SHA384 {
             s = Sha512.init384();
         }
         return Hasher.{ kind: kind, s256: Sha256.init(), s512: s, s1: sha1.Sha1.init() };
@@ -464,16 +467,16 @@ pub struct Hasher {
     }
 
     pub fn block_size(self: *Hasher) usize {
-        if (self.kind == SHA256) or (self.kind == SHA1) {
+        if (self.kind == Algorithm.SHA256) or (self.kind == Algorithm.SHA1) {
             return 64;
         }
         return 128;
     }
 
     pub fn update(self: *mut Hasher, data: []u8) void {
-        if self.kind == SHA1 {
+        if self.kind == Algorithm.SHA1 {
             self.s1.update(data);
-        } else if self.kind == SHA256 {
+        } else if self.kind == Algorithm.SHA256 {
             self.s256.update(data);
         } else {
             self.s512.update(data);
@@ -482,9 +485,9 @@ pub struct Hasher {
 
     /// Writes size() bytes to out.
     pub fn final(self: *mut Hasher, out: []mut u8) void {
-        if self.kind == SHA1 {
+        if self.kind == Algorithm.SHA1 {
             self.s1.final(out);
-        } else if self.kind == SHA256 {
+        } else if self.kind == Algorithm.SHA256 {
             self.s256.final(out);
         } else {
             self.s512.final(out);
@@ -492,17 +495,17 @@ pub struct Hasher {
     }
 }
 
-pub fn digest_size(kind: u8) usize {
+pub fn digest_size(kind: Algorithm) usize {
     match kind {
-        1    => { return 32; }
-        2    => { return 48; }
-        4    => { return 20; }
-        else => { return 64; }
+        .SHA256 => { return 32; }
+        .SHA384 => { return 48; }
+        .SHA512 => { return 64; }
+        .SHA1   => { return 20; }
     }
 }
 
 /// One-shot hash with a Hasher kind.
-pub fn hash(kind: u8, data: []u8, out: []mut u8) void {
+pub fn hash(kind: Algorithm, data: []u8, out: []mut u8) void {
     let mut h = Hasher.init(kind);
     h.update(data);
     h.final(out);
@@ -554,6 +557,6 @@ test "sha-384 and sha-512" {
            d[..]);
     @expect_eq(hex(d[..], x[..]),
                "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909");
-    hash(SHA256, "abc", d[..32]);
+    hash(Algorithm.SHA256, "abc", d[..32]);
     @expect_eq(hex(d[..32], x[..]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }

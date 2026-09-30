@@ -319,7 +319,7 @@ fn info(k: Kind) Info {
 // Local time as seconds since the epoch, as if it were UTC.
 fn local_seconds(dt: time.DateTime) !i64 {
     let u = time.DateTime.{ year: dt.year, month: dt.month, day: dt.day, hour: dt.hour, minute: dt.minute,
-                            second: dt.second, nanosecond: 0, weekday: 0, yearday: 0, offset: 0 };
+                            second: dt.second, nanosecond: 0, weekday: time.Weekday.SUNDAY, yearday: 0, offset: 0 };
     let t = u.to_time() catch return error.NonExistent;
     return t.unix();
 }
@@ -737,7 +737,7 @@ test "Python's zoneinfo" {
             let fold = @int_cast(u32, fmt_i64(f.next()!));
             let want = fmt_i64(f.next()!);
             let dt = time.DateTime.{ year: y, month: v[0], day: v[1], hour: v[2], minute: v[3], second: v[4],
-                                     nanosecond: 0, weekday: 0, yearday: 0, offset: 0 };
+                                     nanosecond: 0, weekday: time.Weekday.SUNDAY, yearday: 0, offset: 0 };
             let got = z.from_local(dt, fold)!;
             if got.unix() != want {
                 @expect_eq(line, "");
@@ -759,14 +759,14 @@ test "rules, names and the system database" {
     let t = time.date(2026, 3, 8, 6, 59, 59)!.unix();
     @expect(strs.eq(z.lookup(t).abbrev, "EST") and (z.lookup(t).offset == -18000));
     @expect(strs.eq(z.lookup(t + 1).abbrev, "EDT") and z.lookup(t + 1).is_dst);
-    let gap = time.DateTime.{ year: 2026, month: 3, day: 8, hour: 2, minute: 30, second: 0, nanosecond: 0, weekday: 0,
-                              yearday: 0, offset: 0 };
+    let gap = time.DateTime.{ year: 2026, month: 3, day: 8, hour: 2, minute: 30, second: 0, nanosecond: 0,
+                              weekday: time.Weekday.SUNDAY, yearday: 0, offset: 0 };
     // fold 0: read with EST, so 07:30 UTC (03:30 EDT); fold 1: with EDT
     @expect(z.from_local(gap, 0)!.unix() == (t + 1801));
     @expect(z.from_local(gap, 1)!.unix() == ((t + 1801) - 3600));
     @expect(nonexistent(z.from_local_strict(gap)));
-    let back = time.DateTime.{ year: 2026, month: 11, day: 1, hour: 1, minute: 30, second: 0, nanosecond: 0, weekday: 0,
-                               yearday: 0, offset: 0 };
+    let back = time.DateTime.{ year: 2026, month: 11, day: 1, hour: 1, minute: 30, second: 0, nanosecond: 0,
+                               weekday: time.Weekday.SUNDAY, yearday: 0, offset: 0 };
     let first = z.from_local(back, 0)!.unix();
     let second = z.from_local(back, 1)!.unix();
     @expect((second - first) == 3600);

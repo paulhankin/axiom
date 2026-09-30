@@ -39,12 +39,14 @@ error { HandshakeFailed, ProtocolError, MessageTooBig, Closed, BadUrl, NetError,
         InvalidArgument }
 
 /// Message and frame kinds (the opcodes).
-pub const CONTINUATION: u8 = 0;
-pub const TEXT: u8 = 1;
-pub const BINARY: u8 = 2;
-pub const CLOSE: u8 = 8;
-pub const PING: u8 = 9;
-pub const PONG: u8 = 10;
+pub enum Opcode: u8 {
+    CONTINUATION = 0,
+    TEXT = 1,
+    BINARY = 2,
+    CLOSE = 8,
+    PING = 9,
+    PONG = 10,
+}
 
 /// Close codes.
 pub const NORMAL: u16 = 1000;
@@ -71,7 +73,7 @@ pub fn accept_key(key: []u8, out: []mut u8) []u8 {
 
 /// A received message: TEXT or BINARY, or CLOSE (with the peer's code).
 pub struct Message {
-    kind: u8,
+    kind: Opcode,
     data: []u8,
     code: u16,
 }
@@ -114,29 +116,29 @@ pub struct Conn {
     }
 
     pub fn send_text(self: *mut Conn, s: []u8) !void {
-        self.send(TEXT, s)!;
+        self.send(Opcode.TEXT, s)!;
     }
 
     pub fn send_binary(self: *mut Conn, b: []u8) !void {
-        self.send(BINARY, b)!;
+        self.send(Opcode.BINARY, b)!;
     }
 
     /// Sends a message (TEXT, BINARY) or a control frame (PING, PONG).
-    pub fn send(self: *mut Conn, kind: u8, data: []u8) !void {
+    pub fn send(self: *mut Conn, kind: Opcode, data: []u8) !void {
         if self.sent_close {
             return error.Closed;
         }
-        if ((kind == PING) or (kind == PONG)) and (data.len > 125) {
+        if ((kind == Opcode.PING) or (kind == Opcode.PONG)) and (data.len > 125) {
             return error.InvalidArgument;
         }
-        if (kind == TEXT) and not strs.valid_utf8(data) {
+        if (kind == Opcode.TEXT) and not strs.valid_utf8(data) {
             return error.InvalidArgument;
         }
         self.send_frame(kind, data)!;
     }
 
     pub fn ping(self: *mut Conn, data: []u8) !void {
-        self.send(PING, data)!;
+        self.send(Opcode.PING, data)!;
     }
 
     /// Starts the closing handshake: sends a close frame, then waits (up to
@@ -148,7 +150,7 @@ pub struct Conn {
             p[1] = @truncate(u8, code);
             let n = @min(reason.len, 123);
             @mem_copy(p[2..2 + n], reason[..n]);
-            self.send_frame(CLOSE, p[..2 + n])!;
+            self.send_frame(Opcode.CLOSE, p[..2 + n])!;
             self.sent_close = true;
         }
         for _k in @as(usize, 0)..16 {
@@ -159,9 +161,9 @@ pub struct Conn {
         }
     }
 
-    fn send_frame(self: *mut Conn, op: u8, data: []u8) !void {
+    fn send_frame(self: *mut Conn, op: Opcode, data: []u8) !void {
         self.out.clear();
-        self.out.push(0x80 | op)!;
+        self.out.push(0x80 | @int_from_enum(op))!;
         let mut mbit: u8 = 0;
         if self.client {
             mbit = 0x80;
@@ -236,7 +238,7 @@ pub struct Conn {
     // Fails the connection: a close frame with the code, then the error.
     fn fail(self: *mut Conn, code: u16, e: error) error { if not self.sent_close {
         let p: [2]u8 = [@truncate(u8, code >> 8), @truncate(u8, code)];
-        self.send_frame(CLOSE, p[..]) catch {};
+        self.send_frame(Opcode.CLOSE, p[..]) catch {};
         self.sent_close = true;
     }
     self.got_close = true; return e; }
@@ -248,7 +250,7 @@ pub struct Conn {
             return error.Closed;
         }
         self.msg.clear();
-        let mut kind: u8 = 0;
+        let mut kind = Opcode.CONTINUATION;  // (none yet)
         loop {
             self.fill(2)!;
             let b0 = self.rbuf[self.start];
@@ -308,19 +310,19 @@ pub struct Conn {
             }
             self.start += hl + n;
             if control {
-                if op == PING {
+                if op == @int_from_enum(Opcode.PING) {
                     if not self.sent_close {
                         self.frame.clear();
                         self.frame.push_str(payload)!;
                         // (a peer that has gone will show on the next read)
-                        self.send_frame(PONG, self.frame.bytes()) catch {};
+                        self.send_frame(Opcode.PONG, self.frame.bytes()) catch {};
                     }
                     continue;
                 }
-                if op == PONG {
+                if op == @int_from_enum(Opcode.PONG) {
                     continue;
                 }
-                if op != CLOSE {
+                if op != @int_from_enum(Opcode.CLOSE) {
                     return self.fail(PROTOCOL_ERROR, error.ProtocolError);
                 }
                 // close: code (optional) and a UTF-8 reason
@@ -341,9 +343,9 @@ pub struct Conn {
                 if not self.sent_close {
                     let back: [2]u8 = [@truncate(u8, code >> 8), @truncate(u8, code)];
                     if code == 1005 {
-                        self.send_frame(CLOSE, back[..0]) catch {};
+                        self.send_frame(Opcode.CLOSE, back[..0]) catch {};
                     } else {
-                        self.send_frame(CLOSE, back[..]) catch {};
+                        self.send_frame(Opcode.CLOSE, back[..]) catch {};
                     }
                     self.sent_close = true;
                 }
@@ -351,24 +353,24 @@ pub struct Conn {
                 if n >= 2 {
                     self.frame.push_str(payload[2..])!;
                 }
-                return Message.{ kind: CLOSE, data: self.frame.bytes(), code: code };
+                return Message.{ kind: Opcode.CLOSE, data: self.frame.bytes(), code: code };
             }
             // a data frame
-            if op == CONTINUATION {
-                if kind == 0 {
+            if op == @int_from_enum(Opcode.CONTINUATION) {
+                if kind == Opcode.CONTINUATION {
                     return self.fail(PROTOCOL_ERROR, error.ProtocolError);
                 }
-            } else if (op == TEXT) or (op == BINARY) {
-                if kind != 0 {
+            } else if (op == @int_from_enum(Opcode.TEXT)) or (op == @int_from_enum(Opcode.BINARY)) {
+                if kind != Opcode.CONTINUATION {
                     return self.fail(PROTOCOL_ERROR, error.ProtocolError);
                 }
-                kind = op;
+                kind = @enum_from_int(Opcode, op);  // (TEXT or BINARY: checked above)
             } else {
                 return self.fail(PROTOCOL_ERROR, error.ProtocolError);
             }
             self.msg.push_str(payload)!;
             if fin {
-                if (kind == TEXT) and not strs.valid_utf8(self.msg.bytes()) {
+                if (kind == Opcode.TEXT) and not strs.valid_utf8(self.msg.bytes()) {
                     return self.fail(INVALID_DATA, error.ProtocolError);
                 }
                 return Message.{ kind: kind, data: self.msg.bytes(), code: 0 };
@@ -518,7 +520,7 @@ fn handshake(c: *mut Conn, u: http.Url) !void {
 
 // a Conn reading from bytes given in advance (writes go nowhere useful)
 fn fed(bytes: []u8, client: bool) !Conn {
-    let l = net.listen_addr(net.Addr.loopback(4, 0))!;
+    let l = net.listen_addr(net.Addr.loopback(net.Family.V4, 0))!;
     defer l.close();
     let a = net.connect_addr(l.local_addr()!)!;
     let b = l.accept()!;
@@ -533,7 +535,7 @@ test "the RFC's examples" {
     // a single-frame unmasked text message, as a client receives it
     let mut c = fed("\x81\x05\x48\x65\x6c\x6c\x6f", true)!;
     let m = c.recv()!;
-    @expect((m.kind == TEXT) and strs.eq(m.data, "Hello"));
+    @expect((m.kind == Opcode.TEXT) and strs.eq(m.data, "Hello"));
     c.deinit();
     // masked, as a server receives it; and a fragmented one
     let mut s = fed("\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", false)!;
@@ -541,7 +543,7 @@ test "the RFC's examples" {
     s.deinit();
     let mut f = fed("\x01\x03\x48\x65\x6c\x89\x00\x80\x02\x6c\x6f", true)!;
     let fm = f.recv()!;
-    @expect((fm.kind == TEXT) and strs.eq(fm.data, "Hello"));
+    @expect((fm.kind == Opcode.TEXT) and strs.eq(fm.data, "Hello"));
     f.deinit();
 }
 
@@ -588,7 +590,7 @@ fn echo(app: *mut App, req: *http.Request, res: *mut http.Response) !void {
     _ = @atomic_add(&mut app.served, 1);
     loop {
         let m = ws.recv() catch break;
-        if m.kind == CLOSE {
+        if m.kind == Opcode.CLOSE {
             break;
         }
         ws.send(m.kind, m.data)!;
@@ -609,7 +611,7 @@ test "a client and a server" {
     let mut ws = connect(url.bytes(), http.ClientOptions.default())!;
     ws.send_text("héllo")!;
     let m = ws.recv()!;
-    @expect((m.kind == TEXT) and strs.eq(m.data, "héllo"));
+    @expect((m.kind == Opcode.TEXT) and strs.eq(m.data, "héllo"));
     // a big binary message (a 64-bit length), and a ping on the way
     let big = mem.alloc.[u8](70000)!;
     defer mem.free(big);
@@ -619,7 +621,7 @@ test "a client and a server" {
     ws.ping("are you there")!;
     ws.send_binary(big)!;
     let b = ws.recv()!;
-    @expect((b.kind == BINARY) and @mem_eq(b.data, big));
+    @expect((b.kind == Opcode.BINARY) and @mem_eq(b.data, big));
     ws.close(NORMAL, "bye")!;
     @expect(closed(ws.recv()));
     ws.deinit();

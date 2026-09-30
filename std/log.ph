@@ -5,7 +5,7 @@
 //     log.info("server started", [log.str("addr", "0.0.0.0"), log.int("port", 8080)]);
 //     // time=2026-09-29T06:40:12.5Z level=INFO msg="server started" addr=0.0.0.0 port=8080
 //
-//     let mut lg = log.Logger.init(some_writer, log.DEBUG, log.JSON);
+//     let mut lg = log.Logger.init(some_writer, log.Level.DEBUG, log.Format.JSON);
 //     let mut req = lg.with([log.str("request", id)][..])!;    // adds fields to every line
 //     defer req.deinit();
 //     req.warn("slow", [log.duration("took", d)]);
@@ -32,15 +32,35 @@ import "time.ph" as time;
 
 error { OutOfMemory, IoError, BadLevel }
 
-/// Levels. Others between them are allowed (INFO + 2 prints as INFO+2).
-pub const DEBUG: i32 = -4;
-pub const INFO: i32 = 0;
-pub const WARN: i32 = 4;
-pub const ERROR: i32 = 8;
+/// Levels, from least to most severe: a logger prints lines at its level
+/// or above (see at_least).
+pub enum Level: i32 {
+    DEBUG = -4,
+    INFO = 0,
+    WARN = 4,
+    ERROR = 8,
+
+    /// The level's name: DEBUG, INFO, WARN or ERROR.
+    pub fn name(self: Level) []u8 {
+        match self {
+            .DEBUG => { return "DEBUG"; }
+            .INFO  => { return "INFO"; }
+            .WARN  => { return "WARN"; }
+            .ERROR => { return "ERROR"; }
+        }
+    }
+
+    /// Whether this level is as severe as min or more.
+    pub fn at_least(self: Level, min: Level) bool {
+        return @int_from_enum(self) >= @int_from_enum(min);
+    }
+}
 
 /// Output formats.
-pub const TEXT: u8 = 0;
-pub const JSON: u8 = 1;
+pub enum Format: u8 {
+    TEXT = 0,
+    JSON = 1,
+}
 
 union Value {
     Str: []u8,
@@ -93,49 +113,26 @@ pub fn at(key: []u8, t: time.Time) Field {
     return Field.{ key: key, value: Value.Time(t) };
 }
 
-/// A level's name: DEBUG, INFO, WARN, ERROR, or one of them with an
-/// offset (INFO+2, DEBUG-1).
-pub fn level_name(level: i32, buf: []mut u8) []u8 {
-    let mut base = ERROR;
-    let mut name = "ERROR";
-    if level < INFO {
-        base = DEBUG;
-        name = "DEBUG";
-    } else if level < WARN {
-        base = INFO;
-        name = "INFO";
-    } else if level < ERROR {
-        base = WARN;
-        name = "WARN";
-    }
-    if level == base {
-        return name;
-    }
-    let mut bw = io.BufferWriter.init(buf);
-    let mut sign = "+";
-    if level < base {
-        sign = "-";
-    }
-    let off = @abs(level - base);
-    fmt.write(bw.writer(), "{}{}{}", [fmt.str(name), fmt.str(sign), fmt.int(off)]) catch return name;
-    return bw.written();
-}
-
-/// A level from its name (any case; "warning" too) or a number.
-pub fn parse_level(s: []u8) !i32 {
+/// A level from its name (any case; "warning" too) or its number (-4, 0, 4
+/// or 8).
+pub fn parse_level(s: []u8) !Level {
     if strs.eq_ignore_case(s, "debug") {
-        return DEBUG;
+        return Level.DEBUG;
     }
     if strs.eq_ignore_case(s, "info") {
-        return INFO;
+        return Level.INFO;
     }
     if strs.eq_ignore_case(s, "warn") or strs.eq_ignore_case(s, "warning") {
-        return WARN;
+        return Level.WARN;
     }
     if strs.eq_ignore_case(s, "error") {
-        return ERROR;
+        return Level.ERROR;
     }
-    return fmt.parse_int.[i32](s) catch return error.BadLevel;
+    let n = fmt.parse_int.[i32](s) catch return error.BadLevel;
+    if (n == -4) or (n == 0) or (n == 4) or (n == 8) {
+        return @enum_from_int(Level, n);
+    }
+    return error.BadLevel;
 }
 
 // One lock for all output: a line is written whole.
@@ -143,12 +140,12 @@ let mut out_lock: sync.Mutex = sync.Mutex.{ state: 0 };
 
 pub struct Logger {
     out: io.Writer,
-    level: i32,
-    format: u8,
+    level: Level,
+    format: Format,
     with_time: bool,      // start each line with the time (default true)
     fields: []mut Field,  // added to every line (owned: see with)
 
-    pub fn init(out: io.Writer, level: i32, format: u8) Logger {
+    pub fn init(out: io.Writer, level: Level, format: Format) Logger {
         return Logger.{ out: out, level: level, format: format, with_time: true, fields: empty_fields() };
     }
 
@@ -160,8 +157,8 @@ pub struct Logger {
         self.fields = empty_fields();
     }
 
-    pub fn enabled(self: *Logger, level: i32) bool {
-        return level >= self.level;
+    pub fn enabled(self: *Logger, level: Level) bool {
+        return level.at_least(self.level);
     }
 
     /// A logger that adds fields to every line (after this logger's own);
@@ -175,32 +172,32 @@ pub struct Logger {
         return l;
     }
 
-    pub fn log[const N: usize](self: *Logger, level: i32, msg: []u8, fields: [N]Field) void {
-        if level < self.level {
+    pub fn log[const N: usize](self: *Logger, level: Level, msg: []u8, fields: [N]Field) void {
+        if not level.at_least(self.level) {
             return;
         }
         self.emit(level, msg, fields[..]);
     }
 
     pub fn debug[const N: usize](self: *Logger, msg: []u8, fields: [N]Field) void {
-        self.log(DEBUG, msg, fields);
+        self.log(Level.DEBUG, msg, fields);
     }
 
     pub fn info[const N: usize](self: *Logger, msg: []u8, fields: [N]Field) void {
-        self.log(INFO, msg, fields);
+        self.log(Level.INFO, msg, fields);
     }
 
     pub fn warn[const N: usize](self: *Logger, msg: []u8, fields: [N]Field) void {
-        self.log(WARN, msg, fields);
+        self.log(Level.WARN, msg, fields);
     }
 
     pub fn err[const N: usize](self: *Logger, msg: []u8, fields: [N]Field) void {
-        self.log(ERROR, msg, fields);
+        self.log(Level.ERROR, msg, fields);
     }
 
     /// Logs a line with fields given as a slice.
-    pub fn emit(self: *Logger, level: i32, msg: []u8, fields: []Field) void {
-        if level < self.level {
+    pub fn emit(self: *Logger, level: Level, msg: []u8, fields: []Field) void {
+        if not level.at_least(self.level) {
             return;
         }
         let mut line = strs.String.init();
@@ -216,16 +213,15 @@ fn empty_fields() []mut Field {
     return @slice_from_ptr(@ptr_from_int(*mut Field, 8), 0);
 }
 
-fn format_line(line: *mut strs.String, l: *Logger, level: i32, msg: []u8, fields: []Field) !void {
+fn format_line(line: *mut strs.String, l: *Logger, level: Level, msg: []u8, fields: []Field) !void {
     let w = line.writer();
-    let mut lb: [24]u8 = [0; 24];
-    let lname = level_name(level, lb[..]);
+    let lname = level.name();
     let mut tb: [48]u8 = [0; 48];
     let mut ts: []u8 = tb[..0];
     if l.with_time {
         ts = time.now().format_rfc3339(tb[..]);
     }
-    if l.format == JSON {
+    if l.format == Format.JSON {
         line.push('{')!;
         let mut first = true;
         if ts.len > 0 {
@@ -460,8 +456,8 @@ fn json_field(line: *mut strs.String, f: *Field) !void {
 // The default logger
 // -----------------------------------------------------------------------------
 
-let mut default_level: i32 = INFO;
-let mut default_format: u8 = TEXT;
+let mut default_level: Level = Level.INFO;
+let mut default_format: Format = Format.TEXT;
 let mut default_time: bool = true;
 let mut default_out: io.Writer = io.Writer.{ ctx: @ptr_from_int(*mut void, 0), write_fn: stderr_write };
 
@@ -477,11 +473,11 @@ pub fn default() Logger {
     return l;
 }
 
-pub fn set_level(level: i32) void {
+pub fn set_level(level: Level) void {
     default_level = level;
 }
 
-pub fn set_format(format: u8) void {
+pub fn set_format(format: Format) void {
     default_format = format;
 }
 
@@ -506,22 +502,22 @@ pub fn level_from_env(name: []u8) bool {
 
 pub fn debug[const N: usize](msg: []u8, fields: [N]Field) void {
     let l = default();
-    l.log(DEBUG, msg, fields);
+    l.log(Level.DEBUG, msg, fields);
 }
 
 pub fn info[const N: usize](msg: []u8, fields: [N]Field) void {
     let l = default();
-    l.log(INFO, msg, fields);
+    l.log(Level.INFO, msg, fields);
 }
 
 pub fn warn[const N: usize](msg: []u8, fields: [N]Field) void {
     let l = default();
-    l.log(WARN, msg, fields);
+    l.log(Level.WARN, msg, fields);
 }
 
 pub fn err[const N: usize](msg: []u8, fields: [N]Field) void {
     let l = default();
-    l.log(ERROR, msg, fields);
+    l.log(Level.ERROR, msg, fields);
 }
 
 // -----------------------------------------------------------------------------
@@ -647,21 +643,21 @@ error { Boom }
 test "text lines" {
     let mut out = strs.String.init();
     defer out.deinit();
-    let mut l = Logger.init(out.writer(), INFO, TEXT);
+    let mut l = Logger.init(out.writer(), Level.INFO, Format.TEXT);
     l.with_time = false;
     l.info("server started", [str("addr", "0.0.0.0"), int("port", 8080), boolean("tls", true)]);
     l.debug("hidden", [int("x", 1)]);
     l.warn("odd \"value\"", [str("path", "a b"), str("empty", ""), float("ratio", 0.25), error_value(error.Boom)]);
-    l.log(INFO + 2, "between", [uint("n", 3)]);
+    l.log(Level.ERROR, "severe", [uint("n", 3)]);
     let want =
-        "level=INFO msg=\"server started\" addr=0.0.0.0 port=8080 tls=true\nlevel=WARN msg=\"odd \\\"value\\\"\" path=\"a b\" empty=\"\" ratio=0.25 error=Boom\nlevel=INFO+2 msg=between n=3\n";
+        "level=INFO msg=\"server started\" addr=0.0.0.0 port=8080 tls=true\nlevel=WARN msg=\"odd \\\"value\\\"\" path=\"a b\" empty=\"\" ratio=0.25 error=Boom\nlevel=ERROR msg=severe n=3\n";
     @expect_eq(out.bytes(), want);
 }
 
 test "json lines and loggers with fields" {
     let mut out = strs.String.init();
     defer out.deinit();
-    let mut l = Logger.init(out.writer(), DEBUG, JSON);
+    let mut l = Logger.init(out.writer(), Level.DEBUG, Format.JSON);
     l.with_time = false;
     let extra: [1]Field = [str("request", "r-1")];
     let mut req = l.with(extra[..])!;
@@ -675,21 +671,32 @@ test "json lines and loggers with fields" {
 }
 
 test "levels" {
-    @expect_eq(parse_level("Warning")!, WARN);
-    @expect_eq(parse_level("-4")!, DEBUG);
-    let mut b: [24]u8 = [0; 24];
-    @expect_eq(level_name(DEBUG - 1, b[..]), "DEBUG-1");
-    @expect_eq(level_name(12, b[..]), "ERROR+4");
+    @expect(parse_level("Warning")! == Level.WARN);
+    @expect(parse_level("-4")! == Level.DEBUG);
+    @expect_eq(Level.WARN.name(), "WARN");
+    @expect(Level.ERROR.at_least(Level.WARN) and Level.WARN.at_least(Level.WARN));
+    @expect(not Level.DEBUG.at_least(Level.INFO));
+    let l = Logger.init(io.Writer.{ ctx: @ptr_from_int(*mut void, 0), write_fn: stderr_write }, Level.INFO,
+                        Format.TEXT);
+    @expect(l.enabled(Level.WARN) and not l.enabled(Level.DEBUG));
     let mut out = strs.String.init();
     defer out.deinit();
     set_output(out.writer());
     set_time(false);
-    set_level(WARN);
+    set_level(Level.WARN);
     info("no", [int("x", 1)]);
     warn("yes", [int("x", 2)]);
-    set_level(INFO);
+    set_level(Level.INFO);
     set_time(true);
     @expect_eq(out.bytes(), "level=WARN msg=yes x=2\n");
+}
+
+test "a number that is no level" {
+    _ = parse_level("12") catch |e| {
+        @expect_eq(e, error.BadLevel);
+        return;
+    };
+    @expect(false);
 }
 
 test "rotating files" {
@@ -699,7 +706,7 @@ test "rotating files" {
     let p = fmt.alloc("{}/app.log", [fmt.str(dir)])!;
     defer mem.free(p);
     let sink = open_file(p, 100, 2)!;
-    let mut l = Logger.init(sink.writer(), INFO, TEXT);
+    let mut l = Logger.init(sink.writer(), Level.INFO, Format.TEXT);
     l.with_time = false;
     for i in @as(i64, 0)..12 {
         l.info("line", [int("i", i)]);  // 22 bytes: four to a file
@@ -728,7 +735,7 @@ fn log_many(l: *Logger) void {
 test "lines from threads do not interleave" {
     let mut out = strs.String.init();
     defer out.deinit();
-    let mut l = Logger.init(out.writer(), INFO, TEXT);
+    let mut l = Logger.init(out.writer(), Level.INFO, Format.TEXT);
     l.with_time = false;
     let mut ts = vec.Vec.[thread.Thread.[*Logger]].init();
     defer ts.deinit();
@@ -752,11 +759,11 @@ test "lines from threads do not interleave" {
 test "line-breaking characters are escaped" {
     let mut buf = strs.String.init();
     defer buf.deinit();
-    let mut lg = Logger.init(buf.writer(), DEBUG, TEXT);
+    let mut lg = Logger.init(buf.writer(), Level.DEBUG, Format.TEXT);
     lg.with_time = false;
     lg.info("m", [str("k\xe2\x80\xa8", "a\xc2\x85b\xe2\x80\xa9c")]);
     @expect(strs.contains(buf.bytes(), "k_=\"a\\u0085b\\u2029c\""));
-    lg.format = JSON;
+    lg.format = Format.JSON;
     buf.clear();
     lg.info("m", [str("k", "\xc2\x9b31m")]);
     @expect(strs.contains(buf.bytes(), "\"k\":\"\\u009b31m\""));
