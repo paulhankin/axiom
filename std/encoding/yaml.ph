@@ -1298,7 +1298,7 @@ pub struct Events {
     sc: Scanner,
     own: *mut arena.Arena,
     state: State,
-    states: vec.Vec.[u8],  // State values
+    states: vec.Vec.[State],
     tags: vec.Vec.[TagDirective],
     had_doc: bool,     // a document has been seen
     open_ended: bool,  // the last document ended without ... and may not be followed by directives
@@ -1336,7 +1336,7 @@ pub struct Events {
             },
             own: a,
             state: State.STREAM_START,
-            states: vec.Vec.[u8].init(),
+            states: vec.Vec.[State].init(),
             tags: vec.Vec.[TagDirective].init(),
             had_doc: false,
             open_ended: false,
@@ -1380,12 +1380,11 @@ pub struct Events {
         if self.states.len > (2 * MAX_DEPTH) {
             return error.TooDeep;
         }
-        self.states.push(@int_from_enum(s))!;
+        self.states.push(s)!;
     }
 
     fn pop_state(self: *mut Events) State {
-        let s = self.states.pop() catch return State.END;
-        return @enum_from_int(State, s);
+        return self.states.pop() catch State.END;
     }
 
     fn ev(kind: EventKind, start: Mark, end: Mark) Event {

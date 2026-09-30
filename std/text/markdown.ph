@@ -518,7 +518,7 @@ struct Parser {
     /// Bytes of destinations and titles that reference links may still expand to.
     ref_budget: usize,
     /// Column alignments (Align values) of the tables (each TABLE's `start` columns from its `fence_offset`).
-    aligns: vec.Vec.[u8],
+    aligns: vec.Vec.[Align],
     scratch: strs.String,
     // the inline parser's subject: s is raw[sbase..], inside `block`
     s: []u8,
@@ -561,7 +561,7 @@ struct Parser {
             partially_consumed_tab: false,
             current: 0,
             ref_budget: @max(size * 10, 100000),
-            aligns: vec.Vec.[u8].init(),
+            aligns: vec.Vec.[Align].init(),
             scratch: strs.String.init(),
             s: "",
             sbase: 0,
@@ -2131,7 +2131,7 @@ fn table_start(p: *mut Parser, para: u32) !bool {
         } else if right {
             al = Align.RIGHT;
         }
-        p.aligns.push(@int_from_enum(al))!;
+        p.aligns.push(al)!;
     }
     let ncols = cells.len;
     // the paragraph's last line
@@ -2177,7 +2177,7 @@ fn add_row(p: *mut Parser, table: u32, off: u32, cells: *vec.Vec.[Cell], header:
         let cell = p.append(row, Kind.TABLE_CELL)!;
         let cn = p.nd(cell);
         cn.open = false;
-        cn.align = @enum_from_int(Align, p.aligns.get(@as(usize, t.fence_offset) + k));
+        cn.align = p.aligns.get(@as(usize, t.fence_offset) + k);
         if k < cells.len {
             let c = cells.get(k);
             cn.text = Ref.{ off: off + @truncate(u32, c.a), len: @truncate(u32, c.b - c.a), raw: true };

@@ -2791,7 +2791,7 @@ struct Parser {
     stack: vec.Vec.[u32],
     open: [124]u32,  // how many HTML elements of each T_ are on the stack
     afe: vec.Vec.[u32],
-    tmodes: vec.Vec.[u8],  // Mode values
+    tmodes: vec.Vec.[Mode],
     mode: Mode,
     orig: Mode,
     head: u32,
@@ -3114,7 +3114,7 @@ struct Parser {
                     return;
                 }
                 if t == T_TEMPLATE {
-                    self.mode = @enum_from_int(Mode, self.tmodes.last() catch @int_from_enum(Mode.IN_BODY));
+                    self.mode = self.tmodes.last() catch Mode.IN_BODY;
                     return;
                 }
                 if (t == T_HEAD) and not last {
@@ -4041,7 +4041,7 @@ fn in_head(p: *mut Parser, t: *mut Token) !bool {
             p.afe.push(MARKER)!;
             p.frameset_ok = false;
             p.mode = Mode.IN_TEMPLATE;
-            p.tmodes.push(@int_from_enum(Mode.IN_TEMPLATE))!;
+            p.tmodes.push(Mode.IN_TEMPLATE)!;
             return false;
         }
         if g == T_HEAD {
@@ -4061,7 +4061,7 @@ fn in_head(p: *mut Parser, t: *mut Token) !bool {
             p.gen_thorough();
             p.pop_until(T_TEMPLATE);
             p.afe_clear_to_marker();
-            _ = p.tmodes.pop() catch 0;
+            _ = p.tmodes.pop() catch Mode.IN_BODY;
             p.reset_mode();
             return false;
         }
@@ -5205,8 +5205,8 @@ fn in_cell(p: *mut Parser, t: *mut Token) !bool {
 }
 
 fn switch_template(p: *mut Parser, mode: Mode) !bool {
-    _ = p.tmodes.pop() catch 0;
-    p.tmodes.push(@int_from_enum(mode))!;
+    _ = p.tmodes.pop() catch Mode.IN_BODY;
+    p.tmodes.push(mode)!;
     p.mode = mode;
     return true;
 }
@@ -5247,7 +5247,7 @@ fn in_template(p: *mut Parser, t: *mut Token) !bool {
         }
         p.pop_until(T_TEMPLATE);
         p.afe_clear_to_marker();
-        _ = p.tmodes.pop() catch 0;
+        _ = p.tmodes.pop() catch Mode.IN_BODY;
         p.reset_mode();
         return true;
     }
@@ -5511,7 +5511,7 @@ fn foreign(p: *mut Parser, t: *mut Token) !bool {
 
 fn new_parser(doc: *mut Document, tz: *mut Tokenizer, opts: Options) Parser {
     return Parser.{ doc: doc, tz: tz, stack: vec.Vec.[u32].init(), open: [0; 124], afe: vec.Vec.[u32].init(),
-                    tmodes: vec.Vec.[u8].init(), mode: Mode.INITIAL, orig: Mode.INITIAL, head: NONE, form: NONE,
+                    tmodes: vec.Vec.[Mode].init(), mode: Mode.INITIAL, orig: Mode.INITIAL, head: NONE, form: NONE,
                     context: NONE, frameset_ok: true, foster: false, scripting: opts.scripting, skip_lf: false,
                     text_elem: NONE, pend: strs.String.init(), pend_text: false, sbuf: strs.String.init(),
                     abuf: vec.Vec.[Attr].init() };
@@ -5740,7 +5740,7 @@ fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: Nam
         doc.append_child(0, root);
         _ = p.push(root)!;
         if p.is(p.context, T_TEMPLATE) {
-            p.tmodes.push(@int_from_enum(Mode.IN_TEMPLATE))!;
+            p.tmodes.push(Mode.IN_TEMPLATE)!;
         }
         p.reset_mode();
         if p.is(p.context, T_FORM) {
