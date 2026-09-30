@@ -10,7 +10,7 @@
 //     let out = formats.encode(&img, formats.PNG, formats.Options.default())!;
 //
 // Formats: PNG, JPEG, BMP, QOI, PNM (PBM, PGM, PPM, PAM, PFM), Radiance HDR,
-// OpenEXR, GIF and TIFF. HDR and EXR hold linear floating point (F32) images; the
+// OpenEXR, GIF, TIFF and WebP (lossless when writing). HDR and EXR hold linear floating point (F32) images; the
 // others 8 or 16 bits per sample. Encoding converts as the format needs.
 // =============================================================================
 
@@ -27,6 +27,7 @@ import "png.ph" as png;
 import "pnm.ph" as pnm;
 import "qoi.ph" as qoi;
 import "tiff.ph" as tiff;
+import "webp.ph" as webp;
 
 error { Unsupported, InvalidImage, OutOfMemory }
 
@@ -40,6 +41,7 @@ pub const HDR: u8 = 6;
 pub const EXR: u8 = 7;
 pub const GIF: u8 = 8;
 pub const TIFF: u8 = 9;
+pub const WEBP: u8 = 10;
 
 /// Settings for encoders (each uses the ones that apply to it).
 pub struct Options {
@@ -71,6 +73,9 @@ pub fn detect(data: []u8) u8 {
     }
     if tiff.is_tiff(data) {
         return TIFF;
+    }
+    if webp.is_webp(data) {
+        return WEBP;
     }
     if qoi.is_qoi(data) {
         return QOI;
@@ -127,6 +132,9 @@ pub fn from_extension(path: []u8) u8 {
     if @mem_eq(e, "tif") or @mem_eq(e, "tiff") {
         return TIFF;
     }
+    if @mem_eq(e, "webp") {
+        return WEBP;
+    }
     return UNKNOWN;
 }
 
@@ -160,6 +168,9 @@ pub fn decode(data: []u8) !image.Image {
     if f == TIFF {
         return tiff.decode(data);
     }
+    if f == WEBP {
+        return webp.decode(data);
+    }
     return error.Unsupported;
 }
 
@@ -191,6 +202,9 @@ pub fn encode(img: *image.Image, format: u8, opts: Options) ![]mut u8 {
     }
     if format == TIFF {
         return tiff.encode(img, opts.tiff);
+    }
+    if format == WEBP {
+        return webp.encode(img);
     }
     return error.Unsupported;
 }
@@ -225,7 +239,7 @@ test "every format" {
     for i in @as(usize, 0)..px.len {
         px[i] = @truncate(u8, (i % 30) * 8);
     }
-    let formats: [9]u8 = [PNG, JPEG, BMP, QOI, PNM, HDR, EXR, GIF, TIFF];
+    let formats: [10]u8 = [PNG, JPEG, BMP, QOI, PNM, HDR, EXR, GIF, TIFF, WEBP];
     for f in formats {
         let enc = encode(&img, f, Options.default())!;
         defer mem.free(enc);
