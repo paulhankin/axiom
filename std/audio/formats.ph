@@ -10,8 +10,8 @@
 //     let s2 = formats.decode(bytes)!;
 //     let out = formats.encode(&s, formats.FLAC)!;
 //
-// Formats: WAV, AIFF and FLAC (read and write), Ogg Vorbis, Ogg Opus and MP3
-// (read).
+// Formats: WAV, AIFF and FLAC (read and write), Ogg Vorbis, Ogg Opus, MP3 and
+// AAC (ADTS and MP4; read).
 // Encoding converts as the format needs (FLAC holds integers of up to 32
 // bits: float sounds become S24).
 // =============================================================================
@@ -20,6 +20,7 @@ import "../audio.ph" as audio;
 import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
+import "aac.ph" as aac;
 import "aiff.ph" as aiff;
 import "flac.ph" as flac;
 import "mp3.ph" as mp3;
@@ -36,6 +37,7 @@ pub const FLAC: u8 = 3;
 pub const VORBIS: u8 = 4;
 pub const MP3: u8 = 5;
 pub const OPUS: u8 = 6;
+pub const AAC: u8 = 7;
 
 /// The format of encoded data, from its first bytes.
 pub fn detect(data: []u8) u8 {
@@ -53,6 +55,9 @@ pub fn detect(data: []u8) u8 {
     }
     if opus.is_opus(data) {
         return OPUS;
+    }
+    if aac.is_aac(data) {
+        return AAC;
     }
     if mp3.is_mp3(data) {
         return MP3;  // last: its test is the loosest
@@ -90,6 +95,9 @@ pub fn from_extension(path: []u8) u8 {
     if @mem_eq(e, "opus") {
         return OPUS;
     }
+    if @mem_eq(e, "aac") or @mem_eq(e, "adts") or @mem_eq(e, "m4a") or @mem_eq(e, "m4b") or @mem_eq(e, "mp4") {
+        return AAC;
+    }
     return UNKNOWN;
 }
 
@@ -113,6 +121,9 @@ pub fn decode(data: []u8) !audio.Sound {
     }
     if f == OPUS {
         return opus.decode(data);
+    }
+    if f == AAC {
+        return aac.decode(data);
     }
     return error.Unsupported;
 }
@@ -173,5 +184,6 @@ test "every writable format" {
     @expect_eq(from_extension("x.ogg"), VORBIS);
     @expect_eq(from_extension("x.MP3"), MP3);
     @expect_eq(from_extension("x.opus"), OPUS);
+    @expect_eq(from_extension("x.m4a"), AAC);
     @expect_eq(from_extension("noext"), UNKNOWN);
 }

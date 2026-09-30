@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generates std/audio/testdata: Opus streams from libopus (through ffmpeg)
 in each of its modes, with libopus's own decoding (through ctypes) as
-16-bit PCM to compare with.
+16-bit PCM to compare with; AAC streams (ADTS and MP4) from FFmpeg's
+encoder in each of its profiles and tools, with FFmpeg's decoding.
 
-    tools/gen_audio_tests.py [opus ...]
+    tools/gen_audio_tests.py [opus|aac ...]
 """
 import ctypes
 import math
@@ -195,6 +196,48 @@ def opus():
     with open(os.path.join(d, 'cases.txt'), 'w') as f:
         f.write('\n'.join(cases) + '\n')
     print(len(cases), 'opus cases')
+
+
+def aac():
+    d = os.path.join(root, 'aac')
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, 'src.wav')
+    cases = []
+
+    def enc(name, ext, frames, rate, params):
+        write_wav(tmp, frames, rate)
+        out = os.path.join(d, name + '.' + ext)
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', tmp, '-c:a', 'aac'] + params + [out], check=True)
+        raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', out, '-f', 'f32le', '-'], check=True,
+                             capture_output=True).stdout
+        pcm = struct.unpack('<%df' % (len(raw) // 4), raw)
+        ch = len(frames[0])
+        with open(os.path.join(d, name + '.pcm'), 'wb') as f:
+            f.write(b''.join(struct.pack('<h', max(-32768, min(32767, int(math.floor(v * 32768 + 0.5))))) for v in pcm))
+        # FFmpeg trims an MP4's edit list at the start but not at the end;
+        # the stream holds exactly the input
+        want = len(frames) if ext == 'm4a' else len(pcm) // ch
+        cases.append('%s %s %d %d %d %d' % (name, ext, ch, len(pcm) // ch, rate, want))
+
+    # AAC-LC: sampling rates, mono and stereo, M/S, intensity stereo,
+    # noise substitution, TNS, short windows (the clicks)
+    enc('lc_stereo', 'm4a', signal(0.5, 2, 44100), 44100, ['-b:a', '128k'])
+    enc('lc_low', 'm4a', signal(0.5, 2, 48000, seed=2), 48000, ['-b:a', '48k'])
+    enc('lc_mono', 'aac', signal(0.5, 1, 22050, seed=4), 22050, ['-b:a', '40k'])
+    enc('lc_8k', 'aac', speech(0.5, 1, 8000), 8000, ['-b:a', '16k'])
+    enc('lc_96k', 'm4a', signal(0.25, 2, 96000, seed=6), 96000, ['-b:a', '192k'])
+    enc('lc_12k', 'aac', speech(0.5, 2, 12000), 12000, ['-b:a', '24k'])
+    enc('lc_fast', 'aac', signal(0.5, 2, 32000, seed=7), 32000, ['-b:a', '64k', '-aac_coder', 'fast'])
+    enc('lc_pce', 'aac', signal(0.3, 2, 24000, seed=8), 24000, ['-b:a', '48k', '-aac_pce', '1'])
+    # 5.1 (a channel configuration with LFE)
+    enc('surround', 'm4a', signal(0.3, 6, 48000, seed=5), 48000, ['-b:a', '256k'])
+    # AAC Main (prediction) and AAC LTP
+    enc('main', 'm4a', signal(0.5, 2, 44100, seed=9), 44100, ['-profile:a', 'aac_main', '-aac_pred', '1', '-strict', '-2', '-b:a', '96k'])
+    enc('ltp', 'aac', signal(0.5, 2, 44100, seed=10), 44100, ['-profile:a', 'aac_ltp', '-aac_ltp', '1', '-strict', '-2', '-b:a', '96k'])
+    os.remove(tmp)
+    with open(os.path.join(d, 'cases.txt'), 'w') as f:
+        f.write('\n'.join(cases) + '\n')
+    print(len(cases), 'aac cases')
 
 
 for what in sys.argv[1:] or ['opus']:
