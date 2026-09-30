@@ -1,0 +1,211 @@
+// =============================================================================
+// std/audio/opus/range.ph - Opus's range decoder (RFC 6716 section 4.1), as
+// libopus implements it (celt/entdec.c): symbols from the front of a frame,
+// raw bits from its end.
+// =============================================================================
+
+pub const BITRES: u32 = 3;
+
+const SYM_BITS: u32 = 8;
+const CODE_BITS: u32 = 32;
+const SYM_MAX: u32 = 255;
+const CODE_TOP: u32 = 0x80000000;
+const CODE_BOT: u32 = 0x800000;
+const CODE_EXTRA: u32 = 7;
+const UINT_BITS: u32 = 8;
+
+/// The number of bits needed to write v (0 for 0).
+pub fn ilog(v: u32) i32 {
+    return 32 - @as(i32, @truncate(u8, @clz(v)));
+}
+
+pub struct Dec {
+    buf: []u8,
+    storage: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    offs: u32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: u32,
+    err: bool,
+
+    pub fn init(buf: []u8) Dec {
+        let mut d = Dec.{ buf: buf, storage: @truncate(u32, buf.len), end_offs: 0, end_window: 0, nend_bits: 0,
+                          nbits_total: @bit_cast(i32, (CODE_BITS + 1) - (((CODE_BITS - CODE_EXTRA) / SYM_BITS) * SYM_BITS)),
+                          offs: 0, rng: @as(u32, 1) << CODE_EXTRA, val: 0, ext: 0, rem: 0, err: false };
+        d.rem = d.read_byte();
+        d.val = (d.rng - 1) - (d.rem >> (SYM_BITS - CODE_EXTRA));
+        d.normalize();
+        return d;
+    }
+
+    fn read_byte(self: *mut Dec) u32 {
+        if self.offs < self.storage {
+            let b = @as(u32, self.buf[@as(usize, self.offs)]);
+            self.offs += 1;
+            return b;
+        }
+        return 0;
+    }
+
+    fn read_byte_from_end(self: *mut Dec) u32 {
+        if self.end_offs < self.storage {
+            self.end_offs += 1;
+            return @as(u32, self.buf[@as(usize, self.storage - self.end_offs)]);
+        }
+        return 0;
+    }
+
+    fn normalize(self: *mut Dec) void {
+        while self.rng <= CODE_BOT {
+            self.nbits_total += @bit_cast(i32, SYM_BITS);
+            self.rng = self.rng << SYM_BITS;
+            let mut sym = self.rem;
+            self.rem = self.read_byte();
+            sym = ((sym << SYM_BITS) | self.rem) >> (SYM_BITS - CODE_EXTRA);
+            self.val = ((self.val << SYM_BITS) +% (SYM_MAX & ~sym)) & (CODE_TOP - 1);
+        }
+    }
+
+    pub fn decode(self: *mut Dec, ft: u32) u32 {
+        self.ext = self.rng / ft;
+        let s = self.val / self.ext;
+        return ft - @min(s + 1, ft);
+    }
+
+    pub fn decode_bin(self: *mut Dec, bits: u32) u32 {
+        self.ext = self.rng >> bits;
+        let s = self.val / self.ext;
+        return (@as(u32, 1) << bits) - @min(s + 1, @as(u32, 1) << bits);
+    }
+
+    pub fn update(self: *mut Dec, fl: u32, fh: u32, ft: u32) void {
+        let s = self.ext *% (ft - fh);
+        self.val -%= s;
+        if fl > 0 {
+            self.rng = self.ext *% (fh - fl);
+        } else {
+            self.rng -%= s;
+        }
+        self.normalize();
+    }
+
+    /// A bit that is 1 with probability 1/2^logp.
+    pub fn bit_logp(self: *mut Dec, logp: u32) bool {
+        let r = self.rng;
+        let d = self.val;
+        let s = r >> logp;
+        let ret = d < s;
+        if not ret {
+            self.val = d - s;
+        }
+        if ret {
+            self.rng = s;
+        } else {
+            self.rng = r - s;
+        }
+        self.normalize();
+        return ret;
+    }
+
+    pub fn bit_logp_int(self: *mut Dec, logp: u32) i32 {
+        if self.bit_logp(logp) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /// A symbol from an inverse CDF of 1/2^ftb units.
+    pub fn icdf(self: *mut Dec, t: []u8, ftb: u32) i32 {
+        let mut s = self.rng;
+        let d = self.val;
+        let r = s >> ftb;
+        let mut ret: i32 = -1;
+        let mut tt: u32 = 0;
+        loop {
+            tt = s;
+            ret += 1;
+            s = r *% @as(u32, t[@as(usize, @bit_cast(u32, ret))]);
+            if d >= s {
+                break;
+            }
+        }
+        self.val = d - s;
+        self.rng = tt - s;
+        self.normalize();
+        return ret;
+    }
+
+    /// A uniform value in [0, ft).
+    pub fn uint(self: *mut Dec, ft0: u32) u32 {
+        let ft = ft0 - 1;
+        let mut ftb = ilog(ft);
+        if ftb > @bit_cast(i32, UINT_BITS) {
+            ftb -= @bit_cast(i32, UINT_BITS);
+            let f = (ft >> @bit_cast(u32, ftb)) + 1;
+            let s = self.decode(f);
+            self.update(s, s + 1, f);
+            let t = (s << @bit_cast(u32, ftb)) | self.bits(@bit_cast(u32, ftb));
+            if t <= ft {
+                return t;
+            }
+            self.err = true;
+            return ft;
+        }
+        let s = self.decode(ft0);
+        self.update(s, s + 1, ft0);
+        return s;
+    }
+
+    /// Raw bits, from the end of the frame.
+    pub fn bits(self: *mut Dec, n: u32) u32 {
+        let mut window = self.end_window;
+        let mut available = self.nend_bits;
+        if @bit_cast(u32, available) < n {
+            loop {
+                window |= self.read_byte_from_end() << @bit_cast(u32, available);
+                available += @bit_cast(i32, SYM_BITS);
+                if available > (32 - @bit_cast(i32, SYM_BITS)) {
+                    break;
+                }
+            }
+        }
+        let mut ret = window;
+        if n < 32 {
+            ret = window & ((@as(u32, 1) << n) - 1);
+        }
+        if n < 32 {
+            window = window >> n;
+        } else {
+            window = 0;
+        }
+        available -= @bit_cast(i32, n);
+        self.end_window = window;
+        self.nend_bits = available;
+        self.nbits_total += @bit_cast(i32, n);
+        return ret;
+    }
+
+    /// The bits used so far (rounded up).
+    pub fn tell(self: *Dec) i32 {
+        return self.nbits_total - ilog(self.rng);
+    }
+
+    /// The bits used so far, in 1/8 bits.
+    pub fn tell_frac(self: *Dec) u32 {
+        let nbits = @bit_cast(u32, self.nbits_total) << BITRES;
+        let mut l = @bit_cast(u32, ilog(self.rng));
+        let mut r = self.rng >> (l - 16);
+        for _q in @as(u32, 0)..BITRES {
+            r = (r * r) >> 15;
+            let b = r >> 16;
+            l = (l << 1) | b;
+            r = r >> b;
+        }
+        return nbits -% l;
+    }
+}
