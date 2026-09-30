@@ -2823,6 +2823,56 @@ static void gen_stmt(Stmt *s) {
 // ---------------------------------------------------------------------------
 // Function bodies
 // ---------------------------------------------------------------------------
+// Deletes the blocks that cannot be reached from the entry: continuations
+// after return/break/trap, and anything generated in them, loops included.
+// Leaving them for the backend makes -O0 code generation several times
+// slower. A dead loop's blocks use one another's values, so every use of a
+// dead instruction is cut before the blocks go.
+static void delete_unreachable(LLVMValueRef fn) {
+    int n = (int)LLVMCountBasicBlocks(fn);
+    LLVMBasicBlockRef *bbs = NEWN(LLVMBasicBlockRef, n);
+    LLVMGetBasicBlocks(fn, bbs);
+    // block -> index, by open addressing on the pointer
+    int cap = 16;
+    while (cap < 2 * n) cap *= 2;
+    int *slot = NEWN(int, cap);
+    for (int i = 0; i < cap; i++) slot[i] = -1;
+    for (int i = 0; i < n; i++) {
+        size_t h = ((size_t)(uintptr_t)bbs[i] >> 4) & (size_t)(cap - 1);
+        while (slot[h] >= 0) h = (h + 1) & (size_t)(cap - 1);
+        slot[h] = i;
+    }
+    bool *live = NEWN(bool, n);
+    int *stack = NEWN(int, n);
+    int sp = 0;
+    live[0] = true;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(bbs[stack[--sp]]);
+        if (!term) continue;
+        unsigned ns = LLVMGetNumSuccessors(term);
+        for (unsigned k = 0; k < ns; k++) {
+            LLVMBasicBlockRef succ = LLVMGetSuccessor(term, k);
+            size_t h = ((size_t)(uintptr_t)succ >> 4) & (size_t)(cap - 1);
+            while (slot[h] >= 0 && bbs[slot[h]] != succ) h = (h + 1) & (size_t)(cap - 1);
+            int j = slot[h];
+            if (j >= 0 && !live[j]) {
+                live[j] = true;
+                stack[sp++] = j;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (live[i]) continue;
+        for (LLVMValueRef in = LLVMGetFirstInstruction(bbs[i]); in; in = LLVMGetNextInstruction(in)) {
+            if (LLVMGetFirstUse(in)) LLVMReplaceAllUsesWith(in, LLVMGetUndef(LLVMTypeOf(in)));
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!live[i]) LLVMDeleteBasicBlock(bbs[i]);
+    }
+}
+
 static void gen_fn_body(FnInst *fi) {
     Decl *d = fi->decl;
     FnState st = {0};
@@ -2861,21 +2911,7 @@ static void gen_fn_body(FnInst *fi) {
     }
     LLVMPositionBuilderAtEnd(B, st.entry);
     LLVMBuildBr(B, start);
-    // Delete blocks with no predecessors (continuations after return/break/trap).
-    // Leaving them for the backend makes -O0 code generation several times slower.
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        LLVMBasicBlockRef bb = LLVMGetNextBasicBlock(st.entry);
-        while (bb) {
-            LLVMBasicBlockRef next = LLVMGetNextBasicBlock(bb);
-            if (!LLVMGetFirstUse(LLVMBasicBlockAsValue(bb))) {
-                LLVMDeleteBasicBlock(bb);
-                changed = true;
-            }
-            bb = next;
-        }
-    }
+    delete_unreachable(fi->fn);
     free(st.defers.data);
     free(st.loops.data);
     F = saved;

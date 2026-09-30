@@ -46,6 +46,23 @@ fn e2() !u32 {
     return v;
 }
 
+// a deferred loop also emitted after a loop that never ends: dead code, which
+// must go without taking the loop's bound with it
+fn f(n: u32) u32 {
+    let mut k: u32 = 0;
+    defer {
+        for i in @as(u32, 0)..k {
+            io.int(@as(i64, i));
+        }
+    }
+    loop {
+        k += 1;
+        if k >= n {
+            return k;
+        }
+    }
+}
+
 export fn run() void {
     a();
     // expect: body
@@ -64,4 +81,8 @@ export fn run() void {
     _ = e2() catch 0;
     // expect: b-cleanup
     // expect: e2-defer
+    io.int(@as(i64, f(2)));
+    // expect: 0
+    // expect: 1
+    // expect: 2
 }
