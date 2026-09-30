@@ -143,10 +143,10 @@ def tiff():
     write('gray16_lzw.tif', g16, photometric='minisblack', compression='lzw', predictor=2)
     case('gray16_lzw.tif', g16, 'u16')
     rgb16 = rgb.astype(np.uint16) * 257 + np.arange(45, dtype=np.uint16)[None, :, None]
-    write('rgb16_planar_be.tif', rgb16, photometric='rgb', compression='deflate', planarconfig='separate',
+    write('rgb16_planar_be.tif', np.moveaxis(rgb16, -1, 0), photometric='rgb', compression='deflate', planarconfig='separate',
           byteorder='>', rowsperstrip=8)
     case('rgb16_planar_be.tif', rgb16, 'u16')
-    write('rgb16_planar_tiled.tif', rgb16, photometric='rgb', compression='lzw', planarconfig='separate',
+    write('rgb16_planar_tiled.tif', np.moveaxis(rgb16, -1, 0), photometric='rgb', compression='lzw', planarconfig='separate',
           tile=(16, 32))
     case('rgb16_planar_tiled.tif', rgb16, 'u16')
     fl = (np.sin(np.arange(31 * 27).reshape(27, 31) / 7.0) * 3.5).astype(np.float32)
@@ -229,6 +229,61 @@ def tiff():
     with open(os.path.join(d, 'cases.txt'), 'w') as f:
         f.write('\n'.join(cases) + '\n')
     print(len(cases), 'tiff cases')
+
+
+def webp():
+    """WebP files from libwebp (through Pillow): lossless with each effort
+    (so every transform and the colour cache), palettes of 2 to 256 colours,
+    lossy at several qualities, with and without alpha, and animations. The
+    pixels expected are libwebp's decoding (fancy upsampling), as PNG."""
+    d = os.path.join(root, 'webp')
+    os.makedirs(d, exist_ok=True)
+    names = []
+
+    def save(name, im, **kw):
+        im.save(os.path.join(d, name + '.webp'), 'WEBP', **kw)
+        names.append(name)
+
+    photo = picture(67, 45, 'RGB', 21)
+    alpha = picture(53, 39, 'RGBA', 22)
+    for m in [0, 3, 6]:
+        save('lossless_m%d' % m, photo, lossless=True, method=m, quality=100)
+    save('lossless_alpha', alpha, lossless=True, method=4, exact=True)
+    save('lossless_q0', photo, lossless=True, method=0, quality=0)
+    for n in [2, 4, 16, 200]:
+        save('palette%d' % n, picture(41, 29, 'RGB', 23 + n).quantize(n).convert('RGB'), lossless=True, method=5)
+    for q in [5, 50, 90, 100]:
+        save('lossy_q%d' % q, photo, quality=q, method=4)
+    save('lossy_big', picture(200, 150, 'RGB', 30), quality=75, method=6)
+    save('lossy_alpha', alpha, quality=70, alpha_quality=100)
+    save('lossy_alpha_q50', alpha, quality=70, alpha_quality=50, alpha_filtering=2)
+    save('lossy_alpha_raw', alpha, quality=70, alpha_compression=0)
+    save('lossy_tiny', picture(3, 5, 'RGB', 31), quality=80)
+    frames = []
+    for k in range(4):
+        f = Image.new('RGBA', (48, 40), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(f)
+        dr.rectangle([5 * k, 4 * k, 5 * k + 20, 4 * k + 15], fill=(60 * k, 255 - 50 * k, 90, 255))
+        dr.ellipse([30 - 3 * k, 5, 45, 20 + k], fill=(200, 30 * k, 250, 128))
+        frames.append(f)
+    frames[0].save(os.path.join(d, 'anim_lossless.webp'), save_all=True, append_images=frames[1:],
+                   duration=[100, 50, 70, 30], loop=0, lossless=True)
+    names.append('anim_lossless')
+    frames[0].save(os.path.join(d, 'anim_lossy.webp'), save_all=True, append_images=frames[1:],
+                   duration=80, loop=3, lossless=False, quality=80, allow_mixed=True)
+    names.append('anim_lossy')
+    listing = []
+    for name in names:
+        im = Image.open(os.path.join(d, name + '.webp'))
+        n = getattr(im, 'n_frames', 1)
+        for k in range(n):
+            im.seek(k)
+            fr = im.convert('RGBA') if (im.mode == 'RGBA' or n > 1) else im.convert('RGB')
+            expect(os.path.join(d, '%s.%d.png' % (name, k)), fr)
+        listing.append('%s %d %d' % (name, n, im.info.get('loop', -1) if n > 1 else -1))
+    with open(os.path.join(d, 'cases.txt'), 'w') as f:
+        f.write('\n'.join(listing) + '\n')
+    print(len(names), 'webp files')
 
 
 for what in sys.argv[1:] or ['gif']:

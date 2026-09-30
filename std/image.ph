@@ -16,7 +16,7 @@
 //
 // Reading and writing files: std/image/formats (any format, by content or
 // file extension), or the codecs std/image/png, jpeg, bmp, qoi, pnm (PPM,
-// PGM, PFM), hdr (Radiance) and exr (OpenEXR).
+// PGM, PFM), hdr (Radiance), exr (OpenEXR), gif and tiff.
 // =============================================================================
 
 import "color.ph" as color;

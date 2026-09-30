@@ -100,6 +100,7 @@ Image files are read and written by `std/image/`:
 | [`image/hdr`](image/hdr.ph) | Radiance RGBE (HDR) |
 | [`image/exr`](image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
 | [`image/gif`](image/gif.ph) | GIF 87a/89a: interlacing, transparency, animation (`decode_all` → frames composited with each disposal method, delays, loop count); writes single images and animations with median-cut palettes. Checked against files made by Pillow ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
+| [`image/tiff`](image/tiff.ph) | TIFF and BigTIFF, either byte order: strips or tiles, planar or not; none, LZW, Deflate, PackBits, CCITT fax (group 3 1D/2D, group 4), JPEG; both predictors; 1–64-bit integers and 16/32/64-bit floats; gray, RGB, palette, CMYK, YCbCr; associated or unassociated alpha; `page_count`, `decode_page`. Writes U8/U16/F32 pages with LZW, Deflate or PackBits. Checked against files from tifffile and libtiff ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
 
 Sound files are read and written by `std/audio/`:
 
