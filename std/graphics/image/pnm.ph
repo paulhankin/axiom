@@ -134,9 +134,9 @@ pub fn decode(data: []u8) !image.Image {
     if (kind >= '4') and (s.pos < data.len) {
         s.pos += 1;
     }
-    let mut out_depth = image.U8;
+    let mut out_depth = image.Depth.U8;
     if maxval > 255 {
-        out_depth = image.U16;
+        out_depth = image.Depth.U16;
     }
     let mut img = image.Image.init(w, h, depth, out_depth)!;
     let n = (w * h) * depth;
@@ -216,7 +216,7 @@ fn decode_pfm(s: *mut Scan, color: bool) !image.Image {
         return error.InvalidImage;
     }
     let little = scale < 0.0;
-    let mut img = image.Image.init(w, h, ch, image.F32)!;
+    let mut img = image.Image.init(w, h, ch, image.Depth.F32)!;
     let out = img.samples32();
     // rows are stored bottom to top
     for y in @as(usize, 0)..h {
@@ -249,12 +249,12 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
     let w = img.width;
     let h = img.height;
     let wr = o.writer();
-    if img.depth == image.F32 {
+    if img.depth == image.Depth.F32 {
         let mut ch: usize = 3;
         if img.channels <= 2 {
             ch = 1;
         }
-        let mut c = img.convert(ch, image.F32)!;
+        let mut c = img.convert(ch, image.Depth.F32)!;
         defer c.deinit();
         let mut tag = "PF";
         if ch == 1 {
@@ -274,7 +274,7 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
         return;
     }
     let mut maxval: u32 = 255;
-    if img.depth == image.U16 {
+    if img.depth == image.Depth.U16 {
         maxval = 65535;
     }
     if img.has_alpha() {
@@ -292,7 +292,7 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
         }
         fmt.write(wr, "{}\n{} {}\n{}\n", [fmt.str(tag), fmt.int(w), fmt.int(h), fmt.int(maxval)])!;
     }
-    if img.depth == image.U8 {
+    if img.depth == image.Depth.U8 {
         o.push_str(img.samples8())!;
         return;
     }
@@ -317,7 +317,7 @@ test "formats" {
     let mut d = decode("P5 1 1 65535\n\x12\x34")!;
     defer d.deinit();
     @expect_eq(d.samples16()[0], 0x1234);
-    let kinds: [3]u8 = [image.U8, image.U16, image.F32];
+    let kinds: [3]image.Depth = [image.Depth.U8, image.Depth.U16, image.Depth.F32];
     let chans: [4]usize = [1, 2, 3, 4];
     for k in kinds {
         for ch in chans {
@@ -326,7 +326,7 @@ test "formats" {
             for i in @as(usize, 0)..img.data.len {
                 img.data[i] = @truncate(u8, (i * 7) + 1);
             }
-            if k == image.F32 {
+            if k == image.Depth.F32 {
                 let f = img.samples32();
                 for i in @as(usize, 0)..f.len {
                     f[i] = @float_from_int(f32, i) * 0.25;
@@ -336,7 +336,7 @@ test "formats" {
             defer mem.free(enc);
             let mut back = decode(enc)!;
             defer back.deinit();
-            if (k == image.F32) and ((ch == 2) or (ch == 4)) {
+            if (k == image.Depth.F32) and ((ch == 2) or (ch == 4)) {
                 @expect_eq(back.channels, ch - 1);  // PFM has no alpha
                 continue;
             }

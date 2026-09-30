@@ -131,27 +131,28 @@ fn decode_samples(d: []u8, tag: u32, channels: usize, rate: u32, align: usize, b
     if (align >= channels) and ((align % channels) == 0) and ((align / channels) >= width) {
         width = align / channels;
     }
-    let mut format: u8 = 0;
+    let mut format = audio.SampleFormat.S16;
     if tag == TAG_PCM {
         if width == 1 {
-            format = audio.U8;
+            format = audio.SampleFormat.U8;
         } else if width == 2 {
-            format = audio.S16;
+            format = audio.SampleFormat.S16;
         } else if width == 3 {
-            format = audio.S24;
+            format = audio.SampleFormat.S24;
         } else if width == 4 {
-            format = audio.S32;
+            format = audio.SampleFormat.S32;
+        } else {
+            return error.Unsupported;
         }
     } else if tag == TAG_FLOAT {
         if width == 4 {
-            format = audio.F32;
+            format = audio.SampleFormat.F32;
         } else if width == 8 {
-            format = audio.F64;
+            format = audio.SampleFormat.F64;
+        } else {
+            return error.Unsupported;
         }
-    } else if ((tag == TAG_ALAW) or (tag == TAG_MULAW)) and (width == 1) {
-        format = audio.S16;
-    }
-    if format == 0 {
+    } else if not (((tag == TAG_ALAW) or (tag == TAG_MULAW)) and (width == 1)) {
         return error.Unsupported;
     }
     let frames = d.len / (width * channels);
@@ -166,7 +167,7 @@ fn decode_samples(d: []u8, tag: u32, channels: usize, rate: u32, align: usize, b
                 out[i] = mulaw_decode(d[i]);
             }
         }
-    } else if format == audio.S24 {
+    } else if format == audio.SampleFormat.S24 {
         let out = s.samples_i32();
         for i in @as(usize, 0)..n {
             let v = (@as(u32, d[3 * i]) << 8) | (@as(u32, d[(3 * i) + 1]) << 16) | (@as(u32, d[(3 * i) + 2]) << 24);
@@ -295,7 +296,7 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
     } else {
         o.u32le(@truncate(u32, data_len));
     }
-    if s.format == audio.S24 {
+    if s.format == audio.SampleFormat.S24 {
         let src = s.samples_i32();
         for i in @as(usize, 0)..n {
             let v = @bit_cast(u32, src[i]);
@@ -315,7 +316,8 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
 }
 
 test "round trips every format" {
-    let fmts: [6]u8 = [audio.U8, audio.S16, audio.S24, audio.S32, audio.F32, audio.F64];
+    let fmts: [6]audio.SampleFormat = [audio.SampleFormat.U8, audio.SampleFormat.S16, audio.SampleFormat.S24,
+                                       audio.SampleFormat.S32, audio.SampleFormat.F32, audio.SampleFormat.F64];
     let chans: [3]usize = [1, 2, 6];
     for f in fmts {
         for ch in chans {
@@ -329,7 +331,7 @@ test "round trips every format" {
             @expect(is_wav(enc));
             let mut back = decode(enc)!;
             defer back.deinit();
-            @expect_eq(back.format, f);
+            @expect(back.format == f);
             @expect_eq(back.channels, ch);
             @expect_eq(back.rate, 22050);
             @expect_eq(back.frames, 101);

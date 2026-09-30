@@ -1,14 +1,14 @@
 // =============================================================================
 // std/graphics/image.ph - images in memory.
 //
-//     let mut img = image.Image.init(640, 480, 4, image.U8)!;  // RGBA, 8 bits
+//     let mut img = image.Image.init(640, 480, 4, image.Depth.U8)!;  // RGBA, 8 bits
 //     defer img.deinit();
 //     img.set(10, 20, color.Color.rgb(1.0, 0.5, 0.0));
-//     let c = img.get(10, 20);                                   // a color.Color
-//     let hdr = img.convert(3, image.F32)!;                      // RGB, linear float
+//     let c = img.get(10, 20);                                         // a color.Color
+//     let hdr = img.convert(3, image.Depth.F32)!;                      // RGB, linear float
 //
 // An Image is a grid of pixels of 1 (gray), 2 (gray and alpha), 3 (RGB) or
-// 4 (RGBA) channels, each channel U8 or U16 (sRGB-encoded integers, as most
+// 4 (RGBA) channels, each channel (its Depth) U8 or U16 (sRGB-encoded integers, as most
 // files hold) or F32 (linear light, unbounded: HDR). Rows are packed, top row
 // first; U16 and F32 samples are in the machine's order (little-endian) and
 // are reached with samples16() and samples32(). Alpha is straight (not
@@ -24,20 +24,22 @@ import "color.ph" as color;
 
 error { InvalidImage, Unsupported, TooLarge, OutOfMemory }
 
-/// Sample types.
-pub const U8: u8 = 1;
-pub const U16: u8 = 2;
-pub const F32: u8 = 3;
+/// The type of an image's samples.
+pub enum Depth: u8 {
+    U8 = 1,
+    U16,
+    F32,
+}
 
 /// Images bigger than this many pixels are refused by the decoders (a guard
 /// against hostile headers); 2^28 is 16384 x 16384.
 pub const MAX_PIXELS: usize = 268435456;
 
-pub fn bytes_per_sample(depth: u8) usize {
-    if depth == U8 {
+pub fn bytes_per_sample(depth: Depth) usize {
+    if depth == Depth.U8 {
         return 1;
     }
-    if depth == U16 {
+    if depth == Depth.U16 {
         return 2;
     }
     return 4;
@@ -47,12 +49,12 @@ pub struct Image {
     width: usize,
     height: usize,
     channels: usize,  // 1 gray, 2 gray + alpha, 3 RGB, 4 RGBA
-    depth: u8,        // U8, U16 or F32
+    depth: Depth,     // U8, U16 or F32
     data: []mut u8,
 
     /// A new image, all zero (transparent black). Free it with deinit.
-    pub fn init(width: usize, height: usize, channels: usize, depth: u8) !Image {
-        if (channels < 1) or (channels > 4) or ((depth != U8) and (depth != U16) and (depth != F32)) {
+    pub fn init(width: usize, height: usize, channels: usize, depth: Depth) !Image {
+        if (channels < 1) or (channels > 4) {
             return error.Unsupported;
         }
         let px = @mul_checked(width, height) catch return error.TooLarge;
@@ -110,14 +112,14 @@ pub struct Image {
     /// Sample c of pixel (x, y) as linear light for colour channels, or as
     /// a fraction for alpha.
     fn sample(self: *Image, i: usize, is_alpha: bool) f32 {
-        if self.depth == U8 {
+        if self.depth == Depth.U8 {
             let v = self.data[i];
             if is_alpha {
                 return @float_from_int(f32, v) / 255.0;
             }
             return color.linear8(v);
         }
-        if self.depth == U16 {
+        if self.depth == Depth.U16 {
             let v = @float_from_int(f32, self.samples16()[i]) / 65535.0;
             if is_alpha {
                 return v;
@@ -128,13 +130,13 @@ pub struct Image {
     }
 
     fn put(self: *mut Image, i: usize, v: f32, is_alpha: bool) void {
-        if self.depth == U8 {
+        if self.depth == Depth.U8 {
             if is_alpha {
                 self.data[i] = @truncate(u8, @int_from_float(u32, @nearest(clamp01(v) * 255.0)));
             } else {
                 self.data[i] = color.srgb8(v);
             }
-        } else if self.depth == U16 {
+        } else if self.depth == Depth.U16 {
             let mut e = v;
             if not is_alpha {
                 e = color.srgb_encode(v);
@@ -198,13 +200,13 @@ pub struct Image {
 
     /// A copy with other channels and sample type. Integer samples convert
     /// exactly between U8 and U16 (v * 257); to and from F32 through sRGB.
-    pub fn convert(self: *Image, channels: usize, depth: u8) !Image {
+    pub fn convert(self: *Image, channels: usize, depth: Depth) !Image {
         if (channels == self.channels) and (depth == self.depth) {
             return self.clone();
         }
         let mut out = Image.init(self.width, self.height, channels, depth)!;
         let n = self.width * self.height;
-        let fast = (self.depth != F32) and (depth != F32);
+        let fast = (self.depth != Depth.F32) and (depth != Depth.F32);
         for p in @as(usize, 0)..n {
             if fast {
                 // integers: move encoded values without going through linear
@@ -212,7 +214,7 @@ pub struct Image {
                 let si = p * self.channels;
                 for c in @as(usize, 0)..self.channels {
                     let mut s: u32 = 0;
-                    if self.depth == U8 {
+                    if self.depth == Depth.U8 {
                         s = @as(u32, self.data[si + c]) * 257;
                     } else {
                         s = @as(u32, self.samples16()[si + c]);
@@ -238,7 +240,7 @@ pub struct Image {
                     if (channels == 2) and (c == 1) {
                         s = rgba[3];
                     }
-                    if depth == U8 {
+                    if depth == Depth.U8 {
                         out.data[di + c] = @truncate(u8, (s + 128) / 257);
                     } else {
                         out.samples16()[di + c] = @truncate(u16, s);
@@ -505,22 +507,22 @@ pub fn f32_to_half(v: f32) u16 {
 // -----------------------------------------------------------------------------
 
 test "pixels and conversion" {
-    let mut img = Image.init(3, 2, 4, U8)!;
+    let mut img = Image.init(3, 2, 4, Depth.U8)!;
     defer img.deinit();
     img.set(1, 1, color.Color.from_rgba8(color.Rgba8.from_u32(0x40806020)));
     @expect_eq(img.get(1, 1).to_rgba8().to_u32(), 0x40806020);
     @expect_eq(img.data[(1 * 3 + 1) * 4], 0x40);
-    let mut g = img.convert(1, U16)!;
+    let mut g = img.convert(1, Depth.U16)!;
     defer g.deinit();
     @expect_eq(g.samples16().len, 6);
-    let mut back = img.convert(4, U16)!;
+    let mut back = img.convert(4, Depth.U16)!;
     defer back.deinit();
     @expect_eq(back.samples16()[(1 * 3 + 1) * 4], 0x4040);
-    let mut f = img.convert(3, F32)!;
+    let mut f = img.convert(3, Depth.F32)!;
     defer f.deinit();
     let c = f.get(1, 1);
     @expect(@abs(c.r - color.linear8(0x40)) < 1.0e-6);
-    let mut again = f.convert(4, U8)!;
+    let mut again = f.convert(4, Depth.U8)!;
     defer again.deinit();
     @expect_eq(again.get(1, 1).to_rgba8().to_u32(), 0x408060ff);
     let mut cr = img.crop(1, 1, 5, 5)!;
@@ -533,7 +535,7 @@ test "pixels and conversion" {
 }
 
 test "resize" {
-    let mut img = Image.init(4, 4, 3, U8)!;
+    let mut img = Image.init(4, 4, 3, Depth.U8)!;
     defer img.deinit();
     img.fill(color.Color.rgb(1.0, 0.0, 0.0));
     let mut small = img.resize(2, 2)!;
@@ -543,7 +545,7 @@ test "resize" {
     defer big.deinit();
     @expect_eq(big.get(8, 6).to_rgba8().to_u32(), 0xff0000ff);
     // black and white columns average to linear 0.5, not encoded 0.5
-    let mut bw = Image.init(2, 1, 1, U8)!;
+    let mut bw = Image.init(2, 1, 1, Depth.U8)!;
     defer bw.deinit();
     bw.data[1] = 255;
     let mut one = bw.resize(1, 1)!;

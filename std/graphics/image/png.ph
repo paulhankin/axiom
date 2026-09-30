@@ -156,9 +156,9 @@ pub fn decode(data: []u8) !image.Image {
     if has_trns and ((hdr.color_type == 0) or (hdr.color_type == 2) or (hdr.color_type == 3)) {
         channels += 1;
     }
-    let mut depth = image.U8;
+    let mut depth = image.Depth.U8;
     if hdr.depth == 16 {
-        depth = image.U16;
+        depth = image.Depth.U16;
     }
     let mut img = image.Image.init(hdr.width, hdr.height, channels, depth)!;
     let mut at: usize = 0;
@@ -415,8 +415,8 @@ fn expand_row(e: *Expand, row: []u8, w: usize, img: *mut image.Image, x0: usize,
 
 /// Encodes an image as PNG (free the result with mem.free).
 pub fn encode(img: *image.Image, level: u32) ![]mut u8 {
-    if img.depth == image.F32 {
-        let mut c = img.convert(img.channels, image.U16)!;
+    if img.depth == image.Depth.F32 {
+        let mut c = img.convert(img.channels, image.Depth.U16)!;
         defer c.deinit();
         return encode(&c, level);
     }
@@ -563,8 +563,9 @@ fn filter_row(f: u8, cur: []u8, prev: []u8, out: []mut u8, bpp: usize) u64 {
 
 test "round trips" {
     let kinds: [4]usize = [1, 2, 3, 4];
+    let depths: [2]image.Depth = [image.Depth.U8, image.Depth.U16];
     for ch in kinds {
-        for d in @as(u8, 1)..3 {
+        for d in depths {
             let mut img = image.Image.init(37, 21, ch, d)!;
             defer img.deinit();
             for y in @as(usize, 0)..21 {
@@ -579,14 +580,14 @@ test "round trips" {
             let mut back = decode(enc)!;
             defer back.deinit();
             @expect_eq(back.channels, ch);
-            @expect_eq(back.depth, d);
+            @expect(back.depth == d);
             @expect_eq(back.data[..], img.data[..]);
         }
     }
 }
 
 test "rejects" {
-    let mut img = image.Image.init(4, 4, 3, image.U8)!;
+    let mut img = image.Image.init(4, 4, 3, image.Depth.U8)!;
     defer img.deinit();
     let enc = encode(&img, FAST)!;
     defer mem.free(enc);

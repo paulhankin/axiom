@@ -201,7 +201,7 @@ pub fn decode(data: []u8) !audio.Sound {
         }
     }
     let total = end - @min(skip, end);
-    let mut s = audio.Sound.init(total, nch, 48000, audio.F32) catch |e| {
+    let mut s = audio.Sound.init(total, nch, 48000, audio.SampleFormat.F32) catch |e| {
         if e == error.OutOfMemory {
             return error.OutOfMemory;
         }

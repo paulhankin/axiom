@@ -6,9 +6,9 @@
 //     defer s.deinit();
 //     formats.save("song.wav", &s)!;                   // from the extension
 //
-//     let f = formats.detect(bytes);                   // WAV, AIFF, ... or UNKNOWN
+//     let f = formats.detect(bytes);                   // Format.WAV, ... or Format.UNKNOWN
 //     let s2 = formats.decode(bytes)!;
-//     let out = formats.encode(&s, formats.FLAC)!;
+//     let out = formats.encode(&s, formats.Format.FLAC)!;
 //
 // Formats: WAV, AIFF and FLAC (read and write), Ogg Vorbis, Ogg Opus, MP3 and
 // AAC (ADTS and MP4; read).
@@ -30,113 +30,116 @@ import "wav.ph" as wav;
 
 error { Unsupported, InvalidAudio, OutOfMemory }
 
-pub const UNKNOWN: u8 = 0;
-pub const WAV: u8 = 1;
-pub const AIFF: u8 = 2;
-pub const FLAC: u8 = 3;
-pub const VORBIS: u8 = 4;
-pub const MP3: u8 = 5;
-pub const OPUS: u8 = 6;
-pub const AAC: u8 = 7;
-
-/// The format of encoded data, from its first bytes.
-pub fn detect(data: []u8) u8 {
-    if wav.is_wav(data) {
-        return WAV;
-    }
-    if aiff.is_aiff(data) {
-        return AIFF;
-    }
-    if flac.is_flac(data) {
-        return FLAC;
-    }
-    if vorbis.is_vorbis(data) {
-        return VORBIS;
-    }
-    if opus.is_opus(data) {
-        return OPUS;
-    }
-    if aac.is_aac(data) {
-        return AAC;
-    }
-    if mp3.is_mp3(data) {
-        return MP3;  // last: its test is the loosest
-    }
-    return UNKNOWN;
+/// A sound file format.
+pub enum Format: u8 {
+    UNKNOWN,
+    WAV,
+    AIFF,
+    FLAC,
+    VORBIS,
+    MP3,
+    OPUS,
+    AAC,
 }
 
-/// The format for a file name's extension (case-insensitive), or UNKNOWN.
-pub fn from_extension(path: []u8) u8 {
-    let dot = strs.last_index_of_byte(path, '.') catch return UNKNOWN;
+/// The format of encoded data, from its first bytes.
+pub fn detect(data: []u8) Format {
+    if wav.is_wav(data) {
+        return Format.WAV;
+    }
+    if aiff.is_aiff(data) {
+        return Format.AIFF;
+    }
+    if flac.is_flac(data) {
+        return Format.FLAC;
+    }
+    if vorbis.is_vorbis(data) {
+        return Format.VORBIS;
+    }
+    if opus.is_opus(data) {
+        return Format.OPUS;
+    }
+    if aac.is_aac(data) {
+        return Format.AAC;
+    }
+    if mp3.is_mp3(data) {
+        return Format.MP3;  // last: its test is the loosest
+    }
+    return Format.UNKNOWN;
+}
+
+/// The format for a file name's extension (case-insensitive), or Format.UNKNOWN.
+pub fn from_extension(path: []u8) Format {
+    let dot = strs.last_index_of_byte(path, '.') catch return Format.UNKNOWN;
     let ext = path[dot + 1..];
     let mut buf: [8]u8 = [0; 8];
     if ext.len > buf.len {
-        return UNKNOWN;
+        return Format.UNKNOWN;
     }
     for i in @as(usize, 0)..ext.len {
         buf[i] = strs.to_lower_byte(ext[i]);
     }
     let e = buf[..ext.len];
     if @mem_eq(e, "wav") or @mem_eq(e, "wave") {
-        return WAV;
+        return Format.WAV;
     }
     if @mem_eq(e, "aiff") or @mem_eq(e, "aif") or @mem_eq(e, "aifc") {
-        return AIFF;
+        return Format.AIFF;
     }
     if @mem_eq(e, "flac") {
-        return FLAC;
+        return Format.FLAC;
     }
     if @mem_eq(e, "ogg") or @mem_eq(e, "oga") {
-        return VORBIS;
+        return Format.VORBIS;
     }
     if @mem_eq(e, "mp3") {
-        return MP3;
+        return Format.MP3;
     }
     if @mem_eq(e, "opus") {
-        return OPUS;
+        return Format.OPUS;
     }
     if @mem_eq(e, "aac") or @mem_eq(e, "adts") or @mem_eq(e, "m4a") or @mem_eq(e, "m4b") or @mem_eq(e, "mp4") {
-        return AAC;
+        return Format.AAC;
     }
-    return UNKNOWN;
+    return Format.UNKNOWN;
 }
 
 /// Decodes a sound in any supported format.
 pub fn decode(data: []u8) !audio.Sound {
     let f = detect(data);
-    if f == WAV {
+    if f == Format.WAV {
         return wav.decode(data);
     }
-    if f == AIFF {
+    if f == Format.AIFF {
         return aiff.decode(data);
     }
-    if f == FLAC {
+    if f == Format.FLAC {
         return flac.decode(data);
     }
-    if f == VORBIS {
+    if f == Format.VORBIS {
         return vorbis.decode(data);
     }
-    if f == MP3 {
+    if f == Format.MP3 {
         return mp3.decode(data);
     }
-    if f == OPUS {
+    if f == Format.OPUS {
         return opus.decode(data);
     }
-    if f == AAC {
+    if f == Format.AAC {
         return aac.decode(data);
     }
     return error.Unsupported;
 }
 
 /// Encodes a sound (free the result with mem.free); WAV, AIFF or FLAC.
-pub fn encode(s: *audio.Sound, format: u8) ![]mut u8 {
-    if format == WAV {
+pub fn encode(s: *audio.Sound, format: Format) ![]mut u8 {
+    if format == Format.WAV {
         return wav.encode(s);
     }
-    if format == AIFF {
+    if format == Format.AIFF {
         return aiff.encode(s);
     }
-    if format == FLAC {
+    if format == Format.FLAC {
         return flac.encode(s, flac.DEFAULT);
     }
     return error.Unsupported;
@@ -155,7 +158,7 @@ pub fn load(path: []u8) !audio.Sound {
 /// writes the file.
 pub fn save(path: []u8, s: *audio.Sound) !void {
     let format = from_extension(path);
-    if format == UNKNOWN {
+    if format == Format.UNKNOWN {
         return error.Unsupported;
     }
     let data = encode(s, format)!;
@@ -166,24 +169,24 @@ pub fn save(path: []u8, s: *audio.Sound) !void {
 }
 
 test "every writable format" {
-    let mut s = audio.Sound.init(300, 2, 32000, audio.S16)!;
+    let mut s = audio.Sound.init(300, 2, 32000, audio.SampleFormat.S16)!;
     defer s.deinit();
     for i in @as(usize, 0)..s.len() {
         s.set_sample(i, @float_from_int(f64, (i * 37) % 200) / 100.0 - 1.0);
     }
-    let fmts: [3]u8 = [WAV, AIFF, FLAC];
+    let fmts: [3]Format = [Format.WAV, Format.AIFF, Format.FLAC];
     for f in fmts {
         let enc = encode(&s, f)!;
         defer mem.free(enc);
-        @expect_eq(detect(enc), f);
+        @expect(detect(enc) == f);
         let mut back = decode(enc)!;
         defer back.deinit();
         @expect_eq(back.data[..], s.data[..]);
     }
-    @expect_eq(from_extension("a/b.Flac"), FLAC);
-    @expect_eq(from_extension("x.ogg"), VORBIS);
-    @expect_eq(from_extension("x.MP3"), MP3);
-    @expect_eq(from_extension("x.opus"), OPUS);
-    @expect_eq(from_extension("x.m4a"), AAC);
-    @expect_eq(from_extension("noext"), UNKNOWN);
+    @expect(from_extension("a/b.Flac") == Format.FLAC);
+    @expect(from_extension("x.ogg") == Format.VORBIS);
+    @expect(from_extension("x.MP3") == Format.MP3);
+    @expect(from_extension("x.opus") == Format.OPUS);
+    @expect(from_extension("x.m4a") == Format.AAC);
+    @expect(from_extension("noext") == Format.UNKNOWN);
 }

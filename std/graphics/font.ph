@@ -1777,7 +1777,7 @@ pub fn draw_layout(cv: *mut draw.Canvas, f: *Font, l: *Layout, size: f64, paint:
     for g in l.glyphs.items() {
         f.glyph_path(g.id, &mut p, g.x, g.y, s)!;
     }
-    cv.fill(&p, paint, draw.NONZERO)!;
+    cv.fill(&p, paint, draw.FillRule.NONZERO)!;
 }
 
 /// Draws one line of text with its baseline starting at (x, y).
@@ -1826,7 +1826,7 @@ test "truetype" {
     f.glyph_path(f.glyph_index(0xc1), &mut p, 0.0, 0.0, 1.0)!;
     @expect(p.verbs.len > 5);
     // a render: ink appears, and "Hi" is wider than "i"
-    let mut img = image.Image.init(80, 40, 1, image.U8)!;
+    let mut img = image.Image.init(80, 40, 1, image.Depth.U8)!;
     defer img.deinit();
     let mut cv = draw.Canvas.init(&mut img);
     defer cv.deinit();

@@ -5,9 +5,9 @@
 //     defer img.deinit();
 //     formats.save("photo.png", &img, formats.Options.default())!;  // from the extension
 //
-//     let f = formats.detect(bytes);                   // PNG, JPEG, ... or UNKNOWN
+//     let f = formats.detect(bytes);                   // Format.PNG, ... or Format.UNKNOWN
 //     let img2 = formats.decode(bytes)!;
-//     let out = formats.encode(&img, formats.PNG, formats.Options.default())!;
+//     let out = formats.encode(&img, formats.Format.PNG, formats.Options.default())!;
 //
 // Formats: PNG, JPEG, BMP, QOI, PNM (PBM, PGM, PPM, PAM, PFM), Radiance HDR,
 // OpenEXR, GIF, TIFF, WebP (lossless when writing) and AVIF (reading). HDR and EXR hold linear floating point
@@ -32,189 +32,192 @@ import "webp.ph" as webp;
 
 error { Unsupported, InvalidImage, OutOfMemory }
 
-pub const UNKNOWN: u8 = 0;
-pub const PNG: u8 = 1;
-pub const JPEG: u8 = 2;
-pub const BMP: u8 = 3;
-pub const QOI: u8 = 4;
-pub const PNM: u8 = 5;
-pub const HDR: u8 = 6;
-pub const EXR: u8 = 7;
-pub const GIF: u8 = 8;
-pub const TIFF: u8 = 9;
-pub const WEBP: u8 = 10;
-pub const AVIF: u8 = 11;
+/// An image file format.
+pub enum Format: u8 {
+    UNKNOWN,
+    PNG,
+    JPEG,
+    BMP,
+    QOI,
+    PNM,
+    HDR,
+    EXR,
+    GIF,
+    TIFF,
+    WEBP,
+    AVIF,
+}
 
 /// Settings for encoders (each uses the ones that apply to it).
 pub struct Options {
-    quality: u32,   // JPEG, 1-100
-    subsample: u8,  // JPEG chroma: jpeg.SUBSAMPLE_444, _422 or _420
-    level: u32,     // PNG compression, 0-9
+    quality: u32,               // JPEG, 1-100
+    subsample: jpeg.Subsample,  // JPEG chroma
+    level: u32,                 // PNG compression, 0-9
     exr: exr.Options,
     tiff: tiff.Options,
 
     pub fn default() Options {
-        return Options.{ quality: 90, subsample: jpeg.SUBSAMPLE_420, level: png.DEFAULT, exr: exr.Options.default(),
+        return Options.{ quality: 90, subsample: jpeg.Subsample.S420, level: png.DEFAULT, exr: exr.Options.default(),
                          tiff: tiff.Options.default() };
     }
 }
 
 /// The format of encoded data, from its first bytes.
-pub fn detect(data: []u8) u8 {
+pub fn detect(data: []u8) Format {
     if png.is_png(data) {
-        return PNG;
+        return Format.PNG;
     }
     if jpeg.is_jpeg(data) {
-        return JPEG;
+        return Format.JPEG;
     }
     if exr.is_exr(data) {
-        return EXR;
+        return Format.EXR;
     }
     if gif.is_gif(data) {
-        return GIF;
+        return Format.GIF;
     }
     if tiff.is_tiff(data) {
-        return TIFF;
+        return Format.TIFF;
     }
     if webp.is_webp(data) {
-        return WEBP;
+        return Format.WEBP;
     }
     if avif.is_avif(data) {
-        return AVIF;
+        return Format.AVIF;
     }
     if qoi.is_qoi(data) {
-        return QOI;
+        return Format.QOI;
     }
     if hdr.is_hdr(data) {
-        return HDR;
+        return Format.HDR;
     }
     if bmp.is_bmp(data) {
-        return BMP;
+        return Format.BMP;
     }
     if pnm.is_pnm(data) {
-        return PNM;
+        return Format.PNM;
     }
-    return UNKNOWN;
+    return Format.UNKNOWN;
 }
 
-/// The format for a file name's extension (case-insensitive), or UNKNOWN.
-pub fn from_extension(path: []u8) u8 {
-    let dot = strs.last_index_of_byte(path, '.') catch return UNKNOWN;
+/// The format for a file name's extension (case-insensitive), or Format.UNKNOWN.
+pub fn from_extension(path: []u8) Format {
+    let dot = strs.last_index_of_byte(path, '.') catch return Format.UNKNOWN;
     let ext = path[dot + 1..];
     let mut buf: [8]u8 = [0; 8];
     if ext.len > buf.len {
-        return UNKNOWN;
+        return Format.UNKNOWN;
     }
     for i in @as(usize, 0)..ext.len {
         buf[i] = strs.to_lower_byte(ext[i]);
     }
     let e = buf[..ext.len];
     if @mem_eq(e, "png") {
-        return PNG;
+        return Format.PNG;
     }
     if @mem_eq(e, "jpg") or @mem_eq(e, "jpeg") or @mem_eq(e, "jpe") or @mem_eq(e, "jfif") {
-        return JPEG;
+        return Format.JPEG;
     }
     if @mem_eq(e, "bmp") or @mem_eq(e, "dib") {
-        return BMP;
+        return Format.BMP;
     }
     if @mem_eq(e, "qoi") {
-        return QOI;
+        return Format.QOI;
     }
     if @mem_eq(e, "pbm") or @mem_eq(e, "pgm") or @mem_eq(e, "ppm") or @mem_eq(e, "pnm") or @mem_eq(e, "pam") or
        @mem_eq(e, "pfm") {
-        return PNM;
+        return Format.PNM;
     }
     if @mem_eq(e, "hdr") or @mem_eq(e, "pic") or @mem_eq(e, "rgbe") {
-        return HDR;
+        return Format.HDR;
     }
     if @mem_eq(e, "exr") {
-        return EXR;
+        return Format.EXR;
     }
     if @mem_eq(e, "gif") {
-        return GIF;
+        return Format.GIF;
     }
     if @mem_eq(e, "tif") or @mem_eq(e, "tiff") {
-        return TIFF;
+        return Format.TIFF;
     }
     if @mem_eq(e, "webp") {
-        return WEBP;
+        return Format.WEBP;
     }
     if @mem_eq(e, "avif") {
-        return AVIF;
+        return Format.AVIF;
     }
-    return UNKNOWN;
+    return Format.UNKNOWN;
 }
 
 /// Decodes an image in any supported format.
 pub fn decode(data: []u8) !image.Image {
     let f = detect(data);
-    if f == PNG {
+    if f == Format.PNG {
         return png.decode(data);
     }
-    if f == JPEG {
+    if f == Format.JPEG {
         return jpeg.decode(data);
     }
-    if f == BMP {
+    if f == Format.BMP {
         return bmp.decode(data);
     }
-    if f == QOI {
+    if f == Format.QOI {
         return qoi.decode(data);
     }
-    if f == PNM {
+    if f == Format.PNM {
         return pnm.decode(data);
     }
-    if f == HDR {
+    if f == Format.HDR {
         return hdr.decode(data);
     }
-    if f == EXR {
+    if f == Format.EXR {
         return exr.decode(data);
     }
-    if f == GIF {
+    if f == Format.GIF {
         return gif.decode(data);
     }
-    if f == TIFF {
+    if f == Format.TIFF {
         return tiff.decode(data);
     }
-    if f == WEBP {
+    if f == Format.WEBP {
         return webp.decode(data);
     }
-    if f == AVIF {
+    if f == Format.AVIF {
         return avif.decode(data);
     }
     return error.Unsupported;
 }
 
 /// Encodes an image (free the result with mem.free).
-pub fn encode(img: *image.Image, format: u8, opts: Options) ![]mut u8 {
-    if format == PNG {
+pub fn encode(img: *image.Image, format: Format, opts: Options) ![]mut u8 {
+    if format == Format.PNG {
         return png.encode(img, opts.level);
     }
-    if format == JPEG {
+    if format == Format.JPEG {
         return jpeg.encode(img, opts.quality, opts.subsample);
     }
-    if format == BMP {
+    if format == Format.BMP {
         return bmp.encode(img);
     }
-    if format == QOI {
+    if format == Format.QOI {
         return qoi.encode(img);
     }
-    if format == PNM {
+    if format == Format.PNM {
         return pnm.encode(img);
     }
-    if format == HDR {
+    if format == Format.HDR {
         return hdr.encode(img);
     }
-    if format == EXR {
+    if format == Format.EXR {
         return exr.encode(img, opts.exr);
     }
-    if format == GIF {
+    if format == Format.GIF {
         return gif.encode(img);
     }
-    if format == TIFF {
+    if format == Format.TIFF {
         return tiff.encode(img, opts.tiff);
     }
-    if format == WEBP {
+    if format == Format.WEBP {
         return webp.encode(img);
     }
     return error.Unsupported;
@@ -233,7 +236,7 @@ pub fn load(path: []u8) !image.Image {
 /// writes the file.
 pub fn save(path: []u8, img: *image.Image, opts: Options) !void {
     let format = from_extension(path);
-    if format == UNKNOWN {
+    if format == Format.UNKNOWN {
         return error.Unsupported;
     }
     let data = encode(img, format, opts)!;
@@ -244,31 +247,32 @@ pub fn save(path: []u8, img: *image.Image, opts: Options) !void {
 }
 
 test "every format" {
-    let mut img = image.Image.init(10, 6, 3, image.U8)!;
+    let mut img = image.Image.init(10, 6, 3, image.Depth.U8)!;
     defer img.deinit();
     let px = img.samples8();
     for i in @as(usize, 0)..px.len {
         px[i] = @truncate(u8, (i % 30) * 8);
     }
-    let formats: [10]u8 = [PNG, JPEG, BMP, QOI, PNM, HDR, EXR, GIF, TIFF, WEBP];
+    let formats: [10]Format = [Format.PNG, Format.JPEG, Format.BMP, Format.QOI, Format.PNM, Format.HDR, Format.EXR,
+                               Format.GIF, Format.TIFF, Format.WEBP];
     for f in formats {
         let enc = encode(&img, f, Options.default())!;
         defer mem.free(enc);
-        @expect_eq(detect(enc), f);
+        @expect(detect(enc) == f);
         let mut back = decode(enc)!;
         defer back.deinit();
         @expect_eq(back.width, 10);
         @expect_eq(back.height, 6);
-        if (f != JPEG) and (f != HDR) {
+        if (f != Format.JPEG) and (f != Format.HDR) {
             @expect_eq(back.get(3, 2).to_rgba8().to_u32(), img.get(3, 2).to_rgba8().to_u32());
         }
     }
-    @expect_eq(from_extension("a/b.JPG"), JPEG);
-    @expect_eq(from_extension("x.exr"), EXR);
-    @expect_eq(from_extension("noext"), UNKNOWN);
-    @expect_eq(from_extension("p.avif"), AVIF);
+    @expect(from_extension("a/b.JPG") == Format.JPEG);
+    @expect(from_extension("x.exr") == Format.EXR);
+    @expect(from_extension("noext") == Format.UNKNOWN);
+    @expect(from_extension("p.avif") == Format.AVIF);
     // AVIF is read only
-    let out = encode(&img, AVIF, Options.default()) catch |e| {
+    let out = encode(&img, Format.AVIF, Options.default()) catch |e| {
         @expect(e == error.Unsupported);
         return;
     };

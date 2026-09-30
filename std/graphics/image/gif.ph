@@ -123,12 +123,12 @@ fn decode_frames(b: []u8, first_only: bool) !Animation {
         i += n;
     }
     let mut anim = Animation.{ width: w, height: h, loops: -1, frames: vec.Vec.[Frame].init() };
-    let mut canvas = image.Image.init(w, h, 4, image.U8) catch |e| {
+    let mut canvas = image.Image.init(w, h, 4, image.Depth.U8) catch |e| {
         anim.deinit();
         return e;
     };
     defer canvas.deinit();
-    let mut saved = image.Image.init(w, h, 4, image.U8) catch |e| {
+    let mut saved = image.Image.init(w, h, 4, image.Depth.U8) catch |e| {
         anim.deinit();
         return e;
     };
@@ -478,7 +478,7 @@ fn encode_frames(frames: []*image.Image, delays: []u32, loops: i32) ![]mut u8 {
             out.deinit();
             return error.InvalidImage;
         }
-        let mut rgba = f.convert(4, image.U8) catch |e| {
+        let mut rgba = f.convert(4, image.Depth.U8) catch |e| {
             out.deinit();
             return e;
         };
@@ -810,9 +810,9 @@ fn same(a: *image.Image, b: *image.Image) bool {
     if (a.width != b.width) or (a.height != b.height) {
         return false;
     }
-    let mut x = a.convert(4, image.U8) catch return false;
+    let mut x = a.convert(4, image.Depth.U8) catch return false;
     defer x.deinit();
-    let mut y = b.convert(4, image.U8) catch return false;
+    let mut y = b.convert(4, image.Depth.U8) catch return false;
     defer y.deinit();
     // (fully transparent pixels match whatever their colour)
     for k in @as(usize, 0)..(a.width * a.height) {
@@ -863,7 +863,7 @@ test "files made by Pillow" {
 
 test "round trips" {
     // few colours: exact
-    let mut img = image.Image.init(37, 23, 4, image.U8)!;
+    let mut img = image.Image.init(37, 23, 4, image.Depth.U8)!;
     defer img.deinit();
     for y in @as(usize, 0)..23 {
         for x in @as(usize, 0)..37 {
@@ -883,7 +883,7 @@ test "round trips" {
     defer back.deinit();
     @expect(same(&img, &back));
     // many colours: close
-    let mut rich = image.Image.init(64, 64, 3, image.U8)!;
+    let mut rich = image.Image.init(64, 64, 3, image.Depth.U8)!;
     defer rich.deinit();
     for k in @as(usize, 0)..(64 * 64) {
         rich.data[3 * k] = @truncate(u8, k);

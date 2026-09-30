@@ -495,17 +495,17 @@ fn subframe(b: *mut Bits, block: usize, bps0: u32, out: []mut i64) !void {
 }
 
 /// The format samples of bps bits are held in.
-fn format_for(bps: u32) u8 {
+fn format_for(bps: u32) audio.SampleFormat {
     if bps <= 8 {
-        return audio.U8;
+        return audio.SampleFormat.U8;
     }
     if bps <= 16 {
-        return audio.S16;
+        return audio.SampleFormat.S16;
     }
     if bps <= 24 {
-        return audio.S24;
+        return audio.SampleFormat.S24;
     }
-    return audio.S32;
+    return audio.SampleFormat.S32;
 }
 
 /// The next frame's sync code at or after p (with a valid header), or
@@ -662,7 +662,7 @@ fn decode_frames(data: []u8, p0: usize, info: *Info, s: *mut audio.Sound) !void 
         }
         let sh = @as(u64, shift);
         let base = frames * nch;
-        if fmt == audio.U8 {
+        if fmt == audio.SampleFormat.U8 {
             let out = s.data;
             for c in @as(usize, 0)..nch {
                 let src = chans[c * MAX_BLOCK..(c * MAX_BLOCK) + block];
@@ -670,7 +670,7 @@ fn decode_frames(data: []u8, p0: usize, info: *Info, s: *mut audio.Sound) !void 
                     out[base + (i * nch) + c] = @truncate(u8, @bit_cast(u64, (src[i] << sh) + 128));
                 }
             }
-        } else if fmt == audio.S16 {
+        } else if fmt == audio.SampleFormat.S16 {
             let out = @cast_slice(i16, s.data[..s.frames * nch * 2]);
             for c in @as(usize, 0)..nch {
                 let src = chans[c * MAX_BLOCK..(c * MAX_BLOCK) + block];
@@ -1257,7 +1257,7 @@ fn utf8_number(o: *mut Out, v: u64) void {
 
 pub fn encode(s: *audio.Sound, level: u32) ![]mut u8 {
     if audio.is_float(s.format) {
-        let mut c = s.convert(audio.S24)!;
+        let mut c = s.convert(audio.SampleFormat.S24)!;
         defer c.deinit();
         return encode(&c, level);
     }
@@ -1349,11 +1349,11 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out) !void {
         let base = start * nch;
         for c in @as(usize, 0)..nch {
             let dst = chans[c * block..(c * block) + n];
-            if s.format == audio.U8 {
+            if s.format == audio.SampleFormat.U8 {
                 for i in @as(usize, 0)..n {
                     dst[i] = @as(i64, s.data[base + (i * nch) + c]) - 128;
                 }
-            } else if s.format == audio.S16 {
+            } else if s.format == audio.SampleFormat.S16 {
                 let src = s.samples_i16();
                 for i in @as(usize, 0)..n {
                     dst[i] = @as(i64, src[base + (i * nch) + c]);
@@ -1502,7 +1502,7 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn test_sound(frames: usize, channels: usize, format: u8, seed: u64) !audio.Sound {
+fn test_sound(frames: usize, channels: usize, format: audio.SampleFormat, seed: u64) !audio.Sound {
     let mut s = audio.Sound.init(frames, channels, 44100, format)!;
     let mut x = seed;
     for i in @as(usize, 0)..frames {
@@ -1518,7 +1518,8 @@ fn test_sound(frames: usize, channels: usize, format: u8, seed: u64) !audio.Soun
 }
 
 test "round trips" {
-    let fmts: [4]u8 = [audio.U8, audio.S16, audio.S24, audio.S32];
+    let fmts: [4]audio.SampleFormat = [audio.SampleFormat.U8, audio.SampleFormat.S16, audio.SampleFormat.S24,
+                                       audio.SampleFormat.S32];
     let chans: [3]usize = [1, 2, 5];
     let levels: [3]u32 = [FAST, DEFAULT, BEST];
     for f in fmts {
@@ -1531,7 +1532,7 @@ test "round trips" {
                 @expect(is_flac(enc));
                 let mut back = decode(enc)!;
                 defer back.deinit();
-                @expect_eq(back.format, f);
+                @expect(back.format == f);
                 @expect_eq(back.channels, ch);
                 @expect_eq(back.frames, s.frames);
                 @expect_eq(back.data[..], s.data[..]);
@@ -1541,7 +1542,7 @@ test "round trips" {
 }
 
 test "compresses" {
-    let mut s = audio.Sound.init(44100, 2, 44100, audio.S16)!;
+    let mut s = audio.Sound.init(44100, 2, 44100, audio.SampleFormat.S16)!;
     defer s.deinit();
     for i in @as(usize, 0)..44100 {
         let t = @float_from_int(f64, i) / 44100.0;
@@ -1552,19 +1553,19 @@ test "compresses" {
     defer mem.free(enc);
     @expect(enc.len < (s.data.len / 4));
     // silence and short sounds
-    let mut z = audio.Sound.init(10000, 1, 8000, audio.S16)!;
+    let mut z = audio.Sound.init(10000, 1, 8000, audio.SampleFormat.S16)!;
     defer z.deinit();
     let ez = encode(&z, DEFAULT)!;
     defer mem.free(ez);
     @expect(ez.len < 200);
-    let mut e = audio.Sound.init(0, 2, 8000, audio.S16)!;
+    let mut e = audio.Sound.init(0, 2, 8000, audio.SampleFormat.S16)!;
     defer e.deinit();
     let ee = encode(&e, DEFAULT)!;
     defer mem.free(ee);
     let mut eb = decode(ee)!;
     defer eb.deinit();
     @expect_eq(eb.frames, 0);
-    let mut one = audio.Sound.init(1, 1, 8000, audio.S16)!;
+    let mut one = audio.Sound.init(1, 1, 8000, audio.SampleFormat.S16)!;
     defer one.deinit();
     one.samples_i16()[0] = -5;
     let eo = encode(&one, DEFAULT)!;
@@ -1575,7 +1576,7 @@ test "compresses" {
 }
 
 test "rejects corruption" {
-    let mut s = test_sound(3000, 1, audio.S16, 5)!;
+    let mut s = test_sound(3000, 1, audio.SampleFormat.S16, 5)!;
     defer s.deinit();
     let enc = encode(&s, DEFAULT)!;
     defer mem.free(enc);

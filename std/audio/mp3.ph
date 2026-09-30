@@ -4215,7 +4215,7 @@ pub fn decode(data: []u8) !audio.Sound {
     let chans = mem.alloc_zeroed.[Chan](2)!;
     defer mem.free(chans);
     let nch = first.channels;
-    let mut out = audio.Sound.init(0, nch, first.rate, audio.F32)!;
+    let mut out = audio.Sound.init(0, nch, first.rate, audio.SampleFormat.F32)!;
     decode_frames(d, p, &first, &t[0], chans, &mut out) catch |e| {
         out.deinit();
         return e;

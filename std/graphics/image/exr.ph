@@ -22,23 +22,29 @@ import "../image.ph" as image;
 
 error { InvalidImage, Unsupported, OutOfMemory }
 
-pub const NONE: u8 = 0;
-pub const RLE: u8 = 1;
-pub const ZIPS: u8 = 2;
-pub const ZIP: u8 = 3;
-pub const PIZ: u8 = 4;
-pub const PXR24: u8 = 5;
+/// A compression method (its value as stored in the file).
+pub enum Compression: u8 {
+    NONE,
+    RLE,
+    ZIPS,
+    ZIP,
+    PIZ,
+    PXR24,
+}
 
-pub const UINT: u8 = 0;
-pub const HALF: u8 = 1;
-pub const FLOAT: u8 = 2;
+/// The type of a channel's samples (its value as stored in the file).
+pub enum PixelType: u8 {
+    UINT,
+    HALF,
+    FLOAT,
+}
 
 pub struct Options {
-    compression: u8,  // NONE, RLE, ZIPS or ZIP
-    pixel_type: u8,   // HALF or FLOAT
+    compression: Compression,  // NONE, RLE, ZIPS or ZIP
+    pixel_type: PixelType,     // HALF or FLOAT
 
     pub fn default() Options {
-        return Options.{ compression: ZIP, pixel_type: HALF };
+        return Options.{ compression: Compression.ZIP, pixel_type: PixelType.HALF };
     }
 }
 
@@ -54,8 +60,8 @@ fn le64(b: []u8, i: usize) u64 {
     return @as(u64, le32(b, i)) | (@as(u64, le32(b, i + 4)) << 32);
 }
 
-fn type_size(t: u8) usize {
-    if t == HALF {
+fn type_size(t: PixelType) usize {
+    if t == PixelType.HALF {
         return 2;
     }
     return 4;
@@ -63,14 +69,14 @@ fn type_size(t: u8) usize {
 
 struct Channel {
     name: []u8,
-    kind: u8,     // UINT, HALF, FLOAT
+    kind: PixelType,
     target: i32,  // output channel, or -1 if unused
 }
 
 struct Header {
     channels: [16]Channel,
     nch: usize,
-    compression: u8,
+    compression: Compression,
     xmin: i32,
     ymin: i32,
     width: usize,
@@ -82,11 +88,11 @@ struct Header {
 }
 
 /// Scanlines per block for each compression.
-fn block_lines(c: u8) usize {
-    if (c == ZIP) or (c == PXR24) {
+fn block_lines(c: Compression) usize {
+    if (c == Compression.ZIP) or (c == Compression.PXR24) {
         return 16;
     }
-    if c == PIZ {
+    if c == Compression.PIZ {
         return 32;
     }
     return 1;
@@ -105,9 +111,9 @@ fn cstr(data: []u8, pos: *mut usize) ![]u8 {
 
 fn parse_header(data: []u8, pos: *mut usize) !Header {
     let mut h = Header.{
-        channels: [Channel.{ name: "", kind: 0, target: -1 }; 16],
+        channels: [Channel.{ name: "", kind: PixelType.HALF, target: -1 }; 16],
         nch: 0,
-        compression: 255,
+        compression: Compression.NONE,
         xmin: 0,
         ymin: 0,
         width: 0,
@@ -118,6 +124,7 @@ fn parse_header(data: []u8, pos: *mut usize) !Header {
         decreasing: false,
     };
     let mut have_window = false;
+    let mut compression: u32 = 256;  // none seen
     loop {
         let name = cstr(data, pos)!;
         if name.len == 0 {
@@ -148,17 +155,17 @@ fn parse_header(data: []u8, pos: *mut usize) !Header {
                 let xs = le32(v, p + 8);
                 let ys = le32(v, p + 12);
                 p += 16;
-                if kind > 2 {
+                if kind > @as(u32, @int_from_enum(PixelType.FLOAT)) {
                     return error.InvalidImage;
                 }
                 if (xs != 1) or (ys != 1) {
                     return error.Unsupported;
                 }
-                h.channels[h.nch] = Channel.{ name: cn, kind: @truncate(u8, kind), target: -1 };
+                h.channels[h.nch] = Channel.{ name: cn, kind: @enum_from_int(PixelType, kind), target: -1 };
                 h.nch += 1;
             }
         } else if @mem_eq(name, "compression") and (size == 1) {
-            h.compression = v[0];
+            compression = @as(u32, v[0]);
         } else if @mem_eq(name, "dataWindow") and (size == 16) {
             let xmin = @bit_cast(i32, le32(v, 0));
             let ymin = @bit_cast(i32, le32(v, 4));
@@ -187,16 +194,17 @@ fn parse_header(data: []u8, pos: *mut usize) !Header {
             return error.Unsupported;  // deep data
         }
     }
-    if not have_window or (h.nch == 0) or (h.compression == 255) {
+    if not have_window or (h.nch == 0) or (compression == 256) {
         return error.InvalidImage;
     }
     let px = @mul_checked(h.width, h.height) catch return error.InvalidImage;
     if px > image.MAX_PIXELS {
         return error.InvalidImage;
     }
-    if h.compression > PXR24 {
+    if compression > @as(u32, @int_from_enum(Compression.PXR24)) {
         return error.Unsupported;  // B44, B44A, DWAA, DWAB
     }
+    h.compression = @enum_from_int(Compression, compression);
     return h;
 }
 
@@ -252,7 +260,7 @@ pub fn decode(data: []u8) !image.Image {
     if (raw / 2048) > data.len {
         return error.InvalidImage;
     }
-    let mut img = image.Image.init(h.width, h.height, chans, image.F32)!;
+    let mut img = image.Image.init(h.width, h.height, chans, image.Depth.F32)!;
     // gray from R alone etc.: channels not present stay 0; alpha defaults to 1
     if (chans == 4) or (chans == 2) {
         let px = img.samples32();
@@ -314,7 +322,7 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
     let seen = mem.alloc_zeroed.[u8](nblocks)!;
     defer mem.free(seen);
     let tiles_x = (h.width + h.tile_w - 1) / @max(h.tile_w, 1);
-    let mut piz = PizScratch.init(h.compression == PIZ)!;
+    let mut piz = PizScratch.init(h.compression == Compression.PIZ)!;
     defer piz.deinit();
     for bi in @as(usize, 0)..nblocks {
         let off = le64(data, start + (bi * 8));
@@ -378,16 +386,16 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
         let packed = data[p..p + size];
         let n = (bw * bh) * bpp;
         let out = raw[..n];
-        if (h.compression == NONE) or ((size == n) and (h.compression != PIZ)) {
+        if (h.compression == Compression.NONE) or ((size == n) and (h.compression != Compression.PIZ)) {
             // stored raw (also when compression would not have helped)
             if size != n {
                 return error.InvalidImage;
             }
             @mem_copy(out, packed);
-        } else if h.compression == RLE {
+        } else if h.compression == Compression.RLE {
             rle_decode(packed, out)!;
             unpredict(out)!;
-        } else if (h.compression == ZIPS) or (h.compression == ZIP) {
+        } else if (h.compression == Compression.ZIPS) or (h.compression == Compression.ZIP) {
             let z = deflate.decompress(packed, deflate.ZLIB, n) catch return error.InvalidImage;
             defer mem.free(z);
             if z.len != n {
@@ -395,9 +403,9 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
             }
             @mem_copy(out, z);
             unpredict(out)!;
-        } else if h.compression == PXR24 {
+        } else if h.compression == Compression.PXR24 {
             pxr24_decode(packed, out, h, bw, bh)!;
-        } else if h.compression == PIZ {
+        } else if h.compression == Compression.PIZ {
             if size == n {
                 @mem_copy(out, packed);
             } else {
@@ -466,9 +474,9 @@ fn pxr24_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !voi
         for c in @as(usize, 0)..h.nch {
             let kind = h.channels[c].kind;
             let mut planes: usize = 3;
-            if kind == HALF {
+            if kind == PixelType.HALF {
                 planes = 2;
-            } else if kind == UINT {
+            } else if kind == PixelType.UINT {
                 planes = 4;
             }
             if (t + (planes * bw)) > z.len {
@@ -477,18 +485,18 @@ fn pxr24_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !voi
             let mut pixel: u32 = 0;
             for j in @as(usize, 0)..bw {
                 let mut diff: u32 = 0;
-                if kind == UINT {
+                if kind == PixelType.UINT {
                     diff = (
                         ((@as(u32, z[t + j]) << 24) | (@as(u32, z[t + bw + j]) << 16)) | (
                             @as(u32, z[t + (2 * bw) + j]) << 8)) | @as(u32, z[t + (3 * bw) + j]);
-                } else if kind == HALF {
+                } else if kind == PixelType.HALF {
                     diff = (@as(u32, z[t + j]) << 8) | @as(u32, z[t + bw + j]);
                 } else {
                     diff = ((@as(u32, z[t + j]) << 24) | (@as(u32, z[t + bw + j]) << 16)) | (
                         @as(u32, z[t + (2 * bw) + j]) << 8);
                 }
                 pixel = pixel +% diff;
-                if kind == HALF {
+                if kind == PixelType.HALF {
                     out[o] = @truncate(u8, pixel);
                     out[o + 1] = @truncate(u8, pixel >> 8);
                     o += 2;
@@ -519,9 +527,9 @@ fn store(raw: []u8, h: *Header, img: *mut image.Image, x0: usize, y0: usize, bw:
                 for x in @as(usize, 0)..bw {
                     let at = o + (x * sz);
                     let mut v: f32 = 0.0;
-                    if kind == HALF {
+                    if kind == PixelType.HALF {
                         v = image.half_to_f32(@truncate(u16, @as(u32, raw[at]) | (@as(u32, raw[at + 1]) << 8)));
-                    } else if kind == FLOAT {
+                    } else if kind == PixelType.FLOAT {
                         v = @bit_cast(f32, le32(raw, at));
                     } else {
                         v = @float_from_int(f32, le32(raw, at));
@@ -1008,8 +1016,8 @@ fn attr(o: *mut strs.String, name: []u8, ty: []u8, value: []u8) !void {
 }
 
 pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
-    if img.depth != image.F32 {
-        let mut c = img.convert(img.channels, image.F32)!;
+    if img.depth != image.Depth.F32 {
+        let mut c = img.convert(img.channels, image.Depth.F32)!;
         defer c.deinit();
         return encode(&c, opts);
     }
@@ -1027,7 +1035,8 @@ fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
     if (w == 0) or (h == 0) or (w > 0x7fffffff) or (h > 0x7fffffff) {
         return error.Unsupported;
     }
-    if (opts.compression > ZIP) or ((opts.pixel_type != HALF) and (opts.pixel_type != FLOAT)) {
+    if (opts.compression == Compression.PIZ) or (opts.compression == Compression.PXR24) or
+       (opts.pixel_type == PixelType.UINT) {
         return error.Unsupported;
     }
     // channels, in name order, and where each comes from in the image
@@ -1057,14 +1066,14 @@ fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
     for c in @as(usize, 0)..nch {
         chl.push_str(names[c])!;
         chl.push(0)!;
-        put32(&mut chl, @as(u32, opts.pixel_type))!;
+        put32(&mut chl, @as(u32, @int_from_enum(opts.pixel_type)))!;
         put32(&mut chl, 0)!;  // pLinear and reserved
         put32(&mut chl, 1)!;  // x sampling
         put32(&mut chl, 1)!;  // y sampling
     }
     chl.push(0)!;
     attr(o, "channels", "chlist", chl.bytes())!;
-    let comp: [1]u8 = [opts.compression];
+    let comp: [1]u8 = [@int_from_enum(opts.compression)];
     attr(o, "compression", "compression", comp[..])!;
     let mut win: [16]u8 = [0; 16];
     let xm = @truncate(u32, w - 1);
@@ -1120,7 +1129,7 @@ fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
             o.buf[table_at + (b * 8) + k] = @truncate(u8, off >> @truncate(u32, 8 * k));
         }
         put32(o, @truncate(u32, y0))!;
-        if opts.compression == NONE {
+        if opts.compression == Compression.NONE {
             put32(o, @truncate(u32, block.len))!;
             o.push_str(block)!;
             continue;
@@ -1129,7 +1138,7 @@ fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
         defer mem.free(pre);
         predict(pre);
         let mut packed: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
-        if opts.compression == RLE {
+        if opts.compression == Compression.RLE {
             packed = rle_encode(pre)!;
         } else {
             packed = deflate.compress(pre, deflate.ZLIB, 6)!;
@@ -1207,13 +1216,13 @@ fn rle_encode(src: []u8) ![]mut u8 {
 // -----------------------------------------------------------------------------
 
 test "round trips" {
-    let comps: [4]u8 = [NONE, RLE, ZIPS, ZIP];
-    let types: [2]u8 = [HALF, FLOAT];
+    let comps: [4]Compression = [Compression.NONE, Compression.RLE, Compression.ZIPS, Compression.ZIP];
+    let types: [2]PixelType = [PixelType.HALF, PixelType.FLOAT];
     let chans: [4]usize = [1, 2, 3, 4];
     for comp in comps {
         for t in types {
             for ch in chans {
-                let mut img = image.Image.init(19, 23, ch, image.F32)!;
+                let mut img = image.Image.init(19, 23, ch, image.Depth.F32)!;
                 defer img.deinit();
                 let px = img.samples32();
                 for i in @as(usize, 0)..px.len {

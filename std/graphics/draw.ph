@@ -1,7 +1,7 @@
 // =============================================================================
 // std/graphics/draw.ph - 2D vector drawing with anti-aliasing, onto a std/graphics/image Image.
 //
-//     let mut img = image.Image.init(400, 300, 4, image.U8)!;
+//     let mut img = image.Image.init(400, 300, 4, image.Depth.U8)!;
 //     let mut cv = draw.Canvas.init(&mut img);
 //     defer cv.deinit();
 //     cv.clear(color.Color.rgb(1.0, 1.0, 1.0));
@@ -12,7 +12,7 @@
 //     cv.stroke(&p, draw.Paint.solid(red), draw.Stroke.width(4.0))!;
 //     p.clear();
 //     p.circle(200.0, 180.0, 80.0)!;
-//     cv.fill(&p, draw.Paint.linear(0.0, 100.0, 0.0, 260.0, stops[..]), draw.NONZERO)!;
+//     cv.fill(&p, draw.Paint.linear(0.0, 100.0, 0.0, 260.0, stops[..]), draw.FillRule.NONZERO)!;
 //
 // Paths are lines, quadratic and cubic Béziers and arcs, in user space; the
 // canvas transform (translate, scale, rotate, or any affine matrix) maps
@@ -119,17 +119,19 @@ pub struct Affine {
 // Paths
 // -----------------------------------------------------------------------------
 
-// A Path's verbs, for code that walks `verbs` and `pts` (move and line
-// take one point, quad two, cubic three, close none).
-pub const V_MOVE: u8 = 0;
-pub const V_LINE: u8 = 1;
-pub const V_QUAD: u8 = 2;
-pub const V_CUBIC: u8 = 3;
-pub const V_CLOSE: u8 = 4;
+/// A Path's verbs, for code that walks `verbs` and `pts` (move and line
+/// take one point, quad two, cubic three, close none).
+pub enum Verb: u8 {
+    MOVE,
+    LINE,
+    QUAD,
+    CUBIC,
+    CLOSE,
+}
 
 /// A sequence of subpaths, each starting with move_to.
 pub struct Path {
-    verbs: vec.Vec.[u8],
+    verbs: vec.Vec.[Verb],
     pts: vec.Vec.[f64],  // x, y pairs
     start_x: f64,        // the current subpath's first point
     start_y: f64,
@@ -138,8 +140,10 @@ pub struct Path {
     open: bool,  // a subpath has begun
 
     pub fn init() Path {
+        // (a local: the bootstrap compiler mistypes Vec.[an enum].init() in a struct literal)
+        let verbs = vec.Vec.[Verb].init();
         return Path.{
-            verbs: vec.Vec.[u8].init(),
+            verbs: verbs,
             pts: vec.Vec.[f64].init(),
             start_x: 0.0,
             start_y: 0.0,
@@ -176,7 +180,7 @@ pub struct Path {
     }
 
     pub fn move_to(self: *mut Path, x: f64, y: f64) !void {
-        self.verbs.push(V_MOVE)!;
+        self.verbs.push(Verb.MOVE)!;
         self.pt(x, y)!;
         self.start_x = x;
         self.start_y = y;
@@ -187,14 +191,14 @@ pub struct Path {
         if not self.open {
             return self.move_to(x, y);
         }
-        self.verbs.push(V_LINE)!;
+        self.verbs.push(Verb.LINE)!;
         self.pt(x, y)!;
     }
 
     /// A quadratic Bézier with control point (cx, cy).
     pub fn quad_to(self: *mut Path, cx: f64, cy: f64, x: f64, y: f64) !void {
         self.ensure(cx, cy)!;
-        self.verbs.push(V_QUAD)!;
+        self.verbs.push(Verb.QUAD)!;
         self.pt(cx, cy)!;
         self.pt(x, y)!;
     }
@@ -202,7 +206,7 @@ pub struct Path {
     /// A cubic Bézier with control points (c1x, c1y) and (c2x, c2y).
     pub fn cubic_to(self: *mut Path, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) !void {
         self.ensure(c1x, c1y)!;
-        self.verbs.push(V_CUBIC)!;
+        self.verbs.push(Verb.CUBIC)!;
         self.pt(c1x, c1y)!;
         self.pt(c2x, c2y)!;
         self.pt(x, y)!;
@@ -213,7 +217,7 @@ pub struct Path {
         if not self.open {
             return;
         }
-        self.verbs.push(V_CLOSE)!;
+        self.verbs.push(Verb.CLOSE)!;
         self.cur_x = self.start_x;
         self.cur_y = self.start_y;
         self.open = false;
@@ -392,20 +396,20 @@ fn flatten(p: *Path, t: Affine, tol: f64, out: *mut Poly) !void {
     let mut cx: f64 = 0.0;
     let mut cy: f64 = 0.0;
     for v in verbs {
-        if v == V_MOVE {
+        if v == Verb.MOVE {
             let q = t.apply(pts[k], pts[k + 1]);
             k += 2;
             out.begin()!;
             out.add(q.x, q.y)!;
             cx = q.x;
             cy = q.y;
-        } else if v == V_LINE {
+        } else if v == Verb.LINE {
             let q = t.apply(pts[k], pts[k + 1]);
             k += 2;
             out.add(q.x, q.y)!;
             cx = q.x;
             cy = q.y;
-        } else if v == V_QUAD {
+        } else if v == Verb.QUAD {
             let c = t.apply(pts[k], pts[k + 1]);
             let e = t.apply(pts[k + 2], pts[k + 3]);
             k += 4;
@@ -420,7 +424,7 @@ fn flatten(p: *Path, t: Affine, tol: f64, out: *mut Poly) !void {
             }
             cx = e.x;
             cy = e.y;
-        } else if v == V_CUBIC {
+        } else if v == Verb.CUBIC {
             let c1 = t.apply(pts[k], pts[k + 1]);
             let c2 = t.apply(pts[k + 2], pts[k + 3]);
             let e = t.apply(pts[k + 4], pts[k + 5]);
@@ -469,8 +473,11 @@ fn segments(x: f64) usize {
 // stroke) combine by their true winding, not by adding up.
 // -----------------------------------------------------------------------------
 
-pub const NONZERO: u8 = 0;
-pub const EVEN_ODD: u8 = 1;
+/// Which points a fill covers: those with a nonzero winding number, or an odd one.
+pub enum FillRule: u8 {
+    NONZERO,
+    EVEN_ODD,
+}
 
 const BAND: usize = 16;  // rows prepared at a time
 const SUB: usize = 16;   // sample lines per row
@@ -552,7 +559,7 @@ fn add_span(cov: []mut f32, run: []mut f32, n: usize, xa0: f64, xb0: f64, w: f32
 /// Calls visit(ctx, x, y, cov) for each row of the polygons' coverage:
 /// cov[i] is the coverage of pixel (x + i, y).
 fn rasterize[C](
-    p: *Poly, w: usize, h: usize, rule: u8, ctx: *mut C, visit: fn(*mut C, usize, usize, []f32) void) !void {
+    p: *Poly, w: usize, h: usize, rule: FillRule, ctx: *mut C, visit: fn(*mut C, usize, usize, []f32) void) !void {
     let b = bounds_of(p, w, h);
     if (b.x1 <= b.x0) or (b.y1 <= b.y0) {
         return;
@@ -686,9 +693,11 @@ fn rasterize[C](
                     if c[i].x >= FAR {
                         break;
                     }
-                    let was = (rule == EVEN_ODD and ((wind & 1) != 0)) or ((rule != EVEN_ODD) and (wind != 0));
+                    let was = (rule == FillRule.EVEN_ODD and ((wind & 1) != 0)) or
+                              ((rule != FillRule.EVEN_ODD) and (wind != 0));
                     wind += c[i].dir;
-                    let now = (rule == EVEN_ODD and ((wind & 1) != 0)) or ((rule != EVEN_ODD) and (wind != 0));
+                    let now = (rule == FillRule.EVEN_ODD and ((wind & 1) != 0)) or
+                              ((rule != FillRule.EVEN_ODD) and (wind != 0));
                     if now and not was {
                         start = c[i].x;
                     } else if was and not now and (c[i].x > start) {
@@ -724,18 +733,24 @@ fn rasterize[C](
 // Strokes
 // -----------------------------------------------------------------------------
 
-pub const JOIN_MITER: u8 = 0;
-pub const JOIN_ROUND: u8 = 1;
-pub const JOIN_BEVEL: u8 = 2;
+/// How a stroke's segments meet.
+pub enum Join: u8 {
+    MITER,
+    ROUND,
+    BEVEL,
+}
 
-pub const CAP_BUTT: u8 = 0;
-pub const CAP_ROUND: u8 = 1;
-pub const CAP_SQUARE: u8 = 2;
+/// How a stroke's open ends are drawn.
+pub enum Cap: u8 {
+    BUTT,
+    ROUND,
+    SQUARE,
+}
 
 pub struct Stroke {
     width: f64,
-    join: u8,
-    cap: u8,
+    join: Join,
+    cap: Cap,
     miter_limit: f64,  // longest miter, in widths (as SVG's)
     dash: []f64,       // on, off, on, ... lengths (empty: solid)
     dash_offset: f64,
@@ -743,8 +758,8 @@ pub struct Stroke {
     pub fn width(w: f64) Stroke {
         return Stroke.{
             width: w,
-            join: JOIN_MITER,
-            cap: CAP_BUTT,
+            join: Join.MITER,
+            cap: Cap.BUTT,
             miter_limit: 4.0,
             dash: @slice_from_ptr(@ptr_from_int(*f64, 8), 0),
             dash_offset: 0.0,
@@ -809,9 +824,9 @@ struct Stroker {
         let hw = self.hw;
         if n == 1 {
             // a dot: only caps show
-            if self.style.cap == CAP_ROUND {
+            if self.style.cap == Cap.ROUND {
                 self.disc(xs[0], xs[1])!;
-            } else if self.style.cap == CAP_SQUARE {
+            } else if self.style.cap == Cap.SQUARE {
                 self.quad(xs[0] - hw, xs[1] - hw, xs[0] + hw, xs[1] - hw, xs[0] + hw, xs[1] + hw, xs[0] - hw,
                           xs[1] + hw)!;
             }
@@ -871,7 +886,7 @@ struct Stroker {
         if (@abs(cross) < 1.0e-9) and (dot > 0.0) {
             return;  // straight on
         }
-        if self.style.join == JOIN_ROUND {
+        if self.style.join == Join.ROUND {
             return self.disc(bx, by);
         }
         // the outer side: right of a left turn, left of a right one
@@ -883,7 +898,7 @@ struct Stroker {
         let n1y = (u1x * hw) * s;
         let n2x = (-u2y * hw) * s;
         let n2y = (u2x * hw) * s;
-        if self.style.join == JOIN_MITER {
+        if self.style.join == Join.MITER {
             let ratio = @sqrt(2.0 / @max(1.0 + dot, 1.0e-12));
             if ratio <= self.style.miter_limit {
                 // the miter tip: along the bisector of the normals
@@ -898,10 +913,10 @@ struct Stroker {
     /// The cap at end (ex, ey) of a segment coming from (ax, ay).
     fn cap(self: *mut Stroker, ax: f64, ay: f64, ex: f64, ey: f64) !void {
         let c = self.style.cap;
-        if c == CAP_ROUND {
+        if c == Cap.ROUND {
             return self.disc(ex, ey);
         }
-        if c == CAP_SQUARE {
+        if c == Cap.SQUARE {
             let hw = self.hw;
             let dx = ex - ax;
             let dy = ey - ay;
@@ -1028,14 +1043,20 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) !v
 // Paint
 // -----------------------------------------------------------------------------
 
-pub const PAINT_SOLID: u8 = 0;
-pub const PAINT_LINEAR: u8 = 1;
-pub const PAINT_RADIAL: u8 = 2;
-pub const PAINT_IMAGE: u8 = 3;
+/// What a Paint is.
+pub enum PaintKind: u8 {
+    SOLID,
+    LINEAR,
+    RADIAL,
+    IMAGE,
+}
 
-pub const SPREAD_PAD: u8 = 0;
-pub const SPREAD_REPEAT: u8 = 1;
-pub const SPREAD_REFLECT: u8 = 2;
+/// How a gradient continues beyond its ends.
+pub enum Spread: u8 {
+    PAD,
+    REPEAT,
+    REFLECT,
+}
 
 /// A gradient colour stop: where (0 to 1) and which colour.
 pub struct Stop {
@@ -1044,7 +1065,7 @@ pub struct Stop {
 }
 
 pub struct Paint {
-    kind: u8,
+    kind: PaintKind,
     color: color.Color,  // solid
     stops: []Stop,       // gradients, by increasing offset
     x0: f64,             // linear: from (x0, y0) to (x1, y1); radial: centre (x0, y0), radius r
@@ -1052,18 +1073,18 @@ pub struct Paint {
     x1: f64,
     y1: f64,
     r: f64,
-    spread: u8,
-    image: *image.Image,  // PAINT_IMAGE
+    spread: Spread,
+    image: *image.Image,  // PaintKind.IMAGE
     transform: Affine,    // paint space to user space
 
     pub fn solid(c: color.Color) Paint {
-        let mut p = base_paint(PAINT_SOLID);
+        let mut p = base_paint(PaintKind.SOLID);
         p.color = c;
         return p;
     }
 
     pub fn linear(x0: f64, y0: f64, x1: f64, y1: f64, stops: []Stop) Paint {
-        let mut p = base_paint(PAINT_LINEAR);
+        let mut p = base_paint(PaintKind.LINEAR);
         p.x0 = x0;
         p.y0 = y0;
         p.x1 = x1;
@@ -1073,7 +1094,7 @@ pub struct Paint {
     }
 
     pub fn radial(cx: f64, cy: f64, r: f64, stops: []Stop) Paint {
-        let mut p = base_paint(PAINT_RADIAL);
+        let mut p = base_paint(PaintKind.RADIAL);
         p.x0 = cx;
         p.y0 = cy;
         p.r = r;
@@ -1084,13 +1105,13 @@ pub struct Paint {
     /// An image, its pixel (0, 0) at user-space (0, 0) (then transform),
     /// filtered bilinearly, transparent outside.
     pub fn pattern(img: *image.Image, transform: Affine) Paint {
-        let mut p = base_paint(PAINT_IMAGE);
+        let mut p = base_paint(PaintKind.IMAGE);
         p.image = img;
         p.transform = transform;
         return p;
     }
 
-    pub fn with_spread(self: Paint, spread: u8) Paint {
+    pub fn with_spread(self: Paint, spread: Spread) Paint {
         let mut p = self;
         p.spread = spread;
         return p;
@@ -1103,7 +1124,7 @@ pub struct Paint {
     }
 }
 
-fn base_paint(kind: u8) Paint {
+fn base_paint(kind: PaintKind) Paint {
     return Paint.{
         kind: kind,
         color: color.Color.rgb(0.0, 0.0, 0.0),
@@ -1113,7 +1134,7 @@ fn base_paint(kind: u8) Paint {
         x1: 0.0,
         y1: 0.0,
         r: 0.0,
-        spread: SPREAD_PAD,
+        spread: Spread.PAD,
         image: @ptr_from_int(*image.Image, 8),
         transform: Affine.identity(),
     };
@@ -1146,7 +1167,7 @@ fn make_shader(p: *Paint, ctm: Affine, sh: *mut Shader) void {
     sh.paint = p;
     sh.inv = p.transform.then(ctm).invert();
     sh.solid = premul(p.color);
-    if (p.kind == PAINT_LINEAR) or (p.kind == PAINT_RADIAL) {
+    if (p.kind == PaintKind.LINEAR) or (p.kind == PaintKind.RADIAL) {
         for i in @as(usize, 0)..LUT_SIZE {
             let t = @float_from_int(f64, i) / @float_from_int(f64, LUT_SIZE - 1);
             sh.lut[i] = gradient_at(p.stops, t);
@@ -1182,11 +1203,11 @@ fn gradient_at(stops: []Stop, t: f64) Premul {
     return premul(stops[stops.len - 1].color);
 }
 
-fn spread_t(t: f64, spread: u8) f64 {
-    if spread == SPREAD_REPEAT {
+fn spread_t(t: f64, spread: Spread) f64 {
+    if spread == Spread.REPEAT {
         return t - @floor(t);
     }
-    if spread == SPREAD_REFLECT {
+    if spread == Spread.REFLECT {
         let m = @rem(@abs(t), 2.0);
         if m > 1.0 {
             return 2.0 - m;
@@ -1199,15 +1220,15 @@ fn spread_t(t: f64, spread: u8) f64 {
 /// The paint's colour at the centre of device pixel (x, y).
 fn shade(sh: *Shader, x: usize, y: usize) Premul {
     let p = sh.paint;
-    if p.kind == PAINT_SOLID {
+    if p.kind == PaintKind.SOLID {
         return sh.solid;
     }
     let q = sh.inv.apply(@float_from_int(f64, x) + 0.5, @float_from_int(f64, y) + 0.5);
-    if p.kind == PAINT_IMAGE {
+    if p.kind == PaintKind.IMAGE {
         return sample(p.image, q.x, q.y);
     }
     let mut t: f64 = 0.0;
-    if p.kind == PAINT_LINEAR {
+    if p.kind == PaintKind.LINEAR {
         let dx = p.x1 - p.x0;
         let dy = p.y1 - p.y0;
         let dd = (dx * dx) + (dy * dy);
@@ -1267,81 +1288,89 @@ fn sample(img: *image.Image, x: f64, y: f64) Premul {
 // Compositing
 // -----------------------------------------------------------------------------
 
-// Porter-Duff operators
-pub const CLEAR: u8 = 0;
-pub const SRC: u8 = 1;
-pub const OVER: u8 = 2;  // the default
-pub const DST_OVER: u8 = 3;
-pub const SRC_IN: u8 = 4;
-pub const DST_IN: u8 = 5;
-pub const SRC_OUT: u8 = 6;
-pub const DST_OUT: u8 = 7;
-pub const SRC_ATOP: u8 = 8;
-pub const DST_ATOP: u8 = 9;
-pub const XOR: u8 = 10;
-pub const PLUS: u8 = 11;
-// blend modes (source-over, mixing the colours)
-pub const MULTIPLY: u8 = 12;
-pub const SCREEN: u8 = 13;
-pub const OVERLAY: u8 = 14;
-pub const DARKEN: u8 = 15;
-pub const LIGHTEN: u8 = 16;
-pub const DIFFERENCE: u8 = 17;
+/// How colours combine: a Porter-Duff operator or a blend mode.
+pub enum Op: u8 {
+    // Porter-Duff operators
+    CLEAR,
+    SRC,
+    OVER,  // the default
+    DST_OVER,
+    SRC_IN,
+    DST_IN,
+    SRC_OUT,
+    DST_OUT,
+    SRC_ATOP,
+    DST_ATOP,
+    XOR,
+    PLUS,
+    // blend modes (source-over, mixing the colours)
+    MULTIPLY,
+    SCREEN,
+    OVERLAY,
+    DARKEN,
+    LIGHTEN,
+    DIFFERENCE,
 
-fn blend_channel(mode: u8, cb: f32, cs: f32) f32 {
-    if mode == MULTIPLY {
+    /// Whether this is a blend mode (MULTIPLY to DIFFERENCE).
+    pub fn is_blend(self: Op) bool {
+        return @int_from_enum(self) >= @int_from_enum(Op.MULTIPLY);
+    }
+}
+
+fn blend_channel(mode: Op, cb: f32, cs: f32) f32 {
+    if mode == Op.MULTIPLY {
         return cb * cs;
     }
-    if mode == SCREEN {
+    if mode == Op.SCREEN {
         return (cb + cs) - (cb * cs);
     }
-    if mode == OVERLAY {
+    if mode == Op.OVERLAY {
         if cb <= 0.5 {
             return (2.0 * cb) * cs;
         }
         let s2 = (2.0 * cs) - 1.0;
         return (cb + s2) - (cb * s2);
     }
-    if mode == DARKEN {
+    if mode == Op.DARKEN {
         return @min(cb, cs);
     }
-    if mode == LIGHTEN {
+    if mode == Op.LIGHTEN {
         return @max(cb, cs);
     }
     return @abs(cb - cs);
 }
 
 /// s composited onto d (both premultiplied) by the operator.
-fn composite(op: u8, s: Premul, d: Premul) Premul {
+fn composite(op: Op, s: Premul, d: Premul) Premul {
     let sa = s.a;
     let da = d.a;
     let mut fs: f32 = 0.0;  // how much of the source and destination remain
     let mut fd: f32 = 0.0;
-    if op == CLEAR {
+    if op == Op.CLEAR {
         return Premul.{ r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
-    } else if op == SRC {
+    } else if op == Op.SRC {
         fs = 1.0;
-    } else if (op == OVER) or (op >= MULTIPLY) {
+    } else if (op == Op.OVER) or op.is_blend() {
         fs = 1.0;
         fd = 1.0 - sa;
-    } else if op == DST_OVER {
+    } else if op == Op.DST_OVER {
         fs = 1.0 - da;
         fd = 1.0;
-    } else if op == SRC_IN {
+    } else if op == Op.SRC_IN {
         fs = da;
-    } else if op == DST_IN {
+    } else if op == Op.DST_IN {
         fd = sa;
-    } else if op == SRC_OUT {
+    } else if op == Op.SRC_OUT {
         fs = 1.0 - da;
-    } else if op == DST_OUT {
+    } else if op == Op.DST_OUT {
         fd = 1.0 - sa;
-    } else if op == SRC_ATOP {
+    } else if op == Op.SRC_ATOP {
         fs = da;
         fd = 1.0 - sa;
-    } else if op == DST_ATOP {
+    } else if op == Op.DST_ATOP {
         fs = 1.0 - da;
         fd = sa;
-    } else if op == XOR {
+    } else if op == Op.XOR {
         fs = 1.0 - da;
         fd = 1.0 - sa;
     } else {
@@ -1354,7 +1383,7 @@ fn composite(op: u8, s: Premul, d: Premul) Premul {
         b: (s.b * fs) + (d.b * fd),
         a: @min((sa * fs) + (da * fd), 1.0),
     };
-    if (op >= MULTIPLY) and (sa > 0.0) and (da > 0.0) {
+    if op.is_blend() and (sa > 0.0) and (da > 0.0) {
         // Cr = (1 - da) Cs + (1 - sa) Cb + sa da B(Cb, Cs), premultiplied
         let k = sa * da;
         r.r = ((s.r * (1.0 - da)) + (d.r * (1.0 - sa))) + (k * blend_channel(op, d.r / da, s.r / sa));
@@ -1383,7 +1412,7 @@ fn read_px(img: *image.Image, x: usize, y: usize) Premul {
     let ch = img.channels;
     let i = ((y * img.width) + x) * ch;
     let mut v: [4]f32 = [0.0, 0.0, 0.0, 1.0];
-    if img.depth == image.U8 {
+    if img.depth == image.Depth.U8 {
         let s = img.data;
         for c in @as(usize, 0)..ch {
             if (c == (ch - 1)) and ((ch == 2) or (ch == 4)) {
@@ -1392,7 +1421,7 @@ fn read_px(img: *image.Image, x: usize, y: usize) Premul {
                 v[c] = color.linear8(s[i + c]);
             }
         }
-    } else if img.depth == image.U16 {
+    } else if img.depth == image.Depth.U16 {
         let s = img.samples16();
         for c in @as(usize, 0)..ch {
             if (c == (ch - 1)) and ((ch == 2) or (ch == 4)) {
@@ -1436,7 +1465,7 @@ fn write_px(img: *mut image.Image, x: usize, y: usize, p: Premul) void {
 
 struct State {
     transform: Affine,
-    op: u8,
+    op: Op,
     alpha: f32,
     clip: []mut f32,  // a copy of the clip mask (empty: none)
 }
@@ -1444,7 +1473,7 @@ struct State {
 pub struct Canvas {
     img: *mut image.Image,
     transform: Affine,
-    op: u8,      // how colours combine: OVER, or another operator or blend mode
+    op: Op,      // how colours combine: OVER, or another operator or blend mode
     alpha: f32,  // global alpha
     antialias: bool,
     tolerance: f64,   // how far flattened curves may stray, in pixels
@@ -1458,7 +1487,7 @@ pub struct Canvas {
         return Canvas.{
             img: img,
             transform: Affine.identity(),
-            op: OVER,
+            op: Op.OVER,
             alpha: 1.0,
             antialias: true,
             tolerance: 0.05,
@@ -1533,7 +1562,7 @@ pub struct Canvas {
         self.img.fill(c);
     }
 
-    pub fn fill(self: *mut Canvas, path: *Path, paint: Paint, rule: u8) !void {
+    pub fn fill(self: *mut Canvas, path: *Path, paint: Paint, rule: FillRule) !void {
         self.poly.clear();
         flatten(path, self.transform, self.tolerance, &mut self.poly)!;
         self.paint_poly(paint, rule)!;
@@ -1576,7 +1605,7 @@ pub struct Canvas {
             }
         }
         orient_positive(&mut self.poly);
-        self.paint_poly(paint, NONZERO)!;
+        self.paint_poly(paint, FillRule.NONZERO)!;
     }
 
     /// Fills a rectangle.
@@ -1584,7 +1613,7 @@ pub struct Canvas {
         let mut p = Path.init();
         defer p.deinit();
         p.rect(x, y, w, h)!;
-        self.fill(&p, paint, NONZERO)!;
+        self.fill(&p, paint, FillRule.NONZERO)!;
     }
 
     /// Strokes a line from (x0, y0) to (x1, y1).
@@ -1606,7 +1635,7 @@ pub struct Canvas {
     }
 
     /// Intersects the clip with a path.
-    pub fn clip_to(self: *mut Canvas, path: *Path, rule: u8) !void {
+    pub fn clip_to(self: *mut Canvas, path: *Path, rule: FillRule) !void {
         let w = self.img.width;
         let h = self.img.height;
         let mask = mem.alloc_zeroed.[f32](w * h)!;
@@ -1637,7 +1666,7 @@ pub struct Canvas {
         self.clip = @slice_from_ptr(@ptr_from_int(*mut f32, 4), 0);
     }
 
-    fn paint_poly(self: *mut Canvas, paint: Paint, rule: u8) !void {
+    fn paint_poly(self: *mut Canvas, paint: Paint, rule: FillRule) !void {
         let sh = mem.create(Shader.{
             paint: &paint,
             inv: Affine.identity(),
@@ -1685,8 +1714,8 @@ fn fill_row(fc: *mut FillCtx, x0: usize, y: usize, cov: []f32) void {
     let has_clip = cv.clip.len > 0;
     // an opaque solid colour drawn over or in place of 8-bit pixels: a
     // fully covered pixel just takes its bytes (written once the slow way)
-    let fast = (fc.sh.paint.kind == PAINT_SOLID) and (fc.sh.solid.a >= 1.0) and ((cv.op == OVER) or (cv.op == SRC)) and
-               (img.depth == image.U8) and (cv.alpha >= 1.0);
+    let fast = (fc.sh.paint.kind == PaintKind.SOLID) and (fc.sh.solid.a >= 1.0) and
+               ((cv.op == Op.OVER) or (cv.op == Op.SRC)) and (img.depth == image.Depth.U8) and (cv.alpha >= 1.0);
     let ch = img.channels;
     let mut tpl: [4]u8 = [0; 4];
     let mut have_tpl = false;
@@ -1774,7 +1803,7 @@ fn coverage_sum(img: *image.Image) f64 {
 }
 
 test "exact coverage" {
-    let mut img = image.Image.init(40, 30, 4, image.F32)!;
+    let mut img = image.Image.init(40, 30, 4, image.Depth.F32)!;
     defer img.deinit();
     let mut cv = Canvas.init(&mut img);
     defer cv.deinit();
@@ -1790,22 +1819,22 @@ test "exact coverage" {
     let mut p = Path.init();
     defer p.deinit();
     p.circle(20.0, 15.0, 10.0)!;
-    cv.fill(&p, white, NONZERO)!;
+    cv.fill(&p, white, FillRule.NONZERO)!;
     @expect(@abs(coverage_sum(&img) - (math.PI * 100.0)) < 2.2);  // chords: 2/3 tolerance x circumference
     // even-odd: a ring
     p.circle(20.0, 15.0, 5.0)!;
     cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
-    cv.fill(&p, white, EVEN_ODD)!;
+    cv.fill(&p, white, FillRule.EVEN_ODD)!;
     @expect(@abs(coverage_sum(&img) - (math.PI * 75.0)) < 3.3);
     @expect_eq(img.get(20, 15).a, 0.0);
     // nonzero with the inner circle the same way round: a disc
     cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
-    cv.fill(&p, white, NONZERO)!;
+    cv.fill(&p, white, FillRule.NONZERO)!;
     @expect(@abs(coverage_sum(&img) - (math.PI * 100.0)) < 2.2);
 }
 
 test "strokes" {
-    let mut img = image.Image.init(60, 40, 4, image.F32)!;
+    let mut img = image.Image.init(60, 40, 4, image.Depth.F32)!;
     defer img.deinit();
     let mut cv = Canvas.init(&mut img);
     defer cv.deinit();
@@ -1816,7 +1845,7 @@ test "strokes" {
     // square caps add 2 at each end
     cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
     let mut st = Stroke.width(4.0);
-    st.cap = CAP_SQUARE;
+    st.cap = Cap.SQUARE;
     cv.line(10.0, 20.0, 40.0, 20.0, white, st)!;
     @expect(@abs(coverage_sum(&img) - 136.0) < 1.0e-3);
     // a closed square outline, miter joins: 20x20 outer ring of width 2
@@ -1838,7 +1867,7 @@ test "strokes" {
 }
 
 test "paint and compositing" {
-    let mut img = image.Image.init(20, 10, 3, image.U8)!;
+    let mut img = image.Image.init(20, 10, 3, image.Depth.U8)!;
     defer img.deinit();
     let mut cv = Canvas.init(&mut img);
     defer cv.deinit();
@@ -1856,16 +1885,16 @@ test "paint and compositing" {
     cv.fill_rect(0.0, 0.0, 20.0, 10.0, Paint.linear(0.0, 0.0, 20.0, 0.0, stops[..]))!;
     @expect(@abs(img.get(9, 0).r - 0.475) < 0.01);
     // multiply by grey 0.5 halves it
-    cv.op = MULTIPLY;
+    cv.op = Op.MULTIPLY;
     cv.fill_rect(0.0, 0.0, 20.0, 10.0, Paint.solid(color.Color.rgb(0.5, 0.5, 0.5)))!;
     @expect(@abs(img.get(19, 0).r - 0.4875) < 0.01);
     // a clip limits drawing
-    cv.op = OVER;
+    cv.op = Op.OVER;
     let mut p = Path.init();
     defer p.deinit();
     p.rect(0.0, 0.0, 5.0, 10.0)!;
     cv.save()!;
-    cv.clip_to(&p, NONZERO)!;
+    cv.clip_to(&p, FillRule.NONZERO)!;
     cv.fill_rect(0.0, 0.0, 20.0, 10.0, Paint.solid(color.Color.rgb(0.0, 1.0, 0.0)))!;
     cv.restore();
     @expect_eq(img.get(2, 2).to_rgba8().to_u32(), 0x00ff00ff);

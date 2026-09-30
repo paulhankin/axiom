@@ -49,9 +49,12 @@ import "shape/plan.ph" as plan;
 
 error { OutOfMemory, InvalidFeature }
 
-pub const DIR_AUTO: u8 = 0;
-pub const DIR_LTR: u8 = 1;
-pub const DIR_RTL: u8 = 2;
+/// The direction text is shaped in.
+pub enum Direction: u8 {
+    AUTO,  // the script's
+    LTR,
+    RTL,
+}
 
 /// Applies to all of the text.
 pub const ALL: u32 = 0xffffffff;
@@ -66,16 +69,16 @@ pub struct Feature {
 }
 
 pub struct Options {
-    script: u32,    // ISO 15924 code (tag("Arab")); 0: from the text
-    direction: u8,  // DIR_AUTO: the script's
-    language: u32,  // OpenType language system tag (tag("TRK ")); 0: the default
+    script: u32,           // ISO 15924 code (tag("Arab")); 0: from the text
+    direction: Direction,  // AUTO: the script's
+    language: u32,         // OpenType language system tag (tag("TRK ")); 0: the default
     features: []Feature,
 }
 
 pub fn options() Options {
     return Options.{
         script: 0,
-        direction: DIR_AUTO,
+        direction: Direction.AUTO,
         language: 0,
         features: @slice_from_ptr(@ptr_from_int(*Feature, 4), 0),
     };
@@ -1204,9 +1207,9 @@ fn run_props(text: []u8, opts: Options) [2]u32 {
         script = detect_script(text);
     }
     let mut rtl = plan.script_is_rtl(script);
-    if opts.direction == DIR_LTR {
+    if opts.direction == Direction.LTR {
         rtl = false;
-    } else if opts.direction == DIR_RTL {
+    } else if opts.direction == Direction.RTL {
         rtl = true;
     }
     let mut r: u32 = 0;
@@ -1384,7 +1387,7 @@ pub fn draw_text(cv: *mut draw.Canvas, f: *font.Font, text: []u8, x: f64, y: f64
         pen += @float_from_int(f64, g.x_advance) * scale;
         pen_y -= @float_from_int(f64, g.y_advance) * scale;
     }
-    cv.fill(&path, paint, draw.NONZERO)!;
+    cv.fill(&path, paint, draw.FillRule.NONZERO)!;
 }
 
 // -----------------------------------------------------------------------------
