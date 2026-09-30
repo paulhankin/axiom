@@ -153,7 +153,7 @@ pub fn decode(data: []u8) !image.Image {
     if has_alpha {
         chans = 4;
     }
-    let mut img = image.Image.init(w, h, chans, image.U8)!;
+    let mut img = image.Image.init(w, h, chans, image.Depth.U8)!;
     let out = img.samples8();
     if off > data.len {
         img.deinit();
@@ -307,8 +307,8 @@ fn put32(o: *mut strs.String, v: u32) !void {
 }
 
 pub fn encode(img: *image.Image) ![]mut u8 {
-    if img.depth != image.U8 {
-        let mut c = img.convert(img.channels, image.U8)!;
+    if img.depth != image.Depth.U8 {
+        let mut c = img.convert(img.channels, image.Depth.U8)!;
         defer c.deinit();
         return encode(&c);
     }
@@ -422,7 +422,7 @@ fn write_file(o: *mut strs.String, img: *image.Image, size: usize, off: usize, h
 test "round trips" {
     let kinds: [4]usize = [1, 2, 3, 4];
     for ch in kinds {
-        let mut img = image.Image.init(13, 7, ch, image.U8)!;
+        let mut img = image.Image.init(13, 7, ch, image.Depth.U8)!;
         defer img.deinit();
         let px = img.samples8();
         for i in @as(usize, 0)..px.len {

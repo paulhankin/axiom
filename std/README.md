@@ -135,11 +135,11 @@ that owns memory has `deinit`).
 | Module | Contents |
 |---|---|
 | [`graphics/color`](graphics/color.ph) | `Color` (linear-light RGB + alpha, HDR-capable), `Rgba8`/`Rgba16` (sRGB-encoded); sRGB encoding (exact 8-bit tables), HSV, HSL, CIE XYZ, L\*a\*b\*, LCh, Oklab, Oklch, YCbCr; Display P3 and Rec. 2020 gamuts; PQ and HLG transfer functions, tone mapping; CIE76 / CIEDE2000 differences, WCAG contrast; `mix`, `over`, premultiplied alpha; CSS-style parsing and hex formatting |
-| [`graphics/image`](graphics/image.ph) | `Image`: 1–4 channels of U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
-| [`graphics/draw`](graphics/draw.ph) | 2D vector drawing onto an `Image`: `Path` (lines, quadratic and cubic Béziers, arcs, rectangles, rounded rectangles, ellipses), `Canvas` with affine transforms, fills (nonzero, even-odd), strokes (width, miter/round/bevel joins, butt/round/square caps, dashes), paints (solid, linear and radial gradients, images), Porter-Duff operators and blend modes in linear light, global alpha, clipping, save/restore; exact anti-aliasing |
+| [`graphics/image`](graphics/image.ph) | `Image`: 1–4 channels of `Depth` U8, U16 (sRGB-encoded) or F32 (linear, HDR) samples; `get`/`set` as `color.Color`, `convert`, `crop`, `resize` (linear-light filtering), `flip_vertical`; half-float conversion |
+| [`graphics/draw`](graphics/draw.ph) | 2D vector drawing onto an `Image`: `Path` (lines, quadratic and cubic Béziers, arcs, rectangles, rounded rectangles, ellipses), `Canvas` with affine transforms, fills (`FillRule`: nonzero, even-odd), strokes (width, `Join`: miter/round/bevel, `Cap`: butt/round/square, dashes), paints (solid, linear and radial gradients with a `Spread`, images), `Op`: Porter-Duff operators and blend modes in linear light, global alpha, clipping, save/restore; exact anti-aliasing |
 | [`graphics/font`](graphics/font.ph) | TrueType and OpenType (CFF) fonts and collections: `Font` (cmap formats 0/4/6/12, advances, GPOS and `kern` kerning, simple, composite and Type 2 charstring outlines as `draw.Path`s), text `layout` with word wrapping, `measure`, `draw_text`, `draw_text_box` (one glyph per character: `shape` shapes); unhinted; HarfBuzz-compatible `glyph_extents` |
 | [`graphics/shape`](graphics/shape.ph) | OpenType text shaping, a port of HarfBuzz's: GSUB (all lookup types: ligatures, contextual and chained substitution, reverse chaining) and GPOS (kerning, mark-to-base/ligature/mark, cursive attachment) with the feature map, stages and mark filtering; normalization against the font's cmap; shapers for Arabic and Syriac (joining, stretching, presentation-form fallback), Hebrew, and Indic scripts (syllables, reph, pre-base matras and forms, from HarfBuzz's own tables); fallback mark positioning; `Shaper` caches plans. Matches HarfBuzz glyph for glyph on the test fonts (Latin, Arabic, Hebrew, nine Indic scripts, CFF and fonts without GPOS). Tables from [`tools/gen_shape_tables.py`](../tools/gen_shape_tables.py), tests from [`tools/gen_shape_tests.py`](../tools/gen_shape_tests.py) |
-| [`graphics/text`](graphics/text.ph) | Rich text layout: styled spans (font, fallback fonts, size, colour, underline, strike-through, letter spacing), UAX #14 line breaking with grapheme-safe emergency breaks, bidirectional text, shaping (std/graphics/shape, per run of one font, style, level and script; lines reshaped as placed), OpenType feature settings, tabs, alignment (start, end, left, right, centre, justify), line spacing; `Layout` with glyph and line positions, hit testing (`offset_at`), `draw` onto a canvas, `measure` |
+| [`graphics/text`](graphics/text.ph) | Rich text layout: styled spans (font, fallback fonts, size, colour, underline, strike-through, letter spacing), UAX #14 line breaking with grapheme-safe emergency breaks, bidirectional text, shaping (std/graphics/shape, per run of one font, style, level and script; lines reshaped as placed), OpenType feature settings, tabs, `Align` (start, end, left, right, centre, justify), line spacing; `Layout` with glyph and line positions, hit testing (`offset_at`), `draw` onto a canvas, `measure` |
 | [`graphics/pdf`](graphics/pdf.ph) | Writing PDF: pages of vector graphics (`draw.Path`s filled and stroked with solid colours, alpha and linear/radial gradients; clipping; transforms), text in embedded TrueType (subset) and OpenType CFF fonts with ToUnicode maps, `draw_layout` for `text.Layout`s, images (Flate with soft-mask alpha, or JPEG as is), links, bookmarks, metadata; compressed |
 | [`graphics/pdf/read`](graphics/pdf/read.ph) | Reading PDF: cross-reference tables and streams, object streams, incremental updates, repair of damaged files; objects and decoded streams (Flate with predictors, LZW, ASCIIHex, ASCII85, RunLength); pages, metadata, and text extraction (ToUnicode maps, simple-font encodings and glyph names, layout into lines and words). Hardened against hostile files. Tables from [`tools/gen_pdf_tables.py`](../tools/gen_pdf_tables.py) |
 
@@ -147,14 +147,14 @@ Image files are read and written by `std/graphics/image/`:
 
 | Module | Contents |
 |---|---|
-| [`graphics/image/formats`](graphics/image/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
+| [`graphics/image/formats`](graphics/image/formats.ph) | Any `Format`: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension) |
 | [`graphics/image/png`](graphics/image/png.ph) | PNG: every colour type and bit depth, interlacing, transparency; writes 8/16-bit with per-row filters |
 | [`graphics/image/jpeg`](graphics/image/jpeg.ph) | JPEG: baseline and progressive, any sampling, restart markers, gray/YCbCr/RGB/CMYK/YCCK, output identical to libjpeg's; writes baseline with optimized Huffman tables |
 | [`graphics/image/bmp`](graphics/image/bmp.ph) | BMP: 1–32 bits, palettes, bit fields, RLE4/RLE8, all header versions |
 | [`graphics/image/qoi`](graphics/image/qoi.ph) | QOI |
 | [`graphics/image/pnm`](graphics/image/pnm.ph) | PBM, PGM, PPM (ASCII and binary), PAM, PFM (float) |
 | [`graphics/image/hdr`](graphics/image/hdr.ph) | Radiance RGBE (HDR) |
-| [`graphics/image/exr`](graphics/image/exr.ph) | OpenEXR (HDR): scanline and tiled, NONE/RLE/ZIPS/ZIP/PIZ/PXR24, half/float/uint; writes ZIP, ZIPS, RLE or NONE |
+| [`graphics/image/exr`](graphics/image/exr.ph) | OpenEXR (HDR): scanline and tiled, `Compression` NONE/RLE/ZIPS/ZIP/PIZ/PXR24, `PixelType` half/float/uint; writes ZIP, ZIPS, RLE or NONE |
 | [`graphics/image/gif`](graphics/image/gif.ph) | GIF 87a/89a: interlacing, transparency, animation (`decode_all` → frames composited with each disposal method, delays, loop count); writes single images and animations with median-cut palettes. Checked against files made by Pillow ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
 | [`graphics/image/tiff`](graphics/image/tiff.ph) | TIFF and BigTIFF, either byte order: strips or tiles, planar or not; none, LZW, Deflate, PackBits, CCITT fax (group 3 1D/2D, group 4), JPEG; both predictors; 1–64-bit integers and 16/32/64-bit floats; gray, RGB, palette, CMYK, YCbCr; associated or unassociated alpha; `page_count`, `decode_page`. Writes U8/U16/F32 pages with LZW, Deflate or PackBits. Checked against files from tifffile and libtiff ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
 | [`graphics/image/webp`](graphics/image/webp.ph) | WebP: lossy (VP8, [`webp/vp8.ph`](graphics/image/webp/vp8.ph): intra prediction, both loop filters, libwebp's fancy upsampling), lossless (VP8L: every transform, colour caches, meta prefix codes), alpha (each filter), animations composited as libwebp's `WebPAnimDecoder` does: pixels identical to libwebp's. Writes lossless stills and animations (palette or subtract-green and predictors, LZ77). Checked against files from libwebp ([`tools/gen_image_tests.py`](../tools/gen_image_tests.py)) |
@@ -164,13 +164,13 @@ Image files are read and written by `std/graphics/image/`:
 
 | Module | Contents |
 |---|---|
-| [`audio`](audio.ph) | `Sound`: interleaved frames of U8, S16, S24, S32, F32 or F64 samples; `get`/`set` as floats, `convert` (exact integer ↔ float), `remix` (channel counts), `slice`, `gain`, `peak`, `resample` (Kaiser-windowed sinc, > 90 dB rejection) |
+| [`audio`](audio.ph) | `Sound`: interleaved frames of `SampleFormat` U8, S16, S24, S32, F32 or F64 samples; `get`/`set` as floats, `convert` (exact integer ↔ float), `remix` (channel counts), `slice`, `gain`, `peak`, `resample` (Kaiser-windowed sinc, > 90 dB rejection) |
 
 Sound files are read and written by `std/audio/`:
 
 | Module | Contents |
 |---|---|
-| [`audio/formats`](audio/formats.ph) | Any format: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension); WAV, AIFF and FLAC are written, all seven read |
+| [`audio/formats`](audio/formats.ph) | Any `Format`: `detect`, `decode`, `encode`, `load(path)`, `save(path)` (by extension); WAV, AIFF and FLAC are written, all seven read |
 | [`audio/wav`](audio/wav.ph) | WAV: PCM 8–32 bits, float, A-law, µ-law, WAVE_FORMAT_EXTENSIBLE, RF64 |
 | [`audio/aiff`](audio/aiff.ph) | AIFF and AIFF-C: big- and little-endian PCM, float, A-law, µ-law |
 | [`audio/flac`](audio/flac.ph) | FLAC: decodes every stream (4–32 bits, 1–8 channels; CRCs and MD5 checked); encodes at levels 0–8, about as small as the reference encoder |

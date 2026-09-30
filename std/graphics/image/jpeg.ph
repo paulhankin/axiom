@@ -2,7 +2,7 @@
 // std/graphics/image/jpeg.ph - JPEG (ITU T.81, JFIF) decoding and encoding.
 //
 //     let img = jpeg.decode(bytes)!;                 // U8 gray or RGB
-//     let out = jpeg.encode(&img, 90, jpeg.SUBSAMPLE_420)!;  // mem.free it
+//     let out = jpeg.encode(&img, 90, jpeg.Subsample.S420)!;  // mem.free it
 //
 // Decoding handles baseline, extended sequential and progressive Huffman-
 // coded JPEGs with 8-bit samples: any sampling factors, restart intervals,
@@ -25,9 +25,12 @@ import "../image.ph" as image;
 
 error { InvalidImage, Unsupported, OutOfMemory }
 
-pub const SUBSAMPLE_444: u8 = 0;  // full-resolution chroma
-pub const SUBSAMPLE_422: u8 = 1;  // half horizontally
-pub const SUBSAMPLE_420: u8 = 2;  // half both ways (the usual)
+/// The chroma resolution an encoded image keeps.
+pub enum Subsample: u8 {
+    S444,  // full-resolution chroma
+    S422,  // half horizontally
+    S420,  // half both ways (the usual)
+}
 
 /// Whether data starts like a JPEG file.
 pub fn is_jpeg(data: []u8) bool {
@@ -1008,7 +1011,7 @@ fn output(d: *mut Decoder) !image.Image {
     if d.ncomp == 1 {
         chans = 1;
     }
-    let mut img = image.Image.init(w, h, chans, image.U8)!;
+    let mut img = image.Image.init(w, h, chans, image.Depth.U8)!;
     let out = img.samples8();
     if d.ncomp == 1 {
         let c = &d.comp[0];
@@ -1470,13 +1473,13 @@ fn dct_table() *[64]f32 {
 }
 
 /// Encodes as baseline JPEG (free the result with mem.free).
-pub fn encode(img: *image.Image, quality: u32, subsample: u8) ![]mut u8 {
-    if img.depth != image.U8 {
+pub fn encode(img: *image.Image, quality: u32, subsample: Subsample) ![]mut u8 {
+    if img.depth != image.Depth.U8 {
         let mut ch: usize = 3;
         if img.channels <= 2 {
             ch = 1;
         }
-        let mut c = img.convert(ch, image.U8)!;
+        let mut c = img.convert(ch, image.Depth.U8)!;
         defer c.deinit();
         return encode(&c, quality, subsample);
     }
@@ -1493,10 +1496,10 @@ pub fn encode(img: *image.Image, quality: u32, subsample: u8) ![]mut u8 {
     let mut hs: usize = 1;  // luma sampling factors (chroma is 1x1)
     let mut vs: usize = 1;
     if not gray {
-        if subsample == SUBSAMPLE_420 {
+        if subsample == Subsample.S420 {
             hs = 2;
             vs = 2;
-        } else if subsample == SUBSAMPLE_422 {
+        } else if subsample == Subsample.S422 {
             hs = 2;
         }
     }
@@ -1952,11 +1955,11 @@ fn write_headers(o: *mut strs.String, w: usize, h: usize, ncomp: usize, hs: usiz
 // -----------------------------------------------------------------------------
 
 test "round trips" {
-    let modes: [3]u8 = [SUBSAMPLE_444, SUBSAMPLE_422, SUBSAMPLE_420];
+    let modes: [3]Subsample = [Subsample.S444, Subsample.S422, Subsample.S420];
     let chans: [2]usize = [1, 3];
     for ch in chans {
         for mode in modes {
-            let mut img = image.Image.init(45, 29, ch, image.U8)!;
+            let mut img = image.Image.init(45, 29, ch, image.Depth.U8)!;
             defer img.deinit();
             let px = img.samples8();
             for i in @as(usize, 0)..px.len {

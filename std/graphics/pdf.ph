@@ -6,7 +6,7 @@
 //     let mut page = doc.page(pdf.A4_WIDTH, pdf.A4_HEIGHT);
 //     defer page.deinit();
 //     page.text(&f, 24.0, 72.0, 100.0, "Hello, world", color.Color.rgb(0.0, 0.0, 0.0))!;
-//     page.fill(&path, draw.Paint.solid(red), draw.NONZERO)!;
+//     page.fill(&path, draw.Paint.solid(red), draw.FillRule.NONZERO)!;
 //     page.image(&img, 72.0, 200.0, 200.0, 150.0)!;
 //     doc.add_page(&mut page)!;
 //     doc.save("out.pdf")!;
@@ -847,21 +847,21 @@ pub struct Page {
         let mut cx: f64 = 0.0;
         let mut cy: f64 = 0.0;
         for v in verbs {
-            if v == draw.V_MOVE {
+            if v == draw.Verb.MOVE {
                 cx = pts[k];
                 cy = pts[k + 1];
                 self.num(cx)!;
                 self.num(cy)!;
                 self.op("m\n")!;
                 k += 2;
-            } else if v == draw.V_LINE {
+            } else if v == draw.Verb.LINE {
                 cx = pts[k];
                 cy = pts[k + 1];
                 self.num(cx)!;
                 self.num(cy)!;
                 self.op("l\n")!;
                 k += 2;
-            } else if v == draw.V_QUAD {
+            } else if v == draw.Verb.QUAD {
                 // as a cubic
                 let qx = pts[k];
                 let qy = pts[k + 1];
@@ -877,7 +877,7 @@ pub struct Page {
                 cx = x;
                 cy = y;
                 k += 4;
-            } else if v == draw.V_CUBIC {
+            } else if v == draw.Verb.CUBIC {
                 for j in @as(usize, 0)..6 {
                     self.num(pts[k + j])!;
                 }
@@ -885,7 +885,7 @@ pub struct Page {
                 cy = pts[k + 5];
                 self.op("c\n")!;
                 k += 6;
-            } else if v == draw.V_CLOSE {
+            } else if v == draw.Verb.CLOSE {
                 self.op("h\n")!;
             }
         }
@@ -893,7 +893,7 @@ pub struct Page {
 
     /// Sets the fill (or stroke) paint; returns false if nothing would show.
     fn paint(self: *mut Page, p: draw.Paint, stroke: bool) !bool {
-        if p.kind == draw.PAINT_SOLID {
+        if p.kind == draw.PaintKind.SOLID {
             let c = p.color;
             if c.a <= 0.0 {
                 return false;
@@ -909,7 +909,7 @@ pub struct Page {
             }
             return true;
         }
-        if (p.kind == draw.PAINT_LINEAR) or (p.kind == draw.PAINT_RADIAL) {
+        if (p.kind == draw.PaintKind.LINEAR) or (p.kind == draw.PaintKind.RADIAL) {
             if p.stops.len == 0 {
                 return false;
             }
@@ -946,13 +946,13 @@ pub struct Page {
         self.op(" gs\n")!;
     }
 
-    /// Fills a path (rule: draw.NONZERO or draw.EVEN_ODD).
-    pub fn fill(self: *mut Page, p: *draw.Path, paint: draw.Paint, rule: u8) !void {
+    /// Fills a path (rule: draw.FillRule.NONZERO or EVEN_ODD).
+    pub fn fill(self: *mut Page, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) !void {
         if not self.paint(paint, false)! {
             return;
         }
         self.path(p)!;
-        if rule == draw.EVEN_ODD {
+        if rule == draw.FillRule.EVEN_ODD {
             self.op("f*\n")!;
         } else {
             self.op("f\n")!;
@@ -966,9 +966,9 @@ pub struct Page {
         }
         self.num(style.width)!;
         self.op("w ")!;
-        put_u64(&mut self.content, @as(u64, style.cap))!;
+        put_u64(&mut self.content, @as(u64, @int_from_enum(style.cap)))!;  // the values are PDF's
         self.op(" J ")!;
-        put_u64(&mut self.content, @as(u64, style.join))!;
+        put_u64(&mut self.content, @as(u64, @int_from_enum(style.join)))!;
         self.op(" j ")!;
         self.num(@max(style.miter_limit, 1.0))!;
         self.op("M [")!;
@@ -986,13 +986,13 @@ pub struct Page {
         self.path_tmp.clear();
         self.path_tmp.rect(x, y, w, h)!;
         let tmp = self.path_tmp;
-        self.fill(&tmp, paint, draw.NONZERO)!;
+        self.fill(&tmp, paint, draw.FillRule.NONZERO)!;
     }
 
     /// Limits what follows (until restore) to the inside of a path.
-    pub fn clip(self: *mut Page, p: *draw.Path, rule: u8) !void {
+    pub fn clip(self: *mut Page, p: *draw.Path, rule: draw.FillRule) !void {
         self.path(p)!;
-        if rule == draw.EVEN_ODD {
+        if rule == draw.FillRule.EVEN_ODD {
             self.op("W* n\n")!;
         } else {
             self.op("W n\n")!;
@@ -1260,7 +1260,7 @@ fn gradient(doc: *mut Document, p: draw.Paint, ctm: draw.Affine) !usize {
     b.push(' ')!;
     put_num(&mut b, m.f)!;
     b.push_str("] /Shading << /ColorSpace /DeviceRGB /Extend [true true] ")!;
-    if p.kind == draw.PAINT_LINEAR {
+    if p.kind == draw.PaintKind.LINEAR {
         b.push_str("/ShadingType 2 /Coords [")!;
         put_num(&mut b, p.x0)!;
         b.push(' ')!;
@@ -1296,7 +1296,7 @@ fn gradient(doc: *mut Document, p: draw.Paint, ctm: draw.Affine) !usize {
 fn add_image(doc: *mut Document, img: *image.Image) !usize {
     let alpha = (img.channels == 2) or (img.channels == 4);
     let gray = img.channels <= 2;
-    let mut conv = img.convert(img.channels, image.U8)!;
+    let mut conv = img.convert(img.channels, image.Depth.U8)!;
     defer conv.deinit();
     let n = img.width * img.height;
     let cc: usize = if_gray(gray);
@@ -1920,14 +1920,14 @@ test "documents read back" {
     let mut path = draw.Path.init();
     defer path.deinit();
     path.circle(100.0, 100.0, 50.0)!;
-    p.fill(&path, draw.Paint.solid(color.Color.rgb(1.0, 0.0, 0.0)), draw.NONZERO)!;
+    p.fill(&path, draw.Paint.solid(color.Color.rgb(1.0, 0.0, 0.0)), draw.FillRule.NONZERO)!;
     p.stroke(&path, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)), draw.Stroke.width(2.0))!;
     let stops: [2]draw.Stop = [
         draw.Stop.{ offset: 0.0, color: color.Color.rgb(0.0, 0.0, 1.0) },
         draw.Stop.{ offset: 1.0, color: color.Color.rgb(1.0, 1.0, 1.0) },
     ];
     p.fill_rect(200.0, 50.0, 100.0, 100.0, draw.Paint.linear(200.0, 0.0, 300.0, 0.0, stops[..]))!;
-    let mut img = image.Image.init(4, 3, 4, image.U8)!;
+    let mut img = image.Image.init(4, 3, 4, image.Depth.U8)!;
     defer img.deinit();
     p.image(&img, 10.0, 300.0, 40.0, 30.0)!;
     p.link(10.0, 10.0, 50.0, 20.0, "https://example.com/(x)")!;

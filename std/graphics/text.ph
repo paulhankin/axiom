@@ -8,7 +8,7 @@
 //     bold.font = &serif_bold;
 //     let spans: [2]text.Span = [text.Span.{ text: "Hello, ", style: body }, text.Span.{ text: "world", style: bold }];
 //     let mut opts = text.Options.init(300.0);    // lines at most 300 px wide
-//     opts.align = text.JUSTIFY;
+//     opts.align = text.Align.JUSTIFY;
 //     let mut l = text.layout(spans[..], opts)!;
 //     defer l.deinit();
 //     l.draw(&mut canvas, 20.0, 40.0)!;          // top left of the text box
@@ -35,13 +35,15 @@ import "shape.ph" as shape;
 
 error { OutOfMemory, Done }
 
-/// Alignments.
-pub const START: u8 = 0;  // left in left-to-right paragraphs, right in right-to-left ones
-pub const END: u8 = 1;
-pub const LEFT: u8 = 2;
-pub const RIGHT: u8 = 3;
-pub const CENTER: u8 = 4;
-pub const JUSTIFY: u8 = 5;  // both edges (the last line of a paragraph as START)
+/// How lines are aligned in the width.
+pub enum Align: u8 {
+    START,  // left in left-to-right paragraphs, right in right-to-left ones
+    END,
+    LEFT,
+    RIGHT,
+    CENTER,
+    JUSTIFY,  // both edges (the last line of a paragraph as START)
+}
 
 /// How a run of text looks.
 pub struct Style {
@@ -80,13 +82,13 @@ pub struct Span {
 
 pub struct Options {
     width: f64,  // the longest a line may be (0: lines break only at newlines)
-    align: u8,
+    align: Align,
     direction: i32,     // bidi.AUTO, bidi.LTR or bidi.RTL, for each paragraph
     line_spacing: f64,  // a multiple of the natural line height
     tab_stops: f64,     // tabs advance to the next multiple of this (0: 4 spaces of the font)
 
     pub fn init(width: f64) Options {
-        return Options.{ width: width, align: START, direction: bidi.AUTO, line_spacing: 1.0, tab_stops: 0.0 };
+        return Options.{ width: width, align: Align.START, direction: bidi.AUTO, line_spacing: 1.0, tab_stops: 0.0 };
     }
 }
 
@@ -148,7 +150,7 @@ pub struct Layout {
                 g.font.glyph_path(g.id, &mut path, x + g.x, y + g.y, scale)!;
                 i += 1;
             }
-            cv.fill(&path, draw.Paint.solid(self.spans.get(sp).style.color), draw.NONZERO)!;
+            cv.fill(&path, draw.Paint.solid(self.spans.get(sp).style.color), draw.FillRule.NONZERO)!;
         }
         // underlines and strike-throughs
         for g in gs {
@@ -373,9 +375,9 @@ fn shape_cells(s: []u8, cs: []Cell, r: Run, a: usize, b: usize, spans: []Span, m
     let to = cs[b - 1].offset + cs[b - 1].len;
     let mut o = shape.options();
     o.script = r.script;
-    o.direction = shape.DIR_LTR;
+    o.direction = shape.Direction.LTR;
     if (r.level & 1) == 1 {
-        o.direction = shape.DIR_RTL;
+        o.direction = shape.Direction.RTL;
     }
     o.features = spans[c0.span].style.features;
     return memo.shaper.shape(c0.font, s[from..to], o);
@@ -812,7 +814,7 @@ fn place_line(s: []u8, cs: []Cell, runs: []Run, bp: *bidi.Paragraph, a: usize, b
     // justification: extra room shared among the spaces
     let mut extra: f64 = 0.0;
     let ends_para = last or ((b > a) and is_newline(cs[b - 1].cp));
-    if (opts.align == JUSTIFY) and not ends_para and (opts.width > lw) {
+    if (opts.align == Align.JUSTIFY) and not ends_para and (opts.width > lw) {
         let mut spaces: usize = 0;
         for p in ps {
             if p.space {
@@ -825,27 +827,27 @@ fn place_line(s: []u8, cs: []Cell, runs: []Run, bp: *bidi.Paragraph, a: usize, b
     }
     let mut x: f64 = 0.0;
     let mut align = opts.align;
-    if align == JUSTIFY {
-        align = START;
+    if align == Align.JUSTIFY {
+        align = Align.START;
         if extra > 0.0 {
-            align = LEFT;
+            align = Align.LEFT;
         }
     }
-    if align == START {
-        align = LEFT;
+    if align == Align.START {
+        align = Align.LEFT;
         if rtl {
-            align = RIGHT;
+            align = Align.RIGHT;
         }
-    } else if align == END {
-        align = RIGHT;
+    } else if align == Align.END {
+        align = Align.RIGHT;
         if rtl {
-            align = LEFT;
+            align = Align.LEFT;
         }
     }
     if opts.width > 0.0 {
-        if align == RIGHT {
+        if align == Align.RIGHT {
             x = opts.width - lw;
-        } else if align == CENTER {
+        } else if align == Align.CENTER {
             x = (opts.width - lw) / 2.0;
         }
     }
@@ -936,14 +938,14 @@ test "lines, alignment and bidi" {
     @expect_eq(l.lines.get(0).start, 0);
     @expect_eq(l.lines.get(l.lines.len - 1).end, sp[0].text.len);
     // right alignment puts each line's end at the width
-    opts.align = RIGHT;
+    opts.align = Align.RIGHT;
     let mut r = layout(sp[..], opts)!;
     defer r.deinit();
     for line in r.lines.items() {
         @expect(@abs(line.right - 150.0) < 0.001);
     }
     // justification fills every line but the last
-    opts.align = JUSTIFY;
+    opts.align = Align.JUSTIFY;
     let mut j = layout(sp[..], opts)!;
     defer j.deinit();
     let jl = j.lines.items();
@@ -977,7 +979,7 @@ test "lines, alignment and bidi" {
     // hit testing
     @expect_eq(l.offset_at(0.0, 5.0), 0);
     // drawing puts ink down
-    let mut img = image.Image.init(160, 120, 1, image.U8)!;
+    let mut img = image.Image.init(160, 120, 1, image.Depth.U8)!;
     defer img.deinit();
     let mut cv = draw.Canvas.init(&mut img);
     defer cv.deinit();

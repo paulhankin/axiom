@@ -60,7 +60,7 @@ pub fn decode(data: []u8) !image.Image {
     if (w == 0) or (h == 0) or ((@mul_checked(w, h) catch return error.InvalidImage) > image.MAX_PIXELS) {
         return error.InvalidImage;
     }
-    let mut img = image.Image.init(w, h, 3, image.F32)!;
+    let mut img = image.Image.init(w, h, 3, image.Depth.F32)!;
     let line = mem.alloc.[u8](w * 4) catch |e| {
         img.deinit();
         return e;
@@ -196,8 +196,8 @@ fn byte(v: f64) u8 {
 }
 
 pub fn encode(img: *image.Image) ![]mut u8 {
-    if (img.depth != image.F32) or (img.channels != 3) {
-        let mut c = img.convert(3, image.F32)!;
+    if (img.depth != image.Depth.F32) or (img.channels != 3) {
+        let mut c = img.convert(3, image.Depth.F32)!;
         defer c.deinit();
         return encode(&c);
     }
@@ -276,7 +276,7 @@ fn write_channel(o: *mut strs.String, line: []u8, c: usize, w: usize) !void {
 test "round trip" {
     let widths: [3]usize = [5, 40, 300];
     for w in widths {
-        let mut img = image.Image.init(w, 3, 3, image.F32)!;
+        let mut img = image.Image.init(w, 3, 3, image.Depth.F32)!;
         defer img.deinit();
         let px = img.samples32();
         for i in @as(usize, 0)..px.len {

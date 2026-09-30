@@ -1282,7 +1282,7 @@ fn decode_audio(s: *Setup, pk: []ogg.Packet) !audio.Sound {
     let mut m1 = Mdct.init(s.bs[1])!;
     defer m1.free();
     // the output, grown as needed
-    let mut out = audio.Sound.init(0, nch, s.rate, audio.F32)!;
+    let mut out = audio.Sound.init(0, nch, s.rate, audio.SampleFormat.F32)!;
     let mut cap: usize = 0;
     let mut frames: usize = 0;
     let mut prev_n: usize = 0;  // 0 before the first block

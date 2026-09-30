@@ -2,13 +2,13 @@
 // std/audio.ph - sound in memory: sample formats, conversion, channel
 // mixing and resampling.
 //
-//     let mut s = audio.Sound.init(44100, 2, 48000, audio.S16)!;  // 44100 frames, stereo, 48 kHz
+//     let mut s = audio.Sound.init(44100, 2, 48000, audio.SampleFormat.S16)!;  // 44100 frames, stereo, 48 kHz
 //     defer s.deinit();
-//     s.set(0, 1, 0.5);                                  // frame 0, right channel
-//     let v = s.get(0, 1);                               // -1.0 to 1.0
-//     let mut f = s.convert(audio.F32)!;                 // float samples
-//     let mut m = s.remix(1)!;                           // mono
-//     let mut r = s.resample(44100)!;                    // to 44.1 kHz
+//     s.set(0, 1, 0.5);                                   // frame 0, right channel
+//     let v = s.get(0, 1);                                // -1.0 to 1.0
+//     let mut f = s.convert(audio.SampleFormat.F32)!;     // float samples
+//     let mut m = s.remix(1)!;                            // mono
+//     let mut r = s.resample(44100)!;                     // to 44.1 kHz
 //
 // A Sound is frames of interleaved samples (channel 0 of frame 0, channel
 // 1 of frame 0, ...), each U8 (unsigned, 128 is silence), S16, S24 (held
@@ -27,13 +27,15 @@ import "mem.ph" as mem;
 
 error { InvalidAudio, Unsupported, TooLarge, OutOfMemory }
 
-/// Sample formats.
-pub const U8: u8 = 1;
-pub const S16: u8 = 2;
-pub const S24: u8 = 3;
-pub const S32: u8 = 4;
-pub const F32: u8 = 5;
-pub const F64: u8 = 6;
+/// The format of a sound's samples.
+pub enum SampleFormat: u8 {
+    U8 = 1,
+    S16,
+    S24,
+    S32,
+    F32,
+    F64,
+}
 
 /// Sounds with more samples than this (frames times channels) are refused
 /// by the decoders (a guard against hostile headers): 2^30, an hour and a
@@ -41,54 +43,50 @@ pub const F64: u8 = 6;
 pub const MAX_SAMPLES: usize = 1073741824;
 
 /// The bytes a sample of a format takes in memory.
-pub fn bytes_per_sample(format: u8) usize {
-    if format == U8 {
+pub fn bytes_per_sample(format: SampleFormat) usize {
+    if format == SampleFormat.U8 {
         return 1;
     }
-    if format == S16 {
+    if format == SampleFormat.S16 {
         return 2;
     }
-    if format == F64 {
+    if format == SampleFormat.F64 {
         return 8;
     }
     return 4;
 }
 
 /// The bits of precision of a format (24 for S24, 32 for F32, 64 for F64).
-pub fn bits(format: u8) u32 {
-    if format == U8 {
+pub fn bits(format: SampleFormat) u32 {
+    if format == SampleFormat.U8 {
         return 8;
     }
-    if format == S16 {
+    if format == SampleFormat.S16 {
         return 16;
     }
-    if format == S24 {
+    if format == SampleFormat.S24 {
         return 24;
     }
-    if format == F64 {
+    if format == SampleFormat.F64 {
         return 64;
     }
     return 32;
 }
 
-pub fn is_float(format: u8) bool {
-    return (format == F32) or (format == F64);
-}
-
-fn valid_format(format: u8) bool {
-    return (format >= U8) and (format <= F64);
+pub fn is_float(format: SampleFormat) bool {
+    return (format == SampleFormat.F32) or (format == SampleFormat.F64);
 }
 
 pub struct Sound {
     frames: usize,
     channels: usize,
     rate: u32,  // frames per second
-    format: u8,
+    format: SampleFormat,
     data: []mut u8,
 
     /// A new sound, all silence. Free it with deinit.
-    pub fn init(frames: usize, channels: usize, rate: u32, format: u8) !Sound {
-        if (channels < 1) or (channels > 255) or not valid_format(format) or (rate == 0) {
+    pub fn init(frames: usize, channels: usize, rate: u32, format: SampleFormat) !Sound {
+        if (channels < 1) or (channels > 255) or (rate == 0) {
             return error.Unsupported;
         }
         let n = @mul_checked(frames, channels) catch return error.TooLarge;
@@ -96,7 +94,7 @@ pub struct Sound {
             return error.TooLarge;
         }
         let data = mem.alloc_zeroed.[u8](@max(n * bytes_per_sample(format), 1))!;
-        if format == U8 {
+        if format == SampleFormat.U8 {
             @mem_set(data, 128);
         }
         return Sound.{ frames: frames, channels: channels, rate: rate, format: format, data: data };
@@ -150,19 +148,19 @@ pub struct Sound {
     /// Sample i (frame i / channels) as a float.
     pub fn sample(self: *Sound, i: usize) f64 {
         let f = self.format;
-        if f == U8 {
+        if f == SampleFormat.U8 {
             return @float_from_int(f64, @as(i32, self.data[i]) - 128) * (1.0 / 128.0);
         }
-        if f == S16 {
+        if f == SampleFormat.S16 {
             return @float_from_int(f64, self.samples_i16()[i]) * (1.0 / 32768.0);
         }
-        if f == S24 {
+        if f == SampleFormat.S24 {
             return @float_from_int(f64, self.samples_i32()[i]) * (1.0 / 8388608.0);
         }
-        if f == S32 {
+        if f == SampleFormat.S32 {
             return @float_from_int(f64, self.samples_i32()[i]) * (1.0 / 2147483648.0);
         }
-        if f == F32 {
+        if f == SampleFormat.F32 {
             return @float_cast(f64, self.samples_f32()[i]);
         }
         return self.samples_f64()[i];
@@ -171,15 +169,15 @@ pub struct Sound {
     /// Sets sample i from a float (rounded and clipped for integer formats).
     pub fn set_sample(self: *mut Sound, i: usize, v: f64) void {
         let f = self.format;
-        if f == U8 {
+        if f == SampleFormat.U8 {
             self.data[i] = @truncate(u8, @bit_cast(u32, to_int(v, 8) + 128));
-        } else if f == S16 {
+        } else if f == SampleFormat.S16 {
             self.samples_i16()[i] = @truncate(i16, to_int(v, 16));
-        } else if f == S24 {
+        } else if f == SampleFormat.S24 {
             self.samples_i32()[i] = to_int(v, 24);
-        } else if f == S32 {
+        } else if f == SampleFormat.S32 {
             self.samples_i32()[i] = to_int(v, 32);
-        } else if f == F32 {
+        } else if f == SampleFormat.F32 {
             self.samples_f32()[i] = @float_cast(f32, v);
         } else {
             self.samples_f64()[i] = v;
@@ -200,17 +198,17 @@ pub struct Sound {
     /// on 0); for integer formats only.
     fn int_sample(self: *Sound, i: usize) i32 {
         let f = self.format;
-        if f == U8 {
+        if f == SampleFormat.U8 {
             return @as(i32, self.data[i]) - 128;
         }
-        if f == S16 {
+        if f == SampleFormat.S16 {
             return @as(i32, self.samples_i16()[i]);
         }
         return self.samples_i32()[i];
     }
 
     /// A copy in another sample format.
-    pub fn convert(self: *Sound, format: u8) !Sound {
+    pub fn convert(self: *Sound, format: SampleFormat) !Sound {
         let mut out = Sound.init(self.frames, self.channels, self.rate, format)!;
         let n = self.len();
         if is_float(self.format) or is_float(format) {
@@ -233,9 +231,9 @@ pub struct Sound {
                 let hi = (@as(i64, 1) << (to - 1)) - 1;
                 w = @truncate(i32, @min(r, hi));
             }
-            if format == U8 {
+            if format == SampleFormat.U8 {
                 out.data[i] = @truncate(u8, @bit_cast(u32, w + 128));
-            } else if format == S16 {
+            } else if format == SampleFormat.S16 {
                 out.samples_i16()[i] = @truncate(i16, w);
             } else {
                 out.samples_i32()[i] = w;
@@ -458,8 +456,9 @@ fn resample_into(src: *Sound, out: *mut Sound) !void {
 // -----------------------------------------------------------------------------
 
 test "formats convert exactly" {
-    let fmts: [6]u8 = [U8, S16, S24, S32, F32, F64];
-    let mut s = Sound.init(7, 2, 8000, S16)!;
+    let fmts: [6]SampleFormat = [SampleFormat.U8, SampleFormat.S16, SampleFormat.S24, SampleFormat.S32,
+                                 SampleFormat.F32, SampleFormat.F64];
+    let mut s = Sound.init(7, 2, 8000, SampleFormat.S16)!;
     defer s.deinit();
     let vals: [7]i16 = [-32768, -32767, -1, 0, 1, 12345, 32767];
     for i in @as(usize, 0)..7 {
@@ -469,9 +468,9 @@ test "formats convert exactly" {
     for f in fmts {
         let mut a = s.convert(f)!;
         defer a.deinit();
-        let mut b = a.convert(S16)!;
+        let mut b = a.convert(SampleFormat.S16)!;
         defer b.deinit();
-        if f == U8 {
+        if f == SampleFormat.U8 {
             @expect_eq(b.samples_i16()[0], -32768);
             @expect_eq(b.samples_i16()[12], 32512);  // 8 bits keep the top byte, rounded
             continue;
@@ -480,22 +479,22 @@ test "formats convert exactly" {
     }
     @expect_eq(s.get(0, 0), -1.0);
     @expect_eq(s.get(3, 0), 0.0);
-    let mut f = s.convert(F32)!;
+    let mut f = s.convert(SampleFormat.F32)!;
     defer f.deinit();
     f.set(0, 0, 2.0);
     f.set(1, 0, -3.0);
-    let mut back = f.convert(S24)!;
+    let mut back = f.convert(SampleFormat.S24)!;
     defer back.deinit();
     @expect_eq(back.samples_i32()[0], 8388607);  // clipped
     @expect_eq(back.samples_i32()[2], -8388608);
-    let mut u = Sound.init(1, 1, 8000, U8)!;
+    let mut u = Sound.init(1, 1, 8000, SampleFormat.U8)!;
     defer u.deinit();
     @expect_eq(u.data[0], 128);  // silence
     @expect_eq(u.get(0, 0), 0.0);
 }
 
 test "remix and slice" {
-    let mut s = Sound.init(4, 2, 100, F32)!;
+    let mut s = Sound.init(4, 2, 100, SampleFormat.F32)!;
     defer s.deinit();
     for i in @as(usize, 0)..4 {
         s.set(i, 0, 0.5);
@@ -521,7 +520,7 @@ test "remix and slice" {
 test "resampling keeps tones and removes aliases" {
     // a 1 kHz tone at 48 kHz to 44.1 kHz and back: amplitude kept
     let n: usize = 4800;
-    let mut s = Sound.init(n, 1, 48000, F64)!;
+    let mut s = Sound.init(n, 1, 48000, SampleFormat.F64)!;
     defer s.deinit();
     for i in @as(usize, 0)..n {
         s.set(i, 0, 0.5 * math.sin((2.0 * math.PI * 1000.0 * @float_from_int(f64, i)) / 48000.0));

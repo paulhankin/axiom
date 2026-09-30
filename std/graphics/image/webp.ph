@@ -883,7 +883,7 @@ pub fn decode_all(data: []u8) !Animation {
 }
 
 fn to_image(p: *Pic, channels: usize) !image.Image {
-    let mut img = image.Image.init(p.width, p.height, channels, image.U8)!;
+    let mut img = image.Image.init(p.width, p.height, channels, image.Depth.U8)!;
     if channels == 4 {
         @mem_copy(img.data[..p.rgba.len], p.rgba);
     } else {
@@ -1069,7 +1069,7 @@ fn decode_frames(data: []u8, first_only: bool) !Animation {
                 }
             }
         }
-        let mut img = image.Image.init(cw, chh, 4, image.U8) catch |e| {
+        let mut img = image.Image.init(cw, chh, 4, image.Depth.U8) catch |e| {
             anim.deinit();
             return e;
         };
@@ -1707,7 +1707,7 @@ fn pred_at(px: []u32, w: usize, x: usize, y: usize, m: u32) u32 {
 }
 
 fn argb_of(img: *image.Image) ![]mut u32 {
-    let mut src = img.convert(4, image.U8)!;
+    let mut src = img.convert(4, image.Depth.U8)!;
     defer src.deinit();
     let n = img.width * img.height;
     let px = mem.alloc.[u32](n)!;
@@ -1861,7 +1861,7 @@ test "files made by libwebp" {
 }
 
 fn test_image(w: usize, h: usize, ch: usize, colours: usize) !image.Image {
-    let mut img = image.Image.init(w, h, ch, image.U8)!;
+    let mut img = image.Image.init(w, h, ch, image.Depth.U8)!;
     for y in @as(usize, 0)..h {
         for x in @as(usize, 0)..w {
             for c in @as(usize, 0)..ch {
@@ -1890,7 +1890,7 @@ test "round trips" {
                 defer mem.free(enc);
                 let mut back = decode(enc)!;
                 defer back.deinit();
-                let mut want = img.convert(back.channels, image.U8)!;
+                let mut want = img.convert(back.channels, image.Depth.U8)!;
                 defer want.deinit();
                 @expect(same(&back, &want));
             }

@@ -615,7 +615,7 @@ fn clamp01(v: f32) f32 {
 }
 
 fn store(img: *mut image.Image, i: usize, v: f32) void {
-    if img.depth == image.U8 {
+    if img.depth == image.Depth.U8 {
         img.data[i] = @truncate(u8, @bit_cast(u32, @int_from_float(i32, (clamp01(v) * 255.0) + 0.5)));
     } else {
         img.samples16()[i] = @truncate(u16, @bit_cast(u32, @int_from_float(i32, (clamp01(v) * 65535.0) + 0.5)));
@@ -896,9 +896,9 @@ pub fn decode(data: []u8) !image.Image {
     if alpha_i != 0xffffffff {
         ch += 1;
     }
-    let mut depth = image.U8;
+    let mut depth = image.Depth.U8;
     if info.bitdepth > 8 {
-        depth = image.U16;
+        depth = image.Depth.U16;
     }
     let mut img = image.Image.init(info.width, info.height, ch, depth) catch |e| {
         if e == error.OutOfMemory {

@@ -34,18 +34,20 @@ import "jpeg.ph" as jpeg;
 
 error { InvalidImage, TooLarge, Unsupported, OutOfMemory }
 
-/// Compressions for encoding.
-pub const NONE: u16 = 1;
-pub const LZW: u16 = 5;
-pub const DEFLATE: u16 = 8;
-pub const PACKBITS: u16 = 32773;
+/// Compressions for encoding (their values are TIFF's).
+pub enum Compression: u16 {
+    NONE = 1,
+    LZW = 5,
+    DEFLATE = 8,
+    PACKBITS = 32773,
+}
 
 pub struct Options {
-    compression: u16,  // NONE, LZW, DEFLATE or PACKBITS
-    predictor: bool,   // difference neighbouring samples first (LZW, Deflate)
+    compression: Compression,
+    predictor: bool,  // difference neighbouring samples first (LZW, Deflate)
 
     pub fn default() Options {
-        return Options.{ compression: DEFLATE, predictor: true };
+        return Options.{ compression: Compression.DEFLATE, predictor: true };
     }
 }
 
@@ -679,7 +681,7 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, spp: usize, colors:
     }
     let px = w * h;
     if float {
-        let mut img = image.Image.init(w, h, outc, image.F32)!;
+        let mut img = image.Image.init(w, h, outc, image.Depth.F32)!;
         let o = img.samples32();
         let r = @cast_slice(f32, raw[..(px * spp) * 4]);
         for i in @as(usize, 0)..px {
@@ -718,16 +720,16 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, spp: usize, colors:
     }
     let maxv = (@as(u64, 1) << eff) - 1;
     let mut outmax: u64 = 255;
-    let mut depth = image.U8;
+    let mut depth = image.Depth.U8;
     if bps > 8 {
         outmax = 65535;
-        depth = image.U16;
+        depth = image.Depth.U16;
     }
     let mut img = image.Image.init(w, h, outc, depth)!;
     let o8 = img.data;
     let mut o16 = @slice_from_ptr(@ptr_from_int(*mut u16, 2), 0);
     let mut r16: []u16 = o16;
-    if depth == image.U16 {
+    if depth == image.Depth.U16 {
         o16 = img.samples16();
         r16 = @cast_slice(u16, raw[..(px * spp) * 2]);
     }
@@ -735,7 +737,7 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, spp: usize, colors:
     for i in @as(usize, 0)..px {
         let mut s: [5]u64 = [0; 5];
         for k in @as(usize, 0)..@min(spp, 5) {
-            if depth == image.U16 {
+            if depth == image.Depth.U16 {
                 s[k] = @as(u64, r16[(i * spp) + k]);
             } else {
                 s[k] = @as(u64, raw[(i * spp) + k]);
@@ -747,7 +749,7 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, spp: usize, colors:
             if ix < ncol {
                 for k in @as(usize, 0)..3 {
                     c[k] = elem(f, p.colormap, (@as(u64, k) * ncol) + ix);
-                    if depth == image.U8 {
+                    if depth == image.Depth.U8 {
                         c[k] = c[k] >> 8;
                     }
                 }
@@ -788,7 +790,7 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, spp: usize, colors:
             c[nc] = a;
         }
         for k in @as(usize, 0)..outc {
-            if depth == image.U16 {
+            if depth == image.Depth.U16 {
                 o16[(i * outc) + k] = @truncate(u16, c[k]);
             } else {
                 o8[(i * outc) + k] = @truncate(u8, c[k]);
@@ -1410,9 +1412,6 @@ fn field(o: *mut strs.String, tag: u64, typ: u64, count: u64, value: u64) !void 
 /// Writes images as the pages of one file.
 pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
     let comp = opts.compression;
-    if (comp != NONE) and (comp != LZW) and (comp != DEFLATE) and (comp != PACKBITS) {
-        return error.Unsupported;
-    }
     if imgs.len == 0 {
         return error.InvalidImage;
     }
@@ -1434,9 +1433,9 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
         let h = img.height;
         let mut bps: usize = 8;
         let mut format: u64 = 1;
-        if img.depth == image.U16 {
+        if img.depth == image.Depth.U16 {
             bps = 16;
-        } else if img.depth == image.F32 {
+        } else if img.depth == image.Depth.F32 {
             bps = 32;
             format = 3;
         }
@@ -1444,7 +1443,7 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
         let rowbytes = (w * ch) * bytes;
         let rps = @min(@max(65536 / @max(rowbytes, 1), 1), h);
         let nstrips = (h + (rps - 1)) / rps;
-        let use_pred = opts.predictor and ((comp == LZW) or (comp == DEFLATE));
+        let use_pred = opts.predictor and ((comp == Compression.LZW) or (comp == Compression.DEFLATE));
         let mut pred: u64 = 1;
         if use_pred {
             pred = 2;
@@ -1465,13 +1464,13 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
                 }
             }
             packed.clear();
-            if comp == NONE {
+            if comp == Compression.NONE {
                 packed.push_str(sb)!;
-            } else if comp == PACKBITS {
+            } else if comp == Compression.PACKBITS {
                 for y in @as(usize, 0)..(y1 - y0) {
                     packbits_row(sb[y * rowbytes..(y + 1) * rowbytes], &mut packed)!;
                 }
-            } else if comp == LZW {
+            } else if comp == Compression.LZW {
                 lzw_encode(sb, &mut packed)!;
             } else {
                 let z = deflate.compress(sb, deflate.ZLIB, deflate.DEFAULT_LEVEL)!;
@@ -1531,7 +1530,7 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
         } else {
             field(&mut o, 258, 3, @as(u64, ch), (@as(u64, bps) << 16) | @as(u64, bps))!;
         }
-        field(&mut o, 259, 3, 1, @as(u64, comp))!;
+        field(&mut o, 259, 3, 1, @as(u64, @int_from_enum(comp)))!;
         let mut photo: u64 = 1;
         if ch >= 3 {
             photo = 2;
@@ -1655,11 +1654,11 @@ test "files made by tifffile and libtiff" {
             return e;
         };
         defer img.deinit();
-        let mut depth = image.U8;
+        let mut depth = image.Depth.U8;
         if strs.eq(depth_name, "u16") {
-            depth = image.U16;
+            depth = image.Depth.U16;
         } else if strs.eq(depth_name, "f32") {
-            depth = image.F32;
+            depth = image.Depth.F32;
         }
         if (img.width != w) or (img.height != h) or (img.channels != c) or (img.depth != depth) {
             @expect_eq(name, "");
@@ -1679,19 +1678,19 @@ test "files made by tifffile and libtiff" {
     @expect(cases > 30);
 }
 
-fn test_image(w: usize, h: usize, ch: usize, depth: u8) !image.Image {
+fn test_image(w: usize, h: usize, ch: usize, depth: image.Depth) !image.Image {
     let mut img = image.Image.init(w, h, ch, depth)!;
     for y in @as(usize, 0)..h {
         for x in @as(usize, 0)..w {
             for c in @as(usize, 0)..ch {
                 let i = (((y * w) + x) * ch) + c;
                 let v = ((x * (7 + c)) + (y * 3)) + ((x / 5) * (y / 3));
-                if depth == image.U8 {
+                if depth == image.Depth.U8 {
                     img.data[i] = @truncate(u8, v);
                     if (x / 9) == 2 {
                         img.data[i] = 200;  // a run for PackBits
                     }
-                } else if depth == image.U16 {
+                } else if depth == image.Depth.U16 {
                     img.samples16()[i] = @truncate(u16, v * 263);
                 } else {
                     img.samples32()[i] = (@float_from_int(f32, v) / 37.0) - 1.5;
@@ -1703,8 +1702,8 @@ fn test_image(w: usize, h: usize, ch: usize, depth: u8) !image.Image {
 }
 
 test "round trips" {
-    let comps: [4]u16 = [NONE, LZW, DEFLATE, PACKBITS];
-    let depths: [3]u8 = [image.U8, image.U16, image.F32];
+    let comps: [4]Compression = [Compression.NONE, Compression.LZW, Compression.DEFLATE, Compression.PACKBITS];
+    let depths: [3]image.Depth = [image.Depth.U8, image.Depth.U16, image.Depth.F32];
     for d in @as(usize, 0)..3 {
         for ch in @as(usize, 1)..5 {
             let mut img = test_image(301, 250, ch, depths[d])!;
@@ -1725,9 +1724,9 @@ test "round trips" {
 }
 
 test "pages" {
-    let mut a = test_image(20, 10, 3, image.U8)!;
+    let mut a = test_image(20, 10, 3, image.Depth.U8)!;
     defer a.deinit();
-    let mut b = test_image(7, 30, 1, image.U16)!;
+    let mut b = test_image(7, 30, 1, image.Depth.U16)!;
     defer b.deinit();
     let both: [2]*image.Image = [&a, &b];
     let enc = encode_pages(both[..], Options.default())!;

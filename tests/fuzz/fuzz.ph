@@ -197,8 +197,17 @@ fn seeds(dir: []u8) !void {
     // images: gray, gray+alpha, RGB, RGBA; 8 and 16 bits; float for HDR/EXR
     let chans: [4]usize = [1, 2, 3, 4];
     let names: [7][]u8 = ["png", "jpeg", "bmp", "qoi", "pnm", "hdr", "exr"];
+    let fmts: [7]image_formats.Format = [
+        image_formats.Format.PNG,
+        image_formats.Format.JPEG,
+        image_formats.Format.BMP,
+        image_formats.Format.QOI,
+        image_formats.Format.PNM,
+        image_formats.Format.HDR,
+        image_formats.Format.EXR,
+    ];
     for c in chans {
-        let mut img = image.Image.init(13, 7, c, image.U8)!;
+        let mut img = image.Image.init(13, 7, c, image.Depth.U8)!;
         defer img.deinit();
         for y in @as(usize, 0)..7 {
             for x in @as(usize, 0)..13 {
@@ -207,11 +216,12 @@ fn seeds(dir: []u8) !void {
                 img.set(x, y, col);
             }
         }
-        for f in @as(u8, 1)..8 {
+        for k in @as(usize, 0)..7 {
+            let f = fmts[k];
             let mut src = img.clone()!;
             defer src.deinit();
-            if f >= image_formats.HDR {
-                let conv = src.convert(c, image.F32)!;
+            if (f == image_formats.Format.HDR) or (f == image_formats.Format.EXR) {
+                let conv = src.convert(c, image.Depth.F32)!;
                 src.deinit();
                 src = conv;
             }
@@ -219,24 +229,28 @@ fn seeds(dir: []u8) !void {
             defer mem.free(b);
             let mut n = strs.String.init();
             defer n.deinit();
-            n.push_str(names[@as(usize, f - 1)])!;
+            n.push_str(names[k])!;
             n.push('0' + @truncate(u8, c))!;
             put(dir, "image", n.bytes(), b)!;
         }
     }
     // sounds
     let rates: [2]u32 = [8000, 44100];
-    let fmts: [3]u8 = [audio_formats.WAV, audio_formats.AIFF, audio_formats.FLAC];
+    let afmts: [3]audio_formats.Format = [
+        audio_formats.Format.WAV,
+        audio_formats.Format.AIFF,
+        audio_formats.Format.FLAC,
+    ];
     let fnames: [3][]u8 = ["wav", "aiff", "flac"];
     for r in rates {
-        let mut snd = audio.Sound.init(300, 2, r, audio.S16)!;
+        let mut snd = audio.Sound.init(300, 2, r, audio.SampleFormat.S16)!;
         defer snd.deinit();
         for i in @as(usize, 0)..300 {
             snd.set(i, 0, (@float_from_int(f64, i % 37) / 40.0) - 0.4);
             snd.set(i, 1, (@float_from_int(f64, i % 11) / 12.0) - 0.4);
         }
         for k in @as(usize, 0)..3 {
-            let b = audio_formats.encode(&snd, fmts[k]) catch continue;
+            let b = audio_formats.encode(&snd, afmts[k]) catch continue;
             defer mem.free(b);
             let mut n = strs.String.init();
             defer n.deinit();
@@ -282,7 +296,7 @@ fn seeds(dir: []u8) !void {
     let mut path = draw.Path.init();
     defer path.deinit();
     path.rect(10.0, 10.0, 50.0, 20.0)!;
-    pg.fill(&path, draw.Paint.solid(color.Color.rgb(1.0, 0.0, 0.0)), draw.NONZERO)!;
+    pg.fill(&path, draw.Paint.solid(color.Color.rgb(1.0, 0.0, 0.0)), draw.FillRule.NONZERO)!;
     let mut f = font.Font.load("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") catch {
         doc.add_page(&mut pg)!;
         let b = doc.bytes()!;

@@ -290,7 +290,7 @@ fn run() !void {
     if wanted("image") {
         let w: usize = 1024;
         let h: usize = 768;
-        let mut img = image.Image.init(w, h, 4, image.U8)!;
+        let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
         defer img.deinit();
         for y in @as(usize, 0)..h {
             for x in @as(usize, 0)..w {
@@ -314,7 +314,7 @@ fn run() !void {
         report("png decode", raw * 4, t1);
         mem.free(p);
         let t2 = time.Instant.now();
-        let j = jpeg.encode(&img, 90, jpeg.SUBSAMPLE_420)!;
+        let j = jpeg.encode(&img, 90, jpeg.Subsample.S420)!;
         report("jpeg encode q90", raw, t2);
         save("image.jpg", j)!;
         let t3 = time.Instant.now();
@@ -332,7 +332,7 @@ fn run() !void {
         big.deinit();
     }
     if wanted("draw") {
-        let mut img = image.Image.init(800, 600, 4, image.U8)!;
+        let mut img = image.Image.init(800, 600, 4, image.Depth.U8)!;
         defer img.deinit();
         let mut cv = draw.Canvas.init(&mut img);
         defer cv.deinit();
@@ -345,7 +345,7 @@ fn run() !void {
             let x = @float_from_int(f64, rand() % 800);
             let y = @float_from_int(f64, rand() % 600);
             path.circle(x, y, 5.0 + @float_from_int(f64, i % 40))!;
-            cv.fill(&path, draw.Paint.solid(color.Color.rgb(0.2, 0.4, 0.8)), draw.NONZERO)!;
+            cv.fill(&path, draw.Paint.solid(color.Color.rgb(0.2, 0.4, 0.8)), draw.FillRule.NONZERO)!;
         }
         report_ms("draw fill circles", n, t0);
         let t1 = time.Instant.now();

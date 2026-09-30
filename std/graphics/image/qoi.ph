@@ -39,7 +39,7 @@ pub fn decode(data: []u8) !image.Image {
     if (@mul_checked(w, h) catch return error.InvalidImage) > image.MAX_PIXELS {
         return error.InvalidImage;
     }
-    let mut img = image.Image.init(w, h, ch, image.U8)!;
+    let mut img = image.Image.init(w, h, ch, image.Depth.U8)!;
     let out = img.samples8();
     let mut index: [64][4]u8 = [[0, 0, 0, 0]; 64];
     let mut px: [4]u8 = [0, 0, 0, 255];
@@ -95,12 +95,12 @@ pub fn decode(data: []u8) !image.Image {
 }
 
 pub fn encode(img: *image.Image) ![]mut u8 {
-    if (img.depth != image.U8) or (img.channels < 3) {
+    if (img.depth != image.Depth.U8) or (img.channels < 3) {
         let mut ch: usize = 3;
         if img.has_alpha() {
             ch = 4;
         }
-        let mut c = img.convert(ch, image.U8)!;
+        let mut c = img.convert(ch, image.Depth.U8)!;
         defer c.deinit();
         return encode(&c);
     }
@@ -196,7 +196,7 @@ pub fn encode(img: *image.Image) ![]mut u8 {
 test "round trips" {
     let chans: [2]usize = [3, 4];
     for ch in chans {
-        let mut img = image.Image.init(40, 30, ch, image.U8)!;
+        let mut img = image.Image.init(40, 30, ch, image.Depth.U8)!;
         defer img.deinit();
         let px = img.samples8();
         for i in @as(usize, 0)..px.len {

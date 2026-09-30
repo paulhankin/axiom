@@ -94,7 +94,7 @@ fn finish(o: *mut Out, rate: i32, skip0: usize, total0: usize) !audio.Sound {
     let skip = @min(skip0, o.frames);
     let total = @min(total0, o.frames - skip);
     let n = o.channels;
-    let mut s = audio.Sound.init(total, n, @bit_cast(u32, rate), audio.F32) catch |e| {
+    let mut s = audio.Sound.init(total, n, @bit_cast(u32, rate), audio.SampleFormat.F32) catch |e| {
         if e == error.OutOfMemory {
             return error.OutOfMemory;
         }

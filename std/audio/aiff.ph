@@ -151,20 +151,20 @@ fn decode_samples(d: []u8, comp: [4]u8, channels: usize, frames_hint: usize, bit
     if width > 8 or (not float and (width > 4)) {
         return error.Unsupported;
     }
-    let mut format = audio.S32;
+    let mut format = audio.SampleFormat.S32;
     if law != 0 {
-        format = audio.S16;
+        format = audio.SampleFormat.S16;
     } else if float {
-        format = audio.F32;
+        format = audio.SampleFormat.F32;
         if width == 8 {
-            format = audio.F64;
+            format = audio.SampleFormat.F64;
         }
     } else if width == 1 {
-        format = audio.U8;
+        format = audio.SampleFormat.U8;
     } else if width == 2 {
-        format = audio.S16;
+        format = audio.SampleFormat.S16;
     } else if width == 3 {
-        format = audio.S24;
+        format = audio.SampleFormat.S24;
     }
     let frames = @min(frames_hint, d.len / (width * channels));
     let mut s = audio.Sound.init(frames, channels, rate, format)!;
@@ -188,19 +188,19 @@ fn decode_samples(d: []u8, comp: [4]u8, channels: usize, frames_hint: usize, bit
             }
             v = (v << 8) | @as(u64, b);
         }
-        if format == audio.U8 {
+        if format == audio.SampleFormat.U8 {
             let mut x = @truncate(u8, v);
             if not unsigned {
                 x ^= 0x80;  // AIFF's 8-bit samples are signed
             }
             s.data[i] = x;
-        } else if format == audio.S16 {
+        } else if format == audio.SampleFormat.S16 {
             s.samples_i16()[i] = @bit_cast(i16, @truncate(u16, v));
-        } else if format == audio.S24 {
+        } else if format == audio.SampleFormat.S24 {
             s.samples_i32()[i] = @bit_cast(i32, @truncate(u32, v << 8)) >> 8;
-        } else if format == audio.S32 {
+        } else if format == audio.SampleFormat.S32 {
             s.samples_i32()[i] = @bit_cast(i32, @truncate(u32, v));
-        } else if format == audio.F32 {
+        } else if format == audio.SampleFormat.F32 {
             s.samples_f32()[i] = @bit_cast(f32, @truncate(u32, v));
         } else {
             s.samples_f64()[i] = @bit_cast(f64, v);
@@ -258,7 +258,7 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
     b[o + 15] = @truncate(u8, bits);
     ext80(s.rate, b[o + 16..o + 26]);
     if float {
-        if s.format == audio.F32 {
+        if s.format == audio.SampleFormat.F32 {
             @mem_copy(b[o + 26..o + 30], "fl32");
         } else {
             @mem_copy(b[o + 26..o + 30], "fl64");
@@ -270,17 +270,17 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
     put32(b, o + 4, @truncate(u32, data_len + 8));
     o += 16;  // offset and block size: 0
     for i in @as(usize, 0)..n {
-        if s.format == audio.U8 {
+        if s.format == audio.SampleFormat.U8 {
             b[o] = s.data[i] ^ 0x80;
             o += 1;
             continue;
         }
         let mut v: u64 = 0;
-        if s.format == audio.S16 {
+        if s.format == audio.SampleFormat.S16 {
             v = @as(u64, @bit_cast(u16, s.samples_i16()[i]));
-        } else if (s.format == audio.S24) or (s.format == audio.S32) {
+        } else if (s.format == audio.SampleFormat.S24) or (s.format == audio.SampleFormat.S32) {
             v = @as(u64, @bit_cast(u32, s.samples_i32()[i]));
-        } else if s.format == audio.F32 {
+        } else if s.format == audio.SampleFormat.F32 {
             v = @as(u64, @bit_cast(u32, s.samples_f32()[i]));
         } else {
             v = @bit_cast(u64, s.samples_f64()[i]);
@@ -294,7 +294,8 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
 }
 
 test "round trips every format" {
-    let fmts: [6]u8 = [audio.U8, audio.S16, audio.S24, audio.S32, audio.F32, audio.F64];
+    let fmts: [6]audio.SampleFormat = [audio.SampleFormat.U8, audio.SampleFormat.S16, audio.SampleFormat.S24,
+                                       audio.SampleFormat.S32, audio.SampleFormat.F32, audio.SampleFormat.F64];
     let chans: [2]usize = [1, 3];
     for f in fmts {
         for ch in chans {
@@ -308,7 +309,7 @@ test "round trips every format" {
             @expect(is_aiff(enc));
             let mut back = decode(enc)!;
             defer back.deinit();
-            @expect_eq(back.format, f);
+            @expect(back.format == f);
             @expect_eq(back.channels, ch);
             @expect_eq(back.rate, 44100);
             @expect_eq(back.frames, 51);
