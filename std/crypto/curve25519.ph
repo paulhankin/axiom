@@ -16,6 +16,7 @@
 // from their definitions rather than written out.
 // =============================================================================
 
+import "../sync.ph" as sync;
 import "random.ph" as random;
 import "sha2.ph" as sha2;
 import "subtle.ph" as subtle;
@@ -340,35 +341,35 @@ let mut CONSTS: Consts = Consts.{
     sqrtm1: Fe.{ l: [0; 10] },
     base: Point.{ x: Fe.{ l: [0; 10] }, y: Fe.{ l: [0; 10] }, z: Fe.{ l: [0; 10] }, t: Fe.{ l: [0; 10] } },
 };
-let mut CONSTS_READY: u32 = 0;
+let mut CONSTS_ONCE: sync.Once = sync.Once.{ state: 0 };
+
+fn build_consts(_u: u8) void {
+    let n = fe_small(-121665);
+    let dd = fe_small(121666);
+    let di = fe_invert(&dd);
+    let d = fe_mul(&n, &di);
+    let two = fe_small(2);
+    // (p - 1) / 4 = 2^253 - 5
+    let mut e: [32]u8 = [0xff; 32];
+    e[0] = 0xfb;
+    e[31] = 0x1f;
+    let sq = fe_pow(&two, e[..]);
+    let mut c = Consts.{ d: d, d2: fe_add(&d, &d), sqrtm1: sq, base: identity() };
+    fe_carry(&mut c.d2);
+    // y = 4/5, x recovered from the curve equation, sign bit 0
+    let four = fe_small(4);
+    let five = fe_small(5);
+    let fi = fe_invert(&five);
+    let y = fe_mul(&four, &fi);
+    let mut yb: [32]u8 = [0; 32];
+    fe_to_bytes(&y, yb[..]);
+    CONSTS = c;
+    c.base = decode_point(yb[..]) catch identity();
+    CONSTS = c;
+}
 
 fn consts() *Consts {
-    if @atomic_load(&CONSTS_READY) == 0 {
-        // racing threads compute and store the same values
-        let n = fe_small(-121665);
-        let dd = fe_small(121666);
-        let di = fe_invert(&dd);
-        let d = fe_mul(&n, &di);
-        let two = fe_small(2);
-        // (p - 1) / 4 = 2^253 - 5
-        let mut e: [32]u8 = [0xff; 32];
-        e[0] = 0xfb;
-        e[31] = 0x1f;
-        let sq = fe_pow(&two, e[..]);
-        let mut c = Consts.{ d: d, d2: fe_add(&d, &d), sqrtm1: sq, base: identity() };
-        fe_carry(&mut c.d2);
-        // y = 4/5, x recovered from the curve equation, sign bit 0
-        let four = fe_small(4);
-        let five = fe_small(5);
-        let fi = fe_invert(&five);
-        let y = fe_mul(&four, &fi);
-        let mut yb: [32]u8 = [0; 32];
-        fe_to_bytes(&y, yb[..]);
-        CONSTS = c;
-        c.base = decode_point(yb[..]) catch identity();
-        CONSTS = c;
-        @atomic_store(&mut CONSTS_READY, 1);
-    }
+    CONSTS_ONCE.call(build_consts, @as(u8, 0));
     return &CONSTS;
 }
 

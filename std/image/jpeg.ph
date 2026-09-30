@@ -21,6 +21,7 @@ import "../image.ph" as image;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
+import "../sync.ph" as sync;
 
 error { InvalidImage, Unsupported, OutOfMemory }
 
@@ -1447,23 +1448,24 @@ let ZIGZAG_OF: [64]u8 = [
 
 let mut DCT_COS: [64]f32 = [0.0; 64];    // c(u) cos((2x + 1) u pi / 16) / 2
 let mut DCT_COS_T: [64]f32 = [0.0; 64];  // transposed
-let mut DCT_READY: u32 = 0;
+let mut DCT_ONCE: sync.Once = sync.Once.{ state: 0 };
+
+fn build_dct(_u: u8) void {
+    for u in @as(usize, 0)..8 {
+        let mut cu: f64 = 0.5;
+        if u == 0 {
+            cu = 0.35355339059327373;  // 1 / (2 sqrt 2)
+        }
+        for x in @as(usize, 0)..8 {
+            let a = (@float_from_int(f64, (2 * x) + 1) * @float_from_int(f64, u)) * (3.14159265358979323846 / 16.0);
+            DCT_COS[(u * 8) + x] = @float_cast(f32, cu * math.cos(a));
+            DCT_COS_T[(x * 8) + u] = DCT_COS[(u * 8) + x];
+        }
+    }
+}
 
 fn dct_table() *[64]f32 {
-    if @atomic_load(&DCT_READY) == 0 {
-        for u in @as(usize, 0)..8 {
-            let mut cu: f64 = 0.5;
-            if u == 0 {
-                cu = 0.35355339059327373;  // 1 / (2 sqrt 2)
-            }
-            for x in @as(usize, 0)..8 {
-                let a = (@float_from_int(f64, (2 * x) + 1) * @float_from_int(f64, u)) * (3.14159265358979323846 / 16.0);
-                DCT_COS[(u * 8) + x] = @float_cast(f32, cu * math.cos(a));
-                DCT_COS_T[(x * 8) + u] = DCT_COS[(u * 8) + x];
-            }
-        }
-        @atomic_store(&mut DCT_READY, 1);
-    }
+    DCT_ONCE.call(build_dct, @as(u8, 0));
     return &DCT_COS;
 }
 

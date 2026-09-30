@@ -22,6 +22,7 @@
 import "fmt.ph" as fmt;
 import "math.ph" as math;
 import "str.ph" as strs;
+import "sync.ph" as sync;
 
 error { InvalidColor }
 
@@ -351,21 +352,22 @@ pub fn srgb_decode(v: f32) f32 {
 let mut DECODE8: [256]f32 = [0.0; 256];  // encoded byte -> linear
 let mut THRESH8: [255]f32 = [0.0; 255];  // linear values where the encoded byte steps up
 let mut BUCKET8: [4096]u8 = [0; 4096];   // srgb8(k / 4096): where to start looking
-let mut TABLES_READY: u32 = 0;
+let mut TABLES_ONCE: sync.Once = sync.Once.{ state: 0 };
+
+fn build_tables(_u: u8) void {
+    for i in @as(usize, 0)..256 {
+        DECODE8[i] = srgb_decode_f64(@float_from_int(f64, i) / 255.0);
+    }
+    for i in @as(usize, 0)..255 {
+        THRESH8[i] = srgb_decode_f64((@float_from_int(f64, i) + 0.5) / 255.0);
+    }
+    for k in @as(usize, 0)..4096 {
+        BUCKET8[k] = search8(@float_from_int(f32, k) / 4096.0);
+    }
+}
 
 fn decode_table() *[256]f32 {
-    if @atomic_load(&TABLES_READY) == 0 {
-        for i in @as(usize, 0)..256 {
-            DECODE8[i] = srgb_decode_f64(@float_from_int(f64, i) / 255.0);
-        }
-        for i in @as(usize, 0)..255 {
-            THRESH8[i] = srgb_decode_f64((@float_from_int(f64, i) + 0.5) / 255.0);
-        }
-        for k in @as(usize, 0)..4096 {
-            BUCKET8[k] = search8(@float_from_int(f32, k) / 4096.0);
-        }
-        @atomic_store(&mut TABLES_READY, 1);
-    }
+    TABLES_ONCE.call(build_tables, @as(u8, 0));
     return &DECODE8;
 }
 

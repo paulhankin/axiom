@@ -30,6 +30,7 @@ import "color.ph" as color;
 import "image.ph" as image;
 import "math.ph" as math;
 import "mem.ph" as mem;
+import "sync.ph" as sync;
 import "vec.ph" as vec;
 
 error { OutOfMemory, InvalidPath }
@@ -1364,15 +1365,16 @@ fn composite(op: u8, s: Premul, d: Premul) Premul {
 }
 
 let mut U16_LINEAR: [65536]f32 = [0.0; 65536];
-let mut U16_READY: u32 = 0;
+let mut U16_ONCE: sync.Once = sync.Once.{ state: 0 };
+
+fn build_u16(_u: u8) void {
+    for i in @as(usize, 0)..65536 {
+        U16_LINEAR[i] = color.srgb_decode(@float_from_int(f32, i) / 65535.0);
+    }
+}
 
 fn u16_linear(v: u16) f32 {
-    if @atomic_load(&U16_READY) == 0 {
-        for i in @as(usize, 0)..65536 {
-            U16_LINEAR[i] = color.srgb_decode(@float_from_int(f32, i) / 65535.0);
-        }
-        @atomic_store(&mut U16_READY, 1);
-    }
+    U16_ONCE.call(build_u16, @as(u8, 0));
     return U16_LINEAR[@as(usize, v)];
 }
 

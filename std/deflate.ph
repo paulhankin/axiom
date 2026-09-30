@@ -28,6 +28,7 @@
 import "io.ph" as io;
 import "mem.ph" as mem;
 import "str.ph" as strs;
+import "sync.ph" as sync;
 
 error { CorruptData, ChecksumMismatch, Truncated, TooLarge, OutOfMemory }
 
@@ -63,30 +64,31 @@ let CL_ORDER: [19]u8 = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 1
 // -----------------------------------------------------------------------------
 
 let mut CRC_TABLE: [2048]u32 = [0; 2048];  // slicing by 8: eight tables of 256
-let mut CRC_READY: u32 = 0;
+let mut CRC_ONCE: sync.Once = sync.Once.{ state: 0 };
+
+fn build_crc(_u: u8) void {
+    for n in @as(usize, 0)..256 {
+        let mut c = @as(u32, @truncate(u8, n));
+        for k in @as(usize, 0)..8 {
+            if (c & 1) != 0 {
+                c = 0xedb88320 ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        CRC_TABLE[n] = c;
+    }
+    for n in @as(usize, 0)..256 {
+        let mut c = CRC_TABLE[n];
+        for t in @as(usize, 1)..8 {
+            c = CRC_TABLE[@as(usize, c & 0xff)] ^ (c >> 8);
+            CRC_TABLE[(t * 256) + n] = c;
+        }
+    }
+}
 
 fn crc_table() *[2048]u32 {
-    if @atomic_load(&CRC_READY) == 0 {
-        for n in @as(usize, 0)..256 {
-            let mut c = @as(u32, @truncate(u8, n));
-            for k in @as(usize, 0)..8 {
-                if (c & 1) != 0 {
-                    c = 0xedb88320 ^ (c >> 1);
-                } else {
-                    c = c >> 1;
-                }
-            }
-            CRC_TABLE[n] = c;
-        }
-        for n in @as(usize, 0)..256 {
-            let mut c = CRC_TABLE[n];
-            for t in @as(usize, 1)..8 {
-                c = CRC_TABLE[@as(usize, c & 0xff)] ^ (c >> 8);
-                CRC_TABLE[(t * 256) + n] = c;
-            }
-        }
-        @atomic_store(&mut CRC_READY, 1);
-    }
+    CRC_ONCE.call(build_crc, @as(u8, 0));
     return &CRC_TABLE;
 }
 
@@ -713,12 +715,13 @@ const TOO_FAR: usize = 4096;      // a 3-byte match this far back isn't worth it
 // Symbol lookup for encoding: LEN_CODE[len - 3] and DIST_CODE (see dist_code).
 let mut LEN_CODE: [256]u8 = [0; 256];
 let mut DIST_CODE: [512]u8 = [0; 512];
-let mut CODES_READY: u32 = 0;
+let mut CODES_ONCE: sync.Once = sync.Once.{ state: 0 };
 
 fn init_codes() void {
-    if @atomic_load(&CODES_READY) != 0 {
-        return;
-    }
+    CODES_ONCE.call(build_symbol_codes, @as(u8, 0));
+}
+
+fn build_symbol_codes(_u: u8) void {
     for c in @as(usize, 0)..29 {
         let base = @as(usize, LEN_BASE[c]) - 3;
         for k in 0..(@as(usize, 1) << LEN_EXTRA[c]) {
@@ -739,7 +742,6 @@ fn init_codes() void {
             }
         }
     }
-    @atomic_store(&mut CODES_READY, 1);
 }
 
 /// The symbol for distance d + 1.

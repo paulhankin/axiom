@@ -12,6 +12,7 @@
 // =============================================================================
 
 import "../mem.ph" as mem;
+import "../sync.ph" as sync;
 import "../vec.ph" as vec;
 
 error { InvalidAudio, OutOfMemory }
@@ -37,24 +38,25 @@ pub struct Packets {
 }
 
 let mut crc_table: [256]u32 = [0; 256];
-let mut crc_ready: bool = false;
+let mut crc_once: sync.Once = sync.Once.{ state: 0 };
+
+fn build_crc(_u: u8) void {
+    for i in @as(u32, 0)..256 {
+        let mut c = i << 24;
+        for _k in @as(u32, 0)..8 {
+            if (c & 0x80000000) != 0 {
+                c = (c << 1) ^ 0x04c11db7;
+            } else {
+                c = c << 1;
+            }
+        }
+        crc_table[@as(usize, i)] = c;
+    }
+}
 
 /// Ogg's CRC-32 (polynomial 0x04c11db7, not reflected, initial 0).
 pub fn crc32(d: []u8) u32 {
-    if not crc_ready {
-        for i in @as(u32, 0)..256 {
-            let mut c = i << 24;
-            for _k in @as(u32, 0)..8 {
-                if (c & 0x80000000) != 0 {
-                    c = (c << 1) ^ 0x04c11db7;
-                } else {
-                    c = c << 1;
-                }
-            }
-            crc_table[@as(usize, i)] = c;
-        }
-        crc_ready = true;
-    }
+    crc_once.call(build_crc, @as(u8, 0));
     let mut c: u32 = 0;
     for b in d {
         c = (c << 8) ^ crc_table[@as(usize, (c >> 24) ^ @as(u32, b))];

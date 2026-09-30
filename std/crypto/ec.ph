@@ -18,6 +18,7 @@
 // code, generic over the number of limbs.
 // =============================================================================
 
+import "../sync.ph" as sync;
 import "random.ph" as random;
 import "subtle.ph" as subtle;
 
@@ -680,22 +681,24 @@ let mut CURVE384: Curve.[12] = Curve.[12].{
     b: U.[12].{ w: [0; 12] },
     g: Point.[12].{ x: U.[12].{ w: [0; 12] }, y: U.[12].{ w: [0; 12] }, z: U.[12].{ w: [0; 12] } },
 };
-let mut READY256: u32 = 0;
-let mut READY384: u32 = 0;
+let mut ONCE256: sync.Once = sync.Once.{ state: 0 };
+let mut ONCE384: sync.Once = sync.Once.{ state: 0 };
+
+fn build256(_u: u8) void {
+    CURVE256 = make_curve.[8](P256_P[..], P256_N[..], P256_B[..], P256_GX[..], P256_GY[..]);
+}
+
+fn build384(_u: u8) void {
+    CURVE384 = make_curve.[12](P384_P[..], P384_N[..], P384_B[..], P384_GX[..], P384_GY[..]);
+}
 
 fn p256() *Curve.[8] {
-    if @atomic_load(&READY256) == 0 {
-        CURVE256 = make_curve.[8](P256_P[..], P256_N[..], P256_B[..], P256_GX[..], P256_GY[..]);
-        @atomic_store(&mut READY256, 1);
-    }
+    ONCE256.call(build256, @as(u8, 0));
     return &CURVE256;
 }
 
 fn p384() *Curve.[12] {
-    if @atomic_load(&READY384) == 0 {
-        CURVE384 = make_curve.[12](P384_P[..], P384_N[..], P384_B[..], P384_GX[..], P384_GY[..]);
-        @atomic_store(&mut READY384, 1);
-    }
+    ONCE384.call(build384, @as(u8, 0));
     return &CURVE384;
 }
 

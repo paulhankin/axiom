@@ -18,6 +18,7 @@ import "../base64.ph" as base64;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
+import "../sync.ph" as sync;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
 
@@ -3684,16 +3685,17 @@ fn read_values(b: *mut Bits, g: *Granule, end: usize, is: []mut i32) usize {
 }
 
 let mut pow43_table: [8207]f64 = [0.0; 8207];
-let mut pow43_ready: bool = false;
+let mut pow43_once: sync.Once = sync.Once.{ state: 0 };
+
+fn build_pow43(_u: u8) void {
+    for k in @as(usize, 0)..8207 {
+        let x = @float_from_int(f64, k);
+        pow43_table[k] = x * math.cbrt(x);
+    }
+}
 
 fn pow43(v: i32) f64 {
-    if not pow43_ready {
-        for k in @as(usize, 0)..8207 {
-            let x = @float_from_int(f64, k);
-            pow43_table[k] = x * math.cbrt(x);
-        }
-        pow43_ready = true;
-    }
+    pow43_once.call(build_pow43, @as(u8, 0));
     let a = @abs(v);
     let mut m: f64 = 0.0;
     if a < 8207 {

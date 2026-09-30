@@ -9,31 +9,28 @@
 // =============================================================================
 
 import "crypto/random.ph" as random;
+import "sync.ph" as sync;
 import "time.ph" as time;
 
-let mut key_state: u32 = 0;  // 0: no key yet, 1: being chosen, 2: ready
+let mut key_once: sync.Once = sync.Once.{ state: 0 };
 let mut k0: u64 = 0;
 let mut k1: u64 = 0;
 
 fn key() void {
-    if @atomic_load(&key_state) == 2 {
-        return;
-    }
-    if @atomic_cas(&mut key_state, 0, 1) == 0 {
-        let mut b: [16]u8 = [0; 16];
-        random.fill(b[..]) catch {
-            // (no system randomness: the clock is a poor key, but a key)
-            let t = @bit_cast(u64, time.Instant.now().ns);
-            for i in @as(usize, 0)..16 {
-                b[i] = @truncate(u8, splitmix(t +% @as(u64, i)) >> 17);
-            }
-        };
-        k0 = load64(b[..8]);
-        k1 = load64(b[8..]);
-        @atomic_store(&mut key_state, 2);
-        return;
-    }
-    while @atomic_load(&key_state) != 2 {}
+    key_once.call(choose_key, @as(u8, 0));
+}
+
+fn choose_key(_u: u8) void {
+    let mut b: [16]u8 = [0; 16];
+    random.fill(b[..]) catch {
+        // (no system randomness: the clock is a poor key, but a key)
+        let t = @bit_cast(u64, time.Instant.now().ns);
+        for i in @as(usize, 0)..16 {
+            b[i] = @truncate(u8, splitmix(t +% @as(u64, i)) >> 17);
+        }
+    };
+    k0 = load64(b[..8]);
+    k1 = load64(b[8..]);
 }
 
 fn load64(b: []u8) u64 {

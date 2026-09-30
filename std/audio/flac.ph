@@ -22,6 +22,7 @@ import "../audio.ph" as audio;
 import "../crypto/md5.ph" as md5;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
+import "../sync.ph" as sync;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
 
@@ -75,23 +76,24 @@ fn crc8(d: []u8) u8 {
 }
 
 let mut crc16_table: [256]u16 = [0; 256];
-let mut crc16_ready: bool = false;
+let mut crc16_once: sync.Once = sync.Once.{ state: 0 };
+
+fn build_crc16(_u: u8) void {
+    for i in @as(u32, 0)..256 {
+        let mut c = i << 8;
+        for _k in @as(u32, 0)..8 {
+            if (c & 0x8000) != 0 {
+                c = ((c << 1) ^ 0x8005) & 0xffff;
+            } else {
+                c = (c << 1) & 0xffff;
+            }
+        }
+        crc16_table[@as(usize, i)] = @truncate(u16, c);
+    }
+}
 
 fn crc16(d: []u8) u16 {
-    if not crc16_ready {
-        for i in @as(u32, 0)..256 {
-            let mut c = i << 8;
-            for _k in @as(u32, 0)..8 {
-                if (c & 0x8000) != 0 {
-                    c = ((c << 1) ^ 0x8005) & 0xffff;
-                } else {
-                    c = (c << 1) & 0xffff;
-                }
-            }
-            crc16_table[@as(usize, i)] = @truncate(u16, c);
-        }
-        crc16_ready = true;
-    }
+    crc16_once.call(build_crc16, @as(u8, 0));
     let mut c: u32 = 0;
     for b in d {
         c = ((c << 8) & 0xffff) ^ @as(u32, crc16_table[@as(usize, (c >> 8) ^ @as(u32, b))]);

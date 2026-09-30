@@ -16,6 +16,7 @@ import "../base64.ph" as base64;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
+import "../sync.ph" as sync;
 import "../vec.ph" as vec;
 import "ogg.ph" as ogg;
 
@@ -812,16 +813,17 @@ fn render_line(x0: i32, y0: i32, x1: i32, y1: i32, out: []mut i32) void {
 }
 
 let mut inv_db: [256]f32 = [0.0; 256];
-let mut inv_db_ready: bool = false;
+let mut inv_db_once: sync.Once = sync.Once.{ state: 0 };
+
+fn build_inv_db(_u: u8) void {
+    for k in @as(usize, 0)..256 {
+        let e = (@float_from_int(f64, k) - 255.0) * (7.0 / 256.0);
+        inv_db[k] = @float_cast(f32, math.pow(10.0, e));
+    }
+}
 
 fn inverse_db(i: i32) f32 {
-    if not inv_db_ready {
-        for k in @as(usize, 0)..256 {
-            let e = (@float_from_int(f64, k) - 255.0) * (7.0 / 256.0);
-            inv_db[k] = @float_cast(f32, math.pow(10.0, e));
-        }
-        inv_db_ready = true;
-    }
+    inv_db_once.call(build_inv_db, @as(u8, 0));
     return inv_db[@as(usize, @bit_cast(u32, @max(@min(i, 255), 0)))];
 }
 
