@@ -1607,8 +1607,9 @@ fn check_cmp_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
                                      t.name, ty.constraint_name(t.constraint)));
         return false;
     }
-    if eq and ((t.kind == ast.TY_BOOL) or (t.kind == ast.TY_PTR) or (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_FN) or
-               (t.kind == ast.TY_ENUM)) {
+    if eq and
+       ((t.kind == ast.TY_BOOL) or (t.kind == ast.TY_PTR) or (t.kind == ast.TY_ERROR) or (t.kind == ast.TY_FN) or
+        (t.kind == ast.TY_ENUM)) {
         return true;
     }
     if (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128) {
@@ -2086,8 +2087,8 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
         return e.ty;
     }
     let mut base = t;
-    if (t.kind == ast.TY_PTR) and ((t.elem.kind == ast.TY_STRUCT) or (t.elem.kind == ast.TY_UNION) or
-                                   (t.elem.kind == ast.TY_ENUM)) {
+    if (t.kind == ast.TY_PTR) and
+       ((t.elem.kind == ast.TY_STRUCT) or (t.elem.kind == ast.TY_UNION) or (t.elem.kind == ast.TY_ENUM)) {
         base = t.elem;
         e.self_mode = ast.SELF_DEREF;
     }
@@ -3395,8 +3396,7 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         } else if ty.is_untyped(s) {
             _ = finalize_untyped(earg(e, 1));
         } else if (s.kind != ast.TY_INT) and (s.kind != ast.TY_INVALID) {
-            _ = dg.err(barg(e, 1).span, "E0822", u.f1("@enum_from_int requires an integer operand, found %s",
-                                                      tstr(s)));
+            _ = dg.err(barg(e, 1).span, "E0822", u.f1("@enum_from_int requires an integer operand, found %s", tstr(s)));
         }
         let a = barg(e, 1);
         if a.is_const and (a.ty.kind == ast.TY_INT) {
@@ -4197,16 +4197,19 @@ fn check_match(s: *mut ast.Stmt) bool {
                     }
                     if not u.isnos(a.bind) {
                         if u.isnil(pt) {
-                            _ = dg.err(a.bind_span, "E0633", u.f2("%s '%s' has no payload to bind",
-                                                                  u.pick(is_enum, "enum member", "variant"), a.name));
+                            _ = dg.err(
+                                a.bind_span, "E0633", u.f2(
+                                    "%s '%s' has no payload to bind", u.pick(is_enum, "enum member", "variant"),
+                                    a.name));
                         } else {
                             a.bind_local = declare_local(a.bind, a.bind_span, pt, false, false);
                         }
                     }
                 }
             } else {
-                _ = dg.err(a.span, "E0634", u.f2("this pattern cannot match a value of %s type %s",
-                                                 u.pick(is_enum, "enum", "union"), tstr(t)));
+                _ = dg.err(
+                    a.span, "E0634", u.f2(
+                        "this pattern cannot match a value of %s type %s", u.pick(is_enum, "enum", "union"), tstr(t)));
             }
             if not check_block(a.body) {
                 all_div = false;
