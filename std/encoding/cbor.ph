@@ -628,12 +628,14 @@ pub fn decode_prefix(bytes: []u8, used: *mut usize) !Document {
     return Document.{ root: v, arena: d.arena };
 }
 
-const F_ARRAY: u8 = 0;
-const F_MAP: u8 = 1;
-const F_TAG: u8 = 2;
+enum FrameKind: u8 {
+    ARRAY,
+    MAP,
+    TAG,
+}
 
 struct Frame {
-    kind: u8,
+    kind: FrameKind,
     indefinite: bool,
     left: u64,     // items still to come (definite lengths; a map's keys and values both count)
     start: usize,  // where its items begin in the list of open items
@@ -641,11 +643,13 @@ struct Frame {
 }
 
 // What one head was: a complete value, the start of a container, or a break.
-const H_VALUE: u8 = 0;
-const H_ARRAY: u8 = 1;
-const H_MAP: u8 = 2;
-const H_TAG: u8 = 3;
-const H_BREAK: u8 = 4;
+enum Head: u8 {
+    VALUE,
+    ARRAY,
+    MAP,
+    TAG,
+    BREAK,
+}
 
 struct Decoder {
     s: []u8,
@@ -723,7 +727,7 @@ struct Decoder {
 
     // Reads one head: a value into v, or a container's header (its length
     // into n, or NONE for indefinite).
-    fn head(self: *mut Decoder, v: *mut Value, n: *mut u64) !u8 {
+    fn head(self: *mut Decoder, v: *mut Value, n: *mut u64) !Head {
         let b = self.byte()!;
         let major = b >> 5;
         let ai = b & 31;
@@ -732,7 +736,7 @@ struct Decoder {
         }
         if major == 7 {
             if ai == 31 {
-                return H_BREAK;
+                return Head.BREAK;
             }
             if ai < 20 {
                 v.* = Value.Simple(ai);
@@ -757,30 +761,30 @@ struct Decoder {
             } else {
                 v.* = Value.Float(@bit_cast(f64, self.arg(ai)!));
             }
-            return H_VALUE;
+            return Head.VALUE;
         }
         if (ai == 31) and ((major == 0) or (major == 1) or (major == 6)) {
             return error.Invalid;
         }
         if major == 0 {
             v.* = Value.Uint(self.arg(ai)!);
-            return H_VALUE;
+            return Head.VALUE;
         }
         if major == 1 {
             v.* = Value.Neg(self.arg(ai)!);
-            return H_VALUE;
+            return Head.VALUE;
         }
         if major == 2 {
             v.* = Value.Bytes(self.string(2, ai)!);
-            return H_VALUE;
+            return Head.VALUE;
         }
         if major == 3 {
             v.* = Value.Text(self.string(3, ai)!);
-            return H_VALUE;
+            return Head.VALUE;
         }
         if major == 6 {
             n.* = self.arg(ai)!;
-            return H_TAG;
+            return Head.TAG;
         }
         if ai == 31 {
             n.* = NONE64;
@@ -788,9 +792,9 @@ struct Decoder {
             n.* = self.arg(ai)!;
         }
         if major == 4 {
-            return H_ARRAY;
+            return Head.ARRAY;
         }
-        return H_MAP;
+        return Head.MAP;
     }
 
     // One data item, with its nested items, read with an explicit stack.
@@ -805,13 +809,13 @@ struct Decoder {
             let mut v = Value.Null;
             let mut n: u64 = 0;
             let h = self.head(&mut v, &mut n)!;
-            let mut done = h == H_VALUE;
-            if h == H_BREAK {
+            let mut done = h == Head.VALUE;
+            if h == Head.BREAK {
                 if (frames.len == 0) or not frames.get(frames.len - 1).indefinite {
                     return error.Invalid;
                 }
                 let top = frames.get(frames.len - 1);
-                if (top.kind == F_MAP) and (((vals.len - top.start) % 2) != 0) {
+                if (top.kind == FrameKind.MAP) and (((vals.len - top.start) % 2) != 0) {
                     return error.Invalid;  // a key without a value
                 }
                 v = self.close(top, &mut vals, &mut pairs)!;
@@ -820,13 +824,13 @@ struct Decoder {
             } else if not done {
                 let mut left = n;
                 let indefinite = n == NONE64;
-                if h == H_MAP and not indefinite {
+                if h == Head.MAP and not indefinite {
                     if n > (@as(u64, self.s.len) / 2) {
                         return error.Truncated;
                     }
                     left = n * 2;
                 }
-                if h == H_TAG {
+                if h == Head.TAG {
                     left = 1;
                 }
                 if not indefinite and (left > @as(u64, self.s.len - self.i)) {
@@ -835,11 +839,11 @@ struct Decoder {
                 if frames.len >= @as(usize, MAX_DEPTH) {
                     return error.TooDeep;
                 }
-                let mut kind = F_ARRAY;
-                if h == H_MAP {
-                    kind = F_MAP;
-                } else if h == H_TAG {
-                    kind = F_TAG;
+                let mut kind = FrameKind.ARRAY;
+                if h == Head.MAP {
+                    kind = FrameKind.MAP;
+                } else if h == Head.TAG {
+                    kind = FrameKind.TAG;
                 }
                 let f = Frame.{ kind: kind, indefinite: indefinite, left: left, start: vals.len, tag: n };
                 if not indefinite and (left == 0) {
@@ -876,13 +880,13 @@ struct Decoder {
     fn close(self: *mut Decoder, f: Frame, vals: *mut vec.Vec.[Value], pairs: *mut vec.Vec.[Pair]) !Value {
         let items = vals.items()[f.start..];
         let mut v = Value.Null;
-        if f.kind == F_MAP {
+        if f.kind == FrameKind.MAP {
             pairs.clear();
             for k in @as(usize, 0)..items.len / 2 {
                 pairs.push(Pair.{ key: items[2 * k], value: items[(2 * k) + 1] })!;
             }
             v = Value.Map(self.arena.copy.[Pair](pairs.items())!);
-        } else if f.kind == F_TAG {
+        } else if f.kind == FrameKind.TAG {
             v = Value.Tag(Tagged.{ tag: f.tag, content: self.arena.copy.[Value](items)! });
         } else {
             v = Value.Array(self.arena.copy.[Value](items)!);

@@ -166,16 +166,18 @@ fn is_word_byte(c: u8) bool {
 // Syntax tree
 // -----------------------------------------------------------------------------
 
-const N_EMPTY: u8 = 0;
-const N_RUNE: u8 = 1;    // a: code point
-const N_CLASS: u8 = 2;   // a: class
-const N_ANY: u8 = 3;     // . without s
-const N_ANY_NL: u8 = 4;  // . with s
-const N_CAT: u8 = 5;     // kids
-const N_ALT: u8 = 6;     // kids
-const N_REPEAT: u8 = 7;  // a: child; min, max (INF), greedy
-const N_GROUP: u8 = 8;   // a: child; b: capture index, or NONE
-const N_ASSERT: u8 = 9;  // a: assertion
+enum NodeKind: u8 {
+    EMPTY,
+    RUNE,    // a: code point
+    CLASS,   // a: class
+    ANY,     // . without s
+    ANY_NL,  // . with s
+    CAT,     // kids
+    ALT,     // kids
+    REPEAT,  // a: child; min, max (INF), greedy
+    GROUP,   // a: child; b: capture index, or NONE
+    ASSERT,  // a: assertion
+}
 
 const INF: u32 = 0xFFFFFFFF;
 const NONE: u32 = 0xFFFFFFFF;
@@ -188,7 +190,7 @@ const A_WORD: u32 = 4;
 const A_NOT_WORD: u32 = 5;
 
 struct Node {
-    kind: u8,
+    kind: NodeKind,
     greedy: bool,
     a: u32,
     b: u32,
@@ -237,11 +239,11 @@ struct Parser {
         return @int_cast(u32, self.nodes.len - 1);
     }
 
-    fn leaf(self: *mut Parser, kind: u8, a: u32) !u32 {
+    fn leaf(self: *mut Parser, kind: NodeKind, a: u32) !u32 {
         return self.node(Node.{ kind: kind, greedy: false, a: a, b: 0, min: 0, max: 0, first: 0, count: 0 });
     }
 
-    fn list(self: *mut Parser, kind: u8, items: []u32) !u32 {
+    fn list(self: *mut Parser, kind: NodeKind, items: []u32) !u32 {
         let first = @int_cast(u32, self.kids.len);
         self.kids.extend(items)!;
         return self.node(Node.{ kind: kind, greedy: false, a: 0, b: 0, min: 0, max: 0, first: first,
@@ -286,7 +288,7 @@ struct Parser {
         if alts.len == 1 {
             return alts.get(0);
         }
-        return self.list(N_ALT, alts.items());
+        return self.list(NodeKind.ALT, alts.items());
     }
 
     fn concatenation(self: *mut Parser, f: *mut Flags) !u32 {
@@ -302,12 +304,12 @@ struct Parser {
             items.push(r)!;
         }
         if items.len == 0 {
-            return self.leaf(N_EMPTY, 0);
+            return self.leaf(NodeKind.EMPTY, 0);
         }
         if items.len == 1 {
             return items.get(0);
         }
-        return self.list(N_CAT, items.items());
+        return self.list(NodeKind.CAT, items.items());
     }
 
     fn number(self: *mut Parser) !u32 {
@@ -368,7 +370,7 @@ struct Parser {
                 return a;
             }
             let k = self.nodes.get(@as(usize, a)).kind;
-            if (k == N_EMPTY) or (k == N_ASSERT) {
+            if (k == NodeKind.EMPTY) or (k == NodeKind.ASSERT) {
                 return self.fail("missing argument to repetition operator");
             }
             let mut greedy = true;
@@ -383,7 +385,8 @@ struct Parser {
             if (nc == '*') or (nc == '+') or (nc == '?') {
                 return self.fail("bad repetition operator");
             }
-            a = self.node(Node.{ kind: N_REPEAT, greedy: greedy, a: a, b: 0, min: min, max: max, first: 0, count: 0 })!;
+            a = self.node(Node.{ kind: NodeKind.REPEAT, greedy: greedy, a: a, b: 0, min: min, max: max, first: 0,
+                                 count: 0 })!;
         }
     }
 
@@ -393,9 +396,9 @@ struct Parser {
             defer set.deinit();
             set.add(r, r)!;
             set.fold()!;
-            return self.leaf(N_CLASS, self.class_of(&mut set)!);
+            return self.leaf(NodeKind.CLASS, self.class_of(&mut set)!);
         }
-        return self.leaf(N_RUNE, r);
+        return self.leaf(NodeKind.RUNE, r);
     }
 
     /// One atom; NONE for a flag group, which matches nothing.
@@ -407,28 +410,28 @@ struct Parser {
                 let mut set = Set.init();
                 defer set.deinit();
                 self.class(&mut set, f)!;
-                return self.leaf(N_CLASS, self.class_of(&mut set)!);
+                return self.leaf(NodeKind.CLASS, self.class_of(&mut set)!);
             }
             '.' => {
                 self.i += 1;
                 if f.dotall {
-                    return self.leaf(N_ANY_NL, 0);
+                    return self.leaf(NodeKind.ANY_NL, 0);
                 }
-                return self.leaf(N_ANY, 0);
+                return self.leaf(NodeKind.ANY, 0);
             }
             '^' => {
                 self.i += 1;
                 if f.multiline {
-                    return self.leaf(N_ASSERT, A_BEGIN_LINE);
+                    return self.leaf(NodeKind.ASSERT, A_BEGIN_LINE);
                 }
-                return self.leaf(N_ASSERT, A_BEGIN_TEXT);
+                return self.leaf(NodeKind.ASSERT, A_BEGIN_TEXT);
             }
             '$' => {
                 self.i += 1;
                 if f.multiline {
-                    return self.leaf(N_ASSERT, A_END_LINE);
+                    return self.leaf(NodeKind.ASSERT, A_END_LINE);
                 }
-                return self.leaf(N_ASSERT, A_END_TEXT);
+                return self.leaf(NodeKind.ASSERT, A_END_TEXT);
             }
             '\\' => { return self.escape(f); }
             '*'  => { return self.fail("missing argument to repetition operator"); }
@@ -450,19 +453,19 @@ struct Parser {
         match c {
             'A' => {
                 self.i += 1;
-                return self.leaf(N_ASSERT, A_BEGIN_TEXT);
+                return self.leaf(NodeKind.ASSERT, A_BEGIN_TEXT);
             }
             'z' => {
                 self.i += 1;
-                return self.leaf(N_ASSERT, A_END_TEXT);
+                return self.leaf(NodeKind.ASSERT, A_END_TEXT);
             }
             'b' => {
                 self.i += 1;
-                return self.leaf(N_ASSERT, A_WORD);
+                return self.leaf(NodeKind.ASSERT, A_WORD);
             }
             'B' => {
                 self.i += 1;
-                return self.leaf(N_ASSERT, A_NOT_WORD);
+                return self.leaf(NodeKind.ASSERT, A_NOT_WORD);
             }
             else => {}
         }
@@ -475,7 +478,7 @@ struct Parser {
             if strs.is_upper(c) {
                 set.negate()!;
             }
-            return self.leaf(N_CLASS, self.class_of(&mut set)!);
+            return self.leaf(NodeKind.CLASS, self.class_of(&mut set)!);
         }
         let r = self.escaped_rune()!;
         return self.literal(r, f);
@@ -623,7 +626,8 @@ struct Parser {
         }
         self.i += 1;
         self.depth -= 1;
-        return self.node(Node.{ kind: N_GROUP, greedy: false, a: body, b: cap, min: 0, max: 0, first: 0, count: 0 });
+        return self.node(Node.{ kind: NodeKind.GROUP, greedy: false, a: body, b: cap, min: 0, max: 0, first: 0,
+                                count: 0 });
     }
 
     /// A bracketed class, from '[' to ']'.
@@ -762,18 +766,20 @@ fn hex_digit(c: u8) u32 {
 // Compilation
 // -----------------------------------------------------------------------------
 
-const OP_RUNE: u8 = 0;    // a: code point
-const OP_CLASS: u8 = 1;   // a: class
-const OP_ANY: u8 = 2;     // any code point but \n
-const OP_ANY_NL: u8 = 3;  // any code point
-const OP_SPLIT: u8 = 4;   // try a, then b
-const OP_JMP: u8 = 5;     // a
-const OP_SAVE: u8 = 6;    // a: capture slot
-const OP_ASSERT: u8 = 7;  // a: assertion
-const OP_MATCH: u8 = 8;
+enum Op: u8 {
+    RUNE,    // a: code point
+    CLASS,   // a: class
+    ANY,     // any code point but \n
+    ANY_NL,  // any code point
+    SPLIT,   // try a, then b
+    JMP,     // a
+    SAVE,    // a: capture slot
+    ASSERT,  // a: assertion
+    MATCH,
+}
 
 struct Inst {
-    op: u8,
+    op: Op,
     a: u32,
     b: u32,
 }
@@ -787,7 +793,7 @@ struct Compiler {
     work: usize,
     depth: u32,
 
-    fn emit(self: *mut Compiler, op: u8, a: u32, b: u32) !u32 {
+    fn emit(self: *mut Compiler, op: Op, a: u32, b: u32) !u32 {
         if self.prog.len >= MAX_PROGRAM {
             return error.TooBig;
         }
@@ -821,12 +827,12 @@ struct Compiler {
     fn compile_node(self: *mut Compiler, ni: u32) !void {
         let n = self.p.nodes.get(@as(usize, ni));
         match n.kind {
-            0 => {}
-            1 => { _ = self.emit(OP_RUNE, n.a, 0)!; }
-            2 => { _ = self.emit(OP_CLASS, n.a, 0)!; }
-            3 => { _ = self.emit(OP_ANY, 0, 0)!; }
-            4 => { _ = self.emit(OP_ANY_NL, 0, 0)!; }
-            5 => {
+            .EMPTY => {}
+            .RUNE   => { _ = self.emit(Op.RUNE, n.a, 0)!; }
+            .CLASS  => { _ = self.emit(Op.CLASS, n.a, 0)!; }
+            .ANY    => { _ = self.emit(Op.ANY, 0, 0)!; }
+            .ANY_NL => { _ = self.emit(Op.ANY_NL, 0, 0)!; }
+            .CAT => {
                 for j in 0..n.count {
                     let mut k = n.first + j;
                     if self.reverse {
@@ -835,7 +841,7 @@ struct Compiler {
                     self.compile(self.p.kids.get(@as(usize, k)))!;
                 }
             }
-            6 => {
+            .ALT => {
                 // split L1, next; L1: x1; jmp end; next: split L2, ...
                 let mut jumps = vec.Vec.[u32].init();
                 defer jumps.deinit();
@@ -845,10 +851,10 @@ struct Compiler {
                         self.compile(child)!;
                         break;
                     }
-                    let sp = self.emit(OP_SPLIT, 0, 0)!;
+                    let sp = self.emit(Op.SPLIT, 0, 0)!;
                     self.patch_a(sp, self.pc());
                     self.compile(child)!;
-                    jumps.push(self.emit(OP_JMP, 0, 0)!)!;
+                    jumps.push(self.emit(Op.JMP, 0, 0)!)!;
                     self.patch_b(sp, self.pc());
                 }
                 let end = self.pc();
@@ -856,24 +862,23 @@ struct Compiler {
                     self.patch_a(j, end);
                 }
             }
-            7 => { self.repeat(n)!; }
-            8 => {
+            .REPEAT => { self.repeat(n)!; }
+            .GROUP => {
                 if (n.b != NONE) and not self.reverse {
-                    _ = self.emit(OP_SAVE, 2 * n.b, 0)!;
+                    _ = self.emit(Op.SAVE, 2 * n.b, 0)!;
                     self.compile(n.a)!;
-                    _ = self.emit(OP_SAVE, (2 * n.b) + 1, 0)!;
+                    _ = self.emit(Op.SAVE, (2 * n.b) + 1, 0)!;
                 } else {
                     self.compile(n.a)!;
                 }
             }
-            9    => { _ = self.emit(OP_ASSERT, n.a, 0)!; }
-            else => { @trap(); }
+            .ASSERT => { _ = self.emit(Op.ASSERT, n.a, 0)!; }
         }
     }
 
     /// A split whose targets set_split fills in.
     fn split(self: *mut Compiler) !u32 {
-        return self.emit(OP_SPLIT, 0, 0);
+        return self.emit(Op.SPLIT, 0, 0);
     }
 
     fn set_split(self: *mut Compiler, at: u32, into: u32, out: u32, greedy: bool) void {
@@ -892,7 +897,7 @@ struct Compiler {
                 // L1: split L2, L3; L2: x; jmp L1; L3:
                 let l1 = self.split()!;
                 self.compile(n.a)!;
-                _ = self.emit(OP_JMP, l1, 0)!;
+                _ = self.emit(Op.JMP, l1, 0)!;
                 self.set_split(l1, l1 + 1, self.pc(), n.greedy);
                 return;
             }
@@ -1309,10 +1314,10 @@ fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) !Regex {
     if p.more() {
         return p.fail("unmatched )");
     }
-    _ = c.emit(OP_SAVE, 0, 0)!;
+    _ = c.emit(Op.SAVE, 0, 0)!;
     c.compile(root)!;
-    _ = c.emit(OP_SAVE, 1, 0)!;
-    _ = c.emit(OP_MATCH, 0, 0)!;
+    _ = c.emit(Op.SAVE, 1, 0)!;
+    _ = c.emit(Op.MATCH, 0, 0)!;
     let prefix = literal_prefix(p, root)!;
     let mut re = Regex.{
         prog: c.prog,
@@ -1333,7 +1338,7 @@ fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) !Regex {
     // the DFAs handle patterns without assertions that are not anchored
     let mut plain = not re.anchored;
     for inst in re.prog.items() {
-        if inst.op == OP_ASSERT {
+        if inst.op == Op.ASSERT {
             plain = false;
         }
     }
@@ -1344,7 +1349,7 @@ fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) !Regex {
             re.forget_parts();
             return e;
         };
-        _ = rc.emit(OP_MATCH, 0, 0) catch |e| {
+        _ = rc.emit(Op.MATCH, 0, 0) catch |e| {
             rc.prog.deinit();
             re.forget_parts();
             return e;
@@ -1364,7 +1369,7 @@ fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) !Regex {
 /// The node with any non-capturing groups around it removed.
 fn unwrap(p: *Parser, ni: u32) Node {
     let mut n = p.nodes.get(@as(usize, ni));
-    while (n.kind == N_GROUP) and (n.b == NONE) {
+    while (n.kind == NodeKind.GROUP) and (n.b == NONE) {
         n = p.nodes.get(@as(usize, n.a));
     }
     return n;
@@ -1374,15 +1379,15 @@ fn unwrap(p: *Parser, ni: u32) Node {
 fn literal_prefix(p: *Parser, root: u32) ![]mut u8 {
     let mut out = strs.String.init();
     let n = unwrap(p, root);
-    if n.kind == N_RUNE {
+    if n.kind == NodeKind.RUNE {
         out.push_rune(n.a) catch |e| {
             out.deinit();
             return e;
         };
-    } else if n.kind == N_CAT {
+    } else if n.kind == NodeKind.CAT {
         for k in n.first..n.first + n.count {
             let child = unwrap(p, p.kids.get(@as(usize, k)));
-            if child.kind != N_RUNE {
+            if child.kind != NodeKind.RUNE {
                 break;
             }
             out.push_rune(child.a) catch |e| {
@@ -1397,10 +1402,10 @@ fn literal_prefix(p: *Parser, root: u32) ![]mut u8 {
 /// Whether the pattern starts with \A (or ^ without the m flag).
 fn starts_anchored(p: *Parser, root: u32) bool {
     let mut n = unwrap(p, root);
-    if n.kind == N_CAT {
+    if n.kind == NodeKind.CAT {
         n = unwrap(p, p.kids.get(@as(usize, n.first)));
     }
-    return (n.kind == N_ASSERT) and (n.a == A_BEGIN_TEXT);
+    return (n.kind == NodeKind.ASSERT) and (n.a == A_BEGIN_TEXT);
 }
 
 /// Fills re.first_bytes with every byte a match can start with; false when
@@ -1423,18 +1428,18 @@ fn first_bytes(re: *mut Regex) bool {
         seen[@as(usize, pc)] = true;
         let inst = prog[@as(usize, pc)];
         match inst.op {
-            4 => {
+            .SPLIT => {
                 stack.push(inst.a) catch return false;
                 stack.push(inst.b) catch return false;
             }
-            5 => { stack.push(inst.a) catch return false; }
-            6 => { stack.push(pc + 1) catch return false; }
-            0 => {
+            .JMP  => { stack.push(inst.a) catch return false; }
+            .SAVE => { stack.push(pc + 1) catch return false; }
+            .RUNE => {
                 let mut b: [4]u8 = [0; 4];
                 let enc = strs.encode_rune(b[..], inst.a);
                 re.first_bytes[@as(usize, enc[0])] = true;
             }
-            1 => {
+            .CLASS => {
                 let cls = re.classes.get(@as(usize, inst.a));
                 for r in re.ranges.items()[@as(usize, cls.lo)..@as(usize, cls.lo + cls.hi)] {
                     if r.lo < 0x80 {
@@ -1544,16 +1549,16 @@ fn add_thread(vm: *mut Vm, l: *mut List, pc0: u32, i: usize) void {
         vm.stamp[pc] = vm.gen;
         let inst = prog[pc];
         match inst.op {
-            4 => {
+            .SPLIT => {
                 vm.stack[sp] = @as(usize, inst.b) << 1;
                 vm.stack[sp + 1] = @as(usize, inst.a) << 1;
                 sp += 2;
             }
-            5 => {
+            .JMP => {
                 vm.stack[sp] = @as(usize, inst.a) << 1;
                 sp += 1;
             }
-            6 => {
+            .SAVE => {
                 let slot = @as(usize, inst.a);
                 if slot < vm.ncap {
                     vm.stack[sp] = vm.tmp[slot];
@@ -1564,7 +1569,7 @@ fn add_thread(vm: *mut Vm, l: *mut List, pc0: u32, i: usize) void {
                 vm.stack[sp] = (pc + 1) << 1;
                 sp += 1;
             }
-            7 => {
+            .ASSERT => {
                 if assertion_holds(inst.a, vm.text, i) {
                     vm.stack[sp] = (pc + 1) << 1;
                     sp += 1;
@@ -1674,11 +1679,11 @@ fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) !
             let inst = prog[pc];
             let mut ok = false;
             match inst.op {
-                0 => { ok = r == inst.a; }
-                1 => { ok = (len > 0) and class_has(re, inst.a, r); }
-                2 => { ok = (len > 0) and (r != '\n'); }
-                3 => { ok = len > 0; }
-                8 => {
+                .RUNE   => { ok = r == inst.a; }
+                .CLASS  => { ok = (len > 0) and class_has(re, inst.a, r); }
+                .ANY    => { ok = (len > 0) and (r != '\n'); }
+                .ANY_NL => { ok = len > 0; }
+                .MATCH => {
                     matched = true;
                     if ncap > 0 {
                         @mem_copy(slots, clist.caps[k * ncap..(k + 1) * ncap]);
@@ -1806,13 +1811,13 @@ struct Dfa {
             self.stamp[upc] = self.gen;
             let inst = prog[upc];
             match inst.op {
-                4 => {
+                .SPLIT => {
                     self.stack.push(inst.b)!;
                     self.stack.push(inst.a)!;
                 }
-                5 => { self.stack.push(inst.a)!; }
-                6 => { self.stack.push(pc + 1)!; }
-                8 => {
+                .JMP  => { self.stack.push(inst.a)!; }
+                .SAVE => { self.stack.push(pc + 1)!; }
+                .MATCH => {
                     self.work.push(pc)!;
                     if not self.longest {
                         return true;
@@ -1834,7 +1839,7 @@ struct Dfa {
         let mut has_match = false;
         for pc in list {
             h = (h ^ @as(u64, pc)) *% 0x100000001b3;
-            if prog[@as(usize, pc)].op == OP_MATCH {
+            if prog[@as(usize, pc)].op == Op.MATCH {
                 has_match = true;
             }
         }
@@ -1903,11 +1908,11 @@ struct Dfa {
             let inst = prog[@as(usize, pc)];
             let mut ok = false;
             match inst.op {
-                0 => { ok = r == inst.a; }
-                1 => { ok = class_has(re, inst.a, r); }
-                2 => { ok = r != '\n'; }
-                3 => { ok = true; }
-                8 => {
+                .RUNE   => { ok = r == inst.a; }
+                .CLASS  => { ok = class_has(re, inst.a, r); }
+                .ANY    => { ok = r != '\n'; }
+                .ANY_NL => { ok = true; }
+                .MATCH => {
                     if not self.longest {
                         break;
                     }

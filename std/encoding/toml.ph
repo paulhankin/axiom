@@ -38,13 +38,16 @@ pub const MAX_DEPTH: u32 = 256;
 // Values
 // -----------------------------------------------------------------------------
 
-pub const OFFSET_DATETIME: u8 = 0;  // 1979-05-27T07:32:00Z
-pub const LOCAL_DATETIME: u8 = 1;   // 1979-05-27T07:32:00
-pub const LOCAL_DATE: u8 = 2;       // 1979-05-27
-pub const LOCAL_TIME: u8 = 3;       // 07:32:00
+/// The kinds of DateTime.
+pub enum DateTimeKind: u8 {
+    OFFSET_DATETIME,  // 1979-05-27T07:32:00Z
+    LOCAL_DATETIME,   // 1979-05-27T07:32:00
+    LOCAL_DATE,       // 1979-05-27
+    LOCAL_TIME,       // 07:32:00
+}
 
 pub struct DateTime {
-    kind: u8,
+    kind: DateTimeKind,
     year: u16,
     month: u8,
     day: u8,
@@ -52,14 +55,14 @@ pub struct DateTime {
     minute: u8,
     second: u8,
     nanosecond: u32,
-    offset_minutes: i16,  // east of UTC (OFFSET_DATETIME only)
+    offset_minutes: i16,  // east of UTC (DateTimeKind.OFFSET_DATETIME only)
 
     /// RFC 3339 text: "1979-05-27T07:32:00.5-07:00", or the date or time
     /// alone for local dates and times (fractions without trailing zeros).
     pub fn format(self: DateTime, w: io.Writer) !void {
-        if self.kind != LOCAL_TIME {
+        if self.kind != DateTimeKind.LOCAL_TIME {
             fmt.write(w, "{:04}-{:02}-{:02}", [fmt.int(self.year), fmt.int(self.month), fmt.int(self.day)])!;
-            if self.kind == LOCAL_DATE {
+            if self.kind == DateTimeKind.LOCAL_DATE {
                 return;
             }
             w.write_all("T")!;
@@ -81,7 +84,7 @@ pub struct DateTime {
             }
             w.write_all(digits[..n])!;
         }
-        if self.kind == OFFSET_DATETIME {
+        if self.kind == DateTimeKind.OFFSET_DATETIME {
             if self.offset_minutes == 0 {
                 w.write_all("Z")!;
             } else {
@@ -241,12 +244,15 @@ pub struct ErrorInfo {
 // -----------------------------------------------------------------------------
 
 const NIL: u32 = 0xffffffff;
-const N_TABLE: u8 = 0;
-const N_ARRAY: u8 = 1;
-const N_VALUE: u8 = 2;
+
+enum NodeKind: u8 {
+    TABLE,
+    ARRAY,
+    VALUE,
+}
 
 struct Node {
-    kind: u8,
+    kind: NodeKind,
     aot: bool,       // an array of tables ([[x]])
     explicit: bool,  // defined by a [header], or by dotted keys in an earlier section
     frozen: bool,    // an inline table or array: closed to additions
@@ -305,7 +311,7 @@ struct Parser {
         return NIL;
     }
 
-    fn new_node(self: *mut Parser, kind: u8, depth: u32) !u32 {
+    fn new_node(self: *mut Parser, kind: NodeKind, depth: u32) !u32 {
         if depth > MAX_DEPTH {
             return error.TooDeep;
         }
@@ -337,7 +343,7 @@ struct Parser {
         let p2 = self.node(parent);
         p2.last = n;
         p2.count += 1;
-        if p2.kind == N_TABLE {
+        if p2.kind == NodeKind.TABLE {
             let h = key_hash(parent, key);
             let prev = self.index.get(h) catch NIL;
             self.node(n).chain = prev;
@@ -364,7 +370,7 @@ struct Parser {
 
     fn table_child(self: *mut Parser, parent: u32, key: []u8) !u32 {
         let pd = self.node(parent).depth;
-        let n = self.new_node(N_TABLE, pd + 1)!;
+        let n = self.new_node(NodeKind.TABLE, pd + 1)!;
         self.attach(parent, key, n)!;
         return n;
     }
@@ -697,7 +703,7 @@ struct Parser {
     }
 
     fn leaf(self: *mut Parser, v: Value, depth: u32) !u32 {
-        let n = self.new_node(N_VALUE, depth)!;
+        let n = self.new_node(NodeKind.VALUE, depth)!;
         self.node(n).value = v;
         return n;
     }
@@ -717,7 +723,7 @@ struct Parser {
 
     fn array(self: *mut Parser, depth: u32) !u32 {
         self.i += 1;
-        let a = self.new_node(N_ARRAY, depth)!;
+        let a = self.new_node(NodeKind.ARRAY, depth)!;
         loop {
             self.skip_ws_comments_newlines()!;
             if self.peek() == ']' {
@@ -744,7 +750,7 @@ struct Parser {
 
     fn inline_table(self: *mut Parser, depth: u32) !u32 {
         self.i += 1;
-        let t = self.new_node(N_TABLE, depth)!;
+        let t = self.new_node(NodeKind.TABLE, depth)!;
         self.skip_ws();
         if self.peek() == '}' {
             self.i += 1;
@@ -789,7 +795,7 @@ struct Parser {
                 n = self.table_child(cur, parts[k])!;
             } else {
                 let nd = self.node(n);
-                if (nd.kind != N_TABLE) or nd.frozen or (section and nd.explicit) {
+                if (nd.kind != NodeKind.TABLE) or nd.frozen or (section and nd.explicit) {
                     return self.fail("cannot add to this key with a dotted key");
                 }
             }
@@ -814,8 +820,8 @@ struct Parser {
             return Value.DateTime(self.datetime()!);
         }
         if ((st + 2) < self.s.len) and is_digit(self.s[st]) and is_digit(self.s[st + 1]) and (self.s[st + 2] == ':') {
-            let mut d = DateTime.{ kind: LOCAL_TIME, year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0,
-                                   nanosecond: 0, offset_minutes: 0 };
+            let mut d = DateTime.{ kind: DateTimeKind.LOCAL_TIME, year: 0, month: 0, day: 0, hour: 0, minute: 0,
+                                   second: 0, nanosecond: 0, offset_minutes: 0 };
             self.time(&mut d)!;
             return Value.DateTime(d);
         }
@@ -853,7 +859,7 @@ struct Parser {
     }
 
     fn datetime(self: *mut Parser) !DateTime {
-        let mut d = DateTime.{ kind: LOCAL_DATE, year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0,
+        let mut d = DateTime.{ kind: DateTimeKind.LOCAL_DATE, year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0,
                                nanosecond: 0, offset_minutes: 0 };
         d.year = @truncate(u16, self.digits(4)!);
         self.expect('-')!;
@@ -868,12 +874,12 @@ struct Parser {
         let space_time = (c == ' ') and ((self.i + 1) < self.s.len) and is_digit(self.s[self.i + 1]);
         if (c == 'T') or (c == 't') or space_time {
             self.i += 1;
-            d.kind = LOCAL_DATETIME;
+            d.kind = DateTimeKind.LOCAL_DATETIME;
             self.time(&mut d)!;
             let o = self.peek();
             if (o == 'Z') or (o == 'z') {
                 self.i += 1;
-                d.kind = OFFSET_DATETIME;
+                d.kind = DateTimeKind.OFFSET_DATETIME;
             } else if (o == '+') or (o == '-') {
                 self.i += 1;
                 let h = self.digits(2)!;
@@ -887,7 +893,7 @@ struct Parser {
                     off = -off;
                 }
                 d.offset_minutes = off;
-                d.kind = OFFSET_DATETIME;
+                d.kind = DateTimeKind.OFFSET_DATETIME;
             }
         }
         if (self.i < self.s.len) and not is_delim(self.s[self.i]) {
@@ -926,7 +932,7 @@ struct Parser {
             }
             d.nanosecond = ns;
         }
-        if (d.kind == LOCAL_TIME) and (self.i < self.s.len) and not is_delim(self.s[self.i]) {
+        if (d.kind == DateTimeKind.LOCAL_TIME) and (self.i < self.s.len) and not is_delim(self.s[self.i]) {
             return self.fail("invalid time");
         }
     }
@@ -942,10 +948,10 @@ struct Parser {
                 n = self.table_child(cur, parts[k])!;
             } else {
                 let nd = self.node(n);
-                if nd.frozen or (nd.kind == N_VALUE) or ((nd.kind == N_ARRAY) and not nd.aot) {
+                if nd.frozen or (nd.kind == NodeKind.VALUE) or ((nd.kind == NodeKind.ARRAY) and not nd.aot) {
                     return self.fail("cannot extend this key");
                 }
-                if nd.kind == N_ARRAY {
+                if nd.kind == NodeKind.ARRAY {
                     n = nd.last;  // the latest table of the array
                 }
             }
@@ -984,15 +990,15 @@ struct Parser {
                     let mut arr = existing;
                     if arr == NIL {
                         let pd = self.node(parent).depth;
-                        arr = self.new_node(N_ARRAY, pd + 1)!;
+                        arr = self.new_node(NodeKind.ARRAY, pd + 1)!;
                         self.node(arr).aot = true;
                         self.attach(parent, stem, arr)!;
-                    } else if not ((self.node(arr).kind == N_ARRAY) and self.node(arr).aot) {
+                    } else if not ((self.node(arr).kind == NodeKind.ARRAY) and self.node(arr).aot) {
                         return self.fail("not an array of tables");
                     }
                     self.node(arr).explicit = true;
                     let ad = self.node(arr).depth;
-                    let t = self.new_node(N_TABLE, ad + 1)!;
+                    let t = self.new_node(NodeKind.TABLE, ad + 1)!;
                     self.attach(arr, "", t)!;
                     cur = t;
                 } else {
@@ -1001,7 +1007,7 @@ struct Parser {
                         t = self.table_child(parent, stem)!;
                     } else {
                         let nd = self.node(t);
-                        if (nd.kind != N_TABLE) or nd.explicit or nd.frozen {
+                        if (nd.kind != NodeKind.TABLE) or nd.explicit or nd.frozen {
                             return self.fail("table defined twice");
                         }
                     }
@@ -1039,10 +1045,10 @@ struct Parser {
 
     fn build(self: *mut Parser, n: u32) !Value {
         let nd = self.node(n).*;
-        if nd.kind == N_VALUE {
+        if nd.kind == NodeKind.VALUE {
             return nd.value;
         }
-        if nd.kind == N_ARRAY {
+        if nd.kind == NodeKind.ARRAY {
             let xs = @cast_slice(Value, self.arena.bytes(@as(usize, nd.count) * @size_of(Value))!);
             let mut c = nd.first;
             let mut k: usize = 0;
@@ -1329,7 +1335,7 @@ fn parse_doc(p: *mut Parser) !void {
         p.i = k;
         return p.fail("invalid UTF-8");
     }
-    _ = p.new_node(N_TABLE, 0)!;
+    _ = p.new_node(NodeKind.TABLE, 0)!;
     p.document()!;
 }
 
@@ -1614,7 +1620,7 @@ fn leaf_matches(v: Value, tag: []u8, want: []u8) bool {
     defer doc.deinit();
     let e = (doc.root.get("x") catch return false).as_datetime() catch return false;
     let kinds: [4][]u8 = ["datetime", "datetime-local", "date-local", "time-local"];
-    return d.eq(e) and strs.eq(kinds[@as(usize, d.kind)], tag);
+    return d.eq(e) and strs.eq(kinds[@as(usize, @int_from_enum(d.kind))], tag);
 }
 
 fn next_line(data: []u8, at: *mut usize) []u8 {

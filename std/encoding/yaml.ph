@@ -53,43 +53,48 @@ pub struct Mark {
     column: u32,  // from 0, in characters
 }
 
-const T_NONE: u8 = 0;
-const T_STREAM_START: u8 = 1;
-const T_STREAM_END: u8 = 2;
-const T_VERSION_DIRECTIVE: u8 = 3;
-const T_TAG_DIRECTIVE: u8 = 4;
-const T_DOCUMENT_START: u8 = 5;
-const T_DOCUMENT_END: u8 = 6;
-const T_BLOCK_SEQUENCE_START: u8 = 7;
-const T_BLOCK_MAPPING_START: u8 = 8;
-const T_BLOCK_END: u8 = 9;
-const T_FLOW_SEQUENCE_START: u8 = 10;
-const T_FLOW_SEQUENCE_END: u8 = 11;
-const T_FLOW_MAPPING_START: u8 = 12;
-const T_FLOW_MAPPING_END: u8 = 13;
-const T_BLOCK_ENTRY: u8 = 14;
-const T_FLOW_ENTRY: u8 = 15;
-const T_KEY: u8 = 16;
-const T_VALUE: u8 = 17;
-const T_ALIAS: u8 = 18;
-const T_ANCHOR: u8 = 19;
-const T_TAG: u8 = 20;
-const T_SCALAR: u8 = 21;
+enum TokenKind: u8 {
+    NONE,
+    STREAM_START,
+    STREAM_END,
+    VERSION_DIRECTIVE,
+    TAG_DIRECTIVE,
+    DOCUMENT_START,
+    DOCUMENT_END,
+    BLOCK_SEQUENCE_START,
+    BLOCK_MAPPING_START,
+    BLOCK_END,
+    FLOW_SEQUENCE_START,
+    FLOW_SEQUENCE_END,
+    FLOW_MAPPING_START,
+    FLOW_MAPPING_END,
+    BLOCK_ENTRY,
+    FLOW_ENTRY,
+    KEY,
+    VALUE,
+    ALIAS,
+    ANCHOR,
+    TAG,
+    SCALAR,
+}
 
 /// Scalar styles.
-pub const PLAIN: u8 = 1;
-pub const SINGLE_QUOTED: u8 = 2;
-pub const DOUBLE_QUOTED: u8 = 3;
-pub const LITERAL: u8 = 4;
-pub const FOLDED: u8 = 5;
+pub enum Style: u8 {
+    NONE,  // not a scalar
+    PLAIN,
+    SINGLE_QUOTED,
+    DOUBLE_QUOTED,
+    LITERAL,
+    FOLDED,
+}
 
 struct Token {
-    kind: u8,
+    kind: TokenKind,
     start: Mark,
     end: Mark,
     value: []u8,   // scalar text, anchor or alias name, directive value
     handle: []u8,  // tag handle, or %TAG handle
-    style: u8,
+    style: Style,
 }
 
 struct SimpleKey {
@@ -156,8 +161,8 @@ struct Scanner {
     flow_maps: vec.Vec.[bool],  // for each open flow collection: is it a mapping
     line_start: usize,          // where the current line starts
     token_line: u32,            // the line where the last token ended
-    last_kind: u8,              // the last token queued, and its style
-    last_style: u8,
+    last_kind: TokenKind,       // the last token queued, and its style
+    last_style: Style,
     last_end: usize,
     buf: strs.String,
     lead: strs.String,   // scalar folding: the leading line break
@@ -237,8 +242,8 @@ struct Scanner {
         b.push('\n')!;
     }
 
-    fn token(self: *Scanner, kind: u8, start: Mark) Token {
-        return Token.{ kind: kind, start: start, end: self.m, value: "", handle: "", style: 0 };
+    fn token(self: *Scanner, kind: TokenKind, start: Mark) Token {
+        return Token.{ kind: kind, start: start, end: self.m, value: "", handle: "", style: Style.NONE };
     }
 
     fn push(self: *mut Scanner, t: Token) !void {
@@ -348,7 +353,7 @@ struct Scanner {
 
     // Opens a block collection at column (its start token goes at token
     // number `number`, or at the end).
-    fn roll(self: *mut Scanner, column: i32, number: usize, at_end: bool, kind: u8, mark: Mark) !void {
+    fn roll(self: *mut Scanner, column: i32, number: usize, at_end: bool, kind: TokenKind, mark: Mark) !void {
         if self.flow > 0 {
             return;
         }
@@ -367,7 +372,7 @@ struct Scanner {
             }
             self.indents.push(self.indent)!;
             self.indent = column;
-            let t = Token.{ kind: kind, start: mark, end: mark, value: "", handle: "", style: 0 };
+            let t = Token.{ kind: kind, start: mark, end: mark, value: "", handle: "", style: Style.NONE };
             if at_end {
                 self.push(t)!;
             } else {
@@ -381,7 +386,7 @@ struct Scanner {
             return;
         }
         while self.indent > column {
-            self.push(self.token(T_BLOCK_END, self.m))!;
+            self.push(self.token(TokenKind.BLOCK_END, self.m))!;
             self.indent = self.indents.pop() catch -1;
         }
     }
@@ -394,7 +399,7 @@ struct Scanner {
             self.indent = -1;
             self.allowed = true;
             self.keys.push(SimpleKey.{ possible: false, required: false, token_number: 0, mark: self.m })!;
-            self.push(self.token(T_STREAM_START, self.m))!;
+            self.push(self.token(TokenKind.STREAM_START, self.m))!;
             return;
         }
         self.skip_to_token()!;
@@ -414,22 +419,22 @@ struct Scanner {
             return self.fetch_directive();
         }
         if col0 and (c == '-') and (self.at(1) == '-') and (self.at(2) == '-') and self.blankz(3) {
-            return self.fetch_document_indicator(T_DOCUMENT_START);
+            return self.fetch_document_indicator(TokenKind.DOCUMENT_START);
         }
         if col0 and (c == '.') and (self.at(1) == '.') and (self.at(2) == '.') and self.blankz(3) {
-            return self.fetch_document_indicator(T_DOCUMENT_END);
+            return self.fetch_document_indicator(TokenKind.DOCUMENT_END);
         }
         if c == '[' {
-            return self.fetch_flow_start(T_FLOW_SEQUENCE_START, false);
+            return self.fetch_flow_start(TokenKind.FLOW_SEQUENCE_START, false);
         }
         if c == '{' {
-            return self.fetch_flow_start(T_FLOW_MAPPING_START, true);
+            return self.fetch_flow_start(TokenKind.FLOW_MAPPING_START, true);
         }
         if c == ']' {
-            return self.fetch_flow_end(T_FLOW_SEQUENCE_END);
+            return self.fetch_flow_end(TokenKind.FLOW_SEQUENCE_END);
         }
         if c == '}' {
-            return self.fetch_flow_end(T_FLOW_MAPPING_END);
+            return self.fetch_flow_end(TokenKind.FLOW_MAPPING_END);
         }
         if c == ',' {
             return self.fetch_flow_entry();
@@ -445,10 +450,10 @@ struct Scanner {
             return self.fetch_value();
         }
         if c == '*' {
-            return self.fetch_anchor(T_ALIAS);
+            return self.fetch_anchor(TokenKind.ALIAS);
         }
         if c == '&' {
-            return self.fetch_anchor(T_ANCHOR);
+            return self.fetch_anchor(TokenKind.ANCHOR);
         }
         if c == '!' {
             return self.fetch_tag();
@@ -488,8 +493,9 @@ struct Scanner {
     // a value indicator even without a space after it ("a":b).
     fn after_json_node(self: *Scanner) bool {
         let k = self.last_kind;
-        return ((k == T_SCALAR) and ((self.last_style == SINGLE_QUOTED) or (self.last_style == DOUBLE_QUOTED))) or
-               (k == T_FLOW_SEQUENCE_END) or (k == T_FLOW_MAPPING_END);
+        return ((k == TokenKind.SCALAR) and
+                ((self.last_style == Style.SINGLE_QUOTED) or (self.last_style == Style.DOUBLE_QUOTED))) or
+               (k == TokenKind.FLOW_SEQUENCE_END) or (k == TokenKind.FLOW_MAPPING_END);
     }
 
     fn skip_to_token(self: *mut Scanner) !void {
@@ -528,7 +534,7 @@ struct Scanner {
         self.unroll(-1)!;
         self.remove_key()!;
         self.allowed = false;
-        self.push(self.token(T_STREAM_END, self.m))!;
+        self.push(self.token(TokenKind.STREAM_END, self.m))!;
         self.ended = true;
     }
 
@@ -565,7 +571,7 @@ struct Scanner {
                 return self.fail("unsupported YAML version");
             }
             self.directive_end()!;
-            let mut t = self.token(T_VERSION_DIRECTIVE, start);
+            let mut t = self.token(TokenKind.VERSION_DIRECTIVE, start);
             t.value = v;
             self.push(t)!;
             return;
@@ -589,7 +595,7 @@ struct Scanner {
                 return self.fail("bad %TAG directive");
             }
             self.directive_end()!;
-            let mut t = self.token(T_TAG_DIRECTIVE, start);
+            let mut t = self.token(TokenKind.TAG_DIRECTIVE, start);
             t.handle = handle;
             t.value = prefix;
             self.push(t)!;
@@ -615,7 +621,7 @@ struct Scanner {
         }
     }
 
-    fn fetch_document_indicator(self: *mut Scanner, kind: u8) !void {
+    fn fetch_document_indicator(self: *mut Scanner, kind: TokenKind) !void {
         self.unroll(-1)!;
         self.remove_key()!;
         self.allowed = false;
@@ -623,7 +629,7 @@ struct Scanner {
         self.skip();
         self.skip();
         self.skip();
-        if kind == T_DOCUMENT_END {
+        if kind == TokenKind.DOCUMENT_END {
             // nothing but a comment may follow ... on its line
             let mut k: usize = 0;
             while is_blank(self.at(k)) {
@@ -636,7 +642,7 @@ struct Scanner {
         self.push(self.token(kind, start))!;
     }
 
-    fn fetch_flow_start(self: *mut Scanner, kind: u8, mapping: bool) !void {
+    fn fetch_flow_start(self: *mut Scanner, kind: TokenKind, mapping: bool) !void {
         self.save_key()!;
         self.flow_in(mapping)!;
         self.allowed = true;
@@ -645,7 +651,7 @@ struct Scanner {
         self.push(self.token(kind, start))!;
     }
 
-    fn fetch_flow_end(self: *mut Scanner, kind: u8) !void {
+    fn fetch_flow_end(self: *mut Scanner, kind: TokenKind) !void {
         self.remove_key()!;
         self.flow_out();
         self.allowed = false;
@@ -659,7 +665,7 @@ struct Scanner {
         self.allowed = true;
         let start = self.m;
         self.skip();
-        self.push(self.token(T_FLOW_ENTRY, start))!;
+        self.push(self.token(TokenKind.FLOW_ENTRY, start))!;
     }
 
     fn fetch_block_entry(self: *mut Scanner) !void {
@@ -667,13 +673,13 @@ struct Scanner {
             if not self.allowed {
                 return self.fail("block sequence entries are not allowed in this context");
             }
-            self.roll(@bit_cast(i32, self.m.column), 0, true, T_BLOCK_SEQUENCE_START, self.m)!;
+            self.roll(@bit_cast(i32, self.m.column), 0, true, TokenKind.BLOCK_SEQUENCE_START, self.m)!;
         }
         self.remove_key()!;
         self.allowed = true;
         let start = self.m;
         self.skip();
-        self.push(self.token(T_BLOCK_ENTRY, start))!;
+        self.push(self.token(TokenKind.BLOCK_ENTRY, start))!;
     }
 
     fn fetch_key(self: *mut Scanner) !void {
@@ -681,22 +687,22 @@ struct Scanner {
             if not self.allowed {
                 return self.fail("mapping keys are not allowed in this context");
             }
-            self.roll(@bit_cast(i32, self.m.column), 0, true, T_BLOCK_MAPPING_START, self.m)!;
+            self.roll(@bit_cast(i32, self.m.column), 0, true, TokenKind.BLOCK_MAPPING_START, self.m)!;
         }
         self.remove_key()!;
         self.allowed = self.flow == 0;
         let start = self.m;
         self.skip();
-        self.push(self.token(T_KEY, start))!;
+        self.push(self.token(TokenKind.KEY, start))!;
     }
 
     fn fetch_value(self: *mut Scanner) !void {
         let k = self.keys.get(self.keys.len - 1);
         if k.possible {
             // the simple key becomes a KEY token (and maybe opens a mapping)
-            let t = Token.{ kind: T_KEY, start: k.mark, end: k.mark, value: "", handle: "", style: 0 };
+            let t = Token.{ kind: TokenKind.KEY, start: k.mark, end: k.mark, value: "", handle: "", style: Style.NONE };
             self.tokens.insert(self.head + (k.token_number - self.parsed), t)!;
-            self.roll(@bit_cast(i32, k.mark.column), k.token_number, false, T_BLOCK_MAPPING_START, k.mark)!;
+            self.roll(@bit_cast(i32, k.mark.column), k.token_number, false, TokenKind.BLOCK_MAPPING_START, k.mark)!;
             self.keys.get_ptr(self.keys.len - 1).possible = false;
             self.allowed = false;
         } else {
@@ -704,16 +710,16 @@ struct Scanner {
                 if not self.allowed {
                     return self.fail("mapping values are not allowed in this context");
                 }
-                self.roll(@bit_cast(i32, self.m.column), 0, true, T_BLOCK_MAPPING_START, self.m)!;
+                self.roll(@bit_cast(i32, self.m.column), 0, true, TokenKind.BLOCK_MAPPING_START, self.m)!;
             }
             self.allowed = self.flow == 0;
         }
         let start = self.m;
         self.skip();
-        self.push(self.token(T_VALUE, start))!;
+        self.push(self.token(TokenKind.VALUE, start))!;
     }
 
-    fn fetch_anchor(self: *mut Scanner, kind: u8) !void {
+    fn fetch_anchor(self: *mut Scanner, kind: TokenKind) !void {
         self.save_key()!;
         self.allowed = false;
         let start = self.m;
@@ -773,7 +779,7 @@ struct Scanner {
         if not self.blankz(0) and not ((self.flow > 0) and is_flow_indicator(self.at(0))) {
             return self.fail("did not find expected whitespace or line break after a tag");
         }
-        let mut t = self.token(T_TAG, start);
+        let mut t = self.token(TokenKind.TAG, start);
         t.handle = handle;
         t.value = self.ar.dup(self.buf.bytes())!;
         self.push(t)!;
@@ -909,11 +915,11 @@ struct Scanner {
         if chomp == 1 {
             self.buf.push_str(self.trail.bytes())!;
         }
-        let mut t = self.token(T_SCALAR, start);
+        let mut t = self.token(TokenKind.SCALAR, start);
         t.value = self.ar.dup(self.buf.bytes())!;
-        t.style = FOLDED;
+        t.style = Style.FOLDED;
         if literal {
-            t.style = LITERAL;
+            t.style = Style.LITERAL;
         }
         self.push(t)!;
     }
@@ -1073,11 +1079,11 @@ struct Scanner {
             }
         }
         self.skip();
-        let mut t = self.token(T_SCALAR, start);
+        let mut t = self.token(TokenKind.SCALAR, start);
         t.value = self.ar.dup(self.buf.bytes())!;
-        t.style = DOUBLE_QUOTED;
+        t.style = Style.DOUBLE_QUOTED;
         if single {
-            t.style = SINGLE_QUOTED;
+            t.style = Style.SINGLE_QUOTED;
         }
         self.push(t)!;
     }
@@ -1215,8 +1221,8 @@ struct Scanner {
                 break;
             }
         }
-        let mut t = Token.{ kind: T_SCALAR, start: start, end: end, value: self.ar.dup(self.buf.bytes())!, handle: "",
-                            style: PLAIN };
+        let mut t = Token.{ kind: TokenKind.SCALAR, start: start, end: end, value: self.ar.dup(self.buf.bytes())!,
+                            handle: "", style: Style.PLAIN };
         self.push(t)!;
         if leading_blanks {
             self.allowed = true;
@@ -1228,53 +1234,58 @@ struct Scanner {
 // Events
 // -----------------------------------------------------------------------------
 
-pub const E_STREAM_START: u8 = 1;
-pub const E_STREAM_END: u8 = 2;
-pub const E_DOCUMENT_START: u8 = 3;
-pub const E_DOCUMENT_END: u8 = 4;
-pub const E_ALIAS: u8 = 5;
-pub const E_SCALAR: u8 = 6;
-pub const E_SEQUENCE_START: u8 = 7;
-pub const E_SEQUENCE_END: u8 = 8;
-pub const E_MAPPING_START: u8 = 9;
-pub const E_MAPPING_END: u8 = 10;
+/// Event kinds.
+pub enum EventKind: u8 {
+    STREAM_START = 1,
+    STREAM_END,
+    DOCUMENT_START,
+    DOCUMENT_END,
+    ALIAS,
+    SCALAR,
+    SEQUENCE_START,
+    SEQUENCE_END,
+    MAPPING_START,
+    MAPPING_END,
+}
 
 pub struct Event {
-    kind: u8,
+    kind: EventKind,
     start: Mark,
     end: Mark,
     anchor: []u8,    // for nodes (the name, for aliases)
     tag: []u8,       // resolved: "tag:yaml.org,2002:str", "!" (non-specific), "" (none)
     value: []u8,     // scalars
-    style: u8,       // scalars
+    style: Style,    // scalars
     flow: bool,      // collections written in flow style
     explicit: bool,  // documents with --- (start) or ... (end)
 }
 
-const S_STREAM_START: u8 = 0;
-const S_IMPLICIT_DOCUMENT_START: u8 = 1;
-const S_DOCUMENT_START: u8 = 2;
-const S_DOCUMENT_CONTENT: u8 = 3;
-const S_DOCUMENT_END: u8 = 4;
-const S_BLOCK_NODE: u8 = 5;
-const S_BLOCK_NODE_OR_INDENTLESS_SEQUENCE: u8 = 6;
-const S_FLOW_NODE: u8 = 7;
-const S_BLOCK_SEQUENCE_FIRST_ENTRY: u8 = 8;
-const S_BLOCK_SEQUENCE_ENTRY: u8 = 9;
-const S_INDENTLESS_SEQUENCE_ENTRY: u8 = 10;
-const S_BLOCK_MAPPING_FIRST_KEY: u8 = 11;
-const S_BLOCK_MAPPING_KEY: u8 = 12;
-const S_BLOCK_MAPPING_VALUE: u8 = 13;
-const S_FLOW_SEQUENCE_FIRST_ENTRY: u8 = 14;
-const S_FLOW_SEQUENCE_ENTRY: u8 = 15;
-const S_FLOW_SEQUENCE_ENTRY_MAPPING_KEY: u8 = 16;
-const S_FLOW_SEQUENCE_ENTRY_MAPPING_VALUE: u8 = 17;
-const S_FLOW_SEQUENCE_ENTRY_MAPPING_END: u8 = 18;
-const S_FLOW_MAPPING_FIRST_KEY: u8 = 19;
-const S_FLOW_MAPPING_KEY: u8 = 20;
-const S_FLOW_MAPPING_VALUE: u8 = 21;
-const S_FLOW_MAPPING_EMPTY_VALUE: u8 = 22;
-const S_END: u8 = 23;
+enum State: u8 {
+    STREAM_START,
+    IMPLICIT_DOCUMENT_START,
+    DOCUMENT_START,
+    DOCUMENT_CONTENT,
+    DOCUMENT_END,
+    BLOCK_NODE,
+    BLOCK_NODE_OR_INDENTLESS_SEQUENCE,
+    FLOW_NODE,
+    BLOCK_SEQUENCE_FIRST_ENTRY,
+    BLOCK_SEQUENCE_ENTRY,
+    INDENTLESS_SEQUENCE_ENTRY,
+    BLOCK_MAPPING_FIRST_KEY,
+    BLOCK_MAPPING_KEY,
+    BLOCK_MAPPING_VALUE,
+    FLOW_SEQUENCE_FIRST_ENTRY,
+    FLOW_SEQUENCE_ENTRY,
+    FLOW_SEQUENCE_ENTRY_MAPPING_KEY,
+    FLOW_SEQUENCE_ENTRY_MAPPING_VALUE,
+    FLOW_SEQUENCE_ENTRY_MAPPING_END,
+    FLOW_MAPPING_FIRST_KEY,
+    FLOW_MAPPING_KEY,
+    FLOW_MAPPING_VALUE,
+    FLOW_MAPPING_EMPTY_VALUE,
+    END,
+}
 
 struct TagDirective {
     handle: []u8,
@@ -1286,8 +1297,8 @@ struct TagDirective {
 pub struct Events {
     sc: Scanner,
     own: *mut arena.Arena,
-    state: u8,
-    states: vec.Vec.[u8],
+    state: State,
+    states: vec.Vec.[u8],  // State values
     tags: vec.Vec.[TagDirective],
     had_doc: bool,     // a document has been seen
     open_ended: bool,  // the last document ended without ... and may not be followed by directives
@@ -1313,8 +1324,8 @@ pub struct Events {
                 flow_maps: vec.Vec.[bool].init(),
                 line_start: 0,
                 token_line: 0,
-                last_kind: T_NONE,
-                last_style: 0,
+                last_kind: TokenKind.NONE,
+                last_style: Style.NONE,
                 last_end: 0,
                 buf: strs.String.init(),
                 lead: strs.String.init(),
@@ -1324,7 +1335,7 @@ pub struct Events {
                 err_mark: Mark.{ index: 0, line: 0, column: 0 },
             },
             own: a,
-            state: S_STREAM_START,
+            state: State.STREAM_START,
             states: vec.Vec.[u8].init(),
             tags: vec.Vec.[TagDirective].init(),
             had_doc: false,
@@ -1365,88 +1376,89 @@ pub struct Events {
         self.sc.take_token();
     }
 
-    fn push_state(self: *mut Events, s: u8) !void {
+    fn push_state(self: *mut Events, s: State) !void {
         if self.states.len > (2 * MAX_DEPTH) {
             return error.TooDeep;
         }
-        self.states.push(s)!;
+        self.states.push(@int_from_enum(s))!;
     }
 
-    fn pop_state(self: *mut Events) u8 {
-        return self.states.pop() catch S_END;
+    fn pop_state(self: *mut Events) State {
+        let s = self.states.pop() catch return State.END;
+        return @enum_from_int(State, s);
     }
 
-    fn ev(kind: u8, start: Mark, end: Mark) Event {
-        return Event.{ kind: kind, start: start, end: end, anchor: "", tag: "", value: "", style: 0, flow: false,
-                       explicit: false };
+    fn ev(kind: EventKind, start: Mark, end: Mark) Event {
+        return Event.{ kind: kind, start: start, end: end, anchor: "", tag: "", value: "", style: Style.NONE,
+                       flow: false, explicit: false };
     }
 
     fn empty_scalar(self: *mut Events, m: Mark) Event {
-        let mut e = Events.ev(E_SCALAR, m, m);
-        e.style = PLAIN;
+        let mut e = Events.ev(EventKind.SCALAR, m, m);
+        e.style = Style.PLAIN;
         return e;
     }
 
-    /// The next event; E_STREAM_END is the last.
+    /// The next event; EventKind.STREAM_END is the last.
     pub fn next(self: *mut Events) !Event {
         match self.state {
-            0 => {
+            .STREAM_START => {
                 let t = self.tok()!;
-                if t.kind != T_STREAM_START {
+                if t.kind != TokenKind.STREAM_START {
                     return self.fail("did not find expected <stream-start>");
                 }
                 self.skip();
-                self.state = S_IMPLICIT_DOCUMENT_START;
-                return Events.ev(E_STREAM_START, t.start, t.end);
+                self.state = State.IMPLICIT_DOCUMENT_START;
+                return Events.ev(EventKind.STREAM_START, t.start, t.end);
             }
-            1  => { return self.document_start(true); }
-            2  => { return self.document_start(false); }
-            3  => { return self.document_content(); }
-            4  => { return self.document_end(); }
-            5  => { return self.node(true, false); }
-            6  => { return self.node(true, true); }
-            7  => { return self.node(false, false); }
-            8  => { return self.block_sequence_entry(true); }
-            9  => { return self.block_sequence_entry(false); }
-            10 => { return self.indentless_sequence_entry(); }
-            11 => { return self.block_mapping_key(true); }
-            12 => { return self.block_mapping_key(false); }
-            13 => { return self.block_mapping_value(); }
-            14 => { return self.flow_sequence_entry(true); }
-            15 => { return self.flow_sequence_entry(false); }
-            16 => { return self.flow_sequence_entry_mapping_key(); }
-            17 => { return self.flow_sequence_entry_mapping_value(); }
-            18 => {
-                self.state = S_FLOW_SEQUENCE_ENTRY;
+            .IMPLICIT_DOCUMENT_START           => { return self.document_start(true); }
+            .DOCUMENT_START                    => { return self.document_start(false); }
+            .DOCUMENT_CONTENT                  => { return self.document_content(); }
+            .DOCUMENT_END                      => { return self.document_end(); }
+            .BLOCK_NODE                        => { return self.node(true, false); }
+            .BLOCK_NODE_OR_INDENTLESS_SEQUENCE => { return self.node(true, true); }
+            .FLOW_NODE                         => { return self.node(false, false); }
+            .BLOCK_SEQUENCE_FIRST_ENTRY        => { return self.block_sequence_entry(true); }
+            .BLOCK_SEQUENCE_ENTRY              => { return self.block_sequence_entry(false); }
+            .INDENTLESS_SEQUENCE_ENTRY         => { return self.indentless_sequence_entry(); }
+            .BLOCK_MAPPING_FIRST_KEY           => { return self.block_mapping_key(true); }
+            .BLOCK_MAPPING_KEY                 => { return self.block_mapping_key(false); }
+            .BLOCK_MAPPING_VALUE               => { return self.block_mapping_value(); }
+            .FLOW_SEQUENCE_FIRST_ENTRY         => { return self.flow_sequence_entry(true); }
+            .FLOW_SEQUENCE_ENTRY               => { return self.flow_sequence_entry(false); }
+            .FLOW_SEQUENCE_ENTRY_MAPPING_KEY   => { return self.flow_sequence_entry_mapping_key(); }
+            .FLOW_SEQUENCE_ENTRY_MAPPING_VALUE => { return self.flow_sequence_entry_mapping_value(); }
+            .FLOW_SEQUENCE_ENTRY_MAPPING_END => {
+                self.state = State.FLOW_SEQUENCE_ENTRY;
                 let t = self.tok()!;
-                return Events.ev(E_MAPPING_END, t.start, t.start);
+                return Events.ev(EventKind.MAPPING_END, t.start, t.start);
             }
-            19   => { return self.flow_mapping_key(true); }
-            20   => { return self.flow_mapping_key(false); }
-            21   => { return self.flow_mapping_value(false); }
-            22   => { return self.flow_mapping_value(true); }
-            else => { return error.NotFound; }
+            .FLOW_MAPPING_FIRST_KEY   => { return self.flow_mapping_key(true); }
+            .FLOW_MAPPING_KEY         => { return self.flow_mapping_key(false); }
+            .FLOW_MAPPING_VALUE       => { return self.flow_mapping_value(false); }
+            .FLOW_MAPPING_EMPTY_VALUE => { return self.flow_mapping_value(true); }
+            else                      => { return error.NotFound; }
         }
     }
 
     fn document_start(self: *mut Events, implicit: bool) !Event {
         let mut t = self.tok()!;
-        while t.kind == T_DOCUMENT_END {
+        while t.kind == TokenKind.DOCUMENT_END {
             self.skip();
             self.open_ended = false;
             t = self.tok()!;
         }
-        let bare = (t.kind != T_VERSION_DIRECTIVE) and (t.kind != T_TAG_DIRECTIVE) and (t.kind != T_DOCUMENT_START) and
-                   (t.kind != T_STREAM_END);
+        let bare = (t.kind != TokenKind.VERSION_DIRECTIVE) and (t.kind != TokenKind.TAG_DIRECTIVE) and
+                   (t.kind != TokenKind.DOCUMENT_START) and (t.kind != TokenKind.STREAM_END);
         // a document may start without --- at the start of the stream or after ...
         if bare and (implicit or not self.open_ended) {
             self.default_tags()!;
-            self.push_state(S_DOCUMENT_END)!;
-            self.state = S_BLOCK_NODE;
+            self.push_state(State.DOCUMENT_END)!;
+            self.state = State.BLOCK_NODE;
             self.had_doc = true;
-            return Events.ev(E_DOCUMENT_START, t.start, t.start);
+            return Events.ev(EventKind.DOCUMENT_START, t.start, t.start);
         }
-        if t.kind != T_STREAM_END {
+        if t.kind != TokenKind.STREAM_END {
             if not implicit and bare {
                 // after an implicit end, a document needs --- (unless it is empty)
                 return self.fail("did not find expected <document start>");
@@ -1456,7 +1468,7 @@ pub struct Events {
             self.tags.clear();
             loop {
                 t = self.tok()!;
-                if t.kind == T_VERSION_DIRECTIVE {
+                if t.kind == TokenKind.VERSION_DIRECTIVE {
                     if version {
                         return self.fail("found duplicate %YAML directive");
                     }
@@ -1465,7 +1477,7 @@ pub struct Events {
                     }
                     version = true;
                     self.skip();
-                } else if t.kind == T_TAG_DIRECTIVE {
+                } else if t.kind == TokenKind.TAG_DIRECTIVE {
                     if self.open_ended {
                         return self.fail("a directive follows a document without an explicit end");
                     }
@@ -1481,20 +1493,20 @@ pub struct Events {
                 }
             }
             self.default_tags()!;
-            if t.kind != T_DOCUMENT_START {
+            if t.kind != TokenKind.DOCUMENT_START {
                 return self.fail("did not find expected <document start>");
             }
             self.skip();
-            self.push_state(S_DOCUMENT_END)!;
-            self.state = S_DOCUMENT_CONTENT;
+            self.push_state(State.DOCUMENT_END)!;
+            self.state = State.DOCUMENT_CONTENT;
             self.had_doc = true;
-            let mut e = Events.ev(E_DOCUMENT_START, start, t.end);
+            let mut e = Events.ev(EventKind.DOCUMENT_START, start, t.end);
             e.explicit = true;
             return e;
         }
         self.skip();
-        self.state = S_END;
-        return Events.ev(E_STREAM_END, t.start, t.end);
+        self.state = State.END;
+        return Events.ev(EventKind.STREAM_END, t.start, t.end);
     }
 
     fn default_tags(self: *mut Events) !void {
@@ -1518,8 +1530,9 @@ pub struct Events {
 
     fn document_content(self: *mut Events) !Event {
         let t = self.tok()!;
-        if (t.kind == T_VERSION_DIRECTIVE) or (t.kind == T_TAG_DIRECTIVE) or (t.kind == T_DOCUMENT_START) or
-           (t.kind == T_DOCUMENT_END) or (t.kind == T_STREAM_END) {
+        if (t.kind == TokenKind.VERSION_DIRECTIVE) or (t.kind == TokenKind.TAG_DIRECTIVE) or
+           (t.kind == TokenKind.DOCUMENT_START) or (t.kind == TokenKind.DOCUMENT_END) or
+           (t.kind == TokenKind.STREAM_END) {
             self.state = self.pop_state();
             return self.empty_scalar(t.start);
         }
@@ -1528,19 +1541,19 @@ pub struct Events {
 
     fn document_end(self: *mut Events) !Event {
         let t = self.tok()!;
-        let mut e = Events.ev(E_DOCUMENT_END, t.start, t.start);
-        if t.kind == T_DOCUMENT_END {
+        let mut e = Events.ev(EventKind.DOCUMENT_END, t.start, t.start);
+        if t.kind == TokenKind.DOCUMENT_END {
             self.skip();
             e.explicit = true;
             self.open_ended = false;
         } else {
             self.open_ended = true;
-            if (t.kind != T_DOCUMENT_START) and (t.kind != T_STREAM_END) {
+            if (t.kind != TokenKind.DOCUMENT_START) and (t.kind != TokenKind.STREAM_END) {
                 return self.fail("did not find expected <document end>");
             }
         }
         self.tags.clear();
-        self.state = S_DOCUMENT_START;
+        self.state = State.DOCUMENT_START;
         return e;
     }
 
@@ -1561,10 +1574,10 @@ pub struct Events {
 
     fn node(self: *mut Events, block: bool, indentless: bool) !Event {
         let mut t = self.tok()!;
-        if t.kind == T_ALIAS {
+        if t.kind == TokenKind.ALIAS {
             self.state = self.pop_state();
             self.skip();
-            let mut e = Events.ev(E_ALIAS, t.start, t.end);
+            let mut e = Events.ev(EventKind.ALIAS, t.start, t.end);
             e.anchor = t.value;
             return e;
         }
@@ -1572,67 +1585,67 @@ pub struct Events {
         let mut anchor: []u8 = "";
         let mut tag: []u8 = "";
         let mut have_props = false;
-        if t.kind == T_ANCHOR {
+        if t.kind == TokenKind.ANCHOR {
             anchor = t.value;
             have_props = true;
             self.skip();
             t = self.tok()!;
-            if t.kind == T_TAG {
+            if t.kind == TokenKind.TAG {
                 tag = self.resolve_tag(t)!;
                 self.skip();
                 t = self.tok()!;
             }
-        } else if t.kind == T_TAG {
+        } else if t.kind == TokenKind.TAG {
             tag = self.resolve_tag(t)!;
             have_props = true;
             self.skip();
             t = self.tok()!;
-            if t.kind == T_ANCHOR {
+            if t.kind == TokenKind.ANCHOR {
                 anchor = t.value;
                 self.skip();
                 t = self.tok()!;
             }
         }
-        let mut e = Events.ev(E_SCALAR, start, t.end);
+        let mut e = Events.ev(EventKind.SCALAR, start, t.end);
         e.anchor = anchor;
         e.tag = tag;
-        if indentless and (t.kind == T_BLOCK_ENTRY) {
-            self.state = S_INDENTLESS_SEQUENCE_ENTRY;
-            e.kind = E_SEQUENCE_START;
+        if indentless and (t.kind == TokenKind.BLOCK_ENTRY) {
+            self.state = State.INDENTLESS_SEQUENCE_ENTRY;
+            e.kind = EventKind.SEQUENCE_START;
             return e;
         }
-        if t.kind == T_SCALAR {
+        if t.kind == TokenKind.SCALAR {
             self.state = self.pop_state();
             self.skip();
             e.value = t.value;
             e.style = t.style;
             return e;
         }
-        if t.kind == T_FLOW_SEQUENCE_START {
-            self.state = S_FLOW_SEQUENCE_FIRST_ENTRY;
-            e.kind = E_SEQUENCE_START;
+        if t.kind == TokenKind.FLOW_SEQUENCE_START {
+            self.state = State.FLOW_SEQUENCE_FIRST_ENTRY;
+            e.kind = EventKind.SEQUENCE_START;
             e.flow = true;
             return e;
         }
-        if t.kind == T_FLOW_MAPPING_START {
-            self.state = S_FLOW_MAPPING_FIRST_KEY;
-            e.kind = E_MAPPING_START;
+        if t.kind == TokenKind.FLOW_MAPPING_START {
+            self.state = State.FLOW_MAPPING_FIRST_KEY;
+            e.kind = EventKind.MAPPING_START;
             e.flow = true;
             return e;
         }
-        if block and (t.kind == T_BLOCK_SEQUENCE_START) {
-            self.state = S_BLOCK_SEQUENCE_FIRST_ENTRY;
-            e.kind = E_SEQUENCE_START;
+        if block and (t.kind == TokenKind.BLOCK_SEQUENCE_START) {
+            self.state = State.BLOCK_SEQUENCE_FIRST_ENTRY;
+            e.kind = EventKind.SEQUENCE_START;
             return e;
         }
-        if block and (t.kind == T_BLOCK_MAPPING_START) {
-            self.state = S_BLOCK_MAPPING_FIRST_KEY;
-            e.kind = E_MAPPING_START;
+        if block and (t.kind == TokenKind.BLOCK_MAPPING_START) {
+            self.state = State.BLOCK_MAPPING_FIRST_KEY;
+            e.kind = EventKind.MAPPING_START;
             return e;
         }
         if have_props {
             self.state = self.pop_state();
-            e.style = PLAIN;
+            e.style = Style.PLAIN;
             return e;
         }
         return self.fail("did not find expected node content");
@@ -1643,40 +1656,41 @@ pub struct Events {
             self.skip();
         }
         let t = self.tok()!;
-        if t.kind == T_BLOCK_ENTRY {
+        if t.kind == TokenKind.BLOCK_ENTRY {
             let m = t.end;
             self.skip();
             let n = self.tok()!;
-            if (n.kind != T_BLOCK_ENTRY) and (n.kind != T_BLOCK_END) {
-                self.push_state(S_BLOCK_SEQUENCE_ENTRY)!;
+            if (n.kind != TokenKind.BLOCK_ENTRY) and (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.BLOCK_SEQUENCE_ENTRY)!;
                 return self.node(true, false);
             }
-            self.state = S_BLOCK_SEQUENCE_ENTRY;
+            self.state = State.BLOCK_SEQUENCE_ENTRY;
             return self.empty_scalar(m);
         }
-        if t.kind == T_BLOCK_END {
+        if t.kind == TokenKind.BLOCK_END {
             self.state = self.pop_state();
             self.skip();
-            return Events.ev(E_SEQUENCE_END, t.start, t.end);
+            return Events.ev(EventKind.SEQUENCE_END, t.start, t.end);
         }
         return self.fail("did not find expected '-' indicator");
     }
 
     fn indentless_sequence_entry(self: *mut Events) !Event {
         let t = self.tok()!;
-        if t.kind == T_BLOCK_ENTRY {
+        if t.kind == TokenKind.BLOCK_ENTRY {
             let m = t.end;
             self.skip();
             let n = self.tok()!;
-            if (n.kind != T_BLOCK_ENTRY) and (n.kind != T_KEY) and (n.kind != T_VALUE) and (n.kind != T_BLOCK_END) {
-                self.push_state(S_INDENTLESS_SEQUENCE_ENTRY)!;
+            if (n.kind != TokenKind.BLOCK_ENTRY) and (n.kind != TokenKind.KEY) and (n.kind != TokenKind.VALUE) and
+               (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.INDENTLESS_SEQUENCE_ENTRY)!;
                 return self.node(true, false);
             }
-            self.state = S_INDENTLESS_SEQUENCE_ENTRY;
+            self.state = State.INDENTLESS_SEQUENCE_ENTRY;
             return self.empty_scalar(m);
         }
         self.state = self.pop_state();
-        return Events.ev(E_SEQUENCE_END, t.start, t.start);
+        return Events.ev(EventKind.SEQUENCE_END, t.start, t.start);
     }
 
     fn block_mapping_key(self: *mut Events, first: bool) !Event {
@@ -1684,25 +1698,25 @@ pub struct Events {
             self.skip();
         }
         let t = self.tok()!;
-        if t.kind == T_KEY {
+        if t.kind == TokenKind.KEY {
             let m = t.end;
             self.skip();
             let n = self.tok()!;
-            if (n.kind != T_KEY) and (n.kind != T_VALUE) and (n.kind != T_BLOCK_END) {
-                self.push_state(S_BLOCK_MAPPING_VALUE)!;
+            if (n.kind != TokenKind.KEY) and (n.kind != TokenKind.VALUE) and (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.BLOCK_MAPPING_VALUE)!;
                 return self.node(true, true);
             }
-            self.state = S_BLOCK_MAPPING_VALUE;
+            self.state = State.BLOCK_MAPPING_VALUE;
             return self.empty_scalar(m);
         }
-        if t.kind == T_BLOCK_END {
+        if t.kind == TokenKind.BLOCK_END {
             self.state = self.pop_state();
             self.skip();
-            return Events.ev(E_MAPPING_END, t.start, t.end);
+            return Events.ev(EventKind.MAPPING_END, t.start, t.end);
         }
-        if t.kind == T_VALUE {
+        if t.kind == TokenKind.VALUE {
             // ": value" with an empty key
-            self.state = S_BLOCK_MAPPING_VALUE;
+            self.state = State.BLOCK_MAPPING_VALUE;
             return self.empty_scalar(t.start);
         }
         return self.fail("did not find expected key");
@@ -1710,18 +1724,18 @@ pub struct Events {
 
     fn block_mapping_value(self: *mut Events) !Event {
         let t = self.tok()!;
-        if t.kind == T_VALUE {
+        if t.kind == TokenKind.VALUE {
             let m = t.end;
             self.skip();
             let n = self.tok()!;
-            if (n.kind != T_KEY) and (n.kind != T_VALUE) and (n.kind != T_BLOCK_END) {
-                self.push_state(S_BLOCK_MAPPING_KEY)!;
+            if (n.kind != TokenKind.KEY) and (n.kind != TokenKind.VALUE) and (n.kind != TokenKind.BLOCK_END) {
+                self.push_state(State.BLOCK_MAPPING_KEY)!;
                 return self.node(true, true);
             }
-            self.state = S_BLOCK_MAPPING_KEY;
+            self.state = State.BLOCK_MAPPING_KEY;
             return self.empty_scalar(m);
         }
-        self.state = S_BLOCK_MAPPING_KEY;
+        self.state = State.BLOCK_MAPPING_KEY;
         return self.empty_scalar(t.start);
     }
 
@@ -1730,55 +1744,56 @@ pub struct Events {
             self.skip();
         }
         let mut t = self.tok()!;
-        if t.kind != T_FLOW_SEQUENCE_END {
+        if t.kind != TokenKind.FLOW_SEQUENCE_END {
             if not first {
-                if t.kind != T_FLOW_ENTRY {
+                if t.kind != TokenKind.FLOW_ENTRY {
                     return self.fail("did not find expected ',' or ']'");
                 }
                 self.skip();
                 t = self.tok()!;
             }
-            if (t.kind == T_KEY) or (t.kind == T_VALUE) {
+            if (t.kind == TokenKind.KEY) or (t.kind == TokenKind.VALUE) {
                 // a single-pair mapping (": x" has an empty key)
-                self.state = S_FLOW_SEQUENCE_ENTRY_MAPPING_KEY;
-                if t.kind == T_KEY {
+                self.state = State.FLOW_SEQUENCE_ENTRY_MAPPING_KEY;
+                if t.kind == TokenKind.KEY {
                     self.skip();
                 }
-                let mut e = Events.ev(E_MAPPING_START, t.start, t.end);
+                let mut e = Events.ev(EventKind.MAPPING_START, t.start, t.end);
                 e.flow = true;
                 return e;
             }
-            if t.kind != T_FLOW_SEQUENCE_END {
-                self.push_state(S_FLOW_SEQUENCE_ENTRY)!;
+            if t.kind != TokenKind.FLOW_SEQUENCE_END {
+                self.push_state(State.FLOW_SEQUENCE_ENTRY)!;
                 return self.node(false, false);
             }
         }
         self.state = self.pop_state();
         self.skip();
-        return Events.ev(E_SEQUENCE_END, t.start, t.end);
+        return Events.ev(EventKind.SEQUENCE_END, t.start, t.end);
     }
 
     fn flow_sequence_entry_mapping_key(self: *mut Events) !Event {
         let t = self.tok()!;
-        if (t.kind != T_VALUE) and (t.kind != T_FLOW_ENTRY) and (t.kind != T_FLOW_SEQUENCE_END) {
-            self.push_state(S_FLOW_SEQUENCE_ENTRY_MAPPING_VALUE)!;
+        if (t.kind != TokenKind.VALUE) and (t.kind != TokenKind.FLOW_ENTRY) and
+           (t.kind != TokenKind.FLOW_SEQUENCE_END) {
+            self.push_state(State.FLOW_SEQUENCE_ENTRY_MAPPING_VALUE)!;
             return self.node(false, false);
         }
-        self.state = S_FLOW_SEQUENCE_ENTRY_MAPPING_VALUE;
+        self.state = State.FLOW_SEQUENCE_ENTRY_MAPPING_VALUE;
         return self.empty_scalar(t.start);
     }
 
     fn flow_sequence_entry_mapping_value(self: *mut Events) !Event {
         let t = self.tok()!;
-        if t.kind == T_VALUE {
+        if t.kind == TokenKind.VALUE {
             self.skip();
             let n = self.tok()!;
-            if (n.kind != T_FLOW_ENTRY) and (n.kind != T_FLOW_SEQUENCE_END) {
-                self.push_state(S_FLOW_SEQUENCE_ENTRY_MAPPING_END)!;
+            if (n.kind != TokenKind.FLOW_ENTRY) and (n.kind != TokenKind.FLOW_SEQUENCE_END) {
+                self.push_state(State.FLOW_SEQUENCE_ENTRY_MAPPING_END)!;
                 return self.node(false, false);
             }
         }
-        self.state = S_FLOW_SEQUENCE_ENTRY_MAPPING_END;
+        self.state = State.FLOW_SEQUENCE_ENTRY_MAPPING_END;
         return self.empty_scalar(t.start);
     }
 
@@ -1787,53 +1802,54 @@ pub struct Events {
             self.skip();
         }
         let mut t = self.tok()!;
-        if t.kind != T_FLOW_MAPPING_END {
+        if t.kind != TokenKind.FLOW_MAPPING_END {
             if not first {
-                if t.kind != T_FLOW_ENTRY {
+                if t.kind != TokenKind.FLOW_ENTRY {
                     return self.fail("did not find expected ',' or '}'");
                 }
                 self.skip();
                 t = self.tok()!;
             }
-            if t.kind == T_KEY {
+            if t.kind == TokenKind.KEY {
                 self.skip();
                 let n = self.tok()!;
-                if (n.kind != T_VALUE) and (n.kind != T_FLOW_ENTRY) and (n.kind != T_FLOW_MAPPING_END) {
-                    self.push_state(S_FLOW_MAPPING_VALUE)!;
+                if (n.kind != TokenKind.VALUE) and (n.kind != TokenKind.FLOW_ENTRY) and
+                   (n.kind != TokenKind.FLOW_MAPPING_END) {
+                    self.push_state(State.FLOW_MAPPING_VALUE)!;
                     return self.node(false, false);
                 }
-                self.state = S_FLOW_MAPPING_VALUE;
+                self.state = State.FLOW_MAPPING_VALUE;
                 return self.empty_scalar(n.start);
             }
-            if t.kind == T_VALUE {
-                self.state = S_FLOW_MAPPING_VALUE;
+            if t.kind == TokenKind.VALUE {
+                self.state = State.FLOW_MAPPING_VALUE;
                 return self.empty_scalar(t.start);  // an empty key
             }
-            if t.kind != T_FLOW_MAPPING_END {
-                self.push_state(S_FLOW_MAPPING_EMPTY_VALUE)!;
+            if t.kind != TokenKind.FLOW_MAPPING_END {
+                self.push_state(State.FLOW_MAPPING_EMPTY_VALUE)!;
                 return self.node(false, false);
             }
         }
         self.state = self.pop_state();
         self.skip();
-        return Events.ev(E_MAPPING_END, t.start, t.end);
+        return Events.ev(EventKind.MAPPING_END, t.start, t.end);
     }
 
     fn flow_mapping_value(self: *mut Events, empty: bool) !Event {
         let t = self.tok()!;
         if empty {
-            self.state = S_FLOW_MAPPING_KEY;
+            self.state = State.FLOW_MAPPING_KEY;
             return self.empty_scalar(t.start);
         }
-        if t.kind == T_VALUE {
+        if t.kind == TokenKind.VALUE {
             self.skip();
             let n = self.tok()!;
-            if (n.kind != T_FLOW_ENTRY) and (n.kind != T_FLOW_MAPPING_END) {
-                self.push_state(S_FLOW_MAPPING_KEY)!;
+            if (n.kind != TokenKind.FLOW_ENTRY) and (n.kind != TokenKind.FLOW_MAPPING_END) {
+                self.push_state(State.FLOW_MAPPING_KEY)!;
                 return self.node(false, false);
             }
         }
-        self.state = S_FLOW_MAPPING_KEY;
+        self.state = State.FLOW_MAPPING_KEY;
         return self.empty_scalar(t.start);
     }
 }
@@ -1841,29 +1857,29 @@ pub struct Events {
 /// An event in yaml-test-suite's text form ("+MAP {}", "=VAL :text", ...).
 pub fn format_event(e: Event, w: io.Writer) !void {
     match e.kind {
-        1 => { w.write_all("+STR")!; }
-        2 => { w.write_all("-STR")!; }
-        3 => {
+        .STREAM_START => { w.write_all("+STR")!; }
+        .STREAM_END   => { w.write_all("-STR")!; }
+        .DOCUMENT_START => {
             w.write_all("+DOC")!;
             if e.explicit {
                 w.write_all(" ---")!;
             }
         }
-        4 => {
+        .DOCUMENT_END => {
             w.write_all("-DOC")!;
             if e.explicit {
                 w.write_all(" ...")!;
             }
         }
-        5 => {
+        .ALIAS => {
             w.write_all("=ALI *")!;
             w.write_all(e.anchor)!;
         }
-        6 => {
+        .SCALAR => {
             w.write_all("=VAL")!;
             props(e, w)!;
             let sigils = " :'\"|>";
-            let one: [2]u8 = [' ', sigils[@as(usize, e.style)]];
+            let one: [2]u8 = [' ', sigils[@as(usize, @int_from_enum(e.style))]];
             w.write_all(one[..])!;
             for c in e.value {
                 if c == '\\' {
@@ -1882,22 +1898,22 @@ pub fn format_event(e: Event, w: io.Writer) !void {
                 }
             }
         }
-        7 => {
+        .SEQUENCE_START => {
             w.write_all("+SEQ")!;
             if e.flow {
                 w.write_all(" []")!;
             }
             props(e, w)!;
         }
-        8 => { w.write_all("-SEQ")!; }
-        9 => {
+        .SEQUENCE_END => { w.write_all("-SEQ")!; }
+        .MAPPING_START => {
             w.write_all("+MAP")!;
             if e.flow {
                 w.write_all(" {}")!;
             }
             props(e, w)!;
         }
-        10 => { w.write_all("-MAP")!; }
+        .MAPPING_END => { w.write_all("-MAP")!; }
         else => {}
     }
 }
@@ -2018,13 +2034,13 @@ struct Composer {
     fn document(self: *mut Composer) !json.Value {
         loop {
             let e = self.ev.next()!;
-            if e.kind == E_STREAM_START {
+            if e.kind == EventKind.STREAM_START {
                 continue;
             }
-            if e.kind == E_STREAM_END {
+            if e.kind == EventKind.STREAM_END {
                 return error.NotFound;
             }
-            if e.kind == E_DOCUMENT_START {
+            if e.kind == EventKind.DOCUMENT_START {
                 break;
             }
         }
@@ -2033,14 +2049,14 @@ struct Composer {
         loop {
             let e = self.ev.next()!;
             match e.kind {
-                5 => {
+                .ALIAS => {
                     let a = self.anchors.get(e.anchor) catch return self.fail(
                         "an alias to an unknown anchor", error.SyntaxError);
                     if self.add(a.value, a.size, &mut root)! {
                         break;
                     }
                 }
-                6 => {
+                .SCALAR => {
                     let v = resolve(self.ar, e) catch |err| {
                         return self.fail("a scalar does not match its tag", err);
                     };
@@ -2049,17 +2065,17 @@ struct Composer {
                         break;
                     }
                 }
-                7 => {
+                .SEQUENCE_START => {
                     self.frames.push(Frame.{ seq: true, items: vec.Vec.[json.Value].init(),
                                              members: vec.Vec.[json.Member].init(), key: "", has_key: false,
                                              anchor: e.anchor, size: 1 })!;
                 }
-                9 => {
+                .MAPPING_START => {
                     self.frames.push(Frame.{ seq: false, items: vec.Vec.[json.Value].init(),
                                              members: vec.Vec.[json.Member].init(), key: "", has_key: false,
                                              anchor: e.anchor, size: 1 })!;
                 }
-                8 => {
+                .SEQUENCE_END => {
                     let mut f = self.frames.pop()!;
                     let xs = self.ar.copy.[json.Value](f.items.items()) catch |err| {
                         f.items.deinit();
@@ -2075,7 +2091,7 @@ struct Composer {
                         break;
                     }
                 }
-                10 => {
+                .MAPPING_END => {
                     let mut f = self.frames.pop()!;
                     let dup = has_duplicates(f.members.items());
                     let ms = self.ar.copy.[json.Member](f.members.items()) catch |err| {
@@ -2100,7 +2116,7 @@ struct Composer {
         }
         // the document's end
         let e = self.ev.next()!;
-        if e.kind != E_DOCUMENT_END {
+        if e.kind != EventKind.DOCUMENT_END {
             return self.fail("expected the end of the document", error.SyntaxError);
         }
         return root;
@@ -2196,7 +2212,7 @@ fn resolve(a: *mut arena.Arena, e: Event) !json.Value {
             }
         }
     }
-    if (t.len > 0) or (e.style != PLAIN) {
+    if (t.len > 0) or (e.style != Style.PLAIN) {
         return json.Value.String(s);  // quoted, "!" or another tag: a string
     }
     return plain_value(s);
@@ -2589,7 +2605,7 @@ fn events_text(text: []u8, out: *mut strs.String) !void {
         let e = ev.next()!;
         format_event(e, out.writer())!;
         out.push('\n')!;
-        if e.kind == E_STREAM_END {
+        if e.kind == EventKind.STREAM_END {
             return;
         }
     }

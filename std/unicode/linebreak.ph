@@ -77,7 +77,7 @@ pub struct Breaks {
                 c = t.LB_AL;
             } else if c == t.LB_SA {
                 let gc = uni.category(r.value);
-                if (gc == uni.GC_MN) or (gc == uni.GC_MC) {
+                if (gc == uni.Category.MN) or (gc == uni.Category.MC) {
                     c = t.LB_CM;
                 } else {
                     c = t.LB_AL;
@@ -193,7 +193,7 @@ pub struct Breaks {
 
     fn is_ea(self: *Breaks, k: usize) bool {
         let ea = uni.east_asian_width(self.cps.get(k));
-        return (ea == uni.EA_F) or (ea == uni.EA_W) or (ea == uni.EA_H);
+        return (ea == uni.EastAsianWidth.F) or (ea == uni.EastAsianWidth.W) or (ea == uni.EastAsianWidth.H);
     }
 
     fn decide(self: *Breaks, k: usize) u8 {
@@ -263,7 +263,7 @@ pub struct Breaks {
             return NO;
         }
         // LB15a: (sot | BK | CR | LF | NL | OP | QU | GL | SP | ZW) [Pi & QU] SP* ×
-        if (x == t.LB_QU) and (uni.category(self.cps.get(xi)) == uni.GC_PI) {
+        if (x == t.LB_QU) and (uni.category(self.cps.get(xi)) == uni.Category.PI) {
             let before = self.prev_base(xi);
             if before < 0 {
                 return NO;
@@ -275,7 +275,7 @@ pub struct Breaks {
             }
         }
         // LB15b: × [Pf & QU] (SP | GL | WJ | CL | QU | CP | EX | IS | SY | BK | CR | LF | NL | ZW | eot)
-        if (eb == t.LB_QU) and (uni.category(self.cps.get(k)) == uni.GC_PF) {
+        if (eb == t.LB_QU) and (uni.category(self.cps.get(k)) == uni.Category.PF) {
             let nc = self.next_class(k);
             if nc < 0 {
                 return NO;
@@ -303,10 +303,10 @@ pub struct Breaks {
             return MAY;
         }
         // LB19
-        if (eb == t.LB_QU) and (uni.category(self.cps.get(k)) != uni.GC_PI) {
+        if (eb == t.LB_QU) and (uni.category(self.cps.get(k)) != uni.Category.PI) {
             return NO;
         }
-        if (ea == t.LB_QU) and (uni.category(self.cps.get(pa)) != uni.GC_PF) {
+        if (ea == t.LB_QU) and (uni.category(self.cps.get(pa)) != uni.Category.PF) {
             return NO;
         }
         // LB19a
@@ -488,7 +488,7 @@ pub struct Breaks {
                 return NO;
             }
             let c = self.cps.get(pa);
-            if uni.is_extended_pictographic(c) and (uni.category(c) == uni.GC_CN) {
+            if uni.is_extended_pictographic(c) and (uni.category(c) == uni.Category.CN) {
                 return NO;
             }
         }

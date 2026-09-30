@@ -15,7 +15,7 @@
 //
 //     let mut t = html.Tokenizer.init(text)!;             // just the tokens
 //     defer t.deinit();
-//     loop { let tok = t.next()!; if tok.kind == html.TK_EOF { break; } ... }
+//     loop { let tok = t.next()!; if tok.kind == html.TokenKind.EOF { break; } ... }
 //
 // parse() implements the HTML Living Standard's parser: the tokenizer with
 // every character reference, and tree construction with all its insertion
@@ -61,29 +61,42 @@ pub const NONE: u32 = 0xffffffff;
 /// their parent.
 pub const MAX_DEPTH: usize = 512;
 
-// Node kinds
-pub const DOCUMENT: u8 = 0;
-pub const DOCTYPE: u8 = 1;
-pub const ELEMENT: u8 = 2;
-pub const TEXT: u8 = 3;
-pub const COMMENT: u8 = 4;
-pub const FRAGMENT: u8 = 5;  // template contents; the result of parse_fragment
+/// Node kinds.
+pub enum Kind: u8 {
+    DOCUMENT,
+    DOCTYPE,
+    ELEMENT,
+    TEXT,
+    COMMENT,
+    FRAGMENT,  // template contents; the result of parse_fragment
+}
 
-// Element namespaces
-pub const NS_HTML: u8 = 0;
-pub const NS_SVG: u8 = 1;
-pub const NS_MATHML: u8 = 2;
+/// Element namespaces.
+pub enum Namespace: u8 {
+    HTML,
+    SVG,
+    MATHML,
 
-// Attribute namespaces (from SVG and MathML: xlink:href, xml:lang, xmlns)
-pub const A_NONE: u8 = 0;
-pub const A_XLINK: u8 = 1;
-pub const A_XML: u8 = 2;
-pub const A_XMLNS: u8 = 3;
+    /// The namespace's URI (NAMESPACE_URIS).
+    pub fn uri(self: Namespace) []u8 {
+        return NAMESPACE_URIS[@as(usize, @int_from_enum(self))];
+    }
+}
 
-// Document modes
-pub const NO_QUIRKS: u8 = 0;
-pub const QUIRKS: u8 = 1;
-pub const LIMITED_QUIRKS: u8 = 2;
+/// Attribute namespaces (from SVG and MathML: xlink:href, xml:lang, xmlns).
+pub enum AttrNamespace: u8 {
+    NONE,
+    XLINK,
+    XML,
+    XMLNS,
+}
+
+/// Document modes.
+pub enum QuirksMode: u8 {
+    NO_QUIRKS,
+    QUIRKS,
+    LIMITED_QUIRKS,
+}
 
 pub let NAMESPACE_URIS: [3][]u8 = ["http://www.w3.org/1999/xhtml", "http://www.w3.org/2000/svg",
                                    "http://www.w3.org/1998/Math/MathML"];
@@ -590,92 +603,97 @@ fn normalize(s: []u8, i0: usize, out: *mut strs.String) !void {
 // Tokenizer
 // -----------------------------------------------------------------------------
 
-// Token kinds
-pub const TK_NONE: u8 = 0;
-pub const TK_DOCTYPE: u8 = 1;
-pub const TK_START: u8 = 2;
-pub const TK_END: u8 = 3;
-pub const TK_COMMENT: u8 = 4;
-pub const TK_CHARS: u8 = 5;
-pub const TK_EOF: u8 = 6;
+/// Token kinds.
+pub enum TokenKind: u8 {
+    NONE,
+    DOCTYPE,
+    START,
+    END,
+    COMMENT,
+    CHARS,
+    EOF,
+}
 
-// Tokenizer states (those the tree builder or a caller may set are public)
-pub const S_DATA: u8 = 0;
-pub const S_RCDATA: u8 = 1;
-pub const S_RAWTEXT: u8 = 2;
-pub const S_SCRIPT: u8 = 3;
-pub const S_PLAINTEXT: u8 = 4;
-pub const S_CDATA: u8 = 5;
-const S_TAG_OPEN: u8 = 6;
-const S_END_TAG_OPEN: u8 = 7;
-const S_TAG_NAME: u8 = 8;
-const S_RCDATA_LT: u8 = 9;
-const S_RCDATA_END_OPEN: u8 = 10;
-const S_RCDATA_END_NAME: u8 = 11;
-const S_RAWTEXT_LT: u8 = 12;
-const S_RAWTEXT_END_OPEN: u8 = 13;
-const S_RAWTEXT_END_NAME: u8 = 14;
-const S_SCRIPT_LT: u8 = 15;
-const S_SCRIPT_END_OPEN: u8 = 16;
-const S_SCRIPT_END_NAME: u8 = 17;
-const S_SCRIPT_ESC_START: u8 = 18;
-const S_SCRIPT_ESC_START_DASH: u8 = 19;
-const S_SCRIPT_ESC: u8 = 20;
-const S_SCRIPT_ESC_DASH: u8 = 21;
-const S_SCRIPT_ESC_DASH_DASH: u8 = 22;
-const S_SCRIPT_ESC_LT: u8 = 23;
-const S_SCRIPT_ESC_END_OPEN: u8 = 24;
-const S_SCRIPT_ESC_END_NAME: u8 = 25;
-const S_SCRIPT_DESC_START: u8 = 26;
-const S_SCRIPT_DESC: u8 = 27;
-const S_SCRIPT_DESC_DASH: u8 = 28;
-const S_SCRIPT_DESC_DASH_DASH: u8 = 29;
-const S_SCRIPT_DESC_LT: u8 = 30;
-const S_SCRIPT_DESC_END: u8 = 31;
-const S_BEFORE_ATTR_NAME: u8 = 32;
-const S_ATTR_NAME: u8 = 33;
-const S_AFTER_ATTR_NAME: u8 = 34;
-const S_BEFORE_ATTR_VALUE: u8 = 35;
-const S_ATTR_VALUE_DQ: u8 = 36;
-const S_ATTR_VALUE_SQ: u8 = 37;
-const S_ATTR_VALUE_UNQ: u8 = 38;
-const S_AFTER_ATTR_VALUE: u8 = 39;
-const S_SELF_CLOSING: u8 = 40;
-const S_BOGUS_COMMENT: u8 = 41;
-const S_MARKUP_DECL: u8 = 42;
-const S_COMMENT_START: u8 = 43;
-const S_COMMENT_START_DASH: u8 = 44;
-const S_COMMENT: u8 = 45;
-const S_COMMENT_LT: u8 = 46;
-const S_COMMENT_LT_BANG: u8 = 47;
-const S_COMMENT_LT_BANG_DASH: u8 = 48;
-const S_COMMENT_LT_BANG_DASH_DASH: u8 = 49;
-const S_COMMENT_END_DASH: u8 = 50;
-const S_COMMENT_END: u8 = 51;
-const S_COMMENT_END_BANG: u8 = 52;
-const S_DOCTYPE: u8 = 53;
-const S_BEFORE_DOCTYPE_NAME: u8 = 54;
-const S_DOCTYPE_NAME: u8 = 55;
-const S_AFTER_DOCTYPE_NAME: u8 = 56;
-const S_AFTER_DOCTYPE_PUBLIC_KW: u8 = 57;
-const S_BEFORE_DOCTYPE_PUBLIC_ID: u8 = 58;
-const S_DOCTYPE_PUBLIC_ID_DQ: u8 = 59;
-const S_DOCTYPE_PUBLIC_ID_SQ: u8 = 60;
-const S_AFTER_DOCTYPE_PUBLIC_ID: u8 = 61;
-const S_BETWEEN_DOCTYPE_IDS: u8 = 62;
-const S_AFTER_DOCTYPE_SYSTEM_KW: u8 = 63;
-const S_BEFORE_DOCTYPE_SYSTEM_ID: u8 = 64;
-const S_DOCTYPE_SYSTEM_ID_DQ: u8 = 65;
-const S_DOCTYPE_SYSTEM_ID_SQ: u8 = 66;
-const S_AFTER_DOCTYPE_SYSTEM_ID: u8 = 67;
-const S_BOGUS_DOCTYPE: u8 = 68;
-const S_CDATA_BRACKET: u8 = 69;
-const S_CDATA_END: u8 = 70;
+/// Tokenizer states. A tree builder or a caller sets one of the first six
+/// (DATA to CDATA); the others are the tokenizer's own.
+pub enum State: u8 {
+    DATA,
+    RCDATA,
+    RAWTEXT,
+    SCRIPT,
+    PLAINTEXT,
+    CDATA,
+    TAG_OPEN,
+    END_TAG_OPEN,
+    TAG_NAME,
+    RCDATA_LT,
+    RCDATA_END_OPEN,
+    RCDATA_END_NAME,
+    RAWTEXT_LT,
+    RAWTEXT_END_OPEN,
+    RAWTEXT_END_NAME,
+    SCRIPT_LT,
+    SCRIPT_END_OPEN,
+    SCRIPT_END_NAME,
+    SCRIPT_ESC_START,
+    SCRIPT_ESC_START_DASH,
+    SCRIPT_ESC,
+    SCRIPT_ESC_DASH,
+    SCRIPT_ESC_DASH_DASH,
+    SCRIPT_ESC_LT,
+    SCRIPT_ESC_END_OPEN,
+    SCRIPT_ESC_END_NAME,
+    SCRIPT_DESC_START,
+    SCRIPT_DESC,
+    SCRIPT_DESC_DASH,
+    SCRIPT_DESC_DASH_DASH,
+    SCRIPT_DESC_LT,
+    SCRIPT_DESC_END,
+    BEFORE_ATTR_NAME,
+    ATTR_NAME,
+    AFTER_ATTR_NAME,
+    BEFORE_ATTR_VALUE,
+    ATTR_VALUE_DQ,
+    ATTR_VALUE_SQ,
+    ATTR_VALUE_UNQ,
+    AFTER_ATTR_VALUE,
+    SELF_CLOSING,
+    BOGUS_COMMENT,
+    MARKUP_DECL,
+    COMMENT_START,
+    COMMENT_START_DASH,
+    COMMENT,
+    COMMENT_LT,
+    COMMENT_LT_BANG,
+    COMMENT_LT_BANG_DASH,
+    COMMENT_LT_BANG_DASH_DASH,
+    COMMENT_END_DASH,
+    COMMENT_END,
+    COMMENT_END_BANG,
+    DOCTYPE,
+    BEFORE_DOCTYPE_NAME,
+    DOCTYPE_NAME,
+    AFTER_DOCTYPE_NAME,
+    AFTER_DOCTYPE_PUBLIC_KW,
+    BEFORE_DOCTYPE_PUBLIC_ID,
+    DOCTYPE_PUBLIC_ID_DQ,
+    DOCTYPE_PUBLIC_ID_SQ,
+    AFTER_DOCTYPE_PUBLIC_ID,
+    BETWEEN_DOCTYPE_IDS,
+    AFTER_DOCTYPE_SYSTEM_KW,
+    BEFORE_DOCTYPE_SYSTEM_ID,
+    DOCTYPE_SYSTEM_ID_DQ,
+    DOCTYPE_SYSTEM_ID_SQ,
+    AFTER_DOCTYPE_SYSTEM_ID,
+    BOGUS_DOCTYPE,
+    CDATA_BRACKET,
+    CDATA_END,
+}
 
 pub struct Attr {
-    ns: u8,        // A_NONE, or A_XLINK, A_XML or A_XMLNS on foreign elements
-    prefix: []u8,  // "xlink" etc. with a namespace, else ""
-    name: []u8,    // the local name
+    ns: AttrNamespace,  // NONE, or XLINK, XML or XMLNS on foreign elements
+    prefix: []u8,       // "xlink" etc. with a namespace, else ""
+    name: []u8,         // the local name
     value: []u8,
 }
 
@@ -688,12 +706,12 @@ struct Span {
 
 /// A token: valid until the next call of Tokenizer.next.
 pub struct Token {
-    kind: u8,
+    kind: TokenKind,
     name: []u8,  // tag name (lowercase) or DOCTYPE name
     tag: u16,    // the tag name's T_ constant, or 0
     attrs: []Attr,
     self_closing: bool,
-    data: []u8,  // TK_CHARS and TK_COMMENT
+    data: []u8,  // TokenKind.CHARS and TokenKind.COMMENT
     public_id: []u8,
     system_id: []u8,
     has_name: bool,  // DOCTYPE: whether each part was present
@@ -702,16 +720,16 @@ pub struct Token {
     force_quirks: bool,
 }
 
-/// The HTML tokenizer. Characters come as runs (TK_CHARS); a caller building
+/// The HTML tokenizer. Characters come as runs (TokenKind.CHARS); a caller building
 /// a tree changes `state` after start tags as the tree builder does.
 pub struct Tokenizer {
     s: []u8,
     owned: []mut u8,  // s, when preprocessing had to copy it
     i: usize,
-    state: u8,
+    state: State,
     last_start: strs.String,  // the last start tag's name (for appropriate end tags)
     cdata_ok: bool,           // <![CDATA[ opens a section (set in foreign content)
-    kind: u8,                 // the tag being built: TK_START or TK_END
+    kind: TokenKind,          // the tag being built: START or END
     self_closing: bool,
     name: strs.String,
     tmp: strs.String,
@@ -727,7 +745,7 @@ pub struct Tokenizer {
     has_public: bool,
     has_system: bool,
     force_quirks: bool,
-    pending: u8,  // a finished token waiting behind characters
+    pending: TokenKind,  // a finished token waiting behind characters
     done: bool,
     errors: u32,  // parse errors seen (they are not fatal)
 
@@ -735,13 +753,13 @@ pub struct Tokenizer {
     pub fn init(text: []u8) !Tokenizer {
         let mut owned: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
         let s = preprocess(text, &mut owned)!;
-        return Tokenizer.{ s: s, owned: owned, i: 0, state: S_DATA, last_start: strs.String.init(), cdata_ok: false,
-                           kind: TK_START, self_closing: false, name: strs.String.init(), tmp: strs.String.init(),
-                           comment: strs.String.init(), chars: strs.String.init(), abuf: strs.String.init(),
-                           spans: vec.Vec.[Span].init(), seen: vec.Vec.[u32].init(), attrs: vec.Vec.[Attr].init(),
-                           public_id: strs.String.init(), system_id: strs.String.init(), has_name: false,
-                           has_public: false, has_system: false, force_quirks: false, pending: TK_NONE, done: false,
-                           errors: 0 };
+        return Tokenizer.{ s: s, owned: owned, i: 0, state: State.DATA, last_start: strs.String.init(), cdata_ok: false,
+                           kind: TokenKind.START, self_closing: false, name: strs.String.init(),
+                           tmp: strs.String.init(), comment: strs.String.init(), chars: strs.String.init(),
+                           abuf: strs.String.init(), spans: vec.Vec.[Span].init(), seen: vec.Vec.[u32].init(),
+                           attrs: vec.Vec.[Attr].init(), public_id: strs.String.init(), system_id: strs.String.init(),
+                           has_name: false, has_public: false, has_system: false, force_quirks: false,
+                           pending: TokenKind.NONE, done: false, errors: 0 };
     }
 
     pub fn deinit(self: *mut Tokenizer) void {
@@ -768,39 +786,39 @@ pub struct Tokenizer {
         self.last_start.push_str(name)!;
     }
 
-    /// The next token. After TK_EOF, TK_EOF again.
+    /// The next token. After TokenKind.EOF, TokenKind.EOF again.
     pub fn next(self: *mut Tokenizer) !Token {
-        if self.pending != TK_NONE {
+        if self.pending != TokenKind.NONE {
             let k = self.pending;
-            self.pending = TK_NONE;
+            self.pending = TokenKind.NONE;
             return self.make(k);
         }
         self.chars.clear();
         if self.done {
-            return self.make(TK_EOF);
+            return self.make(TokenKind.EOF);
         }
         let k = self.run()!;
-        if k == TK_EOF {
+        if k == TokenKind.EOF {
             self.done = true;
         } else if self.i >= self.s.len {
-            self.state = S_DATA;  // (a comment or DOCTYPE cut off by the end: EOF next)
+            self.state = State.DATA;  // (a comment or DOCTYPE cut off by the end: EOF next)
         }
         if self.chars.len > 0 {
             self.pending = k;
-            return self.make(TK_CHARS);
+            return self.make(TokenKind.CHARS);
         }
         return self.make(k);
     }
 
-    fn make(self: *mut Tokenizer, k: u8) !Token {
+    fn make(self: *mut Tokenizer, k: TokenKind) !Token {
         let mut t = Token.{ kind: k, name: "", tag: 0, attrs: self.attrs.items()[..0], self_closing: false, data: "",
                             public_id: "", system_id: "", has_name: false, has_public: false, has_system: false,
                             force_quirks: false };
-        if k == TK_CHARS {
+        if k == TokenKind.CHARS {
             t.data = self.chars.bytes();
-        } else if k == TK_COMMENT {
+        } else if k == TokenKind.COMMENT {
             t.data = self.comment.bytes();
-        } else if (k == TK_START) or (k == TK_END) {
+        } else if (k == TokenKind.START) or (k == TokenKind.END) {
             t.name = self.name.bytes();
             t.tag = tag_of(t.name);
             t.self_closing = self.self_closing;
@@ -815,15 +833,15 @@ pub struct Tokenizer {
                 if sp[k2].dup {
                     continue;
                 }
-                self.attrs.push(Attr.{ ns: A_NONE, prefix: "", name: b[sp[k2].ns..sp[k2].ne],
+                self.attrs.push(Attr.{ ns: AttrNamespace.NONE, prefix: "", name: b[sp[k2].ns..sp[k2].ne],
                                        value: b[sp[k2].vs..ve] })!;
             }
             t.attrs = self.attrs.items();
-            if k == TK_START {
+            if k == TokenKind.START {
                 self.last_start.clear();
                 self.last_start.push_str(t.name)!;
             }
-        } else if k == TK_DOCTYPE {
+        } else if k == TokenKind.DOCTYPE {
             t.name = self.name.bytes();
             t.public_id = self.public_id.bytes();
             t.system_id = self.system_id.bytes();
@@ -846,7 +864,7 @@ pub struct Tokenizer {
         self.errors +%= 1;
     }
 
-    fn new_tag(self: *mut Tokenizer, k: u8) void {
+    fn new_tag(self: *mut Tokenizer, k: TokenKind) void {
         self.kind = k;
         self.self_closing = false;
         self.name.clear();
@@ -936,8 +954,8 @@ pub struct Tokenizer {
     }
 
     // Finishes the current tag: the kind to return.
-    fn emit_tag(self: *mut Tokenizer) u8 {
-        if self.kind == TK_END {
+    fn emit_tag(self: *mut Tokenizer) TokenKind {
+        if self.kind == TokenKind.END {
             if (self.spans.len > 0) or self.self_closing {
                 self.err();
             }
@@ -1091,13 +1109,13 @@ pub struct Tokenizer {
 
     // Runs the state machine until a token other than characters is complete
     // (characters collect in self.chars): returns its kind.
-    fn run(self: *mut Tokenizer) !u8 {
+    fn run(self: *mut Tokenizer) !TokenKind {
         let s = self.s;
         let n = s.len;
         loop {
             let st = self.state;
             // --- the text states, a run at a time
-            if st == S_DATA {
+            if st == State.DATA {
                 let b = self.i;
                 let mut i = b;
                 while (i < n) and (s[i] != '<') and (s[i] != '&') and (s[i] != 0) {
@@ -1106,30 +1124,30 @@ pub struct Tokenizer {
                 self.chars.push_str(s[b..i])!;
                 self.i = i;
                 if i >= n {
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i = i + 1;
                 let c = s[i];
                 if c == '&' {
                     self.char_ref(false)!;
                 } else if c == '<' {
-                    self.state = S_TAG_OPEN;
+                    self.state = State.TAG_OPEN;
                 } else {
                     self.err();
                     self.chars.push(0)!;  // (the tree builder drops it)
                 }
                 continue;
             }
-            if (st == S_RCDATA) or (st == S_RAWTEXT) or (st == S_SCRIPT) or (st == S_PLAINTEXT) {
+            if (st == State.RCDATA) or (st == State.RAWTEXT) or (st == State.SCRIPT) or (st == State.PLAINTEXT) {
                 let b = self.i;
                 let mut i = b;
-                while (i < n) and (s[i] != '<') and (s[i] != 0) and ((s[i] != '&') or (st != S_RCDATA)) {
+                while (i < n) and (s[i] != '<') and (s[i] != 0) and ((s[i] != '&') or (st != State.RCDATA)) {
                     i += 1;
                 }
                 self.chars.push_str(s[b..i])!;
                 self.i = i;
                 if i >= n {
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i = i + 1;
                 let c = s[i];
@@ -1138,31 +1156,31 @@ pub struct Tokenizer {
                     self.chars.push_str("\xef\xbf\xbd")!;
                 } else if c == '&' {
                     self.char_ref(false)!;
-                } else if st == S_PLAINTEXT {
+                } else if st == State.PLAINTEXT {
                     self.chars.push('<')!;
-                } else if st == S_RCDATA {
-                    self.state = S_RCDATA_LT;
-                } else if st == S_RAWTEXT {
-                    self.state = S_RAWTEXT_LT;
+                } else if st == State.RCDATA {
+                    self.state = State.RCDATA_LT;
+                } else if st == State.RAWTEXT {
+                    self.state = State.RAWTEXT_LT;
                 } else {
-                    self.state = S_SCRIPT_LT;
+                    self.state = State.SCRIPT_LT;
                 }
                 continue;
             }
             let c = self.at();
-            if st == S_TAG_NAME {
+            if st == State.TAG_NAME {
                 if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i += 1;
                 let b = @truncate(u8, c);
                 if is_ws(b) {
-                    self.state = S_BEFORE_ATTR_NAME;
+                    self.state = State.BEFORE_ATTR_NAME;
                 } else if b == '/' {
-                    self.state = S_SELF_CLOSING;
+                    self.state = State.SELF_CLOSING;
                 } else if b == '>' {
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else if b == 0 {
                     self.err();
@@ -1172,31 +1190,31 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if st == S_BEFORE_ATTR_NAME {
+            if st == State.BEFORE_ATTR_NAME {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if (c == '/') or (c == '>') or (c < 0) {
-                    self.state = S_AFTER_ATTR_NAME;
+                    self.state = State.AFTER_ATTR_NAME;
                 } else if c == '=' {
                     self.err();
                     self.new_attr()!;
                     self.abuf.push('=')!;
                     self.i += 1;
-                    self.state = S_ATTR_NAME;
+                    self.state = State.ATTR_NAME;
                 } else {
                     self.new_attr()!;
-                    self.state = S_ATTR_NAME;
+                    self.state = State.ATTR_NAME;
                 }
                 continue;
             }
-            if st == S_ATTR_NAME {
+            if st == State.ATTR_NAME {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') or (c < 0) {
                     self.end_attr_name()!;
-                    self.state = S_AFTER_ATTR_NAME;
+                    self.state = State.AFTER_ATTR_NAME;
                 } else if c == '=' {
                     self.end_attr_name()!;
                     self.i += 1;
-                    self.state = S_BEFORE_ATTR_VALUE;
+                    self.state = State.BEFORE_ATTR_VALUE;
                 } else {
                     self.i += 1;
                     if c == 0 {
@@ -1211,50 +1229,50 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if st == S_AFTER_ATTR_NAME {
+            if st == State.AFTER_ATTR_NAME {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if c == '/' {
                     self.i += 1;
-                    self.state = S_SELF_CLOSING;
+                    self.state = State.SELF_CLOSING;
                 } else if c == '=' {
                     self.i += 1;
-                    self.state = S_BEFORE_ATTR_VALUE;
+                    self.state = State.BEFORE_ATTR_VALUE;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 } else {
                     self.new_attr()!;
-                    self.state = S_ATTR_NAME;
+                    self.state = State.ATTR_NAME;
                 }
                 continue;
             }
-            if st == S_BEFORE_ATTR_VALUE {
+            if st == State.BEFORE_ATTR_VALUE {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if c == '"' {
                     self.i += 1;
-                    self.state = S_ATTR_VALUE_DQ;
+                    self.state = State.ATTR_VALUE_DQ;
                 } else if c == '\'' {
                     self.i += 1;
-                    self.state = S_ATTR_VALUE_SQ;
+                    self.state = State.ATTR_VALUE_SQ;
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else {
-                    self.state = S_ATTR_VALUE_UNQ;
+                    self.state = State.ATTR_VALUE_UNQ;
                 }
                 continue;
             }
-            if (st == S_ATTR_VALUE_DQ) or (st == S_ATTR_VALUE_SQ) {
+            if (st == State.ATTR_VALUE_DQ) or (st == State.ATTR_VALUE_SQ) {
                 let mut qq: u8 = '"';
-                if st == S_ATTR_VALUE_SQ {
+                if st == State.ATTR_VALUE_SQ {
                     qq = '\'';
                 }
                 let b = self.i;
@@ -1266,11 +1284,11 @@ pub struct Tokenizer {
                 self.i = i;
                 if i >= n {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i = i + 1;
                 if s[i] == qq {
-                    self.state = S_AFTER_ATTR_VALUE;
+                    self.state = State.AFTER_ATTR_VALUE;
                 } else if s[i] == '&' {
                     self.char_ref(true)!;
                 } else {
@@ -1279,19 +1297,19 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if st == S_ATTR_VALUE_UNQ {
+            if st == State.ATTR_VALUE_UNQ {
                 if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i += 1;
                 let b = @truncate(u8, c);
                 if (b == '\t') or (b == '\n') or (b == 12) or (b == ' ') {
-                    self.state = S_BEFORE_ATTR_NAME;
+                    self.state = State.BEFORE_ATTR_NAME;
                 } else if b == '&' {
                     self.char_ref(true)!;
                 } else if b == '>' {
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else if b == 0 {
                     self.err();
@@ -1304,98 +1322,98 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if st == S_AFTER_ATTR_VALUE {
+            if st == State.AFTER_ATTR_VALUE {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
-                    self.state = S_BEFORE_ATTR_NAME;
+                    self.state = State.BEFORE_ATTR_NAME;
                 } else if c == '/' {
                     self.i += 1;
-                    self.state = S_SELF_CLOSING;
+                    self.state = State.SELF_CLOSING;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 } else {
                     self.err();
-                    self.state = S_BEFORE_ATTR_NAME;
+                    self.state = State.BEFORE_ATTR_NAME;
                 }
                 continue;
             }
-            if st == S_SELF_CLOSING {
+            if st == State.SELF_CLOSING {
                 if c == '>' {
                     self.i += 1;
                     self.self_closing = true;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 } else {
                     self.err();
-                    self.state = S_BEFORE_ATTR_NAME;
+                    self.state = State.BEFORE_ATTR_NAME;
                 }
                 continue;
             }
-            if st == S_TAG_OPEN {
+            if st == State.TAG_OPEN {
                 if c == '!' {
                     self.i += 1;
-                    self.state = S_MARKUP_DECL;
+                    self.state = State.MARKUP_DECL;
                 } else if c == '/' {
                     self.i += 1;
-                    self.state = S_END_TAG_OPEN;
+                    self.state = State.END_TAG_OPEN;
                 } else if is_alpha(c) {
-                    self.new_tag(TK_START);
-                    self.state = S_TAG_NAME;
+                    self.new_tag(TokenKind.START);
+                    self.state = State.TAG_NAME;
                 } else if c == '?' {
                     self.err();
                     self.comment.clear();
-                    self.state = S_BOGUS_COMMENT;
+                    self.state = State.BOGUS_COMMENT;
                 } else if c < 0 {
                     self.err();
                     self.chars.push('<')!;
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 } else {
                     self.err();
                     self.chars.push('<')!;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                 }
                 continue;
             }
-            if st == S_END_TAG_OPEN {
+            if st == State.END_TAG_OPEN {
                 if is_alpha(c) {
-                    self.new_tag(TK_END);
-                    self.state = S_TAG_NAME;
+                    self.new_tag(TokenKind.END);
+                    self.state = State.TAG_NAME;
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                 } else if c < 0 {
                     self.err();
                     self.chars.push_str("</")!;
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 } else {
                     self.err();
                     self.comment.clear();
-                    self.state = S_BOGUS_COMMENT;
+                    self.state = State.BOGUS_COMMENT;
                 }
                 continue;
             }
             // --- RCDATA, RAWTEXT and script data end tags
-            if (st == S_RCDATA_LT) or (st == S_RAWTEXT_LT) {
-                let mut back = S_RCDATA;
-                if st == S_RAWTEXT_LT {
-                    back = S_RAWTEXT;
+            if (st == State.RCDATA_LT) or (st == State.RAWTEXT_LT) {
+                let mut back = State.RCDATA;
+                if st == State.RAWTEXT_LT {
+                    back = State.RAWTEXT;
                 }
                 if c == '/' {
                     self.i += 1;
                     self.tmp.clear();
-                    if st == S_RCDATA_LT {
-                        self.state = S_RCDATA_END_OPEN;
+                    if st == State.RCDATA_LT {
+                        self.state = State.RCDATA_END_OPEN;
                     } else {
-                        self.state = S_RAWTEXT_END_OPEN;
+                        self.state = State.RAWTEXT_END_OPEN;
                     }
                 } else {
                     self.chars.push('<')!;
@@ -1403,28 +1421,28 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if (st == S_RCDATA_END_OPEN) or (st == S_RAWTEXT_END_OPEN) or (st == S_SCRIPT_END_OPEN) or
-               (st == S_SCRIPT_ESC_END_OPEN) {
+            if (st == State.RCDATA_END_OPEN) or (st == State.RAWTEXT_END_OPEN) or (st == State.SCRIPT_END_OPEN) or
+               (st == State.SCRIPT_ESC_END_OPEN) {
                 if is_alpha(c) {
-                    self.new_tag(TK_END);
-                    self.state = st + 1;
+                    self.new_tag(TokenKind.END);
+                    self.state = end_name_state(st);
                 } else {
                     self.chars.push_str("</")!;
                     self.state = end_tag_back(st);
                 }
                 continue;
             }
-            if (st == S_RCDATA_END_NAME) or (st == S_RAWTEXT_END_NAME) or (st == S_SCRIPT_END_NAME) or
-               (st == S_SCRIPT_ESC_END_NAME) {
+            if (st == State.RCDATA_END_NAME) or (st == State.RAWTEXT_END_NAME) or (st == State.SCRIPT_END_NAME) or
+               (st == State.SCRIPT_ESC_END_NAME) {
                 if ((c == '\t') or (c == '\n') or (c == 12) or (c == ' ')) and self.appropriate() {
                     self.i += 1;
-                    self.state = S_BEFORE_ATTR_NAME;
+                    self.state = State.BEFORE_ATTR_NAME;
                 } else if (c == '/') and self.appropriate() {
                     self.i += 1;
-                    self.state = S_SELF_CLOSING;
+                    self.state = State.SELF_CLOSING;
                 } else if (c == '>') and self.appropriate() {
                     self.i += 1;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                     return self.emit_tag();
                 } else if is_alpha(c) {
                     self.i += 1;
@@ -1432,98 +1450,98 @@ pub struct Tokenizer {
                     self.tmp.push(@truncate(u8, c))!;
                 } else {
                     self.flush_end_tag()!;
-                    self.state = end_tag_back(st - 1);
+                    self.state = end_tag_back(st);
                 }
                 continue;
             }
-            if st == S_SCRIPT_LT {
+            if st == State.SCRIPT_LT {
                 if c == '/' {
                     self.i += 1;
                     self.tmp.clear();
-                    self.state = S_SCRIPT_END_OPEN;
+                    self.state = State.SCRIPT_END_OPEN;
                 } else if c == '!' {
                     self.i += 1;
                     self.chars.push_str("<!")!;
-                    self.state = S_SCRIPT_ESC_START;
+                    self.state = State.SCRIPT_ESC_START;
                 } else {
                     self.chars.push('<')!;
-                    self.state = S_SCRIPT;
+                    self.state = State.SCRIPT;
                 }
                 continue;
             }
-            if (st == S_SCRIPT_ESC_START) or (st == S_SCRIPT_ESC_START_DASH) {
+            if (st == State.SCRIPT_ESC_START) or (st == State.SCRIPT_ESC_START_DASH) {
                 if c == '-' {
                     self.i += 1;
                     self.chars.push('-')!;
-                    if st == S_SCRIPT_ESC_START {
-                        self.state = S_SCRIPT_ESC_START_DASH;
+                    if st == State.SCRIPT_ESC_START {
+                        self.state = State.SCRIPT_ESC_START_DASH;
                     } else {
-                        self.state = S_SCRIPT_ESC_DASH_DASH;
+                        self.state = State.SCRIPT_ESC_DASH_DASH;
                     }
                 } else {
-                    self.state = S_SCRIPT;
+                    self.state = State.SCRIPT;
                 }
                 continue;
             }
-            if (st == S_SCRIPT_ESC) or (st == S_SCRIPT_ESC_DASH) or (st == S_SCRIPT_ESC_DASH_DASH) {
+            if (st == State.SCRIPT_ESC) or (st == State.SCRIPT_ESC_DASH) or (st == State.SCRIPT_ESC_DASH_DASH) {
                 if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i += 1;
                 if c == '-' {
                     self.chars.push('-')!;
-                    if st == S_SCRIPT_ESC {
-                        self.state = S_SCRIPT_ESC_DASH;
+                    if st == State.SCRIPT_ESC {
+                        self.state = State.SCRIPT_ESC_DASH;
                     } else {
-                        self.state = S_SCRIPT_ESC_DASH_DASH;
+                        self.state = State.SCRIPT_ESC_DASH_DASH;
                     }
                 } else if c == '<' {
-                    self.state = S_SCRIPT_ESC_LT;
-                } else if (c == '>') and (st == S_SCRIPT_ESC_DASH_DASH) {
+                    self.state = State.SCRIPT_ESC_LT;
+                } else if (c == '>') and (st == State.SCRIPT_ESC_DASH_DASH) {
                     self.chars.push('>')!;
-                    self.state = S_SCRIPT;
+                    self.state = State.SCRIPT;
                 } else if c == 0 {
                     self.err();
                     self.chars.push_str("\xef\xbf\xbd")!;
-                    self.state = S_SCRIPT_ESC;
+                    self.state = State.SCRIPT_ESC;
                 } else {
                     self.chars.push(@truncate(u8, c))!;
-                    self.state = S_SCRIPT_ESC;
+                    self.state = State.SCRIPT_ESC;
                 }
                 continue;
             }
-            if st == S_SCRIPT_ESC_LT {
+            if st == State.SCRIPT_ESC_LT {
                 if c == '/' {
                     self.i += 1;
                     self.tmp.clear();
-                    self.state = S_SCRIPT_ESC_END_OPEN;
+                    self.state = State.SCRIPT_ESC_END_OPEN;
                 } else if is_alpha(c) {
                     self.tmp.clear();
                     self.chars.push('<')!;
-                    self.state = S_SCRIPT_DESC_START;
+                    self.state = State.SCRIPT_DESC_START;
                 } else {
                     self.chars.push('<')!;
-                    self.state = S_SCRIPT_ESC;
+                    self.state = State.SCRIPT_ESC;
                 }
                 continue;
             }
-            if (st == S_SCRIPT_DESC_START) or (st == S_SCRIPT_DESC_END) {
+            if (st == State.SCRIPT_DESC_START) or (st == State.SCRIPT_DESC_END) {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') {
                     self.i += 1;
                     self.chars.push(@truncate(u8, c))!;
                     let is_script = strs.eq(self.tmp.bytes(), "script");
-                    if st == S_SCRIPT_DESC_START {
+                    if st == State.SCRIPT_DESC_START {
                         if is_script {
-                            self.state = S_SCRIPT_DESC;
+                            self.state = State.SCRIPT_DESC;
                         } else {
-                            self.state = S_SCRIPT_ESC;
+                            self.state = State.SCRIPT_ESC;
                         }
                     } else {
                         if is_script {
-                            self.state = S_SCRIPT_ESC;
+                            self.state = State.SCRIPT_ESC;
                         } else {
-                            self.state = S_SCRIPT_DESC;
+                            self.state = State.SCRIPT_DESC;
                         }
                     }
                 } else if is_alpha(c) {
@@ -1531,81 +1549,81 @@ pub struct Tokenizer {
                     self.tmp.push(lower(c))!;
                     self.chars.push(@truncate(u8, c))!;
                 } else {
-                    if st == S_SCRIPT_DESC_START {
-                        self.state = S_SCRIPT_ESC;
+                    if st == State.SCRIPT_DESC_START {
+                        self.state = State.SCRIPT_ESC;
                     } else {
-                        self.state = S_SCRIPT_DESC;
+                        self.state = State.SCRIPT_DESC;
                     }
                 }
                 continue;
             }
-            if (st == S_SCRIPT_DESC) or (st == S_SCRIPT_DESC_DASH) or (st == S_SCRIPT_DESC_DASH_DASH) {
+            if (st == State.SCRIPT_DESC) or (st == State.SCRIPT_DESC_DASH) or (st == State.SCRIPT_DESC_DASH_DASH) {
                 if c < 0 {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i += 1;
                 if c == '-' {
                     self.chars.push('-')!;
-                    if st == S_SCRIPT_DESC {
-                        self.state = S_SCRIPT_DESC_DASH;
+                    if st == State.SCRIPT_DESC {
+                        self.state = State.SCRIPT_DESC_DASH;
                     } else {
-                        self.state = S_SCRIPT_DESC_DASH_DASH;
+                        self.state = State.SCRIPT_DESC_DASH_DASH;
                     }
                 } else if c == '<' {
                     self.chars.push('<')!;
-                    self.state = S_SCRIPT_DESC_LT;
-                } else if (c == '>') and (st == S_SCRIPT_DESC_DASH_DASH) {
+                    self.state = State.SCRIPT_DESC_LT;
+                } else if (c == '>') and (st == State.SCRIPT_DESC_DASH_DASH) {
                     self.chars.push('>')!;
-                    self.state = S_SCRIPT;
+                    self.state = State.SCRIPT;
                 } else if c == 0 {
                     self.err();
                     self.chars.push_str("\xef\xbf\xbd")!;
-                    self.state = S_SCRIPT_DESC;
+                    self.state = State.SCRIPT_DESC;
                 } else {
                     self.chars.push(@truncate(u8, c))!;
-                    self.state = S_SCRIPT_DESC;
+                    self.state = State.SCRIPT_DESC;
                 }
                 continue;
             }
-            if st == S_SCRIPT_DESC_LT {
+            if st == State.SCRIPT_DESC_LT {
                 if c == '/' {
                     self.i += 1;
                     self.tmp.clear();
                     self.chars.push('/')!;
-                    self.state = S_SCRIPT_DESC_END;
+                    self.state = State.SCRIPT_DESC_END;
                 } else {
-                    self.state = S_SCRIPT_DESC;
+                    self.state = State.SCRIPT_DESC;
                 }
                 continue;
             }
             // --- comments
-            if st == S_MARKUP_DECL {
+            if st == State.MARKUP_DECL {
                 if self.lookahead("--") {
                     self.i += 2;
                     self.comment.clear();
-                    self.state = S_COMMENT_START;
+                    self.state = State.COMMENT_START;
                 } else if self.lookahead_ci("doctype") {
                     self.i += 7;
-                    self.state = S_DOCTYPE;
+                    self.state = State.DOCTYPE;
                 } else if self.lookahead("[CDATA[") {
                     self.i += 7;
                     if self.cdata_ok {
-                        self.state = S_CDATA;
+                        self.state = State.CDATA;
                     } else {
                         self.err();
                         self.comment.clear();
                         self.comment.push_str("[CDATA[")!;
-                        self.state = S_BOGUS_COMMENT;
+                        self.state = State.BOGUS_COMMENT;
                     }
                 } else {
                     self.err();
                     self.comment.clear();
-                    self.state = S_BOGUS_COMMENT;
+                    self.state = State.BOGUS_COMMENT;
                 }
                 continue;
             }
-            if st == S_BOGUS_COMMENT {
+            if st == State.BOGUS_COMMENT {
                 let b = self.i;
                 let mut i = b;
                 while (i < n) and (s[i] != '>') and (s[i] != 0) {
@@ -1614,42 +1632,42 @@ pub struct Tokenizer {
                 self.comment.push_str(s[b..i])!;
                 self.i = i;
                 if i >= n {
-                    return TK_COMMENT;  // (then EOF)
+                    return TokenKind.COMMENT;  // (then EOF)
                 }
                 self.i = i + 1;
                 if s[i] == '>' {
-                    self.state = S_DATA;
-                    return TK_COMMENT;
+                    self.state = State.DATA;
+                    return TokenKind.COMMENT;
                 }
                 self.err();
                 self.comment.push_str("\xef\xbf\xbd")!;
                 continue;
             }
-            if (st == S_COMMENT_START) or (st == S_COMMENT_START_DASH) {
+            if (st == State.COMMENT_START) or (st == State.COMMENT_START_DASH) {
                 if c == '-' {
                     self.i += 1;
-                    if st == S_COMMENT_START {
-                        self.state = S_COMMENT_START_DASH;
+                    if st == State.COMMENT_START {
+                        self.state = State.COMMENT_START_DASH;
                     } else {
-                        self.state = S_COMMENT_END;
+                        self.state = State.COMMENT_END;
                     }
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_COMMENT;
-                } else if (c < 0) and (st == S_COMMENT_START_DASH) {
+                    self.state = State.DATA;
+                    return TokenKind.COMMENT;
+                } else if (c < 0) and (st == State.COMMENT_START_DASH) {
                     self.err();
-                    return TK_COMMENT;
+                    return TokenKind.COMMENT;
                 } else {
-                    if st == S_COMMENT_START_DASH {
+                    if st == State.COMMENT_START_DASH {
                         self.comment.push('-')!;
                     }
-                    self.state = S_COMMENT;
+                    self.state = State.COMMENT;
                 }
                 continue;
             }
-            if st == S_COMMENT {
+            if st == State.COMMENT {
                 let b = self.i;
                 let mut i = b;
                 while (i < n) and (s[i] != '<') and (s[i] != '-') and (s[i] != 0) {
@@ -1659,112 +1677,112 @@ pub struct Tokenizer {
                 self.i = i;
                 if i >= n {
                     self.err();
-                    return TK_COMMENT;
+                    return TokenKind.COMMENT;
                 }
                 self.i = i + 1;
                 if s[i] == '<' {
                     self.comment.push('<')!;
-                    self.state = S_COMMENT_LT;
+                    self.state = State.COMMENT_LT;
                 } else if s[i] == '-' {
-                    self.state = S_COMMENT_END_DASH;
+                    self.state = State.COMMENT_END_DASH;
                 } else {
                     self.err();
                     self.comment.push_str("\xef\xbf\xbd")!;
                 }
                 continue;
             }
-            if st == S_COMMENT_LT {
+            if st == State.COMMENT_LT {
                 if c == '!' {
                     self.i += 1;
                     self.comment.push('!')!;
-                    self.state = S_COMMENT_LT_BANG;
+                    self.state = State.COMMENT_LT_BANG;
                 } else if c == '<' {
                     self.i += 1;
                     self.comment.push('<')!;
                 } else {
-                    self.state = S_COMMENT;
+                    self.state = State.COMMENT;
                 }
                 continue;
             }
-            if st == S_COMMENT_LT_BANG {
+            if st == State.COMMENT_LT_BANG {
                 if c == '-' {
                     self.i += 1;
-                    self.state = S_COMMENT_LT_BANG_DASH;
+                    self.state = State.COMMENT_LT_BANG_DASH;
                 } else {
-                    self.state = S_COMMENT;
+                    self.state = State.COMMENT;
                 }
                 continue;
             }
-            if st == S_COMMENT_LT_BANG_DASH {
+            if st == State.COMMENT_LT_BANG_DASH {
                 if c == '-' {
                     self.i += 1;
-                    self.state = S_COMMENT_LT_BANG_DASH_DASH;
+                    self.state = State.COMMENT_LT_BANG_DASH_DASH;
                 } else {
-                    self.state = S_COMMENT_END_DASH;
+                    self.state = State.COMMENT_END_DASH;
                 }
                 continue;
             }
-            if st == S_COMMENT_LT_BANG_DASH_DASH {
+            if st == State.COMMENT_LT_BANG_DASH_DASH {
                 if (c != '>') and (c >= 0) {
                     self.err();
                 }
-                self.state = S_COMMENT_END;
+                self.state = State.COMMENT_END;
                 continue;
             }
-            if st == S_COMMENT_END_DASH {
+            if st == State.COMMENT_END_DASH {
                 if c == '-' {
                     self.i += 1;
-                    self.state = S_COMMENT_END;
+                    self.state = State.COMMENT_END;
                 } else if c < 0 {
                     self.err();
-                    return TK_COMMENT;
+                    return TokenKind.COMMENT;
                 } else {
                     self.comment.push('-')!;
-                    self.state = S_COMMENT;
+                    self.state = State.COMMENT;
                 }
                 continue;
             }
-            if st == S_COMMENT_END {
+            if st == State.COMMENT_END {
                 if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_COMMENT;
+                    self.state = State.DATA;
+                    return TokenKind.COMMENT;
                 } else if c == '!' {
                     self.i += 1;
-                    self.state = S_COMMENT_END_BANG;
+                    self.state = State.COMMENT_END_BANG;
                 } else if c == '-' {
                     self.i += 1;
                     self.comment.push('-')!;
                 } else if c < 0 {
                     self.err();
-                    return TK_COMMENT;
+                    return TokenKind.COMMENT;
                 } else {
                     self.comment.push_str("--")!;
-                    self.state = S_COMMENT;
+                    self.state = State.COMMENT;
                 }
                 continue;
             }
-            if st == S_COMMENT_END_BANG {
+            if st == State.COMMENT_END_BANG {
                 if c == '-' {
                     self.i += 1;
                     self.comment.push_str("--!")!;
-                    self.state = S_COMMENT_END_DASH;
+                    self.state = State.COMMENT_END_DASH;
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_COMMENT;
+                    self.state = State.DATA;
+                    return TokenKind.COMMENT;
                 } else if c < 0 {
                     self.err();
-                    return TK_COMMENT;
+                    return TokenKind.COMMENT;
                 } else {
                     self.comment.push_str("--!")!;
-                    self.state = S_COMMENT;
+                    self.state = State.COMMENT;
                 }
                 continue;
             }
             // --- CDATA sections (in foreign content)
-            if st == S_CDATA {
+            if st == State.CDATA {
                 let b = self.i;
                 let mut i = b;
                 while (i < n) and (s[i] != ']') {
@@ -1774,81 +1792,81 @@ pub struct Tokenizer {
                 self.i = i;
                 if i >= n {
                     self.err();
-                    return TK_EOF;
+                    return TokenKind.EOF;
                 }
                 self.i = i + 1;
-                self.state = S_CDATA_BRACKET;
+                self.state = State.CDATA_BRACKET;
                 continue;
             }
-            if st == S_CDATA_BRACKET {
+            if st == State.CDATA_BRACKET {
                 if c == ']' {
                     self.i += 1;
-                    self.state = S_CDATA_END;
+                    self.state = State.CDATA_END;
                 } else {
                     self.chars.push(']')!;
-                    self.state = S_CDATA;
+                    self.state = State.CDATA;
                 }
                 continue;
             }
-            if st == S_CDATA_END {
+            if st == State.CDATA_END {
                 if c == ']' {
                     self.i += 1;
                     self.chars.push(']')!;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
+                    self.state = State.DATA;
                 } else {
                     self.chars.push_str("]]")!;
-                    self.state = S_CDATA;
+                    self.state = State.CDATA;
                 }
                 continue;
             }
             // --- DOCTYPE
-            if st == S_DOCTYPE {
+            if st == State.DOCTYPE {
                 self.new_doctype();
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else if c != '>' {
                     self.err();
                 }
-                self.state = S_BEFORE_DOCTYPE_NAME;
+                self.state = State.BEFORE_DOCTYPE_NAME;
                 continue;
             }
-            if st == S_BEFORE_DOCTYPE_NAME {
+            if st == State.BEFORE_DOCTYPE_NAME {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
                     self.force_quirks = true;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else {
                     self.has_name = true;
-                    self.state = S_DOCTYPE_NAME;
+                    self.state = State.DOCTYPE_NAME;
                 }
                 continue;
             }
-            if st == S_DOCTYPE_NAME {
+            if st == State.DOCTYPE_NAME {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
-                    self.state = S_AFTER_DOCTYPE_NAME;
+                    self.state = State.AFTER_DOCTYPE_NAME;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else {
                     self.i += 1;
                     if c == 0 {
@@ -1860,38 +1878,40 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if st == S_AFTER_DOCTYPE_NAME {
+            if st == State.AFTER_DOCTYPE_NAME {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else if self.lookahead_ci("public") {
                     self.i += 6;
-                    self.state = S_AFTER_DOCTYPE_PUBLIC_KW;
+                    self.state = State.AFTER_DOCTYPE_PUBLIC_KW;
                 } else if self.lookahead_ci("system") {
                     self.i += 6;
-                    self.state = S_AFTER_DOCTYPE_SYSTEM_KW;
+                    self.state = State.AFTER_DOCTYPE_SYSTEM_KW;
                 } else {
                     self.err();
                     self.force_quirks = true;
-                    self.state = S_BOGUS_DOCTYPE;
+                    self.state = State.BOGUS_DOCTYPE;
                 }
                 continue;
             }
-            if (st == S_AFTER_DOCTYPE_PUBLIC_KW) or (st == S_BEFORE_DOCTYPE_PUBLIC_ID) or
-               (st == S_AFTER_DOCTYPE_SYSTEM_KW) or (st == S_BEFORE_DOCTYPE_SYSTEM_ID) {
-                let public = (st == S_AFTER_DOCTYPE_PUBLIC_KW) or (st == S_BEFORE_DOCTYPE_PUBLIC_ID);
-                let kw = (st == S_AFTER_DOCTYPE_PUBLIC_KW) or (st == S_AFTER_DOCTYPE_SYSTEM_KW);
+            if (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.BEFORE_DOCTYPE_PUBLIC_ID) or
+               (st == State.AFTER_DOCTYPE_SYSTEM_KW) or (st == State.BEFORE_DOCTYPE_SYSTEM_ID) {
+                let public = (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.BEFORE_DOCTYPE_PUBLIC_ID);
+                let kw = (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.AFTER_DOCTYPE_SYSTEM_KW);
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
-                    if kw {
-                        self.state = st + 1;
+                    if kw and public {
+                        self.state = State.BEFORE_DOCTYPE_PUBLIC_ID;
+                    } else if kw {
+                        self.state = State.BEFORE_DOCTYPE_SYSTEM_ID;
                     }
                 } else if (c == '"') or (c == '\'') {
                     if kw {
@@ -1900,55 +1920,58 @@ pub struct Tokenizer {
                     self.i += 1;
                     if public {
                         self.has_public = true;
-                        self.state = S_DOCTYPE_PUBLIC_ID_DQ;
+                        self.state = State.DOCTYPE_PUBLIC_ID_DQ;
+                        if c == '\'' {
+                            self.state = State.DOCTYPE_PUBLIC_ID_SQ;
+                        }
                     } else {
                         self.has_system = true;
-                        self.state = S_DOCTYPE_SYSTEM_ID_DQ;
-                    }
-                    if c == '\'' {
-                        self.state += 1;
+                        self.state = State.DOCTYPE_SYSTEM_ID_DQ;
+                        if c == '\'' {
+                            self.state = State.DOCTYPE_SYSTEM_ID_SQ;
+                        }
                     }
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
                     self.force_quirks = true;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else {
                     self.err();
                     self.force_quirks = true;
-                    self.state = S_BOGUS_DOCTYPE;
+                    self.state = State.BOGUS_DOCTYPE;
                 }
                 continue;
             }
-            if (st == S_DOCTYPE_PUBLIC_ID_DQ) or (st == S_DOCTYPE_PUBLIC_ID_SQ) or (st == S_DOCTYPE_SYSTEM_ID_DQ) or
-               (st == S_DOCTYPE_SYSTEM_ID_SQ) {
+            if (st == State.DOCTYPE_PUBLIC_ID_DQ) or (st == State.DOCTYPE_PUBLIC_ID_SQ) or
+               (st == State.DOCTYPE_SYSTEM_ID_DQ) or (st == State.DOCTYPE_SYSTEM_ID_SQ) {
                 let mut q: i32 = '"';
-                if (st == S_DOCTYPE_PUBLIC_ID_SQ) or (st == S_DOCTYPE_SYSTEM_ID_SQ) {
+                if (st == State.DOCTYPE_PUBLIC_ID_SQ) or (st == State.DOCTYPE_SYSTEM_ID_SQ) {
                     q = '\'';
                 }
-                let public = (st == S_DOCTYPE_PUBLIC_ID_DQ) or (st == S_DOCTYPE_PUBLIC_ID_SQ);
+                let public = (st == State.DOCTYPE_PUBLIC_ID_DQ) or (st == State.DOCTYPE_PUBLIC_ID_SQ);
                 if c == q {
                     self.i += 1;
                     if public {
-                        self.state = S_AFTER_DOCTYPE_PUBLIC_ID;
+                        self.state = State.AFTER_DOCTYPE_PUBLIC_ID;
                     } else {
-                        self.state = S_AFTER_DOCTYPE_SYSTEM_ID;
+                        self.state = State.AFTER_DOCTYPE_SYSTEM_ID;
                     }
                 } else if c == '>' {
                     self.err();
                     self.i += 1;
                     self.force_quirks = true;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else {
                     self.i += 1;
                     let mut out = &mut self.system_id;
@@ -1964,60 +1987,60 @@ pub struct Tokenizer {
                 }
                 continue;
             }
-            if (st == S_AFTER_DOCTYPE_PUBLIC_ID) or (st == S_BETWEEN_DOCTYPE_IDS) {
+            if (st == State.AFTER_DOCTYPE_PUBLIC_ID) or (st == State.BETWEEN_DOCTYPE_IDS) {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
-                    self.state = S_BETWEEN_DOCTYPE_IDS;
+                    self.state = State.BETWEEN_DOCTYPE_IDS;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if (c == '"') or (c == '\'') {
-                    if st == S_AFTER_DOCTYPE_PUBLIC_ID {
+                    if st == State.AFTER_DOCTYPE_PUBLIC_ID {
                         self.err();
                     }
                     self.i += 1;
                     self.has_system = true;
-                    self.state = S_DOCTYPE_SYSTEM_ID_DQ;
+                    self.state = State.DOCTYPE_SYSTEM_ID_DQ;
                     if c == '\'' {
-                        self.state = S_DOCTYPE_SYSTEM_ID_SQ;
+                        self.state = State.DOCTYPE_SYSTEM_ID_SQ;
                     }
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else {
                     self.err();
                     self.force_quirks = true;
-                    self.state = S_BOGUS_DOCTYPE;
+                    self.state = State.BOGUS_DOCTYPE;
                 }
                 continue;
             }
-            if st == S_AFTER_DOCTYPE_SYSTEM_ID {
+            if st == State.AFTER_DOCTYPE_SYSTEM_ID {
                 if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                     self.i += 1;
                 } else if c == '>' {
                     self.i += 1;
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 } else if c < 0 {
                     self.err();
                     self.force_quirks = true;
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 } else {
                     self.err();
-                    self.state = S_BOGUS_DOCTYPE;
+                    self.state = State.BOGUS_DOCTYPE;
                 }
                 continue;
             }
-            if st == S_BOGUS_DOCTYPE {
+            if st == State.BOGUS_DOCTYPE {
                 if c < 0 {
-                    return TK_DOCTYPE;
+                    return TokenKind.DOCTYPE;
                 }
                 self.i += 1;
                 if c == '>' {
-                    self.state = S_DATA;
-                    return TK_DOCTYPE;
+                    self.state = State.DATA;
+                    return TokenKind.DOCTYPE;
                 }
                 continue;
             }
@@ -2028,18 +2051,28 @@ pub struct Tokenizer {
 
 const NONE_USIZE: usize = 0xffffffff;
 
-// Where an end tag that turns out not to be one goes back to.
-fn end_tag_back(open_state: u8) u8 {
-    if open_state == S_RCDATA_END_OPEN {
-        return S_RCDATA;
+// Where an end tag that turns out not to be one goes back to (from its end
+// tag open or end tag name state).
+fn end_tag_back(st: State) State {
+    match st {
+        .RCDATA_END_OPEN  => { return State.RCDATA; }
+        .RCDATA_END_NAME  => { return State.RCDATA; }
+        .RAWTEXT_END_OPEN => { return State.RAWTEXT; }
+        .RAWTEXT_END_NAME => { return State.RAWTEXT; }
+        .SCRIPT_END_OPEN  => { return State.SCRIPT; }
+        .SCRIPT_END_NAME  => { return State.SCRIPT; }
+        else              => { return State.SCRIPT_ESC; }
     }
-    if open_state == S_RAWTEXT_END_OPEN {
-        return S_RAWTEXT;
+}
+
+// The end tag name state that follows an end tag open state.
+fn end_name_state(open_state: State) State {
+    match open_state {
+        .RCDATA_END_OPEN  => { return State.RCDATA_END_NAME; }
+        .RAWTEXT_END_OPEN => { return State.RAWTEXT_END_NAME; }
+        .SCRIPT_END_OPEN  => { return State.SCRIPT_END_NAME; }
+        else              => { return State.SCRIPT_ESC_END_NAME; }
     }
-    if open_state == S_SCRIPT_END_OPEN {
-        return S_SCRIPT;
-    }
-    return S_SCRIPT_ESC;
 }
 
 // Replacements for numeric references to C1 controls (0x80-0x9f), or 0.
@@ -2129,10 +2162,10 @@ const FL_AFE: u8 = 2;   // in the list of active formatting elements
 const FL_HIP: u8 = 4;   // an HTML integration point (MathML annotation-xml)
 
 pub struct Node {
-    kind: u8,
-    ns: u8,      // NS_HTML, NS_SVG or NS_MATHML (elements)
-    tag: u16,    // (the parser's number for the name)
-    name: []u8,  // element local name; DOCTYPE name
+    kind: Kind,
+    ns: Namespace,  // (elements)
+    tag: u16,       // (the parser's number for the name)
+    name: []u8,     // element local name; DOCTYPE name
     attrs: []Attr,
     text: []u8,       // TEXT and COMMENT data; DOCTYPE public identifier
     system_id: []u8,  // DOCTYPE system identifier
@@ -2152,12 +2185,12 @@ pub struct Node {
 pub struct Document {
     nodes: vec.Vec.[Node],
     arena: arena.Arena,
-    mode: u8,  // NO_QUIRKS, QUIRKS or LIMITED_QUIRKS
+    mode: QuirksMode,
     tbuf: strs.String,
     texts: vec.Vec.[strs.String],
 
     fn init() Document {
-        return Document.{ nodes: vec.Vec.[Node].init(), arena: arena.Arena.init(), mode: NO_QUIRKS,
+        return Document.{ nodes: vec.Vec.[Node].init(), arena: arena.Arena.init(), mode: QuirksMode.NO_QUIRKS,
                           tbuf: strs.String.init(), texts: vec.Vec.[strs.String].init() };
     }
 
@@ -2179,11 +2212,11 @@ pub struct Document {
         return self.nodes.get_ptr(@as(usize, id));
     }
 
-    fn new_node(self: *mut Document, kind: u8) !u32 {
+    fn new_node(self: *mut Document, kind: Kind) !u32 {
         let id = @truncate(u32, self.nodes.len);
-        self.nodes.push(Node.{ kind: kind, ns: NS_HTML, tag: 0, name: "", attrs: no_attrs(), text: "", system_id: "",
-                               parent: NONE, first: NONE, last: NONE, prev: NONE, next: NONE, contents: NONE, flags: 0,
-                               tx: NONE, toff: 0, tlen: 0 })!;
+        self.nodes.push(Node.{ kind: kind, ns: Namespace.HTML, tag: 0, name: "", attrs: no_attrs(), text: "",
+                               system_id: "", parent: NONE, first: NONE, last: NONE, prev: NONE, next: NONE,
+                               contents: NONE, flags: 0, tx: NONE, toff: 0, tlen: 0 })!;
         return id;
     }
 
@@ -2251,7 +2284,7 @@ pub struct Document {
     }
 
     fn new_text(self: *mut Document, data: []u8) !u32 {
-        let id = self.new_node(TEXT)!;
+        let id = self.new_node(Kind.TEXT)!;
         let n = self.nm(id);
         n.toff = @truncate(u32, self.tbuf.len);
         n.tlen = @truncate(u32, data.len);
@@ -2288,7 +2321,7 @@ pub struct Document {
         for k in @as(usize, 0)..self.nodes.len {
             let id = @truncate(u32, k);
             let n = self.nm(id);
-            if (n.kind == TEXT) and (n.text.len == 0) {
+            if (n.kind == Kind.TEXT) and (n.text.len == 0) {
                 n.text = self.tdata(id);
             }
         }
@@ -2300,7 +2333,7 @@ pub struct Document {
     pub fn root(self: *Document) u32 {
         let mut c = self.node(0).first;
         while c != NONE {
-            if self.node(c).kind == ELEMENT {
+            if self.node(c).kind == Kind.ELEMENT {
                 return c;
             }
             c = self.node(c).next;
@@ -2317,7 +2350,7 @@ pub struct Document {
         let mut c = self.node(r).first;
         while c != NONE {
             let n = self.node(c);
-            if (n.kind == ELEMENT) and (n.ns == NS_HTML) and strs.eq(n.name, name) {
+            if (n.kind == Kind.ELEMENT) and (n.ns == Namespace.HTML) and strs.eq(n.name, name) {
                 return c;
             }
             c = n.next;
@@ -2376,7 +2409,7 @@ pub struct Document {
     // The first child, or for a template the first node of its contents.
     fn first_kid(self: *Document, id: u32, templates: bool) u32 {
         let n = self.node(id);
-        if templates and (n.kind == ELEMENT) and (n.contents != NONE) {
+        if templates and (n.kind == Kind.ELEMENT) and (n.contents != NONE) {
             return self.node(n.contents).first;
         }
         return n.first;
@@ -2385,7 +2418,7 @@ pub struct Document {
     // The parent, or for template contents the template.
     fn up(self: *Document, id: u32) u32 {
         let p = self.node(id).parent;
-        if (p != NONE) and (self.node(p).kind == FRAGMENT) and (self.node(p).contents != NONE) {
+        if (p != NONE) and (self.node(p).kind == Kind.FRAGMENT) and (self.node(p).contents != NONE) {
             return self.node(p).contents;
         }
         return p;
@@ -2394,7 +2427,7 @@ pub struct Document {
     /// The parent element (NONE for the root and detached nodes).
     pub fn parent_element(self: *Document, id: u32) u32 {
         let p = self.up(id);
-        if (p != NONE) and (self.node(p).kind == ELEMENT) {
+        if (p != NONE) and (self.node(p).kind == Kind.ELEMENT) {
             return p;
         }
         return NONE;
@@ -2424,7 +2457,7 @@ pub struct Document {
         w.templates = false;
         while w.next() {
             let n = self.node(w.id);
-            if w.entering and (n.kind == TEXT) {
+            if w.entering and (n.kind == Kind.TEXT) {
                 s.push_str(n.text) catch |e| {
                     s.deinit();
                     return e;
@@ -2440,7 +2473,7 @@ pub struct Document {
         let mut w = self.walk(id);
         while w.next() {
             let n = self.node(w.id);
-            if w.entering and (n.kind == ELEMENT) and name_is(n, name) {
+            if w.entering and (n.kind == Kind.ELEMENT) and name_is(n, name) {
                 return w.id;
             }
         }
@@ -2451,7 +2484,7 @@ pub struct Document {
 
     /// A new, detached HTML element.
     pub fn create_element(self: *mut Document, name: []u8) !u32 {
-        let id = self.new_node(ELEMENT)!;
+        let id = self.new_node(Kind.ELEMENT)!;
         let lname = self.arena.bytes(name.len)!;
         for k in @as(usize, 0)..name.len {
             lname[k] = strs.to_lower_byte(name[k]);
@@ -2460,7 +2493,7 @@ pub struct Document {
         n.name = lname;
         n.tag = tag_of(lname);
         if n.tag == T_TEMPLATE {
-            let f = self.new_node(FRAGMENT)!;
+            let f = self.new_node(Kind.FRAGMENT)!;
             self.nm(f).contents = id;
             self.nm(id).contents = f;
         }
@@ -2468,13 +2501,13 @@ pub struct Document {
     }
 
     pub fn create_text(self: *mut Document, data: []u8) !u32 {
-        let id = self.new_node(TEXT)!;
+        let id = self.new_node(Kind.TEXT)!;
         self.nm(id).text = self.arena.dup(data)!;
         return id;
     }
 
     pub fn create_comment(self: *mut Document, data: []u8) !u32 {
-        let id = self.new_node(COMMENT)!;
+        let id = self.new_node(Kind.COMMENT)!;
         self.nm(id).text = self.arena.dup(data)!;
         return id;
     }
@@ -2488,14 +2521,14 @@ pub struct Document {
         let mut found = false;
         for a in old {
             let mut b = a;
-            if (a.ns == A_NONE) and strs.eq(a.name, name) {
+            if (a.ns == AttrNamespace.NONE) and strs.eq(a.name, name) {
                 b.value = v;
                 found = true;
             }
             all.push(b)!;
         }
         if not found {
-            all.push(Attr.{ ns: A_NONE, prefix: "", name: self.arena.dup(name)!, value: v })!;
+            all.push(Attr.{ ns: AttrNamespace.NONE, prefix: "", name: self.arena.dup(name)!, value: v })!;
         }
         self.nm(id).attrs = self.arena.copy.[Attr](all.items())!;
     }
@@ -2526,7 +2559,7 @@ pub struct Document {
             let src = work.pop()!;
             let mut from = src;
             let mut to = dst;
-            if (self.nm(src).kind == ELEMENT) and (self.nm(src).contents != NONE) {
+            if (self.nm(src).kind == Kind.ELEMENT) and (self.nm(src).contents != NONE) {
                 from = self.nm(src).contents;
                 to = self.nm(dst).contents;
             }
@@ -2552,8 +2585,8 @@ pub struct Document {
         n.attrs = o.attrs;
         n.text = o.text;
         n.system_id = o.system_id;
-        if (o.kind == ELEMENT) and (o.contents != NONE) {
-            let f = self.new_node(FRAGMENT)!;
+        if (o.kind == Kind.ELEMENT) and (o.contents != NONE) {
+            let f = self.new_node(Kind.FRAGMENT)!;
             self.nm(f).contents = k;
             self.nm(k).contents = f;
         }
@@ -2593,23 +2626,24 @@ pub struct Document {
                 continue;
             }
             if not w.entering {
-                if (n.kind == ELEMENT) and not ((n.ns == NS_HTML) and ((TAG_FLAGS[@as(usize, n.tag)] & F_VOID) != 0)) {
+                if (n.kind == Kind.ELEMENT) and
+                   not ((n.ns == Namespace.HTML) and ((TAG_FLAGS[@as(usize, n.tag)] & F_VOID) != 0)) {
                     out.write_all("</")!;
                     out.write_all(n.name)!;
                     out.write_all(">")!;
                 }
                 continue;
             }
-            if n.kind == ELEMENT {
+            if n.kind == Kind.ELEMENT {
                 out.write_all("<")!;
                 out.write_all(n.name)!;
                 for a in n.attrs {
                     out.write_all(" ")!;
-                    if a.ns == A_XML {
+                    if a.ns == AttrNamespace.XML {
                         out.write_all("xml:")!;
-                    } else if a.ns == A_XLINK {
+                    } else if a.ns == AttrNamespace.XLINK {
                         out.write_all("xlink:")!;
-                    } else if (a.ns == A_XMLNS) and not strs.eq(a.name, "xmlns") {
+                    } else if (a.ns == AttrNamespace.XMLNS) and not strs.eq(a.name, "xmlns") {
                         out.write_all("xmlns:")!;
                     }
                     out.write_all(a.name)!;
@@ -2618,22 +2652,22 @@ pub struct Document {
                     out.write_all("\"")!;
                 }
                 out.write_all(">")!;
-                if (n.ns == NS_HTML) and ((TAG_FLAGS[@as(usize, n.tag)] & F_VOID) != 0) {
+                if (n.ns == Namespace.HTML) and ((TAG_FLAGS[@as(usize, n.tag)] & F_VOID) != 0) {
                     w.skip();
                 }
-            } else if n.kind == TEXT {
+            } else if n.kind == Kind.TEXT {
                 let p = self.parent_element(w.id);
-                if (p != NONE) and (self.node(p).ns == NS_HTML) and
+                if (p != NONE) and (self.node(p).ns == Namespace.HTML) and
                    ((TAG_FLAGS[@as(usize, self.node(p).tag)] & F_RAW) != 0) {
                     out.write_all(n.text)!;
                 } else {
                     escape(out, n.text, false)!;
                 }
-            } else if n.kind == COMMENT {
+            } else if n.kind == Kind.COMMENT {
                 out.write_all("<!--")!;
                 out.write_all(n.text)!;
                 out.write_all("-->")!;
-            } else if n.kind == DOCTYPE {
+            } else if n.kind == Kind.DOCTYPE {
                 out.write_all("<!DOCTYPE ")!;
                 out.write_all(n.name)!;
                 out.write_all(">")!;
@@ -2651,7 +2685,7 @@ pub struct Document {
         let mut w = self.walk(id);
         _ = w.next();
         while w.next() {
-            if w.entering and (self.node(w.id).kind == ELEMENT) and sel.matches(self, w.id) {
+            if w.entering and (self.node(w.id).kind == Kind.ELEMENT) and sel.matches(self, w.id) {
                 return w.id;
             }
         }
@@ -2672,7 +2706,7 @@ pub struct Document {
         let mut w = self.walk(id);
         _ = w.next();
         while w.next() {
-            if w.entering and (self.node(w.id).kind == ELEMENT) and sel.matches(self, w.id) {
+            if w.entering and (self.node(w.id).kind == Kind.ELEMENT) and sel.matches(self, w.id) {
                 out.push(w.id) catch |e| {
                     out.deinit();
                     return e;
@@ -2699,33 +2733,37 @@ fn no_attrs() []Attr {
 }
 
 // Insertion modes
-const M_INITIAL: u8 = 0;
-const M_BEFORE_HTML: u8 = 1;
-const M_BEFORE_HEAD: u8 = 2;
-const M_IN_HEAD: u8 = 3;
-const M_IN_HEAD_NOSCRIPT: u8 = 4;
-const M_AFTER_HEAD: u8 = 5;
-const M_IN_BODY: u8 = 6;
-const M_TEXT: u8 = 7;
-const M_IN_TABLE: u8 = 8;
-const M_IN_TABLE_TEXT: u8 = 9;
-const M_IN_CAPTION: u8 = 10;
-const M_IN_COLUMN_GROUP: u8 = 11;
-const M_IN_TABLE_BODY: u8 = 12;
-const M_IN_ROW: u8 = 13;
-const M_IN_CELL: u8 = 14;
-const M_IN_TEMPLATE: u8 = 15;
-const M_AFTER_BODY: u8 = 16;
-const M_IN_FRAMESET: u8 = 17;
-const M_AFTER_FRAMESET: u8 = 18;
-const M_AFTER_AFTER_BODY: u8 = 19;
-const M_AFTER_AFTER_FRAMESET: u8 = 20;
+enum Mode: u8 {
+    INITIAL,
+    BEFORE_HTML,
+    BEFORE_HEAD,
+    IN_HEAD,
+    IN_HEAD_NOSCRIPT,
+    AFTER_HEAD,
+    IN_BODY,
+    TEXT,
+    IN_TABLE,
+    IN_TABLE_TEXT,
+    IN_CAPTION,
+    IN_COLUMN_GROUP,
+    IN_TABLE_BODY,
+    IN_ROW,
+    IN_CELL,
+    IN_TEMPLATE,
+    AFTER_BODY,
+    IN_FRAMESET,
+    AFTER_FRAMESET,
+    AFTER_AFTER_BODY,
+    AFTER_AFTER_FRAMESET,
+}
 
 // Kinds of scope
-const SC_DEFAULT: u8 = 0;
-const SC_LIST: u8 = 1;
-const SC_BUTTON: u8 = 2;
-const SC_TABLE: u8 = 3;
+enum Scope: u8 {
+    DEFAULT,
+    LIST,
+    BUTTON,
+    TABLE,
+}
 
 const MARKER: u32 = 0xfffffffe;
 
@@ -2753,9 +2791,9 @@ struct Parser {
     stack: vec.Vec.[u32],
     open: [124]u32,  // how many HTML elements of each T_ are on the stack
     afe: vec.Vec.[u32],
-    tmodes: vec.Vec.[u8],
-    mode: u8,
-    orig: u8,
+    tmodes: vec.Vec.[u8],  // Mode values
+    mode: Mode,
+    orig: Mode,
     head: u32,
     form: u32,
     context: u32,
@@ -2802,7 +2840,7 @@ struct Parser {
             return false;
         }
         let n = self.nd(id);
-        return (n.ns == NS_HTML) and (n.tag == t) and (n.kind == ELEMENT);
+        return (n.ns == Namespace.HTML) and (n.tag == t) and (n.kind == Kind.ELEMENT);
     }
 
     fn cur_is(self: *Parser, t: u16) bool {
@@ -2811,7 +2849,7 @@ struct Parser {
 
     fn special(self: *Parser, id: u32) bool {
         let n = self.nd(id);
-        if n.ns == NS_HTML {
+        if n.ns == Namespace.HTML {
             return (TAG_FLAGS[@as(usize, n.tag)] & F_SPECIAL) != 0;
         }
         return scope_foreign(n);
@@ -2819,16 +2857,16 @@ struct Parser {
 
     fn mathml_text_ip(self: *Parser, id: u32) bool {
         let n = self.nd(id);
-        return (n.ns == NS_MATHML) and
+        return (n.ns == Namespace.MATHML) and
                ((n.tag == T_MI) or (n.tag == T_MO) or (n.tag == T_MN) or (n.tag == T_MS) or (n.tag == T_MTEXT));
     }
 
     fn html_ip(self: *Parser, id: u32) bool {
         let n = self.nd(id);
-        if n.ns == NS_MATHML {
+        if n.ns == Namespace.MATHML {
             return (n.flags & FL_HIP) != 0;
         }
-        return (n.ns == NS_SVG) and ((n.tag == T_FOREIGNOBJECT) or (n.tag == T_DESC) or (n.tag == T_TITLE));
+        return (n.ns == Namespace.SVG) and ((n.tag == T_FOREIGNOBJECT) or (n.tag == T_DESC) or (n.tag == T_TITLE));
     }
 
     fn has_template(self: *Parser) bool {
@@ -2854,7 +2892,7 @@ struct Parser {
     fn opened_at(self: *mut Parser, id: u32) void {
         let n = self.nd(id);
         n.flags |= FL_OPEN;
-        if n.ns == NS_HTML {
+        if n.ns == Namespace.HTML {
             self.open[@as(usize, n.tag)] += 1;
         }
     }
@@ -2862,7 +2900,7 @@ struct Parser {
     fn closed_at(self: *mut Parser, id: u32) void {
         let n = self.nd(id);
         n.flags &= ~FL_OPEN;
-        if n.ns == NS_HTML {
+        if n.ns == Namespace.HTML {
             self.open[@as(usize, n.tag)] -= 1;
         }
     }
@@ -2925,19 +2963,19 @@ struct Parser {
         }
     }
 
-    fn boundary(self: *Parser, id: u32, sc: u8) bool {
+    fn boundary(self: *Parser, id: u32, sc: Scope) bool {
         let n = self.nd(id);
-        if sc == SC_TABLE {
-            return (n.ns == NS_HTML) and ((n.tag == T_HTML) or (n.tag == T_TABLE) or (n.tag == T_TEMPLATE));
+        if sc == Scope.TABLE {
+            return (n.ns == Namespace.HTML) and ((n.tag == T_HTML) or (n.tag == T_TABLE) or (n.tag == T_TEMPLATE));
         }
-        if n.ns == NS_HTML {
+        if n.ns == Namespace.HTML {
             if (TAG_FLAGS[@as(usize, n.tag)] & F_SCOPE) != 0 {
                 return true;
             }
-            if sc == SC_LIST {
+            if sc == Scope.LIST {
                 return (n.tag == T_OL) or (n.tag == T_UL);
             }
-            if sc == SC_BUTTON {
+            if sc == Scope.BUTTON {
                 return n.tag == T_BUTTON;
             }
             return false;
@@ -2945,7 +2983,7 @@ struct Parser {
         return scope_foreign(n);
     }
 
-    fn in_scope(self: *Parser, t: u16, sc: u8) bool {
+    fn in_scope(self: *Parser, t: u16, sc: Scope) bool {
         if self.open[@as(usize, t)] == 0 {
             return false;
         }
@@ -2971,7 +3009,7 @@ struct Parser {
             if items[i] == id {
                 return true;
             }
-            if self.boundary(items[i], SC_DEFAULT) {
+            if self.boundary(items[i], Scope.DEFAULT) {
                 return false;
             }
         }
@@ -2984,10 +3022,10 @@ struct Parser {
         while i > 0 {
             i -= 1;
             let n = self.nd(items[i]);
-            if (n.ns == NS_HTML) and (n.tag >= T_H1) and (n.tag <= T_H6) {
+            if (n.ns == Namespace.HTML) and (n.tag >= T_H1) and (n.tag <= T_H6) {
                 return true;
             }
-            if self.boundary(items[i], SC_DEFAULT) {
+            if self.boundary(items[i], Scope.DEFAULT) {
                 return false;
             }
         }
@@ -2998,7 +3036,7 @@ struct Parser {
         loop {
             let c = self.cur();
             let n = self.nd(c);
-            if (n.ns != NS_HTML) or (n.tag == except) or ((TAG_FLAGS[@as(usize, n.tag)] & F_IMPLIED) == 0) {
+            if (n.ns != Namespace.HTML) or (n.tag == except) or ((TAG_FLAGS[@as(usize, n.tag)] & F_IMPLIED) == 0) {
                 return;
             }
             self.pop();
@@ -3008,7 +3046,7 @@ struct Parser {
     fn gen_thorough(self: *mut Parser) void {
         loop {
             let n = self.nd(self.cur());
-            if (n.ns != NS_HTML) or ((TAG_FLAGS[@as(usize, n.tag)] & F_THOROUGH) == 0) {
+            if (n.ns != Namespace.HTML) or ((TAG_FLAGS[@as(usize, n.tag)] & F_THOROUGH) == 0) {
                 return;
             }
             self.pop();
@@ -3021,7 +3059,7 @@ struct Parser {
     }
 
     fn close_p_in_button_scope(self: *mut Parser) void {
-        if self.in_scope(T_P, SC_BUTTON) {
+        if self.in_scope(T_P, Scope.BUTTON) {
             self.close_p();
         }
     }
@@ -3049,63 +3087,63 @@ struct Parser {
                 id = self.context;
             }
             let n = self.nd(id);
-            if n.ns == NS_HTML {
+            if n.ns == Namespace.HTML {
                 let t = n.tag;
                 if ((t == T_TD) or (t == T_TH)) and not last {
-                    self.mode = M_IN_CELL;
+                    self.mode = Mode.IN_CELL;
                     return;
                 }
                 if t == T_TR {
-                    self.mode = M_IN_ROW;
+                    self.mode = Mode.IN_ROW;
                     return;
                 }
                 if (t == T_TBODY) or (t == T_THEAD) or (t == T_TFOOT) {
-                    self.mode = M_IN_TABLE_BODY;
+                    self.mode = Mode.IN_TABLE_BODY;
                     return;
                 }
                 if t == T_CAPTION {
-                    self.mode = M_IN_CAPTION;
+                    self.mode = Mode.IN_CAPTION;
                     return;
                 }
                 if t == T_COLGROUP {
-                    self.mode = M_IN_COLUMN_GROUP;
+                    self.mode = Mode.IN_COLUMN_GROUP;
                     return;
                 }
                 if t == T_TABLE {
-                    self.mode = M_IN_TABLE;
+                    self.mode = Mode.IN_TABLE;
                     return;
                 }
                 if t == T_TEMPLATE {
-                    self.mode = self.tmodes.last() catch M_IN_BODY;
+                    self.mode = @enum_from_int(Mode, self.tmodes.last() catch @int_from_enum(Mode.IN_BODY));
                     return;
                 }
                 if (t == T_HEAD) and not last {
-                    self.mode = M_IN_HEAD;
+                    self.mode = Mode.IN_HEAD;
                     return;
                 }
                 if t == T_BODY {
-                    self.mode = M_IN_BODY;
+                    self.mode = Mode.IN_BODY;
                     return;
                 }
                 if t == T_FRAMESET {
-                    self.mode = M_IN_FRAMESET;
+                    self.mode = Mode.IN_FRAMESET;
                     return;
                 }
                 if t == T_HTML {
                     if self.head == NONE {
-                        self.mode = M_BEFORE_HEAD;
+                        self.mode = Mode.BEFORE_HEAD;
                     } else {
-                        self.mode = M_AFTER_HEAD;
+                        self.mode = Mode.AFTER_HEAD;
                     }
                     return;
                 }
             }
             if last {
-                self.mode = M_IN_BODY;
+                self.mode = Mode.IN_BODY;
                 return;
             }
         }
-        self.mode = M_IN_BODY;
+        self.mode = Mode.IN_BODY;
     }
 
     // --- the list of active formatting elements
@@ -3282,14 +3320,14 @@ struct Parser {
         }
         let at = self.place(NONE);
         let p = self.nd(at.parent);
-        if p.kind == DOCUMENT {
+        if p.kind == Kind.DOCUMENT {
             return;
         }
         let mut prev = p.last;
         if at.before != NONE {
             prev = self.nd(at.before).prev;
         }
-        if (prev != NONE) and (self.nd(prev).kind == TEXT) {
+        if (prev != NONE) and (self.nd(prev).kind == Kind.TEXT) {
             self.doc.append_text(prev, data)!;
             return;
         }
@@ -3298,17 +3336,17 @@ struct Parser {
     }
 
     fn insert_comment(self: *mut Parser, t: *Token, at: Loc) !void {
-        let id = self.doc.new_node(COMMENT)!;
+        let id = self.doc.new_node(Kind.COMMENT)!;
         self.nd(id).text = self.doc.arena.dup(t.data)!;
         self.insert_node(at, id);
     }
 
-    fn create_element(self: *mut Parser, t: *Token, ns: u8) !u32 {
-        let id = self.doc.new_node(ELEMENT)!;
+    fn create_element(self: *mut Parser, t: *Token, ns: Namespace) !u32 {
+        let id = self.doc.new_node(Kind.ELEMENT)!;
         let mut name = t.name;
-        if (ns == NS_HTML) and (t.tag != 0) {
+        if (ns == Namespace.HTML) and (t.tag != 0) {
             name = TAG_NAMES[@as(usize, t.tag) - 1];
-        } else if ns == NS_SVG {
+        } else if ns == Namespace.SVG {
             name = svg_tag_name(t.name);
         }
         if name.ptr == t.name.ptr {
@@ -3320,7 +3358,7 @@ struct Parser {
         n.tag = t.tag;
         n.name = name;
         n.attrs = attrs;
-        if (ns == NS_MATHML) and (t.tag == T_ANNOTATION_XML) {
+        if (ns == Namespace.MATHML) and (t.tag == T_ANNOTATION_XML) {
             for a in attrs {
                 if strs.eq(a.name, "encoding") and
                    (strs.eq_ignore_case(a.value, "text/html") or
@@ -3329,8 +3367,8 @@ struct Parser {
                 }
             }
         }
-        if (ns == NS_HTML) and (t.tag == T_TEMPLATE) {
-            let f = self.doc.new_node(FRAGMENT)!;
+        if (ns == Namespace.HTML) and (t.tag == T_TEMPLATE) {
+            let f = self.doc.new_node(Kind.FRAGMENT)!;
             self.nd(f).contents = id;
             self.nd(id).contents = f;
         }
@@ -3338,7 +3376,7 @@ struct Parser {
     }
 
     // The token's attributes in the arena, adjusted for SVG and MathML.
-    fn copy_attrs(self: *mut Parser, attrs: []Attr, ns: u8) ![]Attr {
+    fn copy_attrs(self: *mut Parser, attrs: []Attr, ns: Namespace) ![]Attr {
         if attrs.len == 0 {
             return no_attrs();
         }
@@ -3356,13 +3394,13 @@ struct Parser {
             @mem_copy(buf[at..at + a.value.len], a.value);
             let v = buf[at..at + a.value.len];
             at += a.value.len;
-            let mut b = Attr.{ ns: A_NONE, prefix: "", name: nm, value: v };
-            if ns == NS_MATHML {
+            let mut b = Attr.{ ns: AttrNamespace.NONE, prefix: "", name: nm, value: v };
+            if ns == Namespace.MATHML {
                 if strs.eq(nm, "definitionurl") {
                     b.name = "definitionURL";
                 }
                 foreign_attr(&mut b);
-            } else if ns == NS_SVG {
+            } else if ns == Namespace.SVG {
                 b.name = svg_attr_name(nm);
                 foreign_attr(&mut b);
             }
@@ -3372,7 +3410,7 @@ struct Parser {
     }
 
     fn clone_element(self: *mut Parser, id: u32) !u32 {
-        let e = self.doc.new_node(ELEMENT)!;
+        let e = self.doc.new_node(Kind.ELEMENT)!;
         let o = self.nd(id);
         let n = self.nd(e);
         n.ns = o.ns;
@@ -3385,7 +3423,7 @@ struct Parser {
 
     // Inserts an element for the token and opens it (unless the stack is
     // full).
-    fn insert(self: *mut Parser, t: *Token, ns: u8) !u32 {
+    fn insert(self: *mut Parser, t: *Token, ns: Namespace) !u32 {
         let at = self.place(NONE);
         let id = self.create_element(t, ns)!;
         self.insert_node(at, id);
@@ -3396,25 +3434,25 @@ struct Parser {
     // Inserts an element that is closed at once.
     fn insert_void(self: *mut Parser, t: *Token) !u32 {
         let at = self.place(NONE);
-        let id = self.create_element(t, NS_HTML)!;
+        let id = self.create_element(t, Namespace.HTML)!;
         self.insert_node(at, id);
         return id;
     }
 
     fn insert_fake(self: *mut Parser, tag: u16) !u32 {
         let mut t = fake_token(tag);
-        return self.insert(&mut t, NS_HTML);
+        return self.insert(&mut t, Namespace.HTML);
     }
 
     fn opened(self: *Parser, id: u32) bool {
         return (self.nd(id).flags & FL_OPEN) != 0;
     }
 
-    fn raw_text(self: *mut Parser, t: *Token, state: u8) !void {
-        let id = self.insert(t, NS_HTML)!;
+    fn raw_text(self: *mut Parser, t: *Token, state: State) !void {
+        let id = self.insert(t, Namespace.HTML)!;
         self.tz.state = state;
         self.orig = self.mode;
-        self.mode = M_TEXT;
+        self.mode = Mode.TEXT;
         self.text_elem = NONE;
         if self.opened(id) {
             self.text_elem = id;
@@ -3426,11 +3464,11 @@ struct Parser {
         let mut all = vec.Vec.[Attr].init();
         defer all.deinit();
         all.extend(n.attrs)!;
-        let extra = self.copy_attrs(t.attrs, NS_HTML)!;
+        let extra = self.copy_attrs(t.attrs, Namespace.HTML)!;
         for a in extra {
             let mut have = false;
             for b in n.attrs {
-                if strs.eq(a.name, b.name) and (b.ns == A_NONE) {
+                if strs.eq(a.name, b.name) and (b.ns == AttrNamespace.NONE) {
                     have = true;
                 }
             }
@@ -3445,17 +3483,17 @@ struct Parser {
 }
 
 fn fake_token(tag: u16) Token {
-    return Token.{ kind: TK_START, name: TAG_NAMES[@as(usize, tag) - 1], tag: tag, attrs: no_attrs(),
+    return Token.{ kind: TokenKind.START, name: TAG_NAMES[@as(usize, tag) - 1], tag: tag, attrs: no_attrs(),
                    self_closing: false, data: "", public_id: "", system_id: "", has_name: false, has_public: false,
                    has_system: false, force_quirks: false };
 }
 
 fn scope_foreign(n: *Node) bool {
-    if n.ns == NS_MATHML {
+    if n.ns == Namespace.MATHML {
         return (n.tag == T_MI) or (n.tag == T_MO) or (n.tag == T_MN) or (n.tag == T_MS) or (n.tag == T_MTEXT) or
                (n.tag == T_ANNOTATION_XML);
     }
-    if n.ns == NS_SVG {
+    if n.ns == Namespace.SVG {
         return (n.tag == T_FOREIGNOBJECT) or (n.tag == T_DESC) or (n.tag == T_TITLE);
     }
     return false;
@@ -3467,7 +3505,7 @@ fn foreign_attr(a: *mut Attr) void {
         let local = nm[6..];
         for x in ["actuate", "arcrole", "href", "role", "show", "title", "type"]{
             if strs.eq(local, x) {
-                a.ns = A_XLINK;
+                a.ns = AttrNamespace.XLINK;
                 a.prefix = "xlink";
                 a.name = local;
                 return;
@@ -3476,17 +3514,17 @@ fn foreign_attr(a: *mut Attr) void {
         return;
     }
     if strs.eq(nm, "xml:lang") or strs.eq(nm, "xml:space") {
-        a.ns = A_XML;
+        a.ns = AttrNamespace.XML;
         a.prefix = "xml";
         a.name = nm[4..];
         return;
     }
     if strs.eq(nm, "xmlns") {
-        a.ns = A_XMLNS;
+        a.ns = AttrNamespace.XMLNS;
         return;
     }
     if strs.eq(nm, "xmlns:xlink") {
-        a.ns = A_XMLNS;
+        a.ns = AttrNamespace.XMLNS;
         a.prefix = "xmlns";
         a.name = nm[6..];
     }
@@ -3628,11 +3666,11 @@ fn all_ws(s: []u8) bool {
 // -----------------------------------------------------------------------------
 
 fn is_start(t: *Token, tag: u16) bool {
-    return (t.kind == TK_START) and (t.tag == tag);
+    return (t.kind == TokenKind.START) and (t.tag == tag);
 }
 
 fn is_end(t: *Token, tag: u16) bool {
-    return (t.kind == TK_END) and (t.tag == tag);
+    return (t.kind == TokenKind.END) and (t.tag == tag);
 }
 
 fn tag_in(t: *Token, tags: []u16) bool {
@@ -3669,21 +3707,21 @@ fn html_content(p: *mut Parser, t: *Token) bool {
     }
     let a = p.adjusted_current();
     let n = p.nd(a);
-    if (n.ns == NS_HTML) or (t.kind == TK_EOF) {
+    if (n.ns == Namespace.HTML) or (t.kind == TokenKind.EOF) {
         return true;
     }
     if p.mathml_text_ip(a) {
-        if (t.kind == TK_START) and (t.tag != T_MGLYPH) and (t.tag != T_MALIGNMARK) {
+        if (t.kind == TokenKind.START) and (t.tag != T_MGLYPH) and (t.tag != T_MALIGNMARK) {
             return true;
         }
-        if t.kind == TK_CHARS {
+        if t.kind == TokenKind.CHARS {
             return true;
         }
     }
-    if (n.ns == NS_MATHML) and (n.tag == T_ANNOTATION_XML) and is_start(t, T_SVG) {
+    if (n.ns == Namespace.MATHML) and (n.tag == T_ANNOTATION_XML) and is_start(t, T_SVG) {
         return true;
     }
-    if p.html_ip(a) and ((t.kind == TK_START) or (t.kind == TK_CHARS)) {
+    if p.html_ip(a) and ((t.kind == TokenKind.START) or (t.kind == TokenKind.CHARS)) {
         return true;
     }
     return false;
@@ -3691,79 +3729,85 @@ fn html_content(p: *mut Parser, t: *Token) bool {
 
 // Processes the token by the rules of an insertion mode: true to reprocess
 // it (in p.mode).
-fn step(p: *mut Parser, mode: u8, t: *mut Token) !bool {
-    if mode == M_IN_BODY {
+fn step(p: *mut Parser, mode: Mode, t: *mut Token) !bool {
+    if mode == Mode.IN_BODY {
         return in_body(p, t);
     }
-    if mode == M_TEXT {
+    if mode == Mode.TEXT {
         return in_text(p, t);
     }
-    if mode == M_IN_TABLE {
+    if mode == Mode.IN_TABLE {
         return in_table(p, t);
     }
-    if mode == M_IN_CELL {
+    if mode == Mode.IN_CELL {
         return in_cell(p, t);
     }
-    if mode == M_IN_ROW {
+    if mode == Mode.IN_ROW {
         return in_row(p, t);
     }
-    if mode == M_IN_TABLE_BODY {
+    if mode == Mode.IN_TABLE_BODY {
         return in_table_body(p, t);
     }
-    if mode == M_IN_TABLE_TEXT {
+    if mode == Mode.IN_TABLE_TEXT {
         return in_table_text(p, t);
     }
-    if mode == M_IN_HEAD {
+    if mode == Mode.IN_HEAD {
         return in_head(p, t);
     }
-    if mode == M_INITIAL {
+    if mode == Mode.INITIAL {
         return initial(p, t);
     }
-    if mode == M_BEFORE_HTML {
+    if mode == Mode.BEFORE_HTML {
         return before_html(p, t);
     }
-    if mode == M_BEFORE_HEAD {
+    if mode == Mode.BEFORE_HEAD {
         return before_head(p, t);
     }
-    if mode == M_IN_HEAD_NOSCRIPT {
+    if mode == Mode.IN_HEAD_NOSCRIPT {
         return in_head_noscript(p, t);
     }
-    if mode == M_AFTER_HEAD {
+    if mode == Mode.AFTER_HEAD {
         return after_head(p, t);
     }
-    if mode == M_IN_CAPTION {
+    if mode == Mode.IN_CAPTION {
         return in_caption(p, t);
     }
-    if mode == M_IN_COLUMN_GROUP {
+    if mode == Mode.IN_COLUMN_GROUP {
         return in_column_group(p, t);
     }
-    if mode == M_IN_TEMPLATE {
+    if mode == Mode.IN_TEMPLATE {
         return in_template(p, t);
     }
-    if mode == M_AFTER_BODY {
+    if mode == Mode.AFTER_BODY {
         return after_body(p, t);
     }
-    if mode == M_IN_FRAMESET {
+    if mode == Mode.IN_FRAMESET {
         return in_frameset(p, t);
     }
-    if mode == M_AFTER_FRAMESET {
+    if mode == Mode.AFTER_FRAMESET {
         return after_frameset(p, t);
     }
-    if mode == M_AFTER_AFTER_BODY {
+    if mode == Mode.AFTER_AFTER_BODY {
         return after_after_body(p, t);
     }
     return after_after_frameset(p, t);
 }
 
-// Whitespace at the start of a character token is handled by `f`'s mode
-// (in_body, or 255 to insert it, or 254 to drop it); true if characters
-// remain in t.
-fn split_ws(p: *mut Parser, t: *mut Token, how: u8) !bool {
+// What split_ws does with whitespace at the start of a character token.
+enum Whitespace: u8 {
+    INSERT,   // insert it
+    DROP,     // drop it
+    IN_BODY,  // process it as in_body does
+}
+
+// Handles whitespace at the start of a character token as `how` says; true
+// if characters remain in t.
+fn split_ws(p: *mut Parser, t: *mut Token, how: Whitespace) !bool {
     let k = leading_ws(t.data);
     if k > 0 {
-        if how == 255 {
+        if how == Whitespace.INSERT {
             p.insert_text(t.data[..k])!;
-        } else if how == M_IN_BODY {
+        } else if how == Whitespace.IN_BODY {
             let mut w = t.*;
             w.data = t.data[..k];
             _ = in_body(p, &mut w)!;
@@ -3773,30 +3817,27 @@ fn split_ws(p: *mut Parser, t: *mut Token, how: u8) !bool {
     return t.data.len > 0;
 }
 
-const WS_INSERT: u8 = 255;
-const WS_DROP: u8 = 254;
-
 fn initial(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_CHARS {
-        if not split_ws(p, t, WS_DROP)! {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.DROP)! {
             return false;
         }
-    } else if t.kind == TK_COMMENT {
+    } else if t.kind == TokenKind.COMMENT {
         p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
         return false;
-    } else if t.kind == TK_DOCTYPE {
-        let id = p.doc.new_node(DOCTYPE)!;
+    } else if t.kind == TokenKind.DOCTYPE {
+        let id = p.doc.new_node(Kind.DOCTYPE)!;
         let n = p.nd(id);
         n.name = p.doc.arena.dup(t.name)!;
         n.text = p.doc.arena.dup(t.public_id)!;
         n.system_id = p.doc.arena.dup(t.system_id)!;
         p.doc.append_child(0, id);
         p.doc.mode = doctype_mode(t);
-        p.mode = M_BEFORE_HTML;
+        p.mode = Mode.BEFORE_HTML;
         return false;
     }
-    p.doc.mode = QUIRKS;
-    p.mode = M_BEFORE_HTML;
+    p.doc.mode = QuirksMode.QUIRKS;
+    p.mode = Mode.BEFORE_HTML;
     return true;
 }
 
@@ -3862,110 +3903,111 @@ fn starts_ci(s: []u8, prefix: []u8) bool {
     return (s.len >= prefix.len) and strs.eq_ignore_case(s[..prefix.len], prefix);
 }
 
-fn doctype_mode(t: *Token) u8 {
+fn doctype_mode(t: *Token) QuirksMode {
     let pub_id = t.public_id;
     let sys = t.system_id;
     if t.force_quirks or not strs.eq(t.name, "html") {
-        return QUIRKS;
+        return QuirksMode.QUIRKS;
     }
     if t.has_public {
         if strs.eq_ignore_case(pub_id, "-//W3O//DTD W3 HTML Strict 3.0//EN//") or
            strs.eq_ignore_case(pub_id, "-/W3C/DTD HTML 4.0 Transitional/EN") or strs.eq_ignore_case(pub_id, "HTML") {
-            return QUIRKS;
+            return QuirksMode.QUIRKS;
         }
         for q in QUIRKY_PUBLIC {
             if starts_ci(pub_id, q) {
-                return QUIRKS;
+                return QuirksMode.QUIRKS;
             }
         }
     }
     if t.has_system and strs.eq_ignore_case(sys, "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") {
-        return QUIRKS;
+        return QuirksMode.QUIRKS;
     }
     let html401 = starts_ci(pub_id, "-//W3C//DTD HTML 4.01 Frameset//") or
                   starts_ci(pub_id, "-//W3C//DTD HTML 4.01 Transitional//");
     if t.has_public and html401 and not t.has_system {
-        return QUIRKS;
+        return QuirksMode.QUIRKS;
     }
     if t.has_public and
        (starts_ci(pub_id, "-//W3C//DTD XHTML 1.0 Frameset//") or
         starts_ci(pub_id, "-//W3C//DTD XHTML 1.0 Transitional//") or (html401 and t.has_system)) {
-        return LIMITED_QUIRKS;
+        return QuirksMode.LIMITED_QUIRKS;
     }
-    return NO_QUIRKS;
+    return QuirksMode.NO_QUIRKS;
 }
 
 // An end tag the "before" modes treat as anything else.
 fn end_hbhb(t: *Token) bool {
-    return (t.kind == TK_END) and ((t.tag == T_HEAD) or (t.tag == T_BODY) or (t.tag == T_HTML) or (t.tag == T_BR));
+    return (t.kind == TokenKind.END) and
+           ((t.tag == T_HEAD) or (t.tag == T_BODY) or (t.tag == T_HTML) or (t.tag == T_BR));
 }
 
 fn before_html(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_DOCTYPE {
+    if t.kind == TokenKind.DOCTYPE {
         return false;
     }
-    if t.kind == TK_COMMENT {
+    if t.kind == TokenKind.COMMENT {
         p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
         return false;
     }
-    if t.kind == TK_CHARS {
-        if not split_ws(p, t, WS_DROP)! {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.DROP)! {
             return false;
         }
     }
     if is_start(t, T_HTML) {
-        let id = p.create_element(t, NS_HTML)!;
+        let id = p.create_element(t, Namespace.HTML)!;
         p.doc.append_child(0, id);
         _ = p.push(id)!;
-        p.mode = M_BEFORE_HEAD;
+        p.mode = Mode.BEFORE_HEAD;
         return false;
     }
-    if (t.kind == TK_END) and not end_hbhb(t) {
+    if (t.kind == TokenKind.END) and not end_hbhb(t) {
         return false;
     }
     let mut h = fake_token(T_HTML);
-    let id = p.create_element(&mut h, NS_HTML)!;
+    let id = p.create_element(&mut h, Namespace.HTML)!;
     p.doc.append_child(0, id);
     _ = p.push(id)!;
-    p.mode = M_BEFORE_HEAD;
+    p.mode = Mode.BEFORE_HEAD;
     return true;
 }
 
 fn before_head(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_CHARS {
-        if not split_ws(p, t, WS_DROP)! {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.DROP)! {
             return false;
         }
-    } else if t.kind == TK_COMMENT {
+    } else if t.kind == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
-    } else if t.kind == TK_DOCTYPE {
+    } else if t.kind == TokenKind.DOCTYPE {
         return false;
     } else if is_start(t, T_HTML) {
         return in_body(p, t);
     } else if is_start(t, T_HEAD) {
-        p.head = p.insert(t, NS_HTML)!;
-        p.mode = M_IN_HEAD;
+        p.head = p.insert(t, Namespace.HTML)!;
+        p.mode = Mode.IN_HEAD;
         return false;
-    } else if (t.kind == TK_END) and not end_hbhb(t) {
+    } else if (t.kind == TokenKind.END) and not end_hbhb(t) {
         return false;
     }
     p.head = p.insert_fake(T_HEAD)!;
-    p.mode = M_IN_HEAD;
+    p.mode = Mode.IN_HEAD;
     return true;
 }
 
 fn in_head(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_CHARS {
-        if not split_ws(p, t, WS_INSERT)! {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
             return false;
         }
-    } else if t.kind == TK_COMMENT {
+    } else if t.kind == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
-    } else if t.kind == TK_DOCTYPE {
+    } else if t.kind == TokenKind.DOCTYPE {
         return false;
-    } else if t.kind == TK_START {
+    } else if t.kind == TokenKind.START {
         let g = t.tag;
         if g == T_HTML {
             return in_body(p, t);
@@ -3975,41 +4017,41 @@ fn in_head(p: *mut Parser, t: *mut Token) !bool {
             return false;
         }
         if g == T_TITLE {
-            p.raw_text(t, S_RCDATA)!;
+            p.raw_text(t, State.RCDATA)!;
             return false;
         }
         if ((g == T_NOSCRIPT) and p.scripting) or (g == T_NOFRAMES) or (g == T_STYLE) {
-            p.raw_text(t, S_RAWTEXT)!;
+            p.raw_text(t, State.RAWTEXT)!;
             return false;
         }
         if g == T_NOSCRIPT {
-            _ = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_HEAD_NOSCRIPT;
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_HEAD_NOSCRIPT;
             return false;
         }
         if g == T_SCRIPT {
-            p.raw_text(t, S_SCRIPT)!;
+            p.raw_text(t, State.SCRIPT)!;
             return false;
         }
         if g == T_TEMPLATE {
-            let id = p.insert(t, NS_HTML)!;
+            let id = p.insert(t, Namespace.HTML)!;
             if not p.opened(id) {
                 return false;
             }
             p.afe.push(MARKER)!;
             p.frameset_ok = false;
-            p.mode = M_IN_TEMPLATE;
-            p.tmodes.push(M_IN_TEMPLATE)!;
+            p.mode = Mode.IN_TEMPLATE;
+            p.tmodes.push(@int_from_enum(Mode.IN_TEMPLATE))!;
             return false;
         }
         if g == T_HEAD {
             return false;
         }
-    } else if t.kind == TK_END {
+    } else if t.kind == TokenKind.END {
         let g = t.tag;
         if g == T_HEAD {
             p.pop();
-            p.mode = M_AFTER_HEAD;
+            p.mode = Mode.AFTER_HEAD;
             return false;
         }
         if g == T_TEMPLATE {
@@ -4028,12 +4070,12 @@ fn in_head(p: *mut Parser, t: *mut Token) !bool {
         }
     }
     p.pop();
-    p.mode = M_AFTER_HEAD;
+    p.mode = Mode.AFTER_HEAD;
     return true;
 }
 
 fn in_head_noscript(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_DOCTYPE {
+    if t.kind == TokenKind.DOCTYPE {
         return false;
     }
     if is_start(t, T_HTML) {
@@ -4041,16 +4083,16 @@ fn in_head_noscript(p: *mut Parser, t: *mut Token) !bool {
     }
     if is_end(t, T_NOSCRIPT) {
         p.pop();
-        p.mode = M_IN_HEAD;
+        p.mode = Mode.IN_HEAD;
         return false;
     }
-    if t.kind == TK_CHARS {
-        if not split_ws(p, t, WS_INSERT)! {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
             return false;
         }
-    } else if t.kind == TK_COMMENT {
+    } else if t.kind == TokenKind.COMMENT {
         return in_head(p, t);
-    } else if t.kind == TK_START {
+    } else if t.kind == TokenKind.START {
         let g = t.tag;
         if (g == T_BASEFONT) or (g == T_BGSOUND) or (g == T_LINK) or (g == T_META) or (g == T_NOFRAMES) or
            (g == T_STYLE) {
@@ -4059,38 +4101,38 @@ fn in_head_noscript(p: *mut Parser, t: *mut Token) !bool {
         if (g == T_HEAD) or (g == T_NOSCRIPT) {
             return false;
         }
-    } else if (t.kind == TK_END) and (t.tag != T_BR) {
+    } else if (t.kind == TokenKind.END) and (t.tag != T_BR) {
         return false;
     }
     p.pop();
-    p.mode = M_IN_HEAD;
+    p.mode = Mode.IN_HEAD;
     return true;
 }
 
 fn after_head(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_CHARS {
-        if not split_ws(p, t, WS_INSERT)! {
+    if t.kind == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
             return false;
         }
-    } else if t.kind == TK_COMMENT {
+    } else if t.kind == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
-    } else if t.kind == TK_DOCTYPE {
+    } else if t.kind == TokenKind.DOCTYPE {
         return false;
-    } else if t.kind == TK_START {
+    } else if t.kind == TokenKind.START {
         let g = t.tag;
         if g == T_HTML {
             return in_body(p, t);
         }
         if g == T_BODY {
-            _ = p.insert(t, NS_HTML)!;
+            _ = p.insert(t, Namespace.HTML)!;
             p.frameset_ok = false;
-            p.mode = M_IN_BODY;
+            p.mode = Mode.IN_BODY;
             return false;
         }
         if g == T_FRAMESET {
-            _ = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_FRAMESET;
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_FRAMESET;
             return false;
         }
         if (g == T_BASE) or (g == T_BASEFONT) or (g == T_BGSOUND) or (g == T_LINK) or (g == T_META) or
@@ -4106,7 +4148,7 @@ fn after_head(p: *mut Parser, t: *mut Token) !bool {
         if g == T_HEAD {
             return false;
         }
-    } else if t.kind == TK_END {
+    } else if t.kind == TokenKind.END {
         if t.tag == T_TEMPLATE {
             return in_head(p, t);
         }
@@ -4116,7 +4158,7 @@ fn after_head(p: *mut Parser, t: *mut Token) !bool {
     }
     _ = p.insert_fake(T_BODY)!;
     p.frameset_ok = true;
-    p.mode = M_IN_BODY;
+    p.mode = Mode.IN_BODY;
     return true;
 }
 
@@ -4226,21 +4268,21 @@ fn in_body_chars(p: *mut Parser, data: []u8) !void {
 
 fn in_body(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_CHARS {
+    if k == TokenKind.CHARS {
         in_body_chars(p, t.data)!;
         return false;
     }
-    if k == TK_START {
+    if k == TokenKind.START {
         return in_body_start(p, t);
     }
-    if k == TK_END {
+    if k == TokenKind.END {
         return in_body_end(p, t);
     }
-    if k == TK_COMMENT {
+    if k == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
     }
-    if k == TK_EOF {
+    if k == TokenKind.EOF {
         if p.tmodes.len > 0 {
             return in_template(p, t);
         }
@@ -4252,18 +4294,18 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
     let g = t.tag;
     if g == 0 {
         p.reconstruct()!;
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if tag_in(t, FORMATTING[..]) {
         p.reconstruct()!;
-        let id = p.insert(t, NS_HTML)!;
+        let id = p.insert(t, Namespace.HTML)!;
         p.afe_push(id)!;
         return false;
     }
     if tag_in(t, CLOSES_P[..]) {
         p.close_p_in_button_scope();
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if g == T_HTML {
@@ -4289,22 +4331,22 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
         }
         p.doc.remove(p.stack.items()[1]);
         p.pop_to(1);
-        _ = p.insert(t, NS_HTML)!;
-        p.mode = M_IN_FRAMESET;
+        _ = p.insert(t, Namespace.HTML)!;
+        p.mode = Mode.IN_FRAMESET;
         return false;
     }
     if (g >= T_H1) and (g <= T_H6) {
         p.close_p_in_button_scope();
         let c = p.nd(p.cur());
-        if (c.ns == NS_HTML) and (c.tag >= T_H1) and (c.tag <= T_H6) {
+        if (c.ns == Namespace.HTML) and (c.tag >= T_H1) and (c.tag <= T_H6) {
             p.pop();
         }
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if (g == T_PRE) or (g == T_LISTING) {
         p.close_p_in_button_scope();
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         p.skip_lf = true;
         p.frameset_ok = false;
         return false;
@@ -4315,7 +4357,7 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
             return false;
         }
         p.close_p_in_button_scope();
-        let id = p.insert(t, NS_HTML)!;
+        let id = p.insert(t, Namespace.HTML)!;
         if not tpl {
             p.form = id;
         }
@@ -4344,22 +4386,22 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
             }
         }
         p.close_p_in_button_scope();
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if g == T_PLAINTEXT {
         p.close_p_in_button_scope();
-        _ = p.insert(t, NS_HTML)!;
-        p.tz.state = S_PLAINTEXT;
+        _ = p.insert(t, Namespace.HTML)!;
+        p.tz.state = State.PLAINTEXT;
         return false;
     }
     if g == T_BUTTON {
-        if p.in_scope(T_BUTTON, SC_DEFAULT) {
+        if p.in_scope(T_BUTTON, Scope.DEFAULT) {
             p.gen_implied(0);
             p.pop_until(T_BUTTON);
         }
         p.reconstruct()!;
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         p.frameset_ok = false;
         return false;
     }
@@ -4385,25 +4427,25 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
             p.stack_remove(old);
         }
         p.reconstruct()!;
-        let id = p.insert(t, NS_HTML)!;
+        let id = p.insert(t, Namespace.HTML)!;
         p.afe_push(id)!;
         return false;
     }
     if g == T_NOBR {
         p.reconstruct()!;
-        if p.in_scope(T_NOBR, SC_DEFAULT) {
+        if p.in_scope(T_NOBR, Scope.DEFAULT) {
             if not adoption(p, t)! {
                 any_other_end(p, t);
             }
             p.reconstruct()!;
         }
-        let id = p.insert(t, NS_HTML)!;
+        let id = p.insert(t, Namespace.HTML)!;
         p.afe_push(id)!;
         return false;
     }
     if (g == T_APPLET) or (g == T_MARQUEE) or (g == T_OBJECT) {
         p.reconstruct()!;
-        let id = p.insert(t, NS_HTML)!;
+        let id = p.insert(t, Namespace.HTML)!;
         if p.opened(id) {
             p.afe.push(MARKER)!;
         }
@@ -4411,12 +4453,12 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
         return false;
     }
     if g == T_TABLE {
-        if p.doc.mode != QUIRKS {
+        if p.doc.mode != QuirksMode.QUIRKS {
             p.close_p_in_button_scope();
         }
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         p.frameset_ok = false;
-        p.mode = M_IN_TABLE;
+        p.mode = Mode.IN_TABLE;
         return false;
     }
     if (g == T_AREA) or (g == T_BR) or (g == T_EMBED) or (g == T_IMG) or (g == T_KEYGEN) or (g == T_WBR) {
@@ -4429,7 +4471,7 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
         if p.is(p.context, T_SELECT) {
             return false;
         }
-        if p.in_scope(T_SELECT, SC_DEFAULT) {
+        if p.in_scope(T_SELECT, Scope.DEFAULT) {
             p.pop_until(T_SELECT);
         }
         p.reconstruct()!;
@@ -4445,7 +4487,7 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
     }
     if g == T_HR {
         p.close_p_in_button_scope();
-        if p.in_scope(T_SELECT, SC_DEFAULT) {
+        if p.in_scope(T_SELECT, Scope.DEFAULT) {
             p.gen_implied(0);
         }
         _ = p.insert_void(t)!;
@@ -4458,7 +4500,7 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
         return true;
     }
     if g == T_TEXTAREA {
-        p.raw_text(t, S_RCDATA)!;
+        p.raw_text(t, State.RCDATA)!;
         p.skip_lf = true;
         p.frameset_ok = false;
         return false;
@@ -4467,70 +4509,70 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
         p.close_p_in_button_scope();
         p.reconstruct()!;
         p.frameset_ok = false;
-        p.raw_text(t, S_RAWTEXT)!;
+        p.raw_text(t, State.RAWTEXT)!;
         return false;
     }
     if g == T_IFRAME {
         p.frameset_ok = false;
-        p.raw_text(t, S_RAWTEXT)!;
+        p.raw_text(t, State.RAWTEXT)!;
         return false;
     }
     if (g == T_NOEMBED) or ((g == T_NOSCRIPT) and p.scripting) {
-        p.raw_text(t, S_RAWTEXT)!;
+        p.raw_text(t, State.RAWTEXT)!;
         return false;
     }
     if g == T_SELECT {
         if p.is(p.context, T_SELECT) {
             return false;
         }
-        if p.in_scope(T_SELECT, SC_DEFAULT) {
+        if p.in_scope(T_SELECT, Scope.DEFAULT) {
             p.pop_until(T_SELECT);
             return false;
         }
         p.reconstruct()!;
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         p.frameset_ok = false;
         return false;
     }
     if g == T_OPTION {
-        if p.in_scope(T_SELECT, SC_DEFAULT) {
+        if p.in_scope(T_SELECT, Scope.DEFAULT) {
             p.gen_implied(T_OPTGROUP);
         } else if p.cur_is(T_OPTION) {
             p.pop();
         }
         p.reconstruct()!;
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if g == T_OPTGROUP {
-        if p.in_scope(T_SELECT, SC_DEFAULT) {
+        if p.in_scope(T_SELECT, Scope.DEFAULT) {
             p.gen_implied(0);
         } else if p.cur_is(T_OPTION) {
             p.pop();
         }
         p.reconstruct()!;
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if (g == T_RB) or (g == T_RTC) {
-        if p.in_scope(T_RUBY, SC_DEFAULT) {
+        if p.in_scope(T_RUBY, Scope.DEFAULT) {
             p.gen_implied(0);
         }
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if (g == T_RP) or (g == T_RT) {
-        if p.in_scope(T_RUBY, SC_DEFAULT) {
+        if p.in_scope(T_RUBY, Scope.DEFAULT) {
             p.gen_implied(T_RTC);
         }
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
         return false;
     }
     if (g == T_MATH) or (g == T_SVG) {
         p.reconstruct()!;
-        let mut ns = NS_MATHML;
+        let mut ns = Namespace.MATHML;
         if g == T_SVG {
-            ns = NS_SVG;
+            ns = Namespace.SVG;
         }
         let id = p.insert(t, ns)!;
         if t.self_closing and p.opened(id) {
@@ -4542,7 +4584,7 @@ fn in_body_start(p: *mut Parser, t: *mut Token) !bool {
         return false;
     }
     p.reconstruct()!;
-    _ = p.insert(t, NS_HTML)!;
+    _ = p.insert(t, Namespace.HTML)!;
     return false;
 }
 
@@ -4568,7 +4610,7 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
         return false;
     }
     if tag_in(t, BLOCK_ENDS[..]) {
-        if not p.in_scope(g, SC_DEFAULT) {
+        if not p.in_scope(g, Scope.DEFAULT) {
             return false;
         }
         p.gen_implied(0);
@@ -4579,10 +4621,10 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
         return in_head(p, t);
     }
     if (g == T_BODY) or (g == T_HTML) {
-        if not p.in_scope(T_BODY, SC_DEFAULT) {
+        if not p.in_scope(T_BODY, Scope.DEFAULT) {
             return false;
         }
-        p.mode = M_AFTER_BODY;
+        p.mode = Mode.AFTER_BODY;
         return g == T_HTML;
     }
     if g == T_FORM {
@@ -4595,7 +4637,7 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
             p.gen_implied(0);
             p.stack_remove(node);
         } else {
-            if not p.in_scope(T_FORM, SC_DEFAULT) {
+            if not p.in_scope(T_FORM, Scope.DEFAULT) {
                 return false;
             }
             p.gen_implied(0);
@@ -4604,14 +4646,14 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
         return false;
     }
     if g == T_P {
-        if not p.in_scope(T_P, SC_BUTTON) {
+        if not p.in_scope(T_P, Scope.BUTTON) {
             _ = p.insert_fake(T_P)!;
         }
         p.close_p();
         return false;
     }
     if g == T_LI {
-        if not p.in_scope(T_LI, SC_LIST) {
+        if not p.in_scope(T_LI, Scope.LIST) {
             return false;
         }
         p.gen_implied(T_LI);
@@ -4619,7 +4661,7 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
         return false;
     }
     if (g == T_DD) or (g == T_DT) {
-        if not p.in_scope(g, SC_DEFAULT) {
+        if not p.in_scope(g, Scope.DEFAULT) {
             return false;
         }
         p.gen_implied(g);
@@ -4633,7 +4675,7 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
         p.gen_implied(0);
         while p.stack.len > 1 {
             let n = p.nd(p.cur());
-            let h = (n.ns == NS_HTML) and (n.tag >= T_H1) and (n.tag <= T_H6);
+            let h = (n.ns == Namespace.HTML) and (n.tag >= T_H1) and (n.tag <= T_H6);
             p.pop();
             if h {
                 break;
@@ -4642,7 +4684,7 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
         return false;
     }
     if (g == T_APPLET) or (g == T_MARQUEE) or (g == T_OBJECT) {
-        if not p.in_scope(g, SC_DEFAULT) {
+        if not p.in_scope(g, Scope.DEFAULT) {
             return false;
         }
         p.gen_implied(0);
@@ -4662,7 +4704,8 @@ fn in_body_end(p: *mut Parser, t: *mut Token) !bool {
 }
 
 fn same_name(n: *Node, t: *Token) bool {
-    return (n.kind == ELEMENT) and (n.ns == NS_HTML) and (n.tag == t.tag) and ((t.tag != 0) or strs.eq(n.name, t.name));
+    return (n.kind == Kind.ELEMENT) and (n.ns == Namespace.HTML) and (n.tag == t.tag) and
+           ((t.tag != 0) or strs.eq(n.name, t.name));
 }
 
 fn any_other_end(p: *mut Parser, t: *Token) void {
@@ -4801,17 +4844,17 @@ fn adoption(p: *mut Parser, t: *Token) !bool {
 }
 
 fn in_text(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_CHARS {
+    if t.kind == TokenKind.CHARS {
         p.insert_text(t.data)!;
         return false;
     }
-    if (t.kind == TK_EOF) or (t.kind == TK_END) {
+    if (t.kind == TokenKind.EOF) or (t.kind == TokenKind.END) {
         if (p.text_elem != NONE) and (p.cur() == p.text_elem) {
             p.pop();
         }
         p.text_elem = NONE;
         p.mode = p.orig;
-        return t.kind == TK_EOF;
+        return t.kind == TokenKind.EOF;
     }
     return false;
 }
@@ -4824,55 +4867,55 @@ fn cur_is_table_ish(p: *mut Parser) bool {
 
 fn in_table(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if (k == TK_CHARS) and cur_is_table_ish(p) {
+    if (k == TokenKind.CHARS) and cur_is_table_ish(p) {
         p.pend.clear();
         p.pend_text = false;
         p.orig = p.mode;
-        p.mode = M_IN_TABLE_TEXT;
+        p.mode = Mode.IN_TABLE_TEXT;
         return true;
     }
-    if k == TK_COMMENT {
+    if k == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
     }
-    if k == TK_DOCTYPE {
+    if k == TokenKind.DOCTYPE {
         return false;
     }
-    if k == TK_START {
+    if k == TokenKind.START {
         let g = t.tag;
         if g == T_CAPTION {
             p.clear_to(T_TABLE, T_TABLE, T_TABLE);
             p.afe.push(MARKER)!;
-            _ = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_CAPTION;
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_CAPTION;
             return false;
         }
         if g == T_COLGROUP {
             p.clear_to(T_TABLE, T_TABLE, T_TABLE);
-            _ = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_COLUMN_GROUP;
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_COLUMN_GROUP;
             return false;
         }
         if g == T_COL {
             p.clear_to(T_TABLE, T_TABLE, T_TABLE);
             _ = p.insert_fake(T_COLGROUP)!;
-            p.mode = M_IN_COLUMN_GROUP;
+            p.mode = Mode.IN_COLUMN_GROUP;
             return true;
         }
         if (g == T_TBODY) or (g == T_TFOOT) or (g == T_THEAD) {
             p.clear_to(T_TABLE, T_TABLE, T_TABLE);
-            _ = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_TABLE_BODY;
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_TABLE_BODY;
             return false;
         }
         if (g == T_TD) or (g == T_TH) or (g == T_TR) {
             p.clear_to(T_TABLE, T_TABLE, T_TABLE);
             _ = p.insert_fake(T_TBODY)!;
-            p.mode = M_IN_TABLE_BODY;
+            p.mode = Mode.IN_TABLE_BODY;
             return true;
         }
         if g == T_TABLE {
-            if not p.in_scope(T_TABLE, SC_TABLE) {
+            if not p.in_scope(T_TABLE, Scope.TABLE) {
                 return false;
             }
             p.pop_until(T_TABLE);
@@ -4896,10 +4939,10 @@ fn in_table(p: *mut Parser, t: *mut Token) !bool {
             }
             return false;
         }
-    } else if k == TK_END {
+    } else if k == TokenKind.END {
         let g = t.tag;
         if g == T_TABLE {
-            if not p.in_scope(T_TABLE, SC_TABLE) {
+            if not p.in_scope(T_TABLE, Scope.TABLE) {
                 return false;
             }
             p.pop_until(T_TABLE);
@@ -4913,7 +4956,7 @@ fn in_table(p: *mut Parser, t: *mut Token) !bool {
         if g == T_TEMPLATE {
             return in_head(p, t);
         }
-    } else if k == TK_EOF {
+    } else if k == TokenKind.EOF {
         return in_body(p, t);
     }
     p.foster = true;
@@ -4923,7 +4966,7 @@ fn in_table(p: *mut Parser, t: *mut Token) !bool {
 }
 
 fn in_table_text(p: *mut Parser, t: *mut Token) !bool {
-    if t.kind == TK_CHARS {
+    if t.kind == TokenKind.CHARS {
         for c in t.data {
             if c == 0 {
                 continue;
@@ -4949,13 +4992,13 @@ fn in_table_text(p: *mut Parser, t: *mut Token) !bool {
 }
 
 fn close_caption(p: *mut Parser) bool {
-    if not p.in_scope(T_CAPTION, SC_TABLE) {
+    if not p.in_scope(T_CAPTION, Scope.TABLE) {
         return false;
     }
     p.gen_implied(0);
     p.pop_until(T_CAPTION);
     p.afe_clear_to_marker();
-    p.mode = M_IN_TABLE;
+    p.mode = Mode.IN_TABLE;
     return true;
 }
 
@@ -4965,12 +5008,12 @@ fn in_caption(p: *mut Parser, t: *mut Token) !bool {
         _ = close_caption(p);
         return false;
     }
-    if ((t.kind == TK_START) and
+    if ((t.kind == TokenKind.START) and
         ((g == T_CAPTION) or (g == T_COL) or (g == T_COLGROUP) or (g == T_TBODY) or (g == T_TD) or (g == T_TFOOT) or
          (g == T_TH) or (g == T_THEAD) or (g == T_TR))) or is_end(t, T_TABLE) {
         return close_caption(p);
     }
-    if (t.kind == TK_END) and
+    if (t.kind == TokenKind.END) and
        ((g == T_BODY) or (g == T_COL) or (g == T_COLGROUP) or (g == T_HTML) or (g == T_TBODY) or (g == T_TD) or
         (g == T_TFOOT) or (g == T_TH) or (g == T_THEAD) or (g == T_TR)) {
         return false;
@@ -4980,14 +5023,14 @@ fn in_caption(p: *mut Parser, t: *mut Token) !bool {
 
 fn in_column_group(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_CHARS {
-        if not split_ws(p, t, WS_INSERT)! {
+    if k == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.INSERT)! {
             return false;
         }
-    } else if k == TK_COMMENT {
+    } else if k == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
-    } else if k == TK_DOCTYPE {
+    } else if k == TokenKind.DOCTYPE {
         return false;
     } else if is_start(t, T_HTML) {
         return in_body(p, t);
@@ -4997,50 +5040,50 @@ fn in_column_group(p: *mut Parser, t: *mut Token) !bool {
     } else if is_end(t, T_COLGROUP) {
         if p.cur_is(T_COLGROUP) {
             p.pop();
-            p.mode = M_IN_TABLE;
+            p.mode = Mode.IN_TABLE;
         }
         return false;
     } else if is_end(t, T_COL) {
         return false;
     } else if is_start(t, T_TEMPLATE) or is_end(t, T_TEMPLATE) {
         return in_head(p, t);
-    } else if k == TK_EOF {
+    } else if k == TokenKind.EOF {
         return in_body(p, t);
     }
     if not p.cur_is(T_COLGROUP) {
         return false;
     }
     p.pop();
-    p.mode = M_IN_TABLE;
+    p.mode = Mode.IN_TABLE;
     return true;
 }
 
 fn in_table_body(p: *mut Parser, t: *mut Token) !bool {
     let g = t.tag;
-    if t.kind == TK_START {
+    if t.kind == TokenKind.START {
         if g == T_TR {
             p.clear_to(T_TBODY, T_TFOOT, T_THEAD);
-            _ = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_ROW;
+            _ = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_ROW;
             return false;
         }
         if (g == T_TH) or (g == T_TD) {
             p.clear_to(T_TBODY, T_TFOOT, T_THEAD);
             _ = p.insert_fake(T_TR)!;
-            p.mode = M_IN_ROW;
+            p.mode = Mode.IN_ROW;
             return true;
         }
         if (g == T_CAPTION) or (g == T_COL) or (g == T_COLGROUP) or (g == T_TBODY) or (g == T_TFOOT) or (g == T_THEAD) {
             return leave_table_body(p);
         }
-    } else if t.kind == TK_END {
+    } else if t.kind == TokenKind.END {
         if (g == T_TBODY) or (g == T_TFOOT) or (g == T_THEAD) {
-            if not p.in_scope(g, SC_TABLE) {
+            if not p.in_scope(g, Scope.TABLE) {
                 return false;
             }
             p.clear_to(T_TBODY, T_TFOOT, T_THEAD);
             p.pop();
-            p.mode = M_IN_TABLE;
+            p.mode = Mode.IN_TABLE;
             return false;
         }
         if g == T_TABLE {
@@ -5055,32 +5098,32 @@ fn in_table_body(p: *mut Parser, t: *mut Token) !bool {
 }
 
 fn leave_table_body(p: *mut Parser) bool {
-    if not (p.in_scope(T_TBODY, SC_TABLE) or p.in_scope(T_THEAD, SC_TABLE) or p.in_scope(T_TFOOT, SC_TABLE)) {
+    if not (p.in_scope(T_TBODY, Scope.TABLE) or p.in_scope(T_THEAD, Scope.TABLE) or p.in_scope(T_TFOOT, Scope.TABLE)) {
         return false;
     }
     p.clear_to(T_TBODY, T_TFOOT, T_THEAD);
     p.pop();
-    p.mode = M_IN_TABLE;
+    p.mode = Mode.IN_TABLE;
     return true;
 }
 
 fn leave_row(p: *mut Parser) bool {
-    if not p.in_scope(T_TR, SC_TABLE) {
+    if not p.in_scope(T_TR, Scope.TABLE) {
         return false;
     }
     p.clear_to(T_TR, T_TR, T_TR);
     p.pop();
-    p.mode = M_IN_TABLE_BODY;
+    p.mode = Mode.IN_TABLE_BODY;
     return true;
 }
 
 fn in_row(p: *mut Parser, t: *mut Token) !bool {
     let g = t.tag;
-    if t.kind == TK_START {
+    if t.kind == TokenKind.START {
         if (g == T_TH) or (g == T_TD) {
             p.clear_to(T_TR, T_TR, T_TR);
-            let id = p.insert(t, NS_HTML)!;
-            p.mode = M_IN_CELL;
+            let id = p.insert(t, Namespace.HTML)!;
+            p.mode = Mode.IN_CELL;
             if p.opened(id) {
                 p.afe.push(MARKER)!;
             }
@@ -5090,7 +5133,7 @@ fn in_row(p: *mut Parser, t: *mut Token) !bool {
            (g == T_THEAD) or (g == T_TR) {
             return leave_row(p);
         }
-    } else if t.kind == TK_END {
+    } else if t.kind == TokenKind.END {
         if g == T_TR {
             _ = leave_row(p);
             return false;
@@ -5099,7 +5142,7 @@ fn in_row(p: *mut Parser, t: *mut Token) !bool {
             return leave_row(p);
         }
         if (g == T_TBODY) or (g == T_TFOOT) or (g == T_THEAD) {
-            if not p.in_scope(g, SC_TABLE) {
+            if not p.in_scope(g, Scope.TABLE) {
                 return false;
             }
             return leave_row(p);
@@ -5122,36 +5165,36 @@ fn close_cell(p: *mut Parser) void {
         }
     }
     p.afe_clear_to_marker();
-    p.mode = M_IN_ROW;
+    p.mode = Mode.IN_ROW;
 }
 
 fn in_cell(p: *mut Parser, t: *mut Token) !bool {
     let g = t.tag;
-    if t.kind == TK_END {
+    if t.kind == TokenKind.END {
         if (g == T_TD) or (g == T_TH) {
-            if not p.in_scope(g, SC_TABLE) {
+            if not p.in_scope(g, Scope.TABLE) {
                 return false;
             }
             p.gen_implied(0);
             p.pop_until(g);
             p.afe_clear_to_marker();
-            p.mode = M_IN_ROW;
+            p.mode = Mode.IN_ROW;
             return false;
         }
         if (g == T_BODY) or (g == T_CAPTION) or (g == T_COL) or (g == T_COLGROUP) or (g == T_HTML) {
             return false;
         }
         if (g == T_TABLE) or (g == T_TBODY) or (g == T_TFOOT) or (g == T_THEAD) or (g == T_TR) {
-            if not p.in_scope(g, SC_TABLE) {
+            if not p.in_scope(g, Scope.TABLE) {
                 return false;
             }
             close_cell(p);
             return true;
         }
-    } else if t.kind == TK_START {
+    } else if t.kind == TokenKind.START {
         if (g == T_CAPTION) or (g == T_COL) or (g == T_COLGROUP) or (g == T_TBODY) or (g == T_TD) or (g == T_TFOOT) or
            (g == T_TH) or (g == T_THEAD) or (g == T_TR) {
-            if not (p.in_scope(T_TD, SC_TABLE) or p.in_scope(T_TH, SC_TABLE)) {
+            if not (p.in_scope(T_TD, Scope.TABLE) or p.in_scope(T_TH, Scope.TABLE)) {
                 return false;
             }
             close_cell(p);
@@ -5161,9 +5204,9 @@ fn in_cell(p: *mut Parser, t: *mut Token) !bool {
     return in_body(p, t);
 }
 
-fn switch_template(p: *mut Parser, mode: u8) !bool {
+fn switch_template(p: *mut Parser, mode: Mode) !bool {
     _ = p.tmodes.pop() catch 0;
-    p.tmodes.push(mode)!;
+    p.tmodes.push(@int_from_enum(mode))!;
     p.mode = mode;
     return true;
 }
@@ -5171,34 +5214,34 @@ fn switch_template(p: *mut Parser, mode: u8) !bool {
 fn in_template(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
     let g = t.tag;
-    if (k == TK_CHARS) or (k == TK_COMMENT) or (k == TK_DOCTYPE) {
+    if (k == TokenKind.CHARS) or (k == TokenKind.COMMENT) or (k == TokenKind.DOCTYPE) {
         return in_body(p, t);
     }
-    if k == TK_START {
+    if k == TokenKind.START {
         if tag_in(t, HEAD_TAGS[..]) {
             return in_head(p, t);
         }
         if (g == T_CAPTION) or (g == T_COLGROUP) or (g == T_TBODY) or (g == T_TFOOT) or (g == T_THEAD) {
-            return switch_template(p, M_IN_TABLE);
+            return switch_template(p, Mode.IN_TABLE);
         }
         if g == T_COL {
-            return switch_template(p, M_IN_COLUMN_GROUP);
+            return switch_template(p, Mode.IN_COLUMN_GROUP);
         }
         if g == T_TR {
-            return switch_template(p, M_IN_TABLE_BODY);
+            return switch_template(p, Mode.IN_TABLE_BODY);
         }
         if (g == T_TD) or (g == T_TH) {
-            return switch_template(p, M_IN_ROW);
+            return switch_template(p, Mode.IN_ROW);
         }
-        return switch_template(p, M_IN_BODY);
+        return switch_template(p, Mode.IN_BODY);
     }
-    if k == TK_END {
+    if k == TokenKind.END {
         if g == T_TEMPLATE {
             return in_head(p, t);
         }
         return false;
     }
-    if k == TK_EOF {
+    if k == TokenKind.EOF {
         if not p.has_template() {
             return false;
         }
@@ -5213,26 +5256,26 @@ fn in_template(p: *mut Parser, t: *mut Token) !bool {
 
 fn after_body(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_CHARS {
-        if not split_ws(p, t, M_IN_BODY)! {
+    if k == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.IN_BODY)! {
             return false;
         }
-    } else if k == TK_COMMENT {
+    } else if k == TokenKind.COMMENT {
         p.insert_comment(t, Loc.{ parent: p.stack.items()[0], before: NONE })!;
         return false;
-    } else if k == TK_DOCTYPE {
+    } else if k == TokenKind.DOCTYPE {
         return false;
     } else if is_start(t, T_HTML) {
         return in_body(p, t);
     } else if is_end(t, T_HTML) {
         if p.context == NONE {
-            p.mode = M_AFTER_AFTER_BODY;
+            p.mode = Mode.AFTER_AFTER_BODY;
         }
         return false;
-    } else if k == TK_EOF {
+    } else if k == TokenKind.EOF {
         return false;
     }
-    p.mode = M_IN_BODY;
+    p.mode = Mode.IN_BODY;
     return true;
 }
 
@@ -5249,19 +5292,19 @@ fn insert_ws_only(p: *mut Parser, t: *Token) !void {
 
 fn in_frameset(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_CHARS {
+    if k == TokenKind.CHARS {
         insert_ws_only(p, t)!;
-    } else if k == TK_COMMENT {
+    } else if k == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
     } else if is_start(t, T_HTML) {
         return in_body(p, t);
     } else if is_start(t, T_FRAMESET) {
-        _ = p.insert(t, NS_HTML)!;
+        _ = p.insert(t, Namespace.HTML)!;
     } else if is_end(t, T_FRAMESET) {
         if p.stack.len > 1 {
             p.pop();
             if (p.context == NONE) and not p.cur_is(T_FRAMESET) {
-                p.mode = M_AFTER_FRAMESET;
+                p.mode = Mode.AFTER_FRAMESET;
             }
         }
     } else if is_start(t, T_FRAME) {
@@ -5274,14 +5317,14 @@ fn in_frameset(p: *mut Parser, t: *mut Token) !bool {
 
 fn after_frameset(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_CHARS {
+    if k == TokenKind.CHARS {
         insert_ws_only(p, t)!;
-    } else if k == TK_COMMENT {
+    } else if k == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
     } else if is_start(t, T_HTML) {
         return in_body(p, t);
     } else if is_end(t, T_HTML) {
-        p.mode = M_AFTER_AFTER_FRAMESET;
+        p.mode = Mode.AFTER_AFTER_FRAMESET;
     } else if is_start(t, T_NOFRAMES) {
         return in_head(p, t);
     }
@@ -5290,35 +5333,35 @@ fn after_frameset(p: *mut Parser, t: *mut Token) !bool {
 
 fn after_after_body(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_COMMENT {
+    if k == TokenKind.COMMENT {
         p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
         return false;
     }
-    if (k == TK_DOCTYPE) or is_start(t, T_HTML) {
+    if (k == TokenKind.DOCTYPE) or is_start(t, T_HTML) {
         return in_body(p, t);
     }
-    if k == TK_CHARS {
-        if not split_ws(p, t, M_IN_BODY)! {
+    if k == TokenKind.CHARS {
+        if not split_ws(p, t, Whitespace.IN_BODY)! {
             return false;
         }
     }
-    if k == TK_EOF {
+    if k == TokenKind.EOF {
         return false;
     }
-    p.mode = M_IN_BODY;
+    p.mode = Mode.IN_BODY;
     return true;
 }
 
 fn after_after_frameset(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_COMMENT {
+    if k == TokenKind.COMMENT {
         p.insert_comment(t, Loc.{ parent: 0, before: NONE })!;
         return false;
     }
-    if (k == TK_DOCTYPE) or is_start(t, T_HTML) {
+    if (k == TokenKind.DOCTYPE) or is_start(t, T_HTML) {
         return in_body(p, t);
     }
-    if k == TK_CHARS {
+    if k == TokenKind.CHARS {
         p.sbuf.clear();
         for c in t.data {
             if is_ws(c) {
@@ -5387,7 +5430,7 @@ let BREAKOUT: [44]u16 = [
 
 fn foreign(p: *mut Parser, t: *mut Token) !bool {
     let k = t.kind;
-    if k == TK_CHARS {
+    if k == TokenKind.CHARS {
         p.sbuf.clear();
         let mut text = false;
         for c in t.data {
@@ -5406,14 +5449,14 @@ fn foreign(p: *mut Parser, t: *mut Token) !bool {
         }
         return false;
     }
-    if k == TK_COMMENT {
+    if k == TokenKind.COMMENT {
         p.insert_comment(t, p.place(NONE))!;
         return false;
     }
-    if k == TK_DOCTYPE {
+    if k == TokenKind.DOCTYPE {
         return false;
     }
-    let mut breakout = (k == TK_START) and tag_in(t, BREAKOUT[..]);
+    let mut breakout = (k == TokenKind.START) and tag_in(t, BREAKOUT[..]);
     if is_start(t, T_FONT) {
         for a in t.attrs {
             if strs.eq(a.name, "color") or strs.eq(a.name, "face") or strs.eq(a.name, "size") {
@@ -5427,14 +5470,14 @@ fn foreign(p: *mut Parser, t: *mut Token) !bool {
     if breakout {
         while p.stack.len > 1 {
             let c = p.cur();
-            if p.mathml_text_ip(c) or p.html_ip(c) or (p.nd(c).ns == NS_HTML) {
+            if p.mathml_text_ip(c) or p.html_ip(c) or (p.nd(c).ns == Namespace.HTML) {
                 break;
             }
             p.pop();
         }
         return step(p, p.mode, t);
     }
-    if k == TK_START {
+    if k == TokenKind.START {
         let ns = p.nd(p.adjusted_current()).ns;
         let id = p.insert(t, ns)!;
         if t.self_closing and p.opened(id) {
@@ -5442,7 +5485,7 @@ fn foreign(p: *mut Parser, t: *mut Token) !bool {
         }
         return false;
     }
-    if k == TK_END {
+    if k == TokenKind.END {
         let mut i = p.stack.len - 1;
         loop {
             if i == 0 {
@@ -5454,7 +5497,7 @@ fn foreign(p: *mut Parser, t: *mut Token) !bool {
                 return false;
             }
             i -= 1;
-            if p.nd(p.stack.items()[i]).ns == NS_HTML {
+            if p.nd(p.stack.items()[i]).ns == Namespace.HTML {
                 return step(p, p.mode, t);
             }
         }
@@ -5468,7 +5511,7 @@ fn foreign(p: *mut Parser, t: *mut Token) !bool {
 
 fn new_parser(doc: *mut Document, tz: *mut Tokenizer, opts: Options) Parser {
     return Parser.{ doc: doc, tz: tz, stack: vec.Vec.[u32].init(), open: [0; 124], afe: vec.Vec.[u32].init(),
-                    tmodes: vec.Vec.[u8].init(), mode: M_INITIAL, orig: M_INITIAL, head: NONE, form: NONE,
+                    tmodes: vec.Vec.[u8].init(), mode: Mode.INITIAL, orig: Mode.INITIAL, head: NONE, form: NONE,
                     context: NONE, frameset_ok: true, foster: false, scripting: opts.scripting, skip_lf: false,
                     text_elem: NONE, pend: strs.String.init(), pend_text: false, sbuf: strs.String.init(),
                     abuf: vec.Vec.[Attr].init() };
@@ -5477,11 +5520,11 @@ fn new_parser(doc: *mut Document, tz: *mut Tokenizer, opts: Options) Parser {
 fn run_parser(p: *mut Parser) !void {
     loop {
         let a = p.adjusted_current();
-        p.tz.cdata_ok = (a != NONE) and (p.nd(a).ns != NS_HTML);
+        p.tz.cdata_ok = (a != NONE) and (p.nd(a).ns != Namespace.HTML);
         let mut t = p.tz.next()!;
         if p.skip_lf {
             p.skip_lf = false;
-            if (t.kind == TK_CHARS) and (t.data[0] == '\n') {
+            if (t.kind == TokenKind.CHARS) and (t.data[0] == '\n') {
                 t.data = t.data[1..];
                 if t.data.len == 0 {
                     continue;
@@ -5489,7 +5532,7 @@ fn run_parser(p: *mut Parser) !void {
             }
         }
         dispatch(p, t)!;
-        if t.kind == TK_EOF {
+        if t.kind == TokenKind.EOF {
             return;
         }
     }
@@ -5502,7 +5545,7 @@ pub fn parse(text: []u8) !Document {
 
 pub fn parse_with(text: []u8, opts: Options) !Document {
     let mut doc = Document.init();
-    build(&mut doc, text, opts, "", NS_HTML) catch |e| {
+    build(&mut doc, text, opts, "", Namespace.HTML) catch |e| {
         doc.deinit();
         return e;
     };
@@ -5515,13 +5558,13 @@ pub fn parse_with(text: []u8, opts: Options) !Document {
 /// holds the parsed nodes.
 pub fn parse_fragment(text: []u8, context: []u8, opts: Options) !Document {
     let mut doc = Document.init();
-    let mut ns = NS_HTML;
+    let mut ns = Namespace.HTML;
     let mut name = context;
     if strs.starts_with(context, "svg ") {
-        ns = NS_SVG;
+        ns = Namespace.SVG;
         name = context[4..];
     } else if strs.starts_with(context, "math ") {
-        ns = NS_MATHML;
+        ns = Namespace.MATHML;
         name = context[5..];
     }
     build(&mut doc, text, opts, name, ns) catch |e| {
@@ -5661,8 +5704,8 @@ fn charset_in(tag: []u8) []u8 {
     return "";
 }
 
-fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: u8) !void {
-    _ = doc.new_node(DOCUMENT)!;
+fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: Namespace) !void {
+    _ = doc.new_node(Kind.DOCUMENT)!;
     let mut text = text0;
     if (text.len >= 3) and (text[0] == 0xef) and (text[1] == 0xbb) and (text[2] == 0xbf) {
         text = text[3..];  // a byte-order mark
@@ -5679,25 +5722,25 @@ fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: u8)
         ct.name = lname;
         ct.tag = tag_of(lname);
         p.context = p.create_element(&mut ct, cns)!;
-        if cns == NS_HTML {
+        if cns == Namespace.HTML {
             let g = ct.tag;
             if (g == T_TITLE) or (g == T_TEXTAREA) {
-                tz.state = S_RCDATA;
+                tz.state = State.RCDATA;
             } else if (g == T_STYLE) or (g == T_XMP) or (g == T_IFRAME) or (g == T_NOEMBED) or (g == T_NOFRAMES) or
                       ((g == T_NOSCRIPT) and opts.scripting) {
-                tz.state = S_RAWTEXT;
+                tz.state = State.RAWTEXT;
             } else if g == T_SCRIPT {
-                tz.state = S_SCRIPT;
+                tz.state = State.SCRIPT;
             } else if g == T_PLAINTEXT {
-                tz.state = S_PLAINTEXT;
+                tz.state = State.PLAINTEXT;
             }
         }
         let mut h = fake_token(T_HTML);
-        root = p.create_element(&mut h, NS_HTML)!;
+        root = p.create_element(&mut h, Namespace.HTML)!;
         doc.append_child(0, root);
         _ = p.push(root)!;
         if p.is(p.context, T_TEMPLATE) {
-            p.tmodes.push(M_IN_TEMPLATE)!;
+            p.tmodes.push(@int_from_enum(Mode.IN_TEMPLATE))!;
         }
         p.reset_mode();
         if p.is(p.context, T_FORM) {
@@ -5708,7 +5751,7 @@ fn build(doc: *mut Document, text0: []u8, opts: Options, context: []u8, cns: u8)
     if root != NONE {
         // the fragment: the root element's children, under node 0
         doc.remove(root);
-        doc.nm(0).kind = FRAGMENT;
+        doc.nm(0).kind = Kind.FRAGMENT;
         loop {
             let c = doc.node(root).first;
             if c == NONE {
@@ -5736,7 +5779,8 @@ fn fill_selectedcontent(doc: *mut Document) !void {
     let n = @truncate(u32, doc.nodes.len);
     for sel in @as(u32, 0)..n {
         let s = doc.node(sel);
-        if (s.kind != ELEMENT) or (s.ns != NS_HTML) or (s.tag != T_SELECT) or has_attr_named(s, "multiple") {
+        if (s.kind != Kind.ELEMENT) or (s.ns != Namespace.HTML) or (s.tag != T_SELECT) or
+           has_attr_named(s, "multiple") {
             continue;
         }
         let mut sc = NONE;
@@ -5749,7 +5793,7 @@ fn fill_selectedcontent(doc: *mut Document) !void {
                 continue;
             }
             let e = doc.node(w.id);
-            if (e.kind != ELEMENT) or (e.ns != NS_HTML) {
+            if (e.kind != Kind.ELEMENT) or (e.ns != Namespace.HTML) {
                 continue;
             }
             if (e.tag == T_SELECTEDCONTENT) and (sc == NONE) {
@@ -5780,7 +5824,7 @@ fn fill_selectedcontent(doc: *mut Document) !void {
 
 fn has_attr_named(n: *Node, name: []u8) bool {
     for a in n.attrs {
-        if (a.ns == A_NONE) and strs.eq(a.name, name) {
+        if (a.ns == AttrNamespace.NONE) and strs.eq(a.name, name) {
             return true;
         }
     }
@@ -5870,7 +5914,7 @@ fn attr_is(a: Attr, name: []u8) bool {
 
 // Whether an element has a local name (ASCII case-insensitively for HTML).
 fn name_is(n: *Node, name: []u8) bool {
-    if n.ns == NS_HTML {
+    if n.ns == Namespace.HTML {
         return strs.eq_ignore_case(n.name, name);
     }
     return strs.eq(n.name, name);
@@ -5922,20 +5966,22 @@ pub fn escape(out: io.Writer, s: []u8, attr: bool) !void {
 // :enabled.
 
 // Simple selector kinds
-const SS_TYPE: u8 = 0;
-const SS_UNIVERSAL: u8 = 1;
-const SS_ID: u8 = 2;
-const SS_CLASS: u8 = 3;
-const SS_ATTR: u8 = 4;
-const SS_ROOT: u8 = 5;
-const SS_EMPTY: u8 = 6;
-const SS_NTH: u8 = 7;  // op: bit 0 from the end, bit 1 of type
-const SS_NOT: u8 = 8;  // sub: a list
-const SS_IS: u8 = 9;
-const SS_LINK: u8 = 10;
-const SS_CHECKED: u8 = 11;
-const SS_DISABLED: u8 = 12;
-const SS_ENABLED: u8 = 13;
+enum SimpleKind: u8 {
+    TYPE,
+    UNIVERSAL,
+    ID,
+    CLASS,
+    ATTR,
+    ROOT,
+    EMPTY,
+    NTH,  // op: bit 0 from the end, bit 1 of type
+    NOT,  // sub: a list
+    IS,
+    LINK,
+    CHECKED,
+    DISABLED,
+    ENABLED,
+}
 
 // Attribute operators
 const AO_EXISTS: u8 = 0;
@@ -5947,14 +5993,16 @@ const AO_SUFFIX: u8 = 5;  // $=
 const AO_SUB: u8 = 6;     // *=
 
 // Combinators (to the compound on the left)
-const C_NONE: u8 = 0;
-const C_DESCENDANT: u8 = 1;
-const C_CHILD: u8 = 2;
-const C_NEXT: u8 = 3;
-const C_LATER: u8 = 4;
+enum Combinator: u8 {
+    NONE,
+    DESCENDANT,
+    CHILD,
+    NEXT,
+    LATER,
+}
 
 struct Simple {
-    kind: u8,
+    kind: SimpleKind,
     op: u8,
     ci: bool,
     name: []u8,
@@ -5967,7 +6015,7 @@ struct Simple {
 struct Compound {
     first: u32,  // simples[first..first + count]
     count: u32,
-    comb: u8,  // how it relates to the compound before it
+    comb: Combinator,  // how it relates to the compound before it
 }
 
 struct Complex {
@@ -5981,10 +6029,12 @@ struct Range {
 }
 
 // Match results (as in Servo, which avoids exponential backtracking)
-const R_MATCHED: u8 = 0;
-const R_LATER_SIBLING: u8 = 1;  // not matched: restart from the closest later-sibling combinator
-const R_DESCENDANT: u8 = 2;     // ... from the closest descendant combinator
-const R_GLOBALLY: u8 = 3;       // not matched, and no other placement can match
+enum MatchResult: u8 {
+    MATCHED,
+    LATER_SIBLING,  // not matched: restart from the closest later-sibling combinator
+    DESCENDANT,     // ... from the closest descendant combinator
+    GLOBALLY,       // not matched, and no other placement can match
+}
 
 /// A compiled selector list.
 pub struct Selector {
@@ -6005,7 +6055,7 @@ pub struct Selector {
 
     /// Whether an element matches.
     pub fn matches(self: *Selector, doc: *Document, id: u32) bool {
-        if doc.node(id).kind != ELEMENT {
+        if doc.node(id).kind != Kind.ELEMENT {
             return false;
         }
         return self.list_matches(doc, self.top, id, 0);
@@ -6015,29 +6065,29 @@ pub struct Selector {
         let r = self.lists.get(@as(usize, list));
         for k in r.first..r.first + r.count {
             let c = self.complexes.get(@as(usize, k));
-            if self.match_from(doc, c, c.count - 1, id, depth) == R_MATCHED {
+            if self.match_from(doc, c, c.count - 1, id, depth) == MatchResult.MATCHED {
                 return true;
             }
         }
         return false;
     }
 
-    fn match_from(self: *Selector, doc: *Document, cx: Complex, i: u32, id: u32, depth: u32) u8 {
+    fn match_from(self: *Selector, doc: *Document, cx: Complex, i: u32, id: u32, depth: u32) MatchResult {
         let comp = self.compounds.get(@as(usize, cx.first + i));
         if not self.compound_matches(doc, comp, id, depth) {
-            return R_LATER_SIBLING;
+            return MatchResult.LATER_SIBLING;
         }
         if i == 0 {
-            return R_MATCHED;
+            return MatchResult.MATCHED;
         }
         let comb = comp.comb;
-        let mut not_found = R_GLOBALLY;
-        if (comb == C_NEXT) or (comb == C_LATER) {
-            not_found = R_DESCENDANT;
+        let mut not_found = MatchResult.GLOBALLY;
+        if (comb == Combinator.NEXT) or (comb == Combinator.LATER) {
+            not_found = MatchResult.DESCENDANT;
         }
         let mut next = id;
         loop {
-            if (comb == C_CHILD) or (comb == C_DESCENDANT) {
+            if (comb == Combinator.CHILD) or (comb == Combinator.DESCENDANT) {
                 next = doc.parent_element(next);
             } else {
                 next = prev_element(doc, next);
@@ -6046,13 +6096,13 @@ pub struct Selector {
                 return not_found;
             }
             let r = self.match_from(doc, cx, i - 1, next, depth);
-            if (r == R_MATCHED) or (r == R_GLOBALLY) or (comb == C_NEXT) {
+            if (r == MatchResult.MATCHED) or (r == MatchResult.GLOBALLY) or (comb == Combinator.NEXT) {
                 return r;
             }
-            if comb == C_CHILD {
-                return R_DESCENDANT;
+            if comb == Combinator.CHILD {
+                return MatchResult.DESCENDANT;
             }
-            if (r == R_DESCENDANT) and (comb == C_LATER) {
+            if (r == MatchResult.DESCENDANT) and (comb == Combinator.LATER) {
                 return r;
             }
         }
@@ -6070,24 +6120,24 @@ pub struct Selector {
     fn simple_matches(self: *Selector, doc: *Document, s: Simple, id: u32, depth: u32) bool {
         let n = doc.node(id);
         let k = s.kind;
-        if k == SS_TYPE {
+        if k == SimpleKind.TYPE {
             return name_is(n, s.name);
         }
-        if k == SS_UNIVERSAL {
+        if k == SimpleKind.UNIVERSAL {
             return true;
         }
-        if k == SS_ID {
+        if k == SimpleKind.ID {
             let v = doc.attr(id, "id") catch return false;
             return strs.eq(v, s.name);
         }
-        if k == SS_CLASS {
+        if k == SimpleKind.CLASS {
             let v = doc.attr(id, "class") catch return false;
             return has_word(v, s.name, false);
         }
-        if k == SS_ATTR {
+        if k == SimpleKind.ATTR {
             for a in n.attrs {
                 let mut hit = false;
-                if n.ns == NS_HTML {
+                if n.ns == Namespace.HTML {
                     hit = (a.prefix.len == 0) and strs.eq_ignore_case(a.name, s.name);
                 } else {
                     hit = attr_is(a, s.name);
@@ -6098,21 +6148,21 @@ pub struct Selector {
             }
             return false;
         }
-        if k == SS_ROOT {
-            return (n.parent != NONE) and (doc.node(n.parent).kind == DOCUMENT);
+        if k == SimpleKind.ROOT {
+            return (n.parent != NONE) and (doc.node(n.parent).kind == Kind.DOCUMENT);
         }
-        if k == SS_EMPTY {
+        if k == SimpleKind.EMPTY {
             let mut c = n.first;
             while c != NONE {
                 let ck = doc.node(c).kind;
-                if (ck == ELEMENT) or ((ck == TEXT) and (doc.node(c).text.len > 0)) {
+                if (ck == Kind.ELEMENT) or ((ck == Kind.TEXT) and (doc.node(c).text.len > 0)) {
                     return false;
                 }
                 c = doc.node(c).next;
             }
             return true;
         }
-        if k == SS_NTH {
+        if k == SimpleKind.NTH {
             let from_end = (s.op & 1) != 0;
             let of_type = (s.op & 2) != 0;
             let mut pos: i64 = 1;
@@ -6136,26 +6186,26 @@ pub struct Selector {
             let d = pos - s.b;
             return ((d % s.a) == 0) and ((d / s.a) >= 0);
         }
-        if (k == SS_NOT) or (k == SS_IS) {
+        if (k == SimpleKind.NOT) or (k == SimpleKind.IS) {
             if depth > 32 {
                 return false;
             }
             let m = self.list_matches(doc, s.sub, id, depth + 1);
-            return m == (k == SS_IS);
+            return m == (k == SimpleKind.IS);
         }
-        if (n.ns != NS_HTML) {
+        if (n.ns != Namespace.HTML) {
             return false;
         }
-        if k == SS_LINK {
+        if k == SimpleKind.LINK {
             return ((n.tag == T_A) or (n.tag == T_AREA)) and doc.has_attr(id, "href");
         }
-        if k == SS_CHECKED {
+        if k == SimpleKind.CHECKED {
             return (((n.tag == T_INPUT) and doc.has_attr(id, "checked")) or
                     ((n.tag == T_OPTION) and doc.has_attr(id, "selected")));
         }
         let form = (n.tag == T_BUTTON) or (n.tag == T_INPUT) or (n.tag == T_SELECT) or (n.tag == T_TEXTAREA) or
                    (n.tag == T_OPTGROUP) or (n.tag == T_OPTION) or (n.tag == T_FIELDSET);
-        if k == SS_DISABLED {
+        if k == SimpleKind.DISABLED {
             return form and doc.has_attr(id, "disabled");
         }
         return form and not doc.has_attr(id, "disabled");
@@ -6164,7 +6214,7 @@ pub struct Selector {
 
 fn prev_element(doc: *Document, id: u32) u32 {
     let mut c = doc.node(id).prev;
-    while (c != NONE) and (doc.node(c).kind != ELEMENT) {
+    while (c != NONE) and (doc.node(c).kind != Kind.ELEMENT) {
         c = doc.node(c).prev;
     }
     return c;
@@ -6172,7 +6222,7 @@ fn prev_element(doc: *Document, id: u32) u32 {
 
 fn next_element(doc: *Document, id: u32) u32 {
     let mut c = doc.node(id).next;
-    while (c != NONE) and (doc.node(c).kind != ELEMENT) {
+    while (c != NONE) and (doc.node(c).kind != Kind.ELEMENT) {
         c = doc.node(c).next;
     }
     return c;
@@ -6300,7 +6350,7 @@ struct SelParser {
     fn complex(self: *mut SelParser, depth: u32) !Complex {
         let mut comps = vec.Vec.[Compound].init();
         defer comps.deinit();
-        let mut comb = C_NONE;
+        let mut comb = Combinator.NONE;
         loop {
             let mut c = self.compound(depth)!;
             c.comb = comb;
@@ -6309,13 +6359,13 @@ struct SelParser {
             self.ws();
             let ch = self.peek();
             if ch == '>' {
-                comb = C_CHILD;
+                comb = Combinator.CHILD;
             } else if ch == '+' {
-                comb = C_NEXT;
+                comb = Combinator.NEXT;
             } else if ch == '~' {
-                comb = C_LATER;
+                comb = Combinator.LATER;
             } else if had_ws and (ch != 0) and (ch != ',') and (ch != ')') {
-                comb = C_DESCENDANT;
+                comb = Combinator.DESCENDANT;
                 continue;
             } else {
                 break;
@@ -6353,21 +6403,21 @@ struct SelParser {
         let c = self.peek();
         if c == '*' {
             self.i += 1;
-            add(&mut out, SS_UNIVERSAL, "")!;
+            add(&mut out, SimpleKind.UNIVERSAL, "")!;
         } else if is_alnum(@as(i32, c)) or (c == '-') or (c == '_') or (c == '\\') or (c >= 0x80) {
             let nm = self.ident()!;
-            add(&mut out, SS_TYPE, nm)!;
+            add(&mut out, SimpleKind.TYPE, nm)!;
         }
         loop {
             let ch = self.peek();
             if ch == '#' {
                 self.i += 1;
                 let nm = self.ident()!;
-                add(&mut out, SS_ID, nm)!;
+                add(&mut out, SimpleKind.ID, nm)!;
             } else if ch == '.' {
                 self.i += 1;
                 let nm = self.ident()!;
-                add(&mut out, SS_CLASS, nm)!;
+                add(&mut out, SimpleKind.CLASS, nm)!;
             } else if ch == '[' {
                 self.i += 1;
                 self.attribute(&mut out)!;
@@ -6386,14 +6436,14 @@ struct SelParser {
         }
         let first = @truncate(u32, self.sel.simples.len);
         self.sel.simples.extend(out.items())!;
-        return Compound.{ first: first, count: @truncate(u32, out.len), comb: C_NONE };
+        return Compound.{ first: first, count: @truncate(u32, out.len), comb: Combinator.NONE };
     }
 
     fn attribute(self: *mut SelParser, out: *mut vec.Vec.[Simple]) !void {
         self.ws();
         let nm = self.ident()!;
         self.ws();
-        let mut s = Simple.{ kind: SS_ATTR, op: AO_EXISTS, ci: false, name: nm, value: "", a: 0, b: 0, sub: 0 };
+        let mut s = Simple.{ kind: SimpleKind.ATTR, op: AO_EXISTS, ci: false, name: nm, value: "", a: 0, b: 0, sub: 0 };
         let c = self.peek();
         if c != ']' {
             if c == '=' {
@@ -6457,22 +6507,22 @@ struct SelParser {
     fn pseudo(self: *mut SelParser, out: *mut vec.Vec.[Simple], depth: u32) !void {
         let nm = self.ident()!;
         if strs.eq_ignore_case(nm, "root") {
-            return add(out, SS_ROOT, "");
+            return add(out, SimpleKind.ROOT, "");
         }
         if strs.eq_ignore_case(nm, "empty") {
-            return add(out, SS_EMPTY, "");
+            return add(out, SimpleKind.EMPTY, "");
         }
         if strs.eq_ignore_case(nm, "link") or strs.eq_ignore_case(nm, "any-link") {
-            return add(out, SS_LINK, "");
+            return add(out, SimpleKind.LINK, "");
         }
         if strs.eq_ignore_case(nm, "checked") {
-            return add(out, SS_CHECKED, "");
+            return add(out, SimpleKind.CHECKED, "");
         }
         if strs.eq_ignore_case(nm, "disabled") {
-            return add(out, SS_DISABLED, "");
+            return add(out, SimpleKind.DISABLED, "");
         }
         if strs.eq_ignore_case(nm, "enabled") {
-            return add(out, SS_ENABLED, "");
+            return add(out, SimpleKind.ENABLED, "");
         }
         // positions: (from the end, of type) and an+b
         let mut op: u8 = 0;
@@ -6506,9 +6556,9 @@ struct SelParser {
                     return error.SyntaxError;
                 }
                 self.i += 1;
-                let mut kind = SS_IS;
+                let mut kind = SimpleKind.IS;
                 if strs.eq_ignore_case(nm, "not") {
-                    kind = SS_NOT;
+                    kind = SimpleKind.NOT;
                 }
                 out.push(Simple.{ kind: kind, op: 0, ci: false, name: "", value: "", a: 0, b: 0, sub: sub })!;
                 return;
@@ -6534,14 +6584,14 @@ struct SelParser {
             parse_nth(strs.trim(self.s[st..self.i]), &mut a, &mut b)!;
             self.i += 1;
         }
-        out.push(Simple.{ kind: SS_NTH, op: op, ci: false, name: "", value: "", a: a, b: b, sub: 0 })!;
+        out.push(Simple.{ kind: SimpleKind.NTH, op: op, ci: false, name: "", value: "", a: a, b: b, sub: 0 })!;
         if both {
-            out.push(Simple.{ kind: SS_NTH, op: op | 1, ci: false, name: "", value: "", a: 0, b: 1, sub: 0 })!;
+            out.push(Simple.{ kind: SimpleKind.NTH, op: op | 1, ci: false, name: "", value: "", a: 0, b: 1, sub: 0 })!;
         }
     }
 }
 
-fn add(out: *mut vec.Vec.[Simple], kind: u8, name: []u8) !void {
+fn add(out: *mut vec.Vec.[Simple], kind: SimpleKind, name: []u8) !void {
     out.push(Simple.{ kind: kind, op: 0, ci: false, name: name, value: "", a: 0, b: 0, sub: 0 })!;
 }
 
@@ -6654,16 +6704,16 @@ fn dump(doc: *Document, from: u32, out: *mut strs.String) !void {
         for _k in @as(u32, 0)..depth {
             out.push_str("  ")!;
         }
-        if n.kind == FRAGMENT {
+        if n.kind == Kind.FRAGMENT {
             out.push_str("content\n")!;
             push_children(doc, &mut work, n.first, depth + 1)!;
             continue;
         }
-        if n.kind == ELEMENT {
+        if n.kind == Kind.ELEMENT {
             out.push('<')!;
-            if n.ns == NS_SVG {
+            if n.ns == Namespace.SVG {
                 out.push_str("svg ")!;
-            } else if n.ns == NS_MATHML {
+            } else if n.ns == Namespace.MATHML {
                 out.push_str("math ")!;
             }
             out.push_str(n.name)!;
@@ -6692,15 +6742,15 @@ fn dump(doc: *Document, from: u32, out: *mut strs.String) !void {
                 work.push(depth + 1)!;
             }
             push_children(doc, &mut work, n.first, depth + 1)!;
-        } else if n.kind == TEXT {
+        } else if n.kind == Kind.TEXT {
             out.push('"')!;
             out.push_str(n.text)!;
             out.push_str("\"\n")!;
-        } else if n.kind == COMMENT {
+        } else if n.kind == Kind.COMMENT {
             out.push_str("<!-- ")!;
             out.push_str(n.text)!;
             out.push_str(" -->\n")!;
-        } else if n.kind == DOCTYPE {
+        } else if n.kind == Kind.DOCTYPE {
             out.push_str("<!DOCTYPE ")!;
             out.push_str(n.name)!;
             if (n.text.len > 0) or (n.system_id.len > 0) {
@@ -6872,7 +6922,7 @@ fn attr_less(a: Attr, b: Attr) bool {
     return strs.less(a.name, b.name);
 }
 
-fn tokens_of(input: []u8, state: u8, last: []u8, out: *mut strs.String) !void {
+fn tokens_of(input: []u8, state: State, last: []u8, out: *mut strs.String) !void {
     let mut tz = Tokenizer.init(input)!;
     defer tz.deinit();
     tz.state = state;
@@ -6883,10 +6933,10 @@ fn tokens_of(input: []u8, state: u8, last: []u8, out: *mut strs.String) !void {
     loop {
         let t = tz.next()!;
         let k = t.kind;
-        if k == TK_EOF {
+        if k == TokenKind.EOF {
             return;
         }
-        if k == TK_CHARS {
+        if k == TokenKind.CHARS {
             if not chars {
                 if out.len > 0 {
                     out.push('\n')!;
@@ -6901,13 +6951,13 @@ fn tokens_of(input: []u8, state: u8, last: []u8, out: *mut strs.String) !void {
         if out.len > 0 {
             out.push('\n')!;
         }
-        if k == TK_COMMENT {
+        if k == TokenKind.COMMENT {
             out.push_str("C|")!;
             esc_field(out, t.data)!;
-        } else if k == TK_END {
+        } else if k == TokenKind.END {
             out.push_str("E|")!;
             esc_field(out, t.name)!;
-        } else if k == TK_START {
+        } else if k == TokenKind.START {
             out.push_str("S|")!;
             esc_field(out, t.name)!;
             if t.self_closing {
@@ -6925,7 +6975,7 @@ fn tokens_of(input: []u8, state: u8, last: []u8, out: *mut strs.String) !void {
                 out.push('|')!;
                 esc_field(out, a.value)!;
             }
-        } else if k == TK_DOCTYPE {
+        } else if k == TokenKind.DOCTYPE {
             out.push_str("D|")!;
             let parts: [3][]u8 = [t.name, t.public_id, t.system_id];
             let has: [3]bool = [t.has_name, t.has_public, t.has_system];
@@ -6966,17 +7016,17 @@ test "html5lib tokenizer" {
         at += ilen + 1;
         let want = data[at..at + elen];
         at += elen + 1;
-        let mut state = S_DATA;
+        let mut state = State.DATA;
         if strs.eq(st, "plaintext") {
-            state = S_PLAINTEXT;
+            state = State.PLAINTEXT;
         } else if strs.eq(st, "rcdata") {
-            state = S_RCDATA;
+            state = State.RCDATA;
         } else if strs.eq(st, "rawtext") {
-            state = S_RAWTEXT;
+            state = State.RAWTEXT;
         } else if strs.eq(st, "script") {
-            state = S_SCRIPT;
+            state = State.SCRIPT;
         } else if strs.eq(st, "cdata") {
-            state = S_CDATA;
+            state = State.CDATA;
         }
         let mut got = strs.String.init();
         defer got.deinit();
@@ -7003,7 +7053,7 @@ test "reading the tree" {
         "<!doctype html><title> A  <b>title</b>\n</title><body class='x y'><ul id=l><li>one<li data-n=2>two &amp; &lt;three&gt;</ul><p>caf&eacute;&notit; &#x1F600;</p><template><i>t</i></template>";
     let mut doc = parse(text)!;
     defer doc.deinit();
-    @expect_eq(doc.mode, NO_QUIRKS);
+    @expect(doc.mode == QuirksMode.NO_QUIRKS);
     let t = doc.title()!;
     defer mem.free(t);
     @expect_eq(t, "A <b>title</b>");
@@ -7039,7 +7089,7 @@ test "reading the tree" {
     // quirks
     let mut q = parse("<p>x")!;
     defer q.deinit();
-    @expect_eq(q.mode, QUIRKS);
+    @expect(q.mode == QuirksMode.QUIRKS);
 }
 
 fn round(text: []u8) ![]mut u8 {
@@ -7166,7 +7216,7 @@ test "changing the tree" {
 test "fragments" {
     let mut f = parse_fragment("<td>x<td>y", "tr", Options.default())!;
     defer f.deinit();
-    @expect_eq(f.node(0).kind, FRAGMENT);
+    @expect(f.node(0).kind == Kind.FRAGMENT);
     let s = f.inner_html(0)!;
     defer mem.free(s);
     @expect_eq(s, "<td>x</td><td>y</td>");

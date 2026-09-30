@@ -47,15 +47,17 @@ pub struct Partial {
     source: []u8,
 }
 
-const TEXT: u8 = 0;
-const VAR: u8 = 1;  // escaped
-const RAW: u8 = 2;  // not escaped
-const SECTION: u8 = 3;
-const INVERTED: u8 = 4;
-const PARTIAL: u8 = 5;
+enum Kind: u8 {
+    TEXT,
+    VAR,  // escaped
+    RAW,  // not escaped
+    SECTION,
+    INVERTED,
+    PARTIAL,
+}
 
 struct Token {
-    kind: u8,
+    kind: Kind,
     text: []u8,    // the text, or the tag's name
     indent: []u8,  // for a standalone partial: the whitespace before it
     end: usize,    // for a section: the index after its closing tag
@@ -161,7 +163,7 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) !void {
     let mut line_tagged: usize = 0;  // where the last tag ended (a line with an earlier tag has no standalone tag)
     while pos < src.len {
         let t = strs.index_of_from(src, otag, pos) catch {
-            toks.push(Token.{ kind: TEXT, text: src[pos..], indent: "", end: 0 })!;
+            toks.push(Token.{ kind: Kind.TEXT, text: src[pos..], indent: "", end: 0 })!;
             break;
         };
         // the tag: its kind and content
@@ -240,7 +242,7 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) !void {
             indent = src[ls..t];
         }
         if text_end > pos {
-            toks.push(Token.{ kind: TEXT, text: src[pos..text_end], indent: "", end: 0 })!;
+            toks.push(Token.{ kind: Kind.TEXT, text: src[pos..text_end], indent: "", end: 0 })!;
         }
         pos = after;
         line_tagged = e;
@@ -261,9 +263,9 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) !void {
             continue;
         }
         if (sigil == '#') or (sigil == '^') {
-            let mut kind = SECTION;
+            let mut kind = Kind.SECTION;
             if sigil == '^' {
-                kind = INVERTED;
+                kind = Kind.INVERTED;
             }
             open.push(toks.len)!;
             toks.push(Token.{ kind: kind, text: name, indent: "", end: 0 })!;
@@ -278,12 +280,12 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) !void {
             continue;
         }
         if sigil == '>' {
-            toks.push(Token.{ kind: PARTIAL, text: name, indent: indent, end: 0 })!;
+            toks.push(Token.{ kind: Kind.PARTIAL, text: name, indent: indent, end: 0 })!;
             continue;
         }
-        let mut kind = VAR;
+        let mut kind = Kind.VAR;
         if (sigil == '{') or (sigil == '&') {
-            kind = RAW;
+            kind = Kind.RAW;
         }
         if name.len == 0 {
             return error.InvalidTemplate;
@@ -309,18 +311,18 @@ struct Renderer {
         let mut k = from;
         while k < to {
             let t = toks[k];
-            if t.kind == TEXT {
+            if t.kind == Kind.TEXT {
                 self.w.write_all(t.text)!;
                 k += 1;
                 continue;
             }
-            if (t.kind == VAR) or (t.kind == RAW) {
+            if (t.kind == Kind.VAR) or (t.kind == Kind.RAW) {
                 let v = self.lookup(t.text);
-                write_value(self.w, v, t.kind == VAR)!;
+                write_value(self.w, v, t.kind == Kind.VAR)!;
                 k += 1;
                 continue;
             }
-            if t.kind == PARTIAL {
+            if t.kind == Kind.PARTIAL {
                 self.partial(t.text, t.indent)!;
                 k += 1;
                 continue;
@@ -328,7 +330,7 @@ struct Renderer {
             // a section: its tokens are k + 1 .. t.end
             let v = self.lookup(t.text);
             let truthy = is_truthy(v);
-            if t.kind == INVERTED {
+            if t.kind == Kind.INVERTED {
                 if not truthy {
                     self.run(toks, k + 1, t.end)!;
                 }
