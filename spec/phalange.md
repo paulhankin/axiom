@@ -2218,7 +2218,7 @@ test "indexing past the end traps" expect trap(T0001) {
   so they are testable.
 - `@expect(cond)` traps with `T0011` when `cond` is false.
 - `@expect_eq(a, b)` traps with `T0011` when `a != b`, and records both values. It
-  compares integers, floats, `bool`, `error`, pointers, and `[]u8` by content
+  compares integers, floats, `bool`, `error`, enums, pointers, and `[]u8` by content
   (`E0825` for other types). Both builtins also work outside tests, as assertions
   that stay on in every build.
 

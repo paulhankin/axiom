@@ -3895,7 +3895,7 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         let tk = t.kind;
         let ok = (tk == ast.TY_INT) or (tk == ast.TY_FLOAT) or (tk == ast.TY_BOOL) or (tk == ast.TY_ERROR) or
-                 (tk == ast.TY_PTR) or (tk == ast.TY_FN) or (tk == ast.TY_INVALID) or
+                 (tk == ast.TY_PTR) or (tk == ast.TY_FN) or (tk == ast.TY_ENUM) or (tk == ast.TY_INVALID) or
                  ((tk == ast.TY_SLICE) and (t.elem == ty.t_u8)) or ((tk == ast.TY_PARAM) and ty.satisfies(t, ast.C_EQ));
         if not ok {
             _ = dg.err(e.span, "E0825",

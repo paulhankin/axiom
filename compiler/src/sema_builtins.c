@@ -631,7 +631,7 @@ Type *builtin_check(Expr *e, Type *expected) {
             }
         }
         bool ok = t->kind == TY_INT || t->kind == TY_FLOAT || t->kind == TY_BOOL || t->kind == TY_ERROR ||
-                  t->kind == TY_PTR || t->kind == TY_FN || t->kind == TY_INVALID ||
+                  t->kind == TY_PTR || t->kind == TY_FN || t->kind == TY_ENUM || t->kind == TY_INVALID ||
                   (t->kind == TY_SLICE && t->elem == t_u8) || (t->kind == TY_PARAM && type_satisfies(t, C_EQ));
         if (!ok)
             diag_error(e->span, "E0825",
