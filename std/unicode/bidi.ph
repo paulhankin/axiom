@@ -3,7 +3,7 @@
 // Unicode 15.1: embedding levels of mixed left-to-right and right-to-left
 // text, and the visual order of a line.
 //
-//     let mut p = bidi.Paragraph.init(cps, bidi.AUTO)!;   // one paragraph's code points
+//     let mut p = bidi.Paragraph.init(cps, bidi.Direction.AUTO)!;   // one paragraph's code points
 //     defer p.deinit();
 //     // p.level: the paragraph's level (0 left to right, 1 right to left)
 //     // p.levels[i]: each character's level (odd: right to left)
@@ -22,9 +22,11 @@ import "tables.ph" as t;
 error { OutOfMemory, Done }
 
 /// Paragraph directions.
-pub const AUTO: i32 = -1;  // from the first strong character (else left to right)
-pub const LTR: i32 = 0;
-pub const RTL: i32 = 1;
+pub enum Direction: i8 {
+    AUTO = -1,  // from the first strong character (else left to right)
+    LTR,
+    RTL,
+}
 
 const MAX_DEPTH: u32 = 125;
 
@@ -76,9 +78,8 @@ pub struct Paragraph {
     matching: []mut i64,  // each isolate initiator's matching PDI (-1: none)
     emb: []mut u8,        // the embedding levels (before the implicit rules)
 
-    /// Resolves the levels of one paragraph of code points; dir is AUTO,
-    /// LTR or RTL.
-    pub fn init(cps: []u32, dir: i32) !Paragraph {
+    /// Resolves the levels of one paragraph of code points.
+    pub fn init(cps: []u32, dir: Direction) !Paragraph {
         let mut p = empty(cps.len)!;
         for i in @as(usize, 0)..cps.len {
             p.cps[i] = cps[i];
@@ -92,7 +93,7 @@ pub struct Paragraph {
     }
 
     /// Resolves levels from bidi classes alone (no bracket pairs).
-    pub fn from_classes(classes: []u8, dir: i32) !Paragraph {
+    pub fn from_classes(classes: []u8, dir: Direction) !Paragraph {
         let mut p = empty(classes.len)!;
         mem.free(p.cps);
         p.cps = mem.alloc.[u32](0)!;
@@ -118,17 +119,19 @@ pub struct Paragraph {
         return removed(self.orig[i]);
     }
 
-    fn resolve(self: *mut Paragraph, dir: i32) !void {
+    fn resolve(self: *mut Paragraph, dir: Direction) !void {
         let n = self.orig.len;
         @mem_copy(self.cls, self.orig);
         self.find_matching_pdis()!;
-        if dir == AUTO {
-            self.level = 0;
-            if self.first_strong(0, n) == 1 {
-                self.level = 1;
+        match dir {
+            .AUTO => {
+                self.level = 0;
+                if self.first_strong(0, n) == 1 {
+                    self.level = 1;
+                }
             }
-        } else {
-            self.level = @truncate(u8, @bit_cast(u32, dir));
+            .LTR => { self.level = 0; }
+            .RTL => { self.level = 1; }
         }
         self.explicit();
         @mem_copy(self.emb, self.levels);
@@ -954,7 +957,7 @@ fn run_bidi_test(file: []u8) ![2]usize {
             classes.push(class_by_name(tok))!;
         }
         let bits = parse_uint(strs.trim(line[semi + 1..]));
-        let dirs: [3]i32 = [AUTO, LTR, RTL];
+        let dirs: [3]Direction = [Direction.AUTO, Direction.LTR, Direction.RTL];
         for k in @as(usize, 0)..3 {
             if ((bits >> @as(usize, k)) & 1) == 0 {
                 continue;
@@ -1015,11 +1018,11 @@ fn run_char_test(file: []u8) ![2]usize {
             order.push(parse_uint(tok))!;
         }
         let d = parse_uint(strs.trim(f_dir));
-        let mut dir = AUTO;
+        let mut dir = Direction.AUTO;
         if d == 0 {
-            dir = LTR;
+            dir = Direction.LTR;
         } else if d == 1 {
-            dir = RTL;
+            dir = Direction.RTL;
         }
         cases += 1;
         let mut p = Paragraph.init(cps.items(), dir)!;
@@ -1042,7 +1045,7 @@ test "conformance (BidiTest.txt, BidiCharacterTest.txt, when installed)" {
 test "mixed text" {
     // "abc" then Hebrew alef bet gimel then "1 2"
     let cps: [9]u32 = ['a', 'b', 'c', ' ', 0x5d0, 0x5d1, 0x5d2, ' ', '1'];
-    let mut p = Paragraph.init(cps[..], AUTO)!;
+    let mut p = Paragraph.init(cps[..], Direction.AUTO)!;
     defer p.deinit();
     @expect_eq(p.level, 0);
     @expect_eq(p.levels[4], 1);
@@ -1053,7 +1056,7 @@ test "mixed text" {
         @expect_eq(ord[k], want[k]);
     }
     let rtl: [3]u32 = [0x5d0, ' ', 'x'];
-    let mut q = Paragraph.init(rtl[..], AUTO)!;
+    let mut q = Paragraph.init(rtl[..], Direction.AUTO)!;
     defer q.deinit();
     @expect_eq(q.level, 1);
 }

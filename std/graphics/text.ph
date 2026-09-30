@@ -83,12 +83,13 @@ pub struct Span {
 pub struct Options {
     width: f64,  // the longest a line may be (0: lines break only at newlines)
     align: Align,
-    direction: i32,     // bidi.AUTO, bidi.LTR or bidi.RTL, for each paragraph
-    line_spacing: f64,  // a multiple of the natural line height
-    tab_stops: f64,     // tabs advance to the next multiple of this (0: 4 spaces of the font)
+    direction: bidi.Direction,  // for each paragraph
+    line_spacing: f64,          // a multiple of the natural line height
+    tab_stops: f64,             // tabs advance to the next multiple of this (0: 4 spaces of the font)
 
     pub fn init(width: f64) Options {
-        return Options.{ width: width, align: Align.START, direction: bidi.AUTO, line_spacing: 1.0, tab_stops: 0.0 };
+        return Options.{ width: width, align: Align.START, direction: bidi.Direction.AUTO, line_spacing: 1.0,
+                         tab_stops: 0.0 };
     }
 }
 

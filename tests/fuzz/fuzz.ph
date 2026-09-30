@@ -170,7 +170,7 @@ fn run(t: []u8, d: []u8) !void {
             v[k] = it.next() catch break;
             k += 1;
         }
-        let mut p = bidi.Paragraph.init(v, bidi.AUTO)!;
+        let mut p = bidi.Paragraph.init(v, bidi.Direction.AUTO)!;
         let order = p.visual_order(0, v.len)!;
         mem.free(order);
         p.deinit();
