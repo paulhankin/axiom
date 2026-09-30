@@ -3,13 +3,14 @@
 codebooks, dequantisation values, TNS and LTP coefficients and the sine and
 KBD windows) from FFmpeg's AAC decoder, as FFmpeg computes them.
 
-    for f in aactab.c aactab.h; do
+    for f in aactab.c aactab.h aacsbrdata.h sbrdsp_template.c aacpsdata.c; do
         curl -sO https://raw.githubusercontent.com/FFmpeg/FFmpeg/n6.1.1/libavcodec/$f
     done
     tools/gen_aac_tables.py .
 
 The KBD windows use FFmpeg's own Bessel function (av_bessel_i0, from
-libavutil through ctypes).
+libavutil through ctypes); the parametric stereo tables are computed as
+FFmpeg's ps_tableinit computes them, with the C library's float functions.
 """
 import ctypes
 import ctypes.util
@@ -59,8 +60,13 @@ def f32(x):
 
 
 def lit(v):
-    v = re.sub(r'^Q3[01]\((.*)\)$', r'\1', v.strip()).rstrip('fF')
-    return f32(float(v))
+    v = v.strip()
+    neg = v.startswith('-Q')
+    if neg:
+        v = v[1:]
+    v = re.sub(r'^Q\d+\((.*)\)$', r'\1', v).strip().rstrip('fF')
+    x = float(v)
+    return f32(-x if neg else x)
 
 
 def ints(vals):
@@ -112,7 +118,7 @@ for k in range(1, 12):
     codes += c
     bits += b
 starts.append(len(codes))
-emit('SPECTRAL_CODES', 'u16', codes, 'the spectral codebooks 1-11, one after another')
+emit('SPECTRAL_CODES', 'u32', codes, 'the spectral codebooks 1-11, one after another')
 emit('SPECTRAL_BITS', 'u8', bits)
 emit('SPECTRAL_START', 'u16', starts)
 emit('VALS', 'f32', [lit(v) for v in array(tab, 'codebook_vector10_vals')], 'i^(4/3) for 0 <= i < 16, as FFmpeg rounds them')
@@ -162,6 +168,169 @@ emit('SINE_1024', 'f32', sine(1024), 'the rising halves of the windows')
 emit('SINE_128', 'f32', sine(128))
 emit('KBD_1024', 'f32', kbd(4.0, 1024))
 emit('KBD_128', 'f32', kbd(6.0, 128))
+
+# --- spectral band replication ---------------------------------------------
+sbr = read('aacsbrdata.h')
+names = ['t_huffman_env_1_5dB', 'f_huffman_env_1_5dB', 't_huffman_env_bal_1_5dB', 'f_huffman_env_bal_1_5dB',
+         't_huffman_env_3_0dB', 'f_huffman_env_3_0dB', 't_huffman_env_bal_3_0dB', 'f_huffman_env_bal_3_0dB',
+         't_huffman_noise_3_0dB', 't_huffman_noise_bal_3_0dB']
+codes = []
+bits = []
+starts = []
+for nm in names:
+    starts.append(len(codes))
+    c = ints(array(sbr, nm + '_codes'))
+    b = ints(array(sbr, nm + '_bits'))
+    assert len(c) == len(b)
+    codes += c
+    bits += b
+starts.append(len(codes))
+emit('SBR_HUFF_CODES', 'u32', codes, 'the SBR envelope and noise codebooks, one after another (FFmpeg\'s order)')
+emit('SBR_HUFF_BITS', 'u8', bits)
+emit('SBR_HUFF_START', 'u16', starts)
+emit('SBR_OFFSET', 'i8', ints(array(sbr, 'sbr_offset')), '[6][16]')
+emit('SBR_QMF_WINDOW', 'f32', [lit(v) for v in array(sbr, 'sbr_qmf_window_us')], 'the synthesis window (every other value is the analysis window)')
+dsp = read('sbrdsp_template.c')
+emit('SBR_NOISE', 'f32', [lit(v) for v in array(dsp, 'AAC_RENAME(ff_sbr_noise_table)')], '[512][2]')
+
+# --- parametric stereo -------------------------------------------------------
+psd = read('aacpsdata.c')
+names = ['huff_iid_df1', 'huff_iid_dt1', 'huff_iid_df0', 'huff_iid_dt0', 'huff_icc_df', 'huff_icc_dt',
+         'huff_ipd_df', 'huff_ipd_dt', 'huff_opd_df', 'huff_opd_dt']
+codes = []
+bits = []
+starts = []
+for nm in names:
+    starts.append(len(codes))
+    c = ints(array(psd, nm + '_codes'))
+    b = ints(array(psd, nm + '_bits'))
+    assert len(c) == len(b)
+    codes += c
+    bits += b
+starts.append(len(codes))
+emit('PS_HUFF_CODES', 'u32', codes, 'the PS codebooks, one after another (FFmpeg\'s order)')
+emit('PS_HUFF_BITS', 'u8', bits)
+emit('PS_HUFF_START', 'u16', starts)
+emit('PS_HUFF_OFFSET', 'i8', ints(array(psd, 'huff_offset')))
+emit('PS_K_TO_I_20', 'i8', ints(array(psd, 'ff_k_to_i_20')))
+emit('PS_K_TO_I_34', 'i8', ints(array(psd, 'ff_k_to_i_34')))
+
+libm = ctypes.CDLL(ctypes.util.find_library('m'))
+for fn in ('cosf', 'sinf', 'atanf', 'sqrtf'):
+    getattr(libm, fn).restype = ctypes.c_float
+    getattr(libm, fn).argtypes = [ctypes.c_float]
+libm.atan2f.restype = ctypes.c_float
+libm.atan2f.argtypes = [ctypes.c_float, ctypes.c_float]
+libm.hypot.restype = ctypes.c_double
+libm.hypot.argtypes = [ctypes.c_double, ctypes.c_double]
+libm.cos.restype = ctypes.c_double
+libm.cos.argtypes = [ctypes.c_double]
+libm.sin.restype = ctypes.c_double
+libm.sin.argtypes = [ctypes.c_double]
+
+
+def F(x):
+    return struct.unpack('f', struct.pack('f', x))[0]
+
+
+SQRT2 = 1.41421356237309504880
+SQRT1_2 = 0.70710678118654752440
+ipd_sin = [F(v) for v in (0, SQRT1_2, 1, SQRT1_2, 0, -SQRT1_2, -1, -SQRT1_2)]
+ipd_cos = [F(v) for v in (1, SQRT1_2, 0, -SQRT1_2, -1, -SQRT1_2, 0, SQRT1_2)]
+pd_re = []
+pd_im = []
+for pd0 in range(8):
+    for pd1 in range(8):
+        for pd2 in range(8):
+            re = F(F(F(F(0.25 * ipd_cos[pd0]) + F(0.5 * ipd_cos[pd1])) + ipd_cos[pd2]))
+            im = F(F(F(F(0.25 * ipd_sin[pd0]) + F(0.5 * ipd_sin[pd1])) + ipd_sin[pd2]))
+            mag = F(1 / libm.hypot(im, re))
+            pd_re.append(f32(F(re * mag)))
+            pd_im.append(f32(F(im * mag)))
+emit('PS_PD_RE_SMOOTH', 'f32', pd_re)
+emit('PS_PD_IM_SMOOTH', 'f32', pd_im)
+iid_dq = [0.05623413251903, 0.12589254117942, 0.19952623149689, 0.31622776601684, 0.44668359215096, 0.63095734448019,
+          0.79432823472428, 1, 1.25892541179417, 1.58489319246111, 2.23872113856834, 3.16227766016838,
+          5.01187233627272, 7.94328234724282, 17.7827941003892, 0.00316227766017, 0.00562341325190, 0.01,
+          0.01778279410039, 0.03162277660168, 0.05623413251903, 0.07943282347243, 0.11220184543020,
+          0.15848931924611, 0.22387211385683, 0.31622776601684, 0.39810717055350, 0.50118723362727,
+          0.63095734448019, 0.79432823472428, 1, 1.25892541179417, 1.58489319246111, 1.99526231496888,
+          2.51188643150958, 3.16227766016838, 4.46683592150963, 6.30957344480193, 8.91250938133745,
+          12.5892541179417, 17.7827941003892, 31.6227766016838, 56.2341325190349, 100, 177.827941003892,
+          316.227766016837]
+icc_invq = [F(v) for v in (1, 0.937, 0.84118, 0.60092, 0.36764, 0, -0.589, -1)]
+acos_icc = [F(v) for v in (0, 0.35685527, 0.57133466, 0.92614472, 1.1943263, math.pi / 2, 2.2006171, math.pi)]
+ha = []
+hb = []
+for iid in range(46):
+    c = F(iid_dq[iid])
+    c1 = F(F(SQRT2) / libm.sqrtf(F(1.0 + F(c * c))))
+    c2 = F(c * c1)
+    for icc in range(8):
+        alpha = F(0.5 * acos_icc[icc])
+        beta = F(F(alpha * F(c1 - c2)) * F(SQRT1_2))
+        ha += [F(c2 * libm.cosf(F(beta + alpha))), F(c1 * libm.cosf(F(beta - alpha))),
+               F(c2 * libm.sinf(F(beta + alpha))), F(c1 * libm.sinf(F(beta - alpha)))]
+        rho = max(icc_invq[icc], F(0.05))
+        alpha = F(0.5 * libm.atan2f(F(F(2.0 * c) * rho), F(F(c * c) - 1.0)))
+        mu = F(c + F(1.0 / c))
+        mu = libm.sqrtf(F(1 + F(F(F(F(4 * rho) * rho) - 4) / F(mu * mu))))
+        gamma = libm.atanf(libm.sqrtf(F(F(1.0 - mu) / F(1.0 + mu))))
+        if alpha < 0:
+            alpha = F(alpha + math.pi / 2)
+        ac, as_, gc, gs = libm.cosf(alpha), libm.sinf(alpha), libm.cosf(gamma), libm.sinf(gamma)
+        hb += [F(SQRT2 * ac * gc), F(SQRT2 * as_ * gc), F(-SQRT2 * as_ * gs), F(SQRT2 * ac * gs)]
+emit('PS_HA', 'f32', [f32(v) for v in ha], '[46][8][4]')
+emit('PS_HB', 'f32', [f32(v) for v in hb], '[46][8][4]')
+f_center_20 = [-3, -1, 1, 3, 5, 7, 10, 14, 18, 22]
+f_center_34 = [2, 6, 10, 14, 18, 22, 26, 30, 34, -10, -6, -2, 51, 57, 15, 21, 27, 33, 39, 45, 54, 66, 78, 42, 102, 66,
+               78, 90, 102, 114, 126, 90]
+links = [F(0.43), F(0.75), F(0.347)]
+gain = F(0.39)
+qf = []
+phi = []
+for is34, nbands in ((0, 30), (1, 50)):
+    for k in range(50):
+        if k >= nbands:
+            qf += [0.0] * 6
+            phi += [0.0] * 2
+            continue
+        if is34:
+            fc = f_center_34[k] / 24.0 if k < len(f_center_34) else float(F(k - 26.5))
+        else:
+            fc = f_center_20[k] * 0.125 if k < len(f_center_20) else float(F(k - 6.5))
+        for m in range(3):
+            th = -math.pi * links[m] * fc
+            qf += [F(libm.cos(th)), F(libm.sin(th))]
+        th = -math.pi * gain * fc
+        phi += [F(libm.cos(th)), F(libm.sin(th))]
+emit('PS_Q_FRACT_ALLPASS', 'f32', [f32(v) for v in qf], '[2][50][3][2]')
+emit('PS_PHI_FRACT', 'f32', [f32(v) for v in phi], '[2][50][2]')
+
+
+def filters(proto, bands):
+    out = []
+    for q in range(bands):
+        for n in range(8):
+            if n == 7:
+                out += [0.0, 0.0]
+                continue
+            th = 2 * math.pi * (q + 0.5) * (n - 6) / bands
+            out += [F(F(proto[n]) * libm.cos(th)), F(F(proto[n]) * -libm.sin(th))]
+    return [f32(v) for v in out]
+
+
+g0_q8 = [0.00746082949812, 0.02270420949825, 0.04546865930473, 0.07266113929591, 0.09885108575264, 0.11793710567217,
+         0.125]
+g0_q12 = [0.04081179924692, 0.03812810994926, 0.05144908135699, 0.06399831151592, 0.07428313801106,
+          0.08100347892914, 0.08333333333333]
+g1_q8 = [0.01565675600122, 0.03752716391991, 0.05417891378782, 0.08417044116767, 0.10307344158036, 0.12222452249753,
+         0.125]
+g2_q4 = [-0.05908211155639, -0.04871498374946, 0.0, 0.07778723915851, 0.16486303567403, 0.23279856662996, 0.25]
+emit('PS_F20_0_8', 'f32', filters(g0_q8, 8), '[8][8][2]')
+emit('PS_F34_0_12', 'f32', filters(g0_q12, 12), '[12][8][2]')
+emit('PS_F34_1_8', 'f32', filters(g1_q8, 8), '[8][8][2]')
+emit('PS_F34_2_4', 'f32', filters(g2_q4, 4), '[4][8][2]')
 
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, 'w') as f:

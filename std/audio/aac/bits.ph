@@ -1,0 +1,274 @@
+// =============================================================================
+// std/audio/aac/bits.ph - what the AAC, SBR and PS decoders share: a bit
+// reader (most significant bit first), Huffman decoding from code tables,
+// and a DCT-IV (for the inverse MDCTs and the QMF banks).
+// =============================================================================
+
+import "../../math.ph" as math;
+import "../../mem.ph" as mem;
+
+error { InvalidAudio, OutOfMemory }
+
+pub struct Bits {
+    buf: []u8,
+    pos: usize,
+    over: bool,
+
+    pub fn init(buf: []u8) Bits {
+        return Bits.{ buf: buf, pos: 0, over: false };
+    }
+
+    /// The bits left (negative after reading past the end).
+    pub fn left(self: *Bits) i64 {
+        return (@bit_cast(i64, @as(u64, self.buf.len)) * 8) - @bit_cast(i64, @as(u64, self.pos));
+    }
+
+    pub fn get1(self: *mut Bits) u32 {
+        let byte = self.pos >> 3;
+        if byte >= self.buf.len {
+            self.over = true;
+            self.pos += 1;
+            return 0;
+        }
+        let b = (@as(u32, self.buf[byte]) >> @truncate(u32, 7 - (self.pos & 7))) & 1;
+        self.pos += 1;
+        return b;
+    }
+
+    /// n <= 32 bits; zeros past the end.
+    pub fn get(self: *mut Bits, n: u32) u32 {
+        let mut v: u32 = 0;
+        let mut k = n;
+        while k > 0 {
+            let byte = self.pos >> 3;
+            if byte >= self.buf.len {
+                self.over = true;
+                self.pos += @as(usize, k);
+                return v << k;
+            }
+            let avail = 8 - @truncate(u32, self.pos & 7);
+            let take = @min(avail, k);
+            let bits = (@as(u32, self.buf[byte]) >> (avail - take)) & ((@as(u32, 1) << take) - 1);
+            v = (v << take) | bits;
+            self.pos += @as(usize, take);
+            k -= take;
+        }
+        return v;
+    }
+
+    pub fn geti(self: *mut Bits, n: u32) i32 {
+        return @bit_cast(i32, self.get(n));
+    }
+
+    /// The next n bits without consuming them.
+    pub fn peek(self: *Bits, n: u32) u32 {
+        let mut c = self.*;
+        return c.get(n);
+    }
+
+    pub fn skip(self: *mut Bits, n: usize) void {
+        self.pos += n;
+        if (self.pos >> 3) > self.buf.len {
+            self.over = true;
+        }
+    }
+
+    pub fn align(self: *mut Bits) void {
+        self.pos = (self.pos + 7) & ~@as(usize, 7);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Huffman codebooks: trees of nodes; a leaf is -(symbol + 1)
+// -----------------------------------------------------------------------------
+
+pub struct Huff {
+    nodes: []mut i32,
+    root: [16]usize,
+    used: usize,
+
+    pub fn deinit(self: *mut Huff) void {
+        mem.free(self.nodes);
+    }
+}
+
+fn add(h: *mut Huff, root: usize, code: u32, len: u32, sym: i32) !void {
+    let mut node = root;
+    let mut i = len;
+    while i > 0 {
+        i -= 1;
+        let slot = (node * 2) + @as(usize, (code >> i) & 1);
+        if i == 0 {
+            if h.nodes[slot] != 0 {
+                return error.InvalidAudio;
+            }
+            h.nodes[slot] = -(sym + 1);
+        } else {
+            let v = h.nodes[slot];
+            if v < 0 {
+                return error.InvalidAudio;
+            }
+            if v == 0 {
+                h.nodes[slot] = @bit_cast(i32, @truncate(u32, h.used));
+                node = h.used;
+                h.used += 1;
+            } else {
+                node = @as(usize, @bit_cast(u32, v));
+            }
+        }
+    }
+}
+
+/// Codebook i holds the codes codes[starts[i]..starts[i + 1]] (of lengths
+/// lens), for the symbols 0, 1, ...
+pub fn build(h: *mut Huff, codes: []u32, lens: []u8, starts: []u16) !void {
+    let n = @as(usize, starts[starts.len - 1]);
+    h.nodes = mem.alloc_zeroed.[i32](2 * (n + 16))!;
+    h.used = 0;
+    for b in @as(usize, 0)..(starts.len - 1) {
+        h.root[b] = h.used;
+        h.used += 1;
+        let s = @as(usize, starts[b]);
+        for i in s..@as(usize, starts[b + 1]) {
+            add(h, h.root[b], codes[i], @as(u32, lens[i]), @bit_cast(i32, @truncate(u32, i - s))) catch |e| {
+                mem.free(h.nodes);
+                return e;
+            };
+        }
+    }
+}
+
+/// The next symbol of codebook book, or -1 for an invalid code.
+pub fn decode(h: *Huff, book: usize, b: *mut Bits) i32 {
+    let mut node = h.root[book];
+    for _i in @as(usize, 0)..24 {
+        let v = h.nodes[(node * 2) + @as(usize, b.get1())];
+        if v < 0 {
+            return -v - 1;
+        }
+        if v == 0 {
+            return -1;
+        }
+        node = @as(usize, @bit_cast(u32, v));
+    }
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+// DCT-IV
+// -----------------------------------------------------------------------------
+
+/// Twiddle factors for a DCT-IV of n points (a power of two, 4 to 1024).
+pub struct Tw {
+    n: usize,
+    pre_c: [512]f64,
+    pre_s: [512]f64,
+    post_c: [512]f64,
+    post_s: [512]f64,
+    fft_c: [256]f64,
+    fft_s: [256]f64,
+    // scratch
+    re: [512]f64,
+    im: [512]f64,
+    x: [1024]f64,
+    u: [1024]f64,
+}
+
+pub fn twiddles(tw: *mut Tw, n: usize) void {
+    tw.n = n;
+    let h = n / 2;
+    let nf = @float_from_int(f64, n);
+    for j in @as(usize, 0)..h {
+        let a = (-3.14159265358979323846 * @float_from_int(f64, (4 * j) + 1)) / (4.0 * nf);
+        tw.pre_c[j] = math.cos(a);
+        tw.pre_s[j] = math.sin(a);
+        let b = (-3.14159265358979323846 * @float_from_int(f64, j)) / nf;
+        tw.post_c[j] = math.cos(b);
+        tw.post_s[j] = math.sin(b);
+    }
+    for k in @as(usize, 0)..(h / 2) {
+        let a = (-6.283185307179586476925 * @float_from_int(f64, k)) / @float_from_int(f64, h);
+        tw.fft_c[k] = math.cos(a);
+        tw.fft_s[k] = math.sin(a);
+    }
+}
+
+/// An in-place complex FFT of tw.re/tw.im, n = 2^k points (n = tw.n / 2).
+fn fft_tw(tw: *mut Tw, n: usize) void {
+    let re = tw.re[..];
+    let im = tw.im[..];
+    let mut j: usize = 0;
+    for i in @as(usize, 1)..n {
+        let mut bit = n >> 1;
+        while (j & bit) != 0 {
+            j ^= bit;
+            bit = bit >> 1;
+        }
+        j ^= bit;
+        if i < j {
+            let tr = re[i];
+            re[i] = re[j];
+            re[j] = tr;
+            let ti = im[i];
+            im[i] = im[j];
+            im[j] = ti;
+        }
+    }
+    let mut len: usize = 2;
+    while len <= n {
+        let half = len >> 1;
+        let step = n / len;
+        for k in @as(usize, 0)..half {
+            let wr = tw.fft_c[k * step];
+            let wi = tw.fft_s[k * step];
+            let mut i = k;
+            while i < n {
+                let p = i + half;
+                let xr = (re[p] * wr) - (im[p] * wi);
+                let xi = (re[p] * wi) + (im[p] * wr);
+                re[p] = re[i] - xr;
+                im[p] = im[i] - xi;
+                re[i] = re[i] + xr;
+                im[i] = im[i] + xi;
+                i += len;
+            }
+        }
+        len = len << 1;
+    }
+}
+
+/// u[n] = scale * sum_k x[k] cos(pi/N (n + 1/2)(k + 1/2)), N = tw.n.
+pub fn dct4(tw: *mut Tw, x: []f64, u: []mut f64, scale: f64) void {
+    let n = tw.n;
+    let h = n / 2;
+    for j in @as(usize, 0)..h {
+        let c = tw.pre_c[j];
+        let s = tw.pre_s[j];
+        let xr = x[2 * j];
+        let xi = x[(n - 1) - (2 * j)];
+        tw.re[j] = (xr * c) - (xi * s);
+        tw.im[j] = (xr * s) + (xi * c);
+    }
+    fft_tw(tw, h);
+    for p in @as(usize, 0)..h {
+        let c = tw.post_c[p];
+        let s = tw.post_s[p];
+        let wr = (tw.re[p] * c) - (tw.im[p] * s);
+        let wi = (tw.re[p] * s) + (tw.im[p] * c);
+        u[2 * p] = wr * scale;
+        u[(n - 1) - (2 * p)] = -wi * scale;
+    }
+}
+
+/// FFmpeg's inverse MDCT of n = tw.n coefficients (av_tx, "half" output):
+/// out[m] = scale * sum_k in[k] cos(pi/n (n - 1 - m + 1/2)(k + 1/2)).
+pub fn imdct(tw: *mut Tw, inp: []f32, out: []mut f32, scale: f64) void {
+    let n = tw.n;
+    for k in @as(usize, 0)..n {
+        tw.x[k] = @as(f64, inp[k]);
+    }
+    dct4(tw, tw.x[..n], tw.u[..n], scale);
+    for m in @as(usize, 0)..n {
+        out[m] = @float_cast(f32, tw.u[(n - 1) - m]);
+    }
+}

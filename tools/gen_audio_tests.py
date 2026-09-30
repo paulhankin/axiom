@@ -2,7 +2,10 @@
 """Generates std/audio/testdata: Opus streams from libopus (through ffmpeg)
 in each of its modes, with libopus's own decoding (through ctypes) as
 16-bit PCM to compare with; AAC streams (ADTS and MP4) from FFmpeg's
-encoder in each of its profiles and tools, with FFmpeg's decoding.
+encoder in each of its profiles and tools, and HE-AAC (v1 and v2) streams
+from the Fraunhofer encoder (fdk-aac's aac-enc, built from
+https://github.com/mstorsjo/fdk-aac; its path in FDK_AAC_ENC), with
+FFmpeg's decoding.
 
     tools/gen_audio_tests.py [opus|aac ...]
 """
@@ -234,10 +237,96 @@ def aac():
     # AAC Main (prediction) and AAC LTP
     enc('main', 'm4a', signal(0.5, 2, 44100, seed=9), 44100, ['-profile:a', 'aac_main', '-aac_pred', '1', '-strict', '-2', '-b:a', '96k'])
     enc('ltp', 'aac', signal(0.5, 2, 44100, seed=10), 44100, ['-profile:a', 'aac_ltp', '-aac_ltp', '1', '-strict', '-2', '-b:a', '96k'])
+    # HE-AAC: spectral band replication, parametric stereo, in ADTS and in
+    # MP4 with implicit and explicit signalling
+    enc_bin = os.environ.get('FDK_AAC_ENC')
+    if enc_bin:
+        def fdk(name, frames, rate, aot, bitrate, explicit=None):
+            write_wav(tmp, frames, rate)
+            adts = os.path.join(d, name + '.aac')
+            env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(enc_bin))
+            subprocess.run([enc_bin, '-t', str(aot), '-r', str(bitrate), tmp, adts], check=True, env=env,
+                           capture_output=True)
+            out = adts
+            ext = 'aac'
+            if explicit is not None:
+                ext = 'm4a'
+                out = os.path.join(d, name + '.m4a')
+                subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', adts, '-c', 'copy', out], check=True)
+                os.remove(adts)
+                if explicit:
+                    explicit_sbr(out, aot, len(frames[0]), rate)
+            raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', out, '-f', 'f32le', '-'], check=True,
+                                 capture_output=True).stdout
+            pcm = struct.unpack('<%df' % (len(raw) // 4), raw)
+            ch = 2  # FFmpeg decodes mono HE-AAC as stereo (parametric stereo may follow)
+            with open(os.path.join(d, name + '.pcm'), 'wb') as f:
+                f.write(b''.join(struct.pack('<h', max(-32768, min(32767, int(math.floor(v * 32768 + 0.5)))))
+                                 for v in pcm))
+            cases.append('%s %s %d %d %d %d' % (name, ext, ch, len(pcm) // ch, rate, len(pcm) // ch))
+
+        fdk('he', signal(0.5, 2, 44100, seed=11), 44100, 5, 48000)
+        fdk('he_mono', signal(0.5, 1, 48000, seed=12), 48000, 5, 32000)
+        fdk('he_v2', signal(0.5, 2, 44100, seed=13), 44100, 29, 32000)
+        fdk('he_implicit', signal(0.4, 2, 32000, seed=14), 32000, 5, 40000, explicit=False)
+        fdk('he_explicit', signal(0.4, 2, 44100, seed=15), 44100, 5, 48000, explicit=True)
+        fdk('he_v2_explicit', signal(0.4, 2, 48000, seed=16), 48000, 29, 32000, explicit=True)
     os.remove(tmp)
     with open(os.path.join(d, 'cases.txt'), 'w') as f:
         f.write('\n'.join(cases) + '\n')
     print(len(cases), 'aac cases')
+
+
+RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+
+
+def explicit_sbr(path, aot, channels, rate):
+    """Rewrites an MP4's AudioSpecificConfig to signal SBR (and PS)
+    explicitly (object type 5 or 29) instead of implicitly."""
+    def asc():
+        core = RATES.index(rate // 2)
+        chan = 1 if aot == 29 else channels
+        bits = '{:05b}{:04b}{:04b}{:04b}{:05b}000'.format(aot, core, chan, RATES.index(rate), 2)
+        bits += '0' * (-len(bits) % 8)
+        return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+
+    def desc(tag, payload):
+        n = len(payload)
+        return bytes([tag, 0x80 | (n >> 21) & 0x7f, 0x80 | (n >> 14) & 0x7f, 0x80 | (n >> 7) & 0x7f, n & 0x7f]) + payload
+
+    def rebuild(data, o, end):
+        out = b''
+        while o < end:
+            size, typ = struct.unpack('>I4s', data[o:o + 8])
+            body = data[o + 8:o + size]
+            if typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl'):
+                body = rebuild(data, o + 8, o + size)
+            elif typ == b'stsd':
+                entry = body[8:]
+                esize, etyp = struct.unpack('>I4s', entry[:8])
+                fields = entry[8:36]
+                kids = entry[36:esize]
+                k = 0
+                new = b''
+                while k < len(kids):
+                    ksize, ktyp = struct.unpack('>I4s', kids[k:k + 8])
+                    if ktyp == b'esds':
+                        kb = kids[k + 8:k + ksize]
+                        es_hdr = kb[9:12]
+                        dc_fixed = kb[17:30]
+                        esd = desc(3, es_hdr + desc(4, dc_fixed + desc(5, asc())) + desc(6, b'\x02'))
+                        new += struct.pack('>I4s', 12 + len(esd), b'esds') + kb[:4] + esd
+                    else:
+                        new += kids[k:k + ksize]
+                    k += ksize
+                body = body[:8] + struct.pack('>I4s', 36 + len(new), etyp) + fields + new
+            out += struct.pack('>I4s', 8 + len(body), typ) + body
+            o += size
+        return out
+
+    data = open(path, 'rb').read()
+    assert data.find(b'moov') > data.find(b'mdat')  # chunk offsets stay valid
+    open(path, 'wb').write(rebuild(data, 0, len(data)))
 
 
 for what in sys.argv[1:] or ['opus']:

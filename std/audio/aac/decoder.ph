@@ -4,12 +4,15 @@
 // pair, LFE), program configuration, section and scalefactor data, the
 // spectral Huffman codebooks, pulses, noise substitution, M/S and
 // intensity stereo, Main-profile prediction, long-term prediction, TNS,
-// the sine and KBD windows and the inverse MDCT. Follows FFmpeg's float
-// decoder (libavcodec/aacdec_template.c), with the same arithmetic.
+// the sine and KBD windows and the inverse MDCT; spectral band replication
+// and parametric stereo through sbr.ph. Follows FFmpeg's float decoder
+// (libavcodec/aacdec_template.c), with the same arithmetic.
 // =============================================================================
 
 import "../../math.ph" as math;
 import "../../mem.ph" as mem;
+import "bits.ph" as bitio;
+import "sbr.ph" as sbr;
 import "tables.ph" as t;
 
 error { InvalidAudio, Unsupported, OutOfMemory }
@@ -50,71 +53,6 @@ fn si(v: usize) i32 {
 }
 
 // -----------------------------------------------------------------------------
-// Bits
-// -----------------------------------------------------------------------------
-
-pub struct Bits {
-    buf: []u8,
-    pos: usize,
-    over: bool,
-
-    pub fn init(buf: []u8) Bits {
-        return Bits.{ buf: buf, pos: 0, over: false };
-    }
-
-    pub fn left(self: *Bits) i64 {
-        return (@as(i64, @bit_cast(i64, @as(u64, self.buf.len))) * 8) - @bit_cast(i64, @as(u64, self.pos));
-    }
-
-    pub fn get1(self: *mut Bits) u32 {
-        let byte = self.pos >> 3;
-        if byte >= self.buf.len {
-            self.over = true;
-            self.pos += 1;
-            return 0;
-        }
-        let b = (@as(u32, self.buf[byte]) >> @truncate(u32, 7 - (self.pos & 7))) & 1;
-        self.pos += 1;
-        return b;
-    }
-
-    pub fn get(self: *mut Bits, n: u32) u32 {
-        let mut v: u32 = 0;
-        let mut k = n;
-        while k > 0 {
-            let byte = self.pos >> 3;
-            if byte >= self.buf.len {
-                self.over = true;
-                self.pos += @as(usize, k);
-                return v << k;
-            }
-            let avail = 8 - @truncate(u32, self.pos & 7);
-            let take = @min(avail, k);
-            let bits = (@as(u32, self.buf[byte]) >> (avail - take)) & ((@as(u32, 1) << take) - 1);
-            v = (v << take) | bits;
-            self.pos += @as(usize, take);
-            k -= take;
-        }
-        return v;
-    }
-
-    pub fn geti(self: *mut Bits, n: u32) i32 {
-        return @bit_cast(i32, self.get(n));
-    }
-
-    pub fn skip(self: *mut Bits, n: usize) void {
-        self.pos += n;
-        if (self.pos >> 3) > self.buf.len {
-            self.over = true;
-        }
-    }
-
-    pub fn align(self: *mut Bits) void {
-        self.pos = (self.pos + 7) & ~@as(usize, 7);
-    }
-}
-
-// -----------------------------------------------------------------------------
 // Audio specific configuration
 // -----------------------------------------------------------------------------
 
@@ -128,18 +66,20 @@ pub struct Config {
     sampling_index: i32,
     sample_rate: i32,
     chan_config: i32,
-    sbr: bool,
+    sbr: i32,       // spectral band replication: 1, 0 or -1 (not known yet)
+    ps: i32,        // parametric stereo: 1, 0 or -1
+    ext_rate: i32,  // the output rate with SBR (0: twice the core rate)
     // from a program configuration element (chan_config 0)
     nelems: usize,
     elems: [64]Elem,
 }
 
 pub fn empty_config() Config {
-    return Config.{ object_type: 0, sampling_index: 0, sample_rate: 0, chan_config: 0, sbr: false, nelems: 0,
+    return Config.{ object_type: 0, sampling_index: 0, sample_rate: 0, chan_config: 0, sbr: -1, ps: -1, ext_rate: 0, nelems: 0,
                     elems: [Elem.{ typ: 0, id: 0 }; 64] };
 }
 
-fn get_aot(b: *mut Bits) i32 {
+fn get_aot(b: *mut bitio.Bits) i32 {
     let mut aot = b.geti(5);
     if aot == 31 {
         aot = 32 + b.geti(6);
@@ -147,7 +87,7 @@ fn get_aot(b: *mut Bits) i32 {
     return aot;
 }
 
-fn get_rate(b: *mut Bits, index: *mut i32) i32 {
+fn get_rate(b: *mut bitio.Bits, index: *mut i32) i32 {
     index.* = b.geti(4);
     if index.* == 15 {
         return b.geti(24);
@@ -196,7 +136,7 @@ fn rate_index(rate: i32) i32 {
 }
 
 /// A program configuration element's channel layout (into cfg.elems).
-fn decode_pce(b: *mut Bits, cfg: *mut Config, align_ref: usize) !void {
+fn decode_pce(b: *mut bitio.Bits, cfg: *mut Config, align_ref: usize) !void {
     b.skip(2);
     _ = b.get(4);
     let nfront = b.get(4);
@@ -246,16 +186,21 @@ fn decode_pce(b: *mut Bits, cfg: *mut Config, align_ref: usize) !void {
 
 /// Parses an AudioSpecificConfig (as in an MP4 esds box).
 pub fn parse_asc(data: []u8, cfg: *mut Config) !void {
-    let mut b = Bits.init(data);
+    let mut b = bitio.Bits.init(data);
     cfg.* = empty_config();
     let mut aot = get_aot(&mut b);
     let mut idx: i32 = 0;
     cfg.sample_rate = get_rate(&mut b, &mut idx);
     cfg.chan_config = b.geti(4);
-    if (aot == 5) or (aot == 29) {
-        cfg.sbr = true;
+    let mut explicit = false;
+    if (aot == 5) or ((aot == 29) and not (((b.peek(3) & 3) != 0) and ((b.peek(9) & 0x3f) == 0))) {
+        if aot == 29 {
+            cfg.ps = 1;
+        }
+        cfg.sbr = 1;
+        explicit = true;
         let mut eidx: i32 = 0;
-        _ = get_rate(&mut b, &mut eidx);
+        cfg.ext_rate = get_rate(&mut b, &mut eidx);
         aot = get_aot(&mut b);
     }
     cfg.object_type = aot;
@@ -269,6 +214,38 @@ pub fn parse_asc(data: []u8, cfg: *mut Config) !void {
         idx = rate_index(cfg.sample_rate);
     }
     cfg.sampling_index = idx;
+    if not explicit {
+        // backward compatible signalling: a sync extension after the config
+        let mut g = b;
+        while g.left() > 15 {
+            if g.peek(11) == 0x2b7 {
+                g.skip(11);
+                let ext = get_aot(&mut g);
+                if ext == 5 {
+                    cfg.sbr = g.geti(1);
+                    if cfg.sbr == 1 {
+                        let mut eidx: i32 = 0;
+                        cfg.ext_rate = get_rate(&mut g, &mut eidx);
+                        if cfg.ext_rate == cfg.sample_rate {
+                            cfg.sbr = -1;
+                        }
+                    }
+                }
+                if (g.left() > 11) and (g.get(11) == 0x548) {
+                    cfg.ps = g.geti(1);
+                }
+                break;
+            }
+            g.skip(1);
+        }
+    }
+    if cfg.sbr == 0 {
+        cfg.ps = 0;
+    }
+    let chans: [8]i32 = [0, 1, 2, 3, 4, 5, 6, 8];
+    if ((cfg.ps == -1) and (aot != AOT_LC)) or ((cfg.chan_config < 8) and (chans[us(cfg.chan_config)] >= 2)) {
+        cfg.ps = 0;
+    }
     // GASpecificConfig
     if b.get1() != 0 {
         return error.Unsupported; // 960-sample frames
@@ -286,81 +263,6 @@ pub fn parse_asc(data: []u8, cfg: *mut Config) !void {
     if b.over {
         return error.InvalidAudio;
     }
-}
-
-// -----------------------------------------------------------------------------
-// Huffman codebooks (trees of nodes; a leaf is -(symbol + 1))
-// -----------------------------------------------------------------------------
-
-struct Huff {
-    nodes: []mut i32,
-    root: [12]usize,
-    used: usize,
-}
-
-fn huff_add(h: *mut Huff, root: usize, code: u32, len: u32, sym: i32) !void {
-    let mut node = root;
-    let mut i = len;
-    while i > 0 {
-        i -= 1;
-        let bit = us(@bit_cast(i32, (code >> i) & 1));
-        let slot = (node * 2) + bit;
-        if i == 0 {
-            if h.nodes[slot] != 0 {
-                return error.InvalidAudio;
-            }
-            h.nodes[slot] = -(sym + 1);
-        } else {
-            let v = h.nodes[slot];
-            if v < 0 {
-                return error.InvalidAudio;
-            }
-            if v == 0 {
-                h.nodes[slot] = si(h.used);
-                node = h.used;
-                h.used += 1;
-            } else {
-                node = us(v);
-            }
-        }
-    }
-}
-
-fn huff_build(h: *mut Huff) !void {
-    let total = t.SF_CODE.len + t.SPECTRAL_CODES.len;
-    h.nodes = mem.alloc_zeroed.[i32](2 * (total + 16))!;
-    h.used = 0;
-    // 0: scalefactors; 1..11: spectral codebooks
-    h.root[0] = h.used;
-    h.used += 1;
-    for i in @as(usize, 0)..t.SF_CODE.len {
-        huff_add(h, h.root[0], t.SF_CODE[i], @as(u32, t.SF_BITS[i]), si(i))!;
-    }
-    for cb in @as(usize, 1)..12 {
-        h.root[cb] = h.used;
-        h.used += 1;
-        let s = @as(usize, t.SPECTRAL_START[cb - 1]);
-        let e = @as(usize, t.SPECTRAL_START[cb]);
-        for i in s..e {
-            huff_add(h, h.root[cb], @as(u32, t.SPECTRAL_CODES[i]), @as(u32, t.SPECTRAL_BITS[i]), si(i - s))!;
-        }
-    }
-}
-
-/// The next symbol, or -1 for an invalid code.
-fn huff_decode(h: *Huff, cb: usize, b: *mut Bits) i32 {
-    let mut node = h.root[cb];
-    for _i in @as(usize, 0)..20 {
-        let v = h.nodes[(node * 2) + us(@bit_cast(i32, b.get1()))];
-        if v < 0 {
-            return -v - 1;
-        }
-        if v == 0 {
-            return -1;
-        }
-        node = us(v);
-    }
-    return -1;
 }
 
 // -----------------------------------------------------------------------------
@@ -432,7 +334,8 @@ fn swb_off(ics: *Ics, i: i32) i32 {
 
 pub struct Decoder {
     cfg: Config,
-    huff: Huff,
+    sfh: bitio.Huff,
+    spec: bitio.Huff,
     chans: []mut Chan,
     nchans: usize,
     // channel of each element: [type (SCE, CPE, LFE)][id]
@@ -447,17 +350,75 @@ pub struct Decoder {
     temp: [128]f32,
     ltp_in: [2048]f32,
     ltp_freq: [1024]f32,
-    fft_re: [512]f64,
-    fft_im: [512]f64,
     configured: bool,
+    // spectral band replication, per element
+    nelems: usize,
+    elem_typ: [64]i32,
+    elem_ch: [64]usize,
+    slot_elem: [3][16]i32,
+    sbrs: []mut sbr.Sbr,
+    sbr_huff: bitio.Huff,
+    ps_huff: bitio.Huff,
+    sbr_ready: bool,
+    locked: bool,
+    dummy: [2048]f32,
+    tw64: bitio.Tw,
+    tw128: bitio.Tw,
+    tw1024: bitio.Tw,
 
     pub fn deinit(self: *mut Decoder) void {
-        mem.free(self.huff.nodes);
+        self.sfh.deinit();
+        self.spec.deinit();
         if self.chans.len > 0 {
             mem.free(self.chans);
         }
+        drop_sbr(self);
         mem.free(self.cbrt);
     }
+}
+
+fn drop_sbr(d: *mut Decoder) void {
+    if d.sbr_ready {
+        mem.free(d.sbrs);
+        d.sbr_huff.deinit();
+        d.ps_huff.deinit();
+        d.sbr_ready = false;
+    }
+}
+
+fn ensure_sbr(d: *mut Decoder) !void {
+    if d.sbr_ready {
+        return;
+    }
+    d.sbrs = mem.alloc_zeroed.[sbr.Sbr](@max(d.nelems, 1))!;
+    bitio.build(&mut d.sbr_huff, t.SBR_HUFF_CODES[..], t.SBR_HUFF_BITS[..], t.SBR_HUFF_START[..]) catch |e| {
+        mem.free(d.sbrs);
+        return e;
+    };
+    bitio.build(&mut d.ps_huff, t.PS_HUFF_CODES[..], t.PS_HUFF_BITS[..], t.PS_HUFF_START[..]) catch |e| {
+        d.sbr_huff.deinit();
+        mem.free(d.sbrs);
+        return e;
+    };
+    for i in @as(usize, 0)..d.nelems {
+        sbr.init(&mut d.sbrs[i], d.elem_typ[i]);
+    }
+    d.sbr_ready = true;
+}
+
+/// The output sample rate.
+pub fn output_rate(d: *Decoder) i32 {
+    if (d.cfg.sbr == 1) and (ext_rate(d) > d.cfg.sample_rate) {
+        return 2 * d.cfg.sample_rate;
+    }
+    return d.cfg.sample_rate;
+}
+
+fn ext_rate(d: *Decoder) i32 {
+    if d.cfg.ext_rate != 0 {
+        return d.cfg.ext_rate;
+    }
+    return 2 * d.cfg.sample_rate;
 }
 
 fn reset_pred(p: *mut Pred) void {
@@ -475,11 +436,21 @@ pub fn new(cfg: Config) ![]mut Decoder {
     let d = &mut dd[0];
     d.cfg = cfg;
     d.random_state = 0x1f2e3d4c;
+    bitio.twiddles(&mut d.tw64, 64);
+    bitio.twiddles(&mut d.tw128, 128);
+    bitio.twiddles(&mut d.tw1024, 1024);
     d.cbrt = mem.alloc.[f32](8192) catch |e| {
         mem.free(dd);
         return e;
     };
-    huff_build(&mut d.huff) catch |e| {
+    let sf_start: [2]u16 = [0, 121];
+    bitio.build(&mut d.sfh, t.SF_CODE[..], t.SF_BITS[..], sf_start[..]) catch |e| {
+        mem.free(d.cbrt);
+        mem.free(dd);
+        return e;
+    };
+    bitio.build(&mut d.spec, t.SPECTRAL_CODES[..], t.SPECTRAL_BITS[..], t.SPECTRAL_START[..]) catch |e| {
+        d.sfh.deinit();
         mem.free(d.cbrt);
         mem.free(dd);
         return e;
@@ -498,6 +469,13 @@ pub fn new(cfg: Config) ![]mut Decoder {
         mem.free(dd);
         return e;
     };
+    if d.cfg.ps == 1 {
+        ps_stereo(d) catch |e| {
+            d.deinit();
+            mem.free(dd);
+            return e;
+        };
+    }
     return dd;
 }
 
@@ -519,11 +497,21 @@ fn add_chan(d: *mut Decoder, typ: i32, id: i32, n: *mut usize) !void {
         return error.Unsupported;
     }
     d.slot[k][us(id)] = si(n.*);
+    d.slot_elem[k][us(id)] = si(d.nelems);
+    let mut et = typ;
+    if typ == 2 {
+        et = TYPE_LFE;
+    }
+    d.elem_typ[d.nelems] = et;
+    d.elem_ch[d.nelems] = n.*;
+    d.nelems += 1;
     n.* += w;
 }
 
 /// Sets up the channels for the configuration (or the elements of a PCE).
 fn configure(d: *mut Decoder) !void {
+    drop_sbr(d);
+    d.nelems = 0;
     for k in @as(usize, 0)..3 {
         for i in @as(usize, 0)..16 {
             d.slot[k][i] = -1;
@@ -617,7 +605,7 @@ fn configure(d: *mut Decoder) !void {
 // Individual channel streams
 // -----------------------------------------------------------------------------
 
-fn decode_ltp(ltp: *mut Ltp, b: *mut Bits, max_sfb: i32) void {
+fn decode_ltp(ltp: *mut Ltp, b: *mut bitio.Bits, max_sfb: i32) void {
     ltp.lag = b.geti(11);
     ltp.coef = t.LTP_COEF[@as(usize, b.get(3))];
     for sfb in @as(usize, 0)..us(@min(max_sfb, MAX_LTP_LONG_SFB)) {
@@ -625,7 +613,7 @@ fn decode_ltp(ltp: *mut Ltp, b: *mut Bits, max_sfb: i32) void {
     }
 }
 
-fn decode_ics_info(d: *mut Decoder, ics: *mut Ics, b: *mut Bits) !void {
+fn decode_ics_info(d: *mut Decoder, ics: *mut Ics, b: *mut bitio.Bits) !void {
     let aot = d.cfg.object_type;
     let si_ = us(d.cfg.sampling_index);
     _ = b.get1(); // reserved
@@ -690,7 +678,7 @@ fn decode_ics_info(d: *mut Decoder, ics: *mut Ics, b: *mut Bits) !void {
     }
 }
 
-fn decode_band_types(ch: *mut Chan, b: *mut Bits) !void {
+fn decode_band_types(ch: *mut Chan, b: *mut bitio.Bits) !void {
     let ics = &ch.ics;
     let mut bits: u32 = 5;
     if ics.window_sequence[0] == EIGHT_SHORT {
@@ -726,7 +714,7 @@ fn decode_band_types(ch: *mut Chan, b: *mut Bits) !void {
     }
 }
 
-fn decode_scalefactors(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, global_gain: i32) !void {
+fn decode_scalefactors(d: *mut Decoder, ch: *mut Chan, b: *mut bitio.Bits, global_gain: i32) !void {
     let ics = &ch.ics;
     let mut off0 = global_gain;
     let mut off1 = global_gain - 90;
@@ -742,7 +730,7 @@ fn decode_scalefactors(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, global_gain
                 if bt == ZERO_BT {
                     ch.sf[idx] = 0.0;
                 } else if (bt == INTENSITY_BT) or (bt == INTENSITY_BT2) {
-                    let v = huff_decode(&d.huff, 0, b);
+                    let v = bitio.decode(&d.sfh, 0, b);
                     if v < 0 {
                         return error.InvalidAudio;
                     }
@@ -753,7 +741,7 @@ fn decode_scalefactors(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, global_gain
                     if noise_flag > 0 {
                         off1 += b.geti(9) - 256;
                     } else {
-                        let v = huff_decode(&d.huff, 0, b);
+                        let v = bitio.decode(&d.sfh, 0, b);
                         if v < 0 {
                             return error.InvalidAudio;
                         }
@@ -763,7 +751,7 @@ fn decode_scalefactors(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, global_gain
                     let c = @min(@max(off1, -100), 155);
                     ch.sf[idx] = -d.pow2sf[us(c + 200)];
                 } else {
-                    let v = huff_decode(&d.huff, 0, b);
+                    let v = bitio.decode(&d.sfh, 0, b);
                     if v < 0 {
                         return error.InvalidAudio;
                     }
@@ -786,7 +774,7 @@ struct Pulse {
     amp: [4]i32,
 }
 
-fn decode_pulses(p: *mut Pulse, b: *mut Bits, ics: *Ics) bool {
+fn decode_pulses(p: *mut Pulse, b: *mut bitio.Bits, ics: *Ics) bool {
     p.num = b.geti(2) + 1;
     let pulse_swb = b.geti(6);
     if pulse_swb >= ics.num_swb {
@@ -808,7 +796,7 @@ fn decode_pulses(p: *mut Pulse, b: *mut Bits, ics: *Ics) bool {
     return true;
 }
 
-fn decode_tns(d: *Decoder, tns: *mut Tns, b: *mut Bits, ics: *Ics) !void {
+fn decode_tns(d: *Decoder, tns: *mut Tns, b: *mut bitio.Bits, ics: *Ics) !void {
     let is8 = ics.window_sequence[0] == EIGHT_SHORT;
     let mut max_order: i32 = 12;
     if is8 {
@@ -853,7 +841,7 @@ fn decode_tns(d: *Decoder, tns: *mut Tns, b: *mut Bits, ics: *Ics) !void {
     }
 }
 
-fn decode_gain_control(ch: *Chan, b: *mut Bits) void {
+fn decode_gain_control(ch: *Chan, b: *mut bitio.Bits) void {
     let modes: [12]u32 = [1, 0, 5, 2, 1, 2, 8, 0, 2, 2, 1, 5];
     let m = us(ch.ics.window_sequence[0]) * 3;
     let max_band = b.get(2);
@@ -875,7 +863,7 @@ fn lcg_random(prev: i32) i32 {
     return @bit_cast(i32, (@bit_cast(u32, prev) *% 1664525) +% 1013904223);
 }
 
-fn decode_spectrum(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, pulse_present: bool, pulse: *Pulse) !void {
+fn decode_spectrum(d: *mut Decoder, ch: *mut Chan, b: *mut bitio.Bits, pulse_present: bool, pulse: *Pulse) !void {
     let ics = &ch.ics;
     let c = 1024 / us(ics.num_windows);
     let maxo = us(swb_off(ics, ics.max_sfb));
@@ -916,7 +904,7 @@ fn decode_spectrum(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, pulse_present: 
                     let cb = us(bt);
                     let mut k: usize = 0;
                     while k < off_len {
-                        let sym = huff_decode(&d.huff, cb, b);
+                        let sym = bitio.decode(&d.spec, cb - 1, b);
                         if sym < 0 {
                             return error.InvalidAudio;
                         }
@@ -1092,7 +1080,7 @@ fn apply_prediction(d: *Decoder, ch: *mut Chan) void {
     }
 }
 
-fn decode_ics(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, common_window: bool) !void {
+fn decode_ics(d: *mut Decoder, ch: *mut Chan, b: *mut bitio.Bits, common_window: bool) !void {
     let mut pulse = Pulse.{ num: 0, pos: [0; 4], amp: [0; 4] };
     let global_gain = b.geti(8);
     if not common_window {
@@ -1139,7 +1127,7 @@ fn decode_ics(d: *mut Decoder, ch: *mut Chan, b: *mut Bits, common_window: bool)
     }
 }
 
-fn decode_cpe(d: *mut Decoder, c0: usize, b: *mut Bits) !void {
+fn decode_cpe(d: *mut Decoder, c0: usize, b: *mut bitio.Bits) !void {
     let mut ms_mask: [128]bool = [false; 128];
     let common_window = b.get1() != 0;
     let mut ms_present: i32 = 0;
@@ -1311,90 +1299,7 @@ fn apply_tns(coef: []mut f32, tns: *Tns, ics: *Ics, decode: bool) void {
     }
 }
 
-/// An in-place complex FFT of n = 2^k points.
-fn fft(re: []mut f64, im: []mut f64, n: usize) void {
-    let mut j: usize = 0;
-    for i in @as(usize, 1)..n {
-        let mut bit = n >> 1;
-        while (j & bit) != 0 {
-            j ^= bit;
-            bit = bit >> 1;
-        }
-        j ^= bit;
-        if i < j {
-            let tr = re[i];
-            re[i] = re[j];
-            re[j] = tr;
-            let ti = im[i];
-            im[i] = im[j];
-            im[j] = ti;
-        }
-    }
-    let mut len: usize = 2;
-    while len <= n {
-        let ang = -6.283185307179586476925 / @float_from_int(f64, len);
-        let half = len >> 1;
-        for k in @as(usize, 0)..half {
-            let a = ang * @float_from_int(f64, k);
-            let wr = math.cos(a);
-            let wi = math.sin(a);
-            let mut i = k;
-            while i < n {
-                let p = i + half;
-                let xr = (re[p] * wr) - (im[p] * wi);
-                let xi = (re[p] * wi) + (im[p] * wr);
-                re[p] = re[i] - xr;
-                im[p] = im[i] - xi;
-                re[i] = re[i] + xr;
-                im[i] = im[i] + xi;
-                i += len;
-            }
-        }
-        len = len << 1;
-    }
-}
-
-/// u[n] = scale * sum_k x[k] cos(pi/N (n + 1/2)(k + 1/2)), N = x.len.
-fn dct4(d: *mut Decoder, x: []f64, u: []mut f64, scale: f64) void {
-    let n = x.len;
-    let h = n / 2;
-    let nf = @float_from_int(f64, n);
-    for j in @as(usize, 0)..h {
-        let a = (-3.14159265358979323846 * @float_from_int(f64, (4 * j) + 1)) / (4.0 * nf);
-        let c = math.cos(a);
-        let s = math.sin(a);
-        let xr = x[2 * j];
-        let xi = x[(n - 1) - (2 * j)];
-        d.fft_re[j] = (xr * c) - (xi * s);
-        d.fft_im[j] = (xr * s) + (xi * c);
-    }
-    fft(d.fft_re[..], d.fft_im[..], h);
-    for p in @as(usize, 0)..h {
-        let a = (-3.14159265358979323846 * @float_from_int(f64, p)) / nf;
-        let c = math.cos(a);
-        let s = math.sin(a);
-        let wr = (d.fft_re[p] * c) - (d.fft_im[p] * s);
-        let wi = (d.fft_re[p] * s) + (d.fft_im[p] * c);
-        u[2 * p] = wr * scale;
-        u[(n - 1) - (2 * p)] = -wi * scale;
-    }
-}
-
 const IMDCT_SCALE: f64 = 1.0 / (1024.0 * 32768.0);
-
-/// The middle half of the inverse MDCT of in[0..n] (n = 1024 or 128),
-/// into out[0..n].
-fn imdct_half(d: *mut Decoder, inp: []f32, out: []mut f32, n: usize) void {
-    let mut x: [1024]f64 = [0.0; 1024];
-    let mut u: [1024]f64 = [0.0; 1024];
-    for k in @as(usize, 0)..n {
-        x[k] = @as(f64, inp[k]);
-    }
-    dct4(d, x[..n], u[..n], IMDCT_SCALE * (1024.0 / @float_from_int(f64, n)));
-    for m in @as(usize, 0)..n {
-        out[m] = @float_cast(f32, u[(n - 1) - m]);
-    }
-}
 
 /// dst[i] and dst[2 len - 1 - i] from src0, src1 and the rising window.
 fn fmul_window(dst: []mut f32, s0: []f32, s1: []f32, win: []f32, len: usize) void {
@@ -1434,14 +1339,14 @@ fn imdct_and_windowing(d: *mut Decoder, ch: *mut Chan) void {
     if seq == EIGHT_SHORT {
         for i in @as(usize, 0)..8 {
             let mut o: [128]f32 = [0.0; 128];
-            imdct_half(d, ch.coeffs[i * 128..], o[..], 128);
+            bitio.imdct(&mut d.tw128, ch.coeffs[i * 128..], o[..], IMDCT_SCALE * 8.0);
             for k in @as(usize, 0)..128 {
                 d.buf[(i * 128) + k] = o[k];
             }
         }
     } else {
         let mut o: [1024]f32 = [0.0; 1024];
-        imdct_half(d, ch.coeffs[..], o[..], 1024);
+        bitio.imdct(&mut d.tw1024, ch.coeffs[..], o[..], IMDCT_SCALE);
         d.buf = o;
     }
     let buf = d.buf[..];
@@ -1505,7 +1410,7 @@ fn mdct_ltp(d: *mut Decoder, inp: []f32, out: []mut f32) void {
     for q in h..n {
         z[q] = @as(f64, inp[q - h]) - @as(f64, inp[((3 * h) - 1) - q]);
     }
-    dct4(d, z[..], u[..], -32768.0);
+    bitio.dct4(&mut d.tw1024, z[..], u[..], -32768.0);
     for k in @as(usize, 0)..n {
         out[k] = @float_cast(f32, u[k]);
     }
@@ -1621,7 +1526,7 @@ fn update_ltp(d: *mut Decoder, ch: *mut Chan) void {
 // Raw data blocks
 // -----------------------------------------------------------------------------
 
-fn skip_dse(b: *mut Bits) !void {
+fn skip_dse(b: *mut bitio.Bits) !void {
     let align = b.get1() != 0;
     let mut count = @as(usize, b.get(8));
     if count == 255 {
@@ -1636,27 +1541,104 @@ fn skip_dse(b: *mut Bits) !void {
     }
 }
 
-fn decode_fil(d: *mut Decoder, b: *mut Bits, id: usize) !void {
-    let mut count = id;
+fn decode_fil(d: *mut Decoder, b: *mut bitio.Bits, id: usize, prev: i32) !void {
+    let mut count = @bit_cast(i64, @as(u64, id));
     if count == 15 {
-        count += @as(usize, b.get(8)) - 1;
+        count += @as(i64, b.get(8)) - 1;
     }
-    if b.left() < @as(i64, @bit_cast(i64, @as(u64, 8 * count))) {
+    if b.left() < (8 * count) {
         return error.InvalidAudio;
     }
-    if count > 0 {
-        let typ = b.get(4);
-        if (typ == 13) or (typ == 14) {
-            d.cfg.sbr = true; // spectral band replication: not decoded (the core is)
-        }
-        b.skip((8 * count) - 4);
+    while count > 0 {
+        count -= extension_payload(d, b, @truncate(usize, @bit_cast(u64, count)), prev)!;
     }
 }
 
-/// Decodes one raw data block (a frame) into out: 1024 interleaved frames
-/// of channels(d) samples. Returns false if the block held no audio.
-pub fn decode_block(d: *mut Decoder, b: *mut Bits, out: []mut f32) !bool {
+/// One extension payload of at most cnt bytes; returns the bytes used.
+fn extension_payload(d: *mut Decoder, b: *mut bitio.Bits, cnt: usize, prev: i32) !i64 {
+    let typ = b.get(4);
+    let rest = (8 * cnt) - 4;
+    if (typ == 13) or (typ == 14) {
+        // spectral band replication
+        if (prev < 0) or (d.cfg.sbr == 0) or ((d.cfg.sbr == -1) and d.locked) {
+            b.skip(rest);
+            return @bit_cast(i64, @as(u64, cnt));
+        }
+        if (d.cfg.ps == -1) and not d.locked and (d.nchans == 1) {
+            d.cfg.sbr = 1;
+            d.cfg.ps = 1;
+            ps_stereo(d)!;
+        } else {
+            d.cfg.sbr = 1;
+        }
+        ensure_sbr(d)!;
+        let e = us(prev);
+        sbr.decode_extension(&mut d.sbrs[e], &d.sbr_huff, &d.ps_huff, b, typ == 14, cnt, d.elem_typ[e],
+                             d.cfg.sample_rate, d.cfg.ps != 0);
+        return @bit_cast(i64, @as(u64, cnt));
+    }
+    if typ == 11 {
+        // dynamic range control: parsed (to find its length), not applied
+        let mut n: i64 = 1;
+        let mut bands: u32 = 1;
+        if b.get1() != 0 {
+            b.skip(8);
+            n += 1;
+        }
+        if b.get1() != 0 {
+            let mut excl: usize = 0;
+            loop {
+                b.skip(7);
+                excl += 7;
+                if (excl >= 57) or (b.get1() == 0) {
+                    break;
+                }
+            }
+            n += @bit_cast(i64, @as(u64, excl / 7));
+        }
+        if b.get1() != 0 {
+            let incr = b.get(4);
+            b.skip(4);
+            n += 1;
+            bands += incr;
+            b.skip(@as(usize, 8 * bands));
+            n += @as(i64, bands);
+        }
+        if b.get1() != 0 {
+            b.skip(8);
+            n += 1;
+        }
+        b.skip(@as(usize, 8 * bands));
+        n += @as(i64, bands);
+        return n;
+    }
+    b.skip(rest);
+    return @bit_cast(i64, @as(u64, cnt));
+}
+
+/// A mono stream turns out to carry parametric stereo: two output channels.
+fn ps_stereo(d: *mut Decoder) !void {
+    if (d.nchans != 1) or (d.cfg.chan_config > 1) {
+        return;
+    }
+    let nc = mem.alloc_zeroed.[Chan](2)!;
+    nc[0] = d.chans[0];
+    for k in @as(usize, 0)..MAX_PREDICTORS {
+        reset_pred(&mut nc[1].pred[k]);
+    }
+    mem.free(d.chans);
+    d.chans = nc;
+    d.nchans = 2;
+    d.order[0] = 0;
+    d.order[1] = 1;
+}
+
+/// Decodes one raw data block (a frame) into out: interleaved frames of
+/// channels(d) samples. Returns the number of frames (1024, 2048 with SBR,
+/// 0 if the block held no audio).
+pub fn decode_block(d: *mut Decoder, b: *mut bitio.Bits, out: []mut f32) !usize {
     let align_ref = b.pos;
+    let mut prev: i32 = -1;
     let mut present: [64]bool = [false; 64];
     let mut seen: [4][16]u8 = [[0; 16]; 4];
     let mut audio = false;
@@ -1688,6 +1670,7 @@ pub fn decode_block(d: *mut Decoder, b: *mut Bits, out: []mut f32) !bool {
                 return error.InvalidAudio;
             }
             let cu = us(c);
+            prev = d.slot_elem[k][us(id)];
             present[cu] = true;
             if typ == TYPE_CPE {
                 present[cu + 1] = true;
@@ -1706,14 +1689,14 @@ pub fn decode_block(d: *mut Decoder, b: *mut Bits, out: []mut f32) !bool {
                 configure(d)!;
             }
         } else if typ == TYPE_FIL {
-            decode_fil(d, b, @as(usize, @bit_cast(u32, id)))!;
+            decode_fil(d, b, @as(usize, @bit_cast(u32, id)), prev)!;
         }
         if b.over or (b.left() < 3) {
             return error.InvalidAudio;
         }
     }
     if not audio {
-        return false;
+        return 0;
     }
     // TNS, prediction, the inverse transform
     for c in @as(usize, 0)..d.nchans {
@@ -1735,12 +1718,33 @@ pub fn decode_block(d: *mut Decoder, b: *mut Bits, out: []mut f32) !bool {
             update_ltp(d, ch);
         }
     }
+    let mut samples: usize = 1024;
+    if d.cfg.sbr == 1 {
+        ensure_sbr(d)!;
+        let downsampled = ext_rate(d) < (2 * d.cfg.sample_rate);
+        let ps_mode = d.cfg.ps == 1;
+        for e in @as(usize, 0)..d.nelems {
+            let c = d.elem_ch[e];
+            let typ = d.elem_typ[e];
+            let two = (typ == TYPE_CPE) or (ps_mode and (typ == TYPE_SCE) and ((c + 1) < d.nchans) and
+                                            (d.cfg.chan_config <= 1));
+            if two {
+                sbr.apply(&mut d.sbrs[e], &mut d.tw64, typ, d.chans[c].ret[..], d.chans[c + 1].ret[..], ps_mode, downsampled);
+            } else {
+                sbr.apply(&mut d.sbrs[e], &mut d.tw64, typ, d.chans[c].ret[..], d.dummy[..], ps_mode, downsampled);
+            }
+        }
+        if not downsampled {
+            samples = 2048;
+        }
+    }
+    d.locked = true;
     let n = d.nchans;
     for c in @as(usize, 0)..n {
         let src = &d.chans[d.order[c]];
-        for i in @as(usize, 0)..1024 {
+        for i in @as(usize, 0)..samples {
             out[(i * n) + c] = src.ret[i];
         }
     }
-    return true;
+    return samples;
 }

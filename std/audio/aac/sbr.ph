@@ -1,0 +1,1694 @@
+// =============================================================================
+// std/audio/aac/sbr.ph - spectral band replication (HE-AAC, ISO/IEC 14496-3
+// subpart 4.6.18): the SBR bitstream (header, time/frequency grids,
+// envelopes, noise floors, sinusoids), the derived frequency tables, the
+// 32-band analysis and 64-band synthesis QMF banks, the high frequency
+// generator (LPC inverse filtering, patching) and adjuster (gains,
+// limiter, smoothing, noise and sinusoids). Follows FFmpeg's float SBR
+// decoder (libavcodec/aacsbr_template.c, aacsbr.c, sbrdsp_template.c).
+// =============================================================================
+
+import "../../math.ph" as math;
+import "bits.ph" as bitio;
+import "ps.ph" as ps;
+import "tables.ph" as t;
+
+const TYPE_SCE: i32 = 0;
+const TYPE_CPE: i32 = 1;
+const TYPE_CCE: i32 = 2;
+const ENV_OFF: usize = 2; // ENVELOPE_ADJUSTMENT_OFFSET
+const SYN_BUF: usize = 2304; // SBR_SYNTHESIS_BUF_SIZE
+const NOISE_FLOOR_OFFSET: i32 = 6;
+const FIXFIX: i32 = 0;
+const FIXVAR: i32 = 1;
+const VARFIX: i32 = 2;
+const VARVAR: i32 = 3;
+const FLT_MIN: f32 = 1.17549435e-38;
+const FLT_EPSILON: f32 = 1.1920929e-07;
+
+// the codebooks (FFmpeg's order)
+const T_ENV_1_5: usize = 0;
+const F_ENV_1_5: usize = 1;
+const T_ENV_BAL_1_5: usize = 2;
+const F_ENV_BAL_1_5: usize = 3;
+const T_ENV_3_0: usize = 4;
+const F_ENV_3_0: usize = 5;
+const T_ENV_BAL_3_0: usize = 6;
+const F_ENV_BAL_3_0: usize = 7;
+const T_NOISE_3_0: usize = 8;
+const T_NOISE_BAL_3_0: usize = 9;
+let LAV: [10]i32 = [60, 60, 24, 24, 31, 31, 12, 12, 31, 12];
+let CEIL_LOG2: [6]u32 = [0, 1, 2, 2, 3, 3];
+
+fn us(v: i32) usize {
+    return @as(usize, @bit_cast(u32, v));
+}
+
+fn si(v: usize) i32 {
+    return @bit_cast(i32, @truncate(u32, v));
+}
+
+fn b2i(b: bool) i32 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn lrintf(x: f32) i32 {
+    return @int_from_float(i32, @nearest(x));
+}
+
+fn sqrtf(x: f32) f32 {
+    return @float_cast(f32, @sqrt(@float_cast(f64, x)));
+}
+
+/// 2^x as a float, exactly (FFmpeg's ff_exp2fi).
+fn exp2fi(x: i32) f32 {
+    if (x >= -126) and (x <= 128) {
+        return @bit_cast(f32, @bit_cast(u32, x + 127) << 23);
+    }
+    if x > 128 {
+        return @bit_cast(f32, @as(u32, 0x7f800000));
+    }
+    if x > -150 {
+        return @bit_cast(f32, @as(u32, 1) << @bit_cast(u32, x + 149));
+    }
+    return 0.0;
+}
+
+struct Data {
+    bs_frame_class: i32,
+    bs_add_harmonic_flag: bool,
+    bs_num_env: i32,
+    bs_freq_res: [7]i32,
+    bs_num_noise: i32,
+    bs_df_env: [5]i32,
+    bs_df_noise: [2]i32,
+    bs_invf_mode: [2][5]i32,
+    bs_add_harmonic: [48]i32,
+    bs_amp_res: i32,
+    synthesis: [2304]f32,
+    analysis: [1312]f32,
+    syn_offset: usize,
+    e_a: [2]i32,
+    bw_array: [5]f32,
+    w: [2][32][32][2]f32,
+    ypos: usize,
+    y: [2][38][64][2]f32,
+    g_temp: [42][48]f32,
+    q_temp: [42][48]f32,
+    s_indexmapped: [8][48]i32,
+    env_facs_q: [6][48]i32,
+    env_facs: [6][48]f32,
+    noise_facs_q: [3][5]i32,
+    noise_facs: [3][5]f32,
+    t_env: [8]i32,
+    t_env_num_env_old: i32,
+    t_q: [3]i32,
+    f_indexnoise: i32,
+    f_indexsine: i32,
+}
+
+pub struct Sbr {
+    sample_rate: i32,
+    start: bool,
+    ready_for_dequant: bool,
+    id_aac: i32,
+    reset: bool,
+    // bs_start_freq, bs_stop_freq, bs_xover_band, bs_freq_scale,
+    // bs_alter_scale, bs_noise_bands
+    spectrum: [6]i32,
+    bs_amp_res_header: i32,
+    bs_limiter_bands: i32,
+    bs_limiter_gains: i32,
+    bs_interpol_freq: i32,
+    bs_smoothing_mode: i32,
+    bs_coupling: bool,
+    k: [5]i32,
+    kx: [2]i32,
+    m: [2]i32,
+    kx_and_m_pushed: bool,
+    n_master: i32,
+    data: [2]Data,
+    ps: ps.Ps,
+    n: [2]i32,
+    n_q: i32,
+    n_lim: i32,
+    f_master: [49]i32,
+    f_tablelow: [25]i32,
+    f_tablehigh: [49]i32,
+    f_tablenoise: [6]i32,
+    f_tablelim: [30]i32,
+    num_patches: i32,
+    patch_num_subbands: [6]i32,
+    patch_start_subband: [6]i32,
+    x_low: [32][40][2]f32,
+    x_high: [64][40][2]f32,
+    x: [2][2][38][64]f32,
+    alpha0: [64][2]f32,
+    alpha1: [64][2]f32,
+    e_origmapped: [7][48]f32,
+    q_mapped: [7][48]f32,
+    s_mapped: [7][48]i32,
+    e_curr: [7][48]f32,
+    q_m: [7][48]f32,
+    s_m: [7][48]f32,
+    gain: [7][48]f32,
+    scratch: [320]f32,
+}
+
+fn turnoff(s: *mut Sbr) void {
+    s.start = false;
+    s.ready_for_dequant = false;
+    s.kx[1] = 32;
+    s.m[1] = 0;
+    s.data[0].e_a[1] = -1;
+    s.data[1].e_a[1] = -1;
+    for i in @as(usize, 0)..6 {
+        s.spectrum[i] = 255;
+    }
+}
+
+/// Sets up a zeroed context for an element of type id_aac.
+pub fn init(s: *mut Sbr, id_aac: i32) void {
+    s.kx[0] = s.kx[1];
+    s.id_aac = id_aac;
+    turnoff(s);
+    s.data[0].syn_offset = SYN_BUF - (1280 - 128);
+    s.data[1].syn_offset = SYN_BUF - (1280 - 128);
+}
+
+fn sort(a: []mut i32) void {
+    for i in @as(usize, 1)..a.len {
+        let v = a[i];
+        let mut j = i;
+        while (j > 0) and (a[j - 1] > v) {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = v;
+    }
+}
+
+fn in_table(table: []i32, last_el: i32, needle: i32) bool {
+    for i in @as(usize, 0)..us(last_el + 1) {
+        if table[i] == needle {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn make_bands(bands: []mut i32, start: i32, stop: i32, num_bands: i32) void {
+    let base = math.powf(@float_from_int(f32, stop) / @float_from_int(f32, start), 1.0 / @float_from_int(f32, num_bands));
+    let mut prod = @float_from_int(f32, start);
+    let mut previous = start;
+    for k in @as(usize, 0)..us(num_bands - 1) {
+        prod = prod * base;
+        let present = lrintf(prod);
+        bands[k] = present - previous;
+        previous = present;
+    }
+    bands[us(num_bands - 1)] = stop - previous;
+}
+
+/// The limiter frequency band table.
+fn make_f_tablelim(s: *mut Sbr) void {
+    if s.bs_limiter_bands > 0 {
+        let warped: [3]f32 = [1.32715174233856803909, 1.18509277094158210129, 1.11987160404675912501];
+        let lim = warped[us(s.bs_limiter_bands - 1)];
+        let mut borders: [7]i32 = [0; 7];
+        borders[0] = s.kx[1];
+        for k in @as(usize, 1)..(us(s.num_patches) + 1) {
+            borders[k] = borders[k - 1] + s.patch_num_subbands[k - 1];
+        }
+        for i in @as(usize, 0)..us(s.n[0] + 1) {
+            s.f_tablelim[i] = s.f_tablelow[i];
+        }
+        if s.num_patches > 1 {
+            for i in @as(usize, 0)..us(s.num_patches - 1) {
+                s.f_tablelim[us(s.n[0] + 1) + i] = borders[1 + i];
+            }
+        }
+        sort(s.f_tablelim[..us(s.num_patches + s.n[0])]);
+        s.n_lim = (s.n[0] + s.num_patches) - 1;
+        let mut out: usize = 0;
+        let mut inp: usize = 1;
+        while out < us(s.n_lim) {
+            let vi = s.f_tablelim[inp];
+            let vo = s.f_tablelim[out];
+            if @float_from_int(f32, vi) >= (@float_from_int(f32, vo) * lim) {
+                out += 1;
+                s.f_tablelim[out] = vi;
+                inp += 1;
+            } else if (vi == vo) or not in_table(borders[..], s.num_patches, vi) {
+                inp += 1;
+                s.n_lim -= 1;
+            } else if not in_table(borders[..], s.num_patches, vo) {
+                s.f_tablelim[out] = vi;
+                inp += 1;
+                s.n_lim -= 1;
+            } else {
+                out += 1;
+                s.f_tablelim[out] = vi;
+                inp += 1;
+            }
+        }
+    } else {
+        s.f_tablelim[0] = s.f_tablelow[0];
+        s.f_tablelim[1] = s.f_tablelow[us(s.n[0])];
+        s.n_lim = 1;
+    }
+}
+
+fn read_header(s: *mut Sbr, b: *mut bitio.Bits) void {
+    let old_limiter = s.bs_limiter_bands;
+    s.start = true;
+    s.ready_for_dequant = false;
+    let old: [6]i32 = s.spectrum;
+    s.bs_amp_res_header = b.geti(1);
+    s.spectrum[0] = b.geti(4);
+    s.spectrum[1] = b.geti(4);
+    s.spectrum[2] = b.geti(3);
+    b.skip(2);
+    let extra1 = b.get1() != 0;
+    let extra2 = b.get1() != 0;
+    if extra1 {
+        s.spectrum[3] = b.geti(2);
+        s.spectrum[4] = b.geti(1);
+        s.spectrum[5] = b.geti(2);
+    } else {
+        s.spectrum[3] = 2;
+        s.spectrum[4] = 1;
+        s.spectrum[5] = 2;
+    }
+    for i in @as(usize, 0)..6 {
+        if old[i] != s.spectrum[i] {
+            s.reset = true;
+        }
+    }
+    if extra2 {
+        s.bs_limiter_bands = b.geti(2);
+        s.bs_limiter_gains = b.geti(2);
+        s.bs_interpol_freq = b.geti(1);
+        s.bs_smoothing_mode = b.geti(1);
+    } else {
+        s.bs_limiter_bands = 2;
+        s.bs_limiter_gains = 2;
+        s.bs_interpol_freq = 1;
+        s.bs_smoothing_mode = 1;
+    }
+    if (s.bs_limiter_bands != old_limiter) and not s.reset {
+        make_f_tablelim(s);
+    }
+}
+
+fn check_n_master(n_master: i32, xover: i32) bool {
+    return (n_master > 0) and (xover < n_master);
+}
+
+/// The master frequency band table.
+fn make_f_master(s: *mut Sbr) bool {
+    let rate = s.sample_rate;
+    let mut row: usize = 0;
+    if rate == 16000 {
+        row = 0;
+    } else if rate == 22050 {
+        row = 1;
+    } else if rate == 24000 {
+        row = 2;
+    } else if rate == 32000 {
+        row = 3;
+    } else if (rate == 44100) or (rate == 48000) or (rate == 64000) {
+        row = 4;
+    } else if (rate == 88200) or (rate == 96000) or (rate == 128000) or (rate == 176400) or (rate == 192000) {
+        row = 5;
+    } else {
+        return false;
+    }
+    let mut temp: i32 = 5000;
+    if rate < 32000 {
+        temp = 3000;
+    } else if rate < 64000 {
+        temp = 4000;
+    }
+    let start_min = ((temp << 7) + (rate >> 1)) / rate;
+    let stop_min = ((temp << 8) + (rate >> 1)) / rate;
+    s.k[0] = start_min + @as(i32, t.SBR_OFFSET[(row * 16) + us(s.spectrum[0])]);
+    let stop = s.spectrum[1];
+    if stop < 14 {
+        let mut stop_dk: [13]i32 = [0; 13];
+        s.k[2] = stop_min;
+        make_bands(stop_dk[..], stop_min, 64, 13);
+        sort(stop_dk[..]);
+        for k in @as(usize, 0)..us(stop) {
+            s.k[2] += stop_dk[k];
+        }
+    } else if stop == 14 {
+        s.k[2] = 2 * s.k[0];
+    } else if stop == 15 {
+        s.k[2] = 3 * s.k[0];
+    } else {
+        return false;
+    }
+    s.k[2] = @min(64, s.k[2]);
+    let mut max_qmf: i32 = 32;
+    if rate <= 32000 {
+        max_qmf = 48;
+    } else if rate == 44100 {
+        max_qmf = 35;
+    }
+    if (s.k[2] - s.k[0]) > max_qmf {
+        return false;
+    }
+    let xover = s.spectrum[2];
+    if s.spectrum[3] == 0 {
+        let dk = s.spectrum[4] + 1;
+        s.n_master = ((((s.k[2] - s.k[0]) + (dk & 2)) >> @bit_cast(u32, dk)) << 1);
+        if not check_n_master(s.n_master, xover) {
+            return false;
+        }
+        for k in @as(usize, 1)..(us(s.n_master) + 1) {
+            s.f_master[k] = dk;
+        }
+        let k2diff = (s.k[2] - s.k[0]) - (s.n_master * dk);
+        if k2diff < 0 {
+            s.f_master[1] -= 1;
+            s.f_master[2] -= b2i(k2diff < -1);
+        } else if k2diff != 0 {
+            s.f_master[us(s.n_master)] += 1;
+        }
+        s.f_master[0] = s.k[0];
+        for k in @as(usize, 1)..(us(s.n_master) + 1) {
+            s.f_master[k] += s.f_master[k - 1];
+        }
+    } else {
+        let half_bands = 7 - s.spectrum[3];
+        let mut two_regions = false;
+        if (49 * s.k[2]) > (110 * s.k[0]) {
+            two_regions = true;
+            s.k[1] = 2 * s.k[0];
+        } else {
+            s.k[1] = s.k[2];
+        }
+        let num_bands_0 = lrintf(@float_from_int(f32, half_bands) *
+                                 math.log2f(@float_from_int(f32, s.k[1]) / @float_from_int(f32, s.k[0]))) * 2;
+        if (num_bands_0 <= 0) or (num_bands_0 > 48) {
+            return false;
+        }
+        let mut vk0: [49]i32 = [0; 49];
+        make_bands(vk0[1..], s.k[0], s.k[1], num_bands_0);
+        sort(vk0[1..us(num_bands_0) + 1]);
+        let vdk0_max = vk0[us(num_bands_0)];
+        vk0[0] = s.k[0];
+        for k in @as(usize, 1)..(us(num_bands_0) + 1) {
+            if vk0[k] <= 0 {
+                return false;
+            }
+            vk0[k] += vk0[k - 1];
+        }
+        if two_regions {
+            let mut vk1: [49]i32 = [0; 49];
+            let mut invwarp: f32 = 1.0;
+            if s.spectrum[4] != 0 {
+                invwarp = 0.76923076923076923077;
+            }
+            let num_bands_1 = lrintf((@float_from_int(f32, half_bands) * invwarp) *
+                                     math.log2f(@float_from_int(f32, s.k[2]) / @float_from_int(f32, s.k[1]))) * 2;
+            if (num_bands_1 <= 0) or ((num_bands_0 + num_bands_1) > 48) {
+                return false;
+            }
+            make_bands(vk1[1..], s.k[1], s.k[2], num_bands_1);
+            let mut vdk1_min = vk1[1];
+            for i in @as(usize, 2)..(us(num_bands_1) + 1) {
+                vdk1_min = @min(vdk1_min, vk1[i]);
+            }
+            if vdk1_min < vdk0_max {
+                sort(vk1[1..us(num_bands_1) + 1]);
+                let change = @min(vdk0_max - vk1[1], (vk1[us(num_bands_1)] - vk1[1]) >> 1);
+                vk1[1] += change;
+                vk1[us(num_bands_1)] -= change;
+            }
+            sort(vk1[1..us(num_bands_1) + 1]);
+            vk1[0] = s.k[1];
+            for k in @as(usize, 1)..(us(num_bands_1) + 1) {
+                if vk1[k] <= 0 {
+                    return false;
+                }
+                vk1[k] += vk1[k - 1];
+            }
+            s.n_master = num_bands_0 + num_bands_1;
+            if not check_n_master(s.n_master, xover) {
+                return false;
+            }
+            for k in @as(usize, 0)..(us(num_bands_0) + 1) {
+                s.f_master[k] = vk0[k];
+            }
+            for k in @as(usize, 0)..us(num_bands_1) {
+                s.f_master[us(num_bands_0) + 1 + k] = vk1[k + 1];
+            }
+        } else {
+            s.n_master = num_bands_0;
+            if not check_n_master(s.n_master, xover) {
+                return false;
+            }
+            for k in @as(usize, 0)..(us(num_bands_0) + 1) {
+                s.f_master[k] = vk0[k];
+            }
+        }
+    }
+    return true;
+}
+
+/// Patch construction for the high frequency generator.
+fn hf_calc_npatches(s: *mut Sbr) bool {
+    let mut last_k: i32 = -1;
+    let mut last_msb: i32 = -1;
+    let mut sb: i32 = 0;
+    let mut msb = s.k[0];
+    let mut usb = s.kx[1];
+    let goal_sb = ((1000 << 11) + (s.sample_rate >> 1)) / s.sample_rate;
+    s.num_patches = 0;
+    let mut k: i32 = 0;
+    if goal_sb < (s.kx[1] + s.m[1]) {
+        k = 0;
+        while s.f_master[us(k)] < goal_sb {
+            k += 1;
+        }
+    } else {
+        k = s.n_master;
+    }
+    loop {
+        let mut odd: i32 = 0;
+        if (k == last_k) and (msb == last_msb) {
+            return false;
+        }
+        last_k = k;
+        last_msb = msb;
+        let mut i = k;
+        loop {
+            if not ((i == k) or (sb > (((s.k[0] - 1) + msb) - odd))) {
+                break;
+            }
+            if i < 0 {
+                return false;
+            }
+            sb = s.f_master[us(i)];
+            odd = (sb + s.k[0]) & 1;
+            i -= 1;
+        }
+        if s.num_patches > 5 {
+            return false;
+        }
+        let np = us(s.num_patches);
+        s.patch_num_subbands[np] = @max(sb - usb, 0);
+        s.patch_start_subband[np] = (s.k[0] - odd) - s.patch_num_subbands[np];
+        if s.patch_num_subbands[np] > 0 {
+            usb = sb;
+            msb = sb;
+            s.num_patches += 1;
+        } else {
+            msb = s.kx[1];
+        }
+        if (s.f_master[us(k)] - sb) < 3 {
+            k = s.n_master;
+        }
+        if sb == (s.kx[1] + s.m[1]) {
+            break;
+        }
+    }
+    if (s.num_patches > 1) and (s.patch_num_subbands[us(s.num_patches - 1)] < 3) {
+        s.num_patches -= 1;
+    }
+    return true;
+}
+
+/// The derived frequency band tables.
+fn make_f_derived(s: *mut Sbr) bool {
+    let xover = s.spectrum[2];
+    s.n[1] = s.n_master - xover;
+    s.n[0] = (s.n[1] + 1) >> 1;
+    for i in @as(usize, 0)..(us(s.n[1]) + 1) {
+        s.f_tablehigh[i] = s.f_master[us(xover) + i];
+    }
+    s.m[1] = s.f_tablehigh[us(s.n[1])] - s.f_tablehigh[0];
+    s.kx[1] = s.f_tablehigh[0];
+    if ((s.kx[1] + s.m[1]) > 64) or (s.kx[1] > 32) or (s.m[1] > 48) {
+        return false;
+    }
+    s.f_tablelow[0] = s.f_tablehigh[0];
+    let odd = s.n[1] & 1;
+    for k in @as(usize, 1)..(us(s.n[0]) + 1) {
+        s.f_tablelow[k] = s.f_tablehigh[us(((2 * si(k)) - odd))];
+    }
+    s.n_q = @max(1, lrintf(@float_from_int(f32, s.spectrum[5]) *
+                           math.log2f(@float_from_int(f32, s.k[2]) / @float_from_int(f32, s.kx[1]))));
+    if s.n_q > 5 {
+        return false;
+    }
+    s.f_tablenoise[0] = s.f_tablelow[0];
+    let mut temp: i32 = 0;
+    for k in @as(i32, 1)..(s.n_q + 1) {
+        temp += (s.n[0] - temp) / ((s.n_q + 1) - k);
+        s.f_tablenoise[us(k)] = s.f_tablelow[us(temp)];
+    }
+    if not hf_calc_npatches(s) {
+        return false;
+    }
+    make_f_tablelim(s);
+    s.data[0].f_indexnoise = 0;
+    s.data[1].f_indexnoise = 0;
+    return true;
+}
+
+fn read_grid(s: *mut Sbr, b: *mut bitio.Bits, c: usize) bool {
+    let d = &mut s.data[c];
+    let mut bs_pointer: i32 = 0;
+    let mut abs_bord_trail: i32 = 16;
+    let num_env_old = d.bs_num_env;
+    d.bs_freq_res[0] = d.bs_freq_res[us(d.bs_num_env)];
+    d.bs_amp_res = s.bs_amp_res_header;
+    d.t_env_num_env_old = d.t_env[us(num_env_old)];
+    let frame_class = b.geti(2);
+    if frame_class == FIXFIX {
+        let n = @as(i32, 1) << b.get(2);
+        if n > 4 {
+            return false;
+        }
+        d.bs_num_env = n;
+        let num_rel_lead = n - 1;
+        if n == 1 {
+            d.bs_amp_res = 0;
+        }
+        d.t_env[0] = 0;
+        d.t_env[us(n)] = abs_bord_trail;
+        abs_bord_trail = (abs_bord_trail + (n >> 1)) / n;
+        for i in @as(usize, 0)..us(num_rel_lead) {
+            d.t_env[i + 1] = d.t_env[i] + abs_bord_trail;
+        }
+        d.bs_freq_res[1] = b.geti(1);
+        for i in @as(usize, 1)..us(n) {
+            d.bs_freq_res[i + 1] = d.bs_freq_res[1];
+        }
+    } else if frame_class == FIXVAR {
+        abs_bord_trail += b.geti(2);
+        let num_rel_trail = b.geti(2);
+        d.bs_num_env = num_rel_trail + 1;
+        d.t_env[0] = 0;
+        d.t_env[us(d.bs_num_env)] = abs_bord_trail;
+        for i in @as(i32, 0)..num_rel_trail {
+            let v = (d.t_env[us(d.bs_num_env - i)] - (2 * b.geti(2))) - 2;
+            d.t_env[us((d.bs_num_env - 1) - i)] = v & 255;
+        }
+        bs_pointer = b.geti(CEIL_LOG2[us(d.bs_num_env)]);
+        for i in @as(i32, 0)..d.bs_num_env {
+            d.bs_freq_res[us(d.bs_num_env - i)] = b.geti(1);
+        }
+    } else if frame_class == VARFIX {
+        d.t_env[0] = b.geti(2);
+        let num_rel_lead = b.geti(2);
+        d.bs_num_env = num_rel_lead + 1;
+        d.t_env[us(d.bs_num_env)] = abs_bord_trail;
+        for i in @as(usize, 0)..us(num_rel_lead) {
+            d.t_env[i + 1] = ((d.t_env[i] + (2 * b.geti(2))) + 2) & 255;
+        }
+        bs_pointer = b.geti(CEIL_LOG2[us(d.bs_num_env)]);
+        for i in @as(usize, 0)..us(d.bs_num_env) {
+            d.bs_freq_res[i + 1] = b.geti(1);
+        }
+    } else {
+        d.t_env[0] = b.geti(2);
+        abs_bord_trail += b.geti(2);
+        let num_rel_lead = b.geti(2);
+        let num_rel_trail = b.geti(2);
+        let n = (num_rel_lead + num_rel_trail) + 1;
+        if n > 5 {
+            return false;
+        }
+        d.bs_num_env = n;
+        d.t_env[us(n)] = abs_bord_trail;
+        for i in @as(usize, 0)..us(num_rel_lead) {
+            d.t_env[i + 1] = ((d.t_env[i] + (2 * b.geti(2))) + 2) & 255;
+        }
+        for i in @as(i32, 0)..num_rel_trail {
+            let v = (d.t_env[us(n - i)] - (2 * b.geti(2))) - 2;
+            d.t_env[us((n - 1) - i)] = v & 255;
+        }
+        bs_pointer = b.geti(CEIL_LOG2[us(n)]);
+        for i in @as(usize, 0)..us(n) {
+            d.bs_freq_res[i + 1] = b.geti(1);
+        }
+    }
+    d.bs_frame_class = frame_class;
+    if bs_pointer > (d.bs_num_env + 1) {
+        return false;
+    }
+    for i in @as(usize, 1)..(us(d.bs_num_env) + 1) {
+        if d.t_env[i - 1] >= d.t_env[i] {
+            return false;
+        }
+    }
+    d.bs_num_noise = b2i(d.bs_num_env > 1) + 1;
+    d.t_q[0] = d.t_env[0];
+    d.t_q[us(d.bs_num_noise)] = d.t_env[us(d.bs_num_env)];
+    if d.bs_num_noise > 1 {
+        let mut idx: i32 = 0;
+        if d.bs_frame_class == FIXFIX {
+            idx = d.bs_num_env >> 1;
+        } else if (d.bs_frame_class & 1) != 0 {
+            idx = d.bs_num_env - @max(bs_pointer - 1, 1);
+        } else if bs_pointer == 0 {
+            idx = 1;
+        } else if bs_pointer == 1 {
+            idx = d.bs_num_env - 1;
+        } else {
+            idx = bs_pointer - 1;
+        }
+        d.t_q[1] = d.t_env[us(idx)];
+    }
+    d.e_a[0] = -b2i(d.e_a[1] != num_env_old);
+    d.e_a[1] = -1;
+    if ((d.bs_frame_class & 1) != 0) and (bs_pointer != 0) {
+        d.e_a[1] = (d.bs_num_env + 1) - bs_pointer;
+    } else if (d.bs_frame_class == 2) and (bs_pointer > 1) {
+        d.e_a[1] = bs_pointer - 1;
+    }
+    return true;
+}
+
+fn copy_grid(s: *mut Sbr) void {
+    let src = &s.data[0];
+    let dst = &mut s.data[1];
+    dst.bs_freq_res[0] = dst.bs_freq_res[us(dst.bs_num_env)];
+    dst.t_env_num_env_old = dst.t_env[us(dst.bs_num_env)];
+    dst.e_a[0] = -b2i(dst.e_a[1] != dst.bs_num_env);
+    for i in @as(usize, 1)..7 {
+        dst.bs_freq_res[i] = src.bs_freq_res[i];
+    }
+    dst.t_env = src.t_env;
+    dst.t_q = src.t_q;
+    dst.bs_num_env = src.bs_num_env;
+    dst.bs_amp_res = src.bs_amp_res;
+    dst.bs_num_noise = src.bs_num_noise;
+    dst.bs_frame_class = src.bs_frame_class;
+    dst.e_a[1] = src.e_a[1];
+}
+
+fn read_dtdf(d: *mut Data, b: *mut bitio.Bits) void {
+    for i in @as(usize, 0)..us(d.bs_num_env) {
+        d.bs_df_env[i] = b.geti(1);
+    }
+    for i in @as(usize, 0)..us(d.bs_num_noise) {
+        d.bs_df_noise[i] = b.geti(1);
+    }
+}
+
+fn read_invf(s: *Sbr, d: *mut Data, b: *mut bitio.Bits) void {
+    d.bs_invf_mode[1] = d.bs_invf_mode[0];
+    for i in @as(usize, 0)..us(s.n_q) {
+        d.bs_invf_mode[0][i] = b.geti(2);
+    }
+}
+
+fn vlc(h: *bitio.Huff, book: usize, b: *mut bitio.Bits) i32 {
+    let v = bitio.decode(h, book, b);
+    if v < 0 {
+        return -1000;
+    }
+    return v - LAV[book];
+}
+
+fn read_envelope(s: *mut Sbr, h: *bitio.Huff, b: *mut bitio.Bits, c: usize) bool {
+    let coupled = s.bs_coupling and (c == 1);
+    let delta = b2i(coupled) + 1;
+    let odd = s.n[1] & 1;
+    let d = &mut s.data[c];
+    let mut bits: u32 = 7;
+    let mut tb = T_ENV_1_5;
+    let mut fb = F_ENV_1_5;
+    if coupled {
+        if d.bs_amp_res != 0 {
+            bits = 5;
+            tb = T_ENV_BAL_3_0;
+            fb = F_ENV_BAL_3_0;
+        } else {
+            bits = 6;
+            tb = T_ENV_BAL_1_5;
+            fb = F_ENV_BAL_1_5;
+        }
+    } else if d.bs_amp_res != 0 {
+        bits = 6;
+        tb = T_ENV_3_0;
+        fb = F_ENV_3_0;
+    }
+    for i in @as(usize, 0)..us(d.bs_num_env) {
+        let res = d.bs_freq_res[i + 1];
+        let n = us(s.n[us(res)]);
+        if d.bs_df_env[i] != 0 {
+            for j in @as(usize, 0)..n {
+                let mut k = j;
+                if res != d.bs_freq_res[i] {
+                    if res != 0 {
+                        k = us((si(j) + odd) >> 1);
+                    } else if j == 0 {
+                        k = 0;
+                    } else {
+                        k = us((2 * si(j)) - odd);
+                    }
+                }
+                let v = d.env_facs_q[i][k] + (delta * vlc(h, tb, b));
+                if (v < 0) or (v > 127) {
+                    return false;
+                }
+                d.env_facs_q[i + 1][j] = v;
+            }
+        } else {
+            d.env_facs_q[i + 1][0] = delta * b.geti(bits);
+            for j in @as(usize, 1)..n {
+                let v = d.env_facs_q[i + 1][j - 1] + (delta * vlc(h, fb, b));
+                if (v < 0) or (v > 127) {
+                    return false;
+                }
+                d.env_facs_q[i + 1][j] = v;
+            }
+        }
+    }
+    d.env_facs_q[0] = d.env_facs_q[us(d.bs_num_env)];
+    return true;
+}
+
+fn read_noise(s: *mut Sbr, h: *bitio.Huff, b: *mut bitio.Bits, c: usize) bool {
+    let coupled = s.bs_coupling and (c == 1);
+    let delta = b2i(coupled) + 1;
+    let mut tb = T_NOISE_3_0;
+    let mut fb = F_ENV_3_0;
+    if coupled {
+        tb = T_NOISE_BAL_3_0;
+        fb = F_ENV_BAL_3_0;
+    }
+    let nq = us(s.n_q);
+    let d = &mut s.data[c];
+    for i in @as(usize, 0)..us(d.bs_num_noise) {
+        if d.bs_df_noise[i] != 0 {
+            for j in @as(usize, 0)..nq {
+                let v = d.noise_facs_q[i][j] + (delta * vlc(h, tb, b));
+                if (v < 0) or (v > 30) {
+                    return false;
+                }
+                d.noise_facs_q[i + 1][j] = v;
+            }
+        } else {
+            d.noise_facs_q[i + 1][0] = delta * b.geti(5);
+            for j in @as(usize, 1)..nq {
+                let v = d.noise_facs_q[i + 1][j - 1] + (delta * vlc(h, fb, b));
+                if (v < 0) or (v > 30) {
+                    return false;
+                }
+                d.noise_facs_q[i + 1][j] = v;
+            }
+        }
+    }
+    d.noise_facs_q[0] = d.noise_facs_q[us(d.bs_num_noise)];
+    return true;
+}
+
+fn read_harmonics(s: *mut Sbr, c: usize, b: *mut bitio.Bits) void {
+    let d = &mut s.data[c];
+    d.bs_add_harmonic_flag = b.get1() != 0;
+    if d.bs_add_harmonic_flag {
+        for i in @as(usize, 0)..us(s.n[1]) {
+            d.bs_add_harmonic[i] = b.geti(1);
+        }
+    }
+}
+
+fn read_sce(s: *mut Sbr, h: *bitio.Huff, b: *mut bitio.Bits) bool {
+    if b.get1() != 0 {
+        b.skip(4);
+    }
+    if not read_grid(s, b, 0) {
+        return false;
+    }
+    read_dtdf(&mut s.data[0], b);
+    read_invf(s, &mut s.data[0], b);
+    if not read_envelope(s, h, b, 0) or not read_noise(s, h, b, 0) {
+        return false;
+    }
+    read_harmonics(s, 0, b);
+    return true;
+}
+
+fn read_cpe(s: *mut Sbr, h: *bitio.Huff, b: *mut bitio.Bits) bool {
+    if b.get1() != 0 {
+        b.skip(8);
+    }
+    s.bs_coupling = b.get1() != 0;
+    if s.bs_coupling {
+        if not read_grid(s, b, 0) {
+            return false;
+        }
+        copy_grid(s);
+        read_dtdf(&mut s.data[0], b);
+        read_dtdf(&mut s.data[1], b);
+        read_invf(s, &mut s.data[0], b);
+        s.data[1].bs_invf_mode[1] = s.data[1].bs_invf_mode[0];
+        s.data[1].bs_invf_mode[0] = s.data[0].bs_invf_mode[0];
+        if not read_envelope(s, h, b, 0) or not read_noise(s, h, b, 0) or not read_envelope(s, h, b, 1) or
+           not read_noise(s, h, b, 1) {
+            return false;
+        }
+    } else {
+        if not read_grid(s, b, 0) or not read_grid(s, b, 1) {
+            return false;
+        }
+        read_dtdf(&mut s.data[0], b);
+        read_dtdf(&mut s.data[1], b);
+        read_invf(s, &mut s.data[0], b);
+        read_invf(s, &mut s.data[1], b);
+        if not read_envelope(s, h, b, 0) or not read_envelope(s, h, b, 1) or not read_noise(s, h, b, 0) or
+           not read_noise(s, h, b, 1) {
+            return false;
+        }
+    }
+    read_harmonics(s, 0, b);
+    read_harmonics(s, 1, b);
+    return true;
+}
+
+fn read_data(s: *mut Sbr, h: *bitio.Huff, ph: *bitio.Huff, b: *mut bitio.Bits, id_aac: i32, ps_allowed: bool) void {
+    s.id_aac = id_aac;
+    s.ready_for_dequant = true;
+    if (id_aac == TYPE_SCE) or (id_aac == TYPE_CCE) {
+        if not read_sce(s, h, b) {
+            turnoff(s);
+            return;
+        }
+    } else if id_aac == TYPE_CPE {
+        if not read_cpe(s, h, b) {
+            turnoff(s);
+            return;
+        }
+    } else {
+        turnoff(s);
+        return;
+    }
+    if b.get1() != 0 {
+        let mut left = b.geti(4);
+        if left == 15 {
+            left += b.geti(8);
+        }
+        left = left << 3;
+        while left > 7 {
+            left -= 2;
+            let id = b.geti(2);
+            if (id == 2) and ps_allowed {
+                left -= ps.read_data(&mut s.ps.common, b, left, ph);
+            } else {
+                b.skip(us(@max(left, 0)));
+                left = 0;
+            }
+        }
+        if left > 0 {
+            b.skip(us(left));
+        }
+    }
+}
+
+fn sbr_reset(s: *mut Sbr) void {
+    if not make_f_master(s) or not make_f_derived(s) {
+        turnoff(s);
+    }
+}
+
+/// Decodes an SBR extension payload of cnt bytes (its first 4 bits, the
+/// extension type, already read), advancing b past it. crc: the payload
+/// has a CRC. core_rate: the AAC sample rate.
+pub fn decode_extension(s: *mut Sbr, h: *bitio.Huff, ph: *bitio.Huff, b: *mut bitio.Bits, crc: bool, cnt: usize,
+                        id_aac: i32, core_rate: i32, ps_allowed: bool) void {
+    let mut g = b.*;
+    b.skip((cnt * 8) - 4);
+    let start = g.pos;
+    s.reset = false;
+    if s.sample_rate == 0 {
+        s.sample_rate = 2 * core_rate;
+    }
+    if crc {
+        g.skip(10);
+    }
+    s.kx[0] = s.kx[1];
+    s.m[0] = s.m[1];
+    s.kx_and_m_pushed = true;
+    if g.get1() != 0 {
+        read_header(s, &mut g);
+    }
+    if s.reset {
+        sbr_reset(s);
+    }
+    if s.start {
+        read_data(s, h, ph, &mut g, id_aac, ps_allowed);
+    }
+    let num_sbr_bits = g.pos - start;
+    let num_align = (((cnt << 3) - 4) -% num_sbr_bits) & 7;
+    let bytes_read = (num_sbr_bits + num_align + 4) >> 3;
+    if bytes_read > cnt {
+        turnoff(s);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Dequantisation
+// -----------------------------------------------------------------------------
+
+fn dequant(s: *mut Sbr, id_aac: i32) void {
+    let sqrt2: f64 = 1.41421356237309504880;
+    if (id_aac == TYPE_CPE) and s.bs_coupling {
+        let pan_offset: i32 = 24 - (12 * b2i(s.data[0].bs_amp_res != 0));
+        for e in @as(usize, 1)..(us(s.data[0].bs_num_env) + 1) {
+            let n = us(s.n[us(s.data[0].bs_freq_res[e])]);
+            for k in @as(usize, 0)..n {
+                let q0 = s.data[0].env_facs_q[e][k];
+                let q1 = s.data[1].env_facs_q[e][k];
+                let mut temp1: f32 = 0.0;
+                let mut temp2: f32 = 0.0;
+                if s.data[0].bs_amp_res != 0 {
+                    temp1 = exp2fi(q0 + 7);
+                    temp2 = exp2fi(pan_offset - q1);
+                } else {
+                    let mut m1: f64 = 1.0;
+                    if (q0 & 1) != 0 {
+                        m1 = sqrt2;
+                    }
+                    let mut m2: f64 = 1.0;
+                    if ((pan_offset - q1) & 1) != 0 {
+                        m2 = sqrt2;
+                    }
+                    temp1 = @float_cast(f32, @as(f64, exp2fi((q0 >> 1) + 7)) * m1);
+                    temp2 = @float_cast(f32, @as(f64, exp2fi((pan_offset - q1) >> 1)) * m2);
+                }
+                if temp1 > 1e20 {
+                    temp1 = 1.0;
+                }
+                let fac = temp1 / (1.0 + temp2);
+                s.data[0].env_facs[e][k] = fac;
+                s.data[1].env_facs[e][k] = fac * temp2;
+            }
+        }
+        for e in @as(usize, 1)..(us(s.data[0].bs_num_noise) + 1) {
+            for k in @as(usize, 0)..us(s.n_q) {
+                let temp1 = exp2fi((NOISE_FLOOR_OFFSET - s.data[0].noise_facs_q[e][k]) + 1);
+                let temp2 = exp2fi(12 - s.data[1].noise_facs_q[e][k]);
+                let fac = temp1 / (1.0 + temp2);
+                s.data[0].noise_facs[e][k] = fac;
+                s.data[1].noise_facs[e][k] = fac * temp2;
+            }
+        }
+    } else {
+        for c in @as(usize, 0)..(us(b2i(id_aac == TYPE_CPE)) + 1) {
+            let d = &mut s.data[c];
+            for e in @as(usize, 1)..(us(d.bs_num_env) + 1) {
+                for k in @as(usize, 0)..us(s.n[us(d.bs_freq_res[e])]) {
+                    let q = d.env_facs_q[e][k];
+                    let mut v: f32 = 0.0;
+                    if d.bs_amp_res != 0 {
+                        v = exp2fi(q + 6);
+                    } else {
+                        let mut m: f64 = 1.0;
+                        if (q & 1) != 0 {
+                            m = sqrt2;
+                        }
+                        v = @float_cast(f32, @as(f64, exp2fi((q >> 1) + 6)) * m);
+                    }
+                    if v > 1e20 {
+                        v = 1.0;
+                    }
+                    d.env_facs[e][k] = v;
+                }
+            }
+            for e in @as(usize, 1)..(us(d.bs_num_noise) + 1) {
+                for k in @as(usize, 0)..us(s.n_q) {
+                    d.noise_facs[e][k] = exp2fi(NOISE_FLOOR_OFFSET - d.noise_facs_q[e][k]);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// QMF banks
+// -----------------------------------------------------------------------------
+
+fn win_ds(i: usize) f32 {
+    return t.SBR_QMF_WINDOW[2 * i];
+}
+
+fn qmf_analysis(s: *mut Sbr, tw: *mut bitio.Tw, c: usize, inp: []f32) void {
+    let d = &mut s.data[c];
+    let buf_idx = d.ypos;
+    for i in @as(usize, 0)..288 {
+        d.analysis[i] = d.analysis[1024 + i];
+    }
+    for i in @as(usize, 0)..1024 {
+        d.analysis[288 + i] = inp[i];
+    }
+    let mut z: [128]f32 = [0.0; 128];
+    let mut zz: [320]f32 = [0.0; 320];
+    for l in @as(usize, 0)..32 {
+        let x = d.analysis[l * 32..];
+        for i in @as(usize, 0)..320 {
+            zz[i] = win_ds(i) * x[319 - i];
+        }
+        for k in @as(usize, 0)..64 {
+            z[k] = (((zz[k] + zz[k + 64]) + zz[k + 128]) + zz[k + 192]) + zz[k + 256];
+        }
+        // pre-shuffle into z[64..128]
+        z[64] = z[0];
+        z[65] = z[1];
+        let mut k: usize = 1;
+        while k < 31 {
+            z[64 + (2 * k)] = -z[64 - k];
+            z[65 + (2 * k)] = z[k + 1];
+            z[66 + (2 * k)] = -z[63 - k];
+            z[67 + (2 * k)] = z[k + 2];
+            k += 2;
+        }
+        z[64 + 62] = -z[64 - 31];
+        z[64 + 63] = z[32];
+        let mut o: [64]f32 = [0.0; 64];
+        bitio.imdct(tw, z[64..], o[..], -2.0 * 32768.0);
+        // post-shuffle
+        let mut kk: usize = 0;
+        while kk < 32 {
+            d.w[buf_idx][l][kk][0] = -o[63 - kk];
+            d.w[buf_idx][l][kk][1] = o[kk];
+            d.w[buf_idx][l][kk + 1][0] = -o[62 - kk];
+            d.w[buf_idx][l][kk + 1][1] = o[kk + 1];
+            kk += 2;
+        }
+    }
+}
+
+fn qmf_synthesis(s: *mut Sbr, tw: *mut bitio.Tw, out: []mut f32, xc: usize, dc: usize, div: bool) void {
+    let mut step: usize = 128;
+    let mut saved: usize = 1280 - 128;
+    let mut n: usize = 64;
+    let mut sh: u32 = 0;
+    if div {
+        step = 64;
+        saved = (1280 - 128) >> 1;
+        n = 32;
+        sh = 1;
+    }
+    let mut oo: usize = 0;
+    for i in @as(usize, 0)..32 {
+        let d = &mut s.data[dc];
+        if d.syn_offset < step {
+            for k in @as(usize, 0)..saved {
+                d.synthesis[(SYN_BUF - saved) + k] = d.synthesis[k];
+            }
+            d.syn_offset = (SYN_BUF - saved) - step;
+        } else {
+            d.syn_offset -= step;
+        }
+        let v = d.syn_offset;
+        let mut buf0: [64]f32 = [0.0; 64];
+        let mut buf1: [64]f32 = [0.0; 64];
+        if div {
+            let mut xx: [64]f32 = [0.0; 64];
+            for k in @as(usize, 0)..32 {
+                s.x[xc][0][i][k] = -s.x[xc][0][i][k];
+                s.x[xc][0][i][32 + k] = s.x[xc][1][i][31 - k];
+            }
+            for k in @as(usize, 0)..64 {
+                xx[k] = s.x[xc][0][i][k];
+            }
+            bitio.imdct(tw, xx[..], buf0[..], 1.0 / (64.0 * 32768.0));
+            let dd = &mut s.data[dc];
+            for k in @as(usize, 0)..32 {
+                dd.synthesis[v + k] = buf0[63 - (2 * k)];
+                dd.synthesis[(v + 63) - k] = -buf0[(63 - (2 * k)) - 1];
+            }
+        } else {
+            let mut x0: [64]f32 = [0.0; 64];
+            let mut x1: [64]f32 = [0.0; 64];
+            let mut k: usize = 1;
+            while k < 64 {
+                s.x[xc][1][i][k] = -s.x[xc][1][i][k];
+                s.x[xc][1][i][k + 2] = -s.x[xc][1][i][k + 2];
+                k += 4;
+            }
+            for kk in @as(usize, 0)..64 {
+                x0[kk] = s.x[xc][0][i][kk];
+                x1[kk] = s.x[xc][1][i][kk];
+            }
+            bitio.imdct(tw, x0[..], buf0[..], 1.0 / (64.0 * 32768.0));
+            bitio.imdct(tw, x1[..], buf1[..], 1.0 / (64.0 * 32768.0));
+            let dd = &mut s.data[dc];
+            for kk in @as(usize, 0)..64 {
+                dd.synthesis[v + kk] = buf1[kk] - buf0[63 - kk];
+                dd.synthesis[(v + 127) - kk] = buf1[kk] + buf0[63 - kk];
+            }
+        }
+        let syn = s.data[dc].synthesis[v..];
+        let offs: [10]usize = [0, 192, 256, 448, 512, 704, 768, 960, 1024, 1216];
+        let w = t.SBR_QMF_WINDOW[..];
+        let wstep = @as(usize, 64) << sh; // the analysis window is every other value
+        let ws = @as(usize, 1) << sh;
+        for k in @as(usize, 0)..n {
+            let mut acc = syn[k] * w[k * ws];
+            for j in @as(usize, 1)..10 {
+                acc = (syn[(offs[j] >> sh) + k] * w[((j * wstep) >> sh) + (k * ws)]) + acc;
+            }
+            out[oo + k] = acc;
+        }
+        oo += n;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// High frequency generation and adjustment
+// -----------------------------------------------------------------------------
+
+fn lf_gen(s: *mut Sbr, c: usize) void {
+    let buf_idx = s.data[c].ypos;
+    for k in @as(usize, 0)..32 {
+        for i in @as(usize, 0)..40 {
+            s.x_low[k][i] = [0.0, 0.0];
+        }
+    }
+    for k in @as(usize, 0)..us(s.kx[1]) {
+        for i in @as(usize, 8)..40 {
+            s.x_low[k][i] = s.data[c].w[buf_idx][i - 8][k];
+        }
+    }
+    let other = 1 - buf_idx;
+    for k in @as(usize, 0)..us(s.kx[0]) {
+        for i in @as(usize, 0)..8 {
+            s.x_low[k][i] = s.data[c].w[other][i + 24][k];
+        }
+    }
+}
+
+fn autocorrelate(x: *[40][2]f32, phi: *mut [3][2][2]f32) void {
+    let mut real_sum2 = (x[0][0] * x[2][0]) + (x[0][1] * x[2][1]);
+    let mut imag_sum2 = (x[0][0] * x[2][1]) - (x[0][1] * x[2][0]);
+    let mut real_sum1: f32 = 0.0;
+    let mut imag_sum1: f32 = 0.0;
+    let mut real_sum0: f32 = 0.0;
+    for i in @as(usize, 1)..38 {
+        real_sum0 += (x[i][0] * x[i][0]) + (x[i][1] * x[i][1]);
+        real_sum1 += (x[i][0] * x[i + 1][0]) + (x[i][1] * x[i + 1][1]);
+        imag_sum1 += (x[i][0] * x[i + 1][1]) - (x[i][1] * x[i + 1][0]);
+        real_sum2 += (x[i][0] * x[i + 2][0]) + (x[i][1] * x[i + 2][1]);
+        imag_sum2 += (x[i][0] * x[i + 2][1]) - (x[i][1] * x[i + 2][0]);
+    }
+    phi[0][1][0] = real_sum2;
+    phi[0][1][1] = imag_sum2;
+    phi[2][1][0] = (real_sum0 + (x[0][0] * x[0][0])) + (x[0][1] * x[0][1]);
+    phi[1][0][0] = (real_sum0 + (x[38][0] * x[38][0])) + (x[38][1] * x[38][1]);
+    phi[1][1][0] = (real_sum1 + (x[0][0] * x[1][0])) + (x[0][1] * x[1][1]);
+    phi[1][1][1] = (imag_sum1 + (x[0][0] * x[1][1])) - (x[0][1] * x[1][0]);
+    phi[0][0][0] = (real_sum1 + (x[38][0] * x[39][0])) + (x[38][1] * x[39][1]);
+    phi[0][0][1] = (imag_sum1 + (x[38][0] * x[39][1])) - (x[38][1] * x[39][0]);
+}
+
+fn hf_inverse_filter(s: *mut Sbr, k0: i32) void {
+    for k in @as(usize, 0)..us(k0) {
+        let mut phi: [3][2][2]f32 = [[[0.0; 2]; 2]; 3];
+        autocorrelate(&s.x_low[k], &mut phi);
+        let dk = (phi[2][1][0] * phi[1][0][0]) -
+                 (((phi[1][1][0] * phi[1][1][0]) + (phi[1][1][1] * phi[1][1][1])) / 1.000001);
+        if dk == 0.0 {
+            s.alpha1[k] = [0.0, 0.0];
+        } else {
+            let tr = ((phi[0][0][0] * phi[1][1][0]) - (phi[0][0][1] * phi[1][1][1])) - (phi[0][1][0] * phi[1][0][0]);
+            let ti = ((phi[0][0][0] * phi[1][1][1]) + (phi[0][0][1] * phi[1][1][0])) - (phi[0][1][1] * phi[1][0][0]);
+            s.alpha1[k] = [tr / dk, ti / dk];
+        }
+        if phi[1][0][0] == 0.0 {
+            s.alpha0[k] = [0.0, 0.0];
+        } else {
+            let tr = (phi[0][0][0] + (s.alpha1[k][0] * phi[1][1][0])) + (s.alpha1[k][1] * phi[1][1][1]);
+            let ti = (phi[0][0][1] + (s.alpha1[k][1] * phi[1][1][0])) - (s.alpha1[k][0] * phi[1][1][1]);
+            s.alpha0[k] = [-tr / phi[1][0][0], -ti / phi[1][0][0]];
+        }
+        let a1 = (s.alpha1[k][0] * s.alpha1[k][0]) + (s.alpha1[k][1] * s.alpha1[k][1]);
+        let a0 = (s.alpha0[k][0] * s.alpha0[k][0]) + (s.alpha0[k][1] * s.alpha0[k][1]);
+        if (a1 >= 16.0) or (a0 >= 16.0) {
+            s.alpha1[k] = [0.0, 0.0];
+            s.alpha0[k] = [0.0, 0.0];
+        }
+    }
+}
+
+fn chirp(s: *mut Sbr, c: usize) void {
+    let bw_tab: [4]f32 = [0.0, 0.75, 0.9, 0.98];
+    let d = &mut s.data[c];
+    for i in @as(usize, 0)..us(s.n_q) {
+        let mut new_bw: f32 = 0.0;
+        if (d.bs_invf_mode[0][i] + d.bs_invf_mode[1][i]) == 1 {
+            new_bw = 0.6;
+        } else {
+            new_bw = bw_tab[us(d.bs_invf_mode[0][i])];
+        }
+        if new_bw < d.bw_array[i] {
+            new_bw = (0.75 * new_bw) + (0.25 * d.bw_array[i]);
+        } else {
+            new_bw = (0.90625 * new_bw) + (0.09375 * d.bw_array[i]);
+        }
+        if new_bw < 0.015625 {
+            d.bw_array[i] = 0.0;
+        } else {
+            d.bw_array[i] = new_bw;
+        }
+    }
+}
+
+fn hf_gen(s: *mut Sbr, c: usize) bool {
+    let mut g: i32 = 0;
+    let mut k = us(s.kx[1]);
+    let start = us(2 * s.data[c].t_env[0]);
+    let end = us(2 * s.data[c].t_env[us(s.data[c].bs_num_env)]);
+    for j in @as(usize, 0)..us(s.num_patches) {
+        for x in @as(usize, 0)..us(s.patch_num_subbands[j]) {
+            let p = us(s.patch_start_subband[j]) + x;
+            while (g <= s.n_q) and (si(k) >= s.f_tablenoise[us(g)]) {
+                g += 1;
+            }
+            g -= 1;
+            if (g < 0) or (k >= 64) or (p >= 32) {
+                return false;
+            }
+            let bw = s.data[c].bw_array[us(g)];
+            let al0 = s.alpha0[p];
+            let al1 = s.alpha1[p];
+            let a0 = (al1[0] * bw) * bw;
+            let a1 = (al1[1] * bw) * bw;
+            let a2 = al0[0] * bw;
+            let a3 = al0[1] * bw;
+            for i in start..end {
+                let ii = i + ENV_OFF;
+                let lo = &s.x_low[p];
+                let re = ((((lo[ii - 2][0] * a0) - (lo[ii - 2][1] * a1)) + (lo[ii - 1][0] * a2)) - (lo[ii - 1][1] * a3)) +
+                         lo[ii][0];
+                let im = ((((lo[ii - 2][1] * a0) + (lo[ii - 2][0] * a1)) + (lo[ii - 1][1] * a2)) + (lo[ii - 1][0] * a3)) +
+                         lo[ii][1];
+                s.x_high[k][ii] = [re, im];
+            }
+            k += 1;
+        }
+    }
+    let top = us(s.m[1] + s.kx[1]);
+    while k < top {
+        for i in @as(usize, 0)..40 {
+            s.x_high[k][i] = [0.0, 0.0];
+        }
+        k += 1;
+    }
+    return true;
+}
+
+fn x_gen(s: *mut Sbr, c: usize) void {
+    let ypos = s.data[c].ypos;
+    let y0 = 1 - ypos; // the previous frame's Y
+    let i_temp = us(@max((2 * s.data[c].t_env_num_env_old) - 32, 0));
+    for a in @as(usize, 0)..2 {
+        for i in @as(usize, 0)..38 {
+            for k in @as(usize, 0)..64 {
+                s.x[c][a][i][k] = 0.0;
+            }
+        }
+    }
+    let mut k: usize = 0;
+    while k < us(s.kx[0]) {
+        for i in @as(usize, 0)..i_temp {
+            s.x[c][0][i][k] = s.x_low[k][i + ENV_OFF][0];
+            s.x[c][1][i][k] = s.x_low[k][i + ENV_OFF][1];
+        }
+        k += 1;
+    }
+    while k < us(s.kx[0] + s.m[0]) {
+        for i in @as(usize, 0)..i_temp {
+            s.x[c][0][i][k] = s.data[c].y[y0][i + 32][k][0];
+            s.x[c][1][i][k] = s.data[c].y[y0][i + 32][k][1];
+        }
+        k += 1;
+    }
+    k = 0;
+    while k < us(s.kx[1]) {
+        for i in i_temp..38 {
+            s.x[c][0][i][k] = s.x_low[k][i + ENV_OFF][0];
+            s.x[c][1][i][k] = s.x_low[k][i + ENV_OFF][1];
+        }
+        k += 1;
+    }
+    while k < us(s.kx[1] + s.m[1]) {
+        for i in i_temp..32 {
+            s.x[c][0][i][k] = s.data[c].y[ypos][i][k][0];
+            s.x[c][1][i][k] = s.data[c].y[ypos][i][k][1];
+        }
+        k += 1;
+    }
+}
+
+fn mapping(s: *mut Sbr, c: usize) bool {
+    let kx1 = s.kx[1];
+    let e_a1 = s.data[c].e_a[1];
+    for e in @as(usize, 1)..8 {
+        for m in @as(usize, 0)..48 {
+            s.data[c].s_indexmapped[e][m] = 0;
+        }
+    }
+    for e in @as(usize, 0)..us(s.data[c].bs_num_env) {
+        let res = s.data[c].bs_freq_res[e + 1];
+        let ilim = us(s.n[us(res)]);
+        let high = res != 0;
+        let t0 = if_table(s, high, 0);
+        if kx1 != t0 {
+            turnoff(s);
+            return false;
+        }
+        for i in @as(usize, 0)..ilim {
+            for m in if_table(s, high, i)..if_table(s, high, i + 1) {
+                s.e_origmapped[e][us(m - kx1)] = s.data[c].env_facs[e + 1][i];
+            }
+        }
+        let k = us(b2i((s.data[c].bs_num_noise > 1) and (s.data[c].t_env[e] >= s.data[c].t_q[1])));
+        for i in @as(usize, 0)..us(s.n_q) {
+            for m in s.f_tablenoise[i]..s.f_tablenoise[i + 1] {
+                s.q_mapped[e][us(m - kx1)] = s.data[c].noise_facs[k + 1][i];
+            }
+        }
+        for i in @as(usize, 0)..us(s.n[1]) {
+            if s.data[c].bs_add_harmonic_flag {
+                let mid = us(((s.f_tablehigh[i] + s.f_tablehigh[i + 1]) >> 1) - kx1);
+                s.data[c].s_indexmapped[e + 1][mid] = s.data[c].bs_add_harmonic[i] *
+                    b2i((si(e) >= e_a1) or (s.data[c].s_indexmapped[0][mid] == 1));
+            }
+        }
+        for i in @as(usize, 0)..ilim {
+            let a = if_table(s, high, i);
+            let bnd = if_table(s, high, i + 1);
+            let mut present: i32 = 0;
+            for m in a..bnd {
+                if s.data[c].s_indexmapped[e + 1][us(m - kx1)] != 0 {
+                    present = 1;
+                    break;
+                }
+            }
+            for m in a..bnd {
+                s.s_mapped[e][us(m - kx1)] = present;
+            }
+        }
+    }
+    let ne = us(s.data[c].bs_num_env);
+    s.data[c].s_indexmapped[0] = s.data[c].s_indexmapped[ne];
+    return true;
+}
+
+fn if_table(s: *Sbr, high: bool, i: usize) i32 {
+    if high {
+        return s.f_tablehigh[i];
+    }
+    return s.f_tablelow[i];
+}
+
+fn sum_square(x: *[40][2]f32, ilb: usize, n: usize) f32 {
+    let mut sum0: f32 = 0.0;
+    let mut sum1: f32 = 0.0;
+    let mut i: usize = 0;
+    while i < n {
+        sum0 += x[ilb + i][0] * x[ilb + i][0];
+        sum1 += x[ilb + i][1] * x[ilb + i][1];
+        sum0 += x[ilb + i + 1][0] * x[ilb + i + 1][0];
+        sum1 += x[ilb + i + 1][1] * x[ilb + i + 1][1];
+        i += 2;
+    }
+    return sum0 + sum1;
+}
+
+fn env_estimate(s: *mut Sbr, c: usize) void {
+    let kx1 = s.kx[1];
+    let d = &s.data[c];
+    if s.bs_interpol_freq != 0 {
+        for e in @as(usize, 0)..us(d.bs_num_env) {
+            let recip = 0.5 / @float_from_int(f32, d.t_env[e + 1] - d.t_env[e]);
+            let ilb = us(d.t_env[e] * 2) + ENV_OFF;
+            let iub = us(d.t_env[e + 1] * 2) + ENV_OFF;
+            for m in @as(usize, 0)..us(s.m[1]) {
+                let sum = sum_square(&s.x_high[m + us(kx1)], ilb, iub - ilb);
+                s.e_curr[e][m] = sum * recip;
+            }
+        }
+    } else {
+        for e in @as(usize, 0)..us(d.bs_num_env) {
+            let env_size = 2 * (d.t_env[e + 1] - d.t_env[e]);
+            let ilb = us(d.t_env[e] * 2) + ENV_OFF;
+            let iub = us(d.t_env[e + 1] * 2) + ENV_OFF;
+            let high = d.bs_freq_res[e + 1] != 0;
+            for p in @as(usize, 0)..us(s.n[us(d.bs_freq_res[e + 1])]) {
+                let a = if_table(s, high, p);
+                let bnd = if_table(s, high, p + 1);
+                let mut sum: f32 = 0.0;
+                let den = env_size * (bnd - a);
+                for k in a..bnd {
+                    sum += sum_square(&s.x_high[us(k)], ilb, iub - ilb);
+                }
+                sum = sum / @float_from_int(f32, den);
+                for k in a..bnd {
+                    s.e_curr[e][us(k - kx1)] = sum;
+                }
+            }
+        }
+    }
+}
+
+fn gain_calc(s: *mut Sbr, c: usize) void {
+    let limgain: [4]f32 = [0.70795, 1.0, 1.41254, 10000000000.0];
+    let d = &s.data[c];
+    for e in @as(usize, 0)..us(d.bs_num_env) {
+        let delta = b2i(not ((si(e) == d.e_a[1]) or (si(e) == d.e_a[0])));
+        for k in @as(usize, 0)..us(s.n_lim) {
+            let lo = us(s.f_tablelim[k] - s.kx[1]);
+            let hi = us(s.f_tablelim[k + 1] - s.kx[1]);
+            for m in lo..hi {
+                let temp = s.e_origmapped[e][m] / (1.0 + s.q_mapped[e][m]);
+                s.q_m[e][m] = sqrtf(temp * s.q_mapped[e][m]);
+                s.s_m[e][m] = sqrtf(temp * @float_from_int(f32, d.s_indexmapped[e + 1][m]));
+                if s.s_mapped[e][m] == 0 {
+                    s.gain[e][m] = sqrtf(s.e_origmapped[e][m] /
+                                         ((1.0 + s.e_curr[e][m]) * (1.0 + (s.q_mapped[e][m] * @float_from_int(f32, delta)))));
+                } else {
+                    s.gain[e][m] = sqrtf((s.e_origmapped[e][m] * s.q_mapped[e][m]) /
+                                         ((1.0 + s.e_curr[e][m]) * (1.0 + s.q_mapped[e][m])));
+                }
+                s.gain[e][m] += FLT_MIN;
+            }
+            let mut sum0: f32 = 0.0;
+            let mut sum1: f32 = 0.0;
+            for m in lo..hi {
+                sum0 += s.e_origmapped[e][m];
+                sum1 += s.e_curr[e][m];
+            }
+            let mut gain_max = limgain[us(s.bs_limiter_gains)] * sqrtf((FLT_EPSILON + sum0) / (FLT_EPSILON + sum1));
+            gain_max = @min(100000.0, gain_max);
+            for m in lo..hi {
+                let q_m_max = (s.q_m[e][m] * gain_max) / s.gain[e][m];
+                s.q_m[e][m] = @min(s.q_m[e][m], q_m_max);
+                s.gain[e][m] = @min(s.gain[e][m], gain_max);
+            }
+            sum0 = 0.0;
+            sum1 = 0.0;
+            for m in lo..hi {
+                sum0 += s.e_origmapped[e][m];
+                let noise = @float_from_int(f32, b2i((delta != 0) and (s.s_m[e][m] == 0.0)));
+                sum1 += (((s.e_curr[e][m] * s.gain[e][m]) * s.gain[e][m]) + (s.s_m[e][m] * s.s_m[e][m])) +
+                        ((noise * s.q_m[e][m]) * s.q_m[e][m]);
+            }
+            let mut gain_boost = sqrtf((FLT_EPSILON + sum0) / (FLT_EPSILON + sum1));
+            gain_boost = @min(1.584893192, gain_boost);
+            for m in lo..hi {
+                s.gain[e][m] = s.gain[e][m] * gain_boost;
+                s.q_m[e][m] = s.q_m[e][m] * gain_boost;
+                s.s_m[e][m] = s.s_m[e][m] * gain_boost;
+            }
+        }
+    }
+}
+
+let H_SMOOTH: [5]f32 = [0.33333333333333, 0.30150283239582, 0.21816949906249, 0.11516383427084, 0.03183050093751];
+
+fn hf_assemble(s: *mut Sbr, c: usize) void {
+    let h_sl = us(4 * b2i(s.bs_smoothing_mode == 0));
+    let kx = us(s.kx[1]);
+    let m_max = us(s.m[1]);
+    let ypos = s.data[c].ypos;
+    let mut indexnoise = s.data[c].f_indexnoise;
+    let mut indexsine = s.data[c].f_indexsine;
+    let t0 = us(2 * s.data[c].t_env[0]);
+    if s.reset {
+        for i in @as(usize, 0)..h_sl {
+            for m in @as(usize, 0)..m_max {
+                s.data[c].g_temp[i + t0][m] = s.gain[0][m];
+                s.data[c].q_temp[i + t0][m] = s.q_m[0][m];
+            }
+        }
+    } else if h_sl != 0 {
+        let told = us(2 * s.data[c].t_env_num_env_old);
+        for i in @as(usize, 0)..4 {
+            s.data[c].g_temp[i + t0] = s.data[c].g_temp[i + told];
+            s.data[c].q_temp[i + t0] = s.data[c].q_temp[i + told];
+        }
+    }
+    let ne = us(s.data[c].bs_num_env);
+    for e in @as(usize, 0)..ne {
+        for i in us(2 * s.data[c].t_env[e])..us(2 * s.data[c].t_env[e + 1]) {
+            for m in @as(usize, 0)..m_max {
+                s.data[c].g_temp[h_sl + i][m] = s.gain[e][m];
+                s.data[c].q_temp[h_sl + i][m] = s.q_m[e][m];
+            }
+        }
+    }
+    let e_a0 = s.data[c].e_a[0];
+    let e_a1 = s.data[c].e_a[1];
+    for e in @as(usize, 0)..ne {
+        let ei = si(e);
+        for i in us(2 * s.data[c].t_env[e])..us(2 * s.data[c].t_env[e + 1]) {
+            let mut g_filt: [48]f32 = [0.0; 48];
+            let mut q_filt: [48]f32 = [0.0; 48];
+            if (h_sl != 0) and (ei != e_a0) and (ei != e_a1) {
+                for m in @as(usize, 0)..m_max {
+                    let idx1 = i + h_sl;
+                    let mut gf: f32 = 0.0;
+                    let mut qf: f32 = 0.0;
+                    for j in @as(usize, 0)..(h_sl + 1) {
+                        gf += s.data[c].g_temp[idx1 - j][m] * H_SMOOTH[j];
+                        qf += s.data[c].q_temp[idx1 - j][m] * H_SMOOTH[j];
+                    }
+                    g_filt[m] = gf;
+                    q_filt[m] = qf;
+                }
+            } else {
+                g_filt = s.data[c].g_temp[i + h_sl];
+                q_filt = s.data[c].q_temp[i];
+            }
+            // g_filt
+            let ixh = i + ENV_OFF;
+            for m in @as(usize, 0)..m_max {
+                s.data[c].y[ypos][i][kx + m][0] = s.x_high[kx + m][ixh][0] * g_filt[m];
+                s.data[c].y[ypos][i][kx + m][1] = s.x_high[kx + m][ixh][1] * g_filt[m];
+            }
+            if (ei != e_a0) and (ei != e_a1) {
+                // noise and sinusoids
+                let mut phi0: f32 = 0.0;
+                let mut phi1: f32 = 0.0;
+                let kodd = 1.0 - (2.0 * @float_from_int(f32, si(kx & 1)));
+                if indexsine == 0 {
+                    phi0 = 1.0;
+                } else if indexsine == 1 {
+                    phi1 = kodd;
+                } else if indexsine == 2 {
+                    phi0 = -1.0;
+                } else {
+                    phi1 = -kodd;
+                }
+                let mut noise = indexnoise;
+                for m in @as(usize, 0)..m_max {
+                    let mut y0 = s.data[c].y[ypos][i][kx + m][0];
+                    let mut y1 = s.data[c].y[ypos][i][kx + m][1];
+                    noise = (noise + 1) & 0x1ff;
+                    if s.s_m[e][m] != 0.0 {
+                        y0 += s.s_m[e][m] * phi0;
+                        y1 += s.s_m[e][m] * phi1;
+                    } else {
+                        y0 += q_filt[m] * t.SBR_NOISE[us(noise) * 2];
+                        y1 += q_filt[m] * t.SBR_NOISE[(us(noise) * 2) + 1];
+                    }
+                    s.data[c].y[ypos][i][kx + m][0] = y0;
+                    s.data[c].y[ypos][i][kx + m][1] = y1;
+                    phi1 = -phi1;
+                }
+            } else {
+                let idx = us(indexsine & 1);
+                let a = 1 - ((indexsine + si(kx & 1)) & 2);
+                let bb = (a ^ -si(idx)) + si(idx);
+                let fa = @float_from_int(f32, a);
+                let fb = @float_from_int(f32, bb);
+                let mut m: usize = 0;
+                while (m + 1) < m_max {
+                    s.data[c].y[ypos][i][kx + m][idx] += s.s_m[e][m] * fa;
+                    s.data[c].y[ypos][i][kx + m + 1][idx] += s.s_m[e][m + 1] * fb;
+                    m += 2;
+                }
+                if (m_max & 1) != 0 {
+                    s.data[c].y[ypos][i][kx + m][idx] += s.s_m[e][m] * fa;
+                }
+            }
+            indexnoise = (indexnoise + si(m_max)) & 0x1ff;
+            indexsine = (indexsine + 1) & 3;
+        }
+    }
+    s.data[c].f_indexnoise = indexnoise;
+    s.data[c].f_indexsine = indexsine;
+}
+
+/// Replicates the high band of l (and r, for a channel pair) in place:
+/// 1024 samples in, 2048 out (1024 when downsampled). ps_mode: parametric
+/// stereo makes r from l.
+pub fn apply(s: *mut Sbr, tw: *mut bitio.Tw, id_aac: i32, l: []mut f32, r: []mut f32, ps_mode: bool, downsampled: bool) void {
+    let mut nch: usize = 1;
+    if id_aac == TYPE_CPE {
+        nch = 2;
+    }
+    if id_aac != s.id_aac {
+        turnoff(s);
+    }
+    if s.start and not s.ready_for_dequant {
+        turnoff(s);
+    }
+    if not s.kx_and_m_pushed {
+        s.kx[0] = s.kx[1];
+        s.m[0] = s.m[1];
+    } else {
+        s.kx_and_m_pushed = false;
+    }
+    if s.start {
+        dequant(s, id_aac);
+        s.ready_for_dequant = false;
+    }
+    for c in @as(usize, 0)..nch {
+        if c == 0 {
+            qmf_analysis(s, tw, 0, l);
+        } else {
+            qmf_analysis(s, tw, 1, r);
+        }
+        lf_gen(s, c);
+        s.data[c].ypos ^= 1;
+        if s.start {
+            hf_inverse_filter(s, s.k[0]);
+            chirp(s, c);
+            if s.data[c].bs_num_env > 0 {
+                let ok = hf_gen(s, c);
+                _ = ok;
+                if mapping(s, c) {
+                    env_estimate(s, c);
+                    gain_calc(s, c);
+                    hf_assemble(s, c);
+                }
+            }
+        }
+        x_gen(s, c);
+    }
+    if ps_mode {
+        if s.ps.common.start {
+            ps.apply(&mut s.ps, &mut s.x, s.kx[1] + s.m[1]);
+        } else {
+            s.x[1] = s.x[0];
+        }
+        nch = 2;
+    }
+    qmf_synthesis(s, tw, l, 0, 0, downsampled);
+    if nch == 2 {
+        qmf_synthesis(s, tw, r, 1, 1, downsampled);
+    }
+}

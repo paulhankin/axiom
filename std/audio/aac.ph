@@ -5,19 +5,21 @@
 //     let mut s = aac.decode(bytes)!;   // F32 samples
 //     defer s.deinit();
 //
-// AAC Main, LC and LTP (aac/decoder.ph), 1 to 48 channels (the standard
+// AAC Main, LC and LTP (aac/decoder.ph), HE-AAC (spectral band
+// replication, aac/sbr.ph) and HE-AAC v2 (parametric stereo, aac/ps.ph),
+// signalled explicitly or implicitly; up to 64 channels (the standard
 // channel configurations, in FFmpeg's channel order, or a program
-// configuration element). An MP4 file's first audio track is decoded and
-// trimmed by its edit list (or iTunes' iTunSMPB gapless information), so
-// the output has exactly the encoded length; an ADTS stream is decoded
-// whole, including the encoder's priming. HE-AAC files decode their AAC
-// core, at half the sample rate (spectral band replication is not
-// applied).
+// configuration element). Mono HE-AAC decodes to stereo, as in FFmpeg
+// (parametric stereo may appear). An MP4 file's first audio track is
+// decoded and trimmed by its edit list (or iTunes' iTunSMPB gapless
+// information), so the output has exactly the encoded length; an ADTS
+// stream is decoded whole, including the encoder's priming.
 // =============================================================================
 
 import "../audio.ph" as audio;
 import "../mem.ph" as mem;
 import "../vec.ph" as vec;
+import "aac/bits.ph" as bitio;
 import "aac/decoder.ph" as dec;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
@@ -77,14 +79,14 @@ struct Out {
     channels: usize,
 }
 
-fn emit(o: *mut Out, block: []f32, n: usize) !void {
-    if ((o.frames + 1024) * n) > audio.MAX_SAMPLES {
+fn emit(o: *mut Out, block: []f32, n: usize, frames: usize) !void {
+    if ((o.frames + frames) * n) > audio.MAX_SAMPLES {
         return error.TooLarge;
     }
-    for i in @as(usize, 0)..(1024 * n) {
+    for i in @as(usize, 0)..(frames * n) {
         o.v.push(block[i])!;
     }
-    o.frames += 1024;
+    o.frames += frames;
 }
 
 fn finish(o: *mut Out, rate: i32, skip0: usize, total0: usize) !audio.Sound {
@@ -114,7 +116,7 @@ fn decode_adts(data: []u8) !audio.Sound {
         }
         mem.free(d);
     }
-    let block = mem.alloc.[f32](1024 * 64)!;
+    let block = mem.alloc.[f32](2048 * 64)!;
     defer mem.free(block);
     let mut out = Out.{ v: vec.Vec.[f32].init(), frames: 0, channels: 0 };
     defer out.v.deinit();
@@ -172,16 +174,16 @@ fn decode_adts(data: []u8) !audio.Sound {
         } else if ((profile + 1) != first_aot) or (rate_index != first_rate) or (chan != first_chan) {
             return error.Unsupported; // the format changes mid-stream
         }
-        let mut b = dec.Bits.init(data[o + hl..o + len]);
+        let mut b = bitio.Bits.init(data[o + hl..o + len]);
         for _k in @as(usize, 0)..nblocks {
             let got = dec.decode_block(&mut d[0], &mut b, block)!;
-            if got {
+            if got > 0 {
                 let n = dec.channels(&d[0]);
                 if (out.channels != 0) and (out.channels != n) {
                     return error.Unsupported;
                 }
                 out.channels = n;
-                emit(&mut out, block, n)!;
+                emit(&mut out, block, n, got)!;
             }
             b.align();
         }
@@ -191,7 +193,7 @@ fn decode_adts(data: []u8) !audio.Sound {
         return error.InvalidAudio;
     }
     let total = out.frames;
-    return finish(&mut out, d[0].cfg.sample_rate, 0, total);
+    return finish(&mut out, dec.output_rate(&d[0]), 0, total);
 }
 
 // -----------------------------------------------------------------------------
@@ -525,7 +527,7 @@ fn decode_mp4(data: []u8) !audio.Sound {
         d[0].deinit();
         mem.free(d);
     }
-    let block = mem.alloc.[f32](1024 * 64)!;
+    let block = mem.alloc.[f32](2048 * 64)!;
     defer mem.free(block);
     let mut out = Out.{ v: vec.Vec.[f32].init(), frames: 0, channels: 0 };
     defer out.v.deinit();
@@ -578,15 +580,15 @@ fn decode_mp4(data: []u8) !audio.Sound {
             if (pos > data.len) or (size > (data.len - pos)) {
                 return error.InvalidAudio;
             }
-            let mut b = dec.Bits.init(data[pos..pos + size]);
+            let mut b = bitio.Bits.init(data[pos..pos + size]);
             let got = dec.decode_block(&mut d[0], &mut b, block)!;
-            if got {
+            if got > 0 {
                 let n = dec.channels(&d[0]);
                 if (out.channels != 0) and (out.channels != n) {
                     return error.Unsupported;
                 }
                 out.channels = n;
-                emit(&mut out, block, n)!;
+                emit(&mut out, block, n, got)!;
             }
             pos += size;
             sample += 1;
@@ -596,7 +598,8 @@ fn decode_mp4(data: []u8) !audio.Sound {
         return error.InvalidAudio;
     }
     // trimming: the edit list, else iTunes' gapless information
-    let rate = @as(u64, @bit_cast(u32, cfg.sample_rate));
+    let orate = dec.output_rate(&d[0]);
+    let rate = @as(u64, @bit_cast(u32, orate));
     let ts = @as(u64, tr.timescale);
     let mut skip: usize = 0;
     let mut total = out.frames;
@@ -621,7 +624,7 @@ fn decode_mp4(data: []u8) !audio.Sound {
             total = @truncate(usize, length);
         }
     }
-    return finish(&mut out, cfg.sample_rate, skip, total);
+    return finish(&mut out, orate, skip, total);
 }
 
 /// Decodes an ADTS stream or an MP4 file's first AAC track to F32 samples.
@@ -699,14 +702,21 @@ test "decodes like FFmpeg" {
             let g = @min(@max(got[k] * 32768.0, -32768.0), 32767.0);
             worst = @max(worst, @abs(g - w));
         }
-        @expect(worst <= 1.0);
+        // SBR and PS amplify rounding differences: FFmpeg's own C and SIMD
+        // code differ by up to 0.75 of a 16-bit step on these streams
+        let mut limit: f32 = 1.0;
+        if (name.len >= 2) and @mem_eq(name[..2], "he") {
+            limit = 2.0;
+        }
+        @expect(worst <= limit);
         n += 1;
     }
-    @expect_eq(n, 11);
+    @expect_eq(n, 17);
 }
 
 test "rejects damaged files" {
-    let names: [2][]u8 = ["std/audio/testdata/aac/lc_mono.aac", "std/audio/testdata/aac/main.m4a"];
+    let names: [3][]u8 = ["std/audio/testdata/aac/lc_mono.aac", "std/audio/testdata/aac/main.m4a",
+                          "std/audio/testdata/aac/he_v2.aac"];
     let mut seed: u32 = 777;
     for name in names {
         let data = fs.read_file(name) catch return;
