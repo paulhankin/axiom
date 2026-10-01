@@ -1,6 +1,6 @@
 // util.h - arenas, growable arrays, string interning, source files.
-#ifndef PH_UTIL_H
-#define PH_UTIL_H
+#ifndef AX_UTIL_H
+#define AX_UTIL_H
 
 #include <stdbool.h>
 #include <stddef.h>

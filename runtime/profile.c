@@ -1,13 +1,13 @@
-// runtime/profile.c - sampling profiler for native Phalange programs (spec
-// §16.6). `phalange profile` links this in and runs the program with
-// PHALANGE_PROFILE=<raw output file> and PHALANGE_PROFILE_HZ=<rate>.
+// runtime/profile.c - sampling profiler for native Axiom programs (spec
+// §16.6). `axiom profile` links this in and runs the program with
+// AXIOM_PROFILE=<raw output file> and AXIOM_PROFILE_HZ=<rate>.
 //
 // A SIGPROF timer on the process CPU clock interrupts whichever thread
 // is running; the handler copies that thread's shadow stack (§16.4) into a
 // preallocated buffer. At exit the samples are aggregated and written in the
-// raw format read by `phalange profile`:
+// raw format read by `axiom profile`:
 //
-//   # phalange-profile-raw 1
+//   # axiom-profile-raw 1
 //   hz <rate>
 //   clock cpu
 //   S <count> <depth> <leaf> <site>...        (tab-separated, sites innermost first)
@@ -26,7 +26,7 @@
 
 #include "trap_format.h"
 
-const struct ph_shadow_stack *phalange_shadow_stack(void);
+const struct ax_shadow_stack *axiom_shadow_stack(void);
 
 #define BUF_WORDS (32u << 20)  // 256 MiB of address space, touched only as used
 static uintptr_t *buf;
@@ -44,10 +44,10 @@ static int timer_ok;
 static void on_prof(int sig, siginfo_t *si, void *uc) {
     (void)sig;
     (void)uc;
-    const struct ph_shadow_stack *ss = phalange_shadow_stack();
+    const struct ax_shadow_stack *ss = axiom_shadow_stack();
     if (!ss) return;
     uint32_t depth = __atomic_load_n(&ss->depth, __ATOMIC_RELAXED);
-    uint32_t n = depth < PH_SS_CAP ? depth : PH_SS_CAP;
+    uint32_t n = depth < AX_SS_CAP ? depth : AX_SS_CAP;
     size_t at = __atomic_fetch_add(&buf_pos, (size_t)n + 2, __ATOMIC_RELAXED);
     if (at + n + 2 > BUF_WORDS) {
         __atomic_fetch_add(&dropped, 1, __ATOMIC_RELAXED);
@@ -56,7 +56,7 @@ static void on_prof(int sig, siginfo_t *si, void *uc) {
     // depth, with the top bit set for threads other than the main one
     buf[at] = depth | (gettid() == getpid() ? 0 : (uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1));
     buf[at + 1] = 1 + (uintptr_t)(si->si_code == SI_TIMER && si->si_overrun > 0 ? si->si_overrun : 0);
-    for (uint32_t i = 0; i < n; i++) buf[at + 2 + i] = (uintptr_t)ss->calls[(depth - 1 - i) & (PH_SS_CAP - 1)];
+    for (uint32_t i = 0; i < n; i++) buf[at + 2 + i] = (uintptr_t)ss->calls[(depth - 1 - i) & (AX_SS_CAP - 1)];
 }
 
 // Aggregation: an open-addressing table keyed by the sample's words.
@@ -75,10 +75,10 @@ static uint64_t hash_sample(const uintptr_t *s, size_t n) {
 
 static size_t sample_len(size_t at) {
     uintptr_t d = buf[at] & ~THREAD_BIT;
-    return 2 + (d < PH_SS_CAP ? d : PH_SS_CAP);
+    return 2 + (d < AX_SS_CAP ? d : AX_SS_CAP);
 }
 
-static void put_site(FILE *f, const struct ph_trap_site *s) {
+static void put_site(FILE *f, const struct ax_trap_site *s) {
     fprintf(f, "\t%u\x1f%u\x1f%u\x1f%s", s->file_id, s->start, s->end, s->fn);
 }
 
@@ -90,7 +90,7 @@ static void write_profile(void) {
     size_t end = buf_pos < BUF_WORDS ? buf_pos : BUF_WORDS;
     FILE *f = fopen(out_path, "w");
     if (!f) return;
-    fprintf(f, "# phalange-profile-raw 1\nhz %d\nclock cpu\n", hz);
+    fprintf(f, "# axiom-profile-raw 1\nhz %d\nclock cpu\n", hz);
     if (dropped) fprintf(f, "dropped %lu\n", dropped);
     size_t cap = 1024;
     while (cap < end / 4) cap <<= 1;
@@ -124,23 +124,23 @@ static void write_profile(void) {
         if (!tab[i].count) continue;
         const uintptr_t *s = buf + tab[i].at;
         size_t n = sample_len(tab[i].at) - 2;
-        const struct ph_trap_site *inner = n ? (const struct ph_trap_site *)s[2] : NULL;
+        const struct ax_trap_site *inner = n ? (const struct ax_trap_site *)s[2] : NULL;
         const char *leaf = inner ? (inner->callee[0] ? inner->callee : "<indirect call>")
                            : s[0] & THREAD_BIT ? "<thread entry>" : "main";
         fprintf(f, "S\t%lu\t%lu\t%s", tab[i].count, (unsigned long)(s[0] & ~THREAD_BIT), leaf);
-        for (size_t k = 0; k < n; k++) put_site(f, (const struct ph_trap_site *)s[2 + k]);
+        for (size_t k = 0; k < n; k++) put_site(f, (const struct ax_trap_site *)s[2 + k]);
         fputc('\n', f);
     }
     free(tab);
     fclose(f);
 }
 
-void ph_profile_flush(void) { write_profile(); }
+void ax_profile_flush(void) { write_profile(); }
 
-__attribute__((constructor)) static void ph_profile_start(void) {
-    out_path = getenv("PHALANGE_PROFILE");
+__attribute__((constructor)) static void ax_profile_start(void) {
+    out_path = getenv("AXIOM_PROFILE");
     if (!out_path || !*out_path) return;
-    const char *r = getenv("PHALANGE_PROFILE_HZ");
+    const char *r = getenv("AXIOM_PROFILE_HZ");
     if (r && atoi(r) > 0) hz = atoi(r);
     buf = mmap(NULL, BUF_WORDS * sizeof *buf, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (buf == MAP_FAILED) return;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/text/hyphen/en_us.ph, the American English hyphenation patterns
+"""Generates std/text/hyphen/en_us.ax, the American English hyphenation patterns
 and exceptions of the hyph-utf8 package (TeX's ushyphmax: Knuth's patterns
 with Gerard D.C. Kuiken's additions), and std/text/hyphen/testdata/words.txt,
 words from the CommonMark specification hyphenated by a reference
@@ -45,7 +45,7 @@ def lines(words, per):
     return out
 
 
-with open(os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ph'), 'w') as f:
+with open(os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ax'), 'w') as f:
     f.write(NOTICE + '\n')
     f.write('/// The %d patterns, separated by spaces.\n' % len(pats))
     f.write('pub let PATTERNS: []u8 = "%s";\n\n' % ' '.join(pats))
@@ -53,9 +53,9 @@ with open(os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ph'), 'w') as f:
     f.write('pub let EXCEPTIONS: []u8 = "%s";\n\n' % ' '.join(exc))
     f.write('/// The fewest letters to leave before and after a hyphen.\n')
     f.write('pub const LEFT_MIN: usize = 2;\npub const RIGHT_MIN: usize = 3;\n')
-exe = os.path.join(root, 'selfhost', 'build', 'phalange')
+exe = os.path.join(root, 'selfhost', 'build', 'axiom')
 if os.path.exists(exe):
-    subprocess.run([exe, 'fmt', os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ph')], check=False)
+    subprocess.run([exe, 'fmt', os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ax')], check=False)
 
 # the reference implementation
 tree = {}

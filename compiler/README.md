@@ -1,18 +1,18 @@
-# phalange — the Phalange compiler
+# axiom — the Axiom compiler
 
-A small, fast compiler for [Phalange](../spec/phalange.md), written in C11 with an LLVM
-backend. It compiles `.ph` programs to WebAssembly modules (the primary target) or to
+A small, fast compiler for [Axiom](../spec/axiom.md), written in C11 with an LLVM
+backend. It compiles `.ax` programs to WebAssembly modules (the primary target) or to
 native executables.
 
-[`selfhost/`](../selfhost/README.md) has a port of this compiler to Phalange, which this
+[`selfhost/`](../selfhost/README.md) has a port of this compiler to Axiom, which this
 one bootstraps. The port has the same front end (identical diagnostics, so a change to
 one belongs in both) and its own backends instead of LLVM; programs must behave the same
 with either compiler. `selfhost/difftest.sh` compares them.
 
 ```
 $ make -C compiler
-$ ./compiler/build/phalange build examples/dot_product.ph -O2 -o engine.wasm
-$ ./compiler/build/phalange check examples/shapes.ph --format=agent-json
+$ ./compiler/build/axiom build examples/dot_product.ax -O2 -o engine.wasm
+$ ./compiler/build/axiom check examples/shapes.ax --format=agent-json
 ```
 
 ## Requirements
@@ -27,13 +27,13 @@ $ ./compiler/build/phalange check examples/shapes.ph --format=agent-json
 ## Usage
 
 ```
-phalange build <file.ph> [options]    compile and link
-phalange check <file.ph> [options]    parse and type-check only
-phalange test  <file.ph> [options]    build and run the file's test blocks (spec §17)
+axiom build <file.ax> [options]    compile and link
+axiom check <file.ax> [options]    parse and type-check only
+axiom test  <file.ax> [options]    build and run the file's test blocks (spec §17)
                                       --filter=<text> --timeout=<ms> (default 10000)
-phalange new   <name>                 create a package (phalange.toml, src/lib.ph)
-phalange cache [path|clean]           the compiled-module cache
-phalange profile <file.ph> [options]  build, run under the sampling profiler, report (spec §16.6)
+axiom new   <name>                 create a package (axiom.toml, src/lib.ax)
+axiom cache [path|clean]           the compiled-module cache
+axiom profile <file.ax> [options]  build, run under the sampling profiler, report (spec §16.6)
                                       --rate=<hz> (default 999) --folded=<path>
 
 build, check and test also take a package directory, or no path for the package in the
@@ -54,27 +54,27 @@ current directory (spec §4.6).
   --verbose                       report compiled and cached modules
   --emit-header=<path>            write a C header for the `export fn`s (also works with `check`)
   --std=<dir>                     standard library directory (default: found next to the binary,
-                                  or $PHALANGE_STD)
+                                  or $AXIOM_STD)
   -o <path>                       output file
 ```
 
 Exit codes: `0` success, `1` the program has errors (or linking failed), `2` bad invocation.
 With `--format=agent-json`, stdout holds exactly one JSON object in the spec's
-`phalange-diagnostics/1` schema, including machine-applicable fixes.
+`axiom-diagnostics/1` schema, including machine-applicable fixes.
 
 Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the host ABI
 used by `std/io` and `std/net` and calls the `main` export. Native programs that use
 the host ABI get `runtime/native_host.c` linked in automatically.
 
 **Tests** (spec §17): `test "name" { … }` blocks with `@expect` / `@expect_eq`.
-`phalange test` runs each test isolated, with a timeout and captured output: a fresh
+`axiom test` runs each test isolated, with a timeout and captured output: a fresh
 instance in a node worker (`runtime/test_runner.mjs`) or a forked process
-(`runtime/test_main.c`). It reports human-readable text or `phalange-tests/1` JSON.
+(`runtime/test_main.c`). It reports human-readable text or `axiom-tests/1` JSON.
 Every trap reports its code, the failing expression and its location, in tests and in
 normal runs.
 
 **Separate compilation** (spec §16.7, `src/units.c`): each module becomes its own object,
-cached under `~/.cache/phalange/obj` by a key that hashes the compiler, the options, the
+cached under `~/.cache/axiom/obj` by a key that hashes the compiler, the options, the
 module's source and the keys of its imports. So an edit recompiles only that module and
 its importers, and those are compiled in parallel worker processes. Program-wide pieces
 (globals, error codes, runtime state, exports) go in a small link unit that is
@@ -87,25 +87,25 @@ it too, or, for a test that returned an error, the error return trace. They come
 from a per-thread shadow stack of call sites. Each call costs three stores and a
 load; `--stack-traces=off` removes them.
 
-**Profiling** (spec §16.6): `phalange profile` samples the shadow stack, using a
+**Profiling** (spec §16.6): `axiom profile` samples the shadow stack, using a
 CPU-clock `SIGPROF` natively (`runtime/profile.c`) or a worker reading shared memory
 on wasm (`runtime/profile_worker.mjs`). It reports self and total time per function,
 inclusive time per call site, and folded stacks for flame graphs.
 
-**Packages** (spec §4.6, `src/package.c`): a `phalange.toml` manifest (a TOML subset)
+**Packages** (spec §4.6, `src/package.c`): a `axiom.toml` manifest (a TOML subset)
 with path dependencies and git dependencies pinned to a commit, fetched once into
-`$PHALANGE_CACHE` (default `~/.cache/phalange`). Modules import them as `"pkg:name"` or
+`$AXIOM_CACHE` (default `~/.cache/axiom`). Modules import them as `"pkg:name"` or
 `"pkg:name/sub/mod"`; only declared dependencies are visible, and a build uses one
 source per package name.
 
 **C interop** (spec §14.5):
 - `extern "C" { fn ...; }` calls C. On wasm, the C sources passed with `--link` are
   compiled to wasm and share the module's memory.
-- `export fn` plus `--emit-header` makes Phalange callable from C. See
+- `export fn` plus `--emit-header` makes Axiom callable from C. See
   `examples/c_interop/`.
 
 Programs that use `std/thread` are linked with a shared, imported memory, and export
-`phalange_thread_start`. `runtime/host.mjs` creates the memory and runs each thread as
+`axiom_thread_start`. `runtime/host.mjs` creates the memory and runs each thread as
 a node worker. Native builds use pthreads. Atomics are always available.
 
 On wasm, `export fn` functions become WebAssembly exports, `import host "mod" { ... }`
@@ -119,12 +119,12 @@ becomes an out-of-bounds trap instead of corrupting data.
 $ node tests/run.mjs              # wasm32, -O0
 $ node tests/run.mjs -O2
 $ node tests/run.mjs --native     # native target (links tests/native_rt.c)
-$ make -C compiler asan && PHALANGE=compiler/build-asan/phalange node tests/run.mjs
+$ make -C compiler asan && AXIOM=compiler/build-asan/axiom node tests/run.mjs
 ```
 
-`tests/run/*.ph` are run-and-compare tests. `// expect:` lines give the expected output,
+`tests/run/*.ax` are run-and-compare tests. `// expect:` lines give the expected output,
 `// expect-trap` means `run` must trap, and `// flags:` adds compiler options.
-`tests/errors/*.ph` must fail to compile with the `// expect-error:` codes. The suite
+`tests/errors/*.ax` must fail to compile with the `// expect-error:` codes. The suite
 passes on wasm32 and native at every optimization level, and under ASan/UBSan.
 
 ## Architecture
@@ -182,9 +182,9 @@ Implemented: the whole language described in spec v0.1-draft.3:
 
 Not yet implemented (reported with a diagnostic where relevant):
 
-- `phalange fmt` (only the self-hosted compiler has it: [`selfhost/`](../selfhost/README.md)),
-  `phalange run` and `phalange explain` (spec §16.1).
-- The debug trap map (`phalange.traps` custom section) and error-return traces
+- `axiom fmt` (only the self-hosted compiler has it: [`selfhost/`](../selfhost/README.md)),
+  `axiom run` and `axiom explain` (spec §16.1).
+- The debug trap map (`axiom.traps` custom section) and error-return traces
   (spec §16.4). Traps are plain `unreachable`, so the trap code isn't reported yet.
 - Global initializers containing union values with a payload (`E0353`).
 - **Native targets use real addresses for raw pointers.** Slices, arrays and all

@@ -1,0 +1,1134 @@
+// =============================================================================
+// std/encoding/json.ax - JSON (RFC 8259): parsing into a tree, and writing.
+//
+// Reading:
+//
+//     let mut doc = json.parse(text)!;
+//     defer doc.deinit();
+//     let name = doc.root.get("user")!.get("name")!.as_str()!;
+//     for item in doc.root.get("items")!.as_array()! { ... }
+//
+// A Document owns everything the tree points at (strings are copied out of
+// the input, so the input may be freed); deinit frees it all at once.
+// Values are views into it. Numbers are Int when they are written without a
+// fraction or exponent and fit in an i64, and Float otherwise. Objects keep
+// their members in order; get() finds a key by linear search, and returns
+// the last one if a key appears twice.
+//
+// Writing:
+//
+//     let mut w = json.Writer.init(io.stdout());        // or Writer.pretty(out, 2)
+//     w.begin_object()!;
+//     w.key("name")!;
+//     w.string("Ada")!;
+//     w.key("langs")!;
+//     w.begin_array()!;
+//     w.string("en")!;
+//     w.end_array()!;
+//     w.end_object()!;                                   // {"name":"Ada","langs":["en"]}
+//
+// The Writer adds commas, colons and indentation; value() writes a whole
+// tree, stringify() returns one in new memory and stringify_to() writes one
+// to an io.Writer. Floats are written in the shortest form that reads back
+// exactly; NaN and infinities, which JSON cannot express, are written as null.
+// =============================================================================
+
+import "../collections/vec.ax" as vec;
+import "../fmt.ax" as fmt;
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+
+error { SyntaxError, TooDeep, NotFound, WrongType, BadNesting, OutOfMemory }
+
+/// Nesting deeper than this is rejected (error.TooDeep) instead of risking
+/// the stack.
+pub const MAX_DEPTH: u32 = 512;
+
+// -----------------------------------------------------------------------------
+// Values
+// -----------------------------------------------------------------------------
+
+pub struct Member {
+    key: []u8,
+    value: Value,
+}
+
+pub union Value {
+    Null,
+    Bool: bool,
+    Int: i64,
+    Float: f64,
+    String: []u8,
+    Array: []Value,
+    Object: []Member,
+
+    /// The value of `key` in an object: NotFound if it has no such member,
+    /// WrongType if this is not an object.
+    pub fn get(self: Value, key: []u8) !Value {
+        match self {
+            .Object(ms) => {
+                let mut i = ms.len;
+                while i > 0 {
+                    i -= 1;
+                    if @mem_eq(ms[i].key, key) {
+                        return ms[i].value;
+                    }
+                }
+                return error.NotFound;
+            }
+            else => { return error.WrongType; }
+        }
+    }
+
+    /// Element i of an array: NotFound if out of range, WrongType if this is
+    /// not an array.
+    pub fn at(self: Value, i: usize) !Value {
+        match self {
+            .Array(xs) => {
+                if i >= xs.len {
+                    return error.NotFound;
+                }
+                return xs[i];
+            }
+            else => { return error.WrongType; }
+        }
+    }
+
+    /// The number of elements or members; for a string, its length in bytes;
+    /// 0 for anything else.
+    pub fn len(self: Value) usize {
+        match self {
+            .Array(xs)  => { return xs.len; }
+            .Object(ms) => { return ms.len; }
+            .String(s)  => { return s.len; }
+            else        => { return 0; }
+        }
+    }
+
+    pub fn is_null(self: Value) bool {
+        match self {
+            .Null => { return true; }
+            else  => { return false; }
+        }
+    }
+
+    pub fn as_bool(self: Value) !bool {
+        match self {
+            .Bool(b) => { return b; }
+            else     => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_str(self: Value) ![]u8 {
+        match self {
+            .String(s) => { return s; }
+            else       => { return error.WrongType; }
+        }
+    }
+
+    /// Any number, as an f64.
+    pub fn as_f64(self: Value) !f64 {
+        match self {
+            .Int(x)   => { return @float_from_int(f64, x); }
+            .Float(x) => { return x; }
+            else      => { return error.WrongType; }
+        }
+    }
+
+    /// An integer: an Int, or a Float with no fractional part that fits.
+    pub fn as_i64(self: Value) !i64 {
+        match self {
+            .Int(x) => { return x; }
+            .Float(x) => {
+                if (@trunc(x) != x) or (x < -9223372036854775808.0) or (x >= 9223372036854775808.0) {
+                    return error.WrongType;
+                }
+                return @int_from_float(i64, x);
+            }
+            else => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_array(self: Value) ![]Value {
+        match self {
+            .Array(xs) => { return xs; }
+            else       => { return error.WrongType; }
+        }
+    }
+
+    pub fn as_object(self: Value) ![]Member {
+        match self {
+            .Object(ms) => { return ms; }
+            else        => { return error.WrongType; }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Arena: the memory of a Document
+// -----------------------------------------------------------------------------
+
+struct Arena {
+    chunks: vec.Vec.[[]mut u8],
+    cur: []mut u8,
+    used: usize,
+
+    fn init() Arena {
+        return Arena.{ chunks: vec.Vec.[[]mut u8].init(), cur: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0), used: 0 };
+    }
+
+    fn deinit(self: *mut Arena) void {
+        for c in self.chunks.items() {
+            mem.free(c);
+        }
+        self.chunks.deinit();
+    }
+
+    fn bytes(self: *mut Arena, n: usize) ![]mut u8 {
+        let start = (self.used + 7) & ~@as(usize, 7);
+        if (start + n) <= self.cur.len {
+            self.used = start + n;
+            return self.cur[start..start + n];
+        }
+        if n >= 16384 {
+            // a big block gets a chunk of its own
+            let big = mem.alloc.[u8](n)!;
+            self.chunks.push(big) catch |e| {
+                mem.free(big);
+                return e;
+            };
+            return big;
+        }
+        let size = @max(@min(@max(self.cur.len * 2, 4096), 1048576), n);
+        let c = mem.alloc.[u8](size)!;
+        self.chunks.push(c) catch |e| {
+            mem.free(c);
+            return e;
+        };
+        self.cur = c;
+        self.used = n;
+        return c[..n];
+    }
+
+    fn values(self: *mut Arena, xs: []Value) ![]Value {
+        if xs.len == 0 {
+            return @slice_from_ptr(@ptr_from_int(*Value, 8), 0);
+        }
+        let b = self.bytes(xs.len * @size_of(Value))!;
+        let out = @cast_slice(Value, b);
+        @mem_copy(out, xs);
+        return out;
+    }
+
+    fn members(self: *mut Arena, xs: []Member) ![]Member {
+        if xs.len == 0 {
+            return @slice_from_ptr(@ptr_from_int(*Member, 8), 0);
+        }
+        let b = self.bytes(xs.len * @size_of(Member))!;
+        let out = @cast_slice(Member, b);
+        @mem_copy(out, xs);
+        return out;
+    }
+}
+
+/// A parsed JSON text: the root value and the memory behind it.
+pub struct Document {
+    root: Value,
+    arena: Arena,
+
+    pub fn deinit(self: *mut Document) void {
+        self.arena.deinit();
+        self.root = Value.Null;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parsing
+// -----------------------------------------------------------------------------
+
+/// Where and why parsing failed.
+pub struct ErrorInfo {
+    offset: usize,  // byte offset in the input
+    line: u32,      // from 1
+    column: u32,    // from 1, in bytes
+    message: []u8,
+}
+
+struct Parser {
+    s: []u8,
+    i: usize,
+    depth: u32,
+    arena: *mut Arena,
+    values: vec.Vec.[Value],    // elements of the arrays being parsed
+    members: vec.Vec.[Member],  // members of the objects being parsed
+    message: []u8,
+
+    fn fail(self: *mut Parser, msg: []u8) error { if self.message.len == 0 {
+        self.message = msg;
+    }
+    return error.SyntaxError; }
+
+    fn skip_ws(self: *mut Parser) void {
+        while self.i < self.s.len {
+            let c = self.s[self.i];
+            if (c != ' ') and (c != '\n') and (c != '\r') and (c != '\t') {
+                return;
+            }
+            self.i += 1;
+        }
+    }
+
+    fn literal(self: *mut Parser, word: []u8, v: Value) !Value {
+        if ((self.i + word.len) > self.s.len) or not @mem_eq(self.s[self.i..self.i + word.len], word) {
+            return self.fail("invalid literal");
+        }
+        self.i += word.len;
+        return v;
+    }
+
+    fn value(self: *mut Parser) !Value {
+        self.skip_ws();
+        if self.i >= self.s.len {
+            return self.fail("unexpected end of input");
+        }
+        let c = self.s[self.i];
+        match c {
+            '{' => { return self.object(); }
+            '[' => { return self.array(); }
+            '"' => { return Value.String(self.string()!); }
+            't' => { return self.literal("true", Value.Bool(true)); }
+            'f' => { return self.literal("false", Value.Bool(false)); }
+            'n' => { return self.literal("null", Value.Null); }
+            else => {
+                if (c == '-') or ((c >= '0') and (c <= '9')) {
+                    return self.number();
+                }
+                return self.fail("unexpected character");
+            }
+        }
+    }
+
+    fn enter(self: *mut Parser) !void {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            _ = self.fail("nested too deeply");
+            return error.TooDeep;
+        }
+    }
+
+    fn array(self: *mut Parser) !Value {
+        self.enter()!;
+        self.i += 1;
+        let base = self.values.len;
+        self.skip_ws();
+        if (self.i < self.s.len) and (self.s[self.i] == ']') {
+            self.i += 1;
+        } else {
+            loop {
+                let v = self.value()!;
+                self.values.push(v)!;
+                self.skip_ws();
+                if self.i >= self.s.len {
+                    return self.fail("unterminated array");
+                }
+                let c = self.s[self.i];
+                self.i += 1;
+                if c == ']' {
+                    break;
+                }
+                if c != ',' {
+                    return self.fail("expected ',' or ']'");
+                }
+            }
+        }
+        let xs = self.arena.values(self.values.items()[base..])!;
+        self.values.truncate(base);
+        self.depth -= 1;
+        return Value.Array(xs);
+    }
+
+    fn object(self: *mut Parser) !Value {
+        self.enter()!;
+        self.i += 1;
+        let base = self.members.len;
+        self.skip_ws();
+        if (self.i < self.s.len) and (self.s[self.i] == '}') {
+            self.i += 1;
+        } else {
+            loop {
+                self.skip_ws();
+                if (self.i >= self.s.len) or (self.s[self.i] != '"') {
+                    return self.fail("expected a string key");
+                }
+                let k = self.string()!;
+                self.skip_ws();
+                if (self.i >= self.s.len) or (self.s[self.i] != ':') {
+                    return self.fail("expected ':'");
+                }
+                self.i += 1;
+                let v = self.value()!;
+                self.members.push(Member.{ key: k, value: v })!;
+                self.skip_ws();
+                if self.i >= self.s.len {
+                    return self.fail("unterminated object");
+                }
+                let c = self.s[self.i];
+                self.i += 1;
+                if c == '}' {
+                    break;
+                }
+                if c != ',' {
+                    return self.fail("expected ',' or '}'");
+                }
+            }
+        }
+        let ms = self.arena.members(self.members.items()[base..])!;
+        self.members.truncate(base);
+        self.depth -= 1;
+        return Value.Object(ms);
+    }
+
+    fn hex4(self: *mut Parser) !u32 {
+        if (self.i + 4) > self.s.len {
+            return self.fail("truncated \\u escape");
+        }
+        let mut v: u32 = 0;
+        for k in @as(usize, 0)..4 {
+            let c = self.s[self.i + k];
+            let mut d: u32 = 0;
+            if (c >= '0') and (c <= '9') {
+                d = @as(u32, c - '0');
+            } else if ((c | 0x20) >= 'a') and ((c | 0x20) <= 'f') {
+                d = @as(u32, (c | 0x20) - 'a') + 10;
+            } else {
+                return self.fail("invalid \\u escape");
+            }
+            v = (v << 4) | d;
+        }
+        self.i += 4;
+        return v;
+    }
+
+    /// A string starting at the opening quote, unescaped into the arena.
+    fn string(self: *mut Parser) ![]u8 {
+        self.i += 1;
+        let start = self.i;
+        // the common case: no escapes
+        while self.i < self.s.len {
+            let c = self.s[self.i];
+            if (c == '"') or (c == '\\') or (c < 0x20) or (c >= 0x80) {
+                break;
+            }
+            self.i += 1;
+        }
+        if (self.i < self.s.len) and (self.s[self.i] == '"') {
+            let n = self.i - start;
+            let out = self.arena.bytes(n)!;
+            @mem_copy(out, self.s[start..self.i]);
+            self.i += 1;
+            return out;
+        }
+        // an unescaped string is never longer than its source
+        let end = self.find_end(start)!;
+        let out = self.arena.bytes(end - start)!;
+        let mut n = self.i - start;
+        @mem_copy(out[..n], self.s[start..self.i]);
+        loop {
+            if self.i >= self.s.len {
+                return self.fail("unterminated string");
+            }
+            let c = self.s[self.i];
+            if c == '"' {
+                self.i += 1;
+                return out[..n];
+            }
+            if c < 0x20 {
+                return self.fail("control character in string");
+            }
+            if c >= 0x80 {
+                let r = strs.decode_rune(self.s[self.i..]);
+                if (r.value == strs.REPLACEMENT) and (r.len == 1) {
+                    return self.fail("invalid UTF-8");
+                }
+                @mem_copy(out[n..n + r.len], self.s[self.i..self.i + r.len]);
+                n += r.len;
+                self.i += r.len;
+                continue;
+            }
+            if c != '\\' {
+                out[n] = c;
+                n += 1;
+                self.i += 1;
+                continue;
+            }
+            self.i += 1;
+            if self.i >= self.s.len {
+                return self.fail("unterminated string");
+            }
+            let e = self.s[self.i];
+            self.i += 1;
+            let mut b: u8 = 0;
+            match e {
+                '"'  => { b = '"'; }
+                '\\' => { b = '\\'; }
+                '/'  => { b = '/'; }
+                'b'  => { b = 8; }
+                'f'  => { b = 12; }
+                'n'  => { b = '\n'; }
+                'r'  => { b = '\r'; }
+                't'  => { b = '\t'; }
+                'u' => {
+                    let mut cp = self.hex4()!;
+                    if (cp >= 0xD800) and (cp <= 0xDBFF) {
+                        // a high surrogate should be followed by a low one
+                        let mut lo: u32 = 0;
+                        if ((self.i + 6) <= self.s.len) and (self.s[self.i] == '\\') and (self.s[self.i + 1] == 'u') {
+                            let save = self.i;
+                            self.i += 2;
+                            lo = self.hex4()!;
+                            if (lo < 0xDC00) or (lo > 0xDFFF) {
+                                self.i = save;
+                                lo = 0;
+                            }
+                        }
+                        if lo != 0 {
+                            cp = (((cp - 0xD800) << 10) | (lo - 0xDC00)) + 0x10000;
+                        } else {
+                            cp = strs.REPLACEMENT;
+                        }
+                    } else if (cp >= 0xDC00) and (cp <= 0xDFFF) {
+                        cp = strs.REPLACEMENT;
+                    }
+                    let enc = strs.encode_rune(out[n..], cp);
+                    n += enc.len;
+                    continue;
+                }
+                else => { return self.fail("invalid escape"); }
+            }
+            out[n] = b;
+            n += 1;
+        }
+    }
+
+    /// The offset of the closing quote of the string whose body starts at
+    /// `from` (an upper bound on its unescaped length).
+    fn find_end(self: *mut Parser, from: usize) !usize {
+        let mut j = from;
+        while j < self.s.len {
+            let c = self.s[j];
+            if c == '"' {
+                return j;
+            }
+            if c == '\\' {
+                j += 1;
+            }
+            j += 1;
+        }
+        return self.fail("unterminated string");
+    }
+
+    fn number(self: *mut Parser) !Value {
+        let start = self.i;
+        let s = self.s;
+        if s[self.i] == '-' {
+            self.i += 1;
+        }
+        if (self.i >= s.len) or not strs.is_digit(s[self.i]) {
+            return self.fail("invalid number");
+        }
+        if s[self.i] == '0' {
+            self.i += 1;
+            if (self.i < s.len) and strs.is_digit(s[self.i]) {
+                return self.fail("leading zero in number");
+            }
+        } else {
+            while (self.i < s.len) and strs.is_digit(s[self.i]) {
+                self.i += 1;
+            }
+        }
+        let mut is_int = true;
+        if (self.i < s.len) and (s[self.i] == '.') {
+            is_int = false;
+            self.i += 1;
+            if (self.i >= s.len) or not strs.is_digit(s[self.i]) {
+                return self.fail("invalid number");
+            }
+            while (self.i < s.len) and strs.is_digit(s[self.i]) {
+                self.i += 1;
+            }
+        }
+        if (self.i < s.len) and ((s[self.i] | 0x20) == 'e') {
+            is_int = false;
+            self.i += 1;
+            if (self.i < s.len) and ((s[self.i] == '+') or (s[self.i] == '-')) {
+                self.i += 1;
+            }
+            if (self.i >= s.len) or not strs.is_digit(s[self.i]) {
+                return self.fail("invalid number");
+            }
+            while (self.i < s.len) and strs.is_digit(s[self.i]) {
+                self.i += 1;
+            }
+        }
+        let text = s[start..self.i];
+        if is_int {
+            let v = fmt.parse_int.[i64](text) catch 0;
+            if (v != 0) or (text.len == 1) or ((text.len == 2) and (text[0] == '-')) {
+                return Value.Int(v);
+            }
+            // too big for an i64: fall through to a float
+        }
+        let f = fmt.parse_float(text) catch return self.fail("invalid number");
+        return Value.Float(f);
+    }
+}
+
+/// Parses a JSON text (any value, surrounded by optional whitespace).
+/// Fails with SyntaxError, TooDeep or OutOfMemory; see parse_with for where.
+pub fn parse(text: []u8) !Document {
+    let mut info = ErrorInfo.{ offset: 0, line: 0, column: 0, message: "" };
+    return parse_with(text, &mut info);
+}
+
+/// Like parse, and on failure fills `info` with the position and reason.
+pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
+    let mut arena = Arena.init();
+    let mut p = Parser.{
+        s: text,
+        i: 0,
+        depth: 0,
+        arena: &mut arena,
+        values: vec.Vec.[Value].init(),
+        members: vec.Vec.[Member].init(),
+        message: "",
+    };
+    defer p.values.deinit();
+    defer p.members.deinit();
+    let root = p.value() catch |e| {
+        fill_info(text, p.i, p.message, info);
+        arena.deinit();
+        return e;
+    };
+    p.skip_ws();
+    if p.i != text.len {
+        fill_info(text, p.i, "unexpected text after the value", info);
+        arena.deinit();
+        return error.SyntaxError;
+    }
+    return Document.{ root: root, arena: arena };
+}
+
+fn fill_info(text: []u8, at: usize, msg: []u8, info: *mut ErrorInfo) void {
+    let pos = @min(at, text.len);
+    let mut line: u32 = 1;
+    let mut col: u32 = 1;
+    for i in 0..pos {
+        if text[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    info.offset = pos;
+    info.line = line;
+    info.column = col;
+    info.message = msg;
+    if msg.len == 0 {
+        info.message = "out of memory";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+/// Writes JSON text to an io.Writer, adding commas, colons and (with
+/// `pretty`) newlines and indentation. Calls must nest properly (a key only
+/// directly in an object, before each value there); otherwise they fail
+/// with BadNesting.
+pub struct Writer {
+    out: io.Writer,
+    indent: u32,  // spaces per level; 0 for compact output
+    depth: usize,
+    kinds: [512]u8,   // '{' or '[' for each open level
+    count: [512]u32,  // values (or keys) written at each level
+    after_key: bool,
+
+    /// Compact output: {"a":[1,2]}.
+    pub fn init(out: io.Writer) Writer {
+        return Writer.{ out: out, indent: 0, depth: 0, kinds: [0; 512], count: [0; 512], after_key: false };
+    }
+
+    /// Indented output, `indent` spaces per level.
+    pub fn pretty(out: io.Writer, indent: u32) Writer {
+        let mut w = Writer.init(out);
+        w.indent = indent;
+        return w;
+    }
+
+    fn newline(self: *mut Writer) !void {
+        if self.indent == 0 {
+            return;
+        }
+        self.out.write_all("\n")!;
+        let n = @as(usize, self.indent) * self.depth;
+        let spaces = "                                ";
+        let mut left = n;
+        while left > 0 {
+            let k = @min(left, spaces.len);
+            self.out.write_all(spaces[..k])!;
+            left -= k;
+        }
+    }
+
+    /// Before any value: the separator, or an error if a key is missing.
+    fn before_value(self: *mut Writer) !void {
+        if self.depth == 0 {
+            return;
+        }
+        if self.kinds[self.depth - 1] == '{' {
+            if not self.after_key {
+                return error.BadNesting;
+            }
+            self.after_key = false;
+            return;
+        }
+        if self.count[self.depth - 1] > 0 {
+            self.out.write_all(",")!;
+        }
+        self.count[self.depth - 1] += 1;
+        self.newline()!;
+    }
+
+    pub fn key(self: *mut Writer, k: []u8) !void {
+        if (self.depth == 0) or (self.kinds[self.depth - 1] != '{') or self.after_key {
+            return error.BadNesting;
+        }
+        if self.count[self.depth - 1] > 0 {
+            self.out.write_all(",")!;
+        }
+        self.count[self.depth - 1] += 1;
+        self.newline()!;
+        write_string(self.out, k)!;
+        if self.indent > 0 {
+            self.out.write_all(": ")!;
+        } else {
+            self.out.write_all(":")!;
+        }
+        self.after_key = true;
+    }
+
+    fn open(self: *mut Writer, kind: u8) !void {
+        self.before_value()!;
+        if self.depth == self.kinds.len {
+            return error.BadNesting;
+        }
+        let one: [1]u8 = [kind];
+        self.out.write_all(one[..])!;
+        self.kinds[self.depth] = kind;
+        self.count[self.depth] = 0;
+        self.depth += 1;
+    }
+
+    fn close(self: *mut Writer, kind: u8, text: []u8) !void {
+        if (self.depth == 0) or (self.kinds[self.depth - 1] != kind) or self.after_key {
+            return error.BadNesting;
+        }
+        self.depth -= 1;
+        if self.count[self.depth] > 0 {
+            self.newline()!;
+        }
+        self.out.write_all(text)!;
+    }
+
+    pub fn begin_object(self: *mut Writer) !void {
+        self.open('{')!;
+    }
+
+    pub fn end_object(self: *mut Writer) !void {
+        self.close('{', "}")!;
+    }
+
+    pub fn begin_array(self: *mut Writer) !void {
+        self.open('[')!;
+    }
+
+    pub fn end_array(self: *mut Writer) !void {
+        self.close('[', "]")!;
+    }
+
+    pub fn string(self: *mut Writer, s: []u8) !void {
+        self.before_value()!;
+        write_string(self.out, s)!;
+    }
+
+    /// Any integer type.
+    pub fn int[T: Int](self: *mut Writer, x: T) !void {
+        self.before_value()!;
+        let mut b: [40]u8 = [0; 40];
+        self.out.write_all(fmt.format_int(b[..], x))!;
+    }
+
+    pub fn float(self: *mut Writer, x: f64) !void {
+        self.before_value()!;
+        write_float(self.out, x)!;
+    }
+
+    pub fn boolean(self: *mut Writer, b: bool) !void {
+        self.before_value()!;
+        if b {
+            self.out.write_all("true")!;
+        } else {
+            self.out.write_all("false")!;
+        }
+    }
+
+    pub fn null_value(self: *mut Writer) !void {
+        self.before_value()!;
+        self.out.write_all("null")!;
+    }
+
+    /// Writes a whole value.
+    pub fn value(self: *mut Writer, v: Value) !void {
+        match v {
+            .Null      => { self.null_value()!; }
+            .Bool(b)   => { self.boolean(b)!; }
+            .Int(x)    => { self.int(x)!; }
+            .Float(x)  => { self.float(x)!; }
+            .String(s) => { self.string(s)!; }
+            .Array(xs) => {
+                self.begin_array()!;
+                for x in xs {
+                    self.value(x)!;
+                }
+                self.end_array()!;
+            }
+            .Object(ms) => {
+                self.begin_object()!;
+                for m in ms {
+                    self.key(m.key)!;
+                    self.value(m.value)!;
+                }
+                self.end_object()!;
+            }
+        }
+    }
+}
+
+fn write_float(w: io.Writer, x: f64) !void {
+    if (x != x) or (x == (1.0 / 0.0)) or (x == (-1.0 / 0.0)) {
+        w.write_all("null")!;
+        return;
+    }
+    let mut b: [32]u8 = [0; 32];
+    w.write_all(fmt.format_float(b[..], x)!)!;
+}
+
+/// Writes s as a JSON string: quoted, with `"`, `\` and control characters
+/// escaped. Invalid UTF-8 is written as U+FFFD, so the output is always
+/// valid JSON.
+pub fn write_string(w: io.Writer, s: []u8) !void {
+    let hex = "0123456789abcdef";
+    w.write_all("\"")!;
+    let mut lit: usize = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c >= 0x20) and (c != '"') and (c != '\\') and (c < 0x80) {
+            i += 1;
+            continue;
+        }
+        if c >= 0x80 {
+            let r = strs.decode_rune(s[i..]);
+            if (r.value != strs.REPLACEMENT) or (r.len != 1) {
+                i += r.len;
+                continue;
+            }
+            w.write_all(s[lit..i])!;
+            w.write_all("\u{FFFD}")!;
+            i += 1;
+            lit = i;
+            continue;
+        }
+        w.write_all(s[lit..i])!;
+        match c {
+            '"'  => { w.write_all("\\\"")!; }
+            '\\' => { w.write_all("\\\\")!; }
+            '\n' => { w.write_all("\\n")!; }
+            '\r' => { w.write_all("\\r")!; }
+            '\t' => { w.write_all("\\t")!; }
+            8    => { w.write_all("\\b")!; }
+            12   => { w.write_all("\\f")!; }
+            else => {
+                let esc: [6]u8 = ['\\', 'u', '0', '0', hex[@as(usize, c >> 4)], hex[@as(usize, c & 15)]];
+                w.write_all(esc[..])!;
+            }
+        }
+        i += 1;
+        lit = i;
+    }
+    w.write_all(s[lit..])!;
+    w.write_all("\"")!;
+}
+
+/// v as compact JSON text in new memory (free it with mem.free).
+pub fn stringify(v: Value) ![]mut u8 {
+    let mut s = strs.String.init();
+    stringify_to(s.writer(), v) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// v as indented JSON text in new memory (free it with mem.free).
+pub fn stringify_pretty(v: Value, indent: u32) ![]mut u8 {
+    let mut s = strs.String.init();
+    stringify_pretty_to(s.writer(), v, indent) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Writes v as compact JSON text to w (through a 4 KB buffer, flushed before
+/// returning).
+pub fn stringify_to(w: io.Writer, v: Value) !void {
+    stringify_pretty_to(w, v, 0)!;
+}
+
+/// Writes v as indented JSON text to w, `indent` spaces per level (0 for
+/// compact output), through a 4 KB buffer flushed before returning.
+pub fn stringify_pretty_to(w: io.Writer, v: Value, indent: u32) !void {
+    let mut bw = io.BufWriter.init(w);
+    let mut jw = Writer.pretty(bw.writer(), indent);
+    jw.value(v)!;
+    bw.flush()!;
+}
+
+// -----------------------------------------------------------------------------
+// Tests (axiom test std/encoding/json.ax)
+// -----------------------------------------------------------------------------
+
+test "parse and read" {
+    let text =
+        " {\"name\": \"Ada\", \"age\": 36, \"langs\": [\"en\", \"fr\"], \"x\": -1.5e3, \"ok\": true, \"none\": null, \"big\": 12345678901234567890} ";
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    let r = doc.root;
+    @expect_eq(r.len(), 7);
+    @expect_eq(r.get("name")!.as_str()!, "Ada");
+    @expect_eq(r.get("age")!.as_i64()!, 36);
+    @expect_eq(r.get("langs")!.at(1)!.as_str()!, "fr");
+    @expect_eq(r.get("x")!.as_f64()!, -1500.0);
+    @expect_eq(r.get("x")!.as_i64()!, -1500);
+    @expect(r.get("ok")!.as_bool()!);
+    @expect(r.get("none")!.is_null());
+    @expect_eq(r.get("big")!.as_f64()!, 12345678901234567890.0);
+    @expect(fails(r.get("big")!.as_i64(), error.WrongType));
+    @expect(fails(r.get("missing"), error.NotFound));
+    @expect(fails(r.get("langs")!.get("x"), error.WrongType));
+    @expect(fails(r.get("langs")!.at(2), error.NotFound));
+}
+
+fn fails_void(r: !void, want: error) bool {
+    r catch |e| {
+        return e == want;
+    };
+    return false;
+}
+
+fn fails[T](r: !T, want: error) bool {
+    _ = r catch |e| {
+        return e == want;
+    };
+    return false;
+}
+
+test "strings and escapes" {
+    let mut doc =
+        parse("[\"a\\\"b\\\\c\\/\\n\\t\", \"\\u00e9\\u20AC\", \"\\ud83d\\ude00\", \"\\ud800x\", \"h\u{e9}\"]")!;
+    defer doc.deinit();
+    let r = doc.root;
+    @expect_eq(r.at(0)!.as_str()!, "a\"b\\c/\n\t");
+    @expect_eq(r.at(1)!.as_str()!, "\u{e9}\u{20ac}");
+    @expect_eq(r.at(2)!.as_str()!, "\u{1F600}");
+    @expect_eq(r.at(3)!.as_str()!, "\u{FFFD}x");
+    @expect_eq(r.at(4)!.as_str()!, "h\u{e9}");
+}
+
+test "numbers" {
+    let mut doc = parse("[0, -0, 1e2, 0.5, -9223372036854775808, 9223372036854775807, 9223372036854775808, 1E-2]")!;
+    defer doc.deinit();
+    let xs = doc.root.as_array()!;
+    @expect_eq(xs[0].as_i64()!, 0);
+    @expect_eq(xs[1].as_i64()!, 0);
+    @expect_eq(xs[2].as_f64()!, 100.0);
+    @expect_eq(xs[3].as_f64()!, 0.5);
+    @expect_eq(xs[4].as_i64()!, -9223372036854775807 - 1);
+    @expect_eq(xs[5].as_i64()!, 9223372036854775807);
+    @expect_eq(xs[6].as_f64()!, 9223372036854775808.0);
+    @expect_eq(xs[7].as_f64()!, 0.01);
+}
+
+test "syntax errors" {
+    let bad: [22][]u8 = [
+        "",
+        " ",
+        "[",
+        "]",
+        "{",
+        "[1,]",
+        "[1 2]",
+        "{\"a\" 1}",
+        "{\"a\":1,}",
+        "{a:1}",
+        "01",
+        "1.",
+        ".5",
+        "-",
+        "+1",
+        "1e",
+        "\"abc",
+        "\"\\x\"",
+        "\"\t\"",
+        "tru",
+        "nul",
+        "[1] x",
+    ];
+    for s in bad {
+        _ = parse(s) catch continue;
+        @trap();
+    }
+    let mut info = ErrorInfo.{ offset: 0, line: 0, column: 0, message: "" };
+    _ = parse_with("{\n  \"a\": [1,\n  2,,]\n}", &mut info) catch |e| {
+        @expect_eq(e, error.SyntaxError);
+        @expect_eq(info.line, 3);
+        @expect_eq(info.column, 5);
+        @expect_eq(info.message, "unexpected character");
+        return;
+    };
+    @trap();
+}
+
+test "depth limit" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    for i in @as(u32, 0)..600 {
+        s.push('[')!;
+    }
+    _ = parse(s.bytes()) catch |e| {
+        @expect_eq(e, error.TooDeep);
+        return;
+    };
+    @trap();
+}
+
+test "writer" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut w = Writer.init(s.writer());
+    w.begin_object()!;
+    w.key("name")!;
+    w.string("A\"da\n")!;
+    w.key("n")!;
+    w.int(@as(u8, 7))!;
+    w.key("xs")!;
+    w.begin_array()!;
+    w.float(0.1)!;
+    w.float(1.0e21)!;
+    w.float(0.0 / 0.0)!;
+    w.boolean(false)!;
+    w.null_value()!;
+    w.begin_object()!;
+    w.end_object()!;
+    w.end_array()!;
+    w.end_object()!;
+    @expect_eq(s.bytes(), "{\"name\":\"A\\\"da\\n\",\"n\":7,\"xs\":[0.1,1e+21,null,false,null,{}]}");
+    let mut w2 = Writer.init(s.writer());
+    @expect(fails_void(w2.key("x"), error.BadNesting));
+    w2.begin_object()!;
+    @expect(fails_void(w2.string("no key"), error.BadNesting));
+    @expect(fails_void(w2.end_array(), error.BadNesting));
+}
+
+test "round trip and pretty" {
+    let text = "{\"a\":[1,2.5,\"x\\u0001\"],\"b\":{\"c\":null,\"d\":[]},\"e\":\"\u{e9}\"}";
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    let out = stringify(doc.root)!;
+    defer mem.free(out);
+    @expect_eq(out, text);
+    let p = stringify_pretty(doc.root, 2)!;
+    defer mem.free(p);
+    @expect_eq(p,
+               "{\n  \"a\": [\n    1,\n    2.5,\n    \"x\\u0001\"\n  ],\n  \"b\": {\n    \"c\": null,\n    \"d\": []\n  },\n  \"e\": \"\u{e9}\"\n}");
+}
+
+test "a larger document" {
+    // many members, long strings and chunk growth
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut w = Writer.init(s.writer());
+    w.begin_array()!;
+    for i in @as(i64, 0)..3000 {
+        w.begin_object()!;
+        w.key("id")!;
+        w.int(i)!;
+        w.key("name")!;
+        w.string("item with a reasonably long name \u{2603}")!;
+        w.end_object()!;
+    }
+    w.end_array()!;
+    let mut doc = parse(s.bytes())!;
+    defer doc.deinit();
+    @expect_eq(doc.root.len(), 3000);
+    @expect_eq(doc.root.at(2999)!.get("id")!.as_i64()!, 2999);
+    let again = stringify(doc.root)!;
+    defer mem.free(again);
+    @expect_eq(again, s.bytes());
+    let mut t = strs.String.init();
+    defer t.deinit();
+    stringify_pretty_to(t.writer(), doc.root, 1)!;
+    let p = stringify_pretty(doc.root, 1)!;
+    defer mem.free(p);
+    @expect_eq(t.bytes(), p);
+    // a full destination fails with its error
+    let mut small: [5000]u8 = [0; 5000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    stringify_to(bw.writer(), doc.root) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
+}
+
+test "values of every size" {
+    // arrays and strings of 4 KiB to 16 KiB land in the arena's chunks
+    for n in @as(usize, 1)..40 {
+        let mut t = strs.String.init();
+        defer t.deinit();
+        t.push_str("[")!;
+        for i in @as(usize, 0)..n * 25 {
+            if i > 0 {
+                t.push(',')!;
+            }
+            t.push('0')!;
+        }
+        t.push_str("], \"")!;
+        for _i in @as(usize, 0)..n * 300 {
+            t.push('x')!;
+        }
+        t.push_str("\"]")!;
+        let mut src = strs.String.init();
+        defer src.deinit();
+        src.push('[')!;
+        src.push_str(t.bytes())!;
+        let mut doc = parse(src.bytes())!;
+        defer doc.deinit();
+        @expect_eq(doc.root.at(0)!.len(), n * 25);
+        @expect_eq(doc.root.at(1)!.len(), n * 300);
+    }
+}

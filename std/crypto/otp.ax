@@ -1,0 +1,643 @@
+// =============================================================================
+// std/crypto/otp.ax - one-time passwords: HOTP (RFC 4226) and TOTP (RFC 6238),
+// and otpauth:// URIs (the Key URI Format of authenticator apps).
+//
+//     let c = otp.Config.default();                     // SHA-1, 6 digits, 30 s
+//     let code = otp.totp(secret, time.now().unix(), c)!;   // u32
+//     let mut buf: [8]u8 = [0; 8];
+//     let text = otp.format_code(code, c, buf[..]);         // "054321"
+//     let step = otp.totp_check(secret, now, "054321", 1, c)!;  // NoMatch if wrong
+//
+//     let mut k = otp.parse_uri("otpauth://totp/Acme:ann@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme")!;
+//     defer k.deinit();                                 // k.secret, k.config, k.issuer, ...
+//     let uri = otp.uri(&k)!;                           // mem.free; or uri_to(w, &k)
+//
+// HOTP is HMAC (SHA-1, SHA-256 or SHA-512) of an 8-byte big-endian counter,
+// dynamically truncated to 31 bits and reduced to 6 to 8 decimal digits;
+// TOTP is HOTP of the number of periods (30 seconds by default) since t0.
+// Checking compares the code given with each candidate in constant time,
+// trying them all, and returns the counter (time step) that matched, which
+// the caller should remember to refuse a code used twice (RFC 6238 §5.2).
+//
+// URIs follow github.com/google/google-authenticator/wiki/Key-Uri-Format:
+// otpauth://TYPE/[ISSUER:]ACCOUNT?secret=BASE32[&issuer=..][&algorithm=SHA1|
+// SHA256|SHA512][&digits=6|8][&counter=N][&period=S], percent-encoded; the
+// secret is base32 (std/encoding/base32) without padding. Writing omits the
+// parameters that have their default values (SHA1, 6 digits, 30 seconds).
+// =============================================================================
+
+import "../encoding/base32.ax" as base32;
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+import "hmac.ax" as hmac;
+import "sha2.ax" as sha2;
+import "subtle.ax" as subtle;
+
+error { InvalidConfig, InvalidTime, NoMatch, InvalidUri, UnsupportedAlgorithm, OutOfMemory }
+
+/// The parameters shared by both kinds of password.
+pub struct Config {
+    alg: sha2.Algorithm,  // SHA1, SHA256 or SHA512
+    digits: u32,          // 6 to 8
+    period: u64,          // TOTP: seconds per time step (at least 1)
+    t0: i64,              // TOTP: the Unix time at which counting starts
+
+    /// SHA-1, 6 digits, 30-second steps from the Unix epoch: what
+    /// authenticator apps assume.
+    pub fn default() Config {
+        return Config.{ alg: sha2.Algorithm.SHA1, digits: 6, period: 30, t0: 0 };
+    }
+
+    fn valid(self: Config) bool {
+        return (self.digits >= 6) and (self.digits <= 8) and (self.period >= 1) and (self.alg != sha2.Algorithm.SHA384);
+    }
+}
+
+/// The most steps hotp_check and totp_check look at either side
+/// (InvalidConfig beyond).
+pub const MAX_WINDOW: u64 = 1000;
+
+fn pow10(n: u32) u32 {
+    let mut p: u32 = 1;
+    for _i in @as(u32, 0)..n {
+        p *= 10;
+    }
+    return p;
+}
+
+/// The HOTP value for counter: InvalidConfig unless c has 6 to 8 digits and
+/// SHA-1, SHA-256 or SHA-512.
+pub fn hotp(key: []u8, counter: u64, c: Config) !u32 {
+    if not c.valid() {
+        return error.InvalidConfig;
+    }
+    let mut msg: [8]u8 = [0; 8];
+    for i in @as(usize, 0)..8 {
+        msg[i] = @truncate(u8, counter >> @as(u64, 56 - (8 * i)));
+    }
+    let mut mac: [64]u8 = [0; 64];
+    let n = sha2.digest_size(c.alg);
+    hmac.hmac(c.alg, key, msg[..], mac[..n]);
+    // dynamic truncation (RFC 4226 §5.3)
+    let off = @as(usize, mac[n - 1] & 0xf);
+    let bin = (
+        ((@as(u32, mac[off] & 0x7f) << 24) | (@as(u32, mac[off + 1]) << 16)) | (@as(u32, mac[off + 2]) << 8)) | @as(
+            u32, mac[off + 3]);
+    return bin % pow10(c.digits);
+}
+
+/// The TOTP time step for a Unix time: InvalidTime before c.t0.
+pub fn time_step(unix: i64, c: Config) !u64 {
+    if (unix < c.t0) or (c.period == 0) {
+        return error.InvalidTime;
+    }
+    let since = @as(u64, @bit_cast(u64, unix -% c.t0));
+    return since / c.period;
+}
+
+/// The TOTP value at a Unix time (seconds).
+pub fn totp(key: []u8, unix: i64, c: Config) !u32 {
+    return hotp(key, time_step(unix, c)!, c);
+}
+
+/// The code as text: c.digits digits with leading zeros, in out (at least
+/// that long).
+pub fn format_code(code: u32, c: Config, out: []mut u8) []u8 {
+    let n = @as(usize, c.digits);
+    let mut v = code;
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        out[i] = '0' + @truncate(u8, v % 10);
+        v = v / 10;
+    }
+    return out[..n];
+}
+
+/// Whether code is the right text for counter, in constant time.
+fn matches(key: []u8, counter: u64, code: []u8, c: Config) !bool {
+    let want = hotp(key, counter, c)!;
+    let mut buf: [8]u8 = [0; 8];
+    let text = format_code(want, c, buf[..]);
+    return subtle.equal(text, code);
+}
+
+/// Checks an HOTP code against counters counter, counter + 1, ...,
+/// counter + look_ahead (at most MAX_WINDOW), all of them, so the time
+/// taken does not tell which matched; returns the one that matched (the
+/// next expected counter is that plus one), or fails with NoMatch.
+pub fn hotp_check(key: []u8, counter: u64, code: []u8, look_ahead: u64, c: Config) !u64 {
+    if look_ahead > MAX_WINDOW {
+        return error.InvalidConfig;
+    }
+    let mut found: u64 = 0;
+    let mut ok = false;
+    let mut k: u64 = 0;
+    while k <= look_ahead {
+        let ctr = counter +% k;
+        if (ctr >= counter) and matches(key, ctr, code, c)! and not ok {
+            found = ctr;
+            ok = true;
+        }
+        if k == look_ahead {
+            break;
+        }
+        k += 1;
+    }
+    if not ok {
+        return error.NoMatch;
+    }
+    return found;
+}
+
+/// Checks a TOTP code at a Unix time, allowing `window` steps (at most
+/// MAX_WINDOW) of clock drift either way; returns the time step that
+/// matched (remember it, and refuse codes for it or earlier steps
+/// afterwards), or fails with NoMatch.
+pub fn totp_check(key: []u8, unix: i64, code: []u8, window: u64, c: Config) !u64 {
+    if window > MAX_WINDOW {
+        return error.InvalidConfig;
+    }
+    let step = time_step(unix, c)!;
+    let first = @sub_sat(step, window);
+    let mut found: u64 = 0;
+    let mut ok = false;
+    let mut s = first;
+    loop {
+        if matches(key, s, code, c)! and not ok {
+            found = s;
+            ok = true;
+        }
+        if (s >= step) and ((s - step) >= window) {
+            break;
+        }
+        s += 1;
+    }
+    if not ok {
+        return error.NoMatch;
+    }
+    return found;
+}
+
+// -----------------------------------------------------------------------------
+// otpauth:// URIs
+// -----------------------------------------------------------------------------
+
+/// The two kinds of one-time password.
+pub enum Kind: u8 {
+    HOTP,
+    TOTP,
+}
+
+/// What an otpauth:// URI holds. From parse_uri, the slices are owned
+/// (deinit frees them); to build a URI, point them at anything.
+pub struct Key {
+    kind: Kind,
+    secret: []u8,   // the shared secret (raw bytes)
+    issuer: []u8,   // the provider (may be empty)
+    account: []u8,  // the user's account name
+    config: Config,
+    counter: u64,          // HOTP: the initial counter
+    own_secret: []mut u8,  // what parse_uri allocated
+    own_issuer: []mut u8,
+    own_account: []mut u8,
+
+    /// A Key to write as a URI (nothing is copied or owned).
+    pub fn init(kind: Kind, secret: []u8, issuer: []u8, account: []u8, config: Config) Key {
+        return Key.{ kind: kind, secret: secret, issuer: issuer, account: account, config: config, counter: 0,
+                     own_secret: empty(), own_issuer: empty(), own_account: empty() };
+    }
+
+    /// Frees what parse_uri allocated.
+    pub fn deinit(self: *mut Key) void {
+        subtle.zero(self.own_secret);
+        mem.free(self.own_secret);
+        mem.free(self.own_issuer);
+        mem.free(self.own_account);
+        self.own_secret = empty();
+        self.own_issuer = empty();
+        self.own_account = empty();
+        self.secret = "";
+        self.issuer = "";
+        self.account = "";
+    }
+}
+
+fn unreserved(b: u8) bool {
+    return strs.is_alnum(b) or (b == '-') or (b == '.') or (b == '_') or (b == '~');
+}
+
+fn put_escaped(w: io.Writer, s: []u8) !void {
+    let digits = "0123456789ABCDEF";
+    let mut start: usize = 0;
+    for i in 0..s.len {
+        let b = s[i];
+        if not unreserved(b) {
+            w.write_all(s[start..i])!;
+            let esc: [3]u8 = ['%', digits[@as(usize, b >> 4)], digits[@as(usize, b & 15)]];
+            w.write_all(esc[..])!;
+            start = i + 1;
+        }
+    }
+    w.write_all(s[start..])!;
+}
+
+fn alg_name(a: sha2.Algorithm) []u8 {
+    match a {
+        .SHA1   => { return "SHA1"; }
+        .SHA256 => { return "SHA256"; }
+        .SHA384 => { return "SHA384"; }
+        .SHA512 => { return "SHA512"; }
+    }
+}
+
+/// Writes the otpauth:// URI of k to w.
+pub fn uri_to(w: io.Writer, k: *Key) !void {
+    if (not k.config.valid()) or (k.config.t0 != 0) {
+        return error.InvalidConfig;  // (the format has no way to say t0)
+    }
+    if k.kind == Kind.HOTP {
+        w.write_all("otpauth://hotp/")!;
+    } else {
+        w.write_all("otpauth://totp/")!;
+    }
+    if k.issuer.len > 0 {
+        put_escaped(w, k.issuer)!;
+        w.write_all(":")!;
+    }
+    put_escaped(w, k.account)!;
+    w.write_all("?secret=")!;
+    let enc = base32.encode_alloc(k.secret, base32.STANDARD_NO_PAD)!;
+    defer mem.free(enc);
+    w.write_all(enc)!;
+    if k.issuer.len > 0 {
+        w.write_all("&issuer=")!;
+        put_escaped(w, k.issuer)!;
+    }
+    if k.config.alg != sha2.Algorithm.SHA1 {
+        w.write_all("&algorithm=")!;
+        w.write_all(alg_name(k.config.alg))!;
+    }
+    let mut nb: [24]u8 = [0; 24];
+    if k.config.digits != 6 {
+        w.write_all("&digits=")!;
+        w.write_all(io.fmt_u64(nb[..], @as(u64, k.config.digits)))!;
+    }
+    if k.kind == Kind.HOTP {
+        w.write_all("&counter=")!;
+        w.write_all(io.fmt_u64(nb[..], k.counter))!;
+    } else if k.config.period != 30 {
+        w.write_all("&period=")!;
+        w.write_all(io.fmt_u64(nb[..], k.config.period))!;
+    }
+}
+
+/// The otpauth:// URI of k, in new memory (free it with mem.free).
+pub fn uri(k: *Key) ![]mut u8 {
+    let mut s = strs.String.init();
+    uri_to(s.writer(), k) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+fn hexval(c: u8) u8 {
+    if (c >= '0') and (c <= '9') {
+        return c - '0';
+    }
+    let l = c | 0x20;
+    if (l >= 'a') and (l <= 'f') {
+        return (l - 'a') + 10;
+    }
+    return 0xff;
+}
+
+/// Percent-decodes s into new memory ('+' is a space when plus_space).
+fn unescape(s: []u8, plus_space: bool) ![]mut u8 {
+    let out = mem.alloc.[u8](s.len)!;
+    let mut o: usize = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        let b = s[i];
+        if b == '%' {
+            if (i + 2) >= s.len {
+                mem.free(out);
+                return error.InvalidUri;
+            }
+            let h = hexval(s[i + 1]);
+            let l = hexval(s[i + 2]);
+            if (h > 15) or (l > 15) {
+                mem.free(out);
+                return error.InvalidUri;
+            }
+            out[o] = (h << 4) | l;
+            i += 3;
+        } else {
+            if plus_space and (b == '+') {
+                out[o] = ' ';
+            } else {
+                out[o] = b;
+            }
+            i += 1;
+        }
+        o += 1;
+    }
+    return mem.realloc(out, o) catch |e| {
+        mem.free(out);
+        return e;
+    };
+}
+
+fn parse_uint(s: []u8, max: u64) !u64 {
+    if (s.len == 0) or (s.len > 19) {
+        return error.InvalidUri;
+    }
+    let mut v: u64 = 0;
+    for b in s {
+        if not strs.is_digit(b) {
+            return error.InvalidUri;
+        }
+        v = (v * 10) + @as(u64, b - '0');
+    }
+    if v > max {
+        return error.InvalidUri;
+    }
+    return v;
+}
+
+/// Parses an otpauth:// URI (InvalidUri if malformed, UnsupportedAlgorithm
+/// for an algorithm other than SHA1, SHA256 or SHA512). An issuer
+/// parameter takes precedence over the label's prefix.
+pub fn parse_uri(text: []u8) !Key {
+    let mut k = Key.init(Kind.TOTP, "", "", "", Config.default());
+    parse_into(text, &mut k) catch |e| {
+        k.deinit();
+        return e;
+    };
+    k.secret = k.own_secret;
+    k.issuer = k.own_issuer;
+    k.account = k.own_account;
+    return k;
+}
+
+fn empty() []mut u8 {
+    return @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+}
+
+fn parse_into(text: []u8, k: *mut Key) !void {
+    let prefix = "otpauth://";
+    if (text.len < prefix.len) or not strs.eq_ignore_case(text[..prefix.len], prefix) {
+        return error.InvalidUri;
+    }
+    let rest = text[prefix.len..];
+    let slash = strs.index_of_byte(rest, '/') catch return error.InvalidUri;
+    let kind = rest[..slash];
+    if strs.eq_ignore_case(kind, "totp") {
+        k.kind = Kind.TOTP;
+    } else if strs.eq_ignore_case(kind, "hotp") {
+        k.kind = Kind.HOTP;
+    } else {
+        return error.InvalidUri;
+    }
+    let after = rest[slash + 1..];
+    let mut label = after;
+    let mut query: []u8 = "";
+    let q = strs.index_of_byte(after, '?') catch after.len;
+    if q < after.len {
+        label = after[..q];
+        query = after[q + 1..];
+    }
+    // the label: [issuer ":"] account, the colon literal or %3A
+    let full = unescape(label, false)!;
+    defer mem.free(full);
+    let colon = strs.index_of_byte(full, ':') catch full.len;
+    let mut issuer_from_label: []u8 = "";
+    let mut account: []u8 = full[..];
+    if colon < full.len {
+        issuer_from_label = full[..colon];
+        account = strs.trim_left(full[colon + 1..]);
+    }
+    k.own_account = strs.dup(account)!;
+    k.own_issuer = strs.dup(issuer_from_label)!;
+    let mut have_secret = false;
+    let mut have_counter = false;
+    let mut params = strs.split(query, "&");
+    loop {
+        let p = params.next() catch break;
+        if p.len == 0 {
+            continue;
+        }
+        let eq = strs.index_of_byte(p, '=') catch p.len;
+        let name = p[..eq];
+        let mut raw: []u8 = "";
+        if eq < p.len {
+            raw = p[eq + 1..];
+        }
+        let value = unescape(raw, true)!;
+        defer mem.free(value);
+        if strs.eq(name, "secret") {
+            // (padding optional, any case, spaces ignored)
+            let mut clean = strs.String.init();
+            defer clean.deinit();
+            for b in value {
+                if (b != ' ') and (b != '=') {
+                    clean.push(strs.to_upper_byte(b))!;
+                }
+            }
+            let sec = base32.decode_alloc(clean.bytes(), base32.STANDARD_NO_PAD) catch |e| {
+                if e == error.OutOfMemory {
+                    return e;
+                }
+                return error.InvalidUri;
+            };
+            subtle.zero(k.own_secret);
+            mem.free(k.own_secret);
+            k.own_secret = sec;
+            have_secret = sec.len > 0;
+        } else if strs.eq(name, "issuer") {
+            mem.free(k.own_issuer);
+            k.own_issuer = empty();
+            k.own_issuer = strs.dup(value)!;
+        } else if strs.eq(name, "algorithm") {
+            if strs.eq_ignore_case(value, "SHA1") {
+                k.config.alg = sha2.Algorithm.SHA1;
+            } else if strs.eq_ignore_case(value, "SHA256") {
+                k.config.alg = sha2.Algorithm.SHA256;
+            } else if strs.eq_ignore_case(value, "SHA512") {
+                k.config.alg = sha2.Algorithm.SHA512;
+            } else {
+                return error.UnsupportedAlgorithm;
+            }
+        } else if strs.eq(name, "digits") {
+            let d = parse_uint(value, 8)!;
+            if d < 6 {
+                return error.InvalidUri;
+            }
+            k.config.digits = @truncate(u32, d);
+        } else if strs.eq(name, "counter") {
+            k.counter = parse_uint(value, 0xffffffffffffffff)!;
+            have_counter = true;
+        } else if strs.eq(name, "period") {
+            let s = parse_uint(value, 0xffffffffffffffff)!;
+            if s == 0 {
+                return error.InvalidUri;
+            }
+            k.config.period = s;
+        }
+        // (other parameters, such as image, are ignored)
+    }
+    if (not have_secret) or ((k.kind == Kind.HOTP) and not have_counter) {
+        return error.InvalidUri;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests: RFC 4226 Appendix D, RFC 6238 Appendix B; URIs as pyotp writes them
+// -----------------------------------------------------------------------------
+
+test "hotp rfc 4226" {
+    let key = "12345678901234567890";
+    let want: [10]u32 = [755224, 287082, 359152, 969429, 338314, 254676, 287922, 162583, 399871, 520489];
+    let c = Config.default();
+    for i in @as(usize, 0)..10 {
+        @expect_eq(hotp(key, @as(u64, i), c)!, want[i]);
+    }
+    let mut buf: [8]u8 = [0; 8];
+    @expect_eq(hotp_check(key, 0, "755224", 0, c)!, 0);
+    @expect_eq(hotp_check(key, 2, format_code(want[7], c, buf[..]), 5, c)!, 7);
+    @expect_eq(hotp_check(key, 2, "162583", 4, c) catch 99, 99);  // beyond the look-ahead
+    @expect_eq(hotp_check(key, 0, "75522", 3, c) catch 99, 99);   // too short
+    @expect_eq(hotp_check(key, 0, "0755224", 3, c) catch 99, 99);
+    @expect_eq(hotp_check(key, 0xfffffffffffffffe, "000000", 10, c) catch 99, 99);  // (no wrapping around)
+    let bad = Config.{ alg: sha2.Algorithm.SHA1, digits: 9, period: 30, t0: 0 };
+    @expect_eq(hotp(key, 0, bad) catch 1, 1);
+}
+
+struct TotpVector {
+    t: i64,
+    sha1: u32,
+    sha256: u32,
+    sha512: u32,
+}
+
+test "totp rfc 6238" {
+    let k1 = "12345678901234567890";
+    let k256 = "12345678901234567890123456789012";
+    let k512 = "1234567890123456789012345678901234567890123456789012345678901234";
+    let vs: [6]TotpVector = [
+        TotpVector.{ t: 59, sha1: 94287082, sha256: 46119246, sha512: 90693936 },
+        TotpVector.{ t: 1111111109, sha1: 7081804, sha256: 68084774, sha512: 25091201 },
+        TotpVector.{ t: 1111111111, sha1: 14050471, sha256: 67062674, sha512: 99943326 },
+        TotpVector.{ t: 1234567890, sha1: 89005924, sha256: 91819424, sha512: 93441116 },
+        TotpVector.{ t: 2000000000, sha1: 69279037, sha256: 90698825, sha512: 38618901 },
+        TotpVector.{ t: 20000000000, sha1: 65353130, sha256: 77737706, sha512: 47863826 },
+    ];
+    let mut c = Config.default();
+    c.digits = 8;
+    let mut c256 = c;
+    c256.alg = sha2.Algorithm.SHA256;
+    let mut c512 = c;
+    c512.alg = sha2.Algorithm.SHA512;
+    for v in vs {
+        @expect_eq(totp(k1, v.t, c)!, v.sha1);
+        @expect_eq(totp(k256, v.t, c256)!, v.sha256);
+        @expect_eq(totp(k512, v.t, c512)!, v.sha512);
+    }
+    let mut buf: [8]u8 = [0; 8];
+    @expect_eq(format_code(7081804, c, buf[..]), "07081804");
+    // checking with drift: the code of 1111111109 (step 37037036)
+    @expect_eq(totp_check(k1, 1111111109, "07081804", 0, c)!, 37037036);
+    @expect_eq(totp_check(k1, 1111111109 + 30, "07081804", 1, c)!, 37037036);
+    @expect_eq(totp_check(k1, 1111111109 - 30, "07081804", 1, c)!, 37037036);
+    @expect_eq(totp_check(k1, 1111111109 + 60, "07081804", 1, c) catch 1, 1);
+    @expect_eq(totp_check(k1, 1111111109, "07081805", 2, c) catch 1, 1);
+    @expect_eq(totp_check(k1, 10, "94287082", 3, c) catch 1, 1);  // (step 0 - 3 saturates)
+    @expect_eq(totp_check(k1, 59, "94287082", 3, c)!, 1);
+    @expect_eq(time_step(-5, c) catch 7, 7);
+    let mut c6 = Config.default();
+    c6.t0 = 1000;
+    c6.period = 60;
+    @expect_eq(time_step(1000 + 119, c6)!, 1);
+    @expect_eq(totp(k1, 1111111109, Config.default())!, 81804);  // "081804", as pyotp
+}
+
+fn join(parts: [2][]u8) ![]mut u8 {
+    return strs.concat(parts[0], parts[1]);
+}
+
+test "otpauth uris" {
+    let secret = "12345678901234567890";
+    let mut k = Key.init(Kind.TOTP, secret, "ACME Co", "john.doe@email.com", Config.default());
+    let u = uri(&k)!;
+    defer mem.free(u);
+    let want = join(["otpauth://totp/ACME%20Co:john.doe%40email.com?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+                     "&issuer=ACME%20Co"])!;
+    defer mem.free(want);
+    @expect_eq(u, want);
+    let c = Config.{ alg: sha2.Algorithm.SHA256, digits: 8, period: 60, t0: 0 };
+    k = Key.init(Kind.TOTP, secret, "Ex/am ple", "ann+b \xc3\xbc", c);
+    let u2 = uri(&k)!;
+    defer mem.free(u2);
+    let want2 = join(["otpauth://totp/Ex%2Fam%20ple:ann%2Bb%20%C3%BC?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+                      "&issuer=Ex%2Fam%20ple&algorithm=SHA256&digits=8&period=60"])!;
+    defer mem.free(want2);
+    @expect_eq(u2, want2);
+    k = Key.init(Kind.HOTP, secret, "", "bob", Config.default());
+    k.counter = 5;
+    let u3 = uri(&k)!;
+    defer mem.free(u3);
+    @expect_eq(u3, "otpauth://hotp/bob?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=5");
+
+    // parsing: pyotp's form of the second (a literal '/' in the label)
+    let py = join(["otpauth://totp/Ex/am%20ple:ann%2Bb%20%C3%BC?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+                   "&issuer=Ex%2Fam%20ple&algorithm=SHA256&digits=8&period=60"])!;
+    defer mem.free(py);
+    let mut p = parse_uri(py)!;
+    defer p.deinit();
+    @expect(p.kind == Kind.TOTP);
+    @expect_eq(p.secret, secret);
+    @expect_eq(p.issuer, "Ex/am ple");
+    @expect_eq(p.account, "ann+b \xc3\xbc");
+    @expect(p.config.alg == sha2.Algorithm.SHA256);
+    @expect_eq(p.config.digits, 8);
+    @expect_eq(p.config.period, 60);
+    let back = uri(&p)!;
+    defer mem.free(back);
+    @expect_eq(back, u2);
+    // the Key Uri Format's example, lower-case secret with padding, issuer only in the label
+    let mut g = parse_uri("otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example")!;
+    defer g.deinit();
+    @expect_eq(g.issuer, "Example");
+    @expect_eq(g.account, "alice@google.com");
+    @expect_eq(g.secret, "Hello!\xde\xad\xbe\xef");
+    let mut h = parse_uri("OTPAUTH://HOTP/Big%3A%20Corp?secret=gezd+gnbv&counter=42&image=x")!;
+    defer h.deinit();
+    @expect(h.kind == Kind.HOTP);
+    @expect_eq(h.issuer, "Big");
+    @expect_eq(h.account, "Corp");
+    @expect_eq(h.counter, 42);
+    @expect_eq(h.secret, "12345");
+    @expect_eq(hotp(h.secret, h.counter, h.config)!, hotp("12345", 42, Config.default())!);
+    // malformed
+    let bad: [12][]u8 = [
+        "otpauth://totp/x",                  // no secret
+        "otpauth://hotp/x?secret=GEZDGNBV",  // HOTP without a counter
+        "otpauth://xotp/x?secret=GEZDGNBV",
+        "http://totp/x?secret=GEZDGNBV",
+        "otpauth://totp/x?secret=GEZDGNB1",  // not base32
+        "otpauth://totp/x?secret=GEZDGNBV&digits=9",
+        "otpauth://totp/x?secret=GEZDGNBV&digits=5",
+        "otpauth://totp/x?secret=GEZDGNBV&period=0",
+        "otpauth://totp/x?secret=GEZDGNBV&period=-1",
+        "otpauth://totp/x?secret=GEZDGNBV&algorithm=MD5",
+        "otpauth://totp/x%2?secret=GEZDGNBV",  // a broken escape
+        "otpauth://totp/x?secret=GEZDGNBV&counter=99999999999999999999",
+    ];
+    for b in bad {
+        let mut r = parse_uri(b) catch continue;
+        r.deinit();
+        @expect(false);
+    }
+}

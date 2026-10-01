@@ -1,0 +1,734 @@
+// =============================================================================
+// std/graphics/svg/css.ax - the CSS that SVG documents use: colours (keywords,
+// #hex, rgb(), rgba(), hsl(), hsla()), transform lists, declaration blocks
+// ("fill: red; stroke-width: 2"), and style sheets of rules with type, class,
+// id and universal selectors, compounds of them, and descendant and child
+// combinators, ordered by specificity. Part of std/graphics/svg.
+//
+//     let c = css.parse_color("cornflowerblue")!;          // a color.Color
+//     let mut t = draw.Affine.identity();
+//     css.parse_transform("translate(10 20) rotate(45)", &mut t)!;
+//
+// Sources: SVG 1.1 (second edition) sections 4.4 (colours) and 7.6
+// (transforms); CSS 2.1 sections 4 (syntax) and 6.4.3 (specificity); CSS
+// Color Module Level 3 (keywords, hsl()).
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../math.ax" as math;
+import "../../str.ax" as strs;
+import "../color.ax" as color;
+import "../draw.ax" as draw;
+import "colors.ax" as colors;
+import "path.ax" as path;
+
+error { InvalidColor, InvalidTransform, InvalidSelector, OutOfMemory }
+
+// -----------------------------------------------------------------------------
+// Colours
+// -----------------------------------------------------------------------------
+
+fn lower_eq(a: []u8, lower: []u8) bool {
+    if a.len != lower.len {
+        return false;
+    }
+    for i in @as(usize, 0)..a.len {
+        if strs.to_lower_byte(a[i]) != lower[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn hex_digit(c: u8) !u32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u32, c - '0');
+    }
+    let l = strs.to_lower_byte(c);
+    if (l >= 'a') and (l <= 'f') {
+        return @as(u32, l - 'a') + 10;
+    }
+    return error.InvalidColor;
+}
+
+/// A colour keyword's sRGB value (0xrrggbb), case-insensitively.
+pub fn named_color(name: []u8) !u32 {
+    let mut lo: usize = 0;
+    let mut hi = colors.NAMES.len;
+    let mut buf: [24]u8 = [0; 24];
+    if name.len > buf.len {
+        return error.InvalidColor;
+    }
+    for i in @as(usize, 0)..name.len {
+        buf[i] = strs.to_lower_byte(name[i]);
+    }
+    let key = buf[..name.len];
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let c = strs.compare(colors.NAMES[mid].name, key);
+        if c == 0 {
+            return colors.NAMES[mid].rgb;
+        }
+        if c < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return error.InvalidColor;
+}
+
+/// One component of rgb(): an integer 0-255 or a percentage, as 0-1.
+fn rgb_component(s: []u8) !f32 {
+    let t = strs.trim(s);
+    let mut sc = path.Scanner.init(t);
+    let v = sc.raw_number() catch return error.InvalidColor;
+    let rest = strs.trim(t[sc.i..]);
+    if strs.eq(rest, "%") {
+        return @float_cast(f32, @min(@max(v / 100.0, 0.0), 1.0));
+    }
+    if rest.len != 0 {
+        return error.InvalidColor;
+    }
+    return @float_cast(f32, @min(@max(v / 255.0, 0.0), 1.0));
+}
+
+/// An alpha value: a number 0-1 or a percentage.
+fn alpha_component(s: []u8) !f32 {
+    let t = strs.trim(s);
+    let mut sc = path.Scanner.init(t);
+    let v = sc.raw_number() catch return error.InvalidColor;
+    let rest = strs.trim(t[sc.i..]);
+    if strs.eq(rest, "%") {
+        return @float_cast(f32, @min(@max(v / 100.0, 0.0), 1.0));
+    }
+    if rest.len != 0 {
+        return error.InvalidColor;
+    }
+    return @float_cast(f32, @min(@max(v, 0.0), 1.0));
+}
+
+/// The arguments of a function "name(a, b, c)" (commas or spaces between, an
+/// optional "/" before alpha), at most 4.
+fn func_args(s: []u8, args: *mut [4][]u8) !usize {
+    let open = strs.index_of_byte(s, '(') catch return error.InvalidColor;
+    if (s.len == 0) or (s[s.len - 1] != ')') {
+        return error.InvalidColor;
+    }
+    let inner = s[open + 1..s.len - 1];
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    loop {
+        while (i < inner.len) and (path.is_space(inner[i]) or (inner[i] == ',') or (inner[i] == '/')) {
+            i += 1;
+        }
+        if i >= inner.len {
+            break;
+        }
+        let start = i;
+        while (i < inner.len) and not path.is_space(inner[i]) and (inner[i] != ',') and (inner[i] != '/') {
+            i += 1;
+        }
+        if n >= 4 {
+            return error.InvalidColor;
+        }
+        args[n] = inner[start..i];
+        n += 1;
+    }
+    return n;
+}
+
+fn hue_to_rgb(p: f32, q: f32, t0: f32) f32 {
+    let mut t = t0;
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+    if t < (1.0 / 6.0) {
+        return p + (((q - p) * 6.0) * t);
+    }
+    if t < 0.5 {
+        return q;
+    }
+    if t < (2.0 / 3.0) {
+        return p + (((q - p) * ((2.0 / 3.0) - t)) * 6.0);
+    }
+    return p;
+}
+
+/// Parses a CSS colour: a keyword (case-insensitive), "#rgb", "#rgba",
+/// "#rrggbb", "#rrggbbaa", rgb()/rgba() (integers or percentages; alpha a
+/// number or percentage), hsl()/hsla(), or "transparent". The colour is linear
+/// (color.Color), from sRGB.
+pub fn parse_color(text: []u8) !color.Color {
+    let s = strs.trim(text);
+    if s.len == 0 {
+        return error.InvalidColor;
+    }
+    if s[0] == '#' {
+        let h = s[1..];
+        let mut v: u32 = 0;
+        if (h.len == 3) or (h.len == 4) {
+            for c in h {
+                v = (v << 8) | (hex_digit(c)! * 17);
+            }
+            if h.len == 3 {
+                v = (v << 8) | 0xff;
+            }
+        } else if (h.len == 6) or (h.len == 8) {
+            for c in h {
+                v = (v << 4) | hex_digit(c)!;
+            }
+            if h.len == 6 {
+                v = (v << 8) | 0xff;
+            }
+        } else {
+            return error.InvalidColor;
+        }
+        return color.Color.from_rgba8(color.Rgba8.from_u32(v));
+    }
+    if lower_eq(s, "transparent") {
+        return color.Color.rgba(0.0, 0.0, 0.0, 0.0);
+    }
+    let paren = strs.index_of_byte(s, '(') catch {
+        let rgb = named_color(s)!;
+        return color.Color.from_rgba8(color.Rgba8.from_u32((rgb << 8) | 0xff));
+    };
+    let name = strs.trim(s[..paren]);
+    let mut args: [4][]u8 = [""; 4];
+    let n = func_args(s, &mut args)!;
+    if lower_eq(name, "rgb") or lower_eq(name, "rgba") {
+        if (n != 3) and (n != 4) {
+            return error.InvalidColor;
+        }
+        let mut a: f32 = 1.0;
+        if n == 4 {
+            a = alpha_component(args[3])!;
+        }
+        return color.Color.from_srgb(rgb_component(args[0])!, rgb_component(args[1])!, rgb_component(args[2])!, a);
+    }
+    if lower_eq(name, "hsl") or lower_eq(name, "hsla") {
+        if (n != 3) and (n != 4) {
+            return error.InvalidColor;
+        }
+        let mut hs = path.Scanner.init(strs.trim(args[0]));
+        let hdeg = hs.raw_number() catch return error.InvalidColor;
+        let sat = alpha_component(args[1])!;
+        let lig = alpha_component(args[2])!;
+        if not strs.ends_with(strs.trim(args[1]), "%") or not strs.ends_with(strs.trim(args[2]), "%") {
+            return error.InvalidColor;
+        }
+        let mut a: f32 = 1.0;
+        if n == 4 {
+            a = alpha_component(args[3])!;
+        }
+        let mut hue = @rem(hdeg / 360.0, 1.0);
+        if hue < 0.0 {
+            hue += 1.0;
+        }
+        let h = @float_cast(f32, hue);
+        let mut q = (lig + sat) - (lig * sat);
+        if lig <= 0.5 {
+            q = lig * (1.0 + sat);
+        }
+        let p = (2.0 * lig) - q;
+        return color.Color.from_srgb(
+            hue_to_rgb(p, q, h + (1.0 / 3.0)), hue_to_rgb(p, q, h), hue_to_rgb(p, q, h - (1.0 / 3.0)), a);
+    }
+    return error.InvalidColor;
+}
+
+// -----------------------------------------------------------------------------
+// Transforms
+// -----------------------------------------------------------------------------
+
+/// Parses a transform list ("translate(10) scale(2, 3) rotate(30 5 5)
+/// skewX(10) matrix(a b c d e f)"), composing it onto out: the result maps
+/// the element's coordinates to its parent's (the last transform in the list
+/// is applied first). out is left unchanged on an error.
+pub fn parse_transform(text: []u8, out: *mut draw.Affine) !void {
+    let mut t = draw.Affine.identity();
+    let mut sc = path.Scanner.init(text);
+    loop {
+        sc.skip_space();
+        while (sc.i < text.len) and (text[sc.i] == ',') {
+            sc.i += 1;
+            sc.skip_space();
+        }
+        if sc.i >= text.len {
+            break;
+        }
+        let start = sc.i;
+        while (sc.i < text.len) and strs.is_alpha(text[sc.i]) {
+            sc.i += 1;
+        }
+        let name = text[start..sc.i];
+        sc.skip_space();
+        if (sc.i >= text.len) or (text[sc.i] != '(') {
+            return error.InvalidTransform;
+        }
+        sc.i += 1;
+        let mut v: [6]f64 = [0.0; 6];
+        let mut n: usize = 0;
+        loop {
+            sc.skip_space();
+            if (sc.i < text.len) and (text[sc.i] == ')') {
+                sc.i += 1;
+                break;
+            }
+            if n >= 6 {
+                return error.InvalidTransform;
+            }
+            v[n] = sc.number() catch return error.InvalidTransform;
+            n += 1;
+        }
+        let mut m = draw.Affine.identity();
+        if strs.eq(name, "matrix") and (n == 6) {
+            m = draw.Affine.{ a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] };
+        } else if strs.eq(name, "translate") and ((n == 1) or (n == 2)) {
+            m = draw.Affine.translation(v[0], v[1]);
+        } else if strs.eq(name, "scale") and ((n == 1) or (n == 2)) {
+            let mut sy = v[1];
+            if n == 1 {
+                sy = v[0];
+            }
+            m = draw.Affine.scaling(v[0], sy);
+        } else if strs.eq(name, "rotate") and ((n == 1) or (n == 3)) {
+            let r = draw.Affine.rotation(v[0] * (math.PI / 180.0));
+            m = draw.Affine.translation(-v[1], -v[2]).then(r).then(draw.Affine.translation(v[1], v[2]));
+        } else if strs.eq(name, "skewX") and (n == 1) {
+            m.c = math.tan(v[0] * (math.PI / 180.0));
+        } else if strs.eq(name, "skewY") and (n == 1) {
+            m.b = math.tan(v[0] * (math.PI / 180.0));
+        } else {
+            return error.InvalidTransform;
+        }
+        // the list's later transforms apply first
+        t = m.then(t);
+    }
+    out.* = t.then(out.*);
+}
+
+// -----------------------------------------------------------------------------
+// Declarations and style sheets
+// -----------------------------------------------------------------------------
+
+/// A declaration: "name: value".
+pub struct Decl {
+    name: []u8,
+    value: []u8,
+    important: bool,
+}
+
+/// Copies text with its /* comments */ replaced by spaces, into out.
+pub fn strip_comments(text: []u8, out: []mut u8) []u8 {
+    let mut i: usize = 0;
+    while i < text.len {
+        if ((i + 1) < text.len) and (text[i] == '/') and (text[i + 1] == '*') {
+            let mut j = i + 2;
+            while ((j + 1) < text.len) and not ((text[j] == '*') and (text[j + 1] == '/')) {
+                j += 1;
+            }
+            let end = @min(j + 2, text.len);
+            for k in i..end {
+                out[k] = ' ';
+            }
+            i = end;
+            continue;
+        }
+        out[i] = text[i];
+        i += 1;
+    }
+    return out[..text.len];
+}
+
+/// Appends the declarations of a block ("a: b; c: d") to out; malformed ones
+/// are skipped. The slices point into text (which should have no comments).
+pub fn parse_declarations(text: []u8, out: *mut vec.Vec.[Decl]) !void {
+    let mut parts = strs.split(text, ";");
+    loop {
+        let part = parts.next() catch break;
+        let c = strs.cut(part, ":") catch continue;
+        let name = strs.trim(c.before);
+        let mut value = strs.trim(c.after);
+        if (name.len == 0) or (value.len == 0) {
+            continue;
+        }
+        let mut important = false;
+        let bang = strs.last_index_of_byte(value, '!') catch value.len;
+        if (bang < value.len) and lower_eq(strs.trim(value[bang + 1..]), "important") {
+            important = true;
+            value = strs.trim(value[..bang]);
+        }
+        out.push(Decl.{ name: name, value: value, important: important })!;
+    }
+}
+
+/// A compound selector: a type (or "" for any), an id, classes; and how it
+/// relates to the compound before it (' ' descendant, '>' child, 0 for the
+/// first).
+pub struct Compound {
+    tag: []u8,
+    id: []u8,
+    classes: [4][]u8,
+    nclasses: usize,
+    combinator: u8,
+}
+
+/// A rule: a complex selector (compounds[first..first + count]), its
+/// declarations, and where it ranks.
+pub struct Rule {
+    first: usize,
+    count: usize,
+    decl_first: usize,
+    decl_count: usize,
+    specificity: u32,
+    order: u32,
+}
+
+/// What a selector is matched against: one element (its type, id and class
+/// attribute).
+pub struct Elem {
+    tag: []u8,
+    id: []u8,
+    class: []u8,
+}
+
+/// Style sheet rules (their text must outlive the sheet).
+pub struct Sheet {
+    compounds: vec.Vec.[Compound],
+    rules: vec.Vec.[Rule],
+    decls: vec.Vec.[Decl],
+
+    /// An empty sheet.
+    pub fn init() Sheet {
+        return Sheet.{ compounds: vec.Vec.[Compound].init(), rules: vec.Vec.[Rule].init(),
+                       decls: vec.Vec.[Decl].init() };
+    }
+
+    pub fn deinit(self: *mut Sheet) void {
+        self.compounds.deinit();
+        self.rules.deinit();
+        self.decls.deinit();
+    }
+
+    /// Adds the rules of a style sheet (comments already removed). At-rules
+    /// and rules with selectors this does not understand (attributes,
+    /// pseudo-classes, sibling combinators) are skipped.
+    pub fn add(self: *mut Sheet, text: []u8) !void {
+        let mut i: usize = 0;
+        loop {
+            while (i < text.len) and path.is_space(text[i]) {
+                i += 1;
+            }
+            if i >= text.len {
+                return;
+            }
+            if text[i] == '@' {
+                // an at-rule: up to ";" or past its block
+                while (i < text.len) and (text[i] != ';') and (text[i] != '{') {
+                    i += 1;
+                }
+                if (i < text.len) and (text[i] == '{') {
+                    i = skip_block(text, i);
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            let open = strs.index_of_from(text, "{", i) catch return;
+            let close = skip_block(text, open);
+            let prelude = text[i..open];
+            let mut body_end = close;
+            if (body_end > 0) and (body_end <= text.len) and (text[body_end - 1] == '}') {
+                body_end -= 1;
+            }
+            let body = text[open + 1..@max(body_end, open + 1)];
+            i = close;
+            let decl_first = self.decls.len;
+            parse_declarations(body, &mut self.decls)!;
+            let decl_count = self.decls.len - decl_first;
+            // each selector of a group is a rule
+            let mut sels = strs.split(prelude, ",");
+            loop {
+                let sel = sels.next() catch break;
+                let first = self.compounds.len;
+                let spec = self.parse_selector(strs.trim(sel)) catch {
+                    self.compounds.truncate(first);
+                    continue;
+                };
+                self.rules.push(Rule.{ first: first, count: self.compounds.len - first, decl_first: decl_first,
+                                       decl_count: decl_count, specificity: spec, order: @truncate(
+                                           u32, self.rules.len) })!;
+            }
+        }
+    }
+
+    /// Parses a selector into compounds, returning its specificity.
+    fn parse_selector(self: *mut Sheet, s: []u8) !u32 {
+        if s.len == 0 {
+            return error.InvalidSelector;
+        }
+        let mut ids: u32 = 0;
+        let mut cls: u32 = 0;
+        let mut tags: u32 = 0;
+        let mut i: usize = 0;
+        let mut comb: u8 = 0;
+        let mut count: usize = 0;
+        loop {
+            // white space and ">" between compounds
+            let mut saw_space = false;
+            while (i < s.len) and (path.is_space(s[i]) or (s[i] == '>')) {
+                if s[i] == '>' {
+                    comb = '>';
+                } else {
+                    saw_space = true;
+                }
+                i += 1;
+            }
+            if i >= s.len {
+                break;
+            }
+            if (count > 0) and saw_space and (comb == 0) {
+                comb = ' ';
+            }
+            let mut c = Compound.{ tag: "", id: "", classes: [""; 4], nclasses: 0, combinator: comb };
+            let start = i;
+            if s[i] == '*' {
+                i += 1;
+            } else {
+                let ts = i;
+                while (i < s.len) and is_ident(s[i]) {
+                    i += 1;
+                }
+                c.tag = s[ts..i];
+                if c.tag.len > 0 {
+                    tags += 1;
+                }
+            }
+            while (i < s.len) and ((s[i] == '.') or (s[i] == '#')) {
+                let kind = s[i];
+                i += 1;
+                let ns = i;
+                while (i < s.len) and is_ident(s[i]) {
+                    i += 1;
+                }
+                if i == ns {
+                    return error.InvalidSelector;
+                }
+                if kind == '#' {
+                    c.id = s[ns..i];
+                    ids += 1;
+                } else {
+                    if c.nclasses >= 4 {
+                        return error.InvalidSelector;
+                    }
+                    c.classes[c.nclasses] = s[ns..i];
+                    c.nclasses += 1;
+                    cls += 1;
+                }
+            }
+            if (i == start) or ((i < s.len) and not path.is_space(s[i]) and (s[i] != '>')) {
+                return error.InvalidSelector;  // something unsupported
+            }
+            self.compounds.push(c)!;
+            count += 1;
+            comb = 0;
+        }
+        if (comb != 0) or (count == 0) {
+            return error.InvalidSelector;  // a dangling ">"
+        }
+        return (((@min(ids, 99) * 10000) + (@min(cls, 99) * 100)) + @min(tags, 99));
+    }
+
+    /// Whether rule r matches the last element of chain (whose ancestors,
+    /// outermost first, come before it).
+    pub fn matches(self: *Sheet, r: Rule, chain: []Elem) bool {
+        if (r.count == 0) or (chain.len == 0) {
+            return false;
+        }
+        return self.match_at(r.first, r.count - 1, chain, chain.len - 1);
+    }
+
+    fn match_at(self: *Sheet, first: usize, ci: usize, chain: []Elem, ei: usize) bool {
+        let c = self.compounds.get(first + ci);
+        if not compound_matches(c, chain[ei]) {
+            return false;
+        }
+        if ci == 0 {
+            return true;
+        }
+        if ei == 0 {
+            return false;
+        }
+        if c.combinator == '>' {
+            return self.match_at(first, ci - 1, chain, ei - 1);
+        }
+        let mut k = ei;
+        while k > 0 {
+            k -= 1;
+            if self.match_at(first, ci - 1, chain, k) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+fn is_ident(c: u8) bool {
+    return strs.is_alnum(c) or (c == '-') or (c == '_') or (c >= 0x80);
+}
+
+/// The index just past the block whose "{" is at text[open] (or the end).
+fn skip_block(text: []u8, open: usize) usize {
+    let mut depth: usize = 0;
+    let mut i = open;
+    while i < text.len {
+        if text[i] == '{' {
+            depth += 1;
+        } else if text[i] == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    return text.len;
+}
+
+fn has_class(list: []u8, name: []u8) bool {
+    let mut f = strs.fields(list);
+    loop {
+        let c = f.next() catch return false;
+        if strs.eq(c, name) {
+            return true;
+        }
+    }
+}
+
+fn compound_matches(c: Compound, e: Elem) bool {
+    if (c.tag.len > 0) and not strs.eq(c.tag, e.tag) {
+        return false;
+    }
+    if (c.id.len > 0) and not strs.eq(c.id, e.id) {
+        return false;
+    }
+    for k in @as(usize, 0)..c.nclasses {
+        if not has_class(e.class, c.classes[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn rgba(text: []u8) u32 {
+    let c = parse_color(text) catch return 1;
+    return c.to_rgba8().to_u32();
+}
+
+fn bad_color(text: []u8) bool {
+    _ = parse_color(text) catch return true;
+    return false;
+}
+
+test "colours" {
+    @expect_eq(rgba("red"), 0xff0000ff);
+    @expect_eq(rgba("CornflowerBlue"), 0x6495edff);
+    @expect_eq(rgba(" #abc "), 0xaabbccff);
+    @expect_eq(rgba("#AABBCC80"), 0xaabbcc80);
+    @expect_eq(rgba("#1234"), 0x11223344);
+    @expect_eq(rgba("rgb(255, 128, 0)"), 0xff8000ff);
+    @expect_eq(rgba("rgb(100%,0%,50%)"), 0xff0080ff);
+    @expect_eq(rgba("rgba(0, 0, 255, 0.5)"), 0x0000ff80);
+    @expect_eq(rgba("rgb(300, -5, 0)"), 0xff0000ff);  // clamped
+    @expect_eq(rgba("hsl(0, 100%, 50%)"), 0xff0000ff);
+    @expect_eq(rgba("hsl(120, 100%, 25%)"), 0x008000ff);
+    @expect_eq(rgba("hsla(240, 100%, 50%, 0.25)"), 0x0000ff40);
+    @expect_eq(rgba("transparent"), 0x00000000);
+    @expect(bad_color("#12"));
+    @expect(bad_color("#ggg"));
+    @expect(bad_color("rgb(1, 2)"));
+    @expect(bad_color("rgb(1, 2, 3"));
+    @expect(bad_color("hsl(1, 2, 3)"));
+    @expect(bad_color("nonsense"));
+    @expect(bad_color(""));
+    @expect(bad_color("averyveryverylongcolourname"));
+    // every keyword is found
+    for n in colors.NAMES {
+        @expect_eq(named_color(n.name)!, n.rgb);
+    }
+}
+
+fn mapped(t: []u8, x: f64, y: f64) draw.Point {
+    let mut m = draw.Affine.identity();
+    parse_transform(t, &mut m) catch return draw.Point.{ x: -999.0, y: -999.0 };
+    return m.apply(x, y);
+}
+
+fn close_to(p: draw.Point, x: f64, y: f64) bool {
+    return (@abs(p.x - x) < 1.0e-9) and (@abs(p.y - y) < 1.0e-9);
+}
+
+test "transforms" {
+    // the last transform applies first
+    @expect(close_to(mapped("translate(10 20) scale(2)", 1.0, 1.0), 12.0, 22.0));
+    @expect(close_to(mapped("scale(2),translate(10,20)", 1.0, 1.0), 22.0, 42.0));
+    @expect(close_to(mapped("rotate(90 10 10)", 20.0, 10.0), 10.0, 20.0));
+    @expect(close_to(mapped("rotate(-90)", 0.0, 10.0), 10.0, 0.0));
+    @expect(close_to(mapped("skewX(45)", 0.0, 10.0), 10.0, 10.0));
+    @expect(close_to(mapped("skewY(45)", 10.0, 0.0), 10.0, 10.0));
+    @expect(close_to(mapped("matrix(1 2 3 4 5 6)", 1.0, 1.0), 9.0, 12.0));
+    @expect(close_to(mapped("translate(5)", 1.0, 1.0), 6.0, 1.0));
+    @expect(close_to(mapped("  ", 1.0, 1.0), 1.0, 1.0));
+    @expect(close_to(mapped("scale(1, 2, 3)", 1.0, 1.0), -999.0, -999.0));
+    @expect(close_to(mapped("rotate(", 1.0, 1.0), -999.0, -999.0));
+    @expect(close_to(mapped("spin(3)", 1.0, 1.0), -999.0, -999.0));
+    // composed onto what is there
+    let mut m = draw.Affine.translation(100.0, 0.0);
+    parse_transform("scale(3)", &mut m)!;
+    @expect(close_to(m.apply(1.0, 1.0), 103.0, 3.0));
+}
+
+test "declarations and selectors" {
+    let mut d = vec.Vec.[Decl].init();
+    defer d.deinit();
+    parse_declarations(" fill : red ; ; stroke:blue !important;bad; :x; opacity: 0.5", &mut d)!;
+    @expect_eq(d.len, 3);
+    @expect(strs.eq(d.get(0).name, "fill"));
+    @expect(strs.eq(d.get(0).value, "red"));
+    @expect(strs.eq(d.get(1).value, "blue"));
+    @expect(d.get(1).important);
+    @expect(not d.get(2).important);
+    let mut buf: [64]u8 = [0; 64];
+    @expect(strs.eq(strip_comments("a/* x */b/*", buf[..]), "a       b  "));
+    let mut sh = Sheet.init();
+    defer sh.deinit();
+    sh.add("rect { fill: red } #a .b > c, g c.d.e { x: y } a:hover { x: z } @media print { q { r: s } } p ~ q {}")!;
+    @expect_eq(sh.rules.len, 3);
+    @expect_eq(sh.rules.get(0).specificity, 1);
+    @expect_eq(sh.rules.get(1).specificity, 10101);
+    @expect_eq(sh.rules.get(2).specificity, 202);
+    let chain: [3]Elem = [
+        Elem.{ tag: "svg", id: "a", class: "" },
+        Elem.{ tag: "g", id: "", class: "b" },
+        Elem.{ tag: "c", id: "", class: "e  d" },
+    ];
+    @expect(not sh.matches(sh.rules.get(0), chain[..]));
+    @expect(sh.matches(sh.rules.get(1), chain[..]));
+    @expect(sh.matches(sh.rules.get(2), chain[..]));
+    // a child combinator needs the parent itself
+    let chain2: [3]Elem = [
+        Elem.{ tag: "svg", id: "", class: "b" },
+        Elem.{ tag: "svg", id: "a", class: "" },
+        Elem.{ tag: "c", id: "", class: "" },
+    ];
+    @expect(not sh.matches(sh.rules.get(1), chain2[..]));
+    @expect(not sh.matches(sh.rules.get(2), chain2[..]));
+}

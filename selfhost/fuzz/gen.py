@@ -1,4 +1,4 @@
-# Generates a Phalange program exercising many operations over edge values.
+# Generates a Axiom program exercising many operations over edge values.
 import random, sys
 seed = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 random.seed(seed)

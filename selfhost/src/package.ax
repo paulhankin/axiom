@@ -1,0 +1,573 @@
+// =============================================================================
+// package.ax - packages (spec §4.6).
+//
+// A package is a directory with a axiom.toml manifest:
+//
+//     [package]
+//     name = "geometry"
+//     version = "0.1.0"
+//     entry = "src/lib.ax"          # optional: default src/lib.ax, else src/main.ax
+//
+//     [dependencies]
+//     vecmath = { path = "../vecmath" }
+//     json = { git = "https://example.com/json.git", rev = "<full commit hash>" }
+//
+// Modules import dependencies with "pkg:name" (the entry module) or
+// "pkg:name/sub/mod" (src/sub/mod.ax). Only a package's own dependencies are
+// visible to it, and each package name resolves to one source per build.
+// =============================================================================
+import "diag.ax" as dg;
+import "util.ax" as u;
+
+pub struct Package {
+    name: []u8,
+    version: []u8,
+    dir: []u8,           // real path of the package root (where axiom.toml is)
+    entry: []u8,         // real path of the entry module
+    manifest_file: i32,  // g_files index, for diagnostics
+    deps: u.SymMap.[*mut Package],
+    dep_names: u.List.[[]u8],
+    dep_spans: u.List.[u.Span],
+}
+
+let mut pkg_by_dir: u.SymMap.[*mut Package] = u.SymMap.[*mut Package].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut *mut Package, 0),
+                                                                        cap: 0, len: 0 };
+let mut pkg_by_name: u.SymMap.[*mut Package] = u.SymMap.[*mut Package].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut Package, 0), cap: 0, len: 0 };
+
+// -----------------------------------------------------------------------------
+// Manifest parsing: a TOML subset (sections, string values, inline tables).
+// -----------------------------------------------------------------------------
+struct Parser {
+    f: *mut u.SourceFile,
+    pos: usize,
+    failed: bool,
+}
+
+fn pspan(P: *Parser, a: usize, b: usize) u.Span {
+    return u.mkspan(P.f.id, @int_cast(u32, a), @int_cast(u32, b));
+}
+
+fn perr(P: *mut Parser, a: usize, b: usize, msg: []u8) void {
+    _ = dg.err(pspan(P, a, b), "E0215", u.f1("invalid axiom.toml: %s", msg));
+    P.failed = true;
+}
+
+fn ch(P: *Parser) u8 {
+    if P.pos < P.f.text.len {
+        return P.f.text[P.pos];
+    }
+    return 0;
+}
+
+fn skip_ws(P: *mut Parser) void {
+    let t = P.f.text;
+    while (P.pos < t.len) and ((t[P.pos] == ' ') or (t[P.pos] == '\t')) {
+        P.pos += 1;
+    }
+    if (P.pos < t.len) and (t[P.pos] == '#') {
+        while (P.pos < t.len) and (t[P.pos] != '\n') {
+            P.pos += 1;
+        }
+    }
+}
+
+fn at_eol(P: *mut Parser) bool {
+    skip_ws(P);
+    let t = P.f.text;
+    return (P.pos >= t.len) or (t[P.pos] == '\n') or (t[P.pos] == '\r');
+}
+
+// A key, or a nil slice. Its start is stored in *start.
+fn parse_key(P: *mut Parser, start: *mut usize) []u8 {
+    skip_ws(P);
+    start.* = P.pos;
+    let t = P.f.text;
+    while P.pos < t.len {
+        let c = t[P.pos];
+        if not (u.is_alnum(c) or (c == '_') or (c == '-')) {
+            break;
+        }
+        P.pos += 1;
+    }
+    if P.pos == start.* {
+        return u.nosym();
+    }
+    return u.dup(t[start.*..P.pos]);
+}
+
+fn parse_string(P: *mut Parser) []u8 {
+    skip_ws(P);
+    let t = P.f.text;
+    if (P.pos >= t.len) or (t[P.pos] != '"') {
+        perr(P, P.pos, P.pos + 1, "expected a \"string\"");
+        return u.nosym();
+    }
+    P.pos += 1;
+    let a = P.pos;
+    while (P.pos < t.len) and (t[P.pos] != '"') and (t[P.pos] != '\n') {
+        P.pos += 1;
+    }
+    if (P.pos >= t.len) or (t[P.pos] != '"') {
+        perr(P, a - 1, P.pos, "unterminated string");
+        return u.nosym();
+    }
+    let s = u.dup(t[a..P.pos]);
+    P.pos += 1;
+    return s;
+}
+
+fn expect_ch(P: *mut Parser, c: u8) bool {
+    skip_ws(P);
+    if ch(P) == c {
+        P.pos += 1;
+        return true;
+    }
+    let one = [c];
+    perr(P, P.pos, P.pos + 1, u.f1("expected '%s'", one[..]));
+    return false;
+}
+
+fn next_line(P: *mut Parser) void {
+    let t = P.f.text;
+    while (P.pos < t.len) and (t[P.pos] != '\n') {
+        P.pos += 1;
+    }
+    if P.pos < t.len {
+        P.pos += 1;
+    }
+}
+
+struct DepSpec {
+    name: []u8,
+    span: u.Span,
+    path: []u8,
+    git: []u8,
+    rev: []u8,
+}
+
+fn valid_name(s: []u8) bool {
+    if s.len == 0 {
+        return false;
+    }
+    for c in s {
+        if not (((c >= 'a') and (c <= 'z')) or u.is_digit(c) or (c == '_')) {
+            return false;
+        }
+    }
+    return not u.is_digit(s[0]);
+}
+
+// -----------------------------------------------------------------------------
+// Git dependencies: cloned once per (url, rev) into the cache.
+// -----------------------------------------------------------------------------
+// Runs a command with stdout and stderr discarded; its exit status or -1.
+fn run_quiet(args: [][]u8) i32 {
+    u.flush_out();
+    let argv = u.c_argv(args);
+    let pid = u.fork();
+    if pid == 0 {
+        let fd = u.open("/dev/null".ptr, 1);
+        if fd >= 0 {
+            _ = u.dup2(fd, 1);
+            _ = u.dup2(fd, 2);
+        }
+        _ = u.execvp(argv.*, argv);
+        u._exit(127);
+    }
+    if pid < 0 {
+        return -1;
+    }
+    let mut status: i32 = 0;
+    _ = u.waitpid(pid, &mut status, 0);
+    if u.wifexited(status) {
+        return u.wexitstatus(status);
+    }
+    return -1;
+}
+
+// The toolchain cache: $AXIOM_CACHE, $XDG_CACHE_HOME/axiom or ~/.cache/axiom.
+pub fn cache_dir() []u8 {
+    let c = u.env("AXIOM_CACHE");
+    if not u.isnos(c) and (c.len > 0) {
+        return c;
+    }
+    let x = u.env("XDG_CACHE_HOME");
+    if not u.isnos(x) and (x.len > 0) {
+        return u.cat2(x, "/axiom");
+    }
+    let h = u.env("HOME");
+    if not u.isnos(h) and (h.len > 0) {
+        return u.cat2(h, "/.cache/axiom");
+    }
+    return "/tmp/.cache/axiom";
+}
+
+fn fetch_git(url: []u8, rev: []u8, sp: u.Span) []u8 {
+    let mut key = u.Buf.init();
+    for c in url {
+        if key.len() >= 150 {
+            break;
+        }
+        if u.is_alnum(c) {
+            key.c(c);
+        } else {
+            key.c('_');
+        }
+    }
+    let dir = u.f3("%s/git/%s-%s", cache_dir(), key.done(), rev);
+    if u.is_file(u.cat2(dir, "/axiom.toml")) {
+        return dir;
+    }
+    u.mkdirs(u.cat2(cache_dir(), "/git"));
+    let tmp = u.f2("%s.tmp%s", dir, u.idec(u.getpid()));
+    let clone = ["git", "clone", "--quiet", url, tmp];
+    let co = ["git", "-C", tmp, "-c", "advice.detachedHead=false", "checkout", "--quiet", rev];
+    let rm = ["rm", "-rf", tmp];
+    if (run_quiet(clone[..]) != 0) or (run_quiet(co[..]) != 0) {
+        _ = run_quiet(rm[..]);
+        _ = dg.err(sp, "E0216", u.f2("cannot fetch %s at %s (is the URL reachable and the commit correct?)", url, rev));
+        return u.nosym();
+    }
+    if u.rename(u.cz(tmp), u.cz(dir)) != 0 {
+        _ = run_quiet(rm[..]);
+    }
+    return dir;
+}
+
+// -----------------------------------------------------------------------------
+// Loading
+// -----------------------------------------------------------------------------
+// Loads the package rooted at `dir_in` (which must contain axiom.toml).
+// `from` is where it was named (for diagnostics), or nil.
+pub fn load_dir(dir_in: []u8, from: *u.Span) *mut Package {
+    let dir = u.real_path(dir_in);
+    if u.isnos(dir) {
+        if u.notnil(from) {
+            _ = dg.err(from.*, "E0217", u.f1("package directory '%s' does not exist", dir_in));
+        }
+        return u.nil.[Package]();
+    }
+    let key = u.intern(dir);
+    let found = pkg_by_dir.get(key);
+    if u.notnil(found) {
+        return found;
+    }
+    let mpath = u.cat2(dir, "/axiom.toml");
+    let mut display = mpath;
+    let cwd = u.cwd();
+    if (cwd.len > 0) and u.starts(mpath, cwd) and (mpath.len > cwd.len) and (mpath[cwd.len] == '/') {
+        display = u.dup(mpath[cwd.len + 1..]);
+    }
+    let f = u.load_file(mpath, display);
+    if u.isnil(f) {
+        if u.notnil(from) {
+            _ = dg.err(from.*, "E0217", u.f1("no axiom.toml in '%s'", dir_in));
+        }
+        return u.nil.[Package]();
+    }
+    let p = u.new.[Package]();
+    p.dir = key;
+    p.manifest_file = f.id;
+    pkg_by_dir.put(key, p);
+
+    let mut P = Parser.{ f: f, pos: 0, failed: false };
+    let t = f.text;
+    let mut section: []u8 = "";
+    let mut entry = u.nosym();
+    let mut specs = u.List.[DepSpec].{ data: u.nil.[DepSpec](), len: 0, cap: 0 };
+    while P.pos < t.len {
+        skip_ws(&mut P);
+        if at_eol(&mut P) {
+            next_line(&mut P);
+            continue;
+        }
+        if t[P.pos] == '[' {
+            let a = P.pos;
+            P.pos += 1;
+            let mut ks0: usize = 0;
+            let name = parse_key(&mut P, &mut ks0);
+            if u.isnos(name) {
+                next_line(&mut P);
+                continue;
+            }
+            if not expect_ch(&mut P, ']') {
+                next_line(&mut P);
+                continue;
+            }
+            if not u.str_eq(name, "package") and not u.str_eq(name, "dependencies") {
+                perr(&mut P, a, P.pos, u.f1("unknown section [%s]", name));
+            }
+            section = name;
+            next_line(&mut P);
+            continue;
+        }
+        let mut ks: usize = 0;
+        let key_s = parse_key(&mut P, &mut ks);
+        if u.isnos(key_s) {
+            perr(&mut P, P.pos, P.pos + 1, "expected key = value");
+            next_line(&mut P);
+            continue;
+        }
+        let ke = P.pos;
+        if not expect_ch(&mut P, '=') {
+            next_line(&mut P);
+            continue;
+        }
+        if u.str_eq(section, "package") {
+            let v = parse_string(&mut P);
+            if u.isnos(v) {
+                next_line(&mut P);
+                continue;
+            }
+            if u.str_eq(key_s, "name") {
+                if not valid_name(v) {
+                    perr(&mut P, ks, P.pos, "package names use lower-case letters, digits and '_'");
+                }
+                p.name = u.intern(v);
+            } else if u.str_eq(key_s, "version") {
+                p.version = v;
+            } else if u.str_eq(key_s, "entry") {
+                entry = v;
+            } else {
+                perr(&mut P, ks, ke, u.f1("unknown key '%s' in [package]", key_s));
+            }
+        } else if u.str_eq(section, "dependencies") {
+            let mut d = DepSpec.{ name: u.intern(key_s), span: pspan(&P, ks, ke), path: u.nosym(), git: u.nosym(),
+                                  rev: u.nosym() };
+            if not valid_name(key_s) {
+                perr(&mut P, ks, ke, "package names use lower-case letters, digits and '_'");
+            }
+            if not expect_ch(&mut P, '{') {
+                next_line(&mut P);
+                continue;
+            }
+            loop {
+                skip_ws(&mut P);
+                if ch(&P) == '}' {
+                    P.pos += 1;
+                    break;
+                }
+                let mut fs: usize = 0;
+                let fk = parse_key(&mut P, &mut fs);
+                if u.isnos(fk) {
+                    break;
+                }
+                if not expect_ch(&mut P, '=') {
+                    break;
+                }
+                let fv = parse_string(&mut P);
+                if u.isnos(fv) {
+                    break;
+                }
+                if u.str_eq(fk, "path") {
+                    d.path = fv;
+                } else if u.str_eq(fk, "git") {
+                    d.git = fv;
+                } else if u.str_eq(fk, "rev") {
+                    d.rev = fv;
+                } else {
+                    perr(&mut P, fs, P.pos, u.f1("unknown dependency field '%s' (path, git, rev)", fk));
+                }
+                skip_ws(&mut P);
+                if ch(&P) == ',' {
+                    P.pos += 1;
+                }
+            }
+            if u.isnos(d.path) and u.isnos(d.git) {
+                perr(&mut P, ks, ke, "a dependency needs path = \"...\" or git = \"...\"");
+            }
+            if not u.isnos(d.git) and u.isnos(d.rev) {
+                perr(&mut P, ks, ke, "git dependencies must pin a commit: rev = \"<full commit hash>\"");
+            }
+            for i in 0..specs.len {
+                if u.same(specs.get(i).name, d.name) {
+                    perr(&mut P, ks, ke, "duplicate dependency");
+                }
+            }
+            specs.push(d);
+        } else {
+            perr(&mut P, ks, ke, "key outside of [package] or [dependencies]");
+        }
+        if not at_eol(&mut P) {
+            perr(&mut P, P.pos, P.pos + 1, "unexpected text after value");
+        }
+        next_line(&mut P);
+    }
+    if u.isnos(p.name) {
+        _ = dg.err(u.mkspan(f.id, 0, 0), "E0215", "invalid axiom.toml: [package] needs name = \"...\"");
+        p.name = u.intern("<unnamed>");
+    }
+    // one source per package name
+    let same = pkg_by_name.get(p.name);
+    if u.notnil(same) and (same != p) {
+        let mut sp = u.mkspan(f.id, 0, 0);
+        if u.notnil(from) {
+            sp = from.*;
+        }
+        let d = dg.err(sp, "E0213", u.f1("two different packages are both named '%s'; a build can use only one",
+                                         p.name));
+        dg.note(d, u.mkspan(same.manifest_file, 0, 0), "one is here");
+        dg.note(d, u.mkspan(f.id, 0, 0), "the other is here");
+    } else {
+        pkg_by_name.put(p.name, p);
+    }
+    // entry module
+    if not u.isnos(entry) {
+        p.entry = u.f2("%s/%s", dir, entry);
+    } else if u.is_file(u.cat2(dir, "/src/lib.ax")) {
+        p.entry = u.cat2(dir, "/src/lib.ax");
+    } else {
+        p.entry = u.cat2(dir, "/src/main.ax");
+    }
+    // dependencies (sources resolved now; loaded as imports happen)
+    for i in 0..specs.len {
+        let d = specs.at(i);
+        if u.isnos(d.path) and u.isnos(d.rev) {
+            continue;
+        }
+        let mut ddir = u.nosym();
+        if not u.isnos(d.path) {
+            if (d.path.len > 0) and (d.path[0] == '/') {
+                ddir = d.path;
+            } else {
+                ddir = u.f2("%s/%s", dir, d.path);
+            }
+        } else {
+            ddir = fetch_git(d.git, d.rev, d.span);
+        }
+        if u.isnos(ddir) {
+            continue;
+        }
+        let dp = load_dir(ddir, &d.span);
+        if u.isnil(dp) {
+            continue;
+        }
+        if not u.same(dp.name, d.name) {
+            _ = dg.err(d.span, "E0215", u.f2("dependency '%s' points at package '%s'", d.name, dp.name));
+            continue;
+        }
+        p.deps.put(d.name, dp);
+        p.dep_names.push(d.name);
+        p.dep_spans.push(d.span);
+    }
+    return p;
+}
+
+// The package containing `file_path` (nearest axiom.toml above it), or nil.
+pub fn for_file(file_path: []u8) *mut Package {
+    let mut dir = u.real_path(file_path);
+    if u.isnos(dir) {
+        return u.nil.[Package]();
+    }
+    loop {
+        let slash = u.rfind(dir, '/');
+        if slash < 0 {
+            return u.nil.[Package]();
+        }
+        dir = dir[0..@int_cast(usize, slash)];
+        if dir.len == 0 {
+            return u.nil.[Package]();
+        }
+        let dz = u.dup(dir);
+        let p = pkg_by_dir.get(u.intern(dz));
+        if u.notnil(p) {
+            return p;
+        }
+        if u.is_file(u.cat2(dz, "/axiom.toml")) {
+            return load_dir(dz, u.nil.[u.Span]());
+        }
+    }
+}
+
+// Resolves `import "pkg:name[/sub/path]"` made from `importer` (a module's
+// package, may be nil). The module's file path, or a nil slice on error
+// (reported at `sp`).
+pub fn resolve_import(importer: *mut Package, spec: []u8, sp: u.Span) []u8 {
+    let rest = spec[4..];
+    let slash = u.find(rest, '/');
+    let mut name = u.intern(rest);
+    if slash >= 0 {
+        name = u.intern(rest[0..@int_cast(usize, slash)]);
+    }
+    if u.isnil(importer) {
+        _ = dg.err(sp, "E0214",
+                   u.f2("'%s' imports package '%s', but this file is not part of a package (no axiom.toml)", spec,
+                        name));
+        return u.nosym();
+    }
+    let mut dep = importer.deps.get(name);
+    if u.same(importer.name, name) {
+        dep = importer;
+    }
+    if u.isnil(dep) {
+        let d = dg.err(sp, "E0214", u.f2("package '%s' is not a dependency of '%s'", name, importer.name));
+        dg.note(d, u.mkspan(importer.manifest_file, 0, 0), "add it under [dependencies] in this manifest");
+        return u.nosym();
+    }
+    if slash >= 0 {
+        let sub = rest[@int_cast(usize, slash) + 1..];
+        let ext = (sub.len > 3) and u.ends(sub, ".ax");
+        return u.f3("%s/src/%s%s", dep.dir, sub, u.pick(ext, "", ".ax"));
+    }
+    return dep.entry;
+}
+
+fn cmp_str(a: []u8, b: []u8) i32 {
+    return u.str_cmp(a, b);
+}
+
+fn collect(dir: []u8, out: *mut u.List.[[]u8]) void {
+    let mut names = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    if not u.list_dir(dir, &mut names) {
+        return;
+    }
+    for i in 0..names.len {
+        let n = names.get(i);
+        if (n.len > 0) and (n[0] == '.') {
+            continue;
+        }
+        let p = u.f2("%s/%s", dir, n);
+        if u.is_dir(p) {
+            collect(p, out);
+        } else if (n.len > 3) and u.ends(n, ".ax") {
+            out.push(p);
+        }
+    }
+}
+
+// Every .ax file under the package's src/ directory (sorted).
+pub fn source_files(p: *mut Package, out: *mut u.List.[[]u8]) void {
+    let start = out.len;
+    collect(u.cat2(p.dir, "/src"), out);
+    u.sort(out.items()[start..], cmp_str);
+}
+
+// Creates a new package skeleton in ./name. False on error.
+pub fn new_package(name: []u8, json: bool) bool {
+    if not valid_name(name) {
+        dg.emit_fatal(json, "E0215", "package names use lower-case letters, digits and '_'");
+        return false;
+    }
+    if u.is_dir(name) or u.is_file(name) {
+        dg.emit_fatal(json, "E9005", u.f1("'%s' already exists", name));
+        return false;
+    }
+    u.mkdirs(u.cat2(name, "/src"));
+    let m = u.f1("[package]\nname = \"%s\"\nversion = \"0.1.0\"\n\n[dependencies]\n# other = { path = \"../other\" }\n",
+                 name);
+    let s =
+        u.f2("// %s: library entry module (import it as \"pkg:%s\").\n\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n\ntest \"add\" {\n    @expect_eq(add(2, 3), 5);\n}\n",
+             name, name);
+    if not u.write_file(u.cat2(name, "/axiom.toml"), m) or not u.write_file(u.cat2(name, "/src/lib.ax"), s) {
+        dg.emit_fatal(json, "E9005", "cannot create the package files");
+        return false;
+    }
+    if json {
+        u.print(u.f1("{\"status\":\"ok\",\"created\":\"%s\"}\n", name));
+    } else {
+        u.print(u.f3("created package '%s': %s/axiom.toml, %s/src/lib.ax\n", name, name, name));
+    }
+    return true;
+}

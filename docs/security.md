@@ -6,7 +6,7 @@ how to go on checking.
 
 ## What "safe" means here
 
-Phalange checks bounds and integer overflow, so bad input can't corrupt
+Axiom checks bounds and integer overflow, so bad input can't corrupt
 memory. It can still cause harm in four ways:
 
 - **Traps.** An out-of-bounds index or an overflow that input can reach
@@ -28,7 +28,7 @@ size** (or by a documented limit).
 1. Each module was read with the four questions above in mind. Five review
    passes covered: media codecs, network/TLS/X.509, memory and runtime,
    text formats, and the filesystem.
-2. Mutation fuzzing: `tools/fuzz.py`, which drives `tests/fuzz/fuzz.ph`.
+2. Mutation fuzzing: `tools/fuzz.py`, which drives `tests/fuzz/fuzz.ax`.
    Seeds come from std's own encoders, plus ffmpeg/sox sounds, system
    fonts and CA certificates. Mutated inputs run through every parser
    target, and a trap, a signal or a hang (10 s) is saved as a failure.
@@ -74,7 +74,7 @@ To run the fuzzer:
 | json | the arena chunk size could be smaller than the allocation | `size = max(chunk, n)` |
 | vec, str | `v.extend(v.items())` and `s.push_str(s.bytes())` read freed memory after growing | the source is handled when it aliases |
 | c | `to_cstr` silently truncated at an interior NUL | rejected; the size is stored in a header |
-| fs | NUL in paths; mtime overflow; temporary directories created 0755; `remove_all` and `walk` followed a symbolic link swapped in for a directory | NUL rejected by every runtime; saturating times; 0700; directories opened relative to their parents with `O_NOFOLLOW` (`ph_dir_*`) |
+| fs | NUL in paths; mtime overflow; temporary directories created 0755; `remove_all` and `walk` followed a symbolic link swapped in for a directory | NUL rejected by every runtime; saturating times; 0700; directories opened relative to their parents with `O_NOFOLLOW` (`ax_dir_*`) |
 | threads | signal alternate stacks and thread stacks leaked | freed on exit |
 | log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 in messages or keys could forge log lines; failed rotation lost the file | all escaped; the sink reopens in append mode |
 

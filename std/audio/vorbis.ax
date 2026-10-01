@@ -1,0 +1,1732 @@
+// =============================================================================
+// std/audio/vorbis.ax - Ogg Vorbis decoding (the Vorbis I specification).
+//
+//     let mut s = vorbis.decode(bytes)!;   // F32 samples
+//     defer s.deinit();
+//
+// Decodes the first Vorbis stream of an Ogg file: any number of channels
+// and sample rate, floor type 1, residue types 0, 1 and 2, channel
+// coupling, both block sizes. The output is trimmed to the stream's granule
+// positions, so it has exactly the encoded length. Floor type 0, used only
+// by encoders from before Vorbis 1.0, is not supported.
+// =============================================================================
+
+import "../audio.ax" as audio;
+import "../collections/vec.ax" as vec;
+import "../encoding/base64.ax" as base64;
+import "../math.ax" as math;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+import "../sync.ax" as sync;
+import "ogg.ax" as ogg;
+
+error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
+
+pub fn is_vorbis(data: []u8) bool {
+    if not ogg.is_ogg(data) {
+        return false;
+    }
+    _ = ogg.find_stream(data, "\x01vorbis") catch return false;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Bits, least significant first
+// -----------------------------------------------------------------------------
+
+struct Bits {
+    d: []u8,
+    pos: usize,  // in bits
+    eop: bool,   // read past the end of the packet
+
+    fn read(self: *mut Bits, k: u32) u32 {
+        if k == 0 {
+            return 0;
+        }
+        if (self.pos + @as(usize, k)) > (self.d.len * 8) {
+            self.pos = self.d.len * 8;
+            self.eop = true;
+            return 0;
+        }
+        let v = self.peek(k);
+        self.pos += @as(usize, k);
+        return v;
+    }
+
+    /// The next k bits (k <= 32), zeros past the end, without consuming.
+    fn peek(self: *Bits, k: u32) u32 {
+        let byte = self.pos >> 3;
+        let sh = @as(u64, self.pos & 7);
+        let mut w: u64 = 0;
+        let d = self.d;
+        let mut i: usize = 0;
+        while (i < 5) and ((byte + i) < d.len) {
+            w |= @as(u64, d[byte + i]) << @as(u64, 8 * i);
+            i += 1;
+        }
+        return @truncate(u32, (w >> sh) & ((@as(u64, 1) << @as(u64, k)) - 1));
+    }
+
+    fn left(self: *Bits) usize {
+        return (self.d.len * 8) - self.pos;
+    }
+
+    fn flag(self: *mut Bits) bool {
+        return self.read(1) == 1;
+    }
+}
+
+fn ilog(v: u32) u32 {
+    if v == 0 {
+        return 0;
+    }
+    return 32 - @as(u32, @truncate(u8, @clz(v)));
+}
+
+fn float32_unpack(x: u32) f32 {
+    let mant = @float_from_int(f64, x & 0x1fffff);
+    let exp = @as(i32, @bit_cast(i32, (x & 0x7fe00000) >> 21)) - 788;
+    let mut v = math.ldexp(mant, exp);
+    if (x & 0x80000000) != 0 {
+        v = -v;
+    }
+    return @float_cast(f32, v);
+}
+
+fn bit_reverse(v0: u32) u32 {
+    let mut v = v0;
+    v = ((v & 0xaaaaaaaa) >> 1) | ((v & 0x55555555) << 1);
+    v = ((v & 0xcccccccc) >> 2) | ((v & 0x33333333) << 2);
+    v = ((v & 0xf0f0f0f0) >> 4) | ((v & 0x0f0f0f0f) << 4);
+    v = ((v & 0xff00ff00) >> 8) | ((v & 0x00ff00ff) << 8);
+    return (v >> 16) | (v << 16);
+}
+
+// -----------------------------------------------------------------------------
+// Codebooks
+// -----------------------------------------------------------------------------
+
+const FAST: u32 = 10;
+
+struct Book {
+    dims: usize,
+    entries: usize,
+    fast: []mut i32,  // entry for the next FAST bits (codes that short), or -1
+    keys: []mut u32,  // codewords, most significant bit first and left-aligned, sorted
+    ids: []mut u32,   // their entries
+    lens: []mut u8,   // their lengths
+    single: i64,      // the only entry, if there is just one (else -1)
+    single_len: u32,
+    vq: []mut f32,  // entries * dims values, if the book has a lookup
+    has_vq: bool,
+
+    fn free(self: *mut Book) void {
+        mem.free(self.fast);
+        mem.free(self.keys);
+        mem.free(self.ids);
+        mem.free(self.lens);
+        mem.free(self.vq);
+    }
+
+    /// The next entry, or -1 at the end of the packet (or on an invalid
+    /// code).
+    fn decode(self: *Book, b: *mut Bits) i64 {
+        if self.single >= 0 {
+            _ = b.read(self.single_len);
+            if b.eop {
+                return -1;
+            }
+            return self.single;
+        }
+        let f = self.fast[@as(usize, b.peek(FAST))];
+        if f >= 0 {
+            let len = @as(u32, self.lens[@as(usize, @bit_cast(u32, f))]);
+            if @as(usize, len) <= b.left() {
+                b.pos += @as(usize, len);
+                return @as(i64, self.ids[@as(usize, @bit_cast(u32, f))]);
+            }
+        }
+        // a longer code: the largest key not above the next 32 bits
+        let v = bit_reverse(b.peek(32));
+        let mut lo: usize = 0;
+        let mut hi = self.keys.len;
+        while (hi - lo) > 1 {
+            let mid = (lo + hi) / 2;
+            if self.keys[mid] <= v {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        if self.keys.len == 0 {
+            b.eop = true;
+            return -1;
+        }
+        let len = @as(u32, self.lens[lo]);
+        let span = @as(u64, 1) << @as(u64, 32 - len);
+        if (@as(u64, v) >= (@as(u64, self.keys[lo]) + span)) or (@as(usize, len) > b.left()) {
+            b.eop = true;
+            return -1;
+        }
+        b.pos += @as(usize, len);
+        return @as(i64, self.ids[lo]);
+    }
+}
+
+fn lookup1_values(entries: usize, dims: usize) usize {
+    let mut r = @int_from_float(
+        usize, @floor(math.pow(@float_from_int(f64, entries), 1.0 / @float_from_int(f64, dims))));
+    // fix any rounding: the largest r with r^dims <= entries
+    loop {
+        if pow_le(r + 1, dims, entries) {
+            r += 1;
+        } else if (r > 0) and not pow_le(r, dims, entries) {
+            r -= 1;
+        } else {
+            return r;
+        }
+    }
+}
+
+fn pow_le(r: usize, dims: usize, limit: usize) bool {
+    let mut v: usize = 1;
+    for _i in @as(usize, 0)..dims {
+        v = @mul_checked(v, r) catch return false;
+        if v > limit {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn read_book(b: *mut Bits) !Book {
+    if b.read(24) != 0x564342 {
+        return error.InvalidAudio;
+    }
+    let dims = @as(usize, b.read(16));
+    let entries = @as(usize, b.read(24));
+    if (dims == 0) or (entries == 0) {
+        return error.InvalidAudio;
+    }
+    let lengths = mem.alloc_zeroed.[u8](entries)!;
+    defer mem.free(lengths);
+    if b.flag() {
+        // ordered
+        let mut cur: usize = 0;
+        let mut len = b.read(5) + 1;
+        while cur < entries {
+            let num = @as(usize, b.read(ilog(@truncate(u32, entries - cur))));
+            if ((cur + num) > entries) or (len > 32) {
+                return error.InvalidAudio;
+            }
+            @mem_set(lengths[cur..cur + num], @truncate(u8, len));
+            cur += num;
+            len += 1;
+            if b.eop {
+                return error.InvalidAudio;
+            }
+        }
+    } else {
+        let sparse = b.flag();
+        for i in @as(usize, 0)..entries {
+            if not sparse or b.flag() {
+                lengths[i] = @truncate(u8, b.read(5) + 1);
+            }
+        }
+    }
+    let lookup = b.read(4);
+    let mut book = Book.{
+        dims: dims,
+        entries: entries,
+        fast: mem.alloc.[i32](@as(usize, 1) << @as(usize, FAST))!,
+        keys: mem.alloc.[u32](0)!,
+        ids: mem.alloc.[u32](0)!,
+        lens: mem.alloc.[u8](0)!,
+        single: -1,
+        single_len: 0,
+        vq: mem.alloc.[f32](0)!,
+        has_vq: false,
+    };
+    build_book(b, &mut book, lengths, lookup) catch |e| {
+        book.free();
+        return e;
+    };
+    return book;
+}
+
+fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) !void {
+    let entries = book.entries;
+    // assign codewords (the specification's algorithm)
+    let mut used: usize = 0;
+    let mut last_used: usize = 0;
+    for i in @as(usize, 0)..entries {
+        if lengths[i] > 0 {
+            used += 1;
+            last_used = i;
+        }
+    }
+    for i in @as(usize, 0)..book.fast.len {
+        book.fast[i] = -1;
+    }
+    if used == 1 {
+        book.single = @as(i64, @truncate(u32, last_used));
+        book.single_len = @as(u32, lengths[last_used]);
+    } else if used > 1 {
+        mem.free(book.keys);
+        mem.free(book.ids);
+        mem.free(book.lens);
+        book.keys = mem.alloc.[u32](used)!;
+        book.ids = mem.alloc.[u32](used)!;
+        book.lens = mem.alloc.[u8](used)!;
+        let mut marker: [33]u32 = [0; 33];
+        let mut k: usize = 0;
+        for i in @as(usize, 0)..entries {
+            let len = @as(u32, lengths[i]);
+            if len == 0 {
+                continue;
+            }
+            let mut entry = marker[@as(usize, len)];
+            if (len < 32) and ((entry >> len) != 0) {
+                return error.InvalidAudio;  // over-specified
+            }
+            book.keys[k] = entry << (32 - len);
+            if len == 32 {
+                book.keys[k] = entry;
+            }
+            book.ids[k] = @truncate(u32, i);
+            book.lens[k] = @truncate(u8, len);
+            k += 1;
+            let mut j = len;
+            while j > 0 {
+                let ju = @as(usize, j);
+                if (marker[ju] & 1) != 0 {
+                    if j == 1 {
+                        marker[1] += 1;
+                    } else {
+                        marker[ju] = marker[ju - 1] << 1;
+                    }
+                    break;
+                }
+                marker[ju] += 1;
+                j -= 1;
+            }
+            let mut jj = @as(usize, len) + 1;
+            while jj < 33 {
+                if (marker[jj] >> 1) == entry {
+                    entry = marker[jj];
+                    marker[jj] = marker[jj - 1] << 1;
+                } else {
+                    break;
+                }
+                jj += 1;
+            }
+        }
+        // the fast table (indexed by the next FAST bits as read)
+        for e in @as(usize, 0)..used {
+            let len = @as(u32, book.lens[e]);
+            if len > FAST {
+                continue;
+            }
+            let rev = bit_reverse(book.keys[e]);  // the codeword in reading order
+            let step = @as(usize, 1) << @as(usize, len);
+            let mut fill = @as(usize, rev);
+            while fill < (@as(usize, 1) << @as(usize, FAST)) {
+                book.fast[fill] = @bit_cast(i32, @truncate(u32, e));
+                fill += step;
+            }
+        }
+        // sort the keys for the slow path (codewords are distinct: prefix-free)
+        let mut sorted = true;
+        for i in @as(usize, 1)..used {
+            if book.keys[i - 1] > book.keys[i] {
+                sorted = false;
+                break;
+            }
+        }
+        if not sorted {
+            // O(n log n) whatever the order: key << 32 | old position
+            let order = mem.alloc.[u64](used)!;
+            defer mem.free(order);
+            for i in @as(usize, 0)..used {
+                order[i] = (@as(u64, book.keys[i]) << 32) | @as(u64, @truncate(u32, i));
+            }
+            vec.sort(order, less_u64);
+            let ids = mem.alloc.[u32](used)!;
+            defer mem.free(ids);
+            let lens = mem.alloc.[u8](used)!;
+            defer mem.free(lens);
+            for i in @as(usize, 0)..used {
+                let at = @truncate(usize, order[i] & 0xffffffff);
+                ids[i] = book.ids[at];
+                lens[i] = book.lens[at];
+            }
+            for i in @as(usize, 0)..used {
+                book.keys[i] = @truncate(u32, order[i] >> 32);
+                book.ids[i] = ids[i];
+                book.lens[i] = lens[i];
+            }
+        }
+        // the fast table holds positions in the sorted arrays
+        for i in @as(usize, 0)..book.fast.len {
+            book.fast[i] = -1;
+        }
+        for e in @as(usize, 0)..used {
+            let len = @as(u32, book.lens[e]);
+            if len > FAST {
+                continue;
+            }
+            let rev = bit_reverse(book.keys[e]);
+            let step = @as(usize, 1) << @as(usize, len);
+            let mut fill = @as(usize, rev);
+            while fill < (@as(usize, 1) << @as(usize, FAST)) {
+                book.fast[fill] = @bit_cast(i32, @truncate(u32, e));
+                fill += step;
+            }
+        }
+    }
+    if lookup == 0 {
+        return;
+    }
+    if lookup > 2 {
+        return error.InvalidAudio;
+    }
+    let minv = float32_unpack(b.read(32));
+    let delta = float32_unpack(b.read(32));
+    let vbits = b.read(4) + 1;
+    let seq = b.flag();
+    let dims = book.dims;
+    let mut nvals: usize = 0;
+    if lookup == 1 {
+        nvals = lookup1_values(entries, dims);
+    } else {
+        nvals = @mul_checked(entries, dims) catch return error.InvalidAudio;
+    }
+    if (nvals > 65536 * 16) or ((@as(usize, vbits) * nvals) > b.left()) {
+        return error.InvalidAudio;
+    }
+    let mults = mem.alloc.[u32](@max(nvals, 1))!;
+    defer mem.free(mults);
+    for i in @as(usize, 0)..nvals {
+        mults[i] = b.read(vbits);
+    }
+    if b.eop {
+        return error.InvalidAudio;
+    }
+    let total = @mul_checked(entries, dims) catch return error.InvalidAudio;
+    if total > (1 << 24) {
+        return error.InvalidAudio;
+    }
+    mem.free(book.vq);
+    book.vq = mem.alloc.[f32](total)!;
+    book.has_vq = true;
+    for e in @as(usize, 0)..entries {
+        let mut last: f32 = 0.0;
+        let mut div: usize = 1;
+        for i in @as(usize, 0)..dims {
+            let mut off: usize = 0;
+            if lookup == 1 {
+                off = (e / div) % nvals;
+                div *= nvals;
+            } else {
+                off = (e * dims) + i;
+            }
+            let v = ((@float_from_int(f32, mults[off]) * delta) + minv) + last;
+            if seq {
+                last = v;
+            }
+            book.vq[(e * dims) + i] = v;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Setup
+// -----------------------------------------------------------------------------
+
+struct Floor1 {
+    partitions: usize,
+    class_of: [32]u8,
+    dims: [16]u8,
+    subs: [16]u8,
+    master: [16]i32,
+    books: [16][8]i32,
+    mult: u32,
+    xs: [65]u32,    // the X list, in decode order
+    n: usize,       // its length
+    order: [65]u8,  // positions sorted by X
+    low: [65]u8,    // neighbours, for positions >= 2
+    high: [65]u8,
+}
+
+struct Residue {
+    kind: u32,
+    begin: usize,
+    end: usize,
+    psize: usize,
+    classes: usize,
+    classbook: usize,
+    books: [64][8]i32,
+}
+
+struct Mapping {
+    submaps: usize,
+    steps: usize,
+    mag: [256]u8,
+    ang: [256]u8,
+    mux: [256]u8,
+    floor: [16]u8,
+    residue: [16]u8,
+}
+
+struct Mode {
+    long: bool,
+    mapping: usize,
+}
+
+struct Setup {
+    channels: usize,
+    rate: u32,
+    bs: [2]usize,
+    books: []mut Book,
+    nbooks: usize,
+    floors: []mut Floor1,
+    nfloors: usize,
+    residues: []mut Residue,
+    nresidues: usize,
+    maps: []mut Mapping,
+    nmaps: usize,
+    modes: [64]Mode,
+    nmodes: usize,
+
+    fn free(self: *mut Setup) void {
+        for i in @as(usize, 0)..self.nbooks {
+            self.books[i].free();
+        }
+        mem.free(self.books);
+        mem.free(self.floors);
+        mem.free(self.residues);
+        mem.free(self.maps);
+    }
+}
+
+fn read_ident(p: []u8, s: *mut Setup) !void {
+    if (p.len < 30) or (p[0] != 1) or not @mem_eq(p[1..7], "vorbis") {
+        return error.InvalidAudio;
+    }
+    let mut b = Bits.{ d: p[7..], pos: 0, eop: false };
+    if b.read(32) != 0 {
+        return error.Unsupported;
+    }
+    s.channels = @as(usize, b.read(8));
+    s.rate = b.read(32);
+    _ = b.read(32);
+    _ = b.read(32);
+    _ = b.read(32);
+    let b0 = b.read(4);
+    let b1 = b.read(4);
+    if (s.channels == 0) or (s.rate == 0) or (b0 < 6) or (b1 < b0) or (b1 > 13) or not b.flag() {
+        return error.InvalidAudio;
+    }
+    s.bs = [@as(usize, 1) << @as(usize, b0), @as(usize, 1) << @as(usize, b1)];
+}
+
+fn read_setup(p: []u8, s: *mut Setup) !void {
+    if (p.len < 7) or (p[0] != 5) or not @mem_eq(p[1..7], "vorbis") {
+        return error.InvalidAudio;
+    }
+    let mut b = Bits.{ d: p[7..], pos: 0, eop: false };
+    // codebooks
+    let nb = @as(usize, b.read(8)) + 1;
+    mem.free(s.books);
+    s.books = mem.alloc.[Book](nb)!;
+    for i in @as(usize, 0)..nb {
+        s.books[i] = read_book(&mut b)!;
+        s.nbooks = i + 1;
+    }
+    // time-domain transforms: placeholders
+    let nt = b.read(6) + 1;
+    for _i in @as(u32, 0)..nt {
+        if b.read(16) != 0 {
+            return error.InvalidAudio;
+        }
+    }
+    // floors
+    let nf = @as(usize, b.read(6)) + 1;
+    mem.free(s.floors);
+    s.floors = mem.alloc.[Floor1](nf)!;
+    for i in @as(usize, 0)..nf {
+        let kind = b.read(16);
+        if kind == 0 {
+            return error.Unsupported;
+        }
+        if kind != 1 {
+            return error.InvalidAudio;
+        }
+        read_floor1(&mut b, &mut s.floors[i], nb)!;
+        s.nfloors = i + 1;
+    }
+    // residues
+    let nr = @as(usize, b.read(6)) + 1;
+    mem.free(s.residues);
+    s.residues = mem.alloc.[Residue](nr)!;
+    for i in @as(usize, 0)..nr {
+        let r = &mut s.residues[i];
+        r.kind = b.read(16);
+        if r.kind > 2 {
+            return error.InvalidAudio;
+        }
+        r.begin = @as(usize, b.read(24));
+        r.end = @as(usize, b.read(24));
+        r.psize = @as(usize, b.read(24)) + 1;
+        r.classes = @as(usize, b.read(6)) + 1;
+        r.classbook = @as(usize, b.read(8));
+        if r.classbook >= nb {
+            return error.InvalidAudio;
+        }
+        let mut cascade: [64]u32 = [0; 64];
+        for c in @as(usize, 0)..r.classes {
+            let mut bits = b.read(3);
+            if b.flag() {
+                bits |= b.read(5) << 3;
+            }
+            cascade[c] = bits;
+        }
+        for c in @as(usize, 0)..r.classes {
+            for k in @as(usize, 0)..8 {
+                r.books[c][k] = -1;
+                if (cascade[c] & (@as(u32, 1) << @as(u32, @truncate(u8, k)))) != 0 {
+                    let bk = @as(usize, b.read(8));
+                    if (bk >= nb) or not s.books[bk].has_vq {
+                        return error.InvalidAudio;
+                    }
+                    r.books[c][k] = @bit_cast(i32, @truncate(u32, bk));
+                }
+            }
+        }
+        // the classbook's entries must cover every classification sequence
+        s.nresidues = i + 1;
+    }
+    // mappings
+    let nm = @as(usize, b.read(6)) + 1;
+    mem.free(s.maps);
+    s.maps = mem.alloc.[Mapping](nm)!;
+    for i in @as(usize, 0)..nm {
+        let m = &mut s.maps[i];
+        if b.read(16) != 0 {
+            return error.InvalidAudio;
+        }
+        m.submaps = 1;
+        if b.flag() {
+            m.submaps = @as(usize, b.read(4)) + 1;
+        }
+        m.steps = 0;
+        if b.flag() {
+            m.steps = @as(usize, b.read(8)) + 1;
+            let bits = ilog(@truncate(u32, s.channels - 1));
+            for k in @as(usize, 0)..m.steps {
+                let mg = @as(usize, b.read(bits));
+                let an = @as(usize, b.read(bits));
+                if (mg == an) or (mg >= s.channels) or (an >= s.channels) {
+                    return error.InvalidAudio;
+                }
+                m.mag[k] = @truncate(u8, mg);
+                m.ang[k] = @truncate(u8, an);
+            }
+        }
+        if b.read(2) != 0 {
+            return error.InvalidAudio;
+        }
+        for c in @as(usize, 0)..s.channels {
+            m.mux[c] = 0;
+        }
+        if m.submaps > 1 {
+            for c in @as(usize, 0)..s.channels {
+                let x = b.read(4);
+                if @as(usize, x) >= m.submaps {
+                    return error.InvalidAudio;
+                }
+                m.mux[c] = @truncate(u8, x);
+            }
+        }
+        for k in @as(usize, 0)..m.submaps {
+            _ = b.read(8);
+            let fl = @as(usize, b.read(8));
+            let re = @as(usize, b.read(8));
+            if (fl >= nf) or (re >= nr) {
+                return error.InvalidAudio;
+            }
+            m.floor[k] = @truncate(u8, fl);
+            m.residue[k] = @truncate(u8, re);
+        }
+        s.nmaps = i + 1;
+    }
+    // modes
+    let nmo = @as(usize, b.read(6)) + 1;
+    for i in @as(usize, 0)..nmo {
+        let long = b.flag();
+        let wt = b.read(16);
+        let tt = b.read(16);
+        let mp = @as(usize, b.read(8));
+        if (wt != 0) or (tt != 0) or (mp >= nm) {
+            return error.InvalidAudio;
+        }
+        s.modes[i] = Mode.{ long: long, mapping: mp };
+    }
+    s.nmodes = nmo;
+    if not b.flag() or b.eop {
+        return error.InvalidAudio;
+    }
+}
+
+fn read_floor1(b: *mut Bits, f: *mut Floor1, nb: usize) !void {
+    f.partitions = @as(usize, b.read(5));
+    let mut maxc: i32 = -1;
+    for i in @as(usize, 0)..f.partitions {
+        let c = b.read(4);
+        f.class_of[i] = @truncate(u8, c);
+        maxc = @max(maxc, @bit_cast(i32, c));
+    }
+    for c in @as(usize, 0)..@as(usize, @bit_cast(u32, maxc + 1)) {
+        f.dims[c] = @truncate(u8, b.read(3) + 1);
+        f.subs[c] = @truncate(u8, b.read(2));
+        f.master[c] = -1;
+        if f.subs[c] > 0 {
+            let m = b.read(8);
+            if @as(usize, m) >= nb {
+                return error.InvalidAudio;
+            }
+            f.master[c] = @bit_cast(i32, m);
+        }
+        for k in @as(usize, 0)..(@as(usize, 1) << @as(usize, f.subs[c])) {
+            let bk = @bit_cast(i32, b.read(8)) - 1;
+            if bk >= @bit_cast(i32, @truncate(u32, nb)) {
+                return error.InvalidAudio;
+            }
+            f.books[c][k] = bk;
+        }
+    }
+    f.mult = b.read(2) + 1;
+    let rbits = b.read(4);
+    f.xs[0] = 0;
+    f.xs[1] = @as(u32, 1) << rbits;
+    f.n = 2;
+    for i in @as(usize, 0)..f.partitions {
+        let c = @as(usize, f.class_of[i]);
+        for _k in @as(usize, 0)..@as(usize, f.dims[c]) {
+            if f.n >= 65 {
+                return error.InvalidAudio;
+            }
+            f.xs[f.n] = b.read(rbits);
+            f.n += 1;
+        }
+    }
+    set_neighbours(f)!;
+}
+
+/// Sorts the X list (into order) and finds each point's neighbours among
+/// the points before it.
+fn set_neighbours(f: *mut Floor1) !void {
+    for i in @as(usize, 0)..f.n {
+        f.order[i] = @truncate(u8, i);
+    }
+    for i in @as(usize, 1)..f.n {
+        let v = f.order[i];
+        let mut j = i;
+        while (j > 0) and (f.xs[@as(usize, f.order[j - 1])] > f.xs[@as(usize, v)]) {
+            f.order[j] = f.order[j - 1];
+            j -= 1;
+        }
+        f.order[j] = v;
+    }
+    for i in @as(usize, 1)..f.n {
+        if f.xs[@as(usize, f.order[i])] == f.xs[@as(usize, f.order[i - 1])] {
+            return error.InvalidAudio;  // repeated X
+        }
+    }
+    for i in @as(usize, 2)..f.n {
+        let x = f.xs[i];
+        let mut lo: usize = 0;
+        let mut hi: usize = 1;
+        let mut lx: u32 = 0;
+        let mut hx: u32 = 0xffffffff;
+        for j in @as(usize, 0)..i {
+            let xj = f.xs[j];
+            if (xj < x) and (xj >= lx) {
+                lx = xj;
+                lo = j;
+            }
+            if (xj > x) and (xj < hx) {
+                hx = xj;
+                hi = j;
+            }
+        }
+        f.low[i] = @truncate(u8, lo);
+        f.high[i] = @truncate(u8, hi);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Audio packets
+// -----------------------------------------------------------------------------
+
+fn render_point(x0: i32, y0: i32, x1: i32, y1: i32, x: i32) i32 {
+    let dy = y1 - y0;
+    let adx = x1 - x0;
+    let ady = @abs(dy);
+    let err = ady * (x - x0);
+    let off = err / adx;
+    if dy < 0 {
+        return y0 - off;
+    }
+    return y0 + off;
+}
+
+fn render_line(x0: i32, y0: i32, x1: i32, y1: i32, out: []mut i32) void {
+    let dy = y1 - y0;
+    let adx = x1 - x0;
+    let base = dy / adx;
+    let mut ady = @abs(dy);
+    let mut sy = base + 1;
+    if dy < 0 {
+        sy = base - 1;
+    }
+    ady -= @abs(base) * adx;
+    let n = @bit_cast(i32, @truncate(u32, out.len));
+    let mut y = y0;
+    let mut err: i32 = 0;
+    if x0 < n {
+        out[@as(usize, @bit_cast(u32, x0))] = y;
+    }
+    let mut x = x0 + 1;
+    let end = @min(x1, n);
+    while x < end {
+        err += ady;
+        if err >= adx {
+            err -= adx;
+            y += sy;
+        } else {
+            y += base;
+        }
+        out[@as(usize, @bit_cast(u32, x))] = y;
+        x += 1;
+    }
+}
+
+let mut inv_db: [256]f32 = [0.0; 256];
+let mut inv_db_once: sync.Once = sync.Once.{ state: 0 };
+
+fn build_inv_db(_u: u8) void {
+    for k in @as(usize, 0)..256 {
+        let e = (@float_from_int(f64, k) - 255.0) * (7.0 / 256.0);
+        inv_db[k] = @float_cast(f32, math.pow(10.0, e));
+    }
+}
+
+fn inverse_db(i: i32) f32 {
+    inv_db_once.call(build_inv_db, @as(u8, 0));
+    return inv_db[@as(usize, @bit_cast(u32, @max(@min(i, 255), 0)))];
+}
+
+/// Reads a channel's floor-1 Y values; false if the channel is unused.
+fn floor1_read(b: *mut Bits, s: *Setup, f: *Floor1, ys: []mut i32) bool {
+    if not b.flag() {
+        return false;
+    }
+    let ranges: [4]u32 = [256, 128, 86, 64];
+    let range = ranges[@as(usize, f.mult - 1)];
+    let rb = ilog(range - 1);
+    ys[0] = @bit_cast(i32, b.read(rb));
+    ys[1] = @bit_cast(i32, b.read(rb));
+    let mut off: usize = 2;
+    for i in @as(usize, 0)..f.partitions {
+        let c = @as(usize, f.class_of[i]);
+        let cdim = @as(usize, f.dims[c]);
+        let cbits = @as(u32, f.subs[c]);
+        let csub = (@as(i64, 1) << @as(u64, cbits)) - 1;
+        let mut cval: i64 = 0;
+        if cbits > 0 {
+            cval = s.books[@as(usize, @bit_cast(u32, f.master[c]))].decode(b);
+            if cval < 0 {
+                return false;
+            }
+        }
+        for j in @as(usize, 0)..cdim {
+            let bk = f.books[c][@truncate(usize, @bit_cast(u64, cval & csub))];
+            cval = cval >> @as(u64, cbits);
+            if bk >= 0 {
+                let v = s.books[@as(usize, @bit_cast(u32, bk))].decode(b);
+                if v < 0 {
+                    return false;
+                }
+                ys[off + j] = @truncate(i32, v);
+            } else {
+                ys[off + j] = 0;
+            }
+        }
+        off += cdim;
+    }
+    return not b.eop;
+}
+
+/// The floor curve from Y values, into out (n/2 values).
+fn floor1_curve(f: *Floor1, ys: []i32, out: []mut f32, ints: []mut i32) void {
+    let ranges: [4]i32 = [256, 128, 86, 64];
+    let range = ranges[@as(usize, f.mult - 1)];
+    let mut fy: [65]i32 = [0; 65];
+    let mut used: [65]bool = [false; 65];
+    fy[0] = ys[0];
+    fy[1] = ys[1];
+    used[0] = true;
+    used[1] = true;
+    for i in @as(usize, 2)..f.n {
+        let lo = @as(usize, f.low[i]);
+        let hi = @as(usize, f.high[i]);
+        let pred = render_point(
+            @bit_cast(i32, f.xs[lo]), fy[lo], @bit_cast(i32, f.xs[hi]), fy[hi], @bit_cast(i32, f.xs[i]));
+        let val = ys[i];
+        let highroom = range - pred;
+        let lowroom = pred;
+        let mut room: i32 = 0;
+        if highroom < lowroom {
+            room = highroom * 2;
+        } else {
+            room = lowroom * 2;
+        }
+        if val != 0 {
+            used[lo] = true;
+            used[hi] = true;
+            used[i] = true;
+            if val >= room {
+                if highroom > lowroom {
+                    fy[i] = (val - lowroom) + pred;
+                } else {
+                    fy[i] = ((pred - val) + highroom) - 1;
+                }
+            } else if (val & 1) != 0 {
+                fy[i] = pred - ((val + 1) / 2);
+            } else {
+                fy[i] = pred + (val / 2);
+            }
+        } else {
+            used[i] = false;
+            fy[i] = pred;
+        }
+    }
+    let n2 = out.len;
+    let mult = @bit_cast(i32, f.mult);
+    let mut lx: i32 = 0;
+    let mut ly = fy[@as(usize, f.order[0])] * mult;
+    let mut hx: i32 = 0;
+    let mut hy: i32 = ly;
+    for k in @as(usize, 1)..f.n {
+        let i = @as(usize, f.order[k]);
+        if used[i] {
+            hy = fy[i] * mult;
+            hx = @bit_cast(i32, f.xs[i]);
+            render_line(lx, ly, hx, hy, ints[..n2]);
+            lx = hx;
+            ly = hy;
+        }
+    }
+    let n2i = @bit_cast(i32, @truncate(u32, n2));
+    if hx < n2i {
+        render_line(hx, hy, n2i, hy, ints[..n2]);
+    }
+    for i in @as(usize, 0)..n2 {
+        out[i] = inverse_db(ints[i]);
+    }
+}
+
+/// Decodes a residue into the vectors of the channels (each n/2 long)
+/// that are not skipped.
+fn residue_decode(b: *mut Bits, s: *Setup, r: *Residue, vecs: [][]mut f32, skip: []bool, n2: usize,
+                  classes: []mut u8) void {
+    let nch = vecs.len;
+    let book = &s.books[r.classbook];
+    let cpw = book.dims;
+    let mut size = n2;
+    if r.kind == 2 {
+        size = n2 * nch;
+    }
+    let begin = @min(r.begin, size);
+    let end = @min(r.end, size);
+    if end <= begin {
+        return;
+    }
+    let nparts = (end - begin) / r.psize;
+    if nparts == 0 {
+        return;
+    }
+    let mut groups = nch;  // how many independent classification streams
+    if r.kind == 2 {
+        groups = 1;
+    }
+    for pass in @as(usize, 0)..8 {
+        let mut part: usize = 0;
+        while part < nparts {
+            if pass == 0 {
+                for j in @as(usize, 0)..groups {
+                    if (r.kind != 2) and skip[j] {
+                        continue;
+                    }
+                    let mut t = book.decode(b);
+                    if t < 0 {
+                        return;
+                    }
+                    let mut i = cpw;
+                    while i > 0 {
+                        i -= 1;
+                        if (part + i) < nparts {
+                            classes[(j * nparts) + part + i] = @truncate(u8, @bit_cast(u64, t) % @as(u64, r.classes));
+                        }
+                        t = t / @bit_cast(i64, @as(u64, r.classes));
+                    }
+                }
+            }
+            let mut i: usize = 0;
+            while (i < cpw) and (part < nparts) {
+                for j in @as(usize, 0)..groups {
+                    if (r.kind != 2) and skip[j] {
+                        continue;
+                    }
+                    let c = @as(usize, classes[(j * nparts) + part]);
+                    let bk = r.books[c][pass];
+                    if bk < 0 {
+                        continue;
+                    }
+                    let vb = &s.books[@as(usize, @bit_cast(u32, bk))];
+                    let off = begin + (part * r.psize);
+                    if not decode_partition(b, vb, r.kind, vecs, j, off, r.psize, n2) {
+                        return;
+                    }
+                }
+                part += 1;
+                i += 1;
+            }
+        }
+    }
+}
+
+fn decode_partition(b: *mut Bits, vb: *Book, kind: u32, vecs: [][]mut f32, j: usize, off: usize, psize: usize,
+                    n2: usize) bool {
+    let dims = vb.dims;
+    if kind == 0 {
+        let step = psize / dims;
+        let v = vecs[j];
+        for i in @as(usize, 0)..step {
+            let e = vb.decode(b);
+            if e < 0 {
+                return false;
+            }
+            let base = @truncate(usize, @bit_cast(u64, e)) * dims;
+            for k in @as(usize, 0)..dims {
+                v[off + i + (k * step)] += vb.vq[base + k];
+            }
+        }
+        return true;
+    }
+    if kind == 1 {
+        let v = vecs[j];
+        let mut i: usize = 0;
+        while i < psize {
+            let e = vb.decode(b);
+            if e < 0 {
+                return false;
+            }
+            let base = @truncate(usize, @bit_cast(u64, e)) * dims;
+            for k in @as(usize, 0)..dims {
+                if i < psize {
+                    v[off + i] += vb.vq[base + k];
+                }
+                i += 1;
+            }
+        }
+        return true;
+    }
+    // type 2: one vector interleaving the channels
+    let nch = vecs.len;
+    let mut i: usize = 0;
+    while i < psize {
+        let e = vb.decode(b);
+        if e < 0 {
+            return false;
+        }
+        let base = @truncate(usize, @bit_cast(u64, e)) * dims;
+        for k in @as(usize, 0)..dims {
+            if i < psize {
+                let at = off + i;
+                vecs[at % nch][at / nch] += vb.vq[base + k];
+            }
+            i += 1;
+        }
+    }
+    _ = n2;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// The inverse MDCT
+// -----------------------------------------------------------------------------
+
+/// Tables for one transform size n.
+struct Mdct {
+    n: usize,
+    tw_re: []mut f64,  // pre-twiddles exp(-i pi (j + 1/4) / M), M = n/2
+    tw_im: []mut f64,
+    pt_re: []mut f64,  // post-twiddles exp(-i pi k / M)
+    pt_im: []mut f64,
+    fft_re: []mut f64,  // FFT roots for size n/4
+    fft_im: []mut f64,
+    zr: []mut f64,
+    zi: []mut f64,
+    u: []mut f64,
+
+    fn init(n: usize) !Mdct {
+        let m = n / 2;
+        let q = n / 4;
+        let mut t = Mdct.{
+            n: n,
+            tw_re: mem.alloc.[f64](q)!,
+            tw_im: mem.alloc.[f64](q)!,
+            pt_re: mem.alloc.[f64](q)!,
+            pt_im: mem.alloc.[f64](q)!,
+            fft_re: mem.alloc.[f64](q)!,
+            fft_im: mem.alloc.[f64](q)!,
+            zr: mem.alloc.[f64](q)!,
+            zi: mem.alloc.[f64](q)!,
+            u: mem.alloc.[f64](m)!,
+        };
+        let mf = @float_from_int(f64, m);
+        for j in @as(usize, 0)..q {
+            let a = (-math.PI * (@float_from_int(f64, j) + 0.25)) / mf;
+            t.tw_re[j] = math.cos(a);
+            t.tw_im[j] = math.sin(a);
+            let c = (-math.PI * @float_from_int(f64, j)) / mf;
+            t.pt_re[j] = math.cos(c);
+            t.pt_im[j] = math.sin(c);
+            let r = (-2.0 * math.PI * @float_from_int(f64, j)) / @float_from_int(f64, q);
+            t.fft_re[j] = math.cos(r);
+            t.fft_im[j] = math.sin(r);
+        }
+        return t;
+    }
+
+    fn free(self: *mut Mdct) void {
+        mem.free(self.tw_re);
+        mem.free(self.tw_im);
+        mem.free(self.pt_re);
+        mem.free(self.pt_im);
+        mem.free(self.fft_re);
+        mem.free(self.fft_im);
+        mem.free(self.zr);
+        mem.free(self.zi);
+        mem.free(self.u);
+    }
+
+    /// y (n values) from the n/2 spectral values x.
+    fn inverse(self: *mut Mdct, x: []f32, y: []mut f32) void {
+        let n = self.n;
+        let m = n / 2;
+        let q = n / 4;
+        let zr = self.zr;
+        let zi = self.zi;
+        for j in @as(usize, 0)..q {
+            let a = @float_cast(f64, x[2 * j]);
+            let b = @float_cast(f64, x[m - 1 - (2 * j)]);
+            zr[j] = (a * self.tw_re[j]) - (b * self.tw_im[j]);
+            zi[j] = (a * self.tw_im[j]) + (b * self.tw_re[j]);
+        }
+        fft(zr, zi, self.fft_re, self.fft_im);
+        let u = self.u;
+        for k in @as(usize, 0)..q {
+            let re = (zr[k] * self.pt_re[k]) - (zi[k] * self.pt_im[k]);
+            let im = (zr[k] * self.pt_im[k]) + (zi[k] * self.pt_re[k]);
+            u[2 * k] = re;
+            u[m - 1 - (2 * k)] = -im;
+        }
+        // unfold the DCT-IV into the MDCT's output
+        let n4 = n / 4;
+        let n34 = (3 * n) / 4;
+        for i in @as(usize, 0)..n4 {
+            y[i] = @float_cast(f32, u[i + n4]);
+        }
+        for i in n4..n34 {
+            y[i] = @float_cast(f32, -u[n34 - 1 - i]);
+        }
+        for i in n34..n {
+            y[i] = @float_cast(f32, -u[i - n34]);
+        }
+    }
+}
+
+/// An in-place radix-2 FFT (forward) of size re.len, a power of two.
+fn fft(re: []mut f64, im: []mut f64, wr: []f64, wi: []f64) void {
+    let n = re.len;
+    // bit-reversal permutation
+    let mut j: usize = 0;
+    for i in @as(usize, 0)..n - 1 {
+        if i < j {
+            let tr = re[i];
+            re[i] = re[j];
+            re[j] = tr;
+            let ti = im[i];
+            im[i] = im[j];
+            im[j] = ti;
+        }
+        let mut k = n >> 1;
+        while (k > 0) and ((j & k) != 0) {
+            j ^= k;
+            k >>= 1;
+        }
+        j |= k;
+    }
+    let mut len: usize = 2;
+    while len <= n {
+        let half = len / 2;
+        let step = n / len;
+        let mut s: usize = 0;
+        while s < n {
+            for k in @as(usize, 0)..half {
+                let w_r = wr[k * step];
+                let w_i = wi[k * step];
+                let a = s + k;
+                let b = a + half;
+                let xr = (re[b] * w_r) - (im[b] * w_i);
+                let xi = (re[b] * w_i) + (im[b] * w_r);
+                re[b] = re[a] - xr;
+                im[b] = im[a] - xi;
+                re[a] += xr;
+                im[a] += xi;
+            }
+            s += len;
+        }
+        len *= 2;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Decoding
+// -----------------------------------------------------------------------------
+
+fn slope(k: usize, len: usize) f32 {
+    let x = ((@float_from_int(f64, k) + 0.5) / @float_from_int(f64, len)) * (math.PI / 2.0);
+    let sx = math.sin(x);
+    return @float_cast(f32, math.sin((math.PI / 2.0) * (sx * sx)));
+}
+
+pub fn decode(data: []u8) !audio.Sound {
+    let serial = ogg.find_stream(data, "\x01vorbis")!;
+    let mut ps = ogg.packets(data, serial)!;
+    defer ps.deinit();
+    let pk = ps.items.items();
+    if pk.len < 3 {
+        return error.InvalidAudio;
+    }
+    let mut s = Setup.{
+        channels: 0,
+        rate: 0,
+        bs: [0, 0],
+        books: mem.alloc.[Book](0)!,
+        nbooks: 0,
+        floors: mem.alloc.[Floor1](0)!,
+        nfloors: 0,
+        residues: mem.alloc.[Residue](0)!,
+        nresidues: 0,
+        maps: mem.alloc.[Mapping](0)!,
+        nmaps: 0,
+        modes: [Mode.{ long: false, mapping: 0 }; 64],
+        nmodes: 0,
+    };
+    defer s.free();
+    read_ident(pk[0].data, &mut s)!;
+    if (pk[1].data.len < 7) or (pk[1].data[0] != 3) {
+        return error.InvalidAudio;
+    }
+    read_setup(pk[2].data, &mut s)!;
+    return decode_audio(&s, pk[3..]);
+}
+
+fn decode_audio(s: *Setup, pk: []ogg.Packet) !audio.Sound {
+    let nch = s.channels;
+    let bs1 = s.bs[1];
+    let n2max = bs1 / 2;
+    // per-channel memory
+    let spec = mem.alloc_zeroed.[f32](nch * n2max)!;
+    defer mem.free(spec);
+    let pcm = mem.alloc_zeroed.[f32](nch * bs1)!;
+    defer mem.free(pcm);
+    let overlap = mem.alloc_zeroed.[f32](nch * n2max)!;
+    defer mem.free(overlap);
+    let curve = mem.alloc.[f32](n2max)!;
+    defer mem.free(curve);
+    let ints = mem.alloc.[i32](n2max + 1)!;
+    defer mem.free(ints);
+    let ys = mem.alloc.[i32](nch * 65)!;
+    defer mem.free(ys);
+    let has_floor = mem.alloc.[bool](nch)!;
+    defer mem.free(has_floor);
+    let decode_res = mem.alloc.[bool](nch)!;
+    defer mem.free(decode_res);
+    let skip = mem.alloc.[bool](nch)!;
+    defer mem.free(skip);
+    let classes = mem.alloc.[u8]((nch * n2max) + 1)!;
+    defer mem.free(classes);
+    let vec_store = mem.alloc.[[]mut f32](nch)!;
+    defer mem.free(vec_store);
+    let w0 = slope_table(s.bs[0] / 2)!;
+    defer mem.free(w0);
+    let w1 = slope_table(s.bs[1] / 2)!;
+    defer mem.free(w1);
+    let mut m0 = Mdct.init(s.bs[0])!;
+    defer m0.free();
+    let mut m1 = Mdct.init(s.bs[1])!;
+    defer m1.free();
+    // the output, grown as needed
+    let mut out = audio.Sound.init(0, nch, s.rate, audio.SampleFormat.F32)!;
+    let mut cap: usize = 0;
+    let mut frames: usize = 0;
+    let mut prev_n: usize = 0;  // 0 before the first block
+    let mut last_granule: i64 = -1;
+    let mut first_granule_seen = false;
+    // the last packet with a granule position ends the stream
+    let mut last_g: usize = pk.len;
+    for i in @as(usize, 0)..pk.len {
+        if pk[i].granule >= 0 {
+            last_g = i;
+        }
+    }
+    for pi in @as(usize, 0)..pk.len {
+        let p = pk[pi];
+        let mut b = Bits.{ d: p.data, pos: 0, eop: false };
+        if (p.data.len == 0) or (b.read(1) != 0) {
+            continue;  // not an audio packet
+        }
+        let mi = @as(usize, b.read(ilog(@truncate(u32, s.nmodes - 1))));
+        if (mi >= s.nmodes) or b.eop {
+            continue;
+        }
+        let mode = s.modes[mi];
+        let mut n = s.bs[0];
+        let mut prev_long = false;
+        let mut next_long = false;
+        if mode.long {
+            n = s.bs[1];
+            prev_long = b.flag();
+            next_long = b.flag();
+        }
+        let n2 = n / 2;
+        let map = &s.maps[mode.mapping];
+        // floors
+        for c in @as(usize, 0)..nch {
+            let sub = @as(usize, map.mux[c]);
+            let fl = &s.floors[@as(usize, map.floor[sub])];
+            has_floor[c] = floor1_read(&mut b, s, fl, ys[c * 65..(c * 65) + 65]);
+        }
+        // the residues of coupled channels are decoded if either has a floor
+        for c in @as(usize, 0)..nch {
+            decode_res[c] = has_floor[c];
+        }
+        for k in @as(usize, 0)..map.steps {
+            let mg = @as(usize, map.mag[k]);
+            let an = @as(usize, map.ang[k]);
+            if decode_res[mg] or decode_res[an] {
+                decode_res[mg] = true;
+                decode_res[an] = true;
+            }
+        }
+        // residues, per submap
+        for c in @as(usize, 0)..nch {
+            @mem_set(spec[c * n2max..(c * n2max) + n2], 0);
+        }
+        for sub in @as(usize, 0)..map.submaps {
+            let mut k: usize = 0;
+            for c in @as(usize, 0)..nch {
+                if @as(usize, map.mux[c]) == sub {
+                    vec_store[k] = spec[c * n2max..(c * n2max) + n2];
+                    skip[k] = not decode_res[c];
+                    k += 1;
+                }
+            }
+            let r = &s.residues[@as(usize, map.residue[sub])];
+            if r.kind == 2 {
+                // decoded only if some channel is
+                let mut any = false;
+                for j in @as(usize, 0)..k {
+                    if not skip[j] {
+                        any = true;
+                    }
+                }
+                if not any {
+                    continue;
+                }
+            }
+            residue_decode(&mut b, s, r, vec_store[..k], skip[..k], n2, classes);
+        }
+        // inverse coupling, last step first
+        let mut st = map.steps;
+        while st > 0 {
+            st -= 1;
+            let mv = spec[@as(usize, map.mag[st]) * n2max..];
+            let av = spec[@as(usize, map.ang[st]) * n2max..];
+            for i in @as(usize, 0)..n2 {
+                let m = mv[i];
+                let a = av[i];
+                if m > 0.0 {
+                    if a > 0.0 {
+                        av[i] = m - a;
+                    } else {
+                        av[i] = m;
+                        mv[i] = m + a;
+                    }
+                } else if a > 0.0 {
+                    av[i] = m + a;
+                } else {
+                    av[i] = m;
+                    mv[i] = m - a;
+                }
+            }
+        }
+        // floors times residues, then the inverse MDCT and the window
+        for c in @as(usize, 0)..nch {
+            let sp = spec[c * n2max..(c * n2max) + n2];
+            if has_floor[c] {
+                let sub = @as(usize, map.mux[c]);
+                floor1_curve(&s.floors[@as(usize, map.floor[sub])], ys[c * 65..(c * 65) + 65], curve[..n2], ints);
+                for i in @as(usize, 0)..n2 {
+                    sp[i] *= curve[i];
+                }
+            } else {
+                @mem_set(sp, 0);
+            }
+            let y = pcm[c * bs1..(c * bs1) + n];
+            if n == s.bs[0] {
+                m0.inverse(sp, y);
+            } else {
+                m1.inverse(sp, y);
+            }
+            apply_window(y, n, s.bs[0], mode.long, prev_long, next_long, w0, w1);
+        }
+        // overlap-add with the previous block, and output
+        if prev_n > 0 {
+            let count = (prev_n / 4) + (n / 4);
+            if (frames + count) > cap {
+                cap = @max(cap * 2, frames + count + 4096);
+                if (cap * nch) > audio.MAX_SAMPLES {
+                    out.deinit();
+                    return error.TooLarge;
+                }
+                out.data = mem.realloc(out.data, cap * nch * 4) catch |e| {
+                    out.deinit();
+                    return e;
+                };
+            }
+            let o = @cast_slice(f32, out.data[..cap * nch * 4]);
+            let shift = @bit_cast(i64, @as(u64, n / 4)) - @bit_cast(i64, @as(u64, prev_n / 4));
+            for c in @as(usize, 0)..nch {
+                let ov = overlap[c * n2max..];
+                let y = pcm[c * bs1..];
+                for t in @as(usize, 0)..count {
+                    let mut v: f32 = 0.0;
+                    if t < (prev_n / 2) {
+                        v = ov[t];
+                    }
+                    let ci = @bit_cast(i64, @as(u64, t)) + shift;
+                    if (ci >= 0) and (ci < @bit_cast(i64, @as(u64, n))) {
+                        v += y[@truncate(usize, @bit_cast(u64, ci))];
+                    }
+                    o[((frames + t) * nch) + c] = v;
+                }
+            }
+            frames += count;
+        }
+        for c in @as(usize, 0)..nch {
+            @mem_copy(overlap[c * n2max..(c * n2max) + n2], pcm[(c * bs1) + n2..(c * bs1) + n]);
+        }
+        prev_n = n;
+        // granule positions: trim a stream that starts late, or ends early
+        if p.granule >= 0 {
+            if not first_granule_seen and (pi != last_g) and (@bit_cast(u64, p.granule) < @as(u64, frames)) {
+                let drop = frames - @truncate(usize, @bit_cast(u64, p.granule));
+                let o = @cast_slice(f32, out.data[..cap * nch * 4]);
+                for i in @as(usize, 0)..(frames - drop) * nch {
+                    o[i] = o[i + (drop * nch)];
+                }
+                frames -= drop;
+            }
+            first_granule_seen = true;
+            last_granule = p.granule;
+        }
+    }
+    if (last_granule >= 0) and (@bit_cast(u64, last_granule) < @as(u64, frames)) {
+        frames = @truncate(usize, @bit_cast(u64, last_granule));
+    }
+    out.data = mem.realloc(out.data, @max(frames * nch * 4, 1)) catch |e| {
+        out.deinit();
+        return e;
+    };
+    out.frames = frames;
+    return out;
+}
+
+/// The rising half of a window slope len samples long.
+fn slope_table(len: usize) ![]mut f32 {
+    let t = mem.alloc.[f32](len)!;
+    for k in @as(usize, 0)..len {
+        t[k] = slope(k, len);
+    }
+    return t;
+}
+
+/// Windows a block; w0 and w1 are the slopes for the short and long
+/// overlaps (bs0/2 and bs1/2 long).
+fn apply_window(y: []mut f32, n: usize, bs0: usize, long: bool, prev_long: bool, next_long: bool, w0: []f32,
+                w1: []f32) void {
+    let mut ls: usize = 0;
+    let mut le = n / 2;
+    let mut rs = n / 2;
+    let mut re = n;
+    if long and not prev_long {
+        ls = (n / 4) - (bs0 / 4);
+        le = (n / 4) + (bs0 / 4);
+    }
+    if long and not next_long {
+        rs = ((3 * n) / 4) - (bs0 / 4);
+        re = ((3 * n) / 4) + (bs0 / 4);
+    }
+    for i in @as(usize, 0)..ls {
+        y[i] = 0.0;
+    }
+    let mut lw = w1;
+    if (le - ls) == w0.len {
+        lw = w0;
+    }
+    for i in ls..le {
+        y[i] *= lw[i - ls];
+    }
+    let mut rw = w1;
+    if (re - rs) == w0.len {
+        rw = w0;
+    }
+    for i in rs..re {
+        y[i] *= rw[re - 1 - i];
+    }
+    for i in re..n {
+        y[i] = 0.0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "inverse MDCT matches its definition" {
+    let n: usize = 64;
+    let mut t = Mdct.init(n)!;
+    defer t.free();
+    let mut x: [32]f32 = [0.0; 32];
+    for k in @as(usize, 0)..32 {
+        x[k] = @float_cast(f32, math.sin(@float_from_int(f64, (k * 7) + 1)));
+    }
+    let mut y: [64]f32 = [0.0; 64];
+    t.inverse(x[..], y[..]);
+    for i in @as(usize, 0)..n {
+        let mut want: f64 = 0.0;
+        for k in @as(usize, 0)..32 {
+            let a = ((2.0 * math.PI) / 64.0) * (
+                (@float_from_int(f64, i) + 0.5 + 16.0) * (@float_from_int(f64, k) + 0.5));
+            want += @float_cast(f64, x[k]) * math.cos(a);
+        }
+        @expect(@abs(@float_cast(f64, y[i]) - want) < 1e-4);
+    }
+}
+
+test "codeword assignment" {
+    // lengths 2, 4, 4, 4, 4, 2, 3, 3 (the specification's example)
+    let lengths: [8]u8 = [2, 4, 4, 4, 4, 2, 3, 3];
+    let mut book = Book.{
+        dims: 1,
+        entries: 8,
+        fast: mem.alloc.[i32](@as(usize, 1) << @as(usize, FAST))!,
+        keys: mem.alloc.[u32](0)!,
+        ids: mem.alloc.[u32](0)!,
+        lens: mem.alloc.[u8](0)!,
+        single: -1,
+        single_len: 0,
+        vq: mem.alloc.[f32](0)!,
+        has_vq: false,
+    };
+    defer book.free();
+    let mut dummy = Bits.{ d: "", pos: 0, eop: false };
+    build_book(&mut dummy, &mut book, lengths[..], 0)!;
+    // expected codewords: 00, 0100, 0101, 0110, 0111, 10, 110, 111
+    let want: [8]u32 = [0x0, 0x4, 0x5, 0x6, 0x7, 0x2, 0x6, 0x7];
+    for e in @as(usize, 0)..8 {
+        // write entry e's codeword, first bit first, into the low bits
+        let len = @as(u32, lengths[e]);
+        let mut v: u32 = 0;
+        for k in @as(u32, 0)..len {
+            let bit = (want[e] >> (len - 1 - k)) & 1;
+            v |= bit << k;
+        }
+        let bytes: [4]u8 = [@truncate(u8, v), 0, 0, 0];
+        let mut bb = Bits.{ d: bytes[..], pos: 0, eop: false };
+        @expect_eq(book.decode(&mut bb), @as(i64, @truncate(u32, e)));
+        @expect_eq(bb.pos, @as(usize, len));
+    }
+}
+
+test "long codewords" {
+    // lengths 1, 2, ..., 19, 19: codeword i is i ones then a zero (the
+    // last is all ones), so codes up to 19 bits use the slow path
+    let mut lengths: [20]u8 = [0; 20];
+    for i in @as(usize, 0)..19 {
+        lengths[i] = @truncate(u8, i + 1);
+    }
+    lengths[19] = 19;
+    let mut book = Book.{
+        dims: 1,
+        entries: 20,
+        fast: mem.alloc.[i32](@as(usize, 1) << @as(usize, FAST))!,
+        keys: mem.alloc.[u32](0)!,
+        ids: mem.alloc.[u32](0)!,
+        lens: mem.alloc.[u8](0)!,
+        single: -1,
+        single_len: 0,
+        vq: mem.alloc.[f32](0)!,
+        has_vq: false,
+    };
+    defer book.free();
+    let mut dummy = Bits.{ d: "", pos: 0, eop: false };
+    build_book(&mut dummy, &mut book, lengths[..], 0)!;
+    // a stream of entries 0..19 and back
+    let mut buf: [64]u8 = [0; 64];
+    let mut pos: usize = 0;
+    let mut seq: [40]usize = [0; 40];
+    for i in @as(usize, 0)..20 {
+        seq[i] = i;
+        seq[20 + i] = 19 - i;
+    }
+    for e in seq {
+        let ones = @min(e, 19);
+        for _k in @as(usize, 0)..ones {
+            buf[pos / 8] |= @as(u8, 1) << @truncate(u8, pos % 8);
+            pos += 1;
+        }
+        if e < 19 {
+            pos += 1;  // the zero
+        }
+    }
+    let mut b = Bits.{ d: buf[..], pos: 0, eop: false };
+    for e in seq {
+        @expect_eq(book.decode(&mut b), @as(i64, @truncate(u32, e)));
+    }
+    @expect_eq(b.pos, pos);
+}
+
+test "floor curve" {
+    // a floor from a libvorbis stream, and its curve per the specification
+    let xs: [19]u32 = [0, 128, 12, 46, 4, 8, 16, 23, 33, 70, 2, 6, 10, 14, 19, 28, 39, 58, 90];
+    let ys: [19]i32 = [68, 90, 34, 7, 16, 0, 4, 21, 20, 0, 0, 0, 0, 0, 0, 11, 0, 4, 0];
+    let mut f = Floor1.{
+        partitions: 0,
+        class_of: [0; 32],
+        dims: [0; 16],
+        subs: [0; 16],
+        master: [0; 16],
+        books: [[0; 8]; 16],
+        mult: 2,
+        xs: [0; 65],
+        n: 19,
+        order: [0; 65],
+        low: [0; 65],
+        high: [0; 65],
+    };
+    for i in @as(usize, 0)..19 {
+        f.xs[i] = xs[i];
+    }
+    set_neighbours(&mut f)!;
+    let mut out: [128]f32 = [0.0; 128];
+    let mut ints: [129]i32 = [0; 129];
+    floor1_curve(&f, ys[..], out[..], ints[..]);
+    let want: [30]i32 = [136, 143, 150, 157, 164, 165, 166, 167, 169, 170, 171, 172, 174, 175, 176, 177, 178, 175, 172,
+                         168, 165, 161, 158, 154, 154, 154, 154, 154, 154, 158];
+    for i in @as(usize, 0)..30 {
+        @expect_eq(ints[i], want[i]);
+    }
+}
+
+/// A quarter second of 8 kHz stereo, from libvorbis at quality -1, base64-encoded (for tests).
+let TINY: [43][]u8 = [
+    "T2dnUwACAAAAAAAAAACnejEhAAAAAF4MjSgBHgF2b3JiaXMAAAAAAkAfAAAAAAAA4C4AAAAAAACZAU9nZ1MAAAAAAAAAAAAA",
+    "p3oxIQEAAACNYwLnDET/////////////GwN2b3JiaXM0AAAAWGlwaC5PcmcgbGliVm9yYmlzIEkgMjAyMDA3MDQgKFJlZHVj",
+    "aW5nIEVudmlyb25tZW50KQAAAAABBXZvcmJpcxFCQ1YBAAABAAxSFCElGVNKYwiVUlIpBR1jUFtHHWPUOUYhZBBTiEkZpXtP",
+    "KpVYSsgRUlgpRR1TTFNJlVKWKUUdYxRTSCFT1jFloXMUS4ZJCSVsTa50FkvomWOWMUYdY85aSp1j1jFFHWNSUkmhcxg6ZiVk",
+    "FDpGxehifDA6laJCKL7H3lLpLYWKW4q91xpT6y2EGEtpwQhhc+211dxKasUYY4wxxsXiUyiC0JBVAAABAABABAFCQ1YBAAoA",
+    "AMJQDEVRgNCQVQBABgCAABRFcRTHcRxHkiTLAkJDVgEAQAAAAgAAKI7hKJIjSZJkWZZlWZameZaouaov+64u667t6roOhIas",
+    "BADIAAAYJJpUzEGJhEgMKeYoCCGEEEIIzYAFlZOWUwaiUgxSrgxYyiBHvVLgKaQg9g6CCp2jGEQLusYWa3A5CCGED0IQGrJC",
+    "AAjNADBIDiBpGiBpGgAAAAAAAABIngdonghonggAAAAAAAAAkucBmigCmugBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACB5HuCZJuCJIgAAAAAAAABopgh4ogqIqgoAAAAAAAAA",
+    "mmgComoCoqoCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAACB5HuCJIuCJJgAAAAAAAABoogiIqgqIpgoAAAAAAAAAmmgCoqoCnioCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAIAAAIcAAACLAQCg1ZEQDECQAYHMeyAADAkSxNAwAAR5I0DQAALE3zPAAAsDTN8wAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAADDgAAASYUAYKDVkJAEQBABgM",
+    "RdMAlgWwLICmATQN4HkA0QOYJgAQAABQ4AAAEGCDpsTiAIWGrAQAogAADIoiSZrledA0TfM8aJqmeSI8z/NEEZ7neaIIUfQ8",
+    "04Qoep5pwjRF0TSBKJqmAACAAgcAgAAbNCUWByg0ZCUAEBIAYFAUy/I8UfQ8UzRNVYWmeZ4oiqJpqqrqQtM8TxRF0TRV1VXh",
+    "eaJomqJomqrquvA8UTRNUVRNVXVdiKIomqZpqqrqui5EURRN0zRV1XVlGaZpmqpqmqrqurIMTNFUTVNVXVeWgSiaoqm6rizb",
+    "MhBF0TRNVZVdWQamaZqq6rqybNsA01RV15Vl2Qaoqqq6rmzbNkBVVdV1ZdmWAarqurJs27YNwHVdV5ZtWwAAwIEDAECAEXSS",
+    "UWURNppw4QEoNGRFABAFAAAYw5RiShnGKJQWSsOYlJJCqKik1FJKlZSUWiqlgpJSSqVkklpKLbUKQgkhlVJBKKWkUgoAADtw",
+    "AAA7sBAKDVkJAOQBAACEKOUchBBKKRlzDkIIpYSMOQchhFJK5yCEEEIppXMQQuiglNI5CKGUUkoJIYQQSkklhRBCKaWklEoJ",
+    "oZQSUimllBJCKSmVUkIIpZQCAIAKHAAAAmwU2ZxgJKjQkJUAQCoAgMFxNEvTNM3zRFGzLE3zPE3zRNPULEvTPE3TRNF0eZ7n",
+    "eaLniaJp8jzP80RPFEXVRBY9URRF01RVMlEURVFUTVWFJ5qiacqq68ITRdE0ZdeV4TJNVzVV14Usm6apumRAVrmuK7uALKuy",
+    "rLoCAMATHACACmxYHeGkaCyw0JCVAEAGAABADEJMKYUYY0oxxpRijCklAABgwAEAIMCEMlBoyIoAIAoAAHDOOeecc84555xz",
+    "zjnnnHPOOeecY4wxxhhjjDHGGGOMMcYYY4wxxhhjjDHGGGOMMcYYEwCwE+EAsBNhIRQashIACAcAAIxBSDpKKaWUUqUUU1RS",
+    "SimllDKklHKMUkoppZQy5xyElFJKKaUUOuYgpZRSSimlVFJKKaWUUkoppVRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkop",
+    "pZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKKaWUUkoppZRSSimllFJKBQCYPDgAQCXYOMNK0lnhaHCh",
+    "ISsBgNwAAAAhxhxzTkoIpZSUSkuttdA55xyUUkpKqaTUWmqdY8xBKSWUEkpJKaWUQgihg1JSKSm1UlpLqYRQOiilhFJSKqmU",
+    "0loLJZQQSkkppVJKaqmlVlJJoYQSSgmlpJJSSi2FUkpJKaVUUkqptNJaaqWkElJJoaRSSkoptVZCSCW0VFpLKaWSUkulhVRS",
+    "KamkUEpJLaWWSkkplNJKKqWEUkoJpaSUUkullJJSSSmk0kpLJZVSUikplVRKKSm1UkoqqaWSSkmptBJKSSmVVkpKqZRUSkkl",
+    "lZZSKaWVkkJJKZWSSgkptZZaSimlFEoqrZRSUimplFZKKSW0UkppIZWSSmultVZKKaGkUlopLZVUSkullZJCKqGEUgAA0IED",
+    "AECAEZUWYqcZVx6BIwoZJqAAAAAQABBgAggMEBSMQhAgjIAAAAAAAGAAwAcAQFIABEREM2dwgJCgsMDQ4PAAEQEAAAggAAAA",
+    "AAAAAACAT2dnUwAE0AcAAAAAAACnejEhAgAAACywnAYJGxgXGzoZGRkdjtGTYC5b5czMCjIozwkAABai4sCTb795CnQCstWQ",
+    "3LNtZ+bsRAQAAAAAwBEAaDNnm5MGup+Zc6dtNRR3QgQAAAAAwDkA4EvdEgK24JDoqSxn5r2EGEDTr/+5CQAAKMDv0r+grQXO",
+    "q/5Bxql4QwyAD3MLSjUpUXC9dtac4M7f452cw3mcWl7ufOdhJ7G/9Pre9eAJL5QS78+Ck2v7628AuteQvLNtNRR3QgQAAAAA",
+    "4BwAWKN6rLcGALqfmXOnbTUUd0IEAAAAAOBcBwBrdLa+Lxq6n5ltVZWGomtEAAAAAAD6AwCMFSawzfwIrtRQWOnXXOVdYgDd",
+    "wddf500AAFCVkjLXNisfnAE=",
+];
+
+test "decodes like the reference decoder" {
+    let mut text = strs.String.init();
+    defer text.deinit();
+    for l in TINY {
+        text.push_str(l)!;
+    }
+    let data = base64.decode_alloc(text.bytes(), base64.STANDARD)!;
+    defer mem.free(data);
+    let mut s = decode(data)!;
+    defer s.deinit();
+    @expect_eq(s.frames, 2000);
+    @expect_eq(s.channels, 2);
+    @expect_eq(s.rate, 8000);
+    // the energy, and samples, as libvorbis gives them
+    let mut energy: f64 = 0.0;
+    for v in s.samples_f32() {
+        energy += @float_cast(f64, v) * @float_cast(f64, v);
+    }
+    @expect(@abs(energy - 335.317480758171) < 1e-3);
+    @expect(@abs(s.get(500, 0) - 0.02695661410689354) < 1e-5);
+    @expect(@abs(s.get(500, 1) - 0.09827262163162231) < 1e-5);
+    @expect(@abs(s.get(1003, 0) - 0.8854621648788452) < 1e-5);
+    @expect(@abs(s.get(1003, 1) - -0.11724459379911423) < 1e-5);
+}
+
+fn less_u64(a: u64, b: u64) bool {
+    return a < b;
+}

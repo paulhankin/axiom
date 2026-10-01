@@ -1,18 +1,18 @@
 // package.c - packages (spec §4.6).
 //
-// A package is a directory with a phalange.toml manifest:
+// A package is a directory with a axiom.toml manifest:
 //
 //     [package]
 //     name = "geometry"
 //     version = "0.1.0"
-//     entry = "src/lib.ph"          # optional: default src/lib.ph, else src/main.ph
+//     entry = "src/lib.ax"          # optional: default src/lib.ax, else src/main.ax
 //
 //     [dependencies]
 //     vecmath = { path = "../vecmath" }
 //     json = { git = "https://example.com/json.git", rev = "<full commit hash>" }
 //
 // Modules import dependencies with "pkg:name" (the entry module) or
-// "pkg:name/sub/mod" (src/sub/mod.ph). Only a package's own dependencies are
+// "pkg:name/sub/mod" (src/sub/mod.ax). Only a package's own dependencies are
 // visible to it, and each package name resolves to one source per build.
 #include "package.h"
 
@@ -53,7 +53,7 @@ typedef struct Parser {
 static Span pspan(Parser *P, uint32_t a, uint32_t b) { return (Span){P->f->id, a, b}; }
 
 static void perr(Parser *P, uint32_t a, uint32_t b, const char *msg) {
-    diag_error(pspan(P, a, b), "E0215", "invalid phalange.toml: %s", msg);
+    diag_error(pspan(P, a, b), "E0215", "invalid axiom.toml: %s", msg);
     P->failed = true;
 }
 
@@ -143,12 +143,12 @@ static int run_quiet(char *const argv[]) {
 }
 
 const char *pkg_cache_dir(void) {
-    const char *c = getenv("PHALANGE_CACHE");
+    const char *c = getenv("AXIOM_CACHE");
     if (c && *c) return c;
     const char *x = getenv("XDG_CACHE_HOME");
-    if (x && *x) return arena_printf("%s/phalange", x);
+    if (x && *x) return arena_printf("%s/axiom", x);
     const char *h = getenv("HOME");
-    return arena_printf("%s/.cache/phalange", h && *h ? h : "/tmp");
+    return arena_printf("%s/.cache/axiom", h && *h ? h : "/tmp");
 }
 
 static void mkdirs(const char *path) {
@@ -170,7 +170,7 @@ static const char *fetch_git(const char *url, const char *rev, Span sp) {
     for (const char *p = url; *p && k < 150; p++) key[k++] = isalnum((unsigned char)*p) ? *p : '_';
     key[k] = 0;
     const char *dir = arena_printf("%s/git/%s-%s", pkg_cache_dir(), key, rev);
-    if (is_file(arena_printf("%s/phalange.toml", dir))) return dir;  // cached
+    if (is_file(arena_printf("%s/axiom.toml", dir))) return dir;  // cached
     mkdirs(arena_printf("%s/git", pkg_cache_dir()));
     const char *tmp = arena_printf("%s.tmp%d", dir, (int)getpid());
     char *clone[] = {"git", "clone", "--quiet", (char *)url, (char *)tmp, NULL};
@@ -200,14 +200,14 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
     Sym key = intern_cstr(dir);
     Package *p = symmap_get(&pkg_by_dir, key);
     if (p) return p;
-    const char *mpath = arena_printf("%s/phalange.toml", dir);
+    const char *mpath = arena_printf("%s/axiom.toml", dir);
     const char *display = mpath;
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof cwd) && !strncmp(mpath, cwd, strlen(cwd)) && mpath[strlen(cwd)] == '/')
         display = mpath + strlen(cwd) + 1;
     SourceFile *f = load_file(mpath, arena_strndup(display, strlen(display)));
     if (!f) {
-        if (from) diag_error(*from, "E0217", "no phalange.toml in '%s'", dir_in);
+        if (from) diag_error(*from, "E0217", "no axiom.toml in '%s'", dir_in);
         return NULL;
     }
     p = NEW(Package);
@@ -305,7 +305,7 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
         next_line(&P);
     }
     if (!p->name) {
-        diag_error((Span){f->id, 0, 0}, "E0215", "invalid phalange.toml: [package] needs name = \"...\"");
+        diag_error((Span){f->id, 0, 0}, "E0215", "invalid axiom.toml: [package] needs name = \"...\"");
         p->name = intern_cstr("<unnamed>");
     }
     // one source per package name
@@ -320,8 +320,8 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
     }
     // entry module
     if (entry) p->entry = arena_printf("%s/%s", dir, entry);
-    else if (is_file(arena_printf("%s/src/lib.ph", dir))) p->entry = arena_printf("%s/src/lib.ph", dir);
-    else p->entry = arena_printf("%s/src/main.ph", dir);
+    else if (is_file(arena_printf("%s/src/lib.ax", dir))) p->entry = arena_printf("%s/src/lib.ax", dir);
+    else p->entry = arena_printf("%s/src/main.ax", dir);
     // dependencies (sources resolved now; loaded as imports happen)
     for (int i = 0; i < specs.len; i++) {
         DepSpec *d = &specs.data[i];
@@ -353,7 +353,7 @@ Package *pkg_for_file(const char *file_path) {
         if (!dir[0]) return NULL;
         Package *p = symmap_get(&pkg_by_dir, intern_cstr(dir));
         if (p) return p;
-        if (is_file(arena_printf("%s/phalange.toml", dir))) return pkg_load_dir(dir, NULL);
+        if (is_file(arena_printf("%s/axiom.toml", dir))) return pkg_load_dir(dir, NULL);
     }
 }
 
@@ -362,7 +362,7 @@ bool pkg_resolve_import(Package *importer, const char *spec, Span sp, char *out,
     const char *slash = strchr(rest, '/');
     Sym name = slash ? intern(rest, (size_t)(slash - rest)) : intern_cstr(rest);
     if (!importer) {
-        diag_error(sp, "E0214", "'%s' imports package '%s', but this file is not part of a package (no phalange.toml)",
+        diag_error(sp, "E0214", "'%s' imports package '%s', but this file is not part of a package (no axiom.toml)",
                    spec, name);
         return false;
     }
@@ -375,8 +375,8 @@ bool pkg_resolve_import(Package *importer, const char *spec, Span sp, char *out,
     if (slash) {
         const char *sub = slash + 1;
         size_t n = strlen(sub);
-        bool ext = n > 3 && !strcmp(sub + n - 3, ".ph");
-        snprintf(out, cap, "%s/src/%s%s", dep->dir, sub, ext ? "" : ".ph");
+        bool ext = n > 3 && !strcmp(sub + n - 3, ".ax");
+        snprintf(out, cap, "%s/src/%s%s", dep->dir, sub, ext ? "" : ".ax");
     } else {
         snprintf(out, cap, "%s", dep->entry);
     }
@@ -394,7 +394,7 @@ static void collect(const char *dir, StrVec *out) {
         char *p = arena_printf("%s/%s", dir, e->d_name);
         size_t n = strlen(e->d_name);
         if (is_dir(p)) collect(p, out);
-        else if (n > 3 && !strcmp(e->d_name + n - 3, ".ph")) vec_push(*out, p);
+        else if (n > 3 && !strcmp(e->d_name + n - 3, ".ax")) vec_push(*out, p);
     }
     closedir(d);
 }
@@ -415,8 +415,8 @@ bool pkg_new(const char *name, bool json) {
         return false;
     }
     mkdirs(arena_printf("%s/src", name));
-    FILE *m = fopen(arena_printf("%s/phalange.toml", name), "w");
-    FILE *s = fopen(arena_printf("%s/src/lib.ph", name), "w");
+    FILE *m = fopen(arena_printf("%s/axiom.toml", name), "w");
+    FILE *s = fopen(arena_printf("%s/src/lib.ax", name), "w");
     if (!m || !s) {
         diag_emit_fatal(json, "E9005", "cannot create the package files");
         return false;
@@ -431,6 +431,6 @@ bool pkg_new(const char *name, bool json) {
     fclose(m);
     fclose(s);
     if (json) printf("{\"status\":\"ok\",\"created\":\"%s\"}\n", name);
-    else printf("created package '%s': %s/phalange.toml, %s/src/lib.ph\n", name, name, name);
+    else printf("created package '%s': %s/axiom.toml, %s/src/lib.ax\n", name, name, name);
     return true;
 }

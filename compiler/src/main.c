@@ -1,7 +1,7 @@
 // main.c - command-line driver.
 //
-//   phalange build <file.ph> [options] -o <out>
-//   phalange check <file.ph> [options]
+//   axiom build <file.ax> [options] -o <out>
+//   axiom check <file.ax> [options]
 //
 // Options:
 //   --target=wasm32|native     (default wasm32; wasm32-freestanding accepted)
@@ -35,10 +35,10 @@ extern char **environ;
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: phalange <build|check|test> [<file.ph> | <package dir>] [options]\n"
-            "       phalange profile [<file.ph> | <package dir>] [--rate=<hz>] [--folded=<path>]\n"
-            "       phalange new <name>      create a package skeleton\n"
-            "       phalange cache [path|clean]   the compiled-module cache\n"
+            "usage: axiom <build|check|test> [<file.ax> | <package dir>] [options]\n"
+            "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>]\n"
+            "       axiom new <name>      create a package skeleton\n"
+            "       axiom cache [path|clean]   the compiled-module cache\n"
             "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
@@ -55,7 +55,7 @@ static bool is_directory(const char *p) {
 }
 
 static const char *find_std(const char *argv0) {
-    const char *env = getenv("PHALANGE_STD");
+    const char *env = getenv("AXIOM_STD");
     if (env && *env) return env;
     char exe[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
@@ -67,9 +67,9 @@ static const char *find_std(const char *argv0) {
     char *slash = strrchr(exe, '/');
     if (slash) *slash = 0;
     static char buf[PATH_MAX + 32];
-    const char *cands[] = {"/../../std", "/../std", "/std", "/../share/phalange/std"};
+    const char *cands[] = {"/../../std", "/../std", "/std", "/../share/axiom/std"};
     for (size_t i = 0; i < sizeof cands / sizeof *cands; i++) {
-        snprintf(buf, sizeof buf, "%s%s/mem.ph", exe, cands[i]);
+        snprintf(buf, sizeof buf, "%s%s/mem.ax", exe, cands[i]);
         if (file_exists(buf)) {
             snprintf(buf, sizeof buf, "%s%s", exe, cands[i]);
             char *r = realpath(buf, NULL);
@@ -110,7 +110,7 @@ static const char *find_tool(const char **names) {
 }
 
 // ---------------------------------------------------------------------------
-// phalange test: run the test binary and report (spec §17).
+// axiom test: run the test binary and report (spec §17).
 // ---------------------------------------------------------------------------
 static int run_capture(char *const argv[], CharVec *out) {
     int fds[2];
@@ -280,7 +280,7 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
         const char *names[] = {"node", NULL};
         const char *node = find_tool(names);
         if (!node) {
-            diag_emit_fatal(json, "E9003", "phalange test needs node to run WebAssembly tests (or use --target=native)");
+            diag_emit_fatal(json, "E9003", "axiom test needs node to run WebAssembly tests (or use --target=native)");
             return 2;
         }
         vec_push(av, (char *)node);
@@ -298,13 +298,13 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
         return 2;
     }
     int passed = 0, failed = 0;
-    if (json) printf("{\"schema\":\"phalange-tests/1\",\"tests\":[");
+    if (json) printf("{\"schema\":\"axiom-tests/1\",\"tests\":[");
     int nres = 0;
     char *line = out.data;
     while (line && *line) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
-        if (strncmp(line, "PHT\t", 4) != 0) {  // stray output
+        if (strncmp(line, "AXT\t", 4) != 0) {  // stray output
             fprintf(stderr, "%s\n", line);
             line = nl ? nl + 1 : NULL;
             continue;
@@ -392,7 +392,7 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
 }
 
 // ---------------------------------------------------------------------------
-// phalange profile: run a program under the sampling profiler (spec §16.6)
+// axiom profile: run a program under the sampling profiler (spec §16.6)
 // and report where its time goes.
 // ---------------------------------------------------------------------------
 typedef struct ProfFn {
@@ -440,7 +440,7 @@ static int spawn_program(char *const argv[], char *const envp[], bool out_to_err
 
 static int run_profile(const char *bin, const char *std_dir, const char *folded_path, int hz, bool json) {
     const char *tmpdir = getenv("TMPDIR");
-    const char *raw = arena_printf("%s/phalange-profile-%d.raw", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid());
+    const char *raw = arena_printf("%s/axiom-profile-%d.raw", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid());
     unlink(raw);
     Vec(char *) av = {0};
     Vec(char *) env = {0};
@@ -449,7 +449,7 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
         const char *names[] = {"node", NULL};
         const char *node = find_tool(names);
         if (!node) {
-            diag_emit_fatal(json, "E9003", "phalange profile needs node to run WebAssembly programs (or use --target=native)");
+            diag_emit_fatal(json, "E9003", "axiom profile needs node to run WebAssembly programs (or use --target=native)");
             return 2;
         }
         vec_push(av, (char *)node);
@@ -457,8 +457,8 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
         vec_push(av, arena_printf("--profile=%s", raw));
         vec_push(av, arena_printf("--profile-hz=%d", hz));
     } else {
-        vec_push(env, arena_printf("PHALANGE_PROFILE=%s", raw));
-        vec_push(env, arena_printf("PHALANGE_PROFILE_HZ=%d", hz));
+        vec_push(env, arena_printf("AXIOM_PROFILE=%s", raw));
+        vec_push(env, arena_printf("AXIOM_PROFILE_HZ=%d", hz));
     }
     vec_push(av, (char *)bin);
     vec_push(av, NULL);
@@ -594,7 +594,7 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
     double n = nsamples ? (double)nsamples : 1.0;
     int nfn = fnv.len < 25 ? fnv.len : 25, nsite = sitev.len < 15 ? sitev.len : 15;
     if (json) {
-        printf("{\"schema\":\"phalange-profile/1\",\"samples\":%ld,\"hz\":%d,\"clock\":", nsamples, hz);
+        printf("{\"schema\":\"axiom-profile/1\",\"samples\":%ld,\"hz\":%d,\"clock\":", nsamples, hz);
         json_str_out(clock);
         printf(",\"seconds\":%.3f,\"dropped\":%ld,\"truncated\":%ld,\"exit_status\":%d,\"folded\":", nsamples / (double)hz,
                dropped, truncated, status);
@@ -647,7 +647,7 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
 
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "cache")) {
-        // phalange cache [path|clean]: the object cache of separate compilation
+        // axiom cache [path|clean]: the object cache of separate compilation
         const char *dir = arena_printf("%s/obj", pkg_cache_dir());
         if (argc >= 3 && !strcmp(argv[2], "clean")) {
             char *rm[] = {"rm", "-rf", (char *)dir, NULL};
@@ -738,10 +738,10 @@ int main(int argc, char **argv) {
     if (!input || is_directory(input)) {
         const char *dir = input ? input : ".";
         char mf[PATH_MAX];
-        snprintf(mf, sizeof mf, "%s/phalange.toml", dir);
+        snprintf(mf, sizeof mf, "%s/axiom.toml", dir);
         if (!file_exists(mf)) {
-            diag_emit_fatal(json, "E9001", input ? arena_printf("'%s' is a directory without a phalange.toml", input)
-                                                 : "no input file (and no phalange.toml in the current directory)");
+            diag_emit_fatal(json, "E9001", input ? arena_printf("'%s' is a directory without a axiom.toml", input)
+                                                 : "no input file (and no axiom.toml in the current directory)");
             return 2;
         }
         Package *pk = pkg_load_dir(dir, NULL);
@@ -770,13 +770,13 @@ int main(int argc, char **argv) {
     }
     types_init();
     const char *std_path = std_dir ? std_dir : find_std(argv[0]);
-    // WebAssembly builds include runtime/rt.ph: software @fma and @rem.
+    // WebAssembly builds include runtime/rt.ax: software @fma and @rem.
     if (g_target.wasm && strcmp(cmd, "check") != 0) {
-        const char *rtp = arena_printf("%s/../runtime/rt.ph", std_path);
+        const char *rtp = arena_printf("%s/../runtime/rt.ax", std_path);
         if (file_exists(rtp)) vec_push(pkg_files, (char *)rtp);
     }
-    // --sanitize=address checks accesses with std/mem.ph's shadow memory
-    if (co.sanitize_address) vec_push(pkg_files, (char *)arena_printf("%s/mem.ph", std_path));
+    // --sanitize=address checks accesses with std/mem.ax's shadow memory
+    if (co.sanitize_address) vec_push(pkg_files, (char *)arena_printf("%s/mem.ax", std_path));
     SemaOptions so = {.std_dir = std_path,
                       .extra_files = (const char *const *)pkg_files.data,
                       .n_extra_files = pkg_files.len};
@@ -811,7 +811,7 @@ int main(int argc, char **argv) {
     char test_bin[PATH_MAX];
     if (profiling) {
         if (!final_link) {
-            diag_emit_fatal(json, "E9001", "phalange profile builds and runs the program; --emit is not supported");
+            diag_emit_fatal(json, "E9001", "axiom profile builds and runs the program; --emit is not supported");
             return 2;
         }
         co.stack_traces = true;  // the profiler samples the shadow stack
@@ -820,7 +820,7 @@ int main(int argc, char **argv) {
             const char *base = strrchr(input, '/');
             base = base ? base + 1 : input;
             size_t n = strlen(base);
-            if (n > 3 && !strcmp(base + n - 3, ".ph")) n -= 3;
+            if (n > 3 && !strcmp(base + n - 3, ".ax")) n -= 3;
             if (out) {  // -o names the folded output too
                 folded_path = out;
             } else {
@@ -828,7 +828,7 @@ int main(int argc, char **argv) {
             }
         }
         const char *tmpdir = getenv("TMPDIR");
-        snprintf(test_bin, sizeof test_bin, "%s/phalange-profile-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
+        snprintf(test_bin, sizeof test_bin, "%s/axiom-profile-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
                  g_target.wasm ? ".wasm" : "");
         out = test_bin;
         if (!g_target.wasm) {
@@ -842,11 +842,11 @@ int main(int argc, char **argv) {
     }
     if (testing) {
         if (!final_link) {
-            diag_emit_fatal(json, "E9001", "phalange test builds and runs a test binary; --emit is not supported");
+            diag_emit_fatal(json, "E9001", "axiom test builds and runs a test binary; --emit is not supported");
             return 2;
         }
         const char *tmpdir = getenv("TMPDIR");
-        snprintf(test_bin, sizeof test_bin, "%s/phalange-test-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
+        snprintf(test_bin, sizeof test_bin, "%s/axiom-test-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
                  g_target.wasm ? ".wasm" : "");
         out = test_bin;
         if (!g_target.wasm) {
@@ -862,13 +862,13 @@ int main(int argc, char **argv) {
         const char *base = strrchr(input, '/');
         base = base ? base + 1 : input;
         size_t n = strlen(base);
-        if (n > 3 && !strcmp(base + n - 3, ".ph")) n -= 3;
+        if (n > 3 && !strcmp(base + n - 3, ".ax")) n -= 3;
         const char *ext = co.emit == EMIT_LLVM ? ".ll" : co.emit == EMIT_ASM ? ".s" : !final_link ? ".o"
                           : g_target.wasm ? ".wasm" : "";
         out = arena_printf("%.*s%s", (int)n, base, ext);
     }
     for (int i = 0; i < g_prog.host_fns.len; i++)
-        if (!strcmp(g_prog.host_fns.data[i]->name, "ph_thread_spawn")) g_threads = true;
+        if (!strcmp(g_prog.host_fns.data[i]->name, "ax_thread_spawn")) g_threads = true;
     // The wasm profiler reads the shadow stack from another thread, so the
     // program runs on a shared memory.
     if (profiling && g_target.wasm) g_threads = true;
@@ -896,7 +896,7 @@ int main(int argc, char **argv) {
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         if (verbose)
-            fprintf(stderr, "phalange: %d modules, %d compiled, %d cached (%.0f ms)\n", us.total, us.compiled,
+            fprintf(stderr, "axiom: %d modules, %d compiled, %d cached (%.0f ms)\n", us.total, us.compiled,
                     us.total - us.compiled, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
         for (int i = 0; i < objs.len; i++) vec_push(link_inputs, objs.data[i]);
     } else if (!codegen_program(&co)) {

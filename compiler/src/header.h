@@ -1,6 +1,6 @@
 // header.h - C header generation for exported functions.
-#ifndef PH_HEADER_H
-#define PH_HEADER_H
+#ifndef AX_HEADER_H
+#define AX_HEADER_H
 
 #include "sema.h"
 

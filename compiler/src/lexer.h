@@ -1,6 +1,6 @@
 // lexer.h - tokens and tokenizer.
-#ifndef PH_LEXER_H
-#define PH_LEXER_H
+#ifndef AX_LEXER_H
+#define AX_LEXER_H
 
 #include "util.h"
 

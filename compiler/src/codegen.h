@@ -1,6 +1,6 @@
 // codegen.h - LLVM backend.
-#ifndef PH_CODEGEN_H
-#define PH_CODEGEN_H
+#ifndef AX_CODEGEN_H
+#define AX_CODEGEN_H
 
 #include "sema.h"
 
@@ -21,7 +21,7 @@ typedef struct CgOptions {
     EmitKind emit;
     const char *out_path;    // file to write
     bool stack_traces;       // shadow stack for traces and profiles (--stack-traces=on, default)
-    bool profile;            // phalange profile: the shadow stack is sampled concurrently
+    bool profile;            // axiom profile: the shadow stack is sampled concurrently
     bool sanitize_address;   // --sanitize=address: heap accesses are checked (spec §16.8)
     CgUnit unit;
     Module *module;          // CG_MODULE
@@ -46,7 +46,7 @@ extern SymVec g_link_libs;
 // Set before codegen: the program spawns threads (wasm: shared memory and a
 // thread entry export).
 extern bool g_threads;
-// Build a test binary (phalange test): tests become roots and are exported.
+// Build a test binary (axiom test): tests become roots and are exported.
 extern bool g_test_mode;
 // Set by codegen: the output calls into runtime/native_host.c.
 extern bool g_needs_native_runtime;

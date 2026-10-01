@@ -83,11 +83,11 @@ static Module *load_module(const char *fs_path, Span *from) {
         if (strncmp(ip, "pkg:", 4) == 0) {
             if (!pkg_resolve_import(m->pkg, ip, d->import_path_span, path, sizeof path)) continue;
         } else if (strncmp(ip, "std/", 4) == 0) {
-            snprintf(path, sizeof path, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ph");
+            snprintf(path, sizeof path, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ax");
         } else if (ip[0] == '/') {
-            snprintf(path, sizeof path, "%s%s", ip, has_ext(ip) ? "" : ".ph");
+            snprintf(path, sizeof path, "%s%s", ip, has_ext(ip) ? "" : ".ax");
         } else {
-            snprintf(path, sizeof path, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ph");
+            snprintf(path, sizeof path, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ax");
         }
         d->imported = load_module(path, &d->import_path_span);
     }

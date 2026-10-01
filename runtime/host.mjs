@@ -1,4 +1,4 @@
-// runtime/host.mjs - the Phalange host ABI (import module "phalange") for
+// runtime/host.mjs - the Axiom host ABI (import module "axiom") for
 // WebAssembly under node, plus a runner:
 //
 //   node runtime/host.mjs program.wasm [export] [-- args...]
@@ -31,7 +31,7 @@ export function trapCodeName(n) { return 'T' + String(n).padStart(4, '0'); }
 export function describeTrap(instance, memory, err) {
   const msg = String(err && err.message || err);
   let t = null;
-  const info = instance && instance.exports.phalange_trap_info;
+  const info = instance && instance.exports.axiom_trap_info;
   if (info && memory) {
     const dv = new DataView(memory.buffer);
     const base = Number(info());
@@ -62,7 +62,7 @@ export function describeTrap(instance, memory, err) {
 // Site records (see codegen: site_record_ex):
 //   {u32 code, file_id, start, end, line, col; ptr file, text, fn, callee}
 function reader(instance, memory) {
-  const wide = !!(instance && instance.exports.phalange_wasm64);
+  const wide = !!(instance && instance.exports.axiom_wasm64);
   const P = wide ? 8 : 4;
   const dv = new DataView(memory.buffer);
   const u = new Uint8Array(memory.buffer);
@@ -92,7 +92,7 @@ export const SS_CAP = 256, ET_CAP = 32;
 // The calling thread's shadow stack (spec §16.4): {depth, calls (innermost
 // first), errors (oldest first)}, or null if the program has none.
 export function readStack(instance, memory) {
-  const f = instance && instance.exports.phalange_shadow_stack;
+  const f = instance && instance.exports.axiom_shadow_stack;
   if (!f || !memory) return null;
   const base = Number(f());
   if (!base) return null;
@@ -148,7 +148,7 @@ export function formatErrorTrace(st, indent = '  ') {
 
 // A full crash report: message, location and stack.
 export function formatTrap(t, where = '') {
-  let s = `phalange: ${trapMessage(t)}${where}${t.file ? ` at ${t.file}:${t.line}:${t.col}` : ''}`;
+  let s = `axiom: ${trapMessage(t)}${where}${t.file ? ` at ${t.file}:${t.line}:${t.col}` : ''}`;
   const frames = stackFrames(t, t.stack);
   if (frames.length) s += '\nstack trace (innermost first):\n' + formatFrames(frames);
   return s;
@@ -160,7 +160,7 @@ function formatValues(kind, dv, base, memory, instance) {
   const f64 = (x) => { const d = new DataView(new ArrayBuffer(8)); d.setBigUint64(0, x, true); return String(d.getFloat64(0, true)); };
   const bytes = (p, n) => JSON.stringify(Buffer.from(new Uint8Array(memory.buffer, Number(p), Math.min(n, 200))).toString('utf8'));
   const errName = (x) => {
-    const f = instance.exports.phalange_error_name;
+    const f = instance.exports.axiom_error_name;
     if (!f) return `error #${x}`;
     const p = f(Number(x)) >>> 0;
     const u = new Uint8Array(memory.buffer);
@@ -179,7 +179,7 @@ function formatValues(kind, dv, base, memory, instance) {
   }
 }
 
-// Frames in the PHT protocol of `phalange test` (see test_main.c: encode_stack).
+// Frames in the AXT protocol of `axiom test` (see test_main.c: encode_stack).
 export function encodeFrames(frames, kindOfFirst) {
   return frames.map((f, i) => {
     if (f.repeat) return `R\x1f${f.repeat}\x1f0\x1f0\x1f`;
@@ -307,7 +307,7 @@ class SharedPositions {
   }
 }
 
-// An address record (see runtime/native.ph) as node's host and port.
+// An address record (see runtime/native.ax) as node's host and port.
 function addrOf(r) {
   const port = (r[2] << 8) | r[3];
   if (r[0] === 4) return { host: `${r[4]}.${r[5]}.${r[6]}.${r[7]}`, port, family: 4 };
@@ -334,7 +334,7 @@ export function createHost(opts = {}) {
   const programArgs = shared.args;
   const pos = new SharedPositions(shared.pos);
   const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, ELOOP: -40 })[e && e.code] || -1;
-  // Directory handles (see ph_dir_open). Node has no openat, so these hold
+  // Directory handles (see ax_dir_open). Node has no openat, so these hold
   // paths: a symbolic link swapped in between lstat and use is followed.
   const dirs = new Map();
   let nextDir = 1;
@@ -356,8 +356,8 @@ export function createHost(opts = {}) {
       return fsErr(e);
     }
   };
-  const phalange = {
-    ph_write(fd, p, n) {
+  const axiom = {
+    ax_write(fd, p, n) {
       try {
         if (!pos.has(fd)) return writeFd(fd, bytes(p, n).slice());
         const at = pos.get(fd);
@@ -366,7 +366,7 @@ export function createHost(opts = {}) {
         return w;
       } catch { return -1; }
     },
-    ph_read(fd, p, n) {
+    ax_read(fd, p, n) {
       try {
         const buf = Buffer.alloc(Math.min(n >>> 0, READ_CHUNK));
         const at = pos.has(fd) ? pos.get(fd) : -1;
@@ -378,7 +378,7 @@ export function createHost(opts = {}) {
         return e.code === 'EOF' ? 0 : -1;
       }
     },
-    ph_open(p, n, flags) {
+    ax_open(p, n, flags) {
       try {
         const fd = fs.openSync(str(p, n), ['r', 'w', 'a', 'r+'][flags] || 'r');
         pos.set(fd, flags === 2 ? -1 : 0);  // appends go to the end
@@ -387,11 +387,11 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_close(fd) {
+    ax_close(fd) {
       pos.delete(fd);
       try { fs.closeSync(fd); } catch { /* ignore */ }
     },
-    ph_seek(fd, off, whence) {
+    ax_seek(fd, off, whence) {
       if (!pos.has(fd)) return -1n;
       try {
         let base = 0;
@@ -405,7 +405,7 @@ export function createHost(opts = {}) {
         return BigInt(fsErr(e));
       }
     },
-    ph_stat(p, n, follow, out) {
+    ax_stat(p, n, follow, out) {
       try {
         const path = str(p, n);
         const st = follow ? fs.statSync(path, { bigint: true }) : fs.lstatSync(path, { bigint: true });
@@ -421,10 +421,10 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_mkdir(p, n, mode) {
+    ax_mkdir(p, n, mode) {
       try { fs.mkdirSync(str(p, n), { mode: mode & 0o7777 }); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_remove(p, n, dir) {
+    ax_remove(p, n, dir) {
       try {
         if (dir) fs.rmdirSync(str(p, n));
         else fs.unlinkSync(str(p, n));
@@ -433,11 +433,11 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_rename(a, an, b, bn) {
+    ax_rename(a, an, b, bn) {
       try { fs.renameSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_readdir(p, n, out, cap) { return readdirPath(str(p, n), out, cap); },
-    ph_dir_open(d, p, n) {
+    ax_readdir(p, n, out, cap) { return readdirPath(str(p, n), out, cap); },
+    ax_dir_open(d, p, n) {
       try {
         if (d >= 0 && !dirs.has(d)) return -1;
         const full = dirPath(d, str(p, n));
@@ -451,11 +451,11 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_dir_read(d, out, cap) {
+    ax_dir_read(d, out, cap) {
       if (!dirs.has(d)) return -1;
       return readdirPath(dirs.get(d), out, cap);
     },
-    ph_dir_remove(d, p, n, dir) {
+    ax_dir_remove(d, p, n, dir) {
       try {
         if (d >= 0 && !dirs.has(d)) return -1;
         const full = dirPath(d, str(p, n));
@@ -466,59 +466,59 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_dir_close(d) { dirs.delete(d); },
-    ph_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
-    ph_argc: () => programArgs.length,
-    ph_arg(i, p, cap) {
+    ax_dir_close(d) { dirs.delete(d); },
+    ax_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
+    ax_argc: () => programArgs.length,
+    ax_arg(i, p, cap) {
       if (i < 0 || i >= programArgs.length) return -1;
       return give(Buffer.from(programArgs[i], 'utf8'), p, cap);
     },
-    ph_getenv(p, n, out, cap) {
+    ax_getenv(p, n, out, cap) {
       const v = process.env[str(p, n)];
       if (v === undefined) return -2;
       return give(Buffer.from(v, 'utf8'), out, cap);
     },
-    ph_exit(code) { process.exit(code); },
-    ph_tcp_connect: (p, n, port) => net().call('connect', { host: str(p, n), port }),
-    ph_tcp_listen: (p, n, port) => net().call('listen', { host: str(p, n), port }),
-    ph_tcp_accept: (h) => net().call('accept', { h }),
-    ph_tcp_local_port: (h) => net().call('local_port', { h }),
-    ph_sock_read(h, p, n) {
+    ax_exit(code) { process.exit(code); },
+    ax_tcp_connect: (p, n, port) => net().call('connect', { host: str(p, n), port }),
+    ax_tcp_listen: (p, n, port) => net().call('listen', { host: str(p, n), port }),
+    ax_tcp_accept: (h) => net().call('accept', { h }),
+    ax_tcp_local_port: (h) => net().call('local_port', { h }),
+    ax_sock_read(h, p, n) {
       const c = net();
       const got = c.call('read', { h, n: Math.min(n >>> 0, READ_CHUNK) });
       if (got > 0) bytes(p, got).set(c.data.subarray(0, got));
       return got;
     },
-    ph_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
-    ph_sock_close: (h) => { net().call('close', { h }); },
-    ph_sock_timeout: (h, ms) => net().call('timeout', { h, ms: ms >>> 0 }),
+    ax_sock_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
+    ax_sock_close: (h) => { net().call('close', { h }); },
+    ax_sock_timeout: (h, ms) => net().call('timeout', { h, ms: ms >>> 0 }),
     // Processes and the environment. process.env and the directory are the
     // calling thread's (node gives each worker its own copy of the
     // environment, and only the main thread may change directory). Signals
     // are not supported: node delivers them only to the main thread's event
     // loop, which a running program does not return to.
-    ph_getpid: () => process.pid,
-    ph_chdir(p, n) {
+    ax_getpid: () => process.pid,
+    ax_chdir(p, n) {
       try { process.chdir(str(p, n)); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_setenv(k, kn, v, vn) {
+    ax_setenv(k, kn, v, vn) {
       const name = str(k, kn), value = str(v, vn);
       if (!name || name.includes('=') || name.includes('\0') || value.includes('\0')) return -1;
       process.env[name] = value;
       return 0;
     },
-    ph_unsetenv(k, kn) {
+    ax_unsetenv(k, kn) {
       const name = str(k, kn);
       if (!name || name.includes('=') || name.includes('\0')) return -1;
       delete process.env[name];
       return 0;
     },
-    ph_environ(p, cap) {
+    ax_environ(p, cap) {
       const b = Buffer.from(Object.entries(process.env).map(([k, v]) => `${k}=${v}\0`).join(''));
       if (b.length <= cap >>> 0) bytes(p, b.length).set(b);
       return b.length;
     },
-    ph_proc_spawn(p, n, stdio) {
+    ax_proc_spawn(p, n, stdio) {
       // argv and the environment (0-terminated strings, each list ending in
       // an empty one), then the directory
       const b = Buffer.from(bytes(p, n));
@@ -549,52 +549,52 @@ export function createHost(opts = {}) {
       for (let k = 0; k < 3; k++) view[k] = h >= 0 ? got[k] : -1;
       return h;
     },
-    ph_proc_wait(h, block, status) {
+    ax_proc_wait(h, block, status) {
       const c = net();
       const r = c.call('wait', { h, block });
       if (r > 0) new Int32Array(memory.buffer, status >>> 0, 1)[0] = new Int32Array(c.data.buffer, 0, 1)[0];
       return r;
     },
-    ph_proc_kill: (h, sig) => net().call('kill', { h, sig }),
-    ph_pipe_read(h, p, n) {
+    ax_proc_kill: (h, sig) => net().call('kill', { h, sig }),
+    ax_pipe_read(h, p, n) {
       const c = net();
       const got = c.call('read', { h, n: Math.min(n >>> 0, READ_CHUNK) });
       if (got > 0) bytes(p, got).set(c.data.subarray(0, got));
       return got;
     },
-    ph_pipe_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
-    ph_pipe_close: (h) => { net().call('close', { h }); },
-    ph_signal: () => -2,  // unsupported
+    ax_pipe_write: (h, p, n) => net().call('write', { h }, bytes(p, n).slice()),
+    ax_pipe_close: (h) => { net().call('close', { h }); },
+    ax_signal: () => -2,  // unsupported
     // Addresses, IPv6, UDP, Unix sockets and polling (on the net worker).
-    ph_resolve(p, n, out, max) {
+    ax_resolve(p, n, out, max) {
       const c = net();
       const k = c.call('resolve', { name: str(p, n), max: Math.min(max >>> 0, READ_CHUNK / 24) });
       if (k > 0) bytes(out, 24 * k).set(c.data.subarray(0, 24 * k));
       return k;
     },
-    ph_tcp_connect_addr(r) {
+    ax_tcp_connect_addr(r) {
       const a = addrOf(bytes(r, 24));
       return a ? net().call('connect_addr', a) : -4;
     },
-    ph_tcp_listen_addr(r) {
+    ax_tcp_listen_addr(r) {
       const a = addrOf(bytes(r, 24));
       return a ? net().call('listen_addr', a) : -4;
     },
-    ph_sock_addr(h, peer, out) {
+    ax_sock_addr(h, peer, out) {
       const c = net();
       const r = c.call('sock_addr', { h, peer });
       if (r === 0) bytes(out, 24).set(c.data.subarray(0, 24));
       return r;
     },
-    ph_udp_open(r) {
+    ax_udp_open(r) {
       const a = addrOf(bytes(r, 24));
       return a ? net().call('udp_open', a) : -4;
     },
-    ph_udp_send(h, p, n, r) {
+    ax_udp_send(h, p, n, r) {
       const a = addrOf(bytes(r, 24));
       return a ? net().call('udp_send', { h, host: a.host, port: a.port }, bytes(p, n).slice()) : -4;
     },
-    ph_udp_recv(h, p, n, from) {
+    ax_udp_recv(h, p, n, from) {
       const c = net();
       const k = c.call('udp_recv', { h, n: Math.min(n >>> 0, READ_CHUNK - 24) });
       if (k >= 0) {
@@ -603,9 +603,9 @@ export function createHost(opts = {}) {
       }
       return k;
     },
-    ph_unix_connect: (p, n) => net().call('unix_connect', { path: str(p, n) }),
-    ph_unix_listen: (p, n) => net().call('listen_addr', { path: str(p, n) }),
-    ph_poll(ep, n, timeout) {
+    ax_unix_connect: (p, n) => net().call('unix_connect', { path: str(p, n) }),
+    ax_unix_listen: (p, n) => net().call('listen_addr', { path: str(p, n) }),
+    ax_poll(ep, n, timeout) {
       const view = new DataView(memory.buffer, ep >>> 0, 8 * n);
       const entries = [];
       for (let k = 0; k < n; k++) entries.push({ h: view.getInt32(8 * k, true), events: view.getUint16(8 * k + 4, true) });
@@ -618,18 +618,18 @@ export function createHost(opts = {}) {
       return r;
     },
     // More of the file system. Node has no flock and cannot map files into
-    // the program's memory: ph_flock reports -95 (not supported) and ph_mmap
+    // the program's memory: ax_flock reports -95 (not supported) and ax_mmap
     // 0, for std/os/fs to fall back on. Watching runs on the net worker.
-    ph_chmod(p, n, mode) {
+    ax_chmod(p, n, mode) {
       try { fs.chmodSync(str(p, n), mode & 0o7777); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_symlink(t, tn, l, ln) {
+    ax_symlink(t, tn, l, ln) {
       try { fs.symlinkSync(str(t, tn), str(l, ln)); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_link(a, an, b, bn) {
+    ax_link(a, an, b, bn) {
       try { fs.linkSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_readlink(p, n, buf, cap) {
+    ax_readlink(p, n, buf, cap) {
       try {
         const b = fs.readlinkSync(str(p, n), { encoding: 'buffer' });
         if (b.length <= cap >>> 0) bytes(buf, b.length).set(b);
@@ -638,33 +638,33 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ph_utimes(p, n, atime, mtime) {
+    ax_utimes(p, n, atime, mtime) {
       try { fs.utimesSync(str(p, n), Number(atime) / 1e9, Number(mtime) / 1e9); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_ftruncate(fd, size) {
+    ax_ftruncate(fd, size) {
       try { fs.ftruncateSync(fd, Number(size)); return 0; } catch (e) { return fsErr(e); }
     },
-    ph_fsync(fd) {
+    ax_fsync(fd) {
       try { fs.fsyncSync(fd); return 0; } catch { return -1; }
     },
-    ph_flock: () => -95,
-    ph_mmap: () => 0,
-    ph_munmap: () => -1,
-    ph_msync: () => -1,
-    ph_watch_open: () => net().call('watch_open', {}),
-    ph_watch_add: (h, p, n) => net().call('watch_add', { h, path: str(p, n) }),
-    ph_watch_remove: (h, wd) => net().call('watch_remove', { h, wd }),
-    ph_watch_read(h, buf, cap, timeout) {
+    ax_flock: () => -95,
+    ax_mmap: () => 0,
+    ax_munmap: () => -1,
+    ax_msync: () => -1,
+    ax_watch_open: () => net().call('watch_open', {}),
+    ax_watch_add: (h, p, n) => net().call('watch_add', { h, path: str(p, n) }),
+    ax_watch_remove: (h, wd) => net().call('watch_remove', { h, wd }),
+    ax_watch_read(h, buf, cap, timeout) {
       const c = net();
       const got = c.call('watch_read', { h, n: Math.min(cap >>> 0, READ_CHUNK), timeout });
       if (got > 0) bytes(buf, got).set(c.data.subarray(0, got));
       return got;
     },
-    ph_watch_close: (h) => { net().call('close', { h }); },
+    ax_watch_close: (h) => { net().call('close', { h }); },
     // Terminals: the size of stdout's and stderr's, raw mode for stdin (on
     // the main thread only).
-    ph_isatty: (fd) => (tty.isatty(fd) ? 1 : 0),
-    ph_term_size(fd, out) {
+    ax_isatty: (fd) => (tty.isatty(fd) ? 1 : 0),
+    ax_term_size(fd, out) {
       const s = fd === 1 ? process.stdout : fd === 2 ? process.stderr : null;
       if (!s || !s.isTTY || !s.getWindowSize) return -1;
       const [cols, rows] = s.getWindowSize();
@@ -673,12 +673,12 @@ export function createHost(opts = {}) {
       o[1] = rows;
       return 0;
     },
-    ph_term_raw(fd, enable) {
+    ax_term_raw(fd, enable) {
       if (fd !== 0 || !process.stdin.isTTY || !process.stdin.setRawMode) return -1;
       try { process.stdin.setRawMode(enable !== 0); return 0; } catch { return -1; }
     },
-    ph_signal_take: () => -1n,
-    ph_thread_spawn(entry, arg, stackTop, exited) {
+    ax_signal_take: () => -1n,
+    ax_thread_spawn(entry, arg, stackTop, exited) {
       // The new thread shares this program's sockets.
       const netPort = net().newPort();
       const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
@@ -687,20 +687,20 @@ export function createHost(opts = {}) {
       });
       // A trap in any thread terminates the whole program (spec §12.8).
       w.on('error', (e) => {
-        process.stderr.write(`phalange: trap in thread: ${e.message}\n`);
+        process.stderr.write(`axiom: trap in thread: ${e.message}\n`);
         process.exit(134);
       });
       w.unref();
       return nextThread++;
     },
-    ph_thread_stack_size: () => THREAD_STACK,
-    ph_cpu_count: () => (os.availableParallelism ? os.availableParallelism() : os.cpus().length),
-    ph_sleep_ns(ns) {
+    ax_thread_stack_size: () => THREAD_STACK,
+    ax_cpu_count: () => (os.availableParallelism ? os.availableParallelism() : os.cpus().length),
+    ax_sleep_ns(ns) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ns) / 1e6);
     },
     // Cryptographically secure random bytes (at most 64 KiB per call to
     // getRandomValues, which cannot fill shared memory directly).
-    ph_random(p, n) {
+    ax_random(p, n) {
       const out = bytes(p, n);
       for (let at = 0; at < out.length; at += 65536) {
         const chunk = new Uint8Array(Math.min(65536, out.length - at));
@@ -710,13 +710,13 @@ export function createHost(opts = {}) {
       return 0;
     },
     // Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
-    ph_clock_ns(clock) {
+    ax_clock_ns(clock) {
       if (clock === 1) return process.hrtime.bigint();
       return BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000)) * 1000n;  // microseconds
     },
   };
   const host = {
-    imports: { phalange },
+    imports: { axiom },
     setMemory(m) { memory = m; },
     memory() { return memory; },
     close() { if (netClient) netClient.close(); },
@@ -729,7 +729,7 @@ export function createHost(opts = {}) {
       for (const imp of WebAssembly.Module.imports(mod)) {
         imports[imp.module] ||= {};
         let v;
-        if (imp.module === 'phalange' && phalange[imp.name]) v = phalange[imp.name];
+        if (imp.module === 'axiom' && axiom[imp.name]) v = axiom[imp.name];
         else if (imp.kind === 'memory') v = memory;
         else if (extra[imp.module] && extra[imp.module][imp.name] !== undefined) v = extra[imp.module][imp.name];
         else if (imp.kind === 'function') v = () => { throw new Error(`host import ${imp.module}.${imp.name} is not available`); };
@@ -751,14 +751,14 @@ export function createHost(opts = {}) {
 }
 
 // Sampling profiler (spec §16.6): a worker samples the main thread's shadow
-// stack; the result is written in the raw format read by `phalange profile`
+// stack; the result is written in the raw format read by `axiom profile`
 // (see runtime/profile.c).
 function startProfiler(instance, memory, hz) {
-  if (!(memory.buffer instanceof SharedArrayBuffer)) throw new Error('--profile needs a program built by phalange profile (shared memory)');
+  if (!(memory.buffer instanceof SharedArrayBuffer)) throw new Error('--profile needs a program built by axiom profile (shared memory)');
   const control = new SharedArrayBuffer(8);
-  const ss = Number(instance.exports.phalange_shadow_stack());
+  const ss = Number(instance.exports.axiom_shadow_stack());
   const w = new Worker(new URL('./profile_worker.mjs', import.meta.url),
-    { workerData: { memory, ss, wide: !!instance.exports.phalange_wasm64, hz, control } });
+    { workerData: { memory, ss, wide: !!instance.exports.axiom_wasm64, hz, control } });
   let ready;
   const started = new Promise((resolve) => { ready = resolve; });
   const result = new Promise((resolve, reject) => {
@@ -774,7 +774,7 @@ function startProfiler(instance, memory, hz) {
       Atomics.notify(ctl, 1);
       const samples = await result;
       await w.terminate();
-      let text = `# phalange-profile-raw 1\nhz ${hz}\nclock wall\n`;
+      let text = `# axiom-profile-raw 1\nhz ${hz}\nclock wall\n`;
       const cache = new Map();
       const site = (a) => {
         if (!cache.has(a)) {
@@ -812,7 +812,7 @@ async function main() {
   const name = entry || (instance.exports.main ? 'main' : 'run');
   const fn = instance.exports[name];
   if (typeof fn !== 'function') {
-    console.error(`phalange: no export named '${entry || 'main'}'`);
+    console.error(`axiom: no export named '${entry || 'main'}'`);
     process.exit(2);
   }
   const profiler = profile ? startProfiler(instance, host.memory(), hz) : null;

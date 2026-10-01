@@ -1,0 +1,1443 @@
+// =============================================================================
+// std/net/url.ax - URLs (RFC 3986): parsing, serializing, normalizing,
+// resolving references, percent-encoding and query strings.
+//
+//     let u = url.parse("https://user@Example.COM:8443/a/b?x=1&y=two%20words#top")!;
+//     // u.scheme "https", u.hostname "Example.COM", u.port "8443", u.path "/a/b",
+//     // u.query "x=1&y=two%20words", u.fragment "top"; u.port_number() 8443
+//     let abs = url.join("http://a/b/c/d;p?q", "../g")!;      // "http://a/b/g" (mem.free)
+//     let n = url.normalize("HTTP://Example.com:80/a/./b/../%7e")!;  // "http://example.com/a/~"
+//
+//     let mut it = url.query(u.query);                        // raw pairs
+//     loop {
+//         let p = it.next() catch break;
+//         let v = url.percent_decode(p.value, buf[..], true)!;   // '+' is a space
+//     }
+//     let mut q = url.query_writer(s.writer());               // "q=a+b&lang=fr"
+//     q.add("q", "a b")!;
+//     q.add("lang", "fr")!;
+//
+// parse splits a URI or a relative reference into its components without
+// copying or decoding anything: a Url's fields are slices of the text it was
+// parsed from (or of whatever its maker points them at). Functions that make
+// a new URL write it to an io.Writer (resolve_to, normalize_to, Url.write_to)
+// or return it in new memory (resolve, join, normalize, Url.to_string).
+//
+// The syntax is RFC 3986's, with some of the WHATWG URL Standard's
+// leniencies: the path, query and fragment may hold any bytes but spaces
+// and control characters (such as '"', '{' or UTF-8, which normalize
+// percent-encodes), and a '%' without two hex digits after it (which
+// normalize writes as "%25"). The host must be an RFC 3986 reg-name (a name
+// or IPv4 address; xn-- punycode labels pass through, but there is no IDNA
+// processing) or an IP literal ("[2001:db8::1]", checked). For the special
+// schemes http, https, ws and wss (compared ignoring case, like all
+// schemes) an authority must have a host, and normalize drops their default
+// ports (80, 443, 80, 443; also 21 for ftp) and gives an empty path as "/".
+// Backslashes are not read as slashes, and tabs and newlines are not
+// removed, as the WHATWG parser does: such URLs fail with InvalidUrl.
+//
+// Resolution is RFC 3986 §5.2's strict algorithm ("http:g" against an http
+// base is "http:g"); normalization is §6.2.2's syntax-based normalization
+// (case, percent-encoding, dot segments) plus the scheme-based rules above,
+// and IPv6 addresses in the RFC 5952 form.
+//
+// Checked against RFC 3986 §5.4's examples and Python's urllib.parse
+// (urlsplit, urljoin, quote, unquote, parse_qsl, urlencode;
+// tools/gen_url_tests.py, std/net/url/testdata).
+// =============================================================================
+
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+
+error { InvalidUrl, InvalidEscape, NotAbsolute, NotFound, Done, OutOfMemory }
+
+let HEX: []u8 = "0123456789ABCDEF";
+
+/// The components of a URI or relative reference (RFC 3986 §3), still
+/// percent-encoded. A component that is absent has its `has_` flag false
+/// (and is ""), which is not the same as present and empty: "http://h/?"
+/// has an empty query, "http://h/" none.
+pub struct Url {
+    scheme: []u8,    // "" for a relative reference; as written (see scheme_is)
+    userinfo: []u8,  // before the '@' in the authority
+    hostname: []u8,  // a name, an IPv4 address, or an IP literal without its brackets
+    port: []u8,      // the digits after the ':' (which may be none)
+    path: []u8,
+    query: []u8,     // after the '?'
+    fragment: []u8,  // after the '#'
+    has_authority: bool,
+    has_userinfo: bool,
+    ip_literal: bool,  // the host is in brackets: an IPv6 address or an IPvFuture
+    has_port: bool,
+    has_query: bool,
+    has_fragment: bool,
+
+    /// An empty relative reference (all components absent), for building
+    /// a Url field by field.
+    pub fn empty() Url {
+        return Url.{
+            scheme: "",
+            userinfo: "",
+            hostname: "",
+            port: "",
+            path: "",
+            query: "",
+            fragment: "",
+            has_authority: false,
+            has_userinfo: false,
+            ip_literal: false,
+            has_port: false,
+            has_query: false,
+            has_fragment: false,
+        };
+    }
+
+    /// Whether this is an absolute URI (it has a scheme) rather than a
+    /// relative reference.
+    pub fn is_absolute(self: Url) bool {
+        return self.scheme.len > 0;
+    }
+
+    /// Whether the scheme is `name` (given in lowercase), ignoring case.
+    pub fn scheme_is(self: Url, name: []u8) bool {
+        return strs.eq_ignore_case(self.scheme, name);
+    }
+
+    /// Whether the scheme is http, https, ws or wss.
+    pub fn is_special(self: Url) bool {
+        return is_special_scheme(self.scheme);
+    }
+
+    /// The user name: the userinfo up to any ':' ("" if there is none).
+    pub fn username(self: Url) []u8 {
+        let c = strs.index_of_byte(self.userinfo, ':') catch self.userinfo.len;
+        return self.userinfo[..c];
+    }
+
+    /// The password: the userinfo after its first ':'; NotFound if there is
+    /// no ':'. (RFC 3986 deprecates passwords in URLs.)
+    pub fn password(self: Url) ![]u8 {
+        let c = strs.index_of_byte(self.userinfo, ':') catch return error.NotFound;
+        return self.userinfo[c + 1..];
+    }
+
+    /// Whether the host is an IPv6 address ("[...]").
+    pub fn is_ipv6(self: Url) bool {
+        return self.ip_literal and (self.hostname.len > 0) and (lower(self.hostname[0]) != 'v');
+    }
+
+    /// The port given in the URL; NotFound if there is none (or it is empty).
+    pub fn port_number(self: Url) !u16 {
+        if not self.has_port or (self.port.len == 0) {
+            return error.NotFound;
+        }
+        return parse_port(self.port) catch return error.NotFound;
+    }
+
+    /// The port given in the URL, else the scheme's default; NotFound if
+    /// neither.
+    pub fn effective_port(self: Url) !u16 {
+        return self.port_number() catch return default_port(self.scheme);
+    }
+
+    /// Writes the URL (RFC 3986 §5.3). A path that would be read as an
+    /// authority (no authority, and a path starting "//") is written with
+    /// "/." in front, as the WHATWG standard does.
+    pub fn write_to(self: Url, w: io.Writer) !void {
+        if self.scheme.len > 0 {
+            w.write_all(self.scheme)!;
+            w.write_all(":")!;
+        }
+        if self.has_authority {
+            w.write_all("//")!;
+            if self.has_userinfo {
+                w.write_all(self.userinfo)!;
+                w.write_all("@")!;
+            }
+            if self.ip_literal {
+                w.write_all("[")!;
+                w.write_all(self.hostname)!;
+                w.write_all("]")!;
+            } else {
+                w.write_all(self.hostname)!;
+            }
+            if self.has_port {
+                w.write_all(":")!;
+                w.write_all(self.port)!;
+            }
+        } else if strs.starts_with(self.path, "//") {
+            w.write_all("/.")!;
+        }
+        w.write_all(self.path)!;
+        if self.has_query {
+            w.write_all("?")!;
+            w.write_all(self.query)!;
+        }
+        if self.has_fragment {
+            w.write_all("#")!;
+            w.write_all(self.fragment)!;
+        }
+    }
+
+    /// The URL as text in new memory (free it with mem.free).
+    pub fn to_string(self: Url) ![]mut u8 {
+        let mut s = strs.String.init();
+        self.write_to(s.writer()) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+}
+
+fn is_special_scheme(s: []u8) bool {
+    return strs.eq_ignore_case(s, "http") or strs.eq_ignore_case(s, "https") or strs.eq_ignore_case(s, "ws") or
+           strs.eq_ignore_case(s, "wss");
+}
+
+/// The default port of a scheme (ignoring case): http and ws 80, https and
+/// wss 443, ftp 21; NotFound for any other.
+pub fn default_port(scheme: []u8) !u16 {
+    if strs.eq_ignore_case(scheme, "http") or strs.eq_ignore_case(scheme, "ws") {
+        return 80;
+    }
+    if strs.eq_ignore_case(scheme, "https") or strs.eq_ignore_case(scheme, "wss") {
+        return 443;
+    }
+    if strs.eq_ignore_case(scheme, "ftp") {
+        return 21;
+    }
+    return error.NotFound;
+}
+
+// -----------------------------------------------------------------------------
+// Characters
+// -----------------------------------------------------------------------------
+
+fn lower(c: u8) u8 {
+    if (c >= 'A') and (c <= 'Z') {
+        return c + 32;
+    }
+    return c;
+}
+
+fn is_alpha(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'));
+}
+
+fn is_digit(c: u8) bool {
+    return (c >= '0') and (c <= '9');
+}
+
+fn hex_value(c: u8) u32 {
+    if is_digit(c) {
+        return @as(u32, c - '0');
+    }
+    let l = c | 0x20;
+    if (l >= 'a') and (l <= 'f') {
+        return @as(u32, l - 'a') + 10;
+    }
+    return 16;
+}
+
+fn is_unreserved(c: u8) bool {
+    return is_alpha(c) or is_digit(c) or (c == '-') or (c == '.') or (c == '_') or (c == '~');
+}
+
+fn is_sub_delim(c: u8) bool {
+    return (c == '!') or (c == '$') or (c == '&') or (c == '\'') or (c == '(') or (c == ')') or (c == '*') or
+           (c == '+') or (c == ',') or (c == ';') or (c == '=');
+}
+
+/// What a string is to be percent-encoded for: each component leaves its
+/// own characters (RFC 3986 §3) alone besides the unreserved ones (letters,
+/// digits and -._~), and encodes everything else, '%' included.
+pub enum Component: u8 {
+    COMPONENT,     // only unreserved characters left (like JavaScript's encodeURIComponent)
+    USERINFO,      // also sub-delims and ':'
+    HOST,          // also sub-delims (a reg-name)
+    PATH_SEGMENT,  // pchar: sub-delims, ':' and '@'
+    PATH,          // pchar and '/'
+    QUERY,         // pchar, '/' and '?'
+    FRAGMENT,      // as QUERY
+}
+
+fn allowed(c: u8, comp: Component) bool {
+    if is_unreserved(c) {
+        return true;
+    }
+    match comp {
+        .COMPONENT    => { return false; }
+        .HOST         => { return is_sub_delim(c); }
+        .USERINFO     => { return is_sub_delim(c) or (c == ':'); }
+        .PATH_SEGMENT => { return is_sub_delim(c) or (c == ':') or (c == '@'); }
+        .PATH         => { return is_sub_delim(c) or (c == ':') or (c == '@') or (c == '/'); }
+        .QUERY        => { return is_sub_delim(c) or (c == ':') or (c == '@') or (c == '/') or (c == '?'); }
+        .FRAGMENT     => { return is_sub_delim(c) or (c == ':') or (c == '@') or (c == '/') or (c == '?'); }
+    }
+}
+
+// Writes s, escaping the bytes `comp` does not allow; with `plus`, a space
+// becomes '+'.
+fn escape_to(w: io.Writer, s: []u8, comp: Component, plus: bool) !void {
+    let mut lit: usize = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        if allowed(c, comp) {
+            continue;
+        }
+        w.write_all(s[lit..i])!;
+        if plus and (c == ' ') {
+            w.write_all("+")!;
+        } else {
+            let esc: [3]u8 = ['%', HEX[@as(usize, c >> 4)], HEX[@as(usize, c & 15)]];
+            w.write_all(esc[..])!;
+        }
+        lit = i + 1;
+    }
+    w.write_all(s[lit..])!;
+}
+
+/// Writes s percent-encoded for use in `comp` (uppercase hex digits).
+pub fn encode_to(w: io.Writer, s: []u8, comp: Component) !void {
+    escape_to(w, s, comp, false)!;
+}
+
+/// s percent-encoded for `comp`, in new memory (free it with mem.free).
+pub fn encode(s: []u8, comp: Component) ![]mut u8 {
+    let mut out = strs.String.init();
+    escape_to(out.writer(), s, comp, false) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// Writes s encoded as application/x-www-form-urlencoded data: unreserved
+/// characters as they are, a space as '+', anything else percent-encoded
+/// (as Python's quote_plus; the WHATWG standard also leaves '*' alone and
+/// encodes '~').
+pub fn form_encode_to(w: io.Writer, s: []u8) !void {
+    escape_to(w, s, Component.COMPONENT, true)!;
+}
+
+/// Decodes %XX escapes (and, with `plus`, '+' as a space, as in query
+/// strings and form data) into out, which must be at least as long as s and
+/// may be s itself. Fails with InvalidEscape on a '%' without two hex
+/// digits after it.
+pub fn percent_decode(s: []u8, out: []mut u8, plus: bool) ![]mut u8 {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '%' {
+            if (i + 2) >= s.len {
+                return error.InvalidEscape;
+            }
+            let hi = hex_value(s[i + 1]);
+            let lo = hex_value(s[i + 2]);
+            if (hi > 15) or (lo > 15) {
+                return error.InvalidEscape;
+            }
+            out[n] = @truncate(u8, (hi << 4) | lo);
+            i += 3;
+        } else {
+            out[n] = c;
+            if plus and (c == '+') {
+                out[n] = ' ';
+            }
+            i += 1;
+        }
+        n += 1;
+    }
+    return out[..n];
+}
+
+/// s with its %XX escapes decoded, in new memory (free it with mem.free).
+pub fn decode(s: []u8, plus: bool) ![]mut u8 {
+    let out = mem.alloc.[u8](s.len)!;
+    let d = percent_decode(s, out, plus) catch |e| {
+        mem.free(out);
+        return e;
+    };
+    if d.len < out.len {
+        let shrunk = mem.alloc.[u8](d.len) catch |e| {
+            mem.free(out);
+            return e;
+        };
+        @mem_copy(shrunk, d);
+        mem.free(out);
+        return shrunk;
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Query strings
+// -----------------------------------------------------------------------------
+
+/// A name and a value of a query string (still encoded, from `query`; or
+/// as they are, for build_query).
+pub struct Pair {
+    key: []u8,
+    value: []u8,
+}
+
+/// An iterator over the pairs of a query string "a=1&b=x%20y&c": split at
+/// '&' and then at the first '=' (a pair without one has an empty value),
+/// skipping empty pairs, as Python's parse_qsl and the WHATWG standard do.
+/// Decode keys and values with percent_decode(.., true).
+pub struct Query {
+    s: []u8,
+    i: usize,
+
+    /// The next pair; Done after the last.
+    pub fn next(self: *mut Query) !Pair {
+        while self.i < self.s.len {
+            let rest = self.s[self.i..];
+            let amp = strs.index_of_byte(rest, '&') catch rest.len;
+            self.i += amp + 1;
+            let item = rest[..amp];
+            if item.len == 0 {
+                continue;
+            }
+            let eq = strs.index_of_byte(item, '=') catch item.len;
+            if eq == item.len {
+                return Pair.{ key: item, value: "" };
+            }
+            return Pair.{ key: item[..eq], value: item[eq + 1..] };
+        }
+        return error.Done;
+    }
+}
+
+/// The pairs of a query string (without its '?').
+pub fn query(q: []u8) Query {
+    return Query.{ s: q, i: 0 };
+}
+
+/// The value of the first pair whose name is `name` (compared as written,
+/// still encoded); NotFound if there is none.
+pub fn query_value(q: []u8, name: []u8) ![]u8 {
+    let mut it = query(q);
+    loop {
+        let p = it.next() catch break;
+        if @mem_eq(p.key, name) {
+            return p.value;
+        }
+    }
+    return error.NotFound;
+}
+
+/// Writes a query string pair by pair, form-encoding names and values:
+/// "q=a+b&lang=fr".
+pub struct QueryWriter {
+    w: io.Writer,
+    n: usize,
+
+    /// Writes a pair (after an '&' if it is not the first).
+    pub fn add(self: *mut QueryWriter, key: []u8, value: []u8) !void {
+        if self.n > 0 {
+            self.w.write_all("&")!;
+        }
+        form_encode_to(self.w, key)!;
+        self.w.write_all("=")!;
+        form_encode_to(self.w, value)!;
+        self.n += 1;
+    }
+}
+
+/// A QueryWriter writing to w.
+pub fn query_writer(w: io.Writer) QueryWriter {
+    return QueryWriter.{ w: w, n: 0 };
+}
+
+/// The query string of the pairs (as Python's urlencode), in new memory
+/// (free it with mem.free).
+pub fn build_query(pairs: []Pair) ![]mut u8 {
+    let mut s = strs.String.init();
+    let mut q = query_writer(s.writer());
+    for p in pairs {
+        q.add(p.key, p.value) catch |e| {
+            s.deinit();
+            return e;
+        };
+    }
+    return s.take();
+}
+
+// -----------------------------------------------------------------------------
+// Parsing
+// -----------------------------------------------------------------------------
+
+fn parse_port(s: []u8) !u16 {
+    let mut v: u32 = 0;
+    for c in s {
+        if not is_digit(c) {
+            return error.InvalidUrl;
+        }
+        v = (v * 10) + @as(u32, c - '0');
+        if v > 65535 {
+            return error.InvalidUrl;
+        }
+    }
+    return @truncate(u16, v);
+}
+
+// Whether s is a reg-name: unreserved, sub-delims and %XX escapes.
+fn valid_reg_name(s: []u8) bool {
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '%' {
+            if ((i + 2) >= s.len) or (hex_value(s[i + 1]) > 15) or (hex_value(s[i + 2]) > 15) {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if not (is_unreserved(c) or is_sub_delim(c)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn parse_ipv4(s: []u8, out: *mut [4]u8) bool {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while n < 4 {
+        if n > 0 {
+            if (i >= s.len) or (s[i] != '.') {
+                return false;
+            }
+            i += 1;
+        }
+        let start = i;
+        let mut v: u32 = 0;
+        while (i < s.len) and is_digit(s[i]) and ((i - start) < 3) {
+            v = (v * 10) + @as(u32, s[i] - '0');
+            i += 1;
+        }
+        // no leading zeros (RFC 3986's dec-octet)
+        if (i == start) or (v > 255) or (((i - start) > 1) and (s[start] == '0')) {
+            return false;
+        }
+        out[n] = @truncate(u8, v);
+        n += 1;
+    }
+    return i == s.len;
+}
+
+/// Parses an IPv6 address (RFC 4291 text form, as RFC 3986's IPv6address:
+/// "::" compression and a trailing IPv4 address allowed, no zone) into
+/// eight 16-bit groups; false if it is not one.
+pub fn parse_ipv6(s: []u8, out: *mut [8]u16) bool {
+    let mut g: [8]u16 = [0; 8];
+    let mut n: usize = 0;
+    let mut gap: usize = 9;  // where "::" was, in groups, or 9
+    let mut i: usize = 0;
+    if strs.starts_with(s, "::") {
+        gap = 0;
+        i = 2;
+    } else if (s.len > 0) and (s[0] == ':') {
+        return false;
+    }
+    while i < s.len {
+        if n == 8 {
+            return false;
+        }
+        // a trailing IPv4 address
+        let rest = s[i..];
+        let dot = strs.index_of_byte(rest, '.') catch rest.len;
+        let colon = strs.index_of_byte(rest, ':') catch rest.len;
+        if dot < colon {
+            let mut v4: [4]u8 = [0; 4];
+            if (n > 6) or not parse_ipv4(rest, &mut v4) {
+                return false;
+            }
+            g[n] = (@as(u16, v4[0]) << 8) | @as(u16, v4[1]);
+            g[n + 1] = (@as(u16, v4[2]) << 8) | @as(u16, v4[3]);
+            n += 2;
+            i = s.len;
+            break;
+        }
+        let start = i;
+        let mut v: u32 = 0;
+        while (i < s.len) and (hex_value(s[i]) < 16) and ((i - start) < 4) {
+            v = (v << 4) | hex_value(s[i]);
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+        g[n] = @truncate(u16, v);
+        n += 1;
+        if i == s.len {
+            break;
+        }
+        if s[i] != ':' {
+            return false;
+        }
+        i += 1;
+        if (i < s.len) and (s[i] == ':') {
+            if gap != 9 {
+                return false;
+            }
+            gap = n;
+            i += 1;
+        } else if i == s.len {
+            return false;  // a trailing single ':'
+        }
+    }
+    if gap == 9 {
+        if n != 8 {
+            return false;
+        }
+    } else {
+        if n > 7 {
+            return false;
+        }
+        // move the groups after the gap to the end
+        let after = n - gap;
+        let mut k: usize = 0;
+        while k < after {
+            g[7 - k] = g[n - 1 - k];
+            g[n - 1 - k] = 0;
+            k += 1;
+        }
+        for j in gap..(8 - after) {
+            g[j] = 0;
+        }
+    }
+    out.* = g;
+    return true;
+}
+
+/// Writes an IPv6 address in the form RFC 5952 recommends: lowercase hex
+/// without leading zeros, the longest run of two or more zero groups (the
+/// first, of equal runs) as "::".
+pub fn format_ipv6_to(w: io.Writer, g: [8]u16) !void {
+    let mut best: usize = 8;
+    let mut best_len: usize = 1;
+    let mut i: usize = 0;
+    while i < 8 {
+        if g[i] == 0 {
+            let mut j = i;
+            while (j < 8) and (g[j] == 0) {
+                j += 1;
+            }
+            if (j - i) > best_len {
+                best = i;
+                best_len = j - i;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let digits = "0123456789abcdef";
+    i = 0;
+    while i < 8 {
+        if i == best {
+            w.write_all("::")!;
+            i += best_len;
+            continue;
+        }
+        if (i > 0) and (i != (best + best_len)) {
+            w.write_all(":")!;
+        }
+        let mut buf: [4]u8 = [0; 4];
+        let mut n: usize = 0;
+        let mut shift: u32 = 12;
+        loop {
+            let d = (g[i] >> @truncate(u16, shift)) & 15;
+            if (n > 0) or (d != 0) or (shift == 0) {
+                buf[n] = digits[@as(usize, d)];
+                n += 1;
+            }
+            if shift == 0 {
+                break;
+            }
+            shift -= 4;
+        }
+        w.write_all(buf[..n])!;
+        i += 1;
+    }
+}
+
+// Whether s (inside the brackets) is an IPvFuture: "v" hex+ "." then
+// unreserved, sub-delims and ':'.
+fn valid_ipvfuture(s: []u8) bool {
+    if (s.len < 4) or (lower(s[0]) != 'v') {
+        return false;
+    }
+    let dot = strs.index_of_byte(s, '.') catch return false;
+    if (dot < 2) or (dot == (s.len - 1)) {
+        return false;
+    }
+    for c in s[1..dot] {
+        if hex_value(c) > 15 {
+            return false;
+        }
+    }
+    for c in s[dot + 1..] {
+        if not (is_unreserved(c) or is_sub_delim(c) or (c == ':')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parse_authority(a: []u8, u: *mut Url) !void {
+    let mut hp = a;
+    let at = strs.last_index_of_byte(a, '@') catch a.len;
+    if at < a.len {
+        u.userinfo = a[..at];
+        u.has_userinfo = true;
+        hp = a[at + 1..];
+        for c in u.userinfo {
+            if (c == '[') or (c == ']') {
+                return error.InvalidUrl;
+            }
+        }
+    }
+    let mut name = hp;
+    if (hp.len > 0) and (hp[0] == '[') {
+        let close = strs.index_of_byte(hp, ']') catch return error.InvalidUrl;
+        let inner = hp[1..close];
+        name = inner;
+        u.ip_literal = true;
+        let mut g: [8]u16 = [0; 8];
+        if not parse_ipv6(inner, &mut g) and not valid_ipvfuture(inner) {
+            return error.InvalidUrl;
+        }
+        if (close + 1) < hp.len {
+            if hp[close + 1] != ':' {
+                return error.InvalidUrl;
+            }
+            u.port = hp[close + 2..];
+            u.has_port = true;
+        }
+    } else {
+        let colon = strs.last_index_of_byte(hp, ':') catch hp.len;
+        if colon < hp.len {
+            name = hp[..colon];
+            u.port = hp[colon + 1..];
+            u.has_port = true;
+        }
+        if not valid_reg_name(name) {
+            return error.InvalidUrl;
+        }
+    }
+    u.hostname = name;
+    if u.has_port {
+        _ = parse_port(u.port)!;
+    }
+}
+
+/// Parses a URI ("scheme:...") or a relative reference ("/a?b", "../c",
+/// "//host/p") into its components (slices of s). InvalidUrl if s holds a
+/// space or a control character, or its scheme, host or port is malformed
+/// (see the module comment for what else is accepted).
+pub fn parse(s: []u8) !Url {
+    for c in s {
+        if (c <= 0x20) or (c == 0x7f) {
+            return error.InvalidUrl;
+        }
+    }
+    let mut u = Url.empty();
+    let mut rest = s;
+    // fragment, then query
+    let hash = strs.index_of_byte(rest, '#') catch rest.len;
+    if hash < rest.len {
+        u.fragment = rest[hash + 1..];
+        u.has_fragment = true;
+        rest = rest[..hash];
+    }
+    let qm = strs.index_of_byte(rest, '?') catch rest.len;
+    if qm < rest.len {
+        u.query = rest[qm + 1..];
+        u.has_query = true;
+        rest = rest[..qm];
+    }
+    // a scheme: a letter, then letters, digits, '+', '-' and '.', before a
+    // ':' that comes before any '/'
+    let mut i: usize = 0;
+    if (rest.len > 0) and is_alpha(rest[0]) {
+        i = 1;
+        while (i < rest.len) and
+              (is_alpha(rest[i]) or is_digit(rest[i]) or (rest[i] == '+') or (rest[i] == '-') or (rest[i] == '.')) {
+            i += 1;
+        }
+        if (i < rest.len) and (rest[i] == ':') {
+            u.scheme = rest[..i];
+            rest = rest[i + 1..];
+        }
+    }
+    if strs.starts_with(rest, "//") {
+        let a = rest[2..];
+        let slash = strs.index_of_byte(a, '/') catch a.len;
+        u.has_authority = true;
+        parse_authority(a[..slash], &mut u)!;
+        rest = a[slash..];
+        if (u.hostname.len == 0) and is_special_scheme(u.scheme) {
+            return error.InvalidUrl;
+        }
+    }
+    u.path = rest;
+    return u;
+}
+
+// -----------------------------------------------------------------------------
+// Resolution (RFC 3986 §5.2)
+// -----------------------------------------------------------------------------
+
+/// Removes "." and ".." segments from a path in place (RFC 3986 §5.2.4)
+/// and returns what is left of it: "/a/b/c/./../../g" becomes "/a/g".
+pub fn remove_dot_segments(path: []mut u8) []mut u8 {
+    let b = path;
+    let mut i: usize = 0;  // the input: b[i..]
+    let mut n: usize = 0;  // the output: b[..n] (n <= i)
+    while i < b.len {
+        let r = b[i..];
+        if strs.starts_with(r, "../") {
+            i += 3;
+        } else if strs.starts_with(r, "./") {
+            i += 2;
+        } else if strs.starts_with(r, "/./") {
+            i += 2;
+        } else if (r.len == 2) and strs.starts_with(r, "/.") {
+            i += 1;
+            b[i] = '/';
+        } else if strs.starts_with(r, "/../") or ((r.len == 3) and strs.starts_with(r, "/..")) {
+            if r.len == 3 {
+                i += 2;
+                b[i] = '/';
+            } else {
+                i += 3;
+            }
+            // drop the last output segment and its '/'
+            while (n > 0) and (b[n - 1] != '/') {
+                n -= 1;
+            }
+            if n > 0 {
+                n -= 1;
+            }
+        } else if ((r.len == 1) and (r[0] == '.')) or ((r.len == 2) and (r[0] == '.') and (r[1] == '.')) {
+            i = b.len;
+        } else {
+            // move the first segment (with its leading '/', if any)
+            let mut j: usize = 0;
+            if r[0] == '/' {
+                j = 1;
+            }
+            while (j < r.len) and (r[j] != '/') {
+                j += 1;
+            }
+            for k in @as(usize, 0)..j {
+                b[n + k] = b[i + k];
+            }
+            n += j;
+            i += j;
+        }
+    }
+    return b[..n];
+}
+
+/// Writes the target URI of reference `r` against the absolute URI `base`
+/// (RFC 3986 §5.2.2, strict: a scheme in r is always taken). NotAbsolute
+/// if base has no scheme.
+pub fn resolve_to(w: io.Writer, base: Url, r: Url) !void {
+    if base.scheme.len == 0 {
+        return error.NotAbsolute;
+    }
+    let mut t = r;
+    // the merged path, then with dot segments removed
+    let buf = mem.alloc.[u8](@add_checked(base.path.len, r.path.len + 1) catch return error.OutOfMemory)!;
+    defer mem.free(buf);
+    let mut n: usize = 0;
+    if r.scheme.len == 0 {
+        t.scheme = base.scheme;
+        if not r.has_authority {
+            t.has_authority = base.has_authority;
+            t.userinfo = base.userinfo;
+            t.has_userinfo = base.has_userinfo;
+            t.hostname = base.hostname;
+            t.ip_literal = base.ip_literal;
+            t.port = base.port;
+            t.has_port = base.has_port;
+            if r.path.len == 0 {
+                t.path = base.path;
+                if not r.has_query {
+                    t.query = base.query;
+                    t.has_query = base.has_query;
+                }
+            } else if r.path[0] == '/' {
+                @mem_copy(buf[..r.path.len], r.path);
+                n = r.path.len;
+                t.path = remove_dot_segments(buf[..n]);
+            } else {
+                // merge (§5.2.3)
+                if base.has_authority and (base.path.len == 0) {
+                    buf[0] = '/';
+                    n = 1;
+                } else {
+                    let slash = strs.last_index_of_byte(base.path, '/') catch base.path.len;
+                    if slash < base.path.len {
+                        n = slash + 1;
+                        @mem_copy(buf[..n], base.path[..n]);
+                    }
+                }
+                @mem_copy(buf[n..n + r.path.len], r.path);
+                n += r.path.len;
+                t.path = remove_dot_segments(buf[..n]);
+            }
+            t.write_to(w)!;
+            return;
+        }
+    }
+    @mem_copy(buf[..r.path.len], r.path);
+    t.path = remove_dot_segments(buf[..r.path.len]);
+    t.write_to(w)!;
+}
+
+/// The target URI of reference `r` against `base`, in new memory (free
+/// it with mem.free).
+pub fn resolve(base: Url, r: Url) ![]mut u8 {
+    let mut s = strs.String.init();
+    resolve_to(s.writer(), base, r) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Parses `base` and `reference` and resolves the one against the other:
+/// join("http://a/b/c/d;p?q", "../g") is "http://a/b/g". In new memory
+/// (free it with mem.free).
+pub fn join(base: []u8, reference: []u8) ![]mut u8 {
+    return resolve(parse(base)!, parse(reference)!);
+}
+
+// -----------------------------------------------------------------------------
+// Normalization (RFC 3986 §6.2.2 and §6.2.3)
+// -----------------------------------------------------------------------------
+
+// Writes s with escapes of unreserved characters decoded, other escapes in
+// uppercase, and bytes `comp` does not allow (and stray '%'s) escaped; with
+// `lowercase`, letters in lowercase (for hosts).
+fn normalize_part(w: io.Writer, s: []u8, comp: Component, lowercase: bool) !void {
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '%' {
+            if ((i + 2) < s.len) and (hex_value(s[i + 1]) < 16) and (hex_value(s[i + 2]) < 16) {
+                let v = @truncate(u8, (hex_value(s[i + 1]) << 4) | hex_value(s[i + 2]));
+                if is_unreserved(v) {
+                    let mut d = v;
+                    if lowercase {
+                        d = lower(v);
+                    }
+                    w.print_byte(d)!;
+                } else {
+                    let esc: [3]u8 = ['%', HEX[@as(usize, v >> 4)], HEX[@as(usize, v & 15)]];
+                    w.write_all(esc[..])!;
+                }
+                i += 3;
+                continue;
+            }
+            w.write_all("%25")!;
+        } else if allowed(c, comp) {
+            if lowercase {
+                w.print_byte(lower(c))!;
+            } else {
+                w.print_byte(c)!;
+            }
+        } else {
+            let esc: [3]u8 = ['%', HEX[@as(usize, c >> 4)], HEX[@as(usize, c & 15)]];
+            w.write_all(esc[..])!;
+        }
+        i += 1;
+    }
+}
+
+/// Writes u normalized: the scheme and host in lowercase, percent-encoding
+/// normalized (escapes of unreserved characters decoded, the others in
+/// uppercase, characters a component does not allow encoded), dot segments
+/// removed from the path (unless it is a relative path: "../a" stays as it
+/// is), an IPv6 host in RFC 5952 form,
+/// an empty or default port dropped, and an empty path with an authority
+/// of a special scheme given as "/". Equivalent URLs (RFC 3986 §6.2.2)
+/// normalize to the same text.
+pub fn normalize_to(w: io.Writer, u: Url) !void {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let sw = s.writer();
+    for c in u.scheme {
+        sw.print_byte(lower(c))!;
+    }
+    if u.scheme.len > 0 {
+        sw.write_all(":")!;
+    }
+    if u.has_authority {
+        sw.write_all("//")!;
+        if u.has_userinfo {
+            normalize_part(sw, u.userinfo, Component.USERINFO, false)!;
+            sw.write_all("@")!;
+        }
+        let mut g: [8]u16 = [0; 8];
+        if u.is_ipv6() and parse_ipv6(u.hostname, &mut g) {
+            sw.write_all("[")!;
+            format_ipv6_to(sw, g)!;
+            sw.write_all("]")!;
+        } else if u.ip_literal {
+            sw.write_all("[")!;
+            for c in u.hostname {
+                sw.print_byte(lower(c))!;
+            }
+            sw.write_all("]")!;
+        } else {
+            normalize_part(sw, u.hostname, Component.HOST, true)!;
+        }
+        // (default ports are never 0)
+        let port = u.port_number() catch 0;
+        let def = default_port(u.scheme) catch 0;
+        if u.has_port and (u.port.len > 0) and ((def == 0) or (port != def)) {
+            sw.write_all(":")!;
+            sw.print_u64(@as(u64, port))!;
+        }
+    }
+    normalize_rest(sw, &mut s, u)!;
+    w.write_all(s.bytes())!;
+}
+
+// The path, query and fragment of normalize_to, onto s.
+fn normalize_rest(sw: io.Writer, s: *mut strs.String, u: Url) !void {
+    let start = s.bytes().len;
+    normalize_part(sw, u.path, Component.PATH, false)!;
+    // (dot segments mean something only in a relative-path reference)
+    if (u.scheme.len > 0) or u.has_authority or strs.starts_with(u.path, "/") {
+        let p = remove_dot_segments(s.bytes()[start..]);
+        s.truncate(start + p.len);
+    }
+    if (s.bytes().len == start) and u.has_authority and u.is_special() {
+        sw.write_all("/")!;
+    } else if not u.has_authority and strs.starts_with(s.bytes()[start..], "//") {
+        // (a path that would read as an authority)
+        let p = mem.alloc.[u8](s.bytes().len - start)!;
+        defer mem.free(p);
+        @mem_copy(p, s.bytes()[start..]);
+        s.truncate(start);
+        sw.write_all("/.")!;
+        sw.write_all(p)!;
+    }
+    if u.has_query {
+        sw.write_all("?")!;
+        normalize_part(sw, u.query, Component.QUERY, false)!;
+    }
+    if u.has_fragment {
+        sw.write_all("#")!;
+        normalize_part(sw, u.fragment, Component.FRAGMENT, false)!;
+    }
+}
+
+/// Parses s and returns it normalized (see normalize_to) in new memory
+/// (free it with mem.free).
+pub fn normalize(s: []u8) ![]mut u8 {
+    let u = parse(s)!;
+    let mut out = strs.String.init();
+    normalize_to(out.writer(), u) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+// -----------------------------------------------------------------------------
+// Tests (axiom test std/net/url.ax)
+// -----------------------------------------------------------------------------
+
+import "../encoding/hex.ax" as hex;
+import "../os/fs.ax" as fs;
+
+fn invalid(r: !Url) bool {
+    _ = r catch |e| return e == error.InvalidUrl;
+    return false;
+}
+
+test "components and accessors" {
+    let u = parse("https://user:pa%3Ass@Example.COM:8443/a/b?x=1&y=two%20words#top")!;
+    @expect_eq(u.scheme, "https");
+    @expect_eq(u.userinfo, "user:pa%3Ass");
+    @expect_eq(u.username(), "user");
+    @expect_eq(u.password()!, "pa%3Ass");
+    @expect_eq(u.hostname, "Example.COM");
+    @expect_eq(u.port, "8443");
+    @expect_eq(u.port_number()!, 8443);
+    @expect_eq(u.path, "/a/b");
+    @expect_eq(u.query, "x=1&y=two%20words");
+    @expect_eq(u.fragment, "top");
+    @expect(u.is_absolute() and u.is_special() and u.scheme_is("https"));
+    let v = parse("HTTP://[2001:DB8::1]/")!;
+    @expect(v.scheme_is("http") and v.is_ipv6());
+    @expect_eq(v.hostname, "2001:DB8::1");
+    @expect_eq(v.effective_port()!, 80);
+    _ = v.port_number() catch |e| {
+        @expect_eq(e, error.NotFound);
+        let r = parse("../g?q")!;
+        @expect(not r.is_absolute() and not r.has_authority and r.has_query);
+        @expect_eq(r.path, "../g");
+        let e2 = parse("http://h:/?#")!;
+        @expect(e2.has_port and (e2.port.len == 0) and e2.has_query and e2.has_fragment);
+        @expect_eq(e2.query, "");
+        let m = parse("mailto:a@example.com")!;
+        @expect_eq(m.path, "a@example.com");
+        @expect(not m.has_authority);
+        _ = m.effective_port() catch |e3| {
+            @expect_eq(e3, error.NotFound);
+            return;
+        };
+        @trap();
+    };
+    @trap();
+}
+
+test "invalid URLs" {
+    let bad: [16][]u8 = [
+        "http://a b/",
+        "http://h/\x01",
+        "http://h:65536/",
+        "http://h:8a/",
+        "http://[::1/",
+        "http://[::1]x/",
+        "http://[1:2:3]/",
+        "http://[::1::2]/",
+        "http:///p",
+        "https://",
+        "http://h^/",
+        "http://a@b@[c/",
+        "ws://u@:80/",
+        "http://[1.2.3.4]/",
+        "http://h/\t",
+        "http://[v1.]/",
+    ];
+    for s in bad {
+        @expect(invalid(parse(s)));
+    }
+    // a host may be empty for other schemes
+    @expect_eq(parse("file:///etc/hosts")!.path, "/etc/hosts");
+    @expect(parse("http://[v7.a:b]/")!.has_authority);
+    @expect(parse("http://xn--nxasmq6b.example/")!.has_authority);
+}
+
+test "IPv6 addresses" {
+    let cases: [8][]u8 = [
+        "::",
+        "::",
+        "::1",
+        "::1",
+        "2001:DB8:0:0:8:800:200C:417A",
+        "2001:db8::8:800:200c:417a",
+        "1:0:0:2:0:0:0:3",
+        "1:0:0:2::3",
+    ];
+    let more: [8][]u8 = [
+        "::ffff:192.0.2.1",
+        "::ffff:c000:201",
+        "1:2:3:4:5:6:7::",
+        "1:2:3:4:5:6:7:0",
+        "0:0:1:0:0:1:0:0",
+        "::1:0:0:1:0:0",
+        "fe80::0001:0000",
+        "fe80::1:0",
+    ];
+    let mut s = strs.String.init();
+    defer s.deinit();
+    for k in @as(usize, 0)..4 {
+        for half in @as(usize, 0)..2 {
+            let mut src = cases[2 * k];
+            let mut want = cases[(2 * k) + 1];
+            if half == 1 {
+                src = more[2 * k];
+                want = more[(2 * k) + 1];
+            }
+            let mut g: [8]u16 = [0; 8];
+            @expect(parse_ipv6(src, &mut g));
+            s.clear();
+            format_ipv6_to(s.writer(), g)!;
+            @expect_eq(s.bytes(), want);
+        }
+    }
+    let bad: [9][]u8 = [":", ":::", "1::2::3", "1:2:3:4:5:6:7:8:9", "12345::", "::1.2.3", "1:2:3:4:5:6:7:1.2.3.4",
+                        "::1:", "::01.2.3.4"];
+    for b in bad {
+        let mut g: [8]u16 = [0; 8];
+        @expect(not parse_ipv6(b, &mut g));
+    }
+}
+
+test "RFC 3986 section 5.4 examples" {
+    let base = parse("http://a/b/c/d;p?q")!;
+    let cases: [68][]u8 = [
+        // 5.4.1 normal examples
+        "g:h", "g:h", "g", "http://a/b/c/g", "./g", "http://a/b/c/g", "g/", "http://a/b/c/g/", "/g", "http://a/g",
+        "//g", "http://g", "?y", "http://a/b/c/d;p?y", "g?y", "http://a/b/c/g?y", "#s", "http://a/b/c/d;p?q#s",
+        "g#s", "http://a/b/c/g#s", "g?y#s", "http://a/b/c/g?y#s", ";x", "http://a/b/c/;x", "g;x", "http://a/b/c/g;x",
+        "g;x?y#s", "http://a/b/c/g;x?y#s", "", "http://a/b/c/d;p?q", ".", "http://a/b/c/", "./", "http://a/b/c/",
+        "..", "http://a/b/", "../", "http://a/b/", "../g", "http://a/b/g", "../..", "http://a/", "../../",
+        "http://a/", "../../g", "http://a/g",
+        // 5.4.2 abnormal examples
+        "../../../g", "http://a/g", "../../../../g", "http://a/g", "/./g", "http://a/g", "/../g", "http://a/g",
+        "g.", "http://a/b/c/g.", ".g", "http://a/b/c/.g", "g..", "http://a/b/c/g..", "..g", "http://a/b/c/..g",
+        "./../g", "http://a/b/g", "./g/.", "http://a/b/c/g/", "g/./h", "http://a/b/c/g/h",
+    ];
+    let more: [18][]u8 = [
+        "g/../h",
+        "http://a/b/c/h",
+        "g;x=1/./y",
+        "http://a/b/c/g;x=1/y",
+        "g;x=1/../y",
+        "http://a/b/c/y",
+        "g?y/./x",
+        "http://a/b/c/g?y/./x",
+        "g?y/../x",
+        "http://a/b/c/g?y/../x",
+        "g#s/./x",
+        "http://a/b/c/g#s/./x",
+        "g#s/../x",
+        "http://a/b/c/g#s/../x",
+        "http:g",
+        "http:g",
+        "//g/../x",
+        "http://g/x",
+    ];
+    let mut i: usize = 0;
+    while i < (cases.len + more.len) {
+        let mut r = "";
+        let mut want = "";
+        if i < cases.len {
+            r = cases[i];
+            want = cases[i + 1];
+        } else {
+            r = more[i - cases.len];
+            want = more[(i - cases.len) + 1];
+        }
+        let got = resolve(base, parse(r)!)!;
+        @expect_eq(got, want);
+        mem.free(got);
+        i += 2;
+    }
+    _ = join("a/b", "c") catch |e| {
+        @expect_eq(e, error.NotAbsolute);
+        let j = join("http://h", "x")!;  // an empty base path with an authority merges as "/"
+        defer mem.free(j);
+        @expect_eq(j, "http://h/x");
+        return;
+    };
+    @trap();
+}
+
+test "remove_dot_segments" {
+    let cases: [12][]u8 = [
+        "/a/b/c/./../../g",
+        "/a/g",
+        "mid/content=5/../6",
+        "mid/6",
+        "/..",
+        "/",
+        "a/..",
+        "/",
+        "../a/./b/..",
+        "a/",
+        "/a//../b",
+        "/a/b",
+    ];
+    let mut buf: [64]u8 = [0; 64];
+    let mut i: usize = 0;
+    while i < cases.len {
+        let p = buf[..cases[i].len];
+        @mem_copy(p, cases[i]);
+        @expect_eq(remove_dot_segments(p), cases[i + 1]);
+        i += 2;
+    }
+}
+
+test "normalize" {
+    let cases: [30][]u8 = [
+        // RFC 3986 6.2.2: these are equivalent
+        "example://a/b/c/%7Bfoo%7D", "example://a/b/c/%7Bfoo%7D", "eXAMPLE://a/./b/../b/%63/%7bfoo%7d",
+        "example://a/b/c/%7Bfoo%7D",
+        // 6.2.3: scheme-based
+        "HTTP://www.Example.com:80", "http://www.example.com/", "http://example.com:/?", "http://example.com/?",
+        "https://h:0443/%7euser/%2e%2E/x", "https://h/x", "http://[2001:DB8:0:0:0:0:0:1]:8080/",
+        "http://[2001:db8::1]:8080/", "http://%41b.C/%zz/ä\"<>", "http://ab.c/%25zz/%C3%A4%22%3C%3E",
+        "foo:a/../b", "foo:/b", "../a/./b", "../a/./b", "/a/./b/../c", "/a/c", "//H/./b", "//h/b", "x://h:0/",
+        "x://h:0/", "http://h:8080", "http://h:8080/", "http://U%3a@h/?a=%2f#%7E", "http://U%3A@h/?a=%2F#~",
+        "file:///a/b/../c", "file:///a/c",
+    ];
+    let mut i: usize = 0;
+    while i < cases.len {
+        let got = normalize(cases[i])!;
+        @expect_eq(got, cases[i + 1]);
+        mem.free(got);
+        i += 2;
+    }
+}
+
+test "encoding, decoding and queries" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), "a b/c?d#e@f:g", Component.PATH)!;
+    @expect_eq(s.bytes(), "a%20b/c%3Fd%23e@f:g");
+    let e = encode("a b/\u{e9}~", Component.COMPONENT)!;
+    @expect_eq(e, "a%20b%2F%C3%A9~");
+    mem.free(e);
+    let mut buf: [32]u8 = [0; 32];
+    @expect_eq(percent_decode("a%20b+c%2F", buf[..], true)!, "a b c/");
+    @expect_eq(percent_decode("a+b", buf[..], false)!, "a+b");
+    let d = decode("%41%42%43", false)!;
+    @expect_eq(d, "ABC");
+    mem.free(d);
+    let bad: [4][]u8 = ["%", "%4", "a%g0", "%%41"];
+    for b in bad {
+        _ = percent_decode(b, buf[..], false) catch |err| {
+            @expect_eq(err, error.InvalidEscape);
+            continue;
+        };
+        @trap();
+    }
+    @expect_eq(query_value("a=1&bb=x%20y&c", "bb")!, "x%20y");
+    @expect_eq(query_value("a=1&bb=x%20y&c", "c")!, "");
+    s.clear();
+    let mut q = query_writer(s.writer());
+    q.add("q", "a b&c=d")!;
+    q.add("lang", "fr")!;
+    @expect_eq(s.bytes(), "q=a+b%26c%3Dd&lang=fr");
+    let pairs: [2]Pair = [Pair.{ key: "x y", value: "1+1" }, Pair.{ key: "z", value: "" }];
+    let b = build_query(pairs[..])!;
+    @expect_eq(b, "x+y=1%2B1&z=");
+    mem.free(b);
+    let u = parse("http://h")!;
+    let t = u.to_string()!;
+    @expect_eq(t, "http://h");
+    mem.free(t);
+    // a path that would read as an authority is kept a path
+    let mut odd = Url.empty();
+    odd.scheme = "x";
+    odd.path = "//p";
+    let o = odd.to_string()!;
+    @expect_eq(o, "x:/.//p");
+    @expect_eq(parse(o)!.path, "/.//p");
+    mem.free(o);
+}
+
+fn hexs(s: []u8, out: []mut u8) []u8 {
+    return hex.decode(s, out) catch @trap();
+}
+
+fn opt(present: bool, s: []u8) []u8 {
+    if present {
+        return s;
+    }
+    return "-";
+}
+
+test "Python's urllib.parse" {
+    let data = fs.read_file("std/net/url/testdata/cases.txt") catch return;
+    defer mem.free(data);
+    let mut lines = strs.lines(data);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut b1: [256]u8 = [0; 256];
+    let mut b2: [256]u8 = [0; 256];
+    let mut n: usize = 0;
+    loop {
+        let line = lines.next() catch break;
+        if strs.starts_with(line, "#") {
+            continue;
+        }
+        let mut f = strs.split(line, "\t");
+        let op = f.next()!;
+        s.clear();
+        if strs.eq(op, "split") {
+            let text = f.next()!;
+            let u = parse(text)!;
+            let low = strs.to_lower(u.scheme)!;
+            @expect_eq(low, f.next()!);
+            mem.free(low);
+            // netloc
+            let ab = f.next()!;
+            if u.has_authority {
+                let start = @int_from_ptr(text.ptr) + (u.scheme.len + 3);
+                let end = @int_from_ptr(u.path.ptr);
+                @expect_eq(text[start - @int_from_ptr(text.ptr)..end - @int_from_ptr(text.ptr)], ab);
+            } else {
+                @expect_eq(ab, "");
+            }
+            @expect_eq(u.path, f.next()!);
+            @expect_eq(u.query, f.next()!);
+            @expect_eq(u.fragment, f.next()!);
+            let hn = strs.to_lower(u.hostname)!;
+            @expect_eq(opt(u.has_authority, hn), f.next()!);
+            mem.free(hn);
+            let want_port = f.next()!;
+            if strs.eq(want_port, "-") {
+                @expect(not u.has_port);
+            } else {
+                @expect_eq(@as(u64, u.port_number()!), io.parse_u64(want_port)!);
+            }
+            @expect_eq(opt(u.has_userinfo, u.username()), f.next()!);
+            @expect_eq(u.password() catch "-", f.next()!);
+            // and it serializes as it was
+            u.write_to(s.writer())!;
+            @expect_eq(s.bytes(), text);
+        } else if strs.eq(op, "join") {
+            let base = f.next()!;
+            let r = f.next()!;
+            let got = join(base, r)!;
+            @expect_eq(got, f.next()!);
+            mem.free(got);
+        } else if strs.eq(op, "quote") {
+            let comp = f.next()!;
+            let input = hexs(f.next()!, b1[..]);
+            let names: [7][]u8 = ["component", "userinfo", "host", "segment", "path", "query", "fragment"];
+            let mut c: u8 = 0;
+            while not strs.eq(names[@as(usize, c)], comp) {
+                c += 1;
+            }
+            encode_to(s.writer(), input, @enum_from_int(Component, c))!;
+            @expect_eq(s.bytes(), f.next()!);
+        } else if strs.eq(op, "unquote") {
+            let plus = strs.eq(f.next()!, "1");
+            let got = percent_decode(f.next()!, b1[..], plus)!;
+            @expect_eq(got, hexs(f.next()!, b2[..]));
+        } else if strs.eq(op, "qs") {
+            let mut it = query(f.next()!);
+            let mut want = strs.split(f.next()!, ",");
+            loop {
+                let p = it.next() catch break;
+                let w = want.next()!;
+                let eq = strs.index_of_byte(w, '=')!;
+                @expect_eq(percent_decode(p.key, b1[..], true)!, hexs(w[..eq], b2[..]));
+                @expect_eq(percent_decode(p.value, b1[..], true)!, hexs(w[eq + 1..], b2[..]));
+            }
+            let rest = want.next() catch "";
+            @expect_eq(rest, "");
+        } else {
+            @expect_eq(op, "urlencode");
+            let mut q = query_writer(s.writer());
+            let mut ps = strs.split(f.next()!, ",");
+            loop {
+                let w = ps.next() catch break;
+                let eq = strs.index_of_byte(w, '=')!;
+                q.add(hexs(w[..eq], b1[..]), hexs(w[eq + 1..], b2[..]))!;
+            }
+            @expect_eq(s.bytes(), f.next()!);
+        }
+        n += 1;
+    }
+    @expect_eq(n, 1133);
+}

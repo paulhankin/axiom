@@ -1,4 +1,4 @@
-// Uses the Phalange library in stats.ph through its generated header.
+// Uses the Axiom library in stats.ax through its generated header.
 #include <stdio.h>
 
 #include "stats.h"

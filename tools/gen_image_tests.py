@@ -202,7 +202,7 @@ def tiff():
         fax.save(os.path.join(d, 'fax_%s.tif' % comp), compression=comp)
         case('fax_%s.tif' % comp, fbits, 'u8')
     text = Image.new('1', (211, 64), 1)
-    ImageDraw.Draw(text).text((5, 5), 'Phalange TIFF\nGroup 4 fax', fill=0)
+    ImageDraw.Draw(text).text((5, 5), 'Axiom TIFF\nGroup 4 fax', fill=0)
     text.save(os.path.join(d, 'fax_text.tif'), compression='group4')
     case('fax_text.tif', np.asarray(text.convert('L')), 'u8')
     photo = picture(64, 48, 'RGB', 5)

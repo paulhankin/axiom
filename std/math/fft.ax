@@ -1,0 +1,446 @@
+// =============================================================================
+// std/math/fft.ax - fast Fourier transforms.
+//
+//     let mut x: [8]complex.Complex = ...;
+//     fft.forward(x[..])!;           // X[k] = sum x[j] e^(-2 pi i jk / n)
+//     fft.inverse(x[..])!;           // back again (scaled by 1 / n)
+//
+//     let spec = fft.rfft(samples)!;             // n / 2 + 1 bins; mem.free
+//     let y = fft.convolve(a, b)!;               // a.len + b.len - 1 values
+//
+// Any length works: powers of two use an iterative radix-2 transform, and
+// other lengths Bluestein's algorithm (a convolution by a chirp, done with
+// power-of-two transforms), so every transform is O(n log n). Twiddle
+// factors are computed directly (not by recurrence), which keeps the
+// error to O(log n) ulps of the largest input.
+//
+// For many transforms of one size, a Plan keeps the twiddles and the
+// chirp: fft.Plan.init(n), then plan.forward(x) and plan.inverse(x).
+// =============================================================================
+
+import "../math.ax" as math;
+import "../mem.ax" as mem;
+import "complex.ax" as cx;
+
+error { OutOfMemory, DimensionMismatch }
+
+/// Transforms x in place: X[k] = sum over j of x[j] e^(-2 pi i jk / n).
+pub fn forward(x: []mut cx.Complex) !void {
+    let mut p = Plan.init(x.len)!;
+    defer p.deinit();
+    p.forward(x)!;
+}
+
+/// The inverse transform, in place: x[j] = (1 / n) sum over k of
+/// X[k] e^(2 pi i jk / n).
+pub fn inverse(x: []mut cx.Complex) !void {
+    let mut p = Plan.init(x.len)!;
+    defer p.deinit();
+    p.inverse(x)!;
+}
+
+/// Precomputed tables for transforms of one length.
+pub struct Plan {
+    n: usize,
+    m: usize,                 // the power-of-two length transforms use
+    tw: []mut cx.Complex,     // e^(-2 pi i k / m) for k < m / 2
+    chirp: []mut cx.Complex,  // Bluestein: e^(-pi i k^2 / n) for k < n
+    bhat: []mut cx.Complex,   // the transformed conjugate chirp, m long
+    work: []mut cx.Complex,   // m long
+
+    pub fn init(n: usize) !Plan {
+        let mut p = Plan.{ n: n, m: n, tw: mem.alloc.[cx.Complex](0)!, chirp: mem.alloc.[cx.Complex](0)!,
+                           bhat: mem.alloc.[cx.Complex](0)!, work: mem.alloc.[cx.Complex](0)! };
+        if n <= 1 {
+            return p;
+        }
+        if (n & (n - 1)) != 0 {
+            // Bluestein: a circular convolution of length m >= 2n - 1
+            let mut m: usize = 1;
+            while m < ((2 * n) - 1) {
+                m <<= 1;
+            }
+            p.m = m;
+        }
+        p.init_tables() catch |e| {
+            p.deinit();
+            return e;
+        };
+        return p;
+    }
+
+    fn init_tables(self: *mut Plan) !void {
+        let m = self.m;
+        let n = self.n;
+        mem.free(self.tw);
+        self.tw = mem.alloc.[cx.Complex](m / 2)!;
+        for k in @as(usize, 0)..m / 2 {
+            self.tw[k] = unit(@as(u64, k), @as(u64, m));
+        }
+        if m == n {
+            return;
+        }
+        mem.free(self.chirp);
+        self.chirp = mem.alloc.[cx.Complex](n)!;
+        mem.free(self.bhat);
+        self.bhat = mem.alloc.[cx.Complex](m)!;
+        mem.free(self.work);
+        self.work = mem.alloc.[cx.Complex](m)!;
+        // k^2 mod 2n keeps the angle small and exact
+        let nn = @as(u64, n) * 2;
+        for k in @as(usize, 0)..n {
+            let q = (@as(u64, k) * @as(u64, k)) % nn;
+            self.chirp[k] = unit(q, nn);
+        }
+        @mem_set(@cast_slice(u8, self.bhat), 0);
+        self.bhat[0] = self.chirp[0].conj();
+        for k in @as(usize, 1)..n {
+            self.bhat[k] = self.chirp[k].conj();
+            self.bhat[m - k] = self.chirp[k].conj();
+        }
+        radix2(self.bhat, self.tw, false);
+    }
+
+    pub fn deinit(self: *mut Plan) void {
+        mem.free(self.tw);
+        mem.free(self.chirp);
+        mem.free(self.bhat);
+        mem.free(self.work);
+    }
+
+    pub fn forward(self: *mut Plan, x: []mut cx.Complex) !void {
+        self.run(x, false)!;
+    }
+
+    /// The inverse transform, scaled by 1 / n.
+    pub fn inverse(self: *mut Plan, x: []mut cx.Complex) !void {
+        self.run(x, true)!;
+        let s = 1.0 / @float_from_int(f64, x.len);
+        for k in @as(usize, 0)..x.len {
+            x[k] = x[k].scale(s);
+        }
+    }
+
+    // The unscaled transform, with e^(+...) when inv.
+    fn run(self: *mut Plan, x: []mut cx.Complex, inv: bool) !void {
+        if x.len != self.n {
+            return error.DimensionMismatch;
+        }
+        let n = self.n;
+        if n <= 1 {
+            return;
+        }
+        if self.m == n {
+            radix2(x, self.tw, inv);
+            return;
+        }
+        // the inverse is the forward transform of the conjugates, conjugated
+        let m = self.m;
+        let a = self.work;
+        for k in @as(usize, 0)..n {
+            let mut v = x[k];
+            if inv {
+                v = v.conj();
+            }
+            a[k] = v.mul(self.chirp[k]);
+        }
+        @mem_set(@cast_slice(u8, a[n..]), 0);
+        radix2(a, self.tw, false);
+        for k in @as(usize, 0)..m {
+            a[k] = a[k].mul(self.bhat[k]);
+        }
+        radix2(a, self.tw, true);
+        let s = 1.0 / @float_from_int(f64, m);
+        for k in @as(usize, 0)..n {
+            let mut v = a[k].mul(self.chirp[k]).scale(s);
+            if inv {
+                v = v.conj();
+            }
+            x[k] = v;
+        }
+    }
+}
+
+// e^(-2 pi i k / n), exact at multiples of an eighth of a turn
+fn unit(k: u64, n: u64) cx.Complex {
+    let k8 = k * 8;
+    if (k8 % n) == 0 {
+        let h = math.SQRT2 * 0.5;
+        let xs: [8]f64 = [1.0, h, 0.0, -h, -1.0, -h, 0.0, h];
+        let ys: [8]f64 = [0.0, -h, -1.0, -h, 0.0, h, 1.0, h];
+        let oct = @truncate(usize, (k8 / n) & 7);
+        return cx.Complex.init(xs[oct], ys[oct]);
+    }
+    return cx.Complex.cis(-(math.TAU * @float_from_int(f64, k)) / @float_from_int(f64, n));
+}
+
+// The iterative radix-2 transform of x (a power of two long), with tw the
+// e^(-2 pi i k / m) of the largest length m this x's length divides.
+fn radix2(x: []mut cx.Complex, tw: []cx.Complex, inv: bool) void {
+    let n = x.len;
+    // bit-reversal permutation
+    let mut j: usize = 0;
+    for i in @as(usize, 1)..n {
+        let mut bit = n >> 1;
+        while (j & bit) != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            let t = x[i];
+            x[i] = x[j];
+            x[j] = t;
+        }
+    }
+    let stride0 = (tw.len * 2) / n;
+    let mut len: usize = 2;
+    while len <= n {
+        let half = len >> 1;
+        let step = stride0 * (n / len);
+        let mut s: usize = 0;
+        while s < n {
+            for k in @as(usize, 0)..half {
+                let mut w = tw[k * step];
+                if inv {
+                    w = w.conj();
+                }
+                let u = x[s + k];
+                let v = x[s + k + half].mul(w);
+                x[s + k] = u.add(v);
+                x[s + k + half] = u.sub(v);
+            }
+            s += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// The transform of real data: the n / 2 + 1 bins X[0] .. X[n / 2] (the
+/// rest are their conjugates). The caller frees the result.
+pub fn rfft(x: []f64) ![]mut cx.Complex {
+    let n = x.len;
+    let buf = mem.alloc.[cx.Complex](n)!;
+    defer mem.free(buf);
+    for k in @as(usize, 0)..n {
+        buf[k] = cx.Complex.init(x[k], 0.0);
+    }
+    forward(buf)!;
+    let out = mem.alloc.[cx.Complex]((n / 2) + 1)!;
+    if n == 0 {
+        out[0] = cx.Complex.init(0.0, 0.0);
+        return out;
+    }
+    @mem_copy(out, buf[..(n / 2) + 1]);
+    return out;
+}
+
+/// The inverse of rfft: n real values from the n / 2 + 1 bins in spec
+/// (the imaginary parts of X[0], and of X[n / 2] for even n, are
+/// ignored). The caller frees the result.
+pub fn irfft(spec: []cx.Complex, n: usize) ![]mut f64 {
+    if spec.len != ((n / 2) + 1) {
+        return error.DimensionMismatch;
+    }
+    let buf = mem.alloc.[cx.Complex](n)!;
+    defer mem.free(buf);
+    for k in @as(usize, 0)..n {
+        if k < spec.len {
+            buf[k] = spec[k];
+        } else {
+            buf[k] = spec[n - k].conj();
+        }
+    }
+    if n > 0 {
+        buf[0].im = 0.0;
+        if (n % 2) == 0 {
+            buf[n / 2].im = 0.0;
+        }
+    }
+    inverse(buf)!;
+    let out = mem.alloc.[f64](n)!;
+    for k in @as(usize, 0)..n {
+        out[k] = buf[k].re;
+    }
+    return out;
+}
+
+/// The linear convolution of a and b: a.len + b.len - 1 values (none if
+/// either is empty), c[k] = sum of a[i] b[k - i]. The caller frees it.
+pub fn convolve(a: []f64, b: []f64) ![]mut f64 {
+    if (a.len == 0) or (b.len == 0) {
+        return mem.alloc.[f64](0)!;
+    }
+    let n = (a.len + b.len) - 1;
+    if (a.len * b.len) <= 4096 {
+        // small: directly
+        let out = mem.alloc.[f64](n)!;
+        @mem_set(out, 0);
+        for i in @as(usize, 0)..a.len {
+            for j in @as(usize, 0)..b.len {
+                out[i + j] += a[i] * b[j];
+            }
+        }
+        return out;
+    }
+    let mut m: usize = 1;
+    while m < n {
+        m <<= 1;
+    }
+    // both real inputs in one complex transform: z = a + ib
+    let z = mem.alloc.[cx.Complex](m)!;
+    defer mem.free(z);
+    @mem_set(@cast_slice(u8, z), 0);
+    for i in @as(usize, 0)..a.len {
+        z[i].re = a[i];
+    }
+    for i in @as(usize, 0)..b.len {
+        z[i].im = b[i];
+    }
+    forward(z)!;
+    // A[k] = (Z[k] + conj Z[-k]) / 2, B[k] = (Z[k] - conj Z[-k]) / 2i, and
+    // A B = (Z[k]^2 - conj(Z[-k])^2) / 4i
+    let p = mem.alloc.[cx.Complex](m)!;
+    defer mem.free(p);
+    for k in @as(usize, 0)..m {
+        let zk = z[k];
+        let zm = z[(m - k) & (m - 1)].conj();
+        let d = zk.mul(zk).sub(zm.mul(zm));
+        p[k] = cx.Complex.init(d.im * 0.25, -d.re * 0.25);
+    }
+    inverse(p)!;
+    let out = mem.alloc.[f64](n)!;
+    for k in @as(usize, 0)..n {
+        out[k] = p[k].re;
+    }
+    return out;
+}
+
+// the transform by definition, with twiddles from exact angles
+fn naive(x: []cx.Complex, out: []mut cx.Complex, inv: bool) void {
+    let n = x.len;
+    for k in @as(usize, 0)..n {
+        let mut s = cx.Complex.init(0.0, 0.0);
+        for j in @as(usize, 0)..n {
+            let mut w = unit((@as(u64, j) * @as(u64, k)) % @as(u64, n), @as(u64, n));
+            if inv {
+                w = w.conj();
+            }
+            s = s.add(x[j].mul(w));
+        }
+        out[k] = s;
+    }
+}
+
+fn max_err(a: []cx.Complex, b: []cx.Complex) f64 {
+    let mut e: f64 = 0.0;
+    for k in @as(usize, 0)..a.len {
+        e = @max(e, a[k].sub(b[k]).abs());
+    }
+    return e;
+}
+
+test "against the definition" {
+    let sizes: [14]usize = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 17, 64, 100, 257];
+    let mut seed: u32 = 1;
+    for n in sizes {
+        let x = mem.alloc.[cx.Complex](n)!;
+        defer mem.free(x);
+        let want = mem.alloc.[cx.Complex](n)!;
+        defer mem.free(want);
+        for k in @as(usize, 0)..n {
+            seed = (seed *% 1103515245) +% 12345;
+            let re = @float_from_int(f64, @bit_cast(i32, seed) >> 8) / 8388608.0;
+            seed = (seed *% 1103515245) +% 12345;
+            let im = @float_from_int(f64, @bit_cast(i32, seed) >> 8) / 8388608.0;
+            x[k] = cx.Complex.init(re, im);
+        }
+        naive(x, want, false);
+        let y = mem.alloc.[cx.Complex](n)!;
+        defer mem.free(y);
+        @mem_copy(y, x);
+        forward(y)!;
+        let tol = 1.0e-14 * @max(@float_from_int(f64, n), 1.0);
+        @expect(max_err(y, want) <= tol);
+        inverse(y)!;
+        @expect(max_err(y, x) <= 1.0e-15 * @max(@float_from_int(f64, n), 1.0));
+        naive(x, want, true);
+        let mut p = Plan.init(n)!;
+        defer p.deinit();
+        @mem_copy(y, x);
+        p.run(y, true)!;
+        @expect(max_err(y, want) <= tol);
+    }
+    // an impulse gives a flat spectrum, and a constant an impulse
+    let mut v: [6]cx.Complex = [cx.Complex.init(0.0, 0.0); 6];
+    v[0] = cx.Complex.init(1.0, 0.0);
+    forward(v[..])!;
+    for z in v {
+        @expect(z.near(cx.Complex.init(1.0, 0.0), 1.0e-15));
+    }
+    forward(v[..])!;
+    @expect(v[0].near(cx.Complex.init(6.0, 0.0), 1.0e-14));
+    @expect(v[1].abs() < 1.0e-14);
+    let mut p4 = Plan.init(4)!;
+    defer p4.deinit();
+    @expect(fails(p4.forward(v[..])));
+}
+
+fn fails(r: !void) bool {
+    r catch return true;
+    return false;
+}
+
+test "real transforms and convolution" {
+    let x: [7]f64 = [1.0, -2.0, 0.5, 3.25, 0.0, -1.0, 2.0];
+    let s = rfft(x[..])!;
+    defer mem.free(s);
+    @expect(s.len == 4);
+    // X[0] is the sum
+    @expect(s[0].near(cx.Complex.init(3.75, 0.0), 1.0e-14));
+    let back = irfft(s, 7)!;
+    defer mem.free(back);
+    for k in @as(usize, 0)..7 {
+        @expect(@abs(back[k] - x[k]) < 1.0e-14);
+    }
+    let e = rfft(x[..6])!;
+    defer mem.free(e);
+    let back6 = irfft(e, 6)!;
+    defer mem.free(back6);
+    for k in @as(usize, 0)..6 {
+        @expect(@abs(back6[k] - x[k]) < 1.0e-14);
+    }
+    // (1 + 2t)(3 + t + t^2) = 3 + 7t + 3t^2 + 2t^3
+    let p1: [2]f64 = [1.0, 2.0];
+    let p2: [3]f64 = [3.0, 1.0, 1.0];
+    let c = convolve(p1[..], p2[..])!;
+    defer mem.free(c);
+    @expect(c.len == 4);
+    @expect((c[0] == 3.0) and (c[1] == 7.0) and (c[2] == 3.0) and (c[3] == 2.0));
+    // a large one, through the transform, against the direct sum
+    let a = mem.alloc.[f64](300)!;
+    defer mem.free(a);
+    let b = mem.alloc.[f64](77)!;
+    defer mem.free(b);
+    for k in @as(usize, 0)..300 {
+        a[k] = @float_from_int(f64, (k * 37) % 11) - 5.0;
+    }
+    for k in @as(usize, 0)..77 {
+        b[k] = @float_from_int(f64, (k * 13) % 7) - 3.0;
+    }
+    let big = convolve(a, b)!;
+    defer mem.free(big);
+    @expect(big.len == 376);
+    for k in @as(usize, 0)..376 {
+        let mut want: f64 = 0.0;
+        for i in @as(usize, 0)..300 {
+            if (k >= i) and ((k - i) < 77) {
+                want += a[i] * b[k - i];
+            }
+        }
+        @expect(@abs(big[k] - want) < 1.0e-9);
+    }
+    let none = convolve(a, b[..0])!;
+    defer mem.free(none);
+    @expect(none.len == 0);
+}

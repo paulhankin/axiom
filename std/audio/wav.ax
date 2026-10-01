@@ -1,0 +1,414 @@
+// =============================================================================
+// std/audio/wav.ax - WAV (RIFF WAVE) files, and RF64 for sounds over 4 GiB.
+//
+//     let mut s = wav.decode(bytes)!;
+//     defer s.deinit();
+//     let out = wav.encode(&s)!;   // mem.free it
+//     wav.encode_to(w, &s)!;       // or to an io.Writer
+//
+// Decoding reads integer PCM of 8 to 32 bits (any valid-bits count in its
+// container), 32- and 64-bit float, A-law and mu-law (as S16), plain or
+// WAVE_FORMAT_EXTENSIBLE, and RF64/BW64. Encoding writes the sound's own
+// sample format (PCM, or IEEE float with a fact chunk), extensible with
+// the standard speaker layout when there are more than two channels, and
+// RF64 when the data does not fit in 4 GiB.
+// =============================================================================
+
+import "../audio.ax" as audio;
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+
+error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
+
+const TAG_PCM: u32 = 1;
+const TAG_FLOAT: u32 = 3;
+const TAG_ALAW: u32 = 6;
+const TAG_MULAW: u32 = 7;
+const TAG_EXTENSIBLE: u32 = 0xfffe;
+
+pub fn is_wav(data: []u8) bool {
+    return (data.len >= 12) and
+           (@mem_eq(data[..4], "RIFF") or @mem_eq(data[..4], "RF64") or @mem_eq(data[..4], "BW64")) and
+           @mem_eq(data[8..12], "WAVE");
+}
+
+fn le16(b: []u8, i: usize) u32 {
+    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8);
+}
+
+fn le32(b: []u8, i: usize) u32 {
+    return le16(b, i) | (le16(b, i + 2) << 16);
+}
+
+fn le64(b: []u8, i: usize) u64 {
+    return @as(u64, le32(b, i)) | (@as(u64, le32(b, i + 4)) << 32);
+}
+
+/// G.711 A-law to 16-bit linear.
+pub fn alaw_decode(a: u8) i16 {
+    let v = a ^ 0x55;
+    let seg = @as(i32, (v >> 4) & 7);
+    let mut t = @as(i32, v & 15) << 4;
+    if seg == 0 {
+        t += 8;
+    } else {
+        t = (t + 0x108) << @truncate(u32, @bit_cast(u32, seg - 1));
+    }
+    if (v & 0x80) != 0 {
+        return @truncate(i16, t);
+    }
+    return @truncate(i16, -t);
+}
+
+/// G.711 mu-law to 16-bit linear.
+pub fn mulaw_decode(u: u8) i16 {
+    let v = ~u;
+    let seg = @as(u32, (v >> 4) & 7);
+    let t = ((@as(i32, v & 15) << 3) + 0x84) << seg;
+    if (v & 0x80) != 0 {
+        return @truncate(i16, 0x84 - t);
+    }
+    return @truncate(i16, t - 0x84);
+}
+
+pub fn decode(data: []u8) !audio.Sound {
+    if not is_wav(data) {
+        return error.InvalidAudio;
+    }
+    let rf64 = not @mem_eq(data[..4], "RIFF");
+    let mut ds64_data: u64 = 0;
+    let mut have_fmt = false;
+    let mut tag: u32 = 0;
+    let mut channels: usize = 0;
+    let mut rate: u32 = 0;
+    let mut align: usize = 0;
+    let mut bits: u32 = 0;
+    let mut p: usize = 12;
+    while (p + 8) <= data.len {
+        let id = data[p..p + 4];
+        let mut size = @as(u64, le32(data, p + 4));
+        let body = p + 8;
+        if @mem_eq(id, "ds64") and (size >= 16) and ((body + 16) <= data.len) {
+            ds64_data = le64(data, body + 8);
+        } else if @mem_eq(id, "fmt ") {
+            if (size < 16) or ((body + 16) > data.len) {
+                return error.InvalidAudio;
+            }
+            tag = le16(data, body);
+            channels = @as(usize, le16(data, body + 2));
+            rate = le32(data, body + 4);
+            align = @as(usize, le16(data, body + 12));
+            bits = le16(data, body + 14);
+            if (tag == TAG_EXTENSIBLE) and (size >= 40) and ((body + 40) <= data.len) {
+                tag = le16(data, body + 24);  // the sub-format GUID's first bytes
+            }
+            have_fmt = true;
+        } else if @mem_eq(id, "data") {
+            if not have_fmt {
+                return error.InvalidAudio;
+            }
+            if rf64 and (size == 0xffffffff) {
+                size = ds64_data;
+            }
+            let avail = @as(u64, data.len - body);
+            if (size > avail) or (size == 0xffffffff) {
+                size = avail;  // truncated, or written while streaming
+            }
+            return decode_samples(data[body..body + @truncate(usize, size)], tag, channels, rate, align, bits);
+        }
+        let skip = size + (size & 1);
+        if skip > @as(u64, data.len - body) {
+            break;
+        }
+        p = body + @truncate(usize, skip);
+    }
+    return error.InvalidAudio;
+}
+
+fn decode_samples(d: []u8, tag: u32, channels: usize, rate: u32, align: usize, bits: u32) !audio.Sound {
+    if (channels == 0) or (channels > 255) or (rate == 0) or (bits == 0) {
+        return error.InvalidAudio;
+    }
+    let mut width = (@as(usize, bits) + 7) / 8;  // bytes per sample in the file
+    if (align >= channels) and ((align % channels) == 0) and ((align / channels) >= width) {
+        width = align / channels;
+    }
+    let mut format = audio.SampleFormat.S16;
+    if tag == TAG_PCM {
+        if width == 1 {
+            format = audio.SampleFormat.U8;
+        } else if width == 2 {
+            format = audio.SampleFormat.S16;
+        } else if width == 3 {
+            format = audio.SampleFormat.S24;
+        } else if width == 4 {
+            format = audio.SampleFormat.S32;
+        } else {
+            return error.Unsupported;
+        }
+    } else if tag == TAG_FLOAT {
+        if width == 4 {
+            format = audio.SampleFormat.F32;
+        } else if width == 8 {
+            format = audio.SampleFormat.F64;
+        } else {
+            return error.Unsupported;
+        }
+    } else if not (((tag == TAG_ALAW) or (tag == TAG_MULAW)) and (width == 1)) {
+        return error.Unsupported;
+    }
+    let frames = d.len / (width * channels);
+    let mut s = audio.Sound.init(frames, channels, rate, format)!;
+    let n = frames * channels;
+    if (tag == TAG_ALAW) or (tag == TAG_MULAW) {
+        let out = s.samples_i16();
+        for i in @as(usize, 0)..n {
+            if tag == TAG_ALAW {
+                out[i] = alaw_decode(d[i]);
+            } else {
+                out[i] = mulaw_decode(d[i]);
+            }
+        }
+    } else if format == audio.SampleFormat.S24 {
+        let out = s.samples_i32();
+        for i in @as(usize, 0)..n {
+            let v = (@as(u32, d[3 * i]) << 8) | (@as(u32, d[(3 * i) + 1]) << 16) | (@as(u32, d[(3 * i) + 2]) << 24);
+            out[i] = @bit_cast(i32, v) >> 8;
+        }
+    } else {
+        // the file's samples are little-endian, like memory
+        @mem_copy(s.data[..n * width], d[..n * width]);
+    }
+    return s;
+}
+
+/// The standard speaker layout for a number of channels (0 if none).
+fn channel_mask(channels: usize) u32 {
+    let masks: [9]u32 = [0, 0x4, 0x3, 0x7, 0x33, 0x37, 0x3f, 0x13f, 0x63f];
+    if channels < masks.len {
+        return masks[channels];
+    }
+    return 0;
+}
+
+struct Out {
+    b: []mut u8,
+    n: usize,
+
+    fn bytes(self: *mut Out, s: []u8) void {
+        @mem_copy(self.b[self.n..self.n + s.len], s);
+        self.n += s.len;
+    }
+
+    fn u16le(self: *mut Out, v: u32) void {
+        self.b[self.n] = @truncate(u8, v);
+        self.b[self.n + 1] = @truncate(u8, v >> 8);
+        self.n += 2;
+    }
+
+    fn u32le(self: *mut Out, v: u32) void {
+        self.u16le(v & 0xffff);
+        self.u16le(v >> 16);
+    }
+
+    fn u64le(self: *mut Out, v: u64) void {
+        self.u32le(@truncate(u32, v));
+        self.u32le(@truncate(u32, v >> 32));
+    }
+}
+
+// The sizes of the parts of a sound's encoding.
+struct Layout {
+    width: usize,  // bytes per sample
+    data_len: u64,
+    ext: bool,
+    float: bool,
+    fmt_len: usize,
+    pad: usize,
+    big: bool,  // RF64
+    total: u64,
+}
+
+fn layout(s: *audio.Sound) Layout {
+    let width = @as(usize, audio.bits(s.format)) / 8;
+    let data_len = @as(u64, s.len()) * @as(u64, width);
+    let ext = s.channels > 2;
+    let float = audio.is_float(s.format);
+    let mut fmt_len: usize = 16;
+    if ext {
+        fmt_len = 40;
+    } else if float {
+        fmt_len = 18;
+    }
+    let mut head: usize = 12 + 8 + fmt_len;
+    if float {
+        head += 12;  // fact
+    }
+    let pad = @truncate(usize, data_len & 1);
+    let mut total = @as(u64, head + 8 + pad) + data_len;
+    let big = total > 0xffffffff;
+    if big {
+        total += 36;  // ds64
+    }
+    return Layout.{ width: width, data_len: data_len, ext: ext, float: float, fmt_len: fmt_len, pad: pad, big: big,
+                    total: total };
+}
+
+/// The WAV file for a sound, in new memory (free it with mem.free).
+pub fn encode(s: *audio.Sound) ![]mut u8 {
+    let total = layout(s).total;
+    if total > @as(u64, @max_value(usize)) {
+        return error.TooLarge;
+    }
+    let mut out = strs.String.with_capacity(@truncate(usize, total))!;
+    encode_to(out.writer(), s) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// Writes the WAV file for a sound to w: the header in one write, then the
+/// samples (straight from the sound, or 24-bit ones converted 3 KB at a
+/// time).
+pub fn encode_to(w: io.Writer, s: *audio.Sound) !void {
+    let l = layout(s);
+    let width = l.width;
+    let n = s.len();
+    let mut hb: [128]u8 = [0; 128];
+    let mut o = Out.{ b: hb[..], n: 0 };
+    if l.big {
+        o.bytes("RF64");
+        o.u32le(0xffffffff);
+        o.bytes("WAVE");
+        o.bytes("ds64");
+        o.u32le(28);
+        o.u64le(l.total - 8);
+        o.u64le(l.data_len);
+        o.u64le(@as(u64, s.frames));
+        o.u32le(0);  // no table
+    } else {
+        o.bytes("RIFF");
+        o.u32le(@truncate(u32, l.total - 8));
+        o.bytes("WAVE");
+    }
+    o.bytes("fmt ");
+    o.u32le(@truncate(u32, l.fmt_len));
+    let mut tag = TAG_PCM;
+    if l.float {
+        tag = TAG_FLOAT;
+    }
+    if l.ext {
+        o.u16le(TAG_EXTENSIBLE);
+    } else {
+        o.u16le(tag);
+    }
+    o.u16le(@truncate(u32, s.channels));
+    o.u32le(s.rate);
+    o.u32le(@truncate(u32, @as(u64, s.rate) * @as(u64, s.channels * width)));
+    o.u16le(@truncate(u32, s.channels * width));
+    o.u16le(@truncate(u32, width * 8));
+    if l.ext {
+        o.u16le(22);
+        o.u16le(@truncate(u32, width * 8));
+        o.u32le(channel_mask(s.channels));
+        // the sub-format GUID: tag-0000-0010-8000-00aa00389b71
+        o.u32le(tag);
+        let rest: [12]u8 = [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71];
+        o.bytes(rest[..]);
+    } else if l.float {
+        o.u16le(0);
+    }
+    if l.float {
+        o.bytes("fact");
+        o.u32le(4);
+        o.u32le(@truncate(u32, @min(@as(u64, s.frames), 0xffffffff)));
+    }
+    o.bytes("data");
+    if l.big {
+        o.u32le(0xffffffff);
+    } else {
+        o.u32le(@truncate(u32, l.data_len));
+    }
+    w.write_all(hb[..o.n])!;
+    if s.format == audio.SampleFormat.S24 {
+        let src = s.samples_i32();
+        let mut buf: [3072]u8 = [0; 3072];
+        let mut i: usize = 0;
+        while i < n {
+            let k = @min(n - i, 1024);
+            for j in @as(usize, 0)..k {
+                let v = @bit_cast(u32, src[i + j]);
+                buf[3 * j] = @truncate(u8, v);
+                buf[(3 * j) + 1] = @truncate(u8, v >> 8);
+                buf[(3 * j) + 2] = @truncate(u8, v >> 16);
+            }
+            w.write_all(buf[..3 * k])!;
+            i += k;
+        }
+    } else {
+        w.write_all(s.data[..n * width])!;
+    }
+    if l.pad != 0 {
+        w.write_all("\x00")!;
+    }
+}
+
+test "round trips every format" {
+    let fmts: [6]audio.SampleFormat = [audio.SampleFormat.U8, audio.SampleFormat.S16, audio.SampleFormat.S24,
+                                       audio.SampleFormat.S32, audio.SampleFormat.F32, audio.SampleFormat.F64];
+    let chans: [3]usize = [1, 2, 6];
+    for f in fmts {
+        for ch in chans {
+            let mut s = audio.Sound.init(101, ch, 22050, f)!;
+            defer s.deinit();
+            for i in @as(usize, 0)..s.len() {
+                s.set_sample(i, @float_from_int(f64, (i * 7919) % 2001) / 1000.0 - 1.0);
+            }
+            let enc = encode(&s)!;
+            defer mem.free(enc);
+            @expect(is_wav(enc));
+            let mut sw = strs.String.init();
+            defer sw.deinit();
+            encode_to(sw.writer(), &s)!;
+            @expect_eq(sw.bytes(), enc);
+            let mut back = decode(enc)!;
+            defer back.deinit();
+            @expect(back.format == f);
+            @expect_eq(back.channels, ch);
+            @expect_eq(back.rate, 22050);
+            @expect_eq(back.frames, 101);
+            @expect_eq(back.data[..], s.data[..]);
+        }
+    }
+}
+
+test "encode_to passes on the writer's errors" {
+    let mut s = audio.Sound.init(5000, 2, 8000, audio.SampleFormat.S24)!;
+    defer s.deinit();
+    let mut small: [4000]u8 = [0; 4000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &s) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
+}
+
+test "g711" {
+    @expect_eq(mulaw_decode(0xff), 0);
+    @expect_eq(mulaw_decode(0x80), 32124);
+    @expect_eq(mulaw_decode(0x00), -32124);
+    @expect_eq(alaw_decode(0xd5), 8);
+    @expect_eq(alaw_decode(0x55), -8);
+    @expect_eq(alaw_decode(0xaa), 32256);
+}
+
+test "rejects" {
+    _ = decode("RIFF\x04\x00\x00\x00WAVEdata\x00\x00\x00\x00") catch |e| {
+        @expect_eq(e, error.InvalidAudio);  // data before fmt
+        return;
+    };
+    @trap();
+}

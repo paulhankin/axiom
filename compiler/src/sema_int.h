@@ -1,6 +1,6 @@
 // sema_int.h - internals shared by the sema_*.c files.
-#ifndef PH_SEMA_INT_H
-#define PH_SEMA_INT_H
+#ifndef AX_SEMA_INT_H
+#define AX_SEMA_INT_H
 
 #include "builtins.h"
 #include "diag.h"

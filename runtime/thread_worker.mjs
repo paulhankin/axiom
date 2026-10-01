@@ -1,9 +1,9 @@
-// runtime/thread_worker.mjs - runs one Phalange thread: a new instance of the
-// program's module on the shared memory, entered through phalange_thread_start.
+// runtime/thread_worker.mjs - runs one Axiom thread: a new instance of the
+// program's module on the shared memory, entered through axiom_thread_start.
 //
 // A trap in any thread terminates the whole program (spec §12.8). The main
 // thread may be blocked in Atomics.wait and unable to see worker events, so
-// the trapping thread ends the process itself. Under `phalange test` it
+// the trapping thread ends the process itself. Under `axiom test` it
 // reports the trap as its test's result to the test runner instead, which
 // ends that test.
 import fs from 'fs';
@@ -15,7 +15,7 @@ const host = createHost({ memory, netPort, shared });
 let instance = null;
 try {
   instance = host.instantiateModule(module);
-  instance.exports.phalange_thread_start(entry, arg, stackTop);
+  instance.exports.axiom_thread_start(entry, arg, stackTop);
   // Only now is the thread off its stack, which the program may then free.
   const words = new Int32Array(memory.buffer);
   const i = Number(exited) / 4;

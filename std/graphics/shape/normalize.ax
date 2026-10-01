@@ -1,0 +1,484 @@
+// =============================================================================
+// std/graphics/shape/normalize.ax - normalization for shaping: characters decompose
+// when the font lacks a composed form but has the parts, marks sort into
+// canonical order, then compose again where the font has the composite
+// (HarfBuzz's hb-ot-shape-normalize). Each character ends up with the glyph
+// the font maps it to (Info.gid).
+// =============================================================================
+
+import "../../unicode.ax" as uni;
+import "buffer.ax" as buf;
+import "layout.ax" as layout;
+import "plan.ax" as plan;
+
+const MAX_COMBINING_MARKS: usize = 32;
+
+fn decompose_pair(p: *plan.Plan, ab: u32) [2]u32 {
+    if p.shaper == plan.SHAPER_INDIC {
+        if (ab == 0x0931) or (ab == 0x09dc) or (ab == 0x09dd) or (ab == 0x0b94) {
+            return [0, 0];
+        }
+    }
+    return uni.decompose_step(ab);
+}
+
+let DAGESH_FORMS: [27]u32 = [
+    0xfb30,
+    0xfb31,
+    0xfb32,
+    0xfb33,
+    0xfb34,
+    0xfb35,
+    0xfb36,
+    0,
+    0xfb38,
+    0xfb39,
+    0xfb3a,
+    0xfb3b,
+    0xfb3c,
+    0,
+    0xfb3e,
+    0,
+    0xfb40,
+    0xfb41,
+    0,
+    0xfb43,
+    0xfb44,
+    0,
+    0xfb46,
+    0xfb47,
+    0xfb48,
+    0xfb49,
+    0xfb4a,
+];
+
+/// Hebrew presentation forms, for fonts without mark positioning.
+fn compose_hebrew(a: u32, b: u32) u32 {
+    if b == 0x05b4 {
+        if a == 0x05d9 {
+            return 0xfb1d;
+        }
+    } else if b == 0x05b7 {
+        if a == 0x05f2 {
+            return 0xfb1f;
+        }
+        if a == 0x05d0 {
+            return 0xfb2e;
+        }
+    } else if b == 0x05b8 {
+        if a == 0x05d0 {
+            return 0xfb2f;
+        }
+    } else if b == 0x05b9 {
+        if a == 0x05d5 {
+            return 0xfb4b;
+        }
+    } else if b == 0x05bc {
+        if (a >= 0x05d0) and (a <= 0x05ea) {
+            return DAGESH_FORMS[@as(usize, a - 0x05d0)];
+        }
+        if a == 0xfb2a {
+            return 0xfb2c;
+        }
+        if a == 0xfb2b {
+            return 0xfb2d;
+        }
+    } else if b == 0x05bf {
+        if a == 0x05d1 {
+            return 0xfb4c;
+        }
+        if a == 0x05db {
+            return 0xfb4d;
+        }
+        if a == 0x05e4 {
+            return 0xfb4e;
+        }
+    } else if b == 0x05c1 {
+        if a == 0x05e9 {
+            return 0xfb2a;
+        }
+        if a == 0xfb49 {
+            return 0xfb2c;
+        }
+    } else if b == 0x05c2 {
+        if a == 0x05e9 {
+            return 0xfb2b;
+        }
+        if a == 0xfb49 {
+            return 0xfb2d;
+        }
+    }
+    return 0;
+}
+
+fn compose_pair(p: *plan.Plan, a: u32, b: u32) u32 {
+    if p.shaper == plan.SHAPER_INDIC {
+        if plan.is_mark_gc(uni.category_code(a)) {
+            return 0;
+        }
+        if (a == 0x09af) and (b == 0x09bc) {
+            return 0x09df;
+        }
+    }
+    let ab = uni.compose_step(a, b);
+    if (ab == 0) and (p.shaper == plan.SHAPER_HEBREW) and not p.has_gpos_mark {
+        return compose_hebrew(a, b);
+    }
+    return ab;
+}
+
+fn output_char(b: *mut buf.Buffer, unichar: u32, glyph: u32) void {
+    b.cur().gid = glyph;
+    _ = b.output_glyph(unichar);
+    plan.set_unicode_props(b, b.prev());
+}
+
+fn next_char(b: *mut buf.Buffer, glyph: u32) void {
+    b.cur().gid = glyph;
+    _ = b.next_glyph();
+}
+
+/// Outputs the decomposition of ab (as far as the font needs); the number
+/// of characters output, 0 if none.
+fn decompose(p: *plan.Plan, b: *mut buf.Buffer, shortest: bool, ab: u32, depth: u32) usize {
+    let pair = decompose_pair(p, ab);
+    let a = pair[0];
+    let bb = pair[1];
+    if (a == 0) or (depth > 32) {
+        return 0;
+    }
+    let mut b_glyph: u32 = 0;
+    if bb != 0 {
+        b_glyph = p.glyph(bb);
+        if b_glyph == 0 {
+            return 0;
+        }
+    }
+    let a_glyph = p.glyph(a);
+    let has_a = a_glyph != 0;
+    if shortest and has_a {
+        output_char(b, a, a_glyph);
+        if bb != 0 {
+            output_char(b, bb, b_glyph);
+            return 2;
+        }
+        return 1;
+    }
+    let ret = decompose(p, b, shortest, a, depth + 1);
+    if ret > 0 {
+        if bb != 0 {
+            output_char(b, bb, b_glyph);
+            return ret + 1;
+        }
+        return ret;
+    }
+    if has_a {
+        output_char(b, a, a_glyph);
+        if bb != 0 {
+            output_char(b, bb, b_glyph);
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn decompose_current_character(p: *plan.Plan, b: *mut buf.Buffer, shortest: bool) void {
+    let u = b.cur().cp;
+    if shortest {
+        let g = p.glyph(u);
+        if g != 0 {
+            next_char(b, g);
+            return;
+        }
+    }
+    if decompose(p, b, shortest, u, 0) > 0 {
+        b.skip_glyph();
+        return;
+    }
+    if not shortest {
+        let g = p.glyph(u);
+        if g != 0 {
+            next_char(b, g);
+            return;
+        }
+    }
+    if layout.gen_cat(b.cur()) == plan.GC_ZS {
+        let st = plan.space_fallback_type(u);
+        let space = p.glyph(0x20);
+        if (st != plan.SPACE_NOT) and (space != 0) {
+            let i = b.cur();
+            i.uprops = @truncate(u16, (st << 8) | @as(u32, i.uprops & 0xff));
+            next_char(b, space);
+            b.scratch |= buf.SF_HAS_SPACE_FALLBACK;
+            return;
+        }
+    }
+    if u == 0x2011 {
+        let g = p.glyph(0x2010);
+        if g != 0 {
+            next_char(b, g);
+            return;
+        }
+    }
+    next_char(b, 0);
+}
+
+fn is_variation_selector(u: u32) bool {
+    return ((u >= 0xfe00) and (u <= 0xfe0f)) or ((u >= 0xe0100) and (u <= 0xe01ef));
+}
+
+fn set_glyph(p: *plan.Plan, i: *mut buf.Info) void {
+    i.gid = p.glyph(i.cp);
+}
+
+fn handle_variation_selector_cluster(p: *plan.Plan, b: *mut buf.Buffer, end: usize) void {
+    while ((b.idx + 1) < end) and b.successful {
+        if is_variation_selector(b.info[b.idx + 1].cp) {
+            // (std/graphics/font has no variation-sequence cmap: the base keeps its
+            // usual glyph and the selector stays, to be hidden)
+            set_glyph(p, b.cur());
+            _ = b.next_glyph();
+            b.scratch |= buf.SF_HAS_VS_FALLBACK;
+            let vs = b.cur();
+            layout.set_gen_cat(vs, plan.GC_CF);
+            vs.uprops |= buf.UP_VS;
+            set_glyph(p, b.cur());
+            _ = b.next_glyph();
+            while (b.idx < end) and b.successful and is_variation_selector(b.info[b.idx].cp) {
+                set_glyph(p, b.cur());
+                _ = b.next_glyph();
+            }
+        } else {
+            set_glyph(p, b.cur());
+            _ = b.next_glyph();
+        }
+    }
+    if b.idx < end {
+        set_glyph(p, b.cur());
+        _ = b.next_glyph();
+    }
+}
+
+fn decompose_multi_char_cluster(p: *plan.Plan, b: *mut buf.Buffer, end: usize, short_circuit: bool) void {
+    for i in b.idx..end {
+        if is_variation_selector(b.info[i].cp) {
+            handle_variation_selector_cluster(p, b, end);
+            return;
+        }
+    }
+    while (b.idx < end) and b.successful {
+        decompose_current_character(p, b, short_circuit);
+    }
+}
+
+fn mcc_key(p: *plan.Plan, i: *buf.Info) u32 {
+    return layout.modified_cc(i);
+}
+
+/// Arabic: modifier combining marks (hamza above and below and a few others)
+/// move before other marks of their class (HarfBuzz's reorder_marks_arabic).
+fn reorder_marks_arabic(b: *mut buf.Buffer, start0: usize, end: usize) void {
+    let mcm: [14]u32 = [0x0654, 0x0655, 0x0658, 0x06dc, 0x06e3, 0x06e7, 0x06e8, 0x08ca, 0x08cb, 0x08cd, 0x08ce, 0x08cf,
+                        0x08d3, 0x08f3];
+    let mut start = start0;
+    let mut i = start;
+    let mut cc: u32 = 220;
+    while cc <= 230 {
+        while (i < end) and (layout.modified_cc(&b.info[i]) < cc) {
+            i += 1;
+        }
+        if i == end {
+            break;
+        }
+        if layout.modified_cc(&b.info[i]) > cc {
+            cc += 10;
+            continue;
+        }
+        let mut j = i;
+        while (j < end) and (layout.modified_cc(&b.info[j]) == cc) and in_list(mcm[..], b.info[j].cp) {
+            j += 1;
+        }
+        if i == j {
+            cc += 10;
+            continue;
+        }
+        b.merge_clusters(start, j);
+        let mut temp: [32]buf.Info = [buf.zero_info(); 32];
+        for k in i..j {
+            temp[k - i] = b.info[k];
+        }
+        let mut k = i;
+        while k > start {
+            k -= 1;
+            b.info[k + (j - i)] = b.info[k];
+        }
+        for k2 in @as(usize, 0)..(j - i) {
+            b.info[start + k2] = temp[k2];
+        }
+        let new_start = start + (j - i);
+        let mut new_cc: u32 = 26;  // HarfBuzz's CCC26 (point varika's class) for 230
+        if cc == 220 {
+            new_cc = 25;  // CCC22 (meteg)
+        }
+        while start < new_start {
+            layout.set_modified_cc(&mut b.info[start], new_cc);
+            start += 1;
+        }
+        i = j;
+        cc += 10;
+    }
+}
+
+fn in_list(xs: []u32, x: u32) bool {
+    for v in xs {
+        if v == x {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Hebrew: patah or qamats before a sheva or hiriq, then meteg or a below
+/// mark, swap the last two (HarfBuzz's reorder_marks_hebrew).
+fn reorder_marks_hebrew(b: *mut buf.Buffer, start: usize, end: usize) void {
+    let mut i = start + 2;
+    while i < end {
+        let c0 = layout.modified_cc(&b.info[i - 2]);
+        let c1 = layout.modified_cc(&b.info[i - 1]);
+        let c2 = layout.modified_cc(&b.info[i]);
+        if ((c0 == 20) or (c0 == 21)) and ((c1 == 22) or (c1 == 23)) and ((c2 == 25) or (c2 == 220)) {
+            b.merge_clusters(i - 1, i + 1);
+            let t = b.info[i - 1];
+            b.info[i - 1] = b.info[i];
+            b.info[i] = t;
+            break;
+        }
+        i += 1;
+    }
+}
+
+pub fn normalize(p: *plan.Plan, b: *mut buf.Buffer) void {
+    if b.len == 0 {
+        return;
+    }
+    let mode = p.norm;
+    let might_short_circuit = (mode != plan.NM_DECOMPOSED) and (mode != plan.NM_COMPOSED_NO_SHORT_CIRCUIT);
+    let mut all_simple = true;
+    // decompose
+    b.clear_output();
+    let count = b.len;
+    b.idx = 0;
+    loop {
+        let mut end = b.idx + 1;
+        while (end < count) and not layout.is_unicode_mark(&b.info[end]) {
+            end += 1;
+        }
+        if end < count {
+            end -= 1;  // leave the base of the marks for the cluster
+        }
+        if might_short_circuit {
+            let mut done: usize = 0;
+            while (b.idx + done) < end {
+                let i = &mut b.info[b.idx + done];
+                let g = p.glyph(i.cp);
+                if g == 0 {
+                    break;
+                }
+                i.gid = g;
+                done += 1;
+            }
+            if not b.next_glyphs(done) {
+                break;
+            }
+        }
+        while (b.idx < end) and b.successful {
+            decompose_current_character(p, b, might_short_circuit);
+        }
+        if (b.idx == count) or not b.successful {
+            break;
+        }
+        all_simple = false;
+        end = b.idx + 1;
+        while (end < count) and layout.is_unicode_mark(&b.info[end]) {
+            end += 1;
+        }
+        decompose_multi_char_cluster(p, b, end, false);
+        if (b.idx >= count) or not b.successful {
+            break;
+        }
+    }
+    _ = b.sync();
+    // reorder marks
+    if not all_simple {
+        let n = b.len;
+        let mut i: usize = 0;
+        while i < n {
+            if layout.modified_cc(&b.info[i]) == 0 {
+                i += 1;
+                continue;
+            }
+            let mut end = i + 1;
+            while (end < n) and (layout.modified_cc(&b.info[end]) != 0) {
+                end += 1;
+            }
+            if (end - i) > MAX_COMBINING_MARKS {
+                i = end + 1;
+                continue;
+            }
+            b.sort_by(i, end, p, mcc_key);
+            if p.shaper == plan.SHAPER_ARABIC {
+                reorder_marks_arabic(b, i, end);
+            } else if p.shaper == plan.SHAPER_HEBREW {
+                reorder_marks_hebrew(b, i, end);
+            }
+            i = end + 1;
+        }
+    }
+    if (b.scratch & buf.SF_HAS_CGJ) != 0 {
+        let n = b.len;
+        let mut i: usize = 1;
+        while (i + 1) < n {
+            if (b.info[i].cp == 0x034f) and
+               ((layout.modified_cc(&b.info[i + 1]) == 0) or
+                (layout.modified_cc(&b.info[i - 1]) <= layout.modified_cc(&b.info[i + 1]))) {
+                b.info[i].uprops &= ~buf.UP_HIDDEN;
+            }
+            i += 1;
+        }
+    }
+    // recompose
+    if not all_simple and b.successful and ((mode == plan.NM_COMPOSED) or (mode == plan.NM_COMPOSED_NO_SHORT_CIRCUIT)) {
+        b.clear_output();
+        let n = b.len;
+        let mut starter: usize = 0;
+        _ = b.next_glyph();
+        while b.idx < n {
+            if layout.is_unicode_mark(&b.info[b.idx]) {
+                if (starter == (b.out_len - 1)) or
+                   (layout.modified_cc(&b.out[b.out_len - 1]) < layout.modified_cc(&b.info[b.idx])) {
+                    let composed = compose_pair(p, b.out[starter].cp, b.info[b.idx].cp);
+                    let glyph = p.glyph(composed);
+                    if (composed != 0) and (glyph != 0) {
+                        if not b.next_glyph() {
+                            break;
+                        }
+                        b.merge_out_clusters(starter, b.out_len);
+                        b.out_len -= 1;
+                        b.out[starter].cp = composed;
+                        b.out[starter].gid = glyph;
+                        plan.set_unicode_props(b, &mut b.out[starter]);
+                        continue;
+                    }
+                }
+            }
+            if not b.next_glyph() {
+                break;
+            }
+            if layout.modified_cc(&b.out[b.out_len - 1]) == 0 {
+                starter = b.out_len - 1;
+            }
+        }
+        _ = b.sync();
+    }
+}

@@ -1,0 +1,225 @@
+// =============================================================================
+// std/hash/murmur3.ax - MurmurHash3 (Austin Appleby): x86_32 and x64_128.
+//
+//     let h = murmur3.x86_32(data, seed);           // u32
+//     let w = murmur3.x64_128(data, seed);          // Hash128 { h1, h2 }
+//     let b = w.bytes();                            // [16]u8, as the reference writes it
+//
+// Fast, well-mixed, non-cryptographic hashes, the ones named by Bloom
+// filters, Cassandra, Kafka partitioners and many file formats. They are
+// unkeyed (the seed is no secret: collisions independent of the seed are
+// known), so for tables of untrusted keys use std/hash. Follows
+// MurmurHash3.cpp from SMHasher; checked against the Python mmh3 package,
+// which wraps it.
+// =============================================================================
+
+fn le32(b: []u8, i: usize) u32 {
+    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8) | (@as(u32, b[i + 2]) << 16) | (@as(u32, b[i + 3]) << 24);
+}
+
+fn le64(b: []u8, i: usize) u64 {
+    return @as(u64, le32(b, i)) | (@as(u64, le32(b, i + 4)) << 32);
+}
+
+/// The tail bytes from i on (fewer than a block), little-endian.
+fn tail64(b: []u8, i: usize, n: usize) u64 {
+    let mut x: u64 = 0;
+    for k in @as(usize, 0)..n {
+        x |= @as(u64, b[i + k]) << @as(u64, 8 * k);
+    }
+    return x;
+}
+
+fn fmix32(x: u32) u32 {
+    let mut h = x;
+    h ^= h >> 16;
+    h *%= 0x85ebca6b;
+    h ^= h >> 13;
+    h *%= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+}
+
+fn fmix64(x: u64) u64 {
+    let mut k = x;
+    k ^= k >> 33;
+    k *%= 0xff51afd7ed558ccd;
+    k ^= k >> 33;
+    k *%= 0xc4ceb9fe1a85ec53;
+    k ^= k >> 33;
+    return k;
+}
+
+const C1_32: u32 = 0xcc9e2d51;
+const C2_32: u32 = 0x1b873593;
+const C1_64: u64 = 0x87c37b91114253d5;
+const C2_64: u64 = 0x4cf5ad432745937f;
+
+/// MurmurHash3_x86_32 of data.
+pub fn x86_32(data: []u8, seed: u32) u32 {
+    let mut h = seed;
+    let nblocks = data.len / 4;
+    for b in @as(usize, 0)..nblocks {
+        let mut k = le32(data, 4 * b);
+        k *%= C1_32;
+        k = @rotl(k, 15);
+        k *%= C2_32;
+        h ^= k;
+        h = @rotl(h, 13);
+        h = (h *% 5) +% 0xe6546b64;
+    }
+    let rest = data.len % 4;
+    if rest > 0 {
+        let mut k = @truncate(u32, tail64(data, 4 * nblocks, rest));
+        k *%= C1_32;
+        k = @rotl(k, 15);
+        k *%= C2_32;
+        h ^= k;
+    }
+    h ^= @truncate(u32, data.len);
+    return fmix32(h);
+}
+
+/// A 128-bit MurmurHash3 result: the reference's two words.
+pub struct Hash128 {
+    h1: u64,
+    h2: u64,
+
+    /// The 16 bytes the reference writes (h1 then h2, little-endian).
+    pub fn bytes(self: Hash128) [16]u8 {
+        let mut out: [16]u8 = [0; 16];
+        for i in @as(usize, 0)..8 {
+            out[i] = @truncate(u8, self.h1 >> @as(u64, 8 * i));
+            out[i + 8] = @truncate(u8, self.h2 >> @as(u64, 8 * i));
+        }
+        return out;
+    }
+}
+
+/// MurmurHash3_x64_128 of data.
+pub fn x64_128(data: []u8, seed: u32) Hash128 {
+    let mut h1 = @as(u64, seed);
+    let mut h2 = @as(u64, seed);
+    let nblocks = data.len / 16;
+    for b in @as(usize, 0)..nblocks {
+        let mut k1 = le64(data, 16 * b);
+        let mut k2 = le64(data, (16 * b) + 8);
+        k1 *%= C1_64;
+        k1 = @rotl(k1, 31);
+        k1 *%= C2_64;
+        h1 ^= k1;
+        h1 = @rotl(h1, 27);
+        h1 +%= h2;
+        h1 = (h1 *% 5) +% 0x52dce729;
+        k2 *%= C2_64;
+        k2 = @rotl(k2, 33);
+        k2 *%= C1_64;
+        h2 ^= k2;
+        h2 = @rotl(h2, 31);
+        h2 +%= h1;
+        h2 = (h2 *% 5) +% 0x38495ab5;
+    }
+    let base = 16 * nblocks;
+    let rest = data.len % 16;
+    if rest > 8 {
+        let mut k2 = tail64(data, base + 8, rest - 8);
+        k2 *%= C2_64;
+        k2 = @rotl(k2, 33);
+        k2 *%= C1_64;
+        h2 ^= k2;
+    }
+    if rest > 0 {
+        let mut k1 = tail64(data, base, @min(rest, 8));
+        k1 *%= C1_64;
+        k1 = @rotl(k1, 31);
+        k1 *%= C2_64;
+        h1 ^= k1;
+    }
+    h1 ^= @as(u64, data.len);
+    h2 ^= @as(u64, data.len);
+    h1 +%= h2;
+    h2 +%= h1;
+    h1 = fmix64(h1);
+    h2 = fmix64(h2);
+    h1 +%= h2;
+    h2 +%= h1;
+    return Hash128.{ h1: h1, h2: h2 };
+}
+
+// -----------------------------------------------------------------------------
+// Tests: from the Python mmh3 package (hash, hash128 with x64arch=True), over
+// bytes (i * 31 + 7) & 255
+// -----------------------------------------------------------------------------
+
+struct Vector {
+    n: usize,
+    seed: u32,
+    h32: u32,
+    h1: u64,
+    h2: u64,
+}
+
+let MM_VECTORS: [40]Vector = [
+    Vector.{ n: 0, seed: 0x00000000, h32: 0x00000000, h1: 0x0000000000000000, h2: 0x0000000000000000 },
+    Vector.{ n: 0, seed: 0x9747b28c, h32: 0xebb6c228, h1: 0x392b208a1daabbb3, h2: 0x93b0608fe302957a },
+    Vector.{ n: 1, seed: 0x00000000, h32: 0x6882f382, h1: 0xc427909d8972bd17, h2: 0x5c15702a45b199dd },
+    Vector.{ n: 1, seed: 0x9747b28c, h32: 0xafa14d0c, h1: 0x9358a8cb656340b3, h2: 0x6782311328d3b7ca },
+    Vector.{ n: 2, seed: 0x00000000, h32: 0x10665d92, h1: 0xbcaa5d247b77f590, h2: 0x2b9be8c87f32d7ee },
+    Vector.{ n: 2, seed: 0x9747b28c, h32: 0x632bea95, h1: 0x946ef3533322e44d, h2: 0x6f739bc18fa6d317 },
+    Vector.{ n: 3, seed: 0x00000000, h32: 0x5db0b144, h1: 0x33ff6eda4da0a23b, h2: 0x5f905e8bd93c3afb },
+    Vector.{ n: 3, seed: 0x9747b28c, h32: 0x3298a451, h1: 0x214c13332d08ea31, h2: 0xdadee36cdd8d1b89 },
+    Vector.{ n: 4, seed: 0x00000000, h32: 0xc09a300e, h1: 0x331195913937a3b4, h2: 0x642e0845db611d66 },
+    Vector.{ n: 4, seed: 0x9747b28c, h32: 0xe10f9125, h1: 0x271b79d34a24f11d, h2: 0x541c0b408bbeebf2 },
+    Vector.{ n: 5, seed: 0x00000000, h32: 0x268013ad, h1: 0x634332548738e00f, h2: 0x05368e5c33ad8afc },
+    Vector.{ n: 5, seed: 0x9747b28c, h32: 0x64f9dfa8, h1: 0x0dbc24d506b12471, h2: 0x34b6b1352ecd2cd8 },
+    Vector.{ n: 7, seed: 0x00000000, h32: 0x5b1bc169, h1: 0x3f14fdfcc2d9b91c, h2: 0x01ebfd1098f1204f },
+    Vector.{ n: 7, seed: 0x9747b28c, h32: 0xcbbece51, h1: 0xcf3d4238d21683c1, h2: 0xb587939f87952698 },
+    Vector.{ n: 8, seed: 0x00000000, h32: 0xecad64a3, h1: 0xd927130c3ea3af5d, h2: 0xeeab4cb4fb7e6832 },
+    Vector.{ n: 8, seed: 0x9747b28c, h32: 0x244a1af6, h1: 0x87b3faace034a74c, h2: 0xd33f5af263181ac5 },
+    Vector.{ n: 9, seed: 0x00000000, h32: 0xc4d63cf9, h1: 0x320f43f3fbfb3be4, h2: 0xa373172dd046f7a2 },
+    Vector.{ n: 9, seed: 0x9747b28c, h32: 0xfd1ba07e, h1: 0x71c101b86e28b692, h2: 0x3633950aaa89df75 },
+    Vector.{ n: 15, seed: 0x00000000, h32: 0xc30c03de, h1: 0x3775f4b56782ab17, h2: 0x6c299d80b12b415e },
+    Vector.{ n: 15, seed: 0x9747b28c, h32: 0xb905907d, h1: 0x48c70bc5f71a7700, h2: 0x52e45ce62da062b7 },
+    Vector.{ n: 16, seed: 0x00000000, h32: 0x2a3ac0f6, h1: 0x466b79ebf689da14, h2: 0x8c548b02b805858a },
+    Vector.{ n: 16, seed: 0x9747b28c, h32: 0xa61be608, h1: 0xfd381038d043fa0c, h2: 0x278cce0f63e9afa8 },
+    Vector.{ n: 17, seed: 0x00000000, h32: 0x3e8a519e, h1: 0xeb322f84309de524, h2: 0x082aa01f2728481b },
+    Vector.{ n: 17, seed: 0x9747b28c, h32: 0xa2cdd862, h1: 0x0b583dc53f00886e, h2: 0x9f17c457949bc501 },
+    Vector.{ n: 31, seed: 0x00000000, h32: 0x46d9904d, h1: 0x49db93da32960569, h2: 0x90b21e6033dc6c1e },
+    Vector.{ n: 31, seed: 0x9747b28c, h32: 0x39837028, h1: 0xe3a218227f195d8f, h2: 0x44767f22a3b629e5 },
+    Vector.{ n: 32, seed: 0x00000000, h32: 0x1e9978f3, h1: 0x428638cea8126132, h2: 0xf0ca1d512a155d2e },
+    Vector.{ n: 32, seed: 0x9747b28c, h32: 0xa9f25f32, h1: 0x469f3bb24e0e6c4c, h2: 0xa28dd2f4786b1b48 },
+    Vector.{ n: 33, seed: 0x00000000, h32: 0xd7d09e89, h1: 0xfa0bc7309230cdeb, h2: 0x3721c70c96532164 },
+    Vector.{ n: 33, seed: 0x9747b28c, h32: 0xfc12f764, h1: 0x85aac9ff6999f2cd, h2: 0x39846019246bd5b1 },
+    Vector.{ n: 100, seed: 0x00000000, h32: 0x34c6bb9c, h1: 0x024e0b490a12c598, h2: 0x6dbbc2144bf00383 },
+    Vector.{ n: 100, seed: 0x9747b28c, h32: 0x7bd4d1c7, h1: 0xb502601d6c7fdf71, h2: 0xe920da50d1bca772 },
+    Vector.{ n: 299, seed: 0x00000000, h32: 0xbc71a2f9, h1: 0xf3360c687d2df2cd, h2: 0x218eacf29e2d9198 },
+    Vector.{ n: 299, seed: 0x9747b28c, h32: 0x2c362cb5, h1: 0xf5744c65867b9a26, h2: 0x9a5e27a45fab7357 },
+    Vector.{ n: 0, seed: 0x00000001, h32: 0x514e28b7, h1: 0x4610abe56eff5cb5, h2: 0x51622daa78f83583 },
+    Vector.{ n: 0, seed: 0xffffffff, h32: 0x81f16f39, h1: 0x6af1df4d9d3bc9ec, h2: 0x857421121ee6446b },
+    Vector.{ n: 1, seed: 0x00000001, h32: 0x16b344ea, h1: 0x587362219a67c0a2, h2: 0x84ad1332679ba0f3 },
+    Vector.{ n: 1, seed: 0xffffffff, h32: 0xf261df19, h1: 0x45dcefa96b6ae797, h2: 0xffd58bdb8c6c0470 },
+    Vector.{ n: 16, seed: 0x00000001, h32: 0xe4fc49d4, h1: 0x927c77d3376549f8, h2: 0x963f2cee2fc573a7 },
+    Vector.{ n: 16, seed: 0xffffffff, h32: 0x1ef58c6d, h1: 0x15a053dfed5d7c31, h2: 0x50a3530fc7cab351 },
+];
+
+test "murmur3 vectors" {
+    let mut data: [300]u8 = [0; 300];
+    for i in @as(usize, 0)..300 {
+        data[i] = @truncate(u8, (i * 31) + 7);
+    }
+    for v in MM_VECTORS {
+        let d = data[..v.n];
+        @expect_eq(x86_32(d, v.seed), v.h32);
+        let h = x64_128(d, v.seed);
+        @expect_eq(h.h1, v.h1);
+        @expect_eq(h.h2, v.h2);
+    }
+}
+
+test "murmur3 known answers" {
+    @expect_eq(x86_32("", 1), 0x514e28b7);
+    @expect_eq(x86_32("Hello, world!", 1234), 0xfaf6cdb3);
+    let b = x64_128("The quick brown fox jumps over the lazy dog", 0).bytes();
+    let want: [16]u8 = [0x6c, 0x1b, 0x07, 0xbc, 0x7b, 0xbc, 0x4b, 0xe3, 0x47, 0x93, 0x9a, 0xc4, 0xa9, 0x3c, 0x43, 0x7a];
+    @expect_eq(b[..], want[..]);
+}

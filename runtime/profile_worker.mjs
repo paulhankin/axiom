@@ -1,4 +1,4 @@
-// runtime/profile_worker.mjs - samples a Phalange program's shadow stack
+// runtime/profile_worker.mjs - samples a Axiom program's shadow stack
 // (spec §16.4, §16.6) from another thread. The program runs with a shared
 // memory, so this worker can read the main thread's call-site ring while the
 // program runs. Samples are wall-clock. See host.mjs --profile.

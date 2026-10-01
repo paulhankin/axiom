@@ -1,0 +1,2029 @@
+// =============================================================================
+// std/graphics/image/jpeg.ax - JPEG (ITU T.81, JFIF) decoding and encoding.
+//
+//     let img = jpeg.decode(bytes)!;                 // U8 gray or RGB
+//     let out = jpeg.encode(&img, 90, jpeg.Subsample.S420)!;  // mem.free it
+//     jpeg.encode_to(w, &img, 90, jpeg.Subsample.S420)!;     // or to an io.Writer
+//
+// Decoding handles baseline, extended sequential and progressive Huffman-
+// coded JPEGs with 8-bit samples: any sampling factors, restart intervals,
+// grayscale, YCbCr, RGB and Adobe CMYK/YCCK. The IDCT, chroma upsampling and
+// colour conversion are libjpeg's, so results match libjpeg's (and so most
+// software's) exactly for common files. Arithmetic coding, 12-bit samples,
+// lossless and hierarchical JPEG are not supported (Unsupported).
+//
+// Encoding writes baseline JFIF with the standard quantization tables
+// scaled by quality (1-100, as libjpeg), 4:2:0, 4:2:2 or 4:4:4 chroma, and
+// Huffman tables optimized for the image. Alpha is dropped; U16 and F32
+// images are converted to 8 bits.
+// =============================================================================
+
+import "../../io.ax" as io;
+import "../../math.ax" as math;
+import "../../mem.ax" as mem;
+import "../../str.ax" as strs;
+import "../../sync.ax" as sync;
+import "../image.ax" as image;
+
+error { InvalidImage, Unsupported, OutOfMemory }
+
+/// The chroma resolution an encoded image keeps.
+pub enum Subsample: u8 {
+    S444,  // full-resolution chroma
+    S422,  // half horizontally
+    S420,  // half both ways (the usual)
+}
+
+/// Whether data starts like a JPEG file.
+pub fn is_jpeg(data: []u8) bool {
+    return (data.len >= 3) and (data[0] == 0xff) and (data[1] == 0xd8) and (data[2] == 0xff);
+}
+
+// the natural (row-major) index of each zigzag position, with padding so
+// that a corrupt run past 63 stays in bounds
+let DEZIGZAG: [80]u8 = [
+    0,
+    1,
+    8,
+    16,
+    9,
+    2,
+    3,
+    10,
+    17,
+    24,
+    32,
+    25,
+    18,
+    11,
+    4,
+    5,
+    12,
+    19,
+    26,
+    33,
+    40,
+    48,
+    41,
+    34,
+    27,
+    20,
+    13,
+    6,
+    7,
+    14,
+    21,
+    28,
+    35,
+    42,
+    49,
+    56,
+    57,
+    50,
+    43,
+    36,
+    29,
+    22,
+    15,
+    23,
+    30,
+    37,
+    44,
+    51,
+    58,
+    59,
+    52,
+    45,
+    38,
+    31,
+    39,
+    46,
+    53,
+    60,
+    61,
+    54,
+    47,
+    55,
+    62,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+    63,
+];
+
+// -----------------------------------------------------------------------------
+// Huffman decoding
+// -----------------------------------------------------------------------------
+
+const FAST_BITS: u32 = 9;
+
+/// More scans than this is not a real image (progressive files use a dozen or so).
+const MAX_SCANS: usize = 256;
+
+struct Huffman {
+    fast: [512]u8,  // by the next 9 bits: the code's index, or 255
+    code: [256]u16,
+    values: [256]u8,
+    size: [257]u8,
+    maxcode: [18]u32,
+    delta: [17]i32,  // code to index
+    defined: bool,
+
+    fn build(self: *mut Huffman, counts: []u8, values: []u8) !void {
+        let mut k: usize = 0;
+        for i in @as(usize, 0)..16 {
+            for j in @as(usize, 0)..@as(usize, counts[i]) {
+                if k >= 256 {
+                    return error.InvalidImage;
+                }
+                self.size[k] = @truncate(u8, i + 1);
+                k += 1;
+            }
+        }
+        self.size[k] = 0;
+        let mut code: u32 = 0;
+        k = 0;
+        for j in @as(usize, 1)..17 {
+            self.delta[j] = @bit_cast(i32, @truncate(u32, k)) - @bit_cast(i32, code);
+            if @as(usize, self.size[k]) == j {
+                while @as(usize, self.size[k]) == j {
+                    self.code[k] = @truncate(u16, code);
+                    code += 1;
+                    k += 1;
+                }
+                if (code - 1) >= (@as(u32, 1) << @truncate(u32, j)) {
+                    return error.InvalidImage;  // bad code lengths
+                }
+            }
+            self.maxcode[j] = code << @truncate(u32, 16 - j);
+            code = code << 1;
+        }
+        self.maxcode[17] = 0xffffffff;
+        for i in @as(usize, 0)..512 {
+            self.fast[i] = 255;
+        }
+        for i in @as(usize, 0)..k {
+            let s = @as(u32, self.size[i]);
+            if s <= FAST_BITS {
+                let c = @as(usize, self.code[i]) << @truncate(u32, FAST_BITS - s);
+                let m = @as(usize, 1) << @truncate(u32, FAST_BITS - s);
+                for j in @as(usize, 0)..m {
+                    self.fast[c + j] = @truncate(u8, i);
+                }
+            }
+        }
+        @mem_copy(self.values[..values.len], values);
+        self.defined = true;
+    }
+}
+
+struct Component {
+    id: u8,
+    h: usize,
+    v: usize,
+    tq: usize,  // quantization table
+    td: usize,  // DC table (in the current scan)
+    ta: usize,  // AC table
+    x: usize,   // samples across and down (before upsampling)
+    y: usize,
+    bw: usize,  // blocks across and down, padded to whole MCUs
+    bh: usize,
+    coeffs: []mut i16,  // 64 per block, zigzag-free (natural order), not dequantized
+    pixels: []mut u8,   // bw * 8 by bh * 8
+    dc_pred: i32,
+}
+
+struct Decoder {
+    data: []u8,
+    pos: usize,
+    // the bit reader
+    code_buffer: u32,
+    code_bits: u32,
+    marker: u8,  // a marker met inside entropy-coded data, or 0
+    nomore: bool,
+    fake: usize,  // zero bytes supplied past the end of the scan's data
+    scans: usize,
+    // frame
+    width: usize,
+    height: usize,
+    progressive: bool,
+    ncomp: usize,
+    comp: [4]Component,
+    hmax: usize,
+    vmax: usize,
+    mcux: usize,
+    mcuy: usize,
+    quant: [4][64]u16,  // natural order
+    dc: [4]Huffman,
+    ac: [4]Huffman,
+    restart_interval: usize,
+    adobe_transform: i32,  // -1 if no Adobe marker
+    jfif: bool,
+    // the current scan
+    scan_comp: [4]usize,
+    scan_n: usize,
+    spec_start: usize,
+    spec_end: usize,
+    succ_high: u32,
+    succ_low: u32,
+    eob_run: i32,
+    todo: usize,
+    got_frame: bool,
+
+    fn get8(self: *mut Decoder) u8 {
+        if self.pos >= self.data.len {
+            return 0;
+        }
+        let b = self.data[self.pos];
+        self.pos += 1;
+        return b;
+    }
+
+    fn get16(self: *mut Decoder) usize {
+        let hi = @as(usize, self.get8());
+        return (hi << 8) | @as(usize, self.get8());
+    }
+
+    fn grow_buffer(self: *mut Decoder) void {
+        while self.code_bits <= 24 {
+            let mut b: u32 = 0;
+            if self.nomore {
+                self.fake += 1;
+            } else {
+                b = @as(u32, self.get8());
+                if b == 0xff {
+                    let mut c = self.get8();
+                    while c == 0xff {
+                        c = self.get8();  // fill bytes
+                    }
+                    if c != 0 {
+                        self.marker = c;
+                        self.nomore = true;
+                        return;
+                    }
+                }
+            }
+            self.code_buffer = self.code_buffer | (b << (24 - self.code_bits));
+            self.code_bits += 8;
+        }
+    }
+
+    fn decode(self: *mut Decoder, h: *Huffman) !u32 {
+        if self.code_bits < 16 {
+            self.grow_buffer();
+        }
+        let c = @as(usize, (self.code_buffer >> (32 - FAST_BITS)) & 511);
+        let k = h.fast[c];
+        if k < 255 {
+            let s = @as(u32, h.size[@as(usize, k)]);
+            if s > self.code_bits {
+                return error.InvalidImage;
+            }
+            self.code_buffer = self.code_buffer << s;
+            self.code_bits -= s;
+            return @as(u32, h.values[@as(usize, k)]);
+        }
+        let temp = self.code_buffer >> 16;
+        let mut n: usize = @as(usize, FAST_BITS) + 1;
+        while temp >= h.maxcode[n] {
+            n += 1;
+        }
+        if (n == 17) or (@as(u32, @truncate(u8, n)) > self.code_bits) {
+            return error.InvalidImage;
+        }
+        let nn = @truncate(u32, n);
+        let idx = @bit_cast(i32, (self.code_buffer >> (32 - nn)) & ((@as(u32, 1) << nn) - 1)) + h.delta[n];
+        self.code_bits -= nn;
+        self.code_buffer = self.code_buffer << nn;
+        if (idx < 0) or (idx > 255) {
+            return error.InvalidImage;
+        }
+        return @as(u32, h.values[@as(usize, @bit_cast(u32, idx))]);
+    }
+
+    fn get_bits(self: *mut Decoder, n: u32) u32 {
+        if n == 0 {
+            return 0;
+        }
+        if self.code_bits < n {
+            self.grow_buffer();
+        }
+        let v = self.code_buffer >> (32 - n);
+        self.code_buffer = self.code_buffer << n;
+        self.code_bits -= @min(n, self.code_bits);
+        return v;
+    }
+
+    fn get_bit(self: *mut Decoder) bool {
+        return self.get_bits(1) != 0;
+    }
+
+    /// n bits as a signed value (JPEG's EXTEND).
+    fn receive_extend(self: *mut Decoder, n: u32) i32 {
+        if n == 0 {
+            return 0;
+        }
+        let v = @bit_cast(i32, self.get_bits(n));
+        if v < (@as(i32, 1) << (n - 1)) {
+            return (v - (@as(i32, 1) << n)) + 1;
+        }
+        return v;
+    }
+
+    fn reset(self: *mut Decoder) void {
+        self.code_bits = 0;
+        self.code_buffer = 0;
+        self.nomore = false;
+        self.fake = 0;
+        for i in @as(usize, 0)..self.ncomp {
+            self.comp[i].dc_pred = 0;
+        }
+        self.marker = 0;
+        self.eob_run = 0;
+        self.todo = self.restart_interval;
+        if self.todo == 0 {
+            self.todo = 0x7fffffff;
+        }
+    }
+
+    // --- blocks --------------------------------------------------------------
+
+    fn block_baseline(self: *mut Decoder, c: usize, data: []mut i16) !void {
+        let t = self.decode(&self.dc[self.comp[c].td])!;
+        if t > 15 {
+            return error.InvalidImage;
+        }
+        let dc = self.comp[c].dc_pred +% self.receive_extend(t);
+        self.comp[c].dc_pred = dc;
+        data[0] = sat16(dc);
+        let h = &self.ac[self.comp[c].ta];
+        let mut k: usize = 1;
+        while k < 64 {
+            let rs = self.decode(h)!;
+            let s = rs & 15;
+            let r = @as(usize, rs >> 4);
+            if s == 0 {
+                if rs != 0xf0 {
+                    break;
+                }
+                k += 16;
+            } else {
+                k += r;
+                if k > 63 {
+                    return error.InvalidImage;
+                }
+                data[@as(usize, DEZIGZAG[k])] = sat16(self.receive_extend(s));
+                k += 1;
+            }
+        }
+    }
+
+    fn block_prog_dc(self: *mut Decoder, c: usize, data: []mut i16) !void {
+        if self.spec_end != 0 {
+            return error.InvalidImage;
+        }
+        if self.succ_high == 0 {
+            let t = self.decode(&self.dc[self.comp[c].td])!;
+            if t > 15 {
+                return error.InvalidImage;
+            }
+            let dc = self.comp[c].dc_pred +% self.receive_extend(t);
+            self.comp[c].dc_pred = dc;
+            data[0] = sat16(dc *% (@as(i32, 1) << self.succ_low));
+        } else if self.get_bit() {
+            data[0] = data[0] | @truncate(i16, @as(i32, 1) << self.succ_low);
+        }
+    }
+
+    fn block_prog_ac(self: *mut Decoder, c: usize, data: []mut i16) !void {
+        if self.spec_start == 0 {
+            return error.InvalidImage;
+        }
+        let h = &self.ac[self.comp[c].ta];
+        if self.succ_high == 0 {
+            if self.eob_run > 0 {
+                self.eob_run -= 1;
+                return;
+            }
+            let mut k = self.spec_start;
+            while k <= self.spec_end {
+                let rs = self.decode(h)!;
+                let s = rs & 15;
+                let r = rs >> 4;
+                if s == 0 {
+                    if r < 15 {
+                        self.eob_run = @as(i32, 1) << r;
+                        if r > 0 {
+                            self.eob_run += @bit_cast(i32, self.get_bits(r));
+                        }
+                        self.eob_run -= 1;
+                        break;
+                    }
+                    k += 16;
+                } else {
+                    k += @as(usize, r);
+                    if k > 63 {
+                        return error.InvalidImage;
+                    }
+                    data[@as(usize, DEZIGZAG[k])] = sat16(self.receive_extend(s) *% (@as(i32, 1) << self.succ_low));
+                    k += 1;
+                }
+            }
+            return;
+        }
+        // refinement
+        let bit = @truncate(i16, @as(i32, 1) << self.succ_low);
+        if self.eob_run > 0 {
+            self.eob_run -= 1;
+            for k in self.spec_start..self.spec_end + 1 {
+                let z = @as(usize, DEZIGZAG[k]);
+                if data[z] != 0 {
+                    refine(self, data, z, bit);
+                }
+            }
+            return;
+        }
+        let mut k = self.spec_start;
+        while k <= self.spec_end {
+            let rs = self.decode(h)!;
+            let mut s: i16 = 0;
+            let mut r = @as(i32, @bit_cast(i32, rs >> 4));
+            let sz = rs & 15;
+            if sz == 0 {
+                if r < 15 {
+                    self.eob_run = (@as(i32, 1) << @bit_cast(u32, r)) - 1;
+                    if r > 0 {
+                        self.eob_run += @bit_cast(i32, self.get_bits(@bit_cast(u32, r)));
+                    }
+                    r = 64;  // the rest of the band is zero history
+                }
+                // r = 15: a run of 16 zeros
+            } else {
+                if sz != 1 {
+                    return error.InvalidImage;
+                }
+                if self.get_bit() {
+                    s = bit;
+                } else {
+                    s = -bit;
+                }
+            }
+            while k <= self.spec_end {
+                let z = @as(usize, DEZIGZAG[k]);
+                k += 1;
+                if data[z] != 0 {
+                    refine(self, data, z, bit);
+                } else {
+                    if r == 0 {
+                        data[z] = s;
+                        break;
+                    }
+                    r -= 1;
+                }
+            }
+        }
+    }
+
+    // --- scans ---------------------------------------------------------------
+
+    fn decode_scan(self: *mut Decoder) !void {
+        self.reset();
+        if self.scan_n == 1 {
+            // not interleaved: the component's own blocks, in raster order
+            let c = self.scan_comp[0];
+            let w = (self.comp[c].x + 7) / 8;
+            let h = (self.comp[c].y + 7) / 8;
+            for j in @as(usize, 0)..h {
+                for i in @as(usize, 0)..w {
+                    let at = ((j * self.comp[c].bw) + i) * 64;
+                    self.block(c, self.comp[c].coeffs[at..at + 64])!;
+                    if not self.after_mcu()! {
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        for j in @as(usize, 0)..self.mcuy {
+            for i in @as(usize, 0)..self.mcux {
+                for k in @as(usize, 0)..self.scan_n {
+                    let c = self.scan_comp[k];
+                    for y in @as(usize, 0)..self.comp[c].v {
+                        for x in @as(usize, 0)..self.comp[c].h {
+                            let bx = (i * self.comp[c].h) + x;
+                            let by = (j * self.comp[c].v) + y;
+                            let at = ((by * self.comp[c].bw) + bx) * 64;
+                            self.block(c, self.comp[c].coeffs[at..at + 64])!;
+                        }
+                    }
+                }
+                if not self.after_mcu()! {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn block(self: *mut Decoder, c: usize, data: []mut i16) !void {
+        if not self.progressive {
+            return self.block_baseline(c, data);
+        }
+        if self.spec_start == 0 {
+            return self.block_prog_dc(c, data);
+        }
+        return self.block_prog_ac(c, data);
+    }
+
+    /// Counts down the restart interval; false once the scan has ended.
+    fn after_mcu(self: *mut Decoder) !bool {
+        // a scan whose data ran out long ago is over (a truncated or
+        // hostile file must not cost a full decode per scan)
+        if self.fake > 1024 {
+            return false;
+        }
+        self.todo -= 1;
+        if self.todo == 0 {
+            if self.code_bits < 24 {
+                self.grow_buffer();
+            }
+            if (self.marker < 0xd0) or (self.marker > 0xd7) {
+                return false;  // no restart marker: the data ends here
+            }
+            self.reset();
+        }
+        return true;
+    }
+
+    // --- markers -------------------------------------------------------------
+
+    /// The next marker (after entropy-coded data, skipping to it).
+    fn next_marker(self: *mut Decoder) u8 {
+        if self.marker != 0 {
+            let m = self.marker;
+            self.marker = 0;
+            return m;
+        }
+        while self.pos < self.data.len {
+            if self.get8() == 0xff {
+                let mut c = self.get8();
+                while c == 0xff {
+                    c = self.get8();
+                }
+                if c != 0 {
+                    return c;
+                }
+            }
+        }
+        return 0xd9;  // treat the end of the data as EOI
+    }
+
+    fn segment(self: *mut Decoder) ![]u8 {
+        let len = self.get16();
+        if (len < 2) or ((self.pos + len - 2) > self.data.len) {
+            return error.InvalidImage;
+        }
+        let s = self.data[self.pos..self.pos + len - 2];
+        self.pos += len - 2;
+        return s;
+    }
+
+    fn read_dqt(self: *mut Decoder, s: []u8) !void {
+        let mut i: usize = 0;
+        while i < s.len {
+            let pq = s[i] >> 4;
+            let tq = @as(usize, s[i] & 15);
+            i += 1;
+            if (tq > 3) or (pq > 1) {
+                return error.InvalidImage;
+            }
+            let n = 64 * (@as(usize, pq) + 1);
+            if (i + n) > s.len {
+                return error.InvalidImage;
+            }
+            for k in @as(usize, 0)..64 {
+                let mut v = @as(u16, s[i + k]);
+                if pq == 1 {
+                    v = (@as(u16, s[i + (2 * k)]) << 8) | @as(u16, s[i + (2 * k) + 1]);
+                }
+                self.quant[tq][@as(usize, DEZIGZAG[k])] = v;
+            }
+            i += n;
+        }
+    }
+
+    fn read_dht(self: *mut Decoder, s: []u8) !void {
+        let mut i: usize = 0;
+        while i < s.len {
+            if (i + 17) > s.len {
+                return error.InvalidImage;
+            }
+            let tc = s[i] >> 4;
+            let th = @as(usize, s[i] & 15);
+            if (tc > 1) or (th > 3) {
+                return error.InvalidImage;
+            }
+            let counts = s[i + 1..i + 17];
+            let mut n: usize = 0;
+            for c in counts {
+                n += @as(usize, c);
+            }
+            i += 17;
+            if ((i + n) > s.len) or (n > 256) {
+                return error.InvalidImage;
+            }
+            if tc == 0 {
+                self.dc[th].build(counts, s[i..i + n])!;
+            } else {
+                self.ac[th].build(counts, s[i..i + n])!;
+            }
+            i += n;
+        }
+    }
+
+    fn read_sof(self: *mut Decoder, s: []u8) !void {
+        if self.got_frame {
+            return error.InvalidImage;
+        }
+        if (s.len < 6) or (s[0] != 8) {
+            return error.Unsupported;  // 12-bit samples
+        }
+        self.height = (@as(usize, s[1]) << 8) | @as(usize, s[2]);
+        self.width = (@as(usize, s[3]) << 8) | @as(usize, s[4]);
+        self.ncomp = @as(usize, s[5]);
+        if (self.width == 0) or (self.height == 0) {
+            return error.Unsupported;  // height from a DNL marker
+        }
+        if (self.ncomp != 1) and (self.ncomp != 3) and (self.ncomp != 4) {
+            return error.Unsupported;
+        }
+        if s.len < (6 + (3 * self.ncomp)) {
+            return error.InvalidImage;
+        }
+        if (self.width * self.height) > image.MAX_PIXELS {
+            return error.InvalidImage;
+        }
+        self.hmax = 1;
+        self.vmax = 1;
+        for i in @as(usize, 0)..self.ncomp {
+            let b = s[6 + (3 * i)..9 + (3 * i)];
+            let h = @as(usize, b[1] >> 4);
+            let v = @as(usize, b[1] & 15);
+            if (h < 1) or (h > 4) or (v < 1) or (v > 4) or (b[2] > 3) {
+                return error.InvalidImage;
+            }
+            self.comp[i] = Component.{
+                id: b[0],
+                h: h,
+                v: v,
+                tq: @as(usize, b[2]),
+                td: 0,
+                ta: 0,
+                x: 0,
+                y: 0,
+                bw: 0,
+                bh: 0,
+                coeffs: self.comp[i].coeffs,
+                pixels: self.comp[i].pixels,
+                dc_pred: 0,
+            };
+            self.hmax = @max(self.hmax, h);
+            self.vmax = @max(self.vmax, v);
+        }
+        // every block costs at least a bit (its DC code in the first scan), so
+        // a file too small for the frame it declares is broken: stop before
+        // allocating and decoding gigabytes for it
+        let px = @mul_checked(self.width, self.height) catch return error.InvalidImage;
+        if (px / 512) > self.data.len {
+            return error.InvalidImage;
+        }
+        // (as libjpeg: fractional sampling ratios are not supported)
+        for i in @as(usize, 0)..self.ncomp {
+            if ((self.hmax % self.comp[i].h) != 0) or ((self.vmax % self.comp[i].v) != 0) {
+                return error.Unsupported;
+            }
+        }
+        self.mcux = (self.width + (8 * self.hmax) - 1) / (8 * self.hmax);
+        self.mcuy = (self.height + (8 * self.vmax) - 1) / (8 * self.vmax);
+        for i in @as(usize, 0)..self.ncomp {
+            let c = &mut self.comp[i];
+            c.x = ((self.width * c.h) + self.hmax - 1) / self.hmax;
+            c.y = ((self.height * c.v) + self.vmax - 1) / self.vmax;
+            c.bw = self.mcux * c.h;
+            c.bh = self.mcuy * c.v;
+            c.coeffs = mem.alloc_zeroed.[i16]((c.bw * c.bh) * 64)!;
+            c.pixels = mem.alloc.[u8]((c.bw * c.bh) * 64)!;
+        }
+        self.got_frame = true;
+    }
+
+    fn read_sos(self: *mut Decoder, s: []u8) !void {
+        if not self.got_frame or (s.len < 1) {
+            return error.InvalidImage;
+        }
+        let n = @as(usize, s[0]);
+        if (n < 1) or (n > self.ncomp) or (s.len != (4 + (2 * n))) {
+            return error.InvalidImage;
+        }
+        for i in @as(usize, 0)..n {
+            let id = s[1 + (2 * i)];
+            let t = s[2 + (2 * i)];
+            let mut found = false;
+            for c in @as(usize, 0)..self.ncomp {
+                if self.comp[c].id == id {
+                    self.scan_comp[i] = c;
+                    self.comp[c].td = @as(usize, t >> 4);
+                    self.comp[c].ta = @as(usize, t & 15);
+                    found = true;
+                }
+            }
+            if not found or ((t >> 4) > 3) or ((t & 15) > 3) {
+                return error.InvalidImage;
+            }
+        }
+        self.scan_n = n;
+        let b = s[1 + (2 * n)..];
+        self.spec_start = @as(usize, b[0]);
+        self.spec_end = @as(usize, b[1]);
+        self.succ_high = @as(u32, b[2] >> 4);
+        self.succ_low = @as(u32, b[2] & 15);
+        if self.progressive {
+            if (self.spec_start > 63) or (self.spec_end > 63) or (self.spec_start > self.spec_end) or
+               (self.succ_high > 13) or (self.succ_low > 13) {
+                return error.InvalidImage;
+            }
+            if (self.spec_start > 0) and (n != 1) {
+                return error.InvalidImage;  // AC scans hold one component
+            }
+        } else {
+            self.spec_start = 0;
+            self.spec_end = 63;
+            self.succ_high = 0;
+            self.succ_low = 0;
+        }
+        // the tables the scan needs
+        for i in @as(usize, 0)..n {
+            let c = &self.comp[self.scan_comp[i]];
+            if (self.spec_start == 0) and (self.succ_high == 0) and not self.dc[c.td].defined {
+                return error.InvalidImage;
+            }
+            if (self.spec_end > 0) and not self.ac[c.ta].defined {
+                return error.InvalidImage;
+            }
+        }
+    }
+
+    fn free(self: *mut Decoder) void {
+        for i in @as(usize, 0)..4 {
+            if self.comp[i].coeffs.len > 0 {
+                mem.free(self.comp[i].coeffs);
+                mem.free(self.comp[i].pixels);
+            }
+        }
+    }
+}
+
+fn refine(d: *mut Decoder, data: []mut i16, z: usize, bit: i16) void {
+    if d.get_bit() and ((data[z] & bit) == 0) {
+        if data[z] >= 0 {
+            data[z] = data[z] +% bit;
+        } else {
+            data[z] = data[z] -% bit;
+        }
+    }
+}
+
+fn sat16(v: i32) i16 {
+    return @truncate(i16, @min(@max(v, -32768), 32767));
+}
+
+// -----------------------------------------------------------------------------
+// IDCT: libjpeg's jidctint ("islow"). Valid 8-bit data fits in 32 bits (as
+// in libjpeg's 32-bit builds); wrapping arithmetic keeps hostile
+// coefficients from trapping (they only produce garbage pixels).
+// -----------------------------------------------------------------------------
+
+const CONST_BITS: u32 = 13;
+const PASS1_BITS: u32 = 2;
+const F0298: i32 = 2446;
+const F0390: i32 = 3196;
+const F0541: i32 = 4433;
+const F0765: i32 = 6270;
+const F0899: i32 = 7373;
+const F1175: i32 = 9633;
+const F1501: i32 = 12299;
+const F1847: i32 = 15137;
+const F1961: i32 = 16069;
+const F2053: i32 = 16819;
+const F2562: i32 = 20995;
+const F3072: i32 = 25172;
+
+fn clamp8(v: i32) u8 {
+    return @truncate(u8, @bit_cast(u32, @min(@max(v, 0), 255)));
+}
+
+/// Dequantizes and inverse-transforms a block into out (row stride given).
+fn idct_block(coef: []i16, q: *[64]u16, out: []mut u8, stride: usize) void {
+    let mut ws: [64]i32 = [0; 64];
+    for col in @as(usize, 0)..8 {
+        if (((coef[8 + col] | coef[16 + col]) | (coef[24 + col] | coef[32 + col])) |
+            ((coef[40 + col] | coef[48 + col]) | coef[56 + col])) == 0 {
+            let dc = (@as(i32, coef[col]) *% @as(i32, q[col])) << PASS1_BITS;
+            for r in @as(usize, 0)..8 {
+                ws[(r * 8) + col] = dc;
+            }
+            continue;
+        }
+        idct_1d(ws[..], col, 8, coef, q, @as(i32, 1) << (CONST_BITS - PASS1_BITS - 1), CONST_BITS - PASS1_BITS);
+    }
+    let mut row_out: [8]i32 = [0; 8];
+    for row in @as(usize, 0)..8 {
+        // the range centre (128) and the rounding are added before the descale
+        let round = (@as(i32, 1) << ((CONST_BITS + PASS1_BITS) + 2)) + (
+            @as(i32, 128) << ((CONST_BITS + PASS1_BITS) + 3));
+        idct_row(ws[row * 8..(row * 8) + 8], row_out[..], round, (CONST_BITS + PASS1_BITS) + 3);
+        let o = out[row * stride..(row * stride) + 8];
+        for c in @as(usize, 0)..8 {
+            o[c] = clamp8(row_out[c]);
+        }
+    }
+}
+
+/// Pass 1: column col of the (dequantized) coefficients into the workspace.
+fn idct_1d(ws: []mut i32, col: usize, step: usize, coef: []i16, q: *[64]u16, round: i32, shift: u32) void {
+    let v0 = @as(i32, coef[col]) *% @as(i32, q[col]);
+    let v1 = @as(i32, coef[col + 8]) *% @as(i32, q[col + 8]);
+    let v2 = @as(i32, coef[col + 16]) *% @as(i32, q[col + 16]);
+    let v3 = @as(i32, coef[col + 24]) *% @as(i32, q[col + 24]);
+    let v4 = @as(i32, coef[col + 32]) *% @as(i32, q[col + 32]);
+    let v5 = @as(i32, coef[col + 40]) *% @as(i32, q[col + 40]);
+    let v6 = @as(i32, coef[col + 48]) *% @as(i32, q[col + 48]);
+    let v7 = @as(i32, coef[col + 56]) *% @as(i32, q[col + 56]);
+    let r = butterfly(v0, v1, v2, v3, v4, v5, v6, v7, round, shift);
+    for k in @as(usize, 0)..8 {
+        ws[(k * step) + col] = r[k];
+    }
+}
+
+/// Pass 2: one row of the workspace.
+fn idct_row(v: []i32, out: []mut i32, round: i32, shift: u32) void {
+    let r = butterfly(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], round, shift);
+    for k in @as(usize, 0)..8 {
+        out[k] = r[k];
+    }
+}
+
+/// The 8-point IDCT; outputs (x + round) >> shift.
+fn butterfly(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32, round: i32, shift: u32) [8]i32 {
+    // even part
+    let z1 = (v2 +% v6) *% F0541;
+    let tmp2 = z1 +% (v6 *% -F1847);
+    let tmp3 = z1 +% (v2 *% F0765);
+    let t0 = ((v0 +% v4) << CONST_BITS) +% round;
+    let t1 = ((v0 -% v4) << CONST_BITS) +% round;
+    let tmp10 = t0 +% tmp3;
+    let tmp13 = t0 -% tmp3;
+    let tmp11 = t1 +% tmp2;
+    let tmp12 = t1 -% tmp2;
+    // odd part
+    let za = v7 +% v1;
+    let zb = v5 +% v3;
+    let zc = v7 +% v3;
+    let zd = v5 +% v1;
+    let z5 = (zc +% zd) *% F1175;
+    let a1 = za *% -F0899;
+    let b2 = zb *% -F2562;
+    let c3 = (zc *% -F1961) +% z5;
+    let d4 = (zd *% -F0390) +% z5;
+    let o0 = ((v7 *% F0298) +% a1) +% c3;
+    let o1 = ((v5 *% F2053) +% b2) +% d4;
+    let o2 = ((v3 *% F3072) +% b2) +% c3;
+    let o3 = ((v1 *% F1501) +% a1) +% d4;
+    return [
+        (tmp10 +% o3) >> shift,
+        (tmp11 +% o2) >> shift,
+        (tmp12 +% o1) >> shift,
+        (tmp13 +% o0) >> shift,
+        (tmp13 -% o0) >> shift,
+        (tmp12 -% o1) >> shift,
+        (tmp11 -% o2) >> shift,
+        (tmp10 -% o3) >> shift,
+    ];
+}
+
+// -----------------------------------------------------------------------------
+// Decoding
+// -----------------------------------------------------------------------------
+
+pub fn decode(data: []u8) !image.Image {
+    if not is_jpeg(data) {
+        return error.InvalidImage;
+    }
+    let dm = mem.alloc.[Decoder](1)!;
+    defer mem.free(dm);
+    @mem_set(@cast_slice(u8, dm), 0);
+    let d = &mut dm[0];
+    for i in @as(usize, 0)..4 {
+        d.comp[i].coeffs = @slice_from_ptr(@ptr_from_int(*mut i16, 2), 0);
+        d.comp[i].pixels = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+    defer d.free();
+    d.data = data;
+    d.pos = 2;
+    d.adobe_transform = -1;
+    loop {
+        let m = d.next_marker();
+        if m == 0xd9 {
+            break;  // EOI
+        }
+        if (m == 0xc0) or (m == 0xc1) or (m == 0xc2) {
+            d.progressive = m == 0xc2;
+            d.read_sof(d.segment()!)!;
+        } else if ((m >= 0xc3) and (m <= 0xcf)) and (m != 0xc4) and (m != 0xc8) and (m != 0xcc) {
+            return error.Unsupported;  // lossless, hierarchical or arithmetic
+        } else if m == 0xc4 {
+            d.read_dht(d.segment()!)!;
+        } else if m == 0xdb {
+            d.read_dqt(d.segment()!)!;
+        } else if m == 0xdd {
+            let s = d.segment()!;
+            if s.len != 2 {
+                return error.InvalidImage;
+            }
+            d.restart_interval = (@as(usize, s[0]) << 8) | @as(usize, s[1]);
+        } else if m == 0xda {
+            d.scans += 1;
+            if d.scans > MAX_SCANS {
+                return error.InvalidImage;
+            }
+            d.read_sos(d.segment()!)!;
+            d.decode_scan()!;
+        } else if m == 0xee {
+            let s = d.segment()!;
+            if (s.len >= 12) and @mem_eq(s[..5], "Adobe") {
+                d.adobe_transform = @as(i32, s[11]);
+            }
+        } else if m == 0xe0 {
+            let s = d.segment()!;
+            if (s.len >= 5) and @mem_eq(s[..5], "JFIF\x00") {
+                d.jfif = true;
+            }
+        } else if (m >= 0xd0) and (m <= 0xd7) {
+            // a stray restart marker: nothing to skip
+        } else {
+            _ = d.segment()!;
+        }
+    }
+    if not d.got_frame {
+        return error.InvalidImage;
+    }
+    // inverse transforms
+    for c in @as(usize, 0)..d.ncomp {
+        let comp = &d.comp[c];
+        let q = &d.quant[comp.tq];
+        let stride = comp.bw * 8;
+        for by in @as(usize, 0)..comp.bh {
+            for bx in @as(usize, 0)..comp.bw {
+                let at = ((by * comp.bw) + bx) * 64;
+                let o = ((by * 8) * stride) + (bx * 8);
+                idct_block(comp.coeffs[at..at + 64], q, comp.pixels[o..], stride);
+            }
+        }
+    }
+    return output(d);
+}
+
+/// Upsamples and colour-converts the component planes into an image.
+fn output(d: *mut Decoder) !image.Image {
+    let w = d.width;
+    let h = d.height;
+    let mut chans: usize = 3;
+    if d.ncomp == 1 {
+        chans = 1;
+    }
+    let mut img = image.Image.init(w, h, chans, image.Depth.U8)!;
+    let out = img.samples8();
+    if d.ncomp == 1 {
+        let c = &d.comp[0];
+        for y in @as(usize, 0)..h {
+            @mem_copy(out[y * w..(y + 1) * w], c.pixels[y * (c.bw * 8)..(y * (c.bw * 8)) + w]);
+        }
+        return img;
+    }
+    // full-resolution rows of each component
+    let rows = mem.alloc.[u8](d.ncomp * w) catch |e| {
+        img.deinit();
+        return e;
+    };
+    defer mem.free(rows);
+    // the transform: YCbCr unless an Adobe marker says otherwise, or the
+    // components are named R, G, B
+    let mut ycc = true;
+    if d.ncomp == 3 {
+        if d.adobe_transform == 0 {
+            ycc = false;
+        } else if (d.adobe_transform < 0) and not d.jfif and (d.comp[0].id == 'R') and (d.comp[1].id == 'G') and
+                  (d.comp[2].id == 'B') {
+            ycc = false;
+        }
+    } else {
+        ycc = d.adobe_transform == 2;  // YCCK; otherwise CMYK
+    }
+    for y in @as(usize, 0)..h {
+        for c in @as(usize, 0)..d.ncomp {
+            upsample_row(d, c, y, rows[c * w..(c + 1) * w]);
+        }
+        let o = out[(y * w) * 3..((y + 1) * w) * 3];
+        if d.ncomp == 3 {
+            if ycc {
+                ycc_to_rgb(rows[..w], rows[w..2 * w], rows[2 * w..3 * w], o);
+            } else {
+                for x in @as(usize, 0)..w {
+                    o[x * 3] = rows[x];
+                    o[(x * 3) + 1] = rows[w + x];
+                    o[(x * 3) + 2] = rows[(2 * w) + x];
+                }
+            }
+        } else {
+            // Adobe CMYK is stored inverted; YCCK is YCbCr for inverted CMY
+            if ycc {
+                ycc_to_rgb(rows[..w], rows[w..2 * w], rows[2 * w..3 * w], o);
+                for x in @as(usize, 0)..w {
+                    let k = @as(u32, rows[(3 * w) + x]);
+                    for i in @as(usize, 0)..3 {
+                        o[(x * 3) + i] = blinn(255 - o[(x * 3) + i], k);
+                    }
+                }
+            } else {
+                for x in @as(usize, 0)..w {
+                    let k = @as(u32, rows[(3 * w) + x]);
+                    for i in @as(usize, 0)..3 {
+                        o[(x * 3) + i] = blinn(rows[(i * w) + x], k);
+                    }
+                }
+            }
+        }
+    }
+    return img;
+}
+
+fn blinn(x: u8, y: u32) u8 {
+    let t = (@as(u32, x) * y) + 128;
+    return @truncate(u8, (t + (t >> 8)) >> 8);
+}
+
+/// Row y of component c at full resolution, with libjpeg's "fancy"
+/// (triangle-filter) upsampling for 2x factors and replication otherwise.
+fn upsample_row(d: *Decoder, ci: usize, y: usize, out: []mut u8) void {
+    let c = &d.comp[ci];
+    let w = d.width;
+    let stride = c.bw * 8;
+    let hs = d.hmax / c.h;
+    let vs = d.vmax / c.v;
+    // (as libjpeg-turbo: horizontal fancy upsampling needs 3 columns)
+    let fancy_h = (hs == 2) and ((d.hmax % c.h) == 0) and (c.x > 2);
+    let fancy_v = (vs == 2) and ((d.vmax % c.v) == 0);
+    let sy = y / vs;
+    let row = c.pixels[sy * stride..(sy * stride) + c.x];
+    if (hs == 1) and (vs == 1) {
+        @mem_copy(out, row[..w]);
+        return;
+    }
+    if fancy_v and ((hs == 1) or fancy_h) {
+        // the nearer neighbouring row: above for even output rows, below for odd
+        let mut ny = sy;
+        let even = (y % 2) == 0;
+        if even {
+            if sy > 0 {
+                ny = sy - 1;
+            }
+        } else if (sy + 1) < c.y {
+            ny = sy + 1;
+        }
+        let nrow = c.pixels[ny * stride..(ny * stride) + c.x];
+        if hs == 1 {
+            let mut bias: u32 = 2;
+            if even {
+                bias = 1;
+            }
+            for x in @as(usize, 0)..w {
+                out[x] = @truncate(u8, (((@as(u32, row[x]) *% 3) +% @as(u32, nrow[x])) +% bias) >> 2);
+            }
+            return;
+        }
+        // h2v2
+        let n = c.x;
+        let mut this = (@as(u32, row[0]) * 3) + @as(u32, nrow[0]);
+        let mut next = (@as(u32, row[1]) * 3) + @as(u32, nrow[1]);
+        put(out, 0, ((this * 4) + 8) >> 4);
+        put(out, 1, (((this * 3) + next) + 7) >> 4);
+        let mut last = this;
+        this = next;
+        // (inside the loop, 2i + 1 <= 2n - 3 < w: always in out)
+        for i in @as(usize, 1)..n - 1 {
+            next = (@as(u32, row[i + 1]) *% 3) +% @as(u32, nrow[i + 1]);
+            out[2 * i] = @truncate(u8, (((this *% 3) +% last) +% 8) >> 4);
+            out[(2 * i) + 1] = @truncate(u8, (((this *% 3) +% next) +% 7) >> 4);
+            last = this;
+            this = next;
+        }
+        put(out, 2 * (n - 1), (((this * 3) + last) + 8) >> 4);
+        put(out, (2 * (n - 1)) + 1, ((this * 4) + 7) >> 4);
+        return;
+    }
+    if fancy_h and (vs == 1) {
+        let n = c.x;
+        put(out, 0, @as(u32, row[0]));
+        put(out, 1, (((@as(u32, row[0]) * 3) + @as(u32, row[1])) + 2) >> 2);
+        for i in @as(usize, 1)..n - 1 {
+            let v = @as(u32, row[i]) *% 3;
+            out[2 * i] = @truncate(u8, ((v +% @as(u32, row[i - 1])) +% 1) >> 2);
+            out[(2 * i) + 1] = @truncate(u8, ((v +% @as(u32, row[i + 1])) +% 2) >> 2);
+        }
+        put(out, 2 * (n - 1), (((@as(u32, row[n - 1]) * 3) + @as(u32, row[n - 2])) + 1) >> 2);
+        put(out, (2 * (n - 1)) + 1, @as(u32, row[n - 1]));
+        return;
+    }
+    for x in @as(usize, 0)..w {
+        out[x] = row[@min(x / hs, c.x - 1)];
+    }
+}
+
+/// out[i] = v if i is inside out (the last upsampled column may be past the
+/// image's edge).
+fn put(out: []mut u8, i: usize, v: u32) void {
+    if i < out.len {
+        out[i] = @truncate(u8, v);
+    }
+}
+
+// libjpeg's fixed-point YCbCr to RGB
+const SCALEBITS: u32 = 16;
+const ONE_HALF: i32 = 32768;
+const FIX_1_40200: i32 = 91881;
+const FIX_1_77200: i32 = 116130;
+const FIX_0_71414: i32 = 46802;
+const FIX_0_34414: i32 = 22554;
+
+fn ycc_to_rgb(ys: []u8, cbs: []u8, crs: []u8, out_all: []mut u8) void {
+    let out = out_all[..ys.len * 3];
+    for x in @as(usize, 0)..ys.len {
+        let y = @as(i32, ys[x]);
+        let cb = @as(i32, cbs[x]) - 128;
+        let cr = @as(i32, crs[x]) - 128;
+        // (no overflow: the products fit in 25 bits)
+        let r = y +% (((FIX_1_40200 *% cr) +% ONE_HALF) >> SCALEBITS);
+        let g = y +% ((((-FIX_0_34414) *% cb) +% (((-FIX_0_71414) *% cr) +% ONE_HALF)) >> SCALEBITS);
+        let b = y +% (((FIX_1_77200 *% cb) +% ONE_HALF) >> SCALEBITS);
+        out[x * 3] = clamp8(r);
+        out[(x * 3) + 1] = clamp8(g);
+        out[(x * 3) + 2] = clamp8(b);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Encoding
+// -----------------------------------------------------------------------------
+
+let STD_LUMA: [64]u8 = [
+    16,
+    11,
+    10,
+    16,
+    24,
+    40,
+    51,
+    61,
+    12,
+    12,
+    14,
+    19,
+    26,
+    58,
+    60,
+    55,
+    14,
+    13,
+    16,
+    24,
+    40,
+    57,
+    69,
+    56,
+    14,
+    17,
+    22,
+    29,
+    51,
+    87,
+    80,
+    62,
+    18,
+    22,
+    37,
+    56,
+    68,
+    109,
+    103,
+    77,
+    24,
+    35,
+    55,
+    64,
+    81,
+    104,
+    113,
+    92,
+    49,
+    64,
+    78,
+    87,
+    103,
+    121,
+    120,
+    101,
+    72,
+    92,
+    95,
+    98,
+    112,
+    100,
+    103,
+    99,
+];
+let STD_CHROMA: [64]u8 = [
+    17,
+    18,
+    24,
+    47,
+    99,
+    99,
+    99,
+    99,
+    18,
+    21,
+    26,
+    66,
+    99,
+    99,
+    99,
+    99,
+    24,
+    26,
+    56,
+    99,
+    99,
+    99,
+    99,
+    99,
+    47,
+    66,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+    99,
+];
+
+/// A quantization table for quality 1-100, libjpeg's way (natural order).
+fn scaled_table(base: *[64]u8, quality: u32) [64]u16 {
+    let q = @min(@max(quality, 1), 100);
+    let mut scale: u32 = 200 - (2 * q);
+    if q < 50 {
+        scale = 5000 / q;
+    }
+    let mut t: [64]u16 = [0; 64];
+    for i in @as(usize, 0)..64 {
+        let v = ((@as(u32, base[i]) * scale) + 50) / 100;
+        t[i] = @truncate(u16, @min(@max(v, 1), 255));
+    }
+    return t;
+}
+
+/// Forward DCT (float, separable) of an 8x8 block of samples - 128, then
+/// quantization; the result is in zigzag order.
+fn fdct_quantize(block: *[64]f32, q: *[64]u16, out: []mut i16) void {
+    _ = dct_table();
+    let ct = &DCT_COS_T;
+    let cos = &DCT_COS;
+    // rows: tmp[y][u] = sum over x of block[y][x] cos[u][x], four u at a time
+    let mut tmp: [64]f32 = [0.0; 64];
+    for y in @as(usize, 0)..8 {
+        let mut a0: f32x4 = @splat(@as(f32, 0.0));
+        let mut a1: f32x4 = @splat(@as(f32, 0.0));
+        for x in @as(usize, 0)..8 {
+            let b: f32x4 = @splat(block[(y * 8) + x]);
+            a0 = a0 + (b * @load(f32x4, ct[x * 8..(x * 8) + 4]));
+            a1 = a1 + (b * @load(f32x4, ct[(x * 8) + 4..(x * 8) + 8]));
+        }
+        @store(tmp[y * 8..(y * 8) + 4], a0);
+        @store(tmp[(y * 8) + 4..(y * 8) + 8], a1);
+    }
+    // columns: sum over y of tmp[y][u] cos[v][y]
+    let mut res: [64]f32 = [0.0; 64];
+    for v in @as(usize, 0)..8 {
+        let mut a0: f32x4 = @splat(@as(f32, 0.0));
+        let mut a1: f32x4 = @splat(@as(f32, 0.0));
+        for y in @as(usize, 0)..8 {
+            let c: f32x4 = @splat(cos[(v * 8) + y]);
+            a0 = a0 + (@load(f32x4, tmp[y * 8..(y * 8) + 4]) * c);
+            a1 = a1 + (@load(f32x4, tmp[(y * 8) + 4..(y * 8) + 8]) * c);
+        }
+        @store(res[v * 8..(v * 8) + 4], a0);
+        @store(res[(v * 8) + 4..(v * 8) + 8], a1);
+    }
+    for n in @as(usize, 0)..64 {
+        out[@as(usize, ZIGZAG_OF[n])] = @truncate(
+            i16, @int_from_float(i32, @nearest(res[n] / @float_from_int(f32, q[n]))));
+    }
+}
+
+// the zigzag position of each natural index
+let ZIGZAG_OF: [64]u8 = [
+    0,
+    1,
+    5,
+    6,
+    14,
+    15,
+    27,
+    28,
+    2,
+    4,
+    7,
+    13,
+    16,
+    26,
+    29,
+    42,
+    3,
+    8,
+    12,
+    17,
+    25,
+    30,
+    41,
+    43,
+    9,
+    11,
+    18,
+    24,
+    31,
+    40,
+    44,
+    53,
+    10,
+    19,
+    23,
+    32,
+    39,
+    45,
+    52,
+    54,
+    20,
+    22,
+    33,
+    38,
+    46,
+    51,
+    55,
+    60,
+    21,
+    34,
+    37,
+    47,
+    50,
+    56,
+    59,
+    61,
+    35,
+    36,
+    48,
+    49,
+    57,
+    58,
+    62,
+    63,
+];
+
+let mut DCT_COS: [64]f32 = [0.0; 64];    // c(u) cos((2x + 1) u pi / 16) / 2
+let mut DCT_COS_T: [64]f32 = [0.0; 64];  // transposed
+let mut DCT_ONCE: sync.Once = sync.Once.{ state: 0 };
+
+fn build_dct(_u: u8) void {
+    for u in @as(usize, 0)..8 {
+        let mut cu: f64 = 0.5;
+        if u == 0 {
+            cu = 0.35355339059327373;  // 1 / (2 sqrt 2)
+        }
+        for x in @as(usize, 0)..8 {
+            let a = (@float_from_int(f64, (2 * x) + 1) * @float_from_int(f64, u)) * (3.14159265358979323846 / 16.0);
+            DCT_COS[(u * 8) + x] = @float_cast(f32, cu * math.cos(a));
+            DCT_COS_T[(x * 8) + u] = DCT_COS[(u * 8) + x];
+        }
+    }
+}
+
+fn dct_table() *[64]f32 {
+    DCT_ONCE.call(build_dct, @as(u8, 0));
+    return &DCT_COS;
+}
+
+/// Encodes as baseline JPEG (free the result with mem.free).
+/// Encodes an image as baseline JPEG (free the result with mem.free).
+pub fn encode(img: *image.Image, quality: u32, subsample: Subsample) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img, quality, subsample) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as baseline JPEG to wr. The image is transformed
+/// first (the Huffman tables come from the coefficients), then the headers
+/// and entropy-coded data are written a few KiB at a time.
+pub fn encode_to(wr: io.Writer, img: *image.Image, quality: u32, subsample: Subsample) !void {
+    if img.depth != image.Depth.U8 {
+        let mut ch: usize = 3;
+        if img.channels <= 2 {
+            ch = 1;
+        }
+        let mut c = img.convert(ch, image.Depth.U8)!;
+        defer c.deinit();
+        return encode_to(wr, &c, quality, subsample);
+    }
+    let w = img.width;
+    let h = img.height;
+    if (w > 65535) or (h > 65535) or (w == 0) or (h == 0) {
+        return error.Unsupported;
+    }
+    let gray = img.channels <= 2;  // alpha is dropped
+    let mut ncomp: usize = 3;
+    if gray {
+        ncomp = 1;
+    }
+    let mut hs: usize = 1;  // luma sampling factors (chroma is 1x1)
+    let mut vs: usize = 1;
+    if not gray {
+        if subsample == Subsample.S420 {
+            hs = 2;
+            vs = 2;
+        } else if subsample == Subsample.S422 {
+            hs = 2;
+        }
+    }
+    let qt: [2][64]u16 = [scaled_table(&STD_LUMA, quality), scaled_table(&STD_CHROMA, quality)];
+    let mcux = (w + (8 * hs) - 1) / (8 * hs);
+    let mcuy = (h + (8 * vs) - 1) / (8 * vs);
+    let blocks_per_mcu = (hs * vs) + (2 * (ncomp - 1));
+    let nblocks = (mcux * mcuy) * blocks_per_mcu;
+    let coefs = mem.alloc.[i16](nblocks * 64)!;
+    defer mem.free(coefs);
+    // the components at full resolution, padded to whole MCUs by
+    // repeating the last column and row
+    let pw = mcux * 8 * hs;
+    let ph = mcuy * 8 * vs;
+    let full = mem.alloc.[f32]((pw * ph) * ncomp)!;
+    defer mem.free(full);
+    let px = img.samples8();
+    let sc = img.channels;
+    for y in @as(usize, 0)..h {
+        for x in @as(usize, 0)..w {
+            let i = ((y * w) + x) * sc;
+            let o = (y * pw) + x;
+            if gray {
+                full[o] = @float_from_int(f32, px[i]);
+            } else {
+                let r = @float_from_int(f32, px[i]);
+                let g = @float_from_int(f32, px[i + 1]);
+                let b = @float_from_int(f32, px[i + 2]);
+                full[o] = ((0.299 * r) + (0.587 * g)) + (0.114 * b);
+                full[(pw * ph) + o] = ((128.0 - (0.168736 * r)) - (0.331264 * g)) + (0.5 * b);
+                full[(2 * (pw * ph)) + o] = ((128.0 + (0.5 * r)) - (0.418688 * g)) - (0.081312 * b);
+            }
+        }
+    }
+    for c in @as(usize, 0)..ncomp {
+        let pl = full[(c * pw) * ph..((c + 1) * pw) * ph];
+        for y in @as(usize, 0)..h {
+            let last = pl[(y * pw) + w - 1];
+            for x in w..pw {
+                pl[(y * pw) + x] = last;
+            }
+        }
+        for y in h..ax {
+            @mem_copy(pl[y * pw..(y + 1) * pw], pl[(h - 1) * pw..h * pw]);
+        }
+    }
+    // chroma: the average of the hs x vs pixels each sample covers
+    let cw = mcux * 8;
+    let chh = mcuy * 8;
+    let mut nd: usize = 0;
+    if not gray {
+        nd = (cw * chh) * 2;
+    }
+    let down = mem.alloc.[f32](nd)!;
+    defer mem.free(down);
+    if not gray {
+        for c in @as(usize, 1)..3 {
+            let pl = full[(c * pw) * ph..((c + 1) * pw) * ph];
+            let dp = down[((c - 1) * cw) * chh..(c * cw) * chh];
+            for y in @as(usize, 0)..chh {
+                if (hs == 2) and (vs == 2) {
+                    let r0 = pl[(2 * y) * pw..((2 * y) + 1) * pw];
+                    let r1 = pl[((2 * y) + 1) * pw..((2 * y) + 2) * pw];
+                    let d = dp[y * cw..(y + 1) * cw];
+                    for x in @as(usize, 0)..cw {
+                        d[x] = (((r0[2 * x] + r0[(2 * x) + 1]) + r1[2 * x]) + r1[(2 * x) + 1]) / 4.0;
+                    }
+                    continue;
+                }
+                for x in @as(usize, 0)..cw {
+                    let mut sum: f32 = 0.0;
+                    for sy in @as(usize, 0)..vs {
+                        for sx in @as(usize, 0)..hs {
+                            sum += pl[(((y * vs) + sy) * pw) + (x * hs) + sx];
+                        }
+                    }
+                    dp[(y * cw) + x] = sum / @float_from_int(f32, hs * vs);
+                }
+            }
+        }
+    }
+    // transform every block, in MCU order
+    let mut blk: usize = 0;
+    let mut samples: [64]f32 = [0.0; 64];
+    for my in @as(usize, 0)..mcuy {
+        for mx in @as(usize, 0)..mcux {
+            for c in @as(usize, 0)..ncomp {
+                let mut bh: usize = 1;
+                let mut bv: usize = 1;
+                let mut pl = full[..pw * ph];
+                let mut stride = pw;
+                if c == 0 {
+                    bh = hs;
+                    bv = vs;
+                } else {
+                    pl = down[((c - 1) * cw) * chh..(c * cw) * chh];
+                    stride = cw;
+                }
+                for by in @as(usize, 0)..bv {
+                    for bx in @as(usize, 0)..bh {
+                        let x0 = ((mx * bh) + bx) * 8;
+                        let y0 = ((my * bv) + by) * 8;
+                        for yy in @as(usize, 0)..8 {
+                            let row = pl[((y0 + yy) * stride) + x0..((y0 + yy) * stride) + x0 + 8];
+                            for xx in @as(usize, 0)..8 {
+                                samples[(yy * 8) + xx] = row[xx] - 128.0;
+                            }
+                        }
+                        let mut t: usize = 0;
+                        if c > 0 {
+                            t = 1;
+                        }
+                        fdct_quantize(&samples, &qt[t], coefs[blk * 64..(blk + 1) * 64]);
+                        blk += 1;
+                    }
+                }
+            }
+        }
+    }
+    // Huffman tables from the symbol frequencies
+    let mut freq: [4][257]u32 = [[0; 257]; 4];  // DC luma, AC luma, DC chroma, AC chroma
+    let mut tables: [4]HuffTable = [HuffTable.{ bits: [0; 16], vals: [0; 256], nvals: 0, code: [0; 256],
+                                                len: [0; 256] }; 4];
+    walk(coefs, mcux * mcuy, hs * vs, ncomp, &mut freq, @ptr_from_int(*mut BitWriter, 8), false, &tables)!;
+    for t in @as(usize, 0)..4 {
+        if (t < 2) or not gray {
+            build_huff(&freq[t], &mut tables[t]);
+        }
+    }
+    // the file
+    let mut hdrs = strs.String.init();
+    defer hdrs.deinit();
+    write_headers(&mut hdrs, w, h, ncomp, hs, vs, &qt, &tables)!;
+    wr.write_all(hdrs.bytes())!;
+    let mut bw = BitWriter.{ out: wr, buf: [0; 4096], len: 0, acc: 0, nbits: 0 };
+    walk(coefs, mcux * mcuy, hs * vs, ncomp, &mut freq, &mut bw, true, &tables)!;
+    // pad the last byte with ones
+    bw.put(0x7f, 7)!;
+    bw.buf[bw.len] = 0xff;
+    bw.buf[bw.len + 1] = 0xd9;
+    bw.len += 2;
+    wr.write_all(bw.buf[..bw.len])!;
+}
+
+struct HuffTable {
+    bits: [16]u8,
+    vals: [256]u8,
+    nvals: usize,
+    code: [256]u16,  // by symbol
+    len: [256]u8,
+}
+
+// Bits, most significant first, into buf, written to out when it fills.
+struct BitWriter {
+    out: io.Writer,
+    buf: [4096]u8,
+    len: usize,
+    acc: u32,
+    nbits: u32,
+
+    fn put(self: *mut BitWriter, v: u32, n: u32) !void {
+        self.acc = (self.acc << n) | (v & ((@as(u32, 1) << n) - 1));
+        self.nbits += n;
+        if self.len > (self.buf.len - 8) {
+            self.out.write_all(self.buf[..self.len])!;
+            self.len = 0;
+        }
+        while self.nbits >= 8 {
+            let b = @truncate(u8, self.acc >> (self.nbits - 8));
+            self.buf[self.len] = b;
+            self.len += 1;
+            if b == 0xff {
+                self.buf[self.len] = 0;  // byte stuffing
+                self.len += 1;
+            }
+            self.nbits -= 8;
+        }
+        self.acc = self.acc & ((@as(u32, 1) << self.nbits) - 1);
+    }
+}
+
+fn bit_size(v: i32) u32 {
+    let mut a = @abs(v);
+    let mut n: u32 = 0;
+    while a > 0 {
+        n += 1;
+        a = a >> 1;
+    }
+    return n;
+}
+
+/// Goes over the blocks' symbols: counting them, or writing them.
+fn walk(coefs: []i16, nmcu: usize, luma_blocks: usize, ncomp: usize, freq: *mut [4][257]u32, bw: *mut BitWriter,
+        emit: bool, tables: *[4]HuffTable) !void {
+    let mut pred: [3]i32 = [0, 0, 0];
+    let mut blk: usize = 0;
+    for m in @as(usize, 0)..nmcu {
+        for c in @as(usize, 0)..ncomp {
+            let mut nb: usize = 1;
+            if c == 0 {
+                nb = luma_blocks;
+            }
+            let mut t: usize = 0;
+            if c > 0 {
+                t = 2;
+            }
+            for b in @as(usize, 0)..nb {
+                let z = coefs[blk * 64..(blk + 1) * 64];
+                blk += 1;
+                let dc = @as(i32, z[0]);
+                let diff = dc - pred[c];
+                pred[c] = dc;
+                let s = bit_size(diff);
+                symbol(freq, bw, emit, tables, t, s, diff)!;
+                let mut run: u32 = 0;
+                for k in @as(usize, 1)..64 {
+                    let v = @as(i32, z[k]);
+                    if v == 0 {
+                        run += 1;
+                        continue;
+                    }
+                    while run >= 16 {
+                        symbol(freq, bw, emit, tables, t + 1, 0xf0, 0)!;
+                        run -= 16;
+                    }
+                    let sz = bit_size(v);
+                    symbol(freq, bw, emit, tables, t + 1, (run << 4) | sz, v)!;
+                    run = 0;
+                }
+                if run > 0 {
+                    symbol(freq, bw, emit, tables, t + 1, 0, 0)!;  // end of block
+                }
+            }
+        }
+    }
+}
+
+/// Counts or writes one Huffman symbol and its extra bits (the low bits
+/// of v, for a symbol whose size is sym & 15).
+fn symbol(freq: *mut [4][257]u32, bw: *mut BitWriter, emit: bool, tables: *[4]HuffTable, t: usize, sym: u32,
+          v: i32) !void {
+    if not emit {
+        freq[t][@as(usize, sym)] += 1;
+        return;
+    }
+    let tb = &tables[t];
+    let s = @as(usize, sym);
+    bw.put(@as(u32, tb.code[s]), @as(u32, tb.len[s]))!;
+    let n = sym & 15;
+    if n > 0 {
+        let mut e = v;
+        if v < 0 {
+            e = v - 1;  // ones' complement of the magnitude
+        }
+        bw.put(@bit_cast(u32, e), n)!;
+    }
+}
+
+/// A length-limited (16 bits) Huffman code for the frequencies, as JPEG
+/// requires (Annex K.2), with a reserved symbol so that no code is all ones.
+fn build_huff(freq: *[257]u32, t: *mut HuffTable) void {
+    let mut f: [257]u32 = [0; 257];
+    @mem_copy(f[..], freq[..]);
+    f[256] = 1;  // the reserved code point
+    let mut codesize: [257]u32 = [0; 257];
+    let mut others: [257]i32 = [-1; 257];
+    loop {
+        // the two least frequent (v1 the smaller, ties to the larger index)
+        let mut v1: i32 = -1;
+        let mut v2: i32 = -1;
+        let mut f1: u32 = 0xffffffff;
+        let mut f2: u32 = 0xffffffff;
+        for i in @as(usize, 0)..257 {
+            if f[i] != 0 {
+                if f[i] <= f1 {
+                    f2 = f1;
+                    v2 = v1;
+                    f1 = f[i];
+                    v1 = @bit_cast(i32, @truncate(u32, i));
+                } else if f[i] <= f2 {
+                    f2 = f[i];
+                    v2 = @bit_cast(i32, @truncate(u32, i));
+                }
+            }
+        }
+        if v2 < 0 {
+            break;
+        }
+        let a = @as(usize, @bit_cast(u32, v1));
+        let b = @as(usize, @bit_cast(u32, v2));
+        f[a] += f[b];
+        f[b] = 0;
+        // lengthen every code in both trees
+        let mut x = a;
+        loop {
+            codesize[x] += 1;
+            if others[x] < 0 {
+                break;
+            }
+            x = @as(usize, @bit_cast(u32, others[x]));
+        }
+        others[x] = v2;
+        x = b;
+        loop {
+            codesize[x] += 1;
+            if others[x] < 0 {
+                break;
+            }
+            x = @as(usize, @bit_cast(u32, others[x]));
+        }
+    }
+    let mut bits: [33]u32 = [0; 33];
+    for i in @as(usize, 0)..257 {
+        if codesize[i] > 0 {
+            bits[@as(usize, codesize[i])] += 1;
+        }
+    }
+    // limit lengths to 16 (K.3)
+    let mut i: usize = 32;
+    while i > 16 {
+        while bits[i] > 0 {
+            let mut j = i - 2;
+            while bits[j] == 0 {
+                j -= 1;
+            }
+            bits[i] -= 2;
+            bits[i - 1] += 1;
+            bits[j + 1] += 2;
+            bits[j] -= 1;
+        }
+        i -= 1;
+    }
+    // drop the reserved code (the longest)
+    i = 16;
+    while bits[i] == 0 {
+        i -= 1;
+    }
+    bits[i] -= 1;
+    for k in @as(usize, 0)..16 {
+        t.bits[k] = @truncate(u8, bits[k + 1]);
+    }
+    // symbols by code length, then value
+    let mut n: usize = 0;
+    for len in @as(u32, 1)..33 {
+        for s in @as(usize, 0)..256 {
+            if codesize[s] == len {
+                t.vals[n] = @truncate(u8, s);
+                n += 1;
+            }
+        }
+    }
+    t.nvals = n;
+    // canonical codes
+    let mut code: u32 = 0;
+    let mut k: usize = 0;
+    for len in @as(usize, 1)..17 {
+        for c in @as(usize, 0)..@as(usize, t.bits[len - 1]) {
+            let s = @as(usize, t.vals[k]);
+            t.code[s] = @truncate(u16, code);
+            t.len[s] = @truncate(u8, len);
+            code += 1;
+            k += 1;
+        }
+        code = code << 1;
+    }
+    t.nvals = k;
+}
+
+fn write_headers(o: *mut strs.String, w: usize, h: usize, ncomp: usize, hs: usize, vs: usize, qt: *[2][64]u16,
+                 tables: *[4]HuffTable) !void {
+    let soi_app0: [20]u8 = [
+        0xff,
+        0xd8,
+        0xff,
+        0xe0,
+        0,
+        16,
+        'J',
+        'F',
+        'I',
+        'F',
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+        0,
+    ];
+    o.push_str(soi_app0[..])!;
+    let nq: usize = @min(ncomp, 2);
+    for t in @as(usize, 0)..nq {
+        let hdr: [5]u8 = [0xff, 0xdb, 0, 67, @truncate(u8, t)];
+        o.push_str(hdr[..])!;
+        for k in @as(usize, 0)..64 {
+            o.push(@truncate(u8, qt[t][@as(usize, DEZIGZAG[k])]))!;
+        }
+    }
+    let sof: [10]u8 = [
+        0xff,
+        0xc0,
+        0,
+        @truncate(u8, 8 + (3 * ncomp)),
+        8,
+        @truncate(u8, h >> 8),
+        @truncate(u8, h),
+        @truncate(u8, w >> 8),
+        @truncate(u8, w),
+        @truncate(u8, ncomp),
+    ];
+    o.push_str(sof[..])!;
+    for c in @as(usize, 0)..ncomp {
+        let mut samp: u8 = 0x11;
+        let mut q: u8 = 1;
+        if c == 0 {
+            samp = @truncate(u8, (hs << 4) | vs);
+            q = 0;
+        }
+        let comp: [3]u8 = [@truncate(u8, c + 1), samp, q];
+        o.push_str(comp[..])!;
+    }
+    for t in @as(usize, 0)..4 {
+        if (t >= 2) and (ncomp == 1) {
+            continue;
+        }
+        let tb = &tables[t];
+        let len = 2 + 17 + tb.nvals;
+        let class = @truncate(u8, ((t % 2) << 4) | (t / 2));
+        let hdr: [5]u8 = [0xff, 0xc4, @truncate(u8, len >> 8), @truncate(u8, len), class];
+        o.push_str(hdr[..])!;
+        o.push_str(tb.bits[..])!;
+        o.push_str(tb.vals[..tb.nvals])!;
+    }
+    let sos_len = 6 + (2 * ncomp);
+    let hdr: [5]u8 = [0xff, 0xda, 0, @truncate(u8, sos_len), @truncate(u8, ncomp)];
+    o.push_str(hdr[..])!;
+    for c in @as(usize, 0)..ncomp {
+        let mut tabs: u8 = 0x00;
+        if c > 0 {
+            tabs = 0x11;
+        }
+        let comp: [2]u8 = [@truncate(u8, c + 1), tabs];
+        o.push_str(comp[..])!;
+    }
+    let tail: [3]u8 = [0, 63, 0];
+    o.push_str(tail[..])!;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "round trips" {
+    let modes: [3]Subsample = [Subsample.S444, Subsample.S422, Subsample.S420];
+    let chans: [2]usize = [1, 3];
+    for ch in chans {
+        for mode in modes {
+            let mut img = image.Image.init(45, 29, ch, image.Depth.U8)!;
+            defer img.deinit();
+            let px = img.samples8();
+            for i in @as(usize, 0)..px.len {
+                px[i] = @truncate(u8, ((((i / ch) % 45) * 3) + ((i / (ch * 45)) * 2)) + ((i % ch) * 20));
+            }
+            let enc = encode(&img, 95, mode)!;
+            defer mem.free(enc);
+            @expect(is_jpeg(enc));
+            let mut back = decode(enc)!;
+            defer back.deinit();
+            @expect_eq(back.width, 45);
+            @expect_eq(back.height, 29);
+            @expect_eq(back.channels, ch);
+            // lossy, but close
+            let mut worst: i32 = 0;
+            for i in @as(usize, 0)..px.len {
+                worst = @max(worst, @abs(@as(i32, px[i]) - @as(i32, back.data[i])));
+            }
+            @expect(worst <= 8);
+        }
+    }
+}
+
+test "rejects" {
+    let bad: [3][]u8 = ["\xff\xd8\xff\xd9", "\xff\xd8\xff\xc3\x00\x02", "\xff\xd8\xff\xdb\x00\x05\x07"];
+    for b in bad {
+        _ = decode(b) catch continue;
+        @trap();
+    }
+}
+
+test "encode_to" {
+    let mut img = image.Image.init(200, 120, 3, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..img.data.len {
+        img.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
+    }
+    let enc = encode(&img, 90, Subsample.S420)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &img, 90, Subsample.S420)!;
+    @expect_eq(s.bytes(), enc[..]);
+    let mut small: [1000]u8 = [0; 1000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &img, 90, Subsample.S420) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
+}

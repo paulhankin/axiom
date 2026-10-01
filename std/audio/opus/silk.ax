@@ -1,0 +1,1997 @@
+// =============================================================================
+// std/audio/opus/silk.ax - the SILK layer of Opus (RFC 6716 section 4.2): the
+// frame header, LSF and gain dequantisation, pitch and LTP, the excitation,
+// LPC synthesis, packet loss concealment, comfort noise, stereo unmixing and
+// the resampler up to 48 kHz. Ported from libopus's decoder (silk/*.c;
+// Copyright Skype Limited, Xiph.Org and others, BSD 3-clause). SILK is fixed
+// point, so the output matches libopus exactly.
+// =============================================================================
+
+import "../../mem.ax" as mem;
+import "range.ax" as rc;
+import "tables.ax" as t;
+
+error { OutOfMemory }
+
+const MAX_FRAME_LENGTH: usize = 320;
+const MAX_SUB_FRAME_LENGTH: usize = 80;
+const MAX_LPC_ORDER: usize = 16;
+const MAX_NB_SUBFR: usize = 4;
+const LTP_ORDER: usize = 5;
+const OUTBUF_LEN: usize = 480;
+const TYPE_NO_VOICE_ACTIVITY: i32 = 0;
+const TYPE_VOICED: i32 = 2;
+const CODE_INDEPENDENTLY: i32 = 0;
+const CODE_INDEPENDENTLY_NO_LTP_SCALING: i32 = 1;
+const CODE_CONDITIONALLY: i32 = 2;
+const DECODE_NORMAL: i32 = 0;
+const PACKET_LOST: i32 = 1;
+const DECODE_LBRR: i32 = 2;
+const I32_MAX: i32 = 2147483647;
+const I32_MIN: i32 = -2147483648;
+
+// -----------------------------------------------------------------------------
+// Fixed point helpers (silk/SigProc_FIX.h, macros.h, Inlines.h)
+// -----------------------------------------------------------------------------
+
+fn us(v: i32) usize {
+    return @as(usize, @bit_cast(u32, v));
+}
+
+fn si(v: usize) i32 {
+    return @bit_cast(i32, @truncate(u32, v));
+}
+
+fn b2i(b: bool) i32 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn shl(a: i32, s: i32) i32 {
+    return a << @bit_cast(u32, s);
+}
+
+fn shr(a: i32, s: i32) i32 {
+    return a >> @bit_cast(u32, s);
+}
+
+/// (opus_int16)a
+fn i16v(a: i32) i32 {
+    return @as(i32, @truncate(i16, a));
+}
+
+fn smulbb(a: i32, b: i32) i32 {
+    return i16v(a) *% i16v(b);
+}
+
+fn smlabb(a: i32, b: i32, c: i32) i32 {
+    return a +% smulbb(b, c);
+}
+
+fn smulwb(a: i32, b: i32) i32 {
+    return @truncate(i32, (@as(i64, a) * @as(i64, i16v(b))) >> 16);
+}
+
+fn smlawb(a: i32, b: i32, c: i32) i32 {
+    return a +% smulwb(b, c);
+}
+
+fn smulww(a: i32, b: i32) i32 {
+    return @truncate(i32, (@as(i64, a) * @as(i64, b)) >> 16);
+}
+
+fn smlaww(a: i32, b: i32, c: i32) i32 {
+    return a +% smulww(b, c);
+}
+
+fn smmul(a: i32, b: i32) i32 {
+    return @truncate(i32, (@as(i64, a) * @as(i64, b)) >> 32);
+}
+
+fn smultt(a: i32, b: i32) i32 {
+    return (a >> 16) *% (b >> 16);
+}
+
+fn rshift_round(a: i32, s: i32) i32 {
+    if s == 1 {
+        return (a >> 1) +% (a & 1);
+    }
+    return (shr(a, s - 1) +% 1) >> 1;
+}
+
+fn rshift_round64(a: i64, s: i32) i64 {
+    if s == 1 {
+        return (a >> 1) + (a & 1);
+    }
+    return ((a >> @bit_cast(u32, s - 1)) + 1) >> 1;
+}
+
+fn sat16(a: i32) i32 {
+    if a > 32767 {
+        return 32767;
+    }
+    if a < -32768 {
+        return -32768;
+    }
+    return a;
+}
+
+fn limit(a: i32, l1: i32, l2: i32) i32 {
+    if l1 > l2 {
+        if a > l1 {
+            return l1;
+        }
+        if a < l2 {
+            return l2;
+        }
+        return a;
+    }
+    if a > l2 {
+        return l2;
+    }
+    if a < l1 {
+        return l1;
+    }
+    return a;
+}
+
+fn lshift_sat32(a: i32, s: i32) i32 {
+    return shl(limit(a, shr(I32_MIN, s), shr(I32_MAX, s)), s);
+}
+
+fn add_sat32(a: i32, b: i32) i32 {
+    return @add_sat(a, b);
+}
+
+fn sub_sat32(a: i32, b: i32) i32 {
+    return @sub_sat(a, b);
+}
+
+fn iabs(a: i32) i32 {
+    if a < 0 {
+        return -%a;
+    }
+    return a;
+}
+
+fn clz32(a: i32) i32 {
+    if a == 0 {
+        return 32;
+    }
+    return @as(i32, @truncate(u8, @clz(@bit_cast(u32, a))));
+}
+
+fn rand(seed: i32) i32 {
+    return 907633515 +% (seed *% 196314165);
+}
+
+fn ror32(a: i32, rot: i32) i32 {
+    let x = @bit_cast(u32, a);
+    if rot == 0 {
+        return a;
+    }
+    if rot < 0 {
+        let m = @bit_cast(u32, -rot);
+        return @bit_cast(i32, (x << m) | (x >> (32 - m)));
+    }
+    let r = @bit_cast(u32, rot);
+    return @bit_cast(i32, (x << (32 - r)) | (x >> r));
+}
+
+fn sqrt_approx(x: i32) i32 {
+    if x <= 0 {
+        return 0;
+    }
+    let lz = clz32(x);
+    let frac_q7 = ror32(x, 24 - lz) & 0x7f;
+    let mut y: i32 = 46214;
+    if (lz & 1) != 0 {
+        y = 32768;
+    }
+    y = shr(y, lz >> 1);
+    return smlawb(y, y, smulbb(213, frac_q7));
+}
+
+fn div32_varq(a32: i32, b32: i32, qres: i32) i32 {
+    let a_headrm = clz32(iabs(a32)) - 1;
+    let mut a32_nrm = shl(a32, a_headrm);
+    let b_headrm = clz32(iabs(b32)) - 1;
+    let b32_nrm = shl(b32, b_headrm);
+    let b32_inv = (I32_MAX >> 2) / (b32_nrm >> 16);
+    let mut result = smulwb(a32_nrm, b32_inv);
+    a32_nrm = a32_nrm -% (smmul(b32_nrm, result) << 3);
+    result = smlawb(result, a32_nrm, b32_inv);
+    let lshift = ((29 + a_headrm) - b_headrm) - qres;
+    if lshift < 0 {
+        return lshift_sat32(result, -lshift);
+    }
+    if lshift < 32 {
+        return shr(result, lshift);
+    }
+    return 0;
+}
+
+fn inverse32_varq(b32: i32, qres: i32) i32 {
+    let b_headrm = clz32(iabs(b32)) - 1;
+    let b32_nrm = shl(b32, b_headrm);
+    let b32_inv = (I32_MAX >> 2) / (b32_nrm >> 16);
+    let mut result = b32_inv << 16;
+    let err_q32 = ((@as(i32, 1) << 29) -% smulwb(b32_nrm, b32_inv)) << 3;
+    result = smlaww(result, err_q32, b32_inv);
+    let lshift = (61 - b_headrm) - qres;
+    if lshift <= 0 {
+        return lshift_sat32(result, -lshift);
+    }
+    if lshift < 32 {
+        return shr(result, lshift);
+    }
+    return 0;
+}
+
+fn log2lin(in_log_q7: i32) i32 {
+    if in_log_q7 < 0 {
+        return 0;
+    }
+    if in_log_q7 >= 3967 {
+        return I32_MAX;
+    }
+    let mut out = shl(1, in_log_q7 >> 7);
+    let frac_q7 = in_log_q7 & 0x7f;
+    let p = smlawb(frac_q7, smulbb(frac_q7, 128 - frac_q7), -174);
+    if in_log_q7 < 2048 {
+        out = out +% ((out *% p) >> 7);
+    } else {
+        out = out +% ((out >> 7) *% p);
+    }
+    return out;
+}
+
+fn sum_sqr_shift(energy: *mut i32, shift: *mut i32, x: []i32, len: i32) void {
+    let mut shft = 31 - clz32(len);
+    let mut nrg = @bit_cast(u32, len);
+    let mut i: i32 = 0;
+    while i < (len - 1) {
+        let tmp = @bit_cast(u32, smlabb(smulbb(x[us(i)], x[us(i)]), x[us(i + 1)], x[us(i + 1)]));
+        nrg = nrg +% (tmp >> @bit_cast(u32, shft));
+        i += 2;
+    }
+    if i < len {
+        let tmp = @bit_cast(u32, smulbb(x[us(i)], x[us(i)]));
+        nrg = nrg +% (tmp >> @bit_cast(u32, shft));
+    }
+    shft = @max(0, (shft + 3) - clz32(@bit_cast(i32, nrg)));
+    nrg = 0;
+    i = 0;
+    while i < (len - 1) {
+        let tmp = @bit_cast(u32, smlabb(smulbb(x[us(i)], x[us(i)]), x[us(i + 1)], x[us(i + 1)]));
+        nrg = nrg +% (tmp >> @bit_cast(u32, shft));
+        i += 2;
+    }
+    if i < len {
+        let tmp = @bit_cast(u32, smulbb(x[us(i)], x[us(i)]));
+        nrg = nrg +% (tmp >> @bit_cast(u32, shft));
+    }
+    shift.* = shft;
+    energy.* = @bit_cast(i32, nrg);
+}
+
+// -----------------------------------------------------------------------------
+// LPC helpers
+// -----------------------------------------------------------------------------
+
+fn bwexpander(ar: []mut i32, d: i32, chirp0: i32) void {
+    let mut chirp = chirp0;
+    let chirp_minus_one = chirp - 65536;
+    for i in @as(usize, 0)..us(d - 1) {
+        ar[i] = i16v(rshift_round(chirp *% ar[i], 16));
+        chirp +%= rshift_round(chirp *% chirp_minus_one, 16);
+    }
+    ar[us(d - 1)] = i16v(rshift_round(chirp *% ar[us(d - 1)], 16));
+}
+
+fn bwexpander_32(ar: []mut i32, d: i32, chirp0: i32) void {
+    let mut chirp = chirp0;
+    let chirp_minus_one = chirp - 65536;
+    for i in @as(usize, 0)..us(d - 1) {
+        ar[i] = smulww(chirp, ar[i]);
+        chirp +%= rshift_round(chirp *% chirp_minus_one, 16);
+    }
+    ar[us(d - 1)] = smulww(chirp, ar[us(d - 1)]);
+}
+
+fn lpc_fit(a_qout: []mut i32, a_qin: []mut i32, qout: i32, qin: i32, d: i32) void {
+    let mut idx: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 10 {
+        let mut maxabs: i32 = 0;
+        for k in @as(usize, 0)..us(d) {
+            let absval = iabs(a_qin[k]);
+            if absval > maxabs {
+                maxabs = absval;
+                idx = si(k);
+            }
+        }
+        maxabs = rshift_round(maxabs, qin - qout);
+        if maxabs > 32767 {
+            maxabs = @min(maxabs, 163838);
+            let chirp_q16 = 65470 - (shl(maxabs - 32767, 14) / ((maxabs * (idx + 1)) >> 2));
+            bwexpander_32(a_qin, d, chirp_q16);
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if i == 10 {
+        for k in @as(usize, 0)..us(d) {
+            a_qout[k] = sat16(rshift_round(a_qin[k], qin - qout));
+            a_qin[k] = shl(a_qout[k], qin - qout);
+        }
+    } else {
+        for k in @as(usize, 0)..us(d) {
+            a_qout[k] = i16v(rshift_round(a_qin[k], qin - qout));
+        }
+    }
+}
+
+const QA24: i32 = 24;
+const A_LIMIT: i32 = 16773022;
+const MIN_INV_GAIN_Q30: i32 = 107374;
+
+fn mul32_frac_q31(a: i32, b: i32) i32 {
+    return @truncate(i32, rshift_round64(@as(i64, a) * @as(i64, b), 31));
+}
+
+fn inverse_pred_gain_qa(a: []mut i32, order: i32) i32 {
+    let mut inv_gain_q30: i32 = 1 << 30;
+    let mut k = order - 1;
+    while k > 0 {
+        let ak = a[us(k)];
+        if (ak > A_LIMIT) or (ak < -A_LIMIT) {
+            return 0;
+        }
+        let rc_q31 = -shl(ak, 31 - QA24);
+        let rc_mult1_q30 = (@as(i32, 1) << 30) - smmul(rc_q31, rc_q31);
+        inv_gain_q30 = smmul(inv_gain_q30, rc_mult1_q30) << 2;
+        if inv_gain_q30 < MIN_INV_GAIN_Q30 {
+            return 0;
+        }
+        let mult2q = 32 - clz32(iabs(rc_mult1_q30));
+        let rc_mult2 = inverse32_varq(rc_mult1_q30, mult2q + 30);
+        for n in @as(usize, 0)..us((k + 1) >> 1) {
+            let tmp1 = a[n];
+            let tmp2 = a[us(k - 1) - n];
+            let mut t64 = rshift_round64(@as(i64, sub_sat32(tmp1, mul32_frac_q31(tmp2, rc_q31))) * @as(i64, rc_mult2),
+                                         mult2q);
+            if (t64 > @as(i64, I32_MAX)) or (t64 < @as(i64, I32_MIN)) {
+                return 0;
+            }
+            a[n] = @truncate(i32, t64);
+            t64 = rshift_round64(@as(i64, sub_sat32(tmp2, mul32_frac_q31(tmp1, rc_q31))) * @as(i64, rc_mult2), mult2q);
+            if (t64 > @as(i64, I32_MAX)) or (t64 < @as(i64, I32_MIN)) {
+                return 0;
+            }
+            a[us(k - 1) - n] = @truncate(i32, t64);
+        }
+        k -= 1;
+    }
+    let a0 = a[0];
+    if (a0 > A_LIMIT) or (a0 < -A_LIMIT) {
+        return 0;
+    }
+    let rc_q31 = -shl(a0, 31 - QA24);
+    let rc_mult1_q30 = (@as(i32, 1) << 30) - smmul(rc_q31, rc_q31);
+    inv_gain_q30 = smmul(inv_gain_q30, rc_mult1_q30) << 2;
+    if inv_gain_q30 < MIN_INV_GAIN_Q30 {
+        return 0;
+    }
+    return inv_gain_q30;
+}
+
+fn inverse_pred_gain(a_q12: []i32, order: i32) i32 {
+    let mut atmp: [16]i32 = [0; 16];
+    let mut dc_resp: i32 = 0;
+    for k in @as(usize, 0)..us(order) {
+        dc_resp += a_q12[k];
+        atmp[k] = a_q12[k] << 12;
+    }
+    if dc_resp >= 4096 {
+        return 0;
+    }
+    return inverse_pred_gain_qa(atmp[..], order);
+}
+
+let ORDERING16: [16]u8 = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1];
+let ORDERING10: [10]u8 = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7];
+
+fn nlsf2a_find_poly(out: []mut i32, c: []i32, co: usize, dd: i32) void {
+    out[0] = 1 << 16;
+    out[1] = -c[co];
+    for k in @as(usize, 1)..us(dd) {
+        let ftmp = @as(i64, c[co + (2 * k)]);
+        out[k + 1] = (out[k - 1] << 1) -% @truncate(i32, rshift_round64(ftmp * @as(i64, out[k]), 16));
+        let mut n = k;
+        while n > 1 {
+            out[n] +%= out[n - 2] -% @truncate(i32, rshift_round64(ftmp * @as(i64, out[n - 1]), 16));
+            n -= 1;
+        }
+        out[1] -%= @truncate(i32, ftmp);
+    }
+}
+
+/// LSFs (Q15) to prediction coefficients (Q12, stored as int16 values).
+fn nlsf2a(a_q12: []mut i32, nlsf: []i32, d: i32) void {
+    let mut cos_lsf: [16]i32 = [0; 16];
+    let mut p: [9]i32 = [0; 9];
+    let mut q: [9]i32 = [0; 9];
+    let mut a32: [16]i32 = [0; 16];
+    for k in @as(usize, 0)..us(d) {
+        let f_int = nlsf[k] >> 8;
+        let f_frac = nlsf[k] - (f_int << 8);
+        let cos_val = @as(i32, t.SILK_LSFCOSTAB_FIX_Q12[us(f_int)]);
+        let delta = @as(i32, t.SILK_LSFCOSTAB_FIX_Q12[us(f_int + 1)]) - cos_val;
+        let mut o: usize = 0;
+        if d == 16 {
+            o = @as(usize, ORDERING16[k]);
+        } else {
+            o = @as(usize, ORDERING10[k]);
+        }
+        cos_lsf[o] = rshift_round((cos_val << 8) + (delta * f_frac), 4);
+    }
+    let dd = d >> 1;
+    nlsf2a_find_poly(p[..], cos_lsf[..], 0, dd);
+    nlsf2a_find_poly(q[..], cos_lsf[..], 1, dd);
+    for k in @as(usize, 0)..us(dd) {
+        let ptmp = p[k + 1] +% p[k];
+        let qtmp = q[k + 1] -% q[k];
+        a32[k] = -%qtmp -% ptmp;
+        a32[us(d - 1) - k] = qtmp -% ptmp;
+    }
+    lpc_fit(a_q12, a32[..], 12, 17, d);
+    let mut i: i32 = 0;
+    while (inverse_pred_gain(a_q12, d) == 0) and (i < 16) {
+        bwexpander_32(a32[..], d, 65536 - shl(2, i));
+        for k in @as(usize, 0)..us(d) {
+            a_q12[k] = i16v(rshift_round(a32[k], 5));
+        }
+        i += 1;
+    }
+}
+
+/// out[oo + ix] for ix in d..len: the whitened in[io..].
+fn lpc_analysis_filter(out: []mut i32, oo: usize, inp: []i16, io: usize, b: []i32, len: i32, d: i32) void {
+    for ix in us(d)..us(len) {
+        let p = io + ix - 1;
+        let mut acc = smulbb(@as(i32, inp[p]), b[0]);
+        for j in @as(usize, 1)..us(d) {
+            acc = smlabb(acc, @as(i32, inp[p - j]), b[j]);
+        }
+        acc = (@as(i32, inp[p + 1]) << 12) -% acc;
+        out[oo + ix] = sat16(rshift_round(acc, 12));
+    }
+    for j in @as(usize, 0)..us(d) {
+        out[oo + j] = 0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// LSF codebooks
+// -----------------------------------------------------------------------------
+
+struct NlsfCb {
+    order: i32,
+    step_q16: i32,
+    cb1: []u8,
+    wght: []i16,
+    cb1_icdf: []u8,
+    pred: []u8,
+    sel: []u8,
+    icdf: []u8,
+    delta_min: []i16,
+}
+
+fn nlsf_cb(wb: bool) NlsfCb {
+    if wb {
+        return NlsfCb.{ order: 16, step_q16: 9830, cb1: t.SILK_NLSF_CB1_WB_Q8[..], wght: t.SILK_NLSF_CB1_WB_WGHT_Q9[..],
+                        cb1_icdf: t.SILK_NLSF_CB1_ICDF_WB[..], pred: t.SILK_NLSF_PRED_WB_Q8[..],
+                        sel: t.SILK_NLSF_CB2_SELECT_WB[..], icdf: t.SILK_NLSF_CB2_ICDF_WB[..],
+                        delta_min: t.SILK_NLSF_DELTA_MIN_WB_Q15[..] };
+    }
+    return NlsfCb.{ order: 10, step_q16: 11796, cb1: t.SILK_NLSF_CB1_NB_MB_Q8[..], wght: t.SILK_NLSF_CB1_WGHT_Q9[..],
+                    cb1_icdf: t.SILK_NLSF_CB1_ICDF_NB_MB[..], pred: t.SILK_NLSF_PRED_NB_MB_Q8[..],
+                    sel: t.SILK_NLSF_CB2_SELECT_NB_MB[..], icdf: t.SILK_NLSF_CB2_ICDF_NB_MB[..],
+                    delta_min: t.SILK_NLSF_DELTA_MIN_NB_MB_Q15[..] };
+}
+
+fn nlsf_unpack(ec_ix: []mut i32, pred_q8: []mut i32, cb: *NlsfCb, cb1_index: i32) void {
+    let base = us((cb1_index * cb.order) / 2);
+    let mut i: usize = 0;
+    while i < us(cb.order) {
+        let entry = @as(i32, cb.sel[base + (i / 2)]);
+        ec_ix[i] = ((entry >> 1) & 7) * 9;
+        pred_q8[i] = @as(i32, cb.pred[i + (us(entry & 1) * us(cb.order - 1))]);
+        ec_ix[i + 1] = ((entry >> 5) & 7) * 9;
+        pred_q8[i + 1] = @as(i32, cb.pred[i + (us((entry >> 4) & 1) * us(cb.order - 1)) + 1]);
+        i += 2;
+    }
+}
+
+fn nlsf_stabilize(nlsf: []mut i32, dmin: []i16, l: i32) void {
+    let lu = us(l);
+    for _loops in @as(i32, 0)..20 {
+        let mut min_diff = nlsf[0] - @as(i32, dmin[0]);
+        let mut ii: usize = 0;
+        for i in @as(usize, 1)..lu {
+            let diff = nlsf[i] - (nlsf[i - 1] + @as(i32, dmin[i]));
+            if diff < min_diff {
+                min_diff = diff;
+                ii = i;
+            }
+        }
+        let diff = 32768 - (nlsf[lu - 1] + @as(i32, dmin[lu]));
+        if diff < min_diff {
+            min_diff = diff;
+            ii = lu;
+        }
+        if min_diff >= 0 {
+            return;
+        }
+        if ii == 0 {
+            nlsf[0] = @as(i32, dmin[0]);
+        } else if ii == lu {
+            nlsf[lu - 1] = 32768 - @as(i32, dmin[lu]);
+        } else {
+            let mut min_center: i32 = 0;
+            for k in @as(usize, 0)..ii {
+                min_center += @as(i32, dmin[k]);
+            }
+            min_center += @as(i32, dmin[ii]) >> 1;
+            let mut max_center: i32 = 32768;
+            let mut k = lu;
+            while k > ii {
+                max_center -= @as(i32, dmin[k]);
+                k -= 1;
+            }
+            max_center -= @as(i32, dmin[ii]) >> 1;
+            let center = i16v(limit(rshift_round(nlsf[ii - 1] + nlsf[ii], 1), min_center, max_center));
+            nlsf[ii - 1] = i16v(center - (@as(i32, dmin[ii]) >> 1));
+            nlsf[ii] = i16v(nlsf[ii - 1] + @as(i32, dmin[ii]));
+        }
+    }
+    // fall back: sort, then push apart
+    for i in @as(usize, 1)..lu {
+        let v = nlsf[i];
+        let mut j = i;
+        while (j > 0) and (v < nlsf[j - 1]) {
+            nlsf[j] = nlsf[j - 1];
+            j -= 1;
+        }
+        nlsf[j] = v;
+    }
+    nlsf[0] = @max(nlsf[0], @as(i32, dmin[0]));
+    for i in @as(usize, 1)..lu {
+        nlsf[i] = @max(nlsf[i], sat16(nlsf[i - 1] + @as(i32, dmin[i])));
+    }
+    nlsf[lu - 1] = @min(nlsf[lu - 1], 32768 - @as(i32, dmin[lu]));
+    let mut i = lu - 1;
+    while i > 0 {
+        i -= 1;
+        nlsf[i] = @min(nlsf[i], nlsf[i + 1] - @as(i32, dmin[i + 1]));
+    }
+}
+
+fn nlsf_decode(nlsf: []mut i32, indices: []i32, cb: *NlsfCb) void {
+    let mut pred_q8: [16]i32 = [0; 16];
+    let mut ec_ix: [16]i32 = [0; 16];
+    let mut res_q10: [16]i32 = [0; 16];
+    nlsf_unpack(ec_ix[..], pred_q8[..], cb, indices[0]);
+    // residual dequantisation
+    let mut out_q10: i32 = 0;
+    let mut i = cb.order;
+    while i > 0 {
+        i -= 1;
+        let pred_q10 = smulbb(out_q10, pred_q8[us(i)]) >> 8;
+        out_q10 = indices[us(i + 1)] << 10;
+        if out_q10 > 0 {
+            out_q10 = i16v(out_q10 - 102);
+        } else if out_q10 < 0 {
+            out_q10 = i16v(out_q10 + 102);
+        }
+        out_q10 = smlawb(pred_q10, out_q10, cb.step_q16);
+        res_q10[us(i)] = i16v(out_q10);
+    }
+    let base = us(indices[0] * cb.order);
+    for k in @as(usize, 0)..us(cb.order) {
+        let tmp = ((res_q10[k] << 14) / @as(i32, cb.wght[base + k])) + (@as(i32, cb.cb1[base + k]) << 7);
+        nlsf[k] = limit(tmp, 0, 32767);
+    }
+    nlsf_stabilize(nlsf, cb.delta_min, cb.order);
+}
+
+// -----------------------------------------------------------------------------
+// The resampler (internal rate to 48 kHz)
+// -----------------------------------------------------------------------------
+
+const RS_COPY: i32 = 0;
+const RS_UP2: i32 = 1;
+const RS_IIR_FIR: i32 = 2;
+
+struct Resampler {
+    iir: [6]i32,
+    fir: [8]i32,
+    delay: [48]i32,
+    func: i32,
+    batch: i32,
+    inv_ratio_q16: i32,
+    fs_in_khz: i32,
+    fs_out_khz: i32,
+    input_delay: i32,
+}
+
+fn rate_id(r: i32) i32 {
+    return (((r >> 12) - b2i(r > 16000)) >> @bit_cast(u32, b2i(r > 24000))) - 1;
+}
+
+let DELAY_MATRIX_DEC: [15]i8 = [4, 0, 2, 0, 0, 0, 9, 4, 7, 4, 0, 3, 12, 7, 7];
+
+fn resampler_init(s: *mut Resampler, fs_in: i32, fs_out: i32) bool {
+    s.* = Resampler.{ iir: [0; 6], fir: [0; 8], delay: [0; 48], func: 0, batch: 0, inv_ratio_q16: 0, fs_in_khz: 0,
+                      fs_out_khz: 0, input_delay: 0 };
+    if ((fs_in != 8000) and (fs_in != 12000) and (fs_in != 16000)) or
+       ((fs_out != 8000) and (fs_out != 12000) and (fs_out != 16000) and (fs_out != 24000) and (fs_out != 48000)) {
+        return false;
+    }
+    if fs_out < fs_in {
+        return false;  // downsampling is never needed here: the API rate is 48 kHz
+    }
+    s.input_delay = @as(i32, DELAY_MATRIX_DEC[us((rate_id(fs_in) * 5) + rate_id(fs_out))]);
+    s.fs_in_khz = fs_in / 1000;
+    s.fs_out_khz = fs_out / 1000;
+    s.batch = s.fs_in_khz * 10;
+    let mut up2x: i32 = 0;
+    if fs_out > fs_in {
+        if fs_out == (fs_in * 2) {
+            s.func = RS_UP2;
+        } else {
+            s.func = RS_IIR_FIR;
+            up2x = 1;
+        }
+    } else {
+        s.func = RS_COPY;
+    }
+    s.inv_ratio_q16 = (shl(fs_in, 14 + up2x) / fs_out) << 2;
+    while smulww(s.inv_ratio_q16, fs_out) < shl(fs_in, up2x) {
+        s.inv_ratio_q16 += 1;
+    }
+    return true;
+}
+
+let UP2_HQ_0: [3]i32 = [1746, 14986, 39083 - 65536];
+let UP2_HQ_1: [3]i32 = [6854, 25769, 55542 - 65536];
+
+fn up2_hq(s: []mut i32, out: []mut i32, oo: usize, inp: []i32, io: usize, len: i32) void {
+    for k in @as(usize, 0)..us(len) {
+        let in32 = inp[io + k] << 10;
+        let mut y = in32 -% s[0];
+        let mut x = smulwb(y, UP2_HQ_0[0]);
+        let mut out1 = s[0] +% x;
+        s[0] = in32 +% x;
+        y = out1 -% s[1];
+        x = smulwb(y, UP2_HQ_0[1]);
+        let mut out2 = s[1] +% x;
+        s[1] = out1 +% x;
+        y = out2 -% s[2];
+        x = smlawb(y, y, UP2_HQ_0[2]);
+        out1 = s[2] +% x;
+        s[2] = out2 +% x;
+        out[oo + (2 * k)] = sat16(rshift_round(out1, 10));
+        y = in32 -% s[3];
+        x = smulwb(y, UP2_HQ_1[0]);
+        out1 = s[3] +% x;
+        s[3] = in32 +% x;
+        y = out1 -% s[4];
+        x = smulwb(y, UP2_HQ_1[1]);
+        out2 = s[4] +% x;
+        s[4] = out1 +% x;
+        y = out2 -% s[5];
+        x = smlawb(y, y, UP2_HQ_1[2]);
+        out1 = s[5] +% x;
+        s[5] = out2 +% x;
+        out[oo + (2 * k) + 1] = sat16(rshift_round(out1, 10));
+    }
+}
+
+fn frac_fir(i: i32, j: usize) i32 {
+    return @as(i32, t.SILK_RESAMPLER_FRAC_FIR_12[(us(i) * 4) + j]);
+}
+
+/// Returns the new output position.
+fn iir_fir(s: *mut Resampler, out: []mut i32, oo0: usize, inp: []i32, io0: usize, len0: i32) usize {
+    let mut buf: [488]i32 = [0; 488];
+    for k in @as(usize, 0)..8 {
+        buf[k] = s.fir[k];
+    }
+    let inc = s.inv_ratio_q16;
+    let mut oo = oo0;
+    let mut io = io0;
+    let mut len = len0;
+    let mut n: i32 = 0;
+    loop {
+        n = @min(len, s.batch);
+        up2_hq(s.iir[..], buf[..], 8, inp, io, n);
+        let max_index = n << 17;
+        let mut index: i32 = 0;
+        while index < max_index {
+            let ti = smulwb(index & 0xffff, 12);
+            let b = us(index >> 16);
+            let mut r = smulbb(buf[b], frac_fir(ti, 0));
+            r = smlabb(r, buf[b + 1], frac_fir(ti, 1));
+            r = smlabb(r, buf[b + 2], frac_fir(ti, 2));
+            r = smlabb(r, buf[b + 3], frac_fir(ti, 3));
+            r = smlabb(r, buf[b + 4], frac_fir(11 - ti, 3));
+            r = smlabb(r, buf[b + 5], frac_fir(11 - ti, 2));
+            r = smlabb(r, buf[b + 6], frac_fir(11 - ti, 1));
+            r = smlabb(r, buf[b + 7], frac_fir(11 - ti, 0));
+            out[oo] = sat16(rshift_round(r, 15));
+            oo += 1;
+            index += inc;
+        }
+        io += us(n);
+        len -= n;
+        if len > 0 {
+            for k in @as(usize, 0)..8 {
+                buf[k] = buf[us(n << 1) + k];
+            }
+        } else {
+            break;
+        }
+    }
+    for k in @as(usize, 0)..8 {
+        s.fir[k] = buf[us(n << 1) + k];
+    }
+    return oo;
+}
+
+fn resample_part(s: *mut Resampler, out: []mut i32, oo: usize, inp: []i32, io: usize, len: i32) void {
+    if s.func == RS_IIR_FIR {
+        _ = iir_fir(s, out, oo, inp, io, len);
+    } else if s.func == RS_UP2 {
+        up2_hq(s.iir[..], out, oo, inp, io, len);
+    } else {
+        for k in @as(usize, 0)..us(len) {
+            out[oo + k] = inp[io + k];
+        }
+    }
+}
+
+fn resample(s: *mut Resampler, out: []mut i32, inp: []i32, io: usize, in_len: i32) void {
+    let nsamples = s.fs_in_khz - s.input_delay;
+    for k in @as(usize, 0)..us(nsamples) {
+        s.delay[us(s.input_delay) + k] = inp[io + k];
+    }
+    let mut dl: [48]i32 = s.delay;
+    resample_part(s, out, 0, dl[..], 0, s.fs_in_khz);
+    resample_part(s, out, us(s.fs_out_khz), inp, io + us(nsamples), in_len - s.fs_in_khz);
+    for k in @as(usize, 0)..us(s.input_delay) {
+        s.delay[k] = inp[(io + us(in_len - s.input_delay)) + k];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Decoder state
+// -----------------------------------------------------------------------------
+
+struct Indices {
+    gains: [4]i32,
+    ltp: [4]i32,
+    nlsf: [17]i32,
+    lag: i32,
+    contour: i32,
+    signal_type: i32,
+    quant_offset_type: i32,
+    nlsf_interp_q2: i32,
+    per: i32,
+    ltp_scale: i32,
+    seed: i32,
+}
+
+struct Plc {
+    pitch_l_q8: i32,
+    ltp_coef_q14: [5]i32,
+    prev_lpc_q12: [16]i32,
+    last_frame_lost: bool,
+    rand_seed: i32,
+    rand_scale_q14: i32,
+    conc_energy: i32,
+    conc_energy_shift: i32,
+    prev_ltp_scale_q14: i32,
+    prev_gain_q16: [2]i32,
+    fs_khz: i32,
+    nb_subfr: i32,
+    subfr_length: i32,
+}
+
+struct Cng {
+    exc_buf_q14: [320]i32,
+    smth_nlsf_q15: [16]i32,
+    synth_state: [16]i32,
+    smth_gain_q16: i32,
+    rand_seed: i32,
+    fs_khz: i32,
+}
+
+struct Chan {
+    prev_gain_q16: i32,
+    exc_q14: [320]i32,
+    slpc_q14_buf: [16]i32,
+    out_buf: [480]i16,
+    lag_prev: i32,
+    last_gain_index: i32,
+    fs_khz: i32,
+    fs_api_hz: i32,
+    nb_subfr: i32,
+    frame_length: i32,
+    subfr_length: i32,
+    ltp_mem_length: i32,
+    lpc_order: i32,
+    prev_nlsf_q15: [16]i32,
+    first_frame_after_reset: bool,
+    n_frames_decoded: i32,
+    n_frames_per_packet: i32,
+    ec_prev_signal_type: i32,
+    ec_prev_lag_index: i32,
+    vad_flags: [3]i32,
+    lbrr_flag: i32,
+    lbrr_flags: [3]i32,
+    resampler: Resampler,
+    indices: Indices,
+    cng: Cng,
+    loss_cnt: i32,
+    prev_signal_type: i32,
+    plc: Plc,
+}
+
+struct Ctrl {
+    pitch_l: [4]i32,
+    gains_q16: [4]i32,
+    pred_coef_q12: [32]i32,
+    ltp_coef_q14: [20]i32,
+    ltp_scale_q14: i32,
+}
+
+pub struct Control {
+    api_rate: i32,
+    channels_api: i32,
+    channels_internal: i32,
+    internal_rate: i32,
+    payload_ms: i32,
+}
+
+pub struct Silk {
+    ch: [2]Chan,
+    pred_prev_q13: [2]i32,
+    s_mid: [2]i32,
+    s_side: [2]i32,
+    n_channels_api: i32,
+    n_channels_internal: i32,
+    prev_decode_only_middle: i32,
+}
+
+fn plc_reset(ch: *mut Chan) void {
+    ch.plc.pitch_l_q8 = ch.frame_length << 7;
+    ch.plc.prev_gain_q16[0] = 65536;
+    ch.plc.prev_gain_q16[1] = 65536;
+    ch.plc.subfr_length = 20;
+    ch.plc.nb_subfr = 2;
+}
+
+fn cng_reset(ch: *mut Chan) void {
+    let step = 32767 / (ch.lpc_order + 1);
+    let mut acc: i32 = 0;
+    for i in @as(usize, 0)..us(ch.lpc_order) {
+        acc += step;
+        ch.cng.smth_nlsf_q15[i] = acc;
+    }
+    ch.cng.smth_gain_q16 = 0;
+    ch.cng.rand_seed = 3176576;
+}
+
+fn init_chan(ch: *mut Chan) void {
+    @mem_set(@cast_slice(u8, @slice_from_ptr(ch, 1)), 0);
+    ch.first_frame_after_reset = true;
+    ch.prev_gain_q16 = 65536;
+    cng_reset(ch);
+    plc_reset(ch);
+}
+
+pub fn new() ![]mut Silk {
+    let s = mem.alloc_zeroed.[Silk](1)!;
+    reset(&mut s[0]);
+    return s;
+}
+
+/// silk_InitDecoder
+pub fn reset(st: *mut Silk) void {
+    init_chan(&mut st.ch[0]);
+    init_chan(&mut st.ch[1]);
+    st.pred_prev_q13 = [0; 2];
+    st.s_mid = [0; 2];
+    st.s_side = [0; 2];
+    st.prev_decode_only_middle = 0;
+}
+
+fn set_fs(ch: *mut Chan, fs_khz: i32, fs_api_hz: i32) bool {
+    let mut ok = true;
+    ch.subfr_length = 5 * fs_khz;
+    let frame_length = ch.nb_subfr * ch.subfr_length;
+    if (ch.fs_khz != fs_khz) or (ch.fs_api_hz != fs_api_hz) {
+        ok = resampler_init(&mut ch.resampler, fs_khz * 1000, fs_api_hz);
+        ch.fs_api_hz = fs_api_hz;
+    }
+    if (ch.fs_khz != fs_khz) or (frame_length != ch.frame_length) {
+        if ch.fs_khz != fs_khz {
+            ch.ltp_mem_length = 20 * fs_khz;
+            if fs_khz == 16 {
+                ch.lpc_order = 16;
+            } else {
+                ch.lpc_order = 10;
+            }
+            ch.first_frame_after_reset = true;
+            ch.lag_prev = 100;
+            ch.last_gain_index = 10;
+            ch.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
+            @mem_set(ch.out_buf[..], 0);
+            ch.slpc_q14_buf = [0; 16];
+        }
+        ch.fs_khz = fs_khz;
+        ch.frame_length = frame_length;
+    }
+    return ok;
+}
+
+fn pitch_lag_low_bits_icdf(fs_khz: i32) []u8 {
+    if fs_khz == 16 {
+        return t.SILK_UNIFORM8_ICDF[..];
+    }
+    if fs_khz == 12 {
+        return t.SILK_UNIFORM6_ICDF[..];
+    }
+    return t.SILK_UNIFORM4_ICDF[..];
+}
+
+fn pitch_contour_icdf(fs_khz: i32, nb_subfr: i32) []u8 {
+    if fs_khz == 8 {
+        if nb_subfr == 4 {
+            return t.SILK_PITCH_CONTOUR_NB_ICDF[..];
+        }
+        return t.SILK_PITCH_CONTOUR_10_MS_NB_ICDF[..];
+    }
+    if nb_subfr == 4 {
+        return t.SILK_PITCH_CONTOUR_ICDF[..];
+    }
+    return t.SILK_PITCH_CONTOUR_10_MS_ICDF[..];
+}
+
+fn ltp_gain_icdf(per: i32) []u8 {
+    if per == 0 {
+        return t.SILK_LTP_GAIN_ICDF_0[..];
+    }
+    if per == 1 {
+        return t.SILK_LTP_GAIN_ICDF_1[..];
+    }
+    return t.SILK_LTP_GAIN_ICDF_2[..];
+}
+
+fn ltp_vq(per: i32) []i8 {
+    if per == 0 {
+        return t.SILK_LTP_GAIN_VQ_0[..];
+    }
+    if per == 1 {
+        return t.SILK_LTP_GAIN_VQ_1[..];
+    }
+    return t.SILK_LTP_GAIN_VQ_2[..];
+}
+
+// -----------------------------------------------------------------------------
+// Side information and excitation
+// -----------------------------------------------------------------------------
+
+fn decode_indices(ch: *mut Chan, d: *mut rc.Dec, frame_index: i32, decode_lbrr: bool, cond_coding: i32) void {
+    let ix = &mut ch.indices;
+    let mut sym: i32 = 0;
+    if decode_lbrr or (ch.vad_flags[us(frame_index)] != 0) {
+        sym = d.icdf(t.SILK_TYPE_OFFSET_VAD_ICDF[..], 8) + 2;
+    } else {
+        sym = d.icdf(t.SILK_TYPE_OFFSET_NO_VAD_ICDF[..], 8);
+    }
+    ix.signal_type = sym >> 1;
+    ix.quant_offset_type = sym & 1;
+    if cond_coding == CODE_CONDITIONALLY {
+        ix.gains[0] = d.icdf(t.SILK_DELTA_GAIN_ICDF[..], 8);
+    } else {
+        ix.gains[0] = d.icdf(t.SILK_GAIN_ICDF[us(ix.signal_type * 8)..], 8) << 3;
+        ix.gains[0] += d.icdf(t.SILK_UNIFORM8_ICDF[..], 8);
+    }
+    for i in @as(usize, 1)..us(ch.nb_subfr) {
+        ix.gains[i] = d.icdf(t.SILK_DELTA_GAIN_ICDF[..], 8);
+    }
+    let cb = nlsf_cb(ch.lpc_order == 16);
+    ix.nlsf[0] = d.icdf(cb.cb1_icdf[us((ix.signal_type >> 1) * 32)..], 8);
+    let mut ec_ix: [16]i32 = [0; 16];
+    let mut pred_q8: [16]i32 = [0; 16];
+    nlsf_unpack(ec_ix[..], pred_q8[..], &cb, ix.nlsf[0]);
+    for i in @as(usize, 0)..us(cb.order) {
+        let mut s = d.icdf(cb.icdf[us(ec_ix[i])..], 8);
+        if s == 0 {
+            s -= d.icdf(t.SILK_NLSF_EXT_ICDF[..], 8);
+        } else if s == 8 {
+            s += d.icdf(t.SILK_NLSF_EXT_ICDF[..], 8);
+        }
+        ix.nlsf[i + 1] = s - 4;
+    }
+    if ch.nb_subfr == 4 {
+        ix.nlsf_interp_q2 = d.icdf(t.SILK_NLSF_INTERPOLATION_FACTOR_ICDF[..], 8);
+    } else {
+        ix.nlsf_interp_q2 = 4;
+    }
+    if ix.signal_type == TYPE_VOICED {
+        let mut absolute = true;
+        if (cond_coding == CODE_CONDITIONALLY) and (ch.ec_prev_signal_type == TYPE_VOICED) {
+            let delta = d.icdf(t.SILK_PITCH_DELTA_ICDF[..], 8);
+            if delta > 0 {
+                ix.lag = i16v(ch.ec_prev_lag_index + (delta - 9));
+                absolute = false;
+            }
+        }
+        if absolute {
+            ix.lag = d.icdf(t.SILK_PITCH_LAG_ICDF[..], 8) * (ch.fs_khz >> 1);
+            ix.lag += d.icdf(pitch_lag_low_bits_icdf(ch.fs_khz), 8);
+        }
+        ch.ec_prev_lag_index = ix.lag;
+        ix.contour = d.icdf(pitch_contour_icdf(ch.fs_khz, ch.nb_subfr), 8);
+        ix.per = d.icdf(t.SILK_LTP_PER_INDEX_ICDF[..], 8);
+        for k in @as(usize, 0)..us(ch.nb_subfr) {
+            ix.ltp[k] = d.icdf(ltp_gain_icdf(ix.per), 8);
+        }
+        if cond_coding == CODE_INDEPENDENTLY {
+            ix.ltp_scale = d.icdf(t.SILK_LTPSCALE_ICDF[..], 8);
+        } else {
+            ix.ltp_scale = 0;
+        }
+    }
+    ch.ec_prev_signal_type = ix.signal_type;
+    ix.seed = d.icdf(t.SILK_UNIFORM4_ICDF[..], 8);
+}
+
+fn decode_split(c1: *mut i32, c2: *mut i32, d: *mut rc.Dec, p: i32, table: []u8) void {
+    if p > 0 {
+        c1.* = d.icdf(table[@as(usize, t.SILK_SHELL_CODE_TABLE_OFFSETS[us(p)])..], 8);
+        c2.* = p - c1.*;
+    } else {
+        c1.* = 0;
+        c2.* = 0;
+    }
+}
+
+fn shell_decoder(p0: []mut i32, o: usize, d: *mut rc.Dec, pulses4: i32) void {
+    let mut p3: [2]i32 = [0; 2];
+    let mut p2: [4]i32 = [0; 4];
+    let mut p1: [8]i32 = [0; 8];
+    let t0 = t.SILK_SHELL_CODE_TABLE0[..];
+    let t1 = t.SILK_SHELL_CODE_TABLE1[..];
+    let t2 = t.SILK_SHELL_CODE_TABLE2[..];
+    let t3 = t.SILK_SHELL_CODE_TABLE3[..];
+    decode_split(&mut p3[0], &mut p3[1], d, pulses4, t3);
+    decode_split(&mut p2[0], &mut p2[1], d, p3[0], t2);
+    decode_split(&mut p1[0], &mut p1[1], d, p2[0], t1);
+    decode_split(&mut p0[o], &mut p0[o + 1], d, p1[0], t0);
+    decode_split(&mut p0[o + 2], &mut p0[o + 3], d, p1[1], t0);
+    decode_split(&mut p1[2], &mut p1[3], d, p2[1], t1);
+    decode_split(&mut p0[o + 4], &mut p0[o + 5], d, p1[2], t0);
+    decode_split(&mut p0[o + 6], &mut p0[o + 7], d, p1[3], t0);
+    decode_split(&mut p2[2], &mut p2[3], d, p3[1], t2);
+    decode_split(&mut p1[4], &mut p1[5], d, p2[2], t1);
+    decode_split(&mut p0[o + 8], &mut p0[o + 9], d, p1[4], t0);
+    decode_split(&mut p0[o + 10], &mut p0[o + 11], d, p1[5], t0);
+    decode_split(&mut p1[6], &mut p1[7], d, p2[3], t1);
+    decode_split(&mut p0[o + 12], &mut p0[o + 13], d, p1[6], t0);
+    decode_split(&mut p0[o + 14], &mut p0[o + 15], d, p1[7], t0);
+}
+
+fn decode_pulses(d: *mut rc.Dec, pulses: []mut i32, signal_type: i32, quant_offset_type: i32, frame_length: i32) void {
+    let mut sum_pulses: [20]i32 = [0; 20];
+    let mut nlshifts: [20]i32 = [0; 20];
+    let rate_level = d.icdf(t.SILK_RATE_LEVELS_ICDF[us((signal_type >> 1) * 9)..], 8);
+    let mut iter = frame_length >> 4;
+    if (iter * 16) < frame_length {
+        iter += 1;
+    }
+    let cdf = t.SILK_PULSES_PER_BLOCK_ICDF[us(rate_level * 18)..];
+    for i in @as(usize, 0)..us(iter) {
+        nlshifts[i] = 0;
+        sum_pulses[i] = d.icdf(cdf, 8);
+        while sum_pulses[i] == 17 {
+            nlshifts[i] += 1;
+            sum_pulses[i] = d.icdf(t.SILK_PULSES_PER_BLOCK_ICDF[(9 * 18) + us(b2i(nlshifts[i] == 10))..], 8);
+        }
+    }
+    for i in @as(usize, 0)..us(iter) {
+        if sum_pulses[i] > 0 {
+            shell_decoder(pulses, i * 16, d, sum_pulses[i]);
+        } else {
+            for k in @as(usize, 0)..16 {
+                pulses[(i * 16) + k] = 0;
+            }
+        }
+    }
+    for i in @as(usize, 0)..us(iter) {
+        if nlshifts[i] > 0 {
+            let nls = nlshifts[i];
+            for k in @as(usize, 0)..16 {
+                let mut abs_q = pulses[(i * 16) + k];
+                for _j in @as(i32, 0)..nls {
+                    abs_q = abs_q << 1;
+                    abs_q += d.icdf(t.SILK_LSB_ICDF[..], 8);
+                }
+                pulses[(i * 16) + k] = i16v(abs_q);
+            }
+            sum_pulses[i] |= nls << 5;
+        }
+    }
+    // signs
+    let mut icdf: [2]u8 = [0; 2];
+    let base = us(7 * (quant_offset_type + (signal_type << 1)));
+    let len = (frame_length + 8) >> 4;
+    for i in @as(usize, 0)..us(len) {
+        let p = sum_pulses[i];
+        if p > 0 {
+            icdf[0] = t.SILK_SIGN_ICDF[base + us(@min(p & 0x1f, 6))];
+            for j in @as(usize, 0)..16 {
+                let q = (i * 16) + j;
+                if pulses[q] > 0 {
+                    pulses[q] = i16v(pulses[q] * ((d.icdf(icdf[..], 8) << 1) - 1));
+                }
+            }
+        }
+    }
+}
+
+fn gains_dequant(gain_q16: []mut i32, ind: []i32, prev_ind: *mut i32, conditional: bool, nb_subfr: i32) void {
+    for k in @as(usize, 0)..us(nb_subfr) {
+        if (k == 0) and not conditional {
+            prev_ind.* = @max(ind[k], prev_ind.* - 16);
+        } else {
+            let ind_tmp = ind[k] - 4;
+            let thr = (72 - 64) + prev_ind.*;
+            if ind_tmp > thr {
+                prev_ind.* += (ind_tmp << 1) - thr;
+            } else {
+                prev_ind.* += ind_tmp;
+            }
+        }
+        prev_ind.* = limit(prev_ind.*, 0, 63);
+        gain_q16[k] = log2lin(@min(smulwb(1907825, prev_ind.*) + 2090, 3967));
+    }
+}
+
+fn decode_pitch(lag_index: i32, contour_index: i32, pitch_lags: []mut i32, fs_khz: i32, nb_subfr: i32) void {
+    let mut cb: []i8 = t.SILK_CB_LAGS_STAGE2[..];
+    let mut size: i32 = 11;
+    if fs_khz == 8 {
+        if nb_subfr != 4 {
+            cb = t.SILK_CB_LAGS_STAGE2_10_MS[..];
+            size = 3;
+        }
+    } else if nb_subfr == 4 {
+        cb = t.SILK_CB_LAGS_STAGE3[..];
+        size = 34;
+    } else {
+        cb = t.SILK_CB_LAGS_STAGE3_10_MS[..];
+        size = 12;
+    }
+    let min_lag = 2 * fs_khz;
+    let max_lag = 18 * fs_khz;
+    let lag = min_lag + lag_index;
+    for k in @as(usize, 0)..us(nb_subfr) {
+        let v = lag + @as(i32, cb[(k * us(size)) + us(contour_index)]);
+        pitch_lags[k] = limit(v, min_lag, max_lag);
+    }
+}
+
+fn decode_parameters(ch: *mut Chan, ctrl: *mut Ctrl, cond_coding: i32) void {
+    let mut nlsf: [16]i32 = [0; 16];
+    let mut nlsf0: [16]i32 = [0; 16];
+    let order = ch.lpc_order;
+    let ou = us(order);
+    gains_dequant(ctrl.gains_q16[..], ch.indices.gains[..], &mut ch.last_gain_index, cond_coding == CODE_CONDITIONALLY,
+                  ch.nb_subfr);
+    let cb = nlsf_cb(order == 16);
+    nlsf_decode(nlsf[..], ch.indices.nlsf[..], &cb);
+    nlsf2a(ctrl.pred_coef_q12[16..], nlsf[..], order);
+    if ch.first_frame_after_reset {
+        ch.indices.nlsf_interp_q2 = 4;
+    }
+    if ch.indices.nlsf_interp_q2 < 4 {
+        for i in @as(usize, 0)..ou {
+            nlsf0[i] = i16v(ch.prev_nlsf_q15[i] + ((ch.indices.nlsf_interp_q2 * (nlsf[i] - ch.prev_nlsf_q15[i])) >> 2));
+        }
+        nlsf2a(ctrl.pred_coef_q12[..16], nlsf0[..], order);
+    } else {
+        for i in @as(usize, 0)..ou {
+            ctrl.pred_coef_q12[i] = ctrl.pred_coef_q12[16 + i];
+        }
+    }
+    for i in @as(usize, 0)..ou {
+        ch.prev_nlsf_q15[i] = nlsf[i];
+    }
+    if ch.loss_cnt != 0 {
+        bwexpander(ctrl.pred_coef_q12[..16], order, 63570);
+        bwexpander(ctrl.pred_coef_q12[16..], order, 63570);
+    }
+    if ch.indices.signal_type == TYPE_VOICED {
+        decode_pitch(ch.indices.lag, ch.indices.contour, ctrl.pitch_l[..], ch.fs_khz, ch.nb_subfr);
+        let cbk = ltp_vq(ch.indices.per);
+        for k in @as(usize, 0)..us(ch.nb_subfr) {
+            let ix = us(ch.indices.ltp[k]);
+            for i in @as(usize, 0)..LTP_ORDER {
+                ctrl.ltp_coef_q14[(k * LTP_ORDER) + i] = @as(i32, cbk[(ix * LTP_ORDER) + i]) << 7;
+            }
+        }
+        ctrl.ltp_scale_q14 = @as(i32, t.SILK_LTPSCALES_TABLE_Q14[us(ch.indices.ltp_scale)]);
+    } else {
+        ctrl.pitch_l = [0; 4];
+        ctrl.ltp_coef_q14 = [0; 20];
+        ch.indices.per = 0;
+        ctrl.ltp_scale_q14 = 0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Synthesis
+// -----------------------------------------------------------------------------
+
+fn lpc_synth_step(s: []i32, o: usize, a: []i32, order: i32) i32 {
+    let mut pred = order >> 1;
+    for j in @as(usize, 0)..us(order) {
+        pred = smlawb(pred, s[o - 1 - j], a[j]);
+    }
+    return pred;
+}
+
+fn decode_core(ch: *mut Chan, ctrl: *mut Ctrl, xq: []mut i32, pulses: []i32) void {
+    let mut sltp: [320]i32 = [0; 320];
+    let mut sltp_q15: [640]i32 = [0; 640];
+    let mut res_q14: [80]i32 = [0; 80];
+    let mut slpc_q14: [96]i32 = [0; 96];
+    let mut a_tmp: [16]i32 = [0; 16];
+    let sub = us(ch.subfr_length);
+    let ltp_mem = ch.ltp_mem_length;
+    let order = ch.lpc_order;
+    let offset_q10 = @as(i32,
+                         t.SILK_QUANTIZATION_OFFSETS_Q10[us(((ch.indices.signal_type >> 1) * 2) +
+                                                            ch.indices.quant_offset_type)]);
+    let interp = ch.indices.nlsf_interp_q2 < 4;
+    let mut seed = ch.indices.seed;
+    for i in @as(usize, 0)..us(ch.frame_length) {
+        seed = rand(seed);
+        let mut e = pulses[i] << 14;
+        if e > 0 {
+            e -= 80 << 4;
+        } else if e < 0 {
+            e += 80 << 4;
+        }
+        e += offset_q10 << 4;
+        if seed < 0 {
+            e = -e;
+        }
+        ch.exc_q14[i] = e;
+        seed = seed +% pulses[i];
+    }
+    for i in @as(usize, 0)..MAX_LPC_ORDER {
+        slpc_q14[i] = ch.slpc_q14_buf[i];
+    }
+    let mut pexc: usize = 0;
+    let mut pxq: usize = 0;
+    let mut sltp_buf_idx = us(ltp_mem);
+    let mut lag: i32 = 0;
+    for k in @as(usize, 0)..us(ch.nb_subfr) {
+        let ao = (k >> 1) * 16;
+        for i in @as(usize, 0)..us(order) {
+            a_tmp[i] = ctrl.pred_coef_q12[ao + i];
+        }
+        let bo = k * LTP_ORDER;
+        let mut signal_type = ch.indices.signal_type;
+        let gain_q10 = ctrl.gains_q16[k] >> 6;
+        let mut inv_gain_q31 = inverse32_varq(ctrl.gains_q16[k], 47);
+        let mut gain_adj_q16: i32 = 1 << 16;
+        if ctrl.gains_q16[k] != ch.prev_gain_q16 {
+            gain_adj_q16 = div32_varq(ch.prev_gain_q16, ctrl.gains_q16[k], 16);
+            for i in @as(usize, 0)..MAX_LPC_ORDER {
+                slpc_q14[i] = smulww(gain_adj_q16, slpc_q14[i]);
+            }
+        }
+        ch.prev_gain_q16 = ctrl.gains_q16[k];
+        if (ch.loss_cnt != 0) and (ch.prev_signal_type == TYPE_VOICED) and (ch.indices.signal_type != TYPE_VOICED) and
+           (k < 2) {
+            for i in @as(usize, 0)..LTP_ORDER {
+                ctrl.ltp_coef_q14[bo + i] = 0;
+            }
+            ctrl.ltp_coef_q14[bo + 2] = 4096;
+            signal_type = TYPE_VOICED;
+            ctrl.pitch_l[k] = ch.lag_prev;
+        }
+        if signal_type == TYPE_VOICED {
+            lag = ctrl.pitch_l[k];
+            if (k == 0) or ((k == 2) and interp) {
+                let start_idx = ((ltp_mem - lag) - order) - 2;
+                if k == 2 {
+                    for i in @as(usize, 0)..(2 * sub) {
+                        ch.out_buf[us(ltp_mem) + i] = @truncate(i16, xq[i]);
+                    }
+                }
+                lpc_analysis_filter(sltp[..], us(start_idx), ch.out_buf[..], us(start_idx) + (k * sub),
+                                    ctrl.pred_coef_q12[ao..], ltp_mem - start_idx, order);
+                if k == 0 {
+                    inv_gain_q31 = smulwb(inv_gain_q31, ctrl.ltp_scale_q14) << 2;
+                }
+                for i in @as(usize, 0)..us(lag + 2) {
+                    sltp_q15[(sltp_buf_idx - 1) - i] = smulwb(inv_gain_q31, sltp[us(ltp_mem - 1) - i]);
+                }
+            } else if gain_adj_q16 != (1 << 16) {
+                for i in @as(usize, 0)..us(lag + 2) {
+                    let j = (sltp_buf_idx - 1) - i;
+                    sltp_q15[j] = smulww(gain_adj_q16, sltp_q15[j]);
+                }
+            }
+        }
+        let mut res: []i32 = ch.exc_q14[pexc..];
+        if signal_type == TYPE_VOICED {
+            let mut pl = (sltp_buf_idx - us(lag)) + 2;
+            for i in @as(usize, 0)..sub {
+                let mut p: i32 = 2;
+                p = smlawb(p, sltp_q15[pl], ctrl.ltp_coef_q14[bo]);
+                p = smlawb(p, sltp_q15[pl - 1], ctrl.ltp_coef_q14[bo + 1]);
+                p = smlawb(p, sltp_q15[pl - 2], ctrl.ltp_coef_q14[bo + 2]);
+                p = smlawb(p, sltp_q15[pl - 3], ctrl.ltp_coef_q14[bo + 3]);
+                p = smlawb(p, sltp_q15[pl - 4], ctrl.ltp_coef_q14[bo + 4]);
+                pl += 1;
+                res_q14[i] = ch.exc_q14[pexc + i] +% (p << 1);
+                sltp_q15[sltp_buf_idx] = res_q14[i] << 1;
+                sltp_buf_idx += 1;
+            }
+            res = res_q14[..];
+        }
+        for i in @as(usize, 0)..sub {
+            let pred = lpc_synth_step(slpc_q14[..], MAX_LPC_ORDER + i, a_tmp[..], order);
+            slpc_q14[MAX_LPC_ORDER + i] = add_sat32(res[i], lshift_sat32(pred, 4));
+            xq[pxq + i] = sat16(rshift_round(smulww(slpc_q14[MAX_LPC_ORDER + i], gain_q10), 8));
+        }
+        for i in @as(usize, 0)..MAX_LPC_ORDER {
+            slpc_q14[i] = slpc_q14[sub + i];
+        }
+        pexc += sub;
+        pxq += sub;
+    }
+    for i in @as(usize, 0)..MAX_LPC_ORDER {
+        ch.slpc_q14_buf[i] = slpc_q14[i];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Packet loss concealment and comfort noise
+// -----------------------------------------------------------------------------
+
+let HARM_ATT_Q15: [2]i32 = [32440, 31130];
+let PLC_RAND_ATTENUATE_V_Q15: [2]i32 = [31130, 26214];
+let PLC_RAND_ATTENUATE_UV_Q15: [2]i32 = [32440, 29491];
+
+fn plc_update(ch: *mut Chan, ctrl: *mut Ctrl) void {
+    let pl = &mut ch.plc;
+    ch.prev_signal_type = ch.indices.signal_type;
+    let mut ltp_gain_q14: i32 = 0;
+    let nb = ch.nb_subfr;
+    if ch.indices.signal_type == TYPE_VOICED {
+        let mut j: i32 = 0;
+        while (j * ch.subfr_length) < ctrl.pitch_l[us(nb - 1)] {
+            if j == nb {
+                break;
+            }
+            let mut tmp: i32 = 0;
+            let o = us((nb - 1) - j) * LTP_ORDER;
+            for i in @as(usize, 0)..LTP_ORDER {
+                tmp += ctrl.ltp_coef_q14[o + i];
+            }
+            if tmp > ltp_gain_q14 {
+                ltp_gain_q14 = tmp;
+                for i in @as(usize, 0)..LTP_ORDER {
+                    pl.ltp_coef_q14[i] = ctrl.ltp_coef_q14[o + i];
+                }
+                pl.pitch_l_q8 = ctrl.pitch_l[us((nb - 1) - j)] << 8;
+            }
+            j += 1;
+        }
+        pl.ltp_coef_q14 = [0; 5];
+        pl.ltp_coef_q14[2] = i16v(ltp_gain_q14);
+        if ltp_gain_q14 < 11469 {
+            let scale_q10 = (11469 << 10) / @max(ltp_gain_q14, 1);
+            for i in @as(usize, 0)..LTP_ORDER {
+                pl.ltp_coef_q14[i] = i16v(smulbb(pl.ltp_coef_q14[i], scale_q10) >> 10);
+            }
+        } else if ltp_gain_q14 > 15565 {
+            let scale_q14 = (15565 << 14) / @max(ltp_gain_q14, 1);
+            for i in @as(usize, 0)..LTP_ORDER {
+                pl.ltp_coef_q14[i] = i16v(smulbb(pl.ltp_coef_q14[i], scale_q14) >> 14);
+            }
+        }
+    } else {
+        pl.pitch_l_q8 = smulbb(ch.fs_khz, 18) << 8;
+        pl.ltp_coef_q14 = [0; 5];
+    }
+    for i in @as(usize, 0)..us(ch.lpc_order) {
+        pl.prev_lpc_q12[i] = ctrl.pred_coef_q12[16 + i];
+    }
+    pl.prev_ltp_scale_q14 = ctrl.ltp_scale_q14;
+    pl.prev_gain_q16[0] = ctrl.gains_q16[us(nb - 2)];
+    pl.prev_gain_q16[1] = ctrl.gains_q16[us(nb - 1)];
+    pl.subfr_length = ch.subfr_length;
+    pl.nb_subfr = nb;
+}
+
+fn plc_energy(e1: *mut i32, s1: *mut i32, e2: *mut i32, s2: *mut i32, exc: []i32, prev_gain_q10: []i32, sub: i32,
+              nb: i32) void {
+    let mut buf: [160]i32 = [0; 160];
+    let su = us(sub);
+    for k in @as(usize, 0)..2 {
+        for i in @as(usize, 0)..su {
+            buf[(k * su) + i] = sat16(smulww(exc[i + ((k + us(nb - 2)) * su)], prev_gain_q10[k]) >> 8);
+        }
+    }
+    sum_sqr_shift(e1, s1, buf[..], sub);
+    sum_sqr_shift(e2, s2, buf[su..], sub);
+}
+
+fn plc_conceal(ch: *mut Chan, ctrl: *mut Ctrl, frame: []mut i32) void {
+    let mut sltp: [320]i32 = [0; 320];
+    let mut sltp_q14: [640]i32 = [0; 640];
+    let mut a_q12: [16]i32 = [0; 16];
+    let mut prev_gain_q10: [2]i32 = [0; 2];
+    let ltp_mem = ch.ltp_mem_length;
+    let order = ch.lpc_order;
+    prev_gain_q10[0] = ch.plc.prev_gain_q16[0] >> 6;
+    prev_gain_q10[1] = ch.plc.prev_gain_q16[1] >> 6;
+    if ch.first_frame_after_reset {
+        ch.plc.prev_lpc_q12 = [0; 16];
+    }
+    let mut e1: i32 = 0;
+    let mut s1: i32 = 0;
+    let mut e2: i32 = 0;
+    let mut s2: i32 = 0;
+    plc_energy(&mut e1, &mut s1, &mut e2, &mut s2, ch.exc_q14[..], prev_gain_q10[..], ch.subfr_length, ch.nb_subfr);
+    let mut rand_o: usize = 0;
+    if shr(e1, s2) < shr(e2, s1) {
+        rand_o = us(@max(0, ((ch.plc.nb_subfr - 1) * ch.plc.subfr_length) - 128));
+    } else {
+        rand_o = us(@max(0, (ch.plc.nb_subfr * ch.plc.subfr_length) - 128));
+    }
+    let mut rand_scale_q14 = ch.plc.rand_scale_q14;
+    let att = us(@min(1, ch.loss_cnt));
+    let harm_gain_q15 = HARM_ATT_Q15[att];
+    let mut rand_gain_q15: i32 = 0;
+    if ch.prev_signal_type == TYPE_VOICED {
+        rand_gain_q15 = PLC_RAND_ATTENUATE_V_Q15[att];
+    } else {
+        rand_gain_q15 = PLC_RAND_ATTENUATE_UV_Q15[att];
+    }
+    bwexpander(ch.plc.prev_lpc_q12[..], order, 64881);
+    for i in @as(usize, 0)..us(order) {
+        a_q12[i] = ch.plc.prev_lpc_q12[i];
+    }
+    if ch.loss_cnt == 0 {
+        rand_scale_q14 = 1 << 14;
+        if ch.prev_signal_type == TYPE_VOICED {
+            for i in @as(usize, 0)..LTP_ORDER {
+                rand_scale_q14 = i16v(rand_scale_q14 - ch.plc.ltp_coef_q14[i]);
+            }
+            rand_scale_q14 = @max(3277, rand_scale_q14);
+            rand_scale_q14 = i16v(smulbb(rand_scale_q14, ch.plc.prev_ltp_scale_q14) >> 14);
+        } else {
+            let inv_gain_q30 = inverse_pred_gain(ch.plc.prev_lpc_q12[..], order);
+            let mut down_scale_q30 = @min((@as(i32, 1) << 30) >> 3, inv_gain_q30);
+            down_scale_q30 = @max((@as(i32, 1) << 30) >> 8, down_scale_q30);
+            down_scale_q30 = down_scale_q30 << 3;
+            rand_gain_q15 = smulwb(down_scale_q30, rand_gain_q15) >> 14;
+        }
+    }
+    let mut rand_seed = ch.plc.rand_seed;
+    let mut lag = rshift_round(ch.plc.pitch_l_q8, 8);
+    let mut sltp_buf_idx = us(ltp_mem);
+    let idx0 = ((ltp_mem - lag) - order) - 2;
+    lpc_analysis_filter(sltp[..], us(idx0), ch.out_buf[..], us(idx0), a_q12[..], ltp_mem - idx0, order);
+    let inv_gain_q30 = @min(inverse32_varq(ch.plc.prev_gain_q16[1], 46), I32_MAX >> 1);
+    for i in us(idx0 + order)..us(ltp_mem) {
+        sltp_q14[i] = smulwb(inv_gain_q30, sltp[i]);
+    }
+    for _k in @as(usize, 0)..us(ch.nb_subfr) {
+        let mut pl = (sltp_buf_idx - us(lag)) + 2;
+        for _i in @as(usize, 0)..us(ch.subfr_length) {
+            let mut p: i32 = 2;
+            p = smlawb(p, sltp_q14[pl], ch.plc.ltp_coef_q14[0]);
+            p = smlawb(p, sltp_q14[pl - 1], ch.plc.ltp_coef_q14[1]);
+            p = smlawb(p, sltp_q14[pl - 2], ch.plc.ltp_coef_q14[2]);
+            p = smlawb(p, sltp_q14[pl - 3], ch.plc.ltp_coef_q14[3]);
+            p = smlawb(p, sltp_q14[pl - 4], ch.plc.ltp_coef_q14[4]);
+            pl += 1;
+            rand_seed = rand(rand_seed);
+            let idx = us((rand_seed >> 25) & 127);
+            sltp_q14[sltp_buf_idx] = smlawb(p, ch.exc_q14[rand_o + idx], rand_scale_q14) << 2;
+            sltp_buf_idx += 1;
+        }
+        for j in @as(usize, 0)..LTP_ORDER {
+            ch.plc.ltp_coef_q14[j] = i16v(smulbb(harm_gain_q15, ch.plc.ltp_coef_q14[j]) >> 15);
+        }
+        rand_scale_q14 = i16v(smulbb(rand_scale_q14, rand_gain_q15) >> 15);
+        ch.plc.pitch_l_q8 = smlawb(ch.plc.pitch_l_q8, ch.plc.pitch_l_q8, 655);
+        ch.plc.pitch_l_q8 = @min(ch.plc.pitch_l_q8, smulbb(18, ch.fs_khz) << 8);
+        lag = rshift_round(ch.plc.pitch_l_q8, 8);
+    }
+    let lo = us(ltp_mem) - MAX_LPC_ORDER;
+    for i in @as(usize, 0)..MAX_LPC_ORDER {
+        sltp_q14[lo + i] = ch.slpc_q14_buf[i];
+    }
+    for i in @as(usize, 0)..us(ch.frame_length) {
+        let o = lo + MAX_LPC_ORDER + i;
+        let pred = lpc_synth_step(sltp_q14[..], o, a_q12[..], order);
+        sltp_q14[o] = add_sat32(sltp_q14[o], lshift_sat32(pred, 4));
+        frame[i] = sat16(rshift_round(smulww(sltp_q14[o], prev_gain_q10[1]), 8));
+    }
+    for i in @as(usize, 0)..MAX_LPC_ORDER {
+        ch.slpc_q14_buf[i] = sltp_q14[lo + us(ch.frame_length) + i];
+    }
+    ch.plc.rand_seed = rand_seed;
+    ch.plc.rand_scale_q14 = rand_scale_q14;
+    for i in @as(usize, 0)..MAX_NB_SUBFR {
+        ctrl.pitch_l[i] = lag;
+    }
+}
+
+fn run_plc(ch: *mut Chan, ctrl: *mut Ctrl, frame: []mut i32, lost: bool) void {
+    if ch.fs_khz != ch.plc.fs_khz {
+        plc_reset(ch);
+        ch.plc.fs_khz = ch.fs_khz;
+    }
+    if lost {
+        plc_conceal(ch, ctrl, frame);
+        ch.loss_cnt += 1;
+    } else {
+        plc_update(ch, ctrl);
+    }
+}
+
+fn plc_glue_frames(ch: *mut Chan, frame: []mut i32, length: i32) void {
+    let p = &mut ch.plc;
+    if ch.loss_cnt != 0 {
+        sum_sqr_shift(&mut p.conc_energy, &mut p.conc_energy_shift, frame, length);
+        p.last_frame_lost = true;
+        return;
+    }
+    if p.last_frame_lost {
+        let mut energy: i32 = 0;
+        let mut energy_shift: i32 = 0;
+        sum_sqr_shift(&mut energy, &mut energy_shift, frame, length);
+        if energy_shift > p.conc_energy_shift {
+            p.conc_energy = shr(p.conc_energy, energy_shift - p.conc_energy_shift);
+        } else if energy_shift < p.conc_energy_shift {
+            energy = shr(energy, p.conc_energy_shift - energy_shift);
+        }
+        if energy > p.conc_energy {
+            let lz = clz32(p.conc_energy) - 1;
+            p.conc_energy = shl(p.conc_energy, lz);
+            energy = shr(energy, @max(24 - lz, 0));
+            let frac_q24 = p.conc_energy / @max(energy, 1);
+            let mut gain_q16 = sqrt_approx(frac_q24) << 4;
+            let slope_q16 = (((1 << 16) - gain_q16) / length) << 2;
+            for i in @as(usize, 0)..us(length) {
+                frame[i] = smulwb(gain_q16, frame[i]);
+                gain_q16 += slope_q16;
+                if gain_q16 > (1 << 16) {
+                    break;
+                }
+            }
+        }
+    }
+    p.last_frame_lost = false;
+}
+
+fn run_cng(ch: *mut Chan, ctrl: *mut Ctrl, frame: []mut i32, length: i32) void {
+    let c = &mut ch.cng;
+    if ch.fs_khz != c.fs_khz {
+        cng_reset(ch);
+        c.fs_khz = ch.fs_khz;
+    }
+    let order = ch.lpc_order;
+    let sub = us(ch.subfr_length);
+    if (ch.loss_cnt == 0) and (ch.prev_signal_type == TYPE_NO_VOICE_ACTIVITY) {
+        for i in @as(usize, 0)..us(order) {
+            c.smth_nlsf_q15[i] = i16v(c.smth_nlsf_q15[i] + smulwb(ch.prev_nlsf_q15[i] - c.smth_nlsf_q15[i], 16348));
+        }
+        let mut max_gain_q16: i32 = 0;
+        let mut subfr: usize = 0;
+        for i in @as(usize, 0)..us(ch.nb_subfr) {
+            if ctrl.gains_q16[i] > max_gain_q16 {
+                max_gain_q16 = ctrl.gains_q16[i];
+                subfr = i;
+            }
+        }
+        let mut i = us(ch.nb_subfr - 1) * sub;
+        while i > 0 {
+            i -= 1;
+            c.exc_buf_q14[sub + i] = c.exc_buf_q14[i];
+        }
+        for k in @as(usize, 0)..sub {
+            c.exc_buf_q14[k] = ch.exc_q14[(subfr * sub) + k];
+        }
+        for k in @as(usize, 0)..us(ch.nb_subfr) {
+            c.smth_gain_q16 +%= smulwb(ctrl.gains_q16[k] -% c.smth_gain_q16, 4634);
+            if smulww(c.smth_gain_q16, 46396) > ctrl.gains_q16[k] {
+                c.smth_gain_q16 = ctrl.gains_q16[k];
+            }
+        }
+    }
+    if ch.loss_cnt != 0 {
+        let mut sig: [336]i32 = [0; 336];
+        let mut a_q12: [16]i32 = [0; 16];
+        let mut gain_q16 = smulww(ch.plc.rand_scale_q14, ch.plc.prev_gain_q16[1]);
+        if (gain_q16 >= (1 << 21)) or (c.smth_gain_q16 > (1 << 23)) {
+            gain_q16 = smultt(gain_q16, gain_q16);
+            gain_q16 = smultt(c.smth_gain_q16, c.smth_gain_q16) -% (gain_q16 << 5);
+            gain_q16 = sqrt_approx(gain_q16) << 16;
+        } else {
+            gain_q16 = smulww(gain_q16, gain_q16);
+            gain_q16 = smulww(c.smth_gain_q16, c.smth_gain_q16) -% (gain_q16 << 5);
+            gain_q16 = sqrt_approx(gain_q16) << 8;
+        }
+        let gain_q10 = gain_q16 >> 6;
+        // excitation
+        let mut mask: i32 = 255;
+        while mask > length {
+            mask = mask >> 1;
+        }
+        let mut seed = c.rand_seed;
+        for i in @as(usize, 0)..us(length) {
+            seed = rand(seed);
+            let idx = us((seed >> 24) & mask);
+            sig[MAX_LPC_ORDER + i] = c.exc_buf_q14[idx];
+        }
+        c.rand_seed = seed;
+        nlsf2a(a_q12[..], c.smth_nlsf_q15[..], order);
+        for i in @as(usize, 0)..MAX_LPC_ORDER {
+            sig[i] = c.synth_state[i];
+        }
+        for i in @as(usize, 0)..us(length) {
+            let o = MAX_LPC_ORDER + i;
+            let pred = lpc_synth_step(sig[..], o, a_q12[..], order);
+            sig[o] = add_sat32(sig[o], lshift_sat32(pred, 4));
+            frame[i] = sat16(frame[i] + sat16(rshift_round(smulww(sig[o], gain_q10), 8)));
+        }
+        for i in @as(usize, 0)..MAX_LPC_ORDER {
+            c.synth_state[i] = sig[us(length) + i];
+        }
+    } else {
+        for i in @as(usize, 0)..us(order) {
+            c.synth_state[i] = 0;
+        }
+    }
+}
+
+fn decode_frame(ch: *mut Chan, d: *mut rc.Dec, out: []mut i32, n: *mut i32, lost_flag: i32, cond_coding: i32) void {
+    let mut ctrl = Ctrl.{ pitch_l: [0; 4], gains_q16: [0; 4], pred_coef_q12: [0; 32], ltp_coef_q14: [0; 20],
+                          ltp_scale_q14: 0 };
+    let l = ch.frame_length;
+    if (lost_flag == DECODE_NORMAL) or ((lost_flag == DECODE_LBRR) and (ch.lbrr_flags[us(ch.n_frames_decoded)] == 1)) {
+        let mut pulses: [320]i32 = [0; 320];
+        decode_indices(ch, d, ch.n_frames_decoded, lost_flag != DECODE_NORMAL, cond_coding);
+        decode_pulses(d, pulses[..], ch.indices.signal_type, ch.indices.quant_offset_type, ch.frame_length);
+        decode_parameters(ch, &mut ctrl, cond_coding);
+        decode_core(ch, &mut ctrl, out, pulses[..]);
+        run_plc(ch, &mut ctrl, out, false);
+        ch.loss_cnt = 0;
+        ch.prev_signal_type = ch.indices.signal_type;
+        ch.first_frame_after_reset = false;
+    } else {
+        run_plc(ch, &mut ctrl, out, true);
+    }
+    let mv_len = us(ch.ltp_mem_length - ch.frame_length);
+    let fl = us(ch.frame_length);
+    for i in @as(usize, 0)..mv_len {
+        ch.out_buf[i] = ch.out_buf[fl + i];
+    }
+    for i in @as(usize, 0)..fl {
+        ch.out_buf[mv_len + i] = @truncate(i16, out[i]);
+    }
+    run_cng(ch, &mut ctrl, out, l);
+    plc_glue_frames(ch, out, l);
+    ch.lag_prev = ctrl.pitch_l[us(ch.nb_subfr - 1)];
+    n.* = l;
+}
+
+// -----------------------------------------------------------------------------
+// Stereo
+// -----------------------------------------------------------------------------
+
+fn stereo_decode_pred(d: *mut rc.Dec, pred_q13: []mut i32) void {
+    let mut ix: [6]i32 = [0; 6];
+    let n = d.icdf(t.SILK_STEREO_PRED_JOINT_ICDF[..], 8);
+    ix[2] = n / 5;
+    ix[5] = n - (5 * ix[2]);
+    for k in @as(usize, 0)..2 {
+        ix[(k * 3)] = d.icdf(t.SILK_UNIFORM3_ICDF[..], 8);
+        ix[(k * 3) + 1] = d.icdf(t.SILK_UNIFORM5_ICDF[..], 8);
+    }
+    for k in @as(usize, 0)..2 {
+        ix[k * 3] += 3 * ix[(k * 3) + 2];
+        let low = @as(i32, t.SILK_STEREO_PRED_QUANT_Q13[us(ix[k * 3])]);
+        let step = smulwb(@as(i32, t.SILK_STEREO_PRED_QUANT_Q13[us(ix[k * 3] + 1)]) - low, 6554);
+        pred_q13[k] = smlabb(low, step, (2 * ix[(k * 3) + 1]) + 1);
+    }
+    pred_q13[0] -= pred_q13[1];
+}
+
+fn stereo_ms_to_lr(st: *mut Silk, x1: []mut i32, x2: []mut i32, pred_q13: []i32, fs_khz: i32, frame_length: i32) void {
+    x1[0] = st.s_mid[0];
+    x1[1] = st.s_mid[1];
+    x2[0] = st.s_side[0];
+    x2[1] = st.s_side[1];
+    let fl = us(frame_length);
+    st.s_mid[0] = x1[fl];
+    st.s_mid[1] = x1[fl + 1];
+    st.s_side[0] = x2[fl];
+    st.s_side[1] = x2[fl + 1];
+    let mut pred0 = st.pred_prev_q13[0];
+    let mut pred1 = st.pred_prev_q13[1];
+    let denom_q16 = (1 << 16) / (8 * fs_khz);
+    let delta0 = rshift_round(smulbb(pred_q13[0] - st.pred_prev_q13[0], denom_q16), 16);
+    let delta1 = rshift_round(smulbb(pred_q13[1] - st.pred_prev_q13[1], denom_q16), 16);
+    let interp = us(8 * fs_khz);
+    for n in @as(usize, 0)..fl {
+        if n < interp {
+            pred0 += delta0;
+            pred1 += delta1;
+        } else if n == interp {
+            pred0 = pred_q13[0];
+            pred1 = pred_q13[1];
+        }
+        let mut sum = ((x1[n] + x1[n + 2]) + (x1[n + 1] << 1)) << 9;
+        sum = smlawb(x2[n + 1] << 8, sum, pred0);
+        sum = smlawb(sum, x1[n + 1] << 11, pred1);
+        x2[n + 1] = sat16(rshift_round(sum, 8));
+    }
+    st.pred_prev_q13[0] = i16v(pred_q13[0]);
+    st.pred_prev_q13[1] = i16v(pred_q13[1]);
+    for n in @as(usize, 0)..fl {
+        let sum = x1[n + 1] + x2[n + 1];
+        let diff = x1[n + 1] - x2[n + 1];
+        x1[n + 1] = sat16(sum);
+        x2[n + 1] = sat16(diff);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// silk_Decode
+// -----------------------------------------------------------------------------
+
+/// Decodes one SILK frame (10 or 20 ms) into out (interleaved at the API
+/// rate). lost: 0 decode, 1 conceal, 2 decode the redundant (LBRR) copy.
+pub fn decode(st: *mut Silk, ctl: *mut Control, lost: i32, first: bool, d: *mut rc.Dec, out: []mut i16,
+              n: *mut i32) bool {
+    n.* = 0;
+    let nci = ctl.channels_internal;
+    if (nci != 1) and (nci != 2) {
+        return false;
+    }
+    let mut decode_only_middle: i32 = 0;
+    let mut ms_pred_q13: [2]i32 = [0; 2];
+    if first {
+        for k in @as(usize, 0)..us(nci) {
+            st.ch[k].n_frames_decoded = 0;
+        }
+    }
+    if nci > st.n_channels_internal {
+        init_chan(&mut st.ch[1]);
+    }
+    let stereo_to_mono = (nci == 1) and (st.n_channels_internal == 2) and
+                         (ctl.internal_rate == (1000 * st.ch[0].fs_khz));
+    if st.ch[0].n_frames_decoded == 0 {
+        for k in @as(usize, 0)..us(nci) {
+            let ch = &mut st.ch[k];
+            if (ctl.payload_ms == 0) or (ctl.payload_ms == 10) {
+                ch.n_frames_per_packet = 1;
+                ch.nb_subfr = 2;
+            } else if ctl.payload_ms == 20 {
+                ch.n_frames_per_packet = 1;
+                ch.nb_subfr = 4;
+            } else if ctl.payload_ms == 40 {
+                ch.n_frames_per_packet = 2;
+                ch.nb_subfr = 4;
+            } else if ctl.payload_ms == 60 {
+                ch.n_frames_per_packet = 3;
+                ch.nb_subfr = 4;
+            } else {
+                return false;
+            }
+            let fs_khz_dec = (ctl.internal_rate >> 10) + 1;
+            if (fs_khz_dec != 8) and (fs_khz_dec != 12) and (fs_khz_dec != 16) {
+                return false;
+            }
+            if not set_fs(ch, fs_khz_dec, ctl.api_rate) {
+                return false;
+            }
+        }
+    }
+    if (ctl.channels_api == 2) and (nci == 2) and ((st.n_channels_api == 1) or (st.n_channels_internal == 1)) {
+        st.pred_prev_q13 = [0; 2];
+        st.s_side = [0; 2];
+        st.ch[1].resampler = st.ch[0].resampler;
+    }
+    st.n_channels_api = ctl.channels_api;
+    st.n_channels_internal = nci;
+    if (ctl.api_rate > 48000) or (ctl.api_rate < 8000) {
+        return false;
+    }
+    if (lost != PACKET_LOST) and (st.ch[0].n_frames_decoded == 0) {
+        for k in @as(usize, 0)..us(nci) {
+            let ch = &mut st.ch[k];
+            for i in @as(usize, 0)..us(ch.n_frames_per_packet) {
+                ch.vad_flags[i] = d.bit_logp_int(1);
+            }
+            ch.lbrr_flag = d.bit_logp_int(1);
+        }
+        for k in @as(usize, 0)..us(nci) {
+            let ch = &mut st.ch[k];
+            ch.lbrr_flags = [0; 3];
+            if ch.lbrr_flag != 0 {
+                if ch.n_frames_per_packet == 1 {
+                    ch.lbrr_flags[0] = 1;
+                } else {
+                    let mut tab: []u8 = t.SILK_LBRR_FLAGS_2_ICDF[..];
+                    if ch.n_frames_per_packet == 3 {
+                        tab = t.SILK_LBRR_FLAGS_3_ICDF[..];
+                    }
+                    let sym = d.icdf(tab, 8) + 1;
+                    for i in @as(usize, 0)..us(ch.n_frames_per_packet) {
+                        ch.lbrr_flags[i] = (sym >> @truncate(u32, i)) & 1;
+                    }
+                }
+            }
+        }
+        if lost == DECODE_NORMAL {
+            // skip the redundant frames
+            for i in @as(usize, 0)..us(st.ch[0].n_frames_per_packet) {
+                for k in @as(usize, 0)..us(nci) {
+                    if st.ch[k].lbrr_flags[i] != 0 {
+                        let mut pulses: [320]i32 = [0; 320];
+                        if (nci == 2) and (k == 0) {
+                            stereo_decode_pred(d, ms_pred_q13[..]);
+                            if st.ch[1].lbrr_flags[i] == 0 {
+                                decode_only_middle = d.icdf(t.SILK_STEREO_ONLY_CODE_MID_ICDF[..], 8);
+                            }
+                        }
+                        let mut cond = CODE_INDEPENDENTLY;
+                        if (i > 0) and (st.ch[k].lbrr_flags[i - 1] != 0) {
+                            cond = CODE_CONDITIONALLY;
+                        }
+                        let ch = &mut st.ch[k];
+                        decode_indices(ch, d, si(i), true, cond);
+                        decode_pulses(d, pulses[..], ch.indices.signal_type, ch.indices.quant_offset_type,
+                                      ch.frame_length);
+                    }
+                }
+            }
+        }
+    }
+    let nfd = us(st.ch[0].n_frames_decoded);
+    if nci == 2 {
+        if (lost == DECODE_NORMAL) or ((lost == DECODE_LBRR) and (st.ch[0].lbrr_flags[nfd] == 1)) {
+            stereo_decode_pred(d, ms_pred_q13[..]);
+            if ((lost == DECODE_NORMAL) and (st.ch[1].vad_flags[nfd] == 0)) or
+               ((lost == DECODE_LBRR) and (st.ch[1].lbrr_flags[nfd] == 0)) {
+                decode_only_middle = d.icdf(t.SILK_STEREO_ONLY_CODE_MID_ICDF[..], 8);
+            } else {
+                decode_only_middle = 0;
+            }
+        } else {
+            ms_pred_q13[0] = st.pred_prev_q13[0];
+            ms_pred_q13[1] = st.pred_prev_q13[1];
+        }
+    }
+    if (nci == 2) and (decode_only_middle == 0) and (st.prev_decode_only_middle == 1) {
+        let c1 = &mut st.ch[1];
+        @mem_set(c1.out_buf[..], 0);
+        c1.slpc_q14_buf = [0; 16];
+        c1.lag_prev = 100;
+        c1.last_gain_index = 10;
+        c1.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
+        c1.first_frame_after_reset = true;
+    }
+    let mut tmp0: [322]i32 = [0; 322];
+    let mut tmp1: [322]i32 = [0; 322];
+    let mut has_side = false;
+    if lost == DECODE_NORMAL {
+        has_side = decode_only_middle == 0;
+    } else {
+        has_side = (st.prev_decode_only_middle == 0) or
+                   ((nci == 2) and (lost == DECODE_LBRR) and (st.ch[1].lbrr_flags[us(st.ch[1].n_frames_decoded)] == 1));
+    }
+    let mut n_out_dec: i32 = 0;
+    for k in @as(usize, 0)..us(nci) {
+        if (k == 0) or has_side {
+            let frame_index = st.ch[0].n_frames_decoded - si(k);
+            let mut cond = CODE_CONDITIONALLY;
+            if frame_index <= 0 {
+                cond = CODE_INDEPENDENTLY;
+            } else if lost == DECODE_LBRR {
+                if st.ch[k].lbrr_flags[us(frame_index - 1)] != 0 {
+                    cond = CODE_CONDITIONALLY;
+                } else {
+                    cond = CODE_INDEPENDENTLY;
+                }
+            } else if (k > 0) and (st.prev_decode_only_middle != 0) {
+                cond = CODE_INDEPENDENTLY_NO_LTP_SCALING;
+            }
+            if k == 0 {
+                decode_frame(&mut st.ch[0], d, tmp0[2..], &mut n_out_dec, lost, cond);
+            } else {
+                decode_frame(&mut st.ch[1], d, tmp1[2..], &mut n_out_dec, lost, cond);
+            }
+        } else {
+            for i in @as(usize, 0)..us(n_out_dec) {
+                tmp1[2 + i] = 0;
+            }
+        }
+        st.ch[k].n_frames_decoded += 1;
+    }
+    let t0 = tmp0[..];
+    let t1 = tmp1[..];
+    if (ctl.channels_api == 2) and (nci == 2) {
+        stereo_ms_to_lr(st, t0, t1, ms_pred_q13[..], st.ch[0].fs_khz, n_out_dec);
+    } else {
+        t0[0] = st.s_mid[0];
+        t0[1] = st.s_mid[1];
+        st.s_mid[0] = t0[us(n_out_dec)];
+        st.s_mid[1] = t0[us(n_out_dec) + 1];
+    }
+    let n_out = (n_out_dec * ctl.api_rate) / (st.ch[0].fs_khz * 1000);
+    n.* = n_out;
+    let mut rs: [960]i32 = [0; 960];
+    let nca = us(ctl.channels_api);
+    for k in @as(usize, 0)..us(@min(ctl.channels_api, nci)) {
+        if k == 0 {
+            resample(&mut st.ch[0].resampler, rs[..], t0, 1, n_out_dec);
+        } else {
+            resample(&mut st.ch[1].resampler, rs[..], t1, 1, n_out_dec);
+        }
+        for i in @as(usize, 0)..us(n_out) {
+            out[k + (nca * i)] = @truncate(i16, rs[i]);
+        }
+    }
+    if (ctl.channels_api == 2) and (nci == 1) {
+        if stereo_to_mono {
+            resample(&mut st.ch[1].resampler, rs[..], t0, 1, n_out_dec);
+            for i in @as(usize, 0)..us(n_out) {
+                out[1 + (2 * i)] = @truncate(i16, rs[i]);
+            }
+        } else {
+            for i in @as(usize, 0)..us(n_out) {
+                out[1 + (2 * i)] = out[2 * i];
+            }
+        }
+    }
+    if lost == PACKET_LOST {
+        for k in @as(usize, 0)..us(st.n_channels_internal) {
+            st.ch[k].last_gain_index = 10;
+        }
+    } else {
+        st.prev_decode_only_middle = decode_only_middle;
+    }
+    return true;
+}

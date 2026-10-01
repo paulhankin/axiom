@@ -1,0 +1,300 @@
+// =============================================================================
+// std/hash/crc.ax - cyclic redundancy checks of any width from 1 to 64 bits,
+// described by the Rocksoft model, with presets for the common ones.
+//
+//     let c = crc.Crc.init(crc.CRC32C);              // builds the table once
+//     let x = c.checksum(data);                      // u64 (here, 32 bits)
+//
+//     let mut d = c.digest();                        // streaming
+//     d.update(part1);
+//     d.update(part2);
+//     let y = d.finish();
+//
+//     let z = crc.checksum(crc.CRC16_XMODEM, data);  // one-shot
+//
+// A CRC is described (Ross Williams, "A painless guide to CRC error
+// detection algorithms", 1993) by its width, polynomial (without the top
+// bit), initial register value, whether input bytes are reflected (refin),
+// whether the result is reflected (refout) and a value XORed into the
+// result. The presets and their `check` values (the CRC of the ASCII text
+// "123456789") are from Greg Cook's catalogue of parametrised CRC
+// algorithms (reveng.sourceforge.io/crc-catalogue). Computation goes a byte
+// at a time through a 256-entry table; reflected CRCs keep the register
+// reflected, the others keep it in the top bits of a u64, so every width
+// works the same way.
+//
+// std/compress/deflate (crc32), std/compress/xz (crc64) and the formats
+// built on them keep their own slicing-by-8 code, which is faster.
+// =============================================================================
+
+/// A CRC algorithm in the Rocksoft model.
+pub struct Params {
+    width: u32,    // 1 to 64
+    poly: u64,     // the generator polynomial, without its top bit, unreflected
+    init: u64,     // the register's initial value, unreflected
+    refin: bool,   // input bytes are reflected (least significant bit first)
+    refout: bool,  // the final register is reflected
+    xorout: u64,   // XORed into the result
+    check: u64,    // the CRC of "123456789", for testing
+}
+
+/// CRC-8/SMBUS (the SMBus packet error code).
+pub let CRC8_SMBUS: Params = Params.{ width: 8, poly: 0x07, init: 0, refin: false, refout: false, xorout: 0,
+                                      check: 0xf4 };
+/// CRC-16/ARC (also CRC-16, CRC-16/LHA, CRC-IBM).
+pub let CRC16_ARC: Params = Params.{ width: 16, poly: 0x8005, init: 0, refin: true, refout: true, xorout: 0,
+                                     check: 0xbb3d };
+/// CRC-16/MODBUS.
+pub let CRC16_MODBUS: Params = Params.{ width: 16, poly: 0x8005, init: 0xffff, refin: true, refout: true, xorout: 0,
+                                        check: 0x4b37 };
+/// CRC-16/IBM-3740, better known as CRC-16/CCITT-FALSE.
+pub let CRC16_IBM_3740: Params = Params.{ width: 16, poly: 0x1021, init: 0xffff, refin: false, refout: false, xorout: 0,
+                                          check: 0x29b1 };
+/// The same as CRC16_IBM_3740, by its common name.
+pub let CRC16_CCITT_FALSE: Params = Params.{ width: 16, poly: 0x1021, init: 0xffff, refin: false, refout: false,
+                                             xorout: 0, check: 0x29b1 };
+/// CRC-16/XMODEM (also CRC-16/ACORN, CRC-16/LTE, CRC-16/V-41-MSB).
+pub let CRC16_XMODEM: Params = Params.{ width: 16, poly: 0x1021, init: 0, refin: false, refout: false, xorout: 0,
+                                        check: 0x31c3 };
+/// CRC-16/KERMIT (also CRC-16/CCITT, CRC-16/CCITT-TRUE, CRC-16/V-41-LSB).
+pub let CRC16_KERMIT: Params = Params.{ width: 16, poly: 0x1021, init: 0, refin: true, refout: true, xorout: 0,
+                                        check: 0x2189 };
+/// CRC-24/OPENPGP (the OpenPGP armor checksum).
+pub let CRC24_OPENPGP: Params = Params.{ width: 24, poly: 0x864cfb, init: 0xb704ce, refin: false, refout: false,
+                                         xorout: 0, check: 0x21cf02 };
+/// CRC-32/ISO-HDLC: the CRC-32 of zlib, gzip, zip, PNG and Ethernet.
+pub let CRC32: Params = Params.{ width: 32, poly: 0x04c11db7, init: 0xffffffff, refin: true, refout: true,
+                                 xorout: 0xffffffff, check: 0xcbf43926 };
+/// CRC-32/ISCSI, better known as CRC-32C (Castagnoli): iSCSI, SCTP, ext4,
+/// Btrfs, Snappy framing.
+pub let CRC32C: Params = Params.{ width: 32, poly: 0x1edc6f41, init: 0xffffffff, refin: true, refout: true,
+                                  xorout: 0xffffffff, check: 0xe3069283 };
+/// CRC-32/BZIP2 (also CRC-32/AAL5, CRC-32/DECT-B).
+pub let CRC32_BZIP2: Params = Params.{ width: 32, poly: 0x04c11db7, init: 0xffffffff, refin: false, refout: false,
+                                       xorout: 0xffffffff, check: 0xfc891918 };
+/// CRC-32/MPEG-2.
+pub let CRC32_MPEG2: Params = Params.{ width: 32, poly: 0x04c11db7, init: 0xffffffff, refin: false, refout: false,
+                                       xorout: 0, check: 0x0376e6e7 };
+/// CRC-64/ECMA-182.
+pub let CRC64_ECMA_182: Params = Params.{ width: 64, poly: 0x42f0e1eba9ea3693, init: 0, refin: false, refout: false,
+                                          xorout: 0, check: 0x6c40df5f0b497347 };
+/// CRC-64/XZ (also CRC-64/GO-ECMA): the CRC-64 of xz.
+pub let CRC64_XZ: Params = Params.{ width: 64, poly: 0x42f0e1eba9ea3693, init: 0xffffffffffffffff, refin: true,
+                                    refout: true, xorout: 0xffffffffffffffff, check: 0x995dc9bbdf1939fa };
+
+/// The low w bits of x in reverse order.
+fn reflect(x: u64, w: u32) u64 {
+    let mut r: u64 = 0;
+    let mut v = x;
+    for _i in @as(u32, 0)..w {
+        r = (r << 1) | (v & 1);
+        v = v >> 1;
+    }
+    return r;
+}
+
+fn mask(w: u32) u64 {
+    if w >= 64 {
+        return 0xffffffffffffffff;
+    }
+    return (@as(u64, 1) << w) - 1;
+}
+
+/// A CRC algorithm with its table, ready to compute.
+pub struct Crc {
+    p: Params,
+    table: [256]u64,
+    shift: u32,  // 64 - width, for the unreflected (top-aligned) register
+
+    /// The tables for p. The width must be 1 to 64 (anything else traps:
+    /// it is a programming error, not bad input).
+    pub fn init(p: Params) Crc {
+        @expect((p.width >= 1) and (p.width <= 64));
+        let mut c = Crc.{ p: p, table: [0; 256], shift: 64 - p.width };
+        let poly = p.poly & mask(p.width);
+        if p.refin {
+            let rpoly = reflect(poly, p.width);
+            for i in @as(usize, 0)..256 {
+                let mut r = @as(u64, i);
+                for _k in @as(usize, 0)..8 {
+                    if (r & 1) != 0 {
+                        r = (r >> 1) ^ rpoly;
+                    } else {
+                        r = r >> 1;
+                    }
+                }
+                c.table[i] = r;
+            }
+        } else {
+            let tpoly = poly << c.shift;
+            for i in @as(usize, 0)..256 {
+                let mut r = @as(u64, i) << 56;
+                for _k in @as(usize, 0)..8 {
+                    if (r >> 63) != 0 {
+                        r = (r << 1) ^ tpoly;
+                    } else {
+                        r = r << 1;
+                    }
+                }
+                c.table[i] = r;
+            }
+        }
+        return c;
+    }
+
+    /// The register before any data (its form is internal: pass it to
+    /// update and finish).
+    pub fn start(self: *Crc) u64 {
+        let init = self.p.init & mask(self.p.width);
+        if self.p.refin {
+            return reflect(init, self.p.width);
+        }
+        return init << self.shift;
+    }
+
+    /// The register after data.
+    pub fn update(self: *Crc, reg: u64, data: []u8) u64 {
+        let mut r = reg;
+        let t = &self.table;
+        if self.p.refin {
+            for b in data {
+                r = t[@as(usize, @truncate(u8, r) ^ b)] ^ (r >> 8);
+            }
+        } else {
+            for b in data {
+                r = t[@as(usize, @truncate(u8, r >> 56) ^ b)] ^ (r << 8);
+            }
+        }
+        return r;
+    }
+
+    /// The CRC value of a register.
+    pub fn finish(self: *Crc, reg: u64) u64 {
+        let w = self.p.width;
+        let mut v = reg;
+        if not self.p.refin {
+            v = v >> self.shift;
+        }
+        if self.p.refin != self.p.refout {
+            v = reflect(v, w);
+        }
+        return (v ^ self.p.xorout) & mask(w);
+    }
+
+    /// The CRC of data.
+    pub fn checksum(self: *Crc, data: []u8) u64 {
+        return self.finish(self.update(self.start(), data));
+    }
+
+    /// A streaming computation (it points at this Crc: keep it in place).
+    pub fn digest(self: *Crc) Digest {
+        return Digest.{ crc: self, reg: self.start() };
+    }
+}
+
+/// A CRC computed piece by piece.
+pub struct Digest {
+    crc: *Crc,
+    reg: u64,
+
+    pub fn update(self: *mut Digest, data: []u8) void {
+        self.reg = self.crc.update(self.reg, data);
+    }
+
+    /// The CRC of everything so far (more may follow).
+    pub fn finish(self: *Digest) u64 {
+        return self.crc.finish(self.reg);
+    }
+
+    /// Starts again from no data.
+    pub fn reset(self: *mut Digest) void {
+        self.reg = self.crc.start();
+    }
+}
+
+/// The CRC of data under p (building the table each time: keep a Crc to
+/// compute many).
+pub fn checksum(p: Params, data: []u8) u64 {
+    let c = Crc.init(p);
+    return c.checksum(data);
+}
+
+// -----------------------------------------------------------------------------
+// Tests: the catalogue's check values for the presets and for odd widths
+// (CRC-3/GSM, CRC-5/USB, CRC-7/MMC, CRC-10/ATM, and CRC-12/UMTS, whose refin
+// and refout differ); longer inputs against a bit-at-a-time Python model of
+// the Rocksoft algorithm (itself checked against zlib.crc32 and
+// binascii.crc_hqx), over bytes (i * 31 + 7) & 255 of lengths 0, 1, 7, 8, 9,
+// 100 and 300.
+// -----------------------------------------------------------------------------
+
+struct Case {
+    p: Params,
+    want: [7]u64,
+}
+
+let LENGTHS: [7]usize = [0, 1, 7, 8, 9, 100, 300];
+
+fn cases() [18]Case {
+    return [
+        Case.{ p: CRC8_SMBUS, want: [0x0, 0x15, 0x3b, 0xf, 0xde, 0xe5, 0x1e] },
+        Case.{ p: CRC16_ARC, want: [0x0, 0xc241, 0x21ea, 0x7a1, 0xf886, 0x9481, 0x1c15] },
+        Case.{ p: CRC16_MODBUS, want: [0xffff, 0x82fe, 0x21f1, 0xce1, 0x88c, 0x6080, 0x2c70] },
+        Case.{ p: CRC16_IBM_3740, want: [0xffff, 0x9117, 0x2104, 0xcd6d, 0x7b11, 0x9a31, 0x923d] },
+        Case.{ p: CRC16_XMODEM, want: [0x0, 0x70e7, 0xd0ca, 0xfc53, 0x6363, 0xdc05, 0xfa12] },
+        Case.{ p: CRC16_KERMIT, want: [0x0, 0x74bf, 0xfebe, 0xbb05, 0x586e, 0x3a6b, 0x2a46] },
+        Case.{ p: CRC24_OPENPGP, want: [0xb704ce, 0xfe16c4, 0x84be02, 0x3896da, 0x234161, 0xc92f48, 0xc19f6e] },
+        Case.{ p: CRC32, want: [0x0, 0x4c667a2e, 0x3e483922, 0xa7560428, 0xca12fefe, 0xb5a935fc, 0x226c6629] },
+        Case.{ p: CRC32C, want: [0x0, 0x86b737ba, 0x5110a112, 0x40795c72, 0x6fe35da6, 0xe26c441c, 0x578cf53a] },
+        Case.{ p: CRC32_BZIP2, want: [0x0, 0xafb0104e, 0x39b9a3d7, 0x3b062cad, 0xf9550b0e, 0x809b5379, 0xa7716dc] },
+        Case.{ p: CRC32_MPEG2, want: [0xffffffff, 0x504fefb1, 0xc6465c28, 0xc4f9d352, 0x6aaf4f1, 0x7f64ac86,
+                                      0xf588e923] },
+        Case.{ p: CRC64_ECMA_182, want: [0x0, 0x8e224479f47cb76a, 0xb8e13800c8228ecd, 0xcf66b6a84486b07e,
+                                         0xccf121443792f031, 0x89f3c68296255a8f, 0x60c6a01b48294a66] },
+        Case.{ p: CRC64_XZ, want: [0x0, 0x23d7181e300f9e5e, 0x4d1d36924f82a1ff, 0xa9a023190c6dc6d0, 0x2fe87d44747b836c,
+                                   0xe39420aeedda4e7d, 0xc64c278da5c88eb1] },
+        Case.{ p: Params.{ width: 3, poly: 0x3, init: 0, refin: false, refout: false, xorout: 7, check: 0x4 },
+               want: [0x7, 0x5, 0x3, 0x1, 0x3, 0x3, 0x4] },
+        Case.{ p: Params.{ width: 5, poly: 0x05, init: 0x1f, refin: true, refout: true, xorout: 0x1f, check: 0x19 },
+               want: [0x0, 0x2, 0x15, 0x13, 0x0, 0x0, 0x19] },
+        Case.{ p: Params.{ width: 12, poly: 0x80f, init: 0, refin: false, refout: true, xorout: 0, check: 0xdaf },
+               want: [0x0, 0xcc1, 0xaef, 0x69a, 0x3e4, 0x5ea, 0xec1] },
+        Case.{ p: Params.{ width: 7, poly: 0x09, init: 0, refin: false, refout: false, xorout: 0, check: 0x75 },
+               want: [0x0, 0x3f, 0xf, 0x70, 0x6e, 0x7c, 0x12] },
+        Case.{ p: Params.{ width: 10, poly: 0x233, init: 0, refin: false, refout: false, xorout: 0, check: 0x199 },
+               want: [0x0, 0x2ff, 0x380, 0x0, 0xe1, 0x241, 0x185] },
+    ];
+}
+
+test "crc catalogue check values" {
+    for k in cases() {
+        @expect_eq(checksum(k.p, "123456789"), k.p.check);
+    }
+    @expect_eq(checksum(CRC16_CCITT_FALSE, "123456789"), 0x29b1);
+}
+
+test "crc longer inputs and streaming" {
+    let mut data: [300]u8 = [0; 300];
+    for i in @as(usize, 0)..300 {
+        data[i] = @truncate(u8, (i * 31) + 7);
+    }
+    for k in cases() {
+        let c = Crc.init(k.p);
+        for j in @as(usize, 0)..7 {
+            let d = data[..LENGTHS[j]];
+            @expect_eq(c.checksum(d), k.want[j]);
+            let mut s = c.digest();
+            let mut i: usize = 0;
+            let mut step: usize = 1;
+            while i < d.len {
+                let e = @min(i + step, d.len);
+                s.update(d[i..e]);
+                i = e;
+                step += 3;
+            }
+            @expect_eq(s.finish(), k.want[j]);
+            s.reset();
+            @expect_eq(s.finish(), c.checksum(""));
+        }
+    }
+}

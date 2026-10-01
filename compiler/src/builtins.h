@@ -1,7 +1,7 @@
 // builtins.h - the closed set of builtin functions. The parser uses the
 // signature strings to decide which argument positions are types.
-#ifndef PH_BUILTINS_H
-#define PH_BUILTINS_H
+#ifndef AX_BUILTINS_H
+#define AX_BUILTINS_H
 
 // Signature: one char per argument: 't' = type, 'e' = expression.
 // A trailing '*' means "any number of further expressions".

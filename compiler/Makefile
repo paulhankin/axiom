@@ -1,8 +1,8 @@
-# Phalange compiler (C11 + LLVM C API)
+# Axiom compiler (C11 + LLVM C API)
 #
-#   make                 release build -> build/phalange
+#   make                 release build -> build/axiom
 #   make test            run the test suite (needs node)
-#   make asan            sanitizer build -> build-asan/phalange
+#   make asan            sanitizer build -> build-asan/axiom
 LLVM_CONFIG ?= llvm-config
 CC ?= cc
 BUILD ?= build
@@ -17,7 +17,7 @@ LDLIBS := $(shell $(LLVM_CONFIG) --libs) -lm
 SRCS := $(wildcard src/*.c)
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 
-$(BUILD)/phalange: $(OBJS)
+$(BUILD)/axiom: $(OBJS)
 	$(CC) $(LDFLAGS) $(REQ_LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 $(BUILD)/%.o: src/%.c src/*.h | $(BUILD)
@@ -26,7 +26,7 @@ $(BUILD)/%.o: src/%.c src/*.h | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-test: $(BUILD)/phalange
+test: $(BUILD)/axiom
 	node ../tests/run.mjs
 
 asan:

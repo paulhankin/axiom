@@ -1,4 +1,4 @@
-// tests/run.mjs - Phalange test runner.
+// tests/run.mjs - Axiom test runner.
 //
 // Directives (in comments anywhere in a test file):
 //   // expect: <line>          expected output line (in order)
@@ -19,21 +19,21 @@ import { Worker } from 'worker_threads';
 import { createHost } from '../runtime/host.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const compiler = path.resolve(process.env.PHALANGE || path.join(root, 'compiler/build/phalange'));
+const compiler = path.resolve(process.env.AXIOM || path.join(root, 'compiler/build/axiom'));
 const argv = process.argv.slice(2);
 const native = argv.includes('--native');
-// Cross testing: PHALANGE_NATIVE_TARGET=aarch64 PHALANGE_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
-const nativeTarget = `--target=${process.env.PHALANGE_NATIVE_TARGET || 'native'}`;
-const execWrap = (process.env.PHALANGE_NATIVE_EXEC || '').split(' ').filter((x) => x);
+// Cross testing: AXIOM_NATIVE_TARGET=aarch64 AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+const nativeTarget = `--target=${process.env.AXIOM_NATIVE_TARGET || 'native'}`;
+const execWrap = (process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => x);
 // Emulated tests run several times slower: give each test a minute.
 const testTimeout = execWrap.length ? ['--timeout=60000'] : [];
 const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a));
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phalange-tests-'));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'axiom-tests-'));
 
 function files(dir) {
-  return fs.readdirSync(dir).filter(f => f.endsWith('.ph')).map(f => path.join(dir, f)).sort();
+  return fs.readdirSync(dir).filter(f => f.endsWith('.ax')).map(f => path.join(dir, f)).sort();
 }
 
 function directives(src) {
@@ -103,7 +103,7 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   if (filter && !name.includes(filter)) continue;
   const d = directives(fs.readFileSync(f, 'utf8'));
   if ((native && d.wasmOnly) || (!native && d.nativeOnly)) { skip++; continue; }
-  const out = path.join(tmp, path.basename(f, '.ph') + (native ? '' : '.wasm'));
+  const out = path.join(tmp, path.basename(f, '.ax') + (native ? '' : '.wasm'));
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
   if (native) args.push(nativeTarget, `--link=${path.join(root, 'tests/native_rt.c')}`);
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
@@ -130,7 +130,7 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
   else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
 }
-// `phalange test`: the standard library's own tests must pass, and the
+// `axiom test`: the standard library's own tests must pass, and the
 // self-tests in tests/testing/ must produce exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
 function dirsUnder(dir) {
@@ -141,7 +141,7 @@ function dirsUnder(dir) {
 const stdDirs = dirsUnder(path.join(root, 'std'));
 const stdFiles = stdDirs.flatMap(files).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
 for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
-  const name = path.relative(root, f) + ' [phalange test]';
+  const name = path.relative(root, f) + ' [axiom test]';
   if (filter && !name.includes(filter)) continue;
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
@@ -171,11 +171,11 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
 }
 
 // Stack traces (spec §16.4): `// stack:` and `// errors:` lines in
-// tests/traces/traces.ph give the expected frames of each failing test, and
-// tests/traces/crash.ph must report a stack overflow with its stack.
+// tests/traces/traces.ax give the expected frames of each failing test, and
+// tests/traces/crash.ax must report a stack overflow with its stack.
 {
-  const f = path.join(root, 'tests/traces/traces.ph');
-  const name = 'tests/traces/traces.ph [stack traces]';
+  const f = path.join(root, 'tests/traces/traces.ax');
+  const name = 'tests/traces/traces.ax [stack traces]';
   if (!filter || name.includes(filter)) {
     const src = fs.readFileSync(f, 'utf8');
     const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...extraFlags], { encoding: 'utf8' });
@@ -193,14 +193,14 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
     if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
     else { pass++; console.log(`ok   ${name}`); }
   }
-  const cname = 'tests/traces/crash.ph [crash report]';
+  const cname = 'tests/traces/crash.ax [crash report]';
   if (!filter || cname.includes(filter)) {
     const out = path.join(tmp, 'crash' + (native ? '' : '.wasm'));
-    const b = spawnSync(compiler, ['build', path.join(root, 'tests/traces/crash.ph'), '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags], { encoding: 'utf8' });
+    const b = spawnSync(compiler, ['build', path.join(root, 'tests/traces/crash.ax'), '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags], { encoding: 'utf8' });
     let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
     if (!problem) {
       const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
-      const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \((?:\S*\/)?tests\/traces\/crash\.ph:4:12\)/,
+      const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \((?:\S*\/)?tests\/traces\/crash\.ax:4:12\)/,
         /the frame above repeats 255 more times/, /\.\.\. \d+ more frames/];
       for (const w of want) if (!w.test(r.stderr)) { problem = `stderr lacks ${w}:\n${r.stderr}`; break; }
       if (!problem && r.status === 0) problem = 'the program exited normally';
@@ -220,7 +220,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   const src = fs.readFileSync(f, 'utf8');
   const st = (src.match(/^\/\/ status: (\w+)/m) || [null, '0'])[1];
   const wants = [...src.matchAll(/^\/\/ stderr: (.+)$/gm)].map((m) => m[1].trim());
-  const out = path.join(tmp, 'asan-' + path.basename(f, '.ph') + (native ? '' : '.wasm'));
+  const out = path.join(tmp, 'asan-' + path.basename(f, '.ax') + (native ? '' : '.wasm'));
   const b = spawnSync(compiler, ['build', f, '--sanitize=address', '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags],
     { encoding: 'utf8' });
   let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
@@ -241,10 +241,10 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 
 // Profiling (spec §16.6).
 {
-  const name = 'tests/profile/hot.ph [phalange profile]';
+  const name = 'tests/profile/hot.ax [axiom profile]';
   if (!filter || name.includes(filter)) {
     const folded = path.join(tmp, 'hot.folded');
-    const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ph'), '--format=agent-json', `--folded=${folded}`,
+    const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ax'), '--format=agent-json', `--folded=${folded}`,
       ...testTargets, ...extraFlags], { encoding: 'utf8' });
     let problem = null;
     let j = null;
@@ -252,7 +252,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     if (j) {
       const fn = (n) => j.functions.find((f) => f.name === n);
       const site = (a, b) => j.call_sites.find((x) => x.caller === a && x.callee === b);
-      if (j.schema !== 'phalange-profile/1' || j.samples < 20) problem = `too few samples: ${c.stdout}`;
+      if (j.schema !== 'axiom-profile/1' || j.samples < 20) problem = `too few samples: ${c.stdout}`;
       else if (!fn('spin') || fn('spin').self_pct < 50) problem = `spin is not the hot function: ${JSON.stringify(j.functions)}`;
       else if (!fn('main') || fn('main').total_pct < 90) problem = `main should be on (almost) every stack: ${JSON.stringify(j.functions)}`;
       else if (!site('work', 'spin') || site('work', 'spin').line !== 18) problem = `missing call site work -> spin: ${JSON.stringify(j.call_sites)}`;
@@ -271,20 +271,20 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   if (!filter || name.includes(filter)) {
     const dir = path.join(tmp, 'units');
     fs.mkdirSync(dir, { recursive: true });
-    for (const f of ['lib.ph', 'main.ph']) fs.copyFileSync(path.join(root, 'tests/units', f), path.join(dir, f));
-    const env = { ...process.env, PHALANGE_CACHE: path.join(tmp, 'units-cache') };
+    for (const f of ['lib.ax', 'main.ax']) fs.copyFileSync(path.join(root, 'tests/units', f), path.join(dir, f));
+    const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'units-cache') };
     const out = path.join(tmp, 'units-prog' + (native ? '' : '.wasm'));
     const want = ['42', '3', '9', 'too big', 'TooBig'].join('\n');
     const steps = [
       ['cold build', () => {}, (n, t) => n === t],
       ['no change', () => {}, (n) => n === 0],
-      ['new error name renumbers all codes', () => fs.appendFileSync(path.join(dir, 'main.ph'), '\nerror { Aardvark }\n'), (n) => n === 1],
-      ['library edit', () => fs.appendFileSync(path.join(dir, 'lib.ph'), '\n// edited\n'), (n) => n === 2],
+      ['new error name renumbers all codes', () => fs.appendFileSync(path.join(dir, 'main.ax'), '\nerror { Aardvark }\n'), (n) => n === 1],
+      ['library edit', () => fs.appendFileSync(path.join(dir, 'lib.ax'), '\n// edited\n'), (n) => n === 2],
     ];
     let problem = null;
     for (const [what, edit, ok] of steps) {
       edit();
-      const c = spawnSync(compiler, ['build', path.join(dir, 'main.ph'), '-o', out, '--verbose', '--units=module',
+      const c = spawnSync(compiler, ['build', path.join(dir, 'main.ax'), '-o', out, '--verbose', '--units=module',
         ...(native ? [nativeTarget] : [])], { encoding: 'utf8', env });
       const m = /(\d+) modules, (\d+) compiled/.exec(c.stderr);
       if (c.status !== 0 || !m) { problem = `${what}: build failed:\n${c.stdout}${c.stderr}`; break; }
@@ -306,9 +306,9 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   if (!filter || name.includes(filter)) {
     const dir = path.join(tmp, 'stdcopy');
     fs.mkdirSync(path.join(dir, 'std'), { recursive: true });
-    fs.copyFileSync(path.join(root, 'std/mem.ph'), path.join(dir, 'std/mem.ph'));
-    fs.writeFileSync(path.join(dir, 'std/app.ph'), [
-      'import "mem.ph" as mem;', '',
+    fs.copyFileSync(path.join(root, 'std/mem.ax'), path.join(dir, 'std/mem.ax'));
+    fs.writeFileSync(path.join(dir, 'std/app.ax'), [
+      'import "mem.ax" as mem;', '',
       'export fn main() i32 {',
       '    let b = mem.alloc.[u8](100) catch return 1;',
       '    b[99] = 7;',
@@ -317,8 +317,8 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       '    return @as(i32, v) - 7;',
       '}', ''].join('\n'));
     const out = path.join(tmp, 'stdcopy-prog' + (native ? '' : '.wasm'));
-    const c = spawnSync(compiler, ['build', 'std/app.ph', '-o', out, '--sanitize=address', '--units=module',
-      ...(native ? [nativeTarget] : [])], { encoding: 'utf8', cwd: dir, env: { ...process.env, PHALANGE_CACHE: path.join(tmp, 'stdcopy-cache') } });
+    const c = spawnSync(compiler, ['build', 'std/app.ax', '-o', out, '--sanitize=address', '--units=module',
+      ...(native ? [nativeTarget] : [])], { encoding: 'utf8', cwd: dir, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'stdcopy-cache') } });
     let problem = c.status !== 0 ? `build failed:\n${c.stdout}${c.stderr}` : null;
     if (!problem) {
       const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
@@ -329,8 +329,8 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   }
 }
 
-// `phalange fmt` (spec §16.5; the self-hosted compiler only). Each
-// tests/fmt/<name>.ph formats to <name>.expected, which formats to itself;
+// `axiom fmt` (spec §16.5; the self-hosted compiler only). Each
+// tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left
 // alone; the repository's own sources are canonical.
 {
@@ -340,7 +340,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   const supported = !/usage:/.test(probe.stderr);
   const cases = {};
   for (const f of files(fdir)) {
-    const want = f.replace(/\.ph$/, '.expected');
+    const want = f.replace(/\.ax$/, '.expected');
     cases[path.basename(f)] = () => {
       const r = fmt(['--stdout', f]);
       if (r.status !== 0) return `status ${r.status}: ${r.stderr}`;
@@ -350,7 +350,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     };
   }
   cases['--check and rewriting'] = () => {
-    const f = path.join(tmp, 'messy.ph');
+    const f = path.join(tmp, 'messy.ax');
     fs.writeFileSync(f, 'fn  f( ) i32 { return 1 ; }\n');
     const c = fmt(['--check', f]);
     if (c.status !== 1 || c.stdout.trim() !== f) return `--check: status ${c.status}, output ${c.stdout}`;
@@ -360,7 +360,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     return text === 'fn f() i32 {\n    return 1;\n}\n' ? null : `rewritten as:\n${text}`;
   };
   cases['syntax errors are reported'] = () => {
-    const f = path.join(tmp, 'broken.ph');
+    const f = path.join(tmp, 'broken.ax');
     const src = 'fn f() i32 { return 1 }\n';
     fs.writeFileSync(f, src);
     const r = fmt(['--format=agent-json', f]);
@@ -383,10 +383,10 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 }
 
 // Packages (spec §4.6): builds from a package directory, dependency
-// visibility, name conflicts, manifests, git dependencies, `phalange new`.
+// visibility, name conflicts, manifests, git dependencies, `axiom new`.
 {
   const pk = path.join(root, 'tests/packages');
-  const env = { ...process.env, PHALANGE_CACHE: path.join(tmp, 'cache') };
+  const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'cache') };
   const ph = (args, cwd) => spawnSync(compiler, [...args, ...extraFlags], { encoding: 'utf8', cwd: cwd || root, env });
   const git = (args, cwd) => spawnSync('git', args, { encoding: 'utf8', cwd,
     env: { ...env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
@@ -437,19 +437,19 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       const app = path.join(tmp, 'gitapp');
       fs.mkdirSync(path.join(app, 'src'), { recursive: true });
       const manifest = (r) => `[package]\nname = "gitapp"\n\n[dependencies]\nutil = { git = "${repo}", rev = "${r}" }\n`;
-      fs.writeFileSync(path.join(app, 'phalange.toml'), manifest(rev));
-      fs.writeFileSync(path.join(app, 'src/main.ph'),
+      fs.writeFileSync(path.join(app, 'axiom.toml'), manifest(rev));
+      fs.writeFileSync(path.join(app, 'src/main.ax'),
         'import "pkg:util" as util;\nimport "std/io" as io;\n\nexport fn main() i32 {\n' +
         '    io.stdout().print_i64(util.clamp(42, 0, 7)) catch return 1;\n    return 0;\n}\n');
       for (let i = 0; i < 2; i++) {  // the second build uses the cache
         const r = await buildRun(app);
         if (r.problem || r.out !== '7') return r.problem || `output: ${r.out}`;
       }
-      fs.writeFileSync(path.join(app, 'phalange.toml'), manifest('0'.repeat(40)));
+      fs.writeFileSync(path.join(app, 'axiom.toml'), manifest('0'.repeat(40)));
       const codes = errorCodes(app);
       return codes.includes('E0216') ? null : `bad rev: ${codes.join()}`;
     },
-    'phalange new': async () => {
+    'axiom new': async () => {
       const c = ph(['new', 'fresh'], tmp);
       if (c.status !== 0) return `status ${c.status}: ${c.stdout}${c.stderr}${c.error || ''}`;
       const j = tested('.', path.join(tmp, 'fresh'));
@@ -501,9 +501,9 @@ if (!native) {
       };
       const host = createHost({ netPort: port });
       host.setMemory(new WebAssembly.Memory({ initial: 1 }));
-      const net = host.imports.phalange;
-      const wrote = net.ph_sock_write(3, 0, 5);
-      const got = net.ph_sock_read(3, 64, 16);
+      const net = host.imports.axiom;
+      const wrote = net.ax_sock_write(3, 0, 5);
+      const got = net.ax_sock_read(3, 64, 16);
       const data = Array.from(new Uint8Array(host.memory().buffer, 64, 3));
       host.close();
       await helper.terminate();

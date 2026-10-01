@@ -121,7 +121,7 @@ static const char *sev_name(int s) { return s == SEV_ERROR ? "error" : s == SEV_
 void diag_emit(bool json, FILE *out) {
     if (diags.len) qsort(diags.data, (size_t)diags.len, sizeof(Diag *), diag_cmp);
     if (json) {
-        fprintf(out, "{\"schema\":\"phalange-diagnostics/1\",\"status\":\"%s\",\"diagnostics\":[",
+        fprintf(out, "{\"schema\":\"axiom-diagnostics/1\",\"status\":\"%s\",\"diagnostics\":[",
                 nerrors ? "error" : "ok");
         for (int i = 0; i < diags.len; i++) {
             Diag *d = diags.data[i];
@@ -198,12 +198,12 @@ void diag_emit(bool json, FILE *out) {
 
 void diag_emit_fatal(bool json, const char *code, const char *msg) {
     if (json) {
-        printf("{\"schema\":\"phalange-diagnostics/1\",\"status\":\"error\",\"diagnostics\":[{\"code\":");
+        printf("{\"schema\":\"axiom-diagnostics/1\",\"status\":\"error\",\"diagnostics\":[{\"code\":");
         json_str(stdout, code);
         printf(",\"severity\":\"error\",\"message\":");
         json_str(stdout, msg);
         printf(",\"notes\":[],\"fixes\":[]}]}\n");
     } else {
-        fprintf(stderr, "phalange: error[%s]: %s\n", code, msg);
+        fprintf(stderr, "axiom: error[%s]: %s\n", code, msg);
     }
 }

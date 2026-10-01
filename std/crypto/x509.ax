@@ -1,0 +1,1371 @@
+// =============================================================================
+// std/crypto/x509.ax - X.509 certificates (RFC 5280), PEM files, private
+// keys, and certificate chain verification.
+//
+//     let mut roots = x509.CertPool.init();
+//     defer roots.deinit();
+//     roots.load_system()!;                          // the OS's CA bundle
+//     let mut leaf = x509.Certificate.parse(der)!;   // copies der
+//     defer leaf.deinit();
+//     x509.verify_chain(chain[..], &roots, "example.com", time.now())!;
+//
+// Verification builds a path from the leaf through the given intermediates
+// to a root in the pool, checking every signature, validity period, basic
+// constraints, key usage, extended key usage (serverAuth), path length and
+// DNS / IP name constraints, then matches the host name against the leaf's
+// subject alternative names (the subject's common name is not used). A
+// certificate with an unrecognized critical extension is rejected.
+//
+// Signatures: RSA PKCS #1 v1.5 and PSS, ECDSA on P-256 and P-384, Ed25519,
+// with SHA-256, SHA-384 or SHA-512. SHA-1 signatures are refused.
+// =============================================================================
+
+import "../collections/vec.ax" as vec;
+import "../encoding/base64.ax" as base64;
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../net.ax" as net;
+import "../str.ax" as strs;
+import "../time.ax" as time;
+import "curve25519.ax" as curve25519;
+import "der.ax" as der;
+import "ec.ax" as ec;
+import "rsa.ax" as rsa;
+import "sha2.ax" as sha2;
+
+error {
+    InvalidCertificate,
+    InvalidPem,
+    InvalidKey,
+    UnsupportedAlgorithm,
+    UnknownAuthority,
+    Expired,
+    NotYetValid,
+    HostnameMismatch,
+    BadSignature,
+    NotCA,
+    IncompatibleUsage,
+    NameConstraint,
+    UnhandledCriticalExtension,
+    PathTooLong,
+    NotFound,
+    OutOfMemory,
+}
+
+// -----------------------------------------------------------------------------
+// Object identifiers (DER-encoded contents)
+// -----------------------------------------------------------------------------
+
+let OID_RSA: []u8 = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
+let OID_RSA_SHA256: []u8 = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b";
+let OID_RSA_SHA384: []u8 = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c";
+let OID_RSA_SHA512: []u8 = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d";
+let OID_RSA_PSS: []u8 = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
+let OID_EC: []u8 = "\x2a\x86\x48\xce\x3d\x02\x01";
+let OID_P256: []u8 = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
+let OID_P384: []u8 = "\x2b\x81\x04\x00\x22";
+let OID_ECDSA_SHA256: []u8 = "\x2a\x86\x48\xce\x3d\x04\x03\x02";
+let OID_ECDSA_SHA384: []u8 = "\x2a\x86\x48\xce\x3d\x04\x03\x03";
+let OID_ECDSA_SHA512: []u8 = "\x2a\x86\x48\xce\x3d\x04\x03\x04";
+let OID_ED25519: []u8 = "\x2b\x65\x70";
+let OID_SHA256: []u8 = "\x60\x86\x48\x01\x65\x03\x04\x02\x01";
+let OID_SHA384: []u8 = "\x60\x86\x48\x01\x65\x03\x04\x02\x02";
+let OID_SHA512: []u8 = "\x60\x86\x48\x01\x65\x03\x04\x02\x03";
+let OID_BASIC_CONSTRAINTS: []u8 = "\x55\x1d\x13";
+let OID_KEY_USAGE: []u8 = "\x55\x1d\x0f";
+let OID_EXT_KEY_USAGE: []u8 = "\x55\x1d\x25";
+let OID_SUBJECT_ALT_NAME: []u8 = "\x55\x1d\x11";
+let OID_NAME_CONSTRAINTS: []u8 = "\x55\x1d\x1e";
+let OID_CERT_POLICIES: []u8 = "\x55\x1d\x20";
+let OID_POLICY_CONSTRAINTS: []u8 = "\x55\x1d\x24";
+let OID_INHIBIT_ANY: []u8 = "\x55\x1d\x36";
+let OID_SERVER_AUTH: []u8 = "\x2b\x06\x01\x05\x05\x07\x03\x01";
+let OID_ANY_EKU: []u8 = "\x55\x1d\x25\x00";
+let OID_COMMON_NAME: []u8 = "\x55\x04\x03";
+
+// -----------------------------------------------------------------------------
+// Public keys and signatures
+// -----------------------------------------------------------------------------
+
+/// Kinds of public key.
+pub enum KeyKind: u8 {
+    UNSUPPORTED = 0,
+    RSA = 1,
+    P256 = 2,
+    P384 = 3,
+    ED25519 = 4,
+}
+
+/// Signature algorithms (the hash is separate: a sha2.Algorithm).
+pub enum SigAlg: u8 {
+    UNSUPPORTED = 0,
+    RSA_PKCS1 = 1,
+    RSA_PSS = 2,
+    ECDSA = 3,
+    ED25519 = 4,
+}
+
+/// A public key, as views into the certificate or buffer it came from.
+pub struct PublicKey {
+    kind: KeyKind,
+    point: []u8,  // an EC point or Ed25519 key
+    n: []u8,      // RSA modulus
+    e: []u8,      // RSA exponent
+
+    /// Whether sig is a signature of message with the given algorithm
+    /// and hash (ignored for Ed25519).
+    pub fn verify(self: *PublicKey, alg: SigAlg, hash: sha2.Algorithm, message: []u8, sig: []u8) bool {
+        if alg == SigAlg.ED25519 {
+            return (self.kind == KeyKind.ED25519) and curve25519.ed25519_verify(self.point, message, sig);
+        }
+        let mut digest: [64]u8 = [0; 64];
+        let dl = sha2.digest_size(hash);
+        sha2.hash(hash, message, digest[..]);
+        if (alg == SigAlg.RSA_PKCS1) or (alg == SigAlg.RSA_PSS) {
+            if self.kind != KeyKind.RSA {
+                return false;
+            }
+            let mut pk = rsa.PublicKey.from_bytes(self.n, self.e) catch return false;
+            defer pk.deinit();
+            if alg == SigAlg.RSA_PKCS1 {
+                return rsa.verify_pkcs1v15(&pk, hash, digest[..dl], sig);
+            }
+            return rsa.verify_pss(&pk, hash, digest[..dl], sig);
+        }
+        if alg == SigAlg.ECDSA {
+            return self.verify_ecdsa_raw(digest[..dl], sig);
+        }
+        return false;
+    }
+
+    /// ECDSA with a DER signature (SEQUENCE { r, s }) over a digest.
+    fn verify_ecdsa_raw(self: *PublicKey, digest: []u8, sig: []u8) bool {
+        let mut size: usize = 32;
+        if self.kind == KeyKind.P384 {
+            size = 48;
+        } else if self.kind != KeyKind.P256 {
+            return false;
+        }
+        let mut rs: [96]u8 = [0; 96];
+        let mut rd = der.Reader.init(sig);
+        let mut seq = rd.sequence() catch return false;
+        let r = seq.integer() catch return false;
+        let s = seq.integer() catch return false;
+        if (not rd.empty()) or (not seq.empty()) or (r.len > size) or (s.len > size) {
+            return false;
+        }
+        @mem_copy(rs[size - r.len..size], r);
+        @mem_copy(rs[(2 * size) - s.len..2 * size], s);
+        if self.kind == KeyKind.P256 {
+            return ec.verify_p256(self.point, digest, rs[..64]);
+        }
+        return ec.verify_p384(self.point, digest, rs[..96]);
+    }
+}
+
+/// Parses a SubjectPublicKeyInfo.
+pub fn parse_spki(spki: []u8) !PublicKey {
+    let mut r = der.Reader.init(spki);
+    let mut seq = r.sequence()!;
+    let mut alg = seq.sequence()!;
+    let oid = alg.oid()!;
+    let bits = seq.bit_string()!;
+    let mut k = PublicKey.{ kind: KeyKind.UNSUPPORTED, point: bits, n: "", e: "" };
+    if @mem_eq(oid, OID_RSA) {
+        let mut kr = der.Reader.init(bits);
+        let mut ks = kr.sequence()!;
+        k.n = ks.integer()!;
+        k.e = ks.integer()!;
+        k.kind = KeyKind.RSA;
+    } else if @mem_eq(oid, OID_EC) {
+        let curve = alg.oid() catch "";
+        if @mem_eq(curve, OID_P256) and (bits.len == 65) {
+            k.kind = KeyKind.P256;
+        } else if @mem_eq(curve, OID_P384) and (bits.len == 97) {
+            k.kind = KeyKind.P384;
+        }
+    } else if @mem_eq(oid, OID_ED25519) and (bits.len == 32) {
+        k.kind = KeyKind.ED25519;
+    }
+    return k;
+}
+
+/// The algorithm and hash of an AlgorithmIdentifier for a signature.
+/// (The hash is SHA-256, and ignored, for Ed25519 and unsupported ones.)
+fn parse_sig_alg(alg_der: []u8, alg: *mut SigAlg, hash: *mut sha2.Algorithm) !void {
+    let mut r = der.Reader.init(alg_der);
+    let mut seq = r.sequence()!;
+    let oid = seq.oid()!;
+    alg.* = SigAlg.UNSUPPORTED;
+    hash.* = sha2.Algorithm.SHA256;
+    if @mem_eq(oid, OID_RSA_SHA256) {
+        alg.* = SigAlg.RSA_PKCS1;
+        hash.* = sha2.Algorithm.SHA256;
+    } else if @mem_eq(oid, OID_RSA_SHA384) {
+        alg.* = SigAlg.RSA_PKCS1;
+        hash.* = sha2.Algorithm.SHA384;
+    } else if @mem_eq(oid, OID_RSA_SHA512) {
+        alg.* = SigAlg.RSA_PKCS1;
+        hash.* = sha2.Algorithm.SHA512;
+    } else if @mem_eq(oid, OID_ECDSA_SHA256) {
+        alg.* = SigAlg.ECDSA;
+        hash.* = sha2.Algorithm.SHA256;
+    } else if @mem_eq(oid, OID_ECDSA_SHA384) {
+        alg.* = SigAlg.ECDSA;
+        hash.* = sha2.Algorithm.SHA384;
+    } else if @mem_eq(oid, OID_ECDSA_SHA512) {
+        alg.* = SigAlg.ECDSA;
+        hash.* = sha2.Algorithm.SHA512;
+    } else if @mem_eq(oid, OID_ED25519) {
+        alg.* = SigAlg.ED25519;
+    } else if @mem_eq(oid, OID_RSA_PSS) {
+        // RSASSA-PSS-params: [0] hashAlgorithm (the default, SHA-1, is refused)
+        let mut params = seq.sequence()!;
+        if params.peek_tag() == der.context(0, true) {
+            let mut h0 = params.nested(der.context(0, true))!;
+            let mut ha = h0.sequence()!;
+            let hoid = ha.oid()!;
+            if @mem_eq(hoid, OID_SHA256) {
+                alg.* = SigAlg.RSA_PSS;
+                hash.* = sha2.Algorithm.SHA256;
+            } else if @mem_eq(hoid, OID_SHA384) {
+                alg.* = SigAlg.RSA_PSS;
+                hash.* = sha2.Algorithm.SHA384;
+            } else if @mem_eq(hoid, OID_SHA512) {
+                alg.* = SigAlg.RSA_PSS;
+                hash.* = sha2.Algorithm.SHA512;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Certificates
+// -----------------------------------------------------------------------------
+
+pub const KU_DIGITAL_SIGNATURE: u32 = 1;
+pub const KU_KEY_CERT_SIGN: u32 = 1 << 5;
+
+pub struct Certificate {
+    raw: []mut u8,  // the whole certificate (owned)
+    tbs: []u8,      // the signed part
+    serial: []u8,
+    issuer: []u8,  // Name, DER (compared byte for byte)
+    subject: []u8,
+    common_name: []u8,  // for display
+    not_before: time.Time,
+    not_after: time.Time,
+    key: PublicKey,
+    spki: []u8,
+    sig_alg: SigAlg,
+    sig_hash: sha2.Algorithm,
+    signature: []u8,
+    is_ca: bool,
+    max_path_len: i32,  // -1: unlimited
+    key_usage: u32,     // KU_* bits; all set when absent
+    server_auth: bool,  // extKeyUsage allows serverAuth (or is absent)
+    dns_names: vec.Vec.[[]u8],
+    ip_addrs: vec.Vec.[[]u8],
+    permitted: vec.Vec.[[]u8],  // name constraints: DNS names, and IP address+mask
+    excluded: vec.Vec.[[]u8],
+    has_constraints: bool,
+    critical_unknown: bool,
+
+    /// Parses a DER certificate (the bytes are copied).
+    pub fn parse(der_bytes: []u8) !Certificate {
+        let raw = mem.alloc.[u8](der_bytes.len)!;
+        @mem_copy(raw, der_bytes);
+        let mut c = Certificate.{
+            raw: raw,
+            tbs: "",
+            serial: "",
+            issuer: "",
+            subject: "",
+            common_name: "",
+            not_before: time.Time.from_unix(0, 0),
+            not_after: time.Time.from_unix(0, 0),
+            key: PublicKey.{ kind: KeyKind.UNSUPPORTED, point: "", n: "", e: "" },
+            spki: "",
+            sig_alg: SigAlg.UNSUPPORTED,
+            sig_hash: sha2.Algorithm.SHA256,
+            signature: "",
+            is_ca: false,
+            max_path_len: -1,
+            key_usage: 0xFFFFFFFF,
+            server_auth: true,
+            dns_names: vec.Vec.[[]u8].init(),
+            ip_addrs: vec.Vec.[[]u8].init(),
+            permitted: vec.Vec.[[]u8].init(),
+            excluded: vec.Vec.[[]u8].init(),
+            has_constraints: false,
+            critical_unknown: false,
+        };
+        c.parse_fields() catch |e| {
+            c.deinit();
+            if (e == error.OutOfMemory) or (e == error.UnsupportedAlgorithm) {
+                return e;
+            }
+            return error.InvalidCertificate;
+        };
+        return c;
+    }
+
+    pub fn deinit(self: *mut Certificate) void {
+        mem.free(self.raw);
+        self.dns_names.deinit();
+        self.ip_addrs.deinit();
+        self.permitted.deinit();
+        self.excluded.deinit();
+    }
+
+    fn parse_fields(self: *mut Certificate) !void {
+        let mut top = der.Reader.init(self.raw);
+        let mut cert = top.sequence()!;
+        if not top.empty() {
+            return error.InvalidCertificate;
+        }
+        let tbs_el = cert.expect(der.SEQUENCE)!;
+        self.tbs = tbs_el.raw;
+        let alg_el = cert.expect(der.SEQUENCE)!;
+        parse_sig_alg(alg_el.raw, &mut self.sig_alg, &mut self.sig_hash)!;
+        self.signature = cert.bit_string()!;
+        if not cert.empty() {
+            return error.InvalidCertificate;  // (DER: nothing may follow)
+        }
+        let mut t = der.Reader.init(tbs_el.content);
+        // version [0] EXPLICIT INTEGER (v3 = 2), optional
+        if t.peek_tag() == der.context(0, true) {
+            let mut v = t.nested(der.context(0, true))!;
+            let ver = v.small_integer()!;
+            if (ver < 0) or (ver > 2) {
+                return error.InvalidCertificate;
+            }
+        }
+        self.serial = t.expect(der.INTEGER)!.content;
+        let inner_alg = t.expect(der.SEQUENCE)!;
+        if not @mem_eq(inner_alg.raw, alg_el.raw) {
+            return error.InvalidCertificate;  // the two algorithm fields must agree
+        }
+        self.issuer = t.expect(der.SEQUENCE)!.raw;
+        let mut validity = t.sequence()!;
+        self.not_before = validity.time_value()!;
+        self.not_after = validity.time_value()!;
+        let subj = t.expect(der.SEQUENCE)!;
+        self.subject = subj.raw;
+        self.common_name = find_common_name(subj.content);
+        let spki = t.expect(der.SEQUENCE)!;
+        self.spki = spki.raw;
+        self.key = parse_spki(spki.raw)!;
+        // issuerUniqueID [1], subjectUniqueID [2]: skipped
+        _ = t.skip_if(der.context(1, false))!;
+        _ = t.skip_if(der.context(2, false))!;
+        if t.peek_tag() == der.context(3, true) {
+            let mut ex = t.nested(der.context(3, true))!;
+            let mut exts = ex.sequence()!;
+            let mut seen: [32][]u8 = [""; 32];
+            let mut nseen: usize = 0;
+            while not exts.empty() {
+                let mut e = exts.sequence()!;
+                let oid = e.oid()!;
+                // an extension may appear only once (RFC 5280 4.2)
+                for k in @as(usize, 0)..nseen {
+                    if @mem_eq(seen[k], oid) {
+                        return error.InvalidCertificate;
+                    }
+                }
+                if nseen < 32 {
+                    seen[nseen] = oid;
+                    nseen += 1;
+                }
+                let mut critical = false;
+                if e.peek_tag() == der.BOOLEAN {
+                    critical = e.boolean()!;
+                }
+                let value = e.octet_string()!;
+                if not self.extension(oid, value)! {
+                    if critical {
+                        self.critical_unknown = true;
+                    }
+                }
+            }
+        }
+        if not t.empty() {
+            return error.InvalidCertificate;
+        }
+    }
+
+    /// Handles one extension; false if it is not one this module knows.
+    fn extension(self: *mut Certificate, oid: []u8, value: []u8) !bool {
+        let mut r = der.Reader.init(value);
+        if @mem_eq(oid, OID_BASIC_CONSTRAINTS) {
+            let mut s = r.sequence()!;
+            if s.peek_tag() == der.BOOLEAN {
+                self.is_ca = s.boolean()!;
+            }
+            if s.peek_tag() == der.INTEGER {
+                let n = s.small_integer()!;
+                if (n < 0) or (n > 1000) {
+                    return error.InvalidCertificate;
+                }
+                self.max_path_len = @int_cast(i32, n);
+            }
+            return true;
+        }
+        if @mem_eq(oid, OID_KEY_USAGE) {
+            let e = r.expect(der.BIT_STRING)!;
+            let c = e.content;
+            if c.len < 1 {
+                return error.InvalidCertificate;
+            }
+            let mut ku: u32 = 0;
+            for i in 1..c.len {
+                for b in @as(u32, 0)..8 {
+                    if ((c[i] >> @truncate(u8, 7 - b)) & 1) == 1 {
+                        ku = ku | (@as(u32, 1) << (@int_cast(u32, (i - 1) * 8) + b));
+                    }
+                }
+            }
+            self.key_usage = ku;
+            return true;
+        }
+        if @mem_eq(oid, OID_EXT_KEY_USAGE) {
+            let mut s = r.sequence()!;
+            self.server_auth = false;
+            while not s.empty() {
+                let u = s.oid()!;
+                if @mem_eq(u, OID_SERVER_AUTH) or @mem_eq(u, OID_ANY_EKU) {
+                    self.server_auth = true;
+                }
+            }
+            return true;
+        }
+        if @mem_eq(oid, OID_SUBJECT_ALT_NAME) {
+            let mut s = r.sequence()!;
+            while not s.empty() {
+                let g = s.next()!;
+                if g.tag == 0x82 {
+                    self.dns_names.push(g.content)!;
+                } else if g.tag == 0x87 {
+                    self.ip_addrs.push(g.content)!;
+                }
+            }
+            return true;
+        }
+        if @mem_eq(oid, OID_NAME_CONSTRAINTS) {
+            self.has_constraints = true;
+            let mut s = r.sequence()!;
+            while not s.empty() {
+                let sub = s.next()!;
+                let mut list = &mut self.permitted;
+                if sub.tag == der.context(1, true) {
+                    list = &mut self.excluded;
+                } else if sub.tag != der.context(0, true) {
+                    return error.InvalidCertificate;
+                }
+                let mut trees = der.Reader.init(sub.content);
+                while not trees.empty() {
+                    let mut tree = trees.sequence()!;
+                    let base = tree.next()!;
+                    if (base.tag == 0x82) or (base.tag == 0x87) {
+                        // tag the entry with its kind: 'd' DNS, 'i' IP
+                        let mut kind: []u8 = "d";
+                        if base.tag == 0x87 {
+                            kind = "i";
+                        }
+                        let entry = strs.concat(kind, base.content)!;
+                        list.push(entry)!;
+                    }
+                }
+            }
+            return true;
+        }
+        // non-critical in practice, and nothing to enforce here
+        if @mem_eq(oid, OID_CERT_POLICIES) or @mem_eq(oid, OID_POLICY_CONSTRAINTS) or @mem_eq(oid, OID_INHIBIT_ANY) {
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether issuer's key made this certificate's signature.
+    pub fn signed_by(self: *Certificate, issuer: *Certificate) bool {
+        if self.sig_alg == SigAlg.UNSUPPORTED {
+            return false;
+        }
+        return issuer.key.verify(self.sig_alg, self.sig_hash, self.tbs, self.signature);
+    }
+
+    /// Whether the certificate is valid for hostname (a DNS name or an IPv4
+    /// address), by its subject alternative names.
+    pub fn matches_host(self: *Certificate, hostname: []u8) bool {
+        let ip = net.parse_ipv4(hostname) catch 0;
+        if (ip != 0) or @mem_eq(hostname, "0.0.0.0") {
+            let want: [4]u8 = [
+                @truncate(u8, ip >> 24), @truncate(u8, ip >> 16), @truncate(u8, ip >> 8), @truncate(u8, ip)];
+            for a in self.ip_addrs.items() {
+                if @mem_eq(a, want[..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        let h = strs.trim_bytes(hostname, ".");
+        for pattern in self.dns_names.items() {
+            if match_dns(strs.trim_bytes(pattern, "."), h) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Frees and re-creates the owned parts so that a Certificate can be
+    /// copied into a container: returns a deep copy.
+    pub fn clone(self: *Certificate) !Certificate {
+        return Certificate.parse(self.raw);
+    }
+}
+
+/// The subject's first common name (for messages only).
+fn find_common_name(name: []u8) []u8 {
+    let mut r = der.Reader.init(name);
+    while not r.empty() {
+        let mut set = der.Reader.init((r.expect(der.SET) catch return "").content);
+        while not set.empty() {
+            let mut atv = set.sequence() catch return "";
+            let oid = atv.oid() catch return "";
+            let v = atv.next() catch return "";
+            if @mem_eq(oid, OID_COMMON_NAME) {
+                return v.content;
+            }
+        }
+    }
+    return "";
+}
+
+/// Case-insensitive DNS name match, with a leftmost-label "*" wildcard.
+fn match_dns(pattern: []u8, hostname: []u8) bool {
+    if strs.starts_with(pattern, "*.") {
+        let rest = pattern[1..];  // ".example.com"
+        let dot = strs.index_of_byte(hostname, '.') catch return false;
+        if dot == 0 {
+            return false;
+        }
+        return strs.eq_ignore_case(hostname[dot..], rest);
+    }
+    return strs.eq_ignore_case(pattern, hostname);
+}
+
+/// Whether a DNS name is within a name-constraint subtree: equal to it, or
+/// a subdomain of it ("example.com" covers "a.example.com"; a leading dot
+/// allows only subdomains).
+fn within_dns(name: []u8, base: []u8) bool {
+    if base.len == 0 {
+        return true;
+    }
+    if base[0] == '.' {
+        return (name.len > base.len) and strs.eq_ignore_case(name[name.len - base.len..], base);
+    }
+    if strs.eq_ignore_case(name, base) {
+        return true;
+    }
+    return (name.len > base.len) and (name[(name.len - base.len) - 1] == '.') and
+           strs.eq_ignore_case(name[name.len - base.len..], base);
+}
+
+/// Whether name is exactly one label under domain ("www.x.test" under "x.test").
+fn one_label_under(name: []u8, domain: []u8) bool {
+    if name.len <= domain.len + 1 {
+        return false;
+    }
+    let cut = name.len - domain.len - 1;
+    if (name[cut] != '.') or not strs.eq_ignore_case(name[cut + 1..], domain) {
+        return false;
+    }
+    return (strs.index_of_byte(name[..cut], '.') catch cut) == cut;
+}
+
+/// Whether an IP address is within an address+mask constraint.
+fn within_ip(ip: []u8, base: []u8) bool {
+    if (base.len != (2 * ip.len)) or (ip.len == 0) {
+        return false;
+    }
+    for i in 0..ip.len {
+        let mask = base[ip.len + i];
+        if (ip[i] & mask) != (base[i] & mask) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether leaf's names satisfy ca's name constraints.
+fn names_allowed(ca: *Certificate, leaf: *Certificate) bool {
+    if not ca.has_constraints {
+        return true;
+    }
+    for n0 in leaf.dns_names.items() {
+        // names as matches_host sees them ("a.example." is "a.example"); a
+        // wildcard "*.d" is judged by a name it matches ("a.d"), and is
+        // excluded if any name it could match is
+        let n = strs.trim_bytes(n0, ".");
+        let mut rep: [260]u8 = [0; 260];
+        let mut name = n;
+        let wild = strs.starts_with(n, "*.") and (n.len < 250);
+        if wild {
+            rep[0] = 'a';
+            @mem_copy(rep[1..n.len], n[1..]);
+            name = rep[..n.len];
+        }
+        let mut permitted_any = false;
+        let mut has_dns_permits = false;
+        for p in ca.permitted.items() {
+            if p[0] == 'd' {
+                has_dns_permits = true;
+                if within_dns(name, p[1..]) {
+                    permitted_any = true;
+                }
+            }
+        }
+        if has_dns_permits and not permitted_any {
+            return false;
+        }
+        for x in ca.excluded.items() {
+            if x[0] != 'd' {
+                continue;
+            }
+            if within_dns(name, x[1..]) or (wild and one_label_under(strs.trim_bytes(x[1..], "."), n[2..])) {
+                return false;
+            }
+        }
+    }
+    for a in leaf.ip_addrs.items() {
+        let mut permitted_any = false;
+        let mut has_ip_permits = false;
+        for p in ca.permitted.items() {
+            if p[0] == 'i' {
+                has_ip_permits = true;
+                if within_ip(a, p[1..]) {
+                    permitted_any = true;
+                }
+            }
+        }
+        if has_ip_permits and not permitted_any {
+            return false;
+        }
+        for x in ca.excluded.items() {
+            if (x[0] == 'i') and within_ip(a, x[1..]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// PEM
+// -----------------------------------------------------------------------------
+
+/// One "-----BEGIN label-----" block.
+pub struct PemBlock {
+    label: []u8,
+    body: []u8,  // base64 text
+}
+
+/// The PEM blocks of a text, in order.
+pub struct PemIter {
+    text: []u8,
+    pos: usize,
+
+    pub fn next(self: *mut PemIter) !PemBlock {
+        let begin = strs.index_of_from(self.text, "-----BEGIN ", self.pos) catch {
+            self.pos = self.text.len;
+            return error.NotFound;
+        };
+        let label_start = begin + 11;
+        let label_end = strs.index_of_from(self.text, "-----", label_start) catch return error.InvalidPem;
+        let label = self.text[label_start..label_end];
+        let body_start = label_end + 5;
+        let end_marker = strs.index_of_from(self.text, "-----END ", body_start) catch return error.InvalidPem;
+        let after = strs.index_of_from(self.text, "-----", end_marker + 9) catch return error.InvalidPem;
+        if not @mem_eq(self.text[end_marker + 9..after], label) {
+            return error.InvalidPem;
+        }
+        self.pos = after + 5;
+        return PemBlock.{ label: label, body: self.text[body_start..end_marker] };
+    }
+}
+
+pub fn pem_blocks(text: []u8) PemIter {
+    return PemIter.{ text: text, pos: 0 };
+}
+
+/// The DER bytes of a block, in new memory (free them with mem.free).
+pub fn pem_decode(b: PemBlock) ![]mut u8 {
+    return base64.decode_alloc(b.body, base64.STANDARD) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return error.InvalidPem;
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Private keys
+// -----------------------------------------------------------------------------
+
+pub union PrivateKey {
+    Rsa: rsa.PrivateKey,
+    P256: ec.P256,
+    P384: ec.P384,
+    Ed25519: curve25519.Ed25519,
+
+    pub fn deinit(self: *mut PrivateKey) void {
+        match self.* {
+            .Rsa(k) => {
+                let mut kk = k;
+                kk.deinit();
+            }
+            else => {}
+        }
+    }
+}
+
+/// Parses a private key: PKCS #8 ("PRIVATE KEY"), PKCS #1 ("RSA PRIVATE
+/// KEY") or SEC 1 ("EC PRIVATE KEY") DER.
+pub fn parse_private_key(label: []u8, d: []u8) !PrivateKey {
+    if @mem_eq(label, "RSA PRIVATE KEY") {
+        return parse_pkcs1(d);
+    }
+    if @mem_eq(label, "EC PRIVATE KEY") {
+        return parse_sec1(d, "");
+    }
+    // PKCS #8: SEQUENCE { version, AlgorithmIdentifier, OCTET STRING }
+    let mut r = der.Reader.init(d);
+    let mut s = r.sequence()!;
+    _ = s.small_integer()!;
+    let mut alg = s.sequence()!;
+    let oid = alg.oid()!;
+    let inner = s.octet_string()!;
+    if @mem_eq(oid, OID_RSA) {
+        return parse_pkcs1(inner);
+    }
+    if @mem_eq(oid, OID_EC) {
+        let curve = alg.oid()!;
+        return parse_sec1(inner, curve);
+    }
+    if @mem_eq(oid, OID_ED25519) {
+        let mut ir = der.Reader.init(inner);
+        let seed = ir.octet_string()!;
+        if seed.len != 32 {
+            return error.InvalidKey;
+        }
+        return PrivateKey.Ed25519(curve25519.Ed25519.from_seed(seed));
+    }
+    return error.UnsupportedAlgorithm;
+}
+
+fn parse_pkcs1(d: []u8) !PrivateKey {
+    let mut r = der.Reader.init(d);
+    let mut s = r.sequence()!;
+    _ = s.small_integer()!;
+    let n = s.integer()!;
+    let e = s.integer()!;
+    let dd = s.integer()!;
+    return PrivateKey.Rsa(rsa.PrivateKey.from_bytes(n, e, dd) catch return error.InvalidKey);
+}
+
+/// ECPrivateKey (SEC 1), with the curve from outside or from [0].
+fn parse_sec1(d: []u8, outer_curve: []u8) !PrivateKey {
+    let mut r = der.Reader.init(d);
+    let mut s = r.sequence()!;
+    _ = s.small_integer()!;
+    let k = s.octet_string()!;
+    let mut curve = outer_curve;
+    if s.peek_tag() == der.context(0, true) {
+        let mut p = s.nested(der.context(0, true))!;
+        curve = p.oid()!;
+    }
+    if @mem_eq(curve, OID_P256) and (k.len == 32) {
+        return PrivateKey.P256(ec.P256.from_bytes(k) catch return error.InvalidKey);
+    }
+    if @mem_eq(curve, OID_P384) and (k.len == 48) {
+        return PrivateKey.P384(ec.P384.from_bytes(k) catch return error.InvalidKey);
+    }
+    return error.UnsupportedAlgorithm;
+}
+
+/// The first private key in a PEM text.
+pub fn parse_private_key_pem(text: []u8) !PrivateKey {
+    let mut it = pem_blocks(text);
+    loop {
+        let b = it.next() catch |e| {
+            if e == error.NotFound {
+                return error.InvalidKey;
+            }
+            return e;
+        };
+        if strs.ends_with(b.label, "PRIVATE KEY") {
+            let d = pem_decode(b)!;
+            defer mem.free(d);
+            return parse_private_key(b.label, d);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Certificate pools and chain verification
+// -----------------------------------------------------------------------------
+
+/// A set of trusted root certificates.
+pub struct CertPool {
+    certs: vec.Vec.[Certificate],
+
+    pub fn init() CertPool {
+        return CertPool.{ certs: vec.Vec.[Certificate].init() };
+    }
+
+    pub fn deinit(self: *mut CertPool) void {
+        for i in 0..self.certs.len {
+            self.certs.get_ptr(i).deinit();
+        }
+        self.certs.deinit();
+    }
+
+    pub fn add(self: *mut CertPool, der_bytes: []u8) !void {
+        let mut c = Certificate.parse(der_bytes)!;
+        self.certs.push(c) catch |e| {
+            c.deinit();
+            return e;
+        };
+    }
+
+    /// Adds every CERTIFICATE block of a PEM text that parses; returns how
+    /// many were added.
+    pub fn add_pem(self: *mut CertPool, text: []u8) !usize {
+        let mut it = pem_blocks(text);
+        let mut n: usize = 0;
+        loop {
+            let b = it.next() catch |e| {
+                if e == error.NotFound {
+                    break;
+                }
+                return e;
+            };
+            if not @mem_eq(b.label, "CERTIFICATE") {
+                continue;
+            }
+            let d = pem_decode(b) catch continue;
+            defer mem.free(d);
+            self.add(d) catch |e| {
+                if e == error.OutOfMemory {
+                    return e;
+                }
+                continue;
+            };
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Adds the certificates of a PEM file.
+    pub fn add_file(self: *mut CertPool, path: []u8) !usize {
+        let f = io.open(path)!;
+        defer f.close();
+        let text = f.reader().read_all()!;
+        defer mem.free(text);
+        return self.add_pem(text);
+    }
+
+    /// Loads the operating system's CA bundle (the first that exists of the
+    /// usual Linux locations); returns how many certificates were added.
+    pub fn load_system(self: *mut CertPool) !usize {
+        let paths: [5][]u8 = [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/ssl/cert.pem",
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        ];
+        for p in paths {
+            let n = self.add_file(p) catch continue;
+            if n > 0 {
+                return n;
+            }
+        }
+        return error.NotFound;
+    }
+}
+
+fn check_time(c: *Certificate, now: time.Time) !void {
+    if now.before(c.not_before) {
+        return error.NotYetValid;
+    }
+    if now.after(c.not_after) {
+        return error.Expired;
+    }
+}
+
+/// Verifies a chain as a TLS server presents it: the leaf first, then
+/// intermediates in any order. On success some path reaches a root in
+/// `roots`; otherwise the error explains the most relevant failure.
+pub fn verify_chain(chain: []Certificate, roots: *CertPool, hostname: []u8, now: time.Time) !void {
+    if chain.len == 0 {
+        return error.InvalidCertificate;
+    }
+    let leaf = &chain[0];
+    if leaf.critical_unknown {
+        return error.UnhandledCriticalExtension;
+    }
+    check_time(leaf, now)!;
+    if (hostname.len > 0) and not leaf.matches_host(hostname) {
+        return error.HostnameMismatch;
+    }
+    if not leaf.server_auth {
+        return error.IncompatibleUsage;
+    }
+    // the leaf itself may be trusted directly
+    for r in roots.certs.items() {
+        if @mem_eq(r.raw, leaf.raw) {
+            return;
+        }
+    }
+    let mut used: [16]bool = [false; 16];
+    let mut budget: u32 = MAX_SIGNATURE_CHECKS;
+    return extend(chain, leaf, roots, now, 0, &mut used, &mut budget);
+}
+
+/// Chain building gives up after this many signature checks: a peer's
+/// pile of look-alike intermediates must not cost more (real chains need
+/// a handful).
+const MAX_SIGNATURE_CHECKS: u32 = 64;
+
+fn check_signature(cert: *Certificate, issuer: *Certificate, budget: *mut u32) !bool {
+    if budget.* == 0 {
+        return error.PathTooLong;
+    }
+    budget.* -= 1;
+    return cert.signed_by(issuer);
+}
+
+/// Finds an issuer for `cert` among the roots, then the intermediates.
+fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.Time, depth: u32, used: *mut [16]bool,
+          budget: *mut u32) !void {
+    if depth > 8 {
+        return error.PathTooLong;
+    }
+    let leaf = &chain[0];
+    let mut last = error.UnknownAuthority;
+    for r in roots.certs.items() {
+        if not @mem_eq(r.subject, cert.issuer) {
+            continue;
+        }
+        if not check_signature(cert, &r, budget)! {
+            last = error.BadSignature;
+            continue;
+        }
+        let rr = &r;
+        if not names_allowed(rr, leaf) {
+            last = error.NameConstraint;
+            continue;
+        }
+        if (rr.max_path_len >= 0) and (@as(i64, depth) > @as(i64, rr.max_path_len)) {
+            last = error.PathTooLong;
+            continue;
+        }
+        return;
+    }
+    for i in 1..chain.len {
+        if (i >= 16) or used[i] {
+            continue;
+        }
+        let ca = &chain[i];
+        if not @mem_eq(ca.subject, cert.issuer) {
+            continue;
+        }
+        if ca.critical_unknown {
+            last = error.UnhandledCriticalExtension;
+            continue;
+        }
+        if (not ca.is_ca) or ((ca.key_usage & KU_KEY_CERT_SIGN) == 0) {
+            last = error.NotCA;
+            continue;
+        }
+        if not ca.server_auth {
+            last = error.IncompatibleUsage;
+            continue;
+        }
+        check_time(ca, now) catch |e| {
+            last = e;
+            continue;
+        };
+        if (ca.max_path_len >= 0) and (@as(i64, depth) > @as(i64, ca.max_path_len)) {
+            last = error.PathTooLong;
+            continue;
+        }
+        if not names_allowed(ca, leaf) {
+            last = error.NameConstraint;
+            continue;
+        }
+        if not check_signature(cert, ca, budget)! {
+            last = error.BadSignature;
+            continue;
+        }
+        used[i] = true;
+        extend(chain, ca, roots, now, depth + 1, used, budget) catch |e| {
+            used[i] = false;
+            if budget.* == 0 {
+                return e;
+            }
+            last = e;
+            continue;
+        };
+        return;
+    }
+    return last;
+}
+
+// -----------------------------------------------------------------------------
+// Tests: a small PKI made with OpenSSL. Test Root (RSA-2048) signs Test
+// Intermediate (P-384, pathlen 0), which signs example.test (P-256, SHA-384;
+// DNS example.test and *.wild.test, IP 127.0.0.1). The root also signs an
+// Ed25519 leaf with RSA-PSS, and Constrained (permitted DNS good.test),
+// which signs www.good.test and www.evil.test.
+// -----------------------------------------------------------------------------
+
+let ROOT_PEM: [19][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIDGzCCAgOgAwIBAgIUf6BVdFqWwcXmcJKPqDAPhvrGfDIwDQYJKoZIhvcNAQEL\n",
+    "BQAwFDESMBAGA1UEAwwJVGVzdCBSb290MCAXDTI2MDkyODIzMDUwOVoYDzIxMjYw\n",
+    "OTA0MjMwNTA5WjAUMRIwEAYDVQQDDAlUZXN0IFJvb3QwggEiMA0GCSqGSIb3DQEB\n",
+    "AQUAA4IBDwAwggEKAoIBAQDvy5tsummgEIiQ0LY2J4gLXoKnXXxsducSI6eQFJn8\n",
+    "cnDzVI+xhoT2Y3Dz3i3oiWmh6f0RBbMOjJfqq56WYMi8qS0dPRN8iZIPI98XrtOm\n",
+    "rh4EnpAhWcnBW0ZvRinlOeof9yOWjsUXDoId5UBKDp3AJwnt9pLl9klC97O/+O1a\n",
+    "o4JxZ8BJB3yg9Zlrnh6k654fDVDwEU+mZEUVXS48A7iu8sH7mB7iwSFnLHO9oaK8\n",
+    "wfAc4qchofQsIyLQquKKR/4KKGreGj0n4ljMzbEnAV+Iuzrxv7AO2OtDiPGgp5Je\n",
+    "+PI0xrY3KlBnejAfdZ/ghmPsLZmFNsjK0ScR4Wz+yOw1AgMBAAGjYzBhMB0GA1Ud\n",
+    "DgQWBBSFVEgxIuJ46nM3cLjEFBiI/CRBrTAfBgNVHSMEGDAWgBSFVEgxIuJ46nM3\n",
+    "cLjEFBiI/CRBrTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjANBgkq\n",
+    "hkiG9w0BAQsFAAOCAQEAbThixq246jP8Viev6Vozqxkr5vDganCzGUT6ctGYNqgU\n",
+    "JJqj36LgAma7cNA28jAcCyLXadq3qDe8RdojWZ1GUCv/BZ25nIAGukUrj6sJ0DXk\n",
+    "X5ZQSb7J3TJ74Uoc7Ysavqn1LLOnmkPApqaYskV41jPe3XMddVuwNqL5NEfFHGDH\n",
+    "0BXDp/JOL8olABzrVQRCRPvIO0aDwy0qulBjXz0o/AxsBhtbXkc4ujJyKixpkU2n\n",
+    "5URn+JRugn7IghHW+NR/VjuhHpvbKABBYEU6Q1tdvjdzwQrGn2J+s5I0JFW7IDNj\n",
+    "JW82fo07hZ2Pw0BnmT5k8PPLyS6qvVkGbDov2XTNkg==\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let INTER_PEM: [16][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIICeDCCAWCgAwIBAgIUBHuW5Fx/CHoRBOQ+OoxGw+Tbe0swDQYJKoZIhvcNAQEL\n",
+    "BQAwFDESMBAGA1UEAwwJVGVzdCBSb290MCAXDTI2MDkyODIzMDUwOVoYDzIxMjYw\n",
+    "OTA0MjMwNTA5WjAcMRowGAYDVQQDDBFUZXN0IEludGVybWVkaWF0ZTB2MBAGByqG\n",
+    "SM49AgEGBSuBBAAiA2IABFDrfcyARv+694QJalIk36eNAAndhLOB2az01BuVp3MA\n",
+    "blo5xVTLRpH4ObFe/NTkyJ4dt+f7mD6tvVwiJ6HrHL063yW4cX3kIXRdnBNSqmsP\n",
+    "KUTafq2sh7ZIPrydywcsfKNmMGQwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8B\n",
+    "Af8EBAMCAQYwHQYDVR0OBBYEFLkZo29B4MBIpSW3BNsQsIo7ylIVMB8GA1UdIwQY\n",
+    "MBaAFIVUSDEi4njqczdwuMQUGIj8JEGtMA0GCSqGSIb3DQEBCwUAA4IBAQCX79H4\n",
+    "Abdb382dPfmkO9F8da6wucMQcF7E7C8rWdnFKGCXyl6fSLS5mPh87VQ7OhNmZw21\n",
+    "JvO8XXwRYH7/fELmNJ+6Lj2DOx+p9IcnjZ38nB5t/mHxSPGfTqymUU0yu1N3R0m9\n",
+    "JMrQdClk8eKrCvSD2CcPD5F088mP7OiL5ER8GKG8fHpykaw/iEJlAZ+ss1la1+mb\n",
+    "3hiI2sHuJVz0voSPuCJ98KAZaNryl3xEU6yIoK4E37akH5T8wgkMgltX+oi52LvE\n",
+    "aSDYiTidfKhhqPeu9JghvVWfsE9yQ4n8jsAmgvMUSlyUg/h54DFWo8MWgCvGYyQg\n",
+    "suclLE0tw5RE8uWd\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let LEAF_PEM: [13][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIB+jCCAYCgAwIBAgIUfZCVf2zN4jY0kycKfpKemvhgs8cwCgYIKoZIzj0EAwMw\n",
+    "HDEaMBgGA1UEAwwRVGVzdCBJbnRlcm1lZGlhdGUwIBcNMjYwOTI4MjMwNTA5WhgP\n",
+    "MjEyNjA5MDQyMzA1MDlaMBcxFTATBgNVBAMMDGV4YW1wbGUudGVzdDBZMBMGByqG\n",
+    "SM49AgEGCCqGSM49AwEHA0IABCkW67uX5N0QlaCuWDiG4fOvFPJyIGQushYTciTg\n",
+    "mB0EJYmjvpn8rcrGu9ncdQVT4NLATbCwjwilFChRYjd5ICGjgaIwgZ8wDAYDVR0T\n",
+    "AQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwKgYD\n",
+    "VR0RBCMwIYIMZXhhbXBsZS50ZXN0ggsqLndpbGQudGVzdIcEfwAAATAdBgNVHQ4E\n",
+    "FgQU4luf1CjCcqTw0WdBIwNOfTnI748wHwYDVR0jBBgwFoAUuRmjb0HgwEilJbcE\n",
+    "2xCwijvKUhUwCgYIKoZIzj0EAwMDaAAwZQIxALPFcXg732gCyz3M7IIKwfMCsA7H\n",
+    "HsTBj9nq3XTJ2qgw2kKf4wDbwPnYlSqSUyoX2AIwJPMBVUsGy9Z+vUSNgBwksqcu\n",
+    "QZypxBz4bfOzA0R0iyhFoNcpr0ANbWiM3gRrtlce\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let ED_PEM: [17][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIICyTCCAXygAwIBAgIUBHuW5Fx/CHoRBOQ+OoxGw+Tbe0wwQgYJKoZIhvcNAQEK\n",
+    "MDWgDzANBglghkgBZQMEAgEFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgEF\n",
+    "AKIEAgIA3jAUMRIwEAYDVQQDDAlUZXN0IFJvb3QwIBcNMjYwOTI4MjMwNTA5WhgP\n",
+    "MjEyNjA5MDQyMzA1MDlaMBIxEDAOBgNVBAMMB2VkLnRlc3QwKjAFBgMrZXADIQAD\n",
+    "DlpwFTvVBn3fUuBSRqYrVF2GSuqi9NeLuVqMPPtlRqOBojCBnzAMBgNVHRMBAf8E\n",
+    "AjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAqBgNVHREE\n",
+    "IzAhggxleGFtcGxlLnRlc3SCCyoud2lsZC50ZXN0hwR/AAABMB0GA1UdDgQWBBR6\n",
+    "VxHRmHxh4R+EeRWoCmYgmF/0XDAfBgNVHSMEGDAWgBSFVEgxIuJ46nM3cLjEFBiI\n",
+    "/CRBrTBCBgkqhkiG9w0BAQowNaAPMA0GCWCGSAFlAwQCAQUAoRwwGgYJKoZIhvcN\n",
+    "AQEIMA0GCWCGSAFlAwQCAQUAogQCAgDeA4IBAQCJTQ/y4RPUZkVhJ0RswkvlX7BN\n",
+    "T87VoptO7/sDa9m/CgDV/BzyZh9lPenuAwdo30VHv2JGNFbUS0XL48lEGKHrlV87\n",
+    "WfdnTv64eyTJcKCLi9i1beFbSBo58ulwmMBCTbLrnXL0mTbjgIuZRYCwSZ5D7qhC\n",
+    "9RX3xjp/Rndq1dWe9KjdbilHCJnahNGmZ0oP6H6cYkpqnmnMI+iJ2sSEIAIcd3x/\n",
+    "UYaAvMazG4JXnBvbP+u+Em9CsYA3IrTSCDK+Ji2Gd/r7bSJmd4AxzAGoxr9xl3Ef\n",
+    "99j64QK9zm5t4mNE6Uf37FTbONNaaU8c5M15pp+KtPKEpmRn1mJPSwqSTkay\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let CON_PEM: [16][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIICdDCCAVygAwIBAgIUBHuW5Fx/CHoRBOQ+OoxGw+Tbe00wDQYJKoZIhvcNAQEL\n",
+    "BQAwFDESMBAGA1UEAwwJVGVzdCBSb290MCAXDTI2MDkyODIzMDUwOVoYDzIxMjYw\n",
+    "OTA0MjMwNTA5WjAWMRQwEgYDVQQDDAtDb25zdHJhaW5lZDBZMBMGByqGSM49AgEG\n",
+    "CCqGSM49AwEHA0IABEE+Sbaz00dmUFRTu3Dk78j7+VoCg7/MpVLhE5DGi7jeBk5+\n",
+    "UDTbOrOkZtMo2yjptZT/H8bclvYIb7+jXAPNpdOjgYQwgYEwEgYDVR0TAQH/BAgw\n",
+    "BgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwGwYDVR0eAQH/BBEwD6ANMAuCCWdvb2Qu\n",
+    "dGVzdDAdBgNVHQ4EFgQUViEqEp7601NLnwsKKwpUO6JBDqowHwYDVR0jBBgwFoAU\n",
+    "hVRIMSLieOpzN3C4xBQYiPwkQa0wDQYJKoZIhvcNAQELBQADggEBACFGYfWc0LE2\n",
+    "yaJqYVS3g1odmuRECspEZwwfIoNjGUUcPyQEha4bLetbipwNiuZAAJojgatI3JRD\n",
+    "UruVH0FGIi7XkHhAhLbHYPqJrJ7WQ/RDkpiau6HDvHDMqLKDQoACFMjKIG3TwHNb\n",
+    "Y/djVU6rUNOptn8q5g797YHOoIa0nEUyYIfGyQnOl9nDYSZlg8qopzW2yp88JVru\n",
+    "oSQ05nmjCkpUrzluNsLWGtA38e8kERdvnjATo1dxOfJZY3PnY1Lnn65iVeVt8ISU\n",
+    "Ra1cnT8kuHZznyrmYZDZ8U59FlTqalji0JxdtImSsHRJ3xIOBwnQpgegs9y4lGju\n",
+    "53h6Tud2Fos=\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let GOOD_PEM: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBmjCCAUCgAwIBAgIUeWjv3BzfKRdrqqMDm8YWAihJ4HAwCgYIKoZIzj0EAwIw\n",
+    "FjEUMBIGA1UEAwwLQ29uc3RyYWluZWQwIBcNMjYwOTI4MjMwNTA5WhgPMjEyNjA5\n",
+    "MDQyMzA1MDlaMA8xDTALBgNVBAMMBGdvb2QwWTATBgcqhkjOPQIBBggqhkjOPQMB\n",
+    "BwNCAARMMXuAx07xu2MU2B8cuvtCGswe2aHuA7UMa/BivEBnsz62fU4bz9fhERJD\n",
+    "7aaFCMyRa4m3dPWGjh5o++tH/KQro3EwbzAYBgNVHREEETAPgg13d3cuZ29vZC50\n",
+    "ZXN0MBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBR3ksB0Cx6cdOF2My90\n",
+    "oK7/VT4b5TAfBgNVHSMEGDAWgBRWISoSnvrTU0ufCworClQ7okEOqjAKBggqhkjO\n",
+    "PQQDAgNIADBFAiBlZ/utcp0kEAyOpmlolms9yXW31NAhgqMC2eYVIdhhAAIhAJ5t\n",
+    "yNpzxrgLpSgr7x8sVWnHrS/cA0jCLN5LxKXUDxos\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let BAD_PEM: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBmTCCAUCgAwIBAgIUeWjv3BzfKRdrqqMDm8YWAihJ4HEwCgYIKoZIzj0EAwIw\n",
+    "FjEUMBIGA1UEAwwLQ29uc3RyYWluZWQwIBcNMjYwOTI4MjMwNTA5WhgPMjEyNjA5\n",
+    "MDQyMzA1MDlaMA8xDTALBgNVBAMMBGdvb2QwWTATBgcqhkjOPQIBBggqhkjOPQMB\n",
+    "BwNCAARMMXuAx07xu2MU2B8cuvtCGswe2aHuA7UMa/BivEBnsz62fU4bz9fhERJD\n",
+    "7aaFCMyRa4m3dPWGjh5o++tH/KQro3EwbzAYBgNVHREEETAPgg13d3cuZXZpbC50\n",
+    "ZXN0MBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBR3ksB0Cx6cdOF2My90\n",
+    "oK7/VT4b5TAfBgNVHSMEGDAWgBRWISoSnvrTU0ufCworClQ7okEOqjAKBggqhkjO\n",
+    "PQQDAgNHADBEAiAYA7zbeQZF5pWBwHXVV/E5USQecH7s5DoqcVI24R3z0gIgSt/O\n",
+    "ckxCpTWqGdfAbdwmEPDBBrQyzNnPQgQx2M1ZCFA=\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let LEAF_KEY: [5][]u8 = [
+    "-----BEGIN PRIVATE KEY-----\n",
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgpSiGQz+1pgj6owIh\n",
+    "PlaO93L4z/dSdx0YsShednJJjGOhRANCAAQpFuu7l+TdEJWgrlg4huHzrxTyciBk\n",
+    "LrIWE3Ik4JgdBCWJo76Z/K3KxrvZ3HUFU+DSwE2wsI8IpRQoUWI3eSAh\n",
+    "-----END PRIVATE KEY-----\n",
+];
+
+let ED_KEY: [3][]u8 = [
+    "-----BEGIN PRIVATE KEY-----\n",
+    "MC4CAQAwBQYDK2VwBCIEIBcCVulzUG72Qpq9W9OraKBrukAwXH+ils3FzNRagpqh\n",
+    "-----END PRIVATE KEY-----\n",
+];
+
+let ROOT_KEY: [28][]u8 = [
+    "-----BEGIN PRIVATE KEY-----\n",
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDvy5tsummgEIiQ\n",
+    "0LY2J4gLXoKnXXxsducSI6eQFJn8cnDzVI+xhoT2Y3Dz3i3oiWmh6f0RBbMOjJfq\n",
+    "q56WYMi8qS0dPRN8iZIPI98XrtOmrh4EnpAhWcnBW0ZvRinlOeof9yOWjsUXDoId\n",
+    "5UBKDp3AJwnt9pLl9klC97O/+O1ao4JxZ8BJB3yg9Zlrnh6k654fDVDwEU+mZEUV\n",
+    "XS48A7iu8sH7mB7iwSFnLHO9oaK8wfAc4qchofQsIyLQquKKR/4KKGreGj0n4ljM\n",
+    "zbEnAV+Iuzrxv7AO2OtDiPGgp5Je+PI0xrY3KlBnejAfdZ/ghmPsLZmFNsjK0ScR\n",
+    "4Wz+yOw1AgMBAAECggEAGv5nIS687DVgQjkUgfUiRfFeMNv/wTADZBHab4g6K2Zw\n",
+    "m5vFzzyu5BOep/03Wsl5OC5gfBWRqg4end6y7Ae6IS7EMtnowyizZfvqRb66+bT5\n",
+    "ERkObYqvgRI21BjoZ3MFDZMjEPRCcI2EDTx857lMfdCHOB/9OmDmr2C1/eLWSVEN\n",
+    "9refVTi58/stc7zNRbWzTx4LibCvLx7+dpDbPB735Sa2RmabYNnaEhW/KZRNZiNC\n",
+    "IVWvCneQgRDdv/U0m9SwgK1XLyb3MhjhCPO/UbHLCLZAmiH39jT4Y2BZdpCOoW2j\n",
+    "EyTQfXSwxog1RkrIqkSStxviE4LFoCUoROoOSFMp4wKBgQD9USiI3ghQATU+uSMH\n",
+    "P9Lz0rwHPOcpZaNGlYKclzFSxrQN28+k9JBj8psTA+do3AHWlSfJJ9La5BHzJGMi\n",
+    "2HttJoL3vFpChjQ9ols2toVF2wXCmh+mk/0Rie5uPkE6Cw18aruTMqIwCNapDcy+\n",
+    "a9N1uRV1xiz5RoSNXXk9YIZDiwKBgQDyVclE4xMNKUNrPBe1v5hcZxf+HWidLUxd\n",
+    "Ood8h5R5pb0MmwHcToKH6k/JOxulullpryfdSz8YJjRPInza4XvpT0qcFAVVHCJY\n",
+    "zI5nBtYfLafScfFWCiNLcUwzXnF6G96sSxjWs+rJxJImSlccg32Cn3oFrqpGyK7t\n",
+    "FinJ1GCHPwKBgGSzj76hLYLIiCcwKBmoqK7fFnp2HpsZWYgkxXCEtknmzgs4V9qG\n",
+    "kqP4/ObZRXQtCdoJH3DbEPqNcglLbNGcZ6yjg6sCSItrmHbsBQDCHEcB489Rv8VT\n",
+    "zWXchFl1DC8L18efEoRYu5sG2HcKEluct8pz0nEoYBaUjvs3rovUxGszAoGAOdTv\n",
+    "K1lleoaWaEj2/5Cxs5uGxkYOaTQePUFyg+13KXC8JP34+7JgxD7Ou583gd1u6SG7\n",
+    "ybvjWsgDQ79fPH0DLTKXA5hjjWQhbj+i3ENtZhNnMXmvtnDE64QmQzwOqK1t/oAN\n",
+    "dW+KYIxgtHKZR1y53ypf3GtKh4ns9PeNEXV1c9ECgYEAwu/SR+uQZIdb0C6X5NEe\n",
+    "6Jiu107j5F3PU3hVnJGnblr/MaEiTnJ03W6bAIaA2F04lsspZg6rAYeHSa4ifVee\n",
+    "CvaH3DfPtIjcB9tl2F4ivbwuW4+0p3va6ZpWKZ/yB6f0/a/EeZnwo0quEAAY14Bt\n",
+    "0/X1isNJkgVdHgYRz1I8Ns4=\n",
+    "-----END PRIVATE KEY-----\n",
+];
+
+fn join(lines: [][]u8) ![]mut u8 {
+    let mut s = strs.String.init();
+    for l in lines {
+        s.push_str(l)!;
+    }
+    return s.take();
+}
+
+/// Parses the first certificate of a PEM text.
+fn cert_of(lines: [][]u8) !Certificate {
+    let text = join(lines)!;
+    defer mem.free(text);
+    let mut it = pem_blocks(text);
+    let b = it.next()!;
+    let d = pem_decode(b)!;
+    defer mem.free(d);
+    return Certificate.parse(d);
+}
+
+fn fails_with(r: !void, want: error) bool {
+    r catch |e| {
+        return e == want;
+    };
+    return false;
+}
+
+// A root excluding the subtree evil.test, and a leaf it signed for "evil.test."
+// (a trailing dot must not slip past the constraint).
+let NC_ROOT_PEM: [8][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBEDCBw6ADAgECAgEGMAUGAytlcDARMQ8wDQYDVQQDDAZOQ1Jvb3QwHhcNMjYw\n",
+    "MTAxMDAwMDAwWhcNMzAwMTAxMDAwMDAwWjARMQ8wDQYDVQQDDAZOQ1Jvb3QwKjAF\n",
+    "BgMrZXADIQD1elxuzR5lsQJH29sWLdOsynA6jWOK/HrD4BuUmgyhk6NAMD4wDwYD\n",
+    "VR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwGwYDVR0eAQH/BBEwD6ENMAuC\n",
+    "CWV2aWwudGVzdDAFBgMrZXADQQBhGv/5tFrlJV4DicitgJszHMG2vKg7S5CU9Lvb\n",
+    "9Q+aMrvWUjkPk+FqT86plcbek022ixsVw+EvSiWPW+OxWCYK\n",
+    "-----END CERTIFICATE-----\n",
+];
+let NC_DOT_LEAF_PEM: [7][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIHnMIGaoAMCAQICAQcwBQYDK2VwMBExDzANBgNVBAMMBk5DUm9vdDAeFw0yNjAx\n",
+    "MDEwMDAwMDBaFw0zMDAxMDEwMDAwMDBaMA8xDTALBgNVBAMMBGxlYWYwKjAFBgMr\n",
+    "ZXADIQDurLn1y3Pq0lBpzx5L4oGdA7Lc5Z5F7bHseWPJtZYxcaMZMBcwFQYDVR0R\n",
+    "BA4wDIIKZXZpbC50ZXN0LjAFBgMrZXADQQATAv0sqhomumnpTGbj1Kte+Wlnpfg2\n",
+    "YfeCMNpbeUD1IJVHcZWTXHZlIXVxcLnhUGKhjLnpwjE6JkClY2j9QbgB\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+test "parse certificates" {
+    let mut leaf = cert_of(LEAF_PEM[..])!;
+    defer leaf.deinit();
+    @expect_eq(leaf.common_name, "example.test");
+    @expect(leaf.key.kind == KeyKind.P256);
+    @expect(leaf.sig_alg == SigAlg.ECDSA);
+    @expect(leaf.sig_hash == sha2.Algorithm.SHA384);
+    @expect(not leaf.is_ca);
+    @expect_eq(leaf.dns_names.len, 2);
+    @expect(leaf.matches_host("example.test"));
+    @expect(leaf.matches_host("EXAMPLE.test."));
+    @expect(leaf.matches_host("a.wild.test"));
+    @expect(not leaf.matches_host("wild.test"));
+    @expect(not leaf.matches_host("a.b.wild.test"));
+    @expect(leaf.matches_host("127.0.0.1"));
+    @expect(not leaf.matches_host("127.0.0.2"));
+    let mut inter = cert_of(INTER_PEM[..])!;
+    defer inter.deinit();
+    @expect(inter.key.kind == KeyKind.P384);
+    @expect(inter.is_ca);
+    @expect_eq(inter.max_path_len, 0);
+    @expect(leaf.signed_by(&inter));
+    let mut root = cert_of(ROOT_PEM[..])!;
+    defer root.deinit();
+    @expect(root.key.kind == KeyKind.RSA);
+    @expect(inter.signed_by(&root));
+    @expect(not leaf.signed_by(&root));
+    @expect(root.signed_by(&root));
+    let mut ed = cert_of(ED_PEM[..])!;
+    defer ed.deinit();
+    @expect(ed.key.kind == KeyKind.ED25519);
+    @expect(ed.sig_alg == SigAlg.RSA_PSS);
+    @expect(ed.signed_by(&root));
+}
+
+test "verify chains" {
+    let mut roots = CertPool.init();
+    defer roots.deinit();
+    let rt = join(ROOT_PEM[..])!;
+    defer mem.free(rt);
+    @expect_eq(roots.add_pem(rt)!, 1);
+    let mut chain: [2]Certificate = [cert_of(LEAF_PEM[..])!, cert_of(INTER_PEM[..])!];
+    defer chain[0].deinit();
+    defer chain[1].deinit();
+    let now = time.date(2030, 1, 1, 0, 0, 0)!;
+    verify_chain(chain[..], &roots, "example.test", now)!;
+    verify_chain(chain[..], &roots, "x.wild.test", now)!;
+    @expect(fails_with(verify_chain(chain[..], &roots, "other.test", now), error.HostnameMismatch));
+    @expect(fails_with(verify_chain(chain[..1], &roots, "example.test", now), error.UnknownAuthority));
+    @expect(fails_with(verify_chain(chain[..], &roots, "example.test", time.date(2200, 1, 1, 0, 0, 0)!),
+                       error.Expired));
+    @expect(fails_with(verify_chain(chain[..], &roots, "example.test", time.date(2000, 1, 1, 0, 0, 0)!),
+                       error.NotYetValid));
+    let mut empty = CertPool.init();
+    defer empty.deinit();
+    @expect(fails_with(verify_chain(chain[..], &empty, "example.test", now), error.UnknownAuthority));
+    // name constraints
+    let mut good: [2]Certificate = [cert_of(GOOD_PEM[..])!, cert_of(CON_PEM[..])!];
+    defer good[0].deinit();
+    defer good[1].deinit();
+    verify_chain(good[..], &roots, "www.good.test", now)!;
+    let mut bad: [2]Certificate = [cert_of(BAD_PEM[..])!, cert_of(CON_PEM[..])!];
+    defer bad[0].deinit();
+    defer bad[1].deinit();
+    @expect(fails_with(verify_chain(bad[..], &roots, "www.evil.test", now), error.NameConstraint));
+    let mut nroots = CertPool.init();
+    defer nroots.deinit();
+    let nr = join(NC_ROOT_PEM[..])!;
+    defer mem.free(nr);
+    @expect_eq(nroots.add_pem(nr)!, 1);
+    let mut dot: [1]Certificate = [cert_of(NC_DOT_LEAF_PEM[..])!];
+    defer dot[0].deinit();
+    @expect(fails_with(verify_chain(dot[..], &nroots, "evil.test", time.date(2027, 1, 1, 0, 0, 0)!),
+                       error.NameConstraint));
+    @expect_eq(one_label_under("www.x.test", "x.test"), true);
+    @expect_eq(one_label_under("a.www.x.test", "x.test"), false);
+    @expect_eq(one_label_under("x.test", "x.test"), false);
+}
+
+test "private keys" {
+    let lk = join(LEAF_KEY[..])!;
+    defer mem.free(lk);
+    let mut k = parse_private_key_pem(lk)!;
+    defer k.deinit();
+    let mut leaf = cert_of(LEAF_PEM[..])!;
+    defer leaf.deinit();
+    match k {
+        .P256(p) => {
+            let mut pubk: [65]u8 = [0; 65];
+            p.public_key(pubk[..]);
+            @expect_eq(pubk[..], leaf.key.point);
+        }
+        else => { @trap(); }
+    }
+    let ek = join(ED_KEY[..])!;
+    defer mem.free(ek);
+    let mut e = parse_private_key_pem(ek)!;
+    let mut ed = cert_of(ED_PEM[..])!;
+    defer ed.deinit();
+    match e {
+        .Ed25519(s) => { @expect_eq(s.public[..], ed.key.point); }
+        else        => { @trap(); }
+    }
+    e.deinit();
+    let rk = join(ROOT_KEY[..])!;
+    defer mem.free(rk);
+    let mut r = parse_private_key_pem(rk)!;
+    defer r.deinit();
+    let mut root = cert_of(ROOT_PEM[..])!;
+    defer root.deinit();
+    match r {
+        .Rsa(s) => {
+            let mut digest: [32]u8 = [0; 32];
+            sha2.sha256("msg", digest[..]);
+            let mut sig: [256]u8 = [0; 256];
+            s.sign_pss(sha2.Algorithm.SHA256, digest[..], sig[..])!;
+            @expect(root.key.verify(SigAlg.RSA_PSS, sha2.Algorithm.SHA256, "msg", sig[..]));
+        }
+        else => { @trap(); }
+    }
+}

@@ -97,7 +97,7 @@ static Type *ct(Type *t) {
 }
 
 static void internal_error(const char *msg) {
-    fprintf(stderr, "phalange: internal compiler error: %s\n", msg);
+    fprintf(stderr, "axiom: internal compiler error: %s\n", msg);
     exit(2);
 }
 
@@ -244,9 +244,9 @@ static LLVMValueRef intr2(const char *name, LLVMValueRef a, LLVMValueRef b) {
 //
 // Every trap site has a constant record {code, file id, span, line, column,
 // file name, source text}. Before trapping, the helper stores the record's
-// address (and, for @expect_eq, the compared values) in phalange.trap_info,
-// which hosts read after the trap (wasm export phalange_trap_info; native
-// weak hook ph_on_trap). Going through one cold helper also keeps LLVM's fast
+// address (and, for @expect_eq, the compared values) in axiom.trap_info,
+// which hosts read after the trap (wasm export axiom_trap_info; native
+// weak hook ax_on_trap). Going through one cold helper also keeps LLVM's fast
 // instruction selector usable at -O0; -O1+ inlines it.
 // ---------------------------------------------------------------------------
 enum {
@@ -262,11 +262,11 @@ static LLVMValueRef trap_fn, trap_info, trap_hook;
 static LLVMTypeRef trap_fnty, site_ty;
 static SymMap site_map;
 
-// phalange.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
+// axiom.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
 static LLVMValueRef trap_info_global(void) {
     if (!trap_info) {
         LLVMTypeRef t = LLVMArrayType2(T_i64, 6);
-        trap_info = shared_global(t, "phalange.trap_info", LLVMConstNull(t), 0);
+        trap_info = shared_global(t, "axiom.trap_info", LLVMConstNull(t), 0);
         LLVMSetAlignment(trap_info, 8);
     }
     return trap_info;
@@ -378,7 +378,7 @@ static LLVMValueRef stack_limit_global;
 
 static LLVMValueRef stack_limit(void) {
     if (!stack_limit_global)
-        stack_limit_global = shared_global(T_isz, "phalange.stack_limit", usz(WASM_MAIN_STACK_LIMIT), 1);
+        stack_limit_global = shared_global(T_isz, "axiom.stack_limit", usz(WASM_MAIN_STACK_LIMIT), 1);
     return stack_limit_global;
 }
 
@@ -405,13 +405,13 @@ static void ss_globals(void) {
     LLVMTypeRef t = ss_type();
     if (!ss_global) {
         if (g_target.wasm) {
-            ss_main = shared_global(t, "phalange.ss.main", LLVMConstNull(t), 0);
+            ss_main = shared_global(t, "axiom.ss.main", LLVMConstNull(t), 0);
             LLVMSetAlignment(ss_main, 8);
             // null means the main thread's record (wasm-ld does not relocate
             // wasm global initializers); thread starts set their own.
-            ss_global = shared_global(T_ptr, "phalange.ss", LLVMConstNull(T_ptr), 1);
+            ss_global = shared_global(T_ptr, "axiom.ss", LLVMConstNull(T_ptr), 1);
         } else {
-            ss_global = shared_global(t, "phalange.ss", LLVMConstNull(t), 0);
+            ss_global = shared_global(t, "axiom.ss", LLVMConstNull(t), 0);
             LLVMSetThreadLocal(ss_global, true);
             LLVMSetThreadLocalMode(ss_global, LLVMInitialExecTLSModel);
             LLVMSetAlignment(ss_global, 8);
@@ -495,7 +495,7 @@ static void etrace_clear(void) {
 static void call_trap_site(LLVMValueRef site) {
     if (!trap_fn) {
         trap_fnty = LLVMFunctionType(T_void, &T_ptr, 1, false);
-        trap_fn = LLVMAddFunction(mod, "phalange.trap", trap_fnty);
+        trap_fn = LLVMAddFunction(mod, "axiom.trap", trap_fnty);
         LLVMSetLinkage(trap_fn, LLVMInternalLinkage);
         const char *attrs[] = {"noreturn", "cold", "nounwind", "noinline"};
         for (int i = 0; i < 4; i++) {
@@ -511,7 +511,7 @@ static void call_trap_site(LLVMValueRef site) {
             // Optional host hook (runtime/native_host.c, runtime/test_main.c).
             LLVMTypeRef ps[3] = {T_ptr, T_ptr, T_ptr};
             LLVMTypeRef hty = LLVMFunctionType(T_void, ps, 3, false);
-            trap_hook = LLVMAddFunction(mod, "ph_on_trap", hty);
+            trap_hook = LLVMAddFunction(mod, "ax_on_trap", hty);
             LLVMSetLinkage(trap_hook, LLVMExternalWeakLinkage);
             LLVMBasicBlockRef call_bb = LLVMAppendBasicBlockInContext(ctx, fn, "hook");
             LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(ctx, fn, "trap");
@@ -752,12 +752,12 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
     return LLVMConstNull(lty(t));
 }
 
-// Symbols are prefixed with the module's path (without .ph), which is unique
+// Symbols are prefixed with the module's path (without .ax), which is unique
 // within a build, so modules compiled separately never clash.
 static const char *mangle_prefix(Decl *d) {
     const char *base = d->module ? g_files.data[d->module->file->id]->display : "";
     size_t n = strlen(base);
-    if (n > 3 && strcmp(base + n - 3, ".ph") == 0) n -= 3;
+    if (n > 3 && strcmp(base + n - 3, ".ax") == 0) n -= 3;
     return arena_strndup(base, n);
 }
 
@@ -874,8 +874,8 @@ static const char *fn_display(Decl *d, Type **gargs, int n) {
 // The symbol of an exported function. On wasm (and in test binaries, which
 // have their own main) `main` is renamed; the export name is an attribute.
 static const char *export_symbol(Decl *d) {
-    if (g_sanitize_main && !g_test_mode && !strcmp(d->name, "main")) return "phalange.asan.main";
-    return (g_target.wasm || g_test_mode) && !strcmp(d->name, "main") ? "phalange.export.main" : d->name;
+    if (g_sanitize_main && !g_test_mode && !strcmp(d->name, "main")) return "axiom.asan.main";
+    return (g_target.wasm || g_test_mode) && !strcmp(d->name, "main") ? "axiom.export.main" : d->name;
 }
 
 // Globals live in the link unit when units are compiled separately (their
@@ -910,7 +910,7 @@ static LLVMValueRef shared_global(LLVMTypeRef t, const char *name, LLVMValueRef 
 static LLVMValueRef errcode_value(uint32_t code) {
     if (O->unit != CG_MODULE || code == 0 || (int)code > g_prog.error_names.len)
         return LLVMConstInt(T_i16, code, false);
-    const char *name = arena_printf("phalange.errcode.%s", g_prog.error_names.data[code - 1]);
+    const char *name = arena_printf("axiom.errcode.%s", g_prog.error_names.data[code - 1]);
     LLVMValueRef g = LLVMGetNamedGlobal(mod, name);
     if (!g) {
         g = LLVMAddGlobal(mod, T_i16, name);
@@ -1046,8 +1046,8 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
 
 // C ABI detail: integers narrower than 32 bits and bool are passed and
 // returned sign- or zero-extended. Marking every function (and indirect call)
-// this way makes any Phalange function with a scalar signature callable from
-// C, and C function pointers callable from Phalange (spec §14.5).
+// this way makes any Axiom function with a scalar signature callable from
+// C, and C function pointers callable from Axiom (spec §14.5).
 static void ext_attr(LLVMValueRef v, unsigned idx, Type *t, bool is_call) {
     const char *kind = NULL;
     t = ct(t);
@@ -1436,7 +1436,7 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
     return r;
 }
 
-// A function of runtime/rt.ph, which is loaded into every WebAssembly build:
+// A function of runtime/rt.ax, which is loaded into every WebAssembly build:
 // software versions of the operations WebAssembly has no instruction for
 // (@rem, and @fma, whose libm calls would have nothing to link against).
 static FnInst *rt_fn(const char *name) {
@@ -1445,9 +1445,9 @@ static FnInst *rt_fn(const char *name) {
         if (strcmp(d->name, name) != 0 || !d->module) continue;
         const char *f = g_files.data[d->module->file->id]->display;
         size_t n = strlen(f);
-        if (n >= 13 && !strcmp(f + n - 13, "runtime/rt.ph")) return get_inst(d, NULL, 0);
+        if (n >= 13 && !strcmp(f + n - 13, "runtime/rt.ax")) return get_inst(d, NULL, 0);
     }
-    fprintf(stderr, "phalange: internal error: runtime function %s not found (is runtime/rt.ph missing?)\n", name);
+    fprintf(stderr, "axiom: internal error: runtime function %s not found (is runtime/rt.ax missing?)\n", name);
     exit(3);
 }
 
@@ -1457,22 +1457,22 @@ static bool is_f32_type(LLVMTypeRef t) {
 }
 
 // --sanitize=address (spec §16.8): an access of `size` bytes at `addr` is
-// checked against std/mem.ph's shadow memory (mem.asan_check), trapping with
+// checked against std/mem.ax's shadow memory (mem.asan_check), trapping with
 // T0012 when it touches memory that is not allocated. The allocator itself
 // and the runtime are not checked.
 static bool asan_on(void) {
     if (!O->sanitize_address || !F || !F->decl || !F->decl->module) return false;
     const char *f = g_files.data[F->decl->module->file->id]->display;
-    return strcmp(f, "std/mem.ph") != 0 && strncmp(f, "runtime/", 8) != 0;
+    return strcmp(f, "std/mem.ax") != 0 && strncmp(f, "runtime/", 8) != 0;
 }
 
 static FnInst *mem_fn(const char *name) {
     for (int i = 0; i < g_prog.fns.len; i++) {
         Decl *d = g_prog.fns.data[i];
         if (strcmp(d->name, name) != 0 || !d->module) continue;
-        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ph")) return get_inst(d, NULL, 0);
+        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ax")) return get_inst(d, NULL, 0);
     }
-    fprintf(stderr, "phalange: internal error: std/mem.ph has no %s (is --std right?)\n", name);
+    fprintf(stderr, "axiom: internal error: std/mem.ax has no %s (is --std right?)\n", name);
     exit(3);
 }
 
@@ -1480,16 +1480,16 @@ static LLVMValueRef mem_global(const char *name) {
     for (int i = 0; i < g_prog.globals.len; i++) {
         Decl *d = g_prog.globals.data[i];
         if (strcmp(d->name, name) != 0 || !d->module) continue;
-        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ph")) return global_ref(d);
+        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ax")) return global_ref(d);
     }
-    fprintf(stderr, "phalange: internal error: std/mem.ph has no %s (is --std right?)\n", name);
+    fprintf(stderr, "axiom: internal error: std/mem.ax has no %s (is --std right?)\n", name);
     exit(3);
 }
 
 // The check is inline for the common cases: an access of at most 8 bytes
 // within one granule of tracked (heap) memory whose shadow byte is 0, or an
 // access within one 64 KiB page that the sanitizer does not track (stack,
-// globals). It walks std/mem.ph's shadow tables (as_base, as_l1, then the
+// globals). It walks std/mem.ax's shadow tables (as_base, as_l1, then the
 // page's table and its shadow bytes) and calls mem.asan_check, which
 // reports, only when that fails.
 static void asan_check(LLVMValueRef addr, LLVMValueRef size) {
@@ -2148,7 +2148,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         if (!g_target.wasm) {
             LLVMTypeRef fty;
             LLVMTypeRef ps[2] = {T_isz, T_isz};
-            LLVMValueRef f = native_rt_fn("ph_memory_discard", T_void, ps, 2, &fty);
+            LLVMValueRef f = native_rt_fn("ax_memory_discard", T_void, ps, 2, &fty);
             LLVMBuildCall2(B, fty, f, args, 2, "");
         }
         return NULL;
@@ -2179,7 +2179,7 @@ static LLVMValueRef native_rt_fn(const char *name, LLVMTypeRef ret, LLVMTypeRef 
 }
 
 // @expect_eq(a, b): on failure, record both values (and how to show them) in
-// phalange.trap_info before trapping. kind: 1 signed, 2 unsigned, 3 float,
+// axiom.trap_info before trapping. kind: 1 signed, 2 unsigned, 3 float,
 // 4 bool, 5 bytes ([]u8), 6 error, 7 address.
 static void store_info(int slot, LLVMValueRef v) { LLVMBuildStore(B, v, trap_info_slot(slot)); }
 
@@ -2298,7 +2298,7 @@ static LLVMValueRef gen_atomic(Expr *e) {
             return intrinsic("llvm.wasm.memory.atomic.wait32", NULL, 0, args, 3);
         }
         LLVMTypeRef ps[3] = {T_ptr, T_i32, T_i64}, fty;
-        LLVMValueRef f = native_rt_fn("ph_wait32", T_i32, ps, 3, &fty);
+        LLVMValueRef f = native_rt_fn("ax_wait32", T_i32, ps, 3, &fty);
         LLVMValueRef args[3] = {p, expv, timeout};
         return LLVMBuildCall2(B, fty, f, args, 3, "");
     }
@@ -2309,7 +2309,7 @@ static LLVMValueRef gen_atomic(Expr *e) {
             return intrinsic("llvm.wasm.memory.atomic.notify", NULL, 0, args, 2);
         }
         LLVMTypeRef ps[2] = {T_ptr, T_i32}, fty;
-        LLVMValueRef f = native_rt_fn("ph_notify32", T_i32, ps, 2, &fty);
+        LLVMValueRef f = native_rt_fn("ax_notify32", T_i32, ps, 2, &fty);
         LLVMValueRef args[2] = {p, count};
         return LLVMBuildCall2(B, fty, f, args, 2, "");
     }
@@ -2340,10 +2340,10 @@ static LLVMValueRef gen_atomic(Expr *e) {
 static void emit_thread_start(void) {
     LLVMTypeRef ps[3] = {T_ptr, T_ptr, T_ptr};
     LLVMTypeRef fty = LLVMFunctionType(T_void, ps, 3, false);
-    LLVMValueRef fn = LLVMAddFunction(mod, "phalange_thread_start", fty);
+    LLVMValueRef fn = LLVMAddFunction(mod, "axiom_thread_start", fty);
     LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
-                            LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "phalange_thread_start", 21));
-    vec_push(g_export_names, intern_cstr("phalange_thread_start"));
+                            LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "axiom_thread_start", 21));
+    vec_push(g_export_names, intern_cstr("axiom_thread_start"));
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
     LLVMPositionBuilderAtEnd(B, bb);
@@ -2384,22 +2384,22 @@ static LLVMValueRef error_name_table(void) {
         vs[i + 1] = const_slice(string_ptr(s, (uint32_t)strlen(s)), (int64_t)strlen(s));
     }
     LLVMTypeRef st = lty(type_slice(t_u8, false));
-    g_errtab = LLVMAddGlobal(mod, LLVMArrayType2(st, (uint64_t)n + 1), "phalange.error_names");
+    g_errtab = LLVMAddGlobal(mod, LLVMArrayType2(st, (uint64_t)n + 1), "axiom.error_names");
     LLVMSetInitializer(g_errtab, LLVMConstArray2(st, vs, (uint64_t)n + 1));
     LLVMSetLinkage(g_errtab, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(g_errtab, true);
     return g_errtab;
 }
 
-// phalange.error_name(code) []u8: the name table lives with the error codes
+// axiom.error_name(code) []u8: the name table lives with the error codes
 // (in the link unit when units are compiled separately).
 static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out) {
     LLVMTypeRef st = lty(type_slice(t_u8, false));
     LLVMTypeRef fty = LLVMFunctionType(st, &T_i16, 1, false);
     *fty_out = fty;
-    LLVMValueRef f = LLVMGetNamedFunction(mod, "phalange.error_name");
+    LLVMValueRef f = LLVMGetNamedFunction(mod, "axiom.error_name");
     if (f) return f;
-    f = LLVMAddFunction(mod, "phalange.error_name", fty);
+    f = LLVMAddFunction(mod, "axiom.error_name", fty);
     if (O->unit == CG_MODULE) return f;
     if (O->unit == CG_WHOLE) LLVMSetLinkage(f, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
@@ -2415,7 +2415,7 @@ static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out) {
 }
 
 // Linear memory growth. On wasm these are the real instructions; on native
-// targets the runtime (ph_memory_size, ph_memory_grow) commits 64 KiB pages of
+// targets the runtime (ax_memory_size, ax_memory_grow) commits 64 KiB pages of
 // one large reserved region, so linear memory is contiguous there too.
 static LLVMValueRef mem_size(void) {
     if (g_target.wasm) {
@@ -2423,7 +2423,7 @@ static LLVMValueRef mem_size(void) {
         return intrinsic("llvm.wasm.memory.size", &T_isz, 1, &zero, 1);
     }
     LLVMTypeRef fty;
-    LLVMValueRef f = native_rt_fn("ph_memory_size", T_isz, NULL, 0, &fty);
+    LLVMValueRef f = native_rt_fn("ax_memory_size", T_isz, NULL, 0, &fty);
     return LLVMBuildCall2(B, fty, f, NULL, 0, "");
 }
 
@@ -2434,7 +2434,7 @@ static LLVMValueRef mem_grow(LLVMValueRef pages) {
     }
     LLVMTypeRef fty;
     LLVMTypeRef ps[1] = {T_isz};
-    LLVMValueRef f = native_rt_fn("ph_memory_grow", T_isz, ps, 1, &fty);
+    LLVMValueRef f = native_rt_fn("ax_memory_grow", T_isz, ps, 1, &fty);
     return LLVMBuildCall2(B, fty, f, &pages, 1, "");
 }
 
@@ -3034,7 +3034,7 @@ static bool setup_target(void) {
         LLVMInitializeNativeAsmPrinter();
     }
     if (LLVMGetTargetFromTriple(triple, &target, &err)) {
-        fprintf(stderr, "phalange: cannot find LLVM target '%s': %s\n", triple, err);
+        fprintf(stderr, "axiom: cannot find LLVM target '%s': %s\n", triple, err);
         LLVMDisposeMessage(err);
         return false;
     }
@@ -3119,11 +3119,11 @@ static void emit_asan_main(void) {
     FnInst *fi = get_inst(user_main, NULL, 0);
     LLVMTypeRef ps[2] = {T_i32, T_ptr};
     LLVMTypeRef fty = LLVMFunctionType(T_i32, ps, 2, false);
-    LLVMValueRef fn = LLVMAddFunction(mod, g_target.wasm ? "phalange.export.main" : "main", fty);
+    LLVMValueRef fn = LLVMAddFunction(mod, g_target.wasm ? "axiom.export.main" : "main", fty);
     if (g_target.wasm) {
         LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
                                 LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "main", 4));
-        vec_push(g_export_names, intern_cstr("phalange.export.main"));
+        vec_push(g_export_names, intern_cstr("axiom.export.main"));
     }
     LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
     unsigned np = LLVMCountParamTypes(fi->llty);
@@ -3140,29 +3140,29 @@ static void emit_asan_main(void) {
     LLVMBuildRet(B, c);
 }
 
-// phalange_shadow_stack(): the calling thread's shadow stack record (see
+// axiom_shadow_stack(): the calling thread's shadow stack record (see
 // ss_ptr), or null when built with --stack-traces=off.
 static void emit_shadow_stack_export(void) {
-    add_export("phalange_shadow_stack", T_ptr, NULL, 0);
+    add_export("axiom_shadow_stack", T_ptr, NULL, 0);
     LLVMBuildRet(B, stack_traces_on() ? ss_ptr() : LLVMConstNull(T_ptr));
 }
 
-// phalange_trap_info(): address of {site, kind, a, b, alen, blen} (64-bit
+// axiom_trap_info(): address of {site, kind, a, b, alen, blen} (64-bit
 // fields); `site` points at {code, file_id, start, end, line, col, file, text}.
 static void emit_trap_info_export(void) {
-    add_export("phalange_trap_info", T_ptr, NULL, 0);
+    add_export("axiom_trap_info", T_ptr, NULL, 0);
     LLVMBuildRet(B, trap_info_global());
 }
 
 // Test binaries (spec §17): tests are listed and run through exports.
-//   phalange_test_count() u32
-//   phalange_test_name(i) *u8        NUL-terminated
-//   phalange_test_expect(i) i32      -1 must not trap, -2 any trap, n: trap Tn
-//   phalange_test_run(i) u32         0, or the error code the test returned
-//   phalange_error_name(code) *u8    NUL-terminated
+//   axiom_test_count() u32
+//   axiom_test_name(i) *u8        NUL-terminated
+//   axiom_test_expect(i) i32      -1 must not trap, -2 any trap, n: trap Tn
+//   axiom_test_run(i) u32         0, or the error code the test returned
+//   axiom_error_name(code) *u8    NUL-terminated
 static void emit_test_exports(void) {
     int n = g_prog.tests.len;
-    LLVMValueRef c = add_export("phalange_test_count", T_i32, NULL, 0);
+    LLVMValueRef c = add_export("axiom_test_count", T_i32, NULL, 0);
     (void)c;
     LLVMBuildRet(B, LLVMConstInt(T_i32, (unsigned)n, false));
 
@@ -3172,25 +3172,25 @@ static void emit_test_exports(void) {
         names[i] = string_ptr(d->test_name, (uint32_t)strlen(d->test_name));
         expects[i] = LLVMConstInt(T_i32, (unsigned long long)(int64_t)d->test_trap, true);
     }
-    LLVMValueRef ntab = LLVMAddGlobal(mod, LLVMArrayType2(T_ptr, (uint64_t)n + 1), "phalange.test_names");
+    LLVMValueRef ntab = LLVMAddGlobal(mod, LLVMArrayType2(T_ptr, (uint64_t)n + 1), "axiom.test_names");
     names[n] = LLVMConstNull(T_ptr);
     LLVMSetInitializer(ntab, LLVMConstArray2(T_ptr, names, (uint64_t)n + 1));
     LLVMSetLinkage(ntab, LLVMPrivateLinkage);
-    LLVMValueRef etab = LLVMAddGlobal(mod, LLVMArrayType2(T_i32, (uint64_t)n + 1), "phalange.test_expect");
+    LLVMValueRef etab = LLVMAddGlobal(mod, LLVMArrayType2(T_i32, (uint64_t)n + 1), "axiom.test_expect");
     expects[n] = LLVMConstInt(T_i32, 0, false);
     LLVMSetInitializer(etab, LLVMConstArray2(T_i32, expects, (uint64_t)n + 1));
     LLVMSetLinkage(etab, LLVMPrivateLinkage);
 
     LLVMTypeRef pi = T_i32;
-    LLVMValueRef f = add_export("phalange_test_name", T_ptr, &pi, 1);
+    LLVMValueRef f = add_export("axiom_test_name", T_ptr, &pi, 1);
     LLVMValueRef ix[2] = {LLVMConstInt(T_i32, 0, false), LLVMGetParam(f, 0)};
     LLVMBuildRet(B, LLVMBuildLoad2(B, T_ptr, LLVMBuildGEP2(B, LLVMArrayType2(T_ptr, (uint64_t)n + 1), ntab, ix, 2, ""), ""));
-    f = add_export("phalange_test_expect", T_i32, &pi, 1);
+    f = add_export("axiom_test_expect", T_i32, &pi, 1);
     ix[1] = LLVMGetParam(f, 0);
     LLVMBuildRet(B, LLVMBuildLoad2(B, T_i32, LLVMBuildGEP2(B, LLVMArrayType2(T_i32, (uint64_t)n + 1), etab, ix, 2, ""), ""));
 
-    // phalange_test_run: a switch over the test functions.
-    LLVMValueRef run = add_export("phalange_test_run", T_i32, &pi, 1);
+    // axiom_test_run: a switch over the test functions.
+    LLVMValueRef run = add_export("axiom_test_run", T_i32, &pi, 1);
     LLVMBasicBlockRef dflt = LLVMAppendBasicBlockInContext(ctx, run, "none");
     LLVMValueRef sw = LLVMBuildSwitch(B, LLVMGetParam(run, 0), dflt, (unsigned)n);
     for (int i = 0; i < n; i++) {
@@ -3204,7 +3204,7 @@ static void emit_test_exports(void) {
     LLVMPositionBuilderAtEnd(B, dflt);
     LLVMBuildRet(B, LLVMConstInt(T_i32, 0xFFFF, false));
 
-    LLVMValueRef en = add_export("phalange_error_name", T_ptr, &pi, 1);
+    LLVMValueRef en = add_export("axiom_error_name", T_ptr, &pi, 1);
     LLVMValueRef tab = error_name_table();
     int ne = g_prog.error_names.len;
     LLVMValueRef code = LLVMBuildZExt(B, LLVMGetParam(en, 0), T_isz, "");
@@ -3263,7 +3263,7 @@ bool codegen_program(CgOptions *o) {
         // The link unit: globals, error codes and names.
         for (int i = 0; i < g_prog.globals.len; i++) global_ref(g_prog.globals.data[i]);
         for (int i = 0; i < g_prog.error_names.len; i++) {
-            LLVMValueRef g = LLVMAddGlobal(mod, T_i16, arena_printf("phalange.errcode.%s", g_prog.error_names.data[i]));
+            LLVMValueRef g = LLVMAddGlobal(mod, T_i16, arena_printf("axiom.errcode.%s", g_prog.error_names.data[i]));
             LLVMSetInitializer(g, LLVMConstInt(T_i16, (unsigned long long)i + 1, false));
             LLVMSetGlobalConstant(g, true);
         }
@@ -3289,15 +3289,15 @@ bool codegen_program(CgOptions *o) {
 
     char *err = NULL;
     if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &err)) {
-        fprintf(stderr, "phalange: internal compiler error: invalid LLVM IR generated:\n%s\n", err);
+        fprintf(stderr, "axiom: internal compiler error: invalid LLVM IR generated:\n%s\n", err);
         LLVMDisposeMessage(err);
-        if (getenv("PHALANGE_DUMP_IR")) LLVMPrintModuleToFile(mod, getenv("PHALANGE_DUMP_IR"), NULL);
+        if (getenv("AXIOM_DUMP_IR")) LLVMPrintModuleToFile(mod, getenv("AXIOM_DUMP_IR"), NULL);
         return false;
     }
     LLVMDisposeMessage(err);
     // At -O0 a very cheap cleanup (promote locals to SSA, merge trivial
     // blocks) makes the backend faster than skipping it.
-    const char *o0_pipeline = getenv("PHALANGE_O0_PIPELINE");
+    const char *o0_pipeline = getenv("AXIOM_O0_PIPELINE");
     if (!o0_pipeline) o0_pipeline = "function(mem2reg,simplifycfg)";
     if (!*o0_pipeline) o0_pipeline = NULL;
     if (O->opt_level > 0 || o0_pipeline) {
@@ -3307,21 +3307,21 @@ bool codegen_program(CgOptions *o) {
         LLVMDisposePassBuilderOptions(po);
         if (pe) {
             char *m = LLVMGetErrorMessage(pe);
-            fprintf(stderr, "phalange: optimization failed: %s\n", m);
+            fprintf(stderr, "axiom: optimization failed: %s\n", m);
             LLVMDisposeErrorMessage(m);
             return false;
         }
     }
     if (O->emit == EMIT_LLVM) {
         if (LLVMPrintModuleToFile(mod, O->out_path, &err)) {
-            fprintf(stderr, "phalange: cannot write %s: %s\n", O->out_path, err);
+            fprintf(stderr, "axiom: cannot write %s: %s\n", O->out_path, err);
             return false;
         }
         return true;
     }
     if (LLVMTargetMachineEmitToFile(TM, mod, (char *)O->out_path, O->emit == EMIT_ASM ? LLVMAssemblyFile : LLVMObjectFile,
                                     &err)) {
-        fprintf(stderr, "phalange: code generation failed: %s\n", err);
+        fprintf(stderr, "axiom: code generation failed: %s\n", err);
         LLVMDisposeMessage(err);
         return false;
     }

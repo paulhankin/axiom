@@ -1,6 +1,6 @@
 // units.h - separate compilation of modules, with an object cache (spec §16.7).
-#ifndef PH_UNITS_H
-#define PH_UNITS_H
+#ifndef AX_UNITS_H
+#define AX_UNITS_H
 
 #include "codegen.h"
 

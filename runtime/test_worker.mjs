@@ -25,19 +25,19 @@ const cstr = (p) => {
 const ex = instance.exports;
 
 if (list) {
-  const n = ex.phalange_test_count();
+  const n = ex.axiom_test_count();
   const names = [];
-  for (let i = 0; i < n; i++) names.push(cstr(ex.phalange_test_name(i) >>> 0));
+  for (let i = 0; i < n; i++) names.push(cstr(ex.axiom_test_name(i) >>> 0));
   parentPort.postMessage(names);
 } else {
-  const expect = ex.phalange_test_expect(index);
+  const expect = ex.axiom_test_expect(index);
   // a trap in one of the test's threads is reported by that thread
   hostOpts.testTrap = { channel: trapChannel, expect };
   let r;
   try {
-    const code = ex.phalange_test_run(index) >>> 0;
+    const code = ex.axiom_test_run(index) >>> 0;
     if (code !== 0) {
-      r = { status: 'fail', code: 'error', message: `test returned error.${cstr(ex.phalange_error_name(code) >>> 0)}` };
+      r = { status: 'fail', code: 'error', message: `test returned error.${cstr(ex.axiom_error_name(code) >>> 0)}` };
       const st = readStack(instance, mem());
       if (st) r.stack = st.errors.map((e) => `E\x1f${e.fileId}\x1f${e.start}\x1f${e.end}\x1f${e.fn}\x1e`).join('');
     } else if (expect !== -1) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generates std/graphics/pdf/tables.ph for std/graphics/pdf/read: the simple-font encodings
+# Generates std/graphics/pdf/tables.ax for std/graphics/pdf/read: the simple-font encodings
 # (WinAnsi, MacRoman, Standard), PDFDocEncoding, and the Adobe Glyph List
 # (glyph name to Unicode, the legacy list that old fonts use too). Needs fontTools (pip install fonttools).
 import os
@@ -8,7 +8,7 @@ from fontTools import agl
 from fontTools.encodings.StandardEncoding import StandardEncoding
 from fontTools.encodings.MacRoman import MacRoman
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'graphics', 'pdf', 'tables.ph')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'std', 'graphics', 'pdf', 'tables.ax')
 
 
 def by_name(names):
@@ -78,7 +78,7 @@ os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, 'w') as f:
     f.write('\n\n'.join(parts) + '\n')
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-exe = os.path.join(root, 'selfhost/build/phalange')
+exe = os.path.join(root, 'selfhost/build/axiom')
 if os.path.exists(exe):
     subprocess.run([exe, 'fmt', OUT], check=True)
 print('%d glyph names -> %s' % (len(names), OUT))

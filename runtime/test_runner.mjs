@@ -1,10 +1,10 @@
-// runtime/test_runner.mjs - runs the tests of a Phalange test binary (wasm),
+// runtime/test_runner.mjs - runs the tests of a Axiom test binary (wasm),
 // each in a fresh instance in its own worker, several in parallel.
 //
 //   node runtime/test_runner.mjs tests.wasm [--filter=text] [--timeout=ms]
 //
-// Prints one line per test in the protocol read by `phalange test`:
-//   PHT <index> <status> <code> <file_id> <start> <end> <ms> <message> <output> <stack>
+// Prints one line per test in the protocol read by `axiom test`:
+//   AXT <index> <status> <code> <file_id> <start> <end> <ms> <message> <output> <stack>
 // (<stack>: see test_main.c, encode_stack)
 // (tab-separated; tabs, newlines and backslashes in fields are escaped).
 import fs from 'fs';
@@ -35,7 +35,7 @@ function runOne(index) {
     const t0 = Date.now();
     // A trap in one of the test's threads arrives here (the test's own
     // thread may be blocked waiting for it).
-    const trapChannel = `phalange-test-${process.pid}-${index}`;
+    const trapChannel = `axiom-test-${process.pid}-${index}`;
     const bc = new BroadcastChannel(trapChannel);
     const w = new Worker(new URL('./test_worker.mjs', import.meta.url), { workerData: { bytes, index, trapChannel } });
     let done = false;
@@ -65,7 +65,7 @@ await Promise.all(Array.from({ length: width }, pool));
 
 for (const i of selected) {
   const r = results.get(i);
-  process.stdout.write(['PHT', i, r.status, r.code || '', r.fileId ?? -1, r.start ?? 0, r.end ?? 0, r.ms,
+  process.stdout.write(['AXT', i, r.status, r.code || '', r.fileId ?? -1, r.start ?? 0, r.end ?? 0, r.ms,
     esc(r.message), esc(r.output), esc(r.stack)].join('\t') + '\n');
 }
 module; // (compiled once above to validate the file early)

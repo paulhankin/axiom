@@ -1,0 +1,231 @@
+// =============================================================================
+// lstub.ax - the functions the linker provides to every native program: the
+// Linux system call interface, which Axiom code cannot express, as a few
+// lines of machine code per architecture (runtime/linux.ax wraps them).
+//
+//   ax_syscall(n, a, b, c, d, e, f) isize    one system call; -errno on failure
+//   ax_thread_create(f, arg, stack_top, tls, ctid) isize
+//                          clone(): the new thread runs f(arg) on stack_top
+//                          with thread pointer tls, then exits; the kernel
+//                          clears *ctid (and wakes it) once the thread is gone
+//   ax_sigreturn()         the signal-return trampoline (SA_RESTORER)
+//   ax_start_sp() usize    the stack pointer at entry (argc, argv, envp, auxv)
+//   ax_tls_info() *u64     [template address, template size, memory size,
+//                          alignment] of the thread-local storage block
+//   ax_libc_linked() i32   1 if the program is linked against the C library
+//   memcpy, memmove, memset (AArch64, whose code generator calls them)
+//
+// A program that needs nothing else is linked statically, with its own
+// _start (elink.ax). One that uses the C library (extern "C" functions, C
+// sources, -l) is linked against it as before; the runtime then creates
+// threads with pthread_create, which only exists then: in a static program
+// those names are stubs that fail.
+// =============================================================================
+import "elf.ax" as elf;
+import "util.ax" as u;
+
+// The C library functions the runtime uses when it is linked (and only then).
+pub fn libc_only(name: []u8) bool {
+    let names = ["pthread_create", "pthread_attr_init", "pthread_attr_setdetachstate", "pthread_attr_destroy",
+                 "__libc_start_main"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is `name` defined by the stubs?
+pub fn provides(name: []u8, machine: u32) bool {
+    let names = ["ax_syscall", "ax_thread_create", "ax_sigreturn", "ax_start_sp", "ax_tls_info", "ax_libc_linked"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    if machine == elf.EM_AARCH64 {
+        return u.str_eq(name, "memcpy") or u.str_eq(name, "memmove") or u.str_eq(name, "memset");
+    }
+    return false;
+}
+
+fn func(o: *mut elf.Obj, text: i32, name: []u8) u64 {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    s.data.align(16);
+    let at = @as(u64, s.data.len());
+    _ = elf.add_sym(o, elf.Sym.{ name: name, sec: text, value: at, size: 0, bind: elf.B_GLOBAL, ty: elf.T_FUNC,
+                                 hidden: false });
+    return at;
+}
+
+fn words(o: *mut elf.Obj, text: i32, ws: []u64) void {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    for w in ws {
+        s.data.u32_(w);
+    }
+}
+
+fn bytes(o: *mut elf.Obj, text: i32, b: []u8) void {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    s.data.put(b);
+}
+
+fn reloc(o: *mut elf.Obj, text: i32, off: u64, ty: u32, sym: u32, addend: i64) void {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    s.relocs.push(elf.Rel.{ off: off, ty: ty, sym: sym, addend: addend });
+}
+
+// The stub object. `static` programs also get failing pthread functions.
+pub fn build(machine: u32, static: bool) *mut elf.Obj {
+    let o = elf.new_obj(machine);
+    let text = elf.add_sec(o, ".text.axiom", elf.S_TEXT, 16);
+    let data = elf.add_sec(o, ".data.axiom", elf.S_DATA, 16);
+    o.secs.get(@as(usize, @bit_cast(u32, data))).data.zeros(48);
+    let sp_sym = elf.add_sym(o, elf.Sym.{ name: "axiom.start_sp", sec: data, value: 0, size: 8, bind: elf.B_GLOBAL,
+                                          ty: elf.T_OBJECT, hidden: false });
+    let tls_sym = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_info", sec: data, value: 16, size: 32,
+                                           bind: elf.B_GLOBAL, ty: elf.T_OBJECT, hidden: false });
+    let mut linked: u64 = 1;
+    if static {
+        linked = 0;
+    }
+    if machine == elf.EM_X86_64 {
+        // rax = n; rdi, rsi, rdx, r10, r8, r9 = a..f (f from the stack)
+        _ = func(o, text, "ax_syscall");
+        bytes(o, text,
+              "\x48\x89\xf8\x48\x89\xf7\x48\x89\xd6\x48\x89\xca\x4d\x89\xc2\x4d\x89\xc8\x4c\x8b\x4c\x24\x08\x0f\x05\xc3");
+        // clone(CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM | SETTLS |
+        // CHILD_CLEARTID, stack, 0, ctid, tls); the child pops f and arg
+        _ = func(o, text, "ax_thread_create");
+        bytes(o, text, "\x48\x83\xea\x10\x48\x89\x3a\x48\x89\x72\x08\x4d\x89\xc2\x49\x89\xc8\x48\x89\xd6\x31\xd2");
+        bytes(o, text, "\xbf\x00\x0f\x2d\x00\xb8\x38\x00\x00\x00\x0f\x05\x48\x85\xc0\x75\x17");
+        bytes(o, text,
+              "\x31\xed\x48\x8b\x04\x24\x48\x8b\x7c\x24\x08\xff\xd0\x31\xff\xb8\x3c\x00\x00\x00\x0f\x05\xf4\xc3");
+        _ = func(o, text, "ax_sigreturn");
+        bytes(o, text, "\xb8\x0f\x00\x00\x00\x0f\x05\xf4");
+        let a = func(o, text, "ax_start_sp");
+        bytes(o, text, "\x48\x8b\x05\x00\x00\x00\x00\xc3");  // mov rax, [rip + start_sp]
+        reloc(o, text, a + 3, elf.R_X86_64_PC32, sp_sym, -4);
+        let b = func(o, text, "ax_tls_info");
+        bytes(o, text, "\x48\x8d\x05\x00\x00\x00\x00\xc3");  // lea rax, [rip + tls_info]
+        reloc(o, text, b + 3, elf.R_X86_64_PC32, tls_sym, -4);
+        _ = func(o, text, "ax_libc_linked");
+        bytes(o, text, "\xb8");
+        o.secs.get(@as(usize, @bit_cast(u32, text))).data.u32_(linked);
+        bytes(o, text, "\xc3");
+        if static {
+            let fails = ["pthread_create", "pthread_attr_init", "pthread_attr_setdetachstate", "pthread_attr_destroy"];
+            for f in fails {
+                _ = func(o, text, f);
+                bytes(o, text, "\xb8\x26\x00\x00\x00\xc3");  // return ENOSYS
+            }
+        }
+        return o;
+    }
+    // AArch64: x8 = n; x0..x5 = a..f
+    _ = func(o, text, "ax_syscall");
+    let sc: [9]u64 = [0xAA0003E8, 0xAA0103E0, 0xAA0203E1, 0xAA0303E2, 0xAA0403E3, 0xAA0503E4, 0xAA0603E5, 0xD4000001,
+                      0xD65F03C0];
+    words(o, text, sc[..]);
+    // stack -= 16; [stack] = f, arg; clone(flags, stack, 0, tls, ctid)
+    _ = func(o, text, "ax_thread_create");
+    let tc: [18]u64 = [0xD1004042, 0xA9000440, 0xAA0203E1, 0xD281E000, 0xF2A005A0, 0xAA1F03E2, 0xD2801B88, 0xD4000001,
+                       0xB5000120, 0xA94003E9, 0xAA1F03FD, 0xAA1F03FE, 0xD63F0120, 0xAA1F03E0, 0xD2800BA8, 0xD4000001,
+                       0xD4200000, 0xD65F03C0];
+    words(o, text, tc[..]);
+    _ = func(o, text, "ax_sigreturn");
+    let sr: [3]u64 = [0xD2801168, 0xD4000001, 0xD4200000];
+    words(o, text, sr[..]);
+    let a = func(o, text, "ax_start_sp");
+    let ss: [3]u64 = [0x90000000, 0xF9400000, 0xD65F03C0];  // adrp x0; ldr x0, [x0, lo12]; ret
+    words(o, text, ss[..]);
+    reloc(o, text, a, elf.R_AARCH64_ADR_PREL_PG_HI21, sp_sym, 0);
+    reloc(o, text, a + 4, elf.R_AARCH64_LDST64_ABS_LO12_NC, sp_sym, 0);
+    let b = func(o, text, "ax_tls_info");
+    let ti: [3]u64 = [0x90000000, 0x91000000, 0xD65F03C0];  // adrp x0; add x0, x0, lo12; ret
+    words(o, text, ti[..]);
+    reloc(o, text, b, elf.R_AARCH64_ADR_PREL_PG_HI21, tls_sym, 0);
+    reloc(o, text, b + 4, elf.R_AARCH64_ADD_ABS_LO12_NC, tls_sym, 0);
+    _ = func(o, text, "ax_libc_linked");
+    let ll: [2]u64 = [0x52800000 | (linked << 5), 0xD65F03C0];  // mov w0, #linked; ret
+    words(o, text, ll[..]);
+    // memmove: forward (into memcpy, which follows) unless dst lies inside src
+    _ = func(o, text, "memmove");
+    let mm: [12]u64 = [0xEB01001F, 0x54000169, 0x8B020029, 0xEB09001F, 0x54000102, 0x8B020003, 0xB40000A2, 0x385FFD24,
+                       0x381FFC64, 0xD1000442, 0x17FFFFFC, 0xD65F03C0];
+    words(o, text, mm[..]);
+    // memcpy: 16 bytes at a time, then bytes (memmove falls into it: no padding)
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    _ = elf.add_sym(o, elf.Sym.{ name: "memcpy", sec: text, value: @as(u64, s.data.len()), size: 0, bind: elf.B_GLOBAL,
+                                 ty: elf.T_FUNC, hidden: false });
+    let mc: [13]u64 = [0xAA0003E3, 0xF100405F, 0x540000A3, 0xA8C11424, 0xA8811464, 0xD1004042, 0x17FFFFFB, 0xB40000A2,
+                       0x38401424, 0x38001464, 0xD1000442, 0x17FFFFFC, 0xD65F03C0];
+    words(o, text, mc[..]);
+    // memset: the byte repeated in a register, 16 bytes at a time, then bytes
+    _ = func(o, text, "memset");
+    let ms: [17]u64 = [0xAA0003E3, 0x12001C21, 0xD2802025, 0xF2A02025, 0xF2C02025, 0xF2E02025, 0x9B057C24, 0xF100405F,
+                       0x54000083, 0xA8811064, 0xD1004042, 0x17FFFFFC, 0xB4000082, 0x38001461, 0xD1000442, 0x17FFFFFD,
+                       0xD65F03C0];
+    words(o, text, ms[..]);
+    if static {
+        let fails = ["pthread_create", "pthread_attr_init", "pthread_attr_setdetachstate", "pthread_attr_destroy"];
+        for f in fails {
+            _ = func(o, text, f);
+            let en: [2]u64 = [0x528004C0, 0xD65F03C0];  // mov w0, #38 (ENOSYS); ret
+            words(o, text, en[..]);
+        }
+    }
+    return o;
+}
+
+// The static program's entry: saves the stack pointer, sets the thread
+// pointer (arch_prctl / tpidr_el0), calls main(argc, argv), exits with its
+// result. `code` receives the bytes; addresses are absolute.
+pub fn write_start(b: []mut u8, fo: u64, start: u64, sp_word: u64, tp: u64, main_addr: u64, machine: u32) void {
+    if machine == elf.EM_X86_64 {
+        let code =
+            "\x31\xed\x48\x89\xe0\x48\x89\x05\x00\x00\x00\x00\x48\x8d\x35\x00\x00\x00\x00\x48\x89\x36\xbf\x02\x10\x00\x00\xb8\x9e\x00\x00\x00\x0f\x05\x48\x8b\x3c\x24\x48\x8d\x74\x24\x08\x48\x83\xe4\xf0\xe8\x00\x00\x00\x00\x89\xc7\xb8\xe7\x00\x00\x00\x0f\x05\xf4";
+        let base = @truncate(usize, fo);
+        for i in 0..code.len {
+            b[base + i] = code[i];
+        }
+        w32(b, fo + 8, (sp_word -% (start + 12)) & 0xFFFF_FFFF);
+        w32(b, fo + 15, (tp -% (start + 19)) & 0xFFFF_FFFF);
+        w32(b, fo + 48, (main_addr -% (start + 52)) & 0xFFFF_FFFF);
+        return;
+    }
+    let ws: [14]u64 = [0xAA1F03FD, 0xAA1F03FE, 0x910003E0, 0x90000001, 0xF9000020, 0x90000001, 0x91000021, 0xD51BD041,
+                       0xF94003E0, 0x910023E1, 0x94000000, 0xD2800BC8, 0xD4000001, 0xD4200000];
+    for i in @as(usize, 0)..14 {
+        w32(b, fo + (@as(u64, i) * 4), ws[i]);
+    }
+    adrp(b, fo + 12, start + 12, sp_word);
+    or32(b, fo + 16, ((sp_word & 0xfff) >> 3) << 10);  // str x0, [x1, lo12]
+    adrp(b, fo + 20, start + 20, tp);
+    or32(b, fo + 24, (tp & 0xfff) << 10);  // add x1, x1, lo12
+    let d = @bit_cast(i64, main_addr -% (start + 40)) >> 2;
+    or32(b, fo + 40, @bit_cast(u64, d) & 0x3FF_FFFF);
+}
+
+fn w32(b: []mut u8, off: u64, x: u64) void {
+    let o = @truncate(usize, off);
+    for i in @as(usize, 0)..4 {
+        b[o + i] = @truncate(u8, x >> @truncate(u32, i * 8));
+    }
+}
+
+fn or32(b: []mut u8, off: u64, x: u64) void {
+    let o = @truncate(usize, off);
+    let v = @as(u64, b[o]) | (@as(u64, b[o + 1]) << 8) | (@as(u64, b[o + 2]) << 16) | (@as(u64, b[o + 3]) << 24);
+    w32(b, off, v | x);
+}
+
+fn adrp(b: []mut u8, off: u64, p: u64, target: u64) void {
+    let pages = @bit_cast(i64, (target & ~@as(u64, 0xfff)) -% (p & ~@as(u64, 0xfff))) >> 12;
+    let v = @bit_cast(u64, pages);
+    or32(b, off, ((v & 3) << 29) | (((v >> 2) & 0x7FFFF) << 5));
+}
+
+// The size of the static _start.
+pub const START_SIZE: u64 = 64;

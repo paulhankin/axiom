@@ -1,0 +1,873 @@
+// =============================================================================
+// std/encoding/mime.ax - MIME: media types, header parameters, quoted-printable,
+// and multipart bodies (RFC 2045, 2046, 2231, 7578).
+//
+//     mime.type_by_extension("png")                   // "image/png"
+//     let mt = mime.parse_media_type(content_type);  // mt.essence, mt.is("text/html")
+//     let b = mime.param_alloc(content_type, "boundary")!;
+//
+//     let mut mp = mime.Multipart.init(body, b)!;
+//     loop {
+//         let part = mp.next() catch |e| { if e == error.Done { break; } return e; };
+//         let name = part.param_alloc("Content-Disposition", "name")!;
+//         ... part.body ...
+//     }
+//
+//     let mut w = mime.MultipartWriter.init()!;
+//     w.add_field("title", "Hello")!;
+//     w.add_file("upload", "a.txt", "text/plain", bytes)!;
+//     let ct = w.content_type_alloc()!;   // for the Content-Type header
+//     let body = w.finish()!;             // or w.finish_to(out)!
+//
+//     let mut sw = mime.MultipartWriter.init_to(out)!;   // parts go to `out`
+//     sw.add_field("title", "Hello")!;                   // as they are added
+//     sw.finish_to(out)!;
+// =============================================================================
+
+import "../crypto/random.ax" as random;
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+
+error { NotFound, Done, InvalidMultipart, InvalidEncoding, InvalidArgument, OutOfMemory, Unavailable }
+
+// -----------------------------------------------------------------------------
+// Media types
+// -----------------------------------------------------------------------------
+
+let TYPES: [58][2][]u8 = [
+    ["html", "text/html; charset=utf-8"],
+    ["htm", "text/html; charset=utf-8"],
+    ["css", "text/css; charset=utf-8"],
+    ["js", "text/javascript; charset=utf-8"],
+    ["mjs", "text/javascript; charset=utf-8"],
+    ["json", "application/json"],
+    ["txt", "text/plain; charset=utf-8"],
+    ["md", "text/markdown; charset=utf-8"],
+    ["csv", "text/csv; charset=utf-8"],
+    ["xml", "application/xml"],
+    ["svg", "image/svg+xml"],
+    ["png", "image/png"],
+    ["jpg", "image/jpeg"],
+    ["jpeg", "image/jpeg"],
+    ["gif", "image/gif"],
+    ["webp", "image/webp"],
+    ["avif", "image/avif"],
+    ["bmp", "image/bmp"],
+    ["ico", "image/vnd.microsoft.icon"],
+    ["tif", "image/tiff"],
+    ["tiff", "image/tiff"],
+    ["qoi", "image/qoi"],
+    ["exr", "image/x-exr"],
+    ["hdr", "image/vnd.radiance"],
+    ["wav", "audio/wav"],
+    ["mp3", "audio/mpeg"],
+    ["ogg", "audio/ogg"],
+    ["opus", "audio/opus"],
+    ["flac", "audio/flac"],
+    ["aac", "audio/aac"],
+    ["m4a", "audio/mp4"],
+    ["aif", "audio/aiff"],
+    ["aiff", "audio/aiff"],
+    ["mp4", "video/mp4"],
+    ["webm", "video/webm"],
+    ["pdf", "application/pdf"],
+    ["zip", "application/zip"],
+    ["gz", "application/gzip"],
+    ["tar", "application/x-tar"],
+    ["zst", "application/zstd"],
+    ["xz", "application/x-xz"],
+    ["bz2", "application/x-bzip2"],
+    ["br", "application/x-brotli"],
+    ["wasm", "application/wasm"],
+    ["woff", "font/woff"],
+    ["woff2", "font/woff2"],
+    ["ttf", "font/ttf"],
+    ["otf", "font/otf"],
+    ["toml", "application/toml"],
+    ["yaml", "application/yaml"],
+    ["yml", "application/yaml"],
+    ["ics", "text/calendar; charset=utf-8"],
+    ["cbor", "application/cbor"],
+    ["msgpack", "application/msgpack"],
+    ["eml", "message/rfc822"],
+    ["ph", "text/plain; charset=utf-8"],
+    ["sh", "text/x-shellscript; charset=utf-8"],
+    ["bin", "application/octet-stream"],
+];
+
+/// The media type for a file extension ("png" or ".png", any case), or
+/// application/octet-stream.
+pub fn type_by_extension(ext0: []u8) []u8 {
+    let ext = strs.strip_prefix(ext0, ".") catch ext0;
+    for t in TYPES {
+        if strs.eq_ignore_case(t[0], ext) {
+            return t[1];
+        }
+    }
+    return "application/octet-stream";
+}
+
+/// The usual extension (without the dot) for a media type.
+pub fn extension_by_type(t: []u8) ![]u8 {
+    let essence = parse_media_type(t).essence;
+    for e in TYPES {
+        if strs.eq_ignore_case(parse_media_type(e[1]).essence, essence) {
+            return e[0];
+        }
+    }
+    return error.NotFound;
+}
+
+/// A Content-Type value split into "type/subtype" and its parameters.
+pub struct MediaType {
+    essence: []u8,  // "text/html", as written (compare with is())
+    params: []u8,   // the rest: "; charset=utf-8"
+
+    /// Whether the type is t, ignoring case ("text/*" matches any text type).
+    pub fn is(self: MediaType, t: []u8) bool {
+        if strs.ends_with(t, "/*") {
+            let major = t[..t.len - 1];
+            return (self.essence.len >= major.len) and strs.eq_ignore_case(self.essence[..major.len], major);
+        }
+        return strs.eq_ignore_case(self.essence, t);
+    }
+}
+
+pub fn parse_media_type(h: []u8) MediaType {
+    let t = strs.trim(h);
+    let semi = strs.index_of_byte(t, ';') catch t.len;
+    return MediaType.{ essence: strs.trim(t[..semi]), params: t[semi..] };
+}
+
+fn is_token_char(c: u8) bool {
+    return (c > 0x20) and (c < 0x7f) and (strs.index_of_byte("()<>@,;:\\\"/[]?={}", c) catch 999) == 999;
+}
+
+/// The value of parameter `name` in a header value such as
+/// `form-data; name="field"; filename*=UTF-8''na%C3%AFve.txt` (free it with
+/// mem.free): quoted strings are unescaped, and the RFC 2231 `name*` form
+/// (UTF-8 or US-ASCII) is decoded and preferred.
+pub fn param_alloc(h: []u8, name: []u8) ![]mut u8 {
+    let mut plain = NO_RANGE;
+    let mut ext = NO_RANGE;
+    let mut i = strs.index_of_byte(h, ';') catch return error.NotFound;
+    while i < h.len {
+        // ; name = value
+        i += 1;
+        while (i < h.len) and ((h[i] == ' ') or (h[i] == '\t')) {
+            i += 1;
+        }
+        let ks = i;
+        while (i < h.len) and is_token_char(h[i]) and (h[i] != '*') {
+            i += 1;
+        }
+        let key = h[ks..i];
+        let star = (i < h.len) and (h[i] == '*');
+        if star {
+            i += 1;
+        }
+        while (i < h.len) and ((h[i] == ' ') or (h[i] == '\t')) {
+            i += 1;
+        }
+        if (i >= h.len) or (h[i] != '=') {
+            // not a parameter: skip to the next ;
+            i = strs.index_of_from(h, ";", i) catch h.len;
+            continue;
+        }
+        i += 1;
+        while (i < h.len) and ((h[i] == ' ') or (h[i] == '\t')) {
+            i += 1;
+        }
+        let vs = i;
+        if (i < h.len) and (h[i] == '"') {
+            i += 1;
+            while (i < h.len) and (h[i] != '"') {
+                if (h[i] == '\\') and ((i + 1) < h.len) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i >= h.len {
+                return error.InvalidEncoding;  // unterminated
+            }
+            i += 1;
+        } else {
+            while (i < h.len) and (h[i] != ';') {
+                i += 1;
+            }
+        }
+        if strs.eq_ignore_case(key, name) {
+            if star {
+                ext = Range.{ start: vs, end: i };
+            } else if plain.start == NO_RANGE.start {
+                plain = Range.{ start: vs, end: i };
+            }
+        }
+        i = strs.index_of_from(h, ";", i) catch h.len;
+    }
+    if ext.start != NO_RANGE.start {
+        return decode_ext_value(strs.trim(h[ext.start..ext.end]));
+    }
+    if plain.start != NO_RANGE.start {
+        return unquote(strs.trim(h[plain.start..plain.end]));
+    }
+    return error.NotFound;
+}
+
+struct Range {
+    start: usize,
+    end: usize,
+}
+
+let NO_RANGE: Range = Range.{ start: @max_value(usize), end: 0 };
+
+fn unquote(v: []u8) ![]mut u8 {
+    let mut s = strs.String.init();
+    if (v.len >= 2) and (v[0] == '"') and (v[v.len - 1] == '"') {
+        let mut i: usize = 1;
+        while i < (v.len - 1) {
+            if (v[i] == '\\') and ((i + 1) < (v.len - 1)) {
+                i += 1;
+            }
+            s.push(v[i]) catch |e| {
+                s.deinit();
+                return e;
+            };
+            i += 1;
+        }
+    } else {
+        s.push_str(v) catch |e| {
+            s.deinit();
+            return e;
+        };
+    }
+    return s.take();
+}
+
+// charset'language'percent-encoded
+fn decode_ext_value(v: []u8) ![]mut u8 {
+    let q1 = strs.index_of_byte(v, '\'') catch return error.InvalidEncoding;
+    let q2 = strs.index_of_from(v, "'", q1 + 1) catch return error.InvalidEncoding;
+    let cs = v[..q1];
+    if not (strs.eq_ignore_case(cs, "utf-8") or strs.eq_ignore_case(cs, "us-ascii")) {
+        return error.InvalidEncoding;
+    }
+    let out = mem.alloc.[u8](v.len)!;
+    let mut o: usize = 0;
+    let mut i = q2 + 1;
+    while i < v.len {
+        if v[i] == '%' {
+            if ((i + 2) >= v.len) or (hexv(v[i + 1]) > 15) or (hexv(v[i + 2]) > 15) {
+                mem.free(out);
+                return error.InvalidEncoding;
+            }
+            out[o] = (hexv(v[i + 1]) << 4) | hexv(v[i + 2]);
+            i += 3;
+        } else {
+            out[o] = v[i];
+            i += 1;
+        }
+        o += 1;
+    }
+    if not strs.valid_utf8(out[..o]) {
+        mem.free(out);
+        return error.InvalidEncoding;
+    }
+    return mem.realloc(out, o) catch |e| {
+        mem.free(out);
+        return e;
+    };
+}
+
+fn hexv(c: u8) u8 {
+    if (c >= '0') and (c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return (c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return (c - 'A') + 10;
+    }
+    return 255;
+}
+
+/// The value of header `name` in a block of "Name: value" lines (CRLF or
+/// LF), trimmed; the first one if repeated.
+pub fn header(block: []u8, name: []u8) ![]u8 {
+    let mut i: usize = 0;
+    while i < block.len {
+        let nl = strs.index_of_from(block, "\n", i) catch block.len;
+        let mut line = block[i..nl];
+        if (line.len > 0) and (line[line.len - 1] == '\r') {
+            line = line[..line.len - 1];
+        }
+        let colon = strs.index_of_byte(line, ':') catch line.len;
+        if (colon < line.len) and strs.eq_ignore_case(strs.trim(line[..colon]), name) {
+            return strs.trim(line[colon + 1..]);
+        }
+        i = nl + 1;
+    }
+    return error.NotFound;
+}
+
+// -----------------------------------------------------------------------------
+// Quoted-printable (RFC 2045 6.7)
+// -----------------------------------------------------------------------------
+
+/// Decodes quoted-printable text (free it with mem.free).
+pub fn qp_decode_alloc(text: []u8) ![]mut u8 {
+    let out = mem.alloc.[u8](text.len)!;
+    let mut o: usize = 0;
+    let mut i: usize = 0;
+    while i < text.len {
+        let c = text[i];
+        if c != '=' {
+            out[o] = c;
+            o += 1;
+            i += 1;
+            continue;
+        }
+        // a soft line break: = then optional white space, then a line end
+        let mut j = i + 1;
+        while (j < text.len) and ((text[j] == ' ') or (text[j] == '\t')) {
+            j += 1;
+        }
+        if (j < text.len) and ((text[j] == '\n') or (text[j] == '\r')) {
+            if (text[j] == '\r') and ((j + 1) < text.len) and (text[j + 1] == '\n') {
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if j == text.len {
+            i = j;  // = at the very end: a soft break
+            continue;
+        }
+        if ((i + 2) >= text.len) or (hexv(text[i + 1]) > 15) or (hexv(text[i + 2]) > 15) {
+            mem.free(out);
+            return error.InvalidEncoding;
+        }
+        out[o] = (hexv(text[i + 1]) << 4) | hexv(text[i + 2]);
+        o += 1;
+        i += 3;
+    }
+    return mem.realloc(out, o) catch |e| {
+        mem.free(out);
+        return e;
+    };
+}
+
+/// Encodes data as quoted-printable, lines of at most 76 characters, with
+/// the data's line breaks as CRLF (free it with mem.free).
+pub fn qp_encode_alloc(data: []u8) ![]mut u8 {
+    let mut s = strs.String.init();
+    qp_encode_into(&mut s, data) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+fn qp_encode_into(s: *mut strs.String, data: []u8) !void {
+    let digits = "0123456789ABCDEF";
+    let mut col: usize = 0;
+    let mut i: usize = 0;
+    while i < data.len {
+        let c = data[i];
+        if (c == '\n') or ((c == '\r') and ((i + 1) < data.len) and (data[i + 1] == '\n')) {
+            s.push_str("\r\n")!;
+            col = 0;
+            i += 1;
+            if c == '\r' {
+                i += 1;
+            }
+            continue;
+        }
+        // space and tab stay, except at the end of a line
+        let at_eol = ((i + 1) == data.len) or (data[i + 1] == '\n') or (data[i + 1] == '\r');
+        let literal = ((c >= 33) and (c <= 126) and (c != '=')) or (((c == ' ') or (c == '\t')) and not at_eol);
+        let mut w: usize = 3;
+        if literal {
+            w = 1;
+        }
+        if (col + w) > 75 {
+            s.push_str("=\r\n")!;
+            col = 0;
+        }
+        if literal {
+            s.push(c)!;
+        } else {
+            s.push('=')!;
+            s.push(digits[@as(usize, c >> 4)])!;
+            s.push(digits[@as(usize, c & 15)])!;
+        }
+        col += w;
+        i += 1;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Multipart bodies
+// -----------------------------------------------------------------------------
+
+pub struct Part {
+    headers: []u8,  // the part's header lines
+    body: []u8,
+
+    /// A header of the part (see header()).
+    pub fn header(self: *Part, name: []u8) ![]u8 {
+        return header(self.headers, name);
+    }
+
+    /// A parameter of one of the part's headers (see param_alloc()).
+    pub fn param_alloc(self: *Part, header_name: []u8, name: []u8) ![]mut u8 {
+        return param_alloc(header(self.headers, header_name)!, name);
+    }
+}
+
+/// Reads the parts of a multipart body in turn; the parts point into it.
+pub struct Multipart {
+    data: []u8,
+    delim: [74]u8,  // "--" boundary
+    dlen: usize,
+    pos: usize,
+    started: bool,
+    done: bool,
+
+    pub fn init(data: []u8, boundary: []u8) !Multipart {
+        if (boundary.len == 0) or (boundary.len > 70) {
+            return error.InvalidMultipart;
+        }
+        let mut m = Multipart.{ data: data, delim: [0; 74], dlen: boundary.len + 2, pos: 0, started: false,
+                                done: false };
+        m.delim[0] = '-';
+        m.delim[1] = '-';
+        @mem_copy(m.delim[2..2 + boundary.len], boundary);
+        return m;
+    }
+
+    // The next delimiter line at or after `from` (at the start of the data
+    // or after a line break).
+    fn find(self: *Multipart, from: usize) !usize {
+        let d = self.delim[..self.dlen];
+        let mut i = from;
+        loop {
+            let at = strs.index_of_from(self.data, d, i) catch return error.InvalidMultipart;
+            if ((at == 0) or (self.data[at - 1] == '\n')) and self.ends_delimiter(at + d.len) {
+                return at;
+            }
+            i = at + 1;
+        }
+    }
+
+    // Whether a delimiter line can end at j: "--", or white space and a
+    // line break.
+    fn ends_delimiter(self: *Multipart, j0: usize) bool {
+        let d = self.data;
+        let mut j = j0;
+        if ((j + 2) <= d.len) and (d[j] == '-') and (d[j + 1] == '-') {
+            return true;
+        }
+        while (j < d.len) and ((d[j] == ' ') or (d[j] == '\t')) {
+            j += 1;
+        }
+        return (j < d.len) and ((d[j] == '\r') or (d[j] == '\n'));
+    }
+
+    /// The next part, or Done after the last.
+    pub fn next(self: *mut Multipart) !Part {
+        if self.done {
+            return error.Done;
+        }
+        let d = self.data;
+        if not self.started {
+            self.pos = self.find(0)!;  // after any preamble
+            self.started = true;
+        }
+        // at a delimiter: "--" after it ends the body
+        let mut i = self.pos + self.dlen;
+        if ((i + 2) <= d.len) and (d[i] == '-') and (d[i + 1] == '-') {
+            self.done = true;
+            return error.Done;
+        }
+        while (i < d.len) and ((d[i] == ' ') or (d[i] == '\t')) {
+            i += 1;
+        }
+        if (i < d.len) and (d[i] == '\r') {
+            i += 1;
+        }
+        if (i >= d.len) or (d[i] != '\n') {
+            return error.InvalidMultipart;
+        }
+        i += 1;
+        // headers, up to an empty line
+        let hs = i;
+        let mut he = i;
+        let mut bs = i;
+        loop {
+            let nl = strs.index_of_from(d, "\n", i) catch return error.InvalidMultipart;
+            let line_end = nl;
+            let empty = (nl == i) or ((nl == (i + 1)) and (d[i] == '\r'));
+            if empty {
+                he = i;
+                bs = nl + 1;
+                break;
+            }
+            i = line_end + 1;
+        }
+        // the body runs to the line break before the next delimiter
+        let next = self.find(bs)!;
+        let mut be = next;
+        if (be > bs) and (d[be - 1] == '\n') {
+            be -= 1;
+            if (be > bs) and (d[be - 1] == '\r') {
+                be -= 1;
+            }
+        }
+        self.pos = next;
+        return Part.{ headers: d[hs..he], body: d[bs..be] };
+    }
+}
+
+/// Builds a multipart/form-data body: in memory (init, then finish or
+/// finish_to), or straight to an io.Writer as the parts are added (init_to,
+/// then finish_to on the same writer).
+pub struct MultipartWriter {
+    out: strs.String,  // the body so far (init) or nothing (init_to)
+    sink: io.Writer,
+    streaming: bool,
+    parts: usize,
+    boundary: [32]u8,
+
+    /// A writer that keeps the body in memory.
+    pub fn init() !MultipartWriter {
+        let mut w = MultipartWriter.{ out: strs.String.init(), sink: io.discard(), streaming: false, parts: 0,
+                                      boundary: [0; 32] };
+        let mut r: [12]u8 = [0; 12];
+        random.fill(r[..])!;
+        @mem_copy(w.boundary[..8], "axiom");
+        let digits = "0123456789abcdef";
+        for i in @as(usize, 0)..12 {
+            w.boundary[8 + (2 * i)] = digits[@as(usize, r[i] >> 4)];
+            w.boundary[9 + (2 * i)] = digits[@as(usize, r[i] & 15)];
+        }
+        return w;
+    }
+
+    /// A writer that writes each part to `out` as it is added; end the body
+    /// with finish_to(out). Nothing but a part's headers is held in memory.
+    pub fn init_to(out: io.Writer) !MultipartWriter {
+        let mut w = MultipartWriter.init()!;
+        w.sink = out;
+        w.streaming = true;
+        return w;
+    }
+
+    pub fn deinit(self: *mut MultipartWriter) void {
+        self.out.deinit();
+    }
+
+    pub fn boundary_text(self: *MultipartWriter) []u8 {
+        return self.boundary[..];
+    }
+
+    /// "multipart/form-data; boundary=..." (free it with mem.free).
+    pub fn content_type_alloc(self: *MultipartWriter) ![]mut u8 {
+        let mut s = strs.String.init();
+        s.push_str("multipart/form-data; boundary=") catch |e| {
+            s.deinit();
+            return e;
+        };
+        s.push_str(self.boundary[..]) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+
+    /// A part with raw header lines (each ending in CRLF) and a body.
+    pub fn add_part(self: *mut MultipartWriter, headers: []u8, body: []u8) !void {
+        // (the body must not contain the delimiter)
+        let mut d: [36]u8 = [0; 36];
+        d[0] = '-';
+        d[1] = '-';
+        @mem_copy(d[2..34], self.boundary[..]);
+        if strs.contains(body, d[..34]) or strs.contains(headers, d[..34]) {
+            return error.InvalidArgument;
+        }
+        // the CRLF that ends a part's body is written with the next delimiter
+        let mut pre = strs.String.init();
+        defer pre.deinit();
+        if self.parts > 0 {
+            pre.push_str("\r\n")!;
+        }
+        pre.push_str(d[..34])!;
+        pre.push_str("\r\n")!;
+        pre.push_str(headers)!;
+        pre.push_str("\r\n")!;
+        let mut w = self.sink;
+        if not self.streaming {
+            w = self.out.writer();
+        }
+        w.write_all(pre.bytes())!;
+        w.write_all(body)!;
+        self.parts += 1;
+    }
+
+    /// A form field.
+    pub fn add_field(self: *mut MultipartWriter, name: []u8, value: []u8) !void {
+        let mut h = strs.String.init();
+        defer h.deinit();
+        h.push_str("Content-Disposition: form-data; name=\"")!;
+        push_escaped(&mut h, name)!;
+        h.push_str("\"\r\n")!;
+        self.add_part(h.bytes(), value)!;
+    }
+
+    /// A file field.
+    pub fn add_file(self: *mut MultipartWriter, name: []u8, filename: []u8, content_type: []u8, data: []u8) !void {
+        for c in content_type {
+            if (c == '\r') or (c == '\n') {
+                return error.InvalidArgument;
+            }
+        }
+        let mut h = strs.String.init();
+        defer h.deinit();
+        h.push_str("Content-Disposition: form-data; name=\"")!;
+        push_escaped(&mut h, name)!;
+        h.push_str("\"; filename=\"")!;
+        push_escaped(&mut h, filename)!;
+        h.push_str("\"\r\nContent-Type: ")!;
+        h.push_str(content_type)!;
+        h.push_str("\r\n")!;
+        self.add_part(h.bytes(), data)!;
+    }
+
+    /// Ends the body and hands it over (free it with mem.free). Only for a
+    /// writer made with init (InvalidArgument otherwise: use finish_to).
+    pub fn finish(self: *mut MultipartWriter) ![]mut u8 {
+        if self.streaming {
+            return error.InvalidArgument;
+        }
+        let mut tail: [40]u8 = [0; 40];
+        self.out.push_str(self.tail(tail[..]))!;
+        return self.out.take();
+    }
+
+    /// Ends the body, writing to w what is left of it: for a writer made
+    /// with init, the whole body (which is then dropped); for one made with
+    /// init_to (pass the same writer), the closing delimiter.
+    pub fn finish_to(self: *mut MultipartWriter, w: io.Writer) !void {
+        let mut tail: [40]u8 = [0; 40];
+        let t = self.tail(tail[..]);
+        if self.streaming {
+            w.write_all(t)!;
+            return;
+        }
+        self.out.push_str(t)!;
+        w.write_all(self.out.bytes())!;
+        self.out.clear();
+    }
+
+    // The closing delimiter (after the last part's CRLF).
+    fn tail(self: *MultipartWriter, buf: []mut u8) []u8 {
+        let mut n: usize = 0;
+        if self.parts > 0 {
+            @mem_copy(buf[..2], "\r\n");
+            n = 2;
+        }
+        @mem_copy(buf[n..n + 2], "--");
+        @mem_copy(buf[n + 2..n + 34], self.boundary[..]);
+        @mem_copy(buf[n + 34..n + 38], "--\r\n");
+        return buf[..n + 38];
+    }
+}
+
+// Names in form-data: " and line breaks percent-encoded, as browsers do.
+fn push_escaped(s: *mut strs.String, v: []u8) !void {
+    for c in v {
+        if c == '"' {
+            s.push_str("%22")!;
+        } else if c == '\r' {
+            s.push_str("%0D")!;
+        } else if c == '\n' {
+            s.push_str("%0A")!;
+        } else {
+            s.push(c)!;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+test "media types and parameters" {
+    @expect_eq(type_by_extension(".PNG"), "image/png");
+    @expect_eq(type_by_extension("unknown"), "application/octet-stream");
+    @expect_eq(extension_by_type("image/jpeg; q=1")!, "jpg");
+    let mt = parse_media_type(" Text/HTML ; charset=UTF-8");
+    @expect(mt.is("text/html"));
+    @expect(mt.is("text/*"));
+    @expect(not mt.is("image/*"));
+    let h = "form-data; name=\"a \\\"b\\\"\"; filename=plain.txt; filename*=UTF-8''na%C3%AFve%20file.txt";
+    let n = param_alloc(h, "name")!;
+    defer mem.free(n);
+    @expect_eq(n, "a \"b\"");
+    let f = param_alloc(h, "FILENAME")!;
+    defer mem.free(f);
+    @expect_eq(f, "na\xc3\xafve file.txt");
+    @expect(missing(param_alloc(h, "size")));
+    @expect(missing(param_alloc("text/plain", "charset")));
+    let b = param_alloc("multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW", "boundary")!;
+    defer mem.free(b);
+    @expect_eq(b, "----WebKitFormBoundary7MA4YWxkTrZu0gW");
+}
+
+fn missing(r: ![]mut u8) bool {
+    _ = r catch return true;
+    return false;
+}
+
+test "quoted-printable" {
+    let d = qp_decode_alloc("J=C3=A9r=C3=B4me says: caf=\r\n=C3=A9 =3D good=20\r\nnext")!;
+    defer mem.free(d);
+    @expect_eq(d, "J\xc3\xa9r\xc3\xb4me says: caf\xc3\xa9 = good \r\nnext");
+    @expect(missing(qp_decode_alloc("bad =ZZ")));
+    let long =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa= \nb\tc ";
+    let e = qp_encode_alloc(long)!;
+    defer mem.free(e);
+    let mut i: usize = 0;
+    while i < e.len {
+        let nl = strs.index_of_from(e, "\r\n", i) catch e.len;
+        @expect((nl - i) <= 76);
+        i = nl + 2;
+    }
+    let back = qp_decode_alloc(e)!;
+    defer mem.free(back);
+    @expect_eq(back,
+               "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa= \r\nb\tc ");
+}
+
+test "multipart" {
+    let body =
+        "preamble\r\n--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello\r\n--XyZ\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nline 1\r\n--XyZnot a delimiter\r\n\r\n--XyZ--\r\nepilogue";
+    let mut mp = Multipart.init(body, "XyZ")!;
+    let p1 = mp.next()!;
+    @expect_eq(p1.body, "Hello");
+    let n1 = p1.param_alloc("content-disposition", "name")!;
+    defer mem.free(n1);
+    @expect_eq(n1, "title");
+    let p2 = mp.next()!;
+    @expect_eq(p2.header("Content-Type")!, "text/plain");
+    @expect_eq(p2.body, "line 1\r\n--XyZnot a delimiter\r\n");
+    @expect(done(mp.next()));
+}
+
+test "multipart round trip and bad input" {
+    let mut w = MultipartWriter.init()!;
+    defer w.deinit();
+    w.add_field("na\"me", "value")!;
+    w.add_file("up", "x\r\ny.bin", "application/octet-stream", "\x00\x01\x02")!;
+    let ct = w.content_type_alloc()!;
+    defer mem.free(ct);
+    let b = param_alloc(ct, "boundary")!;
+    defer mem.free(b);
+    let body = w.finish()!;
+    defer mem.free(body);
+    let mut mp = Multipart.init(body, b)!;
+    let p1 = mp.next()!;
+    let n = p1.param_alloc("Content-Disposition", "name")!;
+    defer mem.free(n);
+    @expect_eq(n, "na%22me");
+    @expect_eq(p1.body, "value");
+    let p2 = mp.next()!;
+    @expect_eq(p2.body, "\x00\x01\x02");
+    let f = p2.param_alloc("Content-Disposition", "filename")!;
+    defer mem.free(f);
+    @expect_eq(f, "x%0D%0Ay.bin");
+    @expect(done(mp.next()));
+    // truncated or malformed bodies fail cleanly
+    let cuts: [4][]u8 = ["--b\r\nX: y", "--b\r\n\r\nno end", "no delimiter", "--bX\r\n"];
+    for c in cuts {
+        let mut m = Multipart.init(c, "b")!;
+        @expect(not done(m.next()));
+    }
+    let mut w2 = MultipartWriter.init()!;
+    defer w2.deinit();
+    let mut evil: [40]u8 = [0; 40];
+    evil[0] = '-';
+    evil[1] = '-';
+    @mem_copy(evil[2..34], w2.boundary_text());
+    @expect(not done_or_ok(w2.add_field("x", evil[..34])));
+}
+
+test "multipart writing to an io.Writer" {
+    let mut sink = strs.String.init();
+    defer sink.deinit();
+    let mut w = MultipartWriter.init_to(sink.writer())!;
+    defer w.deinit();
+    // the same boundary in memory, for comparison
+    let mut m = MultipartWriter.init()!;
+    defer m.deinit();
+    m.boundary = w.boundary;
+    let mut empty = MultipartWriter.init()!;
+    defer empty.deinit();
+    let e = empty.finish()!;
+    defer mem.free(e);
+    @expect_eq(e.len, 38);
+    w.add_field("a", "1")!;
+    m.add_field("a", "1")!;
+    @expect(strs.ends_with(sink.bytes(), "\r\n\r\n1"));
+    w.add_file("f", "f.txt", "text/plain", "hello\r\n")!;
+    m.add_file("f", "f.txt", "text/plain", "hello\r\n")!;
+    w.finish_to(sink.writer())!;
+    @expect(not done_or_ok_bytes(w.finish()));
+    let mut copy = strs.String.init();
+    defer copy.deinit();
+    let mut m2 = MultipartWriter.init()!;
+    defer m2.deinit();
+    m2.boundary = w.boundary;
+    m2.add_field("a", "1")!;
+    m2.add_file("f", "f.txt", "text/plain", "hello\r\n")!;
+    m2.finish_to(copy.writer())!;
+    let body = m.finish()!;
+    defer mem.free(body);
+    @expect_eq(sink.bytes(), body);
+    @expect_eq(copy.bytes(), body);
+    let mut mp = Multipart.init(body, w.boundary_text())!;
+    @expect_eq(mp.next()!.body, "1");
+    @expect_eq(mp.next()!.body, "hello\r\n");
+    @expect(done(mp.next()));
+    // a full destination fails with its error
+    let mut small: [10]u8 = [0; 10];
+    let mut bw = io.BufferWriter.init(small[..]);
+    let mut w3 = MultipartWriter.init_to(bw.writer())!;
+    defer w3.deinit();
+    w3.add_field("a", "1") catch |err| {
+        @expect_eq(err, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
+}
+
+fn done_or_ok_bytes(r: ![]mut u8) bool {
+    let b = r catch return false;
+    mem.free(b);
+    return true;
+}
+
+fn done(r: !Part) bool {
+    _ = r catch |e| {
+        return e == error.Done;
+    };
+    return false;
+}
+
+fn done_or_ok(r: !void) bool {
+    r catch return false;
+    return true;
+}

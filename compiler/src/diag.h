@@ -1,6 +1,6 @@
 // diag.h - diagnostics collection and emission (human / agent-json).
-#ifndef PH_DIAG_H
-#define PH_DIAG_H
+#ifndef AX_DIAG_H
+#define AX_DIAG_H
 
 #include "util.h"
 

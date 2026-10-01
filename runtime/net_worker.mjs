@@ -160,7 +160,7 @@ const ops = {
     }
     reply(req, 0);
   },
-  // Child processes (see ph_proc_spawn): the handle, and pipe handles in
+  // Child processes (see ax_proc_spawn): the handle, and pipe handles in
   // data as three i32s.
   spawn(req, { argv, env, cwd, modes }) {
     const out = new Int32Array(req.data, 0, 3);
@@ -190,7 +190,7 @@ const ops = {
     });
   },
   // Addresses (records of 24 bytes: family, port, address, scope; see
-  // runtime/native.ph), written to data.
+  // runtime/native.ax), written to data.
   resolve(req, { name, max }) {
     dns.lookup(name, { all: true }, (err, addrs) => {
       if (err || !addrs.length) return reply(req, BAD_ADDRESS);

@@ -1,0 +1,87 @@
+// std/thread and std/sync: spawn/join, atomics across threads, Mutex,
+// WaitGroup, Channel, parallel_for, wait/notify timeouts.
+import "../lib/io.ax" as io;
+import "std/mem" as mem;
+import "std/sync" as sync;
+import "std/thread" as thread;
+
+struct Shared {
+    hits: sync.Atomic.[u64],
+    lock: sync.Mutex,
+    plain: u64,  // only touched with `lock` held
+    group: sync.WaitGroup,
+}
+
+fn hammer(s: *mut Shared) void {
+    for i in @as(u64, 0)..10000 {
+        _ = s.hits.add(1);
+        s.lock.lock();
+        s.plain += 1;
+        s.lock.unlock();
+    }
+    s.group.done();
+}
+
+fn produce(ch: *mut sync.Channel.[u64]) void {
+    for i in @as(u64, 1)..1001 {
+        ch.send(i) catch return;
+    }
+    ch.close();
+}
+
+struct Squares {
+    out: []mut u64,
+}
+
+fn square_range(ctx: *mut Squares, lo: usize, hi: usize) void {
+    for i in lo..hi {
+        ctx.out[i] = @as(u64, i) * @as(u64, i);
+    }
+}
+
+fn demo() !void {
+    // 4 threads x 10000 increments, atomically and under a mutex
+    let mut shared = Shared.{ hits: sync.Atomic.[u64].init(0), lock: sync.Mutex.init(), plain: 0,
+                              group: sync.WaitGroup.init() };
+    shared.group.add(4);
+    let mut ts: [4]thread.Thread.[*mut Shared] = [
+        thread.spawn(hammer, &mut shared)!, thread.spawn(hammer, &mut shared)!, thread.spawn(hammer, &mut shared)!,
+        thread.spawn(hammer, &mut shared)!];
+    shared.group.wait();
+    for t in ts {
+        t.join();
+    }
+    io.uint(shared.hits.load());  // expect: 40000
+    io.uint(shared.plain);        // expect: 40000
+
+    // producer / consumer through a small channel
+    let mut ch = sync.Channel.[u64].init(8)!;
+    let p = thread.spawn(produce, &mut ch)!;
+    let mut sum: u64 = 0;
+    loop {
+        let v = ch.recv() catch break;
+        sum += v;
+    }
+    p.join();
+    io.uint(sum);  // expect: 500500
+
+    // parallel_for over disjoint ranges
+    let out = mem.alloc.[u64](1000)!;
+    let mut sq = Squares.{ out: out };
+    thread.parallel_for(out.len, 4, square_range, &mut sq)!;
+    let mut total: u64 = 0;
+    for v in out {
+        total += v;
+    }
+    io.uint(total);  // expect: 332833500
+
+    // wait/notify results: 1 = value differs, 2 = timed out
+    let mut word: u32 = 7;
+    io.uint(@as(u64, @atomic_wait(&word, 8, -1)));       // expect: 1
+    io.uint(@as(u64, @atomic_wait(&word, 7, 1000000)));  // expect: 2
+    io.boolean(thread.cpu_count() >= 1);                 // expect: true
+}
+
+export fn run() void {
+    demo() catch @trap();
+}

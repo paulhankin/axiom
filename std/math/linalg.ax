@@ -1,0 +1,990 @@
+// =============================================================================
+// std/math/linalg.ax - linear algebra on matrix.Matrix[f64].
+//
+//     let x = linalg.solve(&a, b)!;               // a x = b; mem.free(x)
+//     let d = linalg.det(&a)!;
+//     let mut inv = linalg.inverse(&a)!;          // inv.deinit()
+//
+//     let mut f = linalg.Lu.init(&a)!;            // factor once, solve often
+//     f.solve(b1, x1)!; f.solve(b2, x2)!;
+//
+//     let mut e = linalg.eigen_symmetric(&s)!;    // e.values, e.vectors
+//     let mut d = linalg.svd(&a)!;                // d.u, d.s, d.v
+//     let coef = linalg.lstsq(&a, b)!;            // least squares
+//
+// The algorithms are the standard dense ones: LU with partial pivoting,
+// Cholesky, Householder QR, the cyclic Jacobi method for symmetric
+// eigenproblems and one-sided Jacobi (Hestenes) for the SVD. The Jacobi
+// methods are slower than QR iterations for large matrices (they suit
+// sizes up to a few hundred) but compute small eigenvalues and singular
+// values to high relative accuracy.
+//
+// Results are new matrices and slices the caller frees; inputs are not
+// changed.
+// =============================================================================
+
+import "../math.ax" as math;
+import "../mem.ax" as mem;
+import "matrix.ax" as mx;
+
+error { DimensionMismatch, Singular, NotPositiveDefinite, NoConvergence, OutOfMemory }
+
+// element (r, c)
+fn at(a: *mx.Matrix.[f64], r: usize, c: usize) f64 {
+    return a.data[(r * a.cols) + c];
+}
+
+fn put(a: *mut mx.Matrix.[f64], r: usize, c: usize, v: f64) void {
+    a.data[(r * a.cols) + c] = v;
+}
+
+/// y = a x.
+pub fn mat_vec(a: *mx.Matrix.[f64], x: []f64, y: []mut f64) !void {
+    if (x.len != a.cols) or (y.len != a.rows) {
+        return error.DimensionMismatch;
+    }
+    for r in @as(usize, 0)..a.rows {
+        let row = a.data[r * a.cols..(r + 1) * a.cols];
+        let mut s: f64 = 0.0;
+        for c in @as(usize, 0)..a.cols {
+            s += row[c] * x[c];
+        }
+        y[r] = s;
+    }
+}
+
+/// The sum of the diagonal.
+pub fn trace(a: *mx.Matrix.[f64]) !f64 {
+    if a.rows != a.cols {
+        return error.DimensionMismatch;
+    }
+    let mut s: f64 = 0.0;
+    for k in @as(usize, 0)..a.rows {
+        s += at(a, k, k);
+    }
+    return s;
+}
+
+/// The Frobenius norm, the square root of the sum of squares (without
+/// overflow for large elements).
+pub fn norm(a: *mx.Matrix.[f64]) f64 {
+    let mut scale: f64 = 0.0;
+    let mut ssq: f64 = 1.0;
+    for v in a.data {
+        if v != 0.0 {
+            let x = @abs(v);
+            if scale < x {
+                ssq = 1.0 + ((ssq * (scale / x)) * (scale / x));
+                scale = x;
+            } else {
+                ssq += (x / scale) * (x / scale);
+            }
+        }
+    }
+    return scale * @sqrt(ssq);
+}
+
+// -----------------------------------------------------------------------------
+// LU
+// -----------------------------------------------------------------------------
+
+/// The factorization P a = L U of a square matrix, with partial pivoting:
+/// L (unit lower triangular) and U share one matrix.
+pub struct Lu {
+    lu: mx.Matrix.[f64],
+    perm: []mut usize,  // row k of P a is row perm[k] of a
+    sign: f64,          // the determinant of P
+    singular: bool,     // a zero pivot (solve fails; det is 0)
+
+    pub fn init(a: *mx.Matrix.[f64]) !Lu {
+        if a.rows != a.cols {
+            return error.DimensionMismatch;
+        }
+        let n = a.rows;
+        let mut m = a.clone()!;
+        let perm = mem.alloc.[usize](n) catch |e| {
+            m.deinit();
+            return e;
+        };
+        for k in @as(usize, 0)..n {
+            perm[k] = k;
+        }
+        let mut sign: f64 = 1.0;
+        let mut singular = false;
+        for k in @as(usize, 0)..n {
+            // the largest pivot in column k
+            let mut p = k;
+            let mut big = @abs(at(&m, k, k));
+            for r in k + 1..n {
+                let v = @abs(at(&m, r, k));
+                if v > big {
+                    big = v;
+                    p = r;
+                }
+            }
+            if big == 0.0 {
+                singular = true;
+                continue;
+            }
+            if p != k {
+                for c in @as(usize, 0)..n {
+                    let t = at(&m, k, c);
+                    put(&mut m, k, c, at(&m, p, c));
+                    put(&mut m, p, c, t);
+                }
+                let t = perm[k];
+                perm[k] = perm[p];
+                perm[p] = t;
+                sign = -sign;
+            }
+            let piv = at(&m, k, k);
+            for r in k + 1..n {
+                let f = at(&m, r, k) / piv;
+                put(&mut m, r, k, f);
+                if f != 0.0 {
+                    let rk = k * n;
+                    let rr = r * n;
+                    for c in k + 1..n {
+                        m.data[rr + c] -= f * m.data[rk + c];
+                    }
+                }
+            }
+        }
+        return Lu.{ lu: m, perm: perm, sign: sign, singular: singular };
+    }
+
+    pub fn deinit(self: *mut Lu) void {
+        self.lu.deinit();
+        mem.free(self.perm);
+    }
+
+    pub fn det(self: *Lu) f64 {
+        if self.singular {
+            return 0.0;
+        }
+        let mut d = self.sign;
+        for k in @as(usize, 0)..self.lu.rows {
+            d *= at(&self.lu, k, k);
+        }
+        return d;
+    }
+
+    /// Solves a x = b.
+    pub fn solve(self: *Lu, b: []f64, x: []mut f64) !void {
+        let n = self.lu.rows;
+        if (b.len != n) or (x.len != n) {
+            return error.DimensionMismatch;
+        }
+        if self.singular {
+            return error.Singular;
+        }
+        // (b and x may be the same memory: permute through a copy)
+        let y = mem.alloc.[f64](n)!;
+        defer mem.free(y);
+        for k in @as(usize, 0)..n {
+            y[k] = b[self.perm[k]];
+        }
+        // L y = P b, then U x = y
+        for r in @as(usize, 0)..n {
+            let mut s = y[r];
+            for c in @as(usize, 0)..r {
+                s -= at(&self.lu, r, c) * y[c];
+            }
+            y[r] = s;
+        }
+        let mut r = n;
+        while r > 0 {
+            r -= 1;
+            let mut s = y[r];
+            for c in r + 1..n {
+                s -= at(&self.lu, r, c) * y[c];
+            }
+            y[r] = s / at(&self.lu, r, r);
+        }
+        @mem_copy(x, y);
+    }
+
+    /// The inverse of a.
+    pub fn inverse(self: *Lu) !mx.Matrix.[f64] {
+        let n = self.lu.rows;
+        if self.singular {
+            return error.Singular;
+        }
+        let mut inv = mx.Matrix.[f64].init(n, n)!;
+        let col = mem.alloc.[f64](n) catch |e| {
+            inv.deinit();
+            return e;
+        };
+        defer mem.free(col);
+        for c in @as(usize, 0)..n {
+            @mem_set(col, 0);
+            col[c] = 1.0;
+            self.solve(col, col) catch |e| {
+                inv.deinit();
+                return e;
+            };
+            for r in @as(usize, 0)..n {
+                put(&mut inv, r, c, col[r]);
+            }
+        }
+        return inv;
+    }
+}
+
+/// Solves a x = b for square a; Singular if a is.
+pub fn solve(a: *mx.Matrix.[f64], b: []f64) ![]mut f64 {
+    let mut f = Lu.init(a)!;
+    defer f.deinit();
+    let x = mem.alloc.[f64](b.len)!;
+    f.solve(b, x) catch |e| {
+        mem.free(x);
+        return e;
+    };
+    return x;
+}
+
+pub fn det(a: *mx.Matrix.[f64]) !f64 {
+    let mut f = Lu.init(a)!;
+    defer f.deinit();
+    return f.det();
+}
+
+pub fn inverse(a: *mx.Matrix.[f64]) !mx.Matrix.[f64] {
+    let mut f = Lu.init(a)!;
+    defer f.deinit();
+    return f.inverse()!;
+}
+
+// -----------------------------------------------------------------------------
+// Cholesky
+// -----------------------------------------------------------------------------
+
+/// The lower triangular L with a = L L^T, for symmetric positive definite
+/// a (only its lower triangle is read); NotPositiveDefinite otherwise.
+pub fn cholesky(a: *mx.Matrix.[f64]) !mx.Matrix.[f64] {
+    if a.rows != a.cols {
+        return error.DimensionMismatch;
+    }
+    let n = a.rows;
+    let mut l = mx.Matrix.[f64].init(n, n)!;
+    for j in @as(usize, 0)..n {
+        let mut d = at(a, j, j);
+        for k in @as(usize, 0)..j {
+            d -= at(&l, j, k) * at(&l, j, k);
+        }
+        if not (d > 0.0) {
+            l.deinit();
+            return error.NotPositiveDefinite;
+        }
+        let ljj = @sqrt(d);
+        put(&mut l, j, j, ljj);
+        for i in j + 1..n {
+            let mut s = at(a, i, j);
+            for k in @as(usize, 0)..j {
+                s -= at(&l, i, k) * at(&l, j, k);
+            }
+            put(&mut l, i, j, s / ljj);
+        }
+    }
+    return l;
+}
+
+/// Solves L L^T x = b, with L from cholesky.
+pub fn cholesky_solve(l: *mx.Matrix.[f64], b: []f64, x: []mut f64) !void {
+    let n = l.rows;
+    if (b.len != n) or (x.len != n) or (l.cols != n) {
+        return error.DimensionMismatch;
+    }
+    for i in @as(usize, 0)..n {
+        let mut s = b[i];
+        for k in @as(usize, 0)..i {
+            s -= at(l, i, k) * x[k];
+        }
+        x[i] = s / at(l, i, i);
+    }
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        let mut s = x[i];
+        for k in i + 1..n {
+            s -= at(l, k, i) * x[k];
+        }
+        x[i] = s / at(l, i, i);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// QR and least squares
+// -----------------------------------------------------------------------------
+
+/// a = Q R for an m x n matrix with m >= n: Q is m x n with orthonormal
+/// columns, R is n x n upper triangular.
+pub struct Qr {
+    q: mx.Matrix.[f64],
+    r: mx.Matrix.[f64],
+
+    pub fn deinit(self: *mut Qr) void {
+        self.q.deinit();
+        self.r.deinit();
+    }
+}
+
+/// The QR factorization by Householder reflections.
+pub fn qr(a: *mx.Matrix.[f64]) !Qr {
+    let m = a.rows;
+    let n = a.cols;
+    if m < n {
+        return error.DimensionMismatch;
+    }
+    let mut w = a.clone()!;
+    defer w.deinit();
+    // the reflectors: v_k in column k below the diagonal (with v_k[k] kept
+    // in vd[k]), H_k = I - 2 v v^T / v^T v
+    let vd = mem.alloc.[f64](n)!;
+    defer mem.free(vd);
+    let beta = mem.alloc.[f64](n)!;
+    defer mem.free(beta);
+    for k in @as(usize, 0)..n {
+        let mut nrm: f64 = 0.0;
+        for i in k..m {
+            nrm = math.hypot(nrm, at(&w, i, k));
+        }
+        beta[k] = 0.0;
+        vd[k] = 0.0;
+        if nrm == 0.0 {
+            continue;
+        }
+        let x0 = at(&w, k, k);
+        let alpha = -@copysign(nrm, x0);
+        // v = x - alpha e1; v^T v = 2 nrm (nrm + |x0|)
+        let v0 = x0 - alpha;
+        vd[k] = v0;
+        beta[k] = 1.0 / (nrm * (nrm + @abs(x0)));
+        // apply H to the remaining columns
+        for c in k + 1..n {
+            let mut s = v0 * at(&w, k, c);
+            for i in k + 1..m {
+                s += at(&w, i, k) * at(&w, i, c);
+            }
+            s *= beta[k];
+            put(&mut w, k, c, at(&w, k, c) - (s * v0));
+            for i in k + 1..m {
+                put(&mut w, i, c, at(&w, i, c) - (s * at(&w, i, k)));
+            }
+        }
+        put(&mut w, k, k, alpha);
+    }
+    let mut r = mx.Matrix.[f64].init(n, n)!;
+    for i in @as(usize, 0)..n {
+        for c in i..n {
+            put(&mut r, i, c, at(&w, i, c));
+        }
+    }
+    // Q = H_0 H_1 ... H_(n-1) applied to the first n columns of I
+    let mut q = mx.Matrix.[f64].init(m, n) catch |e| {
+        r.deinit();
+        return e;
+    };
+    for k in @as(usize, 0)..n {
+        put(&mut q, k, k, 1.0);
+    }
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        if beta[k] == 0.0 {
+            continue;
+        }
+        let v0 = vd[k];
+        for c in @as(usize, 0)..n {
+            let mut s = v0 * at(&q, k, c);
+            for i in k + 1..m {
+                s += at(&w, i, k) * at(&q, i, c);
+            }
+            s *= beta[k];
+            put(&mut q, k, c, at(&q, k, c) - (s * v0));
+            for i in k + 1..m {
+                put(&mut q, i, c, at(&q, i, c) - (s * at(&w, i, k)));
+            }
+        }
+    }
+    return Qr.{ q: q, r: r };
+}
+
+/// The x minimizing |a x - b| for an m x n matrix a (m >= n) of full
+/// column rank (Singular otherwise), by QR.
+pub fn lstsq(a: *mx.Matrix.[f64], b: []f64) ![]mut f64 {
+    if b.len != a.rows {
+        return error.DimensionMismatch;
+    }
+    let mut f = qr(a)!;
+    defer f.deinit();
+    let n = a.cols;
+    let x = mem.alloc.[f64](n)!;
+    // x = R^-1 Q^T b
+    for c in @as(usize, 0)..n {
+        let mut s: f64 = 0.0;
+        for i in @as(usize, 0)..a.rows {
+            s += at(&f.q, i, c) * b[i];
+        }
+        x[c] = s;
+    }
+    // a column rank below n shows as a negligible diagonal element of R
+    let mut rmax: f64 = 0.0;
+    for k in @as(usize, 0)..n {
+        rmax = @max(rmax, @abs(at(&f.r, k, k)));
+    }
+    let tol = (rmax * @float_from_int(f64, @max(a.rows, n))) * 2.220446049250313e-16;
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        let d = at(&f.r, k, k);
+        if @abs(d) <= tol {
+            mem.free(x);
+            return error.Singular;
+        }
+        let mut s = x[k];
+        for c in k + 1..n {
+            s -= at(&f.r, k, c) * x[c];
+        }
+        x[k] = s / d;
+    }
+    return x;
+}
+
+// -----------------------------------------------------------------------------
+// Eigenvalues of symmetric matrices
+// -----------------------------------------------------------------------------
+
+/// Eigenvalues in increasing order, and the corresponding unit
+/// eigenvectors as the columns of `vectors`.
+pub struct Eigen {
+    values: []mut f64,
+    vectors: mx.Matrix.[f64],
+
+    pub fn deinit(self: *mut Eigen) void {
+        mem.free(self.values);
+        self.vectors.deinit();
+    }
+}
+
+/// The eigendecomposition a = V diag(values) V^T of a symmetric matrix
+/// (only its upper triangle is read), by the cyclic Jacobi method.
+pub fn eigen_symmetric(a: *mx.Matrix.[f64]) !Eigen {
+    if a.rows != a.cols {
+        return error.DimensionMismatch;
+    }
+    let n = a.rows;
+    let mut w = a.clone()!;
+    defer w.deinit();
+    for i in @as(usize, 0)..n {
+        for j in @as(usize, 0)..i {
+            put(&mut w, i, j, at(&w, j, i));
+        }
+    }
+    let mut v = mx.Matrix.[f64].identity(n)!;
+    let mut sweep: usize = 0;
+    while true {
+        let mut off: f64 = 0.0;
+        for i in @as(usize, 0)..n {
+            for j in i + 1..n {
+                off += at(&w, i, j) * at(&w, i, j);
+            }
+        }
+        if off == 0.0 {
+            break;
+        }
+        sweep += 1;
+        if sweep > 100 {
+            v.deinit();
+            return error.NoConvergence;
+        }
+        let mut rotated = false;
+        for p in @as(usize, 0)..n {
+            for q in p + 1..n {
+                let apq = at(&w, p, q);
+                if apq == 0.0 {
+                    continue;
+                }
+                let app = at(&w, p, p);
+                let aqq = at(&w, q, q);
+                // skip elements negligible beside both diagonal entries
+                if (@abs(apq) * 1.0e-18) == 0.0 {
+                    put(&mut w, p, q, 0.0);
+                    put(&mut w, q, p, 0.0);
+                    continue;
+                }
+                if (@abs(apq) <= ((2.220446049250313e-16 * 0.5) * @sqrt(@abs(app) * @abs(aqq)))) and (sweep > 3) {
+                    put(&mut w, p, q, 0.0);
+                    put(&mut w, q, p, 0.0);
+                    continue;
+                }
+                rotated = true;
+                // the rotation annihilating (p, q): t = tan(theta)
+                let theta = (aqq - app) / (2.0 * apq);
+                let mut t = 1.0 / (@abs(theta) + math.hypot(theta, 1.0));
+                if theta < 0.0 {
+                    t = -t;
+                }
+                let c = 1.0 / math.hypot(t, 1.0);
+                let s = t * c;
+                let tau = s / (1.0 + c);
+                put(&mut w, p, p, app - (t * apq));
+                put(&mut w, q, q, aqq + (t * apq));
+                put(&mut w, p, q, 0.0);
+                put(&mut w, q, p, 0.0);
+                for r in @as(usize, 0)..n {
+                    if (r != p) and (r != q) {
+                        let arp = at(&w, r, p);
+                        let arq = at(&w, r, q);
+                        let np = arp - (s * (arq + (tau * arp)));
+                        let nq = arq + (s * (arp - (tau * arq)));
+                        put(&mut w, r, p, np);
+                        put(&mut w, p, r, np);
+                        put(&mut w, r, q, nq);
+                        put(&mut w, q, r, nq);
+                    }
+                    let vrp = at(&v, r, p);
+                    let vrq = at(&v, r, q);
+                    put(&mut v, r, p, vrp - (s * (vrq + (tau * vrp))));
+                    put(&mut v, r, q, vrq + (s * (vrp - (tau * vrq))));
+                }
+            }
+        }
+        if not rotated {
+            break;
+        }
+    }
+    let values = mem.alloc.[f64](n) catch |e| {
+        v.deinit();
+        return e;
+    };
+    for k in @as(usize, 0)..n {
+        values[k] = at(&w, k, k);
+    }
+    // sort the pairs by value (selection sort: n is small)
+    for i in @as(usize, 0)..n {
+        let mut best = i;
+        for j in i + 1..n {
+            if values[j] < values[best] {
+                best = j;
+            }
+        }
+        if best != i {
+            let t = values[i];
+            values[i] = values[best];
+            values[best] = t;
+            for r in @as(usize, 0)..n {
+                let tv = at(&v, r, i);
+                put(&mut v, r, i, at(&v, r, best));
+                put(&mut v, r, best, tv);
+            }
+        }
+    }
+    return Eigen.{ values: values, vectors: v };
+}
+
+// -----------------------------------------------------------------------------
+// Singular value decomposition
+// -----------------------------------------------------------------------------
+
+/// a = U diag(s) V^T for an m x n matrix: with k = min(m, n), U is m x k
+/// and V is n x k with orthonormal columns, and s holds the k singular
+/// values in decreasing order.
+pub struct Svd {
+    u: mx.Matrix.[f64],
+    s: []mut f64,
+    v: mx.Matrix.[f64],
+
+    pub fn deinit(self: *mut Svd) void {
+        self.u.deinit();
+        mem.free(self.s);
+        self.v.deinit();
+    }
+}
+
+/// The singular value decomposition, by one-sided Jacobi rotations.
+pub fn svd(a: *mx.Matrix.[f64]) !Svd {
+    if a.rows < a.cols {
+        // decompose the transpose and swap U and V
+        let mut t = a.transpose()!;
+        defer t.deinit();
+        let d = svd(&t)!;
+        return Svd.{ u: d.v, s: d.s, v: d.u };
+    }
+    let m = a.rows;
+    let n = a.cols;
+    // orthogonalize the columns of U = a (V accumulates the rotations)
+    let mut u = a.clone()!;
+    let mut v = mx.Matrix.[f64].identity(n) catch |e| {
+        u.deinit();
+        return e;
+    };
+    let eps: f64 = 2.220446049250313e-16;
+    let mut sweep: usize = 0;
+    while true {
+        sweep += 1;
+        if sweep > 100 {
+            u.deinit();
+            v.deinit();
+            return error.NoConvergence;
+        }
+        let mut rotated = false;
+        for p in @as(usize, 0)..n {
+            for q in p + 1..n {
+                let mut alpha: f64 = 0.0;
+                let mut beta: f64 = 0.0;
+                let mut gamma: f64 = 0.0;
+                for i in @as(usize, 0)..m {
+                    let up = at(&u, i, p);
+                    let uq = at(&u, i, q);
+                    alpha += up * up;
+                    beta += uq * uq;
+                    gamma += up * uq;
+                }
+                if (gamma == 0.0) or (@abs(gamma) <= ((eps * @sqrt(alpha)) * @sqrt(beta))) {
+                    continue;
+                }
+                rotated = true;
+                let zeta = (beta - alpha) / (2.0 * gamma);
+                let mut t = 1.0 / (@abs(zeta) + math.hypot(zeta, 1.0));
+                if zeta < 0.0 {
+                    t = -t;
+                }
+                let c = 1.0 / math.hypot(t, 1.0);
+                let s = c * t;
+                for i in @as(usize, 0)..m {
+                    let up = at(&u, i, p);
+                    let uq = at(&u, i, q);
+                    put(&mut u, i, p, (c * up) - (s * uq));
+                    put(&mut u, i, q, (s * up) + (c * uq));
+                }
+                for i in @as(usize, 0)..n {
+                    let vp = at(&v, i, p);
+                    let vq = at(&v, i, q);
+                    put(&mut v, i, p, (c * vp) - (s * vq));
+                    put(&mut v, i, q, (s * vp) + (c * vq));
+                }
+            }
+        }
+        if not rotated {
+            break;
+        }
+    }
+    // the singular values are the column norms; normalize U's columns
+    let sv = mem.alloc.[f64](n) catch |e| {
+        u.deinit();
+        v.deinit();
+        return e;
+    };
+    for c in @as(usize, 0)..n {
+        let mut nrm: f64 = 0.0;
+        for i in @as(usize, 0)..m {
+            nrm = math.hypot(nrm, at(&u, i, c));
+        }
+        sv[c] = nrm;
+        if nrm > 0.0 {
+            for i in @as(usize, 0)..m {
+                put(&mut u, i, c, at(&u, i, c) / nrm);
+            }
+        }
+    }
+    // decreasing order
+    for i in @as(usize, 0)..n {
+        let mut best = i;
+        for j in i + 1..n {
+            if sv[j] > sv[best] {
+                best = j;
+            }
+        }
+        if best != i {
+            let t = sv[i];
+            sv[i] = sv[best];
+            sv[best] = t;
+            for r in @as(usize, 0)..m {
+                let tu = at(&u, r, i);
+                put(&mut u, r, i, at(&u, r, best));
+                put(&mut u, r, best, tu);
+            }
+            for r in @as(usize, 0)..n {
+                let tv = at(&v, r, i);
+                put(&mut v, r, i, at(&v, r, best));
+                put(&mut v, r, best, tv);
+            }
+        }
+    }
+    // a zero singular value leaves a zero column in U: complete it to an
+    // orthonormal set (Gram-Schmidt against the unit vectors)
+    for c in @as(usize, 0)..n {
+        if sv[c] > 0.0 {
+            continue;
+        }
+        let mut e: usize = 0;
+        while e < m {
+            for i in @as(usize, 0)..m {
+                put(&mut u, i, c, 0.0);
+            }
+            put(&mut u, e, c, 1.0);
+            for j in @as(usize, 0)..n {
+                if (j == c) or ((sv[j] == 0.0) and (j > c)) {
+                    continue;
+                }
+                let mut d: f64 = 0.0;
+                for i in @as(usize, 0)..m {
+                    d += at(&u, i, j) * at(&u, i, c);
+                }
+                for i in @as(usize, 0)..m {
+                    put(&mut u, i, c, at(&u, i, c) - (d * at(&u, i, j)));
+                }
+            }
+            let mut nrm: f64 = 0.0;
+            for i in @as(usize, 0)..m {
+                nrm = math.hypot(nrm, at(&u, i, c));
+            }
+            if nrm > 0.5 {
+                for i in @as(usize, 0)..m {
+                    put(&mut u, i, c, at(&u, i, c) / nrm);
+                }
+                break;
+            }
+            e += 1;
+        }
+    }
+    return Svd.{ u: u, s: sv, v: v };
+}
+
+/// The numerical rank: the number of singular values above
+/// max(m, n) eps s_max.
+pub fn rank(a: *mx.Matrix.[f64]) !usize {
+    let mut d = svd(a)!;
+    defer d.deinit();
+    if d.s.len == 0 {
+        return 0;
+    }
+    let tol = (d.s[0] * @float_from_int(f64, @max(a.rows, a.cols))) * 2.220446049250313e-16;
+    let mut r: usize = 0;
+    for x in d.s {
+        if x > tol {
+            r += 1;
+        }
+    }
+    return r;
+}
+
+/// The 2-norm condition number, s_max / s_min (infinite if singular).
+pub fn cond(a: *mx.Matrix.[f64]) !f64 {
+    let mut d = svd(a)!;
+    defer d.deinit();
+    if d.s.len == 0 {
+        return 0.0;
+    }
+    return d.s[0] / d.s[d.s.len - 1];
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn mat(r: usize, c: usize, xs: []f64) mx.Matrix.[f64] {
+    return mx.Matrix.[f64].from_slice(r, c, xs) catch @trap();
+}
+
+// |a - b| (Frobenius) <= tol
+fn close(a: *mx.Matrix.[f64], b: *mx.Matrix.[f64], tol: f64) bool {
+    if (a.rows != b.rows) or (a.cols != b.cols) {
+        return false;
+    }
+    let mut d = a.sub(b) catch return false;
+    defer d.deinit();
+    return norm(&d) <= tol;
+}
+
+fn slice_fails(r: ![]mut f64, want: error) bool {
+    let x = r catch |e| return e == want;
+    mem.free(x);
+    return false;
+}
+
+fn matrix_fails(r: !mx.Matrix.[f64], want: error) bool {
+    let mut x = r catch |e| return e == want;
+    x.deinit();
+    return false;
+}
+
+// a^T a (to check orthonormal columns)
+fn gram(a: *mx.Matrix.[f64]) mx.Matrix.[f64] {
+    let mut t = a.transpose() catch @trap();
+    defer t.deinit();
+    return t.mul(a) catch @trap();
+}
+
+test "LU, solve, det and inverse" {
+    let xs: [9]f64 = [2.0, 1.0, 1.0, 4.0, -6.0, 0.0, -2.0, 7.0, 2.0];
+    let mut a = mat(3, 3, xs[..]);
+    defer a.deinit();
+    // numpy.linalg.det
+    @expect(@abs(det(&a)! - -16.0) < 1.0e-13);
+    let b: [3]f64 = [5.0, -2.0, 9.0];
+    let x = solve(&a, b[..])!;
+    defer mem.free(x);
+    @expect((@abs(x[0] - 1.0) < 1.0e-14) and (@abs(x[1] - 1.0) < 1.0e-14) and (@abs(x[2] - 2.0) < 1.0e-14));
+    let mut inv = inverse(&a)!;
+    defer inv.deinit();
+    let mut p = a.mul(&inv)!;
+    defer p.deinit();
+    let mut id = mx.Matrix.[f64].identity(3)!;
+    defer id.deinit();
+    @expect(close(&p, &id, 1.0e-14));
+    let sx: [4]f64 = [1.0, 2.0, 2.0, 4.0];
+    let mut s = mat(2, 2, sx[..]);
+    defer s.deinit();
+    @expect(det(&s)! == 0.0);
+    @expect(slice_fails(solve(&s, sx[..2]), error.Singular));
+    @expect(trace(&a)! == -2.0);
+}
+
+test "Cholesky" {
+    let xs: [9]f64 = [4.0, 12.0, -16.0, 12.0, 37.0, -43.0, -16.0, -43.0, 98.0];
+    let mut a = mat(3, 3, xs[..]);
+    defer a.deinit();
+    let mut l = cholesky(&a)!;
+    defer l.deinit();
+    let want: [9]f64 = [2.0, 0.0, 0.0, 6.0, 1.0, 0.0, -8.0, 5.0, 3.0];
+    let mut w = mat(3, 3, want[..]);
+    defer w.deinit();
+    @expect(close(&l, &w, 1.0e-14));
+    let b: [3]f64 = [1.0, 2.0, 3.0];
+    let mut x: [3]f64 = [0.0; 3];
+    cholesky_solve(&l, b[..], x[..])!;
+    let mut y: [3]f64 = [0.0; 3];
+    mat_vec(&a, x[..], y[..])!;
+    for k in @as(usize, 0)..3 {
+        @expect(@abs(y[k] - b[k]) < 1.0e-12);
+    }
+    let nx: [4]f64 = [1.0, 2.0, 2.0, 1.0];
+    let mut n = mat(2, 2, nx[..]);
+    defer n.deinit();
+    @expect(matrix_fails(cholesky(&n), error.NotPositiveDefinite));
+}
+
+test "QR and least squares" {
+    let xs: [12]f64 = [1.0, 1.0, 1.0, 2.0, 1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 1.0, 6.0];
+    let mut a = mat(6, 2, xs[..]);
+    defer a.deinit();
+    let mut f = qr(&a)!;
+    defer f.deinit();
+    let mut g = gram(&f.q);
+    defer g.deinit();
+    let mut id = mx.Matrix.[f64].identity(2)!;
+    defer id.deinit();
+    @expect(close(&g, &id, 1.0e-14));
+    @expect(at(&f.r, 1, 0) == 0.0);
+    let mut back = f.q.mul(&f.r)!;
+    defer back.deinit();
+    @expect(close(&back, &a, 1.0e-13));
+    // numpy.linalg.lstsq: the line through the points (x, 2x + 1 + noise)
+    let b: [6]f64 = [3.1, 4.9, 7.2, 8.8, 11.1, 13.0];
+    let c = lstsq(&a, b[..])!;
+    defer mem.free(c);
+    @expect(@abs(c[0] - 1.0466666666666617) < 1.0e-13);
+    @expect(@abs(c[1] - 1.9914285714285729) < 1.0e-13);
+    // rank deficient
+    let dx: [6]f64 = [1.0, 2.0, 2.0, 4.0, 3.0, 6.0];
+    let mut d = mat(3, 2, dx[..]);
+    defer d.deinit();
+    @expect(slice_fails(lstsq(&d, b[..3]), error.Singular));
+}
+
+test "symmetric eigenproblems" {
+    let xs: [16]f64 = [4.0, 1.0, -2.0, 2.0, 1.0, 2.0, 0.0, 1.0, -2.0, 0.0, 3.0, -2.0, 2.0, 1.0, -2.0, -1.0];
+    let mut a = mat(4, 4, xs[..]);
+    defer a.deinit();
+    let mut e = eigen_symmetric(&a)!;
+    defer e.deinit();
+    // numpy.linalg.eigvalsh
+    let want: [4]f64 = [-2.197516977439427, 1.0843644637732177, 2.2685314064312423, 6.844621107234966];
+    for k in @as(usize, 0)..4 {
+        @expect(@abs(e.values[k] - want[k]) < 1.0e-13);
+    }
+    // A V = V diag(values), V orthogonal
+    let mut av = a.mul(&e.vectors)!;
+    defer av.deinit();
+    let mut vl = e.vectors.clone()!;
+    defer vl.deinit();
+    for r in @as(usize, 0)..4 {
+        for c in @as(usize, 0)..4 {
+            put(&mut vl, r, c, at(&vl, r, c) * e.values[c]);
+        }
+    }
+    @expect(close(&av, &vl, 1.0e-13));
+    let mut g = gram(&e.vectors);
+    defer g.deinit();
+    let mut id = mx.Matrix.[f64].identity(4)!;
+    defer id.deinit();
+    @expect(close(&g, &id, 1.0e-14));
+    // tiny eigenvalues keep their relative accuracy
+    let hx: [4]f64 = [1.0e-20, 0.0, 0.0, 1.0];
+    let mut h = mat(2, 2, hx[..]);
+    defer h.deinit();
+    let mut he = eigen_symmetric(&h)!;
+    defer he.deinit();
+    @expect((he.values[0] == 1.0e-20) and (he.values[1] == 1.0));
+}
+
+test "singular value decomposition" {
+    let xs: [12]f64 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.5];
+    let shapes: [2][2]usize = [[4, 3], [3, 4]];
+    for sh in shapes {
+        let mut a = mat(sh[0], sh[1], xs[..]);
+        defer a.deinit();
+        let mut d = svd(&a)!;
+        defer d.deinit();
+        let k = @min(sh[0], sh[1]);
+        @expect((d.s.len == k) and (d.u.rows == sh[0]) and (d.u.cols == k) and (d.v.rows == sh[1]) and (d.v.cols == k));
+        // U diag(s) V^T = A
+        let mut us = d.u.clone()!;
+        defer us.deinit();
+        for r in @as(usize, 0)..us.rows {
+            for c in @as(usize, 0)..k {
+                put(&mut us, r, c, at(&us, r, c) * d.s[c]);
+            }
+        }
+        let mut vt = d.v.transpose()!;
+        defer vt.deinit();
+        let mut back = us.mul(&vt)!;
+        defer back.deinit();
+        @expect(close(&back, &a, 1.0e-13));
+        let mut id = mx.Matrix.[f64].identity(k)!;
+        defer id.deinit();
+        let mut gu = gram(&d.u);
+        defer gu.deinit();
+        let mut gv = gram(&d.v);
+        defer gv.deinit();
+        @expect(close(&gu, &id, 1.0e-14) and close(&gv, &id, 1.0e-14));
+    }
+    // numpy.linalg.svd(..., compute_uv=False) of the 4 x 3 matrix
+    let mut a = mat(4, 3, xs[..]);
+    defer a.deinit();
+    let mut d = svd(&a)!;
+    defer d.deinit();
+    let want: [3]f64 = [25.70657408594712, 1.1863957154243983, 0.12047393965028469];
+    for k in @as(usize, 0)..3 {
+        @expect(@abs(d.s[k] - want[k]) < 1.0e-13);
+    }
+    @expect(rank(&a)! == 3);
+    // a rank-one matrix: its U still has orthonormal columns
+    let ox: [6]f64 = [1.0, 2.0, 2.0, 4.0, 3.0, 6.0];
+    let mut o = mat(3, 2, ox[..]);
+    defer o.deinit();
+    @expect(rank(&o)! == 1);
+    let mut od = svd(&o)!;
+    defer od.deinit();
+    let mut go = gram(&od.u);
+    defer go.deinit();
+    let mut id2 = mx.Matrix.[f64].identity(2)!;
+    defer id2.deinit();
+    @expect(close(&go, &id2, 1.0e-14));
+    let cx: [4]f64 = [1.0, 0.0, 0.0, 1.0e-8];
+    let mut cm = mat(2, 2, cx[..]);
+    defer cm.deinit();
+    @expect(@abs(cond(&cm)! - 1.0e8) < 1.0e-6);
+}

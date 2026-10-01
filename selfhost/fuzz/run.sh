@@ -6,14 +6,14 @@
 #
 #   selfhost/fuzz/run.sh [first seed] [last seed]    (default 1 5)
 #
-# Environment: NEW (default selfhost/build/phalange), OLD (default
-# compiler/build/phalange). AArch64 runs need qemu-aarch64, the AArch64 C
+# Environment: NEW (default selfhost/build/axiom), OLD (default
+# compiler/build/axiom). AArch64 runs need qemu-aarch64, the AArch64 C
 # library in /usr/aarch64-linux-gnu and aarch64-linux-gnu-gcc (for the test's
 # C host functions); they are skipped otherwise.
 set -u
 cd "$(dirname "$0")/../.."
-NEW=${NEW:-selfhost/build/phalange}
-OLD=${OLD:-compiler/build/phalange}
+NEW=${NEW:-selfhost/build/axiom}
+OLD=${OLD:-compiler/build/axiom}
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 RT=tests/native_rt.c
@@ -36,7 +36,7 @@ seed=${1:-1}
 last=${2:-5}
 while [ "$seed" -le "$last" ]; do
     echo "seed $seed"
-    f=$T/f$seed.ph
+    f=$T/f$seed.ax
     python3 selfhost/fuzz/gen.py "$seed" > "$f"
     $OLD build "$f" --target=native --link=$RT -o "$T/ref" >/dev/null 2>&1 || { echo "  reference build failed"; exit 1; }
     "$T/ref" > "$T/ref.txt" 2>&1

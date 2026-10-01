@@ -1,6 +1,6 @@
 // ast.h - abstract syntax tree. Sema annotates nodes in place.
-#ifndef PH_AST_H
-#define PH_AST_H
+#ifndef AX_AST_H
+#define AX_AST_H
 
 #include "lexer.h"
 

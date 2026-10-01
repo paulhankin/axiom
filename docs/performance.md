@@ -5,11 +5,11 @@ was slow, and what changed.
 
 ## How to measure
 
-    phalange build --target=native -O2 tests/bench/std.ph -o build/bench/std
-    build/bench/std [filter]      # Phalange; also writes the inputs to build/bench/
+    axiom build --target=native -O2 tests/bench/std.ax -o build/bench/std
+    build/bench/std [filter]      # Axiom; also writes the inputs to build/bench/
     tools/bench_std.py [filter]   # the same work in zlib, OpenSSL, libjpeg, Pillow, ...
 
-`tests/bench/std.ph` times the standard library's heavy operations on
+`tests/bench/std.ax` times the standard library's heavy operations on
 generated inputs (4 MB of English-like text, a 4 MB JSON document, a
 1024×768 image, a 2 MB Markdown document, and so on). It saves those inputs so
 that `tools/bench_std.py` can run the same work through Python's bindings
@@ -18,7 +18,7 @@ overhead hardly counts for these bulk operations.
 
 To find where the time goes, use the sampling profiler:
 
-    phalange profile prog.ph --target=native -O2
+    axiom profile prog.ax --target=native -O2
 
 ## Results
 
@@ -50,7 +50,7 @@ To find where the time goes, use the sampling profiler:
 The machine was a 4-core 2.1 GHz Xeon VM, and the numbers vary by 10–20%
 from run to run. "Before" is the library at the start of the review. The
 reference column is a C library with hand-written SIMD, or hardware
-instructions such as AES-NI and SHA-NI where it has them. Phalange has no
+instructions such as AES-NI and SHA-NI where it has them. Axiom has no
 hardware crypto instructions, so AES and SHA-256 can't match those.
 
 ## What changed
@@ -84,7 +84,7 @@ overflow; wrapping operators (`+%`, `*%`) now say so, with a comment on why.
 ## Still slower than it could be
 
 - **AES-GCM and SHA-256** would need hardware instructions (AES-NI,
-  PCLMULQDQ, SHA-NI) to approach OpenSSL. Phalange has no way to reach
+  PCLMULQDQ, SHA-NI) to approach OpenSSL. Axiom has no way to reach
   them yet.
 - **Strokes** are built as one small polygon per segment and join, then
   rasterized with 16 sample lines per row. An outline stroker, or analytic

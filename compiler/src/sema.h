@@ -1,6 +1,6 @@
 // sema.h - semantic analysis: module loading, name resolution, type checking.
-#ifndef PH_SEMA_H
-#define PH_SEMA_H
+#ifndef AX_SEMA_H
+#define AX_SEMA_H
 
 #include "types.h"
 
@@ -19,7 +19,7 @@ extern Program g_prog;
 
 typedef struct SemaOptions {
     const char *std_dir;
-    // Extra modules to load after the root (phalange test <package> loads
+    // Extra modules to load after the root (axiom test <package> loads
     // every source file of the package).
     const char *const *extra_files;
     int n_extra_files;

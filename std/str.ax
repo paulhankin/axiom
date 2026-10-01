@@ -1,0 +1,885 @@
+// =============================================================================
+// std/str.ax - byte strings: comparing, searching, splitting, trimming,
+// ASCII case, UTF-8, and String (a growable string that owns its bytes).
+//
+// Strings are []u8. Functions that look at characters treat the bytes as
+// UTF-8 where it matters (runes, Utf8Iter) and as ASCII otherwise (case,
+// whitespace). Nothing here allocates except the functions that return !
+// with new memory (free it with mem.free) and String.
+// =============================================================================
+
+import "io.ax" as io;
+import "mem.ax" as mem;
+
+error { NotFound, Done, InvalidUtf8, OutOfMemory }
+
+// -----------------------------------------------------------------------------
+// Comparison
+// -----------------------------------------------------------------------------
+
+pub fn eq(a: []u8, b: []u8) bool {
+    return @mem_eq(a, b);
+}
+
+/// Byte-wise order: negative if a < b, 0 if equal, positive if a > b.
+pub fn compare(a: []u8, b: []u8) i32 {
+    let n = @min(a.len, b.len);
+    for i in 0..n {
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    if a.len < b.len {
+        return -1;
+    }
+    if a.len > b.len {
+        return 1;
+    }
+    return 0;
+}
+
+/// For sorting: vec.sort(names, str.less).
+pub fn less(a: []u8, b: []u8) bool {
+    return compare(a, b) < 0;
+}
+
+/// Equal ignoring ASCII case.
+pub fn eq_ignore_case(a: []u8, b: []u8) bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if to_lower_byte(a[i]) != to_lower_byte(b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn starts_with(s: []u8, prefix: []u8) bool {
+    return (s.len >= prefix.len) and @mem_eq(s[..prefix.len], prefix);
+}
+
+pub fn ends_with(s: []u8, suffix: []u8) bool {
+    return (s.len >= suffix.len) and @mem_eq(s[s.len - suffix.len..], suffix);
+}
+
+// -----------------------------------------------------------------------------
+// Searching
+// -----------------------------------------------------------------------------
+
+pub fn index_of_byte(s: []u8, b: u8) !usize {
+    let mut i: usize = 0;
+    // 16 bytes at a time
+    if s.len >= 16 {
+        let needle: u8x16 = @splat(b);
+        while (i + 16) <= s.len {
+            let m = @bitmask(@lanes_eq(@load(u8x16, s[i..i + 16]), needle));
+            if m != 0 {
+                return i + @as(usize, @ctz(m));
+            }
+            i += 16;
+        }
+    }
+    while i < s.len {
+        if s[i] == b {
+            return i;
+        }
+        i += 1;
+    }
+    return error.NotFound;
+}
+
+pub fn last_index_of_byte(s: []u8, b: u8) !usize {
+    let mut i = s.len;
+    while i > 0 {
+        i -= 1;
+        if s[i] == b {
+            return i;
+        }
+    }
+    return error.NotFound;
+}
+
+/// The first position of needle in s. An empty needle is found at 0.
+pub fn index_of(s: []u8, needle: []u8) !usize {
+    return index_of_from(s, needle, 0);
+}
+
+/// The first position of needle in s at or after `from`.
+pub fn index_of_from(s: []u8, needle: []u8, from: usize) !usize {
+    if from > s.len {
+        return error.NotFound;
+    }
+    if needle.len == 0 {
+        return from;
+    }
+    if needle.len > (s.len - from) {
+        return error.NotFound;
+    }
+    let first = needle[0];
+    let last_start = s.len - needle.len;
+    let mut i = from;
+    while i <= last_start {
+        // find the first byte quickly, then compare the rest
+        let k = index_of_byte(s[i..last_start + 1], first) catch return error.NotFound;
+        i += k;
+        if @mem_eq(s[i..i + needle.len], needle) {
+            return i;
+        }
+        i += 1;
+    }
+    return error.NotFound;
+}
+
+/// The last position of needle in s.
+pub fn last_index_of(s: []u8, needle: []u8) !usize {
+    if needle.len > s.len {
+        return error.NotFound;
+    }
+    let mut i = (s.len - needle.len) + 1;
+    while i > 0 {
+        i -= 1;
+        if @mem_eq(s[i..i + needle.len], needle) {
+            return i;
+        }
+    }
+    return error.NotFound;
+}
+
+pub fn contains(s: []u8, needle: []u8) bool {
+    _ = index_of(s, needle) catch return false;
+    return true;
+}
+
+/// The number of non-overlapping occurrences of needle (needle must not be
+/// empty).
+pub fn count(s: []u8, needle: []u8) usize {
+    if needle.len == 0 {
+        @trap();
+    }
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    loop {
+        let k = index_of_from(s, needle, i) catch break;
+        n += 1;
+        i = k + needle.len;
+    }
+    return n;
+}
+
+/// The first position of any byte from `set`.
+pub fn index_of_any(s: []u8, set: []u8) !usize {
+    for i in 0..s.len {
+        for c in set {
+            if s[i] == c {
+                return i;
+            }
+        }
+    }
+    return error.NotFound;
+}
+
+// -----------------------------------------------------------------------------
+// Trimming and cutting
+// -----------------------------------------------------------------------------
+
+/// Space, tab, newline, carriage return, vertical tab, form feed.
+pub fn is_space(c: u8) bool {
+    return (c == ' ') or ((c >= 9) and (c <= 13));
+}
+
+pub fn is_digit(c: u8) bool {
+    return (c >= '0') and (c <= '9');
+}
+
+pub fn is_alpha(c: u8) bool {
+    let l = c | 0x20;
+    return (l >= 'a') and (l <= 'z');
+}
+
+pub fn is_alnum(c: u8) bool {
+    return is_alpha(c) or is_digit(c);
+}
+
+pub fn is_hex_digit(c: u8) bool {
+    let l = c | 0x20;
+    return is_digit(c) or ((l >= 'a') and (l <= 'f'));
+}
+
+pub fn is_upper(c: u8) bool {
+    return (c >= 'A') and (c <= 'Z');
+}
+
+pub fn is_lower(c: u8) bool {
+    return (c >= 'a') and (c <= 'z');
+}
+
+/// Removes leading and trailing ASCII whitespace.
+pub fn trim(s: []u8) []u8 {
+    return trim_right(trim_left(s));
+}
+
+pub fn trim_left(s: []u8) []u8 {
+    let mut i: usize = 0;
+    while (i < s.len) and is_space(s[i]) {
+        i += 1;
+    }
+    return s[i..];
+}
+
+pub fn trim_right(s: []u8) []u8 {
+    let mut n = s.len;
+    while (n > 0) and is_space(s[n - 1]) {
+        n -= 1;
+    }
+    return s[..n];
+}
+
+/// Removes leading and trailing bytes that are in `set`.
+pub fn trim_bytes(s: []u8, set: []u8) []u8 {
+    let mut i: usize = 0;
+    let mut n = s.len;
+    while (i < n) and in_set(s[i], set) {
+        i += 1;
+    }
+    while (n > i) and in_set(s[n - 1], set) {
+        n -= 1;
+    }
+    return s[i..n];
+}
+
+fn in_set(c: u8, set: []u8) bool {
+    for x in set {
+        if x == c {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// s without `prefix`, or error.NotFound if s does not start with it.
+pub fn strip_prefix(s: []u8, prefix: []u8) ![]u8 {
+    if not starts_with(s, prefix) {
+        return error.NotFound;
+    }
+    return s[prefix.len..];
+}
+
+/// s without `suffix`, or error.NotFound if s does not end with it.
+pub fn strip_suffix(s: []u8, suffix: []u8) ![]u8 {
+    if not ends_with(s, suffix) {
+        return error.NotFound;
+    }
+    return s[..s.len - suffix.len];
+}
+
+/// The two sides of the first `sep` in s.
+pub struct Cut {
+    before: []u8,
+    after: []u8,
+}
+
+/// Splits s around the first occurrence of sep: cut("k=v", "=") gives
+/// "k" and "v". Fails with NotFound if sep does not occur.
+pub fn cut(s: []u8, sep: []u8) !Cut {
+    let i = index_of(s, sep)!;
+    return Cut.{ before: s[..i], after: s[i + sep.len..] };
+}
+
+// -----------------------------------------------------------------------------
+// Splitting
+// -----------------------------------------------------------------------------
+
+/// The pieces of a string between separators. For "a,b,,c" split on ","
+/// the pieces are "a", "b", "" and "c". next() fails with error.Done after
+/// the last piece:
+///
+///     let mut it = str.split(line, ",");
+///     loop {
+///         let field = it.next() catch break;
+///         ...
+///     }
+pub struct Split {
+    rest: []u8,
+    sep: []u8,
+    done: bool,
+
+    pub fn next(self: *mut Split) ![]u8 {
+        if self.done {
+            return error.Done;
+        }
+        let i = index_of(self.rest, self.sep) catch {
+            self.done = true;
+            return self.rest;
+        };
+        let piece = self.rest[..i];
+        self.rest = self.rest[i + self.sep.len..];
+        return piece;
+    }
+
+    /// Everything not yet returned.
+    pub fn remainder(self: *Split) []u8 {
+        return self.rest;
+    }
+}
+
+/// Splits s on every occurrence of sep (which must not be empty).
+pub fn split(s: []u8, sep: []u8) Split {
+    if sep.len == 0 {
+        @trap();
+    }
+    return Split.{ rest: s, sep: sep, done: false };
+}
+
+/// Lines of text, without their "\n" or "\r\n". A final newline does not
+/// start another (empty) line.
+pub struct Lines {
+    rest: []u8,
+
+    pub fn next(self: *mut Lines) ![]u8 {
+        if self.rest.len == 0 {
+            return error.Done;
+        }
+        let mut line = self.rest;
+        let i = index_of_byte(self.rest, '\n') catch self.rest.len;
+        if i < self.rest.len {
+            line = self.rest[..i];
+            self.rest = self.rest[i + 1..];
+        } else {
+            self.rest = self.rest[self.rest.len..];
+        }
+        if (line.len > 0) and (line[line.len - 1] == '\r') {
+            line = line[..line.len - 1];
+        }
+        return line;
+    }
+}
+
+pub fn lines(s: []u8) Lines {
+    return Lines.{ rest: s };
+}
+
+/// Runs of non-whitespace: fields("  a b\tc ") gives "a", "b", "c".
+pub struct Fields {
+    rest: []u8,
+
+    pub fn next(self: *mut Fields) ![]u8 {
+        let s = trim_left(self.rest);
+        if s.len == 0 {
+            self.rest = s;
+            return error.Done;
+        }
+        let mut n: usize = 0;
+        while (n < s.len) and not is_space(s[n]) {
+            n += 1;
+        }
+        self.rest = s[n..];
+        return s[..n];
+    }
+}
+
+pub fn fields(s: []u8) Fields {
+    return Fields.{ rest: s };
+}
+
+// -----------------------------------------------------------------------------
+// ASCII case
+// -----------------------------------------------------------------------------
+
+pub fn to_lower_byte(c: u8) u8 {
+    if is_upper(c) {
+        return c | 0x20;
+    }
+    return c;
+}
+
+pub fn to_upper_byte(c: u8) u8 {
+    if is_lower(c) {
+        return c & 0xDF;
+    }
+    return c;
+}
+
+/// Lower-cases ASCII letters in place.
+pub fn lower_in_place(s: []mut u8) void {
+    for i in 0..s.len {
+        s[i] = to_lower_byte(s[i]);
+    }
+}
+
+/// Upper-cases ASCII letters in place.
+pub fn upper_in_place(s: []mut u8) void {
+    for i in 0..s.len {
+        s[i] = to_upper_byte(s[i]);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// New strings (free the result with mem.free)
+// -----------------------------------------------------------------------------
+
+pub fn dup(s: []u8) ![]mut u8 {
+    let out = mem.alloc.[u8](s.len)!;
+    @mem_copy(out, s);
+    return out;
+}
+
+pub fn concat(a: []u8, b: []u8) ![]mut u8 {
+    let out = mem.alloc.[u8](a.len + b.len)!;
+    @mem_copy(out[..a.len], a);
+    @mem_copy(out[a.len..], b);
+    return out;
+}
+
+/// The parts with `sep` between them.
+pub fn join(parts: [][]u8, sep: []u8) ![]mut u8 {
+    let mut n: usize = 0;
+    for p in parts {
+        n += p.len;
+    }
+    if parts.len > 1 {
+        n += sep.len * (parts.len - 1);
+    }
+    let out = mem.alloc.[u8](n)!;
+    let mut at: usize = 0;
+    for i in 0..parts.len {
+        if i > 0 {
+            @mem_copy(out[at..at + sep.len], sep);
+            at += sep.len;
+        }
+        let p = parts[i];
+        @mem_copy(out[at..at + p.len], p);
+        at += p.len;
+    }
+    return out;
+}
+
+/// s with every occurrence of `from` (not empty) replaced by `to`.
+pub fn replace(s: []u8, from: []u8, to: []u8) ![]mut u8 {
+    let n = count(s, from);
+    let out = mem.alloc.[u8]((s.len - (n * from.len)) + (n * to.len))!;
+    let mut i: usize = 0;
+    let mut at: usize = 0;
+    loop {
+        let k = index_of_from(s, from, i) catch break;
+        @mem_copy(out[at..at + (k - i)], s[i..k]);
+        at += k - i;
+        @mem_copy(out[at..at + to.len], to);
+        at += to.len;
+        i = k + from.len;
+    }
+    @mem_copy(out[at..], s[i..]);
+    return out;
+}
+
+/// s repeated n times.
+pub fn repeat(s: []u8, n: usize) ![]mut u8 {
+    let total = @mul_checked(s.len, n) catch return error.OutOfMemory;
+    let out = mem.alloc.[u8](total)!;
+    for i in 0..n {
+        @mem_copy(out[i * s.len..(i + 1) * s.len], s);
+    }
+    return out;
+}
+
+pub fn to_lower(s: []u8) ![]mut u8 {
+    let out = dup(s)!;
+    lower_in_place(out);
+    return out;
+}
+
+pub fn to_upper(s: []u8) ![]mut u8 {
+    let out = dup(s)!;
+    upper_in_place(out);
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// UTF-8
+// -----------------------------------------------------------------------------
+
+/// U+FFFD, which decoding produces for invalid bytes.
+pub const REPLACEMENT: u32 = 0xFFFD;
+
+/// A code point and the number of bytes it took.
+pub struct Rune {
+    value: u32,
+    len: usize,
+}
+
+/// Decodes the code point at the start of s (which must not be empty).
+/// Invalid or truncated sequences, overlong forms and surrogates decode as
+/// REPLACEMENT with length 1.
+pub fn decode_rune(s: []u8) Rune {
+    let bad = Rune.{ value: REPLACEMENT, len: 1 };
+    let b0 = s[0];
+    if b0 < 0x80 {
+        return Rune.{ value: @as(u32, b0), len: 1 };
+    }
+    let mut need: usize = 0;
+    let mut v: u32 = 0;
+    let mut min: u32 = 0;
+    if (b0 & 0xE0) == 0xC0 {
+        need = 1;
+        v = @as(u32, b0 & 0x1F);
+        min = 0x80;
+    } else if (b0 & 0xF0) == 0xE0 {
+        need = 2;
+        v = @as(u32, b0 & 0x0F);
+        min = 0x800;
+    } else if (b0 & 0xF8) == 0xF0 {
+        need = 3;
+        v = @as(u32, b0 & 0x07);
+        min = 0x10000;
+    } else {
+        return bad;
+    }
+    if s.len <= need {
+        return bad;
+    }
+    for i in 1..need + 1 {
+        let b = s[i];
+        if (b & 0xC0) != 0x80 {
+            return bad;
+        }
+        v = (v << 6) | @as(u32, b & 0x3F);
+    }
+    if (v < min) or (v > 0x10FFFF) or ((v >= 0xD800) and (v <= 0xDFFF)) {
+        return bad;
+    }
+    return Rune.{ value: v, len: need + 1 };
+}
+
+/// Encodes r into buf (4 bytes suffice) and returns the bytes written.
+/// Values that are not code points (surrogates, above U+10FFFF) encode as
+/// REPLACEMENT.
+pub fn encode_rune(buf: []mut u8, r: u32) []u8 {
+    let mut c = r;
+    if ((c >= 0xD800) and (c <= 0xDFFF)) or (c > 0x10FFFF) {
+        c = REPLACEMENT;
+    }
+    if c < 0x80 {
+        buf[0] = @truncate(u8, c);
+        return buf[..1];
+    }
+    if c < 0x800 {
+        buf[0] = 0xC0 | @truncate(u8, c >> 6);
+        buf[1] = 0x80 | @truncate(u8, c & 0x3F);
+        return buf[..2];
+    }
+    if c < 0x10000 {
+        buf[0] = 0xE0 | @truncate(u8, c >> 12);
+        buf[1] = 0x80 | @truncate(u8, (c >> 6) & 0x3F);
+        buf[2] = 0x80 | @truncate(u8, c & 0x3F);
+        return buf[..3];
+    }
+    buf[0] = 0xF0 | @truncate(u8, c >> 18);
+    buf[1] = 0x80 | @truncate(u8, (c >> 12) & 0x3F);
+    buf[2] = 0x80 | @truncate(u8, (c >> 6) & 0x3F);
+    buf[3] = 0x80 | @truncate(u8, c & 0x3F);
+    return buf[..4];
+}
+
+/// Whether s is well-formed UTF-8.
+pub fn valid_utf8(s: []u8) bool {
+    let mut i: usize = 0;
+    while i < s.len {
+        if s[i] < 0x80 {
+            i += 1;
+            continue;
+        }
+        let r = decode_rune(s[i..]);
+        if (r.value == REPLACEMENT) and (r.len == 1) {
+            // a real U+FFFD is three bytes long
+            return false;
+        }
+        i += r.len;
+    }
+    return true;
+}
+
+/// The number of code points (each invalid byte counts as one).
+pub fn rune_count(s: []u8) usize {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        if s[i] < 0x80 {
+            i += 1;
+        } else {
+            i += decode_rune(s[i..]).len;
+        }
+        n += 1;
+    }
+    return n;
+}
+
+/// The code points of a string, with their byte offsets.
+pub struct Utf8Iter {
+    s: []u8,
+    pos: usize,
+
+    /// The next code point; `self.pos` is then just past it.
+    pub fn next(self: *mut Utf8Iter) !u32 {
+        if self.pos >= self.s.len {
+            return error.Done;
+        }
+        let r = decode_rune(self.s[self.pos..]);
+        self.pos += r.len;
+        return r.value;
+    }
+}
+
+pub fn runes(s: []u8) Utf8Iter {
+    return Utf8Iter.{ s: s, pos: 0 };
+}
+
+// -----------------------------------------------------------------------------
+// String: a growable string that owns its bytes
+// -----------------------------------------------------------------------------
+
+/// A growable byte string. `deinit` frees it; `take` hands the bytes to the
+/// caller instead. Slices from `bytes()` are invalidated by anything that
+/// grows the string.
+pub struct String {
+    buf: []mut u8,  // capacity == buf.len
+    len: usize,
+
+    pub fn init() String {
+        return String.{ buf: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0), len: 0 };
+    }
+
+    pub fn with_capacity(cap: usize) !String {
+        let mut s = String.init();
+        s.reserve(cap)!;
+        return s;
+    }
+
+    pub fn from(bytes: []u8) !String {
+        let mut s = String.init();
+        s.push_str(bytes)!;
+        return s;
+    }
+
+    pub fn deinit(self: *mut String) void {
+        mem.free(self.buf);
+        self.* = String.init();
+    }
+
+    /// The contents.
+    pub fn bytes(self: *String) []mut u8 {
+        return self.buf[..self.len];
+    }
+
+    pub fn capacity(self: *String) usize {
+        return self.buf.len;
+    }
+
+    /// Ensures room for `extra` more bytes without reallocating.
+    pub fn reserve(self: *mut String, extra: usize) !void {
+        let need = @add_checked(self.len, extra) catch return error.OutOfMemory;
+        if need <= self.buf.len {
+            return;
+        }
+        let mut cap = @max(self.buf.len, 16);
+        while cap < need {
+            cap = @mul_checked(cap, 2) catch return error.OutOfMemory;
+        }
+        self.buf = mem.realloc(self.buf, cap)!;
+    }
+
+    pub fn push(self: *mut String, b: u8) !void {
+        if self.len == self.buf.len {
+            self.reserve(1)!;
+        }
+        self.buf[self.len] = b;
+        self.len += 1;
+    }
+
+    pub fn push_str(self: *mut String, s: []u8) !void {
+        if s.len == 0 {
+            return;
+        }
+        // s may be part of this String, which growing moves: copy from where it went
+        let base = @int_from_ptr(self.buf.ptr);
+        let at = @int_from_ptr(s.ptr);
+        if (at >= base) and (at - base < self.buf.len) {
+            let off = at - base;
+            self.reserve(s.len)!;
+            @mem_copy(self.buf[self.len..self.len + s.len], self.buf[off..off + s.len]);
+        } else {
+            self.reserve(s.len)!;
+            @mem_copy(self.buf[self.len..self.len + s.len], s);
+        }
+        self.len += s.len;
+    }
+
+    /// Appends a code point as UTF-8.
+    pub fn push_rune(self: *mut String, r: u32) !void {
+        let mut tmp: [4]u8 = [0; 4];
+        self.push_str(encode_rune(tmp[..], r))!;
+    }
+
+    pub fn clear(self: *mut String) void {
+        self.len = 0;
+    }
+
+    pub fn truncate(self: *mut String, n: usize) void {
+        if n < self.len {
+            self.len = n;
+        }
+    }
+
+    /// Returns the contents as memory the caller owns (free it with
+    /// mem.free) and leaves the String empty.
+    pub fn take(self: *mut String) ![]mut u8 {
+        let out = mem.realloc(self.buf, self.len)!;
+        self.* = String.init();
+        return out;
+    }
+
+    /// A Writer that appends to this String (which must not move while the
+    /// Writer is in use).
+    pub fn writer(self: *mut String) io.Writer {
+        return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: string_write };
+    }
+}
+
+fn string_write(ctx: *mut void, bytes: []u8) !usize {
+    let s = @ptr_cast(*mut String, ctx);
+    s.push_str(bytes) catch return error.OutOfMemory;
+    return bytes.len;
+}
+
+// -----------------------------------------------------------------------------
+// Tests (axiom test std/str.ax)
+// -----------------------------------------------------------------------------
+
+test "compare and search" {
+    @expect(eq("abc", "abc"));
+    @expect(compare("abc", "abd") < 0);
+    @expect(compare("ab", "abc") < 0);
+    @expect(compare("b", "abc") > 0);
+    @expect_eq(compare("", ""), 0);
+    @expect(eq_ignore_case("HeLLo", "hello"));
+    @expect(starts_with("hello", "he") and ends_with("hello", "llo"));
+    @expect(not starts_with("he", "hello"));
+    @expect_eq(index_of("hello world", "o w")!, 4);
+    @expect_eq(index_of("aaab", "ab")!, 2);
+    @expect_eq(last_index_of("abcabc", "bc")!, 4);
+    @expect_eq(index_of("x", "")!, 0);
+    @expect(not contains("hello", "xyz"));
+    @expect_eq(count("a,b,,c", ","), 3);
+    @expect_eq(count("aaaa", "aa"), 2);
+    @expect_eq(index_of_any("hello", "lo")!, 2);
+    // the 16-byte scan and its tail
+    let long = "0123456789abcdefghijklmnopqrstuvwxyz";
+    @expect_eq(index_of_byte(long, 'z')!, 35);
+    @expect_eq(index_of_byte(long, 'g')!, 16);
+    @expect_eq(index_of(long, "xyz")!, 33);
+    _ = index_of_byte(long, '!') catch return;
+    @trap();
+}
+
+test "trim and cut" {
+    @expect_eq(trim("  \t hi there \r\n"), "hi there");
+    @expect_eq(trim("   "), "");
+    @expect_eq(trim_left("  x "), "x ");
+    @expect_eq(trim_bytes("--x-y--", "-"), "x-y");
+    @expect_eq(strip_prefix("v1.2", "v")!, "1.2");
+    let c = cut("key=value=x", "=")!;
+    @expect_eq(c.before, "key");
+    @expect_eq(c.after, "value=x");
+    _ = cut("novalue", "=") catch return;
+    @trap();
+}
+
+fn is_done(r: ![]u8) bool {
+    _ = r catch |e| {
+        return e == error.Done;
+    };
+    return false;
+}
+
+test "split, lines and fields" {
+    let mut it = split("a,b,,c", ",");
+    @expect_eq(it.next()!, "a");
+    @expect_eq(it.next()!, "b");
+    @expect_eq(it.next()!, "");
+    @expect_eq(it.next()!, "c");
+    @expect(is_done(it.next()));
+    let mut ls = lines("one\r\ntwo\n\nthree\n");
+    @expect_eq(ls.next()!, "one");
+    @expect_eq(ls.next()!, "two");
+    @expect_eq(ls.next()!, "");
+    @expect_eq(ls.next()!, "three");
+    let mut n: usize = 0;
+    let mut fs = fields("  a  bb\tccc\n");
+    loop {
+        let f = fs.next() catch break;
+        n += f.len;
+    }
+    @expect_eq(n, 6);
+}
+
+test "new strings" {
+    let parts: [3][]u8 = ["a", "bc", "d"];
+    let j = join(parts[..], ", ")!;
+    defer mem.free(j);
+    @expect_eq(j, "a, bc, d");
+    let r = replace("one two two", "two", "2")!;
+    defer mem.free(r);
+    @expect_eq(r, "one 2 2");
+    let r2 = replace("aaa", "a", "bb")!;
+    defer mem.free(r2);
+    @expect_eq(r2, "bbbbbb");
+    let u = to_upper("mIxEd 1")!;
+    defer mem.free(u);
+    @expect_eq(u, "MIXED 1");
+    let rep = repeat("ab", 3)!;
+    defer mem.free(rep);
+    @expect_eq(rep, "ababab");
+}
+
+test "utf-8" {
+    let s = "h\u{e9}llo \u{1F600}";
+    @expect_eq(rune_count(s), 7);
+    @expect(valid_utf8(s));
+    let mut it = runes(s);
+    @expect_eq(it.next()!, 'h');
+    @expect_eq(it.next()!, 0xE9);
+    let mut buf: [4]u8 = [0; 4];
+    @expect_eq(encode_rune(buf[..], 0x1F600), "\u{1F600}");
+    @expect_eq(encode_rune(buf[..], 0xD800), "\u{FFFD}");
+    let bad: [3]u8 = [0xE2, 0x28, 0xA1];
+    @expect(not valid_utf8(bad[..]));
+    let overlong: [2]u8 = [0xC0, 0xAF];
+    @expect_eq(decode_rune(overlong[..]).value, REPLACEMENT);
+}
+
+test "String" {
+    let mut s = String.init();
+    defer s.deinit();
+    s.push_str("hello")!;
+    s.push(',')!;
+    s.push_rune(0x20AC)!;
+    let w = s.writer();
+    w.print(" world")!;
+    @expect_eq(s.bytes(), "hello,\u{20ac} world");
+    let owned = s.take()!;
+    defer mem.free(owned);
+    @expect_eq(owned.len, 15);
+    @expect_eq(s.len, 0);
+}
+
+test "push_str from itself" {
+    let mut s = String.init();
+    defer s.deinit();
+    s.push_str("abcd")!;
+    s.push_str(s.bytes())!;
+    s.push_str(s.bytes()[2..5])!;
+    @expect(eq(s.bytes(), "abcdabcdcda"));
+}

@@ -31,18 +31,18 @@ best() {
 
 for job in "-O0 --units=program" "-O2"; do
     # shellcheck disable=SC2086
-    a=$(best $B/phalange1 build selfhost/src/main.ph --target=native $job -o $T/x)
+    a=$(best $B/axiom1 build selfhost/src/main.ax --target=native $job -o $T/x)
     # shellcheck disable=SC2086
-    b=$(best $B/phalange2 build selfhost/src/main.ph --target=native $job -o $T/y)
+    b=$(best $B/axiom2 build selfhost/src/main.ax --target=native $job -o $T/y)
     echo "compile selfhost $job: llvm-built ${a} ms, self-built ${b} ms, ratio $(echo "scale=2; $b / $a" | bc)"
 done
-echo "size: llvm-built $(wc -c < $B/phalange1) bytes, self-built $(wc -c < $B/phalange2) bytes"
+echo "size: llvm-built $(wc -c < $B/axiom1) bytes, self-built $(wc -c < $B/axiom2) bytes"
 
-for f in selfhost/bench/*.ph; do
-    n=$(basename "$f" .ph)
+for f in selfhost/bench/*.ax; do
+    n=$(basename "$f" .ax)
     [ "$n" = common ] && continue
-    compiler/build/phalange build "$f" --target=native -O2 -o "$T/llvm_$n"
-    $B/phalange2 build "$f" --target=native -O2 -o "$T/self_$n"
+    compiler/build/axiom build "$f" --target=native -O2 -o "$T/llvm_$n"
+    $B/axiom2 build "$f" --target=native -O2 -o "$T/self_$n"
     if [ "$("$T/llvm_$n")" != "$("$T/self_$n")" ]; then
         echo "$n: DIFFERENT OUTPUT" >&2
         exit 1

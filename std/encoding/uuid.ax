@@ -1,0 +1,473 @@
+// =============================================================================
+// std/encoding/uuid.ax - UUIDs (RFC 9562, which obsoletes RFC 4122).
+//
+//     let id = uuid.v4()!;                                  // random
+//     let t = uuid.v7()!;                                   // time-ordered
+//     let n = uuid.v5(uuid.NAMESPACE_DNS, "example.com");   // name-based (SHA-1)
+//     let mut buf: [36]u8 = [0; 36];
+//     io.stdout().println(id.format(buf[..]))!;             // "1b4e28ba-2fa1-4d2e-..."
+//     let p = uuid.parse("{1B4E28BA-2FA1-11D2-883F-0016D3CCA427}")!;
+//
+// parse takes the canonical 8-4-4-4-12 hex form in either case, also inside
+// braces or after "urn:uuid:", and 32 hex digits without hyphens; format
+// writes the canonical lowercase form.
+//
+// v4 is 122 random bits from the operating system (std/crypto/random). v7
+// is a 48-bit Unix timestamp in milliseconds followed by 74 random bits;
+// within a process, each v7 is greater than the one before (RFC 9562 §6.2:
+// when the clock has not moved on, the previous random bits are increased
+// by a random amount, carrying into the timestamp if they overflow). v3 and
+// v5 hash a namespace and a name with MD5 and SHA-1 (§5.3, §5.5); the
+// namespaces are those of RFC 9562 §6.6.
+//
+// Checked against Python's uuid module (tools/gen_uuid_tests.py,
+// std/encoding/uuid/testdata) and the examples of RFC 9562 Appendix A.
+// =============================================================================
+
+import "../crypto/md5.ax" as md5;
+import "../crypto/random.ax" as random;
+import "../crypto/sha1.ax" as sha1;
+import "../io.ax" as io;
+import "../time.ax" as time;
+
+error { InvalidUuid }
+
+/// The variant field (the top bits of byte 8), which says how to read the
+/// rest.
+pub enum Variant: u8 {
+    NCS,        // 0xxx: Apollo NCS, reserved
+    RFC9562,    // 10xx: the variant of RFC 9562 (and RFC 4122)
+    MICROSOFT,  // 110x: reserved for Microsoft
+    FUTURE,     // 111x: reserved
+}
+
+/// A UUID: 16 bytes, most significant first.
+pub struct Uuid {
+    bytes: [16]u8,
+
+    /// The UUID of 16 bytes (InvalidUuid if there are not 16).
+    pub fn from_bytes(b: []u8) !Uuid {
+        if b.len != 16 {
+            return error.InvalidUuid;
+        }
+        let mut u = Uuid.{ bytes: [0; 16] };
+        @mem_copy(u.bytes[..], b);
+        return u;
+    }
+
+    /// The UUID of a 128-bit number given as its high and low halves.
+    pub fn from_u64s(hi: u64, lo: u64) Uuid {
+        let mut u = Uuid.{ bytes: [0; 16] };
+        for i in @as(usize, 0)..8 {
+            u.bytes[i] = @truncate(u8, hi >> @as(u32, 56 - (8 * @truncate(u32, i))));
+            u.bytes[i + 8] = @truncate(u8, lo >> @as(u32, 56 - (8 * @truncate(u32, i))));
+        }
+        return u;
+    }
+
+    /// The high 64 bits, as a number.
+    pub fn high(self: Uuid) u64 {
+        return be64(self.bytes[..8]);
+    }
+
+    /// The low 64 bits, as a number.
+    pub fn low(self: Uuid) u64 {
+        return be64(self.bytes[8..]);
+    }
+
+    /// The version field (the top four bits of byte 6): 1 to 8 for the
+    /// versions RFC 9562 defines (when the variant is RFC9562), 0 for the
+    /// nil UUID, 15 for the max.
+    pub fn version(self: Uuid) u32 {
+        return @as(u32, self.bytes[6] >> 4);
+    }
+
+    /// The variant field.
+    pub fn variant(self: Uuid) Variant {
+        let b = self.bytes[8];
+        if (b & 0x80) == 0 {
+            return Variant.NCS;
+        }
+        if (b & 0x40) == 0 {
+            return Variant.RFC9562;
+        }
+        if (b & 0x20) == 0 {
+            return Variant.MICROSOFT;
+        }
+        return Variant.FUTURE;
+    }
+
+    /// The Unix time in milliseconds of a version 7 UUID (its top 48 bits).
+    pub fn unix_millis(self: Uuid) u64 {
+        return self.high() >> 16;
+    }
+
+    /// Whether this is the nil UUID.
+    pub fn is_nil(self: Uuid) bool {
+        return (self.high() == 0) and (self.low() == 0);
+    }
+
+    /// Negative, 0 or positive as self is less than, equal to or greater
+    /// than other, comparing them as 128-bit numbers (bytes in order).
+    pub fn compare(self: Uuid, other: Uuid) i32 {
+        for i in @as(usize, 0)..16 {
+            if self.bytes[i] != other.bytes[i] {
+                if self.bytes[i] < other.bytes[i] {
+                    return -1;
+                }
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    /// Whether the two are the same UUID.
+    pub fn eq(self: Uuid, other: Uuid) bool {
+        return @mem_eq(self.bytes[..], other.bytes[..]);
+    }
+
+    /// The canonical form, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6", in
+    /// buf[..36] (buf must hold 36 bytes).
+    pub fn format(self: Uuid, buf: []mut u8) []u8 {
+        return self.format_with(buf, "0123456789abcdef");
+    }
+
+    /// The canonical form in uppercase.
+    pub fn format_upper(self: Uuid, buf: []mut u8) []u8 {
+        return self.format_with(buf, "0123456789ABCDEF");
+    }
+
+    fn format_with(self: Uuid, buf: []mut u8, digits: []u8) []u8 {
+        let out = buf[..36];
+        let mut n: usize = 0;
+        for i in @as(usize, 0)..16 {
+            if (i == 4) or (i == 6) or (i == 8) or (i == 10) {
+                out[n] = '-';
+                n += 1;
+            }
+            out[n] = digits[@as(usize, self.bytes[i] >> 4)];
+            out[n + 1] = digits[@as(usize, self.bytes[i] & 15)];
+            n += 2;
+        }
+        return out;
+    }
+
+    /// Writes the canonical form to w.
+    pub fn format_to(self: Uuid, w: io.Writer) !void {
+        let mut buf: [36]u8 = [0; 36];
+        w.write_all(self.format(buf[..]))!;
+    }
+}
+
+fn be64(b: []u8) u64 {
+    let mut v: u64 = 0;
+    for x in b[..8] {
+        v = (v << 8) | @as(u64, x);
+    }
+    return v;
+}
+
+/// The nil UUID, all zeros.
+pub fn nil() Uuid {
+    return Uuid.{ bytes: [0; 16] };
+}
+
+/// The max UUID, all ones (RFC 9562 §5.10).
+pub fn max() Uuid {
+    return Uuid.{ bytes: [0xff; 16] };
+}
+
+/// The namespace for v3 and v5 names that are fully qualified domain names
+/// (RFC 9562 §6.6; the others are for URLs, ISO OIDs and X.500 DNs).
+pub let NAMESPACE_DNS: Uuid = Uuid.{ bytes: [0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0,
+                                             0x4f, 0xd4, 0x30, 0xc8] };
+/// The namespace for names that are URLs.
+pub let NAMESPACE_URL: Uuid = Uuid.{ bytes: [0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0,
+                                             0x4f, 0xd4, 0x30, 0xc8] };
+/// The namespace for names that are ISO OIDs.
+pub let NAMESPACE_OID: Uuid = Uuid.{ bytes: [0x6b, 0xa7, 0xb8, 0x12, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0,
+                                             0x4f, 0xd4, 0x30, 0xc8] };
+/// The namespace for names that are X.500 distinguished names.
+pub let NAMESPACE_X500: Uuid = Uuid.{ bytes: [0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0,
+                                              0x4f, 0xd4, 0x30, 0xc8] };
+
+fn hex_digit(c: u8) u32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u32, c - '0');
+    }
+    let l = c | 0x20;
+    if (l >= 'a') and (l <= 'f') {
+        return @as(u32, l - 'a') + 10;
+    }
+    return 16;
+}
+
+// Whether s is `lower` but for the case of ASCII letters.
+fn lower_eq(s: []u8, lower: []u8) bool {
+    if s.len != lower.len {
+        return false;
+    }
+    for i in @as(usize, 0)..s.len {
+        let mut c = s[i];
+        if (c >= 'A') and (c <= 'Z') {
+            c += 32;
+        }
+        if c != lower[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Parses a UUID: "f81d4fae-7dec-11d0-a765-00a0c91e6bf6" in upper, lower or
+/// mixed case, the same in braces ("{...}") or after "urn:uuid:" (in any
+/// case), or 32 hex digits without hyphens. Anything else is InvalidUuid.
+pub fn parse(text: []u8) !Uuid {
+    let mut s = text;
+    if (s.len == 38) and (s[0] == '{') and (s[37] == '}') {
+        s = s[1..37];
+    } else if (s.len == 45) and lower_eq(s[..9], "urn:uuid:") {
+        s = s[9..];
+    }
+    let mut u = Uuid.{ bytes: [0; 16] };
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    let hyphens = s.len == 36;
+    if not hyphens and (s.len != 32) {
+        return error.InvalidUuid;
+    }
+    while i < s.len {
+        if hyphens and ((i == 8) or (i == 13) or (i == 18) or (i == 23)) {
+            if s[i] != '-' {
+                return error.InvalidUuid;
+            }
+            i += 1;
+            continue;
+        }
+        let hi = hex_digit(s[i]);
+        let lo = hex_digit(s[i + 1]);
+        if (hi > 15) or (lo > 15) {
+            return error.InvalidUuid;
+        }
+        u.bytes[n] = @truncate(u8, (hi << 4) | lo);
+        n += 1;
+        i += 2;
+    }
+    return u;
+}
+
+// Sets the version and the RFC 9562 variant.
+fn stamp(u: *mut Uuid, version: u8) void {
+    u.bytes[6] = (u.bytes[6] & 0x0f) | (version << 4);
+    u.bytes[8] = (u.bytes[8] & 0x3f) | 0x80;
+}
+
+/// A random (version 4) UUID.
+pub fn v4() !Uuid {
+    let mut u = Uuid.{ bytes: [0; 16] };
+    random.fill(u.bytes[..])!;
+    stamp(&mut u, 4);
+    return u;
+}
+
+/// A version 3 UUID: the MD5 hash of the namespace and the name. Prefer v5.
+pub fn v3(namespace: Uuid, name: []u8) Uuid {
+    let mut h = md5.Md5.init();
+    h.update(namespace.bytes[..]);
+    h.update(name);
+    let mut u = Uuid.{ bytes: [0; 16] };
+    h.final(u.bytes[..]);
+    stamp(&mut u, 3);
+    return u;
+}
+
+/// A version 5 UUID: the SHA-1 hash of the namespace and the name.
+pub fn v5(namespace: Uuid, name: []u8) Uuid {
+    let mut h = sha1.Sha1.init();
+    h.update(namespace.bytes[..]);
+    h.update(name);
+    let mut d: [20]u8 = [0; 20];
+    h.final(d[..]);
+    let mut u = Uuid.{ bytes: [0; 16] };
+    @mem_copy(u.bytes[..], d[..16]);
+    stamp(&mut u, 5);
+    return u;
+}
+
+/// The version 7 UUID of a Unix time in milliseconds (the low 48 bits) and
+/// 74 bits of `rand`: the low 12 bits of rand_a and the low 62 of rand_b.
+pub fn v7_from_parts(unix_ms: u64, rand_a: u32, rand_b: u64) Uuid {
+    let hi = ((unix_ms & 0xFFFF_FFFF_FFFF) << 16) | (0x7000 | @as(u64, rand_a & 0xfff));
+    let lo = 0x8000_0000_0000_0000 | (rand_b & 0x3FFF_FFFF_FFFF_FFFF);
+    return Uuid.from_u64s(hi, lo);
+}
+
+// The last v7: its time and its 74 random bits (rand_a above rand_b), under
+// a spin lock.
+let mut V7_LOCK: u32 = 0;
+let mut V7_MS: u64 = 0;
+let mut V7_A: u32 = 0;
+let mut V7_B: u64 = 0;
+
+/// A time-ordered (version 7) UUID: the current Unix time in milliseconds
+/// and random bits. Each is greater than the one before in this process.
+pub fn v7() !Uuid {
+    let now = time.now().unix_millis();
+    return v7_at(@int_cast(u64, @max(now, 0)));
+}
+
+// v7 at a given clock reading (for tests).
+fn v7_at(now: u64) !Uuid {
+    let mut r: [16]u8 = [0; 16];
+    random.fill(r[..])!;
+    let ra = @truncate(u32, be64(r[..8]) >> 52);    // 12 bits
+    let rb = be64(r[8..]) & 0x3FFF_FFFF_FFFF_FFFF;  // 62 bits
+    let step = (be64(r[..8]) & 0xFFFF_FFFF) + 1;    // 1 to 2^32
+    while @atomic_cas(&mut V7_LOCK, 0, 1) != 0 {}
+    let mut ms = now & 0xFFFF_FFFF_FFFF;
+    let mut a = ra;
+    let mut b = rb;
+    if ms <= V7_MS {
+        // the clock has not moved on (or went back): count up from the last
+        ms = V7_MS;
+        a = V7_A;
+        b = V7_B + step;
+        if b > 0x3FFF_FFFF_FFFF_FFFF {
+            b &= 0x3FFF_FFFF_FFFF_FFFF;
+            a += 1;
+            if a > 0xfff {
+                a = 0;
+                ms += 1;
+            }
+        }
+    }
+    V7_MS = ms;
+    V7_A = a;
+    V7_B = b;
+    @atomic_store(&mut V7_LOCK, 0);
+    return v7_from_parts(ms, a, b);
+}
+
+// -----------------------------------------------------------------------------
+// Tests (axiom test std/encoding/uuid.ax)
+// -----------------------------------------------------------------------------
+
+import "../mem.ax" as mem;
+import "../os/fs.ax" as fs;
+import "../str.ax" as strs;
+import "hex.ax" as hex;
+
+fn invalid(r: !Uuid) bool {
+    _ = r catch |e| return e == error.InvalidUuid;
+    return false;
+}
+
+test "RFC 9562 examples" {
+    let mut buf: [36]u8 = [0; 36];
+    // Appendix A.2 (v3) and A.4 (v5): www.example.com in the DNS namespace
+    @expect_eq(v3(NAMESPACE_DNS, "www.example.com").format(buf[..]), "5df41881-3aed-3515-88a7-2f4a814cf09e");
+    @expect_eq(v5(NAMESPACE_DNS, "www.example.com").format(buf[..]), "2ed6657d-e927-568b-95e1-2665a8aea6a2");
+    // A.6: a v7 from its parts
+    let u = v7_from_parts(0x017F22E279B0, 0xCC3, 0x18C4DC0C0C07398F);
+    @expect_eq(u.format(buf[..]), "017f22e2-79b0-7cc3-98c4-dc0c0c07398f");
+    @expect_eq(u.version(), 7);
+    @expect(u.variant() == Variant.RFC9562);
+    @expect_eq(u.unix_millis(), 0x017F22E279B0);
+    @expect_eq(nil().format(buf[..]), "00000000-0000-0000-0000-000000000000");
+    @expect_eq(max().format_upper(buf[..]), "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF");
+    @expect(nil().is_nil() and not max().is_nil());
+    @expect_eq(max().version(), 15);
+    @expect(max().variant() == Variant.FUTURE);
+    @expect(nil().variant() == Variant.NCS);
+    @expect_eq(NAMESPACE_URL.format(buf[..]), "6ba7b811-9dad-11d1-80b4-00c04fd430c8");
+    @expect_eq(NAMESPACE_X500.format(buf[..]), "6ba7b814-9dad-11d1-80b4-00c04fd430c8");
+}
+
+test "parse forms and errors" {
+    let a = parse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6")!;
+    @expect(a.eq(parse("{F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6}")!));
+    @expect(a.eq(parse("URN:UUID:f81d4fae-7dec-11d0-a765-00a0c91e6bf6")!));
+    @expect(a.eq(parse("f81d4fae7dec11d0a76500a0c91e6bf6")!));
+    @expect(a.eq(Uuid.from_bytes(a.bytes[..])!));
+    @expect(a.eq(Uuid.from_u64s(a.high(), a.low())));
+    @expect_eq(a.high(), 0xf81d4fae7dec11d0);
+    let bad: [10][]u8 = [
+        "",
+        "{f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf6}",
+        "+81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+        "f81d4fae-7dec-11d0-a765+00a0c91e6bf6",
+        "f81d4fae7-dec-11d0-a765-00a0c91e6bf6",
+        "urn:uuix:f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+        "urn:uuid:f81d4fae7dec11d0a76500a0c91e6bf6",
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf6 ",
+        "{f81d4fae7dec11d0a76500a0c91e6bf6}",
+    ];
+    for s in bad {
+        @expect(invalid(parse(s)));
+    }
+    @expect(invalid(Uuid.from_bytes(a.bytes[..15])));
+    @expect(a.compare(a) == 0);
+    @expect((nil().compare(a) < 0) and (max().compare(a) > 0) and (a.compare(nil()) > 0));
+}
+
+test "Python's uuid module" {
+    let data = fs.read_file("std/encoding/uuid/testdata/cases.txt") catch return;
+    defer mem.free(data);
+    let mut lines = strs.lines(data);
+    let mut buf: [36]u8 = [0; 36];
+    let mut name: [256]u8 = [0; 256];
+    let mut n: usize = 0;
+    loop {
+        let line = lines.next() catch break;
+        if strs.starts_with(line, "#") {
+            continue;
+        }
+        let mut f = strs.split(line, " ");
+        let op = f.next()!;
+        if strs.eq(op, "v3") or strs.eq(op, "v5") {
+            let ns = parse(f.next()!)!;
+            let nm = hex.decode(f.next()!, name[..])!;
+            let want = f.next()!;
+            let mut got = v3(ns, nm);
+            if strs.eq(op, "v5") {
+                got = v5(ns, nm);
+            }
+            @expect_eq(got.format(buf[..]), want);
+        } else if strs.eq(op, "parse") {
+            let u = parse(f.next()!)!;
+            @expect_eq(u.format(buf[..]), f.next()!);
+            @expect_eq(@as(u64, u.version()), io.parse_u64(f.next()!)!);
+            @expect_eq(@as(u64, @int_from_enum(u.variant())), io.parse_u64(f.next()!)!);
+        } else {
+            @expect(strs.eq(op, "bad") and invalid(parse(f.next()!)));
+        }
+        n += 1;
+    }
+    @expect_eq(n, 166);
+}
+
+test "v4 and v7" {
+    let a = v4()!;
+    let b = v4()!;
+    @expect(not a.eq(b));
+    @expect((a.version() == 4) and (a.variant() == Variant.RFC9562));
+    let mut prev = v7()!;
+    @expect((prev.version() == 7) and (prev.variant() == Variant.RFC9562));
+    let now = @int_cast(u64, time.now().unix_millis());
+    @expect((prev.unix_millis() <= now) and ((prev.unix_millis() + 10000) > now));
+    for i in @as(u32, 0)..2000 {
+        let next = v7()!;
+        @expect(next.compare(prev) > 0);
+        prev = next;
+    }
+    // a clock that goes back still gives increasing UUIDs, with the last time
+    let back = v7_at(prev.unix_millis() - 5000)!;
+    @expect((back.compare(prev) > 0) and (back.unix_millis() >= prev.unix_millis()));
+    // overflowing the 74 random bits carries into the timestamp
+    V7_A = 0xfff;
+    V7_B = 0x3FFF_FFFF_FFFF_FFFF;
+    let carried = v7_at(back.unix_millis())!;
+    @expect_eq(carried.unix_millis(), V7_MS);
+    @expect((carried.unix_millis() == (back.unix_millis() + 1)) and (carried.compare(back) > 0));
+}

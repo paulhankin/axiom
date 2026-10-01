@@ -1,0 +1,142 @@
+// =============================================================================
+// std/thread.ax - threads (spec §12.8).
+//
+// A thread runs a function on its own stack, sharing all memory with the rest
+// of the program. Threads are created through the Axiom host ABI: on
+// WebAssembly each thread is a new instance of the module on the shared
+// memory (a Web Worker / node worker), on native targets a POSIX thread.
+//
+//     let t = thread.spawn(worker, arg)!;   // worker: fn(T) void
+//     t.join();
+// =============================================================================
+
+import "mem.ax" as mem;
+
+error { SpawnFailed, OutOfMemory }
+
+import host "axiom" {
+    // `exited` is set to 1 (and notified) once the thread has left its stack
+    fn ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32;
+    fn ax_thread_stack_size() usize;  // 0: the host provides stacks
+    fn ax_cpu_count() u32;
+    fn ax_sleep_ns(ns: u64) void;
+}
+
+struct Start[T] {
+    f: fn(T) void,
+    arg: T,
+    exited: u32,  // set by the host once the thread is off its stack
+    stack: []mut u8,
+}
+
+fn trampoline[T](ctx: *mut void) void {
+    let s = @ptr_cast(*mut Start.[T], ctx);
+    s.f(s.arg);
+}
+
+/// A running thread. Call join() exactly once.
+pub struct Thread[T] {
+    start: *mut Start.[T],
+
+    /// Blocks until the thread has finished, then releases its resources.
+    pub fn join(self: Self) void {
+        while @atomic_load(&self.start.exited) == 0 {
+            _ = @atomic_wait(&self.start.exited, 0, -1);
+        }
+        if self.start.stack.len > 0 {
+            mem.free(self.start.stack);
+        }
+        mem.free(@slice_from_ptr(self.start, 1));
+    }
+}
+
+/// Runs `f(arg)` on a new thread. `arg` is copied to the new thread; to share
+/// data, pass a pointer (and synchronize, e.g. with std/sync).
+pub fn spawn[T](f: fn(T) void, arg: T) !Thread.[T] {
+    mem.enable_threads();
+    let cell = mem.alloc.[Start.[T]](1)!;
+    let s = &mut cell[0];
+    let stack_size = ax_thread_stack_size();
+    let mut stack = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    let mut top: usize = 0;
+    if stack_size > 0 {
+        stack = mem.alloc.[u8](stack_size) catch |e| {
+            mem.free(cell);
+            return e;
+        };
+        // the top 16 bytes hold the stack's lowest address: the thread's
+        // stack limit (the compiler checks frames against it)
+        top = ((@int_from_ptr(stack.ptr) + stack_size) & ~@as(usize, 15)) - 16;
+        @ptr_from_int(*mut usize, top).* = @int_from_ptr(stack.ptr);
+    }
+    s.* = Start.[T].{ f: f, arg: arg, exited: 0, stack: stack };
+    let id = ax_thread_spawn(trampoline.[T], @ptr_cast(*mut void, s), top, &mut s.exited);
+    if id < 0 {
+        if stack.len > 0 {
+            mem.free(stack);
+        }
+        mem.free(cell);
+        return error.SpawnFailed;
+    }
+    return Thread.[T].{ start: s };
+}
+
+/// The number of processors available to the program.
+pub fn cpu_count() u32 {
+    return ax_cpu_count();
+}
+
+pub fn sleep_ms(ms: u64) void {
+    ax_sleep_ns(ms * 1000000);
+}
+
+// -----------------------------------------------------------------------------
+// parallel_for: structured data parallelism.
+// -----------------------------------------------------------------------------
+
+struct Chunk[C] {
+    body: fn(*mut C, usize, usize) void,
+    ctx: *mut C,
+    lo: usize,
+    hi: usize,
+}
+
+fn run_chunk[C](c: Chunk.[C]) void {
+    c.body(c.ctx, c.lo, c.hi);
+}
+
+/// Splits 0..n into `threads` contiguous ranges and calls body(ctx, lo, hi)
+/// for each, in parallel; returns when all have finished. The ranges are
+/// disjoint, so bodies that only write elements in their own range do not
+/// race.
+pub fn parallel_for[C](n: usize, threads: usize, body: fn(*mut C, usize, usize) void, ctx: *mut C) !void {
+    let k = @max(@min(threads, n), 1);
+    let handles = mem.alloc.[Thread.[Chunk.[C]]](k)!;
+    defer mem.free(handles);
+    let per = n / k;
+    let extra = n % k;
+    let mut lo: usize = 0;
+    let mut started: usize = 0;
+    for i in 0..k {
+        let mut size = per;
+        if i < extra {
+            size += 1;
+        }
+        let chunk = Chunk.[C].{ body: body, ctx: ctx, lo: lo, hi: lo + size };
+        lo += size;
+        if i == (k - 1) {
+            run_chunk(chunk);  // the calling thread takes the last range
+        } else {
+            handles[i] = spawn(run_chunk.[C], chunk) catch |e| {
+                for j in 0..started {
+                    handles[j].join();
+                }
+                return e;
+            };
+            started += 1;
+        }
+    }
+    for j in 0..started {
+        handles[j].join();
+    }
+}

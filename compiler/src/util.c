@@ -16,7 +16,7 @@ void *arena_alloc(size_t size) {
         size_t bs = size > ARENA_BLOCK ? size : ARENA_BLOCK;
         arena_cur = calloc(1, bs);
         if (!arena_cur) {
-            fprintf(stderr, "phalange: out of memory\n");
+            fprintf(stderr, "axiom: out of memory\n");
             exit(2);
         }
         arena_end = arena_cur + bs;

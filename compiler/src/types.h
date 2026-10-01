@@ -1,7 +1,7 @@
 // types.h - semantic types. Types are hash-consed: equal types are the same
 // pointer, so type equality is pointer equality.
-#ifndef PH_TYPES_H
-#define PH_TYPES_H
+#ifndef AX_TYPES_H
+#define AX_TYPES_H
 
 #include "ast.h"
 

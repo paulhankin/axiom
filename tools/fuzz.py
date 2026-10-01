@@ -3,7 +3,7 @@
 
     tools/fuzz.py [--runs N] [--timeout S] [--jobs J] [--seed K] [target ...]
 
-Builds tests/fuzz/fuzz.ph natively, makes seed inputs (with std's own
+Builds tests/fuzz/fuzz.ax natively, makes seed inputs (with std's own
 encoders, plus sounds from ffmpeg/sox, system fonts and certificates when
 they are around), then runs mutated seeds through each target. Bad input is
 expected to fail with an error; a trap, a signal or a hang is a bug, and
@@ -38,7 +38,7 @@ def build(compiler):
     os.makedirs(OUT, exist_ok=True)
     exe = os.path.join(OUT, 'fuzz')
     subprocess.run([compiler, 'build', '--target=native', '-O2', '-o', exe,
-                    os.path.join(ROOT, 'tests', 'fuzz', 'fuzz.ph')], check=True)
+                    os.path.join(ROOT, 'tests', 'fuzz', 'fuzz.ax')], check=True)
     return exe
 
 
@@ -136,7 +136,7 @@ def main():
     ap.add_argument('--timeout', type=float, default=10.0)
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--seed', type=int, default=1)
-    ap.add_argument('--compiler', default=os.environ.get('PHALANGE', os.path.join(ROOT, 'compiler', 'build', 'phalange')))
+    ap.add_argument('--compiler', default=os.environ.get('AXIOM', os.path.join(ROOT, 'compiler', 'build', 'axiom')))
     ap.add_argument('targets', nargs='*')
     a = ap.parse_args()
     targets = a.targets or TARGETS

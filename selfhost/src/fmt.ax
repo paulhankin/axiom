@@ -1,0 +1,1642 @@
+// =============================================================================
+// fmt.ax - axiom fmt: the canonical layout of source code (spec §16.5).
+//
+// The formatter works on the token stream. Comments and blank lines come from
+// the gaps between the tokens; everything else about the input's layout is
+// thrown away and rebuilt:
+//
+//   - four spaces per block, one statement per line, one struct field per line
+//     (each with a comma), '{' at the end of the line that opens it;
+//   - spacing decided by each token and the one before it (binary operators
+//     spaced, unary ones not, '.{ a: 1 }', '[1, 2]', '(a, b)', '|e|');
+//   - lines longer than 120 columns broken after 'and' / 'or' (when one is no
+//     deeper in brackets than every ','), else after the last ',' that fits,
+//     else after another binary operator; the next line starts just inside
+//     the bracket the break is in (outside any: after 'if ', 'return ', '= ',
+//     ...), or, if that would squeeze it against the edge, the break goes
+//     right after the bracket and the next line is indented four more;
+//   - a bracket written with a trailing comma: one item per line;
+//   - a match arm with one short statement on one line, '=>' lined up;
+//   - trailing comments lined up two spaces after the longest of a run of
+//     lines of about the same length;
+//   - blank lines kept (several become one), none at the start or end of a
+//     block; a statement with comments inside keeps its line breaks.
+//
+// Imports are tidied too: each run of imports is sorted by path; duplicates and
+// unused imports go (not a package, nor a module with tests: importing it
+// runs them); a standard library module used as 'name.x' but never imported
+// is added.
+//
+// The output is lexed again and must give the same tokens (commas aside) and
+// the same comments, or the file is left alone.
+// =============================================================================
+import "diag.ax" as dg;
+import "lexer.ax" as lx;
+import "parser.ax" as ps;
+import "util.ax" as u;
+
+const WIDTH: usize = 120;
+const EL_COMMENT: i32 = -1;
+const NONE: usize = @max_value(usize);
+
+// What a pair of braces holds.
+const BR_BLOCK: i32 = 1;   // statements (also the top level)
+const BR_FIELDS: i32 = 2;  // struct, union and enum members, one per line
+const BR_DECLS: i32 = 3;   // the functions of extern and import host
+const BR_MATCH: i32 = 4;   // match arms
+const BR_INLINE: i32 = 5;  // struct literals, anonymous struct types, error lists
+
+// A token or a comment.
+struct El {
+    kind: i32,  // a token kind, or EL_COMMENT
+    text: []u8,
+    nl: i32,       // line breaks before it in the input
+    col: i32,      // its input column (comments)
+    sp: bool,      // a space before it, after a token on the same line
+    opnd: bool,    // it ends an operand
+    unary: bool,   // a prefix operator
+    binop: bool,   // a binary or assignment operator
+    brace: i32,    // BR_* of a '{' or '}'
+    empty: bool,   // a '{' or '}' of an empty '{}'
+    fnsig: bool,   // the parentheses of a function's parameters
+    pfx: bool,     // the brackets of a type prefix or array literal
+    cap: i32,      // 1, 2: the bars of a catch capture
+    trail: bool,   // a comma just before a closing bracket
+    x: bool,       // a bracket written with a trailing comma: one item per line
+    xcomma: bool,  // a comma between those items
+    eol: bool,     // the '}' that ends an error declaration
+    comma: bool,   // a comma is added after it (the last struct member)
+}
+
+fn mk_el(kind: i32, text: []u8, nl: i32, col: i32) El {
+    return El.{ kind: kind, text: text, nl: nl, col: col, sp: false, opnd: false, unary: false, binop: false, brace: 0,
+                empty: false, fnsig: false, pfx: false, cap: 0, trail: false, x: false, xcomma: false, eol: false,
+                comma: false };
+}
+
+fn el_list() u.List.[El] {
+    return u.List.[El].{ data: u.nil.[El](), len: 0, cap: 0 };
+}
+
+fn idx_list() u.List.[usize] {
+    return u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+}
+
+fn str_list() u.List.[[]u8] {
+    return u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+}
+
+fn is_cmt(e: *El) bool {
+    return e.kind == EL_COMMENT;
+}
+
+// Display width: UTF-8 continuation bytes take no column.
+fn width(s: []u8) usize {
+    let mut n: usize = 0;
+    for c in s {
+        if (c & 0xC0) != 0x80 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+// -----------------------------------------------------------------------------
+// Tokens and comments
+// -----------------------------------------------------------------------------
+// The file's tokens and comments in order. Returns false if the text does not
+// lex cleanly.
+fn scan(f: *mut u.SourceFile, out: *mut u.List.[El]) bool {
+    let before = dg.error_count();
+    let toks = lx.lex_file(f);
+    if dg.error_count() != before {
+        return false;
+    }
+    let s = f.text;
+    let mut pos: usize = 0;
+    let mut line_start: usize = 0;
+    let mut ti: usize = 0;
+    loop {
+        let mut end = s.len;
+        let last = ti >= toks.len;
+        if not last {
+            let t = toks.get(ti);
+            if t.kind == lx.TK_EOF {
+                end = s.len;
+            } else {
+                end = @as(usize, t.span.start);
+            }
+        }
+        let mut nl: i32 = 0;
+        let mut p = pos;
+        while p < end {
+            let c = s[p];
+            if c == '\n' {
+                nl += 1;
+                p += 1;
+                line_start = p;
+            } else if (c == '/') and ((p + 1) < end) and (s[p + 1] == '/') {
+                let q = p;
+                while (p < end) and (s[p] != '\n') {
+                    p += 1;
+                }
+                let mut e = p;
+                while (e > q) and ((s[e - 1] == ' ') or (s[e - 1] == '\t') or (s[e - 1] == '\r')) {
+                    e -= 1;
+                }
+                out.push(mk_el(EL_COMMENT, s[q..e], nl, @int_cast(i32, q - line_start)));
+                nl = 0;
+            } else {
+                p += 1;
+            }
+        }
+        if last or (toks.get(ti).kind == lx.TK_EOF) {
+            break;
+        }
+        let t = toks.get(ti);
+        let a = @as(usize, t.span.start);
+        let b = @as(usize, t.span.end);
+        out.push(mk_el(t.kind, s[a..b], nl, @int_cast(i32, a - line_start)));
+        pos = b;
+        ti += 1;
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Imports
+// -----------------------------------------------------------------------------
+struct Imp {
+    a: usize,  // its elements [a, b), with a trailing comment
+    b: usize,
+    path: []u8,  // without the quotes
+    alias: []u8,
+    run: usize,  // the first import of its run
+}
+
+fn imp_list() u.List.[Imp] {
+    return u.List.[Imp].{ data: u.nil.[Imp](), len: 0, cap: 0 };
+}
+
+fn cmp_imp(x: Imp, y: Imp) i32 {
+    return u.str_cmp(x.path, y.path);
+}
+
+fn dir_of(p: []u8) []u8 {
+    let k = u.rfind(p, '/');
+    if k < 0 {
+        return ".";
+    }
+    if k == 0 {
+        return "/";
+    }
+    return u.dup(p[0..@int_cast(usize, k)]);
+}
+
+fn same_dir(a: []u8, b: []u8) bool {
+    let ra = u.real_path(a);
+    let rb = u.real_path(b);
+    return not u.isnos(ra) and not u.isnos(rb) and u.str_eq(ra, rb);
+}
+
+// Where directory `dir` is within the standard library: "" for std itself,
+// "graphics/shape" for a subdirectory, or no string when it is outside.
+fn std_subdir(dir: []u8, std_dir: []u8) []u8 {
+    let ra = u.real_path(dir);
+    let rb = u.real_path(std_dir);
+    if u.isnos(ra) or u.isnos(rb) {
+        return u.nosym();
+    }
+    if u.str_eq(ra, rb) {
+        return "";
+    }
+    if u.starts(ra, rb) and (ra.len > rb.len) and (ra[rb.len] == '/') {
+        return ra[rb.len + 1..];
+    }
+    return u.nosym();
+}
+
+// The standard library module `name`, as a path within std ("vec" is
+// "collections/vec"): std/<name>.ax, else the one std/<group>/<name>.ax.
+// No string when there is none, or more than one.
+fn std_module(name: []u8, std_dir: []u8) []u8 {
+    if u.is_file(u.f3("%s/%s%s", std_dir, name, ".ax")) {
+        return name;
+    }
+    let mut ents = str_list();
+    if not u.list_dir(std_dir, &mut ents) {
+        return u.nosym();
+    }
+    let mut found = u.nosym();
+    for i in 0..ents.len {
+        let g = ents.get(i);
+        if (g.len == 0) or (g[0] == '.') {
+            continue;
+        }
+        if u.is_file(u.f3("%s/%s%s", u.cat3(std_dir, "/", g), u.cat2("/", name), ".ax")) {
+            if not u.isnos(found) {
+                return u.nosym();
+            }
+            found = u.cat3(g, "/", name);
+        }
+    }
+    return found;
+}
+
+// True if a module's text declares a test.
+fn has_tests(text: []u8) bool {
+    let mut i: usize = 0;
+    while i < text.len {
+        if u.starts(text[i..], "test ") or u.starts(text[i..], "test\"") {
+            return true;
+        }
+        while (i < text.len) and (text[i] != '\n') {
+            i += 1;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// Whether an unused import can go: its module's tests (if any) must not be
+// ones that importing it runs (spec §17: those of modules outside the standard
+// library and packages); a package import names a dependency and stays.
+fn removable(path: []u8, file_dir: []u8, std_dir: []u8) bool {
+    if u.starts(path, "pkg:") {
+        return false;  // it names a dependency, used or not
+    }
+    if u.starts(path, "std/") {
+        return true;
+    }
+    let mut p = u.cat3(file_dir, "/", path);
+    if not u.ends(p, ".ax") {
+        p = u.cat2(p, ".ax");
+    }
+    if not u.isnos(std_subdir(dir_of(p), std_dir)) {
+        return true;
+    }
+    let text = u.read_file(p);
+    if u.isnos(text) {
+        return false;
+    }
+    return not has_tests(text);
+}
+
+// The previous token before element i, or NONE.
+fn prev_tok(els: []El, i: usize) usize {
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        if not is_cmt(&els[j]) {
+            return j;
+        }
+    }
+    return NONE;
+}
+
+fn next_tok(els: []El, i: usize) usize {
+    let mut j = i + 1;
+    while j < els.len {
+        if not is_cmt(&els[j]) {
+            return j;
+        }
+        j += 1;
+    }
+    return NONE;
+}
+
+fn is_import_at(els: []El, i: usize) bool {
+    if (i + 4) >= els.len {
+        return false;
+    }
+    return (els[i].kind == lx.KW_IMPORT) and (els[i + 1].kind == lx.TK_STRING) and (els[i + 2].kind == lx.KW_AS) and
+           (els[i + 3].kind == lx.TK_IDENT) and (els[i + 4].kind == lx.TK_SEMI);
+}
+
+fn push_tok(out: *mut u.List.[El], kind: i32, text: []u8, nl: i32) void {
+    out.push(mk_el(kind, text, nl, 0));
+}
+
+// Sorts, dedupes, removes and adds imports; returns the new elements.
+fn fix_imports(els: []El, path: []u8, std_dir: []u8) u.List.[El] {
+    let file_dir = dir_of(path);
+    let sub = std_subdir(file_dir, std_dir);
+    let in_std = not u.isnos(sub);
+    // the imports, with their runs
+    let mut imps = imp_list();
+    let mut depth: i32 = 0;
+    let mut i: usize = 0;
+    while i < els.len {
+        let k = els[i].kind;
+        if k == lx.TK_LBRACE {
+            depth += 1;
+        } else if k == lx.TK_RBRACE {
+            depth -= 1;
+        } else if (depth == 0) and is_import_at(els, i) {
+            let s = els[i + 1].text;
+            let mut b = i + 5;
+            if (b < els.len) and is_cmt(&els[b]) and (els[b].nl == 0) {
+                b += 1;
+            }
+            let mut run = i;
+            if (imps.len > 0) and (imps.last().b == i) and (els[i].nl == 1) {
+                run = imps.last().run;
+            }
+            imps.push(Imp.{ a: i, b: b, path: s[1..s.len - 1], alias: els[i + 3].text, run: run });
+            i = b;
+            continue;
+        }
+        i += 1;
+    }
+    // which to keep: not unused, not a duplicate
+    let keep = u.newn.[bool](imps.len + 1);
+    for j in 0..imps.len {
+        let m = imps.get(j);
+        keep[j] = true;
+        for q in 0..j {
+            let o = imps.get(q);
+            if keep[q] and u.str_eq(o.path, m.path) and u.str_eq(o.alias, m.alias) {
+                keep[j] = false;
+            }
+        }
+        if not keep[j] {
+            continue;
+        }
+        let mut used = false;
+        for q in 0..els.len {
+            if (els[q].kind == lx.TK_IDENT) and (q != (m.a + 3)) and u.str_eq(els[q].text, m.alias) {
+                let pt = prev_tok(els, q);
+                if (pt == NONE) or (els[pt].kind != lx.TK_DOT) {
+                    let mut decl = false;
+                    for r in 0..imps.len {
+                        if q == (imps.get(r).a + 3) {
+                            decl = true;
+                        }
+                    }
+                    if not decl {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if not used and removable(m.path, file_dir, std_dir) {
+            keep[j] = false;
+        }
+    }
+    // standard library modules used as 'name.ident' (and never otherwise)
+    let mut adds = imp_list();
+    let mut state = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    let mut names = str_list();
+    for q in 0..els.len {
+        if els[q].kind != lx.TK_IDENT {
+            continue;
+        }
+        let pt = prev_tok(els, q);
+        if (pt != NONE) and (els[pt].kind == lx.TK_DOT) {
+            continue;
+        }
+        let nm = u.intern(els[q].text);
+        let n1 = next_tok(els, q);
+        let mut dotted = false;
+        if (n1 != NONE) and (els[n1].kind == lx.TK_DOT) {
+            let n2 = next_tok(els, n1);
+            dotted = (n2 != NONE) and (els[n2].kind == lx.TK_IDENT);
+        }
+        if not state.has(nm) {
+            names.push(nm);
+            state.put(nm, 1);
+        }
+        if not dotted {
+            state.put(nm, 2);
+        }
+    }
+    for q in 0..names.len {
+        let name = names.get(q);
+        if state.get(name) != 1 {
+            continue;
+        }
+        let mut known = false;
+        for r in 0..imps.len {
+            if u.str_eq(imps.get(r).alias, name) {
+                known = true;
+            }
+        }
+        if known or (in_std and u.str_eq(u.cat2(name, ".ax"), basename_of(path))) {
+            continue;
+        }
+        let module = std_module(name, std_dir);
+        if u.isnos(module) {
+            continue;
+        }
+        let mut ip = u.cat2("std/", module);
+        if in_std {
+            ip = u.cat2(rel_to(module, sub), ".ax");
+        }
+        adds.push(Imp.{ a: NONE, b: NONE, path: ip, alias: name, run: NONE });
+    }
+    let mut out = el_list();
+    let first_run = first_run_of(&imps);
+    // runs, sorted
+    let mut j: usize = 0;
+    let mut e: usize = 0;
+    let mut added = adds.len == 0;
+    while e < els.len {
+        if (j < imps.len) and (imps.get(j).a == e) {
+            let run = imps.get(j).run;
+            let mut members = imp_list();
+            let mut end = e;
+            while (j < imps.len) and (imps.get(j).run == run) {
+                if keep[j] {
+                    members.push(imps.get(j));
+                }
+                end = imps.get(j).b;
+                j += 1;
+            }
+            if not added and (run == first_run) {
+                for r in 0..adds.len {
+                    members.push(adds.get(r));
+                }
+                added = true;
+            }
+            u.sort.[Imp](members.items(), cmp_imp);
+            for r in 0..members.len {
+                let m = members.get(r);
+                let mut nl: i32 = 1;
+                if r == 0 {
+                    nl = els[e].nl;
+                }
+                if m.a == NONE {
+                    push_tok(&mut out, lx.KW_IMPORT, "import", nl);
+                    push_tok(&mut out, lx.TK_STRING, u.f1("\"%s\"", m.path), 0);
+                    push_tok(&mut out, lx.KW_AS, "as", 0);
+                    push_tok(&mut out, lx.TK_IDENT, m.alias, 0);
+                    push_tok(&mut out, lx.TK_SEMI, ";", 0);
+                } else {
+                    for q in m.a..m.b {
+                        let mut x = els[q];
+                        if q == m.a {
+                            x.nl = nl;
+                        }
+                        out.push(x);
+                    }
+                }
+            }
+            e = end;
+            continue;
+        }
+        if not added and (imps.len == 0) and not is_cmt(&els[e]) {
+            // no imports: the new ones go before the first declaration
+            for r in 0..adds.len {
+                let mut nl: i32 = 1;
+                if r == 0 {
+                    nl = els[e].nl;
+                }
+                push_tok(&mut out, lx.KW_IMPORT, "import", nl);
+                push_tok(&mut out, lx.TK_STRING, u.f1("\"%s\"", adds.get(r).path), 0);
+                push_tok(&mut out, lx.KW_AS, "as", 0);
+                push_tok(&mut out, lx.TK_IDENT, adds.get(r).alias, 0);
+                push_tok(&mut out, lx.TK_SEMI, ";", 0);
+            }
+            added = true;
+            let mut x = els[e];
+            x.nl = 2;
+            out.push(x);
+            e += 1;
+            continue;
+        }
+        out.push(els[e]);
+        e += 1;
+    }
+    return out;
+}
+
+fn first_run_of(imps: *u.List.[Imp]) usize {
+    if imps.len == 0 {
+        return NONE;
+    }
+    return imps.get(0).run;
+}
+
+// `target`, a path within std, relative to the std subdirectory `from`.
+fn rel_to(target: []u8, from: []u8) []u8 {
+    let mut t = target;
+    let mut f = from;
+    // drop the directories they share
+    while f.len > 0 {
+        let kt = u.find(t, '/');
+        if kt < 0 {
+            break;
+        }
+        let head = t[0..@int_cast(usize, kt) + 1];
+        if u.str_eq(f, head[0..head.len - 1]) {
+            t = t[head.len..];
+            f = "";
+        } else if u.starts(f, head) {
+            t = t[head.len..];
+            f = f[head.len..];
+        } else {
+            break;
+        }
+    }
+    let mut out = t;
+    for i in 0..f.len {
+        if (i == 0) or (f[i - 1] == '/') {
+            out = u.cat2("../", out);
+        }
+    }
+    return out;
+}
+
+fn basename_of(p: []u8) []u8 {
+    let k = u.rfind(p, '/');
+    if k < 0 {
+        return p;
+    }
+    return p[@int_cast(usize, k) + 1..];
+}
+
+// -----------------------------------------------------------------------------
+// What each token is
+// -----------------------------------------------------------------------------
+fn is_opener(k: i32) bool {
+    return (k == lx.TK_LPAREN) or (k == lx.TK_LBRACKET) or (k == lx.TK_LBRACE);
+}
+
+fn is_closer(k: i32) bool {
+    return (k == lx.TK_RPAREN) or (k == lx.TK_RBRACKET) or (k == lx.TK_RBRACE);
+}
+
+fn is_assign(k: i32) bool {
+    return (k == lx.TK_EQ) or ((k >= lx.TK_PLUS_EQ) and (k <= lx.TK_SHR_EQ));
+}
+
+// Operators that are always binary.
+fn is_binary(k: i32) bool {
+    if (k == lx.KW_AND) or (k == lx.KW_OR) or is_assign(k) {
+        return true;
+    }
+    if (k == lx.TK_SLASH) or (k == lx.TK_PERCENT) or (k == lx.TK_PLUS) or (k == lx.TK_PLUS_PCT) or
+       (k == lx.TK_STAR_PCT) or (k == lx.TK_CARET) or (k == lx.TK_SHL) or (k == lx.TK_SHR) {
+        return true;
+    }
+    return (k >= lx.TK_EQEQ) and (k <= lx.TK_GE);
+}
+
+// '-', '-%', '*', '&' and '|' are binary after an operand, else prefix.
+fn is_either(k: i32) bool {
+    return (k == lx.TK_MINUS) or (k == lx.TK_MINUS_PCT) or (k == lx.TK_STAR) or (k == lx.TK_AMP) or (k == lx.TK_PIPE);
+}
+
+fn operand_token(k: i32) bool {
+    return (k == lx.TK_IDENT) or (k == lx.TK_INT) or (k == lx.TK_FLOAT) or (k == lx.TK_STRING) or (k == lx.TK_CHAR) or
+           (k == lx.TK_BUILTIN) or (k == lx.TK_DISCARD) or (k == lx.TK_PRIM) or (k == lx.KW_SELF) or
+           (k == lx.KW_TRUE) or (k == lx.KW_FALSE) or (k == lx.KW_ERROR);
+}
+
+fn space_before(p: *El, c: *El) bool {
+    let pk = p.kind;
+    let ck = c.kind;
+    if (ck == lx.TK_RPAREN) or (ck == lx.TK_RBRACKET) or (ck == lx.TK_COMMA) or (ck == lx.TK_SEMI) or
+       (ck == lx.TK_COLON) or (ck == lx.TK_DOTDOT) {
+        return false;
+    }
+    if ck == lx.TK_RBRACE {
+        return pk != lx.TK_LBRACE;
+    }
+    if pk == lx.TK_LBRACE {
+        return true;
+    }
+    if (pk == lx.TK_LPAREN) or (pk == lx.TK_LBRACKET) or (pk == lx.TK_DOT) or (pk == lx.TK_DOTDOT) or p.unary {
+        return false;
+    }
+    if (p.cap == 1) or (c.cap == 2) {
+        return false;
+    }
+    if c.binop or p.binop {
+        return true;
+    }
+    if (pk == lx.TK_RBRACKET) and p.pfx {
+        return false;
+    }
+    if ck == lx.TK_DOT {
+        return not p.opnd;
+    }
+    if (ck == lx.TK_BANG) and c.opnd {
+        return false;
+    }
+    if ck == lx.TK_LPAREN {
+        return not p.opnd and (pk != lx.KW_FN);
+    }
+    if ck == lx.TK_LBRACKET {
+        return not p.opnd;
+    }
+    return true;
+}
+
+// Brackets, brace kinds, operators and spacing.
+fn classify(els: []mut El) void {
+    let mate = u.newn.[usize](els.len + 1);
+    let mut stack = idx_list();
+    for i in 0..els.len {
+        mate[i] = NONE;
+        let k = els[i].kind;
+        if is_opener(k) {
+            stack.push(i);
+        } else if is_closer(k) and (stack.len > 0) {
+            let o = stack.pop();
+            mate[o] = i;
+            mate[i] = o;
+        }
+    }
+    let mut pending: i32 = 0;
+    let mut prev = NONE;
+    for i in 0..els.len {
+        if is_cmt(&els[i]) {
+            continue;
+        }
+        let k = els[i].kind;
+        let nt = next_tok(els, i);
+        let mut nk: i32 = -1;
+        if nt != NONE {
+            nk = els[nt].kind;
+        }
+        let mut pk: i32 = -1;
+        let mut popnd = false;
+        if prev != NONE {
+            pk = els[prev].kind;
+            popnd = els[prev].opnd;
+        }
+        if (k == lx.KW_STRUCT) and (nk == lx.TK_IDENT) {
+            pending = BR_FIELDS;
+        } else if (k == lx.KW_STRUCT) and (nk == lx.TK_LBRACE) {
+            pending = BR_INLINE;
+        } else if (k == lx.KW_UNION) or (k == lx.KW_ENUM) {
+            pending = BR_FIELDS;
+        } else if (k == lx.KW_ERROR) and (nk == lx.TK_LBRACE) {
+            pending = BR_INLINE;
+            let m = mate[nt];
+            if m != NONE {
+                els[m].eol = true;
+            }
+        } else if k == lx.KW_MATCH {
+            pending = BR_MATCH;
+        } else if (k == lx.KW_EXTERN) or ((k == lx.KW_IMPORT) and (nk == lx.KW_HOST)) {
+            pending = BR_DECLS;
+        } else if k == lx.TK_LBRACE {
+            let mut br = BR_BLOCK;
+            if pk == lx.TK_DOT {
+                br = BR_INLINE;
+            } else if pending != 0 {
+                br = pending;
+                pending = 0;
+            }
+            els[i].brace = br;
+            let m = mate[i];
+            if m != NONE {
+                els[m].brace = br;
+                if (m == (i + 1)) and (br != BR_INLINE) {
+                    els[i].empty = true;
+                    els[m].empty = true;
+                }
+            }
+        } else if k == lx.TK_LPAREN {
+            let mut sig = pk == lx.KW_FN;
+            if (pk == lx.TK_IDENT) and (prev > 0) {
+                let pp = prev_tok(els, prev);
+                sig = (pp != NONE) and (els[pp].kind == lx.KW_FN);
+            }
+            if (pk == lx.TK_RBRACKET) and (mate[prev] != NONE) {
+                let g = prev_tok(els, mate[prev]);
+                if (g != NONE) and (els[g].kind == lx.TK_IDENT) {
+                    let gg = prev_tok(els, g);
+                    sig = (gg != NONE) and (els[gg].kind == lx.KW_FN);
+                }
+            }
+            if sig and (mate[i] != NONE) {
+                els[i].fnsig = true;
+                els[mate[i]].fnsig = true;
+            }
+        } else if k == lx.TK_LBRACKET {
+            if not popnd and (pk != lx.TK_DOT) and (mate[i] != NONE) {
+                els[i].pfx = true;
+                els[mate[i]].pfx = true;
+            }
+        } else if (k == lx.TK_PIPE) and (pk == lx.KW_CATCH) {
+            els[i].cap = 1;
+            let n2 = next_tok(els, nt);
+            if (nt != NONE) and (n2 != NONE) and (els[n2].kind == lx.TK_PIPE) {
+                els[n2].cap = 2;
+            }
+        } else if k == lx.TK_COMMA {
+            if (nk == lx.TK_RPAREN) or (nk == lx.TK_RBRACKET) or
+               ((nk == lx.TK_RBRACE) and (els[nt].brace == BR_INLINE)) {
+                els[i].trail = true;
+            }
+        }
+        // operand ends and operators
+        if operand_token(k) {
+            els[i].opnd = true;
+        } else if k == lx.TK_RPAREN {
+            els[i].opnd = not els[i].fnsig;
+        } else if k == lx.TK_RBRACKET {
+            els[i].opnd = not els[i].pfx;
+        } else if k == lx.TK_RBRACE {
+            els[i].opnd = els[i].brace == BR_INLINE;
+        } else if k == lx.TK_BANG {
+            els[i].opnd = popnd;
+            els[i].unary = not popnd;
+        } else if (k == lx.TK_STAR) and (pk == lx.TK_DOT) {
+            els[i].opnd = true;
+        } else if is_either(k) and (els[i].cap == 0) {
+            els[i].binop = popnd;
+            els[i].unary = not popnd;
+        } else if k == lx.TK_TILDE {
+            els[i].unary = true;
+        } else if is_binary(k) {
+            els[i].binop = true;
+        }
+        if prev != NONE {
+            els[i].sp = space_before(&els[prev], &els[i]);
+        }
+        prev = i;
+    }
+    // brackets with a trailing comma, and the commas between their items
+    for i in 0..els.len {
+        if not els[i].trail {
+            continue;
+        }
+        let c = next_tok(els, i);
+        let o = mate[c];
+        if o == NONE {
+            continue;
+        }
+        els[c].x = true;
+        els[o].x = true;
+        let mut d: i32 = 0;
+        for q in o + 1..c {
+            let k = els[q].kind;
+            if is_opener(k) {
+                d += 1;
+            } else if is_closer(k) {
+                d -= 1;
+            } else if (k == lx.TK_COMMA) and (d == 0) {
+                els[q].xcomma = true;
+            }
+        }
+    }
+
+    u.free(@ptr_cast(*mut void, stack.data));
+}
+
+// -----------------------------------------------------------------------------
+// Lines
+// -----------------------------------------------------------------------------
+struct Line {
+    a: usize,  // its elements [a, b)
+    b: usize,
+    indent: i32,
+    blank: bool,     // a blank line before it
+    cmt: usize,      // its trailing comment, or NONE
+    only_cmt: bool,  // a comment on a line of its own (element a)
+    cont: bool,      // ... continuing the trailing comment above it
+    keep: bool,      // keeps its input line breaks (it has comments inside)
+    arrow: usize,    // a match arm on one line: its '=>', or NONE
+    group: i32,      // the match it is an arm of
+}
+
+struct Frame {
+    kind: i32,
+    nest: i32,   // brackets open in it
+    arm: usize,  // an arm's block: the line with the arm's '{', or NONE
+    group: i32,  // a match: its number
+}
+
+struct Shaper {
+    els: []mut El,
+    lines: u.List.[Line],
+    frames: u.List.[Frame],
+    cur: Line,  // the line being built (cur.a == NONE: none)
+    indent: i32,
+    fresh: bool,  // at the start of a block: no blank line
+    groups: i32,
+}
+
+fn new_line(a: usize, indent: i32) Line {
+    return Line.{ a: a, b: a, indent: indent, blank: false, cmt: NONE, only_cmt: false, cont: false, keep: false,
+                  arrow: NONE, group: 0 };
+}
+
+fn begin(S: *mut Shaper, i: usize) void {
+    S.cur = new_line(i, S.indent);
+    let e = &S.els[i];
+    let closing = (e.kind == lx.TK_RBRACE) and (e.brace != BR_INLINE) and not e.empty;
+    S.cur.blank = (e.nl >= 2) and not S.fresh and not closing and (S.lines.len > 0);
+    S.fresh = false;
+}
+
+fn end_line(S: *mut Shaper, b: usize) void {
+    if S.cur.a == NONE {
+        return;
+    }
+    S.cur.b = b;
+    S.lines.push(S.cur);
+    S.cur.a = NONE;
+}
+
+fn top(S: *mut Shaper) *mut Frame {
+    return S.frames.at(S.frames.len - 1);
+}
+
+// Width of elements [a, b) on one line.
+fn line_width(els: []El, a: usize, b: usize, keep: bool) usize {
+    let mut w: usize = 0;
+    let mut first = true;
+    for i in a..b {
+        let e = &els[i];
+        if is_cmt(e) {
+            continue;
+        }
+        if not first and e.sp {
+            w += 1;
+        }
+        first = false;
+        w += width(e.text);
+        if e.comma {
+            w += 1;
+        }
+    }
+    return w;
+}
+
+fn has_block(els: []El, a: usize, b: usize) bool {
+    for i in a..b {
+        if ((els[i].kind == lx.TK_LBRACE) or (els[i].kind == lx.TK_RBRACE)) and (els[i].brace != BR_INLINE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_x(els: []El, a: usize, b: usize) bool {
+    for i in a..b {
+        if els[i].x {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An arm's block closes at element i: puts the arm on one line if its block
+// is one short statement.
+fn try_merge(S: *mut Shaper, h: usize, i: usize) bool {
+    if S.lines.len != (h + 2) {
+        return false;
+    }
+    let hd = S.lines.get(h);
+    let st = S.lines.get(h + 1);
+    if hd.keep or st.keep or st.only_cmt or (hd.cmt != NONE) or (st.cmt != NONE) or (hd.b != st.a) or (st.b != i) {
+        return false;
+    }
+    if has_block(S.els, st.a, st.b) or has_x(S.els, hd.a, i) {
+        return false;
+    }
+    if ((@int_cast(usize, hd.indent) * 4) + line_width(S.els, hd.a, i + 1, false)) > WIDTH {
+        return false;
+    }
+    S.lines.len -= 2;
+    S.cur = hd;
+    for j in hd.a..i {
+        if S.els[j].kind == lx.TK_FATARROW {
+            S.cur.arrow = j;
+            break;
+        }
+    }
+    return true;
+}
+
+fn shape(els: []mut El) u.List.[Line] {
+    let mut S = Shaper.{ els: els, lines: u.List.[Line].{ data: u.nil.[Line](), len: 0, cap: 0 },
+                         frames: u.List.[Frame].{ data: u.nil.[Frame](), len: 0, cap: 0 }, cur: new_line(NONE, 0),
+                         indent: 0, fresh: true, groups: 0 };
+    S.frames.push(Frame.{ kind: BR_BLOCK, nest: 0, arm: NONE, group: 0 });
+    let mut prev = NONE;
+    let mut i: usize = 0;
+    while i < els.len {
+        let e = &mut els[i];
+        if is_cmt(e) {
+            if S.cur.a != NONE {
+                S.cur.keep = true;  // inside a statement
+            } else if (e.nl == 0) and (S.lines.len > 0) and not S.lines.last().only_cmt and (S.lines.last().b == i) {
+                S.lines.at(S.lines.len - 1).cmt = i;
+            } else {
+                let mut l = new_line(i, S.indent);
+                l.b = i + 1;
+                l.only_cmt = true;
+                l.blank = (e.nl >= 2) and not S.fresh and (S.lines.len > 0);
+                if not l.blank and (S.lines.len > 0) and (e.nl <= 1) {
+                    let pl = S.lines.last();
+                    if ((pl.cmt != NONE) or (pl.only_cmt and pl.cont)) and (e.col > (S.indent * 4)) {
+                        l.cont = true;
+                    }
+                }
+                S.fresh = false;
+                S.lines.push(l);
+            }
+            i += 1;
+            continue;
+        }
+        if S.cur.a == NONE {
+            begin(&mut S, i);
+        }
+        let k = e.kind;
+        let fr = top(&mut S);
+        let block = (e.brace != 0) and (e.brace != BR_INLINE) and not e.empty;
+        if (k == lx.TK_LBRACE) and block {
+            end_line(&mut S, i + 1);
+            let mut arm = NONE;
+            if fr.kind == BR_MATCH {
+                arm = S.lines.len - 1;
+            }
+            let mut g: i32 = 0;
+            if e.brace == BR_MATCH {
+                S.groups += 1;
+                g = S.groups;
+            }
+            S.frames.push(Frame.{ kind: e.brace, nest: 0, arm: arm, group: g });
+            S.indent += 1;
+            S.fresh = true;
+        } else if (k == lx.TK_RBRACE) and block {
+            if S.cur.a != i {
+                if (fr.kind == BR_FIELDS) and (prev != NONE) and (els[prev].kind != lx.TK_COMMA) {
+                    els[prev].comma = true;
+                }
+                end_line(&mut S, i);
+            }
+            let closed = S.frames.pop();
+            S.indent -= 1;
+            S.cur.a = NONE;
+            let merged = (closed.arm != NONE) and try_merge(&mut S, closed.arm, i);
+            if merged {
+                S.cur.group = top(&mut S).group;
+            } else {
+                begin(&mut S, i);
+            }
+            if (closed.arm != NONE) or not continues(els, i) {
+                end_line(&mut S, i + 1);
+            }
+        } else if (k == lx.TK_RBRACE) and e.empty {
+            if (fr.kind == BR_MATCH) or not continues(els, i) {
+                end_line(&mut S, i + 1);
+            }
+        } else if (k == lx.TK_SEMI) and (fr.nest == 0) and ((fr.kind == BR_BLOCK) or (fr.kind == BR_DECLS)) {
+            end_line(&mut S, i + 1);
+        } else if (k == lx.TK_COMMA) and (fr.nest == 0) and (fr.kind == BR_FIELDS) {
+            end_line(&mut S, i + 1);
+        } else if (fr.kind == BR_FIELDS) and (fr.nest == 0) and (S.cur.a != i) and
+                  ((k == lx.KW_PUB) or ((k == lx.KW_FN) and (prev != NONE) and els[prev].opnd)) {
+            // a member without its comma, then a method
+            els[prev].comma = true;
+            end_line(&mut S, i);
+            begin(&mut S, i);
+        } else if is_opener(k) and not e.empty {
+            fr.nest += 1;
+        } else if is_closer(k) and not e.empty {
+            fr.nest -= 1;
+            if e.eol and (fr.nest == 0) {
+                end_line(&mut S, i + 1);
+            }
+        }
+        prev = i;
+        i += 1;
+    }
+    end_line(&mut S, els.len);
+    u.free(@ptr_cast(*mut void, S.frames.data));
+    return S.lines;
+}
+
+// Does the line go on after the block-closing '}' at i?
+fn continues(els: []El, i: usize) bool {
+    if (i + 1) >= els.len {
+        return false;
+    }
+    let k = els[i + 1].kind;
+    return (k == lx.KW_ELSE) or (k == lx.TK_SEMI) or (k == lx.TK_RPAREN) or (k == lx.TK_RBRACKET) or (k == lx.TK_COMMA);
+}
+
+// -----------------------------------------------------------------------------
+// Rendering
+// -----------------------------------------------------------------------------
+struct Out {
+    text: []u8,  // the code, indented
+    cmt: []u8,   // a trailing comment, or nosym
+    indent: i32,
+    cont: bool,  // a comment continuing the one above (text is empty)
+}
+
+struct Renderer {
+    els: []El,
+    out: u.List.[Out],
+}
+
+fn spaces(b: *mut u.Buf, n: usize) void {
+    let mut k: usize = 0;
+    while k < n {
+        b.c(' ');
+        k += 1;
+    }
+}
+
+fn put(R: *mut Renderer, text: []u8, indent: i32) void {
+    R.out.push(Out.{ text: text, cmt: u.nosym(), indent: indent, cont: false });
+}
+
+fn put_tok(b: *mut u.Buf, e: *El) void {
+    b.s(e.text);
+    if e.comma {
+        b.c(',');
+    }
+}
+
+// A place to break a line: after token 'at', inside 'depth' brackets; the
+// next line would start at 'col'; 'outer' is the outermost bracket opened on
+// this line and still open there.
+struct Brk {
+    at: usize,
+    depth: usize,
+    col: usize,
+    outer: usize,
+}
+
+// Trailing comments line up on lines whose code differs in width by at most this.
+const RAGGED: usize = 20;
+
+// Past this column, a continuation lined up with its bracket is too squeezed.
+const DEEP: usize = 72;
+
+// Content column of a bracket that opens at column c (after the token).
+fn inner_col(e: *El, c: usize) usize {
+    if (e.kind == lx.TK_LBRACE) and (e.brace == BR_INLINE) {
+        return c + 1;
+    }
+    return c;
+}
+
+// A code line that is too long: broken after ',', 'and' or 'or' (else another
+// binary operator) at the shallowest nesting.
+fn wrap(R: *mut Renderer, ts: []usize, c0: usize, indent: i32, pad_at: usize, pad: usize) void {
+    let els = R.els;
+    let n = ts.len;
+    let mut st = idx_list();  // where the items of each open bracket start
+    let mut sb = idx_list();  // where the line with the bracket starts
+    let mut hang = c0 + 4;
+    let k0 = els[ts[0]].kind;
+    if (k0 == lx.KW_IF) or (k0 == lx.KW_WHILE) or (k0 == lx.KW_RETURN) or (k0 == lx.KW_FOR) or (k0 == lx.KW_MATCH) {
+        hang = c0 + width(els[ts[0]].text) + 1;
+    } else if (k0 == lx.TK_RBRACE) and (n > 2) and (els[ts[1]].kind == lx.KW_ELSE) and (els[ts[2]].kind == lx.KW_IF) {
+        hang = c0 + 10;
+    }
+    let mut kw_hang = hang != (c0 + 4);
+    let mut sim_col = idx_list();  // the brackets open while measuring a line
+    let mut sim_tok = idx_list();  // (NONE: opened on an earlier line)
+    let mut s: usize = 0;
+    let mut col0 = c0;
+    while s < n {
+        // how far this line can go, and where it could break
+        sim_col.clear();
+        sim_tok.clear();
+        for q in 0..st.len {
+            sim_col.push(st.get(q));
+            sim_tok.push(NONE);
+        }
+        let mut col = col0;
+        let mut ba = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE };  // 'and', 'or': the shallowest, then the last
+        let mut bc = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE };  // ',': the last
+        let mut bs = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE };  // other operators: the shallowest, then the last
+        let mut comma_depth = NONE;
+        let mut over = false;
+        let mut forced = NONE;
+        let mut j = s;
+        while j < n {
+            let e = &els[ts[j]];
+            if (j > s) and e.sp {
+                col += 1;
+            }
+            if ts[j] == pad_at {
+                col += pad;
+            }
+            col += width(e.text);
+            if e.comma {
+                col += 1;
+            }
+            if (col > WIDTH) and (j > s) {
+                over = true;
+                break;
+            }
+            let next_x = ((j + 1) < n) and els[ts[j + 1]].x and is_closer(els[ts[j + 1]].kind);
+            if (e.x and is_opener(e.kind)) or e.xcomma or next_x {
+                forced = j;
+                break;
+            }
+            if is_opener(e.kind) {
+                sim_col.push(inner_col(e, col));
+                sim_tok.push(j);
+            } else if is_closer(e.kind) and (sim_col.len > 0) {
+                _ = sim_col.pop();
+                _ = sim_tok.pop();
+            }
+            if (j + 1) < n {
+                let mut here = Brk.{ at: j, depth: sim_col.len, col: hang, outer: NONE };
+                if sim_col.len > 0 {
+                    here.col = sim_col.last();
+                }
+                for q in 0..sim_tok.len {
+                    if sim_tok.get(q) != NONE {
+                        here.outer = sim_tok.get(q);
+                        break;
+                    }
+                }
+                let k = e.kind;
+                if (k == lx.KW_AND) or (k == lx.KW_OR) {
+                    if (ba.at == NONE) or (here.depth <= ba.depth) {
+                        ba = here;
+                    }
+                } else if (k == lx.TK_COMMA) or e.comma {
+                    bc = here;
+                    if (comma_depth == NONE) or (here.depth < comma_depth) {
+                        comma_depth = here.depth;
+                    }
+                } else if e.binop and ((bs.at == NONE) or (here.depth <= bs.depth)) {
+                    bs = here;
+                }
+            }
+            j += 1;
+        }
+        let mut stop = n - 1;
+        if forced != NONE {
+            stop = forced;
+        } else if over {
+            let mut br = bs;
+            if (ba.at != NONE) and ((bc.at == NONE) or (ba.depth <= comma_depth)) {
+                br = ba;
+            } else if bc.at != NONE {
+                br = bc;
+            }
+            if br.at == NONE {
+                // nowhere to break before the edge: the first place after it
+                let mut q = j;
+                while q < (n - 1) {
+                    let e = &els[ts[q]];
+                    if (e.kind == lx.TK_COMMA) or (e.kind == lx.KW_AND) or (e.kind == lx.KW_OR) or e.comma or e.binop {
+                        break;
+                    }
+                    q += 1;
+                }
+                stop = q;
+            } else if (br.col > DEEP) and (br.outer != NONE) and (br.outer > s) and ((col0 + 4) < br.col) {
+                // the rest would be squeezed against the edge: break after the
+                // bracket instead, the items indented under the line
+                stop = br.outer;
+            } else {
+                stop = br.at;
+            }
+        }
+        // emit s..=stop
+        let mut b = u.Buf.init();
+        spaces(&mut b, col0);
+        let mut c = col0;
+        for q in s..stop + 1 {
+            let e = &els[ts[q]];
+            if (q > s) and e.sp {
+                b.c(' ');
+                c += 1;
+            }
+            if ts[q] == pad_at {
+                spaces(&mut b, pad);
+                c += pad;
+            }
+            put_tok(&mut b, e);
+            c += width(e.text);
+            if e.comma {
+                c += 1;
+            }
+            if is_opener(e.kind) {
+                if q == stop {
+                    st.push(col0 + 4);
+                } else {
+                    st.push(inner_col(e, c));
+                }
+                sb.push(col0);
+            } else if is_closer(e.kind) and (st.len > 0) {
+                _ = st.pop();
+                _ = sb.pop();
+            } else if is_assign(e.kind) and (st.len == 0) and not kw_hang and (q < stop) {
+                hang = c + 1;
+                kw_hang = true;
+            }
+        }
+        put(R, b.done(), indent);
+        s = stop + 1;
+        if (s < n) and els[ts[s]].x and is_closer(els[ts[s]].kind) and (sb.len > 0) {
+            col0 = sb.last();
+        } else if st.len > 0 {
+            col0 = st.last();
+        } else {
+            col0 = hang;
+        }
+    }
+    u.free(@ptr_cast(*mut void, st.data));
+    u.free(@ptr_cast(*mut void, sb.data));
+    u.free(@ptr_cast(*mut void, sim_col.data));
+    u.free(@ptr_cast(*mut void, sim_tok.data));
+}
+
+// A line with comments inside: its input line breaks stay. A line inside
+// brackets lines up with the items as a wrapped line does.
+fn render_keep(R: *mut Renderer, l: *Line, c0: usize) void {
+    let els = R.els;
+    let mut st = idx_list();
+    let mut sb = idx_list();
+    let mut b = u.Buf.init();
+    let mut empty = true;
+    let mut first = true;
+    let mut col0 = c0;
+    let mut c = c0;
+    for i in l.a..l.b {
+        let e = &els[i];
+        if is_cmt(e) {
+            if (e.nl == 0) and not empty {
+                R.out.push(Out.{ text: b.done(), cmt: e.text, indent: l.indent, cont: false });
+                b = u.Buf.init();
+                empty = true;
+            } else {
+                if not empty {
+                    put(R, b.done(), l.indent);
+                    b = u.Buf.init();
+                    empty = true;
+                }
+                let mut cb = u.Buf.init();
+                let mut ind = c0 + 4;
+                if st.len > 0 {
+                    ind = st.last();
+                }
+                spaces(&mut cb, ind);
+                cb.s(e.text);
+                put(R, cb.done(), l.indent);
+            }
+            continue;
+        }
+        if not empty and (e.nl > 0) {
+            put(R, b.done(), l.indent);
+            b = u.Buf.init();
+            empty = true;
+        }
+        if empty {
+            col0 = c0 + 4;
+            if first {
+                col0 = c0;
+            } else if is_closer(e.kind) and not e.empty and (sb.len > 0) {
+                col0 = sb.last();
+            } else if st.len > 0 {
+                col0 = st.last();
+            }
+            spaces(&mut b, col0);
+            c = col0;
+        } else if e.sp {
+            b.c(' ');
+            c += 1;
+        }
+        put_tok(&mut b, e);
+        c += width(e.text);
+        if e.comma {
+            c += 1;
+        }
+        empty = false;
+        first = false;
+        if is_opener(e.kind) and not e.empty {
+            // the items start after it, or on the next line, indented
+            let nx = next_tok(els, i);
+            if (nx != NONE) and (nx < l.b) and (els[nx].nl > 0) {
+                st.push(col0 + 4);
+            } else {
+                st.push(inner_col(e, c));
+            }
+            sb.push(col0);
+        } else if is_closer(e.kind) and not e.empty and (st.len > 0) {
+            _ = st.pop();
+            _ = sb.pop();
+        }
+    }
+    if not empty {
+        put(R, b.done(), l.indent);
+    }
+    u.free(@ptr_cast(*mut void, st.data));
+    u.free(@ptr_cast(*mut void, sb.data));
+}
+
+fn render_line(R: *mut Renderer, l: *Line, pad: usize) void {
+    let els = R.els;
+    let c0 = @int_cast(usize, l.indent) * 4;
+    if l.only_cmt {
+        if l.cont {
+            R.out.push(Out.{ text: "", cmt: els[l.a].text, indent: l.indent, cont: true });
+        } else {
+            let mut b = u.Buf.init();
+            spaces(&mut b, c0);
+            b.s(els[l.a].text);
+            put(R, b.done(), l.indent);
+        }
+        return;
+    }
+    if l.keep {
+        render_keep(R, l, c0);
+    } else {
+        let mut ts = idx_list();
+        let mut exploded = false;
+        for i in l.a..l.b {
+            if not is_cmt(&els[i]) {
+                ts.push(i);
+                exploded = exploded or els[i].x;
+            }
+        }
+        if ts.len == 0 {
+            return;
+        }
+        let w = c0 + line_width(els, l.a, l.b, false) + pad;
+        if (w <= WIDTH) and not exploded {
+            let mut b = u.Buf.init();
+            spaces(&mut b, c0);
+            for q in 0..ts.len {
+                let e = &els[ts.get(q)];
+                if (q > 0) and e.sp {
+                    b.c(' ');
+                }
+                if ts.get(q) == l.arrow {
+                    spaces(&mut b, pad);
+                }
+                put_tok(&mut b, e);
+            }
+            put(R, b.done(), l.indent);
+        } else {
+            wrap(R, ts.items(), c0, l.indent, l.arrow, pad);
+        }
+        u.free(@ptr_cast(*mut void, ts.data));
+    }
+    if l.cmt != NONE {
+        R.out.at(R.out.len - 1).cmt = els[l.cmt].text;
+    }
+}
+
+fn render(els: []El, lines: *u.List.[Line]) []u8 {
+    let mut R = Renderer.{ els: els, out: u.List.[Out].{ data: u.nil.[Out](), len: 0, cap: 0 } };
+    let n = lines.len;
+    // lined-up '=>' in runs of one-line arms
+    let pads = u.newn.[usize](n + 1);
+    let mut i: usize = 0;
+    while i < n {
+        pads[i] = 0;
+        let l = lines.get(i);
+        if l.arrow == NONE {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        let mut w: usize = 0;
+        while j < n {
+            let m = lines.get(j);
+            if (m.arrow == NONE) or (m.group != l.group) or ((j > i) and m.blank) {
+                break;
+            }
+            let pw = line_width(els, m.a, m.arrow, false);
+            if pw > w {
+                w = pw;
+            }
+            j += 1;
+        }
+        for q in i..j {
+            let m = lines.get(q);
+            pads[q] = w - line_width(els, m.a, m.arrow, false);
+        }
+        i = j;
+    }
+    for q in 0..n {
+        let l = lines.at(q);
+        if l.blank {
+            put(&mut R, "", -1);
+        }
+        render_line(&mut R, l, pads[q]);
+    }
+
+    // trailing comments lined up in runs
+    let outs = R.out.items();
+    let mut b = u.Buf.init();
+    let mut k: usize = 0;
+    while k < outs.len {
+        let o = outs[k];
+        if u.isnos(o.cmt) {
+            b.s(o.text);
+            b.c('\n');
+            k += 1;
+            continue;
+        }
+        let mut j = k;
+        let mut w: usize = 0;
+        let mut lo: usize = NONE;
+        while j < outs.len {
+            let m = outs[j];
+            if u.isnos(m.cmt) {
+                break;
+            }
+            if not m.cont {
+                let tw = width(m.text);
+                if (j > k) and ((m.indent != o.indent) or (m.text.len == 0)) {
+                    break;
+                }
+                // a line much longer or shorter than the others starts a new run
+                if (j > k) and (lo != NONE) and ((tw > (w + RAGGED)) or ((tw + RAGGED) < lo)) {
+                    break;
+                }
+                if tw > w {
+                    w = tw;
+                }
+                if (lo == NONE) or (tw < lo) {
+                    lo = tw;
+                }
+            }
+            j += 1;
+        }
+        for q in k..j {
+            let m = outs[q];
+            b.s(m.text);
+            if m.cont and (w == 0) {
+                spaces(&mut b, @int_cast(usize, m.indent) * 4);
+            } else {
+                spaces(&mut b, (w + 2) - width(m.text));
+            }
+            b.s(m.cmt);
+            b.c('\n');
+        }
+        k = j;
+    }
+    u.free(@ptr_cast(*mut void, R.out.data));
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Files
+// -----------------------------------------------------------------------------
+fn load_text(path: []u8, text: []u8) *mut u.SourceFile {
+    let sf = u.new.[u.SourceFile]();
+    sf.path = path;
+    sf.display = path;
+    sf.text = text;
+    sf.id = @int_cast(i32, u.g_files.len);
+    u.g_files.push(sf);
+    return sf;
+}
+
+// Same tokens (commas aside) and the same comments?
+fn same_program(x: []El, y: []El) bool {
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    loop {
+        while (i < x.len) and (x[i].kind == lx.TK_COMMA) {
+            i += 1;
+        }
+        while (j < y.len) and (y[j].kind == lx.TK_COMMA) {
+            j += 1;
+        }
+        if (i >= x.len) or (j >= y.len) {
+            return (i >= x.len) and (j >= y.len);
+        }
+        if (x[i].kind != y[j].kind) or not u.str_eq(x[i].text, y[j].text) {
+            return false;
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+pub const FMT_SAME: i32 = 0;
+pub const FMT_CHANGED: i32 = 1;
+pub const FMT_ERROR: i32 = 2;
+
+pub struct Result {
+    status: i32,
+    text: []u8,
+}
+
+// Formats one file's text. Syntax errors are reported through diag.
+pub fn format_text(path: []u8, text: []u8, std_dir: []u8) Result {
+    let f = load_text(path, text);
+    let before = dg.error_count();
+    _ = ps.parse_module(f);
+    if dg.error_count() != before {
+        return Result.{ status: FMT_ERROR, text: text };
+    }
+    let mut raw = el_list();
+    if not scan(f, &mut raw) {
+        return Result.{ status: FMT_ERROR, text: text };
+    }
+    let mut els = fix_imports(raw.items(), path, std_dir);
+    classify(els.items());
+    let lines = shape(els.items());
+    let out = render(els.items(), &lines);
+    // the check
+    let g = load_text(u.cat2(path, " (formatted)"), out);
+    let mut again = el_list();
+    if not scan(g, &mut again) or not same_program(els.items(), again.items()) {
+        _ = dg.err(u.mkspan(f.id, 0, 0), "E9007",
+                   "axiom fmt: internal error: the formatted text differs; the file is left alone");
+        return Result.{ status: FMT_ERROR, text: text };
+    }
+    if u.str_eq(out, text) {
+        return Result.{ status: FMT_SAME, text: out };
+    }
+    return Result.{ status: FMT_CHANGED, text: out };
+}
+
+fn collect(path: []u8, out: *mut u.List.[[]u8]) void {
+    if not u.is_dir(path) {
+        out.push(path);
+        return;
+    }
+    let mut names = str_list();
+    _ = u.list_dir(path, &mut names);
+    u.sort.[[]u8](names.items(), u.str_cmp);
+    for i in 0..names.len {
+        let nm = names.get(i);
+        if u.starts(nm, ".") {
+            continue;
+        }
+        let p = u.cat3(path, "/", nm);
+        if u.is_dir(p) {
+            collect(p, out);
+        } else if u.ends(nm, ".ax") {
+            out.push(p);
+        }
+    }
+}
+
+// axiom fmt <file|dir>... [--check] [--stdout] [--format=agent-json]
+pub fn run_fmt(args: [][]u8, std_dir: []u8) i32 {
+    let mut check = false;
+    let mut to_stdout = false;
+    let mut json = false;
+    let mut files = str_list();
+    for a in args {
+        if u.str_eq(a, "--check") {
+            check = true;
+        } else if u.str_eq(a, "--stdout") {
+            to_stdout = true;
+        } else if u.str_eq(a, "--format=agent-json") {
+            json = true;
+        } else if u.str_eq(a, "--format=human") {
+            json = false;
+        } else if u.starts(a, "-") {
+            dg.emit_fatal(json, "E9001", u.f1("unknown option '%s'", a));
+            return 2;
+        } else if not u.file_exists(a) {
+            dg.emit_fatal(json, "E9001", u.f1("cannot read '%s'", a));
+            return 2;
+        } else {
+            collect(a, &mut files);
+        }
+    }
+    if files.len == 0 {
+        dg.emit_fatal(json, "E9001", "axiom fmt: no files given");
+        return 2;
+    }
+    let mut rc: i32 = 0;
+    for i in 0..files.len {
+        let p = files.get(i);
+        let text = u.read_file(p);
+        if u.isnos(text) {
+            dg.emit_fatal(json, "E9001", u.f1("cannot read '%s'", p));
+            rc = 1;
+            continue;
+        }
+        let r = format_text(p, text, std_dir);
+        if r.status == FMT_ERROR {
+            rc = 1;
+            continue;
+        }
+        if to_stdout {
+            u.print(r.text);
+        } else if check {
+            if r.status == FMT_CHANGED {
+                u.print(u.cat2(p, "\n"));
+                rc = 1;
+            }
+        } else if r.status == FMT_CHANGED {
+            if not u.write_file(p, r.text) {
+                dg.emit_fatal(json, "E9001", u.f1("cannot write '%s'", p));
+                rc = 1;
+            }
+        }
+    }
+    if dg.error_count() != 0 {
+        dg.emit(json, json);
+    }
+    return rc;
+}

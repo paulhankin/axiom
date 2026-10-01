@@ -1,0 +1,112 @@
+// =============================================================================
+// std/c.ax - helpers for the C FFI (spec §14.5).
+//
+// C type          Axiom type
+// -------------   ---------------------------------------------
+// int8_t..int64_t i8..i64          uint8_t..uint64_t  u8..u64
+// int / unsigned  i32 / u32        (every supported target)
+// long            isize            unsigned long      usize   (LP64 and ILP32)
+// size_t          usize            ptrdiff_t/intptr_t isize
+// float / double  f32 / f64        bool (_Bool)       bool
+// char            u8 (or i8)       T* / const T*      *mut T / *T
+// void*           *mut void        function pointer   fn(...) R
+// struct S*       *S               (layouts match; structs by value: not yet)
+// =============================================================================
+
+import "mem.ax" as mem;
+
+error { OutOfMemory, InvalidArgument }
+
+/// A null pointer, for passing NULL to C. Never dereference it.
+pub fn null_ptr[T]() *T {
+    return @ptr_from_int(*T, 0);
+}
+
+pub fn null_mut[T]() *mut T {
+    return @ptr_from_int(*mut T, 0);
+}
+
+/// C functions may return NULL; Axiom pointers are never checked for it
+/// implicitly.
+pub fn is_null[T](p: *T) bool {
+    return @int_from_ptr(p) == 0;
+}
+
+/// is_null for C's void* (generic parameters cannot be void).
+pub fn is_null_void(p: *void) bool {
+    return @int_from_ptr(p) == 0;
+}
+
+/// Length of a NUL-terminated C string.
+pub fn cstr_len(p: *u8) usize {
+    let base = @int_from_ptr(p);
+    let mut n: usize = 0;
+    while @ptr_from_int(*u8, base + n).* != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+/// Views a NUL-terminated C string as a slice (without the NUL). The bytes
+/// are not copied.
+pub fn from_cstr(p: *u8) []u8 {
+    return @slice_from_ptr(p, cstr_len(p));
+}
+
+/// Copies `s` into memory from `alloc`, adding a terminating NUL, for passing
+/// to C. Free it with free_cstr.
+pub fn to_cstr(s: []u8) !*mut u8 {
+    // (a NUL inside would end the C string early)
+    for b in s {
+        if b == 0 {
+            return error.InvalidArgument;
+        }
+    }
+    // the allocation's size goes in a hidden header, so free_cstr is right
+    // even if C code shortens the string in place
+    let total = @add_checked(s.len, CSTR_HEADER + 1) catch return error.OutOfMemory;
+    let buf = mem.alloc.[u8](total)!;
+    let n = @as(u64, total);
+    for k in @as(usize, 0)..8 {
+        buf[k] = @truncate(u8, n >> @as(u64, 8 * k));
+    }
+    @mem_copy(buf[CSTR_HEADER..CSTR_HEADER + s.len], s);
+    buf[CSTR_HEADER + s.len] = 0;
+    return @ptr_from_int(*mut u8, @int_from_ptr(buf.ptr) + CSTR_HEADER);
+}
+
+const CSTR_HEADER: usize = 8;
+
+/// Frees a string from to_cstr (and only those).
+pub fn free_cstr(p: *mut u8) void {
+    let base = @ptr_from_int(*mut u8, @int_from_ptr(p) - CSTR_HEADER);
+    let h = @slice_from_ptr(base, CSTR_HEADER);
+    let mut n: u64 = 0;
+    for k in @as(usize, 0)..8 {
+        n |= @as(u64, h[k]) << @as(u64, 8 * k);
+    }
+    mem.free(@slice_from_ptr(base, @truncate(usize, n)));
+}
+
+// -----------------------------------------------------------------------------
+// Tests (axiom test std/c.ax)
+// -----------------------------------------------------------------------------
+
+test "C strings" {
+    let p = to_cstr("hello")!;
+    @expect_eq(cstr_len(p), 5);
+    @expect_eq(from_cstr(p), "hello");
+    @expect_eq(cstr_len("literal".ptr), 7);  // literals are NUL-terminated
+    free_cstr(p);
+    @expect(is_null(null_ptr.[u8]()));
+    // C may shorten a string in place; interior NULs cannot be passed
+    let q = to_cstr("hello world")!;
+    @slice_from_ptr(q, 12)[5] = 0;
+    @expect_eq(from_cstr(q), "hello");
+    free_cstr(q);
+    _ = to_cstr("a\x00b") catch |e| {
+        @expect(e == error.InvalidArgument);
+        return;
+    };
+    @expect(false);
+}

@@ -1,4 +1,4 @@
-// runtime/test_main.c - runs the tests of a native Phalange test binary.
+// runtime/test_main.c - runs the tests of a native Axiom test binary.
 // Each test runs in a forked child (isolation from traps, a timeout, and its
 // own captured output). Output protocol: see runtime/test_runner.mjs.
 #define _GNU_SOURCE
@@ -14,39 +14,39 @@
 
 #include "trap_format.h"
 
-uint32_t phalange_test_count(void);
-const char *phalange_test_name(uint32_t i);
-int32_t phalange_test_expect(uint32_t i);
-uint32_t phalange_test_run(uint32_t i);
-const char *phalange_error_name(uint32_t code);
+uint32_t axiom_test_count(void);
+const char *axiom_test_name(uint32_t i);
+int32_t axiom_test_expect(uint32_t i);
+uint32_t axiom_test_run(uint32_t i);
+const char *axiom_error_name(uint32_t code);
 
 static int result_fd = -1;
 
-const struct ph_shadow_stack *phalange_shadow_stack(void);
+const struct ax_shadow_stack *axiom_shadow_stack(void);
 
-// Stack frames in the PHT protocol: frames separated by \x1e, fields by \x1f:
+// Stack frames in the AXT protocol: frames separated by \x1e, fields by \x1f:
 // kind (T trap site, C call, E error return, R repeat, O omitted), file id,
 // start, end, function.
-static size_t put_frame(char *out, size_t cap, char kind, const struct ph_trap_site *s, long count) {
+static size_t put_frame(char *out, size_t cap, char kind, const struct ax_trap_site *s, long count) {
     int k = s ? snprintf(out, cap, "%c\x1f%u\x1f%u\x1f%u\x1f%s\x1e", kind, s->file_id, s->start, s->end, s->fn)
               : snprintf(out, cap, "%c\x1f%ld\x1f" "0\x1f" "0\x1f\x1e", kind, count);
     return k > 0 && (size_t)k < cap ? (size_t)k : 0;
 }
 
-static size_t encode_stack(char *out, size_t cap, const struct ph_trap_site *top, const struct ph_shadow_stack *ss) {
+static size_t encode_stack(char *out, size_t cap, const struct ax_trap_site *top, const struct ax_shadow_stack *ss) {
     size_t n = 0;
     if (cap) out[0] = 0;
     if (top) n += put_frame(out + n, cap - n, 'T', top, 0);
     if (!ss) return n;
     uint32_t depth = ss->depth;
     int shown = 0;
-    for (int64_t i = (int64_t)depth - 1; i >= 0 && i >= (int64_t)depth - PH_SS_CAP; i--) {
-        const struct ph_trap_site *c = ss->calls[i & (PH_SS_CAP - 1)];
+    for (int64_t i = (int64_t)depth - 1; i >= 0 && i >= (int64_t)depth - AX_SS_CAP; i--) {
+        const struct ax_trap_site *c = ss->calls[i & (AX_SS_CAP - 1)];
         if (!c) continue;
         if (!top && n == 0) n += put_frame(out + n, cap - n, 'U', c, 0);  // innermost function, location unknown
         if (shown >= 40) return n + put_frame(out + n, cap - n, 'O', NULL, (long)i + 1);
         int64_t j = i;
-        while (j - 1 >= 0 && j - 1 >= (int64_t)depth - PH_SS_CAP && ss->calls[(j - 1) & (PH_SS_CAP - 1)] == c) j--;
+        while (j - 1 >= 0 && j - 1 >= (int64_t)depth - AX_SS_CAP && ss->calls[(j - 1) & (AX_SS_CAP - 1)] == c) j--;
         n += put_frame(out + n, cap - n, 'C', c, 0);
         shown++;
         if (j < i) {
@@ -54,25 +54,25 @@ static size_t encode_stack(char *out, size_t cap, const struct ph_trap_site *top
             i = j;
         }
     }
-    if (depth > PH_SS_CAP) n += put_frame(out + n, cap - n, 'O', NULL, (long)(depth - PH_SS_CAP));
+    if (depth > AX_SS_CAP) n += put_frame(out + n, cap - n, 'O', NULL, (long)(depth - AX_SS_CAP));
     return n;
 }
 
-static size_t encode_errors(char *out, size_t cap, const struct ph_shadow_stack *ss) {
+static size_t encode_errors(char *out, size_t cap, const struct ax_shadow_stack *ss) {
     size_t n = 0;
     if (cap) out[0] = 0;
     if (!ss) return 0;
-    uint32_t first = ss->errors > PH_ET_CAP ? ss->errors - PH_ET_CAP : 0;
+    uint32_t first = ss->errors > AX_ET_CAP ? ss->errors - AX_ET_CAP : 0;
     for (uint32_t i = first; i < ss->errors; i++)
-        if (ss->error_returns[i & (PH_ET_CAP - 1)]) n += put_frame(out + n, cap - n, 'E', ss->error_returns[i & (PH_ET_CAP - 1)], 0);
+        if (ss->error_returns[i & (AX_ET_CAP - 1)]) n += put_frame(out + n, cap - n, 'E', ss->error_returns[i & (AX_ET_CAP - 1)], 0);
     return n;
 }
 
 // Called by the trapping test (in the child) before it dies.
-void ph_on_trap(const struct ph_trap_site *site, const struct ph_trap_info *info, const struct ph_shadow_stack *ss) {
+void ax_on_trap(const struct ax_trap_site *site, const struct ax_trap_info *info, const struct ax_shadow_stack *ss) {
     static char rec[32768];
     char msg[1024];
-    ph_format_trap(msg, sizeof msg, site, info);
+    ax_format_trap(msg, sizeof msg, site, info);
     int n = snprintf(rec, sizeof rec, "TRAP\t%u\t%u\t%u\t%u\t%s\t", site->code, site->file_id, site->start, site->end, msg);
     if (n < 0 || (size_t)n >= sizeof rec) return;
     n += (int)encode_stack(rec + n, sizeof rec - (size_t)n, site, ss);
@@ -96,7 +96,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc) {
         pthread_attr_destroy(&attr);
     }
     int n = snprintf(rec, sizeof rec, "CRASH\t%d\t", code);
-    n += (int)encode_stack(rec + n, sizeof rec - (size_t)n, NULL, phalange_shadow_stack());
+    n += (int)encode_stack(rec + n, sizeof rec - (size_t)n, NULL, axiom_shadow_stack());
     if (result_fd >= 0) (void)!write(result_fd, rec, (size_t)n);
     signal(sig, SIG_DFL);
     raise(sig);
@@ -126,10 +126,10 @@ int main(int argc, char **argv) {
         if (!strncmp(argv[i], "--filter=", 9)) filter = argv[i] + 9;
         else if (!strncmp(argv[i], "--timeout=", 10)) timeout_ms = atol(argv[i] + 10);
     }
-    uint32_t n = phalange_test_count();
+    uint32_t n = axiom_test_count();
     for (uint32_t i = 0; i < n; i++) {
-        if (*filter && !strstr(phalange_test_name(i), filter)) continue;
-        int expect = phalange_test_expect(i);
+        if (*filter && !strstr(axiom_test_name(i), filter)) continue;
+        int expect = axiom_test_expect(i);
         int res[2], out[2];
         if (pipe(res) || pipe(out)) return 2;
         fflush(stdout);
@@ -152,10 +152,10 @@ int main(int argc, char **argv) {
             sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
             sigaction(SIGSEGV, &sa, NULL);
             sigaction(SIGBUS, &sa, NULL);
-            uint32_t code = phalange_test_run(i);
+            uint32_t code = axiom_test_run(i);
             static char rec[8192];
             int k = snprintf(rec, sizeof rec, "DONE\t%u\t", code);
-            if (code) k += (int)encode_errors(rec + k, sizeof rec - (size_t)k, phalange_shadow_stack());
+            if (code) k += (int)encode_errors(rec + k, sizeof rec - (size_t)k, axiom_shadow_stack());
             (void)!write(res[1], rec, (size_t)k);
             _exit(0);
         }
@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
                 st = "fail";
                 code = "error";
                 if (*endp == '\t') stack = endp + 1;
-                snprintf(msg, sizeof msg, "test returned error.%s", phalange_error_name(ec));
+                snprintf(msg, sizeof msg, "test returned error.%s", axiom_error_name(ec));
             } else if (expect != -1) {
                 st = "fail";
                 code = "no_trap";
@@ -243,14 +243,14 @@ int main(int argc, char **argv) {
                 snprintf(codebuf, sizeof codebuf, "T%04d", tc);
                 st = "fail";
                 code = codebuf;
-                snprintf(msg, sizeof msg, "trap %s (%s, signal %d)", codebuf, ph_trap_names[tc], sig);
+                snprintf(msg, sizeof msg, "trap %s (%s, signal %d)", codebuf, ax_trap_names[tc], sig);
             }
         } else {
             st = "fail";
             code = "T0000";
             snprintf(msg, sizeof msg, "test process exited unexpectedly (status %d)", status);
         }
-        printf("PHT\t%u\t%s\t%s\t%lld\t%u\t%u\t%.0f\t", i, st, code, file_id == (unsigned)-1 ? -1ll : (long long)file_id, start, end, ms);
+        printf("AXT\t%u\t%s\t%s\t%lld\t%u\t%u\t%.0f\t", i, st, code, file_id == (unsigned)-1 ? -1ll : (long long)file_id, start, end, ms);
         put_escaped(msg, strlen(msg));
         putchar('\t');
         if (outbuf) put_escaped(outbuf, outlen);

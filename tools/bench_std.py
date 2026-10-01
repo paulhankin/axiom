@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Times reference implementations on the inputs tests/bench/std.ph saves.
+"""Times reference implementations on the inputs tests/bench/std.ax saves.
 
-    phalange build --target=native -O2 tests/bench/std.ph -o build/bench/std
-    build/bench/std            # writes build/bench/*, prints Phalange's numbers
+    axiom build --target=native -O2 tests/bench/std.ax -o build/bench/std
+    build/bench/std            # writes build/bench/*, prints Axiom's numbers
     tools/bench_std.py         # the same work in zlib, hashlib, json, re, ...
 
 Each reference is optional: a missing module is skipped. The C libraries

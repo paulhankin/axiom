@@ -1,0 +1,286 @@
+// =============================================================================
+// units.ax - separate compilation (spec §16.7).
+//
+// Each module is compiled to its own object file, cached under
+// <cache>/obj/<key>.o, where the key hashes everything the object depends on:
+// the compiler binary, the code generation options, the module's source and
+// path, and (recursively) the keys of the modules it imports. A build
+// compiles only the modules whose key has no cached object, in parallel
+// worker processes forked after type checking, then generates the small
+// per-program link unit (globals, error codes, runtime state, exports).
+// =============================================================================
+import "ast.ax" as ast;
+import "codegen.ax" as cg;
+import "diag.ax" as dg;
+import "package.ax" as pkg;
+import "sema.ax" as sema;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+pub struct UnitStats {
+    total: usize,     // modules in the program
+    compiled: usize,  // modules compiled (not cached)
+}
+
+// Two independent 64-bit hashes make a 128-bit key.
+struct Hasher {
+    a: u64,
+    b: u64,
+}
+
+fn hash_bytes(h: *mut Hasher, s: []u8) void {
+    for c in s {
+        h.a = (h.a ^ @as(u64, c)) *% 0x100000001b3;
+        h.b = ((h.b +% @as(u64, c)) +% 1) *% 0x9E3779B97F4A7C15;
+        h.b = h.b ^ (h.b >> 29);
+    }
+}
+
+fn hash_str(h: *mut Hasher, s: []u8) void {
+    hash_bytes(h, s);
+    let z: [1]u8 = [0];
+    hash_bytes(h, z[..]);  // with the NUL, as a separator
+}
+
+fn hasher() Hasher {
+    return Hasher.{ a: 0xcbf29ce484222325, b: 0x2545F4914F6CDD1D };
+}
+
+fn hex_key(h: *Hasher) []u8 {
+    return u.cat2(u.hex16(h.a), u.hex16(h.b));
+}
+
+let mut compiler_id_s: []u8 = "";
+
+// The compiler's own identity: a hash of its executable.
+fn compiler_id() []u8 {
+    if compiler_id_s.len > 0 {
+        return compiler_id_s;
+    }
+    let mut h = hasher();
+    let bytes = u.read_file("/proc/self/exe");
+    if not u.isnos(bytes) {
+        hash_bytes(&mut h, bytes);
+    } else {
+        hash_str(&mut h, "axiom (unknown executable)");
+    }
+    compiler_id_s = hex_key(&h);
+    return compiler_id_s;
+}
+
+fn options_id(o: *cg.CgOptions) []u8 {
+    let mut b = u.Buf.init();
+    b.s("unit-v1|");
+    b.s(ty.g_target.triple);
+    b.s("|");
+    b.s(u.idec(ty.g_target.ptr_bits));
+    b.s("|");
+    b.s(u.idec(o.opt_level));
+    b.s(u.pick(o.overflow_saturate, "|1", "|0"));
+    b.s(u.pick(o.stack_traces, "|1", "|0"));
+    b.s(u.pick(o.profile, "|1", "|0"));
+    b.s(u.pick(o.sanitize_address, "|1", "|0"));
+    b.s(u.pick(cg.g_test_mode, "|1", "|0"));
+    b.s("|");
+    b.s(u.idec(o.emit));
+    b.s("|");
+    if not u.isnos(o.cpu) {
+        b.s(o.cpu);
+    }
+    b.s("|");
+    b.s(u.hex16(tg.g_features));  // the extensions the code may use
+    return b.done();
+}
+
+struct Unit {
+    m: *mut ast.Module,
+    key: []u8,
+    obj: []u8,
+    cached: bool,
+}
+
+let mut key_memo: u.SymMap.[[]u8] = u.SymMap.[[]u8].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut []u8, 0), cap: 0, len: 0 };
+
+fn module_key(m: *mut ast.Module, opts: []u8) []u8 {
+    let mk = u.intern(m.path);
+    let k = key_memo.get(mk);
+    if not u.isnos(k) {
+        return k;
+    }
+    let mut h = hasher();
+    hash_str(&mut h, compiler_id());
+    hash_str(&mut h, opts);
+    let f = u.file_of(m.file.id);
+    hash_str(&mut h, f.display);
+    hash_bytes(&mut h, f.text);
+    let mut has_tests = false;
+    let tests = sema.g_prog.tests;
+    for i in 0..tests.len {
+        if tests.get(i).module == m {
+            has_tests = true;
+        }
+    }
+    hash_str(&mut h, u.pick(has_tests, "tests", "no-tests"));
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) {
+            hash_str(&mut h, module_key(d.imported, opts));
+        }
+    }
+    let key = hex_key(&h);
+    key_memo.put(mk, key);
+    return key;
+}
+
+fn file_ok(p: []u8) bool {
+    return u.is_file(p) and (u.file_size(p) > 0);
+}
+
+// Compiles one module in a child process. Its pid (or -1).
+fn spawn_unit(base: *cg.CgOptions, un: *mut Unit) i32 {
+    u.flush_out();
+    let pid = u.fork();
+    if pid != 0 {
+        return pid;
+    }
+    let co = u.new.[cg.CgOptions]();
+    co.* = base.*;
+    co.unit = cg.CG_MODULE;
+    co.module = un.m;
+    let tmp = u.f2("%s.tmp%s", un.obj, u.idec(u.getpid()));
+    co.out_path = tmp;
+    let ok = cg.codegen_program(co);
+    if not ok {
+        dg.emit(false, false);
+        _ = u.unlink(u.cz(tmp));
+        u._exit(1);
+    }
+    if u.rename(u.cz(tmp), u.cz(un.obj)) != 0 {
+        _ = u.unlink(u.cz(tmp));
+        u._exit(1);
+    }
+    u._exit(0);
+    return 0;
+}
+
+// Compiles every module whose object is not cached, then the link unit into
+// `link_obj`. Appends the module objects to `objs`. False on failure (errors
+// already reported).
+pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8], stats: *mut UnitStats) bool {
+    let opts = options_id(base);
+    let dir = u.cat2(pkg.cache_dir(), "/obj");
+    u.mkdirs(dir);
+    let mods = sema.g_prog.modules;
+    let n = mods.len;
+    let units = u.newn.[Unit](n + 1);
+    let mut todo = u.List.[*mut Unit].{ data: u.nil.[*mut Unit](), len: 0, cap: 0 };
+    for i in 0..n {
+        let un = &mut units[i];
+        un.m = mods.get(i);
+        un.key = module_key(un.m, opts);
+        un.obj = u.f2("%s/%s.o", dir, un.key);
+        un.cached = file_ok(un.obj);
+        if not un.cached {
+            todo.push(un);
+        }
+    }
+    // Compile what is missing, a few at a time.
+    let cpus = u.sysconf(84);  // _SC_NPROCESSORS_ONLN
+    let mut width: usize = 1;
+    if cpus > 0 {
+        width = @int_cast(usize, cpus);
+    }
+    if width > 16 {
+        width = 16;
+    }
+    let mut running: usize = 0;
+    let mut next: usize = 0;
+    let mut failed = false;
+    while (next < todo.len) or (running > 0) {
+        while not failed and (running < width) and (next < todo.len) {
+            let p = spawn_unit(base, todo.get(next));
+            if p < 0 {
+                failed = true;
+                break;
+            }
+            next += 1;
+            running += 1;
+        }
+        if running == 0 {
+            break;
+        }
+        let mut status: i32 = 0;
+        let done = u.wait(&mut status);
+        if done < 0 {
+            break;
+        }
+        running -= 1;
+        if not u.wifexited(status) or (u.wexitstatus(status) != 0) {
+            failed = true;
+        }
+    }
+    stats.total = n;
+    stats.compiled = todo.len;
+    if failed {
+        return false;
+    }
+    for i in 0..n {
+        objs.push(units[i].obj);
+    }
+    // The link unit, in this process.
+    let co = u.new.[cg.CgOptions]();
+    co.* = base.*;
+    co.unit = cg.CG_LINK;
+    co.module = u.nil.[ast.Module]();
+    co.out_path = link_obj;
+    return cg.codegen_program(co);
+}
+
+// The toolchain's own C runtime (runtime/*.c) is compiled once per content
+// and compiler, like modules. Its object, or a nil slice to compile it in
+// the link step instead.
+pub fn cached_runtime_object(cc: []u8, src: []u8) []u8 {
+    let text = u.read_file(src);
+    if u.isnos(text) {
+        return u.nosym();
+    }
+    let mut h = hasher();
+    hash_str(&mut h, "runtime-v1");
+    hash_str(&mut h, cc);
+    hash_str(&mut h, compiler_id());
+    hash_bytes(&mut h, text);
+    // Its only local header.
+    let mut dir: []u8 = ".";
+    let slash = u.rfind(src, '/');
+    if slash >= 0 {
+        dir = u.dup(src[0..@int_cast(usize, slash)]);
+    }
+    let hdr = u.read_file(u.cat2(dir, "/trap_format.h"));
+    if not u.isnos(hdr) {
+        hash_bytes(&mut h, hdr);
+    }
+    let cdir = u.cat2(pkg.cache_dir(), "/obj");
+    u.mkdirs(cdir);
+    let obj = u.f2("%s/rt-%s.o", cdir, hex_key(&h));
+    if file_ok(obj) {
+        return obj;
+    }
+    let tmp = u.f2("%s.tmp%s", obj, u.idec(u.getpid()));
+    let args = [cc, "-O2", "-c", "-pthread", src, "-o", tmp];
+    let argv = u.c_argv(args[..]);
+    u.flush_out();
+    let pid = u.fork();
+    if pid == 0 {
+        _ = u.execvp(argv.*, argv);
+        u._exit(127);
+    }
+    let mut status: i32 = 0;
+    if (pid < 0) or (u.waitpid(pid, &mut status, 0) < 0) or not u.wifexited(status) or (u.wexitstatus(status) != 0) or
+       (u.rename(u.cz(tmp), u.cz(obj)) != 0) {
+        _ = u.unlink(u.cz(tmp));
+        return u.nosym();
+    }
+    return obj;
+}
