@@ -2349,6 +2349,40 @@ fn phi_from(p: *ir.Value, v: *mut ir.Value) *mut ir.Block {
     return u.nil.[ir.Block]();
 }
 
+// Nothing with effects between i and end (nil: the end of i's block).
+fn no_effects_between(i: *mut ir.Value, end: *mut ir.Value) bool {
+    let mut x = i.next;
+    while u.notnil(x) and (x != end) {
+        if not pure_op(x) and (x.op != ir.OP_ALLOCA) and not ir.is_term(x.op) {
+            return false;
+        }
+        x = x.next;
+    }
+    return true;
+}
+
+// Whether computing i where it is used also moves something with effects
+// (a load, a call) that is computed inline as part of it.
+fn inlines_effects(i: *mut ir.Value) bool {
+    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+    for o in ops {
+        if u.notnil(o) and (o.kind == ir.V_INST) and (o.flag == FL_INLINE) {
+            if not pure_op(o) or inlines_effects(o) {
+                return true;
+            }
+        }
+    }
+    for k in 0..i.xs.len {
+        let o = i.xs.get(k);
+        if (o.kind == ir.V_INST) and (o.flag == FL_INLINE) {
+            if not pure_op(o) or inlines_effects(o) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn classify(f: *mut ir.Func) void {
     let mut b = f.first;
     while u.notnil(b) {
@@ -2363,24 +2397,20 @@ fn classify(f: *mut ir.Func) void {
             } else if (i.uses == 1) and (o != ir.OP_PHI) and pure_op(i) and (i.user.op == ir.OP_PHI) and
                       phi_from(i.user, i) == b {
                 // computed where the phi copy at the end of this block pushes it
-                i.flag = FL_INLINE;
+                if not inlines_effects(i) or no_effects_between(i, vnil()) {
+                    i.flag = FL_INLINE;
+                }
             } else if (i.uses == 1) and (o != ir.OP_PHI) and not ir.is_term(o) and (i.user.blk == b) and
                       (i.user.op != ir.OP_PHI) and (i.user.pos > i.pos) {
                 if pure_op(i) {
-                    i.flag = FL_INLINE;
+                    // a load inside it moves to the user too
+                    if not inlines_effects(i) or no_effects_between(i, i.user) {
+                        i.flag = FL_INLINE;
+                    }
                 } else if (o == ir.OP_LOAD) or (o == ir.OP_CALL) or (o == ir.OP_INTR) or (o == ir.OP_RMW) or
                           (o == ir.OP_CMPXCHG) {
                     // only if nothing with effects happens in between
-                    let mut ok = true;
-                    let mut x = i.next;
-                    while x != i.user {
-                        if not pure_op(x) and (x.op != ir.OP_ALLOCA) {
-                            ok = false;
-                            break;
-                        }
-                        x = x.next;
-                    }
-                    if ok {
+                    if no_effects_between(i, i.user) {
                         i.flag = FL_INLINE;
                     }
                 }

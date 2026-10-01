@@ -1,0 +1,34 @@
+// A value computed from a load and used after a store to the same place
+// must use the value loaded before the store (the WebAssembly backend
+// computes single-use values where they are used, but not past a store).
+import "../lib/io.ph" as io;
+
+struct R {
+    s: [4]u64,
+}
+
+fn read_then_write(r: *mut R) u64 {
+    let s = &mut r.s;
+    let result = @rotl(s[1] *% 5, 7) *% 9;
+    s[1] ^= s[2];
+    return result;
+}
+
+fn through_phi(r: *mut R, c: bool) u64 {
+    let mut v: u64 = 0;
+    if c {
+        v = r.s[0] +% 100;
+        r.s[0] = 0;
+    }
+    return v;
+}
+
+export fn run() void {
+    let mut r = R.{ s: [1, 2, 3, 4] };
+    io.uint(read_then_write(&mut r));
+    io.uint(r.s[1]);
+    // expect: 11520
+    // expect: 1
+    io.uint(through_phi(&mut r, true));
+    // expect: 101
+}
