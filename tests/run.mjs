@@ -15,6 +15,7 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { Worker } from 'worker_threads';
 import { createHost } from '../runtime/host.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
@@ -457,6 +458,60 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   };
   for (const [cname, fn] of Object.entries(cases)) {
     const name = `packages: ${cname}`;
+    if (filter && !name.includes(filter)) continue;
+    const t0 = process.hrtime.bigint();
+    const problem = await fn();
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
+  }
+}
+
+// The node host itself (runtime/host.mjs), driven without a program.
+if (!native) {
+  const cases = {
+    // A socket request completes with a store and then a notify (see
+    // runtime/net_worker.mjs). A thread that sees the store before it sleeps
+    // returns at once, and that request's notify comes later: it must not
+    // complete the thread's next request, which would return the previous
+    // result (a read returning a write's count, with stale data).
+    'net requests wait for their own completion': async () => {
+      const helper = new Worker(`
+        const { parentPort } = require('worker_threads');
+        parentPort.on('message', ({ ctrl, delay, result }) => setTimeout(() => {
+          const c = new Int32Array(ctrl);
+          if (result !== undefined) { Atomics.store(c, 1, result); Atomics.store(c, 0, 1); }
+          Atomics.notify(c, 0);
+        }, delay));`, { eval: true });
+      let requests = 0;
+      const port = {
+        postMessage(m) {
+          const c = new Int32Array(m.ctrl);
+          if (++requests === 1) {
+            // done before the caller waits; notified 50 ms later
+            Atomics.store(c, 1, m.payload.length);
+            Atomics.store(c, 0, 1);
+            helper.postMessage({ ctrl: m.ctrl, delay: 50 });
+          } else {
+            new Uint8Array(m.data).set([7, 7, 7]);
+            helper.postMessage({ ctrl: m.ctrl, delay: 300, result: 3 });
+          }
+        },
+        close() {},
+      };
+      const host = createHost({ netPort: port });
+      host.setMemory(new WebAssembly.Memory({ initial: 1 }));
+      const net = host.imports.phalange;
+      const wrote = net.ph_sock_write(3, 0, 5);
+      const got = net.ph_sock_read(3, 64, 16);
+      const data = Array.from(new Uint8Array(host.memory().buffer, 64, 3));
+      host.close();
+      await helper.terminate();
+      return wrote === 5 && got === 3 && data.join() === '7,7,7' ? null : `write returned ${wrote}, read ${got} [${data}]`;
+    },
+  };
+  for (const [cname, fn] of Object.entries(cases)) {
+    const name = `host: ${cname}`;
     if (filter && !name.includes(filter)) continue;
     const t0 = process.hrtime.bigint();
     const problem = await fn();

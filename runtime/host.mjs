@@ -265,7 +265,13 @@ class NetClient {
   call(op, args, payload) {
     Atomics.store(this.ctrl, 0, 0);
     this.port.postMessage({ op, args, payload, ctrl: this.ctrl.buffer, data: this.data.buffer });
-    Atomics.wait(this.ctrl, 0, 0);
+    // Wait until this request is done, not merely until a wakeup: the worker
+    // completes a request with a store and then a notify, and when this
+    // thread sees the store before it sleeps, that request's notify is still
+    // to come and may wake the wait for the next request, which would then
+    // return the previous result (a read returning a write's count, with
+    // stale data in the buffer).
+    while (Atomics.load(this.ctrl, 0) === 0) Atomics.wait(this.ctrl, 0, 0);
     return Atomics.load(this.ctrl, 1);
   }
   // A new port to the same worker, for another thread.
