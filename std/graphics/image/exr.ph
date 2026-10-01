@@ -3,6 +3,7 @@
 //
 //     let img = exr.decode(bytes)!;                       // F32, linear
 //     let out = exr.encode(&img, exr.Options.default())!;  // mem.free it
+//     exr.encode_to(w, &img, exr.Options.default())!;     // or to an io.Writer
 //
 // Decoding reads single-part scanline and tiled images (the full-resolution
 // level of mipmaps) with NONE, RLE, ZIPS, ZIP, PIZ and PXR24 compression and
@@ -16,6 +17,7 @@
 // =============================================================================
 
 import "../../compress/deflate.ph" as deflate;
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../str.ph" as strs;
 import "../image.ph" as image;
@@ -1015,21 +1017,97 @@ fn attr(o: *mut strs.String, name: []u8, ty: []u8, value: []u8) !void {
     o.push_str(value)!;
 }
 
+/// Encodes an image as OpenEXR (free the result with mem.free).
 pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img, opts) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as OpenEXR to w, a block of scanlines at a time. The
+/// offset table at the start needs every block's size, so compressed blocks
+/// are compressed twice: once to measure them, once to write them.
+pub fn encode_to(w: io.Writer, img: *image.Image, opts: Options) !void {
     if img.depth != image.Depth.F32 {
         let mut c = img.convert(img.channels, image.Depth.F32)!;
         defer c.deinit();
-        return encode(&c, opts);
+        return encode_to(w, &c, opts);
     }
     let mut o = strs.String.init();
-    write_file(&mut o, img, opts) catch |e| {
-        o.deinit();
-        return e;
-    };
-    return o.take();
+    defer o.deinit();
+    write_file(w, &mut o, img, opts)!;
 }
 
-fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
+const FLUSH_AT: usize = 16384;  // write out what is gathered at this size
+
+// The blocks' data: lines of channels of samples, and the packed form.
+struct Blocks {
+    img: *image.Image,
+    opts: Options,
+    src: [4]usize,  // where each channel comes from in the image
+    nch: usize,
+    lines: usize,
+    raw: []mut u8,
+    packed: strs.String,
+
+    // Block b's data, packed if that makes it smaller.
+    fn get(self: *mut Blocks, b: usize) ![]u8 {
+        let w = self.img.width;
+        let h = self.img.height;
+        let y0 = b * self.lines;
+        let bh = @min(self.lines, h - y0);
+        let sz = type_size(self.opts.pixel_type);
+        let raw = self.raw;
+        let px = self.img.samples32();
+        let mut at: usize = 0;
+        for yy in @as(usize, 0)..bh {
+            for c in @as(usize, 0)..self.nch {
+                for x in @as(usize, 0)..w {
+                    let v = px[((((y0 + yy) * w) + x) * self.img.channels) + self.src[c]];
+                    if sz == 2 {
+                        let hv = image.f32_to_half(v);
+                        raw[at] = @truncate(u8, hv);
+                        raw[at + 1] = @truncate(u8, hv >> 8);
+                    } else {
+                        let bits = @bit_cast(u32, v);
+                        for k in @as(usize, 0)..4 {
+                            raw[at + k] = @truncate(u8, bits >> @truncate(u32, 8 * k));
+                        }
+                    }
+                    at += sz;
+                }
+            }
+        }
+        let block = raw[..at];
+        if self.opts.compression == Compression.NONE {
+            return block;
+        }
+        let pre = mem.dup(block)!;
+        defer mem.free(pre);
+        predict(pre);
+        self.packed.clear();
+        if self.opts.compression == Compression.RLE {
+            let r = rle_encode(pre)!;
+            defer mem.free(r);
+            self.packed.push_str(r)!;
+        } else {
+            let z = deflate.Compressor.init(self.packed.writer(), deflate.Format.ZLIB, 6)!;
+            defer z.deinit();
+            z.write_all(pre)!;
+            z.finish()!;
+        }
+        if self.packed.len < block.len {
+            return self.packed.bytes();
+        }
+        return block;  // stored raw when compression doesn't help
+    }
+}
+
+// (o gathers the output, written to out a few KiB at a time)
+fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Options) !void {
     let w = img.width;
     let h = img.height;
     if (w == 0) or (h == 0) or (w > 0x7fffffff) or (h > 0x7fffffff) {
@@ -1090,68 +1168,51 @@ fn write_file(o: *mut strs.String, img: *image.Image, opts: Options) !void {
     attr(o, "screenWindowCenter", "v2f", "\x00\x00\x00\x00\x00\x00\x00\x00")!;
     attr(o, "screenWindowWidth", "float", "\x00\x00\x80\x3f")!;
     o.push(0)!;
-    // the offset table, filled in as the blocks are written
     let lines = block_lines(opts.compression);
     let nblocks = (h + lines - 1) / lines;
-    let table_at = o.len;
-    for i in @as(usize, 0)..nblocks * 8 {
-        o.push(0)!;
-    }
     let sz = type_size(opts.pixel_type);
     let raw = mem.alloc.[u8](((w * lines) * nch) * sz)!;
     defer mem.free(raw);
-    let px = img.samples32();
+    let mut bl = Blocks.{ img: img, opts: opts, src: src, nch: nch, lines: lines, raw: raw,
+                          packed: strs.String.init() };
+    defer bl.packed.deinit();
+    // the offset table: each block is its line, its size and its data
+    let mut off = @as(u64, o.len) + (@as(u64, nblocks) * 8);
     for b in @as(usize, 0)..nblocks {
-        let y0 = b * lines;
-        let bh = @min(lines, h - y0);
-        let mut at: usize = 0;
-        for yy in @as(usize, 0)..bh {
-            for c in @as(usize, 0)..nch {
-                for x in @as(usize, 0)..w {
-                    let v = px[((((y0 + yy) * w) + x) * img.channels) + src[c]];
-                    if sz == 2 {
-                        let hv = image.f32_to_half(v);
-                        raw[at] = @truncate(u8, hv);
-                        raw[at + 1] = @truncate(u8, hv >> 8);
-                    } else {
-                        let bits = @bit_cast(u32, v);
-                        for k in @as(usize, 0)..4 {
-                            raw[at + k] = @truncate(u8, bits >> @truncate(u32, 8 * k));
-                        }
-                    }
-                    at += sz;
-                }
+        if o.len >= FLUSH_AT {
+            out.write_all(o.bytes())!;
+            o.clear();
+        }
+        let mut n: u64 = 0;
+        if opts.compression == Compression.NONE {
+            n = @as(u64, ((@min(lines, h - (b * lines)) * w) * nch) * sz);
+        } else {
+            n = @as(u64, bl.get(b)!.len);  // (measured: packed again below)
+        }
+        let mut ob: [8]u8 = [0; 8];
+        for k in @as(usize, 0)..8 {
+            ob[k] = @truncate(u8, off >> @truncate(u32, 8 * k));
+        }
+        o.push_str(ob[..])!;
+        off += 8 + n;
+    }
+    for b in @as(usize, 0)..nblocks {
+        let data = bl.get(b)!;
+        put32(o, @truncate(u32, b * lines))!;
+        put32(o, @truncate(u32, data.len))!;
+        if data.len >= FLUSH_AT {
+            out.write_all(o.bytes())!;
+            o.clear();
+            out.write_all(data)!;
+        } else {
+            o.push_str(data)!;
+            if o.len >= FLUSH_AT {
+                out.write_all(o.bytes())!;
+                o.clear();
             }
         }
-        let block = raw[..at];
-        let off = @as(u64, o.len);
-        for k in @as(usize, 0)..8 {
-            o.buf[table_at + (b * 8) + k] = @truncate(u8, off >> @truncate(u32, 8 * k));
-        }
-        put32(o, @truncate(u32, y0))!;
-        if opts.compression == Compression.NONE {
-            put32(o, @truncate(u32, block.len))!;
-            o.push_str(block)!;
-            continue;
-        }
-        let pre = mem.dup(block)!;
-        defer mem.free(pre);
-        predict(pre);
-        let mut packed: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
-        if opts.compression == Compression.RLE {
-            packed = rle_encode(pre)!;
-        } else {
-            packed = deflate.compress(pre, deflate.Format.ZLIB, 6)!;
-        }
-        defer mem.free(packed);
-        if packed.len < block.len {
-            put32(o, @truncate(u32, packed.len))!;
-            o.push_str(packed)!;
-        } else {
-            put32(o, @truncate(u32, block.len))!;
-            o.push_str(block)!;  // stored raw when compression doesn't help
-        }
     }
+    out.write_all(o.bytes())!;
 }
 
 /// ZIP's and RLE's preprocessing: even bytes then odd bytes, then deltas.
@@ -1236,5 +1297,31 @@ test "round trips" {
                 @expect_eq(back.data[..], img.data[..]);
             }
         }
+    }
+}
+
+test "encode_to" {
+    let comps: [4]Compression = [Compression.NONE, Compression.RLE, Compression.ZIPS, Compression.ZIP];
+    let mut img = image.Image.init(70, 40, 4, image.Depth.F32)!;
+    defer img.deinit();
+    let px = img.samples32();
+    for i in @as(usize, 0)..px.len {
+        px[i] = @float_from_int(f32, ((i * 7) + (i / 300)) % 50) * 0.125;
+    }
+    for comp in comps {
+        let opts = Options.{ compression: comp, pixel_type: PixelType.HALF };
+        let enc = encode(&img, opts)!;
+        defer mem.free(enc);
+        let mut s = strs.String.init();
+        defer s.deinit();
+        encode_to(s.writer(), &img, opts)!;
+        @expect_eq(s.bytes(), enc[..]);
+        let mut small: [100]u8 = [0; 100];
+        let mut bw = io.BufferWriter.init(small[..]);
+        encode_to(bw.writer(), &img, opts) catch |e| {
+            @expect_eq(e, error.NoSpaceLeft);
+            continue;
+        };
+        @trap();
     }
 }

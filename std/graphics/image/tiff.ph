@@ -7,6 +7,7 @@
 //
 //     let out = tiff.encode(&img, tiff.Options.default())!;   // mem.free(out)
 //     let book = tiff.encode_pages(pages, tiff.Options.default())!;
+//     tiff.encode_to(w, &img, tiff.Options.default())!;       // or to an io.Writer
 //
 // Decoding reads classic TIFF and BigTIFF in either byte order: strips or
 // tiles, contiguous or planar samples; no compression, LZW, Deflate,
@@ -26,6 +27,7 @@
 
 import "../../compress/deflate.ph" as deflate;
 import "../../fmt.ph" as fmt;
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../os/fs.ph" as fs;
 import "../../str.ph" as strs;
@@ -1372,10 +1374,16 @@ struct Fax {
 // Encoding
 // -----------------------------------------------------------------------------
 
-/// Writes one image.
+/// Writes one image (free the result with mem.free).
 pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
     let one: [1]*image.Image = [img];
     return encode_pages(one[..], opts);
+}
+
+/// Writes one image to w, as encode_pages_to does.
+pub fn encode_to(w: io.Writer, img: *image.Image, opts: Options) !void {
+    let one: [1]*image.Image = [img];
+    encode_pages_to(w, one[..], opts)!;
 }
 
 fn put16(o: *mut strs.String, v: u64) !void {
@@ -1388,19 +1396,6 @@ fn put32(o: *mut strs.String, v: u64) !void {
     put16(o, v >> 16)!;
 }
 
-fn set32(o: *mut strs.String, at: usize, v: u64) void {
-    let b = o.bytes();
-    for k in @as(usize, 0)..4 {
-        b[at + k] = @truncate(u8, v >> @as(u64, 8 * k));
-    }
-}
-
-fn align2(o: *mut strs.String) !void {
-    if (o.len & 1) != 0 {
-        o.push(0)!;
-    }
-}
-
 // a field: SHORTs or LONGs, inline when they fit
 fn field(o: *mut strs.String, tag: u64, typ: u64, count: u64, value: u64) !void {
     put16(o, tag)!;
@@ -1409,126 +1404,235 @@ fn field(o: *mut strs.String, tag: u64, typ: u64, count: u64, value: u64) !void 
     put32(o, value)!;
 }
 
-/// Writes images as the pages of one file.
+/// Writes images as the pages of one file (free the result with mem.free).
 pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_pages_to(s.writer(), imgs, opts) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+// How a page is laid out: in strips, then the arrays too long to go
+// inline, then its directory.
+struct PageLayout {
+    bps: usize,
+    format: u64,
+    rowbytes: usize,
+    rps: usize,  // rows per strip
+    nstrips: usize,
+    pred: u64,
+    first: usize,  // its first strip's index in the strip tables
+    bits_at: u64,
+    format_at: u64,
+    offsets_at: u64,
+    counts_at: u64,
+    ifd_at: u64,
+    nf: u64,  // directory entries
+}
+
+fn layout_of(img: *image.Image, opts: Options) PageLayout {
+    let comp = opts.compression;
+    let mut bps: usize = 8;
+    let mut format: u64 = 1;
+    if img.depth == image.Depth.U16 {
+        bps = 16;
+    } else if img.depth == image.Depth.F32 {
+        bps = 32;
+        format = 3;
+    }
+    let rowbytes = (img.width * img.channels) * (bps / 8);
+    let rps = @min(@max(65536 / @max(rowbytes, 1), 1), img.height);
+    let mut pred: u64 = 1;
+    if opts.predictor and ((comp == Compression.LZW) or (comp == Compression.DEFLATE)) {
+        pred = 2;
+        if format == 3 {
+            pred = 3;
+        }
+    }
+    let mut nf: u64 = 10;
+    if pred != 1 {
+        nf += 1;
+    }
+    if (img.channels == 2) or (img.channels == 4) {
+        nf += 1;
+    }
+    if format != 1 {
+        nf += 1;
+    }
+    return PageLayout.{ bps: bps, format: format, rowbytes: rowbytes, rps: rps, nstrips: (img.height + (rps - 1)) / rps,
+                        pred: pred, first: 0, bits_at: 0, format_at: 0, offsets_at: 0, counts_at: 0, ifd_at: 0,
+                        nf: nf };
+}
+
+// Strip si of a page, compressed into packed (strip is scratch space).
+fn pack_strip(img: *image.Image, lay: *PageLayout, comp: Compression, si: usize, strip: *mut strs.String,
+              packed: *mut strs.String) !void {
+    let ch = img.channels;
+    let rowbytes = lay.rowbytes;
+    let y0 = si * lay.rps;
+    let y1 = @min(y0 + lay.rps, img.height);
+    strip.clear();
+    strip.push_str(img.data[y0 * rowbytes..y1 * rowbytes])!;
+    let sb = strip.bytes();
+    if lay.pred != 1 {
+        for y in @as(usize, 0)..(y1 - y0) {
+            predict(sb[y * rowbytes..(y + 1) * rowbytes], ch, lay.bps, lay.pred, packed)!;
+        }
+    }
+    packed.clear();
+    if comp == Compression.NONE {
+        packed.push_str(sb)!;
+    } else if comp == Compression.PACKBITS {
+        for y in @as(usize, 0)..(y1 - y0) {
+            packbits_row(sb[y * rowbytes..(y + 1) * rowbytes], packed)!;
+        }
+    } else if comp == Compression.LZW {
+        lzw_encode(sb, packed)!;
+    } else {
+        let z = deflate.Compressor.init(packed.writer(), deflate.Format.ZLIB, deflate.DEFAULT_LEVEL)!;
+        defer z.deinit();
+        z.write_all(sb)!;
+        z.finish()!;
+    }
+}
+
+fn even(v: u64) u64 {
+    return v + (v & 1);
+}
+
+/// Writes images as the pages of one file to w, a strip at a time. The
+/// directories' offsets are worked out first, which needs every strip's
+/// compressed size: compressed strips are compressed twice, once to
+/// measure them and once to write them.
+pub fn encode_pages_to(w: io.Writer, imgs: []*image.Image, opts: Options) !void {
     let comp = opts.compression;
     if imgs.len == 0 {
         return error.InvalidImage;
     }
-    let mut o = strs.String.init();
-    defer o.deinit();
-    o.push_str("II*\x00")!;
-    put32(&mut o, 0)!;
-    let mut link: usize = 4;
+    let layouts = mem.alloc.[PageLayout](imgs.len)!;
+    defer mem.free(layouts);
+    let mut total: usize = 0;
+    for pi in @as(usize, 0)..imgs.len {
+        layouts[pi] = layout_of(imgs[pi], opts);
+        layouts[pi].first = total;
+        total += layouts[pi].nstrips;
+    }
+    // every strip's offset and size
+    let offs = mem.alloc.[u64](total)!;
+    defer mem.free(offs);
+    let sizes = mem.alloc.[u64](total)!;
+    defer mem.free(sizes);
     let mut strip = strs.String.init();
     defer strip.deinit();
     let mut packed = strs.String.init();
     defer packed.deinit();
-    let mut offs = strs.String.init();  // u32s
-    defer offs.deinit();
+    let mut pos: u64 = 8;
     for pi in @as(usize, 0)..imgs.len {
         let img = imgs[pi];
+        let lay = &mut layouts[pi];
         let ch = img.channels;
-        let w = img.width;
+        for si in @as(usize, 0)..lay.nstrips {
+            let mut n = @as(u64, @min(lay.rps, img.height - (si * lay.rps)) * lay.rowbytes);
+            if comp != Compression.NONE {
+                pack_strip(img, lay, comp, si, &mut strip, &mut packed)!;
+                n = @as(u64, packed.len);
+            }
+            pos = even(pos);
+            offs[lay.first + si] = pos;
+            sizes[lay.first + si] = n;
+            pos += n;
+        }
+        pos = even(pos);
+        if ch > 2 {
+            lay.bits_at = pos;
+            pos += @as(u64, 2 * ch);
+            lay.format_at = pos;
+            pos += @as(u64, 2 * ch);
+        }
+        if lay.nstrips > 1 {
+            lay.offsets_at = pos;
+            pos += @as(u64, 4 * lay.nstrips);
+            lay.counts_at = pos;
+            pos += @as(u64, 4 * lay.nstrips);
+        }
+        pos = even(pos);
+        lay.ifd_at = pos;
+        pos += (2 + (12 * lay.nf)) + 4;
+        if pos > 0xffffffff {
+            return error.TooLarge;
+        }
+    }
+    // the file
+    let mut o = strs.String.init();  // (gathers the small parts)
+    defer o.deinit();
+    o.push_str("II*\x00")!;
+    put32(&mut o, layouts[0].ifd_at)!;
+    let mut at: u64 = 0;  // where o's contents start
+    for pi in @as(usize, 0)..imgs.len {
+        let img = imgs[pi];
+        let lay = &layouts[pi];
+        let ch = img.channels;
+        let wd = img.width;
         let h = img.height;
-        let mut bps: usize = 8;
-        let mut format: u64 = 1;
-        if img.depth == image.Depth.U16 {
-            bps = 16;
-        } else if img.depth == image.Depth.F32 {
-            bps = 32;
-            format = 3;
-        }
-        let bytes = bps / 8;
-        let rowbytes = (w * ch) * bytes;
-        let rps = @min(@max(65536 / @max(rowbytes, 1), 1), h);
-        let nstrips = (h + (rps - 1)) / rps;
-        let use_pred = opts.predictor and ((comp == Compression.LZW) or (comp == Compression.DEFLATE));
-        let mut pred: u64 = 1;
-        if use_pred {
-            pred = 2;
-            if format == 3 {
-                pred = 3;
+        for si in @as(usize, 0)..lay.nstrips {
+            let k = lay.first + si;
+            if (at + @as(u64, o.len)) < offs[k] {
+                o.push(0)!;
             }
-        }
-        offs.clear();
-        for si in @as(usize, 0)..nstrips {
-            let y0 = si * rps;
-            let y1 = @min(y0 + rps, h);
-            strip.clear();
-            strip.push_str(img.data[y0 * rowbytes..y1 * rowbytes])!;
-            let sb = strip.bytes();
-            if use_pred {
-                for y in @as(usize, 0)..(y1 - y0) {
-                    predict(sb[y * rowbytes..(y + 1) * rowbytes], ch, bps, pred, &mut packed)!;
-                }
-            }
-            packed.clear();
+            let mut data = packed.bytes();
             if comp == Compression.NONE {
-                packed.push_str(sb)!;
-            } else if comp == Compression.PACKBITS {
-                for y in @as(usize, 0)..(y1 - y0) {
-                    packbits_row(sb[y * rowbytes..(y + 1) * rowbytes], &mut packed)!;
-                }
-            } else if comp == Compression.LZW {
-                lzw_encode(sb, &mut packed)!;
+                let start = (si * lay.rps) * lay.rowbytes;
+                data = img.data[start..start + @int_cast(usize, sizes[k])];
             } else {
-                let z = deflate.compress(sb, deflate.Format.ZLIB, deflate.DEFAULT_LEVEL)!;
-                defer mem.free(z);
-                packed.push_str(z)!;
+                pack_strip(img, lay, comp, si, &mut strip, &mut packed)!;
+                data = packed.bytes();
             }
-            align2(&mut o)!;
-            put32(&mut offs, @as(u64, o.len))!;
-            put32(&mut offs, @as(u64, packed.len))!;
-            o.push_str(packed.bytes())!;
+            if @as(u64, data.len) != sizes[k] {
+                return error.InvalidImage;  // (cannot happen: the compression is deterministic)
+            }
+            w.write_all(o.bytes())!;
+            at += @as(u64, o.len);
+            o.clear();
+            w.write_all(data)!;
+            at += @as(u64, data.len);
         }
         // the arrays too long to go inline
-        align2(&mut o)!;
-        let mut bits_at: u64 = 0;
-        let mut format_at: u64 = 0;
-        let mut offsets_at: u64 = 0;
-        let mut counts_at: u64 = 0;
-        let ob = offs.bytes();
+        if ((at + @as(u64, o.len)) & 1) != 0 {
+            o.push(0)!;
+        }
         if ch > 2 {
-            bits_at = @as(u64, o.len);
             for _q in @as(usize, 0)..ch {
-                put16(&mut o, @as(u64, bps))!;
+                put16(&mut o, @as(u64, lay.bps))!;
             }
-            format_at = @as(u64, o.len);
             for _q in @as(usize, 0)..ch {
-                put16(&mut o, format)!;
+                put16(&mut o, lay.format)!;
             }
         }
-        if nstrips > 1 {
-            offsets_at = @as(u64, o.len);
-            for si in @as(usize, 0)..nstrips {
-                o.push_str(ob[si * 8..(si * 8) + 4])!;
+        if lay.nstrips > 1 {
+            for si in @as(usize, 0)..lay.nstrips {
+                put32(&mut o, offs[lay.first + si])!;
             }
-            counts_at = @as(u64, o.len);
-            for si in @as(usize, 0)..nstrips {
-                o.push_str(ob[(si * 8) + 4..(si * 8) + 8])!;
+            for si in @as(usize, 0)..lay.nstrips {
+                put32(&mut o, sizes[lay.first + si])!;
             }
         }
         // the directory
-        align2(&mut o)!;
-        set32(&mut o, link, @as(u64, o.len));
-        let mut nf: u64 = 10;
-        if pred != 1 {
-            nf += 1;
+        if ((at + @as(u64, o.len)) & 1) != 0 {
+            o.push(0)!;
         }
-        if (ch == 2) or (ch == 4) {
-            nf += 1;
-        }
-        if format != 1 {
-            nf += 1;
-        }
-        put16(&mut o, nf)!;
-        field(&mut o, 256, 4, 1, @as(u64, w))!;
+        let bps = @as(u64, lay.bps);
+        let format = lay.format;
+        let pred = lay.pred;
+        let nstrips = lay.nstrips;
+        put16(&mut o, lay.nf)!;
+        field(&mut o, 256, 4, 1, @as(u64, wd))!;
         field(&mut o, 257, 4, 1, @as(u64, h))!;
         if ch > 2 {
-            field(&mut o, 258, 3, @as(u64, ch), bits_at)!;
+            field(&mut o, 258, 3, @as(u64, ch), lay.bits_at)!;
         } else {
-            field(&mut o, 258, 3, @as(u64, ch), (@as(u64, bps) << 16) | @as(u64, bps))!;
+            field(&mut o, 258, 3, @as(u64, ch), (bps << 16) | bps)!;
         }
         field(&mut o, 259, 3, 1, @as(u64, @int_from_enum(comp)))!;
         let mut photo: u64 = 1;
@@ -1537,16 +1641,16 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
         }
         field(&mut o, 262, 3, 1, photo)!;
         if nstrips > 1 {
-            field(&mut o, 273, 4, @as(u64, nstrips), offsets_at)!;
+            field(&mut o, 273, 4, @as(u64, nstrips), lay.offsets_at)!;
         } else {
-            field(&mut o, 273, 4, 1, word(ob, 0))!;
+            field(&mut o, 273, 4, 1, offs[lay.first])!;
         }
         field(&mut o, 277, 3, 1, @as(u64, ch))!;
-        field(&mut o, 278, 4, 1, @as(u64, rps))!;
+        field(&mut o, 278, 4, 1, @as(u64, lay.rps))!;
         if nstrips > 1 {
-            field(&mut o, 279, 4, @as(u64, nstrips), counts_at)!;
+            field(&mut o, 279, 4, @as(u64, nstrips), lay.counts_at)!;
         } else {
-            field(&mut o, 279, 4, 1, word(ob, 4))!;
+            field(&mut o, 279, 4, 1, sizes[lay.first])!;
         }
         field(&mut o, 284, 3, 1, 1)!;
         if pred != 1 {
@@ -1557,22 +1661,23 @@ pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
         }
         if format != 1 {
             if ch > 2 {
-                field(&mut o, 339, 3, @as(u64, ch), format_at)!;
+                field(&mut o, 339, 3, @as(u64, ch), lay.format_at)!;
             } else {
                 field(&mut o, 339, 3, @as(u64, ch), (format << 16) | format)!;
             }
         }
-        link = o.len;
-        put32(&mut o, 0)!;
-        if o.len > 0xffffffff {
-            return error.TooLarge;
+        let mut next: u64 = 0;
+        if (pi + 1) < imgs.len {
+            next = layouts[pi + 1].ifd_at;
+        }
+        put32(&mut o, next)!;
+        if o.len >= 16384 {
+            w.write_all(o.bytes())!;
+            at += @as(u64, o.len);
+            o.clear();
         }
     }
-    return o.take();
-}
-
-fn word(b: []u8, i: usize) u64 {
-    return ((@as(u64, b[i]) | (@as(u64, b[i + 1]) << 8)) | (@as(u64, b[i + 2]) << 16)) | (@as(u64, b[i + 3]) << 24);
+    w.write_all(o.bytes())!;
 }
 
 // differences a row in place: horizontal (pred 2) on samples, or
@@ -1770,4 +1875,35 @@ test "damaged files" {
             }
         }
     }
+}
+
+test "encode_to" {
+    let mut a = test_image(301, 250, 3, image.Depth.U8)!;
+    defer a.deinit();
+    let mut b = test_image(7, 30, 2, image.Depth.F32)!;
+    defer b.deinit();
+    let both: [2]*image.Image = [&a, &b];
+    let comps: [4]Compression = [Compression.NONE, Compression.LZW, Compression.DEFLATE, Compression.PACKBITS];
+    let mut s = strs.String.init();
+    defer s.deinit();
+    for c in comps {
+        let opts = Options.{ compression: c, predictor: true };
+        let enc = encode_pages(both[..], opts)!;
+        defer mem.free(enc);
+        s.clear();
+        encode_pages_to(s.writer(), both[..], opts)!;
+        @expect(strs.eq(s.bytes(), enc));
+        let one = encode(&b, opts)!;
+        defer mem.free(one);
+        s.clear();
+        encode_to(s.writer(), &b, opts)!;
+        @expect(strs.eq(s.bytes(), one));
+    }
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &a, Options.default()) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

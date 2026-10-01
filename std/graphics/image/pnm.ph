@@ -4,6 +4,7 @@
 //
 //     let img = pnm.decode(bytes)!;
 //     let out = pnm.encode(&img)!;   // mem.free it
+//     pnm.encode_to(w, &img)!;       // or to an io.Writer
 //
 // Decoding reads every variant, ASCII and binary, with any maximum value
 // (scaled to U8, or U16 when above 255); PFM gives F32 (linear) images.
@@ -12,6 +13,7 @@
 // =============================================================================
 
 import "../../fmt.ph" as fmt;
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../str.ph" as strs;
 import "../image.ph" as image;
@@ -236,16 +238,27 @@ fn decode_pfm(s: *mut Scan, color: bool) !image.Image {
     return img;
 }
 
+/// Encodes an image as PNM, PAM or PFM (free the result with mem.free).
 pub fn encode(img: *image.Image) ![]mut u8 {
-    let mut o = strs.String.init();
-    write_file(&mut o, img) catch |e| {
-        o.deinit();
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img) catch |e| {
+        s.deinit();
         return e;
     };
-    return o.take();
+    return s.take();
 }
 
-fn write_file(o: *mut strs.String, img: *image.Image) !void {
+/// Encodes an image as PNM, PAM or PFM to w, a few KiB at a time.
+pub fn encode_to(w: io.Writer, img: *image.Image) !void {
+    let mut o = strs.String.init();
+    defer o.deinit();
+    write_file(w, &mut o, img)!;
+}
+
+const FLUSH_AT: usize = 16384;  // write out what is gathered at this size
+
+// (o gathers the output, written to out a few KiB at a time)
+fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image) !void {
     let w = img.width;
     let h = img.height;
     let wr = o.writer();
@@ -263,6 +276,10 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
         fmt.write(wr, "{}\n{} {}\n-1.0\n", [fmt.str(tag), fmt.int(w), fmt.int(h)])!;
         let src = c.samples32();
         for y in @as(usize, 0)..h {
+            if o.len >= FLUSH_AT {
+                out.write_all(o.bytes())!;
+                o.clear();
+            }
             let row = h - 1 - y;
             for i in @as(usize, 0)..w * ch {
                 let v = @bit_cast(u32, src[(row * w * ch) + i]);
@@ -271,6 +288,7 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
                 o.push_str(b[..])!;
             }
         }
+        out.write_all(o.bytes())!;
         return;
     }
     let mut maxval: u32 = 255;
@@ -292,14 +310,21 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
         }
         fmt.write(wr, "{}\n{} {}\n{}\n", [fmt.str(tag), fmt.int(w), fmt.int(h), fmt.int(maxval)])!;
     }
+    out.write_all(o.bytes())!;
+    o.clear();
     if img.depth == image.Depth.U8 {
-        o.push_str(img.samples8())!;
+        out.write_all(img.samples8())!;
         return;
     }
     for v in img.samples16() {
+        if o.len >= FLUSH_AT {
+            out.write_all(o.bytes())!;
+            o.clear();
+        }
         o.push(@truncate(u8, v >> 8))!;
         o.push(@truncate(u8, v))!;
     }
+    out.write_all(o.bytes())!;
 }
 
 test "formats" {
@@ -343,5 +368,35 @@ test "formats" {
             @expect_eq(back.channels, ch);
             @expect_eq(back.data[..], img.data[..]);
         }
+    }
+}
+
+test "encode_to" {
+    let kinds: [3]image.Depth = [image.Depth.U8, image.Depth.U16, image.Depth.F32];
+    for k in kinds {
+        let mut img = image.Image.init(90, 70, 3, k)!;
+        defer img.deinit();
+        for i in @as(usize, 0)..img.data.len {
+            img.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
+        }
+        if k == image.Depth.F32 {
+            let f = img.samples32();
+            for i in @as(usize, 0)..f.len {
+                f[i] = @float_from_int(f32, i % 50) * 0.5;
+            }
+        }
+        let enc = encode(&img)!;
+        defer mem.free(enc);
+        let mut s = strs.String.init();
+        defer s.deinit();
+        encode_to(s.writer(), &img)!;
+        @expect_eq(s.bytes(), enc[..]);
+        let mut small: [100]u8 = [0; 100];
+        let mut bw = io.BufferWriter.init(small[..]);
+        encode_to(bw.writer(), &img) catch |e| {
+            @expect_eq(e, error.NoSpaceLeft);
+            continue;
+        };
+        @trap();
     }
 }

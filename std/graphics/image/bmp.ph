@@ -3,6 +3,7 @@
 //
 //     let img = bmp.decode(bytes)!;
 //     let out = bmp.encode(&img)!;    // mem.free it
+//     bmp.encode_to(w, &img)!;        // or to an io.Writer
 //
 // Decoding handles 1, 4 and 8 bits with a palette (and RLE4/RLE8
 // compression), 16 and 32 bits with or without bit fields, 24 bits,
@@ -13,6 +14,7 @@
 // bits, and anything with alpha as 32 bits with a BITMAPV4HEADER.
 // =============================================================================
 
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../str.ph" as strs;
 import "../image.ph" as image;
@@ -306,11 +308,22 @@ fn put32(o: *mut strs.String, v: u32) !void {
     put16(o, v >> 16)!;
 }
 
+/// Encodes an image as BMP (free the result with mem.free).
 pub fn encode(img: *image.Image) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as BMP to w, some rows at a time.
+pub fn encode_to(wr: io.Writer, img: *image.Image) !void {
     if img.depth != image.Depth.U8 {
         let mut c = img.convert(img.channels, image.Depth.U8)!;
         defer c.deinit();
-        return encode(&c);
+        return encode_to(wr, &c);
     }
     let w = img.width;
     let h = img.height;
@@ -332,21 +345,19 @@ pub fn encode(img: *image.Image) ![]mut u8 {
     if size > 0xffffffff {
         return error.Unsupported;
     }
-    let mut o = strs.String.init();
-    write_file(&mut o, img, size, off, hsize, bpp, stride) catch |e| {
-        o.deinit();
-        return e;
-    };
-    return o.take();
+    let mut buf = strs.String.init();
+    defer buf.deinit();
+    write_file(wr, &mut buf, img, size, off, hsize, bpp, stride)!;
 }
 
-fn write_file(o: *mut strs.String, img: *image.Image, size: usize, off: usize, hsize: usize, bpp: usize,
+// (o gathers the output, written to wr a few KiB at a time)
+fn write_file(wr: io.Writer, o: *mut strs.String, img: *image.Image, size: usize, off: usize, hsize: usize, bpp: usize,
               stride: usize) !void {
     let w = img.width;
     let h = img.height;
     let gray = img.channels == 1;
     let alpha = img.has_alpha();
-    o.reserve(size)!;
+    o.reserve(@min(size, FLUSH_AT + stride))!;
     o.push_str("BM")!;
     put32(o, @truncate(u32, size))!;
     put32(o, 0)!;
@@ -388,6 +399,10 @@ fn write_file(o: *mut strs.String, img: *image.Image, size: usize, off: usize, h
     let px = img.samples8();
     let ch = img.channels;
     for yy in @as(usize, 0)..h {
+        if o.len >= FLUSH_AT {
+            wr.write_all(o.bytes())!;
+            o.clear();
+        }
         let y = h - 1 - yy;
         let start = o.len;
         for x in @as(usize, 0)..w {
@@ -413,7 +428,10 @@ fn write_file(o: *mut strs.String, img: *image.Image, size: usize, off: usize, h
             o.push(0)!;
         }
     }
+    wr.write_all(o.bytes())!;
 }
+
+const FLUSH_AT: usize = 16384;  // write out what is gathered at this size
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -463,4 +481,25 @@ test "rle8" {
     @expect_eq(img.get(3, 1).to_rgba8().b, 0);
     @expect_eq(img.get(0, 0).to_rgba8().b, 150);
     @expect_eq(img.get(2, 0).to_rgba8().b, 210);
+}
+
+test "encode_to" {
+    let mut img = image.Image.init(300, 40, 4, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..img.data.len {
+        img.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
+    }
+    let enc = encode(&img)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &img)!;
+    @expect_eq(s.bytes(), enc[..]);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &img) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

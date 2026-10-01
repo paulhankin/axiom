@@ -3,6 +3,7 @@
 //
 //     let img = png.decode(bytes)!;           // an image.Image
 //     let out = png.encode(&img, png.DEFAULT)!;  // mem.free it
+//     png.encode_to(file.writer(), &img, png.DEFAULT)!;  // or stream it
 //
 // Decoding handles every colour type and bit depth, interlacing (Adam7),
 // palettes and tRNS transparency, and checks CRCs. Images come out as U8
@@ -15,6 +16,7 @@
 // =============================================================================
 
 import "../../compress/deflate.ph" as deflate;
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../str.ph" as strs;
 import "../color.ph" as color;
@@ -415,10 +417,22 @@ fn expand_row(e: *Expand, row: []u8, w: usize, img: *mut image.Image, x0: usize,
 
 /// Encodes an image as PNG (free the result with mem.free).
 pub fn encode(img: *image.Image, level: u32) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img, level) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as PNG to w, a row at a time: the filtered rows go
+/// through a streaming deflate, whose output is cut into IDAT chunks of at
+/// most 1 MiB (one chunk is buffered, for its length and CRC).
+pub fn encode_to(w: io.Writer, img: *image.Image, level: u32) !void {
     if img.depth == image.Depth.F32 {
         let mut c = img.convert(img.channels, image.Depth.U16)!;
         defer c.deinit();
-        return encode(&c, level);
+        return encode_to(w, &c, level);
     }
     let mut ct: u8 = 0;
     if img.channels == 2 {
@@ -431,18 +445,30 @@ pub fn encode(img: *image.Image, level: u32) ![]mut u8 {
     let bps = image.bytes_per_sample(img.depth);
     let bpp = img.channels * bps;
     let rb = img.width * bpp;
-    // the filtered scanlines
-    let mut raw = strs.String.init();
-    defer raw.deinit();
-    raw.reserve(img.height * (rb + 1))!;
+    // the signature, IHDR and sRGB
+    let mut head: [46]u8 = [0; 46];
+    @mem_copy(head[..8], SIGNATURE[..]);
+    let mut ihdr: [13]u8 = [0; 13];
+    put_be32(ihdr[0..4], @truncate(u32, img.width));
+    put_be32(ihdr[4..8], @truncate(u32, img.height));
+    ihdr[8] = @truncate(u8, bps * 8);
+    ihdr[9] = ct;
+    put_chunk(head[8..33], "IHDR", ihdr[..]);
+    let srgb: [1]u8 = [0];  // perceptual rendering intent
+    put_chunk(head[33..46], "sRGB", srgb[..]);
+    w.write_all(head[..])!;
     let cur = mem.alloc.[u8](rb)!;
     defer mem.free(cur);
     let prev = mem.alloc_zeroed.[u8](rb)!;
     defer mem.free(prev);
     let trial = mem.alloc.[u8](rb)!;
     defer mem.free(trial);
-    let best = mem.alloc.[u8](rb)!;
+    let best = mem.alloc.[u8](rb + 1)!;  // the filter type and the filtered row
     defer mem.free(best);
+    let mut idat = Idat.{ out: w, buf: strs.String.init() };
+    defer idat.buf.deinit();
+    let z = deflate.Compressor.init(idat.writer(), deflate.Format.ZLIB, level)!;
+    defer z.deinit();
     for y in @as(usize, 0)..img.height {
         // big-endian samples
         let src = img.data[y * rb..(y + 1) * rb];
@@ -457,7 +483,6 @@ pub fn encode(img: *image.Image, level: u32) ![]mut u8 {
             @mem_copy(cur, src);
         }
         // the filter with the smallest sum of absolute (signed) values
-        let mut best_f: u8 = 0;
         let mut best_cost: u64 = 0xffffffffffffffff;
         let mut last: u8 = 4;
         if level == 0 {
@@ -467,50 +492,48 @@ pub fn encode(img: *image.Image, level: u32) ![]mut u8 {
             let cost = filter_row(f, cur, prev, trial, bpp);
             if cost < best_cost {
                 best_cost = cost;
-                best_f = f;
-                @mem_copy(best, trial);
+                best[0] = f;
+                @mem_copy(best[1..], trial);
             }
         }
-        raw.push(best_f)!;
-        raw.push_str(best)!;
+        z.write_all(best)!;
         @mem_copy(prev, cur);
     }
-    let z = deflate.compress(raw.bytes(), deflate.Format.ZLIB, level)!;
-    defer mem.free(z);
-    let mut out = strs.String.init();
-    out.push_str(SIGNATURE[..]) catch |e| {
-        out.deinit();
-        return e;
-    };
-    let mut ihdr: [13]u8 = [0; 13];
-    put_be32(ihdr[0..4], @truncate(u32, img.width));
-    put_be32(ihdr[4..8], @truncate(u32, img.height));
-    ihdr[8] = @truncate(u8, bps * 8);
-    ihdr[9] = ct;
-    write_chunk(&mut out, "IHDR", ihdr[..]) catch |e| {
-        out.deinit();
-        return e;
-    };
-    let srgb: [1]u8 = [0];  // perceptual rendering intent
-    write_chunk(&mut out, "sRGB", srgb[..]) catch |e| {
-        out.deinit();
-        return e;
-    };
-    // IDAT chunks of at most 1 MiB
-    let mut rest = z[..];
-    while rest.len > 0 {
-        let n = @min(rest.len, 1048576);
-        write_chunk(&mut out, "IDAT", rest[..n]) catch |e| {
-            out.deinit();
-            return e;
-        };
-        rest = rest[n..];
+    z.finish()!;
+    idat.flush()!;
+    let mut iend: [12]u8 = [0; 12];
+    put_chunk(iend[..], "IEND", "");
+    w.write_all(iend[..])!;
+}
+
+const IDAT_SIZE: usize = 1048576;  // the most data in one IDAT chunk
+
+// Gathers the compressed stream into IDAT chunks of IDAT_SIZE bytes (the
+// last one shorter), each written once it is complete.
+struct Idat {
+    out: io.Writer,
+    buf: strs.String,
+
+    fn writer(self: *mut Idat) io.Writer {
+        return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: idat_write };
     }
-    write_chunk(&mut out, "IEND", "") catch |e| {
-        out.deinit();
-        return e;
-    };
-    return out.take();
+
+    fn flush(self: *mut Idat) !void {
+        if self.buf.len > 0 {
+            write_chunk(self.out, "IDAT", self.buf.bytes())!;
+            self.buf.clear();
+        }
+    }
+}
+
+fn idat_write(ctx: *mut void, bytes: []u8) !usize {
+    let d = @ptr_cast(*mut Idat, ctx);
+    if d.buf.len == IDAT_SIZE {
+        d.flush()!;
+    }
+    let n = @min(bytes.len, IDAT_SIZE - d.buf.len);
+    d.buf.push_str(bytes[..n])!;
+    return n;
 }
 
 fn put_be32(b: []mut u8, v: u32) void {
@@ -520,14 +543,22 @@ fn put_be32(b: []mut u8, v: u32) void {
     b[3] = @truncate(u8, v);
 }
 
-fn write_chunk(out: *mut strs.String, kind: []u8, body: []u8) !void {
-    let mut lb: [4]u8 = [0; 4];
-    put_be32(lb[..], @truncate(u32, body.len));
-    out.push_str(lb[..])!;
-    out.push_str(kind)!;
-    out.push_str(body)!;
-    put_be32(lb[..], deflate.crc32(deflate.crc32(0, kind), body));
-    out.push_str(lb[..])!;
+// a whole chunk with a short body into out (12 + body.len bytes)
+fn put_chunk(out: []mut u8, kind: []u8, body: []u8) void {
+    put_be32(out[0..4], @truncate(u32, body.len));
+    @mem_copy(out[4..8], kind);
+    @mem_copy(out[8..8 + body.len], body);
+    put_be32(out[8 + body.len..12 + body.len], deflate.crc32(deflate.crc32(0, kind), body));
+}
+
+fn write_chunk(w: io.Writer, kind: []u8, body: []u8) !void {
+    let mut lb: [8]u8 = [0; 8];
+    put_be32(lb[..4], @truncate(u32, body.len));
+    @mem_copy(lb[4..], kind);
+    w.write_all(lb[..])!;
+    w.write_all(body)!;
+    put_be32(lb[..4], deflate.crc32(deflate.crc32(0, kind), body));
+    w.write_all(lb[..4])!;
 }
 
 /// Filters cur (with prev above) into out; returns the heuristic cost.
@@ -598,6 +629,28 @@ test "rejects" {
         @expect_eq(e, error.ChecksumMismatch);
         _ = decode(enc[..enc.len - 12]) catch return;  // no IEND
         @trap();
+    };
+    @trap();
+}
+
+test "encode_to" {
+    let mut img = image.Image.init(19, 11, 3, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..img.data.len {
+        img.data[i] = @truncate(u8, (i * 13) + (i / 40));
+    }
+    let enc = encode(&img, DEFAULT)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &img, DEFAULT)!;
+    @expect_eq(s.bytes(), enc[..]);
+    // the writer's errors come through
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &img, DEFAULT) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
     };
     @trap();
 }

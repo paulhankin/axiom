@@ -3,6 +3,7 @@
 //
 //     let img = jpeg.decode(bytes)!;                 // U8 gray or RGB
 //     let out = jpeg.encode(&img, 90, jpeg.Subsample.S420)!;  // mem.free it
+//     jpeg.encode_to(w, &img, 90, jpeg.Subsample.S420)!;     // or to an io.Writer
 //
 // Decoding handles baseline, extended sequential and progressive Huffman-
 // coded JPEGs with 8-bit samples: any sampling factors, restart intervals,
@@ -17,6 +18,7 @@
 // images are converted to 8 bits.
 // =============================================================================
 
+import "../../io.ph" as io;
 import "../../math.ph" as math;
 import "../../mem.ph" as mem;
 import "../../str.ph" as strs;
@@ -1473,7 +1475,20 @@ fn dct_table() *[64]f32 {
 }
 
 /// Encodes as baseline JPEG (free the result with mem.free).
+/// Encodes an image as baseline JPEG (free the result with mem.free).
 pub fn encode(img: *image.Image, quality: u32, subsample: Subsample) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img, quality, subsample) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as baseline JPEG to wr. The image is transformed
+/// first (the Huffman tables come from the coefficients), then the headers
+/// and entropy-coded data are written a few KiB at a time.
+pub fn encode_to(wr: io.Writer, img: *image.Image, quality: u32, subsample: Subsample) !void {
     if img.depth != image.Depth.U8 {
         let mut ch: usize = 3;
         if img.channels <= 2 {
@@ -1481,7 +1496,7 @@ pub fn encode(img: *image.Image, quality: u32, subsample: Subsample) ![]mut u8 {
         }
         let mut c = img.convert(ch, image.Depth.U8)!;
         defer c.deinit();
-        return encode(&c, quality, subsample);
+        return encode_to(wr, &c, quality, subsample);
     }
     let w = img.width;
     let h = img.height;
@@ -1630,26 +1645,18 @@ pub fn encode(img: *image.Image, quality: u32, subsample: Subsample) ![]mut u8 {
         }
     }
     // the file
-    let mut bw = BitWriter.{ out: strs.String.init(), acc: 0, nbits: 0 };
-    write_headers(&mut bw.out, w, h, ncomp, hs, vs, &qt, &tables) catch |e| {
-        bw.out.deinit();
-        return e;
-    };
-    walk(coefs, mcux * mcuy, hs * vs, ncomp, &mut freq, &mut bw, true, &tables) catch |e| {
-        bw.out.deinit();
-        return e;
-    };
+    let mut hdrs = strs.String.init();
+    defer hdrs.deinit();
+    write_headers(&mut hdrs, w, h, ncomp, hs, vs, &qt, &tables)!;
+    wr.write_all(hdrs.bytes())!;
+    let mut bw = BitWriter.{ out: wr, buf: [0; 4096], len: 0, acc: 0, nbits: 0 };
+    walk(coefs, mcux * mcuy, hs * vs, ncomp, &mut freq, &mut bw, true, &tables)!;
     // pad the last byte with ones
-    bw.put(0x7f, 7) catch |e| {
-        bw.out.deinit();
-        return e;
-    };
-    let eoi: [2]u8 = [0xff, 0xd9];
-    bw.out.push_str(eoi[..]) catch |e| {
-        bw.out.deinit();
-        return e;
-    };
-    return bw.out.take();
+    bw.put(0x7f, 7)!;
+    bw.buf[bw.len] = 0xff;
+    bw.buf[bw.len + 1] = 0xd9;
+    bw.len += 2;
+    wr.write_all(bw.buf[..bw.len])!;
 }
 
 struct HuffTable {
@@ -1660,19 +1667,28 @@ struct HuffTable {
     len: [256]u8,
 }
 
+// Bits, most significant first, into buf, written to out when it fills.
 struct BitWriter {
-    out: strs.String,
+    out: io.Writer,
+    buf: [4096]u8,
+    len: usize,
     acc: u32,
     nbits: u32,
 
     fn put(self: *mut BitWriter, v: u32, n: u32) !void {
         self.acc = (self.acc << n) | (v & ((@as(u32, 1) << n) - 1));
         self.nbits += n;
+        if self.len > (self.buf.len - 8) {
+            self.out.write_all(self.buf[..self.len])!;
+            self.len = 0;
+        }
         while self.nbits >= 8 {
             let b = @truncate(u8, self.acc >> (self.nbits - 8));
-            self.out.push(b)!;
+            self.buf[self.len] = b;
+            self.len += 1;
             if b == 0xff {
-                self.out.push(0)!;  // byte stuffing
+                self.buf[self.len] = 0;  // byte stuffing
+                self.len += 1;
             }
             self.nbits -= 8;
         }
@@ -1989,4 +2005,25 @@ test "rejects" {
         _ = decode(b) catch continue;
         @trap();
     }
+}
+
+test "encode_to" {
+    let mut img = image.Image.init(200, 120, 3, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..img.data.len {
+        img.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
+    }
+    let enc = encode(&img, 90, Subsample.S420)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &img, 90, Subsample.S420)!;
+    @expect_eq(s.bytes(), enc[..]);
+    let mut small: [1000]u8 = [0; 1000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &img, 90, Subsample.S420) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

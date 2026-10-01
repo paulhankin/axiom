@@ -8,6 +8,7 @@
 //
 //     let out = gif.encode(&img)!;                     // mem.free(out)
 //     let movie = gif.encode_animation(frames, delays, 0)!;   // loop for ever
+//     gif.encode_to(w, &img)!;                         // or to an io.Writer
 //
 // Decoding composites each frame onto the canvas as a viewer would
 // (disposal methods, transparency, interlacing, local palettes), so every
@@ -17,6 +18,7 @@
 // =============================================================================
 
 import "../../collections/vec.ph" as vec;
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../os/fs.ph" as fs;
 import "../../str.ph" as strs;
@@ -432,18 +434,39 @@ fn b2u(b: bool) usize {
 /// Encodes an image (any channels and depth; alpha below half is
 /// transparent). The caller frees the result.
 pub fn encode(img: *image.Image) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as encode does, to w (as the LZW codes are made).
+pub fn encode_to(w: io.Writer, img: *image.Image) !void {
     let one: [1]*image.Image = [img];
     let d: [1]u32 = [0];
-    return encode_frames(one[..], d[..], -1)!;
+    encode_frames(w, one[..], d[..], -1)!;
 }
 
 /// Encodes frames (all the same size) with their delays in milliseconds;
-/// loops: 0 for ever, n more times, or -1 to play once.
+/// loops: 0 for ever, n more times, or -1 to play once. The caller frees
+/// the result.
 pub fn encode_animation(frames: []*image.Image, delays_ms: []u32, loops: i32) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_animation_to(s.writer(), frames, delays_ms, loops) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an animation as encode_animation does, to w, a frame at a time.
+pub fn encode_animation_to(w: io.Writer, frames: []*image.Image, delays_ms: []u32, loops: i32) !void {
     if (frames.len == 0) or (delays_ms.len != frames.len) {
         return error.InvalidImage;
     }
-    return encode_frames(frames, delays_ms, loops)!;
+    encode_frames(w, frames, delays_ms, loops)!;
 }
 
 fn put16(s: *mut strs.String, v: usize) !void {
@@ -451,17 +474,47 @@ fn put16(s: *mut strs.String, v: usize) !void {
     s.push(@truncate(u8, v >> 8))!;
 }
 
-fn encode_frames(frames: []*image.Image, delays: []u32, loops: i32) ![]mut u8 {
+const FLUSH_AT: usize = 16384;  // write out what is gathered at this size
+
+// Image data as sub-blocks of up to 255 bytes, gathered in o and written
+// to out a few KiB at a time.
+struct SubBlocks {
+    out: io.Writer,
+    o: *mut strs.String,
+    blk: [255]u8,
+    n: usize,
+
+    fn push(self: *mut SubBlocks, b: u8) !void {
+        self.blk[self.n] = b;
+        self.n += 1;
+        if self.n == 255 {
+            self.end_block()!;
+        }
+    }
+
+    fn end_block(self: *mut SubBlocks) !void {
+        if self.n == 0 {
+            return;
+        }
+        self.o.push(@truncate(u8, self.n))!;
+        self.o.push_str(self.blk[..self.n])!;
+        self.n = 0;
+        if self.o.len >= FLUSH_AT {
+            self.out.write_all(self.o.bytes())!;
+            self.o.clear();
+        }
+    }
+}
+
+fn encode_frames(wr: io.Writer, frames: []*image.Image, delays: []u32, loops: i32) !void {
     let w = frames[0].width;
     let h = frames[0].height;
     if (w > 65535) or (h > 65535) or (w == 0) or (h == 0) {
         return error.TooLarge;
     }
     let mut out = strs.String.init();
-    out.push_str("GIF89a") catch |e| {
-        out.deinit();
-        return e;
-    };
+    defer out.deinit();
+    out.push_str("GIF89a")!;
     put16(&mut out, w)!;
     put16(&mut out, h)!;
     out.push(0x70)!;  // no global table; 8 bits of colour resolution
@@ -475,24 +528,14 @@ fn encode_frames(frames: []*image.Image, delays: []u32, loops: i32) ![]mut u8 {
     for k in @as(usize, 0)..frames.len {
         let f = frames[k];
         if (f.width != w) or (f.height != h) {
-            out.deinit();
             return error.InvalidImage;
         }
-        let mut rgba = f.convert(4, image.Depth.U8) catch |e| {
-            out.deinit();
-            return e;
-        };
+        let mut rgba = f.convert(4, image.Depth.U8)!;
         defer rgba.deinit();
         let mut pal = Palette.{ colors: [0; 768], n: 0, transparent: false };
-        let idx = mem.alloc.[u8](w * h) catch |e| {
-            out.deinit();
-            return e;
-        };
+        let idx = mem.alloc.[u8](w * h)!;
         defer mem.free(idx);
-        index_image(&rgba, &mut pal, idx) catch |e| {
-            out.deinit();
-            return e;
-        };
+        index_image(&rgba, &mut pal, idx)!;
         // graphic control: delay, disposal "none", the transparent index
         out.push_str("\x21\xf9\x04")!;
         let mut packed: u8 = 4;  // disposal 1: leave in place
@@ -521,21 +564,13 @@ fn encode_frames(frames: []*image.Image, delays: []u32, loops: i32) ![]mut u8 {
         }
         let min_code = @max(bits, 2);
         out.push(@truncate(u8, min_code))!;
-        let mut data = strs.String.init();
-        defer data.deinit();
+        let mut data = SubBlocks.{ out: wr, o: &mut out, blk: [0; 255], n: 0 };
         lzw_encode(idx, min_code, &mut data)!;
-        let bs = data.bytes();
-        let mut at: usize = 0;
-        while at < bs.len {
-            let n = @min(255, bs.len - at);
-            out.push(@truncate(u8, n))!;
-            out.push_str(bs[at..at + n])!;
-            at += n;
-        }
+        data.end_block()!;
         out.push(0)!;
     }
     out.push(0x3b)!;
-    return out.take();
+    wr.write_all(out.bytes())!;
 }
 
 struct Palette {
@@ -726,7 +761,7 @@ fn nearest(pal: *Palette, first: usize, r: u8, g: u8, b: u8) usize {
     return best;
 }
 
-fn lzw_encode(idx: []u8, min_code: u32, out: *mut strs.String) !void {
+fn lzw_encode(idx: []u8, min_code: u32, out: *mut SubBlocks) !void {
     let clear = @as(u32, 1) << min_code;
     let eoi = clear + 1;
     // the dictionary: (prefix code << 8 | byte) -> code, open addressing
@@ -784,7 +819,7 @@ fn lzw_encode(idx: []u8, min_code: u32, out: *mut strs.String) !void {
     flush_bits(out, &mut acc, &mut nbits)!;
 }
 
-fn emit(out: *mut strs.String, acc: *mut u32, nbits: *mut u32, code: u32, size: u32) !void {
+fn emit(out: *mut SubBlocks, acc: *mut u32, nbits: *mut u32, code: u32, size: u32) !void {
     acc.* |= code << nbits.*;
     nbits.* += size;
     while nbits.* >= 8 {
@@ -794,7 +829,7 @@ fn emit(out: *mut strs.String, acc: *mut u32, nbits: *mut u32, code: u32, size: 
     }
 }
 
-fn flush_bits(out: *mut strs.String, acc: *mut u32, nbits: *mut u32) !void {
+fn flush_bits(out: *mut SubBlocks, acc: *mut u32, nbits: *mut u32) !void {
     if nbits.* > 0 {
         out.push(@truncate(u8, acc.*))!;
         acc.* = 0;
@@ -924,4 +959,35 @@ fn invalid(r: !image.Image) bool {
     let mut x = r catch return true;
     x.deinit();
     return false;
+}
+
+test "encode_to" {
+    let mut a = image.Image.init(120, 90, 3, image.Depth.U8)!;
+    defer a.deinit();
+    for i in @as(usize, 0)..a.data.len {
+        a.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
+    }
+    let mut b = a.clone()!;
+    defer b.deinit();
+    b.data[5] = 9;
+    let enc = encode(&a)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &a)!;
+    @expect_eq(s.bytes(), enc[..]);
+    let frames: [2]*image.Image = [&a, &b];
+    let delays: [2]u32 = [100, 250];
+    let movie = encode_animation(frames[..], delays[..], 2)!;
+    defer mem.free(movie);
+    s.clear();
+    encode_animation_to(s.writer(), frames[..], delays[..], 2)!;
+    @expect_eq(s.bytes(), movie[..]);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &a) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
