@@ -59,6 +59,7 @@ import "../time.ph" as time;
 import "hpack.ph" as hpack;
 import "http2.ph" as http2;
 import "tls.ph" as tls;
+import "url.ph" as urls;
 
 error {
     InvalidArgument,
@@ -161,67 +162,21 @@ fn hex_value(c: u8) u32 {
 
 /// Decodes %XX escapes (and, if `plus_space`, '+' as a space, as in query
 /// strings) into out, which must be at least as long as s. Fails with
-/// BadRequest on a malformed escape.
+/// BadRequest on a malformed escape. (std/net/url has the rest of
+/// percent-encoding.)
 pub fn percent_decode(s: []u8, out: []mut u8, plus_space: bool) ![]u8 {
-    let mut n: usize = 0;
-    let mut i: usize = 0;
-    while i < s.len {
-        let c = s[i];
-        if c == '%' {
-            if (i + 2) >= s.len {
-                return error.BadRequest;
-            }
-            let hi = hex_value(s[i + 1]);
-            let lo = hex_value(s[i + 2]);
-            if (hi > 15) or (lo > 15) {
-                return error.BadRequest;
-            }
-            out[n] = @truncate(u8, (hi << 4) | lo);
-            i += 3;
-        } else {
-            out[n] = c;
-            if plus_space and (c == '+') {
-                out[n] = ' ';
-            }
-            i += 1;
-        }
-        n += 1;
-    }
-    return out[..n];
+    return urls.percent_decode(s, out, plus_space) catch return error.BadRequest;
 }
 
 /// Writes s with everything but unreserved characters (letters, digits and
 /// -._~) percent-encoded, for use in a path segment or query value.
 pub fn percent_encode(w: io.Writer, s: []u8) !void {
-    let hex = "0123456789ABCDEF";
-    let mut lit: usize = 0;
-    for i in 0..s.len {
-        let c = s[i];
-        if strs.is_alnum(c) or (c == '-') or (c == '.') or (c == '_') or (c == '~') {
-            continue;
-        }
-        w.write_all(s[lit..i])!;
-        let esc: [3]u8 = ['%', hex[@as(usize, c >> 4)], hex[@as(usize, c & 15)]];
-        w.write_all(esc[..])!;
-        lit = i + 1;
-    }
-    w.write_all(s[lit..])!;
+    urls.encode_to(w, s, urls.Component.COMPONENT)!;
 }
 
 /// The value of `name` in a query string ("a=1&b=x%20y"), still encoded.
 pub fn query_raw(query: []u8, name: []u8) ![]u8 {
-    let mut it = strs.split(query, "&");
-    loop {
-        let pair = it.next() catch break;
-        let eq = strs.index_of_byte(pair, '=') catch pair.len;
-        if @mem_eq(pair[..eq], name) {
-            if eq == pair.len {
-                return "";
-            }
-            return pair[eq + 1..];
-        }
-    }
-    return error.NotFound;
+    return urls.query_value(query, name);
 }
 
 // -----------------------------------------------------------------------------
@@ -1533,51 +1488,46 @@ pub struct Url {
     secure: bool,  // https
 }
 
-/// Parses "http[s]://hostname[:port][/path][?query]".
-pub fn parse_url(url: []u8) !Url {
-    // no spaces or control characters anywhere (they would split the request)
-    for ch in url {
-        if (ch <= 0x20) or (ch == 0x7f) {
-            return error.BadUrl;
-        }
-    }
-    let mut secure = false;
-    let mut rest = url;
-    if strs.starts_with(url, "https://") {
-        secure = true;
-        rest = url[8..];
-    } else {
-        rest = strs.strip_prefix(url, "http://") catch return error.BadUrl;
-    }
-    let slash = strs.index_of_any(rest, "/?") catch rest.len;
-    let authority = rest[..slash];
-    let mut target = rest[slash..];
-    if target.len == 0 {
-        target = "/";
-    } else if target[0] == '?' {
+/// Parses "http[s]://hostname[:port][/path][?query]" (with std/net/url;
+/// no user information or IPv6 addresses, and the scheme in lowercase).
+pub fn parse_url(text: []u8) !Url {
+    let u = urls.parse(text) catch return error.BadUrl;
+    let secure = strs.eq(u.scheme, "https");
+    if (not secure and not strs.eq(u.scheme, "http")) or not u.has_authority or u.has_userinfo or u.ip_literal {
         return error.BadUrl;
     }
-    let mut hostname = authority;
+    // the target is the path and query, which end the text but for a fragment
+    let mut end = text.len;
+    if u.has_fragment {
+        end -= u.fragment.len + 1;
+    }
+    let mut target = text[end - u.path.len..end];
+    if u.has_query {
+        target = text[(end - u.query.len) - (u.path.len + 1)..end];
+        if u.path.len == 0 {
+            return error.BadUrl;  // "http://h?q"
+        }
+    }
+    if target.len == 0 {
+        target = "/";
+    }
     let mut port: u16 = 80;
     if secure {
         port = 443;
     }
-    let colon = strs.last_index_of_byte(authority, ':') catch authority.len;
-    if colon < authority.len {
-        hostname = authority[..colon];
-        port = fmt.parse_int.[u16](authority[colon + 1..]) catch return error.BadUrl;
+    if u.has_port {
+        port = u.port_number() catch return error.BadUrl;  // (also for an empty port)
     }
-    if hostname.len == 0 {
+    if u.hostname.len == 0 {
         return error.BadUrl;
     }
     // a host name or an IPv4 address: letters, digits, '-' and '.'
-    for ch in hostname {
+    for ch in u.hostname {
         if not (strs.is_alnum(ch) or (ch == '-') or (ch == '.')) {
             return error.BadUrl;
         }
     }
-    let hash = strs.index_of_byte(target, '#') catch target.len;
-    return Url.{ hostname: hostname, port: port, target: target[..hash], secure: secure };
+    return Url.{ hostname: u.hostname, port: port, target: target, secure: secure };
 }
 
 let H2_ALPN: [2][]u8 = ["h2", "http/1.1"];
@@ -1914,6 +1864,8 @@ test "urls and encoding" {
     @expect_eq(u.port, 8080);
     @expect_eq(u.target, "/a/b?x=1");
     @expect_eq(parse_url("http://h")!.target, "/");
+    @expect_eq(parse_url("http://h#frag")!.target, "/");
+    @expect_eq(parse_url("http://h/p?q=1#frag")!.target, "/p?q=1");
     @expect_eq(parse_url("http://h")!.port, 80);
     @expect(not parse_url("http://h")!.secure);
     let v = parse_url("https://h.example/x")!;
