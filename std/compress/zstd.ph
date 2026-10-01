@@ -3,6 +3,7 @@
 //
 //     let packed = zstd.compress(data, 3)!;          // level 1..19; the caller frees
 //     let back = zstd.decompress(packed, 1 << 30)!;  // at most 1 GiB out
+//     zstd.compress_to(w, data, 3)!;                 // to an io.Writer
 //
 // decompress reads Zstandard frames one after another, and skips skippable
 // frames: raw, RLE and compressed blocks, Huffman-coded literals (one or
@@ -22,6 +23,7 @@
 
 import "../collections/vec.ph" as vec;
 import "../hash/xxhash.ph" as xxhash;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
@@ -1743,14 +1745,21 @@ fn seq_bits(w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) !void {
 /// level 1 (fastest) to 19 (smallest). The caller frees the result.
 pub fn compress(data: []u8, level: u32) ![]mut u8 {
     let mut out = strs.String.init();
-    encode_frame(data, level, &mut out) catch |e| {
+    compress_to(out.writer(), data, level) catch |e| {
         out.deinit();
         return e;
     };
     return out.take();
 }
 
-fn encode_frame(data: []u8, level: u32, out: *mut strs.String) !void {
+/// Compresses data as one Zstandard frame (see compress) and writes it to
+/// w a block (at most 128 KB) at a time, as each is compressed.
+pub fn compress_to(w: io.Writer, data: []u8, level: u32) !void {
+    // what goes out next: the frame header, then each block with its header
+    // (and, after the last, the checksum)
+    let mut ob = strs.String.init();
+    defer ob.deinit();
+    let out = &mut ob;
     let lv = @max(@min(level, 19), 1);
     let n = @as(u64, data.len);
     // the header: single segment, the content size, a checksum
@@ -1832,10 +1841,13 @@ fn encode_frame(data: []u8, level: u32, out: *mut strs.String) !void {
         if last {
             break;
         }
+        w.write_all(out.bytes())!;
+        out.clear();
     }
     let h = @truncate(u32, xxhash.xxh64(data, 0));
     put24(out, h)!;
     out.push(@truncate(u8, h >> 24))!;
+    w.write_all(out.bytes())!;
 }
 
 fn put24(out: *mut strs.String, v: u32) !void {
@@ -1911,6 +1923,20 @@ test "round trips" {
         defer mem.free(d);
         @expect_eq(d, input);
     }
+    // compress_to writes the same frame, block by block
+    let c = compress(big.bytes(), 1)!;
+    defer mem.free(c);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    compress_to(out.writer(), big.bytes(), 1)!;
+    @expect_eq(out.bytes(), c);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    compress_to(bw.writer(), big.bytes(), 1) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "damaged input" {

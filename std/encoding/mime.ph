@@ -17,10 +17,15 @@
 //     w.add_field("title", "Hello")!;
 //     w.add_file("upload", "a.txt", "text/plain", bytes)!;
 //     let ct = w.content_type_alloc()!;   // for the Content-Type header
-//     let body = w.finish()!;
+//     let body = w.finish()!;             // or w.finish_to(out)!
+//
+//     let mut sw = mime.MultipartWriter.init_to(out)!;   // parts go to `out`
+//     sw.add_field("title", "Hello")!;                   // as they are added
+//     sw.finish_to(out)!;
 // =============================================================================
 
 import "../crypto/random.ph" as random;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
 
@@ -526,13 +531,20 @@ pub struct Multipart {
     }
 }
 
-/// Builds a multipart/form-data body.
+/// Builds a multipart/form-data body: in memory (init, then finish or
+/// finish_to), or straight to an io.Writer as the parts are added (init_to,
+/// then finish_to on the same writer).
 pub struct MultipartWriter {
-    out: strs.String,
+    out: strs.String,  // the body so far (init) or nothing (init_to)
+    sink: io.Writer,
+    streaming: bool,
+    parts: usize,
     boundary: [32]u8,
 
+    /// A writer that keeps the body in memory.
     pub fn init() !MultipartWriter {
-        let mut w = MultipartWriter.{ out: strs.String.init(), boundary: [0; 32] };
+        let mut w = MultipartWriter.{ out: strs.String.init(), sink: io.discard(), streaming: false, parts: 0,
+                                      boundary: [0; 32] };
         let mut r: [12]u8 = [0; 12];
         random.fill(r[..])!;
         @mem_copy(w.boundary[..8], "phalange");
@@ -541,6 +553,15 @@ pub struct MultipartWriter {
             w.boundary[8 + (2 * i)] = digits[@as(usize, r[i] >> 4)];
             w.boundary[9 + (2 * i)] = digits[@as(usize, r[i] & 15)];
         }
+        return w;
+    }
+
+    /// A writer that writes each part to `out` as it is added; end the body
+    /// with finish_to(out). Nothing but a part's headers is held in memory.
+    pub fn init_to(out: io.Writer) !MultipartWriter {
+        let mut w = MultipartWriter.init()!;
+        w.sink = out;
+        w.streaming = true;
         return w;
     }
 
@@ -576,12 +597,23 @@ pub struct MultipartWriter {
         if strs.contains(body, d[..34]) or strs.contains(headers, d[..34]) {
             return error.InvalidArgument;
         }
-        self.out.push_str(d[..34])!;
-        self.out.push_str("\r\n")!;
-        self.out.push_str(headers)!;
-        self.out.push_str("\r\n")!;
-        self.out.push_str(body)!;
-        self.out.push_str("\r\n")!;
+        // the CRLF that ends a part's body is written with the next delimiter
+        let mut pre = strs.String.init();
+        defer pre.deinit();
+        if self.parts > 0 {
+            pre.push_str("\r\n")!;
+        }
+        pre.push_str(d[..34])!;
+        pre.push_str("\r\n")!;
+        pre.push_str(headers)!;
+        pre.push_str("\r\n")!;
+        let mut w = self.sink;
+        if not self.streaming {
+            w = self.out.writer();
+        }
+        w.write_all(pre.bytes())!;
+        w.write_all(body)!;
+        self.parts += 1;
     }
 
     /// A form field.
@@ -613,12 +645,43 @@ pub struct MultipartWriter {
         self.add_part(h.bytes(), data)!;
     }
 
-    /// Ends the body and hands it over (free it with mem.free).
+    /// Ends the body and hands it over (free it with mem.free). Only for a
+    /// writer made with init (InvalidArgument otherwise: use finish_to).
     pub fn finish(self: *mut MultipartWriter) ![]mut u8 {
-        self.out.push_str("--")!;
-        self.out.push_str(self.boundary[..])!;
-        self.out.push_str("--\r\n")!;
+        if self.streaming {
+            return error.InvalidArgument;
+        }
+        let mut tail: [40]u8 = [0; 40];
+        self.out.push_str(self.tail(tail[..]))!;
         return self.out.take();
+    }
+
+    /// Ends the body, writing to w what is left of it: for a writer made
+    /// with init, the whole body (which is then dropped); for one made with
+    /// init_to (pass the same writer), the closing delimiter.
+    pub fn finish_to(self: *mut MultipartWriter, w: io.Writer) !void {
+        let mut tail: [40]u8 = [0; 40];
+        let t = self.tail(tail[..]);
+        if self.streaming {
+            w.write_all(t)!;
+            return;
+        }
+        self.out.push_str(t)!;
+        w.write_all(self.out.bytes())!;
+        self.out.clear();
+    }
+
+    // The closing delimiter (after the last part's CRLF).
+    fn tail(self: *MultipartWriter, buf: []mut u8) []u8 {
+        let mut n: usize = 0;
+        if self.parts > 0 {
+            @mem_copy(buf[..2], "\r\n");
+            n = 2;
+        }
+        @mem_copy(buf[n..n + 2], "--");
+        @mem_copy(buf[n + 2..n + 34], self.boundary[..]);
+        @mem_copy(buf[n + 34..n + 38], "--\r\n");
+        return buf[..n + 38];
     }
 }
 
@@ -740,6 +803,61 @@ test "multipart round trip and bad input" {
     evil[1] = '-';
     @mem_copy(evil[2..34], w2.boundary_text());
     @expect(not done_or_ok(w2.add_field("x", evil[..34])));
+}
+
+test "multipart writing to an io.Writer" {
+    let mut sink = strs.String.init();
+    defer sink.deinit();
+    let mut w = MultipartWriter.init_to(sink.writer())!;
+    defer w.deinit();
+    // the same boundary in memory, for comparison
+    let mut m = MultipartWriter.init()!;
+    defer m.deinit();
+    m.boundary = w.boundary;
+    let mut empty = MultipartWriter.init()!;
+    defer empty.deinit();
+    let e = empty.finish()!;
+    defer mem.free(e);
+    @expect_eq(e.len, 38);
+    w.add_field("a", "1")!;
+    m.add_field("a", "1")!;
+    @expect(strs.ends_with(sink.bytes(), "\r\n\r\n1"));
+    w.add_file("f", "f.txt", "text/plain", "hello\r\n")!;
+    m.add_file("f", "f.txt", "text/plain", "hello\r\n")!;
+    w.finish_to(sink.writer())!;
+    @expect(not done_or_ok_bytes(w.finish()));
+    let mut copy = strs.String.init();
+    defer copy.deinit();
+    let mut m2 = MultipartWriter.init()!;
+    defer m2.deinit();
+    m2.boundary = w.boundary;
+    m2.add_field("a", "1")!;
+    m2.add_file("f", "f.txt", "text/plain", "hello\r\n")!;
+    m2.finish_to(copy.writer())!;
+    let body = m.finish()!;
+    defer mem.free(body);
+    @expect_eq(sink.bytes(), body);
+    @expect_eq(copy.bytes(), body);
+    let mut mp = Multipart.init(body, w.boundary_text())!;
+    @expect_eq(mp.next()!.body, "1");
+    @expect_eq(mp.next()!.body, "hello\r\n");
+    @expect(done(mp.next()));
+    // a full destination fails with its error
+    let mut small: [10]u8 = [0; 10];
+    let mut bw = io.BufferWriter.init(small[..]);
+    let mut w3 = MultipartWriter.init_to(bw.writer())!;
+    defer w3.deinit();
+    w3.add_field("a", "1") catch |err| {
+        @expect_eq(err, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
+}
+
+fn done_or_ok_bytes(r: ![]mut u8) bool {
+    let b = r catch return false;
+    mem.free(b);
+    return true;
 }
 
 fn done(r: !Part) bool {

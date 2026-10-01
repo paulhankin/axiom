@@ -11,6 +11,7 @@
 //     defer doc.deinit();
 //     let n = doc.root.get("n")!.as_i64()!;
 //     let d = cbor.diagnostic_alloc(doc.root)!;         // {"n": -7, "at": 1(1363896240)}
+//     cbor.encode_to(out, doc.root)!;                   // a whole value to an io.Writer
 //
 // Values cover the whole data model: unsigned and negative integers (all
 // 65 bits of them), byte and text strings, arrays, maps with keys of any
@@ -568,13 +569,31 @@ pub fn encode_canonical(v: Value) ![]mut u8 {
 
 fn encode_with(v: Value, canonical: bool) ![]mut u8 {
     let mut s = strs.String.init();
-    let mut w = Writer.init(s.writer());
-    w.canonical = canonical;
-    w.value(v) catch |e| {
+    encode_to_with(s.writer(), v, canonical) catch |e| {
         s.deinit();
         return e;
     };
     return s.take();
+}
+
+/// Writes the CBOR encoding of a value (preferred serialization) to w,
+/// through a 4 KB buffer flushed before returning.
+pub fn encode_to(w: io.Writer, v: Value) !void {
+    encode_to_with(w, v, false)!;
+}
+
+/// Writes the deterministic encoding (map keys sorted) to w. Each map is
+/// encoded into memory to sort its entries; everything else streams.
+pub fn encode_canonical_to(w: io.Writer, v: Value) !void {
+    encode_to_with(w, v, true)!;
+}
+
+fn encode_to_with(w: io.Writer, v: Value, canonical: bool) !void {
+    let mut bw = io.BufWriter.init(w);
+    let mut cw = Writer.init(bw.writer());
+    cw.canonical = canonical;
+    cw.value(v)!;
+    bw.flush()!;
 }
 
 /// Converts JSON text to CBOR; the caller frees the result.
@@ -1181,6 +1200,19 @@ test "writing" {
     let cd = diagnostic_alloc(d2.root)!;
     defer mem.free(cd);
     @expect_eq(cd, "{10: [0.5, 1e-7, h'01'], \"n\": -7, \"at\": 1(1363896240)}");
+    // the writer forms give the same bytes, and pass on the writer's errors
+    let mut sw = strs.String.init();
+    defer sw.deinit();
+    encode_canonical_to(sw.writer(), doc.root)!;
+    @expect_eq(sw.bytes(), c);
+    sw.clear();
+    encode_to(sw.writer(), doc.root)!;
+    let plain = encode(doc.root)!;
+    defer mem.free(plain);
+    @expect_eq(sw.bytes(), plain);
+    let mut small: [6]u8 = [0; 6];
+    let mut bw = io.BufferWriter.init(small[..]);
+    @expect(write_fails(encode_to(bw.writer(), doc.root)));
     let mut j = strs.String.init();
     defer j.deinit();
     to_json(j.writer(), d2.root)!;
@@ -1251,4 +1283,11 @@ test "malformed input" {
     let mut d = decode_prefix("\x01\x02", &mut used)!;
     d.deinit();
     @expect_eq(used, 1);
+}
+
+fn write_fails(r: !void) bool {
+    r catch |e| {
+        return e == error.NoSpaceLeft;
+    };
+    return false;
 }

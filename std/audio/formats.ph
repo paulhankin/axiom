@@ -7,8 +7,9 @@
 //     formats.save("song.wav", &s)!;                   // from the extension
 //
 //     let f = formats.detect(bytes);                   // Format.WAV, ... or Format.UNKNOWN
-//     let s2 = formats.decode(bytes)!;
+//     let s2 = formats.decode(bytes)!;                 // or decode_from(reader)
 //     let out = formats.encode(&s, formats.Format.FLAC)!;
+//     formats.encode_to(w, &s, formats.Format.WAV)!;   // to an io.Writer
 //
 // Formats: WAV, AIFF and FLAC (read and write), Ogg Vorbis, Ogg Opus, MP3 and
 // AAC (ADTS and MP4; read).
@@ -19,6 +20,7 @@
 import "../audio.ph" as audio;
 import "../io.ph" as io;
 import "../mem.ph" as mem;
+import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
 import "aac.ph" as aac;
 import "aiff.ph" as aiff;
@@ -131,6 +133,13 @@ pub fn decode(data: []u8) !audio.Sound {
     return error.Unsupported;
 }
 
+/// Decodes a sound in any supported format, read to the end from r.
+pub fn decode_from(r: io.Reader) !audio.Sound {
+    let data = r.read_all()!;
+    defer mem.free(data);
+    return decode(data);
+}
+
 /// Encodes a sound (free the result with mem.free); WAV, AIFF or FLAC.
 pub fn encode(s: *audio.Sound, format: Format) ![]mut u8 {
     if format == Format.WAV {
@@ -145,27 +154,41 @@ pub fn encode(s: *audio.Sound, format: Format) ![]mut u8 {
     return error.Unsupported;
 }
 
+/// Encodes a sound to w; WAV, AIFF or FLAC (see each module's encode_to
+/// for how much it holds in memory).
+pub fn encode_to(w: io.Writer, s: *audio.Sound, format: Format) !void {
+    if format == Format.WAV {
+        return wav.encode_to(w, s);
+    }
+    if format == Format.AIFF {
+        return aiff.encode_to(w, s);
+    }
+    if format == Format.FLAC {
+        return flac.encode_to(w, s, flac.DEFAULT);
+    }
+    return error.Unsupported;
+}
+
 /// Reads and decodes a sound file.
 pub fn load(path: []u8) !audio.Sound {
     let f = io.open(path)!;
     defer f.close();
-    let data = f.reader().read_all()!;
-    defer mem.free(data);
-    return decode(data);
+    return decode_from(f.reader());
 }
 
 /// Encodes a sound in the format its file name's extension names, and
-/// writes the file.
+/// writes the file as it is encoded (on an error after the file is
+/// created, what was written so far stays).
 pub fn save(path: []u8, s: *audio.Sound) !void {
     let format = from_extension(path);
-    if format == Format.UNKNOWN {
+    if (format != Format.WAV) and (format != Format.AIFF) and (format != Format.FLAC) {
         return error.Unsupported;
     }
-    let data = encode(s, format)!;
-    defer mem.free(data);
     let f = io.create(path)!;
     defer f.close();
-    f.writer().write_all(data)!;
+    let mut bw = io.BufWriter.init(f.writer());
+    encode_to(bw.writer(), s, format)!;
+    bw.flush()!;
 }
 
 test "every writable format" {
@@ -182,6 +205,14 @@ test "every writable format" {
         let mut back = decode(enc)!;
         defer back.deinit();
         @expect_eq(back.data[..], s.data[..]);
+        let mut sw = strs.String.init();
+        defer sw.deinit();
+        encode_to(sw.writer(), &s, f)!;
+        @expect_eq(sw.bytes(), enc);
+        let mut sr = io.SliceReader.init(enc);
+        let mut back2 = decode_from(sr.reader())!;
+        defer back2.deinit();
+        @expect_eq(back2.data[..], s.data[..]);
     }
     @expect(from_extension("a/b.Flac") == Format.FLAC);
     @expect(from_extension("x.ogg") == Format.VORBIS);
@@ -189,4 +220,31 @@ test "every writable format" {
     @expect(from_extension("x.opus") == Format.OPUS);
     @expect(from_extension("x.m4a") == Format.AAC);
     @expect(from_extension("noext") == Format.UNKNOWN);
+}
+
+test "save and load" {
+    let mut s = audio.Sound.init(20000, 2, 32000, audio.SampleFormat.S24)!;
+    defer s.deinit();
+    for i in @as(usize, 0)..s.len() {
+        s.set_sample(i, @float_from_int(f64, (i * 37) % 200) / 100.0 - 1.0);
+    }
+    let dir = fs.make_temp_dir("audio")!;
+    defer mem.free(dir);
+    let names: [3][]u8 = ["/a.wav", "/a.aiff", "/a.flac"];
+    let fmts: [3]Format = [Format.WAV, Format.AIFF, Format.FLAC];
+    for k in @as(usize, 0)..3 {
+        let mut p = strs.String.from(dir)!;
+        defer p.deinit();
+        p.push_str(names[k])!;
+        save(p.bytes(), &s)!;
+        let file = fs.read_file(p.bytes())!;
+        defer mem.free(file);
+        let enc = encode(&s, fmts[k])!;
+        defer mem.free(enc);
+        @expect_eq(file, enc);
+        let mut back = load(p.bytes())!;
+        defer back.deinit();
+        @expect_eq(back.data[..], s.data[..]);
+    }
+    fs.remove_all(dir)!;
 }

@@ -3,6 +3,7 @@
 //
 //     let packed = brotli.compress(data, 9)!;          // quality 1..11; the caller frees
 //     let back = brotli.decompress(packed, 1 << 30)!;  // at most 1 GiB out
+//     brotli.compress_to(w, data, 9)!;                 // to an io.Writer
 //
 // decompress implements the whole format: every window size, compressed,
 // uncompressed and metadata meta-blocks, simple and complex prefix codes,
@@ -22,6 +23,7 @@
 // =============================================================================
 
 import "../collections/vec.ph" as vec;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
@@ -1189,7 +1191,7 @@ fn dist_code(d: u32, extra: *mut u32, nbits: *mut u32) u32 {
 /// caller frees the result.
 pub fn compress(data: []u8, quality: u32) ![]mut u8 {
     let mut out = strs.String.init();
-    encode(data, quality, &mut out) catch |e| {
+    compress_to(out.writer(), data, quality) catch |e| {
         out.deinit();
         return e;
     };
@@ -1199,9 +1201,15 @@ pub fn compress(data: []u8, quality: u32) ![]mut u8 {
 const WBITS: u32 = 22;
 const EHASH: usize = 1 << 17;
 
-fn encode(data: []u8, quality: u32, out: *mut strs.String) !void {
+/// Compresses data as a Brotli stream (see compress) and writes it to dst
+/// a meta-block (at most 1 MiB of input) at a time, as each is made.
+/// Meta-blocks are not byte aligned: a block's last bits go out with the
+/// next one.
+pub fn compress_to(dst: io.Writer, data: []u8, quality: u32) !void {
     let q = @max(@min(quality, 11), 1);
-    let mut w = BitW.{ out: out, acc: 0, n: 0 };
+    let mut ob = strs.String.init();
+    defer ob.deinit();
+    let mut w = BitW.{ out: &mut ob, acc: 0, n: 0 };
     // the window: 1, then 3 bits of WBITS - 17
     w.add(1, 1)!;
     w.add(WBITS - 17, 3)!;
@@ -1292,11 +1300,14 @@ fn encode(data: []u8, quality: u32, out: *mut strs.String) !void {
             ring_after_stored(&mut ring);
         }
         start = end;
+        dst.write_all(ob.bytes())!;
+        ob.clear();
     }
     // the last, empty meta-block
     w.add(1, 1)!;
     w.add(1, 1)!;
     w.align()!;
+    dst.write_all(ob.bytes())!;
 }
 
 // (A stored meta-block leaves the ring of distances alone.)
@@ -1485,6 +1496,34 @@ test "round trips" {
         defer mem.free(d);
         @expect_eq(d, input);
     }
+    // compress_to: the same bytes, meta-block by meta-block (two here: one
+    // compressed, one stored)
+    let mut big = strs.String.init();
+    defer big.deinit();
+    for k in @as(usize, 0)..1100000 {
+        x = (x *% 1103515245) +% 12345;
+        if k < 1000000 {
+            big.push('a' + @truncate(u8, (x >> 16) % 5))!;
+        } else {
+            big.push(@truncate(u8, x >> 16))!;
+        }
+    }
+    let c = compress(big.bytes(), 1)!;
+    defer mem.free(c);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    compress_to(out.writer(), big.bytes(), 1)!;
+    @expect_eq(out.bytes(), c);
+    let back = decompress(c, big.len)!;
+    defer mem.free(back);
+    @expect_eq(back, big.bytes());
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    compress_to(bw.writer(), rnd.bytes(), 1) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "damaged input" {

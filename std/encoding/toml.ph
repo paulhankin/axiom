@@ -7,6 +7,7 @@
 //     for t in doc.root.get("products")!.as_array()! { ... }
 //
 //     let s = toml.stringify(doc.root)!;   // mem.free
+//     toml.stringify_to(w, doc.root)!;     // to an io.Writer
 //
 // Tables keep their keys in the order they were first defined. Strings are
 // copied out of the input, so the input may be freed. Dates and times are
@@ -1368,15 +1369,23 @@ fn set_info(info: *mut ErrorInfo, text: []u8, off: usize, msg: []u8) void {
 /// of scalars are written as key = value lines, subtables as [sections],
 /// arrays of tables as [[sections]].
 pub fn stringify(root: Value) ![]mut u8 {
-    let ms = root.as_table()!;
     let mut s = strs.String.init();
-    let mut path = vec.Vec.[[]u8].init();
-    defer path.deinit();
-    write_table(&mut s, ms, &mut path) catch |e| {
+    stringify_to(s.writer(), root) catch |e| {
         s.deinit();
         return e;
     };
     return s.take();
+}
+
+/// Writes a table as a TOML document (see stringify) to w, through a 4 KB
+/// buffer flushed before returning.
+pub fn stringify_to(w: io.Writer, root: Value) !void {
+    let ms = root.as_table()!;
+    let mut path = vec.Vec.[[]u8].init();
+    defer path.deinit();
+    let mut bw = io.BufWriter.init(w);
+    write_table(bw.writer(), ms, &mut path)!;
+    bw.flush()!;
 }
 
 fn is_table_array(v: Value) bool {
@@ -1397,8 +1406,7 @@ fn is_section(v: Value) bool {
     }
 }
 
-fn write_table(s: *mut strs.String, ms: []Member, path: *mut vec.Vec.[[]u8]) !void {
-    let w = s.writer();
+fn write_table(w: io.Writer, ms: []Member, path: *mut vec.Vec.[[]u8]) !void {
     for m in ms {
         if not is_section(m.value) {
             write_key(w, m.key)!;
@@ -1417,14 +1425,14 @@ fn write_table(s: *mut strs.String, ms: []Member, path: *mut vec.Vec.[[]u8]) !vo
                 w.write_all("\n[")!;
                 write_path(w, path.items())!;
                 w.write_all("]\n")!;
-                write_table(s, sub, path)!;
+                write_table(w, sub, path)!;
             }
             .Array(xs) => {
                 for x in xs {
                     w.write_all("\n[[")!;
                     write_path(w, path.items())!;
                     w.write_all("]]\n")!;
-                    write_table(s, x.as_table()!, path)!;
+                    write_table(w, x.as_table()!, path)!;
                 }
             }
             else => {}
@@ -1705,6 +1713,13 @@ test "values, paths and writing" {
     @expect_eq(out, out2);
     @expect(strs.contains(out, "[[products]]\nname = \"Nail\"\nsku = 16\n"));
     @expect(strs.contains(out, "dob = 1979-05-27T07:32:00-08:00"));
+    let mut sw = strs.String.init();
+    defer sw.deinit();
+    stringify_to(sw.writer(), doc.root)!;
+    @expect_eq(sw.bytes(), out);
+    let mut small: [20]u8 = [0; 20];
+    let mut bw = io.BufferWriter.init(small[..]);
+    @expect(fails_with(stringify_to(bw.writer(), doc.root), error.NoSpaceLeft));
     let mut info = ErrorInfo.{ offset: 0, line: 0, column: 0, message: "" };
     _ = parse_with("a = 1\nb = @\n", &mut info) catch |e| {
         @expect_eq(e, error.SyntaxError);
@@ -1712,6 +1727,13 @@ test "values, paths and writing" {
         return;
     };
     @trap();
+}
+
+fn fails_with(r: !void, want: error) bool {
+    r catch |e| {
+        return e == want;
+    };
+    return false;
 }
 
 test "hostile nesting" {

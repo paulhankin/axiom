@@ -4,6 +4,7 @@
 //     let mut s = wav.decode(bytes)!;
 //     defer s.deinit();
 //     let out = wav.encode(&s)!;   // mem.free it
+//     wav.encode_to(w, &s)!;       // or to an io.Writer
 //
 // Decoding reads integer PCM of 8 to 32 bits (any valid-bits count in its
 // container), 32- and 64-bit float, A-law and mu-law (as S16), plain or
@@ -14,7 +15,9 @@
 // =============================================================================
 
 import "../audio.ph" as audio;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
+import "../str.ph" as strs;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
 
@@ -215,10 +218,21 @@ struct Out {
     }
 }
 
-pub fn encode(s: *audio.Sound) ![]mut u8 {
+// The sizes of the parts of a sound's encoding.
+struct Layout {
+    width: usize,  // bytes per sample
+    data_len: u64,
+    ext: bool,
+    float: bool,
+    fmt_len: usize,
+    pad: usize,
+    big: bool,  // RF64
+    total: u64,
+}
+
+fn layout(s: *audio.Sound) Layout {
     let width = @as(usize, audio.bits(s.format)) / 8;
-    let n = s.len();
-    let data_len = @as(u64, n) * @as(u64, width);
+    let data_len = @as(u64, s.len()) * @as(u64, width);
     let ext = s.channels > 2;
     let float = audio.is_float(s.format);
     let mut fmt_len: usize = 16;
@@ -232,39 +246,60 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
         head += 12;  // fact
     }
     let pad = @truncate(usize, data_len & 1);
-    let mut total64 = @as(u64, head + 8 + pad) + data_len;
-    let big = total64 > 0xffffffff;
+    let mut total = @as(u64, head + 8 + pad) + data_len;
+    let big = total > 0xffffffff;
     if big {
-        total64 += 36;  // ds64
+        total += 36;  // ds64
     }
-    if total64 > @as(u64, @max_value(usize)) {
+    return Layout.{ width: width, data_len: data_len, ext: ext, float: float, fmt_len: fmt_len, pad: pad, big: big,
+                    total: total };
+}
+
+/// The WAV file for a sound, in new memory (free it with mem.free).
+pub fn encode(s: *audio.Sound) ![]mut u8 {
+    let total = layout(s).total;
+    if total > @as(u64, @max_value(usize)) {
         return error.TooLarge;
     }
-    let total = @truncate(usize, total64);
-    let buf = mem.alloc.[u8](total)!;
-    let mut o = Out.{ b: buf, n: 0 };
-    if big {
+    let mut out = strs.String.with_capacity(@truncate(usize, total))!;
+    encode_to(out.writer(), s) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// Writes the WAV file for a sound to w: the header in one write, then the
+/// samples (straight from the sound, or 24-bit ones converted 3 KB at a
+/// time).
+pub fn encode_to(w: io.Writer, s: *audio.Sound) !void {
+    let l = layout(s);
+    let width = l.width;
+    let n = s.len();
+    let mut hb: [128]u8 = [0; 128];
+    let mut o = Out.{ b: hb[..], n: 0 };
+    if l.big {
         o.bytes("RF64");
         o.u32le(0xffffffff);
         o.bytes("WAVE");
         o.bytes("ds64");
         o.u32le(28);
-        o.u64le(@as(u64, total) - 8);
-        o.u64le(data_len);
+        o.u64le(l.total - 8);
+        o.u64le(l.data_len);
         o.u64le(@as(u64, s.frames));
         o.u32le(0);  // no table
     } else {
         o.bytes("RIFF");
-        o.u32le(@truncate(u32, total - 8));
+        o.u32le(@truncate(u32, l.total - 8));
         o.bytes("WAVE");
     }
     o.bytes("fmt ");
-    o.u32le(@truncate(u32, fmt_len));
+    o.u32le(@truncate(u32, l.fmt_len));
     let mut tag = TAG_PCM;
-    if float {
+    if l.float {
         tag = TAG_FLOAT;
     }
-    if ext {
+    if l.ext {
         o.u16le(TAG_EXTENSIBLE);
     } else {
         o.u16le(tag);
@@ -274,7 +309,7 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
     o.u32le(@truncate(u32, @as(u64, s.rate) * @as(u64, s.channels * width)));
     o.u16le(@truncate(u32, s.channels * width));
     o.u16le(@truncate(u32, width * 8));
-    if ext {
+    if l.ext {
         o.u16le(22);
         o.u16le(@truncate(u32, width * 8));
         o.u32le(channel_mask(s.channels));
@@ -282,37 +317,42 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
         o.u32le(tag);
         let rest: [12]u8 = [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71];
         o.bytes(rest[..]);
-    } else if float {
+    } else if l.float {
         o.u16le(0);
     }
-    if float {
+    if l.float {
         o.bytes("fact");
         o.u32le(4);
         o.u32le(@truncate(u32, @min(@as(u64, s.frames), 0xffffffff)));
     }
     o.bytes("data");
-    if big {
+    if l.big {
         o.u32le(0xffffffff);
     } else {
-        o.u32le(@truncate(u32, data_len));
+        o.u32le(@truncate(u32, l.data_len));
     }
+    w.write_all(hb[..o.n])!;
     if s.format == audio.SampleFormat.S24 {
         let src = s.samples_i32();
-        for i in @as(usize, 0)..n {
-            let v = @bit_cast(u32, src[i]);
-            buf[o.n] = @truncate(u8, v);
-            buf[o.n + 1] = @truncate(u8, v >> 8);
-            buf[o.n + 2] = @truncate(u8, v >> 16);
-            o.n += 3;
+        let mut buf: [3072]u8 = [0; 3072];
+        let mut i: usize = 0;
+        while i < n {
+            let k = @min(n - i, 1024);
+            for j in @as(usize, 0)..k {
+                let v = @bit_cast(u32, src[i + j]);
+                buf[3 * j] = @truncate(u8, v);
+                buf[(3 * j) + 1] = @truncate(u8, v >> 8);
+                buf[(3 * j) + 2] = @truncate(u8, v >> 16);
+            }
+            w.write_all(buf[..3 * k])!;
+            i += k;
         }
     } else {
-        o.bytes(s.data[..n * width]);
+        w.write_all(s.data[..n * width])!;
     }
-    if pad != 0 {
-        buf[o.n] = 0;
-        o.n += 1;
+    if l.pad != 0 {
+        w.write_all("\x00")!;
     }
-    return buf;
 }
 
 test "round trips every format" {
@@ -329,6 +369,10 @@ test "round trips every format" {
             let enc = encode(&s)!;
             defer mem.free(enc);
             @expect(is_wav(enc));
+            let mut sw = strs.String.init();
+            defer sw.deinit();
+            encode_to(sw.writer(), &s)!;
+            @expect_eq(sw.bytes(), enc);
             let mut back = decode(enc)!;
             defer back.deinit();
             @expect(back.format == f);
@@ -338,6 +382,18 @@ test "round trips every format" {
             @expect_eq(back.data[..], s.data[..]);
         }
     }
+}
+
+test "encode_to passes on the writer's errors" {
+    let mut s = audio.Sound.init(5000, 2, 8000, audio.SampleFormat.S24)!;
+    defer s.deinit();
+    let mut small: [4000]u8 = [0; 4000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &s) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "g711" {

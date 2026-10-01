@@ -4,10 +4,12 @@
 //
 //     let s = base32.encode_alloc(data, base32.STANDARD)!;   // mem.free
 //     let b = base32.decode_alloc(s, base32.STANDARD)!;
+//     base32.encode_to(w, data, base32.STANDARD)!;          // to an io.Writer
 //
 // Decoding accepts either case and skips line breaks.
 // =============================================================================
 
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 
 error { InvalidBase32, NoSpaceLeft, OutOfMemory }
@@ -63,6 +65,17 @@ pub fn encode_alloc(data: []u8, enc: Encoding) ![]mut u8 {
     let out = mem.alloc.[u8](encoded_len(data.len, enc))!;
     _ = encode(data, out, enc);
     return out;
+}
+
+/// Encodes data to w, a kilobyte of text at a time.
+pub fn encode_to(w: io.Writer, data: []u8, enc: Encoding) !void {
+    let mut buf: [1024]u8 = [0; 1024];
+    let mut i: usize = 0;
+    while (data.len - i) > 640 {
+        w.write_all(encode(data[i..i + 640], buf[..], enc))!;
+        i += 640;
+    }
+    w.write_all(encode(data[i..], buf[..], enc))!;
 }
 
 fn value_of(c0: u8, enc: *Encoding) u32 {
@@ -166,6 +179,29 @@ test "rfc 4648 vectors" {
     let back = decode_alloc(e, STANDARD)!;
     defer mem.free(back);
     @expect_eq(back, "hello");
+}
+
+test "encode_to matches encode_alloc" {
+    let mut data: [1500]u8 = [0; 1500];
+    for i in @as(usize, 0)..data.len {
+        data[i] = @truncate(u8, (i * 89) + 7);
+    }
+    let lens: [5]usize = [0, 3, 640, 641, 1500];
+    for n in lens {
+        let a = encode_alloc(data[..n], STANDARD)!;
+        defer mem.free(a);
+        let mut out: [2500]u8 = [0; 2500];
+        let mut bw = io.BufferWriter.init(out[..]);
+        encode_to(bw.writer(), data[..n], STANDARD)!;
+        @expect_eq(bw.written(), a);
+    }
+    let mut small: [10]u8 = [0; 10];
+    let mut sw = io.BufferWriter.init(small[..]);
+    encode_to(sw.writer(), data[..], HEX) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 fn bad(r: ![]u8) bool {

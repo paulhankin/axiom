@@ -9,6 +9,7 @@
 //     for v in all.documents { ... }
 //
 //     let s = yaml.stringify(value)!;                // block-style YAML (mem.free)
+//     yaml.stringify_to(w, value)!;                  // to an io.Writer
 //
 // Scalars are resolved with the YAML 1.2 core schema: null (~, null, empty),
 // booleans (true/false in three cases), integers (decimal, 0o octal, 0x
@@ -2436,11 +2437,19 @@ pub fn parse_all_with(text: []u8, info: *mut ErrorInfo) !Stream {
 /// when that reads back as the same string, and double-quoted otherwise.
 pub fn stringify(v: json.Value) ![]mut u8 {
     let mut s = strs.String.init();
-    write_block(s.writer(), v, 0, 0) catch |e| {
+    stringify_to(s.writer(), v) catch |e| {
         s.deinit();
         return e;
     };
     return s.take();
+}
+
+/// Writes a value as block-style YAML (see stringify) to w, through a 4 KB
+/// buffer flushed before returning.
+pub fn stringify_to(w: io.Writer, v: json.Value) !void {
+    let mut bw = io.BufWriter.init(w);
+    write_block(bw.writer(), v, 0, 0)!;
+    bw.flush()!;
 }
 
 fn nonempty_collection(v: json.Value) bool {
@@ -2898,4 +2907,15 @@ test "writing round trips" {
     @expect(strs.contains(out, "title: \"true\"\n"));
     @expect(strs.contains(out, "- plain text\n"));
     @expect(strs.contains(out, "f: 2.0\n"));
+    let mut sw = strs.String.init();
+    defer sw.deinit();
+    stringify_to(sw.writer(), d.root)!;
+    @expect_eq(sw.bytes(), out);
+    let mut small: [16]u8 = [0; 16];
+    let mut bw = io.BufferWriter.init(small[..]);
+    stringify_to(bw.writer(), d.root) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

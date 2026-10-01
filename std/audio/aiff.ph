@@ -4,6 +4,7 @@
 //     let mut s = aiff.decode(bytes)!;
 //     defer s.deinit();
 //     let out = aiff.encode(&s)!;   // mem.free it
+//     aiff.encode_to(w, &s)!;       // or to an io.Writer
 //
 // Decoding reads AIFF (big-endian integers of 1 to 32 bits) and AIFF-C
 // with the NONE, twos, sowt (little-endian), in24, in32, 42ni, 23ni, raw
@@ -13,7 +14,9 @@
 // =============================================================================
 
 import "../audio.ph" as audio;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
+import "../str.ph" as strs;
 import "wav.ph" as wav;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
@@ -216,25 +219,52 @@ fn put32(b: []mut u8, at: usize, v: u32) void {
     b[at + 3] = @truncate(u8, v);
 }
 
+// The length of a sound's COMM chunk body, and of its whole file
+// (TooLarge if that does not fit AIFF's 32-bit sizes).
+fn comm_len(s: *audio.Sound) usize {
+    if audio.is_float(s.format) {
+        return 24;  // + compression type and an empty name, padded
+    }
+    return 18;
+}
+
+fn file_len(s: *audio.Sound) !u64 {
+    let width = @as(usize, audio.bits(s.format)) / 8;
+    let data_len = @as(u64, s.len()) * @as(u64, width);
+    let mut head: usize = 12;
+    if audio.is_float(s.format) {
+        head += 12;  // FVER
+    }
+    head += 8 + comm_len(s) + 16;  // COMM, SSND header
+    let total = (@as(u64, head) + data_len) + (data_len & 1);
+    if (total > 0xffffffff) or (s.frames > 0xffffffff) {
+        return error.TooLarge;
+    }
+    return total;
+}
+
+/// The AIFF (or, for float samples, AIFF-C) file for a sound, in new memory
+/// (free it with mem.free).
 pub fn encode(s: *audio.Sound) ![]mut u8 {
+    let mut out = strs.String.with_capacity(@truncate(usize, file_len(s)!))!;
+    encode_to(out.writer(), s) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// Writes the AIFF (or AIFF-C) file for a sound to w: the header in one
+/// write, then the samples converted to big-endian 4 KB at a time.
+pub fn encode_to(w: io.Writer, s: *audio.Sound) !void {
+    let total = @truncate(usize, file_len(s)!);
     let width = @as(usize, audio.bits(s.format)) / 8;
     let n = s.len();
     let data_len = @as(u64, n) * @as(u64, width);
     let float = audio.is_float(s.format);
-    let mut comm_len: usize = 18;
-    let mut head: usize = 12;
-    if float {
-        comm_len = 24;  // + compression type and an empty name, padded
-        head += 12;     // FVER
-    }
-    head += 8 + comm_len + 16;  // COMM, SSND header
-    let pad = @truncate(usize, data_len & 1);
-    let total64 = (@as(u64, head) + data_len) + @as(u64, pad);
-    if (total64 > 0xffffffff) or (s.frames > 0xffffffff) {
-        return error.TooLarge;
-    }
-    let total = @truncate(usize, total64);
-    let b = mem.alloc_zeroed.[u8](total)!;
+    let comm = comm_len(s);
+    let mut hb: [80]u8 = [0; 80];
+    let b = hb[..];
     let mut o: usize = 0;
     @mem_copy(b[0..4], "FORM");
     put32(b, 4, @truncate(u32, total - 8));
@@ -249,7 +279,7 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
         o = 12;
     }
     @mem_copy(b[o..o + 4], "COMM");
-    put32(b, o + 4, @truncate(u32, comm_len));
+    put32(b, o + 4, @truncate(u32, comm));
     b[o + 8] = @truncate(u8, s.channels >> 8);
     b[o + 9] = @truncate(u8, s.channels);
     put32(b, o + 10, @truncate(u32, s.frames));
@@ -265,14 +295,21 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
         }
         // an empty Pascal string, padded to even length: two zero bytes
     }
-    o += 8 + comm_len;
+    o += 8 + comm;
     @mem_copy(b[o..o + 4], "SSND");
     put32(b, o + 4, @truncate(u32, data_len + 8));
     o += 16;  // offset and block size: 0
+    w.write_all(b[..o])!;
+    let mut buf: [4096]u8 = [0; 4096];
+    let mut k: usize = 0;
     for i in @as(usize, 0)..n {
+        if (k + width) > buf.len {
+            w.write_all(buf[..k])!;
+            k = 0;
+        }
         if s.format == audio.SampleFormat.U8 {
-            b[o] = s.data[i] ^ 0x80;
-            o += 1;
+            buf[k] = s.data[i] ^ 0x80;
+            k += 1;
             continue;
         }
         let mut v: u64 = 0;
@@ -285,12 +322,20 @@ pub fn encode(s: *audio.Sound) ![]mut u8 {
         } else {
             v = @bit_cast(u64, s.samples_f64()[i]);
         }
-        for k in @as(usize, 0)..width {
-            b[o + k] = @truncate(u8, v >> @truncate(u64, 8 * (width - 1 - k)));
+        for j in @as(usize, 0)..width {
+            buf[k + j] = @truncate(u8, v >> @truncate(u64, 8 * (width - 1 - j)));
         }
-        o += width;
+        k += width;
     }
-    return b;
+    if (data_len & 1) != 0 {
+        if k == buf.len {
+            w.write_all(buf[..k])!;
+            k = 0;
+        }
+        buf[k] = 0;  // the pad byte
+        k += 1;
+    }
+    w.write_all(buf[..k])!;
 }
 
 test "round trips every format" {
@@ -307,6 +352,10 @@ test "round trips every format" {
             let enc = encode(&s)!;
             defer mem.free(enc);
             @expect(is_aiff(enc));
+            let mut sw = strs.String.init();
+            defer sw.deinit();
+            encode_to(sw.writer(), &s)!;
+            @expect_eq(sw.bytes(), enc);
             let mut back = decode(enc)!;
             defer back.deinit();
             @expect(back.format == f);
@@ -316,6 +365,18 @@ test "round trips every format" {
             @expect_eq(back.data[..], s.data[..]);
         }
     }
+}
+
+test "encode_to passes on the writer's errors" {
+    let mut s = audio.Sound.init(5000, 2, 8000, audio.SampleFormat.S24)!;
+    defer s.deinit();
+    let mut small: [4000]u8 = [0; 4000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &s) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "sample rates" {

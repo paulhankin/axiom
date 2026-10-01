@@ -3,6 +3,7 @@
 //
 //     let packed = bzip2.compress(data, 9)!;          // block size 1..9 (x 100 kB)
 //     let back = bzip2.decompress(packed, 1 << 30)!;  // at most 1 GiB out
+//     bzip2.compress_to(w, data, 9)!;                 // to an io.Writer
 //
 // decompress reads bzip2 streams, one after another (as bzip2 does for
 // concatenated files), checking every block's CRC and the stream CRC.
@@ -17,6 +18,7 @@
 // =============================================================================
 
 import "../collections/vec.ph" as vec;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
@@ -701,17 +703,22 @@ struct BitWriter {
 /// Compresses data with blocks of level x 100 kB (1 to 9); the caller
 /// frees the result.
 pub fn compress(data: []u8, level: u32) ![]mut u8 {
-    let lv = @max(@min(level, 9), 1);
     let mut out = strs.String.init();
-    encode(data, lv, &mut out) catch |e| {
+    compress_to(out.writer(), data, level) catch |e| {
         out.deinit();
         return e;
     };
     return out.take();
 }
 
-fn encode(data: []u8, level: u32, out: *mut strs.String) !void {
-    let mut w = BitWriter.{ out: out, acc: 0, n: 0 };
+/// Compresses data with blocks of level x 100 kB (1 to 9) and writes it
+/// to dst a block at a time, as each is compressed (blocks are not byte
+/// aligned: a block's last bits go out with the next one).
+pub fn compress_to(dst: io.Writer, data: []u8, level0: u32) !void {
+    let level = @max(@min(level0, 9), 1);
+    let mut ob = strs.String.init();
+    defer ob.deinit();
+    let mut w = BitWriter.{ out: &mut ob, acc: 0, n: 0 };
     w.put(8, 'B')!;
     w.put(8, 'Z')!;
     w.put(8, 'h')!;
@@ -757,11 +764,14 @@ fn encode(data: []u8, level: u32, out: *mut strs.String) !void {
         w.put(24, 0x265359)!;
         w.put(32, crc)!;
         encode_block(&mut w, block.items())!;
+        dst.write_all(ob.bytes())!;
+        ob.clear();
     }
     w.put(24, 0x177245)!;
     w.put(24, 0x385090)!;
     w.put(32, combined)!;
     w.flush()!;
+    dst.write_all(ob.bytes())!;
 }
 
 // The Burrows-Wheeler transform of s (cyclic rotations, sorted by prefix
@@ -1200,6 +1210,30 @@ test "round trips" {
         defer mem.free(d);
         @expect_eq(d, input);
     }
+    // compress_to: the same bytes, block by block (three blocks here)
+    let mut text = strs.String.init();
+    defer text.deinit();
+    let mut x: u32 = 7;
+    for _k in @as(usize, 0)..230000 {
+        x = (x *% 1103515245) +% 12345;
+        text.push('a' + @truncate(u8, (x >> 16) % 7))!;
+    }
+    let c = compress(text.bytes(), 1)!;
+    defer mem.free(c);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    compress_to(out.writer(), text.bytes(), 1)!;
+    @expect_eq(out.bytes(), c);
+    let back = decompress(c, text.len)!;
+    defer mem.free(back);
+    @expect_eq(back, text.bytes());
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    compress_to(bw.writer(), text.bytes(), 1) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "damaged input" {

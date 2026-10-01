@@ -2,6 +2,7 @@
 // std/encoding/msgpack.ph - MessagePack: a compact binary form of JSON-like data.
 //
 //     let bytes = msgpack.encode(msgpack.Value.Str("hi"))!;   // (the caller frees)
+//     msgpack.encode_to(w, value)!;                        // to an io.Writer
 //
 //     let mut s = strs.String.init();                      // streaming
 //     let mut w = msgpack.Writer.init(s.writer());
@@ -505,12 +506,20 @@ pub struct Writer {
 /// The MessagePack encoding of a value; the caller frees it.
 pub fn encode(v: Value) ![]mut u8 {
     let mut s = strs.String.init();
-    let mut w = Writer.init(s.writer());
-    w.value(v) catch |e| {
+    encode_to(s.writer(), v) catch |e| {
         s.deinit();
         return e;
     };
     return s.take();
+}
+
+/// Writes the MessagePack encoding of a value to w, through a 4 KB buffer
+/// flushed before returning.
+pub fn encode_to(w: io.Writer, v: Value) !void {
+    let mut bw = io.BufWriter.init(w);
+    let mut mw = Writer.init(bw.writer());
+    mw.value(v)!;
+    bw.flush()!;
 }
 
 /// Converts JSON text to MessagePack; the caller frees the result.
@@ -1062,6 +1071,21 @@ test "writing and reading" {
     j.clear();
     to_json(j.writer(), d2.root)!;
     @expect_eq(j.bytes(), "{\"a\":[1,2.5,\"x\",null,true],\"b\":{}}");
+    // encode_to gives encode's bytes, and passes on the writer's errors
+    let again = encode(d2.root)!;
+    defer mem.free(again);
+    @expect_eq(again, mp);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    encode_to(out.writer(), doc.root)!;
+    @expect_eq(out.bytes(), s.bytes());
+    let mut small: [8]u8 = [0; 8];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), doc.root) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 fn fails(r: !Value) bool {
