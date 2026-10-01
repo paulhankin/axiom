@@ -251,14 +251,30 @@ pub fn load(path: []u8) !image.Image {
 }
 
 /// Encodes an image in the format its file name's extension names, and
-/// writes the file (streaming the encoding into it).
+/// writes the file as it is encoded. If that fails, the file is removed.
 pub fn save(path: []u8, img: *image.Image, opts: Options) !void {
     let format = from_extension(path);
     if format == Format.UNKNOWN {
         return error.Unsupported;
     }
     let f = io.create(path)!;
-    defer f.close();
+    write_file(f, img, format, opts) catch |e| {
+        f.close();
+        fs.remove(path) catch {};
+        return e;
+    };
+    f.close();
+}
+
+fn write_file(f: io.File, img: *image.Image, format: Format, opts: Options) !void {
+    if (format == Format.TIFF) or (format == Format.EXR) {
+        // their encode_to compresses twice (the offsets that come first need
+        // the compressed sizes); in memory it is one pass
+        let b = encode(img, format, opts)!;
+        defer mem.free(b);
+        f.writer().write_all(b)!;
+        return;
+    }
     let mut bw = io.BufWriter.init(f.writer());
     encode_to(bw.writer(), img, format, opts)!;
     bw.flush()!;
