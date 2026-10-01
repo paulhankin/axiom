@@ -740,7 +740,7 @@ int main(int argc, char **argv) {
         char mf[PATH_MAX];
         snprintf(mf, sizeof mf, "%s/axiom.toml", dir);
         if (!file_exists(mf)) {
-            diag_emit_fatal(json, "E9001", input ? arena_printf("'%s' is a directory without a axiom.toml", input)
+            diag_emit_fatal(json, "E9001", input ? arena_printf("'%s' is a directory without an axiom.toml", input)
                                                  : "no input file (and no axiom.toml in the current directory)");
             return 2;
         }

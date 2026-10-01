@@ -2342,7 +2342,7 @@ static void emit_thread_start(void) {
     LLVMTypeRef fty = LLVMFunctionType(T_void, ps, 3, false);
     LLVMValueRef fn = LLVMAddFunction(mod, "axiom_thread_start", fty);
     LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
-                            LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "axiom_thread_start", 21));
+                            LLVMCreateStringAttribute(ctx, "wasm-export-name", 16, "axiom_thread_start", 18));
     vec_push(g_export_names, intern_cstr("axiom_thread_start"));
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);

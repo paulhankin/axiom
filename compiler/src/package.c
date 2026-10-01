@@ -1,6 +1,6 @@
 // package.c - packages (spec §4.6).
 //
-// A package is a directory with a axiom.toml manifest:
+// A package is a directory with an axiom.toml manifest:
 //
 //     [package]
 //     name = "geometry"

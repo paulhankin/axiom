@@ -1955,7 +1955,7 @@ stacks:
 
 1. **Portability.** It works the same on every engine and OS and needs no debug
    information in the binary.
-2. **Exact source locations.** A call site is recorded as a Axiom source span, not
+2. **Exact source locations.** A call site is recorded as an Axiom source span, not
    as a machine address that must be mapped back to source.
 3. **It doubles as the profiler's stack sampler** (§16.6).
 

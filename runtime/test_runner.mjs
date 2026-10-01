@@ -1,4 +1,4 @@
-// runtime/test_runner.mjs - runs the tests of a Axiom test binary (wasm),
+// runtime/test_runner.mjs - runs the tests of an Axiom test binary (wasm),
 // each in a fresh instance in its own worker, several in parallel.
 //
 //   node runtime/test_runner.mjs tests.wasm [--filter=text] [--timeout=ms]
