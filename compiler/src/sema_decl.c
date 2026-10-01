@@ -37,7 +37,14 @@ static const char *display_path(const char *real) {
             return arena_printf("runtime/%s", real + k + 9);
     }
     size_t n = strlen(g_cwd);
-    if (n && strncmp(real, g_cwd, n) == 0 && real[n] == '/') return real + n + 1;
+    if (n && strncmp(real, g_cwd, n) == 0 && real[n] == '/') {
+        const char *rel = real + n + 1;
+        // std/ and runtime/ name the library's own modules (and prefix their
+        // symbols): another copy in the working directory must not pass for
+        // them
+        if (strncmp(rel, "std/", 4) == 0 || strncmp(rel, "runtime/", 8) == 0) return arena_printf("./%s", rel);
+        return rel;
+    }
     return real;
 }
 

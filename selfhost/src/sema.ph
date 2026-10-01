@@ -147,7 +147,14 @@ fn display_path(real: []u8) []u8 {
     }
     let n = g_cwd.len;
     if (n > 0) and (real.len > n) and u.starts(real, g_cwd) and (real[n] == '/') {
-        return u.dup(real[n + 1..]);
+        let rel = real[n + 1..];
+        // std/ and runtime/ name the library's own modules (and prefix their
+        // symbols): another copy in the working directory must not pass for
+        // them
+        if u.starts(rel, "std/") or u.starts(rel, "runtime/") {
+            return u.cat2("./", rel);
+        }
+        return u.dup(rel);
     }
     return real;
 }

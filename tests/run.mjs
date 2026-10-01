@@ -296,6 +296,38 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   }
 }
 
+// A copy of the standard library under the working directory (as when
+// testing a checkout of std without --std) is not the library: with the
+// address sanitizer, which links the library's std/mem, its modules must not
+// clash with the library's in separate compilation.
+{
+  const name = 'std copy under the working directory [--sanitize=address]';
+  if (!filter || name.includes(filter)) {
+    const dir = path.join(tmp, 'stdcopy');
+    fs.mkdirSync(path.join(dir, 'std'), { recursive: true });
+    fs.copyFileSync(path.join(root, 'std/mem.ph'), path.join(dir, 'std/mem.ph'));
+    fs.writeFileSync(path.join(dir, 'std/app.ph'), [
+      'import "mem.ph" as mem;', '',
+      'export fn main() i32 {',
+      '    let b = mem.alloc.[u8](100) catch return 1;',
+      '    b[99] = 7;',
+      '    let v = b[99];',
+      '    mem.free(b);',
+      '    return @as(i32, v) - 7;',
+      '}', ''].join('\n'));
+    const out = path.join(tmp, 'stdcopy-prog' + (native ? '' : '.wasm'));
+    const c = spawnSync(compiler, ['build', 'std/app.ph', '-o', out, '--sanitize=address', '--units=module',
+      ...(native ? [nativeTarget] : [])], { encoding: 'utf8', cwd: dir, env: { ...process.env, PHALANGE_CACHE: path.join(tmp, 'stdcopy-cache') } });
+    let problem = c.status !== 0 ? `build failed:\n${c.stdout}${c.stderr}` : null;
+    if (!problem) {
+      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      if (r.status !== 0) problem = `exit status ${r.status}:\n${r.stderr}`;
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // `phalange fmt` (spec §16.5; the self-hosted compiler only). Each
 // tests/fmt/<name>.ph formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left
