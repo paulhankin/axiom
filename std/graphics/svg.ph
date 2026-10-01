@@ -1474,7 +1474,9 @@ fn is_hidden_element(name: []u8) bool {
     return false;
 }
 
-const MAX_NESTING: usize = 400;
+// Elements nest at most this deep (each level is a few frames of stack:
+// deeper documents fail with TooComplex rather than exhaust a 1 MiB stack).
+const MAX_NESTING: usize = 256;
 
 fn walk(b: *mut Builder, e: *xml.Element, parent: *Style, ctm: draw.Affine, depth: usize) !void {
     if depth > MAX_NESTING {
@@ -3521,6 +3523,21 @@ test "limits" {
     }
     s.push_str("</svg>")!;
     @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    // as deep as allowed: parsed and rendered
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>")!;
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("<g>")!;
+    }
+    s.push_str("<rect width='4' height='4' fill='#f00'/>")!;
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    let mut d = parse(s.bytes())!;
+    defer d.deinit();
+    let mut img = render_image(&d, 4, 4)!;
+    defer img.deinit();
 }
 
 fn fails_doc(r: !Document, want: error) bool {
