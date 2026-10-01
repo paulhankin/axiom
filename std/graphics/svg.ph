@@ -1,0 +1,3573 @@
+// =============================================================================
+// std/graphics/svg.ph - SVG 1.1: writing documents from draw.Paths and paints, and
+// reading static documents into a scene that renders onto a draw.Canvas, an
+// image or a pdf.Page.
+//
+//     let mut w = svg.Writer.begin(out, 200.0, 100.0)!;     // out: an io.Writer
+//     defer w.deinit();
+//     w.fill(&path, draw.Paint.solid(red), draw.FillRule.NONZERO)!;
+//     w.stroke(&path, draw.Paint.linear(0.0, 0.0, 200.0, 0.0, stops[..]), draw.Stroke.width(3.0))!;
+//     w.finish()!;
+//
+//     let mut doc = svg.parse(text)!;                        // reading
+//     defer doc.deinit();
+//     let mut img = svg.render_image(&doc, 512, 512)!;      // RGBA, transparent background
+//     svg.render(&doc, &mut canvas, x, y, w, h)!;            // into a rectangle of a canvas
+//     svg.render_page(&doc, &mut page, x, y, w, h)!;         // onto a PDF page
+//
+// Writing (Writer): paths as path data, fills (nonzero, even-odd) and strokes
+// (width, caps, joins, miter limit, dashes) in solid colours with opacity and
+// linear and radial gradients (with their spread and transform), groups with
+// a transform, an opacity or a clip path, text as plain <text>, and images
+// embedded as PNG data URIs (gradient stops are written as given: viewers
+// interpolate them as sRGB values, std/graphics/draw in linear light).
+// path_data and parse_path_data convert between draw.Paths and path data.
+//
+// Reading (parse): the XML (std/encoding/xml: no external entities) becomes a
+// list of drawing items. Supported: path data (every command; arcs become
+// cubics), rect (with rx/ry), circle, ellipse, line, polyline, polygon, g,
+// svg (nested viewports, clipped), use (of shapes, groups, symbols and svg
+// elements), defs, symbol, switch (its first child), a; transforms;
+// presentation attributes, the style attribute and <style> sheets (type,
+// class, id and universal selectors, compounds, descendant and child
+// combinators, by specificity; !important); fill, stroke, opacity,
+// fill-opacity, stroke-opacity, fill-rule, clip-rule, stroke-width,
+// stroke-linecap, stroke-linejoin, stroke-miterlimit, stroke-dasharray,
+// stroke-dashoffset, color/currentColor, display, visibility; linear and
+// radial gradients with gradientUnits, gradientTransform, spreadMethod and
+// href inheritance; clip-path (its shapes unioned under the first one's
+// clip-rule; clipPathUnits); mask (luminance masks with maskUnits,
+// maskContentUnits and the mask region); viewBox and preserveAspectRatio
+// (on svg, symbol and image); images that are PNG or JPEG data URIs;
+// lengths in every unit (96 pixels an inch) and percentages. Text: <text>
+// and <tspan> with x, y, dx, dy (the first value of a list), font-size and
+// text-anchor (per run), drawn as outlines when RenderOptions gives a font
+// (one font for all text; font-family and font-weight are ignored), and
+// skipped otherwise. Not supported: the focal point of radial gradients
+// (fx, fy), patterns, markers, filters, external references, textPath,
+// and animation.
+//
+// Rendering onto a canvas follows SVG renderers: the document is drawn into
+// an offscreen image where colours blend and gradients interpolate as sRGB
+// values (with colour and opacity interpolated separately), group opacity
+// and masks use offscreen layers, and the result is composited onto the
+// canvas (std/graphics/draw composites in linear light). On a PDF page,
+// group opacity multiplies the opacity of the solid colours inside it,
+// gradients are opaque and masks are ignored. Malformed input gives an
+// error or is skipped as SVG renderers do (a path is drawn up to an error
+// in its data); it never traps. Use elements that multiply past MAX_ITEMS
+// items fail with TooComplex.
+//
+// Sources: Scalable Vector Graphics (SVG) 1.1 (Second Edition), W3C 2011;
+// checked against skia's SVG renderer (std/graphics/svg/testdata, from
+// tools/gen_svg_tests.py: within 2 of 255 away from edges), hand-made
+// documents for what skia does not render, and analytic arc points.
+// =============================================================================
+
+import "../collections/arena.ph" as arena;
+import "../collections/map.ph" as maps;
+import "../collections/vec.ph" as vec;
+import "../encoding/base64.ph" as base64;
+import "../encoding/xml.ph" as xml;
+import "../fmt.ph" as fmt;
+import "../hash.ph" as hash;
+import "../io.ph" as io;
+import "../math.ph" as math;
+import "../mem.ph" as mem;
+import "../os/fs.ph" as files;
+import "../str.ph" as strs;
+import "color.ph" as color;
+import "draw.ph" as draw;
+import "font.ph" as font;
+import "image.ph" as image;
+import "image/jpeg.ph" as jpeg;
+import "image/png.ph" as png;
+import "pdf.ph" as pdf;
+import "svg/css.ph" as css;
+import "svg/path.ph" as pathdata;
+
+error { InvalidSvg, Unsupported, TooComplex, OutOfMemory }
+
+/// The SVG namespace.
+pub let SVG_NS: []u8 = "http://www.w3.org/2000/svg";
+/// The XLink namespace (of xlink:href).
+pub let XLINK_NS: []u8 = "http://www.w3.org/1999/xlink";
+
+/// The most drawing items a document may make (use elements can multiply
+/// them): beyond it, parse fails with TooComplex.
+pub const MAX_ITEMS: usize = 100000;
+
+// -----------------------------------------------------------------------------
+// Path data
+// -----------------------------------------------------------------------------
+
+/// Writes a path as SVG path data (absolute commands).
+pub fn write_path_data(w: io.Writer, p: *draw.Path) !void {
+    return pathdata.write(w, p);
+}
+
+/// A path as SVG path data (free it with mem.free).
+pub fn path_data(p: *draw.Path) ![]mut u8 {
+    let mut s = strs.String.init();
+    pathdata.write(s.writer(), p) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Appends the subpaths of SVG path data to p (arcs as cubic Béziers). On
+/// malformed data, p keeps what came before the error, which is returned.
+pub fn parse_path_data(d: []u8, p: *mut draw.Path) !void {
+    return pathdata.parse(d, p);
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+/// Writes an SVG document: begin, drawing calls, finish.
+pub struct Writer {
+    xw: xml.Writer,
+    out: io.Writer,
+    next_id: u32,
+    groups: usize,
+    buf: strs.String,
+
+    /// Starts a document width by height user units (= CSS pixels) big.
+    pub fn begin(out: io.Writer, width: f64, height: f64) !Writer {
+        let mut w = Writer.{ xw: xml.Writer.init(out), out: out, next_id: 0, groups: 0, buf: strs.String.init() };
+        w.start_document(width, height) catch |e| {
+            w.deinit();
+            return e;
+        };
+        return w;
+    }
+
+    pub fn deinit(self: *mut Writer) void {
+        self.xw.deinit();
+        self.buf.deinit();
+    }
+
+    fn start_document(self: *mut Writer, width: f64, height: f64) !void {
+        self.xw.declaration()!;
+        self.xw.start("svg")!;
+        self.xw.attr("xmlns", SVG_NS)!;
+        self.xw.attr("xmlns:xlink", XLINK_NS)!;
+        self.xw.attr("version", "1.1")!;
+        self.num_attr("width", width)!;
+        self.num_attr("height", height)!;
+        self.buf.clear();
+        let bw = self.buf.writer();
+        bw.write_all("0 0 ")!;
+        pathdata.write_number(bw, width)!;
+        bw.write_all(" ")!;
+        pathdata.write_number(bw, height)!;
+        self.xw.attr("viewBox", self.buf.bytes())!;
+    }
+
+    /// Closes any open groups and the document.
+    pub fn finish(self: *mut Writer) !void {
+        while self.groups > 0 {
+            self.end_group()!;
+        }
+        self.xw.end()!;
+        self.out.write_all("\n")!;
+    }
+
+    fn num_attr(self: *mut Writer, name: []u8, v: f64) !void {
+        let mut nb: [40]u8 = [0; 40];
+        self.xw.attr(name, pathdata.format_number(nb[..], v))!;
+    }
+
+    fn color_attrs(self: *mut Writer, name: []u8, opacity_name: []u8, c: color.Color, alpha: f32) !void {
+        let mut hb: [12]u8 = [0; 12];
+        let mut c8 = c.to_rgba8();
+        c8.a = 255;
+        self.xw.attr(name, color.format_hex(c8, hb[..]))!;
+        let a = c.a * alpha;
+        if a < 1.0 {
+            self.num_attr(opacity_name, @as(f64, @max(a, 0.0)))!;
+        }
+    }
+
+    fn matrix_attr(self: *mut Writer, name: []u8, t: draw.Affine) !void {
+        self.buf.clear();
+        let bw = self.buf.writer();
+        bw.write_all("matrix(")!;
+        let v: [6]f64 = [t.a, t.b, t.c, t.d, t.e, t.f];
+        for i in @as(usize, 0)..6 {
+            if i > 0 {
+                bw.write_all(" ")!;
+            }
+            pathdata.write_number(bw, v[i])!;
+        }
+        bw.write_all(")")!;
+        self.xw.attr(name, self.buf.bytes())!;
+    }
+
+    /// Writes a gradient's definition (if the paint is one), returning its id.
+    fn define_paint(self: *mut Writer, p: draw.Paint) !u32 {
+        if (p.kind != draw.PaintKind.LINEAR) and (p.kind != draw.PaintKind.RADIAL) {
+            if p.kind == draw.PaintKind.IMAGE {
+                return error.Unsupported;
+            }
+            return 0;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.xw.start("defs")!;
+        if p.kind == draw.PaintKind.LINEAR {
+            self.xw.start("linearGradient")!;
+        } else {
+            self.xw.start("radialGradient")!;
+        }
+        let mut ib: [16]u8 = [0; 16];
+        self.xw.attr("id", id_text(ib[..], 'g', id))!;
+        self.xw.attr("gradientUnits", "userSpaceOnUse")!;
+        if p.kind == draw.PaintKind.LINEAR {
+            self.num_attr("x1", p.x0)!;
+            self.num_attr("y1", p.y0)!;
+            self.num_attr("x2", p.x1)!;
+            self.num_attr("y2", p.y1)!;
+        } else {
+            self.num_attr("cx", p.x0)!;
+            self.num_attr("cy", p.y0)!;
+            self.num_attr("r", p.r)!;
+        }
+        if p.spread == draw.Spread.REPEAT {
+            self.xw.attr("spreadMethod", "repeat")!;
+        } else if p.spread == draw.Spread.REFLECT {
+            self.xw.attr("spreadMethod", "reflect")!;
+        }
+        let t = p.transform;
+        if (t.a != 1.0) or (t.b != 0.0) or (t.c != 0.0) or (t.d != 1.0) or (t.e != 0.0) or (t.f != 0.0) {
+            self.matrix_attr("gradientTransform", t)!;
+        }
+        for s in p.stops {
+            self.xw.start("stop")!;
+            self.num_attr("offset", s.offset)!;
+            self.color_attrs("stop-color", "stop-opacity", s.color, 1.0)!;
+            self.xw.end()!;
+        }
+        self.xw.end()!;
+        self.xw.end()!;
+        return id;
+    }
+
+    fn paint_attrs(self: *mut Writer, name: []u8, opacity_name: []u8, p: draw.Paint, id: u32) !void {
+        if id == 0 {
+            return self.color_attrs(name, opacity_name, p.color, 1.0);
+        }
+        let mut ib: [24]u8 = [0; 24];
+        ib[0] = 'u';
+        ib[1] = 'r';
+        ib[2] = 'l';
+        ib[3] = '(';
+        ib[4] = '#';
+        let n = id_text(ib[5..], 'g', id).len;
+        ib[5 + n] = ')';
+        self.xw.attr(name, ib[..n + 6])!;
+    }
+
+    fn path_attr(self: *mut Writer, p: *draw.Path) !void {
+        self.buf.clear();
+        pathdata.write(self.buf.writer(), p)!;
+        self.xw.attr("d", self.buf.bytes())!;
+    }
+
+    /// Fills a path.
+    pub fn fill(self: *mut Writer, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) !void {
+        let id = self.define_paint(paint)!;
+        self.xw.start("path")!;
+        self.path_attr(p)!;
+        self.paint_attrs("fill", "fill-opacity", paint, id)!;
+        if rule == draw.FillRule.EVEN_ODD {
+            self.xw.attr("fill-rule", "evenodd")!;
+        }
+        self.xw.end()!;
+    }
+
+    /// Strokes a path.
+    pub fn stroke(self: *mut Writer, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) !void {
+        let id = self.define_paint(paint)!;
+        self.xw.start("path")!;
+        self.path_attr(p)!;
+        self.xw.attr("fill", "none")!;
+        self.paint_attrs("stroke", "stroke-opacity", paint, id)!;
+        self.num_attr("stroke-width", style.width)!;
+        if style.cap == draw.Cap.ROUND {
+            self.xw.attr("stroke-linecap", "round")!;
+        } else if style.cap == draw.Cap.SQUARE {
+            self.xw.attr("stroke-linecap", "square")!;
+        }
+        if style.join == draw.Join.ROUND {
+            self.xw.attr("stroke-linejoin", "round")!;
+        } else if style.join == draw.Join.BEVEL {
+            self.xw.attr("stroke-linejoin", "bevel")!;
+        }
+        if style.miter_limit != 4.0 {
+            self.num_attr("stroke-miterlimit", @max(style.miter_limit, 1.0))!;
+        }
+        if style.dash.len > 0 {
+            self.buf.clear();
+            let bw = self.buf.writer();
+            for i in @as(usize, 0)..style.dash.len {
+                if i > 0 {
+                    bw.write_all(" ")!;
+                }
+                pathdata.write_number(bw, style.dash[i])!;
+            }
+            self.xw.attr("stroke-dasharray", self.buf.bytes())!;
+            if style.dash_offset != 0.0 {
+                self.num_attr("stroke-dashoffset", style.dash_offset)!;
+            }
+        }
+        self.xw.end()!;
+    }
+
+    /// Fills a rectangle (as a <rect>).
+    pub fn fill_rect(self: *mut Writer, x: f64, y: f64, w: f64, h: f64, paint: draw.Paint) !void {
+        let id = self.define_paint(paint)!;
+        self.xw.start("rect")!;
+        self.num_attr("x", x)!;
+        self.num_attr("y", y)!;
+        self.num_attr("width", w)!;
+        self.num_attr("height", h)!;
+        self.paint_attrs("fill", "fill-opacity", paint, id)!;
+        self.xw.end()!;
+    }
+
+    /// Opens a group: what follows (until end_group) is transformed by t (in
+    /// the current user space) and composited with an opacity.
+    pub fn begin_group(self: *mut Writer, t: draw.Affine, opacity: f32) !void {
+        self.xw.start("g")!;
+        if (t.a != 1.0) or (t.b != 0.0) or (t.c != 0.0) or (t.d != 1.0) or (t.e != 0.0) or (t.f != 0.0) {
+            self.matrix_attr("transform", t)!;
+        }
+        if opacity < 1.0 {
+            self.num_attr("opacity", @as(f64, @max(opacity, 0.0)))!;
+        }
+        self.groups += 1;
+    }
+
+    /// Opens a group clipped to a path (in the current user space).
+    pub fn begin_clip(self: *mut Writer, p: *draw.Path, rule: draw.FillRule) !void {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut ib: [24]u8 = [0; 24];
+        self.xw.start("defs")!;
+        self.xw.start("clipPath")!;
+        self.xw.attr("id", id_text(ib[..], 'c', id))!;
+        self.xw.start("path")!;
+        self.path_attr(p)!;
+        if rule == draw.FillRule.EVEN_ODD {
+            self.xw.attr("clip-rule", "evenodd")!;
+        }
+        self.xw.end()!;
+        self.xw.end()!;
+        self.xw.end()!;
+        self.xw.start("g")!;
+        ib[0] = 'u';
+        ib[1] = 'r';
+        ib[2] = 'l';
+        ib[3] = '(';
+        ib[4] = '#';
+        let n = id_text(ib[5..], 'c', id).len;
+        ib[5 + n] = ')';
+        self.xw.attr("clip-path", ib[..n + 6])!;
+        self.groups += 1;
+    }
+
+    /// Closes the innermost group.
+    pub fn end_group(self: *mut Writer) !void {
+        if self.groups == 0 {
+            return error.InvalidSvg;
+        }
+        self.xw.end()!;
+        self.groups -= 1;
+    }
+
+    /// Writes a line of text with its baseline starting at (x, y).
+    pub fn text(self: *mut Writer, x: f64, y: f64, s: []u8, size: f64, family: []u8, c: color.Color) !void {
+        self.xw.start("text")!;
+        self.num_attr("x", x)!;
+        self.num_attr("y", y)!;
+        self.num_attr("font-size", size)!;
+        if family.len > 0 {
+            self.xw.attr("font-family", family)!;
+        }
+        self.color_attrs("fill", "fill-opacity", c, 1.0)!;
+        self.xw.text(s)!;
+        self.xw.end()!;
+    }
+
+    /// Embeds an image (as a PNG data URI) into the rectangle (x, y, w, h).
+    pub fn image(self: *mut Writer, img: *image.Image, x: f64, y: f64, w: f64, h: f64) !void {
+        let data = png.encode(img, 6)!;
+        defer mem.free(data);
+        self.buf.clear();
+        self.buf.push_str("data:image/png;base64,")!;
+        base64.encode_to(self.buf.writer(), data, base64.STANDARD)!;
+        self.xw.start("image")!;
+        self.num_attr("x", x)!;
+        self.num_attr("y", y)!;
+        self.num_attr("width", w)!;
+        self.num_attr("height", h)!;
+        self.xw.attr("preserveAspectRatio", "none")!;
+        self.xw.attr("xlink:href", self.buf.bytes())!;
+        self.xw.end()!;
+    }
+}
+
+/// "g12" for prefix 'g' and 12, in buf.
+fn id_text(buf: []mut u8, prefix: u8, id: u32) []u8 {
+    buf[0] = prefix;
+    let mut nb: [12]u8 = [0; 12];
+    let s = io.fmt_u64(nb[..], @as(u64, id));
+    @mem_copy(buf[1..1 + s.len], s);
+    return buf[..1 + s.len];
+}
+
+/// Writes a document of one call: a path filled with a paint, w by h (for
+/// quick output; use Writer for more).
+pub fn write_path_document(out: io.Writer, p: *draw.Path, paint: draw.Paint, w: f64, h: f64) !void {
+    let mut sw = Writer.begin(out, w, h)!;
+    defer sw.deinit();
+    sw.fill(p, paint, draw.FillRule.NONZERO)!;
+    sw.finish()!;
+}
+
+// -----------------------------------------------------------------------------
+// The scene
+// -----------------------------------------------------------------------------
+
+/// How a viewBox fits a viewport (preserveAspectRatio): aligned at the
+/// minimum, middle or maximum of each axis (0, 1, 2), and scaled uniformly to
+/// fit inside it (meet) or cover it (slice), or stretched (none).
+pub struct Fit {
+    align_x: u8,
+    align_y: u8,
+    none: bool,
+    slice: bool,
+
+    /// xMidYMid meet.
+    pub fn default() Fit {
+        return Fit.{ align_x: 1, align_y: 1, none: false, slice: false };
+    }
+}
+
+/// The transform that maps the box vb (x, y, width, height) into a viewport
+/// w by h at the origin, as fit says. A box without area maps nothing (to
+/// a zero scale).
+pub fn viewbox_transform(vb: [4]f64, fit: Fit, w: f64, h: f64) draw.Affine {
+    if not (vb[2] > 0.0) or not (vb[3] > 0.0) {
+        return draw.Affine.scaling(0.0, 0.0);
+    }
+    let mut sx = w / vb[2];
+    let mut sy = h / vb[3];
+    if not fit.none {
+        let mut s = @min(sx, sy);
+        if fit.slice {
+            s = @max(sx, sy);
+        }
+        sx = s;
+        sy = s;
+    }
+    let mut tx: f64 = 0.0;
+    let mut ty: f64 = 0.0;
+    if not fit.none {
+        tx = (w - (vb[2] * sx)) * (@float_from_int(f64, fit.align_x) / 2.0);
+        ty = (h - (vb[3] * sy)) * (@float_from_int(f64, fit.align_y) / 2.0);
+    }
+    return draw.Affine.translation(-vb[0], -vb[1]).then(draw.Affine.scaling(sx, sy)).then(
+        draw.Affine.translation(tx, ty));
+}
+
+/// What a drawing item does.
+pub enum ItemKind: u8 {
+    SHAPE,        // fill and stroke a path
+    TEXT,         // a run of text
+    IMAGE,        // an image
+    BEGIN_GROUP,  // until the matching END_GROUP: clipped, masked and with an opacity
+    BEGIN_MASK,   // what follows (to the group's END_GROUP) is the group's mask
+    END_GROUP,
+}
+
+/// One step of drawing a document. Coordinates are user units of the root
+/// element's viewBox (or of its viewport, without one).
+pub struct Item {
+    kind: ItemKind,
+    transform: draw.Affine,  // the item's user space to the document's
+    path: usize,             // SHAPE: its path; BEGIN_GROUP: the clip (NO_PATH: none), in the document's space
+    fill: draw.Paint,
+    has_fill: bool,
+    fill_rule: draw.FillRule,  // (BEGIN_GROUP: the clip's rule)
+    stroke: draw.Paint,
+    has_stroke: bool,
+    style: draw.Stroke,
+    opacity: f32,  // BEGIN_GROUP
+    masked: bool,  // BEGIN_GROUP: a BEGIN_MASK follows its content
+    text: []u8,    // TEXT: the characters, white space collapsed
+    x: f64,        // TEXT: the position, if set (has_x, has_y), else after the run before; IMAGE: its box
+    y: f64,
+    dx: f64,  // TEXT: shifts
+    dy: f64,
+    has_x: bool,
+    has_y: bool,
+    size: f64,     // TEXT: font size
+    anchor: u8,    // TEXT: 0 start, 1 middle, 2 end
+    image: usize,  // IMAGE: index in Document.images
+    width: f64,    // IMAGE
+    height: f64,
+}
+
+/// Item.path when there is none.
+pub const NO_PATH: usize = 0xffffffff;
+
+fn blank_item(kind: ItemKind, t: draw.Affine) Item {
+    return Item.{
+        kind: kind,
+        transform: t,
+        path: NO_PATH,
+        fill: draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)),
+        has_fill: false,
+        fill_rule: draw.FillRule.NONZERO,
+        stroke: draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)),
+        has_stroke: false,
+        style: draw.Stroke.width(1.0),
+        opacity: 1.0,
+        masked: false,
+        text: "",
+        x: 0.0,
+        y: 0.0,
+        dx: 0.0,
+        dy: 0.0,
+        has_x: false,
+        has_y: false,
+        size: 16.0,
+        anchor: 0,
+        image: 0,
+        width: 0.0,
+        height: 0.0,
+    };
+}
+
+/// A parsed SVG document: its size and drawing items.
+pub struct Document {
+    width: f64,  // the intrinsic size, in CSS pixels
+    height: f64,
+    view_box: [4]f64,  // x, y, width, height (the viewport's, if the root has none)
+    fit: Fit,
+    items: vec.Vec.[Item],
+    paths: vec.Vec.[draw.Path],
+    images: vec.Vec.[image.Image],
+    arena: arena.Arena,  // stops, dashes, text
+
+    pub fn deinit(self: *mut Document) void {
+        for i in @as(usize, 0)..self.paths.len {
+            self.paths.get_ptr(i).deinit();
+        }
+        self.paths.deinit();
+        for i in @as(usize, 0)..self.images.len {
+            self.images.get_ptr(i).deinit();
+        }
+        self.images.deinit();
+        self.items.deinit();
+        self.arena.deinit();
+    }
+
+    fn add_path(self: *mut Document, p: draw.Path) !usize {
+        let mut q = p;
+        self.paths.push(p) catch |e| {
+            q.deinit();
+            return e;
+        };
+        return self.paths.len - 1;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Styles
+// -----------------------------------------------------------------------------
+
+enum PaintKind: u8 {
+    NONE,
+    COLOR,
+    CURRENT,  // currentColor
+    URL,      // a paint server, with a fallback
+}
+
+struct PaintSpec {
+    kind: PaintKind,
+    color: color.Color,
+    url: []u8,
+    fallback: PaintKind,
+    fallback_color: color.Color,
+}
+
+/// The computed properties of an element.
+struct Style {
+    fill: PaintSpec,
+    stroke: PaintSpec,
+    fill_opacity: f32,
+    stroke_opacity: f32,
+    opacity: f32,
+    fill_rule: draw.FillRule,
+    clip_rule: draw.FillRule,
+    stroke_width: f64,
+    cap: draw.Cap,
+    join: draw.Join,
+    miter: f64,
+    dash: []f64,
+    dash_offset: f64,
+    color: color.Color,
+    visible: bool,
+    display: bool,
+    font_size: f64,
+    anchor: u8,
+    stop_color: color.Color,
+    stop_opacity: f32,
+    clip_path: []u8,
+    mask: []u8,
+}
+
+fn black() color.Color {
+    return color.Color.rgb(0.0, 0.0, 0.0);
+}
+
+fn initial_style() Style {
+    let none = PaintSpec.{ kind: PaintKind.NONE, color: black(), url: "", fallback: PaintKind.NONE,
+                           fallback_color: black() };
+    let mut fill = none;
+    fill.kind = PaintKind.COLOR;
+    return Style.{
+        fill: fill,
+        stroke: none,
+        fill_opacity: 1.0,
+        stroke_opacity: 1.0,
+        opacity: 1.0,
+        fill_rule: draw.FillRule.NONZERO,
+        clip_rule: draw.FillRule.NONZERO,
+        stroke_width: 1.0,
+        cap: draw.Cap.BUTT,
+        join: draw.Join.MITER,
+        miter: 4.0,
+        dash: @slice_from_ptr(@ptr_from_int(*f64, 8), 0),
+        dash_offset: 0.0,
+        color: black(),
+        visible: true,
+        display: true,
+        font_size: 16.0,
+        anchor: 0,
+        stop_color: black(),
+        stop_opacity: 1.0,
+        clip_path: "",
+        mask: "",
+    };
+}
+
+/// A child's starting style: the inherited properties of its parent's.
+fn inherit(parent: *Style) Style {
+    let mut s = parent.*;
+    let init = initial_style();
+    s.opacity = 1.0;
+    s.display = true;
+    s.stop_color = init.stop_color;
+    s.stop_opacity = 1.0;
+    s.clip_path = "";
+    s.mask = "";
+    return s;
+}
+
+fn number_or_percent(v: []u8) !f64 {
+    let t = strs.trim(v);
+    let mut sc = pathdata.Scanner.init(t);
+    let x = sc.raw_number() catch return error.InvalidSvg;
+    let rest = strs.trim(t[sc.i..]);
+    if strs.eq(rest, "%") {
+        return x / 100.0;
+    }
+    if rest.len != 0 {
+        return error.InvalidSvg;
+    }
+    return x;
+}
+
+fn unit_value(v: []u8) !f32 {
+    let x = number_or_percent(v)!;
+    return @float_cast(f32, @min(@max(x, 0.0), 1.0));
+}
+
+/// Parses a paint: none, currentColor, a colour, or url(#id) with an
+/// optional fallback.
+fn parse_paint(v: []u8, out: *mut PaintSpec) !void {
+    let t = strs.trim(v);
+    if strs.eq(t, "none") {
+        out.kind = PaintKind.NONE;
+        return;
+    }
+    if strs.eq_ignore_case(t, "currentColor") {
+        out.kind = PaintKind.CURRENT;
+        return;
+    }
+    if strs.starts_with(t, "url(") {
+        let close = strs.index_of_byte(t, ')') catch return error.InvalidSvg;
+        let id = url_id(t[..close + 1]) catch return error.InvalidSvg;
+        let rest = strs.trim(t[close + 1..]);
+        let mut fb = PaintKind.NONE;
+        let mut fc = black();
+        if rest.len > 0 {
+            if strs.eq(rest, "none") {
+                fb = PaintKind.NONE;
+            } else if strs.eq_ignore_case(rest, "currentColor") {
+                fb = PaintKind.CURRENT;
+            } else {
+                fc = css.parse_color(rest) catch return error.InvalidSvg;
+                fb = PaintKind.COLOR;
+            }
+        }
+        out.kind = PaintKind.URL;
+        out.url = id;
+        out.fallback = fb;
+        out.fallback_color = fc;
+        return;
+    }
+    let c = css.parse_color(t) catch return error.InvalidSvg;
+    out.kind = PaintKind.COLOR;
+    out.color = c;
+}
+
+/// The id in "url(#id)" (quotes allowed).
+fn url_id(v: []u8) ![]u8 {
+    let t = strs.trim(v);
+    if not strs.starts_with(t, "url(") or not strs.ends_with(t, ")") {
+        return error.InvalidSvg;
+    }
+    let mut inner = strs.trim(t[4..t.len - 1]);
+    if (inner.len >= 2) and ((inner[0] == '"') or (inner[0] == '\'')) and (inner[inner.len - 1] == inner[0]) {
+        inner = strs.trim(inner[1..inner.len - 1]);
+    }
+    if (inner.len < 2) or (inner[0] != '#') {
+        return error.InvalidSvg;
+    }
+    return inner[1..];
+}
+
+fn is_property(name: []u8) bool {
+    let props: [25][]u8 = [
+        "fill",
+        "stroke",
+        "fill-opacity",
+        "stroke-opacity",
+        "opacity",
+        "fill-rule",
+        "clip-rule",
+        "stroke-width",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-miterlimit",
+        "stroke-dasharray",
+        "stroke-dashoffset",
+        "color",
+        "display",
+        "visibility",
+        "font-size",
+        "text-anchor",
+        "stop-color",
+        "stop-opacity",
+        "clip-path",
+        "font",
+        "font-family",
+        "font-weight",
+        "mask",
+    ];
+    for p in props {
+        if strs.eq(p, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Building the scene
+// -----------------------------------------------------------------------------
+
+struct Builder {
+    doc: *mut Document,
+    ids: maps.Map.[[]u8, *xml.Element],
+    sheet: css.Sheet,
+    chain: vec.Vec.[css.Elem],
+    decls: vec.Vec.[css.Decl],
+    rules: vec.Vec.[css.Rule],
+    uses: vec.Vec.[*xml.Element],   // the use elements being expanded
+    masks: vec.Vec.[*xml.Element],  // the masks being expanded
+    vw: f64,  // the viewport, for percentages
+    vh: f64,
+
+    fn deinit(self: *mut Builder) void {
+        self.ids.deinit();
+        self.sheet.deinit();
+        self.chain.deinit();
+        self.decls.deinit();
+        self.rules.deinit();
+        self.uses.deinit();
+        self.masks.deinit();
+    }
+
+    fn push_item(self: *mut Builder, it: Item) !void {
+        if self.doc.items.len >= MAX_ITEMS {
+            return error.TooComplex;
+        }
+        self.doc.items.push(it)!;
+    }
+
+    // --- lengths ---
+
+    /// A length: a number with an optional unit, or a percentage of the
+    /// viewport's width ('x'), height ('y') or normalized diagonal ('o').
+    fn length(self: *Builder, v: []u8, axis: u8, font_size: f64) !f64 {
+        let t = strs.trim(v);
+        let mut sc = pathdata.Scanner.init(t);
+        let x = sc.raw_number() catch return error.InvalidSvg;
+        let v2 = self.length_value(x, strs.trim(t[sc.i..]), axis, font_size)!;
+        if not math.is_finite(v2) {
+            return error.InvalidSvg;
+        }
+        return v2;
+    }
+
+    fn length_value(self: *Builder, x: f64, u: []u8, axis: u8, font_size: f64) !f64 {
+        if (u.len == 0) or strs.eq(u, "px") {
+            return x;
+        }
+        if strs.eq(u, "%") {
+            let mut base = @sqrt(((self.vw * self.vw) + (self.vh * self.vh)) / 2.0);
+            if axis == 'x' {
+                base = self.vw;
+            } else if axis == 'y' {
+                base = self.vh;
+            }
+            return (x / 100.0) * base;
+        }
+        if strs.eq(u, "pt") {
+            return x * (4.0 / 3.0);
+        }
+        if strs.eq(u, "pc") {
+            return x * 16.0;
+        }
+        if strs.eq(u, "mm") {
+            return x * (96.0 / 25.4);
+        }
+        if strs.eq(u, "cm") {
+            return x * (96.0 / 2.54);
+        }
+        if strs.eq(u, "in") {
+            return x * 96.0;
+        }
+        if strs.eq(u, "em") {
+            return x * font_size;
+        }
+        if strs.eq(u, "ex") {
+            return x * (font_size / 2.0);
+        }
+        return error.InvalidSvg;
+    }
+
+    /// An attribute's length, or a default if it is missing or malformed.
+    fn attr_length(self: *Builder, e: *xml.Element, name: []u8, axis: u8, fs: f64, default: f64) f64 {
+        let v = e.attr(name) catch return default;
+        return self.length(v, axis, fs) catch default;
+    }
+
+    /// The first length of a list attribute (x="1 2 3").
+    fn first_length(self: *Builder, e: *xml.Element, name: []u8, axis: u8, fs: f64) !f64 {
+        let v = strs.trim(e.attr(name)!);
+        let mut end: usize = 0;
+        while (end < v.len) and not pathdata.is_space(v[end]) and (v[end] != ',') {
+            end += 1;
+        }
+        return self.length(v[..end], axis, fs);
+    }
+
+    // --- the cascade ---
+
+    /// Applies one declaration to s (parent: for "inherit"); bad values are ignored.
+    fn apply(self: *mut Builder, s: *mut Style, parent: *Style, name: []u8, value0: []u8) void {
+        let value = strs.trim(value0);
+        if strs.eq(value, "inherit") {
+            self.inherit_one(s, parent, name);
+            return;
+        }
+        if strs.eq(name, "fill") {
+            parse_paint(value, &mut s.fill) catch return;
+        } else if strs.eq(name, "stroke") {
+            parse_paint(value, &mut s.stroke) catch return;
+        } else if strs.eq(name, "fill-opacity") {
+            s.fill_opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "stroke-opacity") {
+            s.stroke_opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "opacity") {
+            s.opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "stop-opacity") {
+            s.stop_opacity = unit_value(value) catch return;
+        } else if strs.eq(name, "fill-rule") {
+            if strs.eq(value, "evenodd") {
+                s.fill_rule = draw.FillRule.EVEN_ODD;
+            } else if strs.eq(value, "nonzero") {
+                s.fill_rule = draw.FillRule.NONZERO;
+            }
+        } else if strs.eq(name, "clip-rule") {
+            if strs.eq(value, "evenodd") {
+                s.clip_rule = draw.FillRule.EVEN_ODD;
+            } else if strs.eq(value, "nonzero") {
+                s.clip_rule = draw.FillRule.NONZERO;
+            }
+        } else if strs.eq(name, "stroke-width") {
+            let w = self.length(value, 'o', s.font_size) catch return;
+            if w >= 0.0 {
+                s.stroke_width = w;
+            }
+        } else if strs.eq(name, "stroke-linecap") {
+            if strs.eq(value, "butt") {
+                s.cap = draw.Cap.BUTT;
+            } else if strs.eq(value, "round") {
+                s.cap = draw.Cap.ROUND;
+            } else if strs.eq(value, "square") {
+                s.cap = draw.Cap.SQUARE;
+            }
+        } else if strs.eq(name, "stroke-linejoin") {
+            if strs.eq(value, "miter") or strs.eq(value, "miter-clip") or strs.eq(value, "arcs") {
+                s.join = draw.Join.MITER;
+            } else if strs.eq(value, "round") {
+                s.join = draw.Join.ROUND;
+            } else if strs.eq(value, "bevel") {
+                s.join = draw.Join.BEVEL;
+            }
+        } else if strs.eq(name, "stroke-miterlimit") {
+            let m = number_or_percent(value) catch return;
+            if m >= 1.0 {
+                s.miter = m;
+            }
+        } else if strs.eq(name, "stroke-dasharray") {
+            s.dash = self.parse_dashes(value, s.font_size) catch return;
+        } else if strs.eq(name, "stroke-dashoffset") {
+            s.dash_offset = self.length(value, 'o', s.font_size) catch return;
+        } else if strs.eq(name, "color") {
+            s.color = css.parse_color(value) catch return;
+        } else if strs.eq(name, "display") {
+            s.display = not strs.eq(value, "none");
+        } else if strs.eq(name, "visibility") {
+            if strs.eq(value, "visible") {
+                s.visible = true;
+            } else if strs.eq(value, "hidden") or strs.eq(value, "collapse") {
+                s.visible = false;
+            }
+        } else if strs.eq(name, "font-size") {
+            s.font_size = self.font_size(value, parent.font_size) catch return;
+        } else if strs.eq(name, "text-anchor") {
+            if strs.eq(value, "start") {
+                s.anchor = 0;
+            } else if strs.eq(value, "middle") {
+                s.anchor = 1;
+            } else if strs.eq(value, "end") {
+                s.anchor = 2;
+            }
+        } else if strs.eq(name, "stop-color") {
+            if strs.eq_ignore_case(value, "currentColor") {
+                s.stop_color = s.color;
+            } else {
+                s.stop_color = css.parse_color(value) catch return;
+            }
+        } else if strs.eq(name, "clip-path") {
+            if strs.eq(value, "none") {
+                s.clip_path = "";
+            } else {
+                s.clip_path = url_id(value) catch return;
+            }
+        } else if strs.eq(name, "mask") {
+            if strs.eq(value, "none") {
+                s.mask = "";
+            } else {
+                s.mask = url_id(value) catch return;
+            }
+        }
+    }
+
+    fn inherit_one(self: *mut Builder, s: *mut Style, p: *Style, name: []u8) void {
+        if strs.eq(name, "fill") {
+            s.fill = p.fill;
+        } else if strs.eq(name, "stroke") {
+            s.stroke = p.stroke;
+        } else if strs.eq(name, "fill-opacity") {
+            s.fill_opacity = p.fill_opacity;
+        } else if strs.eq(name, "stroke-opacity") {
+            s.stroke_opacity = p.stroke_opacity;
+        } else if strs.eq(name, "opacity") {
+            s.opacity = p.opacity;
+        } else if strs.eq(name, "stop-opacity") {
+            s.stop_opacity = p.stop_opacity;
+        } else if strs.eq(name, "stop-color") {
+            s.stop_color = p.stop_color;
+        } else if strs.eq(name, "clip-path") {
+            s.clip_path = p.clip_path;
+        } else if strs.eq(name, "mask") {
+            s.mask = p.mask;
+        } else if strs.eq(name, "display") {
+            s.display = p.display;
+        } else if strs.eq(name, "stroke-width") {
+            s.stroke_width = p.stroke_width;
+        } else if strs.eq(name, "stroke-dasharray") {
+            s.dash = p.dash;
+        }
+        // (the other properties are inherited anyway)
+        _ = self.vw;
+    }
+
+    fn font_size(self: *Builder, v: []u8, parent_size: f64) !f64 {
+        let names: [7][]u8 = ["xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large"];
+        let sizes: [7]f64 = [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0];
+        for i in @as(usize, 0)..7 {
+            if strs.eq(v, names[i]) {
+                return sizes[i];
+            }
+        }
+        if strs.eq(v, "larger") {
+            return parent_size * 1.2;
+        }
+        if strs.eq(v, "smaller") {
+            return parent_size / 1.2;
+        }
+        let t = strs.trim(v);
+        if strs.ends_with(t, "%") {
+            return (number_or_percent(t)!) * parent_size;
+        }
+        let size = self.length(t, 'o', parent_size)!;
+        if size < 0.0 {
+            return error.InvalidSvg;
+        }
+        return size;
+    }
+
+    /// A dash array (none: solid); an odd count is repeated, as SVG says, and
+    /// a negative length or an all-zero pattern means solid.
+    fn parse_dashes(self: *mut Builder, v: []u8, fs: f64) ![]f64 {
+        let empty = @slice_from_ptr(@ptr_from_int(*f64, 8), 0);
+        if strs.eq(v, "none") {
+            return empty;
+        }
+        let mut vals = vec.Vec.[f64].init();
+        defer vals.deinit();
+        let mut i: usize = 0;
+        let mut total: f64 = 0.0;
+        while i < v.len {
+            while (i < v.len) and (pathdata.is_space(v[i]) or (v[i] == ',')) {
+                i += 1;
+            }
+            if i >= v.len {
+                break;
+            }
+            let start = i;
+            while (i < v.len) and not pathdata.is_space(v[i]) and (v[i] != ',') {
+                i += 1;
+            }
+            let d = self.length(v[start..i], 'o', fs)!;
+            if d < 0.0 {
+                return empty;
+            }
+            total += d;
+            vals.push(d)!;
+            if vals.len > 1000 {
+                return error.InvalidSvg;
+            }
+        }
+        if (vals.len == 0) or not (total > 0.0) {
+            return empty;
+        }
+        let n = vals.len;
+        if (n % 2) == 1 {
+            for k in @as(usize, 0)..n {
+                vals.push(vals.get(k))!;
+            }
+        }
+        return self.doc.arena.copy(vals.items())!;
+    }
+
+    /// The computed style of element e (whose css.Elem is the last of chain)
+    /// under parent.
+    fn compute_style(self: *mut Builder, e: *xml.Element, parent: *Style) !Style {
+        let mut s = inherit(parent);
+        for a in e.attrs {
+            if (a.ns.len == 0) and is_property(a.local) {
+                self.apply(&mut s, parent, a.local, a.value);
+            }
+        }
+        // style sheet rules, by specificity and order
+        self.rules.clear();
+        if self.sheet.rules.len > 0 {
+            for r in self.sheet.rules.items() {
+                if self.sheet.matches(r, self.chain.items()) {
+                    self.rules.push(r)!;
+                }
+            }
+            vec.sort(self.rules.items(), rule_less);
+        }
+        for r in self.rules.items() {
+            for k in r.decl_first..r.decl_first + r.decl_count {
+                let d = self.sheet.decls.get(k);
+                if not d.important {
+                    self.apply(&mut s, parent, d.name, d.value);
+                }
+            }
+        }
+        // the style attribute
+        self.decls.clear();
+        let st = e.attr("style") catch "";
+        if st.len > 0 {
+            let buf = self.doc.arena.bytes(st.len)!;
+            let clean = css.strip_comments(st, buf);
+            css.parse_declarations(clean, &mut self.decls)!;
+            for d in self.decls.items() {
+                if not d.important {
+                    self.apply(&mut s, parent, d.name, d.value);
+                }
+            }
+        }
+        // !important declarations
+        for r in self.rules.items() {
+            for k in r.decl_first..r.decl_first + r.decl_count {
+                let d = self.sheet.decls.get(k);
+                if d.important {
+                    self.apply(&mut s, parent, d.name, d.value);
+                }
+            }
+        }
+        for d in self.decls.items() {
+            if d.important {
+                self.apply(&mut s, parent, d.name, d.value);
+            }
+        }
+        return s;
+    }
+
+    fn enter(self: *mut Builder, e: *xml.Element) !void {
+        let id = e.attr("id") catch "";
+        let class = e.attr("class") catch "";
+        self.chain.push(css.Elem.{ tag: e.local, id: id, class: class })!;
+    }
+
+    fn leave(self: *mut Builder) void {
+        _ = self.chain.pop() catch return;
+    }
+
+    // --- references ---
+
+    fn collect_ids(self: *mut Builder, e: *xml.Element, depth: usize) !void {
+        if depth > xml.MAX_DEPTH {
+            return error.TooComplex;
+        }
+        let id = e.attr("id") catch "";
+        if (id.len > 0) and not self.ids.contains(id) {
+            self.ids.put(id, e)!;
+        }
+        if strs.eq(e.local, "style") and is_svg(e) {
+            let typ = e.attr("type") catch "text/css";
+            if strs.eq(strs.trim(typ), "text/css") or (strs.trim(typ).len == 0) {
+                let t = e.text_alloc()!;
+                defer mem.free(t);
+                let buf = self.doc.arena.bytes(t.len)!;
+                let clean = css.strip_comments(t, buf);
+                self.sheet.add(clean)!;
+            }
+        }
+        for c in e.children {
+            match c {
+                .Element(x) => { self.collect_ids(x, depth + 1)!; }
+                else => {}
+            }
+        }
+    }
+
+    /// The element an href (xlink:href or href) points to ("#id").
+    fn href(self: *Builder, e: *xml.Element) !*xml.Element {
+        let t = strs.trim(href_value(e)!);
+        if (t.len < 2) or (t[0] != '#') {
+            return error.InvalidSvg;
+        }
+        return self.ids.get(t[1..]);
+    }
+
+    // --- paints ---
+
+    /// The draw.Paint for a paint spec at an alpha, for a shape whose box is
+    /// bbox; false if nothing is painted.
+    fn make_paint(self: *mut Builder, spec: PaintSpec, s: *Style, alpha: f32, bbox: pathdata.Box,
+                  out: *mut draw.Paint) !bool {
+        if spec.kind == PaintKind.NONE {
+            return false;
+        }
+        if spec.kind == PaintKind.COLOR {
+            out.* = draw.Paint.solid(spec.color.with_alpha(spec.color.a * alpha));
+            return true;
+        }
+        if spec.kind == PaintKind.CURRENT {
+            out.* = draw.Paint.solid(s.color.with_alpha(s.color.a * alpha));
+            return true;
+        }
+        let g = self.ids.get(spec.url) catch {
+            let mut fb = spec;
+            fb.kind = spec.fallback;
+            fb.color = spec.fallback_color;
+            return self.make_paint(fb, s, alpha, bbox, out);
+        };
+        if not is_svg(g) or (not strs.eq(g.local, "linearGradient") and not strs.eq(g.local, "radialGradient")) {
+            let mut fb = spec;
+            fb.kind = spec.fallback;
+            fb.color = spec.fallback_color;
+            return self.make_paint(fb, s, alpha, bbox, out);
+        }
+        return self.gradient(g, s, alpha, bbox, out);
+    }
+
+    /// An attribute of a gradient, or of the gradients it inherits from.
+    fn gradient_attr(self: *Builder, g: *xml.Element, name: []u8) ![]u8 {
+        let mut cur = g;
+        for _i in @as(usize, 0)..16 {
+            let v = cur.attr(name) catch {
+                cur = self.href(cur) catch return error.InvalidSvg;
+                if not strs.eq(cur.local, "linearGradient") and not strs.eq(cur.local, "radialGradient") {
+                    return error.InvalidSvg;
+                }
+                continue;
+            };
+            return v;
+        }
+        return error.InvalidSvg;
+    }
+
+    /// The gradient whose stops g uses (itself or one it inherits from).
+    fn gradient_stops_owner(self: *Builder, g: *xml.Element) !*xml.Element {
+        let mut cur = g;
+        for _i in @as(usize, 0)..16 {
+            for c in cur.children {
+                match c {
+                    .Element(x) => {
+                        if strs.eq(x.local, "stop") {
+                            return cur;
+                        }
+                    }
+                    else => {}
+                }
+            }
+            cur = self.href(cur) catch return error.InvalidSvg;
+            if not strs.eq(cur.local, "linearGradient") and not strs.eq(cur.local, "radialGradient") {
+                return error.InvalidSvg;
+            }
+        }
+        return error.InvalidSvg;
+    }
+
+    fn gradient(self: *mut Builder, g: *xml.Element, s: *Style, alpha: f32, bbox: pathdata.Box,
+                out: *mut draw.Paint) !bool {
+        // the stops, with their own styles
+        let owner = self.gradient_stops_owner(g) catch return false;
+        let mut stops = vec.Vec.[draw.Stop].init();
+        defer stops.deinit();
+        let base = initial_style();
+        let mut last: f64 = 0.0;
+        for c in owner.children {
+            match c {
+                .Element(x) => {
+                    if strs.eq(x.local, "stop") {
+                        self.enter(x)!;
+                        let st = self.compute_style(x, &base);
+                        self.leave();
+                        let ss = st!;
+                        let ov = x.attr("offset") catch "0";
+                        let mut off = number_or_percent(ov) catch 0.0;
+                        off = @min(@max(off, last), 1.0);
+                        last = off;
+                        let col = ss.stop_color;
+                        stops.push(draw.Stop.{ offset: off,
+                                               color: col.with_alpha((col.a * ss.stop_opacity) * alpha) })!;
+                    }
+                }
+                else => {}
+            }
+        }
+        if stops.len == 0 {
+            return false;
+        }
+        if stops.len == 1 {
+            out.* = draw.Paint.solid(stops.get(0).color);
+            return true;
+        }
+        let user = strs.eq(strs.trim(self.gradient_attr(g, "gradientUnits") catch ""), "userSpaceOnUse");
+        let mut gt = draw.Affine.identity();
+        let tv = self.gradient_attr(g, "gradientTransform") catch "";
+        if tv.len > 0 {
+            css.parse_transform(tv, &mut gt) catch {};
+        }
+        let mut space = gt;
+        if not user {
+            let bw = bbox.x1 - bbox.x0;
+            let bh = bbox.y1 - bbox.y0;
+            if bbox.is_empty() or not (bw > 0.0) or not (bh > 0.0) {
+                return false;
+            }
+            space = gt.then(draw.Affine.scaling(bw, bh)).then(draw.Affine.translation(bbox.x0, bbox.y0));
+        }
+        let sm = strs.trim(self.gradient_attr(g, "spreadMethod") catch "pad");
+        let mut spread = draw.Spread.PAD;
+        if strs.eq(sm, "repeat") {
+            spread = draw.Spread.REPEAT;
+        } else if strs.eq(sm, "reflect") {
+            spread = draw.Spread.REFLECT;
+        }
+        let fine = self.doc.arena.copy(stops.items())!;
+        if strs.eq(g.local, "linearGradient") {
+            let x1 = self.gradient_length(g, "x1", 'x', user, 0.0);
+            let y1 = self.gradient_length(g, "y1", 'y', user, 0.0);
+            let x2 = self.gradient_length(g, "x2", 'x', user, 1.0);
+            let y2 = self.gradient_length(g, "y2", 'y', user, 0.0);
+            if (x1 == x2) and (y1 == y2) {
+                out.* = draw.Paint.solid(stops.get(stops.len - 1).color);
+                return true;
+            }
+            out.* = draw.Paint.linear(x1, y1, x2, y2, fine).with_spread(spread).with_transform(space);
+            return true;
+        }
+        let cx = self.gradient_length(g, "cx", 'x', user, 0.5);
+        let cy = self.gradient_length(g, "cy", 'y', user, 0.5);
+        let r = self.gradient_length(g, "r", 'o', user, 0.5);
+        if not (r > 0.0) {
+            out.* = draw.Paint.solid(stops.get(stops.len - 1).color);
+            return true;
+        }
+        out.* = draw.Paint.radial(cx, cy, r, fine).with_spread(spread).with_transform(space);
+        return true;
+    }
+
+    /// A gradient coordinate: user units (or a percentage of the viewport),
+    /// or a fraction of the bounding box (numbers and percentages alike).
+    fn gradient_length(self: *Builder, g: *xml.Element, name: []u8, axis: u8, user: bool, default: f64) f64 {
+        let v = self.gradient_attr(g, name) catch {
+            if user {
+                // the default percentages, of the viewport
+                let mut base = @sqrt(((self.vw * self.vw) + (self.vh * self.vh)) / 2.0);
+                if axis == 'x' {
+                    base = self.vw;
+                } else if axis == 'y' {
+                    base = self.vh;
+                }
+                return default * base;
+            }
+            return default;
+        };
+        if user {
+            return self.length(v, axis, 16.0) catch default;
+        }
+        return number_or_percent(v) catch default;
+    }
+}
+
+fn rule_less(a: css.Rule, b: css.Rule) bool {
+    if a.specificity != b.specificity {
+        return a.specificity < b.specificity;
+    }
+    return a.order < b.order;
+}
+
+/// xlink:href, or SVG 2's href.
+fn href_value(e: *xml.Element) ![]u8 {
+    let v = e.attr_ns(XLINK_NS, "href") catch {
+        return e.attr("href");
+    };
+    return v;
+}
+
+fn is_svg(e: *xml.Element) bool {
+    return (e.ns.len == 0) or strs.eq(e.ns, SVG_NS);
+}
+
+// -----------------------------------------------------------------------------
+// Walking the tree
+// -----------------------------------------------------------------------------
+
+/// Parses preserveAspectRatio ("xMidYMid meet", "none", "xMinYMax slice").
+fn parse_fit(v: []u8) Fit {
+    let mut f = Fit.default();
+    let mut fields = strs.fields(v);
+    let mut first = fields.next() catch return f;
+    if strs.eq(first, "defer") {
+        first = fields.next() catch return f;
+    }
+    if strs.eq(first, "none") {
+        f.none = true;
+    } else if (first.len == 8) and (first[0] == 'x') and (first[4] == 'Y') {
+        let ax = first[1..4];
+        let ay = first[5..8];
+        if strs.eq(ax, "Min") {
+            f.align_x = 0;
+        } else if strs.eq(ax, "Max") {
+            f.align_x = 2;
+        }
+        if strs.eq(ay, "Min") {
+            f.align_y = 0;
+        } else if strs.eq(ay, "Max") {
+            f.align_y = 2;
+        }
+    }
+    let mode = fields.next() catch return f;
+    f.slice = strs.eq(mode, "slice");
+    return f;
+}
+
+/// Parses a viewBox ("x y width height").
+fn parse_view_box(v: []u8) ![4]f64 {
+    let mut sc = pathdata.Scanner.init(v);
+    let mut out: [4]f64 = [0.0; 4];
+    for i in @as(usize, 0)..4 {
+        out[i] = sc.number() catch return error.InvalidSvg;
+    }
+    if not sc.at_end() or not (out[2] > 0.0) or not (out[3] > 0.0) {
+        return error.InvalidSvg;
+    }
+    return out;
+}
+
+/// The numbers of a points attribute (x, y pairs).
+fn parse_points(v: []u8, out: *mut vec.Vec.[f64]) !void {
+    let mut sc = pathdata.Scanner.init(v);
+    while not sc.at_end() {
+        let x = sc.number() catch return;
+        out.push(x)!;
+    }
+}
+
+/// Elements that draw nothing where they stand.
+fn is_hidden_element(name: []u8) bool {
+    let names: [16][]u8 = [
+        "defs",
+        "symbol",
+        "clipPath",
+        "mask",
+        "linearGradient",
+        "radialGradient",
+        "pattern",
+        "marker",
+        "style",
+        "title",
+        "desc",
+        "metadata",
+        "filter",
+        "script",
+        "foreignObject",
+        "font",
+    ];
+    for n in names {
+        if strs.eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const MAX_NESTING: usize = 400;
+
+fn walk(b: *mut Builder, e: *xml.Element, parent: *Style, ctm: draw.Affine, depth: usize) !void {
+    if depth > MAX_NESTING {
+        return error.TooComplex;
+    }
+    if not is_svg(e) or is_hidden_element(e.local) {
+        return;
+    }
+    b.enter(e)!;
+    defer b.leave();
+    let s = b.compute_style(e, parent)!;
+    if not s.display {
+        return;
+    }
+    let mut t = ctm;
+    let tv = e.attr("transform") catch "";
+    if tv.len > 0 {
+        let mut local = draw.Affine.identity();
+        css.parse_transform(tv, &mut local) catch {};
+        t = local.then(ctm);
+    }
+    let name = e.local;
+    if strs.eq(name, "g") or strs.eq(name, "a") {
+        group(b, e, &s, t, depth, false)!;
+    } else if strs.eq(name, "switch") {
+        group(b, e, &s, t, depth, true)!;
+    } else if strs.eq(name, "svg") {
+        // a nested viewport (its transform attribute, if any, is SVG 2's)
+        let x = b.attr_length(e, "x", 'x', s.font_size, 0.0);
+        let y = b.attr_length(e, "y", 'y', s.font_size, 0.0);
+        let w = b.attr_length(e, "width", 'x', s.font_size, b.vw);
+        let h = b.attr_length(e, "height", 'y', s.font_size, b.vh);
+        viewport(b, e, &s, t, x, y, w, h, depth)!;
+    } else if strs.eq(name, "use") {
+        use_element(b, e, &s, t, depth)!;
+    } else if strs.eq(name, "text") {
+        text_element(b, e, &s, t, depth)!;
+    } else if strs.eq(name, "image") {
+        image_element(b, e, &s, t)!;
+    } else {
+        shape(b, e, &s, t)!;
+    }
+}
+
+/// A group opened for an element's opacity, clip path or mask.
+struct GroupInfo {
+    opened: bool,
+    begin: usize,  // its BEGIN_GROUP item
+    clip: []u8,    // the clipPath's id (if it is one)
+    mask: *xml.Element,
+    has_mask: bool,
+    t: draw.Affine,
+    bbox: pathdata.Box,  // the element's box (empty: from what the group draws)
+}
+
+/// The element (of a kind) an id names.
+fn element_of(b: *Builder, id: []u8, kind: []u8) !*xml.Element {
+    let e = b.ids.get(id)!;
+    if not is_svg(e) or not strs.eq(e.local, kind) {
+        return error.InvalidSvg;
+    }
+    return e;
+}
+
+fn is_element(b: *Builder, id: []u8, kind: []u8) bool {
+    _ = element_of(b, id, kind) catch return false;
+    return true;
+}
+
+/// Opens a group if the element has an opacity, a clip path or a mask (the
+/// clip and mask are made when the group closes, when its box is known).
+fn begin_group(b: *mut Builder, s: *Style, t: draw.Affine, bbox: pathdata.Box) !GroupInfo {
+    let mut g = GroupInfo.{ opened: false, begin: 0, clip: "", mask: @ptr_from_int(*xml.Element, 8), has_mask: false,
+                            t: t, bbox: bbox };
+    if (s.clip_path.len > 0) and is_element(b, s.clip_path, "clipPath") {
+        g.clip = s.clip_path;
+    }
+    if (s.mask.len > 0) and is_element(b, s.mask, "mask") {
+        g.mask = b.ids.get(s.mask)!;
+        g.has_mask = true;
+    }
+    if (g.clip.len == 0) and not g.has_mask and not (s.opacity < 1.0) {
+        return g;
+    }
+    let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+    it.opacity = s.opacity;
+    it.masked = g.has_mask;
+    b.push_item(it)!;
+    g.opened = true;
+    g.begin = b.doc.items.len - 1;
+    return g;
+}
+
+/// Closes a group begin_group opened: its clip, then its mask's content.
+fn end_group(b: *mut Builder, g: *GroupInfo, depth: usize) !void {
+    if not g.opened {
+        return;
+    }
+    let mut bbox = g.bbox;
+    if bbox.is_empty() and ((g.clip.len > 0) or g.has_mask) {
+        bbox = items_bbox(b, g.begin + 1, g.t);
+    }
+    if g.clip.len > 0 {
+        let mut rule = draw.FillRule.NONZERO;
+        let idx = clip_path(b, g.clip, g.t, bbox, &mut rule)!;
+        let it = &mut b.doc.items.items()[g.begin];
+        it.path = idx;
+        it.fill_rule = rule;
+    }
+    if g.has_mask {
+        b.push_item(blank_item(ItemKind.BEGIN_MASK, g.t))!;
+        mask_content(b, g.mask, g.t, bbox, depth)!;
+    }
+    close_group(b)!;
+}
+
+fn close_group(b: *mut Builder) !void {
+    b.push_item(blank_item(ItemKind.END_GROUP, draw.Affine.identity()))!;
+}
+
+/// The box (in t's space) of the shapes and images drawn since item `from`.
+fn items_bbox(b: *Builder, from: usize, t: draw.Affine) pathdata.Box {
+    let mut box = pathdata.Box.empty();
+    if @abs(t.determinant()) < 1.0e-12 {
+        return box;
+    }
+    let inv = t.invert();
+    let items = b.doc.items.items();
+    for i in from..items.len {
+        let it = items[i];
+        let mut local = pathdata.Box.empty();
+        if it.kind == ItemKind.SHAPE {
+            local = pathdata.bounds(&b.doc.paths.items()[it.path]);
+        } else if it.kind == ItemKind.IMAGE {
+            local = pathdata.Box.{ x0: 0.0, y0: 0.0, x1: it.width, y1: it.height };
+        } else {
+            continue;
+        }
+        if local.is_empty() {
+            continue;
+        }
+        let m = it.transform.then(inv);
+        let xs: [2]f64 = [local.x0, local.x1];
+        let ys: [2]f64 = [local.y0, local.y1];
+        for xv in xs {
+            for yv in ys {
+                let q = m.apply(xv, yv);
+                box.add(q.x, q.y);
+            }
+        }
+    }
+    return box;
+}
+
+/// The content of a mask, for an element of box bbox drawn through t.
+fn mask_content(b: *mut Builder, m: *xml.Element, t: draw.Affine, bbox: pathdata.Box, depth: usize) !void {
+    if (b.masks.len >= 8) or (depth > MAX_NESTING) {
+        return;
+    }
+    for x in b.masks.items() {
+        if x == m {
+            return;  // a mask inside itself
+        }
+    }
+    let base = initial_style();
+    b.enter(m)!;
+    defer b.leave();
+    let ms = b.compute_style(m, &base)!;
+    let bw = bbox.x1 - bbox.x0;
+    let bh = bbox.y1 - bbox.y0;
+    let has_box = not bbox.is_empty() and (bw > 0.0) and (bh > 0.0);
+    // the region it covers
+    let mut region = pathdata.Box.empty();
+    let user = strs.eq(strs.trim(m.attr("maskUnits") catch ""), "userSpaceOnUse");
+    if user {
+        let rx = b.attr_length(m, "x", 'x', 16.0, -0.1 * b.vw);
+        let ry = b.attr_length(m, "y", 'y', 16.0, -0.1 * b.vh);
+        let rw = b.attr_length(m, "width", 'x', 16.0, 1.2 * b.vw);
+        let rh = b.attr_length(m, "height", 'y', 16.0, 1.2 * b.vh);
+        region = pathdata.Box.{ x0: rx, y0: ry, x1: rx + rw, y1: ry + rh };
+    } else if has_box {
+        let fx = number_or_percent(m.attr("x") catch "-10%") catch -0.1;
+        let fy = number_or_percent(m.attr("y") catch "-10%") catch -0.1;
+        let fw = number_or_percent(m.attr("width") catch "120%") catch 1.2;
+        let fh = number_or_percent(m.attr("height") catch "120%") catch 1.2;
+        region = pathdata.Box.{ x0: bbox.x0 + (fx * bw), y0: bbox.y0 + (fy * bh), x1: bbox.x0 + ((fx + fw) * bw),
+                                y1: bbox.y0 + ((fy + fh) * bh) };
+    }
+    let mut ct = t;
+    if strs.eq(strs.trim(m.attr("maskContentUnits") catch ""), "objectBoundingBox") {
+        if not has_box {
+            return;  // an empty mask: nothing shows
+        }
+        ct = draw.Affine.scaling(bw, bh).then(draw.Affine.translation(bbox.x0, bbox.y0)).then(t);
+    }
+    let clipped = not region.is_empty();
+    if clipped {
+        let mut rp = rect_path(region.x0, region.y0, region.x1 - region.x0, region.y1 - region.y0)!;
+        let mut dp = draw.Path.init();
+        pathdata.append_transformed(&mut dp, &rp, t) catch |er| {
+            rp.deinit();
+            dp.deinit();
+            return er;
+        };
+        rp.deinit();
+        let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+        it.path = b.doc.add_path(dp)!;
+        b.push_item(it)!;
+    }
+    b.masks.push(m)!;
+    defer b.masks.truncate(b.masks.len - 1);
+    for c in m.children {
+        match c {
+            .Element(x) => { walk(b, x, &ms, ct, depth + 1)!; }
+            else => {}
+        }
+    }
+    if clipped {
+        close_group(b)!;
+    }
+}
+
+/// The clip path an element refers to, in the document's space (NO_PATH if
+/// the reference is not to a clipPath).
+fn clip_path(b: *mut Builder, id: []u8, t: draw.Affine, bbox: pathdata.Box, rule: *mut draw.FillRule) !usize {
+    let cp = b.ids.get(id) catch return NO_PATH;
+    if not is_svg(cp) or not strs.eq(cp.local, "clipPath") {
+        return NO_PATH;
+    }
+    let mut m = draw.Affine.identity();
+    let tv = cp.attr("transform") catch "";
+    if tv.len > 0 {
+        css.parse_transform(tv, &mut m) catch {};
+    }
+    m = m.then(t);
+    if strs.eq(strs.trim(cp.attr("clipPathUnits") catch ""), "objectBoundingBox") {
+        let bw = bbox.x1 - bbox.x0;
+        let bh = bbox.y1 - bbox.y0;
+        if bbox.is_empty() {
+            return NO_PATH;
+        }
+        m = draw.Affine.scaling(bw, bh).then(draw.Affine.translation(bbox.x0, bbox.y0)).then(m);
+    }
+    let mut out = draw.Path.init();
+    let base = initial_style();
+    b.enter(cp) catch |e| {
+        out.deinit();
+        return e;
+    };
+    let cps = b.compute_style(cp, &base);
+    b.leave();
+    let cs = cps catch |e| {
+        out.deinit();
+        return e;
+    };
+    let mut first = true;
+    for c in cp.children {
+        match c {
+            .Element(x) => {
+                clip_child(b, x, &cs, m, &mut out, rule, &mut first) catch |e| {
+                    out.deinit();
+                    return e;
+                };
+            }
+            else => {}
+        }
+    }
+    return b.doc.add_path(out);
+}
+
+fn clip_child(b: *mut Builder, x0: *xml.Element, parent: *Style, m: draw.Affine, out: *mut draw.Path,
+              rule: *mut draw.FillRule, first: *mut bool) !void {
+    let mut x = x0;
+    let mut t = m;
+    let mut ps = parent.*;
+    if not is_svg(x) {
+        return;
+    }
+    let tv = x.attr("transform") catch "";
+    if tv.len > 0 {
+        let mut local = draw.Affine.identity();
+        css.parse_transform(tv, &mut local) catch {};
+        t = local.then(t);
+    }
+    if strs.eq(x.local, "use") {
+        // a use of a shape
+        b.enter(x)!;
+        let us = b.compute_style(x, parent);
+        b.leave();
+        ps = us!;
+        let ux = b.attr_length(x, "x", 'x', ps.font_size, 0.0);
+        let uy = b.attr_length(x, "y", 'y', ps.font_size, 0.0);
+        t = draw.Affine.translation(ux, uy).then(t);
+        x = b.href(x) catch return;
+        let tv2 = x.attr("transform") catch "";
+        if tv2.len > 0 {
+            let mut local2 = draw.Affine.identity();
+            css.parse_transform(tv2, &mut local2) catch {};
+            t = local2.then(t);
+        }
+    }
+    b.enter(x)!;
+    let ss = b.compute_style(x, &ps);
+    b.leave();
+    let s = ss!;
+    if not s.display or not s.visible {
+        return;
+    }
+    let mut p = draw.Path.init();
+    defer p.deinit();
+    if not shape_path(b, x, &s, &mut p)! {
+        return;
+    }
+    if first.* {
+        rule.* = s.clip_rule;
+        first.* = false;
+    }
+    pathdata.append_transformed(out, &p, t)!;
+}
+
+fn group(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, depth: usize, only_first: bool) !void {
+    let mut wrapped = begin_group(b, s, t, pathdata.Box.empty())!;
+    for c in e.children {
+        match c {
+            .Element(x) => {
+                walk(b, x, s, t, depth + 1)!;
+                if only_first and is_svg(x) and not is_hidden_element(x.local) {
+                    break;
+                }
+            }
+            else => {}
+        }
+    }
+    end_group(b, &mut wrapped, depth)!;
+}
+
+/// A rectangle's path, in t's space.
+fn rect_path(x: f64, y: f64, w: f64, h: f64) !draw.Path {
+    let mut p = draw.Path.init();
+    p.rect(x, y, w, h) catch |e| {
+        p.deinit();
+        return e;
+    };
+    return p;
+}
+
+/// A nested viewport (svg, or a symbol a use refers to): x, y, w, h in t's space.
+fn viewport(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, x: f64, y: f64, w: f64, h: f64,
+            depth: usize) !void {
+    if not (w > 0.0) or not (h > 0.0) {
+        return;
+    }
+    let mut inner = draw.Affine.translation(x, y).then(t);
+    let mut vw = w;
+    let mut vh = h;
+    let vbv = e.attr("viewBox") catch "";
+    if vbv.len > 0 {
+        let vb = parse_view_box(vbv) catch [0.0, 0.0, 0.0, 0.0];
+        if vb[2] > 0.0 {
+            let fit = parse_fit(e.attr("preserveAspectRatio") catch "");
+            inner = viewbox_transform(vb, fit, w, h).then(inner);
+            vw = vb[2];
+            vh = vb[3];
+        }
+    }
+    // the viewport clips (overflow: hidden), and the element's opacity and clip apply
+    let overflow = strs.trim(e.attr("overflow") catch "hidden");
+    let clips = not strs.eq(overflow, "visible") and not strs.eq(overflow, "auto");
+    if clips {
+        let mut rp = rect_path(x, y, w, h)!;
+        let mut dp = draw.Path.init();
+        pathdata.append_transformed(&mut dp, &rp, t) catch |er| {
+            rp.deinit();
+            dp.deinit();
+            return er;
+        };
+        rp.deinit();
+        let idx = b.doc.add_path(dp)!;
+        let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+        it.path = idx;
+        b.push_item(it)!;
+    }
+    let mut g = begin_group(b, s, t, pathdata.Box.empty())!;
+    let saved_w = b.vw;
+    let saved_h = b.vh;
+    b.vw = vw;
+    b.vh = vh;
+    for c in e.children {
+        match c {
+            .Element(xe) => {
+                walk(b, xe, s, inner, depth + 1) catch |er| {
+                    b.vw = saved_w;
+                    b.vh = saved_h;
+                    return er;
+                };
+            }
+            else => {}
+        }
+    }
+    b.vw = saved_w;
+    b.vh = saved_h;
+    end_group(b, &mut g, depth)!;
+    if clips {
+        close_group(b)!;
+    }
+}
+
+fn use_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, depth: usize) !void {
+    let target = b.href(e) catch return;
+    if (b.uses.len >= 32) or not is_svg(target) {
+        return;
+    }
+    for u in b.uses.items() {
+        if u == e {
+            return;  // a use that contains itself
+        }
+    }
+    let x = b.attr_length(e, "x", 'x', s.font_size, 0.0);
+    let y = b.attr_length(e, "y", 'y', s.font_size, 0.0);
+    let t2 = draw.Affine.translation(x, y).then(t);
+    b.uses.push(e)!;
+    defer b.uses.truncate(b.uses.len - 1);
+    let mut wrapped = begin_group(b, s, t, pathdata.Box.empty())!;
+    if strs.eq(target.local, "symbol") or strs.eq(target.local, "svg") {
+        b.enter(target)!;
+        let ts = b.compute_style(target, s);
+        b.leave();
+        let tst = ts!;
+        if tst.display {
+            let w = b.attr_length(e, "width", 'x', s.font_size, b.attr_length(target, "width", 'x', s.font_size, b.vw));
+            let h = b.attr_length(
+                e, "height", 'y', s.font_size, b.attr_length(target, "height", 'y', s.font_size, b.vh));
+            b.enter(target)!;
+            let r = viewport(b, target, &tst, t2, 0.0, 0.0, w, h, depth + 1);
+            b.leave();
+            r!;
+        }
+    } else {
+        walk(b, target, s, t2, depth + 1)!;
+    }
+    end_group(b, &mut wrapped, depth)!;
+}
+
+/// The outline of a basic shape or path element; false if it has none.
+fn shape_path(b: *mut Builder, e: *xml.Element, s: *Style, p: *mut draw.Path) !bool {
+    let name = e.local;
+    let fs = s.font_size;
+    if strs.eq(name, "path") {
+        let d = e.attr("d") catch return false;
+        pathdata.parse(d, p) catch |er| {
+            if er == error.OutOfMemory {
+                return er;
+            }
+        };
+        return p.verbs.len > 0;
+    }
+    if strs.eq(name, "rect") {
+        let x = b.attr_length(e, "x", 'x', fs, 0.0);
+        let y = b.attr_length(e, "y", 'y', fs, 0.0);
+        let w = b.attr_length(e, "width", 'x', fs, 0.0);
+        let h = b.attr_length(e, "height", 'y', fs, 0.0);
+        if not (w > 0.0) or not (h > 0.0) {
+            return false;
+        }
+        let mut rx = b.attr_length(e, "rx", 'x', fs, -1.0);
+        let mut ry = b.attr_length(e, "ry", 'y', fs, -1.0);
+        if (rx < 0.0) and (ry < 0.0) {
+            rx = 0.0;
+            ry = 0.0;
+        } else if rx < 0.0 {
+            rx = ry;
+        } else if ry < 0.0 {
+            ry = rx;
+        }
+        rx = @min(rx, w / 2.0);
+        ry = @min(ry, h / 2.0);
+        if (rx <= 0.0) or (ry <= 0.0) {
+            p.rect(x, y, w, h)!;
+            return true;
+        }
+        let hp = math.PI / 2.0;
+        p.move_to(x + rx, y)!;
+        p.line_to((x + w) - rx, y)!;
+        p.elliptic_arc((x + w) - rx, y + ry, rx, ry, -hp, 0.0, false)!;
+        p.line_to(x + w, (y + h) - ry)!;
+        p.elliptic_arc((x + w) - rx, (y + h) - ry, rx, ry, 0.0, hp, false)!;
+        p.line_to(x + rx, y + h)!;
+        p.elliptic_arc(x + rx, (y + h) - ry, rx, ry, hp, math.PI, false)!;
+        p.line_to(x, y + ry)!;
+        p.elliptic_arc(x + rx, y + ry, rx, ry, math.PI, math.PI + hp, false)!;
+        p.close()!;
+        return true;
+    }
+    if strs.eq(name, "circle") {
+        let cx = b.attr_length(e, "cx", 'x', fs, 0.0);
+        let cy = b.attr_length(e, "cy", 'y', fs, 0.0);
+        let r = b.attr_length(e, "r", 'o', fs, 0.0);
+        if not (r > 0.0) {
+            return false;
+        }
+        p.circle(cx, cy, r)!;
+        return true;
+    }
+    if strs.eq(name, "ellipse") {
+        let cx = b.attr_length(e, "cx", 'x', fs, 0.0);
+        let cy = b.attr_length(e, "cy", 'y', fs, 0.0);
+        let mut rx = b.attr_length(e, "rx", 'x', fs, -1.0);
+        let mut ry = b.attr_length(e, "ry", 'y', fs, -1.0);
+        if rx < 0.0 {
+            rx = ry;  // SVG 2's auto
+        }
+        if ry < 0.0 {
+            ry = rx;
+        }
+        if not (rx > 0.0) or not (ry > 0.0) {
+            return false;
+        }
+        p.ellipse(cx, cy, rx, ry)!;
+        return true;
+    }
+    if strs.eq(name, "line") {
+        p.move_to(b.attr_length(e, "x1", 'x', fs, 0.0), b.attr_length(e, "y1", 'y', fs, 0.0))!;
+        p.line_to(b.attr_length(e, "x2", 'x', fs, 0.0), b.attr_length(e, "y2", 'y', fs, 0.0))!;
+        return true;
+    }
+    if strs.eq(name, "polyline") or strs.eq(name, "polygon") {
+        let mut v = vec.Vec.[f64].init();
+        defer v.deinit();
+        parse_points(e.attr("points") catch "", &mut v)!;
+        let xs = v.items();
+        let n = xs.len / 2;
+        if n == 0 {
+            return false;
+        }
+        p.move_to(xs[0], xs[1])!;
+        for i in @as(usize, 1)..n {
+            p.line_to(xs[2 * i], xs[(2 * i) + 1])!;
+        }
+        if strs.eq(name, "polygon") {
+            p.close()!;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn stroke_of(s: *Style) draw.Stroke {
+    let mut st = draw.Stroke.width(s.stroke_width);
+    st.cap = s.cap;
+    st.join = s.join;
+    st.miter_limit = s.miter;
+    st.dash = s.dash;
+    st.dash_offset = s.dash_offset;
+    return st;
+}
+
+fn shape(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !void {
+    if not s.visible and (s.clip_path.len == 0) {
+        // (nothing to draw; but children of a hidden group may show, which
+        // shapes do not have)
+        return;
+    }
+    let mut p = draw.Path.init();
+    let ok = shape_path(b, e, s, &mut p) catch |er| {
+        p.deinit();
+        return er;
+    };
+    if not ok or not s.visible {
+        p.deinit();
+        return;
+    }
+    let bbox = pathdata.bounds(&p);
+    let mut it = blank_item(ItemKind.SHAPE, t);
+    let both = (s.fill.kind != PaintKind.NONE) and (s.stroke.kind != PaintKind.NONE) and (s.stroke_width > 0.0);
+    // an opacity on one paint can go into it; on two, it needs a group
+    let mut fold: f32 = 1.0;
+    let mut gs = s.*;
+    if not both {
+        fold = s.opacity;
+        gs.opacity = 1.0;
+    }
+    it.has_fill = b.make_paint(s.fill, s, s.fill_opacity * fold, bbox, &mut it.fill) catch |er| {
+        p.deinit();
+        return er;
+    };
+    it.fill_rule = s.fill_rule;
+    if s.stroke_width > 0.0 {
+        it.has_stroke = b.make_paint(s.stroke, s, s.stroke_opacity * fold, bbox, &mut it.stroke) catch |er| {
+            p.deinit();
+            return er;
+        };
+    }
+    it.style = stroke_of(s);
+    if not it.has_fill and not it.has_stroke {
+        p.deinit();
+        return;
+    }
+    it.path = b.doc.add_path(p)!;
+    let mut wrapped = begin_group(b, &gs, t, bbox)!;
+    b.push_item(it)!;
+    end_group(b, &mut wrapped, 0)!;
+}
+
+fn data_uri_image(v: []u8) !image.Image {
+    let t = strs.trim(v);
+    if not strs.starts_with(t, "data:") {
+        return error.Unsupported;
+    }
+    let comma = strs.index_of_byte(t, ',') catch return error.InvalidSvg;
+    let head = t[5..comma];
+    if not strs.ends_with(head, ";base64") {
+        return error.Unsupported;
+    }
+    // base64 with the white space taken out
+    let body = t[comma + 1..];
+    let clean = mem.alloc.[u8](body.len)!;
+    defer mem.free(clean);
+    let mut n: usize = 0;
+    for c in body {
+        if not pathdata.is_space(c) {
+            clean[n] = c;
+            n += 1;
+        }
+    }
+    let data = base64.decode_alloc(clean[..n], base64.STANDARD) catch return error.InvalidSvg;
+    defer mem.free(data);
+    if (data.len >= 8) and (data[0] == 0x89) and (data[1] == 'P') and (data[2] == 'N') and (data[3] == 'G') {
+        return png.decode(data);
+    }
+    if (data.len >= 3) and (data[0] == 0xff) and (data[1] == 0xd8) {
+        return jpeg.decode(data);
+    }
+    return error.Unsupported;
+}
+
+fn image_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !void {
+    if not s.visible {
+        return;
+    }
+    let href = href_value(e) catch return;
+    let mut img = data_uri_image(href) catch |er| {
+        if er == error.OutOfMemory {
+            return er;
+        }
+        return;  // unreadable or external: nothing
+    };
+    let iw = @float_from_int(f64, img.width);
+    let ih = @float_from_int(f64, img.height);
+    let fs = s.font_size;
+    let x = b.attr_length(e, "x", 'x', fs, 0.0);
+    let y = b.attr_length(e, "y", 'y', fs, 0.0);
+    let w = b.attr_length(e, "width", 'x', fs, iw);
+    let h = b.attr_length(e, "height", 'y', fs, ih);
+    if not (w > 0.0) or not (h > 0.0) or (img.width == 0) or (img.height == 0) {
+        img.deinit();
+        return;
+    }
+    b.doc.images.push(img) catch |er| {
+        img.deinit();
+        return er;
+    };
+    let fit = parse_fit(e.attr("preserveAspectRatio") catch "");
+    let place = viewbox_transform([0.0, 0.0, iw, ih], fit, w, h).then(draw.Affine.translation(x, y));
+    if fit.slice {
+        let mut rp = rect_path(x, y, w, h)!;
+        let mut dp = draw.Path.init();
+        pathdata.append_transformed(&mut dp, &rp, t) catch |er| {
+            rp.deinit();
+            dp.deinit();
+            return er;
+        };
+        rp.deinit();
+        let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
+        it.path = b.doc.add_path(dp)!;
+        b.push_item(it)!;
+    }
+    let mut g = begin_group(b, s, t, pathdata.Box.{ x0: x, y0: y, x1: x + w, y1: y + h })!;
+    let mut it = blank_item(ItemKind.IMAGE, place.then(t));
+    it.image = b.doc.images.len - 1;
+    it.width = iw;
+    it.height = ih;
+    b.push_item(it)!;
+    end_group(b, &mut g, 0)!;
+    if fit.slice {
+        close_group(b)!;
+    }
+}
+
+// --- text ---
+
+struct TextState {
+    has_x: bool,  // a position for the next run
+    has_y: bool,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    space: bool,  // the text so far ends with a space (or is empty)
+    last: usize,  // the last run's item (NO_PATH: none)
+}
+
+/// Reads x, y, dx and dy of a text or tspan element into the state.
+fn text_position(b: *Builder, e: *xml.Element, s: *Style, st: *mut TextState) void {
+    let fs = s.font_size;
+    let xa = e.attr("x") catch "";
+    if xa.len > 0 {
+        st.x = b.first_length(e, "x", 'x', fs) catch st.x;
+        st.has_x = true;
+    }
+    let ya = e.attr("y") catch "";
+    if ya.len > 0 {
+        st.y = b.first_length(e, "y", 'y', fs) catch st.y;
+        st.has_y = true;
+    }
+    st.dx += b.first_length(e, "dx", 'x', fs) catch 0.0;
+    st.dy += b.first_length(e, "dy", 'y', fs) catch 0.0;
+}
+
+fn text_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, depth: usize) !void {
+    let mut wrapped = begin_group(b, s, t, pathdata.Box.empty())!;
+    let mut st = TextState.{ has_x: true, has_y: true, x: 0.0, y: 0.0, dx: 0.0, dy: 0.0, space: true, last: NO_PATH };
+    text_position(b, e, s, &mut st);
+    text_runs(b, e, s, t, &mut st, depth)!;
+    // no trailing space
+    if st.last != NO_PATH {
+        let it = &mut b.doc.items.items()[st.last];
+        if strs.ends_with(it.text, " ") {
+            it.text = it.text[..it.text.len - 1];
+        }
+    }
+    end_group(b, &mut wrapped, depth)!;
+}
+
+fn text_runs(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, st: *mut TextState, depth: usize) !void {
+    if depth > MAX_NESTING {
+        return error.TooComplex;
+    }
+    for c in e.children {
+        match c {
+            .Text(raw) => {
+                // white space: newlines go, tabs become spaces, runs of spaces one
+                let buf = b.doc.arena.bytes(raw.len)!;
+                let mut n: usize = 0;
+                for ch in raw {
+                    if (ch == '\n') or (ch == '\r') {
+                        continue;
+                    }
+                    let mut k = ch;
+                    if k == '\t' {
+                        k = ' ';
+                    }
+                    if (k == ' ') and st.space {
+                        continue;
+                    }
+                    buf[n] = k;
+                    n += 1;
+                    st.space = k == ' ';
+                }
+                if (n == 0) or not s.visible {
+                    continue;
+                }
+                let mut it = blank_item(ItemKind.TEXT, t);
+                it.text = buf[..n];
+                it.x = st.x;
+                it.y = st.y;
+                it.has_x = st.has_x;
+                it.has_y = st.has_y;
+                it.dx = st.dx;
+                it.dy = st.dy;
+                it.size = s.font_size;
+                it.anchor = s.anchor;
+                // (a rough box for gradients in bounding box units)
+                let bx = pathdata.Box.{
+                    x0: st.x, y0: st.y - s.font_size, x1: st.x + ((@float_from_int(f64, n) * s.font_size) * 0.5),
+                    y1: st.y };
+                it.has_fill = b.make_paint(s.fill, s, s.fill_opacity, bx, &mut it.fill)!;
+                it.fill_rule = s.fill_rule;
+                if s.stroke_width > 0.0 {
+                    it.has_stroke = b.make_paint(s.stroke, s, s.stroke_opacity, bx, &mut it.stroke)!;
+                }
+                it.style = stroke_of(s);
+                st.has_x = false;
+                st.has_y = false;
+                st.dx = 0.0;
+                st.dy = 0.0;
+                b.push_item(it)!;
+                st.last = b.doc.items.len - 1;
+            }
+            .Element(x) => {
+                if is_svg(x) and strs.eq(x.local, "tspan") {
+                    b.enter(x)!;
+                    let ts = b.compute_style(x, s);
+                    let r = ts!;
+                    if r.display {
+                        text_position(b, x, &r, st);
+                        text_runs(b, x, &r, t, st, depth + 1) catch |er| {
+                            b.leave();
+                            return er;
+                        };
+                    }
+                    b.leave();
+                }
+            }
+            else => {}
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parsing
+// -----------------------------------------------------------------------------
+
+/// Parses an SVG document.
+pub fn parse(text: []u8) !Document {
+    let mut x = xml.parse(text) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return error.InvalidSvg;
+    };
+    defer x.deinit();
+    let root = x.root;
+    if not is_svg(root) or not strs.eq(root.local, "svg") {
+        return error.InvalidSvg;
+    }
+    let mut doc = Document.{
+        width: 0.0,
+        height: 0.0,
+        view_box: [0.0; 4],
+        fit: Fit.default(),
+        items: vec.Vec.[Item].init(),
+        paths: vec.Vec.[draw.Path].init(),
+        images: vec.Vec.[image.Image].init(),
+        arena: arena.Arena.init(),
+    };
+    let mut b = Builder.{
+        doc: &mut doc,
+        ids: maps.Map.[[]u8, *xml.Element].init(hash.hash_bytes, hash.eq_bytes),
+        sheet: css.Sheet.init(),
+        chain: vec.Vec.[css.Elem].init(),
+        decls: vec.Vec.[css.Decl].init(),
+        rules: vec.Vec.[css.Rule].init(),
+        uses: vec.Vec.[*xml.Element].init(),
+        masks: vec.Vec.[*xml.Element].init(),
+        vw: 300.0,
+        vh: 150.0,
+    };
+    defer b.deinit();
+    build(&mut b, root) catch |e| {
+        doc.deinit();
+        return e;
+    };
+    return doc;
+}
+
+fn build(b: *mut Builder, root: *xml.Element) !void {
+    let vbv = root.attr("viewBox") catch "";
+    let mut has_vb = false;
+    let mut vb: [4]f64 = [0.0; 4];
+    if vbv.len > 0 {
+        vb = parse_view_box(vbv) catch [0.0; 4];
+        has_vb = vb[2] > 0.0;
+    }
+    if has_vb {
+        b.vw = vb[2];
+        b.vh = vb[3];
+    }
+    // the intrinsic size: width and height (percentages of the viewBox's, or
+    // of 300 x 150)
+    let w = b.attr_length(root, "width", 'x', 16.0, b.vw);
+    let h = b.attr_length(root, "height", 'y', 16.0, b.vh);
+    b.doc.width = w;
+    b.doc.height = h;
+    if not has_vb {
+        vb = [0.0, 0.0, w, h];
+    }
+    b.doc.view_box = vb;
+    b.doc.fit = parse_fit(root.attr("preserveAspectRatio") catch "");
+    b.vw = vb[2];
+    b.vh = vb[3];
+    b.collect_ids(root, 0)!;
+    let base = initial_style();
+    b.enter(root)!;
+    defer b.leave();
+    let s = b.compute_style(root, &base)!;
+    if not s.display {
+        return;
+    }
+    let mut wrapped = begin_group(b, &s, draw.Affine.identity(), pathdata.Box.empty())!;
+    for c in root.children {
+        match c {
+            .Element(x) => { walk(b, x, &s, draw.Affine.identity(), 1)!; }
+            else => {}
+        }
+    }
+    end_group(b, &mut wrapped, 0)!;
+}
+
+// -----------------------------------------------------------------------------
+// Rendering
+// -----------------------------------------------------------------------------
+
+/// What rendering needs besides the document: a font for text (none: text
+/// is not drawn).
+pub struct RenderOptions {
+    font: *font.Font,
+    has_font: bool,
+
+    /// No font: text is not drawn.
+    pub fn init() RenderOptions {
+        return RenderOptions.{ font: @ptr_from_int(*font.Font, 8), has_font: false };
+    }
+
+    /// Text drawn in f.
+    pub fn with_font(f: *font.Font) RenderOptions {
+        return RenderOptions.{ font: f, has_font: true };
+    }
+}
+
+/// The outline of a run of text at (x, y) (the baseline's start, after the
+/// anchor), appended to p; returns its advance.
+fn text_outline(f: *font.Font, s: []u8, x: f64, y: f64, size: f64, p: *mut draw.Path) !f64 {
+    let sc = font.scale_for(f, size);
+    let mut it = strs.runes(s);
+    let mut pen = x;
+    let mut prev: u32 = 0xffffffff;
+    loop {
+        let r = it.next() catch break;
+        let g = f.glyph_index(r);
+        if prev != 0xffffffff {
+            pen += @float_from_int(f64, f.kerning(prev, g)) * sc;
+        }
+        f.glyph_path(g, p, pen, y, sc)!;
+        pen += @float_from_int(f64, f.advance(g)) * sc;
+        prev = g;
+    }
+    return pen - x;
+}
+
+/// Where text runs continue from.
+struct Pen {
+    x: f64,
+    y: f64,
+}
+
+/// A text item's outline; moves the pen past it.
+fn text_item_path(it: *Item, opts: RenderOptions, pen: *mut Pen, p: *mut draw.Path) !void {
+    if it.has_x {
+        pen.x = it.x;
+    }
+    if it.has_y {
+        pen.y = it.y;
+    }
+    pen.x += it.dx;
+    pen.y += it.dy;
+    let f = opts.font;
+    let w = font.measure(f, it.text, it.size);
+    let mut x = pen.x;
+    if it.anchor == 1 {
+        x -= w / 2.0;
+    } else if it.anchor == 2 {
+        x -= w;
+    }
+    _ = text_outline(f, it.text, x, pen.y, it.size, p)!;
+    pen.x = x + w;
+}
+
+/// A colour with its sRGB-encoded components standing in for linear ones:
+/// drawing with these composites and interpolates sRGB values, as SVG
+/// renderers do.
+fn encoded(c: color.Color) color.Color {
+    return color.Color.{
+        r: color.srgb_encode(@min(@max(c.r, 0.0), 1.0)),
+        g: color.srgb_encode(@min(@max(c.g, 0.0), 1.0)),
+        b: color.srgb_encode(@min(@max(c.b, 0.0), 1.0)),
+        a: c.a,
+    };
+}
+
+/// A paint in encoded colours (gradient stops into scratch).
+fn encoded_paint(p: draw.Paint, scratch: *mut vec.Vec.[draw.Stop]) !draw.Paint {
+    let mut q = p;
+    q.color = encoded(p.color);
+    if (p.kind == draw.PaintKind.LINEAR) or (p.kind == draw.PaintKind.RADIAL) {
+        // SVG interpolates colour and opacity separately (draw interpolates
+        // premultiplied colours): spans whose opacity changes are split
+        scratch.clear();
+        let n = p.stops.len;
+        for i in @as(usize, 0)..n {
+            let a = p.stops[i];
+            let ea = encoded(a.color);
+            scratch.push(draw.Stop.{ offset: a.offset, color: ea })!;
+            if ((i + 1) < n) and (a.color.a != p.stops[i + 1].color.a) {
+                let b = p.stops[i + 1];
+                let eb = encoded(b.color);
+                for j in @as(usize, 1)..SUBSTOPS {
+                    let t = @float_from_int(f32, j) / @float_from_int(f32, SUBSTOPS);
+                    let c = color.Color.{ r: ea.r + ((eb.r - ea.r) * t), g: ea.g + ((eb.g - ea.g) * t),
+                                          b: ea.b + ((eb.b - ea.b) * t), a: ea.a + ((eb.a - ea.a) * t) };
+                    scratch.push(draw.Stop.{ offset: a.offset + ((b.offset - a.offset) * @as(f64, t)), color: c })!;
+                }
+            }
+        }
+        q.stops = scratch.items();
+    }
+    return q;
+}
+
+const SUBSTOPS: usize = 16;
+
+/// An offscreen layer (for a group's opacity or mask, or a mask itself).
+struct Layer {
+    img: *mut image.Image,
+    cv: *mut draw.Canvas,
+}
+
+fn new_layer(w: usize, h: usize, like: *draw.Canvas) !Layer {
+    let img = mem.create(image.Image.init(w, h, 4, image.Depth.F32)!)!;
+    let cv = mem.create(draw.Canvas.init(img)) catch |e| {
+        img.deinit();
+        mem.destroy(img);
+        return e;
+    };
+    cv.antialias = like.antialias;
+    cv.tolerance = like.tolerance;
+    return Layer.{ img: img, cv: cv };
+}
+
+fn free_layer(l: Layer) void {
+    l.cv.deinit();
+    mem.destroy(l.cv);
+    l.img.deinit();
+    mem.destroy(l.img);
+}
+
+/// What a BEGIN_GROUP (or BEGIN_MASK) started.
+struct Frame {
+    kind: u8,  // 0: a clip only, 1: a layer, 2: a mask's layer
+    opacity: f32,
+    masked: bool,
+}
+
+/// The state of rendering onto a canvas.
+struct Painter {
+    doc: *Document,
+    work: Layer,  // the document, in encoded colours
+    layers: vec.Vec.[Layer],
+    frames: vec.Vec.[Frame],
+    images: vec.Vec.[image.Image],  // the document's images, encoded
+    stops: vec.Vec.[draw.Stop],
+    base: draw.Affine,
+    opts: RenderOptions,
+
+    fn deinit(self: *mut Painter) void {
+        while self.layers.len > 0 {
+            let l = self.layers.pop() catch break;
+            free_layer(l);
+        }
+        self.layers.deinit();
+        self.frames.deinit();
+        for i in @as(usize, 0)..self.images.len {
+            self.images.get_ptr(i).deinit();
+        }
+        self.images.deinit();
+        self.stops.deinit();
+    }
+
+    /// The canvas drawn on now.
+    fn cur(self: *Painter) *mut draw.Canvas {
+        if self.layers.len > 0 {
+            return self.layers.get(self.layers.len - 1).cv;
+        }
+        return self.work.cv;
+    }
+
+    fn fill(self: *mut Painter, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) !void {
+        let q = encoded_paint(paint, &mut self.stops)!;
+        self.cur().fill(p, q, rule)!;
+    }
+
+    fn stroke(self: *mut Painter, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) !void {
+        let q = encoded_paint(paint, &mut self.stops)!;
+        self.cur().stroke(p, q, style)!;
+    }
+
+    /// Composites the top layer onto the one below at an opacity, after
+    /// masking it with a mask layer (if masked).
+    fn pop_layer(self: *mut Painter, opacity: f32, mask: *image.Image, masked: bool) !void {
+        let l = self.layers.pop()!;
+        if masked {
+            // alpha times the mask's luminance (from its sRGB values) and alpha
+            let d = l.img.samples32();
+            let m = mask.samples32();
+            let mut i: usize = 0;
+            while (i + 3) < d.len {
+                let lum = (((0.2125 * m[i]) + (0.7154 * m[i + 1])) + (0.0721 * m[i + 2])) * m[i + 3];
+                d[i + 3] = d[i + 3] * @min(@max(lum, 0.0), 1.0);
+                i += 4;
+            }
+        }
+        let below = self.cur();
+        below.save() catch |e| {
+            free_layer(l);
+            return e;
+        };
+        below.transform = draw.Affine.identity();
+        below.alpha = below.alpha * opacity;
+        let r = below.draw_image(
+            l.img, 0.0, 0.0, @float_from_int(f64, l.img.width), @float_from_int(f64, l.img.height));
+        below.restore();
+        free_layer(l);
+        r!;
+    }
+
+    fn run(self: *mut Painter) !void {
+        let doc = self.doc;
+        let mut pen = Pen.{ x: 0.0, y: 0.0 };
+        let mut tp = draw.Path.init();
+        defer tp.deinit();
+        let w = self.work.img.width;
+        let h = self.work.img.height;
+        for i in @as(usize, 0)..doc.items.len {
+            let it = &doc.items.items()[i];
+            match it.kind {
+                .BEGIN_GROUP => {
+                    let c = self.cur();
+                    c.save()!;
+                    if it.path != NO_PATH {
+                        c.transform = self.base;
+                        c.clip_to(&doc.paths.items()[it.path], it.fill_rule)!;
+                    }
+                    let mut fr = Frame.{ kind: 0, opacity: it.opacity, masked: it.masked };
+                    if (it.opacity < 1.0) or it.masked {
+                        let l = new_layer(w, h, c)!;
+                        self.layers.push(l) catch |e| {
+                            free_layer(l);
+                            return e;
+                        };
+                        fr.kind = 1;
+                    }
+                    self.frames.push(fr)!;
+                }
+                .BEGIN_MASK => {
+                    let l = new_layer(w, h, self.cur())!;
+                    self.layers.push(l) catch |e| {
+                        free_layer(l);
+                        return e;
+                    };
+                    self.frames.push(Frame.{ kind: 2, opacity: 1.0, masked: false })!;
+                }
+                .END_GROUP => {
+                    let mut fr = self.frames.pop() catch continue;
+                    if fr.kind == 2 {
+                        // the mask is done: apply it to the group's layer
+                        let ml = self.layers.pop()!;
+                        fr = self.frames.pop() catch {
+                            free_layer(ml);
+                            continue;
+                        };
+                        let r = self.pop_layer(fr.opacity, ml.img, true);
+                        free_layer(ml);
+                        r!;
+                    } else if fr.kind == 1 {
+                        if fr.masked {
+                            // (a mask that made no BEGIN_MASK: nothing shows)
+                            let l = self.layers.pop()!;
+                            free_layer(l);
+                        } else {
+                            self.pop_layer(fr.opacity, self.work.img, false)!;
+                        }
+                    }
+                    self.cur().restore();
+                }
+                .SHAPE => {
+                    self.cur().transform = it.transform.then(self.base);
+                    let p = &doc.paths.items()[it.path];
+                    if it.has_fill {
+                        self.fill(p, it.fill, it.fill_rule)!;
+                    }
+                    if it.has_stroke {
+                        self.stroke(p, it.stroke, it.style)!;
+                    }
+                }
+                .TEXT => {
+                    if self.opts.has_font {
+                        tp.clear();
+                        text_item_path(it, self.opts, &mut pen, &mut tp)!;
+                        self.cur().transform = it.transform.then(self.base);
+                        if it.has_fill {
+                            self.fill(&tp, it.fill, it.fill_rule)!;
+                        }
+                        if it.has_stroke {
+                            self.stroke(&tp, it.stroke, it.style)!;
+                        }
+                    }
+                }
+                .IMAGE => {
+                    let c = self.cur();
+                    c.transform = it.transform.then(self.base);
+                    c.draw_image(&self.images.items()[it.image], 0.0, 0.0, it.width, it.height)!;
+                }
+            }
+        }
+    }
+}
+
+/// Renders the document into the rectangle (x, y, w, h) of a canvas (in its
+/// current user space): the root's viewBox fits it as its
+/// preserveAspectRatio says. Text is not drawn (see render_with).
+pub fn render(doc: *Document, cv: *mut draw.Canvas, x: f64, y: f64, w: f64, h: f64) !void {
+    return render_with(doc, cv, x, y, w, h, RenderOptions.init());
+}
+
+/// render, with options (a font for text). The document is drawn into an
+/// offscreen image as SVG says (blending sRGB values), which is then
+/// composited onto the canvas (with its clip, operator and alpha).
+pub fn render_with(doc: *Document, cv: *mut draw.Canvas, x: f64, y: f64, w: f64, h: f64, opts: RenderOptions) !void {
+    if not (w > 0.0) or not (h > 0.0) {
+        return;
+    }
+    // the pixels the rectangle covers
+    let outer = cv.transform;
+    let mut box = pathdata.Box.empty();
+    let xs: [2]f64 = [x, x + w];
+    let ys: [2]f64 = [y, y + h];
+    for xv in xs {
+        for yv in ys {
+            let q = outer.apply(xv, yv);
+            box.add(q.x, q.y);
+        }
+    }
+    let cw = @float_from_int(f64, cv.img.width);
+    let ch = @float_from_int(f64, cv.img.height);
+    let x0 = @floor(@min(@max(box.x0, 0.0), cw));
+    let y0 = @floor(@min(@max(box.y0, 0.0), ch));
+    let x1 = @ceil(@min(@max(box.x1, 0.0), cw));
+    let y1 = @ceil(@min(@max(box.y1, 0.0), ch));
+    if not (x1 > x0) or not (y1 > y0) {
+        return;
+    }
+    let ww = @int_from_float(usize, x1 - x0);
+    let wh = @int_from_float(usize, y1 - y0);
+    let shift = draw.Affine.translation(-x0, -y0);
+    let local = viewbox_transform(doc.view_box, doc.fit, w, h).then(draw.Affine.translation(x, y));
+    let work = new_layer(ww, wh, cv)!;
+    let mut pt = Painter.{
+        doc: doc,
+        work: work,
+        layers: vec.Vec.[Layer].init(),
+        frames: vec.Vec.[Frame].init(),
+        images: vec.Vec.[image.Image].init(),
+        stops: vec.Vec.[draw.Stop].init(),
+        base: local.then(outer).then(shift),
+        opts: opts,
+    };
+    let r = paint_document(&mut pt, x, y, w, h, outer.then(shift));
+    pt.deinit();
+    r catch |e| {
+        free_layer(work);
+        return e;
+    };
+    // back to linear light, onto the canvas
+    let d = work.img.samples32();
+    let mut i: usize = 0;
+    while (i + 3) < d.len {
+        d[i] = color.srgb_decode(@min(@max(d[i], 0.0), 1.0));
+        d[i + 1] = color.srgb_decode(@min(@max(d[i + 1], 0.0), 1.0));
+        d[i + 2] = color.srgb_decode(@min(@max(d[i + 2], 0.0), 1.0));
+        i += 4;
+    }
+    let saved = cv.transform;
+    cv.transform = draw.Affine.identity();
+    let r2 = cv.draw_image(work.img, x0, y0, x1 - x0, y1 - y0);
+    cv.transform = saved;
+    free_layer(work);
+    r2!;
+}
+
+fn paint_document(pt: *mut Painter, x: f64, y: f64, w: f64, h: f64, outer: draw.Affine) !void {
+    // the images, encoded
+    for i in @as(usize, 0)..pt.doc.images.len {
+        let src = &pt.doc.images.items()[i];
+        let mut e = image.Image.init(src.width, src.height, 4, image.Depth.F32)!;
+        for iy in @as(usize, 0)..src.height {
+            for ix in @as(usize, 0)..src.width {
+                e.set(ix, iy, encoded(src.get(ix, iy)));
+            }
+        }
+        pt.images.push(e) catch |er| {
+            e.deinit();
+            return er;
+        };
+    }
+    if pt.doc.fit.slice {
+        let mut rp = rect_path(x, y, w, h)!;
+        defer rp.deinit();
+        pt.work.cv.transform = outer;
+        pt.work.cv.clip_to(&rp, draw.FillRule.NONZERO)!;
+    }
+    pt.run()!;
+}
+
+/// Renders the document as a w by h RGBA image (8 bits, transparent
+/// background), its viewBox fitted as preserveAspectRatio says.
+pub fn render_image(doc: *Document, w: usize, h: usize) !image.Image {
+    return render_image_with(doc, w, h, RenderOptions.init());
+}
+
+/// render_image, with options (a font for text).
+pub fn render_image_with(doc: *Document, w: usize, h: usize, opts: RenderOptions) !image.Image {
+    let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
+    img.fill(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    let mut cv = draw.Canvas.init(&mut img);
+    let r = render_with(doc, &mut cv, 0.0, 0.0, @float_from_int(f64, w), @float_from_int(f64, h), opts);
+    cv.deinit();
+    r catch |e| {
+        img.deinit();
+        return e;
+    };
+    return img;
+}
+
+/// A paint at an opacity (solid colours only: PDF gradients are opaque).
+fn faded(p: draw.Paint, a: f32) draw.Paint {
+    if (p.kind == draw.PaintKind.SOLID) and (a < 1.0) {
+        let mut q = p;
+        q.color = p.color.with_alpha(p.color.a * a);
+        return q;
+    }
+    return p;
+}
+
+/// Renders the document onto a PDF page in the rectangle (x, y, w, h) (in
+/// the page's current user space). Group opacity multiplies the opacity of
+/// the solid colours inside it, and masks are ignored (what they mask is
+/// drawn whole); text is not drawn (see render_page_with).
+pub fn render_page(doc: *Document, page: *mut pdf.Page, x: f64, y: f64, w: f64, h: f64) !void {
+    return render_page_with(doc, page, x, y, w, h, RenderOptions.init());
+}
+
+/// render_page, with options (a font for text, drawn as outlines).
+pub fn render_page_with(doc: *Document, page: *mut pdf.Page, x: f64, y: f64, w: f64, h: f64,
+                        opts: RenderOptions) !void {
+    if not (w > 0.0) or not (h > 0.0) {
+        return;
+    }
+    let base = viewbox_transform(doc.view_box, doc.fit, w, h).then(draw.Affine.translation(x, y));
+    if @abs(base.determinant()) < 1.0e-12 {
+        return;
+    }
+    let inv = base.invert();
+    page.save()!;
+    if doc.fit.slice {
+        let mut rp = rect_path(x, y, w, h)!;
+        defer rp.deinit();
+        page.clip(&rp, draw.FillRule.NONZERO)!;
+    }
+    let mut alphas = vec.Vec.[f32].init();
+    defer alphas.deinit();
+    let mut alpha: f32 = 1.0;
+    let mut pen = Pen.{ x: 0.0, y: 0.0 };
+    let mut tp = draw.Path.init();
+    defer tp.deinit();
+    let mut depth: usize = 0;
+    let mut skipping = false;  // a mask's content: not drawn
+    let mut skip_depth: usize = 0;
+    for i in @as(usize, 0)..doc.items.len {
+        let it = &doc.items.items()[i];
+        if skipping {
+            if it.kind == ItemKind.BEGIN_GROUP {
+                skip_depth += 1;
+                continue;
+            }
+            if it.kind != ItemKind.END_GROUP {
+                continue;
+            }
+            if skip_depth > 0 {
+                skip_depth -= 1;
+                continue;
+            }
+            skipping = false;  // this END_GROUP ends the masked group
+        }
+        match it.kind {
+            .BEGIN_MASK => {
+                skipping = true;
+                skip_depth = 0;
+            }
+            .BEGIN_GROUP => {
+                page.save()!;
+                depth += 1;
+                if it.path != NO_PATH {
+                    page.concat(base)!;
+                    page.clip(&doc.paths.items()[it.path], it.fill_rule)!;
+                    page.concat(inv)!;
+                }
+                alphas.push(alpha)!;
+                alpha = alpha * it.opacity;
+            }
+            .END_GROUP => {
+                if depth > 0 {
+                    page.restore()!;
+                    depth -= 1;
+                }
+                alpha = alphas.pop() catch 1.0;
+            }
+            .SHAPE => {
+                page.save()!;
+                page.concat(it.transform.then(base))!;
+                let p = &doc.paths.items()[it.path];
+                if it.has_fill {
+                    page.fill(p, faded(it.fill, alpha), it.fill_rule)!;
+                }
+                if it.has_stroke {
+                    page.stroke(p, faded(it.stroke, alpha), it.style)!;
+                }
+                page.restore()!;
+            }
+            .TEXT => {
+                if opts.has_font {
+                    tp.clear();
+                    text_item_path(it, opts, &mut pen, &mut tp)!;
+                    page.save()!;
+                    page.concat(it.transform.then(base))!;
+                    if it.has_fill {
+                        page.fill(&tp, faded(it.fill, alpha), it.fill_rule)!;
+                    }
+                    if it.has_stroke {
+                        page.stroke(&tp, faded(it.stroke, alpha), it.style)!;
+                    }
+                    page.restore()!;
+                }
+            }
+            .IMAGE => {
+                page.save()!;
+                page.concat(it.transform.then(base))!;
+                page.image(&doc.images.items()[it.image], 0.0, 0.0, it.width, it.height)!;
+                page.restore()!;
+            }
+        }
+    }
+    while depth > 0 {
+        page.restore()!;
+        depth -= 1;
+    }
+    page.restore()!;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+/// Renders an SVG text at its own size.
+fn render_text(text: []u8) !image.Image {
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    return render_image(&doc, @int_from_float(usize, doc.width), @int_from_float(usize, doc.height));
+}
+
+fn px(img: *image.Image, x: usize, y: usize) u32 {
+    return img.get(x, y).to_rgba8().to_u32();
+}
+
+fn near(img: *image.Image, x: usize, y: usize, want: u32, tol: u32) bool {
+    let got = px(img, x, y);
+    for k in @as(u32, 0)..4 {
+        let a = (got >> (8 * k)) & 0xff;
+        let b = (want >> (8 * k)) & 0xff;
+        if (@max(a, b) - @min(a, b)) > tol {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn void_fails(r: !void, want: error) bool {
+    r catch |e| {
+        return e == want;
+    };
+    return false;
+}
+
+/// Whether the pixels around (x, y) are all the same.
+fn uniform(img: *image.Image, x: usize, y: usize) bool {
+    let c = px(img, x, y);
+    for dy in @as(usize, 0)..3 {
+        for dx in @as(usize, 0)..3 {
+            if ((x + dx) < 1) or ((y + dy) < 1) or ((x + dx) > img.width) or ((y + dy) > img.height) {
+                continue;
+            }
+            if px(img, (x + dx) - 1, (y + dy) - 1) != c {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn same_points(p: *draw.Path, want: []f64) bool {
+    let pts = p.pts.items();
+    if pts.len != want.len {
+        return false;
+    }
+    for i in @as(usize, 0)..pts.len {
+        if @abs(pts[i] - want[i]) > 1.0e-9 {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "path data" {
+    let mut p = draw.Path.init();
+    defer p.deinit();
+    // relative commands, implicit linetos, H and V, close then draw on
+    parse_path_data("m10,20 30 0 v10 H5 z l5 5", &mut p)!;
+    let want: [12]f64 = [10.0, 20.0, 40.0, 20.0, 40.0, 30.0, 5.0, 30.0, 10.0, 20.0, 15.0, 25.0];
+    @expect(same_points(&p, want[..]));
+    @expect_eq(p.verbs.len, 7);  // M L L L Z M L
+    @expect(p.verbs.get(4) == draw.Verb.CLOSE);
+    @expect(p.verbs.get(5) == draw.Verb.MOVE);
+    // compact numbers: "1.5.5" is 1.5 then .5, "-1-2" two numbers, exponents
+    p.clear();
+    parse_path_data("M1.5.5L-1-2l1e1,2E-1", &mut p)!;
+    let want2: [6]f64 = [1.5, 0.5, -1.0, -2.0, 9.0, -1.8];
+    @expect(same_points(&p, want2[..]));
+    // S and T reflect the last control point
+    p.clear();
+    parse_path_data("M0 0 C10 0 20 10 20 20 S30 40 40 40 M0 0 Q10 0 10 10 T20 20", &mut p)!;
+    let pts = p.pts.items();
+    @expect_eq(pts[8], 20.0);  // the reflection of (20, 10) about (20, 20)
+    @expect_eq(pts[9], 30.0);
+    @expect_eq(pts[20], 10.0);  // the reflection of (10, 0) about (10, 10)
+    @expect_eq(pts[21], 20.0);
+    // errors keep what came before
+    p.clear();
+    let r = parse_path_data("M0 0 L10 10 L20 x L30 30", &mut p);
+    @expect(void_fails(r, error.InvalidPathData));
+    @expect_eq(p.verbs.len, 2);
+    p.clear();
+    @expect(void_fails(parse_path_data("L10 10", &mut p), error.InvalidPathData));
+    @expect_eq(p.verbs.len, 0);
+    @expect(void_fails(parse_path_data("M0 0 Z 5", &mut p), error.InvalidPathData));
+    p.clear();
+    // arc flags need no separators
+    parse_path_data("M0 0a10 10 0 1110 10", &mut p)!;
+    @expect(p.verbs.get(p.verbs.len - 1) == draw.Verb.CUBIC);
+    @expect_eq(p.pts.get(p.pts.len - 2), 10.0);
+    @expect_eq(p.pts.get(p.pts.len - 1), 10.0);
+    // round trip
+    let mut q = draw.Path.init();
+    defer q.deinit();
+    q.move_to(1.25, -2.0)!;
+    q.quad_to(3.0, 4.0, 5.0, 6.0)!;
+    q.cubic_to(7.0, 8.0, 9.5, 10.0, 11.0, 12.0)!;
+    q.line_to(0.001, 1000000.0)!;
+    q.close()!;
+    let d = path_data(&q)!;
+    defer mem.free(d);
+    @expect(strs.eq(d, "M1.25 -2Q3 4 5 6C7 8 9.5 10 11 12L0.001 1000000Z"));
+    p.clear();
+    parse_path_data(d, &mut p)!;
+    @expect(same_points(&p, q.pts.items()));
+    @expect_eq(p.verbs.len, q.verbs.len);
+}
+
+/// The largest distance of the arc's curve points (sampled) from the
+/// ellipse centred at (cx, cy) with radii rx, ry rotated by rot degrees, in
+/// units of the radii.
+fn ellipse_error(p: *draw.Path, cx: f64, cy: f64, rx: f64, ry: f64, rot: f64) f64 {
+    let sc = math.sincos(rot * (math.PI / 180.0));
+    let pts = p.pts.items();
+    let mut worst: f64 = 0.0;
+    let mut k: usize = 2;  // after the move
+    let mut x0 = pts[0];
+    let mut y0 = pts[1];
+    while (k + 6) <= pts.len {
+        for i in @as(usize, 0)..21 {
+            let t = @float_from_int(f64, i) / 20.0;
+            let x = pathdata_cubic(x0, pts[k], pts[k + 2], pts[k + 4], t) - cx;
+            let y = pathdata_cubic(y0, pts[k + 1], pts[k + 3], pts[k + 5], t) - cy;
+            let u = ((x * sc.cos) + (y * sc.sin)) / rx;
+            let v = ((y * sc.cos) - (x * sc.sin)) / ry;
+            worst = @max(worst, @abs(@sqrt((u * u) + (v * v)) - 1.0));
+        }
+        x0 = pts[k + 4];
+        y0 = pts[k + 5];
+        k += 6;
+    }
+    return worst;
+}
+
+fn pathdata_cubic(a: f64, b: f64, c: f64, d: f64, t: f64) f64 {
+    let u = 1.0 - t;
+    return ((((u * u) * u) * a) + (((3.0 * (u * u)) * t) * b)) + ((((3.0 * u) * (t * t)) * c) + (((t * t) * t) * d));
+}
+
+test "arcs against the ellipse" {
+    let mut p = draw.Path.init();
+    defer p.deinit();
+    // a half circle from (0, 0) to (100, 0), sweeping through (50, -50)
+    parse_path_data("M0 0 A50 50 0 0 1 100 0", &mut p)!;
+    @expect_eq(p.verbs.len, 3);
+    @expect(@abs(p.pts.get(6) - 50.0) < 1.0e-9);
+    @expect(@abs(p.pts.get(7) + 50.0) < 1.0e-9);
+    @expect(ellipse_error(&p, 50.0, 0.0, 50.0, 50.0, 0.0) < 3.0e-4);
+    // the other sweep goes through (50, 50); radii too small are scaled up
+    p.clear();
+    parse_path_data("M0 0 A1 1 0 0 0 100 0", &mut p)!;
+    @expect(@abs(p.pts.get(7) - 50.0) < 1.0e-9);
+    @expect(ellipse_error(&p, 50.0, 0.0, 50.0, 50.0, 0.0) < 3.0e-4);
+    // a rotated ellipse: from angle 0 to 90 degrees of x = 40 cos t, y = 20
+    // sin t turned by 30 degrees, the small arc and (centred on the
+    // reflection) the large one
+    let s30: f64 = 0.5;
+    let c30 = @sqrt(3.0) / 2.0;
+    let ax = 40.0 * c30;
+    let ay = 40.0 * s30;
+    let bx = -20.0 * s30;
+    let by = 20.0 * c30;
+    for large in @as(u32, 0)..2 {
+        for sweep in @as(u32, 0)..2 {
+            p.clear();
+            p.move_to(ax, ay)!;
+            arc_case(&mut p, ax, ay, bx, by, large == 1, sweep == 1)!;
+            // the centre: (0, 0) when large != sweep... as SVG F.6.5 picks
+            let mut cx: f64 = 0.0;
+            let mut cy: f64 = 0.0;
+            if (large == 1) == (sweep == 1) {
+                cx = ax + bx;
+                cy = ay + by;
+            }
+            @expect(ellipse_error(&p, cx, cy, 40.0, 20.0, 30.0) < 3.0e-4);
+            // it ends exactly at the end point
+            @expect_eq(p.pts.get(p.pts.len - 2), bx);
+            @expect_eq(p.pts.get(p.pts.len - 1), by);
+            // large arcs take more than half a turn: at least 3 segments
+            if large == 1 {
+                @expect(p.verbs.len >= 4);
+            } else {
+                @expect_eq(p.verbs.len, 2);
+            }
+        }
+    }
+    // degenerate arcs: same end point (nothing), zero radius (a line)
+    p.clear();
+    parse_path_data("M5 5 A10 10 0 0 0 5 5 A0 10 0 0 0 20 20", &mut p)!;
+    @expect_eq(p.verbs.len, 2);
+    @expect(p.verbs.get(1) == draw.Verb.LINE);
+}
+
+fn arc_case(p: *mut draw.Path, ax: f64, ay: f64, bx: f64, by: f64, large: bool, sweep: bool) !void {
+    pathdata.arc_to(p, ax, ay, 40.0, 20.0, 30.0, large, sweep, bx, by)!;
+}
+
+fn check_probes(name: []u8) !void {
+    let mut pathb = strs.String.init();
+    defer pathb.deinit();
+    pathb.push_str("std/graphics/svg/testdata/")!;
+    pathb.push_str(name)!;
+    pathb.push_str(".svg")!;
+    let text = files.read_file(pathb.bytes())!;
+    defer mem.free(text);
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    pathb.truncate(pathb.bytes().len - 3);
+    pathb.push_str("probes")!;
+    let probes = files.read_file(pathb.bytes())!;
+    defer mem.free(probes);
+    let mut lines = strs.lines(probes);
+    let mut n: usize = 0;
+    loop {
+        let line = lines.next() catch break;
+        if (line.len == 0) or (line[0] == '#') {
+            continue;
+        }
+        let mut f = strs.fields(line);
+        let mut v: [6]u32 = [0; 6];
+        for i in @as(usize, 0)..6 {
+            v[i] = fmt.parse_int.[u32](f.next()!)!;
+        }
+        let got = img.get(@as(usize, v[0]), @as(usize, v[1])).to_rgba8();
+        let want: [4]u32 = [v[2], v[3], v[4], v[5]];
+        let have: [4]u32 = [@as(u32, got.r), @as(u32, got.g), @as(u32, got.b), @as(u32, got.a)];
+        let mut ok = (@max(have[3], want[3]) - @min(have[3], want[3])) <= 2;
+        if want[3] > 0 {
+            for k in @as(usize, 0)..3 {
+                if (@max(have[k], want[k]) - @min(have[k], want[k])) > 2 {
+                    ok = false;
+                }
+            }
+        }
+        if not ok {
+            let mut eb: [160]u8 = [0; 160];
+            let msg = fmt.bufprint(
+                eb[..], "{}: ({}, {}) is {} {} {} {}, skia {} {} {} {}\n", [
+                    fmt.str(name), fmt.int(v[0]), fmt.int(v[1]), fmt.int(have[0]), fmt.int(have[1]), fmt.int(have[2]),
+                    fmt.int(have[3]), fmt.int(want[0]), fmt.int(want[1]), fmt.int(want[2]), fmt.int(want[3])]) catch "";
+            io.stderr().write_all(msg) catch {};
+        }
+        @expect(ok);
+        n += 1;
+    }
+    @expect(n > 50);
+}
+
+test "rendering matches skia" {
+    let names: [11][]u8 = ["shapes", "paths", "gradients", "strokes", "transforms", "fit", "fit2", "fit3", "clip",
+                           "alpha", "groups"];
+    for name in names {
+        check_probes(name)!;
+    }
+}
+
+test "style sheets and the cascade" {
+    let doc = files.read_file("std/graphics/svg/testdata/cascade.svg")!;
+    defer mem.free(doc);
+    let mut img = render_text(doc)!;
+    defer img.deinit();
+    @expect(near(&img, 25, 25, 0x0000ffff, 0));    // type selector
+    @expect(near(&img, 75, 25, 0xffa500ff, 0));    // class
+    @expect(near(&img, 56, 25, 0x000000ff, 0));    // its stroke
+    @expect(near(&img, 125, 25, 0x008000ff, 0));   // id beats class
+    @expect(near(&img, 175, 25, 0xffff00ff, 0));   // the style attribute beats all
+    @expect(near(&img, 25, 75, 0x800080ff, 0));    // child combinator
+    @expect(near(&img, 75, 75, 0x008080ff, 0));    // currentColor
+    @expect(near(&img, 125, 75, 0x008000ff, 1));   // hsl()
+    @expect(near(&img, 175, 75, 0x0000ffff, 0));   // sheets beat presentation attributes
+    @expect(near(&img, 25, 125, 0x00ff00ff, 0));   // !important beats the style attribute
+    @expect(near(&img, 75, 125, 0x800000ff, 0));   // descendant combinator
+    @expect(near(&img, 125, 125, 0x000080ff, 0));  // compound classes
+    @expect(near(&img, 175, 125, 0x000000ff, 0));  // inherit: the root's black
+}
+
+test "opacity: groups and elements" {
+    let doc = files.read_file("std/graphics/svg/testdata/opacity.svg")!;
+    defer mem.free(doc);
+    let mut img = render_text(doc)!;
+    defer img.deinit();
+    // the group is drawn, then blended (as SVG renderers blend: sRGB values):
+    // its overlap is half blue over white
+    let half_blue: u32 = 0x8080ffff;
+    let half_red: u32 = 0xff8080ff;
+    @expect(near(&img, 20, 10, half_blue, 1));
+    @expect(near(&img, 5, 10, half_red, 1));
+    // two translucent elements blend each
+    @expect(near(&img, 70, 10, 0x8040bfff, 1));
+    // fill and stroke with opacity: a group, so the stroke over the fill is half blue
+    @expect(near(&img, 12, 45, half_blue, 1));
+    @expect(near(&img, 25, 45, half_red, 1));
+    @expect(near(&img, 75, 45, half_red, 1));
+}
+
+test "use, symbol, switch and nested viewports" {
+    let doc = files.read_file("std/graphics/svg/testdata/use.svg")!;
+    defer mem.free(doc);
+    let mut img = render_text(doc)!;
+    defer img.deinit();
+    @expect(near(&img, 35, 150, 0x008000ff, 0));   // the symbol, scaled into the use's box
+    @expect(near(&img, 90, 130, 0x000000ff, 0));   // the nested viewport's content
+    @expect_eq(px(&img, 75, 170), 0);              // and its clip: no red outside it
+    @expect(near(&img, 150, 150, 0x008080ff, 0));  // switch: the first child only
+    @expect(near(&img, 160, 20, 0xffa500ff, 0));   // the use cycle is cut, the rest drawn
+}
+
+test "masks" {
+    let text = files.read_file("std/graphics/svg/testdata/mask.svg")!;
+    defer mem.free(text);
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    @expect(near(&img, 5, 5, 0x0000ffff, 0));    // under the mask's white
+    @expect_eq(px(&img, 25, 25), 0);             // its black: a hole
+    @expect(near(&img, 75, 10, 0x0000ff80, 1));  // its grey: half
+    @expect(near(&img, 10, 60, 0xff0000ff, 0));  // a mask in bounding box units
+    @expect_eq(px(&img, 30, 60), 0);
+    @expect(near(&img, 65, 60, 0x008000ff, 0));  // a mask's region
+    @expect_eq(px(&img, 55, 60), 0);
+    @expect_eq(px(&img, 75, 60), 0);
+    // a PDF page draws what is masked whole
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    let mut pd = pdf.Document.init();
+    defer pd.deinit();
+    let mut page = pd.page(100.0, 70.0)!;
+    defer page.deinit();
+    render_page(&doc, &mut page, 0.0, 0.0, 100.0, 70.0)!;
+}
+
+fn data_uri_svg(img: *image.Image) ![]mut u8 {
+    let data = png.encode(img, 6)!;
+    defer mem.free(data);
+    let mut s = strs.String.init();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'>")!;
+    for k in @as(usize, 0)..2 {
+        if k == 0 {
+            s.push_str("<image x='10' y='10' width='80' height='80' preserveAspectRatio='none' href='")!;
+        } else {
+            s.push_str("<image x='110' y='10' width='80' height='40' href='")!;
+        }
+        s.push_str("data:image/png;base64,\n")!;
+        base64.encode_to(s.writer(), data, base64.STANDARD)!;
+        s.push_str("'/>")!;
+    }
+    s.push_str("<image x='0' y='0' width='10' height='10' href='data:image/png;base64,AAAA'/>")!;
+    s.push_str("<image x='0' y='0' width='10' height='10' href='picture.png'/></svg>")!;
+    return s.take();
+}
+
+test "images" {
+    let mut src = image.Image.init(4, 4, 4, image.Depth.U8)!;
+    defer src.deinit();
+    let cols: [4]u32 = [0xff0000ff, 0x00ff00ff, 0x0000ffff, 0xffff00ff];
+    for y in @as(usize, 0)..4 {
+        for x in @as(usize, 0)..4 {
+            src.set(x, y, color.Color.from_rgba8(color.Rgba8.from_u32(cols[(x / 2) + (2 * (y / 2))])));
+        }
+    }
+    let text = data_uri_svg(&src)!;
+    defer mem.free(text);
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    // stretched (none): each quadrant 40 pixels square
+    @expect(near(&img, 20, 20, 0xff0000ff, 0));
+    @expect(near(&img, 70, 20, 0x00ff00ff, 0));
+    @expect(near(&img, 20, 70, 0x0000ffff, 0));
+    @expect(near(&img, 70, 70, 0xffff00ff, 0));
+    // meet: 40 x 40, centred in 80 x 40
+    @expect_eq(px(&img, 125, 30), 0);
+    @expect(near(&img, 135, 15, 0xff0000ff, 0));
+    @expect(near(&img, 160, 40, 0xffff00ff, 0));
+    @expect_eq(px(&img, 175, 30), 0);
+    // the broken and external images draw nothing
+    @expect_eq(px(&img, 5, 5), 0);
+}
+
+test "text" {
+    let mut f = font.Font.load("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") catch return;
+    defer f.deinit();
+    let docs: [3][]u8 = ["text-middle", "text-end", "text-tspan"];
+    for k in @as(usize, 0)..3 {
+        let mut nb = strs.String.init();
+        defer nb.deinit();
+        nb.push_str("std/graphics/svg/testdata/")!;
+        nb.push_str(docs[k])!;
+        nb.push_str(".svg")!;
+        let text = files.read_file(nb.bytes())!;
+        defer mem.free(text);
+        let mut doc = parse(text)!;
+        defer doc.deinit();
+        let mut img = render_image_with(&doc, 200, 60, RenderOptions.with_font(&f))!;
+        defer img.deinit();
+        let mut minx: usize = 1000;
+        let mut maxx: usize = 0;
+        let mut red_top: usize = 1000;
+        for y in @as(usize, 0)..60 {
+            for x in @as(usize, 0)..200 {
+                let c = img.get(x, y);
+                if c.a > 0.5 {
+                    minx = @min(minx, x);
+                    maxx = @max(maxx, x);
+                    if c.r > 0.5 {
+                        red_top = @min(red_top, y);
+                    }
+                }
+            }
+        }
+        @expect(maxx > minx);
+        if k == 0 {
+            let mid = (minx + maxx) / 2;
+            @expect((mid >= 97) and (mid <= 103));
+        } else if k == 1 {
+            @expect((maxx <= 190) and (maxx >= 180));  // ("I" has side bearings)
+        } else {
+            @expect(red_top > 30);  // the tspan moved down
+        }
+        // without a font nothing is drawn
+        let mut bare = render_image(&doc, 200, 60)!;
+        defer bare.deinit();
+        @expect_eq(px(&bare, (minx + maxx) / 2, 40), 0);
+    }
+}
+
+test "writing, then reading back" {
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let red = draw.Paint.solid(color.Color.rgb(1.0, 0.0, 0.0));
+    let stops: [2]draw.Stop = [
+        draw.Stop.{ offset: 0.0, color: color.Color.rgb(0.0, 0.0, 1.0) },
+        draw.Stop.{ offset: 1.0, color: color.Color.rgb(0.0, 1.0, 0.0) },
+    ];
+    let grad = draw.Paint.linear(10.0, 0.0, 40.0, 0.0, stops[..]).with_spread(draw.Spread.PAD);
+    let mut tri = draw.Path.init();
+    defer tri.deinit();
+    let corners: [6]f64 = [10.0, 10.0, 50.0, 10.0, 30.0, 40.0];
+    tri.polygon(corners[..])!;
+    let mut line = draw.Path.init();
+    defer line.deinit();
+    line.move_to(60.0, 20.0)!;
+    line.line_to(110.0, 20.0)!;
+    let mut disc = draw.Path.init();
+    defer disc.deinit();
+    disc.circle(100.0, 60.0, 15.0)!;
+    let mut st = draw.Stroke.width(6.0);
+    st.cap = draw.Cap.ROUND;
+    let dashes: [2]f64 = [6.0, 3.0];
+    let mut dst = draw.Stroke.width(2.0);
+    dst.dash = dashes[..];
+    let mut small = image.Image.init(2, 2, 4, image.Depth.U8)!;
+    defer small.deinit();
+    small.fill(color.Color.rgb(1.0, 1.0, 0.0));
+    {
+        let mut w = Writer.begin(out.writer(), 120.0, 80.0)!;
+        defer w.deinit();
+        w.fill_rect(0.0, 0.0, 120.0, 80.0, draw.Paint.solid(color.Color.rgb(1.0, 1.0, 1.0)))!;
+        w.fill(&tri, red, draw.FillRule.NONZERO)!;
+        w.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 1.0)), st)!;
+        w.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)), dst)!;
+        w.fill_rect(0.0, 50.0, 50.0, 20.0, grad)!;
+        w.begin_group(draw.Affine.translation(60.0, 30.0), 0.5)!;
+        w.fill_rect(0.0, 0.0, 20.0, 10.0, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)))!;
+        w.end_group()!;
+        w.begin_clip(&disc, draw.FillRule.NONZERO)!;
+        w.fill_rect(80.0, 40.0, 40.0, 40.0, draw.Paint.solid(color.Color.rgba(0.0, 0.5, 0.0, 1.0)))!;
+        w.end_group()!;
+        w.text(5.0, 78.0, "a < b & c", 8.0, "sans-serif", color.Color.rgb(0.0, 0.0, 0.0))!;
+        w.image(&small, 0.0, 0.0, 4.0, 4.0)!;
+        @expect(void_fails(w.end_group(), error.InvalidSvg));
+        w.finish()!;
+    }
+    let text = out.bytes();
+    @expect(strs.starts_with(text, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><svg xmlns="));
+    @expect(strs.contains(text, "<linearGradient id=\"g1\" gradientUnits=\"userSpaceOnUse\" x1=\"10\""));
+    @expect(strs.contains(text, "stroke-dasharray=\"6 3\""));
+    @expect(strs.contains(text, "stroke-linecap=\"round\""));
+    @expect(strs.contains(text, "opacity=\"0.5\""));
+    @expect(strs.contains(text, "clip-path=\"url(#c2)\""));
+    @expect(strs.contains(text, ">a &lt; b &amp; c</text>"));
+    @expect(strs.contains(text, "xlink:href=\"data:image/png;base64,"));
+    @expect(strs.ends_with(text, "</svg>\n"));
+    let mut img = render_text(text)!;
+    defer img.deinit();
+    // the same, drawn directly
+    let mut ref = image.Image.init(120, 80, 4, image.Depth.U8)!;
+    defer ref.deinit();
+    let mut cv = draw.Canvas.init(&mut ref);
+    defer cv.deinit();
+    cv.clear(color.Color.rgb(1.0, 1.0, 1.0));
+    cv.fill(&tri, red, draw.FillRule.NONZERO)!;
+    cv.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 1.0)), st)!;
+    cv.stroke(&line, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)), dst)!;
+    cv.fill_rect(60.0, 30.0, 20.0, 10.0, draw.Paint.solid(color.Color.rgba(0.0, 0.0, 0.0, 0.5)))!;
+    cv.save()!;
+    cv.clip_to(&disc, draw.FillRule.NONZERO)!;
+    cv.fill_rect(80.0, 40.0, 40.0, 40.0, draw.Paint.solid(color.Color.rgba(0.0, 0.5, 0.0, 1.0)))!;
+    cv.restore();
+    cv.draw_image(&small, 0.0, 0.0, 4.0, 4.0)!;
+    // everything but the gradient's inside (SVG interpolates in sRGB) and the text
+    for y in @as(usize, 0)..80 {
+        for x in @as(usize, 0)..120 {
+            let in_grad = (x < 50) and (y >= 50) and (y < 70);
+            let in_text = (x < 60) and (y >= 70);
+            if in_grad or in_text {
+                continue;
+            }
+            // (where nothing is translucent: SVG blends sRGB values, draw linear ones)
+            if (x >= 59) and (x <= 80) and (y >= 29) and (y <= 40) {
+                continue;
+            }
+            if not uniform(&ref, x, y) {
+                continue;
+            }
+            let a = px(&img, x, y);
+            @expect(near(&ref, x, y, a, 1));
+        }
+    }
+    @expect(near(&img, 70, 35, 0x808080ff, 1));  // the half black group
+    // the gradient's pad regions
+    @expect(near(&img, 5, 60, 0x0000ffff, 0));
+    @expect(near(&img, 45, 60, 0x00ff00ff, 0));
+    // near halfway (t = 0.483), interpolated in sRGB
+    @expect(near(&img, 24, 60, 0x007b84ff, 2));
+}
+
+test "malformed documents" {
+    // (bad01.svg is empty, bad02 not XML, bad03 cut short, bad04 not SVG; the
+    // rest are SVG with wrong values, references and structures)
+    let mut nb = strs.String.init();
+    defer nb.deinit();
+    for k in @as(usize, 1)..23 {
+        nb.clear();
+        nb.push_str("std/graphics/svg/testdata/bad")!;
+        nb.push('0' + @truncate(u8, k / 10))!;
+        nb.push('0' + @truncate(u8, k % 10))!;
+        nb.push_str(".svg")!;
+        let b = files.read_file(nb.bytes())!;
+        defer mem.free(b);
+        let mut doc = parse(b) catch continue;
+        defer doc.deinit();
+        let mut img = render_image(&doc, 16, 16)!;
+        img.deinit();
+    }
+    // every prefix of a document
+    let full = files.read_file("std/graphics/svg/testdata/groups.svg")!;
+    defer mem.free(full);
+    let mut n: usize = 0;
+    while n < full.len {
+        let mut doc = parse(full[..n]) catch {
+            n += 13;
+            continue;
+        };
+        let mut img = render_image(&doc, 8, 8)!;
+        img.deinit();
+        doc.deinit();
+        n += 13;
+    }
+}
+
+test "limits" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // a use that multiplies: refused, not run for ever
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg'><rect id='l0' width='1' height='1'/>")!;
+    let digits = "0123456789";
+    for level in @as(usize, 1)..8 {
+        s.push_str("<g id='l")!;
+        s.push(digits[level])!;
+        s.push_str("'>")!;
+        for _k in @as(usize, 0)..10 {
+            s.push_str("<use href='#l")!;
+            s.push(digits[level - 1])!;
+            s.push_str("'/>")!;
+        }
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    // deep nesting
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg'>")!;
+    for _k in @as(usize, 0)..1000 {
+        s.push_str("<g>")!;
+    }
+    for _k in @as(usize, 0)..1000 {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+}
+
+fn fails_doc(r: !Document, want: error) bool {
+    let mut d = r catch |e| return e == want;
+    d.deinit();
+    return false;
+}
+
+test "rendering onto a PDF page" {
+    let text = files.read_file("std/graphics/svg/testdata/clip.svg")!;
+    defer mem.free(text);
+    let mut doc = parse(text)!;
+    defer doc.deinit();
+    let mut pd = pdf.Document.init();
+    defer pd.deinit();
+    let mut page = pd.page(300.0, 300.0)!;
+    defer page.deinit();
+    render_page(&doc, &mut page, 50.0, 50.0, 200.0, 200.0)!;
+    let c = page.content.bytes();
+    @expect(strs.contains(c, "W n\n"));   // the clips
+    @expect(strs.contains(c, "W* n\n"));  // (one even-odd)
+    @expect(strs.contains(c, " c\n"));    // curves
+    @expect(strs.contains(c, "f\n"));     // fills
+    pd.add_page(&mut page)!;
+    let bytes = pd.bytes()!;
+    defer mem.free(bytes);
+    @expect(strs.starts_with(bytes, "%PDF-"));
+}
+
+test "viewbox transforms" {
+    let vb: [4]f64 = [10.0, 20.0, 50.0, 25.0];
+    // meet, centred: scale 2 (100 x 50 of 100 x 80), 15 down
+    let t = viewbox_transform(vb, Fit.default(), 100.0, 80.0);
+    let p = t.apply(10.0, 20.0);
+    @expect(@abs(p.x) < 1.0e-12);
+    @expect(@abs(p.y - 15.0) < 1.0e-12);
+    let q = t.apply(60.0, 45.0);
+    @expect(@abs(q.x - 100.0) < 1.0e-12);
+    @expect(@abs(q.y - 65.0) < 1.0e-12);
+    // slice at the maximum: scale 3.2, overflowing to the left
+    let s = viewbox_transform(vb, parse_fit("xMaxYMax slice"), 100.0, 80.0);
+    let r = s.apply(60.0, 45.0);
+    @expect(@abs(r.x - 100.0) < 1.0e-9);
+    @expect(@abs(r.y - 80.0) < 1.0e-9);
+    @expect(@abs(s.a - 3.2) < 1.0e-12);
+    // none stretches
+    let n = viewbox_transform(vb, parse_fit("none"), 100.0, 100.0);
+    @expect(@abs(n.a - 2.0) < 1.0e-12);
+    @expect(@abs(n.d - 4.0) < 1.0e-12);
+}
