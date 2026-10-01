@@ -75,7 +75,7 @@ async function runWasm(file) {
     print_bool: b => line(b ? 'true' : 'false'),
   };
   const instance = host.instantiate(fs.readFileSync(file), { env });
-  mem = instance.exports.memory;
+  mem = instance.exports.memory || host.memory();
   const lines = () => { const o = text.split('\n'); if (o[o.length - 1] === '') o.pop(); return o; };
   try {
     (instance.exports.run || instance.exports.main)();
