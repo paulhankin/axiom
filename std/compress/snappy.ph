@@ -1,0 +1,1003 @@
+// =============================================================================
+// std/compress/snappy.ph - Snappy: very fast compression, in the raw format
+// and the framing format.
+//
+//     let packed = snappy.compress(data)!;                // framed; the caller frees
+//     let back = snappy.decompress(packed, 1 << 30)!;     // at most 1 GiB out
+//     snappy.compress_to(w, data)!;                       // framed, to an io.Writer
+//
+//     let raw = snappy.compress_raw(data)!;               // one raw block
+//     let back2 = snappy.decompress_raw(raw, 1 << 30)!;
+//
+//     let mut zw = snappy.Writer.init(w)!;                // streaming (framed)
+//     zw.write_all(part)!;
+//     zw.flush()!;
+//     zw.deinit();
+//     let zr = snappy.Reader.init(r)!;                    // an io.Reader of the data
+//
+// The raw format (format_description.txt in github.com/google/snappy): the
+// uncompressed length as a varint, then literals and copies (with 1-, 2- or
+// 4-byte offsets) that may overlap what they copy. The framing format
+// (framing_format.txt): a stream identifier, then chunks of at most 64 KiB of
+// data, compressed or stored, each with the masked CRC-32C of its data;
+// padding and reserved skippable chunks are skipped, so concatenated
+// streams decode as one.
+//
+// The compressor is the reference's: 64 KiB blocks, a hash table of 4-byte
+// sequences with skipping over incompressible data, copies of at most 64
+// bytes. The framing writer stores a chunk instead when compressing saves
+// less than an eighth.
+//
+// Decompression checks every length and offset, and the CRCs, and stops at
+// max_size, so hostile input cannot overrun anything or balloon: it fails
+// with Corrupt, ChecksumMismatch or TooLarge.
+// =============================================================================
+
+import "../hash/crc.ph" as crc;
+import "../io.ph" as io;
+import "../mem.ph" as mem;
+import "../os/fs.ph" as fs;
+import "../str.ph" as strs;
+
+error { Corrupt, ChecksumMismatch, TooLarge, OutOfMemory, EndOfStream }
+
+const BLOCK: usize = 65536;
+const HASH_BITS: u32 = 14;
+const TABLE_SIZE: usize = 16384;
+const INPUT_MARGIN: usize = 15;
+// the largest chunk body the framing format can carry: a CRC and a compressed 64 KiB
+const MAX_CHUNK: usize = 4 + 32 + BLOCK + (BLOCK / 6);
+let IDENT: []u8 = "sNaPpY";
+
+fn le32(b: []u8, i: usize) u32 {
+    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8) | (@as(u32, b[i + 2]) << 16) | (@as(u32, b[i + 3]) << 24);
+}
+
+fn le64(b: []u8, i: usize) u64 {
+    return @as(u64, le32(b, i)) | (@as(u64, le32(b, i + 4)) << 32);
+}
+
+/// The largest raw encoding of n bytes.
+pub fn max_compressed_len(n: usize) usize {
+    return (32 + n) + (n / 6);
+}
+
+/// The CRC-32C of data, masked as the framing format stores it.
+pub fn masked_crc(c: *crc.Crc, data: []u8) u32 {
+    let x = @truncate(u32, c.checksum(data));
+    return ((x >> 15) | (x << 17)) +% 0xa282ead8;
+}
+
+// -----------------------------------------------------------------------------
+// Raw format: decoding
+// -----------------------------------------------------------------------------
+
+/// Reads the varint preamble: the length and the size of the varint.
+fn preamble(src: []u8, len: *mut u64) !usize {
+    let mut v: u64 = 0;
+    for i in @as(usize, 0)..5 {
+        if i >= src.len {
+            return error.Corrupt;
+        }
+        let b = src[i];
+        v |= @as(u64, b & 0x7f) << @as(u64, 7 * i);
+        if (b & 0x80) == 0 {
+            if v > 0xffffffff {
+                return error.Corrupt;
+            }
+            len.* = v;
+            return i + 1;
+        }
+    }
+    return error.Corrupt;
+}
+
+/// The uncompressed length a raw block declares.
+pub fn decoded_len(src: []u8) !usize {
+    let mut n: u64 = 0;
+    _ = preamble(src, &mut n)!;
+    if n > @as(u64, @max_value(usize)) {
+        return error.TooLarge;
+    }
+    return @int_cast(usize, n);
+}
+
+/// Decompresses a raw block into new memory (the caller frees it); fails
+/// with TooLarge if it declares more than max_size bytes.
+pub fn decompress_raw(src: []u8, max_size: usize) ![]mut u8 {
+    let n = decoded_len(src)!;
+    if n > max_size {
+        return error.TooLarge;
+    }
+    let out = mem.alloc.[u8](n)!;
+    decompress_raw_into(src, out) catch |e| {
+        mem.free(out);
+        return e;
+    };
+    return out;
+}
+
+/// Decompresses a raw block into out, which must be exactly decoded_len
+/// bytes (Corrupt otherwise).
+pub fn decompress_raw_into(src: []u8, out: []mut u8) !void {
+    let mut n: u64 = 0;
+    let start = preamble(src, &mut n)!;
+    if n != @as(u64, out.len) {
+        return error.Corrupt;
+    }
+    decode_body(src[start..], out)!;
+}
+
+/// The literals and copies of a raw block, which must fill dst exactly.
+fn decode_body(src: []u8, dst: []mut u8) !void {
+    let mut s: usize = 0;
+    let mut d: usize = 0;
+    while s < src.len {
+        let tag = src[s];
+        s += 1;
+        let kind = tag & 3;
+        if kind == 0 {
+            let mut lit = @as(u64, tag >> 2);
+            if lit >= 60 {
+                let nb = @as(usize, (tag >> 2) - 59);
+                if nb > (src.len - s) {
+                    return error.Corrupt;
+                }
+                lit = 0;
+                for k in @as(usize, 0)..nb {
+                    lit |= @as(u64, src[s + k]) << @as(u64, 8 * k);
+                }
+                s += nb;
+            }
+            lit += 1;
+            if (lit > @as(u64, src.len - s)) or (lit > @as(u64, dst.len - d)) {
+                return error.Corrupt;
+            }
+            let l = @int_cast(usize, lit);
+            @mem_copy(dst[d..d + l], src[s..s + l]);
+            s += l;
+            d += l;
+            continue;
+        }
+        let mut len: usize = 0;
+        let mut off: usize = 0;
+        if kind == 1 {
+            if s >= src.len {
+                return error.Corrupt;
+            }
+            len = 4 + @as(usize, (tag >> 2) & 7);
+            off = (@as(usize, tag >> 5) << 8) | @as(usize, src[s]);
+            s += 1;
+        } else if kind == 2 {
+            if (src.len - s) < 2 {
+                return error.Corrupt;
+            }
+            len = 1 + @as(usize, tag >> 2);
+            off = @as(usize, src[s]) | (@as(usize, src[s + 1]) << 8);
+            s += 2;
+        } else {
+            if (src.len - s) < 4 {
+                return error.Corrupt;
+            }
+            len = 1 + @as(usize, tag >> 2);
+            let o32 = le32(src, s);
+            s += 4;
+            if @as(u64, o32) > @as(u64, d) {
+                return error.Corrupt;
+            }
+            off = @int_cast(usize, o32);
+        }
+        if (off == 0) or (off > d) or (len > (dst.len - d)) {
+            return error.Corrupt;
+        }
+        if off >= len {
+            @mem_copy(dst[d..d + len], dst[d - off..(d - off) + len]);
+        } else {
+            for k in d..d + len {
+                dst[k] = dst[k - off];
+            }
+        }
+        d += len;
+    }
+    if d != dst.len {
+        return error.Corrupt;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Raw format: encoding
+// -----------------------------------------------------------------------------
+
+fn put_varint(out: []mut u8, x: u64) usize {
+    let mut v = x;
+    let mut i: usize = 0;
+    while v >= 0x80 {
+        out[i] = @truncate(u8, v) | 0x80;
+        v = v >> 7;
+        i += 1;
+    }
+    out[i] = @truncate(u8, v);
+    return i + 1;
+}
+
+fn hash4(x: u32) usize {
+    return @as(usize, (x *% 0x1e35a7bd) >> (32 - HASH_BITS));
+}
+
+fn emit_literal(out: []mut u8, at: usize, lit: []u8) usize {
+    let mut o = at;
+    let n = lit.len - 1;
+    if n < 60 {
+        out[o] = @truncate(u8, n << 2);
+        o += 1;
+    } else {
+        let mut nb: usize = 1;
+        while (nb < 4) and ((n >> (8 * @truncate(u32, nb))) != 0) {
+            nb += 1;
+        }
+        out[o] = @truncate(u8, (59 + nb) << 2);
+        o += 1;
+        for k in @as(usize, 0)..nb {
+            out[o] = @truncate(u8, n >> (8 * @truncate(u32, k)));
+            o += 1;
+        }
+    }
+    @mem_copy(out[o..o + lit.len], lit);
+    return o + lit.len;
+}
+
+/// One copy of 4 to 64 bytes.
+fn emit_copy64(out: []mut u8, at: usize, offset: usize, len: usize) usize {
+    if (len < 12) and (offset < 2048) {
+        out[at] = @truncate(u8, (1 | ((len - 4) << 2)) | ((offset >> 8) << 5));
+        out[at + 1] = @truncate(u8, offset);
+        return at + 2;
+    }
+    out[at] = @truncate(u8, 2 | ((len - 1) << 2));
+    out[at + 1] = @truncate(u8, offset);
+    out[at + 2] = @truncate(u8, offset >> 8);
+    return at + 3;
+}
+
+fn emit_copy(out: []mut u8, at: usize, offset: usize, length: usize) usize {
+    let mut o = at;
+    let mut len = length;
+    // (64-byte pieces, leaving at least 4 for the last)
+    while len >= 68 {
+        o = emit_copy64(out, o, offset, 64);
+        len -= 64;
+    }
+    if len > 64 {
+        o = emit_copy64(out, o, offset, 60);
+        len -= 60;
+    }
+    return emit_copy64(out, o, offset, len);
+}
+
+/// How many bytes from a and b (a < b) agree, up to the end of src.
+fn match_len(src: []u8, a: usize, b: usize) usize {
+    let mut i = a;
+    let mut j = b;
+    while (j + 8) <= src.len {
+        let x = le64(src, i) ^ le64(src, j);
+        if x != 0 {
+            return (j - b) + @as(usize, @truncate(u8, @ctz(x) >> 3));
+        }
+        i += 8;
+        j += 8;
+    }
+    while (j < src.len) and (src[i] == src[j]) {
+        i += 1;
+        j += 1;
+    }
+    return j - b;
+}
+
+/// Compresses a block of at most 64 KiB (no preamble) into out (with room
+/// for max_compressed_len); returns the bytes written. table is scratch.
+fn compress_block(src: []u8, out: []mut u8, table: []mut u16) usize {
+    let n = src.len;
+    let mut o: usize = 0;
+    let mut next_emit: usize = 0;
+    if n >= INPUT_MARGIN {
+        @mem_set(table, 0);
+        let ip_limit = n - INPUT_MARGIN;
+        let mut ip: usize = 1;
+        let mut next_hash = hash4(le32(src, 1));
+        let mut done = false;
+        while not done {
+            // find a 4-byte match, skipping faster the longer nothing matches
+            let mut skip: usize = 32;
+            let mut next_ip = ip;
+            let mut candidate: usize = 0;
+            loop {
+                ip = next_ip;
+                let h = next_hash;
+                next_ip = ip + (skip >> 5);
+                skip += 1;
+                if next_ip > ip_limit {
+                    done = true;
+                    break;
+                }
+                next_hash = hash4(le32(src, next_ip));
+                candidate = @as(usize, table[h]);
+                table[h] = @truncate(u16, ip);
+                if le32(src, ip) == le32(src, candidate) {
+                    break;
+                }
+            }
+            if done {
+                break;
+            }
+            o = emit_literal(out, o, src[next_emit..ip]);
+            // copies, as long as the next position matches too
+            loop {
+                let base = ip;
+                let matched = 4 + match_len(src, candidate + 4, ip + 4);
+                ip += matched;
+                o = emit_copy(out, o, base - candidate, matched);
+                next_emit = ip;
+                if ip >= ip_limit {
+                    done = true;
+                    break;
+                }
+                table[hash4(le32(src, ip - 1))] = @truncate(u16, ip - 1);
+                let h = hash4(le32(src, ip));
+                candidate = @as(usize, table[h]);
+                table[h] = @truncate(u16, ip);
+                if le32(src, ip) != le32(src, candidate) {
+                    break;
+                }
+            }
+            if not done {
+                ip += 1;
+                next_hash = hash4(le32(src, ip));
+            }
+        }
+    }
+    if next_emit < n {
+        o = emit_literal(out, o, src[next_emit..]);
+    }
+    return o;
+}
+
+/// Scratch memory for compressing: the output of a block and the table.
+struct Scratch {
+    out: []mut u8,
+    table: []mut u16,
+
+    fn init() !Scratch {
+        let out = mem.alloc.[u8](max_compressed_len(BLOCK))!;
+        let table = mem.alloc.[u16](TABLE_SIZE) catch |e| {
+            mem.free(out);
+            return e;
+        };
+        return Scratch.{ out: out, table: table };
+    }
+
+    fn deinit(self: *mut Scratch) void {
+        mem.free(self.out);
+        mem.free(self.table);
+    }
+
+    /// The raw encoding of a block of at most 64 KiB, preamble included.
+    fn block(self: *mut Scratch, src: []u8) []u8 {
+        let p = put_varint(self.out, @as(u64, src.len));
+        let n = compress_block(src, self.out[p..], self.table);
+        return self.out[..p + n];
+    }
+}
+
+/// Compresses data as one raw block (at most 4 GiB - 1: TooLarge
+/// otherwise); the caller frees the result.
+pub fn compress_raw(data: []u8) ![]mut u8 {
+    let mut out = strs.String.init();
+    compress_raw_to(out.writer(), data) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// Compresses data as one raw block and writes it to w, 64 KiB of input at
+/// a time.
+pub fn compress_raw_to(w: io.Writer, data: []u8) !void {
+    if @as(u64, data.len) > 0xffffffff {
+        return error.TooLarge;
+    }
+    let mut sc = Scratch.init()!;
+    defer sc.deinit();
+    let mut pre: [5]u8 = [0; 5];
+    w.write_all(pre[..put_varint(pre[..], @as(u64, data.len))])!;
+    let mut i: usize = 0;
+    while i < data.len {
+        let e = @min(i + BLOCK, data.len);
+        let n = compress_block(data[i..e], sc.out, sc.table);
+        w.write_all(sc.out[..n])!;
+        i = e;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Framing format
+// -----------------------------------------------------------------------------
+
+/// Compresses data in the framing format; the caller frees the result.
+pub fn compress(data: []u8) ![]mut u8 {
+    let mut out = strs.String.init();
+    compress_to(out.writer(), data) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// Compresses data in the framing format and writes it to w a chunk at a
+/// time.
+pub fn compress_to(w: io.Writer, data: []u8) !void {
+    let mut sc = Scratch.init()!;
+    defer sc.deinit();
+    let c = crc.Crc.init(crc.CRC32C);
+    write_ident(w)!;
+    let mut i: usize = 0;
+    while i < data.len {
+        let e = @min(i + BLOCK, data.len);
+        write_chunk(w, &mut sc, &c, data[i..e])!;
+        i = e;
+    }
+}
+
+fn write_ident(w: io.Writer) !void {
+    let id: [10]u8 = [0xff, 6, 0, 0, 's', 'N', 'a', 'P', 'p', 'Y'];
+    w.write_all(id[..])!;
+}
+
+/// One chunk: compressed if that saves at least an eighth, else stored.
+fn write_chunk(w: io.Writer, sc: *mut Scratch, c: *crc.Crc, data: []u8) !void {
+    let sum = masked_crc(c, data);
+    let packed = sc.block(data);
+    let mut kind: u8 = 0;
+    let mut body = packed;
+    if packed.len >= (data.len - (data.len / 8)) {
+        kind = 1;
+        body = data;
+    }
+    let n = body.len + 4;
+    let hdr: [8]u8 = [kind, @truncate(u8, n), @truncate(u8, n >> 8), @truncate(u8, n >> 16), @truncate(u8, sum),
+                      @truncate(u8, sum >> 8), @truncate(u8, sum >> 16), @truncate(u8, sum >> 24)];
+    w.write_all(hdr[..])!;
+    w.write_all(body)!;
+}
+
+/// Decompresses a framed stream (or several, concatenated) into new memory
+/// (the caller frees it); fails with TooLarge past max_size bytes.
+pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+    let mut out = strs.String.init();
+    decode_frames(data, &mut out, max_size) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+fn decode_frames(data: []u8, out: *mut strs.String, max_size: usize) !void {
+    let c = crc.Crc.init(crc.CRC32C);
+    let mut i: usize = 0;
+    let mut first = true;
+    while i < data.len {
+        if (data.len - i) < 4 {
+            return error.Corrupt;
+        }
+        let kind = data[i];
+        let n = (@as(usize, data[i + 1]) | (@as(usize, data[i + 2]) << 8)) | (@as(usize, data[i + 3]) << 16);
+        i += 4;
+        if n > (data.len - i) {
+            return error.Corrupt;
+        }
+        let body = data[i..i + n];
+        i += n;
+        if first and (kind != 0xff) {
+            return error.Corrupt;
+        }
+        first = false;
+        if kind == 0xff {
+            if not @mem_eq(body, IDENT) {
+                return error.Corrupt;
+            }
+        } else if (kind == 0) or (kind == 1) {
+            if n < 4 {
+                return error.Corrupt;
+            }
+            let sum = le32(body, 0);
+            let payload = body[4..];
+            let mut len = payload.len;
+            if kind == 0 {
+                len = decoded_len(payload)!;
+            }
+            if len > BLOCK {
+                return error.Corrupt;
+            }
+            if len > (max_size - out.len) {
+                return error.TooLarge;
+            }
+            let at = out.len;
+            out.reserve(len)!;
+            out.len += len;
+            let dst = out.bytes()[at..];
+            if kind == 0 {
+                decompress_raw_into(payload, dst)!;
+            } else {
+                @mem_copy(dst, payload);
+            }
+            if masked_crc(&c, dst) != sum {
+                return error.ChecksumMismatch;
+            }
+        } else if kind < 0x80 {
+            return error.Corrupt;  // a reserved unskippable chunk
+        }
+        // (0x80-0xfe: padding and reserved skippable chunks)
+    }
+}
+
+/// Writes the framing format to an io.Writer: data is gathered into 64 KiB
+/// chunks; flush writes out a partial one. Heap-allocated: deinit frees it.
+pub struct Writer {
+    out: io.Writer,
+    started: bool,
+    pending: usize,
+    sc: Scratch,
+    c: crc.Crc,
+    buf: [65536]u8,
+
+    /// A Writer of the framing format to w.
+    pub fn init(w: io.Writer) !*mut Writer {
+        let sc = Scratch.init()!;
+        let m = mem.alloc.[Writer](1) catch |e| {
+            let mut s2 = sc;
+            s2.deinit();
+            return e;
+        };
+        let z = &mut m[0];
+        z.out = w;
+        z.started = false;
+        z.pending = 0;
+        z.sc = sc;
+        z.c = crc.Crc.init(crc.CRC32C);
+        return z;
+    }
+
+    /// Frees the Writer (without flushing).
+    pub fn deinit(self: *mut Writer) void {
+        self.sc.deinit();
+        mem.free(@slice_from_ptr(self, 1));
+    }
+
+    pub fn writer(self: *mut Writer) io.Writer {
+        return io.Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: writer_write };
+    }
+
+    /// Takes all of bytes.
+    pub fn write(self: *mut Writer, bytes: []u8) !usize {
+        self.write_all(bytes)!;
+        return bytes.len;
+    }
+
+    pub fn write_all(self: *mut Writer, bytes: []u8) !void {
+        let mut rest = bytes;
+        while rest.len > 0 {
+            if self.pending == BLOCK {
+                self.flush()!;
+            }
+            let k = @min(rest.len, BLOCK - self.pending);
+            @mem_copy(self.buf[self.pending..self.pending + k], rest[..k]);
+            self.pending += k;
+            rest = rest[k..];
+        }
+    }
+
+    /// Writes out what has been gathered (the stream identifier first, so
+    /// even an empty stream is a valid one).
+    pub fn flush(self: *mut Writer) !void {
+        if not self.started {
+            write_ident(self.out)!;
+            self.started = true;
+        }
+        if self.pending > 0 {
+            write_chunk(self.out, &mut self.sc, &self.c, self.buf[..self.pending])!;
+            self.pending = 0;
+        }
+    }
+}
+
+fn writer_write(ctx: *mut void, bytes: []u8) !usize {
+    let z = @ptr_cast(*mut Writer, ctx);
+    return z.write(bytes);
+}
+
+/// Reads the framing format from an io.Reader and gives back the data.
+/// Heap-allocated: deinit frees it.
+pub struct Reader {
+    input: io.Reader,
+    started: bool,
+    pos: usize,  // out[pos..len] is still to be read
+    len: usize,
+    c: crc.Crc,
+    out: [65536]u8,
+    chunk: [MAX_CHUNK]u8,
+
+    /// A Reader of the stream read from r.
+    pub fn init(r: io.Reader) !*mut Reader {
+        let m = mem.alloc.[Reader](1)!;
+        let z = &mut m[0];
+        z.input = r;
+        z.started = false;
+        z.pos = 0;
+        z.len = 0;
+        z.c = crc.Crc.init(crc.CRC32C);
+        return z;
+    }
+
+    pub fn deinit(self: *mut Reader) void {
+        mem.free(@slice_from_ptr(self, 1));
+    }
+
+    pub fn reader(self: *mut Reader) io.Reader {
+        return io.Reader.{ ctx: @ptr_cast(*mut void, self), read_fn: reader_read };
+    }
+
+    /// Reads decompressed data into buf; 0 at the end of the stream.
+    pub fn read(self: *mut Reader, buf: []mut u8) !usize {
+        while self.pos == self.len {
+            if not self.next_chunk()! {
+                return 0;
+            }
+        }
+        let k = @min(buf.len, self.len - self.pos);
+        @mem_copy(buf[..k], self.out[self.pos..self.pos + k]);
+        self.pos += k;
+        return k;
+    }
+
+    /// Fills b from the input: false if it ends before the first byte,
+    /// Corrupt if it ends after it.
+    fn fill(self: *mut Reader, b: []mut u8) !bool {
+        let mut got: usize = 0;
+        while got < b.len {
+            let k = self.input.read(b[got..])!;
+            if k == 0 {
+                if got == 0 {
+                    return false;
+                }
+                return error.Corrupt;
+            }
+            got += k;
+        }
+        return true;
+    }
+
+    /// Decodes the next data chunk into out; false at the end of input.
+    fn next_chunk(self: *mut Reader) !bool {
+        loop {
+            let mut hdr: [4]u8 = [0; 4];
+            if not self.fill(hdr[..])! {
+                return false;
+            }
+            let kind = hdr[0];
+            let n = (@as(usize, hdr[1]) | (@as(usize, hdr[2]) << 8)) | (@as(usize, hdr[3]) << 16);
+            if (not self.started) and (kind != 0xff) {
+                return error.Corrupt;
+            }
+            self.started = true;
+            if kind >= 0x80 {
+                if (kind == 0xff) and (n != IDENT.len) {
+                    return error.Corrupt;
+                }
+                // skip it, a piece at a time
+                let mut left = n;
+                while left > 0 {
+                    let k = @min(left, self.chunk.len);
+                    if not self.fill(self.chunk[..k])! {
+                        return error.Corrupt;
+                    }
+                    left -= k;
+                }
+                if (kind == 0xff) and not @mem_eq(self.chunk[..n], IDENT) {
+                    return error.Corrupt;
+                }
+                continue;
+            }
+            if (kind > 1) or (n < 4) or (n > MAX_CHUNK) {
+                return error.Corrupt;
+            }
+            if not self.fill(self.chunk[..n])! {
+                return error.Corrupt;
+            }
+            let body = self.chunk[..n];
+            let sum = le32(body, 0);
+            let payload = body[4..];
+            let mut len = payload.len;
+            if kind == 0 {
+                len = decoded_len(payload)!;
+            }
+            if len > BLOCK {
+                return error.Corrupt;
+            }
+            if kind == 0 {
+                decompress_raw_into(payload, self.out[..len])!;
+            } else {
+                @mem_copy(self.out[..len], payload);
+            }
+            if masked_crc(&self.c, self.out[..len]) != sum {
+                return error.ChecksumMismatch;
+            }
+            self.pos = 0;
+            self.len = len;
+            return true;
+        }
+    }
+}
+
+fn reader_read(ctx: *mut void, buf: []mut u8) !usize {
+    let z = @ptr_cast(*mut Reader, ctx);
+    return z.read(buf);
+}
+
+// -----------------------------------------------------------------------------
+// Tests: files from the reference library and made by hand from the format
+// descriptions (tools/gen_snappy_tests.py), round trips, hostile input
+// -----------------------------------------------------------------------------
+
+fn fails(r: ![]mut u8) bool {
+    let x = r catch return true;
+    mem.free(x);
+    return false;
+}
+
+/// Everything a Reader over data gives, read in pieces of `step` bytes.
+fn read_stream(data: []u8, step: usize) ![]mut u8 {
+    let mut sr = io.SliceReader.init(data);
+    let z = Reader.init(sr.reader())!;
+    defer z.deinit();
+    let mut out = strs.String.init();
+    let mut buf: [1000]u8 = [0; 1000];
+    loop {
+        let n = z.read(buf[..step]) catch |e| {
+            out.deinit();
+            return e;
+        };
+        if n == 0 {
+            break;
+        }
+        out.push_str(buf[..n])!;
+    }
+    return out.take();
+}
+
+test "files from the reference library and the format description" {
+    let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
+    defer mem.free(corpus);
+    let mut dir = fs.read_dir("std/compress/snappy/testdata")!;
+    defer dir.deinit();
+    let mut n: usize = 0;
+    for e in dir.entries.items() {
+        if strs.ends_with(e.name, ".out") {
+            continue;
+        }
+        let mut p = strs.String.init();
+        defer p.deinit();
+        p.push_str("std/compress/snappy/testdata/")!;
+        p.push_str(e.name)!;
+        let data = fs.read_file(p.bytes())!;
+        defer mem.free(data);
+        let mut want = corpus;
+        let mut owned: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        if not strs.starts_with(e.name, "corpus") {
+            p.truncate(p.len - 2);
+            if strs.ends_with(p.bytes(), ".r") {
+                p.truncate(p.len - 1);
+            }
+            p.push_str("out")!;
+            owned = fs.read_file(p.bytes())!;
+            want = owned;
+        }
+        defer mem.free(owned);
+        if strs.ends_with(e.name, ".raw") {
+            @expect_eq(decoded_len(data)!, want.len);
+            let got = decompress_raw(data, 1 << 24)!;
+            defer mem.free(got);
+            @expect_eq(got, want);
+            if want.len > 0 {
+                @expect(fails(decompress_raw(data, want.len - 1)));
+            }
+        } else {
+            let got = decompress(data, 1 << 24)!;
+            defer mem.free(got);
+            @expect_eq(got, want);
+            let got2 = read_stream(data, 777)!;
+            defer mem.free(got2);
+            @expect_eq(got2, want);
+            if want.len > 0 {
+                @expect(fails(decompress(data, want.len - 1)));
+            }
+        }
+        n += 1;
+    }
+    @expect(n >= 13);
+}
+
+test "round trips" {
+    let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
+    defer mem.free(corpus);
+    let raw = compress_raw(corpus)!;
+    defer mem.free(raw);
+    @expect(raw.len < (corpus.len / 2));
+    @expect(raw.len <= max_compressed_len(corpus.len));
+    let back = decompress_raw(raw, corpus.len)!;
+    defer mem.free(back);
+    @expect_eq(back, corpus);
+    let framed = compress(corpus)!;
+    defer mem.free(framed);
+    @expect(framed.len < (raw.len + 100));
+    let back2 = decompress(framed, corpus.len)!;
+    defer mem.free(back2);
+    @expect_eq(back2, corpus);
+    let back3 = read_stream(framed, 1000)!;
+    defer mem.free(back3);
+    @expect_eq(back3, corpus);
+    // many shapes: runs, repeats near and far, random bytes, every short length
+    let mut big = strs.String.init();
+    defer big.deinit();
+    let mut x: u32 = 99;
+    for k in @as(usize, 0)..200000 {
+        x = (x *% 1103515245) +% 12345;
+        let r = x >> 16;
+        if ((k / 5000) % 3) == 0 {
+            big.push(@truncate(u8, r))!;
+        } else if ((k / 5000) % 3) == 1 {
+            big.push(@truncate(u8, (k / 97) % 7))!;
+        } else {
+            big.push(corpus[(k * 13) % 1000])!;
+        }
+    }
+    let mut lens: [40]usize = [0; 40];
+    for i in @as(usize, 0)..32 {
+        lens[i] = i;
+    }
+    lens[32] = 65535;
+    lens[33] = 65536;
+    lens[34] = 65537;
+    lens[35] = 100000;
+    lens[36] = 131072;
+    lens[37] = 150001;
+    lens[38] = 199999;
+    lens[39] = 200000;
+    for n in lens {
+        let d = big.bytes()[200000 - n..];
+        let c = compress_raw(d)!;
+        defer mem.free(c);
+        @expect(c.len <= max_compressed_len(n));
+        let b = decompress_raw(c, n)!;
+        defer mem.free(b);
+        @expect_eq(b, d);
+        let f = compress(d)!;
+        defer mem.free(f);
+        let fb = decompress(f, n)!;
+        defer mem.free(fb);
+        @expect_eq(fb, d);
+    }
+    let zeros: [100000]u8 = [0; 100000];
+    let z = compress_raw(zeros[..])!;
+    defer mem.free(z);
+    @expect(z.len < 5000);
+}
+
+test "streaming writer" {
+    let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
+    defer mem.free(corpus);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let zw = Writer.init(out.writer())!;
+    defer zw.deinit();
+    zw.flush()!;  // just the stream identifier
+    @expect_eq(out.len, 10);
+    let w = zw.writer();
+    let mut i: usize = 0;
+    let mut step: usize = 1;
+    while i < corpus.len {
+        let e = @min(i + step, corpus.len);
+        w.write_all(corpus[i..e])!;
+        i = e;
+        step = (step * 2) + 1;
+        if i > 30000 {
+            zw.flush()!;
+        }
+    }
+    zw.flush()!;
+    let back = decompress(out.bytes(), corpus.len)!;
+    defer mem.free(back);
+    @expect_eq(back, corpus);
+    // two streams one after the other are one stream
+    let one = compress("hello, ")!;
+    defer mem.free(one);
+    let two = compress("world")!;
+    defer mem.free(two);
+    let both = strs.concat(one, two)!;
+    defer mem.free(both);
+    let got = decompress(both, 100)!;
+    defer mem.free(got);
+    @expect_eq(got, "hello, world");
+    let got2 = read_stream(both, 3)!;
+    defer mem.free(got2);
+    @expect_eq(got2, "hello, world");
+}
+
+test "hostile input fails cleanly" {
+    let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
+    defer mem.free(corpus);
+    let raw = compress_raw(corpus[..3000])!;
+    defer mem.free(raw);
+    let framed = compress(corpus[..3000])!;
+    defer mem.free(framed);
+    // truncations
+    for n in @as(usize, 0)..raw.len {
+        @expect(fails(decompress_raw(raw[..n], 1 << 20)));
+    }
+    for n in @as(usize, 1)..framed.len {
+        // (all but the stream identifier, which alone is an empty stream)
+        @expect(fails(decompress(framed[..n], 1 << 20)) == (n != 10));
+    }
+    // every byte changed: a failure or some output, never a trap; in the
+    // framed form, the CRC catches whatever the decoder does not
+    let mut m = strs.String.init();
+    defer m.deinit();
+    for i in @as(usize, 0)..raw.len {
+        for flip in [@as(u8, 1), 0x80, 0xff]{
+            m.clear();
+            m.push_str(raw)!;
+            m.bytes()[i] ^= flip;
+            _ = fails(decompress_raw(m.bytes(), 1 << 20));
+        }
+    }
+    for i in @as(usize, 10)..framed.len {
+        m.clear();
+        m.push_str(framed)!;
+        m.bytes()[i] ^= 0x10;
+        // (a changed offset may copy equal bytes from elsewhere)
+        let got = decompress(m.bytes(), 1 << 20) catch continue;
+        defer mem.free(got);
+        @expect_eq(got, corpus[..3000]);
+    }
+    // hand-made bad blocks
+    let bad: [8][]u8 = [
+        "\x05\x10abc",               // literal past the input
+        "\x05\x01\x01",              // copy before any output
+        "\x04\x00a\x05\x02",         // copy-1 offset 2 > 1 byte so far
+        "\x04\x00a\x02\x00\x00",     // copy-2 offset 0
+        "\x80\x80\x80\x80\x80\x01",  // varint too long
+        "\xff\xff\xff\xff\x1f",      // 2^35-1: more than 32 bits
+        "\x02\x00a",                 // shorter than declared
+        "\x01\x04ab",                // longer than declared
+    ];
+    for b in bad {
+        @expect(fails(decompress_raw(b, 1 << 20)));
+    }
+    @expect(fails(decompress("\x00\x05\x00\x00abcde", 100)));                      // no stream identifier
+    @expect(fails(decompress("\xff\x06\x00\x00sNaPpX", 100)));                     // a wrong one
+    @expect(fails(decompress("\xff\x06\x00\x00sNaPpY\x02\x00\x00\x00", 100)));     // reserved unskippable
+    @expect(fails(decompress("\xff\x06\x00\x00sNaPpY\x01\x03\x00\x00abc", 100)));  // no room for a CRC
+    @expect(fails(read_stream("\xff\x06\x00\x00sNaPpY\x01\x03\x00\x00abc", 10)));
+    @expect(fails(read_stream("\x00\x05\x00\x00abcde", 10)));
+    // the largest chunk the Reader takes, and one byte more
+    for extra in [@as(usize, 0), 1]{
+        let n = MAX_CHUNK + extra;
+        let big = mem.alloc_zeroed.[u8](14 + n)!;
+        defer mem.free(big);
+        @mem_copy(big[..10], "\xff\x06\x00\x00sNaPpY");
+        big[11] = @truncate(u8, n);
+        big[12] = @truncate(u8, n >> 8);
+        big[13] = @truncate(u8, n >> 16);
+        big[18] = 0xff;  // a varint
+        @expect(fails(read_stream(big, 1000)));
+        @expect(fails(decompress(big, 1 << 20)));
+    }
+}

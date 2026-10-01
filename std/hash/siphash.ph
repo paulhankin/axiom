@@ -1,0 +1,508 @@
+// =============================================================================
+// std/hash/siphash.ph - SipHash: keyed hashes of short inputs (SipHash-2-4,
+// with a 64-bit or 128-bit result, and SipHash-1-3).
+//
+//     let k = siphash.Key.from_bytes(secret16)!;     // a 16-byte key
+//     let h = siphash.sip24(k, data);                // u64
+//     let h13 = siphash.sip13(k, data);              // u64, faster
+//     let wide = siphash.sip24_128(k, data);         // [16]u8
+//
+//     let mut s = siphash.Sip64.init24(k);           // streaming
+//     s.update(part1);
+//     s.update(part2);
+//     let h2 = s.finish();
+//
+// SipHash (Aumasson and Bernstein, "SipHash: a fast short-input PRF", 2012)
+// is a pseudorandom function: without the key, nobody can predict hashes or
+// find inputs that collide, which makes it the hash for tables whose keys an
+// adversary chooses. SipHash-2-4 (two compression rounds per 8-byte block,
+// four finalization rounds) is the conservative choice; SipHash-1-3 is the
+// faster variant that Python, Rust and std/hash use for hash tables. The
+// 128-bit output follows the reference implementation (github.com/veorq/SipHash),
+// whose test vectors these pass. It is a MAC for short messages, not a
+// collision-resistant digest.
+//
+// std/hash.hash_bytes is already SipHash-1-3 under a random per-process
+// key, so std/collections/map is safe for untrusted keys as it is (and its
+// hash values are unchanged); a key of your own, for hashes that must agree
+// between processes or be secret per table, is what this module adds.
+// =============================================================================
+
+error { InvalidKey }
+
+/// A 128-bit SipHash key.
+pub struct Key {
+    k0: u64,
+    k1: u64,
+
+    /// The key from 16 bytes (InvalidKey for any other length), read as
+    /// the reference implementation does: two little-endian words.
+    pub fn from_bytes(b: []u8) !Key {
+        if b.len != 16 {
+            return error.InvalidKey;
+        }
+        return Key.{ k0: le64(b, 0), k1: le64(b, 8) };
+    }
+
+    /// The key from its two words.
+    pub fn init(k0: u64, k1: u64) Key {
+        return Key.{ k0: k0, k1: k1 };
+    }
+}
+
+fn le32(b: []u8, i: usize) u32 {
+    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8) | (@as(u32, b[i + 2]) << 16) | (@as(u32, b[i + 3]) << 24);
+}
+
+fn le64(b: []u8, i: usize) u64 {
+    return @as(u64, le32(b, i)) | (@as(u64, le32(b, i + 4)) << 32);
+}
+
+fn put64(out: []mut u8, x: u64) void {
+    for i in @as(usize, 0)..8 {
+        out[i] = @truncate(u8, x >> @as(u64, 8 * i));
+    }
+}
+
+/// The state shared by both widths: v0..v3, a partial block and the length.
+struct State {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    tail: u64,   // the bytes of a partial block, little-endian
+    ntail: u32,  // how many
+    total: u64,  // bytes so far (only the low 8 bits matter)
+    c: u32,      // compression rounds
+    d: u32,      // finalization rounds
+
+    fn init(key: Key, c: u32, d: u32, wide: bool) State {
+        let mut s = State.{ v0: key.k0 ^ 0x736f6d6570736575, v1: key.k1 ^ 0x646f72616e646f6d,
+                            v2: key.k0 ^ 0x6c7967656e657261, v3: key.k1 ^ 0x7465646279746573, tail: 0, ntail: 0,
+                            total: 0, c: c, d: d };
+        if wide {
+            s.v1 ^= 0xee;
+        }
+        return s;
+    }
+
+    fn rounds(self: *mut State, n: u32) void {
+        let mut v0 = self.v0;
+        let mut v1 = self.v1;
+        let mut v2 = self.v2;
+        let mut v3 = self.v3;
+        for _r in @as(u32, 0)..n {
+            v0 +%= v1;
+            v1 = @rotl(v1, 13) ^ v0;
+            v0 = @rotl(v0, 32);
+            v2 +%= v3;
+            v3 = @rotl(v3, 16) ^ v2;
+            v0 +%= v3;
+            v3 = @rotl(v3, 21) ^ v0;
+            v2 +%= v1;
+            v1 = @rotl(v1, 17) ^ v2;
+            v2 = @rotl(v2, 32);
+        }
+        self.v0 = v0;
+        self.v1 = v1;
+        self.v2 = v2;
+        self.v3 = v3;
+    }
+
+    fn block(self: *mut State, m: u64) void {
+        self.v3 ^= m;
+        self.rounds(self.c);
+        self.v0 ^= m;
+    }
+
+    fn update(self: *mut State, data: []u8) void {
+        self.total +%= @as(u64, data.len);
+        let mut i: usize = 0;
+        while (self.ntail > 0) and (i < data.len) {
+            self.tail |= @as(u64, data[i]) << @as(u64, 8 * self.ntail);
+            self.ntail += 1;
+            i += 1;
+            if self.ntail == 8 {
+                self.block(self.tail);
+                self.tail = 0;
+                self.ntail = 0;
+            }
+        }
+        while (i + 8) <= data.len {
+            self.block(le64(data, i));
+            i += 8;
+        }
+        while i < data.len {
+            self.tail |= @as(u64, data[i]) << @as(u64, 8 * self.ntail);
+            self.ntail += 1;
+            i += 1;
+        }
+    }
+
+    /// The last block and the first d rounds; the first (or only) word.
+    fn finish_lo(self: *mut State, wide: bool) u64 {
+        self.block(self.tail | (self.total << 56));
+        if wide {
+            self.v2 ^= 0xee;
+        } else {
+            self.v2 ^= 0xff;
+        }
+        self.rounds(self.d);
+        return ((self.v0 ^ self.v1) ^ self.v2) ^ self.v3;
+    }
+
+    fn finish_hi(self: *mut State) u64 {
+        self.v1 ^= 0xdd;
+        self.rounds(self.d);
+        return ((self.v0 ^ self.v1) ^ self.v2) ^ self.v3;
+    }
+}
+
+/// Streaming SipHash with a 64-bit result.
+pub struct Sip64 {
+    s: State,
+
+    /// SipHash-2-4.
+    pub fn init24(key: Key) Sip64 {
+        return Sip64.{ s: State.init(key, 2, 4, false) };
+    }
+
+    /// SipHash-1-3.
+    pub fn init13(key: Key) Sip64 {
+        return Sip64.{ s: State.init(key, 1, 3, false) };
+    }
+
+    /// SipHash-c-d with any numbers of rounds (at least 1 each).
+    pub fn init_rounds(key: Key, c: u32, d: u32) Sip64 {
+        return Sip64.{ s: State.init(key, @max(c, 1), @max(d, 1), false) };
+    }
+
+    pub fn update(self: *mut Sip64, data: []u8) void {
+        self.s.update(data);
+    }
+
+    /// The hash of everything so far (more may be added afterwards).
+    pub fn finish(self: *Sip64) u64 {
+        let mut s = self.s;
+        return s.finish_lo(false);
+    }
+}
+
+/// Streaming SipHash-2-4 with a 128-bit result.
+pub struct Sip128 {
+    s: State,
+
+    pub fn init24(key: Key) Sip128 {
+        return Sip128.{ s: State.init(key, 2, 4, true) };
+    }
+
+    pub fn update(self: *mut Sip128, data: []u8) void {
+        self.s.update(data);
+    }
+
+    /// The 16 bytes of the hash of everything so far, as the reference
+    /// implementation writes them (two little-endian words).
+    pub fn finish(self: *Sip128) [16]u8 {
+        let mut s = self.s;
+        let mut out: [16]u8 = [0; 16];
+        put64(out[0..8], s.finish_lo(true));
+        put64(out[8..16], s.finish_hi());
+        return out;
+    }
+}
+
+/// SipHash-2-4 of data.
+pub fn sip24(key: Key, data: []u8) u64 {
+    let mut s = Sip64.init24(key);
+    s.update(data);
+    return s.finish();
+}
+
+/// SipHash-1-3 of data.
+pub fn sip13(key: Key, data: []u8) u64 {
+    let mut s = Sip64.init13(key);
+    s.update(data);
+    return s.finish();
+}
+
+/// SipHash-2-4 of data with a 128-bit result.
+pub fn sip24_128(key: Key, data: []u8) [16]u8 {
+    let mut s = Sip128.init24(key);
+    s.update(data);
+    return s.finish();
+}
+
+// -----------------------------------------------------------------------------
+// Tests: the reference implementation's vectors (vectors.h: key 00..0f,
+// messages 00, 00 01, ..., of lengths 0 to 63). SipHash-1-3 has no official
+// vectors; these come from a Python transcription of the reference code that
+// reproduces the 2-4 vectors, and agree with std/hash's known answer.
+// -----------------------------------------------------------------------------
+
+let SIP24: [64]u64 = [
+    0x726fdb47dd0e0e31,
+    0x74f839c593dc67fd,
+    0x0d6c8009d9a94f5a,
+    0x85676696d7fb7e2d,
+    0xcf2794e0277187b7,
+    0x18765564cd99a68d,
+    0xcbc9466e58fee3ce,
+    0xab0200f58b01d137,
+    0x93f5f5799a932462,
+    0x9e0082df0ba9e4b0,
+    0x7a5dbbc594ddb9f3,
+    0xf4b32f46226bada7,
+    0x751e8fbc860ee5fb,
+    0x14ea5627c0843d90,
+    0xf723ca908e7af2ee,
+    0xa129ca6149be45e5,
+    0x3f2acc7f57c29bdb,
+    0x699ae9f52cbe4794,
+    0x4bc1b3f0968dd39c,
+    0xbb6dc91da77961bd,
+    0xbed65cf21aa2ee98,
+    0xd0f2cbb02e3b67c7,
+    0x93536795e3a33e88,
+    0xa80c038ccd5ccec8,
+    0xb8ad50c6f649af94,
+    0xbce192de8a85b8ea,
+    0x17d835b85bbb15f3,
+    0x2f2e6163076bcfad,
+    0xde4daaaca71dc9a5,
+    0xa6a2506687956571,
+    0xad87a3535c49ef28,
+    0x32d892fad841c342,
+    0x7127512f72f27cce,
+    0xa7f32346f95978e3,
+    0x12e0b01abb051238,
+    0x15e034d40fa197ae,
+    0x314dffbe0815a3b4,
+    0x027990f029623981,
+    0xcadcd4e59ef40c4d,
+    0x9abfd8766a33735c,
+    0x0e3ea96b5304a7d0,
+    0xad0c42d6fc585992,
+    0x187306c89bc215a9,
+    0xd4a60abcf3792b95,
+    0xf935451de4f21df2,
+    0xa9538f0419755787,
+    0xdb9acddff56ca510,
+    0xd06c98cd5c0975eb,
+    0xe612a3cb9ecba951,
+    0xc766e62cfcadaf96,
+    0xee64435a9752fe72,
+    0xa192d576b245165a,
+    0x0a8787bf8ecb74b2,
+    0x81b3e73d20b49b6f,
+    0x7fa8220ba3b2ecea,
+    0x245731c13ca42499,
+    0xb78dbfaf3a8d83bd,
+    0xea1ad565322a1a0b,
+    0x60e61c23a3795013,
+    0x6606d7e446282b93,
+    0x6ca4ecb15c5f91e1,
+    0x9f626da15c9625f3,
+    0xe51b38608ef25f57,
+    0x958a324ceb064572,
+];
+
+let SIP24_128: [64][]u8 = [
+    "a3817f04ba25a8e66df67214c7550293",
+    "da87c1d86b99af44347659119b22fc45",
+    "8177228da4a45dc7fca38bdef60affe4",
+    "9c70b60c5267a94e5f33b6b02985ed51",
+    "f88164c12d9c8faf7d0f6e7c7bcd5579",
+    "1368875980776f8854527a07690e9627",
+    "14eeca338b208613485ea0308fd7a15e",
+    "a1f1ebbed8dbc153c0b84aa61ff08239",
+    "3b62a9ba6258f5610f83e264f31497b4",
+    "264499060ad9baabc47f8b02bb6d71ed",
+    "00110dc378146956c95447d3f3d0fbba",
+    "0151c568386b6677a2b4dc6f81e5dc18",
+    "d626b266905ef35882634df68532c125",
+    "9869e247e9c08b10d029934fc4b952f7",
+    "31fcefac66d7de9c7ec7485fe4494902",
+    "5493e99933b0a8117e08ec0f97cfc3d9",
+    "6ee2a4ca67b054bbfd3315bf85230577",
+    "473d06e8738db89854c066c47ae47740",
+    "a426e5e423bf4885294da481feaef723",
+    "78017731cf65fab074d5208952512eb1",
+    "9e25fc833f2290733e9344a5e83839eb",
+    "568e495abe525a218a2214cd3e071d12",
+    "4a29b54552d16b9a469c10528eff0aae",
+    "c9d184ddd5a9f5e0cf8ce29a9abf691c",
+    "2db479ae78bd50d8882a8a178a6132ad",
+    "8ece5f042d5e447b5051b9eacb8d8f6f",
+    "9c0b53b4b3c307e87eaee08678141f66",
+    "abf248af69a6eae4bfd3eb2f129eeb94",
+    "0664da1668574b88b935f3027358aef4",
+    "aa4b9dc4bf337de90cd4fd3c467c6ab7",
+    "ea5c7f471faf6bde2b1ad7d4686d2287",
+    "2939b0183223fafc1723de4f52c43d35",
+    "7c3956ca5eeafc3e363e9d556546eb68",
+    "77c6077146f01c32b6b69d5f4ea9ffcf",
+    "37a6986cb8847edf0925f0f1309b54de",
+    "a705f0e69da9a8f907241a2e923c8cc8",
+    "3dc47d1f29c448461e9e76ed904f6711",
+    "0d62bf01e6fc0e1a0d3c4751c5d3692b",
+    "8c03468bca7c669ee4fd5e084bbee7b5",
+    "528a5bb93baf2c9c4473cce5d0d22bd9",
+    "df6a301e95c95dad97ae0cc8c6913bd8",
+    "801189902c857f39e73591285e70b6db",
+    "e617346ac9c231bb3650ae34ccca0c5b",
+    "27d93437efb721aa401821dcec5adf89",
+    "89237d9ded9c5e78d8b1c9b166cc7342",
+    "4a6d8091bf5e7d651189fa94a250b14c",
+    "0e33f96055e7ae893ffc0e3dcf492902",
+    "e61c432b720b19d18ec8d84bdc63151b",
+    "f7e5aef549f782cf379055a608269b16",
+    "438d030fd0b7a54fa837f2ad201a6403",
+    "a590d3ee4fbf04e3247e0d27f286423f",
+    "5fe2c1a172fe93c4b15cd37caef9f538",
+    "2c97325cbd06b36eb2133dd08b3a017c",
+    "92c814227a6bca949ff0659f002ad39e",
+    "dce850110bd8328cfbd50841d6911d87",
+    "67f14984c7da791248e32bb5922583da",
+    "1938f2cf72d54ee97e94166fa91d2a36",
+    "74481e9646ed49fe0f6224301604698e",
+    "57fca5de98a9d6d8006438d0583d8a1d",
+    "9fecde1cefdc1cbed4763674d9575359",
+    "e3040c00eb28f15366ca73cbd872e740",
+    "7697009a6a831dfecca91c5993670f7a",
+    "5853542321f567a005d547a4f04759bd",
+    "5150d1772f50834a503e069a973fbd7c",
+];
+
+let SIP13: [64]u64 = [
+    0xabac0158050fc4dc,
+    0xc9f49bf37d57ca93,
+    0x82cb9b024dc7d44d,
+    0x8bf80ab8e7ddf7fb,
+    0xcf75576088d38328,
+    0xdef9d52f49533b67,
+    0xc50d2b50c59f22a7,
+    0xd3927d989bb11140,
+    0x369095118d299a8e,
+    0x25a48eb36c063de4,
+    0x79de85ee92ff097f,
+    0x70c118c1f94dc352,
+    0x78a384b157b4d9a2,
+    0x306f760c1229ffa7,
+    0x605aa111c0f95d34,
+    0xd320d86d2a519956,
+    0xcc4fdd1a7d908b66,
+    0x9cf2689063dbd80c,
+    0x8ffc389cb473e63e,
+    0xf21f9de58d297d1c,
+    0xc0dc2f46a6cce040,
+    0xb992abfe2b45f844,
+    0x7ffe7b9ba320872e,
+    0x525a0e7fdae6c123,
+    0xf464aeb267349c8c,
+    0x45cd5928705b0979,
+    0x3a3e35e3ca9913a5,
+    0xa91dc74e4ade3b35,
+    0xfb0bed02ef6cd00d,
+    0x88d93cb44ab1e1f4,
+    0x540f11d643c5e663,
+    0x2370dd1f8c21d1bc,
+    0x81157b6c16a7b60d,
+    0x4d54b9e57a8ff9bf,
+    0x759f12781f2a753e,
+    0xcea1a3bebf186b91,
+    0x2cf508d3ada26206,
+    0xb6101c2da3c33057,
+    0xb3f47496ae3a36a1,
+    0x626b57547b108392,
+    0xc1d2363299e41531,
+    0x667cc1923f1ad944,
+    0x65704ffec8138825,
+    0x24f280d1c28949a6,
+    0xc2ca1cedfaf8876b,
+    0xc2164bfc9f042196,
+    0xa16e9c9368b1d623,
+    0x49fb169c8b5114fd,
+    0x9f3143f8df074c46,
+    0xc6fdaf2412cc86b3,
+    0x7eaf49d10a52098f,
+    0x1cf313559d292f9a,
+    0xc44a30dda2f41f12,
+    0x36fae98943a71ed0,
+    0x318fb34c73f0bce6,
+    0xa27abf3670a7e980,
+    0xb4bcc0db243c6d75,
+    0x23f8d852fdb71513,
+    0x8f035f4da67d8a08,
+    0xd89cd0e5b7e8f148,
+    0xf6f4e6bcf7a644ee,
+    0xaec59ad80f1837f2,
+    0xc3b2f6154b6694e0,
+    0x9d199062b7bbb3a8,
+];
+
+fn hexv(c: u8) u8 {
+    if c <= '9' {
+        return c - '0';
+    }
+    return (c - 'a') + 10;
+}
+
+fn unhex(s: []u8, out: []mut u8) void {
+    for i in 0..out.len {
+        out[i] = (hexv(s[2 * i]) << 4) | hexv(s[(2 * i) + 1]);
+    }
+}
+
+test "siphash reference vectors" {
+    let mut kb: [16]u8 = [0; 16];
+    let mut msg: [64]u8 = [0; 64];
+    for i in @as(usize, 0)..64 {
+        msg[i] = @truncate(u8, i);
+        if i < 16 {
+            kb[i] = @truncate(u8, i);
+        }
+    }
+    let k = Key.from_bytes(kb[..])!;
+    for n in @as(usize, 0)..64 {
+        @expect_eq(sip24(k, msg[..n]), SIP24[n]);
+        @expect_eq(sip13(k, msg[..n]), SIP13[n]);
+        let mut want: [16]u8 = [0; 16];
+        unhex(SIP24_128[n], want[..]);
+        let got = sip24_128(k, msg[..n]);
+        @expect_eq(got[..], want[..]);
+    }
+    @expect_eq(sip24(k, msg[..15]), 0xa129ca6149be45e5);  // the paper's example
+}
+
+test "siphash streaming in pieces" {
+    let mut msg: [64]u8 = [0; 64];
+    for i in @as(usize, 0)..64 {
+        msg[i] = @truncate(u8, i);
+    }
+    let k = Key.init(0x0706050403020100, 0x0f0e0d0c0b0a0908);
+    for n in @as(usize, 0)..64 {
+        for step in @as(usize, 1)..10 {
+            let mut a = Sip64.init24(k);
+            let mut b = Sip64.init13(k);
+            let mut c = Sip128.init24(k);
+            let mut i: usize = 0;
+            while i < n {
+                let e = @min(i + step, n);
+                a.update(msg[i..e]);
+                b.update(msg[i..e]);
+                c.update(msg[i..e]);
+                i = e;
+            }
+            @expect_eq(a.finish(), SIP24[n]);
+            @expect_eq(b.finish(), SIP13[n]);
+            let mut want: [16]u8 = [0; 16];
+            unhex(SIP24_128[n], want[..]);
+            let got = c.finish();
+            @expect_eq(got[..], want[..]);
+        }
+    }
+    let r = Sip64.init_rounds(k, 2, 4);
+    @expect_eq(r.finish(), SIP24[0]);
+    let bad = Key.from_bytes("short") catch Key.init(1, 2);  // InvalidKey
+    @expect_eq(bad.k0, 1);
+}

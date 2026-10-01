@@ -1,0 +1,865 @@
+// =============================================================================
+// std/encoding/jwt.ph - JSON Web Tokens (RFC 7519) in the JWS compact
+// serialization (RFC 7515), with the algorithms of RFC 7518 and EdDSA
+// (RFC 8037).
+//
+// Signing (the claims are JSON text, built with std/encoding/json's Writer or
+// by hand):
+//
+//     let tok = jwt.sign(jwt.Alg.HS256, jwt.SigningKey.Secret(secret), claims, "")!;  // mem.free
+//     let mut sk = x509.parse_private_key_pem(pem)!;
+//     defer sk.deinit();
+//     jwt.sign_to(w, jwt.Alg.ES256, jwt.SigningKey.Private(&sk), claims, "key-1")!;
+//
+// Verifying: the caller says which algorithm (and so which kind of key) it
+// expects, and anything else is refused, so neither "alg": "none" nor a token
+// that reuses an RSA public key as an HMAC secret gets through:
+//
+//     let mut pk = jwt.PublicKey.from_pem(pem)!;                  // or a certificate's key
+//     defer pk.deinit();
+//     let v = jwt.Validation.at(time.now().unix());               // leeway, iss, aud: fields
+//     let mut t = jwt.decode(token, jwt.Alg.RS256, pk.verifying(), v)!;
+//     defer t.deinit();
+//     let user = t.claims.get("sub")!.as_str()!;
+//
+// decode = verify (structure, header, signature) + validate (claims). The
+// header must be a JSON object with that "alg", no member twice and no
+// "crit" (no extensions are understood, so RFC 7515 §4.1.11 says reject);
+// the payload must be a JSON object; the segments must be unpadded base64url.
+// Key strength follows RFC 7518: HMAC secrets at least as long as the hash,
+// RSA moduli of at least 2048 bits (InvalidKey otherwise). RSASSA-PSS signs
+// with a salt as long as the hash, as PyJWT does; ECDSA signatures are the
+// fixed-size r || s.
+//
+// Claim checks follow PyJWT's: exp (expired when exp <= now - leeway), nbf
+// and iat (not yet valid when > now + leeway), each checked if present
+// (Validation.require_exp etc. make them compulsory) and truncated to whole
+// seconds; iss must equal Validation.issuer when that is set; aud must hold
+// Validation.audience when set (a string or an array of strings), and a
+// token with an audience is refused when none is expected (RFC 7519 §4.1.3).
+// Checked against PyJWT (std/encoding/jwt/testdata, from tools/gen_jwt_tests.py).
+// =============================================================================
+
+import "../crypto/curve25519.ph" as curve25519;
+import "../crypto/ec.ph" as ec;
+import "../crypto/hmac.ph" as hmac;
+import "../crypto/rsa.ph" as rsa;
+import "../crypto/sha2.ph" as sha2;
+import "../crypto/subtle.ph" as subtle;
+import "../crypto/x509.ph" as x509;
+import "../io.ph" as io;
+import "../mem.ph" as mem;
+import "../os/fs.ph" as fs;
+import "../str.ph" as strs;
+import "base64.ph" as base64;
+import "json.ph" as json;
+
+error {
+    InvalidToken,
+    InvalidSignature,
+    AlgorithmMismatch,
+    InvalidKey,
+    InvalidClaim,
+    Expired,
+    NotYetValid,
+    InvalidIssuer,
+    InvalidAudience,
+    MissingClaim,
+    NotFound,
+    OutOfMemory,
+}
+
+/// The signature algorithms ("none" is deliberately absent).
+pub enum Alg: u8 {
+    HS256,
+    HS384,
+    HS512,
+    RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
+    ES256,
+    ES384,
+    EDDSA,
+
+    /// The "alg" header value.
+    pub fn name(self: Alg) []u8 {
+        match self {
+            .HS256 => { return "HS256"; }
+            .HS384 => { return "HS384"; }
+            .HS512 => { return "HS512"; }
+            .RS256 => { return "RS256"; }
+            .RS384 => { return "RS384"; }
+            .RS512 => { return "RS512"; }
+            .PS256 => { return "PS256"; }
+            .PS384 => { return "PS384"; }
+            .PS512 => { return "PS512"; }
+            .ES256 => { return "ES256"; }
+            .ES384 => { return "ES384"; }
+            .EDDSA => { return "EdDSA"; }
+        }
+    }
+
+    /// The algorithm with this "alg" name (exactly; NotFound otherwise).
+    pub fn from_name(s: []u8) !Alg {
+        let all: [12]Alg = [Alg.HS256, Alg.HS384, Alg.HS512, Alg.RS256, Alg.RS384, Alg.RS512, Alg.PS256, Alg.PS384,
+                            Alg.PS512, Alg.ES256, Alg.ES384, Alg.EDDSA];
+        for a in all {
+            if strs.eq(a.name(), s) {
+                return a;
+            }
+        }
+        return error.NotFound;
+    }
+
+    /// The hash it uses (SHA-512 for EdDSA, inside Ed25519).
+    pub fn hash(self: Alg) sha2.Algorithm {
+        if (self == Alg.HS256) or (self == Alg.RS256) or (self == Alg.PS256) or (self == Alg.ES256) {
+            return sha2.Algorithm.SHA256;
+        }
+        if (self == Alg.HS384) or (self == Alg.RS384) or (self == Alg.PS384) or (self == Alg.ES384) {
+            return sha2.Algorithm.SHA384;
+        }
+        return sha2.Algorithm.SHA512;
+    }
+}
+
+/// What signs: an HMAC secret, or a private key (RSA, P-256, P-384 or
+/// Ed25519, as std/crypto/x509 reads them).
+pub union SigningKey {
+    Secret: []u8,
+    Private: *x509.PrivateKey,
+}
+
+/// What verifies: an HMAC secret, or a public key.
+pub union VerifyingKey {
+    Secret: []u8,
+    Public: x509.PublicKey,
+}
+
+/// A public key read from PEM or DER (SubjectPublicKeyInfo), owning its
+/// bytes.
+pub struct PublicKey {
+    der: []mut u8,
+    key: x509.PublicKey,
+
+    /// The first "PUBLIC KEY" block of a PEM text.
+    pub fn from_pem(text: []u8) !PublicKey {
+        let mut it = x509.pem_blocks(text);
+        loop {
+            let b = it.next() catch return error.InvalidKey;
+            if strs.eq(b.label, "PUBLIC KEY") {
+                let d = x509.pem_decode(b)!;
+                return PublicKey.adopt(d);
+            }
+        }
+    }
+
+    /// A SubjectPublicKeyInfo (copied).
+    pub fn from_der(der: []u8) !PublicKey {
+        return PublicKey.adopt(mem.dup(der)!);
+    }
+
+    fn adopt(d: []mut u8) !PublicKey {
+        let k = x509.parse_spki(d) catch {
+            mem.free(d);
+            return error.InvalidKey;
+        };
+        if k.kind == x509.KeyKind.UNSUPPORTED {
+            mem.free(d);
+            return error.InvalidKey;
+        }
+        return PublicKey.{ der: d, key: k };
+    }
+
+    pub fn deinit(self: *mut PublicKey) void {
+        mem.free(self.der);
+        self.der = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+
+    /// The key for verify and decode (it points into this PublicKey).
+    pub fn verifying(self: *PublicKey) VerifyingKey {
+        return VerifyingKey.Public(self.key);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Signatures
+// -----------------------------------------------------------------------------
+
+fn is_hmac(a: Alg) bool {
+    return (a == Alg.HS256) or (a == Alg.HS384) or (a == Alg.HS512);
+}
+
+fn is_pkcs1(a: Alg) bool {
+    return (a == Alg.RS256) or (a == Alg.RS384) or (a == Alg.RS512);
+}
+
+fn is_pss(a: Alg) bool {
+    return (a == Alg.PS256) or (a == Alg.PS384) or (a == Alg.PS512);
+}
+
+/// RSA keys under 2048 bits are refused (RFC 7518 §3.3).
+const MIN_RSA_BITS: usize = 2048;
+
+/// Signs msg into out (at least 1024 bytes); returns the signature's length.
+fn sign_bytes(alg: Alg, key: SigningKey, msg: []u8, out: []mut u8) !usize {
+    let h = alg.hash();
+    let hl = sha2.digest_size(h);
+    let mut digest: [64]u8 = [0; 64];
+    match key {
+        .Secret(s) => {
+            if (not is_hmac(alg)) or (s.len < hl) {
+                return error.InvalidKey;
+            }
+            hmac.hmac(h, s, msg, out[..hl]);
+            return hl;
+        }
+        .Private(p) => {
+            match p.* {
+                .Rsa(k) => {
+                    if not (is_pkcs1(alg) or is_pss(alg)) or (k.public.bits() < MIN_RSA_BITS) {
+                        return error.InvalidKey;
+                    }
+                    sha2.hash(h, msg, digest[..hl]);
+                    let n = k.public.size;
+                    if is_pkcs1(alg) {
+                        k.sign_pkcs1v15(h, digest[..hl], out[..n]) catch return error.InvalidKey;
+                    } else {
+                        k.sign_pss(h, digest[..hl], out[..n]) catch return error.InvalidKey;
+                    }
+                    return n;
+                }
+                .P256(k) => {
+                    if alg != Alg.ES256 {
+                        return error.InvalidKey;
+                    }
+                    sha2.hash(h, msg, digest[..hl]);
+                    k.sign(digest[..hl], out[..64]) catch return error.InvalidKey;
+                    return 64;
+                }
+                .P384(k) => {
+                    if alg != Alg.ES384 {
+                        return error.InvalidKey;
+                    }
+                    sha2.hash(h, msg, digest[..hl]);
+                    k.sign(digest[..hl], out[..96]) catch return error.InvalidKey;
+                    return 96;
+                }
+                .Ed25519(k) => {
+                    if alg != Alg.EDDSA {
+                        return error.InvalidKey;
+                    }
+                    k.sign(msg, out[..64]);
+                    return 64;
+                }
+            }
+        }
+    }
+}
+
+/// Checks sig over msg: InvalidKey if the key does not suit alg (a secret
+/// for HMAC, an RSA key for RS and PS, a P-256 key for ES256, P-384 for
+/// ES384, Ed25519 for EdDSA), InvalidSignature if it is wrong.
+fn verify_bytes(alg: Alg, key: VerifyingKey, msg: []u8, sig: []u8) !void {
+    let h = alg.hash();
+    let hl = sha2.digest_size(h);
+    let mut digest: [64]u8 = [0; 64];
+    match key {
+        .Secret(s) => {
+            if (not is_hmac(alg)) or (s.len < hl) {
+                return error.InvalidKey;
+            }
+            hmac.hmac(h, s, msg, digest[..hl]);
+            if not subtle.equal(digest[..hl], sig) {
+                return error.InvalidSignature;
+            }
+        }
+        .Public(pk) => {
+            let mut ok = false;
+            if is_pkcs1(alg) or is_pss(alg) {
+                if pk.kind != x509.KeyKind.RSA {
+                    return error.InvalidKey;
+                }
+                let mut rk = rsa.PublicKey.from_bytes(pk.n, pk.e) catch return error.InvalidKey;
+                defer rk.deinit();
+                if rk.bits() < MIN_RSA_BITS {
+                    return error.InvalidKey;
+                }
+                sha2.hash(h, msg, digest[..hl]);
+                if is_pkcs1(alg) {
+                    ok = rsa.verify_pkcs1v15(&rk, h, digest[..hl], sig);
+                } else {
+                    ok = rsa.verify_pss(&rk, h, digest[..hl], sig);
+                }
+            } else if alg == Alg.ES256 {
+                if pk.kind != x509.KeyKind.P256 {
+                    return error.InvalidKey;
+                }
+                sha2.hash(h, msg, digest[..hl]);
+                ok = (sig.len == 64) and ec.verify_p256(pk.point, digest[..hl], sig);
+            } else if alg == Alg.ES384 {
+                if pk.kind != x509.KeyKind.P384 {
+                    return error.InvalidKey;
+                }
+                sha2.hash(h, msg, digest[..hl]);
+                ok = (sig.len == 96) and ec.verify_p384(pk.point, digest[..hl], sig);
+            } else if alg == Alg.EDDSA {
+                if pk.kind != x509.KeyKind.ED25519 {
+                    return error.InvalidKey;
+                }
+                ok = curve25519.ed25519_verify(pk.point, msg, sig);
+            } else {
+                return error.InvalidKey;  // an HMAC algorithm with a public key
+            }
+            if not ok {
+                return error.InvalidSignature;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Signing
+// -----------------------------------------------------------------------------
+
+/// Writes a token for the claims (a JSON object's text, signed as it is)
+/// to w: the header {"alg":...,"kid":...,"typ":"JWT"} (kid only if not
+/// empty), the claims and the signature, base64url-encoded.
+pub fn sign_to(w: io.Writer, alg: Alg, key: SigningKey, claims: []u8, kid: []u8) !void {
+    let mut input = strs.String.init();
+    defer input.deinit();
+    let mut hdr = strs.String.init();
+    defer hdr.deinit();
+    let hw = hdr.writer();
+    hw.write_all("{\"alg\":\"")!;
+    hw.write_all(alg.name())!;
+    hw.write_all("\"")!;
+    if kid.len > 0 {
+        hw.write_all(",\"kid\":")!;
+        json.write_string(hw, kid)!;
+    }
+    hw.write_all(",\"typ\":\"JWT\"}")!;
+    base64.encode_to(input.writer(), hdr.bytes(), base64.URL)!;
+    input.push('.')!;
+    base64.encode_to(input.writer(), claims, base64.URL)!;
+    let mut sig: [1024]u8 = [0; 1024];
+    let n = sign_bytes(alg, key, input.bytes(), sig[..])!;
+    w.write_all(input.bytes())!;
+    w.write_all(".")!;
+    base64.encode_to(w, sig[..n], base64.URL)!;
+}
+
+/// A token for the claims, in new memory (free it with mem.free).
+pub fn sign(alg: Alg, key: SigningKey, claims: []u8, kid: []u8) ![]mut u8 {
+    let mut s = strs.String.init();
+    sign_to(s.writer(), alg, key, claims, kid) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+// -----------------------------------------------------------------------------
+// Verifying
+// -----------------------------------------------------------------------------
+
+/// A verified token: its header and claims (JSON objects) and the claims'
+/// text. deinit frees it all.
+pub struct Token {
+    alg: Alg,
+    header: json.Value,
+    claims: json.Value,
+    payload: []u8,  // the claims' JSON text
+    kid: []u8,      // the header's "kid", or empty
+    header_doc: json.Document,
+    claims_doc: json.Document,
+    payload_buf: []mut u8,
+
+    pub fn deinit(self: *mut Token) void {
+        self.header_doc.deinit();
+        self.claims_doc.deinit();
+        mem.free(self.payload_buf);
+        self.payload_buf = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        self.payload = "";
+        self.kid = "";
+    }
+}
+
+fn b64url_char(c: u8) bool {
+    return strs.is_alnum(c) or (c == '-') or (c == '_');
+}
+
+/// Strict base64url (RFC 7515 §2: no padding, no white space) into new memory.
+fn segment(s: []u8) ![]mut u8 {
+    for c in s {
+        if not b64url_char(c) {
+            return error.InvalidToken;
+        }
+    }
+    return base64.decode_alloc(s, base64.URL) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return error.InvalidToken;
+    };
+}
+
+fn has(obj: json.Value, name: []u8) bool {
+    _ = obj.get(name) catch return false;
+    return true;
+}
+
+/// A JSON object whose member names are all different.
+fn parse_object(text: []u8) !json.Document {
+    let mut d = json.parse(text) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return error.InvalidToken;
+    };
+    let ms = d.root.as_object() catch {
+        d.deinit();
+        return error.InvalidToken;
+    };
+    for i in 0..ms.len {
+        for j in 0..i {
+            if strs.eq(ms[i].key, ms[j].key) {
+                d.deinit();
+                return error.InvalidToken;
+            }
+        }
+    }
+    return d;
+}
+
+struct Parts {
+    header: []u8,  // the base64url text of each
+    payload: []u8,
+    sig: []u8,
+    input: []u8,  // header "." payload: what is signed
+}
+
+fn split(token: []u8) !Parts {
+    let a = strs.index_of_byte(token, '.') catch return error.InvalidToken;
+    let rest = token[a + 1..];
+    let b = strs.index_of_byte(rest, '.') catch return error.InvalidToken;
+    let sig = rest[b + 1..];
+    if strs.contains(sig, ".") {
+        return error.InvalidToken;  // (five segments: JWE, which this is not)
+    }
+    return Parts.{ header: token[..a], payload: rest[..b], sig: sig, input: token[..(a + 1) + b] };
+}
+
+/// The header of a token, parsed but NOT verified: for choosing a key by
+/// its "kid" before verifying. The caller frees the Document (deinit).
+pub fn header_unverified(token: []u8) !json.Document {
+    let p = split(token)!;
+    let h = segment(p.header)!;
+    defer mem.free(h);
+    return parse_object(h);
+}
+
+/// Verifies a token's structure, header and signature (not its claims:
+/// see validate and decode). alg is the algorithm the caller expects, and
+/// key must suit it; a header naming another algorithm fails with
+/// AlgorithmMismatch.
+pub fn verify(token: []u8, alg: Alg, key: VerifyingKey) !Token {
+    let p = split(token)!;
+    let hb = segment(p.header)!;
+    defer mem.free(hb);
+    let mut hd = parse_object(hb)!;
+    let name = hd.root.get("alg") catch {
+        hd.deinit();
+        return error.InvalidToken;
+    };
+    let alg_name = name.as_str() catch {
+        hd.deinit();
+        return error.InvalidToken;
+    };
+    if not strs.eq(alg_name, alg.name()) {
+        hd.deinit();
+        return error.AlgorithmMismatch;
+    }
+    if has(hd.root, "crit") {
+        hd.deinit();
+        return error.InvalidToken;  // (no extension is understood)
+    }
+    let kv = hd.root.get("kid") catch json.Value.Null;
+    let kid = kv.as_str() catch "";
+    // the signature, before looking at the claims
+    let sig = segment(p.sig) catch |e| {
+        hd.deinit();
+        return e;
+    };
+    defer mem.free(sig);
+    verify_bytes(alg, key, p.input, sig) catch |e| {
+        hd.deinit();
+        return e;
+    };
+    let pb = segment(p.payload) catch |e| {
+        hd.deinit();
+        return e;
+    };
+    let cd = parse_object(pb) catch |e| {
+        mem.free(pb);
+        hd.deinit();
+        return e;
+    };
+    return Token.{ alg: alg, header: hd.root, claims: cd.root, payload: pb, kid: kid, header_doc: hd, claims_doc: cd,
+                   payload_buf: pb };
+}
+
+// -----------------------------------------------------------------------------
+// Claims
+// -----------------------------------------------------------------------------
+
+/// The claim checks: the time, a leeway for clock skew, and the issuer and
+/// audience to require (empty: not checked; but a token that names an
+/// audience is refused when none is expected).
+pub struct Validation {
+    now: i64,        // Unix time, seconds
+    leeway: i64,     // seconds of grace either way
+    issuer: []u8,    // "iss" must equal this, if not empty
+    audience: []u8,  // "aud" must contain this, if not empty
+    require_exp: bool,
+    require_nbf: bool,
+    require_iat: bool,
+
+    /// Checks at Unix time now, no leeway, no issuer or audience, nothing
+    /// required (exp, nbf and iat are checked when present).
+    pub fn at(now: i64) Validation {
+        return Validation.{ now: now, leeway: 0, issuer: "", audience: "", require_exp: false, require_nbf: false,
+                            require_iat: false };
+    }
+}
+
+/// A NumericDate claim, truncated to whole seconds as PyJWT does; false if
+/// absent.
+fn numeric(claims: json.Value, name: []u8, required: bool, out: *mut i64) !bool {
+    let v = claims.get(name) catch {
+        if required {
+            return error.MissingClaim;
+        }
+        return false;
+    };
+    match v {
+        .Int(x) => { out.* = x; }
+        .Float(f) => {
+            if (f != f) or (f < -9.0e18) or (f > 9.0e18) {
+                return error.InvalidClaim;
+            }
+            out.* = @int_from_float(i64, f);
+        }
+        else => { return error.InvalidClaim; }
+    }
+    return true;
+}
+
+/// Whether a JSON value is empty for "aud" (missing, "", [] or null).
+fn empty_aud(v: json.Value) bool {
+    match v {
+        .Null       => { return true; }
+        .Bool(b)    => { return not b; }
+        .String(s)  => { return s.len == 0; }
+        .Array(xs)  => { return xs.len == 0; }
+        .Object(ms) => { return ms.len == 0; }
+        .Int(x)     => { return x == 0; }
+        .Float(f)   => { return f == 0.0; }
+    }
+}
+
+/// Checks a verified token's claims.
+pub fn validate(t: *Token, v: Validation) !void {
+    let c = t.claims;
+    let mut x: i64 = 0;
+    if numeric(c, "iat", v.require_iat, &mut x)! and (x > @add_sat(v.now, v.leeway)) {
+        return error.NotYetValid;
+    }
+    if numeric(c, "nbf", v.require_nbf, &mut x)! and (x > @add_sat(v.now, v.leeway)) {
+        return error.NotYetValid;
+    }
+    if numeric(c, "exp", v.require_exp, &mut x)! and (x <= @sub_sat(v.now, v.leeway)) {
+        return error.Expired;
+    }
+    if v.issuer.len > 0 {
+        let iss = c.get("iss") catch return error.MissingClaim;
+        let s = iss.as_str() catch return error.InvalidIssuer;
+        if not strs.eq(s, v.issuer) {
+            return error.InvalidIssuer;
+        }
+    }
+    let aud = c.get("aud") catch json.Value.Null;
+    if v.audience.len == 0 {
+        if not empty_aud(aud) {
+            return error.InvalidAudience;
+        }
+        return;
+    }
+    if empty_aud(aud) {
+        return error.MissingClaim;
+    }
+    match aud {
+        .String(s) => {
+            if not strs.eq(s, v.audience) {
+                return error.InvalidAudience;
+            }
+        }
+        .Array(xs) => {
+            let mut found = false;
+            for a in xs {
+                let s = a.as_str() catch return error.InvalidAudience;
+                if strs.eq(s, v.audience) {
+                    found = true;
+                }
+            }
+            if not found {
+                return error.InvalidAudience;
+            }
+        }
+        else => { return error.InvalidAudience; }
+    }
+}
+
+/// verify, then validate: the token if both pass.
+pub fn decode(token: []u8, alg: Alg, key: VerifyingKey, v: Validation) !Token {
+    let mut t = verify(token, alg, key)!;
+    validate(&t, v) catch |e| {
+        t.deinit();
+        return e;
+    };
+    return t;
+}
+
+// -----------------------------------------------------------------------------
+// Tests: tokens and keys from PyJWT (tools/gen_jwt_tests.py), and by hand
+// -----------------------------------------------------------------------------
+
+fn read_key_file(name: []u8, suffix: []u8) ![]mut u8 {
+    let mut p = strs.String.init();
+    defer p.deinit();
+    p.push_str("std/encoding/jwt/testdata/")!;
+    p.push_str(name)!;
+    p.push_str(suffix)!;
+    return fs.read_file(p.bytes());
+}
+
+fn result_of(r: !Token) []u8 {
+    let mut t = r catch |e| return @error_name(e);
+    t.deinit();
+    return "ok";
+}
+
+test "tokens from PyJWT" {
+    let text = fs.read_file("std/encoding/jwt/testdata/cases.json") catch return;
+    defer mem.free(text);
+    let mut doc = json.parse(text)!;
+    defer doc.deinit();
+    let now = doc.root.get("now")!.as_i64()!;
+    let mut n: usize = 0;
+    let mut resigned: usize = 0;
+    for c in doc.root.get("cases")!.as_array()! {
+        let token = c.get("token")!.as_str()!;
+        let alg = Alg.from_name(c.get("alg")!.as_str()!)!;
+        let key_name = c.get("key")!.as_str()!;
+        let mut v = Validation.at(now);
+        v.leeway = c.get("leeway")!.as_i64()!;
+        v.issuer = c.get("issuer")!.as_str()!;
+        v.audience = c.get("audience")!.as_str()!;
+        let want = c.get("result")!.as_str()!;
+        let secret = strs.strip_prefix(key_name, "secret:") catch "";
+        let mut pk = PublicKey.{ der: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0),
+                                 key: x509.PublicKey.{ kind: x509.KeyKind.UNSUPPORTED, point: "", n: "", e: "" } };
+        defer pk.deinit();
+        let mut vk = VerifyingKey.Secret(secret);
+        if secret.len == 0 {
+            let pem = read_key_file(key_name, "-public.pem")!;
+            defer mem.free(pem);
+            pk = PublicKey.from_pem(pem)!;
+            vk = pk.verifying();
+        }
+        let got = result_of(decode(token, alg, vk, v));
+        if not strs.eq(got, want) {
+            io.stderr().println(c.get("note")!.as_str()!) catch {};
+        }
+        @expect_eq(got, want);
+        // sign the same claims again: the same token where the algorithm is
+        // deterministic, else one that verifies
+        if strs.eq(want, "ok") and strs.eq(c.get("issuer")!.as_str()!, "") {
+            let mut t = verify(token, alg, vk)!;
+            defer t.deinit();
+            let mut sk_pem: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+            defer mem.free(sk_pem);
+            let zero: [32]u8 = [0; 32];
+            let mut sk = x509.PrivateKey.Ed25519(curve25519.Ed25519.from_seed(zero[..]));  // (replaced below)
+            defer sk.deinit();
+            let mut skey = SigningKey.Secret(secret);
+            if secret.len == 0 {
+                sk_pem = read_key_file(key_name, "-private.pem")!;
+                sk = x509.parse_private_key_pem(sk_pem)!;
+                skey = SigningKey.Private(&sk);
+            }
+            let mine = sign(alg, skey, t.payload, t.kid)!;
+            defer mem.free(mine);
+            let payload = c.get("payload") catch json.Value.Null;
+            if not payload.is_null() {
+                @expect_eq(t.payload, payload.as_str()!);
+                @expect_eq(mine, token);
+                resigned += 1;
+            }
+            let mut t2 = decode(mine, alg, vk, v)!;
+            defer t2.deinit();
+            @expect_eq(t2.payload, t.payload);
+            @expect_eq(t2.kid, t.kid);
+        }
+        n += 1;
+    }
+    @expect(n >= 50);
+    @expect_eq(resigned, 14);
+}
+
+fn ed_public(sk: *curve25519.Ed25519) VerifyingKey {
+    return VerifyingKey.Public(x509.PublicKey.{ kind: x509.KeyKind.ED25519, point: sk.public[..], n: "", e: "" });
+}
+
+test "claims at their boundaries" {
+    let secret = "0123456789abcdef0123456789abcdef";
+    let key = VerifyingKey.Secret(secret);
+    let tok = sign(Alg.HS256, SigningKey.Secret(secret), "{\"exp\":1000,\"nbf\":900,\"iat\":900}", "")!;
+    defer mem.free(tok);
+    let mut v = Validation.at(999);
+    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "ok");
+    v.now = 1000;
+    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "Expired");  // exp <= now
+    v.leeway = 1;
+    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "ok");
+    v = Validation.at(899);
+    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "NotYetValid");
+    v.leeway = 1;
+    @expect_eq(result_of(decode(tok, Alg.HS256, key, v)), "ok");
+    // required claims, and claims of the wrong type
+    let bare = sign(Alg.HS256, SigningKey.Secret(secret), "{\"sub\":\"x\",\"aud\":[]}", "")!;
+    defer mem.free(bare);
+    v = Validation.at(0);
+    @expect_eq(result_of(decode(bare, Alg.HS256, key, v)), "ok");  // (an empty aud is no aud)
+    v.require_exp = true;
+    @expect_eq(result_of(decode(bare, Alg.HS256, key, v)), "MissingClaim");
+    v = Validation.at(0);
+    v.require_nbf = true;
+    @expect_eq(result_of(decode(bare, Alg.HS256, key, v)), "MissingClaim");
+    let odd = sign(Alg.HS256, SigningKey.Secret(secret), "{\"exp\":\"tomorrow\"}", "")!;
+    defer mem.free(odd);
+    @expect_eq(result_of(decode(odd, Alg.HS256, key, Validation.at(0))), "InvalidClaim");
+    let iss = sign(Alg.HS256, SigningKey.Secret(secret), "{\"iss\":7}", "")!;
+    defer mem.free(iss);
+    v = Validation.at(0);
+    v.issuer = "7";
+    @expect_eq(result_of(decode(iss, Alg.HS256, key, v)), "InvalidIssuer");
+    // verify alone does not look at the claims
+    let mut t = verify(tok, Alg.HS256, key)!;
+    defer t.deinit();
+    @expect_eq(t.claims.get("exp")!.as_i64()!, 1000);
+    @expect_eq(t.kid, "");
+    @expect(t.alg == Alg.HS256);
+}
+
+test "keys must suit the algorithm" {
+    let short = "too short for HS256";
+    @expect(fails_sign(sign(Alg.HS256, SigningKey.Secret(short), "{}", "")));
+    let long = "0123456789abcdef0123456789abcdef0123456789abcdef";  // 48 bytes
+    @expect(fails_sign(sign(Alg.HS512, SigningKey.Secret(long), "{}", "")));
+    let tok = sign(Alg.HS384, SigningKey.Secret(long), "{}", "")!;
+    defer mem.free(tok);
+    @expect_eq(result_of(verify(tok, Alg.HS384, VerifyingKey.Secret(long[..40]))), "InvalidKey");
+    @expect_eq(result_of(verify(tok, Alg.HS384, VerifyingKey.Secret(long))), "ok");
+    // an Ed25519 key for everything but EdDSA
+    let seed: [32]u8 = [7; 32];
+    let ed = curve25519.Ed25519.from_seed(seed[..]);
+    let mut xk = x509.PrivateKey.Ed25519(ed);
+    defer xk.deinit();
+    @expect(fails_sign(sign(Alg.ES256, SigningKey.Private(&xk), "{}", "")));
+    @expect(fails_sign(sign(Alg.HS256, SigningKey.Private(&xk), "{}", "")));
+    let et = sign(Alg.EDDSA, SigningKey.Private(&xk), "{\"a\":1}", "k")!;
+    defer mem.free(et);
+    @expect_eq(result_of(verify(et, Alg.EDDSA, ed_public(&ed))), "ok");
+    @expect_eq(result_of(verify(et, Alg.ES256, ed_public(&ed))), "AlgorithmMismatch");
+    // the HMAC algorithm with a public key, and EdDSA with a secret
+    let forged = sign(Alg.HS256, SigningKey.Secret(ed.public[..]), "{\"a\":1}", "")!;
+    defer mem.free(forged);
+    @expect_eq(result_of(verify(forged, Alg.HS256, ed_public(&ed))), "InvalidKey");
+    @expect_eq(result_of(verify(et, Alg.EDDSA, VerifyingKey.Secret(long))), "InvalidKey");
+    // RSA: the key file from the tests above, against ES256
+    let pem = read_key_file("rsa", "-public.pem") catch return;
+    defer mem.free(pem);
+    let mut pk = PublicKey.from_pem(pem)!;
+    defer pk.deinit();
+    let es = read_key_file("p256", "-private.pem")!;
+    defer mem.free(es);
+    let mut esk = x509.parse_private_key_pem(es)!;
+    defer esk.deinit();
+    let et2 = sign(Alg.ES256, SigningKey.Private(&esk), "{}", "")!;
+    defer mem.free(et2);
+    @expect_eq(result_of(verify(et2, Alg.ES256, pk.verifying())), "InvalidKey");
+    @expect(fails_sign(sign(Alg.ES384, SigningKey.Private(&esk), "{}", "")));
+    @expect_eq(result_of(verify(et2, Alg.ES256, VerifyingKey.Secret(long))), "InvalidKey");
+    let bad_pem = PublicKey.from_pem("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n") catch pk;
+    @expect_eq(bad_pem.der.len, pk.der.len);
+}
+
+fn fails_sign(r: ![]mut u8) bool {
+    let x = r catch return true;
+    mem.free(x);
+    return false;
+}
+
+test "malformed tokens" {
+    let secret = "0123456789abcdef0123456789abcdef";
+    let key = VerifyingKey.Secret(secret);
+    let good = sign(Alg.HS256, SigningKey.Secret(secret), "{\"sub\":\"x\"}", "kid \"one\"")!;
+    defer mem.free(good);
+    let mut h = header_unverified(good)!;
+    defer h.deinit();
+    @expect_eq(h.root.get("kid")!.as_str()!, "kid \"one\"");
+    @expect_eq(h.root.get("typ")!.as_str()!, "JWT");
+    let mut t = verify(good, Alg.HS256, key)!;
+    defer t.deinit();
+    @expect_eq(t.kid, "kid \"one\"");
+    let cases: [9][]u8 = [
+        "",
+        "abc",
+        "abc.def",
+        "a.b.c.d.e",
+        "eyJhbGciOiJIUzI1NiJ9.e30.x.y",
+        "eyJhbGciOiJIUzI1NiJ9 .e30.",  // white space
+        "eyJ0eXAiOiJKV1QifQ.e30.",     // no alg
+        "eyJhbGciOjF9.e30.",           // a number for alg
+        "bm90IGpzb24.e30.",            // a header that is not JSON
+    ];
+    for c in cases {
+        @expect_eq(result_of(verify(c, Alg.HS256, key)), "InvalidToken");
+    }
+    @expect_eq(result_of(verify("eyJhbGciOiJIUzM4NCJ9.e30.", Alg.HS256, key)), "AlgorithmMismatch");
+    @expect_eq(result_of(verify("eyJhbGciOiJoczI1NiJ9.e30.", Alg.HS256, key)), "AlgorithmMismatch");  // "hs256"
+    @expect_eq(result_of(verify("eyJhbGciOiJub25lIn0.e30.", Alg.HS256, key)), "AlgorithmMismatch");   // "none"
+    @expect(fails_header(header_unverified("x.y.z")));
+    // every byte changed: an error (or, where base64url has slack, the same token), never a trap
+    let mut m = strs.String.init();
+    defer m.deinit();
+    for i in 0..good.len {
+        for flip in [@as(u8, 1), 0x20, 0x80]{
+            m.clear();
+            m.push_str(good)!;
+            m.bytes()[i] ^= flip;
+            let r = result_of(decode(m.bytes(), Alg.HS256, key, Validation.at(0)));
+            @expect(not strs.eq(r, "ok"));
+        }
+    }
+}
+
+fn fails_header(r: !json.Document) bool {
+    let mut d = r catch return true;
+    d.deinit();
+    return false;
+}
