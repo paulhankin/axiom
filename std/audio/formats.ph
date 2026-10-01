@@ -177,15 +177,30 @@ pub fn load(path: []u8) !audio.Sound {
 }
 
 /// Encodes a sound in the format its file name's extension names, and
-/// writes the file as it is encoded (on an error after the file is
-/// created, what was written so far stays).
+/// writes the file as it is encoded. If that fails, the file is removed.
 pub fn save(path: []u8, s: *audio.Sound) !void {
     let format = from_extension(path);
     if (format != Format.WAV) and (format != Format.AIFF) and (format != Format.FLAC) {
         return error.Unsupported;
     }
     let f = io.create(path)!;
-    defer f.close();
+    write_file(f, s, format) catch |e| {
+        f.close();
+        fs.remove(path) catch {};
+        return e;
+    };
+    f.close();
+}
+
+fn write_file(f: io.File, s: *audio.Sound, format: Format) !void {
+    if format == Format.FLAC {
+        // flac.encode_to encodes twice (its header needs the frame sizes
+        // and MD5 first); in memory it is one pass
+        let b = flac.encode(s, flac.DEFAULT)!;
+        defer mem.free(b);
+        f.writer().write_all(b)!;
+        return;
+    }
     let mut bw = io.BufWriter.init(f.writer());
     encode_to(bw.writer(), s, format)!;
     bw.flush()!;
