@@ -32,7 +32,6 @@ import "../compress/deflate.ph" as deflate;
 import "../crypto/md5.ph" as md5;
 import "../io.ph" as io;
 import "../mem.ph" as mem;
-import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
 import "color.ph" as color;
 import "draw.ph" as draw;
@@ -446,25 +445,31 @@ pub struct Document {
 
     /// Writes the PDF file.
     pub fn save(self: *mut Document, path: []u8) !void {
-        let b = self.bytes()!;
-        defer mem.free(b);
-        fs.write_file(path, b)!;
+        let f = io.create(path)!;
+        defer f.close();
+        self.write(f.writer())!;
     }
 
-    /// Writes the PDF to a Writer.
+    /// Writes the PDF to a Writer, as it is produced. The document is
+    /// finished: no pages can be added after.
     pub fn write(self: *mut Document, w: io.Writer) !void {
-        let b = self.bytes()!;
-        defer mem.free(b);
-        w.write_all(b)!;
-    }
-
-    /// The PDF file. The document is finished: no pages can be added after.
-    pub fn bytes(self: *mut Document) ![]mut u8 {
         if not self.finished {
             self.finish()!;
             self.finished = true;
         }
-        return self.serialize();
+        let mut sink = Sink.init(w);
+        self.serialize_to(&mut sink)!;
+        sink.flush()!;
+    }
+
+    /// The PDF file. The document is finished: no pages can be added after.
+    pub fn bytes(self: *mut Document) ![]mut u8 {
+        let mut out = strs.String.init();
+        self.write(out.writer()) catch |e| {
+            out.deinit();
+            return e;
+        };
+        return out.take();
     }
 
     fn finish(self: *mut Document) !void {
@@ -546,86 +551,103 @@ pub struct Document {
         self.set(CATALOG, &mut c)!;
     }
 
-    fn serialize(self: *mut Document) ![]mut u8 {
-        let mut out = strs.String.init();
-        let r = self.serialize_into(&mut out);
-        r catch |e| {
-            out.deinit();
-            return e;
-        };
-        return out.take();
-    }
-
-    fn serialize_into(self: *mut Document, out: *mut strs.String) !void {
-        out.push_str("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")!;
-        let mut offsets = vec.Vec.[usize].init();
+    fn serialize_to(self: *mut Document, out: *mut Sink) !void {
+        let mut s = strs.String.init();
+        defer s.deinit();
+        out.put("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")!;
+        let mut offsets = vec.Vec.[u64].init();
         defer offsets.deinit();
         for i in 0..self.objs.len {
-            offsets.push(out.len)!;
-            put_u64(out, @as(u64, i + 1))!;
-            out.push_str(" 0 obj\n")!;
-            out.push_str(self.objs.get(i))!;
-            out.push_str("\nendobj\n")!;
+            offsets.push(out.count)!;
+            s.clear();
+            put_u64(&mut s, @as(u64, i + 1))!;
+            s.push_str(" 0 obj\n")!;
+            out.put(s.bytes())!;
+            out.put(self.objs.get(i))!;
+            out.put("\nendobj\n")!;
         }
         // metadata
         let mut info: u32 = 0;
         if self.info.len > 0 {
-            let mut b = strs.String.init();
-            defer b.deinit();
-            b.push_str("<<")!;
+            offsets.push(out.count)!;
+            info = @truncate(u32, offsets.len);
+            s.clear();
+            put_u64(&mut s, @as(u64, info))!;
+            s.push_str(" 0 obj\n<<")!;
             let mut k: usize = 0;
             while k + 1 < self.info.len {
-                b.push(' ')!;
-                put_name(&mut b, self.info.get(k))!;
-                b.push(' ')!;
-                put_text_string(&mut b, self.info.get(k + 1))!;
+                s.push(' ')!;
+                put_name(&mut s, self.info.get(k))!;
+                s.push(' ')!;
+                put_text_string(&mut s, self.info.get(k + 1))!;
                 k += 2;
             }
-            b.push_str(" >>")!;
-            offsets.push(out.len)!;
-            info = @truncate(u32, offsets.len);
-            put_u64(out, @as(u64, info))!;
-            out.push_str(" 0 obj\n")!;
-            out.push_str(b.bytes())!;
-            out.push_str("\nendobj\n")!;
+            s.push_str(" >>\nendobj\n")!;
+            out.put(s.bytes())!;
         }
-        let xref = out.len;
-        out.push_str("xref\n0 ")!;
-        put_u64(out, @as(u64, offsets.len + 1))!;
-        out.push_str("\n0000000000 65535 f \n")!;
+        let xref = out.count;
+        s.clear();
+        s.push_str("xref\n0 ")!;
+        put_u64(&mut s, @as(u64, offsets.len + 1))!;
+        s.push_str("\n0000000000 65535 f \n")!;
+        out.put(s.bytes())!;
         for off in offsets.items() {
-            let mut digits: [10]u8 = [0; 10];
+            let mut line: [20]u8 = [0; 20];
             let mut v = off;
             let mut k: usize = 10;
             while k > 0 {
                 k -= 1;
-                digits[k] = @truncate(u8, v % 10) + '0';
+                line[k] = @truncate(u8, v % 10) + '0';
                 v /= 10;
             }
-            out.push_str(digits[..])!;
-            out.push_str(" 00000 n \n")!;
+            @mem_copy(line[10..], " 00000 n \n");
+            out.put(line[..])!;
         }
-        // a file identifier from the contents
+        // a file identifier from the contents so far
         let mut id: [16]u8 = [0; 16];
-        md5.md5(out.bytes(), id[..]);
-        out.push_str("trailer\n<< /Size ")!;
-        put_u64(out, @as(u64, offsets.len + 1))!;
-        out.push_str(" /Root 1 0 R")!;
+        out.hash.final(id[..]);
+        s.clear();
+        s.push_str("trailer\n<< /Size ")!;
+        put_u64(&mut s, @as(u64, offsets.len + 1))!;
+        s.push_str(" /Root 1 0 R")!;
         if info != 0 {
-            out.push_str(" /Info ")!;
-            put_ref(out, info)!;
+            s.push_str(" /Info ")!;
+            put_ref(&mut s, info)!;
         }
-        out.push_str(" /ID [<")!;
+        s.push_str(" /ID [<")!;
         for b in id {
-            put_hex2(out, b)!;
+            put_hex2(&mut s, b)!;
         }
-        out.push_str("> <")!;
+        s.push_str("> <")!;
         for b in id {
-            put_hex2(out, b)!;
+            put_hex2(&mut s, b)!;
         }
-        out.push_str(">] >>\nstartxref\n")!;
-        put_u64(out, @as(u64, xref))!;
-        out.push_str("\n%%EOF\n")!;
+        s.push_str(">] >>\nstartxref\n")!;
+        put_u64(&mut s, xref)!;
+        s.push_str("\n%%EOF\n")!;
+        out.put(s.bytes())!;
+    }
+}
+
+// Where a document is written: a buffered Writer, the bytes so far (object
+// offsets) and their MD5 (the file identifier).
+struct Sink {
+    buf: io.BufWriter,
+    count: u64,
+    hash: md5.Md5,
+
+    fn init(w: io.Writer) Sink {
+        return Sink.{ buf: io.BufWriter.init(w), count: 0, hash: md5.Md5.init() };
+    }
+
+    fn put(self: *mut Sink, bytes: []u8) !void {
+        self.hash.update(bytes);
+        self.count += @as(u64, bytes.len);
+        self.buf.writer().write_all(bytes)!;
+    }
+
+    fn flush(self: *mut Sink) !void {
+        self.buf.flush()!;
     }
 }
 
@@ -2012,4 +2034,28 @@ test "font subsets are fonts" {
     sub.glyph_path(f.glyph_index('B'), &mut path, 0.0, 0.0, 1.0)!;
     @expect_eq(path.verbs.len, 0);  // B is not
     @expect_eq(checksum(file.bytes()), 0xb1b0afba);
+}
+
+test "write streams to a Writer" {
+    let mut doc = Document.init();
+    defer doc.deinit();
+    doc.set_info("Title", "Streamed")!;
+    let mut p = doc.page(A4_WIDTH, A4_HEIGHT)!;
+    defer p.deinit();
+    p.fill_rect(10.0, 10.0, 100.0, 50.0, draw.Paint.solid(color.Color.rgb(0.0, 0.5, 1.0)))!;
+    doc.add_page(&mut p)!;
+    let mut s = strs.String.init();
+    defer s.deinit();
+    doc.write(s.writer())!;
+    let b = doc.bytes()!;
+    defer mem.free(b);
+    @expect_eq(s.bytes(), b);
+    // the Writer's errors come through
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    doc.write(bw.writer()) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
