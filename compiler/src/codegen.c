@@ -251,7 +251,7 @@ static LLVMValueRef intr2(const char *name, LLVMValueRef a, LLVMValueRef b) {
 // ---------------------------------------------------------------------------
 enum {
     T_TRAP = 0, T_BOUNDS = 1, T_OVERFLOW = 2, T_DIVZERO = 3, T_INTCAST = 4, T_LENGTH = 6, T_UNIONTAG = 7,
-    T_ATOMIC_ALIGN = 10, T_EXPECT = 11, T_MEMORY = 12,
+    T_STACK = 8, T_ATOMIC_ALIGN = 10, T_EXPECT = 11, T_MEMORY = 12,
     SITE_ERR_RETURN = 254, SITE_CALL = 255,  // not traps: shadow stack records
 };
 
@@ -368,6 +368,28 @@ static LLVMValueRef site_record(int code, Span sp) { return site_record_ex(code,
 #define ET_CAP 32
 static LLVMTypeRef ss_ty;
 static LLVMValueRef ss_global, ss_main;
+
+// WebAssembly stacks live in linear memory, where running past the end goes
+// unnoticed: each function with a frame there checks it against this
+// per-thread limit (a wasm global) first. The main thread's stack is the
+// first MiB of memory (--stack-first); its lowest KiB stays unused.
+#define WASM_MAIN_STACK_LIMIT 1024
+static LLVMValueRef stack_limit_global;
+
+static LLVMValueRef stack_limit(void) {
+    if (!stack_limit_global)
+        stack_limit_global = shared_global(T_isz, "phalange.stack_limit", usz(WASM_MAIN_STACK_LIMIT), 1);
+    return stack_limit_global;
+}
+
+static LLVMValueRef stack_pointer_global(void) {
+    LLVMValueRef sp = LLVMGetNamedGlobal(mod, "__stack_pointer");
+    if (!sp) {
+        sp = LLVMAddGlobalInAddressSpace(mod, T_ptr, "__stack_pointer", 1);
+        LLVMSetLinkage(sp, LLVMExternalLinkage);
+    }
+    return sp;
+}
 
 static bool stack_traces_on(void) { return O && O->stack_traces; }
 
@@ -2326,6 +2348,8 @@ static void emit_thread_start(void) {
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
     LLVMPositionBuilderAtEnd(B, bb);
     LLVMValueRef top = LLVMGetParam(fn, 2);
+    // std/thread stores the stack's lowest address at its top
+    LLVMBuildStore(B, LLVMBuildLoad2(B, T_isz, top, "bottom"), stack_limit());
     if (stack_traces_on()) {
         // The thread's shadow stack sits at the top of its stack.
         LLVMTypeRef t = ss_type();
@@ -2341,12 +2365,7 @@ static void emit_thread_start(void) {
     // linker defines) directly; llvm.stackrestore in a function without a
     // frame of its own is dropped, and the thread would run on the main
     // thread's stack.
-    LLVMValueRef sp = LLVMGetNamedGlobal(mod, "__stack_pointer");
-    if (!sp) {
-        sp = LLVMAddGlobalInAddressSpace(mod, T_ptr, "__stack_pointer", 1);
-        LLVMSetLinkage(sp, LLVMExternalLinkage);
-    }
-    LLVMBuildStore(B, top, sp);
+    LLVMBuildStore(B, top, stack_pointer_global());
     LLVMTypeRef ety = LLVMFunctionType(T_void, &T_ptr, 1, false);
     LLVMValueRef arg = LLVMGetParam(fn, 1);
     LLVMBuildCall2(B, ety, LLVMGetParam(fn, 0), &arg, 1, "");
@@ -2928,6 +2947,31 @@ static void delete_unreachable(LLVMValueRef fn) {
     }
 }
 
+// The end of a wasm function's entry block (where its allocas are): trap
+// with T0008 unless its frame fits above the thread's stack limit.
+static void check_stack(Decl *d, LLVMBasicBlockRef entry, LLVMBasicBlockRef start) {
+    unsigned long long frame = 0;
+    for (LLVMValueRef i = LLVMGetFirstInstruction(entry); i; i = LLVMGetNextInstruction(i)) {
+        if (!LLVMIsAAllocaInst(i)) continue;
+        unsigned long long a = LLVMGetAlignment(i);
+        if (a < 1) a = 1;
+        frame = (frame + a - 1) / a * a + LLVMABISizeOfType(TD, LLVMGetAllocatedType(i));
+    }
+    if (frame == 0) {
+        LLVMBuildBr(B, start);
+        return;
+    }
+    frame = (frame + 15) & ~15ull;
+    LLVMValueRef sp = LLVMBuildPtrToInt(B, LLVMBuildLoad2(B, T_ptr, stack_pointer_global(), "sp"), T_isz, "");
+    LLVMValueRef need = LLVMBuildAdd(B, LLVMBuildLoad2(B, T_isz, stack_limit(), "limit"), usz((int64_t)frame), "");
+    Span saved = g_cur_span;
+    g_cur_span = d->name_span;
+    // signed: a stack pointer below address 0 wraps around
+    LLVMValueRef room = LLVMBuildSub(B, sp, need, "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntSLT, room, usz(0), ""), trap_block(T_STACK), start);
+    g_cur_span = saved;
+}
+
 static void gen_fn_body(FnInst *fi) {
     Decl *d = fi->decl;
     FnState st = {0};
@@ -2965,7 +3009,8 @@ static void gen_fn_body(FnInst *fi) {
         else LLVMBuildUnreachable(B);
     }
     LLVMPositionBuilderAtEnd(B, st.entry);
-    LLVMBuildBr(B, start);
+    if (g_target.wasm) check_stack(d, st.entry, start);
+    else LLVMBuildBr(B, start);
     delete_unreachable(fi->fn);
     free(st.defers.data);
     free(st.loops.data);
@@ -3225,6 +3270,7 @@ bool codegen_program(CgOptions *o) {
         LLVMTypeRef fty;
         error_name_fn(&fty);
         if (stack_traces_on()) ss_globals();
+        if (g_target.wasm) stack_limit();
         trap_info_global();
     }
     if (program_parts) {

@@ -64,7 +64,10 @@ pub fn spawn[T](f: fn(T) void, arg: T) !Thread.[T] {
             mem.free(cell);
             return e;
         };
-        top = (@int_from_ptr(stack.ptr) + stack_size) & ~@as(usize, 15);
+        // the top 16 bytes hold the stack's lowest address: the thread's
+        // stack limit (the compiler checks frames against it)
+        top = ((@int_from_ptr(stack.ptr) + stack_size) & ~@as(usize, 15)) - 16;
+        @ptr_from_int(*mut usize, top).* = @int_from_ptr(stack.ptr);
     }
     s.* = Start.[T].{ f: f, arg: arg, exited: 0, stack: stack };
     let id = ph_thread_spawn(trampoline.[T], @ptr_cast(*mut void, s), top, &mut s.exited);

@@ -1671,6 +1671,12 @@ fn gen_intr(v: *mut ir.Value) void {
         memarg(4, 4, 0);
         return;
     }
+    if id == ir.IN_GET_SP {
+        op(0x23);
+        reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
+        C.uleb5(0);
+        return;
+    }
     if id == ir.IN_SET_SP {
         push(v.xs.get(0));
         op(0x24);
@@ -2288,7 +2294,7 @@ fn pure_op(v: *ir.Value) bool {
     if o == ir.OP_INTR {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         return not ((id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_MEMSIZE) or (id == ir.IN_WAIT32) or
-                    (id == ir.IN_NOTIFY) or (id == ir.IN_SET_SP));
+                    (id == ir.IN_NOTIFY) or (id == ir.IN_SET_SP) or (id == ir.IN_GET_SP));
     }
     return false;
 }

@@ -549,6 +549,7 @@ const T_DIVZERO: i32 = 3;
 const T_INTCAST: i32 = 4;
 const T_LENGTH: i32 = 6;
 const T_UNIONTAG: i32 = 7;
+const T_STACK: i32 = 8;
 const T_ATOMIC_ALIGN: i32 = 10;
 const T_EXPECT: i32 = 11;
 const T_MEMORY: i32 = 12;
@@ -755,6 +756,47 @@ fn ss_type() *mut ir.Ty {
         ss_ty = struct_ty(el[..]);
     }
     return ss_ty;
+}
+
+// WebAssembly stacks live in linear memory, where running past the end goes
+// unnoticed: each function with a frame there checks it against this
+// per-thread limit (a wasm global) first. The main thread's stack is the
+// first MiB of memory; its lowest KiB stays unused.
+const WASM_MAIN_STACK_LIMIT: u64 = 1024;
+let mut stack_limit_global: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
+fn stack_limit() *mut ir.Value {
+    if u.isnil(stack_limit_global) {
+        stack_limit_global = shared_global(T_isz, "phalange.stack_limit", ci(T_isz, WASM_MAIN_STACK_LIMIT), 1);
+    }
+    return stack_limit_global;
+}
+
+// The end of a wasm function's entry block (where its allocas are): trap
+// with T0008 if its frame, now reserved, reaches below the thread's limit
+// (or below address 0).
+fn check_stack(d: *mut ast.Decl, entry: *mut ir.Block, start: *mut ir.Block) void {
+    let mut has_frame = false;
+    let mut i = entry.first;
+    while u.notnil(i) {
+        if i.op == ir.OP_ALLOCA {
+            has_frame = true;
+        }
+        i = i.next;
+    }
+    if not has_frame {
+        br(start);
+        return;
+    }
+    let mut none: [1]*mut ir.Value = [vnil()];
+    let sp = ir.intr(B, ir.IN_GET_SP, T_ptr, none[0..0]);
+    let spi = ir.cast(B, ir.OP_PTRTOINT, sp, T_isz);
+    let saved = g_cur_span;
+    g_cur_span = d.name_span;
+    // signed: a frame reserved below address 0 wraps around
+    let room = ir.binop(B, ir.OP_SUB, spi, ld(T_isz, stack_limit()));
+    condbr(icmp(ir.IntSLT, room, ci(T_isz, 0)), trap_block(T_STACK), start);
+    g_cur_span = saved;
 }
 
 fn ss_globals() void {
@@ -3290,6 +3332,8 @@ fn emit_thread_start() void {
     let saved = ir.insert_block(B);
     at_end(bb);
     let mut top = param(f, 2);
+    // std/thread stores the stack's lowest address at its top
+    _ = st(ld(T_isz, top), stack_limit());
     if program_traces() {
         // The thread's shadow stack sits at the top of its stack.
         let t = ss_type();
@@ -4063,7 +4107,11 @@ fn gen_fn_body(fi: *mut FnInst) void {
         }
     }
     at_end(stt.entry);
-    br(start);
+    if ty.g_target.is_wasm {
+        check_stack(d, stt.entry, start);
+    } else {
+        br(start);
+    }
     // Delete blocks with no predecessors (continuations after return/break/trap).
     ir.remove_unreachable(stt.fnv.fnp);
     u.free(@ptr_cast(*mut void, stt.defers.data));
@@ -4294,6 +4342,9 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         _ = error_name_fn();
         if program_traces() {
             ss_globals();
+        }
+        if ty.g_target.is_wasm {
+            _ = stack_limit();
         }
         _ = trap_info_global();
     }

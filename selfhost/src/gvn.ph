@@ -490,7 +490,7 @@ fn leak(v: *mut ir.Value) void {
 // -----------------------------------------------------------------------------
 fn pure_intr(id: i32) bool {
     return (id != ir.IN_TRAP) and (id != ir.IN_MEMGROW) and (id != ir.IN_WAIT32) and (id != ir.IN_NOTIFY) and
-           (id != ir.IN_SET_SP) and (id != ir.IN_MEMSIZE);
+           (id != ir.IN_SET_SP) and (id != ir.IN_GET_SP) and (id != ir.IN_MEMSIZE);
 }
 
 fn cse_able(i: *ir.Value) bool {

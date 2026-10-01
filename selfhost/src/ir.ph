@@ -462,6 +462,7 @@ pub const IN_SWIZZLE: i32 = 34;  // i8x16 swizzle (out-of-range index: 0)
 pub const IN_DOT_I16: i32 = 35;  // i32x4 dot product of i16x8 lanes
 pub const IN_UMUL_OV: i32 = 36;  // i1: the unsigned product of the two operands overflows
 pub const IN_SMUL_OV: i32 = 37;  // i1: the signed product overflows (64-bit operands)
+pub const IN_GET_SP: i32 = 38;   // the stack pointer, after this function's frame (wasm)
 
 // Load/store flags
 pub const F_VOLATILE: u32 = 1;

@@ -9,7 +9,7 @@
 // (tab-separated; tabs, newlines and backslashes in fields are escaped).
 import fs from 'fs';
 import os from 'os';
-import { Worker } from 'worker_threads';
+import { BroadcastChannel, Worker } from 'worker_threads';
 
 const args = process.argv.slice(2);
 const file = args.find((a) => !a.startsWith('--'));
@@ -33,12 +33,17 @@ let next = 0;
 function runOne(index) {
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const w = new Worker(new URL('./test_worker.mjs', import.meta.url), { workerData: { bytes, index } });
+    // A trap in one of the test's threads arrives here (the test's own
+    // thread may be blocked waiting for it).
+    const trapChannel = `phalange-test-${process.pid}-${index}`;
+    const bc = new BroadcastChannel(trapChannel);
+    const w = new Worker(new URL('./test_worker.mjs', import.meta.url), { workerData: { bytes, index, trapChannel } });
     let done = false;
     const finish = (r) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      bc.close();
       r.ms = Date.now() - t0;
       results.set(index, r);
       w.terminate();
@@ -46,6 +51,7 @@ function runOne(index) {
     };
     const timer = setTimeout(() => finish({ status: 'fail', code: 'timeout', message: `test did not finish within ${timeout} ms`, output: '' }), timeout);
     w.once('message', finish);
+    bc.onmessage = (m) => finish(m.data);
     w.once('error', (e) => finish({ status: 'fail', code: 'T0000', message: `host error: ${e.message}`, output: '' }));
     w.once('exit', () => finish({ status: 'fail', code: 'T0000', message: 'test worker exited unexpectedly', output: '' }));
   });

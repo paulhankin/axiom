@@ -1,0 +1,57 @@
+// Self-test of `phalange test`: stack exhaustion is T0008 on every target
+// (on WebAssembly the stack is in linear memory, where each frame is checked
+// against the thread's stack limit), and a trap in a thread is its test's.
+// test-result: recursion that fits | pass
+// test-result: main thread overflow | pass
+// test-result: thread overflow | pass
+// test-result: thread that fits | pass
+// test-result: trap in a thread | pass
+// test-result: unexpected trap in a thread | fail | T0000 | 27
+import "std/thread" as thread;
+
+fn deep(n: u32) u32 {
+    let mut buf: [256]u8 = [0; 256];
+    buf[@as(usize, n % 256)] = 1;
+    if n == 0 {
+        return 0;
+    }
+    return deep(n - 1) + @as(u32, buf[@as(usize, n % 256)]);
+}
+
+fn worker(n: u32) void {
+    _ = deep(n);
+}
+
+fn trapper(n: u32) void {
+    if n > 0 {
+        @trap();
+    }
+}
+
+test "recursion that fits" {
+    @expect_eq(deep(1000), 1000);
+}
+
+test "main thread overflow" expect trap(T0008) {
+    _ = deep(1000000);
+}
+
+test "thread overflow" expect trap(T0008) {
+    let t = thread.spawn(worker, @as(u32, 1000000))!;
+    t.join();
+}
+
+test "thread that fits" {
+    let t = thread.spawn(worker, @as(u32, 100))!;
+    t.join();
+}
+
+test "trap in a thread" expect trap(T0000) {
+    let t = thread.spawn(trapper, @as(u32, 1))!;
+    t.join();
+}
+
+test "unexpected trap in a thread" {
+    let t = thread.spawn(trapper, @as(u32, 1))!;
+    t.join();
+}

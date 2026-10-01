@@ -1038,7 +1038,10 @@ fn name(p1: T1, p2: T2) R { … }
 - Parameters are immutable bindings. To modify one, copy it into a `let mut`.
 - Arguments are passed **by value**, including structs and arrays. To share, pass a
   pointer or a slice.
-- Recursion is allowed. Stack exhaustion traps (`T0008`).
+- Recursion is allowed. Stack exhaustion traps (`T0008`). Native stacks end in a guard
+  page. On WebAssembly, frames that live in linear memory (locals whose address is
+  taken, large aggregates) are checked on entry against the thread's stack limit,
+  since running past the end of a linear-memory stack would otherwise go unnoticed.
 
 ### 9.2 Methods
 
@@ -2235,7 +2238,8 @@ phalange test file.ph|<package dir> [--target=wasm32|native] [--filter=text] [--
   tests a standard library module.
 - **Isolation.** Each test runs in isolation: a fresh WebAssembly instance in its own
   worker, or a forked process on native targets. A trap, a hang or corrupted memory
-  can't affect other tests. Independent tests run in parallel.
+  can't affect other tests. Independent tests run in parallel. A trap in a thread the
+  test started ends the test as its own trap would (`expect trap` applies to it).
 - **Output.** Each test's output (stdout and stderr) is captured and reported with it.
 - **Exit status.** `0` if every selected test passed, `1` if any failed, `2` if the tests
   could not be built or run. Compile errors are reported as diagnostics (§16.2).

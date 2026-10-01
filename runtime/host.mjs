@@ -179,6 +179,26 @@ function formatValues(kind, dv, base, memory, instance) {
   }
 }
 
+// Frames in the PHT protocol of `phalange test` (see test_main.c: encode_stack).
+export function encodeFrames(frames, kindOfFirst) {
+  return frames.map((f, i) => {
+    if (f.repeat) return `R\x1f${f.repeat}\x1f0\x1f0\x1f`;
+    if (f.omitted) return `O\x1f${f.omitted}\x1f0\x1f0\x1f`;
+    const k = i === 0 ? kindOfFirst : 'C';
+    return `${f.file ? k : 'U'}\x1f${f.fileId ?? 0}\x1f${f.start ?? 0}\x1f${f.end ?? 0}\x1f${f.fn || ''}`;
+  }).map((x) => x + '\x1e').join('');
+}
+
+// A test's result when it trapped (t from describeTrap), given what it
+// expected: -1 no trap, -2 any trap, n >= 0 trap Tn.
+export function trapResult(t, expect) {
+  if (expect === -2 || expect === t.code) return { status: 'pass' };
+  const r = { status: 'fail', code: t.codeName, message: trapMessage(t), fileId: t.fileId, start: t.start, end: t.end,
+    stack: encodeFrames(stackFrames(t, t.stack), 'T') };
+  if (expect >= 0) r.message = `expected trap T${String(expect).padStart(4, '0')}, got ${r.message}`;
+  return r;
+}
+
 export function trapMessage(t) {
   let m = `trap ${t.codeName} (${t.name})`;
   if (t.values) m = `expected equal values, left: ${t.values[0]}, right: ${t.values[1]}`;
@@ -656,7 +676,7 @@ export function createHost(opts = {}) {
       // The new thread shares this program's sockets.
       const netPort = net().newPort();
       const w = new Worker(new URL('./thread_worker.mjs', import.meta.url), {
-        workerData: { module, memory, entry, arg, stackTop, exited, netPort, shared },
+        workerData: { module, memory, entry, arg, stackTop, exited, netPort, shared, testTrap: opts.testTrap || null },
         transferList: [netPort],
       });
       // A trap in any thread terminates the whole program (spec §12.8).
