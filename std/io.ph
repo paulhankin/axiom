@@ -514,6 +514,40 @@ fn bufwriter_write(ctx: *mut void, bytes: []u8) !usize {
     return bytes.len;
 }
 
+/// Passes writes on to another Writer and counts the bytes: the offset of
+/// what is written next, for formats that record where things are.
+pub struct CountingWriter {
+    inner: Writer,
+    count: u64,
+
+    pub fn init(inner: Writer) CountingWriter {
+        return CountingWriter.{ inner: inner, count: 0 };
+    }
+
+    /// The returned Writer points at this CountingWriter: do not move it
+    /// while the Writer is in use.
+    pub fn writer(self: *mut CountingWriter) Writer {
+        return Writer.{ ctx: @ptr_cast(*mut void, self), write_fn: counting_write };
+    }
+}
+
+fn counting_write(ctx: *mut void, bytes: []u8) !usize {
+    let w = @ptr_cast(*mut CountingWriter, ctx);
+    let n = w.inner.write(bytes)!;
+    w.count += @as(u64, n);
+    return n;
+}
+
+/// A Writer that accepts and drops everything (to measure output, with a
+/// CountingWriter).
+pub fn discard() Writer {
+    return Writer.{ ctx: @ptr_from_int(*mut void, 1), write_fn: discard_write };
+}
+
+fn discard_write(ctx: *mut void, bytes: []u8) !usize {
+    return bytes.len;
+}
+
 // -----------------------------------------------------------------------------
 // Tests (phalange test std/io.ph)
 // -----------------------------------------------------------------------------
@@ -546,6 +580,20 @@ test "BufferWriter and print_f64" {
     w.print(" ")!;
     w.print_f64(1.0e20, 0)!;
     @expect_eq(bw.written(), "2.50 -0.1 1e20");
+}
+
+test "CountingWriter and discard" {
+    let mut cw = CountingWriter.init(discard());
+    let w = cw.writer();
+    w.print("hello, ")!;
+    w.print_u64(12345)!;
+    @expect_eq(cw.count, 12);
+    let mut storage: [8]u8 = [0; 8];
+    let mut bw = BufferWriter.init(storage[..]);
+    let mut c2 = CountingWriter.init(bw.writer());
+    c2.writer().print("abc")!;
+    @expect_eq(c2.count, 3);
+    @expect_eq(bw.written(), "abc");
 }
 
 test "read_line over a SliceReader" {
