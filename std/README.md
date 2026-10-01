@@ -36,6 +36,7 @@ that owns memory has `deinit`).
 | [`collections/treemap`](collections/treemap.ph) | `TreeMap[K, V]`: ordered map (AVL tree): `floor`, `ceil`, `min`, `max`, in-order and range iteration |
 | [`collections/deque`](collections/deque.ph) | `Deque[T]`: double-ended queue on a ring buffer |
 | [`collections/heap`](collections/heap.ph) | `Heap[T]`: priority queue (binary heap), built from a slice in linear time |
+| [`collections/lru`](collections/lru.ph) | `Lru[K, V]`: least-recently-used cache of a fixed capacity (a `Map` and a doubly linked list in a `Vec`, O(1) operations): `get` (marks recent), `put` (gives back the evicted entry), `peek`, `remove`, `pop_lru`, iteration from most to least recent |
 | [`collections/bitset`](collections/bitset.ph) | `BitSet`: fixed-size sets of bits, `next_set`/`next_clear`, union/intersection |
 
 ## Operating system
@@ -64,6 +65,7 @@ that owns memory has `deinit`).
 |---|---|
 | [`time`](time.ph) | `Duration`, the monotonic `Instant`, wall-clock `Time`, calendar fields (`DateTime`, `Weekday`), RFC 3339 and HTTP dates, `sleep` |
 | [`time/tz`](time/tz.ph) | Time zones: TZif files (RFC 8536, v1–v4) from the system's database (`Zone.load`, safe names) or bytes, POSIX TZ rules, `Zone.local` (`$TZ`, `/etc/localtime`); `lookup` (offset, DST, abbreviation), `to_local`, and `from_local` with PEP 495 folds for repeated and skipped times. Checked against Python's `zoneinfo` ([`time/tz/testdata`](time/tz/testdata)) |
+| [`time/cron`](time/cron.ph) | Cron expressions (Vixie cron's syntax): five fields or six with seconds, lists, ranges, steps, month and day names, `@daily` and the other macros, `L` and `5L`, day-of-month/day-of-week OR rule; `Schedule.next` / `prev` in UTC and `next_in` / `prev_in` a `tz.Zone` (skipped local times fire at the change, repeated ones once unless hourly); hand-checked cases incl. leap years and DST changes |
 
 ## Networking
 
@@ -72,6 +74,7 @@ that owns memory has `deinit`).
 | [`net`](net.ph) | Sockets: TCP (`connect`, `listen` by name; `connect_addr`, `listen_addr`; local and peer addresses), UDP (`UdpSocket`), Unix sockets; `Addr` (IPv4 and IPv6 by `Family`, parsing and RFC 5952 formatting), `resolve`; `Poller` (readiness of many sockets, for event loops); timeouts |
 | [`net/dns`](net/dns.ph) | A DNS client: `Resolver` (the system's servers, public ones, or any), `query` for any record type (A, AAAA, CNAME, NS, PTR, MX, TXT, SRV, SOA) with decoded fields, `lookup_ip`, `reverse`; EDNS0, TCP after truncation, forged-reply and hostile-packet resistance |
 | [`net/http`](http.ph) | HTTP/1.1: a threaded `Server` with keep-alive and chunked bodies (HTTPS with `server_tls` / `Router.serve_tls`), `Router` with `{param}` and `*` patterns, `Request` / `Response`; a client (`get`, `post`, `request`) for `http://` and `https://` URLs; percent-encoding; HTTP/2 served to clients that ask (ALPN `h2`, or the preface), and requested with `ClientOptions.with_http2` |
+| [`net/url`](net/url.ph) | URLs (RFC 3986, with WHATWG leniencies): `parse` → `Url` (components as slices; `username`, `password`, `port_number`, `effective_port`, `is_ipv6`), `write_to`, `normalize` (case, percent-encoding, dot segments, default ports, RFC 5952 IPv6), `resolve` / `join` (§5.2), `encode` per `Component`, `percent_decode`, query strings (`query` pairs, `query_value`, `QueryWriter` form-encoding with '+'). Checked against RFC 3986 §5.4 and Python's `urllib.parse` ([`net/url/testdata`](net/url/testdata)) |
 | [`net/websocket`](net/websocket.ph) | WebSocket (RFC 6455): `connect` (ws://, wss://), `accept` in an `http` handler; text, binary, ping, close (`Opcode`); fragmentation, automatic pongs, strict validation (masking, UTF-8, close codes, message size) |
 | [`net/http2`](http2.ph) | HTTP/2 (RFC 9113): `Conn` (framing, streams, flow control, settings, ping, goaway; strict checks and limits), `Client` for requests over any connection |
 | [`net/hpack`](net/hpack.ph) | HPACK (RFC 7541): `Encoder` and `Decoder` with dynamic tables and Huffman coding; byte-for-byte as Python's hpack ([`net/hpack/testdata`](net/hpack/testdata)) |
@@ -93,6 +96,7 @@ that owns memory has `deinit`).
 | [`encoding/base64`](encoding/base64.ph) | Base64 encoding and decoding, standard and URL-safe alphabets; `encode_to` an `io.Writer` |
 | [`encoding/base32`](encoding/base32.ph) | Base32 (RFC 4648), standard and extended-hex alphabets, padded or not; `encode_to` an `io.Writer` |
 | [`encoding/hex`](encoding/hex.ph) | Hexadecimal encoding and decoding; `xxd`-style hex dumps (`dump_alloc`, `dump_to`); `encode_to` an `io.Writer` |
+| [`encoding/uuid`](encoding/uuid.ph) | UUIDs (RFC 9562): `parse` (canonical, braces, `urn:uuid:`, any case, 32 digits), `format`, `v4` (random), `v7` (time-ordered, monotonic in a process), `v5` / `v3` (SHA-1 / MD5 names, standard namespaces), `nil` / `max`, `version`, `variant`, `compare`. Checked against Python's `uuid` ([`encoding/uuid/testdata`](encoding/uuid/testdata)) and RFC 9562's examples |
 | [`encoding/mime`](encoding/mime.ph) | Media types by extension, `Content-Type` parsing, header parameters (quoted strings, RFC 2231 `name*`), quoted-printable, multipart bodies (`Multipart` reader, `MultipartWriter` for form-data, in memory (`finish`, `finish_to`) or written to an `io.Writer` part by part (`init_to`)) |
 | [`encoding/jwt`](encoding/jwt.ph) | JSON Web Tokens (JWS compact serialization): `sign`/`sign_to` (an `io.Writer`) and `verify`/`decode` with HS256/384/512, RS256/384/512, PS256/384/512, ES256, ES384 and EdDSA (`Alg`) by HMAC secrets or `std/crypto/x509` keys (`SigningKey`, `VerifyingKey`, `PublicKey.from_pem`); the caller names the algorithm, so `none` and algorithm confusion are refused; strict header checks (`crit`, repeated names, base64url); claim checks (`Validation`: exp, nbf, iat with leeway, iss, aud); `header_unverified` for `kid`. Checked against PyJWT ([`encoding/jwt/testdata`](encoding/jwt/testdata), from [`tools/gen_jwt_tests.py`](../tools/gen_jwt_tests.py)) |
 
