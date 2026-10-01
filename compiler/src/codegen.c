@@ -564,7 +564,35 @@ static LLVMValueRef load(Type *t, LLVMValueRef p, bool unaligned) {
     if (unaligned) LLVMSetAlignment(v, 1);
     return from_mem(t, v);
 }
+// Aggregates are first-class values here, but LLVM's instruction selection
+// takes a large one apart element by element (and fails on very large ones):
+// zero it with memset, and copy a constant one (from a global) or one just
+// loaded from memory with memmove.
+#define BIG_AGGREGATE 256
+
 static void store(Type *t, LLVMValueRef v, LLVMValueRef p, bool unaligned) {
+    if (ty_is_aggregate(t) && type_size(t) > BIG_AGGREGATE) {
+        LLVMValueRef size = usz(type_size(t));
+        if (LLVMIsConstant(v) && LLVMIsNull(v)) {
+            LLVMBuildMemSet(B, p, LLVMConstInt(T_i8, 0, false), size, 1);
+            return;
+        }
+        if (LLVMIsConstant(v)) {
+            LLVMValueRef g = LLVMAddGlobal(mod, LLVMTypeOf(v), "aggregate.const");
+            LLVMSetInitializer(g, v);
+            LLVMSetGlobalConstant(g, true);
+            LLVMSetLinkage(g, LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr);
+            LLVMBuildMemMove(B, p, 1, g, 1, size);
+            return;
+        }
+        if (LLVMIsALoadInst(v) && !LLVMGetFirstUse(v)) {
+            LLVMValueRef src = LLVMGetOperand(v, 0);
+            LLVMInstructionEraseFromParent(v);
+            LLVMBuildMemMove(B, p, 1, src, 1, size);
+            return;
+        }
+    }
     LLVMValueRef s = LLVMBuildStore(B, to_mem(t, v), p);
     if (unaligned) LLVMSetAlignment(s, 1);
 }
