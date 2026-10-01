@@ -3,6 +3,7 @@
 //
 //     let img = hdr.decode(bytes)!;   // F32 RGB, linear
 //     let out = hdr.encode(&img)!;    // mem.free it
+//     hdr.encode_to(w, &img)!;        // or to an io.Writer
 //
 // Each pixel is three 8-bit mantissas sharing an exponent: about 1% relative
 // precision over a huge range. Decoding reads flat, old-style and new-style
@@ -11,6 +12,7 @@
 // =============================================================================
 
 import "../../fmt.ph" as fmt;
+import "../../io.ph" as io;
 import "../../math.ph" as math;
 import "../../mem.ph" as mem;
 import "../../str.ph" as strs;
@@ -195,21 +197,32 @@ fn byte(v: f64) u8 {
     return @truncate(u8, @int_from_float(u32, @min(@max(v, 0.0), 255.0)));
 }
 
+/// Encodes an image as Radiance RGBE (free the result with mem.free).
 pub fn encode(img: *image.Image) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as Radiance RGBE to w, some scanlines at a time.
+pub fn encode_to(w: io.Writer, img: *image.Image) !void {
     if (img.depth != image.Depth.F32) or (img.channels != 3) {
         let mut c = img.convert(3, image.Depth.F32)!;
         defer c.deinit();
-        return encode(&c);
+        return encode_to(w, &c);
     }
     let mut o = strs.String.init();
-    write_file(&mut o, img) catch |e| {
-        o.deinit();
-        return e;
-    };
-    return o.take();
+    defer o.deinit();
+    write_file(w, &mut o, img)!;
 }
 
-fn write_file(o: *mut strs.String, img: *image.Image) !void {
+const FLUSH_AT: usize = 16384;  // write out what is gathered at this size
+
+// (o gathers the output, written to out a few KiB at a time)
+fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image) !void {
     let w = img.width;
     let h = img.height;
     fmt.write(o.writer(), "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {} +X {}\n", [fmt.int(h), fmt.int(w)])!;
@@ -217,6 +230,10 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
     defer mem.free(line);
     let px = img.samples32();
     for y in @as(usize, 0)..h {
+        if o.len >= FLUSH_AT {
+            out.write_all(o.bytes())!;
+            o.clear();
+        }
         for x in @as(usize, 0)..w {
             let i = ((y * w) + x) * 3;
             let e = rgbe(px[i], px[i + 1], px[i + 2]);
@@ -232,6 +249,7 @@ fn write_file(o: *mut strs.String, img: *image.Image) !void {
             write_channel(o, line, c, w)!;
         }
     }
+    out.write_all(o.bytes())!;
 }
 
 /// One channel of a scanline: runs of 3 or more as (128 + n, v), the
@@ -299,4 +317,26 @@ test "round trip" {
     @expect_eq(b.get(2, 1).r, 1.0);
     @expect_eq(b.get(2, 1).b, 0.25);
     @expect_eq(b.get(2, 0).g, 0.0625);
+}
+
+test "encode_to" {
+    let mut img = image.Image.init(60, 80, 3, image.Depth.F32)!;
+    defer img.deinit();
+    let px = img.samples32();
+    for i in @as(usize, 0)..px.len {
+        px[i] = @float_from_int(f32, (i / 5) % 11) * 0.75;
+    }
+    let enc = encode(&img)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &img)!;
+    @expect_eq(s.bytes(), enc[..]);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &img) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

@@ -3,12 +3,15 @@
 //
 //     let img = qoi.decode(bytes)!;   // U8 RGB or RGBA
 //     let out = qoi.encode(&img)!;    // mem.free it
+//     qoi.encode_to(w, &img)!;        // or to an io.Writer
 //
 // Lossless and simple: about PNG's size at many times the speed. Gray
 // images are written as RGB; U16 and F32 as 8 bits.
 // =============================================================================
 
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
+import "../../str.ph" as strs;
 import "../image.ph" as image;
 
 error { InvalidImage, OutOfMemory }
@@ -94,7 +97,18 @@ pub fn decode(data: []u8) !image.Image {
     return img;
 }
 
+/// Encodes an image as QOI (free the result with mem.free).
 pub fn encode(img: *image.Image) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Encodes an image as QOI to w, a few KiB at a time.
+pub fn encode_to(w: io.Writer, img: *image.Image) !void {
     if (img.depth != image.Depth.U8) or (img.channels < 3) {
         let mut ch: usize = 3;
         if img.has_alpha() {
@@ -102,22 +116,22 @@ pub fn encode(img: *image.Image) ![]mut u8 {
         }
         let mut c = img.convert(ch, image.Depth.U8)!;
         defer c.deinit();
-        return encode(&c);
+        return encode_to(w, &c);
     }
-    let w = img.width;
+    let wd = img.width;
     let h = img.height;
     let ch = img.channels;
-    let npx = w * h;
-    let out = mem.alloc.[u8](((npx * (ch + 1)) + 14) + 8)!;
+    let npx = wd * h;
+    let mut out: [4096]u8 = [0; 4096];
     let hdr: [14]u8 = [
         'q',
         'o',
         'i',
         'f',
-        @truncate(u8, w >> 24),
-        @truncate(u8, w >> 16),
-        @truncate(u8, w >> 8),
-        @truncate(u8, w),
+        @truncate(u8, wd >> 24),
+        @truncate(u8, wd >> 16),
+        @truncate(u8, wd >> 8),
+        @truncate(u8, wd),
         @truncate(u8, h >> 24),
         @truncate(u8, h >> 16),
         @truncate(u8, h >> 8),
@@ -132,6 +146,10 @@ pub fn encode(img: *image.Image) ![]mut u8 {
     let mut run: u8 = 0;
     let src = img.samples8();
     for p in @as(usize, 0)..npx {
+        if o > (out.len - 6) {
+            w.write_all(out[..o])!;
+            o = 0;
+        }
         let mut px: [4]u8 = [src[p * ch], src[(p * ch) + 1], src[(p * ch) + 2], 255];
         if ch == 4 {
             px[3] = src[(p * ch) + 3];
@@ -185,12 +203,8 @@ pub fn encode(img: *image.Image) ![]mut u8 {
         prev = px;
     }
     let pad: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 1];
-    @mem_copy(out[o..o + 8], pad[..]);
-    o += 8;
-    return mem.realloc(out, o) catch |e| {
-        mem.free(out);
-        return e;
-    };
+    w.write_all(out[..o])!;
+    w.write_all(pad[..])!;
 }
 
 test "round trips" {
@@ -209,4 +223,25 @@ test "round trips" {
         defer back.deinit();
         @expect_eq(back.data[..], img.data[..]);
     }
+}
+
+test "encode_to" {
+    let mut img = image.Image.init(50, 40, 4, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..img.data.len {
+        img.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
+    }
+    let enc = encode(&img)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &img)!;
+    @expect_eq(s.bytes(), enc[..]);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &img) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

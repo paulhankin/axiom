@@ -7,6 +7,7 @@
 //
 //     let out = webp.encode(&img)!;                // lossless; mem.free(out)
 //     let movie = webp.encode_animation(frames, delays, 0)!;
+//     webp.encode_to(w, &img)!;                    // or to an io.Writer
 //
 // Decoding reads lossy images (VP8, std/graphics/image/webp/vp8.ph), lossless ones
 // (VP8L: every transform, colour caches, meta prefix codes), alpha (raw or
@@ -20,6 +21,7 @@
 // =============================================================================
 
 import "../../collections/vec.ph" as vec;
+import "../../io.ph" as io;
 import "../../mem.ph" as mem;
 import "../../os/fs.ph" as fs;
 import "../../str.ph" as strs;
@@ -1104,27 +1106,40 @@ fn decode_frames(data: []u8, first_only: bool) !Animation {
 // Encoding (lossless)
 // -----------------------------------------------------------------------------
 
+// Bits, least significant first, gathered in buf and written to out
+// when it fills.
 struct Writer {
-    out: strs.String,
+    out: io.Writer,
+    buf: [4096]u8,
+    len: usize,
     acc: u64,
     n: u64,
 
     fn put(self: *mut Writer, v: u32, k: u64) !void {
         self.acc |= @as(u64, v) << self.n;
         self.n += k;
+        if self.len > (self.buf.len - 8) {
+            self.out.write_all(self.buf[..self.len])!;
+            self.len = 0;
+        }
         while self.n >= 8 {
-            self.out.push(@truncate(u8, self.acc))!;
+            self.buf[self.len] = @truncate(u8, self.acc);
+            self.len += 1;
             self.acc >>= 8;
             self.n -= 8;
         }
     }
 
+    // pads the last byte and writes everything out
     fn flush(self: *mut Writer) !void {
         if self.n > 0 {
-            self.out.push(@truncate(u8, self.acc))!;
+            self.buf[self.len] = @truncate(u8, self.acc);
+            self.len += 1;
         }
         self.acc = 0;
         self.n = 0;
+        self.out.write_all(self.buf[..self.len])!;
+        self.len = 0;
     }
 }
 
@@ -1560,10 +1575,9 @@ fn residual_cost(r: u32) u32 {
     return c;
 }
 
-// a VP8L bitstream for ARGB pixels
-fn encode_vp8l(px: []mut u32, w: usize, h: usize, out: *mut strs.String) !void {
-    let mut wr = Writer.{ out: strs.String.init(), acc: 0, n: 0 };
-    defer wr.out.deinit();
+// a VP8L bitstream for ARGB pixels (which it changes), written to out
+fn encode_vp8l(px: []mut u32, w: usize, h: usize, out: io.Writer) !void {
+    let mut wr = Writer.{ out: out, buf: [0; 4096], len: 0, acc: 0, n: 0 };
     let mut alpha = false;
     for p in px {
         if (p >> 24) != 255 {
@@ -1688,7 +1702,6 @@ fn encode_vp8l(px: []mut u32, w: usize, h: usize, out: *mut strs.String) !void {
         write_image(&mut wr, res, w, true)!;
     }
     wr.flush()!;
-    out.push_str(wr.out.bytes())!;
 }
 
 // the prediction for (x, y) as the decoder makes it
@@ -1720,18 +1733,9 @@ fn argb_of(img: *image.Image) ![]mut u32 {
     return px;
 }
 
-fn put_chunk(o: *mut strs.String, tag: []u8, body: []u8) !void {
-    o.push_str(tag)!;
-    put_le(o, body.len, 4)!;
-    o.push_str(body)!;
-    if (body.len & 1) != 0 {
-        o.push(0)!;
-    }
-}
-
-fn put_le(o: *mut strs.String, v: usize, n: usize) !void {
+fn put_le(o: []mut u8, v: usize, n: usize) void {
     for k in @as(usize, 0)..n {
-        o.push(@truncate(u8, v >> (8 * k)))!;
+        o[k] = @truncate(u8, v >> (8 * k));
     }
 }
 
@@ -1741,74 +1745,108 @@ fn check_size(img: *image.Image) !void {
     }
 }
 
-/// A lossless WebP of the image.
+/// A lossless WebP of the image (free it with mem.free).
 pub fn encode(img: *image.Image) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_to(s.writer(), img) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Writes a lossless WebP of the image to w. The RIFF header holds the
+/// size of what follows, so the image's VP8L data is made in memory first.
+pub fn encode_to(w: io.Writer, img: *image.Image) !void {
     check_size(img)!;
     let px = argb_of(img)!;
     defer mem.free(px);
     let mut body = strs.String.init();
     defer body.deinit();
-    encode_vp8l(px, img.width, img.height, &mut body)!;
-    let mut o = strs.String.init();
-    defer o.deinit();
-    o.push_str("RIFF\x00\x00\x00\x00WEBP")!;
-    put_chunk(&mut o, "VP8L", body.bytes())!;
-    let size = o.len - 8;
-    let b = o.bytes();
-    for k in @as(usize, 0)..4 {
-        b[4 + k] = @truncate(u8, size >> (8 * k));
+    encode_vp8l(px, img.width, img.height, body.writer())!;
+    let n = body.len;
+    let mut head: [20]u8 = [0; 20];
+    @mem_copy(head[..], "RIFF\x00\x00\x00\x00WEBPVP8L\x00\x00\x00\x00");
+    put_le(head[4..8], (12 + n) + (n & 1), 4);
+    put_le(head[16..20], n, 4);
+    w.write_all(head[..])!;
+    w.write_all(body.bytes())!;
+    if (n & 1) != 0 {
+        w.write_all("\x00")!;
     }
-    return o.take();
 }
 
 /// A lossless animation of frames of one size, each shown for its delay;
-/// loops: 0 for ever.
+/// loops: 0 for ever. Free it with mem.free.
 pub fn encode_animation(frames: []*image.Image, delays_ms: []u32, loops: u16) ![]mut u8 {
+    let mut s = strs.String.init();
+    encode_animation_to(s.writer(), frames, delays_ms, loops) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Writes a lossless animation as encode_animation does to w, a frame at a
+/// time. The RIFF header holds the size of the whole file, so every frame
+/// is encoded twice: once to measure it, once to write it.
+pub fn encode_animation_to(w: io.Writer, frames: []*image.Image, delays_ms: []u32, loops: u16) !void {
     if (frames.len == 0) or (delays_ms.len != frames.len) {
         return error.InvalidImage;
     }
-    let w = frames[0].width;
+    let wd = frames[0].width;
     let h = frames[0].height;
     check_size(frames[0])!;
-    let mut o = strs.String.init();
-    defer o.deinit();
-    o.push_str("RIFF\x00\x00\x00\x00WEBP")!;
-    let mut x = strs.String.init();
-    defer x.deinit();
-    put_le(&mut x, 0x12, 4)!;  // animation, alpha
-    put_le(&mut x, w - 1, 3)!;
-    put_le(&mut x, h - 1, 3)!;
-    put_chunk(&mut o, "VP8X", x.bytes())!;
-    x.clear();
-    put_le(&mut x, 0, 4)!;
-    put_le(&mut x, @as(usize, loops), 2)!;
-    put_chunk(&mut o, "ANIM", x.bytes())!;
-    let mut body = strs.String.init();
-    defer body.deinit();
-    for i in @as(usize, 0)..frames.len {
-        let f = frames[i];
-        if (f.width != w) or (f.height != h) {
+    for f in frames {
+        if (f.width != wd) or (f.height != h) {
             return error.InvalidImage;
         }
-        let px = argb_of(f)!;
+    }
+    // each frame's VP8L size
+    let sizes = mem.alloc.[usize](frames.len)!;
+    defer mem.free(sizes);
+    let mut total: usize = 4 + 18 + 14;  // "WEBP", VP8X and ANIM
+    for i in @as(usize, 0)..frames.len {
+        let px = argb_of(frames[i])!;
         defer mem.free(px);
-        body.clear();
-        encode_vp8l(px, w, h, &mut body)!;
-        x.clear();
-        put_le(&mut x, 0, 6)!;
-        put_le(&mut x, w - 1, 3)!;
-        put_le(&mut x, h - 1, 3)!;
-        put_le(&mut x, @as(usize, @min(delays_ms[i], 0xffffff)), 3)!;
-        x.push(2)!;  // no blending, no disposal
-        put_chunk(&mut x, "VP8L", body.bytes())!;
-        put_chunk(&mut o, "ANMF", x.bytes())!;
+        let mut cw = io.CountingWriter.init(io.discard());
+        encode_vp8l(px, wd, h, cw.writer())!;
+        sizes[i] = @int_cast(usize, cw.count);
+        total += (32 + sizes[i]) + (sizes[i] & 1);
     }
-    let size = o.len - 8;
-    let b = o.bytes();
-    for k in @as(usize, 0)..4 {
-        b[4 + k] = @truncate(u8, size >> (8 * k));
+    let mut head: [44]u8 = [0; 44];
+    @mem_copy(head[..20], "RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00");
+    put_le(head[4..8], total, 4);
+    head[20] = 0x12;  // VP8X flags: animation, alpha
+    put_le(head[24..27], wd - 1, 3);
+    put_le(head[27..30], h - 1, 3);
+    @mem_copy(head[30..38], "ANIM\x06\x00\x00\x00");  // (the background colour is 0)
+    put_le(head[42..44], @as(usize, loops), 2);
+    w.write_all(head[..])!;
+    for i in @as(usize, 0)..frames.len {
+        let n = sizes[i];
+        let mut fh: [32]u8 = [0; 32];
+        @mem_copy(fh[0..4], "ANMF");
+        put_le(fh[4..8], (24 + n) + (n & 1), 4);
+        // (x and y offsets 0)
+        put_le(fh[14..17], wd - 1, 3);
+        put_le(fh[17..20], h - 1, 3);
+        put_le(fh[20..23], @as(usize, @min(delays_ms[i], 0xffffff)), 3);
+        fh[23] = 2;  // no blending, no disposal
+        @mem_copy(fh[24..28], "VP8L");
+        put_le(fh[28..32], n, 4);
+        w.write_all(fh[..])!;
+        let px = argb_of(frames[i])!;
+        defer mem.free(px);
+        let mut cw = io.CountingWriter.init(w);
+        encode_vp8l(px, wd, h, cw.writer())!;
+        if cw.count != @as(u64, n) {
+            return error.InvalidImage;  // (cannot happen: the encoding is deterministic)
+        }
+        if (n & 1) != 0 {
+            w.write_all("\x00")!;
+        }
     }
-    return o.take();
 }
 
 // -----------------------------------------------------------------------------
@@ -1948,4 +1986,31 @@ test "damaged files" {
             copy[i] = old;
         }
     }
+}
+
+test "encode_to" {
+    let mut a = test_image(37, 23, 4, 0)!;
+    defer a.deinit();
+    let mut b = test_image(37, 23, 3, 5)!;
+    defer b.deinit();
+    let enc = encode(&a)!;
+    defer mem.free(enc);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), &a)!;
+    @expect(strs.eq(s.bytes(), enc));
+    let frames: [2]*image.Image = [&a, &b];
+    let delays: [2]u32 = [40, 70];
+    let movie = encode_animation(frames[..], delays[..], 3)!;
+    defer mem.free(movie);
+    s.clear();
+    encode_animation_to(s.writer(), frames[..], delays[..], 3)!;
+    @expect(strs.eq(s.bytes(), movie));
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_animation_to(bw.writer(), frames[..], delays[..], 3) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
