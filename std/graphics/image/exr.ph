@@ -1020,7 +1020,7 @@ fn attr(o: *mut strs.String, name: []u8, ty: []u8, value: []u8) !void {
 /// Encodes an image as OpenEXR (free the result with mem.free).
 pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
     let mut s = strs.String.init();
-    encode_to(s.writer(), img, opts) catch |e| {
+    write(s.writer(), img, opts, true) catch |e| {
         s.deinit();
         return e;
     };
@@ -1029,16 +1029,32 @@ pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
 
 /// Encodes an image as OpenEXR to w, a block of scanlines at a time. The
 /// offset table at the start needs every block's size, so compressed blocks
-/// are compressed twice: once to measure them, once to write them.
+/// are compressed twice: once to measure them, once to write them (encode
+/// compresses once).
 pub fn encode_to(w: io.Writer, img: *image.Image, opts: Options) !void {
+    write(w, img, opts, false)!;
+}
+
+// keep: hold on to the packed blocks from measuring them, to write them
+// without packing again (the output is going to memory anyway)
+fn write(w: io.Writer, img: *image.Image, opts: Options, keep: bool) !void {
     if img.depth != image.Depth.F32 {
         let mut c = img.convert(img.channels, image.Depth.F32)!;
         defer c.deinit();
-        return encode_to(w, &c, opts);
+        return write(w, &c, opts, keep);
     }
     let mut o = strs.String.init();
     defer o.deinit();
-    write_file(w, &mut o, img, opts)!;
+    write_file(w, &mut o, img, opts, keep)!;
+}
+
+fn free_all(xs: []mut []mut u8) void {
+    for x in xs {
+        if x.len > 0 {
+            mem.free(x);
+        }
+    }
+    mem.free(xs);
 }
 
 const FLUSH_AT: usize = 16384;  // write out what is gathered at this size
@@ -1107,7 +1123,7 @@ struct Blocks {
 }
 
 // (o gathers the output, written to out a few KiB at a time)
-fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Options) !void {
+fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Options, keep: bool) !void {
     let w = img.width;
     let h = img.height;
     if (w == 0) or (h == 0) or (w > 0x7fffffff) or (h > 0x7fffffff) {
@@ -1176,6 +1192,15 @@ fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Opti
     let mut bl = Blocks.{ img: img, opts: opts, src: src, nch: nch, lines: lines, raw: raw,
                           packed: strs.String.init() };
     defer bl.packed.deinit();
+    let mut nkept: usize = 0;
+    if keep and (opts.compression != Compression.NONE) {
+        nkept = nblocks;
+    }
+    let kept = mem.alloc.[[]mut u8](nkept)!;
+    for b in @as(usize, 0)..nkept {
+        kept[b] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+    defer free_all(kept);
     // the offset table: each block is its line, its size and its data
     let mut off = @as(u64, o.len) + (@as(u64, nblocks) * 8);
     for b in @as(usize, 0)..nblocks {
@@ -1187,7 +1212,11 @@ fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Opti
         if opts.compression == Compression.NONE {
             n = @as(u64, ((@min(lines, h - (b * lines)) * w) * nch) * sz);
         } else {
-            n = @as(u64, bl.get(b)!.len);  // (measured: packed again below)
+            let data = bl.get(b)!;  // (measured: packed again below, unless kept)
+            n = @as(u64, data.len);
+            if nkept > 0 {
+                kept[b] = mem.dup(data)!;
+            }
         }
         let mut ob: [8]u8 = [0; 8];
         for k in @as(usize, 0)..8 {
@@ -1197,7 +1226,12 @@ fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Opti
         off += 8 + n;
     }
     for b in @as(usize, 0)..nblocks {
-        let data = bl.get(b)!;
+        let mut data: []u8 = "";
+        if nkept > 0 {
+            data = kept[b];
+        } else {
+            data = bl.get(b)!;
+        }
         put32(o, @truncate(u32, b * lines))!;
         put32(o, @truncate(u32, data.len))!;
         if data.len >= FLUSH_AT {
@@ -1210,6 +1244,10 @@ fn write_file(out: io.Writer, o: *mut strs.String, img: *image.Image, opts: Opti
                 out.write_all(o.bytes())!;
                 o.clear();
             }
+        }
+        if nkept > 0 {
+            mem.free(kept[b]);  // (written: let it go)
+            kept[b] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
         }
     }
     out.write_all(o.bytes())!;

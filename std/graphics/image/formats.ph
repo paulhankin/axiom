@@ -199,12 +199,37 @@ pub fn decode_from(r: io.Reader) !image.Image {
 
 /// Encodes an image (free the result with mem.free).
 pub fn encode(img: *image.Image, format: Format, opts: Options) ![]mut u8 {
-    let mut s = strs.String.init();
-    encode_to(s.writer(), img, format, opts) catch |e| {
-        s.deinit();
-        return e;
-    };
-    return s.take();
+    if format == Format.PNG {
+        return png.encode(img, opts.level);
+    }
+    if format == Format.JPEG {
+        return jpeg.encode(img, opts.quality, opts.subsample);
+    }
+    if format == Format.BMP {
+        return bmp.encode(img);
+    }
+    if format == Format.QOI {
+        return qoi.encode(img);
+    }
+    if format == Format.PNM {
+        return pnm.encode(img);
+    }
+    if format == Format.HDR {
+        return hdr.encode(img);
+    }
+    if format == Format.EXR {
+        return exr.encode(img, opts.exr);
+    }
+    if format == Format.GIF {
+        return gif.encode(img);
+    }
+    if format == Format.TIFF {
+        return tiff.encode(img, opts.tiff);
+    }
+    if format == Format.WEBP {
+        return webp.encode(img);
+    }
+    return error.Unsupported;
 }
 
 /// Encodes an image to w (each format's encode_to: see there what is

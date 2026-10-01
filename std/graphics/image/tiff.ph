@@ -1407,7 +1407,7 @@ fn field(o: *mut strs.String, tag: u64, typ: u64, count: u64, value: u64) !void 
 /// Writes images as the pages of one file (free the result with mem.free).
 pub fn encode_pages(imgs: []*image.Image, opts: Options) ![]mut u8 {
     let mut s = strs.String.init();
-    encode_pages_to(s.writer(), imgs, opts) catch |e| {
+    write_pages(s.writer(), imgs, opts, true) catch |e| {
         s.deinit();
         return e;
     };
@@ -1505,8 +1505,23 @@ fn even(v: u64) u64 {
 /// Writes images as the pages of one file to w, a strip at a time. The
 /// directories' offsets are worked out first, which needs every strip's
 /// compressed size: compressed strips are compressed twice, once to
-/// measure them and once to write them.
+/// measure them and once to write them (encode_pages compresses once).
 pub fn encode_pages_to(w: io.Writer, imgs: []*image.Image, opts: Options) !void {
+    write_pages(w, imgs, opts, false)!;
+}
+
+fn free_all(xs: []mut []mut u8) void {
+    for x in xs {
+        if x.len > 0 {
+            mem.free(x);
+        }
+    }
+    mem.free(xs);
+}
+
+// keep: hold on to the compressed strips from measuring them, to write
+// them without compressing again (the output is going to memory anyway)
+fn write_pages(w: io.Writer, imgs: []*image.Image, opts: Options, keep: bool) !void {
     let comp = opts.compression;
     if imgs.len == 0 {
         return error.InvalidImage;
@@ -1528,6 +1543,15 @@ pub fn encode_pages_to(w: io.Writer, imgs: []*image.Image, opts: Options) !void 
     defer strip.deinit();
     let mut packed = strs.String.init();
     defer packed.deinit();
+    let mut nkept: usize = 0;
+    if keep and (comp != Compression.NONE) {
+        nkept = total;
+    }
+    let kept = mem.alloc.[[]mut u8](nkept)!;
+    for k in @as(usize, 0)..nkept {
+        kept[k] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+    defer free_all(kept);
     let mut pos: u64 = 8;
     for pi in @as(usize, 0)..imgs.len {
         let img = imgs[pi];
@@ -1538,6 +1562,9 @@ pub fn encode_pages_to(w: io.Writer, imgs: []*image.Image, opts: Options) !void 
             if comp != Compression.NONE {
                 pack_strip(img, lay, comp, si, &mut strip, &mut packed)!;
                 n = @as(u64, packed.len);
+                if nkept > 0 {
+                    kept[lay.first + si] = mem.dup(packed.bytes())!;
+                }
             }
             pos = even(pos);
             offs[lay.first + si] = pos;
@@ -1585,6 +1612,8 @@ pub fn encode_pages_to(w: io.Writer, imgs: []*image.Image, opts: Options) !void 
             if comp == Compression.NONE {
                 let start = (si * lay.rps) * lay.rowbytes;
                 data = img.data[start..start + @int_cast(usize, sizes[k])];
+            } else if nkept > 0 {
+                data = kept[k];
             } else {
                 pack_strip(img, lay, comp, si, &mut strip, &mut packed)!;
                 data = packed.bytes();
@@ -1597,6 +1626,10 @@ pub fn encode_pages_to(w: io.Writer, imgs: []*image.Image, opts: Options) !void 
             o.clear();
             w.write_all(data)!;
             at += @as(u64, data.len);
+            if nkept > 0 {
+                mem.free(kept[k]);  // (written: let it go)
+                kept[k] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+            }
         }
         // the arrays too long to go inline
         if ((at + @as(u64, o.len)) & 1) != 0 {

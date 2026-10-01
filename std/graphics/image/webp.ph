@@ -1780,7 +1780,7 @@ pub fn encode_to(w: io.Writer, img: *image.Image) !void {
 /// loops: 0 for ever. Free it with mem.free.
 pub fn encode_animation(frames: []*image.Image, delays_ms: []u32, loops: u16) ![]mut u8 {
     let mut s = strs.String.init();
-    encode_animation_to(s.writer(), frames, delays_ms, loops) catch |e| {
+    write_animation(s.writer(), frames, delays_ms, loops, true) catch |e| {
         s.deinit();
         return e;
     };
@@ -1789,8 +1789,24 @@ pub fn encode_animation(frames: []*image.Image, delays_ms: []u32, loops: u16) ![
 
 /// Writes a lossless animation as encode_animation does to w, a frame at a
 /// time. The RIFF header holds the size of the whole file, so every frame
-/// is encoded twice: once to measure it, once to write it.
+/// is encoded twice: once to measure it, once to write it (encode_animation
+/// encodes each once).
 pub fn encode_animation_to(w: io.Writer, frames: []*image.Image, delays_ms: []u32, loops: u16) !void {
+    write_animation(w, frames, delays_ms, loops, false)!;
+}
+
+fn free_all(xs: []mut []mut u8) void {
+    for x in xs {
+        if x.len > 0 {
+            mem.free(x);
+        }
+    }
+    mem.free(xs);
+}
+
+// keep: hold on to the frames' data from measuring them, to write them
+// without encoding again (the output is going to memory anyway)
+fn write_animation(w: io.Writer, frames: []*image.Image, delays_ms: []u32, loops: u16, keep: bool) !void {
     if (frames.len == 0) or (delays_ms.len != frames.len) {
         return error.InvalidImage;
     }
@@ -1805,13 +1821,32 @@ pub fn encode_animation_to(w: io.Writer, frames: []*image.Image, delays_ms: []u3
     // each frame's VP8L size
     let sizes = mem.alloc.[usize](frames.len)!;
     defer mem.free(sizes);
+    let mut nkept: usize = 0;
+    if keep {
+        nkept = frames.len;
+    }
+    let kept = mem.alloc.[[]mut u8](nkept)!;
+    for i in @as(usize, 0)..nkept {
+        kept[i] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+    defer free_all(kept);
     let mut total: usize = 4 + 18 + 14;  // "WEBP", VP8X and ANIM
     for i in @as(usize, 0)..frames.len {
         let px = argb_of(frames[i])!;
         defer mem.free(px);
-        let mut cw = io.CountingWriter.init(io.discard());
-        encode_vp8l(px, wd, h, cw.writer())!;
-        sizes[i] = @int_cast(usize, cw.count);
+        if keep {
+            let mut body = strs.String.init();
+            encode_vp8l(px, wd, h, body.writer()) catch |e| {
+                body.deinit();
+                return e;
+            };
+            kept[i] = body.take()!;
+            sizes[i] = kept[i].len;
+        } else {
+            let mut cw = io.CountingWriter.init(io.discard());
+            encode_vp8l(px, wd, h, cw.writer())!;
+            sizes[i] = @int_cast(usize, cw.count);
+        }
         total += (32 + sizes[i]) + (sizes[i] & 1);
     }
     let mut head: [44]u8 = [0; 44];
@@ -1836,12 +1871,18 @@ pub fn encode_animation_to(w: io.Writer, frames: []*image.Image, delays_ms: []u3
         @mem_copy(fh[24..28], "VP8L");
         put_le(fh[28..32], n, 4);
         w.write_all(fh[..])!;
-        let px = argb_of(frames[i])!;
-        defer mem.free(px);
-        let mut cw = io.CountingWriter.init(w);
-        encode_vp8l(px, wd, h, cw.writer())!;
-        if cw.count != @as(u64, n) {
-            return error.InvalidImage;  // (cannot happen: the encoding is deterministic)
+        if keep {
+            w.write_all(kept[i])!;
+            mem.free(kept[i]);  // (written: let it go)
+            kept[i] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        } else {
+            let px = argb_of(frames[i])!;
+            defer mem.free(px);
+            let mut cw = io.CountingWriter.init(w);
+            encode_vp8l(px, wd, h, cw.writer())!;
+            if cw.count != @as(u64, n) {
+                return error.InvalidImage;  // (cannot happen: the encoding is deterministic)
+            }
         }
         if (n & 1) != 0 {
             w.write_all("\x00")!;
