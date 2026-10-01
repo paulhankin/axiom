@@ -4,6 +4,7 @@
 //
 //     let packed = deflate.compress(data, deflate.Format.GZIP, deflate.DEFAULT_LEVEL)!;
 //     defer mem.free(packed);
+//     deflate.compress_to(w, data, deflate.Format.GZIP, 6)!;   // to an io.Writer
 //     let back = deflate.decompress(packed, deflate.Format.GZIP, 1 << 30)!;  // at most 1 GiB
 //     defer mem.free(back);
 //
@@ -1577,17 +1578,20 @@ fn run_lengths(lens: []u8, syms: []mut u8, extra: []mut u8) usize {
 /// with mem.free).
 pub fn compress(data: []u8, format: Format, level: u32) ![]mut u8 {
     let mut out = strs.String.init();
-    let c = Compressor.init(out.writer(), format, level)!;
-    defer c.deinit();
-    c.write_all(data) catch |e| {
-        out.deinit();
-        return e;
-    };
-    c.finish() catch |e| {
+    compress_to(out.writer(), data, format, level) catch |e| {
         out.deinit();
         return e;
     };
     return out.take();
+}
+
+/// Compresses data into format at level (0 to 9) and writes it to w as
+/// it is produced, 16 KB at a time (a Compressor does the work).
+pub fn compress_to(w: io.Writer, data: []u8, format: Format, level: u32) !void {
+    let c = Compressor.init(w, format, level)!;
+    defer c.deinit();
+    c.write_all(data)!;
+    c.finish()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -1719,4 +1723,22 @@ test "streaming" {
     @expect_eq(back.len, 2 * data.len);
     @expect_eq(back.bytes()[..data.len], data);
     @expect_eq(back.bytes()[data.len..], data);
+}
+
+test "compress_to" {
+    let data = sample(100000)!;
+    defer mem.free(data);
+    let packed = compress(data, Format.ZLIB, 6)!;
+    defer mem.free(packed);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    compress_to(out.writer(), data, Format.ZLIB, 6)!;
+    @expect_eq(out.bytes(), packed);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    compress_to(bw.writer(), data, Format.GZIP, 1) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }

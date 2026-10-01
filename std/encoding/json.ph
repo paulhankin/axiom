@@ -28,9 +28,9 @@
 //     w.end_object()!;                                   // {"name":"Ada","langs":["en"]}
 //
 // The Writer adds commas, colons and indentation; value() writes a whole
-// tree, and stringify() returns one in new memory. Floats are written in the
-// shortest form that reads back exactly; NaN and infinities, which JSON
-// cannot express, are written as null.
+// tree, stringify() returns one in new memory and stringify_to() writes one
+// to an io.Writer. Floats are written in the shortest form that reads back
+// exactly; NaN and infinities, which JSON cannot express, are written as null.
 // =============================================================================
 
 import "../collections/vec.ph" as vec;
@@ -876,8 +876,7 @@ pub fn write_string(w: io.Writer, s: []u8) !void {
 /// v as compact JSON text in new memory (free it with mem.free).
 pub fn stringify(v: Value) ![]mut u8 {
     let mut s = strs.String.init();
-    let mut w = Writer.init(s.writer());
-    w.value(v) catch |e| {
+    stringify_to(s.writer(), v) catch |e| {
         s.deinit();
         return e;
     };
@@ -887,12 +886,26 @@ pub fn stringify(v: Value) ![]mut u8 {
 /// v as indented JSON text in new memory (free it with mem.free).
 pub fn stringify_pretty(v: Value, indent: u32) ![]mut u8 {
     let mut s = strs.String.init();
-    let mut w = Writer.pretty(s.writer(), indent);
-    w.value(v) catch |e| {
+    stringify_pretty_to(s.writer(), v, indent) catch |e| {
         s.deinit();
         return e;
     };
     return s.take();
+}
+
+/// Writes v as compact JSON text to w (through a 4 KB buffer, flushed before
+/// returning).
+pub fn stringify_to(w: io.Writer, v: Value) !void {
+    stringify_pretty_to(w, v, 0)!;
+}
+
+/// Writes v as indented JSON text to w, `indent` spaces per level (0 for
+/// compact output), through a 4 KB buffer flushed before returning.
+pub fn stringify_pretty_to(w: io.Writer, v: Value, indent: u32) !void {
+    let mut bw = io.BufWriter.init(w);
+    let mut jw = Writer.pretty(bw.writer(), indent);
+    jw.value(v)!;
+    bw.flush()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -1076,6 +1089,20 @@ test "a larger document" {
     let again = stringify(doc.root)!;
     defer mem.free(again);
     @expect_eq(again, s.bytes());
+    let mut t = strs.String.init();
+    defer t.deinit();
+    stringify_pretty_to(t.writer(), doc.root, 1)!;
+    let p = stringify_pretty(doc.root, 1)!;
+    defer mem.free(p);
+    @expect_eq(t.bytes(), p);
+    // a full destination fails with its error
+    let mut small: [5000]u8 = [0; 5000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    stringify_to(bw.writer(), doc.root) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "values of every size" {

@@ -3,6 +3,7 @@
 //
 //     let packed = lz4.compress(data, lz4.Options.default())!;   // the caller frees
 //     let back = lz4.decompress(packed, 1 << 30)!;               // at most 1 GiB out
+//     lz4.compress_to(w, data, lz4.Options.default())!;          // to an io.Writer
 //
 // decompress reads LZ4 frames (any block size, independent or linked
 // blocks, block and content checksums, stored content sizes), skippable
@@ -17,6 +18,7 @@
 // =============================================================================
 
 import "../hash/xxhash.ph" as xxhash;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
@@ -441,14 +443,16 @@ pub struct Options {
 /// the result.
 pub fn compress(data: []u8, opts: Options) ![]mut u8 {
     let mut out = strs.String.init();
-    encode_frame(data, opts, &mut out) catch |e| {
+    compress_to(out.writer(), data, opts) catch |e| {
         out.deinit();
         return e;
     };
     return out.take();
 }
 
-fn encode_frame(data: []u8, o: Options, out: *mut strs.String) !void {
+/// Compresses data as one LZ4 frame and writes it to w, a block at a time
+/// (only the block being compressed is held in memory).
+pub fn compress_to(w: io.Writer, data: []u8, o: Options) !void {
     let mut bsize_id: u8 = 7;
     if o.block_size <= (64 << 10) {
         bsize_id = 4;
@@ -458,8 +462,9 @@ fn encode_frame(data: []u8, o: Options, out: *mut strs.String) !void {
         bsize_id = 6;
     }
     let max_block = @as(usize, 1) << (8 + (2 * @as(u32, bsize_id)));
-    put32(out, MAGIC)!;
-    let hstart = out.len;
+    let mut blk = strs.String.init();
+    defer blk.deinit();
+    put32(&mut blk, MAGIC)!;
     let mut flg: u8 = 0x60;  // version 1, independent blocks
     if o.block_checksum {
         flg |= 0x10;
@@ -470,38 +475,46 @@ fn encode_frame(data: []u8, o: Options, out: *mut strs.String) !void {
     if o.content_checksum {
         flg |= 4;
     }
-    out.push(flg)!;
-    out.push(bsize_id << 4)!;
+    blk.push(flg)!;
+    blk.push(bsize_id << 4)!;
     if o.content_size {
         let n = @as(u64, data.len);
-        put32(out, @truncate(u32, n))!;
-        put32(out, @truncate(u32, n >> 32))!;
+        put32(&mut blk, @truncate(u32, n))!;
+        put32(&mut blk, @truncate(u32, n >> 32))!;
     }
-    out.push(@truncate(u8, xxhash.xxh32(out.bytes()[hstart..], 0) >> 8))!;
-    let mut blk = strs.String.init();
-    defer blk.deinit();
+    blk.push(@truncate(u8, xxhash.xxh32(blk.bytes()[4..], 0) >> 8))!;
+    w.write_all(blk.bytes())!;
     let mut i: usize = 0;
     while i < data.len {
         let chunk = data[i..@min(i + max_block, data.len)];
         i += chunk.len;
+        // the block's size word, its body and its checksum, in one write
         blk.clear();
+        put32(&mut blk, 0)!;
         compress_block(chunk, &mut blk, o.level)!;
-        let mut body: []u8 = blk.bytes();
-        let mut word = @truncate(u32, body.len);
-        if body.len >= chunk.len {
-            body = chunk;  // stored: compression did not help
+        let mut word = @truncate(u32, blk.len - 4);
+        if (blk.len - 4) >= chunk.len {
+            blk.truncate(4);  // stored: compression did not help
+            blk.push_str(chunk)!;
             word = @truncate(u32, chunk.len) | 0x80000000;
         }
-        put32(out, word)!;
-        out.push_str(body)!;
+        let b = blk.bytes();
+        b[0] = @truncate(u8, word);
+        b[1] = @truncate(u8, word >> 8);
+        b[2] = @truncate(u8, word >> 16);
+        b[3] = @truncate(u8, word >> 24);
         if o.block_checksum {
-            put32(out, xxhash.xxh32(body, 0))!;
+            let sum = xxhash.xxh32(blk.bytes()[4..], 0);
+            put32(&mut blk, sum)!;
         }
+        w.write_all(blk.bytes())!;
     }
-    put32(out, 0)!;
+    blk.clear();
+    put32(&mut blk, 0)!;
     if o.content_checksum {
-        put32(out, xxhash.xxh32(data, 0))!;
+        put32(&mut blk, xxhash.xxh32(data, 0))!;
     }
+    w.write_all(blk.bytes())!;
 }
 
 // -----------------------------------------------------------------------------
@@ -567,6 +580,39 @@ test "round trips" {
     let d = decompress(c, corpus.len)!;
     defer mem.free(d);
     @expect_eq(d, corpus);
+}
+
+test "compress_to" {
+    // compressible and incompressible blocks, with block checksums
+    let data = mem.alloc.[u8](150000)!;
+    defer mem.free(data);
+    let mut x: u32 = 1;
+    for i in @as(usize, 0)..data.len {
+        x = (x *% 1103515245) +% 12345;
+        data[i] = @truncate(u8, x >> 16);
+        if ((i / 40000) % 2) == 0 {
+            data[i] = @truncate(u8, i % 7);
+        }
+    }
+    let mut o = Options.default();
+    o.block_size = 64 << 10;
+    o.block_checksum = true;
+    let c = compress(data, o)!;
+    defer mem.free(c);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    compress_to(out.writer(), data, o)!;
+    @expect_eq(out.bytes(), c);
+    let d = decompress(c, data.len)!;
+    defer mem.free(d);
+    @expect_eq(d, data);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    compress_to(bw.writer(), data, o) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 fn fails(r: ![]mut u8) bool {

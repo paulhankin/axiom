@@ -5,8 +5,10 @@
 //     base64.encode(data, out[..n], base64.STANDARD);
 //     let bytes = base64.decode(text, out, base64.STANDARD)!;
 //     let owned = base64.decode_alloc(text, base64.STANDARD)!;  // mem.free
+//     base64.encode_to(w, data, base64.STANDARD)!;  // to an io.Writer
 // =============================================================================
 
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 
 error { InvalidBase64, NoSpaceLeft, OutOfMemory }
@@ -76,6 +78,17 @@ pub fn encode_alloc(data: []u8, enc: Encoding) ![]mut u8 {
     let out = mem.alloc.[u8](encoded_len_with(data.len, enc))!;
     _ = encode(data, out, enc);
     return out;
+}
+
+/// Encodes data to w, a kilobyte of text at a time.
+pub fn encode_to(w: io.Writer, data: []u8, enc: Encoding) !void {
+    let mut buf: [1024]u8 = [0; 1024];
+    let mut i: usize = 0;
+    while (data.len - i) > 768 {
+        w.write_all(encode(data[i..i + 768], buf[..], enc))!;
+        i += 768;
+    }
+    w.write_all(encode(data[i..], buf[..], enc))!;
 }
 
 fn value_of(c: u8, enc: *Encoding) u32 {
@@ -256,6 +269,29 @@ test "long input, with line breaks, padding and errors" {
     @expect(failed(decode(padded[..enc.len + 4], d[..], STANDARD)));
     // too little room
     @expect(failed(decode(enc, d[..300], STANDARD)));
+}
+
+test "encode_to matches encode_alloc" {
+    let mut data: [2000]u8 = [0; 2000];
+    for i in @as(usize, 0)..data.len {
+        data[i] = @truncate(u8, (i * 89) + 7);
+    }
+    let lens: [5]usize = [0, 1, 768, 769, 2000];
+    for n in lens {
+        let a = encode_alloc(data[..n], URL)!;
+        defer mem.free(a);
+        let mut out: [2700]u8 = [0; 2700];
+        let mut bw = io.BufferWriter.init(out[..]);
+        encode_to(bw.writer(), data[..n], URL)!;
+        @expect_eq(bw.written(), a);
+    }
+    let mut small: [10]u8 = [0; 10];
+    let mut sw = io.BufferWriter.init(small[..]);
+    encode_to(sw.writer(), data[..], STANDARD) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 fn failed(r: ![]u8) bool {

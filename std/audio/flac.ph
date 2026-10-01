@@ -4,6 +4,7 @@
 //     let mut s = flac.decode(bytes)!;
 //     defer s.deinit();
 //     let out = flac.encode(&s, flac.DEFAULT)!;   // mem.free it
+//     flac.encode_to(w, &s, flac.DEFAULT)!;       // or to an io.Writer
 //
 // Decoding reads every FLAC stream: 4 to 32 bits per sample, 1 to 8
 // channels, fixed and variable block sizes, all subframe types and stereo
@@ -20,8 +21,10 @@
 
 import "../audio.ph" as audio;
 import "../crypto/md5.ph" as md5;
+import "../io.ph" as io;
 import "../math.ph" as math;
 import "../mem.ph" as mem;
+import "../str.ph" as strs;
 import "../sync.ph" as sync;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
@@ -1255,6 +1258,9 @@ fn utf8_number(o: *mut Out, v: u64) void {
     }
 }
 
+/// The FLAC file for a sound at a level (FAST 0 to BEST 8), in new memory
+/// (free it with mem.free). The frames are encoded once, and STREAMINFO
+/// (frame sizes, MD5) filled in at the end.
 pub fn encode(s: *audio.Sound, level: u32) ![]mut u8 {
     if audio.is_float(s.format) {
         let mut c = s.convert(audio.SampleFormat.S24)!;
@@ -1265,7 +1271,8 @@ pub fn encode(s: *audio.Sound, level: u32) ![]mut u8 {
         return error.Unsupported;
     }
     let mut o = Out.init()!;
-    encode_into(s, level, &mut o) catch |e| {
+    let mut info: [34]u8 = [0; 34];
+    encode_into(s, level, &mut o, MEMORY, io.discard(), info[..]) catch |e| {
         mem.free(o.buf);
         return e;
     };
@@ -1275,7 +1282,36 @@ pub fn encode(s: *audio.Sound, level: u32) ![]mut u8 {
     };
 }
 
-fn encode_into(s: *audio.Sound, level: u32, o: *mut Out) !void {
+/// Writes the FLAC file for a sound (see encode) to w, about 32 KB of
+/// frames at a time. STREAMINFO, at the start, holds the smallest and
+/// largest frame sizes, which are known only once every frame is encoded:
+/// rather than hold the whole file, the frames are encoded twice, first
+/// just to measure them (so this takes about twice as long as encode).
+pub fn encode_to(w: io.Writer, s: *audio.Sound, level: u32) !void {
+    if audio.is_float(s.format) {
+        let mut c = s.convert(audio.SampleFormat.S24)!;
+        defer c.deinit();
+        return encode_to(w, &c, level);
+    }
+    if (s.channels > 8) or (s.rate >= 1048576) {
+        return error.Unsupported;
+    }
+    let mut o = Out.init()!;
+    defer mem.free(o.buf);
+    let mut info: [34]u8 = [0; 34];
+    encode_into(s, level, &mut o, MEASURE, w, info[..])!;
+    o.len = 0;
+    encode_into(s, level, &mut o, STREAM, w, info[..])!;
+}
+
+// How encode_into delivers the stream: all in o with STREAMINFO filled in at
+// the end; nothing, only measuring it to fill in info; or written to a
+// Writer, starting with the STREAMINFO in info.
+const MEMORY: u8 = 0;
+const MEASURE: u8 = 1;
+const STREAM: u8 = 2;
+
+fn encode_into(s: *audio.Sound, level: u32, o: *mut Out, mode: u8, sink: io.Writer, info: []mut u8) !void {
     let st = settings(level);
     let nch = s.channels;
     let bps = audio.bits(s.format);
@@ -1284,12 +1320,16 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out) !void {
     if (total < block) and (total >= 16) {
         block = total;
     }
-    // the header, with STREAMINFO to fill in at the end
+    // the header, with STREAMINFO to fill in at the end (unless known)
     o.bytes("fLaC");
     o.bits(0x80, 8);  // last metadata block, STREAMINFO
     o.bits(34, 24);
     let info_at = o.len;
-    o.zeros(34 * 8);
+    if mode == STREAM {
+        o.bytes(info[..34]);
+    } else {
+        o.zeros(34 * 8);
+    }
     // scratch
     let nbuf = (block * @max(nch, 4)) + 1;  // the channels, and mid and side
     let chans = mem.alloc.[i64](nbuf)!;
@@ -1472,11 +1512,24 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out) !void {
         max_frame = @max(max_frame, flen);
         start += n;
         index += 1;
+        if mode == MEASURE {
+            o.len = 0;
+        } else if (mode == STREAM) and (o.len >= 32768) {
+            sink.write_all(o.buf[..o.len])!;
+            o.len = 0;
+        }
+    }
+    if mode == STREAM {
+        sink.write_all(o.buf[..o.len])!;
+        return;
     }
     // STREAMINFO
-    let end = o.len;
     let saved_len = o.len;
-    o.len = info_at;
+    if mode == MEASURE {
+        o.len = 0;
+    } else {
+        o.len = info_at;
+    }
     let mut bs16 = @max(block, 16);
     if total == 0 {
         bs16 = 16;
@@ -1494,8 +1547,10 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out) !void {
     let mut digest: [16]u8 = [0; 16];
     sig.final(digest[..]);
     o.bytes(digest[..]);
+    if mode == MEASURE {
+        @mem_copy(info[..34], o.buf[..34]);
+    }
     o.len = saved_len;
-    _ = end;
 }
 
 // -----------------------------------------------------------------------------
@@ -1530,6 +1585,12 @@ test "round trips" {
                 let enc = encode(&s, lv)!;
                 defer mem.free(enc);
                 @expect(is_flac(enc));
+                if lv == FAST {
+                    let mut sw = strs.String.init();
+                    defer sw.deinit();
+                    encode_to(sw.writer(), &s, lv)!;
+                    @expect_eq(sw.bytes(), enc);
+                }
                 let mut back = decode(enc)!;
                 defer back.deinit();
                 @expect(back.format == f);
@@ -1573,6 +1634,31 @@ test "compresses" {
     let mut ob = decode(eo)!;
     defer ob.deinit();
     @expect_eq(ob.samples_i16()[0], -5);
+}
+
+test "encode_to: long sounds, empty ones, and the writer's errors" {
+    let mut s = test_sound(60000, 2, audio.SampleFormat.S16, 3)!;
+    defer s.deinit();
+    let enc = encode(&s, DEFAULT)!;
+    defer mem.free(enc);
+    let mut sw = strs.String.init();
+    defer sw.deinit();
+    encode_to(sw.writer(), &s, DEFAULT)!;
+    @expect_eq(sw.bytes(), enc);
+    let mut e = audio.Sound.init(0, 1, 8000, audio.SampleFormat.S16)!;
+    defer e.deinit();
+    let ee = encode(&e, DEFAULT)!;
+    defer mem.free(ee);
+    sw.clear();
+    encode_to(sw.writer(), &e, DEFAULT)!;
+    @expect_eq(sw.bytes(), ee);
+    let mut small: [1000]u8 = [0; 1000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    encode_to(bw.writer(), &s, FAST) catch |err| {
+        @expect_eq(err, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "rejects corruption" {

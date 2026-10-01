@@ -4,8 +4,10 @@
 //     let s = hex.encode_alloc(bytes)!;          // "deadbeef" (mem.free)
 //     let b = hex.decode_alloc("DEAD beef")!;    // white space is skipped
 //     let d = hex.dump_alloc(bytes)!;            // like `xxd`
+//     hex.encode_to(w, bytes)!;                  // to an io.Writer (also dump_to)
 // =============================================================================
 
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../str.ph" as strs;
 
@@ -38,6 +40,17 @@ pub fn encode_alloc(data: []u8) ![]mut u8 {
     let out = mem.alloc.[u8](@mul_checked(data.len, 2) catch return error.OutOfMemory)!;
     _ = encode(data, out);
     return out;
+}
+
+/// Encodes data to w in lowercase, a kilobyte of text at a time.
+pub fn encode_to(w: io.Writer, data: []u8) !void {
+    let mut buf: [1024]u8 = [0; 1024];
+    let mut i: usize = 0;
+    while i < data.len {
+        let n = @min(512, data.len - i);
+        w.write_all(encode(data[i..i + n], buf[..]))!;
+        i += n;
+    }
 }
 
 fn value(c: u8) u8 {
@@ -99,53 +112,63 @@ pub fn decode_alloc(text: []u8) ![]mut u8 {
 /// a line each (free it with mem.free).
 pub fn dump_alloc(data: []u8) ![]mut u8 {
     let mut s = strs.String.init();
-    let mut line: [80]u8 = [0; 80];
+    dump_to(s.writer(), data) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// Writes the hex dump of data (see dump_alloc) to w, about 4 KB at a time.
+pub fn dump_to(w: io.Writer, data: []u8) !void {
+    let mut out: [4096]u8 = [0; 4096];
+    let mut k: usize = 0;
     let mut off: usize = 0;
     while off < data.len {
+        if (out.len - k) < 80 {
+            w.write_all(out[..k])!;
+            k = 0;
+        }
         let n = @min(16, data.len - off);
-        let mut k: usize = 0;
         let mut sh: usize = 32;
         while sh > 0 {
             sh -= 4;
-            line[k] = DIGITS[(off >> sh) & 15];
+            out[k] = DIGITS[(off >> sh) & 15];
             k += 1;
         }
-        line[k] = ':';
+        out[k] = ':';
         k += 1;
         for j in @as(usize, 0)..16 {
             if (j % 2) == 0 {
-                line[k] = ' ';
+                out[k] = ' ';
                 k += 1;
             }
             if j < n {
-                line[k] = DIGITS[@as(usize, data[off + j] >> 4)];
-                line[k + 1] = DIGITS[@as(usize, data[off + j] & 15)];
+                out[k] = DIGITS[@as(usize, data[off + j] >> 4)];
+                out[k + 1] = DIGITS[@as(usize, data[off + j] & 15)];
             } else {
-                line[k] = ' ';
-                line[k + 1] = ' ';
+                out[k] = ' ';
+                out[k + 1] = ' ';
             }
             k += 2;
         }
-        line[k] = ' ';
-        line[k + 1] = ' ';
+        out[k] = ' ';
+        out[k + 1] = ' ';
         k += 2;
         for j in @as(usize, 0)..n {
             let c = data[off + j];
             if (c >= 0x20) and (c < 0x7f) {
-                line[k] = c;
+                out[k] = c;
             } else {
-                line[k] = '.';
+                out[k] = '.';
             }
             k += 1;
         }
-        line[k] = '\n';
-        s.push_str(line[..k + 1]) catch |e| {
-            s.deinit();
-            return e;
-        };
+        out[k] = '\n';
+        k += 1;
         off += n;
     }
-    return s.take();
+    w.write_all(out[..k])!;
 }
 
 // -----------------------------------------------------------------------------
@@ -171,6 +194,32 @@ test "hex" {
     defer mem.free(x);
     @expect_eq(x,
                "00000000: 4865 6c6c 6f2c 2068 6578 2064 756d 7021  Hello, hex dump!\n00000010: 0001                                     ..\n");
+}
+
+test "encode_to and dump_to match the allocating forms" {
+    let mut data: [1300]u8 = [0; 1300];
+    for i in @as(usize, 0)..data.len {
+        data[i] = @truncate(u8, (i * 89) + 7);
+    }
+    let e = encode_alloc(data[..])!;
+    defer mem.free(e);
+    let mut s = strs.String.init();
+    defer s.deinit();
+    encode_to(s.writer(), data[..])!;
+    @expect_eq(s.bytes(), e);
+    let d = dump_alloc(data[..])!;
+    defer mem.free(d);
+    s.clear();
+    dump_to(s.writer(), data[..])!;
+    @expect_eq(s.bytes(), d);
+    @expect_eq(d.len, (81 * 68) + 56);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    dump_to(bw.writer(), data[..]) catch |err| {
+        @expect_eq(err, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 fn bad(r: ![]u8) bool {

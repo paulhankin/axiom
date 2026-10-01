@@ -4,6 +4,7 @@
 //     let packed = xz.compress(data, xz.Options.default())!;   // the caller frees
 //     let back = xz.decompress(packed, 1 << 30)!;              // at most 1 GiB out
 //     let old = xz.decompress_lzma(legacy_bytes, 1 << 30)!;    // .lzma files
+//     xz.compress_to(w, data, xz.Options.default())!;          // to an io.Writer
 //
 // decompress reads .xz files: one or more streams (with stream padding),
 // every block and index record checked, with CRC-32, CRC-64 or SHA-256
@@ -23,6 +24,7 @@
 
 import "../collections/vec.ph" as vec;
 import "../crypto/sha2.ph" as sha2;
+import "../io.ph" as io;
 import "../mem.ph" as mem;
 import "../os/fs.ph" as fs;
 import "../str.ph" as strs;
@@ -1631,13 +1633,18 @@ pub struct Options {
     }
 }
 
+// The dictionary size for a level.
+fn level_dict(level: u32) usize {
+    let dicts: [10]usize = [0, 1 << 20, 2 << 20, 4 << 20, 4 << 20, 8 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20];
+    return dicts[@as(usize, @max(@min(level, 9), 1))];
+}
+
 fn new_encoder(data: []u8, level: u32) !Encoder {
     let lv = @max(@min(level, 9), 1);
     let depths: [10]u32 = [0, 4, 8, 16, 24, 32, 48, 96, 192, 384];
-    let dicts: [10]usize = [0, 1 << 20, 2 << 20, 4 << 20, 4 << 20, 8 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20];
     let mut e = Encoder.{ m: new_model(), re: Re.init(), data: data, head: mem.alloc.[u32](HASH_SIZE)!,
                           chain: @slice_from_ptr(@ptr_from_int(*mut u32, 4), 0), depth: depths[@as(usize, lv)],
-                          nice: 32 + (@as(usize, lv) * 24), dict: dicts[@as(usize, lv)] };
+                          nice: 32 + (@as(usize, lv) * 24), dict: level_dict(lv) };
     @mem_set(@cast_slice(u8, e.head), 0xff);
     e.chain = mem.alloc.[u32](@max(data.len, 1)) catch |err| {
         mem.free(e.head);
@@ -1695,11 +1702,21 @@ fn step(e: *mut Encoder, i: usize, start: usize) !usize {
     return 1;
 }
 
-// Encodes data as LZMA2 onto out.
-fn lzma2_encode(data: []u8, level: u32, out: *mut strs.String) !u8 {
+// The LZMA2 dictionary-size byte compress uses for data at a level.
+fn lzma2_dict_byte(data: []u8, level: u32) u8 {
+    return dict_byte(@max(@min(level_dict(level), data.len), 4096));
+}
+
+// Encodes data as LZMA2 to w, a chunk (at most 64 KiB) at a time, but for
+// the end marker (a zero byte) the caller writes; returns how many bytes
+// that was.
+fn lzma2_encode(data: []u8, level: u32, w: io.Writer) !usize {
     let mut e = new_encoder(data, level)!;
     defer e.deinit();
-    let db = dict_byte(@max(@min(e.dict, data.len), 4096));
+    let mut ob = strs.String.init();
+    defer ob.deinit();
+    let out = &mut ob;
+    let mut total: usize = 0;
     let mut i: usize = 0;
     let mut first = true;
     let mut need_reset = false;  // after a stored chunk
@@ -1734,6 +1751,9 @@ fn lzma2_encode(data: []u8, level: u32, out: *mut strs.String) !u8 {
                 out.push_str(data[k..k + n])!;
                 k += n;
                 first = false;
+                w.write_all(out.bytes())!;
+                total += out.len;
+                out.clear();
             }
             need_reset = true;
             continue;
@@ -1757,15 +1777,17 @@ fn lzma2_encode(data: []u8, level: u32, out: *mut strs.String) !u8 {
         out.push_str(packed)!;
         first = false;
         need_reset = false;
+        w.write_all(out.bytes())!;
+        total += out.len;
+        out.clear();
     }
-    out.push(0)!;
-    return db;
+    return total;
 }
 
 /// Compresses data as an .xz stream; the caller frees the result.
 pub fn compress(data: []u8, opts: Options) ![]mut u8 {
     let mut out = strs.String.init();
-    xz_encode(data, opts, &mut out) catch |e| {
+    compress_to(out.writer(), data, opts) catch |e| {
         out.deinit();
         return e;
     };
@@ -1786,25 +1808,31 @@ fn put_varint(out: *mut strs.String, v: u64) !void {
     out.push(@truncate(u8, x))!;
 }
 
-fn xz_encode(data: []u8, o: Options, out: *mut strs.String) !void {
+/// Compresses data as an .xz stream (see compress) and writes it to w as
+/// it is produced, an LZMA2 chunk (at most 64 KiB) at a time.
+pub fn compress_to(w: io.Writer, data: []u8, o: Options) !void {
     let check = @int_from_enum(o.check);
     let csize = check_size(check)!;
+    let mut ob = strs.String.init();
+    defer ob.deinit();
+    let out = &mut ob;
     // the stream header
     out.push_str(HEADER_MAGIC)!;
     out.push(0)!;
     out.push(check)!;
     put32(out, deflate.crc32(0, out.bytes()[6..8]))!;
-    // the block: header, LZMA2 data, padding, check
-    let mut body = strs.String.init();
-    defer body.deinit();
-    let db = lzma2_encode(data, o.level, &mut body)!;
+    // the block: header, LZMA2 data, padding, check (the header holds no
+    // sizes, so the data can follow as it is made)
     let bh = out.len;
-    let hdr: [12]u8 = [2, 0, 0x21, 1, db, 0, 0, 0, 0, 0, 0, 0];
+    let hdr: [12]u8 = [2, 0, 0x21, 1, lzma2_dict_byte(data, o.level), 0, 0, 0, 0, 0, 0, 0];
     out.push_str(hdr[..8])!;  // size (2 + 1) * 4 = 12: flags, filter, padding
     put32(out, deflate.crc32(0, out.bytes()[bh..bh + 8]))!;
-    out.push_str(body.bytes())!;
-    let unpadded = @as(u64, 12 + body.len + csize);
-    while ((out.len - bh) % 4) != 0 {
+    w.write_all(out.bytes())!;
+    out.clear();
+    let chunks_len = lzma2_encode(data, o.level, w)!;
+    out.push(0)!;  // the LZMA2 end marker
+    let unpadded = @as(u64, 12 + chunks_len + 1 + csize);
+    while ((12 + chunks_len + out.len) % 4) != 0 {
         out.push(0)!;
     }
     match o.check {
@@ -1843,21 +1871,26 @@ fn xz_encode(data: []u8, o: Options, out: *mut strs.String) !void {
     put32(out, deflate.crc32(0, f[..]))!;
     out.push_str(f[..])!;
     out.push_str("YZ")!;
+    w.write_all(out.bytes())!;
 }
 
 /// Compresses data in the legacy .lzma format; the caller frees the result.
 pub fn compress_lzma(data: []u8, level: u32) ![]mut u8 {
-    let mut e = new_encoder(data, level)!;
-    defer e.deinit();
     let mut out = strs.String.init();
-    lzma_alone(&mut e, &mut out) catch |err| {
+    compress_lzma_to(out.writer(), data, level) catch |err| {
         out.deinit();
         return err;
     };
     return out.take();
 }
 
-fn lzma_alone(e: *mut Encoder, out: *mut strs.String) !void {
+/// Compresses data in the legacy .lzma format and writes it to w as it is
+/// produced, about 64 KiB at a time.
+pub fn compress_lzma_to(w: io.Writer, data: []u8, level: u32) !void {
+    let mut e = new_encoder(data, level)!;
+    defer e.deinit();
+    // the header goes first in the range encoder's output (which only appends)
+    let out = &mut e.re.out;
     out.push(0x5d)!;
     // (the size in a form xz recognizes: 2^n or 2^n + 2^(n-1))
     let c = @as(u32, dict_byte(@max(@min(e.dict, e.data.len), 4096)));
@@ -1866,14 +1899,18 @@ fn lzma_alone(e: *mut Encoder, out: *mut strs.String) !void {
     put32(out, @truncate(u32, @as(u64, e.data.len) >> 32))!;
     let mut i: usize = 0;
     while i < e.data.len {
-        let n = step(e, i, 0)!;
+        let n = step(&mut e, i, 0)!;
         for k in i..i + n {
             e.insert(k);
         }
         i += n;
+        if e.re.out.len >= 65536 {
+            w.write_all(e.re.out.bytes())!;
+            e.re.out.clear();
+        }
     }
     e.re.flush()!;
-    out.push_str(e.re.out.bytes())!;
+    w.write_all(e.re.out.bytes())!;
 }
 
 // -----------------------------------------------------------------------------
@@ -1960,6 +1997,21 @@ test "round trips" {
     let rd = decompress(rc, rnd.len)!;
     defer mem.free(rd);
     @expect_eq(rd, rnd.bytes());
+    // the writer forms give the same bytes, and pass on the writer's errors
+    let mut out = strs.String.init();
+    defer out.deinit();
+    compress_to(out.writer(), rnd.bytes(), Options.default())!;
+    @expect_eq(out.bytes(), rc);
+    out.clear();
+    compress_lzma_to(out.writer(), corpus, 6)!;
+    @expect_eq(out.bytes(), l);
+    let mut small: [100]u8 = [0; 100];
+    let mut bw = io.BufferWriter.init(small[..]);
+    compress_to(bw.writer(), rnd.bytes(), Options.default()) catch |e| {
+        @expect_eq(e, error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
 
 test "damaged input" {

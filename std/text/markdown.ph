@@ -3,6 +3,7 @@
 //
 //     let html = markdown.to_html(text, markdown.Options.init())!;
 //     defer mem.free(html);
+//     markdown.to_html_to(w, text, markdown.Options.init())!;   // to an io.Writer
 //
 // or, to look at the tree:
 //
@@ -318,18 +319,18 @@ pub struct Document {
     /// Renders the document as HTML.
     pub fn html(self: *Document) ![]mut u8 {
         let mut out = strs.String.init();
-        render_html(self, &mut out) catch |e| {
+        render_html(self, &mut out, io.discard(), false) catch |e| {
             out.deinit();
             return e;
         };
         return out.take();
     }
 
-    /// Renders the document as HTML to a Writer.
+    /// Renders the document as HTML to a Writer, about 4 KB at a time.
     pub fn write_html(self: *Document, w: io.Writer) !void {
         let mut out = strs.String.init();
         defer out.deinit();
-        render_html(self, &mut out)!;
+        render_html(self, &mut out, w, true)!;
         w.write_all(out.bytes())!;
     }
 }
@@ -408,6 +409,14 @@ pub fn to_html(src: []u8, opts: Options) ![]mut u8 {
     let mut doc = parse(src, opts)!;
     defer doc.deinit();
     return doc.html();
+}
+
+/// Markdown to HTML in one step, written to w as it is rendered (the tree
+/// is built first, in memory).
+pub fn to_html_to(w: io.Writer, src: []u8, opts: Options) !void {
+    let mut doc = parse(src, opts)!;
+    defer doc.deinit();
+    doc.write_html(w)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -3545,12 +3554,20 @@ fn plain_into(doc: *Document, id: u32, out: *mut strs.String) !void {
     }
 }
 
-fn render_html(doc: *Document, out: *mut strs.String) !void {
+// Renders into out; with `stream`, whatever piles up there goes on to sink
+// every 4 KB or so (all but the last byte, which cr() looks at).
+fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: bool) !void {
     let opts = doc.opts;
     let mut w = doc.walk();
     // inside an image: children render as plain text (alt), up to this node
     let mut plain: u32 = NONE;
     while w.next() {
+        if stream and (out.len >= 4096) {
+            let last = out.buf[out.len - 1];
+            sink.write_all(out.bytes()[..out.len - 1])!;
+            out.clear();
+            out.push(last)!;
+        }
         let id = w.id;
         let n = doc.node(id);
         let entering = w.entering;
@@ -3965,4 +3982,32 @@ test "hostile input stays linear" {
     defer mem.free(h);
     // references expanded at most ~10x the input's size
     @expect(h.len < s.len * 12);
+}
+
+test "to_html_to streams the same HTML" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    for k in @as(usize, 0)..400 {
+        s.push_str("# Head *em*\n\n> quote `code` <b>x</b>\n> - a\n> - b\n\n```\ncode\n```\n")!;
+        s.push_str("![alt *x*](/i.png)\n| a | b |\n|-|-|\n| 1 | ~~2~~ |\n")!;
+        if (k % 3) == 0 {
+            s.push_str("<div>\nraw\n</div>\n")!;
+        }
+    }
+    let mut o = Options.init();
+    o.unsafe_html = (s.len % 2) == 0;
+    let h = to_html(s.bytes(), o)!;
+    defer mem.free(h);
+    @expect(h.len > 20000);
+    let mut out = strs.String.init();
+    defer out.deinit();
+    to_html_to(out.writer(), s.bytes(), o)!;
+    @expect(strs.eq(out.bytes(), h));
+    let mut small: [5000]u8 = [0; 5000];
+    let mut bw = io.BufferWriter.init(small[..]);
+    to_html_to(bw.writer(), s.bytes(), o) catch |e| {
+        @expect(e == error.NoSpaceLeft);
+        return;
+    };
+    @trap();
 }
