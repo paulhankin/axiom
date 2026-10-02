@@ -123,10 +123,17 @@ traces),
 
 ```
 $ AXIOM=selfhost/build/axiom node tests/run.mjs     # the whole suite, any options
+$ node tests/std_opt.mjs                             # std's tests at -O2 on both targets, with checks
 $ selfhost/difftest.sh                                    # compare with the C compiler
 $ selfhost/fuzz/run.sh 1 20                               # backends vs LLVM on random programs
 $ selfhost/build/axiom test selfhost/src/util.ax --target=native
 ```
+
+`std_opt.mjs` builds and runs every std module's tests at `-O2` (or the level given)
+for wasm32 and native, one module per job, with `AXIOM_CHECK_CINTS=1` (no pass changes a
+shared constant) and `AXIOM_POISON=1` (released memory is poisoned, never reused). Run it
+after changing the optimizer or a backend: the std tests are the largest programs the
+suite has.
 
 `difftest.sh` checks every `.ax` file under `tests/`, `std/`, `examples/` and
 `selfhost/src/` for identical diagnostics (`check --format=agent-json`) and exit status,

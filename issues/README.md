@@ -26,7 +26,6 @@ they travel with the code they describe.
 | # | Type | Area | Title |
 |---|------|------|-------|
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
-| [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
 | [0003](0003-parallel-o2-builds.md) | feature | compiler | Parallel -O2 builds |
 | [0004](0004-optimizer-speed.md) | feature | compiler | Faster optimizer |
 | [0005](0005-compiler-memory.md) | feature | compiler | Further cuts to the compiler's memory |
@@ -39,4 +38,5 @@ they travel with the code they describe.
 
 | # | Type | Area | Title |
 |---|------|------|-------|
+| [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
 | [0007](0007-profile-program-arguments.md) | feature | compiler: `axiom profile` | `axiom profile` cannot pass arguments to the program |

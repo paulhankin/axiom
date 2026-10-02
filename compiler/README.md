@@ -120,6 +120,7 @@ $ node tests/run.mjs              # wasm32, -O0
 $ node tests/run.mjs -O2
 $ node tests/run.mjs --native     # native target (links tests/native_rt.c)
 $ make -C compiler asan && AXIOM=compiler/build-asan/axiom node tests/run.mjs
+$ node tests/std_opt.mjs          # std's tests at -O2, wasm32 and native, in parallel
 ```
 
 `tests/run/*.ax` are run-and-compare tests. `// expect:` lines give the expected output,
