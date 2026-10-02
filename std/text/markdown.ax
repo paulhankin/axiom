@@ -23,7 +23,9 @@
 // and passes all 652 examples of the CommonMark 0.31.2 specification. With
 // Options.gfm it also reads the GitHub Flavored Markdown extensions: tables,
 // strikethrough (~~x~~), autolinks without angle brackets (www.x.com,
-// https://..., a@b.com) and task list items ([ ] and [x]).
+// https://..., a@b.com) and task list items ([ ] and [x]). With Options.math
+// it reads TeX math, $...$ and $$...$$ (as MATH and DISPLAY_MATH nodes) and
+// ```math code blocks, and writes it as MathML (std/text/math).
 //
 // Untrusted input: the HTML output is safe by default. Raw HTML in the input
 // is replaced by a comment (Options.unsafe_html keeps it), links and images
@@ -45,6 +47,7 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "../unicode.ax" as uni;
 import "html/entities.ax" as ent;
+import "math.ax" as tmath;
 
 error { TooLarge, OutOfMemory }
 
@@ -76,6 +79,9 @@ pub enum Kind: u8 {
     STRIKETHROUGH,
     LINK,
     IMAGE,
+    /// With Options.math: $...$ and $$...$$ (the TeX source is the text).
+    MATH,
+    DISPLAY_MATH,
 
     /// The name cmark uses ("block_quote", "softbreak", ...).
     pub fn name(self: Kind) []u8 {
@@ -88,7 +94,7 @@ pub enum Kind: u8 {
     }
 }
 
-let KIND_NAMES: [22][]u8 = [
+let KIND_NAMES: [24][]u8 = [
     "document",
     "block_quote",
     "list",
@@ -111,6 +117,8 @@ let KIND_NAMES: [22][]u8 = [
     "strikethrough",
     "link",
     "image",
+    "math",
+    "display_math",
 ];
 
 /// Table cell alignment.
@@ -138,15 +146,21 @@ pub struct Options {
     tagfilter: bool,
     /// Render soft line breaks as <br />.
     hard_breaks: bool,
+    /// TeX math (std/text/math) as MathML: $...$ inline, $$...$$ displayed,
+    /// and ```math code blocks. A $ needs a non-space after it to open and
+    /// before it to close (and no digit after it), so "$5 and $10" stays
+    /// text; \$ is a dollar sign. Math that does not parse is left as its
+    /// source.
+    math: bool,
 
     /// GitHub Flavored Markdown, safe for untrusted input.
     pub fn init() Options {
-        return Options.{ gfm: true, unsafe_html: false, tagfilter: true, hard_breaks: false };
+        return Options.{ gfm: true, unsafe_html: false, tagfilter: true, hard_breaks: false, math: false };
     }
 
     /// Plain CommonMark, raw HTML allowed (as the specification's examples expect).
     pub fn commonmark() Options {
-        return Options.{ gfm: false, unsafe_html: true, tagfilter: false, hard_breaks: false };
+        return Options.{ gfm: false, unsafe_html: true, tagfilter: false, hard_breaks: false, math: false };
     }
 }
 
@@ -378,7 +392,7 @@ pub struct Walker {
 pub fn has_exit(kind: Kind) bool {
     return (kind != Kind.THEMATIC_BREAK) and (kind != Kind.CODE_BLOCK) and (kind != Kind.HTML_BLOCK) and
            (kind != Kind.TEXT) and (kind != Kind.SOFT_BREAK) and (kind != Kind.HARD_BREAK) and (kind != Kind.CODE) and
-           (kind != Kind.HTML_INLINE);
+           (kind != Kind.HTML_INLINE) and (kind != Kind.MATH) and (kind != Kind.DISPLAY_MATH);
 }
 
 /// Parses Markdown text. The input need not be valid UTF-8 (bad bytes
@@ -539,6 +553,12 @@ struct Parser {
     brackets: vec.Vec.[Bracket],
     ticks: vec.Vec.[usize],
     ticks_scanned: bool,
+    // the next closing $ (or $$) at or after math1_from (math2_from), or
+    // NO_CLOSER: closers do not depend on their openers
+    math1_from: usize,
+    math1: usize,
+    math2_from: usize,
+    math2: usize,
     no_comment_end: bool,
     no_pi_end: bool,
     no_decl_end: bool,
@@ -581,6 +601,10 @@ struct Parser {
             brackets: vec.Vec.[Bracket].init(),
             ticks: vec.Vec.[usize].init(),
             ticks_scanned: false,
+            math1_from: NO_CLOSER,
+            math1: NO_CLOSER,
+            math2_from: NO_CLOSER,
+            math2: NO_CLOSER,
             no_comment_end: false,
             no_pi_end: false,
             no_decl_end: false,
@@ -2341,6 +2365,8 @@ fn parse_inlines(p: *mut Parser, block: u32, r: Ref) !void {
     p.brackets.clear();
     p.link_barrier = 0;
     p.ticks_scanned = false;
+    p.math1_from = NO_CLOSER;
+    p.math2_from = NO_CLOSER;
     p.no_comment_end = false;
     p.no_pi_end = false;
     p.no_decl_end = false;
@@ -2370,9 +2396,9 @@ fn buf_ref(p: *mut Parser, s: []u8) !Ref {
     return Ref.{ off: @truncate(u32, off), len: @truncate(u32, s.len), raw: false };
 }
 
-fn is_special(c: u8, gfm: bool) bool {
+fn is_special(c: u8, gfm: bool, math: bool) bool {
     return (c == '\n') or (c == '\r') or (c == '`') or (c == '\\') or (c == '&') or (c == '_') or (c == '*') or
-           (c == '[') or (c == ']') or (c == '<') or (c == '!') or (gfm and (c == '~'));
+           (c == '[') or (c == ']') or (c == '<') or (c == '!') or (gfm and (c == '~')) or (math and (c == '$'));
 }
 
 fn parse_inline(p: *mut Parser) !void {
@@ -2395,6 +2421,8 @@ fn parse_inline(p: *mut Parser) !void {
         }
     } else if c == '`' {
         handle_backticks(p)!;
+    } else if (c == '$') and p.opts.math {
+        handle_dollars(p)!;
     } else if c == '\\' {
         p.pos += 1;
         let d = peek(p);
@@ -2454,8 +2482,9 @@ fn parse_inline(p: *mut Parser) !void {
     } else {
         let start = p.pos;
         let gfm = p.opts.gfm;
+        let math = p.opts.math;
         let mut e = p.pos;
-        while (e < p.s.len) and not is_special(p.s[e], gfm) {
+        while (e < p.s.len) and not is_special(p.s[e], gfm, math) {
             e += 1;
         }
         p.pos = e;
@@ -2519,6 +2548,97 @@ fn handle_backticks(p: *mut Parser) !void {
     }
     let id = p.append(p.block, Kind.CODE)!;
     p.nd(id).text = Ref.{ off: @truncate(u32, a), len: @truncate(u32, e - a), raw: false };
+}
+
+// --- math ---
+
+const NO_CLOSER: usize = 0xffffffff;  // (inputs are under 1 GB)
+
+fn handle_dollars(p: *mut Parser) !void {
+    let start = p.pos;
+    while peek(p) == '$' {
+        p.pos += 1;
+    }
+    let n = p.pos - start;
+    let after = p.pos;
+    if n == 1 {
+        let c = peek(p);
+        if (c != 0) and not is_ascii_space(c) {
+            let close = math_closer1(p, after);
+            if close != NO_CLOSER {
+                let id = p.append(p.block, Kind.MATH)!;
+                p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, after), len: @truncate(u32, close - after),
+                                      raw: true };
+                p.pos = close + 1;
+                return;
+            }
+        }
+    } else if n == 2 {
+        let close = math_closer2(p, after);
+        if close != NO_CLOSER {
+            let mut a = after;
+            let mut e = close;
+            while (a < e) and is_ascii_space(p.s[a]) {
+                a += 1;
+            }
+            while (e > a) and is_ascii_space(p.s[e - 1]) {
+                e -= 1;
+            }
+            if e > a {
+                let id = p.append(p.block, Kind.DISPLAY_MATH)!;
+                p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, a), len: @truncate(u32, e - a), raw: true };
+                p.pos = close + 2;
+                return;
+            }
+        }
+    }
+    p.pos = after;
+    _ = text_node(p, start, after)!;
+}
+
+/// The next $ at or after `from` that can close inline math: alone (not
+/// in $$), not escaped, after a non-space and not before a digit.
+fn math_closer1(p: *mut Parser, from: usize) usize {
+    if (p.math1_from != NO_CLOSER) and (p.math1_from <= from) and ((p.math1 == NO_CLOSER) or (p.math1 >= from)) {
+        return p.math1;
+    }
+    let s = p.s;
+    let mut found = NO_CLOSER;
+    let mut i = @max(from, 1);
+    while i < s.len {
+        if s[i] == '$' {
+            let b = s[i - 1];
+            let nx = at(s, i + 1);
+            if (b != '$') and (b != '\\') and not is_ascii_space(b) and (nx != '$') and not is_digit(nx) {
+                found = i;
+                break;
+            }
+        }
+        i += 1;
+    }
+    p.math1_from = from;
+    p.math1 = found;
+    return found;
+}
+
+/// The next unescaped $$ at or after `from`.
+fn math_closer2(p: *mut Parser, from: usize) usize {
+    if (p.math2_from != NO_CLOSER) and (p.math2_from <= from) and ((p.math2 == NO_CLOSER) or (p.math2 >= from)) {
+        return p.math2;
+    }
+    let s = p.s;
+    let mut found = NO_CLOSER;
+    let mut i = from;
+    while i + 1 < s.len {
+        if (s[i] == '$') and (s[i + 1] == '$') and ((i == 0) or (s[i - 1] != '\\')) {
+            found = i;
+            break;
+        }
+        i += 1;
+    }
+    p.math2_from = from;
+    p.math2 = found;
+    return found;
 }
 
 /// Where the run of exactly n backticks closing a code span ends, or 0.
@@ -3531,7 +3651,8 @@ fn plain_into(doc: *Document, id: u32, out: *mut strs.String) !void {
     while true {
         let n = doc.node(w.id);
         if w.entering {
-            if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) {
+            if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) or
+               (n.kind == Kind.MATH) or (n.kind == Kind.DISPLAY_MATH) {
                 out.push_str(doc.text(w.id))!;
             } else if (n.kind == Kind.SOFT_BREAK) or (n.kind == Kind.HARD_BREAK) {
                 out.push(' ')!;
@@ -3552,6 +3673,24 @@ fn plain_into(doc: *Document, id: u32, out: *mut strs.String) !void {
         w.id = doc.node(cur).next;
         w.entering = true;
     }
+}
+
+// Whether a code block's info string starts with the word "math".
+fn is_math_info(info: []u8) bool {
+    return strs.starts_with(info, "math") and ((info.len == 4) or is_ascii_space(info[4]));
+}
+
+// TeX as MathML onto out; false (and nothing written) if it does not parse.
+fn math_html(out: *mut strs.String, tex: []u8, display: tmath.Display) !bool {
+    let mut f = tmath.parse(tex) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return false;
+    };
+    defer f.deinit();
+    f.write_mathml(out.writer(), display)!;
+    return true;
 }
 
 // Renders into out; with `stream`, whatever piles up there goes on to sink
@@ -3577,7 +3716,8 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
                 // falls through to close the image
             } else {
                 if entering {
-                    if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) {
+                    if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) or
+                       (n.kind == Kind.MATH) or (n.kind == Kind.DISPLAY_MATH) {
                         escape_html(out, doc.text(id))!;
                     } else if (n.kind == Kind.SOFT_BREAK) or (n.kind == Kind.HARD_BREAK) {
                         out.push(' ')!;
@@ -3638,6 +3778,9 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
                 out.push('0' + n.level)!;
                 out.push_str(">\n")!;
             }
+        } else if (k == Kind.CODE_BLOCK) and opts.math and is_math_info(doc.info(id)) and
+                  math_html(out, strs.trim(doc.text(id)), tmath.Display.BLOCK)! {
+            cr(out)!;
         } else if k == Kind.CODE_BLOCK {
             cr(out)!;
             let info = doc.info(id);
@@ -3731,6 +3874,18 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
             }
         } else if k == Kind.HARD_BREAK {
             out.push_str("<br />\n")!;
+        } else if k == Kind.MATH {
+            if not math_html(out, doc.text(id), tmath.Display.INLINE)! {
+                out.push('$')!;
+                escape_html(out, doc.text(id))!;
+                out.push('$')!;
+            }
+        } else if k == Kind.DISPLAY_MATH {
+            if not math_html(out, doc.text(id), tmath.Display.BLOCK)! {
+                out.push_str("$$")!;
+                escape_html(out, doc.text(id))!;
+                out.push_str("$$")!;
+            }
         } else if k == Kind.CODE {
             out.push_str("<code>")!;
             escape_html(out, doc.text(id))!;
@@ -4010,4 +4165,40 @@ test "to_html_to streams the same HTML" {
         return;
     };
     @trap();
+}
+
+test "math" {
+    let mut o = Options.init();
+    o.math = true;
+    expect_html("Area $x^2$ here.\n", o,
+                "<p>Area <math><semantics><msup><mi>x</mi><mn>2</mn></msup><annotation encoding=\"application/x-tex\">x^2</annotation></semantics></math> here.</p>\n")!;
+    // dollars as money, escaped, spaced or empty stay text
+    expect_html("$5 and $10\n", o, "<p>$5 and $10</p>\n")!;
+    expect_html("\\$x$\n", o, "<p>$x$</p>\n")!;
+    expect_html("$ x$\n", o, "<p>$ x$</p>\n")!;
+    expect_html("$$ $$\n", o, "<p>$$ $$</p>\n")!;
+    // no emphasis or escapes inside; displayed math across lines
+    expect_html("$a_1 * b_2$\n", o,
+                "<p><math><semantics><mrow><msub><mi>a</mi><mn>1</mn></msub><mo>\u{2217}</mo><msub><mi>b</mi><mn>2</mn></msub></mrow><annotation encoding=\"application/x-tex\">a_1 * b_2</annotation></semantics></math></p>\n")!;
+    expect_html("$$\n\\frac{1}{2}\n$$\n", o,
+                "<p><math display=\"block\"><semantics><mfrac><mn>1</mn><mn>2</mn></mfrac><annotation encoding=\"application/x-tex\">\\frac{1}{2}</annotation></semantics></math></p>\n")!;
+    expect_html("```math\nx<y\n```\n", o,
+                "<math display=\"block\"><semantics><mrow><mi>x</mi><mo>&lt;</mo><mi>y</mi></mrow><annotation encoding=\"application/x-tex\">x&lt;y</annotation></semantics></math>\n")!;
+    // math that does not parse stays as its source
+    expect_html("$\\frac{a}$ and $$x^$$\n", o, "<p>$\\frac{a}$ and $$x^$$</p>\n")!;
+    expect_html("```math\n\\foo\n```\n", o, "<pre><code class=\"language-math\">\\foo\n</code></pre>\n")!;
+    // code spans win when they start first; alt text keeps the source
+    expect_html("`$x$` and `a $b` c$\n", o, "<p><code>$x$</code> and <code>a $b</code> c$</p>\n")!;
+    expect_html("![$x$](i.png)\n", o, "<p><img src=\"i.png\" alt=\"x\" /></p>\n")!;
+    // off by default
+    expect_html("$x$\n", Options.init(), "<p>$x$</p>\n")!;
+    // many unclosed openers stay linear
+    let mut s = strs.String.init();
+    defer s.deinit();
+    for _k in 0..@as(usize, 50000) {
+        s.push_str("$a $$b \\$")!;
+    }
+    let h = to_html(s.bytes(), o)!;
+    defer mem.free(h);
+    @expect(h.len >= s.len);
 }

@@ -27,7 +27,8 @@ TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'fon
 TOKENS = {
     'json': [b'{', b'}', b'[', b']', b'"', b'\\u', b'\\ud800', b'1e999', b'-', b'[' * 600, b'null', b','],
     'regex': [b'(', b')', b'*', b'+', b'?', b'{', b'}', b'{1000}', b'{2,', b'[', b']', b'\\', b'|', b'(?P<', b'\x00'],
-    'markdown': [b'*', b'_', b'[', b']', b'(', b')', b'<', b'>', b'`', b'\n', b'    ', b'- ', b'> ', b'|', b'~~',
+    'markdown': [b'$', b'$$', b'\\frac{', b'```math\n',
+                 b'*', b'_', b'[', b']', b'(', b')', b'<', b'>', b'`', b'\n', b'    ', b'- ', b'> ', b'|', b'~~',
                  b'&', b'#', b'\t', b'!['],
     'pdf': [b'<<', b'>>', b'[', b']', b'(', b')', b'R', b' 0 obj', b'endobj', b'stream\n', b'endstream',
             b'/Length 1', b'99999999', b'-1', b'/Filter /FlateDecode', b'xref', b'trailer'],
