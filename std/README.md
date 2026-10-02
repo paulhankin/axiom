@@ -79,7 +79,7 @@ that owns memory has `deinit`).
 | [`net/websocket`](net/websocket.ax) | WebSocket (RFC 6455): `connect` (ws://, wss://), `accept` in an `http` handler; text, binary, ping, close (`Opcode`); fragmentation, automatic pongs, strict validation (masking, UTF-8, close codes, message size) |
 | [`net/http2`](http2.ax) | HTTP/2 (RFC 9113): `Conn` (framing, streams, flow control, settings, ping, goaway; strict checks and limits), `Client` for requests over any connection |
 | [`net/hpack`](net/hpack.ax) | HPACK (RFC 7541): `Encoder` and `Decoder` with dynamic tables and Huffman coding; byte-for-byte as Python's hpack ([`net/hpack/testdata`](net/hpack/testdata)) |
-| [`net/tls`](net/tls.ax) | TLS 1.3 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates |
+| [`net/tls`](net/tls.ax) | TLS 1.3 and 1.2 client and server (`connect`, `client`, `server` → `Conn`, a `Reader`/`Writer`): AES-GCM and ChaCha20-Poly1305, X25519 and P-256 key exchange, Ed25519 / ECDSA / RSA certificates, chain and host-name verification against the system's roots, ALPN, SNI, key updates; TLS 1.2 with peers that lack 1.3 (ECDHE with the same AEADs, extended master secret, downgrade protection; `ClientConfig.min_version`/`max_version`, `Conn.version()`), checked against OpenSSL both ways |
 
 ## Encodings and data formats
 
