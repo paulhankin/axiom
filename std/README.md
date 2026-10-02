@@ -29,7 +29,7 @@ that owns memory has `deinit`).
 
 | Module | Contents |
 |---|---|
-| [`collections/vec`](collections/vec.ax) | `Vec[T]`: growable array. `sort`, `reverse`, `index_of`, `binary_search` on slices |
+| [`collections/vec`](collections/vec.ax) | `Vec[T]`: growable array. On slices: `sort` (introsort, in place), `sort_stable` (merge sort), `sort_with` / `sort_stable_with` (a context value passed to each comparison, e.g. sorting indices by keys), `is_sorted`, `binary_search`, `lower_bound`, `upper_bound`, `reverse`, `index_of` |
 | [`collections/arena`](collections/arena.ax) | `Arena`: bump allocation freed all at once (`bytes`, `dup`, `copy[T]`), for parsed documents |
 | [`collections/map`](collections/map.ax) | `Map[K, V]`: open-addressing hash map, and `Iter[K, V]` |
 | [`collections/set`](collections/set.ax) | `Set[K]`: hash set with union, intersection and difference in place |
