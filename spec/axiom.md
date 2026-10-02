@@ -2217,7 +2217,9 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
 - When `main` returns, the allocations never freed are reported as leaks, and the exit
   status becomes 23 if it was 0. Memory kept on purpose until the end can be excluded:
   allocations made between `mem.leaks_ignored(true)` and `mem.leaks_ignored(false)`
-  are not reported. Test binaries do not check for leaks.
+  are not reported. In a test binary (`axiom test --sanitize=address`), where each
+  test runs in a process or instance of its own, a test that passes but leaves
+  allocations unfreed fails with the code `leak`, and the report is its output.
 
 The allocator and the runtime are not instrumented. Memory that is not from the heap
 (globals, locals, memory from `@memory_grow`) is not checked. Allocation sites come from

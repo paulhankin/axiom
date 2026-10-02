@@ -133,7 +133,9 @@ $ selfhost/build/axiom test selfhost/src/util.ax --target=native
 for wasm32 and native, one module per job, with `AXIOM_CHECK_CINTS=1` (no pass changes a
 shared constant) and `AXIOM_POISON=1` (released memory is poisoned, never reused). Run it
 after changing the optimizer or a backend: the std tests are the largest programs the
-suite has.
+suite has. With `--sanitize=address` (and a longer `--test-timeout=ms`: the
+sanitizer makes code 3–4 times slower) it also checks every std test for memory errors
+and leaks.
 
 `difftest.sh` checks every `.ax` file under `tests/`, `std/`, `examples/` and
 `selfhost/src/` for identical diagnostics (`check --format=agent-json`) and exit status,

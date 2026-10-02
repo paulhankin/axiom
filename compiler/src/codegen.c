@@ -3223,6 +3223,9 @@ static void emit_trap_info_export(void) {
 //   axiom_test_expect(i) i32      -1 must not trap, -2 any trap, n: trap Tn
 //   axiom_test_run(i) u32         0, or the error code the test returned
 //   axiom_error_name(code) *u8    NUL-terminated
+//   axiom_test_leaks() u32        after a test passed: the allocations it
+//                                 never freed, reported on stderr
+//                                 (--sanitize=address; otherwise 0)
 static void emit_test_exports(void) {
     int n = g_prog.tests.len;
     LLVMValueRef c = add_export("axiom_test_count", T_i32, NULL, 0);
@@ -3276,6 +3279,14 @@ static void emit_test_exports(void) {
     LLVMValueRef ix2[2] = {usz(0), code};
     LLVMValueRef sl = LLVMBuildLoad2(B, st, LLVMBuildGEP2(B, LLVMArrayType2(st, (uint64_t)ne + 1), tab, ix2, 2, ""), "");
     LLVMBuildRet(B, LLVMBuildExtractValue(B, sl, 0, ""));
+
+    add_export("axiom_test_leaks", T_i32, NULL, 0);
+    if (O->sanitize_address) {
+        FnInst *lk = mem_fn("asan_test_leaks");
+        LLVMBuildRet(B, LLVMBuildCall2(B, lk->llty, lk->fn, NULL, 0, ""));
+    } else {
+        LLVMBuildRet(B, LLVMConstInt(T_i32, 0, false));
+    }
 }
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void) { return LLVMGetDefaultTargetTriple(); }

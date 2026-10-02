@@ -19,6 +19,7 @@ const char *axiom_test_name(uint32_t i);
 int32_t axiom_test_expect(uint32_t i);
 uint32_t axiom_test_run(uint32_t i);
 const char *axiom_error_name(uint32_t code);
+uint32_t axiom_test_leaks(void);
 
 static int result_fd = -1;
 
@@ -156,6 +157,8 @@ int main(int argc, char **argv) {
             static char rec[8192];
             int k = snprintf(rec, sizeof rec, "DONE\t%u\t", code);
             if (code) k += (int)encode_errors(rec + k, sizeof rec - (size_t)k, axiom_shadow_stack());
+            // --sanitize=address: memory the test never freed (reported on stderr)
+            else k += snprintf(rec + k, sizeof rec - (size_t)k, "%u", axiom_test_leaks());
             (void)!write(res[1], rec, (size_t)k);
             _exit(0);
         }
@@ -206,6 +209,13 @@ int main(int argc, char **argv) {
                 code = "no_trap";
                 if (expect == -2) snprintf(msg, sizeof msg, "expected a trap, but the test completed");
                 else snprintf(msg, sizeof msg, "expected trap T%04d, but the test completed", expect);
+            } else if (*endp == '\t') {
+                unsigned long leaks = strtoul(endp + 1, NULL, 10);
+                if (leaks) {
+                    st = "fail";
+                    code = "leak";
+                    snprintf(msg, sizeof msg, "the test leaked %lu allocation%s (--sanitize=address)", leaks, leaks == 1 ? "" : "s");
+                }
             }
         } else if (resbuf && !strncmp(resbuf, "TRAP\t", 5)) {
             unsigned tc;

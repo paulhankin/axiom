@@ -10,6 +10,7 @@
 //
 // Usage: node tests/std_opt.mjs [-O1|-O2|-O3] [--target=wasm32|native|both]
 //                               [--jobs=N] [--filter=substr] [--timeout=seconds]
+//                               [--sanitize=address] [--test-timeout=ms]
 //
 // The compiler is $AXIOM, else selfhost/build/axiom when built, else
 // compiler/build/axiom. AXIOM_NATIVE_TARGET and AXIOM_NATIVE_EXEC work as in
@@ -29,6 +30,9 @@ const filter = arg('filter', '');
 const jobs = Math.max(1, Number(arg('jobs', os.availableParallelism ? os.availableParallelism() : os.cpus().length)));
 const timeoutMs = Number(arg('timeout', 900)) * 1000;
 const which = arg('target', 'both');
+const extra = argv.filter((a) => a.startsWith('--sanitize='));
+// each test's own limit (axiom test --timeout; default 10 s, 60 s under emulation)
+const testTimeout = argv.filter((a) => a.startsWith('--test-timeout=')).map((a) => `--timeout=${a.slice(15)}`);
 const execWrap = process.env.AXIOM_NATIVE_EXEC || '';
 const targets = [];
 if (which === 'wasm32' || which === 'both') targets.push({ name: 'wasm32', flags: [] });
@@ -54,9 +58,9 @@ for (const f of dirsUnder(path.join(root, 'std')).flatMap(files)) {
   const src = fs.readFileSync(f, 'utf8');
   if (!/^test "/m.test(src)) continue;
   for (const t of targets) {
-    const name = `${path.relative(root, f)} [${t.name} ${opt}]`;
+    const name = `${path.relative(root, f)} [${[t.name, opt, ...extra].join(' ')}]`;
     if (filter && !name.includes(filter)) continue;
-    work.push({ name, args: ['test', f, '--format=agent-json', opt, ...t.flags, ...flagsOf(src)] });
+    work.push({ name, args: ['test', f, '--format=agent-json', opt, ...extra, ...t.flags, ...testTimeout, ...flagsOf(src)] });
   }
 }
 

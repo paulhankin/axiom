@@ -44,7 +44,9 @@ if (list) {
       r = { status: 'fail', code: 'no_trap', message: expect === -2 ? 'expected a trap, but the test completed'
         : `expected trap T${String(expect).padStart(4, '0')}, but the test completed` };
     } else {
-      r = { status: 'pass' };
+      // --sanitize=address: memory the test never freed (reported on stderr)
+      const leaks = ex.axiom_test_leaks ? ex.axiom_test_leaks() >>> 0 : 0;
+      r = leaks ? { status: 'fail', code: 'leak', message: `the test leaked ${leaks} allocation${leaks === 1 ? '' : 's'} (--sanitize=address)` } : { status: 'pass' };
     }
   } catch (e) {
     if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError)) throw e;
