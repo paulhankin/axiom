@@ -34,8 +34,8 @@
 // fill-opacity, stroke-opacity, fill-rule, clip-rule, stroke-width,
 // stroke-linecap, stroke-linejoin, stroke-miterlimit, stroke-dasharray,
 // stroke-dashoffset, color/currentColor, display, visibility; linear and
-// radial gradients with gradientUnits, gradientTransform, spreadMethod and
-// href inheritance; clip-path (its shapes unioned under the first one's
+// radial gradients with gradientUnits, gradientTransform, spreadMethod,
+// focal points (fx, fy) and href inheritance; clip-path (its shapes unioned under the first one's
 // clip-rule; clipPathUnits); mask (luminance masks with maskUnits,
 // maskContentUnits and the mask region); viewBox and preserveAspectRatio
 // (on svg, symbol and image); images that are PNG or JPEG data URIs;
@@ -43,8 +43,8 @@
 // and <tspan> with x, y, dx, dy (the first value of a list), font-size and
 // text-anchor (per run), drawn as outlines when RenderOptions gives a font
 // (one font for all text; font-family and font-weight are ignored), and
-// skipped otherwise. Not supported: the focal point of radial gradients
-// (fx, fy), patterns, markers, filters, external references, textPath,
+// skipped otherwise. Not supported: SVG 2's focal radius (fr), patterns,
+// markers, filters, external references, textPath,
 // and animation.
 //
 // Rendering onto a canvas follows SVG renderers: the document is drawn into
@@ -234,6 +234,10 @@ pub struct Writer {
             self.num_attr("cx", p.x0)!;
             self.num_attr("cy", p.y0)!;
             self.num_attr("r", p.r)!;
+            if p.x1_focal {
+                self.num_attr("fx", p.x1)!;
+                self.num_attr("fy", p.y1)!;
+            }
         }
         if p.spread == draw.Spread.REPEAT {
             self.xw.attr("spreadMethod", "repeat")!;
@@ -1345,7 +1349,18 @@ struct Builder {
             out.* = draw.Paint.solid(stops.get(stops.len - 1).color);
             return true;
         }
-        out.* = draw.Paint.radial(cx, cy, r, fine).with_spread(spread).with_transform(space);
+        // the focal point: (cx, cy) unless fx or fy say otherwise
+        let fx = self.gradient_length(g, "fx", 'x', user, cx);
+        let fy = self.gradient_length(g, "fy", 'y', user, cy);
+        let no_fx = fails_attr(self.gradient_attr(g, "fx"));
+        let no_fy = fails_attr(self.gradient_attr(g, "fy"));
+        if (no_fx and no_fy) or ((fx == cx) and (fy == cy)) {
+            out.* = draw.Paint.radial(cx, cy, r, fine).with_spread(spread).with_transform(space);
+            return true;
+        }
+        let ffx = if_else(no_fx, cx, fx);
+        let ffy = if_else(no_fy, cy, fy);
+        out.* = draw.Paint.radial_focal(cx, cy, r, ffx, ffy, fine).with_spread(spread).with_transform(space);
         return true;
     }
 
@@ -1370,6 +1385,18 @@ struct Builder {
         }
         return number_or_percent(v) catch default;
     }
+}
+
+fn fails_attr(r: ![]u8) bool {
+    _ = r catch return true;
+    return false;
+}
+
+fn if_else(c: bool, a: f64, b: f64) f64 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn rule_less(a: css.Rule, b: css.Rule) bool {
@@ -3183,8 +3210,8 @@ fn check_probes(name: []u8) !void {
 }
 
 test "rendering matches skia" {
-    let names: [11][]u8 = ["shapes", "paths", "gradients", "strokes", "transforms", "fit", "fit2", "fit3", "clip",
-                           "alpha", "groups"];
+    let names: [12][]u8 = ["shapes", "paths", "gradients", "strokes", "transforms", "fit", "fit2", "fit3", "clip",
+                           "alpha", "groups", "focal"];
     for name in names {
         check_probes(name)!;
     }
@@ -3587,4 +3614,39 @@ test "viewbox transforms" {
     let n = viewbox_transform(vb, parse_fit("none"), 100.0, 100.0);
     @expect(@abs(n.a - 2.0) < 1.0e-12);
     @expect(@abs(n.d - 4.0) < 1.0e-12);
+}
+
+test "focal radial gradients are written and read back" {
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let stops: [2]draw.Stop = [
+        draw.Stop.{ offset: 0.0, color: color.Color.rgb(1.0, 1.0, 1.0) },
+        draw.Stop.{ offset: 1.0, color: color.Color.rgb(0.0, 0.0, 0.0) },
+    ];
+    let p = draw.Paint.radial_focal(40.0, 40.0, 30.0, 25.0, 40.0, stops[..]);
+    {
+        let mut w = Writer.begin(out.writer(), 80.0, 80.0)!;
+        defer w.deinit();
+        w.fill_rect(0.0, 0.0, 80.0, 80.0, p)!;
+        w.finish()!;
+    }
+    @expect(strs.contains(out.bytes(), " fx=\"25\" fy=\"40\""));
+    let mut img = render_text(out.bytes())!;
+    defer img.deinit();
+    let mut ref = image.Image.init(80, 80, 4, image.Depth.U8)!;
+    defer ref.deinit();
+    let mut cv = draw.Canvas.init(&mut ref);
+    defer cv.deinit();
+    cv.fill_rect(0.0, 0.0, 80.0, 80.0, p)!;
+    // white at the focal point, black at and beyond the circle on both sides
+    @expect(near(&img, 25, 40, 0xffffffff, 24));
+    @expect(near(&img, 72, 40, 0x000000ff, 0));
+    @expect(near(&img, 8, 40, 0x000000ff, 0));
+    // the focal point pulls the light to the left: (30, 40) is lighter
+    // than (50, 40), the same distance from the centre
+    @expect(px(&img, 30, 40) > px(&img, 50, 40));
+    @expect(near(&ref, 25, 40, 0xffffffff, 24));
+    // a focal point outside the circle moves just inside it
+    let q = draw.Paint.radial_focal(0.0, 0.0, 10.0, 30.0, 0.0, stops[..]);
+    @expect((q.x1 < 10.0) and (q.x1 > 9.9) and (q.y1 == 0.0));
 }

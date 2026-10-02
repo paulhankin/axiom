@@ -60,6 +60,20 @@ DOCS = {
   <circle cx="25" cy="25" r="20" fill="darkred"/>
 </svg>
 ''',
+    'focal': '''\
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="160">
+  <defs>
+    <radialGradient id="f1" fx="0.25" fy="0.3"><stop offset="0" stop-color="white"/><stop offset="0.6" stop-color="gold"/><stop offset="1" stop-color="darkred"/></radialGradient>
+    <radialGradient id="f2" gradientUnits="userSpaceOnUse" cx="180" cy="50" r="40" fx="200" fy="70" spreadMethod="reflect"><stop offset="0" stop-color="navy"/><stop offset="1" stop-color="skyblue"/></radialGradient>
+    <radialGradient id="f3" xlink:href="#f1" fx="0.9" fy="0.5"/>
+    <radialGradient id="f4" gradientUnits="userSpaceOnUse" cx="180" cy="120" r="30" fy="140" spreadMethod="repeat"><stop offset="0" stop-color="seagreen"/><stop offset="1" stop-color="ivory"/></radialGradient>
+  </defs>
+  <rect x="10" y="10" width="100" height="70" fill="url(#f1)"/>
+  <rect x="130" y="5" width="100" height="90" fill="url(#f2)"/>
+  <circle cx="60" cy="120" r="35" fill="url(#f3)"/>
+  <rect x="130" y="95" width="100" height="60" fill="url(#f4)"/>
+</svg>
+''',
     'gradients': '''\
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
   <defs>
