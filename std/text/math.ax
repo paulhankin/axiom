@@ -19,7 +19,8 @@
 // accents (\hat, \vec, \bar, \overline, \overbrace, ...) and \overset,
 // \underset, \stackrel; fonts (\mathbf, \mathbb, \mathcal, \mathfrak,
 // \mathrm, \mathsf, \mathtt, \boldsymbol) as Unicode mathematical
-// alphanumerics; \text; \color and \textcolor; \bmod and \pmod; spaces
+// alphanumerics; \text; \color and \textcolor; \boxed; \phantom, \hphantom,
+// \vphantom and \mathstrut; \cancel, \bcancel and \xcancel; \bmod and \pmod; spaces
 // (\, \: \; \! \quad \qquad); \not; and the environments matrix, pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix,
 // smallmatrix, cases, aligned, gathered, split and array.
 //
@@ -75,6 +76,7 @@ pub enum Kind: u8 {
     TROW,     // cells
     TCELL,    // a: content
     STYLE,    // a: content (display style)
+    ENCLOSE,  // a: content; cls: an E_ value
 }
 
 // operator classes
@@ -91,6 +93,15 @@ pub const C_FUNCL: u8 = 9;    // functions with limits (lim)
 pub const C_GREEK: u8 = 10;   // an identifier
 pub const C_UGREEK: u8 = 11;  // an upright identifier
 pub const C_ACCENT: u8 = 12;
+
+// ENCLOSE kinds (a node's cls)
+pub const E_BOX: u8 = 0;       // \boxed: a frame
+pub const E_PHANTOM: u8 = 1;   // the space the content takes, empty
+pub const E_HPHANTOM: u8 = 2;  // its width only
+pub const E_VPHANTOM: u8 = 3;  // its height and depth only
+pub const E_CANCEL: u8 = 4;    // struck through, /
+pub const E_BCANCEL: u8 = 5;   // \
+pub const E_XCANCEL: u8 = 6;   // X
 
 // node flags
 pub const F_NORMAL: u16 = 1;  // an upright identifier
@@ -1378,17 +1389,23 @@ fn command(p: *mut Parser) !u32 {
         }
         return a;
     }
-    if strs.eq(name, "boxed") or strs.eq(name, "phantom") or strs.eq(name, "mathstrut") {
-        if strs.eq(name, "mathstrut") {
-            return NIL;
+    let encl: [7][]u8 = ["boxed", "phantom", "hphantom", "vphantom", "cancel", "bcancel", "xcancel"];
+    for k in @as(usize, 0)..7 {
+        if strs.eq(name, encl[k]) {
+            let content = argument(p)!;
+            let e = new_node(p, Kind.ENCLOSE)!;
+            p.f.node(e).a = content;
+            p.f.node(e).cls = @truncate(u8, k);
+            return e;
         }
-        let a = argument(p)!;
-        if strs.eq(name, "phantom") {
-            let sp = new_node(p, Kind.SPACE)!;
-            p.f.node(sp).width = 1.0;
-            return sp;
-        }
-        return a;
+    }
+    if strs.eq(name, "mathstrut") {
+        // as tall and deep as a parenthesis, no wider than nothing
+        let paren = op_node(p, "(", C_OPEN)!;
+        let e = new_node(p, Kind.ENCLOSE)!;
+        p.f.node(e).a = paren;
+        p.f.node(e).cls = E_VPHANTOM;
+        return e;
     }
     let k = find_symbol(name);
     if k == SYMBOLS.len {
@@ -1921,6 +1938,7 @@ fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
         }
         .TROW => {}
         .TCELL => {}
+        .ENCLOSE => { enclose_mathml(f, o, n)!; }
         .STYLE => {
             if n.sl != 0 {
                 o.s("<mstyle style=\"color:")!;
@@ -1934,6 +1952,47 @@ fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
             mathml(f, o, n.a)!;
             o.s("</mstyle>")!;
         }
+    }
+}
+
+// The diagonal strokes of \cancel and friends, as CSS gradients ("to
+// bottom right" runs its 50% line from bottom left to top right).
+let STRIKE_UP: []u8 =
+    "linear-gradient(to bottom right,transparent calc(50% - 0.04em),currentColor calc(50% - 0.04em),currentColor calc(50% + 0.04em),transparent calc(50% + 0.04em))";
+let STRIKE_DOWN: []u8 =
+    "linear-gradient(to top right,transparent calc(50% - 0.04em),currentColor calc(50% - 0.04em),currentColor calc(50% + 0.04em),transparent calc(50% + 0.04em))";
+
+fn enclose_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    if n.cls == E_BOX {
+        o.s("<mrow style=\"padding:0.3em;border:0.04em solid\">")!;
+        mathml(f, o, n.a)!;
+        o.s("</mrow>")!;
+    } else if n.cls == E_PHANTOM {
+        o.s("<mphantom>")!;
+        mathml(f, o, n.a)!;
+        o.s("</mphantom>")!;
+    } else if n.cls == E_HPHANTOM {
+        o.s("<mpadded height=\"0\" depth=\"0\"><mphantom>")!;
+        mathml(f, o, n.a)!;
+        o.s("</mphantom></mpadded>")!;
+    } else if n.cls == E_VPHANTOM {
+        o.s("<mpadded width=\"0\"><mphantom>")!;
+        mathml(f, o, n.a)!;
+        o.s("</mphantom></mpadded>")!;
+    } else {
+        o.s("<mrow style=\"background:")!;
+        if n.cls == E_CANCEL {
+            o.s(STRIKE_UP)!;
+        } else if n.cls == E_BCANCEL {
+            o.s(STRIKE_DOWN)!;
+        } else {
+            o.s(STRIKE_UP)!;
+            o.s(",")!;
+            o.s(STRIKE_DOWN)!;
+        }
+        o.s("\">")!;
+        mathml(f, o, n.a)!;
+        o.s("</mrow>")!;
     }
 }
 
@@ -2282,6 +2341,26 @@ fn text(f: *Formula, o: *mut Out, i: u32) !void {
         }
         .TROW => {}
         .TCELL => {}
+        .ENCLOSE => {
+            if (n.cls == E_CANCEL) or (n.cls == E_BCANCEL) or (n.cls == E_XCANCEL) {
+                // a stroke over each character
+                let mut inner = text_to_string(f, n.a)!;
+                defer inner.deinit();
+                let mut it = strs.runes(inner.bytes());
+                loop {
+                    let r = it.next() catch break;
+                    let mut b: [4]u8 = [0; 4];
+                    o.s(strs.encode_rune(b[..], r))!;
+                    if n.cls == E_BCANCEL {
+                        o.s("\u{20e5}")!;
+                    } else {
+                        o.s("\u{338}")!;
+                    }
+                }
+            } else if n.cls == E_BOX {
+                text(f, o, n.a)!;
+            }
+        }
         .STYLE => { text(f, o, n.a)!; }
     }
 }
@@ -2367,6 +2446,7 @@ test "math as text" {
     expect_text("-a - b = -(c)", "\u{2212}a \u{2212} b = \u{2212}(c)")!;
     expect_text("\\text{if } x > 0", "if x > 0")!;
     expect_text("f'(x) + f''", "f\u{2032}(x) + f\u{2033}")!;
+    expect_text("\\boxed{x} + \\cancel{ab} + \\bcancel{c} + a\\phantom{b}c", "x + a\u{338}b\u{338} + c\u{20e5} + ac")!;
     expect_text("", "")!;
 }
 
@@ -2384,6 +2464,13 @@ test "math as MathML" {
     expect_mathml("\\mathbb{R}", "<mi>\u{211d}</mi>")!;
     expect_mathml("a\\,b", "<mrow><mi>a</mi><mspace width=\"0.1667em\"></mspace><mi>b</mi></mrow>")!;
     expect_mathml("\\hat{x}", "<mover accent=\"true\"><mi>x</mi><mo stretchy=\"false\">\u{2c6}</mo></mover>")!;
+    expect_mathml("\\phantom{x}", "<mphantom><mi>x</mi></mphantom>")!;
+    expect_mathml("\\hphantom{x}", "<mpadded height=\"0\" depth=\"0\"><mphantom><mi>x</mi></mphantom></mpadded>")!;
+    expect_mathml("\\mathstrut", "<mpadded width=\"0\"><mphantom><mo stretchy=\"false\">(</mo></mphantom></mpadded>")!;
+    expect_mathml("\\boxed{x}", "<mrow style=\"padding:0.3em;border:0.04em solid\"><mi>x</mi></mrow>")!;
+    let crossed = to_mathml("\\xcancel{x}", Display.INLINE)!;
+    defer mem.free(crossed);
+    @expect(strs.contains(crossed, "to bottom right") and strs.contains(crossed, "to top right"));
     expect_mathml("\\textcolor{#f00}{x}", "<mstyle style=\"color:#f00\"><mi>x</mi></mstyle>")!;
     // (the content's nodes are made after the style's)
     let long =

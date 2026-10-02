@@ -281,11 +281,13 @@ fn construction(mf: *MathFont, gid: u32, vertical: bool) usize {
 // Boxes
 // -----------------------------------------------------------------------------
 
-// A glyph (scale: px per font unit; sx, sy stretch it) or a rule (w by h,
-// from (x, y) up), with its origin at (x, y), y up from the baseline.
+// A glyph (scale: px per font unit; sx, sy stretch it), a rule (w by h,
+// from (x, y) up) or a line (from (x, y) by (w, h), `scale` thick), with
+// its origin at (x, y), y up from the baseline.
 struct Item {
     gid: u32,
     rule: bool,
+    line: bool,
     color: u32,
     x: f64,
     y: f64,
@@ -401,11 +403,18 @@ fn metrics(t: *mut Setter, gid: u32) Metrics {
 }
 
 fn push_glyph(t: *mut Setter, gid: u32, x: f64, y: f64, scale: f64, sx: f64, sy: f64, col: u32) !void {
-    t.items.push(Item.{ gid: gid, rule: false, color: col, x: x, y: y, scale: scale, sx: sx, sy: sy, w: 0.0, h: 0.0 })!;
+    t.items.push(Item.{ gid: gid, rule: false, line: false, color: col, x: x, y: y, scale: scale, sx: sx, sy: sy,
+                        w: 0.0, h: 0.0 })!;
 }
 
 fn push_rule(t: *mut Setter, x: f64, y: f64, w: f64, h: f64, col: u32) !void {
-    t.items.push(Item.{ gid: 0, rule: true, color: col, x: x, y: y, scale: 0.0, sx: 1.0, sy: 1.0, w: w, h: h })!;
+    t.items.push(Item.{ gid: 0, rule: true, line: false, color: col, x: x, y: y, scale: 0.0, sx: 1.0, sy: 1.0, w: w,
+                        h: h })!;
+}
+
+fn push_line(t: *mut Setter, x: f64, y: f64, dx: f64, dy: f64, thick: f64, col: u32) !void {
+    t.items.push(Item.{ gid: 0, rule: false, line: true, color: col, x: x, y: y, scale: thick, sx: 1.0, sy: 1.0, w: dx,
+                        h: dy })!;
 }
 
 // One glyph as a box.
@@ -822,11 +831,12 @@ fn lay(t: *mut Setter, i: u32, st: St) !Box {
             }
             return lay_limits(t, i, st);
         }
-        .ACCENT => { return lay_accent(t, i, st); }
-        .FENCE  => { return lay_fence(t, i, st); }
-        .TABLE  => { return lay_table(t, i, st); }
-        .TROW   => { return empty_box(t); }
-        .TCELL  => { return lay(t, n.a, plain(st)); }
+        .ACCENT  => { return lay_accent(t, i, st); }
+        .ENCLOSE => { return lay_enclose(t, i, st); }
+        .FENCE   => { return lay_fence(t, i, st); }
+        .TABLE   => { return lay_table(t, i, st); }
+        .TROW    => { return empty_box(t); }
+        .TCELL   => { return lay(t, n.a, plain(st)); }
         .STYLE => {
             let mut s = plain(st);
             if n.sl != 0 {
@@ -1281,6 +1291,57 @@ fn lay_accent(t: *mut Setter, i: u32, st0: St) !Box {
     return b;
 }
 
+fn lay_enclose(t: *mut Setter, i: u32, st0: St) !Box {
+    let n = t.f.node(i);
+    let st = plain(st0);
+    let mut b = lay(t, n.a, st)!;
+    b.glyph = false;
+    if (n.cls == m.E_PHANTOM) or (n.cls == m.E_HPHANTOM) or (n.cls == m.E_VPHANTOM) {
+        t.items.truncate(b.start);
+        b.end = b.start;
+        if n.cls == m.E_HPHANTOM {
+            b.h = 0.0;
+            b.d = 0.0;
+        } else if n.cls == m.E_VPHANTOM {
+            b.w = 0.0;
+        }
+        return b;
+    }
+    let th = px(t, st, FRACTION_RULE_THICKNESS);
+    if n.cls == m.E_BOX {
+        // TeX's \fbox: 3pt (0.3em) inside a rule
+        let pad = 0.3 * em(st);
+        shift(t, &b, pad + th, 0.0);
+        let w = b.w + (2.0 * (pad + th));
+        let top = b.h + pad;
+        let bottom = -(b.d + pad);
+        push_rule(t, 0.0, bottom - th, w, th, st.color)!;
+        push_rule(t, 0.0, top, w, th, st.color)!;
+        push_rule(t, 0.0, bottom, th, top - bottom, st.color)!;
+        push_rule(t, w - th, bottom, th, top - bottom, st.color)!;
+        b.end = t.items.len;
+        b.w = w;
+        b.h = top + th;
+        b.d = -(bottom - th);
+        b.accent_x = w / 2.0;
+        return b;
+    }
+    // strokes from corner to corner of the content, a little beyond it
+    let ext = 0.1 * em(st);
+    let x0 = -ext;
+    let y0 = -(b.d + ext);
+    let w = b.w + (2.0 * ext);
+    let h = b.h + b.d + (2.0 * ext);
+    if (n.cls == m.E_CANCEL) or (n.cls == m.E_XCANCEL) {
+        push_line(t, x0, y0, w, h, th, st.color)!;
+    }
+    if (n.cls == m.E_BCANCEL) or (n.cls == m.E_XCANCEL) {
+        push_line(t, x0, y0 + h, w, -h, th, st.color)!;
+    }
+    b.end = t.items.len;
+    return b;
+}
+
 // Whether a fence's content has \middle delimiters (at its own level).
 fn has_middle(f: *m.Formula, i: u32) bool {
     if i == NIL {
@@ -1515,6 +1576,25 @@ pub struct Typeset {
                 }
                 continue;
             }
+            if it.line {
+                // a quadrilateral `scale` wide about the segment
+                let len = @sqrt((it.w * it.w) + (it.h * it.h));
+                if len <= 0.0 {
+                    continue;
+                }
+                let nx = -it.h / len * it.scale / 2.0;
+                let ny = it.w / len * it.scale / 2.0;
+                let ax = x + it.x;
+                let ay = y - it.y;
+                let bx = ax + it.w;
+                let by = ay - it.h;
+                p.move_to(ax + nx, ay - ny)!;
+                p.line_to(bx + nx, by - ny)!;
+                p.line_to(bx - nx, by + ny)!;
+                p.line_to(ax - nx, ay + ny)!;
+                p.close()!;
+                continue;
+            }
             if (it.sx == 1.0) and (it.sy == 1.0) {
                 self.font.glyph_path(it.gid, p, x + it.x, y - it.y, it.scale)!;
                 continue;
@@ -1700,6 +1780,15 @@ pub fn typeset(f: *m.Formula, fnt: *font.Font, size: f64, display: m.Display) !T
     }
     // the ink's bounds
     for it in out.items.items() {
+        if it.line {
+            let ex = @min(it.x, it.x + it.w) - it.scale;
+            let ey = @min(it.y, it.y + it.h) - it.scale;
+            out.left = @min(out.left, ex);
+            out.right = @max(out.right, @max(it.x, it.x + it.w) + it.scale);
+            out.top = @max(out.top, @max(it.y, it.y + it.h) + it.scale);
+            out.bottom = @max(out.bottom, -ey);
+            continue;
+        }
         if it.rule {
             out.left = @min(out.left, it.x);
             out.right = @max(out.right, it.x + it.w);
@@ -1753,7 +1842,7 @@ fn set(f: *font.Font, tex: []u8, display: m.Display) !Typeset {
 
 fn has_glyph(t: *Typeset, gid: u32) bool {
     for x in t.items.items() {
-        if (not x.rule) and (x.gid == gid) {
+        if (not x.rule) and (not x.line) and (x.gid == gid) {
             return true;
         }
     }
@@ -1819,6 +1908,20 @@ test "typesetting with a MATH table" {
     defer r.deinit();
     @expect(r.items.get(r.items.len - 1).rule);
     @expect(r.items.get(0).x > 0.0);  // the body, after the radical
+    // \phantom keeps the size and drops the ink; \boxed adds four rules; \cancel a line
+    let mut ph = set(&f, "\\phantom{x^2}", m.Display.INLINE)!;
+    defer ph.deinit();
+    @expect((ph.items.len == 0) and (ph.width == b.width) and (ph.height == b.height));
+    let mut hp = set(&f, "\\hphantom{x^2}", m.Display.INLINE)!;
+    defer hp.deinit();
+    @expect((hp.width == b.width) and (hp.height == 0.0));
+    let mut bx = set(&f, "\\boxed{x}", m.Display.INLINE)!;
+    defer bx.deinit();
+    @expect((bx.items.len == 5) and bx.items.get(4).rule and (bx.width > a.width + 12.0));
+    let mut cc = set(&f, "\\xcancel{x}", m.Display.INLINE)!;
+    defer cc.deinit();
+    @expect(cc.items.get(1).line and cc.items.get(2).line);
+    @expect(cc.left < 0.0);
 }
 
 test "SVG and drawing" {
