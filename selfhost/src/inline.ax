@@ -690,54 +690,88 @@ fn propagatable(v: *ir.Value) bool {
     return (k == ir.V_CINT) or (k == ir.V_ZERO) or (k == ir.V_FUNC) or (k == ir.V_GLOBAL) or (k == ir.V_CFP);
 }
 
+fn ipcp_eligible(f: *ir.Func, n: *Node) bool {
+    return not (ir.is_decl(f) or (f.linkage != ir.LINK_INTERNAL) or n.addr_taken or (n.calls == 0) or
+                (f.export_name.len > 0));
+}
+
 // Replaces constant parameters; returns the functions it changed.
+//
+// Each parameter has a lattice value: nil (no call seen yet), a constant, or
+// the function's own val (varying). An argument that is the caller's own
+// parameter carries that parameter's value, so a constant passed into a
+// recursive function, or down a chain of calls (sort -> introsort ->
+// heapsort -> sift_down), reaches all of them. Values only go down, so the
+// iteration ends.
 pub fn ipcp(m: *mut ir.Module) u.List.[*mut ir.Func] {
     let mut changed = u.List.[*mut ir.Func].{ data: u.nil.[*mut ir.Func](), len: 0, cap: 0 };
     build_graph(m);
-    // per function: the constant each parameter always gets (nil: none seen,
-    // the function's own val: varying)
     let consts = u.newn.[[]mut *mut ir.Value](m.funcs.len + 1);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         consts[i] = u.newn.[*mut ir.Value](f.params.len + 1);
-    }
-    for i in 0..m.funcs.len {
-        let mut b = m.funcs.get(i).first;
-        while u.notnil(b) {
-            let mut x = b.first;
-            while u.notnil(x) {
-                let g = callee_of(x);
-                if u.notnil(g) and (x.xs.len != g.params.len) {
-                    let cs = consts[@int_cast(usize, g.aux)];
-                    for k in 0..g.params.len {
-                        cs[k] = g.val;
-                    }
-                } else if u.notnil(g) {
-                    let cs = consts[@int_cast(usize, g.aux)];
-                    for k in 0..x.xs.len {
-                        let a = ir.resolve(x.xs.get(k));
-                        if cs[k] == g.val {
-                            continue;
-                        }
-                        if not propagatable(a) {
-                            cs[k] = g.val;
-                        } else if u.isnil(cs[k]) {
-                            cs[k] = a;
-                        } else if not same_const(cs[k], a) {
-                            cs[k] = g.val;
-                        }
-                    }
-                }
-                x = x.next;
+        if not ipcp_eligible(f, nodes.get(i)) {
+            // called from outside the module, or through a pointer
+            for k in 0..f.params.len {
+                consts[i][k] = f.val;
             }
-            b = b.next;
+        }
+    }
+    let mut again = true;
+    while again {
+        again = false;
+        for i in 0..m.funcs.len {
+            let h = m.funcs.get(i);
+            let hcs = consts[i];
+            let mut b = h.first;
+            while u.notnil(b) {
+                let mut x = b.first;
+                while u.notnil(x) {
+                    let g = callee_of(x);
+                    if u.notnil(g) {
+                        let cs = consts[@int_cast(usize, g.aux)];
+                        for k in 0..g.params.len {
+                            if cs[k] == g.val {
+                                continue;
+                            }
+                            let mut a = g.val;
+                            if x.xs.len == g.params.len {
+                                a = ir.resolve(x.xs.get(k));
+                                let pi = @int_cast(usize, a.cv);
+                                if (a.kind == ir.V_PARAM) and (pi < h.params.len) and (h.params[pi] == a) {
+                                    let pc = hcs[pi];
+                                    if u.isnil(pc) {
+                                        continue;  // nothing known yet
+                                    }
+                                    a = pc;
+                                    if pc == h.val {
+                                        a = g.val;
+                                    }
+                                } else if not propagatable(a) {
+                                    a = g.val;
+                                }
+                            }
+                            if a == g.val {
+                                cs[k] = g.val;
+                                again = true;
+                            } else if u.isnil(cs[k]) {
+                                cs[k] = a;
+                                again = true;
+                            } else if not same_const(cs[k], a) {
+                                cs[k] = g.val;
+                                again = true;
+                            }
+                        }
+                    }
+                    x = x.next;
+                }
+                b = b.next;
+            }
         }
     }
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
-        let n = nodes.get(i);
-        if ir.is_decl(f) or (f.linkage != ir.LINK_INTERNAL) or n.addr_taken or (n.calls == 0) or
-           (f.export_name.len > 0) {
+        if not ipcp_eligible(f, nodes.get(i)) {
             continue;
         }
         let cs = consts[i];
