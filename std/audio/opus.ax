@@ -1,8 +1,10 @@
 // =============================================================================
-// std/audio/opus.ax - Ogg Opus decoding (RFC 6716, RFC 7845).
+// std/audio/opus.ax - Ogg Opus decoding and encoding (RFC 6716, RFC 7845).
 //
 //     let mut s = opus.decode(bytes)!;   // F32 samples at 48 kHz
 //     defer s.deinit();
+//     let ogg = opus.encode(&s, 96000)!;  // bits per second (mem.free it)
+//     opus.encode_to(w, &s, 64000)!;      // to an io.Writer
 //
 // Every mode of Opus: SILK (narrow, medium and wide band, 10-60 ms frames,
 // stereo prediction, low bit-rate redundancy), CELT (2.5-20 ms frames,
@@ -11,12 +13,21 @@
 // channels). The pre-skip and the last page's granule position trim the
 // output, and the header's output gain is applied. Ported from libopus
 // (opus/): the output follows libopus's floating point decoder.
+//
+// Encoding writes CELT-only frames of 20 ms at a constant bit-rate (6 to
+// 510 kb/s), mono or stereo (mid/side with intensity stereo at the top
+// bands), from a sound of any rate (resampled to 48 kHz) and format: a
+// simple encoder (long blocks, no pitch pre-filter or dynamic allocation)
+// whose streams libopus, ffmpeg and this decoder read.
 // =============================================================================
 
 import "../audio.ax" as audio;
 import "../collections/vec.ax" as vec;
+import "../io.ax" as io;
 import "../mem.ax" as mem;
+import "../str.ax" as strs;
 import "ogg.ax" as ogg;
+import "opus/celt.ax" as celt;
 import "opus/decoder.ax" as dec;
 
 error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
@@ -216,8 +227,157 @@ pub fn decode(data: []u8) !audio.Sound {
 // Tests
 // -----------------------------------------------------------------------------
 
+import "../math.ax" as math;
 import "../os/fs.ax" as fs;
-import "../str.ax" as strs;
+
+// -----------------------------------------------------------------------------
+// Encoding
+// -----------------------------------------------------------------------------
+
+// The encoder's delay, in samples at 48 kHz: the decoder drops this many.
+const PRE_SKIP: usize = 120;
+
+// Pages of an Ogg stream, written as they fill.
+struct OggOut {
+    w: io.Writer,
+    serial: u32,
+    seq: u32,
+    body: strs.String,
+    lacing: [255]u8,
+    nlace: usize,
+
+    fn add(self: *mut OggOut, packet: []u8) !void {
+        let need = (packet.len / 255) + 1;
+        if (self.nlace + need) > 255 {
+            self.flush(0, 0, false)!;
+        }
+        let mut left = packet.len;
+        while left >= 255 {
+            self.lacing[self.nlace] = 255;
+            self.nlace += 1;
+            left -= 255;
+        }
+        self.lacing[self.nlace] = @truncate(u8, left);
+        self.nlace += 1;
+        self.body.push_str(packet)!;
+    }
+
+    // Writes the packets so far as a page ending at granule.
+    fn flush(self: *mut OggOut, flags: u8, granule: u64, force: bool) !void {
+        if (self.nlace == 0) and not force {
+            return;
+        }
+        let mut h: [282]u8 = [0; 282];
+        @mem_copy(h[..4], "OggS");
+        h[5] = flags;
+        for i in @as(usize, 0)..8 {
+            h[6 + i] = @truncate(u8, granule >> @as(u64, 8 * i));
+        }
+        for i in @as(usize, 0)..4 {
+            h[14 + i] = @truncate(u8, self.serial >> @truncate(u32, 8 * i));
+            h[18 + i] = @truncate(u8, self.seq >> @truncate(u32, 8 * i));
+        }
+        h[26] = @truncate(u8, self.nlace);
+        @mem_copy(h[27..27 + self.nlace], self.lacing[..self.nlace]);
+        let hl = 27 + self.nlace;
+        let mut both = strs.String.init();
+        defer both.deinit();
+        both.push_str(h[..hl])!;
+        both.push_str(self.body.bytes())!;
+        let c = ogg.crc32(both.bytes());
+        let b = both.bytes();
+        for i in @as(usize, 0)..4 {
+            b[22 + i] = @truncate(u8, c >> @truncate(u32, 8 * i));
+        }
+        self.w.write_all(b)!;
+        self.seq += 1;
+        self.nlace = 0;
+        self.body.clear();
+    }
+}
+
+/// Encodes s as Ogg Opus at about bitrate bits per second (CBR; 6000 to
+/// 510000, per stream), into new memory (free it with mem.free). Sounds
+/// that are not 48 kHz are resampled; more than two channels are
+/// Unsupported.
+pub fn encode(s: *audio.Sound, bitrate: u32) ![]mut u8 {
+    let mut out = strs.String.init();
+    encode_to(out.writer(), s, bitrate) catch |e| {
+        out.deinit();
+        return e;
+    };
+    return out.take();
+}
+
+/// encode, writing the stream to w as it is produced (a page a second).
+pub fn encode_to(w: io.Writer, s: *audio.Sound, bitrate: u32) !void {
+    if (s.channels < 1) or (s.channels > 2) {
+        return error.Unsupported;
+    }
+    let mut src = s.convert(audio.SampleFormat.F32)!;
+    defer src.deinit();
+    if src.rate != 48000 {
+        let r = src.resample(48000)!;
+        src.deinit();
+        src = r;
+    }
+    let ch = s.channels;
+    let rate = @min(@max(bitrate, 6000), 510000);
+    // bytes per 20 ms packet, the TOC byte included
+    let packet_bytes = @min(@max(@as(usize, rate / 400), 9), 1276);
+    let st = celt.new_encoder(@as(i32, @truncate(u8, ch)), @bit_cast(i32, rate / 1000))!;
+    defer mem.free(st);
+    let mut o = OggOut.{ w: w, serial: 0x4158494f, seq: 0, body: strs.String.init(), lacing: [0; 255], nlace: 0 };
+    defer o.body.deinit();
+    // OpusHead and OpusTags, each on its own page
+    let mut head: [19]u8 = [0; 19];
+    @mem_copy(head[..8], "OpusHead");
+    head[8] = 1;
+    head[9] = @truncate(u8, ch);
+    head[10] = @truncate(u8, PRE_SKIP);
+    head[11] = @truncate(u8, PRE_SKIP >> 8);
+    let in_rate = s.rate;
+    for i in @as(usize, 0)..4 {
+        head[12 + i] = @truncate(u8, in_rate >> @truncate(u32, 8 * i));
+    }
+    o.add(head[..])!;
+    o.flush(2, 0, false)!;
+    let vendor = "axiom std/audio/opus";
+    let mut tags: [36]u8 = [0; 36];
+    @mem_copy(tags[..8], "OpusTags");
+    tags[8] = @truncate(u8, vendor.len);
+    @mem_copy(tags[12..12 + vendor.len], vendor);
+    o.add(tags[..12 + vendor.len + 4])!;
+    o.flush(0, 0, false)!;
+    // audio: enough frames to cover the delay too
+    let total = src.frames + PRE_SKIP;
+    let nframes = (total + (celt.ENC_FRAME - 1)) / celt.ENC_FRAME;
+    let samples = src.samples_f32();
+    let mut pcm: [1920]f32 = [0.0; 1920];
+    let mut packet: [1276]u8 = [0; 1276];
+    packet[0] = (31 << 3) | (@truncate(u8, ch - 1) << 2);  // CELT, fullband, 20 ms, one frame
+    for f in @as(usize, 0)..nframes {
+        let first = f * celt.ENC_FRAME;
+        for i in @as(usize, 0)..(celt.ENC_FRAME * ch) {
+            let at = (first * ch) + i;
+            if at < samples.len {
+                pcm[i] = samples[at];
+            } else {
+                pcm[i] = 0.0;
+            }
+        }
+        if not celt.encode(&mut st[0], pcm[..celt.ENC_FRAME * ch], packet[1..packet_bytes]) {
+            return error.InvalidAudio;  // (cannot happen: the frame always fits)
+        }
+        o.add(packet[..packet_bytes])!;
+        let last = f == (nframes - 1);
+        if last {
+            o.flush(4, @as(u64, total), true)!;
+        } else if ((f + 1) % 50) == 0 {
+            o.flush(0, @as(u64, (f + 1) * celt.ENC_FRAME), false)!;
+        }
+    }
+}
 
 fn field(line: []u8, n: usize) []u8 {
     let mut k: usize = 0;
@@ -300,4 +460,91 @@ test "survives damaged packets" {
         let mut used: usize = 0;
         _ = dec.decode_packet(&mut st.s.items()[it % 2][0], pb[..n], false, buf, &mut used);
     }
+}
+
+fn test_sound(channels: usize, frames: usize, rate: u32) !audio.Sound {
+    let mut s = audio.Sound.init(frames, channels, rate, audio.SampleFormat.F32)!;
+    let mut seed: u32 = 1;
+    for i in @as(usize, 0)..frames {
+        let tt = @float_from_int(f64, i) / @float_from_int(f64, rate);
+        for c in @as(usize, 0)..channels {
+            seed = (seed *% 1103515245) +% 12345;
+            let noise = (@float_from_int(f64, (seed >> 16) & 0x7fff) / 32768.0) - 0.5;
+            let f = 440.0 + (220.0 * @float_from_int(f64, c));
+            let v =
+                ((0.3 * math.sin((2.0 * math.PI) * f * tt)) + (0.2 * math.sin((2.0 * math.PI) * 3000.0 * tt * tt))) +
+                (0.05 * noise);
+            s.set(i, c, v);
+        }
+    }
+    return s;
+}
+
+// The signal-to-noise ratio of b against a (same length and channels), in dB.
+fn snr_db(a: *audio.Sound, b: *audio.Sound) f64 {
+    let mut sig: f64 = 0.0;
+    let mut err: f64 = 0.0;
+    for i in @as(usize, 0)..a.frames {
+        for c in @as(usize, 0)..a.channels {
+            let x = a.get(i, c);
+            let d = x - b.get(i, c);
+            sig += x * x;
+            err += d * d;
+        }
+    }
+    return 10.0 * math.log10(sig / (err + 1e-30));
+}
+
+test "encoding: round trips through the decoder" {
+    for channels in @as(usize, 1)..3 {
+        let mut s = test_sound(channels, 48000, 48000)!;
+        defer s.deinit();
+        let bytes = encode(&s, @truncate(u32, 64000 * channels))!;
+        defer mem.free(bytes);
+        @expect(is_opus(bytes));
+        // a constant size: 160 bytes a channel for 20 ms at 64 kb/s
+        let mut back = decode(bytes)!;
+        defer back.deinit();
+        @expect_eq(back.frames, s.frames);  // the pre-skip and end trimming line up
+        @expect_eq(back.channels, channels);
+        @expect_eq(back.rate, 48000);
+        @expect(snr_db(&s, &back) > 12.0);
+        // and to a writer, the same bytes
+        let mut w = strs.String.init();
+        defer w.deinit();
+        encode_to(w.writer(), &s, @truncate(u32, 64000 * channels))!;
+        @expect_eq(w.bytes(), bytes);
+    }
+}
+
+test "encoding: bit-rates, rates and silence" {
+    let mut s = test_sound(1, 30000, 44100)!;  // resampled to 48 kHz
+    defer s.deinit();
+    let mut r = s.resample(48000)!;
+    defer r.deinit();
+    let rates: [4]u32 = [6000, 24000, 128000, 510000];
+    for rate in rates {
+        let bytes = encode(&s, rate)!;
+        defer mem.free(bytes);
+        let mut back = decode(bytes)!;
+        defer back.deinit();
+        @expect_eq(back.frames, r.frames);
+        if rate >= 128000 {
+            @expect(snr_db(&r, &back) > 20.0);
+        }
+    }
+    let mut quiet = audio.Sound.init(4800, 2, 48000, audio.SampleFormat.S16)!;
+    defer quiet.deinit();
+    let q = encode(&quiet, 32000)!;
+    defer mem.free(q);
+    let mut qb = decode(q)!;
+    defer qb.deinit();
+    @expect(qb.peak() < 0.001);
+    let mut three = audio.Sound.init(10, 3, 48000, audio.SampleFormat.F32)!;
+    defer three.deinit();
+    _ = encode(&three, 64000) catch |e| {
+        @expect(e == error.Unsupported);
+        return;
+    };
+    @trap();
 }

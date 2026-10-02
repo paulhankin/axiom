@@ -1,7 +1,7 @@
 // =============================================================================
-// std/audio/opus/range.ax - Opus's range decoder (RFC 6716 section 4.1), as
-// libopus implements it (celt/entdec.c): symbols from the front of a frame,
-// raw bits from its end.
+// std/audio/opus/range.ax - Opus's range decoder and encoder (RFC 6716
+// section 4.1), as libopus implements them (celt/entdec.c, celt/entenc.c):
+// symbols from the front of a frame, raw bits from its end.
 // =============================================================================
 
 pub const BITRES: u32 = 3;
@@ -13,6 +13,7 @@ const CODE_TOP: u32 = 0x80000000;
 const CODE_BOT: u32 = 0x800000;
 const CODE_EXTRA: u32 = 7;
 const UINT_BITS: u32 = 8;
+const CODE_SHIFT: u32 = (CODE_BITS - SYM_BITS) - 1;
 
 /// The number of bits needed to write v (0 for 0).
 pub fn ilog(v: u32) i32 {
@@ -209,4 +210,264 @@ pub struct Dec {
         }
         return nbits -% l;
     }
+}
+
+/// The range encoder: fills a frame of a fixed size (the bytes it does not
+/// need are zero).
+pub struct Enc {
+    buf: []mut u8,
+    storage: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    offs: u32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    err: bool,
+
+    pub fn init(buf: []mut u8) Enc {
+        return Enc.{ buf: buf, storage: @truncate(u32, buf.len), end_offs: 0, end_window: 0, nend_bits: 0,
+                     nbits_total: @bit_cast(i32, CODE_BITS + 1), offs: 0, rng: CODE_TOP, val: 0, ext: 0, rem: -1,
+                     err: false };
+    }
+
+    fn write_byte(self: *mut Enc, v: u32) void {
+        if (self.offs + self.end_offs) >= self.storage {
+            self.err = true;
+            return;
+        }
+        self.buf[@as(usize, self.offs)] = @truncate(u8, v);
+        self.offs += 1;
+    }
+
+    fn write_byte_at_end(self: *mut Enc, v: u32) void {
+        if (self.offs + self.end_offs) >= self.storage {
+            self.err = true;
+            return;
+        }
+        self.end_offs += 1;
+        self.buf[@as(usize, self.storage - self.end_offs)] = @truncate(u8, v);
+    }
+
+    // Outputs a symbol, holding back runs of 0xff until a carry is known.
+    fn carry_out(self: *mut Enc, c: i32) void {
+        if c != @bit_cast(i32, SYM_MAX) {
+            let carry = c >> @bit_cast(u32, SYM_BITS);
+            if self.rem >= 0 {
+                self.write_byte(@bit_cast(u32, self.rem + carry));
+            }
+            if self.ext > 0 {
+                let sym = @bit_cast(u32, @bit_cast(i32, SYM_MAX) + carry) & SYM_MAX;
+                loop {
+                    self.write_byte(sym);
+                    self.ext -= 1;
+                    if self.ext == 0 {
+                        break;
+                    }
+                }
+            }
+            self.rem = c & @bit_cast(i32, SYM_MAX);
+        } else {
+            self.ext += 1;
+        }
+    }
+
+    fn normalize(self: *mut Enc) void {
+        while self.rng <= CODE_BOT {
+            self.carry_out(@bit_cast(i32, self.val >> CODE_SHIFT));
+            self.val = (self.val << SYM_BITS) & (CODE_TOP - 1);
+            self.rng = self.rng << SYM_BITS;
+            self.nbits_total += @bit_cast(i32, SYM_BITS);
+        }
+    }
+
+    /// Encodes the symbol [fl, fh) of a total frequency ft.
+    pub fn encode(self: *mut Enc, fl: u32, fh: u32, ft: u32) void {
+        let r = self.rng / ft;
+        if fl > 0 {
+            self.val +%= self.rng -% (r *% (ft - fl));
+            self.rng = r *% (fh - fl);
+        } else {
+            self.rng -%= r *% (ft - fh);
+        }
+        self.normalize();
+    }
+
+    /// encode with ft = 2^bits.
+    pub fn encode_bin(self: *mut Enc, fl: u32, fh: u32, bits: u32) void {
+        let r = self.rng >> bits;
+        if fl > 0 {
+            self.val +%= self.rng -% (r *% ((@as(u32, 1) << bits) - fl));
+            self.rng = r *% (fh - fl);
+        } else {
+            self.rng -%= r *% ((@as(u32, 1) << bits) - fh);
+        }
+        self.normalize();
+    }
+
+    /// A bit that is 1 with probability 1/2^logp.
+    pub fn bit_logp(self: *mut Enc, v: bool, logp: u32) void {
+        let mut r = self.rng;
+        let l = self.val;
+        let s = r >> logp;
+        r -= s;
+        if v {
+            self.val = l +% r;
+            self.rng = s;
+        } else {
+            self.rng = r;
+        }
+        self.normalize();
+    }
+
+    /// Symbol s of an inverse CDF of 1/2^ftb units.
+    pub fn icdf(self: *mut Enc, s: i32, t: []u8, ftb: u32) void {
+        let r = self.rng >> ftb;
+        if s > 0 {
+            let a = @as(u32, t[@as(usize, @bit_cast(u32, s - 1))]);
+            let b = @as(u32, t[@as(usize, @bit_cast(u32, s))]);
+            self.val +%= self.rng -% (r *% a);
+            self.rng = r *% (a - b);
+        } else {
+            self.rng -%= r *% @as(u32, t[@as(usize, @bit_cast(u32, s))]);
+        }
+        self.normalize();
+    }
+
+    /// A uniform value fl in [0, ft).
+    pub fn uint(self: *mut Enc, fl: u32, ft0: u32) void {
+        let ft = ft0 - 1;
+        let mut ftb = ilog(ft);
+        if ftb > @bit_cast(i32, UINT_BITS) {
+            ftb -= @bit_cast(i32, UINT_BITS);
+            let sh = @bit_cast(u32, ftb);
+            let ft1 = (ft >> sh) + 1;
+            let fl1 = fl >> sh;
+            self.encode(fl1, fl1 + 1, ft1);
+            self.bits(fl & ((@as(u32, 1) << sh) - 1), sh);
+        } else {
+            self.encode(fl, fl + 1, ft + 1);
+        }
+    }
+
+    /// Raw bits, at the end of the frame.
+    pub fn bits(self: *mut Enc, fl: u32, n: u32) void {
+        let mut window = self.end_window;
+        let mut used = self.nend_bits;
+        if (@bit_cast(u32, used) + n) > 32 {
+            loop {
+                self.write_byte_at_end(window & SYM_MAX);
+                window = window >> SYM_BITS;
+                used -= @bit_cast(i32, SYM_BITS);
+                if used < @bit_cast(i32, SYM_BITS) {
+                    break;
+                }
+            }
+        }
+        window |= fl << @bit_cast(u32, used);
+        used += @bit_cast(i32, n);
+        self.end_window = window;
+        self.nend_bits = used;
+        self.nbits_total += @bit_cast(i32, n);
+    }
+
+    /// The bits used so far (rounded up).
+    pub fn tell(self: *Enc) i32 {
+        return self.nbits_total - ilog(self.rng);
+    }
+
+    /// The bits used so far, in 1/8 bits.
+    pub fn tell_frac(self: *Enc) u32 {
+        let nbits = @bit_cast(u32, self.nbits_total) << BITRES;
+        let mut l = @bit_cast(u32, ilog(self.rng));
+        let mut r = self.rng >> (l - 16);
+        for _q in @as(u32, 0)..BITRES {
+            r = (r * r) >> 15;
+            let b = r >> 16;
+            l = (l << 1) | b;
+            r = r >> b;
+        }
+        return nbits -% l;
+    }
+
+    /// Flushes the coder: the frame is complete (err says whether it fitted).
+    pub fn done(self: *mut Enc) void {
+        let mut l = @bit_cast(i32, CODE_BITS) - ilog(self.rng);
+        let mut msk = (CODE_TOP - 1) >> @bit_cast(u32, l);
+        let mut end = (self.val +% msk) & ~msk;
+        if (end | msk) >= (self.val +% self.rng) {
+            l += 1;
+            msk = msk >> 1;
+            end = (self.val +% msk) & ~msk;
+        }
+        while l > 0 {
+            self.carry_out(@bit_cast(i32, end >> CODE_SHIFT));
+            end = (end << SYM_BITS) & (CODE_TOP - 1);
+            l -= @bit_cast(i32, SYM_BITS);
+        }
+        if (self.rem >= 0) or (self.ext > 0) {
+            self.carry_out(0);
+        }
+        let mut window = self.end_window;
+        let mut used = self.nend_bits;
+        while used >= @bit_cast(i32, SYM_BITS) {
+            self.write_byte_at_end(window & SYM_MAX);
+            window = window >> SYM_BITS;
+            used -= @bit_cast(i32, SYM_BITS);
+        }
+        if not self.err {
+            let lo = @as(usize, self.offs);
+            let hi = @as(usize, self.storage - self.end_offs);
+            if hi > lo {
+                @mem_set(self.buf[lo..hi], 0);
+            }
+            if used > 0 {
+                if self.end_offs >= self.storage {
+                    self.err = true;
+                } else {
+                    l = -l;
+                    if ((self.offs + self.end_offs) >= self.storage) and (l < used) {
+                        window &= (@as(u32, 1) << @bit_cast(u32, l)) - 1;
+                        self.err = true;
+                    }
+                    let at = @as(usize, (self.storage - self.end_offs) - 1);
+                    self.buf[at] |= @truncate(u8, window);
+                }
+            }
+        }
+    }
+}
+
+test "the encoder and decoder agree" {
+    let mut buf: [256]u8 = [0; 256];
+    let mut e = Enc.init(buf[..]);
+    let icdf: [4]u8 = [200, 100, 30, 0];
+    for i in @as(u32, 0)..20 {
+        e.encode(i % 7, (i % 7) + 1, 9);
+        e.bit_logp((i % 3) == 0, 2 + (i % 5));
+        e.icdf(@bit_cast(i32, i % 4), icdf[..], 8);
+        e.uint(i * 977, 30000);
+        e.bits(i & 7, 3);
+        e.encode_bin(i % 5, (i % 5) + 2, 4);
+    }
+    let te = e.tell();
+    e.done();
+    @expect(not e.err);
+    let mut d = Dec.init(buf[..]);
+    for i in @as(u32, 0)..20 {
+        let s = d.decode(9);
+        @expect_eq(s, i % 7);
+        d.update(s, s + 1, 9);
+        @expect_eq(d.bit_logp(2 + (i % 5)), (i % 3) == 0);
+        @expect_eq(d.icdf(icdf[..], 8), @bit_cast(i32, i % 4));
+        @expect_eq(d.uint(30000), i * 977);
+        @expect_eq(d.bits(3), i & 7);
+        let b = d.decode_bin(4);
+        @expect((b >= (i % 5)) and (b < ((i % 5) + 2)));
+        d.update(i % 5, (i % 5) + 2, 16);
+    }
+    @expect_eq(d.tell(), te);
 }

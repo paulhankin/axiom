@@ -2808,3 +2808,1109 @@ pub fn decode_lost(st: *mut Celt, pcm: []mut f32, frame_size: i32) void {
     st.loss_count = loss_count + 1;
     deemphasis(st, syn, pcm, n, cc, 1);
 }
+
+// =============================================================================
+// The encoder: CELT-only frames of 20 ms (LM 3) at a constant size, from
+// libopus's celt_encoder.c, bands.c, vq.c, quant_bands.c, rate.c and
+// mdct.c with the analysis kept simple: long MDCTs only (no transient
+// detection), no pitch pre-filter, no dynamic allocation boosts, the
+// default allocation trim and spreading; stereo codes mid and side with
+// intensity stereo above a band chosen by the bit-rate.
+// =============================================================================
+
+/// The samples of an encoded frame, per channel.
+pub const ENC_FRAME: usize = 960;
+const ENC_LM: i32 = 3;
+
+/// A CELT encoder of 1 or 2 channels.
+pub struct Encoder {
+    channels: i32,
+    intensity: i32,  // bands from here on are coded as intensity stereo
+    first: bool,
+    last_coded_bands: i32,
+    in_mem: [240]f32,
+    preemph_mem: [2]f32,
+    old_band_e: [42]f32,
+    inp: [2160]f32,
+    freq: [1920]f32,
+    x: [1920]f32,
+    band_e: [42]f32,
+    band_log_e: [42]f32,
+    qerr: [42]f32,  // what the energy quantization left out
+    iy: [256]i32,
+    y: [256]f32,
+}
+
+/// A CELT encoder (in a slice of one; free with mem.free). kbps chooses
+/// where intensity stereo starts.
+pub fn new_encoder(channels: i32, kbps: i32) ![]mut Encoder {
+    let s = mem.alloc_zeroed.[Encoder](1)!;
+    let st = &mut s[0];
+    st.channels = channels;
+    st.first = true;
+    // libopus's thresholds (kb/s) for each band coded as mid and side
+    let thresholds: [21]i32 = [1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 36, 44, 50, 56, 62, 67, 72, 79, 88, 106, 134];
+    st.intensity = 21;
+    for i in @as(usize, 0)..21 {
+        if kbps < thresholds[i] {
+            st.intensity = si(i);
+            break;
+        }
+    }
+    for i in @as(usize, 0)..42 {
+        st.old_band_e[i] = -28.0;
+    }
+    return s;
+}
+
+// The forward MDCT of 1920 points (clt_mdct_forward): inp holds the
+// overlap and the 960 new samples (1080), out gets 960 coefficients.
+fn mdct_forward(inp: []f32, out: []mut f32) void {
+    let n2: usize = 960;
+    let n4: usize = 480;
+    let tw = t.MDCT_TWIDDLES[..];
+    let w = t.WINDOW[..];
+    let mut f: [960]f32 = [0.0; 960];
+    let mut xp1 = OVERLAP >> 1;
+    let mut xp2 = (n2 - 1) + (OVERLAP >> 1);
+    let mut wp1 = OVERLAP >> 1;
+    let mut wp2 = (OVERLAP >> 1) - 1;
+    let mut yp: usize = 0;
+    let q = (OVERLAP + 3) >> 2;
+    for _i in @as(usize, 0)..q {
+        f[yp] = (w[wp2] * inp[xp1 + n2]) + (w[wp1] * inp[xp2]);
+        f[yp + 1] = (w[wp1] * inp[xp1]) - (w[wp2] * inp[xp2 - n2]);
+        yp += 2;
+        xp1 += 2;
+        xp2 -= 2;
+        wp1 += 2;
+        wp2 -%= 2;
+    }
+    wp1 = 0;
+    wp2 = OVERLAP - 1;
+    for _i in q..(n4 - q) {
+        f[yp] = inp[xp2];
+        f[yp + 1] = inp[xp1];
+        yp += 2;
+        xp1 += 2;
+        xp2 -= 2;
+    }
+    for _i in (n4 - q)..n4 {
+        f[yp] = -(w[wp1] * inp[xp1 - n2]) + (w[wp2] * inp[xp2]);
+        f[yp + 1] = (w[wp2] * inp[xp1]) + (w[wp1] * inp[xp2 + n2]);
+        yp += 2;
+        xp1 += 2;
+        xp2 -= 2;
+        wp1 += 2;
+        wp2 -%= 2;
+    }
+    let st = fft_state(0);
+    let scale: f32 = 1.0 / 480.0;
+    let mut f2: [960]f32 = [0.0; 960];
+    for i in @as(usize, 0)..n4 {
+        let t0 = tw[i];
+        let t1 = tw[n4 + i];
+        let re = f[2 * i];
+        let im = f[(2 * i) + 1];
+        let yr = (re * t0) - (im * t1);
+        let yi = (im * t0) + (re * t1);
+        let rev = bitrev(0, i);
+        f2[2 * rev] = yr * scale;
+        f2[(2 * rev) + 1] = yi * scale;
+    }
+    fft_impl(&st, f2[..]);
+    let mut yp1: usize = 0;
+    let mut yp2 = n2 - 1;
+    for i in @as(usize, 0)..n4 {
+        let fr = f2[2 * i];
+        let fi = f2[(2 * i) + 1];
+        out[yp1] = (fi * tw[n4 + i]) - (fr * tw[i]);
+        out[yp2] = (fr * tw[n4 + i]) + (fi * tw[i]);
+        yp1 += 2;
+        yp2 -%= 2;
+    }
+}
+
+// --- PVQ ---------------------------------------------------------------------
+
+// The codeword of the pulses y (icwrs).
+fn icwrs(n: i32, y: []i32) u32 {
+    let mut j = n - 1;
+    let mut i: u32 = 0;
+    if y[us(j)] < 0 {
+        i = 1;
+    }
+    let mut k = iabs(y[us(j)]);
+    loop {
+        j -= 1;
+        i +%= pvq_u(n - j, k);
+        k += iabs(y[us(j)]);
+        if y[us(j)] < 0 {
+            i +%= pvq_u(n - j, k + 1);
+        }
+        if j <= 0 {
+            break;
+        }
+    }
+    return i;
+}
+
+fn iabs(v: i32) i32 {
+    if v < 0 {
+        return -v;
+    }
+    return v;
+}
+
+// The pulse vector of k pulses closest in direction to x (op_pvq_search).
+fn pvq_search(x: []mut f32, iy: []mut i32, k: i32, n: i32, y: []mut f32) void {
+    let nn = us(n);
+    let mut signx: [256]bool = [false; 256];
+    for j in @as(usize, 0)..nn {
+        signx[j] = x[j] < 0.0;
+        x[j] = @abs(x[j]);
+        iy[j] = 0;
+        y[j] = 0.0;
+    }
+    let mut xy: f32 = 0.0;
+    let mut yy: f32 = 0.0;
+    let mut pulses_left = k;
+    if k > (n >> 1) {
+        let mut sum: f32 = 0.0;
+        for j in @as(usize, 0)..nn {
+            sum = sum + x[j];
+        }
+        if not ((sum > EPSILON) and (sum < 64.0)) {
+            x[0] = 1.0;
+            for j in @as(usize, 1)..nn {
+                x[j] = 0.0;
+            }
+            sum = 1.0;
+        }
+        let rcp = (@float_from_int(f32, k) + 0.8) * (1.0 / sum);
+        for j in @as(usize, 0)..nn {
+            iy[j] = @int_from_float(i32, @floor(rcp * x[j]));
+            y[j] = @float_from_int(f32, iy[j]);
+            yy = yy + (y[j] * y[j]);
+            xy = xy + (x[j] * y[j]);
+            y[j] = y[j] * 2.0;
+            pulses_left -= iy[j];
+        }
+    }
+    if pulses_left > (n + 3) {
+        let tmp = @float_from_int(f32, pulses_left);
+        yy = yy + (tmp * tmp);
+        yy = yy + (tmp * y[0]);
+        iy[0] += pulses_left;
+        pulses_left = 0;
+    }
+    for _p in @as(i32, 0)..pulses_left {
+        yy = yy + 1.0;
+        let mut rxy = xy + x[0];
+        let mut ryy = yy + y[0];
+        rxy = rxy * rxy;
+        let mut best_den = ryy;
+        let mut best_num = rxy;
+        let mut best_id: usize = 0;
+        for j in @as(usize, 1)..nn {
+            rxy = xy + x[j];
+            ryy = yy + y[j];
+            rxy = rxy * rxy;
+            if (best_den * rxy) > (ryy * best_num) {
+                best_den = ryy;
+                best_num = rxy;
+                best_id = j;
+            }
+        }
+        xy = xy + x[best_id];
+        yy = yy + y[best_id];
+        y[best_id] = y[best_id] + 2.0;
+        iy[best_id] += 1;
+    }
+    for j in @as(usize, 0)..nn {
+        if signx[j] {
+            iy[j] = -iy[j];
+        }
+    }
+}
+
+// --- Bands -------------------------------------------------------------------
+
+struct EncBand {
+    enc: *mut rc.Enc,
+    i: i32,
+    intensity: i32,
+    spread: i32,
+    remaining_bits: i32,
+    band_e: []f32,  // linear band energies of both channels (intensity stereo)
+    iy: []mut i32,
+    y: []mut f32,
+}
+
+fn alg_quant(ctx: *mut EncBand, x: []mut f32, n: i32, k: i32, b: i32) void {
+    exp_rotation(x, n, 1, b, k, ctx.spread);
+    pvq_search(x, ctx.iy, k, n, ctx.y);
+    ctx.enc.uint(icwrs(n, ctx.iy), pvq_u(n, k) + pvq_u(n, k + 1));
+}
+
+// The angle between the energies of x and y (or of mid and side), in
+// 1/16384 of a quarter turn.
+fn stereo_itheta(x: []f32, y: []f32, stereo: bool, n: i32) i32 {
+    let mut emid: f32 = EPSILON;
+    let mut eside: f32 = EPSILON;
+    if stereo {
+        for i in @as(usize, 0)..us(n) {
+            let m = (0.5 * x[i]) + (0.5 * y[i]);
+            let s = (0.5 * x[i]) - (0.5 * y[i]);
+            emid = emid + (m * m);
+            eside = eside + (s * s);
+        }
+    } else {
+        emid = emid + inner_prod(x, x, us(n));
+        eside = eside + inner_prod(y, y, us(n));
+    }
+    let mid = sqrtf(emid);
+    let side = sqrtf(eside);
+    let a = math.atan2(@float_cast(f64, side), @float_cast(f64, mid));
+    return @int_from_float(i32, @floor(0.5 + ((16384.0 * 0.63662) * a)));
+}
+
+fn intensity_stereo(ctx: *EncBand, x: []mut f32, y: []f32, n: i32) void {
+    let left = ctx.band_e[us(ctx.i)];
+    let right = ctx.band_e[NB_EBANDS + us(ctx.i)];
+    let norm = EPSILON + sqrtf((EPSILON + (left * left)) + (right * right));
+    let a1 = left / norm;
+    let a2 = right / norm;
+    for j in @as(usize, 0)..us(n) {
+        x[j] = (a1 * x[j]) + (a2 * y[j]);
+    }
+}
+
+fn stereo_split(x: []mut f32, y: []mut f32, n: i32) void {
+    for j in @as(usize, 0)..us(n) {
+        let l = 0.70710678 * x[j];
+        let r = 0.70710678 * y[j];
+        x[j] = l + r;
+        y[j] = r - l;
+    }
+}
+
+// compute_theta, encoding: the split of a band (halves in time, or mid and
+// side) and its angle.
+fn enc_theta(ctx: *mut EncBand, sp: *mut Split, x: []mut f32, y: []mut f32, n: i32, b: *mut i32, b0: i32, lm: i32,
+             stereo: bool) void {
+    let e = ctx.enc;
+    let i = ctx.i;
+    let pulse_cap = @as(i32, t.LOGN[us(i)]) + (lm * (1 << 3));
+    let mut off = QTHETA_OFFSET;
+    if stereo and (n == 2) {
+        off = QTHETA_OFFSET_TWOPHASE;
+    }
+    let offset = (pulse_cap >> 1) - off;
+    let mut qn = compute_qn(n, b.*, offset, pulse_cap, stereo);
+    if stereo and (i >= ctx.intensity) {
+        qn = 1;
+    }
+    let mut itheta = stereo_itheta(x, y, stereo, n);
+    let tell = @bit_cast(i32, e.tell_frac());
+    let mut inv = false;
+    if qn != 1 {
+        itheta = ((itheta * qn) + 8192) >> 14;
+        if stereo and (n > 2) {
+            let p0: i32 = 3;
+            let xx = itheta;
+            let x0 = qn / 2;
+            let ft = (p0 * (x0 + 1)) + x0;
+            if xx <= x0 {
+                e.encode(@bit_cast(u32, p0 * xx), @bit_cast(u32, p0 * (xx + 1)), @bit_cast(u32, ft));
+            } else {
+                e.encode(@bit_cast(u32, ((xx - 1) - x0) + ((x0 + 1) * p0)), @bit_cast(u32, (xx - x0) + ((x0 + 1) * p0)),
+                         @bit_cast(u32, ft));
+            }
+        } else if (b0 > 1) or stereo {
+            e.uint(@bit_cast(u32, itheta), @bit_cast(u32, qn + 1));
+        } else {
+            let ft = ((qn >> 1) + 1) * ((qn >> 1) + 1);
+            let mut fs = (qn + 1) - itheta;
+            let mut fl = ft - ((((qn + 1) - itheta) * ((qn + 2) - itheta)) >> 1);
+            if itheta <= (qn >> 1) {
+                fs = itheta + 1;
+                fl = (itheta * (itheta + 1)) >> 1;
+            }
+            e.encode(@bit_cast(u32, fl), @bit_cast(u32, fl + fs), @bit_cast(u32, ft));
+        }
+        itheta = udiv(itheta * 16384, qn);
+        if stereo {
+            if itheta == 0 {
+                intensity_stereo(ctx, x, y, n);
+            } else {
+                stereo_split(x, y, n);
+            }
+        }
+    } else if stereo {
+        inv = itheta > 8192;
+        if inv {
+            for j in @as(usize, 0)..us(n) {
+                y[j] = -y[j];
+            }
+        }
+        intensity_stereo(ctx, x, y, n);
+        if (b.* > (2 << 3)) and (ctx.remaining_bits > (2 << 3)) {
+            e.bit_logp(inv, 2);
+        } else {
+            inv = false;
+        }
+        itheta = 0;
+    }
+    let qalloc = @bit_cast(i32, e.tell_frac()) - tell;
+    b.* -= qalloc;
+    let mut delta: i32 = 0;
+    if itheta == 0 {
+        delta = -16384;
+    } else if itheta == 16384 {
+        delta = 16384;
+    } else {
+        let imid = bitexact_cos(itheta);
+        let iside = bitexact_cos(16384 - itheta);
+        delta = frac_mul16((n - 1) << 7, bitexact_log2tan(iside, imid));
+    }
+    sp.inv = inv;
+    sp.delta = delta;
+    sp.itheta = itheta;
+    sp.qalloc = qalloc;
+}
+
+fn enc_band_n1(ctx: *mut EncBand, x: []f32, y: []f32) void {
+    let stereo = y.len > 0;
+    let mut c: i32 = 0;
+    loop {
+        if ctx.remaining_bits >= (1 << 3) {
+            let mut v = x[0];
+            if c == 1 {
+                v = y[0];
+            }
+            let mut sign: u32 = 0;
+            if v < 0.0 {
+                sign = 1;
+            }
+            ctx.enc.bits(sign, 1);
+            ctx.remaining_bits -= 1 << 3;
+        }
+        c += 1;
+        if (not stereo) or (c >= 2) {
+            break;
+        }
+    }
+}
+
+fn enc_partition(ctx: *mut EncBand, x: []mut f32, n0: i32, b0: i32, bb: i32, lm0: i32) void {
+    let mut n = n0;
+    let mut b = b0;
+    let mut lm = lm0;
+    let i = ctx.i;
+    let c = cache_of(i, lm);
+    if (lm != -1) and (b > (@as(i32, t.CACHE_BITS[c + @as(usize, t.CACHE_BITS[c])]) + 12)) and (n > 2) {
+        n = n >> 1;
+        let y = x[us(n)..];
+        lm -= 1;
+        let bb2 = (bb + 1) >> 1;
+        let mut sp = Split.{ inv: false, imid: 0, iside: 0, delta: 0, itheta: 0, qalloc: 0 };
+        enc_theta(ctx, &mut sp, x[..us(n)], y, n, &mut b, bb, lm, false);
+        let mut delta = sp.delta;
+        let itheta = sp.itheta;
+        if (bb > 1) and ((itheta & 0x3fff) != 0) {
+            if itheta > 8192 {
+                delta -= delta >> @bit_cast(u32, 4 - lm);
+            } else {
+                delta = imin(0, delta + ((n << 3) >> @bit_cast(u32, 5 - lm)));
+            }
+        }
+        let mut mbits = imax(0, imin(b, (b - delta) / 2));
+        let mut sbits = b - mbits;
+        ctx.remaining_bits -= sp.qalloc;
+        let mut rebalance = ctx.remaining_bits;
+        if mbits >= sbits {
+            enc_partition(ctx, x, n, mbits, bb2, lm);
+            rebalance = mbits - (rebalance - ctx.remaining_bits);
+            if (rebalance > (3 << 3)) and (itheta != 0) {
+                sbits += rebalance - (3 << 3);
+            }
+            enc_partition(ctx, y, n, sbits, bb2, lm);
+        } else {
+            enc_partition(ctx, y, n, sbits, bb2, lm);
+            rebalance = sbits - (rebalance - ctx.remaining_bits);
+            if (rebalance > (3 << 3)) and (itheta != 16384) {
+                mbits += rebalance - (3 << 3);
+            }
+            enc_partition(ctx, x, n, mbits, bb2, lm);
+        }
+        return;
+    }
+    let mut q = bits2pulses(i, lm, b);
+    let mut curr_bits = pulses2bits(i, lm, q);
+    ctx.remaining_bits -= curr_bits;
+    while (ctx.remaining_bits < 0) and (q > 0) {
+        ctx.remaining_bits += curr_bits;
+        q -= 1;
+        curr_bits = pulses2bits(i, lm, q);
+        ctx.remaining_bits -= curr_bits;
+    }
+    if q != 0 {
+        alg_quant(ctx, x, n, get_pulses(q), bb);
+    }
+}
+
+fn enc_band(ctx: *mut EncBand, x: []mut f32, n: i32, b: i32, lm: i32) void {
+    if n == 1 {
+        enc_band_n1(ctx, x, x[..0]);
+        return;
+    }
+    enc_partition(ctx, x, n, b, 1, lm);
+}
+
+fn enc_band_stereo(ctx: *mut EncBand, x: []mut f32, y: []mut f32, n: i32, b0: i32, lm: i32) void {
+    let mut b = b0;
+    if n == 1 {
+        enc_band_n1(ctx, x, y);
+        return;
+    }
+    let mut sp = Split.{ inv: false, imid: 0, iside: 0, delta: 0, itheta: 0, qalloc: 0 };
+    enc_theta(ctx, &mut sp, x, y, n, &mut b, 1, lm, true);
+    let itheta = sp.itheta;
+    if n == 2 {
+        let mut sbits: i32 = 0;
+        if (itheta != 0) and (itheta != 16384) {
+            sbits = 1 << 3;
+        }
+        let mbits = b - sbits;
+        ctx.remaining_bits -= sp.qalloc + sbits;
+        let mut x2 = x;
+        let mut y2 = y;
+        if itheta > 8192 {
+            x2 = y;
+            y2 = x;
+        }
+        if sbits != 0 {
+            let mut sign: u32 = 0;
+            if ((x2[0] * y2[1]) - (x2[1] * y2[0])) < 0.0 {
+                sign = 1;
+            }
+            ctx.enc.bits(sign, 1);
+        }
+        enc_band(ctx, x2, n, mbits, lm);
+        return;
+    }
+    let mut mbits = imax(0, imin(b, (b - sp.delta) / 2));
+    let mut sbits = b - mbits;
+    ctx.remaining_bits -= sp.qalloc;
+    let mut rebalance = ctx.remaining_bits;
+    if mbits >= sbits {
+        enc_band(ctx, x, n, mbits, lm);
+        rebalance = mbits - (rebalance - ctx.remaining_bits);
+        if (rebalance > (3 << 3)) and (itheta != 0) {
+            sbits += rebalance - (3 << 3);
+        }
+        enc_band(ctx, y, n, sbits, lm);
+    } else {
+        enc_band(ctx, y, n, sbits, lm);
+        rebalance = sbits - (rebalance - ctx.remaining_bits);
+        if (rebalance > (3 << 3)) and (itheta != 16384) {
+            mbits += rebalance - (3 << 3);
+        }
+        enc_band(ctx, x, n, mbits, lm);
+    }
+}
+
+fn enc_all_bands(st: *mut Encoder, xb: []mut f32, yb: []mut f32, pulses: []i32, spread: i32, dual_stereo: bool,
+                 intensity: i32, total_bits: i32, balance0: i32, e: *mut rc.Enc, lm: i32, coded_bands: i32) void {
+    let mut balance = balance0;
+    let m: i32 = 1 << @bit_cast(u32, lm);
+    let mut ctx = EncBand.{ enc: e, i: 0, intensity: intensity, spread: spread, remaining_bits: 0,
+                            band_e: st.band_e[..], iy: st.iy[..], y: st.y[..] };
+    for i in @as(i32, 0)..NB_EBANDS_I {
+        ctx.i = i;
+        let xo = us(m * eb(us(i)));
+        let n = (m * eb(us(i + 1))) - (m * eb(us(i)));
+        let x = xb[xo..xo + us(n)];
+        let tell = @bit_cast(i32, e.tell_frac());
+        if i != 0 {
+            balance -= tell;
+        }
+        let remaining_bits = (total_bits - tell) - 1;
+        ctx.remaining_bits = remaining_bits;
+        let mut b: i32 = 0;
+        if i <= (coded_bands - 1) {
+            let curr_balance = sudiv(balance, imin(3, coded_bands - i));
+            b = imax(0, imin(16383, imin(remaining_bits + 1, pulses[us(i)] + curr_balance)));
+        }
+        if yb.len > 0 {
+            let y = yb[xo..xo + us(n)];
+            if dual_stereo {
+                enc_band(&mut ctx, x, n, b / 2, lm);
+                enc_band(&mut ctx, y, n, b / 2, lm);
+            } else {
+                enc_band_stereo(&mut ctx, x, y, n, b, lm);
+            }
+        } else {
+            enc_band(&mut ctx, x, n, b, lm);
+        }
+        balance += pulses[us(i)] + tell;
+    }
+}
+
+const NB_EBANDS_I: i32 = 21;
+
+// --- Energy ------------------------------------------------------------------
+
+fn laplace_encode(e: *mut rc.Enc, value: *mut i32, fs0: u32, decay: i32) void {
+    let mut fl: u32 = 0;
+    let mut fs = fs0;
+    let mut val = value.*;
+    if val != 0 {
+        let s: i32 = -@as(i32, b2i(val < 0));
+        val = (val + s) ^ s;
+        fl = fs;
+        fs = @bit_cast(u32, (@bit_cast(i32, (32768 - 32) - fs) * (16384 - decay)) >> 15);
+        let mut i: i32 = 1;
+        while (fs > 0) and (i < val) {
+            fs *= 2;
+            fl += fs + 2;
+            fs = @bit_cast(u32, (@bit_cast(i32, fs) * decay) >> 15);
+            i += 1;
+        }
+        if fs == 0 {
+            let mut ndi_max = @bit_cast(i32, (32768 - fl) + 1 - 1);
+            ndi_max = (ndi_max - s) >> 1;
+            let di = imin(val - i, ndi_max - 1);
+            fl += @bit_cast(u32, ((2 * di) + 1) + s);
+            fs = @min(1, 32768 - fl);
+            value.* = ((i + di) + s) ^ s;
+        } else {
+            fs += 1;
+            fl += fs & ~@bit_cast(u32, s);
+        }
+    }
+    e.encode_bin(fl, fl + fs, 15);
+}
+
+fn quant_coarse_energy(st: *mut Encoder, e: *mut rc.Enc, budget: i32, intra: bool, c: i32, lm: i32,
+                       max_decay: f32) void {
+    let tell = e.tell();
+    if (tell + 3) <= budget {
+        e.bit_logp(intra, 3);
+    }
+    let mut pm = us(lm) * 84;
+    let mut coef: f32 = 0.0;
+    let mut beta = BETA_INTRA;
+    if intra {
+        pm += 42;
+    } else {
+        beta = BETA_COEF[us(lm)];
+        coef = PRED_COEF[us(lm)];
+    }
+    let mut prev: [2]f32 = [0.0, 0.0];
+    for i in @as(i32, 0)..NB_EBANDS_I {
+        for ch in @as(usize, 0)..us(c) {
+            let k = us(i) + (ch * NB_EBANDS);
+            let x = st.band_log_e[k];
+            let old_e = @max(-9.0, st.old_band_e[k]);
+            let f = (x - (coef * old_e)) - prev[ch];
+            let mut qi = @int_from_float(i32, @floor(0.5 + f));
+            let decay_bound = @max(-28.0, st.old_band_e[k]) - max_decay;
+            if (qi < 0) and (x < decay_bound) {
+                qi += @int_from_float(i32, decay_bound - x);
+                if qi > 0 {
+                    qi = 0;
+                }
+            }
+            let tl = e.tell();
+            let bits_left = (budget - tl) - ((3 * c) * (NB_EBANDS_I - i));
+            if (i != 0) and (bits_left < 30) {
+                if bits_left < 24 {
+                    qi = imin(1, qi);
+                }
+                if bits_left < 16 {
+                    qi = imax(-1, qi);
+                }
+            }
+            if (budget - tl) >= 15 {
+                let pi = us(2 * imin(i, 20));
+                laplace_encode(
+                    e, &mut qi, @as(u32, t.E_PROB_MODEL[pm + pi]) << 7, @as(i32, t.E_PROB_MODEL[pm + pi + 1]) << 6);
+            } else if (budget - tl) >= 2 {
+                qi = imax(-1, imin(qi, 1));
+                e.icdf((2 * qi) ^ -@as(i32, b2i(qi < 0)), SMALL_ENERGY_ICDF[..], 2);
+            } else if (budget - tl) >= 1 {
+                qi = imin(0, qi);
+                e.bit_logp(qi != 0, 1);
+            } else {
+                qi = -1;
+            }
+            st.qerr[k] = f - @float_from_int(f32, qi);
+            let q = @float_from_int(f32, qi);
+            st.old_band_e[k] = ((coef * old_e) + prev[ch]) + q;
+            prev[ch] = (prev[ch] + q) - (beta * q);
+        }
+    }
+}
+
+fn quant_fine_energy(st: *mut Encoder, e: *mut rc.Enc, fine_quant: []i32, c: i32) void {
+    for i in @as(usize, 0)..NB_EBANDS {
+        let fq = fine_quant[i];
+        if fq <= 0 {
+            continue;
+        }
+        let frac: i32 = 1 << @bit_cast(u32, fq);
+        for ch in @as(usize, 0)..us(c) {
+            let k = i + (ch * NB_EBANDS);
+            let mut q2 = @int_from_float(i32, @floor((st.qerr[k] + 0.5) * @float_from_int(f32, frac)));
+            q2 = imax(0, imin(frac - 1, q2));
+            e.bits(@bit_cast(u32, q2), @bit_cast(u32, fq));
+            let offset = (
+                ((@float_from_int(f32, q2) + 0.5) * @float_from_int(f32, 1 << @bit_cast(u32,
+                                                                                        14 - fq))) * (1.0 / 16384.0)) -
+                         0.5;
+            st.old_band_e[k] += offset;
+            st.qerr[k] -= offset;
+        }
+    }
+}
+
+fn quant_energy_finalise(st: *mut Encoder, e: *mut rc.Enc, fine_quant: []i32, fine_priority: []i32, bits_left0: i32,
+                         c: i32) void {
+    let mut bits_left = bits_left0;
+    for prio in @as(i32, 0)..2 {
+        let mut i: usize = 0;
+        while (i < NB_EBANDS) and (bits_left >= c) {
+            let fq = fine_quant[i];
+            if (fq >= MAX_FINE_BITS) or (fine_priority[i] != prio) {
+                i += 1;
+                continue;
+            }
+            for ch in @as(usize, 0)..us(c) {
+                let k = i + (ch * NB_EBANDS);
+                let mut q2: u32 = 1;
+                if st.qerr[k] < 0.0 {
+                    q2 = 0;
+                }
+                e.bits(q2, 1);
+                let offset = (
+                    (@float_from_int(f32, q2) - 0.5) * @float_from_int(
+                        f32, 1 << @bit_cast(u32, (14 - fq) - 1))) * (1.0 / 16384.0);
+                st.old_band_e[k] += offset;
+                st.qerr[k] -= offset;
+                bits_left -= 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+// --- Allocation (clt_compute_allocation, encoding) --------------------------
+
+fn interp_bits2pulses_enc(end: i32, skip_start: i32, bits1: []i32, bits2: []i32, thresh: []i32, cap: []i32, total0: i32,
+                          skip_rsv: i32, intensity_rsv0: i32, dual_stereo_rsv0: i32, bits: []mut i32, ebits: []mut i32,
+                          fine_priority: []mut i32, c: i32, lm: i32, e: *mut rc.Enc, prev: i32, signal_bw: i32,
+                          out: *mut Alloc) i32 {
+    let start: i32 = 0;
+    let mut total = total0;
+    let mut intensity_rsv = intensity_rsv0;
+    let mut dual_stereo_rsv = dual_stereo_rsv0;
+    let alloc_floor = c << 3;
+    let stereo: i32 = @as(i32, b2i(c > 1));
+    let log_m = lm << 3;
+    let mut lo: i32 = 0;
+    let mut hi: i32 = 1 << @bit_cast(u32, ALLOC_STEPS);
+    for _q in @as(i32, 0)..ALLOC_STEPS {
+        let mid = (lo + hi) >> 1;
+        let mut psum: i32 = 0;
+        let mut done = false;
+        let mut j = end;
+        while j > start {
+            j -= 1;
+            let tmp = bits1[us(j)] + ((mid * bits2[us(j)]) >> @bit_cast(u32, ALLOC_STEPS));
+            if (tmp >= thresh[us(j)]) or done {
+                done = true;
+                psum += imin(tmp, cap[us(j)]);
+            } else if tmp >= alloc_floor {
+                psum += alloc_floor;
+            }
+        }
+        if psum > total {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let mut psum: i32 = 0;
+    let mut done = false;
+    let mut j = end;
+    while j > start {
+        j -= 1;
+        let mut tmp = bits1[us(j)] + ((lo * bits2[us(j)]) >> @bit_cast(u32, ALLOC_STEPS));
+        if (tmp < thresh[us(j)]) and not done {
+            if tmp >= alloc_floor {
+                tmp = alloc_floor;
+            } else {
+                tmp = 0;
+            }
+        } else {
+            done = true;
+        }
+        tmp = imin(tmp, cap[us(j)]);
+        bits[us(j)] = tmp;
+        psum += tmp;
+    }
+    let mut coded_bands = end;
+    loop {
+        j = coded_bands - 1;
+        if j <= skip_start {
+            total += skip_rsv;
+            break;
+        }
+        let mut left = total - psum;
+        let percoeff = udiv(left, eb(us(coded_bands)) - eb(us(start)));
+        left -= (eb(us(coded_bands)) - eb(us(start))) * percoeff;
+        let rem = imax(left - (eb(us(j)) - eb(us(start))), 0);
+        let band_width = eb(us(coded_bands)) - eb(us(j));
+        let mut band_bits = (bits[us(j)] + (percoeff * band_width)) + rem;
+        if band_bits >= imax(thresh[us(j)], alloc_floor + (1 << 3)) {
+            // the encoder's choice (with hysteresis): keep the band?
+            let mut depth_threshold: i32 = 0;
+            if coded_bands > 17 {
+                depth_threshold = 9;
+                if j < prev {
+                    depth_threshold = 7;
+                }
+            }
+            if (coded_bands <= (start + 2)) or
+               ((band_bits > (((depth_threshold * band_width) << @bit_cast(u32, lm + 3)) >> 4)) and (j <= signal_bw)) {
+                e.bit_logp(true, 1);
+                break;
+            }
+            e.bit_logp(false, 1);
+            psum += 1 << 3;
+            band_bits -= 1 << 3;
+        }
+        psum -= bits[us(j)] + intensity_rsv;
+        if intensity_rsv > 0 {
+            intensity_rsv = @as(i32, LOG2_FRAC_TABLE[us(j - start)]);
+        }
+        psum += intensity_rsv;
+        if band_bits >= alloc_floor {
+            psum += alloc_floor;
+            bits[us(j)] = alloc_floor;
+        } else {
+            bits[us(j)] = 0;
+        }
+        coded_bands -= 1;
+    }
+    if intensity_rsv > 0 {
+        out.intensity = imin(out.intensity, coded_bands);
+        e.uint(@bit_cast(u32, out.intensity - start), @bit_cast(u32, (coded_bands + 1) - start));
+    } else {
+        out.intensity = 0;
+    }
+    if out.intensity <= start {
+        total += dual_stereo_rsv;
+        dual_stereo_rsv = 0;
+    }
+    if dual_stereo_rsv > 0 {
+        e.bit_logp(out.dual_stereo, 1);
+    } else {
+        out.dual_stereo = false;
+    }
+    let mut left = total - psum;
+    let percoeff = udiv(left, eb(us(coded_bands)) - eb(us(start)));
+    left -= (eb(us(coded_bands)) - eb(us(start))) * percoeff;
+    for k in start..coded_bands {
+        bits[us(k)] += percoeff * (eb(us(k + 1)) - eb(us(k)));
+    }
+    for k in start..coded_bands {
+        let tmp = imin(left, eb(us(k + 1)) - eb(us(k)));
+        bits[us(k)] += tmp;
+        left -= tmp;
+    }
+    let mut balance: i32 = 0;
+    j = start;
+    while j < coded_bands {
+        let ju = us(j);
+        let n0 = eb(ju + 1) - eb(ju);
+        let n = n0 << @bit_cast(u32, lm);
+        let bit = bits[ju] + balance;
+        let mut excess: i32 = 0;
+        if n > 1 {
+            excess = imax(bit - cap[ju], 0);
+            bits[ju] = bit - excess;
+            let mut den = c * n;
+            if (c == 2) and (n > 2) and (not out.dual_stereo) and (j < out.intensity) {
+                den += 1;
+            }
+            let nclogn = den * (@as(i32, t.LOGN[ju]) + log_m);
+            let mut offset = (nclogn >> 1) - (den * FINE_OFFSET);
+            if n == 2 {
+                offset += (den << 3) >> 2;
+            }
+            if (bits[ju] + offset) < ((den * 2) << 3) {
+                offset += nclogn >> 2;
+            } else if (bits[ju] + offset) < ((den * 3) << 3) {
+                offset += nclogn >> 3;
+            }
+            ebits[ju] = imax(0, bits[ju] + offset + (den << 2));
+            ebits[ju] = udiv(ebits[ju], den) >> 3;
+            if (c * ebits[ju]) > (bits[ju] >> 3) {
+                ebits[ju] = (bits[ju] >> @bit_cast(u32, stereo)) >> 3;
+            }
+            ebits[ju] = imin(ebits[ju], MAX_FINE_BITS);
+            fine_priority[ju] = @as(i32, b2i((ebits[ju] * (den << 3)) >= (bits[ju] + offset)));
+            bits[ju] -= (c * ebits[ju]) << 3;
+        } else {
+            excess = imax(0, bit - (c << 3));
+            bits[ju] = bit - excess;
+            ebits[ju] = 0;
+            fine_priority[ju] = 1;
+        }
+        if excess > 0 {
+            let extra_fine = imin(excess >> @bit_cast(u32, stereo + 3), MAX_FINE_BITS - ebits[ju]);
+            ebits[ju] += extra_fine;
+            let extra_bits = (extra_fine * c) << 3;
+            fine_priority[ju] = @as(i32, b2i(extra_bits >= (excess - balance)));
+            excess -= extra_bits;
+        }
+        balance = excess;
+        j += 1;
+    }
+    out.balance = balance;
+    while j < end {
+        let ju = us(j);
+        ebits[ju] = (bits[ju] >> @bit_cast(u32, stereo)) >> 3;
+        bits[ju] = 0;
+        fine_priority[ju] = @as(i32, b2i(ebits[ju] < 1));
+        j += 1;
+    }
+    return coded_bands;
+}
+
+fn compute_allocation_enc(cap: []i32, alloc_trim: i32, total0: i32, pulses: []mut i32, ebits: []mut i32,
+                          fine_priority: []mut i32, c: i32, lm: i32, e: *mut rc.Enc, prev: i32, out: *mut Alloc) i32 {
+    let start: i32 = 0;
+    let end = NB_EBANDS_I;
+    let mut total = imax(total0, 0);
+    let len = si(NB_EBANDS);
+    let skip_start = start;
+    let mut skip_rsv: i32 = 0;
+    if total >= (1 << 3) {
+        skip_rsv = 1 << 3;
+    }
+    total -= skip_rsv;
+    let mut intensity_rsv: i32 = 0;
+    let mut dual_stereo_rsv: i32 = 0;
+    if c == 2 {
+        intensity_rsv = @as(i32, LOG2_FRAC_TABLE[us(end - start)]);
+        if intensity_rsv > total {
+            intensity_rsv = 0;
+        } else {
+            total -= intensity_rsv;
+            if total >= (1 << 3) {
+                dual_stereo_rsv = 1 << 3;
+            }
+            total -= dual_stereo_rsv;
+        }
+    }
+    let mut bits1: [21]i32 = [0; 21];
+    let mut bits2: [21]i32 = [0; 21];
+    let mut thresh: [21]i32 = [0; 21];
+    let mut trim_offset: [21]i32 = [0; 21];
+    for j in start..end {
+        let w = eb(us(j + 1)) - eb(us(j));
+        thresh[us(j)] = imax(c << 3, ((3 * w) << @bit_cast(u32, lm + 3)) >> 4);
+        trim_offset[us(j)] = (
+            (((c * w) * ((alloc_trim - 5) - lm)) * ((end - j) - 1)) * (1 << @bit_cast(u32, lm + 3))) >> 6;
+        if (w << @bit_cast(u32, lm)) == 1 {
+            trim_offset[us(j)] -= c << 3;
+        }
+    }
+    let mut lo: i32 = 1;
+    let mut hi: i32 = 11 - 1;
+    loop {
+        let mut done = false;
+        let mut psum: i32 = 0;
+        let mid = (lo + hi) >> 1;
+        let mut j = end;
+        while j > start {
+            j -= 1;
+            let n = eb(us(j + 1)) - eb(us(j));
+            let mut bitsj = (((c * n) * @as(i32, t.BAND_ALLOCATION[us((mid * len) + j)])) << @bit_cast(u32, lm)) >> 2;
+            if bitsj > 0 {
+                bitsj = imax(0, bitsj + trim_offset[us(j)]);
+            }
+            if (bitsj >= thresh[us(j)]) or done {
+                done = true;
+                psum += imin(bitsj, cap[us(j)]);
+            } else if bitsj >= (c << 3) {
+                psum += c << 3;
+            }
+        }
+        if psum > total {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+        if lo > hi {
+            break;
+        }
+    }
+    hi = lo;
+    lo -= 1;
+    for j in start..end {
+        let n = eb(us(j + 1)) - eb(us(j));
+        let mut bits1j = (((c * n) * @as(i32, t.BAND_ALLOCATION[us((lo * len) + j)])) << @bit_cast(u32, lm)) >> 2;
+        let mut bits2j = cap[us(j)];
+        if hi < 11 {
+            bits2j = (((c * n) * @as(i32, t.BAND_ALLOCATION[us((hi * len) + j)])) << @bit_cast(u32, lm)) >> 2;
+        }
+        if bits1j > 0 {
+            bits1j = imax(0, bits1j + trim_offset[us(j)]);
+        }
+        if bits2j > 0 {
+            bits2j = imax(0, bits2j + trim_offset[us(j)]);
+        }
+        bits2j = imax(0, bits2j - bits1j);
+        bits1[us(j)] = bits1j;
+        bits2[us(j)] = bits2j;
+    }
+    return interp_bits2pulses_enc(end, skip_start, bits1[..], bits2[..], thresh[..], cap, total, skip_rsv,
+                                  intensity_rsv, dual_stereo_rsv, pulses, ebits, fine_priority, c, lm, e, prev, end - 1,
+                                  out);
+}
+
+// --- Frames ------------------------------------------------------------------
+
+/// Encodes ENC_FRAME samples per channel (interleaved, nominally +-1) into
+/// exactly out.len bytes (CBR; at least 8). Fails with OutOfMemory never;
+/// returns false if the frame did not fit (it always should).
+pub fn encode(st: *mut Encoder, pcm: []f32, out: []mut u8) bool {
+    let c = st.channels;
+    let cu = us(c);
+    let n = ENC_FRAME;
+    let lm = ENC_LM;
+    let stride = n + OVERLAP;
+    // pre-emphasis, after the overlap kept from the last frame
+    for ch in @as(usize, 0)..cu {
+        let o = ch * stride;
+        @mem_copy(st.inp[o..o + OVERLAP], st.in_mem[ch * OVERLAP..(ch + 1) * OVERLAP]);
+        let mut m = st.preemph_mem[ch];
+        for i in @as(usize, 0)..n {
+            let x = pcm[(i * cu) + ch] * 32768.0;
+            st.inp[o + OVERLAP + i] = x - m;
+            m = PREEMPH * x;
+        }
+        st.preemph_mem[ch] = m;
+        @mem_copy(st.in_mem[ch * OVERLAP..(ch + 1) * OVERLAP], st.inp[o + n..o + stride]);
+    }
+    // the spectrum, its band energies, and the normalized shapes
+    for ch in @as(usize, 0)..cu {
+        let inp = st.inp;
+        mdct_forward(inp[ch * stride..(ch + 1) * stride], st.freq[ch * n..(ch + 1) * n]);
+        for i in @as(usize, 0)..NB_EBANDS {
+            let lo = us(eb(i) << 3);
+            let hi = us(eb(i + 1) << 3);
+            let mut sum: f32 = 1e-27;
+            for j in lo..hi {
+                sum = sum + (st.freq[(ch * n) + j] * st.freq[(ch * n) + j]);
+            }
+            let be = sqrtf(sum);
+            st.band_e[(ch * NB_EBANDS) + i] = be;
+            let g = 1.0 / (1e-27 + be);
+            for j in lo..hi {
+                st.x[(ch * n) + j] = st.freq[(ch * n) + j] * g;
+            }
+            st.band_log_e[(ch * NB_EBANDS) + i] = @float_cast(f32, math.log2(@float_cast(f64, be))) - t.EMEANS[i];
+        }
+    }
+    let nbytes = @bit_cast(i32, @truncate(u32, out.len));
+    let mut e = rc.Enc.init(out);
+    let total_bits = nbytes * 8;
+    // silence (never signalled), no post-filter, long blocks
+    let tell0 = e.tell();
+    if tell0 == 1 {
+        e.bit_logp(false, 15);
+    }
+    if (tell0 + 16) <= total_bits {
+        e.bit_logp(false, 1);
+    }
+    if (lm > 0) and ((e.tell() + 3) <= total_bits) {
+        e.bit_logp(false, 3);
+    }
+    let max_decay = @min(16.0, @float_from_int(f32, nbytes));
+    quant_coarse_energy(st, &mut e, total_bits, st.first, c, lm, max_decay);
+    // tf_res all zero, tf_select 0
+    {
+        let budget = total_bits;
+        let mut tell = e.tell();
+        let mut logp: i32 = 4;
+        let tf_select_rsv = (lm > 0) and (((tell + logp) + 1) <= budget);
+        let mut b = budget;
+        if tf_select_rsv {
+            b -= 1;
+        }
+        for _i in @as(usize, 0)..NB_EBANDS {
+            if (tell + logp) <= b {
+                e.bit_logp(false, @bit_cast(u32, logp));
+                tell = e.tell();
+            }
+            logp = 5;
+        }
+        let base = us(lm) * 8;
+        if tf_select_rsv and (TF_SELECT_TABLE[base] != TF_SELECT_TABLE[base + 2]) {
+            e.bit_logp(false, 1);
+        }
+    }
+    let spread = SPREAD_NORMAL;
+    if (e.tell() + 4) <= total_bits {
+        e.icdf(spread, SPREAD_ICDF[..], 5);
+    }
+    let mut cap: [21]i32 = [0; 21];
+    for i in @as(usize, 0)..NB_EBANDS {
+        let w = (eb(i + 1) - eb(i)) << @bit_cast(u32, lm);
+        cap[i] = (((@as(i32, t.CACHE_CAPS[(NB_EBANDS * us((2 * lm) + (c - 1))) + i]) + 64) * c) * w) >> 2;
+    }
+    // no dynamic allocation boosts
+    let total_frac = total_bits << 3;
+    let mut tellf = @bit_cast(i32, e.tell_frac());
+    for i in @as(usize, 0)..NB_EBANDS {
+        if ((tellf + (6 << 3)) < total_frac) and (0 < cap[i]) {
+            e.bit_logp(false, 6);
+            tellf = @bit_cast(i32, e.tell_frac());
+        }
+    }
+    let alloc_trim: i32 = 5;
+    if (tellf + (6 << 3)) <= total_frac {
+        e.icdf(alloc_trim, TRIM_ICDF[..], 7);
+    }
+    let bits = (total_frac - @bit_cast(i32, e.tell_frac())) - 1;
+    let mut pulses: [21]i32 = [0; 21];
+    let mut fine_quant: [21]i32 = [0; 21];
+    let mut fine_priority: [21]i32 = [0; 21];
+    let mut al = Alloc.{ intensity: st.intensity, dual_stereo: false, balance: 0 };
+    let coded_bands = compute_allocation_enc(cap[..], alloc_trim, bits, pulses[..], fine_quant[..], fine_priority[..],
+                                             c, lm, &mut e, st.last_coded_bands, &mut al);
+    quant_fine_energy(st, &mut e, fine_quant[..], c);
+    let xb = st.x[..];
+    let mut yb = xb[..0];
+    if c == 2 {
+        yb = xb[n..];
+    }
+    enc_all_bands(st, xb[..n], yb, pulses[..], spread, al.dual_stereo, al.intensity, total_frac, al.balance, &mut e, lm,
+                  coded_bands);
+    quant_energy_finalise(st, &mut e, fine_quant[..], fine_priority[..], total_bits - e.tell(), c);
+    e.done();
+    st.last_coded_bands = coded_bands;
+    st.first = false;
+    if c == 1 {
+        for i in @as(usize, 0)..NB_EBANDS {
+            st.old_band_e[NB_EBANDS + i] = st.old_band_e[i];
+        }
+    }
+    return not e.err;
+}
