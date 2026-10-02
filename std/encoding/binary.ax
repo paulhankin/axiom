@@ -1,0 +1,614 @@
+// =============================================================================
+// std/encoding/binary.ax - fixed-width integers and floats in little- and
+// big-endian byte order, and variable-length integers (LEB128 varints).
+//
+//     let n = binary.u32_le(b[4..]);              // b must hold 4 bytes there
+//     binary.put_u16_be(out[0..], 0xcafe);
+//
+//     let mut c = binary.Cursor.init(data, binary.Endian.BIG);
+//     let magic = c.read_u32()!;                  // Truncated past the end
+//     let len = c.read_uvarint()!;
+//     let body = c.read_bytes(@as(usize, len))!;
+//
+//     let mut e = binary.Encoder.init(w, binary.Endian.LITTLE);  // w: io.Writer
+//     e.write_u32(7)!;
+//     e.write_svarint(-3)!;
+//
+// The plain functions (u32_le, put_u64_be, ...) take a slice that holds the
+// value and trap if it is too short, like indexing; parse untrusted input
+// with a Cursor, whose reads fail with Truncated instead. Varints are the
+// unsigned LEB128 of protobuf, WebAssembly and DWARF (seven bits a byte,
+// low first; at most ten bytes for a u64) and its zigzag signed form
+// (0, -1, 1, -2, ... as 0, 1, 2, 3, ...); decoding rejects encodings that
+// overflow 64 bits. An Encoder writes each value with its own write, so give
+// it an io.BufWriter when the destination is a file or socket.
+// =============================================================================
+
+import "../io.ax" as io;
+
+error { Truncated, Overflow }
+
+/// A byte order.
+pub enum Endian: u8 {
+    LITTLE,
+    BIG,
+}
+
+// -----------------------------------------------------------------------------
+// Fixed widths in slices
+// -----------------------------------------------------------------------------
+
+/// The little-endian u16 in b[0..2].
+pub fn u16_le(b: []u8) u16 {
+    return @as(u16, b[0]) | (@as(u16, b[1]) << 8);
+}
+
+/// The big-endian u16 in b[0..2].
+pub fn u16_be(b: []u8) u16 {
+    return (@as(u16, b[0]) << 8) | @as(u16, b[1]);
+}
+
+/// The little-endian u32 in b[0..4].
+pub fn u32_le(b: []u8) u32 {
+    return ((@as(u32, b[0]) | (@as(u32, b[1]) << 8)) | (@as(u32, b[2]) << 16)) | (@as(u32, b[3]) << 24);
+}
+
+/// The big-endian u32 in b[0..4].
+pub fn u32_be(b: []u8) u32 {
+    return (((@as(u32, b[0]) << 24) | (@as(u32, b[1]) << 16)) | (@as(u32, b[2]) << 8)) | @as(u32, b[3]);
+}
+
+/// The little-endian u64 in b[0..8].
+pub fn u64_le(b: []u8) u64 {
+    return @as(u64, u32_le(b[0..4])) | (@as(u64, u32_le(b[4..8])) << 32);
+}
+
+/// The big-endian u64 in b[0..8].
+pub fn u64_be(b: []u8) u64 {
+    return (@as(u64, u32_be(b[0..4])) << 32) | @as(u64, u32_be(b[4..8]));
+}
+
+/// The little-endian IEEE 754 binary32 in b[0..4].
+pub fn f32_le(b: []u8) f32 {
+    return @bit_cast(f32, u32_le(b));
+}
+
+/// The big-endian IEEE 754 binary32 in b[0..4].
+pub fn f32_be(b: []u8) f32 {
+    return @bit_cast(f32, u32_be(b));
+}
+
+/// The little-endian IEEE 754 binary64 in b[0..8].
+pub fn f64_le(b: []u8) f64 {
+    return @bit_cast(f64, u64_le(b));
+}
+
+/// The big-endian IEEE 754 binary64 in b[0..8].
+pub fn f64_be(b: []u8) f64 {
+    return @bit_cast(f64, u64_be(b));
+}
+
+/// Stores v little-endian in b[0..2].
+pub fn put_u16_le(b: []mut u8, v: u16) void {
+    b[0] = @truncate(u8, v);
+    b[1] = @truncate(u8, v >> 8);
+}
+
+/// Stores v big-endian in b[0..2].
+pub fn put_u16_be(b: []mut u8, v: u16) void {
+    b[0] = @truncate(u8, v >> 8);
+    b[1] = @truncate(u8, v);
+}
+
+/// Stores v little-endian in b[0..4].
+pub fn put_u32_le(b: []mut u8, v: u32) void {
+    b[0] = @truncate(u8, v);
+    b[1] = @truncate(u8, v >> 8);
+    b[2] = @truncate(u8, v >> 16);
+    b[3] = @truncate(u8, v >> 24);
+}
+
+/// Stores v big-endian in b[0..4].
+pub fn put_u32_be(b: []mut u8, v: u32) void {
+    b[0] = @truncate(u8, v >> 24);
+    b[1] = @truncate(u8, v >> 16);
+    b[2] = @truncate(u8, v >> 8);
+    b[3] = @truncate(u8, v);
+}
+
+/// Stores v little-endian in b[0..8].
+pub fn put_u64_le(b: []mut u8, v: u64) void {
+    put_u32_le(b[0..4], @truncate(u32, v));
+    put_u32_le(b[4..8], @truncate(u32, v >> 32));
+}
+
+/// Stores v big-endian in b[0..8].
+pub fn put_u64_be(b: []mut u8, v: u64) void {
+    put_u32_be(b[0..4], @truncate(u32, v >> 32));
+    put_u32_be(b[4..8], @truncate(u32, v));
+}
+
+/// Stores v little-endian in b[0..4].
+pub fn put_f32_le(b: []mut u8, v: f32) void {
+    put_u32_le(b, @bit_cast(u32, v));
+}
+
+/// Stores v big-endian in b[0..4].
+pub fn put_f32_be(b: []mut u8, v: f32) void {
+    put_u32_be(b, @bit_cast(u32, v));
+}
+
+/// Stores v little-endian in b[0..8].
+pub fn put_f64_le(b: []mut u8, v: f64) void {
+    put_u64_le(b, @bit_cast(u64, v));
+}
+
+/// Stores v big-endian in b[0..8].
+pub fn put_f64_be(b: []mut u8, v: f64) void {
+    put_u64_be(b, @bit_cast(u64, v));
+}
+
+/// The u16 in b[0..2] in byte order e.
+pub fn get_u16(b: []u8, e: Endian) u16 {
+    if e == Endian.LITTLE {
+        return u16_le(b);
+    }
+    return u16_be(b);
+}
+
+/// The u32 in b[0..4] in byte order e.
+pub fn get_u32(b: []u8, e: Endian) u32 {
+    if e == Endian.LITTLE {
+        return u32_le(b);
+    }
+    return u32_be(b);
+}
+
+/// The u64 in b[0..8] in byte order e.
+pub fn get_u64(b: []u8, e: Endian) u64 {
+    if e == Endian.LITTLE {
+        return u64_le(b);
+    }
+    return u64_be(b);
+}
+
+/// Stores v in b[0..2] in byte order e.
+pub fn put_u16(b: []mut u8, v: u16, e: Endian) void {
+    if e == Endian.LITTLE {
+        put_u16_le(b, v);
+    } else {
+        put_u16_be(b, v);
+    }
+}
+
+/// Stores v in b[0..4] in byte order e.
+pub fn put_u32(b: []mut u8, v: u32, e: Endian) void {
+    if e == Endian.LITTLE {
+        put_u32_le(b, v);
+    } else {
+        put_u32_be(b, v);
+    }
+}
+
+/// Stores v in b[0..8] in byte order e.
+pub fn put_u64(b: []mut u8, v: u64, e: Endian) void {
+    if e == Endian.LITTLE {
+        put_u64_le(b, v);
+    } else {
+        put_u64_be(b, v);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Varints
+// -----------------------------------------------------------------------------
+
+/// The most bytes a u64 varint takes.
+pub const MAX_VARINT_LEN: usize = 10;
+
+/// A decoded varint and the number of bytes it took.
+pub struct Varint {
+    value: u64,
+    len: usize,
+}
+
+/// A decoded signed (zigzag) varint and the number of bytes it took.
+pub struct Svarint {
+    value: i64,
+    len: usize,
+}
+
+/// The zigzag mapping of v: 0, -1, 1, -2, ... to 0, 1, 2, 3, ...
+pub fn zigzag(v: i64) u64 {
+    return @bit_cast(u64, v << 1) ^ @bit_cast(u64, v >> 63);
+}
+
+/// The inverse of zigzag.
+pub fn unzigzag(u: u64) i64 {
+    return @bit_cast(i64, u >> 1) ^ (-@bit_cast(i64, u & 1));
+}
+
+/// The number of bytes v takes as a varint (1 to 10).
+pub fn uvarint_len(v: u64) usize {
+    let mut n: usize = 1;
+    let mut x = v;
+    while x >= 0x80 {
+        x >>= 7;
+        n += 1;
+    }
+    return n;
+}
+
+/// Stores v as a varint at the start of b (which needs uvarint_len(v)
+/// bytes, at most MAX_VARINT_LEN) and returns the bytes written.
+pub fn put_uvarint(b: []mut u8, v: u64) []u8 {
+    let mut n: usize = 0;
+    let mut x = v;
+    while x >= 0x80 {
+        b[n] = @truncate(u8, x) | 0x80;
+        x >>= 7;
+        n += 1;
+    }
+    b[n] = @truncate(u8, x);
+    return b[..n + 1];
+}
+
+/// Stores v as a zigzag varint at the start of b and returns the bytes
+/// written.
+pub fn put_svarint(b: []mut u8, v: i64) []u8 {
+    return put_uvarint(b, zigzag(v));
+}
+
+/// Decodes the varint at the start of b. Fails with Truncated if b ends
+/// inside it, Overflow if it does not fit in 64 bits.
+pub fn uvarint(b: []u8) !Varint {
+    let mut v: u64 = 0;
+    let mut shift: u64 = 0;
+    let mut i: usize = 0;
+    loop {
+        if i >= b.len {
+            return error.Truncated;
+        }
+        let x = b[i];
+        i += 1;
+        if (shift == 63) and (x > 1) {
+            return error.Overflow;  // bits beyond the 64th, or an eleventh byte
+        }
+        v |= @as(u64, x & 0x7f) << shift;
+        if (x & 0x80) == 0 {
+            return Varint.{ value: v, len: i };
+        }
+        shift += 7;
+    }
+}
+
+/// Decodes the zigzag varint at the start of b.
+pub fn svarint(b: []u8) !Svarint {
+    let u = uvarint(b)!;
+    return Svarint.{ value: unzigzag(u.value), len: u.len };
+}
+
+/// Reads a varint from r a byte at a time (wrap a slow source in a
+/// buffer). Fails with Truncated if the stream ends inside it.
+pub fn read_uvarint(r: io.Reader) !u64 {
+    let mut v: u64 = 0;
+    let mut shift: u64 = 0;
+    let mut one: [1]u8 = [0];
+    loop {
+        if r.read(one[..])! == 0 {
+            return error.Truncated;
+        }
+        let x = one[0];
+        if (shift == 63) and (x > 1) {
+            return error.Overflow;
+        }
+        v |= @as(u64, x & 0x7f) << shift;
+        if (x & 0x80) == 0 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+/// Reads a zigzag varint from r.
+pub fn read_svarint(r: io.Reader) !i64 {
+    return unzigzag(read_uvarint(r)!);
+}
+
+/// Writes v to w as a varint.
+pub fn write_uvarint(w: io.Writer, v: u64) !void {
+    let mut buf: [10]u8 = [0; 10];
+    w.write_all(put_uvarint(buf[..], v))!;
+}
+
+/// Writes v to w as a zigzag varint.
+pub fn write_svarint(w: io.Writer, v: i64) !void {
+    write_uvarint(w, zigzag(v))!;
+}
+
+// -----------------------------------------------------------------------------
+// Cursor: checked reads from a slice
+// -----------------------------------------------------------------------------
+
+/// Reads values one after another from a slice in one byte order. Every
+/// read past the end fails with Truncated and leaves the position alone.
+pub struct Cursor {
+    data: []u8,
+    pos: usize,
+    endian: Endian,
+
+    pub fn init(data: []u8, endian: Endian) Cursor {
+        return Cursor.{ data: data, pos: 0, endian: endian };
+    }
+
+    /// The bytes not read yet.
+    pub fn remaining(self: *Cursor) []u8 {
+        return self.data[self.pos..];
+    }
+
+    /// Whether every byte has been read.
+    pub fn at_end(self: *Cursor) bool {
+        return self.pos == self.data.len;
+    }
+
+    /// Moves to offset pos from the start (Truncated beyond the end).
+    pub fn seek(self: *mut Cursor, pos: usize) !void {
+        if pos > self.data.len {
+            return error.Truncated;
+        }
+        self.pos = pos;
+    }
+
+    /// Skips n bytes.
+    pub fn skip(self: *mut Cursor, n: usize) !void {
+        _ = self.take(n)!;
+    }
+
+    /// The next n bytes (a view of the data).
+    pub fn read_bytes(self: *mut Cursor, n: usize) ![]u8 {
+        return self.take(n);
+    }
+
+    fn take(self: *mut Cursor, n: usize) ![]u8 {
+        if n > (self.data.len - self.pos) {
+            return error.Truncated;
+        }
+        let s = self.data[self.pos..self.pos + n];
+        self.pos += n;
+        return s;
+    }
+
+    pub fn read_u8(self: *mut Cursor) !u8 {
+        return self.take(1)![0];
+    }
+
+    pub fn read_i8(self: *mut Cursor) !i8 {
+        return @bit_cast(i8, self.read_u8()!);
+    }
+
+    pub fn read_u16(self: *mut Cursor) !u16 {
+        return get_u16(self.take(2)!, self.endian);
+    }
+
+    pub fn read_i16(self: *mut Cursor) !i16 {
+        return @bit_cast(i16, self.read_u16()!);
+    }
+
+    pub fn read_u32(self: *mut Cursor) !u32 {
+        return get_u32(self.take(4)!, self.endian);
+    }
+
+    pub fn read_i32(self: *mut Cursor) !i32 {
+        return @bit_cast(i32, self.read_u32()!);
+    }
+
+    pub fn read_u64(self: *mut Cursor) !u64 {
+        return get_u64(self.take(8)!, self.endian);
+    }
+
+    pub fn read_i64(self: *mut Cursor) !i64 {
+        return @bit_cast(i64, self.read_u64()!);
+    }
+
+    pub fn read_f32(self: *mut Cursor) !f32 {
+        return @bit_cast(f32, self.read_u32()!);
+    }
+
+    pub fn read_f64(self: *mut Cursor) !f64 {
+        return @bit_cast(f64, self.read_u64()!);
+    }
+
+    /// The next varint (Truncated or Overflow leave the position alone).
+    pub fn read_uvarint(self: *mut Cursor) !u64 {
+        let v = uvarint(self.data[self.pos..])!;
+        self.pos += v.len;
+        return v.value;
+    }
+
+    /// The next zigzag varint.
+    pub fn read_svarint(self: *mut Cursor) !i64 {
+        return unzigzag(self.read_uvarint()!);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Encoder: values to an io.Writer
+// -----------------------------------------------------------------------------
+
+/// Writes values to an io.Writer in one byte order.
+pub struct Encoder {
+    w: io.Writer,
+    endian: Endian,
+
+    pub fn init(w: io.Writer, endian: Endian) Encoder {
+        return Encoder.{ w: w, endian: endian };
+    }
+
+    pub fn write_bytes(self: *mut Encoder, b: []u8) !void {
+        self.w.write_all(b)!;
+    }
+
+    pub fn write_u8(self: *mut Encoder, v: u8) !void {
+        let b: [1]u8 = [v];
+        self.w.write_all(b[..])!;
+    }
+
+    pub fn write_i8(self: *mut Encoder, v: i8) !void {
+        self.write_u8(@bit_cast(u8, v))!;
+    }
+
+    pub fn write_u16(self: *mut Encoder, v: u16) !void {
+        let mut b: [2]u8 = [0; 2];
+        put_u16(b[..], v, self.endian);
+        self.w.write_all(b[..])!;
+    }
+
+    pub fn write_i16(self: *mut Encoder, v: i16) !void {
+        self.write_u16(@bit_cast(u16, v))!;
+    }
+
+    pub fn write_u32(self: *mut Encoder, v: u32) !void {
+        let mut b: [4]u8 = [0; 4];
+        put_u32(b[..], v, self.endian);
+        self.w.write_all(b[..])!;
+    }
+
+    pub fn write_i32(self: *mut Encoder, v: i32) !void {
+        self.write_u32(@bit_cast(u32, v))!;
+    }
+
+    pub fn write_u64(self: *mut Encoder, v: u64) !void {
+        let mut b: [8]u8 = [0; 8];
+        put_u64(b[..], v, self.endian);
+        self.w.write_all(b[..])!;
+    }
+
+    pub fn write_i64(self: *mut Encoder, v: i64) !void {
+        self.write_u64(@bit_cast(u64, v))!;
+    }
+
+    pub fn write_f32(self: *mut Encoder, v: f32) !void {
+        self.write_u32(@bit_cast(u32, v))!;
+    }
+
+    pub fn write_f64(self: *mut Encoder, v: f64) !void {
+        self.write_u64(@bit_cast(u64, v))!;
+    }
+
+    pub fn write_uvarint(self: *mut Encoder, v: u64) !void {
+        write_uvarint(self.w, v)!;
+    }
+
+    pub fn write_svarint(self: *mut Encoder, v: i64) !void {
+        write_svarint(self.w, v)!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+import "../str.ax" as strs;
+
+fn varint_fails(b: []u8, want: error) bool {
+    _ = uvarint(b) catch |e| return e == want;
+    return false;
+}
+
+fn truncated_u32(c: *mut Cursor) bool {
+    _ = c.read_u32() catch |e| return e == error.Truncated;
+    return false;
+}
+
+test "fixed widths in both byte orders" {
+    let b: [8]u8 = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    @expect(u16_le(b[..]) == 0x0201);
+    @expect(u16_be(b[..]) == 0x0102);
+    @expect(u32_le(b[..]) == 0x04030201);
+    @expect(u32_be(b[..]) == 0x01020304);
+    @expect(u64_le(b[..]) == 0x0807060504030201);
+    @expect(u64_be(b[..]) == 0x0102030405060708);
+    let mut o: [8]u8 = [0; 8];
+    put_u64_be(o[..], 0x0102030405060708);
+    @expect(u64_le(o[..]) == 0x0807060504030201);
+    put_u32_le(o[..], 0xdeadbeef);
+    @expect((o[0] == 0xef) and (o[3] == 0xde));
+    put_u16(o[..], 0xcafe, Endian.BIG);
+    @expect(get_u16(o[..], Endian.BIG) == 0xcafe);
+    put_f64_le(o[..], 1.5);
+    @expect(u64_le(o[..]) == 0x3ff8000000000000);
+    @expect(f64_le(o[..]) == 1.5);
+    put_f32_be(o[..], -2.0);
+    @expect(u32_be(o[..]) == 0xc0000000);
+    @expect(f32_be(o[..]) == -2.0);
+}
+
+test "varints" {
+    let mut b: [10]u8 = [0; 10];
+    // the protobuf documentation's 150 = 96 01
+    let e = put_uvarint(b[..], 150);
+    @expect((e.len == 2) and (e[0] == 0x96) and (e[1] == 0x01));
+    let cases: [10]u64 = [0, 1, 127, 128, 255, 300, 16383, 16384, 0x7fffffffffffffff, 0xffffffffffffffff];
+    for c in cases {
+        let s = put_uvarint(b[..], c);
+        @expect(s.len == uvarint_len(c));
+        let d = uvarint(s)!;
+        @expect((d.value == c) and (d.len == s.len));
+    }
+    @expect(uvarint_len(0xffffffffffffffff) == 10);
+    // zigzag: the protobuf documentation's table
+    @expect((zigzag(0) == 0) and (zigzag(-1) == 1) and (zigzag(1) == 2) and (zigzag(-2) == 3));
+    @expect(zigzag(2147483647) == 4294967294);
+    @expect(zigzag(-2147483648) == 4294967295);
+    let sv: [5]i64 = [0, -1, 63, -64, -9223372036854775807 - 1];
+    for v in sv {
+        let s = put_svarint(b[..], v);
+        @expect((svarint(s)!).value == v);
+    }
+    // malformed
+    let trunc: [2]u8 = [0x80, 0x80];
+    @expect(varint_fails(trunc[..], error.Truncated));
+    let over: [10]u8 = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+    @expect(varint_fails(over[..], error.Overflow));
+    let eleven: [11]u8 = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x00];
+    @expect(varint_fails(eleven[..], error.Overflow));
+    let max: [10]u8 = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+    @expect((uvarint(max[..])!).value == 0xffffffffffffffff);
+    @expect(varint_fails(trunc[..0], error.Truncated));
+}
+
+test "cursor and encoder round trip" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut e = Encoder.init(s.writer(), Endian.BIG);
+    e.write_u8(7)!;
+    e.write_i16(-2)!;
+    e.write_u32(0x01020304)!;
+    e.write_i64(-5)!;
+    e.write_f64(0.25)!;
+    e.write_uvarint(300)!;
+    e.write_svarint(-70)!;
+    e.write_bytes("ok")!;
+    let data = s.bytes();
+    @expect((data[3] == 0x01) and (data[6] == 0x04));
+    let mut c = Cursor.init(data, Endian.BIG);
+    @expect(c.read_u8()! == 7);
+    @expect(c.read_i16()! == -2);
+    @expect(c.read_u32()! == 0x01020304);
+    @expect(c.read_i64()! == -5);
+    @expect(c.read_f64()! == 0.25);
+    @expect(c.read_uvarint()! == 300);
+    @expect(c.read_svarint()! == -70);
+    let at = c.pos;
+    @expect(truncated_u32(&mut c));
+    @expect(c.pos == at);
+    @expect(strs.eq(c.read_bytes(2)!, "ok"));
+    @expect(c.at_end());
+    @expect(truncated_u32(&mut c));
+    c.seek(1)!;
+    let mut le = Cursor.init(data, Endian.LITTLE);
+    le.skip(1)!;
+    @expect(le.read_u16()! == 0xfeff);
+    let mut r = io.SliceReader.init(data[data.len - 6..]);
+    @expect(read_uvarint(r.reader())! == 300);
+}
