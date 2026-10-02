@@ -16,9 +16,18 @@
 //
 // Reading follows the central directory, with ZIP64 for big archives,
 // archive comments and UTF-8 names; entries may be stored or deflated
-// (other methods, and encrypted entries, fail with Unsupported). Every
-// entry's CRC-32 and size are checked, and extraction never produces more
-// than the size an entry declares, so "zip bombs" cannot run away.
+// (other methods fail with Unsupported). Every entry's CRC-32 and size are
+// checked, and extraction never produces more than the size an entry
+// declares, so "zip bombs" cannot run away.
+//
+// Encrypted entries (extract fails with PasswordRequired) are read with
+// extract_password / extract_all_password: WinZip AES (AE-1 and AE-2, 128,
+// 192 and 256-bit keys, the MAC checked before anything is decrypted) and
+// the traditional PKWARE encryption ("ZipCrypto", which is weak: anyone can
+// break it, so treat it as obfuscation). A wrong password fails with
+// WrongPassword (for ZipCrypto, 1 in 256 wrong ones get past the check
+// byte and fail the CRC instead). Options.password writes entries with
+// AES-256 (AE-2), as 7-Zip, WinZip and pyzipper read them.
 // extract_all refuses names that would leave the target directory
 // (absolute paths, "..", drive letters: "zip slip"), and symbolic links.
 //
@@ -29,6 +38,12 @@
 
 import "../collections/vec.ax" as vec;
 import "../compress/deflate.ax" as deflate;
+import "../crypto/aes.ax" as aes;
+import "../crypto/hmac.ax" as hmac;
+import "../crypto/kdf.ax" as kdf;
+import "../crypto/random.ax" as random;
+import "../crypto/sha2.ax" as sha2;
+import "../crypto/subtle.ax" as subtle;
 import "../fmt.ax" as fmt;
 import "../io.ax" as io;
 import "../mem.ax" as mem;
@@ -37,10 +52,23 @@ import "../os/path.ax" as path;
 import "../str.ax" as strs;
 import "../time.ax" as time;
 
-error { NotZip, Corrupt, Unsupported, ChecksumMismatch, TooLarge, UnsafePath, NotFound, OutOfMemory }
+error {
+    NotZip,
+    Corrupt,
+    Unsupported,
+    ChecksumMismatch,
+    TooLarge,
+    UnsafePath,
+    NotFound,
+    OutOfMemory,
+    PasswordRequired,
+    WrongPassword,
+}
 
 pub const STORE: u16 = 0;
 pub const DEFLATE: u16 = 8;
+/// The method of WinZip AES entries (the real one is in Entry.aes_method).
+pub const AES: u16 = 99;
 
 const SIG_LOCAL: u32 = 0x04034b50;
 const SIG_CENTRAL: u32 = 0x02014b50;
@@ -59,6 +87,9 @@ pub struct Entry {
     mtime: i64,   // Unix time (from the DOS time, taken as UTC, or an extended timestamp)
     mode: u32,    // Unix mode bits (file type and permissions), or 0 if not recorded
     comment: []u8,
+    aes_strength: u8,  // WinZip AES: 1, 2 or 3 for 128, 192 or 256-bit keys (0: not AES)
+    aes_version: u16,  // 1 (AE-1: the CRC-32 is checked) or 2 (AE-2: it is not recorded)
+    aes_method: u16,   // the compression method under the encryption
 
     pub fn is_dir(self: Entry) bool {
         return strs.ends_with(self.name, "/") or ((self.mode & 0o170000) == 0o040000);
@@ -166,7 +197,8 @@ pub struct Archive {
                                   crc: le32(d, p + 16), csize: @as(u64, le32(d, p + 20)), size: @as(
                                       u64, le32(d, p + 24)), offset: @as(u64, le32(d, p + 42)), mtime: dos_time(
                                           le16(d, p + 12), le16(d, p + 14)), mode: 0,
-                                  comment: d[p + 46 + nlen + xlen..p + 46 + nlen + xlen + klen] };
+                                  comment: d[p + 46 + nlen + xlen..p + 46 + nlen + xlen + klen], aes_strength: 0,
+                                  aes_version: 0, aes_method: 0 };
             if made_by == 3 {
                 ent.mode = le32(d, p + 38) >> 16;  // made on Unix: the mode is in the high bits
             }
@@ -204,47 +236,51 @@ pub struct Archive {
     /// frees them.
     pub fn extract(self: *Archive, e: Entry) ![]mut u8 {
         if e.encrypted() {
-            return error.Unsupported;
+            return error.PasswordRequired;
         }
         let src = self.raw(e)!;
-        if e.size > @as(u64, 0xffffffffffff) {
-            return error.TooLarge;
+        return unpack(e, src, e.method, true);
+    }
+
+    /// An entry's contents, decrypted with password if it is encrypted
+    /// (as extract otherwise); the caller frees them.
+    pub fn extract_password(self: *Archive, e: Entry, password: []u8) ![]mut u8 {
+        if not e.encrypted() {
+            return self.extract(e);
         }
-        let n = @truncate(usize, e.size);
-        let mut out: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
-        if e.method == STORE {
-            if e.csize != e.size {
-                return error.Corrupt;
-            }
-            out = mem.alloc.[u8](n)!;
-            @mem_copy(out, src);
-        } else if e.method == DEFLATE {
-            out = deflate.decompress(src, deflate.Format.RAW, n) catch |err| {
-                if err == error.TooLarge {
-                    return error.Corrupt;  // more than it declares
-                }
-                if err == error.OutOfMemory {
-                    return err;
-                }
-                return error.Corrupt;
-            };
-            if out.len != n {
-                mem.free(out);
-                return error.Corrupt;
-            }
-        } else {
-            return error.Unsupported;
+        if (e.flags & 0x40) != 0 {
+            return error.Unsupported;  // PKWARE's "strong encryption"
         }
-        if deflate.crc32(0, out) != e.crc {
-            mem.free(out);
-            return error.ChecksumMismatch;
+        let src = self.raw(e)!;
+        if e.method == AES {
+            let plain = aes_open(e, src, password)!;
+            defer mem.free(plain);
+            return unpack(e, plain, e.aes_method, e.aes_version != 2);
         }
-        return out;
+        // ZipCrypto: the last header byte checks the password against the
+        // CRC's top byte, or the time's with a data descriptor
+        let mut check = @truncate(u8, e.crc >> 24);
+        if (e.flags & 8) != 0 {
+            let o = @truncate(usize, e.offset);
+            check = @truncate(u8, le16(self.data, o + 10) >> 8);
+        }
+        let plain = zipcrypto_open(src, password, check)!;
+        defer mem.free(plain);
+        return unpack(e, plain, e.method, true);
+    }
+
+    /// extract_all, decrypting encrypted entries with password.
+    pub fn extract_all_password(self: *Archive, dir: []u8, password: []u8) !void {
+        self.extract_all_with(dir, password)!;
     }
 
     /// Extracts every entry under dir (created if need be), refusing names
     /// that would leave it, and symbolic links.
     pub fn extract_all(self: *Archive, dir: []u8) !void {
+        self.extract_all_with(dir, "")!;
+    }
+
+    fn extract_all_with(self: *Archive, dir: []u8, password: []u8) !void {
         fs.mkdir_all(dir)!;
         for e in self.entries {
             if not safe_name(e.name) or e.is_symlink() {
@@ -262,11 +298,213 @@ pub struct Archive {
             if parent.len > 0 {
                 fs.mkdir_all(parent)!;
             }
-            let data = self.extract(e)!;
+            let mut data: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+            if password.len > 0 {
+                data = self.extract_password(e, password)!;
+            } else {
+                data = self.extract(e)!;
+            }
             defer mem.free(data);
             fs.write_file(target, data)!;
         }
     }
+}
+
+// An entry's (decrypted) data, decompressed and checked against its size
+// and, unless check_crc is false, its CRC-32.
+fn unpack(e: Entry, src: []u8, method: u16, check_crc: bool) ![]mut u8 {
+    if e.size > @as(u64, 0xffffffffffff) {
+        return error.TooLarge;
+    }
+    let n = @truncate(usize, e.size);
+    let mut out: []mut u8 = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    if method == STORE {
+        if @as(u64, src.len) != e.size {
+            return error.Corrupt;
+        }
+        out = mem.alloc.[u8](n)!;
+        @mem_copy(out, src);
+    } else if method == DEFLATE {
+        out = deflate.decompress(src, deflate.Format.RAW, n) catch |err| {
+            if err == error.TooLarge {
+                return error.Corrupt;  // more than it declares
+            }
+            if err == error.OutOfMemory {
+                return err;
+            }
+            return error.Corrupt;
+        };
+        if out.len != n {
+            mem.free(out);
+            return error.Corrupt;
+        }
+    } else {
+        return error.Unsupported;
+    }
+    if check_crc and (deflate.crc32(0, out) != e.crc) {
+        mem.free(out);
+        return error.ChecksumMismatch;
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Encryption
+// -----------------------------------------------------------------------------
+
+// The CRC-32 table step that ZipCrypto's keys use.
+fn crc_table(t: *mut [256]u32) void {
+    for i in @as(u32, 0)..256 {
+        let mut c = i;
+        for _k in @as(u32, 0)..8 {
+            if (c & 1) != 0 {
+                c = 0xedb88320 ^ (c >> 1);
+            } else {
+                c >>= 1;
+            }
+        }
+        t[@as(usize, i)] = c;
+    }
+}
+
+// The three keys of the traditional PKWARE encryption (APPNOTE 6.1).
+struct ZipKeys {
+    k: [3]u32,
+    t: [256]u32,
+
+    fn init(password: []u8) ZipKeys {
+        let mut z = ZipKeys.{ k: [0x12345678, 0x23456789, 0x34567890], t: [0; 256] };
+        crc_table(&mut z.t);
+        for c in password {
+            z.update(c);
+        }
+        return z;
+    }
+
+    fn crc(self: *ZipKeys, c: u32, b: u8) u32 {
+        return self.t[@as(usize, (c ^ @as(u32, b)) & 0xff)] ^ (c >> 8);
+    }
+
+    fn update(self: *mut ZipKeys, b: u8) void {
+        self.k[0] = self.crc(self.k[0], b);
+        self.k[1] = ((self.k[1] +% (self.k[0] & 0xff)) *% 134775813) +% 1;
+        self.k[2] = self.crc(self.k[2], @truncate(u8, self.k[1] >> 24));
+    }
+
+    fn stream_byte(self: *ZipKeys) u8 {
+        let t = (self.k[2] | 2) & 0xffff;
+        return @truncate(u8, (t * (t ^ 1)) >> 8);
+    }
+
+    fn decrypt(self: *mut ZipKeys, c: u8) u8 {
+        let p = c ^ self.stream_byte();
+        self.update(p);
+        return p;
+    }
+}
+
+fn zipcrypto_open(src: []u8, password: []u8, check: u8) ![]mut u8 {
+    if src.len < 12 {
+        return error.Corrupt;
+    }
+    let mut z = ZipKeys.init(password);
+    let mut last: u8 = 0;
+    for i in @as(usize, 0)..12 {
+        last = z.decrypt(src[i]);
+    }
+    if last != check {
+        return error.WrongPassword;
+    }
+    let out = mem.alloc.[u8](src.len - 12)!;
+    for i in @as(usize, 12)..src.len {
+        out[i - 12] = z.decrypt(src[i]);
+    }
+    return out;
+}
+
+// WinZip AES: key sizes by strength, and the derived keys.
+fn aes_key_len(strength: u8) !usize {
+    if (strength < 1) or (strength > 3) {
+        return error.Unsupported;
+    }
+    return 8 + (8 * @as(usize, strength));
+}
+
+// PBKDF2-HMAC-SHA1 (1000 rounds) of the password and salt: the AES key,
+// the MAC key and a 2-byte password check, in out (2 * klen + 2 bytes).
+fn aes_derive(password: []u8, salt: []u8, klen: usize, out: []mut u8) void {
+    kdf.pbkdf2(sha2.Algorithm.SHA1, password, salt, 1000, out[..(2 * klen) + 2]);
+}
+
+// AES-CTR with a little-endian counter starting at 1 (Gladman's, as
+// WinZip uses it): encryption and decryption alike.
+fn aes_ctr_le(key: []u8, data: []u8, out: []mut u8) !void {
+    let c = aes.Cipher.init(key) catch return error.Corrupt;
+    let mut ctr: [16]u8 = [0; 16];
+    let mut ks: [16]u8 = [0; 16];
+    let mut i: usize = 0;
+    while i < data.len {
+        let mut j: usize = 0;
+        while j < 16 {
+            ctr[j] +%= 1;
+            if ctr[j] != 0 {
+                break;
+            }
+            j += 1;
+        }
+        c.encrypt_block(ctr[..], ks[..]);
+        let n = @min(16, data.len - i);
+        for k in @as(usize, 0)..n {
+            out[i + k] = data[i + k] ^ ks[k];
+        }
+        i += n;
+    }
+}
+
+fn aes_open(e: Entry, src: []u8, password: []u8) ![]mut u8 {
+    let klen = aes_key_len(e.aes_strength)!;
+    let slen = klen / 2;
+    if src.len < ((slen + 2) + 10) {
+        return error.Corrupt;
+    }
+    let mut keys: [66]u8 = [0; 66];
+    aes_derive(password, src[..slen], klen, keys[..]);
+    if not subtle.equal(keys[2 * klen..(2 * klen) + 2], src[slen..slen + 2]) {
+        return error.WrongPassword;
+    }
+    let ct = src[slen + 2..src.len - 10];
+    let mut mac: [20]u8 = [0; 20];
+    hmac.hmac(sha2.Algorithm.SHA1, keys[klen..2 * klen], ct, mac[..]);
+    if not subtle.equal(mac[..10], src[src.len - 10..]) {
+        return error.ChecksumMismatch;  // altered, or (rarely) a wrong password
+    }
+    let out = mem.alloc.[u8](ct.len)!;
+    aes_ctr_le(keys[..klen], ct, out) catch |err| {
+        mem.free(out);
+        return err;
+    };
+    return out;
+}
+
+// salt || password check || AES-256-CTR(data) || MAC: an AE-2 entry's data.
+fn aes_seal(password: []u8, data: []u8) ![]mut u8 {
+    let out = mem.alloc.[u8](((16 + 2) + data.len) + 10)!;
+    random.fill(out[..16]) catch |err| {
+        mem.free(out);
+        return err;
+    };
+    let mut keys: [66]u8 = [0; 66];
+    aes_derive(password, out[..16], 32, keys[..]);
+    @mem_copy(out[16..18], keys[64..66]);
+    let ct = out[18..18 + data.len];
+    aes_ctr_le(keys[..32], data, ct) catch |err| {
+        mem.free(out);
+        return err;
+    };
+    let mut mac: [20]u8 = [0; 20];
+    hmac.hmac(sha2.Algorithm.SHA1, keys[32..64], ct, mac[..]);
+    @mem_copy(out[18 + data.len..], mac[..10]);
+    return out;
 }
 
 /// Whether an entry name stays inside the directory it is extracted to:
@@ -321,6 +559,10 @@ fn extra_fields(x: []u8, e: *mut Entry) !void {
                 }
                 e.offset = le64(f, j);
             }
+        } else if (id == 0x9901) and (n >= 7) and (f[2] == 'A') and (f[3] == 'E') {
+            e.aes_version = le16(f, 0);
+            e.aes_strength = f[4];
+            e.aes_method = le16(f, 5);
         } else if (id == 0x5455) and (n >= 5) and ((f[0] & 1) != 0) {
             e.mtime = @as(i64, @bit_cast(i32, le32(f, 1)));
         }
@@ -359,13 +601,14 @@ fn to_dos(unix: i64, t: *mut u16, d: *mut u16) void {
 // -----------------------------------------------------------------------------
 
 pub struct Options {
-    method: u16,  // DEFLATE (stored instead when that is no bigger) or STORE
-    level: u32,   // deflate level, 1 to 9
-    mtime: i64,   // Unix time
-    mode: u32,    // Unix permissions (0o644 by default)
+    method: u16,     // DEFLATE (stored instead when that is no bigger) or STORE
+    level: u32,      // deflate level, 1 to 9
+    mtime: i64,      // Unix time
+    mode: u32,       // Unix permissions (0o644 by default)
+    password: []u8,  // non-empty: encrypt with AES-256 (WinZip AE-2)
 
     pub fn default() Options {
-        return Options.{ method: DEFLATE, level: deflate.DEFAULT_LEVEL, mtime: 315532800, mode: 0o644 };
+        return Options.{ method: DEFLATE, level: deflate.DEFAULT_LEVEL, mtime: 315532800, mode: 0o644, password: "" };
     }
 }
 
@@ -380,6 +623,8 @@ struct Written {
     ddate: u16,
     mode: u32,
     mtime: i64,
+    aes_method: u16,  // the method under AES encryption (method is then AES)
+    flags: u16,
 }
 
 /// Writes a zip archive to a stream: add entries, then finish(), then
@@ -422,6 +667,14 @@ pub struct Writer {
         if method == DEFLATE {
             body = packed;
         }
+        if opts.password.len > 0 {
+            // AE-2: no CRC (it would tell about the contents), a MAC instead
+            let sealed = aes_seal(opts.password, body)!;
+            defer mem.free(sealed);
+            self.entry_with(name, AES, 0, @as(u64, data.len), sealed, opts.mtime, 0o100000 | (opts.mode & 0o7777),
+                            method)!;
+            return;
+        }
         self.entry(name, method, deflate.crc32(0, data), @as(u64, data.len), body, opts.mtime,
                    0o100000 | (opts.mode & 0o7777))!;
     }
@@ -434,11 +687,21 @@ pub struct Writer {
     }
 
     fn entry(self: *mut Writer, name: []u8, method: u16, crc: u32, size: u64, body: []u8, mtime: i64, mode: u32) !void {
+        self.entry_with(name, method, crc, size, body, mtime, mode, 0)!;
+    }
+
+    fn entry_with(self: *mut Writer, name: []u8, method: u16, crc: u32, size: u64, body: []u8, mtime: i64, mode: u32,
+                  aes_method: u16) !void {
         if name.len > 65535 {
             return error.TooLarge;
         }
+        let mut flags: u16 = 0x0800;  // UTF-8 names
+        if method == AES {
+            flags |= 1;
+        }
         let mut w = Written.{ name: strs.dup(name)!, method: method, crc: crc, csize: @as(u64, body.len), size: size,
-                              offset: self.offset, dtime: 0, ddate: 0, mode: mode, mtime: mtime };
+                              offset: self.offset, dtime: 0, ddate: 0, mode: mode, mtime: mtime, aes_method: aes_method,
+                              flags: flags };
         to_dos(mtime, &mut w.dtime, &mut w.ddate);
         self.written.push(w) catch |e| {
             mem.free(w.name);
@@ -452,7 +715,7 @@ pub struct Writer {
         } else {
             h.put16(20);
         }
-        h.put16(0x0800);  // UTF-8 names
+        h.put16(flags);
         h.put16(method);
         h.put16(w.dtime);
         h.put16(w.ddate);
@@ -465,21 +728,20 @@ pub struct Writer {
             h.put32(@truncate(u32, size));
         }
         h.put16(@truncate(u16, name.len));
+        let mut x = Buf.{ b: [0; 64], n: 0 };
         if big {
-            h.put16(20);
-        } else {
-            h.put16(0);
-        }
-        self.put(h.bytes())!;
-        self.put(name)!;
-        if big {
-            let mut x = Buf.{ b: [0; 64], n: 0 };
             x.put16(0x0001);
             x.put16(16);
             x.put64(size);
             x.put64(w.csize);
-            self.put(x.bytes())!;
         }
+        if method == AES {
+            aes_extra(&mut x, aes_method);
+        }
+        h.put16(@truncate(u16, x.n));
+        self.put(h.bytes())!;
+        self.put(name)!;
+        self.put(x.bytes())!;
         self.put(body)!;
     }
 
@@ -508,6 +770,9 @@ pub struct Writer {
                     x.put64(w.offset);
                 }
             }
+            if w.method == AES {
+                aes_extra(&mut x, w.aes_method);
+            }
             let mut h = Buf.{ b: [0; 64], n: 0 };
             h.put32(SIG_CENTRAL);
             h.put16(0x0300 | 45);  // made by Unix, version 4.5
@@ -516,7 +781,7 @@ pub struct Writer {
             } else {
                 h.put16(20);
             }
-            h.put16(0x0800);
+            h.put16(w.flags);
             h.put16(w.method);
             h.put16(w.dtime);
             h.put16(w.ddate);
@@ -592,6 +857,17 @@ pub struct Writer {
         }
         self.written.deinit();
     }
+}
+
+// The WinZip AES extra field: AE-2, 256-bit keys, the real method.
+fn aes_extra(x: *mut Buf, method: u16) void {
+    x.put16(0x9901);
+    x.put16(7);
+    x.put16(2);
+    x.put16(0x4541);  // "AE"
+    x.b[x.n] = 3;
+    x.n += 1;
+    x.put16(method);
 }
 
 struct Buf {
@@ -758,4 +1034,120 @@ fn fails_extract(a: *Archive, e: Entry) bool {
     let x = a.extract(e) catch return true;
     mem.free(x);
     return false;
+}
+
+fn data_bin(out: *mut strs.String) !void {
+    // tools/gen_zip_crypt_tests.py's data.bin
+    let mut x: u32 = 12345;
+    for i in @as(usize, 0)..20000 {
+        x = ((x *% 1103515245) +% 12345) & 0x7fffffff;
+        if (i % 3) == 0 {
+            out.push(0x41)!;
+        } else {
+            out.push(@truncate(u8, x >> 16))!;
+        }
+    }
+}
+
+fn wrong_password(a: *Archive, e: Entry, pw: []u8) bool {
+    let r = a.extract_password(e, pw) catch |err| return (err == error.WrongPassword) or
+            (err == error.ChecksumMismatch) or (err == error.Corrupt);
+    mem.free(r);
+    return false;
+}
+
+fn needs_password(a: *Archive, e: Entry) bool {
+    let r = a.extract(e) catch |err| return err == error.PasswordRequired;
+    mem.free(r);
+    return false;
+}
+
+test "encrypted archives: ZipCrypto and WinZip AES" {
+    let mut want = strs.String.init();
+    defer want.deinit();
+    data_bin(&mut want)!;
+    for name in ["zipcrypto", "zipcrypto_stream", "aes128", "aes192", "aes256", "aes256_ae1"]{
+        let mut zp = strs.String.init();
+        defer zp.deinit();
+        fmt.write(zp.writer(), "std/archive/zip/testdata/{}.zip", [fmt.str(name)])!;
+        let data = fs.read_file(zp.bytes())!;
+        defer mem.free(data);
+        let mut a = Archive.open(data)!;
+        defer a.deinit();
+        @expect_eq(a.entries.len, 3);
+        for e in a.entries {
+            @expect(e.encrypted());
+            @expect(needs_password(&a, e));
+        }
+        let h = a.extract_password(a.find("hello.txt")!, "secret")!;
+        defer mem.free(h);
+        @expect_eq(h, "Hello, world!\n");
+        let d = a.extract_password(a.find("data.bin")!, "secret")!;
+        defer mem.free(d);
+        @expect_eq(d, want.bytes());
+        let z = a.extract_password(a.find("empty.txt")!, "secret")!;
+        defer mem.free(z);
+        @expect_eq(z.len, 0);
+        @expect(wrong_password(&a, a.find("data.bin")!, "Secret"));
+        @expect(wrong_password(&a, a.find("hello.txt")!, ""));
+    }
+    // an AES entry whose ciphertext was altered fails its MAC
+    let data = fs.read_file("std/archive/zip/testdata/aes256.zip")!;
+    defer mem.free(data);
+    let mut a = Archive.open(data)!;
+    defer a.deinit();
+    let e = a.find("data.bin")!;
+    let raw = a.raw(e)!;
+    let copy = mem.dup(data)!;
+    defer mem.free(copy);
+    let at = (@int_from_ptr(raw.ptr) - @int_from_ptr(data.ptr)) + 100;
+    copy[at] ^= 1;
+    let mut b = Archive.open(copy)!;
+    defer b.deinit();
+    let r = b.extract_password(b.find("data.bin")!, "secret");
+    _ = r catch |err| {
+        @expect(err == error.ChecksumMismatch);
+        return;
+    };
+    @expect(false);
+}
+
+test "writing AES-encrypted entries" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut big = strs.String.init();
+    defer big.deinit();
+    data_bin(&mut big)!;
+    let mut w = Writer.init(s.writer());
+    let mut o = Options.default();
+    o.password = "pa55";
+    w.add("big.bin", big.bytes(), o)!;
+    w.add("tiny", "x", o)!;
+    w.add("empty", "", o)!;
+    o.password = "";
+    w.add("plain.txt", "not secret", o)!;
+    w.finish()!;
+    w.deinit();
+    let mut a = Archive.open(s.bytes())!;
+    defer a.deinit();
+    let e = a.find("big.bin")!;
+    @expect(e.encrypted() and (e.method == AES) and (e.aes_strength == 3) and (e.aes_version == 2));
+    @expect_eq(e.aes_method, DEFLATE);
+    @expect_eq(e.crc, 0);
+    let b = a.extract_password(e, "pa55")!;
+    defer mem.free(b);
+    @expect_eq(b, big.bytes());
+    let t = a.extract_password(a.find("tiny")!, "pa55")!;
+    defer mem.free(t);
+    @expect_eq(t, "x");
+    @expect_eq(a.find("tiny")!.aes_method, STORE);
+    let z = a.extract_password(a.find("empty")!, "pa55")!;
+    defer mem.free(z);
+    @expect_eq(z.len, 0);
+    @expect(wrong_password(&a, e, "pass"));
+    // unencrypted entries need no password, and take one harmlessly
+    let p = a.extract_password(a.find("plain.txt")!, "pa55")!;
+    defer mem.free(p);
+    @expect_eq(p, "not secret");
+    @expect(not a.find("plain.txt")!.encrypted());
 }
