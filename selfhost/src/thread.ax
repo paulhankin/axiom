@@ -337,8 +337,11 @@ fn copy_cost(b: *ir.Block) i32 {
 }
 
 // Threads one edge in f; true if it did.
-fn thread_one(f: *mut ir.Func) bool {
-    opt.compute_preds(f);
+// (preds_ok: f's predecessor lists are up to date)
+fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
+    if not preds_ok {
+        opt.compute_preds(f);
+    }
     let order = opt.dominators(f);
     let mut done = false;
     for bi in 1..order.len {
@@ -402,14 +405,48 @@ fn thread_one(f: *mut ir.Func) bool {
 
 let mut gen: i64 = 0;
 
-// Threads edges until none is left (or a limit); true if any.
+// Could thread_one find anything (before it works out dominators): a
+// block, cheap to copy, that branches on a value it computes, known on the
+// edge from one of its predecessors?
+fn candidates(f: *mut ir.Func) bool {
+    opt.compute_preds(f);
+    let mut b = f.first.next;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (b.preds.len >= 2) and
+           (t.a.kind == ir.V_INST) and (t.a.blk == b) and (copy_cost(b) <= MAX_COPY) {
+            for k in 0..b.preds.len {
+                let p = b.preds.get(k);
+                if p == b {
+                    continue;
+                }
+                let c = eval(t.a, b, p, 0);
+                if u.isnil(c) {
+                    continue;
+                }
+                let mut s = t.t2;
+                if ir.cint_val(c) != 0 {
+                    s = t.t1;
+                }
+                if s != b {
+                    return true;
+                }
+            }
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+// Threads edges until none is left (or a limit); true if any. When it
+// returns false, f's predecessor lists are up to date.
 pub fn jump_thread(f: *mut ir.Func) bool {
-    if u.isnil(f.first) {
+    if u.isnil(f.first) or not candidates(f) {
         return false;
     }
     gen += 1;
     let mut n: i32 = 0;
-    while (n < 256) and thread_one(f) {
+    while (n < 256) and thread_one(f, n == 0) {
         n += 1;
     }
     if n > 0 {
@@ -719,11 +756,14 @@ fn sink_stores(d: *mut ir.Block) bool {
     }
 }
 
-pub fn if_convert(f: *mut ir.Func) bool {
+// (preds_ok: f's predecessor lists are up to date)
+pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     if u.isnil(f.first) {
         return false;
     }
-    opt.compute_preds(f);
+    if not preds_ok {
+        opt.compute_preds(f);
+    }
     mark_addrs(f);
     let mut any = false;
     let mut b = f.first;

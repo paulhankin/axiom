@@ -1786,7 +1786,7 @@ axiom run   <file.ax> [--export=name]  # build for wasm32 and execute in the ref
 axiom explain <CODE>                   # long-form documentation for a diagnostic code
 axiom test  <file.ax> [--filter=text] [--timeout=ms]   # run test blocks (§17)
 axiom new   <name>                     # create a package skeleton (§4.6)
-axiom profile <file.ax> [--rate=hz]    # sampling profiler (§16.6)
+axiom profile <file.ax> [-- args]      # sampling profiler (§16.6)
 axiom cache [path|clean]               # the compiled-module cache (§16.7)
 ```
 
@@ -2067,9 +2067,13 @@ directory down (`vec` is `std/collections/vec`).
 ```
 axiom profile <file.ax> | <package dir> [--target=wasm32|native] [-O0..-O3]
                  [--rate=<hz>] [--folded=<path>] [--format=human|agent-json]
+                 [-- <program arguments>]
 ```
 
 `axiom profile` builds the program, runs its `main`, and reports where the time went.
+Arguments after `--` are passed to the program, and its standard input is the
+profiler's (so `axiom profile selfhost/src/main.ax -- build app.ax -O2` profiles the
+compiler).
 It is a **sampling profiler**. About `--rate` times a second (default 999) it copies the
 running thread's shadow stack (§16.4.1), so every sample is an exact source-level call
 path. It is not an estimate from machine addresses.

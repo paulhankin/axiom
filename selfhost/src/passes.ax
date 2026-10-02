@@ -20,55 +20,75 @@ import "target.ax" as tg;
 import "thread.ax" as thr;
 import "util.ax" as u;
 
-fn cleanup(f: *mut ir.Func, level: i32) void {
-    let mut rounds: i32 = 0;
-    loop {
-        let a = opt.fold_combine(f, level > 0);
-        let mut c = opt.simplify_cfg(f);
-        if (level > 0) and thr.jump_thread(f) {
-            c = true;
-        }
-        if (level > 0) and thr.if_convert(f) {
-            c = true;
-        }
-        rounds += 1;
-        if not (a or c) or (rounds > 8) {
-            break;
-        }
+// Runs the sub-passes in turn until each has run on the current IR without
+// changing it (a pass that changed nothing need not run again until another
+// one has). True if anything changed.
+fn cleanup(f: *mut ir.Func, level: i32) bool {
+    let mut any = false;
+    let mut npasses: i32 = 2;
+    if level > 0 {
+        npasses = 4;
     }
+    let mut quiet: i32 = 0;  // passes in a row that changed nothing
+    let mut threaded = false;
+    let mut k: i32 = 0;
+    while (quiet < npasses) and (k < (9 * npasses)) {
+        let p = k % npasses;
+        let mut c = false;
+        if p == 0 {
+            c = opt.fold_combine(f, level > 0);
+        } else if p == 1 {
+            c = opt.simplify_cfg(f);
+        } else if p == 2 {
+            c = thr.jump_thread(f);
+        } else {
+            c = thr.if_convert(f, not threaded);
+        }
+        if p == 2 {
+            threaded = c;
+        }
+        if c {
+            quiet = 0;
+            any = true;
+        } else {
+            quiet += 1;
+        }
+        k += 1;
+    }
+    return any;
 }
 
 pub fn optimize_func(f: *mut ir.Func, level: i32) void {
     opt.mem2reg(f);
-    cleanup(f, level);
+    _ = cleanup(f, level);
     if level > 0 {
         let mut rounds: i32 = 0;
         while (rounds < 6) and sroa.sroa(f) {
             opt.mem2reg(f);
-            cleanup(f, level);
+            _ = cleanup(f, level);
             rounds += 1;
         }
+        // again only when the cleanup after it found more to do
         rounds = 0;
-        while (rounds < 3) and gvn.gvn(f) {
-            cleanup(f, level);
+        while (rounds < 3) and gvn.gvn(f) and cleanup(f, level) {
             rounds += 1;
         }
         if gvn.dse(f) {
             _ = gvn.gvn(f);
-            cleanup(f, level);
+            _ = cleanup(f, level);
         }
         if gvn.ss_opt(f) {
-            cleanup(f, level);
+            _ = cleanup(f, level);
         }
         rounds = 0;
         while (rounds < 8) and gvn.loop_idioms(f) {
-            cleanup(f, level);
+            _ = cleanup(f, level);
             rounds += 1;
         }
         if gvn.licm(f) {
-            cleanup(f, level);
+            _ = cleanup(f, level);
             _ = gvn.gvn(f);
-            cleanup(f, level);
+            _ = cleanup(f, level);
         }
         opt.dce(f);
         _ = gvn.sink(f);
@@ -115,14 +135,13 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
             let split = gvn.split_loops(f);
             if split or gvn.reduce_addresses(f, tg.is_wasm()) {
                 let mut rounds: i32 = 0;
-                while (rounds < 3) and gvn.gvn(f) {
-                    cleanup(f, level);
+                while (rounds < 3) and gvn.gvn(f) and cleanup(f, level) {
                     rounds += 1;
                 }
                 if gvn.licm(f) {
-                    cleanup(f, level);
+                    _ = cleanup(f, level);
                     _ = gvn.gvn(f);
-                    cleanup(f, level);
+                    _ = cleanup(f, level);
                 }
                 opt.dce(f);
             }

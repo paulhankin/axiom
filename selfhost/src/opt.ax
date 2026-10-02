@@ -30,13 +30,8 @@ pub fn compute_preds(f: *mut ir.Func) void {
         let t = ir.terminator(b);
         for i in 0..ir.succ_count(t) {
             let s = ir.succ(t, i);
-            let mut dup = false;
-            for k in 0..s.preds.len {
-                if s.preds.get(k) == b {
-                    dup = true;
-                }
-            }
-            if not dup {
+            // (b's edges are added together: a repeat is the last one)
+            if (s.preds.len == 0) or (s.preds.get(s.preds.len - 1) != b) {
                 s.preds.push(b);
             }
         }
@@ -458,7 +453,7 @@ fn rename_block(b: *mut ir.Block, slots: []mut *mut Slot, pushed: *mut u.List.[*
         } else if i.op == ir.OP_LOAD {
             let s = slot_of_ptr(slots, i.a);
             if u.notnil(s) {
-                i.fwd = top(s);
+                ir.forward(i, top(s));
                 ir.remove_inst(i);
             }
         } else if i.op == ir.OP_STORE {
@@ -569,40 +564,6 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
-// Number of uses of each instruction (uses; user: the last user).
-pub fn count_uses(f: *mut ir.Func) void {
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            i.uses = 0;
-            i = i.next;
-        }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            use1(i.a, i);
-            use1(i.b, i);
-            use1(i.c, i);
-            for k in 0..i.xs.len {
-                use1(i.xs.get(k), i);
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-}
-
-fn use1(o: *mut ir.Value, i: *mut ir.Value) void {
-    if u.notnil(o) and (o.kind == ir.V_INST) {
-        o.uses += 1;
-        o.user = i;
-    }
-}
-
 let mut FB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
 
 // Folds constants and trivial phis to a fixed point; with `combine`, also
@@ -625,9 +586,7 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     while changed and (rounds < 16) {
         changed = false;
         rounds += 1;
-        if combine {
-            count_uses(f);
-        }
+        cb.uses_stale = true;
         for bi in 0..order.len {
             let b = order.get(bi);
             let mut i = b.first;
@@ -654,7 +613,7 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
                         r = fold(i);
                     }
                     if u.notnil(r) and (r != i) {
-                        i.fwd = r;
+                        ir.forward(i, r);
                         ir.remove_inst(i);
                         changed = true;
                         any = true;
@@ -811,6 +770,7 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
     ir.remove_unreachable(f);
     compute_preds(f);
     // thread jumps through blocks that contain only `br X` (X without phis)
+    let mut threaded = false;
     b = f.first.next;
     while u.notnil(b) {
         let next = b.next;
@@ -828,12 +788,15 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
             }
             if b.preds.len > 0 {
                 any = true;
+                threaded = true;
             }
         }
         b = next;
     }
-    ir.remove_unreachable(f);
-    compute_preds(f);
+    if threaded {
+        ir.remove_unreachable(f);
+        compute_preds(f);
+    }
     // merge b -> s when b ends in `br s` and s has no other predecessor
     b = f.first;
     while u.notnil(b) {
@@ -845,7 +808,7 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
                 let mut p = s.first;
                 while u.notnil(p) and (p.op == ir.OP_PHI) {
                     let nx = p.next;
-                    p.fwd = p.xs.get(0);
+                    ir.forward(p, p.xs.get(0));
                     ir.remove_inst(p);
                     p = nx;
                 }

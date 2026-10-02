@@ -237,9 +237,9 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     ir.append_inst(b, br);
     if c.ty.kind != ir.T_VOID {
         if rets.len == 1 {
-            c.fwd = rets.get(0);
+            ir.forward(c, rets.get(0));
         } else if rets.len == 0 {
-            c.fwd = ir.undef(c.ty);
+            ir.forward(c, ir.undef(c.ty));
         } else {
             let p = ir.new_inst(f, ir.OP_PHI, c.ty);
             for k in 0..rets.len {
@@ -250,7 +250,7 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
             } else {
                 ir.append_inst(cont, p);
             }
-            c.fwd = p;
+            ir.forward(c, p);
         }
     }
     u.free(@ptr_cast(*mut void, args.data));
@@ -271,12 +271,19 @@ struct Node {
     scc: i32,
     calls: i32,  // direct call sites in the module
     addr_taken: bool,
+    cost: i32,      // cost(f), or -1: not known (f changed since)
+    inlinable: i8,  // inlinable(f): 1 or 0, or -1: not known
 }
 
 let mut nodes: u.List.[*mut Node] = u.List.[*mut Node].{ data: @ptr_from_int(*mut *mut Node, 0), len: 0, cap: 0 };
 
 fn node_of(f: *ir.Func) *mut Node {
     return nodes.get(@int_cast(usize, f.aux));
+}
+
+// Could v be or hold a function's address?
+fn may_ref(v: *ir.Value) bool {
+    return u.notnil(v) and ((v.kind == ir.V_FUNC) or (v.kind == ir.V_CAGG));
 }
 
 fn note_ref(v: *mut ir.Value) void {
@@ -289,6 +296,59 @@ fn note_ref(v: *mut ir.Value) void {
     }
 }
 
+// The functions whose addresses global initializers hold. Initializers do
+// not change and globals are only added, so each global is looked at once
+// (string literals make for many large constants).
+let mut gref_mod: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+let mut gref_n: usize = 0;
+let mut gref_fns: u.List.[*mut ir.Func] = u.List.[*mut ir.Func].{ data: @ptr_from_int(*mut *mut ir.Func, 0), len: 0,
+                                                                  cap: 0 };
+
+fn collect_fns(v: *mut ir.Value) void {
+    if v.kind == ir.V_FUNC {
+        gref_fns.push(v.fnp);
+    } else if v.kind == ir.V_CAGG {
+        for k in 0..v.xs.len {
+            collect_fns(v.xs.get(k));
+        }
+    }
+}
+
+fn global_refs(m: *mut ir.Module) void {
+    if gref_mod != m {
+        gref_mod = m;
+        gref_n = 0;
+        gref_fns.clear();
+    }
+    for i in gref_n..m.globals.len {
+        let g = m.globals.get(i);
+        if u.notnil(g.init) {
+            collect_fns(g.init);
+        }
+    }
+    gref_n = m.globals.len;
+    for i in 0..gref_fns.len {
+        node_of(gref_fns.get(i)).addr_taken = true;
+    }
+}
+
+fn node_cost(n: *mut Node) i32 {
+    if n.cost < 0 {
+        n.cost = cost(n.f);
+    }
+    return n.cost;
+}
+
+fn node_inlinable(n: *mut Node) bool {
+    if n.inlinable < 0 {
+        n.inlinable = 0;
+        if inlinable(n.f) {
+            n.inlinable = 1;
+        }
+    }
+    return n.inlinable == 1;
+}
+
 fn build_graph(m: *mut ir.Module) void {
     nodes.clear();
     for i in 0..m.funcs.len {
@@ -297,6 +357,8 @@ fn build_graph(m: *mut ir.Module) void {
         let n = u.new.[Node]();
         n.f = f;
         n.index = -1;
+        n.cost = -1;
+        n.inlinable = -1;
         nodes.push(n);
     }
     for i in 0..m.funcs.len {
@@ -310,25 +372,27 @@ fn build_graph(m: *mut ir.Module) void {
                 if u.notnil(g) {
                     n.callees.push(@int_cast(i32, g.aux));
                     node_of(g).calls += 1;
-                } else {
+                } else if may_ref(x.a) {
                     note_ref(x.a);
                 }
-                note_ref(x.b);
-                note_ref(x.c);
+                if may_ref(x.b) {
+                    note_ref(x.b);
+                }
+                if may_ref(x.c) {
+                    note_ref(x.c);
+                }
                 for k in 0..x.xs.len {
-                    note_ref(x.xs.get(k));
+                    let o = x.xs.get(k);
+                    if may_ref(o) {
+                        note_ref(o);
+                    }
                 }
                 x = x.next;
             }
             b = b.next;
         }
     }
-    for i in 0..m.globals.len {
-        let g = m.globals.get(i);
-        if u.notnil(g.init) {
-            note_ref(g.init);
-        }
-    }
+    global_refs(m);
 }
 
 // Tarjan's algorithm, iteratively; `order` receives the functions callees
@@ -443,10 +507,10 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
         return false;
     }
     let gn = node_of(g);
-    if (gn.scc == n.scc) or not inlinable(g) {
+    if (gn.scc == n.scc) or not node_inlinable(gn) {
         return false;
     }
-    let gc = cost(g);
+    let gc = node_cost(gn);
     if gc <= SMALL {
         return true;
     }
@@ -498,7 +562,7 @@ fn inline_into(n: *mut Node) bool {
             let c = calls.get(k);
             if want(n, c, fcost) {
                 let g = callee_of(c);
-                fcost += cost(g);
+                fcost += node_cost(node_of(g));
                 node_of(g).calls -= 1;
                 count_calls(g);
                 inline_call(f, c);
@@ -544,6 +608,8 @@ pub fn inline_module(m: *mut ir.Module, simplify: fn(*mut ir.Func) void) void {
         }
         if inline_into(n) {
             simplify(n.f);
+            n.cost = -1;
+            n.inlinable = -1;
         }
     }
     u.free(@ptr_cast(*mut void, order.data));
@@ -679,14 +745,14 @@ pub fn ipcp(m: *mut ir.Module) u.List.[*mut ir.Func] {
         for k in 0..f.params.len {
             let c = cs[k];
             if u.notnil(c) and (c != f.val) {
-                f.params[k].fwd = c;
+                ir.forward(f.params[k], c);
                 any = true;
             }
         }
         if any {
             ir.apply_forwarding(f);
             for k in 0..f.params.len {
-                f.params[k].fwd = vnil();
+                ir.forward(f.params[k], vnil());
             }
             changed.push(f);
         }

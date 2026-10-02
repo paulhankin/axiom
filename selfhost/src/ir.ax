@@ -470,6 +470,7 @@ pub const F_VOLATILE: u32 = 1;
 pub const F_ATOMIC: u32 = 2;  // sequentially consistent
 
 pub struct Value {
+    // the fields every walk over the IR reads come first (two cache lines)
     kind: i32,
     op: i32,
     ty: *mut Ty,
@@ -477,35 +478,35 @@ pub struct Value {
     b: *mut Value,
     c: *mut Value,
     xs: u.List.[*mut Value],
+    next: *mut Value,
+    prev: *mut Value,
+    blk: *mut Block,
+    fwd: *mut Value,   // replacement (passes forward uses through resolve())
+    user: *mut Value,  // the only user (when uses == 1)
+    uses: i32,
+    flags: u32,
+    cv: u64,
+    id: i32,
+    align: u32,
     bs: u.List.[*mut Block],
     t1: *mut Block,
     t2: *mut Block,
-    cv: u64,
     fv: f64,
-    flags: u32,
-    align: u32,
     aty: *mut Ty,     // ALLOCA: allocated type
     fty: *mut Ty,     // CALL: signature
     mask: []mut i32,  // SHUFFLE
     ext: []mut u8,    // CALL: argument extension (0 none, 1 zext, 2 sext)
-    blk: *mut Block,
-    prev: *mut Value,
-    next: *mut Value,
     gv: *mut Global,
     fnp: *mut Func,
-    id: i32,
-    uses: i32,
     name: []u8,
     aux: i64,  // pass / backend scratch
     aux2: i64,
     auxp: *mut void,
-    fwd: *mut Value,  // replacement (passes forward uses through resolve())
     // backend scratch
     pos: i32,  // position in its block
     loc: i32,  // local / virtual register
     flag: i32,
-    user: *mut Value,  // the only user (when uses == 1)
-    grave: u32,        // 1 + its index in the graveyard (0: not there)
+    grave: u32,  // 1 + its index in the graveyard (0: not there)
 }
 
 pub struct Block {
@@ -558,6 +559,7 @@ pub struct Func {
     id: i32,
     aux: i64,
     auxp: *mut void,
+    fwd_seen: u64,  // fwd_epoch when apply_forwarding last rewrote f
 }
 
 pub struct Global {
@@ -1004,8 +1006,22 @@ pub fn resolve(v: *mut Value) *mut Value {
     return x;
 }
 
+// Bumped whenever a value is forwarded: a function that apply_forwarding
+// has rewritten since then has no operand to rewrite.
+let mut fwd_epoch: u64 = 1;
+
+// Forwards v's uses to r (or, with r nil, stops forwarding them).
+pub fn forward(v: *mut Value, r: *mut Value) void {
+    v.fwd = r;
+    fwd_epoch += 1;
+}
+
 // Rewrites every operand of f's instructions through resolve().
 pub fn apply_forwarding(f: *mut Func) void {
+    if f.fwd_seen == fwd_epoch {
+        return;
+    }
+    f.fwd_seen = fwd_epoch;
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
@@ -2128,7 +2144,7 @@ pub fn merge_same_named(m: *mut Module) void {
         if is_decl(f) {
             let d = defs.get(f.name);
             if u.notnil(d) {
-                f.val.fwd = d.val;
+                forward(f.val, d.val);
                 any = true;
                 continue;
             }

@@ -1,7 +1,7 @@
 # 0007: `axiom profile` cannot pass arguments to the program
 
 - Type: feature
-- Status: open
+- Status: fixed (commit "Faster optimizer, part 1")
 - Area: compiler (selfhost), `axiom profile`
 
 `axiom profile <file.ax> [--rate=<hz>] [--folded=<path>]` builds and runs a
@@ -14,3 +14,5 @@ timers.
 Suggested: everything after `--` goes to the program
 (`axiom profile selfhost/src/main.ax -- build x.ax -O2`), and stdin is
 passed through.
+
+Fixed: arguments after `--` go to the program; stdin is inherited.
