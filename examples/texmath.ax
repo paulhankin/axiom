@@ -1,0 +1,158 @@
+// =============================================================================
+// File: texmath.ax
+// Typesets TeX math: as SVG, PNG or PDF with a math font, or as MathML or
+// plain Unicode text.
+//
+//   axiom build examples/texmath.ax --target=native -o texmath
+//   ./texmath -o quadratic.svg 'x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}'
+//   ./texmath -f STIXTwoMath-Regular.otf -s 32 -o euler.png 'e^{i\pi} + 1 = 0'
+//   ./texmath -o out.pdf '\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt\pi}{2}'
+//   ./texmath -o page.html '\sum_{n=1}^\infty \frac{1}{n^2} = \frac{\pi^2}{6}'
+//   ./texmath '\alpha^2 + \beta_1'                     (text: α² + β₁)
+//
+// The output's extension picks the format. The default font is the STIX Two
+// Math subset in std/text/math/testdata (run from the repository's root);
+// any OpenType font with a MATH table does better, and others work too.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/compress/xz" as xz;
+import "std/fmt" as fmt;
+import "std/graphics/color" as color;
+import "std/graphics/draw" as draw;
+import "std/graphics/font" as font;
+import "std/graphics/image" as image;
+import "std/graphics/image/png" as png;
+import "std/graphics/pdf" as pdf;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/str" as strs;
+import "std/text/math" as math;
+import "std/text/math/typeset" as typeset;
+
+let DEFAULT_FONT: []u8 = "std/text/math/testdata/STIXTwoMath-subset.ttf.xz";
+
+// The font file's bytes (an .xz file unpacked).
+fn font_data(path: []u8) ![]mut u8 {
+    let data = fs.read_file(path)!;
+    if not strs.ends_with(path, ".xz") {
+        return data;
+    }
+    defer mem.free(data);
+    return xz.decompress(data, 64000000);
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("texmath", "Typeset TeX math as SVG, PNG, PDF, MathML or text.");
+    defer p.deinit();
+    p.option("output", 'o', "FILE", "write here; .svg, .png, .pdf, .html or .txt (default: text to stdout)")!;
+    p.option("font", 'f', "FILE", "a math font (.otf, .ttf, or .xz of one)")!;
+    p.option("size", 's', "PX", "the font size in px (points in PDF; default 24)")!;
+    p.flag("inline", 'i', "text style, as in a line, rather than display style")!;
+    p.positional("TEX", "the formula", cli.Arity.REQUIRED)!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("texmath: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    let tex = m.get("TEX", "");
+    let out = m.get("output", "");
+    let size = m.float("size", 24.0)!;
+    let mut display = math.Display.BLOCK;
+    if m.has("inline") {
+        display = math.Display.INLINE;
+    }
+    let mut info = math.ErrorInfo.{ offset: 0, message: "" };
+    let mut f = math.parse_with(tex, &mut info) catch |e| {
+        if e == error.InvalidMath {
+            fmt.eprint("texmath: {} at offset {}\n", [fmt.str(info.message), fmt.int(info.offset)])!;
+            return 1;
+        }
+        return e;
+    };
+    defer f.deinit();
+
+    if (out.len == 0) or strs.ends_with(out, ".txt") {
+        let mut s = strs.String.init();
+        defer s.deinit();
+        f.write_text(s.writer())!;
+        s.push('\n')!;
+        if out.len == 0 {
+            io.stdout().print(s.bytes())!;
+        } else {
+            fs.write_file(out, s.bytes())!;
+        }
+        return 0;
+    }
+    if strs.ends_with(out, ".html") {
+        let mut s = strs.String.init();
+        defer s.deinit();
+        s.push_str("<!doctype html>\n<meta charset=\"utf-8\">\n<p>")!;
+        f.write_mathml(s.writer(), display)!;
+        s.push_str("</p>\n")!;
+        fs.write_file(out, s.bytes())!;
+        return 0;
+    }
+
+    let data = font_data(m.get("font", DEFAULT_FONT))!;
+    defer mem.free(data);
+    let mut fnt = font.Font.init(data)!;
+    let mut t = typeset.typeset(&f, &fnt, size, display)!;
+    defer t.deinit();
+    let margin = size / 4.0;
+    let w = (t.right - t.left) + (2.0 * margin);
+    let h = (t.top + t.bottom) + (2.0 * margin);
+    let x = margin - t.left;
+    let y = margin + t.top;
+    if strs.ends_with(out, ".svg") {
+        let mut s = strs.String.init();
+        defer s.deinit();
+        t.write_svg(s.writer())!;
+        s.push('\n')!;
+        fs.write_file(out, s.bytes())!;
+    } else if strs.ends_with(out, ".png") {
+        let mut img = image.Image.init(@int_from_float(usize, @ceil(w)), @int_from_float(usize, @ceil(h)), 4,
+                                       image.Depth.U8)!;
+        defer img.deinit();
+        img.fill(color.Color.rgb(1.0, 1.0, 1.0));
+        let mut cv = draw.Canvas.init(&mut img);
+        defer cv.deinit();
+        t.draw(&mut cv, x, y, draw.Paint.solid(color.Color.rgb(0.0, 0.0, 0.0)))!;
+        let bytes = png.encode(&img, 6)!;
+        defer mem.free(bytes);
+        fs.write_file(out, bytes)!;
+    } else if strs.ends_with(out, ".pdf") {
+        let mut doc = pdf.Document.init();
+        defer doc.deinit();
+        doc.set_info("Title", tex)!;
+        let mut page = doc.page(w, h)!;
+        defer page.deinit();
+        t.draw_pdf(&mut page, x, y, color.Color.rgb(0.0, 0.0, 0.0))!;
+        doc.add_page(&mut page)!;
+        doc.save(out)!;
+    } else {
+        fmt.eprint("texmath: {}: not .svg, .png, .pdf, .html or .txt\n", [fmt.str(out)])!;
+        return 2;
+    }
+    return 0;
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

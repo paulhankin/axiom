@@ -9,7 +9,7 @@
 //
 //     let mut t = typeset.typeset(&formula, &f, 20.0, math.Display.INLINE)!;
 //     defer t.deinit();
-//     t.write_svg(w)!;                       // or t.draw(&mut canvas, x, baseline, paint)
+//     t.write_svg(w)!;     // or t.draw(&mut canvas, x, baseline, paint), t.draw_pdf(&mut page, ...)
 //     ... t.width, t.height (above the baseline), t.depth (below it) ...
 //
 // Layout follows TeX's rules for math (styles, cramped styles, the spacing
@@ -25,6 +25,9 @@
 // view it), filled with currentColor except where \color says otherwise,
 // with the formula's text form as its title; its vertical-align puts the
 // baseline on the surrounding text's.
+//
+// examples/texmath.ax is a command-line front end (SVG, PNG, PDF, MathML,
+// text).
 // =============================================================================
 
 import "../../collections/vec.ax" as vec;
@@ -34,6 +37,7 @@ import "../../graphics/color.ax" as colors;
 import "../../graphics/draw.ax" as draw;
 import "../../graphics/font.ax" as font;
 import "../../graphics/image.ax" as image;
+import "../../graphics/pdf.ax" as pdf;
 import "../../graphics/svg.ax" as svg;
 import "../../graphics/svg/css.ax" as css;
 import "../../io.ax" as io;
@@ -1132,9 +1136,15 @@ fn lay_scripts(t: *mut Setter, i: u32, st0: St) !Box {
             }
         }
     }
-    // the italic correction moves the superscript out
-    let sup_x = base.w + base.italic;
-    let sub_x = base.w;
+    // the italic correction moves the superscript out, or (integrals, which
+    // slant) the subscript in
+    let mut sup_x = base.w + base.italic;
+    let mut sub_x = base.w;
+    let bi = unwrap(t.f, n.a);
+    if (bi != NIL) and (t.f.node(bi).kind == m.Kind.OP) and (t.f.node(bi).cls == m.C_INT) {
+        sup_x = base.w;
+        sub_x = base.w - base.italic;
+    }
     let after = px(t, st, SPACE_AFTER_SCRIPT);
     let mut w = base.w;
     if n.c != NIL {
@@ -1651,6 +1661,26 @@ pub struct Typeset {
         w.print("</svg>")!;
     }
 
+    /// Draws the formula on a PDF page (in points, one px of the size a
+    /// point), its baseline's origin at (x, y): outlines filled in `c`, or
+    /// in \color's colours where they parse.
+    pub fn draw_pdf(self: *Typeset, page: *mut pdf.Page, x: f64, y: f64, c: colors.Color) !void {
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        for k in @as(usize, 0)..self.colors.len + 1 {
+            p.clear();
+            self.path(@truncate(u32, k), &mut p, x, y)!;
+            if p.verbs.len == 0 {
+                continue;
+            }
+            let mut col = c;
+            if k > 0 {
+                col = css.parse_color(self.colors.get(k - 1)) catch c;
+            }
+            page.fill(&p, draw.Paint.solid(col), draw.FillRule.NONZERO)!;
+        }
+    }
+
     /// Fills the formula onto a canvas, its baseline's origin at (x, y):
     /// \color's colours where they parse (as CSS), else `paint`.
     pub fn draw(self: *Typeset, cv: *mut draw.Canvas, x: f64, y: f64, paint: draw.Paint) !void {
@@ -2001,6 +2031,16 @@ test "SVG and drawing" {
         k += 4;
     }
     @expect(blue > 20);
+    // on a PDF page
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    let mut page = doc.page(200.0, 100.0)!;
+    defer page.deinit();
+    t.draw_pdf(&mut page, 20.0, 50.0, colors.Color.rgb(0.0, 0.0, 0.0))!;
+    doc.add_page(&mut page)!;
+    let bytes = doc.bytes()!;
+    defer mem.free(bytes);
+    @expect(strs.starts_with(bytes, "%PDF-") and (bytes.len > 500));
 }
 
 test "Markdown math as SVG" {
