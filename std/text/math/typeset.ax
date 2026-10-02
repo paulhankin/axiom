@@ -1,0 +1,1895 @@
+// =============================================================================
+// std/text/math/typeset.ax - typesetting TeX math (std/text/math) with an
+// OpenType math font: to SVG, or onto a draw.Canvas.
+//
+//     let mut f = font.Font.load("STIXTwoMath-Regular.otf")!;
+//     defer f.deinit();
+//     let svg = typeset.to_svg("x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}", &f, 20.0, math.Display.BLOCK)!;
+//     defer mem.free(svg);
+//
+//     let mut t = typeset.typeset(&formula, &f, 20.0, math.Display.INLINE)!;
+//     defer t.deinit();
+//     t.write_svg(w)!;                       // or t.draw(&mut canvas, x, baseline, paint)
+//     ... t.width, t.height (above the baseline), t.depth (below it) ...
+//
+// Layout follows TeX's rules for math (styles, cramped styles, the spacing
+// between atoms, scripts, limits, fractions, radicals, delimiters) with the
+// parameters of the font's MATH table: its constants, italic corrections,
+// accent attachment points, and the bigger variants and glyph assemblies
+// that stretch delimiters, radicals, big operators and wide accents. Single
+// letters are set in mathematical italic. A font without a MATH table
+// (Liberation, say) still works: the constants default to those of STIX
+// Two Math scaled to the font, and delimiters stretch by scaling.
+//
+// The SVG draws the glyph outlines as paths (no fonts or scripts needed to
+// view it), filled with currentColor except where \color says otherwise,
+// with the formula's text form as its title; its vertical-align puts the
+// baseline on the surrounding text's.
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../compress/xz.ax" as xz;
+import "../../fmt.ax" as fmt;
+import "../../graphics/color.ax" as colors;
+import "../../graphics/draw.ax" as draw;
+import "../../graphics/font.ax" as font;
+import "../../graphics/image.ax" as image;
+import "../../graphics/svg.ax" as svg;
+import "../../graphics/svg/css.ax" as css;
+import "../../io.ax" as io;
+import "../../mem.ax" as mem;
+import "../../os/fs.ax" as fs;
+import "../../str.ax" as strs;
+import "../math.ax" as m;
+
+error { OutOfMemory }
+
+const NIL: u32 = 0xffffffff;
+
+// MathConstants: the MathValueRecords in table order (after four int16s)
+const AXIS_HEIGHT: usize = 1;
+const ACCENT_BASE_HEIGHT: usize = 2;
+const SUBSCRIPT_SHIFT_DOWN: usize = 4;
+const SUBSCRIPT_TOP_MAX: usize = 5;
+const SUBSCRIPT_BASELINE_DROP_MIN: usize = 6;
+const SUPERSCRIPT_SHIFT_UP: usize = 7;
+const SUPERSCRIPT_SHIFT_UP_CRAMPED: usize = 8;
+const SUPERSCRIPT_BOTTOM_MIN: usize = 9;
+const SUPERSCRIPT_BASELINE_DROP_MAX: usize = 10;
+const SUB_SUPERSCRIPT_GAP_MIN: usize = 11;
+const SUPERSCRIPT_BOTTOM_MAX_WITH_SUBSCRIPT: usize = 12;
+const SPACE_AFTER_SCRIPT: usize = 13;
+const UPPER_LIMIT_GAP_MIN: usize = 14;
+const UPPER_LIMIT_BASELINE_RISE_MIN: usize = 15;
+const LOWER_LIMIT_GAP_MIN: usize = 16;
+const LOWER_LIMIT_BASELINE_DROP_MIN: usize = 17;
+const STACK_TOP_SHIFT_UP: usize = 18;
+const STACK_TOP_DISPLAY_SHIFT_UP: usize = 19;
+const STACK_BOTTOM_SHIFT_DOWN: usize = 20;
+const STACK_BOTTOM_DISPLAY_SHIFT_DOWN: usize = 21;
+const STACK_GAP_MIN: usize = 22;
+const STACK_DISPLAY_GAP_MIN: usize = 23;
+const STRETCH_STACK_GAP_ABOVE_MIN: usize = 26;
+const STRETCH_STACK_GAP_BELOW_MIN: usize = 27;
+const FRACTION_NUM_SHIFT_UP: usize = 28;
+const FRACTION_NUM_DISPLAY_SHIFT_UP: usize = 29;
+const FRACTION_DENOM_SHIFT_DOWN: usize = 30;
+const FRACTION_DENOM_DISPLAY_SHIFT_DOWN: usize = 31;
+const FRACTION_NUM_GAP_MIN: usize = 32;
+const FRACTION_NUM_DISPLAY_GAP_MIN: usize = 33;
+const FRACTION_RULE_THICKNESS: usize = 34;
+const FRACTION_DENOM_GAP_MIN: usize = 35;
+const FRACTION_DENOM_DISPLAY_GAP_MIN: usize = 36;
+const OVERBAR_VERTICAL_GAP: usize = 39;
+const OVERBAR_RULE_THICKNESS: usize = 40;
+const OVERBAR_EXTRA_ASCENDER: usize = 41;
+const UNDERBAR_VERTICAL_GAP: usize = 42;
+const UNDERBAR_RULE_THICKNESS: usize = 43;
+const UNDERBAR_EXTRA_DESCENDER: usize = 44;
+const RADICAL_VERTICAL_GAP: usize = 45;
+const RADICAL_DISPLAY_VERTICAL_GAP: usize = 46;
+const RADICAL_RULE_THICKNESS: usize = 47;
+const RADICAL_EXTRA_ASCENDER: usize = 48;
+const RADICAL_KERN_BEFORE_DEGREE: usize = 49;
+const RADICAL_KERN_AFTER_DEGREE: usize = 50;
+const N_CONSTANTS: usize = 51;
+
+// STIX Two Math's constants (per 1000 units per em), for fonts without a MATH table
+let DEFAULT_CONSTANTS: [51]i32 = [150, 258, 480, 656, 210, 368, 160, 360, 252, 120, 230, 150, 380, 40, 135, 300, 135,
+                                  670, 470, 780, 385, 690, 150, 300, 800, 590, 68, 68, 585, 640, 585, 640, 68, 150, 68,
+                                  68, 150, 350, 68, 175, 68, 68, 175, 68, 68, 85, 170, 68, 78, 65, -335];
+
+// A font and its MATH table (offsets within it; 0 where a part is missing).
+struct MathFont {
+    f: *font.Font,
+    t: []u8,
+    upem: f64,
+    consts: [51]f64,
+    script_pct: f64,
+    sscript_pct: f64,
+    display_op_min: f64,
+    degree_raise_pct: f64,
+    italics: usize,
+    accents: usize,
+    variants: usize,
+    min_overlap: f64,
+    has_math: bool,
+}
+
+fn u16_at(d: []u8, off: usize) u32 {
+    if (off + 2) > d.len {
+        return 0;
+    }
+    return (@as(u32, d[off]) << 8) | @as(u32, d[off + 1]);
+}
+
+fn i16_at(d: []u8, off: usize) i32 {
+    let v = u16_at(d, off);
+    if v >= 0x8000 {
+        return @as(i32, @int_cast(i32, v)) - 0x10000;
+    }
+    return @as(i32, @int_cast(i32, v));
+}
+
+// An offset from a table at `base` (0 if null or out of range).
+fn sub_table(d: []u8, base: usize, at_off: usize) usize {
+    let o = u16_at(d, at_off);
+    if (o == 0) or ((base + @as(usize, o)) >= d.len) {
+        return 0;
+    }
+    return base + @as(usize, o);
+}
+
+// The coverage index of a glyph, or -1.
+fn coverage(d: []u8, cov: usize, gid: u32) i64 {
+    if cov == 0 {
+        return -1;
+    }
+    let format = u16_at(d, cov);
+    let count = @as(usize, u16_at(d, cov + 2));
+    if format == 1 {
+        let mut lo: usize = 0;
+        let mut hi = count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let g = u16_at(d, cov + 4 + (2 * mid));
+            if g == gid {
+                return @as(i64, @int_cast(i64, mid));
+            }
+            if g < gid {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+    } else if format == 2 {
+        let mut lo: usize = 0;
+        let mut hi = count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let r = cov + 4 + (6 * mid);
+            let start = u16_at(d, r);
+            let end = u16_at(d, r + 2);
+            if gid < start {
+                hi = mid;
+            } else if gid > end {
+                lo = mid + 1;
+            } else {
+                return @as(i64, u16_at(d, r + 4) + (gid - start));
+            }
+        }
+    }
+    return -1;
+}
+
+fn load_math(f: *font.Font) MathFont {
+    let t = f.table("MATH");
+    let upem = @float_from_int(f64, @max(f.units_per_em, 16));
+    let mut mf = MathFont.{
+        f: f,
+        t: t,
+        upem: upem,
+        consts: [0.0; 51],
+        script_pct: 70.0,
+        sscript_pct: 55.0,
+        display_op_min: 1.8 * upem,
+        degree_raise_pct: 55.0,
+        italics: 0,
+        accents: 0,
+        variants: 0,
+        min_overlap: 0.0,
+        has_math: false,
+    };
+    let consts = sub_table(t, 0, 4);
+    if (t.len >= 10) and (consts != 0) and ((consts + 214) <= t.len) {
+        mf.has_math = true;
+        mf.script_pct = @float_from_int(f64, i16_at(t, consts));
+        mf.sscript_pct = @float_from_int(f64, i16_at(t, consts + 2));
+        mf.display_op_min = @float_from_int(f64, u16_at(t, consts + 6));
+        for k in @as(usize, 0)..N_CONSTANTS {
+            mf.consts[k] = @float_from_int(f64, i16_at(t, consts + 8 + (4 * k)));
+        }
+        mf.degree_raise_pct = @float_from_int(f64, i16_at(t, consts + 8 + (4 * N_CONSTANTS)));
+        let info = sub_table(t, 0, 6);
+        if info != 0 {
+            mf.italics = sub_table(t, info, info);
+            mf.accents = sub_table(t, info, info + 2);
+        }
+        mf.variants = sub_table(t, 0, 8);
+        if mf.variants != 0 {
+            mf.min_overlap = @float_from_int(f64, u16_at(t, mf.variants));
+        }
+        if (mf.script_pct <= 0.0) or (mf.script_pct > 100.0) {
+            mf.script_pct = 70.0;
+        }
+        if (mf.sscript_pct <= 0.0) or (mf.sscript_pct > 100.0) {
+            mf.sscript_pct = 55.0;
+        }
+    } else {
+        for k in @as(usize, 0)..N_CONSTANTS {
+            mf.consts[k] = @float_from_int(f64, DEFAULT_CONSTANTS[k]) * upem / 1000.0;
+        }
+    }
+    return mf;
+}
+
+// A value from a table of MathValueRecords keyed by coverage (italic
+// corrections, accent attachments); `found` says whether the glyph has one.
+fn glyph_value(mf: *MathFont, table: usize, gid: u32, found: *mut bool) f64 {
+    found.* = false;
+    if table == 0 {
+        return 0.0;
+    }
+    let t = mf.t;
+    let idx = coverage(t, sub_table(t, table, table), gid);
+    if (idx < 0) or (idx >= @as(i64, u16_at(t, table + 2))) {
+        return 0.0;
+    }
+    found.* = true;
+    return @float_from_int(f64, i16_at(t, table + 4 + (4 * @as(usize, @int_cast(usize, idx)))));
+}
+
+// The MathGlyphConstruction of a glyph (vertical or horizontal), or 0.
+fn construction(mf: *MathFont, gid: u32, vertical: bool) usize {
+    let v = mf.variants;
+    if v == 0 {
+        return 0;
+    }
+    let t = mf.t;
+    let vcount = @as(usize, u16_at(t, v + 6));
+    let mut cov = sub_table(t, v, v + 4);
+    let mut first = v + 10 + (2 * vcount);
+    if vertical {
+        cov = sub_table(t, v, v + 2);
+        first = v + 10;
+    }
+    let idx = coverage(t, cov, gid);
+    if idx < 0 {
+        return 0;
+    }
+    let mut n = u16_at(t, v + 8);
+    if vertical {
+        n = u16_at(t, v + 6);
+    }
+    if idx >= @as(i64, n) {
+        return 0;
+    }
+    return sub_table(t, v, first + (2 * @as(usize, @int_cast(usize, idx))));
+}
+
+// -----------------------------------------------------------------------------
+// Boxes
+// -----------------------------------------------------------------------------
+
+// A glyph (scale: px per font unit; sx, sy stretch it) or a rule (w by h,
+// from (x, y) up), with its origin at (x, y), y up from the baseline.
+struct Item {
+    gid: u32,
+    rule: bool,
+    color: u32,
+    x: f64,
+    y: f64,
+    scale: f64,
+    sx: f64,
+    sy: f64,
+    w: f64,
+    h: f64,
+}
+
+// A laid-out piece: width, height above the baseline and depth below, the
+// items [start, end) (placed relative to its origin), the italic
+// correction of a final glyph, and where an accent over it attaches.
+struct Box {
+    w: f64,
+    h: f64,
+    d: f64,
+    start: usize,
+    end: usize,
+    italic: f64,
+    accent_x: f64,
+    glyph: bool,  // one glyph (scripts attach to it as to a character)
+}
+
+struct St {
+    size: f64,  // px per em
+    level: u8,  // 0 display, 1 text, 2 script, 3 scriptscript
+    cramped: bool,
+    color: u32,
+    stretch: f64,  // \middle delimiters stretch to this (0: none)
+}
+
+struct Setter {
+    mf: MathFont,
+    f: *m.Formula,
+    items: vec.Vec.[Item],
+    colors: vec.Vec.[[]u8],  // slices of the formula's strings; 0 is the default
+    base: f64,
+}
+
+fn empty_box(t: *mut Setter) Box {
+    let n = t.items.len;
+    return Box.{ w: 0.0, h: 0.0, d: 0.0, start: n, end: n, italic: 0.0, accent_x: -1.0, glyph: false };
+}
+
+fn shift(t: *mut Setter, b: *Box, dx: f64, dy: f64) void {
+    let it = t.items.items();
+    for k in b.start..b.end {
+        it[k].x += dx;
+        it[k].y += dy;
+    }
+}
+
+fn px(t: *mut Setter, st: St, k: usize) f64 {
+    return t.mf.consts[k] * st.size / t.mf.upem;
+}
+
+fn em(st: St) f64 {
+    return st.size;
+}
+
+fn script_st(t: *mut Setter, st: St, cramped: bool) St {
+    let mut s = st;
+    s.stretch = 0.0;
+    s.cramped = cramped;
+    if st.level <= 1 {
+        s.level = 2;
+        s.size = t.base * t.mf.script_pct / 100.0;
+    } else {
+        s.level = 3;
+        s.size = t.base * t.mf.sscript_pct / 100.0;
+    }
+    return s;
+}
+
+// The style of a fraction's parts: D to T, T to S, S to SS.
+fn frac_st(t: *mut Setter, st: St, cramped: bool) St {
+    if st.level == 0 {
+        let mut s = st;
+        s.level = 1;
+        s.cramped = cramped;
+        s.stretch = 0.0;
+        return s;
+    }
+    return script_st(t, st, cramped);
+}
+
+fn plain(st: St) St {
+    let mut s = st;
+    s.stretch = 0.0;
+    return s;
+}
+
+// --- glyphs ---
+
+struct Metrics {
+    adv: f64,
+    h: f64,
+    d: f64,
+    xmin: f64,
+    xmax: f64,
+}
+
+// A glyph's advance and ink extents, in font units.
+fn metrics(t: *mut Setter, gid: u32) Metrics {
+    let f = t.mf.f;
+    let adv = @float_from_int(f64, f.advance(gid));
+    let e = f.glyph_extents(gid) catch return Metrics.{ adv: adv, h: 0.0, d: 0.0, xmin: 0.0, xmax: adv };
+    let top = @float_from_int(f64, e[1]);
+    let bottom = top + @float_from_int(f64, e[3]);
+    let x0 = @float_from_int(f64, e[0]);
+    return Metrics.{ adv: adv, h: top, d: -bottom, xmin: x0, xmax: x0 + @float_from_int(f64, e[2]) };
+}
+
+fn push_glyph(t: *mut Setter, gid: u32, x: f64, y: f64, scale: f64, sx: f64, sy: f64, col: u32) !void {
+    t.items.push(Item.{ gid: gid, rule: false, color: col, x: x, y: y, scale: scale, sx: sx, sy: sy, w: 0.0, h: 0.0 })!;
+}
+
+fn push_rule(t: *mut Setter, x: f64, y: f64, w: f64, h: f64, col: u32) !void {
+    t.items.push(Item.{ gid: 0, rule: true, color: col, x: x, y: y, scale: 0.0, sx: 1.0, sy: 1.0, w: w, h: h })!;
+}
+
+// One glyph as a box.
+fn glyph_box(t: *mut Setter, gid: u32, st: St) !Box {
+    let k = st.size / t.mf.upem;
+    let mut b = empty_box(t);
+    let g = metrics(t, gid);
+    push_glyph(t, gid, 0.0, 0.0, k, 1.0, 1.0, st.color)!;
+    b.end = t.items.len;
+    b.w = g.adv * k;
+    b.h = g.h * k;
+    b.d = g.d * k;
+    let mut found = false;
+    b.italic = glyph_value(&t.mf, t.mf.italics, gid, &mut found) * k;
+    let a = glyph_value(&t.mf, t.mf.accents, gid, &mut found);
+    if found {
+        b.accent_x = a * k;
+    } else {
+        b.accent_x = (g.xmin + g.xmax) * k / 2.0;
+    }
+    b.glyph = true;
+    return b;
+}
+
+fn is_combining(cp: u32) bool {
+    return ((cp >= 0x300) and (cp < 0x370)) or ((cp >= 0x20d0) and (cp < 0x2100));
+}
+
+// Mathematical italic for a Latin or Greek letter (where the font has it).
+fn italic_cp(t: *mut Setter, cp: u32) u32 {
+    let mut r: u32 = cp;
+    if (cp >= 'A') and (cp <= 'Z') {
+        r = 0x1d434 + (cp - 'A');
+    } else if cp == 'h' {
+        r = 0x210e;
+    } else if (cp >= 'a') and (cp <= 'z') {
+        r = 0x1d44e + (cp - 'a');
+    } else if (cp >= 0x3b1) and (cp <= 0x3c9) {
+        r = 0x1d6fc + (cp - 0x3b1);
+    } else if cp == 0x3f5 {
+        r = 0x1d716;  // lunate epsilon
+    } else if cp == 0x3d1 {
+        r = 0x1d717;
+    } else if cp == 0x3d5 {
+        r = 0x1d719;
+    } else if cp == 0x3f1 {
+        r = 0x1d71a;
+    } else if cp == 0x3d6 {
+        r = 0x1d71b;
+    }
+    if (r != cp) and (t.mf.f.glyph_index(r) != 0) {
+        return r;
+    }
+    return cp;
+}
+
+// A run of characters, one after the other (combining marks over the one
+// before).
+fn glyph_run(t: *mut Setter, text: []u8, st: St, italic: bool) !Box {
+    let k = st.size / t.mf.upem;
+    let mut b = empty_box(t);
+    let n = strs.rune_count(text);
+    if n == 1 {
+        let r = strs.decode_rune(text);
+        let mut cp = r.value;
+        if italic {
+            cp = italic_cp(t, cp);
+        }
+        return glyph_box(t, t.mf.f.glyph_index(cp), st);
+    }
+    let mut x: f64 = 0.0;
+    let mut prev_x: f64 = 0.0;
+    let mut prev_w: f64 = 0.0;
+    let mut it = strs.runes(text);
+    loop {
+        let cp = it.next() catch break;
+        let gid = t.mf.f.glyph_index(cp);
+        let g = metrics(t, gid);
+        if is_combining(cp) and (prev_w > 0.0) {
+            // centred over the previous character's advance
+            let gx = prev_x + ((prev_w - ((g.xmin + g.xmax) * k)) / 2.0);
+            push_glyph(t, gid, gx, 0.0, k, 1.0, 1.0, st.color)!;
+        } else {
+            push_glyph(t, gid, x, 0.0, k, 1.0, 1.0, st.color)!;
+            prev_x = x;
+            prev_w = g.adv * k;
+            x += g.adv * k;
+        }
+        b.h = @max(b.h, g.h * k);
+        b.d = @max(b.d, g.d * k);
+    }
+    b.end = t.items.len;
+    b.w = x;
+    b.accent_x = x / 2.0;
+    return b;
+}
+
+// --- stretching ---
+
+// A glyph at least `target` px tall (vertical) or wide: a bigger variant,
+// an assembly of parts, or (without a MATH table) the glyph scaled. With
+// `variants_only`, the biggest variant short of an assembly.
+fn stretchy(t: *mut Setter, cp: u32, st: St, target: f64, vertical: bool, variants_only: bool) !Box {
+    let k = st.size / t.mf.upem;
+    let gid = t.mf.f.glyph_index(cp);
+    let g = metrics(t, gid);
+    let mut have = g.adv * k;
+    if vertical {
+        have = (g.h + g.d) * k;
+    }
+    let c = construction(&t.mf, gid, vertical);
+    if (c == 0) and (have >= target) {
+        return glyph_box(t, gid, st);
+    }
+    if c != 0 {
+        let d = t.mf.t;
+        let n = @as(usize, u16_at(d, c + 2));
+        let mut best = gid;
+        for j in @as(usize, 0)..n {
+            let vg = u16_at(d, c + 4 + (4 * j));
+            let adv = @float_from_int(f64, u16_at(d, c + 6 + (4 * j))) * k;
+            best = vg;
+            if adv >= target {
+                return glyph_box(t, vg, st);
+            }
+        }
+        let asm = sub_table(d, c, c);
+        if (asm != 0) and not variants_only {
+            return assembly(t, asm, st, target, vertical);
+        }
+        return glyph_box(t, best, st);
+    }
+    if t.mf.has_math or (have <= 0.0) {
+        return glyph_box(t, gid, st);
+    }
+    // no MATH table: scale the glyph, keeping its centre
+    let mut b = glyph_box(t, gid, st)!;
+    let s = target / have;
+    let it = t.items.items();
+    if vertical {
+        let mid = (b.h - b.d) / 2.0;
+        it[b.start].sy = s;
+        it[b.start].y = mid - (mid * s);
+        b.h = mid + ((b.h - mid) * s);
+        b.d = (b.d + mid) * s - mid;
+    } else {
+        it[b.start].sx = s;
+        b.w *= s;
+        b.accent_x *= s;
+    }
+    return b;
+}
+
+const MAX_REPEATS: usize = 1000;
+
+// A GlyphAssembly stretched to `target` px: its parts in order (bottom to
+// top, or left to right), extenders repeated as needed, overlapping by at
+// least the font's MinConnectorOverlap.
+fn assembly(t: *mut Setter, asm: usize, st: St, target: f64, vertical: bool) !Box {
+    let d = t.mf.t;
+    let k = st.size / t.mf.upem;
+    let n = @as(usize, u16_at(d, asm + 4));
+    let o = t.mf.min_overlap * k;
+    let mut b = empty_box(t);
+    if (n == 0) or ((asm + 6 + (10 * n)) > d.len) {
+        return b;
+    }
+    // the fewest repeats of the extenders that reach the target
+    let mut fixed: f64 = 0.0;
+    let mut ext: f64 = 0.0;
+    let mut n_fixed: usize = 0;
+    let mut n_ext: usize = 0;
+    for j in @as(usize, 0)..n {
+        let p = asm + 6 + (10 * j);
+        let full = @float_from_int(f64, u16_at(d, p + 6)) * k;
+        if (u16_at(d, p + 8) & 1) != 0 {
+            ext += full;
+            n_ext += 1;
+        } else {
+            fixed += full;
+            n_fixed += 1;
+        }
+    }
+    let mut reps: usize = 0;
+    if n_ext > 0 {
+        while reps < MAX_REPEATS {
+            let parts = n_fixed + (reps * n_ext);
+            let longest = fixed + (@float_from_int(f64, reps) * ext) - (@float_from_int(f64, parts - 1) * o);
+            if (longest >= target) and ((reps > 0) or (n_fixed > 0)) {
+                break;
+            }
+            reps += 1;
+        }
+    }
+    // the parts in order, and how much each joint can overlap
+    let mut gids = vec.Vec.[u32].init();
+    defer gids.deinit();
+    let mut fulls = vec.Vec.[f64].init();
+    defer fulls.deinit();
+    let mut max_ov = vec.Vec.[f64].init();  // joint j: between parts j and j + 1
+    defer max_ov.deinit();
+    let mut prev_end: f64 = 0.0;
+    for j in @as(usize, 0)..n {
+        let p = asm + 6 + (10 * j);
+        let mut times: usize = 1;
+        if (u16_at(d, p + 8) & 1) != 0 {
+            times = reps;
+        }
+        for r in @as(usize, 0)..times {
+            _ = r;
+            let start_conn = @float_from_int(f64, u16_at(d, p + 2)) * k;
+            if gids.len > 0 {
+                max_ov.push(@max(o, @min(prev_end, start_conn)))!;
+            }
+            gids.push(u16_at(d, p))!;
+            fulls.push(@float_from_int(f64, u16_at(d, p + 6)) * k)!;
+            prev_end = @float_from_int(f64, u16_at(d, p + 4)) * k;
+        }
+    }
+    if gids.len == 0 {
+        return b;
+    }
+    // overlaps: the minimum, grown evenly toward each joint's maximum to land on the target
+    let mut total: f64 = 0.0;
+    for x in fulls.items() {
+        total += x;
+    }
+    let joints = max_ov.len;
+    let mut slack: f64 = 0.0;
+    for x in max_ov.items() {
+        slack += x - o;
+    }
+    let longest = total - (@float_from_int(f64, joints) * o);
+    let mut frac: f64 = 0.0;
+    if (slack > 0.0) and (longest > target) {
+        frac = @min(1.0, (longest - target) / slack);
+    }
+    let mut pos: f64 = 0.0;
+    let mut thick: f64 = 0.0;
+    let gs = gids.items();
+    let full = fulls.items();
+    let ms = max_ov.items();
+    for j in @as(usize, 0)..gids.len {
+        let g = metrics(t, gs[j]);
+        if vertical {
+            push_glyph(t, gs[j], 0.0, pos, k, 1.0, 1.0, st.color)!;
+            thick = @max(thick, g.adv * k);
+        } else {
+            push_glyph(t, gs[j], pos, 0.0, k, 1.0, 1.0, st.color)!;
+            b.h = @max(b.h, g.h * k);
+            b.d = @max(b.d, g.d * k);
+        }
+        pos += full[j];
+        if j < joints {
+            pos -= o + (frac * (ms[j] - o));
+        }
+    }
+    b.end = t.items.len;
+    if vertical {
+        b.w = thick;
+        b.h = pos;
+        b.d = 0.0;
+    } else {
+        b.w = pos;
+    }
+    b.accent_x = b.w / 2.0;
+    return b;
+}
+
+// A delimiter stretched to `target` and centred on the axis ("" or "." is
+// an empty space).
+fn delimiter(t: *mut Setter, text: []u8, st: St, target: f64) !Box {
+    let mut b = empty_box(t);
+    if text.len == 0 {
+        b.w = 0.12 * em(st);
+        return b;
+    }
+    let cp = strs.decode_rune(text).value;
+    b = stretchy(t, cp, st, target, true, false)!;
+    let axis = px(t, st, AXIS_HEIGHT);
+    let dy = axis - ((b.h - b.d) / 2.0);
+    shift(t, &b, 0.0, dy);
+    b.h += dy;
+    b.d -= dy;
+    b.glyph = false;
+    return b;
+}
+
+// -----------------------------------------------------------------------------
+// Layout
+// -----------------------------------------------------------------------------
+
+// spacing classes
+const S_ORD: u8 = 0;
+const S_OP: u8 = 1;
+const S_BIN: u8 = 2;
+const S_REL: u8 = 3;
+const S_OPEN: u8 = 4;
+const S_CLOSE: u8 = 5;
+const S_PUNCT: u8 = 6;
+const S_INNER: u8 = 7;
+const S_NONE: u8 = 255;
+
+// TeX's spacing between atoms (TeXbook ch. 18): 1 thin, 2 medium, 3 thick;
+// 10 more: not in script styles.
+let SPACING: [64]u8 = [0, 1, 12, 13, 0, 0, 0, 11,      // ord
+                       1, 1, 0, 13, 0, 0, 0, 11,       // op
+                       12, 12, 0, 0, 12, 0, 0, 12,     // bin
+                       13, 13, 0, 0, 13, 0, 0, 13,     // rel
+                       0, 0, 0, 0, 0, 0, 0, 0,         // open
+                       0, 1, 12, 13, 0, 0, 0, 11,      // close
+                       11, 11, 0, 11, 11, 11, 11, 11,  // punct
+                       11, 1, 12, 13, 11, 0, 11, 11];  // inner
+
+fn unwrap(f: *m.Formula, i: u32) u32 {
+    let mut j = i;
+    while (j != NIL) and (f.node(j).kind == m.Kind.ROW) and (f.node(j).first != NIL) and
+          (f.node(f.node(j).first).next == NIL) {
+        j = f.node(j).first;
+    }
+    return j;
+}
+
+fn class_of(f: *m.Formula, i: u32) u8 {
+    if i == NIL {
+        return S_ORD;
+    }
+    let n = f.node(i);
+    match n.kind {
+        .OP => {
+            if n.cls == m.C_BIN {
+                return S_BIN;
+            }
+            if n.cls == m.C_REL {
+                return S_REL;
+            }
+            if n.cls == m.C_OPEN {
+                return S_OPEN;
+            }
+            if n.cls == m.C_CLOSE {
+                return S_CLOSE;
+            }
+            if n.cls == m.C_PUNCT {
+                return S_PUNCT;
+            }
+            if (n.cls == m.C_LARGE) or (n.cls == m.C_INT) or (n.cls == m.C_FUNCL) {
+                return S_OP;
+            }
+            return S_ORD;
+        }
+        .IDENT => {
+            if ((n.flags & m.F_FUNC) != 0) or (n.cls == m.C_LARGE) {
+                return S_OP;
+            }
+            return S_ORD;
+        }
+        .SCRIPTS => { return class_of(f, n.a); }
+        .LIMITS  => { return class_of(f, n.a); }
+        .FENCE   => { return S_INNER; }
+        .FRAC    => { return S_INNER; }
+        .SPACE   => { return S_NONE; }
+        .STYLE   => { return class_of(f, unwrap(f, n.a)); }
+        else     => { return S_ORD; }
+    }
+}
+
+// Whether a node is a big operator (or function) whose limits go above
+// and below in display style.
+fn movable(f: *m.Formula, i: u32) bool {
+    let b = unwrap(f, i);
+    if b == NIL {
+        return false;
+    }
+    let n = f.node(b);
+    return ((n.kind == m.Kind.OP) or (n.kind == m.Kind.IDENT)) and ((n.cls == m.C_LARGE) or (n.cls == m.C_FUNCL));
+}
+
+fn lay(t: *mut Setter, i: u32, st: St) !Box {
+    if i == NIL {
+        return empty_box(t);
+    }
+    let f = t.f;
+    let n = f.node(i);
+    let text = f.str(n.s, n.sl);
+    match n.kind {
+        .ROW => { return lay_row(t, i, st); }
+        .IDENT => {
+            let italic = ((n.flags & m.F_NORMAL) == 0) and ((n.flags & m.F_FUNC) == 0) and (strs.rune_count(text) == 1);
+            return glyph_run(t, text, st, italic);
+        }
+        .NUMBER => { return glyph_run(t, text, st, false); }
+        .TEXT   => { return glyph_run(t, text, st, false); }
+        .OP     => { return lay_op(t, i, st); }
+        .SPACE => {
+            let mut b = empty_box(t);
+            b.w = @float_cast(f64, n.width) * em(st);
+            return b;
+        }
+        .FRAC => { return lay_frac(t, i, st); }
+        .SQRT => { return lay_root(t, n.a, NIL, st); }
+        .ROOT => { return lay_root(t, n.a, n.b, st); }
+        .SCRIPTS => {
+            if ((n.flags & m.F_LIMITS) != 0) and (n.b == NIL) and (n.c == NIL) {
+                return lay(t, n.a, st);
+            }
+            if (n.flags & m.F_LIMITS) != 0 {
+                return lay_limits(t, i, st);
+            }
+            return lay_scripts(t, i, st);
+        }
+        .LIMITS => {
+            if movable(f, n.a) and ((n.flags & m.F_LIMITS) == 0) and (st.level != 0) {
+                return lay_scripts(t, i, st);
+            }
+            return lay_limits(t, i, st);
+        }
+        .ACCENT => { return lay_accent(t, i, st); }
+        .FENCE  => { return lay_fence(t, i, st); }
+        .TABLE  => { return lay_table(t, i, st); }
+        .TROW   => { return empty_box(t); }
+        .TCELL  => { return lay(t, n.a, plain(st)); }
+        .STYLE => {
+            let mut s = plain(st);
+            if n.sl != 0 {
+                t.colors.push(text)!;
+                s.color = @truncate(u32, t.colors.len);
+            } else if (n.flags & m.F_DISPLAY) != 0 {
+                s.level = 0;
+                s.cramped = false;
+                s.size = t.base;
+            } else if (n.flags & m.F_TEXTSTYLE) != 0 {
+                s.level = 1;
+                s.size = t.base;
+            }
+            return lay(t, n.a, s);
+        }
+    }
+}
+
+fn lay_row(t: *mut Setter, i: u32, st: St) !Box {
+    let f = t.f;
+    let n = f.node(i);
+    let mut b = empty_box(t);
+    if n.first == NIL {
+        return b;
+    }
+    if f.node(n.first).next == NIL {
+        return lay(t, n.first, st);
+    }
+    // classes, with binary operators that cannot be binary made ordinary
+    let mut cls = vec.Vec.[u8].init();
+    defer cls.deinit();
+    let mut c = n.first;
+    let mut prev: usize = 0xffffffff;  // the last child with a class
+    while c != NIL {
+        let mut k = class_of(f, c);
+        if k == S_BIN {
+            if prev == 0xffffffff {
+                k = S_ORD;
+            } else {
+                let pk = cls.get(prev);
+                if (pk == S_BIN) or (pk == S_OP) or (pk == S_REL) or (pk == S_OPEN) or (pk == S_PUNCT) {
+                    k = S_ORD;
+                }
+            }
+        }
+        if ((k == S_REL) or (k == S_CLOSE) or (k == S_PUNCT)) and (prev != 0xffffffff) and (cls.get(prev) == S_BIN) {
+            cls.set(prev, S_ORD);
+        }
+        cls.push(k)!;
+        if k != S_NONE {
+            prev = cls.len - 1;
+        }
+        c = f.node(c).next;
+    }
+    if (prev != 0xffffffff) and (cls.get(prev) == S_BIN) {
+        cls.set(prev, S_ORD);
+    }
+    let mu = em(st) / 18.0;
+    let mut x: f64 = 0.0;
+    let mut last: u8 = S_NONE;
+    let mut j: usize = 0;
+    let mut last_box = empty_box(t);
+    c = n.first;
+    while c != NIL {
+        let k = cls.get(j);
+        if (k != S_NONE) and (last != S_NONE) {
+            let sp = SPACING[(@as(usize, last) * 8) + @as(usize, k)];
+            let mut amount: u8 = sp;
+            if sp >= 10 {
+                amount = sp - 10;
+                if st.level >= 2 {
+                    amount = 0;
+                }
+            }
+            if amount == 1 {
+                x += 3.0 * mu;
+            } else if amount == 2 {
+                x += 4.0 * mu;
+            } else if amount == 3 {
+                x += 5.0 * mu;
+            }
+        }
+        let cb = lay(t, c, st)!;
+        shift(t, &cb, x, 0.0);
+        x += cb.w;
+        b.h = @max(b.h, cb.h);
+        b.d = @max(b.d, cb.d);
+        last_box = cb;
+        if k != S_NONE {
+            last = k;
+        }
+        j += 1;
+        c = f.node(c).next;
+    }
+    b.end = t.items.len;
+    b.w = x;
+    b.italic = last_box.italic;
+    b.accent_x = x / 2.0;
+    return b;
+}
+
+fn lay_op(t: *mut Setter, i: u32, st: St) !Box {
+    let f = t.f;
+    let n = f.node(i);
+    let text = f.str(n.s, n.sl);
+    if text.len == 0 {
+        return empty_box(t);
+    }
+    if (n.flags & m.F_SIZED) != 0 {
+        return delimiter(t, text, st, @float_cast(f64, n.width) * em(st));
+    }
+    if ((n.flags & m.F_STRETCHY) != 0) and (st.stretch > 0.0) {
+        return delimiter(t, text, st, st.stretch);
+    }
+    let big = (n.cls == m.C_LARGE) or (n.cls == m.C_INT);
+    if big and (strs.rune_count(text) == 1) {
+        let cp = strs.decode_rune(text).value;
+        let mut target: f64 = 0.0;
+        if st.level == 0 {
+            target = t.mf.display_op_min * st.size / t.mf.upem;
+        }
+        let mut b = stretchy(t, cp, st, target, true, true)!;
+        // centred on the axis
+        let axis = px(t, st, AXIS_HEIGHT);
+        let dy = axis - ((b.h - b.d) / 2.0);
+        shift(t, &b, 0.0, dy);
+        b.h += dy;
+        b.d -= dy;
+        b.glyph = false;  // scripts drop from its top and bottom
+        return b;
+    }
+    return glyph_run(t, text, st, false);
+}
+
+fn lay_frac(t: *mut Setter, i: u32, st0: St) !Box {
+    let n = t.f.node(i);
+    let mut st = plain(st0);
+    if (n.flags & m.F_DISPLAY) != 0 {
+        st.level = 0;
+        st.size = t.base;
+    } else if (n.flags & m.F_TEXTSTYLE) != 0 {
+        st.level = 1;
+        st.size = t.base;
+    }
+    let display = st.level == 0;
+    let mut b = empty_box(t);
+    let num = lay(t, n.a, frac_st(t, st, st.cramped))!;
+    let den = lay(t, n.b, frac_st(t, st, true))!;
+    let pad = 0.06 * em(st);
+    let w = @max(num.w, den.w) + (2.0 * pad);
+    shift(t, &num, (w - num.w) / 2.0, 0.0);
+    shift(t, &den, (w - den.w) / 2.0, 0.0);
+    let axis = px(t, st, AXIS_HEIGHT);
+    let mut up: f64 = 0.0;
+    let mut down: f64 = 0.0;
+    if (n.flags & m.F_THIN0) != 0 {
+        // a stack: no rule
+        let mut gap: f64 = 0.0;
+        if display {
+            up = px(t, st, STACK_TOP_DISPLAY_SHIFT_UP);
+            down = px(t, st, STACK_BOTTOM_DISPLAY_SHIFT_DOWN);
+            gap = px(t, st, STACK_DISPLAY_GAP_MIN);
+        } else {
+            up = px(t, st, STACK_TOP_SHIFT_UP);
+            down = px(t, st, STACK_BOTTOM_SHIFT_DOWN);
+            gap = px(t, st, STACK_GAP_MIN);
+        }
+        let have = (up - num.d) - (den.h - down);
+        if have < gap {
+            up += (gap - have) / 2.0;
+            down += (gap - have) / 2.0;
+        }
+    } else {
+        let th = px(t, st, FRACTION_RULE_THICKNESS);
+        let mut gn: f64 = 0.0;
+        let mut gd: f64 = 0.0;
+        if display {
+            up = px(t, st, FRACTION_NUM_DISPLAY_SHIFT_UP);
+            down = px(t, st, FRACTION_DENOM_DISPLAY_SHIFT_DOWN);
+            gn = px(t, st, FRACTION_NUM_DISPLAY_GAP_MIN);
+            gd = px(t, st, FRACTION_DENOM_DISPLAY_GAP_MIN);
+        } else {
+            up = px(t, st, FRACTION_NUM_SHIFT_UP);
+            down = px(t, st, FRACTION_DENOM_SHIFT_DOWN);
+            gn = px(t, st, FRACTION_NUM_GAP_MIN);
+            gd = px(t, st, FRACTION_DENOM_GAP_MIN);
+        }
+        up = @max(up, num.d + axis + (th / 2.0) + gn);
+        down = @max(down, den.h - (axis - (th / 2.0)) + gd);
+        push_rule(t, pad, axis - (th / 2.0), w - (2.0 * pad), th, st.color)!;
+    }
+    shift(t, &num, 0.0, up);
+    shift(t, &den, 0.0, -down);
+    b.end = t.items.len;
+    b.w = w;
+    b.h = @max(num.h + up, axis);
+    b.d = @max(den.d + down, 0.0);
+    b.accent_x = w / 2.0;
+    return b;
+}
+
+fn lay_root(t: *mut Setter, body_i: u32, index_i: u32, st0: St) !Box {
+    let st = plain(st0);
+    let mut b = empty_box(t);
+    let mut body_st = st;
+    body_st.cramped = true;
+    let body = lay(t, body_i, body_st)!;
+    let th = px(t, st, RADICAL_RULE_THICKNESS);
+    let mut gap = px(t, st, RADICAL_VERTICAL_GAP);
+    if st.level == 0 {
+        gap = px(t, st, RADICAL_DISPLAY_VERTICAL_GAP);
+    }
+    let target = body.h + body.d + gap + th;
+    let rad = stretchy(t, 0x221a, st, target, true, false)!;
+    let total = rad.h + rad.d;
+    if total > target {
+        gap += (total - target) / 2.0;
+    }
+    // the radical's top meets the rule's top
+    let top = body.h + gap + th;
+    let dy = top - rad.h;
+    shift(t, &rad, 0.0, dy);
+    let mut x: f64 = 0.0;
+    let mut index_box = empty_box(t);
+    let rad_bottom = dy - rad.d;
+    if index_i != NIL {
+        let mut ist = script_st(t, st, false);
+        ist.level = 3;
+        ist.size = t.base * t.mf.sscript_pct / 100.0;
+        index_box = lay(t, index_i, ist)!;
+        let before = px(t, st, RADICAL_KERN_BEFORE_DEGREE);
+        let after = px(t, st, RADICAL_KERN_AFTER_DEGREE);
+        let raise = (t.mf.degree_raise_pct / 100.0) * (top - rad_bottom);
+        shift(t, &index_box, before, rad_bottom + raise + index_box.d);
+        x = @max(0.0, before + index_box.w + after);
+    }
+    shift(t, &rad, x, 0.0);
+    x += rad.w;
+    shift(t, &body, x, 0.0);
+    push_rule(t, x, top - th, body.w, th, st.color)!;
+    b.end = t.items.len;
+    b.w = x + body.w;
+    b.h = top + px(t, st, RADICAL_EXTRA_ASCENDER);
+    if index_i != NIL {
+        let raise = (t.mf.degree_raise_pct / 100.0) * (top - rad_bottom);
+        b.h = @max(b.h, rad_bottom + raise + index_box.d + index_box.h);
+    }
+    b.d = @max(body.d, -rad_bottom);
+    b.accent_x = b.w / 2.0;
+    return b;
+}
+
+fn lay_scripts(t: *mut Setter, i: u32, st0: St) !Box {
+    let n = t.f.node(i);
+    let st = plain(st0);
+    let mut b = empty_box(t);
+    let base = lay(t, n.a, st)!;
+    let mut u: f64 = 0.0;
+    let mut v: f64 = 0.0;
+    let sup_st = script_st(t, st, st.cramped);
+    let sub_st = script_st(t, st, true);
+    if not base.glyph {
+        u = base.h - px(t, sup_st, SUPERSCRIPT_BASELINE_DROP_MAX);
+        v = base.d + px(t, sub_st, SUBSCRIPT_BASELINE_DROP_MIN);
+    }
+    let mut sup = empty_box(t);
+    let mut sub = empty_box(t);
+    if n.c != NIL {
+        sup = lay(t, n.c, sup_st)!;
+        let mut up = px(t, st, SUPERSCRIPT_SHIFT_UP);
+        if st.cramped {
+            up = px(t, st, SUPERSCRIPT_SHIFT_UP_CRAMPED);
+        }
+        u = @max(u, @max(up, sup.d + px(t, st, SUPERSCRIPT_BOTTOM_MIN)));
+    }
+    if n.b != NIL {
+        sub = lay(t, n.b, sub_st)!;
+        v = @max(v, px(t, st, SUBSCRIPT_SHIFT_DOWN));
+        if n.c == NIL {
+            v = @max(v, sub.h - px(t, st, SUBSCRIPT_TOP_MAX));
+        }
+    }
+    if (n.b != NIL) and (n.c != NIL) {
+        let gap = (u - sup.d) - (sub.h - v);
+        let need = px(t, st, SUB_SUPERSCRIPT_GAP_MIN);
+        if gap < need {
+            v += need - gap;
+            let psi = px(t, st, SUPERSCRIPT_BOTTOM_MAX_WITH_SUBSCRIPT) - (u - sup.d);
+            if psi > 0.0 {
+                u += psi;
+                v -= psi;
+            }
+        }
+    }
+    // the italic correction moves the superscript out
+    let sup_x = base.w + base.italic;
+    let sub_x = base.w;
+    let after = px(t, st, SPACE_AFTER_SCRIPT);
+    let mut w = base.w;
+    if n.c != NIL {
+        shift(t, &sup, sup_x, u);
+        w = @max(w, sup_x + sup.w + after);
+    }
+    if n.b != NIL {
+        shift(t, &sub, sub_x, -v);
+        w = @max(w, sub_x + sub.w + after);
+    }
+    b.end = t.items.len;
+    b.w = w;
+    b.h = base.h;
+    b.d = base.d;
+    if n.c != NIL {
+        b.h = @max(b.h, u + sup.h);
+        b.d = @max(b.d, sup.d - u);
+    }
+    if n.b != NIL {
+        b.h = @max(b.h, sub.h - v);
+        b.d = @max(b.d, v + sub.d);
+    }
+    b.accent_x = base.accent_x;
+    return b;
+}
+
+fn lay_limits(t: *mut Setter, i: u32, st0: St) !Box {
+    let n = t.f.node(i);
+    let st = plain(st0);
+    let mut b = empty_box(t);
+    let base = lay(t, n.a, st)!;
+    let mut over = empty_box(t);
+    let mut under = empty_box(t);
+    if n.c != NIL {
+        over = lay(t, n.c, script_st(t, st, st.cramped))!;
+    }
+    if n.b != NIL {
+        under = lay(t, n.b, script_st(t, st, true))!;
+    }
+    let w = @max(base.w, @max(over.w, under.w));
+    let ic = base.italic;
+    shift(t, &base, (w - base.w) / 2.0, 0.0);
+    b.h = base.h;
+    b.d = base.d;
+    if n.c != NIL {
+        let rise = base.h + @max(px(t, st, UPPER_LIMIT_GAP_MIN), px(t, st,
+                                                                    UPPER_LIMIT_BASELINE_RISE_MIN) - over.d) + over.d;
+        shift(t, &over, ((w - over.w) / 2.0) + (ic / 2.0), rise);
+        b.h = rise + over.h;
+    }
+    if n.b != NIL {
+        let drop = base.d + @max(px(t, st, LOWER_LIMIT_GAP_MIN), px(t, st,
+                                                                    LOWER_LIMIT_BASELINE_DROP_MIN) - under.h) + under.h;
+        shift(t, &under, ((w - under.w) / 2.0) - (ic / 2.0), -drop);
+        b.d = drop + under.d;
+    }
+    b.end = t.items.len;
+    b.w = w;
+    b.accent_x = w / 2.0;
+    return b;
+}
+
+fn lay_accent(t: *mut Setter, i: u32, st0: St) !Box {
+    let f = t.f;
+    let n = f.node(i);
+    let st = plain(st0);
+    let mut b = empty_box(t);
+    let mut base_st = st;
+    if (n.flags & m.F_UNDER) == 0 {
+        base_st.cramped = true;
+    }
+    let base = lay(t, n.a, base_st)!;
+    let s1 = f.str(n.s, n.sl);
+    let s2 = f.str(n.s2, n.s2l);
+    let stretch = (n.flags & m.F_STRETCHY) != 0;
+    let under = (n.flags & m.F_UNDER) != 0;
+    b.w = base.w;
+    b.h = base.h;
+    b.d = base.d;
+    b.italic = base.italic;
+    // \overline and \underline: rules
+    if stretch and (strs.eq(s2, "\u{305}") or strs.eq(s2, "\u{332}")) {
+        if under {
+            let th = px(t, st, UNDERBAR_RULE_THICKNESS);
+            let y = -(base.d + px(t, st, UNDERBAR_VERTICAL_GAP) + th);
+            push_rule(t, 0.0, y, base.w, th, st.color)!;
+            b.d = -y + px(t, st, UNDERBAR_EXTRA_DESCENDER);
+        } else {
+            let th = px(t, st, OVERBAR_RULE_THICKNESS);
+            let y = base.h + px(t, st, OVERBAR_VERTICAL_GAP);
+            push_rule(t, 0.0, y, base.w, th, st.color)!;
+            b.h = y + th + px(t, st, OVERBAR_EXTRA_ASCENDER);
+        }
+        b.end = t.items.len;
+        b.accent_x = base.accent_x;
+        return b;
+    }
+    // the combining form where the font has it
+    let mut cp: u32 = 0;
+    if (s2.len > 0) and (t.mf.f.glyph_index(strs.decode_rune(s2).value) != 0) {
+        cp = strs.decode_rune(s2).value;
+    } else if s1.len > 0 {
+        cp = strs.decode_rune(s1).value;
+    }
+    if cp == 0 {
+        b.start = base.start;
+        b.end = t.items.len;
+        return b;
+    }
+    let mut acc = empty_box(t);
+    if stretch {
+        acc = stretchy(t, cp, st, base.w, false, false)!;
+    } else {
+        acc = glyph_box(t, t.mf.f.glyph_index(cp), st)!;
+    }
+    let mut attach = base.w / 2.0;
+    if base.glyph and (base.accent_x >= 0.0) {
+        attach = base.accent_x;
+    }
+    let mut ax = acc.w / 2.0;
+    if acc.accent_x >= 0.0 {
+        ax = acc.accent_x;
+    }
+    if stretch {
+        // wide accents and braces: centred, clear of the base
+        if under {
+            let gap = px(t, st, STRETCH_STACK_GAP_ABOVE_MIN);
+            let y = -(base.d + gap + acc.h);
+            shift(t, &acc, (base.w - acc.w) / 2.0, y);
+            b.d = -y + acc.d;
+        } else {
+            let gap = px(t, st, STRETCH_STACK_GAP_BELOW_MIN);
+            let y = base.h + gap + acc.d;
+            if (s2.len > 0) and (cp == strs.decode_rune(s2).value) {
+                // a combining accent sits over the x-height as drawn
+                let up = @max(0.0, base.h - px(t, st, ACCENT_BASE_HEIGHT));
+                shift(t, &acc, (base.w - acc.w) / 2.0, up);
+                b.h = @max(base.h, acc.h + up);
+            } else {
+                shift(t, &acc, (base.w - acc.w) / 2.0, y);
+                b.h = y + acc.h;
+            }
+        }
+    } else if under {
+        let y = -(base.d + (0.05 * em(st)) + acc.h);
+        shift(t, &acc, attach - ax, y);
+        b.d = @max(b.d, -y + acc.d);
+    } else {
+        let up = @max(0.0, base.h - px(t, st, ACCENT_BASE_HEIGHT));
+        shift(t, &acc, attach - ax, up);
+        b.h = @max(base.h, acc.h + up);
+    }
+    b.end = t.items.len;
+    b.accent_x = base.accent_x;
+    return b;
+}
+
+// Whether a fence's content has \middle delimiters (at its own level).
+fn has_middle(f: *m.Formula, i: u32) bool {
+    if i == NIL {
+        return false;
+    }
+    let n = f.node(i);
+    if (n.kind == m.Kind.OP) and ((n.flags & m.F_STRETCHY) != 0) {
+        return true;
+    }
+    if n.kind != m.Kind.ROW {
+        return false;
+    }
+    let mut c = n.first;
+    while c != NIL {
+        if has_middle(f, c) {
+            return true;
+        }
+        c = f.node(c).next;
+    }
+    return false;
+}
+
+fn lay_fence(t: *mut Setter, i: u32, st0: St) !Box {
+    let f = t.f;
+    let n = f.node(i);
+    let st = plain(st0);
+    let mut b = empty_box(t);
+    let mut inner = lay(t, n.a, st)!;
+    let axis = px(t, st, AXIS_HEIGHT);
+    let delta = @max(inner.h - axis, inner.d + axis);
+    let target = @max(2.0 * delta * 0.901, (2.0 * delta) - (0.5 * em(st)));
+    if has_middle(f, n.a) {
+        t.items.truncate(inner.start);
+        let mut ms = st;
+        ms.stretch = target;
+        inner = lay(t, n.a, ms)!;
+    }
+    let open = delimiter(t, f.str(n.s, n.sl), st, target)!;
+    shift(t, &inner, open.w, 0.0);
+    let close = delimiter(t, f.str(n.s2, n.s2l), st, target)!;
+    shift(t, &close, open.w + inner.w, 0.0);
+    b.end = t.items.len;
+    b.w = open.w + inner.w + close.w;
+    b.h = @max(inner.h, @max(open.h, close.h));
+    b.d = @max(inner.d, @max(open.d, close.d));
+    b.accent_x = b.w / 2.0;
+    return b;
+}
+
+fn lay_table(t: *mut Setter, i: u32, st0: St) !Box {
+    let f = t.f;
+    let n = f.node(i);
+    let mut st = plain(st0);
+    let aligned = (n.flags & m.F_ALIGN) != 0;
+    if (n.flags & m.F_SMALL) != 0 {
+        st = script_st(t, st, false);
+    } else if not aligned and (st.level == 0) {
+        st.level = 1;
+    }
+    st.cramped = false;
+    let mut b = empty_box(t);
+    let mut boxes = vec.Vec.[Box].init();
+    defer boxes.deinit();
+    let mut row_len = vec.Vec.[usize].init();
+    defer row_len.deinit();
+    let mut widths = vec.Vec.[f64].init();
+    defer widths.deinit();
+    let mut r = n.first;
+    while r != NIL {
+        let mut c = f.node(r).first;
+        let mut k: usize = 0;
+        while c != NIL {
+            let mut cb = lay(t, f.node(c).a, st)!;
+            if aligned and ((k % 2) == 1) {
+                // "&=": spaced as if something came before the relation
+                let first = f.node(c).a;
+                let mut fc = class_of(f, first);
+                if (first != NIL) and (f.node(first).kind == m.Kind.ROW) and (f.node(first).first != NIL) {
+                    fc = class_of(f, f.node(first).first);
+                }
+                let mut gap: f64 = 0.0;
+                if fc == S_REL {
+                    gap = 5.0 * em(st) / 18.0;
+                } else if fc == S_BIN {
+                    gap = 4.0 * em(st) / 18.0;
+                }
+                if gap > 0.0 {
+                    shift(t, &cb, gap, 0.0);
+                    cb.w += gap;
+                }
+            }
+            boxes.push(cb)!;
+            if k >= widths.len {
+                widths.push(0.0)!;
+            }
+            widths.set(k, @max(widths.get(k), cb.w));
+            k += 1;
+            c = f.node(c).next;
+        }
+        row_len.push(k)!;
+        r = f.node(r).next;
+    }
+    let e = em(st);
+    let strut_h = 0.85 * e;
+    let strut_d = 0.35 * e;
+    let mut row_gap: f64 = 0.0;
+    if aligned {
+        row_gap = 0.3 * e;
+    }
+    // columns: their x positions
+    let mut col_x = vec.Vec.[f64].init();
+    defer col_x.deinit();
+    let mut x: f64 = 0.0;
+    for k in @as(usize, 0)..widths.len {
+        if k > 0 {
+            if aligned {
+                if (k % 2) == 0 {
+                    x += 1.0 * e;
+                }
+            } else if (n.flags & m.F_SMALL) != 0 {
+                x += 0.3 * e;
+            } else {
+                x += 1.0 * e;
+            }
+        }
+        col_x.push(x)!;
+        x += widths.get(k);
+    }
+    let total_w = x;
+    // rows: heights and depths, then baselines from the top
+    let mut total_h: f64 = 0.0;
+    let mut heights = vec.Vec.[f64].init();
+    defer heights.deinit();
+    let mut depths = vec.Vec.[f64].init();
+    defer depths.deinit();
+    let mut at: usize = 0;
+    for ri in @as(usize, 0)..row_len.len {
+        let mut h = strut_h;
+        let mut d = strut_d;
+        for k in @as(usize, 0)..row_len.get(ri) {
+            let cb = boxes.get(at + k);
+            h = @max(h, cb.h);
+            d = @max(d, cb.d);
+        }
+        heights.push(h)!;
+        depths.push(d)!;
+        total_h += h + d;
+        if ri > 0 {
+            total_h += row_gap;
+        }
+        at += row_len.get(ri);
+    }
+    let axis = px(t, st, AXIS_HEIGHT);
+    let top = axis + (total_h / 2.0);
+    let mut y = top;
+    at = 0;
+    for ri in @as(usize, 0)..row_len.len {
+        if ri > 0 {
+            y -= row_gap;
+        }
+        y -= heights.get(ri);
+        for k in @as(usize, 0)..row_len.get(ri) {
+            let cb = boxes.get(at + k);
+            let cw = widths.get(k);
+            let mut cx = col_x.get(k) + ((cw - cb.w) / 2.0);
+            if (n.flags & m.F_LEFT) != 0 {
+                cx = col_x.get(k);
+            } else if aligned {
+                if (k % 2) == 0 {
+                    cx = col_x.get(k) + (cw - cb.w);
+                } else {
+                    cx = col_x.get(k);
+                }
+            }
+            shift(t, &cb, cx, y);
+        }
+        y -= depths.get(ri);
+        at += row_len.get(ri);
+    }
+    b.end = t.items.len;
+    b.w = total_w;
+    b.h = top;
+    b.d = total_h - top;
+    b.accent_x = total_w / 2.0;
+    return b;
+}
+
+// -----------------------------------------------------------------------------
+// The result
+// -----------------------------------------------------------------------------
+
+/// A typeset formula: glyphs and rules placed around a baseline at y = 0,
+/// in px. Its font must outlive it.
+pub struct Typeset {
+    font: *font.Font,
+    items: vec.Vec.[Item],
+    colors: vec.Vec.[[]mut u8],
+    title: []mut u8,
+    /// The advance width, and the height above and depth below the baseline.
+    width: f64,
+    height: f64,
+    depth: f64,
+    /// The ink's extent (it can stick out of the box above): left and right
+    /// of the origin, above and below the baseline.
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+
+    pub fn deinit(self: *mut Typeset) void {
+        self.items.deinit();
+        for c in self.colors.items() {
+            mem.free(c);
+        }
+        self.colors.deinit();
+        mem.free(self.title);
+    }
+
+    /// Appends the outlines of the items in colour `color` (0: the default,
+    /// then \color's in order, see color_names()) to p, with the baseline's
+    /// origin at (x, y) in p's y-down space.
+    pub fn path(self: *Typeset, col: u32, p: *mut draw.Path, x: f64, y: f64) !void {
+        let mut tmp = draw.Path.init();
+        defer tmp.deinit();
+        for it in self.items.items() {
+            if it.color != col {
+                continue;
+            }
+            if it.rule {
+                if (it.w > 0.0) and (it.h > 0.0) {
+                    p.rect(x + it.x, y - (it.y + it.h), it.w, it.h)!;
+                }
+                continue;
+            }
+            if (it.sx == 1.0) and (it.sy == 1.0) {
+                self.font.glyph_path(it.gid, p, x + it.x, y - it.y, it.scale)!;
+                continue;
+            }
+            tmp.clear();
+            self.font.glyph_path(it.gid, &mut tmp, 0.0, 0.0, it.scale)!;
+            transformed(p, &tmp, x + it.x, y - it.y, it.sx, it.sy)!;
+        }
+    }
+
+    /// The colours \color asked for, by number (1 and up).
+    pub fn color_names(self: *Typeset) [][]mut u8 {
+        return self.colors.items();
+    }
+
+    /// An SVG document of the formula: outlines filled with currentColor,
+    /// sized in px, the baseline aligned with surrounding text.
+    pub fn write_svg(self: *Typeset, w: io.Writer) !void {
+        let wd = self.right - self.left;
+        let ht = self.top + self.bottom;
+        let mut b: [64]u8 = [0; 64];
+        w.print("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"")!;
+        w.print(fmt_num(b[..], wd))!;
+        w.print("\" height=\"")!;
+        w.print(fmt_num(b[..], ht))!;
+        w.print("\" viewBox=\"0 0 ")!;
+        w.print(fmt_num(b[..], wd))!;
+        w.print(" ")!;
+        w.print(fmt_num(b[..], ht))!;
+        w.print("\" style=\"vertical-align:")!;
+        w.print(fmt_num(b[..], -self.bottom))!;
+        w.print("px\" role=\"img\"><title>")!;
+        escape_xml(w, self.title)!;
+        w.print("</title>")!;
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        for c in @as(usize, 0)..self.colors.len + 1 {
+            p.clear();
+            self.path(@truncate(u32, c), &mut p, -self.left, self.top)!;
+            if p.verbs.len == 0 {
+                continue;
+            }
+            w.print("<path fill=\"")!;
+            if c == 0 {
+                w.print("currentColor")!;
+            } else {
+                escape_xml(w, self.colors.get(c - 1))!;
+            }
+            w.print("\" d=\"")!;
+            svg.write_path_data(w, &p)!;
+            w.print("\"/>")!;
+        }
+        w.print("</svg>")!;
+    }
+
+    /// Fills the formula onto a canvas, its baseline's origin at (x, y):
+    /// \color's colours where they parse (as CSS), else `paint`.
+    pub fn draw(self: *Typeset, cv: *mut draw.Canvas, x: f64, y: f64, paint: draw.Paint) !void {
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        for c in @as(usize, 0)..self.colors.len + 1 {
+            p.clear();
+            self.path(@truncate(u32, c), &mut p, x, y)!;
+            if p.verbs.len == 0 {
+                continue;
+            }
+            let mut pt = paint;
+            if c > 0 {
+                let col = css.parse_color(self.colors.get(c - 1)) catch {
+                    cv.fill(&p, paint, draw.FillRule.NONZERO)!;
+                    continue;
+                };
+                pt = draw.Paint.solid(col);
+            }
+            cv.fill(&p, pt, draw.FillRule.NONZERO)!;
+        }
+    }
+}
+
+// Appends src scaled by (sx, sy) and moved to (x, y).
+fn transformed(dst: *mut draw.Path, src: *draw.Path, x: f64, y: f64, sx: f64, sy: f64) !void {
+    let pts = src.pts.items();
+    let mut k: usize = 0;
+    for v in src.verbs.items() {
+        match v {
+            .MOVE => {
+                dst.move_to(x + (pts[k] * sx), y + (pts[k + 1] * sy))!;
+                k += 2;
+            }
+            .LINE => {
+                dst.line_to(x + (pts[k] * sx), y + (pts[k + 1] * sy))!;
+                k += 2;
+            }
+            .QUAD => {
+                dst.quad_to(x + (pts[k] * sx), y + (pts[k + 1] * sy), x + (pts[k + 2] * sx), y + (pts[k + 3] * sy))!;
+                k += 4;
+            }
+            .CUBIC => {
+                dst.cubic_to(x + (pts[k] * sx), y + (pts[k + 1] * sy), x + (pts[k + 2] * sx), y + (pts[k + 3] * sy),
+                             x + (pts[k + 4] * sx), y + (pts[k + 5] * sy))!;
+                k += 6;
+            }
+            .CLOSE => { dst.close()!; }
+        }
+    }
+}
+
+// A number for SVG: at most 2 decimals, no trailing zeros.
+fn fmt_num(buf: []mut u8, v: f64) []u8 {
+    let t = fmt.bufprint(buf, "{:.2}", [fmt.float(v)]) catch return "0";
+    let mut n = t.len;
+    while (n > 0) and (t[n - 1] == '0') {
+        n -= 1;
+    }
+    if (n > 0) and (t[n - 1] == '.') {
+        n -= 1;
+    }
+    if strs.eq(t[..n], "-0") {
+        return "0";
+    }
+    return t[..n];
+}
+
+fn escape_xml(w: io.Writer, s: []u8) !void {
+    let mut a: usize = 0;
+    for k in @as(usize, 0)..s.len {
+        let c = s[k];
+        if (c == '<') or (c == '>') or (c == '&') or (c == '"') {
+            w.write_all(s[a..k])!;
+            if c == '<' {
+                w.print("&lt;")!;
+            } else if c == '>' {
+                w.print("&gt;")!;
+            } else if c == '&' {
+                w.print("&amp;")!;
+            } else {
+                w.print("&quot;")!;
+            }
+            a = k + 1;
+        }
+    }
+    w.write_all(s[a..])!;
+}
+
+/// Typesets a parsed formula at `size` px per em: display style for BLOCK,
+/// text style for INLINE.
+pub fn typeset(f: *m.Formula, fnt: *font.Font, size: f64, display: m.Display) !Typeset {
+    let mut t = Setter.{ mf: load_math(fnt), f: f, items: vec.Vec.[Item].init(), colors: vec.Vec.[[]u8].init(),
+                         base: size };
+    defer t.colors.deinit();
+    let mut level: u8 = 1;
+    if display == m.Display.BLOCK {
+        level = 0;
+    }
+    let st = St.{ size: size, level: level, cramped: false, color: 0, stretch: 0.0 };
+    let b = lay(&mut t, f.root, st) catch |e| {
+        t.items.deinit();
+        return e;
+    };
+    let mut s = strs.String.init();
+    f.write_text(s.writer()) catch |e| {
+        s.deinit();
+        t.items.deinit();
+        return e;
+    };
+    let title = s.take() catch |e| {
+        s.deinit();
+        t.items.deinit();
+        return e;
+    };
+    let mut out = Typeset.{ font: fnt, items: t.items, colors: vec.Vec.[[]mut u8].init(), title: title, width: b.w,
+                            height: b.h, depth: b.d, left: 0.0, right: b.w, top: b.h, bottom: b.d };
+    for c in t.colors.items() {
+        let d = mem.dup(c) catch |e| {
+            out.deinit();
+            return e;
+        };
+        out.colors.push(d) catch |e| {
+            mem.free(d);
+            out.deinit();
+            return e;
+        };
+    }
+    // the ink's bounds
+    for it in out.items.items() {
+        if it.rule {
+            out.left = @min(out.left, it.x);
+            out.right = @max(out.right, it.x + it.w);
+            out.top = @max(out.top, it.y + it.h);
+            out.bottom = @max(out.bottom, -it.y);
+            continue;
+        }
+        let e = fnt.glyph_extents(it.gid) catch continue;
+        let x0 = it.x + (@float_from_int(f64, e[0]) * it.scale * it.sx);
+        let x1 = x0 + (@float_from_int(f64, e[2]) * it.scale * it.sx);
+        let y1 = it.y + (@float_from_int(f64, e[1]) * it.scale * it.sy);
+        let y0 = y1 + (@float_from_int(f64, e[3]) * it.scale * it.sy);
+        out.left = @min(out.left, x0);
+        out.right = @max(out.right, x1);
+        out.top = @max(out.top, y1);
+        out.bottom = @max(out.bottom, -y0);
+    }
+    return out;
+}
+
+/// TeX math as an SVG document (free it with mem.free).
+pub fn to_svg(tex: []u8, fnt: *font.Font, size: f64, display: m.Display) ![]mut u8 {
+    let mut f = m.parse(tex)!;
+    defer f.deinit();
+    let mut t = typeset(&f, fnt, size, display)!;
+    defer t.deinit();
+    let mut s = strs.String.init();
+    t.write_svg(s.writer()) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+// STIX Two Math, cut down to the characters math uses (OFL; see testdata).
+fn test_font_data() ![]mut u8 {
+    let packed = fs.read_file("std/text/math/testdata/STIXTwoMath-subset.ttf.xz")!;
+    defer mem.free(packed);
+    return xz.decompress(packed, 4000000);
+}
+
+fn set(f: *font.Font, tex: []u8, display: m.Display) !Typeset {
+    let mut fm = m.parse(tex)!;
+    defer fm.deinit();
+    return typeset(&fm, f, 20.0, display);
+}
+
+fn has_glyph(t: *Typeset, gid: u32) bool {
+    for x in t.items.items() {
+        if (not x.rule) and (x.gid == gid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+test "typesetting with a MATH table" {
+    let data = test_font_data()!;
+    defer mem.free(data);
+    let mut f = font.Font.init(data)!;
+    let mf = load_math(&f);
+    @expect(mf.has_math);
+    @expect(mf.consts[AXIS_HEIGHT] == 258.0);
+    @expect(mf.script_pct == 70.0);
+    // x^2: the superscript raised, its box beyond the x
+    let mut a = set(&f, "x", m.Display.INLINE)!;
+    defer a.deinit();
+    let mut b = set(&f, "x^2", m.Display.INLINE)!;
+    defer b.deinit();
+    @expect(b.width > a.width);
+    @expect(b.height > a.height + 3.0);
+    @expect(b.items.get(1).y > 5.0);
+    @expect(b.items.get(1).scale < b.items.get(0).scale);
+    // a displayed fraction: numerator over a rule on the axis, denominator below
+    let mut fr = set(&f, "\\frac{a}{b}", m.Display.BLOCK)!;
+    defer fr.deinit();
+    let it = fr.items.items();
+    @expect(it.len == 3);
+    @expect(it[0].y > 0.0);
+    @expect(it[1].y < 0.0);
+    @expect(it[2].rule);
+    @expect(@abs(it[2].y + (it[2].h / 2.0) - (258.0 * 20.0 / 1000.0)) < 0.01);
+    @expect((fr.height > 10.0) and (fr.depth > 5.0));
+    // display style enlarges a sum and sets its limits above and below
+    let mut si = set(&f, "\\sum_{i=1}^n", m.Display.INLINE)!;
+    defer si.deinit();
+    let mut sd = set(&f, "\\sum_{i=1}^n", m.Display.BLOCK)!;
+    defer sd.deinit();
+    @expect(sd.height + sd.depth > si.height + si.depth);
+    @expect(sd.width < si.width);
+    @expect(sd.items.get(0).gid != f.glyph_index(0x2211));
+    // delimiters grow around tall content, by variants and then by assembly
+    let mut p1 = set(&f, "\\left( x \\right)", m.Display.BLOCK)!;
+    defer p1.deinit();
+    let mut p2 = set(&f, "\\left( \\frac{\\frac{a}{b}}{\\frac{c}{d}} \\right)", m.Display.BLOCK)!;
+    defer p2.deinit();
+    let mut p3 = set(&f,
+                     "\\left( \\begin{matrix} 1 \\\\ 2 \\\\ 3 \\\\ 4 \\\\ 5 \\\\ 6 \\\\ 7 \\\\ 8 \\end{matrix} \\right)",
+                     m.Display.BLOCK)!;
+    defer p3.deinit();
+    @expect(has_glyph(&p1, f.glyph_index('(')));
+    @expect(not has_glyph(&p2, f.glyph_index('(')));
+    @expect(p3.height + p3.depth > 160.0);
+    let mut parts: usize = 0;
+    for x in p3.items.items() {
+        if (x.y != p3.items.get(0).y) and (x.x == 0.0) {
+            parts += 1;
+        }
+    }
+    @expect(parts >= 2);
+    // a radical over its body, with a rule
+    let mut r = set(&f, "\\sqrt{x}", m.Display.INLINE)!;
+    defer r.deinit();
+    @expect(r.items.get(r.items.len - 1).rule);
+    @expect(r.items.get(0).x > 0.0);  // the body, after the radical
+}
+
+test "SVG and drawing" {
+    let data = test_font_data()!;
+    defer mem.free(data);
+    let mut f = font.Font.init(data)!;
+    let svg_text = to_svg("x < \\color{red} y", &f, 20.0, m.Display.INLINE)!;
+    defer mem.free(svg_text);
+    @expect(strs.starts_with(svg_text, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""));
+    @expect(strs.contains(svg_text, "<title>x &lt; y</title>"));
+    @expect(strs.contains(svg_text, "<path fill=\"currentColor\" d=\"M"));
+    @expect(strs.contains(svg_text, "<path fill=\"red\" d=\"M"));
+    @expect(strs.ends_with(svg_text, "</svg>"));
+    @expect(strs.contains(svg_text, "style=\"vertical-align:-"));
+    // the same formula twice: the same SVG
+    let again = to_svg("x < \\color{red} y", &f, 20.0, m.Display.INLINE)!;
+    defer mem.free(again);
+    @expect_eq(again, svg_text);
+    // onto a canvas: ink where the formula is, in its colours
+    let mut t = set(&f, "\\color{blue} \\frac{1}{2}", m.Display.BLOCK)!;
+    defer t.deinit();
+    let mut img = image.Image.init(40, 60, 4, image.Depth.U8)!;
+    defer img.deinit();
+    let mut cv = draw.Canvas.init(&mut img);
+    defer cv.deinit();
+    t.draw(&mut cv, 5.0, 30.0, draw.Paint.solid(colors.Color.rgb(0.0, 0.0, 0.0)))!;
+    let mut blue: usize = 0;
+    let px8 = img.samples8();
+    let mut k: usize = 0;
+    while k < px8.len {
+        if (px8[k + 2] > 128) and (px8[k + 3] > 128) and (px8[k] < 64) {
+            blue += 1;
+        }
+        k += 4;
+    }
+    @expect(blue > 20);
+}
+
+test "fonts without a MATH table, and odd input" {
+    let data = test_font_data()!;
+    defer mem.free(data);
+    let mut f = font.Font.init(data)!;
+    // everything the parser makes lays out
+    let inputs: [8][]u8 = ["", "{}", "\\left. \\right.", "x^{}_{}", "\\sqrt[]{}", "\\begin{matrix} \\end{matrix}",
+                           "\\overbrace{}^{}", "\\not\\in \\mathbb{Z}'"];
+    for s in inputs {
+        let out = to_svg(s, &f, 16.0, m.Display.BLOCK)!;
+        mem.free(out);
+    }
+    // deep nesting and huge delimiters stay bounded
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    for i in @as(usize, 0)..20 {
+        _ = i;
+        deep.push_str("\\left(\\frac{1}{")!;
+    }
+    for i in @as(usize, 0)..20 {
+        _ = i;
+        deep.push_str("}\\right)")!;
+    }
+    let out = to_svg(deep.bytes(), &f, 16.0, m.Display.BLOCK)!;
+    mem.free(out);
+    // a font without a MATH table: defaults scaled to it, delimiters scaled
+    let mut d = font.Font.load("/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf") catch return;
+    defer d.deinit();
+    @expect(not load_math(&d).has_math);
+    let mut p = set(&d, "\\left( \\frac{\\frac{a}{b}}{c} \\right)", m.Display.BLOCK)!;
+    defer p.deinit();
+    let mut scaled = false;
+    for x in p.items.items() {
+        scaled = scaled or (x.sy > 1.0);
+    }
+    @expect(scaled);
+}
