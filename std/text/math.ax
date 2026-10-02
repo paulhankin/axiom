@@ -1,0 +1,2407 @@
+// =============================================================================
+// std/text/math.ax - TeX-style mathematics: parsing, MathML Core and plain
+// Unicode text.
+//
+//     let html = math.to_mathml("\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}", math.Display.BLOCK)!;  // mem.free
+//     let txt = math.to_text("x^2 + y_1")!;          // "x² + y₁"
+//
+//     let mut f = math.parse(tex)!;                  // or parse_with(tex, &mut info)
+//     defer f.deinit();
+//     f.write_mathml(w, math.Display.BLOCK)!;
+//     f.write_text(w)!;
+//
+// The input is the math mode of LaTeX as people write it on the web:
+// letters, digits and operators; groups { }; superscripts ^ and subscripts
+// _ (and primes '); \frac, \dfrac, \tfrac, \cfrac, \binom, \over, \choose,
+// \atop; \sqrt and \sqrt[n]; \left ... \middle ... \right and \big .. \Bigg; Greek letters
+// and some 300 symbols, relations, arrows and big operators (\sum, \int,
+// ...) with \limits and \nolimits; functions (\sin, \lim, \operatorname);
+// accents (\hat, \vec, \bar, \overline, \overbrace, ...) and \overset,
+// \underset, \stackrel; fonts (\mathbf, \mathbb, \mathcal, \mathfrak,
+// \mathrm, \mathsf, \mathtt, \boldsymbol) as Unicode mathematical
+// alphanumerics; \text; \color and \textcolor; \bmod and \pmod; spaces
+// (\, \: \; \! \quad \qquad); \not; and the environments matrix, pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix,
+// smallmatrix, cases, aligned, gathered, split and array.
+//
+// MathML follows MathML Core (rendered by current browsers without
+// scripts), with the source in an annotation. Text is a linear form for
+// places without MathML: Unicode symbols, super- and subscript characters
+// where they exist ("x²"), else "^(...)", and "(a+b)/(c+d)" for fractions.
+// Errors (InvalidMath) give the offset and a message; nesting is limited
+// to 64 levels.
+// =============================================================================
+
+import "../collections/vec.ax" as vec;
+import "../fmt.ax" as fmt;
+import "../io.ax" as io;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+
+error { InvalidMath, OutOfMemory }
+
+/// Where a parse failed.
+pub struct ErrorInfo {
+    offset: usize,
+    message: []u8,
+}
+
+/// Inline math, or a block of its own (display style).
+pub enum Display: u8 {
+    INLINE,
+    BLOCK,
+}
+
+const MAX_DEPTH: u32 = 64;
+const NIL: u32 = 0xffffffff;
+
+enum Kind: u8 {
+    ROW,
+    IDENT,
+    NUMBER,
+    OP,
+    TEXT,
+    SPACE,
+    FRAC,
+    SQRT,
+    ROOT,
+    SCRIPTS,  // a: base, b: subscript, c: superscript
+    LIMITS,   // a: base, b: under, c: over
+    ACCENT,   // a: base; s: the accent; s2: its combining character
+    FENCE,    // a: content; s, s2: the delimiters
+    TABLE,    // rows
+    TROW,     // cells
+    TCELL,    // a: content
+    STYLE,    // a: content (display style)
+}
+
+// operator classes
+const C_ORD: u8 = 0;
+const C_BIN: u8 = 1;
+const C_REL: u8 = 2;
+const C_OPEN: u8 = 3;
+const C_CLOSE: u8 = 4;
+const C_PUNCT: u8 = 5;
+const C_LARGE: u8 = 6;    // big operators: limits in display style
+const C_INT: u8 = 7;      // integrals: scripts at the side
+const C_FUNC: u8 = 8;     // functions (sin)
+const C_FUNCL: u8 = 9;    // functions with limits (lim)
+const C_GREEK: u8 = 10;   // an identifier
+const C_UGREEK: u8 = 11;  // an upright identifier
+const C_ACCENT: u8 = 12;
+
+// node flags
+const F_NORMAL: u16 = 1;  // an upright identifier
+const F_STRETCHY: u16 = 2;
+const F_THIN0: u16 = 4;  // a fraction without a line (\binom)
+const F_DISPLAY: u16 = 8;
+const F_TEXTSTYLE: u16 = 16;
+const F_UNDER: u16 = 32;   // an accent below
+const F_LIMITS: u16 = 64;  // limits forced (\limits)
+const F_NOLIMITS: u16 = 128;
+const F_FUNC: u16 = 256;    // a function name: U+2061 follows in MathML
+const F_SIZED: u16 = 512;   // a \big delimiter (width: its size in em)
+const F_LEFT: u16 = 1024;   // a table whose columns align left (cases)
+const F_ALIGN: u16 = 2048;  // a table whose columns align right, left, right, ...
+const F_SMALL: u16 = 4096;  // a small matrix
+
+struct Node {
+    kind: Kind,
+    cls: u8,
+    flags: u16,
+    s: u32,
+    sl: u32,
+    s2: u32,
+    s2l: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    first: u32,
+    next: u32,
+    width: f32,
+}
+
+/// A parsed formula.
+pub struct Formula {
+    nodes: vec.Vec.[Node],
+    strs: strs.String,
+    source: strs.String,
+    root: u32,
+
+    pub fn deinit(self: *mut Formula) void {
+        self.nodes.deinit();
+        self.strs.deinit();
+        self.source.deinit();
+    }
+
+    fn node(self: *Formula, i: u32) *mut Node {
+        return &mut self.nodes.items()[@as(usize, i)];
+    }
+
+    fn str(self: *Formula, off: u32, len: u32) []u8 {
+        return self.strs.bytes()[@as(usize, off)..@as(usize, off + len)];
+    }
+
+    /// MathML Core: a <math> element (display="block" for BLOCK), the
+    /// source kept in an annotation.
+    pub fn write_mathml(self: *Formula, w: io.Writer, display: Display) !void {
+        let mut o = Out.init(w);
+        if display == Display.BLOCK {
+            o.s("<math display=\"block\"><semantics>")!;
+        } else {
+            o.s("<math><semantics>")!;
+        }
+        mathml(self, &mut o, self.root)!;
+        o.s("<annotation encoding=\"application/x-tex\">")!;
+        o.esc(self.source.bytes())!;
+        o.s("</annotation></semantics></math>")!;
+        o.flush()!;
+    }
+
+    /// The formula as linear Unicode text.
+    pub fn write_text(self: *Formula, w: io.Writer) !void {
+        let mut o = Out.init(w);
+        text(self, &mut o, self.root)!;
+        o.flush()!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Symbols
+// -----------------------------------------------------------------------------
+
+struct Sym {
+    name: []u8,
+    text: []u8,
+    cls: u8,
+}
+
+let SYMBOLS: [323]Sym = [
+    // Greek
+    Sym.{ name: "alpha", text: "\u{3b1}", cls: C_GREEK },
+    Sym.{ name: "beta", text: "\u{3b2}", cls: C_GREEK },
+    Sym.{ name: "gamma", text: "\u{3b3}", cls: C_GREEK },
+    Sym.{ name: "delta", text: "\u{3b4}", cls: C_GREEK },
+    Sym.{ name: "epsilon", text: "\u{3f5}", cls: C_GREEK },
+    Sym.{ name: "varepsilon", text: "\u{3b5}", cls: C_GREEK },
+    Sym.{ name: "zeta", text: "\u{3b6}", cls: C_GREEK },
+    Sym.{ name: "eta", text: "\u{3b7}", cls: C_GREEK },
+    Sym.{ name: "theta", text: "\u{3b8}", cls: C_GREEK },
+    Sym.{ name: "vartheta", text: "\u{3d1}", cls: C_GREEK },
+    Sym.{ name: "iota", text: "\u{3b9}", cls: C_GREEK },
+    Sym.{ name: "kappa", text: "\u{3ba}", cls: C_GREEK },
+    Sym.{ name: "varkappa", text: "\u{3f0}", cls: C_GREEK },
+    Sym.{ name: "lambda", text: "\u{3bb}", cls: C_GREEK },
+    Sym.{ name: "mu", text: "\u{3bc}", cls: C_GREEK },
+    Sym.{ name: "nu", text: "\u{3bd}", cls: C_GREEK },
+    Sym.{ name: "xi", text: "\u{3be}", cls: C_GREEK },
+    Sym.{ name: "omicron", text: "\u{3bf}", cls: C_GREEK },
+    Sym.{ name: "pi", text: "\u{3c0}", cls: C_GREEK },
+    Sym.{ name: "varpi", text: "\u{3d6}", cls: C_GREEK },
+    Sym.{ name: "rho", text: "\u{3c1}", cls: C_GREEK },
+    Sym.{ name: "varrho", text: "\u{3f1}", cls: C_GREEK },
+    Sym.{ name: "sigma", text: "\u{3c3}", cls: C_GREEK },
+    Sym.{ name: "varsigma", text: "\u{3c2}", cls: C_GREEK },
+    Sym.{ name: "tau", text: "\u{3c4}", cls: C_GREEK },
+    Sym.{ name: "upsilon", text: "\u{3c5}", cls: C_GREEK },
+    Sym.{ name: "phi", text: "\u{3d5}", cls: C_GREEK },
+    Sym.{ name: "varphi", text: "\u{3c6}", cls: C_GREEK },
+    Sym.{ name: "chi", text: "\u{3c7}", cls: C_GREEK },
+    Sym.{ name: "psi", text: "\u{3c8}", cls: C_GREEK },
+    Sym.{ name: "omega", text: "\u{3c9}", cls: C_GREEK },
+    Sym.{ name: "digamma", text: "\u{3dd}", cls: C_GREEK },
+    Sym.{ name: "Gamma", text: "\u{393}", cls: C_UGREEK },
+    Sym.{ name: "Delta", text: "\u{394}", cls: C_UGREEK },
+    Sym.{ name: "Theta", text: "\u{398}", cls: C_UGREEK },
+    Sym.{ name: "Lambda", text: "\u{39b}", cls: C_UGREEK },
+    Sym.{ name: "Xi", text: "\u{39e}", cls: C_UGREEK },
+    Sym.{ name: "Pi", text: "\u{3a0}", cls: C_UGREEK },
+    Sym.{ name: "Sigma", text: "\u{3a3}", cls: C_UGREEK },
+    Sym.{ name: "Upsilon", text: "\u{3a5}", cls: C_UGREEK },
+    Sym.{ name: "Phi", text: "\u{3a6}", cls: C_UGREEK },
+    Sym.{ name: "Psi", text: "\u{3a8}", cls: C_UGREEK },
+    Sym.{ name: "Omega", text: "\u{3a9}", cls: C_UGREEK },
+    // letter-like
+    Sym.{ name: "infty", text: "\u{221e}", cls: C_UGREEK },
+    Sym.{ name: "partial", text: "\u{2202}", cls: C_GREEK },
+    Sym.{ name: "nabla", text: "\u{2207}", cls: C_UGREEK },
+    Sym.{ name: "forall", text: "\u{2200}", cls: C_ORD },
+    Sym.{ name: "exists", text: "\u{2203}", cls: C_ORD },
+    Sym.{ name: "nexists", text: "\u{2204}", cls: C_ORD },
+    Sym.{ name: "emptyset", text: "\u{2205}", cls: C_UGREEK },
+    Sym.{ name: "varnothing", text: "\u{2205}", cls: C_UGREEK },
+    Sym.{ name: "neg", text: "\u{ac}", cls: C_ORD },
+    Sym.{ name: "lnot", text: "\u{ac}", cls: C_ORD },
+    Sym.{ name: "aleph", text: "\u{2135}", cls: C_UGREEK },
+    Sym.{ name: "beth", text: "\u{2136}", cls: C_UGREEK },
+    Sym.{ name: "hbar", text: "\u{210f}", cls: C_GREEK },
+    Sym.{ name: "hslash", text: "\u{210f}", cls: C_GREEK },
+    Sym.{ name: "ell", text: "\u{2113}", cls: C_GREEK },
+    Sym.{ name: "wp", text: "\u{2118}", cls: C_UGREEK },
+    Sym.{ name: "Re", text: "\u{211c}", cls: C_UGREEK },
+    Sym.{ name: "Im", text: "\u{2111}", cls: C_UGREEK },
+    Sym.{ name: "imath", text: "\u{131}", cls: C_GREEK },
+    Sym.{ name: "jmath", text: "\u{237}", cls: C_GREEK },
+    Sym.{ name: "angle", text: "\u{2220}", cls: C_ORD },
+    Sym.{ name: "measuredangle", text: "\u{2221}", cls: C_ORD },
+    Sym.{ name: "triangle", text: "\u{25b3}", cls: C_ORD },
+    Sym.{ name: "square", text: "\u{25a1}", cls: C_ORD },
+    Sym.{ name: "Box", text: "\u{25a1}", cls: C_ORD },
+    Sym.{ name: "blacksquare", text: "\u{25a0}", cls: C_ORD },
+    Sym.{ name: "prime", text: "\u{2032}", cls: C_ORD },
+    Sym.{ name: "top", text: "\u{22a4}", cls: C_ORD },
+    Sym.{ name: "bot", text: "\u{22a5}", cls: C_ORD },
+    Sym.{ name: "flat", text: "\u{266d}", cls: C_ORD },
+    Sym.{ name: "natural", text: "\u{266e}", cls: C_ORD },
+    Sym.{ name: "sharp", text: "\u{266f}", cls: C_ORD },
+    Sym.{ name: "clubsuit", text: "\u{2663}", cls: C_ORD },
+    Sym.{ name: "diamondsuit", text: "\u{2662}", cls: C_ORD },
+    Sym.{ name: "heartsuit", text: "\u{2661}", cls: C_ORD },
+    Sym.{ name: "spadesuit", text: "\u{2660}", cls: C_ORD },
+    Sym.{ name: "checkmark", text: "\u{2713}", cls: C_ORD },
+    Sym.{ name: "dagger", text: "\u{2020}", cls: C_BIN },
+    Sym.{ name: "ddagger", text: "\u{2021}", cls: C_BIN },
+    Sym.{ name: "dots", text: "\u{2026}", cls: C_ORD },
+    Sym.{ name: "ldots", text: "\u{2026}", cls: C_ORD },
+    Sym.{ name: "dotsc", text: "\u{2026}", cls: C_ORD },
+    Sym.{ name: "cdots", text: "\u{22ef}", cls: C_ORD },
+    Sym.{ name: "dotsb", text: "\u{22ef}", cls: C_ORD },
+    Sym.{ name: "vdots", text: "\u{22ee}", cls: C_ORD },
+    Sym.{ name: "ddots", text: "\u{22f1}", cls: C_ORD },
+    Sym.{ name: "degree", text: "\u{b0}", cls: C_ORD },
+    // binary operators
+    Sym.{ name: "pm", text: "\u{b1}", cls: C_BIN },
+    Sym.{ name: "mp", text: "\u{2213}", cls: C_BIN },
+    Sym.{ name: "times", text: "\u{d7}", cls: C_BIN },
+    Sym.{ name: "div", text: "\u{f7}", cls: C_BIN },
+    Sym.{ name: "cdot", text: "\u{22c5}", cls: C_BIN },
+    Sym.{ name: "ast", text: "\u{2217}", cls: C_BIN },
+    Sym.{ name: "star", text: "\u{22c6}", cls: C_BIN },
+    Sym.{ name: "circ", text: "\u{2218}", cls: C_BIN },
+    Sym.{ name: "bullet", text: "\u{2219}", cls: C_BIN },
+    Sym.{ name: "oplus", text: "\u{2295}", cls: C_BIN },
+    Sym.{ name: "ominus", text: "\u{2296}", cls: C_BIN },
+    Sym.{ name: "otimes", text: "\u{2297}", cls: C_BIN },
+    Sym.{ name: "oslash", text: "\u{2298}", cls: C_BIN },
+    Sym.{ name: "odot", text: "\u{2299}", cls: C_BIN },
+    Sym.{ name: "cap", text: "\u{2229}", cls: C_BIN },
+    Sym.{ name: "cup", text: "\u{222a}", cls: C_BIN },
+    Sym.{ name: "wedge", text: "\u{2227}", cls: C_BIN },
+    Sym.{ name: "land", text: "\u{2227}", cls: C_BIN },
+    Sym.{ name: "vee", text: "\u{2228}", cls: C_BIN },
+    Sym.{ name: "lor", text: "\u{2228}", cls: C_BIN },
+    Sym.{ name: "setminus", text: "\u{2216}", cls: C_BIN },
+    Sym.{ name: "smallsetminus", text: "\u{2216}", cls: C_BIN },
+    Sym.{ name: "wr", text: "\u{2240}", cls: C_BIN },
+    Sym.{ name: "sqcap", text: "\u{2293}", cls: C_BIN },
+    Sym.{ name: "sqcup", text: "\u{2294}", cls: C_BIN },
+    Sym.{ name: "uplus", text: "\u{228e}", cls: C_BIN },
+    Sym.{ name: "amalg", text: "\u{2a3f}", cls: C_BIN },
+    Sym.{ name: "diamond", text: "\u{22c4}", cls: C_BIN },
+    Sym.{ name: "triangleleft", text: "\u{25c1}", cls: C_BIN },
+    Sym.{ name: "triangleright", text: "\u{25b7}", cls: C_BIN },
+    Sym.{ name: "bigtriangleup", text: "\u{25b3}", cls: C_BIN },
+    Sym.{ name: "bigtriangledown", text: "\u{25bd}", cls: C_BIN },
+    Sym.{ name: "ltimes", text: "\u{22c9}", cls: C_BIN },
+    Sym.{ name: "rtimes", text: "\u{22ca}", cls: C_BIN },
+    Sym.{ name: "boxplus", text: "\u{229e}", cls: C_BIN },
+    Sym.{ name: "boxtimes", text: "\u{22a0}", cls: C_BIN },
+    // relations
+    Sym.{ name: "le", text: "\u{2264}", cls: C_REL },
+    Sym.{ name: "leq", text: "\u{2264}", cls: C_REL },
+    Sym.{ name: "ge", text: "\u{2265}", cls: C_REL },
+    Sym.{ name: "geq", text: "\u{2265}", cls: C_REL },
+    Sym.{ name: "leqslant", text: "\u{2a7d}", cls: C_REL },
+    Sym.{ name: "geqslant", text: "\u{2a7e}", cls: C_REL },
+    Sym.{ name: "ne", text: "\u{2260}", cls: C_REL },
+    Sym.{ name: "neq", text: "\u{2260}", cls: C_REL },
+    Sym.{ name: "equiv", text: "\u{2261}", cls: C_REL },
+    Sym.{ name: "approx", text: "\u{2248}", cls: C_REL },
+    Sym.{ name: "approxeq", text: "\u{224a}", cls: C_REL },
+    Sym.{ name: "sim", text: "\u{223c}", cls: C_REL },
+    Sym.{ name: "simeq", text: "\u{2243}", cls: C_REL },
+    Sym.{ name: "cong", text: "\u{2245}", cls: C_REL },
+    Sym.{ name: "propto", text: "\u{221d}", cls: C_REL },
+    Sym.{ name: "ll", text: "\u{226a}", cls: C_REL },
+    Sym.{ name: "gg", text: "\u{226b}", cls: C_REL },
+    Sym.{ name: "lll", text: "\u{22d8}", cls: C_REL },
+    Sym.{ name: "ggg", text: "\u{22d9}", cls: C_REL },
+    Sym.{ name: "subset", text: "\u{2282}", cls: C_REL },
+    Sym.{ name: "supset", text: "\u{2283}", cls: C_REL },
+    Sym.{ name: "subseteq", text: "\u{2286}", cls: C_REL },
+    Sym.{ name: "supseteq", text: "\u{2287}", cls: C_REL },
+    Sym.{ name: "subsetneq", text: "\u{228a}", cls: C_REL },
+    Sym.{ name: "supsetneq", text: "\u{228b}", cls: C_REL },
+    Sym.{ name: "sqsubseteq", text: "\u{2291}", cls: C_REL },
+    Sym.{ name: "sqsupseteq", text: "\u{2292}", cls: C_REL },
+    Sym.{ name: "in", text: "\u{2208}", cls: C_REL },
+    Sym.{ name: "notin", text: "\u{2209}", cls: C_REL },
+    Sym.{ name: "ni", text: "\u{220b}", cls: C_REL },
+    Sym.{ name: "owns", text: "\u{220b}", cls: C_REL },
+    Sym.{ name: "mid", text: "\u{2223}", cls: C_REL },
+    Sym.{ name: "nmid", text: "\u{2224}", cls: C_REL },
+    Sym.{ name: "parallel", text: "\u{2225}", cls: C_REL },
+    Sym.{ name: "nparallel", text: "\u{2226}", cls: C_REL },
+    Sym.{ name: "perp", text: "\u{22a5}", cls: C_REL },
+    Sym.{ name: "models", text: "\u{22a8}", cls: C_REL },
+    Sym.{ name: "vdash", text: "\u{22a2}", cls: C_REL },
+    Sym.{ name: "dashv", text: "\u{22a3}", cls: C_REL },
+    Sym.{ name: "vDash", text: "\u{22a8}", cls: C_REL },
+    Sym.{ name: "prec", text: "\u{227a}", cls: C_REL },
+    Sym.{ name: "succ", text: "\u{227b}", cls: C_REL },
+    Sym.{ name: "preceq", text: "\u{2aaf}", cls: C_REL },
+    Sym.{ name: "succeq", text: "\u{2ab0}", cls: C_REL },
+    Sym.{ name: "doteq", text: "\u{2250}", cls: C_REL },
+    Sym.{ name: "asymp", text: "\u{224d}", cls: C_REL },
+    Sym.{ name: "bowtie", text: "\u{22c8}", cls: C_REL },
+    Sym.{ name: "coloneqq", text: "\u{2254}", cls: C_REL },
+    Sym.{ name: "triangleq", text: "\u{225c}", cls: C_REL },
+    Sym.{ name: "nless", text: "\u{226e}", cls: C_REL },
+    Sym.{ name: "ngtr", text: "\u{226f}", cls: C_REL },
+    Sym.{ name: "nleq", text: "\u{2270}", cls: C_REL },
+    Sym.{ name: "ngeq", text: "\u{2271}", cls: C_REL },
+    Sym.{ name: "nsim", text: "\u{2241}", cls: C_REL },
+    Sym.{ name: "ncong", text: "\u{2247}", cls: C_REL },
+    Sym.{ name: "nsubseteq", text: "\u{2288}", cls: C_REL },
+    Sym.{ name: "nsupseteq", text: "\u{2289}", cls: C_REL },
+    Sym.{ name: "lesssim", text: "\u{2272}", cls: C_REL },
+    Sym.{ name: "gtrsim", text: "\u{2273}", cls: C_REL },
+    // arrows
+    Sym.{ name: "to", text: "\u{2192}", cls: C_REL },
+    Sym.{ name: "rightarrow", text: "\u{2192}", cls: C_REL },
+    Sym.{ name: "leftarrow", text: "\u{2190}", cls: C_REL },
+    Sym.{ name: "gets", text: "\u{2190}", cls: C_REL },
+    Sym.{ name: "leftrightarrow", text: "\u{2194}", cls: C_REL },
+    Sym.{ name: "Rightarrow", text: "\u{21d2}", cls: C_REL },
+    Sym.{ name: "Leftarrow", text: "\u{21d0}", cls: C_REL },
+    Sym.{ name: "Leftrightarrow", text: "\u{21d4}", cls: C_REL },
+    Sym.{ name: "longrightarrow", text: "\u{27f6}", cls: C_REL },
+    Sym.{ name: "longleftarrow", text: "\u{27f5}", cls: C_REL },
+    Sym.{ name: "longleftrightarrow", text: "\u{27f7}", cls: C_REL },
+    Sym.{ name: "Longrightarrow", text: "\u{27f9}", cls: C_REL },
+    Sym.{ name: "Longleftarrow", text: "\u{27f8}", cls: C_REL },
+    Sym.{ name: "Longleftrightarrow", text: "\u{27fa}", cls: C_REL },
+    Sym.{ name: "implies", text: "\u{27f9}", cls: C_REL },
+    Sym.{ name: "impliedby", text: "\u{27f8}", cls: C_REL },
+    Sym.{ name: "iff", text: "\u{27fa}", cls: C_REL },
+    Sym.{ name: "mapsto", text: "\u{21a6}", cls: C_REL },
+    Sym.{ name: "longmapsto", text: "\u{27fc}", cls: C_REL },
+    Sym.{ name: "uparrow", text: "\u{2191}", cls: C_REL },
+    Sym.{ name: "downarrow", text: "\u{2193}", cls: C_REL },
+    Sym.{ name: "updownarrow", text: "\u{2195}", cls: C_REL },
+    Sym.{ name: "Uparrow", text: "\u{21d1}", cls: C_REL },
+    Sym.{ name: "Downarrow", text: "\u{21d3}", cls: C_REL },
+    Sym.{ name: "Updownarrow", text: "\u{21d5}", cls: C_REL },
+    Sym.{ name: "nearrow", text: "\u{2197}", cls: C_REL },
+    Sym.{ name: "searrow", text: "\u{2198}", cls: C_REL },
+    Sym.{ name: "swarrow", text: "\u{2199}", cls: C_REL },
+    Sym.{ name: "nwarrow", text: "\u{2196}", cls: C_REL },
+    Sym.{ name: "hookrightarrow", text: "\u{21aa}", cls: C_REL },
+    Sym.{ name: "hookleftarrow", text: "\u{21a9}", cls: C_REL },
+    Sym.{ name: "rightharpoonup", text: "\u{21c0}", cls: C_REL },
+    Sym.{ name: "leftharpoonup", text: "\u{21bc}", cls: C_REL },
+    Sym.{ name: "rightleftharpoons", text: "\u{21cc}", cls: C_REL },
+    Sym.{ name: "leadsto", text: "\u{219d}", cls: C_REL },
+    Sym.{ name: "twoheadrightarrow", text: "\u{21a0}", cls: C_REL },
+    Sym.{ name: "rightrightarrows", text: "\u{21c9}", cls: C_REL },
+    Sym.{ name: "circlearrowleft", text: "\u{21ba}", cls: C_REL },
+    Sym.{ name: "circlearrowright", text: "\u{21bb}", cls: C_REL },
+    // delimiters
+    Sym.{ name: "langle", text: "\u{27e8}", cls: C_OPEN },
+    Sym.{ name: "rangle", text: "\u{27e9}", cls: C_CLOSE },
+    Sym.{ name: "lfloor", text: "\u{230a}", cls: C_OPEN },
+    Sym.{ name: "rfloor", text: "\u{230b}", cls: C_CLOSE },
+    Sym.{ name: "lceil", text: "\u{2308}", cls: C_OPEN },
+    Sym.{ name: "rceil", text: "\u{2309}", cls: C_CLOSE },
+    Sym.{ name: "lbrace", text: "{", cls: C_OPEN },
+    Sym.{ name: "rbrace", text: "}", cls: C_CLOSE },
+    Sym.{ name: "{", text: "{", cls: C_OPEN },
+    Sym.{ name: "}", text: "}", cls: C_CLOSE },
+    Sym.{ name: "lbrack", text: "[", cls: C_OPEN },
+    Sym.{ name: "rbrack", text: "]", cls: C_CLOSE },
+    Sym.{ name: "lvert", text: "|", cls: C_OPEN },
+    Sym.{ name: "rvert", text: "|", cls: C_CLOSE },
+    Sym.{ name: "lVert", text: "\u{2016}", cls: C_OPEN },
+    Sym.{ name: "rVert", text: "\u{2016}", cls: C_CLOSE },
+    Sym.{ name: "vert", text: "|", cls: C_ORD },
+    Sym.{ name: "Vert", text: "\u{2016}", cls: C_ORD },
+    Sym.{ name: "|", text: "\u{2016}", cls: C_ORD },
+    Sym.{ name: "backslash", text: "\\", cls: C_ORD },
+    Sym.{ name: "llbracket", text: "\u{27e6}", cls: C_OPEN },
+    Sym.{ name: "rrbracket", text: "\u{27e7}", cls: C_CLOSE },
+    // escaped characters and punctuation
+    Sym.{ name: "%", text: "%", cls: C_ORD },
+    Sym.{ name: "$", text: "$", cls: C_ORD },
+    Sym.{ name: "&", text: "&", cls: C_ORD },
+    Sym.{ name: "#", text: "#", cls: C_ORD },
+    Sym.{ name: "_", text: "_", cls: C_ORD },
+    Sym.{ name: "colon", text: ":", cls: C_PUNCT },
+    Sym.{ name: "lt", text: "<", cls: C_REL },
+    Sym.{ name: "gt", text: ">", cls: C_REL },
+    // big operators
+    Sym.{ name: "sum", text: "\u{2211}", cls: C_LARGE },
+    Sym.{ name: "prod", text: "\u{220f}", cls: C_LARGE },
+    Sym.{ name: "coprod", text: "\u{2210}", cls: C_LARGE },
+    Sym.{ name: "bigcup", text: "\u{22c3}", cls: C_LARGE },
+    Sym.{ name: "bigcap", text: "\u{22c2}", cls: C_LARGE },
+    Sym.{ name: "bigvee", text: "\u{22c1}", cls: C_LARGE },
+    Sym.{ name: "bigwedge", text: "\u{22c0}", cls: C_LARGE },
+    Sym.{ name: "bigoplus", text: "\u{2a01}", cls: C_LARGE },
+    Sym.{ name: "bigotimes", text: "\u{2a02}", cls: C_LARGE },
+    Sym.{ name: "bigodot", text: "\u{2a00}", cls: C_LARGE },
+    Sym.{ name: "biguplus", text: "\u{2a04}", cls: C_LARGE },
+    Sym.{ name: "bigsqcup", text: "\u{2a06}", cls: C_LARGE },
+    Sym.{ name: "int", text: "\u{222b}", cls: C_INT },
+    Sym.{ name: "iint", text: "\u{222c}", cls: C_INT },
+    Sym.{ name: "iiint", text: "\u{222d}", cls: C_INT },
+    Sym.{ name: "oint", text: "\u{222e}", cls: C_INT },
+    Sym.{ name: "oiint", text: "\u{222f}", cls: C_INT },
+    // functions
+    Sym.{ name: "sin", text: "sin", cls: C_FUNC },
+    Sym.{ name: "cos", text: "cos", cls: C_FUNC },
+    Sym.{ name: "tan", text: "tan", cls: C_FUNC },
+    Sym.{ name: "cot", text: "cot", cls: C_FUNC },
+    Sym.{ name: "sec", text: "sec", cls: C_FUNC },
+    Sym.{ name: "csc", text: "csc", cls: C_FUNC },
+    Sym.{ name: "arcsin", text: "arcsin", cls: C_FUNC },
+    Sym.{ name: "arccos", text: "arccos", cls: C_FUNC },
+    Sym.{ name: "arctan", text: "arctan", cls: C_FUNC },
+    Sym.{ name: "sinh", text: "sinh", cls: C_FUNC },
+    Sym.{ name: "cosh", text: "cosh", cls: C_FUNC },
+    Sym.{ name: "tanh", text: "tanh", cls: C_FUNC },
+    Sym.{ name: "coth", text: "coth", cls: C_FUNC },
+    Sym.{ name: "log", text: "log", cls: C_FUNC },
+    Sym.{ name: "ln", text: "ln", cls: C_FUNC },
+    Sym.{ name: "lg", text: "lg", cls: C_FUNC },
+    Sym.{ name: "exp", text: "exp", cls: C_FUNC },
+    Sym.{ name: "deg", text: "deg", cls: C_FUNC },
+    Sym.{ name: "dim", text: "dim", cls: C_FUNC },
+    Sym.{ name: "hom", text: "hom", cls: C_FUNC },
+    Sym.{ name: "ker", text: "ker", cls: C_FUNC },
+    Sym.{ name: "arg", text: "arg", cls: C_FUNC },
+    Sym.{ name: "lim", text: "lim", cls: C_FUNCL },
+    Sym.{ name: "limsup", text: "lim sup", cls: C_FUNCL },
+    Sym.{ name: "liminf", text: "lim inf", cls: C_FUNCL },
+    Sym.{ name: "max", text: "max", cls: C_FUNCL },
+    Sym.{ name: "min", text: "min", cls: C_FUNCL },
+    Sym.{ name: "sup", text: "sup", cls: C_FUNCL },
+    Sym.{ name: "inf", text: "inf", cls: C_FUNCL },
+    Sym.{ name: "det", text: "det", cls: C_FUNCL },
+    Sym.{ name: "gcd", text: "gcd", cls: C_FUNCL },
+    Sym.{ name: "Pr", text: "Pr", cls: C_FUNCL },
+    Sym.{ name: "argmax", text: "arg max", cls: C_FUNCL },
+    Sym.{ name: "argmin", text: "arg min", cls: C_FUNCL },
+    // accents
+    Sym.{ name: "hat", text: "\u{2c6}\u{302}", cls: C_ACCENT },
+    Sym.{ name: "widehat", text: "\u{2c6}\u{302}", cls: C_ACCENT },
+    Sym.{ name: "check", text: "\u{2c7}\u{30c}", cls: C_ACCENT },
+    Sym.{ name: "tilde", text: "~\u{303}", cls: C_ACCENT },
+    Sym.{ name: "widetilde", text: "~\u{303}", cls: C_ACCENT },
+    Sym.{ name: "acute", text: "\u{b4}\u{301}", cls: C_ACCENT },
+    Sym.{ name: "grave", text: "`\u{300}", cls: C_ACCENT },
+    Sym.{ name: "dot", text: "\u{2d9}\u{307}", cls: C_ACCENT },
+    Sym.{ name: "ddot", text: "\u{a8}\u{308}", cls: C_ACCENT },
+    Sym.{ name: "breve", text: "\u{2d8}\u{306}", cls: C_ACCENT },
+    Sym.{ name: "bar", text: "\u{203e}\u{304}", cls: C_ACCENT },
+    Sym.{ name: "vec", text: "\u{2192}\u{20d7}", cls: C_ACCENT },
+    Sym.{ name: "overrightarrow", text: "\u{2192}\u{20d7}", cls: C_ACCENT },
+    Sym.{ name: "overleftarrow", text: "\u{2190}\u{20d6}", cls: C_ACCENT },
+    Sym.{ name: "overline", text: "\u{203e}\u{305}", cls: C_ACCENT },
+    Sym.{ name: "underline", text: "_\u{332}", cls: C_ACCENT },
+    Sym.{ name: "overbrace", text: "\u{23de}", cls: C_ACCENT },
+    Sym.{ name: "underbrace", text: "\u{23df}", cls: C_ACCENT },
+];
+
+// The SYMBOLS entry called name, or SYMBOLS.len.
+fn find_symbol(name: []u8) usize {
+    for i in @as(usize, 0)..SYMBOLS.len {
+        if strs.eq(SYMBOLS[i].name, name) {
+            return i;
+        }
+    }
+    return SYMBOLS.len;
+}
+
+/// The accent's spacing character and its combining form (empty for the
+/// braces, which have none).
+fn accent_parts(t: []u8) [2][]u8 {
+    let r = strs.decode_rune(t);
+    let n = @as(usize, r.len);
+    return [t[..n], t[n..]];
+}
+
+// -----------------------------------------------------------------------------
+// Fonts: Unicode's mathematical alphanumerics
+// -----------------------------------------------------------------------------
+
+/// A math font (\mathbf and the like).
+enum Font: u8 {
+    NONE,
+    BOLD,
+    ITALIC,
+    BOLD_ITALIC,
+    SCRIPT,
+    BOLD_SCRIPT,
+    FRAKTUR,
+    BOLD_FRAKTUR,
+    DOUBLE_STRUCK,
+    SANS,
+    SANS_BOLD,
+    SANS_ITALIC,
+    MONO,
+    ROMAN,
+}
+
+let LETTER_BASE: [13]u32 = [0, 0x1d400, 0x1d434, 0x1d468, 0x1d49c, 0x1d4d0, 0x1d504, 0x1d56c, 0x1d538, 0x1d5a0, 0x1d5d4,
+                            0x1d608, 0x1d670];
+
+// (font, letter) pairs whose characters are not in the block: their
+// letterlike symbols
+let HOLES_KEY: [27]u32 = [
+    0x0268,  // italic h
+    0x0442, 0x0445, 0x0446, 0x0448, 0x0449, 0x044c, 0x044d, 0x0452, 0x0465, 0x0467, 0x046f,  // script BEFHILMR e g o
+    0x0643, 0x0648, 0x0649, 0x0652, 0x065a,                  // fraktur C H I R Z
+    0x0843, 0x0848, 0x084e, 0x0850, 0x0851, 0x0852, 0x085a,  // double-struck C H N P Q R Z
+    0, 0, 0,
+];
+let HOLES_VAL: [27]u32 = [
+    0x210e,
+    0x212c,
+    0x2130,
+    0x2131,
+    0x210b,
+    0x2110,
+    0x2112,
+    0x2133,
+    0x211b,
+    0x212f,
+    0x210a,
+    0x2134,
+    0x212d,
+    0x210c,
+    0x2111,
+    0x211c,
+    0x2128,
+    0x2102,
+    0x210d,
+    0x2115,
+    0x2119,
+    0x211a,
+    0x211d,
+    0x2124,
+    0,
+    0,
+    0,
+];
+
+fn styled(c: u32, font: Font) u32 {
+    let f = @as(u32, @int_from_enum(font));
+    if (font == Font.NONE) or (font == Font.ROMAN) {
+        return c;
+    }
+    if (c >= '0') and (c <= '9') {
+        let d = c - '0';
+        if (font == Font.BOLD) or (font == Font.BOLD_ITALIC) {
+            return 0x1d7ce + d;
+        }
+        if font == Font.DOUBLE_STRUCK {
+            return 0x1d7d8 + d;
+        }
+        if font == Font.SANS {
+            return 0x1d7e2 + d;
+        }
+        if font == Font.SANS_BOLD {
+            return 0x1d7ec + d;
+        }
+        if font == Font.MONO {
+            return 0x1d7f6 + d;
+        }
+        return c;
+    }
+    if (c >= 0x391) and (c <= 0x3c9) and (c != 0x3a2) and ((c <= 0x3a9) or (c >= 0x3b1)) {
+        // Greek: capitals then small letters, 26 apart from a font's base
+        let mut g: u32 = c - 0x391;
+        if c >= 0x3b1 {
+            g = (c - 0x3b1) + 26;
+        }
+        if font == Font.BOLD {
+            return 0x1d6a8 + g;
+        }
+        if font == Font.ITALIC {
+            return 0x1d6e2 + g;
+        }
+        if font == Font.BOLD_ITALIC {
+            return 0x1d71c + g;
+        }
+        if font == Font.SANS_BOLD {
+            return 0x1d756 + g;
+        }
+        return c;
+    }
+    let mut idx: u32 = 0;
+    if (c >= 'A') and (c <= 'Z') {
+        idx = c - 'A';
+    } else if (c >= 'a') and (c <= 'z') {
+        idx = (c - 'a') + 26;
+    } else {
+        return c;
+    }
+    let key = (f << 8) | c;
+    for k in @as(usize, 0)..HOLES_KEY.len {
+        if (HOLES_KEY[k] != 0) and (HOLES_KEY[k] == key) {
+            return HOLES_VAL[k];
+        }
+    }
+    return LETTER_BASE[@as(usize, f)] + idx;
+}
+
+// -----------------------------------------------------------------------------
+// Parsing
+// -----------------------------------------------------------------------------
+
+struct Parser {
+    src: []u8,
+    pos: usize,
+    f: *mut Formula,
+    depth: u32,
+    info: *mut ErrorInfo,
+    font: Font,
+}
+
+fn is_letter(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'));
+}
+
+fn new_node(p: *mut Parser, kind: Kind) !u32 {
+    let i = @truncate(u32, p.f.nodes.len);
+    p.f.nodes.push(Node.{ kind: kind, cls: C_ORD, flags: 0, s: 0, sl: 0, s2: 0, s2l: 0, a: NIL, b: NIL, c: NIL,
+                          first: NIL, next: NIL, width: 0.0 })!;
+    return i;
+}
+
+fn add_str(p: *mut Parser, s: []u8) !u32 {
+    let off = @truncate(u32, p.f.strs.len);
+    p.f.strs.push_str(s)!;
+    return off;
+}
+
+fn set_s(p: *mut Parser, n: u32, s: []u8) !void {
+    let off = add_str(p, s)!;
+    let nd = p.f.node(n);
+    nd.s = off;
+    nd.sl = @truncate(u32, s.len);
+}
+
+fn set_s2(p: *mut Parser, n: u32, s: []u8) !void {
+    let off = add_str(p, s)!;
+    let nd = p.f.node(n);
+    nd.s2 = off;
+    nd.s2l = @truncate(u32, s.len);
+}
+
+fn fail(p: *mut Parser, msg: []u8) error { p.info.offset = p.pos; p.info.message = msg; return error.InvalidMath; }
+
+fn skip_ws(p: *mut Parser) void {
+    while (p.pos < p.src.len) and
+          ((p.src[p.pos] == ' ') or (p.src[p.pos] == '\t') or (p.src[p.pos] == '\n') or (p.src[p.pos] == '\r')) {
+        p.pos += 1;
+    }
+}
+
+fn peek(p: *mut Parser) u8 {
+    skip_ws(p);
+    if p.pos < p.src.len {
+        return p.src[p.pos];
+    }
+    return 0;
+}
+
+// The command name at pos (after '\'), without consuming it.
+fn command_at(p: *Parser, at: usize) []u8 {
+    let s = p.src;
+    if ((at + 1) >= s.len) or (s[at] != '\\') {
+        return s[at..at];
+    }
+    let mut e = at + 1;
+    if is_letter(s[e]) {
+        while (e < s.len) and is_letter(s[e]) {
+            e += 1;
+        }
+        return s[at + 1..e];
+    }
+    return s[at + 1..at + 2];
+}
+
+fn take_command(p: *mut Parser) []u8 {
+    let name = command_at(p, p.pos);
+    p.pos += 1 + name.len;
+    return name;
+}
+
+fn append_child(p: *mut Parser, parent: u32, child: u32, last: *mut u32) void {
+    if last.* == NIL {
+        p.f.node(parent).first = child;
+    } else {
+        p.f.node(last.*).next = child;
+    }
+    last.* = child;
+}
+
+// A row of atoms, up to '}', '&', '\\', \right, \middle, \end or the end.
+fn row(p: *mut Parser) !u32 {
+    p.depth += 1;
+    defer p.depth -= 1;
+    if p.depth > MAX_DEPTH {
+        return fail(p, "nested too deeply");
+    }
+    let r = new_node(p, Kind.ROW)!;
+    let mut last: u32 = NIL;
+    loop {
+        let c = peek(p);
+        if (c == 0) or (c == '}') or (c == '&') {
+            break;
+        }
+        if c == '\\' {
+            let name = command_at(p, p.pos);
+            if strs.eq(name, "\\") or strs.eq(name, "right") or strs.eq(name, "middle") or strs.eq(name, "end") or
+               strs.eq(name, "cr") {
+                break;
+            }
+            if strs.eq(name, "over") or strs.eq(name, "choose") or strs.eq(name, "atop") {
+                // infix: everything before over everything after
+                _ = take_command(p);
+                let den = row(p)!;
+                let fr = new_node(p, Kind.FRAC)!;
+                p.f.node(fr).a = r;
+                p.f.node(fr).b = den;
+                let mut top = fr;
+                if not strs.eq(name, "over") {
+                    p.f.node(fr).flags = F_THIN0;
+                }
+                if strs.eq(name, "choose") {
+                    top = new_node(p, Kind.FENCE)!;
+                    p.f.node(top).a = fr;
+                    set_s(p, top, "(")!;
+                    set_s2(p, top, ")")!;
+                }
+                let r2 = new_node(p, Kind.ROW)!;
+                p.f.node(r2).first = top;
+                return r2;
+            }
+            if strs.eq(name, "color") {
+                _ = take_command(p);
+                let st = color_style(p)!;
+                p.f.node(st).a = row(p)!;
+                append_child(p, r, st, &mut last);
+                break;
+            }
+            if strs.eq(name, "displaystyle") or strs.eq(name, "textstyle") {
+                _ = take_command(p);
+                let rest = row(p)!;
+                let st = new_node(p, Kind.STYLE)!;
+                p.f.node(st).a = rest;
+                if strs.eq(name, "displaystyle") {
+                    p.f.node(st).flags = F_DISPLAY;
+                } else {
+                    p.f.node(st).flags = F_TEXTSTYLE;
+                }
+                append_child(p, r, st, &mut last);
+                break;
+            }
+        }
+        let a = atom(p)!;
+        if a != NIL {
+            append_child(p, r, a, &mut last);
+        }
+    }
+    return r;
+}
+
+// A STYLE node for {colour}: a CSS colour name or #hex.
+fn color_style(p: *mut Parser) !u32 {
+    let name = strs.trim(raw_group(p)!);
+    if (name.len == 0) or (name.len > 32) {
+        return fail(p, "bad colour");
+    }
+    for k in @as(usize, 0)..name.len {
+        let c = name[k];
+        if not (((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or
+                (c == '#')) {
+            return fail(p, "bad colour");
+        }
+    }
+    let st = new_node(p, Kind.STYLE)!;
+    set_s(p, st, name)!;
+    return st;
+}
+
+// A primary followed by its scripts.
+fn atom(p: *mut Parser) !u32 {
+    let base = primary(p)!;
+    if base == NIL {
+        return NIL;
+    }
+    let mut sub: u32 = NIL;
+    let mut sup: u32 = NIL;
+    let mut limits: u16 = 0;
+    loop {
+        let c = peek(p);
+        if c == '^' {
+            if sup != NIL {
+                return fail(p, "double superscript");
+            }
+            p.pos += 1;
+            sup = argument(p)!;
+        } else if c == '_' {
+            if sub != NIL {
+                return fail(p, "double subscript");
+            }
+            p.pos += 1;
+            sub = argument(p)!;
+        } else if c == '\'' {
+            if sup != NIL {
+                return fail(p, "double superscript");
+            }
+            let mut n: usize = 0;
+            while (p.pos < p.src.len) and (p.src[p.pos] == '\'') {
+                n += 1;
+                p.pos += 1;
+            }
+            sup = new_node(p, Kind.OP)!;
+            let primes: [4][]u8 = ["\u{2032}", "\u{2033}", "\u{2034}", "\u{2057}"];
+            set_s(p, sup, primes[@min(n, 4) - 1])!;
+            if peek(p) == '^' {
+                // f'^2: the prime and the power together
+                p.pos += 1;
+                let more = argument(p)!;
+                let r = new_node(p, Kind.ROW)!;
+                p.f.node(r).first = sup;
+                p.f.node(sup).next = more;
+                sup = r;
+            }
+        } else if (c == '\\') and
+                  (strs.eq(command_at(p, p.pos), "limits") or strs.eq(command_at(p, p.pos), "nolimits")) {
+            if strs.eq(take_command(p), "limits") {
+                limits = F_LIMITS;
+            } else {
+                limits = F_NOLIMITS;
+            }
+        } else {
+            break;
+        }
+    }
+    if (sub == NIL) and (sup == NIL) {
+        return base;
+    }
+    let bn = p.f.node(base);
+    let mut kind = Kind.SCRIPTS;
+    if (bn.kind == Kind.OP) or (bn.kind == Kind.IDENT) {
+        let large = (bn.cls == C_LARGE) or (bn.cls == C_FUNCL);
+        if ((large and (limits != F_NOLIMITS)) or (limits == F_LIMITS)) {
+            kind = Kind.LIMITS;
+        }
+    }
+    if (bn.kind == Kind.ACCENT) and ((bn.cls == 1) or (bn.cls == 2)) {
+        kind = Kind.LIMITS;  // \overbrace{..}^{label}
+    }
+    let s = new_node(p, kind)!;
+    let sn = p.f.node(s);
+    sn.a = base;
+    sn.b = sub;
+    sn.c = sup;
+    sn.flags = limits;
+    return s;
+}
+
+// A script or command argument: a group, or a single token.
+fn argument(p: *mut Parser) !u32 {
+    let c = peek(p);
+    if c == 0 {
+        return fail(p, "missing argument");
+    }
+    if c == '{' {
+        return group(p);
+    }
+    if (c >= '0') and (c <= '9') {
+        // one digit only: x^23 is x squared, then 3
+        let n = new_node(p, Kind.NUMBER)!;
+        set_s(p, n, p.src[p.pos..p.pos + 1])!;
+        p.pos += 1;
+        return n;
+    }
+    if (c == '}') or (c == '^') or (c == '_') or (c == '&') {
+        return fail(p, "missing argument");
+    }
+    let a = primary(p)!;
+    if a == NIL {
+        return fail(p, "missing argument");
+    }
+    return a;
+}
+
+fn group(p: *mut Parser) !u32 {
+    if peek(p) != '{' {
+        return fail(p, "expected {");
+    }
+    p.pos += 1;
+    let r = row(p)!;
+    if peek(p) != '}' {
+        return fail(p, "missing }");
+    }
+    p.pos += 1;
+    return r;
+}
+
+// The raw text of a {group} (for \text, \operatorname, environment names).
+fn raw_group(p: *mut Parser) ![]u8 {
+    if peek(p) != '{' {
+        return fail(p, "expected {");
+    }
+    p.pos += 1;
+    let start = p.pos;
+    let mut depth: u32 = 0;
+    while p.pos < p.src.len {
+        let c = p.src[p.pos];
+        if c == '\\' {
+            p.pos += 2;
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            if depth == 0 {
+                let t = p.src[start..p.pos];
+                p.pos += 1;
+                return t;
+            }
+            depth -= 1;
+        }
+        p.pos += 1;
+    }
+    p.pos = p.src.len;
+    return fail(p, "missing }");
+}
+
+fn op_node(p: *mut Parser, t: []u8, cls: u8) !u32 {
+    let n = new_node(p, Kind.OP)!;
+    set_s(p, n, t)!;
+    p.f.node(n).cls = cls;
+    return n;
+}
+
+fn ident(p: *mut Parser, t: []u8, upright: bool) !u32 {
+    let n = new_node(p, Kind.IDENT)!;
+    set_s(p, n, t)!;
+    if upright {
+        p.f.node(n).flags = F_NORMAL;
+    }
+    return n;
+}
+
+// A character in the current font.
+fn styled_ident(p: *mut Parser, c: u32) !u32 {
+    let mut buf: [4]u8 = [0; 4];
+    let s = strs.encode_rune(buf[..], styled(c, p.font));
+    return ident(p, s, p.font == Font.ROMAN);
+}
+
+fn primary(p: *mut Parser) !u32 {
+    let c = peek(p);
+    if c == 0 {
+        return NIL;
+    }
+    if c == '{' {
+        return group(p);
+    }
+    if c == '\\' {
+        return command(p);
+    }
+    if (c >= '0') and (c <= '9') {
+        let start = p.pos;
+        while (p.pos < p.src.len) and ((p.src[p.pos] >= '0') and (p.src[p.pos] <= '9')) {
+            p.pos += 1;
+        }
+        if ((p.pos + 1) < p.src.len) and (p.src[p.pos] == '.') and (p.src[p.pos + 1] >= '0') and
+           (p.src[p.pos + 1] <= '9') {
+            p.pos += 1;
+            while (p.pos < p.src.len) and ((p.src[p.pos] >= '0') and (p.src[p.pos] <= '9')) {
+                p.pos += 1;
+            }
+        }
+        if p.font != Font.NONE {
+            // styled digits, one identifier each... as numbers
+            let r = new_node(p, Kind.ROW)!;
+            let mut last: u32 = NIL;
+            for k in start..p.pos {
+                let mut buf: [4]u8 = [0; 4];
+                let n = new_node(p, Kind.NUMBER)!;
+                set_s(p, n, strs.encode_rune(buf[..], styled(@as(u32, p.src[k]), p.font)))!;
+                append_child(p, r, n, &mut last);
+            }
+            return r;
+        }
+        let n = new_node(p, Kind.NUMBER)!;
+        set_s(p, n, p.src[start..p.pos])!;
+        return n;
+    }
+    if is_letter(c) {
+        p.pos += 1;
+        return styled_ident(p, @as(u32, c));
+    }
+    if (c == '}') or (c == '^') or (c == '_') or (c == '&') {
+        return fail(p, "unexpected character");
+    }
+    // other characters: operators, or (non-ASCII) identifiers
+    let r = strs.decode_rune(p.src[p.pos..]);
+    let n = @as(usize, r.len);
+    let t = p.src[p.pos..p.pos + n];
+    p.pos += n;
+    if c == '~' {
+        let sp = new_node(p, Kind.SPACE)!;
+        p.f.node(sp).width = 0.333;
+        return sp;
+    }
+    let mut cls = C_ORD;
+    if (c == '+') or (c == '-') or (c == '*') {
+        cls = C_BIN;
+    } else if (c == '=') or (c == '<') or (c == '>') or (c == ':') {
+        cls = C_REL;
+    } else if (c == '(') or (c == '[') {
+        cls = C_OPEN;
+    } else if (c == ')') or (c == ']') {
+        cls = C_CLOSE;
+    } else if (c == ',') or (c == ';') {
+        cls = C_PUNCT;
+    } else if c >= 0x80 {
+        // a letter (Greek written directly) is an identifier
+        if r.value >= 0x370 {
+            return ident(p, t, false);
+        }
+    }
+    if c == '-' {
+        return op_node(p, "\u{2212}", cls);
+    }
+    if c == '*' {
+        return op_node(p, "\u{2217}", cls);
+    }
+    return op_node(p, t, cls);
+}
+
+fn command(p: *mut Parser) !u32 {
+    let at = p.pos;
+    let name = take_command(p);
+    if name.len == 0 {
+        return fail(p, "a lone backslash");
+    }
+    // spaces
+    let spaces: [8][]u8 = [",", ":", ">", ";", "!", "quad", "qquad", " "];
+    let widths: [8]f32 = [0.1667, 0.2222, 0.2222, 0.2778, -0.1667, 1.0, 2.0, 0.333];
+    for k in @as(usize, 0)..8 {
+        if strs.eq(name, spaces[k]) {
+            let sp = new_node(p, Kind.SPACE)!;
+            p.f.node(sp).width = widths[k];
+            return sp;
+        }
+    }
+    if strs.eq(name, "frac") or strs.eq(name, "dfrac") or strs.eq(name, "tfrac") or strs.eq(name, "cfrac") {
+        let num = argument(p)!;
+        let den = argument(p)!;
+        let f = new_node(p, Kind.FRAC)!;
+        let fnode = p.f.node(f);
+        fnode.a = num;
+        fnode.b = den;
+        if strs.eq(name, "dfrac") or strs.eq(name, "cfrac") {
+            fnode.flags = F_DISPLAY;
+        } else if strs.eq(name, "tfrac") {
+            fnode.flags = F_TEXTSTYLE;
+        }
+        return f;
+    }
+    if strs.eq(name, "binom") or strs.eq(name, "dbinom") or strs.eq(name, "tbinom") {
+        let top = argument(p)!;
+        let bottom = argument(p)!;
+        let f = new_node(p, Kind.FRAC)!;
+        let fnode = p.f.node(f);
+        fnode.a = top;
+        fnode.b = bottom;
+        fnode.flags = F_THIN0;
+        if strs.eq(name, "dbinom") {
+            fnode.flags |= F_DISPLAY;
+        } else if strs.eq(name, "tbinom") {
+            fnode.flags |= F_TEXTSTYLE;
+        }
+        let fe = new_node(p, Kind.FENCE)!;
+        p.f.node(fe).a = f;
+        set_s(p, fe, "(")!;
+        set_s2(p, fe, ")")!;
+        return fe;
+    }
+    if strs.eq(name, "sqrt") {
+        if peek(p) == '[' {
+            p.pos += 1;
+            let idx = new_node(p, Kind.ROW)!;
+            let mut last: u32 = NIL;
+            while peek(p) != ']' {
+                if peek(p) == 0 {
+                    return fail(p, "missing ]");
+                }
+                let a = atom(p)!;
+                if a == NIL {
+                    return fail(p, "missing ]");
+                }
+                append_child(p, idx, a, &mut last);
+            }
+            p.pos += 1;
+            let body = argument(p)!;
+            let rt = new_node(p, Kind.ROOT)!;
+            p.f.node(rt).a = body;
+            p.f.node(rt).b = idx;
+            return rt;
+        }
+        let body = argument(p)!;
+        let sq = new_node(p, Kind.SQRT)!;
+        p.f.node(sq).a = body;
+        return sq;
+    }
+    if strs.eq(name, "left") {
+        let open = delimiter(p)!;
+        let content = row(p)!;
+        let mut last_mid: u32 = NIL;
+        // \middle delimiters split the content
+        let mut parts = content;
+        while (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "middle") {
+            _ = take_command(p);
+            let mid = delimiter(p)!;
+            let m = op_node(p, mid, C_REL)!;
+            p.f.node(m).flags = F_STRETCHY;
+            let more = row(p)!;
+            let r = new_node(p, Kind.ROW)!;
+            let mut last: u32 = NIL;
+            append_child(p, r, parts, &mut last);
+            append_child(p, r, m, &mut last);
+            append_child(p, r, more, &mut last);
+            parts = r;
+            last_mid = m;
+        }
+        _ = last_mid;
+        if not ((peek(p) == '\\') and strs.eq(command_at(p, p.pos), "right")) {
+            return fail(p, "\\left without \\right");
+        }
+        _ = take_command(p);
+        let close = delimiter(p)!;
+        let fe = new_node(p, Kind.FENCE)!;
+        p.f.node(fe).a = parts;
+        p.f.node(fe).flags = F_STRETCHY;
+        set_s(p, fe, open)!;
+        set_s2(p, fe, close)!;
+        return fe;
+    }
+    let sizes: [16][]u8 = ["big", "Big", "bigg", "Bigg", "bigl", "Bigl", "biggl", "Biggl", "bigr", "Bigr", "biggr",
+                           "Biggr", "bigm", "Bigm", "biggm", "Biggm"];
+    let ems: [4]f32 = [1.2, 1.8, 2.4, 3.0];
+    for k in @as(usize, 0)..16 {
+        if strs.eq(name, sizes[k]) {
+            let d = delimiter(p)!;
+            let mut cls = C_ORD;
+            if (k >= 4) and (k < 8) {
+                cls = C_OPEN;
+            } else if (k >= 8) and (k < 12) {
+                cls = C_CLOSE;
+            } else if k >= 12 {
+                cls = C_REL;
+            }
+            let o = op_node(p, d, cls)!;
+            p.f.node(o).flags = F_SIZED;
+            p.f.node(o).width = ems[k % 4];
+            return o;
+        }
+    }
+    if strs.eq(name, "text") or strs.eq(name, "textrm") or strs.eq(name, "textit") or strs.eq(name, "textbf") or
+       strs.eq(name, "mbox") or strs.eq(name, "textnormal") or strs.eq(name, "textsf") or strs.eq(name, "texttt") {
+        let t = raw_group(p)!;
+        let n = new_node(p, Kind.TEXT)!;
+        // the few escapes text mode has
+        let mut b = strs.String.init();
+        defer b.deinit();
+        let mut i: usize = 0;
+        while i < t.len {
+            if (t[i] == '\\') and ((i + 1) < t.len) and not is_letter(t[i + 1]) {
+                b.push(t[i + 1])!;
+                i += 2;
+                continue;
+            }
+            if (t[i] == '{') or (t[i] == '}') {
+                i += 1;
+                continue;
+            }
+            b.push(t[i])!;
+            i += 1;
+        }
+        set_s(p, n, b.bytes())!;
+        return n;
+    }
+    if strs.eq(name, "textcolor") {
+        let st = color_style(p)!;
+        p.f.node(st).a = argument(p)!;
+        return st;
+    }
+    if strs.eq(name, "bmod") {
+        return op_node(p, "mod", C_BIN);
+    }
+    if strs.eq(name, "pmod") or strs.eq(name, "mod") {
+        // \pmod{n}: a quad and (mod n); \mod{n}: a quad, mod and n
+        let arg = argument(p)!;
+        let r = new_node(p, Kind.ROW)!;
+        let mut last: u32 = NIL;
+        let sp = new_node(p, Kind.SPACE)!;
+        p.f.node(sp).width = 1.0;
+        append_child(p, r, sp, &mut last);
+        let inner = new_node(p, Kind.ROW)!;
+        let mut il: u32 = NIL;
+        let m = ident(p, "mod", true)!;
+        p.f.node(m).flags = F_FUNC;
+        p.f.node(m).cls = C_FUNC;
+        append_child(p, inner, m, &mut il);
+        let sp2 = new_node(p, Kind.SPACE)!;
+        p.f.node(sp2).width = 0.333;
+        append_child(p, inner, sp2, &mut il);
+        append_child(p, inner, arg, &mut il);
+        if strs.eq(name, "mod") {
+            append_child(p, r, inner, &mut last);
+            return r;
+        }
+        let fe = new_node(p, Kind.FENCE)!;
+        p.f.node(fe).a = inner;
+        set_s(p, fe, "(")!;
+        set_s2(p, fe, ")")!;
+        append_child(p, r, fe, &mut last);
+        return r;
+    }
+    if strs.eq(name, "operatorname") or strs.eq(name, "operatorname*") {
+        let mut star = false;
+        if peek(p) == '*' {
+            p.pos += 1;
+            star = true;
+        }
+        let t = raw_group(p)!;
+        let n = ident(p, strs.trim(t), true)!;
+        p.f.node(n).flags = F_FUNC;
+        if star {
+            p.f.node(n).cls = C_FUNCL;
+        } else {
+            p.f.node(n).cls = C_FUNC;
+        }
+        return n;
+    }
+    let fonts: [17][]u8 = ["mathbf", "mathit", "boldsymbol", "mathcal", "mathscr", "mathfrak", "mathbb", "mathsf",
+                           "mathtt", "mathrm", "bm", "mathbfit", "mathsfit", "bf", "rm", "it", "Bbb"];
+    let font_of: [17]Font = [Font.BOLD, Font.ITALIC, Font.BOLD_ITALIC, Font.SCRIPT, Font.SCRIPT, Font.FRAKTUR,
+                             Font.DOUBLE_STRUCK, Font.SANS, Font.MONO, Font.ROMAN, Font.BOLD_ITALIC, Font.BOLD_ITALIC,
+                             Font.SANS_ITALIC, Font.BOLD, Font.ROMAN, Font.ITALIC, Font.DOUBLE_STRUCK];
+    for k in @as(usize, 0)..17 {
+        if strs.eq(name, fonts[k]) {
+            let saved = p.font;
+            p.font = font_of[k];
+            defer p.font = saved;
+            if k >= 13 {
+                // \bf and the like: the rest of the group
+                return row(p);
+            }
+            if p.font == Font.ROMAN {
+                // \mathrm{abc}: one upright identifier
+                let save = p.pos;
+                let t = raw_group(p)!;
+                let mut letters = t.len > 1;
+                for ch in t {
+                    if not is_letter(ch) {
+                        letters = false;
+                    }
+                }
+                if letters {
+                    return ident(p, t, true);
+                }
+                p.pos = save;
+            }
+            return argument(p);
+        }
+    }
+    if strs.eq(name, "overset") or strs.eq(name, "underset") or strs.eq(name, "stackrel") {
+        let top = argument(p)!;
+        let base = argument(p)!;
+        let l = new_node(p, Kind.LIMITS)!;
+        let ln = p.f.node(l);
+        ln.a = base;
+        if strs.eq(name, "underset") {
+            ln.b = top;
+        } else {
+            ln.c = top;
+        }
+        return l;
+    }
+    if strs.eq(name, "not") {
+        let next = primary(p)!;
+        if next == NIL {
+            return fail(p, "\\not of nothing");
+        }
+        let nd = p.f.node(next);
+        if (nd.kind == Kind.OP) or (nd.kind == Kind.IDENT) {
+            // the character with U+0338 (a precomposed one where there is)
+            let t = p.f.str(nd.s, nd.sl);
+            let pre: [6][]u8 = ["=", "\u{2208}", "\u{2264}", "\u{2265}", "\u{2282}", "\u{2261}"];
+            let neg: [6][]u8 = ["\u{2260}", "\u{2209}", "\u{2270}", "\u{2271}", "\u{2284}", "\u{2262}"];
+            for k in @as(usize, 0)..6 {
+                if strs.eq(t, pre[k]) {
+                    return op_node(p, neg[k], C_REL);
+                }
+            }
+            let mut b = strs.String.init();
+            defer b.deinit();
+            b.push_str(t)!;
+            b.push_str("\u{338}")!;
+            return op_node(p, b.bytes(), C_REL);
+        }
+        return next;
+    }
+    if strs.eq(name, "begin") {
+        return environment(p);
+    }
+    if strs.eq(name, "mathop") {
+        let a = argument(p)!;
+        let an = p.f.node(a);
+        if (an.kind == Kind.IDENT) or (an.kind == Kind.OP) {
+            an.cls = C_LARGE;
+        }
+        return a;
+    }
+    if strs.eq(name, "boxed") or strs.eq(name, "phantom") or strs.eq(name, "mathstrut") {
+        if strs.eq(name, "mathstrut") {
+            return NIL;
+        }
+        let a = argument(p)!;
+        if strs.eq(name, "phantom") {
+            let sp = new_node(p, Kind.SPACE)!;
+            p.f.node(sp).width = 1.0;
+            return sp;
+        }
+        return a;
+    }
+    let k = find_symbol(name);
+    if k == SYMBOLS.len {
+        p.pos = at;
+        return fail(p, "unknown command");
+    }
+    let sym = SYMBOLS[k];
+    if sym.cls == C_ACCENT {
+        let base = argument(p)!;
+        let acc = new_node(p, Kind.ACCENT)!;
+        let parts = accent_parts(sym.text);
+        set_s(p, acc, parts[0])!;
+        set_s2(p, acc, parts[1])!;
+        let an = p.f.node(acc);
+        an.a = base;
+        if strs.eq(name, "underline") or strs.eq(name, "underbrace") {
+            an.flags = F_UNDER;
+        }
+        if strs.eq(name, "widehat") or strs.eq(name, "widetilde") or strs.eq(name, "overline") or
+           strs.eq(name, "underline") or strs.eq(name, "overrightarrow") or strs.eq(name, "overleftarrow") or
+           strs.eq(name, "overbrace") or strs.eq(name, "underbrace") {
+            an.flags |= F_STRETCHY;
+        }
+        if strs.eq(name, "overbrace") {
+            an.cls = 1;
+        } else if strs.eq(name, "underbrace") {
+            an.cls = 2;
+        }
+        return acc;
+    }
+    if (sym.cls == C_GREEK) or (sym.cls == C_UGREEK) {
+        if p.font != Font.NONE {
+            let d = strs.decode_rune(sym.text);
+            if d.len == sym.text.len {
+                return styled_ident(p, d.value);
+            }
+            return ident(p, sym.text, p.font == Font.ROMAN);
+        }
+        return ident(p, sym.text, sym.cls == C_UGREEK);
+    }
+    if (sym.cls == C_FUNC) or (sym.cls == C_FUNCL) {
+        let n = ident(p, sym.text, true)!;
+        p.f.node(n).flags = F_FUNC;
+        p.f.node(n).cls = sym.cls;
+        return n;
+    }
+    return op_node(p, sym.text, sym.cls);
+}
+
+// A delimiter after \left, \right, \middle or \big: its text ("" for '.').
+fn delimiter(p: *mut Parser) ![]u8 {
+    let c = peek(p);
+    if c == 0 {
+        return fail(p, "missing delimiter");
+    }
+    if c == '.' {
+        p.pos += 1;
+        return "";
+    }
+    if c == '\\' {
+        let name = take_command(p);
+        let k = find_symbol(name);
+        if (k == SYMBOLS.len) or
+           not ((SYMBOLS[k].cls == C_OPEN) or (SYMBOLS[k].cls == C_CLOSE) or (SYMBOLS[k].cls == C_ORD) or
+                (SYMBOLS[k].cls == C_REL)) {
+            return fail(p, "not a delimiter");
+        }
+        return SYMBOLS[k].text;
+    }
+    let delims = "()[]|/<>";
+    for d in delims {
+        if c == d {
+            p.pos += 1;
+            if c == '<' {
+                return "\u{27e8}";
+            }
+            if c == '>' {
+                return "\u{27e9}";
+            }
+            return p.src[p.pos - 1..p.pos];
+        }
+    }
+    return fail(p, "not a delimiter");
+}
+
+fn environment(p: *mut Parser) !u32 {
+    let name = raw_group(p)!;
+    let mut open: []u8 = "";
+    let mut close: []u8 = "";
+    let mut flags: u16 = 0;
+    if strs.eq(name, "matrix") or strs.eq(name, "array") or strs.eq(name, "gathered") or strs.eq(name, "gather*") or
+       strs.eq(name, "gather") {
+        if strs.eq(name, "array") {
+            _ = raw_group(p)!;  // the column specification
+        }
+    } else if strs.eq(name, "smallmatrix") {
+        flags = F_SMALL;
+    } else if strs.eq(name, "pmatrix") {
+        open = "(";
+        close = ")";
+    } else if strs.eq(name, "bmatrix") {
+        open = "[";
+        close = "]";
+    } else if strs.eq(name, "Bmatrix") {
+        open = "{";
+        close = "}";
+    } else if strs.eq(name, "vmatrix") {
+        open = "|";
+        close = "|";
+    } else if strs.eq(name, "Vmatrix") {
+        open = "\u{2016}";
+        close = "\u{2016}";
+    } else if strs.eq(name, "cases") {
+        open = "{";
+        flags = F_LEFT;
+    } else if strs.eq(name, "aligned") or strs.eq(name, "align") or strs.eq(name, "align*") or strs.eq(name, "split") or
+              strs.eq(name, "alignedat") {
+        flags = F_ALIGN;
+        if strs.eq(name, "alignedat") {
+            _ = raw_group(p)!;
+        }
+    } else {
+        return fail(p, "unknown environment");
+    }
+    let table = new_node(p, Kind.TABLE)!;
+    p.f.node(table).flags = flags;
+    let mut last_row: u32 = NIL;
+    loop {
+        let tr = new_node(p, Kind.TROW)!;
+        let mut last_cell: u32 = NIL;
+        loop {
+            // \hline between rows is dropped
+            while (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "hline") {
+                _ = take_command(p);
+            }
+            let content = row(p)!;
+            let cell = new_node(p, Kind.TCELL)!;
+            p.f.node(cell).a = content;
+            append_child(p, tr, cell, &mut last_cell);
+            if peek(p) == '&' {
+                p.pos += 1;
+                continue;
+            }
+            break;
+        }
+        append_child(p, table, tr, &mut last_row);
+        let c = peek(p);
+        if c == 0 {
+            return fail(p, "missing \\end");
+        }
+        if c == '}' {
+            return fail(p, "unexpected }");
+        }
+        let cmd = take_command(p);
+        if strs.eq(cmd, "\\") or strs.eq(cmd, "cr") {
+            // an optional [length] after \\
+            if peek(p) == '[' {
+                while (p.pos < p.src.len) and (p.src[p.pos] != ']') {
+                    p.pos += 1;
+                }
+                p.pos = @min(p.pos + 1, p.src.len);
+            }
+            // a trailing \\ before \end makes no row
+            if (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "end") {
+                _ = take_command(p);
+                break;
+            }
+            continue;
+        }
+        if strs.eq(cmd, "end") {
+            break;
+        }
+        return fail(p, "unexpected command in a table");
+    }
+    let end_name = raw_group(p)!;
+    if not strs.eq(end_name, name) {
+        return fail(p, "\\end does not match \\begin");
+    }
+    if (open.len == 0) and (close.len == 0) {
+        return table;
+    }
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node(fe).a = table;
+    p.f.node(fe).flags = F_STRETCHY;
+    set_s(p, fe, open)!;
+    set_s2(p, fe, close)!;
+    return fe;
+}
+
+/// Parses TeX math (InvalidMath for bad input).
+pub fn parse(tex: []u8) !Formula {
+    let mut info = ErrorInfo.{ offset: 0, message: "" };
+    return parse_with(tex, &mut info);
+}
+
+/// parse, with where and why it failed in info.
+pub fn parse_with(tex: []u8, info: *mut ErrorInfo) !Formula {
+    let mut f = Formula.{ nodes: vec.Vec.[Node].init(), strs: strs.String.init(), source: strs.String.init(),
+                          root: NIL };
+    f.source.push_str(tex) catch |e| {
+        f.deinit();
+        return e;
+    };
+    let mut p = Parser.{ src: tex, pos: 0, f: &mut f, depth: 0, info: info, font: Font.NONE };
+    let r = row(&mut p) catch |e| {
+        f.deinit();
+        return e;
+    };
+    if p.pos < tex.len {
+        let msg: []u8 = "unexpected }";
+        if tex[p.pos] == '&' {
+            info.message = "& outside a table";
+        } else if tex[p.pos] == '\\' {
+            info.message = "unexpected command";
+        } else {
+            info.message = msg;
+        }
+        info.offset = p.pos;
+        f.deinit();
+        return error.InvalidMath;
+    }
+    f.root = r;
+    return f;
+}
+
+// -----------------------------------------------------------------------------
+// Output
+// -----------------------------------------------------------------------------
+
+// A small buffer in front of the writer.
+struct Out {
+    w: io.Writer,
+    buf: [512]u8,
+    n: usize,
+
+    fn init(w: io.Writer) Out {
+        return Out.{ w: w, buf: [0; 512], n: 0 };
+    }
+
+    fn s(self: *mut Out, t: []u8) !void {
+        if (self.n + t.len) > self.buf.len {
+            self.flush()!;
+            if t.len > self.buf.len {
+                self.w.write_all(t)!;
+                return;
+            }
+        }
+        @mem_copy(self.buf[self.n..self.n + t.len], t);
+        self.n += t.len;
+    }
+
+    fn esc(self: *mut Out, t: []u8) !void {
+        let mut from: usize = 0;
+        for i in @as(usize, 0)..t.len {
+            let c = t[i];
+            let mut rep: []u8 = "";
+            if c == '&' {
+                rep = "&amp;";
+            } else if c == '<' {
+                rep = "&lt;";
+            } else if c == '>' {
+                rep = "&gt;";
+            } else if c == '"' {
+                rep = "&quot;";
+            }
+            if rep.len > 0 {
+                self.s(t[from..i])!;
+                self.s(rep)!;
+                from = i + 1;
+            }
+        }
+        self.s(t[from..])!;
+    }
+
+    fn flush(self: *mut Out) !void {
+        if self.n > 0 {
+            self.w.write_all(self.buf[..self.n])!;
+            self.n = 0;
+        }
+    }
+}
+
+// A length in em, to at most 4 decimals ("0.1667em").
+fn em(o: *mut Out, v: f32) !void {
+    let mut b: [48]u8 = [0; 48];
+    let t = fmt.bufprint(b[..], "{:.4}", [fmt.float(@float_cast(f64, v))]) catch "0";
+    let mut n = t.len;
+    if strs.contains(t, ".") {
+        while (n > 0) and (t[n - 1] == 0x30) {
+            n -= 1;
+        }
+        if (n > 0) and (t[n - 1] == 0x2e) {
+            n -= 1;
+        }
+    }
+    o.s(t[..n])!;
+    o.s("em")!;
+}
+
+fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
+    if i == NIL {
+        o.s("<mrow></mrow>")!;
+        return;
+    }
+    let n = f.node(i);
+    let t = f.str(n.s, n.sl);
+    match n.kind {
+        .ROW => {
+            // a row of one child needs no mrow
+            if (n.first != NIL) and (f.node(n.first).next == NIL) {
+                mathml(f, o, n.first)!;
+                return;
+            }
+            o.s("<mrow>")!;
+            let mut c = n.first;
+            while c != NIL {
+                mathml(f, o, c)!;
+                c = f.node(c).next;
+            }
+            o.s("</mrow>")!;
+        }
+        .IDENT => {
+            if ((n.flags & F_NORMAL) != 0) and (strs.rune_count(t) == 1) {
+                o.s("<mi mathvariant=\"normal\">")!;
+            } else {
+                o.s("<mi>")!;
+            }
+            o.esc(t)!;
+            o.s("</mi>")!;
+            if (n.flags & F_FUNC) != 0 {
+                o.s("<mo>\u{2061}</mo>")!;
+            }
+        }
+        .NUMBER => {
+            o.s("<mn>")!;
+            o.esc(t)!;
+            o.s("</mn>")!;
+        }
+        .OP => {
+            if (n.flags & F_SIZED) != 0 {
+                o.s("<mo minsize=\"")!;
+                em(o, n.width)!;
+                o.s("\" maxsize=\"")!;
+                em(o, n.width)!;
+                o.s("\">")!;
+            } else if (n.flags & F_STRETCHY) != 0 {
+                o.s("<mo stretchy=\"true\">")!;
+            } else if (n.cls == C_OPEN) or (n.cls == C_CLOSE) {
+                o.s("<mo stretchy=\"false\">")!;
+            } else if (n.cls == C_ORD) and not strs.eq(t, "|") and not strs.eq(t, "/") {
+                o.s("<mo form=\"prefix\" lspace=\"0\" rspace=\"0\">")!;
+            } else {
+                o.s("<mo>")!;
+            }
+            o.esc(t)!;
+            o.s("</mo>")!;
+        }
+        .TEXT => {
+            o.s("<mtext>")!;
+            o.esc(t)!;
+            o.s("</mtext>")!;
+        }
+        .SPACE => {
+            o.s("<mspace width=\"")!;
+            em(o, n.width)!;
+            o.s("\"></mspace>")!;
+        }
+        .FRAC => {
+            if (n.flags & F_DISPLAY) != 0 {
+                o.s("<mstyle displaystyle=\"true\" scriptlevel=\"0\">")!;
+            } else if (n.flags & F_TEXTSTYLE) != 0 {
+                o.s("<mstyle displaystyle=\"false\">")!;
+            }
+            if (n.flags & F_THIN0) != 0 {
+                o.s("<mfrac linethickness=\"0\">")!;
+            } else {
+                o.s("<mfrac>")!;
+            }
+            mathml(f, o, n.a)!;
+            mathml(f, o, n.b)!;
+            o.s("</mfrac>")!;
+            if (n.flags & (F_DISPLAY | F_TEXTSTYLE)) != 0 {
+                o.s("</mstyle>")!;
+            }
+        }
+        .SQRT => {
+            o.s("<msqrt>")!;
+            mathml(f, o, n.a)!;
+            o.s("</msqrt>")!;
+        }
+        .ROOT => {
+            o.s("<mroot>")!;
+            mathml(f, o, n.a)!;
+            mathml(f, o, n.b)!;
+            o.s("</mroot>")!;
+        }
+        .SCRIPTS => {
+            if (n.b != NIL) and (n.c != NIL) {
+                o.s("<msubsup>")!;
+            } else if n.b != NIL {
+                o.s("<msub>")!;
+            } else {
+                o.s("<msup>")!;
+            }
+            mathml(f, o, n.a)!;
+            if n.b != NIL {
+                mathml(f, o, n.b)!;
+            }
+            if n.c != NIL {
+                mathml(f, o, n.c)!;
+            }
+            if (n.b != NIL) and (n.c != NIL) {
+                o.s("</msubsup>")!;
+            } else if n.b != NIL {
+                o.s("</msub>")!;
+            } else {
+                o.s("</msup>")!;
+            }
+        }
+        .LIMITS => {
+            let base = f.node(n.a);
+            // big operators move their limits to the side in inline style
+            // (movablelimits); \limits keeps them above and below
+            let mut tag: []u8 = "munderover";
+            if n.b == NIL {
+                tag = "mover";
+            } else if n.c == NIL {
+                tag = "munder";
+            }
+            o.s("<")!;
+            o.s(tag)!;
+            o.s(">")!;
+            if ((n.flags & F_LIMITS) != 0) and (base.kind == Kind.OP) {
+                o.s("<mo movablelimits=\"false\">")!;
+                o.esc(f.str(base.s, base.sl))!;
+                o.s("</mo>")!;
+            } else if base.kind == Kind.IDENT and ((base.flags & F_FUNC) != 0) {
+                // lim: an identifier whose limits may move
+                o.s("<mo movablelimits=\"true\" form=\"prefix\">")!;
+                o.esc(f.str(base.s, base.sl))!;
+                o.s("</mo>")!;
+            } else {
+                mathml(f, o, n.a)!;
+            }
+            if n.b != NIL {
+                mathml(f, o, n.b)!;
+            }
+            if n.c != NIL {
+                mathml(f, o, n.c)!;
+            }
+            o.s("</")!;
+            o.s(tag)!;
+            o.s(">")!;
+        }
+        .ACCENT => {
+            let under = (n.flags & F_UNDER) != 0;
+            if under {
+                o.s("<munder accentunder=\"true\">")!;
+            } else {
+                o.s("<mover accent=\"true\">")!;
+            }
+            mathml(f, o, n.a)!;
+            if (n.flags & F_STRETCHY) != 0 {
+                o.s("<mo stretchy=\"true\">")!;
+            } else {
+                o.s("<mo stretchy=\"false\">")!;
+            }
+            o.esc(t)!;
+            o.s("</mo>")!;
+            if under {
+                o.s("</munder>")!;
+            } else {
+                o.s("</mover>")!;
+            }
+        }
+        .FENCE => {
+            let t2 = f.str(n.s2, n.s2l);
+            let mut st: []u8 = "<mo fence=\"true\" stretchy=\"false\">";
+            if (n.flags & F_STRETCHY) != 0 {
+                st = "<mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">";
+            }
+            o.s("<mrow>")!;
+            if t.len > 0 {
+                o.s(st)!;
+                o.esc(t)!;
+                o.s("</mo>")!;
+            }
+            mathml(f, o, n.a)!;
+            if t2.len > 0 {
+                o.s(st)!;
+                o.esc(t2)!;
+                o.s("</mo>")!;
+            }
+            o.s("</mrow>")!;
+        }
+        .TABLE => {
+            if (n.flags & F_SMALL) != 0 {
+                o.s("<mstyle scriptlevel=\"1\">")!;
+            }
+            o.s("<mtable>")!;
+            let mut r = n.first;
+            while r != NIL {
+                o.s("<mtr>")!;
+                let mut c = f.node(r).first;
+                let mut col: usize = 0;
+                while c != NIL {
+                    if (n.flags & F_LEFT) != 0 {
+                        o.s("<mtd style=\"text-align:left\">")!;
+                    } else if (n.flags & F_ALIGN) != 0 {
+                        if (col % 2) == 0 {
+                            o.s("<mtd style=\"text-align:right;padding-right:0\">")!;
+                        } else {
+                            o.s("<mtd style=\"text-align:left;padding-left:0\">")!;
+                        }
+                    } else {
+                        o.s("<mtd>")!;
+                    }
+                    mathml(f, o, f.node(c).a)!;
+                    o.s("</mtd>")!;
+                    c = f.node(c).next;
+                    col += 1;
+                }
+                o.s("</mtr>")!;
+                r = f.node(r).next;
+            }
+            o.s("</mtable>")!;
+            if (n.flags & F_SMALL) != 0 {
+                o.s("</mstyle>")!;
+            }
+        }
+        .TROW => {}
+        .TCELL => {}
+        .STYLE => {
+            if n.sl != 0 {
+                o.s("<mstyle style=\"color:")!;
+                o.esc(t)!;
+                o.s("\">")!;
+            } else if (n.flags & F_DISPLAY) != 0 {
+                o.s("<mstyle displaystyle=\"true\" scriptlevel=\"0\">")!;
+            } else {
+                o.s("<mstyle displaystyle=\"false\">")!;
+            }
+            mathml(f, o, n.a)!;
+            o.s("</mstyle>")!;
+        }
+    }
+}
+
+// --- Text --------------------------------------------------------------------
+
+let SUP_FROM: []u8 = "0123456789+-=()niabcdefghjklmoprstuvwxyzABDEGHIJKLMNOPRTUVW";
+let SUP_TO: [61][]u8 = ["\u{2070}", "\u{b9}", "\u{b2}", "\u{b3}", "\u{2074}", "\u{2075}", "\u{2076}", "\u{2077}",
+                        "\u{2078}", "\u{2079}", "\u{207a}", "\u{207b}", "\u{207c}", "\u{207d}", "\u{207e}", "\u{207f}",
+                        "\u{2071}", "\u{1d43}", "\u{1d47}", "\u{1d9c}", "\u{1d48}", "\u{1d49}", "\u{1da0}", "\u{1d4d}",
+                        "\u{2b0}", "\u{2b2}", "\u{1d4f}", "\u{2e1}", "\u{1d50}", "\u{1d52}", "\u{1d56}", "\u{2b3}",
+                        "\u{2e2}", "\u{1d57}", "\u{1d58}", "\u{1d5b}", "\u{2b7}", "\u{2e3}", "\u{2b8}", "\u{1dbb}",
+                        "\u{1d2c}", "\u{1d2e}", "\u{1d30}", "\u{1d31}", "\u{1d33}", "\u{1d34}", "\u{1d35}", "\u{1d36}",
+                        "\u{1d37}", "\u{1d38}", "\u{1d39}", "\u{1d3a}", "\u{1d3c}", "\u{1d3e}", "\u{1d3f}", "\u{1d40}",
+                        "\u{1d41}", "\u{2c7d}", "\u{1d42}", "", ""];
+let SUB_FROM: []u8 = "0123456789+-=()aehijklmnoprstuvx";
+let SUB_TO: [32][]u8 = ["\u{2080}", "\u{2081}", "\u{2082}", "\u{2083}", "\u{2084}", "\u{2085}", "\u{2086}", "\u{2087}",
+                        "\u{2088}", "\u{2089}", "\u{208a}", "\u{208b}", "\u{208c}", "\u{208d}", "\u{208e}", "\u{2090}",
+                        "\u{2091}", "\u{2095}", "\u{1d62}", "\u{2c7c}", "\u{2096}", "\u{2097}", "\u{2098}", "\u{2099}",
+                        "\u{2092}", "\u{209a}", "\u{1d63}", "\u{209b}", "\u{209c}", "\u{1d64}", "\u{1d65}", "\u{2093}"];
+
+// t in super- or subscript characters, if every character has one.
+fn script_chars(t: []u8, sup: bool, out: *mut strs.String) !bool {
+    let mut from = SUB_FROM;
+    if sup {
+        from = SUP_FROM;
+    }
+    let mut it = strs.runes(t);
+    let start = out.len;
+    loop {
+        let r = it.next() catch break;
+        let mut c = r;
+        if c == 0x2212 {
+            c = '-';
+        }
+        if c == ' ' {
+            continue;
+        }
+        let mut found = false;
+        if c < 0x80 {
+            for k in @as(usize, 0)..from.len {
+                if from[k] == @truncate(u8, c) {
+                    if sup {
+                        out.push_str(SUP_TO[k])!;
+                    } else {
+                        out.push_str(SUB_TO[k])!;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        } else if sup and ((c == 0x2032) or (c == 0x2033) or (c == 0x2034)) {
+            // primes are already raised
+            let mut b: [4]u8 = [0; 4];
+            out.push_str(strs.encode_rune(b[..], c))!;
+            found = true;
+        }
+        if not found {
+            out.truncate(start);
+            return false;
+        }
+    }
+    return out.len > start;
+}
+
+// Whether node i reads as one unit in linear text (no parentheses needed).
+fn simple(f: *Formula, i: u32) bool {
+    if i == NIL {
+        return true;
+    }
+    let n = f.node(i);
+    match n.kind {
+        .ROW => {
+            if n.first == NIL {
+                return true;
+            }
+            if f.node(n.first).next == NIL {
+                return simple(f, n.first);
+            }
+            return false;
+        }
+        .IDENT   => { return ((n.flags & F_FUNC) != 0) or (strs.rune_count(f.str(n.s, n.sl)) == 1); }
+        .NUMBER  => { return true; }
+        .SQRT    => { return true; }
+        .ROOT    => { return true; }
+        .FENCE   => { return true; }
+        .SCRIPTS => { return true; }
+        .OP      => { return n.cls != C_BIN; }
+        .ACCENT  => { return simple(f, n.a); }
+        else     => { return false; }
+    }
+}
+
+fn text_to_string(f: *Formula, i: u32) !strs.String {
+    let mut s = strs.String.init();
+    let mut o = Out.init(s.writer());
+    text(f, &mut o, i) catch |e| {
+        s.deinit();
+        return e;
+    };
+    o.flush() catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s;
+}
+
+fn text_group(f: *Formula, o: *mut Out, i: u32) !void {
+    if simple(f, i) {
+        text(f, o, i)!;
+        return;
+    }
+    o.s("(")!;
+    text(f, o, i)!;
+    o.s(")")!;
+}
+
+fn text_script(f: *Formula, o: *mut Out, i: u32, sup: bool) !void {
+    let mut inner = text_to_string(f, i)!;
+    defer inner.deinit();
+    let mut conv = strs.String.init();
+    defer conv.deinit();
+    if script_chars(inner.bytes(), sup, &mut conv)! {
+        o.s(conv.bytes())!;
+        return;
+    }
+    if sup {
+        o.s("^")!;
+    } else {
+        o.s("_")!;
+    }
+    if strs.rune_count(inner.bytes()) == 1 {
+        o.s(inner.bytes())!;
+    } else {
+        o.s("(")!;
+        o.s(inner.bytes())!;
+        o.s(")")!;
+    }
+}
+
+// Node i with single-child rows unwrapped.
+fn unwrap(f: *Formula, i: u32) u32 {
+    let mut j = i;
+    while (j != NIL) and (f.node(j).kind == Kind.ROW) and (f.node(j).first != NIL) and
+          (f.node(f.node(j).first).next == NIL) {
+        j = f.node(j).first;
+    }
+    return j;
+}
+
+// How node i spaces in linear text: an operator's class, or that of a
+// scripted relation or binary operator, else C_ORD.
+fn text_class(f: *Formula, i: u32) u8 {
+    let n = f.node(i);
+    if n.kind == Kind.OP {
+        return n.cls;
+    }
+    if (n.kind == Kind.SCRIPTS) or (n.kind == Kind.LIMITS) {
+        let b = unwrap(f, n.a);
+        if (b != NIL) and (f.node(b).kind == Kind.OP) and
+           ((f.node(b).cls == C_REL) or (f.node(b).cls == C_BIN) or (f.node(b).cls == C_LARGE) or
+            (f.node(b).cls == C_INT)) {
+            return f.node(b).cls;
+        }
+    }
+    if (n.kind == Kind.FENCE) or (n.kind == Kind.ROW) {
+        return C_CLOSE;
+    }
+    return C_ORD;
+}
+
+// Whether node i is a function name (sin, lim), maybe with scripts, or a
+// big operator with scripts: text after it is spaced off.
+fn is_func(f: *Formula, i: u32) bool {
+    let n = f.node(i);
+    if (n.kind == Kind.IDENT) and ((n.flags & F_FUNC) != 0) {
+        return true;
+    }
+    if (n.kind == Kind.SCRIPTS) or (n.kind == Kind.LIMITS) {
+        let b = unwrap(f, n.a);
+        if b == NIL {
+            return false;
+        }
+        let bn = f.node(b);
+        return ((bn.kind == Kind.IDENT) and ((bn.flags & F_FUNC) != 0)) or
+               ((bn.kind == Kind.OP) and ((bn.cls == C_LARGE) or (bn.cls == C_INT)));
+    }
+    return false;
+}
+
+fn text_scripts(f: *Formula, o: *mut Out, n: *Node) !void {
+    text_group(f, o, n.a)!;
+    if n.b != NIL {
+        text_script(f, o, n.b, false)!;
+    }
+    if n.c != NIL {
+        text_script(f, o, n.c, true)!;
+    }
+}
+
+fn text(f: *Formula, o: *mut Out, i: u32) !void {
+    if i == NIL {
+        return;
+    }
+    let n = f.node(i);
+    let t = f.str(n.s, n.sl);
+    match n.kind {
+        .ROW => {
+            if (n.first != NIL) and (f.node(n.first).next == NIL) {
+                text(f, o, n.first)!;
+                return;
+            }
+            let mut prev_cls: u8 = 255;  // nothing yet: a + or - is a sign
+            let mut c = n.first;
+            while c != NIL {
+                let cn = f.node(c);
+                let cls = text_class(f, c);
+                let unary = (prev_cls == 255) or (prev_cls == C_BIN) or (prev_cls == C_REL) or (prev_cls == C_OPEN) or
+                            (prev_cls == C_PUNCT) or (prev_cls == C_LARGE);
+                let func = is_func(f, c);
+                if (cls == C_REL) or ((cls == C_BIN) and not unary) {
+                    o.s(" ")!;
+                    text(f, o, c)!;
+                    o.s(" ")!;
+                } else if cls == C_PUNCT {
+                    text(f, o, c)!;
+                    o.s(" ")!;
+                } else {
+                    // a space between a name and a function name: "n log n"
+                    if func and ((prev_cls == C_ORD) or (prev_cls == C_CLOSE)) {
+                        o.s(" ")!;
+                    }
+                    text(f, o, c)!;
+                }
+                prev_cls = cls;
+                // a space after a function name, unless brackets follow
+                let nx = cn.next;
+                if func and (nx != NIL) and
+                   not ((f.node(nx).kind == Kind.FENCE) or (f.node(nx).kind == Kind.SPACE) or
+                        ((f.node(nx).kind == Kind.OP) and
+                         ((f.node(nx).cls == C_OPEN) or (f.node(nx).cls == C_REL) or (f.node(nx).cls == C_BIN) or
+                          (f.node(nx).cls == C_PUNCT)))) {
+                    o.s(" ")!;
+                    prev_cls = C_OPEN;
+                }
+                c = cn.next;
+            }
+        }
+        .IDENT  => { o.s(t)!; }
+        .NUMBER => { o.s(t)!; }
+        .TEXT   => { o.s(t)!; }
+        .OP => {
+            o.s(t)!;
+            if ((n.cls == C_LARGE) or (n.cls == C_INT)) and (n.next != NIL) and (f.node(n.next).kind != Kind.SPACE) {
+                o.s(" ")!;
+            }
+        }
+        .SPACE => {
+            if n.width >= 0.16 {
+                o.s(" ")!;
+            }
+        }
+        .FRAC => {
+            if (n.flags & F_THIN0) != 0 {
+                // a binomial coefficient: C(n, k) reads oddly; "n choose k"
+                text_group(f, o, n.a)!;
+                o.s(" choose ")!;
+                text_group(f, o, n.b)!;
+                return;
+            }
+            text_group(f, o, n.a)!;
+            o.s("/")!;
+            text_group(f, o, n.b)!;
+        }
+        .SQRT => {
+            o.s("\u{221a}")!;
+            text_group(f, o, n.a)!;
+        }
+        .ROOT => {
+            let mut idx = text_to_string(f, n.b)!;
+            defer idx.deinit();
+            if strs.eq(idx.bytes(), "3") {
+                o.s("\u{221b}")!;
+            } else if strs.eq(idx.bytes(), "4") {
+                o.s("\u{221c}")!;
+            } else {
+                text_script(f, o, n.b, true)!;
+                o.s("\u{221a}")!;
+            }
+            text_group(f, o, n.a)!;
+        }
+        .SCRIPTS => { text_scripts(f, o, n)!; }
+        .LIMITS  => { text_scripts(f, o, n)!; }
+        .ACCENT => {
+            let comb = f.str(n.s2, n.s2l);
+            let mut inner = text_to_string(f, n.a)!;
+            defer inner.deinit();
+            let b = inner.bytes();
+            if comb.len == 0 {
+                o.s(b)!;  // braces have no combining form
+                return;
+            }
+            let per_char = strs.eq(comb, "\u{305}") or strs.eq(comb, "\u{332}") or strs.eq(comb, "\u{304}");
+            let mut it = strs.runes(b);
+            let count = strs.rune_count(b);
+            let mut k: usize = 0;
+            loop {
+                let r = it.next() catch break;
+                let mut buf: [4]u8 = [0; 4];
+                o.s(strs.encode_rune(buf[..], r))!;
+                k += 1;
+                if per_char or (k == count) {
+                    o.s(comb)!;
+                }
+            }
+        }
+        .FENCE => {
+            o.s(t)!;
+            text(f, o, n.a)!;
+            o.s(f.str(n.s2, n.s2l))!;
+        }
+        .TABLE => {
+            let mut r = n.first;
+            let mut first_row = true;
+            while r != NIL {
+                if not first_row {
+                    o.s("; ")!;
+                }
+                first_row = false;
+                let mut line = strs.String.init();
+                defer line.deinit();
+                let mut lo = Out.init(line.writer());
+                let mut c = f.node(r).first;
+                let mut first = true;
+                while c != NIL {
+                    if (not first) and ((n.flags & F_ALIGN) == 0) {
+                        lo.s(", ")!;
+                    }
+                    first = false;
+                    text(f, &mut lo, f.node(c).a)!;
+                    c = f.node(c).next;
+                }
+                lo.flush()!;
+                o.s(strs.trim(line.bytes()))!;
+                r = f.node(r).next;
+            }
+        }
+        .TROW => {}
+        .TCELL => {}
+        .STYLE => { text(f, o, n.a)!; }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Conveniences
+// -----------------------------------------------------------------------------
+
+/// The MathML of TeX math, in new memory (free it with mem.free).
+pub fn to_mathml(tex: []u8, display: Display) ![]mut u8 {
+    let mut f = parse(tex)!;
+    defer f.deinit();
+    let mut s = strs.String.init();
+    f.write_mathml(s.writer(), display) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+/// TeX math as linear Unicode text, in new memory (free it with mem.free).
+pub fn to_text(tex: []u8) ![]mut u8 {
+    let mut f = parse(tex)!;
+    defer f.deinit();
+    let mut s = strs.String.init();
+    f.write_text(s.writer()) catch |e| {
+        s.deinit();
+        return e;
+    };
+    return s.take();
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn expect_text(tex: []u8, want: []u8) !void {
+    let got = to_text(tex)!;
+    defer mem.free(got);
+    @expect_eq(got, want);
+}
+
+fn expect_mathml(tex: []u8, want: []u8) !void {
+    let got = to_mathml(tex, Display.INLINE)!;
+    defer mem.free(got);
+    let pre = "<math><semantics>";
+    @expect(strs.starts_with(got, pre));
+    let end = strs.index_of(got, "<annotation") catch return error.InvalidMath;
+    @expect_eq(got[pre.len..end], want);
+}
+
+fn expect_error(tex: []u8, offset: usize, message: []u8) void {
+    let mut info = ErrorInfo.{ offset: 0, message: "" };
+    let mut f = parse_with(tex, &mut info) catch |e| {
+        @expect(e == error.InvalidMath);
+        @expect_eq(info.offset, offset);
+        @expect_eq(info.message, message);
+        return;
+    };
+    f.deinit();
+    @expect(false);
+}
+
+test "math as text" {
+    expect_text("x^2 + y_1", "x\u{b2} + y\u{2081}")!;
+    expect_text("\\frac{a+b}{c}", "(a + b)/c")!;
+    expect_text("x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}",
+                "x = (\u{2212}b \u{b1} \u{221a}(b\u{b2} \u{2212} 4ac))/(2a)")!;
+    expect_text("\\sqrt[3]{x}", "\u{221b}x")!;
+    expect_text("\\sum_{i=1}^n i^2", "\u{2211}\u{1d62}\u{208c}\u{2081}\u{207f} i\u{b2}")!;
+    expect_text("\\int_0^\\infty e^{-x}\\,dx", "\u{222b}\u{2080}^\u{221e} e\u{207b}\u{2e3} dx")!;
+    expect_text("\\sin x + \\cos(y)", "sin x + cos(y)")!;
+    expect_text("\\mathcal{O}(n \\log n)", "\u{1d4aa}(n log n)")!;
+    expect_text("\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1", "lim_(x \u{2192} 0) (sin x)/x = 1")!;
+    expect_text("\\binom{n}{k} = {n \\choose k}", "(n choose k) = (n choose k)")!;
+    expect_text("\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}", "(a, b; c, d)")!;
+    expect_text("\\begin{aligned} a &= b \\\\ &= c \\end{aligned}", "a = b; = c")!;
+    expect_text("\\hat{x} + \\overline{AB}", "x\u{302} + A\u{305}B\u{305}")!;
+    expect_text("a \\not= b \\leq c", "a \u{2260} b \u{2264} c")!;
+    expect_text("a^{b^c} + e^{i\\pi}", "a^(b\u{1d9c}) + e^(i\u{3c0})")!;
+    expect_text("\\mathbb{R}^n \\mathbf{v} \\boldsymbol{\\alpha}", "\u{211d}\u{207f}\u{1d42f}\u{1d736}")!;
+    expect_text("a \\equiv b \\pmod{n}", "a \u{2261} b (mod n)")!;
+    expect_text("-a - b = -(c)", "\u{2212}a \u{2212} b = \u{2212}(c)")!;
+    expect_text("\\text{if } x > 0", "if x > 0")!;
+    expect_text("f'(x) + f''", "f\u{2032}(x) + f\u{2033}")!;
+    expect_text("", "")!;
+}
+
+test "math as MathML" {
+    expect_mathml("x^2", "<msup><mi>x</mi><mn>2</mn></msup>")!;
+    expect_mathml("\\frac{1}{2}", "<mfrac><mn>1</mn><mn>2</mn></mfrac>")!;
+    expect_mathml("\\sqrt[3]{x}", "<mroot><mi>x</mi><mn>3</mn></mroot>")!;
+    expect_mathml("a<b", "<mrow><mi>a</mi><mo>&lt;</mo><mi>b</mi></mrow>")!;
+    expect_mathml("\\text{<b>&}", "<mtext>&lt;b&gt;&amp;</mtext>")!;
+    expect_mathml("\\sin x", "<mrow><mi>sin</mi><mo>\u{2061}</mo><mi>x</mi></mrow>")!;
+    expect_mathml("\\sum_{i}^{n}", "<munderover><mo>\u{2211}</mo><mi>i</mi><mi>n</mi></munderover>")!;
+    expect_mathml("\\left( x \\right)",
+                  "<mrow><mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">(</mo><mi>x</mi><mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">)</mo></mrow>")!;
+    expect_mathml("\\mathrm{d}", "<mi mathvariant=\"normal\">d</mi>")!;
+    expect_mathml("\\mathbb{R}", "<mi>\u{211d}</mi>")!;
+    expect_mathml("a\\,b", "<mrow><mi>a</mi><mspace width=\"0.1667em\"></mspace><mi>b</mi></mrow>")!;
+    expect_mathml("\\hat{x}", "<mover accent=\"true\"><mi>x</mi><mo stretchy=\"false\">\u{2c6}</mo></mover>")!;
+    expect_mathml("\\textcolor{#f00}{x}", "<mstyle style=\"color:#f00\"><mi>x</mi></mstyle>")!;
+    expect_mathml("\\begin{matrix} a & b \\end{matrix}",
+                  "<mtable><mtr><mtd><mi>a</mi></mtd><mtd><mi>b</mi></mtd></mtr></mtable>")!;
+    let block = to_mathml("x", Display.BLOCK)!;
+    defer mem.free(block);
+    @expect_eq(block,
+               "<math display=\"block\"><semantics><mi>x</mi><annotation encoding=\"application/x-tex\">x</annotation></semantics></math>");
+}
+
+test "math errors" {
+    expect_error("\\frac{a}", 8, "missing argument");
+    expect_error("x^", 2, "missing argument");
+    expect_error("\\foo", 0, "unknown command");
+    expect_error("a^b^c", 3, "double superscript");
+    expect_error("}", 0, "unexpected }");
+    expect_error("\\left( x", 8, "\\left without \\right");
+    expect_error("\\begin{matrix} a \\end{bmatrix}", 30, "\\end does not match \\begin");
+    expect_error("\\color{red;x} y", 13, "bad colour");
+    // nesting is limited, not the stack
+    let mut deep = strs.String.init();
+    defer deep.deinit();
+    for k in @as(usize, 0)..10000 {
+        _ = k;
+        deep.push_str("{")!;
+    }
+    expect_error(deep.bytes(), 64, "nested too deeply");
+}

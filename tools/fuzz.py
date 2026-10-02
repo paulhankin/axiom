@@ -9,7 +9,7 @@ they are around), then runs mutated seeds through each target. Bad input is
 expected to fail with an error; a trap, a signal or a hang is a bug, and
 the input that caused it is saved under build/fuzz/failures/<target>/.
 Targets: image audio deflate json regex markdown pdf font x509 text web
-structured compress archive svg collate opusenc binary (all by default).
+structured compress archive svg collate opusenc binary math (all by default).
 """
 import argparse
 import concurrent.futures
@@ -23,7 +23,7 @@ import sys
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 OUT = os.path.join(ROOT, 'build', 'fuzz')
 TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'font', 'x509', 'text', 'web', 'structured',
-           'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary']
+           'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary', 'math']
 TOKENS = {
     'json': [b'{', b'}', b'[', b']', b'"', b'\\u', b'\\ud800', b'1e999', b'-', b'[' * 600, b'null', b','],
     'regex': [b'(', b')', b'*', b'+', b'?', b'{', b'}', b'{1000}', b'{2,', b'[', b']', b'\\', b'|', b'(?P<', b'\x00'],
@@ -36,6 +36,9 @@ TOKENS = {
     'structured': [b'[', b']', b'{', b'}', b'<', b'>', b'&', b'"', b"'", b'\n', b'  ', b'- ', b': ', b'*', b'!!', b'<!--',
                 b'\xff', b'\x9f', b'\xbf', b'\x1b'],
     'collate': [b'\xcc\x81', b'\xe0\xbd\xb1', b'\xe0\xbe\x80', b'\xe4\xb8\x80', b'\xff', b'\xed\xa0\x80', b' ', b'-'],
+    'math': [b'{', b'}', b'^', b'_', b'\\frac', b'\\left(', b'\\right)', b'\\middle|', b'\\begin{pmatrix}',
+             b'\\end{pmatrix}', b'&', b'\\\\', b'\\sqrt[', b']', b'\\text{', b'\\mathbb{', b'\\not', b'\\over',
+             b'\\color{red}', b"'", b'{' * 70, b'\xff'],
     'text': [b'\xff', b'\xc3', b'\xcc\x81', b'\xe2\x80\x8f', b'\xd7\xa9', b'(', b')', b'%', b':', b'-', b'9' * 30],
 }
 
