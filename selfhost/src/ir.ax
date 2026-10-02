@@ -505,6 +505,7 @@ pub struct Value {
     loc: i32,  // local / virtual register
     flag: i32,
     user: *mut Value,  // the only user (when uses == 1)
+    grave: u32,        // 1 + its index in the graveyard (0: not there)
 }
 
 pub struct Block {
@@ -520,6 +521,7 @@ pub struct Block {
     dom_kids: u.List.[*mut Block],
     rpo: i32,
     depth: i32,  // dominator tree depth
+    grave: u32,  // 1 + its index in the graveyard (0: not there)
     loop_depth: i32,
     aux: i64,
     auxp: *mut void,
@@ -591,10 +593,132 @@ pub fn bnil() *mut Block {
 }
 
 fn new_val(k: i32, t: *mut Ty) *mut Value {
-    let v = u.new.[Value]();
+    let mut v = vnil();
+    if free_vals.len > 0 {
+        v = free_vals.pop();
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, v), @size_of(Value)), 0);
+    } else {
+        v = u.new.[Value]();
+    }
     v.kind = k;
     v.ty = t;
     return v;
+}
+
+// -----------------------------------------------------------------------------
+// Recycling. Instructions and blocks taken out of a function go to a
+// graveyard with their function: they may be put back (moved) or be dead.
+// recycle(f), called where no pass is at work on f, takes the dead ones
+// (still out, with the instructions of dead blocks) for new values and
+// blocks to reuse, and frees their lists. Passes delete most of what they
+// make, so without this the IR of a build is mostly garbage. With
+// AXIOM_POISON, dead values and blocks are filled with 0xA5 instead and
+// never reused.
+// -----------------------------------------------------------------------------
+let mut grave_v: u.List.[*mut Value] = u.List.[*mut Value].{ data: @ptr_from_int(*mut *mut Value, 0), len: 0, cap: 0 };
+let mut grave_vf: u.List.[*mut Func] = u.List.[*mut Func].{ data: @ptr_from_int(*mut *mut Func, 0), len: 0, cap: 0 };
+let mut grave_b: u.List.[*mut Block] = u.List.[*mut Block].{ data: @ptr_from_int(*mut *mut Block, 0), len: 0, cap: 0 };
+let mut free_vals: u.List.[*mut Value] = u.List.[*mut Value].{ data: @ptr_from_int(*mut *mut Value, 0), len: 0,
+                                                               cap: 0 };
+let mut free_blocks: u.List.[*mut Block] = u.List.[*mut Block].{ data: @ptr_from_int(*mut *mut Block, 0), len: 0,
+                                                                 cap: 0 };
+
+fn bury_value(v: *mut Value) void {
+    if v.grave != 0 {
+        // (an instruction of a dead block that had been moved before)
+        let k = @as(usize, v.grave - 1);
+        let last = grave_v.get(grave_v.len - 1);
+        grave_v.set(k, last);
+        grave_vf.set(k, grave_vf.get(grave_vf.len - 1));
+        last.grave = v.grave;
+        grave_v.len -= 1;
+        grave_vf.len -= 1;
+        v.grave = 0;
+    }
+    u.free(@ptr_cast(*mut void, v.xs.data));
+    u.free(@ptr_cast(*mut void, v.bs.data));
+    if u.poisoning() {
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, v), @size_of(Value)), 0xA5);
+        return;
+    }
+    free_vals.push(v);
+}
+
+fn bury_block(b: *mut Block) void {
+    let mut i = b.first;
+    while u.notnil(i) {
+        let next = i.next;
+        bury_value(i);
+        i = next;
+    }
+    u.free(@ptr_cast(*mut void, b.preds.data));
+    u.free(@ptr_cast(*mut void, b.dom_kids.data));
+    if u.poisoning() {
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, b), @size_of(Block)), 0xA5);
+        return;
+    }
+    free_blocks.push(b);
+}
+
+// Each value or block is in the graveyard once, under the function it was
+// last taken out of (a value may move between functions, and in and out
+// of blocks, before it dies).
+fn to_grave(v: *mut Value, f: *mut Func) void {
+    if v.grave != 0 {
+        grave_vf.set(@as(usize, v.grave - 1), f);
+        return;
+    }
+    grave_v.push(v);
+    grave_vf.push(f);
+    v.grave = @truncate(u32, grave_v.len);
+}
+
+fn block_to_grave(b: *mut Block) void {
+    if b.grave != 0 {
+        return;
+    }
+    grave_b.push(b);
+    b.grave = @truncate(u32, grave_b.len);
+}
+
+pub fn recycle(f: *mut Func) void {
+    // (operands still reaching a dead value through its fwd go straight on)
+    apply_forwarding(f);
+    let mut k: usize = 0;
+    while k < grave_v.len {
+        let v = grave_v.get(k);
+        if grave_vf.get(k) != f {
+            k += 1;
+            continue;
+        }
+        // take the entry out (the last one moves into its place)
+        let last = grave_v.get(grave_v.len - 1);
+        grave_v.set(k, last);
+        grave_vf.set(k, grave_vf.get(grave_vf.len - 1));
+        last.grave = @truncate(u32, k + 1);
+        grave_v.len -= 1;
+        grave_vf.len -= 1;
+        v.grave = 0;
+        if u.isnil(v.blk) {
+            bury_value(v);
+        }
+    }
+    k = 0;
+    while k < grave_b.len {
+        let b = grave_b.get(k);
+        if b.fnp != f {
+            k += 1;
+            continue;
+        }
+        let last = grave_b.get(grave_b.len - 1);
+        grave_b.set(k, last);
+        last.grave = @truncate(u32, k + 1);
+        grave_b.len -= 1;
+        b.grave = 0;
+        if u.isnil(b.prev) and u.isnil(b.next) and (f.first != b) {
+            bury_block(b);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -932,8 +1056,17 @@ pub fn is_decl(f: *Func) bool {
     return u.isnil(f.first);
 }
 
+fn new_block() *mut Block {
+    if free_blocks.len > 0 {
+        let b = free_blocks.pop();
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, b), @size_of(Block)), 0);
+        return b;
+    }
+    return u.new.[Block]();
+}
+
 pub fn append_block(f: *mut Func, name: []u8) *mut Block {
-    let b = u.new.[Block]();
+    let b = new_block();
     b.fnp = f;
     b.name = name;
     b.id = f.nblocks;
@@ -950,6 +1083,7 @@ pub fn append_block(f: *mut Func, name: []u8) *mut Block {
 
 pub fn remove_block(b: *mut Block) void {
     let f = b.fnp;
+    block_to_grave(b);
     if u.notnil(b.prev) {
         b.prev.next = b.next;
     } else {
@@ -1059,6 +1193,7 @@ pub fn append_inst(b: *mut Block, v: *mut Value) void {
 
 pub fn remove_inst(v: *mut Value) void {
     let b = v.blk;
+    to_grave(v, b.fnp);
     if u.notnil(v.prev) {
         v.prev.next = v.next;
     } else {
