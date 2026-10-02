@@ -25,7 +25,8 @@
 // strikethrough (~~x~~), autolinks without angle brackets (www.x.com,
 // https://..., a@b.com) and task list items ([ ] and [x]). With Options.math
 // it reads TeX math, $...$ and $$...$$ (as MATH and DISPLAY_MATH nodes) and
-// ```math code blocks, and writes it as MathML (std/text/math).
+// ```math code blocks, and writes it as MathML (std/text/math), or as SVG
+// through Options.math_html and std/text/math/typeset.
 //
 // Untrusted input: the HTML output is safe by default. Raw HTML in the input
 // is replaced by a comment (Options.unsafe_html keeps it), links and images
@@ -152,16 +153,42 @@ pub struct Options {
     /// text; \$ is a dollar sign. Math that does not parse is left as its
     /// source.
     math: bool,
+    /// How math is written: MathML (MathHtml.mathml(), the default), or
+    /// another renderer such as std/text/math/typeset's SVG.
+    math_html: MathHtml,
 
     /// GitHub Flavored Markdown, safe for untrusted input.
     pub fn init() Options {
-        return Options.{ gfm: true, unsafe_html: false, tagfilter: true, hard_breaks: false, math: false };
+        return Options.{ gfm: true, unsafe_html: false, tagfilter: true, hard_breaks: false, math: false,
+                         math_html: MathHtml.mathml() };
     }
 
     /// Plain CommonMark, raw HTML allowed (as the specification's examples expect).
     pub fn commonmark() Options {
-        return Options.{ gfm: false, unsafe_html: true, tagfilter: false, hard_breaks: false, math: false };
+        return Options.{ gfm: false, unsafe_html: true, tagfilter: false, hard_breaks: false, math: false,
+                         math_html: MathHtml.mathml() };
     }
+}
+
+/// A way to write math as HTML: `render(ctx, tex, displayed, out)` appends
+/// it to out and returns true, or returns false (having written nothing)
+/// to leave it to MathML.
+pub struct MathHtml {
+    ctx: *mut void,
+    render: fn(*mut void, []u8, bool, *mut strs.String) !bool,
+
+    /// MathML (std/text/math).
+    pub fn mathml() MathHtml {
+        return MathHtml.{ ctx: @ptr_from_int(*mut void, 8), render: no_math_html };
+    }
+}
+
+fn no_math_html(ctx: *mut void, tex: []u8, displayed: bool, out: *mut strs.String) !bool {
+    _ = ctx;
+    _ = tex;
+    _ = displayed;
+    _ = out;
+    return false;
 }
 
 /// Where a node's string lives: in the block contents (raw) or in the
@@ -3681,7 +3708,10 @@ fn is_math_info(info: []u8) bool {
 }
 
 // TeX as MathML onto out; false (and nothing written) if it does not parse.
-fn math_html(out: *mut strs.String, tex: []u8, display: tmath.Display) !bool {
+fn math_html(opts: Options, out: *mut strs.String, tex: []u8, display: tmath.Display) !bool {
+    if opts.math_html.render(opts.math_html.ctx, tex, display == tmath.Display.BLOCK, out)! {
+        return true;
+    }
     let mut f = tmath.parse(tex) catch |e| {
         if e == error.OutOfMemory {
             return e;
@@ -3779,7 +3809,7 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
                 out.push_str(">\n")!;
             }
         } else if (k == Kind.CODE_BLOCK) and opts.math and is_math_info(doc.info(id)) and
-                  math_html(out, strs.trim(doc.text(id)), tmath.Display.BLOCK)! {
+                  math_html(opts, out, strs.trim(doc.text(id)), tmath.Display.BLOCK)! {
             cr(out)!;
         } else if k == Kind.CODE_BLOCK {
             cr(out)!;
@@ -3875,13 +3905,13 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
         } else if k == Kind.HARD_BREAK {
             out.push_str("<br />\n")!;
         } else if k == Kind.MATH {
-            if not math_html(out, doc.text(id), tmath.Display.INLINE)! {
+            if not math_html(opts, out, doc.text(id), tmath.Display.INLINE)! {
                 out.push('$')!;
                 escape_html(out, doc.text(id))!;
                 out.push('$')!;
             }
         } else if k == Kind.DISPLAY_MATH {
-            if not math_html(out, doc.text(id), tmath.Display.BLOCK)! {
+            if not math_html(opts, out, doc.text(id), tmath.Display.BLOCK)! {
                 out.push_str("$$")!;
                 escape_html(out, doc.text(id))!;
                 out.push_str("$$")!;

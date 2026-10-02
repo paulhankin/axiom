@@ -40,6 +40,7 @@ import "../../io.ax" as io;
 import "../../mem.ax" as mem;
 import "../../os/fs.ax" as fs;
 import "../../str.ax" as strs;
+import "../markdown.ax" as markdown;
 import "../math.ax" as m;
 
 error { OutOfMemory }
@@ -1809,6 +1810,48 @@ pub fn typeset(f: *m.Formula, fnt: *font.Font, size: f64, display: m.Display) !T
     return out;
 }
 
+/// Math in Markdown as SVG: give `html()` to markdown.Options.math_html
+/// (with Options.math on). Inline math becomes an SVG in the line, and
+/// displayed math a centred block. The font must outlive the rendering.
+///
+///     let mut svg_math = typeset.MarkdownSvg.{ font: &f, size: 18.0 };
+///     let mut o = markdown.Options.init();
+///     o.math = true;
+///     o.math_html = svg_math.html();
+pub struct MarkdownSvg {
+    font: *font.Font,
+    size: f64,
+
+    pub fn html(self: *mut MarkdownSvg) markdown.MathHtml {
+        return markdown.MathHtml.{ ctx: @ptr_cast(*mut void, self), render: markdown_svg };
+    }
+}
+
+fn markdown_svg(ctx: *mut void, tex: []u8, displayed: bool, out: *mut strs.String) !bool {
+    let ms = @ptr_cast(*mut MarkdownSvg, ctx);
+    let mut f = m.parse(tex) catch |e| {
+        if e == error.OutOfMemory {
+            return e;
+        }
+        return false;
+    };
+    defer f.deinit();
+    let mut display = m.Display.INLINE;
+    if displayed {
+        display = m.Display.BLOCK;
+    }
+    let mut t = typeset(&f, ms.font, ms.size, display)!;
+    defer t.deinit();
+    if displayed {
+        out.push_str("<span style=\"display:block;text-align:center\">")!;
+    }
+    t.write_svg(out.writer())!;
+    if displayed {
+        out.push_str("</span>")!;
+    }
+    return true;
+}
+
 /// TeX math as an SVG document (free it with mem.free).
 pub fn to_svg(tex: []u8, fnt: *font.Font, size: f64, display: m.Display) ![]mut u8 {
     let mut f = m.parse(tex)!;
@@ -1958,6 +2001,23 @@ test "SVG and drawing" {
         k += 4;
     }
     @expect(blue > 20);
+}
+
+test "Markdown math as SVG" {
+    let data = test_font_data()!;
+    defer mem.free(data);
+    let mut f = font.Font.init(data)!;
+    let mut ms = MarkdownSvg.{ font: &f, size: 18.0 };
+    let mut o = markdown.Options.init();
+    o.math = true;
+    o.math_html = ms.html();
+    let h = markdown.to_html("Area $\\pi r^2$ and\n\n$$\\frac{1}{2}$$\n\nbad $\\frac{a}$\n", o)!;
+    defer mem.free(h);
+    @expect(strs.starts_with(h, "<p>Area <svg xmlns="));
+    @expect(strs.contains(h, "<title>\u{3c0}r\u{b2}</title>"));
+    @expect(strs.contains(h, "<p><span style=\"display:block;text-align:center\"><svg "));
+    @expect(strs.contains(h, "<p>bad $\\frac{a}$</p>"));
+    @expect(not strs.contains(h, "<math"));
 }
 
 test "fonts without a MATH table, and odd input" {
