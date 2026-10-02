@@ -38,6 +38,7 @@ WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/security.md`](docs/security.md) | A security review of the standard library: findings, fixes and what is open |
 | [`docs/performance.md`](docs/performance.md) | A performance review of the standard library, with comparisons to C libraries |
+| [`issues/`](issues/README.md) | Known bugs and feature requests, one file each |
 | [`examples/dot_product.ax`](examples/dot_product.ax) | SIMD dot product with the global allocator and WASM exports |
 | [`examples/shapes.ax`](examples/shapes.ax) | Tagged unions, `match`, errors |
 | [`examples/generics.ax`](examples/generics.ax) | Generic functions and types, constraints, const parameters |
