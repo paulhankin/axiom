@@ -274,12 +274,16 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     for (const f of ['lib.ax', 'main.ax']) fs.copyFileSync(path.join(root, 'tests/units', f), path.join(dir, f));
     const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'units-cache') };
     const out = path.join(tmp, 'units-prog' + (native ? '' : '.wasm'));
-    const want = ['42', '3', '9', 'too big', 'TooBig'].join('\n');
+    const want = ['42', '3', '9', 'too big', 'TooBig', '5'].join('\n');
     const steps = [
       ['cold build', () => {}, (n, t) => n === t],
       ['no change', () => {}, (n) => n === 0],
       ['new error name renumbers all codes', () => fs.appendFileSync(path.join(dir, 'main.ax'), '\nerror { Aardvark }\n'), (n) => n === 1],
       ['library edit', () => fs.appendFileSync(path.join(dir, 'lib.ax'), '\n// edited\n'), (n) => n === 2],
+      // on wasm the thread-locals of the whole program share one block whose
+      // layout every module's code uses, so a new one recompiles everything
+      ['new thread-local', () => fs.appendFileSync(path.join(dir, 'lib.ax'), '\nthreadlocal let mut more: u8 = 0;\n'),
+        (n, t) => native ? n === 2 : n === t],
     ];
     let problem = null;
     for (const [what, edit, ok] of steps) {

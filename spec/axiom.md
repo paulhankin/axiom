@@ -115,6 +115,9 @@ or        pub       return    Self      struct    test      true      union
 while
 ```
 
+`threadlocal` is not a keyword. It is an identifier that has its special meaning
+only at the start of a module-level `let` (§12.8.6).
+
 **Reserved type names.** These lex as keywords:
 
 ```
@@ -202,7 +205,7 @@ ExternParams  ::= Param ( "," Param )* ( "," "..." )?
 ErrorDecl     ::= "error" "{" IDENT ( "," IDENT )* ","? "}"
 
 ConstDecl     ::= "const" IDENT ":" Type "=" Expr ";"
-GlobalDecl    ::= "let" "mut"? IDENT ":" Type "=" Expr ";"
+GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
 ```
 
 ### 3.2 Aggregates and functions
@@ -1398,9 +1401,10 @@ This section defines shared-memory concurrency. The design follows from three fa
 | 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later (Appendix D). |
 | 4 | **Atomics are builtins on pointers to integers** (`@atomic_add(&mut x, 1)`), not special types. | Any integer in memory can be accessed atomically, as in WebAssembly. `std/sync.Atomic[T]` wraps them for convenience. |
 | 5 | **`wait`/`notify` operate on 32-bit integers only.** | Linux futexes, the native implementation, are 32-bit, and WebAssembly has `wait32`. 64-bit waiting would behave differently on different targets. |
-| 6 | **No `async`/`await`, no coroutines, no thread-local storage.** | An `await` is a suspension point that looks like an ordinary expression, which is hidden control flow. Blocking calls on threads are explicit. Thread-locals would need per-instance TLS setup on WebAssembly. Pass per-thread data explicitly instead. |
+| 6 | **No `async`/`await`, no coroutines.** | An `await` is a suspension point that looks like an ordinary expression, which is hidden control flow. Blocking calls on threads are explicit. |
 | 7 | **A trap in any thread terminates the whole program.** | A trap means the program's state is no longer trustworthy. Letting other threads continue would let them observe that state. |
 | 8 | **Deadlock is not an error.** A thread blocked forever is simply blocked. | Detecting it would require a runtime scheduler. |
+| 9 | **Thread-local globals, mutable only** (`threadlocal let mut`, §12.8.6). | Per-thread state (an allocator cache, a random generator, a log buffer) otherwise has to be threaded through every call or locked. An immutable thread-local would just be a constant. |
 
 #### 12.8.2 Memory model
 
@@ -1487,6 +1491,32 @@ initialized only once, by the first instance. Programs that never spawn threads
 keep an unshared memory and need no worker support.
 
 On native targets, threads are POSIX threads, and `wait`/`notify` are futexes (Linux).
+
+#### 12.8.6 Thread-local globals
+
+```axiom
+threadlocal let mut calls: u64 = 0;
+pub threadlocal let mut seed: [4]u64 = [1, 2, 3, 4];
+```
+
+A module-level `let mut` marked `threadlocal` has one copy per thread. Each thread's
+copy starts with the initializer's value, whatever other threads have done to theirs,
+and lives as long as the thread. The main thread's copy is the one it starts with.
+Otherwise a thread-local is an ordinary global: it is read, assigned and passed by
+address (`&mut calls`) in the same way, and a pointer to it may be given to another
+thread, which then accesses the first thread's copy (a pointer is just an address,
+§12.1). Such a pointer dangles once its thread has ended.
+
+A thread-local must be `mut` (E0354). `threadlocal` is recognized only before a
+module-level `let` and is otherwise an ordinary identifier.
+
+Implementation: native code uses the platform's thread-local storage (ELF TLS, the
+initial-exec model). On WebAssembly, where each thread is a separate instance, the
+program's thread-locals form one block. The main thread uses a static copy. The
+`axiom_thread_start` export (§12.8.5) copies the initial values to the top of the new
+thread's stack and records the copy's address in a WebAssembly global, which every
+access consults. With separate compilation (§16.7), this block's layout is part of
+every module's cache key.
 
 ## 13. SIMD
 
@@ -1900,6 +1930,7 @@ Initial registry, not exhaustive:
 | E0309 | Two enum members with the same value |
 | E0311 | Unknown trap code in `expect trap(...)` |
 | E0312 | Duplicate test name in a module |
+| E0354 | Thread-local global without `mut` |
 | E0801 | Type not allowed at the export or import boundary |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0824 | C variadic argument without a promoted type |
@@ -2111,7 +2142,9 @@ object depends on:
 - the code-generation options (target, `-O`, overflow mode, stack traces, profiling,
   test mode);
 - the module's source and path;
-- and, recursively, the keys of the modules it imports.
+- recursively, the keys of the modules it imports;
+- on WebAssembly, the layout of the program's thread-locals (§12.8.6): their order,
+  sizes and alignments.
 
 Editing a module recompiles it and every module that imports it, directly or
 indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
@@ -2127,6 +2160,7 @@ What makes modules independent:
 | Error codes (§11.1) | Module objects load `axiom.errcode.<Name>` from the link unit. A `match` on errors becomes a chain of comparisons. Adding an error name anywhere renumbers every code without invalidating any cached object |
 | `@error_name` | One function in the link unit, next to the table |
 | Globals | Defined in the link unit (initializers may contain error codes) and referenced by name |
+| Thread-locals on WebAssembly | One block, defined in the link unit; each module's code addresses fields of it, so its layout is in every cache key |
 | Generic instances | Defined link-once by every unit that uses them, under names built from module-qualified types, so the linker keeps one copy |
 | Private functions | Externally visible under their module-qualified names, because another unit's generic instance may call them |
 | Source locations in site records (§16.4) | A stable hash of the file's path, not a per-build file number |
@@ -2488,6 +2522,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C30 | `axiom profile`: a sampling profiler over the shadow stack (§16.6) | The user asked for profiling support |
 | C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§16.7) | The user asked for independent compilation units |
 | C32 | Enums: distinct types over an integer representation, with members, methods, exhaustive `match`, `==`/`!=` and checked conversions (§5.14); `enum` is no longer reserved | The standard library passed alignments, modes and kinds as bare `u8`/`u32` constants, which any integer could be confused with |
+| C33 | Thread-local globals: `threadlocal let mut` (§12.8.6). This replaces the earlier "no thread-local storage" decision | The user asked for thread-locals. WebAssembly needed a per-instance block, set up by the thread start export |
 
 ---
 

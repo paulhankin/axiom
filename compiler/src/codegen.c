@@ -887,6 +887,10 @@ static LLVMValueRef global_ref(Decl *d) {
     Type *t = d->type;
     g = LLVMAddGlobal(mod, lty(t), arena_printf("%s.%s", mangle_prefix(d), d->name));
     LLVMSetAlignment(g, (unsigned)type_align(t));
+    if (d->tls) {
+        LLVMSetThreadLocal(g, true);
+        LLVMSetThreadLocalMode(g, LLVMInitialExecTLSModel);
+    }
     symmap_put(&global_vals, k, g);
     if (O->unit == CG_MODULE) return g;  // defined by the link unit
     if (O->unit == CG_WHOLE) LLVMSetLinkage(g, LLVMInternalLinkage);
@@ -903,6 +907,56 @@ static LLVMValueRef shared_global(LLVMTypeRef t, const char *name, LLVMValueRef 
     LLVMSetInitializer(g, init);
     if (O->unit == CG_WHOLE) LLVMSetLinkage(g, LLVMInternalLinkage);
     return g;
+}
+
+// Thread-locals on wasm, where a thread is a new instance sharing the memory:
+// all of the program's thread-locals live in one block. The main thread uses
+// axiom.tls.main; a thread start copies axiom.tls.init (the initial values)
+// to the top of the new thread's stack and points the wasm global axiom.tls
+// (null in the main thread) at it.
+static LLVMTypeRef tls_ty;
+static LLVMValueRef tls_main, tls_init, tls_ptr;
+static Vec(Decl *) tls_decls;
+
+static bool tls_globals(void) {
+    if (tls_ty) return true;
+    for (int i = 0; i < g_prog.globals.len; i++)
+        if (g_prog.globals.data[i]->tls) vec_push(tls_decls, g_prog.globals.data[i]);
+    int n = tls_decls.len;
+    if (!n) return false;
+    LLVMTypeRef *fs = NEWN(LLVMTypeRef, n);
+    for (int k = 0; k < n; k++) fs[k] = lty(tls_decls.data[k]->type);
+    tls_ty = LLVMStructTypeInContext(ctx, fs, (unsigned)n, false);
+    LLVMValueRef init = NULL;
+    if (O->unit != CG_MODULE) {
+        LLVMValueRef *vs = NEWN(LLVMValueRef, n);
+        for (int k = 0; k < n; k++) vs[k] = gen_const(tls_decls.data[k]->init, tls_decls.data[k]->type);
+        init = LLVMConstNamedStruct(tls_ty, vs, (unsigned)n);
+    }
+    unsigned align = LLVMABIAlignmentOfType(TD, tls_ty);
+    if (align < 8) align = 8;
+    tls_main = shared_global(tls_ty, "axiom.tls.main", init, 0);
+    LLVMSetAlignment(tls_main, align);
+    tls_init = shared_global(tls_ty, "axiom.tls.init", init, 0);
+    LLVMSetAlignment(tls_init, align);
+    LLVMSetGlobalConstant(tls_init, true);
+    tls_ptr = shared_global(T_ptr, "axiom.tls", LLVMConstNull(T_ptr), 1);
+    return true;
+}
+
+static LLVMValueRef tls_addr(Decl *d) {
+    tls_globals();
+    unsigned field = 0;
+    while (tls_decls.data[field] != d) field++;
+    LLVMValueRef p = LLVMBuildLoad2(B, T_ptr, tls_ptr, "");
+    LLVMValueRef base = LLVMBuildSelect(B, LLVMBuildIsNull(B, p, ""), tls_main, p, "");
+    return LLVMBuildStructGEP2(B, tls_ty, base, field, "");
+}
+
+// The address of a global in the current thread.
+static LLVMValueRef global_addr(Decl *d) {
+    if (d->tls && g_target.wasm) return tls_addr(d);
+    return global_ref(d);
 }
 
 // An error code: a constant, except in module units, where the codes are
@@ -1372,11 +1426,11 @@ static LLVMValueRef gen_addr_inner(Expr *e) {
         if (e->local) {
             return local_ptr(e->local);
         }
-        if (e->decl && e->decl->kind == D_GLOBAL) return global_ref(e->decl);
+        if (e->decl && e->decl->kind == D_GLOBAL) return global_addr(e->decl);
         break;
     case E_DEREF: return gen(e->a);
     case E_FIELD: {
-        if (e->op == FK_DECL && e->decl && e->decl->kind == D_GLOBAL) return global_ref(e->decl);
+        if (e->op == FK_DECL && e->decl && e->decl->kind == D_GLOBAL) return global_addr(e->decl);
         Type *at = ct(e->a->type);
         LLVMValueRef base;
         Type *st;
@@ -1480,7 +1534,7 @@ static LLVMValueRef mem_global(const char *name) {
     for (int i = 0; i < g_prog.globals.len; i++) {
         Decl *d = g_prog.globals.data[i];
         if (strcmp(d->name, name) != 0 || !d->module) continue;
-        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ax")) return global_ref(d);
+        if (!strcmp(g_files.data[d->module->file->id]->display, "std/mem.ax")) return global_addr(d);
     }
     fprintf(stderr, "axiom: internal error: std/mem.ax has no %s (is --std right?)\n", name);
     exit(3);
@@ -2361,6 +2415,15 @@ static void emit_thread_start(void) {
         LLVMBuildStore(B, base, ss_global);
         top = base;
     }
+    if (tls_globals()) {
+        // The thread's thread-locals, below that, from their initial values.
+        unsigned long long size = (LLVMABISizeOfType(TD, tls_ty) + 15) & ~15ull;
+        LLVMValueRef neg = LLVMConstInt(T_isz, (unsigned long long)-(long long)size, true);
+        LLVMValueRef base = LLVMBuildGEP2(B, T_i8, top, &neg, 1, "");
+        LLVMBuildMemCpy(B, base, 16, tls_init, 8, usz((int64_t)LLVMABISizeOfType(TD, tls_ty)));
+        LLVMBuildStore(B, base, tls_ptr);
+        top = base;
+    }
     // The thread's stack: set the wasm global __stack_pointer (which the
     // linker defines) directly; llvm.stackrestore in a function without a
     // frame of its own is dropped, and the thread would run on the main
@@ -2571,7 +2634,7 @@ static LLVMValueRef gen_inner(Expr *e) {
         }
         if (e->decl) {
             switch (e->decl->kind) {
-            case D_GLOBAL: return load(t, global_ref(e->decl), false);
+            case D_GLOBAL: return load(t, global_addr(e->decl), false);
             case D_FN:
             case D_HOST_FN: return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
             case D_CONST:
@@ -2612,7 +2675,7 @@ static LLVMValueRef gen_inner(Expr *e) {
         }
         case FK_CONST: return gen_const(e->decl->cexpr, t);
         case FK_DECL:
-            if (e->decl->kind == D_GLOBAL) return load(t, global_ref(e->decl), false);
+            if (e->decl->kind == D_GLOBAL) return load(t, global_addr(e->decl), false);
             return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
         }
         break;
@@ -3261,7 +3324,11 @@ bool codegen_program(CgOptions *o) {
                 if (g_prog.tests.data[i]->module == O->module) get_inst(g_prog.tests.data[i], NULL, 0);
     } else {
         // The link unit: globals, error codes and names.
-        for (int i = 0; i < g_prog.globals.len; i++) global_ref(g_prog.globals.data[i]);
+        for (int i = 0; i < g_prog.globals.len; i++) {
+            Decl *d = g_prog.globals.data[i];
+            if (d->tls && g_target.wasm) tls_globals();
+            else global_ref(d);
+        }
         for (int i = 0; i < g_prog.error_names.len; i++) {
             LLVMValueRef g = LLVMAddGlobal(mod, T_i16, arena_printf("axiom.errcode.%s", g_prog.error_names.data[i]));
             LLVMSetInitializer(g, LLVMConstInt(T_i16, (unsigned long long)i + 1, false));

@@ -1051,6 +1051,9 @@ static void parse_top(Parser *P) {
         expect(P, TK_RBRACE);
         return;
     }
+    // `threadlocal` is a keyword only here, before a module-level `let`
+    bool tls = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "threadlocal") && peek2(P)->kind == KW_LET;
+    if (tls) advance(P);
     switch (pk(P)) {
     case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
     case KW_STRUCT: {
@@ -1137,6 +1140,7 @@ static void parse_top(Parser *P) {
         advance(P);
         Decl *d = new_decl(P, D_GLOBAL, start);
         d->is_pub = is_pub;
+        d->tls = tls;
         d->mut = accept(P, KW_MUT);
         d->name = expect_ident(P, &d->name_span);
         if (!accept(P, TK_COLON)) {

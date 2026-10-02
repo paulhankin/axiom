@@ -288,6 +288,7 @@ struct Decl {
     TypeExpr *te;  // const / global type; enum representation type (NULL: default)
     Expr *init;
     bool mut;
+    bool tls;  // D_GLOBAL: threadlocal (one per thread)
     Sym import_path;
     Span import_path_span;
     Module *imported;

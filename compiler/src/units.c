@@ -93,6 +93,25 @@ static const char *module_key(Module *m, const char *opts) {
     return k;
 }
 
+// On wasm every thread-local of the program lives in one block whose layout
+// each module's code bakes in, so a module's object also depends on the
+// thread-locals of modules it does not import: their order, sizes and
+// alignments. NULL when there is no such dependency.
+static const char *tls_layout_id(void) {
+    if (!g_target.wasm) return NULL;
+    Hasher h = hasher();
+    bool any = false;
+    for (int i = 0; i < g_prog.globals.len; i++) {
+        Decl *d = g_prog.globals.data[i];
+        if (!d->tls) continue;
+        any = true;
+        hash_str(&h, d->module->path);
+        hash_str(&h, d->name);
+        hash_str(&h, arena_printf("%lld/%lld", (long long)type_size(d->type), (long long)type_align(d->type)));
+    }
+    return any ? hex_key(&h) : NULL;
+}
+
 static bool file_ok(const char *p) {
     struct stat st;
     return stat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
@@ -142,10 +161,17 @@ bool build_units(CgOptions *base, const char *link_obj, UnitObjs *objs, UnitStat
     int n = g_prog.modules.len;
     Unit *units = NEWN(Unit, n + 1);
     Vec(Unit *) todo = {0};
+    const char *tls = tls_layout_id();
     for (int i = 0; i < n; i++) {
         Unit *u = &units[i];
         u->m = g_prog.modules.data[i];
         u->key = module_key(u->m, opts);
+        if (tls) {
+            Hasher h = hasher();
+            hash_str(&h, u->key);
+            hash_str(&h, tls);
+            u->key = hex_key(&h);
+        }
         u->obj = arena_printf("%s/%s.o", dir, u->key);
         u->cached = file_ok(u->obj);
         if (!u->cached) vec_push(todo, u);

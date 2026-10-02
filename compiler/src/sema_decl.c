@@ -631,6 +631,10 @@ void resolve_decl(Decl *d) {
             diag_error(d->te->span, "E0404", "global '%s' cannot have type void", d->name);
             d->type = t_invalid;
         }
+        if (d->tls && !d->mut)
+            diag_error(d->name_span, "E0354",
+                       "thread-local '%s' must be mutable (`threadlocal let mut`; a constant needs no copy per thread)",
+                       d->name);
         break;
     }
     default: break;

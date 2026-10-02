@@ -1422,6 +1422,8 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
     let g = ir.add_global(M, lty(t), u.f2("%s.%s", mangle_prefix(d), d.name)).val;
     set_align(g, @int_cast(u32, ty.type_align(t)));
     global_vals.put(k, g);
+    // (on wasm a thread-local lives in the thread's block instead: tls_addr)
+    g.gv.tls = d.is_tls;
     if O.unit == CG_MODULE {
         return g;  // defined by the link unit
     }
@@ -1433,6 +1435,81 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
         g.gv.is_const = true;
     }
     return g;
+}
+
+// A global's address in the function being generated.
+fn global_addr(d: *mut ast.Decl) *mut ir.Value {
+    if d.is_tls and ty.g_target.is_wasm {
+        return tls_addr(d);
+    }
+    return global_ref(d);
+}
+
+// Thread-locals on wasm, which has no TLS: the program's thread-locals,
+// in declaration order (the same in every unit, since all units come from
+// one checked program), make one block. The main thread's is the global
+// axiom.tls.main; every other thread copies the initial values
+// (axiom.tls.init) to the top of its stack when it starts and keeps the
+// address in axiom.tls, a wasm global, so per instance (per thread), null
+// in the main thread.
+let mut tls_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+let mut tls_main: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut tls_init: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut tls_ptr: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut tls_decls: u.List.[*mut ast.Decl] = u.List.[*mut ast.Decl].{ data: @ptr_from_int(*mut *mut ast.Decl, 0), len: 0,
+                                                                     cap: 0 };
+
+// Whether the program has thread-locals; on wasm, makes their block's globals.
+fn tls_globals() bool {
+    if u.notnil(tls_ty) {
+        return true;
+    }
+    let P = sema.g_prog;
+    tls_decls.clear();
+    for i in 0..P.globals.len {
+        let d = P.globals.get(i);
+        if d.is_tls {
+            tls_decls.push(d);
+        }
+    }
+    if tls_decls.len == 0 {
+        return false;
+    }
+    let n = tls_decls.len;
+    let fs = u.newn.[*mut ir.Ty](n + 1);
+    for k in 0..n {
+        fs[k] = lty(tls_decls.get(k).ty);
+    }
+    tls_ty = struct_ty(fs[0..n]);
+    let mut init = vnil();
+    if O.unit != CG_MODULE {
+        let vs = u.newn.[*mut ir.Value](n + 1);
+        for k in 0..n {
+            let d = tls_decls.get(k);
+            vs[k] = gen_const(d.init, d.ty);
+        }
+        init = const_struct(vs[0..n]);
+    }
+    tls_main = shared_global(tls_ty, "axiom.tls.main", init, 0);
+    set_align(tls_main, @int_cast(u32, @max(tls_ty.align, 8)));
+    tls_init = shared_global(tls_ty, "axiom.tls.init", init, 0);
+    set_align(tls_init, @int_cast(u32, @max(tls_ty.align, 8)));
+    tls_init.gv.is_const = true;
+    tls_ptr = shared_global(T_ptr, "axiom.tls", ir.czero(T_ptr), 1);
+    return true;
+}
+
+fn tls_addr(d: *mut ast.Decl) *mut ir.Value {
+    _ = tls_globals();
+    let mut field: u32 = 0;
+    for k in 0..tls_decls.len {
+        if tls_decls.get(k) == d {
+            field = @truncate(u32, k);
+        }
+    }
+    let p = ld(T_ptr, tls_ptr);
+    let base = ir.select(B, ir.is_null(B, p), tls_main, p);
+    return sgep(tls_ty, base, field);
 }
 
 // Program-wide state shared by all units: defined (internal) in a whole
@@ -2091,13 +2168,13 @@ fn gen_addr_inner(e: *mut ast.Expr) *mut ir.Value {
             return local_ptr(e.local);
         }
         if u.notnil(e.decl) and (e.decl.kind == ast.D_GLOBAL) {
-            return global_ref(e.decl);
+            return global_addr(e.decl);
         }
     } else if k == ast.E_DEREF {
         return gen(e.a);
     } else if k == ast.E_FIELD {
         if (e.op == ast.FK_DECL) and u.notnil(e.decl) and (e.decl.kind == ast.D_GLOBAL) {
-            return global_ref(e.decl);
+            return global_addr(e.decl);
         }
         let at = ct(e.a.ty);
         let mut base = vnil();
@@ -2966,7 +3043,7 @@ fn mem_global(name: []u8) *mut ir.Value {
         let d = P.globals.get(i);
         if u.str_eq(d.name, name) and u.notnil(d.module) and
            u.str_eq(u.file_of(d.module.file.id).display, "std/mem.ax") {
-            return global_ref(d);
+            return global_addr(d);
         }
     }
     internal_error(u.f1("std/mem.ax has no %s (is --std right?)", name));
@@ -3334,6 +3411,15 @@ fn emit_thread_start() void {
     let mut top = param(f, 2);
     // std/thread stores the stack's lowest address at its top
     _ = st(ld(T_isz, top), stack_limit());
+    if tls_globals() {
+        // the thread's own copy of the thread-locals, at the top of its stack
+        let size = (tls_ty.size + 15) & ~@as(u64, 15);
+        let neg = ir.cint(T_isz, 0 -% size);
+        let base = gep1(T_i8, top, neg);
+        _ = ir.memop(B, ir.OP_MEMCPY, base, tls_init, usz(@bit_cast(i64, tls_ty.size)));
+        _ = st(base, tls_ptr);
+        top = base;
+    }
     if program_traces() {
         // The thread's shadow stack sits at the top of its stack.
         let t = ss_type();
@@ -3627,7 +3713,7 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
         if u.notnil(e.decl) {
             let dk = e.decl.kind;
             if dk == ast.D_GLOBAL {
-                return load(t, global_ref(e.decl), false);
+                return load(t, global_addr(e.decl), false);
             }
             if (dk == ast.D_FN) or (dk == ast.D_HOST_FN) {
                 return get_inst(e.decl, subst_gargs(e.gargs)).fnv;
@@ -3699,7 +3785,7 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
         }
         if fk == ast.FK_DECL {
             if e.decl.kind == ast.D_GLOBAL {
-                return load(t, global_ref(e.decl), false);
+                return load(t, global_addr(e.decl), false);
             }
             return get_inst(e.decl, subst_gargs(e.gargs)).fnv;
         }
@@ -4332,7 +4418,12 @@ pub fn codegen_program(o: *mut CgOptions) bool {
     } else {
         // The link unit: globals, error codes and names.
         for i in 0..P.globals.len {
-            _ = global_ref(P.globals.get(i));
+            let d = P.globals.get(i);
+            if d.is_tls and ty.g_target.is_wasm {
+                _ = tls_globals();  // (the block, not one global each)
+            } else {
+                _ = global_ref(d);
+            }
         }
         for i in 0..P.error_names.len {
             let g = ir.add_global(M, T_i16, u.f1("axiom.errcode.%s", P.error_names.get(i))).val;

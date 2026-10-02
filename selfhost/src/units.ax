@@ -134,6 +134,33 @@ fn module_key(m: *mut ast.Module, opts: []u8) []u8 {
     return key;
 }
 
+// On wasm every thread-local of the program lives in one block whose layout
+// each module's code bakes in, so a module's object also depends on the
+// thread-locals of modules it does not import: their order, sizes and
+// alignments. Nil when there is no such dependency.
+fn tls_layout_id() []u8 {
+    if not ty.g_target.is_wasm {
+        return u.nil_slice.[u8]();
+    }
+    let P = sema.g_prog;
+    let mut h = hasher();
+    let mut any = false;
+    for i in 0..P.globals.len {
+        let d = P.globals.get(i);
+        if d.is_tls {
+            any = true;
+            hash_str(&mut h, d.module.path);
+            hash_str(&mut h, d.name);
+            hash_str(&mut h, u.dec(ty.type_size(d.ty)));
+            hash_str(&mut h, u.dec(ty.type_align(d.ty)));
+        }
+    }
+    if not any {
+        return u.nil_slice.[u8]();
+    }
+    return hex_key(&h);
+}
+
 fn file_ok(p: []u8) bool {
     return u.is_file(p) and (u.file_size(p) > 0);
 }
@@ -176,10 +203,17 @@ pub fn build_units(base: *cg.CgOptions, link_obj: []u8, objs: *mut u.List.[[]u8]
     let n = mods.len;
     let units = u.newn.[Unit](n + 1);
     let mut todo = u.List.[*mut Unit].{ data: u.nil.[*mut Unit](), len: 0, cap: 0 };
+    let tls = tls_layout_id();
     for i in 0..n {
         let un = &mut units[i];
         un.m = mods.get(i);
         un.key = module_key(un.m, opts);
+        if not u.isnos(tls) {
+            let mut h = hasher();
+            hash_str(&mut h, un.key);
+            hash_str(&mut h, tls);
+            un.key = hex_key(&h);
+        }
         un.obj = u.f2("%s/%s.o", dir, un.key);
         un.cached = file_ok(un.obj);
         if not un.cached {

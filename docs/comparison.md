@@ -304,8 +304,9 @@ small, but real code relies on the preprocessor.
 
 ## Concurrency
 
-Axiom treats threads as a library (`std/thread`) and adds only atomic builtins to the
-language. All atomics are **sequentially consistent**: there are no memory-order
+Axiom treats threads as a library (`std/thread`) and adds only atomic builtins and
+thread-local globals (`threadlocal let mut`, like C's `_Thread_local` and Zig's
+`threadlocal var`) to the language. All atomics are **sequentially consistent**: there are no memory-order
 parameters. A data race is not undefined behavior: a racing read returns, for each byte,
 some value that was written there. This is WebAssembly's thread model, applied everywhere.
 There is no `async`/`await`, since a suspension point that looks like an ordinary
