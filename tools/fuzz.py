@@ -8,8 +8,8 @@ encoders, plus sounds from ffmpeg/sox, system fonts and certificates when
 they are around), then runs mutated seeds through each target. Bad input is
 expected to fail with an error; a trap, a signal or a hang is a bug, and
 the input that caused it is saved under build/fuzz/failures/<target>/.
-Targets: image audio deflate json regex markdown pdf font x509 text (all
-by default).
+Targets: image audio deflate json regex markdown pdf font x509 text web
+structured compress archive svg collate opusenc binary (all by default).
 """
 import argparse
 import concurrent.futures
@@ -22,7 +22,8 @@ import sys
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 OUT = os.path.join(ROOT, 'build', 'fuzz')
-TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'font', 'x509', 'text']
+TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'font', 'x509', 'text', 'web', 'structured',
+           'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary']
 TOKENS = {
     'json': [b'{', b'}', b'[', b']', b'"', b'\\u', b'\\ud800', b'1e999', b'-', b'[' * 600, b'null', b','],
     'regex': [b'(', b')', b'*', b'+', b'?', b'{', b'}', b'{1000}', b'{2,', b'[', b']', b'\\', b'|', b'(?P<', b'\x00'],
@@ -30,6 +31,11 @@ TOKENS = {
                  b'&', b'#', b'\t', b'!['],
     'pdf': [b'<<', b'>>', b'[', b']', b'(', b')', b'R', b' 0 obj', b'endobj', b'stream\n', b'endstream',
             b'/Length 1', b'99999999', b'-1', b'/Filter /FlateDecode', b'xref', b'trailer'],
+    'web': [b';', b'=', b'%', b'%zz', b'/', b'..', b'[', b']', b':', b'@', b'?', b'#', b'*', b',', b'-', b'Expires=',
+            b'Max-Age=-1', b'Domain=', b'.', b'\xff'],
+    'structured': [b'[', b']', b'{', b'}', b'<', b'>', b'&', b'"', b"'", b'\n', b'  ', b'- ', b': ', b'*', b'!!', b'<!--',
+                b'\xff', b'\x9f', b'\xbf', b'\x1b'],
+    'collate': [b'\xcc\x81', b'\xe0\xbd\xb1', b'\xe0\xbe\x80', b'\xe4\xb8\x80', b'\xff', b'\xed\xa0\x80', b' ', b'-'],
     'text': [b'\xff', b'\xc3', b'\xcc\x81', b'\xe2\x80\x8f', b'\xd7\xa9', b'(', b')', b'%', b':', b'-', b'9' * 30],
 }
 
@@ -60,6 +66,12 @@ def make_seeds(exe):
         for f in sorted(glob.glob(pat))[:2]:
             if os.path.getsize(f) < 400000:
                 shutil.copy(f, fonts)
+    arch = os.path.join(seeds, 'archive')
+    for f in sorted(glob.glob(os.path.join(ROOT, 'std', 'archive', 'zip', 'testdata', '*.zip')))[:6]:
+        if os.path.getsize(f) < 30000:
+            shutil.copy(f, arch)
+    for f in sorted(glob.glob(os.path.join(ROOT, 'std', 'graphics', 'svg', 'testdata', '*.svg')))[:20]:
+        shutil.copy(f, os.path.join(seeds, 'svg'))
     certs = os.path.join(seeds, 'x509')
     os.makedirs(certs, exist_ok=True)
     for f in sorted(glob.glob('/etc/ssl/certs/*.pem'))[:4]:

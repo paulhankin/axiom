@@ -2,12 +2,33 @@
 // runs one target on the file's bytes. Errors are fine (bad input is
 // expected); a trap, a hang or runaway memory is a bug. tools/fuzz.py
 // mutates seed files and runs this.
+import "std/archive/tar" as tar;
+import "std/archive/zip" as zip;
 import "std/audio" as audio;
 import "std/audio/formats" as audio_formats;
+import "std/audio/opus" as opus;
+import "std/compress/brotli" as brotli;
+import "std/compress/bzip2" as bzip2;
 import "std/compress/deflate" as deflate;
+import "std/compress/lz4" as lz4;
+import "std/compress/snappy" as snappy;
+import "std/compress/xz" as xz;
+import "std/compress/zstd" as zstd;
+import "std/crypto/otp" as otp;
 import "std/crypto/x509" as x509;
 import "std/encoding/base64" as base64;
+import "std/encoding/binary" as binary;
+import "std/encoding/cbor" as cbor;
+import "std/encoding/ini" as ini;
 import "std/encoding/json" as json;
+import "std/encoding/jwt" as jwt;
+import "std/encoding/mime" as mime;
+import "std/encoding/msgpack" as msgpack;
+import "std/encoding/protobuf" as protobuf;
+import "std/encoding/toml" as toml;
+import "std/encoding/uuid" as uuid;
+import "std/encoding/xml" as xml;
+import "std/encoding/yaml" as yaml;
 import "std/fmt" as fmt;
 import "std/graphics/color" as color;
 import "std/graphics/draw" as draw;
@@ -16,24 +37,37 @@ import "std/graphics/image" as image;
 import "std/graphics/image/formats" as image_formats;
 import "std/graphics/pdf" as pdf;
 import "std/graphics/pdf/read" as pdf_read;
+import "std/graphics/qr" as qr;
+import "std/graphics/svg" as svg;
 import "std/io" as io;
+import "std/math/rational" as rational;
 import "std/mem" as mem;
+import "std/net/cookie" as cookie;
 import "std/net/http" as http;
+import "std/net/url" as url;
 import "std/os" as os;
 import "std/os/fs" as fs;
 import "std/str" as strs;
+import "std/text/html" as html;
 import "std/text/markdown" as markdown;
 import "std/text/regex" as regex;
+import "std/text/similarity" as similarity;
+import "std/text/wrap" as wrap;
 import "std/time" as time;
+import "std/time/cron" as cron;
 import "std/unicode" as uni;
 import "std/unicode/bidi" as bidi;
+import "std/unicode/collate" as collate;
 import "std/unicode/linebreak" as linebreak;
 
 export fn main() i32 {
     let target = os.arg(1) catch return 2;
     let path = os.arg(2) catch return 2;
     if strs.eq(target, "seeds") {
-        seeds(path) catch return 1;
+        seeds(path) catch |e| {
+            io.stderr().write_all(@error_name(e)) catch {};
+            return 1;
+        };
         return 0;
     }
     let data = fs.read_file(path) catch return 2;
@@ -128,6 +162,97 @@ fn run(t: []u8, d: []u8) !void {
         }
         let mut c2 = x509.Certificate.parse(d) catch return;
         c2.deinit();
+    } else if strs.eq(t, "web") {
+        web(d)!;
+    } else if strs.eq(t, "formats") {
+        structured(d)!;
+    } else if strs.eq(t, "compress") {
+        let max: usize = 1 << 24;
+        free_ok(snappy.decompress(d, max));
+        free_ok(snappy.decompress_raw(d, max));
+        free_ok(zstd.decompress(d, max));
+        free_ok(brotli.decompress(d, max));
+        free_ok(xz.decompress(d, max));
+        free_ok(xz.decompress_lzma(d, max));
+        free_ok(bzip2.decompress(d, max));
+        free_ok(lz4.decompress(d, max));
+    } else if strs.eq(t, "archive") {
+        zip_all(d);
+        let mut r = tar.Reader.init(d);
+        defer r.deinit();
+        for _k in @as(usize, 0)..1000 {
+            _ = r.next() catch break;
+        }
+    } else if strs.eq(t, "svg") {
+        let mut doc = svg.parse(d)!;
+        defer doc.deinit();
+        let mut img = svg.render_image(&doc, 48, 48)!;
+        img.deinit();
+    } else if strs.eq(t, "collate") {
+        let mut c = collate.Collator.init(collate.Options.default());
+        defer c.deinit();
+        let mut k = strs.String.init();
+        defer k.deinit();
+        c.sort_key(d, &mut k)!;
+        let half = d.len / 2;
+        _ = c.compare(d[..half], d[half..])!;
+        let mut sh = collate.Collator.init(collate.Options.{ strength: collate.Strength.QUATERNARY,
+                                                             alternate: collate.Alternate.SHIFTED });
+        defer sh.deinit();
+        _ = sh.compare(d[..half], d[half..])!;
+        // text tools on bounded pieces
+        let a = d[..@min(half, 300)];
+        let b = d[half..@min(d.len, half + 300)];
+        _ = similarity.levenshtein.[u8](a, b)!;
+        _ = similarity.damerau_levenshtein.[u8](a, b)!;
+        _ = similarity.jaro_winkler.[u8](a, b)!;
+        _ = similarity.ratio.[u8](a, b)!;
+        _ = similarity.fuzzy_score(a, b)!;
+        let width = (@as(usize, if_byte(d, 0)) % 40) + 1;
+        let lines = wrap.wrap(d, wrap.Options.init(width))!;
+        for l in lines {
+            mem.free(l);
+        }
+        mem.free(lines);
+    } else if strs.eq(t, "opusenc") {
+        // the bytes as float samples, NaNs and infinities included
+        let n = d.len / 4;
+        let ch = (@as(usize, if_byte(d, 0)) % 2) + 1;
+        let frames = n / ch;
+        if frames == 0 {
+            return;
+        }
+        let mut snd = audio.Sound.init(frames, ch, 48000, audio.SampleFormat.F32)!;
+        defer snd.deinit();
+        let smp = snd.samples_f32();
+        for i in @as(usize, 0)..(frames * ch) {
+            smp[i] = @bit_cast(f32, binary.u32_le(d[4 * i..(4 * i) + 4]));
+        }
+        let rates: [3]u32 = [6000, 64000, 510000];
+        let out = opus.encode(&snd, rates[@as(usize, if_byte(d, 1)) % 3])!;
+        defer mem.free(out);
+        let mut back = opus.decode(out)!;
+        back.deinit();
+    } else if strs.eq(t, "binary") {
+        let mut c = binary.Cursor.init(d, binary.Endian.BIG);
+        for _k in @as(usize, 0)..10000 {
+            let op = c.read_u8() catch break;
+            if (op % 6) == 0 {
+                _ = c.read_uvarint() catch break;
+            } else if (op % 6) == 1 {
+                _ = c.read_svarint() catch break;
+            } else if (op % 6) == 2 {
+                _ = c.read_u64() catch break;
+            } else if (op % 6) == 3 {
+                _ = c.read_bytes(@as(usize, op)) catch break;
+            } else if (op % 6) == 4 {
+                c.seek(@as(usize, op) * 3) catch break;
+            } else {
+                _ = c.read_f32() catch break;
+            }
+        }
+        let code = qr.encode_binary(d[..@min(d.len, 3000)], qr.Ecc.M) catch return;
+        _ = code;
     } else if strs.eq(t, "text") {
         // everything that takes arbitrary text
         let b = base64.decode_alloc(d, base64.STANDARD) catch mem.alloc.[u8](0)!;
@@ -178,6 +303,115 @@ fn run(t: []u8, d: []u8) !void {
 }
 
 // -----------------------------------------------------------------------------
+fn if_byte(d: []u8, i: usize) u8 {
+    if i < d.len {
+        return d[i];
+    }
+    return 0;
+}
+
+fn web(d: []u8) !void {
+    free_ok(url.normalize(d));
+    free_ok(url.join("http://a/b/c/d;p?q", d));
+    _ = uuid.parse(d) catch uuid.Uuid.{ bytes: [0; 16] };
+    cron_next(d);
+    _ = cookie.parse_set_cookie(d) catch cookie.SetCookie.init("", "");
+    let mut jar = cookie.Jar.init();
+    defer jar.deinit();
+    jar.set_cookie("www.example.com", "/a/b", true, d, time.Time.from_unix(1700000000, 0))!;
+    jar.set_cookie(d[..@min(d.len, 40)], d, false, "a=b; Path=/", time.Time.from_unix(1700000000, 0))!;
+    let h = jar.header_alloc("www.example.com", "/a/b/c", true, time.Time.from_unix(1700000000, 0))!;
+    mem.free(h);
+    _ = cookie.parse_cookie_date(d) catch time.Time.from_unix(0, 0);
+    otp_jwt(d);
+    _ = mime.parse_media_type(d);
+    free_ok(mime.qp_decode_alloc(d));
+    rational_parse(d);
+    _ = http.parse_url(d) catch return;
+}
+
+fn structured(d: []u8) !void {
+    fmt_toml(d);
+    fmt_yaml(d);
+    fmt_xml(d);
+    fmt_ini(d);
+    fmt_html(d);
+    fmt_cbor(d);
+    fmt_msgpack(d);
+    free_ok(protobuf.decode_raw_alloc(d));
+}
+
+fn free_ok(r: ![]mut u8) void {
+    let x = r catch return;
+    mem.free(x);
+}
+
+fn zip_all(d: []u8) void {
+    let mut a = zip.Archive.open(d) catch return;
+    defer a.deinit();
+    let n = @min(a.entries.len, 64);
+    for e in a.entries[..n] {
+        free_ok(a.extract(e));
+        free_ok(a.extract_password(e, "secret"));
+        free_ok(a.extract_password(e, "wrong"));
+    }
+}
+
+fn cron_next(d: []u8) void {
+    let sc = cron.parse(d) catch return;
+    _ = sc.next(time.Time.from_unix(1700000000, 0)) catch time.Time.from_unix(0, 0);
+}
+
+fn otp_jwt(d: []u8) void {
+    let mut k = otp.parse_uri(d) catch {
+        let mut tk = jwt.verify(d, jwt.Alg.HS256,
+                                jwt.VerifyingKey.Secret("0123456789abcdef0123456789abcdef")) catch return;
+        tk.deinit();
+        return;
+    };
+    k.deinit();
+}
+
+fn rational_parse(d: []u8) void {
+    let mut r = rational.Rational.parse(d) catch return;
+    r.deinit();
+}
+
+fn fmt_toml(d: []u8) void {
+    let mut x = toml.parse(d) catch return;
+    x.deinit();
+}
+
+fn fmt_yaml(d: []u8) void {
+    let mut x = yaml.parse_all(d) catch return;
+    x.deinit();
+}
+
+fn fmt_xml(d: []u8) void {
+    let mut x = xml.parse(d) catch return;
+    x.deinit();
+}
+
+fn fmt_ini(d: []u8) void {
+    let mut x = ini.parse(d) catch return;
+    x.deinit();
+}
+
+fn fmt_html(d: []u8) void {
+    let mut x = html.parse(d) catch return;
+    x.deinit();
+}
+
+fn fmt_cbor(d: []u8) void {
+    let mut x = cbor.decode(d) catch return;
+    x.deinit();
+}
+
+fn fmt_msgpack(d: []u8) void {
+    let mut x = msgpack.decode(d) catch return;
+    x.deinit();
+}
+
 // Seeds: small valid inputs for each target, made with std's own encoders
 // -----------------------------------------------------------------------------
 
@@ -288,6 +522,78 @@ fn seeds(dir: []u8) !void {
     put(dir, "text", "c", "https://user:pw@example.com:8080/p/a%20th?q=1&r=%zz#frag")!;
     put(dir, "text", "d",
         "e\xcc\x81\xef\xac\x81 \xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d (abc) \xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa9 SGVsbG8= -12.5e-3")!;
+    // web strings, structured formats, compressed data and archives
+    put(dir, "web", "a", "https://user:pw@[::1]:8080/a/../b/%7Ex?q=1#f")!;
+    put(dir, "web", "b", "id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Domain=.example.com; Path=/; Secure")!;
+    put(dir, "web", "c", "*/15 9-17 * JAN-MAR MON-FRI")!;
+    put(dir, "web", "d", "otpauth://totp/Ex:alice@x.com?secret=JBSWY3DPEHPK3PXP&issuer=Ex&period=30&digits=8")!;
+    put(dir, "web", "e", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6")!;
+    put(dir, "web", "f", "multipart/form-data; boundary=\"x y\"; charset=utf-8")!;
+    let tok = jwt.sign(jwt.Alg.HS256, jwt.SigningKey.Secret("0123456789abcdef0123456789abcdef"),
+                       "{\"sub\":\"1\",\"exp\":9999999999}", "")!;
+    defer mem.free(tok);
+    put(dir, "web", "g", tok)!;
+    put(dir, "web", "h", "-123456789/987654321")!;
+    put(dir, "structured", "toml",
+        "title = \"x\"\n[a.b]\nc = [1, 2.5, \"s\"]\nd = 1979-05-27T07:32:00Z\n[[e]]\nf = {g = true}\n")!;
+    put(dir, "structured", "yaml", "a: &x [1, 2]\nb: *x\nc: |\n  text\n---\n- {k: v}\n- !!str 3\n")!;
+    put(dir, "structured", "xml",
+        "<?xml version=\"1.0\"?><!DOCTYPE a [<!ENTITY e \"v\">]><a x=\"1\">&e;<b/><![CDATA[c]]></a>")!;
+    put(dir, "structured", "ini", "[s]\nk = v ; c\n[t]\nk2=\"q\"\n")!;
+    put(dir, "structured", "html", "<!doctype html><p>a<b>b<i>c</b>d</i><table><tr><td>x</table><script>1<2</script>")!;
+    let cb = cbor.from_json_text("{\"a\":[1,2.5,\"x\",null,true],\"b\":{\"c\":-7}}")!;
+    defer mem.free(cb);
+    put(dir, "structured", "cbor", cb)!;
+    let mp = msgpack.from_json_text("{\"a\":[1,2.5,\"x\",null,true],\"b\":{\"c\":-7}}")!;
+    defer mem.free(mp);
+    put(dir, "structured", "msgpack", mp)!;
+    let sz = snappy.compress(text)!;
+    defer mem.free(sz);
+    put(dir, "compress", "snappy", sz)!;
+    let zs = zstd.compress(text, 3)!;
+    defer mem.free(zs);
+    put(dir, "compress", "zstd", zs)!;
+    let br = brotli.compress(text, 5)!;
+    defer mem.free(br);
+    put(dir, "compress", "brotli", br)!;
+    let xzb = xz.compress(text, xz.Options.default())!;
+    defer mem.free(xzb);
+    put(dir, "compress", "xz", xzb)!;
+    let bz = bzip2.compress(text, 9)!;
+    defer mem.free(bz);
+    put(dir, "compress", "bzip2", bz)!;
+    let l4 = lz4.compress(text, lz4.Options.default())!;
+    defer mem.free(l4);
+    put(dir, "compress", "lz4", l4)!;
+    {
+        let mut zb = strs.String.init();
+        defer zb.deinit();
+        let mut zw = zip.Writer.init(zb.writer());
+        let mut zo = zip.Options.default();
+        zw.add("a.txt", text, zo)!;
+        zo.password = "secret";
+        zw.add("b.txt", text, zo)!;
+        zw.finish()!;
+        zw.deinit();
+        put(dir, "archive", "zip", zb.bytes())!;
+        let mut tb = strs.String.init();
+        defer tb.deinit();
+        let mut tw = tar.Writer.init(tb.writer());
+        tw.add_file("dir/a.txt", text, tar.Options.default())!;
+        tw.finish()!;
+        put(dir, "archive", "tar", tb.bytes())!;
+    }
+    put(dir, "svg", "a",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><defs><radialGradient id=\"g\" fx=\"0.2\"><stop offset=\"0\" stop-color=\"red\"/><stop offset=\"1\" stop-color=\"blue\"/></radialGradient></defs><path d=\"M1 1 L30 5 A10 10 0 1 1 5 30z\" fill=\"url(#g)\" stroke=\"black\" stroke-dasharray=\"2 1\"/><text x=\"5\" y=\"20\">hi</text></svg>")!;
+    put(dir, "collate", "a",
+        "R\xc3\xa9sum\xc3\xa9 resume co-op coop \xe4\xb8\x80 \xe0\xbd\xb2\xe0\xbd\xb1\xe0\xbe\x80 a\xcc\x81\xcc\xa3 9 \xef\xbf\xbf")!;
+    put(dir, "collate", "b", "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.")!;
+    let mut fl: [64]u8 = [0; 64];
+    for i in @as(usize, 0)..16 {
+        binary.put_f32_le(fl[4 * i..], @float_from_int(f32, i) * 0.05);
+    }
+    put(dir, "opusenc", "a", fl[..])!;
+    put(dir, "binary", "a", "\x00\x96\x01\x01\x7f\x02\x00\x00\x00\x00\x00\x00\x00\x01\x03abc\x05\x00\x00\x80\x3f")!;
     // a PDF
     let mut doc = pdf.Document.init();
     defer doc.deinit();
