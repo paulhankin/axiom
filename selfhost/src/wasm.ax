@@ -2422,6 +2422,302 @@ fn classify(f: *mut ir.Func) void {
 }
 
 // -----------------------------------------------------------------------------
+// Locals
+//
+// Values in locals (FL_LOCAL) share them, like registers, when their
+// lifetimes do not overlap: V8 keeps every local of a function in its native
+// stack frame, so one local per value makes deep recursion run out of
+// native stack long before the linear-memory stack is full.
+//
+// A value is read where it is used, or where an inlined or recomputed value
+// (FL_INLINE, FL_REMAT) that uses it is pushed. Phi sources are read at the
+// end of the predecessor and a phi is written on the edge after all of them
+// (phi_copies), with nothing else live there but what is live into the phi's
+// block: so phis are defined at the start of their block, as in SSA. Then,
+// visiting blocks in dominator tree order, every value live where another is
+// defined already has its local, and the first local of its type that none
+// of them holds is a valid one.
+// -----------------------------------------------------------------------------
+let mut lvals: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                 cap: 0 };
+let mut reads: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+// The local values read when x is computed (appended to `reads`).
+fn add_reads(x: *mut ir.Value) void {
+    let ops: [3]*mut ir.Value = [x.a, x.b, x.c];
+    for o in ops {
+        if u.notnil(o) {
+            add_read(o);
+        }
+    }
+    for k in 0..x.xs.len {
+        add_read(x.xs.get(k));
+    }
+}
+
+fn add_read(o: *mut ir.Value) void {
+    if o.kind != ir.V_INST {
+        return;
+    }
+    if o.flag == FL_LOCAL {
+        if o.loc >= 0 {
+            reads.push(@int_cast(u32, o.loc));
+        }
+        return;
+    }
+    add_reads(o);
+}
+
+// What phi p of block `to` reads on the edge from `from` (as phi_copies).
+fn add_phi_reads(p: *mut ir.Value, from: *mut ir.Block) void {
+    for k in 0..p.bs.len {
+        if p.bs.get(k) == from {
+            add_read(p.xs.get(k));
+            return;
+        }
+    }
+}
+
+fn bit(s: []mut u64, i: u32) bool {
+    return (s[@as(usize, i >> 6)] & (@as(u64, 1) << @as(u64, i & 63))) != 0;
+}
+
+fn set_bit(s: []mut u64, i: u32) void {
+    s[@as(usize, i >> 6)] |= @as(u64, 1) << @as(u64, i & 63);
+}
+
+fn clear_bit(s: []mut u64, i: u32) void {
+    s[@as(usize, i >> 6)] &= ~(@as(u64, 1) << @as(u64, i & 63));
+}
+
+// The instructions computed in a block, in order: what emit_block evaluates
+// (not phis, the terminator or values computed where they are used).
+fn computed(i: *ir.Value) bool {
+    return (i.op != ir.OP_PHI) and not ir.is_term(i.op) and (i.flag == FL_LOCAL);
+}
+
+// The values live at the end of b (into `live`).
+fn live_out(b: *mut ir.Block, live_in: [][]mut u64, live: []mut u64) void {
+    @mem_set(live, 0);
+    let t = ir.terminator(b);
+    if u.isnil(t) {
+        return;
+    }
+    for e in 0..ir.succ_count(t) {
+        let s = ir.succ(t, e);
+        if s.rpo < 0 {
+            continue;
+        }
+        let li = live_in[@int_cast(usize, s.rpo)];
+        for w in 0..live.len {
+            live[w] |= li[w];
+        }
+        reads.clear();
+        let mut p = s.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            add_phi_reads(p, b);
+            p = p.next;
+        }
+        for r in reads.items() {
+            set_bit(live, r);
+        }
+    }
+}
+
+// Walks b backwards from `live` (its live-out set), leaving there what is
+// live after its phis (its live-in set and the phis read). In `deaths`, records for each computed instruction (last first)
+// the values whose last use it is, and itself if it is never read: entries,
+// then the group's size.
+fn walk_back(b: *mut ir.Block, live: []mut u64, deaths: *mut u.List.[u32]) void {
+    let t = ir.terminator(b);
+    if u.notnil(t) {
+        reads.clear();
+        add_reads(t);
+        for r in reads.items() {
+            set_bit(live, r);
+        }
+    }
+    let mut i = b.last;
+    while u.notnil(i) {
+        if computed(i) {
+            let start = deaths.len;
+            if i.loc >= 0 {
+                let d = @int_cast(u32, i.loc);
+                if not bit(live, d) {
+                    deaths.push(d);
+                }
+                clear_bit(live, d);
+            }
+            reads.clear();
+            add_reads(i);
+            for r in reads.items() {
+                if not bit(live, r) {
+                    set_bit(live, r);
+                    deaths.push(r);
+                }
+            }
+            deaths.push(@int_cast(u32, deaths.len - start));
+        }
+        i = i.prev;
+    }
+}
+
+fn clear_phis(b: *mut ir.Block, live: []mut u64) void {
+    let mut p = b.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        if p.loc >= 0 {
+            clear_bit(live, @int_cast(u32, p.loc));
+        }
+        p = p.next;
+    }
+}
+
+// The first free local of type t (occ: which locals from `first` on are taken).
+fn take_local(t: u8, first: usize, occ: *mut u.List.[bool]) u32 {
+    for k in first..LT.len {
+        if (LT.get(k) == t) and not occ.get(k - first) {
+            occ.set(k - first, true);
+            return nparams + @int_cast(u32, k);
+        }
+    }
+    occ.push(true);
+    return new_local(t);
+}
+
+fn release_local(l: i32, first: usize, occ: *mut u.List.[bool]) void {
+    occ.set(@int_cast(usize, l) - @as(usize, nparams) - first, false);
+}
+
+fn alloc_locals(f: *mut ir.Func, order: u.List.[*mut ir.Block]) void {
+    // number the values that need a local (in loc, for now)
+    lvals.clear();
+    let nb = order.len;
+    for bi in 0..nb {
+        let mut i = order.get(bi).first;
+        while u.notnil(i) {
+            if (i.ty.kind != ir.T_VOID) and (i.flag == FL_LOCAL) and ((i.uses > 0) or (i.op == ir.OP_PHI)) {
+                i.loc = @int_cast(i32, lvals.len);
+                lvals.push(i);
+            }
+            i = i.next;
+        }
+    }
+    let n = lvals.len;
+    if n == 0 {
+        return;
+    }
+    let words = (n + 63) / 64;
+    let live_in = u.newn.[[]mut u64](nb + 1);
+    for bi in 0..nb {
+        live_in[bi] = u.newn.[u64](words);
+    }
+    let live = u.newn.[u64](words);
+    let mut none = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut bi = nb;
+        while bi > 0 {
+            bi -= 1;
+            let b = order.get(bi);
+            live_out(b, live_in[..nb], live);
+            none.clear();
+            walk_back(b, live, &mut none);
+            clear_phis(b, live);
+            let li = live_in[bi];
+            for w in 0..words {
+                if li[w] != live[w] {
+                    li[w] = live[w];
+                    changed = true;
+                }
+            }
+        }
+    }
+    // colour in dominator tree order
+    let colour = u.newn.[i32](n);
+    for k in 0..n {
+        colour[k] = -1;
+    }
+    let first = LT.len;
+    let mut occ = u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 };
+    let mut deaths = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };
+    let mut stack = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    stack.push(order.get(0));
+    while stack.len > 0 {
+        let b = stack.pop();
+        for k in 0..b.dom_kids.len {
+            stack.push(b.dom_kids.get(k));
+        }
+        for k in 0..occ.len {
+            occ.set(k, false);
+        }
+        let li = live_in[@int_cast(usize, b.rpo)];
+        for k in 0..n {
+            if bit(li, @int_cast(u32, k)) {
+                if colour[k] < 0 {
+                    fail("a value is live before it has a local");
+                    continue;
+                }
+                occ.set(@int_cast(usize, colour[k]) - @as(usize, nparams) - first, true);
+            }
+        }
+        // the values whose last use each computed instruction is
+        live_out(b, live_in[..nb], live);
+        deaths.clear();
+        walk_back(b, live, &mut deaths);
+        let mut p = b.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            if p.loc >= 0 {
+                colour[@int_cast(usize, p.loc)] = @int_cast(i32, take_local(vt(p.ty), first, &mut occ));
+            }
+            p = p.next;
+        }
+        p = b.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            if (p.loc >= 0) and not bit(live, @int_cast(u32, p.loc)) {
+                release_local(colour[@int_cast(usize, p.loc)], first, &mut occ);
+            }
+            p = p.next;
+        }
+        // forward over the computed instructions; their groups were recorded
+        // last first, so they are read from the end of `deaths`
+        let mut end = deaths.len;
+        let mut i = b.first;
+        while u.notnil(i) {
+            if computed(i) {
+                let size = @as(usize, deaths.get(end - 1));
+                let start = end - 1 - size;
+                let mut self_dead = false;
+                for k in start..end - 1 {
+                    let d = deaths.get(k);
+                    if (i.loc >= 0) and (d == @int_cast(u32, i.loc)) {
+                        self_dead = true;
+                    } else {
+                        release_local(colour[@as(usize, d)], first, &mut occ);
+                    }
+                }
+                if i.loc >= 0 {
+                    let c = take_local(vt(i.ty), first, &mut occ);
+                    colour[@int_cast(usize, i.loc)] = @int_cast(i32, c);
+                    if self_dead {
+                        release_local(@int_cast(i32, c), first, &mut occ);
+                    }
+                }
+                end = start;
+            }
+            i = i.next;
+        }
+    }
+    for k in 0..n {
+        lvals.get(k).loc = colour[k];
+    }
+    u.free(@ptr_cast(*mut void, none.data));
+    u.free(@ptr_cast(*mut void, occ.data));
+    u.free(@ptr_cast(*mut void, deaths.data));
+    u.free(@ptr_cast(*mut void, stack.data));
+}
+
+// -----------------------------------------------------------------------------
 // Control flow
 // -----------------------------------------------------------------------------
 fn depth_of(kind: i32, target: *mut ir.Block) u64 {
@@ -2823,7 +3119,6 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     if frame_size > 0 {
         fp_local = new_local(ptr_vt());
     }
-    // locals for values
     b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
@@ -2832,13 +3127,12 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
                 fail("vector types need the simd128 extension (--features=+simd128)");
                 return;
             }
-            if (i.ty.kind != ir.T_VOID) and (i.flag == FL_LOCAL) and ((i.uses > 0) or (i.op == ir.OP_PHI)) {
-                i.loc = @int_cast(i32, new_local(vt(i.ty)));
-            }
             i = i.next;
         }
         b = b.next;
     }
+    // locals for values
+    alloc_locals(f, order);
     // prologue
     if frame_size > 0 {
         op(0x23);

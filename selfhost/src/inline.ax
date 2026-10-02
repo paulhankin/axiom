@@ -27,6 +27,10 @@ const SMALL: i32 = 30;          // always worth inlining
 const ONE_CALLER: i32 = 1200;   // an internal function called once
 const CALLER_MAX: i32 = 20000;  // stop growing a caller beyond this
 const TAIL_MAX: i32 = 120;      // a callee called in tail position, from one place
+// A callee whose stack slots take more than this is not inlined into a
+// recursive function, where every level of the recursion would pay for them
+// (as LLVM's limit for recursive callers).
+const RECURSIVE_FRAME_MAX: i64 = 1024;
 
 pub fn callee_of(i: *ir.Value) *mut ir.Func {
     if (i.op == ir.OP_CALL) and (i.a.kind == ir.V_FUNC) {
@@ -271,8 +275,10 @@ struct Node {
     scc: i32,
     calls: i32,  // direct call sites in the module
     addr_taken: bool,
-    cost: i32,      // cost(f), or -1: not known (f changed since)
-    inlinable: i8,  // inlinable(f): 1 or 0, or -1: not known
+    cost: i32,        // cost(f), or -1: not known (f changed since)
+    inlinable: i8,    // inlinable(f): 1 or 0, or -1: not known
+    frame: i64,       // frame_bytes(f), or -1: not known
+    recursive: bool,  // calls itself, directly or not
 }
 
 let mut nodes: u.List.[*mut Node] = u.List.[*mut Node].{ data: @ptr_from_int(*mut *mut Node, 0), len: 0, cap: 0 };
@@ -332,6 +338,30 @@ fn global_refs(m: *mut ir.Module) void {
     }
 }
 
+// The bytes of f's stack slots (allocas).
+fn frame_bytes(f: *ir.Func) i64 {
+    let mut n: i64 = 0;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_ALLOCA {
+                n += @bit_cast(i64, i.aty.size);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return n;
+}
+
+fn node_frame(n: *mut Node) i64 {
+    if n.frame < 0 {
+        n.frame = frame_bytes(n.f);
+    }
+    return n.frame;
+}
+
 fn node_cost(n: *mut Node) i32 {
     if n.cost < 0 {
         n.cost = cost(n.f);
@@ -359,6 +389,7 @@ fn build_graph(m: *mut ir.Module) void {
         n.index = -1;
         n.cost = -1;
         n.inlinable = -1;
+        n.frame = -1;
         nodes.push(n);
     }
     for i in 0..m.funcs.len {
@@ -510,6 +541,9 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
     if (gn.scc == n.scc) or not node_inlinable(gn) {
         return false;
     }
+    if n.recursive and (node_frame(gn) > RECURSIVE_FRAME_MAX) {
+        return false;
+    }
     let gc = node_cost(gn);
     if gc <= SMALL {
         return true;
@@ -603,6 +637,14 @@ pub fn inline_module(m: *mut ir.Module, simplify: fn(*mut ir.Func) void) void {
     sccs(&mut order);
     for k in 0..order.len {
         let n = order.get(k);
+        for j in 0..n.callees.len {
+            if nodes.get(@int_cast(usize, n.callees.get(j))).scc == n.scc {
+                n.recursive = true;
+            }
+        }
+    }
+    for k in 0..order.len {
+        let n = order.get(k);
         if ir.is_decl(n.f) {
             continue;
         }
@@ -610,6 +652,7 @@ pub fn inline_module(m: *mut ir.Module, simplify: fn(*mut ir.Func) void) void {
             simplify(n.f);
             n.cost = -1;
             n.inlinable = -1;
+            n.frame = -1;
         }
     }
     u.free(@ptr_cast(*mut void, order.data));

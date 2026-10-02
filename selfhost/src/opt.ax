@@ -545,9 +545,14 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     if op == ir.OP_PHI {
         // all inputs the same (ignoring the phi itself)
         let mut same = vnil();
+        let mut undefs = false;
         for k in 0..i.xs.len {
             let x = i.xs.get(k);
-            if (x == i) or (x.kind == ir.V_UNDEF) {
+            if x == i {
+                continue;
+            }
+            if x.kind == ir.V_UNDEF {
+                undefs = true;
                 continue;
             }
             if u.isnil(same) {
@@ -559,12 +564,41 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
         if u.isnil(same) {
             return ir.undef(i.ty);
         }
+        // phi(x, undef) is x only where x is defined on every path: else the
+        // undef paths would read a value never computed on them
+        if undefs and (same.kind == ir.V_INST) {
+            if same.blk == i.blk {
+                if same.op != ir.OP_PHI {
+                    return vnil();  // defined after the phi (a loop)
+                }
+            } else if not fold_dominates(same.blk, i.blk) {
+                return vnil();
+            }
+        }
         return same;
     }
     return vnil();
 }
 
 let mut FB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+
+// Dominators for fold, computed when first needed in each fold_combine:
+// that only removes edges, which keeps every dominance it had.
+let mut fold_func: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut fold_doms: bool = false;
+
+fn fold_dominates(a: *mut ir.Block, b: *mut ir.Block) bool {
+    if not fold_doms {
+        compute_preds(fold_func);
+        let order = dominators(fold_func);
+        u.free(@ptr_cast(*mut void, order.data));
+        fold_doms = true;
+    }
+    if (a.rpo < 0) or (b.rpo < 0) or u.isnil(a.idom) or u.isnil(b.idom) {
+        return false;
+    }
+    return dominates(a, b);
+}
 
 // Folds constants and trivial phis to a fixed point; with `combine`, also
 // the rewrites of combine.ax. True if anything changed.
@@ -583,6 +617,8 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     // phis on back edges), so a round or two reach the fixed point
     compute_preds(f);
     let order = rpo(f);
+    fold_func = f;
+    fold_doms = false;
     while changed and (rounds < 16) {
         changed = false;
         rounds += 1;
