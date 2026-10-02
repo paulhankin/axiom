@@ -39,7 +39,15 @@
 //
 // https:// URLs are fetched over TLS 1.3 (std/net/tls), checking the server's
 // certificate against the system's roots unless ClientOptions.with_tls
-// gives another configuration. A server serves HTTPS when made with
+// gives another configuration. The client follows up to 10 redirects
+// (with_redirects), keeps cookies in a std/net/cookie Jar (with_cookies),
+// and goes through HTTP proxies (with_proxy; Proxy.from_env reads
+// HTTP_PROXY, HTTPS_PROXY and NO_PROXY), tunnelling https:// with CONNECT:
+//
+//     let mut jar = cookie.Jar.init();
+//     let mut px = http.Proxy.from_env()!;
+//     let opts = http.ClientOptions.default().with_cookies(&mut jar).with_proxy(&px);
+//     let mut resp = http.request("GET", url, http.no_headers(), "", opts)!; A server serves HTTPS when made with
 // server_tls (or Router.serve_tls) and a tls.ServerConfig.
 //
 // The server and the client are threads and blocking sockets over std/net,
@@ -47,15 +55,18 @@
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
+import "../encoding/base64.ax" as base64;
 import "../fmt.ax" as fmt;
 import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../net.ax" as net;
+import "../os.ax" as os;
 import "../os/process.ax" as process;
 import "../str.ax" as strs;
 import "../sync.ax" as sync;
 import "../thread.ax" as thread;
 import "../time.ax" as time;
+import "cookie.ax" as cookie;
 import "hpack.ax" as hpack;
 import "http2.ax" as http2;
 import "tls.ax" as tls;
@@ -75,6 +86,7 @@ error {
     NetError,
     TimedOut,
     Unsupported,
+    ProxyRefused,
 }
 
 pub struct Header {
@@ -1622,7 +1634,12 @@ pub struct ClientOptions {
     max_body_bytes: usize,
     tls_config: *tls.ClientConfig,  // for https (see with_tls)
     has_tls_config: bool,
-    http2: bool,  // offer HTTP/2 (ALPN "h2"; for http://, assume it)
+    http2: bool,           // offer HTTP/2 (ALPN "h2"; for http://, assume it)
+    max_redirects: u32,    // redirects followed (0: the 3xx response is returned)
+    jar: *mut cookie.Jar,  // see with_cookies
+    has_jar: bool,
+    proxy: *Proxy,  // see with_proxy
+    has_proxy: bool,
 
     pub fn default() ClientOptions {
         return ClientOptions.{
@@ -1631,6 +1648,11 @@ pub struct ClientOptions {
             tls_config: @ptr_from_int(*tls.ClientConfig, 8),
             has_tls_config: false,
             http2: false,
+            max_redirects: 10,
+            jar: @ptr_from_int(*mut cookie.Jar, 8),
+            has_jar: false,
+            proxy: @ptr_from_int(*Proxy, 8),
+            has_proxy: false,
         };
     }
 
@@ -1651,6 +1673,237 @@ pub struct ClientOptions {
         o.has_tls_config = true;
         return o;
     }
+
+    /// These options following at most n redirects (301, 302, 303, 307 and
+    /// 308 with a Location; 10 by default, 0 returns the redirect itself).
+    pub fn with_redirects(self: ClientOptions, n: u32) ClientOptions {
+        let mut o = self;
+        o.max_redirects = n;
+        return o;
+    }
+
+    /// These options keeping cookies in jar (which must outlive the
+    /// requests): Set-Cookie headers of every response, redirects
+    /// included, are stored, and a Cookie header is sent from it.
+    pub fn with_cookies(self: ClientOptions, jar: *mut cookie.Jar) ClientOptions {
+        let mut o = self;
+        o.jar = jar;
+        o.has_jar = true;
+        return o;
+    }
+
+    /// These options sending requests through the proxies of p (which
+    /// must outlive the requests), for example Proxy.from_env().
+    pub fn with_proxy(self: ClientOptions, p: *Proxy) ClientOptions {
+        let mut o = self;
+        o.proxy = p;
+        o.has_proxy = true;
+        return o;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Proxies
+// -----------------------------------------------------------------------------
+
+/// The HTTP proxies to use: one for http:// requests and one for https://
+/// ones (tunnelled with CONNECT), each "http://[user:password@]host[:port]"
+/// (or "host:port"; the port defaults to 80) or empty for none, and hosts
+/// to reach directly: NO_PROXY's comma-separated list of names ("example.com"
+/// also covers its subdomains; a leading "." or "*." is ignored), names
+/// with ":port", or "*" for all. localhost and loopback addresses are
+/// always reached directly.
+pub struct Proxy {
+    buf: strs.String,  // the http proxy, the https proxy, the exclusions
+    http_end: usize,
+    https_end: usize,
+
+    /// No proxy.
+    pub fn none() Proxy {
+        return Proxy.{ buf: strs.String.init(), http_end: 0, https_end: 0 };
+    }
+
+    /// Every request through the proxy at url.
+    pub fn to(url: []u8) !Proxy {
+        return Proxy.init(url, url, "");
+    }
+
+    /// The proxies for http:// and https:// requests ("" for none) and the
+    /// hosts to reach directly, as NO_PROXY lists them.
+    pub fn init(http_url: []u8, https_url: []u8, no_proxy: []u8) !Proxy {
+        if http_url.len > 0 {
+            _ = parse_proxy_url(http_url)!;
+        }
+        if https_url.len > 0 {
+            _ = parse_proxy_url(https_url)!;
+        }
+        let mut p = Proxy.none();
+        p.buf.push_str(http_url) catch |e| {
+            p.deinit();
+            return e;
+        };
+        p.http_end = p.buf.len;
+        p.buf.push_str(https_url) catch |e| {
+            p.deinit();
+            return e;
+        };
+        p.https_end = p.buf.len;
+        p.buf.push_str(no_proxy) catch |e| {
+            p.deinit();
+            return e;
+        };
+        return p;
+    }
+
+    /// The proxies the environment names: HTTP_PROXY, HTTPS_PROXY and
+    /// NO_PROXY (or their lower-case forms). HTTP_PROXY is ignored when
+    /// REQUEST_METHOD is set, in a CGI program, where a client's "Proxy:"
+    /// header would arrive as HTTP_PROXY ("httpoxy").
+    pub fn from_env() !Proxy {
+        let cgi = os.has_env("REQUEST_METHOD");
+        let mut h = env_either("HTTP_PROXY", "http_proxy")!;
+        defer mem.free(h);
+        if cgi {
+            h = h[..0];
+        }
+        let hs = env_either("HTTPS_PROXY", "https_proxy")!;
+        defer mem.free(hs);
+        let np = env_either("NO_PROXY", "no_proxy")!;
+        defer mem.free(np);
+        return Proxy.init(h, hs, np);
+    }
+
+    pub fn deinit(self: *mut Proxy) void {
+        self.buf.deinit();
+    }
+
+    /// The proxy a request for u goes through, or "" to go directly.
+    pub fn url_for(self: *Proxy, u: Url) []u8 {
+        let b = self.buf.bytes();
+        let mut p = b[..self.http_end];
+        if u.secure {
+            p = b[self.http_end..self.https_end];
+        }
+        if (p.len == 0) or is_loopback(u.hostname) or excluded(b[self.https_end..], u.hostname, u.port) {
+            return "";
+        }
+        return p;
+    }
+}
+
+fn env_either(upper: []u8, lower: []u8) ![]mut u8 {
+    return os.getenv(upper) catch |e| {
+        if e != error.NotFound {
+            return e;
+        }
+        return os.getenv(lower) catch |e2| {
+            if e2 != error.NotFound {
+                return e2;
+            }
+            return mem.alloc.[u8](0);
+        };
+    };
+}
+
+fn is_loopback(hostname: []u8) bool {
+    return strs.eq_ignore_case(hostname, "localhost") or strs.starts_with(hostname, "127.") or strs.eq(hostname, "::1");
+}
+
+// Whether NO_PROXY's list excludes hostname:port.
+fn excluded(list: []u8, hostname: []u8, port: u16) bool {
+    let mut it = strs.split(list, ",");
+    loop {
+        let piece = it.next() catch return false;
+        let mut e = strs.trim(piece);
+        if e.len == 0 {
+            continue;
+        }
+        if strs.eq(e, "*") {
+            return true;
+        }
+        let colon = strs.last_index_of_byte(e, ':') catch e.len;
+        if colon < e.len {
+            let want = fmt.parse_int.[u16](e[colon + 1..]) catch continue;
+            if want != port {
+                continue;
+            }
+            e = e[..colon];
+        }
+        e = strs.strip_prefix(e, "*") catch e;
+        e = strs.strip_prefix(e, ".") catch e;
+        if e.len == 0 {
+            continue;
+        }
+        if strs.eq_ignore_case(hostname, e) {
+            return true;
+        }
+        if (hostname.len > e.len) and (hostname[(hostname.len - e.len) - 1] == '.') and
+           strs.eq_ignore_case(hostname[hostname.len - e.len..], e) {
+            return true;
+        }
+    }
+}
+
+// A proxy's address and credentials.
+struct ProxyAddr {
+    hostname: []u8,
+    port: u16,
+    user: []u8,  // percent-encoded, as in the URL
+    password: []u8,
+    has_auth: bool,
+}
+
+fn parse_proxy_url(text: []u8) !ProxyAddr {
+    let t = text;
+    if not strs.contains(t, "://") {
+        // "[user:password@]host[:port][/]"
+        let mut rest = t;
+        if (rest.len > 0) and (rest[rest.len - 1] == '/') {
+            rest = rest[..rest.len - 1];
+        }
+        let mut a = ProxyAddr.{ hostname: "", port: 80, user: "", password: "", has_auth: false };
+        let at = strs.last_index_of_byte(rest, '@') catch rest.len;
+        if at < rest.len {
+            let info = rest[..at];
+            let c = strs.index_of_byte(info, ':') catch info.len;
+            a.user = info[..c];
+            a.password = info[@min(c + 1, info.len)..];
+            a.has_auth = true;
+            rest = rest[at + 1..];
+        }
+        let colon = strs.last_index_of_byte(rest, ':') catch rest.len;
+        if colon < rest.len {
+            a.port = fmt.parse_int.[u16](rest[colon + 1..]) catch return error.BadUrl;
+            rest = rest[..colon];
+        }
+        if rest.len == 0 {
+            return error.BadUrl;
+        }
+        for ch in rest {
+            if not (strs.is_alnum(ch) or (ch == '-') or (ch == '.')) {
+                return error.BadUrl;
+            }
+        }
+        a.hostname = rest;
+        return a;
+    }
+    let u = urls.parse(t) catch return error.BadUrl;
+    if not strs.eq_ignore_case(u.scheme, "http") {
+        return error.Unsupported;  // https:// proxies (TLS to the proxy) are not spoken
+    }
+    if not u.has_authority or (u.hostname.len == 0) or u.ip_literal {
+        return error.BadUrl;
+    }
+    let mut port: u16 = 80;
+    if u.has_port {
+        port = u.port_number() catch return error.BadUrl;
+    }
+    let mut a = ProxyAddr.{ hostname: u.hostname, port: port, user: "", password: "", has_auth: u.has_userinfo };
+    if u.has_userinfo {
+        a.user = u.username();
+        a.password = u.password() catch "";
+    }
+    return a;
 }
 
 // The configuration for https:// by default, trusting the system's roots,
@@ -1690,10 +1943,13 @@ pub fn no_headers() []Header {
     return @slice_from_ptr(@ptr_from_int(*Header, 8), 0);
 }
 
-/// Sends one request on a new connection and reads the whole response.
-/// Host, Content-Length and "Connection: close" are added.
+/// Sends a request and reads the whole response, following redirects
+/// (opts.max_redirects) and keeping cookies (opts.with_cookies). Each
+/// request goes on a new connection; Host, Content-Length and
+/// "Connection: close" are added. A redirect to another origin drops the
+/// Authorization, Cookie and Proxy-Authorization headers given here; a 303
+/// (or a 301 or 302 answering a POST) is followed with a GET and no body.
 pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: ClientOptions) !ClientResponse {
-    let u = parse_url(url)!;
     // nothing a caller passes may change the request's framing
     if method.len == 0 {
         return error.InvalidArgument;
@@ -1719,13 +1975,187 @@ pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: Cli
             }
         }
     }
-    let tcp = net.connect(u.hostname, u.port)!;
+    let mut cur = strs.String.init();
+    defer cur.deinit();
+    cur.push_str(url)!;
+    let mut m = method;
+    let mut b = body;
+    let mut sensitive = true;  // Authorization and Cookie headers still go along
+    let mut hops: u32 = 0;
+    loop {
+        let u = parse_url(cur.bytes())!;
+        let mut resp = exchange(m, u, headers, b, opts, sensitive)!;
+        let st = resp.status;
+        let redirect = (st == 301) or (st == 302) or (st == 303) or (st == 307) or (st == 308);
+        if (hops >= opts.max_redirects) or not redirect {
+            return resp;
+        }
+        let loc = resp.header("Location") catch return resp;
+        let next = urls.join(cur.bytes(), loc) catch |e| {
+            if e == error.OutOfMemory {
+                resp.deinit();
+                return e;
+            }
+            return resp;  // a Location that is no URL: the 3xx is the answer
+        };
+        let nu = parse_url(next) catch {
+            mem.free(next);
+            return resp;  // not http(s)
+        };
+        if not (strs.eq_ignore_case(nu.hostname, u.hostname) and (nu.port == u.port) and (nu.secure == u.secure)) {
+            sensitive = false;
+        }
+        if ((st == 303) and not strs.eq(m, "HEAD")) or (((st == 301) or (st == 302)) and strs.eq(m, "POST")) {
+            m = "GET";
+            b = "";
+        }
+        resp.deinit();
+        cur.clear();
+        cur.push_str(next) catch |e| {
+            mem.free(next);
+            return e;
+        };
+        mem.free(next);
+        hops += 1;
+    }
+}
+
+// One request of request(): the headers for this hop, cookies in and out.
+fn exchange(method: []u8, u: Url, headers: []Header, body: []u8, opts: ClientOptions, sensitive: bool) !ClientResponse {
+    let mut hs = vec.Vec.[Header].init();
+    defer hs.deinit();
+    let mut ck = strs.String.init();
+    defer ck.deinit();
+    for x in headers {
+        let is_cookie = strs.eq_ignore_case(x.name, "Cookie");
+        if not sensitive and
+           (is_cookie or strs.eq_ignore_case(x.name, "Authorization") or
+            strs.eq_ignore_case(x.name, "Proxy-Authorization")) {
+            continue;
+        }
+        if is_cookie and opts.has_jar {
+            if ck.len > 0 {
+                ck.push_str("; ")!;
+            }
+            ck.push_str(x.value)!;
+            continue;
+        }
+        hs.push(x)!;
+    }
+    let path = target_path(u.target);
+    if opts.has_jar {
+        let jc = opts.jar.header_alloc(u.hostname, path, u.secure, time.now())!;
+        defer mem.free(jc);
+        if (jc.len > 0) and (ck.len > 0) {
+            ck.push_str("; ")!;
+        }
+        ck.push_str(jc)!;
+    }
+    if ck.len > 0 {
+        hs.push(Header.{ name: "Cookie", value: ck.bytes() })!;
+    }
+    let mut resp = request_once(method, u, hs.items(), body, opts)!;
+    if opts.has_jar {
+        let now = time.now();
+        for x in resp.headers {
+            if strs.eq_ignore_case(x.name, "Set-Cookie") {
+                opts.jar.set_cookie(u.hostname, path, u.secure, x.value, now) catch |e| {
+                    resp.deinit();
+                    return e;
+                };
+            }
+        }
+    }
+    return resp;
+}
+
+// The path of a request target, without its query.
+fn target_path(target: []u8) []u8 {
+    let q = strs.index_of_byte(target, '?') catch target.len;
+    return target[..q];
+}
+
+// "Basic base64(user:password)" for a proxy's credentials, in buf.
+fn proxy_basic_auth(pa: ProxyAddr, buf: []mut u8) ![]u8 {
+    let mut raw: [384]u8 = [0; 384];
+    let user = urls.percent_decode(pa.user, raw[..256], false) catch return error.BadUrl;
+    if (user.len + 1) > 256 {
+        return error.BadUrl;
+    }
+    raw[user.len] = ':';
+    let pw = urls.percent_decode(pa.password, raw[user.len + 1..], false) catch return error.BadUrl;
+    let cred = raw[..(user.len + 1) + pw.len];
+    if (6 + base64.encoded_len(cred.len)) > buf.len {
+        return error.BadUrl;
+    }
+    @mem_copy(buf[..6], "Basic ");
+    let enc = base64.encode(cred, buf[6..], base64.STANDARD);
+    return buf[..6 + enc.len];
+}
+
+// Asks the proxy on tcp for a tunnel to u's host and port (CONNECT) and
+// reads its answer, a byte at a time so as to read nothing beyond it.
+fn connect_tunnel(tcp: net.TcpStream, u: Url, auth: []u8) !void {
+    let mut h = strs.String.init();
+    defer h.deinit();
+    fmt.write(h.writer(), "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n", [fmt.str(u.hostname), fmt.int(u.port),
+                                                                        fmt.str(u.hostname), fmt.int(u.port)])!;
+    if auth.len > 0 {
+        fmt.write(h.writer(), "Proxy-Authorization: {}\r\n", [fmt.str(auth)])!;
+    }
+    h.push_str("\r\n")!;
+    tcp.write_all(h.bytes())!;
+    let mut head: [8192]u8 = [0; 8192];
+    let mut n: usize = 0;
+    loop {
+        if n == head.len {
+            return error.BadResponse;
+        }
+        if tcp.read(head[n..n + 1])! == 0 {
+            return error.BadResponse;
+        }
+        n += 1;
+        if (n >= 4) and strs.eq(head[n - 4..n], "\r\n\r\n") {
+            break;
+        }
+    }
+    let status = parse_status(head[..n])!;
+    if (status < 200) or (status > 299) {
+        return error.ProxyRefused;
+    }
+}
+
+fn request_once(method: []u8, u: Url, headers: []Header, body: []u8, opts: ClientOptions) !ClientResponse {
+    let mut via: []u8 = "";
+    if opts.has_proxy {
+        via = opts.proxy.url_for(u);
+    }
+    let proxied = via.len > 0;
+    let mut abuf: [512]u8 = [0; 512];
+    let mut pauth: []u8 = "";
+    let mut tcp_host = u.hostname;
+    let mut tcp_port = u.port;
+    if proxied {
+        let pa = parse_proxy_url(via)!;
+        if pa.has_auth {
+            pauth = proxy_basic_auth(pa, abuf[..])!;
+        }
+        tcp_host = pa.hostname;
+        tcp_port = pa.port;
+    }
+    let tcp = net.connect(tcp_host, tcp_port)!;
     tcp.set_timeout(opts.timeout_ms) catch |e| {
         tcp.close();
         return e;
     };
+    if proxied and u.secure {
+        connect_tunnel(tcp, u, pauth) catch |e| {
+            tcp.close();
+            return e;
+        };
+    }
     let mut stream = Transport.plain(tcp);
-    let mut use_h2 = opts.http2 and not u.secure;
+    let mut use_h2 = opts.http2 and not u.secure and not proxied;
     if u.secure {
         let mut cfg = opts.tls_config;
         if not opts.has_tls_config {
@@ -1750,9 +2180,21 @@ pub fn request(method: []u8, url: []u8, headers: []Header, body: []u8, opts: Cli
     let mut h = strs.String.init();
     defer h.deinit();
     let w = h.writer();
-    fmt.write(w, "{} {} HTTP/1.1\r\nHost: {}", [fmt.str(method), fmt.str(u.target), fmt.str(u.hostname)])!;
+    let mut hostport = strs.String.init();
+    defer hostport.deinit();
+    hostport.push_str(u.hostname)!;
     if ((u.port != 80) and not u.secure) or ((u.port != 443) and u.secure) {
-        fmt.write(w, ":{}", [fmt.int(u.port)])!;
+        fmt.write(hostport.writer(), ":{}", [fmt.int(u.port)])!;
+    }
+    if proxied and not u.secure {
+        // to a proxy, the absolute form of the target
+        fmt.write(w, "{} http://{}{} HTTP/1.1\r\nHost: {}", [fmt.str(method), fmt.str(hostport.bytes()),
+                                                             fmt.str(u.target), fmt.str(hostport.bytes())])!;
+        if pauth.len > 0 {
+            fmt.write(w, "\r\nProxy-Authorization: {}", [fmt.str(pauth)])!;
+        }
+    } else {
+        fmt.write(w, "{} {} HTTP/1.1\r\nHost: {}", [fmt.str(method), fmt.str(u.target), fmt.str(hostport.bytes())])!;
     }
     h.push_str("\r\nConnection: close\r\n")!;
     if (body.len > 0) or @mem_eq(method, "POST") or @mem_eq(method, "PUT") {
@@ -2290,4 +2732,209 @@ test "HTTP/2 over TLS" {
     out.deinit();
     srv.stop();
     th.join();
+}
+
+fn t_login(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    res.set_status(302);
+    res.header("Location", "/home?x=1")!;
+    res.header("Set-Cookie", "sid=xyz; Path=/; HttpOnly")!;
+    res.header("Set-Cookie", "theme=dark")!;  // path /, from "/login"
+}
+
+fn t_home(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    fmt.write(res.writer(), "cookie={}", [fmt.str(req.header("Cookie") catch "none")])!;
+}
+
+fn t_see_other(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    res.set_status(303);
+    res.header("Location", "method")!;
+}
+
+fn t_method(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    fmt.write(res.writer(), "{} {}", [fmt.str(req.method), fmt.int(req.body.len)])!;
+}
+
+fn t_loop(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    res.set_status(302);
+    res.header("Location", "/loop")!;
+}
+
+fn t_temporary(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    res.set_status(307);
+    let loc = fmt.bufprint(req.scratch.alloc(300)!, "http://{}/method", [fmt.str(req.header("Host")!)])!;
+    res.header("Location", loc)!;
+}
+
+test "redirects and cookies" {
+    let mut app = TestApp.{ hits: 0 };
+    let mut r = Router.[TestApp].init(&mut app);
+    defer r.deinit();
+    r.get("/login", t_login)!;
+    r.get("/home", t_home)!;
+    r.post("/see", t_see_other)!;
+    r.get("/method", t_method)!;
+    r.post("/method", t_method)!;
+    r.get("/loop", t_loop)!;
+    r.post("/temporary", t_temporary)!;
+    let mut opts = Options.default();
+    opts.threads = 2;
+    let mut srv = server("127.0.0.1", 0, Router.[TestApp].handle, &mut r, opts)!;
+    let port = srv.port();
+    let th = thread.spawn(t_run, &mut srv)!;
+    let mut url: [128]u8 = [0; 128];
+
+    let mut jar = cookie.Jar.init();
+    defer jar.deinit();
+    let copts = ClientOptions.default().with_cookies(&mut jar);
+    let mut a = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/login", [fmt.int(port)])!, no_headers(), "",
+                        copts)!;
+    @expect_eq(a.status, 200);
+    @expect_eq(a.body, "cookie=sid=xyz; theme=dark");
+    a.deinit();
+    @expect_eq(jar.len(), 2);
+    // a Cookie header of the caller's goes first
+    let hs: [1]Header = [Header.{ name: "Cookie", value: "mine=1" }];
+    let mut a2 = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/home", [fmt.int(port)])!, hs[..], "",
+                         copts)!;
+    @expect_eq(a2.body, "cookie=mine=1; sid=xyz; theme=dark");
+    a2.deinit();
+    // without following
+    let mut b = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/login", [fmt.int(port)])!, no_headers(), "",
+                        ClientOptions.default().with_redirects(0))!;
+    @expect_eq(b.status, 302);
+    @expect_eq(b.header("Location")!, "/home?x=1");
+    b.deinit();
+    // 303 turns a POST into a GET; 307 keeps it
+    let mut c = request("POST", fmt.bufprint(url[..], "http://127.0.0.1:{}/see", [fmt.int(port)])!, no_headers(),
+                        "body", ClientOptions.default())!;
+    @expect_eq(c.body, "GET 0");
+    c.deinit();
+    let mut d = request("POST", fmt.bufprint(url[..], "http://127.0.0.1:{}/temporary", [fmt.int(port)])!, no_headers(),
+                        "body", ClientOptions.default())!;
+    @expect_eq(d.body, "POST 4");
+    d.deinit();
+    // a loop ends with the last redirect
+    let mut e = request("GET", fmt.bufprint(url[..], "http://127.0.0.1:{}/loop", [fmt.int(port)])!, no_headers(), "",
+                        ClientOptions.default().with_redirects(3))!;
+    @expect_eq(e.status, 302);
+    e.deinit();
+    srv.stop();
+    th.join();
+}
+
+struct FakeProxy {
+    l: net.TcpListener,
+    tls_cfg: *tls.ServerConfig,
+    tunnel: bool,
+    head: [2048]u8,
+    head_len: usize,
+}
+
+fn read_head_bytes(r: io.Reader, buf: []mut u8) usize {
+    let mut n: usize = 0;
+    while n < buf.len {
+        let k = r.read(buf[n..n + 1]) catch return n;
+        if k == 0 {
+            return n;
+        }
+        n += 1;
+        if (n >= 4) and strs.eq(buf[n - 4..n], "\r\n\r\n") {
+            return n;
+        }
+    }
+    return n;
+}
+
+fn fake_proxy_run(p: *mut FakeProxy) void {
+    let mut s = p.l.accept() catch @trap();
+    p.head_len = read_head_bytes(s.reader(), p.head[..]);
+    if p.tunnel {
+        s.write_all("HTTP/1.1 200 Connection established\r\n\r\n") catch @trap();
+        let c = tls.server(s, p.tls_cfg) catch @trap();
+        let mut inner: [2048]u8 = [0; 2048];
+        let r = io.Reader.{ ctx: @ptr_cast(*mut void, c), read_fn: tls_conn_read };
+        _ = read_head_bytes(r, inner[..]);
+        c.write_all("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntunnel") catch @trap();
+        c.close();
+        return;
+    }
+    let mut out = strs.String.init();
+    defer out.deinit();
+    fmt.write(
+        out.writer(), "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", [
+            fmt.int(p.head_len), fmt.str(p.head[..p.head_len])]) catch @trap();
+    s.write_all(out.bytes()) catch @trap();
+    s.close();
+}
+
+fn tls_conn_read(ctx: *mut void, buf: []mut u8) !usize {
+    let c = @ptr_cast(*mut tls.Conn, ctx);
+    return c.read(buf);
+}
+
+test "proxies" {
+    // which requests go through which proxy
+    let mut p = Proxy.init("http://px:3128", "px2:8080", "internal.example, .corp.test,  b.test:8443")!;
+    defer p.deinit();
+    @expect_eq(p.url_for(parse_url("http://example.com/")!), "http://px:3128");
+    @expect_eq(p.url_for(parse_url("https://example.com/")!), "px2:8080");
+    @expect_eq(p.url_for(parse_url("http://internal.example/")!), "");
+    @expect_eq(p.url_for(parse_url("http://a.internal.example/")!), "");
+    @expect_eq(p.url_for(parse_url("http://notinternal.example/")!), "http://px:3128");
+    @expect_eq(p.url_for(parse_url("http://x.corp.test/")!), "");
+    @expect_eq(p.url_for(parse_url("https://b.test:8443/")!), "");
+    @expect_eq(p.url_for(parse_url("https://b.test/")!), "px2:8080");
+    @expect_eq(p.url_for(parse_url("http://localhost:8080/")!), "");
+    @expect_eq(p.url_for(parse_url("http://127.0.0.1/")!), "");
+    let mut all = Proxy.init("http://px", "", "*")!;
+    defer all.deinit();
+    @expect_eq(all.url_for(parse_url("http://example.com/")!), "");
+    @expect(fails(Proxy.to("https://secure-proxy:443")));
+    @expect(fails(Proxy.to("http://")));
+    @expect(fails(Proxy.to("bad host:1")));
+    let a = parse_proxy_url("http://us%40er:p%3Ass@px:3128")!;
+    @expect_eq(a.port, 3128);
+    let mut ab: [128]u8 = [0; 128];
+    @expect_eq(proxy_basic_auth(a, ab[..])!, "Basic dXNAZXI6cDpzcw==");  // base64("us@er:p:ss")
+    let b = parse_proxy_url("user:pass@px")!;
+    @expect(b.has_auth and (b.port == 80));
+    @expect_eq(proxy_basic_auth(b, ab[..])!, "Basic dXNlcjpwYXNz");
+
+    // http:// through a proxy: the absolute form, with credentials
+    let mut fp = FakeProxy.{ l: net.listen("127.0.0.1", 0)!, tls_cfg: @ptr_from_int(*tls.ServerConfig, 8),
+                             tunnel: false, head: [0; 2048], head_len: 0 };
+    let mut pu: [64]u8 = [0; 64];
+    let mut px = Proxy.to(fmt.bufprint(pu[..], "http://user:pass@127.0.0.1:{}", [fmt.int(fp.l.port())])!)!;
+    defer px.deinit();
+    let th = thread.spawn(fake_proxy_run, &mut fp)!;
+    let mut r = request("GET", "http://example.test:81/x?y=1", no_headers(), "",
+                        ClientOptions.default().with_proxy(&px))!;
+    th.join();
+    fp.l.close();
+    @expect(strs.starts_with(r.body, "GET http://example.test:81/x?y=1 HTTP/1.1\r\nHost: example.test:81\r\n"));
+    @expect(strs.contains(r.body, "\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    r.deinit();
+
+    // https:// through a tunnel (the fake proxy is the TLS server too)
+    let cert = tls.test_certificate_pem()!;
+    defer mem.free(cert);
+    let key = tls.test_key_pem()!;
+    defer mem.free(key);
+    let mut scfg = tls.ServerConfig.from_pem(cert, key)!;
+    defer scfg.deinit();
+    let mut fp2 = FakeProxy.{ l: net.listen("127.0.0.1", 0)!, tls_cfg: &scfg, tunnel: true, head: [0; 2048],
+                              head_len: 0 };
+    let mut px2 = Proxy.to(fmt.bufprint(pu[..], "127.0.0.1:{}", [fmt.int(fp2.l.port())])!)!;
+    defer px2.deinit();
+    let mut ccfg = tls.ClientConfig.insecure();
+    defer ccfg.deinit();
+    let th2 = thread.spawn(fake_proxy_run, &mut fp2)!;
+    let mut t = request("GET", "https://tunnelled.test/", no_headers(), "",
+                        ClientOptions.default().with_proxy(&px2).with_tls(&ccfg))!;
+    th2.join();
+    fp2.l.close();
+    @expect_eq(t.body, "tunnel");
+    @expect(strs.starts_with(fp2.head[..fp2.head_len],
+                             "CONNECT tunnelled.test:443 HTTP/1.1\r\nHost: tunnelled.test:443\r\n"));
+    t.deinit();
 }
