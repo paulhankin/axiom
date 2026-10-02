@@ -576,8 +576,18 @@ fn kbool(b: bool) *mut ir.Value {
     return ir.cint(ir.t_int(1), 0);
 }
 
+// Comparisons made up as keys for facts and queries: a pool that each run
+// of gvn starts again (the table they go in is cleared too).
+let mut synth: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                 cap: 0 };
+let mut n_synth: usize = 0;
+
 fn synth_icmp(p: i32, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
-    let v = u.new.[ir.Value]();
+    if n_synth == synth.len {
+        synth.push(u.new.[ir.Value]());
+    }
+    let v = synth.get(n_synth);
+    n_synth += 1;
     v.kind = ir.V_INST;
     v.op = ir.OP_ICMP;
     v.ty = ir.t_int(1);
@@ -953,18 +963,20 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
     } else if (op == ir.OP_ADD) and small_k(x.b) and (kv(x.b) < 0x1_0000_0000) {
         // no wrap when the bound stays below the type's maximum
         let a = ub(x.a, depth + 1);
-        if (a >= 0) and fits_type(a + kv(x.b), x.ty) {
+        if (a >= 0) and (kv(x.b) >= 0) and (a <= 0x7FFF_FFFF_FFFF_FFFF - kv(x.b)) and fits_type(a + kv(x.b), x.ty) {
             d = a + kv(x.b);
         }
     } else if op == ir.OP_ADD {
         let a = ub(x.a, depth + 1);
         let b = ub(x.b, depth + 1);
-        if (a >= 0) and (b >= 0) and fits_type(a + b, x.ty) {
+        if (a >= 0) and (b >= 0) and (a <= 0x7FFF_FFFF_FFFF_FFFF - b) and fits_type(a + b, x.ty) {
             d = a + b;
         }
     } else if (op == ir.OP_MUL) and small_k(x.b) and (kv(x.b) < 0x1_0000_0000) {
         let a = ub(x.a, depth + 1);
-        if (a >= 0) and (a < 0x1_0000_0000) and fits_type(a * kv(x.b), x.ty) {
+        // (both under 2^32, the product may still pass 2^63)
+        if (a >= 0) and (a < 0x1_0000_0000) and (kv(x.b) > 0) and (a <= 0x7FFF_FFFF_FFFF_FFFF / kv(x.b)) and
+           fits_type(a * kv(x.b), x.ty) {
             d = a * kv(x.b);
         }
     } else if (op == ir.OP_SHL) and cb.is_k(x.b) and (ir.cint_val(x.b) < 32) {
@@ -1317,6 +1329,7 @@ pub fn gvn(f: *mut ir.Func) bool {
     }
     ents.clear();
     writes.clear();
+    n_synth = 0;
     escapes(f);
     walk(order.get(0));
     u.free(@ptr_cast(*mut void, order.data));

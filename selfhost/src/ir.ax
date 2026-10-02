@@ -42,6 +42,7 @@ pub struct Ty {
     name: []u8,
     has_body: bool,
     id: i32,
+    undef_v: *mut Value,  // the type's undef (made on first use, shared)
 }
 
 pub let mut ptr_bytes: u64 = 8;
@@ -55,7 +56,7 @@ let mut derived: u.SymMap.[*mut Ty] = u.SymMap.[*mut Ty].{ keys: @ptr_from_int(*
                                                            vals: @ptr_from_int(*mut *mut Ty, 0), cap: 0, len: 0 };
 
 fn new_ty(k: i32) *mut Ty {
-    let t = u.new.[Ty]();
+    let t = u.perm_new.[Ty]();
     t.kind = k;
     ty_count += 1;
     t.id = ty_count;
@@ -158,7 +159,7 @@ pub fn t_array(el: *mut Ty, n: u64) *mut Ty {
 
 fn layout_struct(t: *mut Ty) void {
     let n = t.fields.len;
-    t.offs = u.newn.[u64](n + 1);
+    t.offs = u.perm_newn.[u64](n + 1);
     let mut off: u64 = 0;
     let mut al: u64 = 1;
     for i in 0..n {
@@ -189,7 +190,7 @@ pub fn t_struct(fields: []mut *mut Ty) *mut Ty {
         return found;
     }
     let t = new_ty(T_STRUCT);
-    let fs = u.newn.[*mut Ty](fields.len + 1);
+    let fs = u.perm_newn.[*mut Ty](fields.len + 1);
     for i in 0..fields.len {
         fs[i] = fields[i];
     }
@@ -201,13 +202,13 @@ pub fn t_struct(fields: []mut *mut Ty) *mut Ty {
 
 pub fn t_named_struct(name: []u8) *mut Ty {
     let t = new_ty(T_STRUCT);
-    t.name = u.dup(name);
+    t.name = u.perm_dup(name);
     t.align = 1;
     return t;
 }
 
 pub fn struct_set_body(t: *mut Ty, fields: []mut *mut Ty) void {
-    let fs = u.newn.[*mut Ty](fields.len + 1);
+    let fs = u.perm_newn.[*mut Ty](fields.len + 1);
     for i in 0..fields.len {
         fs[i] = fields[i];
     }
@@ -218,7 +219,7 @@ pub fn struct_set_body(t: *mut Ty, fields: []mut *mut Ty) void {
 pub fn t_fn(rt: *mut Ty, params: []mut *mut Ty, vararg: bool) *mut Ty {
     let t = new_ty(T_FN);
     t.ret = rt;
-    let ps = u.newn.[*mut Ty](params.len + 1);
+    let ps = u.perm_newn.[*mut Ty](params.len + 1);
     for i in 0..params.len {
         ps[i] = params[i];
     }
@@ -616,10 +617,100 @@ pub fn sval(v: *Value) i64 {
     return @bit_cast(i64, v.cv << sh) >> sh;
 }
 
+// Integer constants are shared: one Value per type and value, in permanent
+// memory. Nothing changes a constant once made (passes and backends write
+// their scratch fields on instructions only), and folding makes them by the
+// million.
+struct CintTable {
+    tys: *mut usize,
+    vals: *mut u64,
+    cs: *mut *mut Value,
+    cap: usize,
+    len: usize,
+}
+
+let mut CINTS: CintTable = CintTable.{ tys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                       cs: @ptr_from_int(*mut *mut Value, 0), cap: 0, len: 0 };
+
+fn cint_slot(tys: []usize, vals: []u64, t: usize, v: u64) usize {
+    let mask = tys.len - 1;
+    let mut j = @truncate(usize, ((@as(u64, t) *% 0x9E3779B97F4A7C15) ^ (v *% 0xC2B2AE3D27D4EB4F)) >> 17) & mask;
+    while (tys[j] != 0) and not ((tys[j] == t) and (vals[j] == v)) {
+        j = (j + 1) & mask;
+    }
+    return j;
+}
+
+fn cint_grow() void {
+    let mut n: usize = 4096;
+    if CINTS.cap != 0 {
+        n = CINTS.cap * 2;
+    }
+    let tys = u.calloc_slice.[usize](n);
+    let vals = u.calloc_slice.[u64](n);
+    let cs = u.calloc_slice.[*mut Value](n);
+    let ot = @slice_from_ptr(CINTS.tys, CINTS.cap);
+    let ov = @slice_from_ptr(CINTS.vals, CINTS.cap);
+    let oc = @slice_from_ptr(CINTS.cs, CINTS.cap);
+    for k in 0..CINTS.cap {
+        if ot[k] != 0 {
+            let j = cint_slot(tys, vals, ot[k], ov[k]);
+            tys[j] = ot[k];
+            vals[j] = ov[k];
+            cs[j] = oc[k];
+        }
+    }
+    u.free_slice.[usize](ot);
+    u.free_slice.[u64](ov);
+    u.free_slice.[*mut Value](oc);
+    CINTS.tys = tys.ptr;
+    CINTS.vals = vals.ptr;
+    CINTS.cs = cs.ptr;
+    CINTS.cap = n;
+}
+
 pub fn cint(t: *mut Ty, v: u64) *mut Value {
-    let c = new_val(V_CINT, t);
-    c.cv = v & mask_bits(t.bits);
+    let x = v & mask_bits(t.bits);
+    if (CINTS.len + 1) * 2 > CINTS.cap {
+        cint_grow();
+    }
+    let tys = @slice_from_ptr(CINTS.tys, CINTS.cap);
+    let vals = @slice_from_ptr(CINTS.vals, CINTS.cap);
+    let cs = @slice_from_ptr(CINTS.cs, CINTS.cap);
+    let key = @int_from_ptr(t);
+    let j = cint_slot(tys, vals, key, x);
+    if tys[j] != 0 {
+        return cs[j];
+    }
+    // (shared by every function: outside any scratch scope)
+    let c = u.perm_new.[Value]();
+    c.kind = V_CINT;
+    c.ty = t;
+    c.cv = x;
+    tys[j] = key;
+    vals[j] = x;
+    cs[j] = c;
+    CINTS.len += 1;
     return c;
+}
+
+// Debugging (AXIOM_CHECK_CINTS): that no constant was changed.
+pub fn check_cints() void {
+    let tys = @slice_from_ptr(CINTS.tys, CINTS.cap);
+    let vals = @slice_from_ptr(CINTS.vals, CINTS.cap);
+    let cs = @slice_from_ptr(CINTS.cs, CINTS.cap);
+    let mut bad: usize = 0;
+    for k in 0..CINTS.cap {
+        if tys[k] == 0 {
+            continue;
+        }
+        let c = cs[k];
+        if (c.kind != V_CINT) or (@int_from_ptr(c.ty) != tys[k]) or (c.cv != vals[k]) or u.notnil(c.fwd) or
+           u.notnil(c.a) or (c.xs.len != 0) or u.notnil(c.blk) or u.notnil(c.next) {
+            bad += 1;
+        }
+    }
+    u.eprint(u.f2("cints: %s, changed: %s\n", u.zdec(CINTS.len), u.zdec(bad)));
 }
 
 pub fn ci32(v: u64) *mut Value {
@@ -655,8 +746,15 @@ pub fn cones(t: *mut Ty) *mut Value {
     return cint(t, 0xFFFF_FFFF_FFFF_FFFF);
 }
 
+// One undef per type, shared as integer constants are.
 pub fn undef(t: *mut Ty) *mut Value {
-    return new_val(V_UNDEF, t);
+    if u.isnil(t.undef_v) {
+        let v = u.perm_new.[Value]();
+        v.kind = V_UNDEF;
+        v.ty = t;
+        t.undef_v = v;
+    }
+    return t.undef_v;
 }
 
 pub fn cagg(t: *mut Ty, xs: []mut *mut Value) *mut Value {

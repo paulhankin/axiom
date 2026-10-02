@@ -185,7 +185,7 @@ types share a module.
 
 | Module | C source | What |
 |---|---|---|
-| `util.ax` | `util.c` | libc bindings, arena, `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
+| `util.ax` | `util.c` | libc bindings, arenas (permanent, and per-function scratch the backends release), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
 | `diag.ax` | `diag.c` | diagnostics, human and agent-json output |
 | `lexer.ax` | `lexer.c` | tokens |
 | `ast.ax` | `ast.h`, `types.h`, `builtins.h` | syntax tree, semantic types, builtin table |

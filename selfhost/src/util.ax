@@ -86,28 +86,183 @@ pub fn die(msg: []u8) void {
 }
 
 // -----------------------------------------------------------------------------
-// Arena: zeroed, 16-byte aligned, never freed.
+// Arenas: memory zeroed and 16-byte aligned. Allocations live for the whole
+// run, except inside a scratch scope (scratch_begin .. scratch_end), where
+// they come from a second arena that the end of the scope takes back: the
+// backends compile each function in one, since their per-function data
+// (machine code, live ranges, ...) is dead once its bytes are out. What must
+// outlive a scope (interned strings, shared constants, types) comes from
+// perm_alloc. With AXIOM_POISON set, released memory is filled with 0xA5
+// and never reused, so anything still pointing into it shows.
 // -----------------------------------------------------------------------------
-let mut arena_cur: usize = 0;
-let mut arena_end: usize = 0;
+struct Arena {
+    cur: usize,
+    end: usize,
+    chunks: *mut usize,  // (base, size, used) per chunk
+    nchunks: usize,
+    cap: usize,
+    at: usize,  // the chunk in use
+}
 
-pub fn alloc(size0: usize) *mut u8 {
-    let size = (size0 + 15) & ~15;
-    if (arena_end - arena_cur) < size {
-        let mut bs: usize = 1048576;
-        if size > bs {
-            bs = size;
+let mut main_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0 };
+let mut scratch_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0,
+                                       at: 0 };
+let mut scratch_depth: i32 = 0;
+let mut poison: i32 = -1;  // unknown, no, yes
+
+const CHUNK: usize = 1048576;
+
+fn chunk_slice(a: *mut Arena) []mut usize {
+    return @slice_from_ptr(a.chunks, a.cap * 3);
+}
+
+// Moves to the next chunk with room for `size` (keeping the old ones of
+// the scratch arena to reuse), or a new one.
+fn next_chunk(a: *mut Arena, size: usize, keep: bool) void {
+    if keep and (a.nchunks != 0) {
+        let cs = chunk_slice(a);
+        cs[(a.at * 3) + 2] = a.cur - cs[a.at * 3];
+        let mut k = a.at + 1;
+        while k < a.nchunks {
+            if cs[(k * 3) + 1] >= size {
+                a.at = k;
+                a.cur = cs[k * 3];
+                a.end = a.cur + cs[(k * 3) + 1];
+                return;
+            }
+            k += 1;
         }
-        let p = calloc(1, bs);
-        if isvnil(p) {
+    }
+    let mut bs = CHUNK;
+    if size > bs {
+        bs = size;
+    }
+    let p = calloc(1, bs);
+    if isvnil(p) {
+        die("out of memory");
+    }
+    if a.nchunks == a.cap {
+        let mut nc: usize = 64;
+        if a.cap != 0 {
+            nc = a.cap * 2;
+        }
+        let q = realloc(@ptr_cast(*mut void, a.chunks), nc * 3 * @size_of(usize));
+        if isvnil(q) {
             die("out of memory");
         }
-        arena_cur = @int_from_ptr(p);
-        arena_end = arena_cur + bs;
+        a.chunks = @ptr_cast(*mut usize, q);
+        a.cap = nc;
     }
-    let r = arena_cur;
-    arena_cur += size;
+    let cs = chunk_slice(a);
+    // (a new chunk goes last; the scratch arena's are reused in order)
+    if keep and (a.nchunks != 0) {
+        cs[(a.at * 3) + 2] = a.cur - cs[a.at * 3];
+    }
+    cs[a.nchunks * 3] = @int_from_ptr(p);
+    cs[(a.nchunks * 3) + 1] = bs;
+    cs[(a.nchunks * 3) + 2] = 0;
+    a.at = a.nchunks;
+    a.nchunks += 1;
+    a.cur = @int_from_ptr(p);
+    a.end = a.cur + bs;
+}
+
+fn arena_alloc(a: *mut Arena, size0: usize, keep: bool) *mut u8 {
+    let size = (size0 + 15) & ~15;
+    if (a.end - a.cur) < size {
+        next_chunk(a, size, keep);
+    }
+    let r = a.cur;
+    a.cur += size;
     return @ptr_from_int(*mut u8, r);
+}
+
+pub fn alloc(size0: usize) *mut u8 {
+    if scratch_depth > 0 {
+        return arena_alloc(&mut scratch_arena, size0, true);
+    }
+    return arena_alloc(&mut main_arena, size0, false);
+}
+
+// Memory that outlives any scratch scope.
+pub fn perm_alloc(size0: usize) *mut u8 {
+    return arena_alloc(&mut main_arena, size0, false);
+}
+
+pub fn perm_new[T]() *mut T {
+    return @ptr_cast(*mut T, perm_alloc(@size_of(T)));
+}
+
+pub fn perm_newn[T](n: usize) []mut T {
+    let p = perm_alloc(n * @size_of(T) + 1);
+    return @slice_from_ptr(@ptr_cast(*mut T, p), n);
+}
+
+pub fn scratch_begin() void {
+    scratch_depth += 1;
+}
+
+// Ends a scratch scope; the outermost one releases everything allocated
+// in it.
+pub fn scratch_end() void {
+    scratch_depth -= 1;
+    if scratch_depth > 0 {
+        return;
+    }
+    let a = &mut scratch_arena;
+    if a.nchunks == 0 {
+        return;
+    }
+    if poison < 0 {
+        poison = 0;
+        if not isnos(env("AXIOM_POISON")) {
+            poison = 1;
+        }
+    }
+    let cs = chunk_slice(a);
+    cs[(a.at * 3) + 2] = a.cur - cs[a.at * 3];
+    if poison == 1 {
+        // never reused: a stale pointer reads 0xA5s
+        for k in 0..a.nchunks {
+            let used = cs[(k * 3) + 2];
+            if used != 0 {
+                @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, cs[k * 3]), used), 0xA5);
+            }
+        }
+        a.nchunks = 0;
+        a.cur = 0;
+        a.end = 0;
+        a.at = 0;
+        return;
+    }
+    // zero what was used and start again at the first chunk; chunks bigger
+    // than the standard size go back to the system
+    let mut kept: usize = 0;
+    for k in 0..a.nchunks {
+        let base = cs[k * 3];
+        let size = cs[(k * 3) + 1];
+        let used = cs[(k * 3) + 2];
+        if size > CHUNK {
+            free(@ptr_from_int(*mut void, base));
+            continue;
+        }
+        if used != 0 {
+            @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, base), used), 0);
+        }
+        cs[kept * 3] = base;
+        cs[(kept * 3) + 1] = size;
+        cs[(kept * 3) + 2] = 0;
+        kept += 1;
+    }
+    a.nchunks = kept;
+    a.at = 0;
+    if kept == 0 {
+        a.cur = 0;
+        a.end = 0;
+    } else {
+        a.cur = cs[0];
+        a.end = cs[0] + cs[1];
+    }
 }
 
 pub fn new[T]() *mut T {
@@ -117,6 +272,36 @@ pub fn new[T]() *mut T {
 pub fn newn[T](n: usize) []mut T {
     let p = alloc(n * @size_of(T) + 1);
     return @slice_from_ptr(@ptr_cast(*mut T, p), n);
+}
+
+// -----------------------------------------------------------------------------
+// Heap slices (malloc'd, freed with free_slice) for tables that grow and
+// shrink, unlike the arena's.
+// -----------------------------------------------------------------------------
+pub fn nil_slice[T]() []mut T {
+    return @slice_from_ptr(nil.[T](), 0);
+}
+
+pub fn calloc_slice[T](n: usize) []mut T {
+    let p = calloc(@max(n, 1), @size_of(T));
+    if isvnil(p) {
+        die("out of memory");
+    }
+    return @slice_from_ptr(@ptr_cast(*mut T, p), n);
+}
+
+pub fn free_slice[T](s: []mut T) void {
+    if s.len != 0 {
+        free(@ptr_cast(*mut void, s.ptr));
+    }
+}
+
+// A permanent copy of `s` (see perm_alloc), followed by a NUL.
+pub fn perm_dup(s: []u8) []u8 {
+    let p = perm_alloc(s.len + 1);
+    let d = @slice_from_ptr(p, s.len);
+    @mem_copy(d, s);
+    return d;
 }
 
 // A copy of `s` in the arena, followed by a NUL (so `.ptr` is a C string).
@@ -619,7 +804,7 @@ pub fn intern(s: []u8) []u8 {
         }
         j = (j + 1) & (itab_cap - 1);
     }
-    t[j] = InternEntry.{ s: dup(s), hash: h };
+    t[j] = InternEntry.{ s: perm_dup(s), hash: h };
     itab_len += 1;
     return t[j].s;
 }
