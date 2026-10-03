@@ -55,6 +55,13 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - **The compiler on Windows.** It builds for `x86_64-windows`, runs, and
   reaches a fixed point there: built by the Windows compiler, it builds
   itself bit-identically (under Wine). `util.real_path` keeps drive letters.
+- **Unwind tables.** Every function with a frame has unwind information
+  (.xdata) and an entry in the function table (.pdata, the exception
+  directory); frameless ones are leaf functions as Windows defines them
+  (no pushes, rsp untouched). So exceptions DLLs raise pass through Axiom
+  frames, and Windows' stack walks (RtlCaptureStackBackTrace, debuggers)
+  go through to the entry point: checked on Windows 11 with a crash five
+  calls deep, at -O0 and -O2.
 - **Real Windows.** The compiler, examples/game.ax and the other examples run
   on Windows 11.
 - **`axiom profile`.** `runtime/profile_windows.ax`: a sampler thread in place
@@ -93,8 +100,8 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - Symbolic links need Developer Mode or the privilege (Wine cannot make
   them); without it `symlink` fails with AccessDenied.
 - Unix-domain sockets need Windows 10 1803 or later (Wine has none).
-- No `.pdata` unwind information: debuggers and Windows' own stack walks see
-  only leaf frames (Axiom's traces use its shadow stack).
+- No debug symbols (a PDB): debuggers walk Axiom frames but show them as
+  addresses (Axiom's own traces name them, from the shadow stack).
 - Direct3D: mipmaps, texture formats other than 8-bit RGBA, rendering into
   a texture and then sampling it, compute shaders writing textures, MSAA;
   the overlay under Wine (no D3D11On12 there). Windows.Gaming.Input, raw
