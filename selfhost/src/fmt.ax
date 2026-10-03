@@ -14,7 +14,9 @@
 //     else after another binary operator; the next line starts just inside
 //     the bracket the break is in (outside any: after 'if ', 'return ', '= ',
 //     ...), or, if that would squeeze it against the edge, the break goes
-//     right after the bracket and the next line is indented four more;
+//     between the items of the line's own list (a list of lists stays a row
+//     per item), else right after the bracket and the next line is indented
+//     four more;
 //   - a bracket written with a trailing comma: one item per line;
 //   - a match arm with one short statement on one line, '=>' lined up;
 //   - trailing comments lined up two spaces after the longest of a run of
@@ -1060,12 +1062,13 @@ fn put_tok(b: *mut u.Buf, e: *El) void {
 
 // A place to break a line: after token 'at', inside 'depth' brackets; the
 // next line would start at 'col'; 'outer' is the outermost bracket opened on
-// this line and still open there.
+// this line and still open there, 'odepth' brackets deep.
 struct Brk {
     at: usize,
     depth: usize,
     col: usize,
     outer: usize,
+    odepth: usize,
 }
 
 // Trailing comments line up on lines whose code differs in width by at most this.
@@ -1080,6 +1083,22 @@ fn inner_col(e: *El, c: usize) usize {
         return c + 1;
     }
     return c;
+}
+
+// The width of tokens ts[a..=b] on one line.
+fn span_width(els: []El, ts: []usize, a: usize, b: usize) usize {
+    let mut w: usize = 0;
+    for q in a..b + 1 {
+        let e = &els[ts[q]];
+        if (q > a) and e.sp {
+            w += 1;
+        }
+        w += width(e.text);
+        if e.comma {
+            w += 1;
+        }
+    }
+    return w;
 }
 
 // A code line that is too long: broken after ',', 'and' or 'or' (else another
@@ -1110,15 +1129,24 @@ fn wrap(R: *mut Renderer, ts: []usize, c0: usize, indent: i32, pad_at: usize, pa
             sim_tok.push(NONE);
         }
         let mut col = col0;
-        let mut ba = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE };  // 'and', 'or': the shallowest, then the last
-        let mut bc = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE };  // ',': the last
-        let mut bs = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE };  // other operators: the shallowest, then the last
+        let mut ba = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE, odepth: 0 };  // 'and', 'or': the shallowest, then the last
+        let mut bc = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE, odepth: 0 };  // ',': the last
+        let mut bs = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE, odepth: 0 };  // other operators: the shallowest, then the last
         let mut comma_depth = NONE;
+        // ',' between the items of the line's own list (the one it continues,
+        // else one it opens): the last, while that list is open
+        let own = @max(st.len, 1);
+        let mut bt = Brk.{ at: NONE, depth: 0, col: 0, outer: NONE, odepth: 0 };
+        let mut bt_closed = false;  // its list closed: it goes once more than closers follow
         let mut over = false;
         let mut forced = NONE;
         let mut j = s;
         while j < n {
             let e = &els[ts[j]];
+            if bt_closed and not is_closer(e.kind) and (e.kind != lx.TK_BANG) and (e.kind != lx.TK_SEMI) {
+                bt.at = NONE;
+                bt_closed = false;
+            }
             if (j > s) and e.sp {
                 col += 1;
             }
@@ -1144,15 +1172,19 @@ fn wrap(R: *mut Renderer, ts: []usize, c0: usize, indent: i32, pad_at: usize, pa
             } else if is_closer(e.kind) and (sim_col.len > 0) {
                 _ = sim_col.pop();
                 _ = sim_tok.pop();
+                if sim_col.len < own {
+                    bt_closed = bt.at != NONE;
+                }
             }
             if (j + 1) < n {
-                let mut here = Brk.{ at: j, depth: sim_col.len, col: hang, outer: NONE };
+                let mut here = Brk.{ at: j, depth: sim_col.len, col: hang, outer: NONE, odepth: 0 };
                 if sim_col.len > 0 {
                     here.col = sim_col.last();
                 }
                 for q in 0..sim_tok.len {
                     if sim_tok.get(q) != NONE {
                         here.outer = sim_tok.get(q);
+                        here.odepth = q;
                         break;
                     }
                 }
@@ -1163,6 +1195,10 @@ fn wrap(R: *mut Renderer, ts: []usize, c0: usize, indent: i32, pad_at: usize, pa
                     }
                 } else if (k == lx.TK_COMMA) or e.comma {
                     bc = here;
+                    if here.depth == own {
+                        bt = here;
+                        bt_closed = false;
+                    }
                     if (comma_depth == NONE) or (here.depth < comma_depth) {
                         comma_depth = here.depth;
                     }
@@ -1195,8 +1231,16 @@ fn wrap(R: *mut Renderer, ts: []usize, c0: usize, indent: i32, pad_at: usize, pa
                 stop = q;
             } else if (br.col > DEEP) and (br.outer != NONE) and (br.outer > s) and ((col0 + 4) < br.col) {
                 // the rest would be squeezed against the edge: break after the
-                // bracket instead, the items indented under the line
-                stop = br.outer;
+                // bracket, the items indented under the line; but between the
+                // items of the line's own list if that bracket is one of them
+                // or they would not fit there either (so a list of lists or
+                // calls keeps whole items on each line)
+                if (bt.at != NONE) and (bt.depth < br.depth) and
+                   ((br.odepth == own) or (((col0 + 4) + span_width(els, ts, br.outer + 1, n - 1)) > WIDTH)) {
+                    stop = bt.at;
+                } else {
+                    stop = br.outer;
+                }
             } else {
                 stop = br.at;
             }
