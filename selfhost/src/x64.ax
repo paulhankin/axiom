@@ -24,6 +24,9 @@ const XMM: u8 = 1;
 let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
 let mut TEXT: i32 = 0;
 let mut RODATA: i32 = 0;
+let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
+let mut PDATA: i32 = -1;
+let mut XDATA_SYM: u32 = 0;
 let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
@@ -3686,11 +3689,36 @@ fn epilogue() void {
     b8(0xc3);
 }
 
+// Windows: what the prologue did, step by step, for the function's unwind
+// information (see unwind_info).
+const UW_PUSH: u32 = 0;   // pushed register `reg`
+const UW_ALLOC: u32 = 1;  // lowered rsp by `val`
+const UW_XMM: u32 = 2;    // stored xmm `reg` at [rsp + val]
+
+struct UnwindStep {
+    off: u64,  // the code offset just after it
+    op: u32,
+    reg: u32,
+    val: u64,
+}
+
+let mut uw: [24]UnwindStep = [UnwindStep.{ off: 0, op: 0, reg: 0, val: 0 }; 24];
+let mut nuw: usize = 0;
+let mut prologue_end: u64 = 0;
+
+fn uw_step(op: u32, r: i32, val: u64) void {
+    uw[nuw] = UnwindStep.{ off: @as(u64, E.b.len()), op: op, reg: @bit_cast(u32, r), val: val };
+    nuw += 1;
+}
+
 fn prologue(sub: i64) void {
+    nuw = 0;
+    prologue_end = 0;
     if frameless {
         return;
     }
     b8(0x55);  // push rbp
+    uw_step(UW_PUSH, xe.RBP, 0);
     b8(0x48);
     b8(0x89);
     b8(0xe5);  // mov rbp, rsp
@@ -3700,6 +3728,7 @@ fn prologue(sub: i64) void {
             b8(0x41);
         }
         b8(0x50 + @as(u64, @bit_cast(u32, r & 7)));
+        uw_step(UW_PUSH, r, 0);
     }
     if sub > 0 {
         // touch each page of a large frame in order (stack guard)
@@ -3721,10 +3750,89 @@ fn prologue(sub: i64) void {
         b8(0x81);
         b8(0xec);
         E.b.u32_(@bit_cast(u64, rem));
+        uw_step(UW_ALLOC, 0, @bit_cast(u64, sub));
     }
     for k in 0..nxsaved {
         xmm_rbp(xsaved[@int_cast(usize, k)], xmm_save_off(k), true);
+        // rbp - 8*nsaved - sub is rsp, so the save is at rsp + sub + its offset
+        uw_step(UW_XMM, xsaved[@int_cast(usize, k)] - xe.XMM0, @bit_cast(u64, sub + xmm_save_off(k) + (8 * nsaved)));
     }
+    prologue_end = @as(u64, E.b.len());
+}
+
+// The function's UNWIND_INFO for Windows x64, which the system's stack
+// walker (exception dispatch, stack traces) needs for every function with a
+// frame: version 1, no handler, the prologue's size, the number of code
+// slots, no frame register (rsp stays put after the prologue, and rbp is
+// described as a saved register), then the codes in reverse order of the
+// prologue's steps: push (UWOP_PUSH_NONVOL), sub rsp (UWOP_ALLOC_SMALL or
+// _LARGE), xmm saves (UWOP_SAVE_XMM128_FAR, at an unscaled offset from rsp).
+// Offsets past 255 (only in prologues with large frames' probes) are
+// clamped.
+fn unwind_info() bn.Bytes {
+    let mut codes = bn.new_bytes();
+    let mut n: u64 = 0;
+    let mut k = nuw;
+    while k > 0 {
+        k -= 1;
+        let s = uw[k];
+        let off = @min(s.off, 255);
+        if s.op == UW_PUSH {
+            codes.u8_(@truncate(u8, off));
+            codes.u8_(@truncate(u8, 0 | (@as(u64, s.reg) << 4)));
+            n += 1;
+        } else if s.op == UW_ALLOC {
+            if s.val <= 128 {
+                codes.u8_(@truncate(u8, off));
+                codes.u8_(@truncate(u8, 2 | (((s.val / 8) - 1) << 4)));
+                n += 1;
+            } else if s.val <= 524280 {
+                codes.u8_(@truncate(u8, off));
+                codes.u8_(@truncate(u8, 1));
+                codes.u16_(s.val / 8);
+                n += 2;
+            } else {
+                codes.u8_(@truncate(u8, off));
+                codes.u8_(@truncate(u8, 1 | (1 << 4)));
+                codes.u32_(s.val);
+                n += 3;
+            }
+        } else {
+            codes.u8_(@truncate(u8, off));
+            codes.u8_(@truncate(u8, 9 | (@as(u64, s.reg) << 4)));
+            codes.u32_(s.val);
+            n += 3;
+        }
+    }
+    if (n & 1) != 0 {
+        codes.u16_(0);  // an even number of slots
+    }
+    let mut b = bn.new_bytes();
+    b.u8_(1);
+    b.u8_(@truncate(u8, @min(prologue_end, 255)));
+    b.u8_(@truncate(u8, n));
+    b.u8_(0);
+    b.put(codes.view());
+    codes.free();
+    return b;
+}
+
+// Windows: the function placed at `base` in .text with `size` bytes gets its
+// unwind information in .xdata and an entry in .pdata (start, end, unwind
+// information: addresses relative to the image, which plink.ax resolves).
+fn emit_unwind(fs: u32, base: u64, size: u64) void {
+    let x = OBJ.secs.get(@int_cast(usize, XDATA));
+    x.data.align(4);
+    let xoff = @as(u64, x.data.len());
+    let mut info = unwind_info();
+    x.data.put(info.view());
+    info.free();
+    let p = OBJ.secs.get(@int_cast(usize, PDATA));
+    let poff = @as(u64, p.data.len());
+    p.data.zeros(12);
+    p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_X86_64_RVA32, sym: fs, addend: 0 });
+    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, size) });
+    p.relocs.push(elf.Rel.{ off: poff + 8, ty: elf.R_X86_64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
 }
 
 fn enc_sse(i: *mut mc.MInst) void {
@@ -4336,6 +4444,9 @@ fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, E.b.len());
+    if WIN and not frameless {
+        emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
+    }
     E.b.free();
 }
 
@@ -4401,6 +4512,16 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 16);
     RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
+    XDATA = -1;
+    PDATA = -1;
+    if WIN {
+        // here, not when the first function needs them: functions are
+        // compiled in scratch scopes (their sections must outlive them)
+        XDATA = elf.add_sec(OBJ, ".xdata", elf.S_RODATA, 4);
+        PDATA = elf.add_sec(OBJ, ".pdata", elf.S_RODATA, 4);
+        XDATA_SYM = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: XDATA, value: 0, size: 0, bind: elf.B_LOCAL,
+                                               ty: elf.T_NOTYPE, hidden: false });
+    }
     let data = elf.add_sec(OBJ, ".data", elf.S_DATA, 16);
     let bss = elf.add_sec(OBJ, ".bss", elf.S_BSS, 16);
     let tbss = elf.add_sec(OBJ, ".tbss", elf.S_TBSS, 16);

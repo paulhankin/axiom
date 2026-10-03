@@ -9,7 +9,11 @@
 //   .text   r-x  code, one jump through the import address table per
 //                imported function called, the entry point
 //   .rdata  r--  read-only data, relocated read-only data, the thread-local
-//                directory
+//                directory, unwind information (.xdata), then the function
+//                table (.pdata: every function with a frame, sorted; the
+//                exception directory), without which the system cannot walk
+//                the stack through our code, and an exception a DLL raises
+//                to catch itself further up can end the process
 //   .idata  rw-  the import directory, lookup and address tables, names
 //   .data   rw-  data, the GOT (addresses of our own symbols that code loads
 //                through it), the thread-local template, _tls_index, then
@@ -55,6 +59,7 @@ const C_DATA: i32 = 2;
 const C_TDATA: i32 = 3;
 const C_TBSS: i32 = 4;
 const C_BSS: i32 = 5;
+const C_PDATA: i32 = 6;  // the function table (.pdata), one array at the end of .rdata
 
 struct GSym {
     name: []u8,
@@ -126,6 +131,9 @@ fn is_call_reloc(ty: u32) bool {
 }
 
 fn class_of(s: *elf.Sec) i32 {
+    if u.str_eq(s.name, ".pdata") {
+        return C_PDATA;
+    }
     let k = s.kind;
     if k == elf.S_TEXT {
         return C_TEXT;
@@ -498,6 +506,8 @@ fn apply_relocs(b: []mut u8) void {
                     abs_at(b, p, sa);
                 } else if is_call_reloc(t) {
                     rel32(b, p, sa);
+                } else if t == elf.R_X86_64_RVA32 {
+                    w32(b, file_of(p), sa - BASE);
                 } else if t == elf.R_X86_64_TPOFF32 {
                     // the offset in the thread's copy of the template
                     let v = @bit_cast(i64, sa -% tls_addr);
@@ -545,9 +555,44 @@ fn own_object() *mut elf.Obj {
     ts.data.put(entry[..]);
     ts.relocs.push(elf.Rel.{ off: 9, ty: elf.R_X86_64_PLT32, sym: main_, addend: -4 });
     ts.relocs.push(elf.Rel.{ off: 16, ty: elf.R_X86_64_PLT32, sym: exitp, addend: -4 });
-    _ = elf.add_sym(o, elf.Sym.{ name: "axiom.entry", sec: text, value: 0, size: 22, bind: elf.B_GLOBAL, ty: elf.T_FUNC,
-                                 hidden: true });
+    let es = elf.add_sym(o, elf.Sym.{ name: "axiom.entry", sec: text, value: 0, size: 22, bind: elf.B_GLOBAL,
+                                      ty: elf.T_FUNC, hidden: true });
+    // its unwind information (sub rsp, 40: UWOP_ALLOC_SMALL after 4 bytes)
+    // and function table entry, as x64.ax makes them for compiled functions
+    let xdata = elf.add_sec(o, ".xdata", elf.S_RODATA, 4);
+    let unwind: [8]u8 = [1, 4, 1, 0, 4, 0x42, 0, 0];
+    o.secs.get(@int_cast(usize, xdata)).data.put(unwind[..]);
+    let xs = elf.add_sym(o, elf.Sym.{ name: "", sec: xdata, value: 0, size: 8, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
+                                      hidden: false });
+    let pdata = elf.add_sec(o, ".pdata", elf.S_RODATA, 4);
+    let ps = o.secs.get(@int_cast(usize, pdata));
+    ps.data.zeros(12);
+    ps.relocs.push(elf.Rel.{ off: 0, ty: elf.R_X86_64_RVA32, sym: es, addend: 0 });
+    ps.relocs.push(elf.Rel.{ off: 4, ty: elf.R_X86_64_RVA32, sym: es, addend: 22 });
+    ps.relocs.push(elf.Rel.{ off: 8, ty: elf.R_X86_64_RVA32, sym: xs, addend: 0 });
     return o;
+}
+
+// The function table must be sorted by start address. It is, as the
+// objects' .text and .pdata are placed in the same order; this keeps it so
+// whatever the order (insertion sort: one pass when sorted).
+fn sort_pdata(b: []mut u8, start: u64, end: u64) void {
+    if end <= start {
+        return;
+    }
+    let fo = @truncate(usize, file_of(start));
+    let n = @truncate(usize, (end - start) / 12);
+    for i in @as(usize, 1)..n {
+        let mut j = i;
+        while (j > 0) and (elf.rd32(b, fo + (j * 12)) < elf.rd32(b, fo + ((j - 1) * 12))) {
+            for k in @as(usize, 0)..12 {
+                let t = b[fo + (j * 12) + k];
+                b[fo + (j * 12) + k] = b[fo + ((j - 1) * 12) + k];
+                b[fo + ((j - 1) * 12) + k] = t;
+            }
+            j -= 1;
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -703,7 +748,8 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let text_end = thunk_addr + (@as(u64, imports.len) * 8);
     // .rdata
     let rdata_rva = align_up(text_end - BASE, SECT);
-    let rdata_end = place(C_CONST, BASE + rdata_rva);
+    let pdata_start = align_up(place(C_CONST, BASE + rdata_rva), 4);
+    let rdata_end = place(C_PDATA, pdata_start);
     // .idata
     let idata_rva = align_up(rdata_end - BASE, SECT);
     let mut idata = import_section(idata_rva);
@@ -744,6 +790,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let b = f.view();
     copy_class(b, C_TEXT);
     copy_class(b, C_CONST);
+    copy_class(b, C_PDATA);
     copy_class(b, C_DATA);
     copy_class(b, C_TDATA);
     let iv = idata.view();
@@ -767,6 +814,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         abs_at(b, got_addr + (@as(u64, k) * 8), sym_addr(@as(usize, got_obj.get(k)), got_sym.get(k)));
     }
     apply_relocs(b);
+    sort_pdata(b, pdata_start, rdata_end);
     // the TLS directory: the template, the index's address, the (empty)
     // callback list, the zero fill, the alignment
     let own = objs.len - 1;
@@ -846,6 +894,11 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         if d == 1 {
             h.u32_(idata_rva);
             h.u32_((ndll + 1) * 20);
+        } else if d == 3 {
+            // exceptions: the function table, without which the system
+            // cannot walk the stack through our code
+            h.u32_(pdata_start - BASE);
+            h.u32_(rdata_end - pdata_start);
         } else if d == 5 {
             h.u32_(reloc_rva);
             h.u32_(outs[4].vsize);

@@ -103,6 +103,11 @@ pub extern "C" {
     fn GetOverlappedResult(h: usize, ov: *mut u8, got: *mut u32, wait: i32) i32;
     fn CancelIoEx(h: usize, ov: *mut u8) i32;
     fn AddVectoredExceptionHandler(first: u32, handler: fn(*mut usize) i32) *mut void;
+    fn SetUnhandledExceptionFilter(filter: fn(*mut usize) i32) usize;
+    fn RtlCaptureStackBackTrace(skip: u32, n: u32, frames: *mut usize, hash: *mut u32) u16;
+    fn GetModuleHandleExW(flags: u32, addr: usize, module: *mut usize) i32;
+    fn GetModuleHandleW(name: *u16) usize;
+    fn GetModuleFileNameW(module: usize, buf: *mut u16, n: u32) u32;
     fn SetErrorMode(mode: u32) u32;
     fn AcquireSRWLockExclusive(l: *mut usize) void;
     fn ReleaseSRWLockExclusive(l: *mut usize) void;
@@ -3071,22 +3076,62 @@ fn at_stack_limit(addr: usize) bool {
     return (addr >= from) and (addr < (low + 131072));
 }
 
-// Exceptions that are not Axiom traps (a stack overflow, an access
-// violation, a division fault) are reported with the shadow stack; the
-// process ends with the exception's code, as it would unhandled (but with
-// no error dialog). Anything else goes on to other handlers.
+// This program's image: base to base + SizeOfImage (from its PE header, at
+// startup). The exception handler must not call into the loader (to ask
+// which module an address is in): exceptions are raised and handled inside
+// the loader while it loads DLLs, and calling it back then makes loads fail.
+let mut image_lo: usize = 0;
+let mut image_hi: usize = 0;
+
+fn find_image() void {
+    let base = GetModuleHandleW(@ptr_from_int(*u16, 0));
+    if base == 0 {
+        return;
+    }
+    let pe = base + @as(usize, @ptr_from_int(*u32, base + 0x3c).*);
+    image_lo = base;
+    image_hi = base + @as(usize, @ptr_from_int(*u32, pe + 24 + 56).*);  // OptionalHeader.SizeOfImage
+}
+
+// " (the program +0x...)" for an address in our image: its offset from the
+// image's start, which the linker's layout (or a disassembler) relates to
+// code. Nothing for other addresses.
+fn image_offset(o: *mut tf.Fmt, addr: usize) void {
+    if in_image(addr) {
+        o.s(" (the program +0x");
+        o.hex(@as(u64, addr - image_lo));
+        o.s(")");
+    }
+}
+
+// Is addr in this program's own code (not a DLL's)?
+fn in_image(addr: usize) bool {
+    return (addr >= image_lo) and (addr < image_hi);
+}
+
+// Exceptions in our code that are not Axiom traps (a stack overflow, an
+// access violation, a division fault) are reported with the shadow stack;
+// the process ends with the exception's code, as it would unhandled (but
+// with no error dialog). Stack overflows are ours wherever they happen. The
+// rest, and anything raised in a DLL, goes on to other handlers: DLLs fault
+// on purpose and catch it themselves (probing memory, an instruction), and
+// this handler runs before theirs. What nothing handles reaches on_unhandled.
 fn on_exception(ep: *mut usize) i32 {
     let rec = @ptr_from_int(*u8, ep.*);
     let r = @slice_from_ptr(rec, 48);
     let code = le32(r, 0);
-    if code == 0xc000_001d {
+    let ours = in_image(@truncate(usize, le64(r, 16)));  // ExceptionAddress
+    if reporting and ours {
+        nested_fault(@truncate(usize, le64(r, 16)));
+    }
+    if (code == 0xc000_001d) and ours {
         // the trap instruction after ax_on_trap's report
         _ = TerminateProcess(GetCurrentProcess(), code);
     }
     let av = code == 0xc000_0005;
     let so = code == 0xc000_00fd;
     let div = (code == 0xc000_0094) or (code == 0xc000_0095);
-    if not av and not so and not div {
+    if not so and (not ours or (not av and not div)) {
         return 0;  // EXCEPTION_CONTINUE_SEARCH
     }
     let mut addr: usize = 0;
@@ -3102,9 +3147,12 @@ fn on_exception(ep: *mut usize) i32 {
         }
         _ = TerminateProcess(GetCurrentProcess(), code);
     }
+    reporting = true;
+    report_code = code;
     let mut o = tf.fmt(report[..]);
     if overflow {
         o.s("axiom: trap T0008 (stack exhausted)\n");
+        write_all(2, o.text());
     } else {
         o.s("axiom: crash: ");
         if av {
@@ -3114,12 +3162,132 @@ fn on_exception(ep: *mut usize) i32 {
         }
         o.s(" (address 0x");
         o.hex(@as(u64, addr));
-        o.s(")\n");
+        o.s(") at 0x");
+        o.hex(le64(r, 16));  // ExceptionAddress
+        image_offset(&mut o, @truncate(usize, le64(r, 16)));
+        o.c('\n');
+        write_all(2, o.text());  // first, in case what follows fails
     }
-    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
-    write_all(2, o.text());
+    let mut more = tf.fmt(report[..]);
+    tf.format_stack(&mut more, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    if not overflow {
+        native_stack(&mut more);
+    }
+    write_all(2, more.text());
     _ = TerminateProcess(GetCurrentProcess(), code);
     return 0;
+}
+
+// While reporting a crash (on_exception, on_unhandled): if reporting it
+// faults too, end at once with the first exception's code.
+let mut reporting: bool = false;
+let mut report_code: u32 = 0;
+
+fn nested_fault(at: usize) void {
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: (and a fault while reporting it, at 0x");
+    o.hex(@as(u64, at));
+    image_offset(&mut o, at);
+    o.s(")\n");
+    write_all(2, o.text());
+    _ = TerminateProcess(GetCurrentProcess(), report_code);
+}
+
+// Any other exception nothing handled: one a DLL raised (a C++ exception, a
+// failed security check) or anything else that would end the process. It
+// is reported with its code and where it was raised, then the process ends
+// with the code, as it would have, but not silently.
+fn on_unhandled(ep: *mut usize) i32 {
+    let rec = @ptr_from_int(*u8, ep.*);
+    let r = @slice_from_ptr(rec, 48);
+    let code = le32(r, 0);
+    if has_crash_hook {
+        crash_hook(5);
+        _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    if reporting {
+        nested_fault(@truncate(usize, le64(r, 16)));
+    }
+    reporting = true;
+    report_code = code;
+    let mut first = tf.fmt(report[..]);
+    first.s("axiom: crash: unhandled exception 0x");
+    first.hex(@as(u64, code));
+    first.s(" at 0x");
+    first.hex(le64(r, 16));
+    first.c('\n');
+    write_all(2, first.text());  // (in case what follows fails too)
+    let mut o = tf.fmt(report[..]);
+    o.s(" ");
+    where(&mut o, @truncate(usize, le64(r, 16)));
+    if ((code == 0xc06d_007e) or (code == 0xc06d_007f)) and (le32(r, 24) >= 1) {
+        // a DLL loaded on first use was not found (7e), or lacked the
+        // function (7f): ExceptionInformation[0] is the DelayLoadInfo, its
+        // DLL's name at 24
+        let info = @truncate(usize, le64(r, 32));
+        if info != 0 {
+            let name = @ptr_from_int(*usize, info + 24).*;
+            if name != 0 {
+                o.s(" (loading ");
+                o.s(tf.cstr(@ptr_from_int(*u8, name)));
+                o.s(")");
+            }
+        }
+    }
+    o.c('\n');
+    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    native_stack(&mut o);
+    write_all(2, o.text());
+    _ = TerminateProcess(GetCurrentProcess(), code);
+    return 1;  // EXCEPTION_EXECUTE_HANDLER
+}
+
+// The native frames (our code's and the system's, which the shadow stack
+// does not show), innermost first, from where this is called: in an
+// exception handler, through the dispatcher to where it was raised.
+fn native_stack(o: *mut tf.Fmt) void {
+    let mut frames: [48]usize = [0; 48];
+    let n = @as(usize, RtlCaptureStackBackTrace(1, 48, &mut frames[0], @ptr_from_int(*mut u32, 0)));
+    if n == 0 {
+        return;
+    }
+    o.s("native frames (innermost first):\n");
+    for i in 0..n {
+        o.s(" ");
+        where(o, frames[i]);
+        o.c('\n');
+    }
+}
+
+// " at 0x... in module.dll+0x..." for a code address.
+fn where(o: *mut tf.Fmt, addr: usize) void {
+    o.s(" at 0x");
+    o.hex(@as(u64, addr));
+    let mut module: usize = 0;
+    // FROM_ADDRESS | UNCHANGED_REFCOUNT
+    if (addr == 0) or (GetModuleHandleExW(0x6, addr, &mut module) == 0) {
+        return;
+    }
+    let mut w: [260]u16 = [0; 260];
+    let n = @as(usize, GetModuleFileNameW(module, &mut w[0], 260));
+    if (n == 0) or (n >= 260) {
+        return;
+    }
+    let mut start: usize = 0;
+    for i in 0..n {
+        if (w[i] == '\\') or (w[i] == '/') {
+            start = i + 1;
+        }
+    }
+    let mut name: [260]u8 = [0; 260];
+    let k = narrow(&w[start], n - start, name[..], false);
+    if k > name.len {
+        return;
+    }
+    o.s(" in ");
+    o.s(name[0..k]);
+    o.s("+0x");
+    o.hex(@as(u64, addr - module));
 }
 
 // main's arguments come from the command line (main gets none).
@@ -3132,7 +3300,9 @@ export fn ax_rt_args(argc: i32, argv: *mut *mut u8) void {
 // Runs before main.
 export fn ax_rt_init() void {
     _ = SetErrorMode(0x8003);  // no error dialogs
+    find_image();
     _ = AddVectoredExceptionHandler(1, on_exception);
+    _ = SetUnhandledExceptionFilter(on_unhandled);
     guarantee_stack();
     // UTF-8 output; terminal escape sequences on consoles
     _ = SetConsoleOutputCP(CP_UTF8);

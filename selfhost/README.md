@@ -102,7 +102,11 @@ relocations), importing what the runtime calls from `kernel32`, `ntdll`, `ws2_32
 opens no console window (its standard streams are closed unless redirected). Every function uses the Windows x64 calling convention:
 arguments by position in `rcx`, `rdx`, `r8`, `r9` or `xmm0`-`xmm3`, then on the stack
 above 32 bytes of shadow space; `rsi`, `rdi` and `xmm6`-`xmm15` are callee-saved (the
-latter saved below the pushed registers). Thread-locals are the image's TLS directory,
+latter saved below the pushed registers). Every function with a frame has unwind
+information (`.xdata`) and an entry in the function table (`.pdata`, the image's
+exception directory), describing its prologue relative to `rsp`, so the system can walk
+the stack through Axiom code: without it, an exception a DLL raises to catch further up
+(or a stack trace) cannot get past an Axiom frame. Thread-locals are the image's TLS directory,
 found through `gs:[0x58]` and `_tls_index`. On Linux, `axiom test` runs Windows tests
 under Wine (`wine64` on the `PATH`), and so does the test suite:
 
