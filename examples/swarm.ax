@@ -1,0 +1,2571 @@
+// =============================================================================
+// File: swarm.ax
+// A 3D formation shooter on Windows with Direct3D 12, after the arcade
+// games of the early 1980s, in which everything is made of small cubes.
+// Waves of aliens swoop in and take their places in a swaying formation,
+// then peel off and dive at your ship, firing as they come. Shoot them down
+// before they reach you. Anything destroyed (an alien, your ship) breaks
+// into its cubes, which tumble, fall to the floor and bounce, and ride
+// along on it as it scrolls slowly toward you. Bosses take two hits. The
+// front screen has the title in cubes and this session's high scores, over
+// the game playing itself; Escape gives up a game, and quits from there.
+//
+//   axiom build examples/swarm.ax --target=x86_64-windows -O2 --subsystem=windows -o swarm.exe
+//   swarm.exe                   (left/right or A/D to move, Space or Ctrl to
+//                                fire; a controller's left stick or d-pad
+//                                and A; Escape or Back quits)
+//   swarm.exe --autopilot       (it plays itself)
+//   swarm.exe --png out.png --frames 600   (plays 600 frames by itself
+//                                offscreen, then saves the last as a PNG)
+//
+// Every frame the cubes of the aliens, the ship, the shots and the debris
+// are made into one vertex buffer the CPU writes in place (only the faces
+// that can show), drawn in one call into the sun's shadow map and once
+// more lit: by a dim sun with shadows on the tiled floor, the sky, and the
+// nearest of the point lights (shots, explosions, the aliens' flashing
+// lights, the ship's engines). The aliens are pixel-art sprites made into
+// voxels: a second layer where a cell is surrounded, their lights raised
+// above them. Sound is made with std/audio and played with
+// std/audio/xaudio2.
+// =============================================================================
+
+import "std/audio" as audio;
+import "std/audio/xaudio2" as xaudio2;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/d3d12" as d3d;
+import "std/graphics/hlsl" as hlsl;
+import "std/graphics/image/png" as png;
+import "std/io" as io;
+import "std/math" as math;
+import "std/math/geometry" as geo;
+import "std/math/matrix" as matrix;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/os/win32" as win32;
+import "std/os/xinput" as xinput;
+import "std/str" as strs;
+import "std/time" as time;
+
+// -----------------------------------------------------------------------------
+// Shaders: per frame (root constants 0..31) the camera, sun and fog,
+// billboard axes; per draw (32..51) for glows and the instruments. Solid
+// geometry comes in world space. b1: the sun's matrix and the lights.
+// -----------------------------------------------------------------------------
+let SHADER_LINES: [157][]u8 = ["cbuffer C : register(b0) {", "    float4x4 viewproj;", "    float4 eye;",
+                               "    float4 light;", "    float4 right;", "    float4 up;", "    float4 m0;",
+                               "    float4 m1;", "    float4 m2;", "    float4 color;", "    float4 params;", "};",
+                               "cbuffer L : register(b1) {", "    float4x4 sunvp;", "    float4 info;",
+                               "    float4 lpos[48];", "    float4 lcol[48];", "    float4 lcount;", "};",
+                               "Texture2D<float> shadowmap : register(t0);",
+                               "SamplerComparisonState cmp : register(s1);", "struct VIn {",
+                               "    float3 pos : POSITION;", "    float3 nrm : NORMAL;", "    float4 col : COLOR;",
+                               "    float2 uv : TEXCOORD;", "};", "struct VOut {", "    float4 pos : SV_Position;",
+                               "    float3 w : TEXCOORD0;", "    float3 n : TEXCOORD1;", "    float4 col : COLOR;",
+                               "    float2 uv : TEXCOORD2;", "};", "VOut vs(VIn i) {", "    VOut o;",
+                               "    o.w = i.pos;", "    o.n = i.nrm;", "    o.pos = mul(viewproj, float4(i.pos, 1.0));",
+                               "    o.col = i.col;", "    o.uv = i.uv;", "    return o;", "}",
+                               "float4 vs_shadow(VIn i) : SV_Position {", "    return mul(sunvp, float4(i.pos, 1.0));",
+                               "}", "float3 fog(float3 c, float3 w) {",
+                               "    float k = exp(-length(w - eye.xyz) * light.w);",
+                               "    return lerp(float3(0.004, 0.005, 0.012), c, k);", "}",
+                               "float sun_shadow(float3 w, float3 n) {",
+                               "    float4 p = mul(sunvp, float4(w + n * 0.03, 1.0));",
+                               "    float2 uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);",
+                               "    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 || p.z > 1.0) {",
+                               "        return 1.0;", "    }", "    float s = 0.0;",
+                               "    [unroll] for (int y = -1; y <= 1; y++) {",
+                               "        [unroll] for (int x = -1; x <= 1; x++) {",
+                               "            s += shadowmap.SampleCmpLevelZero(cmp, uv + float2(x, y) * info.x, p.z);",
+                               "        }", "    }", "    return s / 9.0;", "}",
+                               "float3 point_light(float3 w, float3 n, float3 v, float3 lp, float r, float3 c, float shine) {",
+                               "    float3 d = lp - w;", "    float dist = length(d);",
+                               "    float att = saturate(1.0 - dist / r);", "    att *= att;",
+                               "    float3 ld = d / max(dist, 0.001);",
+                               "    float diff = saturate(dot(n, ld)) * 0.9 + 0.1;",
+                               "    float spec = pow(saturate(dot(n, normalize(ld + v))), 32.0) * shine;",
+                               "    return c * att * (diff + spec);", "}", "float4 ps(VOut i) : SV_Target {",
+                               "    float3 n = normalize(i.n);", "    float mat = i.col.a;",
+                               "    float edge = max(abs(i.uv.x), abs(i.uv.y));",
+                               "    float bevel = 1.0 - 0.45 * smoothstep(0.7, 1.0, edge);",
+                               "    if (mat > 0.5 && mat < 1.5) {",
+                               "        float3 glow = i.col.rgb * (0.8 + 0.4 * (1.0 - edge));",
+                               "        return float4(fog(glow, i.w), 1.0);", "    }",
+                               "    float3 toeye = eye.xyz - i.w;", "    float dist = length(toeye);",
+                               "    float3 v = toeye / dist;", "    float shine = 0.6;",
+                               "    float3 base = i.col.rgb * bevel;", "    float3 extra = 0.0;",
+                               "    if (mat > 1.5 && mat < 2.5) {",
+                               "        // the floor: darker tiles, a cyan glow along their seams that pulses",
+                               "        // down the field", "        shine = 0.25;",
+                               "        float seam = smoothstep(0.86, 1.0, edge) * (n.y > 0.5 ? 1.0 : 0.0);",
+                               "        float pulse = 0.5 + 0.5 * sin(i.w.z * 0.35 + eye.w * 2.5);",
+                               "        extra = float3(0.0, 0.35, 0.5) * seam * (0.15 + 0.35 * pulse);", "    }",
+                               "    float3 l = -light.xyz;", "    float lambert = saturate(dot(n, l));",
+                               "    float shadow = lambert > 0.0 ? sun_shadow(i.w, n) : 0.0;",
+                               "    float3 sun = float3(0.32, 0.36, 0.5) * shadow * (lambert + pow(saturate(dot(n, normalize(l + v))), 32.0) * shine);",
+                               "    float3 sky = float3(0.035, 0.04, 0.06) * (0.6 + 0.4 * n.y);",
+                               "    float3 local = 0.0;", "    int count = (int)lcount.x;",
+                               "    [loop] for (int k = 0; k < count; k++) {",
+                               "        local += point_light(i.w, n, v, lpos[k].xyz, lpos[k].w, lcol[k].rgb * lcol[k].w, shine);",
+                               "    }", "    if (mat > 2.5) {",
+                               "        // ships and aliens: lit a little from within, and a rim of light",
+                               "        // round their edges, so they stand out from the floor and debris",
+                               "        float rim = pow(1.0 - saturate(dot(n, v)), 2.0);",
+                               "        extra = base * (0.42 + 0.5 * rim);", "    }",
+                               "    float3 lit = base * (sun + sky + local) + extra;",
+                               "    return float4(fog(lit, i.w), 1.0);", "}", "struct GOut {",
+                               "    float4 pos : SV_Position;", "    float2 uv : TEXCOORD0;",
+                               "    float3 w : TEXCOORD1;", "};", "GOut vs_glow(VIn i) {",
+                               "    float3 w = m0.xyz + (right.xyz * i.pos.x + up.xyz * i.pos.y) * m0.w;",
+                               "    GOut o;", "    o.pos = mul(viewproj, float4(w, 1.0));", "    o.uv = i.pos.xy;",
+                               "    o.w = w;", "    return o;", "}", "float4 ps_glow(GOut i) : SV_Target {",
+                               "    float k = saturate(1.0 - length(i.uv));",
+                               "    float glow = k * k + pow(k, 8.0) * 2.0;",
+                               "    float f = params.y > 0.5 ? exp(-length(i.w - eye.xyz) * light.w * 0.5) : 1.0;",
+                               "    return float4(color.rgb * glow * color.a * f, 1.0);", "}", "struct HOut {",
+                               "    float4 pos : SV_Position;", "    float2 uv : TEXCOORD0;", "};",
+                               "HOut vs_hud(VIn i) {", "    HOut o;",
+                               "    o.pos = float4(m0.xy + i.pos.xy * m0.zw, 0.0, 1.0);", "    o.uv = i.pos.xy;",
+                               "    return o;", "}", "float4 ps_hud(HOut i) : SV_Target {", "    if (params.x > 1.5) {",
+                               "        float row = floor(i.pos.y / 3.0);",
+                               "        float band = frac(sin(row * 12.9898 + floor(eye.w * 40.0) * 78.233) * 43758.5453);",
+                               "        return float4(color.rgb, step(0.95, band) * 0.6 * color.a);", "    }",
+                               "    if (params.x > 0.5) {", "        float d = length(i.uv * float2(1.0, 0.85));",
+                               "        return float4(color.rgb, smoothstep(0.55, 1.4, d) * color.a);", "    }",
+                               "    return color;", "}"];
+
+// -----------------------------------------------------------------------------
+// The world: the play plane is horizontal, PLAY_Y above the floor; the ship
+// at z = SHIP_Z faces -z, the formation far up the field
+// -----------------------------------------------------------------------------
+const C: f32 = 0.28;    // the voxels' pitch
+const HC: f32 = 0.128;  // half a voxel (a little gap between them)
+const PLAY_Y: f32 = 2.2;
+const SHIP_Z: f32 = 6.0;
+const FIELD_X: f32 = 17.0;
+const FOG: f32 = 0.0075;
+
+const MAX_ALIENS: usize = 40;
+const MAX_SHOTS: usize = 8;
+const MAX_ENEMY_SHOTS: usize = 48;
+const MAX_BITS: usize = 7000;
+const MAX_FLASHES: usize = 24;
+const MAX_GLOWS: usize = 700;
+const MAX_QUADS: usize = 72000;
+const VERT: usize = 12;  // floats a vertex: position, normal, colour and material, face coordinates
+const MAX_LIGHTS: usize = 48;
+const SHADOW_SIZE: u32 = 4096;
+const STARS: usize = 160;
+const SCROLL_SPEED: f32 = 1.4;  // the floor's, toward the ship
+const TILE: f32 = 2.0;
+
+// enemy shots: bees' sparks (orange, three cubes whirling round a core),
+// moths' plasma (violet, a pulsing core ringed by six cubes, weaving as it
+// comes), bosses' stars (yellow, spinning crosses, three at a time)
+const SPARK: u32 = 1;
+const PLASMA: u32 = 2;
+const STAR: u32 = 3;
+
+// alien kinds
+const BEE: u32 = 0;
+const MOTH: u32 = 1;
+const BOSS: u32 = 2;
+const SHIP: u32 = 3;
+
+// alien states
+const GONE: u32 = 0;
+const WAITING: u32 = 1;  // to enter
+const ENTER: u32 = 2;
+const FORM: u32 = 3;
+const DIVE: u32 = 4;
+const RETURN: u32 = 5;
+
+struct V3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+fn v3(x: f32, y: f32, z: f32) V3 {
+    return V3.{ x: x, y: y, z: z };
+}
+
+fn vadd(a: V3, b: V3) V3 {
+    return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+fn vsub(a: V3, b: V3) V3 {
+    return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+fn vmul(a: V3, k: f32) V3 {
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+fn vdot(a: V3, b: V3) f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+fn vlen(a: V3) f32 {
+    return @sqrt(vdot(a, a));
+}
+
+fn vnorm(a: V3) V3 {
+    let l = vlen(a);
+    if l < 1.0e-6 {
+        return a;
+    }
+    return vmul(a, 1.0 / l);
+}
+
+fn vcross(a: V3, b: V3) V3 {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+fn clamp(x: f32, lo: f32, hi: f32) f32 {
+    return @min(@max(x, lo), hi);
+}
+
+fn if_else(c: bool, a: f32, b: f32) f32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+struct Rng {
+    s: u64,
+}
+
+fn rnd(r: *mut Rng) f32 {
+    r.s = (r.s *% 6364136223846793005) +% 1442695040888963407;
+    return @float_from_int(f32, r.s >> 40) / 16777216.0;
+}
+
+fn rrange(r: *mut Rng, lo: f32, hi: f32) f32 {
+    return lo + (hi - lo) * rnd(r);
+}
+
+// A cubic Bézier curve's point at t.
+fn bezier(p0: V3, p1: V3, p2: V3, p3: V3, t: f32) V3 {
+    let u = 1.0 - t;
+    return vadd(
+        vadd(vmul(p0, u * u * u), vmul(p1, 3.0 * u * u * t)), vadd(vmul(p2, 3.0 * u * t * t), vmul(p3, t * t * t)));
+}
+
+// -----------------------------------------------------------------------------
+// Voxel models, from pixel art: rows from the far end (the front, for the
+// ship, which faces -z; the back, for aliens, which face +z)
+// -----------------------------------------------------------------------------
+let BEE_ART: [9][]u8 = ["....b...b....", ".....b.b.....", "..bb.yyy.bb..", ".bbbyyyyybbb.", "bbbbyrrrybbbb",
+                        "bb..yyyyy..bb", "....yLyLy....", ".....yyy.....", "......y......"];
+let MOTH_ART: [9][]u8 = ["....r...r....", ".....r.r.....", "rr..wwwww..rr", "rrrrwbbbwrrrr", "rrrwwwwwwwrrr",
+                         "rrr.wLwLw.rrr", "rr...www...rr", "......w......", "......w......"];
+let BOSS_ART: [9][]u8 = [".....ooo.....", "....ooooo....", "..g.oLoLo.g..", ".gggoooooggg.", "ggggggggggggg",
+                         "gg.ggLgLgg.gg", "g..ggggggg..g", "g...g...g...g", "g...g...g...g"];
+let SHIP_ART: [11][]u8 = ["......w......", "......w......", ".....www.....", ".....www.....", "..r..www..r..",
+                          "..r.wwwww.r..", "w.wwwbwbwww.w", "wwwwwwwwwwwww", "www.wwwww.www", "ww..rCrCr..ww",
+                          "w....C.C....w"];
+
+const MAX_MODEL: usize = 240;
+
+struct Model {
+    n: usize,
+    pos: [240]V3,  // centre of each cube, relative to the model's centre
+    col: [240]V3,
+    light: [240]bool,  // an emissive cube: the model's light colour, flashing
+    wing: [240]f32,    // how much it flaps (0 the body .. 1 a wing tip)
+    faces: [240]u8,    // the faces that can show: +x -x +y -y +z -z
+    light_at: V3,      // the lights' centre
+}
+
+fn palette(c: u8) V3 {
+    if c == 'y' {
+        return v3(1.0, 0.82, 0.12);
+    }
+    if c == 'b' {
+        return v3(0.18, 0.32, 1.0);
+    }
+    if c == 'r' {
+        return v3(0.9, 0.12, 0.1);
+    }
+    if c == 'w' {
+        return v3(0.9, 0.9, 0.94);
+    }
+    if c == 'g' {
+        return v3(0.15, 0.72, 0.3);
+    }
+    if c == 'o' {
+        return v3(1.0, 0.52, 0.1);
+    }
+    return v3(0.5, 0.5, 0.5);
+}
+
+fn filled(art: [][]u8, row: i32, col: i32) bool {
+    if (row < 0) or (col < 0) or (row >= @bit_cast(i32, @truncate(u32, art.len))) {
+        return false;
+    }
+    let line = art[@as(usize, @bit_cast(u32, row))];
+    if col >= @bit_cast(i32, @truncate(u32, line.len)) {
+        return false;
+    }
+    return line[@as(usize, @bit_cast(u32, col))] != '.';
+}
+
+// The model of a sprite: one cube per cell, a second on top where all four
+// neighbours are filled, lights ('L', 'C') raised on a dark base.
+fn make_model(art: [][]u8) Model {
+    let mut m = Model.{ n: 0, pos: [v3(0.0, 0.0, 0.0); 240], col: [v3(0.0, 0.0, 0.0); 240], light: [false; 240],
+                        wing: [0.0; 240], faces: [0; 240], light_at: v3(0.0, 0.0, 0.0) };
+    let h = @bit_cast(i32, @truncate(u32, art.len));
+    let w = @bit_cast(i32, @truncate(u32, art[0].len));
+    let mid_x = @float_from_int(f32, w - 1) * 0.5;
+    let mid_z = @float_from_int(f32, h - 1) * 0.5;
+    // occupancy: two layers
+    let mut occ: [2][16][16]bool = [[[false; 16]; 16]; 2];
+    let mut nlights: f32 = 0.0;
+    let mut lsum = v3(0.0, 0.0, 0.0);
+    for row in @as(i32, 0)..h {
+        for col in @as(i32, 0)..w {
+            if not filled(art, row, col) {
+                continue;
+            }
+            let ch = art[@as(usize, @bit_cast(u32, row))][@as(usize, @bit_cast(u32, col))];
+            let is_light = (ch == 'L') or (ch == 'C');
+            let inner = filled(art, row - 1, col) and filled(art, row + 1, col) and filled(art, row, col - 1) and
+                        filled(art, row, col + 1);
+            let x = (@float_from_int(f32, col) - mid_x) * C;
+            let z = (@float_from_int(f32, row) - mid_z) * C;
+            let wing = clamp((@abs(@float_from_int(f32, col) - mid_x) - 2.0) / 4.0, 0.0, 1.0);
+            let mut layers: i32 = 1;
+            if inner or is_light {
+                layers = 2;
+            }
+            for layer in @as(i32, 0)..layers {
+                if m.n >= MAX_MODEL {
+                    break;
+                }
+                let top_light = is_light and (layer == 1);
+                let mut c = palette(ch);
+                if is_light and not top_light {
+                    c = v3(0.15, 0.15, 0.17);
+                }
+                m.pos[m.n] = v3(x, @float_from_int(f32, layer) * C, z);
+                m.col[m.n] = c;
+                m.light[m.n] = top_light;
+                m.wing[m.n] = wing;
+                occ[@as(usize, @bit_cast(u32, layer))][@as(usize, @bit_cast(u32, row))][
+                    @as(usize, @bit_cast(u32, col))] = true;
+                if top_light {
+                    lsum = vadd(lsum, m.pos[m.n]);
+                    nlights += 1.0;
+                }
+                m.n += 1;
+            }
+        }
+    }
+    if nlights > 0.0 {
+        m.light_at = vmul(lsum, 1.0 / nlights);
+    }
+    // the faces with nothing against them (the bottom never shows)
+    for i in 0..m.n {
+        let p = m.pos[i];
+        let col = @int_from_float(i32, @nearest(p.x / C + mid_x));
+        let row = @int_from_float(i32, @nearest(p.z / C + mid_z));
+        let layer = @int_from_float(i32, @nearest(p.y / C));
+        let mut f: u8 = 0;
+        if not occupied(occ, layer, row, col + 1) {
+            f = f | 1;
+        }
+        if not occupied(occ, layer, row, col - 1) {
+            f = f | 2;
+        }
+        if not occupied(occ, layer + 1, row, col) {
+            f = f | 4;
+        }
+        if not occupied(occ, layer, row + 1, col) {
+            f = f | 16;
+        }
+        if not occupied(occ, layer, row - 1, col) {
+            f = f | 32;
+        }
+        m.faces[i] = f;
+    }
+    return m;
+}
+
+fn occupied(occ: [2][16][16]bool, layer: i32, row: i32, col: i32) bool {
+    if (layer < 0) or (layer > 1) or (row < 0) or (row > 15) or (col < 0) or (col > 15) {
+        return false;
+    }
+    return occ[@as(usize, @bit_cast(u32, layer))][@as(usize, @bit_cast(u32, row))][@as(usize, @bit_cast(u32, col))];
+}
+
+// -----------------------------------------------------------------------------
+// The game
+// -----------------------------------------------------------------------------
+struct Alien {
+    kind: u32,
+    state: u32,
+    hp: u32,
+    slot: V3,  // its place in the formation (before the sway)
+    pos: V3,
+    yaw: f32,
+    t: f32,     // seconds into the current path
+    wait: f32,  // ENTER: seconds before it comes
+    side: f32,  // which side it comes from or dives toward
+    a: V3,      // the current path's control points
+    b: V3,
+    c: V3,
+    d: V3,
+    dur: f32,
+    stage: u32,
+    shots: u32,
+    next_shot: f32,
+    flash: f32,  // just hit (a boss): glows white
+    phase: f32,
+}
+
+// Shots, debris, flashes, glows.
+struct Body {
+    p: V3,
+    v: V3,
+    c: V3,
+    rot: V3,  // debris: its angles about x and y (and z unused)
+    spin: V3,
+    life: f32,
+    max: f32,
+    size: f32,
+    kind: u32,    // an enemy shot's sort: SPARK, PLASMA, STAR
+    light: bool,  // an emissive cube
+    alive: bool,
+}
+
+fn dead() Body {
+    return Body.{ p: v3(0.0, 0.0, 0.0), v: v3(0.0, 0.0, 0.0), c: v3(0.0, 0.0, 0.0), rot: v3(0.0, 0.0, 0.0),
+                  spin: v3(0.0, 0.0, 0.0), life: 0.0, max: 1.0, size: 0.0, kind: 0, light: false, alive: false };
+}
+
+fn spawn(list: []mut Body, b: Body) void {
+    for i in 0..list.len {
+        if not list[i].alive {
+            list[i] = b;
+            return;
+        }
+    }
+}
+
+struct Game {
+    rng: Rng,
+    time: f32,
+    wave: u32,
+    score: u32,
+    lives: u32,
+    over: f32,   // seconds since the game ended (0: playing)
+    clear: f32,  // seconds since the wave was cleared (0: not yet)
+    ship_x: f32,
+    ship_vx: f32,
+    ship_alive: bool,
+    respawn: f32,
+    invuln: f32,
+    fire_cool: f32,
+    dive_cool: f32,
+    shake: f32,
+    kick: f32,
+    flash_red: f32,
+    static_t: f32,
+    rumble: f32,
+    scroll: f32,  // how far the floor has moved
+    banner: f32,  // seconds of the wave's number left on the screen
+    aliens: [40]Alien,
+    shots: [8]Body,
+    enemy: [48]Body,
+    bits: [7000]Body,
+    flashes: [24]Body,
+    glows: [700]Body,
+    stars: [160]V3,
+}
+
+let BOSS_X: [4]f32 = [-1.5, -0.5, 0.5, 1.5];
+
+// A game is big (its debris): it lives on the heap and starts over in
+// place, never built as a value on the stack.
+fn alloc_game(seed: u64) ![]mut Game {
+    let s = mem.alloc.[Game](1)!;
+    reset_game(&mut s[0], seed);
+    return s;
+}
+
+fn reset_game(g: *mut Game, seed: u64) void {
+    let none = Alien.{ kind: BEE, state: GONE, hp: 1, slot: v3(0.0, 0.0, 0.0), pos: v3(0.0, 0.0, 0.0), yaw: 0.0, t: 0.0,
+                       wait: 0.0, side: 1.0, a: v3(0.0, 0.0, 0.0), b: v3(0.0, 0.0, 0.0), c: v3(0.0, 0.0, 0.0),
+                       d: v3(0.0, 0.0, 0.0), dur: 1.0, stage: 0, shots: 0, next_shot: 0.0, flash: 0.0, phase: 0.0 };
+    g.rng = Rng.{ s: seed };
+    g.time = 0.0;
+    g.wave = 1;
+    g.score = 0;
+    g.lives = 3;
+    g.over = 0.0;
+    g.clear = 0.0;
+    g.ship_x = 0.0;
+    g.ship_vx = 0.0;
+    g.ship_alive = true;
+    g.respawn = 0.0;
+    g.invuln = 2.0;
+    g.fire_cool = 0.0;
+    g.dive_cool = 4.0;
+    g.shake = 0.0;
+    g.kick = 0.0;
+    g.flash_red = 0.0;
+    g.static_t = 0.0;
+    g.rumble = 0.0;
+    g.scroll = 0.0;
+    g.banner = 0.0;
+    for i in @as(usize, 0)..MAX_ALIENS {
+        g.aliens[i] = none;
+    }
+    for i in @as(usize, 0)..MAX_SHOTS {
+        g.shots[i] = dead();
+    }
+    for i in @as(usize, 0)..MAX_ENEMY_SHOTS {
+        g.enemy[i] = dead();
+    }
+    for i in @as(usize, 0)..MAX_BITS {
+        g.bits[i] = dead();
+    }
+    for i in @as(usize, 0)..MAX_FLASHES {
+        g.flashes[i] = dead();
+    }
+    for i in @as(usize, 0)..MAX_GLOWS {
+        g.glows[i] = dead();
+    }
+    for i in @as(usize, 0)..STARS {
+        g.stars[i] = v3(rrange(&mut g.rng, -1.0, 1.0), rrange(&mut g.rng, 0.06, 0.5), rrange(&mut g.rng, -1.0, -0.3));
+    }
+    start_wave(g);
+}
+
+// The aliens of a wave, in the order they come in: groups of eight from
+// alternate sides, each one a moment behind the one before.
+fn start_wave(g: *mut Game) void {
+    g.clear = 0.0;
+    g.banner = 2.5;
+    g.dive_cool = 5.0;
+    let mut k: usize = 0;
+    // places: bosses at the back, then two rows of moths, two of bees
+    for i in @as(usize, 0)..4 {
+        set_slot(g, k, BOSS, v3(BOSS_X[i] * 4.6, 0.0, -27.0));
+        k += 1;
+    }
+    for row in @as(usize, 0)..2 {
+        for i in @as(usize, 0)..8 {
+            set_slot(
+                g, k, MOTH, v3((@float_from_int(f32, i) - 3.5) * 4.1, 0.0, -22.6 + 3.7 * @float_from_int(f32, row)));
+            k += 1;
+        }
+    }
+    for row in @as(usize, 0)..2 {
+        for i in @as(usize, 0)..10 {
+            set_slot(
+                g, k, BEE, v3((@float_from_int(f32, i) - 4.5) * 3.75, 0.0, -14.8 + 3.5 * @float_from_int(f32, row)));
+            k += 1;
+        }
+    }
+    // the order they enter in: mixed so groups have a few kinds
+    for i in @as(usize, 0)..MAX_ALIENS {
+        let group = i % 5;
+        let within = i / 5;
+        let a = &mut g.aliens[i];
+        a.side = if_else((group % 2) == 0, 1.0, -1.0);
+        a.wait = @float_from_int(f32, group) * 2.4 + @float_from_int(f32, within) * 0.16 + 0.8;
+        a.phase = rnd(&mut g.rng) * 6.28;
+    }
+}
+
+fn set_slot(g: *mut Game, k: usize, kind: u32, slot: V3) void {
+    let a = &mut g.aliens[k];
+    a.kind = kind;
+    a.state = WAITING;
+    a.hp = 1;
+    if kind == BOSS {
+        a.hp = 2;
+    }
+    a.slot = slot;
+    a.pos = v3(0.0, -50.0, 0.0);
+    a.flash = 0.0;
+    a.stage = 0;
+}
+
+// Where an alien's place in the formation is now: the formation sways and
+// breathes.
+fn slot_pos(g: *Game, a: *Alien) V3 {
+    let breathe = 1.0 + 0.06 * math.sinf(g.time * 1.1);
+    return v3(a.slot.x * breathe + 1.6 * math.sinf(g.time * 0.45), PLAY_Y, -19.0 + (a.slot.z + 19.0) * breathe);
+}
+
+fn ship_pos(g: *Game) V3 {
+    return v3(g.ship_x, PLAY_Y, SHIP_Z);
+}
+
+fn begin_path(a: *mut Alien, b: V3, c: V3, d: V3, dur: f32) void {
+    a.a = a.pos;
+    a.b = b;
+    a.c = c;
+    a.d = d;
+    a.dur = dur;
+    a.t = 0.0;
+}
+
+// -----------------------------------------------------------------------------
+// Sound
+// -----------------------------------------------------------------------------
+const RATE: u32 = 44100;
+
+fn samples(secs: f64) usize {
+    return @int_from_float(usize, secs * @float_from_int(f64, RATE));
+}
+
+// A sweep from f0 to f1 (exponentially), a square-ish tone, fading.
+fn sweep(secs: f64, f0: f64, f1: f64, decay: f64, vol: f64) !audio.Sound {
+    let n = samples(secs);
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    let mut ph: f64 = 0.0;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let f = f0 * math.exp(math.log(f1 / f0) * t / secs);
+        ph += 2.0 * math.PI * f / @float_from_int(f64, RATE);
+        let env = math.exp(-t * decay) * @min(t * 400.0, 1.0);
+        s.set_sample(i, vol * env * (math.sin(ph) + 0.3 * math.sin(3.0 * ph) + 0.12 * math.sin(5.0 * ph)));
+    }
+    return s;
+}
+
+// Filtered noise and a low thump, fading over `secs`.
+fn boom_sound(secs: f64, decay: f64, low: f64, seed: u64) !audio.Sound {
+    let n = samples(secs);
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    let mut r = Rng.{ s: seed };
+    let mut y: f64 = 0.0;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let k = 0.05 + 0.45 * math.exp(-t * 8.0);
+        y += (@as(f64, rnd(&mut r)) * 2.0 - 1.0 - y) * k;
+        let env = math.exp(-t * decay) * @min(t * 300.0, 1.0);
+        let thump = math.sin(2.0 * math.PI * low * t * (1.0 - 0.3 * t / secs)) * math.exp(-t * decay * 0.7);
+        s.set_sample(i, env * (0.85 * y + 0.4 * thump));
+    }
+    return s;
+}
+
+struct Sound {
+    engine: xaudio2.Engine,
+    on: bool,
+    shot: audio.Sound,
+    zap: audio.Sound,
+    pop: audio.Sound,
+    big: audio.Sound,
+    dive: audio.Sound,
+    voices: [8]xaudio2.Voice,
+    sounds: [8]u32,  // which sound each voice was made for
+    next: usize,
+    haptics: bool,  // rumble the controller (not for the demo behind the menu)
+}
+
+const S_SHOT: u32 = 0;
+const S_ZAP: u32 = 1;
+const S_POP: u32 = 2;
+const S_BIG: u32 = 3;
+const S_DIVE: u32 = 4;
+
+fn sound(enabled: bool) !Sound {
+    let none = xaudio2.Voice.{ v: 0, block: 0 };
+    let mut s = Sound.{
+        engine: xaudio2.Engine.{ x: 0, master: 0 }, on: false, shot: sweep(0.16, 1900.0, 600.0, 18.0, 0.18)!,
+        zap: sweep(0.25, 700.0, 180.0, 10.0, 0.16)!, pop: boom_sound(0.6, 6.0, 90.0, 7)!, big: boom_sound(
+            2.2, 1.6, 45.0, 13)!, dive: sweep(0.9, 1400.0, 300.0, 1.5, 0.08)!, voices: [none; 8], sounds: [0; 8],
+        next: 0, haptics: enabled };
+    if not enabled {
+        return s;
+    }
+    s.engine = xaudio2.Engine.init() catch {
+        return s;  // no audio device: silence
+    };
+    for i in @as(usize, 0)..8 {
+        s.voices[i] = s.engine.voice(&s.shot)!;  // all the sounds have one format
+    }
+    s.on = true;
+    return s;
+}
+
+fn play(s: *mut Sound, which: u32, pitch: f32, volume: f32) void {
+    if not s.on {
+        return;
+    }
+    let mut v = &mut s.voices[s.next];
+    s.next = (s.next + 1) % 8;
+    v.stop();
+    v.set_pitch(pitch);
+    v.set_volume(volume);
+    if which == S_SHOT {
+        v.play(&s.shot, false) catch {};
+    } else if which == S_ZAP {
+        v.play(&s.zap, false) catch {};
+    } else if which == S_POP {
+        v.play(&s.pop, false) catch {};
+    } else if which == S_BIG {
+        v.play(&s.big, false) catch {};
+    } else {
+        v.play(&s.dive, false) catch {};
+    }
+}
+
+// The controller's motors, if this game may use them.
+fn rumble(s: *Sound, strength: f32) void {
+    if s.haptics {
+        _ = xinput.vibrate(0, strength, strength);
+    }
+}
+
+fn sound_deinit(s: *mut Sound) void {
+    if s.on {
+        for i in @as(usize, 0)..8 {
+            s.voices[i].destroy();
+        }
+        s.engine.deinit();
+    }
+    s.shot.deinit();
+    s.zap.deinit();
+    s.pop.deinit();
+    s.big.deinit();
+    s.dive.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Playing
+// -----------------------------------------------------------------------------
+struct Input {
+    x: f32,
+    fire: bool,
+}
+
+struct Keys {
+    left: bool,
+    right: bool,
+    fire: bool,
+}
+
+fn key(k: *mut Keys, code: u32, down: bool) void {
+    if (code == win32.KEY_LEFT) or (code == 'A') {
+        k.left = down;
+    } else if (code == win32.KEY_RIGHT) or (code == 'D') {
+        k.right = down;
+    } else if (code == win32.KEY_SPACE) or (code == win32.KEY_CONTROL) or (code == win32.KEY_ENTER) {
+        k.fire = down;
+    }
+}
+
+fn axis(neg: bool, pos: bool) f32 {
+    if neg == pos {
+        return 0.0;
+    }
+    if pos {
+        return 1.0;
+    }
+    return -1.0;
+}
+
+// Lines up under the nearest alien, steps out of the way of shots and
+// divers coming at it, and fires.
+fn autopilot(g: *Game) Input {
+    let mut target = g.ship_x;
+    let mut best: f32 = 1.0e9;
+    for i in @as(usize, 0)..MAX_ALIENS {
+        let a = g.aliens[i];
+        if (a.state == GONE) or (a.state == WAITING) or (a.pos.z > SHIP_Z) {
+            continue;
+        }
+        let d = @abs(a.pos.x - g.ship_x) + (SHIP_Z - a.pos.z) * 0.3;
+        if d < best {
+            best = d;
+            target = a.pos.x;
+        }
+    }
+    // danger: shots and divers close in front of the ship
+    for i in @as(usize, 0)..MAX_ENEMY_SHOTS {
+        let b = g.enemy[i];
+        if b.alive and (b.p.z > SHIP_Z - 9.0) and (b.p.z < SHIP_Z + 1.0) and (@abs(b.p.x - g.ship_x) < 1.6) {
+            target = g.ship_x + if_else(b.p.x > g.ship_x, -3.5, 3.5);
+        }
+    }
+    for i in @as(usize, 0)..MAX_ALIENS {
+        let a = g.aliens[i];
+        if (a.state == DIVE) and (a.pos.z > SHIP_Z - 8.0) and (@abs(a.pos.x - g.ship_x) < 2.5) {
+            target = g.ship_x + if_else(a.pos.x > g.ship_x, -4.0, 4.0);
+        }
+    }
+    return Input.{ x: clamp((target - g.ship_x) * 0.8, -1.0, 1.0), fire: true };
+}
+
+fn flash(g: *mut Game, p: V3, reach: f32, c: V3, life: f32) void {
+    spawn(g.flashes[..], Body.{ p: p, v: v3(0.0, 0.0, 0.0), c: c, rot: v3(0.0, 0.0, 0.0), spin: v3(0.0, 0.0, 0.0),
+                                life: life, max: life, size: reach, kind: 0, light: false, alive: true });
+}
+
+fn glow_burst(g: *mut Game, p: V3, n: usize, speed: f32, size: f32, c: V3, life: f32) void {
+    for burst in @as(usize, 0)..n {
+        let d = vnorm(v3(rnd(&mut g.rng) - 0.5, rnd(&mut g.rng) * 0.6, rnd(&mut g.rng) - 0.5));
+        let l = life * rrange(&mut g.rng, 0.5, 1.0);
+        spawn(g.glows[..], Body.{ p: p, v: vmul(d, speed * rrange(&mut g.rng, 0.3, 1.0)), c: c, rot: v3(0.0, 0.0, 0.0),
+                                  spin: v3(0.0, 0.0, 0.0), life: l, max: l, size: size * rrange(&mut g.rng, 0.6, 1.4),
+                                  kind: 0, light: false, alive: true });
+    }
+}
+
+// Breaks a model at pos (turned by yaw) into its cubes, flying apart from
+// its centre with the momentum it had.
+fn shatter(g: *mut Game, m: *Model, pos: V3, yaw: f32, vel: V3, light: V3, force: f32) void {
+    let co = math.cosf(yaw);
+    let si = math.sinf(yaw);
+    for i in 0..m.n {
+        let l = m.pos[i];
+        let w = vadd(pos, v3(l.x * co + l.z * si, l.y, -l.x * si + l.z * co));
+        let out = vsub(w, vadd(pos, v3(0.0, -0.3, 0.0)));
+        let v = vadd(
+            vadd(vel, vmul(vnorm(out), force * rrange(&mut g.rng, 0.4, 1.2))), v3(
+                rrange(&mut g.rng, -1.5, 1.5), rrange(&mut g.rng, 2.0, 7.0), rrange(&mut g.rng, -1.5, 1.5)));
+        // debris is dull: darker and greyer than what it came from, so it is
+        // not taken for an alien or a shot
+        let mut c = dull(m.col[i]);
+        if m.light[i] {
+            c = light;
+        }
+        let life = rrange(&mut g.rng, 3.0, 4.5);
+        spawn(g.bits[..], Body.{ p: w, v: v, c: c, rot: v3(rnd(&mut g.rng) * 6.28, rnd(&mut g.rng) * 6.28, 0.0),
+                                 spin: v3(rrange(&mut g.rng, -12.0, 12.0), rrange(&mut g.rng, -12.0, 12.0), 0.0),
+                                 life: life, max: life, size: HC, kind: 0, light: m.light[i], alive: true });
+    }
+}
+
+// A hit that does not destroy: some of a model's cubes (picked at random)
+// knocked off as debris; the model keeps them.
+fn chip(g: *mut Game, m: *Model, pos: V3, yaw: f32, n: usize) void {
+    let co = math.cosf(yaw);
+    let si = math.sinf(yaw);
+    for k in 0..n {
+        let i = @int_from_float(usize, rnd(&mut g.rng) * @float_from_int(f32, m.n - 1));
+        let l = m.pos[i];
+        let w = vadd(pos, v3(l.x * co + l.z * si, l.y, -l.x * si + l.z * co));
+        let out = vnorm(vadd(vsub(w, pos), v3(0.0, 0.2, 0.0)));
+        let v = vadd(vmul(out, rrange(&mut g.rng, 4.0, 9.0)), v3(0.0, rrange(&mut g.rng, 3.0, 6.0), -3.0));
+        let life = rrange(&mut g.rng, 2.0, 3.0);
+        spawn(g.bits[..], Body.{ p: w, v: v, c: dull(m.col[i]), rot: v3(rnd(&mut g.rng) * 6.28, rnd(&mut g.rng) * 6.28,
+                                                                        0.0), spin: v3(
+                                                                            rrange(&mut g.rng, -14.0, 14.0),
+                                                                            rrange(&mut g.rng, -14.0, 14.0), 0.0),
+                                 life: life, max: life, size: HC * 0.8, kind: 0, light: false, alive: true });
+    }
+}
+
+// A colour darkened and moved toward grey: debris.
+fn dull(c: V3) V3 {
+    let g = (c.x + c.y + c.z) / 3.0;
+    return vmul(vadd(vmul(c, 0.45), vmul(v3(g, g, g), 0.55)), 0.45);
+}
+
+fn light_colour(kind: u32) V3 {
+    if kind == BEE {
+        return v3(1.0, 0.15, 0.1);
+    }
+    if kind == MOTH {
+        return v3(0.2, 0.85, 1.0);
+    }
+    if kind == BOSS {
+        return v3(1.0, 0.85, 0.2);
+    }
+    return v3(0.25, 0.9, 1.0);
+}
+
+fn model_of(art: *Art, kind: u32) *Model {
+    if kind == BEE {
+        return &art.bee;
+    }
+    if kind == MOTH {
+        return &art.moth;
+    }
+    if kind == BOSS {
+        return &art.boss;
+    }
+    return &art.ship;
+}
+
+struct Art {
+    bee: Model,
+    moth: Model,
+    boss: Model,
+    ship: Model,
+}
+
+fn make_art() Art {
+    return Art.{ bee: make_model(BEE_ART[..]), moth: make_model(MOTH_ART[..]), boss: make_model(BOSS_ART[..]),
+                 ship: make_model(SHIP_ART[..]) };
+}
+
+fn kill_alien(g: *mut Game, art: *Art, i: usize, s: *mut Sound) void {
+    let a = g.aliens[i];
+    let diving = (a.state == DIVE) or (a.state == RETURN);
+    let mut points: u32 = 50;
+    if a.kind == MOTH {
+        points = 80;
+    } else if a.kind == BOSS {
+        points = 150;
+    }
+    if diving {
+        points *= 2;
+        if a.kind == BOSS {
+            points = 400;
+        }
+    }
+    g.score += points;
+    g.aliens[i].state = GONE;
+    let lc = light_colour(a.kind);
+    let vel = vmul(vsub(path_point(&g.aliens[i], a.t + 0.02), a.pos), 25.0);
+    shatter(g, model_of(art, a.kind), a.pos, a.yaw, vmul(vel, 0.4), lc, 6.0);
+    flash(g, vadd(a.pos, v3(0.0, 0.8, 0.0)), 12.0, v3(1.0, 0.55, 0.2), 0.5);
+    glow_burst(g, a.pos, 10, 6.0, 0.7, v3(1.0, 0.6, 0.25), 0.4);
+    let mut shake: f32 = 0.22;
+    if a.kind == BOSS {
+        shake = 0.38;
+    }
+    g.shake = @max(g.shake, shake);
+    play(s, S_POP, rrange(&mut g.rng, 0.9, 1.25), 0.8);
+}
+
+fn path_point(a: *Alien, t: f32) V3 {
+    return bezier(a.a, a.b, a.c, a.d, clamp(t / a.dur, 0.0, 1.0));
+}
+
+fn kill_ship(g: *mut Game, art: *Art, s: *mut Sound) void {
+    if not g.ship_alive or (g.invuln > 0.0) {
+        return;
+    }
+    g.ship_alive = false;
+    g.respawn = 2.5;
+    let p = ship_pos(g);
+    shatter(g, &art.ship, p, 0.0, v3(g.ship_vx * 0.5, 0.0, 0.0), light_colour(SHIP), 9.0);
+    flash(g, vadd(p, v3(0.0, 1.0, 0.0)), 22.0, v3(1.0, 0.5, 0.15), 0.9);
+    glow_burst(g, p, 30, 9.0, 1.0, v3(1.0, 0.55, 0.2), 0.7);
+    g.shake = 1.0;
+    g.kick = if_else(rnd(&mut g.rng) < 0.5, -1.0, 1.0) * rrange(&mut g.rng, 0.15, 0.3);
+    g.flash_red = 0.8;
+    g.static_t = 0.4;
+    g.rumble = 0.6;
+    rumble(s, 1.0);
+    play(s, S_BIG, 1.0, 1.0);
+    if g.lives > 0 {
+        g.lives -= 1;
+    }
+    if g.lives == 0 {
+        g.over = 0.001;
+    }
+}
+
+fn shot_colour(kind: u32) V3 {
+    if kind == PLASMA {
+        return v3(0.85, 0.2, 1.0);
+    }
+    if kind == STAR {
+        return v3(1.0, 0.85, 0.2);
+    }
+    return v3(1.0, 0.35, 0.06);
+}
+
+fn enemy_fire(g: *mut Game, a: *Alien, s: *mut Sound) void {
+    let from = vadd(a.pos, v3(0.0, 0.0, 0.8));
+    let lead = g.ship_vx * 0.4;
+    let to = vadd(ship_pos(g), v3(lead + rrange(&mut g.rng, -1.0, 1.0), 0.0, 0.0));
+    let mut speed = 11.0 + 1.5 * @float_from_int(f32, g.wave);
+    let mut d = vnorm(vsub(to, from));
+    if d.z < 0.4 {
+        d = vnorm(v3(d.x, 0.0, 0.4));
+    }
+    let mut kind = SPARK;
+    let mut pitch: f32 = 1.2;
+    if a.kind == MOTH {
+        kind = PLASMA;
+        speed *= 0.85;
+        pitch = 0.75;
+    } else if a.kind == BOSS {
+        kind = STAR;
+        speed *= 0.9;
+        pitch = 0.55;
+    }
+    // a boss fires three in a fan
+    let mut spread: [3]f32 = [0.0, 0.0, 0.0];
+    let mut n: usize = 1;
+    if kind == STAR {
+        spread = [-0.28, 0.0, 0.28];
+        n = 3;
+    }
+    for k in 0..n {
+        let co = math.cosf(spread[k]);
+        let si = math.sinf(spread[k]);
+        let dk = v3(d.x * co + d.z * si, 0.0, -d.x * si + d.z * co);
+        spawn(
+            g.enemy[..], Body.{
+                p: from, v: vmul(dk, speed), c: shot_colour(kind), rot: v3(0.0, 0.0, rnd(&mut g.rng) * 6.28),
+                spin: v3(0.0, 0.0, 0.0), life: 5.0, max: 5.0, size: 0.13, kind: kind, light: true, alive: true });
+    }
+    play(s, S_ZAP, pitch * rrange(&mut g.rng, 0.92, 1.08), 0.5);
+}
+
+fn update(g: *mut Game, art: *Art, inp: Input, s: *mut Sound, dt: f32) void {
+    g.time += dt;
+    g.scroll += SCROLL_SPEED * dt;
+    g.banner = @max(g.banner - dt, 0.0);
+    g.shake = @max(g.shake - dt * 1.6, 0.0);
+    g.flash_red = @max(g.flash_red - dt * 1.3, 0.0);
+    g.static_t = @max(g.static_t - dt, 0.0);
+    g.invuln = @max(g.invuln - dt, 0.0);
+    if g.rumble > 0.0 {
+        g.rumble -= dt;
+        if g.rumble <= 0.0 {
+            rumble(s, 0.0);
+        }
+    }
+    let speedup = 1.0 + 0.08 * @float_from_int(f32, g.wave - 1);
+
+    // the ship
+    if g.ship_alive {
+        let target = clamp(inp.x, -1.0, 1.0) * 16.0;
+        g.ship_vx += (target - g.ship_vx) * @min(dt * 12.0, 1.0);
+        g.ship_x = clamp(g.ship_x + g.ship_vx * dt, -FIELD_X, FIELD_X);
+        g.fire_cool -= dt;
+        let mut live: u32 = 0;
+        for b in g.shots {
+            if b.alive {
+                live += 1;
+            }
+        }
+        if inp.fire and (g.fire_cool <= 0.0) and (live < 3) and (g.over == 0.0) {
+            g.fire_cool = 0.2;
+            spawn(
+                g.shots[..], Body.{
+                    p: vadd(ship_pos(g), v3(0.0, 0.3, -1.2)), v: v3(0.0, 0.0, -48.0), c: v3(0.4, 0.95, 1.0),
+                    rot: v3(0.0, 0.0, 0.0), spin: v3(0.0, 0.0, 0.0), life: 1.2, max: 1.2, size: 0.12, kind: 0,
+                    light: true, alive: true });
+            play(s, S_SHOT, rrange(&mut g.rng, 0.95, 1.05), 0.6);
+        }
+    } else if g.over == 0.0 {
+        g.respawn -= dt;
+        if g.respawn <= 0.0 {
+            g.ship_alive = true;
+            g.ship_x = 0.0;
+            g.ship_vx = 0.0;
+            g.invuln = 2.5;
+        }
+    }
+
+    // the aliens
+    let mut left: u32 = 0;
+    let mut in_form: u32 = 0;
+    for i in @as(usize, 0)..MAX_ALIENS {
+        let st = g.aliens[i].state;
+        if st == GONE {
+            continue;
+        }
+        left += 1;
+        g.aliens[i].flash = @max(g.aliens[i].flash - dt * 2.5, 0.0);
+        g.aliens[i].t += dt * speedup;
+        let old = g.aliens[i].pos;
+        if st == WAITING {
+            g.aliens[i].wait -= dt;
+            if g.aliens[i].wait <= 0.0 {
+                // in from far off to one side, round a loop, to its place
+                let sd = g.aliens[i].side;
+                g.aliens[i].state = ENTER;
+                g.aliens[i].stage = 0;
+                g.aliens[i].pos = v3(sd * 30.0, PLAY_Y, -42.0);
+                let mut a = g.aliens[i];
+                begin_path(&mut a, v3(sd * 22.0, PLAY_Y, 0.0), v3(-sd * 2.0, PLAY_Y, 4.0), v3(-sd * 8.0, PLAY_Y, -6.0),
+                           1.9);
+                g.aliens[i] = a;
+            }
+            continue;
+        }
+        let mut a = g.aliens[i];
+        if st == ENTER {
+            if a.stage == 0 {
+                a.pos = path_point(&a, a.t);
+                if a.t >= a.dur {
+                    a.stage = 1;
+                    let sd = a.side;
+                    begin_path(&mut a, v3(-sd * 15.0, PLAY_Y, -18.0), v3(0.0, PLAY_Y, -34.0), slot_pos(g, &a), 1.4);
+                }
+            } else {
+                a.d = slot_pos(g, &a);
+                a.pos = path_point(&a, a.t);
+                if a.t >= a.dur {
+                    a.state = FORM;
+                }
+            }
+        } else if st == FORM {
+            a.pos = slot_pos(g, &a);
+            in_form += 1;
+        } else if st == DIVE {
+            if a.stage == 0 {
+                a.pos = path_point(&a, a.t);
+                if (a.shots > 0) and (a.t >= a.next_shot) and g.ship_alive {
+                    enemy_fire(g, &a, s);
+                    a.shots -= 1;
+                    a.next_shot = a.t + rrange(&mut g.rng, 0.25, 0.6);
+                }
+                if a.t >= a.dur {
+                    // on past the ship and off the near end
+                    a.stage = 1;
+                    let p = a.pos;
+                    begin_path(
+                        &mut a, vadd(p, v3(0.0, 0.0, 6.0)), vadd(p, v3(0.0, 0.0, 12.0)), vadd(p, v3(0.0, 0.0, 18.0)),
+                        0.9);
+                }
+            } else {
+                a.pos = path_point(&a, a.t);
+                if a.t >= a.dur {
+                    // round again from beyond the formation
+                    a.state = RETURN;
+                    a.pos = v3(a.pos.x * 0.5, PLAY_Y, -48.0);
+                    begin_path(&mut a, v3(a.pos.x, PLAY_Y, -40.0), v3(a.slot.x, PLAY_Y, -36.0), slot_pos(g, &a), 1.8);
+                }
+            }
+        } else if st == RETURN {
+            a.d = slot_pos(g, &a);
+            a.pos = path_point(&a, a.t);
+            if a.t >= a.dur {
+                a.state = FORM;
+            }
+        }
+        // face the way it goes (in formation: at the ship)
+        let dv = vsub(a.pos, old);
+        let mut want: f32 = 0.0;
+        if (vlen(dv) > 0.002) and (a.state != FORM) {
+            want = math.atan2f(dv.x, dv.z);
+        }
+        let mut dy = want - a.yaw;
+        while dy > 3.14159 {
+            dy -= 6.28318;
+        }
+        while dy < -3.14159 {
+            dy += 6.28318;
+        }
+        a.yaw += dy * @min(dt * 8.0, 1.0);
+        // a diver that meets the ship takes it with it
+        if g.ship_alive and (vlen(vsub(a.pos, ship_pos(g))) < 2.3) and (g.invuln <= 0.0) {
+            g.aliens[i] = a;
+            kill_alien(g, art, i, s);
+            kill_ship(g, art, s);
+            continue;
+        }
+        g.aliens[i] = a;
+    }
+
+    // send divers down
+    g.dive_cool -= dt * speedup;
+    if (g.dive_cool <= 0.0) and (in_form > 0) and g.ship_alive and (g.over == 0.0) {
+        // fewer at first: one every two to four seconds in the first wave
+        g.dive_cool = rrange(&mut g.rng, 2.0, 4.0) / (speedup * speedup);
+        let pick = @int_from_float(usize, rnd(&mut g.rng) * @float_from_int(f32, in_form));
+        let mut n: usize = 0;
+        for i in @as(usize, 0)..MAX_ALIENS {
+            if g.aliens[i].state != FORM {
+                continue;
+            }
+            if n == pick {
+                let mut a = g.aliens[i];
+                let sd = if_else(a.slot.x >= 0.0, 1.0, -1.0);
+                let tx = clamp(g.ship_x + rrange(&mut g.rng, -3.0, 3.0), -FIELD_X, FIELD_X);
+                a.state = DIVE;
+                a.stage = 0;
+                a.side = sd;
+                begin_path(
+                    &mut a, vadd(a.pos, v3(sd * 8.0, 0.0, -6.0)), v3(tx + sd * 10.0, PLAY_Y, -2.0), v3(
+                        tx, PLAY_Y, SHIP_Z + 2.0), 2.4);
+                a.shots = 1 + @int_from_float(u32, rnd(&mut g.rng) * @min(0.5 * @float_from_int(f32, g.wave), 3.0));
+                a.next_shot = rrange(&mut g.rng, 0.6, 1.2);
+                g.aliens[i] = a;
+                play(s, S_DIVE, rrange(&mut g.rng, 0.9, 1.1), 0.6);
+                break;
+            }
+            n += 1;
+        }
+    }
+
+    // the ship's shots
+    for i in @as(usize, 0)..MAX_SHOTS {
+        if not g.shots[i].alive {
+            continue;
+        }
+        g.shots[i].life -= dt;
+        g.shots[i].p = vadd(g.shots[i].p, vmul(g.shots[i].v, dt));
+        if (g.shots[i].life <= 0.0) or (g.shots[i].p.z < -60.0) {
+            g.shots[i].alive = false;
+            continue;
+        }
+        let p = g.shots[i].p;
+        for k in @as(usize, 0)..MAX_ALIENS {
+            let st = g.aliens[k].state;
+            if (st == GONE) or (st == WAITING) {
+                continue;
+            }
+            let q = g.aliens[k].pos;
+            if (@abs(p.x - q.x) < 1.75) and (@abs(p.z - q.z) < 1.35) {
+                g.shots[i].alive = false;
+                if g.aliens[k].hp > 1 {
+                    g.aliens[k].hp -= 1;
+                    g.aliens[k].flash = 1.0;
+                    let a = g.aliens[k];
+                    chip(g, model_of(art, a.kind), a.pos, a.yaw, 14);
+                    flash(g, vadd(q, v3(0.0, 1.0, 0.0)), 11.0, v3(0.9, 0.85, 1.0), 0.35);
+                    glow_burst(g, vadd(q, v3(0.0, 0.3, 0.8)), 14, 9.0, 0.6, v3(1.0, 0.9, 0.7), 0.3);
+                    g.shake = @max(g.shake, 0.2);
+                    play(s, S_ZAP, 2.2, 0.6);
+                    play(s, S_POP, 2.0, 0.5);
+                } else {
+                    kill_alien(g, art, k, s);
+                }
+                break;
+            }
+        }
+    }
+
+    // theirs
+    for i in @as(usize, 0)..MAX_ENEMY_SHOTS {
+        if not g.enemy[i].alive {
+            continue;
+        }
+        g.enemy[i].life -= dt;
+        let mut b = g.enemy[i];
+        b.p = vadd(b.p, vmul(b.v, dt));
+        let age = b.max - b.life;
+        if b.kind == PLASMA {
+            // side to side, across its path
+            let across = vnorm(v3(b.v.z, 0.0, -b.v.x));
+            b.p = vadd(b.p, vmul(across, math.cosf(age * 9.0 + b.rot.z) * 4.0 * dt));
+        }
+        // a trail of fading glows
+        b.rot.x -= dt;
+        if b.rot.x <= 0.0 {
+            b.rot.x = 0.035;
+            let tl: f32 = if_else(b.kind == STAR, 0.22, 0.3);
+            spawn(g.glows[..], Body.{ p: b.p, v: vmul(b.v, 0.05), c: vmul(b.c, 0.7), rot: v3(0.0, 0.0, 0.0),
+                                      spin: v3(0.0, 0.0, 0.0), life: tl, max: tl, size: 0.55, kind: 0, light: false,
+                                      alive: true });
+        }
+        g.enemy[i] = b;
+        if (g.enemy[i].life <= 0.0) or (g.enemy[i].p.z > SHIP_Z + 12.0) {
+            g.enemy[i].alive = false;
+            continue;
+        }
+        if g.ship_alive and (vlen(vsub(g.enemy[i].p, ship_pos(g))) < 1.25) and (g.invuln <= 0.0) {
+            g.enemy[i].alive = false;
+            kill_ship(g, art, s);
+        }
+    }
+
+    // debris: falls, bounces on the floor, settles, fades
+    for i in @as(usize, 0)..MAX_BITS {
+        if not g.bits[i].alive {
+            continue;
+        }
+        let mut b = g.bits[i];
+        b.life -= dt;
+        if b.life <= 0.0 {
+            g.bits[i].alive = false;
+            continue;
+        }
+        b.v.y -= 22.0 * dt;
+        b.p = vadd(b.p, vmul(b.v, dt));
+        b.rot = vadd(b.rot, vmul(b.spin, dt));
+        let ground = floor_at(g.scroll, b.p.x, b.p.z) + b.size;
+        if b.p.y <= ground + 0.01 {
+            b.p.z += SCROLL_SPEED * dt;  // carried by the floor
+        }
+        if b.p.z > 40.0 {
+            g.bits[i].alive = false;
+            continue;
+        }
+        if b.p.y < ground {
+            b.p.y = ground;
+            if b.v.y < -1.0 {
+                b.v.y = -b.v.y * 0.35;
+            } else {
+                b.v.y = 0.0;
+            }
+            b.v.x *= 0.7;
+            b.v.z *= 0.7;
+            b.spin = vmul(b.spin, 0.6);
+        }
+        g.bits[i] = b;
+    }
+    for i in @as(usize, 0)..MAX_GLOWS {
+        if g.glows[i].alive {
+            g.glows[i].life -= dt;
+            g.glows[i].p = vadd(g.glows[i].p, vmul(g.glows[i].v, dt));
+            g.glows[i].v = vmul(g.glows[i].v, 1.0 - @min(dt * 3.0, 1.0));
+            if g.glows[i].life <= 0.0 {
+                g.glows[i].alive = false;
+            }
+        }
+    }
+    for i in @as(usize, 0)..MAX_FLASHES {
+        if g.flashes[i].alive {
+            g.flashes[i].life -= dt;
+            if g.flashes[i].life <= 0.0 {
+                g.flashes[i].alive = false;
+            }
+        }
+    }
+
+    // the wave's end, the game's
+    if (left == 0) and (g.over == 0.0) {
+        g.clear += dt;
+        if g.clear > 2.5 {
+            g.wave += 1;
+            start_wave(g);
+        }
+    }
+    if g.over > 0.0 {
+        g.over += dt;  // (the menu takes over after a while)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Cubes: quads written in place into a vertex buffer (12 floats a vertex)
+// -----------------------------------------------------------------------------
+struct Quads {
+    v: []mut f32,
+    n: usize,  // quads written
+    cap: usize,
+}
+
+fn put_vertex(q: *mut Quads, at: usize, p: V3, n: V3, c: V3, mat: f32, u: f32, w: f32) void {
+    let v = q.v;
+    v[at] = p.x;
+    v[at + 1] = p.y;
+    v[at + 2] = p.z;
+    v[at + 3] = n.x;
+    v[at + 4] = n.y;
+    v[at + 5] = n.z;
+    v[at + 6] = c.x;
+    v[at + 7] = c.y;
+    v[at + 8] = c.z;
+    v[at + 9] = mat;
+    v[at + 10] = u;
+    v[at + 11] = w;
+}
+
+// One face: its centre, normal, and half-extents along it (u × w = n).
+fn quad(q: *mut Quads, fc: V3, n: V3, u: V3, w: V3, c: V3, mat: f32) void {
+    if q.n >= q.cap {
+        return;
+    }
+    let at = q.n * 4 * VERT;
+    put_vertex(q, at, vsub(vsub(fc, u), w), n, c, mat, -1.0, -1.0);
+    put_vertex(q, at + VERT, vsub(vadd(fc, u), w), n, c, mat, 1.0, -1.0);
+    put_vertex(q, at + 2 * VERT, vadd(vadd(fc, u), w), n, c, mat, 1.0, 1.0);
+    put_vertex(q, at + 3 * VERT, vadd(vsub(fc, u), w), n, c, mat, -1.0, 1.0);
+    q.n += 1;
+}
+
+// A box at c with axes ax, ay, az (unit) and half-sizes h; `faces` says
+// which faces to make (bits: +x -x +y -y +z -z).
+fn box(q: *mut Quads, c: V3, ax: V3, ay: V3, az: V3, h: V3, col: V3, mat: f32, faces: u8) void {
+    let x = vmul(ax, h.x);
+    let y = vmul(ay, h.y);
+    let z = vmul(az, h.z);
+    if (faces & 1) != 0 {
+        quad(q, vadd(c, x), ax, vmul(z, -1.0), y, col, mat);
+    }
+    if (faces & 2) != 0 {
+        quad(q, vsub(c, x), vmul(ax, -1.0), z, y, col, mat);
+    }
+    if (faces & 4) != 0 {
+        quad(q, vadd(c, y), ay, x, vmul(z, -1.0), col, mat);
+    }
+    if (faces & 8) != 0 {
+        quad(q, vsub(c, y), vmul(ay, -1.0), x, z, col, mat);
+    }
+    if (faces & 16) != 0 {
+        quad(q, vadd(c, z), az, x, y, col, mat);
+    }
+    if (faces & 32) != 0 {
+        quad(q, vsub(c, z), vmul(az, -1.0), vmul(x, -1.0), y, col, mat);
+    }
+}
+
+fn cube(q: *mut Quads, c: V3, h: f32, col: V3, mat: f32) void {
+    box(q, c, v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0), v3(h, h, h), col, mat, 0x3f);
+}
+
+// A model at pos, turned by yaw (and banked by roll), wings flapping by
+// `flap`; its lights in `light`, at `on` (0..1); tinted toward `tint` by
+// `tint_k`.
+fn model(q: *mut Quads, m: *Model, pos: V3, yaw: f32, roll: f32, flap: f32, light: V3, on: f32, tint: V3, tint_k: f32,
+         white: f32) void {
+    let co = math.cosf(yaw);
+    let si = math.sinf(yaw);
+    let cr = math.cosf(roll);
+    let sr = math.sinf(roll);
+    // roll about the model's z, then yaw about y
+    let ax = v3(cr * co, sr, -cr * si);
+    let ay = v3(-sr * co, cr, sr * si);
+    let az = v3(si, 0.0, co);
+    let lc = vmul(light, 0.25 + 1.6 * on);
+    for i in 0..m.n {
+        let l = m.pos[i];
+        let ly = l.y + flap * m.wing[i] * 0.5;
+        let w = vadd(pos, vadd(vadd(vmul(ax, l.x), vmul(ay, ly)), vmul(az, l.z)));
+        if m.light[i] {
+            box(q, w, ax, ay, az, v3(HC, HC, HC), lc, 1.0, m.faces[i]);
+        } else {
+            let c = vadd(vmul(m.col[i], 1.0 - tint_k), vmul(tint, tint_k));
+            if white > 0.05 {
+                // just hit: white hot, fading back to its colours
+                let wc = vadd(vmul(c, 1.0 - white), vmul(v3(2.2, 2.2, 2.4), white));
+                box(q, w, ax, ay, az, v3(HC, HC, HC), wc, 1.0, m.faces[i]);
+            } else {
+                box(q, w, ax, ay, az, v3(HC, HC, HC), c, 3.0, m.faces[i]);  // lit from within
+            }
+        }
+    }
+}
+
+// The floor: tiles at heights jittered a little at random, tall blocks
+// here and there along the edges; tile (i, j) is at x = 2i + 1, and at
+// z = 2j + 1 + the scroll, so the floor moves toward the ship.
+fn tile_hash(i: i32, j: i32) f32 {
+    let mut x = (@as(u64, @bit_cast(u32, i)) *% 0x9e37_79b9_7f4a_7c15) ^ (
+        @as(u64, @bit_cast(u32, j)) *% 0xc2b2_ae3d_27d4_eb4f);
+    x = (x ^ (x >> 31)) *% 0xbf58_476d_1ce4_e5b9;
+    x = x ^ (x >> 29);
+    return @float_from_int(f32, x >> 40) / 16777216.0;
+}
+
+fn tile_top(i: i32, j: i32) f32 {
+    let x = @float_from_int(f32, i) * TILE + 1.0;
+    if (@abs(x) > 19.0) and (tile_hash(i + 1000, j) < 0.3) {
+        return 0.4 + tile_hash(i, j) * 3.4;
+    }
+    return (tile_hash(i, j) - 0.5) * 0.36;
+}
+
+fn tile_of(v: f32) i32 {
+    return @int_from_float(i32, @floor(v / TILE));
+}
+
+// The floor's height under (x, z).
+fn floor_at(scroll: f32, x: f32, z: f32) f32 {
+    return tile_top(tile_of(x), tile_of(z - scroll));
+}
+
+fn make_floor(q: *mut Quads, scroll: f32) void {
+    let j0 = tile_of(-96.0 - scroll);
+    let j1 = tile_of(34.0 - scroll);
+    let mut j = j0;
+    while j <= j1 {
+        let z = @float_from_int(f32, j) * TILE + 1.0 + scroll;
+        let mut i: i32 = -24;
+        while i < 24 {
+            let x = @float_from_int(f32, i) * TILE + 1.0;
+            let top = tile_top(i, j);
+            let bottom: f32 = -1.2;
+            // the top, and the sides that stand above a neighbour
+            let mut faces: u8 = 4;
+            if tile_top(i + 1, j) < top {
+                faces = faces | 1;
+            }
+            if tile_top(i - 1, j) < top {
+                faces = faces | 2;
+            }
+            if tile_top(i, j + 1) < top {
+                faces = faces | 16;
+            }
+            if tile_top(i, j - 1) < top {
+                faces = faces | 32;
+            }
+            let shade = 0.16 + 0.08 * tile_hash(i + 500, j);
+            let mut col = v3(shade, shade * 1.05, shade * 1.2);
+            if top > 0.3 {
+                col = vmul(col, 1.15);
+            }
+            box(
+                q, v3(x, (top + bottom) * 0.5, z), v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0), v3(
+                    0.97, (top - bottom) * 0.5, 0.97), col, 2.0, faces);
+            i += 1;
+        }
+        j += 1;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Text: a 5x7 pixel font, drawn in squares (the instruments) or cubes (the
+// title)
+// -----------------------------------------------------------------------------
+let FONT_CHARS: []u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-!:.";
+let FONT: [40][7]u8 = [
+    [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11], [0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e], [
+        0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e], [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e], [
+            0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f], [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10], [
+                0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f], [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11], [
+                    0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e], [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c], [
+                        0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11], [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f], [
+                            0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11], [0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11],
+    [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e], [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10], [
+        0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d], [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11], [
+            0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e], [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04], [
+                0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e], [0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04], [
+                    0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a], [0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11], [
+                        0x11, 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04], [0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f], [
+                            0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e], [0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e],
+    [0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f], [0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e], [
+        0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02], [0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e], [
+            0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e], [0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08], [
+                0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e], [0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c], [
+                    0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00], [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04], [
+                        0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00], [0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c]];
+
+// The font's index of a character (-1: none, as for a space).
+fn glyph(c: u8) i32 {
+    for k in 0..FONT_CHARS.len {
+        if FONT_CHARS[k] == c {
+            return @bit_cast(i32, @truncate(u32, k));
+        }
+    }
+    return -1;
+}
+
+fn pixel_on(g: i32, row: usize, col: usize) bool {
+    if g < 0 {
+        return false;
+    }
+    let bits = FONT[@as(usize, @bit_cast(u32, g))][row];
+    return ((bits >> @truncate(u8, 4 - col)) & 1) != 0;
+}
+
+let TITLE: []u8 = "SWARM";
+
+// The title in cubes, facing the camera, rippling, its pixels in colours
+// from cyan to magenta, some of them lights.
+fn make_title(q: *mut Quads, cam: Camera, t: f32) void {
+    let pitch: f32 = 0.78;
+    let cols = TITLE.len * 6 - 1;
+    let centre = cam.title;
+    let az = vmul(cam.fwd, -1.0);
+    for ci in 0..TITLE.len {
+        let g = glyph(TITLE[ci]);
+        for row in @as(usize, 0)..7 {
+            for col in @as(usize, 0)..5 {
+                if not pixel_on(g, row, col) {
+                    continue;
+                }
+                let cx = ci * 6 + col;
+                let u = @float_from_int(f32, cx) / @float_from_int(f32, cols - 1);
+                let x = (@float_from_int(f32, cx) - @float_from_int(f32, cols - 1) * 0.5) * pitch;
+                let y = (3.0 - @float_from_int(f32, row)) * pitch;
+                let wave = math.sinf(t * 2.2 - @float_from_int(f32, cx) * 0.25) * 0.35;
+                let p = vadd(centre, vadd(vadd(vmul(cam.right, x), vmul(cam.up, y + wave * 0.3)), vmul(az, wave)));
+                let c = vadd(vmul(v3(0.15, 0.85, 1.0), 1.0 - u), vmul(v3(1.0, 0.2, 0.75), u));
+                let spark = tile_hash(@bit_cast(i32, @truncate(u32, cx)), @bit_cast(i32, @truncate(u32, row)) + 77);
+                let h = pitch * 0.5;
+                if (spark > 0.82) and (math.sinf(t * 5.0 + spark * 40.0) > 0.0) {
+                    box(q, p, cam.right, cam.up, az, v3(h, h, h), vmul(c, 1.8), 1.0, 0x3f);
+                } else {
+                    box(q, p, cam.right, cam.up, az, v3(h, h, h), c, 3.0, 0x3f);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Graphics
+// -----------------------------------------------------------------------------
+struct Gfx {
+    root: d3d.RootSignature,
+    solid: d3d.Pipeline,
+    glow: d3d.Pipeline,
+    hud: d3d.Pipeline,
+    shadow_pipe: d3d.Pipeline,
+    shadow: d3d.DepthBuffer,
+    lights: d3d.Buffer,
+    cubes: d3d.Buffer,  // this frame's cubes (written in place)
+    index: d3d.Buffer,  // 0 1 2 0 2 3 for every quad
+    quad: d3d.Buffer,   // the billboards' and instruments' square
+}
+
+fn f32_bytes(p: []f32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}
+
+fn u32_bytes(p: []u32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}
+
+fn shader_source() !strs.String {
+    let mut s = strs.String.init();
+    for l in SHADER_LINES {
+        s.push_str(l)!;
+        s.push('\n')!;
+    }
+    return s;
+}
+
+fn shader(src: []u8, entry: []u8, target: []u8) !hlsl.Code {
+    return hlsl.compile(src, entry, target) catch |e| {
+        if e == error.CompileError {
+            fmt.eprint("swarm: {}\n", [fmt.str(hlsl.message())]) catch {};
+        }
+        return e;
+    };
+}
+
+fn attributes() [4]d3d.Attribute {
+    let attrs: [4]d3d.Attribute = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32B32_FLOAT,
+                                                   offset: 0 }, d3d.Attribute.{
+                                                       semantic: "NORMAL", index: 0, format: d3d.R32G32B32_FLOAT,
+                                                       offset: 12 }, d3d.Attribute.{
+                                                           semantic: "COLOR", index: 0, format: d3d.R32G32B32A32_FLOAT,
+                                                           offset: 24 }, d3d.Attribute.{
+                                                               semantic: "TEXCOORD", index: 0, format: d3d.R32G32_FLOAT,
+                                                               offset: 40 }];
+    return attrs;
+}
+
+fn pipe(gpu: *mut d3d.Device, root: *d3d.RootSignature, src: []u8, vs: []u8, ps: []u8,
+        o: d3d.PipelineOptions) !d3d.Pipeline {
+    let mut vcode = shader(src, vs, "vs_5_0")!;
+    defer vcode.release();
+    let attrs = attributes();
+    if o.depth_only {
+        return gpu.pipeline_with(root, &vcode, &vcode, attrs[..], o);
+    }
+    let mut pcode = shader(src, ps, "ps_5_0")!;
+    defer pcode.release();
+    return gpu.pipeline_with(root, &vcode, &pcode, attrs[..], o);
+}
+
+fn options(blend: u32, depth: u32, cull: u32) d3d.PipelineOptions {
+    let mut o = d3d.PipelineOptions.defaults();
+    o.blend = blend;
+    o.depth = depth;
+    o.cull = cull;
+    return o;
+}
+
+fn graphics(gpu: *mut d3d.Device) !Gfx {
+    let mut src = shader_source()!;
+    defer src.deinit();
+    let mut root = gpu.root_signature_with(52, 1, 1)!;
+    let solid = pipe(gpu, &root, src.bytes(), "vs", "ps", options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_BACK))!;
+    let glow_pipe = pipe(
+        gpu, &root, src.bytes(), "vs_glow", "ps_glow", options(d3d.BLEND_ADD, d3d.DEPTH_TEST, d3d.CULL_NONE))!;
+    let hud = pipe(gpu, &root, src.bytes(), "vs_hud", "ps_hud", options(d3d.BLEND_ALPHA, d3d.DEPTH_OFF,
+                                                                        d3d.CULL_NONE))!;
+    let mut so = options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_NONE);
+    so.depth_only = true;
+    so.depth_bias = 1200;
+    so.slope_bias = 2.0;
+    let shadow_pipe = pipe(gpu, &root, src.bytes(), "vs_shadow", "", so)!;
+    // indices: 0 1 2 0 2 3 for every quad
+    let mut iv = vec.Vec.[u32].init();
+    defer iv.deinit();
+    let nq = MAX_QUADS;
+    let pattern: [6]u32 = [0, 1, 2, 0, 2, 3];
+    for qi in 0..nq {
+        for p in pattern {
+            iv.push(@truncate(u32, qi * 4) + p)!;
+        }
+    }
+    let mut square: [48]f32 = [0.0; 48];
+    let qc: [4][2]f32 = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+    for k2 in @as(usize, 0)..4 {
+        square[k2 * VERT] = qc[k2][0];
+        square[k2 * VERT + 1] = qc[k2][1];
+        square[k2 * VERT + 6] = 1.0;
+        square[k2 * VERT + 7] = 1.0;
+        square[k2 * VERT + 8] = 1.0;
+    }
+    return Gfx.{ root: root, solid: solid, glow: glow_pipe, hud: hud, shadow_pipe: shadow_pipe,
+                 shadow: gpu.shadow_map(SHADOW_SIZE)!, lights: gpu.constant_buffer(LIGHT_FLOATS * 4)!,
+                 cubes: gpu.upload_buffer(MAX_QUADS * 4 * VERT * 4)!, index: gpu.buffer(u32_bytes(iv.items()))!,
+                 quad: gpu.buffer(f32_bytes(square[..]))! };
+}
+
+fn release(g: *mut Gfx) void {
+    g.quad.release();
+    g.index.release();
+    g.cubes.release();
+    g.lights.release();
+    g.shadow.release();
+    g.shadow_pipe.release();
+    g.hud.release();
+    g.glow.release();
+    g.solid.release();
+    g.root.release();
+}
+
+// The frame's cubes: the floor, the title (on the menu), aliens, the ship,
+// shots, debris.
+fn make_cubes(gfx: *mut Gfx, g: *Game, art: *Art, ui: *Ui, cam: Camera) u32 {
+    let mut q = Quads.{ v: gfx.cubes.floats(), n: 0, cap: MAX_QUADS };
+    make_floor(&mut q, g.scroll);
+    if ui.menu {
+        make_title(&mut q, cam, ui.menu_t);
+    }
+    for i in @as(usize, 0)..MAX_ALIENS {
+        let a = g.aliens[i];
+        if (a.state == GONE) or (a.state == WAITING) {
+            continue;
+        }
+        let blink = math.sinf(g.time * 6.0 + a.phase);
+        let on = if_else(blink > 0.2, 1.0, 0.1);
+        let flap = math.sinf(g.time * 9.0 + a.phase);
+        let mut roll: f32 = 0.0;
+        if (a.state == DIVE) or (a.state == ENTER) or (a.state == RETURN) {
+            roll = clamp(-math.sinf(a.yaw) * 0.5, -0.5, 0.5);
+        }
+        let bob = math.sinf(g.time * 2.0 + a.phase) * 0.12;
+        let mut tint = v3(1.0, 1.0, 1.0);
+        let mut tk: f32 = 0.0;
+        if (a.kind == BOSS) and (a.hp == 1) {
+            tint = v3(0.55, 0.2, 0.85);  // hurt: purple
+            tk = 0.55;
+        }
+        // a hit knocks it back and shakes it
+        let f = a.flash;
+        let jolt = v3(math.sinf(g.time * 90.0) * f * 0.25, f * 0.3, -f * f * 0.9);
+        model(&mut q, model_of(art, a.kind), vadd(a.pos, vadd(v3(0.0, bob, 0.0), jolt)),
+              a.yaw + math.sinf(g.time * 70.0) * f * 0.25, roll, flap, light_colour(a.kind), on, tint, tk, f * f);
+    }
+    if g.ship_alive {
+        let visible = (g.invuln <= 0.0) or (math.sinf(g.time * 30.0) > 0.0);
+        if visible {
+            let roll = clamp(g.ship_vx * 0.03, -0.45, 0.45);
+            let on = 0.7 + 0.3 * math.sinf(g.time * 40.0);
+            model(&mut q, &art.ship, ship_pos(g), 0.0, roll, 0.0, light_colour(SHIP), on, v3(1.0, 1.0, 1.0), 0.0, 0.0);
+        }
+    }
+    for b in g.shots {
+        if b.alive {
+            box(
+                &mut q, b.p, v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0), v3(0.09, 0.09, 0.45), vmul(
+                    b.c, 2.0), 1.0, 0x3f);
+        }
+    }
+    for b in g.enemy {
+        if b.alive {
+            enemy_shot(&mut q, b, g.time);
+        }
+    }
+    for i in @as(usize, 0)..MAX_BITS {
+        let b = g.bits[i];
+        if not b.alive {
+            continue;
+        }
+        let k = clamp(b.life / 0.8, 0.0, 1.0);  // shrinks at the end
+        let h = b.size * k;
+        let cx = math.cosf(b.rot.x);
+        let sx = math.sinf(b.rot.x);
+        let cy = math.cosf(b.rot.y);
+        let sy = math.sinf(b.rot.y);
+        let ax = v3(cy, 0.0, -sy);
+        let ay = v3(sx * sy, cx, sx * cy);
+        let az = v3(cx * sy, -sx, cx * cy);
+        let age = b.max - b.life;
+        if b.light and (age < 0.5) {
+            // a light glows for a moment as it flies off, then goes dark
+            let lit = 1.0 - age / 0.5;
+            box(&mut q, b.p, ax, ay, az, v3(h, h, h), vmul(b.c, 0.2 + 0.9 * lit), 1.0, 0x3f);
+        } else if b.light {
+            box(&mut q, b.p, ax, ay, az, v3(h, h, h), dull(b.c), 0.0, 0x3f);
+        } else {
+            box(&mut q, b.p, ax, ay, az, v3(h, h, h), b.c, 0.0, 0x3f);
+        }
+    }
+    return @truncate(u32, q.n);
+}
+
+// An enemy shot's cubes, by its sort, moving.
+fn enemy_shot(q: *mut Quads, b: Body, now: f32) void {
+    let t = now + b.rot.z;
+    let hot = vmul(b.c, 2.4);
+    let x = v3(1.0, 0.0, 0.0);
+    let y = v3(0.0, 1.0, 0.0);
+    let z = v3(0.0, 0.0, 1.0);
+    if b.kind == PLASMA {
+        // a pulsing core, six cubes round it breathing in and out, the
+        // whole tumbling
+        let pulse = 1.0 + 0.25 * math.sinf(t * 20.0);
+        let a = t * 5.0;
+        let ax = v3(math.cosf(a), 0.0, -math.sinf(a));
+        let az = v3(math.sinf(a) * math.cosf(a * 0.7), math.sinf(a * 0.7), math.cosf(a) * math.cosf(a * 0.7));
+        let ay = vcross(az, ax);
+        box(q, b.p, ax, ay, az, v3(0.15 * pulse, 0.15 * pulse, 0.15 * pulse), vmul(hot, 1.2), 1.0, 0x3f);
+        let r = 0.3 * (1.0 + 0.35 * math.sinf(t * 12.0));
+        let dirs: [6]V3 = [ax, vmul(ax, -1.0), ay, vmul(ay, -1.0), az, vmul(az, -1.0)];
+        for d in dirs {
+            box(q, vadd(b.p, vmul(d, r)), ax, ay, az, v3(0.06, 0.06, 0.06), hot, 1.0, 0x3f);
+        }
+    } else if b.kind == STAR {
+        // a cross of cubes spinning fast, tilted
+        let a = t * 14.0;
+        let ax = v3(math.cosf(a), 0.0, -math.sinf(a));
+        let az = v3(math.sinf(a), 0.0, math.cosf(a));
+        box(q, b.p, ax, y, az, v3(0.12, 0.12, 0.12), vmul(hot, 1.2), 1.0, 0x3f);
+        let arms: [4]V3 = [ax, vmul(ax, -1.0), az, vmul(az, -1.0)];
+        for d in arms {
+            box(q, vadd(b.p, vmul(d, 0.24)), ax, y, az, v3(0.08, 0.08, 0.08), hot, 1.0, 0x3f);
+            box(q, vadd(b.p, vmul(d, 0.4)), ax, y, az, v3(0.05, 0.05, 0.05), hot, 1.0, 0x3f);
+        }
+    } else {
+        // a core, three cubes whirling round it
+        box(q, b.p, x, y, z, v3(0.1, 0.1, 0.1), vmul(hot, 1.3), 1.0, 0x3f);
+        for k in @as(usize, 0)..3 {
+            let a = t * 16.0 + @float_from_int(f32, k) * 2.094;
+            let o = v3(math.cosf(a) * 0.26, math.sinf(a * 1.3) * 0.08, math.sinf(a) * 0.26);
+            let sa = t * 9.0 + @float_from_int(f32, k);
+            let ax = v3(math.cosf(sa), 0.0, -math.sinf(sa));
+            let az = v3(math.sinf(sa), 0.0, math.cosf(sa));
+            box(q, vadd(b.p, o), ax, y, az, v3(0.065, 0.065, 0.065), hot, 1.0, 0x3f);
+        }
+    }
+}
+
+// The camera: behind and above the ship, looking up the field; shaken.
+struct Camera {
+    eye: V3,
+    fwd: V3,
+    right: V3,
+    up: V3,
+    th: f32,    // tan(half the vertical field of view)
+    title: V3,  // where the menu's title goes: fixed in the view
+}
+
+// In a tall window it moves up the field, so the ship sits low in the view.
+fn camera(g: *Game, aspect: f32) Camera {
+    let ahead = clamp((1.78 - aspect) * 5.5, 0.0, 7.0);
+    let mut eye = v3(0.0, 34.0, 24.0 - ahead);
+    let target = v3(0.0, 0.0, -8.5 - ahead);
+    let mut roll: f32 = 0.0;
+    if g.shake > 0.0 {
+        let k = g.shake * g.shake;
+        let t = g.time;
+        eye = vadd(eye, v3((math.sinf(t * 67.0) + 0.6 * math.sinf(t * 109.0 + 1.3)) * k * 0.7,
+                           (math.sinf(t * 53.0 + 0.7) + 0.6 * math.sinf(t * 91.0)) * k * 0.7, 0.0));
+        roll = g.kick * k + math.sinf(t * 37.0) * k * 0.04;
+    }
+    let fwd = vnorm(vsub(target, eye));
+    let up0 = v3(math.sinf(roll), math.cosf(roll), 0.0);
+    let right = vnorm(vcross(fwd, up0));
+    let up = vcross(right, fwd);
+    // tall windows see wider: enough to keep the field (about 0.53 of the
+    // distance either side) in view across
+    let th = @max(0.411, 0.53 / aspect);
+    let title = vadd(vadd(eye, vmul(fwd, 40.0)), vmul(up, 40.0 * th * 0.55));
+    return Camera.{ eye: eye, fwd: fwd, right: right, up: up, th: th, title: title };
+}
+
+fn gv(v: V3) geo.Vec3 {
+    return geo.Vec3.init(@as(f64, v.x), @as(f64, v.y), @as(f64, v.z));
+}
+
+fn sun_dir() V3 {
+    return vnorm(v3(0.3, -0.9, 0.3));
+}
+
+fn frame_constants(cam: Camera, aspect: f32, secs: f32) [32]u32 {
+    let view = geo.look_at(gv(cam.eye), gv(vadd(cam.eye, cam.fwd)), gv(cam.up));
+    let fovy = 2.0 * math.atanf(cam.th);
+    let proj = geo.perspective_zo(@as(f64, fovy), @as(f64, aspect), 0.5, 400.0);
+    let vp = proj.mul(view);
+    let mut f: [32]f32 = [0.0; 32];
+    put_matrix(vp, f[..], 0);
+    let sun = sun_dir();
+    let vals: [16]f32 = [cam.eye.x, cam.eye.y, cam.eye.z, secs, sun.x, sun.y, sun.z, FOG, cam.right.x, cam.right.y,
+                         cam.right.z, 0.0, cam.up.x, cam.up.y, cam.up.z, 0.0];
+    for k in @as(usize, 0)..16 {
+        f[16 + k] = vals[k];
+    }
+    let mut u: [32]u32 = [0; 32];
+    for k in @as(usize, 0)..32 {
+        u[k] = @bit_cast(u32, f[k]);
+    }
+    return u;
+}
+
+fn put_matrix(m: matrix.Mat4, out: []mut f32, at: usize) void {
+    for c in @as(usize, 0)..4 {
+        let mut col: [4]f32 = [0.0; 4];
+        @store(col[..], m.cols[c]);
+        for k in @as(usize, 0)..4 {
+            out[at + c * 4 + k] = col[k];
+        }
+    }
+}
+
+// The sun's view of the field (it does not move: no snapping needed).
+fn sun_matrix() matrix.Mat4 {
+    let l = sun_dir();
+    let view = geo.look_at(gv(vmul(l, -200.0)), geo.Vec3.init(0.0, 0.0, -18.0), geo.Vec3.init(0.0, 0.0, -1.0));
+    let mut lo = geo.Vec3.init(1.0e9, 1.0e9, 1.0e9);
+    let mut hi = geo.Vec3.init(-1.0e9, -1.0e9, -1.0e9);
+    for k in @as(usize, 0)..8 {
+        let x = if_else((k & 1) != 0, 32.0, -32.0);
+        let y = if_else((k & 2) != 0, 8.0, -1.0);
+        let z = if_else((k & 4) != 0, 18.0, -62.0);
+        let p = geo.transform_point(view, gv(v3(x, y, z)));
+        lo = geo.Vec3.init(@min(lo.x, p.x), @min(lo.y, p.y), @min(lo.z, p.z));
+        hi = geo.Vec3.init(@max(hi.x, p.x), @max(hi.y, p.y), @max(hi.z, p.z));
+    }
+    let proj = geo.orthographic_zo(lo.x, hi.x, lo.y, hi.y, -hi.z - 20.0, -lo.z + 5.0);
+    return proj.mul(view);
+}
+
+// The light buffer (b1), in floats: the sun's matrix, the shadow map's texel
+// size and whether it is on, then the lights' positions and radii, their
+// colours and strengths, their number.
+const LIGHT_FLOATS: usize = 408;
+const LPOS: usize = 20;
+const LCOL: usize = 212;
+const LCOUNT: usize = 404;
+
+struct LightList {
+    out: []mut f32,
+    n: usize,
+}
+
+fn add_light(l: *mut LightList, p: V3, r: f32, c: V3, k: f32) void {
+    if (l.n >= MAX_LIGHTS) or (k <= 0.01) {
+        return;
+    }
+    let i = l.n;
+    l.out[LPOS + i * 4] = p.x;
+    l.out[LPOS + i * 4 + 1] = p.y;
+    l.out[LPOS + i * 4 + 2] = p.z;
+    l.out[LPOS + i * 4 + 3] = r;
+    l.out[LCOL + i * 4] = c.x;
+    l.out[LCOL + i * 4 + 1] = c.y;
+    l.out[LCOL + i * 4 + 2] = c.z;
+    l.out[LCOL + i * 4 + 3] = k;
+    l.n += 1;
+}
+
+// Explosions first, then shots, the ship's engines, then the aliens' lights.
+fn light_data(g: *Game, art: *Art, ui: *Ui, cam: Camera, out: []mut f32) void {
+    put_matrix(sun_matrix(), out, 0);
+    out[16] = 1.0 / @float_from_int(f32, SHADOW_SIZE);
+    out[17] = 1.0;
+    let mut l = LightList.{ out: out, n: 0 };
+    if ui.menu {
+        // the title lights the floor under it
+        let t = ui.menu_t;
+        let c = cam.title;
+        add_light(&mut l, v3(c.x - 7.0 + 2.0 * math.sinf(t * 0.7), c.y - 3.0, c.z + 2.0), 16.0, v3(0.2, 0.85, 1.0),
+                  2.2);
+        add_light(&mut l, v3(c.x + 7.0 + 2.0 * math.sinf(t * 0.9), c.y - 3.0, c.z + 2.0), 16.0, v3(1.0, 0.25, 0.8),
+                  2.2);
+    }
+    for b in g.flashes {
+        if b.alive {
+            let k = b.life / b.max;
+            add_light(&mut l, b.p, b.size, b.c, 5.0 * k * k);
+        }
+    }
+    for b in g.shots {
+        if b.alive {
+            add_light(&mut l, b.p, 6.0, b.c, 2.2);
+        }
+    }
+    for b in g.enemy {
+        if b.alive {
+            let t = g.time + b.rot.z;
+            let mut k = 2.2 + 0.6 * math.sinf(t * 20.0);
+            if b.kind == STAR {
+                k = 1.6 + 0.4 * math.sinf(t * 14.0);
+            }
+            add_light(&mut l, b.p, 5.5, b.c, k);
+        }
+    }
+    if g.ship_alive {
+        add_light(&mut l, vadd(ship_pos(g), v3(0.0, 0.8, 1.6)), 7.0, light_colour(SHIP),
+                  1.4 + 0.3 * math.sinf(g.time * 40.0));
+    }
+    for i in @as(usize, 0)..MAX_ALIENS {
+        let a = g.aliens[i];
+        if (a.state == GONE) or (a.state == WAITING) {
+            continue;
+        }
+        let blink = math.sinf(g.time * 6.0 + a.phase);
+        let on = if_else(blink > 0.2, 1.0, 0.0);
+        let m = model_of(art, a.kind);
+        let co = math.cosf(a.yaw);
+        let si = math.sinf(a.yaw);
+        let la = m.light_at;
+        let p = vadd(a.pos, v3(la.x * co + la.z * si, la.y + 0.5, -la.x * si + la.z * co));
+        add_light(&mut l, p, 6.0, light_colour(a.kind), 1.8 * on);
+    }
+    out[LCOUNT] = @float_from_int(f32, l.n);
+}
+
+fn put_draw(gpu: *mut d3d.Device, vals: [20]f32) void {
+    let mut u: [20]u32 = [0; 20];
+    for k in @as(usize, 0)..20 {
+        u[k] = @bit_cast(u32, vals[k]);
+    }
+    gpu.set_constants_at(32, u[..]);
+}
+
+fn glow(gpu: *mut d3d.Device, p: V3, size: f32, c: V3, a: f32, fogged: bool) void {
+    let f = if_else(fogged, 1.0, 0.0);
+    put_draw(gpu, [p.x, p.y, p.z, size, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, 0.0, f, 0.0, 0.0]);
+    gpu.draw_indexed(6, 0, 0);
+}
+
+fn rect(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, c: V3, a: f32) void {
+    put_draw(gpu, [x / aspect, y, w * 0.5 / aspect, h * 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a,
+                   0.0, 0.0, 0.0, 0.0]);
+    gpu.draw_indexed(6, 0, 0);
+}
+
+fn overlay(gpu: *mut d3d.Device, kind: f32, c: V3, a: f32) void {
+    put_draw(gpu, [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, kind, 0.0, 0.0, 0.0]);
+    gpu.draw_indexed(6, 0, 0);
+}
+
+// The target's size in pixels: text and icons are laid out on its pixel grid.
+struct Screen {
+    w: f32,
+    h: f32,
+    aspect: f32,
+}
+
+// A rectangle of whole pixels: x, y its top left, w × h (pixels).
+fn pixels(gpu: *mut d3d.Device, sc: *Screen, x: f32, y: f32, w: f32, h: f32, c: V3, a: f32) void {
+    let cx = (x + w * 0.5) / sc.w * 2.0 - 1.0;
+    let cy = 1.0 - (y + h * 0.5) / sc.h * 2.0;
+    put_draw(gpu, [cx, cy, w / sc.w, h / sc.h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, 0.0, 0.0, 0.0,
+                   0.0]);
+    gpu.draw_indexed(6, 0, 0);
+}
+
+// A font pixel's size in screen pixels for a text size (a fraction of the
+// screen's half height; smaller in narrow windows, to fit): whole pixels,
+// at least two.
+fn cell_px(sc: *Screen, size: f32) f32 {
+    return @max(2.0, @floor(size * sc.h * 0.5 * @min(1.0, sc.aspect / 1.25) + 0.5));
+}
+
+// The gap between font pixels: one screen pixel, two for big text.
+fn gap_px(cell: f32) f32 {
+    if cell >= 6.0 {
+        return 2.0;
+    }
+    return 1.0;
+}
+
+// Text in the pixel font, every square the same size and every gap the
+// same width: x (-aspect..aspect) is its centre (anchor 0), left edge (-1)
+// or right edge (1); y (-1..1) its top.
+fn text_at(gpu: *mut d3d.Device, sc: *Screen, s: []u8, x: f32, y: f32, anchor: f32, size: f32, c: V3, a: f32) void {
+    let cell = cell_px(sc, size);
+    let gap = gap_px(cell);
+    let w = @float_from_int(f32, s.len) * 6.0 * cell - cell;
+    let xp = (x / sc.aspect + 1.0) * 0.5 * sc.w;
+    let x0 = @floor(xp - w * (anchor + 1.0) * 0.5 + 0.5);
+    let y0 = @floor((1.0 - y) * 0.5 * sc.h + 0.5);
+    for ci in 0..s.len {
+        let g = glyph(s[ci]);
+        if g < 0 {
+            continue;
+        }
+        for row in @as(usize, 0)..7 {
+            for col in @as(usize, 0)..5 {
+                if pixel_on(g, row, col) {
+                    pixels(
+                        gpu, sc, x0 + @float_from_int(f32, ci * 6 + col) * cell, y0 + @float_from_int(f32, row) * cell,
+                        cell - gap, cell - gap, c, a);
+                }
+            }
+        }
+    }
+}
+
+fn text(gpu: *mut d3d.Device, sc: *Screen, s: []u8, cx: f32, y: f32, size: f32, c: V3, a: f32) void {
+    text_at(gpu, sc, s, cx, y, 0.0, size, c, a);
+}
+
+// A ship left, as a small bitmap on the same grid.
+let LIFE_ICON: [5]u8 = [0x04, 0x0e, 0x1f, 0x1f, 0x11];
+
+fn life_icon(gpu: *mut d3d.Device, sc: *Screen, x0: f32, y0: f32, cell: f32, c: V3) void {
+    let gap = gap_px(cell);
+    for row in @as(usize, 0)..5 {
+        for col in @as(usize, 0)..5 {
+            if ((LIFE_ICON[row] >> @truncate(u8, 4 - col)) & 1) != 0 {
+                pixels(gpu, sc, x0 + @float_from_int(f32, col) * cell, y0 + @float_from_int(f32, row) * cell,
+                       cell - gap, cell - gap, c, 0.9);
+            }
+        }
+    }
+}
+
+fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.DepthBuffer, g: *Game, art: *Art,
+        ui: *Ui) !void {
+    let aspect = @float_from_int(f32, t.width) / @float_from_int(f32, t.height);
+    let cam = camera(g, aspect);
+    let fc = frame_constants(cam, aspect, g.time);
+    let mut lb: [408]f32 = [0.0; 408];
+    light_data(g, art, ui, cam, lb[..]);
+    gfx.lights.write(f32_bytes(lb[..]))!;
+    let nq = make_cubes(gfx, g, art, ui, cam);
+
+    // the sun's view, for shadows
+    gpu.begin_shadow(&mut gfx.shadow)!;
+    gpu.clear_depth(&gfx.shadow);
+    gpu.set_pipeline(&gfx.shadow_pipe);
+    gpu.set_buffer(0, &gfx.lights);
+    gpu.set_indices(&gfx.index, d3d.R32_UINT);
+    gpu.set_vertices(&gfx.cubes, @truncate(u32, VERT * 4));
+    gpu.draw_indexed(nq * 6, 0, 0);
+
+    gpu.begin_depth(t, z)!;
+    gpu.clear(t, 0.004, 0.005, 0.012, 1.0);
+    gpu.clear_depth(z);
+    gpu.set_pipeline(&gfx.solid);
+    gpu.set_constants_at(0, fc[..]);
+    gpu.set_buffer(0, &gfx.lights);
+    gpu.set_texture(0, &mut gfx.shadow);
+    gpu.set_indices(&gfx.index, d3d.R32_UINT);
+    gpu.set_vertices(&gfx.cubes, @truncate(u32, VERT * 4));
+    gpu.draw_indexed(nq * 6, 0, 0);
+
+    // glows, added
+    gpu.set_pipeline(&gfx.glow);
+    gpu.set_constants_at(0, fc[..]);
+    gpu.set_vertices(&gfx.quad, @truncate(u32, VERT * 4));
+    gpu.set_indices(&gfx.index, d3d.R32_UINT);
+    for s in g.stars {
+        let tw = 0.6 + 0.4 * math.sinf(g.time * 1.7 + s.x * 40.0);
+        glow(gpu, vadd(cam.eye, vmul(vnorm(s), 300.0)), 0.9 + 0.6 * @abs(s.x), v3(0.75, 0.82, 1.0), tw, false);
+    }
+    for b in g.shots {
+        if b.alive {
+            glow(gpu, b.p, 0.9, b.c, 0.8, false);
+            glow(gpu, vadd(b.p, v3(0.0, 0.0, 0.5)), 0.6, b.c, 0.5, false);
+        }
+    }
+    for b in g.enemy {
+        if b.alive {
+            let tb = g.time + b.rot.z;
+            if b.kind == PLASMA {
+                glow(gpu, b.p, 1.3 + 0.3 * math.sinf(tb * 20.0), b.c, 1.0, false);
+                glow(gpu, b.p, 0.5, v3(1.0, 0.85, 1.0), 0.8, false);
+            } else if b.kind == STAR {
+                glow(gpu, b.p, 0.9 + 0.15 * math.sinf(tb * 28.0), b.c, 0.9, false);
+            } else {
+                glow(gpu, b.p, 0.85 + 0.2 * math.sinf(tb * 35.0), b.c, 1.0, false);
+                glow(gpu, b.p, 0.35, v3(1.0, 0.9, 0.6), 0.9, false);
+            }
+        }
+    }
+    for b in g.glows {
+        if b.alive {
+            let k = b.life / b.max;
+            glow(gpu, b.p, b.size * (0.5 + 0.5 * k), b.c, k, false);
+        }
+    }
+    for b in g.flashes {
+        if b.alive {
+            let k = b.life / b.max;
+            glow(gpu, b.p, b.size * 0.25, b.c, 0.6 * k * k, false);
+        }
+    }
+
+    // the instruments
+    gpu.set_pipeline(&gfx.hud);
+    gpu.set_constants_at(0, fc[..]);
+    let scr = Screen.{ w: @float_from_int(f32, t.width), h: @float_from_int(f32, t.height), aspect: aspect };
+    let sc = &scr;
+    if ui.menu {
+        menu(gpu, sc, ui);
+        return;
+    }
+    let jolt = g.shake * g.shake;
+    let jx = math.sinf(g.time * 83.0) * jolt * 0.03;
+    let jy = math.sinf(g.time * 67.0 + 1.0) * jolt * 0.03;
+    let mut sb: [16]u8 = [0; 16];
+    let score = sb[0..put_digits(sb[..], 0, g.score, 7)];
+    text_at(gpu, sc, score, -aspect + 0.06 + jx, 0.95 + jy, -1.0, 0.016, v3(0.35, 1.0, 0.5), 0.95);
+    let mut buf: [32]u8 = [0; 32];
+    text_at(gpu, sc, high_line(buf[..], @max(ui.scores[0], g.score)), jx, 0.95 + jy, 0.0, 0.011, v3(1.0, 0.45, 0.4),
+            0.85);
+    let mut wv: [16]u8 = [0; 16];
+    text_at(gpu, sc, wave_line(wv[..], g.wave), aspect - 0.06 + jx, 0.95 + jy, 1.0, 0.011, v3(1.0, 0.75, 0.3), 0.9);
+    let icon = cell_px(sc, 0.016);
+    let ix = @floor(jx / aspect * 0.5 * sc.w + 0.5) + icon * 3.0;
+    let iy = sc.h - icon * 8.0 + @floor(jy * sc.h * 0.5);
+    for k in @as(u32, 0)..g.lives {
+        life_icon(gpu, sc, ix + @float_from_int(f32, k) * icon * 7.0, iy, icon, v3(0.9, 0.9, 0.95));
+    }
+    if (g.banner > 0.0) and (g.over == 0.0) {
+        let mut wb: [16]u8 = [0; 16];
+        let a = @min(g.banner * 1.5, 1.0);
+        text(gpu, sc, wave_line(wb[..], g.wave), 0.0, 0.3, 0.03, v3(1.0, 0.8, 0.3), a);
+    }
+    if g.flash_red > 0.0 {
+        rect(gpu, aspect, 0.0, 0.0, aspect * 2.0, 2.0, v3(1.0, 0.1, 0.05), g.flash_red * 0.12);
+        overlay(gpu, 1.0, v3(0.9, 0.05, 0.02), @min(g.flash_red * 1.3, 1.0));
+    }
+    if g.static_t > 0.0 {
+        overlay(gpu, 2.0, v3(0.7, 0.85, 1.0), g.static_t * 1.5);
+    }
+    if g.over > 0.0 {
+        overlay(gpu, 1.0, v3(0.0, 0.0, 0.0), @min(g.over * 0.4, 0.8));
+        let a = clamp((g.over - 0.8) * 2.0, 0.0, 1.0);
+        text(gpu, sc, "GAME OVER", 0.0, 0.15, 0.035, v3(1.0, 0.3, 0.25), a);
+    }
+}
+
+// Writes n in `places` digits (with leading zeros) at buf[at..].
+fn put_digits(buf: []mut u8, at: usize, n: u32, places: usize) usize {
+    let mut v = n;
+    let mut k = places;
+    while k > 0 {
+        k -= 1;
+        buf[at + k] = '0' + @truncate(u8, v % 10);
+        v /= 10;
+    }
+    return at + places;
+}
+
+fn put_str_slice(buf: []mut u8, s: []u8) []u8 {
+    return buf[0..put_str(buf, 0, s)];
+}
+
+fn put_str(buf: []mut u8, at: usize, s: []u8) usize {
+    @mem_copy(buf[at..at + s.len], s);
+    return at + s.len;
+}
+
+fn high_line(buf: []mut u8, best: u32) []u8 {
+    let n = put_str(buf, 0, "HI ");
+    return buf[0..put_digits(buf, n, best, 7)];
+}
+
+fn wave_line(buf: []mut u8, wave: u32) []u8 {
+    let n = put_str(buf, 0, "WAVE ");
+    let mut places: usize = 1;
+    if wave >= 10 {
+        places = 2;
+    }
+    return buf[0..put_digits(buf, n, wave, places)];
+}
+
+// The front screen, over the game playing itself: the title (in cubes,
+// made with the rest), the high scores, how to start.
+fn menu(gpu: *mut d3d.Device, sc: *Screen, ui: *Ui) void {
+    let aspect = sc.aspect;
+    let t = ui.menu_t;
+    let fade = @min(t * 2.0, 1.0);
+    rect(gpu, aspect, 0.0, -0.36, 1.3, 1.06, v3(0.0, 0.0, 0.02), 0.55 * fade);
+    text(gpu, sc, "HIGH SCORES", 0.0, 0.14, 0.017, v3(1.0, 0.75, 0.3), fade);
+    for k in @as(usize, 0)..8 {
+        let mut buf: [32]u8 = [0; 32];
+        let mut n = put_digits(buf[..], 0, @truncate(u32, k + 1), 1);
+        n = put_str(buf[..], n, "   ");
+        n = put_digits(buf[..], n, ui.scores[k], 7);
+        n = put_str(buf[..], n, "   WAVE ");
+        n = put_digits(buf[..], n, ui.waves[k], 2);
+        let y = 0.0 - 0.088 * @float_from_int(f32, k);
+        let mut c = v3(0.8, 0.82, 0.9);
+        let mut a = fade * 0.85;
+        if @bit_cast(i32, @truncate(u32, k)) == ui.latest {
+            c = v3(1.0, 0.95, 0.3);  // yours, just now
+            a = fade * (0.6 + 0.4 * math.sinf(t * 8.0));
+        }
+        text(gpu, sc, buf[0..n], 0.0, y, 0.0105, c, a);
+    }
+    if math.sinf(t * 4.0) > -0.3 {
+        text(gpu, sc, "PRESS FIRE TO PLAY", 0.0, -0.72, 0.018, v3(0.35, 1.0, 0.55), fade);
+    }
+    text(gpu, sc, "ARROWS MOVE  SPACE FIRES  ESC QUITS", 0.0, -0.88, 0.011, v3(0.55, 0.6, 0.7), fade * 0.8);
+}
+
+// The menu's state, and the high scores (this session's).
+struct Ui {
+    menu: bool,
+    menu_t: f32,
+    scores: [8]u32,
+    waves: [8]u32,
+    latest: i32,  // the entry just made (-1: none)
+}
+
+fn new_ui() Ui {
+    return Ui.{
+        menu: true, menu_t: 0.0, scores: [10000, 8000, 6000, 5000, 4000, 3000, 2000, 1000], waves: [
+            4, 3, 3, 2, 2, 2, 1, 1], latest: -1 };
+}
+
+// A finished game's score into the table, if it makes it.
+fn record(ui: *mut Ui, score: u32, wave: u32) void {
+    ui.latest = -1;
+    let mut at: usize = 8;
+    for k in @as(usize, 0)..8 {
+        if score > ui.scores[k] {
+            at = k;
+            break;
+        }
+    }
+    if at == 8 {
+        return;
+    }
+    let mut k: usize = 7;
+    while k > at {
+        ui.scores[k] = ui.scores[k - 1];
+        ui.waves[k] = ui.waves[k - 1];
+        k -= 1;
+    }
+    ui.scores[at] = score;
+    ui.waves[at] = wave;
+    ui.latest = @bit_cast(i32, @truncate(u32, at));
+}
+
+fn status(g: *Game, on_menu: bool, buf: []mut u8) ![]u8 {
+    if on_menu {
+        return put_str_slice(buf, "Swarm");
+    }
+    if g.over > 0.0 {
+        return fmt.bufprint(buf, "Swarm - game over - score {}", [fmt.int(g.score)]);
+    }
+    return fmt.bufprint(buf, "Swarm - wave {} - score {} - ships {}", [fmt.int(g.wave), fmt.int(g.score),
+                                                                       fmt.int(g.lives)]);
+}
+
+fn windowed(frames: i64, auto: bool) !i32 {
+    let mut w = win32.Window.open("Swarm", 675, 900)!;
+    defer w.deinit();
+    let sz = w.size();
+    let mut gpu = d3d.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut zbuf = gpu.depth_buffer(sz[0], sz[1])!;
+    defer zbuf.release();
+    let mut gfx = graphics(&mut gpu)!;
+    defer release(&mut gfx);
+    let mut snd = sound(true)!;
+    defer sound_deinit(&mut snd);
+    let mut mute = sound(false)!;  // the demo behind the menu plays silently
+    defer sound_deinit(&mut mute);
+    let art = mem.create(make_art())!;
+    defer mem.destroy(art);
+    let mut seed = @bit_cast(u64, time.Instant.now().ns);
+    let demo_mem = alloc_game(seed)!;
+    defer mem.free(demo_mem);
+    let demo = &mut demo_mem[0];
+    let game_mem = alloc_game(seed +% 1)!;
+    defer mem.free(game_mem);
+    let game = &mut game_mem[0];
+    let mut ui = new_ui();
+    if auto {
+        ui.menu = false;  // straight into a game, played by itself
+    }
+    let mut keys = Keys.{ left: false, right: false, fire: false };
+    let mut pads = xinput.Tracker.init();
+    let mut was_firing = true;  // (a press that started the program does not count)
+    let mut title: [96]u8 = [0; 96];
+    let mut shown: [96]u8 = [0; 96];
+    let mut shown_len: usize = 0;
+    let mut last = time.Instant.now();
+    let mut n: i64 = 0;
+    let mut quit = false;
+    while not quit {
+        let e = w.next_event();
+        if e.kind == win32.EventKind.CLOSE {
+            break;
+        }
+        if (e.kind == win32.EventKind.KEY_DOWN) and (e.key == win32.KEY_ESCAPE) {
+            // in a game: give it up; on the menu: quit
+            if ui.menu {
+                break;
+            }
+            ui.menu = true;
+            ui.menu_t = 0.0;
+            ui.latest = -1;
+            _ = xinput.vibrate(0, 0.0, 0.0);
+            continue;
+        }
+        if e.kind == win32.EventKind.KEY_DOWN {
+            key(&mut keys, e.key, true);
+            continue;
+        }
+        if e.kind == win32.EventKind.KEY_UP {
+            key(&mut keys, e.key, false);
+            continue;
+        }
+        if e.kind == win32.EventKind.RESIZE {
+            gpu.resize(e.width, e.height)!;
+            gpu.resize_depth(&mut zbuf, e.width, e.height)!;
+            continue;
+        }
+        if e.kind != win32.EventKind.NONE {
+            continue;
+        }
+        let p = pads.update();
+        if pads.pressed(0, xinput.BACK) {
+            if ui.menu {
+                break;
+            }
+            ui.menu = true;
+            ui.menu_t = 0.0;
+            ui.latest = -1;
+        }
+        let dt = @float_cast(f32, @min(@float_from_int(f64, last.elapsed().ns) / 1e9, 0.05));
+        last = time.Instant.now();
+        let pad = p[0];
+        let firing = keys.fire or pad.down(xinput.A) or pad.down(xinput.START) or (pad.right_trigger > 0.3);
+        let pressed = firing and not was_firing;
+        was_firing = firing;
+        let mut inp = Input.{
+            x: axis(keys.left, keys.right) + pad.left_x + axis(pad.down(xinput.DPAD_LEFT), pad.down(xinput.DPAD_RIGHT)),
+            fire: firing };
+        let mut shown_game = game;
+        if ui.menu {
+            ui.menu_t += dt;
+            update(demo, art, autopilot(demo), &mut mute, dt);
+            if demo.over > 3.0 {
+                seed = seed *% 6364136223846793005 +% 1;
+                reset_game(demo, seed);
+            }
+            if pressed and (ui.menu_t > 0.4) {
+                seed = seed *% 6364136223846793005 +% 1;
+                reset_game(game, seed);
+                ui.menu = false;
+                ui.latest = -1;
+                play(&mut snd, S_DIVE, 1.4, 0.8);
+            }
+            shown_game = demo;
+        } else {
+            if auto {
+                inp = autopilot(game);
+            }
+            update(game, art, inp, &mut snd, dt);
+            if game.over > 4.0 {
+                _ = xinput.vibrate(0, 0.0, 0.0);
+                record(&mut ui, game.score, game.wave);
+                ui.menu = true;
+                ui.menu_t = 0.0;
+                if auto {
+                    quit = true;
+                }
+            }
+        }
+        let st = status(shown_game, ui.menu, title[..])!;
+        if not strs.eq(st, shown[0..shown_len]) {
+            @mem_copy(shown[0..st.len], st);
+            shown_len = st.len;
+            w.set_title(st);
+        }
+        let t = gpu.screen();
+        if (t.width != zbuf.width) or (t.height != zbuf.height) {
+            gpu.resize_depth(&mut zbuf, t.width, t.height)!;
+        }
+        draw(&mut gpu, &mut gfx, t, &mut zbuf, shown_game, art, &ui)!;
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    _ = xinput.vibrate(0, 0.0, 0.0);
+    fmt.print("{} frames, wave {}, score {}\n", [fmt.int(n), fmt.int(game.wave), fmt.int(game.score)])!;
+    return 0;
+}
+
+// Plays `frames` frames by itself (at 60 a second) offscreen, then saves
+// the last as a PNG.
+fn offscreen(out: []u8, frames: i64, on_menu: bool) !i32 {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    let mut gfx = graphics(&mut gpu)!;
+    defer release(&mut gfx);
+    let mut snd = sound(false)!;
+    defer sound_deinit(&mut snd);
+    let art = mem.create(make_art())!;
+    defer mem.destroy(art);
+    let g_mem = alloc_game(12345)!;
+    defer mem.free(g_mem);
+    let g = &mut g_mem[0];
+    let mut n: i64 = 0;
+    while n < frames {
+        update(g, art, autopilot(g), &mut snd, 1.0 / 60.0);
+        n += 1;
+    }
+    let mut t = gpu.target(675, 900)!;
+    defer t.release();
+    let mut zbuf = gpu.depth_buffer(675, 900)!;
+    defer zbuf.release();
+    let mut ui = new_ui();
+    ui.menu = on_menu;
+    ui.menu_t = @float_from_int(f32, frames) / 60.0;
+    if on_menu {
+        ui.latest = 2;
+    }
+    draw(&mut gpu, &mut gfx, &mut t, &mut zbuf, g, art, &ui)!;
+    gpu.finish()!;
+    let mut img = gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    let mut buf: [96]u8 = [0; 96];
+    io.stdout().println(status(g, false, buf[..])!)!;
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("swarm", "A formation shooter in cubes: Direct3D 12, XInput and XAudio2 (Windows).");
+    defer p.deinit();
+    p.option("png", 'o', "FILE", "play by itself offscreen, then save the last frame as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames (with --png: how many to play first)")!;
+    p.flag("autopilot", 'a', "play a game by itself (no menu), then quit")!;
+    p.flag("menu", 'm', "with --png: draw the front screen")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("swarm: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not os.is_windows() {
+        io.stderr().println("swarm: this needs Windows (--target=x86_64-windows)")!;
+        return 1;
+    }
+    if m.has("png") {
+        return offscreen(m.get("png", ""), m.int("frames", 300)!, m.has("menu"));
+    }
+    return windowed(m.int("frames", 0)!, m.has("autopilot"));
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}
