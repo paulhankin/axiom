@@ -31,6 +31,10 @@ they travel with the code they describe.
 | [0008](0008-math-missing-commands.md) | feature | std/text/math | Missing TeX commands: `\xrightarrow`, `\substack`, `\sideset`, ... |
 | [0009](0009-markdown-github-math-syntax.md) | feature | std/text/markdown | GitHub's `` $`...`$ `` math syntax |
 | [0010](0010-typeset-without-math-table.md) | feature | std/text/math/typeset | Better typesetting with fonts that lack a MATH table |
+| [0011](0011-macos-native-target.md) | feature | compiler | Native macOS binaries from the self-hosted compiler |
+| [0012](0012-windows-native-target.md) | feature | compiler, runtime | Native Windows binaries |
+| [0013](0013-c-compiler-runtime-on-macos.md) | feature | runtime | The C compiler's native runtime does not build on macOS |
+| [0014](0014-wasm64-host.md) | bug | runtime | wasm64 programs do not run under `runtime/host.mjs` |
 
 ## Closed
 
