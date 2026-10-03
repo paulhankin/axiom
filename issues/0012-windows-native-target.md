@@ -37,6 +37,11 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
   what is not supported (below) and tests that call C, which are skipped.
   The run tests use `tests/native_rt.ax` (via `--link=<file.ax>`, which now
   builds Axiom sources into the program) in place of the C harness.
+- **DLLs and Direct3D.** `extern "C" "user32" { ... }` imports from that DLL
+  (codegen leaves `axiom.import.<function>` for plink). std/os/win32 (windows,
+  events) and std/graphics/d3d11 (Direct3D 11, DXGI swap chains, HLSL via
+  d3dcompiler_47, COM through method tables); examples/directx.ax draws with
+  them, tested offscreen pixel by pixel under Wine + Xvfb.
 - **The compiler on Windows.** It builds for `x86_64-windows`, runs, and
   reaches a fixed point there: built by the Windows compiler, it builds
   itself bit-identically (under Wine). `util.real_path` keeps drive letters.
@@ -47,7 +52,7 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
   runner in CI (`windows-latest`, billed for private repositories) would
   cover what Wine does differently.
 - `axiom profile` (runtime/profile.ax samples with SIGPROF).
-- Linking C code, `-l` libraries and `extern "lib"` imports. Calls to C
+- Linking C code and `-l` libraries. Calls to C
   variadic functions would also need floating-point arguments copied to the
   integer registers.
 - Signals: only SIGINT (Ctrl+C, Ctrl+Break) and SIGTERM (console close,
@@ -57,6 +62,8 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - Unix-domain sockets need Windows 10 1803 or later (Wine has none).
 - No `.pdata` unwind information: debuggers and Windows' own stack walks see
   only leaf frames (Axiom's traces use its shadow stack).
+- Direct3D 12, Direct2D/DirectWrite, XAudio2, input (XInput); a portable
+  graphics layer over Direct3D, Metal and Vulkan.
 - AArch64 Windows.
 - Separate compilation in the compiler on Windows: it forks, so it falls
   back to one unit (0006).

@@ -1585,7 +1585,8 @@ are passed on the stack (Apple's arm64 ABI), and a thread-local global (§12.8.6
 lives in a per-thread block whose address is kept in a pthread key. On Windows,
 every function uses the Windows x64 calling convention (four register arguments,
 shadow space, `rsi`, `rdi` and `xmm6`-`xmm15` preserved), and thread-locals are the
-image's TLS directory. A program can ask which system it runs on with `os.system()`
+image's TLS directory. An `extern "C" "name"` block (§14.5.1) names the DLL its
+functions come from (`name.dll`) rather than a library to link. A program can ask which system it runs on with `os.system()`
 (std/os); paths on Windows may begin with a drive (`C:/`), which `path.is_abs`
 recognizes there.
 

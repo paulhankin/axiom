@@ -16,7 +16,9 @@
 //   .reloc  r--  base relocations: every absolute address the image holds
 //
 // Imports: what is still undefined after our own objects is a Windows
-// function, found in a DLL by its name: the BSD socket functions and those
+// function. A function declared in an `extern "C" "name"` block comes from
+// name.dll (codegen leaves the name in a constant axiom.import.<function>);
+// the runtime's are found in a DLL by their names: the BSD socket functions and those
 // beginning with WSA are ws2_32.dll's, Rtl and Nt ones ntdll.dll's, BCrypt
 // ones bcrypt.dll's, other capitalized ones kernel32.dll's. Anything else
 // is undefined. Calls
@@ -75,6 +77,10 @@ let mut imports: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0),
 let mut dlls: u.List.[Dll] = u.List.[Dll].{ data: @ptr_from_int(*mut Dll, 0), len: 0, cap: 0 };
 let mut relocs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };  // RVAs of addresses
 let mut errors: u32 = 0;
+// function name -> index in import_dlls + 1 (from axiom.import.* constants)
+let mut import_map: u.SymMap.[u32] = u.SymMap.[u32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+let mut import_dlls: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 
 let mut thunk_addr: u64 = 0;
 let mut iat_addr: u64 = 0;  // the import address table: one slot per import, in thunk order, NULL after each DLL's
@@ -136,8 +142,37 @@ let SOCKET_FNS: [22][]u8 = ["accept", "bind", "closesocket", "connect", "freeadd
                             "getpeername", "getsockname", "getsockopt", "htonl", "htons", "inet_ntop", "inet_pton",
                             "ioctlsocket", "listen", "recv", "recvfrom", "select", "send", "sendto", "setsockopt"];
 
+// The DLLs that extern blocks named (the axiom.import.* constants).
+fn collect_dll_names() void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let s = o.syms.get(si);
+            if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
+                continue;
+            }
+            let d = o.secs.get(@as(usize, @bit_cast(u32, s.sec))).data.view();
+            let mut e = @truncate(usize, s.value);
+            let start = e;
+            while (e < d.len) and (d[e] != 0) {
+                e += 1;
+            }
+            let mut dll = u.dup(d[start..e]);
+            if u.find(dll, '.') < 0 {
+                dll = u.cat2(dll, ".dll");
+            }
+            import_dlls.push(dll);
+            import_map.put(u.intern(s.name[13..]), @int_cast(u32, import_dlls.len));
+        }
+    }
+}
+
 // The DLL that exports a Windows function (see the header); "" if none.
 fn dll_of(name: []u8) []u8 {
+    let k = import_map.get(u.intern(name));
+    if k != 0 {
+        return import_dlls.get(@as(usize, k - 1));
+    }
     for f in SOCKET_FNS {
         if u.str_eq(f, name) {
             return "ws2_32.dll";
@@ -631,6 +666,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         objs.push(inputs[i]);
     }
     objs.push(own_object());
+    collect_dll_names();
     collect_symbols();
     if gsyms.at(@as(usize, gsym_index("main"))).obj < 0 {
         err("no 'main' function");

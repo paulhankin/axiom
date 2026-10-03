@@ -1,0 +1,346 @@
+// =============================================================================
+// std/os/win32.ax - a window on the Windows desktop and its events (keys,
+// mouse, size, close), for drawing into with std/graphics/d3d11.
+//
+//     let mut w = win32.Window.open("Demo", 800, 600)!;
+//     defer w.deinit();
+//     loop {
+//         let e = w.next_event();
+//         if e.kind == win32.EventKind.CLOSE { break; }
+//         if e.kind == win32.EventKind.NONE { /* draw a frame */ }
+//     }
+//
+// Windows only (--target=x86_64-windows): the user32 and kernel32 functions
+// it calls exist nowhere else. A window belongs to the thread that opened
+// it, which must also read its events.
+// =============================================================================
+
+error { Unsupported, Failed }
+
+extern "C" "user32" {
+    fn RegisterClassExW(wc: *u8) u16;
+    fn CreateWindowExW(ex: u32, cls: *u16, title: *u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: usize,
+                       menu: usize, inst: usize, param: *void) usize;
+    fn DefWindowProcW(h: usize, msg: u32, w: usize, l: isize) isize;
+    fn DestroyWindow(h: usize) i32;
+    fn ShowWindow(h: usize, cmd: i32) i32;
+    fn PeekMessageW(msg: *mut u8, h: usize, min: u32, max: u32, remove: u32) i32;
+    fn TranslateMessage(msg: *u8) i32;
+    fn DispatchMessageW(msg: *u8) isize;
+    fn LoadCursorW(inst: usize, name: usize) usize;
+    fn AdjustWindowRect(r: *mut i32, style: u32, menu: i32) i32;
+    fn GetClientRect(h: usize, r: *mut i32) i32;
+    fn SetWindowTextW(h: usize, s: *u16) i32;
+}
+
+extern "C" "kernel32" {
+    fn GetModuleHandleW(name: *u16) usize;
+}
+
+/// What happened (EventKind.NONE: nothing is waiting; draw a frame).
+pub enum EventKind: u8 {
+    NONE,
+    CLOSE,     // the user asked to close the window
+    RESIZE,    // the client area is now width × height
+    KEY_DOWN,  // key: a virtual-key code (KEY_*, or 'A'..'Z', '0'..'9')
+    KEY_UP,
+    MOUSE_MOVE,  // x, y: in the client area, in pixels
+    MOUSE_DOWN,  // button: 0 left, 1 right, 2 middle
+    MOUSE_UP,
+    MOUSE_WHEEL,  // delta: + away from the user, 120 per notch
+}
+
+pub struct Event {
+    kind: EventKind,
+    key: u32,
+    x: i32,
+    y: i32,
+    button: u32,
+    delta: i32,
+    width: u32,
+    height: u32,
+}
+
+// Virtual-key codes (letters and digits are their ASCII capitals).
+pub const KEY_BACKSPACE: u32 = 0x08;
+pub const KEY_TAB: u32 = 0x09;
+pub const KEY_ENTER: u32 = 0x0d;
+pub const KEY_SHIFT: u32 = 0x10;
+pub const KEY_CONTROL: u32 = 0x11;
+pub const KEY_ESCAPE: u32 = 0x1b;
+pub const KEY_SPACE: u32 = 0x20;
+pub const KEY_LEFT: u32 = 0x25;
+pub const KEY_UP: u32 = 0x26;
+pub const KEY_RIGHT: u32 = 0x27;
+pub const KEY_DOWN: u32 = 0x28;
+pub const KEY_F1: u32 = 0x70;
+
+const WM_DESTROY: u32 = 0x2;
+const WM_SIZE: u32 = 0x5;
+const WM_CLOSE: u32 = 0x10;
+const WM_QUIT: u32 = 0x12;
+const WM_KEYDOWN: u32 = 0x100;
+const WM_KEYUP: u32 = 0x101;
+const WM_SYSKEYDOWN: u32 = 0x104;
+const WM_SYSKEYUP: u32 = 0x105;
+const WM_MOUSEMOVE: u32 = 0x200;
+const WM_LBUTTONDOWN: u32 = 0x201;
+const WM_LBUTTONUP: u32 = 0x202;
+const WM_RBUTTONDOWN: u32 = 0x204;
+const WM_RBUTTONUP: u32 = 0x205;
+const WM_MBUTTONDOWN: u32 = 0x207;
+const WM_MBUTTONUP: u32 = 0x208;
+const WM_MOUSEWHEEL: u32 = 0x20a;
+const WS_OVERLAPPEDWINDOW: u32 = 0x00cf_0000;
+const CW_USEDEFAULT: i32 = -0x8000_0000;
+
+// What the window procedure saw of each window (closing and resizing come
+// to it, not through the queue), by window handle.
+const MAX_WINDOWS: usize = 16;
+
+struct State {
+    hwnd: usize,
+    closing: bool,
+    resized: bool,
+    width: u32,
+    height: u32,
+}
+
+let mut states: [16]State = [State.{ hwnd: 0, closing: false, resized: false, width: 0, height: 0 }; 16];
+let mut class_ready: bool = false;
+
+fn state_of(h: usize) *mut State {
+    for k in @as(usize, 0)..MAX_WINDOWS {
+        if states[k].hwnd == h {
+            return &mut states[k];
+        }
+    }
+    return @ptr_from_int(*mut State, 0);
+}
+
+fn wnd_proc(h: usize, msg: u32, wp: usize, lp: isize) isize {
+    let st = state_of(h);
+    if @int_from_ptr(st) != 0 {
+        if msg == WM_CLOSE {
+            st.closing = true;
+            return 0;  // (the program decides; deinit destroys the window)
+        }
+        if msg == WM_SIZE {
+            let l = @bit_cast(usize, lp);
+            st.width = @truncate(u32, l & 0xffff);
+            st.height = @truncate(u32, (l >> 16) & 0xffff);
+            st.resized = true;
+        }
+    }
+    if msg == WM_DESTROY {
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// s as NUL-terminated UTF-16 in out (truncated to fit).
+fn utf16(s: []u8, out: []mut u16) void {
+    let mut i: usize = 0;
+    let mut o: usize = 0;
+    while (i < s.len) and ((o + 3) < out.len) {
+        let c = @as(u32, s[i]);
+        let mut cp = c;
+        let mut n: usize = 1;
+        if (c >= 0xf0) and ((i + 3) < s.len) {
+            cp = (((c & 7) << 18) | ((@as(u32, s[i + 1]) & 0x3f) << 12)) | (
+                ((@as(u32, s[i + 2]) & 0x3f) << 6) | (@as(u32, s[i + 3]) & 0x3f));
+            n = 4;
+        } else if (c >= 0xe0) and ((i + 2) < s.len) {
+            cp = (((c & 0xf) << 12) | ((@as(u32, s[i + 1]) & 0x3f) << 6)) | (@as(u32, s[i + 2]) & 0x3f);
+            n = 3;
+        } else if (c >= 0xc0) and ((i + 1) < s.len) {
+            cp = ((c & 0x1f) << 6) | (@as(u32, s[i + 1]) & 0x3f);
+            n = 2;
+        }
+        if cp >= 0x10000 {
+            let v = cp - 0x10000;
+            out[o] = @truncate(u16, 0xd800 + (v >> 10));
+            out[o + 1] = @truncate(u16, 0xdc00 + (v & 0x3ff));
+            o += 2;
+        } else {
+            out[o] = @truncate(u16, cp);
+            o += 1;
+        }
+        i += n;
+    }
+    out[o] = 0;
+}
+
+fn ensure_class(inst: usize, name: *u16) bool {
+    if class_ready {
+        return true;
+    }
+    // WNDCLASSEXW: cbSize, style, lpfnWndProc at 8, hInstance at 24,
+    // hCursor at 40, lpszClassName at 64 (80 bytes)
+    let mut wc: [80]u8 = [0; 80];
+    put(wc[..], 0, 80, 4);
+    put(wc[..], 4, 0x3, 4);  // CS_HREDRAW | CS_VREDRAW
+    put(wc[..], 8, @as(u64, @bit_cast(usize, wnd_proc)), 8);
+    put(wc[..], 24, @as(u64, inst), 8);
+    put(wc[..], 40, @as(u64, LoadCursorW(0, 32512)), 8);  // IDC_ARROW
+    put(wc[..], 64, @as(u64, @int_from_ptr(name)), 8);
+    if RegisterClassExW(&wc[0]) == 0 {
+        return false;
+    }
+    class_ready = true;
+    return true;
+}
+
+fn put(b: []mut u8, at: usize, x: u64, n: usize) void {
+    for k in 0..n {
+        b[at + k] = @truncate(u8, x >> @as(u64, k * 8));
+    }
+}
+
+fn get32(b: []u8, at: usize) u32 {
+    return ((@as(u32, b[at]) | (@as(u32, b[at + 1]) << 8)) | (@as(u32, b[at + 2]) << 16)) | (@as(u32, b[at + 3]) << 24);
+}
+
+fn get64(b: []u8, at: usize) u64 {
+    return @as(u64, get32(b, at)) | (@as(u64, get32(b, at + 4)) << 32);
+}
+
+pub struct Window {
+    hwnd: usize,
+
+    /// Opens a window whose client area (the part to draw in) is width ×
+    /// height pixels.
+    pub fn open(title: []u8, width: u32, height: u32) !Window {
+        let inst = GetModuleHandleW(@ptr_from_int(*u16, 0));
+        let cls: [12]u16 = ['A', 'x', 'i', 'o', 'm', 'W', 'i', 'n', 'd', 'o', 'w', 0];
+        if not ensure_class(inst, &cls[0]) {
+            return error.Failed;
+        }
+        let st = state_of(0);
+        if @int_from_ptr(st) == 0 {
+            return error.Failed;  // (too many windows)
+        }
+        let mut r: [4]i32 = [0, 0, @bit_cast(i32, width), @bit_cast(i32, height)];
+        _ = AdjustWindowRect(&mut r[0], WS_OVERLAPPEDWINDOW, 0);
+        let mut t: [512]u16 = [0; 512];
+        utf16(title, t[..]);
+        let h = CreateWindowExW(0, &cls[0], &t[0], WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r[2] - r[0],
+                                r[3] - r[1], 0, 0, inst, @ptr_from_int(*void, 0));
+        if h == 0 {
+            return error.Failed;
+        }
+        st.* = State.{ hwnd: h, closing: false, resized: false, width: width, height: height };
+        _ = ShowWindow(h, 5);  // SW_SHOW
+        return Window.{ hwnd: h };
+    }
+
+    pub fn deinit(self: *mut Window) void {
+        let st = state_of(self.hwnd);
+        if @int_from_ptr(st) != 0 {
+            st.hwnd = 0;
+        }
+        _ = DestroyWindow(self.hwnd);
+        self.hwnd = 0;
+    }
+
+    /// The window's handle (HWND), for std/graphics/d3d11.
+    pub fn handle(self: *Window) usize {
+        return self.hwnd;
+    }
+
+    /// The client area's size: width, height.
+    pub fn size(self: *Window) [2]u32 {
+        let mut r: [4]i32 = [0; 4];
+        _ = GetClientRect(self.hwnd, &mut r[0]);
+        return [@bit_cast(u32, r[2] - r[0]), @bit_cast(u32, r[3] - r[1])];
+    }
+
+    pub fn set_title(self: *Window, title: []u8) void {
+        let mut t: [512]u16 = [0; 512];
+        utf16(title, t[..]);
+        _ = SetWindowTextW(self.hwnd, &t[0]);
+    }
+
+    /// The next event, without waiting (EventKind.NONE when none is left).
+    pub fn next_event(self: *mut Window) Event {
+        let mut e = Event.{ kind: EventKind.NONE, key: 0, x: 0, y: 0, button: 0, delta: 0, width: 0, height: 0 };
+        let st = state_of(self.hwnd);
+        loop {
+            if @int_from_ptr(st) != 0 {
+                if st.closing {
+                    st.closing = false;
+                    e.kind = EventKind.CLOSE;
+                    return e;
+                }
+                if st.resized {
+                    st.resized = false;
+                    e.kind = EventKind.RESIZE;
+                    e.width = st.width;
+                    e.height = st.height;
+                    return e;
+                }
+            }
+            // MSG: hwnd, message at 8, wParam at 16, lParam at 24 (48 bytes)
+            let mut msg: [48]u8 = [0; 48];
+            if PeekMessageW(&mut msg[0], 0, 0, 0, 1) == 0 {  // PM_REMOVE
+                return e;
+            }
+            let m = get32(msg[..], 8);
+            let wp = get64(msg[..], 16);
+            let lp = get64(msg[..], 24);
+            if m == WM_QUIT {
+                e.kind = EventKind.CLOSE;
+                return e;
+            }
+            _ = TranslateMessage(&msg[0]);
+            _ = DispatchMessageW(&msg[0]);
+            let mx = @as(i32, @bit_cast(i16, @truncate(u16, lp)));
+            let my = @as(i32, @bit_cast(i16, @truncate(u16, lp >> 16)));
+            if (m == WM_KEYDOWN) or (m == WM_SYSKEYDOWN) {
+                e.kind = EventKind.KEY_DOWN;
+                e.key = @truncate(u32, wp);
+                return e;
+            }
+            if (m == WM_KEYUP) or (m == WM_SYSKEYUP) {
+                e.kind = EventKind.KEY_UP;
+                e.key = @truncate(u32, wp);
+                return e;
+            }
+            if m == WM_MOUSEMOVE {
+                e.kind = EventKind.MOUSE_MOVE;
+                e.x = mx;
+                e.y = my;
+                return e;
+            }
+            if (m == WM_LBUTTONDOWN) or (m == WM_RBUTTONDOWN) or (m == WM_MBUTTONDOWN) {
+                e.kind = EventKind.MOUSE_DOWN;
+                e.button = button_of(m);
+                e.x = mx;
+                e.y = my;
+                return e;
+            }
+            if (m == WM_LBUTTONUP) or (m == WM_RBUTTONUP) or (m == WM_MBUTTONUP) {
+                e.kind = EventKind.MOUSE_UP;
+                e.button = button_of(m);
+                e.x = mx;
+                e.y = my;
+                return e;
+            }
+            if m == WM_MOUSEWHEEL {
+                e.kind = EventKind.MOUSE_WHEEL;
+                e.delta = @as(i32, @bit_cast(i16, @truncate(u16, wp >> 16)));
+                return e;
+            }
+        }
+    }
+}
+
+fn button_of(m: u32) u32 {
+    if (m == WM_RBUTTONDOWN) or (m == WM_RBUTTONUP) {
+        return 1;
+    }
+    if (m == WM_MBUTTONDOWN) or (m == WM_MBUTTONUP) {
+        return 2;
+    }
+    return 0;
+}

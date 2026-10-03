@@ -1,0 +1,195 @@
+// =============================================================================
+// File: directx.ax
+// Direct3D 11 on Windows: a window with a spinning triangle whose corners
+// are red, green and blue, drawn by HLSL shaders compiled at run time.
+//
+//   axiom build examples/directx.ax --target=x86_64-windows -O2 -o directx.exe
+//   directx.exe                       (Escape or closing the window quits)
+//   directx.exe --frames 120          (quits after 120 frames)
+//   directx.exe --png triangle.png    (draws one frame offscreen, saves it)
+//
+// It uses std/os/win32 for the window and std/graphics/d3d11 for the GPU.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/d3d11" as d3d;
+import "std/graphics/image/png" as png;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/os/win32" as win32;
+import "std/str" as strs;
+import "std/time" as time;
+
+// The shaders (HLSL), a line at a time.
+let SHADER_LINES: [28][]u8 = ["cbuffer Frame : register(b0) {", "    float angle;", "    float aspect;",
+                              "    float2 pad;", "};", "", "struct VSIn {", "    float2 pos : POSITION;",
+                              "    float3 col : COLOR;", "};", "", "struct VSOut {", "    float4 pos : SV_Position;",
+                              "    float3 col : COLOR;", "};", "", "VSOut vs(VSIn i) {", "    float c = cos(angle);",
+                              "    float s = sin(angle);", "    VSOut o;",
+                              "    o.pos = float4((i.pos.x * c - i.pos.y * s) / aspect, i.pos.x * s + i.pos.y * c, 0.0, 1.0);",
+                              "    o.col = i.col;", "    return o;", "}", "", "float4 ps(VSOut i) : SV_Target {",
+                              "    return float4(i.col, 1.0);", "}"];
+
+// x, y, r, g, b per corner
+let VERTICES: [15]f32 = [0.0, 0.8, 1.0, 0.0, 0.0, 0.69, -0.4, 0.0, 1.0, 0.0, -0.69, -0.4, 0.0, 0.0, 1.0];
+
+struct Scene {
+    vs: d3d.VertexShader,
+    ps: d3d.PixelShader,
+    layout: d3d.InputLayout,
+    vertices: d3d.Buffer,
+    frame: d3d.Buffer,
+}
+
+fn as_bytes(p: *f32, n: usize) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p), n * 4);
+}
+
+fn shader_source() !strs.String {
+    let mut s = strs.String.init();
+    for l in SHADER_LINES {
+        s.push_str(l)!;
+        s.push('\n')!;
+    }
+    return s;
+}
+
+fn shader(src: []u8, entry: []u8, target: []u8) !d3d.Code {
+    return d3d.compile(src, entry, target) catch |e| {
+        if e == error.CompileError {
+            fmt.eprint("directx: {}\n", [fmt.str(d3d.compile_message())]) catch {};
+        }
+        return e;
+    };
+}
+
+fn scene(gpu: *mut d3d.Device) !Scene {
+    let mut src = shader_source()!;
+    defer src.deinit();
+    let mut vcode = shader(src.bytes(), "vs", "vs_4_0")!;
+    defer vcode.release();
+    let mut pcode = shader(src.bytes(), "ps", "ps_4_0")!;
+    defer pcode.release();
+    let attrs: [2]d3d.Attribute = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32_FLOAT,
+                                                   offset: 0 }, d3d.Attribute.{
+                                                       semantic: "COLOR", index: 0, format: d3d.R32G32B32_FLOAT,
+                                                       offset: 8 }];
+    let frame: [4]f32 = [0.0, 1.0, 0.0, 0.0];
+    return Scene.{
+        vs: gpu.vertex_shader(&vcode)!, ps: gpu.pixel_shader(&pcode)!, layout: gpu.input_layout(attrs[..], &vcode)!,
+        vertices: gpu.buffer(d3d.VERTEX, as_bytes(&VERTICES[0], VERTICES.len))!, frame: gpu.buffer(
+            d3d.CONSTANT, as_bytes(&frame[0], 4))! };
+}
+
+fn draw(gpu: *mut d3d.Device, s: *mut Scene, t: *d3d.Target, angle: f32) void {
+    let frame: [4]f32 = [angle, @float_from_int(f32, t.width) / @float_from_int(f32, t.height), 0.0, 0.0];
+    gpu.update(&s.frame, as_bytes(&frame[0], 4));
+    gpu.clear(t, 0.08, 0.08, 0.12, 1.0);
+    gpu.set_target(t);
+    gpu.set_layout(s.layout);
+    gpu.set_vertices(&s.vertices, 20);
+    gpu.set_topology(d3d.TRIANGLE_LIST);
+    gpu.set_shaders(s.vs, s.ps);
+    gpu.set_constants(0, &s.frame);
+    gpu.draw(3, 0);
+}
+
+fn release(s: *mut Scene) void {
+    s.vs.release();
+    s.ps.release();
+    s.layout.release();
+    s.vertices.release();
+    s.frame.release();
+}
+
+// One frame into a texture, saved as a PNG.
+fn offscreen(out: []u8) !i32 {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    let mut s = scene(&mut gpu)!;
+    defer release(&mut s);
+    let mut t = gpu.target(256, 256)!;
+    defer t.release();
+    draw(&mut gpu, &mut s, &t, 0.0);
+    let mut img = gpu.read_pixels(&t)!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    return 0;
+}
+
+fn windowed(frames: i64) !i32 {
+    let mut w = win32.Window.open("Axiom + Direct3D 11", 640, 480)!;
+    defer w.deinit();
+    let sz = w.size();
+    let mut gpu = d3d.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut s = scene(&mut gpu)!;
+    defer release(&mut s);
+    let t0 = time.Instant.now();
+    let mut n: i64 = 0;
+    loop {
+        let e = w.next_event();
+        if (e.kind == win32.EventKind.CLOSE) or ((e.kind == win32.EventKind.KEY_DOWN) and (e.key == win32.KEY_ESCAPE)) {
+            break;
+        }
+        if e.kind == win32.EventKind.RESIZE {
+            gpu.resize(e.width, e.height)!;
+            continue;
+        }
+        if e.kind != win32.EventKind.NONE {
+            continue;
+        }
+        let secs = @float_from_int(f64, t0.elapsed().ns) / 1e9;
+        draw(&mut gpu, &mut s, gpu.screen(), @float_cast(f32, secs));
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    fmt.print("{} frames\n", [fmt.int(n)])!;
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("directx", "A spinning triangle with Direct3D 11 (Windows).");
+    defer p.deinit();
+    p.option("png", 'o', "FILE", "draw one frame offscreen and save it as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("directx: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not os.is_windows() {
+        io.stderr().println("directx: Direct3D needs Windows (--target=x86_64-windows)")!;
+        return 1;
+    }
+    if m.has("png") {
+        return offscreen(m.get("png", ""));
+    }
+    return windowed(m.int("frames", 0)!);
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

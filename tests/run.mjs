@@ -14,6 +14,7 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import zlib from 'zlib';
 import os from 'os';
 import { Worker } from 'worker_threads';
 import { createHost } from '../runtime/host.mjs';
@@ -476,6 +477,31 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     return names.join(' ') === '.text .rdata .idata .data .reloc' ? null : `sections ${names.join(' ')}`;
   };
   const run = (n, args = []) => spawnSync(wine, [out(n), ...args], { encoding: 'utf8', cwd: root, env });
+  const xvfb = ['xvfb-run'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
+  // An 8-bit RGBA PNG (what std/graphics/image/png writes for RGBA images).
+  const decodePNG = (d) => {
+    let at = 8, width = 0, height = 0;
+    const idat = [];
+    while (at < d.length) {
+      const len = d.readUInt32BE(at), type = d.toString('latin1', at + 4, at + 8);
+      if (type === 'IHDR') { width = d.readUInt32BE(at + 8); height = d.readUInt32BE(at + 12); }
+      if (type === 'IDAT') idat.push(d.subarray(at + 8, at + 8 + len));
+      at += 12 + len;
+    }
+    const raw = zlib.inflateSync(Buffer.concat(idat));
+    const data = Buffer.alloc(width * height * 4), stride = width * 4;
+    for (let y = 0; y < height; y++) {
+      const f = raw[y * (stride + 1)], row = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+      for (let x = 0; x < stride; x++) {
+        const a = x >= 4 ? data[y * stride + x - 4] : 0, b = y > 0 ? data[(y - 1) * stride + x] : 0;
+        const c = x >= 4 && y > 0 ? data[(y - 1) * stride + x - 4] : 0;
+        const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+        const pred = [0, a, b, (a + b) >> 1, pa <= pb && pa <= pc ? a : pb <= pc ? b : c][f];
+        data[y * stride + x] = (row[x] + pred) & 255;
+      }
+    }
+    return { width, height, data };
+  };
   const cases = {
     'thread-locals and output': () => {
       const src = path.join(tmp, 'windows-hello.ax');
@@ -497,6 +523,25 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       const want = '3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679';
       if (r.status !== 0 || !r.stdout.startsWith(want)) return `status ${r.status}: ${r.stdout}${r.stderr}`;
       return fs.readFileSync(path.join(tmp, 'windows-pi.pdf')).subarray(0, 5).toString() === '%PDF-' ? null : 'no PDF';
+    },
+    'Direct3D 11': () => {
+      const c = build(path.join(root, 'examples/directx.ax'), 'directx', ['-O2']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const p = checkPE(out('directx'));
+      if (p || !wine || !xvfb) return p;
+      // one frame offscreen (Wine draws with OpenGL, so it needs a display)
+      const png = path.join(tmp, 'windows-triangle.png');
+      const r = spawnSync(xvfb, ['-a', wine, out('directx'), '--png', png], { encoding: 'utf8', cwd: root, env });
+      if (r.status !== 0 || !fs.existsSync(png)) return `status ${r.status}: ${r.stdout}${r.stderr}`;
+      const img = decodePNG(fs.readFileSync(png));
+      const px = (x, y) => Array.from(img.data.subarray((y * img.width + x) * 4, (y * img.width + x) * 4 + 3));
+      const near = (a, b) => a.every((v, i) => Math.abs(v - b[i]) <= 3);
+      const top = (a, k) => a[k] > 150 && a.every((v, i) => i === k || v < 100);
+      if (!near(px(5, 5), [20, 20, 31])) return `background ${px(5, 5)}`;
+      if (!top(px(128, 40), 0) || !top(px(52, 172), 2) || !top(px(204, 172), 1)) {
+        return `corners ${px(128, 40)} ${px(52, 172)} ${px(204, 172)}`;
+      }
+      return null;
     },
     'the compiler': () => {
       const c = build(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);
