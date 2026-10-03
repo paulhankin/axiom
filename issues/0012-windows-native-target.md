@@ -103,7 +103,19 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 
 - **The test suite on real Windows.** tests/run.mjs has run under Wine only
   (it needs node). A Windows runner in CI (`windows-latest`, billed for
-  private repositories) would cover what Wine does differently.
+  private repositories) would cover what Wine does differently. Every std
+  module's tests pass with `axiom test` on Windows 11; what they found that
+  Wine hides: `fs.temp_dir` (`%TMP%`, `%TEMP%`, `%USERPROFILE%`, not `/tmp`)
+  and std/os/path's drives and `\` (`clean` made `C:\x` into `/C:\x`);
+  sockets must be overlapped (`WSA_FLAG_OVERLAPPED`), since Windows
+  serializes every request on a synchronous handle, so `getsockname` or the
+  close in `Server.stop` waited for another thread's `accept`; a refused
+  connection takes Windows two seconds (it retries the SYN), so
+  `ax_tcp_connect` tries a host's addresses staggered, RFC 8305 style, and
+  "localhost" (`::1` first) is not slow for a server on 127.0.0.1;
+  `connect_unix` to a missing directory fails with WSAENETDOWN (refused);
+  Hyper-V reserves TCP port ranges that UDP hands out (std/net/dns's test
+  retries).
 - Linking C code and `-l` libraries. Calls to C
   variadic functions would also need floating-point arguments copied to the
   integer registers.

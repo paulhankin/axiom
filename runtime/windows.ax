@@ -133,6 +133,9 @@ pub extern "C" {
     fn shutdown(s: usize, how: i32) i32;
     fn closesocket(s: usize) i32;
     fn setsockopt(s: usize, level: i32, name: i32, val: *void, len: i32) i32;
+    fn getsockopt(s: usize, level: i32, name: i32, val: *mut u8, len: *mut i32) i32;
+    fn ioctlsocket(s: usize, cmd: u32, arg: *mut u32) i32;
+    fn select(n: i32, r: *mut u8, w: *mut u8, x: *mut u8, timeout: *u8) i32;
     fn getsockname(s: usize, addr: *mut u8, len: *mut i32) i32;
     fn getpeername(s: usize, addr: *mut u8, len: *mut i32) i32;
     fn recv(s: usize, p: *mut u8, n: i32, flags: i32) i32;
@@ -1609,7 +1612,10 @@ const AF_INET6: i32 = 23;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SOL_SOCKET: i32 = 0xffff;
+const SO_ERROR: i32 = 0x1007;
+const FIONBIO: u32 = 0x8004_667e;
 const WSAEINTR: i32 = 10004;
+const WSAEWOULDBLOCK: i32 = 10035;
 const WSAEADDRINUSE: i32 = 10048;
 const WSAETIMEDOUT: i32 = 10060;
 const WSAECONNREFUSED: i32 = 10061;
@@ -1671,9 +1677,14 @@ fn sockaddr_rec(sa: *u8, r: *mut u8) bool {
 }
 
 // A socket that children do not inherit, in the table.
+// WSA_FLAG_OVERLAPPED as socket() makes them (blocking calls still block):
+// Windows serializes all requests on a handle for synchronous I/O, so
+// without it getsockname, or the shutdown that ax_sock_close does, waits
+// for another thread's accept or recv on the socket to finish (Wine does
+// not); WSA_FLAG_NO_HANDLE_INHERIT.
 fn new_socket(family: i32, ty: i32, proto: i32) usize {
     wsa_init();
-    return WSASocketW(family, ty, proto, @ptr_from_int(*void, 0), 0, 0x80);  // WSA_FLAG_NO_HANDLE_INHERIT
+    return WSASocketW(family, ty, proto, @ptr_from_int(*void, 0), 0, 0x01 | 0x80);
 }
 
 fn sock_fd(s: usize) i32 {
@@ -1765,31 +1776,137 @@ export fn ax_resolve(name: *u8, len: usize, out: *mut u8, max: u32) i32 {
     return @bit_cast(i32, n);
 }
 
+// Connects to a host's addresses in turn, as RFC 8305 does: when an attempt
+// has not finished after a delay the next one starts, and the first to
+// connect wins. Windows takes two seconds to give up on a refused
+// connection (it retries the SYN), so trying them one after another would
+// make "localhost" (::1, then 127.0.0.1) slow for a server on 127.0.0.1.
 export fn ax_tcp_connect(name: *u8, len: usize, port: u32) i32 {
     let mut res = @ptr_from_int(*mut u8, 0);
     let rc = lookup(name, len, port, false, &mut res);
     if rc != 0 {
         return rc;
     }
-    let mut result = AX_ERR;
+    let mut socks: [16]usize = [0; 16];  // the attempts in progress
+    let mut n: usize = 0;
+    let mut refused = false;
+    let mut won = INVALID;
+    let mut delay_ms: u32 = 0;
     let mut a = res;
-    while @int_from_ptr(a) != 0 {
-        let s = new_socket(ai_i32(a, 4), ai_i32(a, 8), ai_i32(a, 12));
-        if s != INVALID {
-            if connect(s, ai_ptr(a, 32), ai_i32(a, 16)) == 0 {
-                result = sock_fd(s);
+    loop {
+        if (@int_from_ptr(a) != 0) and (n < socks.len) {
+            let s = new_socket(ai_i32(a, 4), ai_i32(a, 8), ai_i32(a, 12));
+            if s != INVALID {
+                let mut nb: u32 = 1;
+                _ = ioctlsocket(s, FIONBIO, &mut nb);
+                if connect(s, ai_ptr(a, 32), ai_i32(a, 16)) == 0 {
+                    won = s;
+                    break;
+                }
+                let e = WSAGetLastError();
+                if e == WSAEWOULDBLOCK {
+                    socks[n] = s;
+                    n += 1;
+                } else {
+                    refused = refused or (e == WSAECONNREFUSED);
+                    _ = closesocket(s);
+                }
+            }
+            // (a loopback connection is made at once)
+            delay_ms = 250;
+            if is_loopback(ai_ptr(a, 32)) {
+                delay_ms = 10;
+            }
+            a = ai_ptr(a, 40);
+        }
+        if n == 0 {
+            if @int_from_ptr(a) == 0 {
                 break;
             }
-            result = AX_ERR;
-            if WSAGetLastError() == WSAECONNREFUSED {
-                result = AX_REFUSED;
-            }
-            _ = closesocket(s);
+            continue;
         }
-        a = ai_ptr(a, 40);
+        // fd_sets: a count (padded to 8 bytes), then the sockets
+        let mut wset: [65]u64 = [0; 65];
+        let mut xset: [65]u64 = [0; 65];
+        wset[0] = @as(u64, n);
+        xset[0] = @as(u64, n);
+        for k in 0..n {
+            wset[k + 1] = @as(u64, socks[k]);
+            xset[k + 1] = @as(u64, socks[k]);
+        }
+        let mut tv: [2]i32 = [0, @bit_cast(i32, delay_ms * 1000)];
+        let mut tvp = @ptr_cast(*u8, &tv[0]);
+        if (@int_from_ptr(a) == 0) or (n == socks.len) {
+            tvp = @ptr_from_int(*u8, 0);  // nothing more to start: wait for these
+        }
+        let r = select(0, @ptr_from_int(*mut u8, 0), @ptr_cast(*mut u8, &mut wset[0]),
+                       @ptr_cast(*mut u8, &mut xset[0]), tvp);
+        if r < 0 {
+            break;
+        }
+        // the first in order that connected wins; drop those that failed
+        let mut kept: usize = 0;
+        for k in 0..n {
+            let s = socks[k];
+            if (won == INVALID) and in_fdset(wset[..], s) {
+                won = s;
+                continue;
+            }
+            if in_fdset(xset[..], s) {
+                let mut err: i32 = 0;
+                let mut el: i32 = 4;
+                _ = getsockopt(s, SOL_SOCKET, SO_ERROR, @ptr_cast(*mut u8, &mut err), &mut el);
+                refused = refused or (err == WSAECONNREFUSED);
+                _ = closesocket(s);
+                continue;
+            }
+            socks[kept] = s;
+            kept += 1;
+        }
+        n = kept;
+        if won != INVALID {
+            break;
+        }
+    }
+    for k in 0..n {
+        _ = closesocket(socks[k]);
     }
     freeaddrinfo(res);
-    return result;
+    if won == INVALID {
+        if refused {
+            return AX_REFUSED;
+        }
+        return AX_ERR;
+    }
+    let mut nb: u32 = 0;
+    _ = ioctlsocket(won, FIONBIO, &mut nb);
+    return sock_fd(won);
+}
+
+fn in_fdset(set: []u64, s: usize) bool {
+    for k in 0..@truncate(usize, set[0]) {
+        if set[k + 1] == @as(u64, s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a sockaddr is 127.x.x.x or ::1.
+fn is_loopback(sa: *mut u8) bool {
+    let b = @slice_from_ptr(@ptr_cast(*u8, sa), 24);
+    if b[0] == 2 {
+        return b[4] == 127;
+    }
+    if b[0] == 23 {
+        for k in @as(usize, 8)..23 {
+            if b[k] != 0 {
+                return false;
+            }
+        }
+        return b[23] == 1;
+    }
+    return false;
 }
 
 export fn ax_tcp_listen(name: *u8, len: usize, port: u32) i32 {
@@ -2075,7 +2192,9 @@ export fn ax_unix_connect(path: *u8, len: usize) i32 {
     }
     let e = WSAGetLastError();
     _ = closesocket(s);
-    if (e == WSAECONNREFUSED) or (e == 10049) or (e == 2) {  // (WSAEADDRNOTAVAIL, ENOENT: no such socket file)
+    // (WSAEADDRNOTAVAIL, ENOENT: no such socket file; WSAENETDOWN: no such
+    // directory, on Windows 11)
+    if (e == WSAECONNREFUSED) or (e == 10049) or (e == 2) or (e == 10050) {
         return AX_REFUSED;
     }
     return AX_ERR;
