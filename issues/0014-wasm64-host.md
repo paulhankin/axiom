@@ -1,7 +1,7 @@
 # 0014: wasm64 programs do not run under runtime/host.mjs
 
 - Type: bug
-- Status: open
+- Status: won't fix (not wanted)
 - Area: runtime: `runtime/host.mjs` (and the workers)
 
 Programs build for `--target=wasm64` (memory64), and the compiler itself

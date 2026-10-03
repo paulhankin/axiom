@@ -1,7 +1,7 @@
 # 0013: The C compiler's native runtime does not build on macOS
 
 - Type: feature
-- Status: open
+- Status: won't fix (not wanted)
 - Area: runtime: `runtime/native_host.c`; compiler (C)
 
 The C compiler (`compiler/`) emits code through LLVM for the host's default

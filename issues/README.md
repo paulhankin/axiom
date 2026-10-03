@@ -33,8 +33,6 @@ they travel with the code they describe.
 | [0010](0010-typeset-without-math-table.md) | feature | std/text/math/typeset | Better typesetting with fonts that lack a MATH table |
 | [0011](0011-macos-native-target.md) | feature | compiler | Native macOS binaries from the self-hosted compiler |
 | [0012](0012-windows-native-target.md) | feature | compiler, runtime | Native Windows binaries |
-| [0013](0013-c-compiler-runtime-on-macos.md) | feature | runtime | The C compiler's native runtime does not build on macOS |
-| [0014](0014-wasm64-host.md) | bug | runtime | wasm64 programs do not run under `runtime/host.mjs` |
 
 ## Closed
 
@@ -44,3 +42,5 @@ they travel with the code they describe.
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
 | [0007](0007-profile-program-arguments.md) | feature | compiler: `axiom profile` | `axiom profile` cannot pass arguments to the program |
 | [0006](0006-selfhost-on-wasm32.md) | bug | compiler | The self-hosted compiler does not build for wasm32 |
+| [0013](0013-c-compiler-runtime-on-macos.md) | feature | runtime | The C compiler's native runtime does not build on macOS |
+| [0014](0014-wasm64-host.md) | bug | runtime | wasm64 programs do not run under `runtime/host.mjs` |

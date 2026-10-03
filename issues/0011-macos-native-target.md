@@ -48,4 +48,4 @@ Steps: a Mach-O writer and linker, proved with a "hello" that calls `write`
 and `exit` in `libSystem`; then the Darwin runtime; then the ABI details;
 then the test suite on a Mac.
 
-Related: 0013 (the C compiler on macOS, a cheaper stopgap), 0012 (Windows).
+Related: 0012 (Windows).
