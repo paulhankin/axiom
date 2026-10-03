@@ -1,0 +1,133 @@
+// Copies of aggregates the optimizer removes (selfhost/src/copies.ax) only
+// when nothing can tell: each case here needs its copy, or reads one that
+// may go, around writes to the original.
+// flags: -O2
+import "../lib/io.ax" as io;
+
+struct Big {
+    a: [8]u64,
+    n: u64,
+}
+
+struct Five {  // over four leaves, under the size passed by address
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+    e: u32,
+}
+
+struct Outer {
+    tag: u64,
+    inner: Big,
+}
+
+let mut G: Big = Big.{ a: [0; 8], n: 1 };
+
+fn big(x: u64) Big {
+    let mut b = Big.{ a: [0; 8], n: x };
+    b.a[2] = x * 10;
+    return b;
+}
+
+fn sum(b: Big) u64 {
+    return b.a[2] + b.n;
+}
+
+// reads its parameter after writing the original through p
+fn write_then_read(b: Big, p: *mut Big) u64 {
+    p.n = 1000;
+    p.a[2] = 0;
+    return sum(b);
+}
+
+fn bump_global() void {
+    G.n += 100;
+}
+
+fn pass_on(b: Big, d: u32) u64 {
+    if d == 0 {
+        return sum(b);
+    }
+    return pass_on(b, d - 1);
+}
+
+fn result_of_result(x: u64) Big {
+    return big(x);
+}
+
+fn result_of_result2(x: u64) Big {
+    return result_of_result(x + 1);
+}
+
+fn five_sum(f: Five) u32 {
+    return f.a + f.e;
+}
+
+fn keep(p: *Big) u64 {
+    return p.n;
+}
+
+export fn run() void {
+    // a copy, then the original changes
+    let mut s = big(3);
+    let c = s;
+    s.n = 99;
+    s.a[2] = 0;
+    io.uint(sum(c));  // expect: 33
+    io.uint(sum(s));  // expect: 99
+
+    // the callee writes the original while reading its copy
+    let mut t = big(4);
+    io.uint(write_then_read(t, &mut t));  // expect: 44
+    io.uint(t.n);  // expect: 1000
+
+    // a copy of a global, then a call changes the global
+    G = big(5);
+    let g = G;
+    bump_global();
+    io.uint(sum(g));  // expect: 55
+    io.uint(G.n);     // expect: 105
+
+    // a copy of a copy with a write between
+    let g1 = G;
+    G.n = 7;
+    let g2 = g1;
+    io.uint(g2.n);  // expect: 105
+
+    // in a loop: each copy is of that round's value
+    let mut l = big(1);
+    let mut total: u64 = 0;
+    for i in @as(u64, 0)..4 {
+        let before = l;
+        l.n += 10;
+        total += before.n * (i + 1);
+    }
+    io.uint(total);  // expect: 210
+
+    // passed down by value, results passed up through results
+    io.uint(pass_on(big(6), 5));         // expect: 66
+    io.uint(sum(result_of_result2(7)));  // expect: 88
+
+    // a field copied out, then the struct changes
+    let mut o = Outer.{ tag: 1, inner: big(2) };
+    let inner = o.inner;
+    o.inner.n = 500;
+    io.uint(sum(inner));  // expect: 22
+
+    // a copy whose address is taken and written through
+    let mut e = big(9);
+    let ec = e;
+    let pe = &mut e;
+    pe.n = 1;
+    io.uint(ec.n);       // expect: 9
+    io.uint(keep(&ec));  // expect: 9
+    io.uint(keep(&e));   // expect: 1
+
+    // a small aggregate of five fields, the same way
+    let mut f = Five.{ a: 1, b: 2, c: 3, d: 4, e: 5 };
+    let fc = f;
+    f.e = 50;
+    io.uint(@as(u64, five_sum(fc)));  // expect: 6
+    io.uint(@as(u64, five_sum(f)));   // expect: 51
+}

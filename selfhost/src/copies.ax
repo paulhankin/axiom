@@ -1,0 +1,484 @@
+// =============================================================================
+// copies.ax - removes copies of aggregates that are only read.
+//
+// Lowering (lower.ax) gives every aggregate value memory of its own: reading
+// a struct from a variable, a field or through a pointer copies it into a
+// fresh stack slot, since the source may change later; a `let` copies it
+// again into the variable; passing it on passes the slot's address. So a
+// 200-byte struct read, bound and passed on is copied two or three times,
+// and inlining strings such copies together.
+//
+// A copy `memcpy(D, P, n)` into a stack slot D of n bytes is not needed when
+//   - it is the only write to D, and everything else only reads D (loads,
+//     copies from it, passing it by value: lowering marks those arguments
+//     ir.EXT_BYVAL, and the callee cannot write them), after the copy (the
+//     copy dominates every read);
+//   - P does not change while D is read: P is (inside) a constant global, a
+//     parameter passed by value, or a stack slot whose address goes nowhere
+//     else and whose every write comes before the copy (dominates it). Then
+//     no write to P can come between the copy and a read of D: the read
+//     would be reachable from that write without passing the copy, so from
+//     the function's entry too, and the copy would not dominate it.
+// D's readers then read P instead, and the copy goes. A chain of copies
+// collapses in a round: each link's source only gains readers.
+// =============================================================================
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "util.ax" as u;
+
+// What is known about an object whose address is used: its writes and
+// reads, and whether its address goes anywhere we cannot follow.
+struct Obj {
+    writers: u.List.[*mut ir.Value],
+    readers: u.List.[*mut ir.Value],
+    escaped: bool,
+    readonly: bool,  // a constant global or a by-value parameter: never written
+}
+
+// (Obj records are reused: objs[0..nobjs] are in use.)
+let mut objs: u.List.[*mut Obj] = u.List.[*mut Obj].{ data: @ptr_from_int(*mut *mut Obj, 0), len: 0, cap: 0 };
+let mut nobjs: usize = 0;
+let mut marked: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+// (made when first used; never written: what a global is does not change)
+let mut const_global: *mut Obj = @ptr_from_int(*mut Obj, 0);
+let mut other_global: *mut Obj = @ptr_from_int(*mut Obj, 0);
+
+// The object an address points into: an alloca, a parameter or a global,
+// through constant or variable offsets (nil when it is none of those).
+fn root(p0: *mut ir.Value) *mut ir.Value {
+    let mut p = p0;
+    while u.notnil(p) and (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        p = p.a;
+    }
+    if u.isnil(p) {
+        return p;
+    }
+    if ((p.kind == ir.V_INST) and (p.op == ir.OP_ALLOCA)) or (p.kind == ir.V_PARAM) or (p.kind == ir.V_GLOBAL) {
+        return p;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// (Allocas and parameters are numbered in aux2 while a round runs.)
+fn obj_of(r: *mut ir.Value) *mut Obj {
+    if r.kind == ir.V_GLOBAL {
+        if u.isnil(const_global) {
+            const_global = u.new.[Obj]();
+            const_global.readonly = true;
+            other_global = u.new.[Obj]();
+            other_global.escaped = true;  // (anything may write a variable)
+        }
+        if r.gv.is_const {
+            return const_global;
+        }
+        return other_global;
+    }
+    if r.aux2 > 0 {
+        return objs.get(@truncate(usize, @bit_cast(u64, r.aux2 - 1)));
+    }
+    if nobjs == objs.len {
+        objs.push(u.new.[Obj]());
+    }
+    let o = objs.get(nobjs);
+    nobjs += 1;
+    o.writers.clear();
+    o.readers.clear();
+    o.escaped = false;
+    o.readonly = false;
+    if r.kind == ir.V_PARAM {
+        let f = r.fnp;
+        let k = @truncate(usize, r.cv);
+        o.readonly = (k < f.param_ext.len) and (f.param_ext[k] == ir.EXT_BYVAL);
+        o.escaped = not o.readonly;
+    }
+    marked.push(r);
+    r.aux2 = @bit_cast(i64, @as(u64, nobjs));
+    return o;
+}
+
+// How an instruction uses an address.
+const READ: i32 = 0;
+const WRITE: i32 = 1;
+const ESCAPE: i32 = 2;
+
+fn note(i: *mut ir.Value, p: *mut ir.Value, how: i32) void {
+    if u.isnil(p) or (p.ty.kind != ir.T_PTR) {
+        return;
+    }
+    let r = root(p);
+    if u.isnil(r) {
+        return;
+    }
+    let o = obj_of(r);
+    if r.kind == ir.V_GLOBAL {
+        return;  // (no lists for globals: what they are does not change)
+    }
+    if how == READ {
+        o.readers.push(i);
+    } else if how == WRITE {
+        o.writers.push(i);
+    } else {
+        o.escaped = true;
+    }
+}
+
+fn scan(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let op = i.op;
+            if op == ir.OP_LOAD {
+                note(i, i.a, READ);
+            } else if op == ir.OP_STORE {
+                note(i, i.a, ESCAPE);  // (an address stored somewhere)
+                note(i, i.b, WRITE);
+            } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+                note(i, i.a, WRITE);
+                note(i, i.b, READ);
+            } else if op == ir.OP_MEMSET {
+                note(i, i.a, WRITE);
+            } else if op == ir.OP_CALL {
+                note(i, i.a, ESCAPE);
+                for k in 0..i.xs.len {
+                    let mut e: u8 = 0;
+                    if (k + 1) < i.ext.len {
+                        e = i.ext[k + 1];
+                    }
+                    if e == ir.EXT_BYVAL {
+                        note(i, i.xs.get(k), READ);
+                    } else if e == ir.EXT_SRET {
+                        note(i, i.xs.get(k), WRITE);
+                    } else {
+                        note(i, i.xs.get(k), ESCAPE);
+                    }
+                }
+            } else if (op != ir.OP_ALLOCA) and (op != ir.OP_PTRADD) {
+                // (an offset address: what is done with it is noted)
+                note(i, i.a, ESCAPE);
+                note(i, i.b, ESCAPE);
+                note(i, i.c, ESCAPE);
+                for k in 0..i.xs.len {
+                    note(i, i.xs.get(k), ESCAPE);
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Numbers instructions in their blocks, for dominance within a block (and
+// clears the marks obj_of leaves in aux2, which other passes use too).
+fn number(f: *mut ir.Func) void {
+    for k in 0..f.params.len {
+        f.params[k].aux2 = 0;
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut n: i32 = 0;
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.pos = n;
+            i.aux2 = 0;
+            n += 1;
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Does instruction a run before b on every path to b?
+fn dominates(a: *mut ir.Value, b: *mut ir.Value) bool {
+    if a.blk == b.blk {
+        return a.pos < b.pos;
+    }
+    if (a.blk.rpo < 0) or (b.blk.rpo < 0) {
+        return false;  // (unreachable)
+    }
+    return opt.dominates(a.blk, b.blk);
+}
+
+// Can copy c into slot D go: D only written by c and read after it, its
+// source unchanged while D is read?
+fn removable(c: *mut ir.Value) bool {
+    let d = c.a;
+    if (d.kind != ir.V_INST) or (d.op != ir.OP_ALLOCA) or not ir.is_cint(c.c) or (ir.cint_val(c.c) != d.aty.size) {
+        return false;
+    }
+    let od = obj_of(d);
+    if od.escaped or (od.writers.len != 1) or (od.writers.get(0) != c) {
+        return false;
+    }
+    let r = root(c.b);
+    if u.isnil(r) or (r == d) {
+        return false;
+    }
+    let os = obj_of(r);
+    if os.escaped {
+        return false;
+    }
+    if not os.readonly {
+        for k in 0..os.writers.len {
+            if not dominates(os.writers.get(k), c) {
+                return false;
+            }
+        }
+    }
+    for k in 0..od.readers.len {
+        if not dominates(c, od.readers.get(k)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The source address of copy c where every use of D sees it: c's operand
+// when it is an alloca, a parameter or a global; else its constant offset
+// from that, computed after the allocas at the start of the function (nil
+// when the offset is not constant). Copies removed earlier in the round are
+// seen through (resolve).
+fn source_for_uses(f: *mut ir.Func, c: *mut ir.Value) *mut ir.Value {
+    let mut p = ir.resolve(c.b);
+    let mut off: u64 = 0;
+    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        if not ir.is_cint(p.b) {
+            return u.nil.[ir.Value]();
+        }
+        off +%= ir.cint_val(p.b);
+        p = ir.resolve(p.a);
+    }
+    if off == 0 {
+        return p;
+    }
+    let x = ir.new_inst(f, ir.OP_PTRADD, ir.t_ptr());
+    x.a = p;
+    x.b = ir.cint(ir.isz(), off);
+    x.src = c.src;
+    let mut at = f.first.first;
+    while u.notnil(at) and (at.op == ir.OP_ALLOCA) {
+        at = at.next;
+    }
+    if u.isnil(at) {
+        ir.append_inst(f.first, x);
+    } else {
+        ir.insert_before(at, x);
+    }
+    return x;
+}
+
+// Folds offsets of offsets (ptradd(ptradd(p, a), b) is ptradd(p, a + b)):
+// an address made by source_for_uses may have been based on a slot
+// forwarded later in the round, to an address made after it.
+fn fold_offsets(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_PTRADD) and ir.is_cint(i.b) {
+                while (i.a.kind == ir.V_INST) and (i.a.op == ir.OP_PTRADD) and ir.is_cint(i.a.b) {
+                    i.b = ir.cint(ir.isz(), ir.cint_val(i.b) +% ir.cint_val(i.a.b));
+                    i.a = i.a.a;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Might instruction i write memory (or run code that does)?
+fn writes_memory(i: *ir.Value) bool {
+    let op = i.op;
+    return (op == ir.OP_STORE) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) or
+           (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_INTR);
+}
+
+fn whole(c: *ir.Value, d: *ir.Value) bool {
+    return (d.kind == ir.V_INST) and (d.op == ir.OP_ALLOCA) and ir.is_cint(c.c) and (ir.cint_val(c.c) == d.aty.size);
+}
+
+// A copy of a copy: c2 copies slot D1, which c1 filled from S just before
+// (in the same block, with nothing between them that writes memory), and
+// nothing else reads D1. c2 can copy S itself (then c1 is dead), even when S
+// may change later: it has not changed yet.
+fn copy_of_copy(c2: *mut ir.Value) *mut ir.Value {
+    let d1 = c2.b;
+    if not whole(c2, d1) {
+        return u.nil.[ir.Value]();
+    }
+    let o = obj_of(d1);
+    if o.escaped or (o.writers.len != 1) or (o.readers.len != 1) {
+        return u.nil.[ir.Value]();
+    }
+    let c1 = o.writers.get(0);
+    if (c1.op != ir.OP_MEMCPY) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or (c1.pos >= c2.pos) {
+        return u.nil.[ir.Value]();
+    }
+    let rs = root(c1.b);
+    if u.isnil(rs) or (rs == root(c2.a)) {
+        return u.nil.[ir.Value]();  // (the copy must not overlap)
+    }
+    let mut i = c1.next;
+    while i != c2 {
+        if writes_memory(i) {
+            return u.nil.[ir.Value]();
+        }
+        i = i.next;
+    }
+    return c1;
+}
+
+// The result of a call copied into this function's own result: the call
+// can write it there itself. The result's memory (the sret parameter) is
+// the caller's fresh slot, which nothing else here reads or writes, so it
+// only must not be used between the call and the copy.
+fn result_into_result(f: *mut ir.Func, c: *mut ir.Value) *mut ir.Value {
+    if (f.params.len == 0) or (c.a != f.params[0]) or (f.param_ext.len == 0) or (f.param_ext[0] != ir.EXT_SRET) or
+       not whole(c, c.b) {
+        return u.nil.[ir.Value]();
+    }
+    let d = c.b;
+    let o = obj_of(d);
+    if o.escaped or (o.writers.len != 1) or (o.readers.len != 1) {
+        return u.nil.[ir.Value]();
+    }
+    let k = o.writers.get(0);
+    if (k.op != ir.OP_CALL) or (k.blk != c.blk) or (k.pos >= c.pos) or (k.xs.len == 0) or (k.xs.get(0) != d) {
+        return u.nil.[ir.Value]();
+    }
+    for j in 0..k.xs.len {
+        if (k.xs.get(j).ty.kind == ir.T_PTR) and (root(k.xs.get(j)) == c.a) {
+            return u.nil.[ir.Value]();
+        }
+    }
+    let mut i = k.next;
+    while i != c {
+        if uses_address(i, c.a) {
+            return u.nil.[ir.Value]();
+        }
+        i = i.next;
+    }
+    return k;
+}
+
+fn uses_address(i: *ir.Value, p: *mut ir.Value) bool {
+    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+    for o in ops {
+        if u.notnil(o) and (o.ty.kind == ir.T_PTR) and (root(o) == p) {
+            return true;
+        }
+    }
+    for k in 0..i.xs.len {
+        let o = i.xs.get(k);
+        if (o.ty.kind == ir.T_PTR) and (root(o) == p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn clear() void {
+    for k in 0..marked.len {
+        marked.get(k).aux2 = 0;
+    }
+    marked.clear();
+    nobjs = 0;
+}
+
+/// Removes copies of aggregates into stack slots that are only read; true
+/// if it removed any.
+pub fn forward_copies(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    let mut any = false;
+    for round in @as(i32, 0)..4 {
+        _ = round;
+        opt.compute_preds(f);
+        let order = opt.dominators(f);
+        u.free(@ptr_cast(*mut void, order.data));
+        number(f);
+        scan(f);
+        let mut done = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        // and pairs for the local rules: (copy, the copy before it) or
+        // (copy into the result, the call that made it)
+        let mut pairs = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if i.op == ir.OP_MEMCPY {
+                    if removable(i) {
+                        done.push(i);
+                    } else {
+                        let c1 = copy_of_copy(i);
+                        let k = result_into_result(f, i);
+                        if u.notnil(c1) {
+                            pairs.push(i);
+                            pairs.push(c1);
+                        } else if u.notnil(k) {
+                            pairs.push(i);
+                            pairs.push(k);
+                        }
+                    }
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+        clear();
+        let mut changed = false;
+        // the local rules when nothing else is left (each pair's
+        // instructions untouched by another this round)
+        if done.len == 0 {
+            let mut touched = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+            let mut k: usize = 0;
+            while k < pairs.len {
+                let c = pairs.get(k);
+                let x = pairs.get(k + 1);
+                k += 2;
+                if (c.flag == 77) or (x.flag == 77) {
+                    continue;
+                }
+                if x.op == ir.OP_MEMCPY {
+                    c.b = x.b;  // copy the source itself; the first copy is dead
+                    ir.remove_inst(x);
+                } else {
+                    x.xs.set(0, c.a);  // the call writes the result; no copy
+                    ir.remove_inst(c);
+                }
+                c.flag = 77;
+                x.flag = 77;
+                touched.push(c);
+                touched.push(x);
+                changed = true;
+            }
+            for t in touched.items() {
+                t.flag = 0;
+            }
+            u.free(@ptr_cast(*mut void, touched.data));
+        }
+        u.free(@ptr_cast(*mut void, pairs.data));
+        for k in 0..done.len {
+            let c = done.get(k);
+            let d = c.a;
+            let s = source_for_uses(f, c);
+            if u.isnil(s) {
+                continue;
+            }
+            ir.remove_inst(c);
+            ir.forward(d, s);
+            changed = true;
+        }
+        u.free(@ptr_cast(*mut void, done.data));
+        if not changed {
+            break;
+        }
+        ir.apply_forwarding(f);
+        fold_offsets(f);
+        any = true;
+    }
+    return any;
+}
