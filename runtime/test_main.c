@@ -7,6 +7,9 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -142,6 +145,12 @@ int main(int argc, char **argv) {
             dup2(out[1], 1);
             dup2(out[1], 2);
             result_fd = res[1];
+#ifdef __linux__
+            // A trap or crash ends the child without a core dump: with a piped
+            // core_pattern (as under WSL) RLIMIT_CORE is ignored, and a dump into
+            // a helper that does not read it never ends.
+            prctl(PR_SET_DUMPABLE, 0);
+#endif
             struct itimerval it = {{0, 0}, {timeout_ms / 1000, (timeout_ms % 1000) * 1000}};
             setitimer(ITIMER_REAL, &it, NULL);
             static char altstack[65536];
