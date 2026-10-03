@@ -903,6 +903,32 @@ int32_t ax_os(void) {
 #endif
 }
 
+// The processor's extensions as std/os/cpu.ax's A_* bits, on AArch64 Linux
+// (the kernel's hardware capabilities). x86-64 programs ask cpuid: 0.
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#endif
+uint64_t ax_cpu_features(void) {
+#if defined(__aarch64__) && defined(__linux__)
+    unsigned long h = getauxval(AT_HWCAP), h2 = getauxval(AT_HWCAP2);
+    // ATOMICS, LRCPC, ASIMDDP, AES, SHA2, SHA3, SHA512, SM4, CRC32, ASIMDRDM, ASIMDHP, ASIMDFHM, SVE, DIT
+    static const unsigned char map[][2] = {{8, 0}, {15, 1}, {20, 2}, {3, 4}, {6, 5}, {17, 6}, {21, 7},
+                                           {19, 8}, {7, 9}, {12, 10}, {10, 11}, {23, 12}, {22, 15}, {24, 17}};
+    uint64_t f = 0;
+    for (size_t i = 0; i < sizeof map / sizeof *map; i++)
+        if ((h >> map[i][0]) & 1) f |= (uint64_t)1 << map[i][1];
+    if (((h >> 3) & 1) && !((h >> 4) & 1)) f &= ~(uint64_t)0x10;  // AES without PMULL
+    if (((h >> 6) & 1) && !((h >> 5) & 1)) f &= ~(uint64_t)0x20;  // SHA2 without SHA1
+    // hwcap2: SVE2 1, I8MM 13, BF16 14, SME 23, CSSC 34
+    static const unsigned char map2[][2] = {{1, 16}, {13, 14}, {14, 13}, {23, 18}, {34, 3}};
+    for (size_t i = 0; i < sizeof map2 / sizeof *map2; i++)
+        if ((h2 >> map2[i][0]) & 1) f |= (uint64_t)1 << map2[i][1];
+    return f;
+#else
+    return 0;
+#endif
+}
+
 uint32_t ax_cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (uint32_t)n : 1;

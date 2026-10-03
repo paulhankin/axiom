@@ -40,6 +40,9 @@ build, check and test also take a package directory, or no path for the package 
 current directory (spec §4.6).
 
   --target=wasm32|wasm64|native   default wasm32 (alias: wasm32-freestanding)
+  --cpu=<preset>                  processor extensions: native (the default for native), a baseline, or a
+                                  preset of selfhost/README.md (spec §13.4)
+  --features=+ext,-ext            add or remove extensions
   -O0 | -O1 | -O2 | -O3           optimization level; never changes program behavior
   --release                       integer overflow saturates (= --overflow=saturate)
   --overflow=trap|saturate        default: trap

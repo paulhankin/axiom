@@ -106,7 +106,7 @@ static const char *decl(HeaderGen *g, Type *t, const char *inner, bool konst) {
     case TY_VEC:
     case TY_V128: {
         const char *lane = t->kind == TY_V128 ? "int32_t" : scalar_name(t->elem);
-        return arena_printf("%s%s __attribute__((vector_size(16)))%s%s", k, lane, sep, inner);
+        return arena_printf("%s%s __attribute__((vector_size(%lld)))%s%s", k, lane, (long long)type_size(t), sep, inner);
     }
     default:
         // Tagged unions and error unions have no C equivalent: an opaque blob

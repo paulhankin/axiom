@@ -68,6 +68,12 @@ void scope_push(void);
 void scope_pop(void);
 Local *scope_lookup(Sym name);
 
+// sema_target.c
+int target_name_value(int id, const char *name);
+void check_fn_attr(Decl *f);
+void gate_fn(Decl *f);
+int fn_versions(Decl *f, uint64_t *out);
+
 // helpers
 static inline Span expr_span(Expr *e) { return e->span; }
 

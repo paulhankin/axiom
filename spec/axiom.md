@@ -122,7 +122,9 @@ only at the start of a module-level `let` (§12.8.6).
 
 ```
 u8  u16  u32  u64  usize   i8  i16  i32  i64  isize   f32  f64   bool  void
-i8x16  u8x16  i16x8  u16x8  i32x4  u32x4  i64x2  u64x2  f32x4  f64x2  v128
+i8x16  u8x16  i16x8   u16x8   i32x4   u32x4   i64x2  u64x2  f32x4   f64x2  v128
+i8x32  u8x32  i16x16  u16x16  i32x8   u32x8   i64x4  u64x4  f32x8   f64x4  v256
+i8x64  u8x64  i16x32  u16x32  i32x16  u32x16  i64x8  u64x8  f32x16  f64x8  v512
 ```
 
 **Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
@@ -223,7 +225,8 @@ Member        ::= IDENT ( "=" "-"? ( INT_LIT | CHAR_LIT ) )?
 
 MethodDecl    ::= "pub"? FnDecl
 
-FnDecl        ::= "fn" IDENT GenericParams? "(" ParamList? ")" Type Block
+FnDecl        ::= "fn" IDENT GenericParams? "(" ParamList? ")" Type FnAttr? Block
+FnAttr        ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"   (* §13.4 *)
 ParamList     ::= Param ( "," Param )* ","?
 Param         ::= IDENT ":" Type
 
@@ -557,17 +560,20 @@ There is no pointer arithmetic operator. Write
 
 ### 5.8 SIMD vectors
 
-| Type | Lanes × lane type |
-|---|---|
-| `i8x16`, `u8x16` | 16 × 8-bit |
-| `i16x8`, `u16x8` | 8 × 16-bit |
-| `i32x4`, `u32x4` | 4 × 32-bit |
-| `i64x2`, `u64x2` | 2 × 64-bit |
-| `f32x4` | 4 × f32 |
-| `f64x2` | 2 × f64 |
-| `v128` | 128 raw bits (no lane interpretation) |
+| 128 bits | 256 bits | 512 bits | Lane type |
+|---|---|---|---|
+| `i8x16`, `u8x16` | `i8x32`, `u8x32` | `i8x64`, `u8x64` | 8-bit integer |
+| `i16x8`, `u16x8` | `i16x16`, `u16x16` | `i16x32`, `u16x32` | 16-bit integer |
+| `i32x4`, `u32x4` | `i32x8`, `u32x8` | `i32x16`, `u32x16` | 32-bit integer |
+| `i64x2`, `u64x2` | `i64x4`, `u64x4` | `i64x8`, `u64x8` | 64-bit integer |
+| `f32x4` | `f32x8` | `f32x16` | f32 |
+| `f64x2` | `f64x4` | `f64x8` | f64 |
+| `v128` | `v256` | `v512` | raw bits (no lane interpretation) |
 
-All vector types are 16 bytes with 16-byte alignment. See §13.
+A vector type's size and alignment are its width in bytes: 16, 32 or 64. Every operator and
+builtin of §13 applies to every width, lane by lane, with the same results. Where a target's
+registers are narrower (WebAssembly, AArch64's Advanced SIMD, x86-64 without AVX), a wider
+vector is computed in 128-bit pieces. See §13.
 
 ### 5.9 Structs
 
@@ -1546,24 +1552,122 @@ Appendix A has full signatures.
 - Construction: `@splat`, `@vec` (from lane values).
 - Lanes: `@extract_lane`, `@replace_lane`. The lane index must be a constant expression.
 - Memory: `@load(V, s)` / `@store(s, v)`. `s` is a slice, and the program traps if
-  `s.len * size_of(elem) < 16` (`T0006`).
+  `s.len * size_of(elem)` is less than the vector's size (`T0006`).
 - Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices, and
-  `@swizzle(a, idx)` takes runtime indices.
+  `@swizzle(a, idx)` takes runtime indices into a byte vector of any width (an index
+  past the end gives 0).
 - Comparison: `@lanes_eq`, `@lanes_ne`, `@lanes_lt`, `@lanes_le`, `@lanes_gt`,
   `@lanes_ge`. Each returns an all-ones or all-zeros integer vector of the same shape.
 - Selection and tests: `@select(mask, a, b)`, `@any_true`, `@all_true`, `@bitmask`.
 - Reductions: `@reduce_add(v)` and `@dot(a, b)`. For floats, the association order is
-  fixed as **pairwise**: `(l0 + l1) + (l2 + l3)` for 4 lanes and `l0 + l1` for 2 lanes. The
-  result is therefore deterministic across targets.
+  fixed as **pairwise**: `(l0 + l1) + (l2 + l3)` for 4 lanes and `l0 + l1` for 2 lanes, and
+  for more lanes the sum of each half, added. The result is therefore deterministic across
+  targets.
 - Lane-wise math: `@min`, `@max`, `@abs`, `@sqrt`, `@floor`, `@ceil`, `@trunc`,
   `@nearest`, `@fma`.
 
 ### 13.3 Native targets
 
-On native targets, vector types lower to 128-bit registers (SSE2/AVX or NEON). The
-semantics are the WASM SIMD semantics, including saturation behavior and NaN rules, except
-that shift counts follow §7.6 rather than WASM's modulo rule. The compiler inserts fix-ups
-wherever host instructions differ.
+On native targets, vector types lower to the processor's vector registers (SSE2/AVX/AVX-512
+or NEON), in pieces where a type is wider than they are. The semantics are the WASM SIMD
+semantics, including saturation behavior and NaN rules, except that shift counts follow
+§7.6 rather than WASM's modulo rule. The compiler inserts fix-ups wherever host
+instructions differ.
+
+A 256- or 512-bit vector is passed to and returned from a function in memory, like a
+struct larger than 32 bytes: the caller passes the address of a copy, and a result is
+written through an address the caller passes. So functions compiled for different
+processor extensions (§13.4) agree on how such vectors arrive. Only 128-bit vectors may
+cross the export and import boundary (§14.2).
+
+### 13.4 Processor extensions
+
+A build targets an architecture and a set of **processor extensions** the code may use,
+chosen with `--cpu` and `--features` (§16.1). An extension changes how operations are
+lowered, never what a program computes: every operator and builtin of §13.1-13.2 has the
+same result with or without one. Extensions have the names `--features` takes:
+
+| Architecture | Extensions |
+|---|---|
+| `x86_64` (SSE2 is the baseline) | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1` |
+| `aarch64` (FP and Advanced SIMD are the baseline) | `lse`, `rcpc`, `dotprod`, `cssc`, `aes` (with PMULL), `sha2` (SHA-1 and SHA-256), `sha3`, `sha512`, `sm4` (SM3 and SM4), `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
+| `wasm32`, `wasm64` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
+
+An extension implies those it builds on (`avx2` implies `avx`, which implies `sse4.2`, and
+so on; `avx512bw` implies `avx512f`, which implies `avx2`, `fma` and `f16c`), and removing
+one with `--features=-x` removes the extensions that need it.
+
+**Target conditions.** These builtins are constant `bool`s:
+
+- `@target_has("ext")`: whether the code being compiled may use extension `ext`, that is,
+  the build's extensions plus those of the enclosing function (`@features`, or the version
+  of a `@multiversion` function being compiled). `ext` is a string literal naming an
+  extension of any architecture (`E0827` otherwise); another architecture's extension is
+  simply absent.
+- `@target_arch("x86_64")`: the architecture, one of `wasm32`, `wasm64`, `x86_64`, `aarch64`.
+- `@target_os("linux")`: the operating system of a native target, one of `linux`, `macos`,
+  `windows`, or `none` for WebAssembly (`os.system()` in std/os is the run-time answer:
+  under WebAssembly, the host's).
+
+A **target condition** is one of these, `true` or `false`, or `not`, `and` and `or` of target
+conditions (with parentheses). An `if` whose condition is a target condition compiles only
+the branch the condition selects. The other branch is still parsed and type-checked, but no
+code is generated for it, and it may use builtins that the code is not compiled for (below).
+So a portable fallback costs nothing where the faster path applies:
+
+```axiom
+fn crc32c(crc: u32, data: []u8) u32 {
+    if @target_arch("x86_64") and @target_has("sse4.2") {
+        return crc32c_hw(crc, data);    // uses @x86_crc32c
+    }
+    return crc32c_table(crc, data);
+}
+```
+
+**Run-time detection.** `@cpu_has("ext")` is a `bool`: whether the processor running the
+program has extension `ext`. It is the constant `true` where `@target_has("ext")` is (and
+then also counts as a target condition), and always `false` under WebAssembly, where
+programs cannot ask. Otherwise it asks std/os/cpu (`cpu.features()`, detected once:
+`cpuid` on x86-64, the system on AArch64). Every build includes std/os/cpu for this.
+
+**Functions compiled for more extensions.** A function declared with an attribute after
+its return type is compiled for extensions the build does not assume:
+
+- `fn f(...) T @features("ext,ext") { ... }` compiles the body with these extensions added.
+  A call checks the processor first and traps with `T0013` if it lacks one (the check
+  disappears where the build already has them). Call it after `@cpu_has`, or from a
+  function with the same extensions.
+- `fn f(...) T @multiversion("ext,ext", "ext", ...) { ... }` compiles the body once for
+  each listed set of extensions, and once for the build's own. A call runs the first
+  version, in the order listed, whose extensions the processor has, and the build's own
+  version otherwise. Within each version, `@target_has` answers for that version.
+
+Each string is a comma-separated list of extensions (a leading `+` is allowed). A set
+naming an extension of another architecture describes no version on this target: such a
+`@multiversion` version is left out, and an `@features` function always traps. A function
+has at most one attribute (`E0829`, as for an unknown attribute, no sets or an empty set).
+Every version is shown under the function's name in stack traces and profiles. The
+versions share one calling convention: a value passes between functions compiled for
+different extensions as it does between any two functions.
+
+**Builtins that need an extension.** Builtins that stand for one processor's instructions
+(`@x86_*`, `@arm_*`) exist only where the architecture and extensions they need are
+available: using one in code that is compiled (not in a branch a target condition rules
+out) for a target or function without them is `E0828`.
+
+| Builtin | Needs | Result |
+|---|---|---|
+| `@x86_cpuid(leaf, subleaf)` | `x86_64` | `u32x4`: `eax`, `ebx`, `ecx`, `edx` of the `cpuid` instruction |
+| `@x86_xgetbv(xcr)` | `x86_64` | `u64`: the extended control register (`xgetbv`; only when `cpuid` reports OSXSAVE) |
+
+**Start-up check.** A native program built for more than the architecture's baseline (any
+`--cpu` but the baseline, including the default `--target=native`, which means this
+machine's processor) checks the processor before `main` and exits with status 1 and a
+message naming the missing extensions, instead of failing on an unsupported instruction:
+
+```
+axiom: this program was built for processors with extensions this one lacks (--cpu=x86-64-v4); missing: avx512f avx512cd avx512bw avx512dq avx512vl
+```
 
 ---
 
@@ -1604,7 +1708,7 @@ must be one of the following (`E0801` otherwise):
 - a pointer,
 - a function pointer (a table index on WebAssembly) whose own parameter and return types
   are allowed here (C calls it with its calling convention),
-- a SIMD type,
+- a 128-bit SIMD type,
 - `void` as the return type.
 
 Exported functions MUST NOT return `!T`. Handle errors before the export boundary. The
@@ -1809,6 +1913,7 @@ in which case it is linked against the C library as before.
 ```
 axiom build <file.ax> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
                           [--sanitize=address]    # check heap accesses (§16.8)
+                          [--cpu=<preset>] [--features=+ext,-ext]   # processor extensions (§13.4)
 axiom check <file.ax>                  # parse and type-check only; no codegen
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
 axiom run   <file.ax> [--export=name]  # build for wasm32 and execute in the reference runtime
@@ -1965,6 +2070,9 @@ Initial registry, not exhaustive:
 | E0824 | C variadic argument without a promoted type |
 | E0825 | `@expect_eq` operand type cannot be compared |
 | E0826 | `@enum_from_int` of a constant that is no member |
+| E0827 | Unknown processor extension, architecture or operating system name (§13.4) |
+| E0828 | Builtin used in code not compiled for the architecture or extensions it needs (§13.4) |
+| E0829 | Invalid function attribute (`@features`, `@multiversion`) |
 
 ### 16.4 Runtime trap reporting and stack traces
 
@@ -2327,7 +2435,7 @@ With `--format=agent-json`, stdout holds one object:
 
 `failure.code` is one of:
 
-- a trap code (`T0000` to `T0012`);
+- a trap code (`T0000` to `T0013`);
 - `error`: the test returned an error, and the message names it;
 - `no_trap`: an `expect trap` test completed;
 - `timeout`.
@@ -2464,15 +2572,15 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@vec(V, l0, l1, …)` | Construct a vector from exactly `lanes(V)` lane values |
 | `@extract_lane(v, const i)` | `Vec → lane` |
 | `@replace_lane(v, const i, x)` | `Vec → Vec` |
-| `@load(V, s)` / `@store(s, v)` | Slice-checked 16-byte load/store (§13.2) |
+| `@load(V, s)` / `@store(s, v)` | Slice-checked load/store of the vector's size (§13.2) |
 | `@shuffle(a, b, const [i0, …])` | Two-input byte-granular or lane-granular shuffle. Indices must be in range (`E0820`) |
-| `@swizzle(a, idx)` | `u8x16` runtime indices. Out-of-range indices give 0 (WASM semantics) |
+| `@swizzle(a, idx)` | Byte vectors (`u8x16`, `u8x32`, ...): runtime indices into the whole vector. Out-of-range indices give 0 (WASM semantics) |
 | `@lanes_eq/ne/lt/le/gt/ge(a, b)` | Produce a mask vector |
 | `@select(mask, a, b)` | Bitwise select |
 | `@any_true(v)`, `@all_true(v)` | `→ bool` |
-| `@bitmask(v)` | `→ u32`, one bit per lane |
+| `@bitmask(v)` | `→ u32`, one bit per lane (`u64` for 64 lanes) |
 | `@reduce_add(v)` | Pairwise order (§13.2). Integer lanes wrap |
-| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16x8`: WASM `i32x4.dot_i16x8_s` |
+| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes |
 | `@narrow`, `@widen_low`, `@widen_high` | Lane-width changes per WASM |
 
 ### A.6 Atomics
@@ -2491,6 +2599,19 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 | `@expect_eq(a, b)` | Traps with `T0011` if `a != b`, recording both values (§17.1) |
 | `@memory_error()` | Diverges and traps with `T0012`: how `std/mem` reports a bad `free` under the address sanitizer (§16.8) |
 | `@sanitize_address()` | `→ bool`, a constant: whether the build uses `--sanitize=address` (§16.8) |
+
+### A.8 Processor extensions
+
+See §13.4.
+
+| Builtin | Notes |
+|---|---|
+| `@target_has("ext")` | `→ bool`, a constant: the code may use extension `ext` |
+| `@target_arch("arch")` | `→ bool`, a constant: `wasm32`, `wasm64`, `x86_64` or `aarch64` |
+| `@target_os("os")` | `→ bool`, a constant: `linux`, `macos`, `windows` or `none` (WebAssembly) |
+| `@cpu_has("ext")` | `→ bool`: the running processor has extension `ext` |
+| `@x86_cpuid(leaf, subleaf)` | `u32, u32 → u32x4`; needs `x86_64` |
+| `@x86_xgetbv(xcr)` | `u32 → u64`; needs `x86_64` |
 
 ---
 
@@ -2513,6 +2634,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0010` | Misaligned atomic access (§12.8.3) |
 | `T0011` | Expectation failed: `@expect` / `@expect_eq` (§17.1) |
 | `T0012` | Memory error found by the address sanitizer (§16.8) |
+| `T0013` | A function compiled for processor extensions the running processor lacks (`@features`, §13.4) |
 
 Nothing else traps, and nothing is undefined.
 
@@ -2559,6 +2681,8 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§16.7) | The user asked for independent compilation units |
 | C32 | Enums: distinct types over an integer representation, with members, methods, exhaustive `match`, `==`/`!=` and checked conversions (§5.14); `enum` is no longer reserved | The standard library passed alignments, modes and kinds as bare `u8`/`u32` constants, which any integer could be confused with |
 | C33 | Thread-local globals: `threadlocal let mut` (§12.8.6). This replaces the earlier "no thread-local storage" decision | The user asked for thread-locals. WebAssembly needed a per-instance block, set up by the thread start export |
+| C34 | Processor extensions in the language: target conditions (`@target_has`, `@target_arch`, `@target_os`) that select what is compiled, `@cpu_has`, and functions compiled for more extensions (`@features`, `@multiversion`) (§13.4) | Issue 0015: wider instruction sets need a way to choose between a fast path and a portable one, at build time or at run time. The dead branch is still type-checked, so it cannot rot unnoticed |
+| C35 | 256- and 512-bit vector types (`f32x8`, `i32x16`, `v512`, ...), with every operator and builtin of the 128-bit ones; passed in memory between functions (§5.8, §13.3) | Issue 0015: AVX2 and AVX-512 process 32 and 64 bytes at a time. On narrower targets the compiler splits them, so code written for the wide types is portable |
 
 ---
 

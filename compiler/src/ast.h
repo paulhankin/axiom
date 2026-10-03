@@ -303,6 +303,11 @@ struct Decl {
     Span abi_span;
     Vec(Sym) error_names;
     Vec(Span) error_spans;
+    // fn attribute: @features("a,b") or @multiversion("a,b", "c") after the return type
+    int attr;  // ATTR_*
+    Span attr_span;
+    Vec(Sym) attr_args;
+    Vec(Span) attr_arg_spans;
 
     // ---- sema ----
     int state;          // 0 = unresolved, 1 = resolving, 2 = done
@@ -318,6 +323,13 @@ struct Decl {
     bool layout_done;
     bool anon;
     Expr *cexpr;  // const: checked init expression
+    uint64_t *feat_sets;  // fn with an attribute: the extensions each version adds (closed under implication)
+};
+
+enum {
+    ATTR_NONE,
+    ATTR_FEATURES,      // @features: compiled with more extensions; traps (T0013) without them
+    ATTR_MULTIVERSION,  // @multiversion: one version per set, chosen at run time
 };
 
 struct Module {

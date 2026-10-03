@@ -455,6 +455,7 @@ void check_fn_body(Decl *fn) {
     if (fn->checked) return;
     fn->checked = true;
     resolve_decl(fn);
+    check_fn_attr(fn);
     FnCtx ctx = {0};
     ctx.tc = (TypeCtx){fn->module, fn->owner, fn, fn->owner ? fn->owner->type : NULL};
     ctx.fn = fn;
@@ -479,4 +480,5 @@ void check_fn_body(Decl *fn) {
     free(ctx.marks.data);
     free(ctx.loop_breaks.data);
     C = saved;
+    gate_fn(fn);
 }

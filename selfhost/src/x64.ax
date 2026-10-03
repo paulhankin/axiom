@@ -1059,6 +1059,12 @@ fn sse_unary(id: i32, d: i32, s: mc.MOp) void {
     _ = sse2(id, W(d), s);
 }
 
+// Unary packed op d = op(s): no merge, so VEX.vvvv is unused (1111, as an
+// instruction that does not read it requires).
+fn sse_unary_packed(id: i32, d: i32, s: mc.MOp) void {
+    _ = sse2(id, W(d), s);
+}
+
 fn cvt_si2f(d: i32, r: i32, is64int: bool, single: bool) void {
     let mut id = xe.CVTSI2SD;
     if single {
@@ -1455,7 +1461,11 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if id == ir.IN_SQRT {
-        sse_unary(xe.SQRTSS + kk, d, R(a));
+        if vec {
+            sse_unary_packed(xe.SQRTSS + kk, d, R(a));
+        } else {
+            sse_unary(xe.SQRTSS + kk, d, R(a));
+        }
         return;
     }
     if (id == ir.IN_FMIN) or (id == ir.IN_FMAX) {
@@ -1491,7 +1501,9 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         } else if single {
             op = xe.ROUNDSS;
         }
-        if AVX {
+        if AVX and not vec {
+            // (the scalar form merges vvvv's upper lanes; the packed one
+            // reads no vvvv, which must then be 1111)
             let i = e4(xe.SSE, 0, W(d), R(a), R(a), I(round_imm(id)));
             i.cc = op;
         } else {
@@ -2235,6 +2247,9 @@ fn has41() bool {
 pub fn legal(v: *mut ir.Value) bool {
     let t = v.ty;
     let o = v.op;
+    if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CPUID) {
+        return true;
+    }
     if o == ir.OP_ICMP {
         let at = v.a.ty;
         if at.kind != ir.T_VEC {
@@ -2500,6 +2515,21 @@ fn vec_fcmp(v: *mut ir.Value) void {
 // Lanes through a 16-byte stack slot.
 fn vec_slot() i32 {
     return mc.new_slot(MF, 16, 16);
+}
+
+// cpuid: eax, ebx, ecx and edx as the lanes of a u32x4 (through memory).
+fn gen_cpuid(v: *mut ir.Value) void {
+    let a = reg(v.xs.get(0));
+    let c = reg(v.xs.get(1));
+    _ = e2(xe.MOV_RR, 4, W(xe.RAX), R(a));
+    _ = e2(xe.MOV_RR, 4, W(xe.RCX), R(c));
+    _ = e4(xe.CPUID, 0, RW(xe.RAX), W(xe.RBX), RW(xe.RCX), W(xe.RDX));
+    let s = vec_slot();
+    let rs: [4]i32 = [xe.RAX, xe.RBX, xe.RCX, xe.RDX];
+    for k in @as(usize, 0)..4 {
+        _ = e2(xe.STORE, 4, mc.mem_slot(s, @int_cast(i64, k) * 4), R(rs[k]));
+    }
+    _ = sse2(xe.MOVDQU_LD, W(vreg(v)), mc.mem_slot(s, 0));
 }
 
 fn gen_extract(v: *mut ir.Value) void {
@@ -2794,7 +2824,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let a = reg(a0);
     let k = lk(at);
     if id == ir.IN_ABS {
-        sse_unary(xe.PABSB + k, d, R(a));
+        sse_unary_packed(xe.PABSB + k, d, R(a));
         return;
     }
     let b = reg(v.xs.get(1));
@@ -2979,6 +3009,24 @@ fn gen_inst(v: *mut ir.Value) void {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         if id == ir.IN_TRAP {
             _ = e0(xe.UD2, 0);
+            return;
+        }
+        if id == ir.IN_CPUID {
+            gen_cpuid(v);
+            return;
+        }
+        if id == ir.IN_XGETBV {
+            let c = reg(v.xs.get(0));
+            _ = e2(xe.MOV_RR, 4, W(xe.RCX), R(c));
+            _ = e3(xe.XGETBV, 0, R(xe.RCX), W(xe.RAX), W(xe.RDX));
+            let d = vreg(v);
+            let hi = vgpr();
+            _ = e2(xe.MOV_RR, 4, W(hi), R(xe.RDX));  // (zero-extends)
+            let s = e3(xe.SHIFT, 8, RW(hi), NONE(), I(32));
+            s.cc = 4;
+            _ = e2(xe.MOV_RR, 4, W(d), R(xe.RAX));
+            let orr = e2(xe.ALU, 8, RW(d), R(hi));
+            orr.cc = 1;
             return;
         }
         if (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
@@ -4246,6 +4294,17 @@ fn enc_inst(i: *mut mc.MInst) void {
         b8(0xf0);
         return;
     }
+    if op == xe.CPUID {
+        b8(0x0f);
+        b8(0xa2);
+        return;
+    }
+    if op == xe.XGETBV {
+        b8(0x0f);
+        b8(0x01);
+        b8(0xd0);
+        return;
+    }
     if op == xe.TLSBASE {
         let d = P(i.ops[0].reg);
         if WIN {
@@ -4402,22 +4461,22 @@ fn encode_func(f: *mut ir.Func) void {
     let cs: [5]i32 = [xe.RBX, xe.R12, xe.R13, xe.R14, xe.R15];
     let wcs: [7]i32 = [xe.RBX, xe.RSI, xe.RDI, xe.R12, xe.R13, xe.R14, xe.R15];
     let mut callee = cs[..];
+    // registers instructions name themselves (rsi and rdi of the string
+    // instructions, rbx of cpuid) are used too
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == mc.K_REG) and not mc.is_vreg(o.reg) and (o.reg >= 0) {
+                    MF.used_regs = MF.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
+                }
+            }
+            i = i.next;
+        }
+    }
     if WIN {
         callee = wcs[..];
-        // registers instructions name themselves (rsi and rdi of the string
-        // instructions) are used too
-        for bi in 0..MF.blocks.len {
-            let mut i = MF.blocks.get(bi).first;
-            while u.notnil(i) {
-                for k in 0..i.ops.len {
-                    let o = i.ops[k];
-                    if (o.kind == mc.K_REG) and not mc.is_vreg(o.reg) and (o.reg >= 0) {
-                        MF.used_regs = MF.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
-                    }
-                }
-                i = i.next;
-            }
-        }
         for k in @as(i32, 6)..16 {
             if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, xe.XMM0 + k))) != 0 {
                 xsaved[@int_cast(usize, nxsaved)] = xe.XMM0 + k;
@@ -4662,7 +4721,10 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         if not ir.is_decl(f) {
             // the function's machine code is all that outlives it
             u.scratch_begin();
+            let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
+            AVX = tg.has(tg.X_AVX);
             compile_func(f);
+            tg.end_fn(outer);
             u.scratch_end();
             if errors {
                 return u.nil.[elf.Obj]();

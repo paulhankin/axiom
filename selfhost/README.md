@@ -64,11 +64,25 @@ compiler does (`../../std` from the executable, or `--std`, or `$AXIOM_STD`).
 | Target | `--cpu` presets | Extensions (`--features`) |
 |---|---|---|
 | wasm32, wasm64 | `mvp`, `generic` (default), `bleeding-edge` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
-| x86_64, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16` |
-| aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `apple-m1`, `neoverse-n1`, `native` | `lse`, `rcpc`, `dotprod`, `cssc` |
+| x86_64, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `icelake-server`, `sapphirerapids`, `graniterapids`, `alderlake`, `arrowlake`, `znver3`, `znver4`, `znver5`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1` |
+| aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `neoverse-n1`, `neoverse-n2`, `neoverse-v1`, `neoverse-v2`, `apple-m1` ... `apple-m4`, `native` | `lse`, `rcpc`, `dotprod`, `cssc`, `aes`, `sha2`, `sha3`, `sha512`, `sm4`, `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
 
-`--target=native` means this machine's architecture with `--cpu=native` (its extensions,
-from `/proc/cpuinfo`); `--target=x86_64` and `--target=aarch64` default to the baseline.
+The names and their bits are std/os/cpu.ax's, which the compiler imports: programs see
+the same names through `@target_has` and `@cpu_has` (spec §13.4). An extension implies the
+ones it builds on (`+avx512bw` adds `avx512f`, `avx2`, `avx`, ...), and `-avx` removes
+everything that needs AVX.
+
+`--target=native` means this machine's architecture with `--cpu=native`: the extensions
+the processor reports (`cpuid` on x86-64, so also on Windows; the system on AArch64),
+through std/os/cpu.ax. `--target=x86_64` and `--target=aarch64` default to the baseline.
+A native program built for more than the baseline checks the processor before `main`
+(std/os/cpu.ax's `require`, compiled for the baseline) and exits with a message naming
+what is missing, rather than dying on an unsupported instruction.
+
+Each function is compiled with the build's extensions, or with more: a function declared
+`@features(...)` or each version of an `@multiversion(...)` one (spec §13.4) carries its
+own set in the IR (`ir.Func.features`). The backends switch to it while they compile the
+function, and the inliner never moves code into a function with fewer extensions.
 Without an extension the backends use a baseline sequence with the same result, so the
 choice never changes what a program computes:
 

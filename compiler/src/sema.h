@@ -31,4 +31,12 @@ bool sema_run(const char *path, SemaOptions *opts);
 
 uint32_t error_code_of(Sym name);  // 0 if undeclared
 
+// Processor extensions (sema_target.c, spec §13.4)
+#define SEMA_NO_VERSION (~(uint64_t)0)  // a version naming another architecture's extension
+// The value of a target condition in code compiled with extensions `feats`:
+// 1 true, 0 false, -1 not a target condition.
+int target_cond(Expr *e, uint64_t feats);
+bool baseline_fn(Decl *d);           // std/os/cpu.ax: compiled for the bare architecture
+uint64_t fn_base_features(Decl *d);  // the extensions its code may use, without an attribute
+
 #endif

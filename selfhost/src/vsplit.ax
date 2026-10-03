@@ -1,0 +1,502 @@
+// =============================================================================
+// vsplit.ax - vectors wider than the target's registers (the 256- and 512-bit
+// vectors of spec §5.8) become pieces the target has: an instruction on a
+// wide vector becomes one instruction per piece. A value's pieces are its
+// consecutive 16-byte (or 32-byte) parts, in lane order, so memory is
+// unchanged: a wide load or store is a load or store of each piece.
+//
+// Lane-wise operations split directly. The rest combine pieces: a
+// reduction-like intrinsic (any/all true, bitmask) per piece and then across
+// them, a swizzle as one lookup per table piece, a shuffle as two-input
+// shuffles of the pieces it reads (or lane by lane when it reads more).
+// =============================================================================
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "util.ax" as u;
+
+struct Pieces {
+    n: usize,
+    ps: [4]*mut ir.Value,
+}
+
+let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+let mut MAXB: u64 = 128;
+let mut marked: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+fn vbits(t: *ir.Ty) u64 {
+    return @as(u64, @bit_cast(u32, t.lanes)) * @as(u64, @bit_cast(u32, t.elem.bits));
+}
+
+fn wide(t: *ir.Ty) bool {
+    return (t.kind == ir.T_VEC) and (vbits(t) > MAXB);
+}
+
+fn npieces(t: *ir.Ty) usize {
+    return @truncate(usize, vbits(t) / MAXB);
+}
+
+fn piece_ty(t: *mut ir.Ty) *mut ir.Ty {
+    return ir.t_vec(t.elem, @truncate(u32, @as(u64, @bit_cast(u32, t.lanes)) / @as(u64, npieces(t))));
+}
+
+fn lanes_of(t: *ir.Ty) usize {
+    return @as(usize, @bit_cast(u32, t.lanes));
+}
+
+fn set_pieces(v: *mut ir.Value, p: *mut Pieces) void {
+    v.auxp = @ptr_cast(*mut void, p);
+    marked.push(v);
+}
+
+fn new_pieces(n: usize) *mut Pieces {
+    let p = u.new.[Pieces]();
+    p.n = n;
+    return p;
+}
+
+// The pieces of wide value v (already split, or a constant split here).
+fn pieces(v0: *mut ir.Value) *mut Pieces {
+    let v = ir.resolve(v0);
+    if not u.isvnil(v.auxp) and (v.kind == ir.V_INST) {
+        return @ptr_cast(*mut Pieces, v.auxp);
+    }
+    let t = v.ty;
+    let n = npieces(t);
+    let pt = piece_ty(t);
+    let p = new_pieces(n);
+    let lpp = lanes_of(pt);
+    for k in 0..n {
+        if v.kind == ir.V_CAGG {
+            let xs = u.newn.[*mut ir.Value](lpp + 1);
+            for j in 0..lpp {
+                xs[j] = v.xs.get((k * lpp) + j);
+            }
+            p.ps[k] = ir.cagg(pt, xs[0..lpp]);
+        } else if v.kind == ir.V_ZERO {
+            p.ps[k] = ir.czero(pt);
+        } else if v.kind == ir.V_UNDEF {
+            p.ps[k] = ir.undef(pt);
+        } else {
+            u.die(u.f1("internal compiler error: wide vector value %s has no pieces", ir.val_str(v)));
+        }
+    }
+    return p;
+}
+
+// Lane `l` of wide value v (a piece's lane).
+fn lane(v: *mut ir.Value, l: usize) *mut ir.Value {
+    let p = pieces(v);
+    let lpp = lanes_of(ir.resolve(v).ty) / p.n;
+    return ir.extract_elem(B, p.ps[l / lpp], @as(u64, l % lpp));
+}
+
+fn lanewise_intr(id: i32) bool {
+    return (id >= ir.IN_CTLZ) and (id <= ir.IN_ABS);
+}
+
+fn involves_wide(i: *ir.Value) bool {
+    if wide(i.ty) {
+        return true;
+    }
+    if (u.notnil(i.a) and wide(ir.resolve(i.a).ty)) or (u.notnil(i.b) and wide(ir.resolve(i.b).ty)) or
+       (u.notnil(i.c) and wide(ir.resolve(i.c).ty)) {
+        return true;
+    }
+    for k in 0..i.xs.len {
+        if wide(ir.resolve(i.xs.get(k)).ty) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The piece k of operand x: x's own piece if x is wide, else x itself.
+fn piece_of(x: *mut ir.Value, k: usize) *mut ir.Value {
+    if wide(ir.resolve(x).ty) {
+        return pieces(x).ps[k];
+    }
+    return x;
+}
+
+fn split_inst(i: *mut ir.Value) void {
+    ir.at_before(B, i);
+    let o = i.op;
+    let t = i.ty;
+    if o == ir.OP_STORE {
+        let p = pieces(i.a);
+        let pb = ir.resolve(i.a).ty.size / @as(u64, p.n);
+        for k in 0..p.n {
+            let addr = ir.ptradd(B, i.b, ir.cint(ir.isz(), @as(u64, k) * pb));
+            let s = ir.store(B, p.ps[k], addr);
+            s.flags = i.flags;
+            s.align = piece_align(i.align, pb);
+        }
+        ir.remove_inst(i);
+        return;
+    }
+    if o == ir.OP_EXTRACTELEM {
+        ir.forward(i, lane(i.a, @truncate(usize, i.cv)));
+        ir.remove_inst(i);
+        return;
+    }
+    if o == ir.OP_INTR {
+        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) {
+            let p = pieces(i.xs.get(0));
+            let mut acc = vnil();
+            for k in 0..p.n {
+                let mut args: [1]*mut ir.Value = [p.ps[k]];
+                let r = ir.intr(B, id, ir.t_int(1), args[..]);
+                if u.isnil(acc) {
+                    acc = r;
+                } else if id == ir.IN_ANYTRUE {
+                    acc = ir.or_(B, acc, r);
+                } else {
+                    acc = ir.and_(B, acc, r);
+                }
+            }
+            ir.forward(i, acc);
+            ir.remove_inst(i);
+            return;
+        }
+        if id == ir.IN_BITMASK {
+            let x = ir.resolve(i.xs.get(0));
+            let p = pieces(x);
+            let lpp = lanes_of(x.ty) / p.n;
+            let mut acc = ir.czero(t);
+            for k in 0..p.n {
+                let mut args: [1]*mut ir.Value = [p.ps[k]];
+                let mut r = ir.intr(B, id, ir.t_int(32), args[..]);
+                if t.bits > 32 {
+                    r = ir.zext(B, r, t);
+                }
+                if k > 0 {
+                    r = ir.binop(B, ir.OP_SHL, r, ir.cint(t, @as(u64, k * lpp)));
+                }
+                acc = ir.or_(B, acc, r);
+            }
+            ir.forward(i, acc);
+            ir.remove_inst(i);
+            return;
+        }
+    }
+    if not wide(t) {
+        u.die(u.f1("internal compiler error: cannot split vector instruction %s", ir.inst_str(i)));
+    }
+    let n = npieces(t);
+    let pt = piece_ty(t);
+    let r = new_pieces(n);
+    if o == ir.OP_PHI {
+        for k in 0..n {
+            r.ps[k] = ir.phi(B, pt);
+        }
+        set_pieces(i, r);
+        return;  // (incoming values: fill_phis)
+    }
+    if o == ir.OP_LOAD {
+        let pb = t.size / @as(u64, n);
+        for k in 0..n {
+            let addr = ir.ptradd(B, i.a, ir.cint(ir.isz(), @as(u64, k) * pb));
+            let l = ir.load(B, pt, addr);
+            l.flags = i.flags;
+            l.align = piece_align(i.align, pb);
+            r.ps[k] = l;
+        }
+    } else if ((o >= ir.OP_ADD) and (o <= ir.OP_FREM)) or (o == ir.OP_ICMP) or (o == ir.OP_FCMP) {
+        for k in 0..n {
+            let x = piece_of(i.a, k);
+            let y = piece_of(i.b, k);
+            if o == ir.OP_ICMP {
+                r.ps[k] = ir.icmp(B, @truncate(i32, @bit_cast(i64, i.cv)), x, y);
+            } else if o == ir.OP_FCMP {
+                r.ps[k] = ir.fcmp(B, @truncate(i32, @bit_cast(i64, i.cv)), x, y);
+            } else {
+                r.ps[k] = ir.binop(B, o, x, y);
+            }
+        }
+    } else if o == ir.OP_FNEG {
+        for k in 0..n {
+            r.ps[k] = ir.fneg(B, piece_of(i.a, k));
+        }
+    } else if (o >= ir.OP_ZEXT) and (o <= ir.OP_FPTOUI_SAT) {
+        let src = ir.resolve(i.a);
+        if not wide(src.ty) or (npieces(src.ty) != n) {
+            u.die(u.f1("internal compiler error: cannot split vector conversion %s", ir.inst_str(i)));
+        }
+        for k in 0..n {
+            r.ps[k] = ir.cast(B, o, pieces(src).ps[k], pt);
+        }
+    } else if o == ir.OP_SELECT {
+        for k in 0..n {
+            r.ps[k] = ir.select(B, i.a, piece_of(i.b, k), piece_of(i.c, k));
+        }
+    } else if o == ir.OP_SPLAT {
+        for k in 0..n {
+            r.ps[k] = ir.splat(B, pt, i.a);
+        }
+    } else if o == ir.OP_INSERTELEM {
+        let p = pieces(i.a);
+        let lpp = lanes_of(pt);
+        let l = @truncate(usize, i.cv);
+        for k in 0..n {
+            r.ps[k] = p.ps[k];
+        }
+        r.ps[l / lpp] = ir.insert_elem(B, p.ps[l / lpp], i.b, @as(u64, l % lpp));
+    } else if o == ir.OP_SHUFFLE {
+        split_shuffle(i, r, pt);
+    } else if o == ir.OP_INTR {
+        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        if id == ir.IN_SWIZZLE {
+            let tab = pieces(i.xs.get(0));
+            for k in 0..n {
+                let idx = piece_of(i.xs.get(1), k);
+                let mut acc = vnil();
+                for j in 0..tab.n {
+                    let mut ix = idx;
+                    if j > 0 {
+                        ix = ir.binop(B, ir.OP_SUB, idx, ir.splat(B, pt, ir.cint(pt.elem, @as(u64, j * 16))));
+                    }
+                    let mut args: [2]*mut ir.Value = [tab.ps[j], ix];
+                    let s = ir.intr(B, id, pt, args[..]);
+                    if u.isnil(acc) {
+                        acc = s;
+                    } else {
+                        acc = ir.or_(B, acc, s);
+                    }
+                }
+                r.ps[k] = acc;
+            }
+        } else if (id == ir.IN_DOT_I16) or lanewise_intr(id) {
+            for k in 0..n {
+                let args = u.newn.[*mut ir.Value](i.xs.len + 1);
+                for a in 0..i.xs.len {
+                    args[a] = piece_of(i.xs.get(a), k);
+                }
+                r.ps[k] = ir.intr(B, id, pt, args[0..i.xs.len]);
+            }
+        } else {
+            u.die(u.f1("internal compiler error: cannot split vector instruction %s", ir.inst_str(i)));
+        }
+    } else {
+        u.die(u.f1("internal compiler error: cannot split vector instruction %s", ir.inst_str(i)));
+    }
+    set_pieces(i, r);
+}
+
+fn piece_align(al: u32, pb: u64) u32 {
+    let mut a = al;
+    if @as(u64, a) > pb {
+        a = @truncate(u32, pb);
+    }
+    if a == 0 {
+        a = 1;
+    }
+    return a;
+}
+
+// A shuffle's result pieces, each from the (one or two) source pieces it
+// reads, or lane by lane.
+fn split_shuffle(i: *mut ir.Value, r: *mut Pieces, pt: *mut ir.Ty) void {
+    let a = ir.resolve(i.a);
+    let b = ir.resolve(i.b);
+    let la = lanes_of(a.ty);
+    let mut na: usize = 1;
+    if wide(a.ty) {
+        na = npieces(a.ty);
+    }
+    let lps = la / na;  // lanes per source piece
+    let lpp = lanes_of(pt);
+    for k in 0..r.n {
+        // the source pieces this result piece reads: (operand * 4 + piece)
+        let mut src: [2]usize = [99, 99];
+        let mut nsrc: usize = 0;
+        let mut ok = true;
+        for j in 0..lpp {
+            let m = i.mask[(k * lpp) + j];
+            if m < 0 {
+                continue;
+            }
+            let mi = @as(usize, @bit_cast(u32, m));
+            let mut id = (mi / lps);
+            if mi >= la {
+                id = 4 + ((mi - la) / lps);
+            }
+            if (nsrc > 0) and (src[0] == id) {
+                continue;
+            }
+            if (nsrc > 1) and (src[1] == id) {
+                continue;
+            }
+            if nsrc == 2 {
+                ok = false;
+                break;
+            }
+            src[nsrc] = id;
+            nsrc += 1;
+        }
+        if ok and (lps == lpp) {
+            if nsrc == 0 {
+                r.ps[k] = ir.undef(pt);
+                continue;
+            }
+            let x = shuffle_src(a, b, src[0]);
+            let mut y = x;
+            if nsrc > 1 {
+                y = shuffle_src(a, b, src[1]);
+            }
+            let mask = u.newn.[i32](lpp + 1);
+            for j in 0..lpp {
+                let m = i.mask[(k * lpp) + j];
+                if m < 0 {
+                    mask[j] = -1;
+                    continue;
+                }
+                let mi = @as(usize, @bit_cast(u32, m));
+                let mut id = mi / lps;
+                let mut sub = mi % lps;
+                if mi >= la {
+                    id = 4 + ((mi - la) / lps);
+                    sub = (mi - la) % lps;
+                }
+                if id == src[0] {
+                    mask[j] = @as(i32, @bit_cast(i32, @truncate(u32, sub)));
+                } else {
+                    mask[j] = @as(i32, @bit_cast(i32, @truncate(u32, sub + lpp)));
+                }
+            }
+            r.ps[k] = ir.shuffle(B, x, y, mask[0..lpp]);
+            continue;
+        }
+        // lane by lane
+        let mut v = ir.undef(pt);
+        for j in 0..lpp {
+            let m = i.mask[(k * lpp) + j];
+            if m < 0 {
+                continue;
+            }
+            let mi = @as(usize, @bit_cast(u32, m));
+            let mut x = vnil();
+            if mi < la {
+                x = src_lane(a, mi);
+            } else {
+                x = src_lane(b, mi - la);
+            }
+            v = ir.insert_elem(B, v, x, @as(u64, j));
+        }
+        r.ps[k] = v;
+    }
+}
+
+fn shuffle_src(a: *mut ir.Value, b: *mut ir.Value, id: usize) *mut ir.Value {
+    let mut x = a;
+    let mut k = id;
+    if id >= 4 {
+        x = b;
+        k = id - 4;
+    }
+    return piece_of(x, k);
+}
+
+fn src_lane(x: *mut ir.Value, l: usize) *mut ir.Value {
+    if wide(x.ty) {
+        return lane(x, l);
+    }
+    return ir.extract_elem(B, x, @as(u64, l));
+}
+
+fn fill_phis(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) and (i.op == ir.OP_PHI) {
+            if not u.isvnil(i.auxp) and wide(i.ty) {
+                let r = @ptr_cast(*mut Pieces, i.auxp);
+                for k in 0..i.xs.len {
+                    let p = pieces(i.xs.get(k));
+                    for j in 0..r.n {
+                        ir.add_incoming(r.ps[j], p.ps[j], i.bs.get(k));
+                    }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Splits f's vector instructions wider than `max_bits` (128 or 256).
+pub fn split_wide(f: *mut ir.Func, max_bits: u64) void {
+    MAXB = max_bits;
+    ir.remove_unreachable(f);
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) and not any {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if involves_wide(i) {
+                any = true;
+                break;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if not any {
+        return;
+    }
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    ir.apply_forwarding(f);
+    marked.clear();
+    let order = opt.rpo(f);
+    let mut todo = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    for bi in 0..order.len {
+        let mut i = order.get(bi).first;
+        while u.notnil(i) {
+            if involves_wide(i) {
+                todo.push(i);
+            }
+            i = i.next;
+        }
+    }
+    // phis first: their values may come from blocks later in the order
+    for k in 0..todo.len {
+        let i = todo.get(k);
+        if i.op == ir.OP_PHI {
+            split_inst(i);
+        }
+    }
+    let mut dead = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    for k in 0..todo.len {
+        let i = todo.get(k);
+        if i.op == ir.OP_PHI {
+            dead.push(i);
+            continue;
+        }
+        let keeps = wide(i.ty) and (i.op != ir.OP_STORE);
+        split_inst(i);
+        if keeps {
+            dead.push(i);  // (its pieces replace it; its users are split too)
+        }
+    }
+    fill_phis(f);
+    for k in 0..marked.len {
+        marked.get(k).auxp = u.vnil();
+    }
+    // wide values whose users all had pieces: gone
+    let mut k = dead.len;
+    while k > 0 {
+        k -= 1;
+        ir.remove_inst(dead.get(k));
+    }
+    ir.apply_forwarding(f);
+    u.free(@ptr_cast(*mut void, todo.data));
+    u.free(@ptr_cast(*mut void, dead.data));
+    u.free(@ptr_cast(*mut void, order.data));
+}

@@ -28,8 +28,10 @@
 #include "package.h"
 #include "units.h"
 #include "sema.h"
+#include "target.h"
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void);
+const char *LLVMGetHostCPUFeatures_wrapper(void);
 
 extern char **environ;
 
@@ -687,6 +689,7 @@ int main(int argc, char **argv) {
     bool json = false;
     CgOptions co = {.stack_traces = true};
     Vec(char *) link_inputs = {0};
+    Vec(char *) feature_args = {0};  // --features
     Vec(char *) link_flags = {0};  // -l / -L
     Vec(char *) inc_flags = {0};   // -I, for C sources
     const char *header_path = NULL;
@@ -715,6 +718,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--format=human")) json = false;
         else if (!strncmp(a, "--std=", 6)) std_dir = a + 6;
         else if (!strncmp(a, "--cpu=", 6)) co.cpu = a + 6;
+        else if (!strncmp(a, "--features=", 11)) vec_push(feature_args, (char *)a + 11);
         else if (!strncmp(a, "--link=", 7)) vec_push(link_inputs, (char *)a + 7);
         else if (!strncmp(a, "--emit-header=", 14)) header_path = a + 14;
         else if (testing && !strncmp(a, "--filter=", 9)) test_filter = a;
@@ -764,6 +768,30 @@ int main(int argc, char **argv) {
         diag_emit_fatal(json, "E9002", arena_printf("unknown target '%s' (expected wasm32, wasm64 or native)", target));
         return 2;
     }
+    // Processor extensions: a --cpu preset (default: the host's for native,
+    // a baseline for wasm), then --features edits (target.c).
+    if (g_target.wasm) {
+        g_arch = g_target.ptr_bits == 64 ? ARCH_WASM64 : ARCH_WASM32;
+    } else {
+        g_arch = (strstr(g_target.triple, "aarch64") || strstr(g_target.triple, "arm64")) ? ARCH_A64 : ARCH_X64;
+#ifdef __APPLE__
+        g_os = OS_DARWIN;
+#endif
+    }
+    g_cpu = co.cpu ? co.cpu : g_target.wasm ? "generic" : "native";
+    if (!strcmp(g_cpu, "native") && !g_target.wasm) {
+        g_features = feature_closure(features_from_llvm(LLVMGetHostCPUFeatures_wrapper()));
+    } else if (!cpu_preset(g_arch, g_cpu, &g_features)) {
+        diag_emit_fatal(json, "E9002", arena_printf("unknown --cpu '%s' for target %s", g_cpu, target));
+        return 2;
+    }
+    for (int k = 0; k < feature_args.len; k++) {
+        const char *bad = apply_features(feature_args.data[k]);
+        if (bad) {
+            diag_emit_fatal(json, "E9002", arena_printf("unknown processor extension '%s' (known: %s)", bad, feature_names()));
+            return 2;
+        }
+    }
     if (!file_exists(input)) {
         diag_emit_fatal(json, "E0211", arena_printf("cannot read '%s'", input));
         return 2;
@@ -774,6 +802,13 @@ int main(int argc, char **argv) {
     if (g_target.wasm && strcmp(cmd, "check") != 0) {
         const char *rtp = arena_printf("%s/../runtime/rt.ax", std_path);
         if (file_exists(rtp)) vec_push(pkg_files, (char *)rtp);
+    }
+    // std/os/cpu.ax: @cpu_has, @features and @multiversion ask it about the
+    // processor, and native programs built for more than the baseline check
+    // the processor with it before main.
+    if (strcmp(cmd, "check") != 0) {
+        const char *cpup = arena_printf("%s/os/cpu.ax", std_path);
+        if (file_exists(cpup)) vec_push(pkg_files, (char *)cpup);
     }
     // --sanitize=address checks accesses with std/mem.ax's shadow memory
     if (co.sanitize_address) vec_push(pkg_files, (char *)arena_printf("%s/mem.ax", std_path));

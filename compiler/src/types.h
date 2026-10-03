@@ -80,6 +80,8 @@ Type *type_prim(PrimKind p);
 Type *type_int(int bits, bool is_signed, bool is_size);
 Type *type_float(int bits);
 Type *type_vec(Type *lane, int lanes);
+Type *type_vraw(int bits);       // v128, v256, v512
+int simd_bits(const Type *t);    // a vector type's width: 128, 256 or 512
 Type *type_ptr(Type *elem, bool mut);
 Type *type_slice(Type *elem, bool mut);
 Type *type_array(Type *elem, int64_t len);

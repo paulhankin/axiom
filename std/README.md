@@ -53,6 +53,7 @@ that owns memory has `deinit`).
 | [`os/xinput`](os/xinput.ax) | Windows only: game controllers (XInput; Xbox and compatible pads). `state(i)` → `Pad` (connected, buttons with `down`, triggers 0..1, sticks −1..1 with the dead zones removed), `vibrate`, `battery`, `Tracker` (`pressed`/`released` between updates) |
 | [`os/com`](os/com.ax) | Windows only: calling COM interfaces (`method` by vtable index, `release`, `query`, `init`), little-endian struct fields (`put32`, `get64`, ...), `utf16` |
 | [`os/cli`](os/cli.ax) | Command-line parsing, GNU style: flags and options (bundled short ones, `--name=value`, unique prefixes, `--`), positionals (`Arity`: optional, required, many), subcommands, typed getters, generated `help`, precise error messages |
+| [`os/cpu`](os/cpu.ax) | Processor extensions: `features` (the running processor's, detected once: `cpuid` on x86-64, the system on AArch64), `has` by name, the table of names and bits the compiler shares (`--features`, `@target_has`, `@cpu_has`, spec §13.4) |
 | [`os/term`](os/term.ax) | Terminals: `is_tty`, `size`, raw mode, `color_enabled` (`NO_COLOR`, `FORCE_COLOR`, `TERM`), `Style` (attributes; `BasicColor`, 256 and RGB colours), cursor and screen control, `decode_key` (`KeyCode`: arrows, function keys; modifiers, UTF-8) |
 
 ## Concurrency

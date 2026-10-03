@@ -7,6 +7,7 @@ import "diag.ax" as dg;
 import "lexer.ax" as lx;
 import "package.ax" as pkg;
 import "parser.ax" as parser;
+import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
 
@@ -711,8 +712,10 @@ fn boundary_type_ok(t: *ast.Type, is_ret: bool) bool {
         }
         return boundary_type_ok(t.ret, true);
     }
-    if (k == ast.TY_BOOL) or (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_PTR) or (k == ast.TY_VEC) or
-       (k == ast.TY_V128) or (k == ast.TY_INVALID) {
+    if (k == ast.TY_VEC) or (k == ast.TY_V128) {
+        return ty.simd_bits(t) == 128;  // (WebAssembly has nothing wider)
+    }
+    if (k == ast.TY_BOOL) or (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_PTR) or (k == ast.TY_INVALID) {
         return true;
     }
     if k == ast.TY_VOID {
@@ -3835,7 +3838,7 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_SWIZZLE {
         let t = pair(e, x);
         if (t.kind != ast.TY_INVALID) and not ((t.kind == ast.TY_VEC) and (t.elem.bits == 8)) {
-            _ = dg.err(e.span, "E0812", "@swizzle requires u8x16 or i8x16 operands");
+            _ = dg.err(e.span, "E0812", "@swizzle requires byte vectors (u8x16, i8x16, u8x32, ...)");
         }
         return set_ty(e, t);
     }
@@ -3873,6 +3876,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         if not ty.is_vec_int(t) and (t.kind != ast.TY_INVALID) {
             _ = dg.err(e.span, "E0812", "@bitmask requires an integer vector");
         }
+        if (t.kind == ast.TY_VEC) and (t.lanes > 32) {
+            return set_ty(e, ty.t_u64);
+        }
         return set_ty(e, ty.t_u32);
     }
     if id == ast.BI_REDUCE_ADD {
@@ -3891,9 +3897,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return set_ty(e, t.elem);
         }
         if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i16) {
-            return set_ty(e, ty.type_vec(ty.t_i32, 4));
+            return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 2));
         }
-        _ = dg.err(e.span, "E0812", u.f1("@dot requires float vectors or i16x8, found %s", tstr(t)));
+        _ = dg.err(e.span, "E0812", u.f1("@dot requires float vectors or i16 lanes, found %s", tstr(t)));
         return set_ty(e, ty.t_invalid);
     }
     if (id == ast.BI_TRAP) or (id == ast.BI_MEMORY_ERROR) {
@@ -3901,6 +3907,44 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if id == ast.BI_SANITIZE_ADDRESS {
         return set_ty(e, ty.t_bool);
+    }
+    if (id == ast.BI_TARGET_HAS) or (id == ast.BI_CPU_HAS) {
+        let a = barg(e, 0);
+        if a.kind != ast.E_STRING {
+            _ = check_expr(a, tnil());
+            _ = dg.err(a.span, "E0827", u.f1("@%s expects a string literal naming a processor extension", e.name));
+        } else if not tg.feature_known(a.str) {
+            _ = dg.err(a.span, "E0827", u.f2("unknown processor extension '%s' (this target has: %s)", a.str,
+                                             tg.feature_names()));
+        } else {
+            a.ty = ty.type_slice(ty.t_u8, false);
+        }
+        return set_ty(e, ty.t_bool);
+    }
+    if (id == ast.BI_TARGET_ARCH) or (id == ast.BI_TARGET_OS) {
+        let a = barg(e, 0);
+        let names = u.pick(id == ast.BI_TARGET_ARCH, "wasm32, wasm64, x86_64, aarch64", "linux, macos, windows, none");
+        if a.kind != ast.E_STRING {
+            _ = check_expr(a, tnil());
+            _ = dg.err(a.span, "E0827", u.f2("@%s expects a string literal: one of %s", e.name, names));
+        } else if target_name_value(id, a.str) < 0 {
+            _ = dg.err(a.span, "E0827",
+                       u.f3(
+                           "unknown %s '%s' (expected one of %s)",
+                           u.pick(id == ast.BI_TARGET_ARCH, "architecture", "operating system"), a.str, names));
+        } else {
+            a.ty = ty.type_slice(ty.t_u8, false);
+        }
+        return set_ty(e, ty.t_bool);
+    }
+    if id == ast.BI_X86_CPUID {
+        _ = check_expr_to(earg(e, 0), ty.t_u32);
+        _ = check_expr_to(earg(e, 1), ty.t_u32);
+        return set_ty(e, ty.type_vec(ty.t_u32, 4));
+    }
+    if id == ast.BI_X86_XGETBV {
+        _ = check_expr_to(earg(e, 0), ty.t_u32);
+        return set_ty(e, ty.t_u64);
     }
     if id == ast.BI_EXPECT {
         _ = check_expr_to(earg(e, 0), ty.t_bool);
@@ -4535,6 +4579,7 @@ fn check_fn_body(f: *mut ast.Decl) void {
     }
     f.checked = true;
     resolve_decl(f);
+    check_fn_attr(f);
     let mut oself = tnil();
     if u.notnil(f.owner) {
         oself = f.owner.ty;
@@ -4567,6 +4612,323 @@ fn check_fn_body(f: *mut ast.Decl) void {
     u.free(@ptr_cast(*mut void, ctx.marks.data));
     u.free(@ptr_cast(*mut void, ctx.loop_breaks.data));
     C = saved;
+    gate_fn(f);
+}
+
+// ---------------------------------------------------------------------------
+// Processor extensions (spec §13.4): target conditions, @features and
+// @multiversion, and builtins that need an extension.
+// ---------------------------------------------------------------------------
+pub const NO_VERSION: u64 = 0xFFFF_FFFF_FFFF_FFFF;  // a version naming another architecture's extension
+
+// The value a target name stands for: an architecture (@target_arch) or an
+// operating system (@target_os). -1 for an unknown name.
+fn target_name_value(id: i32, name: []u8) i32 {
+    if id == ast.BI_TARGET_ARCH {
+        let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
+        for i in 0..t.len {
+            if u.str_eq(t[i], name) {
+                return @int_cast(i32, i) + tg.ARCH_WASM32;
+            }
+        }
+        return -1;
+    }
+    let t = ["linux", "macos", "windows", "none"];
+    for i in 0..t.len {
+        if u.str_eq(t[i], name) {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+// The operating system as @target_os numbers it (none: WebAssembly).
+fn target_os_value() i32 {
+    if tg.is_wasm() {
+        return 3;
+    }
+    if tg.g_os == tg.OS_DARWIN {
+        return 1;
+    }
+    if tg.g_os == tg.OS_WINDOWS {
+        return 2;
+    }
+    return 0;
+}
+
+fn tri(c: bool) i32 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+// The value of a target condition in code compiled with extensions
+// `feats`: 1 true, 0 false, -1 not a target condition. Target conditions
+// are @target_has, @target_arch, @target_os, @cpu_has of an extension the
+// code may use (true), true and false, combined with not, and, or.
+pub fn target_cond(e: *ast.Expr, feats: u64) i32 {
+    if e.kind == ast.E_BOOL {
+        return tri(e.bval);
+    }
+    if e.kind == ast.E_BUILTIN {
+        let id = e.index;
+        if (e.bargs.len != 1) or u.isnil(e.bargs.at(0).e) or (e.bargs.at(0).e.kind != ast.E_STRING) {
+            return -1;
+        }
+        let name = e.bargs.at(0).e.str;
+        if (id == ast.BI_TARGET_HAS) or (id == ast.BI_CPU_HAS) {
+            let b = tg.feature_bit(name);
+            let on = (b != 0) and ((feats & b) == b);
+            if (id == ast.BI_CPU_HAS) and not on {
+                return -1;
+            }
+            return tri(on);
+        }
+        if id == ast.BI_TARGET_ARCH {
+            return tri(target_name_value(id, name) == tg.g_arch);
+        }
+        if id == ast.BI_TARGET_OS {
+            return tri(target_name_value(id, name) == target_os_value());
+        }
+        return -1;
+    }
+    if (e.kind == ast.E_UNARY) and (e.op == lx.KW_NOT) {
+        let a = target_cond(e.a, feats);
+        if a < 0 {
+            return -1;
+        }
+        return 1 - a;
+    }
+    if (e.kind == ast.E_BINARY) and ((e.op == lx.KW_AND) or (e.op == lx.KW_OR)) {
+        let a = target_cond(e.a, feats);
+        let b = target_cond(e.b, feats);
+        if e.op == lx.KW_AND {
+            if (a == 0) or (b == 0) {
+                return 0;
+            }
+            if (a == 1) and (b == 1) {
+                return 1;
+            }
+            return -1;
+        }
+        if (a == 1) or (b == 1) {
+            return 1;
+        }
+        if (a == 0) and (b == 0) {
+            return 0;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+// Is this function's code exempt from --cpu (compiled for the bare
+// architecture)? std/os/cpu.ax's detection and start-up check, which must
+// run on any processor of the architecture.
+pub fn baseline_fn(d: *ast.Decl) bool {
+    return u.notnil(d.module) and u.ends(u.file_of(d.module.file.id).display, "std/os/cpu.ax");
+}
+
+// @features / @multiversion: the extension sets, closed under implication.
+// A set naming another architecture's extension is NO_VERSION.
+fn check_fn_attr(f: *mut ast.Decl) void {
+    if f.attr == ast.ATTR_NONE {
+        return;
+    }
+    let n = f.attr_args.len;
+    f.feat_sets = u.newn.[u64](n + 1)[0..n];
+    let what = u.pick(f.attr == ast.ATTR_FEATURES, "features", "multiversion");
+    if n == 0 {
+        _ = dg.err(f.attr_span, "E0829", u.f1("@%s needs at least one set of extensions, such as \"avx2,fma\"", what));
+        return;
+    }
+    if (f.attr == ast.ATTR_FEATURES) and (n != 1) {
+        _ = dg.err(f.attr_span, "E0829",
+                   "@features takes one set of extensions (\"a,b\"); @multiversion takes several");
+    }
+    for i in 0..n {
+        let spec = f.attr_args.get(i);
+        let sp = f.attr_arg_spans.get(i);
+        let mut bits: u64 = 0;
+        let mut foreign = false;
+        let mut empty = true;
+        let mut k: usize = 0;
+        while k <= spec.len {
+            let mut j = k;
+            while (j < spec.len) and (spec[j] != ',') {
+                j += 1;
+            }
+            let mut name = spec[k..j];
+            k = j + 1;
+            while (name.len > 0) and (name[0] == ' ') {
+                name = name[1..];
+            }
+            if (name.len > 0) and (name[0] == '+') {
+                name = name[1..];
+            }
+            if name.len == 0 {
+                continue;
+            }
+            empty = false;
+            if not tg.feature_known(name) {
+                _ = dg.err(sp, "E0827", u.f2("unknown processor extension '%s' (this target has: %s)", name,
+                                             tg.feature_names()));
+                continue;
+            }
+            let b = tg.feature_bit(name);
+            if b == 0 {
+                foreign = true;
+            }
+            bits = bits | b;
+        }
+        if empty {
+            _ = dg.err(sp, "E0829", "empty set of extensions");
+        }
+        if foreign {
+            f.feat_sets[i] = NO_VERSION;
+        } else {
+            f.feat_sets[i] = tg.parse_features(spec).bits;
+        }
+    }
+}
+
+// The extension sets the function's versions are compiled with: the
+// @multiversion fallback first (the target's own), then one per listed set
+// this architecture has.
+pub fn fn_versions(f: *ast.Decl) []mut u64 {
+    let base = tg.func_features(0, baseline_fn(f));
+    if f.attr == ast.ATTR_NONE {
+        let r = u.newn.[u64](1);
+        r[0] = base;
+        return r[0..1];
+    }
+    let r = u.newn.[u64](f.feat_sets.len + 2);
+    let mut n: usize = 0;
+    if f.attr == ast.ATTR_MULTIVERSION {
+        r[n] = base;
+        n += 1;
+    }
+    for x in f.feat_sets {
+        if x != NO_VERSION {
+            r[n] = base | x;
+            n += 1;
+        }
+    }
+    return r[0..n];
+}
+
+// What a builtin needs: an architecture (0: any) and extensions.
+pub struct Need {
+    arch: i32,
+    feats: u64,
+}
+
+pub fn builtin_need(id: i32) Need {
+    if (id == ast.BI_X86_CPUID) or (id == ast.BI_X86_XGETBV) {
+        return Need.{ arch: tg.ARCH_X64, feats: 0 };
+    }
+    return Need.{ arch: 0, feats: 0 };
+}
+
+let mut gate_reported: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+fn arch_name(a: i32) []u8 {
+    let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
+    return t[@int_cast(usize, a - tg.ARCH_WASM32)];
+}
+
+fn need_text(nd: Need, feats: u64) []u8 {
+    if nd.arch != tg.g_arch {
+        let saved = tg.g_arch;
+        tg.g_arch = nd.arch;
+        let mut t = u.f1("the %s architecture", arch_name(nd.arch));
+        if nd.feats != 0 {
+            t = u.f2("%s with %s", t, tg.features_string(nd.feats));
+        }
+        tg.g_arch = saved;
+        return t;
+    }
+    return u.f1("the extensions %s", tg.features_string(nd.feats & ~feats));
+}
+
+fn gate_expr(e: *ast.Expr, feats: u64) void {
+    if u.isnil(e) {
+        return;
+    }
+    if e.kind == ast.E_BUILTIN {
+        let nd = builtin_need(e.index);
+        if ((nd.arch != 0) and (nd.arch != tg.g_arch)) or ((feats & nd.feats) != nd.feats) {
+            let mut seen = false;
+            for i in 0..gate_reported.len {
+                if gate_reported.get(i) == e.span.start {
+                    seen = true;
+                }
+            }
+            if not seen {
+                gate_reported.push(e.span.start);
+                let d = dg.err(e.span, "E0828", u.f2("@%s needs %s, which this code is not compiled for", e.name,
+                                                     need_text(nd, feats)));
+                dg.note(d, e.span,
+                        "use it under `if @target_has(...)` or `if @target_arch(...)`, or in a function declared with @features or @multiversion");
+            }
+        }
+        for i in 0..e.bargs.len {
+            gate_expr(e.bargs.at(i).e, feats);
+        }
+        return;
+    }
+    gate_expr(e.a, feats);
+    gate_expr(e.b, feats);
+    gate_expr(e.c, feats);
+    for i in 0..e.args.len {
+        gate_expr(e.args.get(i), feats);
+    }
+    for i in 0..e.inits.len {
+        gate_expr(e.inits.at(i).value, feats);
+    }
+    gate_expr(e.hexpr, feats);
+    gate_stmt(e.hblock, feats);
+}
+
+fn gate_stmt(s: *ast.Stmt, feats: u64) void {
+    if u.isnil(s) {
+        return;
+    }
+    if s.kind == ast.S_IF {
+        let c = target_cond(s.e, feats);
+        if c == 1 {
+            gate_stmt(s.body, feats);
+            return;
+        }
+        if c == 0 {
+            gate_stmt(s.els, feats);
+            return;
+        }
+    }
+    gate_expr(s.e, feats);
+    gate_expr(s.e2, feats);
+    gate_expr(s.e3, feats);
+    gate_stmt(s.body, feats);
+    gate_stmt(s.els, feats);
+    for i in 0..s.stmts.len {
+        gate_stmt(s.stmts.get(i), feats);
+    }
+    for i in 0..s.arms.len {
+        gate_stmt(s.arms.at(i).body, feats);
+    }
+}
+
+// Each version of a function may use only the builtins its extensions
+// allow (in the code it compiles: a branch a target condition rules out
+// is not compiled).
+fn gate_fn(f: *ast.Decl) void {
+    if u.isnil(f.body) {
+        return;
+    }
+    for v in fn_versions(f) {
+        gate_stmt(f.body, v);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -879,6 +879,36 @@ static void parse_params(Parser *P, Decl *d) {
     expect(P, TK_RPAREN);
 }
 
+// FnAttr ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"
+static void parse_fn_attr(Parser *P, Decl *d) {
+    Token *t = advance(P);
+    int kind = ATTR_NONE;
+    if (!strcmp(t->name, "features")) kind = ATTR_FEATURES;
+    else if (!strcmp(t->name, "multiversion")) kind = ATTR_MULTIVERSION;
+    else diag_error(t->span, "E0829", "unknown function attribute '@%s' (expected @features or @multiversion)", t->name);
+    if (kind != ATTR_NONE && d->attr != ATTR_NONE) {
+        diag_error(t->span, "E0829", "a function has at most one attribute (@features or @multiversion)");
+        kind = ATTR_NONE;
+    }
+    Span ts = t->span;
+    if (kind != ATTR_NONE) {
+        d->attr = kind;
+        d->attr_span = ts;
+    }
+    expect(P, TK_LPAREN);
+    while (pk(P) == TK_STRING) {
+        Token *s = advance(P);
+        if (kind != ATTR_NONE) {
+            vec_push(d->attr_args, intern(s->str.bytes, s->str.len));
+            vec_push(d->attr_arg_spans, s->span);
+        }
+        if (!accept(P, TK_COMMA)) break;
+    }
+    if (pk(P) != TK_RPAREN) syntax_error(P, "a string (the extensions)");
+    expect(P, TK_RPAREN);
+    if (kind != ATTR_NONE) d->attr_span = sp_from(P, ts);
+}
+
 static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     expect(P, KW_FN);
     Decl *d = new_decl(P, D_FN, start);
@@ -894,6 +924,7 @@ static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     } else {
         d->ret_te = parse_type(P);
     }
+    while (pk(P) == TK_BUILTIN) parse_fn_attr(P, d);
     d->body = parse_block(P);
     d->span = sp_from(P, start);
     return d;
@@ -989,8 +1020,8 @@ static void parse_top(Parser *P) {
                     if (c[0] == 'T' && strlen(c) == 5 && isdigit((unsigned char)c[1]) && isdigit((unsigned char)c[2]) &&
                         isdigit((unsigned char)c[3]) && isdigit((unsigned char)c[4]))
                         v = atoi(c + 1);
-                    if (v < 0 || v > 11)
-                        diag_error(code->span, "E0311", "unknown trap code '%s' (expected T0000 ... T0011)", c);
+                    if (v < 0 || v > 13)
+                        diag_error(code->span, "E0311", "unknown trap code '%s' (expected T0000 ... T0013)", c);
                     else d->test_trap = v;
                 } else {
                     syntax_error(P, "trap code such as T0001");

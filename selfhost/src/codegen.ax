@@ -81,6 +81,10 @@ struct FnInst {
     sret: bool,
     display: []u8,  // user-facing name, for stack traces and profiles
     next: *mut FnInst,
+    feats: u64,      // the processor extensions its code may use
+    dispatch: bool,  // @features / @multiversion: chooses a version (vers) and calls it
+    vers: []mut *mut FnInst,
+    key: []u8,
 }
 
 let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
@@ -307,6 +311,9 @@ fn align_unit(a: i64) *mut ir.Ty {
     if a == 8 {
         return T_i64;
     }
+    if a >= 32 {
+        return ir.t_vec(T_i32, @int_cast(u32, a / 4));
+    }
     return T_v128;
 }
 
@@ -342,7 +349,7 @@ fn lty(t: *mut ast.Type) *mut ir.Ty {
         }
         r = ir.t_vec(lane, @int_cast(u32, t.lanes));
     } else if k == ast.TY_V128 {
-        r = T_v128;
+        r = ir.t_vec(T_i32, @int_cast(u32, t.bits / 32));
     } else if (k == ast.TY_PTR) or (k == ast.TY_FN) {
         r = T_ptr;
     } else if k == ast.TY_ERROR {
@@ -398,7 +405,14 @@ fn vty(t: *mut ast.Type) *mut ir.Ty {
     return lty(t);
 }
 
+// Passed by pointer to a copy the callee only reads (results: through a
+// pointer to the caller's memory): aggregates larger than 32 bytes, and
+// 256- and 512-bit vectors, so that functions compiled for different
+// processor extensions (spec §13.4) agree on how they arrive.
 fn by_ptr(t: *mut ast.Type) bool {
+    if ty.is_simd(t) {
+        return ty.type_size(t) > 16;
+    }
     return ty.is_aggregate(t) and (ty.type_size(t) > 32);
 }
 
@@ -553,6 +567,7 @@ const T_STACK: i32 = 8;
 const T_ATOMIC_ALIGN: i32 = 10;
 const T_EXPECT: i32 = 11;
 const T_MEMORY: i32 = 12;
+const T_CPU: i32 = 13;
 const SITE_ERR_RETURN: i32 = 254;
 const SITE_CALL: i32 = 255;  // not traps: shadow stack records
 
@@ -1612,6 +1627,9 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     let fi = u.new.[FnInst]();
     fi.decl = d;
     fi.gargs = gargs;
+    fi.key = k;
+    fi.feats = tg.func_features(0, sema.baseline_fn(d));
+    fi.dispatch = (d.kind == ast.D_FN) and (d.attr != ast.ATTR_NONE);
     for i in 0..n {
         if gargs[i].has_params {
             internal_error("generic instance with unsubstituted arguments");
@@ -1678,6 +1696,8 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     } else {
         fi.fnv = ir.add_function(M, name, fi.llty).val;
     }
+    fi.fnv.fnp.features = fi.feats;
+    fi.fnv.fnp.has_features = true;
     add_ext_attrs(fi.fnv, fi.fnty, fi.sret, false);
     if d.kind == ast.D_HOST_FN {
         if d.extern_c {
@@ -1722,6 +1742,123 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     }
     inst_map.put(k, fi);
     return fi;
+}
+
+// Version k of a function with @features or @multiversion: its body
+// compiled with extensions `feats`, under the name of the dispatcher (fi)
+// with a suffix, and shown under the function's own name in traces.
+fn get_version(fi: *mut FnInst, k: usize, feats: u64) *mut FnInst {
+    let key = u.intern(u.f2("%s#v%s", fi.key, u.zdec(k)));
+    let found = inst_map.get(key);
+    if u.notnil(found) {
+        return found;
+    }
+    let v = u.new.[FnInst]();
+    v.decl = fi.decl;
+    v.gargs = fi.gargs;
+    v.key = key;
+    v.fnty = fi.fnty;
+    v.llty = fi.llty;
+    v.sret = fi.sret;
+    v.display = fi.display;
+    v.feats = feats;
+    let mut suffix = tg.features_string(feats & ~tg.g_features);
+    if suffix.len == 0 {
+        suffix = "base";
+    }
+    v.fnv = ir.add_function(M, u.f2("%s.%s", fi.fnv.fnp.name, suffix), v.llty).val;
+    v.fnv.fnp.features = feats;
+    v.fnv.fnp.has_features = true;
+    set_linkage(v.fnv, ir.LINK_INTERNAL);
+    add_ext_attrs(v.fnv, v.fnty, v.sret, false);
+    if u.notnil(pending_tail) {
+        pending_tail.next = v;
+    } else {
+        pending_head = v;
+    }
+    pending_tail = v;
+    inst_map.put(key, v);
+    return v;
+}
+
+// The body of a function with @features or @multiversion: the first
+// version whose extensions the running processor has (the build's own
+// count as present), else the @multiversion fallback (the target's
+// extensions only), or trap T0013 for @features.
+fn gen_dispatch(fi: *mut FnInst) void {
+    let d = fi.decl;
+    let f = fi.fnv;
+    at_end(ir.append_block(f.fnp, "entry"));
+    set_span(d.attr_span);
+    let nparams = f.fnp.params.len;
+    let args = u.newn.[*mut ir.Value](nparams + 1);
+    for i in 0..nparams {
+        args[i] = param(f, @int_cast(u32, i));
+    }
+    let base = fi.feats;
+    let mut k: usize = 0;
+    let mut done = false;
+    for set in d.feat_sets {
+        k += 1;
+        if (set == sema.NO_VERSION) or done {
+            continue;
+        }
+        let want = base | set;
+        let v = get_version(fi, k, want);
+        let missing = want & ~tg.g_features;
+        if missing == 0 {
+            dispatch_call(fi, v, args[0..nparams]);
+            done = true;
+            continue;
+        }
+        let yes = ir.append_block(f.fnp, "version");
+        let no = ir.append_block(f.fnp, "next");
+        condbr(cpu_has_bits(missing), yes, no);
+        at_end(yes);
+        dispatch_call(fi, v, args[0..nparams]);
+        at_end(no);
+    }
+    if done {
+        return;
+    }
+    if d.attr == ast.ATTR_MULTIVERSION {
+        dispatch_call(fi, get_version(fi, 0, base), args[0..nparams]);
+    } else {
+        call_trap_site(site_record(T_CPU, d.attr_span));
+        ir.unreachable(B);
+    }
+}
+
+fn dispatch_call(fi: *mut FnInst, v: *mut FnInst, args: []mut *mut ir.Value) void {
+    let r = call(fi.llty, v.fnv, args);
+    add_ext_attrs(r, fi.fnty, fi.sret, true);
+    if fi.llty.ret.kind == ir.T_VOID {
+        ir.ret_void(B);
+    } else {
+        ir.ret(B, r);
+    }
+}
+
+// std/os/cpu.ax, which every build includes (the start-up check, @cpu_has).
+fn cpu_fn(name: []u8) *mut FnInst {
+    let P = sema.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.ends(u.file_of(d.module.file.id).display, "std/os/cpu.ax") {
+            return get_inst(d, ty.no_types());
+        }
+    }
+    internal_error(u.f1("std/os/cpu.ax has no %s (is --std right?)", name));
+    return u.nil.[FnInst]();
+}
+
+// Does the running processor have every extension in `bits`? (i1)
+fn cpu_has_bits(bits: u64) *mut ir.Value {
+    let fi = cpu_fn("features");
+    let have = call(fi.llty, fi.fnv, no_vals());
+    let m = ci(T_i64, bits);
+    return icmp(ir.IntEQ, b_and(have, m), m);
 }
 
 // C ABI detail: integers narrower than 32 bits and bool are passed and
@@ -2902,8 +3039,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let s = gen(barg(e, 1));
         let len = extract(s, 1);
         let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
-        check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
-        asan_check(extract(s, 0), usz(16));
+        let vb = ty.type_size(rt);
+        check_or_trap(icmp(ir.IntUGE, bytes, usz(vb)), T_LENGTH);
+        asan_check(extract(s, 0), usz(vb));
         return load(rt, extract(s, 0), true);
     }
     if id == ast.BI_STORE {
@@ -2913,8 +3051,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let v = gen(barg(e, 1));
         let len = extract(s, 1);
         let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
-        check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
-        asan_check(extract(s, 0), usz(16));
+        let vb = ty.type_size(vt);
+        check_or_trap(icmp(ir.IntUGE, bytes, usz(vb)), T_LENGTH);
+        asan_check(extract(s, 0), usz(vb));
         store(vt, v, extract(s, 0), true);
         return vnil();
     }
@@ -2971,7 +3110,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_BITMASK {
         let v = gen(barg(e, 0));
         let mut bargs: [1]*mut ir.Value = [v];
-        return ir.intr(B, ir.IN_BITMASK, T_i32, bargs[..]);
+        return ir.intr(B, ir.IN_BITMASK, lty(rt), bargs[..]);  // (u64 for 64 lanes)
     }
     if id == ast.BI_REDUCE_ADD {
         return reduce_add(ct(barg(e, 0).ty), gen(barg(e, 0)));
@@ -2999,6 +3138,26 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
             return ci(T_i1, 1);
         }
         return ci(T_i1, 0);
+    }
+    if (id == ast.BI_TARGET_HAS) or (id == ast.BI_TARGET_ARCH) or (id == ast.BI_TARGET_OS) or (id == ast.BI_CPU_HAS) {
+        let tc = sema.target_cond(e, tg.g_features);
+        if tc >= 0 {
+            return ci(T_i1, @as(u64, @bit_cast(u32, tc)));
+        }
+        // @cpu_has of an extension the build does not assume
+        let b = tg.feature_bit(barg(e, 0).str);
+        if (b == 0) or ty.g_target.is_wasm {
+            return ci(T_i1, 0);
+        }
+        return cpu_has_bits(b);
+    }
+    if id == ast.BI_X86_CPUID {
+        let mut cargs: [2]*mut ir.Value = [gen(barg(e, 0)), gen(barg(e, 1))];
+        return ir.intr(B, ir.IN_CPUID, lty(rt), cargs[..]);
+    }
+    if id == ast.BI_X86_XGETBV {
+        let mut xargs: [1]*mut ir.Value = [gen(barg(e, 0))];
+        return ir.intr(B, ir.IN_XGETBV, T_i64, xargs[..]);
     }
     if id == ast.BI_EXPECT {
         check_or_trap(gen(barg(e, 0)), T_EXPECT);
@@ -3644,6 +3803,14 @@ fn gen_binary(e: *mut ast.Expr) *mut ir.Value {
     if (e.op == lx.KW_AND) or (e.op == lx.KW_OR) {
         let is_and = e.op == lx.KW_AND;
         let l = gen(e.a);
+        if l.kind == ir.V_CINT {
+            // a constant left operand (a target condition): the builder
+            // would fold the branch, and the right operand runs or not
+            if (l.cv != 0) == is_and {
+                return gen(e.b);
+            }
+            return l;
+        }
         let lbb = ir.insert_block(B);
         let rhs = new_bb(u.pick(is_and, "and.rhs", "or.rhs").ptr);
         let end = new_bb(u.pick(is_and, "and.end", "or.end").ptr);
@@ -3873,6 +4040,22 @@ fn gen_block(b: *mut ast.Stmt) void {
 }
 
 fn gen_if(s: *mut ast.Stmt) void {
+    // A target condition (spec §13.4): only the branch it selects is compiled.
+    let tc = sema.target_cond(s.e, tg.g_features);
+    if tc == 1 {
+        gen_block(s.body);
+        return;
+    }
+    if tc == 0 {
+        if u.notnil(s.els) {
+            if s.els.kind == ast.S_IF {
+                gen_if(s.els);
+            } else {
+                gen_block(s.els);
+            }
+        }
+        return;
+    }
     let c = gen(s.e);
     let then_bb = new_bb("if.then".ptr);
     let end = new_bb("if.end".ptr);
@@ -4190,6 +4373,25 @@ fn gen_stmt(s: *mut ast.Stmt) void {
 // Function bodies
 // ---------------------------------------------------------------------------
 fn gen_fn_body(fi: *mut FnInst) void {
+    let saved_feats = tg.g_features;
+    tg.g_features = fi.feats;  // (@target_has, and lowering that depends on extensions)
+    if fi.dispatch {
+        let saved_f = F;
+        let stt = u.new.[FnState]();
+        stt.inst = fi;
+        stt.decl = fi.decl;
+        stt.fnv = fi.fnv;
+        stt.no_trace = true;
+        F = stt;
+        gen_dispatch(fi);
+        F = saved_f;
+    } else {
+        gen_fn_body_of(fi);
+    }
+    tg.g_features = saved_feats;
+}
+
+fn gen_fn_body_of(fi: *mut FnInst) void {
     let d = fi.decl;
     let stt = u.new.[FnState]();
     stt.inst = fi;
@@ -4379,6 +4581,16 @@ fn emit_native_entry() void {
     }
     let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
     let f = add_export("main", T_i32, pi[..]);
+    // Built for more than the architecture's baseline: check the processor
+    // first (std/os/cpu.ax; it and this entry are compiled for the baseline).
+    f.fnp.features = 0;
+    f.fnp.has_features = true;
+    if tg.g_features != 0 {
+        let req = cpu_fn("require");
+        let mut rargs: [2]*mut ir.Value = [
+            ci(T_i64, tg.g_features), const_slice(string_ptr(tg.g_cpu), @int_cast(i64, tg.g_cpu.len))];
+        _ = call(req.llty, req.fnv, rargs[..]);
+    }
     let aty = fn_type(T_void, pi[..], false);
     let mut aargs: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
     _ = call(aty, ir.add_function(M, "ax_rt_args", aty).val, aargs[..]);

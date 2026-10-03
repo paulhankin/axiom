@@ -1,0 +1,108 @@
+// 256- and 512-bit vectors (spec §5.8): every target computes them, in
+// 128-bit pieces where its registers are narrower.
+import "../lib/io.ax" as io;
+
+struct Pair {
+    tag: u8,
+    v: f32x8,
+}
+
+fn scale(v: f32x8, k: f32) f32x8 {
+    return v * @splat(k);
+}
+
+fn bump(v: i32x16) i32x16 {
+    return v +% @splat(1);
+}
+
+fn lanes_sum(v: u64x8) u64 @multiversion("avx512f", "avx2") {
+    return @reduce_add(v);
+}
+
+export fn run() void {
+    // f32x8: arithmetic, lanes, reductions
+    let a = @vec(f32x8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);
+    let b = scale(a, 2.0);
+    io.float(@as(f64, @extract_lane(b, 7)));  // expect: 16
+    io.float(@as(f64, @reduce_add(b)));       // expect: 72
+    io.float(@as(f64, @dot(a, a)));           // expect: 204
+    let r = @replace_lane(b, 5, 0.5);
+    io.float(@as(f64, @extract_lane(r, 5)));         // expect: 0.5
+    io.float(@as(f64, @reduce_add(@sqrt(a * a))));   // expect: 36
+    io.float(@as(f64, @reduce_add(@fma(a, a, a))));  // expect: 240
+    let mx = @max(a, @splat(4.5));
+    io.float(@as(f64, @reduce_add(mx)));  // expect: 44
+    // comparisons, masks and selection across the pieces
+    let m = @lanes_gt(a, @splat(2.5));
+    io.uint(@as(u64, @bitmask(m)));  // expect: 252
+    io.boolean(@any_true(m));        // expect: true
+    io.boolean(@all_true(m));        // expect: false
+    let s = @select(m, a, @splat(0.0));
+    io.float(@as(f64, @reduce_add(s)));  // expect: 33
+    // a shuffle that crosses the halves
+    let x = @vec(i32x8, 0, 1, 2, 3, 4, 5, 6, 7);
+    let y = @vec(i32x8, 10, 11, 12, 13, 14, 15, 16, 17);
+    let z = @shuffle(x, y, [7, 0, 9, 4, 15, 3, 1, 12]);
+    io.int(@as(i64, @extract_lane(z, 0)));  // expect: 7
+    io.int(@as(i64, @extract_lane(z, 2)));  // expect: 11
+    io.int(@as(i64, @extract_lane(z, 4)));  // expect: 17
+    io.int(@as(i64, @extract_lane(z, 7)));  // expect: 14
+    io.int(@as(i64, @reduce_add(z)));       // expect: 57
+    // i32x16: wrapping arithmetic, shifts, through a function
+    let mut w: i32x16 = @splat(0);
+    for i in @as(u32, 0)..16 {
+        w = @replace_lane(w, 0, @as(i32, @bit_cast(i32, i)));
+        w = @shuffle(w, w, [15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    }
+    io.int(@as(i64, @extract_lane(w, 1)));   // expect: 15
+    io.int(@as(i64, @extract_lane(w, 15)));  // expect: 1
+    let w2 = bump(w) << @as(u32, 2);
+    io.int(@as(i64, @reduce_add(w2)));                  // expect: 544
+    io.int(@as(i64, @reduce_add(w2 >> @as(u32, 40))));  // expect: 0
+    // u8x32: swizzle over the whole table, bitmask
+    let mut tab: u8x32 = @splat(0);
+    for i in @as(u32, 0)..32 {
+        tab = @shuffle(@replace_lane(tab, 31, @truncate(u8, i * 3)), tab,
+                       [31, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                        25, 26, 27, 28, 29, 30]);
+    }
+    let idx = @vec(u8x32, 31, 0, 16, 17, 40, 255, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22,
+                   23, 24, 25, 26, 27, 28);
+    let sw = @swizzle(tab, idx);
+    io.uint(@as(u64, @extract_lane(sw, 1)));  // expect: 93
+    io.uint(@as(u64, @extract_lane(sw, 2)));  // expect: 45
+    io.uint(@as(u64, @extract_lane(sw, 4)));  // expect: 0
+    io.uint(@as(u64, @extract_lane(sw, 5)));  // expect: 0
+    let big = @lanes_ge(tab, @splat(48));
+    io.uint(@as(u64, @bitmask(big)));  // expect: 65535
+    // u8x64: a 64-bit mask
+    let mut bytes: [64]u8 = [0; 64];
+    for i in @as(usize, 0)..64 {
+        bytes[i] = @truncate(u8, i);
+    }
+    let v64 = @load(u8x64, bytes[..]);
+    let odd = @lanes_ne(v64 & @splat(1), @splat(0));
+    io.uint(@bitmask(odd));  // expect: 12297829382473034410
+    // memory: a store and a load of every piece
+    let mut out: [16]f32 = [0.0; 16];
+    @store(out[4..], b);
+    io.float(@as(f64, out[11]));  // expect: 16
+    io.float(@as(f64, @reduce_add(@load(f32x8, out[4..12]))));  // expect: 72
+    // i16x16: @dot gives i32x8
+    let h = @vec(i16x16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    let d = @dot(h, h);
+    io.int(@as(i64, @extract_lane(d, 7)));  // expect: 481
+    io.int(@as(i64, @reduce_add(d)));       // expect: 1496
+    // in a struct, and the raw types
+    let p = Pair.{ tag: 3, v: b };
+    io.float(@as(f64, @extract_lane(p.v, 1)));  // expect: 4
+    io.uint(@as(u64, @size_of(Pair)));          // expect: 64
+    io.uint(@as(u64, @size_of(v512)));          // expect: 64
+    io.uint(@as(u64, @align_of(v256)));         // expect: 32
+    let raw = @bit_cast(v256, b);
+    let back = @bit_cast(f32x8, raw ^ raw);
+    io.float(@as(f64, @reduce_add(back)));  // expect: 0
+    // a multiversioned function taking a wide vector
+    let q = @vec(u64x8, 1, 2, 3, 4, 5, 6, 7, 8);
+    io.uint(lanes_sum(q));  // expect: 36
+}

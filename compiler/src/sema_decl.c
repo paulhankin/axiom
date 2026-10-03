@@ -464,7 +464,8 @@ static bool boundary_type_ok(Type *t, bool is_ret) {
         for (int i = 0; i < t->nparams; i++)
             if (!boundary_type_ok(t->params[i], false)) return false;
         return boundary_type_ok(t->ret, true);
-    case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_VEC: case TY_V128: case TY_INVALID:
+    case TY_VEC: case TY_V128: return simd_bits(t) == 128;  // (WebAssembly has nothing wider)
+    case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_INVALID:
         return true;
     case TY_VOID: return is_ret;
     default: return false;

@@ -92,7 +92,13 @@
     X(SANITIZE_ADDRESS, "sanitize_address", "") \
     X(MEMORY_ERROR, "memory_error", "")       \
     X(INT_FROM_ENUM, "int_from_enum", "e")    \
-    X(ENUM_FROM_INT, "enum_from_int", "te")
+    X(ENUM_FROM_INT, "enum_from_int", "te")   \
+    X(TARGET_HAS, "target_has", "e")          \
+    X(TARGET_ARCH, "target_arch", "e")        \
+    X(TARGET_OS, "target_os", "e")            \
+    X(CPU_HAS, "cpu_has", "e")                \
+    X(X86_CPUID, "x86_cpuid", "ee")           \
+    X(X86_XGETBV, "x86_xgetbv", "e")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

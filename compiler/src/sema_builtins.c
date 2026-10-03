@@ -1,5 +1,6 @@
 // sema_builtins.c - type checking of @builtin calls.
 #include "sema_int.h"
+#include "target.h"
 
 static Type *targ(Expr *e, int i) {
     if (i >= e->bargs.len || !e->bargs.data[i].t) return t_invalid;
@@ -551,7 +552,7 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_SWIZZLE: {
         Type *t = pair(e, x);
         if (t->kind != TY_INVALID && !(t->kind == TY_VEC && t->elem->bits == 8))
-            diag_error(e->span, "E0812", "@swizzle requires u8x16 or i8x16 operands");
+            diag_error(e->span, "E0812", "@swizzle requires byte vectors (u8x16, i8x16, u8x32, ...)");
         return e->type = t;
     }
     case BI_LANES_EQ:
@@ -583,7 +584,7 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_BITMASK: {
         Type *t = check_expr(*earg(e, 0), NULL);
         if (!ty_is_vec_int(t) && t->kind != TY_INVALID) diag_error(e->span, "E0812", "@bitmask requires an integer vector");
-        return e->type = t_u32;
+        return e->type = t->kind == TY_VEC && t->lanes > 32 ? t_u64 : t_u32;
     }
     case BI_REDUCE_ADD: {
         Type *t = check_expr(*earg(e, 0), NULL);
@@ -594,13 +595,48 @@ Type *builtin_check(Expr *e, Type *expected) {
         Type *t = pair(e, NULL);
         if (t->kind == TY_INVALID) return e->type = t_invalid;
         if (ty_is_vec_float(t)) return e->type = t->elem;
-        if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, 4);
-        diag_error(e->span, "E0812", "@dot requires float vectors or i16x8, found %s", type_str(t));
+        if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, t->lanes / 2);
+        diag_error(e->span, "E0812", "@dot requires float vectors or i16 lanes, found %s", type_str(t));
         return e->type = t_invalid;
     }
     case BI_TRAP: return e->type = t_never;
     case BI_MEMORY_ERROR: return e->type = t_never;
     case BI_SANITIZE_ADDRESS: return e->type = t_bool;
+    case BI_TARGET_HAS:
+    case BI_CPU_HAS: {
+        Expr *a = *earg(e, 0);
+        if (a->kind != E_STRING) {
+            check_expr(a, NULL);
+            diag_error(a->span, "E0827", "@%s expects a string literal naming a processor extension", e->name);
+        } else if (!feature_known(a->str)) {
+            diag_error(a->span, "E0827", "unknown processor extension '%s' (this target has: %s)", a->str, feature_names());
+        } else {
+            a->type = type_slice(t_u8, false);
+        }
+        return e->type = t_bool;
+    }
+    case BI_TARGET_ARCH:
+    case BI_TARGET_OS: {
+        Expr *a = *earg(e, 0);
+        const char *names = e->index == BI_TARGET_ARCH ? "wasm32, wasm64, x86_64, aarch64" : "linux, macos, windows, none";
+        if (a->kind != E_STRING) {
+            check_expr(a, NULL);
+            diag_error(a->span, "E0827", "@%s expects a string literal: one of %s", e->name, names);
+        } else if (target_name_value(e->index, a->str) < 0) {
+            diag_error(a->span, "E0827", "unknown %s '%s' (expected one of %s)",
+                       e->index == BI_TARGET_ARCH ? "architecture" : "operating system", a->str, names);
+        } else {
+            a->type = type_slice(t_u8, false);
+        }
+        return e->type = t_bool;
+    }
+    case BI_X86_CPUID:
+        check_expr_to(earg(e, 0), t_u32);
+        check_expr_to(earg(e, 1), t_u32);
+        return e->type = type_vec(t_u32, 4);
+    case BI_X86_XGETBV:
+        check_expr_to(earg(e, 0), t_u32);
+        return e->type = t_u64;
     case BI_EXPECT:
         check_expr_to(earg(e, 0), t_bool);
         return e->type = t_void;
