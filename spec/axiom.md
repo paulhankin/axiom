@@ -1600,7 +1600,8 @@ must be one of the following (`E0801` otherwise):
 - `f32`, `f64`,
 - `usize`/`isize`,
 - a pointer,
-- a function pointer (a table index on WebAssembly),
+- a function pointer (a table index on WebAssembly) whose own parameter and return types
+  are allowed here (C calls it with its calling convention),
 - a SIMD type,
 - `void` as the return type.
 

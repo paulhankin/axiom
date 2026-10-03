@@ -448,13 +448,23 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
 // ---------------------------------------------------------------------------
 // Declarations
 // ---------------------------------------------------------------------------
+// A function type is allowed when its own parameters and result are: C
+// calls a callback with its own calling convention.
 static bool boundary_type_ok(Type *t, bool is_ret) {
     switch (t->kind) {
-    case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_FN: case TY_VEC: case TY_V128: case TY_INVALID:
+    case TY_FN:
+        for (int i = 0; i < t->nparams; i++)
+            if (!boundary_type_ok(t->params[i], false)) return false;
+        return boundary_type_ok(t->ret, true);
+    case TY_BOOL: case TY_INT: case TY_FLOAT: case TY_PTR: case TY_VEC: case TY_V128: case TY_INVALID:
         return true;
     case TY_VOID: return is_ret;
     default: return false;
     }
+}
+
+static const char *fn_type_hint(Type *t) {
+    return t->kind == TY_FN ? " (a function type's parameters and result must be allowed there too)" : "";
 }
 
 static void resolve_fn(Decl *d) {
@@ -502,12 +512,13 @@ static void resolve_fn(Decl *d) {
         if (d->gparams.len) diag_error(d->name_span, "E0466", "%s functions cannot be generic", what);
         for (int i = 0; i < d->params.len; i++)
             if (!boundary_type_ok(d->param_types[i], false))
-                diag_error(d->params.data[i].te->span, "E0801", "type %s is not allowed at the %s function boundary",
-                           type_str(d->param_types[i]), what);
+                diag_error(d->params.data[i].te->span, "E0801", "type %s is not allowed at the %s function boundary%s",
+                           type_str(d->param_types[i]), what, fn_type_hint(d->param_types[i]));
         if (!boundary_type_ok(d->ret_type, true))
             diag_error(d->ret_te ? d->ret_te->span : d->name_span, "E0801",
                        "return type %s is not allowed at the %s function boundary%s", type_str(d->ret_type), what,
-                       d->ret_type->kind == TY_ERRUNION ? " (handle errors before the export boundary)" : "");
+                       d->ret_type->kind == TY_ERRUNION ? " (handle errors before the export boundary)"
+                                                        : fn_type_hint(d->ret_type));
     }
 }
 
