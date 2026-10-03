@@ -56,7 +56,7 @@ compiler does (`../../std` from the executable, or `--std`, or `$AXIOM_STD`).
 ## Targets and processor extensions
 
 ```
---target=wasm32 | wasm64 | x86_64 | aarch64 | native      (default wasm32)
+--target=wasm32 | wasm64 | x86_64 | aarch64 | aarch64-macos | native      (default wasm32)
 --cpu=<preset>
 --features=+ext,-ext
 ```
@@ -65,7 +65,7 @@ compiler does (`../../std` from the executable, or `--std`, or `$AXIOM_STD`).
 |---|---|---|
 | wasm32, wasm64 | `mvp`, `generic` (default), `bleeding-edge` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
 | x86_64 | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16` |
-| aarch64 | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `apple-m1`, `neoverse-n1`, `native` | `lse`, `rcpc`, `dotprod`, `cssc` |
+| aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `apple-m1`, `neoverse-n1`, `native` | `lse`, `rcpc`, `dotprod`, `cssc` |
 
 `--target=native` means this machine's architecture with `--cpu=native` (its extensions,
 from `/proc/cpuinfo`); `--target=x86_64` and `--target=aarch64` default to the baseline.
@@ -84,6 +84,16 @@ choice never changes what a program computes:
 Programs for another architecture are linked without a cross toolchain. `axiom test`
 and `axiom profile` run them under `qemu-<arch>` (with the target's C library from
 `/usr/<arch>-linux-gnu`) when the target is not the machine's.
+
+`--target=aarch64-macos` (also `aarch64-apple-darwin` or `macos`) builds a Mach-O
+executable for Apple silicon, from any host: position independent, dynamically linked
+against `/usr/lib/libSystem.B.dylib`, with an ad-hoc code signature (macOS refuses
+unsigned arm64 code), so it runs without Xcode. The CPU defaults to `apple-m1`. On a Mac,
+`--target=native` means this target. Apple's ABI differs from AAPCS64 in two ways the
+backend follows: variadic arguments go on the stack in 8-byte slots, and `x18` is
+reserved (it already was). Not yet: `axiom test` and `axiom profile` for this target,
+and linking C code or `-l` libraries. The Mac output has been checked structurally
+(`tests/macho.mjs`) but not yet run on a Mac (issue 0011).
 
 ## How code is generated
 
@@ -107,6 +117,7 @@ and `axiom profile` run them under `qemu-<arch>` (with the target's C library fr
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
+| `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes, rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
 | `lstub.ax` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ax` | Architectures, CPU presets, extensions, host detection |
 | `backend.ax` | Lowering, optimization and the target's code generator |
@@ -118,6 +129,11 @@ traces),
 `runtime/test_main.ax` (the forking test runner of `axiom test`),
 `runtime/profile.ax` (the sampling profiler of `axiom profile`) and `runtime/rt.ax`
 (software `fmod` and `fma` where the target has no instruction).
+On macOS `runtime/darwin.ax` replaces `linux.ax` and `native.ax`: the same host ABI over
+`libSystem` (whose system call numbers are private), translating error and signal
+numbers to the Linux values the ABI uses, with `kqueue` for file watching and
+`__ulock_wait2`/`__ulock_wake` for `wait`/`notify`. Thread-local blocks are found
+through a pthread key, since the linker does not emit Mach-O thread-local variables.
 
 ## Testing
 

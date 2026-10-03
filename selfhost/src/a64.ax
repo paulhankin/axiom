@@ -1433,11 +1433,25 @@ fn gen_call(v: *mut ir.Value) void {
     let mut off: u64 = 0;
     let mut uses = u.List.[mc.MOp].{ data: u.nil.[mc.MOp](), len: 0, cap: 0 };
     let dest = u.newn.[i32](n + 1);
+    // Apple's AArch64 ABI passes the variadic arguments of a C call on the
+    // stack, each in an 8-byte slot
+    let mut nfixed = n;
+    if tg.is_darwin() and fty_.vararg {
+        nfixed = fty_.params.len;
+    }
     for i in 0..n {
         let x = v.xs.get(i);
         let c = class_of(x.ty);
         dest[i] = -1;
-        if (c == GPR) and (ng < 8) {
+        if i >= nfixed {
+            let m = mc.mem(SP, -1, 0, @bit_cast(i64, off));
+            if c == GPR {
+                _ = e2(STR, 8, m, R(regs[i]));
+            } else {
+                _ = e2(FSTR, @truncate(u8, x.ty.size), m, R(regs[i]));
+            }
+            off += 8;
+        } else if (c == GPR) and (ng < 8) {
             dest[i] = ng;
             ng += 1;
         } else if (c == VR) and (nv < 8) {
@@ -2662,6 +2676,17 @@ fn here() u64 {
     return @as(u64, code.len());
 }
 
+// The symbol of the slot offset that the Darwin runtime sets (axiom.tls_key,
+// defined by the linker).
+let mut tls_key_si: i32 = -1;
+
+fn tls_key_sym() i32 {
+    if tls_key_si < 0 {
+        tls_key_si = @bit_cast(i32, elf.ext_sym(OBJ, "axiom.tls_key", false));
+    }
+    return tls_key_si;
+}
+
 fn reloc(ty: u32, sym: i32, addend: i64) void {
     rls.push(Rl.{ off: here(), ty: ty, sym: sym, addend: addend });
 }
@@ -3076,7 +3101,23 @@ fn enc_inst(i: *mut mc.MInst) void {
     if op == TLS {
         let d = P(i.ops[0].reg);
         let s = i.ops[1];
-        w32(ae.mrs_tpidr(d));
+        if tg.is_darwin() {
+            // macOS has no thread pointer for programs: the thread-locals
+            // are a block whose address is in a TSD slot (the runtime's
+            // pthread key; axiom.tls_key holds the slot's byte offset), and
+            // TPIDRRO_EL0 addresses the slots (its low 3 bits are not part
+            // of the address)
+            w32(ae.mrs_tpidrro(d));
+            w32(ae.logic_imm(1, 0, d, d, @bit_cast(u64, ae.logical_imm(~@as(u64, 7), 64))));
+            let k = tls_key_sym();
+            reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, k, 0);
+            w32(ae.adrp(X16));
+            reloc(elf.R_AARCH64_LDST64_ABS_LO12_NC, k, 0);
+            w32(ae.ldst_uimm(3, false, 1, X16, X16, 0));
+            w32(ae.ldst_reg(3, false, 1, d, d, X16, false));
+        } else {
+            w32(ae.mrs_tpidr(d));
+        }
         reloc(elf.R_AARCH64_TLSLE_ADD_TPREL_HI12, s.sym, s.disp);
         w32(ae.addsub_imm(1, false, false, d, d, 0, true));
         reloc(elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC, s.sym, s.disp);
@@ -3277,6 +3318,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     errors = false;
     LSE_ = tg.has(tg.A_LSE);
     OBJ = elf.new_obj(elf.EM_AARCH64);
+    tls_key_si = -1;
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 16);

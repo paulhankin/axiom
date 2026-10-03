@@ -17,6 +17,7 @@ import path from 'path';
 import os from 'os';
 import { Worker } from 'worker_threads';
 import { createHost } from '../runtime/host.mjs';
+import { checkMachO } from './macho.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'compiler/build/axiom'));
@@ -390,6 +391,52 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   };
   for (const [cname, fn] of Object.entries(cases)) {
     const name = `fmt: ${cname}`;
+    if (filter && !name.includes(filter)) continue;
+    if (!supported) { skip++; continue; }
+    const problem = fn();
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
+// macOS (spec §14.1; the self-hosted compiler only). Programs cross-built
+// for --target=aarch64-macos cannot run here, so tests/macho.mjs checks the
+// executables the way dyld and the kernel would; the compiler itself is
+// among them. Unsupported commands say so.
+{
+  const out = (n) => path.join(tmp, 'macos-' + n);
+  const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=aarch64-macos', '-o', out(n), ...extra],
+    { encoding: 'utf8', cwd: root, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'macos-cache') } });
+  const supported = !/unknown target/.test(build(path.join(root, 'examples/wordcount.ax'), 'probe').stderr);
+  const check = (src, n, extra) => {
+    const c = build(src, n, extra);
+    if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+    const r = checkMachO(fs.readFileSync(out(n)));
+    if (r.errs.length) return r.errs.join('\n');
+    return (fs.statSync(out(n)).mode & 0o111) ? null : 'not executable';
+  };
+  const cases = {
+    'thread-locals and output': () => {
+      const src = path.join(tmp, 'macos-hello.ax');
+      fs.writeFileSync(src, 'import "std/io" as io;\n\nthreadlocal let mut tl: u64 = 41;\n\nexport fn main() i32 {\n' +
+        '    tl += 1;\n    io.stdout().println("hello") catch return 1;\n    return @int_cast(i32, tl) - 42;\n}\n');
+      return check(src, 'hello', ['-O2']);
+    },
+    'examples': () => {
+      for (const e of ['wordcount', 'http_server', 'texmath']) {
+        const p = check(path.join(root, `examples/${e}.ax`), e);
+        if (p) return `${e}: ${p}`;
+      }
+      return null;
+    },
+    'the compiler': () => check(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']),
+    'unsupported commands': () => {
+      const r = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=aarch64-macos'], { encoding: 'utf8', cwd: root });
+      return r.status !== 0 && /E9001/.test(r.stderr) ? null : `axiom test: status ${r.status}: ${r.stderr}`;
+    },
+  };
+  for (const [cname, fn] of Object.entries(cases)) {
+    const name = `macos: ${cname}`;
     if (filter && !name.includes(filter)) continue;
     if (!supported) { skip++; continue; }
     const problem = fn();

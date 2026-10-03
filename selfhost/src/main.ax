@@ -5,7 +5,7 @@
 //   axiom check <file.ax> [options]
 //
 // Options:
-//   --target=wasm32|wasm64|x86_64|aarch64|native   (default wasm32)
+//   --target=wasm32|wasm64|x86_64|aarch64|aarch64-macos|native   (default wasm32)
 //   --cpu=<name>               processor preset (e.g. x86-64-v3, armv8.1-a, native, mvp)
 //   --features=+a,-b           enable / disable processor extensions
 //   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
@@ -27,6 +27,7 @@ import "elink.ax" as el;
 import "fmt.ax" as fmt;
 import "header.ax" as header;
 import "lstub.ax" as lstub;
+import "mlink.ax" as ml;
 import "package.ax" as pkg;
 import "sema.ax" as sema;
 import "target.ax" as tg;
@@ -43,7 +44,7 @@ fn usage() void {
     u.eprint("       axiom new <name>      create a package skeleton\n");
     u.eprint("       axiom cache [path|clean]   the compiled-module cache\n");
     u.eprint("  test: --filter=<text> --timeout=<ms>\n");
-    u.eprint("  --target=wasm32|wasm64|x86_64|aarch64|native   --cpu=<name>   --features=+ext,-ext\n");
+    u.eprint("  --target=wasm32|wasm64|x86_64|aarch64|aarch64-macos|native   --cpu=<name>   --features=+ext,-ext\n");
     u.eprint("  -O0..-O3   --release | --overflow=trap|saturate\n");
     u.eprint("  --emit=exe|obj|ir  --format=human|agent-json  --std=<dir>  -o <out>\n");
     u.eprint("  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
@@ -848,6 +849,9 @@ fn link_native(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
         }
         os.push(o);
     }
+    if tg.is_darwin() {
+        return ml.link(os.items(), out);
+    }
     let mut machine = elf.EM_X86_64;
     if tg.g_arch == tg.ARCH_A64 {
         machine = elf.EM_AARCH64;
@@ -1070,11 +1074,20 @@ fn driver(args: [][]u8) i32 {
         } else if u.str_eq(target, "aarch64") {
             arch = tg.ARCH_A64;
         }
+        if u.str_eq(target, "native") {
+            tg.g_os = tg.host_os();
+        }
         ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: false, triple: tg.triple_of(arch) };
         tg.g_arch = arch;
+    } else if u.str_eq(target, "aarch64-macos") or u.str_eq(target, "aarch64-apple-darwin") or
+              u.str_eq(target, "macos") {
+        tg.g_arch = tg.ARCH_A64;
+        tg.g_os = tg.OS_DARWIN;
+        ty.g_target = ast.Target.{ ptr_bits: 64, is_wasm: false, triple: tg.triple_of(tg.ARCH_A64) };
     } else {
-        dg.emit_fatal(json, "E9002", u.f1("unknown target '%s' (expected wasm32, wasm64, x86_64, aarch64 or native)",
-                                          target));
+        dg.emit_fatal(json, "E9002",
+                      u.f1("unknown target '%s' (expected wasm32, wasm64, x86_64, aarch64, aarch64-macos or native)",
+                           target));
         return 2;
     }
     if ty.g_target.is_wasm {
@@ -1088,6 +1101,9 @@ fn driver(args: [][]u8) i32 {
     let mut cpu = co.cpu;
     if u.isnos(cpu) {
         cpu = u.pick(u.str_eq(target, "native"), "native", "generic");
+        if tg.is_darwin() {
+            cpu = "apple-m1";  // every Mac with Apple silicon has at least its extensions
+        }
     }
     let cr = tg.cpu_features(tg.g_arch, cpu);
     if not cr.ok {
@@ -1124,8 +1140,15 @@ fn driver(args: [][]u8) i32 {
         }
         // Native programs: the host ABI, crash reports, the test runner and
         // the profiler are Axiom code too.
+        if tg.is_darwin() and (testing or profiling) {
+            dg.emit_fatal(json, "E9001", u.f1("axiom %s does not support --target=aarch64-macos yet", cmd));
+            return 2;
+        }
         if not ty.g_target.is_wasm {
             let mut names: [3][]u8 = ["native.ax", "", ""];
+            if tg.is_darwin() {
+                names[0] = "darwin.ax";  // the host ABI over macOS's libSystem
+            }
             if testing {
                 names[1] = "test_main.ax";
             }
@@ -1287,7 +1310,16 @@ fn driver(args: [][]u8) i32 {
         let mut rc: i32 = 0;
         let own_link = (n_user_inputs == 0) and (link_flags.len == 0) and (cg.g_link_libs.len == 0);
         let mut native_own = false;
-        if not ty.g_target.is_wasm and (n_user_inputs == 0) and (link_flags.len == 0) {
+        if tg.is_darwin() {
+            if (n_user_inputs != 0) or (link_flags.len != 0) or (cg.g_link_libs.len != 0) {
+                dg.emit_fatal(json, "E9004", "linking C code or libraries for aarch64-macos is not supported yet");
+                _ = u.unlink(u.cz(objpath));
+                return 1;
+            }
+            // our own Mach-O linker, against libSystem
+            rc = link_native(objpath, unit_objs.items(), out);
+            native_own = true;
+        } else if not ty.g_target.is_wasm and (n_user_inputs == 0) and (link_flags.len == 0) {
             // our own linker; a C toolchain is only needed to link C code
             rc = link_native(objpath, unit_objs.items(), out);
             native_own = rc != 2;

@@ -1,51 +1,58 @@
 # 0011: Native macOS binaries from the self-hosted compiler
 
 - Type: feature
-- Status: open
-- Area: compiler (selfhost): `target.ax`, `elf.ax`/`elink.ax`, `a64.ax`, `x64.ax`; `runtime/`
+- Status: in progress (implemented; not yet run on a Mac)
+- Area: compiler (selfhost): `target.ax`, `mlink.ax`, `a64.ax`; `runtime/darwin.ax`
 
-The self-hosted compiler builds native programs for Linux only
-(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`; spec §14.1). There
-is no way to produce a Mach-O executable for macOS.
+Scope: Apple Silicon only (`aarch64-apple-darwin`). Apple has sold no Intel
+Mac since 2023 and macOS 26 is the last release for them, so
+`x86_64-apple-darwin` is not planned.
 
-What is reusable: the IR, the optimizer, instruction selection and register
-allocation (`mach.ax`), and the x86-64 and AArch64 encoders.
+## Done
 
-What is missing:
+`--target=aarch64-macos` (also `aarch64-apple-darwin`, `macos`) builds a Mach-O
+executable from any host (spec §14.1, selfhost/README.md):
 
-- **Targets.** `target.ax` knows only the Linux triples. It needs
-  `aarch64-apple-darwin` and `x86_64-apple-darwin`, a way to pick them
-  (`--target=aarch64-macos`, ...), and `host_triple()` on a Mac.
-- **Object files and linking.** The compiler writes ELF objects and links them
-  itself (`elf.ax`, `elink.ax`, `lstub.ax`). macOS needs Mach-O: sections and
-  segments, relocations (`ARM64_RELOC_*`, `X86_64_RELOC_*`), the symbol and
-  string tables, `LC_MAIN`, `LC_LOAD_DYLINKER` and `LC_LOAD_DYLIB` for
-  `/usr/lib/libSystem.B.dylib`, chained fixups or dyld info for imports, and
-  `LC_CODE_SIGNATURE`. Apple Silicon refuses to run unsigned code, but an
-  ad-hoc signature (a SHA-256 hash of each page) is enough and can be written
-  without Apple tools.
-- **Runtime.** `runtime/native.ax` makes Linux system calls directly
-  (`runtime/linux.ax`). Apple does not support raw system calls: a Darwin
-  runtime must call `libSystem` for files, processes (`posix_spawn`),
-  threads (`pthread_create`), waiting (`os_sync_wait_on_address`, or
-  `__ulock_wait` before macOS 14.4), sockets, `kqueue` for poll and file
-  watching, and `getentropy`. The host ABI (spec §15.2) does not change, so
-  std needs no changes.
-- **ABI details.** Symbols get a leading underscore. Apple's AArch64 ABI
-  differs from AAPCS64: variadic arguments always go on the stack, arguments
-  passed on the stack are packed to their natural alignment rather than 8
-  bytes, and `x18` is reserved. Thread-locals use TLV descriptors (`__thread_vars`,
-  a call through `tlv_get_addr`) rather than ELF TLS. That affects `threadlocal`
-  globals and the shadow stack's per-thread record.
-- **Traps.** Trap reporting and stack traces hook `SIGILL`/`SIGTRAP`/`SIGSEGV`
-  via `sigaction`. The Darwin layouts of `ucontext`/`mcontext` differ from
-  Linux's.
-- **Testing.** No Mac is available here; CI on a macOS runner would be needed.
-  Cross-building from Linux is possible once the linker exists. Running the
-  result is not.
+- **Targets.** `target.ax` has an operating system beside the architecture;
+  host detection reads the compiler's own executable (Mach-O magic means a
+  Mac), so `--target=native` on a Mac picks this target. CPU `apple-m1`.
+- **Linker.** `mlink.ax` links the compiler's ELF objects into a PIE
+  executable against `/usr/lib/libSystem.B.dylib`: `__PAGEZERO`, `__TEXT`,
+  `__DATA`, `__LINKEDIT` on 16 KiB pages; imports through stubs and a GOT
+  bound with `LC_DYLD_INFO_ONLY` opcodes (dyld on macOS 11+ accepts these;
+  chained fixups are not needed); rebases; the symbol table, `LC_MAIN`,
+  `LC_UUID`, `LC_BUILD_VERSION` (minos 11.0); and an ad-hoc code signature.
+- **ABI.** Symbols get a leading underscore. Variadic arguments go on the
+  stack in 8-byte slots. `x18` is not used.
+- **Thread-locals.** Instead of TLV descriptors, each thread's block (a copy
+  of the template) hangs off a pthread key: `mrs TPIDRRO_EL0` gives the TSD
+  array, the key indexes it. `ax_rt_args` creates the key and the main
+  thread's block before any code runs; `ax_thread_spawn` does it for others.
+- **Runtime.** `runtime/darwin.ax` implements the host ABI (spec §15.2) over
+  `libSystem`: files, directories, processes (`posix_spawn`), threads,
+  `__ulock_wait2`/`__ulock_wake`, sockets, `poll`, `kqueue` for file
+  watching, `getentropy`, crash reports with stack traces. Error and signal
+  numbers are translated to the Linux values the ABI uses, so std is
+  unchanged.
+- **Tests.** `tests/run.mjs` cross-builds a thread-local program, three
+  examples and the compiler itself, and checks them with `tests/macho.mjs`
+  (load commands, layout, every rebase and bind, symbols, entry point, every
+  page hash). The constants and struct layouts in `darwin.ax` were checked
+  against Apple's headers (with `zig cc -target aarch64-macos`), and every
+  import against `libSystem.tbd`.
 
-Steps: a Mach-O writer and linker, proved with a "hello" that calls `write`
-and `exit` in `libSystem`; then the Darwin runtime; then the ABI details;
-then the test suite on a Mac.
+## Not done
+
+- **Running it.** No Mac is available here. A macOS runner in CI (GitHub's
+  `macos-14`, billed for private repositories) would run the test suite.
+- `axiom test` and `axiom profile` for this target (`runtime/test_main.ax`
+  and `runtime/profile.ax` are written against `linux.ax`).
+- Linking C code, `-l` libraries and `extern "lib"` imports. That also needs
+  Apple's packing of named arguments passed on the stack (natural alignment
+  rather than 8 bytes); no `libSystem` function the runtime calls has more
+  than eight arguments.
+- File watching reports changes to a directory but not the names of the
+  entries that changed (`kqueue` does not say). `notify` with a count wakes
+  one or all waiters.
 
 Related: 0012 (Windows).

@@ -1575,6 +1575,13 @@ wherever host instructions differ.
 | `wasm32-wasi` | 32 | Standard library may use WASI imports |
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Bounds checks against it (§12.1) are future work |
+| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; self-hosted compiler only. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
+
+Linux is the native operating system. `--target=native` on a Mac means
+`aarch64-macos`; elsewhere `aarch64-macos` is a cross target, so a Linux host can
+build Mac executables. On macOS, variadic C arguments are passed on the stack
+(Apple's arm64 ABI), and a thread-local global (§12.8.6) lives in a per-thread block
+whose address is kept in a pthread key.
 
 ### 14.2 Exports
 

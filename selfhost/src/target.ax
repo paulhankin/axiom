@@ -1,7 +1,7 @@
 // =============================================================================
 // target.ax - target architectures, CPUs and processor extensions.
 //
-//   --target=wasm32 | wasm64 | x86_64 | aarch64 | native
+//   --target=wasm32 | wasm64 | x86_64 | aarch64 | aarch64-macos | native
 //   --cpu=<name>          a preset set of extensions (see cpu_features)
 //   --features=+a,-b      add or remove individual extensions
 //
@@ -46,7 +46,12 @@ pub const W_MULTIVALUE: u64 = 0x40;
 pub const W_RELAXED_SIMD: u64 = 0x80;
 pub const W_TAIL_CALL: u64 = 0x100;
 
+// Operating systems of native targets
+pub const OS_LINUX: i32 = 0;
+pub const OS_DARWIN: i32 = 1;  // macOS on Apple silicon (aarch64-apple-darwin)
+
 pub let mut g_arch: i32 = 1;
+pub let mut g_os: i32 = 0;
 pub let mut g_features: u64 = 0;
 pub let mut g_cpu: []u8 = "";
 
@@ -63,6 +68,10 @@ pub fn has_fma() bool {
         return has(X_FMA);
     }
     return false;
+}
+
+pub fn is_darwin() bool {
+    return g_os == OS_DARWIN;
 }
 
 pub fn is_wasm() bool {
@@ -144,16 +153,32 @@ pub fn feature_string() []u8 {
 
 // The architecture this compiler runs on (from its own ELF header).
 let mut host_arch_: i32 = 0;
+let mut host_os_: i32 = 0;
 
+// (From the compiler's own executable: an ELF machine, or Mach-O, which
+// means macOS on Apple silicon.)
 pub fn host_arch() i32 {
     if host_arch_ == 0 {
         host_arch_ = ARCH_X64;
-        let exe = u.read_file("/proc/self/exe");
-        if not u.isnos(exe) and (exe.len > 20) and (exe[18] == 183) {
+        let me = u.self_path();
+        let mut exe = u.nosym();
+        if not u.isnos(me) {
+            exe = u.read_file(me);
+        }
+        if not u.isnos(exe) and (exe.len > 20) and (exe[18] == 183) and (exe[0] == 0x7f) {
             host_arch_ = ARCH_A64;
+        } else if not u.isnos(exe) and (exe.len > 4) and (exe[0] == 0xcf) and (exe[1] == 0xfa) and (exe[2] == 0xed) and
+                  (exe[3] == 0xfe) {
+            host_arch_ = ARCH_A64;
+            host_os_ = OS_DARWIN;
         }
     }
     return host_arch_;
+}
+
+pub fn host_os() i32 {
+    _ = host_arch();
+    return host_os_;
 }
 
 pub fn host_triple() []u8 {
@@ -168,6 +193,9 @@ pub fn triple_of(a: i32) []u8 {
         return "wasm64-unknown-unknown";
     }
     if a == ARCH_A64 {
+        if g_os == OS_DARWIN {
+            return "aarch64-apple-darwin";
+        }
         return "aarch64-unknown-linux-gnu";
     }
     return "x86_64-unknown-linux-gnu";
@@ -197,6 +225,9 @@ fn read_stream(path: []u8) []u8 {
 }
 
 fn host_features(a: i32) u64 {
+    if (a == ARCH_A64) and (host_os() == OS_DARWIN) {
+        return (A_LSE | A_DOTPROD) | A_RCPC;  // every Apple silicon CPU
+    }
     let info = read_stream("/proc/cpuinfo");
     if u.isnos(info) {
         return 0;
