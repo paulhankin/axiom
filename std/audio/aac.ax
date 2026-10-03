@@ -108,78 +108,96 @@ fn finish(o: *mut Out, rate: i32, skip0: usize, total0: usize) !audio.Sound {
 // ADTS
 // -----------------------------------------------------------------------------
 
+/// An ADTS frame's header.
+struct AdtsFrame {
+    end: bool,  // no frame here: the end of the audio
+    profile: i32,
+    rate_index: i32,
+    chan: i32,
+    len: usize,  // the whole frame
+    hl: usize,   // its header
+    nblocks: usize,
+}
+
+/// The header of the ADTS frame at o. Once frames have been decoded
+/// (started), trailing junk or a truncated frame ends the audio.
+fn adts_frame(data: []u8, o: usize, started: bool) !AdtsFrame {
+    let mut f = AdtsFrame.{ end: true, profile: 0, rate_index: 0, chan: 0, len: 0, hl: 7, nblocks: 0 };
+    if (o + 7) > data.len {
+        return f;
+    }
+    if not is_adts_at(data, o) {
+        if started {
+            return f;  // trailing junk (an ID3v1 tag, say)
+        }
+        return error.InvalidAudio;
+    }
+    let h = data[o..];
+    let protection_absent = (h[1] & 1) != 0;
+    f.profile = @as(i32, h[2] >> 6);
+    f.rate_index = @as(i32, (h[2] >> 2) & 15);
+    f.chan = (@as(i32, h[2] & 1) << 2) | @as(i32, h[3] >> 6);
+    f.len = ((@as(usize, h[3]) & 3) << 11) | (@as(usize, h[4]) << 3) | (@as(usize, h[5]) >> 5);
+    f.nblocks = @as(usize, h[6] & 3) + 1;
+    if (f.len < 7) or ((o + f.len) > data.len) or (f.rate_index > 12) {
+        if started and ((o + f.len) > data.len) {
+            return f;  // a truncated last frame
+        }
+        return error.InvalidAudio;
+    }
+    if not protection_absent {
+        if f.nblocks > 1 {
+            return error.Unsupported;
+        }
+        f.hl = 9;
+    }
+    if f.hl > f.len {
+        return error.InvalidAudio;
+    }
+    f.end = false;
+    return f;
+}
+
 fn decode_adts(data: []u8) !audio.Sound {
     let mut o = id3_skip(data);
-    let mut d: []mut dec.Decoder = mem.alloc.[dec.Decoder](0)!;
+    // the first frame sets the format
+    let first = adts_frame(data, o, false)!;
+    if first.end {
+        return error.InvalidAudio;
+    }
+    let mut cfg = dec.empty_config();
+    cfg.object_type = first.profile + 1;
+    if (cfg.object_type != dec.AOT_MAIN) and (cfg.object_type != dec.AOT_LC) and (cfg.object_type != dec.AOT_LTP) {
+        return error.Unsupported;
+    }
+    cfg.sampling_index = first.rate_index;
+    cfg.sample_rate = dec.SAMPLE_RATES[@as(usize, @bit_cast(u32, first.rate_index))];
+    cfg.chan_config = first.chan;
+    if first.chan > 7 {
+        return error.Unsupported;
+    }
+    let d = dec.new(cfg)!;
     defer {
-        if d.len > 0 {
-            d[0].deinit();
-        }
-        mem.free(d);
+        d.deinit();
+        mem.destroy(d);
     }
     let block = mem.alloc.[f32](2048 * 64)!;
     defer mem.free(block);
     let mut out = Out.{ v: vec.Vec.[f32].init(), frames: 0, channels: 0 };
     defer out.v.deinit();
-    let mut first_aot: i32 = 0;
-    let mut first_rate: i32 = -1;
-    let mut first_chan: i32 = -1;
-    while (o + 7) <= data.len {
-        if not is_adts_at(data, o) {
-            if out.frames > 0 {
-                break;  // trailing junk (an ID3v1 tag, say)
-            }
-            return error.InvalidAudio;
+    loop {
+        let f = adts_frame(data, o, out.frames > 0)!;
+        if f.end {
+            break;
         }
-        let h = data[o..];
-        let protection_absent = (h[1] & 1) != 0;
-        let profile = @as(i32, h[2] >> 6);
-        let rate_index = @as(i32, (h[2] >> 2) & 15);
-        let chan = (@as(i32, h[2] & 1) << 2) | @as(i32, h[3] >> 6);
-        let len = ((@as(usize, h[3]) & 3) << 11) | (@as(usize, h[4]) << 3) | (@as(usize, h[5]) >> 5);
-        let nblocks = @as(usize, h[6] & 3) + 1;
-        if (len < 7) or ((o + len) > data.len) or (rate_index > 12) {
-            if (out.frames > 0) and ((o + len) > data.len) {
-                break;  // a truncated last frame
-            }
-            return error.InvalidAudio;
-        }
-        let mut hl: usize = 7;
-        if not protection_absent {
-            if nblocks > 1 {
-                return error.Unsupported;
-            }
-            hl = 9;
-        }
-        if hl > len {
-            return error.InvalidAudio;
-        }
-        if d.len == 0 {
-            let mut cfg = dec.empty_config();
-            cfg.object_type = profile + 1;
-            if (cfg.object_type != dec.AOT_MAIN) and (cfg.object_type != dec.AOT_LC) and
-               (cfg.object_type != dec.AOT_LTP) {
-                return error.Unsupported;
-            }
-            cfg.sampling_index = rate_index;
-            cfg.sample_rate = dec.SAMPLE_RATES[@as(usize, @bit_cast(u32, rate_index))];
-            cfg.chan_config = chan;
-            if chan > 7 {
-                return error.Unsupported;
-            }
-            mem.free(d);
-            d = dec.new(cfg)!;
-            first_aot = cfg.object_type;
-            first_rate = rate_index;
-            first_chan = chan;
-        } else if ((profile + 1) != first_aot) or (rate_index != first_rate) or (chan != first_chan) {
+        if (f.profile != first.profile) or (f.rate_index != first.rate_index) or (f.chan != first.chan) {
             return error.Unsupported;  // the format changes mid-stream
         }
-        let mut b = bitio.Bits.init(data[o + hl..o + len]);
-        for _k in @as(usize, 0)..nblocks {
-            let got = dec.decode_block(&mut d[0], &mut b, block)!;
+        let mut b = bitio.Bits.init(data[o + f.hl..o + f.len]);
+        for _k in @as(usize, 0)..f.nblocks {
+            let got = dec.decode_block(d, &mut b, block)!;
             if got > 0 {
-                let n = dec.channels(&d[0]);
+                let n = dec.channels(d);
                 if (out.channels != 0) and (out.channels != n) {
                     return error.Unsupported;
                 }
@@ -188,13 +206,13 @@ fn decode_adts(data: []u8) !audio.Sound {
             }
             b.align();
         }
-        o += len;
+        o += f.len;
     }
-    if (d.len == 0) or (out.channels == 0) {
+    if out.channels == 0 {
         return error.InvalidAudio;
     }
     let total = out.frames;
-    return finish(&mut out, dec.output_rate(&d[0]), 0, total);
+    return finish(&mut out, dec.output_rate(d), 0, total);
 }
 
 // -----------------------------------------------------------------------------
@@ -525,8 +543,8 @@ fn decode_mp4(data: []u8) !audio.Sound {
     dec.parse_asc(tr.asc, &mut cfg)!;
     let d = dec.new(cfg)!;
     defer {
-        d[0].deinit();
-        mem.free(d);
+        d.deinit();
+        mem.destroy(d);
     }
     let block = mem.alloc.[f32](2048 * 64)!;
     defer mem.free(block);
@@ -582,9 +600,9 @@ fn decode_mp4(data: []u8) !audio.Sound {
                 return error.InvalidAudio;
             }
             let mut b = bitio.Bits.init(data[pos..pos + size]);
-            let got = dec.decode_block(&mut d[0], &mut b, block)!;
+            let got = dec.decode_block(d, &mut b, block)!;
             if got > 0 {
-                let n = dec.channels(&d[0]);
+                let n = dec.channels(d);
                 if (out.channels != 0) and (out.channels != n) {
                     return error.Unsupported;
                 }
@@ -599,7 +617,7 @@ fn decode_mp4(data: []u8) !audio.Sound {
         return error.InvalidAudio;
     }
     // trimming: the edit list, else iTunes' gapless information
-    let orate = dec.output_rate(&d[0]);
+    let orate = dec.output_rate(d);
     let rate = @as(u64, @bit_cast(u32, orate));
     let ts = @as(u64, tr.timescale);
     let mut skip: usize = 0;

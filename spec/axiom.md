@@ -1734,8 +1734,10 @@ pub fn alloc_zeroed[T](n: usize) ![]mut T   // every byte 0
 pub fn free[T](s: []mut T) void
 pub fn realloc[T](s: []mut T, n: usize) ![]mut T
 pub fn dup[T](s: []T) ![]mut T
+pub fn new[T]() !*mut T                    // one value, contents unspecified
+pub fn new_zeroed[T]() !*mut T             // one value, every byte 0
 pub fn create[T](v: T) !*mut T             // one value, initialized to v
-pub fn destroy[T](p: *mut T) void
+pub fn destroy[T](p: *mut T) void          // frees a value from new, new_zeroed or create
 pub fn alloc_bytes(size: usize) usize        // 0 if there is no memory (or size is 0)
 pub fn free_bytes(p: usize, size: usize) void
 pub fn realloc_bytes(p: usize, old: usize, size: usize) usize
@@ -1750,7 +1752,7 @@ These are ordinary functions (§10), not builtins. The rules:
   allocator, or with the wrong size, traps (`T0000`) where the allocator can tell: always
   for an address outside its spans and blocks, and for a large block freed twice. Other
   double frees are logic bugs with defined behavior (§12.1).
-- **Failure.** `alloc`, `realloc`, `dup` and `create` return `error.OutOfMemory` when the
+- **Failure.** `alloc`, `realloc`, `dup`, `new` and `create` return `error.OutOfMemory` when the
   system has no more memory or the byte count overflows. `realloc` leaves the old slice
   valid when it fails.
 - **Alignment.** Memory is aligned to 16 bytes, enough for every type (§12.5).
