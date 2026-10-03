@@ -1,58 +1,203 @@
 // =============================================================================
-// util.ax - the C library, arena allocation, growable lists, interned
+// util.ax - the system (host ABI), arena allocation, growable lists, interned
 // strings, hash maps, 128-bit integers, formatting, sorting and source files.
 //
 // Everything the compiler allocates lives in one arena and is never freed.
 // Pointers that C would make NULL are 0 here: use nil() and isnil().
 // =============================================================================
 
-pub extern "C" {
-    fn malloc(n: usize) *mut void;
-    fn calloc(n: usize, size: usize) *mut void;
-    fn realloc(p: *mut void, n: usize) *mut void;
-    fn free(p: *mut void) void;
-    fn strlen(s: *u8) usize;
-    fn strtod(s: *u8, end: *mut *mut u8) f64;
-    fn snprintf(buf: *mut u8, n: usize, fmt: *u8, ...) i32;
-    fn write(fd: i32, p: *u8, n: usize) isize;
-    fn read(fd: i32, p: *mut u8, n: usize) isize;
-    fn fopen(path: *u8, mode: *u8) *mut void;
-    fn fclose(f: *mut void) i32;
-    fn fread(p: *mut u8, size: usize, n: usize, f: *mut void) usize;
-    fn fwrite(p: *u8, size: usize, n: usize, f: *mut void) usize;
-    fn fseek(f: *mut void, off: isize, whence: i32) i32;
-    fn ftell(f: *mut void) isize;
-    fn exit(code: i32) void;
-    fn _exit(code: i32) void;
-    fn getenv(name: *u8) *u8;
-    fn setenv(name: *u8, value: *u8, overwrite: i32) i32;
-    fn realpath(path: *u8, resolved: *mut u8) *mut u8;
-    fn getcwd(buf: *mut u8, n: usize) *mut u8;
-    fn readlink(path: *u8, buf: *mut u8, n: usize) isize;
-    fn access(path: *u8, mode: i32) i32;
-    fn chmod(path: *u8, mode: u32) i32;
-    fn getpid() i32;
-    fn unlink(path: *u8) i32;
-    fn rename(from: *u8, to: *u8) i32;
-    fn mkdir(path: *u8, mode: u32) i32;
-    fn opendir(path: *u8) *mut void;
-    fn readdir(d: *mut void) *mut u8;
-    fn closedir(d: *mut void) i32;
-    fn fork() i32;
-    fn execvp(file: *u8, argv: *mut *mut u8) i32;
-    fn waitpid(pid: i32, status: *mut i32, options: i32) i32;
-    fn wait(status: *mut i32) i32;
-    fn pipe(fds: *mut i32) i32;
-    fn dup2(a: i32, b: i32) i32;
-    fn close(fd: i32) i32;
-    fn open(path: *u8, flags: i32, ...) i32;
-    fn sysconf(name: i32) isize;
-    fn clock_gettime(clock: i32, ts: *mut Timespec) i32;
+import "std/fmt" as sfmt;
+import "std/mem" as smem;
+import "std/os/process" as sproc;
+
+// The system, through the host interface std uses (spec §15): the same
+// source runs natively and on WebAssembly.
+import host "axiom" {
+    fn ax_write(fd: i32, p: *u8, n: usize) isize;
+    fn ax_read(fd: i32, p: *mut u8, n: usize) isize;
+    fn ax_open(path: *u8, len: usize, flags: u32) i32;
+    fn ax_close(fd: i32) void;
+    fn ax_seek(fd: i32, off: i64, whence: u32) i64;
+    fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32;
+    fn ax_mkdir(path: *u8, len: usize, mode: u32) i32;
+    fn ax_remove(path: *u8, len: usize, dir: u32) i32;
+    fn ax_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
+    fn ax_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
+    fn ax_getcwd(buf: *mut u8, cap: usize) isize;
+    fn ax_chmod(path: *u8, len: usize, mode: u32) i32;
+    fn ax_readlink(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
+    fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize;
+    fn ax_argc() i32;
+    fn ax_arg(i: i32, buf: *mut u8, cap: usize) isize;
+    fn ax_getpid() i32;
+    fn ax_exit(code: i32) void;
+    fn ax_fork() i32;
+    fn ax_proc_wait(h: i32, block: u32, status: *mut i32) i32;
+    fn ax_clock_ns(clock: u32) i64;
+    fn ax_cpu_count() u32;
 }
 
-pub struct Timespec {
-    sec: i64,
-    nsec: i64,
+// -----------------------------------------------------------------------------
+// Memory, with the C library's interface over std/mem (which wants sizes
+// back): each block starts with a 16-byte header that holds its size.
+// -----------------------------------------------------------------------------
+fn out_of_memory() void {
+    eprint("axiom: out of memory\n");
+    ax_exit(70);
+}
+
+pub fn malloc(n: usize) *mut void {
+    let b = smem.alloc_bytes(n + 16);
+    if b == 0 {
+        out_of_memory();
+    }
+    @ptr_from_int(*mut usize, b).* = n;
+    return @ptr_from_int(*mut void, b + 16);
+}
+
+pub fn calloc(n: usize, size: usize) *mut void {
+    let t = n * size;
+    let p = malloc(t);
+    @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, p), t), 0);
+    return p;
+}
+
+pub fn realloc(p: *mut void, n: usize) *mut void {
+    if isvnil(p) {
+        return malloc(n);
+    }
+    let b = @int_from_ptr(p) - 16;
+    let old = @ptr_from_int(*mut usize, b).*;
+    let nb = smem.realloc_bytes(b, old + 16, n + 16);
+    if nb == 0 {
+        out_of_memory();
+    }
+    @ptr_from_int(*mut usize, nb).* = n;
+    return @ptr_from_int(*mut void, nb + 16);
+}
+
+pub fn free(p: *mut void) void {
+    if isvnil(p) {
+        return;
+    }
+    let b = @int_from_ptr(p) - 16;
+    smem.free_bytes(b, @ptr_from_int(*mut usize, b).* + 16);
+}
+
+pub fn strlen(s: *u8) usize {
+    let mut n: usize = 0;
+    while @ptr_from_int(*u8, @int_from_ptr(s) + n).* != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+// -----------------------------------------------------------------------------
+// System calls, C style (paths are NUL-terminated; negative results fail)
+// -----------------------------------------------------------------------------
+pub fn write(fd: i32, p: *u8, n: usize) isize {
+    return ax_write(fd, p, n);
+}
+
+pub fn read(fd: i32, p: *mut u8, n: usize) isize {
+    return ax_read(fd, p, n);
+}
+
+// flags: 0 read, 1 write (create or truncate)
+pub fn open(path: *u8, flags: u32) i32 {
+    return ax_open(path, strlen(path), flags);
+}
+
+pub fn close(fd: i32) i32 {
+    ax_close(fd);
+    return 0;
+}
+
+pub fn unlink(path: *u8) i32 {
+    return ax_remove(path, strlen(path), 0);
+}
+
+pub fn rename(from: *u8, to: *u8) i32 {
+    return ax_rename(from, strlen(from), to, strlen(to));
+}
+
+pub fn chmod(path: *u8, mode: u32) i32 {
+    return ax_chmod(path, strlen(path), mode);
+}
+
+pub fn getpid() i32 {
+    return ax_getpid();
+}
+
+pub fn exit(code: i32) void {
+    ax_exit(code);
+}
+
+// Ends a process made with fork().
+pub fn _exit(code: i32) void {
+    ax_exit(code);
+}
+
+// A copy of this process (spec §15): 0 in the copy, its handle in this
+// process, or negative where the host cannot (WebAssembly).
+pub fn fork() i32 {
+    return ax_fork();
+}
+
+// Waits for a child made with fork() or spawned; its exit status (128 +
+// the signal if a signal ended it), or -1.
+pub fn wait_child(h: i32) i32 {
+    let mut st: i32 = 0;
+    let r = ax_proc_wait(h, 1, &mut st);
+    if r == 1 {
+        return st;
+    }
+    if r == 2 {
+        return 128 + st;
+    }
+    return -1;
+}
+
+pub fn cpu_count() usize {
+    return @as(usize, ax_cpu_count());
+}
+
+// Nanoseconds on a monotonic clock.
+pub fn now_ns() i64 {
+    return ax_clock_ns(1);
+}
+
+// The compiler's own file: argument 0 if it names one (as the WebAssembly
+// host passes the module's path), else /proc/self/exe; nil if neither.
+pub fn self_path() []u8 {
+    let args = program_args();
+    if (args.len > 0) and is_file(args[0]) {
+        return real_path(args[0]);
+    }
+    let r = readlink("/proc/self/exe");
+    if not isnos(r) {
+        return r;
+    }
+    return nosym();
+}
+
+pub fn no_strs() [][]u8 {
+    return @slice_from_ptr(@ptr_from_int(*[]u8, 8), 0);
+}
+
+// The program's arguments.
+pub fn program_args() []mut []u8 {
+    let n = @int_cast(usize, ax_argc());
+    let args = newn.[[]u8](n);
+    for i in 0..n {
+        let len = ax_arg(@int_cast(i32, i), nil.[u8](), 0);
+        let buf = alloc(@int_cast(usize, @max(len, 0)) + 1);
+        if len > 0 {
+            _ = ax_arg(@int_cast(i32, i), buf, @int_cast(usize, len));
+        }
+        args[i] = @slice_from_ptr(buf, @int_cast(usize, @max(len, 0)));
+    }
+    return args;
 }
 
 // -----------------------------------------------------------------------------
@@ -546,11 +691,105 @@ pub fn hex16(v: u64) []u8 {
     return dup(buf[..]);
 }
 
-// Formats one float with a printf conversion such as "%.1f".
+// Formats one float with a printf conversion: "%.1f", "%7.1f" (fixed, with
+// a width and a precision) or "%g".
 pub fn ffmt(f: []u8, v: f64) []u8 {
-    let mut buf: [64]u8 = [0; 64];
-    let n = snprintf(&mut buf[0], 64, cz(f), v);
-    return dup(buf[0..@int_cast(usize, n)]);
+    if str_eq(f, "%g") {
+        return gfmt(v);
+    }
+    // %[width][.precision]f
+    let mut i: usize = 1;
+    let mut width: usize = 0;
+    while (i < f.len) and (f[i] >= '0') and (f[i] <= '9') {
+        width = (width * 10) + @as(usize, f[i] - '0');
+        i += 1;
+    }
+    let mut prec: usize = 6;
+    if (i < f.len) and (f[i] == '.') {
+        prec = 0;
+        i += 1;
+        while (i < f.len) and (f[i] >= '0') and (f[i] <= '9') {
+            prec = (prec * 10) + @as(usize, f[i] - '0');
+            i += 1;
+        }
+    }
+    let s = fixed(v, prec);
+    if s.len >= width {
+        return s;
+    }
+    let mut b = Buf.init();
+    for _k in s.len..width {
+        b.c(' ');
+    }
+    b.s(s);
+    return b.done();
+}
+
+// v with prec digits after the point, correctly rounded (ties to even).
+fn fixed(v: f64, prec: usize) []u8 {
+    let mut buf: [400]u8 = [0; 400];
+    let spec = cat3("{:.", zdec(prec), "f}");
+    let r = sfmt.bufprint(buf[..], spec, [sfmt.float(v)]) catch return "?";
+    return dup(r);
+}
+
+// C's %g: 6 significant digits, in fixed or exponent notation (exponent of
+// at least two digits), without trailing zeros.
+fn gfmt(v: f64) []u8 {
+    if v != v {
+        return "nan";
+    }
+    if (v > 1.7976931348623157e308) or (v < -1.7976931348623157e308) {
+        return pick(v > 0.0, "inf", "-inf");
+    }
+    if v == 0.0 {
+        return pick(@bit_cast(u64, v) == 0, "0", "-0");
+    }
+    // the exponent after rounding to 6 digits
+    let mut buf: [400]u8 = [0; 400];
+    let es = sfmt.bufprint(buf[..], "{:.5e}", [sfmt.float(v)]) catch return "?";
+    let e = find(es, 'e');
+    let mut x: i64 = 0;
+    let mut k = @int_cast(usize, e) + 1;
+    let mut neg = false;
+    if (es[k] == '+') or (es[k] == '-') {
+        neg = es[k] == '-';
+        k += 1;
+    }
+    while k < es.len {
+        x = (x * 10) + @as(i64, es[k] - '0');
+        k += 1;
+    }
+    if neg {
+        x = -x;
+    }
+    if (x < -4) or (x >= 6) {
+        let m = strip_zeros(es[0..@int_cast(usize, e)]);
+        let mut b = Buf.init();
+        b.s(m);
+        b.s(pick(x < 0, "e-", "e+"));
+        let ax = @abs(x);
+        if ax < 10 {
+            b.c('0');
+        }
+        b.s(dec(ax));
+        return b.done();
+    }
+    return strip_zeros(fixed(v, @int_cast(usize, 5 - x)));
+}
+
+fn strip_zeros(s: []u8) []u8 {
+    if find(s, '.') < 0 {
+        return dup(s);
+    }
+    let mut n = s.len;
+    while s[n - 1] == '0' {
+        n -= 1;
+    }
+    if s[n - 1] == '.' {
+        n -= 1;
+    }
+    return dup(s[0..n]);
 }
 
 pub fn pick(c: bool, a: []u8, b: []u8) []u8 {
@@ -745,17 +984,9 @@ pub fn c_strtoull(s: []u8) CStrtoll {
     return r;
 }
 
-// strtod over a slice (which must be followed by a NUL, as arena strings are).
-pub fn c_strtod(s: []u8) CFloat {
-    let z = cz(s);
-    let mut end: *mut u8 = nil.[u8]();
-    let v = strtod(z, &mut end);
-    return CFloat.{ v: v, end: @int_from_ptr(end) - @int_from_ptr(z) };
-}
-
-pub struct CFloat {
-    v: f64,
-    end: usize,
+// A decimal float literal's value, correctly rounded (0 if malformed).
+pub fn parse_f64(s: []u8) f64 {
+    return sfmt.parse_float(s) catch 0.0;
 }
 
 // -----------------------------------------------------------------------------
@@ -1279,155 +1510,317 @@ pub fn write_all(fd: i32, s: []u8) void {
 
 pub fn quit(code: i32) void {
     flush_out();
-    exit(code);
+    ax_exit(code);
 }
 
 // -----------------------------------------------------------------------------
 // Files
 // -----------------------------------------------------------------------------
 // The file's bytes (followed by a NUL), or a nil slice if it can't be read.
+// (Read to the end: /proc files have no size.)
 pub fn read_file(path: []u8) []u8 {
-    let f = fopen(cz(path), "rb".ptr);
-    if isvnil(f) {
+    let fd = ax_open(path.ptr, path.len, 0);
+    if fd < 0 {
         return nosym();
     }
-    _ = fseek(f, 0, 2);
-    let n = ftell(f);
-    _ = fseek(f, 0, 0);
-    if n < 0 {
-        _ = fclose(f);
-        return nosym();
+    let mut cap: usize = 4096;
+    let size = ax_seek(fd, 0, 2);
+    if size > 0 {
+        cap = @int_cast(usize, size) + 1;
     }
-    let len = @int_cast(usize, n);
-    let buf = alloc(len + 1);
-    if len > 0 {
-        if fread(buf, 1, len, f) != len {
-            _ = fclose(f);
+    _ = ax_seek(fd, 0, 0);
+    let mut buf = @ptr_cast(*mut u8, malloc(cap + 1));
+    let mut len: usize = 0;
+    loop {
+        if len == cap {
+            cap = cap * 2;
+            buf = @ptr_cast(*mut u8, realloc(@ptr_cast(*mut void, buf), cap + 1));
+        }
+        let n = ax_read(fd, @ptr_from_int(*mut u8, @int_from_ptr(buf) + len), cap - len);
+        if n < 0 {
+            ax_close(fd);
+            free(@ptr_cast(*mut void, buf));
             return nosym();
         }
+        if n == 0 {
+            break;
+        }
+        len += @int_cast(usize, n);
     }
-    _ = fclose(f);
-    return @slice_from_ptr(buf, len);
+    ax_close(fd);
+    let out = alloc(len + 1);
+    @mem_copy(@slice_from_ptr(out, len), @slice_from_ptr(buf, len));
+    free(@ptr_cast(*mut void, buf));
+    return @slice_from_ptr(out, len);
 }
 
 pub fn write_file(path: []u8, data: []u8) bool {
-    let f = fopen(cz(path), "w".ptr);
-    if isvnil(f) {
+    let fd = ax_open(path.ptr, path.len, 1);
+    if fd < 0 {
         return false;
     }
-    if data.len > 0 {
-        _ = fwrite(data.ptr, 1, data.len, f);
+    let mut off: usize = 0;
+    while off < data.len {
+        let n = ax_write(fd, &data[off], data.len - off);
+        if n <= 0 {
+            ax_close(fd);
+            return false;
+        }
+        off += @int_cast(usize, n);
     }
-    _ = fclose(f);
+    ax_close(fd);
     return true;
+}
+
+// stat: [kind (1 file, 2 directory, 3 link), size, mtime, mode], or a
+// negative kind if there is nothing at p.
+fn stat(p: []u8) [4]i64 {
+    let mut out: [4]i64 = [0; 4];
+    if ax_stat(p.ptr, p.len, 1, &mut out[0]) < 0 {
+        out[0] = -1;
+    }
+    return out;
 }
 
 pub fn file_exists(p: []u8) bool {
-    return access(cz(p), 4) == 0;
+    return stat(p)[0] >= 0;
 }
 
 pub fn is_dir(p: []u8) bool {
-    let d = opendir(cz(p));
-    if isvnil(d) {
-        return false;
-    }
-    _ = closedir(d);
-    return true;
+    return stat(p)[0] == 2;
 }
 
 pub fn is_file(p: []u8) bool {
-    return (access(cz(p), 0) == 0) and not is_dir(p);
+    let k = stat(p)[0];
+    return (k >= 0) and (k != 2);
+}
+
+// Is p a file someone may run?
+pub fn is_executable(p: []u8) bool {
+    let st = stat(p);
+    return (st[0] >= 0) and (st[0] != 2) and ((st[3] & 0o111) != 0);
 }
 
 pub fn file_size(p: []u8) i64 {
-    let f = fopen(cz(p), "rb".ptr);
-    if isvnil(f) {
+    let st = stat(p);
+    if st[0] < 0 {
         return -1;
     }
-    _ = fseek(f, 0, 2);
-    let n = ftell(f);
-    _ = fclose(f);
-    return @as(i64, n);
+    return st[1];
 }
 
-// realpath(3); a nil slice on failure.
-pub fn real_path(p: []u8) []u8 {
-    let r = realpath(cz(p), nil.[u8]());
-    if isnil(r) {
+pub fn readlink(p: []u8) []u8 {
+    let mut buf: [4096]u8 = [0; 4096];
+    let n = ax_readlink(p.ptr, p.len, &mut buf[0], 4096);
+    if (n <= 0) or (n > 4096) {
         return nosym();
     }
-    let s = dup(from_c(r));
-    free(@ptr_cast(*mut void, r));
-    return s;
+    return dup(buf[0..@int_cast(usize, n)]);
+}
+
+// realpath(3): absolute, without "." or ".." or symbolic links; a nil slice
+// if p does not exist.
+pub fn real_path(p: []u8) []u8 {
+    if not file_exists(p) {
+        return nosym();
+    }
+    let mut todo = List.[[]u8].{ data: nil.[[]u8](), len: 0, cap: 0 };  // components, last first
+    push_parts(&mut todo, p);
+    if (p.len == 0) or (p[0] != '/') {
+        push_parts(&mut todo, cwd());
+    }
+    let mut out = List.[[]u8].{ data: nil.[[]u8](), len: 0, cap: 0 };
+    let mut links: i32 = 0;
+    while todo.len > 0 {
+        let c = todo.pop();
+        if (c.len == 0) or str_eq(c, ".") {
+            continue;
+        }
+        if str_eq(c, "..") {
+            if out.len > 0 {
+                _ = out.pop();
+            }
+            continue;
+        }
+        out.push(c);
+        let here = join_parts(&out);
+        let mut lst: [4]i64 = [0; 4];
+        if ax_stat(here.ptr, here.len, 0, &mut lst[0]) < 0 {
+            return nosym();
+        }
+        if lst[0] == 3 {
+            links += 1;
+            if links > 40 {
+                return nosym();
+            }
+            let t = readlink(here);
+            if isnos(t) {
+                return nosym();
+            }
+            _ = out.pop();
+            if (t.len > 0) and (t[0] == '/') {
+                out.clear();
+            }
+            push_parts(&mut todo, t);
+        }
+    }
+    let r = join_parts(&out);
+    free(@ptr_cast(*mut void, todo.data));
+    free(@ptr_cast(*mut void, out.data));
+    return r;
+}
+
+// Pushes p's components on a stack, so that the first is popped first.
+fn push_parts(todo: *mut List.[[]u8], p: []u8) void {
+    let mut end = p.len;
+    let mut i = p.len;
+    while i > 0 {
+        if p[i - 1] == '/' {
+            if end > i {
+                todo.push(p[i..end]);
+            }
+            end = i - 1;
+        }
+        i -= 1;
+    }
+    if end > 0 {
+        todo.push(p[0..end]);
+    }
+}
+
+fn join_parts(parts: *List.[[]u8]) []u8 {
+    if parts.len == 0 {
+        return dup("/");
+    }
+    let mut b = Buf.init();
+    for i in 0..parts.len {
+        b.c('/');
+        b.s(parts.get(i));
+    }
+    return b.done();
 }
 
 pub fn cwd() []u8 {
     let mut buf: [4096]u8 = [0; 4096];
-    if isnil(getcwd(&mut buf[0], 4096)) {
+    let n = ax_getcwd(&mut buf[0], 4096);
+    if (n <= 0) or (n > 4096) {
         return "";
     }
-    return dup(from_c(&buf[0]));
+    return dup(buf[0..@int_cast(usize, n)]);
 }
 
 pub fn env(name: []u8) []u8 {
-    let v = getenv(cz(name));
-    if isnil(v) {
+    let n = ax_getenv(name.ptr, name.len, nil.[u8](), 0);
+    if n < 0 {
         return nosym();
     }
-    return from_c(v);
+    let buf = alloc(@int_cast(usize, n) + 1);
+    _ = ax_getenv(name.ptr, name.len, buf, @int_cast(usize, n));
+    return @slice_from_ptr(buf, @int_cast(usize, n));
 }
 
 pub fn mkdirs(path: []u8) void {
-    let buf = dup(path);
-    for i in 1..buf.len {
-        if buf[i] == '/' {
-            _ = mkdir(cz(buf[0..i]), 493);
+    for i in 1..path.len {
+        if path[i] == '/' {
+            _ = ax_mkdir(path.ptr, i, 493);
         }
     }
-    _ = mkdir(cz(buf), 493);
+    _ = ax_mkdir(path.ptr, path.len, 493);
 }
 
-// Directory entries (names), excluding none; order as readdir returns them.
+// Directory entries (names, without "." and ".."), sorted.
 pub fn list_dir(path: []u8, out: *mut List.[[]u8]) bool {
-    let d = opendir(cz(path));
-    if isvnil(d) {
-        return false;
-    }
+    let mut cap: usize = 4096;
     loop {
-        let e = readdir(d);
-        if isnil(e) {
-            break;
+        let buf = @slice_from_ptr(alloc(cap), cap);
+        let n = ax_readdir(path.ptr, path.len, buf.ptr, cap);
+        if n < 0 {
+            return false;
         }
-        // struct dirent: d_name is at offset 19 on 64-bit Linux (glibc).
-        out.push(dup(from_c(@ptr_from_int(*u8, @int_from_ptr(e) + 19))));
+        let need = @int_cast(usize, n);
+        if need > cap {
+            cap = need + 1024;
+            continue;
+        }
+        let first = out.len;
+        let mut i: usize = 0;
+        while i < need {
+            // a kind byte, then the name and a NUL
+            let mut e = i + 1;
+            while (e < need) and (buf[e] != 0) {
+                e += 1;
+            }
+            let name = buf[i + 1..e];
+            if not str_eq(name, ".") and not str_eq(name, "..") {
+                out.push(dup(name));
+            }
+            i = e + 1;
+        }
+        sort.[[]u8](out.items()[first..], str_cmp);
+        return true;
     }
-    _ = closedir(d);
-    return true;
 }
 
 // -----------------------------------------------------------------------------
 // Processes
 // -----------------------------------------------------------------------------
-pub fn wifexited(s: i32) bool {
-    return (s & 127) == 0;
+// What becomes of a child's standard output (run_process).
+pub const OUT_INHERIT: i32 = 0;
+pub const OUT_CAPTURE: i32 = 1;  // into Ran.out
+pub const OUT_STDERR: i32 = 2;   // copied to our standard error
+pub const OUT_NULL: i32 = 3;     // standard output and error to /dev/null
+
+pub struct Ran {
+    status: i32,  // the exit status; 128 + the signal; 127 if it could not run
+    out: []u8,
 }
 
-pub fn wexitstatus(s: i32) i32 {
-    return (s >> 8) & 255;
-}
-
-pub fn wtermsig(s: i32) i32 {
-    return s & 127;
-}
-
-// A NULL-terminated argv array for exec.
-pub fn c_argv(args: [][]u8) *mut *mut u8 {
-    let v = newn.[*mut u8](args.len + 1);
-    for i in 0..args.len {
-        v[i] = @ptr_from_int(*mut u8, @int_from_ptr(cz(args[i])));
+// Runs args (a program without a "/" is looked for in PATH), with env_sets
+// ("NAME=value") added to the environment, and waits for it.
+pub fn run_process(args: [][]u8, env_sets: [][]u8, out_mode: i32) Ran {
+    flush_out();
+    let mut r = Ran.{ status: 127, out: "" };
+    let mut cmd = sproc.Command.init(args[0]);
+    defer cmd.deinit();
+    cmd.args(args[1..]) catch return r;
+    for kv in env_sets {
+        let k = find(kv, '=');
+        if k > 0 {
+            cmd.set_env(kv[0..@int_cast(usize, k)], kv[@int_cast(usize, k) + 1..]) catch return r;
+        }
     }
-    v[args.len] = nil.[u8]();
-    return v.ptr;
+    if (out_mode == OUT_CAPTURE) or (out_mode == OUT_STDERR) {
+        cmd.stdout(sproc.Stdio.PIPE);
+    } else if out_mode == OUT_NULL {
+        cmd.stdout(sproc.Stdio.NULL);
+        cmd.stderr(sproc.Stdio.NULL);
+    }
+    let mut child = cmd.spawn() catch return r;
+    if (out_mode == OUT_CAPTURE) or (out_mode == OUT_STDERR) {
+        let mut b = Buf.init();
+        let mut chunk: [8192]u8 = [0; 8192];
+        loop {
+            let n = child.stdout.read(chunk[..]) catch 0;
+            if n == 0 {
+                break;
+            }
+            if out_mode == OUT_STDERR {
+                write_all(2, chunk[0..n]);
+            } else {
+                b.s(chunk[0..n]);
+            }
+        }
+        r.out = b.done();
+    }
+    let st = child.wait() catch {
+        r.status = -1;
+        return r;
+    };
+    r.status = st.code;
+    if st.signal != 0 {
+        r.status = 128 + st.signal;
+    }
+    return r;
 }
 
 // -----------------------------------------------------------------------------

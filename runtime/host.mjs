@@ -498,6 +498,7 @@ export function createHost(opts = {}) {
     // are not supported: node delivers them only to the main thread's event
     // loop, which a running program does not return to.
     ax_getpid: () => process.pid,
+    ax_fork: () => -38,  // ENOSYS: an instance cannot be copied
     ax_chdir(p, n) {
       try { process.chdir(str(p, n)); return 0; } catch (e) { return fsErr(e); }
     },

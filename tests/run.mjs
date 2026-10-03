@@ -301,6 +301,18 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   }
 }
 
+// The self-hosted compiler reaches the system only through the host ABI, so
+// it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
+// usize assumptions.
+{
+  const name = 'selfhost/src checks for wasm32';
+  if (!filter || name.includes(filter)) {
+    const c = spawnSync(compiler, ['check', path.join(root, 'selfhost/src/main.ax'), '--target=wasm32'], { encoding: 'utf8' });
+    if (c.status !== 0) { fail++; failures.push(`FAIL ${name}:\n${c.stdout}${c.stderr}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // A copy of the standard library under the working directory (as when
 // testing a checkout of std without --std) is not the library: with the
 // address sanitizer, which links the library's std/mem, its modules must not

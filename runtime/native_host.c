@@ -227,6 +227,11 @@ extern char **environ;
 
 int32_t ax_getpid(void) { return (int32_t)getpid(); }
 
+int32_t ax_fork(void) {
+    pid_t pid = fork();
+    return pid < 0 ? AX_ERR : (int32_t)pid;
+}
+
 int32_t ax_chdir(const uint8_t *path, size_t len) {
     char buf[4096];
     if (copy_cstr(buf, sizeof buf, path, len)) return AX_ERR;

@@ -194,7 +194,7 @@ types share a module.
 
 | Module | C source | What |
 |---|---|---|
-| `util.ax` | `util.c` | libc bindings, arenas (permanent, and per-function scratch the backends release), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
+| `util.ax` | `util.c` | the system (host ABI and std: memory, files, processes), arenas (permanent, and per-function scratch the backends release), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
 | `diag.ax` | `diag.c` | diagnostics, human and agent-json output |
 | `lexer.ax` | `lexer.c` | tokens |
 | `ast.ax` | `ast.h`, `types.h`, `builtins.h` | syntax tree, semantic types, builtin table |
@@ -235,9 +235,19 @@ types share a module.
 
 ## Platform assumptions
 
-- Linux on x86-64 or AArch64. The compiler itself uses glibc (2.34 or later, where
-  `libpthread` is part of `libc.so.6`): `/proc/self/exe`, `/proc/cpuinfo` and
-  `readdir`'s `d_name` at offset 19.
+- Linux on x86-64 or AArch64, or WebAssembly. The compiler reaches the system only
+  through the Axiom host ABI and std (spec §15.2), so natively it is a static
+  executable that needs no C library, and it also builds for wasm32:
+
+  ```
+  selfhost/build/axiom build selfhost/src/main.ax --target=wasm32 -O2 -o axiom.wasm
+  node runtime/host.mjs axiom.wasm -- build app.ax --std=std -o app.wasm
+  ```
+
+  It produces the same bytes on either host. Where the host cannot fork (node), it
+  compiles a program as one unit instead of compiling modules in parallel. It reads
+  `/proc/cpuinfo` for `--cpu=native` and `/proc/self/exe` (or, on WebAssembly, its
+  module's path) to find std and to key its object cache.
 - Programs it builds use only the Linux system call interface and are static, unless
   they link C code or libraries (`-l`, `.c`/`.o` inputs). Those are dynamically linked:
   they use the dynamic loader at its standard path (`/lib64/ld-linux-x86-64.so.2`,

@@ -28,7 +28,6 @@ they travel with the code they describe.
 | [0003](0003-parallel-o2-builds.md) | feature | compiler | Parallel -O2 builds |
 | [0004](0004-optimizer-speed.md) | feature | compiler | Faster optimizer |
 | [0005](0005-compiler-memory.md) | feature | compiler | Further cuts to the compiler's memory |
-| [0006](0006-selfhost-on-wasm32.md) | bug | compiler | The self-hosted compiler does not build for wasm32 |
 | [0008](0008-math-missing-commands.md) | feature | std/text/math | Missing TeX commands: `\xrightarrow`, `\substack`, `\sideset`, ... |
 | [0009](0009-markdown-github-math-syntax.md) | feature | std/text/markdown | GitHub's `` $`...`$ `` math syntax |
 | [0010](0010-typeset-without-math-table.md) | feature | std/text/math/typeset | Better typesetting with fonts that lack a MATH table |
@@ -40,3 +39,4 @@ they travel with the code they describe.
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
 | [0007](0007-profile-program-arguments.md) | feature | compiler: `axiom profile` | `axiom profile` cannot pass arguments to the program |
+| [0006](0006-selfhost-on-wasm32.md) | bug | compiler | The self-hosted compiler does not build for wasm32 |

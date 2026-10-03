@@ -1764,6 +1764,16 @@ services are reached through host functions imported from module `"axiom"` (the
 (`runtime/native_host.c` in C, `runtime/native.ax` in Axiom). A program that uses only the language and `std/mem`, `vec`,
 `hash`, `map` and `matrix` needs no host at all.
 
+One host function has no counterpart on WebAssembly: `ax_fork() i32` copies the
+process, returning 0 in the copy and the copy's handle (for `ax_proc_wait`) in the
+original, or a negative error where the host cannot copy a process (node returns
+`-38`). The self-hosted compiler uses it to compile modules in parallel (§16.7), and
+compiles the program as one unit where it is missing. std does not use it.
+
+The self-hosted compiler itself uses only the host ABI and std, so it builds for every
+target, WebAssembly included: `node runtime/host.mjs axiom.wasm -- build app.ax`
+produces the same bytes as the native compiler.
+
 The Axiom runtime uses no C library. It reaches the kernel through system calls
 (`runtime/linux.ax`), starts threads with `clone` and sets up their thread-local
 storage itself, starts processes with `fork` and `execve` (searching `PATH` itself), and resolves host names from `/etc/hosts` and by DNS queries to the

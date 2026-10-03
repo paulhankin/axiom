@@ -57,16 +57,9 @@ fn find_std(argv0: []u8) []u8 {
     if not u.isnos(e) and (e.len > 0) {
         return e;
     }
-    let mut buf: [4096]u8 = [0; 4096];
-    let n = u.readlink("/proc/self/exe".ptr, &mut buf[0], 4095);
-    let mut exe = u.nosym();
-    if n <= 0 {
-        exe = u.real_path(argv0);
-        if u.isnos(exe) {
-            return "std";
-        }
-    } else {
-        exe = u.dup(buf[0..@int_cast(usize, n)]);
+    let mut exe = u.self_path();
+    if u.isnos(exe) {
+        return "std";
     }
     let slash = u.rfind(exe, '/');
     if slash >= 0 {
@@ -86,32 +79,15 @@ fn find_std(argv0: []u8) []u8 {
     return "std";
 }
 
-// Runs a command; its exit status, or -1.
+// Runs a command; its exit status (127 if it could not run).
 fn run(args: [][]u8) i32 {
-    let argv = u.c_argv(args);
-    u.flush_out();
-    let pid = u.fork();
-    if pid == 0 {
-        _ = u.execvp(argv.*, argv);
-        u._exit(127);
-    }
-    if pid < 0 {
-        return -1;
-    }
-    let mut status: i32 = 0;
-    if u.waitpid(pid, &mut status, 0) < 0 {
-        return -1;
-    }
-    if u.wifexited(status) {
-        return u.wexitstatus(status);
-    }
-    return -1;
+    return u.run_process(args, u.no_strs(), u.OUT_INHERIT).status;
 }
 
 fn find_tool(names: [][]u8) []u8 {
     for name in names {
         if u.find(name, '/') >= 0 {
-            if u.access(u.cz(name), 1) == 0 {
+            if u.is_executable(name) {
                 return name;
             }
             continue;
@@ -128,7 +104,7 @@ fn find_tool(names: [][]u8) []u8 {
             if e >= 0 {
                 len = @int_cast(usize, e);
             }
-            if u.access(u.cz(u.f2("%s/%s", rest[0..len], name)), 1) == 0 {
+            if u.is_executable(u.f2("%s/%s", rest[0..len], name)) {
                 return name;
             }
             if e < 0 {
@@ -149,41 +125,8 @@ struct Captured {
 }
 
 fn run_capture(args: [][]u8) Captured {
-    let argv = u.c_argv(args);
-    let mut fds: [2]i32 = [0, 0];
-    if u.pipe(&mut fds[0]) != 0 {
-        return Captured.{ status: -1, out: "" };
-    }
-    u.flush_out();
-    let pid = u.fork();
-    if pid == 0 {
-        _ = u.dup2(fds[1], 1);
-        _ = u.close(fds[0]);
-        _ = u.execvp(argv.*, argv);
-        u._exit(127);
-    }
-    _ = u.close(fds[1]);
-    if pid < 0 {
-        _ = u.close(fds[0]);
-        return Captured.{ status: -1, out: "" };
-    }
-    let mut out = u.Buf.init();
-    let mut buf: [8192]u8 = [0; 8192];
-    loop {
-        let n = u.read(fds[0], &mut buf[0], 8192);
-        if n <= 0 {
-            break;
-        }
-        out.s(buf[0..@int_cast(usize, n)]);
-    }
-    _ = u.close(fds[0]);
-    let mut status: i32 = 0;
-    _ = u.waitpid(pid, &mut status, 0);
-    let mut rc = 128 + u.wtermsig(status);
-    if u.wifexited(status) {
-        rc = u.wexitstatus(status);
-    }
-    return Captured.{ status: rc, out: out.done() };
+    let r = u.run_process(args, u.no_strs(), u.OUT_CAPTURE);
+    return Captured.{ status: r.status, out: r.out };
 }
 
 fn unescape(s: []u8) []u8 {
@@ -583,34 +526,11 @@ fn cmp_stack(x: *mut ProfStack, y: *mut ProfStack) i32 {
 
 // Runs a program with extra environment variables; its exit status.
 fn spawn_program(args: [][]u8, env: [][]u8, out_to_err: bool) i32 {
-    let argv = u.c_argv(args);
-    u.flush_out();
-    let pid = u.fork();
-    if pid == 0 {
-        for kv in env {
-            let eq = u.find(kv, '=');
-            if eq > 0 {
-                let k = @int_cast(usize, eq);
-                _ = u.setenv(u.cz(kv[0..k]), u.cz(kv[k + 1..]), 1);
-            }
-        }
-        if out_to_err {
-            _ = u.dup2(2, 1);
-        }
-        _ = u.execvp(argv.*, argv);
-        u._exit(127);
+    let mut mode = u.OUT_INHERIT;
+    if out_to_err {
+        mode = u.OUT_STDERR;
     }
-    if pid < 0 {
-        return -1;
-    }
-    let mut status: i32 = 0;
-    if u.waitpid(pid, &mut status, 0) < 0 {
-        return -1;
-    }
-    if u.wifexited(status) {
-        return u.wexitstatus(status);
-    }
-    return 128 + u.wtermsig(status);
+    return u.run_process(args, env, mode).status;
 }
 
 fn tmp_dir() []u8 {
@@ -889,11 +809,6 @@ fn run_profile(bin: []u8, prog_args: [][]u8, std_dir: []u8, folded_path: []u8, h
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-fn arg_at(argv: *mut *mut u8, i: usize) []u8 {
-    let p = @ptr_from_int(*mut *mut u8, @int_from_ptr(argv) + (i * @size_of(*mut u8))).*;
-    return u.from_c(p);
-}
-
 fn strip_ph(base: []u8) []u8 {
     if (base.len > 3) and u.ends(base, ".ax") {
         return base[0..base.len - 3];
@@ -910,9 +825,7 @@ fn basename(p: []u8) []u8 {
 }
 
 fn now_ms() f64 {
-    let mut ts = u.Timespec.{ sec: 0, nsec: 0 };
-    _ = u.clock_gettime(1, &mut ts);  // CLOCK_MONOTONIC
-    return (@float_from_int(f64, ts.sec) * 1000.0) + (@float_from_int(f64, ts.nsec) / 1000000.0);
+    return @float_from_int(f64, u.now_ns()) / 1000000.0;
 }
 
 // Links our wasm objects into a module (no external tools).
@@ -1342,7 +1255,10 @@ fn driver(args: [][]u8) i32 {
         let mut objs = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
         let mut us = units.UnitStats.{ total: 0, compiled: 0 };
         let t0 = now_ms();
-        if not units.build_units(co, objpath, &mut objs, &mut us) {
+        let built = units.build_units(co, objpath, &mut objs, &mut us);
+        if built < 0 {
+            separate = false;  // no processes to compile units in: one unit
+        } else if built == 0 {
             dg.emit(json, json);
             if dg.error_count() == 0 {
                 dg.emit_fatal(json, "E9007", "code generation failed");
@@ -1351,7 +1267,7 @@ fn driver(args: [][]u8) i32 {
             return 1;
         }
         let t1 = now_ms();
-        if verbose {
+        if separate and verbose {
             u.eprint(u.f4("axiom: %s modules, %s compiled, %s cached (%s ms)\n", u.zdec(us.total), u.zdec(us.compiled),
                           u.zdec(us.total - us.compiled), u.ffmt("%.0f", t1 - t0)));
         }
@@ -1359,7 +1275,8 @@ fn driver(args: [][]u8) i32 {
             link_inputs.push(objs.get(k));
             unit_objs.push(objs.get(k));
         }
-    } else if not cg.codegen_program(co) {
+    }
+    if not separate and not cg.codegen_program(co) {
         dg.emit(json, json);
         if final_link {
             _ = u.unlink(u.cz(objpath));
@@ -1542,12 +1459,8 @@ fn driver(args: [][]u8) i32 {
     return 0;
 }
 
-export fn main(argc: i32, argv: *mut *mut u8) i32 {
-    let args = u.newn.[[]u8](@int_cast(usize, argc));
-    for i in 0..args.len {
-        args[i] = arg_at(argv, i);
-    }
-    let rc = driver(args);
+export fn main() i32 {
+    let rc = driver(u.program_args());
     u.flush_out();
     return rc;
 }
