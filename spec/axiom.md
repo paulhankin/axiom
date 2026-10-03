@@ -366,10 +366,12 @@ An unknown builtin name is a compile error (`E0120`) raised by the parser.
 ### 4.1 Modules
 
 Each `.ax` file is a module. `import "path.ax" as name;` binds `name` to that module's `pub`
-declarations. Paths are relative to the importing file. A path beginning with `std/`
-resolves to the standard library, for example `import "std/mem" as mem;`. A path beginning
-with `pkg:` names a module of another package (§4.6). The `.ax` extension may be left out.
-A path that doesn't resolve to a readable file is `E0211`.
+declarations. Paths are relative to the importing file, with `/` between their parts on
+every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\` is `E0218`.
+A path beginning with `std/` resolves to the standard library, for example
+`import "std/mem" as mem;`. A path beginning with `pkg:` names a module of another package
+(§4.6). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
+is `E0211`.
 
 Import cycles are a compile error (`E0210`) in v0.1.
 

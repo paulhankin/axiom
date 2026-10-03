@@ -35,7 +35,6 @@ they travel with the code they describe.
 | [0012](0012-windows-native-target.md) | feature | compiler, runtime | Native Windows binaries (x86-64 done; runs on Windows 11) |
 | [0015](0015-wide-simd-and-cpu-dispatch.md) | feature | language, compiler, std | AVX-512, SVE and wider vectors; conditional compilation; runtime CPU detection and dispatch |
 | [0016](0016-native-crypto-instructions.md) | feature | compiler, std/crypto | AES-NI, PCLMULQDQ, SHA and CRC instructions (x86-64 and AArch64) used in std/crypto with portable fallbacks |
-| [0017](0017-windows-absolute-import-paths.md) | bug | compiler | An import of an absolute Windows path (`C:/...`) is taken as relative |
 
 ## Closed
 
@@ -47,3 +46,4 @@ they travel with the code they describe.
 | [0006](0006-selfhost-on-wasm32.md) | bug | compiler | The self-hosted compiler does not build for wasm32 |
 | [0013](0013-c-compiler-runtime-on-macos.md) | feature | runtime | The C compiler's native runtime does not build on macOS |
 | [0014](0014-wasm64-host.md) | bug | runtime | wasm64 programs do not run under `runtime/host.mjs` |
+| [0017](0017-windows-absolute-import-paths.md) | bug | compiler | An import of an absolute Windows path (`C:/...`) is taken as relative |

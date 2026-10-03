@@ -48,6 +48,13 @@ static const char *display_path(const char *real) {
     return real;
 }
 
+// Whether an import path is relative and uses only '/' between its parts
+// (not "/a", "C:/a" or "a\b"), so that it means the same on every host.
+static bool relative_import(const char *ip) {
+    if (!ip[0] || ip[0] == '/' || ip[1] == ':') return false;
+    return strchr(ip, '\\') == NULL;
+}
+
 static Module *load_module(const char *fs_path, Span *from) {
     char rp[PATH_MAX];
     if (!realpath(fs_path, rp)) {
@@ -84,8 +91,9 @@ static Module *load_module(const char *fs_path, Span *from) {
             if (!pkg_resolve_import(m->pkg, ip, d->import_path_span, path, sizeof path)) continue;
         } else if (strncmp(ip, "std/", 4) == 0) {
             snprintf(path, sizeof path, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ax");
-        } else if (ip[0] == '/') {
-            snprintf(path, sizeof path, "%s%s", ip, has_ext(ip) ? "" : ".ax");
+        } else if (!relative_import(ip)) {
+            diag_error(d->import_path_span, "E0218", "import path '%s' must be relative, with '/' between its parts", ip);
+            continue;
         } else {
             snprintf(path, sizeof path, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ax");
         }

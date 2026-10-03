@@ -1,7 +1,7 @@
 # 0017: An import of an absolute Windows path is taken as relative
 
 - Type: bug
-- Status: open
+- Status: fixed (absolute import paths are an error, E0218)
 - Area: compiler (selfhost): `sema.ax`
 
 ## What happens
@@ -40,3 +40,10 @@ Also take a path with a drive as absolute on Windows. util.ax already has
 `u.is_abs_path`, and use it here. Check the C compiler too, if it resolves
 imports the same way. A test belongs with the Windows tests (an import by an
 absolute path built from the test file's own directory).
+
+## Resolution
+
+Import paths are now relative only, with '/' between their parts: a path
+starting with '/', a drive ("C:") or containing '\' is `E0218` in both
+compilers (spec §4.1), so an import means the same on every host.
+tests/errors/import_absolute.ax, import_drive.ax and import_backslash.ax.
