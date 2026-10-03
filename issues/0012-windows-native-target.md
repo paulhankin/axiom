@@ -68,6 +68,17 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
   crash. Checked on Windows 11 with tests/profile/hot.ax, three threads
   doing 2:1:1 work (one sleeping first), `os.exit`, a trap and a stack
   overflow.
+- **More Direct3D.** std/graphics/d3d11: textures from images (two samplers),
+  depth buffers, depth, cull and blend states, compute shaders over
+  structured storage buffers (read back, or read by vertex shaders).
+  std/graphics/d3d12: textures from images, compute root signatures and
+  pipelines, storage buffers (read back, or drawn as vertices), and an
+  Overlay through D3D11On12 so that std/graphics/d2d draws over its
+  targets. std/graphics/hlsl: DXIL (shader model 6) through the DirectX
+  Shader Compiler, loaded at run time (the PATH, `$AXIOM_DXC`, or the newest
+  Windows SDK, with dxil.dll to sign the code). tests/windows/d3d11.ax and
+  d3d12.ax check them pixel by pixel offscreen; they pass on Windows 11
+  (an RTX 4080), and the window path (back buffers, present, resize) runs.
 
 ## Not done
 
@@ -84,11 +95,11 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - Unix-domain sockets need Windows 10 1803 or later (Wine has none).
 - No `.pdata` unwind information: debuggers and Windows' own stack walks see
   only leaf frames (Axiom's traces use its shadow stack).
-- Direct2D on Direct3D 12 (through D3D11On12, which Wine lacks); compute
-  shaders, textures and depth buffers in the Direct3D wrappers; DXIL (shader
-  model 6, dxcompiler); Windows.Gaming.Input, raw input and DirectInput for
-  other controllers; WASAPI capture; Media Foundation. A portable graphics
-  layer over Direct3D, Metal and Vulkan.
+- Direct3D: mipmaps, texture formats other than 8-bit RGBA, rendering into
+  a texture and then sampling it, compute shaders writing textures, MSAA;
+  the overlay under Wine (no D3D11On12 there). Windows.Gaming.Input, raw
+  input and DirectInput for other controllers; WASAPI capture; Media
+  Foundation. A portable graphics layer over Direct3D, Metal and Vulkan.
 - AArch64 Windows.
 - Separate compilation in the compiler on Windows: it forks, so it falls
   back to one unit (0006).

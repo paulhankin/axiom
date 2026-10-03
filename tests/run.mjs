@@ -574,6 +574,24 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
         { encoding: 'utf8', cwd: root, env, timeout: 120000 });
       return w.status === 0 && /^120 frames, \d+ orbs\n/.test(w.stdout) ? null : `window: status ${w.status}: ${w.stdout}${w.stderr}`;
     },
+    'Direct3D: textures, depth, compute, Direct2D on 12, DXIL (tests/windows)': () => {
+      const files = ['tests/windows/d3d11.ax', 'tests/windows/d3d12.ax'];
+      for (const f of files) {
+        const c = spawnSync(compiler, ['check', f, '--target=x86_64-windows'], { encoding: 'utf8', cwd: root, env });
+        if (c.status !== 0) return `${f}: check failed:\n${c.stdout}${c.stderr}`;
+      }
+      // On Windows they run on the GPU. Under Wine only Direct3D 11's do:
+      // Direct3D 12's draw with Direct2D through D3D11On12, which Wine lacks.
+      const onWindows = process.platform === 'win32';
+      const runs = onWindows ? files : wine && xvfb ? files.slice(0, 1) : [];
+      for (const f of runs) {
+        const args = ['test', f, '--target=x86_64-windows'];
+        const r = onWindows ? spawnSync(compiler, args, { encoding: 'utf8', cwd: root, env })
+          : spawnSync(xvfb, ['-a', compiler, ...args], { encoding: 'utf8', cwd: root, env });
+        if (r.status !== 0) return `${f}: status ${r.status}: ${r.stdout}${r.stderr}`;
+      }
+      return null;
+    },
     'the compiler': () => {
       const c = build(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;

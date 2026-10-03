@@ -1,26 +1,40 @@
 // =============================================================================
-// std/graphics/hlsl.ax - compiling HLSL shaders at run time (d3dcompiler_47),
-// for std/graphics/d3d11 and std/graphics/d3d12.
+// std/graphics/hlsl.ax - compiling HLSL shaders at run time, for
+// std/graphics/d3d11 and std/graphics/d3d12.
 //
 //     let mut code = hlsl.compile(src, "vs", "vs_5_0")!;   // CompileError: hlsl.message()
 //     defer code.release();
 //
-// Windows only (--target=x86_64-windows). The bytecode is DXBC (shader
-// models up to 5.1), which both Direct3D 11 and 12 take.
+// Windows only (--target=x86_64-windows). Shader models up to 5.1 compile
+// to DXBC with d3dcompiler_47 (part of Windows), which both Direct3D 11 and
+// 12 take. Shader model 6 ("cs_6_0", "ps_6_6", ...) compiles to DXIL, for
+// Direct3D 12 only, with the DirectX Shader Compiler: dxcompiler.dll and
+// dxil.dll (which signs the code), found next to the program, on the PATH,
+// in the directory $AXIOM_DXC names, or in the newest Windows SDK; without
+// them compile returns Unsupported.
 // =============================================================================
 
 import "../os/com.ax" as com;
 
-error { CompileError, Failed }
+error { CompileError, Unsupported, Failed }
 
 extern "C" "d3dcompiler_47" {
     fn D3DCompile(src: *u8, size: usize, name: *u8, defines: *void, include: *void, entry: *u8, target: *u8,
                   flags1: u32, flags2: u32, code: *mut usize, errors: *mut usize) i32;
 }
 
+extern "C" "kernel32" {
+    fn LoadLibraryExW(name: *u16, file: usize, flags: u32) usize;
+    fn GetProcAddress(module: usize, name: *u8) usize;
+    fn GetEnvironmentVariableW(name: *u16, buf: *mut u16, n: u32) u32;
+    fn FindFirstFileW(pattern: *u16, data: *mut u8) usize;
+    fn FindNextFileW(h: usize, data: *mut u8) i32;
+    fn FindClose(h: usize) i32;
+}
+
 /// Compiled shader bytecode.
 pub struct Code {
-    blob: usize,  // ID3DBlob
+    blob: usize,  // ID3DBlob, or IDxcBlob (the same methods)
 
     pub fn bytes(self: *Code) []u8 {
         let p = @bit_cast(fn(usize) usize, com.method(self.blob, 3))(self.blob);
@@ -51,9 +65,28 @@ fn cz(s: []u8, out: []mut u8) bool {
     return true;
 }
 
+// Keeps a blob's text as the message.
+fn keep_message(blob: usize) void {
+    message_len = 0;
+    if blob == 0 {
+        return;
+    }
+    let c = Code.{ blob: blob };
+    let m = c.bytes();
+    let mut n = @min(m.len, message_buf.len);
+    while (n > 0) and (m[n - 1] == 0) {
+        n -= 1;
+    }
+    @mem_copy(message_buf[0..n], m[0..n]);
+    message_len = n;
+}
+
 /// Compiles `entry` of src for `target` (a profile: "vs_5_0", "ps_5_0",
-/// "cs_5_0", "vs_4_0", ...).
+/// "cs_5_0", "vs_4_0", ...; "cs_6_0", "ps_6_6", ... for DXIL).
 pub fn compile(src: []u8, entry: []u8, target: []u8) !Code {
+    if model(target) >= 6 {
+        return compile_dxil(src, entry, target);
+    }
     let mut e: [128]u8 = [0; 128];
     let mut t: [32]u8 = [0; 32];
     if not cz(entry, e[..]) or not cz(target, t[..]) {
@@ -64,19 +97,219 @@ pub fn compile(src: []u8, entry: []u8, target: []u8) !Code {
     let name = "shader";
     let hr = D3DCompile(src.ptr, src.len, name.ptr, @ptr_from_int(*void, 0), @ptr_from_int(*void, 0), &e[0], &t[0], 0,
                         0, &mut code, &mut errs);
-    message_len = 0;
-    if errs != 0 {
-        let c = Code.{ blob: errs };
-        let m = c.bytes();
-        let mut n = @min(m.len, message_buf.len);
-        while (n > 0) and (m[n - 1] == 0) {
-            n -= 1;
-        }
-        @mem_copy(message_buf[0..n], m[0..n]);
-        message_len = n;
-        com.release(errs);
-    }
+    keep_message(errs);
+    com.release(errs);
     if (hr < 0) or (code == 0) {
+        com.release(code);
+        return error.CompileError;
+    }
+    return Code.{ blob: code };
+}
+
+// A profile's shader model: 6 for "cs_6_0".
+fn model(target: []u8) u32 {
+    for i in 0..target.len {
+        if (target[i] == '_') and ((i + 1) < target.len) and (target[i + 1] >= '0') and (target[i + 1] <= '9') {
+            return @as(u32, target[i + 1] - '0');
+        }
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// The DirectX Shader Compiler (DXIL)
+// -----------------------------------------------------------------------------
+// CLSID_DxcCompiler {73e22d93-e6ce-47f3-b5bf-f0664f39c1b0}
+let CLSID_COMPILER: [16]u8 = [0x93, 0x2d, 0xe2, 0x73, 0xce, 0xe6, 0xf3, 0x47, 0xb5, 0xbf, 0xf0, 0x66, 0x4f, 0x39, 0xc1,
+                              0xb0];
+// IID_IDxcCompiler3 {228b4687-5a6a-4730-900c-9702b2203f54}
+let IID_COMPILER3: [16]u8 = [0x87, 0x46, 0x8b, 0x22, 0x6a, 0x5a, 0x30, 0x47, 0x90, 0x0c, 0x97, 0x02, 0xb2, 0x20, 0x3f,
+                             0x54];
+// IID_IDxcResult {58346cda-dde7-4497-9461-6f87af5e0659}
+let IID_RESULT: [16]u8 = [0xda, 0x6c, 0x34, 0x58, 0xe7, 0xdd, 0x97, 0x44, 0x94, 0x61, 0x6f, 0x87, 0xaf, 0x5e, 0x06,
+                          0x59];
+
+let mut dxc_create: usize = 0;  // DxcCreateInstance
+let mut dxc_tried: bool = false;
+
+fn wide(s: []u8, out: []mut u16) usize {
+    return com.utf16(s, out);
+}
+
+// Loads dxcompiler.dll from dir (UTF-16, without the final \), with dxil.dll
+// from there first so that the compiler finds it.
+fn load_from(dir: []u16) usize {
+    let mut p: [600]u16 = [0; 600];
+    if (dir.len + 20) > p.len {
+        return 0;
+    }
+    @mem_copy(p[0..dir.len], dir);
+    let mut tail: [32]u16 = [0; 32];
+    let n = wide("\\dxil.dll", tail[..]);
+    @mem_copy(p[dir.len..dir.len + n + 1], tail[0..n + 1]);
+    _ = LoadLibraryExW(&p[0], 0, 0x8);  // LOAD_WITH_ALTERED_SEARCH_PATH
+    let m = wide("\\dxcompiler.dll", tail[..]);
+    @mem_copy(p[dir.len..dir.len + m + 1], tail[0..m + 1]);
+    return LoadLibraryExW(&p[0], 0, 0x8);
+}
+
+fn env(name: []u8, out: []mut u16) usize {
+    let mut k: [64]u16 = [0; 64];
+    _ = wide(name, k[..]);
+    let n = GetEnvironmentVariableW(&k[0], &mut out[0], @truncate(u32, out.len));
+    if @as(usize, n) >= out.len {
+        return 0;
+    }
+    return @as(usize, n);
+}
+
+// The newest Windows SDK's x64 tools: ...\Windows Kits\10\bin\10.*\x64.
+fn sdk_dir(out: []mut u16) usize {
+    let mut base: [400]u16 = [0; 400];
+    let mut n = env("ProgramFiles(x86)", base[..]);
+    if n == 0 {
+        n = wide("C:\\Program Files (x86)", base[..]);
+    }
+    let mut tail: [64]u16 = [0; 64];
+    let k = wide("\\Windows Kits\\10\\bin\\10.*", tail[..]);
+    if (n + k + 1) > base.len {
+        return 0;
+    }
+    @mem_copy(base[n..n + k + 1], tail[0..k + 1]);
+    // WIN32_FIND_DATAW: the name at 44 (260 units)
+    let mut fd: [592]u8 = [0; 592];
+    let h = FindFirstFileW(&base[0], &mut fd[0]);
+    if h == ~@as(usize, 0) {
+        return 0;
+    }
+    let mut best: [64]u16 = [0; 64];
+    let mut best_n: usize = 0;
+    loop {
+        let name = @slice_from_ptr(@ptr_from_int(*u16, @int_from_ptr(&fd[44])), 260);
+        let mut ln: usize = 0;
+        while (ln < 64) and (name[ln] != 0) {
+            ln += 1;
+        }
+        if (ln < 64) and later(name[0..ln], best[0..best_n]) {
+            @mem_copy(best[0..ln], name[0..ln]);
+            best_n = ln;
+        }
+        if FindNextFileW(h, &mut fd[0]) == 0 {
+            break;
+        }
+    }
+    _ = FindClose(h);
+    if best_n == 0 {
+        return 0;
+    }
+    // base without "10.*", then the version and \x64
+    let dir_n = n + k - 4;
+    let x = wide("\\x64", tail[..]);
+    if (dir_n + best_n + x) > out.len {
+        return 0;
+    }
+    @mem_copy(out[0..dir_n], base[0..dir_n]);
+    @mem_copy(out[dir_n..dir_n + best_n], best[0..best_n]);
+    @mem_copy(out[dir_n + best_n..dir_n + best_n + x], tail[0..x]);
+    return dir_n + best_n + x;
+}
+
+// Is version a later than b ("10.0.26100.0" > "10.0.22621.0"): number by number.
+fn later(a: []u16, b: []u16) bool {
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    while (i < a.len) or (j < b.len) {
+        let mut x: u64 = 0;
+        while (i < a.len) and (a[i] != '.') {
+            x = (x * 10) + @as(u64, a[i] -% '0');
+            i += 1;
+        }
+        let mut y: u64 = 0;
+        while (j < b.len) and (b[j] != '.') {
+            y = (y * 10) + @as(u64, b[j] -% '0');
+            j += 1;
+        }
+        if x != y {
+            return x > y;
+        }
+        i += 1;
+        j += 1;
+    }
+    return false;
+}
+
+fn load_dxc() bool {
+    if dxc_tried {
+        return dxc_create != 0;
+    }
+    dxc_tried = true;
+    let mut dir: [600]u16 = [0; 600];
+    let mut m: usize = 0;
+    let n = env("AXIOM_DXC", dir[..]);
+    if n > 0 {
+        m = load_from(dir[0..n]);
+    }
+    if m == 0 {
+        let mut name: [32]u16 = [0; 32];
+        _ = wide("dxcompiler.dll", name[..]);
+        m = LoadLibraryExW(&name[0], 0, 0);
+    }
+    if m == 0 {
+        let k = sdk_dir(dir[..]);
+        if k > 0 {
+            m = load_from(dir[0..k]);
+        }
+    }
+    if m != 0 {
+        dxc_create = GetProcAddress(m, "DxcCreateInstance".ptr);
+    }
+    return dxc_create != 0;
+}
+
+fn compile_dxil(src: []u8, entry: []u8, target: []u8) !Code {
+    message_len = 0;
+    if not load_dxc() {
+        return error.Unsupported;
+    }
+    let mut compiler: usize = 0;
+    let create = @bit_cast(fn(*u8, *u8, *mut usize) i32, dxc_create);
+    if create(&CLSID_COMPILER[0], &IID_COMPILER3[0], &mut compiler) < 0 {
+        return error.Unsupported;
+    }
+    defer com.release(compiler);
+    // the arguments: -E entry -T target
+    let mut w: [4][128]u16 = [[0; 128]; 4];
+    _ = wide("-E", w[0][..]);
+    _ = wide(entry, w[1][..]);
+    _ = wide("-T", w[2][..]);
+    _ = wide(target, w[3][..]);
+    if (entry.len > 120) or (target.len > 120) {
+        return error.Failed;
+    }
+    let args: [4]usize = [@int_from_ptr(&w[0][0]), @int_from_ptr(&w[1][0]), @int_from_ptr(&w[2][0]),
+                          @int_from_ptr(&w[3][0])];
+    // DxcBuffer: the bytes, their size, the encoding (UTF-8)
+    let mut buf: [24]u8 = [0; 24];
+    com.ptr(buf[..], 0, @int_from_ptr(src.ptr));
+    com.put64(buf[..], 8, @as(u64, src.len));
+    com.put32(buf[..], 16, 65001);
+    let mut result: usize = 0;
+    let f = @bit_cast(fn(usize, *u8, *usize, u32, usize, *u8, *mut usize) i32, com.method(compiler, 3));  // Compile
+    if f(compiler, &buf[0], &args[0], 4, 0, &IID_RESULT[0], &mut result) < 0 {
+        return error.Failed;
+    }
+    defer com.release(result);
+    let mut errs: usize = 0;
+    _ = @bit_cast(fn(usize, *mut usize) i32, com.method(result, 5))(result, &mut errs);  // GetErrorBuffer
+    keep_message(errs);
+    com.release(errs);
+    let mut status: i32 = -1;
+    _ = @bit_cast(fn(usize, *mut i32) i32, com.method(result, 3))(result, &mut status);  // GetStatus
+    let mut code: usize = 0;
+    if status >= 0 {
+        _ = @bit_cast(fn(usize, *mut usize) i32, com.method(result, 4))(result, &mut code);  // GetResult
+    }
+    if (status < 0) or (code == 0) {
         com.release(code);
         return error.CompileError;
     }

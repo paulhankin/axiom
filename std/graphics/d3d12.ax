@@ -50,6 +50,27 @@
 //     gpu.set_texture(0, &mut sm);
 //     ... draw ...
 //
+// Images become textures that shaders read like a shadow map, through s0
+// (linear, wrapping), with set_image. Textures and storage buffers are made
+// between frames (each upload is submitted and waited for).
+//
+//     let mut tex = gpu.texture(&img)!;
+//     gpu.set_image(0, &tex);                              // t0
+//
+// Compute shaders work on storage buffers (RWStructuredBuffer<T> at u0, u1,
+// ...), which can be read back or drawn as vertices, in a frame of their
+// own or before the drawing in one:
+//
+//     let rs = gpu.compute_signature(1, 1)!;               // a constant at b0; u0
+//     let cp = gpu.compute_pipeline(&rs, &cs_code)!;       // hlsl.compile(src, "main", "cs_5_0")
+//     let mut b = gpu.storage_buffer(data)!;
+//     gpu.set_compute_pipeline(&cp)!;
+//     gpu.set_compute_constants(consts[..]);
+//     gpu.set_storage(0, &mut b);
+//     gpu.dispatch(n / 64, 1, 1);
+//     gpu.finish()!;                                       // or begin(t), then set_storage_vertices(&mut b, 16) ...
+//     gpu.read_buffer(&mut b, out)!;
+//
 // Front faces are counter-clockwise as seen, as in OpenGL: a mesh wound
 // counter-clockwise seen from outside, in a right-handed world (std/math/
 // geometry's look_at and perspective_zo), shows its outsides with CULL_BACK.
@@ -69,6 +90,11 @@ error { Unsupported, Failed, OutOfMemory }
 extern "C" "d3d12" {
     fn D3D12CreateDevice(adapter: usize, level: u32, riid: *u8, dev: *mut usize) i32;
     fn D3D12SerializeRootSignature(desc: *u8, version: u32, blob: *mut usize, errors: *mut usize) i32;
+}
+
+extern "C" "d3d11" {
+    fn D3D11On12CreateDevice(dev: usize, flags: u32, levels: *u32, nlevels: u32, queues: *usize, nqueues: u32,
+                             node: u32, dev11: *mut usize, ctx: *mut usize, level: *mut u32) i32;
 }
 
 extern "C" "dxgi" {
@@ -117,7 +143,10 @@ pub const CULL_BACK: u32 = 3;
 
 // Resource states
 const PRESENT: u32 = 0;
+const VERTEX_AND_CONSTANT_BUFFER: u32 = 0x1;
 const RENDER_TARGET: u32 = 0x4;
+const UNORDERED_ACCESS: u32 = 0x8;
+const SHADER_RESOURCE: u32 = 0xc0;  // pixel and non-pixel shaders
 const DEPTH_WRITE_STATE: u32 = 0x10;
 const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 const COPY_DEST: u32 = 0x400;
@@ -148,6 +177,9 @@ let IID_FACTORY4: [16]u8 = [0x02, 0xea, 0xc6, 0x1b, 0x36, 0xef, 0x4f, 0x46, 0xbf
                             0x8a];
 let IID_SWAP3: [16]u8 = [0xdb, 0x9b, 0xd9, 0x94, 0xf8, 0xf1, 0xb0, 0x4a, 0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda,
                          0xb1];
+let IID_ON12: [16]u8 = [0x73, 0x1e, 0x61, 0x85, 0xa9, 0x70, 0x0e, 0x49, 0x96, 0x14, 0xa9, 0xe3, 0x02, 0x77, 0x79, 0x04];
+let IID_TEXTURE2D: [16]u8 = [0xf2, 0xaa, 0x15, 0x6f, 0x08, 0xd2, 0x89, 0x4e, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f,
+                             0x9c];
 let IID_ADAPTER: [16]u8 = [0xe1, 0xe7, 0x11, 0x24, 0xac, 0x12, 0xcf, 0x4c, 0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d,
                            0xc0];
 
@@ -167,7 +199,7 @@ pub struct Attribute {
 pub struct RootSignature {
     p: usize,
     constants: u32,
-    buffers: u32,   // root parameter of constant buffer b1 (then b2, ...)
+    buffers: u32,   // root parameter of constant buffer b1 (then b2, ...); for compute, of storage u0 (u1, ...)
     textures: u32,  // root parameter of texture t0's table (then t1's, ...)
 
     pub fn release(self: *mut RootSignature) void {
@@ -219,6 +251,68 @@ pub struct Buffer {
         com.release(self.p);
         self.p = 0;
         self.mapped = 0;
+    }
+}
+
+/// An image on the GPU for shaders to read (set_image).
+pub struct Texture {
+    res: usize,
+    srv: u32,  // its shader resource view's index in the device's heap
+    width: u32,
+    height: u32,
+
+    pub fn release(self: *mut Texture) void {
+        com.release(self.res);
+        self.res = 0;
+    }
+}
+
+/// A buffer in GPU memory that compute shaders read and write (u0, u1,
+/// ...), and that can be drawn as vertices.
+pub struct StorageBuffer {
+    res: usize,
+    gpu: u64,
+    size: u32,
+    state: u32,
+
+    pub fn release(self: *mut StorageBuffer) void {
+        com.release(self.res);
+        self.res = 0;
+    }
+}
+
+/// Direct3D 11 on this device's queue (D3D11On12), so that Direct2D
+/// (std/graphics/d2d) draws onto its targets: a HUD over the 3D scene.
+pub struct Overlay {
+    dev11: usize,       // ID3D11Device
+    ctx: usize,         // its immediate context
+    on12: usize,        // ID3D11On12Device
+    res: [8]usize,      // the targets wrapped (ID3D12Resource) ...
+    wrapped: [8]usize,  // ... as Direct3D 11 textures
+    n: usize,
+
+    /// Lets the wrapped targets go: before Device.resize, which makes new
+    /// back buffers (detach the d2d.Canvas first).
+    pub fn unwrap(self: *mut Overlay) void {
+        for k in 0..self.n {
+            com.release(self.wrapped[k]);
+            self.wrapped[k] = 0;
+            self.res[k] = 0;
+        }
+        self.n = 0;
+        if self.ctx != 0 {
+            @bit_cast(fn(usize) void, com.method(self.ctx, 111))(self.ctx);  // Flush: destroys them
+        }
+    }
+
+    pub fn release(self: *mut Overlay) void {
+        self.unwrap();
+        com.release(self.on12);
+        com.release(self.ctx);
+        com.release(self.dev11);
+        self.on12 = 0;
+        self.ctx = 0;
+        self.dev11 = 0;
     }
 }
 
@@ -645,6 +739,210 @@ pub struct Device {
         return Buffer.{ p: res, gpu: gpu, size: @truncate(u32, n), mapped: p };
     }
 
+    // An upload buffer holding `rows` rows of `row` bytes from data, each at a
+    // multiple of `pitch` (what a texture copy needs).
+    fn staging(self: *mut Device, data: []u8, row: usize, rows: usize, pitch: usize) !usize {
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, pitch * rows));
+        let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, 0];
+        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p) < 0 {
+            com.release(res);
+            return error.Failed;
+        }
+        for y in 0..rows {
+            @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p + (y * pitch)), row), data[y * row..(y + 1) * row]);
+        }
+        @bit_cast(fn(usize, u32, *void) void, com.method(res, 9))(res, 0, @ptr_from_int(*void, 0));  // Unmap
+        return res;
+    }
+
+    /// A texture holding img (converted to 8-bit RGBA), for shaders to read
+    /// (set_image). Made between frames.
+    pub fn texture(self: *mut Device, img: *image.Image) !Texture {
+        if (img.channels == 4) and (img.depth == image.Depth.U8) {
+            return self.texture_rgba(img);
+        }
+        let mut conv = img.convert(4, image.Depth.U8)!;
+        defer conv.deinit();
+        return self.texture_rgba(&conv);
+    }
+
+    fn texture_rgba(self: *mut Device, img: *image.Image) !Texture {
+        if self.recording or (self.srv_next >= MAX_VIEWS) {
+            return error.Failed;
+        }
+        let w = @truncate(u32, img.width);
+        let h = @truncate(u32, img.height);
+        let mut rd: [56]u8 = [0; 56];
+        texture_desc(rd[..], w, h, R8G8B8A8_UNORM, 0);
+        let res = self.committed(1, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;
+        let pitch = ((img.width * 4) + 255) & ~@as(usize, 255);
+        let up = self.staging(img.data, img.width * 4, img.height, pitch) catch |e| {
+            com.release(res);
+            return e;
+        };
+        defer com.release(up);
+        // D3D12_TEXTURE_COPY_LOCATIONs: the texture's subresource 0, the
+        // buffer's placed footprint
+        let mut dst: [48]u8 = [0; 48];
+        com.ptr(dst[..], 0, res);
+        let mut src: [48]u8 = [0; 48];
+        com.ptr(src[..], 0, up);
+        com.put32(src[..], 8, 1);
+        com.put32(src[..], 24, R8G8B8A8_UNORM);
+        com.put32(src[..], 28, w);
+        com.put32(src[..], 32, h);
+        com.put32(src[..], 36, 1);
+        com.put32(src[..], 40, @truncate(u32, pitch));
+        self.open() catch |e| {
+            com.release(res);
+            return e;
+        };
+        let f = @bit_cast(fn(usize, *u8, u32, u32, u32, *u8, *void) void, com.method(self.list, 16));  // CopyTextureRegion
+        f(self.list, &dst[0], 0, 0, 0, &src[0], @ptr_from_int(*void, 0));
+        self.barrier(res, COPY_DEST, SHADER_RESOURCE);
+        self.submit() catch |e| {
+            com.release(res);
+            return e;
+        };
+        let t = Texture.{ res: res, srv: self.srv_next, width: w, height: h };
+        self.srv_next += 1;
+        // D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension (TEXTURE2D), the
+        // default component mapping, then at 16 the most detailed mip and
+        // the number of mips
+        let mut sv: [40]u8 = [0; 40];
+        com.put32(sv[..], 0, R8G8B8A8_UNORM);
+        com.put32(sv[..], 4, 4);
+        com.put32(sv[..], 8, 0x1688);
+        com.put32(sv[..], 20, 1);
+        let handle = self.srv_cpu + (@as(usize, t.srv) * @as(usize, self.srv_size));
+        @bit_cast(fn(usize, usize, *u8, usize) void, com.method(self.dev, 18))(self.dev, res, &sv[0], handle);
+        return t;
+    }
+
+    /// A storage buffer holding data (its length a multiple of 4), for
+    /// compute shaders. Made between frames.
+    pub fn storage_buffer(self: *mut Device, data: []u8) !StorageBuffer {
+        if self.recording or (data.len == 0) or ((data.len % 4) != 0) {
+            return error.Failed;
+        }
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, data.len));
+        com.put32(rd[..], 48, 0x4);  // ALLOW_UNORDERED_ACCESS
+        let res = self.committed(1, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;
+        let up = self.staging(data, data.len, 1, data.len) catch |e| {
+            com.release(res);
+            return e;
+        };
+        defer com.release(up);
+        self.open() catch |e| {
+            com.release(res);
+            return e;
+        };
+        let f = @bit_cast(fn(usize, usize, u64, usize, u64, u64) void, com.method(self.list, 15));  // CopyBufferRegion
+        f(self.list, res, 0, up, 0, @as(u64, data.len));
+        self.barrier(res, COPY_DEST, UNORDERED_ACCESS);
+        self.submit() catch |e| {
+            com.release(res);
+            return e;
+        };
+        let gpu = @bit_cast(fn(usize) u64, com.method(res, 11))(res);
+        return StorageBuffer.{ res: res, gpu: gpu, size: @truncate(u32, data.len), state: UNORDERED_ACCESS };
+    }
+
+    /// Copies a storage buffer's contents into out (as much as fits), after
+    /// what was recorded so far has run.
+    pub fn read_buffer(self: *mut Device, b: *mut StorageBuffer, out: []mut u8) !void {
+        let mut rd: [56]u8 = [0; 56];
+        buffer_desc(rd[..], @as(u64, b.size));
+        let rb = self.committed(3, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;  // READBACK heap
+        defer com.release(rb);
+        self.open()!;
+        self.barrier(b.res, b.state, COPY_SOURCE);
+        let f = @bit_cast(fn(usize, usize, u64, usize, u64, u64) void, com.method(self.list, 15));  // CopyBufferRegion
+        f(self.list, rb, 0, b.res, 0, @as(u64, b.size));
+        self.barrier(b.res, COPY_SOURCE, b.state);
+        self.submit()!;
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, @as(u64, b.size)];
+        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p) < 0 {
+            return error.Failed;
+        }
+        let n = @min(out.len, @as(usize, b.size));
+        @mem_copy(out[0..n], @slice_from_ptr(@ptr_from_int(*u8, p), n));
+        let none: [2]u64 = [0, 0];
+        @bit_cast(fn(usize, u32, *u64) void, com.method(rb, 9))(rb, 0, &none[0]);
+    }
+
+    /// A root signature for compute shaders: `constants` 32-bit constants at
+    /// b0 (0: none) and `storage` storage buffers at u0, u1, ...
+    pub fn compute_signature(self: *mut Device, constants: u32, storage: u32) !RootSignature {
+        if storage > 8 {
+            return error.Failed;
+        }
+        // D3D12_ROOT_PARAMETERs: constants (register, space, count at 8, 12,
+        // 16); root UAVs (the register at 8)
+        let mut params: [9][32]u8 = [[0; 32]; 9];
+        let mut n: u32 = 0;
+        if constants > 0 {
+            com.put32(params[0][..], 0, 1);
+            com.put32(params[0][..], 16, constants);
+            n = 1;
+        }
+        let first = n;
+        for k in @as(u32, 0)..storage {
+            com.put32(params[@as(usize, n)][..], 0, 4);  // UAV
+            com.put32(params[@as(usize, n)][..], 8, k);
+            n += 1;
+        }
+        let mut desc: [40]u8 = [0; 40];
+        if n > 0 {
+            com.put32(desc[..], 0, n);
+            com.ptr(desc[..], 8, @int_from_ptr(&params[0][0]));
+        }
+        let p = self.serialize_root(desc[..])!;
+        return RootSignature.{ p: p, constants: constants, buffers: first, textures: 0 };
+    }
+
+    /// A compute pipeline: the compute shader and its root signature
+    /// (compute_signature).
+    pub fn compute_pipeline(self: *mut Device, root: *RootSignature, cs: *hlsl.Code) !Pipeline {
+        let cb = cs.bytes();
+        // D3D12_COMPUTE_PIPELINE_STATE_DESC: root signature, shader, node
+        // mask, cached state, flags
+        let mut d: [56]u8 = [0; 56];
+        com.ptr(d[..], 0, root.p);
+        com.ptr(d[..], 8, @int_from_ptr(cb.ptr));
+        com.put64(d[..], 16, @as(u64, cb.len));
+        let mut p: usize = 0;
+        let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(self.dev, 11));  // CreateComputePipelineState
+        if f(self.dev, &d[0], &IID_PSO[0], &mut p) < 0 {
+            return error.Failed;
+        }
+        return Pipeline.{ p: p, root: root.p, topology: 0, buffers: root.buffers, textures: 0 };
+    }
+
+    fn serialize_root(self: *mut Device, desc: []u8) !usize {
+        let mut blob: usize = 0;
+        let mut errs: usize = 0;
+        let r = D3D12SerializeRootSignature(&desc[0], 1, &mut blob, &mut errs);
+        com.release(errs);
+        if r < 0 {
+            return error.Failed;
+        }
+        defer com.release(blob);
+        let bp = @bit_cast(fn(usize) usize, com.method(blob, 3))(blob);
+        let bn = @bit_cast(fn(usize) usize, com.method(blob, 4))(blob);
+        let mut p: usize = 0;
+        let f = @bit_cast(fn(usize, u32, usize, usize, *u8, *mut usize) i32, com.method(self.dev, 16));
+        if f(self.dev, 0, bp, bn, &IID_ROOT[0], &mut p) < 0 {
+            return error.Failed;
+        }
+        return p;
+    }
+
     /// A root signature with `constants` 32-bit constants for both shaders
     /// at register b0 (0: none), and vertex input.
     pub fn root_signature(self: *mut Device, constants: u32) !RootSignature {
@@ -718,21 +1016,7 @@ pub struct Device {
         com.put32(desc[..], 16, 2);
         com.ptr(desc[..], 24, @int_from_ptr(&samplers[0][0]));
         com.put32(desc[..], 32, 1);  // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-        let mut blob: usize = 0;
-        let mut errs: usize = 0;
-        let r = D3D12SerializeRootSignature(&desc[0], 1, &mut blob, &mut errs);
-        com.release(errs);
-        if r < 0 {
-            return error.Failed;
-        }
-        defer com.release(blob);
-        let bp = @bit_cast(fn(usize) usize, com.method(blob, 3))(blob);
-        let bn = @bit_cast(fn(usize) usize, com.method(blob, 4))(blob);
-        let mut p: usize = 0;
-        let f = @bit_cast(fn(usize, u32, usize, usize, *u8, *mut usize) i32, com.method(self.dev, 16));
-        if f(self.dev, 0, bp, bn, &IID_ROOT[0], &mut p) < 0 {
-            return error.Failed;
-        }
+        let p = self.serialize_root(desc[..])!;
         return RootSignature.{ p: p, constants: constants, buffers: first_buffer, textures: first_texture };
     }
 
@@ -986,14 +1270,70 @@ pub struct Device {
         }
         self.barrier(d.res, d.state, PIXEL_SHADER_RESOURCE);
         d.state = PIXEL_SHADER_RESOURCE;
+        self.bind_view(slot, d.srv);
+    }
+
+    /// Texture t(slot) of the pipeline's root signature: an image (texture).
+    pub fn set_image(self: *mut Device, slot: u32, t: *Texture) void {
+        self.bind_view(slot, t.srv);
+    }
+
+    fn bind_view(self: *mut Device, slot: u32, srv: u32) void {
         if not self.heaps_set {
             let heaps: [1]usize = [self.srv_heap];
             @bit_cast(fn(usize, u32, *usize) void, com.method(self.list, 28))(self.list, 1, &heaps[0]);  // SetDescriptorHeaps
             self.heaps_set = true;
         }
-        let handle = self.srv_gpu + (@as(u64, d.srv) * @as(u64, self.srv_size));
+        let handle = self.srv_gpu + (@as(u64, srv) * @as(u64, self.srv_size));
         @bit_cast(fn(usize, u32, u64) void, com.method(self.list, 32))(  // SetGraphicsRootDescriptorTable
             self.list, self.cur_textures + slot, handle);
+    }
+
+    // --- computing ---
+
+    /// The compute pipeline to run (compute_pipeline): starts recording, or
+    /// goes on recording the frame. Its constants and storage buffers must
+    /// be set (again) after it.
+    pub fn set_compute_pipeline(self: *mut Device, p: *Pipeline) !void {
+        self.open()!;
+        @bit_cast(fn(usize, usize) void, com.method(self.list, 25))(self.list, p.p);
+        @bit_cast(fn(usize, usize) void, com.method(self.list, 29))(self.list, p.root);  // SetComputeRootSignature
+        self.cur_buffers = p.buffers;
+    }
+
+    /// The compute root signature's constants (b0), as 32-bit words.
+    pub fn set_compute_constants(self: *mut Device, values: []u32) void {
+        let f = @bit_cast(fn(usize, u32, u32, *u32, u32) void, com.method(self.list, 35));
+        f(self.list, 0, @truncate(u32, values.len), values.ptr, 0);
+    }
+
+    /// Storage buffer u(slot) of the compute root signature.
+    pub fn set_storage(self: *mut Device, slot: u32, b: *mut StorageBuffer) void {
+        self.barrier(b.res, b.state, UNORDERED_ACCESS);
+        b.state = UNORDERED_ACCESS;
+        @bit_cast(fn(usize, u32, u64) void, com.method(self.list, 41))(  // SetComputeRootUnorderedAccessView
+            self.list, self.cur_buffers + slot, b.gpu);
+    }
+
+    /// Runs the compute shader on x × y × z groups of threads. What it
+    /// wrote is seen by what is recorded after.
+    pub fn dispatch(self: *mut Device, x: u32, y: u32, z: u32) void {
+        @bit_cast(fn(usize, u32, u32, u32) void, com.method(self.list, 14))(self.list, x, y, z);
+        // a UAV barrier on every resource
+        let mut b: [32]u8 = [0; 32];
+        b[0] = 2;  // D3D12_RESOURCE_BARRIER_TYPE_UAV, of no resource in particular
+        @bit_cast(fn(usize, u32, *u8) void, com.method(self.list, 26))(self.list, 1, &b[0]);
+    }
+
+    /// Draws a storage buffer's contents as the vertices, each `stride` bytes.
+    pub fn set_storage_vertices(self: *mut Device, b: *mut StorageBuffer, stride: u32) void {
+        self.barrier(b.res, b.state, VERTEX_AND_CONSTANT_BUFFER);
+        b.state = VERTEX_AND_CONSTANT_BUFFER;
+        let mut v: [16]u8 = [0; 16];
+        com.put64(v[..], 0, b.gpu);
+        com.put32(v[..], 8, b.size);
+        com.put32(v[..], 12, stride);
+        @bit_cast(fn(usize, u32, u32, *u8) void, com.method(self.list, 44))(self.list, 0, 1, &v[0]);
     }
 
     /// The root signature's constants (b0), as 32-bit words.
@@ -1037,16 +1377,103 @@ pub struct Device {
             self.list, count, 1, first, base, 0);
     }
 
-    /// Submits the frame drawn into a texture and waits for it.
+    /// Submits the frame drawn into a texture and waits for it (and for the
+    /// overlay's drawing).
     pub fn finish(self: *mut Device) !void {
+        if not self.recording {
+            self.wait_idle();
+            return;
+        }
         self.submit()!;
+    }
+
+    // --- Direct2D on top ---
+
+    /// Direct3D 11 on this device, for Direct2D to draw onto its targets:
+    ///
+    ///     let mut ov = gpu.overlay()!;
+    ///     let mut c = d2d.Canvas.for_texture(gpu.overlay_texture(&mut ov, t)!, w, h)!;
+    ///     ... each frame: record the 3D drawing into t, then
+    ///     gpu.begin_overlay(&mut ov, t)!;     // submits it
+    ///     c.retarget(gpu.overlay_texture(&mut ov, t)!, w, h)!;   // (when t changed: back buffers alternate)
+    ///     c.begin(); ... c.end()!;
+    ///     gpu.end_overlay(&mut ov, t);
+    ///     gpu.present(true)!;                 // or finish(), read_pixels
+    pub fn overlay(self: *mut Device) !Overlay {
+        let mut o = Overlay.{ dev11: 0, ctx: 0, on12: 0, res: [0; 8], wrapped: [0; 8], n: 0 };
+        let queues: [1]usize = [self.queue];
+        let mut level: u32 = 0;
+        // BGRA_SUPPORT, for Direct2D
+        if D3D11On12CreateDevice(self.dev, 0x20, @ptr_from_int(*u32, 0), 0, &queues[0], 1, 0, &mut o.dev11, &mut o.ctx,
+                                 &mut level) < 0 {
+            return error.Unsupported;
+        }
+        o.on12 = com.query(o.dev11, &IID_ON12) catch {
+            o.release();
+            return error.Unsupported;
+        };
+        return o;
+    }
+
+    /// t as a Direct3D 11 texture (an ID3D11Texture2D) of the overlay, for
+    /// d2d.Canvas.for_texture or retarget; made the first time.
+    pub fn overlay_texture(self: *mut Device, o: *mut Overlay, t: *Target) !usize {
+        for k in 0..o.n {
+            if o.res[k] == t.res {
+                return o.wrapped[k];
+            }
+        }
+        if o.n == o.res.len {
+            return error.Failed;
+        }
+        // D3D11_RESOURCE_FLAGS: bind (render target), misc, CPU access, stride;
+        // in and out of Direct3D 11 as a render target
+        let flags: [4]u32 = [0x20, 0, 0, 0];
+        let mut w: usize = 0;
+        let f = @bit_cast(fn(usize, usize, *u32, u32, u32, *u8, *mut usize) i32, com.method(o.on12, 3));  // CreateWrappedResource
+        if f(o.on12, t.res, &flags[0], RENDER_TARGET, RENDER_TARGET, &IID_TEXTURE2D[0], &mut w) < 0 {
+            return error.Failed;
+        }
+        o.res[o.n] = t.res;
+        o.wrapped[o.n] = w;
+        o.n += 1;
+        return w;
+    }
+
+    /// Submits what was recorded for t, and hands t to the overlay: Direct2D
+    /// draws onto it until end_overlay.
+    pub fn begin_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) !void {
+        let w = self.overlay_texture(o, t)!;
+        if self.recording or (t.state != RENDER_TARGET) {
+            self.open()!;
+            self.barrier(t.res, t.state, RENDER_TARGET);
+            t.state = RENDER_TARGET;
+            self.submit()!;
+        }
+        let ws: [1]usize = [w];
+        @bit_cast(fn(usize, *usize, u32) void, com.method(o.on12, 5))(o.on12, &ws[0], 1);  // AcquireWrappedResources
+    }
+
+    /// Hands t back from the overlay (after d2d.Canvas.end), and runs what
+    /// Direct2D drew.
+    pub fn end_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) void {
+        _ = self;
+        for k in 0..o.n {
+            if o.res[k] == t.res {
+                let ws: [1]usize = [o.wrapped[k]];
+                @bit_cast(fn(usize, *usize, u32) void, com.method(o.on12, 4))(o.on12, &ws[0], 1);  // ReleaseWrappedResources
+            }
+        }
+        @bit_cast(fn(usize) void, com.method(o.ctx, 111))(o.ctx);  // Flush: onto the queue
+        t.state = RENDER_TARGET;
     }
 
     /// Submits the frame drawn into screen() and shows it; with vsync, at
     /// the display's next refresh.
     pub fn present(self: *mut Device, vsync: bool) !void {
         let t = self.screen();
-        if self.recording {
+        if self.recording or (t.state != PRESENT) {
+            self.open()!;
             self.barrier(t.res, t.state, PRESENT);
             t.state = PRESENT;
             self.submit()!;

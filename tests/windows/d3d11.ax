@@ -1,0 +1,210 @@
+// Direct3D 11 (std/graphics/d3d11), drawn offscreen and read back pixel by
+// pixel: textures, depth buffers, culling, blending and compute shaders.
+// Windows only: axiom test tests/windows/d3d11.ax --target=x86_64-windows
+// (tests/run.mjs runs it under Wine when it can).
+
+import "std/graphics/d3d11" as d3d;
+import "std/graphics/hlsl" as hlsl;
+import "std/graphics/image" as image;
+
+let mut src_buf: [8192]u8 = [0; 8192];
+
+// The lines of a shader, joined.
+fn src(lines: [][]u8) []u8 {
+    let mut n: usize = 0;
+    for l in lines {
+        @mem_copy(src_buf[n..n + l.len], l);
+        src_buf[n + l.len] = '\n';
+        n += l.len + 1;
+    }
+    return src_buf[0..n];
+}
+
+// Vertices: x, y, z (clip space) and r, g, b, a; the pixel shader draws the
+// colour, or the texture at t0 (through s1, point sampling) where `u` >= 0.
+let SHADER: [17][]u8 = ["struct VSIn { float3 pos : POSITION; float4 col : COLOR; };",
+                        "struct VSOut { float4 pos : SV_Position; float4 col : COLOR; float2 uv : TEXCOORD; };",
+                        "Texture2D tex : register(t0);", "SamplerState pt : register(s1);",
+                        "cbuffer Mode : register(b0) { float textured; float3 pad; };", "VSOut vs(VSIn i) {",
+                        "    VSOut o;", "    o.pos = float4(i.pos, 1.0);", "    o.col = i.col;",
+                        "    o.uv = float2(i.pos.x * 0.5 + 0.5, 0.5 - i.pos.y * 0.5);", "    return o;", "}",
+                        "float4 ps(VSOut i) : SV_Target {", "    if (textured > 0.5) { return tex.Sample(pt, i.uv); }",
+                        "    return i.col;", "}", ""];
+
+struct Gpu {
+    dev: d3d.Device,
+    vs: d3d.VertexShader,
+    ps: d3d.PixelShader,
+    layout: d3d.InputLayout,
+    mode: d3d.Buffer,
+
+    fn release(self: *mut Gpu) void {
+        self.mode.release();
+        self.layout.release();
+        self.ps.release();
+        self.vs.release();
+        self.dev.deinit();
+    }
+
+    fn textured(self: *mut Gpu, on: bool) void {
+        let mut m: [4]f32 = [0.0; 4];
+        if on {
+            m[0] = 1.0;
+        }
+        self.dev.update(&self.mode, @slice_from_ptr(@ptr_cast(*u8, &m[0]), 16));
+    }
+
+    // Draws triangles (7 floats a vertex) into t.
+    fn draw(self: *mut Gpu, v: []f32) !void {
+        let mut b = self.dev.buffer(d3d.VERTEX, @slice_from_ptr(@ptr_cast(*u8, v.ptr), v.len * 4))!;
+        defer b.release();
+        self.dev.set_layout(self.layout);
+        self.dev.set_topology(d3d.TRIANGLE_LIST);
+        self.dev.set_shaders(self.vs, self.ps);
+        self.dev.set_constants(0, &self.mode);
+        self.dev.set_vertices(&b, 28);
+        self.dev.draw(@truncate(u32, v.len / 7), 0);
+    }
+}
+
+fn gpu() !Gpu {
+    let mut dev = d3d.Device.init()!;
+    let s = src(SHADER[..]);
+    let mut vc = hlsl.compile(s, "vs", "vs_5_0")!;
+    defer vc.release();
+    let mut pc = hlsl.compile(s, "ps", "ps_5_0")!;
+    defer pc.release();
+    let vs = dev.vertex_shader(&vc)!;
+    let ps = dev.pixel_shader(&pc)!;
+    let attrs = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32B32_FLOAT, offset: 0 },
+                 d3d.Attribute.{ semantic: "COLOR", index: 0, format: d3d.R32G32B32A32_FLOAT, offset: 12 }];
+    let layout = dev.input_layout(attrs[..], &vc)!;
+    let zero: [16]u8 = [0; 16];
+    let mode = dev.buffer(d3d.CONSTANT, zero[..])!;
+    return Gpu.{ dev: dev, vs: vs, ps: ps, layout: layout, mode: mode };
+}
+
+fn px(img: *image.Image, x: usize, y: usize) u32 {
+    let at = ((y * img.width) + x) * 4;
+    return ((@as(u32, img.data[at]) << 24) | (@as(u32, img.data[at + 1]) << 16)) | (
+        (@as(u32, img.data[at + 2]) << 8) | @as(u32, img.data[at + 3]));
+}
+
+// A triangle covering the whole target at depth z, in one colour.
+fn cover(out: []mut f32, z: f32, r: f32, g: f32, b: f32, a: f32) void {
+    let xy: [6]f32 = [-1.0, -1.0, -1.0, 3.0, 3.0, -1.0];  // clockwise as seen
+    for k in @as(usize, 0)..3 {
+        let v: [7]f32 = [xy[k * 2], xy[(k * 2) + 1], z, r, g, b, a];
+        @mem_copy(out[k * 7..(k + 1) * 7], v[..]);
+    }
+}
+
+test "a texture from an image" {
+    let mut g = gpu()!;
+    defer g.release();
+    let mut t = g.dev.target(4, 4)!;
+    defer t.release();
+    // 2 × 2 RGB (converted to RGBA on the way)
+    let mut img = image.Image.init(2, 2, 3, image.Depth.U8)!;
+    defer img.deinit();
+    let px3: [12]u8 = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+    @mem_copy(img.data, px3[..]);
+    let mut tex = g.dev.texture(&img)!;
+    defer tex.release();
+    @expect_eq(tex.width, 2);
+    g.dev.clear(&t, 0.0, 0.0, 0.0, 1.0);
+    g.dev.set_target(&t);
+    g.dev.set_texture(0, &tex)!;
+    g.textured(true);
+    let mut v: [21]f32 = [0.0; 21];
+    cover(v[..], 0.5, 0.0, 0.0, 0.0, 1.0);
+    g.draw(v[..])!;
+    let mut out = g.dev.read_pixels(&t)!;
+    defer out.deinit();
+    // each texel covers 2 × 2 pixels
+    @expect_eq(px(&out, 0, 0), 0xff0000ff);
+    @expect_eq(px(&out, 3, 0), 0x00ff00ff);
+    @expect_eq(px(&out, 1, 3), 0x0000ffff);
+    @expect_eq(px(&out, 2, 2), 0xffffffff);
+}
+
+test "depth, culling and blending" {
+    let mut g = gpu()!;
+    defer g.release();
+    let mut t = g.dev.target(8, 8)!;
+    defer t.release();
+    let mut z = g.dev.depth_buffer(8, 8)!;
+    defer z.release();
+    g.textured(false);
+    g.dev.clear(&t, 0.0, 0.0, 0.0, 1.0);
+    g.dev.set_target_depth(&t, &z);
+    g.dev.clear_depth(&z);
+    let mut v: [21]f32 = [0.0; 21];
+    // near red, then far green: red stays
+    cover(v[..], 0.25, 1.0, 0.0, 0.0, 1.0);
+    g.draw(v[..])!;
+    cover(v[..], 0.75, 0.0, 1.0, 0.0, 1.0);
+    g.draw(v[..])!;
+    let mut a = g.dev.read_pixels(&t)!;
+    defer a.deinit();
+    @expect_eq(px(&a, 4, 4), 0xff0000ff);
+    // with the test off, green covers it
+    g.dev.set_depth(d3d.DEPTH_OFF)!;
+    g.draw(v[..])!;
+    let mut b = g.dev.read_pixels(&t)!;
+    defer b.deinit();
+    @expect_eq(px(&b, 4, 4), 0x00ff00ff);
+    // the triangle is clockwise: a back face once set_cull is used
+    g.dev.set_cull(d3d.CULL_BACK)!;
+    cover(v[..], 0.5, 0.0, 0.0, 1.0, 1.0);
+    g.draw(v[..])!;
+    g.dev.set_cull(d3d.CULL_FRONT)!;
+    cover(v[..], 0.5, 1.0, 1.0, 1.0, 0.5);
+    g.dev.set_blend(d3d.BLEND_ALPHA)!;
+    g.draw(v[..])!;  // half white over green
+    let mut c = g.dev.read_pixels(&t)!;
+    defer c.deinit();
+    let p = px(&c, 4, 4);
+    @expect((p >> 24) >= 126 and (p >> 24) <= 129);
+    @expect_eq((p >> 16) & 0xff, 255);
+    @expect_eq(p & 0xff, 255);
+}
+
+let CS: [8][]u8 = ["struct E { uint a; float b; };", "RWStructuredBuffer<E> buf : register(u0);",
+                   "StructuredBuffer<uint> add : register(t0);", "[numthreads(64, 1, 1)]",
+                   "void main(uint3 id : SV_DispatchThreadID) {",
+                   "    buf[id.x].a = buf[id.x].a * buf[id.x].a + add[id.x % 4];",
+                   "    buf[id.x].b = sqrt((float)id.x);", "}"];
+
+test "a compute shader" {
+    let mut dev = d3d.Device.init()!;
+    defer dev.deinit();
+    let mut code = hlsl.compile(src(CS[..]), "main", "cs_5_0")!;
+    defer code.release();
+    let mut cs = dev.compute_shader(&code)!;
+    defer cs.release();
+    let n: usize = 256;
+    let mut data: [512]u32 = [0; 512];
+    for i in 0..n {
+        data[i * 2] = @truncate(u32, i);
+    }
+    let mut b = dev.storage_buffer(@slice_from_ptr(@ptr_cast(*u8, &data[0]), n * 8), 8)!;
+    defer b.release();
+    let adds: [4]u32 = [1, 2, 3, 4];
+    let mut a = dev.storage_buffer(@slice_from_ptr(@ptr_cast(*u8, &adds[0]), 16), 4)!;
+    defer a.release();
+    dev.set_compute(cs);
+    dev.set_storage(0, &b);
+    dev.set_compute_input(0, &a);
+    dev.dispatch(@truncate(u32, n / 64), 1, 1);
+    dev.dispatch(@truncate(u32, n / 64), 1, 1);  // twice: (i² + k)² + k
+    let mut out: [512]u32 = [0; 512];
+    dev.read_buffer(&b, @slice_from_ptr(@ptr_cast(*mut u8, &mut out[0]), n * 8))!;
+    for i in 0..n {
+        let x = @truncate(u32, i);
+        let k = @truncate(u32, (i % 4) + 1);
+        let once = (x * x) + k;
+        @expect_eq(out[i * 2], (once *% once) +% k);
+        @expect(@abs(@bit_cast(f32, out[(i * 2) + 1]) - @sqrt(@float_from_int(f32, i))) < 0.001);
+    }
+}
