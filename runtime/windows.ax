@@ -1093,6 +1093,7 @@ export fn ax_environ(buf: *mut u8, cap: usize) isize {
 }
 
 export fn ax_exit(code: i32) void {
+    ax_rt_fini();
     ExitProcess(@bit_cast(u32, code));
 }
 
@@ -2810,6 +2811,13 @@ struct ThreadStart {
 
 let mut next_thread_id: i32 = 1;
 
+// Called as each thread starts (true) and ends (false): the profiler
+// (runtime/profile_windows.ax) samples the threads it knows.
+pub let mut thread_hook: fn(bool) void = no_thread_hook;
+pub let mut has_thread_hook: bool = false;
+
+fn no_thread_hook(start: bool) void {}
+
 // Room to report a stack overflow in (the exception handler runs on the
 // overflowing stack).
 fn guarantee_stack() void {
@@ -2820,7 +2828,13 @@ fn guarantee_stack() void {
 fn thread_main(p: *mut void) u32 {
     guarantee_stack();
     let st = @ptr_cast(*mut ThreadStart, p);
+    if has_thread_hook {
+        thread_hook(true);
+    }
     st.entry(st.arg);
+    if has_thread_hook {
+        thread_hook(false);
+    }
     @atomic_store(st.exited, 1);
     _ = ax_notify32(st.exited, 1);
     free(p);
@@ -3029,6 +3043,17 @@ pub let mut trap_hook: fn(*tf.Site, *tf.TrapInfo, *tf.ShadowStack) void = no_hoo
 pub let mut has_trap_hook: bool = false;
 pub let mut crash_hook: fn(u64) void = no_crash_hook;
 pub let mut has_crash_hook: bool = false;
+// Called by code for `axiom profile` builds to write the samples so far.
+pub let mut profile_flush: fn() void = no_flush;
+pub let mut has_profile: bool = false;
+
+fn no_flush() void {}
+
+fn flush_profile() void {
+    if has_profile {
+        profile_flush();
+    }
+}
 
 fn no_hook(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {}
 
@@ -3064,6 +3089,7 @@ export fn ax_on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) vo
     o.c('\n');
     tf.format_stack(&mut o, site, ss);
     write_all(2, o.text());
+    flush_profile();
 }
 
 // Was a fault at addr a stack overflow: an access near the end of the
@@ -3174,6 +3200,7 @@ fn on_exception(ep: *mut usize) i32 {
         native_stack(&mut more);
     }
     write_all(2, more.text());
+    flush_profile();
     _ = TerminateProcess(GetCurrentProcess(), code);
     return 0;
 }
@@ -3238,6 +3265,7 @@ fn on_unhandled(ep: *mut usize) i32 {
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     native_stack(&mut o);
     write_all(2, o.text());
+    flush_profile();
     _ = TerminateProcess(GetCurrentProcess(), code);
     return 1;  // EXCEPTION_EXECUTE_HANDLER
 }
@@ -3316,4 +3344,6 @@ export fn ax_rt_init() void {
 }
 
 // Runs after main returns.
-export fn ax_rt_fini() void {}
+export fn ax_rt_fini() void {
+    flush_profile();
+}

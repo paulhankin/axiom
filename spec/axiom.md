@@ -1576,7 +1576,7 @@ wherever host instructions differ.
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Bounds checks against it (§12.1) are future work |
 | `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; self-hosted compiler only. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
-| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; self-hosted compiler only. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Not yet supported: `axiom profile`, linking C code or `-l` libraries |
+| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; self-hosted compiler only. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Not yet supported: linking C code or `-l` libraries |
 
 Linux is the native operating system. `--target=native` on a Mac means
 `aarch64-macos`, and on Windows `x86_64-windows`; elsewhere they are cross targets,
@@ -2137,6 +2137,7 @@ How samples are taken:
 | Target | Clock | Mechanism | Threads |
 |---|---|---|---|
 | native | process CPU time | a POSIX CPU-clock timer delivers `SIGPROF`, and the handler copies the interrupted thread's shadow stack (`runtime/profile.c`). Timer overruns weight each sample, so coarse kernel ticks don't skew totals | all threads |
+| x86_64-windows | process CPU time | a sampler thread credits each thread the cycles it ran (`QueryThreadCycleTime`) at every tick; a thread with a period's worth is suspended and its shadow stack copied (`runtime/profile_windows.ax`). Each sample is weighted by the periods it stands for, and waiting threads are not sampled | all threads |
 | wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`runtime/profile_worker.mjs`) | main thread only |
 
 Profile builds are otherwise identical to ordinary builds with stack traces on (the

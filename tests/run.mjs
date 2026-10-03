@@ -249,7 +249,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 // Profiling (spec §16.6).
 {
   const name = 'tests/profile/hot.ax [axiom profile]';
-  if (native && noC) skip++;  // (the profiler is Linux's for now)
+  if (native && /macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '')) skip++;  // (not on macOS yet)
   else if (!filter || name.includes(filter)) {
     const folded = path.join(tmp, 'hot.folded');
     const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ax'), '--format=agent-json', `--folded=${folded}`,

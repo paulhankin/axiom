@@ -115,7 +115,7 @@ $ WINEDEBUG=-all AXIOM=selfhost/build/axiom AXIOM_NATIVE_TARGET=x86_64-windows \
   AXIOM_NATIVE_EXEC=wine64 node tests/run.mjs --native
 ```
 
-Not yet: `axiom profile` for Windows, and linking C code or `-l` libraries (issue 0012).
+Not yet: linking C code or `-l` libraries (issue 0012).
 
 ## How code is generated
 

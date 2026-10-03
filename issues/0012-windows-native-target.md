@@ -1,7 +1,7 @@
 # 0012: Native Windows binaries
 
 - Type: feature
-- Status: in progress (x86-64 done and tested under Wine; see below)
+- Status: in progress (x86-64 done; runs on Windows 11 and under Wine; see below)
 - Area: compiler (selfhost): `target.ax`, `x64.ax`, `plink.ax`; `runtime/windows.ax`
 
 ## Done
@@ -55,13 +55,25 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - **The compiler on Windows.** It builds for `x86_64-windows`, runs, and
   reaches a fixed point there: built by the Windows compiler, it builds
   itself bit-identically (under Wine). `util.real_path` keeps drive letters.
+- **Real Windows.** The compiler, examples/game.ax and the other examples run
+  on Windows 11.
+- **`axiom profile`.** `runtime/profile_windows.ax`: a sampler thread in place
+  of SIGPROF. Threads register as they start (`windows.ax`'s `thread_hook`);
+  at each tick (a high-resolution waitable timer) every thread is credited
+  the cycles it ran (`QueryThreadCycleTime`, calibrated against the
+  performance counter at startup), and one with a period's worth is
+  suspended, its shadow stack copied, and resumed. So the counts are CPU
+  time, as on Linux, across all threads, and waiting is not sampled. The
+  profile is written at exit (`ax_rt_fini`, `ax_exit`), at a trap and at a
+  crash. Checked on Windows 11 with tests/profile/hot.ax, three threads
+  doing 2:1:1 work (one sleeping first), `os.exit`, a trap and a stack
+  overflow.
 
 ## Not done
 
-- **A real Windows machine.** Everything has run under Wine only. A Windows
-  runner in CI (`windows-latest`, billed for private repositories) would
-  cover what Wine does differently.
-- `axiom profile` (runtime/profile.ax samples with SIGPROF).
+- **The test suite on real Windows.** tests/run.mjs has run under Wine only
+  (it needs node). A Windows runner in CI (`windows-latest`, billed for
+  private repositories) would cover what Wine does differently.
 - Linking C code and `-l` libraries. Calls to C
   variadic functions would also need floating-point arguments copied to the
   integer registers.
