@@ -1,7 +1,7 @@
 # 0016: Hardware crypto instructions, and their use in std/crypto
 
 - Type: feature
-- Status: fixed (see Resolution)
+- Status: fixed (3facaaa)
 - Area: language/compiler (intrinsics), std/crypto, std/hash, std/net/tls
 
 ## Today
