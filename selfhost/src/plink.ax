@@ -1,0 +1,847 @@
+// =============================================================================
+// plink.ax - links the ELF relocatable objects of x64.ax (read with
+// elf.read) into a Windows executable for x86-64: PE32+, a console program,
+// position independent (base relocations; the loader may place it anywhere),
+// importing what the runtime calls from the system's DLLs.
+//
+// Sections (4 KiB in memory, 512-byte aligned in the file):
+//   .text   r-x  code, one jump through the import address table per
+//                imported function called, the entry point
+//   .rdata  r--  read-only data, relocated read-only data, the thread-local
+//                directory
+//   .idata  rw-  the import directory, lookup and address tables, names
+//   .data   rw-  data, the GOT (addresses of our own symbols that code loads
+//                through it), the thread-local template, _tls_index, then
+//                zero-filled .bss (beyond the section's file data)
+//   .reloc  r--  base relocations: every absolute address the image holds
+//
+// Imports: what is still undefined after our own objects is a Windows
+// function, found in a DLL by its name: the BSD socket functions and those
+// beginning with WSA are ws2_32.dll's, Rtl and Nt ones ntdll.dll's, BCrypt
+// ones bcrypt.dll's, other capitalized ones kernel32.dll's. Anything else
+// is undefined. Calls
+// go through a 6-byte thunk (jmp [rip+slot]); the thunk is also the
+// function's address wherever one is taken.
+//
+// Thread-locals: the TLS directory makes the loader give every thread a copy
+// of the template (.tdata, then .tbss zero-filled) and store its index in
+// axiom.tls_index; code finds the copy in TEB.ThreadLocalStoragePointer
+// (x64.ax). A thread-local's TPOFF32 is its offset in the template.
+//
+// Entry: axiom.entry calls main(0, null) (the runtime reads the command line
+// itself) and passes its result to ExitProcess.
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "util.ax" as u;
+
+const BASE: u64 = 0x1_4000_0000;  // the preferred image base
+const SECT: u64 = 0x1000;         // section alignment in memory
+const FILEAL: u64 = 0x200;        // and in the file
+const STACK_RESERVE: u64 = 8 << 20;
+
+const C_TEXT: i32 = 0;
+const C_CONST: i32 = 1;
+const C_DATA: i32 = 2;
+const C_TDATA: i32 = 3;
+const C_TBSS: i32 = 4;
+const C_BSS: i32 = 5;
+
+struct GSym {
+    name: []u8,
+    obj: i32,  // defining object, -1: imported
+    sym: u32,
+    got: i32,    // GOT slot, -1: none
+    thunk: i32,  // import index, -1: none
+    weak: bool,  // undefined and only weakly referenced: address 0
+}
+
+struct Dll {
+    name: []u8,
+    funcs: u.List.[u32],  // gsym indexes
+}
+
+let mut objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0,
+                                                              cap: 0 };
+let mut gsyms: u.List.[GSym] = u.List.[GSym].{ data: @ptr_from_int(*mut GSym, 0), len: 0, cap: 0 };
+let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                cap: 0, len: 0 };
+let mut sec_addr: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0, cap: 0 };
+let mut sec_cls: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
+let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
+let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+let mut got_sym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+let mut imports: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // gsym per thunk
+let mut dlls: u.List.[Dll] = u.List.[Dll].{ data: @ptr_from_int(*mut Dll, 0), len: 0, cap: 0 };
+let mut relocs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };  // RVAs of addresses
+let mut errors: u32 = 0;
+
+let mut thunk_addr: u64 = 0;
+let mut iat_addr: u64 = 0;  // the import address table: one slot per import, in thunk order, NULL after each DLL's
+let mut iat_slot: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };  // import -> its slot's address
+let mut got_addr: u64 = 0;
+let mut tls_addr: u64 = 0;  // the template's start
+
+// Each section's file and memory placement.
+struct Out {
+    name: []u8,
+    rva: u64,
+    vsize: u64,
+    fsize: u64,  // initialized bytes
+    foff: u64,
+    flags: u64,
+}
+
+fn err(msg: []u8) void {
+    u.eprint(u.f1("axiom: link error: %s\n", msg));
+    errors += 1;
+}
+
+fn align_up(x: u64, a: u64) u64 {
+    if a <= 1 {
+        return x;
+    }
+    return (x + a - 1) & ~(a - 1);
+}
+
+fn is_got_reloc(ty: u32) bool {
+    return (ty == elf.R_X86_64_GOTPCREL) or (ty == 41) or (ty == elf.R_X86_64_REX_GOTPCRELX);
+}
+
+fn is_call_reloc(ty: u32) bool {
+    return (ty == elf.R_X86_64_PLT32) or (ty == elf.R_X86_64_PC32);
+}
+
+fn class_of(s: *elf.Sec) i32 {
+    let k = s.kind;
+    if k == elf.S_TEXT {
+        return C_TEXT;
+    }
+    if k == elf.S_RODATA {
+        return C_CONST;  // (base relocations patch read-only pages too)
+    }
+    if k == elf.S_DATA {
+        return C_DATA;
+    }
+    if k == elf.S_BSS {
+        return C_BSS;
+    }
+    if k == elf.S_TDATA {
+        return C_TDATA;
+    }
+    return C_TBSS;
+}
+
+let SOCKET_FNS: [22][]u8 = ["accept", "bind", "closesocket", "connect", "freeaddrinfo", "getaddrinfo", "gethostname",
+                            "getpeername", "getsockname", "getsockopt", "htonl", "htons", "inet_ntop", "inet_pton",
+                            "ioctlsocket", "listen", "recv", "recvfrom", "select", "send", "sendto", "setsockopt"];
+
+// The DLL that exports a Windows function (see the header); "" if none.
+fn dll_of(name: []u8) []u8 {
+    for f in SOCKET_FNS {
+        if u.str_eq(f, name) {
+            return "ws2_32.dll";
+        }
+    }
+    if u.str_eq(name, "shutdown") {
+        return "ws2_32.dll";
+    }
+    if (name.len == 0) or (name[0] < 'A') or (name[0] > 'Z') {
+        return "";
+    }
+    if u.starts(name, "WSA") {
+        return "ws2_32.dll";
+    }
+    if u.starts(name, "Rtl") or u.starts(name, "Nt") {
+        return "ntdll.dll";
+    }
+    if u.starts(name, "BCrypt") {
+        return "bcrypt.dll";
+    }
+    return "kernel32.dll";
+}
+
+// -----------------------------------------------------------------------------
+// Symbols
+// -----------------------------------------------------------------------------
+fn gsym_index(name: []u8) u32 {
+    let k = u.intern(name);
+    let prev = gmap.get(k);
+    if prev != 0 {
+        return prev - 1;
+    }
+    gsyms.push(GSym.{ name: k, obj: -1, sym: 0, got: -1, thunk: -1, weak: true });
+    gmap.put(k, @int_cast(u32, gsyms.len));
+    return @int_cast(u32, gsyms.len - 1);
+}
+
+fn collect_symbols() void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let s = o.syms.get(si);
+            if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
+                continue;
+            }
+            let gi = gsym_index(s.name);
+            let g = gsyms.at(@as(usize, gi));
+            if s.bind != elf.B_WEAK {
+                g.weak = false;
+            }
+            if s.sec < 0 {
+                continue;
+            }
+            if g.obj < 0 {
+                g.obj = @int_cast(i32, oi);
+                g.sym = @int_cast(u32, si);
+            } else if s.bind != elf.B_WEAK {
+                let prev = objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
+                if prev.bind == elf.B_WEAK {
+                    g.obj = @int_cast(i32, oi);
+                    g.sym = @int_cast(u32, si);
+                } else {
+                    err(u.f1("duplicate symbol '%s'", s.name));
+                }
+            }
+        }
+    }
+    // What is still undefined must be a Windows function, never one of our
+    // own (module-qualified) names.
+    for gi in 0..gsyms.len {
+        let g = gsyms.at(gi);
+        if (g.obj < 0) and not g.weak and (dll_of(g.name).len == 0) {
+            err(u.f1("undefined symbol '%s'", g.name));
+        }
+    }
+}
+
+fn global_of(oi: usize, si: u32) i32 {
+    let s = objs.get(oi).syms.at(@as(usize, si));
+    if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
+        return -1;
+    }
+    return @int_cast(i32, gmap.get(u.intern(s.name))) - 1;
+}
+
+fn is_import(oi: usize, si: u32) bool {
+    let gi = global_of(oi, si);
+    return (gi >= 0) and (gsyms.at(@int_cast(usize, gi)).obj < 0) and not gsyms.at(@int_cast(usize, gi)).weak;
+}
+
+fn sym_addr_in(oi: usize, si: u32) u64 {
+    let s = objs.get(oi).syms.at(@as(usize, si));
+    if s.sec < 0 {
+        return 0;
+    }
+    return sec_addr.get(oi)[@as(usize, @bit_cast(u32, s.sec))] + s.value;
+}
+
+// A symbol's address; an imported function's is its thunk's.
+fn sym_addr(oi: usize, si: u32) u64 {
+    let gi = global_of(oi, si);
+    if gi < 0 {
+        return sym_addr_in(oi, si);
+    }
+    let g = gsyms.at(@int_cast(usize, gi));
+    if g.weak and (g.obj < 0) {
+        return 0;  // (an absolute 0 has no base relocation: see abs_at)
+    }
+    if g.obj < 0 {
+        return thunk_addr + (@as(u64, @bit_cast(u32, g.thunk)) * 8);
+    }
+    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+}
+
+fn global_addr(name: []u8) u64 {
+    let g = gsyms.at(@as(usize, gsym_index(name)));
+    if g.obj < 0 {
+        return 0;
+    }
+    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+}
+
+fn got_slot(oi: usize, si: u32) i32 {
+    let gi = global_of(oi, si);
+    if gi >= 0 {
+        let g = gsyms.at(@int_cast(usize, gi));
+        if g.got < 0 {
+            got_obj.push(@int_cast(u32, oi));
+            got_sym.push(si);
+            g.got = @int_cast(i32, got_sym.len - 1);
+        }
+        return g.got;
+    }
+    let lg = local_got.get(oi);
+    if lg[@as(usize, si)] == 0 {
+        got_obj.push(@int_cast(u32, oi));
+        got_sym.push(si);
+        lg[@as(usize, si)] = @int_cast(i32, got_sym.len);
+    }
+    return lg[@as(usize, si)] - 1;
+}
+
+fn add_import(gi: u32) void {
+    let g = gsyms.at(@as(usize, gi));
+    if g.thunk >= 0 {
+        return;
+    }
+    g.thunk = @int_cast(i32, imports.len);
+    imports.push(gi);
+    let dn = dll_of(g.name);
+    for k in 0..dlls.len {
+        if u.str_eq(dlls.get(k).name, dn) {
+            dlls.at(k).funcs.push(gi);
+            return;
+        }
+    }
+    let mut d = Dll.{ name: dn, funcs: u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 } };
+    d.funcs.push(gi);
+    dlls.push(d);
+}
+
+// Imports, and GOT slots that loads through the GOT need (a load of an
+// imported function's address reads its import address table slot instead).
+fn scan_relocs() void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            for r in s.relocs.items() {
+                if is_import(oi, r.sym) {
+                    add_import(@bit_cast(u32, global_of(oi, r.sym)));
+                } else if is_got_reloc(r.ty) {
+                    _ = got_slot(oi, r.sym);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Layout
+// -----------------------------------------------------------------------------
+fn place(cls: i32, at: u64) u64 {
+    let mut cur = at;
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            if sec_cls.get(oi)[k] != cls {
+                continue;
+            }
+            let s = o.secs.get(k);
+            cur = align_up(cur, s.align);
+            sec_addr.get(oi)[k] = cur;
+            cur += elf.sec_size(s);
+        }
+    }
+    return cur;
+}
+
+fn class_align(cls: i32) u64 {
+    let mut a: u64 = 1;
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            if (sec_cls.get(oi)[k] == cls) and (o.secs.get(k).align > a) {
+                a = o.secs.get(k).align;
+            }
+        }
+    }
+    return a;
+}
+
+let mut outs: [5]Out = [Out.{ name: "", rva: 0, vsize: 0, fsize: 0, foff: 0, flags: 0 }; 5];
+
+// The file offset of an image address (in a section's file data).
+fn file_of(addr: u64) u64 {
+    let rva = addr - BASE;
+    for o in outs {
+        if (rva >= o.rva) and (rva < (o.rva + o.fsize)) {
+            return o.foff + (rva - o.rva);
+        }
+    }
+    err("internal: an address outside the file's data");
+    return 0;
+}
+
+fn copy_class(b: []mut u8, cls: i32) void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            if sec_cls.get(oi)[k] != cls {
+                continue;
+            }
+            let d = o.secs.get(k).data.view();
+            if d.len == 0 {
+                continue;
+            }
+            let fo = @truncate(usize, file_of(sec_addr.get(oi)[k]));
+            for i in 0..d.len {
+                b[fo + i] = d[i];
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Relocation
+// -----------------------------------------------------------------------------
+fn w16(b: []mut u8, off: u64, x: u64) void {
+    let o = @truncate(usize, off);
+    b[o] = @truncate(u8, x);
+    b[o + 1] = @truncate(u8, x >> 8);
+}
+
+fn w32(b: []mut u8, off: u64, x: u64) void {
+    let o = @truncate(usize, off);
+    for k in @as(usize, 0)..4 {
+        b[o + k] = @truncate(u8, x >> @as(u64, k * 8));
+    }
+}
+
+fn w64(b: []mut u8, off: u64, x: u64) void {
+    w32(b, off, x & 0xFFFF_FFFF);
+    w32(b, off + 4, x >> 32);
+}
+
+// An absolute address at addr: the loader adds the image's displacement.
+fn abs_at(b: []mut u8, addr: u64, value: u64) void {
+    w64(b, file_of(addr), value);
+    if value != 0 {
+        relocs.push(addr - BASE);
+    }
+}
+
+fn rel32(b: []mut u8, p: u64, target: u64) void {
+    let v = @bit_cast(i64, target) - @bit_cast(i64, p);
+    if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
+        err("relocation out of range (pc32)");
+    }
+    w32(b, file_of(p), @bit_cast(u64, v) & 0xFFFF_FFFF);
+}
+
+fn apply_relocs(b: []mut u8) void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            let cls = sec_cls.get(oi)[k];
+            if (cls == C_BSS) or (cls == C_TBSS) {
+                continue;
+            }
+            let base = sec_addr.get(oi)[k];
+            for r in s.relocs.items() {
+                let p = base + r.off;
+                let t = r.ty;
+                let sa = sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend);
+                if is_got_reloc(t) {
+                    if is_import(oi, r.sym) {
+                        // the import address table slot holds the address
+                        let g = gsyms.at(@as(usize, @bit_cast(u32, global_of(oi, r.sym))));
+                        rel32(b, p, iat_slot.get(@as(usize, @bit_cast(u32, g.thunk))) +% @bit_cast(u64, r.addend));
+                        continue;
+                    }
+                    let fo = file_of(p);
+                    if (t == elf.R_X86_64_REX_GOTPCRELX) and (fo >= 2) and (b[@truncate(usize, fo - 2)] == 0x8b) {
+                        // mov reg, [rip+GOT] -> lea reg, [rip+sym]
+                        b[@truncate(usize, fo - 2)] = 0x8d;
+                        rel32(b, p, sa);
+                        continue;
+                    }
+                    let ga = got_addr + (@as(u64, @bit_cast(u32, got_slot(oi, r.sym))) * 8);
+                    rel32(b, p, ga +% @bit_cast(u64, r.addend));
+                    continue;
+                }
+                if t == elf.R_X86_64_64 {
+                    abs_at(b, p, sa);
+                } else if is_call_reloc(t) {
+                    rel32(b, p, sa);
+                } else if t == elf.R_X86_64_TPOFF32 {
+                    // the offset in the thread's copy of the template
+                    let v = @bit_cast(i64, sa -% tls_addr);
+                    if (v < 0) or (v > 0x7fff_ffff) {
+                        err("thread-local offset out of range");
+                    }
+                    w32(b, file_of(p), @bit_cast(u64, v));
+                } else {
+                    err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The linker's own object: the entry point, the thread-local index, the TLS
+// callback list (empty) and the TLS directory (filled in at the end).
+// -----------------------------------------------------------------------------
+let mut own_tls_dir: u32 = 0;
+
+fn own_object() *mut elf.Obj {
+    let o = elf.new_obj(elf.EM_X86_64);
+    let text = elf.add_sec(o, ".text", elf.S_TEXT, 16);
+    let data = elf.add_sec(o, ".data", elf.S_DATA, 8);
+    let rodata = elf.add_sec(o, ".rdata", elf.S_RODATA, 8);
+    let ds = o.secs.get(@int_cast(usize, data));
+    ds.data.zeros(16);  // axiom.tls_index (u32), the callback list's NULL
+    _ = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_index", sec: data, value: 0, size: 4, bind: elf.B_GLOBAL,
+                                 ty: elf.T_OBJECT, hidden: true });
+    let rs = o.secs.get(@int_cast(usize, rodata));
+    rs.data.zeros(40);  // IMAGE_TLS_DIRECTORY64
+    own_tls_dir = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_directory", sec: rodata, value: 0, size: 40,
+                                           bind: elf.B_GLOBAL, ty: elf.T_OBJECT, hidden: true });
+    let main_ = elf.ext_sym(o, "main", false);
+    let exitp = elf.ext_sym(o, "ExitProcess", false);
+    let ts = o.secs.get(@int_cast(usize, text));
+    let entry: [22]u8 = [0x48, 0x83, 0xec, 0x28,  // sub rsp, 40 (shadow space; aligned)
+                         0x31, 0xc9,              // xor ecx, ecx
+                         0x31, 0xd2,              // xor edx, edx
+                         0xe8, 0, 0, 0, 0,        // call main
+                         0x89, 0xc1,              // mov ecx, eax
+                         0xe8, 0, 0, 0, 0,        // call ExitProcess
+                         0xcc, 0xcc];
+    ts.data.put(entry[..]);
+    ts.relocs.push(elf.Rel.{ off: 9, ty: elf.R_X86_64_PLT32, sym: main_, addend: -4 });
+    ts.relocs.push(elf.Rel.{ off: 16, ty: elf.R_X86_64_PLT32, sym: exitp, addend: -4 });
+    _ = elf.add_sym(o, elf.Sym.{ name: "axiom.entry", sec: text, value: 0, size: 22, bind: elf.B_GLOBAL, ty: elf.T_FUNC,
+                                 hidden: true });
+    return o;
+}
+
+// -----------------------------------------------------------------------------
+// Tables
+// -----------------------------------------------------------------------------
+
+// The .idata section at rva: descriptors, then per DLL its lookup table, its
+// address table and names. Sets iat_addr and iat_slot; returns the bytes.
+fn import_section(rva: u64) bn.Bytes {
+    let ndll = @as(u64, dlls.len);
+    let nimp = @as(u64, imports.len);
+    let desc_size = (ndll + 1) * 20;
+    let ilt_at = align_up(desc_size, 8);
+    let table_size = (nimp + ndll) * 8;  // each DLL's list ends in a NULL
+    let iat_at = ilt_at + table_size;
+    let names_at = iat_at + table_size;
+    iat_addr = BASE + rva + iat_at;
+    for _k in 0..imports.len {
+        iat_slot.push(0);
+    }
+    // hint/name entries and DLL names
+    let mut names = bn.new_bytes();
+    let hint_name = u.newn.[u64](imports.len + 1);
+    let dll_name = u.newn.[u64](dlls.len + 1);
+    for d in 0..dlls.len {
+        let dl = dlls.get(d);
+        for gi in dl.funcs.items() {
+            let g = gsyms.get(@as(usize, gi));
+            names.align(2);
+            hint_name[@as(usize, @bit_cast(u32, g.thunk))] = rva + names_at + @as(u64, names.len());
+            names.u16_(0);
+            names.put(g.name);
+            names.u8_(0);
+        }
+        names.align(2);
+        dll_name[d] = rva + names_at + @as(u64, names.len());
+        names.put(dl.name);
+        names.u8_(0);
+    }
+    let mut b = bn.new_bytes();
+    let mut slot: u64 = 0;
+    for d in 0..dlls.len {
+        let dl = dlls.get(d);
+        b.u32_(rva + ilt_at + (slot * 8));  // OriginalFirstThunk
+        b.u32_(0);
+        b.u32_(0);
+        b.u32_(dll_name[d]);
+        b.u32_(rva + iat_at + (slot * 8));  // FirstThunk
+        slot += @as(u64, dl.funcs.len) + 1;
+    }
+    b.zeros(20);
+    b.align(8);
+    // the lookup table, then the address table (the same until bound)
+    for pass in @as(usize, 0)..2 {
+        for d in 0..dlls.len {
+            for gi in dlls.at(d).funcs.items() {
+                let th = @as(usize, @bit_cast(u32, gsyms.get(@as(usize, gi)).thunk));
+                if pass == 1 {
+                    iat_slot.items()[th] = BASE + rva + @as(u64, b.len());
+                }
+                b.u64_(hint_name[th]);
+            }
+            b.u64_(0);
+        }
+    }
+    b.put(names.view());
+    return b;
+}
+
+// The base relocation table: blocks of 4 KiB pages, each entry a 12-bit
+// offset with type 10 (DIR64).
+fn reloc_section() bn.Bytes {
+    let n = relocs.len;
+    let rs = relocs.items();
+    // sort (insertion sort over nearly sorted data)
+    for i in @as(usize, 1)..n {
+        let x = rs[i];
+        let mut j = i;
+        while (j > 0) and (rs[j - 1] > x) {
+            rs[j] = rs[j - 1];
+            j -= 1;
+        }
+        rs[j] = x;
+    }
+    let mut b = bn.new_bytes();
+    let mut i: usize = 0;
+    while i < n {
+        let page = rs[i] & ~@as(u64, 0xfff);
+        let mut j = i;
+        while (j < n) and ((rs[j] & ~@as(u64, 0xfff)) == page) {
+            j += 1;
+        }
+        let mut count = @as(u64, j - i);
+        if (count & 1) != 0 {
+            count += 1;  // pad the block to 4 bytes
+        }
+        b.u32_(page);
+        b.u32_(8 + (count * 2));
+        for k in i..j {
+            b.u16_(0xa000 | (rs[k] & 0xfff));
+        }
+        if ((j - i) & 1) != 0 {
+            b.u16_(0);
+        }
+        i = j;
+    }
+    return b;
+}
+
+fn name8(h: *mut bn.Bytes, s: []u8) void {
+    for i in @as(usize, 0)..8 {
+        if i < s.len {
+            h.u8_(s[i]);
+        } else {
+            h.u8_(0);
+        }
+    }
+}
+
+// Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
+pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
+    for i in 0..inputs.len {
+        objs.push(inputs[i]);
+    }
+    objs.push(own_object());
+    collect_symbols();
+    if gsyms.at(@as(usize, gsym_index("main"))).obj < 0 {
+        err("no 'main' function");
+    }
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        let cls = u.newn.[i32](o.secs.len + 1);
+        for k in 0..o.secs.len {
+            cls[k] = class_of(o.secs.get(k));
+        }
+        sec_cls.push(cls);
+        sec_addr.push(u.newn.[u64](o.secs.len + 1));
+        local_got.push(u.newn.[i32](o.syms.len + 1));
+    }
+    scan_relocs();
+    add_import(gsym_index("ExitProcess"));
+    if errors != 0 {
+        return 1;
+    }
+    let nsec: u64 = 5;
+    let headers = align_up(0x40 + 4 + 20 + 240 + (nsec * 40), FILEAL);
+
+    // .text: code, then the import thunks
+    let text_rva = align_up(headers, SECT);
+    let code_end = place(C_TEXT, BASE + text_rva);
+    thunk_addr = align_up(code_end, 8);
+    let text_end = thunk_addr + (@as(u64, imports.len) * 8);
+    // .rdata
+    let rdata_rva = align_up(text_end - BASE, SECT);
+    let rdata_end = place(C_CONST, BASE + rdata_rva);
+    // .idata
+    let idata_rva = align_up(rdata_end - BASE, SECT);
+    let mut idata = import_section(idata_rva);
+    // .data: data, the GOT, the thread-local template, then .bss
+    let data_rva = align_up(idata_rva + @as(u64, idata.len()), SECT);
+    let mut cur = place(C_DATA, BASE + data_rva);
+    got_addr = align_up(cur, 8);
+    cur = got_addr + (@as(u64, got_sym.len) * 8);
+    let tls_align = @max(@max(class_align(C_TDATA), class_align(C_TBSS)), 16);
+    tls_addr = align_up(cur, tls_align);
+    let tdata_end = place(C_TDATA, tls_addr);
+    let tbss_start = align_up(tdata_end, class_align(C_TBSS));
+    let tls_end = place(C_TBSS, tbss_start);  // (an address range only: the loader zero-fills it per thread)
+    let data_file_end = tdata_end;
+    let bss_end = place(C_BSS, align_up(tls_end, class_align(C_BSS)));
+
+    outs[0] = Out.{ name: ".text", rva: text_rva, vsize: text_end - (BASE + text_rva), fsize: 0, foff: 0,
+                    flags: 0x6000_0020 };
+    outs[1] = Out.{ name: ".rdata", rva: rdata_rva, vsize: rdata_end - (BASE + rdata_rva), fsize: 0, foff: 0,
+                    flags: 0x4000_0040 };
+    outs[2] = Out.{ name: ".idata", rva: idata_rva, vsize: @as(u64, idata.len()), fsize: 0, foff: 0,
+                    flags: 0xc000_0040 };
+    outs[3] = Out.{ name: ".data", rva: data_rva, vsize: bss_end - (BASE + data_rva), fsize: 0, foff: 0,
+                    flags: 0xc000_0040 };
+    outs[0].fsize = outs[0].vsize;
+    outs[1].fsize = outs[1].vsize;
+    outs[2].fsize = outs[2].vsize;
+    outs[3].fsize = data_file_end - (BASE + data_rva);
+    let mut foff = headers;
+    for k in @as(usize, 0)..4 {
+        outs[k].foff = foff;
+        foff += align_up(outs[k].fsize, FILEAL);
+    }
+
+    // the file, without .reloc
+    let mut f = bn.new_bytes();
+    f.zeros(@truncate(usize, foff));
+    let b = f.view();
+    copy_class(b, C_TEXT);
+    copy_class(b, C_CONST);
+    copy_class(b, C_DATA);
+    copy_class(b, C_TDATA);
+    let iv = idata.view();
+    for i in 0..iv.len {
+        b[@truncate(usize, outs[2].foff) + i] = iv[i];
+    }
+    // the import address table holds addresses only once bound: base
+    // relocations do not apply to it
+    // thunks: jmp [rip + slot]
+    for k in 0..imports.len {
+        let at = thunk_addr + (@as(u64, k) * 8);
+        let fo = @truncate(usize, file_of(at));
+        b[fo] = 0xff;
+        b[fo + 1] = 0x25;
+        rel32(b, at + 2, iat_slot.get(k) - 4);
+        b[fo + 6] = 0xcc;
+        b[fo + 7] = 0xcc;
+    }
+    // GOT slots: the addresses of our own symbols
+    for k in 0..got_sym.len {
+        abs_at(b, got_addr + (@as(u64, k) * 8), sym_addr(@as(usize, got_obj.get(k)), got_sym.get(k)));
+    }
+    apply_relocs(b);
+    // the TLS directory: the template, the index's address, the (empty)
+    // callback list, the zero fill, the alignment
+    let own = objs.len - 1;
+    let dir = sym_addr_in(own, own_tls_dir);
+    let tls_index = global_addr("axiom.tls_index");
+    abs_at(b, dir, tls_addr);
+    abs_at(b, dir + 8, tdata_end);
+    abs_at(b, dir + 16, tls_index);
+    abs_at(b, dir + 24, tls_index + 8);
+    w32(b, file_of(dir + 32), tls_end - tdata_end);
+    let mut al_bits: u64 = 1;
+    while (@as(u64, 1) << (al_bits - 1)) < tls_align {
+        al_bits += 1;
+    }
+    w32(b, file_of(dir + 36), al_bits << 20);
+    if errors != 0 {
+        return 1;
+    }
+    let mut rel = reloc_section();
+    let reloc_rva = align_up(data_rva + outs[3].vsize, SECT);
+    outs[4] = Out.{ name: ".reloc", rva: reloc_rva, vsize: @as(u64, rel.len()), fsize: @as(u64, rel.len()), foff: foff,
+                    flags: 0x4200_0040 };
+    f.put(rel.view());
+    f.zeros(@truncate(usize, align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
+    let image_size = align_up(reloc_rva + outs[4].vsize, SECT);
+
+    // headers
+    let mut h = bn.new_bytes();
+    h.u8_('M');
+    h.u8_('Z');
+    h.zeros(0x3a);
+    h.u32_(0x40);  // e_lfanew
+    h.u8_('P');
+    h.u8_('E');
+    h.u16_(0);
+    // COFF file header
+    h.u16_(0x8664);
+    h.u16_(nsec);
+    h.u32_(0);  // TimeDateStamp (deterministic builds)
+    h.u32_(0);
+    h.u32_(0);
+    h.u16_(240);     // SizeOfOptionalHeader
+    h.u16_(0x0022);  // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    // optional header (PE32+)
+    h.u16_(0x20b);
+    h.u8_(14);
+    h.u8_(0);
+    h.u32_(align_up(outs[0].vsize, FILEAL));  // SizeOfCode
+    h.u32_(align_up(outs[1].fsize, FILEAL) + align_up(outs[2].fsize, FILEAL) + align_up(outs[3].fsize, FILEAL));  // initialized
+    h.u32_(bss_end - data_file_end);  // uninitialized
+    h.u32_(global_addr("axiom.entry") - BASE);
+    h.u32_(text_rva);  // BaseOfCode
+    h.u64_(BASE);
+    h.u32_(SECT);
+    h.u32_(FILEAL);
+    h.u16_(6);  // operating system version
+    h.u16_(0);
+    h.u16_(0);  // image version
+    h.u16_(0);
+    h.u16_(6);  // subsystem version
+    h.u16_(0);
+    h.u32_(0);
+    h.u32_(image_size);
+    h.u32_(headers);
+    h.u32_(0);       // CheckSum
+    h.u16_(3);       // IMAGE_SUBSYSTEM_WINDOWS_CUI
+    h.u16_(0x8160);  // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+    h.u64_(STACK_RESERVE);
+    h.u64_(0x10000);  // stack commit
+    h.u64_(0x10_0000);
+    h.u64_(0x1000);
+    h.u32_(0);
+    h.u32_(16);
+    // data directories
+    let ndll = @as(u64, dlls.len);
+    for d in @as(u64, 0)..16 {
+        if d == 1 {
+            h.u32_(idata_rva);
+            h.u32_((ndll + 1) * 20);
+        } else if d == 5 {
+            h.u32_(reloc_rva);
+            h.u32_(outs[4].vsize);
+        } else if d == 9 {
+            h.u32_(dir - BASE);
+            h.u32_(40);
+        } else if d == 12 {
+            h.u32_(iat_addr - BASE);
+            h.u32_((@as(u64, imports.len) + ndll) * 8);
+        } else {
+            h.u32_(0);
+            h.u32_(0);
+        }
+    }
+    for o in outs {
+        name8(&mut h, o.name);
+        h.u32_(o.vsize);
+        h.u32_(o.rva);
+        h.u32_(align_up(o.fsize, FILEAL));
+        if o.fsize == 0 {
+            h.u32_(0);
+        } else {
+            h.u32_(o.foff);
+        }
+        h.u32_(0);
+        h.u32_(0);
+        h.u16_(0);
+        h.u16_(0);
+        h.u32_(o.flags);
+    }
+    let fv = f.view();
+    let hv = h.view();
+    for i in 0..hv.len {
+        fv[i] = hv[i];
+    }
+    if not u.write_file(out, fv) {
+        err(u.f1("cannot write %s", out));
+        return 1;
+    }
+    _ = u.chmod(u.cz(out), 0o755);
+    return 0;
+}

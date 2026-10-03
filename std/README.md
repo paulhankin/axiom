@@ -296,6 +296,7 @@ They call a small set of host functions imported from module `"axiom"`:
 | `ax_argc() i32`, `ax_arg(i, buf, cap) isize` | the program's arguments (argument 0 is its name); returns the length |
 | `ax_getenv(name, len, buf, cap) isize` | an environment variable; `-2` if unset |
 | `ax_exit(code)` | ends the process |
+| `ax_os() i32` | the operating system: `1` Linux, `2` macOS, `3` Windows, `0` another (or none) |
 | `ax_tcp_connect(name, len, port) i32`, `ax_tcp_listen(name, len, port) i32` | return a socket handle |
 | `ax_tcp_accept(h) i32`, `ax_tcp_local_port(h) i32` | |
 | `ax_sock_read(h, p, n) isize`, `ax_sock_write(h, p, n) isize`, `ax_sock_close(h)` | |

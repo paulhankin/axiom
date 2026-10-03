@@ -1,0 +1,283 @@
+// =============================================================================
+// File: pi.ax
+// Computes π to 2000 decimal places with Machin's formula and sets them on
+// an A4 PDF page: how they were computed, in typeset mathematics, then the
+// digits in fixed-width columns.
+//
+//   axiom build examples/pi.ax --target=native -O2 -o pi
+//   ./pi pi.pdf                      (run from the repository's root)
+//   ./pi -f STIXTwoMath-Regular.otf -n 1500 pi.pdf
+//
+// The default font is the STIX Two Math subset in std/text/math/testdata;
+// its digits are tabular (all one width), which lines the columns up.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/compress/xz" as xz;
+import "std/fmt" as fmt;
+import "std/graphics/color" as color;
+import "std/graphics/font" as font;
+import "std/graphics/pdf" as pdf;
+import "std/io" as io;
+import "std/math/bigint" as big;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/str" as strs;
+import "std/text/math" as math;
+import "std/text/math/typeset" as typeset;
+
+let DEFAULT_FONT: []u8 = "std/text/math/testdata/STIXTwoMath-subset.ttf.xz";
+
+const GUARD: u64 = 10;  // extra digits, for the rounding of the series' terms
+
+// -----------------------------------------------------------------------------
+// π
+// -----------------------------------------------------------------------------
+
+// arctan(1/x) · scale = Σ (-1)^k · scale / ((2k+1) · x^(2k+1)), in integers:
+// the power term scale / x^(2k+1) is divided down by x² as k grows. Each
+// division truncates, so the result is short by at most one unit per term.
+// Returns the sum; *terms is how many terms it took.
+fn arctan_inv(x: i64, scale: *big.BigInt, terms: *mut u64) !big.BigInt {
+    let mut sum = big.BigInt.init();
+    let mut power = big.BigInt.init();
+    let mut t = big.BigInt.init();
+    let mut next = big.BigInt.init();
+    let mut d = big.BigInt.init();
+    defer power.deinit();
+    defer t.deinit();
+    defer next.deinit();
+    defer d.deinit();
+    let xb = big.BigInt.from_i64(x)!;
+    let x2 = big.BigInt.from_i64(x * x)!;
+    power.quo(scale, &xb)!;  // scale / x
+    let mut k: i64 = 0;
+    while not power.is_zero() {
+        d.set_i64((2 * k) + 1)!;
+        t.quo(&power, &d)!;
+        if (k % 2) == 0 {
+            next.add(&sum, &t)!;
+        } else {
+            next.sub(&sum, &t)!;
+        }
+        sum.set(&next)!;
+        next.quo(&power, &x2)!;
+        power.set(&next)!;
+        k += 1;
+    }
+    terms.* = @bit_cast(u64, k);
+    return sum;
+}
+
+// π to `places` decimal places as digits ("31415..."), truncated: Machin's
+// π = 16·arctan(1/5) − 4·arctan(1/239) with GUARD extra digits.
+fn pi_digits(places: u64, terms5: *mut u64, terms239: *mut u64) ![]mut u8 {
+    let mut scale = big.BigInt.init();
+    defer scale.deinit();
+    let ten = big.BigInt.from_i64(10)!;
+    scale.pow(&ten, places + GUARD)!;
+    let mut a = arctan_inv(5, &scale, terms5)!;
+    defer a.deinit();
+    let mut b = arctan_inv(239, &scale, terms239)!;
+    defer b.deinit();
+    let mut a16 = big.BigInt.init();
+    defer a16.deinit();
+    a16.mul_i64(&a, 16)!;
+    let mut b4 = big.BigInt.init();
+    defer b4.deinit();
+    b4.mul_i64(&b, 4)!;
+    let mut p = big.BigInt.init();
+    defer p.deinit();
+    p.sub(&a16, &b4)!;
+    let mut g = big.BigInt.init();
+    defer g.deinit();
+    g.pow(&ten, GUARD)!;
+    let mut q = big.BigInt.init();
+    defer q.deinit();
+    q.quo(&p, &g)!;  // drop the guard digits
+    return q.to_string(10);
+}
+
+// -----------------------------------------------------------------------------
+// The page
+// -----------------------------------------------------------------------------
+
+const MARGIN: f64 = 56.0;  // points (about 20 mm)
+fn black() color.Color {
+    return color.Color.rgb(0.0, 0.0, 0.0);
+}
+
+fn grey() color.Color {
+    return color.Color.rgb(0.22, 0.22, 0.22);
+}
+
+// A formula typeset at `size`, its left edge at x and the top of its box at
+// *y, which moves below it (with `gap` after). Centred when x < 0.
+fn formula(page: *mut pdf.Page, fnt: *font.Font, tex: []u8, size: f64, x: f64, y: *mut f64, gap: f64,
+           display: math.Display) !void {
+    formula_in(page, fnt, tex, size, x, y, gap, display, black())!;
+}
+
+fn formula_in(page: *mut pdf.Page, fnt: *font.Font, tex: []u8, size: f64, x: f64, y: *mut f64, gap: f64,
+              display: math.Display, c: color.Color) !void {
+    let mut f = math.parse(tex)!;
+    defer f.deinit();
+    let mut t = typeset.typeset(&f, fnt, size, display)!;
+    defer t.deinit();
+    let w = t.right - t.left;
+    let mut left = x;
+    if x < 0.0 {
+        left = (pdf.A4_WIDTH - w) / 2.0;
+    }
+    t.draw_pdf(page, left - t.left, y.* + t.top, c)!;
+    y.* += t.top + t.bottom + gap;
+}
+
+// A paragraph line in grey, below *y (which moves below it).
+fn para(page: *mut pdf.Page, fnt: *font.Font, y: *mut f64, s: []u8) !void {
+    y.* += 10.0;
+    page.text(fnt, 10.0, MARGIN, y.*, s, grey())!;
+    y.* += 9.0;
+}
+
+// A line of text, its baseline at y.
+fn line(page: *mut pdf.Page, fnt: *font.Font, size: f64, x: f64, y: f64, s: []u8, c: color.Color) !void {
+    page.text(fnt, size, x, y, s, c)!;
+}
+
+fn font_data(path: []u8) ![]mut u8 {
+    let data = fs.read_file(path)!;
+    if not strs.ends_with(path, ".xz") {
+        return data;
+    }
+    defer mem.free(data);
+    return xz.decompress(data, 64000000);
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("pi", "Compute π and set its digits on an A4 PDF page.");
+    defer p.deinit();
+    p.option("font", 'f', "FILE", "the font (.otf, .ttf, or .xz of one); a math font sets the formulas best")!;
+    p.option("places", 'n', "N", "decimal places (default 2000, at most 2000 on one page)")!;
+    p.flag("print", 'p', "also print the digits")!;
+    p.positional("OUT", "the PDF to write", cli.Arity.REQUIRED)!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("pi: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    let n = m.int("places", 2000)!;
+    if (n < 50) or (n > 2000) or ((n % 50) != 0) {
+        io.stderr().println("pi: --places must be a multiple of 50 from 50 to 2000")!;
+        return 2;
+    }
+    let places = @bit_cast(u64, n);
+    let mut terms5: u64 = 0;
+    let mut terms239: u64 = 0;
+    let digits = pi_digits(places, &mut terms5, &mut terms239)!;
+    defer mem.free(digits);
+
+    if m.has("print") {
+        io.stdout().print("3.")!;
+        io.stdout().println(digits[1..])!;
+    }
+    let data = font_data(m.get("font", DEFAULT_FONT))!;
+    defer mem.free(data);
+    let mut fnt = font.Font.init(data)!;
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    let mut title = strs.String.init();
+    defer title.deinit();
+    fmt.write(title.writer(), "π to {} decimal places", [fmt.int(places)])!;
+    doc.set_info("Title", title.bytes())!;
+    let mut page = doc.page(pdf.A4_WIDTH, pdf.A4_HEIGHT)!;
+    defer page.deinit();
+
+    // the title, and how the digits were found
+    let mut y = MARGIN;
+    let mut tex = strs.String.init();
+    defer tex.deinit();
+    fmt.write(tex.writer(), "\\pi \\text{{ to {} decimal places}}", [fmt.int(places)])!;
+    formula(&mut page, &fnt, tex.bytes(), 22.0, -1.0, &mut y, 10.0, math.Display.BLOCK)!;
+    para(&mut page, &fnt, &mut y, "Machin’s formula (1706) reduces π to two arctangents of small fractions,")!;
+    formula(&mut page, &fnt, "\\frac{\\pi}{4} = 4\\arctan\\frac{1}{5} - \\arctan\\frac{1}{239}", 15.0, -1.0, &mut y,
+            8.0, math.Display.BLOCK)!;
+    para(&mut page, &fnt, &mut y,
+         "and each arctangent is Gregory’s series, whose terms shrink fast when x is 5 or more:")!;
+    formula(&mut page, &fnt, "\\arctan\\frac{1}{x} = \\sum_{k=0}^{\\infty} \\frac{(-1)^k}{(2k+1)\\,x^{2k+1}}", 15.0,
+            -1.0, &mut y, 8.0, math.Display.BLOCK)!;
+    let n_all = places + GUARD;
+    let mut ln = strs.String.init();
+    defer ln.deinit();
+    fmt.write(ln.writer(),
+              "\\text{{In whole numbers scaled by }}10^{{{}}}\\text{{, each term rounded down, the series stop after {} and {} terms:}}",
+              [fmt.int(n_all), fmt.int(terms5), fmt.int(terms239)])!;
+    y += 4.0;
+    formula_in(&mut page, &fnt, ln.bytes(), 10.0, MARGIN, &mut y, 9.0, math.Display.INLINE, grey())!;
+    tex.clear();
+    fmt.write(tex.writer(),
+              "\\pi \\cdot 10^{{{}}} \\approx 16\\sum_{{k=0}}^{{{}}} (-1)^k \\left\\lfloor \\frac{{10^{{{}}}}}{{(2k+1)\\,5^{{2k+1}}}} \\right\\rfloor - 4\\sum_{{k=0}}^{{{}}} (-1)^k \\left\\lfloor \\frac{{10^{{{}}}}}{{(2k+1)\\,239^{{2k+1}}}} \\right\\rfloor",
+              [fmt.int(n_all), fmt.int(terms5 - 1), fmt.int(n_all), fmt.int(terms239 - 1), fmt.int(n_all)])!;
+    formula(&mut page, &fnt, tex.bytes(), 11.0, -1.0, &mut y, 8.0, math.Display.BLOCK)!;
+    ln.clear();
+    fmt.write(ln.writer(),
+              "The roundings cost less than 16·{} + 4·{} units, well inside the {} guard digits that are then",
+              [fmt.int(terms5), fmt.int(terms239), fmt.int(GUARD)])!;
+    para(&mut page, &fnt, &mut y, ln.bytes())!;
+    y -= 6.0;
+    para(&mut page, &fnt, &mut y, "dropped. What is left:")!;
+    y += 12.0;
+
+    // the digits: "3." and rows of 50 in groups of 10, numbered at the right
+    let size: f64 = 10.0;
+    let adv = @float_from_int(f64, fnt.advance(fnt.glyph_index('0'))) * font.scale_for(&fnt, size);
+    let row_h = size * 1.27;
+    let lead = MARGIN + (adv * 2.0);  // after "3."
+    let group_gap = adv;
+    let row_w = (50.0 * adv) + (4.0 * group_gap);
+    let x0 = lead + ((pdf.A4_WIDTH - (2.0 * MARGIN) - (adv * 2.0) - row_w) / 2.0) - (adv * 3.0);
+    line(&mut page, &fnt, size, x0 - (adv * 2.0), y, "3.", black())!;
+    let ds = digits[1..];  // the decimal places
+    let mut row: usize = 0;
+    while (row * 50) < ds.len {
+        let r = ds[row * 50..@min((row + 1) * 50, ds.len)];
+        let mut x = x0;
+        let mut g: usize = 0;
+        while (g * 10) < r.len {
+            let grp = r[g * 10..@min((g + 1) * 10, r.len)];
+            line(&mut page, &fnt, size, x, y, grp, black())!;
+            x += (@float_from_int(f64, grp.len) * adv) + group_gap;
+            g += 1;
+        }
+        let mut num: [8]u8 = [0; 8];
+        let ns = fmt.bufprint(num[..], "{}", [fmt.int((row + 1) * 50)])!;
+        line(&mut page, &fnt, 7.0, x + (adv * 0.5), y - 0.5, ns, grey())!;
+        y += row_h;
+        row += 1;
+    }
+    doc.add_page(&mut page)!;
+    doc.save(m.get("OUT", "pi.pdf"))!;
+    fmt.print(
+        "π to {} places: {} terms of arctan(1/5), {} of arctan(1/239); wrote {}\n", [
+            fmt.int(places), fmt.int(terms5), fmt.int(terms239), fmt.str(m.get("OUT", "pi.pdf"))])!;
+    return 0;
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

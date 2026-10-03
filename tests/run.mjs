@@ -25,6 +25,10 @@ const argv = process.argv.slice(2);
 const native = argv.includes('--native');
 // Cross testing: AXIOM_NATIVE_TARGET=aarch64 AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
 const nativeTarget = `--target=${process.env.AXIOM_NATIVE_TARGET || 'native'}`;
+// Windows (AXIOM_NATIVE_TARGET=x86_64-windows AXIOM_NATIVE_EXEC=wine64) and
+// macOS link no C code: tests/native_rt.ax replaces tests/native_rt.c, and
+// tests that call C are skipped.
+const noC = /windows|macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '');
 const execWrap = (process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => x);
 // Emulated tests run several times slower: give each test a minute.
 const testTimeout = execWrap.length ? ['--timeout=60000'] : [];
@@ -104,9 +108,10 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   if (filter && !name.includes(filter)) continue;
   const d = directives(fs.readFileSync(f, 'utf8'));
   if ((native && d.wasmOnly) || (!native && d.nativeOnly)) { skip++; continue; }
+  if (native && noC && (d.links.length || /extern "C"/.test(fs.readFileSync(f, 'utf8')))) { skip++; continue; }
   const out = path.join(tmp, path.basename(f, '.ax') + (native ? '' : '.wasm'));
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
-  if (native) args.push(nativeTarget, `--link=${path.join(root, 'tests/native_rt.c')}`);
+  if (native) args.push(nativeTarget, `--link=${path.join(root, noC ? 'tests/native_rt.ax' : 'tests/native_rt.c')}`);
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
   if (d.header) args.push(`--emit-header=${path.join(tmp, d.header)}`);
   const t0 = process.hrtime.bigint();
@@ -243,7 +248,8 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 // Profiling (spec §16.6).
 {
   const name = 'tests/profile/hot.ax [axiom profile]';
-  if (!filter || name.includes(filter)) {
+  if (native && noC) skip++;  // (the profiler is Linux's for now)
+  else if (!filter || name.includes(filter)) {
     const folded = path.join(tmp, 'hot.folded');
     const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ax'), '--format=agent-json', `--folded=${folded}`,
       ...testTargets, ...extraFlags], { encoding: 'utf8' });
@@ -442,6 +448,75 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     const problem = fn();
     if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
     else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
+// Windows (spec §14.1; the self-hosted compiler only). Programs and the
+// compiler itself are cross-built for --target=x86_64-windows and their PE
+// headers checked; with Wine installed they also run (the whole suite runs
+// on Windows with AXIOM_NATIVE_TARGET=x86_64-windows AXIOM_NATIVE_EXEC=wine64).
+{
+  const out = (n) => path.join(tmp, `windows-${n}.exe`);
+  const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'windows-cache'), WINEDEBUG: process.env.WINEDEBUG || '-all' };
+  const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=x86_64-windows', '-o', out(n), ...extra],
+    { encoding: 'utf8', cwd: root, env });
+  const supported = !/unknown target/.test(build(path.join(root, 'examples/wordcount.ax'), 'probe').stderr);
+  const wine = ['wine64', 'wine', '/usr/lib/wine/wine64'].find((w) => spawnSync(w, ['--version'], { encoding: 'utf8' }).status === 0);
+  // The headers: MZ, PE, x86-64, a console program with ASLR, and its sections.
+  const checkPE = (f) => {
+    const d = fs.readFileSync(f);
+    if (d.readUInt16LE(0) !== 0x5a4d) return 'no MZ header';
+    const pe = d.readUInt32LE(0x3c);
+    if (d.readUInt32LE(pe) !== 0x4550 || d.readUInt16LE(pe + 4) !== 0x8664) return 'not a PE file for x86-64';
+    const opt = pe + 24;
+    if (d.readUInt16LE(opt) !== 0x20b || d.readUInt16LE(opt + 68) !== 3) return 'not a PE32+ console program';
+    if ((d.readUInt16LE(opt + 70) & 0x60) !== 0x60) return 'no (high-entropy) ASLR';
+    const names = [];
+    for (let k = 0; k < d.readUInt16LE(pe + 6); k++) names.push(d.toString('latin1', opt + 240 + 40 * k, opt + 248 + 40 * k).replace(/\0+$/, ''));
+    return names.join(' ') === '.text .rdata .idata .data .reloc' ? null : `sections ${names.join(' ')}`;
+  };
+  const run = (n, args = []) => spawnSync(wine, [out(n), ...args], { encoding: 'utf8', cwd: root, env });
+  const cases = {
+    'thread-locals and output': () => {
+      const src = path.join(tmp, 'windows-hello.ax');
+      fs.writeFileSync(src, 'import "std/io" as io;\n\nthreadlocal let mut tl: u64 = 41;\n\nexport fn main() i32 {\n' +
+        '    tl += 1;\n    io.stdout().println("hello") catch return 1;\n    return @int_cast(i32, tl) - 42;\n}\n');
+      const c = build(src, 'hello', ['-O2']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const p = checkPE(out('hello'));
+      if (p || !wine) return p;
+      const r = run('hello');
+      return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'pi to 2000 places': () => {
+      const c = build(path.join(root, 'examples/pi.ax'), 'pi', ['-O2']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const p = checkPE(out('pi'));
+      if (p || !wine) return p;
+      const r = run('pi', ['-p', '-n', '100', path.join(tmp, 'windows-pi.pdf')]);
+      const want = '3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679';
+      if (r.status !== 0 || !r.stdout.startsWith(want)) return `status ${r.status}: ${r.stdout}${r.stderr}`;
+      return fs.readFileSync(path.join(tmp, 'windows-pi.pdf')).subarray(0, 5).toString() === '%PDF-' ? null : 'no PDF';
+    },
+    'the compiler': () => {
+      const c = build(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const p = checkPE(out('axiom'));
+      if (p || !wine) return p;
+      // it builds a program that runs
+      const b = run('axiom', ['build', 'examples/wordcount.ax', '--std=std', '--target=x86_64-windows', '-o', out('wc')]);
+      if (b.status !== 0) return `the Windows compiler failed: ${b.stdout}${b.stderr}`;
+      const r = run('wc', ['README.md']);
+      return r.status === 0 ? null : `wordcount: status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+  };
+  for (const [cname, fn] of Object.entries(cases)) {
+    const name = `windows: ${cname}`;
+    if (filter && !name.includes(filter)) continue;
+    if (!supported) { skip++; continue; }
+    const problem = fn();
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}${wine ? '' : ' (not run: no Wine)'}`); }
   }
 }
 

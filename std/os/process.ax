@@ -510,6 +510,10 @@ pub fn run(argv: [][]u8) !Output {
 // -----------------------------------------------------------------------------
 
 test "running programs" {
+    if os.is_windows() {
+        running_programs_windows()!;
+        return;
+    }
     let argv: [3][]u8 = ["sh", "-c", "echo out; echo err >&2; exit 3"];
     let mut o = run(argv[..])!;
     defer o.deinit();
@@ -538,6 +542,10 @@ test "running programs" {
 }
 
 test "environment, directory and failures" {
+    if os.is_windows() {
+        environment_windows()!;
+        return;
+    }
     let mut c = Command.init("sh");
     defer c.deinit();
     let script: [2][]u8 = ["-c", "echo \"$AX_A|$AX_B|$HOME|$(pwd)\""];
@@ -569,6 +577,95 @@ test "environment, directory and failures" {
     let mut k = Command.init("sleep");
     defer k.deinit();
     k.arg("10")!;
+    let mut child = k.spawn()!;
+    @expect(not child.try_wait()!);
+    child.kill(os.SIGTERM)!;
+    let st = child.wait()!;
+    @expect((st.signal == os.SIGTERM) and not st.success());
+}
+
+// The tests above with cmd.exe (whose lines end in \r\n).
+fn running_programs_windows() !void {
+    let argv: [3][]u8 = ["cmd", "/c", "echo out&echo err>&2&exit 3"];
+    let mut o = run(argv[..])!;
+    defer o.deinit();
+    @expect_eq(o.stdout, "out\r\n");
+    @expect_eq(o.stderr, "err\r\n");
+    @expect((o.status.code == 3) and not o.status.success());
+    // a pipe both ways
+    let mut c = Command.init("cmd");
+    defer c.deinit();
+    let script: [3][]u8 = ["/v:on", "/c", "set /p x=&echo got !x!"];
+    c.args(script[..])!;
+    c.stdin(Stdio.PIPE);
+    c.stdout(Stdio.PIPE);
+    let mut child = c.spawn()!;
+    child.stdin.write_all("hello\r\n")!;
+    child.stdin.close();
+    let got = child.stdout.read_all()!;
+    defer mem.free(got);
+    @expect_eq(got, "got hello\r\n");
+    @expect(child.wait()!.success());
+    // lots of output on both streams at once does not deadlock
+    let mut name = strs.String.init();
+    defer name.deinit();
+    name.push_str("axiom-process-test-")!;
+    let mut nb: [24]u8 = [0; 24];
+    name.push_str(io.fmt_i64(nb[..], @as(i64, os.pid())))!;
+    name.push_str(".txt")!;
+    let mut f = io.create(name.bytes())!;
+    for i in @as(i64, 0)..3000 {
+        f.writer().print("line ")!;
+        f.writer().print(io.fmt_i64(nb[..], i))!;
+        f.writer().print("\r\n")!;
+    }
+    f.close();
+    let mut cmd = strs.String.init();
+    defer cmd.deinit();
+    cmd.push_str("type ")!;
+    cmd.push_str(name.bytes())!;
+    cmd.push_str("&type ")!;
+    cmd.push_str(name.bytes())!;
+    cmd.push_str(">&2&del ")!;
+    cmd.push_str(name.bytes())!;
+    let big: [3][]u8 = ["cmd", "/c", cmd.bytes()];
+    let mut b = run(big[..])!;
+    defer b.deinit();
+    @expect(strs.count(b.stdout, "\n") == 3000);
+    @expect(strs.count(b.stderr, "\n") == 3000);
+}
+
+fn environment_windows() !void {
+    let here = os.cwd()!;
+    defer mem.free(here);
+    let mut c = Command.init("cmd");
+    defer c.deinit();
+    let script: [3][]u8 = ["/v:on", "/c", "echo !AX_A!,!AX_B!,!CD!"];
+    c.args(script[..])!;
+    c.set_env("AX_A", "1")!;
+    c.set_env("AX_B", "x y")!;
+    c.set_env("AX_A", "2")!;
+    c.dir(here[0..3]);  // the drive's root
+    let mut o = c.output()!;
+    defer o.deinit();
+    let mut want = strs.String.init();
+    defer want.deinit();
+    want.push_str("2,x y,")!;
+    want.push(here[0])!;
+    want.push_str(":\\\r\n")!;
+    @expect_eq(o.stdout, want.bytes());
+    let nothing: [1][]u8 = ["/surely/no/such/program"];
+    @expect(fails(run(nothing[..]), error.NotFound));
+    let unnamed: [1][]u8 = ["surely-no-such-program-anywhere"];
+    @expect(fails(run(unnamed[..]), error.NotFound));
+    let bad: [2][]u8 = ["cmd", "a\x00b"];
+    @expect(fails(run(bad[..]), error.InvalidArgument));
+    // a killed child (waiting for a line that never comes)
+    let mut k = Command.init("cmd");
+    defer k.deinit();
+    let wait: [2][]u8 = ["/c", "set /p x="];
+    k.args(wait[..])!;
+    k.stdin(Stdio.PIPE);
     let mut child = k.spawn()!;
     @expect(not child.try_wait()!);
     child.kill(os.SIGTERM)!;

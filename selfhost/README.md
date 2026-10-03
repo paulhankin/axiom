@@ -56,7 +56,7 @@ compiler does (`../../std` from the executable, or `--std`, or `$AXIOM_STD`).
 ## Targets and processor extensions
 
 ```
---target=wasm32 | wasm64 | x86_64 | aarch64 | aarch64-macos | native      (default wasm32)
+--target=wasm32 | wasm64 | x86_64 | aarch64 | aarch64-macos | x86_64-windows | native   (default wasm32)
 --cpu=<preset>
 --features=+ext,-ext
 ```
@@ -64,7 +64,7 @@ compiler does (`../../std` from the executable, or `--std`, or `$AXIOM_STD`).
 | Target | `--cpu` presets | Extensions (`--features`) |
 |---|---|---|
 | wasm32, wasm64 | `mvp`, `generic` (default), `bleeding-edge` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
-| x86_64 | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16` |
+| x86_64, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16` |
 | aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `apple-m1`, `neoverse-n1`, `native` | `lse`, `rcpc`, `dotprod`, `cssc` |
 
 `--target=native` means this machine's architecture with `--cpu=native` (its extensions,
@@ -95,6 +95,23 @@ reserved (it already was). Not yet: `axiom test` and `axiom profile` for this ta
 and linking C code or `-l` libraries. The Mac output has been checked structurally
 (`tests/macho.mjs`) but not yet run on a Mac (issue 0011).
 
+`--target=x86_64-windows` (also `x86_64-pc-windows-msvc` or `windows`) builds a PE32+
+console executable for Windows 10 or later, from any host: position independent (base
+relocations), importing what the runtime calls from `kernel32`, `ntdll`, `ws2_32` and
+`bcrypt`; no C runtime. Every function uses the Windows x64 calling convention:
+arguments by position in `rcx`, `rdx`, `r8`, `r9` or `xmm0`-`xmm3`, then on the stack
+above 32 bytes of shadow space; `rsi`, `rdi` and `xmm6`-`xmm15` are callee-saved (the
+latter saved below the pushed registers). Thread-locals are the image's TLS directory,
+found through `gs:[0x58]` and `_tls_index`. On Linux, `axiom test` runs Windows tests
+under Wine (`wine64` on the `PATH`), and so does the test suite:
+
+```
+$ WINEDEBUG=-all AXIOM=selfhost/build/axiom AXIOM_NATIVE_TARGET=x86_64-windows \
+  AXIOM_NATIVE_EXEC=wine64 node tests/run.mjs --native
+```
+
+Not yet: `axiom profile` for Windows, and linking C code or `-l` libraries (issue 0012).
+
 ## How code is generated
 
 | Module | What |
@@ -118,6 +135,7 @@ and linking C code or `-l` libraries. The Mac output has been checked structural
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
 | `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes, rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
+| `plink.ax` | The PE linker for `x86_64-windows`: the same ELF objects in `.text`, `.rdata`, `.idata`, `.data` and `.reloc` sections; the import directory (each Windows function's DLL from its name), thunks, a GOT for our own symbols, base relocations, the TLS directory and the entry point |
 | `lstub.ax` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ax` | Architectures, CPU presets, extensions, host detection |
 | `backend.ax` | Lowering, optimization and the target's code generator |
@@ -134,6 +152,12 @@ On macOS `runtime/darwin.ax` replaces `linux.ax` and `native.ax`: the same host 
 numbers to the Linux values the ABI uses, with `kqueue` for file watching and
 `__ulock_wait2`/`__ulock_wake` for `wait`/`notify`. Thread-local blocks are found
 through a pthread key, since the linker does not emit Mach-O thread-local variables.
+On Windows `runtime/windows.ax` does the same over the Win32 API: UTF-16 paths, a
+table from the ABI's small handles to Windows handles and sockets, `CreateProcessW`
+with C-runtime quoting, `ReadDirectoryChangesW` for watching, `RtlWaitOnAddress` for
+`wait`/`notify`, and a vectored exception handler for crash reports. Windows cannot
+fork, so `runtime/test_main_windows.ax` runs each test in a new process of the test
+program; both test runners share `runtime/test_report.ax`.
 
 ## Testing
 

@@ -695,6 +695,7 @@ export function createHost(opts = {}) {
       return nextThread++;
     },
     ax_thread_stack_size: () => THREAD_STACK,
+    ax_os: () => ({ linux: 1, darwin: 2, win32: 3 }[process.platform] || 0),
     ax_cpu_count: () => (os.availableParallelism ? os.availableParallelism() : os.cpus().length),
     ax_sleep_ns(ns) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ns) / 1e6);

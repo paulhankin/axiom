@@ -1044,7 +1044,9 @@ test "temporary directories are private; names cannot hide a NUL" {
     let d = make_temp_dir("phfs")!;
     defer mem.free(d);
     let info = stat(d)!;
-    @expect_eq(info.mode & 0o077, 0);
+    if not os.is_windows() {  // (Windows has no permission bits)
+        @expect_eq(info.mode & 0o077, 0);
+    }
     let mut p = strs.String.init();
     defer p.deinit();
     p.push_str(d)!;
@@ -1063,24 +1065,40 @@ test "permissions, links and times" {
     let f = path.join2(dir, "a.txt")!;
     defer mem.free(f);
     write_file(f, "hello")!;
-    chmod(f, 0o600)!;
-    @expect(stat(f)!.mode == 0o600);
+    chmod(f, 0o400)!;
+    if os.is_windows() {
+        @expect(stat(f)!.mode == 0o444);  // (only the read-only attribute)
+    } else {
+        @expect(stat(f)!.mode == 0o400);
+        chmod(f, 0o600)!;
+        @expect(stat(f)!.mode == 0o600);
+    }
     chmod(f, 0o644)!;
     @expect(stat(f)!.mode == 0o644);
     let l = path.join2(dir, "link")!;
     defer mem.free(l);
-    symlink("a.txt", l)!;
-    let t = read_link(l)!;
-    defer mem.free(t);
-    @expect_eq(t, "a.txt");
-    @expect((lstat(l)!.kind == Kind.SYMLINK) and (stat(l)!.kind == Kind.FILE));
+    let mut links = true;
+    symlink("a.txt", l) catch |e| {
+        if not os.is_windows() or (e != error.AccessDenied) {
+            return e;
+        }
+        links = false;  // (Windows only lets some users make them)
+    };
+    if links {
+        let t = read_link(l)!;
+        defer mem.free(t);
+        @expect_eq(t, "a.txt");
+        @expect((lstat(l)!.kind == Kind.SYMLINK) and (stat(l)!.kind == Kind.FILE));
+    }
     let h = path.join2(dir, "hard")!;
     defer mem.free(h);
     hard_link(f, h)!;
     let hc = read_file(h)!;
     defer mem.free(hc);
     @expect_eq(hc, "hello");
-    @expect(exists_err(symlink("x", l)));
+    if links {
+        @expect(exists_err(symlink("x", l)));
+    }
     set_times(f, 1000000000000000000, 1500000000123456000)!;
     let m = stat(f)!.mtime_ns;
     @expect((m >= 1500000000123000000) and (m <= 1500000000123456000));

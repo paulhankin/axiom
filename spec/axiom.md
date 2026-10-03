@@ -1576,12 +1576,18 @@ wherever host instructions differ.
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Bounds checks against it (§12.1) are future work |
 | `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; self-hosted compiler only. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
+| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; self-hosted compiler only. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Not yet supported: `axiom profile`, linking C code or `-l` libraries |
 
 Linux is the native operating system. `--target=native` on a Mac means
-`aarch64-macos`; elsewhere `aarch64-macos` is a cross target, so a Linux host can
-build Mac executables. On macOS, variadic C arguments are passed on the stack
-(Apple's arm64 ABI), and a thread-local global (§12.8.6) lives in a per-thread block
-whose address is kept in a pthread key.
+`aarch64-macos`, and on Windows `x86_64-windows`; elsewhere they are cross targets,
+so a Linux host can build Mac and Windows executables. On macOS, variadic C arguments
+are passed on the stack (Apple's arm64 ABI), and a thread-local global (§12.8.6)
+lives in a per-thread block whose address is kept in a pthread key. On Windows,
+every function uses the Windows x64 calling convention (four register arguments,
+shadow space, `rsi`, `rdi` and `xmm6`-`xmm15` preserved), and thread-locals are the
+image's TLS directory. A program can ask which system it runs on with `os.system()`
+(std/os); paths on Windows may begin with a drive (`C:/`), which `path.is_abs`
+recognizes there.
 
 ### 14.2 Exports
 

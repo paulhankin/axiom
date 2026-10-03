@@ -35,6 +35,7 @@ import host "axiom" {
     fn ax_proc_wait(h: i32, block: u32, status: *mut i32) i32;
     fn ax_clock_ns(clock: u32) i64;
     fn ax_cpu_count() u32;
+    fn ax_os() i32;
 }
 
 // -----------------------------------------------------------------------------
@@ -1636,16 +1637,44 @@ pub fn readlink(p: []u8) []u8 {
     return dup(buf[0..@int_cast(usize, n)]);
 }
 
+// The length of p's Windows drive ("C:" before a separator), or 0.
+fn drive_len(p: []u8) usize {
+    if (p.len < 3) or not on_windows() {
+        return 0;
+    }
+    let l = p[0] | 0x20;
+    if (l >= 'a') and (l <= 'z') and (p[1] == ':') and ((p[2] == '/') or (p[2] == '\\')) {
+        return 2;
+    }
+    return 0;
+}
+
+// Is a byte a path separator ('/', and on Windows also '\\')?
+fn is_sep(c: u8) bool {
+    return (c == '/') or ((c == '\\') and on_windows());
+}
+
+pub fn on_windows() bool {
+    return ax_os() == 3;
+}
+
 // realpath(3): absolute, without "." or ".." or symbolic links; a nil slice
-// if p does not exist.
+// if p does not exist. (A Windows path keeps its drive: "C:/a/b".)
 pub fn real_path(p: []u8) []u8 {
     if not file_exists(p) {
         return nosym();
     }
     let mut todo = List.[[]u8].{ data: nil.[[]u8](), len: 0, cap: 0 };  // components, last first
-    push_parts(&mut todo, p);
-    if (p.len == 0) or (p[0] != '/') {
-        push_parts(&mut todo, cwd());
+    let mut root: []u8 = "";
+    let mut d = drive_len(p);
+    push_parts(&mut todo, p[d..]);
+    if d > 0 {
+        root = p[0..d];
+    } else if (p.len == 0) or not is_sep(p[0]) {
+        let c = cwd();
+        d = drive_len(c);
+        root = c[0..d];
+        push_parts(&mut todo, c[d..]);
     }
     let mut out = List.[[]u8].{ data: nil.[[]u8](), len: 0, cap: 0 };
     let mut links: i32 = 0;
@@ -1661,7 +1690,7 @@ pub fn real_path(p: []u8) []u8 {
             continue;
         }
         out.push(c);
-        let here = join_parts(&out);
+        let here = join_parts(root, &out);
         let mut lst: [4]i64 = [0; 4];
         if ax_stat(here.ptr, here.len, 0, &mut lst[0]) < 0 {
             return nosym();
@@ -1676,13 +1705,17 @@ pub fn real_path(p: []u8) []u8 {
                 return nosym();
             }
             _ = out.pop();
-            if (t.len > 0) and (t[0] == '/') {
+            let td = drive_len(t);
+            if td > 0 {
+                root = t[0..td];
+            }
+            if (td > 0) or ((t.len > 0) and is_sep(t[0])) {
                 out.clear();
             }
-            push_parts(&mut todo, t);
+            push_parts(&mut todo, t[td..]);
         }
     }
-    let r = join_parts(&out);
+    let r = join_parts(root, &out);
     free(@ptr_cast(*mut void, todo.data));
     free(@ptr_cast(*mut void, out.data));
     return r;
@@ -1693,7 +1726,7 @@ fn push_parts(todo: *mut List.[[]u8], p: []u8) void {
     let mut end = p.len;
     let mut i = p.len;
     while i > 0 {
-        if p[i - 1] == '/' {
+        if is_sep(p[i - 1]) {
             if end > i {
                 todo.push(p[i..end]);
             }
@@ -1706,11 +1739,13 @@ fn push_parts(todo: *mut List.[[]u8], p: []u8) void {
     }
 }
 
-fn join_parts(parts: *List.[[]u8]) []u8 {
-    if parts.len == 0 {
-        return dup("/");
-    }
+fn join_parts(root: []u8, parts: *List.[[]u8]) []u8 {
     let mut b = Buf.init();
+    b.s(root);
+    if parts.len == 0 {
+        b.c('/');
+        return b.done();
+    }
     for i in 0..parts.len {
         b.c('/');
         b.s(parts.get(i));

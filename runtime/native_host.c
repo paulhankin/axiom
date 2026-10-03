@@ -890,6 +890,19 @@ int32_t ax_thread_spawn(ax_entry entry, void *arg, size_t stack_top, uint32_t *e
 // Native threads need no stack from the program.
 size_t ax_thread_stack_size(void) { return 0; }
 
+// The operating system: 1 Linux, 2 macOS, 3 Windows, 0 another.
+int32_t ax_os(void) {
+#if defined(__linux__)
+    return 1;
+#elif defined(__APPLE__)
+    return 2;
+#elif defined(_WIN32)
+    return 3;
+#else
+    return 0;
+#endif
+}
+
 uint32_t ax_cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (uint32_t)n : 1;
