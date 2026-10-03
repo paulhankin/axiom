@@ -48,6 +48,80 @@ static Type *operand(Expr **pe, Type *hint) {
     return t;
 }
 
+// The operands of the processor-instruction builtins (spec §13.5), one
+// letter each: W a byte vector (u8x16, u8x32, u8x64), Y a u64 vector (u64x2,
+// u64x4, u64x8), B u8x16, Q u64x2, D u32x4, V a 128-bit integer vector, S
+// u32, C u8, u16, u32 or u64 (CRC data), I a constant.
+static const char *insn_ops(int id) {
+    static const char *const t[] = {"WW", "WW", "WW", "WW", "B", "BI", "YYI", "DDI", "DD", "DD", "DD", "DDD", "DD",
+                                    "DD", "SC", "BB", "BB", "B", "B", "QQ", "QQ", "DSD", "DSD", "DSD", "S", "DDD", "DD",
+                                    "DDD", "DDD", "DD", "DDD", "QQQ", "QQQ", "QQ", "QQQ", "VVV", "VVV", "QQ", "QQI",
+                                    "SC", "SC"};
+    return t[id - BI_X86_AESENC];
+}
+
+static bool insn_kind_ok(char c, Type *t) {
+    if (t->kind == TY_INVALID) return true;
+    switch (c) {
+    case 'W': return t->kind == TY_VEC && t->elem == t_u8;
+    case 'Y': return t->kind == TY_VEC && t->elem == t_u64;
+    case 'B': return t == type_vec(t_u8, 16);
+    case 'Q': return t == type_vec(t_u64, 2);
+    case 'D': return t == type_vec(t_u32, 4);
+    default: return ty_is_vec_int(t) && simd_bits(t) == 128;
+    }
+}
+
+static const char *insn_kind_name(char c) {
+    switch (c) {
+    case 'W': return "u8x16, u8x32 or u8x64";
+    case 'Y': return "u64x2, u64x4 or u64x8";
+    case 'B': return "u8x16";
+    case 'Q': return "u64x2";
+    case 'D': return "u32x4";
+    default: return "a 128-bit integer vector";
+    }
+}
+
+static Type *insn_check(Expr *e) {
+    int id = e->index;
+    const char *ops = insn_ops(id);
+    Type *first = NULL;
+    char first_kind = 0;
+    for (int k = 0; ops[k]; k++) {
+        char c = ops[k];
+        Expr **pe = earg(e, k);
+        if (c == 'I') {
+            long long max = id == BI_X86_SHA1RNDS4 ? 3 : id == BI_ARM_XAR ? 63 : 255;
+            Type *t = check_expr(*pe, t_u32);
+            if (ty_is_untyped(t)) coerce(pe, t_u32);
+            Expr *a = *pe;
+            if (!a->is_const || a->cval < 0 || a->cval > max)
+                diag_error(a->span, "E0820", "@%s needs a constant in 0..%lld here", e->name, max);
+        } else if (c == 'S') {
+            check_expr_to(pe, t_u32);
+        } else if (c == 'C') {
+            Type *t = check_expr(*pe, NULL);
+            if (ty_is_untyped(t)) finalize_untyped(pe);
+            else if (!(t->kind == TY_INT && !t->is_signed && !t->is_size) && t->kind != TY_INVALID)
+                diag_error((*pe)->span, "E0822", "@%s takes u8, u16, u32 or u64 data, found %s", e->name, type_str(t));
+        } else if (first && c == first_kind) {
+            check_expr_to(pe, first);
+        } else {
+            Type *t = check_expr(*pe, NULL);
+            if (!insn_kind_ok(c, t))
+                diag_error((*pe)->span, "E0812", "@%s needs %s operands, found %s", e->name, insn_kind_name(c), type_str(t));
+            if (!first) {
+                first = t;
+                first_kind = c;
+            }
+        }
+    }
+    if (ops[0] == 'S' || !first) return t_u32;
+    if (!insn_kind_ok(first_kind, first)) return t_invalid;
+    return first;
+}
+
 // Two operands of the same type.
 static Type *pair(Expr *e, Type *expected) {
     Type *a = check_expr(*earg(e, 0), expected);
@@ -733,7 +807,9 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_ERROR_NAME:
         check_expr_to(earg(e, 0), t_error);
         return e->type = type_slice(t_u8, false);
-    default: break;
+    default:
+        if (e->index >= BI_X86_AESENC && e->index <= BI_ARM_CRC32C) return e->type = insn_check(e);
+        break;
     }
     return e->type = t_invalid;
 }

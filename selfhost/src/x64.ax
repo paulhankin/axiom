@@ -2368,6 +2368,68 @@ fn has41() bool {
     return tg.has(tg.X_SSE41);
 }
 
+// The processor instructions (spec §13.5) of either architecture.
+fn is_insn(id: i32) bool {
+    return (id >= ir.IN_AESENC) and (id <= ir.IN_CRC32C_A);
+}
+
+// AES rounds, carry-less multiply, SHA-1/SHA-256 steps, CRC-32C.
+fn gen_insn(v: *mut ir.Value, id: i32) void {
+    let d = vreg(v);
+    let a = reg(v.xs.get(0));
+    if id == ir.IN_CRC32C {
+        let x = v.xs.get(1);
+        copy(d, a, GPR);
+        let i = e2(xe.CRC32, @truncate(u8, x.ty.size), RW(d), R(reg(x)));
+        _ = i;
+        return;
+    }
+    if (id >= ir.IN_AESENC) and (id <= ir.IN_AESDECLAST) {
+        sse3(xe.AESENC + (id - ir.IN_AESENC), d, a, R(reg(v.xs.get(1))));
+        return;
+    }
+    if id == ir.IN_AESIMC {
+        sse_unary_packed(xe.AESIMC, d, R(a));
+        return;
+    }
+    if id == ir.IN_AESKEYGEN {
+        _ = sse_i(xe.AESKEYGEN, W(d), R(a), cval(v.xs.get(1)));
+        return;
+    }
+    if id == ir.IN_CLMUL {
+        sse3_i(xe.PCLMULQDQ, d, a, R(reg(v.xs.get(1))), cval(v.xs.get(2)));
+        return;
+    }
+    // SHA-NI: two-operand, destructive (no VEX form)
+    let b = reg(v.xs.get(1));
+    let mut t = vxmm();
+    if b == d {
+        t = vxmm();
+    }
+    copy(t, a, XMM);
+    if id == ir.IN_SHA256RNDS2 {
+        let k = reg(v.xs.get(2));
+        copy(xe.XMM0, k, XMM);
+        let i = e4(xe.SSE, 0, RW(t), R(b), R(xe.XMM0), NONE());  // (xmm0 read implicitly)
+        i.cc = xe.SHA256RNDS2;
+    } else if id == ir.IN_SHA1RNDS4 {
+        let i = e4(xe.SSE, 0, RW(t), R(b), NONE(), I(cval(v.xs.get(2))));
+        i.cc = xe.SHA1RNDS4;
+    } else {
+        let ids: [5]i32 = [xe.SHA1NEXTE, xe.SHA1MSG1, xe.SHA1MSG2, xe.SHA256MSG1, xe.SHA256MSG2];
+        let ins: [5]i32 = [ir.IN_SHA1NEXTE, ir.IN_SHA1MSG1, ir.IN_SHA1MSG2, ir.IN_SHA256MSG1, ir.IN_SHA256MSG2];
+        let mut op: i32 = 0;
+        for k in @as(usize, 0)..5 {
+            if ins[k] == id {
+                op = ids[k];
+            }
+        }
+        let i = e4(xe.SSE, 0, RW(t), R(b), NONE(), NONE());
+        i.cc = op;
+    }
+    copy(d, t, XMM);
+}
+
 // The widest vectors the function's extensions compute in one register:
 // 512 bits with AVX-512 (F and BW; DQ for some operations, see wide_legal),
 // 256 with AVX2, else 128.
@@ -2444,6 +2506,12 @@ pub fn wide_legal(v: *mut ir.Value) bool {
     if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_DOT_I16) {
         return true;
     }
+    if (id >= ir.IN_AESENC) and (id <= ir.IN_AESDECLAST) {
+        return tg.has(tg.X_VAES);
+    }
+    if id == ir.IN_CLMUL {
+        return tg.has(tg.X_VPCLMULQDQ);
+    }
     if id == ir.IN_BITMASK {
         if w == 64 {
             return (b <= 16) or dq;
@@ -2478,6 +2546,9 @@ pub fn wide_legal(v: *mut ir.Value) bool {
 pub fn legal(v: *mut ir.Value) bool {
     if inst_vl(v) > 16 {
         return wide_legal(v);
+    }
+    if (v.op == ir.OP_INTR) and is_insn(@truncate(i32, @bit_cast(i64, v.cv))) {
+        return true;  // (sema allowed it only where the extension is there)
     }
     let t = v.ty;
     let o = v.op;
@@ -3434,6 +3505,10 @@ fn gen_inst_at(v: *mut ir.Value) void {
         }
         if id == ir.IN_CPUID {
             gen_cpuid(v);
+            return;
+        }
+        if is_insn(id) {
+            gen_insn(v, id);
             return;
         }
         if id == ir.IN_XGETBV {
@@ -4751,6 +4826,37 @@ fn enc_inst(i: *mut mc.MInst) void {
     if op == xe.CPUID {
         b8(0x0f);
         b8(0xa2);
+        return;
+    }
+    if op == xe.CRC32 {
+        // [66] F2 [REX] 0F 38 F0/F1 /r: crc32 r32/r64, r/m8/16/32/64
+        let r = P(i.ops[0].reg);
+        let m = P(i.ops[1].reg);
+        if i.sz == 2 {
+            b8(0x66);
+        }
+        b8(0xf2);
+        let mut rex: u64 = 0;
+        if i.sz == 8 {
+            rex = rex | 8;
+        }
+        if r >= 8 {
+            rex = rex | 4;
+        }
+        if m >= 8 {
+            rex = rex | 1;
+        }
+        if (rex != 0) or ((i.sz == 1) and (m >= 4)) {
+            b8(0x40 | rex);
+        }
+        b8(0x0f);
+        b8(0x38);
+        if i.sz == 1 {
+            b8(0xf0);
+        } else {
+            b8(0xf1);
+        }
+        b8(0xc0 | ((@as(u64, @bit_cast(u32, r)) & 7) << 3) | (@as(u64, @bit_cast(u32, m)) & 7));
         return;
     }
     if op == xe.XGETBV {

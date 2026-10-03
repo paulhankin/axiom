@@ -7,6 +7,10 @@
 //
 //     let mut d: [20]u8 = [0; 20];
 //     sha1.sha1(data, d[..]);
+//
+// Where the processor has SHA instructions they compress the blocks
+// (SHA-NI on x86-64, the ARMv8 SHA1 instructions on AArch64; spec §13.5),
+// chosen at run time (@multiversion).
 // =============================================================================
 
 pub const SIZE: usize = 20;
@@ -24,48 +28,7 @@ pub struct Sha1 {
     }
 
     fn block(self: *mut Sha1, p: []u8) void {
-        let mut w: [80]u32 = [0; 80];
-        for i in @as(usize, 0)..16 {
-            let k = 4 * i;
-            w[i] = (((@as(u32, p[k]) << 24) | (@as(u32, p[k + 1]) << 16)) | (@as(u32, p[k + 2]) << 8)) | @as(
-                u32, p[k + 3]);
-        }
-        for i in @as(usize, 16)..80 {
-            w[i] = @rotl(((w[i - 3] ^ w[i - 8]) ^ w[i - 14]) ^ w[i - 16], 1);
-        }
-        let mut a = self.h[0];
-        let mut b = self.h[1];
-        let mut c = self.h[2];
-        let mut d = self.h[3];
-        let mut e = self.h[4];
-        for i in @as(usize, 0)..80 {
-            let mut f: u32 = 0;
-            let mut k: u32 = 0;
-            if i < 20 {
-                f = (b & c) | (~b & d);
-                k = 0x5a827999;
-            } else if i < 40 {
-                f = (b ^ c) ^ d;
-                k = 0x6ed9eba1;
-            } else if i < 60 {
-                f = ((b & c) | (b & d)) | (c & d);
-                k = 0x8f1bbcdc;
-            } else {
-                f = (b ^ c) ^ d;
-                k = 0xca62c1d6;
-            }
-            let t = (((@rotl(a, 5) +% f) +% e) +% k) +% w[i];
-            e = d;
-            d = c;
-            c = @rotl(b, 30);
-            b = a;
-            a = t;
-        }
-        self.h[0] +%= a;
-        self.h[1] +%= b;
-        self.h[2] +%= c;
-        self.h[3] +%= d;
-        self.h[4] +%= e;
+        blocks(&mut self.h, p);
     }
 
     pub fn update(self: *mut Sha1, data: []u8) void {
@@ -83,9 +46,10 @@ pub struct Sha1 {
             self.block(b[..]);
             self.nbuf = 0;
         }
-        while d.len >= 64 {
-            self.block(d[..64]);
-            d = d[64..];
+        let whole = d.len - (d.len % 64);
+        if whole > 0 {
+            blocks(&mut self.h, d[..whole]);
+            d = d[whole..];
         }
         @mem_copy(self.buf[..d.len], d);
         self.nbuf = d.len;
@@ -122,6 +86,214 @@ pub struct Sha1 {
             out[(4 * i) + 2] = @truncate(u8, self.h[i] >> 8);
             out[(4 * i) + 3] = @truncate(u8, self.h[i]);
         }
+    }
+}
+
+fn block_soft(hs: *mut [5]u32, p: []u8) void {
+    let mut w: [80]u32 = [0; 80];
+    for i in @as(usize, 0)..16 {
+        let k = 4 * i;
+        w[i] = (((@as(u32, p[k]) << 24) | (@as(u32, p[k + 1]) << 16)) | (@as(u32, p[k + 2]) << 8)) | @as(u32, p[k + 3]);
+    }
+    for i in @as(usize, 16)..80 {
+        w[i] = @rotl(((w[i - 3] ^ w[i - 8]) ^ w[i - 14]) ^ w[i - 16], 1);
+    }
+    let mut a = hs[0];
+    let mut b = hs[1];
+    let mut c = hs[2];
+    let mut d = hs[3];
+    let mut e = hs[4];
+    for i in @as(usize, 0)..80 {
+        let mut f: u32 = 0;
+        let mut k: u32 = 0;
+        if i < 20 {
+            f = (b & c) | (~b & d);
+            k = 0x5a827999;
+        } else if i < 40 {
+            f = (b ^ c) ^ d;
+            k = 0x6ed9eba1;
+        } else if i < 60 {
+            f = ((b & c) | (b & d)) | (c & d);
+            k = 0x8f1bbcdc;
+        } else {
+            f = (b ^ c) ^ d;
+            k = 0xca62c1d6;
+        }
+        let t = (((@rotl(a, 5) +% f) +% e) +% k) +% w[i];
+        e = d;
+        d = c;
+        c = @rotl(b, 30);
+        b = a;
+        a = t;
+    }
+    hs[0] +%= a;
+    hs[1] +%= b;
+    hs[2] +%= c;
+    hs[3] +%= d;
+    hs[4] +%= e;
+}
+// The big-endian words of 16 bytes, in order (be4) or the last first (be_rev).
+fn be4(p: []u8) u32x4 {
+    let b = @load(u8x16, p);
+    return @bit_cast(u32x4, @shuffle(b, b, [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12]));
+}
+
+fn be_rev(p: []u8) u32x4 {
+    let b = @load(u8x16, p);
+    return @bit_cast(u32x4, @shuffle(b, b, [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]));
+}
+
+let K: [4]u32 = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
+
+/// The blocks of p (a multiple of 64 bytes) into the state.
+fn blocks(hs: *mut [5]u32, p: []u8) void @multiversion("sha,ssse3,sse4.1", "sha2") {
+    if @target_arch("x86_64") and @target_has("sha") {
+        // ABCD with A in the top lane, E in the top lane of its own vector
+        let mut abcd = @vec(u32x4, hs[3], hs[2], hs[1], hs[0]);
+        let mut e0 = @vec(u32x4, 0, 0, 0, hs[4]);
+        let mut i: usize = 0;
+        while i < p.len {
+            let abcd0 = abcd;
+            let e00 = e0;
+            // the words of the last four steps, w3 the newest
+            let mut w0 = be_rev(p[i..i + 16]);
+            let mut w1 = be_rev(p[i + 16..i + 32]);
+            let mut w2 = be_rev(p[i + 32..i + 48]);
+            let mut w3 = be_rev(p[i + 48..i + 64]);
+            // four rounds a step: the first adds E to the words, later ones
+            // derive E from A four rounds back (sha1nexte)
+            let mut prev = abcd;
+            let mut e = e0 +% w0;
+            abcd = @x86_sha1rnds4(abcd, e, 0);
+            for j in @as(usize, 1)..5 {
+                if j >= 4 {
+                    let nw = @x86_sha1msg2(@x86_sha1msg1(w0, w1) ^ w2, w3);
+                    w0 = w1;
+                    w1 = w2;
+                    w2 = w3;
+                    w3 = nw;
+                }
+                // (the first four words stay in place until step 4 needs them)
+                let mut wj = w3;
+                if j == 1 {
+                    wj = w1;
+                } else if j == 2 {
+                    wj = w2;
+                }
+                e = @x86_sha1nexte(prev, wj);
+                prev = abcd;
+                abcd = @x86_sha1rnds4(abcd, e, 0);
+            }
+            for j in @as(usize, 5)..10 {
+                if j >= 4 {
+                    let nw = @x86_sha1msg2(@x86_sha1msg1(w0, w1) ^ w2, w3);
+                    w0 = w1;
+                    w1 = w2;
+                    w2 = w3;
+                    w3 = nw;
+                }
+                // (the first four words stay in place until step 4 needs them)
+                let mut wj = w3;
+                if j == 1 {
+                    wj = w1;
+                } else if j == 2 {
+                    wj = w2;
+                }
+                e = @x86_sha1nexte(prev, wj);
+                prev = abcd;
+                abcd = @x86_sha1rnds4(abcd, e, 1);
+            }
+            for j in @as(usize, 10)..15 {
+                if j >= 4 {
+                    let nw = @x86_sha1msg2(@x86_sha1msg1(w0, w1) ^ w2, w3);
+                    w0 = w1;
+                    w1 = w2;
+                    w2 = w3;
+                    w3 = nw;
+                }
+                // (the first four words stay in place until step 4 needs them)
+                let mut wj = w3;
+                if j == 1 {
+                    wj = w1;
+                } else if j == 2 {
+                    wj = w2;
+                }
+                e = @x86_sha1nexte(prev, wj);
+                prev = abcd;
+                abcd = @x86_sha1rnds4(abcd, e, 2);
+            }
+            for j in @as(usize, 15)..20 {
+                if j >= 4 {
+                    let nw = @x86_sha1msg2(@x86_sha1msg1(w0, w1) ^ w2, w3);
+                    w0 = w1;
+                    w1 = w2;
+                    w2 = w3;
+                    w3 = nw;
+                }
+                // (the first four words stay in place until step 4 needs them)
+                let mut wj = w3;
+                if j == 1 {
+                    wj = w1;
+                } else if j == 2 {
+                    wj = w2;
+                }
+                e = @x86_sha1nexte(prev, wj);
+                prev = abcd;
+                abcd = @x86_sha1rnds4(abcd, e, 3);
+            }
+            e0 = @x86_sha1nexte(prev, e00);
+            abcd +%= abcd0;
+            i += 64;
+        }
+        hs[0] = @extract_lane(abcd, 3);
+        hs[1] = @extract_lane(abcd, 2);
+        hs[2] = @extract_lane(abcd, 1);
+        hs[3] = @extract_lane(abcd, 0);
+        hs[4] = @extract_lane(e0, 3);
+        return;
+    }
+    if @target_arch("aarch64") and @target_has("sha2") {
+        let mut abcd = @load(u32x4, hs[0..4]);
+        let mut e0 = hs[4];
+        let mut i: usize = 0;
+        while i < p.len {
+            let abcd0 = abcd;
+            let e00 = e0;
+            let mut w0 = be4(p[i..i + 16]);
+            let mut w1 = be4(p[i + 16..i + 32]);
+            let mut w2 = be4(p[i + 32..i + 48]);
+            let mut w3 = be4(p[i + 48..i + 64]);
+            // four rounds a step; E for the next step is A rotated (sha1h)
+            let mut e = e0;
+            for j in @as(usize, 0)..20 {
+                let wk = w0 +% @splat(K[j / 5]);
+                let nw = @arm_sha1su1(@arm_sha1su0(w0, w1, w2), w3);
+                w0 = w1;
+                w1 = w2;
+                w2 = w3;
+                w3 = nw;
+                let next = @arm_sha1h(@extract_lane(abcd, 0));
+                if j < 5 {
+                    abcd = @arm_sha1c(abcd, e, wk);
+                } else if (j < 10) or (j >= 15) {
+                    abcd = @arm_sha1p(abcd, e, wk);
+                } else {
+                    abcd = @arm_sha1m(abcd, e, wk);
+                }
+                e = next;
+            }
+            abcd +%= abcd0;
+            e0 = e +% e00;
+            i += 64;
+        }
+        @store(hs[0..4], abcd);
+        hs[4] = e0;
+        return;
+    }
+    let mut i: usize = 0;
+    while i < p.len {
+        block_soft(hs, p[i..i + 64]);
+        i += 64;
     }
 }
 
@@ -178,4 +350,40 @@ test "sha-1 vectors" {
     }
     all.final(d[..]);
     @expect_eq(hex(d[..], h[..]), "c49ada15a78f955989fc22bd889719c249fc3041");
+}
+
+// a deterministic stream of test bytes (xorshift)
+fn fill(state: *mut u64, out: []mut u8) void {
+    for i in 0..out.len {
+        let mut x = state.*;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state.* = x;
+        out[i] = @truncate(u8, x >> 24);
+    }
+}
+
+test "the processor's instructions agree with the portable code" {
+    let mut st: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut data: [1024]u8 = [0; 1024];
+    for t in @as(usize, 0)..16 {
+        let n = 64 * (t + 1);
+        fill(&mut st, data[..n]);
+        let mut a: [5]u32 = [0; 5];
+        let mut b: [5]u32 = [0; 5];
+        for k in @as(usize, 0)..5 {
+            a[k] = @truncate(u32, st >> @as(u64, 4 * k));
+            b[k] = a[k];
+        }
+        blocks(&mut a, data[..n]);
+        let mut i: usize = 0;
+        while i < n {
+            block_soft(&mut b, data[i..i + 64]);
+            i += 64;
+        }
+        for k in @as(usize, 0)..5 {
+            @expect_eq(a[k], b[k]);
+        }
+    }
 }

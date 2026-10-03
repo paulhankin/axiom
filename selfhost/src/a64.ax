@@ -1740,9 +1740,128 @@ fn lk(t: *ir.Ty) u64 {
 
 // Can the instruction selector handle this vector instruction directly?
 // (Everything else is split into lanes by lower.scalarize.)
+// The processor instructions (spec §13.5).
+fn is_insn(id: i32) bool {
+    return (id >= ir.IN_AESENC) and (id <= ir.IN_CRC32C_A);
+}
+
+// An S register (lane 0 of a vector register) holding the u32 in r.
+fn s_reg(r: i32) i32 {
+    let s = vvr();
+    raw2(ae.ins_gen(2, 0, 0, 0), s, r);
+    return s;
+}
+
+// AES rounds, polynomial multiply, SHA steps, the SHA-3 instructions, CRC32.
+// Most of them accumulate into their destination: it starts as a copy of
+// the first operand.
+fn gen_insn(v: *mut ir.Value, id: i32) void {
+    let d = vreg(v);
+    let a = reg(v.xs.get(0));
+    if (id == ir.IN_CRC32) or (id == ir.IN_CRC32C_A) {
+        let x = v.xs.get(1);
+        let sz = x.ty.size;
+        let mut w: u64 = 0x1AC0_4000;
+        if sz == 2 {
+            w = 0x1AC0_4400;
+        } else if sz == 4 {
+            w = 0x1AC0_4800;
+        } else if sz == 8 {
+            w = 0x9AC0_4C00;
+        }
+        if id == ir.IN_CRC32C_A {
+            w = w | 0x1000;
+        }
+        raw3(w, d, a, reg(x));
+        return;
+    }
+    if id == ir.IN_AESMC {
+        raw2(0x4E28_6800, d, a);
+        return;
+    }
+    if id == ir.IN_AESIMC_A {
+        raw2(0x4E28_7800, d, a);
+        return;
+    }
+    if id == ir.IN_SHA1H {
+        let s = s_reg(a);
+        let r = vvr();
+        raw2(0x5E28_0800, r, s);
+        raw2(ae.umov(2, 0, 0, 0), d, r);
+        return;
+    }
+    let b = reg(v.xs.get(1));
+    if (id == ir.IN_PMULL) or (id == ir.IN_PMULL2) {
+        let mut w: u64 = 0x0EE0_E000;
+        if id == ir.IN_PMULL2 {
+            w = 0x4EE0_E000;
+        }
+        raw3(w, d, a, b);
+        return;
+    }
+    if id == ir.IN_RAX1 {
+        raw3(0xCE60_8C00, d, a, b);
+        return;
+    }
+    if id == ir.IN_XAR {
+        let k = @bit_cast(u64, cval(v.xs.get(2))) & 63;
+        raw3(0xCE80_0000 | (k << 10), d, a, b);
+        return;
+    }
+    if (id == ir.IN_EOR3) or (id == ir.IN_BCAX) {
+        let c = reg(v.xs.get(2));
+        let mut w: u64 = 0xCE00_0000;
+        if id == ir.IN_BCAX {
+            w = 0xCE20_0000;
+        }
+        _ = raw(w, W(d), R(a), R(b), R(c));
+        return;
+    }
+    // destructive: Vd (= a) op= Vn [, Vm]
+    let t = vvr();
+    copy(t, a, VR);
+    if (id == ir.IN_AESE) or (id == ir.IN_AESD) {
+        let mut w: u64 = 0x4E28_4800;
+        if id == ir.IN_AESD {
+            w = 0x4E28_5800;
+        }
+        _ = raw(w, RW(t), R(b), NONE(), NONE());
+    } else if (id == ir.IN_SHA1SU1) or (id == ir.IN_SHA256SU0) {
+        let mut w: u64 = 0x5E28_1800;
+        if id == ir.IN_SHA256SU0 {
+            w = 0x5E28_2800;
+        }
+        _ = raw(w, RW(t), R(b), NONE(), NONE());
+    } else if id == ir.IN_SHA512SU0 {
+        _ = raw(0xCEC0_8000, RW(t), R(b), NONE(), NONE());
+    } else {
+        // three operands: Vd op= Vn, Vm
+        let c = reg(v.xs.get(2));
+        let mut n = b;
+        if (id == ir.IN_SHA1C) or (id == ir.IN_SHA1P) or (id == ir.IN_SHA1M) {
+            n = s_reg(b);  // (e: an S register)
+        }
+        let ids: [10]i32 = [ir.IN_SHA1C, ir.IN_SHA1P, ir.IN_SHA1M, ir.IN_SHA1SU0, ir.IN_SHA256H, ir.IN_SHA256H2,
+                            ir.IN_SHA256SU1, ir.IN_SHA512H, ir.IN_SHA512H2, ir.IN_SHA512SU1];
+        let ws: [10]u64 = [0x5E00_0000, 0x5E00_1000, 0x5E00_2000, 0x5E00_3000, 0x5E00_4000, 0x5E00_5000, 0x5E00_6000,
+                           0xCE60_8000, 0xCE60_8400, 0xCE60_8800];
+        let mut w: u64 = 0;
+        for k in @as(usize, 0)..10 {
+            if ids[k] == id {
+                w = ws[k];
+            }
+        }
+        _ = raw(w, RW(t), R(n), R(c), NONE());
+    }
+    copy(d, t, VR);
+}
+
 pub fn legal(v: *mut ir.Value) bool {
     let t = v.ty;
     let o = v.op;
+    if (o == ir.OP_INTR) and is_insn(@truncate(i32, @bit_cast(i64, v.cv))) {
+        return true;  // (sema allowed it only where the extension is there)
+    }
     if o == ir.OP_ICMP {
         return true;
     }
@@ -2288,6 +2407,10 @@ fn gen_inst(v: *mut ir.Value) void {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         if id == ir.IN_TRAP {
             raw_none(ae.UDF);
+            return;
+        }
+        if is_insn(id) {
+            gen_insn(v, id);
             return;
         }
         if (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {

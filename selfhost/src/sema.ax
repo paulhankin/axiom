@@ -3946,6 +3946,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         _ = check_expr_to(earg(e, 0), ty.t_u32);
         return set_ty(e, ty.t_u64);
     }
+    if (id >= ast.BI_X86_AESENC) and (id <= ast.BI_ARM_CRC32C) {
+        return set_ty(e, insn_check(e, id));
+    }
     if id == ast.BI_EXPECT {
         _ = check_expr_to(earg(e, 0), ty.t_bool);
         return set_ty(e, ty.t_void);
@@ -4828,7 +4831,141 @@ pub fn builtin_need(id: i32) Need {
     if (id == ast.BI_X86_CPUID) or (id == ast.BI_X86_XGETBV) {
         return Need.{ arch: tg.ARCH_X64, feats: 0 };
     }
+    if (id >= ast.BI_X86_AESENC) and (id <= ast.BI_X86_AESKEYGENASSIST) {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_AES };
+    }
+    if id == ast.BI_X86_CLMUL {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_PCLMUL };
+    }
+    if (id >= ast.BI_X86_SHA1RNDS4) and (id <= ast.BI_X86_SHA256MSG2) {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_SHA };
+    }
+    if id == ast.BI_X86_CRC32C {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_SSE42 };
+    }
+    if (id >= ast.BI_ARM_AESE) and (id <= ast.BI_ARM_PMULL2) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_AES };
+    }
+    if (id >= ast.BI_ARM_SHA1C) and (id <= ast.BI_ARM_SHA256SU1) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA2 };
+    }
+    if (id >= ast.BI_ARM_SHA512H) and (id <= ast.BI_ARM_SHA512SU1) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA512 };
+    }
+    if (id >= ast.BI_ARM_EOR3) and (id <= ast.BI_ARM_XAR) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA3 };
+    }
+    if (id == ast.BI_ARM_CRC32) or (id == ast.BI_ARM_CRC32C) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_CRC };
+    }
     return Need.{ arch: 0, feats: 0 };
+}
+
+// The operands of the processor-instruction builtins (spec §13.5), one
+// letter each: W a byte vector (u8x16, u8x32, u8x64), Y a u64 vector (u64x2,
+// u64x4, u64x8), B u8x16, Q u64x2, D u32x4, V a 128-bit integer vector, S
+// u32, C u8, u16, u32 or u64 (CRC data), I a constant.
+fn insn_ops(id: i32) []u8 {
+    let t = ["WW", "WW", "WW", "WW", "B", "BI", "YYI", "DDI", "DD", "DD", "DD", "DDD", "DD", "DD", "SC", "BB", "BB",
+             "B", "B", "QQ", "QQ", "DSD", "DSD", "DSD", "S", "DDD", "DD", "DDD", "DDD", "DD", "DDD", "QQQ", "QQQ", "QQ",
+             "QQQ", "VVV", "VVV", "QQ", "QQI", "SC", "SC"];
+    return t[@int_cast(usize, id - ast.BI_X86_AESENC)];
+}
+
+fn insn_kind_ok(c: u8, t: *mut ast.Type) bool {
+    if t.kind == ast.TY_INVALID {
+        return true;
+    }
+    if c == 'W' {
+        return (t.kind == ast.TY_VEC) and (t.elem == ty.t_u8);
+    }
+    if c == 'Y' {
+        return (t.kind == ast.TY_VEC) and (t.elem == ty.t_u64);
+    }
+    if c == 'B' {
+        return t == ty.type_vec(ty.t_u8, 16);
+    }
+    if c == 'Q' {
+        return t == ty.type_vec(ty.t_u64, 2);
+    }
+    if c == 'D' {
+        return t == ty.type_vec(ty.t_u32, 4);
+    }
+    return ty.is_vec_int(t) and (ty.simd_bits(t) == 128);  // V
+}
+
+fn insn_kind_name(c: u8) []u8 {
+    if c == 'W' {
+        return "u8x16, u8x32 or u8x64";
+    }
+    if c == 'Y' {
+        return "u64x2, u64x4 or u64x8";
+    }
+    if c == 'B' {
+        return "u8x16";
+    }
+    if c == 'Q' {
+        return "u64x2";
+    }
+    if c == 'D' {
+        return "u32x4";
+    }
+    return "a 128-bit integer vector";
+}
+
+fn insn_check(e: *mut ast.Expr, id: i32) *mut ast.Type {
+    let ops = insn_ops(id);
+    let mut first = tnil();
+    let mut first_kind: u8 = 0;
+    for k in 0..ops.len {
+        let c = ops[k];
+        let pe = earg(e, k);
+        if c == 'I' {
+            let mut max: i64 = 255;
+            if id == ast.BI_X86_SHA1RNDS4 {
+                max = 3;
+            } else if id == ast.BI_ARM_XAR {
+                max = 63;
+            }
+            let t = check_expr(pe.*, ty.t_u32);
+            if ty.is_untyped(t) {
+                coerce(pe, ty.t_u32);
+            }
+            let a = pe.*;
+            if not a.is_const or a.cval.is_neg() or a.cval.ge(u.I128.of(max + 1)) {
+                _ = dg.err(a.span, "E0820", u.f2("@%s needs a constant in 0..%s here", e.name, u.dec(max)));
+            }
+        } else if c == 'S' {
+            _ = check_expr_to(pe, ty.t_u32);
+        } else if c == 'C' {
+            let t = check_expr(pe.*, tnil());
+            if ty.is_untyped(t) {
+                _ = finalize_untyped(pe);
+            } else if not ((t.kind == ast.TY_INT) and not t.is_signed and not t.is_size) and
+                      (t.kind != ast.TY_INVALID) {
+                _ = dg.err(pe.*.span, "E0822", u.f2("@%s takes u8, u16, u32 or u64 data, found %s", e.name, tstr(t)));
+            }
+        } else if u.notnil(first) and (c == first_kind) {
+            _ = check_expr_to(pe, first);
+        } else {
+            let t = check_expr(pe.*, tnil());
+            if not insn_kind_ok(c, t) {
+                _ = dg.err(pe.*.span, "E0812", u.f3("@%s needs %s operands, found %s", e.name, insn_kind_name(c),
+                                                    tstr(t)));
+            }
+            if u.isnil(first) {
+                first = t;
+                first_kind = c;
+            }
+        }
+    }
+    if (ops[0] == 'S') or (u.isnil(first)) {
+        return ty.t_u32;
+    }
+    if not insn_kind_ok(first_kind, first) {
+        return ty.t_invalid;
+    }
+    return first;
 }
 
 let mut gate_reported: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };

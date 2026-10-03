@@ -70,6 +70,7 @@ pub const LEAVE_TRAP: i32 = 36;  // unused
 pub const CPUID: i32 = 37;       // eax(UD), ebx(D), ecx(UD), edx(D)
 pub const XGETBV: i32 = 38;      // ecx(U), eax(D), edx(D)
 pub const VZEROUPPER: i32 = 39;  // the upper halves of every vector register zeroed
+pub const CRC32: i32 = 40;       // r32(UD) crc of r/m (sz 1/2/4/8 bytes of data; CRC-32C)
 
 // Condition codes
 pub const CC_O: i32 = 0;
@@ -103,11 +104,12 @@ pub struct SseDesc {
     vex_only: bool,  // no legacy encoding (FMA, blends with is4, BMI)
     vl_ok: bool,     // has 256-bit (VEX.L) and 512-bit (EVEX) forms on full vectors
     ew: u8,          // EVEX.W: the element size (1: 64-bit lanes) where EVEX needs it
+    legacy: bool,    // no VEX encoding (SHA-NI): always two-operand legacy SSE
 }
 
 fn d(pfx: u8, map: u8, opc: u8) SseDesc {
     return SseDesc.{ pfx: pfx, map: map, opc: opc, w: 0, digit: -1, gpr_reg: false, gpr_rm: false, vex_only: false,
-                     vl_ok: false, ew: 0 };
+                     vl_ok: false, ew: 0, legacy: false };
 }
 
 // Descriptor ids
@@ -293,10 +295,25 @@ pub const VPMOVQ2M: i32 = 178;
 pub const KMOVQ_RK: i32 = 179;     // r64 (reg) <- k (rm)
 pub const VRNDSCALEPS: i32 = 180;  // EVEX's roundps: imm as roundps's
 pub const VRNDSCALEPD: i32 = 181;
-pub const NSSE: i32 = 182;
+// AES-NI (VAES at 256 and 512 bits), PCLMULQDQ (VPCLMULQDQ), SHA-NI
+pub const AESENC: i32 = 182;
+pub const AESENCLAST: i32 = 183;
+pub const AESDEC: i32 = 184;
+pub const AESDECLAST: i32 = 185;
+pub const AESIMC: i32 = 186;
+pub const AESKEYGEN: i32 = 187;
+pub const PCLMULQDQ: i32 = 188;
+pub const SHA1RNDS4: i32 = 189;
+pub const SHA1NEXTE: i32 = 190;
+pub const SHA1MSG1: i32 = 191;
+pub const SHA1MSG2: i32 = 192;
+pub const SHA256RNDS2: i32 = 193;  // (xmm0: the round constants plus message)
+pub const SHA256MSG1: i32 = 194;
+pub const SHA256MSG2: i32 = 195;
+pub const NSSE: i32 = 196;
 
-let mut table: [182]SseDesc = [SseDesc.{ pfx: 0, map: 0, opc: 0, w: 0, digit: -1, gpr_reg: false, gpr_rm: false,
-                                         vex_only: false, vl_ok: false, ew: 0 }; 182];
+let mut table: [196]SseDesc = [SseDesc.{ pfx: 0, map: 0, opc: 0, w: 0, digit: -1, gpr_reg: false, gpr_rm: false,
+                                         vex_only: false, vl_ok: false, ew: 0, legacy: false }; 196];
 let mut built: bool = false;
 
 fn set(id: i32, x: SseDesc) void {
@@ -508,6 +525,26 @@ fn build() void {
     x.opc = 0x09;
     x.ew = 1;
     set(VRNDSCALEPD, x);
+    let aes: [4]u8 = [0xdc, 0xdd, 0xde, 0xdf];
+    for k in @as(usize, 0)..4 {
+        x = d(P66, 2, aes[k]);
+        x.vl_ok = true;
+        set(AESENC + @int_cast(i32, k), x);
+    }
+    set(AESIMC, d(P66, 2, 0xdb));
+    set(AESKEYGEN, d(P66, 3, 0xdf));
+    x = d(P66, 3, 0x44);
+    x.vl_ok = true;
+    set(PCLMULQDQ, x);
+    let sha: [7]u8 = [0xcc, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd];
+    for k in @as(usize, 0)..7 {
+        x = d(N, 2, sha[k]);
+        if k == 0 {
+            x.map = 3;  // sha1rnds4: 0F 3A CC ib
+        }
+        x.legacy = true;
+        set(SHA1RNDS4 + @int_cast(i32, k), x);
+    }
     // the packed operations with 256-bit (VEX.L) and 512-bit (EVEX) forms,
     // and the ones whose EVEX form needs W for 64-bit lanes
     let full: [64]i32 = [MOVAPS, MOVDQU_LD, MOVDQU_ST, ADDPS, ADDPD, MULPS, MULPD, SUBPS, SUBPD, MINPS, MINPD, DIVPS,
@@ -862,7 +899,7 @@ pub fn sse(e: *mut Enc, id: i32, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
     if has_imm {
         imm_len = 1;
     }
-    if e.avx or x.vex_only {
+    if (e.avx or x.vex_only) and not x.legacy {
         let mut pp: u64 = 0;
         if x.pfx == 0x66 {
             pp = 1;

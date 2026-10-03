@@ -48,11 +48,15 @@ def main():
             zlib.decompress(z)
         report('deflate decompress', len(text) * 4, t0)
     if on('sha') or on('md5'):
-        for name in ['sha256', 'sha512', 'md5']:
+        for name in ['sha256', 'sha512', 'sha1', 'sha3_256', 'md5']:
             t0 = time.perf_counter()
             for _ in range(4):
                 hashlib.new(name, text).digest()
-            report(name, len(text) * 4, t0)
+            report(name.replace('_', '-'), len(text) * 4, t0)
+        t0 = time.perf_counter()
+        for _ in range(16):
+            zlib.crc32(text)
+        report('crc32', len(text) * 16, t0)
     if on('aes') or on('chacha'):
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305

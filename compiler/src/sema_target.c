@@ -131,6 +131,15 @@ typedef struct Need {
 
 static Need builtin_need(int id) {
     if (id == BI_X86_CPUID || id == BI_X86_XGETBV) return (Need){ARCH_X64, 0};
+    if (id >= BI_X86_AESENC && id <= BI_X86_AESKEYGENASSIST) return (Need){ARCH_X64, (uint64_t)1 << 12};  // aes
+    if (id == BI_X86_CLMUL) return (Need){ARCH_X64, (uint64_t)1 << 13};                                     // pclmul
+    if (id >= BI_X86_SHA1RNDS4 && id <= BI_X86_SHA256MSG2) return (Need){ARCH_X64, (uint64_t)1 << 14};      // sha
+    if (id == BI_X86_CRC32C) return (Need){ARCH_X64, (uint64_t)1 << 3};                                     // sse4.2
+    if (id >= BI_ARM_AESE && id <= BI_ARM_PMULL2) return (Need){ARCH_A64, (uint64_t)1 << 4};                // aes
+    if (id >= BI_ARM_SHA1C && id <= BI_ARM_SHA256SU1) return (Need){ARCH_A64, (uint64_t)1 << 5};            // sha2
+    if (id >= BI_ARM_SHA512H && id <= BI_ARM_SHA512SU1) return (Need){ARCH_A64, (uint64_t)1 << 7};          // sha512
+    if (id >= BI_ARM_EOR3 && id <= BI_ARM_XAR) return (Need){ARCH_A64, (uint64_t)1 << 6};                   // sha3
+    if (id == BI_ARM_CRC32 || id == BI_ARM_CRC32C) return (Need){ARCH_A64, (uint64_t)1 << 9};               // crc
     return (Need){0, 0};
 }
 

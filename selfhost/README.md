@@ -100,6 +100,11 @@ choice never changes what a program computes:
   the load-exclusive / store-exclusive loops of atomic read-modify-write and
   compare-and-swap with single instructions.
 
+The cryptographic builtins (`@x86_aesenc`, `@x86_clmul`, `@arm_sha256h`, ..., spec §13.5)
+are IR intrinsics (`ir.IN_AESENC` to `ir.IN_CRC32C_A`) that each backend encodes as its one
+instruction; `@x86_*` ones on 256- and 512-bit vectors are split into 128-bit parts unless
+the function has VAES or VPCLMULQDQ.
+
 Programs for another architecture are linked without a cross toolchain. `axiom test`
 and `axiom profile` run them under `qemu-<arch>` (with the target's C library from
 `/usr/<arch>-linux-gnu`) when the target is not the machine's.

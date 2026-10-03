@@ -1660,6 +1660,8 @@ out) for a target or function without them is `E0828`.
 | `@x86_cpuid(leaf, subleaf)` | `x86_64` | `u32x4`: `eax`, `ebx`, `ecx`, `edx` of the `cpuid` instruction |
 | `@x86_xgetbv(xcr)` | `x86_64` | `u64`: the extended control register (`xgetbv`; only when `cpuid` reports OSXSAVE) |
 
+The cryptographic instructions of §13.5 are builtins of this kind.
+
 **Start-up check.** A native program built for more than the architecture's baseline (any
 `--cpu` but the baseline, including the default `--target=native`, which means this
 machine's processor) checks the processor before `main` and exits with status 1 and a
@@ -1668,6 +1670,66 @@ message naming the missing extensions, instead of failing on an unsupported inst
 ```
 axiom: this program was built for processors with extensions this one lacks (--cpu=x86-64-v4); missing: avx512f avx512cd avx512bw avx512dq avx512vl
 ```
+
+### 13.5 Processor instructions for cryptography
+
+These builtins are single instructions of one architecture: AES rounds, carry-less
+multiplication, SHA rounds and message schedules, and CRC steps. Each needs its
+architecture and extension (`E0828`, §13.4), so they appear under a target condition or
+in a function with `@features` or `@multiversion`, next to a portable fallback. Their
+results are exactly those of the instruction (Intel's and Arm's manuals define them).
+Operand types are checked (`E0812`); an immediate must be a constant in range (`E0820`).
+
+In the table, `B` is `u8x16`, `D` is `u32x4`, `Q` is `u64x2`, and `V` is any 128-bit
+integer vector (the result has its type).
+
+| Builtin | Needs | Signature | Instruction |
+|---|---|---|---|
+| `@x86_aesenc(s, k)`, `@x86_aesenclast`, `@x86_aesdec`, `@x86_aesdeclast` | `x86_64`, `aes` | `B, B → B` (also `u8x32`, `u8x64`: each 128-bit part) | one AES round (`aesenc`, ...) |
+| `@x86_aesimc(k)` | `x86_64`, `aes` | `B → B` | InvMixColumns of a round key |
+| `@x86_aeskeygenassist(k, rcon)` | `x86_64`, `aes` | `B, const u8 → B` | key expansion assist |
+| `@x86_clmul(a, b, imm)` | `x86_64`, `pclmul` | `Q, Q, const u8 → Q` (also `u64x4`, `u64x8`) | 64×64 → 128-bit carry-less product of the halves `imm` selects: bit 0 for `a`, bit 4 for `b` (`pclmulqdq`) |
+| `@x86_sha1rnds4(abcd, e, f)` | `x86_64`, `sha` | `D, D, const 0..3 → D` | four SHA-1 rounds with function `f` |
+| `@x86_sha1nexte(a, b)`, `@x86_sha1msg1`, `@x86_sha1msg2` | `x86_64`, `sha` | `D, D → D` | SHA-1 E and message schedule |
+| `@x86_sha256rnds2(cdgh, abef, wk)` | `x86_64`, `sha` | `D, D, D → D` | two SHA-256 rounds (the words in the low half of `wk`) |
+| `@x86_sha256msg1(a, b)`, `@x86_sha256msg2` | `x86_64`, `sha` | `D, D → D` | SHA-256 message schedule |
+| `@x86_crc32c(crc, x)` | `x86_64`, `sse4.2` | `u32, u8/u16/u32/u64 → u32` | CRC-32C of `x`'s bytes (reflected, not inverted: `crc32`) |
+| `@arm_aese(s, k)`, `@arm_aesd` | `aarch64`, `aes` | `B, B → B` | AddRoundKey, SubBytes, ShiftRows (or their inverses) |
+| `@arm_aesmc(s)`, `@arm_aesimc` | `aarch64`, `aes` | `B → B` | MixColumns (or its inverse) |
+| `@arm_pmull(a, b)`, `@arm_pmull2` | `aarch64`, `aes` | `Q, Q → Q` | carry-less product of the low (`pmull2`: high) halves |
+| `@arm_sha1c(abcd, e, wk)`, `@arm_sha1p`, `@arm_sha1m` | `aarch64`, `sha2` | `D, u32, D → D` | four SHA-1 rounds: choose, parity, majority |
+| `@arm_sha1h(e)` | `aarch64`, `sha2` | `u32 → u32` | rotate left by 30 |
+| `@arm_sha1su0(a, b, c)`, `@arm_sha1su1(a, b)` | `aarch64`, `sha2` | `D, D, D → D`; `D, D → D` | SHA-1 message schedule |
+| `@arm_sha256h(abcd, efgh, wk)`, `@arm_sha256h2(efgh, abcd, wk)` | `aarch64`, `sha2` | `D, D, D → D` | four SHA-256 rounds |
+| `@arm_sha256su0(a, b)`, `@arm_sha256su1(a, b, c)` | `aarch64`, `sha2` | `D, D → D`; `D, D, D → D` | SHA-256 message schedule |
+| `@arm_sha512h(a, b, c)`, `@arm_sha512h2` | `aarch64`, `sha512` | `Q, Q, Q → Q` | two SHA-512 rounds |
+| `@arm_sha512su0(a, b)`, `@arm_sha512su1(a, b, c)` | `aarch64`, `sha512` | `Q, Q → Q`; `Q, Q, Q → Q` | SHA-512 message schedule |
+| `@arm_eor3(a, b, c)` | `aarch64`, `sha3` | `V, V, V → V` | `a ^ b ^ c` |
+| `@arm_bcax(a, b, c)` | `aarch64`, `sha3` | `V, V, V → V` | `a ^ (b & ~c)` |
+| `@arm_rax1(a, b)` | `aarch64`, `sha3` | `Q, Q → Q` | `a ^ @rotl(b, 1)` in each lane |
+| `@arm_xar(a, b, k)` | `aarch64`, `sha3` | `Q, Q, const 0..63 → Q` | `@rotr(a ^ b, k)` in each lane |
+| `@arm_crc32(crc, x)`, `@arm_crc32c` | `aarch64`, `crc` | `u32, u8/u16/u32/u64 → u32` | CRC-32 (or CRC-32C) of `x`'s bytes, reflected, not inverted |
+
+The 256- and 512-bit forms of `@x86_aesenc` and its kin and of `@x86_clmul` act on each
+128-bit part. They are single instructions where the build has `vaes` (or `vpclmulqdq`),
+and one instruction per part otherwise. On AArch64 `@x86_*` builtins do not exist, and on
+x86-64 `@arm_*` ones do not, so code for both architectures keeps each under its own
+target condition:
+
+```axiom
+fn crc32c_step(crc: u32, x: u64) u32 @multiversion("sse4.2", "crc") {
+    if @target_arch("x86_64") and @target_has("sse4.2") {
+        return @x86_crc32c(crc, x);
+    }
+    if @target_arch("aarch64") and @target_has("crc") {
+        return @arm_crc32c(crc, x);
+    }
+    return crc32c_table(crc, x);
+}
+```
+
+The standard library uses them in std/crypto (`aes_gcm`, `sha1`, `sha2`, `sha3`) and
+std/hash/crc, with the portable code where they are absent.
 
 ---
 
@@ -2602,7 +2664,7 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 
 ### A.8 Processor extensions
 
-See §13.4.
+See §13.4 and §13.5.
 
 | Builtin | Notes |
 |---|---|
@@ -2612,6 +2674,15 @@ See §13.4.
 | `@cpu_has("ext")` | `→ bool`: the running processor has extension `ext` |
 | `@x86_cpuid(leaf, subleaf)` | `u32, u32 → u32x4`; needs `x86_64` |
 | `@x86_xgetbv(xcr)` | `u32 → u64`; needs `x86_64` |
+| `@x86_aesenc(s, k)`, `@x86_aesenclast`, `@x86_aesdec`, `@x86_aesdeclast`, `@x86_aesimc`, `@x86_aeskeygenassist` | AES rounds and key expansion; need `x86_64`, `aes` (§13.5) |
+| `@x86_clmul(a, b, imm)` | carry-less multiplication; needs `x86_64`, `pclmul` (§13.5) |
+| `@x86_sha1rnds4`, `@x86_sha1nexte`, `@x86_sha1msg1`, `@x86_sha1msg2`, `@x86_sha256rnds2`, `@x86_sha256msg1`, `@x86_sha256msg2` | SHA-1 and SHA-256; need `x86_64`, `sha` (§13.5) |
+| `@x86_crc32c(crc, x)` | CRC-32C; needs `x86_64`, `sse4.2` (§13.5) |
+| `@arm_aese`, `@arm_aesd`, `@arm_aesmc`, `@arm_aesimc`, `@arm_pmull`, `@arm_pmull2` | AES and carry-less multiplication; need `aarch64`, `aes` (§13.5) |
+| `@arm_sha1c`, `@arm_sha1p`, `@arm_sha1m`, `@arm_sha1h`, `@arm_sha1su0`, `@arm_sha1su1`, `@arm_sha256h`, `@arm_sha256h2`, `@arm_sha256su0`, `@arm_sha256su1` | SHA-1 and SHA-256; need `aarch64`, `sha2` (§13.5) |
+| `@arm_sha512h`, `@arm_sha512h2`, `@arm_sha512su0`, `@arm_sha512su1` | SHA-512; need `aarch64`, `sha512` (§13.5) |
+| `@arm_eor3`, `@arm_bcax`, `@arm_rax1`, `@arm_xar` | SHA-3; need `aarch64`, `sha3` (§13.5) |
+| `@arm_crc32(crc, x)`, `@arm_crc32c(crc, x)` | CRC-32 and CRC-32C; need `aarch64`, `crc` (§13.5) |
 
 ---
 
@@ -2683,6 +2754,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C33 | Thread-local globals: `threadlocal let mut` (§12.8.6). This replaces the earlier "no thread-local storage" decision | The user asked for thread-locals. WebAssembly needed a per-instance block, set up by the thread start export |
 | C34 | Processor extensions in the language: target conditions (`@target_has`, `@target_arch`, `@target_os`) that select what is compiled, `@cpu_has`, and functions compiled for more extensions (`@features`, `@multiversion`) (§13.4) | Issue 0015: wider instruction sets need a way to choose between a fast path and a portable one, at build time or at run time. The dead branch is still type-checked, so it cannot rot unnoticed |
 | C35 | 256- and 512-bit vector types (`f32x8`, `i32x16`, `v512`, ...), with every operator and builtin of the 128-bit ones; passed in memory between functions (§5.8, §13.3) | Issue 0015: AVX2 and AVX-512 process 32 and 64 bytes at a time. On narrower targets the compiler splits them, so code written for the wide types is portable |
+| C36 | Builtins for the processors' cryptographic instructions: AES, carry-less multiplication, SHA-1, SHA-256, SHA-512, SHA-3 and CRC (`@x86_*`, `@arm_*`, §13.5) | Issue 0016: AES-GCM, SHA-2 and CRC run several times faster with them, and std chooses them at run time with `@multiversion` |
 
 ---
 

@@ -1837,6 +1837,136 @@ static LLVMValueRef piece16(LLVMValueRef v, unsigned k) {
     return LLVMBuildShuffleVector(B, v, LLVMGetUndef(LLVMTypeOf(v)), LLVMConstVector(m, 16), "");
 }
 
+// The processor instructions of spec §13.5, as LLVM's intrinsics. A
+// 256- or 512-bit AES round or carry-less multiply in a function without
+// VAES / VPCLMULQDQ is done on each 128-bit part.
+static LLVMValueRef insn_call(const char *name, LLVMTypeRef ret, LLVMValueRef *args, int n) {
+    LLVMTypeRef ps[4];
+    for (int i = 0; i < n; i++) ps[i] = LLVMTypeOf(args[i]);
+    LLVMTypeRef fty = LLVMFunctionType(ret, ps, (unsigned)n, false);
+    LLVMValueRef f = LLVMGetNamedFunction(mod, name);
+    if (!f) f = LLVMAddFunction(mod, name, fty);
+    return LLVMBuildCall2(B, fty, f, args, (unsigned)n, "");
+}
+
+static LLVMValueRef v2i64(LLVMValueRef v, unsigned lanes) {
+    return LLVMBuildBitCast(B, v, LLVMVectorType(T_i64, lanes), "");
+}
+
+static LLVMValueRef part_of(LLVMValueRef v, unsigned k, unsigned n) {
+    LLVMValueRef m[8];
+    for (unsigned i = 0; i < n; i++) m[i] = LLVMConstInt(T_i32, k * n + i, false);
+    return LLVMBuildShuffleVector(B, v, LLVMGetUndef(LLVMTypeOf(v)), LLVMConstVector(m, n), "");
+}
+
+static LLVMValueRef gen_insn(Expr *e, Type *rt) {
+    int id = e->index;
+    int n = e->bargs.len;
+    LLVMValueRef a[3];
+    for (int i = 0; i < n; i++) a[i] = gen(e->bargs.data[i].e);
+    LLVMTypeRef t = lty(rt);
+    LLVMTypeRef v4 = LLVMVectorType(T_i32, 4), v2 = LLVMVectorType(T_i64, 2), v16 = LLVMVectorType(T_i8, 16);
+    if ((id >= BI_X86_AESENC && id <= BI_X86_AESDECLAST) || id == BI_X86_CLMUL) {
+        static const char *const nm[] = {"aesenc", "aesenclast", "aesdec", "aesdeclast"};
+        bool clmul = id == BI_X86_CLMUL;
+        unsigned bytes = (unsigned)type_size(rt), q = bytes / 8;
+        bool wide_ok = bytes == 16 || (g_features & (clmul ? ((uint64_t)1 << 33) : ((uint64_t)1 << 32)));
+        if (!wide_ok) {
+            // each 128-bit part on its own
+            LLVMValueRef r = LLVMGetUndef(LLVMVectorType(T_i64, q));
+            for (unsigned k = 0; k < q / 2; k++) {
+                LLVMValueRef args[3] = {part_of(v2i64(a[0], q), k, 2), part_of(v2i64(a[1], q), k, 2),
+                                        clmul ? LLVMBuildTrunc(B, a[2], T_i8, "") : NULL};
+                LLVMValueRef p = insn_call(clmul ? "llvm.x86.pclmulqdq" : arena_printf("llvm.x86.aesni.%s", nm[id - BI_X86_AESENC]),
+                                           v2, args, clmul ? 3 : 2);
+                for (unsigned j = 0; j < 2; j++)
+                    r = LLVMBuildInsertElement(B, r, LLVMBuildExtractElement(B, p, LLVMConstInt(T_i32, j, false), ""),
+                                               LLVMConstInt(T_i32, 2 * k + j, false), "");
+            }
+            return LLVMBuildBitCast(B, r, t, "");
+        }
+        const char *suffix = bytes == 32 ? ".256" : bytes == 64 ? ".512" : "";
+        LLVMValueRef args[3] = {v2i64(a[0], q), v2i64(a[1], q), clmul ? LLVMBuildTrunc(B, a[2], T_i8, "") : NULL};
+        const char *name = clmul ? arena_printf("llvm.x86.pclmulqdq%s", suffix)
+                                 : arena_printf("llvm.x86.aesni.%s%s", nm[id - BI_X86_AESENC], suffix);
+        return LLVMBuildBitCast(B, insn_call(name, LLVMVectorType(T_i64, q), args, clmul ? 3 : 2), t, "");
+    }
+    switch (id) {
+    case BI_X86_AESIMC: {
+        LLVMValueRef x = v2i64(a[0], 2);
+        return LLVMBuildBitCast(B, insn_call("llvm.x86.aesni.aesimc", v2, &x, 1), t, "");
+    }
+    case BI_X86_AESKEYGENASSIST: {
+        LLVMValueRef args[2] = {v2i64(a[0], 2), LLVMBuildTrunc(B, a[1], T_i8, "")};
+        return LLVMBuildBitCast(B, insn_call("llvm.x86.aesni.aeskeygenassist", v2, args, 2), t, "");
+    }
+    case BI_X86_SHA1RNDS4: {
+        LLVMValueRef args[3] = {a[0], a[1], LLVMBuildTrunc(B, a[2], T_i8, "")};
+        return insn_call("llvm.x86.sha1rnds4", v4, args, 3);
+    }
+    case BI_X86_SHA1NEXTE: return insn_call("llvm.x86.sha1nexte", v4, a, 2);
+    case BI_X86_SHA1MSG1: return insn_call("llvm.x86.sha1msg1", v4, a, 2);
+    case BI_X86_SHA1MSG2: return insn_call("llvm.x86.sha1msg2", v4, a, 2);
+    case BI_X86_SHA256RNDS2: return insn_call("llvm.x86.sha256rnds2", v4, a, 3);
+    case BI_X86_SHA256MSG1: return insn_call("llvm.x86.sha256msg1", v4, a, 2);
+    case BI_X86_SHA256MSG2: return insn_call("llvm.x86.sha256msg2", v4, a, 2);
+    case BI_X86_CRC32C: {
+        unsigned bits = LLVMGetIntTypeWidth(LLVMTypeOf(a[1]));
+        if (bits == 64) {
+            LLVMValueRef args[2] = {LLVMBuildZExt(B, a[0], T_i64, ""), a[1]};
+            return LLVMBuildTrunc(B, insn_call("llvm.x86.sse42.crc32.64.64", T_i64, args, 2), T_i32, "");
+        }
+        return insn_call(arena_printf("llvm.x86.sse42.crc32.32.%u", bits), T_i32, a, 2);
+    }
+    case BI_ARM_AESE: return insn_call("llvm.aarch64.crypto.aese", v16, a, 2);
+    case BI_ARM_AESD: return insn_call("llvm.aarch64.crypto.aesd", v16, a, 2);
+    case BI_ARM_AESMC: return insn_call("llvm.aarch64.crypto.aesmc", v16, a, 1);
+    case BI_ARM_AESIMC: return insn_call("llvm.aarch64.crypto.aesimc", v16, a, 1);
+    case BI_ARM_PMULL:
+    case BI_ARM_PMULL2: {
+        unsigned lane = id == BI_ARM_PMULL2;
+        LLVMValueRef args[2] = {LLVMBuildExtractElement(B, a[0], LLVMConstInt(T_i32, lane, false), ""),
+                                LLVMBuildExtractElement(B, a[1], LLVMConstInt(T_i32, lane, false), "")};
+        return LLVMBuildBitCast(B, insn_call("llvm.aarch64.neon.pmull64", v16, args, 2), t, "");
+    }
+    case BI_ARM_SHA1C: return insn_call("llvm.aarch64.crypto.sha1c", v4, a, 3);
+    case BI_ARM_SHA1P: return insn_call("llvm.aarch64.crypto.sha1p", v4, a, 3);
+    case BI_ARM_SHA1M: return insn_call("llvm.aarch64.crypto.sha1m", v4, a, 3);
+    case BI_ARM_SHA1H: return insn_call("llvm.aarch64.crypto.sha1h", T_i32, a, 1);
+    case BI_ARM_SHA1SU0: return insn_call("llvm.aarch64.crypto.sha1su0", v4, a, 3);
+    case BI_ARM_SHA1SU1: return insn_call("llvm.aarch64.crypto.sha1su1", v4, a, 2);
+    case BI_ARM_SHA256H: return insn_call("llvm.aarch64.crypto.sha256h", v4, a, 3);
+    case BI_ARM_SHA256H2: return insn_call("llvm.aarch64.crypto.sha256h2", v4, a, 3);
+    case BI_ARM_SHA256SU0: return insn_call("llvm.aarch64.crypto.sha256su0", v4, a, 2);
+    case BI_ARM_SHA256SU1: return insn_call("llvm.aarch64.crypto.sha256su1", v4, a, 3);
+    case BI_ARM_SHA512H: return insn_call("llvm.aarch64.crypto.sha512h", v2, a, 3);
+    case BI_ARM_SHA512H2: return insn_call("llvm.aarch64.crypto.sha512h2", v2, a, 3);
+    case BI_ARM_SHA512SU0: return insn_call("llvm.aarch64.crypto.sha512su0", v2, a, 2);
+    case BI_ARM_SHA512SU1: return insn_call("llvm.aarch64.crypto.sha512su1", v2, a, 3);
+    case BI_ARM_EOR3:
+    case BI_ARM_BCAX: {
+        LLVMValueRef args[3] = {LLVMBuildBitCast(B, a[0], v16, ""), LLVMBuildBitCast(B, a[1], v16, ""),
+                                LLVMBuildBitCast(B, a[2], v16, "")};
+        const char *name = id == BI_ARM_EOR3 ? "llvm.aarch64.crypto.eor3u.v16i8" : "llvm.aarch64.crypto.bcaxu.v16i8";
+        return LLVMBuildBitCast(B, insn_call(name, v16, args, 3), t, "");
+    }
+    case BI_ARM_RAX1: return insn_call("llvm.aarch64.crypto.rax1", v2, a, 2);
+    case BI_ARM_XAR: {
+        LLVMValueRef args[3] = {a[0], a[1], LLVMBuildZExt(B, a[2], T_i64, "")};
+        return insn_call("llvm.aarch64.crypto.xar", v2, args, 3);
+    }
+    case BI_ARM_CRC32:
+    case BI_ARM_CRC32C: {
+        unsigned bits = LLVMGetIntTypeWidth(LLVMTypeOf(a[1]));
+        const char *sfx = bits == 8 ? "b" : bits == 16 ? "h" : bits == 32 ? "w" : "x";
+        LLVMValueRef args[2] = {a[0], bits < 32 ? LLVMBuildZExt(B, a[1], T_i32, "") : a[1]};
+        return insn_call(arena_printf("llvm.aarch64.crc32%s%s", id == BI_ARM_CRC32C ? "c" : "", sfx), T_i32, args, 2);
+    }
+    }
+    internal_error("processor instruction builtin");
+    return NULL;
+}
+
 static LLVMValueRef gen_builtin(Expr *e) {
     BuiltinArg *a = e->bargs.data;
     Type *rt = ct(e->type);
@@ -2322,7 +2452,9 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef f = error_name_fn(&fty);
         return LLVMBuildCall2(B, fty, f, &code, 1, "");
     }
-    default: break;
+    default:
+        if (e->index >= BI_X86_AESENC && e->index <= BI_ARM_CRC32C) return gen_insn(e, rt);
+        break;
     }
     internal_error(arena_printf("builtin @%s not implemented", e->name));
     return NULL;

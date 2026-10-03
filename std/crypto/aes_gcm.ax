@@ -7,10 +7,16 @@
 //     g.open(nonce, aad, sealed, out)!;            // AuthFailed if forged
 //
 // Nonces are 12 bytes and must never repeat under one key. The cipher runs
-// in time independent of the key and data: the S-box is 16 table lookups
-// with vector shuffles over all 256 entries (no memory access depends on a
-// secret), and GHASH multiplies with integer multiplications whose unused
-// bits are masked off (after BearSSL's ghash_ctmul64).
+// in time independent of the key and data. Where the processor has AES and
+// carry-less multiplication instructions (AES-NI and PCLMULQDQ on x86-64,
+// the ARMv8 AES instructions and PMULL on AArch64), they do the work, eight
+// counter blocks at a time and GHASH four blocks per reduction; those
+// instructions take the same time for every input. Elsewhere the S-box is
+// 16 table lookups with vector shuffles over all 256 entries (no memory
+// access depends on a secret), and GHASH multiplies with integer
+// multiplications whose unused bits are masked off (after BearSSL's
+// ghash_ctmul64). The choice is made at run time (@multiversion, spec
+// §13.4) unless the build's processor has the instructions anyway.
 // =============================================================================
 
 import "subtle.ax" as subtle;
@@ -627,6 +633,7 @@ fn mix_columns(a: u8x16) u8x16 {
 
 pub struct Aes {
     rk: [15]u8x16,
+    dk: [15]u8x16,  // InvMixColumns of the middle round keys: the hardware's decryption rounds take them
     rounds: usize,
 
     /// Expands a 16-, 24- or 32-byte key (AES-128, -192, -256).
@@ -656,7 +663,7 @@ pub struct Aes {
             }
             w[i] = w[i - nk] ^ t;
         }
-        let mut a = Aes.{ rk: [@splat(@as(u8, 0)); 15], rounds: rounds };
+        let mut a = Aes.{ rk: [@splat(@as(u8, 0)); 15], dk: [@splat(@as(u8, 0)); 15], rounds: rounds };
         for r in 0..rounds + 1 {
             let mut b: [16]u8 = [0; 16];
             for c in @as(usize, 0)..4 {
@@ -668,10 +675,23 @@ pub struct Aes {
             }
             a.rk[r] = @load(u8x16, b[..]);
         }
+        for r in 1..rounds {
+            a.dk[r] = inv_mix_columns(a.rk[r]);
+        }
         return a;
     }
 
+    /// Encrypts one block.
     pub fn encrypt_block(self: *Aes, input: u8x16) u8x16 {
+        return enc_block(self, input);
+    }
+
+    /// Decrypts one block (the inverse cipher).
+    pub fn decrypt_block(self: *Aes, input: u8x16) u8x16 {
+        return dec_block(self, input);
+    }
+
+    fn encrypt_soft(self: *Aes, input: u8x16) u8x16 {
         let mut s = input ^ self.rk[0];
         for r in 1..self.rounds {
             s = mix_columns(shift_rows(sub_bytes(s))) ^ self.rk[r];
@@ -679,8 +699,7 @@ pub struct Aes {
         return shift_rows(sub_bytes(s)) ^ self.rk[self.rounds];
     }
 
-    /// Decrypts one block (the inverse cipher).
-    pub fn decrypt_block(self: *Aes, input: u8x16) u8x16 {
+    fn decrypt_soft(self: *Aes, input: u8x16) u8x16 {
         let mut s = input ^ self.rk[self.rounds];
         let mut r = self.rounds - 1;
         while r > 0 {
@@ -706,6 +725,168 @@ pub struct Aes {
         for i in @as(usize, 0)..4 {
             b[i] = shift_rows(b[i]) ^ self.rk[self.rounds];
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AES with the processor's instructions (spec §13.5): x86-64's aesenc runs a
+// whole round (SubBytes, ShiftRows, MixColumns, AddRoundKey); AArch64's
+// aese is AddRoundKey, SubBytes and ShiftRows, and aesmc MixColumns. Both
+// decrypt with the equivalent inverse cipher (the dk round keys).
+// -----------------------------------------------------------------------------
+fn enc_block(a: *Aes, x: u8x16) u8x16 @multiversion("aes") {
+    if @target_arch("x86_64") and @target_has("aes") {
+        let mut s = x ^ a.rk[0];
+        for r in 1..a.rounds {
+            s = @x86_aesenc(s, a.rk[r]);
+        }
+        return @x86_aesenclast(s, a.rk[a.rounds]);
+    }
+    if @target_arch("aarch64") and @target_has("aes") {
+        let mut s = x;
+        for r in 0..a.rounds - 1 {
+            s = @arm_aesmc(@arm_aese(s, a.rk[r]));
+        }
+        return @arm_aese(s, a.rk[a.rounds - 1]) ^ a.rk[a.rounds];
+    }
+    return a.encrypt_soft(x);
+}
+
+fn dec_block(a: *Aes, x: u8x16) u8x16 @multiversion("aes") {
+    if @target_arch("x86_64") and @target_has("aes") {
+        let mut s = x ^ a.rk[a.rounds];
+        let mut r = a.rounds - 1;
+        while r > 0 {
+            s = @x86_aesdec(s, a.dk[r]);
+            r -= 1;
+        }
+        return @x86_aesdeclast(s, a.rk[0]);
+    }
+    if @target_arch("aarch64") and @target_has("aes") {
+        let mut s = @arm_aesd(x, a.rk[a.rounds]);
+        let mut r = a.rounds - 1;
+        while r > 0 {
+            s = @arm_aesd(@arm_aesimc(s), a.dk[r]);
+            r -= 1;
+        }
+        return s ^ a.rk[0];
+    }
+    return a.decrypt_soft(x);
+}
+
+// Eight blocks through all the rounds at once: independent chains keep the
+// processor's AES units busy.
+fn enc8(a: *Aes, b: *mut [8]u8x16) void @features("aes") {
+    if @target_arch("x86_64") {
+        let k0 = a.rk[0];
+        let mut s0 = b[0] ^ k0;
+        let mut s1 = b[1] ^ k0;
+        let mut s2 = b[2] ^ k0;
+        let mut s3 = b[3] ^ k0;
+        let mut s4 = b[4] ^ k0;
+        let mut s5 = b[5] ^ k0;
+        let mut s6 = b[6] ^ k0;
+        let mut s7 = b[7] ^ k0;
+        for r in 1..a.rounds {
+            let k = a.rk[r];
+            s0 = @x86_aesenc(s0, k);
+            s1 = @x86_aesenc(s1, k);
+            s2 = @x86_aesenc(s2, k);
+            s3 = @x86_aesenc(s3, k);
+            s4 = @x86_aesenc(s4, k);
+            s5 = @x86_aesenc(s5, k);
+            s6 = @x86_aesenc(s6, k);
+            s7 = @x86_aesenc(s7, k);
+        }
+        let kl = a.rk[a.rounds];
+        b[0] = @x86_aesenclast(s0, kl);
+        b[1] = @x86_aesenclast(s1, kl);
+        b[2] = @x86_aesenclast(s2, kl);
+        b[3] = @x86_aesenclast(s3, kl);
+        b[4] = @x86_aesenclast(s4, kl);
+        b[5] = @x86_aesenclast(s5, kl);
+        b[6] = @x86_aesenclast(s6, kl);
+        b[7] = @x86_aesenclast(s7, kl);
+    }
+    if @target_arch("aarch64") {
+        let mut s0 = b[0];
+        let mut s1 = b[1];
+        let mut s2 = b[2];
+        let mut s3 = b[3];
+        let mut s4 = b[4];
+        let mut s5 = b[5];
+        let mut s6 = b[6];
+        let mut s7 = b[7];
+        for r in 0..a.rounds - 1 {
+            let k = a.rk[r];
+            s0 = @arm_aesmc(@arm_aese(s0, k));
+            s1 = @arm_aesmc(@arm_aese(s1, k));
+            s2 = @arm_aesmc(@arm_aese(s2, k));
+            s3 = @arm_aesmc(@arm_aese(s3, k));
+            s4 = @arm_aesmc(@arm_aese(s4, k));
+            s5 = @arm_aesmc(@arm_aese(s5, k));
+            s6 = @arm_aesmc(@arm_aese(s6, k));
+            s7 = @arm_aesmc(@arm_aese(s7, k));
+        }
+        let kp = a.rk[a.rounds - 1];
+        let kl = a.rk[a.rounds];
+        b[0] = @arm_aese(s0, kp) ^ kl;
+        b[1] = @arm_aese(s1, kp) ^ kl;
+        b[2] = @arm_aese(s2, kp) ^ kl;
+        b[3] = @arm_aese(s3, kp) ^ kl;
+        b[4] = @arm_aese(s4, kp) ^ kl;
+        b[5] = @arm_aese(s5, kp) ^ kl;
+        b[6] = @arm_aese(s6, kp) ^ kl;
+        b[7] = @arm_aese(s7, kp) ^ kl;
+    }
+}
+
+/// CTR: data XOR the encryptions of counter blocks j+1, j+2, ... (the last
+/// 32 bits incremented) into out; j ends at the last block used.
+fn ctr_blocks(a: *Aes, j: *mut [16]u8, data: []u8, out: []mut u8) void @multiversion("aes") {
+    let mut i: usize = 0;
+    if @target_has("aes") {
+        let mut eight: [8]u8x16 = [@splat(@as(u8, 0)); 8];
+        while (i + 128) <= data.len {
+            for k in @as(usize, 0)..8 {
+                inc32(j);
+                eight[k] = @load(u8x16, j[..]);
+            }
+            enc8(a, &mut eight);
+            for k in @as(usize, 0)..8 {
+                let o = i + (16 * k);
+                @store(out[o..o + 16], @load(u8x16, data[o..o + 16]) ^ eight[k]);
+            }
+            i += 128;
+        }
+    } else {
+        let mut four: [4]u8x16 = [@splat(@as(u8, 0)); 4];
+        while (i + 64) <= data.len {
+            for k in @as(usize, 0)..4 {
+                inc32(j);
+                four[k] = @load(u8x16, j[..]);
+            }
+            a.encrypt4(&mut four);
+            for k in @as(usize, 0)..4 {
+                let o = i + (16 * k);
+                @store(out[o..o + 16], @load(u8x16, data[o..o + 16]) ^ four[k]);
+            }
+            i += 64;
+        }
+    }
+    let mut ks: [16]u8 = [0; 16];
+    while i < data.len {
+        inc32(j);
+        @store(ks[..], enc_block(a, @load(u8x16, j[..])));
+        let n = @min(16, data.len - i);
+        if n == 16 {
+            @store(out[i..i + 16], @load(u8x16, data[i..i + 16]) ^ @load(u8x16, ks[..]));
+        } else {
+            for k in 0..n {
+                out[i + k] = data[i + k] ^ ks[k];
+            }
+        }
+        i += n;
     }
 }
 
@@ -843,6 +1024,196 @@ struct Ghash {
 }
 
 // -----------------------------------------------------------------------------
+// GHASH with carry-less multiplication instructions. A block is the 128-bit
+// big-endian integer y1:y0 (as Ghash's words: bit 127 is GCM's first bit),
+// held as the u64x2 [y0, y1]: the block's bytes reversed. The product of
+// two such values is three 64x64-bit carry-less products (Karatsuba), and
+// the 256-bit result is shifted and reduced as Ghash.block does. Four
+// blocks share one reduction: y = (y ^ x0) H^4 ^ x1 H^3 ^ x2 H^2 ^ x3 H.
+// -----------------------------------------------------------------------------
+
+/// The 256-bit carry-less product of a and b, as words v0 (lowest) .. v3.
+struct Wide {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+}
+
+fn swap64(x: u64x2) u64x2 {
+    return @shuffle(x, x, [1, 0]);
+}
+
+fn rev_block(b: u8x16) u64x2 {
+    return @bit_cast(u64x2, @shuffle(b, b, [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]));
+}
+
+// (The x86-64 functions need PCLMULQDQ, the AArch64 ones the AES
+// extension's PMULL; each exists only on its architecture.)
+fn clmul_wide_x86(a: u64x2, b: u64x2) Wide @features("pclmul") {
+    let mut lo: u64x2 = @splat(@as(u64, 0));
+    let mut hi = lo;
+    let mut mid = lo;
+    if @target_arch("x86_64") {
+        lo = @x86_clmul(a, b, 0x00);
+        hi = @x86_clmul(a, b, 0x11);
+        mid = @x86_clmul(a ^ swap64(a), b ^ swap64(b), 0x00);
+    }
+    mid = (mid ^ lo) ^ hi;
+    return Wide.{ v0: @extract_lane(lo, 0), v1: @extract_lane(lo, 1) ^ @extract_lane(mid, 0),
+                  v2: @extract_lane(hi, 0) ^ @extract_lane(mid, 1), v3: @extract_lane(hi, 1) };
+}
+
+fn clmul_wide_arm(a: u64x2, b: u64x2) Wide @features("aes") {
+    let mut lo: u64x2 = @splat(@as(u64, 0));
+    let mut hi = lo;
+    let mut mid = lo;
+    if @target_arch("aarch64") {
+        lo = @arm_pmull(a, b);
+        hi = @arm_pmull2(a, b);
+        mid = @arm_pmull(a ^ swap64(a), b ^ swap64(b));
+    }
+    mid = (mid ^ lo) ^ hi;
+    return Wide.{ v0: @extract_lane(lo, 0), v1: @extract_lane(lo, 1) ^ @extract_lane(mid, 0),
+                  v2: @extract_lane(hi, 0) ^ @extract_lane(mid, 1), v3: @extract_lane(hi, 1) };
+}
+
+/// One bit left (the reflected order), then reduced by x^128 + x^7 + x^2 + x + 1.
+fn reduce(w: Wide) u64x2 {
+    let mut v0 = w.v0;
+    let mut v1 = w.v1;
+    let mut v2 = w.v2;
+    let mut v3 = w.v3;
+    v3 = (v3 << 1) | (v2 >> 63);
+    v2 = (v2 << 1) | (v1 >> 63);
+    v1 = (v1 << 1) | (v0 >> 63);
+    v0 = v0 << 1;
+    v2 = v2 ^ (((v0 ^ (v0 >> 1)) ^ (v0 >> 2)) ^ (v0 >> 7));
+    v1 = v1 ^ (((v0 << 63) ^ (v0 << 62)) ^ (v0 << 57));
+    v3 = v3 ^ (((v1 ^ (v1 >> 1)) ^ (v1 >> 2)) ^ (v1 >> 7));
+    v2 = v2 ^ (((v1 << 63) ^ (v1 << 62)) ^ (v1 << 57));
+    return @vec(u64x2, v2, v3);
+}
+
+fn xor_wide(a: Wide, b: Wide) Wide {
+    return Wide.{ v0: a.v0 ^ b.v0, v1: a.v1 ^ b.v1, v2: a.v2 ^ b.v2, v3: a.v3 ^ b.v3 };
+}
+
+fn gmul_x86(a: u64x2, b: u64x2) u64x2 @features("pclmul") {
+    return reduce(clmul_wide_x86(a, b));
+}
+
+fn gmul_arm(a: u64x2, b: u64x2) u64x2 @features("aes") {
+    return reduce(clmul_wide_arm(a, b));
+}
+
+/// GHASH of aad then ct (each zero-padded) then their bit lengths, under
+/// the hash key h; the result as bytes. With the processor's carry-less
+/// multiplication where it has it.
+fn ghash(h: *[16]u8, aad: []u8, ct: []u8) [16]u8 @multiversion("pclmul", "aes") {
+    let mut s: [16]u8 = [0; 16];
+    if @target_arch("x86_64") and @target_has("pclmul") {
+        let hk = rev_block(@load(u8x16, h[..]));
+        let hp = powers_x86(hk);
+        let mut y: u64x2 = @splat(@as(u64, 0));
+        y = absorb_x86(y, &hp, aad);
+        y = absorb_x86(y, &hp, ct);
+        y = gmul_x86(y ^ @vec(u64x2, @as(u64, ct.len) * 8, @as(u64, aad.len) * 8), hk);
+        @store(s[..],
+               @bit_cast(
+                   u8x16,
+                   @shuffle(@bit_cast(u8x16, y), @bit_cast(u8x16, y), [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
+                                                                       1, 0])));
+        return s;
+    }
+    if @target_arch("aarch64") and @target_has("aes") {
+        let hk = rev_block(@load(u8x16, h[..]));
+        let hp = powers_arm(hk);
+        let mut y: u64x2 = @splat(@as(u64, 0));
+        y = absorb_arm(y, &hp, aad);
+        y = absorb_arm(y, &hp, ct);
+        y = gmul_arm(y ^ @vec(u64x2, @as(u64, ct.len) * 8, @as(u64, aad.len) * 8), hk);
+        @store(s[..],
+               @bit_cast(
+                   u8x16,
+                   @shuffle(@bit_cast(u8x16, y), @bit_cast(u8x16, y), [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
+                                                                       1, 0])));
+        return s;
+    }
+    let mut g = Ghash.init(h[..]);
+    g.padded(aad);
+    g.padded(ct);
+    let mut lens: [16]u8 = [0; 16];
+    put_be64(lens[0..8], @as(u64, aad.len) * 8);
+    put_be64(lens[8..16], @as(u64, ct.len) * 8);
+    g.block(lens[..]);
+    put_be64(s[0..8], g.y1);
+    put_be64(s[8..16], g.y0);
+    return s;
+}
+
+/// H, H^2, H^3, H^4.
+fn powers_x86(h: u64x2) [4]u64x2 @features("pclmul") {
+    let h2 = gmul_x86(h, h);
+    let h3 = gmul_x86(h2, h);
+    return [h, h2, h3, gmul_x86(h3, h)];
+}
+
+fn powers_arm(h: u64x2) [4]u64x2 @features("aes") {
+    let h2 = gmul_arm(h, h);
+    let h3 = gmul_arm(h2, h);
+    return [h, h2, h3, gmul_arm(h3, h)];
+}
+
+/// y after absorbing data (zero-padded to whole blocks), four blocks per
+/// reduction.
+fn absorb_x86(y0: u64x2, hp: *[4]u64x2, data: []u8) u64x2 @features("pclmul") {
+    let mut y = y0;
+    let mut i: usize = 0;
+    while (i + 64) <= data.len {
+        let x0 = rev_block(@load(u8x16, data[i..i + 16])) ^ y;
+        let x1 = rev_block(@load(u8x16, data[i + 16..i + 32]));
+        let x2 = rev_block(@load(u8x16, data[i + 32..i + 48]));
+        let x3 = rev_block(@load(u8x16, data[i + 48..i + 64]));
+        let w = xor_wide(xor_wide(clmul_wide_x86(x0, hp[3]), clmul_wide_x86(x1, hp[2])),
+                         xor_wide(clmul_wide_x86(x2, hp[1]), clmul_wide_x86(x3, hp[0])));
+        y = reduce(w);
+        i += 64;
+    }
+    while i < data.len {
+        let mut b: [16]u8 = [0; 16];
+        let n = @min(16, data.len - i);
+        @mem_copy(b[..n], data[i..i + n]);
+        y = gmul_x86(y ^ rev_block(@load(u8x16, b[..])), hp[0]);
+        i += n;
+    }
+    return y;
+}
+
+fn absorb_arm(y0: u64x2, hp: *[4]u64x2, data: []u8) u64x2 @features("aes") {
+    let mut y = y0;
+    let mut i: usize = 0;
+    while (i + 64) <= data.len {
+        let x0 = rev_block(@load(u8x16, data[i..i + 16])) ^ y;
+        let x1 = rev_block(@load(u8x16, data[i + 16..i + 32]));
+        let x2 = rev_block(@load(u8x16, data[i + 32..i + 48]));
+        let x3 = rev_block(@load(u8x16, data[i + 48..i + 64]));
+        let w = xor_wide(xor_wide(clmul_wide_arm(x0, hp[3]), clmul_wide_arm(x1, hp[2])),
+                         xor_wide(clmul_wide_arm(x2, hp[1]), clmul_wide_arm(x3, hp[0])));
+        y = reduce(w);
+        i += 64;
+    }
+    while i < data.len {
+        let mut b: [16]u8 = [0; 16];
+        let n = @min(16, data.len - i);
+        @mem_copy(b[..n], data[i..i + n]);
+        y = gmul_arm(y ^ rev_block(@load(u8x16, b[..])), hp[0]);
+        i += n;
+    }
+    return y;
+}
+
+// -----------------------------------------------------------------------------
 // GCM
 // -----------------------------------------------------------------------------
 
@@ -860,47 +1231,11 @@ pub struct AesGcm {
     /// XORs data with the keystream from counter block j (incremented per
     /// block in its last 32 bits) into out.
     fn ctr(self: *AesGcm, j: *mut [16]u8, data: []u8, out: []mut u8) void {
-        let mut i: usize = 0;
-        let mut ks: [16]u8 = [0; 16];
-        let mut four: [4]u8x16 = [@splat(@as(u8, 0)); 4];
-        while (i + 64) <= data.len {
-            for k in @as(usize, 0)..4 {
-                inc32(j);
-                four[k] = @load(u8x16, j[..]);
-            }
-            self.aes.encrypt4(&mut four);
-            for k in @as(usize, 0)..4 {
-                let o = i + (16 * k);
-                @store(out[o..o + 16], @load(u8x16, data[o..o + 16]) ^ four[k]);
-            }
-            i += 64;
-        }
-        while i < data.len {
-            inc32(j);
-            @store(ks[..], self.aes.encrypt_block(@load(u8x16, j[..])));
-            let n = @min(16, data.len - i);
-            if n == 16 {
-                @store(out[i..i + 16], @load(u8x16, data[i..i + 16]) ^ @load(u8x16, ks[..]));
-            } else {
-                for k in 0..n {
-                    out[i + k] = data[i + k] ^ ks[k];
-                }
-            }
-            i += n;
-        }
+        ctr_blocks(&self.aes, j, data, out);
     }
 
     fn tag(self: *AesGcm, j0: *[16]u8, aad: []u8, ct: []u8, out: []mut u8) void {
-        let mut g = Ghash.init(self.h[..]);
-        g.padded(aad);
-        g.padded(ct);
-        let mut lens: [16]u8 = [0; 16];
-        put_be64(lens[0..8], @as(u64, aad.len) * 8);
-        put_be64(lens[8..16], @as(u64, ct.len) * 8);
-        g.block(lens[..]);
-        let mut s: [16]u8 = [0; 16];
-        put_be64(s[0..8], g.y1);
-        put_be64(s[8..16], g.y0);
+        let s = ghash(&self.h, aad, ct);
         let e = self.aes.encrypt_block(@load(u8x16, j0[..]));
         @store(out[..16], @load(u8x16, s[..]) ^ e);
     }
@@ -1051,4 +1386,70 @@ test "gcm on several blocks at once" {
     let mut back: [200]u8 = [0; 200];
     g.open(nonce[..], "hdr", o[..], back[..])!;
     @expect_eq(back[..], pt[..]);
+}
+
+// a deterministic stream of test bytes (xorshift)
+fn fill(state: *mut u64, out: []mut u8) void {
+    for i in 0..out.len {
+        let mut x = state.*;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state.* = x;
+        out[i] = @truncate(u8, x >> 24);
+    }
+}
+
+test "the processor's instructions agree with the portable code" {
+    let mut st: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut key: [32]u8 = [0; 32];
+    let mut blk: [16]u8 = [0; 16];
+    let mut h: [16]u8 = [0; 16];
+    let mut aad: [300]u8 = [0; 300];
+    let mut data: [300]u8 = [0; 300];
+    let mut o1: [300]u8 = [0; 300];
+    let mut o2: [300]u8 = [0; 300];
+    for t in @as(usize, 0)..60 {
+        let klen = [@as(usize, 16), 24, 32][t % 3];
+        fill(&mut st, key[..klen]);
+        let a = Aes.init(key[..klen])!;
+        fill(&mut st, blk[..]);
+        let x = @load(u8x16, blk[..]);
+        @expect(@all_true(@lanes_eq(enc_block(&a, x), a.encrypt_soft(x))));
+        @expect(@all_true(@lanes_eq(dec_block(&a, x), a.decrypt_soft(x))));
+        // CTR at lengths around the 8-block steps
+        let n = (t * 37) % 300;
+        fill(&mut st, data[..n]);
+        let mut j: [16]u8 = [0; 16];
+        fill(&mut st, j[..]);
+        let mut j1 = j;
+        ctr_blocks(&a, &mut j1, data[..n], o1[..n]);
+        let mut i: usize = 0;
+        let mut ks: [16]u8 = [0; 16];
+        while i < n {
+            inc32(&mut j);
+            @store(ks[..], a.encrypt_soft(@load(u8x16, j[..])));
+            for k in 0..@min(16, n - i) {
+                o2[i + k] = data[i + k] ^ ks[k];
+            }
+            i += 16;
+        }
+        @expect_eq(o1[..n], o2[..n]);
+        // GHASH of every length mix
+        fill(&mut st, h[..]);
+        let m = (t * 53) % 300;
+        fill(&mut st, aad[..m]);
+        let hw = ghash(&h, aad[..m], data[..n]);
+        let mut g = Ghash.init(h[..]);
+        g.padded(aad[..m]);
+        g.padded(data[..n]);
+        let mut lens: [16]u8 = [0; 16];
+        put_be64(lens[0..8], @as(u64, m) * 8);
+        put_be64(lens[8..16], @as(u64, n) * 8);
+        g.block(lens[..]);
+        let mut sw: [16]u8 = [0; 16];
+        put_be64(sw[0..8], g.y1);
+        put_be64(sw[8..16], g.y0);
+        @expect_eq(hw[..], sw[..]);
+    }
 }

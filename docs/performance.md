@@ -50,8 +50,9 @@ To find where the time goes, use the sampling profiler:
 The machine was a 4-core 2.1 GHz Xeon VM, and the numbers vary by 10–20%
 from run to run. "Before" is the library at the start of the review. The
 reference column is a C library with hand-written SIMD, or hardware
-instructions such as AES-NI and SHA-NI where it has them. Axiom has no
-hardware crypto instructions, so AES and SHA-256 can't match those.
+instructions such as AES-NI and SHA-NI where it has them. At the time of
+this table Axiom had no way to use those instructions; it has now (see
+[Hardware instructions](#hardware-instructions) below).
 
 ## What changed
 
@@ -83,11 +84,56 @@ overflow; wrapping operators (`+%`, `*%`) now say so, with a comment on why.
 
 ## Still slower than it could be
 
-- **AES-GCM and SHA-256** would need hardware instructions (AES-NI,
-  PCLMULQDQ, SHA-NI) to approach OpenSSL. Axiom has no way to reach
-  them yet.
+- **AES-GCM** with hardware instructions is still several times slower
+  than OpenSSL, which interleaves eight AES blocks with GHASH in 256- and
+  512-bit registers (VAES, VPCLMULQDQ) and reduces once per eight blocks.
+- **SHA-512 and SHA-3 on x86-64** have no hardware path: only the newest
+  processors have SHA512 instructions, and none have SHA-3 ones. SHA-3 is
+  particularly slow under the self-hosted compiler, which keeps the 25-word
+  state in memory.
 - **Strokes** are built as one small polygon per segment and join, then
   rasterized with 16 sample lines per row. An outline stroker, or analytic
   coverage, would be faster.
 - **Deflate compression** is about 30% slower than zlib at the same level.
 - **PNG encoding** spends its time in deflate, as zlib-based encoders do.
+
+## Hardware instructions
+
+Issue 0016 added builtins for the processors' cryptographic instructions
+(spec §13.5): AES rounds, carry-less multiplication, SHA-1/SHA-256/SHA-512
+rounds, SHA-3's three-way XOR and rotates, and CRC steps. The standard
+library picks them at run time with `@multiversion` and falls back to the
+portable code (still used under WebAssembly, and on processors without
+them):
+
+| Module | x86-64 | AArch64 |
+|---|---|---|
+| `crypto/aes_gcm` | AES-NI rounds; GHASH by PCLMULQDQ (Karatsuba, four blocks per reduction) | AESE/AESMC; GHASH by PMULL |
+| `crypto/sha1`, `crypto/sha2` (SHA-256) | SHA-NI | SHA1 and SHA256 instructions |
+| `crypto/sha2` (SHA-384, SHA-512) | (portable) | SHA512 instructions |
+| `crypto/sha3` | (portable) | EOR3, RAX1, XAR, BCAX |
+| `hash/crc` (CRC-32, also `compress/deflate.crc32`) | folding by PCLMULQDQ, 64 bytes a step | CRC32 instructions |
+| `hash/crc` (CRC-32C) | SSE4.2 `crc32` | CRC32C instructions |
+
+Each has a test that compares the hardware path with the portable one on
+random inputs; the AArch64 paths are tested under qemu.
+
+Measured on a 32-thread x86-64 machine with AVX-512, SHA-NI and VAES
+(Linux under WSL 2), `-O2`, with the self-hosted compiler; the C compiler's
+numbers are in parentheses where they differ by more than 10%. "Portable"
+is the code before the change on the same machine. The reference is
+`tools/bench_std.py` (Python's `hashlib`, `zlib` and `cryptography`, which
+use OpenSSL and zlib).
+
+| Operation | Portable | Hardware | Reference |
+|---|---:|---:|---:|
+| AES-128-GCM seal | 155 MB/s (219) | 1773 MB/s (3472) | 1813 MB/s (OpenSSL) |
+| SHA-256 | 382 MB/s | 2859 MB/s | 2933 MB/s (OpenSSL) |
+| SHA-1 | 442 MB/s | 3121 MB/s | 3120 MB/s (OpenSSL) |
+| CRC-32 | 2334 MB/s (3125) | 22451 MB/s | 6908 MB/s (zlib) |
+| CRC-32C | 743 MB/s | 15785 MB/s | |
+| SHA-512 (no hardware path here) | 581 MB/s (756) | | 1398 MB/s (OpenSSL) |
+| SHA3-256 (no hardware path here) | 67 MB/s (285) | | 801 MB/s (OpenSSL) |
+
+(`openssl speed -evp aes-128-gcm` reaches 17.7 GB/s on
+this machine: Python's `cryptography` allocates and copies for each call.)

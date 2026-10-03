@@ -1,7 +1,7 @@
 # 0015: Wider SIMD (AVX-512, SVE, ...), conditional compilation and runtime CPU dispatch
 
 - Type: feature
-- Status: open
+- Status: fixed (5f8febd, f67d888)
 - Area: language, compiler (selfhost and C), std
 
 ## Today
@@ -81,3 +81,38 @@
   preserves `xmm6`-`xmm15` but not their upper halves; AVX-512's `zmm16`-31
   and `k` registers are volatile everywhere. Prologues and calls must
   respect that.
+
+## Resolution
+
+Done in 5f8febd (the language and both compilers) and f67d888 (x86-64
+code generation at 256 and 512 bits):
+
+- **Extensions.** The table in `std/os/cpu.ax` (mirrored in
+  `compiler/src/target.c`) adds AES, PCLMUL, SHA, the AVX-512 family, GFNI,
+  VAES, VPCLMULQDQ, AVX-VNNI, SHA512, SM3/SM4 and AVX10.1 on x86-64, and
+  AES, SHA2/3/512, SM4, CRC, RDM, FP16, FHM, BF16, I8MM, SVE, SVE2, DIT and
+  SME on AArch64, with implications and `--cpu` presets (x86-64-v4,
+  Haswell to Granite Rapids, Zen 3-5, Neoverse N1/N2/V1/V2, Apple M1-M4).
+- **Wider vectors** (spec §5.8, §13.3): `i8x32` ... `f64x4`, `v256`,
+  `i8x64` ... `f64x8`, `v512`, with every 128-bit operator and builtin.
+  The self-hosted compiler computes them in ymm/zmm registers where the
+  function's extensions allow (VEX.L, EVEX, k1 for compare masks) and
+  splits the rest down to 128 bits (`selfhost/src/vsplit.ax`); AArch64 and
+  wasm split everything.
+- **Conditional compilation** (spec §13.4): `@target_has`, `@target_arch`,
+  `@target_os` are constants; an `if` on them compiles one branch, and the
+  other is type-checked but may use builtins the code is not compiled for
+  (E0828 anywhere else).
+- **Run-time detection and dispatch**: `@cpu_has` (cpuid/xgetbv on
+  x86-64; auxv or sysctl on AArch64 through the `ax_cpu_features` host
+  function), `@features` (traps with T0013 on a processor without them)
+  and `@multiversion` (one version per set plus the build's own, chosen at
+  each call by the processor's features). A program built for more than
+  the baseline checks the processor before `main`.
+- **std**: `str.index_of_byte` (AVX-512BW, AVX2), and the cryptographic
+  code of issue 0016.
+
+Not done, now issue 0018: SVE/SVE2 and SME (scalable vectors and
+predicates), mask types, FP16/BF16 arithmetic types, AVX-512VL forms of
+128- and 256-bit operations (they use VEX), relaxed-simd, and wide paths
+in more of std (graphics, linalg, FFT, compress).

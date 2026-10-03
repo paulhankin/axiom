@@ -1,7 +1,7 @@
 # 0016: Hardware crypto instructions, and their use in std/crypto
 
 - Type: feature
-- Status: open
+- Status: fixed (see Resolution)
 - Area: language/compiler (intrinsics), std/crypto, std/hash, std/net/tls
 
 ## Today
@@ -86,3 +86,43 @@ knows (selfhost/src/target.ax) do not include them.
 - Related: 0015 (wide vectors, conditional compilation, runtime CPU
   detection and dispatch). The dispatch mechanism should be shared, not
   invented twice.
+
+## Resolution
+
+- **Builtins in both compilers** (spec §13.5): `@x86_aesenc`,
+  `@x86_aesenclast`, `@x86_aesdec`, `@x86_aesdeclast`, `@x86_aesimc`,
+  `@x86_aeskeygenassist`, `@x86_clmul` (also on 256- and 512-bit vectors,
+  one VAES/VPCLMULQDQ instruction where the build has them), the SHA-NI
+  rounds and schedules, `@x86_crc32c`; on AArch64 `@arm_aese`/`aesd`/
+  `aesmc`/`aesimc`, `@arm_pmull`/`pmull2`, the SHA1, SHA256 and SHA512
+  instructions, `@arm_eor3`/`bcax`/`rax1`/`xar` and `@arm_crc32`/`crc32c`.
+  Each needs its architecture and extension (E0828), checked like the
+  other target builtins of 0015. The self-hosted backends encode them
+  (`x64enc.ax`, `a64.ax`); the C compiler calls LLVM's intrinsics.
+  `tests/run/insn.ax` (written by `tools/gen_insn_tests.py` from a Python
+  model) checks each against known results.
+- **std**, each path chosen at run time with `@multiversion` and checked
+  against the portable code on random inputs in its tests:
+  - `crypto/aes_gcm` (and `crypto/aes`, which uses it): AES-NI or ARMv8
+    AES rounds, eight CTR blocks at a time; GHASH by PCLMULQDQ or PMULL
+    (Karatsuba, four blocks per reduction).
+  - `crypto/sha1`, `crypto/sha2`: SHA-NI on x86-64; the SHA1, SHA256 and
+    SHA512 instructions on AArch64.
+  - `crypto/sha3`: Keccak-f with EOR3, RAX1, XAR and BCAX on AArch64.
+  - `hash/crc`: new `crc32` and `crc32c` functions (used by `Crc` for those
+    two presets): SSE4.2 `crc32` or ARM CRC32C for CRC-32C; PCLMULQDQ
+    folding or ARM CRC32 for CRC-32, which `compress/deflate.crc32` (gzip,
+    zip, PNG) now uses. Without hardware, slicing by 8 for both.
+- **Benchmarks** in docs/performance.md, "Hardware instructions": on the
+  test machine AES-128-GCM went from 155 to 1773 MB/s, SHA-256 from 382 to
+  2859 MB/s, SHA-1 from 442 to 3121 MB/s, CRC-32 from 2.3 to 22 GB/s and
+  CRC-32C from 0.74 to 16 GB/s.
+
+The hardware paths are constant time as the portable ones are: no table
+lookups or branches on secrets.
+
+Not done, now issue 0019: GCM with VAES/VPCLMULQDQ over 256/512 bits
+(OpenSSL is still several times faster), SHA-512 with x86 SHA512 or AVX2
+scheduling, SHA-3 with AVX-512 `vpternlogq`, ChaCha20/BLAKE2/Argon2 over
+wider vectors, MULX/ADX in the bignum and curve arithmetic, PSTATE.DIT on
+AArch64, and TLS cipher-suite order by hardware.
