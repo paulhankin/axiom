@@ -1,0 +1,2400 @@
+// =============================================================================
+// File: trench.ax
+// A trench run in 3D on Windows with Direct3D 12, after the vector arcade
+// games of the early 1980s, with filled, lit and subtly textured surfaces in
+// place of their line art. Dive into a trench on a space station, weave over
+// and under the catwalks and around the baffles, shoot the turrets and their
+// fireballs, and hit the exhaust port at the end. Shields go when anything
+// hits you; a run that hits the port earns a bonus for each one left and
+// starts the next wave, faster and better defended.
+//
+//   axiom build examples/trench.ax --target=x86_64-windows -O2 --subsystem=windows -o trench.exe
+//   trench.exe                  (arrows or WASD to steer, Space or Ctrl to
+//                                fire; a controller's left stick or d-pad,
+//                                A or the right trigger; Escape or Back quits)
+//   trench.exe --autopilot      (it plays itself)
+//   trench.exe --png out.png --frames 600   (plays 600 frames by itself
+//                                offscreen, then saves the last as a PNG)
+//
+// It draws with std/graphics/d3d12 (a depth buffer, culling, additive glows,
+// a shadow map, a constant buffer of lights) and std/graphics/hlsl; the
+// camera is std/math/geometry's look_at and perspective_zo, the sun's
+// shadow map its orthographic_zo. The station is one static mesh per wave:
+// walls, floor and surface greebled with blocks, pipe runs, conduits, vents,
+// ribbed panels, sloping armour, stepped blocks, lit windows, gratings,
+// hatches, domes and towers, crowded in some stretches and bare in others,
+// each stretch in its own style. Surfaces are textured in the pixel shader
+// from their world positions: panels with seams, a tint per panel and a
+// little grain. It is night: they are lit by a dim moon,
+// which casts shadows (filtered, from a map that follows the ship, and past
+// its end the trench's own walls), a little by the sky, by the ship's
+// searchlight, the amber lamps along the walls, and the nearest of the
+// fireballs, shots, explosions and turrets about to fire, with a little
+// shine; then fogged. Hits shake and roll the view and fill it with red
+// and static.
+// Sound is made with std/audio and played with std/audio/xaudio2.
+// =============================================================================
+
+import "std/audio" as audio;
+import "std/audio/xaudio2" as xaudio2;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/d3d12" as d3d;
+import "std/graphics/hlsl" as hlsl;
+import "std/graphics/image/png" as png;
+import "std/io" as io;
+import "std/math" as math;
+import "std/math/geometry" as geo;
+import "std/math/matrix" as matrix;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/os/win32" as win32;
+import "std/os/xinput" as xinput;
+import "std/str" as strs;
+import "std/time" as time;
+
+// -----------------------------------------------------------------------------
+// Shaders
+// -----------------------------------------------------------------------------
+// One set of root constants: per frame (words 0..31) the camera, the sun and
+// fog, the billboard axes; per draw (32..51) a model matrix's rows, a colour
+// and parameters (x: material, -1 for the vertex's; y: fog on glows).
+// Materials: 0 hull plating, 1 lights (emissive), 2 fine machinery.
+let SHADER_LINES: [187][]u8 = ["cbuffer C : register(b0) {", "    float4x4 viewproj;", "    float4 eye;",
+                               "    float4 light;", "    float4 right;", "    float4 up;", "    float4 m0;",
+                               "    float4 m1;", "    float4 m2;", "    float4 color;", "    float4 params;", "};",
+                               "cbuffer L : register(b1) {", "    float4x4 sunvp;", "    float4 info;",
+                               "    float4 lpos[24];", "    float4 lcol[24];", "    float4 lcount;", "};",
+                               "Texture2D<float> shadowmap : register(t0);",
+                               "SamplerComparisonState cmp : register(s1);", "struct VIn {",
+                               "    float3 pos : POSITION;", "    float3 nrm : NORMAL;", "    float4 col : COLOR;",
+                               "};", "struct VOut {", "    float4 pos : SV_Position;", "    float3 w : TEXCOORD0;",
+                               "    float3 n : TEXCOORD1;", "    float4 col : COLOR;", "};", "float3 world(float3 p) {",
+                               "    float4 q = float4(p, 1.0);",
+                               "    return float3(dot(m0, q), dot(m1, q), dot(m2, q));", "}", "VOut vs(VIn i) {",
+                               "    VOut o;", "    o.w = world(i.pos);",
+                               "    o.n = float3(dot(m0.xyz, i.nrm), dot(m1.xyz, i.nrm), dot(m2.xyz, i.nrm));",
+                               "    o.pos = mul(viewproj, float4(o.w, 1.0));",
+                               "    o.col = float4(i.col.rgb * color.rgb, params.x < 0.0 ? i.col.a : params.x);",
+                               "    return o;", "}", "float4 vs_shadow(VIn i) : SV_Position {",
+                               "    return mul(sunvp, float4(world(i.pos), 1.0));", "}", "float hash(float2 p) {",
+                               "    return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);", "}",
+                               "float noise(float2 p) {", "    float2 c = floor(p);", "    float2 f = frac(p);",
+                               "    f = f * f * (3.0 - 2.0 * f);",
+                               "    float a = lerp(hash(c), hash(c + float2(1.0, 0.0)), f.x);",
+                               "    float b = lerp(hash(c + float2(0.0, 1.0)), hash(c + float2(1.0, 1.0)), f.x);",
+                               "    return lerp(a, b, f.y);", "}", "float3 fog(float3 c, float3 w, float amount) {",
+                               "    float k = exp(-length(w - eye.xyz) * light.w * amount);",
+                               "    return lerp(float3(0.006, 0.008, 0.014), c, k);", "}",
+                               "float trench_shadow(float3 w) {", "    if (abs(w.x) > 7.01 || w.y > 12.0) {",
+                               "        return 1.0;", "    }", "    float3 l = -light.xyz;",
+                               "    float side = l.x > 0.0 ? 7.0 : -7.0;", "    float t = (side - w.x) / l.x;",
+                               "    return smoothstep(11.6, 12.4, w.y + t * l.y);", "}",
+                               "float sun_shadow(float3 w, float3 n) {",
+                               "    float4 p = mul(sunvp, float4(w + n * 0.08, 1.0));",
+                               "    float2 uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);",
+                               "    if (info.y < 0.5 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 || p.z > 1.0) {",
+                               "        return trench_shadow(w);", "    }", "    float s = 0.0;",
+                               "    [unroll] for (int y = -1; y <= 1; y++) {",
+                               "        [unroll] for (int x = -1; x <= 1; x++) {",
+                               "            s += shadowmap.SampleCmpLevelZero(cmp, uv + float2(x, y) * info.x, p.z);",
+                               "        }", "    }", "    return s / 9.0;", "}",
+                               "float3 point_light(float3 w, float3 n, float3 v, float3 lp, float r, float3 c) {",
+                               "    float3 d = lp - w;", "    float dist = length(d);",
+                               "    float att = saturate(1.0 - dist / r);", "    att *= att;",
+                               "    float3 ld = d / max(dist, 0.001);",
+                               "    float diff = saturate(dot(n, ld)) * 0.85 + 0.15;",
+                               "    float spec = pow(saturate(dot(n, normalize(ld + v))), 24.0) * 0.5;",
+                               "    return c * att * (diff + spec);", "}", "float4 ps(VOut i) : SV_Target {",
+                               "    float3 n = normalize(i.n);", "    float mat = i.col.a;", "    if (mat > 2.5) {",
+                               "        float on = step(0.6, frac(eye.w * 1.3 - i.w.x * 0.09 + i.w.y * 0.03));",
+                               "        return float4(fog(i.col.rgb * (0.12 + 2.2 * on), i.w, 0.3), 1.0);", "    }",
+                               "    if (mat > 0.5 && mat < 1.5) {",
+                               "        float pulse = 0.85 + 0.15 * sin(eye.w * 5.0 + i.w.z * 0.15);",
+                               "        return float4(fog(i.col.rgb * pulse * 1.6, i.w, 0.3), 1.0);", "    }",
+                               "    float3 a = abs(n);",
+                               "    float2 uv = a.x > max(a.y, a.z) ? i.w.zy : (a.y > a.z ? i.w.xz : i.w.xy);",
+                               "    float size = mat > 1.5 ? 0.75 : 2.0;", "    float2 q = uv / size;",
+                               "    float2 cell = floor(q);", "    float2 f = frac(q);",
+                               "    float edge = min(min(f.x, f.y), min(1.0 - f.x, 1.0 - f.y));",
+                               "    float seam = smoothstep(0.0, 0.045, edge);",
+                               "    float tint = 0.8 + 0.32 * hash(cell);",
+                               "    float grain = 0.86 + 0.28 * noise(uv * 3.0) * noise(uv * 0.6 + 3.1);",
+                               "    float3 base = i.col.rgb * tint * grain * (0.5 + 0.5 * seam);",
+                               "    float shine = (mat > 1.5 ? 0.25 : 0.45) * (0.6 + 0.4 * hash(cell + 17.0));",
+                               "    float3 toeye = eye.xyz - i.w;", "    float dist = length(toeye);",
+                               "    float3 v = toeye / dist;", "    float3 l = -light.xyz;",
+                               "    float lambert = saturate(dot(n, l));",
+                               "    float shadow = lambert > 0.0 ? sun_shadow(i.w, n) : 0.0;",
+                               "    float3 sun = float3(0.2, 0.24, 0.34) * shadow * (lambert * 0.95 + pow(saturate(dot(n, normalize(l + v))), 32.0) * shine);",
+                               "    float outside = saturate((abs(i.w.x) - 7.4) * 4.0);",
+                               "    float ao = lerp(0.55 + 0.45 * saturate(i.w.y / 12.0), 1.0, outside);",
+                               "    float3 sky = float3(0.03, 0.035, 0.05) * (0.7 + 0.3 * n.y) * ao;",
+                               "    float3 fwd = cross(up.xyz, right.xyz);",
+                               "    float spot = smoothstep(0.8, 0.95, dot(-v, fwd));",
+                               "    float head = (spot * 0.8 + 0.05) * saturate(dot(n, v)) / (1.0 + dist * dist * 0.0012);",
+                               "    float3 local = 0.0;", "    int count = (int)lcount.x;",
+                               "    [loop] for (int k = 0; k < count; k++) {",
+                               "        local += point_light(i.w, n, v, lpos[k].xyz, lpos[k].w, lcol[k].rgb * lcol[k].w);",
+                               "    }", "    if (i.w.z > -864.0 && i.w.z < 40.0 && i.w.y < 12.0) {",
+                               "        float zc = round((i.w.z - 5.2) / 8.0) * 8.0 + 5.2;",
+                               "        float3 amber = float3(1.0, 0.5, 0.14) * 2.4;",
+                               "        local += point_light(i.w, n, v, float3(-6.7, 0.65, zc), 6.5, amber);",
+                               "        local += point_light(i.w, n, v, float3(6.7, 0.65, zc), 6.5, amber);", "    }",
+                               "    float3 lit = base * (sun + sky + head + local) + local * shine * 0.15;",
+                               "    return float4(fog(lit, i.w, 1.0), 1.0);", "}", "struct GOut {",
+                               "    float4 pos : SV_Position;", "    float2 uv : TEXCOORD0;",
+                               "    float3 w : TEXCOORD1;", "};", "GOut vs_glow(VIn i) {",
+                               "    float3 w = m0.xyz + (right.xyz * i.pos.x + up.xyz * i.pos.y) * m0.w;",
+                               "    GOut o;", "    o.pos = mul(viewproj, float4(w, 1.0));", "    o.uv = i.pos.xy;",
+                               "    o.w = w;", "    return o;", "}", "float4 ps_glow(GOut i) : SV_Target {",
+                               "    float k = saturate(1.0 - length(i.uv));",
+                               "    float glow = k * k + pow(k, 8.0) * 2.0;",
+                               "    float f = params.y > 0.5 ? exp(-length(i.w - eye.xyz) * light.w * 0.5) : 1.0;",
+                               "    return float4(color.rgb * glow * color.a * f, 1.0);", "}", "struct HOut {",
+                               "    float4 pos : SV_Position;", "    float2 uv : TEXCOORD0;", "};",
+                               "HOut vs_hud(VIn i) {", "    HOut o;",
+                               "    o.pos = float4(m0.xy + i.pos.xy * m0.zw, 0.0, 1.0);", "    o.uv = i.pos.xy;",
+                               "    return o;", "}", "float4 ps_hud(HOut i) : SV_Target {", "    if (params.x > 1.5) {",
+                               "        float row = floor(i.pos.y / 3.0);",
+                               "        float band = frac(sin(row * 12.9898 + floor(eye.w * 40.0) * 78.233) * 43758.5453);",
+                               "        float speck = frac(sin(dot(floor(i.pos.xy / 2.0), float2(12.9898, 78.233)) + eye.w * 13.0) * 43758.5453);",
+                               "        return float4(color.rgb, (step(0.96, band) * 0.5 + step(0.985, speck) * 0.5) * color.a);",
+                               "    }", "    if (params.x > 0.5) {",
+                               "        float d = length(i.uv * float2(1.0, 0.85));",
+                               "        return float4(color.rgb, smoothstep(0.55, 1.4, d) * color.a);", "    }",
+                               "    return color;", "}"];
+
+// -----------------------------------------------------------------------------
+// The world: a trench along -z, x in -W..W, floor at 0, rim at H
+// -----------------------------------------------------------------------------
+let SIDES: [2]f32 = [-1.0, 1.0];  // the left wall, the right
+const W: f32 = 7.0;
+const H: f32 = 12.0;
+const SEG: f32 = 24.0;
+const SEGS: usize = 36;
+const LEN: f32 = 864.0;  // SEG * SEGS: the exhaust port's wall is at z = -LEN
+const X_MAX: f32 = 5.4;  // how far the ship goes from the middle
+const Y_MIN: f32 = 1.3;
+const Y_MAX: f32 = 10.7;
+const PORT_Y: f32 = 6.0;
+const PORT_R: f32 = 1.6;        // half the port's width
+const PORT_RANGE: f32 = 150.0;  // it opens when the ship is this close
+const FOG: f32 = 0.0055;
+
+// The way the sun's light goes: down, across the trench and back along it.
+fn sun_dir() V3 {
+    return vnorm(v3(0.35, -0.85, 0.4));
+}
+
+const MAX_TURRETS: usize = 200;
+const MAX_OBST: usize = 64;
+const MAX_LASERS: usize = 40;
+const MAX_FIRE: usize = 64;
+const MAX_SPARKS: usize = 500;
+const MAX_DEBRIS: usize = 80;
+const MAX_FLASHES: usize = 24;
+const MAX_LIGHTS: usize = 24;  // as the shader's arrays
+const SHADOW_SIZE: u32 = 4096;
+const STARS: usize = 240;
+
+const DIVE: u32 = 0;
+const PLAY: u32 = 1;
+const PULLUP: u32 = 2;
+const OVER: u32 = 3;
+
+struct V3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+fn v3(x: f32, y: f32, z: f32) V3 {
+    return V3.{ x: x, y: y, z: z };
+}
+
+fn vadd(a: V3, b: V3) V3 {
+    return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+fn vsub(a: V3, b: V3) V3 {
+    return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+fn vmul(a: V3, k: f32) V3 {
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+fn vdot(a: V3, b: V3) f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+fn vlen(a: V3) f32 {
+    return @sqrt(vdot(a, a));
+}
+
+fn vnorm(a: V3) V3 {
+    let l = vlen(a);
+    if l < 1.0e-6 {
+        return a;
+    }
+    return vmul(a, 1.0 / l);
+}
+
+fn vcross(a: V3, b: V3) V3 {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+fn clamp(x: f32, lo: f32, hi: f32) f32 {
+    return @min(@max(x, lo), hi);
+}
+
+struct Rng {
+    s: u64,
+}
+
+fn rnd(r: *mut Rng) f32 {
+    r.s = (r.s *% 6364136223846793005) +% 1442695040888963407;
+    return @float_from_int(f32, r.s >> 40) / 16777216.0;
+}
+
+fn rrange(r: *mut Rng, lo: f32, hi: f32) f32 {
+    return lo + (hi - lo) * rnd(r);
+}
+
+// An axis-aligned box: an obstacle to fly around.
+struct Box {
+    x0: f32,
+    y0: f32,
+    z0: f32,
+    x1: f32,
+    y1: f32,
+    z1: f32,
+}
+
+fn inside(b: Box, p: V3, margin: f32) bool {
+    return (p.x > b.x0 - margin) and (p.x < b.x1 + margin) and (p.y > b.y0 - margin) and (p.y < b.y1 + margin) and
+           (p.z > b.z0 - margin) and (p.z < b.z1 + margin);
+}
+
+struct Turret {
+    p: V3,
+    side: f32,  // -1 the left wall, 1 the right
+    rim: bool,  // on the surface at the trench's edge, or on the wall
+    alive: bool,
+    cool: f32,  // seconds until it fires
+}
+
+// Lasers, fireballs, sparks and debris.
+struct Body {
+    p: V3,
+    v: V3,
+    c: V3,  // colour
+    life: f32,
+    max: f32,
+    size: f32,
+    ang: f32,
+    alive: bool,
+}
+
+fn dead() Body {
+    return Body.{ p: v3(0.0, 0.0, 0.0), v: v3(0.0, 0.0, 0.0), c: v3(0.0, 0.0, 0.0), life: 0.0, max: 1.0, size: 0.0,
+                  ang: 0.0, alive: false };
+}
+
+fn spawn(list: []mut Body, b: Body) void {
+    for i in 0..list.len {
+        if not list[i].alive {
+            list[i] = b;
+            return;
+        }
+    }
+}
+
+struct Game {
+    rng: Rng,
+    layout: u64,  // the seed of this wave's trench
+    wave: u32,
+    score: u32,
+    shields: u32,
+    phase: u32,
+    phase_t: f32,
+    won: bool,
+    rebuild: bool,  // the trench changed: make its mesh again
+    pos: V3,
+    vx: f32,
+    vy: f32,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    fire_cool: f32,
+    gun: f32,
+    invuln: f32,
+    flash_red: f32,
+    flash_white: f32,
+    shake: f32,
+    kick: f32,      // the roll a hit gave the camera
+    static_t: f32,  // seconds of interference on the screen left
+    rumble: f32,
+    time: f32,
+    turrets: [200]Turret,
+    nturrets: usize,
+    obst: [64]Box,
+    nobst: usize,
+    lasers: [40]Body,
+    fire: [64]Body,
+    sparks: [500]Body,
+    debris: [80]Body,
+    flashes: [24]Body,  // the light of explosions and hits
+    stars: [240]V3,
+}
+
+fn new_game(seed: u64) Game {
+    let none = Turret.{ p: v3(0.0, 0.0, 0.0), side: 1.0, rim: false, alive: false, cool: 0.0 };
+    let nob = Box.{ x0: 0.0, y0: 0.0, z0: 0.0, x1: 0.0, y1: 0.0, z1: 0.0 };
+    let mut g = Game.{ rng: Rng.{ s: seed }, layout: 0, wave: 1, score: 0, shields: 6, phase: DIVE, phase_t: 0.0,
+                       won: false, rebuild: true, pos: v3(0.0, 0.0, 0.0), vx: 0.0, vy: 0.0, yaw: 0.0, pitch: 0.0,
+                       speed: 0.0, fire_cool: 0.0, gun: 1.0, invuln: 0.0, flash_red: 0.0, flash_white: 0.0, shake: 0.0,
+                       kick: 0.0, static_t: 0.0, rumble: 0.0, time: 0.0, turrets: [none; 200], nturrets: 0,
+                       obst: [nob; 64], nobst: 0, lasers: [dead(); 40], fire: [dead(); 64], sparks: [dead(); 500],
+                       debris: [dead(); 80], flashes: [dead(); 24], stars: [v3(0.0, 1.0, 0.0); 240] };
+    // stars over the upper half of the sky
+    for i in @as(usize, 0)..STARS {
+        let a = rnd(&mut g.rng) * 6.2831853;
+        let y = rrange(&mut g.rng, 0.04, 1.0);
+        let r = @sqrt(1.0 - y * y);
+        g.stars[i] = v3(r * math.cosf(a), y, r * math.sinf(a));
+    }
+    g.layout = @bit_cast(u64, seed) ^ 0x9e37_79b9_7f4a_7c15;
+    start_run(&mut g);
+    return g;
+}
+
+// The ship dives into the trench at its start.
+fn start_run(g: *mut Game) void {
+    g.phase = DIVE;
+    g.phase_t = 0.0;
+    g.won = false;
+    g.rebuild = true;
+    g.pos = v3(0.0, 26.0, 50.0);
+    g.vx = 0.0;
+    g.vy = 0.0;
+    g.yaw = 0.0;
+    g.pitch = -0.4;
+    g.speed = 40.0 + 6.0 * @float_from_int(f32, g.wave - 1);
+    g.invuln = 0.0;
+    for i in @as(usize, 0)..MAX_LASERS {
+        g.lasers[i].alive = false;
+    }
+    for i in @as(usize, 0)..MAX_FIRE {
+        g.fire[i].alive = false;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Meshes: position, normal, colour and material (10 floats a vertex)
+// -----------------------------------------------------------------------------
+struct Mesh {
+    v: vec.Vec.[f32],
+    i: vec.Vec.[u32],
+}
+
+fn mesh() Mesh {
+    return Mesh.{ v: vec.Vec.[f32].init(), i: vec.Vec.[u32].init() };
+}
+
+fn mesh_deinit(m: *mut Mesh) void {
+    m.v.deinit();
+    m.i.deinit();
+}
+
+// Each face: its normal n, then u and v along it with u × v = n, so the
+// corners -u-v, u-v, u+v, -u+v go counter-clockwise seen from outside.
+let FACES: [6][9]f32 = [[1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                        [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0], [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                        [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 0.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0]];
+let CORNERS: [4][2]f32 = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+
+fn add_box(m: *mut Mesh, x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32, c: V3, mat: f32) !void {
+    let ctr = v3((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5);
+    let half = v3(@abs(x1 - x0) * 0.5, @abs(y1 - y0) * 0.5, @abs(z1 - z0) * 0.5);
+    for f in FACES {
+        let n = v3(f[0], f[1], f[2]);
+        let u = v3(f[3], f[4], f[5]);
+        let w = v3(f[6], f[7], f[8]);
+        let en = @abs(vdot(n, half));
+        let eu = @abs(vdot(u, half));
+        let ew = @abs(vdot(w, half));
+        let base = @truncate(u32, m.v.items().len / 10);
+        for k in CORNERS {
+            let p = vadd(vadd(ctr, vmul(n, en)), vadd(vmul(u, k[0] * eu), vmul(w, k[1] * ew)));
+            let vals: [10]f32 = [p.x, p.y, p.z, n.x, n.y, n.z, c.x, c.y, c.z, mat];
+            for x in vals {
+                m.v.push(x)!;
+            }
+        }
+        let idx: [6]u32 = [base, base + 1, base + 2, base, base + 2, base + 3];
+        for x in idx {
+            m.i.push(x)!;
+        }
+    }
+}
+
+fn grey(r: *mut Rng, lo: f32, hi: f32) V3 {
+    let k = rrange(r, lo, hi);
+    return v3(k, k * 1.01, k * 1.06);
+}
+
+// -----------------------------------------------------------------------------
+// Greebles: the machinery on the station's walls, floor and surface
+// -----------------------------------------------------------------------------
+fn vert(m: *mut Mesh, p: V3, n: V3, c: V3, mat: f32) !u32 {
+    let i = @truncate(u32, m.v.items().len / 10);
+    let vals: [10]f32 = [p.x, p.y, p.z, n.x, n.y, n.z, c.x, c.y, c.z, mat];
+    for x in vals {
+        m.v.push(x)!;
+    }
+    return i;
+}
+
+// A triangle with a normal at each corner, wound to face the way they point.
+fn tri(m: *mut Mesh, a: V3, b: V3, c: V3, na: V3, nb: V3, nc: V3, col: V3, mat: f32) !void {
+    let i0 = vert(m, a, na, col, mat)!;
+    let i1 = vert(m, b, nb, col, mat)!;
+    let i2 = vert(m, c, nc, col, mat)!;
+    m.i.push(i0)!;
+    if vdot(vcross(vsub(b, a), vsub(c, a)), vadd(vadd(na, nb), nc)) >= 0.0 {
+        m.i.push(i1)!;
+        m.i.push(i2)!;
+    } else {
+        m.i.push(i2)!;
+        m.i.push(i1)!;
+    }
+}
+
+// A flat triangle facing away from o (a point inside the shape).
+fn tri_out(m: *mut Mesh, a: V3, b: V3, c: V3, o: V3, col: V3, mat: f32) !void {
+    let mut n = vnorm(vcross(vsub(b, a), vsub(c, a)));
+    if vdot(n, vsub(vmul(vadd(vadd(a, b), c), 1.0 / 3.0), o)) < 0.0 {
+        n = vmul(n, -1.0);
+    }
+    tri(m, a, b, c, n, n, n, col, mat)!;
+}
+
+// A flat quad, its corners a, b, c, d in order round it, facing away from o.
+fn quad_out(m: *mut Mesh, a: V3, b: V3, c: V3, d: V3, o: V3, col: V3, mat: f32) !void {
+    tri_out(m, a, b, c, o, col, mat)!;
+    tri_out(m, a, c, d, o, col, mat)!;
+}
+
+// An axis (0 x, 1 y, 2 z) and two directions across it.
+fn axis_basis(along: u32) [3]V3 {
+    if along == 0 {
+        return [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)];
+    }
+    if along == 1 {
+        return [v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0), v3(1.0, 0.0, 0.0)];
+    }
+    return [v3(0.0, 0.0, 1.0), v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0)];
+}
+
+// A cylinder of radius r along an axis, from base for len (either way),
+// smooth round its side, with flat ends.
+fn cylinder(m: *mut Mesh, along: u32, base: V3, len: f32, r: f32, sides: u32, col: V3, mat: f32) !void {
+    let b = axis_basis(along);
+    let top = vadd(base, vmul(b[0], len));
+    let mut end = b[0];
+    if len < 0.0 {
+        end = vmul(b[0], -1.0);
+    }
+    let start = vmul(end, -1.0);
+    let step = 6.2831853 / @float_from_int(f32, sides);
+    for k in @as(u32, 0)..sides {
+        let a0 = step * @float_from_int(f32, k);
+        let a1 = a0 + step;
+        let r0 = vadd(vmul(b[1], math.cosf(a0)), vmul(b[2], math.sinf(a0)));
+        let r1 = vadd(vmul(b[1], math.cosf(a1)), vmul(b[2], math.sinf(a1)));
+        let p00 = vadd(base, vmul(r0, r));
+        let p01 = vadd(base, vmul(r1, r));
+        let p10 = vadd(top, vmul(r0, r));
+        let p11 = vadd(top, vmul(r1, r));
+        tri(m, p00, p01, p11, r0, r1, r1, col, mat)!;
+        tri(m, p00, p11, p10, r0, r1, r0, col, mat)!;
+        tri(m, base, p01, p00, start, start, start, col, mat)!;
+        tri(m, top, p10, p11, end, end, end, col, mat)!;
+    }
+}
+
+// Half a sphere of radius r on c, its pole along an axis (dir 1 or -1).
+fn dome(m: *mut Mesh, c: V3, r: f32, along: u32, dir: f32, col: V3, mat: f32) !void {
+    let b = axis_basis(along);
+    let pole = vmul(b[0], dir);
+    let rings: u32 = 4;
+    let sides: u32 = 12;
+    for i in @as(u32, 0)..rings {
+        let t0 = 1.5707963 * @float_from_int(f32, i) / @float_from_int(f32, rings);
+        let t1 = 1.5707963 * @float_from_int(f32, i + 1) / @float_from_int(f32, rings);
+        for k in @as(u32, 0)..sides {
+            let f0 = 6.2831853 * @float_from_int(f32, k) / @float_from_int(f32, sides);
+            let f1 = 6.2831853 * @float_from_int(f32, k + 1) / @float_from_int(f32, sides);
+            let n00 = dome_normal(pole, b, t0, f0);
+            let n01 = dome_normal(pole, b, t0, f1);
+            let n10 = dome_normal(pole, b, t1, f0);
+            let n11 = dome_normal(pole, b, t1, f1);
+            let p00 = vadd(c, vmul(n00, r));
+            let p01 = vadd(c, vmul(n01, r));
+            let p10 = vadd(c, vmul(n10, r));
+            let p11 = vadd(c, vmul(n11, r));
+            tri(m, p00, p01, p11, n00, n01, n11, col, mat)!;
+            tri(m, p00, p11, p10, n00, n11, n10, col, mat)!;
+        }
+    }
+}
+
+fn dome_normal(pole: V3, b: [3]V3, t: f32, f: f32) V3 {
+    let round = vadd(vmul(b[1], math.cosf(f)), vmul(b[2], math.sinf(f)));
+    return vadd(vmul(round, math.cosf(t)), vmul(pole, math.sinf(t)));
+}
+
+// A prism along z from z0 to z1 whose cross-section is the triangle a, b, c
+// (their z ignored): sloping armour.
+fn wedge(m: *mut Mesh, a: V3, b: V3, c: V3, z0: f32, z1: f32, col: V3, mat: f32) !void {
+    let a0 = v3(a.x, a.y, z0);
+    let b0 = v3(b.x, b.y, z0);
+    let c0 = v3(c.x, c.y, z0);
+    let a1 = v3(a.x, a.y, z1);
+    let b1 = v3(b.x, b.y, z1);
+    let c1 = v3(c.x, c.y, z1);
+    let o = v3((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0, (z0 + z1) * 0.5);
+    tri_out(m, a0, b0, c0, o, col, mat)!;
+    tri_out(m, a1, b1, c1, o, col, mat)!;
+    quad_out(m, a0, b0, b1, a1, o, col, mat)!;
+    quad_out(m, b0, c0, c1, b1, o, col, mat)!;
+    quad_out(m, c0, a0, a1, c1, o, col, mat)!;
+}
+
+fn hash01(seed: u64, i: i64) f32 {
+    let mut x = seed +% (@bit_cast(u64, i) *% 0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)) *% 0xbf58_476d_1ce4_e5b9;
+    x = (x ^ (x >> 27)) *% 0x94d0_49bb_1331_11eb;
+    x = x ^ (x >> 31);
+    return @float_from_int(f32, x >> 40) / 16777216.0;
+}
+
+// Smooth noise along a line, 0..1.
+fn noise1(seed: u64, t: f32) f32 {
+    let f = @floor(t);
+    let i = @int_from_float(i64, f);
+    let k = t - f;
+    let e = k * k * (3.0 - 2.0 * k);
+    let a = hash01(seed, i);
+    return a + (hash01(seed, i + 1) - a) * e;
+}
+
+// How crowded the machinery is at z (0..1): long stretches of bare plating
+// and dense clusters, with ragged edges.
+fn crowding(seed: u64, z: f32) f32 {
+    let a = noise1(seed, z / 70.0);
+    let b = noise1(seed +% 77, z / 15.0);
+    return clamp(a * a * 1.6 + (b - 0.5) * 0.6, 0.03, 1.0);
+}
+
+// The kinds of machinery each style of wall has, by weight: blocks, pipe
+// runs, conduits, vents, ribbed panels, sloping armour, stepped blocks, lit
+// windows. A style holds for a stretch of the wall.
+let WALL_STYLES: [5][8]u32 = [
+    [2, 7, 3, 1, 1, 1, 1, 1], [2, 1, 1, 6, 3, 1, 2, 1], [2, 1, 0, 1, 1, 6, 3, 1], [5, 2, 2, 2, 2, 1, 4, 2], [
+        4, 1, 1, 1, 2, 2, 1, 2]];
+// On the floor: blocks, gratings, pipes, hatches, domes, cables, lights.
+let FLOOR_KINDS: [8]u32 = [3, 3, 3, 2, 2, 2, 1, 0];
+// On the surface: blocks, domes, towers, big pipes, vents, armour, ribs.
+let SURFACE_KINDS: [8]u32 = [5, 2, 1, 2, 2, 1, 1, 0];
+let WINDOW_COLORS: [4][3]f32 = [[0.75, 0.88, 1.0], [0.3, 0.9, 1.0], [1.0, 0.2, 0.1], [1.0, 0.6, 0.2]];
+
+fn pick(r: *mut Rng, w: [8]u32) u32 {
+    let mut total: u32 = 0;
+    for x in w {
+        total += x;
+    }
+    let mut at = @int_from_float(u32, rnd(r) * @float_from_int(f32, total));
+    for k in @as(u32, 0)..8 {
+        if at < w[@as(usize, k)] {
+            return k;
+        }
+        at -= w[@as(usize, k)];
+    }
+    return 0;
+}
+
+// A size from 0 to 1, mostly small, now and then large.
+fn bigness(r: *mut Rng) f32 {
+    let k = rnd(r);
+    return k * k;
+}
+
+fn pipe_colour(r: *mut Rng) V3 {
+    let k = rnd(r);
+    if k < 0.15 {
+        return v3(0.5, 0.33, 0.22);  // copper
+    }
+    if k < 0.3 {
+        return v3(0.3, 0.36, 0.45);  // blue-grey
+    }
+    return grey(r, 0.28, 0.45);
+}
+
+// The machinery on one wall (side -1 or 1) of the segment z0 - SEG .. z0.
+fn wall_greebles(m: *mut Mesh, r: *mut Rng, seed: u64, s: f32, z0: f32) !void {
+    let salt = seed +% @as(u64, @int_from_float(u32, s + 2.0));
+    let dark = v3(0.07, 0.07, 0.08);
+    for attempt in @as(usize, 0)..44 {
+        let za = z0 - rrange(r, 0.0, SEG);
+        let c = crowding(salt, za);
+        if rnd(r) > c * c * 1.4 + 0.02 {
+            continue;
+        }
+        let style = @int_from_float(usize, hash01(salt +% 5, @int_from_float(i64, @floor(za / 48.0))) * 4.99);
+        let kind = pick(r, WALL_STYLES[style]);
+        let big = bigness(r);
+        let face = s * W;  // the wall's face; things stand out from it by -s
+        if kind == 0 {
+            // a block
+            let len = 0.4 + big * 6.0;
+            let h = 0.3 + rnd(r) * (0.6 + big * 3.0);
+            let d = 0.12 + rnd(r) * (0.25 + big * 0.6);
+            let ya = rrange(r, 0.0, H - 0.5);
+            let mut mat: f32 = 0.0;
+            if len < 1.5 {
+                mat = 2.0;
+            }
+            add_box(m, s * (W - d), ya, za - len, face, @min(ya + h, H), za, grey(r, 0.3, 0.55), mat)!;
+        } else if kind == 1 {
+            // a run of pipes along the wall, held by brackets
+            let pr = 0.1 + big * 0.35;
+            let count = 1 + @int_from_float(u32, rnd(r) * 3.0);
+            let len = 3.0 + rnd(r) * 18.0;
+            let ya = rrange(r, 0.8, H - 1.5);
+            let col = pipe_colour(r);
+            let gap = pr * 2.4 + 0.05;
+            for k in @as(u32, 0)..count {
+                let y = ya + gap * @float_from_int(f32, k);
+                cylinder(m, 2, v3(s * (W - pr - 0.06), y, za), -len, pr, 8, col, 2.0)!;
+            }
+            let top = ya + gap * @float_from_int(f32, count - 1) + pr + 0.1;
+            let mut zb = za - 0.8;
+            while zb > za - len {
+                add_box(m, face, ya - pr - 0.1, zb - 0.12, s * (W - 2.0 * pr - 0.14), top, zb + 0.12, grey(r, 0.2, 0.3),
+                        2.0)!;
+                zb -= rrange(r, 1.8, 3.2);
+            }
+        } else if kind == 2 {
+            // a conduit up the wall, with collars
+            let pr = 0.15 + big * 0.22;
+            let h = 3.0 + rnd(r) * (H - 3.0);
+            let x = s * (W - pr - 0.05);
+            let col = pipe_colour(r);
+            cylinder(m, 1, v3(x, 0.0, za), h, pr, 8, col, 2.0)!;
+            let mut y = rrange(r, 0.5, 1.5);
+            while y < h - 0.3 {
+                cylinder(m, 1, v3(x, y, za), 0.18, pr * 1.4, 8, grey(r, 0.25, 0.35), 2.0)!;
+                y += rrange(r, 1.4, 2.6);
+            }
+            add_box(
+                m, face, h - 0.2, za - pr - 0.25, s * (W - 2.0 * pr - 0.2), h + 0.5, za + pr + 0.25, grey(r, 0.3, 0.45),
+                2.0)!;
+        } else if kind == 3 {
+            // a round vent: a rim, a dark mouth, blades and a hub
+            let rad = 0.45 + big * 1.1;
+            let y = rrange(r, rad + 0.3, H - rad - 0.3);
+            let p = v3(face, y, za - rad);
+            cylinder(m, 0, p, -s * 0.12, rad, 16, grey(r, 0.35, 0.5), 0.0)!;
+            cylinder(m, 0, p, -s * 0.14, rad * 0.82, 16, dark, 2.0)!;
+            add_box(m, face, y - rad * 0.8, p.z - 0.06, s * (W - 0.2), y + rad * 0.8, p.z + 0.06, grey(r, 0.3, 0.4),
+                    2.0)!;
+            add_box(m, face, y - 0.06, p.z - rad * 0.8, s * (W - 0.2), y + 0.06, p.z + rad * 0.8, grey(r, 0.3, 0.4),
+                    2.0)!;
+            cylinder(m, 0, p, -s * 0.3, rad * 0.22, 10, grey(r, 0.35, 0.5), 2.0)!;
+        } else if kind == 4 {
+            // a ribbed panel
+            let len = 1.5 + rnd(r) * 4.5;
+            let h = 1.0 + rnd(r) * 3.0;
+            let ya = rrange(r, 0.2, H - h);
+            let d = 0.12 + rnd(r) * 0.2;
+            let col = grey(r, 0.3, 0.5);
+            add_box(m, face, ya, za - len, s * (W - 0.05), ya + h, za, grey(r, 0.2, 0.3), 2.0)!;
+            if rnd(r) < 0.5 {
+                let mut z = za - 0.15;
+                while z > za - len {
+                    add_box(m, face, ya, z - 0.12, s * (W - d), ya + h, z, col, 2.0)!;
+                    z -= 0.38;
+                }
+            } else {
+                let mut y = ya + 0.1;
+                while y < ya + h - 0.1 {
+                    add_box(m, face, y, za - len, s * (W - d), y + 0.1, za, col, 2.0)!;
+                    y += 0.32;
+                }
+            }
+        } else if kind == 5 {
+            // sloping armour
+            let len = 2.0 + rnd(r) * 8.0;
+            let h = 0.8 + rnd(r) * (1.0 + big * 2.0);
+            let d = 0.3 + rnd(r) * 0.7;
+            let ya = rrange(r, 0.0, H - h);
+            let mut tip = v3(s * (W - d), ya, 0.0);
+            if rnd(r) < 0.5 {
+                tip = v3(s * (W - d), ya + h, 0.0);
+            }
+            wedge(m, v3(face, ya, 0.0), v3(face, ya + h, 0.0), tip, za - len, za, grey(r, 0.35, 0.55), 0.0)!;
+        } else if kind == 6 {
+            // a stepped block
+            let mut len = 1.0 + big * 5.0;
+            let mut h = 0.8 + big * 2.5;
+            let mut d: f32 = 0.0;
+            let ya = rrange(r, 0.0, H - h);
+            let yc = ya + h * 0.5;
+            let zc = za - len * 0.5;
+            let tiers = 2 + @int_from_float(u32, rnd(r) * 2.0);
+            for k in @as(u32, 0)..tiers {
+                let step = 0.1 + rnd(r) * 0.25;
+                add_box(m, s * (W - d), yc - h * 0.5, zc - len * 0.5, s * (W - d - step), yc + h * 0.5, zc + len * 0.5,
+                        grey(r, 0.32, 0.55), 2.0 * @float_from_int(f32, k % 2))!;
+                d += step;
+                len *= rrange(r, 0.45, 0.8);
+                h *= rrange(r, 0.45, 0.8);
+            }
+        } else {
+            // a row of lit windows on a dark panel
+            let len = 1.0 + rnd(r) * 4.0;
+            let ya = rrange(r, 1.0, H - 1.5);
+            let wc = WINDOW_COLORS[@int_from_float(usize, rnd(r) * 3.99)];
+            add_box(m, face, ya, za - len, s * (W - 0.08), ya + 0.7, za, dark, 2.0)!;
+            let mut z = za - 0.2;
+            while z > za - len + 0.3 {
+                if rnd(r) < 0.8 {
+                    add_box(
+                        m, s * (W - 0.08), ya + 0.22, z - 0.32, s * (W - 0.12), ya + 0.48, z, v3(wc[0], wc[1], wc[2]),
+                        1.0)!;
+                }
+                z -= 0.55;
+            }
+        }
+    }
+}
+
+// The machinery on the trench's floor in the segment z0 - SEG .. z0.
+fn floor_greebles(m: *mut Mesh, r: *mut Rng, seed: u64, z0: f32) !void {
+    let salt = seed +% 999;
+    let dark = v3(0.05, 0.05, 0.06);
+    for attempt in @as(usize, 0)..26 {
+        let za = z0 - rrange(r, 0.0, SEG);
+        let c = crowding(salt, za);
+        if rnd(r) > c * 1.2 + 0.05 {
+            continue;
+        }
+        let kind = pick(r, FLOOR_KINDS);
+        let big = bigness(r);
+        let side: f32 = if_else(rnd(r) < 0.5, -1.0, 1.0);
+        if kind == 0 {
+            let xa = rrange(r, -W, W - 2.0);
+            add_box(
+                m, xa, 0.0, za - 0.5 - big * 3.0, xa + 0.4 + big * 2.0, 0.08 + rnd(r) * 0.35, za, grey(r, 0.28, 0.45),
+                2.0)!;
+        } else if kind == 1 {
+            // a grating over a dark pit
+            let wd = 1.5 + rnd(r) * 3.5;
+            let xa = rrange(r, -W, W - wd);
+            let len = 2.0 + rnd(r) * 5.0;
+            add_box(m, xa, 0.0, za - len, xa + wd, 0.02, za, dark, 2.0)!;
+            let col = grey(r, 0.3, 0.42);
+            let mut z = za - 0.1;
+            while z > za - len {
+                add_box(m, xa, 0.0, z - 0.1, xa + wd, 0.1, z, col, 2.0)!;
+                z -= 0.3;
+            }
+            add_box(m, xa - 0.12, 0.0, za - len, xa, 0.14, za, col, 2.0)!;
+            add_box(m, xa + wd, 0.0, za - len, xa + wd + 0.12, 0.14, za, col, 2.0)!;
+        } else if kind == 2 {
+            // pipes half sunk in the floor by a wall
+            let pr = 0.15 + big * 0.25;
+            let x = side * (W - 0.4 - rnd(r) * 1.6);
+            let len = 5.0 + rnd(r) * 16.0;
+            let col = pipe_colour(r);
+            cylinder(m, 2, v3(x, pr * 0.5, za), -len, pr, 8, col, 2.0)!;
+            if rnd(r) < 0.5 {
+                cylinder(m, 2, v3(x - side * (pr * 2.3), pr * 0.5, za), -len * rrange(r, 0.5, 1.0), pr * 0.8, 8, col,
+                         2.0)!;
+            }
+        } else if kind == 3 {
+            // a hatch
+            let wd = 1.2 + rnd(r) * 1.8;
+            let xa = rrange(r, -W + 0.5, W - wd - 0.5);
+            add_box(m, xa, 0.0, za - wd, xa + wd, 0.06, za, grey(r, 0.3, 0.4), 2.0)!;
+            add_box(m, xa + 0.15, 0.0, za - wd + 0.15, xa + wd - 0.15, 0.12, za - 0.15, grey(r, 0.38, 0.5), 0.0)!;
+            add_box(m, xa + wd * 0.35, 0.12, za - wd * 0.55, xa + wd * 0.65, 0.2, za - wd * 0.45, grey(r, 0.2, 0.3),
+                    2.0)!;
+        } else if kind == 4 {
+            // a small dome
+            let rad = 0.25 + big * 0.5;
+            dome(m, v3(side * rrange(r, 2.0, W - rad), 0.0, za), rad, 1, 1.0, grey(r, 0.3, 0.5), 2.0)!;
+        } else if kind == 5 {
+            // cables along the foot of a wall
+            let n = 2 + @int_from_float(u32, rnd(r) * 4.0);
+            let len = 4.0 + rnd(r) * 14.0;
+            for k in @as(u32, 0)..n {
+                let cr = rrange(r, 0.05, 0.11);
+                let x = side * (W - 0.12 - 0.22 * @float_from_int(f32, k));
+                cylinder(m, 2, v3(x, cr, za), -len * rrange(r, 0.7, 1.0), cr, 6, grey(r, 0.12, 0.25), 2.0)!;
+            }
+        } else {
+            // a light set in the floor
+            let x = rrange(r, -W + 1.0, W - 1.0);
+            let wc = WINDOW_COLORS[@int_from_float(usize, rnd(r) * 3.99)];
+            add_box(m, x - 0.25, 0.0, za - 0.5, x + 0.25, 0.04, za, v3(wc[0], wc[1], wc[2]), 1.0)!;
+        }
+    }
+}
+
+// A small light on an obstacle's face at p (facing +z, the ship), flashing
+// (material 3): a short bar, a round light or a square one.
+fn warning_light(m: *mut Mesh, style: u32, p: V3, c: V3) !void {
+    let housing = v3(0.15, 0.15, 0.17);
+    if style == 0 {
+        add_box(m, p.x - 0.3, p.y - 0.12, p.z, p.x + 0.3, p.y + 0.12, p.z + 0.06, housing, 2.0)!;
+        add_box(m, p.x - 0.24, p.y - 0.06, p.z + 0.06, p.x + 0.24, p.y + 0.06, p.z + 0.09, c, 3.0)!;
+    } else if style == 1 {
+        cylinder(m, 2, p, 0.06, 0.2, 10, housing, 2.0)!;
+        cylinder(m, 2, v3(p.x, p.y, p.z + 0.06), 0.04, 0.13, 10, c, 3.0)!;
+    } else {
+        add_box(m, p.x - 0.17, p.y - 0.17, p.z, p.x + 0.17, p.y + 0.17, p.z + 0.06, housing, 2.0)!;
+        add_box(m, p.x - 0.11, p.y - 0.11, p.z + 0.06, p.x + 0.11, p.y + 0.11, p.z + 0.09, c, 3.0)!;
+    }
+}
+
+// Machinery on an obstacle's face toward the ship, so it looks part of the station.
+fn obstacle_face(m: *mut Mesh, r: *mut Rng, b: Box) !void {
+    let n = 3 + @int_from_float(u32, rnd(r) * 6.0);
+    for k in @as(u32, 0)..n {
+        let wd = rrange(r, 0.6, 3.0);
+        let h = rrange(r, 0.3, @min(2.0, (b.y1 - b.y0) * 0.6));
+        let x = rrange(r, b.x0, b.x1 - wd);
+        let y = rrange(r, b.y0, b.y1 - h);
+        add_box(m, x, y, b.z1, x + wd, y + h, b.z1 + rrange(r, 0.08, 0.3), grey(r, 0.3, 0.45), 2.0)!;
+    }
+    if rnd(r) < 0.6 {
+        cylinder(m, 0, v3(b.x0, rrange(r, b.y0 + 0.3, b.y1 - 0.3), b.z1 + 0.2), b.x1 - b.x0, rrange(r, 0.1, 0.22), 8,
+                 pipe_colour(r), 2.0)!;
+    }
+}
+
+fn if_else(c: bool, a: f32, b: f32) f32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The machinery on the surface beside the trench (side -1 or 1).
+fn surface_greebles(m: *mut Mesh, r: *mut Rng, seed: u64, s: f32, z0: f32) !void {
+    let salt = seed +% @as(u64, @int_from_float(u32, s + 2.0)) +% 4242;
+    let dark = v3(0.05, 0.05, 0.06);
+    let red = v3(1.0, 0.12, 0.08);
+    for attempt in @as(usize, 0)..30 {
+        let za = z0 - rrange(r, 0.0, SEG);
+        let c = crowding(salt, za);
+        if rnd(r) > c * 1.1 + 0.08 {
+            continue;
+        }
+        let kind = pick(r, SURFACE_KINDS);
+        let big = bigness(r);
+        let out = rnd(r);
+        let xa = W + 0.8 + out * out * 60.0;  // crowded near the edge
+        if kind == 0 {
+            // blocks, now and then stacked
+            let wd = 0.6 + big * 7.0;
+            let len = 0.6 + big * 8.0;
+            let mut h = 0.2 + rnd(r) * (0.5 + big * 2.5);
+            add_box(m, s * xa, H, za - len, s * (xa + wd), H + h, za, grey(r, 0.3, 0.55), 0.0)!;
+            if rnd(r) < 0.35 {
+                let h2 = h + 0.3 + rnd(r) * 1.5;
+                add_box(m, s * (xa + wd * 0.2), H + h, za - len * 0.8, s * (xa + wd * 0.7), H + h2, za - len * 0.2,
+                        grey(r, 0.3, 0.55), 2.0)!;
+                h = h2;
+            }
+        } else if kind == 1 {
+            let rad = 0.8 + big * 4.0;
+            dome(m, v3(s * (xa + rad), H, za), rad, 1, 1.0, grey(r, 0.35, 0.55), 0.0)!;
+        } else if kind == 2 {
+            // a tower with a cap, an antenna and a warning light
+            let rad = 0.6 + big * 1.8;
+            let h = 3.0 + rnd(r) * (3.0 + out * 12.0);
+            let p = v3(s * (xa + rad + 1.0), H, za);
+            cylinder(m, 1, p, h, rad, 12, grey(r, 0.35, 0.55), 0.0)!;
+            cylinder(m, 1, v3(p.x, H + h, p.z), 0.4, rad * 1.3, 12, grey(r, 0.3, 0.45), 2.0)!;
+            let ah = 2.0 + rnd(r) * 4.0;
+            cylinder(m, 1, v3(p.x, H + h + 0.4, p.z), ah, 0.07, 6, grey(r, 0.3, 0.4), 2.0)!;
+            add_box(m, p.x - 0.15, H + h + 0.4 + ah, p.z - 0.15, p.x + 0.15, H + h + 0.7 + ah, p.z + 0.15, red, 1.0)!;
+        } else if kind == 3 {
+            // big pipes along the trench
+            let pr = 0.35 + big * 0.9;
+            let len = 10.0 + rnd(r) * 30.0;
+            cylinder(m, 2, v3(s * (xa + pr), H + pr, za), -len, pr, 12, pipe_colour(r), 2.0)!;
+            let mut zb = za - 1.0;
+            while zb > za - len {
+                add_box(
+                    m, s * (xa - 0.2), H, zb - 0.25, s * (xa + pr * 2.0 + 0.2), H + pr * 1.2, zb + 0.25, grey(
+                        r, 0.2, 0.3), 2.0)!;
+                zb -= rrange(r, 3.0, 6.0);
+            }
+        } else if kind == 4 {
+            // a vent facing the sky
+            let rad = 1.0 + big * 2.0;
+            let p = v3(s * (xa + rad), H, za - rad);
+            cylinder(m, 1, p, 0.25, rad, 16, grey(r, 0.35, 0.5), 0.0)!;
+            cylinder(m, 1, p, 0.28, rad * 0.8, 16, dark, 2.0)!;
+            add_box(m, p.x - rad * 0.8, H, p.z - 0.08, p.x + rad * 0.8, H + 0.36, p.z + 0.08, grey(r, 0.3, 0.4), 2.0)!;
+            add_box(m, p.x - 0.08, H, p.z - rad * 0.8, p.x + 0.08, H + 0.36, p.z + rad * 0.8, grey(r, 0.3, 0.4), 2.0)!;
+        } else if kind == 5 {
+            // a sloping bank
+            let len = 3.0 + rnd(r) * 10.0;
+            let wd = 1.0 + big * 4.0;
+            let h = 0.6 + big * 2.5;
+            wedge(
+                m, v3(s * xa, H, 0.0), v3(s * (xa + wd), H, 0.0), v3(s * (xa + wd), H + h, 0.0), za - len, za, grey(
+                    r, 0.35, 0.55), 0.0)!;
+        } else {
+            // a ribbed block
+            let len = 2.0 + rnd(r) * 5.0;
+            let wd = 1.0 + rnd(r) * 3.0;
+            let h = 0.5 + rnd(r) * 1.5;
+            add_box(m, s * xa, H, za - len, s * (xa + wd), H + h * 0.6, za, grey(r, 0.25, 0.35), 2.0)!;
+            let mut z = za - 0.1;
+            while z > za - len {
+                add_box(m, s * xa, H, z - 0.15, s * (xa + wd), H + h, z, grey(r, 0.35, 0.5), 2.0)!;
+                z -= 0.45;
+            }
+        }
+    }
+}
+
+// The trench for the current wave: its mesh, obstacles and turrets.
+fn build_level(g: *mut Game, m: *mut Mesh) !void {
+    let mut r = Rng.{ s: g.layout +% (@as(u64, g.wave) *% 0x2545_f491_4f6c_dd1d) };
+    let hull = v3(0.52, 0.53, 0.57);
+    let amber = v3(1.0, 0.55, 0.16);
+    let red = v3(1.0, 0.12, 0.08);
+    let blue = v3(0.35, 0.6, 1.0);
+    // the floor, the walls, the surface on both sides, the end wall
+    add_box(m, -W, -1.0, -LEN - 4.0, W, 0.0, 60.0, v3(0.48, 0.49, 0.52), 0.0)!;
+    for side in SIDES {
+        let s: f32 = side;
+        add_box(m, s * W, 0.0, -LEN - 4.0, s * (W + 2.0), H, 60.0, hull, 0.0)!;
+        add_box(m, s * W, H - 1.0, -LEN - 120.0, s * (W + 90.0), H, 120.0, v3(0.47, 0.48, 0.52), 0.0)!;
+    }
+    add_box(m, -W, 0.0, -LEN - 4.0, W, H, -LEN, hull, 0.0)!;
+    // the port: a frame standing out of the end wall around a dark hole
+    let pz = -LEN;
+    let fc = v3(0.36, 0.36, 0.38);
+    add_box(m, -PORT_R - 0.8, PORT_Y - PORT_R - 0.8, pz, PORT_R + 0.8, PORT_Y - PORT_R, pz + 0.7, fc, 2.0)!;
+    add_box(m, -PORT_R - 0.8, PORT_Y + PORT_R, pz, PORT_R + 0.8, PORT_Y + PORT_R + 0.8, pz + 0.7, fc, 2.0)!;
+    add_box(m, -PORT_R - 0.8, PORT_Y - PORT_R, pz, -PORT_R, PORT_Y + PORT_R, pz + 0.7, fc, 2.0)!;
+    add_box(m, PORT_R, PORT_Y - PORT_R, pz, PORT_R + 0.8, PORT_Y + PORT_R, pz + 0.7, fc, 2.0)!;
+    for k in @as(usize, 0)..6 {
+        let y = PORT_Y - 4.5 + 1.8 * @float_from_int(f32, k);
+        add_box(m, -6.5, y, pz, -4.0, y + 0.25, pz + 0.3, red, 1.0)!;
+        add_box(m, 4.0, y, pz, 6.5, y + 0.25, pz + 0.3, red, 1.0)!;
+    }
+    g.nobst = 0;
+    g.nturrets = 0;
+    let mut next_obstacle: usize = 3;
+    for seg in @as(usize, 0)..SEGS + 4 {
+        let z0 = 40.0 - SEG * @float_from_int(f32, seg);  // the segment is z0 - SEG .. z0
+        let in_trench = (z0 <= 0.0) and (z0 - SEG >= -LEN);
+        for side in SIDES {
+            let s: f32 = side;
+            if z0 - SEG < -LEN {
+                continue;
+            }
+            wall_greebles(m, &mut r, g.layout, s, z0)!;
+            // a ledge along it
+            let ly = 3.0 + 5.0 * @float_from_int(f32, seg % 2);
+            add_box(m, s * (W - 0.35), ly, z0 - SEG, s * W, ly + 0.35, z0, grey(&mut r, 0.45, 0.5), 0.0)!;
+            // lights low on the wall and at the rim
+            for k in @as(usize, 0)..3 {
+                let lz = z0 - 2.0 - 8.0 * @float_from_int(f32, k);
+                add_box(m, s * (W - 0.1), 0.5, lz - 1.6, s * W, 0.75, lz, amber, 1.0)!;
+            }
+            add_box(m, s * W, H, z0 - 1.0, s * (W + 0.3), H + 0.25, z0 - 0.4, red, 1.0)!;
+            surface_greebles(m, &mut r, g.layout, s, z0)!;
+            // turrets
+            if in_trench and (seg >= 2) and (seg < SEGS - 1) {
+                let p = 0.25 + 0.06 * @float_from_int(f32, g.wave);
+                if (rnd(&mut r) < p) and (g.nturrets < MAX_TURRETS) {
+                    let tz = z0 - rrange(&mut r, 3.0, SEG - 3.0);
+                    let rim = rnd(&mut r) < 0.5;
+                    let mut tp = v3(s * (W - 0.7), rrange(&mut r, 2.5, 9.5), tz);
+                    if rim {
+                        tp = v3(s * (W + 1.8), H + 0.8, tz);
+                    }
+                    g.turrets[g.nturrets] = Turret.{
+                        p: tp, side: s, rim: rim, alive: true, cool: rrange(&mut r, 0.5, 2.5) };
+                    g.nturrets += 1;
+                }
+            }
+        }
+        if not in_trench {
+            continue;
+        }
+        // the floor: machinery, and lights down the middle
+        floor_greebles(m, &mut r, g.layout, z0)!;
+        for k in @as(usize, 0)..4 {
+            let lz = z0 - 6.0 * @float_from_int(f32, k);
+            add_box(m, -0.12, 0.0, lz - 1.2, 0.12, 0.06, lz, blue, 1.0)!;
+        }
+        // an obstacle every two or three segments
+        if (seg == next_obstacle) and (seg < SEGS - 3) and (g.nobst < MAX_OBST) {
+            next_obstacle = seg + 2 + @int_from_float(usize, rnd(&mut r) * 2.0);
+            let oz = z0 - SEG * 0.5;
+            let kind = @int_from_float(u32, rnd(&mut r) * 4.0);
+            let mut b = Box.{ x0: -W, y0: 0.0, z0: oz - 1.0, x1: W, y1: H, z1: oz + 1.0 };
+            if kind == 0 {
+                // a catwalk across: over or under it
+                let y = rrange(&mut r, 3.5, 8.5);
+                b.y0 = y - 0.7;
+                b.y1 = y + 0.7;
+            } else if kind == 1 {
+                // a baffle from one wall to the middle: go round it
+                b.z0 = oz - 0.6;
+                b.z1 = oz + 0.6;
+                if rnd(&mut r) < 0.5 {
+                    b.x1 = 0.6;
+                } else {
+                    b.x0 = -0.6;
+                }
+            } else if kind == 2 {
+                // a wall up from the floor: over it
+                b.y1 = rrange(&mut r, 4.5, 6.5);
+            } else {
+                // hanging from the rim: under it
+                b.y0 = rrange(&mut r, 5.5, 7.5);
+            }
+            let oc = grey(&mut r, 0.4, 0.47);
+            add_box(m, b.x0, b.y0, b.z0, b.x1, b.y1, b.z1, oc, 0.0)!;
+            obstacle_face(m, &mut r, b)!;
+            // small flashing lights along the edges facing the ship
+            let style = @int_from_float(u32, rnd(&mut r) * 3.0);
+            let mut lc = red;
+            if rnd(&mut r) < 0.25 {
+                lc = v3(1.0, 0.55, 0.12);
+            }
+            let spacing = rrange(&mut r, 1.2, 2.2);
+            let ly0 = @max(b.y0, 0.3) + 0.25;
+            let ly1 = @min(b.y1, H - 0.3) - 0.25;
+            let mut x = b.x0 + 0.4;
+            while x < b.x1 - 0.3 {
+                for y in [ly0, ly1]{
+                    warning_light(m, style, v3(x, y, b.z1), lc)!;
+                }
+                x += spacing;
+            }
+            // girders underneath a catwalk, to the walls
+            if kind == 0 {
+                add_box(m, -W, b.y0 - 0.4, oz - 0.3, -W + 1.2, b.y0, oz + 0.3, oc, 2.0)!;
+                add_box(m, W - 1.2, b.y0 - 0.4, oz - 0.3, W, b.y0, oz + 0.3, oc, 2.0)!;
+            }
+            g.obst[g.nobst] = b;
+            g.nobst += 1;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Graphics
+// -----------------------------------------------------------------------------
+struct Gfx {
+    root: d3d.RootSignature,
+    solid: d3d.Pipeline,
+    glow: d3d.Pipeline,
+    hud: d3d.Pipeline,
+    shadow_pipe: d3d.Pipeline,
+    shadow: d3d.DepthBuffer,  // the sun's shadow map
+    lights: d3d.Buffer,       // b1: the sun's matrix and the lights near the ship
+    cube_v: d3d.Buffer,
+    cube_i: d3d.Buffer,
+    quad: d3d.Buffer,
+    world_v: d3d.Buffer,
+    world_i: d3d.Buffer,
+    world_n: u32,
+}
+
+fn f32_bytes(p: []f32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}
+
+fn u32_bytes(p: []u32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}
+
+fn shader_source() !strs.String {
+    let mut s = strs.String.init();
+    for l in SHADER_LINES {
+        s.push_str(l)!;
+        s.push('\n')!;
+    }
+    return s;
+}
+
+fn shader(src: []u8, entry: []u8, target: []u8) !hlsl.Code {
+    return hlsl.compile(src, entry, target) catch |e| {
+        if e == error.CompileError {
+            fmt.eprint("trench: {}\n", [fmt.str(hlsl.message())]) catch {};
+        }
+        return e;
+    };
+}
+
+// A pipeline from the shaders' entry points vs and ps (none for depth_only).
+fn pipe(gpu: *mut d3d.Device, root: *d3d.RootSignature, src: []u8, vs: []u8, ps: []u8,
+        o: d3d.PipelineOptions) !d3d.Pipeline {
+    let mut vcode = shader(src, vs, "vs_5_0")!;
+    defer vcode.release();
+    if o.depth_only {
+        let attrs = attributes();
+        return gpu.pipeline_with(root, &vcode, &vcode, attrs[..], o);
+    }
+    let mut pcode = shader(src, ps, "ps_5_0")!;
+    defer pcode.release();
+    let attrs = attributes();
+    return gpu.pipeline_with(root, &vcode, &pcode, attrs[..], o);
+}
+
+fn attributes() [3]d3d.Attribute {
+    let attrs: [3]d3d.Attribute = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32B32_FLOAT,
+                                                   offset: 0 }, d3d.Attribute.{
+                                                       semantic: "NORMAL", index: 0, format: d3d.R32G32B32_FLOAT,
+                                                       offset: 12 }, d3d.Attribute.{
+                                                           semantic: "COLOR", index: 0, format: d3d.R32G32B32A32_FLOAT,
+                                                           offset: 24 }];
+    return attrs;
+}
+
+fn options(blend: u32, depth: u32, cull: u32) d3d.PipelineOptions {
+    let mut o = d3d.PipelineOptions.defaults();
+    o.blend = blend;
+    o.depth = depth;
+    o.cull = cull;
+    return o;
+}
+
+fn graphics(gpu: *mut d3d.Device) !Gfx {
+    let mut src = shader_source()!;
+    defer src.deinit();
+    let mut root = gpu.root_signature_with(52, 1, 1)!;
+    let solid = pipe(gpu, &root, src.bytes(), "vs", "ps", options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_BACK))!;
+    let glow_pipe = pipe(
+        gpu, &root, src.bytes(), "vs_glow", "ps_glow", options(d3d.BLEND_ADD, d3d.DEPTH_TEST, d3d.CULL_NONE))!;
+    let hud = pipe(gpu, &root, src.bytes(), "vs_hud", "ps_hud", options(d3d.BLEND_ALPHA, d3d.DEPTH_OFF,
+                                                                        d3d.CULL_NONE))!;
+    // the shadow map's pass: depth alone, pushed back a little against acne
+    let mut so = options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_NONE);
+    so.depth_only = true;
+    so.depth_bias = 1500;
+    so.slope_bias = 2.5;
+    let shadow_pipe = pipe(gpu, &root, src.bytes(), "vs_shadow", "", so)!;
+    let mut unit = mesh();
+    defer mesh_deinit(&mut unit);
+    add_box(&mut unit, -0.5, -0.5, -0.5, 0.5, 0.5, 0.5, v3(1.0, 1.0, 1.0), 0.0)!;
+    let mut quad: [60]f32 = [0.0; 60];
+    let qc: [6][2]f32 = [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [-1.0, -1.0], [1.0, 1.0], [1.0, -1.0]];
+    for k in @as(usize, 0)..6 {
+        quad[k * 10] = qc[k][0];
+        quad[k * 10 + 1] = qc[k][1];
+        quad[k * 10 + 6] = 1.0;
+        quad[k * 10 + 7] = 1.0;
+        quad[k * 10 + 8] = 1.0;
+    }
+    let empty = d3d.Buffer.{ p: 0, gpu: 0, size: 0, mapped: 0 };
+    return Gfx.{ root: root, solid: solid, glow: glow_pipe, hud: hud, shadow_pipe: shadow_pipe,
+                 shadow: gpu.shadow_map(SHADOW_SIZE)!, lights: gpu.constant_buffer(LIGHT_FLOATS * 4)!,
+                 cube_v: gpu.buffer(f32_bytes(unit.v.items()))!, cube_i: gpu.buffer(u32_bytes(unit.i.items()))!,
+                 quad: gpu.buffer(f32_bytes(quad[..]))!, world_v: empty, world_i: empty, world_n: 0 };
+}
+
+fn upload_world(gpu: *mut d3d.Device, gfx: *mut Gfx, g: *mut Game) !void {
+    let mut m = mesh();
+    defer mesh_deinit(&mut m);
+    build_level(g, &mut m)!;
+    gpu.wait_idle();
+    gfx.world_v.release();
+    gfx.world_i.release();
+    gfx.world_v = gpu.buffer(f32_bytes(m.v.items()))!;
+    gfx.world_i = gpu.buffer(u32_bytes(m.i.items()))!;
+    gfx.world_n = @truncate(u32, m.i.items().len);
+    g.rebuild = false;
+}
+
+fn release(g: *mut Gfx) void {
+    g.world_v.release();
+    g.world_i.release();
+    g.cube_v.release();
+    g.cube_i.release();
+    g.quad.release();
+    g.lights.release();
+    g.shadow.release();
+    g.shadow_pipe.release();
+    g.hud.release();
+    g.glow.release();
+    g.solid.release();
+    g.root.release();
+}
+
+// The camera this frame: where it is and its axes.
+struct Camera {
+    eye: V3,
+    fwd: V3,
+    right: V3,
+    up: V3,
+}
+
+fn camera(g: *Game) Camera {
+    let mut eye = g.pos;
+    let mut jx: f32 = 0.0;
+    let mut jy: f32 = 0.0;
+    let mut jroll: f32 = 0.0;
+    if g.shake > 0.0 {
+        // shaken: thrown about, knocked off line and rolled by the hit
+        let k = g.shake * g.shake;
+        let t = g.time;
+        eye = vadd(eye, v3((math.sinf(t * 71.0) + 0.6 * math.sinf(t * 113.0 + 1.3)) * k * 0.45,
+                           (math.sinf(t * 53.0 + 0.7) + 0.6 * math.sinf(t * 97.0)) * k * 0.45, 0.0));
+        jx = math.sinf(t * 61.0 + 2.1) * k * 0.05;
+        jy = math.sinf(t * 47.0) * k * 0.05;
+        jroll = g.kick * k + math.sinf(t * 37.0) * k * 0.06;
+    }
+    let fwd = vnorm(v3(math.sinf(g.yaw) + jx, math.sinf(g.pitch) + jy, -1.0));
+    let roll = clamp(-g.vx * 0.022, -0.35, 0.35) + jroll;
+    let up0 = v3(-math.sinf(roll), math.cosf(roll), 0.0);
+    let right = vnorm(vcross(fwd, up0));
+    return Camera.{ eye: eye, fwd: fwd, right: right, up: vcross(right, fwd) };
+}
+
+fn gv(v: V3) geo.Vec3 {
+    return geo.Vec3.init(@as(f64, v.x), @as(f64, v.y), @as(f64, v.z));
+}
+
+// Per-frame constants: they are reset whenever the pipeline changes.
+fn frame_constants(cam: Camera, aspect: f32, secs: f32) [32]u32 {
+    let view = geo.look_at(gv(cam.eye), gv(vadd(cam.eye, cam.fwd)), gv(cam.up));
+    let proj = geo.perspective_zo(1.2, @as(f64, aspect), 0.3, 2000.0);
+    let vp = proj.mul(view);
+    let mut f: [32]f32 = [0.0; 32];
+    for c in @as(usize, 0)..4 {
+        let mut col: [4]f32 = [0.0; 4];
+        @store(col[..], vp.cols[c]);
+        for k in @as(usize, 0)..4 {
+            f[c * 4 + k] = col[k];
+        }
+    }
+    let sun = sun_dir();
+    let vals: [16]f32 = [cam.eye.x, cam.eye.y, cam.eye.z, secs, sun.x, sun.y, sun.z, FOG, cam.right.x, cam.right.y,
+                         cam.right.z, 0.0, cam.up.x, cam.up.y, cam.up.z, 0.0];
+    for k in @as(usize, 0)..16 {
+        f[16 + k] = vals[k];
+    }
+    let mut u: [32]u32 = [0; 32];
+    for k in @as(usize, 0)..32 {
+        u[k] = @bit_cast(u32, f[k]);
+    }
+    return u;
+}
+
+// The light buffer (b1), in floats: the sun's matrix, the shadow map's texel
+// size and whether it is on, then the lights' positions and radii, their
+// colours and strengths, their number.
+const LIGHT_FLOATS: usize = 216;
+const LPOS: usize = 20;
+const LCOL: usize = 116;
+const LCOUNT: usize = 212;
+
+fn put_matrix(m: matrix.Mat4, out: []mut f32, at: usize) void {
+    for c in @as(usize, 0)..4 {
+        let mut col: [4]f32 = [0.0; 4];
+        @store(col[..], m.cols[c]);
+        for k in @as(usize, 0)..4 {
+            out[at + c * 4 + k] = col[k];
+        }
+    }
+}
+
+// The sun's view and projection for the shadow map: a box around the trench
+// from just behind the ship to well ahead of it, seen along the sun's light.
+// The view's origin is fixed and the box snapped to whole texels, so that
+// the shadows' edges stay still as the ship flies on.
+fn sun_matrix(ship_z: f32) matrix.Mat4 {
+    let l = sun_dir();
+    let view = geo.look_at(gv(vmul(l, -500.0)), geo.Vec3.init(0.0, 0.0, 0.0), geo.Vec3.init(0.0, 0.0, -1.0));
+    let mut lo = geo.Vec3.init(1.0e9, 1.0e9, 1.0e9);
+    let mut hi = geo.Vec3.init(-1.0e9, -1.0e9, -1.0e9);
+    for k in @as(usize, 0)..8 {
+        let mut x: f32 = -50.0;
+        if (k & 1) != 0 {
+            x = 50.0;
+        }
+        let mut y: f32 = -2.0;
+        if (k & 2) != 0 {
+            y = 32.0;
+        }
+        let mut z = ship_z + 30.0;
+        if (k & 4) != 0 {
+            z = ship_z - 320.0;
+        }
+        let p = geo.transform_point(view, gv(v3(x, y, z)));
+        lo = geo.Vec3.init(@min(lo.x, p.x), @min(lo.y, p.y), @min(lo.z, p.z));
+        hi = geo.Vec3.init(@max(hi.x, p.x), @max(hi.y, p.y), @max(hi.z, p.z));
+    }
+    let n = @float_from_int(f64, SHADOW_SIZE);
+    let tx = (hi.x - lo.x) / (n - 2.0);
+    let ty = (hi.y - lo.y) / (n - 2.0);
+    let x0 = @floor(lo.x / tx) * tx - tx;
+    let y0 = @floor(lo.y / ty) * ty - ty;
+    let proj = geo.orthographic_zo(x0, x0 + tx * n, y0, y0 + ty * n, -hi.z - 60.0, -lo.z + 10.0);
+    return proj.mul(view);
+}
+
+struct Light {
+    p: V3,
+    r: f32,  // how far it reaches
+    c: V3,
+    k: f32,  // how strong
+}
+
+// What lights the trench this frame: the sun's shadow map, then the point
+// lights nearest the ship (fireballs, shots, explosions, the port, turrets
+// about to fire).
+fn light_data(g: *Game, out: []mut f32) void {
+    put_matrix(sun_matrix(g.pos.z), out, 0);
+    out[16] = 1.0 / @float_from_int(f32, SHADOW_SIZE);
+    out[17] = 1.0;
+    let mut all: [160]Light = [Light.{ p: v3(0.0, 0.0, 0.0), r: 1.0, c: v3(0.0, 0.0, 0.0), k: 0.0 }; 160];
+    let mut n: usize = 0;
+    for b in g.fire {
+        if b.alive and (n < 160) {
+            let flicker = 0.85 + 0.15 * math.sinf(g.time * 37.0 + b.ang * 5.0);
+            all[n] = Light.{ p: b.p, r: 22.0, c: v3(1.0, 0.42, 0.1), k: 3.4 * flicker };
+            n += 1;
+        }
+    }
+    for b in g.flashes {
+        if b.alive and (n < 160) {
+            let k = b.life / b.max;
+            all[n] = Light.{ p: b.p, r: b.size, c: b.c, k: 6.0 * k * k };
+            n += 1;
+        }
+    }
+    for b in g.lasers {
+        if b.alive and (n < 160) {
+            all[n] = Light.{ p: b.p, r: 10.0, c: v3(0.3, 1.0, 0.75), k: 2.0 };
+            n += 1;
+        }
+    }
+    if (g.pos.z + LEN < PORT_RANGE) and not g.won and (n < 160) {
+        all[n] = Light.{ p: v3(0.0, PORT_Y, -LEN + 2.5), r: 28.0, c: v3(1.0, 0.5, 0.12),
+                         k: 2.4 + 0.6 * math.sinf(g.time * 12.0) };
+        n += 1;
+    }
+    for i in 0..g.nturrets {
+        let tu = g.turrets[i];
+        if tu.alive and (tu.cool < 0.7) and (n < 160) {
+            all[n] = Light.{ p: vadd(tu.p, v3(-tu.side * 1.5, 0.5, 0.5)), r: 7.0, c: v3(1.0, 0.12, 0.05),
+                             k: 2.5 * (1.0 - tu.cool) };
+            n += 1;
+        }
+    }
+    // the nearest (less their reach) first
+    let mut count: usize = 0;
+    while (count < MAX_LIGHTS) and (count < n) {
+        let mut best = count;
+        let mut best_d: f32 = 1.0e9;
+        for i in count..n {
+            let d = vlen(vsub(all[i].p, g.pos)) - all[i].r;
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        if best_d > 60.0 {
+            break;
+        }
+        let l = all[best];
+        all[best] = all[count];
+        all[count] = l;
+        out[LPOS + count * 4] = l.p.x;
+        out[LPOS + count * 4 + 1] = l.p.y;
+        out[LPOS + count * 4 + 2] = l.p.z;
+        out[LPOS + count * 4 + 3] = l.r;
+        out[LCOL + count * 4] = l.c.x;
+        out[LCOL + count * 4 + 1] = l.c.y;
+        out[LCOL + count * 4 + 2] = l.c.z;
+        out[LCOL + count * 4 + 3] = l.k;
+        count += 1;
+    }
+    out[LCOUNT] = @float_from_int(f32, count);
+}
+
+fn put_draw(gpu: *mut d3d.Device, vals: [20]f32) void {
+    let mut u: [20]u32 = [0; 20];
+    for k in @as(usize, 0)..20 {
+        u[k] = @bit_cast(u32, vals[k]);
+    }
+    gpu.set_constants_at(32, u[..]);
+}
+
+// A box from the cube mesh: centre, size, turned by ang about y; mat -1 is
+// plating.
+fn cube(gpu: *mut d3d.Device, p: V3, s: V3, ang: f32, c: V3, mat: f32) void {
+    let co = math.cosf(ang);
+    let si = math.sinf(ang);
+    put_draw(gpu, [s.x * co, 0.0, s.z * si, p.x, 0.0, s.y, 0.0, p.y, -s.x * si, 0.0, s.z * co, p.z, c.x, c.y, c.z, 1.0,
+                   @max(mat, 0.0), 0.0, 0.0, 0.0]);
+    gpu.draw_indexed(36, 0, 0);
+}
+
+fn glow(gpu: *mut d3d.Device, p: V3, size: f32, c: V3, a: f32, fogged: bool) void {
+    let mut f: f32 = 0.0;
+    if fogged {
+        f = 1.0;
+    }
+    put_draw(gpu, [p.x, p.y, p.z, size, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, 0.0, f, 0.0, 0.0]);
+    gpu.draw(6, 0);
+}
+
+// A rectangle on the screen: centre and size with y in -1..1, x in -aspect..aspect.
+fn rect(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, r: f32, gr: f32, b: f32, a: f32) void {
+    put_draw(gpu, [x / aspect, y, w * 0.5 / aspect, h * 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, r, gr, b, a, 0.0,
+                   0.0, 0.0, 0.0]);
+    gpu.draw(6, 0);
+}
+
+// The whole screen, drawn by the HUD shader's kind 1 (a vignette, darker
+// toward the edges) or 2 (interference).
+fn overlay(gpu: *mut d3d.Device, kind: f32, c: V3, a: f32) void {
+    put_draw(gpu, [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, kind, 0.0, 0.0, 0.0]);
+    gpu.draw(6, 0);
+}
+
+// Seven-segment digits: bit 0 is the top, then clockwise, bit 6 the middle.
+let DIGITS: [10]u8 = [0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f];
+
+fn digit(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, h: f32, d: u32, c: V3) void {
+    let w = h * 0.55;
+    let t = h * 0.13;
+    let m = DIGITS[@as(usize, d % 10)];
+    let segs: [7][4]f32 = [[0.0, h * 0.5 - t * 0.5, w, t], [w * 0.5 - t * 0.5, h * 0.25, t, h * 0.5],
+                           [w * 0.5 - t * 0.5, -h * 0.25, t, h * 0.5], [0.0, -h * 0.5 + t * 0.5, w, t],
+                           [-w * 0.5 + t * 0.5, -h * 0.25, t, h * 0.5], [-w * 0.5 + t * 0.5, h * 0.25, t, h * 0.5],
+                           [0.0, 0.0, w, t]];
+    for k in @as(usize, 0)..7 {
+        if (m & (@as(u8, 1) << @truncate(u8, k))) != 0 {
+            let s = segs[k];
+            rect(gpu, aspect, x + s[0], y + s[1], s[2], s[3], c.x, c.y, c.z, 0.9);
+        }
+    }
+}
+
+fn number(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, h: f32, n: u32, places: u32, c: V3) void {
+    let mut v = n;
+    let mut k: u32 = 0;
+    while k < places {
+        let dx = h * 0.8 * @float_from_int(f32, places - 1 - k);
+        digit(gpu, aspect, x + dx, y, h, v % 10, c);
+        v /= 10;
+        k += 1;
+    }
+}
+
+fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.DepthBuffer, g: *Game) !void {
+    let aspect = @float_from_int(f32, t.width) / @float_from_int(f32, t.height);
+    let cam = camera(g);
+    let fc = frame_constants(cam, aspect, g.time);
+    let mut lb: [216]f32 = [0.0; 216];
+    light_data(g, lb[..]);
+    gfx.lights.write(f32_bytes(lb[..]))!;
+
+    // what the sun sees, for shadows
+    gpu.begin_shadow(&mut gfx.shadow)!;
+    gpu.clear_depth(&gfx.shadow);
+    gpu.set_pipeline(&gfx.shadow_pipe);
+    gpu.set_buffer(0, &gfx.lights);
+    solids(gpu, gfx, g);
+
+    gpu.begin_depth(t, z)!;
+    gpu.clear(t, 0.004, 0.005, 0.012, 1.0);
+    gpu.clear_depth(z);
+
+    // solid things, lit and shadowed
+    gpu.set_pipeline(&gfx.solid);
+    gpu.set_constants_at(0, fc[..]);
+    gpu.set_buffer(0, &gfx.lights);
+    gpu.set_texture(0, &mut gfx.shadow);
+    solids(gpu, gfx, g);
+    // the port: dim red until the ship is close enough, then hot
+    let pd = g.pos.z + LEN;
+    let open = (pd < PORT_RANGE) and not g.won;
+    let mut pc = v3(0.35, 0.05, 0.03);
+    if open {
+        pc = v3(1.0, 0.55 + 0.25 * math.sinf(g.time * 12.0), 0.12);
+    }
+    if not g.won {
+        cube(gpu, v3(0.0, PORT_Y, -LEN + 0.05), v3(PORT_R * 2.0, PORT_R * 2.0, 0.1), 0.0, pc, 1.0);
+    }
+    glows(gpu, gfx, g, cam, fc, open);
+    instruments(gpu, gfx, g, aspect, open, fc);
+}
+
+// The trench, the turrets and debris (into the shadow map, or lit).
+fn solids(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game) void {
+    gpu.set_vertices(&gfx.world_v, 40);
+    gpu.set_indices(&gfx.world_i, d3d.R32_UINT);
+    put_draw(gpu, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 0.0,
+                   0.0]);
+    gpu.draw_indexed(gfx.world_n, 0, 0);
+    gpu.set_vertices(&gfx.cube_v, 40);
+    gpu.set_indices(&gfx.cube_i, d3d.R32_UINT);
+    let metal = v3(0.5, 0.5, 0.55);
+    for i in 0..g.nturrets {
+        let tu = g.turrets[i];
+        let dz = tu.p.z - g.pos.z;
+        if (not tu.alive) or (dz > 20.0) or (dz < -700.0) {
+            continue;
+        }
+        let s = tu.side;
+        if tu.rim {
+            cube(gpu, tu.p, v3(2.6, 1.6, 2.6), 0.0, metal, -1.0);
+            cube(gpu, vadd(tu.p, v3(0.0, 1.2, 0.0)), v3(1.5, 1.0, 1.5), 0.0, v3(0.42, 0.42, 0.46), 2.0);
+            cube(gpu, vadd(tu.p, v3(-s * 1.2, 1.3, 0.4)), v3(1.8, 0.28, 0.28), 0.0, v3(0.3, 0.3, 0.32), 2.0);
+        } else {
+            cube(gpu, tu.p, v3(1.4, 1.8, 1.8), 0.0, metal, -1.0);
+            cube(gpu, vadd(tu.p, v3(-s * 1.1, 0.0, 0.0)), v3(1.4, 0.3, 0.3), 0.0, v3(0.3, 0.3, 0.32), 2.0);
+        }
+    }
+    for b in g.debris {
+        if b.alive {
+            cube(gpu, b.p, v3(b.size, b.size * 0.6, b.size * 0.8), b.ang, b.c, -1.0);
+        }
+    }
+}
+
+// Stars, the port's glow, turrets' eyes, fireballs, shots and sparks, added
+// over the scene.
+fn glows(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game, cam: Camera, fc: [32]u32, open: bool) void {
+    gpu.set_pipeline(&gfx.glow);
+    gpu.set_constants_at(0, fc[..]);
+    gpu.set_vertices(&gfx.quad, 40);
+    for s in g.stars {
+        let b = 0.6 + 0.4 * math.sinf(g.time * 1.3 + s.x * 50.0);
+        glow(gpu, vadd(cam.eye, vmul(s, 1500.0)), 2.2 + 1.6 * @abs(s.z), v3(0.8, 0.85, 1.0), b, false);
+    }
+    if open {
+        glow(gpu, v3(0.0, PORT_Y, -LEN + 1.0), 5.0, v3(1.0, 0.5, 0.1), 0.8, true);
+    }
+    for i in 0..g.nturrets {
+        let tu = g.turrets[i];
+        let dz = tu.p.z - g.pos.z;
+        if (not tu.alive) or (dz > 0.0) or (dz < -400.0) {
+            continue;
+        }
+        let mut charge: f32 = 0.15;
+        if tu.cool < 0.7 {
+            charge = 1.0 - tu.cool;
+        }
+        let mut ep = vadd(tu.p, v3(-tu.side * 0.75, 0.0, 0.5));
+        if tu.rim {
+            ep = vadd(tu.p, v3(-tu.side * 0.8, 1.25, 0.8));
+        }
+        glow(gpu, ep, 0.5 + charge, v3(1.0, 0.15, 0.05), charge, true);
+    }
+    // the turrets' fireballs: big, ragged and orange, flames licking round a
+    // white-hot core
+    for b in g.fire {
+        if b.alive {
+            let pulse = 1.0 + 0.15 * math.sinf(g.time * 23.0 + b.ang);
+            glow(gpu, b.p, 3.6 * pulse, v3(0.9, 0.18, 0.03), 0.8, true);
+            glow(gpu, b.p, 2.2, v3(1.0, 0.5, 0.08), 1.0, true);
+            for k in @as(usize, 0)..4 {
+                let a = g.time * (7.0 + @float_from_int(f32, k)) + b.ang + @float_from_int(f32, k) * 1.57;
+                let off = vadd(vmul(cam.right, math.cosf(a) * 1.5), vmul(cam.up, math.sinf(a) * 1.5));
+                glow(gpu, vadd(b.p, off), 1.1, v3(1.0, 0.35, 0.04), 0.9, true);
+            }
+            glow(gpu, b.p, 1.0, v3(1.0, 0.95, 0.75), 1.2, true);
+        }
+    }
+    // the ship's shots: thin cyan bolts
+    for b in g.lasers {
+        if b.alive {
+            let d = vnorm(b.v);
+            for k in @as(usize, 0)..7 {
+                let back = @float_from_int(f32, k) * 0.7;
+                let r = 0.38 - 0.04 * @float_from_int(f32, k);
+                glow(gpu, vsub(b.p, vmul(d, back)), r, v3(0.25, 1.0, 0.8), 1.0, false);
+            }
+            glow(gpu, b.p, 0.22, v3(0.9, 1.0, 1.0), 1.5, false);
+        }
+    }
+    for b in g.sparks {
+        if b.alive {
+            let k = b.life / b.max;
+            glow(gpu, b.p, b.size * (0.4 + 0.6 * k), b.c, k, true);
+        }
+    }
+}
+
+// The crosshair, score, wave, shields, the way to the port, flashes.
+fn instruments(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game, aspect: f32, open: bool, fc: [32]u32) void {
+    gpu.set_pipeline(&gfx.hud);
+    gpu.set_constants_at(0, fc[..]);
+    let jolt = g.shake * g.shake;
+    let jx = math.sinf(g.time * 83.0) * jolt * 0.03;
+    let jy = math.sinf(g.time * 67.0 + 1.0) * jolt * 0.03;
+    let mut ch = v3(0.3, 1.0, 0.45);
+    if open {
+        ch = v3(1.0, 0.6, 0.15);
+    }
+    if (g.phase == PLAY) or (g.phase == DIVE) {
+        rect(gpu, aspect, jx - 0.06, jy, 0.05, 0.006, ch.x, ch.y, ch.z, 0.8);
+        rect(gpu, aspect, jx + 0.06, jy, 0.05, 0.006, ch.x, ch.y, ch.z, 0.8);
+        rect(gpu, aspect, jx, jy - 0.06, 0.006, 0.05, ch.x, ch.y, ch.z, 0.8);
+        rect(gpu, aspect, jx, jy + 0.06, 0.006, 0.05, ch.x, ch.y, ch.z, 0.8);
+    }
+    number(gpu, aspect, -aspect + 0.1 + jx, 0.88 + jy, 0.08, g.score, 7, v3(0.35, 1.0, 0.5));
+    number(gpu, aspect, aspect - 0.22 + jx, 0.88 + jy, 0.08, g.wave, 2, v3(1.0, 0.75, 0.3));
+    for k in @as(u32, 0)..8 {
+        let x = -0.35 + 0.1 * @float_from_int(f32, k);
+        if k < g.shields {
+            rect(gpu, aspect, x, -0.9, 0.08, 0.035, 0.3, 0.8, 1.0, 0.85);
+        } else {
+            rect(gpu, aspect, x, -0.9, 0.08, 0.035, 0.3, 0.8, 1.0, 0.15);
+        }
+    }
+    // how far along the trench
+    let along = clamp(-g.pos.z / LEN, 0.0, 1.0);
+    rect(gpu, aspect, aspect - 0.06, 0.0, 0.012, 1.2, 1.0, 1.0, 1.0, 0.15);
+    rect(gpu, aspect, aspect - 0.06, -0.6 + along * 1.2, 0.04, 0.02, 0.35, 1.0, 0.5, 0.9);
+    rect(gpu, aspect, aspect - 0.06, 0.6, 0.04, 0.03, 1.0, 0.5, 0.1, 0.9);
+    if g.flash_red > 0.0 {
+        rect(gpu, aspect, 0.0, 0.0, aspect * 2.0, 2.0, 1.0, 0.1, 0.05, g.flash_red * 0.1);
+        overlay(gpu, 1.0, v3(0.9, 0.05, 0.02), @min(g.flash_red * 1.4, 1.0));
+    }
+    if g.static_t > 0.0 {
+        overlay(gpu, 2.0, v3(0.7, 0.85, 1.0), g.static_t * 1.2);
+    }
+    if g.flash_white > 0.0 {
+        rect(gpu, aspect, 0.0, 0.0, aspect * 2.0, 2.0, 1.0, 0.95, 0.85, @min(g.flash_white, 1.0));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sound
+// -----------------------------------------------------------------------------
+const RATE: u32 = 44100;
+
+fn samples(secs: f64) usize {
+    return @int_from_float(usize, secs * @float_from_int(f64, RATE));
+}
+
+// A falling zap.
+fn laser_sound() !audio.Sound {
+    let n = samples(0.22);
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    let mut ph: f64 = 0.0;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let f = 1700.0 * math.exp(-t * 15.0) + 220.0;
+        ph += 2.0 * math.PI * f / @float_from_int(f64, RATE);
+        let env = math.exp(-t * 14.0) * @min(t * 500.0, 1.0);
+        s.set_sample(i, 0.22 * env * (math.sin(ph) + 0.35 * math.sin(2.0 * ph) + 0.15 * math.sin(3.0 * ph)));
+    }
+    return s;
+}
+
+// Filtered noise and a low thump, fading over `secs`.
+fn boom_sound(secs: f64, decay: f64, low: f64, seed: u64) !audio.Sound {
+    let n = samples(secs);
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    let mut r = Rng.{ s: seed };
+    let mut y: f64 = 0.0;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let k = 0.04 + 0.4 * math.exp(-t * 6.0);
+        y += (@as(f64, rnd(&mut r)) * 2.0 - 1.0 - y) * k;
+        let env = math.exp(-t * decay) * @min(t * 300.0, 1.0);
+        let thump = math.sin(2.0 * math.PI * low * t * (1.0 - 0.3 * t / secs)) * math.exp(-t * decay * 0.7);
+        s.set_sample(i, env * (0.9 * y + 0.35 * thump));
+    }
+    return s;
+}
+
+// The ship's hull ringing when something hits it.
+fn hit_sound() !audio.Sound {
+    let n = samples(0.5);
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    let mut r = Rng.{ s: 77 };
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let f = 140.0 * math.exp(-t * 2.0);
+        let env = math.exp(-t * 7.0);
+        let ring = math.sin(2.0 * math.PI * f * t) + 0.5 * math.sin(2.0 * math.PI * 2.7 * f * t);
+        s.set_sample(i, 0.45 * env * (ring + 0.6 * (@as(f64, rnd(&mut r)) * 2.0 - 1.0) * math.exp(-t * 20.0)));
+    }
+    return s;
+}
+
+// The engines: a low hum over rumbling noise, two seconds to loop.
+fn engine_sound() !audio.Sound {
+    let n = samples(2.0);
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    let mut r = Rng.{ s: 5 };
+    let mut y: f64 = 0.0;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        y += (@as(f64, rnd(&mut r)) * 2.0 - 1.0 - y) * 0.02;
+        let hum = math.sin(2.0 * math.PI * 55.0 * t) + 0.4 * math.sin(2.0 * math.PI * 110.0 * t) + 0.2 *
+                  math.sin(2.0 * math.PI * 165.5 * t);
+        s.set_sample(i, 0.12 * hum + 1.4 * y);
+    }
+    return s;
+}
+
+struct Sound {
+    engine: xaudio2.Engine,
+    on: bool,
+    laser: audio.Sound,
+    boom: audio.Sound,
+    big: audio.Sound,
+    hit: audio.Sound,
+    hum: audio.Sound,
+    lasers: [4]xaudio2.Voice,
+    booms: [4]xaudio2.Voice,
+    big_v: xaudio2.Voice,
+    hit_v: xaudio2.Voice,
+    hum_v: xaudio2.Voice,
+    next_laser: usize,
+    next_boom: usize,
+}
+
+fn sound(enabled: bool) !Sound {
+    let none = xaudio2.Voice.{ v: 0, block: 0 };
+    let mut s = Sound.{ engine: xaudio2.Engine.{ x: 0, master: 0 }, on: false, laser: laser_sound()!,
+                        boom: boom_sound(0.9, 4.5, 60.0, 11)!, big: boom_sound(3.0, 1.3, 38.0, 23)!, hit: hit_sound()!,
+                        hum: engine_sound()!, lasers: [none; 4], booms: [none; 4], big_v: none, hit_v: none,
+                        hum_v: none, next_laser: 0, next_boom: 0 };
+    if not enabled {
+        return s;
+    }
+    s.engine = xaudio2.Engine.init() catch {
+        return s;  // no audio device: silence
+    };
+    for i in @as(usize, 0)..4 {
+        s.lasers[i] = s.engine.voice(&s.laser)!;
+        s.lasers[i].set_volume(0.5);
+        s.booms[i] = s.engine.voice(&s.boom)!;
+    }
+    s.big_v = s.engine.voice(&s.big)!;
+    s.hit_v = s.engine.voice(&s.hit)!;
+    s.hum_v = s.engine.voice(&s.hum)!;
+    s.hum_v.set_volume(0.35);
+    s.hum_v.play(&s.hum, true)!;
+    s.on = true;
+    return s;
+}
+
+fn play_laser(s: *mut Sound, pitch: f32) void {
+    if not s.on {
+        return;
+    }
+    let mut v = &mut s.lasers[s.next_laser];
+    s.next_laser = (s.next_laser + 1) % 4;
+    v.stop();
+    v.set_pitch(pitch);
+    v.play(&s.laser, false) catch {};
+}
+
+fn play_boom(s: *mut Sound, pitch: f32, volume: f32) void {
+    if not s.on {
+        return;
+    }
+    let mut v = &mut s.booms[s.next_boom];
+    s.next_boom = (s.next_boom + 1) % 4;
+    v.stop();
+    v.set_pitch(pitch);
+    v.set_volume(volume);
+    v.play(&s.boom, false) catch {};
+}
+
+fn play_big(s: *mut Sound) void {
+    if s.on {
+        s.big_v.stop();
+        s.big_v.play(&s.big, false) catch {};
+    }
+}
+
+fn play_hit(s: *mut Sound) void {
+    if s.on {
+        s.hit_v.stop();
+        s.hit_v.play(&s.hit, false) catch {};
+    }
+}
+
+fn sound_deinit(s: *mut Sound) void {
+    if s.on {
+        s.hum_v.destroy();
+        s.hit_v.destroy();
+        s.big_v.destroy();
+        for i in @as(usize, 0)..4 {
+            s.lasers[i].destroy();
+            s.booms[i].destroy();
+        }
+        s.engine.deinit();
+    }
+    s.laser.deinit();
+    s.boom.deinit();
+    s.big.deinit();
+    s.hit.deinit();
+    s.hum.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Playing
+// -----------------------------------------------------------------------------
+struct Input {
+    x: f32,  // -1..1, right
+    y: f32,  // -1..1, up
+    fire: bool,
+}
+
+struct Keys {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    fire: bool,
+}
+
+fn key(k: *mut Keys, code: u32, down: bool) void {
+    if (code == win32.KEY_LEFT) or (code == 'A') {
+        k.left = down;
+    } else if (code == win32.KEY_RIGHT) or (code == 'D') {
+        k.right = down;
+    } else if (code == win32.KEY_UP) or (code == 'W') {
+        k.up = down;
+    } else if (code == win32.KEY_DOWN) or (code == 'S') {
+        k.down = down;
+    } else if (code == win32.KEY_SPACE) or (code == win32.KEY_CONTROL) {
+        k.fire = down;
+    }
+}
+
+fn axis(neg: bool, pos: bool) f32 {
+    if neg == pos {
+        return 0.0;
+    }
+    if pos {
+        return 1.0;
+    }
+    return -1.0;
+}
+
+// Flies around the next obstacle, lines up on the port at the end, and
+// fires all the time.
+fn autopilot(g: *Game) Input {
+    let mut tx: f32 = 0.0;
+    let mut ty: f32 = PORT_Y;
+    let mut nearest: f32 = 1.0e9;
+    let mut which: usize = MAX_OBST;
+    for i in 0..g.nobst {
+        let b = g.obst[i];
+        let ahead = g.pos.z - b.z1;
+        if (ahead > -1.5) and (ahead < 90.0) and (ahead < nearest) {
+            nearest = ahead;
+            which = i;
+        }
+    }
+    if which < MAX_OBST {
+        let b = g.obst[which];
+        let mut best: f32 = 1.0e9;
+        for xi in @as(usize, 0)..5 {
+            for yi in @as(usize, 0)..5 {
+                let p = v3(-4.6 + 2.3 * @float_from_int(f32, xi), 2.0 + 2.1 * @float_from_int(f32, yi), b.z0);
+                if inside(b, p, 1.7) {
+                    continue;
+                }
+                let dx = p.x - g.pos.x;
+                let dy = p.y - g.pos.y;
+                let d = dx * dx + dy * dy;
+                if d < best {
+                    best = d;
+                    tx = p.x;
+                    ty = p.y;
+                }
+            }
+        }
+    }
+    return Input.{ x: clamp((tx - g.pos.x) * 0.5, -1.0, 1.0), y: clamp((ty - g.pos.y) * 0.5, -1.0, 1.0), fire: true };
+}
+
+fn sparks(g: *mut Game, p: V3, n: usize, speed: f32, size: f32, c: V3, life: f32) void {
+    for spark in @as(usize, 0)..n {
+        let d = vnorm(v3(rnd(&mut g.rng) - 0.5, rnd(&mut g.rng) - 0.5, rnd(&mut g.rng) - 0.5));
+        let l = life * rrange(&mut g.rng, 0.5, 1.0);
+        let k = rrange(&mut g.rng, 0.3, 1.0);
+        spawn(
+            g.sparks[..], Body.{
+                p: p, v: vmul(d, speed * k), c: c, life: l, max: l, size: size * rrange(&mut g.rng, 0.6, 1.4), ang: 0.0,
+                alive: true });
+    }
+}
+
+// A light that flares and fades (an explosion's, a hit's).
+fn flash(g: *mut Game, p: V3, reach: f32, c: V3, life: f32) void {
+    spawn(g.flashes[..], Body.{ p: p, v: v3(0.0, 0.0, 0.0), c: c, life: life, max: life, size: reach, ang: 0.0,
+                                alive: true });
+}
+
+fn explode(g: *mut Game, p: V3, big: f32) void {
+    flash(g, p, 26.0 * big, v3(1.0, 0.5, 0.15), 0.7);
+    sparks(g, p, @int_from_float(usize, 28.0 * big), 14.0 * big, 1.4 * big, v3(1.0, 0.45, 0.1), 0.9);
+    sparks(g, p, @int_from_float(usize, 12.0 * big), 8.0 * big, 2.2 * big, v3(1.0, 0.85, 0.5), 0.5);
+    for piece in @as(usize, 0)..@int_from_float(usize, 5.0 * big) {
+        let d = v3(rnd(&mut g.rng) - 0.5, rnd(&mut g.rng) * 0.8, rnd(&mut g.rng) - 0.5);
+        spawn(g.debris[..], Body.{ p: p, v: vmul(d, 22.0), c: grey(&mut g.rng, 0.25, 0.4), life: 2.5, max: 2.5,
+                                   size: rrange(&mut g.rng, 0.3, 0.9), ang: rnd(&mut g.rng) * 6.0, alive: true });
+    }
+}
+
+fn hurt(g: *mut Game, s: *mut Sound) void {
+    if (g.invuln > 0.0) or (g.phase != PLAY) {
+        return;
+    }
+    g.shields -= 1;
+    g.invuln = 1.0;
+    g.flash_red = 0.8;
+    g.shake = 1.0;
+    g.kick = if_else(rnd(&mut g.rng) < 0.5, -1.0, 1.0) * rrange(&mut g.rng, 0.18, 0.35);
+    g.static_t = 0.45;
+    g.rumble = 0.45;
+    _ = xinput.vibrate(0, 1.0, 1.0);
+    play_hit(s);
+    play_boom(s, 0.6, 1.0);
+    let ahead = vadd(g.pos, vmul(camera(g).fwd, 2.5));
+    flash(g, ahead, 22.0, v3(1.0, 0.4, 0.12), 0.45);
+    sparks(g, vadd(g.pos, vmul(camera(g).fwd, 6.0)), 24, 14.0, 0.3, v3(1.0, 0.6, 0.3), 0.5);
+    if g.shields == 0 {
+        g.phase = OVER;
+        g.phase_t = 0.0;
+        g.flash_red = 1.0;
+        play_big(s);
+        explode(g, vadd(g.pos, vmul(camera(g).fwd, 4.0)), 2.0);
+    }
+}
+
+fn update(g: *mut Game, inp: Input, s: *mut Sound, dt: f32) void {
+    g.time += dt;
+    g.phase_t += dt;
+    g.invuln = @max(g.invuln - dt, 0.0);
+    g.flash_red = @max(g.flash_red - dt * 1.2, 0.0);
+    g.flash_white = @max(g.flash_white - dt * 0.8, 0.0);
+    g.shake = @max(g.shake - dt * 1.2, 0.0);
+    g.static_t = @max(g.static_t - dt, 0.0);
+    if g.rumble > 0.0 {
+        g.rumble -= dt;
+        if g.rumble <= 0.0 {
+            _ = xinput.vibrate(0, 0.0, 0.0);
+        }
+    }
+
+    // the ship
+    let mut ix = clamp(inp.x, -1.0, 1.0);
+    let mut iy = clamp(inp.y, -1.0, 1.0);
+    if g.phase != PLAY {
+        ix = 0.0;
+        iy = 0.0;
+    }
+    let ease = @min(dt * 6.0, 1.0);
+    g.vx += (ix * 15.0 - g.vx) * ease;
+    g.vy += (iy * 12.0 - g.vy) * ease;
+    g.yaw += (-ix * 0.12 - g.yaw) * ease;
+    if g.phase == DIVE {
+        let k = clamp(g.phase_t / 1.8, 0.0, 1.0);
+        let e = 1.0 - (1.0 - k) * (1.0 - k);
+        g.pos.y = 26.0 + (PORT_Y - 26.0) * e;
+        g.pitch = -0.4 * (1.0 - k);
+        if k >= 1.0 {
+            g.phase = PLAY;
+            g.phase_t = 0.0;
+        }
+    } else if g.phase == PULLUP {
+        g.pos.y += (6.0 + g.phase_t * 18.0) * dt;
+        g.pitch += (0.45 - g.pitch) * ease;
+        if g.phase_t > 2.6 {
+            if g.won {
+                g.wave += 1;
+                g.shields = @min(g.shields + 1, 8);
+            }
+            start_run(g);
+        }
+    } else if g.phase == OVER {
+        g.speed = @max(g.speed - dt * 25.0, 0.0);
+        if g.phase_t > 4.0 {
+            g.wave = 1;
+            g.score = 0;
+            g.shields = 6;
+            start_run(g);
+        }
+    } else {
+        g.pitch += (iy * 0.1 - g.pitch) * ease;
+        g.pos.x = clamp(g.pos.x + g.vx * dt, -X_MAX, X_MAX);
+        g.pos.y = clamp(g.pos.y + g.vy * dt, Y_MIN, Y_MAX);
+        // too close to the end wall: pull up, the port hit or not
+        if g.pos.z < -LEN + 45.0 {
+            g.phase = PULLUP;
+            g.phase_t = 0.0;
+        }
+    }
+    g.pos.z -= g.speed * dt;
+    let cam = camera(g);
+
+    // firing: from under each wing to a point ahead
+    g.fire_cool -= dt;
+    if inp.fire and (g.phase == PLAY) and (g.fire_cool <= 0.0) {
+        g.fire_cool = 0.13;
+        g.gun = -g.gun;
+        let from = vadd(vadd(cam.eye, vmul(cam.right, 1.1 * g.gun)), vadd(vmul(cam.up, -0.7), vmul(cam.fwd, 1.0)));
+        let at = vadd(cam.eye, vmul(cam.fwd, 70.0));
+        let v = vadd(vmul(vnorm(vsub(at, from)), 240.0), v3(0.0, 0.0, -g.speed));
+        spawn(g.lasers[..], Body.{ p: from, v: v, c: v3(0.25, 1.0, 0.8), life: 1.1, max: 1.1, size: 0.5, ang: 0.0,
+                                   alive: true });
+        play_laser(s, 0.95 + 0.1 * rnd(&mut g.rng));
+    }
+
+    // turrets fire at where the ship will be
+    let fb_speed = 32.0 + 3.0 * @float_from_int(f32, g.wave);
+    for i in 0..g.nturrets {
+        let dz = g.turrets[i].p.z - g.pos.z;
+        if (not g.turrets[i].alive) or (dz > -22.0) or (dz < -180.0) or (g.phase != PLAY) {
+            continue;
+        }
+        g.turrets[i].cool -= dt;
+        if g.turrets[i].cool > 0.0 {
+            continue;
+        }
+        let tu = g.turrets[i];
+        let mut muzzle = vadd(tu.p, v3(-tu.side * 1.9, 0.0, 0.0));
+        if tu.rim {
+            muzzle = vadd(tu.p, v3(-tu.side * 2.2, 1.3, 0.4));
+        }
+        let tt = vlen(vsub(g.pos, muzzle)) / (fb_speed + g.speed);
+        let aim = vadd(g.pos, v3(g.vx * tt * 0.5, g.vy * tt * 0.5, -g.speed * tt));
+        spawn(g.fire[..], Body.{ p: muzzle, v: vmul(vnorm(vsub(aim, muzzle)), fb_speed), c: v3(1.0, 0.4, 0.1),
+                                 life: 7.0, max: 7.0, size: 1.2, ang: rnd(&mut g.rng) * 6.0, alive: true });
+        let k = @max(1.0 - 0.07 * @float_from_int(f32, g.wave - 1), 0.45);
+        g.turrets[i].cool = rrange(&mut g.rng, 1.3, 2.8) * k;
+    }
+
+    // lasers, in small steps: they are fast
+    let port_open = (g.pos.z + LEN < PORT_RANGE) and not g.won;
+    for li in @as(usize, 0)..MAX_LASERS {
+        if not g.lasers[li].alive {
+            continue;
+        }
+        g.lasers[li].life -= dt;
+        if g.lasers[li].life <= 0.0 {
+            g.lasers[li].alive = false;
+            continue;
+        }
+        for step in @as(usize, 0)..4 {
+            let p = vadd(g.lasers[li].p, vmul(g.lasers[li].v, dt * 0.25));
+            g.lasers[li].p = p;
+            let mut hit = false;
+            for i in 0..g.nturrets {
+                if g.turrets[i].alive and (vlen(vsub(p, g.turrets[i].p)) < 1.8) {
+                    g.turrets[i].alive = false;
+                    explode(g, g.turrets[i].p, 1.0);
+                    play_boom(s, 1.0, 0.9);
+                    g.score += 75;
+                    if g.turrets[i].rim {
+                        g.score -= 25;
+                    }
+                    hit = true;
+                }
+            }
+            for fi in @as(usize, 0)..MAX_FIRE {
+                if g.fire[fi].alive and (vlen(vsub(p, g.fire[fi].p)) < 2.4) {
+                    g.fire[fi].alive = false;
+                    sparks(g, p, 18, 10.0, 1.3, v3(1.0, 0.5, 0.1), 0.6);
+                    flash(g, p, 14.0, v3(1.0, 0.45, 0.1), 0.35);
+                    play_boom(s, 1.6, 0.5);
+                    g.score += 25;
+                    hit = true;
+                }
+            }
+            for i in 0..g.nobst {
+                if inside(g.obst[i], p, 0.0) {
+                    hit = true;
+                }
+            }
+            if p.z < -LEN + 0.7 {
+                if port_open and (@abs(p.x) < PORT_R) and (@abs(p.y - PORT_Y) < PORT_R) {
+                    // the port: the station's end
+                    g.won = true;
+                    g.flash_white = 1.6;
+                    g.shake = 1.2;
+                    g.rumble = 1.0;
+                    _ = xinput.vibrate(0, 1.0, 1.0);
+                    play_big(s);
+                    for k in @as(usize, 0)..6 {
+                        explode(g, v3(rrange(&mut g.rng, -5.0, 5.0), rrange(&mut g.rng, 2.0, 11.0), -LEN + 2.0), 2.0);
+                    }
+                    g.score += 5000 + 1000 * g.shields;
+                }
+                hit = true;
+            }
+            if (@abs(p.x) > W - 0.2) and (p.y < H) {
+                hit = true;
+            }
+            if p.y < 0.1 {
+                hit = true;
+            }
+            if hit {
+                sparks(g, p, 6, 6.0, 0.5, v3(0.4, 1.0, 0.85), 0.25);
+                flash(g, p, 6.0, v3(0.3, 1.0, 0.75), 0.15);
+                g.lasers[li].alive = false;
+                break;
+            }
+        }
+    }
+
+    // fireballs
+    for i in @as(usize, 0)..MAX_FIRE {
+        if not g.fire[i].alive {
+            continue;
+        }
+        g.fire[i].life -= dt;
+        g.fire[i].p = vadd(g.fire[i].p, vmul(g.fire[i].v, dt));
+        if (g.fire[i].life <= 0.0) or (g.fire[i].p.z > g.pos.z + 15.0) {
+            g.fire[i].alive = false;
+            continue;
+        }
+        if vlen(vsub(g.fire[i].p, g.pos)) < 1.9 {
+            g.fire[i].alive = false;
+            hurt(g, s);
+        }
+    }
+
+    // flying into things
+    if g.phase == PLAY {
+        for i in 0..g.nobst {
+            if inside(g.obst[i], g.pos, 0.45) {
+                hurt(g, s);
+            }
+        }
+    }
+
+    for i in @as(usize, 0)..MAX_SPARKS {
+        if g.sparks[i].alive {
+            g.sparks[i].life -= dt;
+            g.sparks[i].p = vadd(g.sparks[i].p, vmul(g.sparks[i].v, dt));
+            g.sparks[i].v = vmul(g.sparks[i].v, 1.0 - @min(dt * 2.0, 1.0));
+            if g.sparks[i].life <= 0.0 {
+                g.sparks[i].alive = false;
+            }
+        }
+    }
+    for i in @as(usize, 0)..MAX_FLASHES {
+        if g.flashes[i].alive {
+            g.flashes[i].life -= dt;
+            if g.flashes[i].life <= 0.0 {
+                g.flashes[i].alive = false;
+            }
+        }
+    }
+    for i in @as(usize, 0)..MAX_DEBRIS {
+        if g.debris[i].alive {
+            g.debris[i].life -= dt;
+            g.debris[i].v.y -= 9.0 * dt;
+            g.debris[i].p = vadd(g.debris[i].p, vmul(g.debris[i].v, dt));
+            g.debris[i].ang += dt * 5.0;
+            if (g.debris[i].life <= 0.0) or (g.debris[i].p.y < -2.0) {
+                g.debris[i].alive = false;
+            }
+        }
+    }
+}
+
+fn status(g: *Game, buf: []mut u8) ![]u8 {
+    if g.phase == OVER {
+        return fmt.bufprint(buf, "Trench run - game over - score {}", [fmt.int(g.score)]);
+    }
+    return fmt.bufprint(
+        buf, "Trench run - wave {} - score {} - shields {}", [fmt.int(g.wave), fmt.int(g.score), fmt.int(g.shields)]);
+}
+
+fn windowed(frames: i64, auto: bool) !i32 {
+    let mut w = win32.Window.open("Trench run", 1280, 720)!;
+    defer w.deinit();
+    let sz = w.size();
+    let mut gpu = d3d.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut zbuf = gpu.depth_buffer(sz[0], sz[1])!;
+    defer zbuf.release();
+    let mut gfx = graphics(&mut gpu)!;
+    defer release(&mut gfx);
+    let mut snd = sound(true)!;
+    defer sound_deinit(&mut snd);
+    let mut g = new_game(@bit_cast(u64, time.Instant.now().ns));
+    upload_world(&mut gpu, &mut gfx, &mut g)!;
+    let mut keys = Keys.{ left: false, right: false, up: false, down: false, fire: false };
+    let mut pads = xinput.Tracker.init();
+    let mut title: [96]u8 = [0; 96];
+    let mut shown: [96]u8 = [0; 96];
+    let mut shown_len: usize = 0;
+    let mut last = time.Instant.now();
+    let mut n: i64 = 0;
+    loop {
+        let e = w.next_event();
+        if (e.kind == win32.EventKind.CLOSE) or ((e.kind == win32.EventKind.KEY_DOWN) and (e.key == win32.KEY_ESCAPE)) {
+            break;
+        }
+        if e.kind == win32.EventKind.KEY_DOWN {
+            key(&mut keys, e.key, true);
+            continue;
+        }
+        if e.kind == win32.EventKind.KEY_UP {
+            key(&mut keys, e.key, false);
+            continue;
+        }
+        if e.kind == win32.EventKind.RESIZE {
+            gpu.resize(e.width, e.height)!;
+            gpu.resize_depth(&mut zbuf, e.width, e.height)!;
+            continue;
+        }
+        if e.kind != win32.EventKind.NONE {
+            continue;
+        }
+        let p = pads.update();
+        if pads.pressed(0, xinput.BACK) {
+            break;
+        }
+        let dt = @float_cast(f32, @min(@float_from_int(f64, last.elapsed().ns) / 1e9, 0.05));
+        last = time.Instant.now();
+        let pad = p[0];
+        let mut inp = Input.{
+            x: axis(keys.left, keys.right) + pad.left_x + axis(pad.down(xinput.DPAD_LEFT), pad.down(xinput.DPAD_RIGHT)),
+            y: axis(keys.down, keys.up) + pad.left_y + axis(pad.down(xinput.DPAD_DOWN), pad.down(xinput.DPAD_UP)),
+            fire: keys.fire or pad.down(xinput.A) or (pad.right_trigger > 0.3) };
+        if auto {
+            inp = autopilot(&g);
+        }
+        update(&mut g, inp, &mut snd, dt);
+        if g.rebuild {
+            upload_world(&mut gpu, &mut gfx, &mut g)!;
+        }
+        if snd.on {
+            snd.hum_v.set_pitch(0.8 + g.speed / 200.0);
+        }
+        let st = status(&g, title[..])!;
+        if not strs.eq(st, shown[0..shown_len]) {
+            @mem_copy(shown[0..st.len], st);
+            shown_len = st.len;
+            w.set_title(st);
+        }
+        let t = gpu.screen();
+        if (t.width != zbuf.width) or (t.height != zbuf.height) {
+            gpu.resize_depth(&mut zbuf, t.width, t.height)!;
+        }
+        draw(&mut gpu, &mut gfx, t, &mut zbuf, &g)!;
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    _ = xinput.vibrate(0, 0.0, 0.0);
+    fmt.print("{} frames, wave {}, score {}\n", [fmt.int(n), fmt.int(g.wave), fmt.int(g.score)])!;
+    return 0;
+}
+
+// Plays `frames` frames by itself (at 60 a second) offscreen, then saves
+// the last as a PNG.
+fn offscreen(out: []u8, frames: i64) !i32 {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    let mut gfx = graphics(&mut gpu)!;
+    defer release(&mut gfx);
+    let mut snd = sound(false)!;
+    defer sound_deinit(&mut snd);
+    let mut g = new_game(12345);
+    let mut n: i64 = 0;
+    while n < frames {
+        if g.rebuild {
+            upload_world(&mut gpu, &mut gfx, &mut g)!;
+        }
+        update(&mut g, autopilot(&g), &mut snd, 1.0 / 60.0);
+        n += 1;
+    }
+    if g.rebuild {
+        upload_world(&mut gpu, &mut gfx, &mut g)!;
+    }
+    let mut t = gpu.target(960, 540)!;
+    defer t.release();
+    let mut zbuf = gpu.depth_buffer(960, 540)!;
+    defer zbuf.release();
+    draw(&mut gpu, &mut gfx, &mut t, &mut zbuf, &g)!;
+    gpu.finish()!;
+    let mut img = gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    let mut buf: [96]u8 = [0; 96];
+    io.stdout().println(status(&g, buf[..])!)!;
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("trench", "A trench run in 3D: Direct3D 12, XInput and XAudio2 (Windows).");
+    defer p.deinit();
+    p.option("png", 'o', "FILE", "play by itself offscreen, then save the last frame as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames (with --png: how many to play first)")!;
+    p.flag("autopilot", 'a', "play by itself")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("trench: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not os.is_windows() {
+        io.stderr().println("trench: this needs Windows (--target=x86_64-windows)")!;
+        return 1;
+    }
+    if m.has("png") {
+        return offscreen(m.get("png", ""), m.int("frames", 300)!);
+    }
+    return windowed(m.int("frames", 0)!, m.has("autopilot"));
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}
