@@ -1,0 +1,177 @@
+// =============================================================================
+// std/os/xinput.ax - game controllers on Windows (XInput: Xbox controllers
+// and those that act like them): up to four pads' buttons, triggers and
+// sticks, rumble, battery.
+//
+//     let p = xinput.state(0);                 // pad 0
+//     if p.connected and p.down(xinput.A) { jump(); }
+//     move(p.left_x, p.left_y);                // -1..1, the dead zone removed
+//     _ = xinput.vibrate(0, 0.5, 0.0);
+//
+// Windows only (--target=x86_64-windows; xinput1_4.dll is part of Windows 10).
+// =============================================================================
+
+extern "C" "xinput1_4" {
+    fn XInputGetState(index: u32, state: *mut u8) u32;
+    fn XInputSetState(index: u32, vibration: *u8) u32;
+    fn XInputGetBatteryInformation(index: u32, kind: u8, info: *mut u8) u32;
+}
+
+pub const MAX_PADS: u32 = 4;
+
+// Buttons (bits of Pad.buttons)
+pub const DPAD_UP: u16 = 0x0001;
+pub const DPAD_DOWN: u16 = 0x0002;
+pub const DPAD_LEFT: u16 = 0x0004;
+pub const DPAD_RIGHT: u16 = 0x0008;
+pub const START: u16 = 0x0010;
+pub const BACK: u16 = 0x0020;
+pub const LEFT_THUMB: u16 = 0x0040;
+pub const RIGHT_THUMB: u16 = 0x0080;
+pub const LEFT_SHOULDER: u16 = 0x0100;
+pub const RIGHT_SHOULDER: u16 = 0x0200;
+pub const A: u16 = 0x1000;
+pub const B: u16 = 0x2000;
+pub const X: u16 = 0x4000;
+pub const Y: u16 = 0x8000;
+
+// XInput's recommended dead zones
+const LEFT_DEADZONE: f32 = 7849.0;
+const RIGHT_DEADZONE: f32 = 8689.0;
+const TRIGGER_THRESHOLD: f32 = 30.0;
+
+pub struct Pad {
+    connected: bool,
+    packet: u32,  // changes whenever the state does
+    buttons: u16,
+    left_trigger: f32,  // 0..1
+    right_trigger: f32,
+    left_x: f32,  // -1..1 (right, up positive)
+    left_y: f32,
+    right_x: f32,
+    right_y: f32,
+
+    /// Is a button (or all of several) held?
+    pub fn down(self: Pad, b: u16) bool {
+        return (self.buttons & b) == b;
+    }
+}
+
+fn stick(x: i16, y: i16, dead: f32, ox: *mut f32, oy: *mut f32) void {
+    let fx = @float_from_int(f32, x);
+    let fy = @float_from_int(f32, y);
+    let mag = @sqrt((fx * fx) + (fy * fy));
+    if mag <= dead {
+        ox.* = 0.0;
+        oy.* = 0.0;
+        return;
+    }
+    // scale what is outside the dead zone to 0..1, keeping the direction
+    let m = @min(mag, 32767.0);
+    let k = ((m - dead) / (32767.0 - dead)) / mag;
+    ox.* = fx * k;
+    oy.* = fy * k;
+}
+
+fn trigger(v: u8) f32 {
+    let f = @float_from_int(f32, v);
+    if f <= TRIGGER_THRESHOLD {
+        return 0.0;
+    }
+    return (f - TRIGGER_THRESHOLD) / (255.0 - TRIGGER_THRESHOLD);
+}
+
+fn le16(b: []u8, at: usize) i16 {
+    return @bit_cast(i16, @as(u16, b[at]) | (@as(u16, b[at + 1]) << 8));
+}
+
+/// Pad `index` (0..3) now.
+pub fn state(index: u32) Pad {
+    let mut p = Pad.{ connected: false, packet: 0, buttons: 0, left_trigger: 0.0, right_trigger: 0.0, left_x: 0.0,
+                      left_y: 0.0, right_x: 0.0, right_y: 0.0 };
+    // XINPUT_STATE: packet number, then XINPUT_GAMEPAD: buttons, two
+    // triggers, four stick axes
+    let mut s: [16]u8 = [0; 16];
+    if (index >= MAX_PADS) or (XInputGetState(index, &mut s[0]) != 0) {
+        return p;  // (ERROR_DEVICE_NOT_CONNECTED)
+    }
+    p.connected = true;
+    p.packet = ((@as(u32, s[0]) | (@as(u32, s[1]) << 8)) | (@as(u32, s[2]) << 16)) | (@as(u32, s[3]) << 24);
+    p.buttons = @bit_cast(u16, le16(s[..], 4));
+    p.left_trigger = trigger(s[6]);
+    p.right_trigger = trigger(s[7]);
+    stick(le16(s[..], 8), le16(s[..], 10), LEFT_DEADZONE, &mut p.left_x, &mut p.left_y);
+    stick(le16(s[..], 12), le16(s[..], 14), RIGHT_DEADZONE, &mut p.right_x, &mut p.right_y);
+    return p;
+}
+
+/// Sets pad `index`'s rumble: the left (low-frequency) and right
+/// (high-frequency) motors, 0..1; false if the pad is not there.
+pub fn vibrate(index: u32, left: f32, right: f32) bool {
+    let l = @int_from_float(u16, @max(@min(left, 1.0), 0.0) * 65535.0);
+    let r = @int_from_float(u16, @max(@min(right, 1.0), 0.0) * 65535.0);
+    let v: [4]u8 = [@truncate(u8, l), @truncate(u8, l >> 8), @truncate(u8, r), @truncate(u8, r >> 8)];
+    return (index < MAX_PADS) and (XInputSetState(index, &v[0]) == 0);
+}
+
+pub enum BatteryKind: u8 {
+    DISCONNECTED,
+    WIRED,
+    ALKALINE,
+    NIMH,
+    UNKNOWN,
+}
+
+pub struct Battery {
+    kind: BatteryKind,
+    level: u8,  // 0 empty, 1 low, 2 medium, 3 full
+}
+
+pub fn battery(index: u32) Battery {
+    let mut info: [2]u8 = [0, 0];
+    if (index >= MAX_PADS) or (XInputGetBatteryInformation(index, 0, &mut info[0]) != 0) {
+        return Battery.{ kind: BatteryKind.DISCONNECTED, level: 0 };
+    }
+    let mut k = BatteryKind.UNKNOWN;
+    if info[0] == 0 {
+        k = BatteryKind.DISCONNECTED;
+    } else if info[0] == 1 {
+        k = BatteryKind.WIRED;
+    } else if info[0] == 2 {
+        k = BatteryKind.ALKALINE;
+    } else if info[0] == 3 {
+        k = BatteryKind.NIMH;
+    }
+    return Battery.{ kind: k, level: info[1] };
+}
+
+/// Buttons pressed and released between updates, for all pads.
+pub struct Tracker {
+    prev: [4]u16,
+    now: [4]u16,
+
+    pub fn init() Tracker {
+        return Tracker.{ prev: [0; 4], now: [0; 4] };
+    }
+
+    /// Reads every pad; returns them.
+    pub fn update(self: *mut Tracker) [4]Pad {
+        let mut pads: [4]Pad = [state(0), state(1), state(2), state(3)];
+        for i in @as(usize, 0)..4 {
+            self.prev[i] = self.now[i];
+            self.now[i] = pads[i].buttons;
+        }
+        return pads;
+    }
+
+    /// Went down since the last update?
+    pub fn pressed(self: *Tracker, pad: u32, b: u16) bool {
+        let i = @as(usize, pad);
+        return ((self.now[i] & b) != 0) and ((self.prev[i] & b) == 0);
+    }
+
+    pub fn released(self: *Tracker, pad: u32, b: u16) bool {
+        let i = @as(usize, pad);
+        return ((self.now[i] & b) == 0) and ((self.prev[i] & b) != 0);
+    }
+}

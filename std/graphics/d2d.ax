@@ -1,0 +1,552 @@
+// =============================================================================
+// std/graphics/d2d.ax - 2D drawing and text on Windows with Direct2D and
+// DirectWrite: anti-aliased rectangles, rounded rectangles, ellipses, lines,
+// polygons, images and text in any installed font, into a window or onto a
+// Direct3D 11 texture (to draw a HUD over a 3D scene, or offscreen).
+//
+//     let mut c = d2d.Canvas.for_window(w.handle(), 800, 600)!;   // or for_texture
+//     defer c.deinit();
+//     let mut f = c.font("Segoe UI", 24.0, d2d.BOLD, false)!;
+//     defer f.release();
+//     c.begin();
+//     c.clear(d2d.rgb(0.1, 0.1, 0.2));
+//     c.fill_ellipse(400.0, 300.0, 100.0, 100.0, d2d.rgb(1.0, 0.5, 0.0));
+//     c.text(&f, "Hello", 10.0, 10.0, 300.0, 40.0, d2d.WHITE);
+//     c.end()!;
+//
+// Coordinates are pixels, from the top left. Windows only
+// (--target=x86_64-windows); d2d1.dll and dwrite.dll are part of Windows 7
+// and later.
+// =============================================================================
+
+import "../math.ax" as math;
+import "../mem.ax" as mem;
+import "../os/com.ax" as com;
+import "image.ax" as image;
+
+error { Unsupported, Failed, OutOfMemory }
+
+extern "C" "d2d1" {
+    fn D2D1CreateFactory(kind: u32, iid: *u8, options: *void, factory: *mut usize) i32;
+}
+
+extern "C" "dwrite" {
+    fn DWriteCreateFactory(kind: u32, iid: *u8, factory: *mut usize) i32;
+}
+
+let IID_FACTORY: [16]u8 = [0x47, 0x22, 0x15, 0x06, 0x50, 0x6f, 0x5a, 0x46, 0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60,
+                           0x07];
+let IID_DWRITE: [16]u8 = [0x5a, 0xee, 0x59, 0xb8, 0x38, 0xd8, 0x5b, 0x4b, 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb,
+                          0x48];
+let IID_SURFACE: [16]u8 = [0x6c, 0xb5, 0xfc, 0xca, 0xc3, 0x6a, 0x89, 0x48, 0xbf, 0x47, 0x9e, 0x23, 0xbb, 0xd2, 0x60,
+                           0xec];
+
+/// A colour: red, green, blue and opacity, 0..1.
+pub struct Color {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
+
+pub fn rgb(r: f32, g: f32, b: f32) Color {
+    return Color.{ r: r, g: g, b: b, a: 1.0 };
+}
+
+pub fn rgba(r: f32, g: f32, b: f32, a: f32) Color {
+    return Color.{ r: r, g: g, b: b, a: a };
+}
+
+pub let BLACK: Color = Color.{ r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+pub let WHITE: Color = Color.{ r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+
+// Font weights
+pub const LIGHT: u32 = 300;
+pub const NORMAL: u32 = 400;
+pub const BOLD: u32 = 700;
+
+/// Where text sits in its box.
+pub enum Align: u8 {
+    START,  // left (top)
+    END,    // right (bottom)
+    CENTER,
+}
+
+/// A text format: a font family, size, weight and style.
+pub struct Font {
+    f: usize,  // IDWriteTextFormat
+
+    /// Horizontal and vertical alignment in the boxes text is drawn in.
+    pub fn align(self: *mut Font, h: Align, v: Align) void {
+        _ = @bit_cast(fn(usize, u32) i32, com.method(self.f, 3))(self.f, @as(u32, @int_from_enum(h)));
+        _ = @bit_cast(fn(usize, u32) i32, com.method(self.f, 4))(self.f, @as(u32, @int_from_enum(v)));
+    }
+
+    /// Lines are not broken to fit the box.
+    pub fn no_wrap(self: *mut Font) void {
+        _ = @bit_cast(fn(usize, u32) i32, com.method(self.f, 5))(self.f, 1);
+    }
+
+    pub fn release(self: *mut Font) void {
+        com.release(self.f);
+        self.f = 0;
+    }
+}
+
+/// An image on the GPU, for Canvas.image.
+pub struct Bitmap {
+    b: usize,  // ID2D1Bitmap
+    width: u32,
+    height: u32,
+
+    pub fn release(self: *mut Bitmap) void {
+        com.release(self.b);
+        self.b = 0;
+    }
+}
+
+/// The size of laid-out text.
+pub struct Size {
+    width: f32,
+    height: f32,
+    lines: u32,
+}
+
+fn point(x: f32, y: f32) usize {
+    return @as(usize, @bit_cast(u32, x)) | (@as(usize, @bit_cast(u32, y)) << 32);
+}
+
+fn factories() !Canvas {
+    com.init();
+    let mut c = Canvas.{ factory: 0, dwrite: 0, rt: 0, brush: 0, window: false, width: 0, height: 0 };
+    if D2D1CreateFactory(0, &IID_FACTORY[0], @ptr_from_int(*void, 0), &mut c.factory) < 0 {  // single-threaded
+        return error.Unsupported;
+    }
+    if DWriteCreateFactory(0, &IID_DWRITE[0], &mut c.dwrite) < 0 {  // shared
+        com.release(c.factory);
+        return error.Unsupported;
+    }
+    return c;
+}
+
+// D2D1_RENDER_TARGET_PROPERTIES (28 bytes): type, pixel format
+// (format, alpha mode), dpi x and y (96: units are pixels), usage,
+// minimum level
+fn props(b: []mut u8, alpha: u32) void {
+    com.put32(b, 8, alpha);
+    com.putf(b, 12, 96.0);
+    com.putf(b, 16, 96.0);
+}
+
+/// A surface to draw on.
+pub struct Canvas {
+    factory: usize,  // ID2D1Factory
+    dwrite: usize,   // IDWriteFactory
+    rt: usize,       // ID2D1RenderTarget (an ID2D1HwndRenderTarget for a window)
+    brush: usize,    // ID2D1SolidColorBrush, recoloured for each shape
+    window: bool,
+    width: u32,
+    height: u32,
+
+    fn finish(self: *mut Canvas) !void {
+        let black: [4]f32 = [0.0, 0.0, 0.0, 1.0];
+        let f = @bit_cast(fn(usize, *f32, *void, *mut usize) i32, com.method(self.rt, 8));  // CreateSolidColorBrush
+        if f(self.rt, &black[0], @ptr_from_int(*void, 0), &mut self.brush) < 0 {
+            self.deinit();
+            return error.Failed;
+        }
+    }
+
+    /// Draws into a window (its HWND: win32.Window.handle()) of width ×
+    /// height pixels; end() shows what was drawn.
+    pub fn for_window(hwnd: usize, width: u32, height: u32) !Canvas {
+        let mut c = factories()!;
+        let mut p: [28]u8 = [0; 28];
+        props(p[..], 0);
+        // D2D1_HWND_RENDER_TARGET_PROPERTIES: the window, its size, options
+        let mut h: [24]u8 = [0; 24];
+        com.ptr(h[..], 0, hwnd);
+        com.put32(h[..], 8, width);
+        com.put32(h[..], 12, height);
+        let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(c.factory, 14));  // CreateHwndRenderTarget
+        if f(c.factory, &p[0], &h[0], &mut c.rt) < 0 {
+            c.deinit();
+            return error.Failed;
+        }
+        c.window = true;
+        c.width = width;
+        c.height = height;
+        c.finish()!;
+        return c;
+    }
+
+    /// Draws onto a Direct3D 11 texture (d3d11.Target.tex, or another
+    /// ID3D11Texture2D / IDXGISurface), made by a d3d11.Device: on top of
+    /// what Direct3D drew there.
+    pub fn for_texture(tex: usize, width: u32, height: u32) !Canvas {
+        let mut c = factories()!;
+        c.retarget(tex, width, height) catch |e| {
+            c.deinit();
+            return e;
+        };
+        return c;
+    }
+
+    /// Draws onto another texture from now on (for_texture); fonts and
+    /// bitmaps made by the canvas stay usable.
+    pub fn retarget(self: *mut Canvas, tex: usize, width: u32, height: u32) !void {
+        self.detach();
+        let surface = com.query(tex, &IID_SURFACE) catch {
+            return error.Unsupported;
+        };
+        defer com.release(surface);
+        let mut p: [28]u8 = [0; 28];
+        props(p[..], 1);  // D2D1_ALPHA_MODE_PREMULTIPLIED
+        let f = @bit_cast(fn(usize, usize, *u8, *mut usize) i32, com.method(self.factory, 15));  // CreateDxgiSurfaceRenderTarget
+        if f(self.factory, surface, &p[0], &mut self.rt) < 0 {
+            self.rt = 0;
+            return error.Unsupported;  // (a device without d3d11.Device's BGRA support)
+        }
+        let black: [4]f32 = [0.0, 0.0, 0.0, 1.0];
+        let cb = @bit_cast(fn(usize, *f32, *void, *mut usize) i32, com.method(self.rt, 8));  // CreateSolidColorBrush
+        if cb(self.rt, &black[0], @ptr_from_int(*void, 0), &mut self.brush) < 0 {
+            self.detach();
+            return error.Failed;
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    /// Lets the texture go (before d3d11.Device.resize, for one); then
+    /// retarget before drawing again.
+    pub fn detach(self: *mut Canvas) void {
+        com.release(self.brush);
+        com.release(self.rt);
+        self.brush = 0;
+        self.rt = 0;
+    }
+
+    pub fn deinit(self: *mut Canvas) void {
+        self.detach();
+        com.release(self.dwrite);
+        com.release(self.factory);
+        self.dwrite = 0;
+        self.factory = 0;
+    }
+
+    /// After the window's client area changed size (for_window).
+    pub fn resize(self: *mut Canvas, width: u32, height: u32) !void {
+        if not self.window {
+            return error.Unsupported;
+        }
+        let s: [2]u32 = [width, height];
+        if @bit_cast(fn(usize, *u32) i32, com.method(self.rt, 58))(self.rt, &s[0]) < 0 {
+            return error.Failed;
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    /// Starts a frame of drawing.
+    pub fn begin(self: *mut Canvas) void {
+        @bit_cast(fn(usize) void, com.method(self.rt, 48))(self.rt);
+        self.reset_transform();
+    }
+
+    /// Ends the frame: everything is drawn (and, in a window, shown).
+    pub fn end(self: *mut Canvas) !void {
+        let f = @bit_cast(fn(usize, *void, *void) i32, com.method(self.rt, 49));
+        if f(self.rt, @ptr_from_int(*void, 0), @ptr_from_int(*void, 0)) < 0 {
+            return error.Failed;  // (D2DERR_RECREATE_TARGET: the device was lost)
+        }
+    }
+
+    fn paint(self: *mut Canvas, c: Color) usize {
+        let v: [4]f32 = [c.r, c.g, c.b, c.a];
+        @bit_cast(fn(usize, *f32) void, com.method(self.brush, 8))(self.brush, &v[0]);  // SetColor
+        return self.brush;
+    }
+
+    pub fn clear(self: *mut Canvas, c: Color) void {
+        let v: [4]f32 = [c.r, c.g, c.b, c.a];
+        @bit_cast(fn(usize, *f32) void, com.method(self.rt, 47))(self.rt, &v[0]);
+    }
+
+    pub fn fill_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, c: Color) void {
+        let r: [4]f32 = [x, y, x + w, y + h];
+        let b = self.paint(c);
+        @bit_cast(fn(usize, *f32, usize) void, com.method(self.rt, 17))(self.rt, &r[0], b);
+    }
+
+    /// A rectangle's outline, `width` pixels thick.
+    pub fn draw_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, c: Color, width: f32) void {
+        let r: [4]f32 = [x, y, x + w, y + h];
+        let b = self.paint(c);
+        @bit_cast(fn(usize, *f32, usize, f32, usize) void, com.method(self.rt, 16))(self.rt, &r[0], b, width, 0);
+    }
+
+    /// A rectangle with corners rounded to `radius`.
+    pub fn fill_round_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Color) void {
+        let r: [6]f32 = [x, y, x + w, y + h, radius, radius];
+        let b = self.paint(c);
+        @bit_cast(fn(usize, *f32, usize) void, com.method(self.rt, 19))(self.rt, &r[0], b);
+    }
+
+    pub fn draw_round_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Color, width: f32) void {
+        let r: [6]f32 = [x, y, x + w, y + h, radius, radius];
+        let b = self.paint(c);
+        @bit_cast(fn(usize, *f32, usize, f32, usize) void, com.method(self.rt, 18))(self.rt, &r[0], b, width, 0);
+    }
+
+    /// An ellipse centred on (cx, cy) with radii rx and ry.
+    pub fn fill_ellipse(self: *mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, c: Color) void {
+        let e: [4]f32 = [cx, cy, rx, ry];
+        let b = self.paint(c);
+        @bit_cast(fn(usize, *f32, usize) void, com.method(self.rt, 21))(self.rt, &e[0], b);
+    }
+
+    pub fn draw_ellipse(self: *mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, c: Color, width: f32) void {
+        let e: [4]f32 = [cx, cy, rx, ry];
+        let b = self.paint(c);
+        @bit_cast(fn(usize, *f32, usize, f32, usize) void, com.method(self.rt, 20))(self.rt, &e[0], b, width, 0);
+    }
+
+    pub fn line(self: *mut Canvas, x0: f32, y0: f32, x1: f32, y1: f32, c: Color, width: f32) void {
+        let b = self.paint(c);
+        let f = @bit_cast(fn(usize, usize, usize, usize, f32, usize) void, com.method(self.rt, 15));
+        f(self.rt, point(x0, y0), point(x1, y1), b, width, 0);
+    }
+
+    // A path through points (x0, y0, x1, y1, ...): an ID2D1PathGeometry.
+    fn path(self: *mut Canvas, pts: []f32, closed: bool, filled: bool) !usize {
+        if pts.len < 4 {
+            return error.Failed;
+        }
+        let mut g: usize = 0;
+        if @bit_cast(fn(usize, *mut usize) i32, com.method(self.factory, 10))(self.factory, &mut g) < 0 {
+            return error.Failed;
+        }
+        let mut sink: usize = 0;
+        if @bit_cast(fn(usize, *mut usize) i32, com.method(g, 17))(g, &mut sink) < 0 {  // Open
+            com.release(g);
+            return error.Failed;
+        }
+        let mut begin: u32 = 1;  // D2D1_FIGURE_BEGIN_HOLLOW
+        if filled {
+            begin = 0;
+        }
+        @bit_cast(fn(usize, usize, u32) void, com.method(sink, 5))(sink, point(pts[0], pts[1]), begin);  // BeginFigure
+        let n = (pts.len / 2) - 1;
+        @bit_cast(fn(usize, *f32, u32) void, com.method(sink, 6))(sink, &pts[2], @truncate(u32, n));  // AddLines
+        let mut end: u32 = 0;  // D2D1_FIGURE_END_OPEN
+        if closed {
+            end = 1;
+        }
+        @bit_cast(fn(usize, u32) void, com.method(sink, 8))(sink, end);  // EndFigure
+        let hr = @bit_cast(fn(usize) i32, com.method(sink, 9))(sink);    // Close
+        com.release(sink);
+        if hr < 0 {
+            com.release(g);
+            return error.Failed;
+        }
+        return g;
+    }
+
+    /// A filled polygon through points (x0, y0, x1, y1, ...).
+    pub fn fill_polygon(self: *mut Canvas, pts: []f32, c: Color) !void {
+        let g = self.path(pts, true, true)!;
+        let b = self.paint(c);
+        @bit_cast(fn(usize, usize, usize, usize) void, com.method(self.rt, 23))(self.rt, g, b, 0);  // FillGeometry
+        com.release(g);
+    }
+
+    /// Lines through points (x0, y0, x1, y1, ...), back to the first when
+    /// `closed`.
+    pub fn draw_lines(self: *mut Canvas, pts: []f32, closed: bool, c: Color, width: f32) !void {
+        let g = self.path(pts, closed, false)!;
+        let b = self.paint(c);
+        @bit_cast(fn(usize, usize, usize, f32, usize) void, com.method(self.rt, 22))(self.rt, g, b, width, 0);
+        com.release(g);
+    }
+
+    /// Is a font family installed?
+    pub fn has_font(self: *mut Canvas, family: []u8) bool {
+        let mut fonts: usize = 0;
+        // GetSystemFontCollection(collection, check for updates)
+        if @bit_cast(fn(usize, *mut usize, u32) i32, com.method(self.dwrite, 3))(self.dwrite, &mut fonts, 0) < 0 {
+            return false;
+        }
+        defer com.release(fonts);
+        let mut name: [128]u16 = [0; 128];
+        _ = com.utf16(family, name[..]);
+        let mut index: u32 = 0;
+        let mut exists: u32 = 0;
+        let f = @bit_cast(fn(usize, *u16, *mut u32, *mut u32) i32, com.method(fonts, 5));  // FindFamilyName
+        return (f(fonts, &name[0], &mut index, &mut exists) >= 0) and (exists != 0);
+    }
+
+    /// A font: a family name ("Segoe UI", "Arial", "Consolas", ...; or
+    /// several separated by commas, the first installed one used), a size
+    /// in pixels, a weight (NORMAL, BOLD, 100..900) and italic or not.
+    pub fn font(self: *mut Canvas, families: []u8, size: f32, weight: u32, italic: bool) !Font {
+        // the first installed family, else the last named
+        let mut family = families;
+        let mut rest = families;
+        loop {
+            let mut i: usize = 0;
+            while (i < rest.len) and (rest[i] != ',') {
+                i += 1;
+            }
+            let mut a: usize = 0;
+            let mut b = i;
+            while (a < b) and (rest[a] == ' ') {
+                a += 1;
+            }
+            while (b > a) and (rest[b - 1] == ' ') {
+                b -= 1;
+            }
+            family = rest[a..b];
+            if (i == rest.len) or self.has_font(family) {
+                break;
+            }
+            rest = rest[i + 1..];
+        }
+        let mut name: [128]u16 = [0; 128];
+        _ = com.utf16(family, name[..]);
+        let locale: [6]u16 = [0x65, 0x6e, 0x2d, 0x75, 0x73, 0];  // "en-us"
+        let mut style: u32 = 0;
+        if italic {
+            style = 2;
+        }
+        let mut f: usize = 0;
+        // CreateTextFormat(family, collection (the system's), weight, style,
+        // stretch (normal), size, locale, format)
+        let cf = @bit_cast(
+            fn(usize, *u16, usize, u32, u32, u32, f32, *u16, *mut usize) i32, com.method(self.dwrite, 15));
+        if cf(self.dwrite, &name[0], 0, weight, style, 5, size, &locale[0], &mut f) < 0 {
+            return error.Failed;
+        }
+        return Font.{ f: f };
+    }
+
+    /// Draws text (UTF-8) in the box at (x, y) of w × h pixels, wrapping
+    /// at its width.
+    pub fn text(self: *mut Canvas, font: *Font, s: []u8, x: f32, y: f32, w: f32, h: f32, c: Color) !void {
+        let u = mem.alloc.[u16]((s.len + 2) * 2)!;
+        defer mem.free(u);
+        let n = com.utf16(s, u);
+        let r: [4]f32 = [x, y, x + w, y + h];
+        let b = self.paint(c);
+        // DrawText(text, length, format, box, brush, options (none),
+        // measuring mode (natural))
+        let f = @bit_cast(fn(usize, *u16, u32, usize, *f32, usize, u32, u32) void, com.method(self.rt, 27));
+        f(self.rt, &u[0], @truncate(u32, n), font.f, &r[0], b, 0, 0);
+    }
+
+    /// The size of text laid out in boxes `max_width` wide.
+    pub fn measure(self: *mut Canvas, font: *Font, s: []u8, max_width: f32) !Size {
+        let u = mem.alloc.[u16]((s.len + 2) * 2)!;
+        defer mem.free(u);
+        let n = com.utf16(s, u);
+        let mut layout: usize = 0;
+        let f = @bit_cast(fn(usize, *u16, u32, usize, f32, f32, *mut usize) i32, com.method(self.dwrite, 18));
+        if f(self.dwrite, &u[0], @truncate(u32, n), font.f, max_width, 1.0e6, &mut layout) < 0 {
+            return error.Failed;
+        }
+        defer com.release(layout);
+        // DWRITE_TEXT_METRICS (36 bytes): left, top, width, width with
+        // trailing spaces, height, layout width and height, bidi depth,
+        // line count
+        let mut m: [9]u32 = [0; 9];
+        if @bit_cast(fn(usize, *mut u32) i32, com.method(layout, 60))(layout, &mut m[0]) < 0 {
+            return error.Failed;
+        }
+        return Size.{ width: @bit_cast(f32, m[3]), height: @bit_cast(f32, m[4]), lines: m[8] };
+    }
+
+    /// An image (8-bit gray, gray + alpha, RGB or RGBA) as a Bitmap to draw.
+    pub fn bitmap(self: *mut Canvas, img: *image.Image) !Bitmap {
+        if img.depth != image.Depth.U8 {
+            return error.Unsupported;
+        }
+        let n = img.width * img.height;
+        let px = mem.alloc.[u8](n * 4)!;
+        defer mem.free(px);
+        // premultiplied BGRA
+        for i in 0..n {
+            let ch = img.channels;
+            let s = img.data[i * ch..(i + 1) * ch];
+            let mut r = s[0];
+            let mut g = s[0];
+            let mut b = s[0];
+            let mut a: u8 = 255;
+            if ch >= 3 {
+                g = s[1];
+                b = s[2];
+            }
+            if ch == 2 {
+                a = s[1];
+            } else if ch == 4 {
+                a = s[3];
+            }
+            let a32 = @as(u32, a);
+            px[i * 4] = @truncate(u8, ((@as(u32, b) * a32) + 127) / 255);
+            px[(i * 4) + 1] = @truncate(u8, ((@as(u32, g) * a32) + 127) / 255);
+            px[(i * 4) + 2] = @truncate(u8, ((@as(u32, r) * a32) + 127) / 255);
+            px[(i * 4) + 3] = a;
+        }
+        // D2D1_BITMAP_PROPERTIES: pixel format (B8G8R8A8_UNORM,
+        // premultiplied), dpi x and y
+        let mut p: [16]u8 = [0; 16];
+        com.put32(p[..], 0, 87);
+        com.put32(p[..], 4, 1);
+        com.putf(p[..], 8, 96.0);
+        com.putf(p[..], 12, 96.0);
+        let w = @truncate(u32, img.width);
+        let h = @truncate(u32, img.height);
+        let mut bm: usize = 0;
+        // CreateBitmap(size (by value), pixels, pitch, properties, bitmap)
+        let f = @bit_cast(fn(usize, usize, *u8, u32, *u8, *mut usize) i32, com.method(self.rt, 4));
+        if f(self.rt, @as(usize, w) | (@as(usize, h) << 32), &px[0], w * 4, &p[0], &mut bm) < 0 {
+            return error.Failed;
+        }
+        return Bitmap.{ b: bm, width: w, height: h };
+    }
+
+    /// Draws a bitmap scaled into the box at (x, y) of w × h pixels.
+    pub fn image(self: *mut Canvas, bm: *Bitmap, x: f32, y: f32, w: f32, h: f32, opacity: f32) void {
+        let r: [4]f32 = [x, y, x + w, y + h];
+        // DrawBitmap(bitmap, box, opacity, interpolation (linear), source (all))
+        let f = @bit_cast(fn(usize, usize, *f32, f32, u32, *void) void, com.method(self.rt, 26));
+        f(self.rt, bm.b, &r[0], opacity, 1, @ptr_from_int(*void, 0));
+    }
+
+    /// Transforms what is drawn next: (x, y) becomes
+    /// (a·x + c·y + e, b·x + d·y + f).
+    pub fn set_transform(self: *mut Canvas, a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) void {
+        let m: [6]f32 = [a, b, c, d, e, f];
+        @bit_cast(fn(usize, *f32) void, com.method(self.rt, 30))(self.rt, &m[0]);
+    }
+
+    pub fn reset_transform(self: *mut Canvas) void {
+        self.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    }
+
+    /// Draws next around (cx, cy), rotated by `angle` radians
+    /// (clockwise) and scaled by `scale`.
+    pub fn rotate_scale(self: *mut Canvas, cx: f32, cy: f32, angle: f32, scale: f32) void {
+        let c = math.cosf(angle) * scale;
+        let s = math.sinf(angle) * scale;
+        self.set_transform(c, s, -s, c, cx - ((c * cx) - (s * cy)), cy - ((s * cx) + (c * cy)));
+    }
+
+    /// Only draws inside the box at (x, y) of w × h pixels, until unclip.
+    pub fn clip(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32) void {
+        let r: [4]f32 = [x, y, x + w, y + h];
+        @bit_cast(fn(usize, *f32, u32) void, com.method(self.rt, 45))(self.rt, &r[0], 0);
+    }
+
+    pub fn unclip(self: *mut Canvas) void {
+        @bit_cast(fn(usize) void, com.method(self.rt, 46))(self.rt);
+    }
+}

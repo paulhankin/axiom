@@ -1,0 +1,84 @@
+// =============================================================================
+// std/graphics/hlsl.ax - compiling HLSL shaders at run time (d3dcompiler_47),
+// for std/graphics/d3d11 and std/graphics/d3d12.
+//
+//     let mut code = hlsl.compile(src, "vs", "vs_5_0")!;   // CompileError: hlsl.message()
+//     defer code.release();
+//
+// Windows only (--target=x86_64-windows). The bytecode is DXBC (shader
+// models up to 5.1), which both Direct3D 11 and 12 take.
+// =============================================================================
+
+import "../os/com.ax" as com;
+
+error { CompileError, Failed }
+
+extern "C" "d3dcompiler_47" {
+    fn D3DCompile(src: *u8, size: usize, name: *u8, defines: *void, include: *void, entry: *u8, target: *u8,
+                  flags1: u32, flags2: u32, code: *mut usize, errors: *mut usize) i32;
+}
+
+/// Compiled shader bytecode.
+pub struct Code {
+    blob: usize,  // ID3DBlob
+
+    pub fn bytes(self: *Code) []u8 {
+        let p = @bit_cast(fn(usize) usize, com.method(self.blob, 3))(self.blob);
+        let n = @bit_cast(fn(usize) usize, com.method(self.blob, 4))(self.blob);
+        return @slice_from_ptr(@ptr_from_int(*u8, p), n);
+    }
+
+    pub fn release(self: *mut Code) void {
+        com.release(self.blob);
+        self.blob = 0;
+    }
+}
+
+let mut message_buf: [4096]u8 = [0; 4096];
+let mut message_len: usize = 0;
+
+/// The compiler's messages for the last failed compile.
+pub fn message() []u8 {
+    return message_buf[0..message_len];
+}
+
+fn cz(s: []u8, out: []mut u8) bool {
+    if (s.len + 1) > out.len {
+        return false;
+    }
+    @mem_copy(out[0..s.len], s);
+    out[s.len] = 0;
+    return true;
+}
+
+/// Compiles `entry` of src for `target` (a profile: "vs_5_0", "ps_5_0",
+/// "cs_5_0", "vs_4_0", ...).
+pub fn compile(src: []u8, entry: []u8, target: []u8) !Code {
+    let mut e: [128]u8 = [0; 128];
+    let mut t: [32]u8 = [0; 32];
+    if not cz(entry, e[..]) or not cz(target, t[..]) {
+        return error.Failed;
+    }
+    let mut code: usize = 0;
+    let mut errs: usize = 0;
+    let name = "shader";
+    let hr = D3DCompile(src.ptr, src.len, name.ptr, @ptr_from_int(*void, 0), @ptr_from_int(*void, 0), &e[0], &t[0], 0,
+                        0, &mut code, &mut errs);
+    message_len = 0;
+    if errs != 0 {
+        let c = Code.{ blob: errs };
+        let m = c.bytes();
+        let mut n = @min(m.len, message_buf.len);
+        while (n > 0) and (m[n - 1] == 0) {
+            n -= 1;
+        }
+        @mem_copy(message_buf[0..n], m[0..n]);
+        message_len = n;
+        com.release(errs);
+    }
+    if (hr < 0) or (code == 0) {
+        com.release(code);
+        return error.CompileError;
+    }
+    return Code.{ blob: code };
+}

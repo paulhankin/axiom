@@ -5,7 +5,7 @@
 //
 //     let mut gpu = d3d11.Device.init_window(w.handle(), 800, 600)!;  // or Device.init() offscreen
 //     defer gpu.deinit();
-//     let vs_code = d3d11.compile(src, "vs", "vs_4_0")!;
+//     let vs_code = hlsl.compile(src, "vs", "vs_4_0")!;   // std/graphics/hlsl
 //     let vs = gpu.vertex_shader(&vs_code)!;
 //     ...
 //     gpu.clear(gpu.screen(), 0.1, 0.1, 0.2, 1.0);
@@ -14,17 +14,18 @@
 //     gpu.draw(3, 0);
 //     gpu.present(true)!;
 //
-// Windows only (--target=x86_64-windows): d3d11.dll, dxgi and
-// d3dcompiler_47.dll exist nowhere else. Objects are COM interfaces; each
+// Windows only (--target=x86_64-windows): d3d11.dll and dxgi exist nowhere
+// else. Objects are COM interfaces; each
 // wrapper's release() lets it go, and Device.deinit releases the device.
 // One device is used from one thread at a time (the immediate context).
 // Without a GPU (or under Wine without one) the device is WARP's, in
 // software.
 // =============================================================================
 
+import "hlsl.ax" as hlsl;
 import "image.ax" as image;
 
-error { Unsupported, Failed, CompileError, OutOfMemory }
+error { Unsupported, Failed, OutOfMemory }
 
 extern "C" "d3d11" {
     fn D3D11CreateDevice(adapter: usize, driver: u32, software: usize, flags: u32, levels: *u32, nlevels: u32, sdk: u32,
@@ -32,11 +33,6 @@ extern "C" "d3d11" {
     fn D3D11CreateDeviceAndSwapChain(adapter: usize, driver: u32, software: usize, flags: u32, levels: *u32,
                                      nlevels: u32, sdk: u32, desc: *u8, swap: *mut usize, dev: *mut usize,
                                      level: *mut u32, ctx: *mut usize) i32;
-}
-
-extern "C" "d3dcompiler_47" {
-    fn D3DCompile(src: *u8, size: usize, name: *u8, defines: *void, include: *void, entry: *u8, target: *u8,
-                  flags1: u32, flags2: u32, code: *mut usize, errors: *mut usize) i32;
 }
 
 // DXGI formats
@@ -64,6 +60,7 @@ pub const CONSTANT: u32 = 0x4;
 const SDK_VERSION: u32 = 7;
 const DRIVER_HARDWARE: u32 = 1;
 const DRIVER_WARP: u32 = 5;
+const BGRA_SUPPORT: u32 = 0x20;  // D3D11_CREATE_DEVICE_BGRA_SUPPORT, for Direct2D (std/graphics/d2d)
 
 // -----------------------------------------------------------------------------
 // COM: an interface pointer's first word is its table of methods
@@ -88,72 +85,6 @@ fn put(b: []mut u8, at: usize, x: u64, n: usize) void {
 
 fn get32(p: usize) u32 {
     return @ptr_from_int(*u32, p).*;
-}
-
-/// Compiled shader bytecode (from compile).
-pub struct Code {
-    blob: usize,  // ID3DBlob
-
-    pub fn bytes(self: *Code) []u8 {
-        let ptr = @bit_cast(fn(usize) usize, method(self.blob, 3))(self.blob);
-        let n = @bit_cast(fn(usize) usize, method(self.blob, 4))(self.blob);
-        return @slice_from_ptr(@ptr_from_int(*u8, ptr), n);
-    }
-
-    pub fn release(self: *mut Code) void {
-        release_com(self.blob);
-        self.blob = 0;
-    }
-}
-
-// The compiler's message for the last CompileError.
-let mut message_buf: [4096]u8 = [0; 4096];
-let mut message_len: usize = 0;
-
-/// The HLSL compiler's messages for the last failed compile.
-pub fn compile_message() []u8 {
-    return message_buf[0..message_len];
-}
-
-fn cz(s: []u8, out: []mut u8) bool {
-    if (s.len + 1) > out.len {
-        return false;
-    }
-    @mem_copy(out[0..s.len], s);
-    out[s.len] = 0;
-    return true;
-}
-
-/// Compiles HLSL: `entry` for `target` (a profile: "vs_4_0", "ps_4_0",
-/// "vs_5_0", "ps_5_0", "cs_5_0", ...). CompileError: see compile_message.
-pub fn compile(src: []u8, entry: []u8, target: []u8) !Code {
-    let mut e: [128]u8 = [0; 128];
-    let mut t: [32]u8 = [0; 32];
-    if not cz(entry, e[..]) or not cz(target, t[..]) {
-        return error.Failed;
-    }
-    let mut code: usize = 0;
-    let mut errs: usize = 0;
-    let name = "shader";
-    let hr = D3DCompile(src.ptr, src.len, name.ptr, @ptr_from_int(*void, 0), @ptr_from_int(*void, 0), &e[0], &t[0], 0,
-                        0, &mut code, &mut errs);
-    message_len = 0;
-    if errs != 0 {
-        let c = Code.{ blob: errs };
-        let m = c.bytes();
-        let mut n = @min(m.len, message_buf.len);
-        while (n > 0) and (m[n - 1] == 0) {
-            n -= 1;
-        }
-        @mem_copy(message_buf[0..n], m[0..n]);
-        message_len = n;
-        release_com(errs);
-    }
-    if (hr < 0) or (code == 0) {
-        release_com(code);
-        return error.CompileError;
-    }
-    return Code.{ blob: code };
 }
 
 // -----------------------------------------------------------------------------
@@ -236,11 +167,11 @@ pub struct Device {
     /// A device for drawing offscreen (into textures).
     pub fn init() !Device {
         let mut d = Device.{ dev: 0, ctx: 0, swap: 0, back: Target.{ tex: 0, rtv: 0, width: 0, height: 0 }, level: 0 };
-        let mut hr = D3D11CreateDevice(0, DRIVER_HARDWARE, 0, 0, &LEVELS[0], 3, SDK_VERSION, &mut d.dev, &mut d.level,
-                                       &mut d.ctx);
+        let mut hr = D3D11CreateDevice(0, DRIVER_HARDWARE, 0, BGRA_SUPPORT, &LEVELS[0], 3, SDK_VERSION, &mut d.dev,
+                                       &mut d.level, &mut d.ctx);
         if hr < 0 {
-            hr = D3D11CreateDevice(0, DRIVER_WARP, 0, 0, &LEVELS[0], 3, SDK_VERSION, &mut d.dev, &mut d.level,
-                                   &mut d.ctx);
+            hr = D3D11CreateDevice(0, DRIVER_WARP, 0, BGRA_SUPPORT, &LEVELS[0], 3, SDK_VERSION, &mut d.dev,
+                                   &mut d.level, &mut d.ctx);
         }
         if hr < 0 {
             return error.Unsupported;
@@ -271,8 +202,8 @@ pub struct Device {
             put(sd[..], 60, effect, 4);
             put(sd[..], 40, u64_pick(effect == 4, 2, 1), 4);
             for driver in [DRIVER_HARDWARE, DRIVER_WARP]{
-                hr = D3D11CreateDeviceAndSwapChain(0, driver, 0, 0, &LEVELS[0], 3, SDK_VERSION, &sd[0], &mut d.swap,
-                                                   &mut d.dev, &mut d.level, &mut d.ctx);
+                hr = D3D11CreateDeviceAndSwapChain(0, driver, 0, BGRA_SUPPORT, &LEVELS[0], 3, SDK_VERSION, &sd[0],
+                                                   &mut d.swap, &mut d.dev, &mut d.level, &mut d.ctx);
                 if hr >= 0 {
                     break;
                 }
@@ -402,7 +333,7 @@ pub struct Device {
         return img;
     }
 
-    pub fn vertex_shader(self: *mut Device, code: *Code) !VertexShader {
+    pub fn vertex_shader(self: *mut Device, code: *hlsl.Code) !VertexShader {
         let b = code.bytes();
         let mut p: usize = 0;
         let f = @bit_cast(fn(usize, *u8, usize, usize, *mut usize) i32, method(self.dev, 12));
@@ -412,7 +343,7 @@ pub struct Device {
         return VertexShader.{ p: p };
     }
 
-    pub fn pixel_shader(self: *mut Device, code: *Code) !PixelShader {
+    pub fn pixel_shader(self: *mut Device, code: *hlsl.Code) !PixelShader {
         let b = code.bytes();
         let mut p: usize = 0;
         let f = @bit_cast(fn(usize, *u8, usize, usize, *mut usize) i32, method(self.dev, 15));
@@ -423,7 +354,7 @@ pub struct Device {
     }
 
     /// The vertex layout a vertex shader (its code) reads (at most 16 attributes).
-    pub fn input_layout(self: *mut Device, attrs: []Attribute, vs_code: *Code) !InputLayout {
+    pub fn input_layout(self: *mut Device, attrs: []Attribute, vs_code: *hlsl.Code) !InputLayout {
         if attrs.len > 16 {
             return error.Failed;
         }
@@ -530,6 +461,15 @@ pub struct Device {
     pub fn draw_indexed(self: *mut Device, count: u32, first: u32, base: i32) void {
         @bit_cast(fn(usize, u32, u32, i32) void, method(self.ctx, 12))(self.ctx, count, first, base);
     }
+}
+
+fn cz(s: []u8, out: []mut u8) bool {
+    if (s.len + 1) > out.len {
+        return false;
+    }
+    @mem_copy(out[0..s.len], s);
+    out[s.len] = 0;
+    return true;
 }
 
 fn u64_pick(c: bool, a: u64, b: u64) u64 {

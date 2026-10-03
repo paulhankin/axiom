@@ -1,0 +1,511 @@
+// =============================================================================
+// File: game.ax
+// A small game on Windows with Direct3D 12, XInput and XAudio2: steer a ship
+// around a starfield and collect the glowing orbs. Each one chimes (a little
+// higher each time), makes the controller rumble, and adds to the score in
+// the title bar, over a looping bass line.
+//
+//   axiom build examples/game.ax --target=x86_64-windows -O2 -o game.exe
+//   game.exe                    (arrows or WASD, or a controller's left stick
+//                                or d-pad; Escape or Back quits)
+//   game.exe --frames 300       (quits after 300 frames)
+//   game.exe --autopilot        (it plays itself)
+//   game.exe --png game.png     (draws one frame offscreen, saves it)
+//   game.exe --check            (reports the GPU, controllers and audio)
+//
+// It uses std/os/win32 for the window and keyboard, std/graphics/d3d12 and
+// std/graphics/hlsl to draw, std/os/xinput for controllers and
+// std/audio/xaudio2 for sound (sounds made with std/audio).
+// =============================================================================
+
+import "std/audio" as audio;
+import "std/audio/xaudio2" as xaudio2;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/d3d12" as d3d;
+import "std/graphics/hlsl" as hlsl;
+import "std/graphics/image/png" as png;
+import "std/io" as io;
+import "std/math" as math;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/os/win32" as win32;
+import "std/os/xinput" as xinput;
+import "std/str" as strs;
+import "std/time" as time;
+
+// The shaders (HLSL), a line at a time. Every shape is drawn from a mesh
+// in -1..1 placed by twelve root constants: centre, size, rotation,
+// colour and kind (0 the ship, 1 a soft round glow).
+let SHADER_LINES: [33][]u8 = ["cbuffer Shape : register(b0) {", "    float2 center;", "    float radius;",
+                              "    float aspect;", "    float3 color;", "    float kind;", "    float angle;",
+                              "    float3 pad;", "};", "", "struct VOut {", "    float4 pos : SV_Position;",
+                              "    float2 uv : TEXCOORD;", "};", "", "VOut vs(float2 p : POSITION) {",
+                              "    float c = cos(angle);", "    float s = sin(angle);",
+                              "    float2 w = center + float2(p.x * c - p.y * s, p.x * s + p.y * c) * radius;",
+                              "    VOut o;", "    o.pos = float4(w.x / aspect, w.y, 0.0, 1.0);", "    o.uv = p;",
+                              "    return o;", "}", "", "float4 ps(VOut i) : SV_Target {", "    if (kind < 0.5) {",
+                              "        return float4(color * (0.75 + 0.25 * i.uv.y), 1.0);", "    }",
+                              "    float d = length(i.uv);", "    clip(1.0 - d);",
+                              "    return float4(color * (1.3 - d), saturate(1.25 - d * d * 1.25));", "}"];
+
+// A quad (two triangles) and the ship (an arrowhead pointing up), as x, y.
+let QUAD: [12]f32 = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0];
+let SHIP: [12]f32 = [0.0, 1.0, 0.7, -0.8, 0.0, -0.4, 0.0, 1.0, 0.0, -0.4, -0.7, -0.8];
+
+const ORBS: usize = 5;
+const STARS: usize = 60;
+const SHIP_SIZE: f32 = 0.1;
+const ORB_SIZE: f32 = 0.05;
+const SPEED: f32 = 1.1;  // units per second (the screen is 2 high)
+
+struct Gfx {
+    root: d3d.RootSignature,
+    solid: d3d.Pipeline,
+    quad: d3d.Buffer,
+    ship: d3d.Buffer,
+}
+
+struct Game {
+    x: f32,
+    y: f32,
+    angle: f32,
+    orbs: [5][2]f32,
+    stars: [60][3]f32,
+    score: u32,
+    seed: u64,
+    rumble: f64,  // seconds of rumble left
+}
+
+fn as_bytes(p: *f32, n: usize) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p), n * 4);
+}
+
+fn random(g: *mut Game) f32 {
+    g.seed = (g.seed *% 6364136223846793005) +% 1442695040888963407;
+    return @float_from_int(f32, g.seed >> 40) / 16777216.0;
+}
+
+fn new_game(seed: u64) Game {
+    let mut g = Game.{ x: 0.0, y: -0.3, angle: 0.0, orbs: [[0.0; 2]; 5], stars: [[0.0; 3]; 60], score: 0, seed: seed,
+                       rumble: 0.0 };
+    for i in @as(usize, 0)..STARS {
+        g.stars[i] = [(random(&mut g) * 4.0) - 2.0, (random(&mut g) * 2.0) - 1.0, random(&mut g)];
+    }
+    for i in @as(usize, 0)..ORBS {
+        place(&mut g, i);
+    }
+    return g;
+}
+
+fn place(g: *mut Game, i: usize) void {
+    g.orbs[i] = [(random(g) * 2.4) - 1.2, (random(g) * 1.7) - 0.85];
+}
+
+fn shader_source() !strs.String {
+    let mut s = strs.String.init();
+    for l in SHADER_LINES {
+        s.push_str(l)!;
+        s.push('\n')!;
+    }
+    return s;
+}
+
+fn shader(src: []u8, entry: []u8, target: []u8) !hlsl.Code {
+    return hlsl.compile(src, entry, target) catch |e| {
+        if e == error.CompileError {
+            fmt.eprint("game: {}\n", [fmt.str(hlsl.message())]) catch {};
+        }
+        return e;
+    };
+}
+
+fn graphics(gpu: *mut d3d.Device) !Gfx {
+    let mut src = shader_source()!;
+    defer src.deinit();
+    let mut vcode = shader(src.bytes(), "vs", "vs_5_0")!;
+    defer vcode.release();
+    let mut pcode = shader(src.bytes(), "ps", "ps_5_0")!;
+    defer pcode.release();
+    let mut root = gpu.root_signature(12)!;
+    let attrs: [1]d3d.Attribute = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32_FLOAT,
+                                                   offset: 0 }];
+    let solid = gpu.pipeline(&root, &vcode, &pcode, attrs[..], d3d.TRIANGLE_LIST, true)!;
+    return Gfx.{ root: root, solid: solid, quad: gpu.buffer(as_bytes(&QUAD[0], QUAD.len))!,
+                 ship: gpu.buffer(as_bytes(&SHIP[0], SHIP.len))! };
+}
+
+fn release(g: *mut Gfx) void {
+    g.quad.release();
+    g.ship.release();
+    g.solid.release();
+    g.root.release();
+}
+
+fn shape(gpu: *mut d3d.Device, x: f32, y: f32, r: f32, aspect: f32, red: f32, green: f32, blue: f32, kind: f32,
+         angle: f32) void {
+    let c: [12]f32 = [x, y, r, aspect, red, green, blue, kind, angle, 0.0, 0.0, 0.0];
+    let mut u: [12]u32 = [0; 12];
+    for i in @as(usize, 0)..12 {
+        u[i] = @bit_cast(u32, c[i]);
+    }
+    gpu.set_constants(u[..]);
+}
+
+fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, g: *Game, secs: f32) !void {
+    let aspect = @float_from_int(f32, t.width) / @float_from_int(f32, t.height);
+    gpu.begin(t)!;
+    gpu.clear(t, 0.02, 0.02, 0.06, 1.0);
+    gpu.set_pipeline(&gfx.solid);
+    gpu.set_vertices(&gfx.quad, 8);
+    for s in g.stars {
+        let tw = 0.5 + (0.5 * math.sinf((secs * 2.0) + (s[2] * 40.0)));
+        let b = 0.4 + (0.6 * s[2] * tw);
+        shape(gpu, s[0], s[1], 0.004 + (0.006 * s[2]), aspect, b, b, b * 1.1, 1.0, 0.0);
+        gpu.draw(6, 0);
+    }
+    for i in @as(usize, 0)..ORBS {
+        let pulse = 1.0 + (0.12 * math.sinf((secs * 4.0) + @float_from_int(f32, i)));
+        let o = g.orbs[i];
+        shape(gpu, o[0], o[1], ORB_SIZE * 2.2 * pulse, aspect, 1.0, 0.75, 0.2, 1.0, 0.0);
+        gpu.draw(6, 0);
+    }
+    // the engine's glow behind the ship, then the ship
+    let bx = g.x + (math.sinf(g.angle) * SHIP_SIZE * 0.6);
+    let by = g.y - (math.cosf(g.angle) * SHIP_SIZE * 0.6);
+    shape(gpu, bx, by, SHIP_SIZE * (0.6 + (0.1 * math.sinf(secs * 30.0))), aspect, 1.0, 0.4, 0.1, 1.0, 0.0);
+    gpu.draw(6, 0);
+    gpu.set_vertices(&gfx.ship, 8);
+    shape(gpu, g.x, g.y, SHIP_SIZE, aspect, 0.3, 0.9, 1.0, 0.0, g.angle);
+    gpu.draw(6, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Sound
+// -----------------------------------------------------------------------------
+const RATE: u32 = 44100;
+
+// A bell-like note: a sine and its octave, fading out.
+fn chime() !audio.Sound {
+    let n: usize = 13230;  // 0.3 s
+    let mut s = audio.Sound.init(n, 1, RATE, audio.SampleFormat.S16)!;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let w = 2.0 * math.PI * 880.0 * t;
+        s.set_sample(i, 0.35 * math.exp(-t * 12.0) * (math.sin(w) + (0.4 * math.sin(2.0 * w))));
+    }
+    return s;
+}
+
+// Two bars of a soft bass line, to loop.
+fn bass() !audio.Sound {
+    let notes: [8]f64 = [55.0, 55.0, 65.41, 55.0, 73.42, 65.41, 49.0, 49.0];  // A1 A1 C2 A1 D2 C2 G1 G1
+    let step: usize = 11025;  // a quarter second each
+    let mut s = audio.Sound.init(step * 8, 1, RATE, audio.SampleFormat.S16)!;
+    for k in @as(usize, 0)..8 {
+        for i in @as(usize, 0)..step {
+            let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+            let env = math.exp(-t * 6.0) * @min(t * 200.0, 1.0);
+            let w = 2.0 * math.PI * notes[k] * t;
+            s.set_sample((k * step) + i, 0.3 * env * (math.sin(w) + (0.3 * math.sin(3.0 * w))));
+        }
+    }
+    return s;
+}
+
+struct Sound {
+    engine: xaudio2.Engine,
+    on: bool,
+    chime: audio.Sound,
+    bass: audio.Sound,
+    voices: [4]xaudio2.Voice,  // chimes take turns, so they can overlap
+    next: usize,
+    music: xaudio2.Voice,
+}
+
+fn sound() !Sound {
+    let none = xaudio2.Voice.{ v: 0, block: 0 };
+    let mut s = Sound.{ engine: xaudio2.Engine.{ x: 0, master: 0 }, on: false, chime: chime()!, bass: bass()!,
+                        voices: [none; 4], next: 0, music: none };
+    s.engine = xaudio2.Engine.init() catch {
+        return s;  // no audio device: silence
+    };
+    for i in @as(usize, 0)..4 {
+        s.voices[i] = s.engine.voice(&s.chime)!;
+    }
+    s.music = s.engine.voice(&s.bass)!;
+    s.music.set_volume(0.5);
+    s.music.play(&s.bass, true)!;
+    s.on = true;
+    return s;
+}
+
+fn ding(s: *mut Sound, score: u32) void {
+    if not s.on {
+        return;
+    }
+    let mut v = &mut s.voices[s.next];
+    s.next = (s.next + 1) % 4;
+    v.stop();
+    // up a major scale, then round again
+    let steps: [8]f32 = [1.0, 1.1225, 1.2599, 1.3348, 1.4983, 1.6818, 1.8877, 2.0];
+    v.set_pitch(steps[@as(usize, score % 8)]);
+    v.play(&s.chime, false) catch {};
+}
+
+fn sound_deinit(s: *mut Sound) void {
+    if s.on {
+        s.music.destroy();
+        for i in @as(usize, 0)..4 {
+            s.voices[i].destroy();
+        }
+        s.engine.deinit();
+    }
+    s.chime.deinit();
+    s.bass.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Playing
+// -----------------------------------------------------------------------------
+struct Keys {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
+fn key(k: *mut Keys, code: u32, down: bool) void {
+    if (code == win32.KEY_LEFT) or (code == 'A') {
+        k.left = down;
+    } else if (code == win32.KEY_RIGHT) or (code == 'D') {
+        k.right = down;
+    } else if (code == win32.KEY_UP) or (code == 'W') {
+        k.up = down;
+    } else if (code == win32.KEY_DOWN) or (code == 'S') {
+        k.down = down;
+    }
+}
+
+fn axis(neg: bool, pos: bool) f32 {
+    if neg == pos {
+        return 0.0;
+    }
+    if pos {
+        return 1.0;
+    }
+    return -1.0;
+}
+
+// Heads for the nearest orb.
+fn autopilot(g: *Game, dx: *mut f32, dy: *mut f32) void {
+    let mut best: f32 = 1.0e9;
+    for o in g.orbs {
+        let d = ((o[0] - g.x) * (o[0] - g.x)) + ((o[1] - g.y) * (o[1] - g.y));
+        if d < best {
+            best = d;
+            dx.* = (o[0] - g.x) * 4.0;
+            dy.* = (o[1] - g.y) * 4.0;
+        }
+    }
+}
+
+fn update(g: *mut Game, k: *Keys, pad: xinput.Pad, s: *mut Sound, aspect: f32, dt: f32, auto: bool) void {
+    let mut dx = axis(k.left, k.right) + pad.left_x + axis(pad.down(xinput.DPAD_LEFT), pad.down(xinput.DPAD_RIGHT));
+    let mut dy = axis(k.down, k.up) + pad.left_y + axis(pad.down(xinput.DPAD_DOWN), pad.down(xinput.DPAD_UP));
+    if auto {
+        autopilot(g, &mut dx, &mut dy);
+    }
+    let len = @sqrt((dx * dx) + (dy * dy));
+    if len > 1.0 {
+        dx /= len;
+        dy /= len;
+    }
+    if len > 0.05 {
+        g.angle = math.atan2f(-dx, dy);
+    }
+    g.x = @min(@max(g.x + (dx * SPEED * dt), SHIP_SIZE - aspect), aspect - SHIP_SIZE);
+    g.y = @min(@max(g.y + (dy * SPEED * dt), SHIP_SIZE - 1.0), 1.0 - SHIP_SIZE);
+    for i in @as(usize, 0)..ORBS {
+        let ox = g.orbs[i][0] - g.x;
+        let oy = g.orbs[i][1] - g.y;
+        if ((ox * ox) + (oy * oy)) < ((SHIP_SIZE + ORB_SIZE) * (SHIP_SIZE + ORB_SIZE)) {
+            ding(s, g.score);
+            g.score += 1;
+            place(g, i);
+            g.orbs[i][0] *= aspect / 1.4;
+            g.rumble = 0.15;
+            _ = xinput.vibrate(0, 0.4, 0.6);
+        }
+    }
+    if g.rumble > 0.0 {
+        g.rumble -= @float_cast(f64, dt);
+        if g.rumble <= 0.0 {
+            _ = xinput.vibrate(0, 0.0, 0.0);
+        }
+    }
+}
+
+fn windowed(frames: i64, auto: bool) !i32 {
+    let mut w = win32.Window.open("Orbs", 960, 540)!;
+    defer w.deinit();
+    let sz = w.size();
+    let mut gpu = d3d.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut gfx = graphics(&mut gpu)!;
+    defer release(&mut gfx);
+    let mut snd = sound()!;
+    defer sound_deinit(&mut snd);
+    let mut g = new_game(@bit_cast(u64, time.Instant.now().ns));
+    let mut keys = Keys.{ left: false, right: false, up: false, down: false };
+    let mut pads = xinput.Tracker.init();
+    let mut title: [64]u8 = [0; 64];
+    let mut shown: u32 = 0xffff_ffff;
+    let t0 = time.Instant.now();
+    let mut last = time.Instant.now();
+    let mut n: i64 = 0;
+    loop {
+        let e = w.next_event();
+        if (e.kind == win32.EventKind.CLOSE) or ((e.kind == win32.EventKind.KEY_DOWN) and (e.key == win32.KEY_ESCAPE)) {
+            break;
+        }
+        if e.kind == win32.EventKind.KEY_DOWN {
+            key(&mut keys, e.key, true);
+            continue;
+        }
+        if e.kind == win32.EventKind.KEY_UP {
+            key(&mut keys, e.key, false);
+            continue;
+        }
+        if e.kind == win32.EventKind.RESIZE {
+            gpu.resize(e.width, e.height)!;
+            continue;
+        }
+        if e.kind != win32.EventKind.NONE {
+            continue;
+        }
+        let p = pads.update();
+        if pads.pressed(0, xinput.BACK) {
+            break;
+        }
+        let dt = @float_cast(f32, @min(@float_from_int(f64, last.elapsed().ns) / 1e9, 0.1));
+        last = time.Instant.now();
+        let t = gpu.screen();
+        let aspect = @float_from_int(f32, t.width) / @float_from_int(f32, t.height);
+        update(&mut g, &keys, p[0], &mut snd, aspect, dt, auto);
+        if g.score != shown {
+            shown = g.score;
+            w.set_title(fmt.bufprint(title[..], "Orbs: {} collected", [fmt.int(g.score)])!);
+        }
+        draw(&mut gpu, &mut gfx, t, &g, @float_cast(f32, @float_from_int(f64, t0.elapsed().ns) / 1e9))!;
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    _ = xinput.vibrate(0, 0.0, 0.0);
+    fmt.print("{} frames, {} orbs\n", [fmt.int(n), fmt.int(g.score)])!;
+    return 0;
+}
+
+// One frame into a texture, saved as a PNG: the ship in the middle, an orb
+// above it.
+fn offscreen(out: []u8) !i32 {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    let mut gfx = graphics(&mut gpu)!;
+    defer release(&mut gfx);
+    let mut g = new_game(1);
+    g.x = 0.0;
+    g.y = 0.0;
+    for i in @as(usize, 0)..ORBS {
+        g.orbs[i] = [-0.6 + (0.3 * @float_from_int(f32, i)), 0.6];
+    }
+    let mut t = gpu.target(256, 256)!;
+    defer t.release();
+    draw(&mut gpu, &mut gfx, &mut t, &g, 0.0)!;
+    gpu.finish()!;
+    let mut img = gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    return 0;
+}
+
+// What is there: the GPU, controllers, audio (a chime is played).
+fn check() !i32 {
+    let mut gpu = d3d.Device.init()!;
+    gpu.deinit();
+    io.stdout().println("direct3d 12: ok")!;
+    let mut n: u32 = 0;
+    for i in @as(u32, 0)..xinput.MAX_PADS {
+        if xinput.state(i).connected {
+            n += 1;
+        }
+    }
+    fmt.print("controllers: {}\n", [fmt.int(n)])!;
+    let mut s = sound()!;
+    defer sound_deinit(&mut s);
+    if not s.on {
+        io.stdout().println("audio: none")!;
+        return 0;
+    }
+    ding(&mut s, 0);
+    let v = &s.voices[0];
+    let t0 = time.Instant.now();
+    while (v.frames_played() == 0) and (t0.elapsed().ns < 2_000_000_000) {
+        time.sleep(time.Duration.milliseconds(10));
+    }
+    if v.frames_played() == 0 {
+        io.stdout().println("audio: silent")!;
+        return 1;
+    }
+    io.stdout().println("audio: ok")!;
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("game", "Collect the orbs: Direct3D 12, XInput and XAudio2 (Windows).");
+    defer p.deinit();
+    p.option("png", 'o', "FILE", "draw one frame offscreen and save it as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames")!;
+    p.flag("check", 'c', "report the GPU, controllers and audio")!;
+    p.flag("autopilot", 'a', "play by itself")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("game: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not os.is_windows() {
+        io.stderr().println("game: this needs Windows (--target=x86_64-windows)")!;
+        return 1;
+    }
+    if m.has("check") {
+        return check();
+    }
+    if m.has("png") {
+        return offscreen(m.get("png", ""));
+    }
+    return windowed(m.int("frames", 0)!, m.has("autopilot"));
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

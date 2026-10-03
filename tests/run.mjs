@@ -478,6 +478,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   };
   const run = (n, args = []) => spawnSync(wine, [out(n), ...args], { encoding: 'utf8', cwd: root, env });
   const xvfb = ['xvfb-run'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
+  const vulkan = ['/usr/share/vulkan/icd.d', '/etc/vulkan/icd.d'].some((d) => fs.existsSync(d) && fs.readdirSync(d).length > 0);
   // An 8-bit RGBA PNG (what std/graphics/image/png writes for RGBA images).
   const decodePNG = (d) => {
     let at = 8, width = 0, height = 0;
@@ -524,7 +525,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       if (r.status !== 0 || !r.stdout.startsWith(want)) return `status ${r.status}: ${r.stdout}${r.stderr}`;
       return fs.readFileSync(path.join(tmp, 'windows-pi.pdf')).subarray(0, 5).toString() === '%PDF-' ? null : 'no PDF';
     },
-    'Direct3D 11': () => {
+    'Direct3D 11 and Direct2D': () => {
       const c = build(path.join(root, 'examples/directx.ax'), 'directx', ['-O2']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
       const p = checkPE(out('directx'));
@@ -541,7 +542,37 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       if (!top(px(128, 40), 0) || !top(px(52, 172), 2) || !top(px(204, 172), 1)) {
         return `corners ${px(128, 40)} ${px(52, 172)} ${px(204, 172)}`;
       }
-      return null;
+      // the Direct2D caption: a dark box along the bottom with white text
+      if (!px(12, 240).every((v) => v < 20)) return `caption box ${px(12, 240)}`;
+      let white = 0;
+      for (let y = 226; y < 246; y++) for (let x = 20; x < 236; x++) if (px(x, y).every((v) => v > 200)) white++;
+      return white > 40 ? null : `caption text: ${white} white pixels`;
+    },
+    'Direct3D 12, XInput and XAudio2': () => {
+      const c = build(path.join(root, 'examples/game.ax'), 'game', ['-O2']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const p = checkPE(out('game'));
+      // under Wine, Direct3D 12 is vkd3d over Vulkan (Mesa's lavapipe will do)
+      if (p || !wine || !xvfb || !vulkan) return p;
+      const png = path.join(tmp, 'windows-game.png');
+      const r = spawnSync(xvfb, ['-a', wine, out('game'), '--png', png], { encoding: 'utf8', cwd: root, env });
+      if (r.status !== 0 || !fs.existsSync(png)) return `status ${r.status}: ${r.stdout}${r.stderr}`;
+      const img = decodePNG(fs.readFileSync(png));
+      const px = (x, y) => Array.from(img.data.subarray((y * img.width + x) * 4, (y * img.width + x) * 4 + 4));
+      const [bg, ship, orb] = [px(0, 0), px(128, 128), px(128, 51)];
+      if (!(bg[0] < 30 && bg[1] < 30 && bg[2] < 40 && bg[3] === 255)) return `background ${bg}`;
+      if (!(ship[0] < 100 && ship[1] > 140 && ship[2] > 150)) return `ship ${ship}`;
+      if (!(orb[0] > 200 && orb[1] > 150 && orb[2] < 120)) return `orb ${orb}`;
+      // the GPU, controllers (none here) and sound (a chime that plays, when
+      // there is an audio device)
+      const k = spawnSync(xvfb, ['-a', wine, out('game'), '--check'], { encoding: 'utf8', cwd: root, env });
+      if (k.status !== 0 || !/^direct3d 12: ok\ncontrollers: 0\naudio: (ok|none)\n/.test(k.stdout)) {
+        return `check: status ${k.status}: ${k.stdout}${k.stderr}`;
+      }
+      // playing by itself in a window
+      const w = spawnSync(xvfb, ['-a', wine, out('game'), '--frames', '120', '--autopilot'],
+        { encoding: 'utf8', cwd: root, env, timeout: 120000 });
+      return w.status === 0 && /^120 frames, \d+ orbs\n/.test(w.stdout) ? null : `window: status ${w.status}: ${w.stdout}${w.stderr}`;
     },
     'the compiler': () => {
       const c = build(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);

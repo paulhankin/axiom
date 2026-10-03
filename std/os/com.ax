@@ -1,0 +1,137 @@
+// =============================================================================
+// std/os/com.ax - calling COM interfaces (the Windows component model used by
+// Direct3D, DXGI, Direct2D, DirectWrite and XAudio2) from Axiom: an
+// interface pointer's first word points to its table of methods, called
+// with the object as the first argument.
+//
+//     let f = @bit_cast(fn(usize, u32) i32, com.method(obj, 8));  // the 9th method
+//     if f(obj, 0) < 0 { return error.Failed; }                  // an HRESULT
+//     com.release(obj);
+//
+// Methods are numbered in declaration order, the parent interface's first
+// (IUnknown: QueryInterface 0, AddRef 1, Release 2). A method that returns
+// a struct takes a hidden pointer to the result as its second argument,
+// after the object. Structs are written here as bytes at the C offsets
+// (put32, put64, ...), since several of them are packed.
+//
+// Windows only (--target=x86_64-windows).
+// =============================================================================
+
+error { Failed }
+
+extern "C" "ole32" {
+    fn CoInitializeEx(reserved: *void, flags: u32) i32;
+}
+
+/// The address of method i of interface pointer obj.
+pub fn method(obj: usize, i: usize) usize {
+    let vt = @ptr_from_int(*usize, obj).*;
+    return @ptr_from_int(*usize, vt + (i * 8)).*;
+}
+
+/// Lets an interface go (IUnknown::Release); nothing for 0.
+pub fn release(obj: usize) void {
+    if obj != 0 {
+        _ = @bit_cast(fn(usize) u32, method(obj, 2))(obj);
+    }
+}
+
+/// Another interface of the same object (IUnknown::QueryInterface), by its
+/// IID (16 bytes, as in memory).
+pub fn query(obj: usize, iid: *[16]u8) !usize {
+    let mut out: usize = 0;
+    let f = @bit_cast(fn(usize, *u8, *mut usize) i32, method(obj, 0));
+    if f(obj, &iid[0], &mut out) < 0 {
+        return error.Failed;
+    }
+    return out;
+}
+
+let mut com_ready: u32 = 0;
+
+/// Initializes COM for the program (multithreaded; once is enough).
+pub fn init() void {
+    if @atomic_xchg(&mut com_ready, 1) == 0 {
+        _ = CoInitializeEx(@ptr_from_int(*void, 0), 0);  // COINIT_MULTITHREADED
+    }
+}
+
+/// Did a call succeed (an HRESULT that is not negative)?
+pub fn ok(hr: i32) bool {
+    return hr >= 0;
+}
+
+pub fn put8(b: []mut u8, at: usize, x: u8) void {
+    b[at] = x;
+}
+
+pub fn put16(b: []mut u8, at: usize, x: u16) void {
+    b[at] = @truncate(u8, x);
+    b[at + 1] = @truncate(u8, x >> 8);
+}
+
+pub fn put32(b: []mut u8, at: usize, x: u32) void {
+    for k in @as(usize, 0)..4 {
+        b[at + k] = @truncate(u8, x >> @as(u32, @truncate(u32, k * 8)));
+    }
+}
+
+pub fn put64(b: []mut u8, at: usize, x: u64) void {
+    put32(b, at, @truncate(u32, x));
+    put32(b, at + 4, @truncate(u32, x >> 32));
+}
+
+pub fn putf(b: []mut u8, at: usize, x: f32) void {
+    put32(b, at, @bit_cast(u32, x));
+}
+
+pub fn ptr(b: []mut u8, at: usize, p: usize) void {
+    put64(b, at, @as(u64, p));
+}
+
+pub fn get16(b: []u8, at: usize) u16 {
+    return @as(u16, b[at]) | (@as(u16, b[at + 1]) << 8);
+}
+
+pub fn get32(b: []u8, at: usize) u32 {
+    return ((@as(u32, b[at]) | (@as(u32, b[at + 1]) << 8)) | (@as(u32, b[at + 2]) << 16)) | (@as(u32, b[at + 3]) << 24);
+}
+
+pub fn get64(b: []u8, at: usize) u64 {
+    return @as(u64, get32(b, at)) | (@as(u64, get32(b, at + 4)) << 32);
+}
+
+/// s as NUL-terminated UTF-16 in out (truncated to fit); returns its length
+/// in units (without the NUL).
+pub fn utf16(s: []u8, out: []mut u16) usize {
+    let mut i: usize = 0;
+    let mut o: usize = 0;
+    while (i < s.len) and ((o + 3) < out.len) {
+        let c = @as(u32, s[i]);
+        let mut cp = c;
+        let mut n: usize = 1;
+        if (c >= 0xf0) and ((i + 3) < s.len) {
+            cp = (((c & 7) << 18) | ((@as(u32, s[i + 1]) & 0x3f) << 12)) | (
+                ((@as(u32, s[i + 2]) & 0x3f) << 6) | (@as(u32, s[i + 3]) & 0x3f));
+            n = 4;
+        } else if (c >= 0xe0) and ((i + 2) < s.len) {
+            cp = (((c & 0xf) << 12) | ((@as(u32, s[i + 1]) & 0x3f) << 6)) | (@as(u32, s[i + 2]) & 0x3f);
+            n = 3;
+        } else if (c >= 0xc0) and ((i + 1) < s.len) {
+            cp = ((c & 0x1f) << 6) | (@as(u32, s[i + 1]) & 0x3f);
+            n = 2;
+        }
+        if cp >= 0x10000 {
+            let v = cp - 0x10000;
+            out[o] = @truncate(u16, 0xd800 + (v >> 10));
+            out[o + 1] = @truncate(u16, 0xdc00 + (v & 0x3ff));
+            o += 2;
+        } else {
+            out[o] = @truncate(u16, cp);
+            o += 1;
+        }
+        i += n;
+    }
+    out[o] = 0;
+    return o;
+}

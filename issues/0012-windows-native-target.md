@@ -42,6 +42,16 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
   events) and std/graphics/d3d11 (Direct3D 11, DXGI swap chains, HLSL via
   d3dcompiler_47, COM through method tables); examples/directx.ax draws with
   them, tested offscreen pixel by pixel under Wine + Xvfb.
+- **Direct3D 12, Direct2D, XAudio2, XInput.** std/graphics/d3d12 (a direct
+  queue, root constants, pipeline state objects, flip-model swap chains,
+  readback), std/graphics/hlsl (shared by 11 and 12), std/graphics/d2d
+  (Direct2D + DirectWrite on a window or on a Direct3D 11 texture),
+  std/audio/xaudio2 (voices playing std/audio Sounds) and std/os/xinput
+  (pads, rumble, battery), on std/os/com. examples/directx.ax draws a
+  Direct2D caption over Direct3D 11; examples/game.ax is a small game on
+  Direct3D 12, XInput and XAudio2. Tested under Wine (Direct3D 12 through
+  vkd3d on Mesa's lavapipe; XAudio2 into a PulseAudio null sink; XInput
+  with no pads connected).
 - **The compiler on Windows.** It builds for `x86_64-windows`, runs, and
   reaches a fixed point there: built by the Windows compiler, it builds
   itself bit-identically (under Wine). `util.real_path` keeps drive letters.
@@ -62,8 +72,11 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - Unix-domain sockets need Windows 10 1803 or later (Wine has none).
 - No `.pdata` unwind information: debuggers and Windows' own stack walks see
   only leaf frames (Axiom's traces use its shadow stack).
-- Direct3D 12, Direct2D/DirectWrite, XAudio2, input (XInput); a portable
-  graphics layer over Direct3D, Metal and Vulkan.
+- Direct2D on Direct3D 12 (through D3D11On12, which Wine lacks); compute
+  shaders, textures and depth buffers in the Direct3D wrappers; DXIL (shader
+  model 6, dxcompiler); Windows.Gaming.Input, raw input and DirectInput for
+  other controllers; WASAPI capture; Media Foundation. A portable graphics
+  layer over Direct3D, Metal and Vulkan.
 - AArch64 Windows.
 - Separate compilation in the compiler on Windows: it forks, so it falls
   back to one unit (0006).
