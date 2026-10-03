@@ -1,0 +1,231 @@
+// =============================================================================
+// File: metal.ax
+// Metal on macOS: a window with a spinning triangle whose corners are red,
+// green and blue, drawn by shaders in the Metal Shading Language compiled at
+// run time, and a caption over it drawn with Core Graphics and Core Text.
+// (examples/directx.ax is the same on Windows.)
+//
+//   axiom build examples/metal.ax --target=aarch64-macos -O2 -o metal
+//   ./metal                       (Escape or closing the window quits)
+//   ./metal --frames 120          (quits after 120 frames)
+//   ./metal --png triangle.png    (draws one frame offscreen, saves it)
+//
+// It uses std/os/cocoa for the window, std/graphics/metal for the GPU and
+// std/graphics/quartz for the caption.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/image/png" as png;
+import "std/graphics/metal" as metal;
+import "std/graphics/quartz" as quartz;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/cocoa" as cocoa;
+import "std/os/fs" as fs;
+import "std/str" as strs;
+import "std/time" as time;
+
+// The shaders (MSL), a line at a time.
+let SHADER_LINES: [26][]u8 = ["#include <metal_stdlib>", "using namespace metal;", "", "struct Frame {",
+                              "    float angle;", "    float aspect;", "};", "", "struct VSIn {",
+                              "    float2 pos [[attribute(0)]];", "    float3 col [[attribute(1)]];", "};", "",
+                              "struct VSOut {", "    float4 pos [[position]];", "    float3 col;", "};", "",
+                              "vertex VSOut vs(VSIn i [[stage_in]], constant Frame& f [[buffer(0)]]) {",
+                              "    float c = cos(f.angle), s = sin(f.angle);",
+                              "    VSOut o = { float4((i.pos.x * c - i.pos.y * s) / f.aspect, i.pos.x * s + i.pos.y * c, 0.0, 1.0), i.col };",
+                              "    return o;", "}", "",
+                              "fragment float4 ps(VSOut i [[stage_in]]) { return float4(i.col, 1.0); }", ""];
+
+// x, y, r, g, b per corner
+let VERTICES: [15]f32 = [0.0, 0.8, 1.0, 0.0, 0.0, 0.69, -0.4, 0.0, 1.0, 0.0, -0.69, -0.4, 0.0, 0.0, 1.0];
+
+struct Scene {
+    pipeline: metal.Pipeline,
+    vertices: metal.Buffer,
+}
+
+fn as_bytes(p: *f32, n: usize) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p), n * 4);
+}
+
+fn shader_source() !strs.String {
+    let mut s = strs.String.init();
+    for l in SHADER_LINES {
+        s.push_str(l)!;
+        s.push('\n')!;
+    }
+    return s;
+}
+
+fn scene(gpu: *mut metal.Device) !Scene {
+    let mut src = shader_source()!;
+    defer src.deinit();
+    let mut lib = gpu.library(src.bytes()) catch |e| {
+        if e == error.CompileError {
+            fmt.eprint("metal: {}\n", [fmt.str(metal.message())]) catch {};
+        }
+        return e;
+    };
+    defer lib.release();
+    let root = gpu.root_signature(2)!;  // angle, aspect
+    let attrs: [2]metal.Attribute = [metal.Attribute.{ semantic: "POSITION", index: 0, format: metal.R32G32_FLOAT,
+                                                       offset: 0 }, metal.Attribute.{
+                                                           semantic: "COLOR", index: 0, format: metal.R32G32B32_FLOAT,
+                                                           offset: 8 }];
+    return Scene.{ pipeline: gpu.pipeline(&root, &lib, "vs", "ps", attrs[..], metal.TRIANGLE_LIST, false)!,
+                   vertices: gpu.buffer(as_bytes(&VERTICES[0], VERTICES.len))! };
+}
+
+fn draw(gpu: *mut metal.Device, s: *mut Scene, t: *mut metal.Target, angle: f32) !void {
+    let frame: [2]u32 = [
+        @bit_cast(u32, angle), @bit_cast(u32, @float_from_int(f32, t.width) / @float_from_int(f32, t.height))];
+    gpu.begin(t)!;
+    gpu.clear(t, 0.08, 0.08, 0.12, 1.0);
+    gpu.set_pipeline(&s.pipeline);
+    gpu.set_constants(frame[..]);
+    gpu.set_vertices(&s.vertices, 20);
+    gpu.draw(3, 0);
+}
+
+// The caption: a translucent box along the bottom with a line of text.
+fn caption(c: *mut quartz.Canvas, f: *quartz.Font, text: []u8, scale: f32) !void {
+    let w = @float_from_int(f32, c.width);
+    let h = @float_from_int(f32, c.height);
+    c.begin();
+    c.fill_round_rect(8.0 * scale, h - (34.0 * scale), w - (16.0 * scale), 26.0 * scale, 6.0 * scale,
+                      quartz.rgba(0.0, 0.0, 0.0, 0.6));
+    c.text(f, text, 8.0 * scale, h - (34.0 * scale), w - (16.0 * scale), 26.0 * scale, quartz.WHITE)!;
+    c.end()!;
+}
+
+fn caption_font(c: *mut quartz.Canvas, scale: f32) !quartz.Font {
+    let mut f = c.font("Helvetica Neue, Helvetica, system-ui", 15.0 * scale, quartz.BOLD, false)!;
+    f.align(quartz.Align.CENTER, quartz.Align.CENTER);
+    return f;
+}
+
+fn release(s: *mut Scene) void {
+    s.pipeline.release();
+    s.vertices.release();
+}
+
+// One frame into a texture, saved as a PNG.
+fn offscreen(out: []u8) !i32 {
+    let mut gpu = metal.Device.init()!;
+    defer gpu.deinit();
+    let mut s = scene(&mut gpu)!;
+    defer release(&mut s);
+    let mut t = gpu.target(256, 256)!;
+    defer t.release();
+    let mut c = quartz.Canvas.init(t.width, t.height)!;
+    defer c.deinit();
+    let mut f = caption_font(&mut c, 1.0)!;
+    defer f.release();
+    let mut ov = gpu.overlay(t.width, t.height)!;
+    defer ov.release();
+    caption(&mut c, &f, "Metal + Core Text", 1.0)!;
+    draw(&mut gpu, &mut s, &mut t, 0.0)!;
+    gpu.draw_overlay(&mut ov, c.pixels());
+    gpu.finish()!;
+    let mut img = gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    return 0;
+}
+
+fn windowed(frames: i64) !i32 {
+    let mut w = cocoa.Window.open("Axiom + Metal", 640, 480)!;
+    defer w.deinit();
+    let mut sz = w.size();
+    let scale = @float_cast(f32, w.scale());
+    let mut gpu = metal.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut s = scene(&mut gpu)!;
+    defer release(&mut s);
+    let mut c = quartz.Canvas.init(sz[0], sz[1])!;
+    defer c.deinit();
+    let mut f = caption_font(&mut c, scale)!;
+    defer f.release();
+    let mut ov = gpu.overlay(sz[0], sz[1])!;
+    defer ov.release();
+    let mut buf: [64]u8 = [0; 64];
+    let mut fps: i64 = 0;
+    let mut last = time.Instant.now();
+    let mut counted: i64 = 0;
+    let t0 = time.Instant.now();
+    let mut n: i64 = 0;
+    loop {
+        let e = w.next_event();
+        if (e.kind == cocoa.EventKind.CLOSE) or ((e.kind == cocoa.EventKind.KEY_DOWN) and (e.key == cocoa.KEY_ESCAPE)) {
+            break;
+        }
+        if e.kind == cocoa.EventKind.RESIZE {
+            sz = [e.width, e.height];
+            gpu.resize(e.width, e.height)!;
+            c.resize(e.width, e.height)!;
+            gpu.resize_overlay(&mut ov, e.width, e.height)!;
+            continue;
+        }
+        if e.kind != cocoa.EventKind.NONE {
+            continue;
+        }
+        let secs = @float_from_int(f64, t0.elapsed().ns) / 1e9;
+        if last.elapsed().ns >= 1_000_000_000 {
+            fps = n - counted;
+            counted = n;
+            last = time.Instant.now();
+        }
+        caption(&mut c, &f, fmt.bufprint(buf[..], "Metal + Core Text: {} fps", [fmt.int(fps)])!, scale)!;
+        draw(&mut gpu, &mut s, gpu.screen(), @float_cast(f32, secs))!;
+        gpu.draw_overlay(&mut ov, c.pixels());
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    fmt.print("{} frames\n", [fmt.int(n)])!;
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("metal", "A spinning triangle with Metal (macOS).");
+    defer p.deinit();
+    p.option("png", 'o', "FILE", "draw one frame offscreen and save it as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("metal: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not strs.eq(os.system(), "macos") {
+        io.stderr().println("metal: Metal needs macOS (--target=aarch64-macos)")!;
+        return 1;
+    }
+    if m.has("png") {
+        return offscreen(m.get("png", ""));
+    }
+    return windowed(m.int("frames", 0)!);
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

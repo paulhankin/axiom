@@ -1,0 +1,1331 @@
+// =============================================================================
+// std/graphics/metal.ax - Metal, the GPU on macOS: a device with one command
+// queue, recorded frames, pipelines built from Metal Shading Language
+// compiled at run time, root signatures with 32-bit constants, buffers,
+// render targets (a window's layer, or textures whose pixels can be read
+// back), depth buffers and shadow maps, textures, compute, and a 2D
+// overlay. Its interface is std/graphics/d3d12's, so that a program drawing
+// with Direct3D 12 on Windows draws the same way here, with its shaders in
+// MSL instead of HLSL:
+//
+//     let mut gpu = metal.Device.init_window(w.handle(), size[0], size[1])!;  // or Device.init() offscreen
+//     defer gpu.deinit();
+//     let mut lib = gpu.library(msl_source)!;            // functions vs and ps
+//     let rs = gpu.root_signature(4)!;                  // four constants at buffer(0)
+//     let p = gpu.pipeline(&rs, &lib, "vs", "ps", attrs[..], metal.TRIANGLE_LIST, false)!;
+//     loop {
+//         let t = gpu.screen();
+//         gpu.begin(t)!;
+//         gpu.clear(t, 0.1, 0.1, 0.2, 1.0);
+//         gpu.set_pipeline(&p);
+//         gpu.set_constants(consts[..]);
+//         gpu.set_vertices(&vb, 20);
+//         gpu.draw(3, 0);
+//         gpu.present(true)!;   // (Device.finish() for a texture)
+//     }
+//
+// Where Direct3D's registers are, the shaders' arguments are:
+//
+//     HLSL                         MSL
+//     b0 (the root constants)      [[buffer(0)]] in both stages
+//     b1, b2, ... (set_buffer)     [[buffer(1)]], [[buffer(2)]], ...
+//     t0, t1, ... (set_texture,    [[texture(0)]], [[texture(1)]], ... (a
+//       set_image)                   depth2d<float> for a shadow map)
+//     s0 (linear, wrapping)        [[sampler(0)]]
+//     s1 (shadow comparison)       [[sampler(1)]]: sample_compare, less or
+//                                    equal; outside the map, not in shadow
+//     vertex attributes            [[attribute(0)]], [[attribute(1)]], ...
+//                                    in the order the Attributes are given
+//     u0, u1, ... (compute)        [[buffer(1)]], [[buffer(2)]], ...
+//
+// Metal's conventions are Direct3D's: clip space has y up and depth 0..1,
+// a target's pixels and a texture's coordinates start at the top left.
+// Front faces are counter-clockwise as seen, as in std/graphics/d3d12.
+// Targets are 8-bit BGRA (what a window's layer takes); read_pixels gives
+// RGBA.
+//
+// Simplest correct use of the API, not the fastest: a frame is submitted
+// and waited for before the next is recorded, so buffers can be rewritten
+// between frames. macOS only (--target=aarch64-macos).
+// =============================================================================
+
+import "../os/objc.ax" as objc;
+import "image.ax" as image;
+
+error { Unsupported, Failed, CompileError, OutOfMemory }
+
+extern "C" "Metal" {
+    fn MTLCreateSystemDefaultDevice() usize;
+}
+
+// (QuartzCore, where CAMetalLayer is, is loaded with the program because
+// this module calls it.)
+extern "C" "QuartzCore" {
+    fn CACurrentMediaTime() f64;
+}
+
+// Vertex formats (by their Direct3D names, as std/graphics/d3d12 has them)
+pub const R8G8B8A8_UNORM: u32 = 9;  // MTLVertexFormatUChar4Normalized
+pub const R32_FLOAT: u32 = 28;
+pub const R32G32_FLOAT: u32 = 29;
+pub const R32G32B32_FLOAT: u32 = 30;
+pub const R32G32B32A32_FLOAT: u32 = 31;
+pub const R32_UINT: u32 = 36;
+
+// Index formats (set_indices)
+pub const R16_UINT: u32 = 57;
+pub const R32_UINT_INDEX: u32 = 42;  // (R32_UINT is the vertex format)
+
+// Topologies
+pub const POINT_LIST: u32 = 1;
+pub const LINE_LIST: u32 = 2;
+pub const LINE_STRIP: u32 = 3;
+pub const TRIANGLE_LIST: u32 = 4;
+pub const TRIANGLE_STRIP: u32 = 5;
+
+// Blending
+pub const BLEND_NONE: u32 = 0;
+pub const BLEND_ALPHA: u32 = 1;  // over what is there, by the source's alpha
+pub const BLEND_ADD: u32 = 2;    // added to what is there, scaled by the source's alpha (glows)
+
+// Depth
+pub const DEPTH_NONE: u32 = 0;   // drawn without a depth buffer (begin)
+pub const DEPTH_OFF: u32 = 1;    // with one bound (begin_depth), not tested or written
+pub const DEPTH_TEST: u32 = 2;   // tested (nearer passes), not written: transparent things
+pub const DEPTH_WRITE: u32 = 3;  // tested and written: solid things
+
+// Culling
+pub const CULL_NONE: u32 = 1;
+pub const CULL_FRONT: u32 = 2;
+pub const CULL_BACK: u32 = 3;
+
+const BGRA8: u64 = 80;  // MTLPixelFormatBGRA8Unorm
+const DEPTH32: u64 = 252;
+const RGBA8: u64 = 70;
+const VERTEX_BUFFER: u64 = 30;  // the buffer index vertices come from
+const MAX_CONSTANTS: usize = 64;
+
+/// An attribute of a vertex: [[attribute(k)]] for the k-th one given, its
+/// format and byte offset in the vertex. (`semantic` and `index` are
+/// Direct3D's names for it, kept so that the same list serves both.)
+pub struct Attribute {
+    semantic: []u8,
+    index: u32,
+    format: u32,
+    offset: u32,
+}
+
+/// Shaders compiled from MSL source: functions to build pipelines from.
+pub struct Library {
+    p: usize,  // id<MTLLibrary>
+
+    pub fn release(self: *mut Library) void {
+        objc.release(self.p);
+        self.p = 0;
+    }
+}
+
+/// What a pipeline's shaders take: `constants` 32-bit words at buffer(0),
+/// `buffers` constant buffers from buffer(1), `textures` from texture(0).
+pub struct RootSignature {
+    constants: u32,
+    buffers: u32,
+    textures: u32,
+
+    pub fn release(self: *mut RootSignature) void {
+        _ = self;
+    }
+}
+
+pub struct Pipeline {
+    p: usize,      // id<MTLRenderPipelineState> or id<MTLComputePipelineState>
+    depth: usize,  // id<MTLDepthStencilState> (0: none)
+    prim: u64,     // MTLPrimitiveType
+    cull: u64,     // MTLCullMode
+    depth_bias: f32,
+    slope_bias: f32,
+    constants: u32,  // words at buffer(0)
+    stride: u32,     // a vertex's bytes
+    group: [3]u64,   // compute: threads per threadgroup
+
+    pub fn release(self: *mut Pipeline) void {
+        objc.release(self.p);
+        objc.release(self.depth);
+        self.p = 0;
+        self.depth = 0;
+    }
+}
+
+/// A buffer in memory the CPU writes and the GPU reads (vertices, indexes,
+/// constants). It stays mapped: frames are waited for.
+pub struct Buffer {
+    p: usize,  // id<MTLBuffer>
+    size: u32,
+    mapped: usize,  // its contents
+
+    /// Writes the buffer's contents (the GPU has finished with the last
+    /// frame's).
+    pub fn write(self: *mut Buffer, data: []u8) !void {
+        if (self.mapped == 0) or (data.len > @as(usize, self.size)) {
+            return error.Failed;
+        }
+        @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, self.mapped), data.len), data);
+    }
+
+    /// The buffer's memory as floats, to write in place.
+    pub fn floats(self: *mut Buffer) []mut f32 {
+        if self.mapped == 0 {
+            return @slice_from_ptr(@ptr_from_int(*mut f32, 4), 0);
+        }
+        return @slice_from_ptr(@ptr_from_int(*mut f32, self.mapped), @as(usize, self.size) / 4);
+    }
+
+    pub fn release(self: *mut Buffer) void {
+        objc.release(self.p);
+        self.p = 0;
+        self.mapped = 0;
+    }
+}
+
+/// An image on the GPU for shaders to read (set_image).
+pub struct Texture {
+    p: usize,  // id<MTLTexture>
+    width: u32,
+    height: u32,
+
+    pub fn release(self: *mut Texture) void {
+        objc.release(self.p);
+        self.p = 0;
+    }
+}
+
+/// A buffer that compute shaders read and write, and that can be drawn as
+/// vertices or read back.
+pub struct StorageBuffer {
+    p: usize,
+    size: u32,
+    mapped: usize,
+
+    pub fn release(self: *mut StorageBuffer) void {
+        objc.release(self.p);
+        self.p = 0;
+        self.mapped = 0;
+    }
+}
+
+/// Something to draw into: the window (its layer's next drawable) or a texture.
+pub struct Target {
+    tex: usize,  // id<MTLTexture> (the screen's: this frame's drawable's)
+    width: u32,
+    height: u32,
+    screen: bool,
+
+    pub fn release(self: *mut Target) void {
+        if not self.screen {
+            objc.release(self.tex);
+        }
+        self.tex = 0;
+    }
+}
+
+/// A depth buffer (32-bit float) to draw into with a target of its size, or
+/// alone (a shadow map, which shaders can then read: shadow_map).
+pub struct DepthBuffer {
+    tex: usize,
+    width: u32,
+    height: u32,
+    sampled: bool,
+
+    pub fn release(self: *mut DepthBuffer) void {
+        objc.release(self.tex);
+        self.tex = 0;
+    }
+}
+
+/// How a pipeline draws: the topology, BLEND_*, DEPTH_* and CULL_*; depth
+/// bias (constant, in steps of the depth's precision, and scaled by the
+/// slope) against shadow acne; depth_only for a pass without a target (a
+/// shadow map: the fragment function is not used); the vertex stride (0:
+/// the end of the last attribute).
+pub struct PipelineOptions {
+    topology: u32,
+    blend: u32,
+    depth: u32,
+    cull: u32,
+    depth_bias: i32,
+    slope_bias: f32,
+    depth_only: bool,
+    stride: u32,
+
+    /// Triangles, no blending, depth or culling, no bias.
+    pub fn defaults() PipelineOptions {
+        return PipelineOptions.{ topology: TRIANGLE_LIST, blend: BLEND_NONE, depth: DEPTH_NONE, cull: CULL_NONE,
+                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0 };
+    }
+}
+
+/// A 2D layer over the frame: premultiplied BGRA pixels (std/graphics/quartz
+/// draws them) drawn over a target with draw_overlay.
+pub struct Overlay {
+    tex: usize,
+    pipeline: usize,
+    width: u32,
+    height: u32,
+
+    pub fn release(self: *mut Overlay) void {
+        objc.release(self.tex);
+        objc.release(self.pipeline);
+        self.tex = 0;
+        self.pipeline = 0;
+    }
+}
+
+let mut compile_message: [1024]u8 = [0; 1024];
+let mut compile_message_len: usize = 0;
+
+/// What the compiler said about the last library that failed to compile.
+pub fn message() []u8 {
+    return compile_message[0..compile_message_len];
+}
+
+fn set_message(err: usize) void {
+    let s = objc.string_of(objc.call(err, "localizedDescription"));
+    let n = @min(s.len, compile_message.len);
+    @mem_copy(compile_message[0..n], s[0..n]);
+    compile_message_len = n;
+}
+
+// The overlay's shaders: a triangle covering the target, the texture's
+// premultiplied pixels over it.
+let OVERLAY_SHADER: [16][]u8 = ["#include <metal_stdlib>", "using namespace metal;",
+                                "struct VOut { float4 pos [[position]]; float2 uv; };",
+                                "vertex VOut overlay_vs(uint id [[vertex_id]]) {",
+                                "    float2 p = float2((id << 1) & 2, id & 2);", "    VOut o;",
+                                "    o.pos = float4(p * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);",
+                                "    o.uv = p;", "    return o;", "}",
+                                "fragment float4 overlay_ps(VOut i [[stage_in]], texture2d<float> t [[texture(0)]]) {",
+                                "    constexpr sampler s(filter::nearest);", "    float4 c = t.sample(s, i.uv);",
+                                "    return float4(c.r, c.g, c.b, c.a);", "}", ""];
+
+pub struct Device {
+    dev: usize,    // id<MTLDevice>
+    queue: usize,  // id<MTLCommandQueue>
+    layer: usize,  // CAMetalLayer (0: offscreen)
+    back: Target,  // the window's, while a frame draws into it
+    drawable: usize,
+    cmd: usize,  // the frame's command buffer (0: not recording)
+    enc: usize,  // its render or compute encoder (0: none)
+    computing: bool,
+    pool: usize,  // the frame's autorelease pool
+    // the render pass to start when something is drawn
+    pass_target: *mut Target,
+    pass_depth: *mut DepthBuffer,
+    clear_color: [4]f64,
+    clearing: bool,
+    clearing_depth: bool,
+    // the current pipeline's state
+    cur: *Pipeline,
+    consts: [64]u32,
+    nconsts: u32,
+    consts_dirty: bool,
+    index_buffer: usize,
+    index_type: u64,
+    samplers: [2]usize,
+    vsync: bool,
+
+    /// A device for drawing offscreen (into textures).
+    pub fn init() !Device {
+        let dev = MTLCreateSystemDefaultDevice();
+        if dev == 0 {
+            return error.Unsupported;
+        }
+        let mut d = Device.{ dev: dev, queue: 0, layer: 0, back: Target.{ tex: 0, width: 0, height: 0, screen: true },
+                             drawable: 0, cmd: 0, enc: 0, computing: false, pool: 0,
+                             pass_target: @ptr_from_int(*mut Target, 0), pass_depth: @ptr_from_int(*mut DepthBuffer, 0),
+                             clear_color: [0.0; 4], clearing: false, clearing_depth: false,
+                             cur: @ptr_from_int(*Pipeline, 0), consts: [0; 64], nconsts: 0, consts_dirty: false,
+                             index_buffer: 0, index_type: 0, samplers: [0, 0], vsync: true };
+        d.queue = objc.call(dev, "newCommandQueue");
+        if d.queue == 0 {
+            d.deinit();
+            return error.Failed;
+        }
+        d.make_samplers() catch |e| {
+            d.deinit();
+            return e;
+        };
+        return d;
+    }
+
+    /// A device drawing into a window: its content view (cocoa.Window.handle())
+    /// of width × height pixels, through a CAMetalLayer.
+    pub fn init_window(view: usize, width: u32, height: u32) !Device {
+        let mut d = Device.init()!;
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let mut cls = objc.class("CAMetalLayer");
+        if cls == 0 {
+            _ = CACurrentMediaTime();  // (QuartzCore: see above)
+            cls = objc.class("CAMetalLayer");
+        }
+        let layer = objc.retain(objc.call(cls, "layer"));
+        if layer == 0 {
+            d.deinit();
+            return error.Unsupported;
+        }
+        d.layer = layer;
+        _ = objc.call1(layer, "setDevice:", d.dev);
+        _ = objc.call1(layer, "setPixelFormat:", @truncate(usize, BGRA8));
+        _ = objc.send_b(layer, objc.sel("setFramebufferOnly:"), false);  // (read_pixels may copy it)
+        _ = objc.send_dd(
+            layer, objc.sel("setDrawableSize:"), @float_from_int(f64, width), @float_from_int(f64, height));
+        let win = objc.call(view, "window");
+        if win != 0 {
+            _ = objc.send_d(layer, objc.sel("setContentsScale:"), objc.send_f64(win, objc.sel("backingScaleFactor")));
+        }
+        _ = objc.call1(view, "setLayer:", layer);
+        _ = objc.send_b(view, objc.sel("setWantsLayer:"), true);
+        d.back = Target.{ tex: 0, width: width, height: height, screen: true };
+        return d;
+    }
+
+    fn make_samplers(self: *mut Device) !void {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        for k in @as(usize, 0)..2 {
+            let sd = objc.new("MTLSamplerDescriptor");
+            _ = objc.call1(sd, "setMinFilter:", 1);  // linear
+            _ = objc.call1(sd, "setMagFilter:", 1);
+            if k == 0 {
+                _ = objc.call1(sd, "setMipFilter:", 2);     // (linear, if there are mips)
+                _ = objc.call1(sd, "setSAddressMode:", 2);  // repeat
+                _ = objc.call1(sd, "setTAddressMode:", 2);
+            } else {
+                // a shadow map's: compared (less or equal), white outside
+                _ = objc.call1(sd, "setSAddressMode:", 5);  // clamp to border colour
+                _ = objc.call1(sd, "setTAddressMode:", 5);
+                _ = objc.call1(sd, "setBorderColor:", 2);      // opaque white
+                _ = objc.call1(sd, "setCompareFunction:", 3);  // less or equal
+            }
+            self.samplers[k] = objc.call1(self.dev, "newSamplerStateWithDescriptor:", sd);
+            objc.release(sd);
+            if self.samplers[k] == 0 {
+                return error.Failed;
+            }
+        }
+    }
+
+    pub fn deinit(self: *mut Device) void {
+        if self.cmd != 0 {
+            self.submit() catch {};
+        }
+        objc.release(self.samplers[0]);
+        objc.release(self.samplers[1]);
+        objc.release(self.layer);
+        objc.release(self.queue);
+        objc.release(self.dev);
+        self.samplers = [0, 0];
+        self.layer = 0;
+        self.queue = 0;
+        self.dev = 0;
+    }
+
+    /// The GPU's name.
+    pub fn name(self: *Device) []u8 {
+        return objc.string_of(objc.call(self.dev, "name"));
+    }
+
+    /// Waits until the GPU has done everything submitted.
+    pub fn wait_idle(self: *mut Device) void {
+        if self.cmd != 0 {
+            self.submit() catch {};
+        }
+    }
+
+    /// The window to draw the next frame into.
+    pub fn screen(self: *mut Device) *mut Target {
+        return &mut self.back;
+    }
+
+    /// After the window's content area changed size.
+    pub fn resize(self: *mut Device, width: u32, height: u32) !void {
+        if (self.layer == 0) or (width == 0) or (height == 0) {
+            return;
+        }
+        self.wait_idle();
+        _ = objc.send_dd(
+            self.layer, objc.sel("setDrawableSize:"), @float_from_int(f64, width), @float_from_int(f64, height));
+        self.back.width = width;
+        self.back.height = height;
+    }
+
+    fn texture_2d(self: *mut Device, format: u64, width: u32, height: u32, usage: u64, storage: u64) usize {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let f = @bit_cast(fn(usize, usize, u64, u64, u64, u8) usize, objc.msg_send());
+        let td = f(objc.class("MTLTextureDescriptor"),
+                   objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), format, @as(u64, width),
+                   @as(u64, height), 0);
+        _ = objc.call1(td, "setUsage:", @truncate(usize, usage));
+        _ = objc.call1(td, "setStorageMode:", @truncate(usize, storage));
+        return objc.call1(self.dev, "newTextureWithDescriptor:", td);
+    }
+
+    /// A texture of width × height pixels to draw into offscreen.
+    pub fn target(self: *mut Device, width: u32, height: u32) !Target {
+        let t = self.texture_2d(BGRA8, width, height, 0x5, 0);  // render target, shader read; shared
+        if t == 0 {
+            return error.Failed;
+        }
+        return Target.{ tex: t, width: width, height: height, screen: false };
+    }
+
+    /// A depth buffer of width × height, for a target of that size.
+    pub fn depth_buffer(self: *mut Device, width: u32, height: u32) !DepthBuffer {
+        let t = self.texture_2d(DEPTH32, width, height, 0x4, 2);  // render target; private
+        if t == 0 {
+            return error.Failed;
+        }
+        return DepthBuffer.{ tex: t, width: width, height: height, sampled: false };
+    }
+
+    /// A depth buffer of size × size to draw into alone (begin_shadow) and
+    /// then read in shaders (set_texture): a shadow map, a depth2d<float>
+    /// sampled with sample_compare through sampler(1) (less or equal;
+    /// outside the map, nothing is in shadow).
+    pub fn shadow_map(self: *mut Device, size: u32) !DepthBuffer {
+        let t = self.texture_2d(DEPTH32, size, size, 0x5, 2);  // render target, shader read; private
+        if t == 0 {
+            return error.Failed;
+        }
+        return DepthBuffer.{ tex: t, width: size, height: size, sampled: true };
+    }
+
+    /// Makes d width × height (after the window's size changed).
+    pub fn resize_depth(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) !void {
+        if (width == 0) or (height == 0) or ((width == d.width) and (height == d.height)) {
+            return;
+        }
+        self.wait_idle();
+        let mut usage: u64 = 0x4;
+        if d.sampled {
+            usage = 0x5;
+        }
+        let t = self.texture_2d(DEPTH32, width, height, usage, 2);
+        if t == 0 {
+            return error.Failed;
+        }
+        objc.release(d.tex);
+        d.tex = t;
+        d.width = width;
+        d.height = height;
+    }
+
+    /// A buffer holding data (vertices or indexes).
+    pub fn buffer(self: *mut Device, data: []u8) !Buffer {
+        if data.len == 0 {
+            return error.Failed;
+        }
+        let f = @bit_cast(fn(usize, usize, *u8, u64, u64) usize, objc.msg_send());
+        let b = f(self.dev, objc.sel("newBufferWithBytes:length:options:"), data.ptr, @as(u64, data.len), 0);
+        if b == 0 {
+            return error.OutOfMemory;
+        }
+        return Buffer.{ p: b, size: @truncate(u32, data.len), mapped: objc.call(b, "contents") };
+    }
+
+    /// A constant buffer of at least `size` bytes for shaders' buffer(1),
+    /// buffer(2), ... (set_buffer), its contents written with Buffer.write.
+    pub fn constant_buffer(self: *mut Device, size: usize) !Buffer {
+        return self.upload_buffer(size);
+    }
+
+    /// A buffer of at least `size` bytes the CPU rewrites every frame (with
+    /// Buffer.write, or through Buffer.floats): vertices made each frame,
+    /// constants. Its contents start as zeros.
+    pub fn upload_buffer(self: *mut Device, size: usize) !Buffer {
+        let n = (size + 255) & ~@as(usize, 255);
+        let b = objc.call2(self.dev, "newBufferWithLength:options:", n, 0);  // shared
+        if b == 0 {
+            return error.OutOfMemory;
+        }
+        let p = objc.call(b, "contents");
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, p), n), 0);
+        return Buffer.{ p: b, size: @truncate(u32, n), mapped: p };
+    }
+
+    /// A texture holding img (converted to 8-bit RGBA), for shaders to read
+    /// (set_image).
+    pub fn texture(self: *mut Device, img: *image.Image) !Texture {
+        if (img.channels == 4) and (img.depth == image.Depth.U8) {
+            return self.texture_rgba(img);
+        }
+        let mut conv = img.convert(4, image.Depth.U8)!;
+        defer conv.deinit();
+        return self.texture_rgba(&conv);
+    }
+
+    fn texture_rgba(self: *mut Device, img: *image.Image) !Texture {
+        let w = @truncate(u32, img.width);
+        let h = @truncate(u32, img.height);
+        let t = self.texture_2d(RGBA8, w, h, 0x1, 0);  // shader read; shared
+        if t == 0 {
+            return error.Failed;
+        }
+        replace(t, w, h, img.data, img.width * 4);
+        return Texture.{ p: t, width: w, height: h };
+    }
+
+    /// A storage buffer holding data (its length a multiple of 4), for
+    /// compute shaders.
+    pub fn storage_buffer(self: *mut Device, data: []u8) !StorageBuffer {
+        if (data.len == 0) or ((data.len % 4) != 0) {
+            return error.Failed;
+        }
+        let b = self.buffer(data)!;
+        return StorageBuffer.{ p: b.p, size: b.size, mapped: b.mapped };
+    }
+
+    /// Copies a storage buffer's contents into out (as much as fits), after
+    /// what was recorded so far has run.
+    pub fn read_buffer(self: *mut Device, b: *mut StorageBuffer, out: []mut u8) !void {
+        if self.cmd != 0 {
+            self.submit()!;
+        }
+        let n = @min(out.len, @as(usize, b.size));
+        @mem_copy(out[0..n], @slice_from_ptr(@ptr_from_int(*u8, b.mapped), n));
+    }
+
+    // --- shaders and pipelines ---
+
+    /// Compiles MSL source into a library of functions; on a CompileError,
+    /// message() says why.
+    pub fn library(self: *mut Device, src: []u8) !Library {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let mut err: usize = 0;
+        let f = @bit_cast(fn(usize, usize, usize, usize, *mut usize) usize, objc.msg_send());
+        let lib = f(self.dev, objc.sel("newLibraryWithSource:options:error:"), objc.string(src), 0, &mut err);
+        if lib == 0 {
+            if err != 0 {
+                set_message(err);
+            }
+            return error.CompileError;
+        }
+        return Library.{ p: lib };
+    }
+
+    /// A root signature with `constants` 32-bit constants at buffer(0) (0:
+    /// none), and vertex input.
+    pub fn root_signature(self: *mut Device, constants: u32) !RootSignature {
+        return self.root_signature_with(constants, 0, 0);
+    }
+
+    /// A root signature with `constants` 32-bit constants at buffer(0),
+    /// `buffers` constant buffers from buffer(1) (set_buffer) and
+    /// `textures` textures from texture(0) (set_texture, set_image), for
+    /// both shaders. Samplers 0 (linear, wrapping) and 1 (the shadow
+    /// comparison) are always there.
+    pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32, textures: u32) !RootSignature {
+        _ = self;
+        if @as(usize, constants) > MAX_CONSTANTS {
+            return error.Failed;
+        }
+        return RootSignature.{ constants: constants, buffers: buffers, textures: textures };
+    }
+
+    /// A pipeline: the library's vertex and fragment functions, the vertex
+    /// layout, the topology; alpha blending when `blend`.
+    pub fn pipeline(self: *mut Device, root: *RootSignature, lib: *Library, vs: []u8, ps: []u8, attrs: []Attribute,
+                    topology: u32, blend: bool) !Pipeline {
+        let mut o = PipelineOptions.defaults();
+        o.topology = topology;
+        if blend {
+            o.blend = BLEND_ALPHA;
+        }
+        return self.pipeline_with(root, lib, vs, ps, attrs, o);
+    }
+
+    /// A pipeline drawing as `o` says: blending, the depth test (DEPTH_NONE:
+    /// for begin, without a depth buffer; others for begin_depth or
+    /// begin_shadow), culling, depth bias.
+    pub fn pipeline_with(self: *mut Device, root: *RootSignature, lib: *Library, vs: []u8, ps: []u8, attrs: []Attribute,
+                         o: PipelineOptions) !Pipeline {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let vf = objc.call1(lib.p, "newFunctionWithName:", objc.string(vs));
+        if vf == 0 {
+            set_text(vs, ": no such vertex function");
+            return error.CompileError;
+        }
+        defer objc.release(vf);
+        let mut ff: usize = 0;
+        if not o.depth_only {
+            ff = objc.call1(lib.p, "newFunctionWithName:", objc.string(ps));
+            if ff == 0 {
+                set_text(ps, ": no such fragment function");
+                return error.CompileError;
+            }
+        }
+        defer objc.release(ff);
+        let pd = objc.new("MTLRenderPipelineDescriptor");
+        defer objc.release(pd);
+        _ = objc.call1(pd, "setVertexFunction:", vf);
+        _ = objc.call1(pd, "setFragmentFunction:", ff);
+        // the vertex layout: attribute k from buffer 30 at its offset
+        let mut stride = o.stride;
+        if attrs.len > 0 {
+            let vd = objc.call(objc.class("MTLVertexDescriptor"), "vertexDescriptor");
+            let va = objc.call(vd, "attributes");
+            let mut end: u32 = 0;
+            for k in 0..attrs.len {
+                let a = objc.call1(va, "objectAtIndexedSubscript:", k);
+                _ = objc.call1(a, "setFormat:", @as(usize, attrs[k].format));
+                _ = objc.call1(a, "setOffset:", @as(usize, attrs[k].offset));
+                _ = objc.call1(a, "setBufferIndex:", @truncate(usize, VERTEX_BUFFER));
+                end = @max(end, attrs[k].offset + format_size(attrs[k].format));
+            }
+            if stride == 0 {
+                stride = (end + 3) & ~@as(u32, 3);
+            }
+            let l = objc.call1(objc.call(vd, "layouts"), "objectAtIndexedSubscript:", @truncate(usize, VERTEX_BUFFER));
+            _ = objc.call1(l, "setStride:", @as(usize, stride));
+            _ = objc.call1(l, "setStepFunction:", 1);  // per vertex
+            _ = objc.call1(l, "setStepRate:", 1);
+            _ = objc.call1(pd, "setVertexDescriptor:", vd);
+        }
+        if not o.depth_only {
+            let ca = objc.call1(objc.call(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
+            _ = objc.call1(ca, "setPixelFormat:", @truncate(usize, BGRA8));
+            if o.blend != BLEND_NONE {
+                _ = objc.send_b(ca, objc.sel("setBlendingEnabled:"), true);
+                _ = objc.call1(ca, "setRgbBlendOperation:", 0);  // add
+                _ = objc.call1(ca, "setAlphaBlendOperation:", 0);
+                _ = objc.call1(ca, "setSourceRGBBlendFactor:", 4);  // source alpha
+                if o.blend == BLEND_ALPHA {
+                    _ = objc.call1(ca, "setDestinationRGBBlendFactor:", 5);  // one minus source alpha
+                    _ = objc.call1(ca, "setSourceAlphaBlendFactor:", 1);
+                    _ = objc.call1(ca, "setDestinationAlphaBlendFactor:", 5);  // opaque stays opaque
+                } else {
+                    _ = objc.call1(ca, "setDestinationRGBBlendFactor:", 1);  // one: added
+                    _ = objc.call1(ca, "setSourceAlphaBlendFactor:", 0);
+                    _ = objc.call1(ca, "setDestinationAlphaBlendFactor:", 1);  // alpha unchanged
+                }
+            }
+        }
+        if (o.depth != DEPTH_NONE) or o.depth_only {
+            _ = objc.call1(pd, "setDepthAttachmentPixelFormat:", @truncate(usize, DEPTH32));
+        }
+        _ = objc.call1(pd, "setInputPrimitiveTopology:", @truncate(usize, topology_class(o.topology)));
+        let mut err: usize = 0;
+        let mk = @bit_cast(fn(usize, usize, usize, *mut usize) usize, objc.msg_send());
+        let p = mk(self.dev, objc.sel("newRenderPipelineStateWithDescriptor:error:"), pd, &mut err);
+        if p == 0 {
+            if err != 0 {
+                set_message(err);
+            }
+            return error.CompileError;
+        }
+        let mut ds: usize = 0;
+        if (o.depth != DEPTH_NONE) or o.depth_only {
+            let dd = objc.new("MTLDepthStencilDescriptor");
+            let mut func: usize = 7;  // always
+            if (o.depth == DEPTH_TEST) or (o.depth == DEPTH_WRITE) or o.depth_only {
+                func = 1;  // less
+            }
+            _ = objc.call1(dd, "setDepthCompareFunction:", func);
+            _ = objc.send_b(dd, objc.sel("setDepthWriteEnabled:"), (o.depth == DEPTH_WRITE) or o.depth_only);
+            ds = objc.call1(self.dev, "newDepthStencilStateWithDescriptor:", dd);
+            objc.release(dd);
+        }
+        let mut cull: u64 = 0;
+        if o.cull == CULL_FRONT {
+            cull = 1;
+        } else if o.cull == CULL_BACK {
+            cull = 2;
+        }
+        // depth bias: in steps of the depth buffer's precision at the
+        // polygon's depth, as in Direct3D
+        return Pipeline.{ p: p, depth: ds, prim: primitive(o.topology), cull: cull,
+                          depth_bias: @float_from_int(f32, o.depth_bias), slope_bias: o.slope_bias,
+                          constants: root.constants, stride: stride, group: [1, 1, 1] };
+    }
+
+    /// A root signature for compute shaders: `constants` 32-bit constants at
+    /// buffer(0) (0: none) and `storage` storage buffers from buffer(1).
+    pub fn compute_signature(self: *mut Device, constants: u32, storage: u32) !RootSignature {
+        return self.root_signature_with(constants, storage, 0);
+    }
+
+    /// A compute pipeline: the library's kernel function `name`, run in
+    /// threadgroups of gx × gy × gz threads (HLSL's [numthreads]).
+    pub fn compute_pipeline(self: *mut Device, root: *RootSignature, lib: *Library, name: []u8, gx: u32, gy: u32,
+                            gz: u32) !Pipeline {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let kf = objc.call1(lib.p, "newFunctionWithName:", objc.string(name));
+        if kf == 0 {
+            set_text(name, ": no such kernel function");
+            return error.CompileError;
+        }
+        defer objc.release(kf);
+        let mut err: usize = 0;
+        let mk = @bit_cast(fn(usize, usize, usize, *mut usize) usize, objc.msg_send());
+        let p = mk(self.dev, objc.sel("newComputePipelineStateWithFunction:error:"), kf, &mut err);
+        if p == 0 {
+            if err != 0 {
+                set_message(err);
+            }
+            return error.CompileError;
+        }
+        return Pipeline.{ p: p, depth: 0, prim: 0, cull: 0, depth_bias: 0.0, slope_bias: 0.0, constants: root.constants,
+                          stride: 0, group: [@as(u64, gx), @as(u64, gy), @as(u64, gz)] };
+    }
+
+    // --- recording a frame ---
+
+    fn open(self: *mut Device) !void {
+        if self.cmd != 0 {
+            return;
+        }
+        self.pool = objc.pool_push();
+        self.cmd = objc.call(self.queue, "commandBuffer");
+        if self.cmd == 0 {
+            objc.pool_pop(self.pool);
+            return error.Failed;
+        }
+    }
+
+    fn end_encoder(self: *mut Device) void {
+        if self.enc != 0 {
+            _ = objc.call(self.enc, "endEncoding");
+            self.enc = 0;
+        }
+        self.computing = false;
+    }
+
+    fn submit(self: *mut Device) !void {
+        if self.cmd == 0 {
+            return;
+        }
+        self.start_pending();  // (a clear with nothing drawn)
+        self.end_encoder();
+        _ = objc.call(self.cmd, "commit");
+        _ = objc.call(self.cmd, "waitUntilCompleted");
+        let failed = objc.call(self.cmd, "status") == 5;  // MTLCommandBufferStatusError
+        self.cmd = 0;
+        self.drawable = 0;
+        self.back.tex = 0;
+        self.pass_target = @ptr_from_int(*mut Target, 0);
+        self.pass_depth = @ptr_from_int(*mut DepthBuffer, 0);
+        objc.pool_pop(self.pool);
+        self.pool = 0;
+        if failed {
+            return error.Failed;
+        }
+    }
+
+    // The screen's texture for this frame: the layer's next drawable.
+    fn acquire(self: *mut Device, t: *mut Target) !void {
+        if not t.screen or (t.tex != 0) {
+            return;
+        }
+        if self.layer == 0 {
+            return error.Failed;
+        }
+        self.drawable = objc.call(self.layer, "nextDrawable");
+        if self.drawable == 0 {
+            return error.Failed;
+        }
+        t.tex = objc.call(self.drawable, "texture");
+    }
+
+    /// Starts recording a frame that draws into t (over all of it).
+    pub fn begin(self: *mut Device, t: *mut Target) !void {
+        self.begin_pass(t, @ptr_from_int(*mut DepthBuffer, 0))!;
+    }
+
+    /// Starts recording a frame that draws into t, testing depth against d
+    /// (of t's size).
+    pub fn begin_depth(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) !void {
+        if (d.width != t.width) or (d.height != t.height) {
+            return error.Failed;
+        }
+        self.begin_pass(t, d)!;
+    }
+
+    /// Starts recording (or goes on recording the frame, before begin or
+    /// begin_depth) drawing into d alone, with depth_only pipelines: a
+    /// shadow map's pass.
+    pub fn begin_shadow(self: *mut Device, d: *mut DepthBuffer) !void {
+        self.begin_pass(@ptr_from_int(*mut Target, 0), d)!;
+    }
+
+    fn begin_pass(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) !void {
+        self.open()!;
+        self.start_pending();
+        self.end_encoder();
+        if @int_from_ptr(t) != 0 {
+            self.acquire(t)!;
+        }
+        self.pass_target = t;
+        self.pass_depth = d;
+        self.clearing = false;
+        self.clearing_depth = false;
+        self.cur = @ptr_from_int(*Pipeline, 0);
+    }
+
+    // The render encoder for the pass begun, made when first needed (so
+    // that clears become its load actions).
+    fn encoder(self: *mut Device) usize {
+        if (self.enc != 0) and not self.computing {
+            return self.enc;
+        }
+        if self.computing {
+            self.end_encoder();
+        }
+        let rpd = objc.call(objc.class("MTLRenderPassDescriptor"), "renderPassDescriptor");
+        let t = self.pass_target;
+        let d = self.pass_depth;
+        let mut w: u32 = 0;
+        let mut h: u32 = 0;
+        if @int_from_ptr(t) != 0 {
+            let ca = objc.call1(objc.call(rpd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
+            _ = objc.call1(ca, "setTexture:", t.tex);
+            _ = objc.call1(ca, "setStoreAction:", 1);  // store
+            if self.clearing {
+                _ = objc.call1(ca, "setLoadAction:", 2);  // clear
+                _ = objc.send_dddd(ca, objc.sel("setClearColor:"), self.clear_color[0], self.clear_color[1],
+                                   self.clear_color[2], self.clear_color[3]);
+            } else {
+                _ = objc.call1(ca, "setLoadAction:", 1);  // load
+            }
+            w = t.width;
+            h = t.height;
+        }
+        if @int_from_ptr(d) != 0 {
+            let da = objc.call(rpd, "depthAttachment");
+            _ = objc.call1(da, "setTexture:", d.tex);
+            _ = objc.call1(da, "setStoreAction:", 1);
+            if self.clearing_depth {
+                _ = objc.call1(da, "setLoadAction:", 2);
+                _ = objc.send_d(da, objc.sel("setClearDepth:"), 1.0);
+            } else {
+                _ = objc.call1(da, "setLoadAction:", 1);
+            }
+            if w == 0 {
+                w = d.width;
+                h = d.height;
+            }
+        }
+        self.clearing = false;
+        self.clearing_depth = false;
+        self.enc = objc.call1(self.cmd, "renderCommandEncoderWithDescriptor:", rpd);
+        if self.enc == 0 {
+            return 0;
+        }
+        let vp: [6]f64 = [0.0, 0.0, @float_from_int(f64, w), @float_from_int(f64, h), 0.0, 1.0];
+        _ = objc.send1(self.enc, objc.sel("setViewport:"), @int_from_ptr(&vp[0]));  // (an MTLViewport: by address)
+        _ = objc.call1(self.enc, "setFrontFacingWinding:", 1);                      // counter-clockwise
+        _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[0], 0);
+        _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[1], 1);
+        _ = objc.call2(self.enc, "setVertexSamplerState:atIndex:", self.samplers[0], 0);
+        _ = objc.call2(self.enc, "setVertexSamplerState:atIndex:", self.samplers[1], 1);
+        self.consts_dirty = self.nconsts > 0;
+        if @int_from_ptr(self.cur) != 0 {
+            self.apply_pipeline(self.cur);
+        }
+        return self.enc;
+    }
+
+    // A clear asked for and nothing drawn since: run the pass for it.
+    fn start_pending(self: *mut Device) void {
+        if (self.cmd != 0) and (self.enc == 0) and (self.clearing or self.clearing_depth) {
+            _ = self.encoder();
+        }
+    }
+
+    pub fn clear(self: *mut Device, t: *Target, r: f32, g: f32, b: f32, a: f32) void {
+        _ = t;
+        if self.enc != 0 {
+            // drawn already: a new pass of the same targets, cleared
+            self.end_encoder();
+        }
+        self.clear_color = [@float_cast(f64, r), @float_cast(f64, g), @float_cast(f64, b), @float_cast(f64, a)];
+        self.clearing = true;
+    }
+
+    /// Clears d to the far plane (depth 1).
+    pub fn clear_depth(self: *mut Device, d: *DepthBuffer) void {
+        _ = d;
+        if self.enc != 0 {
+            self.end_encoder();
+        }
+        self.clearing_depth = true;
+    }
+
+    fn apply_pipeline(self: *mut Device, p: *Pipeline) void {
+        let e = self.enc;
+        _ = objc.call1(e, "setRenderPipelineState:", p.p);
+        if p.depth != 0 {
+            _ = objc.call1(e, "setDepthStencilState:", p.depth);
+        }
+        _ = objc.call1(e, "setCullMode:", @truncate(usize, p.cull));
+        let bias = @bit_cast(fn(usize, usize, f32, f32, f32) void, objc.msg_send());
+        bias(e, objc.sel("setDepthBias:slopeScale:clamp:"), p.depth_bias, p.slope_bias, 0.0);
+    }
+
+    /// The pipeline to draw with. Its constants, buffers and textures must
+    /// be set (again) after it.
+    pub fn set_pipeline(self: *mut Device, p: *Pipeline) void {
+        self.cur = p;
+        self.nconsts = p.constants;
+        if self.encoder() != 0 {
+            self.apply_pipeline(p);
+        }
+    }
+
+    /// Constant buffer buffer(slot + 1) of the pipeline's shaders.
+    pub fn set_buffer(self: *mut Device, slot: u32, b: *Buffer) void {
+        let e = self.encoder();
+        _ = objc.send3(e, objc.sel("setVertexBuffer:offset:atIndex:"), b.p, 0, @as(usize, slot) + 1);
+        _ = objc.send3(e, objc.sel("setFragmentBuffer:offset:atIndex:"), b.p, 0, @as(usize, slot) + 1);
+    }
+
+    /// Texture texture(slot) of the pipeline's shaders: a shadow map, drawn
+    /// earlier in the frame.
+    pub fn set_texture(self: *mut Device, slot: u32, d: *mut DepthBuffer) void {
+        let e = self.encoder();
+        _ = objc.send2(e, objc.sel("setFragmentTexture:atIndex:"), d.tex, @as(usize, slot));
+        _ = objc.send2(e, objc.sel("setVertexTexture:atIndex:"), d.tex, @as(usize, slot));
+    }
+
+    /// Texture texture(slot) of the pipeline's shaders: an image (texture).
+    pub fn set_image(self: *mut Device, slot: u32, t: *Texture) void {
+        let e = self.encoder();
+        _ = objc.send2(e, objc.sel("setFragmentTexture:atIndex:"), t.p, @as(usize, slot));
+        _ = objc.send2(e, objc.sel("setVertexTexture:atIndex:"), t.p, @as(usize, slot));
+    }
+
+    /// The pipeline's constants (buffer(0)), as 32-bit words.
+    pub fn set_constants(self: *mut Device, values: []u32) void {
+        self.set_constants_at(0, values);
+    }
+
+    /// Some of the constants, from the 32-bit word `offset` on (the others
+    /// keep their values): per-frame ones set once, per-draw ones after.
+    pub fn set_constants_at(self: *mut Device, offset: u32, values: []u32) void {
+        let at = @as(usize, offset);
+        let n = @min(values.len, MAX_CONSTANTS - @min(at, MAX_CONSTANTS));
+        @mem_copy(self.consts[at..at + n], values[0..n]);
+        self.consts_dirty = true;
+    }
+
+    fn flush_constants(self: *mut Device, e: usize) void {
+        if not self.consts_dirty or (self.nconsts == 0) {
+            return;
+        }
+        let n = @as(usize, self.nconsts) * 4;
+        let f = @bit_cast(fn(usize, usize, *u32, u64, u64) void, objc.msg_send());
+        f(e, objc.sel("setVertexBytes:length:atIndex:"), &self.consts[0], @as(u64, n), 0);
+        f(e, objc.sel("setFragmentBytes:length:atIndex:"), &self.consts[0], @as(u64, n), 0);
+        self.consts_dirty = false;
+    }
+
+    /// The vertex buffer, each vertex `stride` bytes (as the pipeline's
+    /// attributes say: its stride is fixed when it is made).
+    pub fn set_vertices(self: *mut Device, b: *Buffer, stride: u32) void {
+        _ = stride;
+        let e = self.encoder();
+        _ = objc.send3(e, objc.sel("setVertexBuffer:offset:atIndex:"), b.p, 0, @truncate(usize, VERTEX_BUFFER));
+    }
+
+    /// The index buffer, of R16_UINT or R32_UINT_INDEX indexes.
+    pub fn set_indices(self: *mut Device, b: *Buffer, format: u32) void {
+        self.index_buffer = b.p;
+        self.index_type = 1;
+        if format == R16_UINT {
+            self.index_type = 0;
+        }
+    }
+
+    pub fn draw(self: *mut Device, count: u32, first: u32) void {
+        let e = self.encoder();
+        if (e == 0) or (@int_from_ptr(self.cur) == 0) {
+            return;
+        }
+        self.flush_constants(e);
+        let f = @bit_cast(fn(usize, usize, u64, u64, u64) void, objc.msg_send());
+        f(e, objc.sel("drawPrimitives:vertexStart:vertexCount:"), self.cur.prim, @as(u64, first), @as(u64, count));
+    }
+
+    pub fn draw_indexed(self: *mut Device, count: u32, first: u32, base: i32) void {
+        let e = self.encoder();
+        if (e == 0) or (@int_from_ptr(self.cur) == 0) or (self.index_buffer == 0) {
+            return;
+        }
+        self.flush_constants(e);
+        let mut size: u64 = 4;
+        if self.index_type == 0 {
+            size = 2;
+        }
+        let f = @bit_cast(fn(usize, usize, u64, u64, u64, usize, u64, u64, i64, u64) void, objc.msg_send());
+        f(e,
+          objc.sel("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:"),
+          self.cur.prim, @as(u64, count), self.index_type, self.index_buffer, @as(u64, first) * size, 1, @as(i64, base),
+          0);
+    }
+
+    // --- computing ---
+
+    /// The compute pipeline to run (compute_pipeline): starts recording, or
+    /// goes on recording the frame. Its constants and storage buffers must
+    /// be set (again) after it.
+    pub fn set_compute_pipeline(self: *mut Device, p: *Pipeline) !void {
+        self.open()!;
+        self.start_pending();
+        if not self.computing {
+            self.end_encoder();
+            self.enc = objc.call(self.cmd, "computeCommandEncoder");
+            if self.enc == 0 {
+                return error.Failed;
+            }
+            self.computing = true;
+        }
+        _ = objc.call1(self.enc, "setComputePipelineState:", p.p);
+        self.cur = p;
+    }
+
+    /// The compute shader's constants (buffer(0)), as 32-bit words.
+    pub fn set_compute_constants(self: *mut Device, values: []u32) void {
+        if not self.computing {
+            return;
+        }
+        let f = @bit_cast(fn(usize, usize, *u32, u64, u64) void, objc.msg_send());
+        f(self.enc, objc.sel("setBytes:length:atIndex:"), values.ptr, @as(u64, values.len) * 4, 0);
+    }
+
+    /// Storage buffer buffer(slot + 1) of the compute shader.
+    pub fn set_storage(self: *mut Device, slot: u32, b: *mut StorageBuffer) void {
+        if not self.computing {
+            return;
+        }
+        _ = objc.send3(self.enc, objc.sel("setBuffer:offset:atIndex:"), b.p, 0, @as(usize, slot) + 1);
+    }
+
+    /// Runs the compute shader on x × y × z threadgroups. What it wrote is
+    /// seen by what is recorded after.
+    pub fn dispatch(self: *mut Device, x: u32, y: u32, z: u32) void {
+        if not self.computing or (@int_from_ptr(self.cur) == 0) {
+            return;
+        }
+        let groups: [3]u64 = [@as(u64, x), @as(u64, y), @as(u64, z)];
+        let threads = self.cur.group;
+        // MTLSizes (24 bytes) are passed by address
+        _ = objc.send2(self.enc, objc.sel("dispatchThreadgroups:threadsPerThreadgroup:"), @int_from_ptr(&groups[0]),
+                       @int_from_ptr(&threads[0]));
+    }
+
+    /// Draws a storage buffer's contents as the vertices.
+    pub fn set_storage_vertices(self: *mut Device, b: *mut StorageBuffer, stride: u32) void {
+        _ = stride;
+        let e = self.encoder();
+        _ = objc.send3(e, objc.sel("setVertexBuffer:offset:atIndex:"), b.p, 0, @truncate(usize, VERTEX_BUFFER));
+    }
+
+    /// Submits the frame drawn into a texture and waits for it.
+    pub fn finish(self: *mut Device) !void {
+        self.submit()!;
+    }
+
+    /// Submits the frame drawn into screen() and shows it; with vsync, at
+    /// the display's next refresh.
+    pub fn present(self: *mut Device, vsync: bool) !void {
+        if self.layer == 0 {
+            return error.Failed;
+        }
+        if vsync != self.vsync {
+            _ = objc.send_b(self.layer, objc.sel("setDisplaySyncEnabled:"), vsync);
+            self.vsync = vsync;
+        }
+        if self.cmd == 0 {
+            return;  // (nothing drawn)
+        }
+        self.start_pending();
+        self.end_encoder();
+        if self.drawable != 0 {
+            _ = objc.call1(self.cmd, "presentDrawable:", self.drawable);
+        }
+        self.submit()!;
+    }
+
+    /// The pixels of a target (after finish()), as an RGBA image (free it
+    /// with deinit).
+    pub fn read_pixels(self: *mut Device, t: *mut Target) !image.Image {
+        if self.cmd != 0 {
+            self.submit()!;
+        }
+        if t.tex == 0 {
+            return error.Failed;
+        }
+        let w = @as(usize, t.width);
+        let h = @as(usize, t.height);
+        let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
+        // getBytes:bytesPerRow:fromRegion:mipmapLevel: (an MTLRegion: by address)
+        let region: [6]u64 = [0, 0, 0, @as(u64, t.width), @as(u64, t.height), 1];
+        let f = @bit_cast(fn(usize, usize, *mut u8, u64, *u64, u64) void, objc.msg_send());
+        f(t.tex, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), img.data.ptr, @as(u64, w * 4), &region[0],
+          0);
+        // BGRA to RGBA
+        let mut i: usize = 0;
+        while i < img.data.len {
+            let b = img.data[i];
+            img.data[i] = img.data[i + 2];
+            img.data[i + 2] = b;
+            i += 4;
+        }
+        return img;
+    }
+
+    // --- 2D on top ---
+
+    /// An overlay of width × height pixels: draw into its pixels with
+    /// std/graphics/quartz (Canvas.init(width, height)), then each frame
+    /// draw_overlay(&mut ov, canvas.pixels()) after the 3D drawing.
+    pub fn overlay(self: *mut Device, width: u32, height: u32) !Overlay {
+        let mut src: [2048]u8 = [0; 2048];
+        let mut n: usize = 0;
+        for l in OVERLAY_SHADER {
+            if (n + l.len + 1) > src.len {
+                return error.Failed;
+            }
+            @mem_copy(src[n..n + l.len], l);
+            src[n + l.len] = '\n';
+            n += l.len + 1;
+        }
+        let mut lib = self.library(src[0..n])!;
+        defer lib.release();
+        let mut ov = Overlay.{ tex: 0, pipeline: self.premultiplied_pipeline(&lib)!, width: 0, height: 0 };
+        self.resize_overlay(&mut ov, width, height)!;
+        return ov;
+    }
+
+    // The overlay's pipeline: premultiplied pixels (one, one minus source alpha).
+    fn premultiplied_pipeline(self: *mut Device, lib: *Library) !usize {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let vf = objc.call1(lib.p, "newFunctionWithName:", objc.string("overlay_vs"));
+        let ff = objc.call1(lib.p, "newFunctionWithName:", objc.string("overlay_ps"));
+        defer objc.release(vf);
+        defer objc.release(ff);
+        let pd = objc.new("MTLRenderPipelineDescriptor");
+        defer objc.release(pd);
+        _ = objc.call1(pd, "setVertexFunction:", vf);
+        _ = objc.call1(pd, "setFragmentFunction:", ff);
+        let ca = objc.call1(objc.call(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
+        _ = objc.call1(ca, "setPixelFormat:", @truncate(usize, BGRA8));
+        _ = objc.send_b(ca, objc.sel("setBlendingEnabled:"), true);
+        _ = objc.call1(ca, "setSourceRGBBlendFactor:", 1);       // one
+        _ = objc.call1(ca, "setDestinationRGBBlendFactor:", 5);  // one minus source alpha
+        _ = objc.call1(ca, "setSourceAlphaBlendFactor:", 1);
+        _ = objc.call1(ca, "setDestinationAlphaBlendFactor:", 5);
+        let mut err: usize = 0;
+        let mk = @bit_cast(fn(usize, usize, usize, *mut usize) usize, objc.msg_send());
+        let p = mk(self.dev, objc.sel("newRenderPipelineStateWithDescriptor:error:"), pd, &mut err);
+        if p == 0 {
+            return error.Failed;
+        }
+        return p;
+    }
+
+    /// Makes the overlay width × height (after the window's size changed).
+    pub fn resize_overlay(self: *mut Device, ov: *mut Overlay, width: u32, height: u32) !void {
+        if (width == ov.width) and (height == ov.height) and (ov.tex != 0) {
+            return;
+        }
+        let t = self.texture_2d(BGRA8, width, height, 0x1, 0);  // shader read; shared
+        if t == 0 {
+            return error.Failed;
+        }
+        objc.release(ov.tex);
+        ov.tex = t;
+        ov.width = width;
+        ov.height = height;
+    }
+
+    /// Draws the overlay's pixels (premultiplied BGRA, width × 4 bytes a
+    /// row) over the target being drawn.
+    pub fn draw_overlay(self: *mut Device, ov: *mut Overlay, pixels: []u8) void {
+        if pixels.len < (@as(usize, ov.width) * @as(usize, ov.height) * 4) {
+            return;
+        }
+        replace(ov.tex, ov.width, ov.height, pixels, @as(usize, ov.width) * 4);
+        let e = self.encoder();
+        if e == 0 {
+            return;
+        }
+        _ = objc.call1(e, "setRenderPipelineState:", ov.pipeline);
+        _ = objc.call1(e, "setCullMode:", 0);
+        _ = objc.send2(e, objc.sel("setFragmentTexture:atIndex:"), ov.tex, 0);
+        let f = @bit_cast(fn(usize, usize, u64, u64, u64) void, objc.msg_send());
+        f(e, objc.sel("drawPrimitives:vertexStart:vertexCount:"), 3, 0, 3);
+        if @int_from_ptr(self.cur) != 0 {
+            self.apply_pipeline(self.cur);
+        }
+    }
+}
+
+// Writes rows of pixels into a shared texture.
+fn replace(tex: usize, width: u32, height: u32, data: []u8, row: usize) void {
+    // replaceRegion:mipmapLevel:withBytes:bytesPerRow: (an MTLRegion: by address)
+    let region: [6]u64 = [0, 0, 0, @as(u64, width), @as(u64, height), 1];
+    let f = @bit_cast(fn(usize, usize, *u64, u64, *u8, u64) void, objc.msg_send());
+    f(tex, objc.sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), &region[0], 0, data.ptr, @as(u64, row));
+}
+
+fn set_text(a: []u8, b: []u8) void {
+    let n = @min(a.len, compile_message.len);
+    @mem_copy(compile_message[0..n], a[0..n]);
+    let m = @min(b.len, compile_message.len - n);
+    @mem_copy(compile_message[n..n + m], b[0..m]);
+    compile_message_len = n + m;
+}
+
+fn format_size(f: u32) u32 {
+    if (f == R32_FLOAT) or (f == R32_UINT) or (f == R8G8B8A8_UNORM) {
+        return 4;
+    }
+    if f == R32G32_FLOAT {
+        return 8;
+    }
+    if f == R32G32B32_FLOAT {
+        return 12;
+    }
+    return 16;
+}
+
+fn primitive(topology: u32) u64 {
+    if topology == POINT_LIST {
+        return 0;
+    }
+    if topology == LINE_LIST {
+        return 1;
+    }
+    if topology == LINE_STRIP {
+        return 2;
+    }
+    if topology == TRIANGLE_STRIP {
+        return 4;
+    }
+    return 3;
+}
+
+fn topology_class(topology: u32) u64 {
+    if topology == POINT_LIST {
+        return 1;
+    }
+    if (topology == LINE_LIST) or (topology == LINE_STRIP) {
+        return 2;
+    }
+    return 3;
+}

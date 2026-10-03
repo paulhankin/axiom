@@ -1,0 +1,418 @@
+// =============================================================================
+// std/os/cocoa.ax - a window on the macOS desktop (AppKit) and its events
+// (keys, mouse, size, close), for drawing into with std/graphics/metal. The
+// same interface as std/os/win32 on Windows, with the same events and key
+// codes (Windows' virtual-key codes), so that a program can serve both:
+//
+//     let mut w = cocoa.Window.open("Demo", 800, 600)!;
+//     defer w.deinit();
+//     loop {
+//         let e = w.next_event();
+//         if e.kind == cocoa.EventKind.CLOSE { break; }
+//         if e.kind == cocoa.EventKind.NONE { /* draw a frame */ }
+//     }
+//
+// Sizes: open takes the content area's size in points, as the system lays
+// windows out; size, RESIZE events and mouse positions are in pixels (twice
+// the points on a Retina display), what a GPU drawing into the window
+// works in. scale() is pixels per point.
+//
+// The program becomes a regular app (in the Dock, with a menu whose Quit,
+// like the close button and Command-Q, comes to the program as a CLOSE
+// event). macOS only (--target=aarch64-macos). Windows belong to the main
+// thread, which must open them and read their events.
+// =============================================================================
+
+import "objc.ax" as objc;
+
+error { Unsupported, Failed }
+
+// (AppKit is loaded with the program because this module calls it.)
+extern "C" "AppKit" {
+    fn NSApplicationLoad() u8;
+}
+
+/// What happened (EventKind.NONE: nothing is waiting; draw a frame).
+pub enum EventKind: u8 {
+    NONE,
+    CLOSE,     // the user asked to close the window (or quit)
+    RESIZE,    // the content area is now width × height pixels
+    KEY_DOWN,  // key: a virtual-key code (KEY_*, or 'A'..'Z', '0'..'9')
+    KEY_UP,
+    MOUSE_MOVE,  // x, y: in the content area, in pixels from its top left
+    MOUSE_DOWN,  // button: 0 left, 1 right, 2 middle
+    MOUSE_UP,
+    MOUSE_WHEEL,  // delta: + away from the user, 120 per notch
+}
+
+pub struct Event {
+    kind: EventKind,
+    key: u32,
+    x: i32,
+    y: i32,
+    button: u32,
+    delta: i32,
+    width: u32,
+    height: u32,
+}
+
+// Key codes: Windows' virtual-key codes (letters and digits are their ASCII
+// capitals), as std/os/win32 has them.
+pub const KEY_BACKSPACE: u32 = 0x08;
+pub const KEY_TAB: u32 = 0x09;
+pub const KEY_ENTER: u32 = 0x0d;
+pub const KEY_SHIFT: u32 = 0x10;
+pub const KEY_CONTROL: u32 = 0x11;
+pub const KEY_ALT: u32 = 0x12;  // Option
+pub const KEY_ESCAPE: u32 = 0x1b;
+pub const KEY_SPACE: u32 = 0x20;
+pub const KEY_PAGE_UP: u32 = 0x21;
+pub const KEY_PAGE_DOWN: u32 = 0x22;
+pub const KEY_END: u32 = 0x23;
+pub const KEY_HOME: u32 = 0x24;
+pub const KEY_LEFT: u32 = 0x25;
+pub const KEY_UP: u32 = 0x26;
+pub const KEY_RIGHT: u32 = 0x27;
+pub const KEY_DOWN: u32 = 0x28;
+pub const KEY_DELETE: u32 = 0x2e;
+pub const KEY_COMMAND: u32 = 0x5b;  // (the Windows key's code)
+pub const KEY_F1: u32 = 0x70;
+
+// macOS key codes (kVK_*) to virtual-key codes; 0 for none.
+let KEYMAP: [128]u8 = [
+    'A', 'S', 'D', 'F', 'H', 'G', 'Z', 'X', 'C', 'V', 0xe2, 'B', 'Q', 'W', 'E', 'R',            // 0x00
+    'Y', 'T', '1', '2', '3', '4', '6', '5', 0xbb, '9', '7', 0xbd, '8', '0', 0xdd, 'O',          // 0x10
+    'U', 0xdb, 'I', 'P', 0x0d, 'L', 'J', 0xde, 'K', 0xba, 0xdc, 0xbc, 0xbf, 'N', 'M', 0xbe,     // 0x20
+    0x09, 0x20, 0xc0, 0x08, 0, 0x1b, 0x5c, 0x5b, 0x10, 0x14, 0x12, 0x11, 0x10, 0x12, 0x11, 0,   // 0x30
+    0x80, 0x6e, 0, 0x6a, 0, 0x6b, 0, 0x0c, 0xaf, 0xae, 0xad, 0x6f, 0x0d, 0, 0x6d, 0x81,         // 0x40
+    0x82, 0xbb, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x83, 0x68, 0x69, 0, 0, 0,      // 0x50
+    0x74, 0x75, 0x76, 0x72, 0x77, 0x78, 0, 0x7a, 0, 0x7c, 0x7f, 0x7d, 0, 0x79, 0, 0x7b,         // 0x60
+    0, 0x7e, 0x2f, 0x24, 0x21, 0x2e, 0x73, 0x23, 0x71, 0x22, 0x70, 0x25, 0x27, 0x28, 0x26, 0];  // 0x70
+
+// NSEvent types
+const EV_LEFT_DOWN: usize = 1;
+const EV_LEFT_UP: usize = 2;
+const EV_RIGHT_DOWN: usize = 3;
+const EV_RIGHT_UP: usize = 4;
+const EV_MOUSE_MOVED: usize = 5;
+const EV_LEFT_DRAGGED: usize = 6;
+const EV_RIGHT_DRAGGED: usize = 7;
+const EV_KEY_DOWN: usize = 10;
+const EV_KEY_UP: usize = 11;
+const EV_FLAGS_CHANGED: usize = 12;
+const EV_SCROLL: usize = 22;
+const EV_OTHER_DOWN: usize = 25;
+const EV_OTHER_UP: usize = 26;
+const EV_OTHER_DRAGGED: usize = 27;
+
+// NSEventModifierFlags
+const MOD_CAPS: usize = 1 << 16;
+const MOD_SHIFT: usize = 1 << 17;
+const MOD_CONTROL: usize = 1 << 18;
+const MOD_OPTION: usize = 1 << 19;
+const MOD_COMMAND: usize = 1 << 20;
+
+// What the delegate saw of each window (closing and resizing come to it, not
+// through the queue), by NSWindow.
+const MAX_WINDOWS: usize = 16;
+
+struct State {
+    win: usize,
+    closing: bool,
+    resized: bool,
+}
+
+let mut states: [16]State = [State.{ win: 0, closing: false, resized: false }; 16];
+let mut app: usize = 0;  // NSApp, once set up
+let mut delegate_class: usize = 0;
+
+fn state_of(w: usize) *mut State {
+    for k in @as(usize, 0)..MAX_WINDOWS {
+        if states[k].win == w {
+            return &mut states[k];
+        }
+    }
+    return @ptr_from_int(*mut State, 0);
+}
+
+// The window delegate's methods.
+fn should_close(self: usize, cmd: usize, sender: usize) u8 {
+    let st = state_of(sender);
+    if @int_from_ptr(st) != 0 {
+        st.closing = true;
+    }
+    return 0;  // (the program decides; deinit closes the window)
+}
+
+fn did_resize(self: usize, cmd: usize, note: usize) void {
+    let st = state_of(objc.call(note, "object"));
+    if @int_from_ptr(st) != 0 {
+        st.resized = true;
+    }
+}
+
+// The application, once: a regular app with a menu (About and Quit).
+fn setup() !void {
+    if app != 0 {
+        return;
+    }
+    _ = NSApplicationLoad();
+    let a = objc.call(objc.class("NSApplication"), "sharedApplication");
+    if a == 0 {
+        return error.Unsupported;
+    }
+    _ = objc.call1(a, "setActivationPolicy:", 0);  // NSApplicationActivationPolicyRegular
+    // the menu bar: the app's menu, holding Quit (Command-Q), which asks the
+    // key window to close (performClose:), so it comes as a CLOSE event
+    let bar = objc.new("NSMenu");
+    let item = objc.new("NSMenuItem");
+    _ = objc.call1(bar, "addItem:", item);
+    let menu = objc.new("NSMenu");
+    let name = objc.call(objc.call(objc.class("NSProcessInfo"), "processInfo"), "processName");
+    let quit_title = objc.call1(objc.string("Quit "), "stringByAppendingString:", name);
+    let quit = objc.send3(objc.alloc("NSMenuItem"), objc.sel("initWithTitle:action:keyEquivalent:"), quit_title,
+                          objc.sel("performClose:"), objc.string("q"));
+    _ = objc.call1(menu, "addItem:", quit);
+    objc.release(quit);
+    _ = objc.call1(item, "setSubmenu:", menu);
+    _ = objc.call1(a, "setMainMenu:", bar);
+    objc.release(menu);
+    objc.release(item);
+    objc.release(bar);
+    _ = objc.call(a, "finishLaunching");
+    // the delegate class, whose methods are Axiom functions
+    delegate_class = objc.class("AxiomWindowDelegate");
+    if delegate_class == 0 {
+        delegate_class = objc.define_class("AxiomWindowDelegate", "NSObject");
+        if delegate_class == 0 {
+            return error.Failed;
+        }
+        _ = objc.add_method(delegate_class, "windowShouldClose:", @bit_cast(usize, should_close), "c@:@");
+        _ = objc.add_method(delegate_class, "windowDidResize:", @bit_cast(usize, did_resize), "v@:@");
+        _ = objc.add_method(delegate_class, "windowDidChangeBackingProperties:", @bit_cast(usize, did_resize), "v@:@");
+        objc.register_class(delegate_class);
+    }
+    app = a;
+}
+
+pub struct Window {
+    win: usize,       // NSWindow
+    view: usize,      // its content view
+    delegate: usize,  // AxiomWindowDelegate
+    buttons: u32,     // mouse buttons down (bits), for drags
+    mods: usize,      // modifier keys down (NSEventModifierFlags)
+
+    /// Opens a window whose content area (the part to draw in) is width ×
+    /// height points, in the middle of the screen, in front.
+    pub fn open(title: []u8, width: u32, height: u32) !Window {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        setup()!;
+        let st = state_of(0);
+        if @int_from_ptr(st) == 0 {
+            return error.Failed;  // (too many windows)
+        }
+        // initWithContentRect:styleMask:backing:defer: (titled, closable,
+        // miniaturizable, resizable; buffered)
+        let f = @bit_cast(fn(usize, usize, f64, f64, f64, f64, u64, u64, u8) usize, objc.msg_send());
+        let w = f(objc.alloc("NSWindow"), objc.sel("initWithContentRect:styleMask:backing:defer:"), 0.0, 0.0,
+                  @float_from_int(f64, width), @float_from_int(f64, height), 15, 2, 0);
+        if w == 0 {
+            return error.Failed;
+        }
+        _ = objc.send_b(w, objc.sel("setReleasedWhenClosed:"), false);
+        _ = objc.call1(w, "setTitle:", objc.string(title));
+        _ = objc.send_b(w, objc.sel("setAcceptsMouseMovedEvents:"), true);
+        let d = objc.new("AxiomWindowDelegate");
+        _ = objc.call1(w, "setDelegate:", d);
+        let view = objc.call(w, "contentView");
+        st.* = State.{ win: w, closing: false, resized: false };
+        _ = objc.call(w, "center");
+        _ = objc.call1(w, "makeKeyAndOrderFront:", 0);
+        _ = objc.send_b(app, objc.sel("activateIgnoringOtherApps:"), true);
+        return Window.{ win: w, view: view, delegate: d, buttons: 0, mods: 0 };
+    }
+
+    pub fn deinit(self: *mut Window) void {
+        if self.win == 0 {
+            return;
+        }
+        let pool = objc.pool_push();
+        let st = state_of(self.win);
+        if @int_from_ptr(st) != 0 {
+            st.win = 0;
+        }
+        _ = objc.call1(self.win, "setDelegate:", 0);
+        _ = objc.call(self.win, "close");
+        objc.release(self.win);
+        objc.release(self.delegate);
+        objc.pool_pop(pool);
+        self.win = 0;
+        self.view = 0;
+        self.delegate = 0;
+    }
+
+    /// The window's content view (an NSView), for std/graphics/metal.
+    pub fn handle(self: *Window) usize {
+        return self.view;
+    }
+
+    /// The NSWindow.
+    pub fn ns_window(self: *Window) usize {
+        return self.win;
+    }
+
+    /// Pixels per point: 2 on a Retina display, 1 on others.
+    pub fn scale(self: *Window) f64 {
+        let s = objc.send_f64(self.win, objc.sel("backingScaleFactor"));
+        if s <= 0.0 {
+            return 1.0;
+        }
+        return s;
+    }
+
+    /// The content area's size in pixels: width, height.
+    pub fn size(self: *Window) [2]u32 {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let r = objc.get_f64x4(self.view, "frame");
+        let s = self.scale();
+        return [@int_from_float(u32, @nearest(r[2] * s)), @int_from_float(u32, @nearest(r[3] * s))];
+    }
+
+    pub fn set_title(self: *Window, title: []u8) void {
+        let pool = objc.pool_push();
+        _ = objc.call1(self.win, "setTitle:", objc.string(title));
+        objc.pool_pop(pool);
+    }
+
+    /// The next event, without waiting (EventKind.NONE when none is left).
+    pub fn next_event(self: *mut Window) Event {
+        let mut e = Event.{ kind: EventKind.NONE, key: 0, x: 0, y: 0, button: 0, delta: 0, width: 0, height: 0 };
+        let st = state_of(self.win);
+        loop {
+            if @int_from_ptr(st) != 0 {
+                if st.closing {
+                    st.closing = false;
+                    e.kind = EventKind.CLOSE;
+                    return e;
+                }
+                if st.resized {
+                    st.resized = false;
+                    let sz = self.size();
+                    e.kind = EventKind.RESIZE;
+                    e.width = sz[0];
+                    e.height = sz[1];
+                    return e;
+                }
+            }
+            let pool = objc.pool_push();
+            // nextEventMatchingMask:untilDate:inMode:dequeue: (any event, not waiting)
+            let next = @bit_cast(fn(usize, usize, u64, usize, usize, u8) usize, objc.msg_send());
+            let past = objc.call(objc.class("NSDate"), "distantPast");
+            let ev = next(app, objc.sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), ~@as(u64, 0), past,
+                          objc.string("kCFRunLoopDefaultMode"), 1);
+            if ev == 0 {
+                objc.pool_pop(pool);
+                return e;
+            }
+            let got = self.translate(ev, &mut e);
+            objc.pool_pop(pool);
+            if got {
+                return e;
+            }
+        }
+    }
+
+    // Turns an NSEvent into e, passing on to AppKit what it should see
+    // (everything but keys typed without Command, which would beep); false
+    // if it is nothing for the program.
+    fn translate(self: *mut Window, ev: usize, e: *mut Event) bool {
+        let ty = objc.call(ev, "type");
+        let mine = objc.call(ev, "window") == self.win;
+        if (ty == EV_KEY_DOWN) or (ty == EV_KEY_UP) {
+            let flags = objc.call(ev, "modifierFlags");
+            let code = objc.call(ev, "keyCode") & 0x7f;
+            if (flags & MOD_COMMAND) != 0 {
+                _ = objc.call1(app, "sendEvent:", ev);  // menu shortcuts: Command-Q
+                return false;
+            }
+            if not mine or (KEYMAP[code] == 0) {
+                return false;
+            }
+            e.kind = EventKind.KEY_DOWN;
+            if ty == EV_KEY_UP {
+                e.kind = EventKind.KEY_UP;
+            }
+            e.key = @as(u32, KEYMAP[code]);
+            return true;
+        }
+        _ = objc.call1(app, "sendEvent:", ev);
+        if not mine {
+            return false;
+        }
+        if ty == EV_FLAGS_CHANGED {
+            // a modifier key went down or up: which, from the flags that changed
+            let flags = objc.call(ev, "modifierFlags");
+            let changed = flags ^ self.mods;
+            self.mods = flags;
+            let bits: [5]usize = [MOD_SHIFT, MOD_CONTROL, MOD_OPTION, MOD_COMMAND, MOD_CAPS];
+            let keys: [5]u32 = [KEY_SHIFT, KEY_CONTROL, KEY_ALT, KEY_COMMAND, 0x14];
+            for k in @as(usize, 0)..5 {
+                if (changed & bits[k]) != 0 {
+                    e.key = keys[k];
+                    e.kind = EventKind.KEY_UP;
+                    if (flags & bits[k]) != 0 {
+                        e.kind = EventKind.KEY_DOWN;
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+        if ty == EV_SCROLL {
+            let dy = objc.send_f64(ev, objc.sel("scrollingDeltaY"));
+            let mut per: f64 = 120.0;  // a wheel's notch
+            if objc.send_bool(ev, objc.sel("hasPreciseScrollingDeltas")) {
+                per = 12.0;  // a trackpad's points: ten to a notch
+            }
+            e.kind = EventKind.MOUSE_WHEEL;
+            e.delta = @int_from_float(i32, @nearest(@max(@min(dy * per, 1.0e6), -1.0e6)));
+            return e.delta != 0;
+        }
+        let mut b: u32 = 3;
+        if (ty == EV_LEFT_DOWN) or (ty == EV_LEFT_UP) {
+            b = 0;
+        } else if (ty == EV_RIGHT_DOWN) or (ty == EV_RIGHT_UP) {
+            b = 1;
+        } else if (ty == EV_OTHER_DOWN) or (ty == EV_OTHER_UP) {
+            b = 2;
+        }
+        let down = (ty == EV_LEFT_DOWN) or (ty == EV_RIGHT_DOWN) or (ty == EV_OTHER_DOWN);
+        let up = (ty == EV_LEFT_UP) or (ty == EV_RIGHT_UP) or (ty == EV_OTHER_UP);
+        let moved = (ty == EV_MOUSE_MOVED) or (ty == EV_LEFT_DRAGGED) or (ty == EV_RIGHT_DRAGGED) or
+                    (ty == EV_OTHER_DRAGGED);
+        if not down and not up and not moved {
+            return false;
+        }
+        // where: in the window's coordinates (from its bottom left, in
+        // points), to the content area's pixels from its top left
+        let p = objc.get_f64x2(ev, "locationInWindow");
+        let r = objc.get_f64x4(self.view, "frame");
+        let s = self.scale();
+        e.x = @int_from_float(i32, @nearest(p[0] * s));
+        e.y = @int_from_float(i32, @nearest((r[3] - p[1]) * s));
+        if down {
+            e.kind = EventKind.MOUSE_DOWN;
+            e.button = b;
+            self.buttons = self.buttons | (@as(u32, 1) << b);
+        } else if up {
+            e.kind = EventKind.MOUSE_UP;
+            e.button = b;
+            self.buttons = self.buttons & ~(@as(u32, 1) << b);
+        } else {
+            e.kind = EventKind.MOUSE_MOVE;
+        }
+        return true;
+    }
+}

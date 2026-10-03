@@ -28,16 +28,34 @@ stage() {
 
 make -C compiler --no-print-directory
 mkdir -p $B
-stage compiler/build/axiom $B/axiom1 1
-stage $B/axiom1 $B/axiom2 2
-stage $B/axiom2 $B/axiom3 3
+if [ "$(uname -s)" = Darwin ]; then
+    # The C compiler does not build native Mac programs (issues/0013), but it
+    # builds WebAssembly: stage 1 is the self-hosted compiler for wasm32,
+    # run under node, building itself for the Mac.
+    echo "stage 1: compiler/build/axiom -> $B/axiom1.wasm (node) -> $B/axiom1"
+    start=$(date +%s)
+    # shellcheck disable=SC2086
+    compiler/build/axiom build selfhost/src/main.ax --target=wasm32 $OPT -o $B/axiom1.wasm
+    # shellcheck disable=SC2086
+    node runtime/host.mjs $B/axiom1.wasm -- build selfhost/src/main.ax --target=native $OPT -o $B/axiom1
+    echo "         $(($(date +%s) - start)) s, $(wc -c < "$B/axiom1") bytes"
+else
+    stage compiler/build/axiom $B/axiom1 1
+fi
+# (stages 2 and 3 have the same file name: a Mac executable's code
+# signature holds it)
+mkdir -p $B/stage2 $B/stage3
+stage $B/axiom1 $B/stage2/axiom 2
+stage $B/stage2/axiom $B/stage3/axiom 3
 
-if ! cmp -s $B/axiom2 $B/axiom3; then
+if ! cmp -s $B/stage2/axiom $B/stage3/axiom; then
     echo "bootstrap FAILED: stage 2 and stage 3 differ (the self-hosted compiler is not at a fixed point)" >&2
     exit 1
 fi
 echo "fixed point: stage 2 and stage 3 are bit-identical"
-cp $B/axiom2 $B/axiom
+cp $B/stage2/axiom $B/axiom2
+rm -f $B/axiom
+cp $B/stage2/axiom $B/axiom
 
 if [ "$CROSS" = 1 ]; then
     # The compiler built for the other architecture must generate the same

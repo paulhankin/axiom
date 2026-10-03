@@ -29,10 +29,12 @@ pub extern "C" {
     fn openat(dir: i32, path: *u8, flags: i32, ...) i32;
     fn close(fd: i32) i32;
     fn dup(fd: i32) i32;
+    fn dup2(fd: i32, to: i32) i32;
     fn fcntl(fd: i32, cmd: i32, ...) i32;
     fn lseek(fd: i32, off: i64, whence: i32) i64;
     fn stat(path: *u8, st: *mut u8) i32;
     fn lstat(path: *u8, st: *mut u8) i32;
+    fn fstat(fd: i32, st: *mut u8) i32;
     fn mkdir(path: *u8, mode: u16) i32;
     fn rmdir(path: *u8) i32;
     fn unlink(path: *u8) i32;
@@ -79,6 +81,8 @@ pub extern "C" {
     fn posix_spawnattr_setflags(attr: *mut usize, flags: i16) i32;
     fn sigaction(sig: i32, act: *void, old: *mut void) i32;
     fn sigaltstack(ss: *StackT, old: *mut StackT) i32;
+    fn setitimer(which: i32, value: *void, old: *mut void) i32;
+    fn setrlimit(resource: i32, rl: *void) i32;
     fn malloc(n: usize) *mut void;
     fn calloc(n: usize, size: usize) *mut void;
     fn free(p: *mut void) void;
@@ -159,7 +163,7 @@ pub struct SigActionInfo {
     flags: i32,
 }
 
-fn set_action(sig: i32, sa: *void) i32 {
+pub fn set_action(sig: i32, sa: *void) i32 {
     return sigaction(sig, sa, vnull());
 }
 
@@ -289,14 +293,14 @@ fn fs_err() i32 {
 let SIG_ABI_TO_DARWIN: [32]i32 = [0, 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15, 0, 20, 19, 17, 18, 21, 22, 16,
                                   24, 25, 26, 27, 28, 23, 0, 12];
 
-fn darwin_sig(abi: i32) i32 {
+pub fn darwin_sig(abi: i32) i32 {
     if (abi < 1) or (abi > 31) {
         return 0;
     }
     return SIG_ABI_TO_DARWIN[@as(usize, @bit_cast(u32, abi))];
 }
 
-fn abi_sig(d: i32) i32 {
+pub fn abi_sig(d: i32) i32 {
     for i in @as(usize, 1)..32 {
         if SIG_ABI_TO_DARWIN[i] == d {
             return @truncate(i32, @bit_cast(isize, i));
@@ -628,6 +632,7 @@ export fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
 }
 
 export fn ax_exit(code: i32) void {
+    ax_rt_fini();
     exit(code);
 }
 
@@ -644,6 +649,9 @@ export fn ax_fork() i32 {
     let pid = fork();
     if pid < 0 {
         return AX_ERR;
+    }
+    if pid == 0 {
+        install_crash_stack();  // a forked child has no signal stack on macOS
     }
     return pid;
 }
@@ -1647,8 +1655,287 @@ export fn ax_msync(addr: usize, len: usize) i32 {
 
 // Watching: a kqueue, with a descriptor per path (the watch's number) and
 // EVFILT_VNODE events, reported as inotify's records (as std/os/fs reads
-// them): changes to a directory's entries arrive as the directory being
-// modified, with no name.
+// them). kqueue says only that a directory changed, not which entries did,
+// and nothing when a file in it is written; so each watched directory keeps
+// a snapshot of its entries. When it changes it is read again and the
+// difference reported (IN_CREATE, IN_DELETE with the entry's name), and
+// each regular file in it has a kqueue watch of its own (IN_MODIFY,
+// IN_ATTRIB with its name). A rescan whose records do not fit in the
+// caller's buffer stays pending, and the next read finishes it.
+struct WEnt {
+    name: usize,  // malloc'd, NUL-terminated; 0 for a free slot
+    len: usize,
+    isdir: bool,
+    fd: i32,     // the entry's own watch, -1 for none
+    seen: bool,  // in the latest scan
+}
+
+struct WDir {
+    kq: i32,  // the Watcher's kqueue; -1 for a free slot
+    fd: i32,  // the descriptor kqueue watches: the watch's number
+    isdir: bool,
+    dirty: bool,  // changed since the last complete rescan
+    path: usize,  // malloc'd, NUL-terminated
+    ents: usize,  // *mut WEnt
+    n: usize,
+    cap: usize,
+}
+
+let mut wdirs: usize = 0;  // *mut WDir
+let mut nwdirs: usize = 0;
+let mut capwdirs: usize = 0;
+let mut watch_lock: u32 = 0;
+
+const IN_MODIFY: u32 = 0x2;
+const IN_ATTRIB: u32 = 0x4;
+const IN_CREATE: u32 = 0x100;
+const IN_DELETE: u32 = 0x200;
+const IN_DELETE_SELF: u32 = 0x400;
+const IN_MOVE_SELF: u32 = 0x800;
+const IN_ISDIR: u32 = 0x4000_0000;
+const O_NONBLOCK: i32 = 0x4;
+
+fn lock_watches() void {
+    while @atomic_xchg(&mut watch_lock, 1) != 0 {}
+}
+
+fn unlock_watches() void {
+    _ = @atomic_xchg(&mut watch_lock, 0);
+}
+
+fn wdir(i: usize) *mut WDir {
+    return @ptr_from_int(*mut WDir, wdirs + (i * @size_of(WDir)));
+}
+
+fn went(w: *WDir, i: usize) *mut WEnt {
+    return @ptr_from_int(*mut WEnt, w.ents + (i * @size_of(WEnt)));
+}
+
+fn went_name(e: *WEnt) []u8 {
+    return @slice_from_ptr(@ptr_from_int(*u8, e.name), e.len);
+}
+
+// A larger copy of an array of n items of size sz (the old one freed);
+// 0 if there is no memory.
+fn grow(p: usize, n: usize, sz: usize, cap: usize) usize {
+    let q = @int_from_ptr(calloc(cap, sz));
+    if (q != 0) and (n > 0) {
+        @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, q), n * sz), @slice_from_ptr(@ptr_from_int(*u8, p), n * sz));
+    }
+    if (q != 0) and (p != 0) {
+        free(@ptr_from_int(*mut void, p));
+    }
+    return q;
+}
+
+// struct kevent: ident u64, filter i16, flags u16, fflags u32, data i64, udata
+fn kev(b: []mut u8, ident: u64, filter: i16, flags: u16, fflags: u32, udata: u64) void {
+    @mem_set(b[0..32], 0);
+    @ptr_cast(*mut u64, &mut b[0]).* = ident;
+    @ptr_cast(*mut i16, &mut b[8]).* = filter;
+    @ptr_cast(*mut u16, &mut b[10]).* = flags;
+    @ptr_cast(*mut u32, &mut b[12]).* = fflags;
+    @ptr_cast(*mut u64, &mut b[24]).* = udata;
+}
+
+// Adds a vnode watch for fd to kq (EV_ADD | EV_CLEAR; NOTE_DELETE | WRITE |
+// EXTEND | ATTRIB | RENAME), tagged with udata.
+fn kq_watch(kq: i32, fd: i32, udata: u64) bool {
+    let mut ev: [32]u8 = [0; 32];
+    kev(ev[..], @as(u64, @bit_cast(u32, fd)), -4, 0x21, 0x2f, udata);
+    return kevent(kq, &ev[0], 1, nil_ptr.[u8](), 0, @ptr_from_int(*Timespec, 0)) >= 0;
+}
+
+// Appends an inotify record (struct inotify_event: wd, mask, cookie, len,
+// then the name padded with NULs); false if it does not fit.
+fn put_rec(out: []mut u8, at: *mut usize, wd: i32, mask: u32, name: []u8) bool {
+    let mut nl: usize = 0;
+    if name.len > 0 {
+        nl = align_up(name.len + 1, 4);
+    }
+    let w = at.*;
+    if (w + 16 + nl) > out.len {
+        return false;
+    }
+    @ptr_cast(*mut i32, &mut out[w]).* = wd;
+    @ptr_cast(*mut u32, &mut out[w + 4]).* = mask;
+    @ptr_cast(*mut u32, &mut out[w + 8]).* = 0;
+    @ptr_cast(*mut u32, &mut out[w + 12]).* = @truncate(u32, nl);
+    if nl > 0 {
+        @mem_set(out[w + 16..w + 16 + nl], 0);
+        @mem_copy(out[w + 16..w + 16 + name.len], name);
+    }
+    at.* = w + 16 + nl;
+    return true;
+}
+
+fn ent_release(e: *mut WEnt) void {
+    if e.fd >= 0 {
+        _ = close(e.fd);  // (its events go with it)
+        e.fd = -1;
+    }
+    if e.name != 0 {
+        free(@ptr_from_int(*mut void, e.name));
+    }
+    e.name = 0;
+    e.len = 0;
+}
+
+// Records entry `name` in w's snapshot, with a watch of its own if it is a
+// regular file; false if there is no memory.
+fn ent_add(w: *mut WDir, slot: usize, name: []u8, ty: u8) bool {
+    let mut k = w.n;
+    for i in @as(usize, 0)..w.n {
+        if went(w, i).name == 0 {
+            k = i;
+            break;
+        }
+    }
+    if k == w.n {
+        if w.n == w.cap {
+            let nc = (w.cap * 2) + 16;
+            let q = grow(w.ents, w.n, @size_of(WEnt), nc);
+            if q == 0 {
+                return false;
+            }
+            w.ents = q;
+            w.cap = nc;
+        }
+        w.n += 1;
+    }
+    let p = @int_from_ptr(malloc(name.len + 1));
+    if p == 0 {
+        return false;
+    }
+    let dst = @slice_from_ptr(@ptr_from_int(*mut u8, p), name.len + 1);
+    @mem_copy(dst[0..name.len], name);
+    dst[name.len] = 0;
+    let e = went(w, k);
+    e.name = p;
+    e.len = name.len;
+    e.isdir = ty == 4;  // DT_DIR
+    e.fd = -1;
+    e.seen = true;
+    if ty == 8 {  // DT_REG: a watch of its own (it may fail: too many open files)
+        let mut full: [4096]u8 = [0; 4096];
+        let dir = @slice_from_ptr(@ptr_from_int(*u8, w.path), cstr_len(@ptr_from_int(*u8, w.path)));
+        if (dir.len + name.len + 2) <= full.len {
+            @mem_copy(full[0..dir.len], dir);
+            full[dir.len] = '/';
+            @mem_copy(full[dir.len + 1..dir.len + 1 + name.len], name);
+            full[dir.len + 1 + name.len] = 0;
+            let fd = open(&full[0], (O_EVTONLY | O_CLOEXEC) | O_NONBLOCK, @as(i32, 0));
+            if fd >= 0 {
+                let tag = ((@as(u64, slot) + 1) << 32) | (@as(u64, k) + 1);
+                if kq_watch(w.kq, fd, tag) {
+                    e.fd = fd;
+                } else {
+                    _ = close(fd);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Reads w's directory again and reports the difference from its snapshot
+// (when out is given), updating the snapshot as far as the records fit.
+// False if some did not fit: the rest stay for the next rescan.
+fn rescan(w: *mut WDir, slot: usize, out: []mut u8, at: *mut usize, emit: bool) bool {
+    let d = opendir(@ptr_from_int(*u8, w.path));
+    if @int_from_ptr(d) == 0 {
+        return true;  // gone: IN_DELETE_SELF comes from its own watch
+    }
+    for i in @as(usize, 0)..w.n {
+        went(w, i).seen = false;
+    }
+    let mut complete = true;
+    loop {
+        let e = readdir(d);
+        if @int_from_ptr(e) == 0 {
+            break;
+        }
+        // struct dirent: d_namlen (u16) at 18, d_type at 20, d_name at 21
+        let ent = @slice_from_ptr(e, 21);
+        let n = @as(usize, ent[18]) | (@as(usize, ent[19]) << 8);
+        let name = @slice_from_ptr(@ptr_from_int(*u8, @int_from_ptr(e) + 21), n);
+        if ((n == 1) and (name[0] == '.')) or ((n == 2) and (name[0] == '.') and (name[1] == '.')) {
+            continue;
+        }
+        let mut found = false;
+        for i in @as(usize, 0)..w.n {
+            let we = went(w, i);
+            if (we.name != 0) and not we.seen and (we.len == n) and str_eq(went_name(we), name) {
+                we.seen = true;
+                found = true;
+                break;
+            }
+        }
+        if found {
+            continue;
+        }
+        let mut mask = IN_CREATE;
+        if ent[20] == 4 {
+            mask = mask | IN_ISDIR;
+        }
+        if emit and not put_rec(out, at, w.fd, mask, name) {
+            complete = false;  // (not in the snapshot: reported next time)
+            continue;
+        }
+        if not ent_add(w, slot, name, ent[20]) {
+            complete = false;
+        }
+    }
+    _ = closedir(d);
+    for i in @as(usize, 0)..w.n {
+        let we = went(w, i);
+        if (we.name == 0) or we.seen {
+            continue;
+        }
+        let mut mask = IN_DELETE;
+        if we.isdir {
+            mask = mask | IN_ISDIR;
+        }
+        if emit and not put_rec(out, at, w.fd, mask, went_name(we)) {
+            complete = false;
+            continue;
+        }
+        ent_release(we);
+    }
+    return complete;
+}
+
+fn str_eq(a: []u8, b: []u8) bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn wdir_release(w: *mut WDir) void {
+    for i in @as(usize, 0)..w.n {
+        ent_release(went(w, i));
+    }
+    if w.ents != 0 {
+        free(@ptr_from_int(*mut void, w.ents));
+    }
+    if w.path != 0 {
+        free(@ptr_from_int(*mut void, w.path));
+    }
+    _ = close(w.fd);
+    w.kq = -1;
+    w.fd = -1;
+    w.ents = 0;
+    w.path = 0;
+    w.n = 0;
+    w.cap = 0;
+}
+
 export fn ax_watch_open() i32 {
     let kq = kqueue();
     if kq < 0 {
@@ -1656,15 +1943,6 @@ export fn ax_watch_open() i32 {
     }
     cloexec(kq);
     return kq;
-}
-
-// struct kevent: ident u64, filter i16, flags u16, fflags u32, data i64, udata
-fn kev(b: []mut u8, ident: u64, filter: i16, flags: u16, fflags: u32) void {
-    @mem_set(b[0..32], 0);
-    @ptr_cast(*mut u64, &mut b[0]).* = ident;
-    @ptr_cast(*mut i16, &mut b[8]).* = filter;
-    @ptr_cast(*mut u16, &mut b[10]).* = flags;
-    @ptr_cast(*mut u32, &mut b[12]).* = fflags;
 }
 
 export fn ax_watch_add(h: i32, path: *u8, len: usize) i32 {
@@ -1676,78 +1954,204 @@ export fn ax_watch_add(h: i32, path: *u8, len: usize) i32 {
     if fd < 0 {
         return fs_err();
     }
-    let mut ev: [32]u8 = [0; 32];
-    // EVFILT_VNODE, EV_ADD | EV_CLEAR; NOTE_DELETE | WRITE | EXTEND | ATTRIB | RENAME
-    kev(ev[..], @as(u64, @bit_cast(u32, fd)), -4, 0x21, 0x2f);
-    if kevent(h, &ev[0], 1, nil_ptr.[u8](), 0, @ptr_from_int(*Timespec, 0)) < 0 {
+    let mut st: [144]u8 = [0; 144];
+    if fstat(fd, &mut st[0]) != 0 {
         _ = close(fd);
         return AX_ERR;
     }
+    let mode = @as(u32, st[4]) | (@as(u32, st[5]) << 8);  // st_mode (u16) at 4
+    let pc = @int_from_ptr(malloc(len + 1));
+    if pc == 0 {
+        _ = close(fd);
+        return AX_ERR;
+    }
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, pc), len + 1), p[0..len + 1]);
+    lock_watches();
+    let mut slot = nwdirs;
+    for i in @as(usize, 0)..nwdirs {
+        if wdir(i).kq < 0 {
+            slot = i;
+            break;
+        }
+    }
+    if slot == nwdirs {
+        if nwdirs == capwdirs {
+            let nc = (capwdirs * 2) + 8;
+            let q = grow(wdirs, nwdirs, @size_of(WDir), nc);
+            if q == 0 {
+                unlock_watches();
+                free(@ptr_from_int(*mut void, pc));
+                _ = close(fd);
+                return AX_ERR;
+            }
+            wdirs = q;
+            capwdirs = nc;
+        }
+        nwdirs += 1;
+    }
+    let w = wdir(slot);
+    w.* = WDir.{ kq: h, fd: fd, isdir: (mode & 0o170000) == 0o040000, dirty: false, path: pc, ents: 0, n: 0, cap: 0 };
+    if not kq_watch(h, fd, @as(u64, slot) + 1) {
+        wdir_release(w);
+        unlock_watches();
+        return AX_ERR;
+    }
+    if w.isdir {
+        let mut none: [1]u8 = [0];
+        let mut at: usize = 0;
+        _ = rescan(w, slot, none[..], &mut at, false);
+    }
+    unlock_watches();
     return fd;
 }
 
 export fn ax_watch_remove(h: i32, wd: i32) i32 {
-    if close(wd) != 0 {  // (its events go with it)
-        return AX_ERR;
+    lock_watches();
+    for i in @as(usize, 0)..nwdirs {
+        let w = wdir(i);
+        if (w.kq == h) and (w.fd == wd) {
+            wdir_release(w);
+            unlock_watches();
+            return 0;
+        }
     }
-    return 0;
+    unlock_watches();
+    return AX_ERR;
+}
+
+// Turns kqueue events into records in out from at; returns the new end.
+fn watch_events(h: i32, evs: []u8, n: usize, out: []mut u8, at0: usize) usize {
+    let mut at = at0;
+    for k in 0..n {
+        let e = evs[k * 32..(k + 1) * 32];
+        let ff = @as(u32, e[12]) | (@as(u32, e[13]) << 8);
+        let tag = @bit_cast(u64, le64(e, 24));
+        let hi = tag >> 32;
+        let lo = tag & 0xffff_ffff;
+        if hi != 0 {
+            // a file in a watched directory
+            let slot = @truncate(usize, hi - 1);
+            if slot >= nwdirs {
+                continue;
+            }
+            let w = wdir(slot);
+            let idx = @truncate(usize, lo - 1);
+            if (w.kq != h) or (idx >= w.n) {
+                continue;
+            }
+            let we = went(w, idx);
+            if we.name == 0 {
+                continue;
+            }
+            if (ff & 0x6) != 0 {  // NOTE_WRITE / NOTE_EXTEND
+                _ = put_rec(out, &mut at, w.fd, IN_MODIFY, went_name(we));
+            }
+            if (ff & 0x8) != 0 {  // NOTE_ATTRIB
+                _ = put_rec(out, &mut at, w.fd, IN_ATTRIB, went_name(we));
+            }
+            if (ff & 0x21) != 0 {  // NOTE_DELETE / NOTE_RENAME: the directory knows which
+                w.dirty = true;
+            }
+            continue;
+        }
+        if (lo == 0) or (@truncate(usize, lo - 1) >= nwdirs) {
+            continue;
+        }
+        let slot = @truncate(usize, lo - 1);
+        let w = wdir(slot);
+        if w.kq != h {
+            continue;
+        }
+        if w.isdir {
+            if (ff & 0x6) != 0 {
+                w.dirty = true;  // its entries changed: rescanned below
+            }
+        } else if (ff & 0x6) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_MODIFY, "");
+        }
+        if (ff & 0x8) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_ATTRIB, "");
+        }
+        if (ff & 0x1) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_DELETE_SELF, "");
+        }
+        if (ff & 0x20) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_MOVE_SELF, "");
+        }
+    }
+    return at;
+}
+
+// Rescans h's changed directories; returns the new end of the records.
+fn watch_rescans(h: i32, out: []mut u8, at0: usize) usize {
+    let mut at = at0;
+    for i in @as(usize, 0)..nwdirs {
+        let w = wdir(i);
+        if (w.kq == h) and w.dirty {
+            if rescan(w, i, out, &mut at, true) {
+                w.dirty = false;
+            }
+        }
+    }
+    return at;
 }
 
 // Waits up to timeout_ms (-1: for ever) for events; returns the bytes of
 // records written to buf (0: timed out).
 export fn ax_watch_read(h: i32, buf: *mut u8, cap: usize, timeout_ms: i32) isize {
     let mut evs: [512]u8 = [0; 512];  // 16 events
-    let mut max: i32 = @truncate(i32, @bit_cast(isize, cap / 16));
-    if max > 16 {
-        max = 16;
-    }
-    if max < 1 {
+    let out = @slice_from_ptr(buf, cap);
+    if cap < 16 {
         return @as(isize, AX_ERR);
     }
-    let mut ts = Timespec.{ sec: @as(i64, timeout_ms / 1000), nsec: @as(i64, timeout_ms % 1000) * 1000000 };
-    let mut tsp = @ptr_cast(*Timespec, &ts);
-    if timeout_ms < 0 {
-        tsp = @ptr_from_int(*Timespec, 0);
+    let deadline = ax_clock_ns(1) + (@as(i64, timeout_ms) * 1000000);
+    lock_watches();
+    let mut w = watch_rescans(h, out, 0);  // what did not fit last time
+    unlock_watches();
+    if w > 0 {
+        return @bit_cast(isize, w);
     }
     loop {
-        let n = kevent(h, nil_ptr.[u8](), 0, &mut evs[0], max, tsp);
+        let mut ts = Timespec.{ sec: 0, nsec: 0 };
+        let mut tsp = @ptr_cast(*Timespec, &ts);
+        if timeout_ms < 0 {
+            tsp = @ptr_from_int(*Timespec, 0);
+        } else {
+            let left = deadline - ax_clock_ns(1);
+            if left > 0 {
+                ts = Timespec.{ sec: left / 1000000000, nsec: left % 1000000000 };
+            }
+        }
+        let n = kevent(h, nil_ptr.[u8](), 0, &mut evs[0], 16, tsp);
         if (n < 0) and (errno() == EINTR) {
             continue;
         }
         if n < 0 {
             return @as(isize, AX_ERR);
         }
-        let out = @slice_from_ptr(buf, cap);
-        let mut w: usize = 0;
-        for k in @as(usize, 0)..@as(usize, @bit_cast(u32, n)) {
-            let e = evs[k * 32..(k + 1) * 32];
-            let wd = @truncate(u32, le64(e, 0));
-            let ff = @as(u32, e[12]) | (@as(u32, e[13]) << 8);
-            let mut mask: u32 = 0;
-            if (ff & 0x6) != 0 {
-                mask = mask | 0x2;  // NOTE_WRITE / NOTE_EXTEND: IN_MODIFY
-            }
-            if (ff & 0x8) != 0 {
-                mask = mask | 0x4;  // NOTE_ATTRIB: IN_ATTRIB
-            }
-            if (ff & 0x1) != 0 {
-                mask = mask | 0x400;  // NOTE_DELETE: IN_DELETE_SELF
-            }
-            if (ff & 0x20) != 0 {
-                mask = mask | 0x800;  // NOTE_RENAME: IN_MOVE_SELF
-            }
-            // struct inotify_event: wd, mask, cookie, len (no name)
-            @ptr_cast(*mut u32, &mut out[w]).* = wd;
-            @ptr_cast(*mut u32, &mut out[w + 4]).* = mask;
-            @ptr_cast(*mut u32, &mut out[w + 8]).* = 0;
-            @ptr_cast(*mut u32, &mut out[w + 12]).* = 0;
-            w += 16;
+        if n == 0 {
+            return 0;
         }
-        return @bit_cast(isize, w);
+        lock_watches();
+        w = watch_events(h, evs[..], @as(usize, @bit_cast(u32, n)), out, 0);
+        w = watch_rescans(h, out, w);
+        unlock_watches();
+        if w > 0 {
+            return @bit_cast(isize, w);
+        }
+        // (nothing to report, e.g. a rescan that found no difference: wait on)
     }
 }
 
 export fn ax_watch_close(h: i32) void {
+    lock_watches();
+    for i in @as(usize, 0)..nwdirs {
+        let w = wdir(i);
+        if w.kq == h {
+            wdir_release(w);
+        }
+    }
+    unlock_watches();
     _ = close(h);
 }
 
@@ -1840,6 +2244,13 @@ struct ThreadStart {
 
 let mut next_thread_id: i32 = 1;
 
+// Called as each thread starts (true) and ends (false): the profiler
+// (runtime/profile_darwin.ax) samples the threads it knows.
+pub let mut thread_hook: fn(bool) void = no_thread_hook;
+pub let mut has_thread_hook: bool = false;
+
+fn no_thread_hook(start: bool) void {}
+
 fn thread_main(p: *mut void) *mut void {
     let st = @ptr_cast(*mut ThreadStart, p);
     if not thread_setup() {
@@ -1847,7 +2258,13 @@ fn thread_main(p: *mut void) *mut void {
         _ = write(2, msg.ptr, msg.len);
         exit(70);
     }
+    if has_thread_hook {
+        thread_hook(true);
+    }
     st.entry(st.arg);
+    if has_thread_hook {
+        thread_hook(false);
+    }
     @atomic_store(st.exited, 1);
     _ = ax_notify32(st.exited, 1);
     // the signal stack goes with the thread (its block goes with its key)
@@ -2088,7 +2505,7 @@ export fn ax_memory_discard(addr: usize, len: usize) void {
 // -----------------------------------------------------------------------------
 let mut report: [16384]u8 = [0; 16384];
 
-fn write_all(fd: i32, s: []u8) void {
+pub fn write_all(fd: i32, s: []u8) void {
     let mut off: usize = 0;
     while off < s.len {
         let n = ax_write(fd, &s[off], s.len - off);
@@ -2099,8 +2516,48 @@ fn write_all(fd: i32, s: []u8) void {
     }
 }
 
+// Called by code for `axiom profile` builds to write the samples so far
+// (runtime/profile_darwin.ax).
+pub let mut profile_flush: fn() void = no_flush;
+pub let mut has_profile: bool = false;
+// Replaces the default trap report (runtime/test_main_darwin.ax).
+pub let mut trap_hook: fn(*tf.Site, *tf.TrapInfo, *tf.ShadowStack) void = no_hook;
+pub let mut has_trap_hook: bool = false;
+// Replaces the default crash report: called with the crash code (5 memory,
+// 3 arithmetic, 8 stack exhausted) before the signal is re-raised.
+pub let mut crash_hook: fn(u64) void = no_crash_hook;
+pub let mut has_crash_hook: bool = false;
+
+fn no_flush() void {}
+
+fn no_hook(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {}
+
+fn no_crash_hook(code: u64) void {}
+
+fn flush_profile() void {
+    if has_profile {
+        profile_flush();
+    }
+}
+
+// Functions of another system's libraries (an extern block naming a Windows DLL)
+// are linked to this, so that a program can support several systems and
+// choose at run time; calling one is a crash with a stack trace.
+export fn ax_unavailable() void {
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: crash: called a function from another system's library (not available on macOS)\n");
+    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    write_all(2, o.text());
+    flush_profile();
+    exit(134);
+}
+
 // Every trap calls this (see codegen: axiom.trap).
 export fn ax_on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {
+    if has_trap_hook {
+        trap_hook(site, info, ss);
+        return;
+    }
     let mut o = tf.fmt(report[..]);
     o.s("axiom: ");
     tf.format_trap(&mut o, site, info);
@@ -2113,11 +2570,12 @@ export fn ax_on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) vo
     o.c('\n');
     tf.format_stack(&mut o, site, ss);
     write_all(2, o.text());
+    flush_profile();
 }
 
 // Was a fault at addr a stack overflow: an access near the end of the
 // thread's stack (its guard page)?
-fn at_stack_limit(addr: usize) bool {
+pub fn at_stack_limit(addr: usize) bool {
     let t = pthread_self();
     let top = @int_from_ptr(pthread_get_stackaddr_np(t));
     let bottom = top - pthread_get_stacksize_np(t);
@@ -2133,6 +2591,13 @@ fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
         code = 3;
     } else if at_stack_limit(addr) {
         code = 8;
+    }
+    if has_crash_hook {
+        crash_hook(@as(u64, code));
+        let dfl = SigAction.{ handler: 0, mask: 0, flags: 0 };  // SIG_DFL
+        _ = set_action(sig, @ptr_cast(*void, &dfl));
+        _ = raise(sig);
+        return;
     }
     let mut o = tf.fmt(report[..]);
     if code == 8 {
@@ -2152,13 +2617,14 @@ fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
     }
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     write_all(2, o.text());
+    flush_profile();
     let sa = SigAction.{ handler: 0, mask: 0, flags: 0 };  // SIG_DFL
     _ = set_action(sig, @ptr_cast(*void, &sa));
     _ = raise(sig);
 }
 
 // The calling thread's signal stack, for reporting its stack overflow.
-fn install_crash_stack() void {
+pub fn install_crash_stack() void {
     let p = malloc(65536);
     if @int_from_ptr(p) != 0 {
         let ss = StackT.{ sp: @int_from_ptr(p), size: 65536, flags: 0 };
@@ -2193,5 +2659,7 @@ export fn ax_rt_init() void {
     _ = set_action(SIGFPE, @ptr_cast(*void, &sa));
 }
 
-// Runs after main returns.
-export fn ax_rt_fini() void {}
+// Runs after main returns (and at exit).
+export fn ax_rt_fini() void {
+    flush_profile();
+}

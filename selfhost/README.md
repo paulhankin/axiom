@@ -115,9 +115,22 @@ against `/usr/lib/libSystem.B.dylib`, with an ad-hoc code signature (macOS refus
 unsigned arm64 code), so it runs without Xcode. The CPU defaults to `apple-m1`. On a Mac,
 `--target=native` means this target. Apple's ABI differs from AAPCS64 in two ways the
 backend follows: variadic arguments go on the stack in 8-byte slots, and `x18` is
-reserved (it already was). Not yet: `axiom test` and `axiom profile` for this target,
-and linking C code or `-l` libraries. The Mac output has been checked structurally
-(`tests/macho.mjs`) but not yet run on a Mac (issue 0011).
+reserved (it already was). The compiler bootstraps on a Mac (`bootstrap.sh` starts
+from the wasm32 build under node) and the test suite passes there natively. `axiom
+test` runs each test in a new process of the test binary (forked, then exec'd: macOS's
+system services do not work in a forked process that has not exec'd); `axiom profile`
+samples with a thread that meters each thread's CPU time through Mach
+(`runtime/profile_darwin.ax`; `setitimer` fires at a third of the rate asked for).
+
+An `extern "C" "name"` block names the library its functions come from: a framework
+(`"AppKit"`, `"Metal"`, `"AudioToolbox"`, ...), `"objc"`, `"System"` (libSystem), a
+library in `/usr/lib` (`"z"`, `"libz.1.dylib"`) or a path; each is an `LC_LOAD_DYLIB`,
+its symbols bound with its ordinal. Functions of another system's libraries (Windows
+DLLs here, Apple frameworks in `plink.ax`) are linked to the runtime's
+`ax_unavailable`, which reports the call: a program can support both systems and
+choose at run time (std/graphics/gpu, std/os/window). Not yet: linking C code or `-l`
+libraries, and structs passed to or returned from C functions (std/os/objc explains
+the workarounds).
 
 `--target=x86_64-windows` (also `x86_64-pc-windows-msvc` or `windows`) builds a PE32+
 console executable for Windows 10 or later, from any host: position independent (base
@@ -170,7 +183,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
-| `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes, rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
+| `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes (libSystem, frameworks and dylibs by ordinal), rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
 | `plink.ax` | The PE linker for `x86_64-windows`: the same ELF objects in `.text`, `.rdata`, `.idata`, `.data` and `.reloc` sections; the import directory (each Windows function's DLL from its name), thunks, a GOT for our own symbols, base relocations, the TLS directory and the entry point |
 | `lstub.ax` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ax` | Architectures, CPU presets, extensions, host detection |

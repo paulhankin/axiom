@@ -249,8 +249,7 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 // Profiling (spec §16.6).
 {
   const name = 'tests/profile/hot.ax [axiom profile]';
-  if (native && /macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '')) skip++;  // (not on macOS yet)
-  else if (!filter || name.includes(filter)) {
+  if (!filter || name.includes(filter)) {
     const folded = path.join(tmp, 'hot.folded');
     const c = spawnSync(compiler, ['profile', path.join(root, 'tests/profile/hot.ax'), '--format=agent-json', `--folded=${folded}`,
       ...testTargets, ...extraFlags], { encoding: 'utf8' });
@@ -406,11 +405,13 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
   }
 }
 
-// macOS (spec §14.1; the self-hosted compiler only). Programs cross-built
-// for --target=aarch64-macos cannot run here, so tests/macho.mjs checks the
-// executables the way dyld and the kernel would; the compiler itself is
-// among them. Unsupported commands say so.
+// macOS (spec §14.1; the self-hosted compiler only). tests/macho.mjs checks
+// the executables built for --target=aarch64-macos the way dyld and the
+// kernel would; the compiler itself is among them. On a Mac they also run
+// (and the whole suite runs natively with AXIOM_NATIVE_TARGET=aarch64-macos);
+// elsewhere `axiom test` for the target says it needs a Mac.
 {
+  const onMac = process.platform === 'darwin' && os.arch() === 'arm64';
   const out = (n) => path.join(tmp, 'macos-' + n);
   const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=aarch64-macos', '-o', out(n), ...extra],
     { encoding: 'utf8', cwd: root, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'macos-cache') } });
@@ -427,7 +428,10 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       const src = path.join(tmp, 'macos-hello.ax');
       fs.writeFileSync(src, 'import "std/io" as io;\n\nthreadlocal let mut tl: u64 = 41;\n\nexport fn main() i32 {\n' +
         '    tl += 1;\n    io.stdout().println("hello") catch return 1;\n    return @int_cast(i32, tl) - 42;\n}\n');
-      return check(src, 'hello', ['-O2']);
+      const p = check(src, 'hello', ['-O2']);
+      if (p || !onMac) return p;
+      const r = spawnSync(out('hello'), [], { encoding: 'utf8' });
+      return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
     'examples': () => {
       for (const e of ['wordcount', 'http_server', 'texmath']) {
@@ -436,10 +440,49 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       }
       return null;
     },
-    'the compiler': () => check(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']),
-    'unsupported commands': () => {
+    'the compiler': () => {
+      const p = check(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);
+      if (p || !onMac) return p;
+      // the Mac-built compiler builds a program that runs
+      const src = path.join(tmp, 'macos-hello.ax');
+      const c = spawnSync(out('axiom'), ['build', src, '--target=native', `--std=${path.join(root, 'std')}`, '-o', out('hello2')],
+        { encoding: 'utf8', cwd: root, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'macos-cache2') } });
+      if (c.status !== 0) return `the Mac compiler failed: ${c.stdout}${c.stderr}`;
+      const r = spawnSync(out('hello2'), [], { encoding: 'utf8' });
+      return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'frameworks: Objective-C, Metal, Quartz, GameController, Core Audio (tests/macos)': () => {
+      const tests = fs.readdirSync(path.join(root, 'tests/macos')).filter((f) => f.endsWith('.ax')).sort()
+        .map((f) => `tests/macos/${f}`);
+      for (const f of tests) {
+        const c = spawnSync(compiler, ['check', f, '--target=aarch64-macos'], { encoding: 'utf8', cwd: root });
+        if (c.status !== 0) return `${f}: check failed:\n${c.stdout}${c.stderr}`;
+        if (!onMac) continue;
+        const r = spawnSync(compiler, ['test', f, '--target=aarch64-macos'], { encoding: 'utf8', cwd: root,
+          env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'macos-cache') } });
+        if (r.status !== 0 || !/passed, 0 failed/.test(r.stdout)) return `${f}: status ${r.status}: ${r.stdout}${r.stderr}`;
+      }
+      return null;
+    },
+    'examples on Metal: metal, game, trench, swarm': () => {
+      for (const e of ['metal', 'game', 'trench', 'swarm']) {
+        const p = check(path.join(root, `examples/${e}.ax`), e, ['-O2']);
+        if (p) return `${e}: ${p}`;
+        if (!onMac) continue;
+        // a frame offscreen (the games play a while by themselves first)
+        const png = out(`${e}.png`);
+        const r = spawnSync(out(e), ['--png', png, ...(e === 'trench' || e === 'swarm' ? ['--frames', '120'] : [])],
+          { encoding: 'utf8', cwd: root, timeout: 120000 });
+        if (r.status !== 0) return `${e} --png: status ${r.status}: ${r.stdout}${r.stderr}`;
+        const d = fs.readFileSync(png);
+        if (d.readUInt32BE(0) !== 0x89504e47 || d.length < 2000) return `${e}: not much of a PNG`;
+      }
+      return null;
+    },
+    'axiom test': () => {
       const r = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=aarch64-macos'], { encoding: 'utf8', cwd: root });
-      return r.status !== 0 && /E9001/.test(r.stderr) ? null : `axiom test: status ${r.status}: ${r.stderr}`;
+      if (!onMac) return r.status !== 0 && /E9001/.test(r.stderr) ? null : `axiom test: status ${r.status}: ${r.stderr}`;
+      return r.status === 0 && /passed, 0 failed/.test(r.stdout) ? null : `axiom test: status ${r.status}: ${r.stdout}${r.stderr}`;
     },
   };
   for (const [cname, fn] of Object.entries(cases)) {

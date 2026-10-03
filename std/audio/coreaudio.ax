@@ -1,0 +1,396 @@
+// =============================================================================
+// std/audio/coreaudio.ax - playing sound on macOS: an engine that mixes
+// voices playing std/audio Sounds (16-bit or 32-bit float samples, any rate
+// and channel count), with volume, pitch and looping, into an Audio Queue
+// on the default output device. The same interface as std/audio/xaudio2 on
+// Windows:
+//
+//     let mut eng = coreaudio.Engine.init()!;
+//     defer eng.deinit();
+//     let snd = formats.read_file("boom.wav")!;          // std/audio/formats
+//     let mut v = eng.voice(&snd)!;                       // its format
+//     defer v.destroy();
+//     v.play(&snd, false)!;                               // snd must outlive the playing
+//     while v.playing() { ... }
+//
+// The mixing happens on a thread of the engine's own, in buffers of about
+// 10 ms (three of them queued: some 30 ms from a call to the sound). Voices
+// are used from one thread at a time. macOS only (--target=aarch64-macos).
+// =============================================================================
+
+import "../audio.ax" as audio;
+import "../mem.ax" as mem;
+import "../thread.ax" as thread;
+
+error { Unsupported, Failed, OutOfMemory }
+
+extern "C" "AudioToolbox" {
+    fn AudioQueueNewOutput(format: *u8, callback: fn(usize, usize, usize) void, user: usize, run_loop: usize,
+                           mode: usize, flags: u32, queue: *mut usize) i32;
+    fn AudioQueueAllocateBuffer(queue: usize, size: u32, buffer: *mut usize) i32;
+    fn AudioQueueEnqueueBuffer(queue: usize, buffer: usize, ndescs: u32, descs: usize) i32;
+    fn AudioQueueStart(queue: usize, time: usize) i32;
+    fn AudioQueueStop(queue: usize, immediate: u8) i32;
+    fn AudioQueueDispose(queue: usize, immediate: u8) i32;
+}
+
+extern "C" "CoreFoundation" {
+    fn CFRunLoopGetCurrent() usize;
+    fn CFRunLoopRunInMode(mode: usize, seconds: f64, after_one: u8) i32;
+}
+
+extern "C" "System" {
+    fn dlsym(handle: usize, name: *u8) usize;
+}
+
+const RATE: f64 = 48000.0;  // the engine's rate (the queue converts to the device's)
+const FRAMES: usize = 480;  // frames per buffer: 10 ms
+const NBUFFERS: usize = 3;
+const MAX_VOICES: usize = 64;
+const MAX_QUEUED: usize = 16;  // buffers queued per voice
+
+struct Queued {
+    data: usize,  // the samples (the caller's)
+    frames: usize,
+    looping: bool,
+}
+
+struct VoiceState {
+    used: bool,
+    running: bool,
+    channels: usize,
+    rate: f64,
+    float: bool,  // F32 samples (else S16)
+    volume: f32,
+    pitch: f32,
+    queued: [16]Queued,
+    head: usize,
+    count: usize,
+    pos: f64,  // in the head buffer, in frames
+    played: u64,
+    end_loop: bool,
+}
+
+struct Shared {
+    lock: u32,
+    quit: u32,   // 1: the thread is to end
+    ready: u32,  // 0 starting, 1 playing, 2 failed
+    volume: f32,
+    queue: usize,  // AudioQueueRef
+    voices: [64]VoiceState,
+}
+
+fn lock(s: *mut Shared) void {
+    while @atomic_xchg(&mut s.lock, 1) != 0 {}
+}
+
+fn unlock(s: *mut Shared) void {
+    _ = @atomic_xchg(&mut s.lock, 0);
+}
+
+// Sample c of frame f of a queued buffer, -1..1.
+fn sample(v: *VoiceState, q: *Queued, f: usize, c: usize) f32 {
+    let i = (f * v.channels) + c;
+    if v.float {
+        return @ptr_from_int(*f32, q.data + (i * 4)).*;
+    }
+    return @float_from_int(f32, @ptr_from_int(*i16, q.data + (i * 2)).*) / 32768.0;
+}
+
+// Adds n frames of voice v into out (stereo), advancing it.
+fn mix_voice(v: *mut VoiceState, out: []mut f32, n: usize, master: f32) void {
+    let step = (v.rate * @float_cast(f64, v.pitch)) / RATE;
+    let gain = v.volume * master;
+    let mut right_ch: usize = 0;
+    if v.channels > 1 {
+        right_ch = 1;
+    }
+    for k in 0..n {
+        if v.count == 0 {
+            return;
+        }
+        let q = &v.queued[v.head];
+        let f0 = @int_from_float(usize, v.pos);
+        let t = @float_cast(f32, v.pos - @float_from_int(f64, f0));
+        let f1 = @min(f0 + 1, q.frames - 1);
+        let l = sample(v, q, f0, 0) + ((sample(v, q, f1, 0) - sample(v, q, f0, 0)) * t);
+        let r = sample(v, q, f0, right_ch) + ((sample(v, q, f1, right_ch) - sample(v, q, f0, right_ch)) * t);
+        out[k * 2] += l * gain;
+        out[(k * 2) + 1] += r * gain;
+        v.pos += step;
+        let before = @int_from_float(u64, v.pos - step);
+        v.played += @int_from_float(u64, v.pos) - before;
+        while (v.count > 0) and (v.pos >= @float_from_int(f64, v.queued[v.head].frames)) {
+            let qf = @float_from_int(f64, v.queued[v.head].frames);
+            if v.queued[v.head].looping and not v.end_loop {
+                v.pos -= qf;
+            } else {
+                v.pos -= qf;
+                v.end_loop = false;
+                v.head = (v.head + 1) % MAX_QUEUED;
+                v.count -= 1;
+            }
+        }
+    }
+}
+
+// The queue's callback (on the engine's thread): mixes the next buffer.
+fn fill(user: usize, queue: usize, buffer: usize) void {
+    let s = @ptr_from_int(*mut Shared, user);
+    // AudioQueueBuffer: capacity (u32), data at 8, data size (u32) at 16
+    let data = @ptr_from_int(*usize, buffer + 8).*;
+    let out = @slice_from_ptr(@ptr_from_int(*mut f32, data), FRAMES * 2);
+    @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, data), FRAMES * 8), 0);
+    lock(s);
+    for i in @as(usize, 0)..MAX_VOICES {
+        let v = &mut s.voices[i];
+        if v.used and v.running and (v.count > 0) {
+            mix_voice(v, out, FRAMES, s.volume);
+        }
+    }
+    unlock(s);
+    // keep it in range (many voices at once)
+    for k in 0..out.len {
+        out[k] = @max(@min(out[k], 1.0), -1.0);
+    }
+    @ptr_from_int(*mut u32, buffer + 16).* = @truncate(u32, FRAMES * 8);
+    if @atomic_load(&s.quit) == 0 {
+        _ = AudioQueueEnqueueBuffer(queue, buffer, 0, 0);
+    }
+}
+
+// The engine's thread: the queue calls back on this thread's run loop.
+fn engine_main(s: *mut Shared) void {
+    // AudioStreamBasicDescription: rate (f64), format ('lpcm'), flags (float,
+    // packed), bytes per packet, frames per packet, bytes per frame,
+    // channels, bits per channel, reserved
+    let mut f: [40]u8 = [0; 40];
+    @ptr_cast(*mut f64, &mut f[0]).* = RATE;
+    let words: [8]u32 = [0x6c70_636d, 9, 8, 1, 8, 2, 32, 0];
+    for k in @as(usize, 0)..8 {
+        @ptr_cast(*mut u32, &mut f[8 + (k * 4)]).* = words[k];
+    }
+    let h = @bit_cast(usize, @as(isize, -2));  // RTLD_DEFAULT
+    let mode_p = dlsym(h, "kCFRunLoopDefaultMode\x00".ptr);
+    if mode_p == 0 {
+        @atomic_store(&mut s.ready, 2);
+        return;
+    }
+    let mode = @ptr_from_int(*usize, mode_p).*;
+    let mut q: usize = 0;
+    if AudioQueueNewOutput(&f[0], fill, @int_from_ptr(s), CFRunLoopGetCurrent(), mode, 0, &mut q) != 0 {
+        @atomic_store(&mut s.ready, 2);
+        return;
+    }
+    s.queue = q;
+    for k in @as(usize, 0)..NBUFFERS {
+        _ = k;
+        let mut b: usize = 0;
+        if AudioQueueAllocateBuffer(q, @truncate(u32, FRAMES * 8), &mut b) != 0 {
+            _ = AudioQueueDispose(q, 1);
+            @atomic_store(&mut s.ready, 2);
+            return;
+        }
+        fill(@int_from_ptr(s), q, b);  // silence, to start with
+    }
+    if AudioQueueStart(q, 0) != 0 {
+        _ = AudioQueueDispose(q, 1);
+        @atomic_store(&mut s.ready, 2);  // (no output device)
+        return;
+    }
+    @atomic_store(&mut s.ready, 1);
+    while @atomic_load(&s.quit) == 0 {
+        _ = CFRunLoopRunInMode(mode, 0.05, 0);
+    }
+    _ = AudioQueueStop(q, 1);
+    _ = AudioQueueDispose(q, 1);
+}
+
+pub struct Engine {
+    s: *mut Shared,
+    t: thread.Thread.[*mut Shared],
+
+    /// The engine, playing to the default output device.
+    pub fn init() !Engine {
+        let s = mem.new_zeroed.[Shared]()!;
+        s.volume = 1.0;
+        let t = thread.spawn(engine_main, s) catch |e| {
+            mem.destroy(s);
+            return e;
+        };
+        while @atomic_load(&s.ready) == 0 {
+            thread.sleep_ms(1);
+        }
+        if @atomic_load(&s.ready) != 1 {
+            t.join();
+            mem.destroy(s);
+            return error.Unsupported;  // (no audio device)
+        }
+        return Engine.{ s: s, t: t };
+    }
+
+    pub fn deinit(self: *mut Engine) void {
+        if @int_from_ptr(self.s) == 0 {
+            return;
+        }
+        @atomic_store(&mut self.s.quit, 1);
+        self.t.join();
+        mem.destroy(self.s);
+        self.s = @ptr_from_int(*mut Shared, 0);
+    }
+
+    /// The overall volume (1: as is, 0: silent).
+    pub fn set_volume(self: *mut Engine, v: f32) void {
+        lock(self.s);
+        self.s.volume = @max(v, 0.0);
+        unlock(self.s);
+    }
+
+    /// A voice for sounds of s's format (channels, rate, S16 or F32 samples).
+    pub fn voice(self: *mut Engine, s: *audio.Sound) !Voice {
+        return self.voice_for(@truncate(u32, s.channels), s.rate, s.format);
+    }
+
+    pub fn voice_for(self: *mut Engine, channels: u32, rate: u32, format: audio.SampleFormat) !Voice {
+        if (format != audio.SampleFormat.S16) and (format != audio.SampleFormat.F32) {
+            return error.Unsupported;  // (Sound.convert to S16 or F32 first)
+        }
+        if (channels == 0) or (rate == 0) {
+            return error.Unsupported;
+        }
+        lock(self.s);
+        defer unlock(self.s);
+        for i in @as(usize, 0)..MAX_VOICES {
+            let v = &mut self.s.voices[i];
+            if not v.used {
+                v.* = VoiceState.{ used: true, running: false, channels: @as(usize, channels),
+                                   rate: @float_from_int(f64, rate), float: format == audio.SampleFormat.F32,
+                                   volume: 1.0, pitch: 1.0, queued: [Queued.{ data: 0, frames: 0, looping: false }; 16],
+                                   head: 0, count: 0, pos: 0.0, played: 0, end_loop: false };
+                return Voice.{ s: self.s, slot: i, block: channels * if_float(format) };
+            }
+        }
+        return error.Failed;  // (too many voices)
+    }
+}
+
+fn if_float(format: audio.SampleFormat) u32 {
+    if format == audio.SampleFormat.F32 {
+        return 4;
+    }
+    return 2;
+}
+
+pub struct Voice {
+    s: *mut Shared,
+    slot: usize,
+    block: u32,  // bytes per frame
+
+    /// A voice that is not there (destroy does nothing).
+    pub fn none() Voice {
+        return Voice.{ s: @ptr_from_int(*mut Shared, 0), slot: 0, block: 0 };
+    }
+
+    /// Is this a voice of an engine (not none, not destroyed)?
+    pub fn live(self: *Voice) bool {
+        return @int_from_ptr(self.s) != 0;
+    }
+
+    fn state(self: *Voice) *mut VoiceState {
+        return &mut self.s.voices[self.slot];
+    }
+
+    /// Plays a sound (all of it; again and again when `looping`) after what
+    /// is queued. Its samples must stay alive until it has played.
+    pub fn play(self: *mut Voice, s: *audio.Sound, looping: bool) !void {
+        self.queue(s.data, looping)!;
+        self.start();
+    }
+
+    /// Queues raw samples in the voice's format.
+    pub fn queue(self: *mut Voice, data: []u8, looping: bool) !void {
+        let frames = data.len / @as(usize, self.block);
+        if frames == 0 {
+            return;
+        }
+        lock(self.s);
+        defer unlock(self.s);
+        let v = self.state();
+        if v.count == MAX_QUEUED {
+            return error.Failed;
+        }
+        v.queued[(v.head + v.count) % MAX_QUEUED] = Queued.{ data: @int_from_ptr(data.ptr), frames: frames,
+                                                             looping: looping };
+        v.count += 1;
+    }
+
+    pub fn start(self: *mut Voice) void {
+        lock(self.s);
+        let v = self.state();
+        if not v.running {
+            v.running = true;
+            v.played = 0;
+        }
+        unlock(self.s);
+    }
+
+    /// Stops and forgets what was queued.
+    pub fn stop(self: *mut Voice) void {
+        lock(self.s);
+        let v = self.state();
+        v.running = false;
+        v.count = 0;
+        v.head = 0;
+        v.pos = 0.0;
+        v.end_loop = false;
+        unlock(self.s);
+    }
+
+    /// Ends a looping sound after its current pass.
+    pub fn end_loop(self: *mut Voice) void {
+        lock(self.s);
+        self.state().end_loop = true;
+        unlock(self.s);
+    }
+
+    /// The voice's volume (1: as is).
+    pub fn set_volume(self: *mut Voice, v: f32) void {
+        lock(self.s);
+        self.state().volume = @max(v, 0.0);
+        unlock(self.s);
+    }
+
+    /// Plays faster and higher (> 1) or slower and lower (< 1), up to 4.
+    pub fn set_pitch(self: *mut Voice, ratio: f32) void {
+        lock(self.s);
+        self.state().pitch = @max(@min(ratio, 4.0), 1.0 / 1024.0);
+        unlock(self.s);
+    }
+
+    /// Is something still queued?
+    pub fn playing(self: *Voice) bool {
+        lock(self.s);
+        let n = self.state().count;
+        unlock(self.s);
+        return n != 0;
+    }
+
+    /// Frames played since the voice started.
+    pub fn frames_played(self: *Voice) u64 {
+        lock(self.s);
+        let n = self.state().played;
+        unlock(self.s);
+        return n;
+    }
+
+    pub fn destroy(self: *mut Voice) void {
+        if @int_from_ptr(self.s) == 0 {
+            return;
+        }
+        lock(self.s);
+        self.state().used = false;
+        self.state().count = 0;
+        unlock(self.s);
+        self.s = @ptr_from_int(*mut Shared, 0);
+    }
+}

@@ -1,0 +1,453 @@
+// =============================================================================
+// std/os/objc.ax - the Objective-C runtime (AppKit, Metal, Foundation and the
+// rest of macOS's frameworks are Objective-C) from Axiom: classes,
+// selectors, messages, strings, autorelease pools, values held in NSValues,
+// and classes made at run time whose methods are Axiom functions.
+//
+//     let pool = objc.pool_push();
+//     defer objc.pool_pop(pool);
+//     let info = objc.send(objc.class("NSProcessInfo"), objc.sel("processInfo"));
+//     let n = objc.send(info, objc.sel("activeProcessorCount"));
+//     let name = objc.string_of(objc.send(info, objc.sel("hostName")));
+//
+// Objects, classes and selectors are pointers, held as usize (0 is nil). A
+// message is a call of objc_msgSend with the object and the selector first;
+// send, send1, ... cover messages whose arguments and result are words
+// (integers, pointers, objects, BOOL), send_f64 and the others those with
+// doubles. Any other kind is a cast of msg_send() to the method's type:
+//
+//     let f = @bit_cast(fn(usize, usize, f64, f64, f64, f64, u64, u64, u8) usize, objc.msg_send());
+//     let w = f(objc.alloc("NSWindow"), objc.sel("initWithContentRect:styleMask:backing:defer:"),
+//               x, y, width, height, style, 2, 0);          // an NSRect: four doubles
+//
+// Structs: on Apple silicon a struct of up to four doubles (NSRect, CGSize,
+// MTLClearColor), or of two words (NSRange), is passed in registers as its
+// fields; pass it as the fields. A larger one (MTLRegion, MTLSize) is passed
+// as a pointer to it. A method returning a struct is read through its
+// property instead: get_struct boxes the result in an NSValue (key-value
+// coding) and copies it out.
+//
+// Methods called back (delegates, actions) are Axiom functions whose first
+// two parameters are the receiver and the selector (define_class,
+// add_method); they run on the thread the framework calls from, which for
+// AppKit is the main thread.
+//
+// macOS only (--target=aarch64-macos).
+// =============================================================================
+
+error { Failed, TooLong }
+
+extern "C" "objc" {
+    fn objc_getClass(name: *u8) usize;
+    fn objc_lookUpClass(name: *u8) usize;
+    fn sel_registerName(name: *u8) usize;
+    fn sel_getName(sel: usize) *u8;
+    fn objc_msgSend() void;
+    fn objc_autoreleasePoolPush() usize;
+    fn objc_autoreleasePoolPop(pool: usize) void;
+    fn objc_retain(obj: usize) usize;
+    fn objc_release(obj: usize) void;
+    fn objc_autorelease(obj: usize) usize;
+    fn objc_allocateClassPair(superclass: usize, name: *u8, extra: usize) usize;
+    fn objc_registerClassPair(cls: usize) void;
+    fn class_addMethod(cls: usize, sel: usize, imp: usize, types: *u8) u8;
+    fn class_addIvar(cls: usize, name: *u8, size: usize, align: u8, types: *u8) u8;
+    fn class_getInstanceVariable(cls: usize, name: *u8) usize;
+    fn ivar_getOffset(ivar: usize) isize;
+    fn object_getClass(obj: usize) usize;
+    fn class_getName(cls: usize) *u8;
+    fn class_respondsToSelector(cls: usize, sel: usize) u8;
+}
+
+extern "C" "System" {
+    fn dlopen(path: *u8, mode: i32) usize;
+}
+
+// (Foundation, which the classes of every framework build on, is loaded
+// with the program because this module calls it.)
+extern "C" "Foundation" {
+    fn NSGetSizeAndAlignment(t: *u8, size: *mut usize, align: *mut usize) *u8;
+}
+
+// A NUL-terminated copy of s in buf.
+fn cstr(buf: []mut u8, s: []u8) !*u8 {
+    if (s.len + 1) > buf.len {
+        return error.TooLong;
+    }
+    @mem_copy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return &buf[0];
+}
+
+fn cstr_len(p: *u8) usize {
+    let mut n: usize = 0;
+    while @ptr_from_int(*u8, @int_from_ptr(p) + n).* != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+/// The class of that name (0 if there is none).
+pub fn class(name: []u8) usize {
+    let mut buf: [256]u8 = [0; 256];
+    let p = cstr(buf[..], name) catch return 0;
+    let c = objc_lookUpClass(p);
+    if c == 0 {
+        // (a reference to Foundation, so that it is loaded: see above)
+        let mut size: usize = 0;
+        _ = value_size("c\x00".ptr, &mut size);
+    }
+    return c;
+}
+
+/// Loads a system framework by name ("GameController", "CoreHaptics"),
+/// for its classes: a module that only sends messages to a framework's
+/// classes, and calls none of its functions, loads it with this. False if
+/// there is no such framework.
+pub fn framework(name: []u8) bool {
+    let mut buf: [256]u8 = [0; 256];
+    let pre = "/System/Library/Frameworks/";
+    if (pre.len + (name.len * 2) + 12) > buf.len {
+        return false;
+    }
+    let mut n: usize = 0;
+    for part in [pre, name, ".framework/", name]{
+        @mem_copy(buf[n..n + part.len], part);
+        n += part.len;
+    }
+    buf[n] = 0;
+    return dlopen(&buf[0], 1) != 0;  // RTLD_LAZY
+}
+
+/// The selector of that name ("initWithFrame:", "setTitle:").
+pub fn sel(name: []u8) usize {
+    let mut buf: [256]u8 = [0; 256];
+    let p = cstr(buf[..], name) catch return 0;
+    return sel_registerName(p);
+}
+
+/// A selector's name.
+pub fn sel_name(s: usize) []u8 {
+    let p = sel_getName(s);
+    return @slice_from_ptr(p, cstr_len(p));
+}
+
+/// The name of an object's class.
+pub fn class_name(obj: usize) []u8 {
+    if obj == 0 {
+        return "nil";
+    }
+    let p = class_getName(object_getClass(obj));
+    return @slice_from_ptr(p, cstr_len(p));
+}
+
+/// Does the object answer the selector?
+pub fn responds(obj: usize, s: usize) bool {
+    return (obj != 0) and (class_respondsToSelector(object_getClass(obj), s) != 0);
+}
+
+/// objc_msgSend's address, to cast to a method's type (see the header).
+pub fn msg_send() usize {
+    return @bit_cast(usize, objc_msgSend);
+}
+
+// Messages whose arguments and result are words.
+pub fn send(obj: usize, s: usize) usize {
+    return @bit_cast(fn(usize, usize) usize, objc_msgSend)(obj, s);
+}
+
+pub fn send1(obj: usize, s: usize, a: usize) usize {
+    return @bit_cast(fn(usize, usize, usize) usize, objc_msgSend)(obj, s, a);
+}
+
+pub fn send2(obj: usize, s: usize, a: usize, b: usize) usize {
+    return @bit_cast(fn(usize, usize, usize, usize) usize, objc_msgSend)(obj, s, a, b);
+}
+
+pub fn send3(obj: usize, s: usize, a: usize, b: usize, c: usize) usize {
+    return @bit_cast(fn(usize, usize, usize, usize, usize) usize, objc_msgSend)(obj, s, a, b, c);
+}
+
+pub fn send4(obj: usize, s: usize, a: usize, b: usize, c: usize, d: usize) usize {
+    return @bit_cast(fn(usize, usize, usize, usize, usize, usize) usize, objc_msgSend)(obj, s, a, b, c, d);
+}
+
+pub fn send5(obj: usize, s: usize, a: usize, b: usize, c: usize, d: usize, e: usize) usize {
+    return @bit_cast(fn(usize, usize, usize, usize, usize, usize, usize) usize, objc_msgSend)(obj, s, a, b, c, d, e);
+}
+
+pub fn send6(obj: usize, s: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) usize {
+    return @bit_cast(fn(usize, usize, usize, usize, usize, usize, usize, usize) usize, objc_msgSend)(
+        obj, s, a, b, c, d, e, f);
+}
+
+/// A message by name with no arguments: call("count") on obj.
+pub fn call(obj: usize, name: []u8) usize {
+    return send(obj, sel(name));
+}
+
+pub fn call1(obj: usize, name: []u8, a: usize) usize {
+    return send1(obj, sel(name), a);
+}
+
+pub fn call2(obj: usize, name: []u8, a: usize, b: usize) usize {
+    return send2(obj, sel(name), a, b);
+}
+
+// Messages with doubles (CGFloat is a double).
+/// A double result (a CGFloat property).
+pub fn send_f64(obj: usize, s: usize) f64 {
+    return @bit_cast(fn(usize, usize) f64, objc_msgSend)(obj, s);
+}
+
+/// A float result.
+pub fn send_f32(obj: usize, s: usize) f32 {
+    return @bit_cast(fn(usize, usize) f32, objc_msgSend)(obj, s);
+}
+
+/// A double argument (setAlphaValue:, setContentsScale:).
+pub fn send_d(obj: usize, s: usize, x: f64) usize {
+    return @bit_cast(fn(usize, usize, f64) usize, objc_msgSend)(obj, s, x);
+}
+
+/// Two doubles: a CGSize or CGPoint (setDrawableSize:, setContentSize:).
+pub fn send_dd(obj: usize, s: usize, x: f64, y: f64) usize {
+    return @bit_cast(fn(usize, usize, f64, f64) usize, objc_msgSend)(obj, s, x, y);
+}
+
+/// Four doubles: an NSRect or CGRect (setFrame:), or an MTLClearColor.
+pub fn send_dddd(obj: usize, s: usize, a: f64, b: f64, c: f64, d: f64) usize {
+    return @bit_cast(fn(usize, usize, f64, f64, f64, f64) usize, objc_msgSend)(obj, s, a, b, c, d);
+}
+
+/// A float argument (setOpacity:).
+pub fn send_f(obj: usize, s: usize, x: f32) usize {
+    return @bit_cast(fn(usize, usize, f32) usize, objc_msgSend)(obj, s, x);
+}
+
+/// A BOOL result.
+pub fn send_bool(obj: usize, s: usize) bool {
+    return @bit_cast(fn(usize, usize) u8, objc_msgSend)(obj, s) != 0;
+}
+
+/// A BOOL argument (setOpaque:, setHidden:).
+pub fn send_b(obj: usize, s: usize, b: bool) usize {
+    let mut v: u8 = 0;
+    if b {
+        v = 1;
+    }
+    return @bit_cast(fn(usize, usize, u8) usize, objc_msgSend)(obj, s, v);
+}
+
+/// [[name alloc] init], owned by the caller (release it).
+pub fn new(name: []u8) usize {
+    return send(alloc(name), sel("init"));
+}
+
+/// [name alloc]: an instance to send an init... message to.
+pub fn alloc(name: []u8) usize {
+    return send(class(name), sel("alloc"));
+}
+
+pub fn retain(obj: usize) usize {
+    if obj == 0 {
+        return 0;
+    }
+    return objc_retain(obj);
+}
+
+/// Lets an object go (nothing for nil).
+pub fn release(obj: usize) void {
+    if obj != 0 {
+        objc_release(obj);
+    }
+}
+
+/// Lets an object go at the end of the current autorelease pool.
+pub fn autorelease(obj: usize) usize {
+    if obj == 0 {
+        return 0;
+    }
+    return objc_autorelease(obj);
+}
+
+/// Starts an autorelease pool: objects the frameworks return without
+/// handing over (most results of methods not named alloc, new, copy) live
+/// until it is popped. A loop that calls them (a frame, an event) pushes
+/// and pops one each time round.
+pub fn pool_push() usize {
+    return objc_autoreleasePoolPush();
+}
+
+pub fn pool_pop(pool: usize) void {
+    objc_autoreleasePoolPop(pool);
+}
+
+// -----------------------------------------------------------------------------
+// Strings and values
+// -----------------------------------------------------------------------------
+/// An NSString of the UTF-8 text s (autoreleased; retain it to keep it).
+pub fn string(s: []u8) usize {
+    // initWithBytes:length:encoding: (NSUTF8StringEncoding = 4)
+    let p = send(class("NSString"), sel("alloc"));
+    let ns = @bit_cast(fn(usize, usize, *u8, usize, usize) usize, objc_msgSend)(
+        p, sel("initWithBytes:length:encoding:"), s.ptr, s.len, 4);
+    return autorelease(ns);
+}
+
+/// An NSString's text as UTF-8, valid while the string lives (and, for one
+/// made on the fly, until the autorelease pool is popped); empty for nil.
+pub fn string_of(ns: usize) []u8 {
+    if ns == 0 {
+        return "";
+    }
+    let p = send(ns, sel("UTF8String"));
+    if p == 0 {
+        return "";
+    }
+    return @slice_from_ptr(@ptr_from_int(*u8, p), cstr_len(@ptr_from_int(*u8, p)));
+}
+
+/// An NSNumber's value as a double (0 for nil).
+pub fn number_f64(n: usize) f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    return send_f64(n, sel("doubleValue"));
+}
+
+/// An NSNumber holding a double (autoreleased).
+pub fn number(x: f64) usize {
+    return send_d(class("NSNumber"), sel("numberWithDouble:"), x);
+}
+
+/// An NSNumber holding an integer (autoreleased).
+pub fn number_int(x: i64) usize {
+    return send1(class("NSNumber"), sel("numberWithLongLong:"), @bit_cast(usize, x));
+}
+
+/// Copies a struct-valued property of obj (by key-value coding: "frame",
+/// "bounds", "drawableSize", "locationInWindow") into out, as its C layout;
+/// false if the object has no such property or it is not that size.
+pub fn get_struct(obj: usize, key: []u8, out: []mut u8) bool {
+    if obj == 0 {
+        return false;
+    }
+    let v = send1(obj, sel("valueForKey:"), string(key));
+    if (v == 0) or not responds(v, sel("getValue:size:")) {
+        return false;
+    }
+    // the NSValue's type must be of out's size: getValue:size: raises otherwise
+    let mut size: usize = 0;
+    let objc_type = send(v, sel("objCType"));
+    if (objc_type == 0) or not value_size(@ptr_from_int(*u8, objc_type), &mut size) or (size != out.len) {
+        return false;
+    }
+    _ = send2(v, sel("getValue:size:"), @int_from_ptr(out.ptr), out.len);
+    return true;
+}
+
+/// A property holding two doubles (a CGSize or CGPoint) by key-value
+/// coding; [0, 0] if there is none.
+pub fn get_f64x2(obj: usize, key: []u8) [2]f64 {
+    let mut b: [16]u8 = [0; 16];
+    if not get_struct(obj, key, b[..]) {
+        return [0.0, 0.0];
+    }
+    return [@bit_cast(f64, le64(b[..], 0)), @bit_cast(f64, le64(b[..], 8))];
+}
+
+/// A property holding four doubles (an NSRect or CGRect: x, y, width,
+/// height) by key-value coding; zeros if there is none.
+pub fn get_f64x4(obj: usize, key: []u8) [4]f64 {
+    let mut b: [32]u8 = [0; 32];
+    if not get_struct(obj, key, b[..]) {
+        return [0.0; 4];
+    }
+    return [@bit_cast(f64, le64(b[..], 0)), @bit_cast(f64, le64(b[..], 8)), @bit_cast(f64, le64(b[..], 16)),
+            @bit_cast(f64, le64(b[..], 24))];
+}
+
+fn le64(b: []u8, at: usize) u64 {
+    let mut v: u64 = 0;
+    for k in @as(usize, 0)..8 {
+        v = v | (@as(u64, b[at + k]) << @as(u64, k * 8));
+    }
+    return v;
+}
+
+// The size of a value of an Objective-C type encoding.
+fn value_size(t: *u8, out: *mut usize) bool {
+    let mut align: usize = 0;
+    _ = NSGetSizeAndAlignment(t, out, &mut align);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Classes made at run time
+// -----------------------------------------------------------------------------
+/// A new class `name` deriving from `superclass` (by name), to give methods
+/// (add_method) and then register; 0 if the name is taken or the
+/// superclass unknown. Each class name can be made once per process: look
+/// it up with class() first.
+pub fn define_class(name: []u8, superclass: []u8) usize {
+    let sup = class(superclass);
+    if sup == 0 {
+        return 0;
+    }
+    let mut buf: [256]u8 = [0; 256];
+    let p = cstr(buf[..], name) catch return 0;
+    return objc_allocateClassPair(sup, p, 0);
+}
+
+/// Adds a method to a class being defined: imp is an Axiom function whose
+/// parameters are the receiver, the selector, then the method's own, and
+/// `types` its Objective-C type encoding ("v@:@" for a method taking an
+/// object and returning nothing, "c@:@" returning a BOOL).
+pub fn add_method(cls: usize, name: []u8, imp: usize, types: []u8) bool {
+    let mut buf: [64]u8 = [0; 64];
+    let p = cstr(buf[..], types) catch return false;
+    return class_addMethod(cls, sel(name), imp, p) != 0;
+}
+
+/// Adds a word-sized instance variable to a class being defined (before
+/// register_class).
+pub fn add_ivar(cls: usize, name: []u8) bool {
+    let mut buf: [64]u8 = [0; 64];
+    let p = cstr(buf[..], name) catch return false;
+    return class_addIvar(cls, p, 8, 3, "^v\x00".ptr) != 0;
+}
+
+/// Finishes defining a class: it can now make instances.
+pub fn register_class(cls: usize) void {
+    objc_registerClassPair(cls);
+}
+
+/// An instance variable of obj added with add_ivar (0 if there is none).
+pub fn get_ivar(obj: usize, name: []u8) usize {
+    let off = ivar_offset(obj, name);
+    if off < 0 {
+        return 0;
+    }
+    return @ptr_from_int(*usize, obj + @bit_cast(usize, off)).*;
+}
+
+pub fn set_ivar(obj: usize, name: []u8, value: usize) void {
+    let off = ivar_offset(obj, name);
+    if off >= 0 {
+        @ptr_from_int(*mut usize, obj + @bit_cast(usize, off)).* = value;
+    }
+}
+
+fn ivar_offset(obj: usize, name: []u8) isize {
+    if obj == 0 {
+        return -1;
+    }
+    let mut buf: [64]u8 = [0; 64];
+    let p = cstr(buf[..], name) catch return -1;
+    let iv = class_getInstanceVariable(object_getClass(obj), p);
+    if iv == 0 {
+        return -1;
+    }
+    return ivar_getOffset(iv);
+}

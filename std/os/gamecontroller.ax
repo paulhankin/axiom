@@ -1,0 +1,395 @@
+// =============================================================================
+// std/os/gamecontroller.ax - game controllers on macOS (Apple's
+// GameController framework: Xbox, PlayStation, Switch Pro and MFi
+// controllers): up to four pads' buttons, triggers and sticks, rumble,
+// battery. The same interface as std/os/xinput on Windows, buttons and all:
+//
+//     let p = gamecontroller.state(0);          // pad 0
+//     if p.connected and p.down(gamecontroller.A) { jump(); }
+//     move(p.left_x, p.left_y);                 // -1..1, the dead zone removed
+//     _ = gamecontroller.vibrate(0, 0.5, 0.0);
+//
+// Buttons are named by their places on an Xbox controller (A is the bottom
+// face button: cross on a PlayStation controller, B on a Switch's). The
+// system finds controllers while the program's events are read (a
+// std/os/cocoa window's next_event), and sends their input to the app in
+// front. macOS only (--target=aarch64-macos).
+// =============================================================================
+
+import "objc.ax" as objc;
+
+extern "C" "System" {
+    fn dlsym(handle: usize, name: *u8) usize;
+}
+
+pub const MAX_PADS: u32 = 4;
+
+// Buttons (bits of Pad.buttons): XInput's
+pub const DPAD_UP: u16 = 0x0001;
+pub const DPAD_DOWN: u16 = 0x0002;
+pub const DPAD_LEFT: u16 = 0x0004;
+pub const DPAD_RIGHT: u16 = 0x0008;
+pub const START: u16 = 0x0010;  // the menu button
+pub const BACK: u16 = 0x0020;   // the options (view) button
+pub const LEFT_THUMB: u16 = 0x0040;
+pub const RIGHT_THUMB: u16 = 0x0080;
+pub const LEFT_SHOULDER: u16 = 0x0100;
+pub const RIGHT_SHOULDER: u16 = 0x0200;
+pub const A: u16 = 0x1000;
+pub const B: u16 = 0x2000;
+pub const X: u16 = 0x4000;
+pub const Y: u16 = 0x8000;
+
+// Dead zones, as fractions of the sticks' and triggers' travel (XInput's)
+const LEFT_DEADZONE: f32 = 0.24;
+const RIGHT_DEADZONE: f32 = 0.265;
+const TRIGGER_THRESHOLD: f32 = 0.12;
+
+pub struct Pad {
+    connected: bool,
+    packet: u32,  // changes whenever the state does
+    buttons: u16,
+    left_trigger: f32,  // 0..1
+    right_trigger: f32,
+    left_x: f32,  // -1..1 (right, up positive)
+    left_y: f32,
+    right_x: f32,
+    right_y: f32,
+
+    /// Is a button (or all of several) held?
+    pub fn down(self: Pad, b: u16) bool {
+        return (self.buttons & b) == b;
+    }
+}
+
+fn stick(x: f32, y: f32, dead: f32, ox: *mut f32, oy: *mut f32) void {
+    let mag = @sqrt((x * x) + (y * y));
+    if mag <= dead {
+        ox.* = 0.0;
+        oy.* = 0.0;
+        return;
+    }
+    // scale what is outside the dead zone to 0..1, keeping the direction
+    let m = @min(mag, 1.0);
+    let k = ((m - dead) / (1.0 - dead)) / mag;
+    ox.* = x * k;
+    oy.* = y * k;
+}
+
+fn trigger(v: f32) f32 {
+    if v <= TRIGGER_THRESHOLD {
+        return 0.0;
+    }
+    return @min((v - TRIGGER_THRESHOLD) / (1.0 - TRIGGER_THRESHOLD), 1.0);
+}
+
+// The controller for pad `index` (0 if there is none).
+fn controller(index: u32) usize {
+    let mut cls = objc.class("GCController");
+    if cls == 0 {
+        _ = objc.framework("GameController");
+        _ = objc.framework("CoreHaptics");
+        cls = objc.class("GCController");
+    }
+    let list = objc.call(cls, "controllers");
+    if (list == 0) or (@as(usize, index) >= objc.call(list, "count")) {
+        return 0;
+    }
+    return objc.call1(list, "objectAtIndex:", @as(usize, index));
+}
+
+fn pressed(el: usize) bool {
+    return (el != 0) and objc.send_bool(el, objc.sel("isPressed"));
+}
+
+fn value(el: usize) f32 {
+    if el == 0 {
+        return 0.0;
+    }
+    return objc.send_f32(el, objc.sel("value"));
+}
+
+/// Pad `index` (0..3) now.
+pub fn state(index: u32) Pad {
+    let mut p = Pad.{ connected: false, packet: 0, buttons: 0, left_trigger: 0.0, right_trigger: 0.0, left_x: 0.0,
+                      left_y: 0.0, right_x: 0.0, right_y: 0.0 };
+    if index >= MAX_PADS {
+        return p;
+    }
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    let c = controller(index);
+    if c == 0 {
+        return p;
+    }
+    let g = objc.call(c, "extendedGamepad");
+    if g == 0 {
+        return p;  // (a controller with fewer controls, a Siri remote)
+    }
+    p.connected = true;
+    let names: [14][]u8 = ["buttonA", "buttonB", "buttonX", "buttonY", "leftShoulder", "rightShoulder", "buttonMenu",
+                           "buttonOptions", "leftThumbstickButton", "rightThumbstickButton", "", "", "", ""];
+    let bits: [10]u16 = [A, B, X, Y, LEFT_SHOULDER, RIGHT_SHOULDER, START, BACK, LEFT_THUMB, RIGHT_THUMB];
+    for k in @as(usize, 0)..10 {
+        let s = objc.sel(names[k]);
+        if objc.responds(g, s) and pressed(objc.send(g, s)) {
+            p.buttons = p.buttons | bits[k];
+        }
+    }
+    let dpad = objc.call(g, "dpad");
+    if pressed(objc.call(dpad, "up")) {
+        p.buttons = p.buttons | DPAD_UP;
+    }
+    if pressed(objc.call(dpad, "down")) {
+        p.buttons = p.buttons | DPAD_DOWN;
+    }
+    if pressed(objc.call(dpad, "left")) {
+        p.buttons = p.buttons | DPAD_LEFT;
+    }
+    if pressed(objc.call(dpad, "right")) {
+        p.buttons = p.buttons | DPAD_RIGHT;
+    }
+    p.left_trigger = trigger(value(objc.call(g, "leftTrigger")));
+    p.right_trigger = trigger(value(objc.call(g, "rightTrigger")));
+    let ls = objc.call(g, "leftThumbstick");
+    let rs = objc.call(g, "rightThumbstick");
+    stick(value(objc.call(ls, "xAxis")), value(objc.call(ls, "yAxis")), LEFT_DEADZONE, &mut p.left_x, &mut p.left_y);
+    stick(value(objc.call(rs, "xAxis")), value(objc.call(rs, "yAxis")), RIGHT_DEADZONE, &mut p.right_x, &mut p.right_y);
+    // a number that changes with the state (XInput's packet number)
+    let mut h: u32 = 2166136261;
+    let vals: [6]f32 = [p.left_trigger, p.right_trigger, p.left_x, p.left_y, p.right_x, p.right_y];
+    h = (h ^ @as(u32, p.buttons)) *% 16777619;
+    for v in vals {
+        h = (h ^ @bit_cast(u32, v)) *% 16777619;
+    }
+    p.packet = h;
+    return p;
+}
+
+// Rumble: a haptic engine per pad (Core Haptics, through the controller),
+// playing one continuous event at a time.
+struct Rumble {
+    controller: usize,  // the controller it is for
+    engine: usize,      // CHHapticEngine
+    player: usize,      // the CHHapticPatternPlayer playing (0: none)
+    left: f32,
+    right: f32,
+}
+
+let mut rumbles: [4]Rumble = [Rumble.{ controller: 0, engine: 0, player: 0, left: 0.0, right: 0.0 }; 4];
+
+// An NSString constant a framework exports.
+fn constant(sym: *u8) usize {
+    let p = dlsym(@bit_cast(usize, @as(isize, -2)), sym);  // RTLD_DEFAULT
+    if p == 0 {
+        return 0;
+    }
+    return @ptr_from_int(*usize, p).*;
+}
+
+fn stop_player(r: *mut Rumble) void {
+    if r.player != 0 {
+        let stop = @bit_cast(fn(usize, usize, f64, *mut usize) u8, objc.msg_send());
+        let mut err: usize = 0;
+        _ = stop(r.player, objc.sel("stopAtTime:error:"), 0.0, &mut err);
+        objc.release(r.player);
+        r.player = 0;
+    }
+}
+
+fn release_rumble(r: *mut Rumble) void {
+    stop_player(r);
+    if r.engine != 0 {
+        _ = objc.call(r.engine, "stop");
+        objc.release(r.engine);
+    }
+    r.engine = 0;
+    r.controller = 0;
+}
+
+/// Sets pad `index`'s rumble: the left (low-frequency) and right
+/// (high-frequency) motors, 0..1; false if the pad is not there or cannot
+/// rumble.
+pub fn vibrate(index: u32, left: f32, right: f32) bool {
+    if index >= MAX_PADS {
+        return false;
+    }
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    let r = &mut rumbles[@as(usize, index)];
+    let c = controller(index);
+    if c != r.controller {
+        release_rumble(r);  // (another controller, or none)
+    }
+    if c == 0 {
+        return false;
+    }
+    let l = @max(@min(left, 1.0), 0.0);
+    let h = @max(@min(right, 1.0), 0.0);
+    if (r.engine != 0) and (l == r.left) and (h == r.right) {
+        return true;
+    }
+    if r.engine == 0 {
+        if not objc.responds(c, objc.sel("haptics")) {
+            return false;
+        }
+        let haptics = objc.call(c, "haptics");
+        let locality = constant("GCHapticsLocalityDefault\x00".ptr);
+        if (haptics == 0) or (locality == 0) {
+            return false;
+        }
+        let engine = objc.call1(haptics, "createEngineWithLocality:", locality);
+        if engine == 0 {
+            return false;
+        }
+        let start = @bit_cast(fn(usize, usize, *mut usize) u8, objc.msg_send());
+        let mut err: usize = 0;
+        if start(engine, objc.sel("startAndReturnError:"), &mut err) == 0 {
+            return false;
+        }
+        r.engine = objc.retain(engine);
+        r.controller = c;
+    }
+    stop_player(r);
+    r.left = l;
+    r.right = h;
+    if (l == 0.0) and (h == 0.0) {
+        return true;
+    }
+    // one continuous event: as strong as the stronger motor, as sharp as
+    // the high-frequency one's share
+    let continuous = constant("CHHapticEventTypeHapticContinuous\x00".ptr);
+    let intensity_id = constant("CHHapticEventParameterIDHapticIntensity\x00".ptr);
+    let sharpness_id = constant("CHHapticEventParameterIDHapticSharpness\x00".ptr);
+    if (continuous == 0) or (intensity_id == 0) or (sharpness_id == 0) {
+        return false;
+    }
+    let param = @bit_cast(fn(usize, usize, usize, f32) usize, objc.msg_send());
+    let ip = objc.autorelease(param(objc.alloc("CHHapticEventParameter"), objc.sel("initWithParameterID:value:"),
+                                    intensity_id, @max(l, h)));
+    let sp = objc.autorelease(param(objc.alloc("CHHapticEventParameter"), objc.sel("initWithParameterID:value:"),
+                                    sharpness_id, h / (l + h)));
+    let ps: [2]usize = [ip, sp];
+    let params = objc.send2(objc.class("NSArray"), objc.sel("arrayWithObjects:count:"), @int_from_ptr(&ps[0]), 2);
+    let ev_init = @bit_cast(fn(usize, usize, usize, usize, f64, f64) usize, objc.msg_send());
+    let ev = objc.autorelease(ev_init(objc.alloc("CHHapticEvent"),
+                                      objc.sel("initWithEventType:parameters:relativeTime:duration:"), continuous,
+                                      params, 0.0, 30.0));
+    let evs: [1]usize = [ev];
+    let events = objc.send2(objc.class("NSArray"), objc.sel("arrayWithObjects:count:"), @int_from_ptr(&evs[0]), 1);
+    let none = objc.call(objc.class("NSArray"), "array");
+    let mut err: usize = 0;
+    let pat_init = @bit_cast(fn(usize, usize, usize, usize, *mut usize) usize, objc.msg_send());
+    let pattern = objc.autorelease(pat_init(objc.alloc("CHHapticPattern"), objc.sel("initWithEvents:parameters:error:"),
+                                            events, none, &mut err));
+    if pattern == 0 {
+        return false;
+    }
+    let mk = @bit_cast(fn(usize, usize, usize, *mut usize) usize, objc.msg_send());
+    let player = mk(r.engine, objc.sel("createPlayerWithPattern:error:"), pattern, &mut err);
+    if player == 0 {
+        return false;
+    }
+    let play = @bit_cast(fn(usize, usize, f64, *mut usize) u8, objc.msg_send());
+    if play(player, objc.sel("startAtTime:error:"), 0.0, &mut err) == 0 {
+        return false;
+    }
+    r.player = objc.retain(player);
+    return true;
+}
+
+pub enum BatteryKind: u8 {
+    DISCONNECTED,
+    WIRED,  // charging, or full and plugged in
+    ALKALINE,
+    NIMH,  // (any rechargeable battery, discharging)
+    UNKNOWN,
+}
+
+pub struct Battery {
+    kind: BatteryKind,
+    level: u8,  // 0 empty, 1 low, 2 medium, 3 full
+}
+
+pub fn battery(index: u32) Battery {
+    let mut b = Battery.{ kind: BatteryKind.DISCONNECTED, level: 0 };
+    if index >= MAX_PADS {
+        return b;
+    }
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    let c = controller(index);
+    if c == 0 {
+        return b;
+    }
+    b.kind = BatteryKind.UNKNOWN;
+    if not objc.responds(c, objc.sel("battery")) {
+        return b;
+    }
+    let bat = objc.call(c, "battery");
+    if bat == 0 {
+        return b;  // (a wired controller has none)
+    }
+    let level = objc.send_f32(bat, objc.sel("batteryLevel"));
+    let st = @bit_cast(isize, objc.call(bat, "batteryState"));  // unknown -1, discharging, charging, full
+    if (st == 1) or (st == 2) {
+        b.kind = BatteryKind.WIRED;
+    } else if st == 0 {
+        b.kind = BatteryKind.NIMH;
+    }
+    if level >= 0.7 {
+        b.level = 3;
+    } else if level >= 0.35 {
+        b.level = 2;
+    } else if level >= 0.05 {
+        b.level = 1;
+    }
+    return b;
+}
+
+/// Buttons pressed and released between updates, for all pads.
+pub struct Tracker {
+    prev: [4]u16,
+    now: [4]u16,
+
+    pub fn init() Tracker {
+        return Tracker.{ prev: [0; 4], now: [0; 4] };
+    }
+
+    /// Reads every pad; returns them.
+    pub fn update(self: *mut Tracker) [4]Pad {
+        let mut pads: [4]Pad = [state(0), state(1), state(2), state(3)];
+        for i in @as(usize, 0)..4 {
+            self.prev[i] = self.now[i];
+            self.now[i] = pads[i].buttons;
+        }
+        return pads;
+    }
+
+    /// Went down since the last update?
+    pub fn pressed(self: *Tracker, pad: u32, b: u16) bool {
+        let i = @as(usize, pad);
+        return ((self.now[i] & b) != 0) and ((self.prev[i] & b) == 0);
+    }
+
+    pub fn released(self: *Tracker, pad: u32, b: u16) bool {
+        let i = @as(usize, pad);
+        return ((self.now[i] & b) == 0) and ((self.prev[i] & b) != 0);
+    }
+}
+
+/// The name of pad `index`'s controller ("Xbox Wireless Controller",
+/// "DualSense Wireless Controller"); empty if there is none. Valid until
+/// the next call.
+pub fn name(index: u32) []u8 {
+    let c = controller(index);
+    if c == 0 {
+        return "";
+    }
+    let n = objc.string_of(objc.call(c, "vendorName"));
+    let k = @min(n.len, name_buf.len);
+    @mem_copy(name_buf[0..k], n[0..k]);
+    return name_buf[0..k];
+}
+
+let mut name_buf: [128]u8 = [0; 128];

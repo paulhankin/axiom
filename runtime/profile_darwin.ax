@@ -1,0 +1,411 @@
+// =============================================================================
+// runtime/profile_darwin.ax - the sampling profiler (spec §16.6) on macOS,
+// in place of runtime/profile.ax. `axiom profile` builds it in and runs the
+// program with AXIOM_PROFILE=<raw output file> and AXIOM_PROFILE_HZ=<rate>;
+// the output is the same raw format.
+//
+// macOS has no POSIX CPU-time timers, and its setitimer(ITIMER_PROF) fires
+// at a third of the rate asked for, so a sampler thread does what SIGPROF
+// does on Linux (as on Windows, runtime/profile_windows.ax). Each Axiom
+// thread registers itself (runtime/darwin.ax calls thread_hook as threads
+// start and end). At every tick the sampler reads each thread's CPU time
+// from the kernel (thread_info, in nanoseconds) and credits it the time it
+// used since the last tick; a thread with a period's worth of credit is
+// suspended, its shadow stack (§16.4) copied, and resumed, with the sample
+// weighted by the periods it stands for. So the counts measure CPU time,
+// and a thread that waits is not sampled.
+//
+// The sampler is the only writer of the sample buffer, and it holds the
+// lock through each tick; the threads take it only to register. It never
+// allocates while a thread is suspended (that thread may hold the heap's
+// lock).
+// =============================================================================
+import "darwin.ax" as rt;
+import "trap_format.ax" as tf;
+
+extern "C" {
+    fn mach_thread_self() u32;
+    fn task_self_trap() u32;
+    fn mach_port_deallocate(task: u32, name: u32) i32;
+    fn thread_suspend(t: u32) i32;
+    fn thread_resume(t: u32) i32;
+    fn thread_info(t: u32, flavor: i32, info: *mut u32, count: *mut u32) i32;
+    fn thread_get_state(t: u32, flavor: i32, state: *mut u32, count: *mut u32) i32;
+}
+
+struct Entry {
+    at: usize,  // offset of the sample in buf
+    count: u64,
+}
+
+// A registered thread.
+struct Slot {
+    port: u32,  // its Mach thread port
+    ss: *tf.ShadowStack,
+    last: u64,    // its CPU time (ns) at the last tick
+    credit: i64,  // nanoseconds used and not yet sampled
+    main: bool,
+}
+
+const BUF_WORDS: usize = 32 << 20;  // 256 MiB of address space, touched only as used
+const THREAD_BIT: u64 = 1 << 63;
+const NSLOTS: usize = 1024;
+const THREAD_EXTENDED_INFO: i32 = 5;
+const ARM_THREAD_STATE64: i32 = 6;
+
+let mut buf: *mut u64 = @ptr_from_int(*mut u64, 0);
+let mut buf_pos: usize = 0;
+let mut dropped: u64 = 0;
+let mut hz: i32 = 999;
+let mut period: i64 = 0;  // nanoseconds per sampling period
+let mut out_path: *u8 = @ptr_from_int(*u8, 0);
+let mut written: bool = false;
+let mut stopped: bool = false;
+let mut reg_lock: u32 = 0;
+let mut slots: [1024]Slot = [Slot.{ port: 0, ss: @ptr_from_int(*tf.ShadowStack, 0), last: 0, credit: 0,
+                                    main: false }; 1024];
+let mut nslots: usize = 0;
+let mut task: u32 = 0;
+
+fn words() []mut u64 {
+    return @slice_from_ptr(buf, BUF_WORDS);
+}
+
+fn lock() void {
+    while @atomic_xchg(&mut reg_lock, 1) != 0 {}
+}
+
+fn unlock() void {
+    _ = @atomic_xchg(&mut reg_lock, 0);
+}
+
+// Pages from the system (zeroed, touched only as used); 0 if there are none.
+fn pages(n: usize) usize {
+    let p = @int_from_ptr(rt.mmap(@ptr_from_int(*mut void, 0), n, 3, 0x1002, -1, 0));  // PROT_READ | PROT_WRITE; MAP_ANON | MAP_PRIVATE
+    if p == @bit_cast(usize, @as(isize, -1)) {  // MAP_FAILED
+        return 0;
+    }
+    return p;
+}
+
+// A thread's CPU time (user and system) in nanoseconds.
+fn cpu_ns(port: u32) u64 {
+    // struct thread_extended_info: pth_user_time, pth_system_time (u64 ns), ...
+    let mut info: [28]u32 = [0; 28];
+    let mut count: u32 = 28;
+    if thread_info(port, THREAD_EXTENDED_INFO, &mut info[0], &mut count) != 0 {
+        return 0;
+    }
+    let user = @as(u64, info[0]) | (@as(u64, info[1]) << 32);
+    let sys = @as(u64, info[2]) | (@as(u64, info[3]) << 32);
+    return user + sys;
+}
+
+// Adds the calling thread to the threads sampled (or, start false, removes it).
+fn register(start: bool) void {
+    let port = mach_thread_self();
+    lock();
+    if start {
+        if nslots < NSLOTS {
+            slots[nslots] = Slot.{ port: port, ss: rt.axiom_shadow_stack(), last: cpu_ns(port), credit: 0,
+                                   main: nslots == 0 };
+            nslots += 1;
+            unlock();
+            return;  // (the slot keeps the port's reference)
+        }
+    } else {
+        for i in 0..nslots {
+            if slots[i].port == port {
+                _ = mach_port_deallocate(task, slots[i].port);
+                nslots -= 1;
+                slots[i] = slots[nslots];
+                break;
+            }
+        }
+    }
+    unlock();
+    _ = mach_port_deallocate(task, port);
+}
+
+// Each sample: [depth (top bit: not the main thread), weight, frames...].
+fn sample(s: *mut Slot, weight: u64) void {
+    if thread_suspend(s.port) != 0 {
+        return;
+    }
+    // Asking for the thread's registers waits until it has stopped.
+    let mut state: [68]u32 = [0; 68];
+    let mut count: u32 = 68;
+    _ = thread_get_state(s.port, ARM_THREAD_STATE64, &mut state[0], &mut count);
+    let ss = s.ss;
+    let depth = ss.depth;
+    let mut n = depth;
+    if n > tf.SS_CAP {
+        n = tf.SS_CAP;
+    }
+    if (buf_pos + @as(usize, n) + 2) <= BUF_WORDS {
+        let w = words();
+        let at = buf_pos;
+        w[at] = @as(u64, depth);
+        if not s.main {
+            w[at] = w[at] | THREAD_BIT;
+        }
+        w[at + 1] = weight;
+        for i in 0..n {
+            w[at + 2 + @as(usize, i)] = @as(u64, @int_from_ptr(tf.call_at(ss, (depth - 1) - i)));
+        }
+        buf_pos = at + @as(usize, n) + 2;
+    } else {
+        dropped += 1;
+    }
+    _ = thread_resume(s.port);
+}
+
+fn tick() bool {
+    lock();
+    if stopped {
+        unlock();
+        return false;
+    }
+    for i in 0..nslots {
+        let s = &mut slots[i];
+        let c = cpu_ns(s.port);
+        if c > s.last {
+            s.credit += @bit_cast(i64, c - s.last);
+            s.last = c;
+        }
+        if (s.credit * 2) < period {
+            continue;
+        }
+        let weight = (s.credit + (period / 2)) / period;
+        s.credit -= weight * period;
+        if not tf.is_null(@ptr_cast(*void, s.ss)) {
+            sample(s, @bit_cast(u64, weight));
+        }
+    }
+    unlock();
+    return true;
+}
+
+fn sampler(arg: *mut void) *mut void {
+    _ = arg;
+    let ts = rt.Timespec.{ sec: 0, nsec: period };
+    loop {
+        _ = rt.nanosleep(&ts, @ptr_from_int(*mut rt.Timespec, 0));
+        if not tick() {
+            return @ptr_from_int(*mut void, 0);
+        }
+    }
+}
+
+fn thread_event(start: bool) void {
+    register(start);
+}
+
+fn hash_words(s: []u64) u64 {
+    let mut h: u64 = 1469598103934665603;
+    for x in s {
+        h = (h ^ x) *% 1099511628211;
+    }
+    return h;
+}
+
+fn sample_len(at: usize) usize {
+    let d = words()[at] & ~THREAD_BIT;
+    if d < @as(u64, tf.SS_CAP) {
+        return 2 + @truncate(usize, d);
+    }
+    return 2 + @as(usize, tf.SS_CAP);
+}
+
+// Buffered output to a file descriptor.
+struct Out {
+    fd: i32,
+    n: usize,
+    b: [8192]u8,
+}
+
+fn out_flush(o: *mut Out) void {
+    let mut off: usize = 0;
+    while off < o.n {
+        let w = rt.write(o.fd, &o.b[off], o.n - off);
+        if w <= 0 {
+            break;
+        }
+        off += @int_cast(usize, w);
+    }
+    o.n = 0;
+}
+
+fn out_s(o: *mut Out, s: []u8) void {
+    for c in s {
+        if o.n == 8192 {
+            out_flush(o);
+        }
+        o.b[o.n] = c;
+        o.n += 1;
+    }
+}
+
+fn out_u(o: *mut Out, v: u64) void {
+    let mut tmp: [24]u8 = [0; 24];
+    let mut f = tf.fmt(tmp[..]);
+    f.u(v);
+    out_s(o, f.text());
+}
+
+fn put_site(o: *mut Out, s: *tf.Site) void {
+    out_s(o, "\t");
+    out_u(o, @as(u64, s.file_id));
+    out_s(o, "\x1f");
+    out_u(o, @as(u64, s.start));
+    out_s(o, "\x1f");
+    out_u(o, @as(u64, s.end));
+    out_s(o, "\x1f");
+    out_s(o, tf.cstr(s.fn_));
+}
+
+fn same_sample(a: usize, b: usize, n: usize) bool {
+    let w = words();
+    if (sample_len(a) != n) or (w[a] != w[b]) {
+        return false;
+    }
+    for k in 2..n {
+        if w[a + k] != w[b + k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn write_profile() void {
+    if written or (@int_from_ptr(buf) == 0) {
+        return;
+    }
+    written = true;
+    rt.has_thread_hook = false;
+    // stop the sampler (it may be in the middle of a tick)
+    lock();
+    stopped = true;
+    unlock();
+    let end = buf_pos;
+    let fd = rt.open(out_path, 0x0100_0601, @as(i32, 0o644));  // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    if fd < 0 {
+        return;
+    }
+    let o = @ptr_from_int(*mut Out, pages(@size_of(Out)));
+    if @int_from_ptr(o) == 0 {
+        _ = rt.close(fd);
+        return;
+    }
+    o.fd = fd;
+    o.n = 0;
+    out_s(o, "# axiom-profile-raw 1\nhz ");
+    out_u(o, @as(u64, @bit_cast(u32, hz)));
+    out_s(o, "\nclock cpu\n");
+    if dropped != 0 {
+        out_s(o, "dropped ");
+        out_u(o, dropped);
+        out_s(o, "\n");
+    }
+    let mut cap: usize = 1024;
+    while cap < (end / 4) {
+        cap = cap << 1;
+    }
+    let tp = @ptr_from_int(*mut Entry, pages(cap * @size_of(Entry)));  // (zeroed)
+    if @int_from_ptr(tp) == 0 {
+        out_flush(o);
+        _ = rt.close(fd);
+        return;
+    }
+    let tab = @slice_from_ptr(tp, cap);
+    let w = words();
+    let mut at: usize = 0;
+    while at < end {
+        let n = sample_len(at);
+        if (at + n) > end {
+            break;
+        }
+        let wt = w[at + 1];
+        let mut h = @truncate(usize, hash_words(w[at..at + 1]) ^ hash_words(w[at + 2..at + n])) & (cap - 1);
+        loop {
+            if tab[h].count == 0 {
+                tab[h].at = at;
+                tab[h].count = wt;
+                break;
+            }
+            if same_sample(tab[h].at, at, n) {
+                tab[h].count += wt;
+                break;
+            }
+            h = (h + 1) & (cap - 1);
+        }
+        at += n;
+    }
+    for i in 0..cap {
+        if tab[i].count == 0 {
+            continue;
+        }
+        let s = tab[i].at;
+        let n = sample_len(s) - 2;
+        let mut leaf: []u8 = "main";
+        if n > 0 {
+            let inner = @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2]));
+            leaf = tf.cstr(inner.callee);
+            if leaf.len == 0 {
+                leaf = "<indirect call>";
+            }
+        } else if (w[s] & THREAD_BIT) != 0 {
+            leaf = "<thread entry>";
+        }
+        out_s(o, "S\t");
+        out_u(o, tab[i].count);
+        out_s(o, "\t");
+        out_u(o, w[s] & ~THREAD_BIT);
+        out_s(o, "\t");
+        out_s(o, leaf);
+        for k in 0..n {
+            put_site(o, @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2 + k])));
+        }
+        out_s(o, "\n");
+    }
+    out_flush(o);
+    _ = rt.close(fd);
+    _ = rt.munmap(@ptr_from_int(*mut void, @int_from_ptr(tp)), cap * @size_of(Entry));
+    _ = rt.munmap(@ptr_from_int(*mut void, @int_from_ptr(o)), @size_of(Out));
+}
+
+export fn ax_profile_start() void {
+    let p0 = rt.getenv("AXIOM_PROFILE\x00".ptr);
+    if @int_from_ptr(p0) == 0 {
+        return;
+    }
+    out_path = p0;  // (NUL-terminated, in the environment)
+    let r = rt.getenv("AXIOM_PROFILE_HZ\x00".ptr);
+    let mut v: i32 = 0;
+    if @int_from_ptr(r) != 0 {
+        for c in tf.cstr(r) {
+            if (c < '0') or (c > '9') or (v > 1_000_000) {
+                break;
+            }
+            v = (v * 10) + @as(i32, c - '0');
+        }
+    }
+    if v > 0 {
+        hz = v;
+    }
+    period = @as(i64, 1_000_000_000 / hz);
+    let p = pages(BUF_WORDS * 8);
+    if p == 0 {
+        return;
+    }
+    buf = @ptr_from_int(*mut u64, p);
+    task = task_self_trap();
+    register(true);  // the main thread
+    rt.thread_hook = thread_event;
+    rt.has_thread_hook = true;
+    // written when main returns (ax_rt_fini), at exit, or at a trap or crash
+    rt.profile_flush = write_profile;
+    rt.has_profile = true;
+    let mut t: usize = 0;
+    _ = rt.pthread_create(&mut t, @ptr_from_int(*void, 0), sampler, @ptr_from_int(*mut void, 0));
+}
