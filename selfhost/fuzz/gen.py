@@ -85,8 +85,11 @@ for ft in ['f64', 'f32']:
     P('    pf(@float_cast(f64, @float_cast(f32, @float_cast(f64, a))));')
     P('}')
 P('fn pf(x: f64) void { if x != x { print_u64(12345); } else { print_u64(@bit_cast(u64, x)); } }')
-# SIMD
-VT = [('i8x16','i8',16),('u8x16','u8',16),('i16x8','i16',8),('u16x8','u16',8),('i32x4','i32',4),('u32x4','u32',4),('i64x2','i64',2),('u64x2','u64',2)]
+# SIMD: 128-bit vectors, and the 256- and 512-bit ones (spec §5.8)
+VT = []
+for scale in (1, 2, 4):
+    for lt, n in (('i8',16),('u8',16),('i16',8),('u16',8),('i32',4),('u32',4),('i64',2),('u64',2)):
+        VT.append(('%sx%d' % (lt, n * scale), lt, n * scale))
 for vt, lt, n in VT:
     P('fn pv_%s(v: %s) void {' % (vt, vt))
     for i in range(n): P('    %s' % pr('@extract_lane(v, %d)' % i, lt))
@@ -117,18 +120,22 @@ for vt, lt, n in VT:
     P('    pv_%s(@shuffle(a, b, [%s]));' % (vt, ', '.join(map(str, idx))))
     P('    pv_%s(@select(@bit_cast(%s, @lanes_lt(a, b)), a, b));' % (vt, vt))
     P('}')
-P('fn pvf(v: f32x4) void { pf(@float_cast(f64, @extract_lane(v, 0))); pf(@float_cast(f64, @extract_lane(v, 1))); pf(@float_cast(f64, @extract_lane(v, 2))); pf(@float_cast(f64, @extract_lane(v, 3))); }')
-P('fn pvd(v: f64x2) void { pf(@extract_lane(v, 0)); pf(@extract_lane(v, 1)); }')
-P('fn sf(a: f32x4, b: f32x4, c: f64x2, d: f64x2) void {')
-for e in ['a + b', 'a - b', 'a * b', 'a / b', '@min(a, b)', '@max(a, b)', '@sqrt(@abs(a))', '@floor(a)', '@ceil(a)', '@trunc(a)', '@nearest(a)', '-a', '@fma(a, b, a)']:
-    P('    pvf(%s);' % e)
-for e in ['c + d', 'c - d', 'c * d', 'c / d', '@min(c, d)', '@max(c, d)', '@sqrt(@abs(c))', '@floor(c)', '@nearest(c)', '-c', '@fma(c, d, c)']:
-    P('    pvd(%s);' % e)
-P('    pf(@float_cast(f64, @reduce_add(a))); pf(@reduce_add(c)); pf(@float_cast(f64, @dot(a, b)));')
-P('    print_u64(@as(u64, @bitmask(@lanes_lt(a, b)))); print_u64(@as(u64, @bitmask(@lanes_ge(c, d))));')
-P('}')
-P('fn sw(a: u8x16, idx: u8x16) void { pv_u8x16(@swizzle(a, idx)); }')
-P('fn dt(a: i16x8, b: i16x8) void { pv_i32x4(@dot(a, b)); }')
+for scale in (1, 2, 4):
+    f4, d2 = 'f32x%d' % (4 * scale), 'f64x%d' % (2 * scale)
+    P('fn pvf_%s(v: %s) void { %s }' % (f4, f4, ' '.join('pf(@float_cast(f64, @extract_lane(v, %d)));' % i for i in range(4 * scale))))
+    P('fn pvd_%s(v: %s) void { %s }' % (d2, d2, ' '.join('pf(@extract_lane(v, %d));' % i for i in range(2 * scale))))
+    P('fn sf_%d(a: %s, b: %s, c: %s, d: %s) void {' % (scale, f4, f4, d2, d2))
+    for e in ['a + b', 'a - b', 'a * b', 'a / b', '@min(a, b)', '@max(a, b)', '@sqrt(@abs(a))', '@floor(a)', '@ceil(a)', '@trunc(a)', '@nearest(a)', '-a', '@fma(a, b, a)']:
+        P('    pvf_%s(%s);' % (f4, e))
+    for e in ['c + d', 'c - d', 'c * d', 'c / d', '@min(c, d)', '@max(c, d)', '@sqrt(@abs(c))', '@floor(c)', '@nearest(c)', '-c', '@fma(c, d, c)']:
+        P('    pvd_%s(%s);' % (d2, e))
+    P('    pf(@float_cast(f64, @reduce_add(a))); pf(@reduce_add(c)); pf(@float_cast(f64, @dot(a, b)));')
+    P('    print_u64(@as(u64, @bitmask(@lanes_lt(a, b)))); print_u64(@as(u64, @bitmask(@lanes_ge(c, d))));')
+    P('    pvf_%s(@select(@lanes_gt(a, b), a, b));' % f4)
+    P('}')
+    b8, i16, i32 = 'u8x%d' % (16 * scale), 'i16x%d' % (8 * scale), 'i32x%d' % (4 * scale)
+    P('fn sw_%d(a: %s, idx: %s) void { pv_%s(@swizzle(a, idx)); }' % (scale, b8, b8, b8))
+    P('fn dt_%d(a: %s, b: %s) void { pv_%s(@dot(a, b)); }' % (scale, i16, i16, i32))
 P('export fn run() void {')
 for t, bits, s in INTS:
     P('    for i in 0..v_%s.len { u_%s(v_%s[i]); for j in 0..v_%s.len { t_%s(v_%s[i], v_%s[j]); } }' % (t,t,t,t,t,t,t))
@@ -136,13 +143,15 @@ for ft in ['f64', 'f32']:
     P('    for i in 0..v_%s.len { g_%s(v_%s[i]); for j in 0..v_%s.len { f_%s(v_%s[i], v_%s[j]); } }' % (ft,ft,ft,ft,ft,ft,ft))
 for vt, lt, n in VT:
     P('    for i in @as(usize, 0)..6 { s_%s(mk_%s(i), mk_%s(i + 3)); }' % (vt, vt, vt))
-P('    for i in @as(usize, 0)..4 { sw(mk_u8x16(i), mk_u8x16(i + 5)); dt(mk_i16x8(i), mk_i16x8(i + 2)); }')
-P('    for i in @as(usize, 0)..5 {')
-P('        let a = @vec(f32x4, v_f32[i], v_f32[i + 1], v_f32[i + 2], v_f32[i + 3]);')
-P('        let b = @vec(f32x4, v_f32[i + 4], v_f32[i + 5], v_f32[i + 6], v_f32[i + 7]);')
-P('        let c = @vec(f64x2, v_f64[i], v_f64[i + 3]);')
-P('        let d = @vec(f64x2, v_f64[i + 5], v_f64[i + 7]);')
-P('        sf(a, b, c, d);')
-P('    }')
+for scale in (1, 2, 4):
+    P('    for i in @as(usize, 0)..4 { sw_%d(mk_u8x%d(i), mk_u8x%d(i + 5)); dt_%d(mk_i16x%d(i), mk_i16x%d(i + 2)); }' % (scale, 16 * scale, 16 * scale, scale, 8 * scale, 8 * scale))
+    nf, nd = 4 * scale, 2 * scale
+    P('    for i in @as(usize, 0)..5 {')
+    P('        let a = @vec(f32x%d, %s);' % (nf, ', '.join('v_f32[(i + %d) %% v_f32.len]' % k for k in range(nf))))
+    P('        let b = @vec(f32x%d, %s);' % (nf, ', '.join('v_f32[(i + %d) %% v_f32.len]' % (k + 4) for k in range(nf))))
+    P('        let c = @vec(f64x%d, %s);' % (nd, ', '.join('v_f64[(i + %d) %% v_f64.len]' % (3 * k) for k in range(nd))))
+    P('        let d = @vec(f64x%d, %s);' % (nd, ', '.join('v_f64[(i + %d) %% v_f64.len]' % (3 * k + 5) for k in range(nd))))
+    P('        sf_%d(a, b, c, d);' % scale)
+    P('    }')
 P('}')
 print('\n'.join(out))

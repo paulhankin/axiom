@@ -1,6 +1,7 @@
 // =============================================================================
 // x64enc.ax - x86-64 machine instructions: opcodes of the machine IR used by
-// x64.ax, and their binary encoding (legacy SSE or VEX when AVX is enabled).
+// x64.ax, and their binary encoding (legacy SSE, VEX when AVX is enabled,
+// with VEX.L for 256-bit vectors, and EVEX for AVX-512's 512-bit ones).
 // =============================================================================
 import "bin.ax" as bn;
 import "util.ax" as u;
@@ -23,6 +24,10 @@ pub const R13: i32 = 13;
 pub const R14: i32 = 14;
 pub const R15: i32 = 15;
 pub const XMM0: i32 = 16;
+// AVX-512 mask registers (k0-k7): never allocated; k1 is a scratch register
+// between a compare and the instruction that reads its result.
+pub const K0: i32 = 32;
+pub const K1: i32 = 33;
 
 // Machine opcodes. Operand conventions in comments: r register, m memory
 // (MOp K_MEM), i immediate; sz is the operand size in bytes.
@@ -64,6 +69,7 @@ pub const CMP_M: i32 = 35;       // cmp m, r(U) / i
 pub const LEAVE_TRAP: i32 = 36;  // unused
 pub const CPUID: i32 = 37;       // eax(UD), ebx(D), ecx(UD), edx(D)
 pub const XGETBV: i32 = 38;      // ecx(U), eax(D), edx(D)
+pub const VZEROUPPER: i32 = 39;  // the upper halves of every vector register zeroed
 
 // Condition codes
 pub const CC_O: i32 = 0;
@@ -95,10 +101,13 @@ pub struct SseDesc {
     gpr_reg: bool,   // the reg field is a general register (pextrw, movmsk, cvtt*2si)
     gpr_rm: bool,    // the r/m operand is a general register (movd/q, cvtsi2*, pinsr*)
     vex_only: bool,  // no legacy encoding (FMA, blends with is4, BMI)
+    vl_ok: bool,     // has 256-bit (VEX.L) and 512-bit (EVEX) forms on full vectors
+    ew: u8,          // EVEX.W: the element size (1: 64-bit lanes) where EVEX needs it
 }
 
 fn d(pfx: u8, map: u8, opc: u8) SseDesc {
-    return SseDesc.{ pfx: pfx, map: map, opc: opc, w: 0, digit: -1, gpr_reg: false, gpr_rm: false, vex_only: false };
+    return SseDesc.{ pfx: pfx, map: map, opc: opc, w: 0, digit: -1, gpr_reg: false, gpr_rm: false, vex_only: false,
+                     vl_ok: false, ew: 0 };
 }
 
 // Descriptor ids
@@ -264,10 +273,30 @@ pub const MOVD_XM: i32 = 159;  // movd xmm <- m32
 pub const MOVD_MX: i32 = 160;  // movd m32 <- xmm
 pub const PUNPCKHBW: i32 = 161;
 pub const PSRAD_I2: i32 = 162;
-pub const NSSE: i32 = 163;
+// AVX2 / AVX-512 (VEX.256 and EVEX.512 only)
+pub const VEXTRACTI128: i32 = 163;   // xmm/m128 (rm) <- ymm/zmm (reg) part imm (vextracti32x4 in EVEX)
+pub const VINSERTI128: i32 = 164;    // ymm/zmm (reg) <- vvvv with part imm replaced by xmm/m128 (rm)
+pub const VEXTRACTI64X4: i32 = 165;  // ymm/m256 (rm) <- zmm (reg) half imm
+pub const VINSERTI64X4: i32 = 166;   // zmm (reg) <- vvvv with half imm replaced by ymm/m256 (rm)
+pub const VPBROADCASTB: i32 = 167;   // every lane <- lane 0 of xmm (rm)
+pub const VPBROADCASTW: i32 = 168;
+pub const VPBROADCASTD: i32 = 169;
+pub const VPBROADCASTQ: i32 = 170;
+pub const VPMOVM2B: i32 = 171;  // zmm (reg) <- each lane all ones where k (rm) has its bit
+pub const VPMOVM2W: i32 = 172;
+pub const VPMOVM2D: i32 = 173;
+pub const VPMOVM2Q: i32 = 174;
+pub const VPMOVB2M: i32 = 175;  // k (reg) <- the top bit of each lane of zmm (rm)
+pub const VPMOVW2M: i32 = 176;
+pub const VPMOVD2M: i32 = 177;
+pub const VPMOVQ2M: i32 = 178;
+pub const KMOVQ_RK: i32 = 179;     // r64 (reg) <- k (rm)
+pub const VRNDSCALEPS: i32 = 180;  // EVEX's roundps: imm as roundps's
+pub const VRNDSCALEPD: i32 = 181;
+pub const NSSE: i32 = 182;
 
-let mut table: [163]SseDesc = [SseDesc.{ pfx: 0, map: 0, opc: 0, w: 0, digit: -1, gpr_reg: false, gpr_rm: false,
-                                         vex_only: false }; 163];
+let mut table: [182]SseDesc = [SseDesc.{ pfx: 0, map: 0, opc: 0, w: 0, digit: -1, gpr_reg: false, gpr_rm: false,
+                                         vex_only: false, vl_ok: false, ew: 0 }; 182];
 let mut built: bool = false;
 
 fn set(id: i32, x: SseDesc) void {
@@ -440,6 +469,84 @@ fn build() void {
     set(VFMADD231PS, x);
     x.w = 1;
     set(VFMADD231PD, x);
+    x = d(P66, 3, 0x39);
+    x.vex_only = true;
+    set(VEXTRACTI128, x);
+    x.opc = 0x38;
+    set(VINSERTI128, x);
+    x.opc = 0x3b;
+    x.ew = 1;
+    set(VEXTRACTI64X4, x);
+    x.opc = 0x3a;
+    set(VINSERTI64X4, x);
+    let bc: [4]u8 = [0x78, 0x79, 0x58, 0x59];
+    for k in @as(usize, 0)..4 {
+        x = d(P66, 2, bc[k]);
+        x.vex_only = true;
+        if k == 3 {
+            x.ew = 1;
+        }
+        set(VPBROADCASTB + @int_cast(i32, k), x);
+    }
+    let m2: [4]u8 = [0x28, 0x28, 0x38, 0x38];
+    for k in @as(usize, 0)..4 {
+        x = d(PF3, 2, m2[k]);
+        x.vex_only = true;
+        x.ew = @truncate(u8, k & 1);
+        set(VPMOVM2B + @int_cast(i32, k), x);
+        x.opc = x.opc + 1;
+        set(VPMOVB2M + @int_cast(i32, k), x);
+    }
+    x = d(PF2, 1, 0x93);
+    x.vex_only = true;
+    x.gpr_reg = true;
+    x.w = 1;
+    set(KMOVQ_RK, x);
+    x = d(P66, 3, 0x08);
+    x.vex_only = true;
+    set(VRNDSCALEPS, x);
+    x.opc = 0x09;
+    x.ew = 1;
+    set(VRNDSCALEPD, x);
+    // the packed operations with 256-bit (VEX.L) and 512-bit (EVEX) forms,
+    // and the ones whose EVEX form needs W for 64-bit lanes
+    let full: [64]i32 = [MOVAPS, MOVDQU_LD, MOVDQU_ST, ADDPS, ADDPD, MULPS, MULPD, SUBPS, SUBPD, MINPS, MINPD, DIVPS,
+                         DIVPD, MAXPS, MAXPD, SQRTPS, SQRTPD, ANDPS, ANDPD, ANDNPS, ANDNPD, ORPS, ORPD, XORPS, XORPD,
+                         CMPPS, CMPPD, PMULLD, PAND, PANDN, POR, PXOR, PCMPEQB, PCMPEQW, PCMPEQD, PCMPEQQ, PCMPGTB,
+                         PCMPGTW, PCMPGTD, PCMPGTQ, PMINUB, PMAXUB, PMINSW, PMAXSW, PABSB, PABSW, PABSD, PSHUFB, PSHUFD,
+                         PSHUFLW, PSHUFHW, SHUFPS, PUNPCKLBW, PUNPCKLWD, PUNPCKLDQ, PUNPCKLQDQ, PUNPCKHQDQ, PUNPCKHBW,
+                         PACKSSWB, PACKSSDW, PMADDWD, PMOVMSKB, MOVMSKPS, MOVMSKPD];
+    for id in full {
+        table[@int_cast(usize, id)].vl_ok = true;
+    }
+    let more: [26]i32 = [PTEST, ROUNDPS, ROUNDPD, VFMADD231PS, VFMADD231PD, PSLLW, PSLLD, PSLLQ, PSRLW, PSRLD, PSRLQ,
+                         PSRAW, PSRAD, VEXTRACTI128, VINSERTI128, VEXTRACTI64X4, VINSERTI64X4, VPBROADCASTB,
+                         VPBROADCASTW, VPBROADCASTD, VPBROADCASTQ, VPMOVM2B, VPMOVM2W, VPMOVM2D, VPMOVM2Q, VRNDSCALEPS];
+    for id in more {
+        table[@int_cast(usize, id)].vl_ok = true;
+    }
+    for k in @as(i32, 0)..19 {
+        table[@int_cast(usize, PADDB + k)].vl_ok = true;
+    }
+    for k in @as(i32, 0)..8 {
+        table[@int_cast(usize, PMINSB + k)].vl_ok = true;
+    }
+    for k in @as(i32, 0)..10 {
+        table[@int_cast(usize, PSRLW_I + k)].vl_ok = true;
+    }
+    let vb: [6]i32 = [VPMOVB2M, VPMOVW2M, VPMOVD2M, VPMOVQ2M, VRNDSCALEPD, PSRAD_I2];
+    for id in vb {
+        table[@int_cast(usize, id)].vl_ok = true;
+    }
+    let q: [22]i32 = [PADDQ, PSUBQ, PMULUDQ, PCMPEQQ, PCMPGTQ, PSLLQ, PSRLQ, PSRLQ_I, PSLLQ_I, ADDPD, MULPD, SUBPD,
+                      MINPD, DIVPD, MAXPD, SQRTPD, ANDPD, ANDNPD, ORPD, XORPD, CMPPD, PUNPCKLQDQ];
+    for id in q {
+        table[@int_cast(usize, id)].ew = 1;
+    }
+    table[@int_cast(usize, PUNPCKHQDQ)].ew = 1;
+    table[@int_cast(usize, MOVDQU_LD)].ew = 1;  // vmovdqu64
+    table[@int_cast(usize, MOVDQU_ST)].ew = 1;
+    table[@int_cast(usize, VFMADD231PD)].ew = 1;
 }
 
 pub fn desc(id: i32) SseDesc {
@@ -581,6 +688,92 @@ pub fn modrm_mem(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64) void {
     }
 }
 
+// EVEX (AVX-512) with a 512-bit vector length: 62 P0 P1 P2 opcode ModRM,
+// where an 8-bit displacement counts in units of the vector (64 bytes).
+// Registers 0-15 only, no masking (aaa = 0), no broadcast.
+fn evex(e: *mut Enc, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm: i64, has_imm: bool) void {
+    let rmem = rm_reg < 0;
+    let mut regf = gpr(reg);
+    let mut rr = hi(reg);
+    if x.digit >= 0 {
+        regf = @as(u64, @bit_cast(u8, x.digit));
+        rr = 0;
+    }
+    let mut xb: u64 = 0;
+    let mut bb: u64 = 0;
+    if rmem {
+        xb = rm_x(m);
+        bb = rm_b(m);
+    } else {
+        bb = hi(rm_reg);
+    }
+    let mut pp: u64 = 0;
+    if x.pfx == 0x66 {
+        pp = 1;
+    } else if x.pfx == 0xf3 {
+        pp = 2;
+    } else if x.pfx == 0xf2 {
+        pp = 3;
+    }
+    let mut v: u64 = 15;
+    if vvvv >= 0 {
+        v = (~gpr(vvvv)) & 15;
+    }
+    let mut w = @as(u64, x.ew);
+    if x.w != 0 {
+        w = 1;
+    }
+    byte(e, 0x62);
+    byte(e, (((((~rr) & 1) << 7) | (((~xb) & 1) << 6)) | ((((~bb) & 1) << 5) | 0x10)) | @as(u64, x.map));
+    byte(e, (((w << 7) | (v << 3)) | 4) | pp);
+    byte(e, (2 << 5) | 8);  // z 0, L'L 512, b 0, V' 1 (inverted), aaa 0
+    byte(e, @as(u64, x.opc));
+    let mut imm_len: i64 = 0;
+    if has_imm {
+        imm_len = 1;
+    }
+    if rmem {
+        modrm_mem_n(e, regf, m, imm_len, 64);
+    } else {
+        modrm_rr(e, regf, gpr(rm_reg));
+    }
+    if has_imm {
+        byte(e, @bit_cast(u64, imm));
+    }
+}
+
+// modrm_mem with EVEX's compressed displacement: disp8 counts n-byte units.
+fn modrm_mem_n(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64, n: i64) void {
+    if m.tpoff or (m.base < 0) or (m.disp == 0) {
+        modrm_mem(e, reg, m, imm_after);
+        return;
+    }
+    let rf = (reg & 7) << 3;
+    let bb = gpr(m.base) & 7;
+    let mut md: u64 = 2;
+    let q = m.disp / n;
+    if ((m.disp % n) == 0) and (q >= -128) and (q <= 127) {
+        md = 1;
+    }
+    if (m.index >= 0) or (bb == 4) {
+        byte(e, ((md << 6) | rf) | 4);
+        let mut ss: u64 = 0;
+        let mut xi: u64 = 4;
+        if m.index >= 0 {
+            ss = scale_bits(m.scale);
+            xi = gpr(m.index) & 7;
+        }
+        byte(e, ((ss << 6) | (xi << 3)) | bb);
+    } else {
+        byte(e, ((md << 6) | rf) | bb);
+    }
+    if md == 1 {
+        byte(e, @bit_cast(u64, q));
+    } else {
+        e.b.u32_(@bit_cast(u64, m.disp));
+    }
+}
+
 pub fn scale_bits(s: u8) u64 {
     if s == 2 {
         return 1;
@@ -638,8 +831,15 @@ pub fn imm_n(e: *mut Enc, x: i64, n: u8) void {
 
 // SSE/AVX instruction. reg: the reg field register (xmm or gpr); rm: register
 // (rm_is_mem false) or memory; vvvv: VEX first source (-1: none / 1111b).
-pub fn sse(e: *mut Enc, id: i32, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm: i64, has_imm: bool, wide: bool) void {
+// vl: 0 for 128-bit (or scalar) operands, 1 for 256-bit (VEX.L), 2 for
+// 512-bit (EVEX).
+pub fn sse(e: *mut Enc, id: i32, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm: i64, has_imm: bool, wide: bool,
+           vl: u64) void {
     let x = desc(id);
+    if vl == 2 {
+        evex(e, x, reg, rm_reg, m, vvvv, imm, has_imm);
+        return;
+    }
     let mut w = @as(u64, x.w);
     if wide {
         w = 1;
@@ -680,13 +880,14 @@ pub fn sse(e: *mut Enc, id: i32, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
             rr = 0;
             // shift-by-immediate: the destination goes in vvvv, the source in rm
         }
+        let l = vl << 2;
         if (xb == 0) and (bb == 0) and (w == 0) and (x.map == 1) {
             byte(e, 0xc5);
-            byte(e, ((((~rr) & 1) << 7) | (v << 3)) | pp);
+            byte(e, (((((~rr) & 1) << 7) | (v << 3)) | l) | pp);
         } else {
             byte(e, 0xc4);
             byte(e, ((((~rr) & 1) << 7) | (((~xb) & 1) << 6)) | ((((~bb) & 1) << 5) | @as(u64, x.map)));
-            byte(e, ((w << 7) | (v << 3)) | pp);
+            byte(e, (((w << 7) | (v << 3)) | l) | pp);
         }
         byte(e, @as(u64, x.opc));
         if rmem {

@@ -72,6 +72,13 @@ pub fn ends_with(s: []u8, suffix: []u8) bool {
 // -----------------------------------------------------------------------------
 
 pub fn index_of_byte(s: []u8, b: u8) !usize {
+    if s.len >= 128 {
+        let k = index_of_byte_long(s, b);
+        if k < s.len {
+            return k;
+        }
+        return error.NotFound;
+    }
     let mut i: usize = 0;
     // 16 bytes at a time
     if s.len >= 16 {
@@ -91,6 +98,46 @@ pub fn index_of_byte(s: []u8, b: u8) !usize {
         i += 1;
     }
     return error.NotFound;
+}
+
+// A long search: 64 or 32 bytes at a time where the processor has AVX-512
+// or AVX2 (spec §13.4), else 16. s.len if b is not there.
+fn index_of_byte_long(s: []u8, b: u8) usize @multiversion("avx512bw", "avx2") {
+    let mut i: usize = 0;
+    if @target_has("avx512bw") {
+        let needle: u8x64 = @splat(b);
+        while (i + 64) <= s.len {
+            let m = @bitmask(@lanes_eq(@load(u8x64, s[i..i + 64]), needle));
+            if m != 0 {
+                return i + @truncate(usize, @ctz(m));
+            }
+            i += 64;
+        }
+    } else if @target_has("avx2") {
+        let needle: u8x32 = @splat(b);
+        while (i + 32) <= s.len {
+            let m = @bitmask(@lanes_eq(@load(u8x32, s[i..i + 32]), needle));
+            if m != 0 {
+                return i + @as(usize, @ctz(m));
+            }
+            i += 32;
+        }
+    }
+    let needle: u8x16 = @splat(b);
+    while (i + 16) <= s.len {
+        let m = @bitmask(@lanes_eq(@load(u8x16, s[i..i + 16]), needle));
+        if m != 0 {
+            return i + @as(usize, @ctz(m));
+        }
+        i += 16;
+    }
+    while i < s.len {
+        if s[i] == b {
+            return i;
+        }
+        i += 1;
+    }
+    return s.len;
 }
 
 pub fn last_index_of_byte(s: []u8, b: u8) !usize {
@@ -781,6 +828,24 @@ test "compare and search" {
     @expect_eq(index_of_byte(long, 'g')!, 16);
     @expect_eq(index_of(long, "xyz")!, 33);
     _ = index_of_byte(long, '!') catch return;
+    @trap();
+}
+
+test "long searches: every position, every version" {
+    let mut buf: [300]u8 = [0; 300];
+    for i in 0..buf.len {
+        buf[i] = @truncate(u8, (i % 61) + 1);
+    }
+    // each byte's first position, near every 16-, 32- and 64-byte boundary
+    for p in @as(usize, 0)..buf.len {
+        let saved = buf[p];
+        buf[p] = 200;
+        @expect_eq(index_of_byte(buf[..], 200)!, p);
+        @expect_eq(index_of_byte_long(buf[..], 200), p);
+        buf[p] = saved;
+    }
+    @expect_eq(index_of_byte_long(buf[..], 0), buf.len);
+    _ = index_of_byte(buf[..], 0) catch return;
     @trap();
 }
 

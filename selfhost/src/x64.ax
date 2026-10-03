@@ -7,6 +7,13 @@
 // upper bits (i1 is always 0 or 1); instructions that depend on the upper
 // bits extend first. Every function keeps a frame pointer (rbp); stack
 // slots are addressed from it.
+//
+// 256-bit vectors (AVX2) and 512-bit ones (AVX-512 F, BW, DQ and VL) live in
+// ymm and zmm registers: register classes of their own over the same
+// registers. An instruction on them is the 128-bit one with VEX.L, or
+// EVEX; vsplit.ax has split what wide_legal does not accept. A function
+// that uses them clears the upper halves (vzeroupper) before each call and
+// return, as code using the legacy SSE encoding expects.
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
@@ -16,10 +23,13 @@ import "mach.ax" as mc;
 import "opt.ax" as opt;
 import "target.ax" as tg;
 import "util.ax" as u;
+import "vsplit.ax" as vs;
 import "x64enc.ax" as xe;
 
 const GPR: u8 = 0;
 const XMM: u8 = 1;
+const YMM: u8 = 2;  // 256-bit vectors (the same registers as XMM)
+const ZMM: u8 = 3;  // 512-bit vectors
 
 let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
 let mut TEXT: i32 = 0;
@@ -34,7 +44,9 @@ let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize
                                                   cap: 0, len: 0 };
 let mut errors: bool = false;
 let mut AVX: bool = false;
-let mut WIN: bool = false;  // Windows x64: its calling convention, and thread-locals through the TEB
+let mut VL: u8 = 0;           // the vector width of the instruction being selected: 0 (128 bits), 32 or 64 bytes
+let mut UPPER: bool = false;  // the function uses ymm or zmm registers (vzeroupper before calls and returns)
+let mut WIN: bool = false;    // Windows x64: its calling convention, and thread-locals through the TEB
 
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
@@ -109,15 +121,61 @@ fn vgpr() i32 {
     return mc.new_vreg(MF, GPR);
 }
 
+// A vector register for a value of the width being selected.
 fn vxmm() i32 {
-    return mc.new_vreg(MF, XMM);
+    return mc.new_vreg(MF, vclass());
+}
+
+fn vclass() u8 {
+    if VL == 32 {
+        return YMM;
+    }
+    if VL == 64 {
+        return ZMM;
+    }
+    return XMM;
 }
 
 fn class_of(t: *ir.Ty) u8 {
-    if (t.kind == ir.T_FLOAT) or (t.kind == ir.T_VEC) {
+    if t.kind == ir.T_VEC {
+        if t.size == 32 {
+            return YMM;
+        }
+        if t.size == 64 {
+            return ZMM;
+        }
+        return XMM;
+    }
+    if t.kind == ir.T_FLOAT {
         return XMM;
     }
     return GPR;
+}
+
+// The vector width (VL) of a type: 0 up to 128 bits, else its bytes.
+fn vl_of(t: *ir.Ty) u8 {
+    if (t.kind == ir.T_VEC) and (t.size > 16) {
+        return @truncate(u8, t.size);
+    }
+    return 0;
+}
+
+fn class_bytes(c: u8) u8 {
+    if c == YMM {
+        return 32;
+    }
+    if c == ZMM {
+        return 64;
+    }
+    return 0;
+}
+
+// A vector instruction at the current width (VEX.L or EVEX for wide ones).
+fn vlz(i: *mut mc.MInst) *mut mc.MInst {
+    if (VL > 0) and xe.desc(i.cc).vl_ok {
+        i.sz = VL;
+    }
+    return i;
 }
 
 fn isz(t: *ir.Ty) u8 {
@@ -145,6 +203,7 @@ fn copy(d: i32, s: i32, class: u8) void {
         i.is_move = true;
     } else {
         let i = sse2(xe.MOVAPS, W(d), R(s));
+        i.sz = class_bytes(class);
         i.is_move = true;
     }
     hint(d, s);
@@ -154,13 +213,13 @@ fn copy(d: i32, s: i32, class: u8) void {
 fn sse2(id: i32, a: mc.MOp, b: mc.MOp) *mut mc.MInst {
     let i = e4(xe.SSE, 0, a, b, NONE(), NONE());
     i.cc = id;
-    return i;
+    return vlz(i);
 }
 
 fn sse_i(id: i32, a: mc.MOp, b: mc.MOp, x: i64) *mut mc.MInst {
     let i = e4(xe.SSE, 0, a, b, NONE(), I(x));
     i.cc = id;
-    return i;
+    return vlz(i);
 }
 
 // d = a op b for a two-operand SSE instruction: VEX 3-operand with AVX,
@@ -169,6 +228,7 @@ fn sse3(id: i32, d: i32, a: i32, b: mc.MOp) void {
     if AVX {
         let i = e4(xe.SSE, 0, W(d), b, R(a), NONE());
         i.cc = id;
+        _ = vlz(i);
         return;
     }
     // d = a; d op= b  (b must not be d: use a temporary if it is)
@@ -189,6 +249,7 @@ fn sse3_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64) void {
     if AVX {
         let i = e4(xe.SSE, 0, W(d), b, R(a), I(x));
         i.cc = id;
+        _ = vlz(i);
         return;
     }
     copy(d, a, XMM);
@@ -232,18 +293,54 @@ fn global_sym(g: *ir.Global) i32 {
 }
 
 // A 16-byte constant in the constant pool (rodata), as a memory operand.
+// (As wide as the instruction being selected: the 16 bytes repeated.)
 fn const16(lo: u64, hi: u64) mc.MOp {
-    let key = u.intern(u.f2("%s:%s", u.hex16(lo), u.hex16(hi)));
+    let mut n: u64 = 16;
+    if VL > 16 {
+        n = @as(u64, VL);
+    }
+    let key = u.intern(u.f3("%s:%s:%s", u.hex16(lo), u.hex16(hi), u.udec(n)));
     let found = consts.get(key);
     if found != 0 {
         return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
     }
     let s = OBJ.secs.get(@int_cast(usize, RODATA));
-    s.data.align(16);
+    s.data.align(@truncate(usize, n));
     let off = @as(u64, s.data.len());
-    s.data.u64_(lo);
-    s.data.u64_(hi);
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: 16, bind: elf.B_LOCAL,
+    for _k in @as(u64, 0)..(n / 16) {
+        s.data.u64_(lo);
+        s.data.u64_(hi);
+    }
+    if n > s.align {
+        s.align = n;
+    }
+    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: n, bind: elf.B_LOCAL,
+                                         ty: elf.T_OBJECT, hidden: false });
+    consts.put(key, sym + 1);
+    return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
+}
+
+// A constant of `bytes` bytes (16, 32 or 64) from the pool.
+fn const_bytes(b: *bn.Bytes, n: usize) mc.MOp {
+    let mut kb = u.Buf.init();
+    for k in 0..(n / 8) {
+        kb.s(u.hex16(b.get_u64(k * 8)));
+    }
+    let key = u.intern(kb.done());
+    let found = consts.get(key);
+    if found != 0 {
+        return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
+    }
+    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    s.data.align(n);
+    let off = @as(u64, s.data.len());
+    for k in 0..(n / 8) {
+        s.data.u64_(b.get_u64(k * 8));
+    }
+    if @as(u64, n) > s.align {
+        s.align = @as(u64, n);
+    }
+    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: @as(u64, n), bind: elf.B_LOCAL,
                                          ty: elf.T_OBJECT, hidden: false });
     consts.put(key, sym + 1);
     return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
@@ -341,10 +438,31 @@ fn reg(v: *mut ir.Value) i32 {
         _ = e2(xe.LEA, 8, W(r), mc.mem_sym(func_sym(f), 0));
         return r;
     }
-    if class_of(t) == XMM {
+    if (t.kind == ir.T_VEC) and (t.size > 16) {
+        let outer_vl = VL;
+        VL = vl_of(t);
         let r = vxmm();
         if ir.is_zero(v) or (k == ir.V_UNDEF) {
             sse3(xe.PXOR, r, r, R(r));
+        } else {
+            let mut b = bn.new_bytes();
+            const_le(v, &mut b, 0);
+            while b.len() < @as(usize, VL) {
+                b.u8_(0);
+            }
+            _ = sse2(xe.MOVDQU_LD, W(r), const_bytes(&b, @as(usize, VL)));
+            b.free();
+        }
+        VL = outer_vl;
+        return r;
+    }
+    if class_of(t) == XMM {
+        let outer_vl = VL;
+        VL = 0;  // (a 128-bit constant, whatever the instruction using it)
+        let r = vxmm();
+        if ir.is_zero(v) or (k == ir.V_UNDEF) {
+            sse3(xe.PXOR, r, r, R(r));
+            VL = outer_vl;
             return r;
         }
         let mut b = bn.new_bytes();
@@ -366,6 +484,7 @@ fn reg(v: *mut ir.Value) i32 {
         } else {
             _ = sse2(xe.MOVSD_LD, W(r), m);
         }
+        VL = outer_vl;
         return r;
     }
     // integer / pointer constant
@@ -924,7 +1043,7 @@ fn gen_select(v: *mut ir.Value) void {
     // floats and vectors: a branch around the move
     let rt = reg(v.b);
     let rf = reg(v.c);
-    copy(d, rf, XMM);
+    copy(d, rf, cls);
     let cc = cond_code(v.a);
     let skip = new_label();
     if cc >= 0 {
@@ -973,7 +1092,7 @@ fn gen_cast(v: *mut ir.Value) void {
     let d = vreg(v);
     if (o == ir.OP_ZEXT) or (o == ir.OP_SEXT) {
         if to.kind == ir.T_VEC {
-            copy(d, reg(v.a), XMM);  // lane masks are already all ones / zeros
+            copy(d, reg(v.a), class_of(to));  // lane masks are already all ones / zeros
             return;
         }
         let sg = o == ir.OP_SEXT;
@@ -1349,7 +1468,7 @@ fn gen_fminmax(d: i32, a: i32, b: i32, is_min: bool, single: bool, vec: bool) vo
     let r = vxmm();
     sse3(andp, r, m1, R(m2));
     let un = vxmm();
-    sse3_i(cmp, un, a, R(b), 3);  // unordered
+    vcmp_i(cmp, un, a, R(b), 3, 2 + @as(i32, k));  // unordered
     let s = vxmm();
     sse3(add, s, a, R(b));
     let n = vxmm();
@@ -1501,7 +1620,13 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         } else if single {
             op = xe.ROUNDSS;
         }
-        if AVX and not vec {
+        if VL == 64 {
+            let mut rs = xe.VRNDSCALEPD;
+            if single {
+                rs = xe.VRNDSCALEPS;
+            }
+            _ = sse_i(rs, W(d), R(a), round_imm(id));
+        } else if AVX and not vec {
             // (the scalar form merges vvvv's upper lanes; the packed one
             // reads no vvvv, which must then be 1111)
             let i = e4(xe.SSE, 0, W(d), R(a), R(a), I(round_imm(id)));
@@ -1515,7 +1640,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         // d = a * b + c: vfmadd231 d(=c) += a * b
         let b = reg(v.xs.get(1));
         let c = reg(v.xs.get(2));
-        copy(d, c, XMM);
+        copy(d, c, vclass());
         let mut op = xe.VFMADD231SD;
         if vec and single {
             op = xe.VFMADD231PS;
@@ -1526,6 +1651,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         }
         let i = e4(xe.SSE, 0, RW(d), R(b), R(a), NONE());
         i.cc = op;
+        _ = vlz(i);
         return;
     }
     fail(u.f1("float intrinsic %s", u.idec(id)));
@@ -2242,9 +2368,117 @@ fn has41() bool {
     return tg.has(tg.X_SSE41);
 }
 
+// The widest vectors the function's extensions compute in one register:
+// 512 bits with AVX-512 (F and BW; DQ for some operations, see wide_legal),
+// 256 with AVX2, else 128.
+pub fn vector_bits() u64 {
+    if tg.has(tg.X_AVX512F | tg.X_AVX512BW) {
+        return 512;
+    }
+    if tg.has(tg.X_AVX2) {
+        return 256;
+    }
+    return 128;
+}
+
+// Which 256- and 512-bit instructions the selector does itself (vsplit.ax
+// splits the others into narrower ones).
+pub fn wide_legal(v: *mut ir.Value) bool {
+    let w = inst_vl(v);
+    let o = v.op;
+    if (o == ir.OP_LOAD) or (o == ir.OP_STORE) or (o == ir.OP_PHI) or (o == ir.OP_SELECT) or (o == ir.OP_COPY) or
+       (o == ir.OP_SPLAT) or (o == ir.OP_EXTRACTELEM) or (o == ir.OP_INSERTELEM) {
+        return true;
+    }
+    if o == ir.OP_SHUFFLE {
+        return vs.plumbing(v);
+    }
+    if (o >= ir.OP_ZEXT) and (o <= ir.OP_FPTOUI_SAT) {
+        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT);
+    }
+    let mut t = v.ty;
+    if (o == ir.OP_ICMP) or (o == ir.OP_FCMP) {
+        t = v.a.ty;
+    } else if (o == ir.OP_INTR) and (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
+        t = v.xs.get(0).ty;
+    }
+    if t.kind != ir.T_VEC {
+        return false;
+    }
+    let b = lane_bits(t);
+    // (at 512 bits: masks of 32- and 64-bit lanes, and the float bit
+    // operations, need AVX512DQ)
+    let dq = (w < 64) or tg.has(tg.X_AVX512DQ);
+    if (o == ir.OP_FNEG) or (o == ir.OP_FCMP) or ((o == ir.OP_ICMP) and (b >= 32)) {
+        if not dq {
+            return false;
+        }
+    }
+    if o == ir.OP_ICMP {
+        return true;
+    }
+    if o == ir.OP_FCMP {
+        let p = @truncate(i32, @bit_cast(i64, v.cv));
+        return (p == ir.RealOEQ) or (p == ir.RealUNE) or (p == ir.RealOLT) or (p == ir.RealOLE) or (p == ir.RealOGT) or
+               (p == ir.RealOGE);
+    }
+    if (o == ir.OP_FADD) or (o == ir.OP_FSUB) or (o == ir.OP_FMUL) or (o == ir.OP_FDIV) {
+        return true;
+    }
+    if (o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_AND) or (o == ir.OP_OR) or (o == ir.OP_XOR) {
+        return true;
+    }
+    if o == ir.OP_MUL {
+        return (b == 16) or (b == 32);
+    }
+    if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
+        if (b == 8) or ((o == ir.OP_ASHR) and (b == 64)) {
+            return false;
+        }
+        return is_inst(v.b, ir.OP_SPLAT) or (v.b.kind == ir.V_CAGG) or (v.b.kind == ir.V_ZERO);
+    }
+    if o != ir.OP_INTR {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_DOT_I16) {
+        return true;
+    }
+    if id == ir.IN_BITMASK {
+        if w == 64 {
+            return (b <= 16) or dq;
+        }
+        return b != 16;  // (16-bit lanes pack within halves on AVX2)
+    }
+    if lane_float(t) and not dq {
+        return false;
+    }
+    if lane_float(t) {
+        if id == ir.IN_FMA {
+            return tg.has(tg.X_FMA);
+        }
+        return (id == ir.IN_FABS) or (id == ir.IN_SQRT) or (id == ir.IN_FMIN) or (id == ir.IN_FMAX) or
+               (id == ir.IN_COPYSIGN) or (id == ir.IN_FLOOR) or (id == ir.IN_CEIL) or (id == ir.IN_FTRUNC) or
+               (id == ir.IN_NEAREST);
+    }
+    if id == ir.IN_ABS {
+        return b <= 32;
+    }
+    if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+        return b <= 32;
+    }
+    if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+        return b <= 16;
+    }
+    return false;
+}
+
 // Can the instruction selector handle this vector instruction directly?
 // (Everything else is split into lanes by lower.scalarize.)
 pub fn legal(v: *mut ir.Value) bool {
+    if inst_vl(v) > 16 {
+        return wide_legal(v);
+    }
     let t = v.ty;
     let o = v.op;
     if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, v.cv)) == ir.IN_CPUID) {
@@ -2393,6 +2627,7 @@ fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
         if AVX {
             let i = e4(xe.SSE, 0, NONE(), R(a), W(d), I(n));
             i.cc = id;
+            _ = vlz(i);
         } else {
             copy(d, a, XMM);
             let i = e4(xe.SSE, 0, NONE(), RW(d), NONE(), I(n));
@@ -2459,10 +2694,10 @@ fn vec_icmp(v: *mut ir.Value) void {
     }
     if (p == ir.IntEQ) or (p == ir.IntNE) {
         if p == ir.IntEQ {
-            sse3(eq, d, a, R(b));
+            vcmp(eq, d, a, R(b), k);
         } else {
             let x = vxmm();
-            sse3(eq, x, a, R(b));
+            vcmp(eq, x, a, R(b), k);
             vnot(d, x);
         }
         return;
@@ -2473,16 +2708,16 @@ fn vec_icmp(v: *mut ir.Value) void {
         b = flip_signs(b, t);
     }
     if (p == ir.IntSGT) or (p == ir.IntUGT) {
-        sse3(gt, d, a, R(b));
+        vcmp(gt, d, a, R(b), k);
     } else if (p == ir.IntSLT) or (p == ir.IntULT) {
-        sse3(gt, d, b, R(a));
+        vcmp(gt, d, b, R(a), k);
     } else if (p == ir.IntSGE) or (p == ir.IntUGE) {
         let x = vxmm();
-        sse3(gt, x, b, R(a));
+        vcmp(gt, x, b, R(a), k);
         vnot(d, x);
     } else {
         let x = vxmm();
-        sse3(gt, x, a, R(b));
+        vcmp(gt, x, a, R(b), k);
         vnot(d, x);
     }
 }
@@ -2497,19 +2732,44 @@ fn vec_fcmp(v: *mut ir.Value) void {
     if lane_float(t) and (lane_bits(t) == 32) {
         op = xe.CMPPS;
     }
+    let k = lk(t);
     if p == ir.RealOEQ {
-        sse3_i(op, d, a, R(b), 0);
+        vcmp_i(op, d, a, R(b), 0, k);
     } else if p == ir.RealUNE {
-        sse3_i(op, d, a, R(b), 4);
+        vcmp_i(op, d, a, R(b), 4, k);
     } else if p == ir.RealOLT {
-        sse3_i(op, d, a, R(b), 1);
+        vcmp_i(op, d, a, R(b), 1, k);
     } else if p == ir.RealOLE {
-        sse3_i(op, d, a, R(b), 2);
+        vcmp_i(op, d, a, R(b), 2, k);
     } else if p == ir.RealOGT {
-        sse3_i(op, d, b, R(a), 1);
+        vcmp_i(op, d, b, R(a), 1, k);
     } else {
-        sse3_i(op, d, b, R(a), 2);
+        vcmp_i(op, d, b, R(a), 2, k);
     }
+}
+
+// d = a cmp b as lane masks. AVX-512 compares write a mask register: k1,
+// then expanded into lanes (k: 0..3 for 8- to 64-bit lanes).
+fn vcmp(id: i32, d: i32, a: i32, b: mc.MOp, k: i32) void {
+    if VL == 64 {
+        let c = e4(xe.SSE, 64, W(xe.K1), b, R(a), NONE());
+        c.cc = id;
+        let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
+        m.cc = xe.VPMOVM2B + k;
+        return;
+    }
+    sse3(id, d, a, b);
+}
+
+fn vcmp_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64, k: i32) void {
+    if VL == 64 {
+        let c = e4(xe.SSE, 64, W(xe.K1), b, R(a), I(x));
+        c.cc = id;
+        let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
+        m.cc = xe.VPMOVM2B + k;
+        return;
+    }
+    sse3_i(id, d, a, b, x);
 }
 
 // Lanes through a 16-byte stack slot.
@@ -2532,11 +2792,36 @@ fn gen_cpuid(v: *mut ir.Value) void {
     _ = sse2(xe.MOVDQU_LD, W(vreg(v)), mc.mem_slot(s, 0));
 }
 
+// Part k (16 bytes) of wide vector register a (of VL bytes), in an xmm
+// register (the register itself for part 0).
+fn part128(a: i32, k: i64) i32 {
+    if k == 0 {
+        return a;
+    }
+    let wl = VL;
+    VL = 0;
+    let p = vxmm();
+    VL = wl;
+    let i = e4(xe.SSE, VL, R(a), W(p), NONE(), I(k));
+    i.cc = xe.VEXTRACTI128;
+    return p;
+}
+
 fn gen_extract(v: *mut ir.Value) void {
-    let t = v.a.ty;
-    let lane = @bit_cast(i64, v.cv);
-    let d = vreg(v);
-    let a = reg(v.a);
+    if VL > 0 {
+        // the lane of the 128-bit part holding it
+        let t = v.a.ty;
+        let per = @as(i64, 16 / (lane_bits(t) / 8));
+        let lane = @bit_cast(i64, v.cv);
+        let p = part128(reg(v.a), lane / per);
+        VL = 0;
+        extract_lane(v, vreg(v), p, ir.t_vec(t.elem, @truncate(u32, @bit_cast(u64, per))), lane % per);
+        return;
+    }
+    extract_lane(v, vreg(v), reg(v.a), v.a.ty, @bit_cast(i64, v.cv));
+}
+
+fn extract_lane(v: *mut ir.Value, d: i32, a: i32, t: *ir.Ty, lane: i64) void {
     let b = lane_bits(t);
     if lane_float(t) {
         if lane == 0 {
@@ -2589,11 +2874,27 @@ fn gen_extract(v: *mut ir.Value) void {
 }
 
 fn gen_insert(v: *mut ir.Value) void {
-    let t = v.ty;
-    let lane = @bit_cast(i64, v.cv);
-    let d = vreg(v);
-    let a = reg(v.a);
-    let x = reg(v.b);
+    if VL > 0 {
+        // into the 128-bit part holding the lane, which goes back in
+        let t = v.ty;
+        let per = @as(i64, 16 / (lane_bits(t) / 8));
+        let lane = @bit_cast(i64, v.cv);
+        let k = lane / per;
+        let a = reg(v.a);
+        let wl = VL;
+        let p = part128(a, k);
+        VL = 0;
+        let q = vxmm();
+        insert_lane(q, p, reg(v.b), ir.t_vec(t.elem, @truncate(u32, @bit_cast(u64, per))), lane % per);
+        VL = wl;
+        let i = e4(xe.SSE, VL, W(vreg(v)), R(q), R(a), I(k));
+        i.cc = xe.VINSERTI128;
+        return;
+    }
+    insert_lane(vreg(v), reg(v.a), reg(v.b), v.ty, @bit_cast(i64, v.cv));
+}
+
+fn insert_lane(d: i32, a: i32, x: i32, t: *ir.Ty, lane: i64) void {
     let b = lane_bits(t);
     if (b == 16) or (has41() and not lane_float(t)) {
         let mut id = xe.PINSRW;
@@ -2628,6 +2929,23 @@ fn gen_splat(v: *mut ir.Value) void {
     let d = vreg(v);
     let x = reg(v.a);
     let b = lane_bits(t);
+    if VL > 0 {
+        // the scalar into lane 0 of an xmm register, then broadcast
+        let wl = VL;
+        VL = 0;
+        let mut s = x;
+        if not lane_float(t) {
+            s = vxmm();
+            if b == 64 {
+                _ = sse2(xe.MOVQ_XR, W(s), R(x));
+            } else {
+                _ = sse2(xe.MOVD_XR, W(s), R(x));
+            }
+        }
+        VL = wl;
+        _ = sse2(xe.VPBROADCASTB + lk(t), W(d), R(s));
+        return;
+    }
     if lane_float(t) {
         if b == 32 {
             _ = sse_i(xe.PSHUFD, W(d), R(x), 0);
@@ -2658,6 +2976,10 @@ fn gen_splat(v: *mut ir.Value) void {
 }
 
 fn gen_shuffle(v: *mut ir.Value) void {
+    if VL > 0 {
+        wide_shuffle(v);
+        return;
+    }
     let t = v.ty;
     let d = vreg(v);
     let a = reg(v.a);
@@ -2704,6 +3026,40 @@ fn gen_shuffle(v: *mut ir.Value) void {
     _ = sse2(xe.MOVDQU_LD, W(d), mc.mem_slot(r, 0));
 }
 
+// The shuffles vsplit.ax makes: two halves joined, or a part of a vector.
+fn wide_shuffle(v: *mut ir.Value) void {
+    let d = vreg(v);
+    let a = reg(v.a);
+    let st = v.a.ty;
+    let n = @int_cast(i64, v.mask.len);
+    let ln = @as(i64, st.lanes);
+    if n == (2 * ln) {
+        // join: a below, b above
+        let b = reg(v.b);
+        let mut id = xe.VINSERTI128;
+        if st.size == 32 {
+            id = xe.VINSERTI64X4;
+        }
+        let i = e4(xe.SSE, VL, W(d), R(b), R(a), I(1));
+        i.cc = id;
+        return;
+    }
+    // part k of a (16 or 32 bytes)
+    let k = @as(i64, v.mask[0]) / n;
+    let pb = v.ty.size;
+    if k == 0 {
+        let c = sse2(xe.MOVAPS, W(d), R(a));  // (the low part: the register itself, upper half cleared)
+        c.sz = class_bytes(class_of(v.ty));
+        return;
+    }
+    let mut id = xe.VEXTRACTI128;
+    if pb == 32 {
+        id = xe.VEXTRACTI64X4;
+    }
+    let i = e4(xe.SSE, VL, R(a), W(d), NONE(), I(k));
+    i.cc = id;
+}
+
 fn le8(b: []u8) u64 {
     let mut x: u64 = 0;
     for i in @as(usize, 0)..8 {
@@ -2715,6 +3071,43 @@ fn le8(b: []u8) u64 {
 fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let a0 = v.xs.get(0);
     let at = a0.ty;
+    if ((id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK)) and (VL == 64) {
+        // AVX-512: through a mask register
+        let d = vreg(v);
+        let a = reg(a0);
+        let k = lk(at);
+        if id == ir.IN_BITMASK {
+            let m = e4(xe.SSE, 64, W(xe.K1), R(a), NONE(), NONE());
+            m.cc = xe.VPMOVB2M + k;
+        } else {
+            // lanes equal to zero
+            let z = vxmm();
+            sse3(xe.PXOR, z, z, R(z));
+            let mut eq = xe.PCMPEQB + k;
+            if k == 3 {
+                eq = xe.PCMPEQQ;
+            }
+            let c = e4(xe.SSE, 64, W(xe.K1), R(z), R(a), NONE());
+            c.cc = eq;
+        }
+        let r = vgpr();
+        let mv = e4(xe.SSE, 8, W(r), R(xe.K1), NONE(), NONE());
+        mv.cc = xe.KMOVQ_RK;
+        if id == ir.IN_BITMASK {
+            copy(d, r, GPR);
+            return;
+        }
+        if id == ir.IN_ANYTRUE {
+            // some byte nonzero: not all bytes zero (a byte compare, all 64 bits)
+            let c = e2(xe.ALU, 8, R(r), I(-1));
+            c.cc = 7;
+            materialize_cc(d, xe.CC_NE);
+            return;
+        }
+        _ = e2(xe.TEST, 8, R(r), R(r));
+        materialize_cc(d, xe.CC_E);
+        return;
+    }
     if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK) {
         let d = vreg(v);
         let a = reg(a0);
@@ -2748,7 +3141,11 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
             sse3(xe.PCMPEQB, e, a, R(z));
             let m = vgpr();
             _ = sse2(xe.PMOVMSKB, W(m), R(e));
-            let c = e2(xe.ALU, 4, R(m), I(0xffff));
+            let mut all: i64 = 0xffff;
+            if VL == 32 {
+                all = -1;  // (32 bytes: 32 bits, the immediate sign-extended)
+            }
+            let c = e2(xe.ALU, 4, R(m), I(all));
             c.cc = 7;
             materialize_cc(d, xe.CC_NE);
             return;
@@ -2902,7 +3299,31 @@ fn gen_ptradd(v: *mut ir.Value) void {
     _ = e2(xe.LEA, 8, W(d), mc.mem(a, reg(off), 1, 0));
 }
 
+// The widest vector an instruction computes or reads, as VL.
+fn inst_vl(v: *ir.Value) u8 {
+    let mut w = vl_of(v.ty);
+    let xs: [3]*mut ir.Value = [v.a, v.b, v.c];
+    for x in xs {
+        if u.notnil(x) and (vl_of(x.ty) > w) {
+            w = vl_of(x.ty);
+        }
+    }
+    for k in 0..v.xs.len {
+        let x = v.xs.get(k);
+        if vl_of(x.ty) > w {
+            w = vl_of(x.ty);
+        }
+    }
+    return w;
+}
+
 fn gen_inst(v: *mut ir.Value) void {
+    VL = inst_vl(v);
+    gen_inst_at(v);
+    VL = 0;
+}
+
+fn gen_inst_at(v: *mut ir.Value) void {
     let o = v.op;
     let t = v.ty;
     if o == ir.OP_COPY {
@@ -3344,6 +3765,9 @@ fn quiet_between(from: *mut ir.Value, to: *mut ir.Value) bool {
 let gpr_order: [14]i32 = [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 12, 13, 14, 15];
 let win_gpr_order: [14]i32 = [0, 1, 2, 8, 9, 10, 11, 3, 6, 7, 12, 13, 14, 15];  // caller-saved first
 let xmm_order: [16]i32 = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+// Windows preserves only the low halves of xmm6-15 across calls: wide
+// values stay in xmm0-5 there.
+let win_wide_order: [6]i32 = [16, 17, 18, 19, 20, 21];
 
 fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     if class == 0 {
@@ -3351,7 +3775,7 @@ fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
         return mc.new_inst(xe.LOAD, 8, ops[..]);
     }
     let ops = mk4(W(r), mc.mem_slot(slot, 0), NONE(), NONE());
-    let i = mc.new_inst(xe.SSE, 0, ops[..]);
+    let i = mc.new_inst(xe.SSE, class_bytes(@truncate(u8, @bit_cast(u32, class))), ops[..]);
     i.cc = xe.MOVDQU_LD;
     return i;
 }
@@ -3362,7 +3786,7 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
         return mc.new_inst(xe.STORE, 8, ops[..]);
     }
     let ops = mk4(R(r), mc.mem_slot(slot, 0), NONE(), NONE());
-    let i = mc.new_inst(xe.SSE, 0, ops[..]);
+    let i = mc.new_inst(xe.SSE, class_bytes(@truncate(u8, @bit_cast(u32, class))), ops[..]);
     i.cc = xe.MOVDQU_ST;
     return i;
 }
@@ -3507,8 +3931,18 @@ fn compile_func(f: *mut ir.Func) void {
     if WIN {
         gorder = win_gpr_order[..];
     }
-    let tgt = mc.Target.{ nclasses: 2, alloc_order: [gorder, xmm_order[..]], caller_saved: caller_saved(),
-                          spill_load: spill_load, spill_store: spill_store };
+    let mut wide_order = xmm_order[..];
+    if WIN {
+        wide_order = win_wide_order[..];
+    }
+    UPPER = false;
+    for k in 0..MF.vclass.len {
+        if MF.vclass.get(k) >= YMM {
+            UPPER = true;
+        }
+    }
+    let tgt = mc.Target.{ nclasses: 4, alloc_order: [gorder, xmm_order[..], wide_order, wide_order],
+                          caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store };
     mc.dce(MF, pure_inst);
     mc.allocate(MF, &tgt);
     mc.drop_reloads(MF, is_label);
@@ -3649,6 +4083,14 @@ fn imm_len(sz: u8) i64 {
 
 fn enc_imm(x: i64, n: i64) void {
     xe.imm_n(&mut E, x, @truncate(u8, @bit_cast(u64, n)));
+}
+
+// After code with ymm or zmm registers, before code that may use the
+// legacy SSE encoding (which would otherwise pay to preserve the upper halves).
+fn vzeroupper() void {
+    b8(0xc5);
+    b8(0xf8);
+    b8(0x77);
 }
 
 fn label_ref(l: i32) void {
@@ -3941,15 +4383,21 @@ fn enc_sse(i: *mut mc.MInst) void {
     }
     let has_imm = o3.kind == mc.K_IMM;
     let wide = i.sz == 8;
+    let mut vl: u64 = 0;  // (sz 32: a 256-bit operation, 64: a 512-bit one)
+    if i.sz == 32 {
+        vl = 1;
+    } else if i.sz == 64 {
+        vl = 2;
+    }
     if o1.kind == mc.K_REG {
         let m = xe.Mem.{ base: -1, index: -1, scale: 0, disp: 0, sym: -1, tpoff: false };
-        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide);
+        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl);
     } else {
         let mut m = to_mem(o1);
         if m.tpoff {
             fail("TLS operand in an SSE instruction");
         }
-        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide);
+        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl);
     }
     _ = d;
 }
@@ -4234,6 +4682,9 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == xe.CALL {
         let t = i.ops[0];
+        if UPPER {
+            vzeroupper();
+        }
         if frameless {
             // sub rsp, 8: the call (which does not return) needs rsp aligned
             b8(0x48);
@@ -4251,6 +4702,9 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.RET {
+        if UPPER {
+            vzeroupper();
+        }
         epilogue();
         return;
     }

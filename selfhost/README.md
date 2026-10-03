@@ -90,7 +90,12 @@ choice never changes what a program computes:
 - **x86-64**: SSE2 is the baseline. SSSE3 (`pshufb` shuffles, `pabs`), SSE4.1 (rounding,
   `pmulld`, `pextr`/`pinsr`, 64-bit lane equality, min/max), SSE4.2 (64-bit lane
   compares), POPCNT, LZCNT, BMI1 (`tzcnt`), BMI2 (`shlx`...), AVX (three-operand VEX
-  encoding of all SSE instructions) and FMA are used when enabled.
+  encoding of all SSE instructions) and FMA are used when enabled. With AVX2, 256-bit
+  vectors live in ymm registers (VEX.L); with AVX-512 F and BW, 512-bit vectors live in
+  zmm registers (EVEX, with the compressed displacements), compares go through a mask
+  register (`k1`, expanded with `vpmovm2*`), and `@bitmask`, `@any_true` and `@all_true`
+  through `vpmov*2m`/`kmovq`. Operations without a single instruction at that width are
+  split into halves first (`vsplit.ax`), so the choice never changes a result.
 - **AArch64**: the FP and Advanced SIMD (NEON) baseline covers everything; LSE replaces
   the load-exclusive / store-exclusive loops of atomic read-modify-write and
   compare-and-swap with single instructions.
@@ -142,6 +147,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
 | `codegen.ax` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces, each instruction's source line) |
+| `vsplit.ax` | 256- and 512-bit vector instructions the target cannot compute at that width become instructions on halves (down to 128 bits, which every target has): lane-wise operations piece by piece, the rest combined (reductions per piece and across them, a swizzle per table piece, shuffles of the pieces they read). Where a kept instruction meets split values, or the reverse, the pieces are joined or taken apart with shuffles a wide target selects as `vinserti128`/`vextracti128` (`*64x4` for 512 bits) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer to a copy the callee only reads, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
 | `opt.ax` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting; code layout (loops contiguous, exit tests after the body, trap paths last) and constants hoisted out of loops for the native backends |
@@ -207,8 +213,9 @@ and leaks.
 runs the test suite for wasm32 and native code at `-O0` and `-O2` and in whole-program
 mode (and for AArch64 under qemu when available), and fuzzes the backends. The fuzzer
 (`fuzz/gen.py`) writes programs that apply every integer, floating point and SIMD
-operation to edge values; the output of every backend and extension level must match the
-C compiler's LLVM-generated code exactly.
+operation to edge values, on vectors of 128, 256 and 512 bits; the output of every backend
+and extension level (x86-64 from SSE2 to AVX-512, AArch64 under qemu) must match the C
+compiler's LLVM-generated code exactly.
 
 The test suite can run AArch64 code on an x86-64 machine:
 
