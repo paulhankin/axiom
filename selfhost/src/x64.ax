@@ -24,6 +24,7 @@ const XMM: u8 = 1;
 let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
 let mut TEXT: i32 = 0;
 let mut RODATA: i32 = 0;
+let mut LINES: i32 = -1;  // Windows: line tables (.axiom.lines, for plink.ax's PDB)
 let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
 let mut PDATA: i32 = -1;
 let mut XDATA_SYM: u32 = 0;
@@ -3395,6 +3396,7 @@ fn compile_func(f: *mut ir.Func) void {
         b = b.next;
     }
     // parameters
+    mc.cur_src = f.src;
     CB = MF.blocks.get(0);
     let mut ng: usize = 0;
     let mut nx: usize = 0;
@@ -3434,6 +3436,9 @@ fn compile_func(f: *mut ir.Func) void {
         CB = MF.blocks.get(bi);
         let mut i = ib.first;
         while u.notnil(i) {
+            if i.src != 0 {
+                mc.cur_src = i.src;
+            }
             if not ir.is_term(i.op) {
                 gen_inst(i);
             }
@@ -3446,6 +3451,7 @@ fn compile_func(f: *mut ir.Func) void {
         }
     }
     u.free(@ptr_cast(*mut void, order.data));
+    mc.cur_src = 0;
     if errors {
         return;
     }
@@ -3687,6 +3693,41 @@ fn epilogue() void {
     }
     b8(0x5d);
     b8(0xc3);
+}
+
+// Windows: a function's line table, into .axiom.lines for plink.ax (which
+// writes the PDB). The section is a series of records: 'F', a file's path
+// (u32 length, bytes; files are numbered in order), or 'P', a function: its
+// symbol's name (u32 length, bytes), the number of rows, and rows of code
+// offset, file number and line (u32 each). rows: offset << 32 | ir.src_loc.
+let mut line_file: [4096]u32 = [0; 4096];  // file id -> its number + 1 in the section
+let mut nline_files: u32 = 0;
+
+fn emit_lines(name: []u8, rows: []u64) void {
+    let sec = OBJ.secs.get(@int_cast(usize, LINES));
+    let d = &mut sec.data;
+    for r in rows {
+        let file = ir.src_file(@truncate(u32, r));
+        let k = @as(usize, @bit_cast(u32, file));
+        if line_file[k] == 0 {
+            let path = u.real_path(u.file_of(file).path);
+            d.u8_('F');
+            d.u32_(@as(u64, path.len));
+            d.put(path);
+            nline_files += 1;
+            line_file[k] = nline_files;
+        }
+    }
+    d.u8_('P');
+    d.u32_(@as(u64, name.len));
+    d.put(name);
+    d.u32_(@as(u64, rows.len));
+    for r in rows {
+        let src = @truncate(u32, r);
+        d.u32_(r >> 32);
+        d.u32_(@as(u64, line_file[@as(usize, @bit_cast(u32, ir.src_file(src)))] - 1));
+        d.u32_(@as(u64, ir.src_line(src)));
+    }
 }
 
 // Windows: what the prologue did, step by step, for the function's unwind
@@ -4408,6 +4449,12 @@ fn encode_func(f: *mut ir.Func) void {
     let nb = MF.blocks.len;
     let skip = tidy_branches();
     let boff = u.newn.[u64](nb + 1);
+    // the line table: (code offset, source location) where the location changes
+    let mut rows = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
+    let mut last_src = f.src;
+    if WIN and (f.src != 0) {
+        rows.push(@as(u64, f.src));
+    }
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
         boff[bi] = @as(u64, E.b.len());
@@ -4416,6 +4463,10 @@ fn encode_func(f: *mut ir.Func) void {
         }
         let mut i = b.first;
         while u.notnil(i) {
+            if WIN and (i.src != 0) and (i.src != last_src) {
+                rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
+                last_src = i.src;
+            }
             enc_inst(i);
             i = i.next;
         }
@@ -4446,6 +4497,9 @@ fn encode_func(f: *mut ir.Func) void {
     s.size = @as(u64, E.b.len());
     if WIN and not frameless {
         emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
+    }
+    if WIN and (rows.len > 0) {
+        emit_lines(s.name, rows.items());
     }
     E.b.free();
 }
@@ -4514,7 +4568,11 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
     XDATA = -1;
     PDATA = -1;
+    LINES = -1;
     if WIN {
+        LINES = elf.add_sec(OBJ, ".axiom.lines", elf.S_DEBUG, 1);
+        @mem_set(line_file[..], 0);
+        nline_files = 0;
         // here, not when the first function needs them: functions are
         // compiled in scratch scopes (their sections must outlive them)
         XDATA = elf.add_sec(OBJ, ".xdata", elf.S_RODATA, 4);

@@ -62,6 +62,18 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
   frames, and Windows' stack walks (RtlCaptureStackBackTrace, debuggers)
   go through to the entry point: checked on Windows 11 with a crash five
   calls deep, at -O0 and -O2.
+- **Debug symbols.** plink.ax writes a PDB (pdb.ax) next to the executable
+  and names it in a CodeView debug directory entry (GUID: a hash of the
+  image, so builds stay deterministic): every function as a procedure and a
+  public symbol, the section headers and map, and line tables. Lines come
+  from the source: every IR instruction carries a file and line
+  (ir.src_loc; codegen sets it per expression, passes inherit it, the
+  inliner copies it), so does every machine instruction, and the encoder
+  records where it changes into the object's .axiom.lines (kept in cached
+  objects), which plink turns into DEBUG_S_LINES. Checked with dbghelp
+  (SymFromName, SymFromAddr, SymGetLineFromAddr64) and DIA (Dia2Dump) on the
+  compiler itself; the self-build stays a fixed point, PDB included.
+  `--pdb=off` writes none; test and profile builds write none.
 - **Real Windows.** The compiler, examples/game.ax and the other examples run
   on Windows 11.
 - **`axiom profile`.** `runtime/profile_windows.ax`: a sampler thread in place
@@ -100,8 +112,10 @@ PE32+ console executable from any host (spec §14.1, selfhost/README.md):
 - Symbolic links need Developer Mode or the privilege (Wine cannot make
   them); without it `symlink` fails with AccessDenied.
 - Unix-domain sockets need Windows 10 1803 or later (Wine has none).
-- No debug symbols (a PDB): debuggers walk Axiom frames but show them as
-  addresses (Axiom's own traces name them, from the shadow stack).
+- Debug information beyond names and lines: types, local variables and
+  parameters (S_LOCAL, S_DEFRANGE_* and the type stream), inline-site
+  records for inlined calls (an inlined call's lines show as its callee's
+  file, in the caller), source checksums.
 - Direct3D: mipmaps, texture formats other than 8-bit RGBA, rendering into
   a texture and then sampling it, compute shaders writing textures, MSAA;
   the overlay under Wine (no D3D11On12 there). Windows.Gaming.Input, raw

@@ -515,6 +515,44 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
       const r = run('hello');
       return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
+    'debug symbols (a PDB)': () => {
+      const c = build(path.join(root, 'examples/pi.ax'), 'pdb', ['-O2']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const exe = fs.readFileSync(out('pdb'));
+      const pdbFile = out('pdb').replace(/\.exe$/, '.pdb');
+      if (!fs.existsSync(pdbFile)) return 'no PDB';
+      // the executable's debug directory: a CodeView (RSDS) entry naming the PDB
+      const pe = exe.readUInt32LE(0x3c), opt = pe + 24, nsec = exe.readUInt16LE(pe + 6);
+      const dirRva = exe.readUInt32LE(opt + 112 + 6 * 8);
+      const fileOf = (rva) => {
+        for (let k = 0; k < nsec; k++) {
+          const s = opt + 240 + 40 * k, va = exe.readUInt32LE(s + 12), raw = exe.readUInt32LE(s + 20);
+          if (rva >= va && rva < va + exe.readUInt32LE(s + 8)) return raw + rva - va;
+        }
+        return -1;
+      };
+      const dir = fileOf(dirRva);
+      if (dir < 0 || exe.readUInt32LE(dir + 12) !== 2) return 'no CodeView debug directory';
+      const rsds = exe.readUInt32LE(dir + 24);
+      if (exe.toString('latin1', rsds, rsds + 4) !== 'RSDS') return 'no RSDS record';
+      const guid = exe.subarray(rsds + 4, rsds + 20);
+      const name = exe.toString('utf8', rsds + 24, exe.indexOf(0, rsds + 24));
+      if (!/pdb\.pdb$/.test(name)) return `the record names ${name}`;
+      // the PDB: an MSF whose info stream (1) has the same GUID and age
+      const p = fs.readFileSync(pdbFile);
+      if (p.toString('latin1', 0, 24) !== 'Microsoft C/C++ MSF 7.00') return 'not an MSF file';
+      const bs = p.readUInt32LE(32), dirBlock = p.readUInt32LE(p.readUInt32LE(52) * bs);
+      const d = dirBlock * bs, nstreams = p.readUInt32LE(d);
+      let at = d + 4 + nstreams * 4;
+      for (let s = 0; s < 1; s++) at += 4 * Math.ceil(p.readUInt32LE(d + 4 + s * 4) / bs);
+      const info = p.readUInt32LE(at) * bs;
+      if (p.readUInt32LE(info) !== 20000404) return 'bad info stream';
+      if (!p.subarray(info + 12, info + 28).equals(guid)) return 'the GUIDs differ';
+      if (p.readUInt32LE(info + 8) !== exe.readUInt32LE(rsds + 20)) return 'the ages differ';
+      // the functions' names are in it (the publics), and their files (/names)
+      const text = p.toString('latin1');
+      return text.includes('examples/pi.pi_digits') && /examples[\\/]pi\.ax/.test(text) ? null : 'names or files missing';
+    },
     'pi to 2000 places': () => {
       const c = build(path.join(root, 'examples/pi.ax'), 'pi', ['-O2']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;

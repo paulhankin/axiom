@@ -107,7 +107,12 @@ information (`.xdata`) and an entry in the function table (`.pdata`, the image's
 exception directory), describing its prologue relative to `rsp`, so the system can walk
 the stack through Axiom code: without it, an exception a DLL raises to catch further up
 (or a stack trace) cannot get past an Axiom frame. Thread-locals are the image's TLS directory,
-found through `gs:[0x58]` and `_tls_index`. On Linux, `axiom test` runs Windows tests
+found through `gs:[0x58]` and `_tls_index`. Debug symbols go in a program database
+next to the executable (`prog.pdb` for `prog.exe`; `--pdb=off` for none), which the
+executable names in its debug directory: every function's name and extent, and line
+tables (each instruction keeps the line of the source it came from, through the
+optimizer, and the encoder records where the line changes), so Visual Studio, WinDbg and
+the system's symbol handler name Axiom frames and show their source. On Linux, `axiom test` runs Windows tests
 under Wine (`wine64` on the `PATH`), and so does the test suite:
 
 ```
@@ -122,7 +127,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | Module | What |
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
-| `codegen.ax` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces) |
+| `codegen.ax` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces, each instruction's source line) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
 | `opt.ax` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting; code layout (loops contiguous, exit tests after the body, trap paths last) and constants hoisted out of loops for the native backends |

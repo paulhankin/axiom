@@ -13,7 +13,8 @@
 //                table (.pdata: every function with a frame, sorted; the
 //                exception directory), without which the system cannot walk
 //                the stack through our code, and an exception a DLL raises
-//                to catch itself further up can end the process
+//                to catch itself further up can end the process; then the
+//                debug directory naming the program database (pdb.ax)
 //   .idata  rw-  the import directory, lookup and address tables, names
 //   .data   rw-  data, the GOT (addresses of our own symbols that code loads
 //                through it), the thread-local template, _tls_index, then
@@ -40,6 +41,7 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "pdb.ax" as pdb;
 import "util.ax" as u;
 
 const BASE: u64 = 0x1_4000_0000;  // the preferred image base
@@ -49,6 +51,9 @@ pub const SUBSYSTEM_WINDOWS_CUI: u64 = 3;
 // The PE subsystem (--subsystem=console|windows): a GUI program gets no
 // console window, and its standard streams are closed unless redirected.
 pub let mut g_subsystem: u64 = 3;
+// Write a program database next to the executable (--pdb=on|off), for
+// debuggers and the system's symbol handler.
+pub let mut g_pdb: bool = true;
 const SECT: u64 = 0x1000;   // section alignment in memory
 const FILEAL: u64 = 0x200;  // and in the file
 const STACK_RESERVE: u64 = 8 << 20;
@@ -60,6 +65,7 @@ const C_TDATA: i32 = 3;
 const C_TBSS: i32 = 4;
 const C_BSS: i32 = 5;
 const C_PDATA: i32 = 6;  // the function table (.pdata), one array at the end of .rdata
+const C_NONE: i32 = -1;  // not in the image (.axiom.lines: for the PDB)
 
 struct GSym {
     name: []u8,
@@ -135,6 +141,9 @@ fn class_of(s: *elf.Sec) i32 {
         return C_PDATA;
     }
     let k = s.kind;
+    if k == elf.S_DEBUG {
+        return C_NONE;
+    }
     if k == elf.S_TEXT {
         return C_TEXT;
     }
@@ -749,7 +758,16 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     // .rdata
     let rdata_rva = align_up(text_end - BASE, SECT);
     let pdata_start = align_up(place(C_CONST, BASE + rdata_rva), 4);
-    let rdata_end = place(C_PDATA, pdata_start);
+    let pdata_end = place(C_PDATA, pdata_start);
+    // the debug directory: one CodeView entry, and its record (RSDS, the
+    // GUID, the age, the PDB's path)
+    let pdb_path = pdb_path_of(out);
+    let debug_at = align_up(pdata_end, 4);
+    let rsds_at = debug_at + 28;
+    let mut rdata_end = pdata_end;
+    if g_pdb {
+        rdata_end = rsds_at + 24 + @as(u64, pdb_path.len) + 1;
+    }
     // .idata
     let idata_rva = align_up(rdata_end - BASE, SECT);
     let mut idata = import_section(idata_rva);
@@ -818,7 +836,24 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         abs_at(b, got_addr + (@as(u64, k) * 8), sym_addr(@as(usize, got_obj.get(k)), got_sym.get(k)));
     }
     apply_relocs(b);
-    sort_pdata(b, pdata_start, rdata_end);
+    sort_pdata(b, pdata_start, pdata_end);
+    if g_pdb {
+        // IMAGE_DEBUG_DIRECTORY: characteristics, time, version, type
+        // (CODEVIEW), size, address, file offset
+        let at = @truncate(usize, file_of(debug_at));
+        let size = (rdata_end - rsds_at);
+        w32(b, @as(u64, at) + 12, 2);
+        w32(b, @as(u64, at) + 16, size);
+        w32(b, @as(u64, at) + 20, rsds_at - BASE);
+        w32(b, @as(u64, at) + 24, file_of(rsds_at));
+        let r = @truncate(usize, file_of(rsds_at));
+        b[r] = 'R';
+        b[r + 1] = 'S';
+        b[r + 2] = 'D';
+        b[r + 3] = 'S';
+        w32(b, @as(u64, r) + 20, 1);  // age; the GUID (at 4) once the image is done
+        @mem_copy(b[r + 24..r + 24 + pdb_path.len], pdb_path);
+    }
     // the TLS directory: the template, the index's address, the (empty)
     // callback list, the zero fill, the alignment
     let own = objs.len - 1;
@@ -902,7 +937,10 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
             // exceptions: the function table, without which the system
             // cannot walk the stack through our code
             h.u32_(pdata_start - BASE);
-            h.u32_(rdata_end - pdata_start);
+            h.u32_(pdata_end - pdata_start);
+        } else if (d == 6) and g_pdb {
+            h.u32_(debug_at - BASE);
+            h.u32_(28);
         } else if d == 5 {
             h.u32_(reloc_rva);
             h.u32_(outs[4].vsize);
@@ -938,10 +976,167 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     for i in 0..hv.len {
         fv[i] = hv[i];
     }
+    let mut guid: [16]u8 = [0; 16];
+    if g_pdb {
+        // the GUID: a hash of the image (so the same build gives the same one)
+        let h1 = fnv(fv, 0xcbf2_9ce4_8422_2325);
+        let h2 = fnv(fv, 0x8422_2325_cbf2_9ce4 ^ h1);
+        for k in @as(usize, 0)..8 {
+            guid[k] = @truncate(u8, h1 >> @as(u64, k * 8));
+            guid[k + 8] = @truncate(u8, h2 >> @as(u64, k * 8));
+        }
+        let r = @truncate(usize, file_of(rsds_at));
+        @mem_copy(fv[r + 4..r + 20], guid[..]);
+    }
     if not u.write_file(out, fv) {
         err(u.f1("cannot write %s", out));
         return 1;
     }
     _ = u.chmod(u.cz(out), 0o755);
+    if g_pdb {
+        let sh: usize = 0x40 + 4 + 20 + 240;
+        let mut files = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+        let funcs = pdb_funcs(text_rva, &mut files);
+        if not pdb.write(pdb_file_of(out), guid[..], 1, hv[sh..sh + @truncate(usize, nsec * 40)], files.items(),
+                         funcs.items(), basename(out)) {
+            err(u.f1("cannot write %s", pdb_file_of(out)));
+            return 1;
+        }
+    }
     return 0;
+}
+
+fn fnv(b: []u8, seed: u64) u64 {
+    let mut h = seed;
+    for c in b {
+        h = (h ^ @as(u64, c)) *% 0x100_0000_01b3;
+    }
+    return h;
+}
+
+// The PDB's file: the executable's name with .pdb for .exe.
+fn pdb_file_of(out: []u8) []u8 {
+    if u.ends(out, ".exe") or u.ends(out, ".EXE") {
+        return u.cat2(out[0..out.len - 4], ".pdb");
+    }
+    return u.cat2(out, ".pdb");
+}
+
+// The path in the debug directory: the PDB's absolute path, with Windows
+// separators when it has a drive letter (debuggers also look for it by name
+// next to the executable).
+fn pdb_path_of(out: []u8) []u8 {
+    let f = pdb_file_of(out);
+    let mut p = f;
+    if not u.starts(f, "/") and not ((f.len > 1) and (f[1] == ':')) {
+        p = u.f2("%s/%s", u.cwd(), f);
+    }
+    return windows_path(p);
+}
+
+// A path with Windows separators when it has a drive letter (a copy).
+fn windows_path(p: []u8) []u8 {
+    let w = u.newn.[u8](p.len);
+    @mem_copy(w, p);
+    if (p.len > 1) and (p[1] == ':') {
+        for i in 0..w.len {
+            if w[i] == '/' {
+                w[i] = '\\';
+            }
+        }
+    }
+    return w;
+}
+
+fn basename(p: []u8) []u8 {
+    let mut i = p.len;
+    while (i > 0) and (p[i - 1] != '/') and (p[i - 1] != '\\') {
+        i -= 1;
+    }
+    return p[i..];
+}
+
+// Every function the image holds, for the PDB: defined in code, the copy
+// kept of a function more than one object defines; with its line table from
+// the object's .axiom.lines (x64.ax), its files added to `files`.
+fn pdb_funcs(text_rva: u64, files: *mut u.List.[[]u8]) u.List.[pdb.Func] {
+    let mut fs = u.List.[pdb.Func].{ data: u.nil.[pdb.Func](), len: 0, cap: 0 };
+    let mut file_map = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        let mut lines = object_lines(o, files, &mut file_map);
+        for si in 0..o.syms.len {
+            let sy = o.syms.at(si);
+            if (sy.ty != elf.T_FUNC) or (sy.sec < 0) or (sy.name.len == 0) {
+                continue;
+            }
+            if sec_cls.get(oi)[@as(usize, @bit_cast(u32, sy.sec))] != C_TEXT {
+                continue;
+            }
+            let gi = global_of(oi, @truncate(u32, si));
+            if gi >= 0 {
+                let g = gsyms.at(@int_cast(usize, gi));
+                if (g.obj != @int_cast(i32, oi)) or (g.sym != @truncate(u32, si)) {
+                    continue;
+                }
+            }
+            let addr = sym_addr_in(oi, @truncate(u32, si));
+            let mut ls = u.nil_slice.[pdb.Line]();
+            let found = lines.get(u.intern(sy.name));
+            if u.notnil(found) {
+                ls = found.items();
+            }
+            fs.push(
+                pdb.Func.{
+                    name: sy.name, sec: 1, off: @truncate(u32, addr - BASE - text_rva), size: @truncate(u32, sy.size),
+                    lines: ls });
+        }
+    }
+    return fs;
+}
+
+// An object's line tables (.axiom.lines: see x64.ax's emit_lines), by
+// function name; file numbers become indexes in `files`.
+fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8],
+                file_map: *mut u.SymMap.[u32]) u.SymMap.[*mut u.List.[pdb.Line]] {
+    let mut m = u.SymMap.[*mut u.List.[pdb.Line]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[pdb.Line]](),
+                                                    cap: 0, len: 0 };
+    let mut local = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };  // the object's file number -> index
+    for k in 0..o.secs.len {
+        let sec = o.secs.get(k);
+        if sec.kind != elf.S_DEBUG {
+            continue;
+        }
+        let d = sec.data.view();
+        let mut at: usize = 0;
+        while (at + 5) <= d.len {
+            let tag = d[at];
+            let n = @truncate(usize, elf.rd32(d, at + 1));
+            let name = d[at + 5..at + 5 + n];
+            at += 5 + n;
+            if tag == 'F' {
+                let key = u.intern(name);
+                let mut idx = file_map.get(key);
+                if idx == 0 {
+                    files.push(windows_path(name));
+                    idx = @truncate(u32, files.len);
+                    file_map.put(key, idx);
+                }
+                local.push(idx - 1);
+                continue;
+            }
+            let nrows = @truncate(usize, elf.rd32(d, at));
+            at += 4;
+            let ls = u.new.[u.List.[pdb.Line]]();
+            for r in 0..nrows {
+                let b = at + (r * 12);
+                let f = @truncate(usize, elf.rd32(d, b + 4));
+                ls.push(pdb.Line.{ off: @truncate(u32, elf.rd32(d, b)), line: @truncate(u32, elf.rd32(d, b + 8)),
+                                   file: local.get(f) });
+            }
+            at += nrows * 12;
+            m.put(u.intern(name), ls);
+        }
+    }
+    return m;
 }
