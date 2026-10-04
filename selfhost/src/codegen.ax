@@ -14,6 +14,7 @@ import "sema.ax" as sema;
 import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
+import "x64.ax" as x64;
 
 // What one codegen run produces (spec §16.8):
 //   CG_WHOLE   the whole program in one object (-O2 and above by default)
@@ -2175,6 +2176,21 @@ fn gen_shift(op: i32, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut
     if t.kind == ast.TY_VEC {
         lane = t.elem;
     }
+    if (k.ty.kind == ir.T_VEC) and on_x64() and (k.ty.elem.bits == x.ty.elem.bits) {
+        // a count per lane, where x86-64 shifts each lane by its own (and
+        // counts beyond the lane give 0, or the sign, as here)
+        let mut sid = ir.IN_SHLV;
+        if op != lx.TK_SHL {
+            sid = ir.IN_LSHRV;
+            if lane.is_signed {
+                sid = ir.IN_ASHRV;
+            }
+        }
+        if x64.shiftv_ok(sid, x.ty.elem.bits, x.ty.lanes) {
+            let mut sargs: [2]*mut ir.Value = [x, k];
+            return ir.intr(B, sid, x.ty, sargs[..]);
+        }
+    }
     if k.ty.kind == ir.T_VEC {
         // a count per lane: lane by lane
         let mut r = ir.undef(x.ty);
@@ -2689,6 +2705,21 @@ fn ext_int(v: *mut ir.Value, to: *mut ir.Ty, is_signed: bool) *mut ir.Value {
     return zext(v, to);
 }
 
+// x86-64 code generation, which selects some vector builtins whole (where
+// the function's extensions have them: x64.perm_ok and the like).
+fn on_x64() bool {
+    return tg.g_arch == tg.ARCH_X64;
+}
+
+// The mask (i64) of the first k lanes, k <= 64: (1 << k) - 1 in two shifts,
+// each below 64.
+fn lane_mask(k: *mut ir.Value) *mut ir.Value {
+    let h = ir.binop(B, ir.OP_LSHR, k, usz(1));
+    let one = ci(T_i64, 1);
+    let m = ir.binop(B, ir.OP_SHL, ir.binop(B, ir.OP_SHL, one, h), b_sub(k, h));
+    return b_sub(m, one);
+}
+
 // A lane-wise builtin on a vector (spec §13.2) that the backends have for
 // scalars only: lane by lane. `src_signed`: the operand's lanes, for
 // @float_from_int.
@@ -2869,10 +2900,37 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return ext_int(gen(barg(e, 1)), lty(rt), s.is_signed);
     }
     if ((id == ast.BI_INT_FROM_FLOAT) or (id == ast.BI_FLOAT_FROM_INT)) and (rt.kind == ast.TY_VEC) {
-        return lanewise(id, rt, gen(barg(e, 1)), ct(barg(e, 1).ty).is_signed);
+        let srct = ct(barg(e, 1).ty);
+        let v = gen(barg(e, 1));
+        if on_x64() and (srct.elem.bits == rt.elem.bits) {
+            // whole vectors (x64.ax converts them, or the lanes one by one)
+            let mut op = ir.OP_UITOFP;
+            if id == ast.BI_INT_FROM_FLOAT {
+                op = ir.OP_FPTOUI_SAT;
+                if rt.is_signed {
+                    op = ir.OP_FPTOSI_SAT;
+                }
+            } else if srct.is_signed {
+                op = ir.OP_SITOFP;
+            }
+            return ir.cast(B, op, v, lty(rt));
+        }
+        return lanewise(id, rt, v, srct.is_signed);
     }
     if ((id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT)) and (rt.kind == ast.TY_VEC) {
-        return lanewise(id, rt, gen(barg(e, 0)), false);
+        let v = gen(barg(e, 0));
+        if on_x64() and (v.ty.elem.bits == lty(rt).elem.bits) {
+            // whole vectors (x64.ax counts them, or the lanes one by one)
+            let mut iid = ir.IN_CTPOP;
+            if id == ast.BI_CLZ {
+                iid = ir.IN_CTLZ;
+            } else if id == ast.BI_CTZ {
+                iid = ir.IN_CTTZ;
+            }
+            let mut args: [1]*mut ir.Value = [v];
+            return ir.intr(B, iid, lty(rt), args[..]);
+        }
+        return lanewise(id, rt, v, false);
     }
     if id == ast.BI_INT_FROM_FLOAT {
         let v = gen(barg(e, 1));
@@ -3225,12 +3283,20 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_SWIZZLE {
         let x = gen(barg(e, 0));
         let idx = gen(barg(e, 1));
+        if on_x64() and (idx.ty.elem.bits == x.ty.elem.bits) and x64.perm_ok(x.ty.elem.bits, x.ty.lanes, false) {
+            let mut pargs: [2]*mut ir.Value = [x, idx];
+            return ir.intr(B, ir.IN_PERM, x.ty, pargs[..]);
+        }
         return swizzle_lanes(rt, x, idx);
     }
     if id == ast.BI_SWIZZLE2 {
         let x = gen(barg(e, 0));
         let y = gen(barg(e, 1));
         let idx = gen(barg(e, 2));
+        if on_x64() and (idx.ty.elem.bits == x.ty.elem.bits) and x64.perm_ok(x.ty.elem.bits, x.ty.lanes, true) {
+            let mut pargs: [3]*mut ir.Value = [x, y, idx];
+            return ir.intr(B, ir.IN_PERM2, x.ty, pargs[..]);
+        }
         // indices below n pick from x (in y they wrap to beyond its lanes),
         // the others from y
         let lo = swizzle_lanes(rt, x, idx);
@@ -3245,6 +3311,10 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let len = extract(s, 1);
         let n = usz(@as(i64, rt.lanes));
         let k = sel(icmp(ir.IntULT, len, n), len, n);
+        if on_x64() and x64.partial_ok(@int_cast(i32, rt.elem.bits), @int_cast(i32, rt.lanes)) {
+            let mut pargs: [2]*mut ir.Value = [p, lane_mask(k)];
+            return ir.intr(B, ir.IN_LOAD_PARTIAL, lty(rt), pargs[..]);
+        }
         let tmp = alloca_in_entry(lty(rt), "partial".ptr);
         _ = ir.memop(B, ir.OP_MEMSET, tmp, ci(T_i8, 0), usz(ty.type_size(rt)));
         _ = ir.memop(B, ir.OP_MEMMOVE, tmp, p, b_mul(k, usz(ty.type_size(rt.elem))));
@@ -3258,6 +3328,11 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let len = extract(s, 1);
         let n = usz(@as(i64, vt.lanes));
         let k = sel(icmp(ir.IntULT, len, n), len, n);
+        if on_x64() and x64.partial_ok(@int_cast(i32, vt.elem.bits), @int_cast(i32, vt.lanes)) {
+            let mut pargs: [3]*mut ir.Value = [v, p, lane_mask(k)];
+            _ = ir.intr(B, ir.IN_STORE_PARTIAL, T_void, pargs[..]);
+            return vnil();
+        }
         let tmp = alloca_in_entry(lty(vt), "partial".ptr);
         store(vt, v, tmp, true);
         _ = ir.memop(B, ir.OP_MEMMOVE, p, tmp, b_mul(k, usz(ty.type_size(vt.elem))));

@@ -1156,6 +1156,10 @@ fn gen_cast(v: *mut ir.Value) void {
         sse_unary(xe.CVTSD2SS, d, R(r));
         return;
     }
+    if to.kind == ir.T_VEC {
+        vec_cvt(v);
+        return;
+    }
     if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) {
         gen_int_to_float(v, d);
         return;
@@ -2448,15 +2452,18 @@ pub fn vector_bits() u64 {
 pub fn wide_legal(v: *mut ir.Value) bool {
     let w = inst_vl(v);
     let o = v.op;
+    if own_vec_op(v) {
+        return true;
+    }
     if (o == ir.OP_LOAD) or (o == ir.OP_STORE) or (o == ir.OP_PHI) or (o == ir.OP_SELECT) or (o == ir.OP_COPY) or
        (o == ir.OP_SPLAT) or (o == ir.OP_EXTRACTELEM) or (o == ir.OP_INSERTELEM) {
         return true;
     }
     if o == ir.OP_SHUFFLE {
-        return vs.plumbing(v);
+        return vs.plumbing(v) or perm_shuffle_ok(v);
     }
     if (o >= ir.OP_ZEXT) and (o <= ir.OP_FPTOUI_SAT) {
-        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT);
+        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT) or cvt_ok(o, v.a.ty, v.ty);
     }
     let mut t = v.ty;
     if (o == ir.OP_ICMP) or (o == ir.OP_FCMP) {
@@ -2547,6 +2554,9 @@ pub fn legal(v: *mut ir.Value) bool {
     if inst_vl(v) > 16 {
         return wide_legal(v);
     }
+    if own_vec_op(v) {
+        return true;
+    }
     if (v.op == ir.OP_INTR) and is_insn(@truncate(i32, @bit_cast(i64, v.cv))) {
         return true;  // (sema allowed it only where the extension is there)
     }
@@ -2636,9 +2646,26 @@ pub fn legal(v: *mut ir.Value) bool {
         return false;
     }
     if (o >= ir.OP_ZEXT) and (o <= ir.OP_FPTOUI_SAT) {
-        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT);
+        return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT) or cvt_ok(o, v.a.ty, v.ty);
     }
     return true;
+}
+
+// The vector instructions of the whole-width section below: the
+// intrinsics codegen.ax makes only where they are selected, and lane-wise
+// bit counts where the extensions have them.
+fn own_vec_op(v: *mut ir.Value) bool {
+    if v.op != ir.OP_INTR {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if (id >= ir.IN_PERM) and (id <= ir.IN_ASHRV) {
+        return true;
+    }
+    if ((id == ir.IN_CTLZ) or (id == ir.IN_CTPOP) or (id == ir.IN_CTTZ)) and (v.ty.kind == ir.T_VEC) {
+        return bitcount_ok(id, lane_bits(v.ty), v.ty.lanes);
+    }
+    return false;
 }
 
 fn vec_binop(v: *mut ir.Value) void {
@@ -3097,8 +3124,13 @@ fn gen_shuffle(v: *mut ir.Value) void {
     _ = sse2(xe.MOVDQU_LD, W(d), mc.mem_slot(r, 0));
 }
 
-// The shuffles vsplit.ax makes: two halves joined, or a part of a vector.
+// The shuffles vsplit.ax makes: two halves joined, or a part of a vector;
+// other wide ones as permutes (perm_shuffle_ok).
 fn wide_shuffle(v: *mut ir.Value) void {
+    if not vs.plumbing(v) {
+        perm_shuffle(v);
+        return;
+    }
     let d = vreg(v);
     let a = reg(v.a);
     let st = v.a.ty;
@@ -3345,6 +3377,466 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
 }
 
 // -----------------------------------------------------------------------------
+// AVX2 and AVX-512: whole-width permutes, conversions, masked loads and
+// stores, per-lane shifts and bit counts. codegen.ax makes the IN_PERM ...
+// intrinsics only where these say the selector does them.
+// -----------------------------------------------------------------------------
+
+// AVX-512 (F and BW, and VL below 512 bits) for vectors of `bytes` bytes.
+pub fn avx512_for(bytes: u64) bool {
+    if not tg.has(tg.X_AVX512F | tg.X_AVX512BW) {
+        return false;
+    }
+    return (bytes == 64) or (((bytes == 16) or (bytes == 32)) and tg.has(tg.X_AVX512VL));
+}
+
+fn pki(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn vbytes(bits: i32, lanes: i32) u64 {
+    return (@as(u64, @bit_cast(u32, bits)) * @as(u64, @bit_cast(u32, lanes))) / 8;
+}
+
+// @swizzle (two: @swizzle2) of `lanes` lanes of `bits` as one permute:
+// vpermd / vpermps (AVX2, 256 bits), vperm[bwdq] and vpermt2* (AVX-512;
+// bytes need VBMI).
+pub fn perm_ok(bits: i32, lanes: i32, two: bool) bool {
+    let n = vbytes(bits, lanes);
+    if (bits == 8) and not tg.has(tg.X_AVX512VBMI) {
+        return false;
+    }
+    if not two and (n == 32) and (bits == 32) and tg.has(tg.X_AVX2) {
+        return true;
+    }
+    if not two and (n == 16) {
+        return false;  // (the one-table permutes have no 128-bit form; pshufb does it)
+    }
+    return avx512_for(n);
+}
+
+// @load_partial / @store_partial as masked moves (AVX-512).
+pub fn partial_ok(bits: i32, lanes: i32) bool {
+    return avx512_for(vbytes(bits, lanes));
+}
+
+// A shift of each lane by its own count: vpsllv[dq], vpsrlv[dq], vpsravd
+// (AVX2), vpsravq and the 16-bit ones (AVX-512).
+pub fn shiftv_ok(id: i32, bits: i32, lanes: i32) bool {
+    let n = vbytes(bits, lanes);
+    if (n != 16) and (n != 32) and (n != 64) {
+        return false;
+    }
+    if (n == 64) or (bits == 16) or ((bits == 64) and (id == ir.IN_ASHRV)) {
+        return ((bits == 16) or (bits == 32) or (bits == 64)) and avx512_for(n);
+    }
+    return ((bits == 32) or (bits == 64)) and tg.has(tg.X_AVX2);
+}
+
+// Leading-zero counts, population counts and trailing-zero counts of each
+// lane (vplzcnt[dq] with AVX512CD, vpopcnt[dq] with VPOPCNTDQ, vpopcnt[bw]
+// with BITALG).
+pub fn bitcount_ok(id: i32, bits: i32, lanes: i32) bool {
+    let n = vbytes(bits, lanes);
+    if not avx512_for(n) {
+        return false;
+    }
+    if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) {
+        return ((bits == 32) or (bits == 64)) and tg.has(tg.X_AVX512CD);
+    }
+    if id == ir.IN_CTPOP {
+        if (bits == 32) or (bits == 64) {
+            return tg.has(tg.X_AVX512VPOPCNTDQ);
+        }
+        return tg.has(tg.X_AVX512BITALG);
+    }
+    return false;
+}
+
+// A conversion between vectors of 32-bit (or 64-bit) lanes: cvtdq2ps and
+// cvttps2dq (SSE2 and AVX), the unsigned ones and the 64-bit ones with
+// AVX-512 (DQ).
+pub fn cvt_ok(o: i32, from: *ir.Ty, to: *ir.Ty) bool {
+    if (from.kind != ir.T_VEC) or (to.kind != ir.T_VEC) or (lane_bits(from) != lane_bits(to)) {
+        return false;
+    }
+    let b = lane_bits(to);
+    let n = @as(u64, to.size);
+    if b == 64 {
+        return tg.has(tg.X_AVX512DQ) and avx512_for(n);
+    }
+    if b != 32 {
+        return false;
+    }
+    if (o == ir.OP_SITOFP) or (o == ir.OP_FPTOSI_SAT) {
+        return (n == 16) or ((n == 32) and tg.has(tg.X_AVX2)) or ((n == 64) and avx512_for(n));
+    }
+    return ((o == ir.OP_UITOFP) or (o == ir.OP_FPTOUI_SAT)) and avx512_for(n);
+}
+
+// A constant vector (of the width being selected) of 32- or 64-bit lanes x.
+fn splat_mem(x: u64, bits: i32) mc.MOp {
+    let mut q = x;
+    if bits == 32 {
+        q = (x & 0xffff_ffff) | (x << 32);
+    } else if bits == 16 {
+        q = x & 0xffff;
+        q = q | (q << 16);
+        q = q | (q << 32);
+    } else if bits == 8 {
+        q = x & 0xff;
+        q = q | (q << 8);
+        q = q | (q << 16);
+        q = q | (q << 32);
+    }
+    return const16(q, q);
+}
+
+// Vector conversions (cvt_ok): saturating like the scalar ones.
+fn vec_cvt(v: *mut ir.Value) void {
+    let o = v.op;
+    let d = vreg(v);
+    let x = reg(v.a);
+    let b = lane_bits(v.ty);
+    if o == ir.OP_SITOFP {
+        sse_unary_packed(pki(b == 32, xe.CVTDQ2PS, xe.VCVTQQ2PD), d, R(x));
+        return;
+    }
+    if o == ir.OP_UITOFP {
+        sse_unary_packed(pki(b == 32, xe.VCVTUDQ2PS, xe.VCVTUQQ2PD), d, R(x));
+        return;
+    }
+    let z = vxmm();
+    sse3(xe.PXOR, z, z, R(z));
+    if o == ir.OP_FPTOUI_SAT {
+        // max(x, 0) is 0 for NaN (its second operand) and negative lanes;
+        // the conversion gives all ones above the range
+        let t = vxmm();
+        sse3(pki(b == 32, xe.MAXPS, xe.MAXPD), t, x, R(z));
+        sse_unary_packed(pki(b == 32, xe.VCVTTPS2UDQ, xe.VCVTTPD2UQQ), d, R(t));
+        return;
+    }
+    // the conversion gives the sign bit alone for NaN and out-of-range lanes:
+    // flipped to the largest value where x >= 2^(b-1), cleared where x is NaN
+    let t = vxmm();
+    sse_unary_packed(pki(b == 32, xe.CVTTPS2DQ, xe.VCVTTPD2QQ), t, R(x));
+    let lim = vxmm();
+    let mut cmp = xe.CMPPS;
+    if b == 32 {
+        _ = sse2(xe.MOVDQU_LD, W(lim), splat_mem(0x4f00_0000, 32));  // 2^31
+    } else {
+        cmp = xe.CMPPD;
+        _ = sse2(xe.MOVDQU_LD, W(lim), splat_mem(0x43e0_0000_0000_0000, 64));  // 2^63
+    }
+    let k = lk(v.ty);
+    let hi = vxmm();
+    vcmp_i(cmp, hi, lim, R(x), 2, k);  // 2^(b-1) <= x (ordered)
+    let f = vxmm();
+    sse3(xe.PXOR, f, t, R(hi));
+    let ord = vxmm();
+    vcmp_i(cmp, ord, x, R(x), 7, k);  // not NaN
+    sse3(xe.PAND, d, f, R(ord));
+}
+
+// Are the lanes of index vector x all below n (unsigned), as constants or
+// masked by one?
+fn known_below(x0: *ir.Value, n: u64) bool {
+    let x = x0;
+    if x.kind == ir.V_ZERO {
+        return true;
+    }
+    if x.kind == ir.V_CAGG {
+        for k in 0..x.xs.len {
+            let c = x.xs.get(k);
+            if (c.kind == ir.V_CINT) and (ir.cint_val(c) >= n) {
+                return false;
+            }
+            if (c.kind != ir.V_CINT) and (c.kind != ir.V_ZERO) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if is_inst(x, ir.OP_SPLAT) {
+        return (x.a.kind == ir.V_ZERO) or ((x.a.kind == ir.V_CINT) and (ir.cint_val(x.a) < n));
+    }
+    if is_inst(x, ir.OP_AND) {
+        return known_below(x.a, n) or known_below(x.b, n);
+    }
+    return false;
+}
+
+// k1 <- the lanes of idx below n (unsigned), for a zeroing permute: 9 (k1,
+// zeroing) as the permute's mask, or 0 when every index is a lane.
+fn in_range_mask(idx_v: *mut ir.Value, idx: i32, n: u64) i64 {
+    if known_below(idx_v, n) {
+        return 0;
+    }
+    let b = lane_bits(idx_v.ty);
+    let mut id = xe.VPCMPUD;
+    if b == 8 {
+        id = xe.VPCMPUB;
+    } else if b == 16 {
+        id = xe.VPCMPUW;
+    } else if b == 64 {
+        id = xe.VPCMPUQ;
+    }
+    let c = e4(xe.SSE, VL, W(xe.K1), splat_mem(n, b), R(idx), I(1));  // idx < n
+    c.cc = id;
+    return 9;
+}
+
+// A wide shuffle whose result has its operands' type, as one permute by
+// constant indices: of one operand (vpermd with AVX2, or AVX-512's), or of
+// both (vpermt2*).
+fn perm_shuffle_ok(v: *mut ir.Value) bool {
+    let t = v.ty;
+    let at = v.a.ty;
+    if (t.lanes != at.lanes) or (lane_bits(t) != lane_bits(at)) {
+        return false;
+    }
+    return perm_ok(lane_bits(t), t.lanes, not one_source(v)) or perm_ok(lane_bits(t), t.lanes, true);
+}
+
+// Does the shuffle read one operand only?
+fn one_source(v: *mut ir.Value) bool {
+    let n = v.a.ty.lanes;
+    let mut lo = false;
+    let mut hi = false;
+    for i in 0..v.mask.len {
+        if v.mask[i] >= n {
+            hi = true;
+        } else if v.mask[i] >= 0 {
+            lo = true;
+        }
+    }
+    return not (lo and hi) or (ir.resolve(v.a) == ir.resolve(v.b));
+}
+
+fn perm_shuffle(v: *mut ir.Value) void {
+    let t = v.ty;
+    let n = t.lanes;
+    let b = lane_bits(t);
+    let fl = lane_float(t);
+    let d = vreg(v);
+    let same = ir.resolve(v.a) == ir.resolve(v.b);
+    let mut uses_b = false;
+    for i in 0..v.mask.len {
+        if (v.mask[i] >= n) and not same {
+            uses_b = true;
+        }
+    }
+    let two = not one_source(v);
+    // the indices, as a constant of the lanes' width
+    let mut bs = bn.new_bytes();
+    for i in 0..v.mask.len {
+        let mut m = v.mask[i];
+        if m < 0 {
+            m = 0;
+        } else if not two and (m >= n) {
+            m = m - n;  // (of b alone, or of a, which b is)
+        }
+        let x = @as(u64, @bit_cast(u32, m));
+        for k in 0..@as(usize, @bit_cast(u32, b / 8)) {
+            bs.u8_(@truncate(u8, x >> @int_cast(u32, k * 8)));
+        }
+    }
+    let idx = vxmm();
+    _ = sse2(xe.MOVDQU_LD, W(idx), const_bytes(&bs, @as(usize, VL)));
+    bs.free();
+    if not two {
+        let mut src = reg(v.a);
+        if uses_b {
+            src = reg(v.b);
+        }
+        let mut op = xe.VPERMD;
+        if b == 8 {
+            op = xe.VPERMB;
+        } else if b == 16 {
+            op = xe.VPERMW;
+        } else if b == 64 {
+            op = pki(fl, xe.VPERMPDV, xe.VPERMQV);
+        } else if fl {
+            op = xe.VPERMPS;
+        }
+        sse3(op, d, idx, R(src));
+        return;
+    }
+    let mut op = xe.VPERMT2D;
+    if b == 8 {
+        op = xe.VPERMT2B;
+    } else if b == 16 {
+        op = xe.VPERMT2W;
+    } else if b == 64 {
+        op = pki(fl, xe.VPERMT2PD, xe.VPERMT2Q);
+    } else if fl {
+        op = xe.VPERMT2PS;
+    }
+    copy(d, reg(v.a), class_of(t));
+    let i = e4(xe.SSE, VL, RW(d), R(reg(v.b)), R(idx), NONE());
+    i.cc = op;
+}
+
+// IN_PERM and IN_PERM2 (perm_ok).
+fn gen_perm(v: *mut ir.Value, id: i32) void {
+    let t = v.ty;
+    let n = @as(u64, @bit_cast(u32, t.lanes));
+    let d = vreg(v);
+    let fl = lane_float(t);
+    let b = lane_bits(t);
+    if id == ir.IN_PERM {
+        let tab = reg(v.xs.get(0));
+        let iv = v.xs.get(1);
+        let idx = reg(iv);
+        if not tg.has(tg.X_AVX512F) or not avx512_for(@as(u64, t.size)) {
+            // AVX2 vpermd: the indices modulo 8; the others zeroed
+            let r = vxmm();
+            sse3(pki(fl, xe.VPERMPS, xe.VPERMD), r, idx, R(tab));
+            if known_below(iv, n) {
+                copy(d, r, class_of(t));
+                return;
+            }
+            let lo = vxmm();
+            sse3(xe.PMINUD, lo, idx, splat_mem(n - 1, 32));
+            let ok = vxmm();
+            sse3(xe.PCMPEQD, ok, lo, R(idx));
+            sse3(xe.PAND, d, r, R(ok));
+            return;
+        }
+        let kz = in_range_mask(iv, idx, n);
+        let mut op = xe.VPERMD;
+        if b == 8 {
+            op = xe.VPERMB;
+        } else if b == 16 {
+            op = xe.VPERMW;
+        } else if b == 64 {
+            op = pki(fl, xe.VPERMPDV, xe.VPERMQV);
+        } else if fl {
+            op = xe.VPERMPS;
+        }
+        let i = e4(xe.SSE, VL, W(d), R(tab), R(idx), NONE());
+        i.cc = op;
+        i.aux = kz;
+        return;
+    }
+    let a = reg(v.xs.get(0));
+    let c = reg(v.xs.get(1));
+    let iv = v.xs.get(2);
+    let idx = reg(iv);
+    let kz = in_range_mask(iv, idx, 2 * n);
+    let mut op = xe.VPERMT2D;
+    if b == 8 {
+        op = xe.VPERMT2B;
+    } else if b == 16 {
+        op = xe.VPERMT2W;
+    } else if b == 64 {
+        op = pki(fl, xe.VPERMT2PD, xe.VPERMT2Q);
+    } else if fl {
+        op = xe.VPERMT2PS;
+    }
+    copy(d, a, class_of(t));
+    let i = e4(xe.SSE, VL, RW(d), R(c), R(idx), NONE());
+    i.cc = op;
+    i.aux = kz;
+}
+
+fn masked_move(bits: i32, store: bool) i32 {
+    let mut k: i32 = 2;
+    if bits == 8 {
+        k = 0;
+    } else if bits == 16 {
+        k = 1;
+    } else if bits == 64 {
+        k = 3;
+    }
+    if store {
+        return xe.VMOVDQU8_ST + k;
+    }
+    return xe.VMOVDQU8_LD + k;
+}
+
+// IN_LOAD_PARTIAL and IN_STORE_PARTIAL (partial_ok): the mask into k1, then
+// a masked move.
+fn gen_partial(v: *mut ir.Value, id: i32) void {
+    if id == ir.IN_LOAD_PARTIAL {
+        let m = reg(v.xs.get(1));
+        let p = addr(v.xs.get(0));
+        let d = vreg(v);
+        let k = e4(xe.SSE, 8, W(xe.K1), R(m), NONE(), NONE());
+        k.cc = xe.KMOVQ_KR;
+        let i = e4(xe.SSE, VL, W(d), p, NONE(), NONE());
+        i.cc = masked_move(lane_bits(v.ty), false);
+        i.aux = 9;
+        return;
+    }
+    let x = reg(v.xs.get(0));
+    let m = reg(v.xs.get(2));
+    let p = addr(v.xs.get(1));
+    let k = e4(xe.SSE, 8, W(xe.K1), R(m), NONE(), NONE());
+    k.cc = xe.KMOVQ_KR;
+    let i = e4(xe.SSE, VL, R(x), p, NONE(), NONE());
+    i.cc = masked_move(lane_bits(v.xs.get(0).ty), true);
+    i.aux = 1;
+}
+
+// IN_SHLV, IN_LSHRV, IN_ASHRV (shiftv_ok): the hardware's shifts give 0
+// (the sign) for counts beyond the lane, as these do.
+fn gen_shiftv(v: *mut ir.Value, id: i32) void {
+    let d = vreg(v);
+    let x = reg(v.xs.get(0));
+    let c = reg(v.xs.get(1));
+    let b = lane_bits(v.ty);
+    let mut k: i32 = 1;
+    if b == 16 {
+        k = 0;
+    } else if b == 64 {
+        k = 2;
+    }
+    let mut op = xe.VPSLLVW + k;
+    if id == ir.IN_LSHRV {
+        op = xe.VPSRLVW + k;
+    } else if id == ir.IN_ASHRV {
+        op = xe.VPSRAVW + k;
+    }
+    sse3(op, d, x, R(c));
+}
+
+// Vector IN_CTLZ, IN_CTPOP, IN_CTTZ (bitcount_ok); trailing zeros are
+// bits - lzcnt(~x & (x - 1)).
+fn gen_bitcount(v: *mut ir.Value, id: i32) void {
+    let d = vreg(v);
+    let x = reg(v.xs.get(0));
+    let b = lane_bits(v.ty);
+    let q = pki(b == 64, 1, 0);
+    if id == ir.IN_CTPOP {
+        let mut op = xe.VPOPCNTD + q;
+        if b == 8 {
+            op = xe.VPOPCNTB;
+        } else if b == 16 {
+            op = xe.VPOPCNTW;
+        }
+        sse_unary_packed(op, d, R(x));
+        return;
+    }
+    if id == ir.IN_CTLZ {
+        sse_unary_packed(xe.VPLZCNTD + q, d, R(x));
+        return;
+    }
+    let m1 = vxmm();
+    sse3(pki(b == 64, xe.PADDQ, xe.PADDD), m1, x, splat_mem(0xffff_ffff_ffff_ffff, b));  // x - 1
+    let low = vxmm();
+    sse3(xe.PANDN, low, x, R(m1));  // ~x & (x - 1)
+    let lz = vxmm();
+    sse_unary_packed(xe.VPLZCNTD + q, lz, R(low));
+    let w = vxmm();
+    _ = sse2(xe.MOVDQU_LD, W(w), splat_mem(@as(u64, @bit_cast(u32, b)), b));
+    sse3(pki(b == 64, xe.PSUBQ, xe.PSUBD), d, w, R(lz));
+}
+
+// -----------------------------------------------------------------------------
 // Instructions
 // -----------------------------------------------------------------------------
 fn gen_ptradd(v: *mut ir.Value) void {
@@ -3509,6 +4001,22 @@ fn gen_inst_at(v: *mut ir.Value) void {
         }
         if is_insn(id) {
             gen_insn(v, id);
+            return;
+        }
+        if (id == ir.IN_PERM) or (id == ir.IN_PERM2) {
+            gen_perm(v, id);
+            return;
+        }
+        if (id == ir.IN_LOAD_PARTIAL) or (id == ir.IN_STORE_PARTIAL) {
+            gen_partial(v, id);
+            return;
+        }
+        if (id == ir.IN_SHLV) or (id == ir.IN_LSHRV) or (id == ir.IN_ASHRV) {
+            gen_shiftv(v, id);
+            return;
+        }
+        if ((id == ir.IN_CTLZ) or (id == ir.IN_CTPOP) or (id == ir.IN_CTTZ)) and (t.kind == ir.T_VEC) {
+            gen_bitcount(v, id);
             return;
         }
         if id == ir.IN_XGETBV {
@@ -4437,10 +4945,10 @@ fn enc_sse(i: *mut mc.MInst) void {
     }
     if o1.kind == mc.K_REG {
         let m = xe.Mem.{ base: -1, index: -1, scale: 0, disp: 0, sym: -1, tpoff: false };
-        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl);
+        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 15);
     } else {
         let mut m = to_mem(o1);
-        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl);
+        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 15);
     }
     _ = d;
 }

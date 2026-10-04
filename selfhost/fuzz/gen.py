@@ -117,6 +117,36 @@ for vt, lt, n in VT:
     idx = [random.randint(0, 2*n-1) for _ in range(n)]
     P('    pv_%s(@shuffle(a, b, [%s]));' % (vt, ', '.join(map(str, idx))))
     P('    pv_%s(@select(@bit_cast(%s, @lanes_lt(a, b)), a, b));' % (vt, vt))
+    # per-lane counts and indices (unsigned, of the lane width): some beyond
+    # the lanes, or the lane's bits
+    bits = int(lt[1:])
+    ut = 'u%dx%d' % (bits, n)
+    P('    let ub = @bit_cast(%s, b);' % ut)
+    P('    let us = ub & @as(%s, @splat(%d));' % (ut, 2 * bits - 1))
+    P('    let ui = ub & @as(%s, @splat(%d));' % (ut, 4 * n - 1))
+    P('    pv_%s(a << ub); pv_%s(a >> ub); pv_%s(a << us); pv_%s(a >> us);' % (vt, vt, vt, vt))
+    P('    pv_%s(@clz(a)); pv_%s(@ctz(a)); pv_%s(@popcount(a));' % (vt, vt, vt))
+    P('    pv_%s(@swizzle(a, ub)); pv_%s(@swizzle(a, ui));' % (vt, vt))
+    P('    pv_%s(@swizzle2(a, b, ub)); pv_%s(@swizzle2(a, b, ui));' % (vt, vt))
+    P('    pv_%s(@swizzle2(a, b, ui & @as(%s, @splat(%d))));' % (vt, ut, 2 * n - 1))
+    if bits >= 32:
+        ft = 'f%dx%d' % (bits, n)
+        P('    let fa = @float_from_int(%s, a);' % ft)
+        P('    pv_%s(@bit_cast(%s, fa));' % (vt, vt))
+        P('    pv_%s(@int_from_float(%s, fa)); pv_%s(@bit_cast(%s, @int_from_float(%s, fa)));' % (vt, vt, vt, vt, ut))
+    # partial loads and stores of every length
+    P('    var_partial_%s(a);' % vt)
+    P('}')
+    P('fn var_partial_%s(a: %s) void {' % (vt, vt))
+    P('    let mut buf: [%d]%s = [@as(%s, 7); %d];' % (n + 2, lt, lt, n + 2))
+    P('    @store(buf[0..%d], a +%% @as(%s, @splat(1)));' % (n, vt))
+    P('    for k in @as(usize, 0)..%d {' % (n + 2))
+    P('        pv_%s(@load_partial(%s, buf[0..k]));' % (vt, vt))
+    P('        pv_%s(@load_partial(%s, buf[1..k + 1]));' % (vt, vt))
+    P('        let mut out: [%d]%s = [@as(%s, 5); %d];' % (n + 2, lt, lt, n + 2))
+    P('        @store_partial(out[1..k + 1], a);')
+    P('        for j in 0..out.len { %s }' % pr('out[j]', lt))
+    P('    }')
     P('}')
 for scale in (1, 2, 4):
     f4, d2 = 'f32x%d' % (4 * scale), 'f64x%d' % (2 * scale)
@@ -130,6 +160,15 @@ for scale in (1, 2, 4):
     P('    pf(@float_cast(f64, @reduce_add(a))); pf(@reduce_add(c)); pf(@float_cast(f64, @dot(a, b)));')
     P('    print_u64(@as(u64, @bitmask(@lanes_lt(a, b)))); print_u64(@as(u64, @bitmask(@lanes_ge(c, d))));')
     P('    pvf_%s(@select(@lanes_gt(a, b), a, b));' % f4)
+    i4, u4, i2, u2 = 'i32x%d' % (4 * scale), 'u32x%d' % (4 * scale), 'i64x%d' % (2 * scale), 'u64x%d' % (2 * scale)
+    for e in ['a', 'b', 'a * b', '-a', 'a * @as(%s, @splat(1e9))' % f4]:
+        P('    pv_%s(@int_from_float(%s, %s)); pv_%s(@int_from_float(%s, %s));' % (i4, i4, e, u4, u4, e))
+    for e in ['c', 'd', 'c * d', '-c', 'c * @as(%s, @splat(1e19))' % d2]:
+        P('    pv_%s(@int_from_float(%s, %s)); pv_%s(@int_from_float(%s, %s));' % (i2, i2, e, u2, u2, e))
+    P('    pvf_%s(@swizzle(a, @as(%s, @splat(1)))); pvd_%s(@swizzle2(c, d, @as(%s, @splat(%d))));' % (f4, u4, d2, u2, 2 * scale + 1))
+    P('    let mut fb: [%d]f32 = [1.5; %d];' % (4 * scale + 1, 4 * scale + 1))
+    P('    for k in @as(usize, 0)..%d { pvf_%s(@load_partial(%s, fb[0..k])); @store_partial(fb[0..k], b); }' % (4 * scale + 2, f4, f4))
+    P('    for k in @as(usize, 0)..fb.len { pf(@float_cast(f64, fb[k])); }')
     P('}')
     b8, i16, i32 = 'u8x%d' % (16 * scale), 'i16x%d' % (8 * scale), 'i32x%d' % (4 * scale)
     P('fn sw_%d(a: %s, idx: %s) void { pv_%s(@swizzle(a, idx)); }' % (scale, b8, b8, b8))
@@ -151,5 +190,12 @@ for scale in (1, 2, 4):
     P('        let d = @vec(f64x%d, %s);' % (nd, ', '.join('v_f64[(i + %d) %% v_f64.len]' % (3 * k + 5) for k in range(nd))))
     P('        sf_%d(a, b, c, d);' % scale)
     P('    }')
+    # NaN, infinities and the bounds of the conversions
+    sp32 = ['0x7fc00000', '0x7f800000', '0xff800000', '0x4f000000', '0x4effffff', '0xcf000000', '0xcf000001', '0x4f800000',
+            '0x4f7fffff', '0xbf7fffff', '0xbf800000', '0x80000000', '0x3f000000', '0xffc00001', '0x5f000000', '0x3f800001']
+    sp64 = ['0x7ff8000000000000', '0x7ff0000000000000', '0xfff0000000000000', '0x43e0000000000000', '0xc3e0000000000000',
+            '0x43f0000000000000', '0x43efffffffffffff', '0xbfefffffffffffff']
+    P('    sf_%d(@bit_cast(f32x%d, @vec(u32x%d, %s)), @bit_cast(f32x%d, @vec(u32x%d, %s)), @bit_cast(f64x%d, @vec(u64x%d, %s)), @bit_cast(f64x%d, @vec(u64x%d, %s)));' %
+      (scale, nf, nf, ', '.join(sp32[:nf]), nf, nf, ', '.join(sp32[16 - nf:]), nd, nd, ', '.join(sp64[:nd]), nd, nd, ', '.join(sp64[8 - nd:])))
 P('}')
 print('\n'.join(out))
