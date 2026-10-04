@@ -75,3 +75,4 @@ they travel with the code they describe.
 | [0043](0043-optional-pointers.md) | feature | language | No optional pointers or optional values |
 | [0044](0044-global-initializers-and-thread-exit.md) | feature | language, std/thread | Restricted global initializers; no thread-exit cleanup for thread-locals |
 | [0045](0045-closures.md) | feature | language | No closures |
+| [0046](0046-selfhost-wide-vectors.md) | feature | compiler (selfhost) | Self-hosted x86-64 backend: 512-bit vector code is about 10x slower than LLVM's |
