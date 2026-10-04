@@ -1,8 +1,8 @@
 # 0053: Self-hosted x86-64: calls still pay for the shadow stack (no frame tables)
 
 - Type: feature (performance)
-- Status: open
-- Area: compiler (selfhost: codegen, x64, elink), runtime
+- Status: fixed (ccd1257)
+- Area: compiler (selfhost: codegen, inline, x64, a64, elink, mlink, plink), runtime
 
 One of a set of issues (0053-0064) from comparing the self-hosted compiler's x86-64 AVX-512
 code with the C compiler's (LLVM) on the benchmark's kernels (`axiom/src/bin/bench_kernels.ax`,
@@ -97,3 +97,64 @@ store above is dead), and keep the ring offset in one slot instead of three.
 `--stack-traces=off` approximates the gain: movegen -9 to -12% (about 105-140 ns of its
 430 ns gap) in three separate runs. The other kernels change by less than the noise
 (0-5%), so about 150 ns summed over the kernels.
+
+## Resolution
+
+0037's design, in the self-hosted compiler for every native target: x86-64 and AArch64
+Linux, `aarch64-macos` and `x86_64-windows` (spec §17.4.1, "Frame tables"; selfhost/README.md).
+Calls no longer touch the shadow stack:
+
+- `codegen.ax` (`frame_tables`: native, traces on, not `axiom profile` and not
+  `--sanitize=address`) gives each call it used to record a chain (`ir.Chain`, a field of the
+  call instruction) holding its site record, instead of the stores. The inliner appends the
+  inlined call's chain to the chains of the calls it copies (trap calls start with none), so
+  after optimization each call's chain is its own record and then those of the calls inlined
+  around it, innermost first: the inline frames of `inline fn`s and of whatever the
+  optimizer inlined, traps in inlined code included. Jump threading, loop-range splitting
+  and outlining copy the chain with the call.
+- The backends (`ftab.ax`, used by `x64.ax` and `a64.ax`) write each distinct chain once
+  (null-terminated, in `.data.rel.ro`) and, after each call that has one, an 8-byte entry in
+  the section `axiom_rets`: the return address and the chain, both relative. Entries are
+  in code order. The x86-64 backend still gives no frame to a leaf whose only calls are
+  traps (they do not return): its calls' entries say so, and such functions are bracketed by
+  marker entries, so a walk (or a crash inside one) finds their return address on the
+  stack. AArch64 gives every function that calls a frame (a call clobbers the link register).
+- `elink.ax`, `mlink.ax` and `plink.ax` place the objects' `axiom_rets` sections together, in
+  the order of their code, between `__start_axiom_rets` and `__stop_axiom_rets` (as GNU ld
+  does when C code is linked with the system's toolchain, whose C code is now compiled with
+  `-fno-omit-frame-pointer`); `axiom_frame_table()` returns them.
+- `axiom.trap` calls the runtime's `ax_stack_walk` with its own frame (`ir.IN_FRAME_ADDR`),
+  and the crash handlers (`native.ax`, `test_main.ax`, `darwin.ax`, `windows.ax`) walk from
+  the signal's or exception's context. `trap_format.ax`'s `walk_frames` follows the
+  frame-pointer chain within the thread's stack, looks each return address up (binary
+  search; the table is checked to be sorted on first use) and fills the thread's
+  shadow-stack record (calls and depth) as the stores would have, so every report is made by
+  unchanged code. Error-return traces keep using the record's ring.
+
+`tests/traces` passes natively at `-O0` to `-O3` and with `--units=module` on x86-64 Linux,
+on AArch64 Linux (under qemu) and on Windows (under Wine); the macOS build was only checked
+statically (its table maps every return address to the instruction after a `bl`/`blr`).
+Code generated for `generate_moves_sub` is now identical to the `--stack-traces=off` build.
+the benchmark's `bench_search` results are bit-identical.
+
+Measured (native, `-O2`; `bench_kernels` min of 11 per kernel, built by origin/main and by this
+change, on a machine with a load average of 10-12 on 4 cores, so differences of several
+percent are noise; checksums unchanged):
+
+| | shadow stack | frame tables | `--stack-traces=off` | C compiler |
+|---|---|---|---|---|
+| recursive fib(38) | 383 ms | 223 ms | 222 ms | |
+| movegen | 1166 ns | 1048 ns | 1052 ns | 744 ns |
+| contact_inputs | 320 | 299 | 301 | 190 |
+| race_inputs | 227 | 202 | 195 | 109 |
+| contact_net | 424 | 386 | 426 | 278 |
+| contact_single | 422 | 403 | 405 | 345 |
+| all 12 kernels summed | 3368 | 3120 | 3175 | |
+
+Executables are smaller than with the shadow stack (bench_kernels 577 -> 550 KB): the table
+costs less than the stores did.
+
+Not identical to the shadow stack, as with 0037: a fault that is not a check inside code the
+optimizer inlined is reported in the function it was inlined into, and a crash in a
+function's first instructions (before its frame is set up) misses that function's caller.
+

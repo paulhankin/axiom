@@ -82,7 +82,7 @@ they travel with the code they describe.
 | [0050](0050-test-output.md) | feature | tools | `axiom test` hides what a test prints |
 | [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic |
 | [0052](0052-runtime-cpu-dispatch.md) | feature | language, compiler, std | No runtime CPU feature dispatch (filed in error: `@features`, `@multiversion`, `@cpu_has`, §13.4; fixed in a749803: inline helpers get a version's extensions) |
-| [0053](0053-selfhost-native-shadow-stack.md) | feature | compiler (selfhost: codegen, x64, elink), runtime | Self-hosted x86-64: calls still pay for the shadow stack (no frame tables) |
+| [0053](0053-selfhost-native-shadow-stack.md) | feature | compiler (selfhost: codegen, inline, x64, a64, linkers), runtime | Self-hosted x86-64: calls still pay for the shadow stack (no frame tables) |
 | [0054](0054-selfhost-regalloc-spills.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator spills hot values and copies around its spill code |
 | [0055](0055-selfhost-full-unrolling.md) | feature | compiler (selfhost: opt/passes) | Self-hosted optimizer does not unroll small constant-trip loops |
 | [0056](0056-selfhost-vector-constants.md) | feature | compiler (selfhost: x64, opt) | Self-hosted x86-64: vector constants reloaded at every use, splats not broadcast |
