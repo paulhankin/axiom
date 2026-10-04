@@ -65,3 +65,5 @@ they travel with the code they describe.
 | [0033](0033-checked-multiply-on-native.md) | feature | compiler (C) | Checked 64-bit multiplication divides back natively |
 | [0034](0034-debug-line-info.md) | feature | compiler (C), tools | Line tables (DWARF) for native profilers |
 | [0035](0035-widen-narrow-and-bool-to-int.md) | bug, feature | compiler (C), language | `@widen_low`/`@widen_high`/`@narrow` unimplemented; no bool to integer |
+| [0036](0036-dot-lowering.md) | bug | compiler (C) | `@dot` on `i16` lanes does not become `pmaddwd` / `i32x4.dot_i16x8_s` |
+| [0037](0037-native-stack-trace-cost.md) | feature | compiler (C), runtime | Stack traces cost 15% in call-heavy native code |
