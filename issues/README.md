@@ -36,6 +36,7 @@ they travel with the code they describe.
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
+| [0066](0066-selfhost-regalloc-movegen.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: reloads around calls in movegen's recursive loop |
 
 ## Closed
 
