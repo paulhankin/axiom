@@ -210,11 +210,56 @@ fn cmp_const_range(p: i32, bits: i32, k: u64) i32 {
     return -1;
 }
 
+// The float 1.0, or a vector of them.
+fn fone(v: *ir.Value) bool {
+    if v.kind == ir.V_CFP {
+        return v.fv == 1.0;
+    }
+    if is_op(v, ir.OP_SPLAT) {
+        return fone(v.a);
+    }
+    if (v.kind == ir.V_CAGG) and (v.ty.kind == ir.T_VEC) {
+        for k in 0..v.xs.len {
+            if not fone(v.xs.get(k)) {
+                return false;
+            }
+        }
+        return v.xs.len > 0;
+    }
+    return false;
+}
+
+// A vector of zeros (a constant, or a splat of zero).
+fn vzero(v: *ir.Value) bool {
+    return ir.is_zero(v) or (is_op(v, ir.OP_SPLAT) and ir.is_zero(v.a));
+}
+
+fn pick_pred(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
 fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let mut p = pred_of(i);
     let mut a = i.a;
     let mut b = i.b;
     let at = a.ty;
+    if (at.kind == ir.T_VEC) and (at.elem.kind == ir.T_INT) {
+        // lanes >u 0 -> lanes != 0, lanes <=u 0 -> lanes == 0 (and with the
+        // zero on the left)
+        if vzero(a) and not vzero(b) {
+            i.a = b;
+            i.b = a;
+            i.cv = @as(u64, @bit_cast(u32, swap_pred(p)));
+            p = pred_of(i);
+        }
+        if vzero(i.b) and ((p == ir.IntUGT) or (p == ir.IntULE)) {
+            i.cv = @as(u64, @bit_cast(u32, pick_pred(p == ir.IntUGT, ir.IntNE, ir.IntEQ)));
+        }
+        return vnil();
+    }
     if (at.kind != ir.T_INT) and (at.kind != ir.T_PTR) {
         return vnil();
     }
@@ -888,10 +933,37 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if small_int(i.ty) {
             return simplify_bin(B, i);
         }
+        if (i.ty.kind == ir.T_VEC) and (i.ty.elem.kind == ir.T_INT) {
+            // lanes plus, minus, or, xor zero; and zero
+            if ((op == ir.OP_ADD) or (op == ir.OP_OR) or (op == ir.OP_XOR)) and vzero(i.a) {
+                return i.b;
+            }
+            if ((((op == ir.OP_ADD) or (op == ir.OP_SUB)) or (op == ir.OP_OR)) or (op == ir.OP_XOR)) and vzero(i.b) {
+                return i.a;
+            }
+            if (op == ir.OP_AND) and (vzero(i.a) or vzero(i.b)) {
+                return ir.czero(i.ty);
+            }
+        }
+        return vnil();
+    }
+    if (op == ir.OP_SHUFFLE) and (i.ty.kind == ir.T_VEC) {
+        // every lane from a vector of zeros
+        let n = @as(i32, @bit_cast(i32, i.a.ty.lanes));
+        let mut z = true;
+        for k in 0..i.mask.len {
+            let x = i.mask[k];
+            if ((x >= 0) and (x < n) and not vzero(i.a)) or ((x >= n) and not vzero(i.b)) {
+                z = false;
+            }
+        }
+        if z and (vzero(i.a) or vzero(i.b)) {
+            return ir.czero(i.ty);
+        }
         return vnil();
     }
     if op == ir.OP_ICMP {
-        if i.ty.kind == ir.T_INT {
+        if (i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_VEC) {
             return simplify_icmp(B, i);
         }
         return vnil();
@@ -912,6 +984,15 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         let id = pred_of(i);
         if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
             return simplify_mul_ov(B, i, id == ir.IN_SMUL_OV);
+        }
+        if (id == ir.IN_FMA) and (i.xs.len == 3) {
+            // fma(1, x, y) = x + y exactly (1 * x is x, then one rounding)
+            if fone(i.xs.get(0)) {
+                return ir.binop(B, ir.OP_FADD, i.xs.get(1), i.xs.get(2));
+            }
+            if fone(i.xs.get(1)) {
+                return ir.binop(B, ir.OP_FADD, i.xs.get(0), i.xs.get(2));
+            }
         }
         return vnil();
     }

@@ -280,6 +280,7 @@ fn new_label() i32 {
 fn place(l: i32) void {
     addr_regs.clear();
     ccache.clear();  // (reached by jumps: what the block built so far may not have been)
+    pcache.clear();
     let i = e0(xe.LABEL, 0);
     i.aux = @as(i64, l);
 }
@@ -1898,10 +1899,27 @@ fn is_f32(t: *ir.Ty) bool {
     return t.bits == 32;
 }
 
+// Operations whose operands may be swapped.
+fn commutes(o: i32) bool {
+    return (o == ir.OP_FADD) or (o == ir.OP_FMUL) or (o == ir.OP_ADD) or (o == ir.OP_AND) or (o == ir.OP_OR) or
+           (o == ir.OP_XOR) or (o == ir.OP_MUL);
+}
+
+// v's operands as a vector instruction reads them: the first a register,
+// the second its r/m operand (a load folded into it goes there).
+fn vsrc_of(v: *mut ir.Value, a: *mut i32) mc.MOp {
+    if commutes(v.op) and (v.ty.kind == ir.T_VEC) and is_inst(v.a, ir.OP_LOAD) and ((v.a.flag & 8) != 0) {
+        a.* = reg(v.b);
+        return vsrc(v.a);
+    }
+    a.* = reg(v.a);
+    return vsrc(v.b);
+}
+
 fn gen_fbin(v: *mut ir.Value) void {
     let d = vreg(v);
-    let a = reg(v.a);
-    let b = vsrc(v.b);
+    let mut a: i32 = 0;
+    let b = vsrc_of(v, &mut a);
     sse3(fop(v.op, is_f32(v.ty), v.ty.kind == ir.T_VEC), d, a, b);
 }
 
@@ -3215,12 +3233,12 @@ fn vec_binop(v: *mut ir.Value) void {
     let t = v.ty;
     let o = v.op;
     let d = vreg(v);
-    let a = reg(v.a);
     if (o == ir.OP_SHL) or (o == ir.OP_LSHR) or (o == ir.OP_ASHR) {
-        vec_shift(v, d, a);
+        vec_shift(v, d, reg(v.a));
         return;
     }
-    let b = vsrc(v.b);
+    let mut ra: i32 = 0;
+    let b = vsrc_of(v, &mut ra);
     let k = lk(t);
     let mut id: i32 = 0;
     if o == ir.OP_ADD {
@@ -3242,7 +3260,7 @@ fn vec_binop(v: *mut ir.Value) void {
         fail(u.f1("vector op %s", u.idec(o)));
         return;
     }
-    sse3(id, d, a, b);
+    sse3(id, d, ra, b);
 }
 
 fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
@@ -3314,6 +3332,30 @@ fn flip_signs(r: i32, t: *ir.Ty) i32 {
     return d;
 }
 
+// The bytes of a constant vector (or a splat of a constant), if v is one.
+fn const_vec_bytes(v: *mut ir.Value, out: *mut bn.Bytes) bool {
+    if is_inst(v, ir.OP_COPY) {
+        return const_vec_bytes(v.a, out);
+    }
+    if (v.kind == ir.V_ZERO) or (v.kind == ir.V_CAGG) {
+        const_le(v, out, 0);
+        return true;
+    }
+    if is_inst(v, ir.OP_SPLAT) and ((v.a.kind == ir.V_CINT) or (v.a.kind == ir.V_ZERO)) {
+        let mut one = bn.new_bytes();
+        const_le(v.a, &mut one, 0);
+        let lb = @truncate(usize, v.ty.elem.size);
+        for _k in 0..@as(usize, @bit_cast(u32, v.ty.lanes)) {
+            for j in 0..lb {
+                out.u8_(one.view()[j]);
+            }
+        }
+        one.free();
+        return true;
+    }
+    return false;
+}
+
 fn vnot(d: i32, r: i32) void {
     sse3(xe.PXOR, d, r, const16(0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff));
 }
@@ -3352,7 +3394,25 @@ fn vec_icmp(v: *mut ir.Value) void {
     let uns = (p == ir.IntULT) or (p == ir.IntULE) or (p == ir.IntUGT) or (p == ir.IntUGE);
     if uns {
         a = flip_signs(a, t);
-        b = flip_signs(b, t);
+        let mut cb = bn.new_bytes();
+        if const_vec_bytes(v.b, &mut cb) and (@as(u64, cb.len()) == t.size) {
+            // a constant flipped at compile time
+            let lb = @as(usize, @bit_cast(u32, lane_bits(t) / 8));
+            let mut fb = bn.new_bytes();
+            let n = @as(usize, vbytes_now());
+            for j in 0..n {
+                let mut x = cb.view()[j % cb.len()];
+                if (j % lb) == (lb - 1) {
+                    x = x ^ 0x80;
+                }
+                fb.u8_(x);
+            }
+            b = const_vreg(xe.MOVDQU_LD, const_bytes(&fb, n), 0, 0);
+            fb.free();
+        } else {
+            b = flip_signs(b, t);
+        }
+        cb.free();
     }
     if (p == ir.IntSGT) or (p == ir.IntUGT) {
         vcmp(gt, d, a, R(b), k);
@@ -3450,19 +3510,17 @@ fn gen_cpuid(v: *mut ir.Value) void {
 
 // Part k (16 bytes) of wide vector register a (of VL bytes), in an xmm
 // register (the register itself for part 0).
+// (The low part is the register itself: extract_lane's instructions take
+// xmm16-31 too, with EVEX. A part taken out is reused in the block.)
 fn part128(a: i32, k: i64) i32 {
-    if (k == 0) and ((VL < 64) or not zmm16()) {
+    if k == 0 {
         return a;
     }
-    if k == 0 {
-        // (a 512-bit register may be one of xmm16-31, which only EVEX
-        // encodes: a copy of the low part)
-        let wl = VL;
-        VL = 0;
-        let p = vxmm();
-        VL = wl;
-        copy(p, a, XMM);
-        return p;
+    for j in 0..pcache.len {
+        let c = pcache.get(j);
+        if (c.sym == a) and (c.disp == k) {
+            return c.r;
+        }
     }
     let wl = VL;
     VL = 0;
@@ -3470,8 +3528,11 @@ fn part128(a: i32, k: i64) i32 {
     VL = wl;
     let i = e4(xe.SSE, VL, R(a), W(p), NONE(), I(k));
     i.cc = xe.VEXTRACTI128;
+    pcache.push(CEnt.{ sym: a, disp: k, op: 0, sz: 0, r: p });
     return p;
 }
+
+let mut pcache: u.List.[CEnt] = u.List.[CEnt].{ data: @ptr_from_int(*mut CEnt, 0), len: 0, cap: 0 };
 
 fn gen_extract(v: *mut ir.Value) void {
     if VL > 0 {
@@ -3503,6 +3564,10 @@ fn extract_lane(v: *mut ir.Value, d: i32, a: i32, t: *ir.Ty, lane: i64) void {
     }
     if b == 16 {
         _ = sse_i(xe.PEXTRW, W(d), R(a), lane);
+        return;
+    }
+    if (lane == 0) and (b >= 32) {
+        _ = sse2(pki(b == 32, xe.MOVD_RX, xe.MOVQ_RX), R(a), W(d));
         return;
     }
     if has41() {
@@ -3548,8 +3613,14 @@ fn gen_insert(v: *mut ir.Value) void {
         let k = lane / per;
         let a = reg(v.a);
         let wl = VL;
-        let p = part128(a, k);
+        let mut p = part128(a, k);
         VL = 0;
+        if (k == 0) and (wl == 64) and zmm16() {
+            // (pinsr* is encoded with VEX, which cannot name xmm16-31: the low
+            // part copied out)
+            p = vxmm();
+            copy(p, a, XMM);
+        }
         let q = vxmm();
         insert_lane(q, p, reg(v.b), ir.t_vec(t.elem, @truncate(u32, @bit_cast(u64, per))), lane % per);
         VL = wl;
@@ -3593,6 +3664,10 @@ fn insert_lane(d: i32, a: i32, x: i32, t: *ir.Ty, lane: i64) void {
 fn gen_splat(v: *mut ir.Value) void {
     let t = v.ty;
     let d = vreg(v);
+    if folded_load(v.a) {
+        _ = sse2(xe.VPBROADCASTB + lk(t), W(d), addr(v.a.a));
+        return;
+    }
     let x = reg(v.a);
     let b = lane_bits(t);
     if VL > 0 {
@@ -3646,6 +3721,9 @@ fn gen_shuffle(v: *mut ir.Value) void {
         wide_shuffle(v);
         return;
     }
+    if shuffle_insn(v) {
+        return;
+    }
     let t = v.ty;
     let d = vreg(v);
     let a = reg(v.a);
@@ -3696,6 +3774,9 @@ fn gen_shuffle(v: *mut ir.Value) void {
 // other wide ones as permutes (perm_shuffle_ok).
 fn wide_shuffle(v: *mut ir.Value) void {
     if not vs.plumbing(v) {
+        if shuffle_insn(v) {
+            return;
+        }
         perm_shuffle(v);
         return;
     }
@@ -3731,6 +3812,311 @@ fn wide_shuffle(v: *mut ir.Value) void {
     i.cc = id;
 }
 
+// -----------------------------------------------------------------------------
+// Constant shuffles that are one instruction: zero extensions (vpmovzx*),
+// interleaves within 128-bit groups (punpck*), 128-bit groups (vshufi64x2)
+// and permutes of 32-bit lanes within each group (pshufd). Lane indices
+// below n are a's, the rest b's; negative ones are any lane.
+// -----------------------------------------------------------------------------
+
+// The mask on lanes twice as wide, when lanes go in aligned pairs.
+fn widen_mask(m: []i32) []mut i32 {
+    let h = m.len / 2;
+    let r = u.newn.[i32](h + 1);
+    for i in 0..h {
+        let mut x = m[2 * i];
+        let mut y = m[(2 * i) + 1];
+        if (x < 0) and (y < 0) {
+            r[i] = -1;
+            continue;
+        }
+        if x < 0 {
+            x = y - 1;
+        }
+        if y < 0 {
+            y = x + 1;
+        }
+        if ((x & 1) != 0) or (y != (x + 1)) {
+            return r[0..0];
+        }
+        r[i] = x / 2;
+    }
+    return r[0..h];
+}
+
+// The mask on lanes half as wide.
+fn narrow_mask(m: []i32) []mut i32 {
+    let r = u.newn.[i32]((2 * m.len) + 1);
+    for i in 0..m.len {
+        if m[i] < 0 {
+            r[2 * i] = -1;
+            r[(2 * i) + 1] = -1;
+        } else {
+            r[2 * i] = 2 * m[i];
+            r[(2 * i) + 1] = (2 * m[i]) + 1;
+        }
+    }
+    return r[0..(2 * m.len)];
+}
+
+// Does lane index x (of n per source) name lane e (an index of the same
+// form)? Either source when they are the same value.
+fn lane_is(x: i32, e: i32, n: i32, same: bool) bool {
+    if x < 0 {
+        return true;
+    }
+    if same {
+        return (x % n) == (e % n);
+    }
+    return x == e;
+}
+
+// punpckl* (hi false) / punpckh* of x and y (0: a, 1: b) on lanes of
+// 128 / (lanes per group) bits.
+fn unpack_match(m: []i32, hi: bool, x: i32, y: i32, same: bool) bool {
+    let n = @int_cast(i32, m.len);
+    let g = @int_cast(i32, (16 * m.len) / @as(usize, VLbytes()));  // lanes per 128-bit group
+    let mut off: i32 = 0;
+    if hi {
+        off = g / 2;
+    }
+    for i in @as(i32, 0)..n {
+        let base = (i / g) * g;
+        let j = i % g;
+        let mut e = (base + off) + (j / 2);
+        if (j & 1) == 0 {
+            e += x * n;
+        } else {
+            e += y * n;
+        }
+        if not lane_is(m[@int_cast(usize, i)], e, n, same) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn VLbytes() u8 {
+    if VL == 0 {
+        return 16;
+    }
+    return VL;
+}
+
+// The pshufd immediate when every 128-bit group permutes its own four
+// 32-bit lanes the same way (one source: src), else -1.
+fn pshufd_imm(m: []i32, n: i32, same: bool, src: i32) i64 {
+    let mut p: [4]i32 = [-1; 4];
+    for i in 0..m.len {
+        let x = m[i];
+        if x < 0 {
+            continue;
+        }
+        let ii = @int_cast(i32, i);
+        let base = (ii / 4) * 4;
+        let mut l = x;
+        if same {
+            l = x % n;
+        } else if (x / n) != src {
+            return -1;
+        } else {
+            l = x % n;
+        }
+        if (l < base) or (l >= (base + 4)) {
+            return -1;
+        }
+        let k = @int_cast(usize, ii % 4);
+        if (p[k] >= 0) and (p[k] != (l - base)) {
+            return -1;
+        }
+        p[k] = l - base;
+    }
+    let mut imm: i64 = 0;
+    for k in @as(usize, 0)..4 {
+        let mut q = p[k];
+        if q < 0 {
+            q = @int_cast(i32, k);
+        }
+        imm = imm | (@as(i64, q) << @int_cast(u32, 2 * k));
+    }
+    return imm;
+}
+
+// vshufi64x2 (512 bits): the four 128-bit groups, the low two from x, the
+// high two from y; its immediate, or -1.
+fn groups_imm(m: []i32, x: i32, y: i32, same: bool) i64 {
+    let n = @int_cast(i32, m.len);
+    let g = n / 4;
+    let mut imm: i64 = 0;
+    for q in @as(i32, 0)..4 {
+        let mut src = x;
+        if q >= 2 {
+            src = y;
+        }
+        let mut sel: i32 = -1;
+        for j in @as(i32, 0)..g {
+            let l = m[@int_cast(usize, (q * g) + j)];
+            if l < 0 {
+                continue;
+            }
+            let mut k = l;
+            if same {
+                k = l % n;
+            } else if (l / n) != src {
+                return -1;
+            } else {
+                k = l % n;
+            }
+            if ((k % g) != j) or ((sel >= 0) and (sel != (k / g))) {
+                return -1;
+            }
+            sel = k / g;
+        }
+        if sel < 0 {
+            sel = 0;
+        }
+        imm = imm | (@as(i64, sel) << @int_cast(u32, 2 * q));
+    }
+    return imm;
+}
+
+// Is v one instruction (shuffle_insn)? (For vsplit, which then keeps it.)
+fn shuffle_insn_ok(v: *mut ir.Value) bool {
+    let outer = VL;
+    VL = vl_of(v.ty);
+    let ok = shuffle_match(v, false);
+    VL = outer;
+    return ok;
+}
+
+fn shuffle_insn(v: *mut ir.Value) bool {
+    return shuffle_match(v, true);
+}
+
+fn shuffle_match(v: *mut ir.Value, gen: bool) bool {
+    let t = v.ty;
+    let at = v.a.ty;
+    if (t.kind != ir.T_VEC) or (t.lanes != at.lanes) or (lane_bits(t) != lane_bits(at)) or (t.size != at.size) or
+       not tg.has(tg.X_AVX) {
+        return false;
+    }
+    let n = @int_cast(i32, t.lanes);
+    let bits = lane_bits(t);
+    let m = v.mask[0..v.mask.len];
+    let same = ir.resolve(v.a) == ir.resolve(v.b);
+    let srcs: [2]*mut ir.Value = [v.a, v.b];
+    // zero extension of the low half's lanes: x's lanes, then zero lanes
+    if (bits <= 32) and ((VL < 64) or (bits > 8) or tg.has(tg.X_AVX512BW)) and ((VL == 0) or tg.has(tg.X_AVX2)) {
+        for zi in @as(i32, 0)..2 {
+            if not is_vzero(srcs[@int_cast(usize, zi)]) or same {
+                continue;
+            }
+            let x = 1 - zi;
+            let mut ok = true;
+            for i in @as(i32, 0)..n {
+                let l = m[@int_cast(usize, i)];
+                if l < 0 {
+                    continue;
+                }
+                if (i & 1) == 0 {
+                    ok = ok and (l == ((x * n) + (i / 2)));
+                } else {
+                    ok = ok and ((l / n) == zi);
+                }
+            }
+            if ok and not gen {
+                return true;
+            }
+            if ok {
+                let d = vreg(v);
+                let a = reg(srcs[@int_cast(usize, x)]);
+                let mut id = xe.VPMOVZXBW;
+                if bits == 16 {
+                    id = xe.VPMOVZXWD;
+                } else if bits == 32 {
+                    id = xe.VPMOVZXDQ;
+                }
+                _ = sse2(id, W(d), R(a));
+                return true;
+            }
+        }
+    }
+    // interleaves, on lanes as wide as they go in pairs
+    let mut w = m;
+    let mut wb = bits;
+    while (wb <= 64) and (w.len >= 2) {
+        let ids: [4]i32 = [xe.PUNPCKLBW, xe.PUNPCKLWD, xe.PUNPCKLDQ, xe.PUNPCKLQDQ];
+        let hids: [4]i32 = [xe.PUNPCKHBW, xe.PUNPCKHWD, xe.PUNPCKHDQ, xe.PUNPCKHQDQ];
+        let k = pki(wb == 8, 0, pki(wb == 16, 1, pki(wb == 32, 2, 3)));
+        for hi in @as(i32, 0)..2 {
+            for x in @as(i32, 0)..2 {
+                if unpack_match(w, hi == 1, x, 1 - x, same) {
+                    if not gen {
+                        return true;
+                    }
+                    let d = vreg(v);
+                    let ra = reg(srcs[@int_cast(usize, x)]);
+                    let rb = reg(srcs[@int_cast(usize, 1 - x)]);
+                    sse3(pki(hi == 1, hids[@int_cast(usize, k)], ids[@int_cast(usize, k)]), d, ra, R(rb));
+                    return true;
+                }
+            }
+        }
+        if wb == 64 {
+            break;
+        }
+        w = widen_mask(w);
+        wb = wb * 2;
+    }
+    // 32-bit lanes permuted within each group (one source)
+    let mut m32 = m;
+    if bits == 64 {
+        m32 = narrow_mask(m);
+    } else if bits == 16 {
+        m32 = widen_mask(m);
+    } else if bits == 8 {
+        m32 = widen_mask(m);
+        if m32.len > 0 {
+            m32 = widen_mask(m32);
+        }
+    }
+    if m32.len > 0 {
+        let n32 = @int_cast(i32, m32.len);
+        for src in @as(i32, 0)..2 {
+            let imm = pshufd_imm(m32, n32, same, src);
+            if (imm >= 0) and not gen {
+                return true;
+            }
+            if imm >= 0 {
+                let d = vreg(v);
+                let a = reg(srcs[@int_cast(usize, src)]);
+                _ = sse_i(xe.PSHUFD, W(d), R(a), imm);
+                return true;
+            }
+        }
+    }
+    // 128-bit groups
+    if (VL == 64) and tg.has(tg.X_AVX512F) {
+        for x in @as(i32, 0)..2 {
+            for y in @as(i32, 0)..2 {
+                let imm = groups_imm(m, x, y, same);
+                if (imm >= 0) and not gen {
+                    return true;
+                }
+                if imm >= 0 {
+                    let d = vreg(v);
+                    let ra = reg(srcs[@int_cast(usize, x)]);
+                    let rb = reg(srcs[@int_cast(usize, y)]);
+                    let i = e4(xe.SSE, VL, W(d), R(rb), R(ra), I(imm));
+                    i.cc = xe.VSHUFI64X2;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 fn le8(b: []u8) u64 {
     let mut x: u64 = 0;
     for i in @as(usize, 0)..8 {
@@ -3742,7 +4128,7 @@ fn le8(b: []u8) u64 {
 fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let a0 = v.xs.get(0);
     let at = a0.ty;
-    if (id == ir.IN_BITMASK) and (VL == 64) and ((a0.flag & 32) != 0) {
+    if (id == ir.IN_BITMASK) and ((a0.flag & 32) != 0) {
         // the compare into the mask register
         cmp_to_k1(a0);
         let r = vgpr();
@@ -4176,7 +4562,8 @@ fn perm_shuffle_ok(v: *mut ir.Value) bool {
     if (t.lanes != at.lanes) or (lane_bits(t) != lane_bits(at)) {
         return false;
     }
-    return perm_ok(lane_bits(t), t.lanes, not one_source(v)) or perm_ok(lane_bits(t), t.lanes, true);
+    return perm_ok(lane_bits(t), t.lanes, not one_source(v)) or perm_ok(lane_bits(t), t.lanes, true) or
+           shuffle_insn_ok(v);
 }
 
 // Does the shuffle read one operand only?
@@ -4222,8 +4609,7 @@ fn perm_shuffle(v: *mut ir.Value) void {
             bs.u8_(@truncate(u8, x >> @int_cast(u32, k * 8)));
         }
     }
-    let idx = vxmm();
-    _ = sse2(xe.MOVDQU_LD, W(idx), const_bytes(&bs, @as(usize, VL)));
+    let idx = const_vreg(xe.MOVDQU_LD, const_bytes(&bs, @as(usize, VL)), 0, 0);
     bs.free();
     if not two {
         let mut src = reg(v.a);
@@ -4260,10 +4646,69 @@ fn perm_shuffle(v: *mut ir.Value) void {
 
 // k1 <- vector compare c (AVX-512), lane by lane.
 fn cmp_to_k1(c: *mut ir.Value) void {
+    cmp_to_k(c, false);
+}
+
+// k1 <- c, or its negation (inv, which an and of masks has not: kinv_ok).
+// An and of compares is the first into k1, then each other masked by k1.
+fn cmp_to_k(c: *mut ir.Value, inv: bool) void {
+    cmp_into_k(c, inv, false);
+}
+
+fn kinv_ok(c: *ir.Value) bool {
+    return not is_inst(c, ir.OP_AND);
+}
+
+// A vector of zeros (a constant or a splat of one).
+fn is_vzero(v: *ir.Value) bool {
+    if is_inst(v, ir.OP_COPY) {
+        return is_vzero(v.a);
+    }
+    return ir.is_zero(v) or (is_inst(v, ir.OP_SPLAT) and ir.is_zero(v.a));
+}
+
+// A compare of lanes against zero for (in)equality: vptestm / vptestnm.
+fn ptest_cmp(c: *ir.Value) bool {
+    if not is_inst(c, ir.OP_ICMP) or not is_vzero(c.b) {
+        return false;
+    }
+    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    return (p == ir.IntNE) or (p == ir.IntEQ) or (p == ir.IntUGT) or (p == ir.IntULE);
+}
+
+// k1 <- compare c lane by lane, or its negation (inv); and k1 already
+// (masked). EVEX at every width (aux 32: the narrower compares have a VEX
+// form too, which writes a vector).
+fn cmp_into_k(c: *mut ir.Value, inv: bool, masked: bool) void {
+    let mut kz: i64 = 32;
+    if masked {
+        kz = 32 | 1;
+    }
+    if is_inst(c, ir.OP_AND) {
+        cmp_into_k(c.a, false, masked);
+        cmp_into_k(c.b, false, true);
+        return;
+    }
     let t = c.a.ty;
     let p = @truncate(i32, @bit_cast(i64, c.cv));
-    let mut a = reg(c.a);
-    let mut b = reg(c.b);
+    if ptest_cmp(c) {
+        // (x & y) != 0 lane by lane, or x != 0
+        let ne = ((p == ir.IntNE) or (p == ir.IntUGT)) != inv;
+        let mut x = c.a;
+        let mut y = c.a;
+        if is_inst(c.a, ir.OP_AND) and ((c.a.flag & 16) != 0) {
+            x = c.a.a;
+            y = c.a.b;
+        }
+        let rx = reg(x);
+        let ry = reg(y);
+        let i = e4(xe.SSE, VL, W(xe.K1), R(ry), R(rx), NONE());
+        i.cc = pki(ne, xe.VPTESTMB, xe.VPTESTNMB) + lk(t);
+        i.aux = kz;
+        return;
+    }
+    let mut xa = c.a;
+    let mut xb = c.b;
     let mut imm: i64 = 0;
     let mut op: i32 = 0;
     if c.op == ir.OP_FCMP {
@@ -4276,9 +4721,8 @@ fn cmp_to_k1(c: *mut ir.Value) void {
             imm = 2;
         }
         if (p == ir.RealOGT) or (p == ir.RealOGE) {
-            let x = a;
-            a = b;
-            b = x;
+            xa = c.b;
+            xb = c.a;
         }
     } else {
         // vpcmp[u]: 0 eq, 1 lt, 2 le, 4 ne, 5 nlt, 6 nle
@@ -4299,8 +4743,132 @@ fn cmp_to_k1(c: *mut ir.Value) void {
             imm = 6;
         }
     }
+    if constish(xa) and not constish(xb) {
+        // the constant as the r/m operand (memory when read once): b cmp' a
+        let x = xa;
+        xa = xb;
+        xb = x;
+        if c.op == ir.OP_FCMP {
+            if imm == 1 {
+                imm = 0x0e;  // gt
+            } else if imm == 2 {
+                imm = 0x0d;  // ge
+            }
+        } else if (imm == 1) or (imm == 6) {
+            imm = 7 - imm;  // lt / nle
+        } else if (imm == 2) or (imm == 5) {
+            imm = 7 - imm;  // le / nlt
+        }
+    }
+    if inv {
+        imm = imm ^ 4;  // (each predicate's negation: eq / ne, lt / nlt, le / nle, unordered too)
+    }
+    let a = reg(xa);
+    let b = reg(xb);
     let i = e4(xe.SSE, VL, W(xe.K1), R(b), R(a), I(imm));  // a cmp b
     i.cc = op;
+    i.aux = kz;
+}
+
+// A constant operand (a register that is rematerialized).
+fn constish(v: *ir.Value) bool {
+    if is_inst(v, ir.OP_COPY) or is_inst(v, ir.OP_BITCAST) {
+        return constish(v.a);
+    }
+    return (v.kind == ir.V_CAGG) or (v.kind == ir.V_ZERO) or remat(v);
+}
+
+// A compare selects and ands can read as a mask register (AVX-512 at its
+// width).
+fn kcmp(c: *ir.Value) bool {
+    if is_inst(c, ir.OP_AND) and (c.ty.kind == ir.T_VEC) {
+        return kcmp(c.a) and kcmp(c.b) and (c.a.ty.lanes == c.b.ty.lanes);
+    }
+    return (is_inst(c, ir.OP_ICMP) or is_inst(c, ir.OP_FCMP)) and (c.ty.kind == ir.T_VEC) and
+           avx512_for(@as(u64, c.a.ty.size));
+}
+
+fn strip_bitcast(v: *mut ir.Value) *mut ir.Value {
+    if is_inst(v, ir.OP_BITCAST) and (v.a.ty.kind == ir.T_VEC) and (v.a.ty.size == v.ty.size) {
+        return v.a;
+    }
+    return v;
+}
+
+// The operation a masked instruction can compute itself (x, through a
+// bitcast, only used there): its result is merged into another value, or
+// zeroed, where the mask is clear.
+fn maskable_op(x: *mut ir.Value, lanes: i32) *mut ir.Value {
+    let o = strip_bitcast(x);
+    if (o.kind != ir.V_INST) or (o.ty.kind != ir.T_VEC) or (o.uses != 1) or (o.ty.lanes != lanes) or
+       ((o.flag & ~@as(i32, 256)) != 0) {
+        return vnil();
+    }
+    if (o != x) and ((x.uses != 1) or ((x.flag & ~@as(i32, 256)) != 0)) {
+        return vnil();
+    }
+    let k = o.op;
+    if ((k >= ir.OP_FADD) and (k <= ir.OP_FDIV)) or (k == ir.OP_ADD) or (k == ir.OP_SUB) {
+        return o;
+    }
+    if ((k == ir.OP_AND) or (k == ir.OP_OR) or (k == ir.OP_XOR)) and (lane_bits(o.ty) == 32) {
+        return o;
+    }
+    return vnil();
+}
+
+// The operation computing x when a masked instruction does (flag 256).
+fn fused_op(x: *mut ir.Value) *mut ir.Value {
+    let o = strip_bitcast(x);
+    if (o.flag & 256) != 0 {
+        return o;
+    }
+    return vnil();
+}
+
+// o (maskable_op) into d where k1 has its bit, d's own lanes (merge) or
+// zeros elsewhere.
+fn masked_op(o: *mut ir.Value, d: i32, zero: bool, src: *mut ir.Value) void {
+    // (an operand that is the value merged into, d's lanes already: d)
+    let mut a = d;
+    if o.a != src {
+        a = reg(o.a);
+    }
+    let mut b = R(d);
+    if o.b != src {
+        b = R(reg(o.b));
+    }
+    let k = o.op;
+    let mut id: i32 = 0;
+    if (k >= ir.OP_FADD) and (k <= ir.OP_FDIV) {
+        id = fop(k, is_f32(o.ty), true);
+    } else if k == ir.OP_ADD {
+        id = xe.PADDB + lk(o.ty);
+    } else if k == ir.OP_SUB {
+        id = xe.PSUBB + lk(o.ty);
+    } else if k == ir.OP_AND {
+        id = xe.PAND;
+    } else if k == ir.OP_OR {
+        id = xe.POR;
+    } else {
+        id = xe.PXOR;
+    }
+    let mut dop = RW(d);
+    let mut kz: i64 = 1;
+    if zero {
+        dop = W(d);
+        kz = 1 | 8;
+    }
+    let i = e4(xe.SSE, VL, dop, b, R(a), NONE());
+    i.cc = id;
+    i.aux = kz;
+}
+
+// d <- x where k1 has its bit, else zero.
+fn masked_move(d: i32, x: i32, t: *ir.Ty) void {
+    let i = e4(xe.SSE, VL, W(d), R(x), NONE(), NONE());
+    i.cc = masked_mov(lane_bits(t), false);
+    i.aux = 1 | 8;
 }
 
 // @select as codegen.ax makes it: (x & m) | (y & ~m), for a lane mask m.
@@ -4314,6 +4882,9 @@ struct Sel {
 }
 
 fn all_ones(v: *ir.Value) bool {
+    if is_inst(v, ir.OP_COPY) {
+        return all_ones(v.a);  // (a constant hoisted out of a loop)
+    }
     if v.kind == ir.V_CAGG {
         for k in 0..v.xs.len {
             let c = v.xs.get(k);
@@ -4360,10 +4931,68 @@ fn sel_parts(o: *mut ir.Value) Sel {
     return r;
 }
 
-// A select (sel_parts) as one vpternlogd: m ? x : y bit by bit (0xca).
+// A select (sel_parts): m ? x : y. A compare's mask in k1 picks lanes
+// (vpblendm*), or makes the instruction computing x (or y) merge into the
+// other, or zero the rest; a select between a float compare's operands is
+// a minimum or maximum. Other masks: one vpternlogd, bit by bit (0xca).
 fn gen_blend(v: *mut ir.Value) void {
     let s = sel_parts(v);
     let d = vreg(v);
+    let m = s.m;
+    if is_inst(m, ir.OP_FCMP) {
+        // m ? x : y for m = a < b (or a > b) and {x, y} = {a, b}: minps and maxps
+        // return their second operand unless the first is less (greater),
+        // NaN and signed zeros included
+        let p = @truncate(i32, @bit_cast(i64, m.cv));
+        let x = strip_bitcast(s.x);
+        let y = strip_bitcast(s.y);
+        if ((p == ir.RealOLT) or (p == ir.RealOGT)) and (((x == m.a) and (y == m.b)) or ((x == m.b) and (y == m.a))) {
+            let min = (p == ir.RealOLT) == (x == m.a);
+            let single = lane_bits(m.a.ty) == 32;
+            let mut id = pki(single, xe.MAXPS, xe.MAXPD);
+            if min {
+                id = pki(single, xe.MINPS, xe.MINPD);
+            }
+            let rx = reg(x);
+            sse3(id, d, rx, R(reg(y)));
+            return;
+        }
+    }
+    if kcmp(m) {
+        let ox = fused_op(s.x);
+        let oy = fused_op(s.y);
+        if u.notnil(ox) {
+            copy(d, reg(s.y), class_of(v.ty));
+            cmp_to_k(m, false);
+            masked_op(ox, d, false, strip_bitcast(s.y));
+            return;
+        }
+        if u.notnil(oy) and kinv_ok(m) {
+            copy(d, reg(s.x), class_of(v.ty));
+            cmp_to_k(m, true);
+            masked_op(oy, d, false, strip_bitcast(s.x));
+            return;
+        }
+        if is_vzero(s.y) {
+            let rx = reg(s.x);
+            cmp_to_k(m, false);
+            masked_move(d, rx, v.ty);
+            return;
+        }
+        if is_vzero(s.x) and kinv_ok(m) {
+            let ry = reg(s.y);
+            cmp_to_k(m, true);
+            masked_move(d, ry, v.ty);
+            return;
+        }
+        let rx = reg(s.x);
+        let ry = reg(s.y);
+        cmp_to_k(m, false);
+        let i = e4(xe.SSE, VL, W(d), R(rx), R(ry), NONE());
+        i.cc = xe.VPBLENDMB + lk(v.ty);
+        i.aux = 1;
+        return;
+    }
     let x = reg(s.x);
     let y = reg(s.y);
     copy(d, reg(s.m), class_of(v.ty));
@@ -4371,11 +5000,44 @@ fn gen_blend(v: *mut ir.Value) void {
     i.cc = xe.VPTERNLOGD;
 }
 
-// Marks the selects and compares that the instructions using them do:
-// the and, and and xor of a blend (flag 16, when they have no other use),
-// and a compare into a mask register for @bitmask (flag 32).
+// An and of a compare and x (flag 128): x where the compare holds, else
+// zero (a zero-masked move, or the instruction computing x zero-masked).
+fn gen_kand(v: *mut ir.Value) void {
+    let d = vreg(v);
+    let mut c = v.a;
+    let mut x = v.b;
+    if not kcmp(c) {
+        c = v.b;
+        x = v.a;
+    }
+    let o = fused_op(x);
+    if u.notnil(o) {
+        cmp_to_k(c, false);
+        masked_op(o, d, true, vnil());
+        return;
+    }
+    let rx = reg(x);
+    cmp_to_k(c, false);
+    masked_move(d, rx, v.ty);
+}
+
+// Marks the vector instructions others do. A select's and, and and xor
+// (flag 16, when they have no other use) are its own; an and of a compare
+// is a masked one (flag 128); the instruction computing a select's or an
+// and's value, when the masked instruction computes it instead (flag 256);
+// a compare read only as a mask register (flag 32: each reader compares
+// again, into k1); and an and only tested against zero (flag 16, vptestm).
 fn mark_fused_vectors(f: *mut ir.Func) void {
     let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux2 = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
@@ -4385,16 +5047,85 @@ fn mark_fused_vectors(f: *mut ir.Func) void {
                 if (s.p.uses == 1) and (s.q.uses == 1) {
                     s.p.flag = s.p.flag | 16;
                     s.q.flag = s.q.flag | 16;
+                    if kcmp(s.m) {
+                        s.m.aux2 += 1;  // (p reads it)
+                    }
                     if s.n.uses == 1 {
                         s.n.flag = s.n.flag | 16;
+                        if kcmp(s.m) {
+                            s.m.aux2 += 1;
+                        }
                     }
                 }
             }
-            if (i.op == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, i.cv)) == ir.IN_BITMASK) and (inst_vl(i) == 64) {
-                let c = i.xs.get(0);
-                if (is_inst(c, ir.OP_ICMP) or is_inst(c, ir.OP_FCMP)) and (c.uses == 1) {
-                    c.flag = c.flag | 32;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if is_inst(i, ir.OP_AND) and (i.ty.kind == ir.T_VEC) and ((i.flag & 16) == 0) and (kcmp(i.a) != kcmp(i.b)) {
+                i.flag = i.flag | 128;
+                if kcmp(i.a) {
+                    i.a.aux2 += 1;
+                } else {
+                    i.b.aux2 += 1;
                 }
+            }
+            if (i.op == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, i.cv)) == ir.IN_BITMASK) and kcmp(i.xs.get(0)) {
+                i.xs.get(0).aux2 += 1;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // values the masked instructions compute; compares only in k1
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.flag & 64) != 0 {
+                let s = sel_parts(i);
+                if kcmp(s.m) and ((s.p.flag & 16) != 0) {
+                    fuse_masked(s.x, i);
+                    if u.isnil(fused_op(s.x)) and kinv_ok(s.m) {
+                        fuse_masked(s.y, i);
+                    }
+                }
+            } else if (i.flag & 128) != 0 {
+                fuse_masked(pick_val(kcmp(i.a), i.b, i.a), i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // (last to first: an and of masks read only as a mask leaves its
+    // compares read only as masks)
+    b = f.last;
+    while u.notnil(b) {
+        let mut i = b.last;
+        while u.notnil(i) {
+            if kcmp(i) and (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
+                i.flag = i.flag | 32;
+                if is_inst(i, ir.OP_AND) {
+                    i.a.aux2 += 1;
+                    i.b.aux2 += 1;
+                }
+            }
+            i = i.prev;
+        }
+        b = b.prev;
+    }
+    // ands only tested against zero
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ptest_cmp(i) and ((inst_vl(i) == 64) or ((i.flag & 32) != 0)) and is_inst(i.a, ir.OP_AND) and
+               (i.a.uses == 1) and (i.a.flag == 0) and (i.a.blk == b) and kcmp(i) {
+                i.a.flag = i.a.flag | 16;
             }
             i = i.next;
         }
@@ -4406,14 +5137,39 @@ fn mark_fused_vectors(f: *mut ir.Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             if AVX and (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
-               not remat(i) and u.notnil(i.user) and (i.user.blk == b) and ((i.user.flag & (16 | 32 | 64)) == 0) and
-               reads_as_rm(i.user, i) and quiet_between(i, i.user) {
+               not remat(i) and u.notnil(i.user) and (i.user.blk == b) and
+               ((i.user.flag & (((16 | 32) | 64) | (128 | 256))) == 0) and reads_as_rm(i.user, i) and
+               quiet_between(i, i.user) {
+                i.flag = i.flag | 8;
+            }
+            // a scalar load only splatted: a broadcast from memory
+            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and
+               ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
+               u.notnil(i.user) and is_inst(i.user, ir.OP_SPLAT) and (i.user.blk == b) and tg.has(tg.X_AVX2) and
+               quiet_between(i, i.user) {
                 i.flag = i.flag | 8;
             }
             i = i.next;
         }
         b = b.next;
     }
+}
+
+fn pick_val(c: bool, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// x (maskable_op), read by masked instruction us in its block: computed by us.
+fn fuse_masked(x: *mut ir.Value, us: *mut ir.Value) void {
+    let o = maskable_op(x, us.ty.lanes);
+    if u.isnil(o) or (o.blk != us.blk) {
+        return;
+    }
+    o.flag = o.flag | 256;
+    x.flag = x.flag | 256;
 }
 
 // Does vector instruction us read x (only) as its r/m operand, through vsrc?
@@ -4424,6 +5180,9 @@ fn reads_as_rm(us: *ir.Value, x: *mut ir.Value) bool {
     }
     if ((o >= ir.OP_FADD) and (o <= ir.OP_FDIV)) or (o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_AND) or
        (o == ir.OP_OR) or (o == ir.OP_XOR) or (o == ir.OP_MUL) {
+        if commutes(o) and (us.a == x) and (us.b != x) and not is_inst(us.b, ir.OP_LOAD) {
+            return true;  // (the operands swapped: vsrc_of; one memory operand)
+        }
         return (us.b == x) and (us.a != x);
     }
     if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, us.cv)) == ir.IN_FMA) {
@@ -4495,7 +5254,7 @@ fn gen_perm(v: *mut ir.Value, id: i32) void {
     i.aux = kz;
 }
 
-fn masked_move(bits: i32, store: bool) i32 {
+fn masked_mov(bits: i32, store: bool) i32 {
     let mut k: i32 = 2;
     if bits == 8 {
         k = 0;
@@ -4520,7 +5279,7 @@ fn gen_partial(v: *mut ir.Value, id: i32) void {
         let k = e4(xe.SSE, 8, W(xe.K1), R(m), NONE(), NONE());
         k.cc = xe.KMOVQ_KR;
         let i = e4(xe.SSE, VL, W(d), p, NONE(), NONE());
-        i.cc = masked_move(lane_bits(v.ty), false);
+        i.cc = masked_mov(lane_bits(v.ty), false);
         i.aux = 9;
         return;
     }
@@ -4530,7 +5289,7 @@ fn gen_partial(v: *mut ir.Value, id: i32) void {
     let k = e4(xe.SSE, 8, W(xe.K1), R(m), NONE(), NONE());
     k.cc = xe.KMOVQ_KR;
     let i = e4(xe.SSE, VL, R(x), p, NONE(), NONE());
-    i.cc = masked_move(lane_bits(v.xs.get(0).ty), true);
+    i.cc = masked_mov(lane_bits(v.xs.get(0).ty), true);
     i.aux = 1;
 }
 
@@ -4641,18 +5400,23 @@ fn gen_inst_at(v: *mut ir.Value) void {
         gen_remat(v);
         return;
     }
-    if (v.flag & (16 | 32)) != 0 {
-        return;  // (part of its user: a blend, or a compare into a mask register)
+    if (v.flag & ((16 | 32) | 256)) != 0 {
+        return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
     if (v.flag & 64) != 0 {
         gen_blend(v);
         return;
     }
+    if (v.flag & 128) != 0 {
+        gen_kand(v);
+        return;
+    }
     if ((o == ir.OP_COPY) or (o == ir.OP_BITCAST)) and (class_of(t) != GPR) and (class_of(t) == class_of(v.a.ty)) {
         let sr = reg(v.a);
         let def = mc.remat_def(MF, sr);
-        if u.notnil(def) and (v.loc < 0) {
-            v.loc = sr;  // a copy of a constant: the constant's register
+        if (u.notnil(def) or ((o == ir.OP_BITCAST) and (t.kind == ir.T_VEC))) and (v.loc < 0) {
+            // a copy of a constant, or a vector as other lanes: the same register
+            v.loc = sr;
             return;
         }
         if u.notnil(def) {
@@ -5596,6 +6360,7 @@ fn compile_func(f: *mut ir.Func) void {
         addr_regs.clear();
         addr_block = CB;
         ccache.clear();
+        pcache.clear();
         let mut i = ib.first;
         while u.notnil(i) {
             if i.src != 0 {
@@ -6069,10 +6834,11 @@ fn enc_sse(i: *mut mc.MInst) void {
     }
     if o1.kind == mc.K_REG {
         let m = xe.Mem.{ base: -1, index: -1, scale: 0, disp: 0, sym: -1, tpoff: false };
-        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 15);
+        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl,
+               (@bit_cast(u64, i.aux) & 15) | (@bit_cast(u64, i.aux) & 32));
     } else {
         let mut m = to_mem(o1);
-        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 31);
+        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 63);
     }
     _ = d;
 }

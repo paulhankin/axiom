@@ -95,14 +95,22 @@ choice never changes what a program computes:
   encoding of all SSE instructions) and FMA are used when enabled. With AVX2, 256-bit
   vectors live in ymm registers (VEX.L); with AVX-512 F and BW, 512-bit vectors live in
   zmm registers (EVEX, with the compressed displacements; with VL, zmm16-31 first),
-  compares go through a mask register (`k1`, expanded with `vpmovm2*`, or read by
-  `@bitmask` directly), and `@bitmask`, `@any_true` and `@all_true` through
-  `vpmov*2m`/`kmovq`. Where the extensions have them, `@swizzle`/`@swizzle2` are one
-  `vpermd`/`vperm*`/`vpermt2*` (out-of-range lanes zeroed through a mask), constant
-  shuffles a permute, vector `@int_from_float`/`@float_from_int` `cvt*` instructions,
+  compares go through a mask register (`k1`): a select of a compare picks lanes
+  with `vpblendm*` or merges the operation computing one side into the other
+  (`vsubps zmm{k1}`), an and of a compare zeroes lanes (`{k1}{z}`), ands of
+  compares are masked compares, tests against zero are `vptestm*`, and
+  `@bitmask` reads `k1`; the compare is expanded into lanes (`vpmovm2*`) only
+  where a vector of it is needed. `@bitmask`, `@any_true` and `@all_true` of
+  other vectors go through `vpmov*2m`/`kmovq`. Constants stay in registers,
+  splats of 32- and 64-bit ones broadcast from 4 or 8 bytes (an EVEX `{1toN}`
+  operand where they are read once), and the register allocator builds them
+  again where it would otherwise spill them (`mc.set_remat`). Where the extensions
+  have them, `@swizzle`/`@swizzle2` are one `vpermd`/`vperm*`/`vpermt2*` (out-of-range
+  lanes zeroed through a mask), constant shuffles one instruction (`vpmovzx*` for a
+  widening with zeros, `punpck*`, `pshufd`, `vshufi64x2`) or else a permute, vector `@int_from_float`/`@float_from_int` `cvt*` instructions,
   `@load_partial`/`@store_partial` masked moves, per-lane shift counts `vpsllv*`/`vpsrlv*`/
-  `vpsrav*`, vector `@clz`/`@popcount` `vplzcnt`/`vpopcnt`, and `@select` one
-  `vpternlogd`: `codegen.ax` makes intrinsics (`ir.IN_PERM` ...) or vector casts for the
+  `vpsrav*`, vector `@clz`/`@popcount` `vplzcnt`/`vpopcnt`, and `@select` of
+  other masks one `vpternlogd`: `codegen.ax` makes intrinsics (`ir.IN_PERM` ...) or vector casts for the
   builtins where `x64.ax` says it selects them (`perm_ok` and the like), and lowers them
   generically elsewhere. Operations without a single instruction at that width are split
   into halves first (`vsplit.ax`), so the choice never changes a result.

@@ -1,0 +1,139 @@
+// Selects and ands of compares, tests against zero, constant shuffles,
+// broadcasts and reductions on 128-, 256- and 512-bit vectors (the forms the
+// x86-64 backends give AVX-512 masks, shuffle instructions and broadcasts).
+import "../lib/io.ax" as io;
+
+let mut F: [64]f32 = [0.0; 64];
+let mut U: [64]u32 = [0; 64];
+let mut B: [64]u8 = [0; 64];
+
+fn fill() void {
+    for i in @as(usize, 0)..64 {
+        let k = @as(i32, @int_cast(i32, i));
+        F[i] = (@float_from_int(f32, k - 30) * 0.75) + 0.125;
+        U[i] = @bit_cast(u32, (k * 37) ^ 0x55) & 127;
+        B[i] = @truncate(u8, (i * 7) % 5);
+    }
+    F[5] = -0.0;
+    F[6] = 0.0;
+    F[9] = @bit_cast(f32, @as(u32, 0x7fc00000));  // NaN
+}
+
+fn fsum(v: f32x16) f64 {
+    let mut a: [16]f32 = [0.0; 16];
+    @store(a[0..], v);
+    let mut s: f64 = 0.0;
+    for i in @as(usize, 0)..16 {
+        let x = @as(f64, a[i]);
+        if x == x {
+            s = (s * 3.0) + x;
+        } else {
+            s = (s * 3.0) + 1000.0;
+        }
+    }
+    return s;
+}
+
+fn usum(v: u32x16) u64 {
+    let mut a: [16]u32 = [0; 16];
+    @store(a[0..], v);
+    let mut s: u64 = 0;
+    for i in @as(usize, 0)..16 {
+        s = (s *% 31) +% @as(u64, a[i]);
+    }
+    return s;
+}
+
+fn sel16(x: f32x16, y: f32x16) f32x16 {
+    let one: f32x16 = @splat(1.0);
+    let ten: f32x16 = @splat(10.0);
+    let a = @abs(x);
+    let m = @select(@lanes_lt(a, ten), a, ten);  // a minimum
+    let n = @select(@lanes_gt(y, x), y, x);      // a maximum
+    let c = one / (m + one);
+    let r = @select(@lanes_lt(x, @as(f32x16, @splat(0.0))), one - c, c);  // merged
+    let s = @select(@lanes_ge(x, ten), @as(f32x16, @splat(0.5)), r);
+    let t = @select(@lanes_le(x, y), s, x * y);  // the other side computed
+    return (t + n) + @select(@lanes_eq(x, y), x, @as(f32x16, @splat(0.0)));
+}
+
+fn mask16(i: u32x16, x: u32x16, y: u32x16) u32x16 {
+    let none: u32x16 = @splat(0);
+    let m32 = @lanes_ne(i & @as(u32x16, @splat(32)), none);
+    let m64 = @lanes_eq(i & @as(u32x16, @splat(64)), none);
+    let both = @lanes_gt(i, @as(u32x16, @splat(20))) & @lanes_lt(i, @as(u32x16, @splat(90)));
+    let a = @select(m64, @select(m32, x, y), @select(m32, y +% x, x));
+    let b = @bit_cast(u32x16, both) & (x -% y);
+    let c = @bit_cast(u32x16, @lanes_gt(i, none)) & i;
+    return (a ^ b) +% c;
+}
+
+fn bytes16(p: []u8) u32 {
+    let z: u8x16 = @splat(0);
+    let v = @load(u8x16, p[0..16]);
+    let w = @load(u8x16, p[16..32]);
+    return @bitmask(@lanes_gt(v, z)) | (@bitmask(@lanes_ge(w, @as(u8x16, @splat(3)))) << 16);
+}
+
+fn narrow(i: u32x4, x: u32x4) u32x4 {
+    let lo = @lanes_lt(i, @as(u32x4, @splat(64)));
+    return @select(lo, x, i) +% (@bit_cast(u32x4, @lanes_gt(x, @as(u32x4, @splat(100)))) & @as(u32x4, @splat(7)));
+}
+
+fn shuffles(v0: u32x16, v1: u32x16) u32x16 {
+    let p = @shuffle(v0, v1, [0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13, 29]) +% @shuffle(
+        v0, v1, [2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15, 31]);
+    let q = @shuffle(p, v0, [0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29]) +% @shuffle(
+        v1, p, [18, 19, 2, 3, 22, 23, 6, 7, 26, 27, 10, 11, 30, 31, 14, 15]);
+    let r = @shuffle(q, v1, [0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27]);
+    let s = @shuffle(q, q, [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12]);
+    return r ^ (s *% @as(u32x16, @splat(3)));
+}
+
+fn widen(p: []u8) u64 {
+    let z: u8x64 = @splat(0);
+    let bytes = @load(u8x64, p[0..64]);
+    let n = @bit_cast(u16x32, @shuffle(bytes, z, [0, 64, 1, 64, 2, 64, 3, 64, 4, 64, 5, 64, 6, 64, 7, 64, 8, 64, 9, 64,
+                                                  10, 64, 11, 64, 12, 64, 13, 64, 14, 64, 15, 64, 16, 64, 17, 64, 18,
+                                                  64, 19, 64, 20, 64, 21, 64, 22, 64, 23, 64, 24, 64, 25, 64, 26, 64,
+                                                  27, 64, 28, 64, 29, 64, 30, 64, 31, 64]));
+    let mut ns: [32]u16 = [0; 32];
+    @store(ns[0..], n);
+    let h = @load(u16x16, ns[0..16]);
+    let w = @bit_cast(u32x8, @shuffle(h, @as(u16x16, @splat(0)), [0, 16, 1, 16, 2, 16, 3, 16, 4, 16, 5, 16, 6, 16, 7,
+                                                                  16]));
+    return @as(u64, @reduce_add(n *% n)) +% @as(u64, @reduce_add(w));
+}
+
+fn bcast(p: []f32, k: usize, h: f32x16) f32x16 {
+    let one: f32x16 = @splat(1.0);
+    let w = @load(f32x16, p[16..32]);
+    let a = @fma(one, w, h);
+    return @fma(@as(f32x16, @splat(p[k])), w, a);
+}
+
+export fn run() void {
+    fill();
+    let x = @load(f32x16, F[0..16]);
+    let y = @load(f32x16, F[16..32]);
+    io.float(fsum(sel16(x, y)));  // expect: -194500670.62954378
+    io.float(fsum(sel16(y, x)));  // expect: 4520898079.686485
+    let i = @load(u32x16, U[0..16]);
+    let a = @load(u32x16, U[16..32]);
+    let b = @load(u32x16, U[32..48]);
+    io.uint(usum(mask16(i, a, b)));      // expect: 12936279401047918516
+    io.uint(usum(mask16(b, i, a)));      // expect: 18338551545290240015
+    io.uint(@as(u64, bytes16(B[0..])));  // expect: 692747230
+    let n = narrow(@load(u32x4, U[0..4]), @load(u32x4, U[4..8])) +% narrow(
+        @load(u32x4, U[8..12]), @load(u32x4, U[12..16]));
+    io.uint(@as(u64, @reduce_add(n)));     // expect: 641
+    io.uint(usum(shuffles(i, a)));         // expect: 12655506181156691424
+    io.uint(widen(B[0..]));                // expect: 200
+    io.float(fsum(bcast(F[0..], 40, x)));  // expect: -2327688973.234375
+    io.float(@as(f64, @reduce_add(@load(f32x16, F[32..48]))));  // expect: 116
+    io.float(@as(f64, @reduce_add(@load(f32x4, F[40..44]))));   // expect: 35
+    io.int(@as(i64, @reduce_add(@load(i8x16, @slice_from_ptr(@ptr_cast(*i8, &B[0]), 16)))));  // expect: 30
+    io.uint(
+        @as(u64, @extract_lane(i, 0)) +% (@as(u64, @extract_lane(i, 5)) << 8) +% (
+            @as(u64, @extract_lane(i, 13)) << 16));  // expect: 3435605
+}
