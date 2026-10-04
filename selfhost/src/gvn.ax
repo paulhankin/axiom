@@ -2964,6 +2964,102 @@ fn iv_start(bld: *mut ir.Builder, v0: *mut ir.Value, h: *mut ir.Block, tag: i64,
     return ir.binop(bld, ir.OP_SHL, a, b);
 }
 
+// Is base + off0 a constant (d) from base1 + off1? Both as a root pointer
+// plus a linear combination of values plus a constant (lin_add): the same
+// root and the same combination.
+fn start_diff(base: *mut ir.Value, off0: *mut ir.Value, base1: *mut ir.Value, off1: *mut ir.Value, d: *mut i64) bool {
+    let mut x = Lin.{ terms: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 },
+                      coefs: u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 }, k: 0, ok: true };
+    let mut y = Lin.{ terms: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 },
+                      coefs: u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 }, k: 0, ok: true };
+    let r = lin_ptr(base, &mut x);
+    let r1 = lin_ptr(base1, &mut y);
+    lin_add(off0, 1, &mut x, 0);
+    lin_add(off1, 1, &mut y, 0);
+    let mut same = x.ok and y.ok and (r == r1);
+    if same {
+        // the same coefficient for each term (y's terms negated into x's)
+        for k in 0..y.terms.len {
+            lin_term(&mut x, y.terms.get(k), 0 -% y.coefs.get(k));
+        }
+        for k in 0..x.coefs.len {
+            if x.coefs.get(k) != 0 {
+                same = false;
+            }
+        }
+    }
+    d.* = x.k -% y.k;
+    u.free(@ptr_cast(*mut void, x.terms.data));
+    u.free(@ptr_cast(*mut void, x.coefs.data));
+    u.free(@ptr_cast(*mut void, y.terms.data));
+    u.free(@ptr_cast(*mut void, y.coefs.data));
+    return same;
+}
+
+// A linear combination: the sum of terms[i] * coefs[i], plus k.
+struct Lin {
+    terms: u.List.[*mut ir.Value],
+    coefs: u.List.[i64],
+    k: i64,
+    ok: bool,
+}
+
+fn lin_term(l: *mut Lin, v: *mut ir.Value, c: i64) void {
+    for i in 0..l.terms.len {
+        if l.terms.get(i) == v {
+            l.coefs.set(i, l.coefs.get(i) +% c);
+            return;
+        }
+    }
+    l.terms.push(v);
+    l.coefs.push(c);
+}
+
+// Adds integer v * s to l.
+fn lin_add(v0: *mut ir.Value, s: i64, l: *mut Lin, depth: i32) void {
+    let v = ir.resolve(v0);
+    if cb.is_k(v) {
+        l.k = l.k +% (ir.sval(v) *% s);
+        return;
+    }
+    if depth > 8 {
+        l.ok = false;
+        return;
+    }
+    if is_inst(v, ir.OP_ADD) {
+        lin_add(v.a, s, l, depth + 1);
+        lin_add(v.b, s, l, depth + 1);
+        return;
+    }
+    if is_inst(v, ir.OP_SUB) {
+        lin_add(v.a, s, l, depth + 1);
+        lin_add(v.b, 0 -% s, l, depth + 1);
+        return;
+    }
+    if is_inst(v, ir.OP_MUL) and cb.is_k(ir.resolve(v.b)) {
+        lin_add(v.a, s *% ir.sval(ir.resolve(v.b)), l, depth + 1);
+        return;
+    }
+    if is_inst(v, ir.OP_SHL) and cb.is_k(ir.resolve(v.b)) and (ir.sval(ir.resolve(v.b)) >= 0) and
+       (ir.sval(ir.resolve(v.b)) < 63) {
+        lin_add(v.a, s *% (@as(i64, 1) << @truncate(u32, @bit_cast(u64, ir.sval(ir.resolve(v.b))))), l, depth + 1);
+        return;
+    }
+    lin_term(l, v, s);
+}
+
+// The root of pointer p through ptradds, their offsets added to l.
+fn lin_ptr(p0: *mut ir.Value, l: *mut Lin) *mut ir.Value {
+    let mut p = ir.resolve(p0);
+    let mut n: i32 = 0;
+    while is_inst(p, ir.OP_PTRADD) and (n < 8) {
+        lin_add(p.b, 1, l, 0);
+        p = ir.resolve(p.a);
+        n += 1;
+    }
+    return p;
+}
+
 fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], no_modes: bool) bool {
     // one latch
     let mut latch = ir.bnil();
@@ -3006,17 +3102,25 @@ fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
                     ir.at_before(bld, ir.terminator(pre));
                     let base = ir.resolve(p.a);
                     let off0 = iv_start(bld, p.b, h, tag, pre);
-                    // a pointer already made for this base and step, a constant away?
+                    // a pointer already made for this step that starts a
+                    // constant away?
                     let mut q = vnil();
                     let mut d: i64 = 0;
                     for k in 0..ivps.len {
                         let e = ivps.at(k);
-                        if (e.base == base) and (e.step == st) {
-                            if e.off0 == off0 {
+                        if u.isnil(q) and (e.step == st) {
+                            if (e.base == base) and (e.off0 == off0) {
                                 q = e.q;
-                            } else if cb.is_k(e.off0) and cb.is_k(off0) {
+                            } else if (e.base == base) and cb.is_k(e.off0) and cb.is_k(off0) {
                                 q = e.q;
                                 d = @bit_cast(i64, ir.cint_val(off0)) -% @bit_cast(i64, ir.cint_val(e.off0));
+                            } else if not no_modes {
+                                // (wasm's offsets cannot be negative)
+                                let mut dd: i64 = 0;
+                                if start_diff(base, off0, e.base, e.off0, &mut dd) {
+                                    q = e.q;
+                                    d = dd;
+                                }
                             }
                         }
                     }
