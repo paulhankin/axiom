@@ -625,8 +625,11 @@ Type *builtin_check(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         Expr *idx = *earg(e, 2);
-        if (idx->kind != E_ARRAY_LIT || idx->args.len != t->lanes) {
-            diag_error(idx->span, "E0820", "@shuffle needs an array literal of %d constant lane indices", t->lanes);
+        // the indices' count sets the result's lanes: a vector of 128, 256 or 512 bits
+        int nb = idx->kind == E_ARRAY_LIT ? idx->args.len * t->elem->bits : 0;
+        if (nb != 128 && nb != 256 && nb != 512) {
+            diag_error(idx->span, "E0820", "@shuffle needs an array literal of %d, %d or %d constant lane indices",
+                       128 / t->elem->bits, 256 / t->elem->bits, 512 / t->elem->bits);
             check_expr(idx, NULL);
             return e->type = t;
         }
@@ -637,8 +640,8 @@ Type *builtin_check(Expr *e, Type *expected) {
                 diag_error((*pi)->span, "E0820", "shuffle index must be a constant in 0..%d", 2 * t->lanes - 1);
             if (ty_is_untyped((*pi)->type)) coerce(pi, t_u32);
         }
-        idx->type = type_array(t_u32, t->lanes);
-        return e->type = t;
+        idx->type = type_array(t_u32, idx->args.len);
+        return e->type = idx->args.len == t->lanes ? t : type_vec(t->elem, idx->args.len);
     }
     case BI_SWIZZLE:
     case BI_SWIZZLE2: {

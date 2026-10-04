@@ -1557,7 +1557,11 @@ Appendix A has full signatures.
   of its lane type, the others zero, and `@store_partial(s, v)` writes those lanes: neither
   touches memory past `s`, so a loop over vectors needs no scalar loop for its tail. x86
   does them with masked moves.
-- Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices. `@swizzle(a, idx)`
+- Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices into the lanes of `a`
+  then `b`; their count sets the result's lanes (any count making a 128-, 256- or 512-bit
+  vector), so `@shuffle(a, zero, [0, …, 7, 8, …, 8])` widens an `f32x8` to an `f32x16`
+  with zeros and `@shuffle(a, a, [8, …, 15])` takes the high half of an `f32x16`.
+  `@swizzle(a, idx)`
   takes runtime indices: `a` is a vector of any lanes and `idx` an integer vector with as
   many lanes of the same width, taken as unsigned; lane i of the result is `a[idx[i]]`, or
   0 when `idx[i]` is not a lane of `a`. `@swizzle2(a, b, idx)` is the same over the `2n`
@@ -2658,7 +2662,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@replace_lane(v, const i, x)` | `Vec → Vec` |
 | `@load(V, s)` / `@store(s, v)` | Slice-checked load/store of the vector's size (§13.2) |
 | `@load_partial(V, s)` / `@store_partial(s, v)` | The first `min(s.len, lanes)` lanes, from or to a slice of the lane type; the rest of a load is zero (§13.2) |
-| `@shuffle(a, b, const [i0, …])` | Two-input byte-granular or lane-granular shuffle. Indices must be in range (`E0820`) |
+| `@shuffle(a, b, const [i0, …])` | Two-input lane shuffle; the result has as many lanes as indices (128, 256 or 512 bits). Indices must be in range (`E0820`) |
 | `@swizzle(a, idx)` | Runtime indices (an integer vector of the same shape, unsigned) into the whole vector, of any lanes. Out-of-range indices give 0 (WASM semantics) |
 | `@swizzle2(a, b, idx)` | `@swizzle` over the lanes of `a` then `b` |
 | `@lanes_eq/ne/lt/le/gt/ge(a, b)` | Produce a mask vector |

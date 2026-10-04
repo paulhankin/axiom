@@ -5,6 +5,8 @@
 // type-checked body by substituting the type arguments.
 #include "codegen.h"
 
+#include <math.h>
+
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/Support.h>
@@ -67,6 +69,7 @@ typedef struct FnState {
     int nsub;
     LLVMValueRef fn;
     LLVMValueRef *locals;
+    Expr **inits;  // the initializers of immutable locals (lane masks: is_mask)
     int nlocals;
     LLVMValueRef sret_ptr;
     Type *ret;  // concrete
@@ -1244,11 +1247,34 @@ static void mul_wide_overflow(bool is_signed, LLVMValueRef l, LLVMValueRef r, LL
 }
 
 // 64-bit multiply: no 128-bit multiply needed (freestanding wasm has no
-// compiler-rt); overflow is detected by dividing back.
+// compiler-rt); overflow is detected by dividing back, or with a constant
+// operand by comparing the other with the quotients of the limits.
 static void mul64_overflow(bool is_signed, LLVMValueRef l, LLVMValueRef r, LLVMValueRef *val, LLVMValueRef *ovf) {
     LLVMTypeRef t = LLVMTypeOf(l);
     LLVMValueRef zero = LLVMConstNull(t), one = LLVMConstInt(t, 1, false);
     LLVMValueRef prod = LLVMBuildMul(B, l, r, "");
+    if (LLVMIsAConstantInt(l) || LLVMIsAConstantInt(r)) {
+        LLVMValueRef kc = LLVMIsAConstantInt(r) ? r : l, x = kc == r ? l : r;
+        unsigned bits = LLVMGetIntTypeWidth(t);
+        *val = prod;
+        if (!is_signed) {
+            unsigned __int128 k = (unsigned long long)LLVMConstIntGetZExtValue(kc);
+            unsigned __int128 mx = ((unsigned __int128)1 << bits) - 1;
+            *ovf = k == 0 ? LLVMConstInt(T_i1, 0, false) : LLVMBuildICmp(B, LLVMIntUGT, x, cint(t, (i128)(mx / k)), "");
+            return;
+        }
+        i128 k = (i128)LLVMConstIntGetSExtValue(kc);
+        i128 mx = ((i128)1 << (bits - 1)) - 1, mn = -mx - 1;
+        if (k == 0) *ovf = LLVMConstInt(T_i1, 0, false);
+        else if (k == -1) *ovf = LLVMBuildICmp(B, LLVMIntEQ, x, cint(t, mn), "");
+        else if (k > 0)  // (division truncates: floor(mx / k), ceil(mn / k))
+            *ovf = LLVMBuildOr(B, LLVMBuildICmp(B, LLVMIntSGT, x, cint(t, mx / k), ""),
+                               LLVMBuildICmp(B, LLVMIntSLT, x, cint(t, mn / k), ""), "");
+        else
+            *ovf = LLVMBuildOr(B, LLVMBuildICmp(B, LLVMIntSLT, x, cint(t, mx / k), ""),
+                               LLVMBuildICmp(B, LLVMIntSGT, x, cint(t, mn / k), ""), "");
+        return;
+    }
     LLVMValueRef lz = LLVMBuildICmp(B, LLVMIntEQ, l, zero, "");
     if (!is_signed) {
         LLVMValueRef div = LLVMBuildSelect(B, lz, one, l, "");
@@ -1851,6 +1877,58 @@ static LLVMValueRef swizzle16(LLVMValueRef x, LLVMValueRef idx) {
     return r;
 }
 
+// @int_from_float on vectors (spec §13.2: truncate, saturate, NaN to 0)
+// from operations x86 lowers to vector instructions (vcvttps2dq/udq, vmaxps,
+// compares and blends); LLVM 18 splits the vector fptosi.sat/fptoui.sat into
+// one scalar conversion per lane there (issue 0030). wasm keeps the
+// intrinsics, which are its trunc_sat instructions.
+static LLVMValueRef vec_int_from_float(Type *rt, Type *ft, LLVMValueRef v) {
+    unsigned n = (unsigned)rt->lanes, bits = (unsigned)rt->elem->bits;
+    LLVMTypeRef fv = LLVMTypeOf(v), fl = LLVMGetElementType(fv), iv = lty(rt), il = LLVMGetElementType(iv);
+    bool f32 = ft->elem->bits == 32;
+    // the largest float below 2^e, and 2^e
+    double two = ldexp(1.0, rt->elem->is_signed ? (int)bits - 1 : (int)bits);
+    double below = f32 ? (double)nextafterf((float)two, 0.0f) : nextafter(two, 0.0);
+    LLVMValueRef cb[64], ct2[64], cmn[64], cz[64];
+    for (unsigned i = 0; i < n; i++) {
+        cb[i] = LLVMConstReal(fl, below);
+        ct2[i] = LLVMConstReal(fl, two);
+        cmn[i] = LLVMConstReal(fl, -two);
+        cz[i] = LLVMConstReal(fl, 0.0);
+    }
+    LLVMValueRef vb = LLVMConstVector(cb, n), vt = LLVMConstVector(ct2, n), vz = LLVMConstVector(cz, n);
+    for (unsigned i = 0; i < n; i++) cz[i] = int_max(il, rt->elem->is_signed);
+    LLVMValueRef top = LLVMConstVector(cz, n);
+    LLVMValueRef big = LLVMBuildFCmp(B, LLVMRealOGE, v, vt, "");
+    if (!rt->elem->is_signed) {
+        // ordered compares: NaN and negatives give 0
+        LLVMValueRef c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGT, v, vz, ""), v, vz, "");
+        c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOLT, c, vb, ""), c, vb, "");
+        return LLVMBuildSelect(B, big, top, LLVMBuildFPToUI(B, c, iv, ""), "");
+    }
+    LLVMValueRef vm = LLVMConstVector(cmn, n);
+    LLVMValueRef c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGT, v, vm, ""), v, vm, "");
+    c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOLT, c, vb, ""), c, vb, "");
+    LLVMValueRef r = LLVMBuildSelect(B, big, top, LLVMBuildFPToSI(B, c, iv, ""), "");
+    return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealUNO, v, v, ""), LLVMConstNull(iv), r, "");
+}
+
+// Whether every lane of a mask expression is all ones or all zeros: a lane
+// comparison, &, |, ^ or ~ of such masks, or an immutable local set to one.
+static bool is_mask(Expr *e, int depth) {
+    if (depth > 16) return false;
+    switch (e->kind) {
+    case E_BUILTIN: return e->index >= BI_LANES_EQ && e->index <= BI_LANES_GE;
+    case E_BINARY:
+        return (e->op == TK_AMP || e->op == TK_PIPE || e->op == TK_CARET) && is_mask(e->a, depth + 1) &&
+               is_mask(e->b, depth + 1);
+    case E_UNARY: return e->op == TK_TILDE && is_mask(e->a, depth + 1);
+    case E_IDENT:
+        return e->local && !e->local->mut && F->inits[e->local->index] && is_mask(F->inits[e->local->index], depth + 1);
+    default: return false;
+    }
+}
+
 // Bytes 16k..16k+15 of a byte vector.
 static LLVMValueRef piece16(LLVMValueRef v, unsigned k) {
     LLVMValueRef m[16];
@@ -2171,6 +2249,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
     }
     case BI_INT_FROM_FLOAT: {
         LLVMValueRef v = gen(a[1].e);
+        if (rt->kind == TY_VEC && !g_target.wasm) return vec_int_from_float(rt, ct(a[1].e->type), v);
         LLVMTypeRef tys[2] = {lty(rt), LLVMTypeOf(v)};
         return intrinsic(rt->is_signed ? "llvm.fptosi.sat" : "llvm.fptoui.sat", tys, 2, &v, 1);
     }
@@ -2463,6 +2542,11 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_SELECT: {
         LLVMValueRef m = gen(a[0].e), x = gen(a[1].e), y = gen(a[2].e);
         LLVMTypeRef mt = LLVMTypeOf(m);
+        // a mask of lane comparisons: a select on its i1 lanes is the same bit
+        // for bit, and becomes a blend (issue 0031)
+        Type *mty = ct(a[0].e->type);
+        if (rt->kind == TY_VEC && mty->kind == TY_VEC && mty->lanes == rt->lanes && is_mask(a[0].e, 0))
+            return LLVMBuildSelect(B, LLVMBuildICmp(B, LLVMIntSLT, m, LLVMConstNull(mt), ""), x, y, "");
         LLVMValueRef xm = LLVMBuildBitCast(B, x, mt, ""), ym = LLVMBuildBitCast(B, y, mt, "");
         LLVMValueRef r = LLVMBuildOr(B, LLVMBuildAnd(B, xm, m, ""), LLVMBuildAnd(B, ym, LLVMBuildNot(B, m, ""), ""), "");
         return LLVMBuildBitCast(B, r, lty(rt), "");
@@ -3370,6 +3454,7 @@ static void gen_stmt_inner(Stmt *s) {
         LLVMValueRef v = gen(s->e);
         if (terminated() || !v) return;
         store(ct(s->local->type), v, local_ptr(s->local), false);
+        if (!s->local->mut) F->inits[s->local->index] = s->e;
         return;
     }
     case S_EXPR: gen(s->e); return;
@@ -3696,6 +3781,7 @@ static void gen_fn_body_of(FnInst *fi) {
     st.fn = fi->fn;
     st.nlocals = d->locals.len;
     st.locals = NEWN(LLVMValueRef, st.nlocals + 1);
+    st.inits = NEWN(Expr *, st.nlocals + 1);
     FnState *saved = F;
     F = &st;
     st.ret = fi->fnty->ret;
