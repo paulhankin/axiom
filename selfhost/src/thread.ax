@@ -14,6 +14,7 @@
 // predecessor was B), uses under B's other successor are unaffected (when B
 // is its only predecessor); any other use, and the edge stays.
 // =============================================================================
+import "combine.ax" as cb;
 import "ir.ax" as ir;
 import "opt.ax" as opt;
 import "util.ax" as u;
@@ -109,6 +110,184 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
         return ir.cast(ir.new_builder(), op, x, v.ty);
     }
     return vnil();
+}
+
+// -----------------------------------------------------------------------------
+// Correlated comparisons: B tests x against a constant, and the branches on
+// the way into B from P (P's own, and those above it through blocks with one
+// predecessor) tested x against constants too. When what they found decides
+// B's test, the edge is threaded: after `if x == 1 { ... }`, the following
+// `if x == 2`, `if x >= 3` are known false.
+// -----------------------------------------------------------------------------
+
+let mut cmp_bld: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+
+// (comparisons of constants fold: it never emits)
+fn cmp_builder() *mut ir.Builder {
+    if u.isnil(cmp_bld) {
+        cmp_bld = ir.new_builder();
+    }
+    return cmp_bld;
+}
+
+fn kbool(b: bool) *mut ir.Value {
+    if b {
+        return ir.cint(ir.t_int(1), 1);
+    }
+    return ir.cint(ir.t_int(1), 0);
+}
+
+// x as a key in the order of the domain: unsigned, or signed (biased).
+fn key(x: u64, signed: bool, bits: i32) u64 {
+    if signed {
+        return (x ^ (@as(u64, 1) << @int_cast(u32, bits - 1))) & ir.mask_bits(bits);
+    }
+    return x;
+}
+
+fn is_signed(p: i32) bool {
+    return (p >= ir.IntSGT) and (p <= ir.IntSLE);
+}
+
+// The keys x with `x p k` (a relational predicate): [lo, hi]; false if none.
+fn interval(p: i32, k: u64, bits: i32, lo: *mut u64, hi: *mut u64) bool {
+    let kk = key(k, is_signed(p), bits);
+    let max = ir.mask_bits(bits);
+    if (p == ir.IntULT) or (p == ir.IntSLT) {
+        if kk == 0 {
+            return false;
+        }
+        lo.* = 0;
+        hi.* = kk - 1;
+    } else if (p == ir.IntULE) or (p == ir.IntSLE) {
+        lo.* = 0;
+        hi.* = kk;
+    } else if (p == ir.IntUGT) or (p == ir.IntSGT) {
+        if kk == max {
+            return false;
+        }
+        lo.* = kk + 1;
+        hi.* = max;
+    } else {
+        lo.* = kk;
+        hi.* = max;
+    }
+    return true;
+}
+
+// The value of `x p1 k1` given that `x p0 k0` is v0, or nil.
+fn decide(p0_: i32, k0: u64, v0: bool, p1: i32, k1: u64, t: *mut ir.Ty) *mut ir.Value {
+    let bits = t.bits;
+    let mut p0 = p0_;
+    if not v0 {
+        p0 = cb.inv_pred(p0);
+    }
+    if p0 == ir.IntEQ {
+        return ir.icmp(cmp_builder(), p1, ir.cint(t, k0), ir.cint(t, k1));
+    }
+    let eq1 = (p1 == ir.IntEQ) or (p1 == ir.IntNE);
+    if p0 == ir.IntNE {
+        if eq1 and (k0 == k1) {
+            return kbool(p1 == ir.IntNE);
+        }
+        return vnil();
+    }
+    let sg = is_signed(p0);
+    let mut lo0: u64 = 0;
+    let mut hi0: u64 = 0;
+    if not interval(p0, k0, bits, &mut lo0, &mut hi0) {
+        return vnil();  // (the edge is never taken)
+    }
+    if eq1 {
+        let kk = key(k1, sg, bits);
+        if (kk < lo0) or (kk > hi0) {
+            return kbool(p1 == ir.IntNE);
+        }
+        return vnil();
+    }
+    if is_signed(p1) != sg {
+        return vnil();
+    }
+    let mut lo1: u64 = 0;
+    let mut hi1: u64 = 0;
+    if not interval(p1, k1, bits, &mut lo1, &mut hi1) {
+        return ir.cint(ir.t_int(1), 0);
+    }
+    if (lo1 <= lo0) and (hi0 <= hi1) {
+        return ir.cint(ir.t_int(1), 1);
+    }
+    if (hi0 < lo1) or (hi1 < lo0) {
+        return ir.cint(ir.t_int(1), 0);
+    }
+    return vnil();
+}
+
+// c as x p k with k a constant (false if it is not that).
+fn split_cmp(c0: *mut ir.Value, x: *mut *mut ir.Value, p: *mut i32, k: *mut u64) bool {
+    let c = ir.resolve(c0);
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) {
+        return false;
+    }
+    let a = ir.resolve(c.a);
+    let b = ir.resolve(c.b);
+    if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
+        return false;
+    }
+    if is_k(b) and not is_k(a) {
+        x.* = a;
+        p.* = cb.pred_of(c);
+        k.* = ir.cint_val(b);
+        return true;
+    }
+    if is_k(a) and not is_k(b) {
+        x.* = b;
+        p.* = cb.swap_pred(cb.pred_of(c));
+        k.* = ir.cint_val(a);
+        return true;
+    }
+    return false;
+}
+
+// The constant B's condition c is when B is entered from P, from the
+// branches on the way there, or nil.
+fn implied(c: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
+    let mut x = vnil();
+    let mut p1: i32 = 0;
+    let mut k1: u64 = 0;
+    if not split_cmp(c, &mut x, &mut p1, &mut k1) {
+        return vnil();
+    }
+    let mut to = b;
+    let mut from = p;
+    for _depth in @as(i32, 0)..4 {
+        let t = ir.terminator(from);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and ((t.t1 == to) or (t.t2 == to)) {
+            let mut x0 = vnil();
+            let mut p0: i32 = 0;
+            let mut k0: u64 = 0;
+            if split_cmp(t.a, &mut x0, &mut p0, &mut k0) and (x0 == x) {
+                let r = decide(p0, k0, t.t1 == to, p1, k1, x.ty);
+                if u.notnil(r) {
+                    return r;
+                }
+            }
+        }
+        if (from.preds.len != 1) or (from.rpo < 0) {
+            break;
+        }
+        to = from;
+        from = from.preds.get(0);
+    }
+    return vnil();
+}
+
+// eval, or else implied.
+fn known_on_edge(c: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
+    let r = eval(c, b, p, 0);
+    if u.notnil(r) {
+        return r;
+    }
+    return implied(c, b, p);
 }
 
 // -----------------------------------------------------------------------------
@@ -370,7 +549,7 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             if (p == b) or (p.rpo < 0) {
                 continue;
             }
-            let c = eval(t.a, b, p, 0);
+            let c = known_on_edge(t.a, b, p);
             if u.isnil(c) {
                 continue;
             }
@@ -421,7 +600,7 @@ fn candidates(f: *mut ir.Func) bool {
                 if p == b {
                     continue;
                 }
-                let c = eval(t.a, b, p, 0);
+                let c = known_on_edge(t.a, b, p);
                 if u.isnil(c) {
                     continue;
                 }
@@ -481,8 +660,50 @@ fn speculatable(i: *ir.Value) bool {
     return false;
 }
 
+// A load that may run on the other path too, with its address replaced
+// there by the start of the same constant global (so `x ^= TABLE[i]` under
+// an unpredictable condition becomes a select): of a scalar, from a constant
+// global at least that large, through additions to its address. Returns the
+// global, or nil.
+fn spec_load_base(i: *mut ir.Value) *mut ir.Value {
+    if (i.op != ir.OP_LOAD) or (i.flags != 0) {
+        return vnil();
+    }
+    let k = i.ty.kind;
+    if (k != ir.T_INT) and (k != ir.T_FLOAT) and (k != ir.T_PTR) {
+        return vnil();
+    }
+    let mut p = ir.resolve(i.a);
+    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        p = ir.resolve(p.a);
+    }
+    if (p.kind != ir.V_GLOBAL) or not p.gv.is_const or p.gv.tls or (p.gv.ty.size < i.ty.size) {
+        return vnil();
+    }
+    return p;
+}
+
+// Marks (aux2 = addr_gen + 1) the instructions of block a computing only
+// the address of its load; returns how many.
+fn mark_arm_addr(v: *mut ir.Value, a: *mut ir.Block, depth: i32) i32 {
+    if (v.kind != ir.V_INST) or (v.blk != a) or (depth > 6) or (v.aux2 == (addr_gen + 1)) {
+        return 0;
+    }
+    let op = v.op;
+    if (op == ir.OP_PTRADD) or (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_MUL) or (op == ir.OP_SHL) {
+        v.aux2 = addr_gen + 1;
+        return 1 + mark_arm_addr(ir.resolve(v.a), a, depth + 1) + mark_arm_addr(ir.resolve(v.b), a, depth + 1);
+    }
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) {
+        v.aux2 = addr_gen + 1;
+        return 1 + mark_arm_addr(ir.resolve(v.a), a, depth + 1);
+    }
+    return 0;
+}
+
 // Does arm block a (a single-predecessor block going to m) hold only a few
-// speculatable instructions? -1: no; else how many.
+// speculatable instructions (and at most one load spec_load_base allows,
+// whose address arithmetic counts for nothing)? -1: no; else how many.
 fn arm_cost(a: *mut ir.Block, d: *mut ir.Block, m: *mut ir.Block) i32 {
     if (a.preds.len != 1) or (a.preds.get(0) != d) {
         return -1;
@@ -492,17 +713,58 @@ fn arm_cost(a: *mut ir.Block, d: *mut ir.Block, m: *mut ir.Block) i32 {
         return -1;
     }
     let mut n: i32 = 0;
+    let mut load = vnil();
     let mut i = a.first;
     while u.notnil(i) and (i != t) {
-        if (i.op == ir.OP_PHI) or not speculatable(i) {
+        if (i.op == ir.OP_LOAD) and u.isnil(load) and u.notnil(spec_load_base(i)) {
+            load = i;
+        } else if (i.op == ir.OP_PHI) or not speculatable(i) {
             return -1;
         }
-        if i.op != ir.OP_PTRADD {
+        i = i.next;
+    }
+    let mut addr_ops: i32 = 0;
+    if u.notnil(load) {
+        addr_ops = mark_arm_addr(ir.resolve(load.a), a, 0);
+        n += 2;  // the load and the select of its address
+    }
+    i = a.first;
+    while u.notnil(i) and (i != t) {
+        let in_addr = u.notnil(load) and (i.aux2 == (addr_gen + 1));
+        if (i.op != ir.OP_PTRADD) and (i != load) and not in_addr {
             n += 1;  // addresses mostly fold into addressing modes
         }
         i = i.next;
     }
+    if addr_ops > 6 {
+        return -1;
+    }
     return n;
+}
+
+// The load of arm a that arm_cost allowed: its address becomes
+// `select(c, address, global)` (`select(c, global, address)` when the arm
+// runs if c is false). Before the arm is hoisted.
+fn spec_load(a: *mut ir.Block, c: *mut ir.Value, on_true: bool) void {
+    let t = ir.terminator(a);
+    let mut i = a.first;
+    while u.notnil(i) and (i != t) {
+        if i.op == ir.OP_LOAD {
+            let g = spec_load_base(i);
+            if u.notnil(g) {
+                let bld = ir.new_builder();
+                ir.at_before(bld, i);
+                let addr = ir.resolve(i.a);
+                if on_true {
+                    i.a = ir.select(bld, c, addr, g);
+                } else {
+                    i.a = ir.select(bld, c, g, addr);
+                }
+                return;
+            }
+        }
+        i = i.next;
+    }
 }
 
 fn phi_count(m: *ir.Block) i32 {
@@ -577,7 +839,7 @@ fn mark_addr(v: *mut ir.Value, depth: i32) void {
 }
 
 fn mark_addrs(f: *mut ir.Func) void {
-    addr_gen += 1;
+    addr_gen += 2;  // (arm_cost marks with addr_gen + 1)
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
@@ -658,9 +920,11 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
         eb = e;
     }
     if via_t {
+        spec_load(t, c, true);
         hoist(t, br);
     }
     if via_e {
+        spec_load(e, c, false);
         hoist(e, br);
     }
     let bld = ir.new_builder();
@@ -757,6 +1021,115 @@ fn sink_stores(d: *mut ir.Block) bool {
     }
 }
 
+// d: condbr c1 -> x, y with x (reached only from d) computing at most a
+// couple of speculatable values and testing c2 -> t, m, where y is m or an
+// empty block going to m, and m's phis get the same value from x as from
+// that way: d tests both, `condbr (c1 and c2) -> t, y` (for the conditions
+// that lead to t), as `if (a and b)` without an else does. The and of two
+// comparisons of one value is then one range check (combine.ax), and t may
+// be if-converted in turn.
+const MERGE_SPEC: i32 = 2;
+
+fn leads_to(y: *mut ir.Block, d: *mut ir.Block, m: *mut ir.Block) bool {
+    if y == m {
+        return true;
+    }
+    let t = ir.terminator(y);
+    return (y.first == t) and (t.op == ir.OP_BR) and (t.t1 == m) and (y.preds.len == 1) and (y.preds.get(0) == d);
+}
+
+fn merge_conds(f: *mut ir.Func, d: *mut ir.Block) bool {
+    let br = ir.terminator(d);
+    if (br.t1 == br.t2) or (br.a.ty.bits != 1) {
+        return false;
+    }
+    for side in @as(i32, 0)..2 {
+        let mut x = br.t1;
+        let mut y = br.t2;
+        if side == 1 {
+            x = br.t2;
+            y = br.t1;
+        }
+        if (x == d) or (x.preds.len != 1) or (x.first.op == ir.OP_PHI) {
+            continue;
+        }
+        let xt = ir.terminator(x);
+        if u.isnil(xt) or (xt.op != ir.OP_CONDBR) or (xt.t1 == xt.t2) or (xt.a.ty.bits != 1) {
+            continue;
+        }
+        // which of x's targets is m (where y leads)
+        let mut m = ir.bnil();
+        let mut t = ir.bnil();
+        let mut t_on_true = true;
+        if leads_to(y, d, xt.t2) {
+            m = xt.t2;
+            t = xt.t1;
+        } else if leads_to(y, d, xt.t1) {
+            m = xt.t1;
+            t = xt.t2;
+            t_on_true = false;
+        } else {
+            continue;
+        }
+        if (t == d) or (t == x) or (t == y) or (t == m) or (m == x) {
+            continue;
+        }
+        // x's work: a few speculatable instructions
+        let mut n: i32 = 0;
+        let mut ok = true;
+        let mut i = x.first;
+        while i != xt {
+            if not speculatable(i) {
+                ok = false;
+            }
+            n += 1;
+            i = i.next;
+        }
+        if not ok or (n > MERGE_SPEC) {
+            continue;
+        }
+        // m sees the same values from x as from y (or d)
+        let mut from_y = y;
+        if y == m {
+            from_y = d;
+        }
+        let mut p = m.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            if ir.resolve(incoming(p, x)) != ir.resolve(incoming(p, from_y)) {
+                ok = false;
+            }
+            p = p.next;
+        }
+        // (t's phis would need an input from d instead of x: none)
+        if not ok or (u.notnil(t.first) and (t.first.op == ir.OP_PHI)) {
+            continue;
+        }
+        hoist_all(x, br);
+        let bld = ir.new_builder();
+        ir.at_before(bld, br);
+        let mut c1 = br.a;
+        if side == 1 {
+            c1 = ir.xor(bld, c1, ir.cint(ir.t_int(1), 1));
+        }
+        let mut c2 = xt.a;
+        if not t_on_true {
+            c2 = ir.xor(bld, c2, ir.cint(ir.t_int(1), 1));
+        }
+        br.a = ir.and_(bld, c1, c2);
+        br.t1 = t;
+        br.t2 = y;
+        remove_phi_input(m, x);
+        _ = f;
+        return true;
+    }
+    return false;
+}
+
+// Moves all of a's instructions but its terminator before `before`.
+fn hoist_all(a: *mut ir.Block, before: *mut ir.Value) void {
+    hoist(a, before);
+}
+
 // (preds_ok: f's predecessor lists are up to date)
 pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     if u.isnil(f.first) {
@@ -771,6 +1144,10 @@ pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     while u.notnil(b) {
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a.ty.kind == ir.T_INT) {
+            if merge_conds(f, b) {
+                any = true;
+                opt.compute_preds(f);
+            }
             if sink_stores(b) {
                 any = true;
             }

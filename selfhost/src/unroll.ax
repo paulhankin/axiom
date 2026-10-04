@@ -245,7 +245,11 @@ fn loop_size(members: *u.List.[*mut ir.Block]) i64 {
             if (op == ir.OP_ALLOCA) or (op == ir.OP_CALL) {
                 return -1;
             }
-            if (op != ir.OP_PHI) and (op != ir.OP_BR) and (op != ir.OP_CONDBR) {
+            // (address arithmetic mostly folds into addressing modes, and
+            // extensions into the loads and operations they feed)
+            let free = (op == ir.OP_PHI) or (op == ir.OP_BR) or (op == ir.OP_CONDBR) or (op == ir.OP_PTRADD) or
+                       (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC);
+            if not free {
                 n += 1;
             }
             v = v.next;
@@ -392,6 +396,73 @@ fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64) vo
     }
 }
 
+// Folds the instructions of a copy whose operands are constants (the
+// induction variable's start, then each value derived from it), so the next
+// loop's trip count can be found without a cleanup in between.
+fn fold_copy(members: *u.List.[*mut ir.Block]) void {
+    let mut changed = true;
+    let mut sweeps: i32 = 0;
+    while changed and (sweeps < 4) {
+        changed = false;
+        sweeps += 1;
+        for k in 0..members.len {
+            let nb = @ptr_cast(*mut ir.Block, members.get(k).auxp);
+            let mut y = nb.first;
+            while u.notnil(y) {
+                let next = y.next;
+                let r = fold_inst(y);
+                if u.notnil(r) {
+                    ir.forward(y, r);
+                    ir.remove_inst(y);
+                    changed = true;
+                }
+                y = next;
+            }
+        }
+    }
+}
+
+fn fold_inst(y: *mut ir.Value) *mut ir.Value {
+    let op = y.op;
+    if (y.ty.kind != ir.T_INT) or (y.ty.bits > 64) {
+        return vnil();
+    }
+    if op == ir.OP_PHI {
+        let mut r = vnil();
+        for k in 0..y.xs.len {
+            let x = ir.resolve(y.xs.get(k));
+            if not is_k(x) or (u.notnil(r) and (x != r)) {
+                return vnil();
+            }
+            r = x;
+        }
+        return r;
+    }
+    if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) {
+        let a = ir.resolve(y.a);
+        let b = ir.resolve(y.b);
+        if is_k(a) and is_k(b) {
+            return ir.fold_int_bin(op, y.ty, a, b);
+        }
+        return vnil();
+    }
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
+        let a = ir.resolve(y.a);
+        if is_k(a) {
+            return ir.cast(builder(), op, a, y.ty);
+        }
+        return vnil();
+    }
+    if op == ir.OP_ICMP {
+        let a = ir.resolve(y.a);
+        let b = ir.resolve(y.b);
+        if is_k(a) and is_k(b) {
+            return ir.icmp(builder(), @truncate(i32, @bit_cast(i64, y.cv)), a, b);
+        }
+    }
+    return vnil();
+}
+
 fn retarget(b: *mut ir.Block, from: *mut ir.Block, to: *mut ir.Block) void {
     let t = ir.terminator(b);
     for j in 0..ir.succ_count(t) {
@@ -408,6 +479,7 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         return false;
     }
     let size = loop_size(members);
+
     if (size < 0) or ((size * n) > UNROLL_SIZE) {
         return false;
     }
@@ -479,6 +551,7 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         nt.a = vnil();
         nt.t1 = @ptr_cast(*mut ir.Block, stay.auxp);
         nt.t2 = ir.bnil();
+        fold_copy(members);
         // its other exits: inputs to the phis where they lead
         if side {
             for k in 0..members.len {
@@ -497,8 +570,8 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
                         let cnt = sp.bs.len;
                         for e in 0..cnt {
                             if sp.bs.get(e) == x {
-                                ir.add_incoming(sp, map_v(ir.resolve(sp.xs.get(e)), tag),
-                                                @ptr_cast(*mut ir.Block, x.auxp));
+                                ir.add_incoming(
+                                    sp, map_v(ir.resolve(sp.xs.get(e)), tag), @ptr_cast(*mut ir.Block, x.auxp));
                             }
                         }
                         sp = sp.next;
@@ -517,7 +590,7 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
                         x = ir.resolve(q.xs.get(j));
                     }
                 }
-                nins.push(map_v(x, tag));
+                nins.push(ir.resolve(map_v(x, tag)));
             }
             q = q.next;
         }
@@ -555,11 +628,10 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
     _ = nphi;
     // the rest of the original loop is unreachable now
     ir.remove_unreachable(f);
+    ir.apply_forwarding(f);
     return true;
 }
 
-// Unrolls one loop (inner loops first). True if it did: the caller cleans
-// up and calls again.
 // Could b head a loop unrolling takes: phis, and a test that depends on one?
 fn maybe_header(b: *mut ir.Block) bool {
     let t = ir.terminator(b);
@@ -580,23 +652,30 @@ fn maybe_header(b: *mut ir.Block) bool {
     return false;
 }
 
-let mut dbg_left: i64 = -2;
+// Debugging: AXIOM_UNROLL_MAX=n unrolls only the first n loops of the build
+// and names the function of the last, to find a loop unrolled wrongly by
+// bisection. -2: not read yet; -1: no limit.
+let mut unroll_budget: i64 = -2;
 
-pub fn full_unroll(f: *mut ir.Func) bool {
-    if u.isnil(f.first) {
-        return false;
-    }
-    if dbg_left == -2 {
-        dbg_left = -1;
+fn budget_left() bool {
+    if unroll_budget == -2 {
+        unroll_budget = -1;
         let e = u.env("AXIOM_UNROLL_MAX");
         if not u.isnos(e) {
-            dbg_left = 0;
+            unroll_budget = 0;
             for ch in e {
-                dbg_left = (dbg_left * 10) + @as(i64, ch - '0');
+                unroll_budget = (unroll_budget * 10) + @as(i64, ch - '0');
             }
         }
     }
-    if dbg_left == 0 {
+    return unroll_budget != 0;
+}
+
+// Unrolls one loop of f (inner loops first). True if it did: the caller
+// calls again (for an inner loop of the copies, whose start may now be a
+// constant), then simplifies f.
+pub fn full_unroll(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or not budget_left() {
         return false;
     }
     // (no CFG analyses for a function without a candidate)
@@ -630,18 +709,381 @@ pub fn full_unroll(f: *mut ir.Func) bool {
         }
         unroll_mark += 1;
         members_of(h, unroll_mark, &mut members);
-        if (dbg_left == 1) and not u.isnos(u.env("AXIOM_UNROLL_DUMP")) {
-            u.eprint(ir.func_str(f));
-        }
         did = try_unroll(f, h, unroll_mark, &members);
     }
-    if did and (dbg_left > 0) {
-        dbg_left -= 1;
-        if dbg_left == 0 {
-            u.eprint(u.cat2(u.cat2("unroll: last in ", f.name), "\n"));
+    if did and (unroll_budget > 0) {
+        unroll_budget -= 1;
+        if unroll_budget == 0 {
+            u.eprint(u.cat2(u.cat2("unroll: the last loop unrolled is in ", f.name), "\n"));
         }
     }
     u.free(@ptr_cast(*mut void, members.data));
     u.free(@ptr_cast(*mut void, order.data));
+    return did;
+}
+
+// -----------------------------------------------------------------------------
+// One-hot stores: a chain of tests of one value x against constants, each
+// storing the same value at an address that is the same base plus an offset
+// linear in the constant,
+//
+//   if x == 1 { p[0] = v } else if x == 2 { p[1] = v } else if ...
+//
+// (an unrolled `for k in 0..n { if x == k + 1 { p[k] = v } }`, once jump
+// threading has sent each store past the remaining tests) becomes one range
+// check and one store at the address computed from x.
+// -----------------------------------------------------------------------------
+const ONEHOT_MIN: usize = 3;
+const ONEHOT_MAX: usize = 64;
+
+struct Arm {
+    c: u64,             // the constant
+    off: u64,           // the store's offset from the base
+    st: *mut ir.Value,  // the store
+}
+
+// b ends in a test of x == c: true, with x, c, and where it goes when x == c
+// and when not.
+fn eq_test(b: *mut ir.Block, x: *mut *mut ir.Value, c: *mut u64, yes: *mut *mut ir.Block, no: *mut *mut ir.Block) bool {
+    let t = ir.terminator(b);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+        return false;
+    }
+    let cmp = ir.resolve(t.a);
+    if (cmp.kind != ir.V_INST) or (cmp.op != ir.OP_ICMP) {
+        return false;
+    }
+    let p = @truncate(i32, @bit_cast(i64, cmp.cv));
+    let a = ir.resolve(cmp.a);
+    let k = ir.resolve(cmp.b);
+    if not is_k(k) or is_k(a) or (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
+        return false;
+    }
+    if p == ir.IntEQ {
+        yes.* = t.t1;
+        no.* = t.t2;
+    } else if p == ir.IntNE {
+        yes.* = t.t2;
+        no.* = t.t1;
+    } else {
+        return false;
+    }
+    x.* = a;
+    c.* = ir.cint_val(k);
+    return true;
+}
+
+// The arm block a (reached only from its test): a store, after arithmetic
+// (its address), then a jump. Its store, or nil.
+fn arm_store(a: *mut ir.Block, tb: *mut ir.Block) *mut ir.Value {
+    if (a.preds.len != 1) or (a.preds.get(0) != tb) {
+        return vnil();
+    }
+    let t = ir.terminator(a);
+    if u.isnil(t) or (t.op != ir.OP_BR) {
+        return vnil();
+    }
+    let mut st = vnil();
+    let mut i = a.first;
+    while i != t {
+        let op = i.op;
+        let arith = (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_MUL) or
+                    ((op >= ir.OP_AND) and (op <= ir.OP_ASHR)) or (op == ir.OP_PTRADD) or (op == ir.OP_ZEXT) or
+                    (op == ir.OP_SEXT) or (op == ir.OP_TRUNC);
+        if (op == ir.OP_STORE) and u.isnil(st) and (i.flags == 0) {
+            st = i;
+        } else if not (arith and u.isnil(st)) {
+            return vnil();
+        }
+        i = i.next;
+    }
+    return st;
+}
+
+// An address as base + sym * scale + off (sym nil: base + off), the
+// arithmetic modulo the pointer width.
+struct Addr {
+    base: *mut ir.Value,
+    sym: *mut ir.Value,
+    scale: u64,
+    off: u64,
+}
+
+// e (a pointer-sized integer) as sym * scale + off.
+fn lin(e0: *mut ir.Value, depth: i32) Addr {
+    let e = ir.resolve(e0);
+    let m = ir.mask_bits(ir.isz().bits);
+    if ir.is_cint(e) {
+        return Addr.{ base: vnil(), sym: vnil(), scale: 0, off: ir.cint_val(e) };
+    }
+    let whole = Addr.{ base: vnil(), sym: e, scale: 1, off: 0 };
+    if (depth <= 0) or (e.kind != ir.V_INST) {
+        return whole;
+    }
+    let op = e.op;
+    if (op == ir.OP_ADD) or (op == ir.OP_SUB) {
+        let x = lin(e.a, depth - 1);
+        let y = lin(e.b, depth - 1);
+        if u.notnil(y.sym) and ((op == ir.OP_SUB) or u.notnil(x.sym)) {
+            return whole;
+        }
+        if op == ir.OP_SUB {
+            return Addr.{ base: vnil(), sym: x.sym, scale: x.scale, off: (x.off -% y.off) & m };
+        }
+        if u.isnil(x.sym) {
+            return Addr.{ base: vnil(), sym: y.sym, scale: y.scale, off: (x.off +% y.off) & m };
+        }
+        return Addr.{ base: vnil(), sym: x.sym, scale: x.scale, off: (x.off +% y.off) & m };
+    }
+    if ((op == ir.OP_MUL) or (op == ir.OP_SHL)) and ir.is_cint(ir.resolve(e.b)) {
+        let mut k = ir.cint_val(ir.resolve(e.b));
+        if op == ir.OP_SHL {
+            if k >= 64 {
+                return whole;
+            }
+            k = @as(u64, 1) << @truncate(u32, k);
+        }
+        let x = lin(e.a, depth - 1);
+        return Addr.{ base: vnil(), sym: x.sym, scale: (x.scale *% k) & m, off: (x.off *% k) & m };
+    }
+    return whole;
+}
+
+fn addr_of(p0: *mut ir.Value, depth: i32) Addr {
+    let p = ir.resolve(p0);
+    if (depth > 0) and (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        let x = addr_of(p.a, depth - 1);
+        let y = lin(p.b, 4);
+        let m = ir.mask_bits(ir.isz().bits);
+        if u.isnil(x.sym) {
+            return Addr.{ base: x.base, sym: y.sym, scale: y.scale, off: (x.off +% y.off) & m };
+        }
+        if u.isnil(y.sym) {
+            return Addr.{ base: x.base, sym: x.sym, scale: x.scale, off: (x.off +% y.off) & m };
+        }
+    }
+    return Addr.{ base: p, sym: vnil(), scale: 0, off: 0 };
+}
+
+// Is a value defined in one of the blocks marked tag used outside its block?
+fn used_elsewhere(f: *mut ir.Func, tag: i64) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if escapes_block(ir.resolve(i.a), b, tag) or escapes_block(ir.resolve(i.b), b, tag) or
+               escapes_block(ir.resolve(i.c), b, tag) {
+                return true;
+            }
+            for k in 0..i.xs.len {
+                if escapes_block(ir.resolve(i.xs.get(k)), b, tag) {
+                    return true;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+fn escapes_block(o: *mut ir.Value, at: *mut ir.Block, tag: i64) bool {
+    return in_loop(o, tag) and (o.blk != at);
+}
+
+fn try_onehot(f: *mut ir.Func, b0: *mut ir.Block, arms: *mut u.List.[Arm]) bool {
+    let mut x = vnil();
+    let mut c: u64 = 0;
+    let mut yes = ir.bnil();
+    let mut no = ir.bnil();
+    if not eq_test(b0, &mut x, &mut c, &mut yes, &mut no) {
+        return false;
+    }
+    arms.clear();
+    unroll_mark += 1;
+    let tag = unroll_mark;
+    let mut end = ir.bnil();
+    let mut base = Addr.{ base: vnil(), sym: vnil(), scale: 0, off: 0 };
+    let mut val = vnil();
+    let mut cur = b0;
+    loop {
+        let st = arm_store(yes, cur);
+        if u.isnil(st) {
+            return false;
+        }
+        let at = ir.terminator(yes).t1;
+        if u.isnil(end) {
+            end = at;
+        }
+        let ad = addr_of(st.b, 4);
+        let off = ad.off;
+        if u.isnil(base.base) {
+            base = ad;
+            val = ir.resolve(st.a);
+        }
+        if (at != end) or (ad.base != base.base) or (ad.sym != base.sym) or (ad.scale != base.scale) or
+           (ir.resolve(st.a) != val) or ((arms.len > 0) and (st.align != arms.get(0).st.align)) {
+            return false;
+        }
+        yes.mark = tag;
+        arms.push(Arm.{ c: c, off: off, st: st });
+        if arms.len >= ONEHOT_MAX {
+            return false;
+        }
+        // the next test: alone in its block, reached only from this one
+        let nb = no;
+        let mut x2 = vnil();
+        let mut y2 = ir.bnil();
+        let mut n2 = ir.bnil();
+        let nt = ir.terminator(nb);
+        if (nb == end) or (nb.preds.len != 1) or (nb.first.op == ir.OP_PHI) or
+           not eq_test(nb, &mut x2, &mut c, &mut y2, &mut n2) or (x2 != x) or (nb.first.next != nt) or
+           (ir.resolve(nt.a) != nb.first) {
+            break;
+        }
+        nb.mark = tag;
+        cur = nb;
+        yes = y2;
+        no = n2;
+    }
+    if (no != end) or (arms.len < ONEHOT_MIN) or (u.notnil(end.first) and (end.first.op == ir.OP_PHI)) {
+        return false;
+    }
+    // the constants: n distinct ones from cmin up, offsets a + s * c
+    let n = arms.len;
+    let bits = x.ty.bits;
+    let mut cmin = arms.get(0).c;
+    for k in 0..n {
+        if arms.get(k).c < cmin {
+            cmin = arms.get(k).c;
+        }
+    }
+    let mut seen = u.calloc_slice.[bool](n);
+    let mut ok = true;
+    for k in 0..n {
+        let d = (arms.get(k).c -% cmin) & ir.mask_bits(bits);
+        if (d >= @as(u64, n)) or seen[@int_cast(usize, d)] {
+            ok = false;
+            break;
+        }
+        seen[@int_cast(usize, d)] = true;
+    }
+    u.free_slice.[bool](seen);
+    if not ok {
+        return false;
+    }
+    let ity = ir.isz();
+    if bits > ity.bits {
+        return false;
+    }
+    let im = ir.mask_bits(ity.bits);
+    // offset of the arm at cmin + d: o0 + s * d
+    let mut o0: u64 = 0;
+    let mut s: u64 = 0;
+    let mut have_s = false;
+    for k in 0..n {
+        let d = (arms.get(k).c -% cmin) & ir.mask_bits(bits);
+        if d == 0 {
+            o0 = arms.get(k).off;
+        }
+    }
+    for k in 0..n {
+        let d = (arms.get(k).c -% cmin) & ir.mask_bits(bits);
+        if (d == 1) {
+            s = (arms.get(k).off -% o0) & im;
+            have_s = true;
+        }
+    }
+    if not have_s {
+        return false;
+    }
+    for k in 0..n {
+        let d = (arms.get(k).c -% cmin) & ir.mask_bits(bits);
+        if ((o0 +% (s *% d)) & im) != (arms.get(k).off & im) {
+            return false;
+        }
+    }
+    // nothing computed in the arms or the later tests is used elsewhere
+    if in_loop(base.base, tag) or in_loop(base.sym, tag) or in_loop(val, tag) or used_elsewhere(f, tag) {
+        return false;
+    }
+    // b0: if x - cmin < n { store v at base + o0 + s * (x - cmin) }
+    let t0 = ir.terminator(b0);
+    let first = arms.get(0).st;
+    ir.at_before(builder2(), t0);
+    let d = ir.sub(builder2(), x, ir.cint(x.ty, cmin));
+    let inr = ir.icmp(builder2(), ir.IntULT, d, ir.cint(x.ty, @as(u64, n)));
+    let arm = ir.append_block(f, "onehot");
+    ir.move_block_after(arm, b0);
+    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+    br.t1 = end;
+    ir.append_inst(arm, br);
+    ir.at_before(builder2(), br);
+    let dz = ir.zext(builder2(), d, ity);
+    let mut off = ir.add(builder2(), ir.mul(builder2(), dz, ir.cint(ity, s)), ir.cint(ity, o0));
+    if u.notnil(base.sym) {
+        off = ir.add(builder2(), ir.mul(builder2(), base.sym, ir.cint(ity, base.scale)), off);
+    }
+    let addr = ir.ptradd(builder2(), base.base, off);
+    let st = ir.store(builder2(), val, addr);
+    st.align = first.align;
+    st.src = first.src;
+    t0.a = inr;
+    t0.t1 = arm;
+    t0.t2 = end;
+    ir.remove_unreachable(f);
+    return true;
+}
+
+let mut bld2_: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+
+// (for the instructions one-hot stores insert)
+fn builder2() *mut ir.Builder {
+    if u.isnil(bld2_) {
+        bld2_ = ir.new_builder();
+    }
+    return bld2_;
+}
+
+// True if any chain was merged.
+pub fn onehot_stores(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    // (only with a chain of three tests of one value against constants)
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) and not any {
+        let mut x = vnil();
+        let mut c: u64 = 0;
+        let mut y = ir.bnil();
+        let mut n = ir.bnil();
+        if eq_test(b, &mut x, &mut c, &mut y, &mut n) {
+            let mut x2 = vnil();
+            let mut y2 = ir.bnil();
+            let mut n2 = ir.bnil();
+            any = eq_test(n, &mut x2, &mut c, &mut y2, &mut n2) and (x2 == x);
+        }
+        b = b.next;
+    }
+    if not any {
+        return false;
+    }
+    let mut arms = u.List.[Arm].{ data: u.nil.[Arm](), len: 0, cap: 0 };
+    let mut did = false;
+    let mut found = true;
+    let mut rounds: i32 = 0;
+    while found and (rounds < 64) {
+        found = false;
+        rounds += 1;
+        opt.compute_preds(f);
+        b = f.first;
+        while u.notnil(b) and not found {
+            found = try_onehot(f, b, &mut arms);
+            b = b.next;
+        }
+        did = did or found;
+    }
+    u.free(@ptr_cast(*mut void, arms.data));
     return did;
 }

@@ -437,6 +437,68 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// The unsigned values of x where the comparison c (x p k, k a constant) is
+// true, when they are one interval [lo, hi]; nil x if not.
+fn unsigned_range(c: *mut ir.Value, lo: *mut u64, hi: *mut u64) *mut ir.Value {
+    let x = c.a;
+    if (x.ty.kind != ir.T_INT) or (x.ty.bits > 64) or not is_k(c.b) or is_k(x) {
+        return vnil();
+    }
+    let k = kval(c.b);
+    let max = ir.mask_bits(x.ty.bits);
+    let p = pred_of(c);
+    lo.* = 0;
+    hi.* = max;
+    if p == ir.IntEQ {
+        lo.* = k;
+        hi.* = k;
+    } else if (p == ir.IntNE) and (k == 0) {
+        lo.* = 1;
+    } else if (p == ir.IntNE) and (k == max) {
+        hi.* = max - 1;
+    } else if (p == ir.IntULT) and (k > 0) {
+        hi.* = k - 1;
+    } else if p == ir.IntULE {
+        hi.* = k;
+    } else if (p == ir.IntUGT) and (k < max) {
+        lo.* = k + 1;
+    } else if p == ir.IntUGE {
+        lo.* = k;
+    } else {
+        return vnil();
+    }
+    return x;
+}
+
+// (x in [a, b]) and (x in [c, d]): one comparison, of x - lo against the
+// length of the intersection (or nil).
+fn and_ranges(B: *mut ir.Builder, c1: *mut ir.Value, c2: *mut ir.Value) *mut ir.Value {
+    let mut lo1: u64 = 0;
+    let mut hi1: u64 = 0;
+    let mut lo2: u64 = 0;
+    let mut hi2: u64 = 0;
+    let x = unsigned_range(c1, &mut lo1, &mut hi1);
+    if u.isnil(x) or (unsigned_range(c2, &mut lo2, &mut hi2) != x) {
+        return vnil();
+    }
+    let t = x.ty;
+    let lo = @max(lo1, lo2);
+    let hi = @min(hi1, hi2);
+    if lo > hi {
+        return kfalse();
+    }
+    if lo == hi {
+        return mk_icmp(B, ir.IntEQ, x, kt(t, lo));
+    }
+    if lo == 0 {
+        return mk_icmp(B, ir.IntULE, x, kt(t, hi));
+    }
+    if hi == ir.mask_bits(t.bits) {
+        return mk_icmp(B, ir.IntUGE, x, kt(t, lo));
+    }
+    return mk_icmp(B, ir.IntULT, ir.sub(B, x, kt(t, lo)), kt(t, (hi - lo) + 1));
+}
+
 fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let t = i.ty;
@@ -552,6 +614,12 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         return vnil();
     }
     if op == ir.OP_AND {
+        if (t.bits == 1) and is_op(a, ir.OP_ICMP) and is_op(b, ir.OP_ICMP) {
+            let r = and_ranges(B, a, b);
+            if u.notnil(r) {
+                return r;
+            }
+        }
         if bk {
             if k == 0 {
                 return b;
