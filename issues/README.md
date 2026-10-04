@@ -101,3 +101,5 @@ they travel with the code they describe.
 | [0067](0067-selfhost-booleans-in-branches.md) | feature | compiler (selfhost: combine, thread, opt, x64, mach) | Self-hosted optimizer: booleans materialised as 0/1 and tested again (fixed in b5484e8, c35afe7, c77857d) |
 | [0068](0068-selfhost-input-kernels-unrolling.md) | feature | compiler (selfhost: unroll) | Self-hosted optimizer: the benchmark's input encoders keep long point loops rolled (fixed in 95c7657) |
 | [0069](0069-selfhost-input-kernels-remaining.md) | feature | compiler (selfhost: opt layout, x64, mach) | Self-hosted x86-64: what is left between the input encoders and LLVM's (fixed in 7133181, 62d2e71, f8011f3, f40fe96) |
+| [0072](0072-selfhost-sse2-shuffles.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without AVX: constant shuffles through memory (fixed in b2dccf2) |
+| [0073](0073-selfhost-outlining-inline-helpers.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: inline helpers' hot bodies outlined as cold functions (fixed in 4b49fd9) |
