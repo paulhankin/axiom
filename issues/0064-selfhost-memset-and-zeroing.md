@@ -1,7 +1,7 @@
 # 0064: Self-hosted x86-64: small constant-size memset/memcpy as `rep stosb`/`rep movsb`, arrays zeroed eight bytes at a time
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (163832e, 4710d95)
 - Area: compiler (selfhost: x64 lowering of memset/memcpy, gvn memset idioms)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -42,3 +42,22 @@ This is low priority: these costs are small next to the issues above.
 
 Below 2% on any kernel (estimate: `race_inputs` 0-5%, `contact_net` about 1%), under
 10 ns summed.
+
+## Resolution
+
+Fixed in 163832e and 4710d95 (`x64.ax`):
+
+- A `memcpy` or `memmove` of up to 256 bytes is loads (all first, so the operands may
+  overlap: no overlap test) and then stores: vectors up to 32 bytes (`ymm` with AVX2; no
+  AVX-512 frequency licence for a copy), one more overlapping the end, and integer moves
+  below 16 bytes. `dim128_pair`'s 20-byte `@mem_copy` is two 16-byte moves.
+- A fill with a constant byte stores a zeroed (or loaded) vector the same way, and from 257
+  bytes to 2 KiB as a loop of vector stores plus one overlapping the end; so does a
+  `memcpy` of up to 2 KiB. Larger ones stay `rep stosb`/`rep movsb`. `calculate_race_inputs`
+  zeroes its 856 bytes with a `ymm` loop (27 stores).
+- Runs of constant stores filling 16 to 64 contiguous bytes from one base (nothing between
+  them that touches memory) are vector stores of their bytes from the constant pool, or of
+  a zeroed register: `[36; 11]u32` in `half_containment` is one `ymm` and one overlapping
+  `xmm` store.
+
+No kernel changed beyond the noise (0057's table, the last two columns).

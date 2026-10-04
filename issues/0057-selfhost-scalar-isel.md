@@ -1,7 +1,7 @@
 # 0057: Self-hosted x86-64: scalar instruction selection leaves extensions, flag materialisation and copies
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (0cbcfb6, 9e2bb29)
 - Area: compiler (selfhost: x64 instruction selection, x64enc, opt layout)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -92,3 +92,60 @@ next block.
 
 Estimate: 5-10% on movegen and the input kernels (about 50-80 ns summed). For example,
 the `base_inputs` loop body is 24 instructions per iteration where 12 would do.
+
+## Resolution
+
+Fixed in 0cbcfb6 (with 0061's addressing modes) and 9e2bb29, in `x64.ax` and `x64enc.ax`:
+
+- **Branches on compares.** A branch on an `and`/`or`/`not` of comparisons used only there
+  jumps on each comparison's flags (`branch_tree`: `cmp; jcc; cmp; jcc`). A comparison whose
+  every use is the condition of a branch or select in its block is compared again at each
+  (no `setcc`, and no dead `cmp` left behind). `setcc` in the the benchmark functions: 169 to 63.
+  Those left are booleans used across blocks or as values, and `@any`/`@all` of vectors
+  (`vpmovmskb; cmp; setne; movzx; test; je` in `save_moves`), whose fusion into the branch
+  belongs with the vector selection (0058/0062).
+- **Extensions.** `zext_known` knows which values have zero upper bits (32-bit operations,
+  loads, logical shifts, unsigned division, bit counts, masks, `umin`/`umax`, selects and
+  phis of such, masked truncations, float bitcasts); their zero extensions are copies.
+  `@min`/`@max` compare at the operands' own width, with an immediate for a constant, and
+  copy after the compare: the `base_inputs` loop body is `movzx; mov r,15; cmp dl,15;
+  cmova; shl` (LLVM's shape). `movzx`: 323 to 179; `mov r32,r32`: 39 to 6.
+- **Read-modify-write.** `load; add/sub/and/or/xor; store` to the same address is one
+  instruction with a memory destination (`add BYTE PTR [rax+0x31],0x1`).
+- **Constants and copies, after allocation.** `mov r, 0` is `xor r32, r32` where the flags
+  are dead (336 to 4 `mov r,0`); `mov d, a; add d, b|k` (and `sub k`) is `lea` where the
+  flags are dead (`add r,-1`: 106 to 47); a compare identical to an earlier one in the block,
+  with nothing between that sets the flags or writes its registers, is dropped; `k - x` puts
+  `k` straight into the result.
+- **Encoding and layout.** No REX for byte operations whose only byte register is a
+  `/digit` or the wider operand of `movzx` (48 to 0); no jumps to the next instruction,
+  past blocks that encode nothing and to local labels (13 to 0).
+
+Not done: constants used by `cmov` in loops are still built in the loop (`mov r11d,0x3`);
+hoisting them, like hoisting globals' addresses (tried for 0061), raises register pressure
+that the allocator (0054) answers with spills.
+
+Instructions in the the benchmark functions of `bench_kernels`: 23,362 before, 22,320 after
+(LLVM: 16,700). Tests: `tests/lowering/x64_scalar.ax`.
+
+Measured with 0059, 0061 and 0064 (`bench_kernels`, ns per position, min of 15 interleaved
+runs, before 0053's frame tables; the machine was shared, load 6-12 on 4 cores, so about
+±10%: the net kernels, which are vector code, moved within that noise):
+
+| kernel | before | 0059 (68528df) | + 0057, 0061 (0cbcfb6) | all (4710d95) | LLVM |
+|---|---|---|---|---|---|
+| movegen | 1136 | 1126 | 1114 | 1087 | 724 |
+| contact_inputs | 337 | 335 | 282 | 307 | 186 |
+| race_inputs | 216 | 202 | 193 | 208 | 108 |
+| pruning_inputs | 38.3 | 39.3 | 25.5 | 27.6 | 19.1 |
+| contact_net | 409 | 364 | 385 | 424 | 291 |
+| race_net | 263 | 283 | 253 | 266 | 203 |
+| pruned_contact | 111 | 112 | 112 | 109 | 91 |
+| pruned_race | 158 | 142 | 151 | 147 | 130 |
+| contact_single | 385 | 379 | 400 | 398 | 310 |
+| pruned_single | 163 | 158 | 156 | 157 | 123 |
+| pruned_boards | 83.5 | 83.1 | 80.6 | 77.4 | 53.1 |
+
+Repeated runs of single kernels (25 each) put contact_inputs at 297-307 for every build
+from 0cbcfb6 on, contact_net at 348-352 for before, 0059 and all. `bench_search --mode 2ply
+--limit 50` gives identical results (and every checksum is unchanged).

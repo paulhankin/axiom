@@ -1,7 +1,7 @@
 # 0061: Self-hosted x86-64: addressing modes not folded, address arithmetic recomputed in loops
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (0cbcfb6, 4b24f5d)
 - Area: compiler (selfhost: x64 address selection, gvn LICM/reassociation)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -68,3 +68,28 @@ iteration) where one base with displacements 0/4/8/12 would do.
 Estimate: 3-5% of movegen and the input kernels, and some of the pruned kernels' loop
 length (about 20-40 ns summed). The loop bodies get shorter and use fewer registers, which
 also helps 0054.
+
+## Resolution
+
+Fixed in 0cbcfb6 (`x64.ax`) and 4b24f5d (`gvn.ax`):
+
+- **`base + disp + index*scale`.** An indexed memory operand takes a constant offset of its
+  base (a register, a stack slot or a folded `ptradd` with a constant) and of its index
+  (`(x + c) * s`) into the displacement: `b.raw[ON_ROLL][i]` is `movzx esi,BYTE PTR
+  [rdi+rbx*1+0x19]`, and stack arrays `[rbp-0x78+rdx*4]`.
+- **Address sums in loops.** An address-only `ptradd` with a variable offset that is the
+  base of another in a different block is computed once, where it is defined, instead of
+  again at each use: the pruned-boards kernel's inner loop reads `movzx ebx,BYTE PTR
+  [r8+r11*1]` instead of three `lea`s per iteration.
+- **Globals.** A global's address is computed once per machine block (until a label).
+  Hoisting it out of loops (`hoist_constants`) was tried: with the global in a register
+  across the loop, the allocator spilled hot values instead (more instructions in most
+  kernels), so it is left for 0054.
+- **Induction pointers.** Strength-reduced addresses with the same step whose starts are
+  a constant apart (each a linear combination of the same values plus constants) share one
+  pointer, the others a displacement from it: `calculate_race_inputs`' 23-point loop has
+  one pointer (`vmovss [rdx-0xc]`, `[rdx-0x8]`, `[rdx-0x4]`, `[rdx]`) instead of four.
+  Not for wasm, whose offsets cannot be negative.
+
+RIP-relative `lea`s in the the benchmark functions: 1,148 to 1,112; most of those left are the
+shadow stack's site records (0053). Measured together with 0057 (its table).

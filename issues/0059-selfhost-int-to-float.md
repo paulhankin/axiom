@@ -1,7 +1,7 @@
 # 0059: Self-hosted x86-64: int-to-float conversions go through the stack; float division by powers of two
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (68528df)
 - Area: compiler (selfhost: x64 instruction selection, combine)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -69,3 +69,19 @@ with no stack traffic.
 
 Measured 3-9% on `contact_inputs`/`race_inputs`/`contact_single`. With the
 multiplication, estimate 20-40 ns summed over the kernels.
+
+## Resolution
+
+Fixed in 68528df as proposed, with `vzero` rather than a function-wide zero register:
+
+- `cvt_si2f` zeroes its destination first (`vpxor d,d,d`, a zeroing idiom that reads nothing)
+  instead of treating it as read, so the register allocator no longer keeps it live (or
+  spills it) into the conversion. `sse_unary` does the same when its source is in memory
+  (with a register source it already merged into that register).
+- With AVX-512F, `u32`/`u64` to `f32`/`f64` is one `vcvtusi2ss`/`vcvtusi2sd` (EVEX.W from
+  the operand size, which the EVEX encoder now honours). The load is not folded.
+- `combine.ax`: `x / c` becomes `x * (1/c)` when `c` (or every lane of a constant vector) is
+  a power of two whose reciprocal is a normal number: the same real number, rounded the same.
+
+`calculate_race_inputs`' conversion is now `vpxor xmm3,xmm3,xmm3; vcvtusi2ss xmm3,xmm3,r12d;
+vmulss`. Measured: race_inputs 216 to 202 ns, the rest within noise; see 0057's table.
