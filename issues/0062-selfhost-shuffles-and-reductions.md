@@ -1,7 +1,7 @@
 # 0062: Self-hosted x86-64: constant shuffles as table permutes, lane extracts and reductions
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (8f61b1f)
 - Area: compiler (selfhost: x64 instruction selection)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -72,3 +72,30 @@ once for several lanes. Use the `vshufpd`+`vmovshdup` tail for float reductions.
 About 20 instructions in each `half_point_sums_avx512` (twice per contact position), the
 output layers' reductions, and `output_x8`. Estimate: 2-4% of `contact_inputs` and 1-3%
 of the net kernels, about 10-20 ns summed.
+
+## Fixed
+
+In 8f61b1f. Before a table permute, a constant shuffle (of 128-, 256- or 512-bit vectors, with
+AVX) is matched against single instructions, which vsplit.ax then also keeps whole:
+
+- a widening with zeros (lanes of the low half interleaved with lanes of a zero vector) is
+  `vpmovzxbw`/`wd`/`dq` (`half_point_sums_avx512`: `vpmovzxbw zmm17, ymm17`);
+- interleaves within 128-bit groups are `punpckl*`/`punpckh*`, on the widest lanes the mask
+  goes in pairs of (`sum_lanes_i32_x8`: `vpunpckldq`/`hdq`, `vpunpcklqdq`/`hqdq`);
+- the same permutation of 32-bit lanes in each group is `pshufd`;
+- 128-bit groups are `vshufi64x2` with an immediate.
+
+A permute's index comes from the constant pool once per block (and is rematerialized).
+Lane extracts read xmm16-31 directly (EVEX `vpextrd`, `vmovd` for lane 0, encoded with EVEX
+when a register is one of xmm16-31) and reuse a 128-bit part taken out in the block.
+`@reduce_add` folds its last 128 bits with in-register shuffles and vector adds, in the
+same order (codegen.ax, every backend): on `f32x16`, `vextracti64x4; vaddps; vextracti128;
+vaddps; vpunpckhqdq; vaddps; vpshufd; vaddps` plus two copies, instead of 13 instructions
+with three scalar adds. combine.ax folds shuffles of zero vectors and adds of zero (the two
+zero inputs of `sum_lanes_i32_x8`).
+
+Not done: `valignd`, byte shifts and two-source `shufps` (no the benchmark kernel uses them), and
+the copies before the reduction's first two steps (the low half is a copy into a narrower
+register class).
+
+Measured together with 0056 and 0058: see 0056.

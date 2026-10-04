@@ -1,7 +1,7 @@
 # 0056: Self-hosted x86-64: vector constants reloaded at every use, splats not broadcast
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (459a664, 8f61b1f)
 - Area: compiler (selfhost: x64 instruction selection, opt hoisting)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -79,3 +79,63 @@ In `dim128_pair`, PC samples on the sigmoid part are about 270 against LLVM's 15
 1230 and 832 samples for the whole function). That is about 10% of `contact_net`. The
 pruned kernels' per-point loop is twice LLVM's length. Estimate: 5-10% on
 `contact_net`/`race_net`/`contact_single`, 10-20% on `pruned_*`, about 50-80 ns summed.
+
+## Fixed
+
+In 459a664 (constants), with the rest in 8f61b1f (masks and shuffles, 0058 and 0062):
+
+- **Rematerialization in the allocator, not at every use.** A splat of a constant, a
+  load from a constant global, and a constant operand (once per block, up to a local
+  label) are values defined once. The definition is registered with `mc.set_remat`;
+  when the allocator would spill such a value it rematerializes it instead: in each
+  block that reads it as a value of its own (which can be rematerialized in turn), or,
+  when it is read only in its own block, at each use, folded into the instruction's r/m
+  operand where the target can (`mc.Target.fold_remat`). No stack slot, no stores. A
+  constant read once in the block defining it is read from memory there
+  (`fold_remats`). A copy of a constant, and a bitcast of any vector, share its register.
+- **Zero and all ones** are `vpxor`/`vpcmpeqd`/`vpternlogd 0xff`, never loads.
+- **Splats** of 32- and 64-bit constants are `vpbroadcastd/q` of a 4- or 8-byte constant
+  (with AVX2); read once by an EVEX instruction they are an embedded broadcast operand
+  (`vpandd zmm, zmm, DWORD BCST [rip+c]`), else a full-width constant made on demand.
+- **`@splat(load)`** is `vpbroadcastd zmm, DWORD PTR [rsi+rbx*4]` (8f61b1f), and a commutative
+  vector operation takes a folded load as either operand (`vaddps zmm, zmm, [w]`).
+- **Scalar float constants** are memory operands when read once (the same folding).
+- **Compares** put a constant in the r/m slot (the predicate swapped), 8f61b1f;
+  `select(a < b, a, b)` is `vminps`/`vmaxps` (8f61b1f, 0058).
+- **combine:** `fma(1, x, y)` is `x + y` (8f61b1f).
+
+Also found and fixed on the way: `vpmovm2*` has a false dependency on its destination
+(on this Sapphire/Emerald Rapids machine): once constants stayed in registers, the
+expansion of each sigmoid's compare into a vector waited for the last sigmoid's result,
+which chained the 17 copies in `dim128_pair` (a micro-benchmark of 16 sigmoids went from
+220 to 330 ns). The destination is now zeroed first (an idiom with no dependency), and
+since 8f61b1f compares rarely need expanding at all.
+
+`sigmoid16` is now about 33 instructions (from 55): the table pairs in registers
+where they fit (two of the four kept, the other two loaded into the permute's
+destination, as the permute destroys it), constants broadcast or in registers.
+`dim128_pair` went from 1715 to 1363 instructions (constant loads 278 to 44).
+
+What is left: `dim128_pair` still reloads the `-beta` splat and the activations from the
+stack in the sigmoid and output loops (0054), and holds only part of the table in
+registers.
+
+Measured with 0058 and 0062 (`bench_kernels`, native `-O2`, min of 30 runs alternating,
+built by origin/main 51b2245 and by this change, on a machine with a load average of 8-10
+on 4 cores, so differences of a few percent are noise; checksums unchanged, `bench_search`
+1-, 2- and 3-ply results bit-identical):
+
+| kernel | before | after | C compiler |
+|---|---|---|---|
+| contact_inputs | 297 | 244 | 181 |
+| contact_net | 386 | 344 | 288 |
+| race_net | 262 | 230 | 196 |
+| contact_single | 374 | 350 | 305 |
+| pruned_contact | 111 | 99 | 88 |
+| pruned_race | 135 | 136 | 117 |
+| pruned_single | 152 | 142 | 126 |
+| pruned_boards | 79 | 69 | 53 |
+| movegen, race_inputs, pruning_inputs, classify | 971, 194, 26, 6 | 985, 198, 27, 5 | 723, 104, 18, 5 |
+
+A micro-benchmark of 16 `sigmoid16` calls on independent vectors: 224 ns before, 115 ns
+after.

@@ -1,7 +1,7 @@
 # 0058: Self-hosted x86-64: AVX-512 compares are expanded to vectors instead of used as k-masks
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (8f61b1f; test 9c83f26)
 - Area: compiler (selfhost: x64 instruction selection, combine)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -84,3 +84,37 @@ About 10 instructions per `sigmoid16` and 4-6 per `half_point_sums_avx512` and
 `compute_occupied_mask`. Estimate: 3-6% of the net kernels, 5-10% of `pruned_*`, a few
 percent of `contact_inputs`; about 30-50 ns summed. It overlaps 0056 in `sigmoid16`: the
 two together take its 55 instructions to about 30.
+
+## Fixed
+
+In 8f61b1f. A vector compare (`icmp`/`fcmp` of 512 bits, or of 128 and 256 with AVX512VL) that is
+read only as a mask is not computed as a vector at all (flag 32): each reader compares
+again into `k1`, which nothing else uses between the compare and the instruction reading
+it. Readers:
+
+- **selects** (`(x & m) | (y & ~m)`): `vpblendm{b,w,d,q} d{k1}, y, x`; or, when one side is
+  an operation only the select reads (`fadd`...`fdiv`, `add`, `sub`; `and`/`or`/`xor` on
+  32-bit lanes), that operation merge-masked into the other side
+  (`vsubps zmm3{k1}, zmm1, zmm3` for `select(x < 0, 1 - c, c)`; with the compare inverted
+  when it is the false side); a zero side is a zero-masked move. A select of a float
+  compare's own operands (`select(a < b, a, b)` and the like, `<` and `>` only) is
+  `vminps`/`vmaxps`, which pick their second operand exactly as the select does for NaN
+  and signed zeros.
+- **ands** of a compare and a value: zero-masked (`vpsubw zmm23{k1}{z}, ...` or
+  `vmovdqu16 zmm{k1}{z}`).
+- **ands of compares** are masked compares (`vpcmpltw k1{k1}, ...`), as a select's mask or
+  an and's.
+- **`(x & y) != 0`, `== 0`** and `x != 0` are `vptestm*`/`vptestnm*` (the `and` not computed);
+  `icmp ugt x, 0` (and `ule`) on vectors becomes `ne` (`eq`) in combine.ax.
+- **`@bitmask`** reads `k1` at 128 and 256 bits too (EVEX compares at every width):
+  `compute_occupied_mask` is `vptestmb k1, xmm, xmm; kmovq` twice.
+
+`vpmovm2*` remains only where a compare's vector is read (or-ed compares in
+`hitting_shots`). Without AVX-512, the sign flip of an unsigned compare's constant operand
+is done at compile time. `tests/lowering/avx512_masks.ax` checks the forms (for both
+compilers); `tests/run/simd_masks.ax` checks values at every x86-64 level.
+
+In `dim128_pair` the 85 `vpmovm2d` and 102 `vpternlogd` are gone; `half_point_sums_avx512`
+has none either.
+
+Measured together with 0056 and 0062: see 0056.
