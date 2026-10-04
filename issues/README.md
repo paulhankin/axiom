@@ -76,3 +76,4 @@ they travel with the code they describe.
 | [0044](0044-global-initializers-and-thread-exit.md) | feature | language, std/thread | Restricted global initializers; no thread-exit cleanup for thread-locals |
 | [0045](0045-closures.md) | feature | language | No closures |
 | [0046](0046-selfhost-wide-vectors.md) | feature | compiler (selfhost) | Self-hosted x86-64 backend: 512-bit vector code is about 10x slower than LLVM's |
+| [0047](0047-wrap-by-default.md) | language change | language, compilers, std | Integer overflow wraps by default, in every build mode |
