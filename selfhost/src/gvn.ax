@@ -3163,7 +3163,10 @@ pub fn split_loops(f: *mut ir.Func) bool {
 // the nearest block dominating all its uses (not into a deeper loop), so
 // the other paths skip it: the shadow stack's slot for the calls of a slow
 // path, values only a trap reports. A load moves into a successor reached
-// only from its block when nothing after it there writes memory.
+// only from its block when nothing after it there writes memory. Where every
+// path from the block reaches the target anyway, an instruction does not
+// move past a call unless its operands are live there regardless (else they,
+// not its result, would be live across the call).
 // -----------------------------------------------------------------------------
 fn lca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
     if u.isnil(a0) {
@@ -3216,6 +3219,99 @@ fn note_use(uses: *mut u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, x: *mu
     }
 }
 
+fn has_call(b: *mut ir.Block) bool {
+    let mut x = b.first;
+    while u.notnil(x) {
+        if x.op == ir.OP_CALL {
+            return true;
+        }
+        x = x.next;
+    }
+    return false;
+}
+
+// Is there a path from blk that skips t: back to blk, or to a return (not
+// to a trap), without passing t? If not, moving an instruction from blk to
+// t saves nothing. (calls: whether the blocks on the way call.)
+fn skips(blk: *mut ir.Block, t: *mut ir.Block, seen: []mut bool, calls: *mut bool) bool {
+    for k in 0..seen.len {
+        seen[k] = false;
+    }
+    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let bt = ir.terminator(blk);
+    for k in 0..ir.succ_count(bt) {
+        work.push(ir.succ(bt, k));
+    }
+    let mut found = false;
+    while (work.len > 0) and not found {
+        let x = work.get(work.len - 1);
+        work.len -= 1;
+        if (x == t) or (x.rpo < 0) or seen[@int_cast(usize, x.rpo)] {
+            continue;
+        }
+        seen[@int_cast(usize, x.rpo)] = true;
+        if x == blk {
+            found = true;
+            break;
+        }
+        let xt = ir.terminator(x);
+        let n = ir.succ_count(xt);
+        if n == 0 {
+            found = u.notnil(xt) and (xt.op != ir.OP_UNREACHABLE);
+            continue;  // (a trap's calls do not count)
+        }
+        if has_call(x) {
+            calls.* = true;
+        }
+        for k in 0..n {
+            work.push(ir.succ(xt, k));
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+    return found;
+}
+
+// Is operand o of i used below t anyway (by something else in a block t
+// dominates), so that it is live into t whether or not i moves there?
+fn used_below(uses: *u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, i: *mut ir.Value, t: *mut ir.Block) bool {
+    if u.isnil(o) or (o.kind != ir.V_INST) {
+        return true;  // (a constant, parameter or global)
+    }
+    if o.aux < 0 {
+        return false;
+    }
+    let us = uses.at(@int_cast(usize, o.aux));
+    for k in 0..us.len {
+        let x = us.get(k);
+        if x == i {
+            continue;
+        }
+        if x.op == ir.OP_PHI {
+            for j in 0..x.xs.len {
+                if (ir.resolve(x.xs.get(j)) == o) and (x.bs.get(j).rpo >= 0) and opt.dominates(t, x.bs.get(j)) {
+                    return true;
+                }
+            }
+        } else if (x.blk.rpo >= 0) and opt.dominates(t, x.blk) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn operands_live_at(uses: *u.List.[u.List.[*mut ir.Value]], i: *mut ir.Value, t: *mut ir.Block) bool {
+    if not used_below(uses, ir.resolve(i.a), i, t) or not used_below(uses, ir.resolve(i.b), i, t) or
+       not used_below(uses, ir.resolve(i.c), i, t) {
+        return false;
+    }
+    for k in 0..i.xs.len {
+        if not used_below(uses, ir.resolve(i.xs.get(k)), i, t) {
+            return false;
+        }
+    }
+    return true;
+}
+
 pub fn sink(f: *mut ir.Func) bool {
     if u.isnil(f.first) {
         return false;
@@ -3252,6 +3348,11 @@ pub fn sink(f: *mut ir.Func) bool {
         }
     }
     // bottom-up: users move before what they use is considered
+    let seen = u.newn.[bool](order.len + 1);
+    let mut last_from = ir.bnil();
+    let mut last_to = ir.bnil();
+    let mut last_skips = false;
+    let mut last_calls = false;
     let mut any = false;
     let mut bi = order.len;
     while bi > 0 {
@@ -3294,6 +3395,23 @@ pub fn sink(f: *mut ir.Func) bool {
                         }
                         if not quiet {
                             t = blk;
+                        }
+                    }
+                    if t != blk {
+                        if (t != last_to) or (blk != last_from) {
+                            last_from = blk;
+                            last_to = t;
+                            last_calls = false;
+                            last_skips = skips(blk, t, seen[0..order.len], &mut last_calls);
+                        }
+                        let mut calls = last_calls;
+                        let mut x = i.next;
+                        while u.notnil(x) and not calls {
+                            calls = x.op == ir.OP_CALL;
+                            x = x.next;
+                        }
+                        if not last_skips and calls and not operands_live_at(&uses, i, t) {
+                            t = blk;  // (its operands would live across calls instead of it)
                         }
                     }
                     if t != blk {

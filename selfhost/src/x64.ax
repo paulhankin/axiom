@@ -6669,8 +6669,32 @@ fn pure_inst(i: *mc.MInst) bool {
     if (op == xe.SHIFT) and (i.ops[2].kind == mc.K_IMM) {
         return true;  // (nothing reads the flags of a constant shift)
     }
+    if (op == xe.ALU) and ((i.cc == 0) or (i.cc == 1) or (i.cc == 4) or (i.cc == 5) or (i.cc == 6)) and
+       (i.ops[0].kind == mc.K_REG) and (i.ops[1].kind != mc.K_MEM) {
+        return flags_dead_after(i);
+    }
     return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.IMUL_I) or
            (op == xe.SETCC);
+}
+
+// Are the flags i sets read by nothing? (Flags are never live into a block;
+// a local label or jump within the block is taken to read them.)
+fn flags_dead_after(i: *mc.MInst) bool {
+    let mut j = i.next;
+    while u.notnil(j) {
+        let op = j.op;
+        if (op == xe.JCC) or (op == xe.CMOV) or (op == xe.SETCC) or (op == xe.JMP) or (op == xe.LABEL) {
+            return false;
+        }
+        if (op == xe.ALU) and ((j.cc == 2) or (j.cc == 3)) {
+            return false;  // (adc, sbb)
+        }
+        if (op == xe.ALU) or (op == xe.TEST) or (op == xe.CMP_M) or (op == xe.CALL) {
+            return true;
+        }
+        j = j.next;
+    }
+    return true;
 }
 
 fn compile_func(f: *mut ir.Func) void {
@@ -6734,7 +6758,8 @@ fn compile_func(f: *mut ir.Func) void {
         } else {
             let m = mc.mem(xe.RBP, -1, 0, soff);
             if c == GPR {
-                _ = e2(xe.LOAD, 8, W(d), m);
+                // (never written: read again from there rather than spilled)
+                mc.set_remat(MF, d, e2(xe.LOAD, 8, W(d), m));
                 soff += 8;
             } else if p.ty.kind == ir.T_VEC {
                 soff = (soff + 15) & ~@as(i64, 15);
@@ -6804,6 +6829,8 @@ fn compile_func(f: *mut ir.Func) void {
     let tgt = mc.Target.{ nclasses: 4, alloc_order: [gorder, xmm_order[..], wide_order, zorder],
                           caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store,
                           spill_move: spill_move, is_label: is_label, fold_remat: fold_remat };
+    let dn = u.env("AXIOM_DEBUG_RA");
+    mc.debug_ra = (dn.len > 0) and (dn.len <= f.name.len) and u.str_eq(f.name[(f.name.len - dn.len)..f.name.len], dn);
     mc.dce(MF, pure_inst);
     fold_remats();
     mc.allocate(MF, &tgt);

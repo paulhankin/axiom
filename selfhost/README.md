@@ -198,7 +198,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `wasm.ax`, `wobj.ax` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
 | `wlink.ax` | The wasm linker: memory layout, function table, exports, shared memory for threads |
 | `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
-| `mach.ax` | Machine IR shared by the native backends, liveness, static block frequencies and linear-scan register allocation with live-range splitting (around calls, at loop and block boundaries) and spilling, redundant reloads and spill stores removed |
+| `mach.ax` | Machine IR shared by the native backends, liveness, static block frequencies, copy coalescing and greedy register allocation (largest intervals first, evicting cheaper ones) with live-range splitting (around calls, at loop and block boundaries; reloads placed where the value is next used) and spilling, redundant reloads and spill stores removed (`AXIOM_DEBUG_RA=<function name suffix>` prints the allocator's decisions for x86-64) |
 | `x64.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |

@@ -6,14 +6,16 @@
 // register operand says whether it is read, written or both. Registers
 // below VREG0 are physical (target numbering), the rest virtual.
 //
-// Register allocation is linear scan over live intervals (one interval per
-// virtual register: the positions where it is live, with holes; positions
-// are 2i for instruction i's reads and 2i+1 for its writes). Physical registers
-// used explicitly (argument and result registers, division, shifts) and
-// registers clobbered by calls are fixed ranges an interval must avoid.
-// When registers run out, the interval with the lowest spill weight (uses,
-// weighted by the estimated frequency of their blocks, per position covered)
-// loses its register and is split (see split): it goes to a stack slot across
+// Register allocation works on live intervals (one interval per virtual
+// register: the positions where it is live, with holes; positions are 2i for
+// instruction i's reads and 2i+1 for its writes), after copies between them
+// are coalesced. Physical registers used explicitly (argument and result
+// registers, division, shifts) and registers clobbered by calls are fixed
+// ranges an interval must avoid. Intervals are assigned greedily, largest
+// first; one that finds no free register takes one from intervals of lower
+// spill weight (uses, weighted by the estimated frequency of their blocks,
+// per position covered), which are queued again, or else it is spilled: it
+// is split (see split): it goes to a stack slot across
 // the calls it is live over and along loop boundaries, and each stretch in
 // between becomes a new vreg; pieces that lose again are split at every block
 // boundary, and those are finally spilled everywhere, their uses and
@@ -917,7 +919,6 @@ struct Interval {
     spilled: bool,
     uses: f64,               // uses and definitions, weighted by 10^loop depth
     ranges: u.List.[Range],  // the positions it is live at: sorted, disjoint, inclusive
-    cur: usize,              // scan cursor into ranges
     size: i32,               // positions covered
 }
 
@@ -971,7 +972,7 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
     let iv = u.newn.[Interval](nv + 1);
     for k in 0..nv {
         iv[k] = Interval.{ v: @int_cast(i32, k), s: 0x7fff_ffff, e: -1, reg: -1, spilled: false, uses: 0.0,
-                           ranges: u.List.[Range].{ data: u.nil.[Range](), len: 0, cap: 0 }, cur: 0, size: 0 };
+                           ranges: u.List.[Range].{ data: u.nil.[Range](), len: 0, cap: 0 }, size: 0 };
     }
     let w = words(nv);
     let live = u.newn.[u64](w + 1);
@@ -1054,35 +1055,9 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
     return iv[0..nv];
 }
 
-// Does x cover position p? (p never decreases between calls: a cursor.)
-fn covers(x: *mut Interval, p: i32) bool {
-    while (x.cur < x.ranges.len) and (x.ranges.get(x.cur).e < p) {
-        x.cur += 1;
-    }
-    return (x.cur < x.ranges.len) and (x.ranges.get(x.cur).s <= p);
-}
-
-// Do a and b overlap anywhere?
-fn intersects(a: *Interval, b: *Interval) bool {
-    let mut i = a.cur;  // the ranges before the cursors end before the current position
-    let mut j = b.cur;
-    while (i < a.ranges.len) and (j < b.ranges.len) {
-        let x = a.ranges.get(i);
-        let y = b.ranges.get(j);
-        if x.e < y.s {
-            i += 1;
-        } else if y.e < x.s {
-            j += 1;
-        } else {
-            return true;
-        }
-    }
-    return false;
-}
-
 // Does a fixed range of r overlap x?
 fn fixed_hits(r: i32, x: *Interval) bool {
-    for k in x.cur..x.ranges.len {
+    for k in 0..x.ranges.len {
         let y = x.ranges.get(k);
         if fixed_conflict(r, y.s, y.e) {
             return true;
@@ -1091,108 +1066,167 @@ fn fixed_hits(r: i32, x: *Interval) bool {
     return false;
 }
 
-fn sort_by_start(xs: []mut *mut Interval) void {
-    // merge sort by start (stable)
-    let n = xs.len;
-    if n < 2 {
-        return;
-    }
-    let tmp = u.newn.[*mut Interval](n);
-    let mut width: usize = 1;
-    while width < n {
-        let mut i: usize = 0;
-        while i < n {
-            let mid = min(i + width, n);
-            let hi = min(i + (2 * width), n);
-            let mut a = i;
-            let mut b = mid;
-            let mut k = i;
-            while k < hi {
-                if (a < mid) and ((b >= hi) or (xs[a].s <= xs[b].s)) {
-                    tmp[k] = xs[a];
-                    a += 1;
-                } else {
-                    tmp[k] = xs[b];
-                    b += 1;
-                }
-                k += 1;
-            }
-            i += 2 * width;
-        }
-        for k in 0..n {
-            xs[k] = tmp[k];
-        }
-        width *= 2;
-    }
+// -----------------------------------------------------------------------------
+// One allocation round, greedily: intervals in order of size (largest
+// first: the hardest to place), each into a free register (its hint's
+// first), else into the register whose interfering intervals cost least
+// to spill, when all of them cost less than it (they are taken out and
+// queued again), else spilled. Unlike a linear scan, an interval is weighed
+// against everything it overlaps, not only what is live where it starts.
+// Each physical register keeps the segments assigned to it (disjoint, in
+// order). Returns the number of intervals spilled.
+// -----------------------------------------------------------------------------
+struct Seg {
+    s: i32,
+    e: i32,
+    x: i32,  // interval index
 }
 
-fn min(a: usize, b: usize) usize {
-    if a < b {
-        return a;
+// the first segment ending at or after p
+fn seg_first(l: *u.List.[Seg], p: i32) usize {
+    let mut lo: usize = 0;
+    let mut hi = l.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if l.get(mid).e < p {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    return b;
+    return lo;
 }
 
-fn drop_at(l: *mut u.List.[*mut Interval], k: usize) void {
-    l.set(k, l.get(l.len - 1));
+fn seg_insert(l: *mut u.List.[Seg], sg: Seg) void {
+    let k = seg_first(l, sg.s);
+    l.push(sg);
+    let mut j = l.len - 1;
+    while j > k {
+        l.set(j, l.get(j - 1));
+        j -= 1;
+    }
+    l.set(k, sg);
+}
+
+fn seg_remove(l: *mut u.List.[Seg], s: i32) void {
+    let k = seg_first(l, s);
+    for j in k..(l.len - 1) {
+        l.set(j, l.get(j + 1));
+    }
     l.len -= 1;
 }
 
-// One allocation round (linear scan with lifetime holes: an interval in a
-// hole is inactive and leaves its register to intervals that fit in the
-// hole). Returns the number of intervals spilled.
-fn scan(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
-    let mut list = u.List.[*mut Interval].{ data: u.nil.[*mut Interval](), len: 0, cap: 0 };
-    for k in 0..iv.len {
-        if iv[k].e >= 0 {
-            list.push(&mut iv[k]);
+fn reg_free(l: *u.List.[Seg], x: *Interval) bool {
+    for j in 0..x.ranges.len {
+        let rg = x.ranges.get(j);
+        let k = seg_first(l, rg.s);
+        if (k < l.len) and (l.get(k).s <= rg.e) {
+            return false;
         }
     }
-    let xs = list.items();
-    sort_by_start(xs);
-    let mut active = u.List.[*mut Interval].{ data: u.nil.[*mut Interval](), len: 0, cap: 0 };
-    let mut inactive = u.List.[*mut Interval].{ data: u.nil.[*mut Interval](), len: 0, cap: 0 };
+    return true;
+}
+
+// max-heap of interval indexes by key
+fn heap_push(h: *mut u.List.[i32], key: []f64, x: i32) void {
+    h.push(x);
+    let mut k = h.len - 1;
+    while k > 0 {
+        let p = (k - 1) / 2;
+        let a = h.get(p);
+        if (key[@int_cast(usize, a)] > key[@int_cast(usize, x)]) or
+           ((key[@int_cast(usize, a)] == key[@int_cast(usize, x)]) and (a < x)) {
+            break;
+        }
+        h.set(k, a);
+        k = p;
+    }
+    h.set(k, x);
+}
+
+fn heap_pop(h: *mut u.List.[i32], key: []f64) i32 {
+    let top = h.get(0);
+    let x = h.get(h.len - 1);
+    h.len -= 1;
+    let n = h.len;
+    if n == 0 {
+        return top;
+    }
+    let mut k: usize = 0;
+    loop {
+        let mut c = (2 * k) + 1;
+        if c >= n {
+            break;
+        }
+        let r = c + 1;
+        if r < n {
+            let a = h.get(c);
+            let b = h.get(r);
+            if (key[@int_cast(usize, b)] > key[@int_cast(usize, a)]) or
+               ((key[@int_cast(usize, b)] == key[@int_cast(usize, a)]) and (b < a)) {
+                c = r;
+            }
+        }
+        let y = h.get(c);
+        if (key[@int_cast(usize, x)] > key[@int_cast(usize, y)]) or
+           ((key[@int_cast(usize, x)] == key[@int_cast(usize, y)]) and (x < y)) {
+            break;
+        }
+        h.set(k, y);
+        k = c;
+    }
+    h.set(k, x);
+    return top;
+}
+
+pub let mut debug_ra: bool = false;
+
+fn assign_reg(segs: []mut u.List.[Seg], x: *mut Interval, xi: i32, r: i32) void {
+    if debug_ra {
+        u.eprint(u.f2("  v%s -> r%s\n", u.idec(xi), u.idec(r)));
+    }
+    x.reg = r;
+    for j in 0..x.ranges.len {
+        let rg = x.ranges.get(j);
+        seg_insert(&mut segs[@int_cast(usize, r)], Seg.{ s: rg.s, e: rg.e, x: xi });
+    }
+}
+
+fn unassign_reg(segs: []mut u.List.[Seg], x: *mut Interval) void {
+    let r = x.reg;
+    for j in 0..x.ranges.len {
+        seg_remove(&mut segs[@int_cast(usize, r)], x.ranges.get(j).s);
+    }
+    x.reg = -1;
+}
+
+fn greedy(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
+    let n = iv.len;
+    let key = u.newn.[f64](n + 1);
+    let wt = u.newn.[f64](n + 1);
+    let mut heap = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    for k in 0..n {
+        wt[k] = weight(f, &iv[k]);
+        key[k] = @float_from_int(f64, iv[k].size);
+        if f.nospill.get(@int_cast(usize, iv[k].v)) {
+            key[k] = 1.0e300;
+        }
+        if iv[k].e >= 0 {
+            heap_push(&mut heap, key[0..n], @int_cast(i32, k));
+        }
+    }
+    let segs = u.newn.[u.List.[Seg]](64);
+    for r in @as(usize, 0)..64 {
+        segs[r] = u.List.[Seg].{ data: u.nil.[Seg](), len: 0, cap: 0 };
+    }
+    let mut vict = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
     let mut nspill: usize = 0;
-    for ci in 0..xs.len {
-        let cur = xs[ci];
-        let pos = cur.s;
-        let mut k: usize = 0;
-        while k < active.len {
-            let a = active.get(k);
-            if a.e < pos {
-                drop_at(&mut active, k);
-            } else if not covers(a, pos) {
-                inactive.push(a);
-                drop_at(&mut active, k);
-            } else {
-                k += 1;
-            }
-        }
-        k = 0;
-        while k < inactive.len {
-            let a = inactive.get(k);
-            if a.e < pos {
-                drop_at(&mut inactive, k);
-            } else if covers(a, pos) {
-                active.push(a);
-                drop_at(&mut inactive, k);
-            } else {
-                k += 1;
-            }
-        }
+    let mut evictions: usize = 0;
+    while heap.len > 0 {
+        let ci = heap_pop(&mut heap, key[0..n]);
+        let cur = &mut iv[@int_cast(usize, ci)];
         let class = f.vclass.get(@int_cast(usize, cur.v));
         let order = t.alloc_order[@as(usize, class)];
-        // registers taken for (part of) cur's life
-        let mut taken: [64]bool = [false; 64];
-        for j in 0..active.len {
-            taken[@int_cast(usize, active.get(j).reg)] = true;
-        }
-        for j in 0..inactive.len {
-            let a = inactive.get(j);
-            if not taken[@int_cast(usize, a.reg)] and intersects(a, cur) {
-                taken[@int_cast(usize, a.reg)] = true;
-            }
-        }
         let mut pick: i32 = -1;
         // the hint first
         let h = f.hint.get(@int_cast(usize, cur.v));
@@ -1202,87 +1236,112 @@ fn scan(f: *mut MFunc, t: *Target, iv: []mut Interval) usize {
         } else if is_vreg(h) and (iv[@int_cast(usize, h - VREG0)].reg >= 0) {
             hr = iv[@int_cast(usize, h - VREG0)].reg;
         }
-        if (hr >= 0) and in_order(order, hr) and not taken[@int_cast(usize, hr)] and not fixed_hits(hr, cur) {
+        if (hr >= 0) and in_order(order, hr) and reg_free(&segs[@int_cast(usize, hr)], cur) and
+           not fixed_hits(hr, cur) {
             pick = hr;
         }
         if pick < 0 {
             for r in order {
-                if not taken[@int_cast(usize, r)] and not fixed_hits(r, cur) {
+                if reg_free(&segs[@int_cast(usize, r)], cur) and not fixed_hits(r, cur) {
                     pick = r;
                     break;
                 }
             }
         }
-        if pick < 0 {
-            // free a register: the one whose intervals overlapping cur cost
-            // least to spill (if less than spilling cur, or cur must not spill)
-            let mut best: i32 = -1;
-            let mut bw: f64 = 0.0;
+        if pick >= 0 {
+            assign_reg(segs, cur, ci, pick);
+            continue;
+        }
+        // evict: the register whose interfering intervals cost least (the
+        // dearest of them, then all together), if less than cur
+        let must = f.nospill.get(@int_cast(usize, cur.v));
+        let wc = wt[@int_cast(usize, ci)];
+        let mut best: i32 = -1;
+        let mut bmax: f64 = 0.0;
+        let mut bsum: f64 = 0.0;
+        if evictions <= ((8 * n) + 100) {
             for r in order {
                 if fixed_hits(r, cur) {
                     continue;
                 }
-                let mut w: f64 = 0.0;
-                for j in 0..active.len {
-                    let a = active.get(j);
-                    if a.reg == r {
-                        w += weight(f, a);
+                let l = &segs[@int_cast(usize, r)];
+                let mut mx: f64 = 0.0;
+                let mut sum: f64 = 0.0;
+                let mut last: i32 = -1;
+                let mut ok = true;
+                for j in 0..cur.ranges.len {
+                    let rg = cur.ranges.get(j);
+                    let mut k = seg_first(l, rg.s);
+                    while ok and (k < l.len) and (l.get(k).s <= rg.e) {
+                        let x = l.get(k).x;
+                        if x != last {
+                            let w = wt[@int_cast(usize, x)];
+                            if f.nospill.get(@int_cast(usize, iv[@int_cast(usize, x)].v)) or not (must or (w < wc)) {
+                                ok = false;
+                            }
+                            if w > mx {
+                                mx = w;
+                            }
+                            sum += w;  // (an interval met twice counts twice: a rough sum)
+                            last = x;
+                        }
+                        k += 1;
                     }
                 }
-                for j in 0..inactive.len {
-                    let a = inactive.get(j);
-                    if (a.reg == r) and intersects(a, cur) {
-                        w += weight(f, a);
-                    }
-                }
-                if (best < 0) or (w < bw) {
+                if ok and ((best < 0) or (mx < bmax) or ((mx == bmax) and (sum < bsum))) {
                     best = r;
-                    bw = w;
+                    bmax = mx;
+                    bsum = sum;
                 }
-            }
-            let must = f.nospill.get(@int_cast(usize, cur.v));
-            if (best >= 0) and ((bw < weight(f, cur)) or must) and (bw < 1.0e299) {
-                pick = best;
-                k = 0;
-                while k < active.len {
-                    let a = active.get(k);
-                    if a.reg == pick {
-                        a.spilled = true;
-                        a.reg = -1;
-                        nspill += 1;
-                        drop_at(&mut active, k);
-                    } else {
-                        k += 1;
-                    }
-                }
-                k = 0;
-                while k < inactive.len {
-                    let a = inactive.get(k);
-                    if (a.reg == pick) and intersects(a, cur) {
-                        a.spilled = true;
-                        a.reg = -1;
-                        nspill += 1;
-                        drop_at(&mut inactive, k);
-                    } else {
-                        k += 1;
-                    }
-                }
-            } else {
-                if must {
-                    u.die("internal compiler error: register allocation failed (no register for a reload)");
-                }
-                cur.spilled = true;
-                nspill += 1;
-                continue;
             }
         }
-        cur.reg = pick;
-        active.push(cur);
+        if best < 0 {
+            if debug_ra {
+                u.eprint(u.f1("  v%s spilled\n", u.idec(ci)));
+            }
+            if must {
+                u.die("internal compiler error: register allocation failed (no register for a reload)");
+            }
+            cur.spilled = true;
+            nspill += 1;
+            continue;
+        }
+        let l = &segs[@int_cast(usize, best)];
+        vict.clear();
+        for j in 0..cur.ranges.len {
+            let rg = cur.ranges.get(j);
+            let mut k = seg_first(l, rg.s);
+            while (k < l.len) and (l.get(k).s <= rg.e) {
+                let x = l.get(k).x;
+                let mut seen = false;
+                for q in 0..vict.len {
+                    if vict.get(q) == x {
+                        seen = true;
+                    }
+                }
+                if not seen {
+                    vict.push(x);
+                }
+                k += 1;
+            }
+        }
+        for q in 0..vict.len {
+            let x = vict.get(q);
+            if debug_ra {
+                u.eprint(u.f2("  v%s evicts v%s\n", u.idec(ci), u.idec(x)));
+            }
+            unassign_reg(segs, &mut iv[@int_cast(usize, x)]);
+            heap_push(&mut heap, key[0..n], x);
+            evictions += 1;
+        }
+        assign_reg(segs, cur, ci, best);
     }
-    u.free(@ptr_cast(*mut void, list.data));
-    u.free(@ptr_cast(*mut void, active.data));
-    u.free(@ptr_cast(*mut void, inactive.data));
-    for k in 0..iv.len {
+    for r in @as(usize, 0)..64 {
+        u.free(@ptr_cast(*mut void, segs[r].data));
+    }
+    u.free(@ptr_cast(*mut void, heap.data));
+    u.free(@ptr_cast(*mut void, vict.data));
+    for k in 0..n {
         u.free(@ptr_cast(*mut void, iv[k].ranges.data));
     }
     return nspill;
@@ -1616,6 +1675,37 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u
     for bi in 0..nb {
         let tl = @int_cast(usize, tail[bi]);
         memtail[bi] = (tail[bi] != head[bi]) and not occ.get(tl);
+    }
+    // blocks that neither use it nor call, entered only from where it is in
+    // memory (after a call it is not used after, or another such block),
+    // leave it there: reloaded where it is used next, past joins of such
+    // paths, not where it was last in memory
+    let memthru = u.newn.[bool](nb + 1);
+    for bi in 0..nb {
+        memthru[bi] = (bi > 0) and (tail[bi] == head[bi]) and not occ.get(@int_cast(usize, head[bi])) and
+                      bget(f.blocks.get(bi).live_in, x);
+    }
+    let mut mchanged = true;
+    while mchanged {
+        mchanged = false;
+        for pi in 0..nb {
+            if memtail[pi] or memthru[pi] {
+                continue;
+            }
+            let pb = f.blocks.get(pi);
+            for k in 0..pb.succs.len {
+                let si = @int_cast(usize, pb.succs.get(k));
+                if memthru[si] {
+                    memthru[si] = false;
+                    mchanged = true;
+                }
+            }
+        }
+    }
+    for bi in 0..nb {
+        if memthru[bi] {
+            memtail[bi] = true;
+        }
     }
     for si in 0..nb {
         allin[si] = true;
@@ -2267,18 +2357,257 @@ fn drop_dead_reloads(f: *mut MFunc) void {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Coalescing (before allocation): the two sides of a copy between virtual
+// registers of a class become one register, and the copy goes, where their
+// lives do not overlap, or where they are the same value (the copy is the
+// destination's only definition, the source has one, and the destination
+// is not live where the source is defined). Hottest copies first. Linear
+// scan's hints alone depend on the order intervals start in; pieces split
+// apart later are copies again.
+// -----------------------------------------------------------------------------
+struct CopyAt {
+    i: *mut MInst,
+    fq: f64,
+}
+
+fn hotter(a: CopyAt, b: CopyAt) i32 {
+    if a.fq > b.fq {
+        return -1;
+    }
+    if a.fq < b.fq {
+        return 1;
+    }
+    return 0;
+}
+
+fn ranges_meet(a: *u.List.[Range], b: *u.List.[Range]) bool {
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    while (i < a.len) and (j < b.len) {
+        let x = a.get(i);
+        let y = b.get(j);
+        if x.e < y.s {
+            i += 1;
+        } else if y.e < x.s {
+            j += 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn ranges_cover(a: *u.List.[Range], p: i32) bool {
+    for k in 0..a.len {
+        let x = a.get(k);
+        if (x.s <= p) and (p <= x.e) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// a's ranges and b's, merged (sorted, adjacent and overlapping ones joined)
+fn ranges_union(a: *u.List.[Range], b: *u.List.[Range]) u.List.[Range] {
+    let mut out = u.List.[Range].{ data: u.nil.[Range](), len: 0, cap: 0 };
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    while (i < a.len) or (j < b.len) {
+        let mut r = Range.{ s: 0, e: 0 };
+        if (j >= b.len) or ((i < a.len) and (a.get(i).s <= b.get(j).s)) {
+            r = a.get(i);
+            i += 1;
+        } else {
+            r = b.get(j);
+            j += 1;
+        }
+        if (out.len > 0) and (r.s <= (out.get(out.len - 1).e + 1)) {
+            let l = out.at(out.len - 1);
+            if r.e > l.e {
+                l.e = r.e;
+            }
+        } else {
+            out.push(r);
+        }
+    }
+    return out;
+}
+
+fn rep_of(rep: []mut i32, x: i32) i32 {
+    let mut r = x;
+    while rep[@int_cast(usize, r)] != r {
+        r = rep[@int_cast(usize, r)];
+    }
+    let mut y = x;
+    while rep[@int_cast(usize, y)] != r {
+        let n = rep[@int_cast(usize, y)];
+        rep[@int_cast(usize, y)] = r;
+        y = n;
+    }
+    return r;
+}
+
+fn coalesce(f: *mut MFunc) void {
+    liveness(f);
+    number(f);
+    let iv = build_intervals(f);
+    let nv = iv.len;
+    let rep = u.newn.[i32](nv + 1);
+    let ndef = u.newn.[i32](nv + 1);
+    let dpos = u.newn.[i32](nv + 1);  // (a definition's position)
+    for k in 0..nv {
+        rep[k] = @int_cast(i32, k);
+        ndef[k] = 0;
+        dpos[k] = -1;
+    }
+    let mut copies = u.List.[CopyAt].{ data: u.nil.[CopyAt](), len: 0, cap: 0 };
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        let mut i = b.first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RD) != 0) {
+                    let x = @int_cast(usize, o.reg - VREG0);
+                    if dpos[x] != i.pos {
+                        ndef[x] += 1;
+                    }
+                    dpos[x] = i.pos;
+                }
+            }
+            if i.is_move {
+                let d = move_dst(i);
+                let sr = move_src(i);
+                if is_vreg(d) and is_vreg(sr) and (d != sr) and
+                   (f.vclass.get(@int_cast(usize, d - VREG0)) == f.vclass.get(@int_cast(usize, sr - VREG0))) {
+                    copies.push(CopyAt.{ i: i, fq: b.freq });
+                }
+            }
+            i = i.next;
+        }
+    }
+    u.sort(copies.items(), hotter);
+    let mut merged = false;
+    for ci in 0..copies.len {
+        let i = copies.get(ci).i;
+        let a = rep_of(rep, move_src(i) - VREG0);
+        let b = rep_of(rep, move_dst(i) - VREG0);
+        if a == b {
+            continue;
+        }
+        let ax = @int_cast(usize, a);
+        let bx = @int_cast(usize, b);
+        if f.nospill.get(ax) or f.nospill.get(bx) {
+            continue;
+        }
+        let mut ok = not ranges_meet(&iv[ax].ranges, &iv[bx].ranges);
+        if not ok and (ndef[bx] == 1) and (dpos[bx] == i.pos) and (ndef[ax] == 1) {
+            ok = not ranges_cover(&iv[bx].ranges, (2 * dpos[ax]) + 1);
+        }
+        if not ok {
+            continue;
+        }
+        // b joins a; the copy defined b
+        if debug_ra {
+            u.eprint(u.f4("merge v%s v%s (%s %s)\n", u.idec(a), u.idec(b), u.idec(iv[ax].size), u.idec(iv[bx].size)));
+        }
+        let un = ranges_union(&iv[ax].ranges, &iv[bx].ranges);
+        u.free(@ptr_cast(*mut void, iv[ax].ranges.data));
+        u.free(@ptr_cast(*mut void, iv[bx].ranges.data));
+        iv[ax].ranges = un;
+        iv[bx].ranges = u.List.[Range].{ data: u.nil.[Range](), len: 0, cap: 0 };
+        let nd = (ndef[ax] + ndef[bx]) - 1;
+        let mut rm = u.nil.[MInst]();
+        if (nd == 1) and (ndef[ax] == 1) {
+            rm = f.remat.get(ax);
+        } else if (nd == 1) and (ndef[bx] == 2) {
+            rm = f.remat.get(bx);  // (the other definition)
+            dpos[ax] = -1;
+            if u.notnil(rm) {
+                dpos[ax] = rm.pos;
+            }
+        }
+        f.remat.set(ax, rm);
+        ndef[ax] = nd;
+        if (f.hint.get(ax) < 0) or (is_vreg(f.hint.get(ax)) and not is_vreg(f.hint.get(bx)) and (f.hint.get(bx) >= 0)) {
+            f.hint.set(ax, f.hint.get(bx));
+        }
+        rep[bx] = a;
+        merged = true;
+    }
+    if merged {
+        for bi in 0..f.blocks.len {
+            let b = f.blocks.get(bi);
+            let mut i = b.first;
+            while u.notnil(i) {
+                let next = i.next;
+                for k in 0..i.ops.len {
+                    let o = &mut i.ops[k];
+                    if (o.kind == K_REG) and is_vreg(o.reg) {
+                        o.reg = VREG0 + rep_of(rep, o.reg - VREG0);
+                    }
+                    if o.kind == K_MEM {
+                        if is_vreg(o.base) {
+                            o.base = VREG0 + rep_of(rep, o.base - VREG0);
+                        }
+                        if is_vreg(o.index) {
+                            o.index = VREG0 + rep_of(rep, o.index - VREG0);
+                        }
+                    }
+                }
+                if i.is_move and (move_dst(i) == move_src(i)) {
+                    remove(b, i);
+                }
+                i = next;
+            }
+        }
+        // hints naming a merged register name its representative
+        for k in 0..nv {
+            let h = f.hint.get(k);
+            if is_vreg(h) and (@int_cast(usize, h - VREG0) < nv) {
+                let r = VREG0 + rep_of(rep, h - VREG0);
+                if r == (VREG0 + @int_cast(i32, k)) {
+                    f.hint.set(k, -1);
+                } else {
+                    f.hint.set(k, r);
+                }
+            }
+        }
+    }
+    for k in 0..nv {
+        u.free(@ptr_cast(*mut void, iv[k].ranges.data));
+    }
+    u.free(@ptr_cast(*mut void, copies.data));
+}
+
 // Allocates registers; afterwards f.assign maps every vreg to a physical
 // register.
 pub fn allocate(f: *mut MFunc, t: *Target) void {
     let mut rounds: i32 = 0;
     block_freqs(f);
+    coalesce(f);
     loop {
         liveness(f);
         drop_dead_reloads(f);
         number(f);
         build_fixed(f);
         let iv = build_intervals(f);
-        let ns = scan(f, t, iv);
+        if debug_ra {
+            for k in 0..iv.len {
+                let x = &iv[k];
+                if x.e >= 0 {
+                    u.eprint(u.f6("v%s c%s l%s s%s w%s [%s", u.zdec(k), u.idec(@as(i32, f.vclass.get(k))),
+                                  u.idec(@as(i32, f.level.get(k))), u.idec(x.size),
+                                  u.dec(@int_from_float(i64, weight(f, x) * 1000000.0)), u.idec(x.s)));
+                    u.eprint(u.f2(",%s] h%s\n", u.idec(x.e), u.idec(f.hint.get(k))));
+                }
+            }
+        }
+        let ns = greedy(f, t, iv);
+        if debug_ra {
+            u.eprint(u.f1("round %s\n", u.idec(rounds)));
+        }
         rounds += 1;
         if ns == 0 {
             let nv = iv.len;
