@@ -494,6 +494,23 @@ fn pure_intr(id: i32) bool {
            (id != ir.IN_XGETBV) and (id != ir.IN_LOAD_PARTIAL) and (id != ir.IN_STORE_PARTIAL);
 }
 
+// x86-64's masked vector loads and stores (codegen.ax makes them for
+// @load_partial and @store_partial): memory accesses at their pointer, of at
+// most the vector's size.
+fn intr_id(i: *ir.Value) i32 {
+    if i.op != ir.OP_INTR {
+        return 0;
+    }
+    return @truncate(i32, @bit_cast(i64, i.cv));
+}
+
+fn partial_loc(i: *ir.Value) Loc {
+    if intr_id(i) == ir.IN_LOAD_PARTIAL {
+        return loc_of(i.xs.get(0), @bit_cast(i64, i.ty.size));
+    }
+    return loc_of(i.xs.get(1), @bit_cast(i64, i.xs.get(0).ty.size));
+}
+
 fn cse_able(i: *ir.Value) bool {
     let op = i.op;
     if ((op >= ir.OP_ADD) and (op <= ir.OP_FPTOUI_SAT)) or (op == ir.OP_PTRADD) {
@@ -535,7 +552,9 @@ fn note_writes(i: *mut ir.Value) void {
         push_write(W_ALL, nowhere());
     } else if (op == ir.OP_LOAD) and (i.flags != 0) {
         push_write(W_ALL, nowhere());
-    } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
+    } else if intr_id(i) == ir.IN_STORE_PARTIAL {
+        push_write(W_LOC, partial_loc(i));
+    } else if (op == ir.OP_INTR) and not pure_intr(intr_id(i)) and (intr_id(i) != ir.IN_LOAD_PARTIAL) {
         push_write(W_ALL, nowhere());
     }
 }
@@ -1506,6 +1525,17 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             killed.clear();
             at_ret = false;
             ss_reads();
+        } else if intr_id(i) == ir.IN_LOAD_PARTIAL {
+            let l = partial_loc(i);
+            read_loc(killed, &l);
+            if noalias_global(l.obj) and (ss_field(&l) != 0) {
+                ss_reads();
+            }
+            if u.notnil(l.obj) {
+                read_objs.push(l.obj);
+            }
+        } else if intr_id(i) == ir.IN_STORE_PARTIAL {
+            // (writes part of its location: nothing it makes dead, nothing it reads)
         } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
             killed.clear();
             at_ret = false;
@@ -1562,6 +1592,13 @@ fn ss_reader(i: *mut ir.Value, depth: bool) bool {
     let op = i.op;
     if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
         return true;
+    }
+    if intr_id(i) == ir.IN_LOAD_PARTIAL {
+        let l = partial_loc(i);
+        return noalias_global(l.obj);
+    }
+    if intr_id(i) == ir.IN_STORE_PARTIAL {
+        return false;
     }
     if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
         return true;
@@ -2693,7 +2730,8 @@ fn writes_mem(x: *ir.Value) bool {
     let op = x.op;
     return (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
            (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
-           ((op == ir.OP_INTR) and not cse_able(x)) or ((op == ir.OP_LOAD) and (x.flags != 0));
+           ((op == ir.OP_INTR) and not cse_able(x) and (intr_id(x) != ir.IN_LOAD_PARTIAL)) or
+           ((op == ir.OP_LOAD) and (x.flags != 0));
 }
 
 // The blocks using v: their common dominator (nil: no uses).
