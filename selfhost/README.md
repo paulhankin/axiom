@@ -174,7 +174,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | Module | What |
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
-| `codegen.ax` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces, each instruction's source line) |
+| `codegen.ax` | The checked program to IR (monomorphization, traps, stack traces: each call's site record, or the shadow stack, each instruction's source line) |
 | `vsplit.ax` | 256- and 512-bit vector instructions the target cannot compute at that width become instructions on halves (down to 128 bits, which every target has): lane-wise operations piece by piece, the rest combined (reductions per piece and across them, a swizzle per table piece, shuffles of the pieces they read). Where a kept instruction meets split values, or the reverse, the pieces are joined or taken apart with shuffles a wide target selects as `vinserti128`/`vextracti128` (`*64x4` for 512 bits) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer to a copy the callee only reads, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
@@ -188,6 +188,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own |
 | `wasm.ax`, `wobj.ax` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
 | `wlink.ax` | The wasm linker: memory layout, function table, exports, shared memory for threads |
+| `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
 | `mach.ax` | Machine IR shared by the native backends, liveness and linear-scan register allocation with spilling, redundant reloads and spill stores removed |
 | `x64.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
@@ -273,7 +274,19 @@ If-conversion keeps a branch when the chosen value goes into the address of
 a load (a heap or tree walk), where a predicted branch lets the load start
 early.
 
-The shadow stack for stack traces is ordinary memory to the optimizer, with
+Native code keeps stack traces without the shadow stack's call records (spec
+§17.4.1, "Frame tables"): every function that makes a call keeps a frame
+pointer, each call carries its chain of site records (`ir.Chain`: its own,
+then those of the calls inlined around it, which the inliner appends as it
+inlines), and the backends follow each call with an entry in the section
+`axiom_rets` (`ftab.ax`) that the linkers place together. A trap
+(`axiom.trap` calls the runtime's `ax_stack_walk` with its own frame) or a
+crash (from the signal's context) walks the frame pointers and fills the
+thread's shadow stack as the calls would have (`runtime/trap_format.ax`,
+`walk_frames`). Profile builds, `--sanitize=address` and WebAssembly keep
+the shadow stack.
+
+There, the shadow stack for stack traces is ordinary memory to the optimizer, with
 two facts it may use: the program never computes a pointer to it, and every
 call leaves its depth as it found it. A call site's record is written just
 before the calls and traps that can read it, so the common path of an

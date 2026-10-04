@@ -29,7 +29,8 @@ const C_DATA: i32 = 2;
 const C_TDATA: i32 = 3;
 const C_TBSS: i32 = 4;
 const C_BSS: i32 = 5;
-const N_CLASSES: usize = 6;
+const C_RETS: i32 = 6;  // frame tables (elf.rets_rank), after .rodata
+const N_CLASSES: usize = 7;
 
 const BASE: u64 = 0x400000;
 const PAGE: u64 = 0x10000;
@@ -107,6 +108,9 @@ fn align_up(x: u64, a: u64) u64 {
 }
 
 fn sec_class(s: *elf.Sec) i32 {
+    if elf.rets_rank(s) >= 0 {
+        return C_RETS;
+    }
     if s.kind == elf.S_TEXT {
         return C_TEXT;
     }
@@ -700,16 +704,22 @@ fn file_of(addr: u64) u64 {
 // Places the sections of class `cls` from address `at`; returns the end.
 fn place(cls: i32, at: u64) u64 {
     let mut cur = at;
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            let s = o.secs.get(k);
-            if sec_class(s) != cls {
-                continue;
+    let mut passes: i32 = 1;
+    if cls == C_RETS {
+        passes = 3;  // the start, the tables, the end
+    }
+    for pass in 0..passes {
+        for oi in 0..objs.len {
+            let o = objs.get(oi);
+            for k in 0..o.secs.len {
+                let s = o.secs.get(k);
+                if (sec_class(s) != cls) or ((cls == C_RETS) and (elf.rets_rank(s) != pass)) {
+                    continue;
+                }
+                cur = align_up(cur, s.align);
+                sec_addr.get(oi)[k] = cur;
+                cur += elf.sec_size(s);
             }
-            cur = align_up(cur, s.align);
-            sec_addr.get(oi)[k] = cur;
-            cur += elf.sec_size(s);
         }
     }
     return cur;
@@ -883,6 +893,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     }
     static_link = needs_nothing(lib_names);
     objs.push(lstub.build(machine, static_link));
+    objs.push(elf.rets_bounds(machine));
     if not static_link {
         let libc = add_lib("libc.so.6", "libc.so.6");
         let libm = add_lib("libm.so.6", "libm.so.6");
@@ -1034,7 +1045,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     let rela_off = align_up(verneed_off + verneed_size, 8);
     let rela_size = (n_rela + n_got_dyn) * 24;
     segs[0] = Seg.{ vaddr: BASE, off: 0, filesz: 0, memsz: 0 };
-    let ro_end = place(C_RODATA, BASE + rela_off + rela_size);
+    let ro_end = place(C_RETS, place(C_RODATA, BASE + rela_off + rela_size));
     segs[0].filesz = ro_end - BASE;
     segs[0].memsz = segs[0].filesz;
 
@@ -1092,6 +1103,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
 
     // contents
     copy_class(b, C_RODATA);
+    copy_class(b, C_RETS);
     copy_class(b, C_TEXT);
     copy_class(b, C_DATA);
     copy_class(b, C_TDATA);

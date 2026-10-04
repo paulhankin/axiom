@@ -15,6 +15,7 @@
 import "a64enc.ax" as ae;
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "ftab.ax" as ft;
 import "ir.ax" as ir;
 import "lower.ax" as lower;
 import "mach.ax" as mc;
@@ -1508,6 +1509,7 @@ fn gen_call(v: *mut ir.Value) void {
         ops.push(W(rreg));
     }
     let ci = emit(CALL, 0, ops.items());
+    ci.aux = ft.call_aux(v);  // (frame tables)
     ci.clobber = caller_saved();
     if (v.a.kind == ir.V_FUNC) and v.a.fnp.noreturn {
         ci.clobber = 0;  // nothing is live after it
@@ -2409,6 +2411,10 @@ fn gen_inst(v: *mut ir.Value) void {
             raw_none(ae.UDF);
             return;
         }
+        if id == ir.IN_FRAME_ADDR {
+            _ = e2(MOV, 8, W(vreg(v)), R(FP));
+            return;
+        }
         if is_insn(id) {
             gen_insn(v, id);
             return;
@@ -3071,8 +3077,11 @@ fn save_restore(load: bool) void {
 }
 
 // A leaf with nothing on the stack needs no frame (a call that does not
-// return may still clobber the link register).
+// return may still clobber the link register; with frame tables, where the
+// walk needs the caller's return address, it does not).
 let mut frameless: bool = false;
+let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
+                              chains_sym: 0, rel32: 0, abs64: 0, empty: 0 };  // frame tables (ftab.ax)
 
 fn needs_frame() bool {
     if (frame != 0) or (nsaved > 0) {
@@ -3081,7 +3090,7 @@ fn needs_frame() bool {
     for bi in 0..MF.blocks.len {
         let mut i = MF.blocks.get(bi).first;
         while u.notnil(i) {
-            if i.clobber != 0 {
+            if (i.clobber != 0) or (FT.on and (i.op == CALL)) {
                 return true;
             }
             for k in 0..i.ops.len {
@@ -3335,12 +3344,18 @@ fn encode_func(f: *mut ir.Func) void {
     prologue();
     let nb = MF.blocks.len;
     let boff = u.newn.[u64](nb + 1);
+    // frame tables: (offset after each call, its chain)
+    let mut calls = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
         boff[bi] = here();
         let mut i = b.first;
         while u.notnil(i) {
             enc_inst(i);
+            if FT.on and (i.op == CALL) {
+                calls.push(here());
+                calls.push(@bit_cast(u64, i.aux));
+            }
             i = i.next;
         }
     }
@@ -3379,6 +3394,7 @@ fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, code.len());
+    ft.func(&FT, base, s.size, frameless, calls.items());
     code.free();
 }
 
@@ -3471,7 +3487,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         }
         galign.push(al);
         if u.isnil(g.init) {
-            let si = elf.ext_sym(OBJ, g.name, false);
+            let si = elf.ext_sym(OBJ, g.name, g.linkage == ir.LINK_EXTWEAK);
             if g.tls {
                 OBJ.syms.at(@as(usize, si)).ty = elf.T_TLS;
             }
@@ -3525,6 +3541,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         }
         emit_data(sec, s.value, g.init);
     }
+    FT = ft.begin(OBJ, m, TEXT, relro, gsym.items(), elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if not ir.is_decl(f) {

@@ -768,6 +768,22 @@ fn program_traces() bool {
     return u.notnil(O) and O.stack_traces;
 }
 
+// Native code keeps stack traces without the shadow stack's call records
+// (issue 0053, as the C compiler's issue 0037): every function that makes a
+// call keeps a frame pointer, and each call is followed by an entry in the
+// object's frame table (section axiom_rets, written by the backend) that
+// maps its return address to its chain of call-site records: its own and
+// those of the calls inlined around it (ir.Chain; inline.ax extends the
+// chains of the code it inlines). A trap or crash walks the frames and
+// fills the thread's shadow stack as the stores would have (runtime:
+// trap_format.ax, walk_frames). Profile builds, which sample the stack while
+// the program runs, and --sanitize=address, which records allocation sites,
+// keep the shadow stack, as does WebAssembly, whose stack cannot be walked.
+// Error-return traces use the shadow stack's ring in every mode.
+fn frame_tables() bool {
+    return program_traces() and not ty.g_target.is_wasm and not O.profile and not O.sanitize_address;
+}
+
 // The native runtime (runtime/*.ax) reports stack traces; it is not part of
 // them.
 fn is_runtime_module(m: *ast.Module) bool {
@@ -875,6 +891,7 @@ fn ss_slot(ss: *mut ir.Value, field: u64, idx: *mut ir.Value) *mut ir.Value {
 struct SsFrame {
     ss: *mut ir.Value,
     depth: *mut ir.Value,
+    site: *mut ir.Value,  // frame tables: the call's record (its chain)
 }
 
 // In profiling builds another thread (or a signal handler) reads the stack at
@@ -889,8 +906,12 @@ fn ss_store(v: *mut ir.Value, p: *mut ir.Value) void {
 }
 
 fn ss_push(callee: []u8) SsFrame {
-    let mut f = SsFrame.{ ss: vnil(), depth: vnil() };
+    let mut f = SsFrame.{ ss: vnil(), depth: vnil(), site: vnil() };
     if not stack_traces_on() or u.isnil(F) {
+        return f;
+    }
+    if frame_tables() {
+        f.site = site_record_ex(SITE_CALL, g_cur_span, callee);
         return f;
     }
     if u.isnil(F.ss_depth) {
@@ -914,7 +935,11 @@ fn ss_push(callee: []u8) SsFrame {
     return f;
 }
 
-fn ss_pop(f: SsFrame) void {
+// After the call `c`.
+fn ss_pop(f: SsFrame, c: *mut ir.Value) void {
+    if u.notnil(f.site) {
+        c.chain = ir.chain1(f.site);
+    }
     if u.notnil(f.ss) {
         ss_store(f.depth, ss_field(f.ss, 0));
     }
@@ -1052,6 +1077,23 @@ fn call_trap_site(site: *mut ir.Value) void {
             let mut ssv = ir.czero(T_ptr);
             if program_traces() {
                 ssv = ss_ptr();
+            }
+            if frame_tables() {
+                // the frames, from this function's own (its return address
+                // is the trap's): runtime/trap_format.ax
+                let mut wps: [1]*mut ir.Ty = [T_ptr];
+                let wty = fn_type(T_void, wps[..], false);
+                let walk = ir.add_function(M, "ax_stack_walk", wty).val;
+                set_linkage(walk, ir.LINK_EXTWEAK);
+                let walk_bb = ir.append_block(f.fnp, "walk");
+                let hook_bb = ir.append_block(f.fnp, "hook.call");
+                condbr(icmp(ir.IntNE, walk, ir.czero(T_ptr)), walk_bb, hook_bb);
+                at_end(walk_bb);
+                let mut none: [1]*mut ir.Value = [vnil()];
+                let mut wargs: [1]*mut ir.Value = [ir.intr(B, ir.IN_FRAME_ADDR, T_ptr, none[0..0])];
+                _ = call(wty, walk, wargs[..]);
+                br(hook_bb);
+                at_end(hook_bb);
             }
             let mut args: [3]*mut ir.Value = [sp, trap_info_global(), ssv];
             _ = call(hty, trap_hook, args[..]);
@@ -2518,7 +2560,7 @@ fn emit_call(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: boo
     }
     let sf = ss_push(callee);
     let r = call(fty, fnv, av[0..n]);
-    ss_pop(sf);
+    ss_pop(sf, r);
     add_ext_attrs(r, fnty, sret, true);
     if sret {
         return load(fnty.ret, ret_tmp, false);
@@ -4852,6 +4894,34 @@ fn emit_shadow_stack_export() void {
     }
 }
 
+// axiom_frame_table(): the frame table's bounds {start, end}: the
+// linked program's axiom_rets sections (the linkers place them together
+// and define these symbols, as the system's linker does), or null when calls
+// record themselves on the shadow stack (see frame_tables).
+fn emit_frame_table_export() void {
+    let mut g = ir.czero(T_ptr);
+    if frame_tables() {
+        let start = ir.add_global(M, T_i8, "__start_axiom_rets").val;
+        let stop = ir.add_global(M, T_i8, "__stop_axiom_rets").val;
+        set_linkage(start, ir.LINK_EXTWEAK);
+        set_linkage(stop, ir.LINK_EXTWEAK);
+        g = ir.add_global(M, ir.t_array(T_ptr, 2), "axiom.rets").val;
+        let mut el: [2]*mut ir.Value = [start, stop];
+        set_init(g, ir.carray(T_ptr, el[..]));
+        set_linkage(g, ir.LINK_INTERNAL);
+        g.gv.is_const = true;
+        set_align(g, 8);
+    }
+    _ = add_export("axiom_frame_table", T_ptr, no_tys());
+    ir.ret(B, g);
+    // axiom_frame_address(): its own frame record, whose first word is the
+    // caller's frame address (for the runtime's walks from its own frames)
+    let f = add_export("axiom_frame_address", T_ptr, no_tys());
+    f.fnp.noinline = true;
+    let mut none: [1]*mut ir.Value = [vnil()];
+    ir.ret(B, ir.intr(B, ir.IN_FRAME_ADDR, T_ptr, none[0..0]));
+}
+
 // axiom_trap_info(): address of {site, kind, a, b, alen, blen} (64-bit
 // fields); `site` points at {code, file_id, start, end, line, col, file, text}.
 fn emit_trap_info_export() void {
@@ -5022,6 +5092,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
     let P = sema.g_prog;
     ir.init_types(@int_cast(u64, ty.g_target.ptr_bits / 8));
     M = ir.new_module(u.file_of(P.root.file.id).display);
+    M.frame_tables = frame_tables();
     B = ir.new_builder();
     T_i1 = ir.t_int(1);
     T_i8 = ir.t_int(8);
@@ -5105,6 +5176,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         }
         emit_shadow_stack_export();
         if not ty.g_target.is_wasm {
+            emit_frame_table_export();
             emit_native_entry();
         } else if O.sanitize_address and not g_test_mode {
             emit_asan_main_wasm();

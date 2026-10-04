@@ -2349,15 +2349,19 @@ example, a naive recursive Fibonacci) it roughly doubles run time. On typical co
 is within measurement noise. Stack traces are on by default, and
 `--stack-traces=off` removes the instrumentation.
 
-**Frame tables.** Native code can be walked, so on x86-64 Linux the C compiler builds
-the same records without a shadow stack, and calls cost nothing:
+**Frame tables.** Native code can be walked, so on x86-64 Linux the C compiler, and on
+every native target (x86-64 and AArch64 Linux, macOS, Windows) the self-hosted one,
+build the same records without a shadow stack, and calls cost nothing:
 
 - Every function keeps a frame pointer, and the executable has a table (the section
   `axiom_rets`) that maps the return address of each call to its call-site record,
   followed by the records of the calls inlined around it: calls to `inline` functions
-  and the ones the optimizer inlined. The compiler takes these from the inlining
+  and the ones the optimizer inlined. The C compiler takes these from the inlining
   information LLVM keeps in its debug locations, and drops the debug information
-  afterwards unless `-g` asks for it.
+  afterwards unless `-g` asks for it; the self-hosted one keeps them with each call
+  as it inlines. (Its x86-64 code gives a leaf function, whose only calls are traps,
+  no frame: the table marks such functions, and the walk finds their return
+  addresses on the stack.)
 - A trap walks the frame-pointer chain from the trap's own frame, a crash from the
   interrupted one, and looks each return address up. The frames fill the thread's
   shadow-stack record (its calls and depth) as the stores would have, so the report,
@@ -2371,8 +2375,8 @@ the same records without a shadow stack, and calls cost nothing:
   table 16 bytes per call. A recursive Fibonacci runs in about a third of the time it
   takes with the shadow stack, the same as with `--stack-traces=off` to within noise.
 - `axiom profile` (§16.6) and `--sanitize=address` (§16.8) builds, which read the
-  records while the program runs, keep the shadow stack, as do WebAssembly, other
-  native targets and the self-hosted compiler.
+  records while the program runs, keep the shadow stack, as do WebAssembly and, with
+  the C compiler, other native targets.
 
 Traces are diagnostics only: whether they are on never changes a program's
 behavior. Record contents and layouts are toolchain ABI, not language semantics.

@@ -22,6 +22,8 @@ import "trap_format.ax" as tf;
 
 pub extern "C" {
     fn axiom_shadow_stack() *tf.ShadowStack;
+    fn axiom_frame_table() *usize;
+    fn axiom_frame_address() *usize;
 
     // kernel32
     fn GetLastError() u32;
@@ -3197,10 +3199,48 @@ fn write_all(fd: i32, s: []u8) void {
 export fn ax_unavailable() void {
     let mut o = tf.fmt(report[..]);
     o.s("axiom: crash: called a function from another system's library (not available on Windows)\n");
+    let fp = axiom_frame_address().*;  // this function's frame
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, true);
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     write_all(2, o.text());
     flush_profile();
     ExitProcess(134);
+}
+
+// Stack traces from frame pointers (trap_format.ax: walk_frames), within
+// the thread's stack.
+fn thread_stack_top() usize {
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    GetCurrentThreadStackLimits(&mut low, &mut high);
+    return high;
+}
+
+fn shadow_stack() *mut tf.ShadowStack {
+    return @ptr_from_int(*mut tf.ShadowStack, @int_from_ptr(axiom_shadow_stack()));
+}
+
+// From axiom.trap (codegen), with its own frame.
+export fn ax_stack_walk(fp: *void) void {
+    let f = @int_from_ptr(fp);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, true);
+}
+
+// From the exception handler: the frames of the code that faulted (its
+// CONTEXT: Rsp, Rbp, Rip).
+fn stack_walk_context(ctx: usize) void {
+    let tab = axiom_frame_table();
+    if tf.is_null(@ptr_cast(*void, tab)) {
+        return;
+    }
+    let sp = @ptr_from_int(*usize, ctx + 0x98).*;
+    let fp = @ptr_from_int(*usize, ctx + 0xa0).*;
+    let pc = @ptr_from_int(*usize, ctx + 0xf8).*;
+    let mut leaf: usize = 0;
+    if tf.frameless_at(tab, pc) {
+        leaf = @ptr_from_int(*usize, sp).*;
+    }
+    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, true);
 }
 
 // Every trap calls this (see codegen: axiom.trap); the trap instruction
@@ -3298,6 +3338,7 @@ fn on_exception(ep: *mut usize) i32 {
         addr = @truncate(usize, le64(r, 40));  // ExceptionInformation[1]
     }
     let overflow = so or (av and at_stack_limit(addr));
+    stack_walk_context(@ptr_from_int(*usize, @int_from_ptr(ep) + 8).*);
     if has_crash_hook {
         if overflow {
             crash_hook(8);

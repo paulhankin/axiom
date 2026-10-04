@@ -20,6 +20,8 @@ import "trap_format.ax" as tf;
 
 pub extern "C" {
     fn axiom_shadow_stack() *tf.ShadowStack;
+    fn axiom_frame_table() *usize;
+    fn axiom_frame_address() *usize;
     fn ax_tls_info() *mut TlsInfo;  // the linker's record (selfhost/src/mlink.ax)
 
     fn __error() *mut i32;
@@ -2546,10 +2548,46 @@ fn flush_profile() void {
 export fn ax_unavailable() void {
     let mut o = tf.fmt(report[..]);
     o.s("axiom: crash: called a function from another system's library (not available on macOS)\n");
+    let fp = axiom_frame_address().*;  // this function's frame
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, false);
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     write_all(2, o.text());
     flush_profile();
     exit(134);
+}
+
+// Stack traces from frame pointers (trap_format.ax: walk_frames), within
+// the thread's stack.
+fn thread_stack_top() usize {
+    return @int_from_ptr(pthread_get_stackaddr_np(pthread_self()));
+}
+
+fn shadow_stack() *mut tf.ShadowStack {
+    return @ptr_from_int(*mut tf.ShadowStack, @int_from_ptr(axiom_shadow_stack()));
+}
+
+// From axiom.trap (codegen), with its own frame.
+export fn ax_stack_walk(fp: *void) void {
+    let f = @int_from_ptr(fp);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, false);
+}
+
+// From a signal handler: the frames of the code it interrupted (the
+// ucontext's uc_mcontext: __es, then __ss: x0-x28, fp, lr, sp, pc).
+fn stack_walk_signal(uc: *mut void) void {
+    let tab = axiom_frame_table();
+    if tf.is_null(@ptr_cast(*void, tab)) {
+        return;
+    }
+    let m = @ptr_from_int(*usize, @int_from_ptr(uc) + 48).*;
+    let fp = @ptr_from_int(*usize, m + 248).*;
+    let sp = @ptr_from_int(*usize, m + 264).*;
+    let pc = @ptr_from_int(*usize, m + 272).*;
+    let mut leaf: usize = 0;
+    if tf.frameless_at(tab, pc) {
+        leaf = @ptr_from_int(*usize, m + 256).*;  // the link register
+    }
+    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, false);
 }
 
 // Every trap calls this (see codegen: axiom.trap).
@@ -2586,6 +2624,7 @@ pub fn at_stack_limit(addr: usize) bool {
 // are reported with the shadow stack, then the signal is re-raised.
 fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
     let addr = @ptr_from_int(*usize, @int_from_ptr(si) + 24).*;  // si_addr
+    stack_walk_signal(uc);
     let mut code: u32 = 5;
     if sig == SIGFPE {
         code = 3;

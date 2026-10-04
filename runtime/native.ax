@@ -17,6 +17,7 @@ import "trap_format.ax" as tf;
 
 pub extern "C" {
     fn axiom_shadow_stack() *tf.ShadowStack;
+    fn axiom_frame_table() *usize;
     // only called when the C library is linked (see selfhost/src/lstub.ax)
     fn pthread_create(t: *mut u64, attr: *void, f: fn(*mut void) *mut void, arg: *mut void) i32;
     fn pthread_attr_init(a: *mut void) i32;
@@ -955,6 +956,8 @@ let mut threads: usize = 0;  // ThreadStart records of threads not yet reclaimed
 let mut threads_lock: u32 = 0;
 
 fn thread_run(p: *mut void) void {
+    let mark: usize = 0;
+    stack_hi = @int_from_ptr(&mark);
     let st = @ptr_cast(*mut ThreadStart, p);
     _ = sys.sigaltstack(st.alt, ALT);
     st.entry(st.arg);
@@ -2591,6 +2594,53 @@ export fn ax_on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) vo
     flush_profile();
 }
 
+// Stack traces from frame pointers (trap_format.ax: walk_frames). The
+// frame walk stops at the top of the thread's stack, as far as Axiom code
+// goes: set as each thread starts (the main thread's arguments are above
+// its frames).
+threadlocal let mut stack_hi: usize = 0;
+
+fn is_x64() bool {
+    return sys.axiom_target_arch() != 2;
+}
+
+fn shadow_stack() *mut tf.ShadowStack {
+    return @ptr_from_int(*mut tf.ShadowStack, @int_from_ptr(axiom_shadow_stack()));
+}
+
+// From axiom.trap (codegen), with its own frame.
+export fn ax_stack_walk(fp: *void) void {
+    let f = @int_from_ptr(fp);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, stack_hi, 0, is_x64());
+}
+
+// From a signal handler: the frames of the code it interrupted.
+pub fn stack_walk_signal(uc: *mut void) void {
+    let tab = axiom_frame_table();
+    if tf.is_null(@ptr_cast(*void, tab)) {
+        return;
+    }
+    let b = @int_from_ptr(uc);
+    // x86-64: uc_mcontext.gregs[REG_RBP, REG_RSP, REG_RIP]; AArch64:
+    // uc_mcontext.regs[29, 30], sp, pc
+    let mut fp = @ptr_from_int(*usize, b + 120).*;
+    let sp = signal_sp(uc);
+    let mut pc = @ptr_from_int(*usize, b + 168).*;
+    if not is_x64() {
+        fp = @ptr_from_int(*usize, b + 416).*;
+        pc = @ptr_from_int(*usize, b + 440).*;
+    }
+    let mut leaf: usize = 0;
+    if tf.frameless_at(tab, pc) {
+        // its return address: at the stack pointer, or in the link register
+        leaf = @ptr_from_int(*usize, sp).*;
+        if not is_x64() {
+            leaf = @ptr_from_int(*usize, b + 424).*;
+        }
+    }
+    tf.walk_frames(tab, shadow_stack(), fp, sp, stack_hi, leaf, is_x64());
+}
+
 // The stack pointer when a signal arrived, from its ucontext.
 pub fn signal_sp(uc: *mut void) usize {
     let mut off: usize = 160;  // x86-64: uc_mcontext.gregs[REG_RSP]
@@ -2611,6 +2661,7 @@ pub fn at_stack_limit(addr: usize, sp: usize) bool {
 // signal is re-raised.
 fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
     let addr = @ptr_cast(*usize, @ptr_from_int(*u8, @int_from_ptr(si) + 16)).*;
+    stack_walk_signal(uc);
     let mut code: u32 = 5;
     if sig == SIGFPE {
         code = 3;
@@ -2656,6 +2707,7 @@ pub fn set_handler(sig: i32, f: fn(i32, *mut void, *mut void) void, flags: u64) 
 export fn ax_rt_args(argc: i32, argv: *mut *mut u8) void {
     sys.main_argc = @as(usize, @bit_cast(u32, argc));
     sys.main_argv = @int_from_ptr(argv);
+    stack_hi = @int_from_ptr(argv);
 }
 
 // Runs before main.

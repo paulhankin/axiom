@@ -17,6 +17,7 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "ftab.ax" as ft;
 import "ir.ax" as ir;
 import "lower.ax" as lower;
 import "mach.ax" as mc;
@@ -38,6 +39,8 @@ let mut LINES: i32 = -1;  // Windows: line tables (.axiom.lines, for plink.ax's 
 let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
 let mut PDATA: i32 = -1;
 let mut XDATA_SYM: u32 = 0;
+let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
+                              chains_sym: 0, rel32: 0, abs64: 0, empty: 0 };  // frame tables (ftab.ax)
 let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
@@ -2435,6 +2438,7 @@ fn gen_call(v: *mut ir.Value) void {
         ops.push(W(rreg));
     }
     let ci = emit(xe.CALL, 0, ops.items());
+    ci.aux = ft.call_aux(v);  // (frame tables)
     ci.clobber = caller_saved();
     if (v.a.kind == ir.V_FUNC) and v.a.fnp.noreturn {
         ci.clobber = 0;  // nothing is live after it
@@ -4605,6 +4609,10 @@ fn gen_inst_at(v: *mut ir.Value) void {
             gen_cpuid(v);
             return;
         }
+        if id == ir.IN_FRAME_ADDR {
+            _ = e2(xe.MOV_RR, 8, W(vreg(v)), R(xe.RBP));
+            return;
+        }
         if is_insn(id) {
             gen_insn(v, id);
             return;
@@ -6520,6 +6528,8 @@ fn encode_func(f: *mut ir.Func) void {
     // the line table: (code offset, source location) where the location changes
     let mut rows = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
     let mut last_src = f.src;
+    // frame tables: (offset after each call, its chain)
+    let mut calls = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
     if WIN and (f.src != 0) {
         rows.push(@as(u64, f.src));
     }
@@ -6536,6 +6546,10 @@ fn encode_func(f: *mut ir.Func) void {
                 last_src = i.src;
             }
             enc_inst(i);
+            if FT.on and (i.op == xe.CALL) {
+                calls.push(@as(u64, E.b.len()));
+                calls.push(@bit_cast(u64, i.aux));
+            }
             i = i.next;
         }
     }
@@ -6563,6 +6577,7 @@ fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, E.b.len());
+    ft.func(&FT, base, s.size, frameless, calls.items());
     if WIN and not frameless {
         emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
     }
@@ -6667,7 +6682,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
         if u.isnil(g.init) {
-            let si = elf.ext_sym(OBJ, g.name, false);
+            let si = elf.ext_sym(OBJ, g.name, g.linkage == ir.LINK_EXTWEAK);
             if g.tls {
                 OBJ.syms.at(@as(usize, si)).ty = elf.T_TLS;
             }
@@ -6725,6 +6740,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         }
         emit_data(sec, s.value, g.init);
     }
+    FT = ft.begin(OBJ, m, TEXT, relro, gsym.items(), elf.R_X86_64_PC32, elf.R_X86_64_64);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if not ir.is_decl(f) {

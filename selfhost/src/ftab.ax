@@ -1,0 +1,162 @@
+// =============================================================================
+// ftab.ax - native frame tables (issue 0053), written by x64.ax and a64.ax.
+// Calls do not record themselves on the shadow stack (codegen.ax:
+// frame_tables): code keeps frame pointers, and the section axiom_rets maps
+// each call's return address to its chain of call-site records (ir.Chain:
+// its own, then those of the calls inlined around it, innermost first,
+// null-terminated, in .data.rel.ro). A trap or crash walks the frames and
+// looks the return addresses up (runtime/trap_format.ax: walk_frames).
+//
+// An entry is 8 bytes, both fields relative to themselves:
+//   i32  the return address (the end of the call instruction)
+//   i32  the chain, with flags in its two low bits (the chain is 8-aligned
+//        and the field is at 4 mod 8, so its offset is 4 mod 8)
+// Entries are in code order within an object, and the linkers place the
+// objects' sections in the same order as their code, so the table is sorted
+// (the runtime checks). Only calls that record something have an entry, and
+// the calls in functions without a frame (x86-64: a leaf whose only calls do
+// not return): F_FRAMELESS says that the caller's own return address is
+// further up the stack (above the call's, past 8 bytes of alignment). A
+// function without a frame is also bracketed by markers (F_MARKER): at its
+// start, and at its end (with F_FRAMELESS), so that a crash in it knows
+// where its return address is (runtime: the first entry after the faulting
+// instruction is one with F_FRAMELESS).
+// =============================================================================
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+pub const F_FRAMELESS: u64 = 1;
+pub const F_MARKER: u64 = 2;
+
+pub struct Tab {
+    on: bool,
+    obj: *mut elf.Obj,
+    rets: i32,      // the section axiom_rets
+    chains: i32,    // where the chains go (.data.rel.ro)
+    text_sym: u32,  // local symbols at the start of .text and of `chains`
+    chains_sym: u32,
+    rel32: u32,  // R_X86_64_PC32 / R_AARCH64_PREL32
+    abs64: u32,  // R_X86_64_64 / R_AARCH64_ABS64
+    empty: u64,  // the empty chain's offset in `chains`
+}
+
+pub fn off() Tab {
+    return Tab.{ on: false, obj: u.nil.[elf.Obj](), rets: -1, chains: -1, text_sym: 0, chains_sym: 0, rel32: 0,
+                 abs64: 0, empty: 0 };
+}
+
+fn local_sym(o: *mut elf.Obj, sec: i32) u32 {
+    return elf.add_sym(o, elf.Sym.{ name: "", sec: sec, value: 0, size: 0, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
+                                    hidden: false });
+}
+
+// The module's frame table, if it has one (m.frame_tables), and the chains
+// of its calls (ir.Chain.off, then the call's place in `chains` + 1).
+// `gsym` maps the module's globals to their symbols.
+pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: []u32, rel32: u32, abs64: u32) Tab {
+    let mut t = off();
+    if not m.frame_tables {
+        return t;
+    }
+    t.on = true;
+    t.obj = o;
+    t.rets = elf.add_sec(o, "axiom_rets", elf.S_RODATA, 4);
+    t.chains = chains;
+    t.text_sym = local_sym(o, text);
+    t.chains_sym = local_sym(o, chains);
+    t.rel32 = rel32;
+    t.abs64 = abs64;
+    let cs = o.secs.get(@int_cast(usize, chains));
+    if cs.align < 8 {
+        cs.align = 8;
+    }
+    cs.data.align(8);
+    t.empty = @as(u64, cs.data.len());
+    cs.data.zeros(8);
+    // each distinct chain once
+    let mut seen = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
+    for fi in 0..m.funcs.len {
+        let f = m.funcs.get(fi);
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i.op == ir.OP_CALL) and u.notnil(i.chain) {
+                    let mut key = u.Buf.init();
+                    let mut c = i.chain;
+                    while u.notnil(c) {
+                        key.s(u.idec(c.site.gv.id));
+                        key.s(",");
+                        c = c.next;
+                    }
+                    let k = u.intern(key.done());
+                    let mut at = seen.get(k);
+                    if at == 0 {
+                        at = @as(u64, cs.data.len()) + 1;
+                        c = i.chain;
+                        while u.notnil(c) {
+                            cs.relocs.push(
+                                elf.Rel.{
+                                    off: @as(u64, cs.data.len()), ty: abs64, sym: gsym[@int_cast(usize, c.site.gv.id)],
+                                    addend: 0 });
+                            cs.data.zeros(8);
+                            c = c.next;
+                        }
+                        cs.data.zeros(8);
+                        seen.put(k, at);
+                    }
+                    i.chain.off = @bit_cast(i64, at);
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+    }
+    return t;
+}
+
+// What a call's machine instruction keeps (MInst.aux): its chain's place + 1,
+// or 0 for none.
+pub fn call_aux(v: *ir.Value) i64 {
+    if u.isnil(v.chain) {
+        return 0;
+    }
+    return v.chain.off;
+}
+
+fn entry(t: *Tab, at: u64, chain: u64, flags: u64) void {
+    let s = t.obj.secs.get(@int_cast(usize, t.rets));
+    let o = @as(u64, s.data.len());
+    s.relocs.push(elf.Rel.{ off: o, ty: t.rel32, sym: t.text_sym, addend: @bit_cast(i64, at) });
+    s.relocs.push(elf.Rel.{ off: o + 4, ty: t.rel32, sym: t.chains_sym, addend: @bit_cast(i64, chain + flags) });
+    s.data.zeros(8);
+}
+
+// A function's entries, once its code is at `base` in .text (`size` bytes):
+// `calls` holds pairs of the offset after a call and its MInst.aux.
+pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, calls: []u64) void {
+    if not t.on {
+        return;
+    }
+    let mut fl: u64 = 0;
+    if frameless {
+        fl = F_FRAMELESS;
+        entry(t, base, t.empty, F_MARKER);
+    }
+    let mut k: usize = 0;
+    while (k + 1) < calls.len {
+        let aux = calls[k + 1];
+        let mut chain = t.empty;
+        if aux != 0 {
+            chain = aux - 1;
+        }
+        if (aux != 0) or frameless {
+            entry(t, base + calls[k], chain, fl);
+        }
+        k += 2;
+    }
+    if frameless {
+        entry(t, base + size, t.empty, F_MARKER | F_FRAMELESS);
+    }
+}
