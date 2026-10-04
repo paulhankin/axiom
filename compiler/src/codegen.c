@@ -115,10 +115,17 @@ static LLVMMetadataRef di_file(int id) {
     return m;
 }
 
+static bool frame_traces(void);
+static void frame_tables_reset(void);
+
 static void dbg_init(void) {
     DIB = NULL;
     di_files = (SymMap){0};
-    if (!O->debug_info) return;
+    frame_tables_reset();
+    // Frame-walked stack traces find inline frames through the locations'
+    // inlinedAt chains, so they need subprograms and call locations even
+    // without -g (and strip them after optimization).
+    if (!O->debug_info && !frame_traces()) return;
     DIB = LLVMCreateDIBuilder(mod);
     LLVMMetadataRef file = di_file(O->unit == CG_MODULE ? O->module->file->id : g_prog.root->file->id);
     const char *producer = "axiom";
@@ -130,6 +137,9 @@ static void dbg_init(void) {
     LLVMAddModuleFlag(mod, LLVMModuleFlagBehaviorWarning, "Dwarf Version", 13,
                       LLVMValueAsMetadata(LLVMConstInt(T_i32, 4, false)));
 }
+
+// -g: every instruction gets a location (otherwise only calls do).
+static bool dbg_lines(void) { return DIB && O->debug_info; }
 
 // The current function's instructions are attributed to `sp` from here on.
 static void dbg_at(Span sp) {
@@ -395,12 +405,21 @@ static const char *cur_fn_display(void) { return F && F->inst ? F->inst->display
 // A constant site record {code, file id, start, end, line, col, file, text,
 // fn, callee}. `fn` is the enclosing function; `callee` is set for call sites.
 // Codes: a trap code, SITE_CALL for a call, SITE_ERR_RETURN for an error return.
+static LLVMValueRef make_site_record(int code, Span sp, const char *fn, const char *callee);
+
 static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
     const char *fn = cur_fn_display();
     if (!callee) callee = "";
     Sym key = intern_cstr(arena_printf("%d:%d:%u:%u:%s:%s", code, sp.file, sp.start, sp.end, fn, callee));
     LLVMValueRef g = symmap_get(&site_map, key);
     if (g) return g;
+    g = make_site_record(code, sp, fn, callee);
+    symmap_put(&site_map, key, g);
+    return g;
+}
+
+static LLVMValueRef make_site_record(int code, Span sp, const char *fn, const char *callee) {
+    LLVMValueRef g;
     if (!site_ty) {
         LLVMTypeRef el[10] = {T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr};
         site_ty = LLVMStructTypeInContext(ctx, el, 10, false);
@@ -435,7 +454,6 @@ static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
     LLVMSetLinkage(g, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(g, true);
     LLVMSetAlignment(g, 8);
-    symmap_put(&site_map, key, g);
     return g;
 }
 
@@ -479,6 +497,21 @@ static LLVMValueRef stack_pointer_global(void) {
 }
 
 static bool stack_traces_on(void) { return O && O->stack_traces; }
+
+// Native x86-64 Linux keeps stack traces without a shadow stack (issue
+// 0037): code keeps frame pointers, and a table maps the return address of
+// each call to its call-site records (see frame_tables_emit); a trap or crash
+// walks the frames (runtime/native_host.c: ax_stack_walk). Profile builds,
+// which sample the stack from a signal handler, and --sanitize=address, which
+// records allocation sites, keep the shadow stack, as does WebAssembly,
+// whose stack cannot be walked.
+static bool frame_traces(void) {
+    return stack_traces_on() && !g_target.wasm && g_arch == ARCH_X64 && g_os == OS_LINUX && !O->profile &&
+           !O->sanitize_address;
+}
+
+// The shadow stack's call records (error returns use it in every mode).
+static bool ss_calls_on(void) { return stack_traces_on() && !frame_traces(); }
 
 static LLVMTypeRef ss_type(void) {
     if (!ss_ty) {
@@ -545,7 +578,7 @@ static void ss_store(LLVMValueRef v, LLVMValueRef p) {
 // inline functions is attributed to them.)
 #define INL_SITES 4
 
-static bool inline_sites_on(void) { return stack_traces_on() && !O->profile; }
+static bool inline_sites_on(void) { return ss_calls_on() && !O->profile; }
 
 // Pushes call-site record `p` unless it is null (a constant once inlined).
 static void ss_push_site(LLVMValueRef ss, LLVMValueRef p) {
@@ -567,7 +600,7 @@ static void ss_push_inline_sites(LLVMValueRef ss, int lo, int hi) {
 
 static SsFrame ss_push(const char *callee) {
     SsFrame f = {0};
-    if (!stack_traces_on() || !F) return f;
+    if (!ss_calls_on() || !F) return f;
     f.ss = ss_ptr();
     LLVMValueRef dp = ss_field(f.ss, 0);
     f.depth = LLVMBuildLoad2(B, T_i32, dp, "depth");
@@ -584,6 +617,171 @@ static SsFrame ss_push(const char *callee) {
 
 static void ss_pop(SsFrame f) {
     if (f.ss) ss_store(f.depth, ss_field(f.ss, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Frame tables (frame_traces). Each call site the shadow stack would record
+// gets a DILocation of its own (in a lexical block made for it, so the
+// locations of different calls never coincide), and the call is `nomerge`,
+// so that optimization keeps one call per site and context. After
+// optimization the inlinedAt chain of each call's location names the inline
+// calls (of `inline` functions and of the ones LLVM inlined) around it, so
+// every remaining call is followed by a label and an entry in the section
+// `axiom_rets`: {label - &entry, chain - &entry.chain}, where `chain` holds
+// the call's site record (none for a trap) and then those of the inline calls
+// that led to it, innermost first, null-terminated (empty for calls that
+// record nothing). The label is the return address or a few bytes after it
+// (copies of the result may come first); runtime/native_host.c looks a
+// return address up as the first label at or after it.
+// ---------------------------------------------------------------------------
+static Sym ptr_key(void *p) { return intern_cstr(arena_printf("%p", p)); }
+
+// A call site's record, made after optimization (which deletes the records
+// that nothing refers to yet).
+typedef struct FtSite {
+    Span sp;
+    const char *fn, *callee;
+    LLVMValueRef g;
+} FtSite;
+
+typedef Vec(LLVMValueRef) ValueVec;
+
+static SymMap ft_scope_sites;  // per-call lexical block -> its FtSite
+static SymMap ft_chains;       // chain contents -> the chain global
+static int ft_nchains;
+static LLVMValueRef ft_walk_fn;  // ax_stack_walk (weak)
+
+static void frame_tables_reset(void) {
+    ft_scope_sites = (SymMap){0};
+    ft_chains = (SymMap){0};
+    ft_nchains = 0;
+    ft_walk_fn = NULL;
+}
+
+static void add_nomerge(LLVMValueRef call) {
+    unsigned k = LLVMGetEnumAttributeKindForName("nomerge", 7);
+    LLVMAddCallSiteAttribute(call, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(ctx, k, 0));
+}
+
+// Before a call to `callee` at g_cur_span: its own location (and its
+// record, for after optimization); returns the previous location, for
+// frame_call_end.
+static LLVMMetadataRef frame_call_begin(const char *callee) {
+    LLVMMetadataRef saved = LLVMGetCurrentDebugLocation2(B);
+    if (!frame_traces() || !F || !F->di_sp) return saved;
+    Span sp = g_cur_span;
+    int l = 0, c = 0, el, ec;
+    LLVMMetadataRef file = di_file(F->di_file);
+    if (sp.file >= 0 && sp.file < g_files.len) {
+        span_linecol(sp, &l, &c, &el, &ec);
+        file = di_file(sp.file);
+    }
+    LLVMMetadataRef blk = LLVMDIBuilderCreateLexicalBlock(DIB, F->di_sp, file, (unsigned)l, (unsigned)c);
+    FtSite *site = NEW(FtSite);
+    site->sp = sp;
+    site->fn = cur_fn_display();
+    site->callee = callee ? callee : "";
+    symmap_put(&ft_scope_sites, ptr_key(blk), site);
+    LLVMSetCurrentDebugLocation2(B, LLVMDIBuilderCreateDebugLocation(ctx, (unsigned)l, (unsigned)c, blk, NULL));
+    return saved;
+}
+
+static void frame_call_end(LLVMValueRef call, LLVMMetadataRef saved) {
+    if (!frame_traces() || !F || !F->di_sp) return;
+    add_nomerge(call);
+    LLVMSetCurrentDebugLocation2(B, saved);
+}
+
+static LLVMValueRef ft_site(FtSite *s) {
+    if (!s->g) s->g = make_site_record(SITE_CALL, s->sp, s->fn, s->callee);
+    return s->g;
+}
+
+// The chain global for these records (made once; all of them are listed in
+// `used`, since only assembly refers to them).
+static LLVMValueRef frame_chain(LLVMValueRef *sites, int n, ValueVec *used) {
+    CharVec key = {0};
+    for (int i = 0; i < n; i++) {
+        const char *k = arena_printf("%p,", (void *)sites[i]);
+        while (*k) vec_push(key, *k++);
+    }
+    vec_push(key, 0);
+    Sym ks = intern_cstr(key.data);
+    free(key.data);
+    LLVMValueRef g = symmap_get(&ft_chains, ks);
+    if (g) return g;
+    LLVMValueRef *vals = NEWN(LLVMValueRef, n + 1);
+    for (int i = 0; i < n; i++) vals[i] = sites[i];
+    vals[n] = LLVMConstNull(T_ptr);
+    LLVMTypeRef t = LLVMArrayType2(T_ptr, (uint64_t)n + 1);
+    // named, and internal rather than private: the table's inline assembly
+    // refers to it by name
+    g = LLVMAddGlobal(mod, t, arena_printf("axiom.chain.%d", ft_nchains++));
+    LLVMSetInitializer(g, LLVMConstArray2(T_ptr, vals, (uint64_t)n + 1));
+    LLVMSetLinkage(g, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(g, true);
+    LLVMSetAlignment(g, 8);
+    symmap_put(&ft_chains, ks, g);
+    vec_push(*used, g);
+    return g;
+}
+
+static void frame_tables_emit(void) {
+    if (!frame_traces()) return;
+    ValueVec used = {0}, chain = {0};
+    LLVMTypeRef asm_ty = LLVMFunctionType(T_void, NULL, 0, false);
+    LLVMMetadataRef saved_loc = LLVMGetCurrentDebugLocation2(B);
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+            for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
+                if (!LLVMIsACallInst(in)) continue;
+                LLVMValueRef callee = LLVMGetCalledValue(in);
+                if (LLVMIsAInlineAsm(callee)) continue;
+                if (LLVMIsAFunction(callee) && LLVMGetIntrinsicID(callee)) continue;
+                // Every call gets an entry, with an empty chain if it records
+                // nothing, so that a return address never finds the label of
+                // a later call.
+                LLVMMetadataRef loc = LLVMInstructionGetDebugLoc(in);
+                chain.len = 0;
+                if (loc) {
+                    FtSite *own = symmap_get(&ft_scope_sites, ptr_key(LLVMDILocationGetScope(loc)));
+                    if (own) vec_push(chain, ft_site(own));
+                    for (LLVMMetadataRef at = LLVMDILocationGetInlinedAt(loc); at; at = LLVMDILocationGetInlinedAt(at)) {
+                        FtSite *s = symmap_get(&ft_scope_sites, ptr_key(LLVMDILocationGetScope(at)));
+                        if (s) vec_push(chain, ft_site(s));
+                    }
+                }
+                LLVMValueRef g = frame_chain(chain.data, chain.len, &used);
+                size_t n;
+                const char *gname = LLVMGetValueName2(g, &n);
+                const char *text = arena_printf(".Laxr${:uid}:\n"
+                                                "\t.pushsection axiom_rets,\"aw\",@progbits\n"
+                                                "\t.balign 8\n"
+                                                "\t.quad .Laxr${:uid}-.\n"
+                                                "\t.quad %s-.\n"
+                                                "\t.popsection",
+                                                gname);
+                LLVMValueRef ia = LLVMGetInlineAsm(asm_ty, (char *)text, strlen(text), "", 0, true, false,
+                                                   LLVMInlineAsmDialectATT, false);
+                LLVMValueRef next = LLVMGetNextInstruction(in);
+                LLVMPositionBuilderBefore(B, next);
+                LLVMSetCurrentDebugLocation2(B, NULL);
+                LLVMBuildCall2(B, asm_ty, ia, NULL, 0, "");
+                in = LLVMGetNextInstruction(in);  // (the label)
+            }
+        }
+    }
+    if (used.len) {
+        // referenced only from assembly: keep them
+        LLVMTypeRef t = LLVMArrayType2(T_ptr, (uint64_t)used.len);
+        LLVMValueRef u = LLVMAddGlobal(mod, t, "llvm.compiler.used");
+        LLVMSetInitializer(u, LLVMConstArray2(T_ptr, used.data, (uint64_t)used.len));
+        LLVMSetLinkage(u, LLVMAppendingLinkage);
+        LLVMSetSection(u, "llvm.metadata");
+    }
+    free(used.data);
+    free(chain.data);
+    LLVMSetCurrentDebugLocation2(B, saved_loc);
 }
 
 // Appends an error-return record when `code` (an error code, i16) is nonzero.
@@ -643,6 +841,22 @@ static void call_trap_site(LLVMValueRef site) {
             LLVMBuildCondBr(B, has, call_bb, done_bb);
             LLVMPositionBuilderAtEnd(B, call_bb);
             LLVMValueRef args[3] = {sp, trap_info_global(), stack_traces_on() ? ss_ptr() : LLVMConstNull(T_ptr)};
+            if (frame_traces()) {
+                // the frames, from this function's own (its return address is the trap's)
+                LLVMTypeRef wty = LLVMFunctionType(T_void, &T_ptr, 1, false);
+                ft_walk_fn = LLVMAddFunction(mod, "ax_stack_walk", wty);
+                LLVMSetLinkage(ft_walk_fn, LLVMExternalWeakLinkage);
+                LLVMBasicBlockRef walk_bb = LLVMAppendBasicBlockInContext(ctx, fn, "walk");
+                LLVMBasicBlockRef hook_bb = LLVMAppendBasicBlockInContext(ctx, fn, "hook.call");
+                LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntNE, ft_walk_fn, LLVMConstNull(T_ptr), ""), walk_bb, hook_bb);
+                LLVMPositionBuilderAtEnd(B, walk_bb);
+                LLVMValueRef zero = LLVMConstInt(T_i32, 0, false);
+                LLVMTypeRef pt = T_ptr;
+                LLVMValueRef fa = intrinsic("llvm.frameaddress", &pt, 1, &zero, 1);
+                LLVMBuildCall2(B, wty, ft_walk_fn, &fa, 1, "");
+                LLVMBuildBr(B, hook_bb);
+                LLVMPositionBuilderAtEnd(B, hook_bb);
+            }
             LLVMBuildCall2(B, hty, trap_hook, args, 3, "");
             LLVMBuildBr(B, done_bb);
             LLVMPositionBuilderAtEnd(B, done_bb);
@@ -652,7 +866,8 @@ static void call_trap_site(LLVMValueRef site) {
         LLVMPositionBuilderAtEnd(B, cur);
         dbg_resume(loc);
     }
-    LLVMBuildCall2(B, trap_fnty, trap_fn, &site, 1, "");
+    LLVMValueRef call = LLVMBuildCall2(B, trap_fnty, trap_fn, &site, 1, "");
+    if (frame_traces() && F && F->di_sp) add_nomerge(call);
 }
 
 // A block that traps with `code` at the current source span.
@@ -791,8 +1006,6 @@ static LLVMValueRef const_slice(LLVMValueRef ptr, int64_t len) {
 }
 
 static SymMap global_vals;  // Decl* name -> LLVMValueRef (keyed by arena string of pointer)
-
-static Sym ptr_key(void *p) { return intern_cstr(arena_printf("%p", p)); }
 
 static LLVMValueRef global_ref(Decl *d);
 
@@ -1757,7 +1970,9 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
         }
     } else {
         SsFrame sf = ss_push(callee);
+        LLVMMetadataRef loc = frame_call_begin(callee);
         r = LLVMBuildCall2(B, fty, fn, av, (unsigned)n, "");
+        frame_call_end(r, loc);
         ss_pop(sf);
     }
     add_ext_attrs(r, fnty, sret, true);
@@ -3839,30 +4054,30 @@ static void gen_stmt_inner(Stmt *s) {
 static LLVMValueRef gen(Expr *e) {
     Span saved = g_cur_span;
     g_cur_span = e->span;
-    if (DIB) dbg_at(e->span);
+    if (dbg_lines()) dbg_at(e->span);
     LLVMValueRef v = gen_inner(e);
     g_cur_span = saved;
-    if (DIB) dbg_at(saved);
+    if (dbg_lines()) dbg_at(saved);
     return v;
 }
 
 static LLVMValueRef gen_addr(Expr *e) {
     Span saved = g_cur_span;
     g_cur_span = e->span;
-    if (DIB) dbg_at(e->span);
+    if (dbg_lines()) dbg_at(e->span);
     LLVMValueRef v = gen_addr_inner(e);
     g_cur_span = saved;
-    if (DIB) dbg_at(saved);
+    if (dbg_lines()) dbg_at(saved);
     return v;
 }
 
 static void gen_stmt(Stmt *s) {
     Span saved = g_cur_span;
     g_cur_span = s->span;
-    if (DIB) dbg_at(s->span);
+    if (dbg_lines()) dbg_at(s->span);
     gen_stmt_inner(s);
     g_cur_span = saved;
-    if (DIB) dbg_at(saved);
+    if (dbg_lines()) dbg_at(saved);
 }
 
 // ---------------------------------------------------------------------------
@@ -4490,6 +4705,13 @@ bool codegen_program(CgOptions *o) {
     }
     if (diag_error_count()) return false;
     if (DIB) LLVMDIBuilderFinalize(DIB);
+    if (frame_traces()) {
+        // every frame on the chain that a trap or crash walks
+        for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn))
+            if (LLVMCountBasicBlocks(fn))
+                LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                        LLVMCreateStringAttribute(ctx, "frame-pointer", 13, "all", 3));
+    }
 
     char *err = NULL;
     if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &err)) {
@@ -4517,6 +4739,11 @@ bool codegen_program(CgOptions *o) {
             return false;
         }
     }
+    // (optimization deleted the strings nothing referred to: the records
+    // made now get their own)
+    string_globals = (SymMap){0};
+    frame_tables_emit();
+    if (DIB && !O->debug_info) LLVMStripModuleDebugInfo(mod);
     if (O->emit == EMIT_LLVM) {
         if (LLVMPrintModuleToFile(mod, O->out_path, &err)) {
             fprintf(stderr, "axiom: cannot write %s: %s\n", O->out_path, err);

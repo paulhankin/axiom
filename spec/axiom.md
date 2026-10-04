@@ -1124,7 +1124,8 @@ and stack traces are the same.
 - Stack traces (§16.4.1) keep its frames. A direct call to it does not record its call
   site; the site is passed to the inlined body, which records it only on the paths that
   need it, before a trap or before calling a function that is not inline. On every other
-  path the call costs nothing. A fault that is not a check (an out-of-bounds raw pointer
+  path the call costs nothing. (With frame tables, §16.4.1, nothing is recorded at run
+  time at all: the inlined code's frames come from the table.) A fault that is not a check (an out-of-bounds raw pointer
   access, say) inside an inlined body is reported as if it were in the caller.
 - With separate compilation (§16.7), every module that calls an inline function compiles
   its own copy.
@@ -2084,7 +2085,7 @@ object, a subprogram per function and a source line and column for each instruct
 so that native profilers (`perf annotate`, `perf report --sort srcline`), debuggers and
 `addr2line -i` map machine code back to Axiom source, inlined functions included
 (`DW_TAG_inlined_subroutine`). It is off by default (`--debug-info=none`), at every
-optimization level: the shadow stack (§16.4) needs no debug information, and outputs
+optimization level: stack traces (§16.4) need no debug information, and outputs
 stay small and independent of the directory they were built in. It does not change
 the generated instructions. `build`, `test` and `profile` accept it; the C compiler emits line tables
 for native and WebAssembly targets, and the self-hosted compiler accepts the option and
@@ -2297,6 +2298,31 @@ example, a naive recursive Fibonacci) it roughly doubles run time. On typical co
 is within measurement noise. Stack traces are on by default, and
 `--stack-traces=off` removes the instrumentation.
 
+**Frame tables.** Native code can be walked, so on x86-64 Linux the C compiler builds
+the same records without a shadow stack, and calls cost nothing:
+
+- Every function keeps a frame pointer, and the executable has a table (the section
+  `axiom_rets`) that maps the return address of each call to its call-site record,
+  followed by the records of the calls inlined around it: calls to `inline` functions
+  and the ones the optimizer inlined. The compiler takes these from the inlining
+  information LLVM keeps in its debug locations, and drops the debug information
+  afterwards unless `-g` asks for it.
+- A trap walks the frame-pointer chain from the trap's own frame, a crash from the
+  interrupted one, and looks each return address up. The frames fill the thread's
+  shadow-stack record (its calls and depth) as the stores would have, so the report,
+  `ax_on_trap`'s third argument and the test runner's frames are the same. Error-return
+  traces (§17.4.2) still use the record's ring.
+- The differences: a fault that is not a check (a raw pointer access, say) inside a
+  function the optimizer inlined is reported in the function it was inlined into, and
+  frames outside a callback from C code compiled without frame pointers can be missing
+  (C code built with the program, `--link=file.c`, keeps them).
+- Keeping frame pointers costs a register and a push and pop per function, and the
+  table 16 bytes per call. A recursive Fibonacci runs in about a third of the time it
+  takes with the shadow stack, the same as with `--stack-traces=off` to within noise.
+- `axiom profile` (§16.6) and `--sanitize=address` (§16.8) builds, which read the
+  records while the program runs, keep the shadow stack, as do WebAssembly, other
+  native targets and the self-hosted compiler.
+
 Traces are diagnostics only: whether they are on never changes a program's
 behavior. Record contents and layouts are toolchain ABI, not language semantics.
 
@@ -2417,7 +2443,8 @@ How samples are taken:
 | wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`runtime/profile_worker.mjs`) | main thread only |
 
 Profile builds are otherwise identical to ordinary builds with stack traces on (the
-default), except that shadow-stack stores are volatile, so optimization can't remove
+default), except that they always use the shadow stack (also where ordinary builds use
+frame tables, §16.4.1), that shadow-stack stores are volatile, so optimization can't remove
 them, and that calls to `inline` functions (§9.5) record their call sites like any other,
 so time spent in them is attributed to them. A program's behavior never depends on
 whether it is being profiled.
@@ -2528,7 +2555,8 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
 
 The allocator and the runtime are not instrumented. Memory that is not from the heap
 (globals, locals, memory from `@memory_grow`) is not checked. Allocation sites come from
-the shadow stack, so they need `--stack-traces=on` (the default). Each checked access
+the shadow stack (which sanitizer builds keep also where other builds use frame tables,
+§16.4.1), so they need `--stack-traces=on` (the default). Each checked access
 looks its shadow byte up inline and calls into `std/mem.ax` only when that test fails, so
 programs typically run three to four times slower, and use more memory. In code,
 `@sanitize_address()` is a constant: whether the program is being built with the
@@ -2869,6 +2897,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C39 | `@widen_low`, `@widen_high` and `@narrow` are specified (§13.2: lane types decide the sign, the result type of `@narrow` is given) and implemented; until then Appendix A listed them "per WASM" but no compiler had them. `@as(T, b)` converts a `bool` to any integer type (§6.2) | Issue 0035. Branch-free counting (`n += @as(u32, x > 0)`, Rust's `b as i32`) needed a helper function. `@as`, not a new builtin: the conversion is lossless and names its type |
 | C40 | `-g` / `--debug-info=lines`: DWARF line tables (§16.1) | Issue 0034: native profilers and debuggers could not map code back to Axiom source, and after inlining one symbol holds many functions |
 | C41 | `@ptr_add(p, n)` and `@ptr_sub(p, n)`: pointers moved by whole elements, which the program promises stay inside their object (§5.7). This is the one unchecked promise beside C13's defined memory: breaking it gives unspecified addresses, not a trap | Issue 0038: `@ptr_from_int(*T, @int_from_ptr(p) + 16)` is either an overflow check per access (`+`) or, wrapping (`+%`), an address WebAssembly cannot fold into the load's offset. Kernels reading rows of weights (the benchmark's) ran 1.15–1.25x slower than Rust's `p.add(n)`. `@ptr_sub` because walking back from an end pointer is as common; no signed variant, since the name gives the direction and `n` stays `usize` like every length |
+| C42 | Native x86-64 Linux builds of the C compiler find stack-trace frames by walking frame pointers, through a table from return addresses to call-site records, instead of a shadow stack written on every call (§16.4.1). Profile and sanitizer builds, WebAssembly and the self-hosted compiler keep the shadow stack | Issue 0037: the stores cost 15% in the benchmark's recursive move generator, and about double the time of a recursive Fibonacci. Traces are on by default, so their cost should be nothing on the hot path |
 
 ---
 

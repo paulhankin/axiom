@@ -1031,6 +1031,124 @@ void ax_memory_discard(uintptr_t addr, size_t len) {
     if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);
 }
 
+// --- Stack traces from frame pointers (issue 0037) ---------------------------
+// On x86-64 Linux the compiler keeps frame pointers instead of maintaining the
+// shadow stack's call records, and puts an entry for each call in the section
+// axiom_rets: the label just after the call (at its return address, or a
+// few bytes on, past copies of the result) and the call's chain of site
+// records, innermost first, null-terminated (see codegen: frame_tables_emit).
+// Both are stored relative to the entry; the first walk turns them into
+// addresses and sorts the table. A walk follows the frame-pointer chain and
+// fills the calling thread's shadow stack (calls and depth) as the shadow
+// stack would have them, so reports are formatted the same way. Programs
+// built with a shadow stack (profiles, --sanitize=address) have no table,
+// and their shadow stack is left alone.
+struct ax_ret_entry {
+    intptr_t ret, chain;
+};
+extern struct ax_ret_entry __start_axiom_rets[] __attribute__((weak, visibility("hidden")));
+extern struct ax_ret_entry __stop_axiom_rets[] __attribute__((weak, visibility("hidden")));
+__attribute__((weak)) const struct ax_shadow_stack *axiom_shadow_stack(void);
+
+static int ax_rets_state;  // 0: as linked, 1: being prepared, 2: absolute and sorted
+
+static void ax_rets_sift(struct ax_ret_entry *a, size_t i, size_t n) {
+    for (;;) {
+        size_t c = 2 * i + 1;
+        if (c >= n) return;
+        if (c + 1 < n && (uintptr_t)a[c + 1].ret > (uintptr_t)a[c].ret) c++;
+        if ((uintptr_t)a[c].ret <= (uintptr_t)a[i].ret) return;
+        struct ax_ret_entry t = a[i];
+        a[i] = a[c];
+        a[c] = t;
+        i = c;
+    }
+}
+
+static size_t ax_rets_prepare(void) {
+    struct ax_ret_entry *a = __start_axiom_rets;
+    size_t n = a && __stop_axiom_rets > a ? (size_t)(__stop_axiom_rets - a) : 0;
+    if (!n) return 0;
+    int st = 0;
+    if (__atomic_compare_exchange_n(&ax_rets_state, &st, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+        for (size_t i = 0; i < n; i++) {
+            a[i].ret += (intptr_t)&a[i].ret;
+            a[i].chain += (intptr_t)&a[i].chain;
+        }
+        for (size_t i = n / 2; i-- > 0;) ax_rets_sift(a, i, n);  // heapsort (no allocation)
+        for (size_t e = n; e-- > 1;) {
+            struct ax_ret_entry t = a[0];
+            a[0] = a[e];
+            a[e] = t;
+            ax_rets_sift(a, 0, e);
+        }
+        __atomic_store_n(&ax_rets_state, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&ax_rets_state, __ATOMIC_ACQUIRE) != 2) sched_yield();
+    }
+    return n;
+}
+
+// The chain of the call returning to `ra`, or NULL (not a recorded call).
+static const struct ax_trap_site *const *ax_rets_find(uintptr_t ra, size_t n) {
+    struct ax_ret_entry *a = __start_axiom_rets;
+    size_t lo = 0, hi = n;  // the first label at or after ra
+    while (lo < hi) {
+        size_t m = lo + (hi - lo) / 2;
+        if ((uintptr_t)a[m].ret < ra) lo = m + 1;
+        else hi = m;
+    }
+    if (lo == n || (uintptr_t)a[lo].ret - ra > 64) return NULL;
+    return (const struct ax_trap_site *const *)a[lo].chain;
+}
+
+// Fills the calling thread's shadow stack from the frames, starting at the
+// frame record `fp` ({caller's frame pointer, return address}); `sp` is the
+// lowest address the walk may read.
+static void ax_walk_frames(uintptr_t fp, uintptr_t sp) {
+    struct ax_shadow_stack *ss = axiom_shadow_stack ? (struct ax_shadow_stack *)axiom_shadow_stack() : NULL;
+    size_t n = ax_rets_prepare();
+    if (!ss || !n) return;
+    uintptr_t top = sp + ((uintptr_t)1 << 30);
+    pthread_attr_t attr;
+    void *stk;
+    size_t stksz;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        if (pthread_attr_getstack(&attr, &stk, &stksz) == 0 && (uintptr_t)stk <= sp && sp < (uintptr_t)stk + stksz)
+            top = (uintptr_t)stk + stksz;
+        pthread_attr_destroy(&attr);
+    }
+    const struct ax_trap_site *inner[AX_SS_CAP];
+    uint64_t depth = 0;
+    for (uintptr_t f = fp; f >= sp && f <= top - 16 && !(f & 7);) {
+        const uintptr_t *rec = (const uintptr_t *)f;
+        const struct ax_trap_site *const *c = ax_rets_find(rec[1], n);
+        for (; c && *c; c++) {
+            if (depth < AX_SS_CAP) inner[depth] = *c;
+            depth++;
+        }
+        if (rec[0] <= f) break;
+        f = rec[0];
+    }
+    ss->depth = depth > UINT32_MAX ? UINT32_MAX : (uint32_t)depth;
+    for (uint64_t k = 0; k < depth && k < AX_SS_CAP; k++) ss->calls[(depth - 1 - k) & (AX_SS_CAP - 1)] = inner[k];
+}
+
+// From axiom.trap (compiled code), with its own frame.
+void ax_stack_walk(void *fp) {
+    ax_walk_frames((uintptr_t)fp, (uintptr_t)fp);
+}
+
+// From a signal handler: the interrupted code's frames.
+void ax_stack_walk_signal(void *ucontext) {
+#if defined(__x86_64__) && defined(__linux__)
+    const ucontext_t *uc = ucontext;
+    if (uc) ax_walk_frames((uintptr_t)uc->uc_mcontext.gregs[REG_RBP], (uintptr_t)uc->uc_mcontext.gregs[REG_RSP]);
+#else
+    (void)ucontext;
+#endif
+}
+
 // Defined by runtime/profile.c when profiling: writes the samples so far.
 __attribute__((weak)) void ax_profile_flush(void);
 
@@ -1050,10 +1168,7 @@ __attribute__((weak)) void ax_on_trap(const struct ax_trap_site *site, const str
 // Crashes that are not Axiom traps (a stack overflow, or a fault in C code
 // called through the FFI) are reported with the shadow stack, then the
 // signal is re-raised.
-__attribute__((weak)) const struct ax_shadow_stack *axiom_shadow_stack(void);
-
 static void ax_crash(int sig, siginfo_t *si, void *uc) {
-    (void)uc;
     static char buf[16384];
     const char *what = sig == SIGSEGV ? "segmentation fault" : sig == SIGBUS ? "bus error" : "arithmetic fault";
     int code = sig == SIGFPE ? 3 : 5;
@@ -1071,6 +1186,7 @@ static void ax_crash(int sig, siginfo_t *si, void *uc) {
     if (code == 8) n = snprintf(buf, sizeof buf, "axiom: trap T0008 (stack exhausted)\n");
     else n = snprintf(buf, sizeof buf, "axiom: crash: %s (address %p)\n", what, si->si_addr);
     if (n < 0 || (size_t)n >= sizeof buf) n = 0;
+    ax_stack_walk_signal(uc);
     const struct ax_shadow_stack *ss = axiom_shadow_stack ? axiom_shadow_stack() : NULL;
     n += (int)ax_format_stack(buf + n, sizeof buf - (size_t)n, NULL, ss);
     (void)!write(2, buf, (size_t)n);

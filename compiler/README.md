@@ -91,7 +91,15 @@ from a per-thread shadow stack of call sites. Each call costs three stores and a
 load; `--stack-traces=off` removes them. A call to an `inline fn` (always inlined, LLVM's
 `alwaysinline`) passes its call-site record as an extra argument instead, which the
 inlined body pushes only before a trap or a call that is not inline (`INL_SITES` in
-`codegen.c`).
+`codegen.c`). On x86-64 Linux, except in profile and `--sanitize=address` builds,
+calls cost nothing instead (issue 0037, `frame_tables_emit` in `codegen.c`): functions
+keep frame pointers, each call gets a lexical-block `DILocation` of its own and
+`nomerge`, and after optimization the inlinedAt chain of each remaining call's
+location gives its records, which an inline-assembly label after the call puts in
+the section `axiom_rets`. A trap or crash walks the frame pointers and fills the
+shadow stack's ring from the table (`ax_stack_walk` in `runtime/native_host.c`), so
+everything that reads the shadow stack is unchanged. The debug information that
+this needs is stripped after optimization without `-g`.
 
 **Line tables** (spec §16.1): `-g` / `--debug-info=lines` attaches a `DISubprogram` to
 each function and a `DILocation` (from the same spans as the trap sites) to each
