@@ -77,3 +77,6 @@ they travel with the code they describe.
 | [0045](0045-closures.md) | feature | language | No closures |
 | [0046](0046-selfhost-wide-vectors.md) | feature | compiler (selfhost) | Self-hosted x86-64 backend: 512-bit vector code is about 10x slower than LLVM's |
 | [0047](0047-wrap-by-default.md) | language change | language, compilers, std | Integer overflow wraps by default, in every build mode |
+| [0048](0048-constant-array-lengths.md) | feature | language, compilers | Array lengths cannot be constant expressions |
+| [0049](0049-address-of-temporary.md) | feature | language | Cannot take the address of a temporary |
+| [0050](0050-test-output.md) | feature | tools | `axiom test` hides what a test prints |
