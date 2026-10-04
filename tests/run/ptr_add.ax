@@ -1,0 +1,92 @@
+// @ptr_add and @ptr_sub (issue 0038): pointers moved by whole elements, over
+// scalars, structs (whose size is not a power of two), vectors, bool, and a
+// generic element type; the result keeps the pointer's mutability. The rows
+// loop is the case the builtin was made for: f32x4 rows read at constant
+// element offsets from one base pointer.
+import "../lib/io.ax" as io;
+
+struct P3 {
+    x: u32,
+    y: u32,
+    z: u32,
+}
+
+let mut words: [8]u32 = [10, 11, 12, 13, 14, 15, 16, 17];
+let mut pts: [4]P3 = [
+    P3.{ x: 1, y: 2, z: 3 }, P3.{ x: 4, y: 5, z: 6 }, P3.{ x: 7, y: 8, z: 9 }, P3.{ x: 10, y: 11, z: 12 }];
+let mut rows: [64]f32 = [0.0; 64];
+let mut flags: [4]bool = [false, true, false, true];
+
+fn nth[T](p: *T, n: usize) T {
+    return @ptr_add(p, n).*;
+}
+
+fn last[T](end: *T) T {
+    return @ptr_sub(end, 1).*;
+}
+
+// Sum of the eight f32x4 of each 32-float row, weighted, like the benchmark's dim128.
+fn rows_dot(base: *f32x4, nrows: usize, w: f32) f32x4 {
+    let mut acc: f32x4 = @splat(0.0);
+    let k: f32x4 = @splat(w);
+    for r in @as(usize, 0)..nrows {
+        let row = @ptr_add(base, r * 8);
+        acc = acc + @ptr_add(row, 0).* * k + @ptr_add(row, 1).* * k + @ptr_add(row, 2).* * k + @ptr_add(row, 3).* * k;
+        acc = acc + @ptr_add(row, 4).* * k + @ptr_add(row, 5).* * k + @ptr_add(row, 6).* * k + @ptr_add(row, 7).* * k;
+    }
+    return acc;
+}
+
+export fn run() void {
+    let p: *u32 = &words[0];
+    io.uint(@as(u64, @ptr_add(p, 0).*));  // expect: 10
+    io.uint(@as(u64, @ptr_add(p, 3).*));  // expect: 13
+    io.uint(@as(u64, @int_from_ptr(@ptr_add(p, 5)) - @int_from_ptr(p)));  // expect: 20
+    io.boolean(@ptr_add(p, 0) == p);                   // expect: true
+    let end = @ptr_add(p, 8);                          // one past the end
+    io.uint(@as(u64, @ptr_sub(end, 1).*));             // expect: 17
+    io.uint(@as(u64, @ptr_sub(@ptr_add(p, 6), 4).*));  // expect: 12
+    io.boolean(@ptr_sub(end, 8) == p);                 // expect: true
+
+    // Through *mut: the result is *mut, and writes land in the array.
+    let m: *mut u32 = &mut words[0];
+    for i in @as(usize, 0)..8 {
+        @ptr_add(m, i).* = @ptr_add(m, i).* * 2;
+    }
+    @ptr_sub(@ptr_add(m, 8), 2).* = 99;
+    io.uint(@as(u64, words[0]));  // expect: 20
+    io.uint(@as(u64, words[6]));  // expect: 99
+    io.uint(@as(u64, words[7]));  // expect: 34
+
+    // A 12-byte struct: whole elements, not bytes.
+    let q: *P3 = &pts[0];
+    io.uint(@as(u64, @ptr_add(q, 2).y));  // expect: 8
+    io.uint(@as(u64, @int_from_ptr(@ptr_add(q, 3)) - @int_from_ptr(q)));  // expect: 36
+    io.uint(@as(u64, @ptr_sub(@ptr_add(q, 4), 1).z));                     // expect: 12
+    let mq: *mut P3 = &mut pts[0];
+    @ptr_add(mq, 1).x = 40;
+    io.uint(@as(u64, pts[1].x));  // expect: 40
+
+    // bool is one byte in memory.
+    let b: *bool = &flags[0];
+    io.boolean(@ptr_add(b, 3).*);  // expect: true
+    io.uint(@as(u64, @int_from_ptr(@ptr_add(b, 3)) - @int_from_ptr(b)));  // expect: 3
+
+    // Generic element types; the offset may be computed.
+    let n: usize = 2;
+    io.uint(@as(u64, nth(p, n + 1)));           // expect: 26
+    io.uint(@as(u64, nth(q, n).z));             // expect: 9
+    io.uint(@as(u64, last(@ptr_add(q, n)).x));  // expect: 40
+
+    // Vector rows from a raw address, as kernels read weight matrices.
+    for i in @as(usize, 0)..64 {
+        rows[i] = @float_from_int(f32, i);
+    }
+    let base = @ptr_from_int(*f32x4, @int_from_ptr(&rows[0]));
+    io.uint(@as(u64, @int_from_ptr(@ptr_add(base, 3)) - @int_from_ptr(base)));  // expect: 48
+    let acc = rows_dot(base, 2, 0.5);
+    // lane j: 0.5 * the sum over r < 2, k < 8 of (32r + 4k + j) = 240 + 8j
+    io.float(@as(f64, @extract_lane(acc, 0)));  // expect: 240
+    io.float(@as(f64, @extract_lane(acc, 3)));  // expect: 264
+    io.float(@as(f64, @extract_lane(rows_dot(@ptr_add(base, 8), 1, 1.0), 1)));  // expect: 376
+}

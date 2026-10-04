@@ -557,9 +557,29 @@ only operations on pointers are:
 - `==` and `!=`
 - the conversion builtins `@int_from_ptr`, `@ptr_from_int`, `@ptr_cast`, and
   `@slice_from_ptr`
+- the offset builtins `@ptr_add` and `@ptr_sub`
 
-There is no pointer arithmetic operator. Write
-`@ptr_from_int(*T, @int_from_ptr(p) + k)`, which states the byte offset explicitly.
+There is no pointer arithmetic operator. `@ptr_add(p, n)`, with `p` a `*T` or `*mut T`
+and `n` a `usize`, is the pointer `n` elements of `T` past `p`, of the same type as `p`:
+the address `@int_from_ptr(p) + n * @size_of(T)` (C's `p + n`, Rust's `p.add(n)`).
+`@ptr_sub(p, n)` is the pointer `n` elements before `p` (Rust's `p.sub(n)`). `T` must
+not be `void`. Neither ever traps: each is the program's promise that the result stays
+inside the object `p` points into (a global, a local, an array, or one block from the
+allocator), or just past its end. Compilers rely on the promise to fold constant offsets
+into addressing (on WebAssembly, `v128.load offset=16` rather than an add and an overflow
+check). The promise is not checked. A result outside the object is a logic bug, like a
+wrong `@ptr_from_int` address, but with a weaker guarantee: code compiled on the promise
+may have moved or merged the accesses, so loads and stores through it reach unspecified
+addresses (still checked against linear memory where §12.1 applies) and comparisons
+with it give unspecified results.
+
+```axiom
+let row = @ptr_add(base, r * 8);          // base: *f32x4, after checking the matrix's length
+acc = acc + @ptr_add(row, 1).* * x;       // the second f32x4 of the row
+```
+
+For an offset in bytes, or one that may leave the object, use
+`@ptr_from_int(*T, @int_from_ptr(p) + k)`, which is checked arithmetic on the address.
 
 ### 5.8 SIMD vectors
 
@@ -2690,6 +2710,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 
 | Builtin | Signature | Notes |
 |---|---|---|
+| `@ptr_add(p, n)` / `@ptr_sub(p, n)` | `*T, usize → *T` (`*mut T → *mut T`) | `n` elements of `T` past (before) `p`. Never traps; the result must stay in `p`'s object (§5.7) |
 | `@slice_from_ptr(p, n)` | `*T, usize → []T` (`*mut T → []mut T`) | No check at creation. Accesses are bounds-checked against linear memory |
 | `@cast_slice(T, s)` | `[]U → []T` (keeps mutability) | Traps `T0006` if `s.len * size_of(U)` is not a multiple of `size_of(T)` |
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
@@ -2847,6 +2868,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C38 | `inline fn`: functions that are always inlined, never recursive, whose calls record no stack-trace site unless a trap or call needs it (§9.5). `inline` is a keyword only before `fn` | Issue 0032: Axiom has no macros, and code ported from Rust's `macro_rules!` and `#[inline(always)]` became calls (with the shadow-stack record making them look bigger to LLVM's inliner) |
 | C39 | `@widen_low`, `@widen_high` and `@narrow` are specified (§13.2: lane types decide the sign, the result type of `@narrow` is given) and implemented; until then Appendix A listed them "per WASM" but no compiler had them. `@as(T, b)` converts a `bool` to any integer type (§6.2) | Issue 0035. Branch-free counting (`n += @as(u32, x > 0)`, Rust's `b as i32`) needed a helper function. `@as`, not a new builtin: the conversion is lossless and names its type |
 | C40 | `-g` / `--debug-info=lines`: DWARF line tables (§16.1) | Issue 0034: native profilers and debuggers could not map code back to Axiom source, and after inlining one symbol holds many functions |
+| C41 | `@ptr_add(p, n)` and `@ptr_sub(p, n)`: pointers moved by whole elements, which the program promises stay inside their object (§5.7). This is the one unchecked promise beside C13's defined memory: breaking it gives unspecified addresses, not a trap | Issue 0038: `@ptr_from_int(*T, @int_from_ptr(p) + 16)` is either an overflow check per access (`+`) or, wrapping (`+%`), an address WebAssembly cannot fold into the load's offset. Kernels reading rows of weights (the benchmark's) ran 1.15–1.25x slower than Rust's `p.add(n)`. `@ptr_sub` because walking back from an end pointer is as common; no signed variant, since the name gives the direction and `n` stays `usize` like every length |
 
 ---
 

@@ -426,6 +426,18 @@ Type *builtin_check(Expr *e, Type *expected) {
             diag_error(e->span, "E0706", "@ptr_cast cannot add 'mut' to a pointer");
         return e->type = t;
     }
+    case BI_PTR_ADD:
+    case BI_PTR_SUB: {
+        const char *name = builtin_info[e->index].name;
+        Type *p = check_expr(*earg(e, 0), NULL);
+        check_expr_to(earg(e, 1), t_usize);
+        if (p->kind != TY_PTR) {
+            if (p->kind != TY_INVALID) diag_error(e->span, "E0822", "@%s requires a pointer, found %s", name, type_str(p));
+            return e->type = t_invalid;
+        }
+        if (p->elem->kind == TY_VOID) diag_error(e->span, "E0822", "@%s needs a pointer to sized elements, not *void", name);
+        return e->type = p;
+    }
     case BI_SLICE_FROM_PTR: {
         Type *p = check_expr(*earg(e, 0), NULL);
         check_expr_to(earg(e, 1), t_usize);

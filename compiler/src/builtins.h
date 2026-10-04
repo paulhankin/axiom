@@ -21,6 +21,8 @@
     X(INT_FROM_PTR, "int_from_ptr", "e")      \
     X(PTR_FROM_INT, "ptr_from_int", "te")     \
     X(PTR_CAST, "ptr_cast", "te")             \
+    X(PTR_ADD, "ptr_add", "ee")               \
+    X(PTR_SUB, "ptr_sub", "ee")               \
     X(SLICE_FROM_PTR, "slice_from_ptr", "ee") \
     X(CAST_SLICE, "cast_slice", "te")         \
     X(MEM_COPY, "mem_copy", "ee")             \

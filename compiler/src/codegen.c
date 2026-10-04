@@ -2480,6 +2480,16 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_INT_FROM_PTR: return LLVMBuildPtrToInt(B, gen(a[0].e), T_isz, "");
     case BI_PTR_FROM_INT: return LLVMBuildIntToPtr(B, gen(a[1].e), T_ptr, "");
     case BI_PTR_CAST: return gen(a[1].e);
+    case BI_PTR_ADD:
+    case BI_PTR_SUB: {
+        // In-bounds (spec §5.7): LLVM may then fold constant offsets into
+        // addressing, such as wasm's `offset=` and x86 displacements. The
+        // stride is exactly the element's size.
+        LLVMValueRef p = gen(a[0].e), n = gen(a[1].e);
+        if (e->index == BI_PTR_SUB) n = LLVMBuildNeg(B, n, "");
+        LLVMTypeRef st = LLVMArrayType2(T_i8, (uint64_t)type_size(rt->elem));
+        return LLVMBuildInBoundsGEP2(B, st, p, &n, 1, "");
+    }
     case BI_SLICE_FROM_PTR: {
         LLVMValueRef p = gen(a[0].e), n = gen(a[1].e);
         LLVMValueRef s = LLVMGetUndef(lty(rt));
