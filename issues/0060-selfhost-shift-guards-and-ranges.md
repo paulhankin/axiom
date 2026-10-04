@@ -1,7 +1,7 @@
 # 0060: Self-hosted optimizer keeps shift guards and checks that value ranges rule out
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (bd1a230)
 - Area: compiler (selfhost: codegen shift lowering, combine, gvn range facts)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -69,3 +69,43 @@ Five instructions per shift in the movegen loop (two shifts per step) and in the
 kernels' loops, and 40 trap paths with their shadow-stack records in
 `calculate_half_inputs_with_masks`. Estimate: 3-6% of movegen and `contact_inputs`,
 about 30-50 ns summed.
+
+## Resolution
+
+Fixed in bd1a230, in `codegen.ax` and `gvn.ax` (the bounds facts were already in GVN, so
+nothing went into `combine.ax`):
+
+- **Shifts.** `gen_shift` lowers a shift left or logical shift right by a variable count to
+  `select(k >= w, 0, op(x, k))`: the count is not clamped (every backend masks it, and the
+  select replaces whatever an out-of-range count computes), so an unknown count is
+  `shlx; xor; cmp; cmovae` on x86-64. Arithmetic shifts keep their clamped count (the sign
+  fill), and constant counts fold as before. GVN removes the select when the count's
+  bound is below the width (the movegen loop's `1 << (31 - @clz(mask))` is a lone `shlx`).
+- **Upper bounds** (`ub`, used to decide comparisons): bit counts (`ctlz`/`cttz` at most
+  `bits - 1` of a value known non-zero, `cttz` below its highest possible bit, `ctpop` at
+  most its bit length), `umin`/`umax`, `smin`/`smax` of values known not negative, `and`
+  of two variables, `or`/`xor`, `c - y` (less the lower bound `bits - bitlen(ub)` of a
+  `ctlz`), `y - z` with `z <= y` known, `y - c` with `y >= c` known, shifts by variable
+  counts, `sext`/`ashr` of values known not negative, a select's arms under its
+  condition, and loads from constant tables (the largest element; offsets multiples of
+  the element size; cached per run). A phi's inputs are taken with the conditions on the
+  paths into it (`path_assume`). A loop phi is bounded by induction: the back edge's value
+  must stay within the other inputs' bound with the phi assumed within it, using only the
+  facts that also hold at the back edge (`fact_lo`/`fact_hi` hide the rest of the scope).
+- **Signed facts.** `x > c` (`c >= -1`) or `x >= c` (`c >= 0`) records that `x` is not
+  negative and at least `c` as unsigned; then `x <= K` adds an unsigned bound. A signed
+  comparison of a value known not negative with a constant that is not negative is decided
+  as the unsigned one.
+
+`calculate_half_inputs_with_masks`: 45 trap paths to 4 (LLVM: 5); `generate_moves_sub`:
+21 to 16 and 11 selects to 6 (the shifts left with a guard have counts nothing bounds:
+`BAR - r` for a byte `r` and `from_pip + 1`). Over `bench_kernels`, 884 trap calls to 810
+and 426 selects to 375. Tests: `tests/run/ranges.ax` (shifts by every count 0-299 at each
+width and signedness, the patterns above, including values that may be 0) and
+`tests/lowering/x64_ranges.ax`.
+
+`bench_kernels` (ns, min of 21, against main at 7fd6c8f): `contact_inputs` 243 to 224
+(LLVM 185), `pruned_boards` 64 to 61; the other kernels within noise. `movegen` and
+`race_inputs` moved by up to +4% and +8% between builds whose code for those functions is
+identical (`calculate_race_inputs` is byte-identical; builds differing only in other
+functions' sizes span 860-895 ns in `movegen`): code placement, not the change.

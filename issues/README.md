@@ -91,7 +91,7 @@ they travel with the code they describe.
 | [0057](0057-selfhost-scalar-isel.md) | feature | compiler (selfhost: x64, x64enc, opt layout) | Self-hosted x86-64: scalar instruction selection leaves extensions, flag materialisation and copies (fixed in 0cbcfb6, 9e2bb29) |
 | [0058](0058-selfhost-avx512-masks.md) | feature | compiler (selfhost: x64, combine) | Self-hosted x86-64: AVX-512 compares are expanded to vectors instead of used as k-masks |
 | [0059](0059-selfhost-int-to-float.md) | feature | compiler (selfhost: x64, combine) | Self-hosted x86-64: int-to-float conversions go through the stack; float division by powers of two (fixed in 68528df) |
-| [0060](0060-selfhost-shift-guards-and-ranges.md) | feature | compiler (selfhost: codegen, combine, gvn) | Self-hosted optimizer keeps shift guards and checks that value ranges rule out |
+| [0060](0060-selfhost-shift-guards-and-ranges.md) | feature | compiler (selfhost: codegen, combine, gvn) | Self-hosted optimizer keeps shift guards and checks that value ranges rule out (fixed in bd1a230) |
 | [0061](0061-selfhost-addressing-modes.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64: addressing modes not folded, address arithmetic recomputed in loops (fixed in 0cbcfb6, 4b24f5d) |
 | [0062](0062-selfhost-shuffles-and-reductions.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: constant shuffles as table permutes, lane extracts and reductions |
 | [0063](0063-selfhost-correlated-branches.md) | feature | compiler (selfhost: thread) | Self-hosted optimizer: correlated branches not threaded, data-dependent table branches not if-converted (fixed in b18d0de, 360066b) |
