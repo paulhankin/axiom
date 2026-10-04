@@ -516,6 +516,13 @@ static void resolve_fn(Decl *d) {
         diag_error(d->abi_span, "E0307", "'...' (C varargs) is only allowed in extern \"C\" declarations");
     else if (d->variadic && d->params.len == 0)
         diag_error(d->abi_span, "E0307", "a variadic C function needs at least one fixed parameter");
+    if (d->is_inline) {
+        if (d->is_export)
+            diag_error(d->inline_span, "E0313", "an exported function cannot be inline (its callers are outside the program)");
+        else if (d->attr != ATTR_NONE)
+            diag_error(d->inline_span, "E0313", "an inline function cannot have @%s (it is compiled as part of its callers)",
+                       d->attr == ATTR_FEATURES ? "features" : "multiversion");
+    }
     if (d->is_export || d->kind == D_HOST_FN) {
         const char *what = d->is_export ? "exported" : d->extern_c ? "C" : "imported";
         if (d->gparams.len) diag_error(d->name_span, "E0466", "%s functions cannot be generic", what);
@@ -734,6 +741,35 @@ static bool is_std_module(Module *m) {
     return strncmp(m->path, rp, n) == 0 && m->path[n] == '/';
 }
 
+// Whether inline function `from` reaches `to` through calls between inline
+// functions.
+static bool inline_reaches(Decl *from, Decl *to, int mark) {
+    if (from == to) return true;
+    if (from->inline_mark == mark) return false;
+    from->inline_mark = mark;
+    for (int i = 0; i < from->inline_callees.len; i++)
+        if (inline_reaches(from->inline_callees.data[i], to, mark)) return true;
+    return false;
+}
+
+// An inline function cannot be recursive, directly or through other inline
+// functions (spec §9.5): every call on such a cycle is reported.
+static void check_inline_cycles(void) {
+    int mark = 0;
+    for (int i = 0; i < g_prog.fns.len; i++) {
+        Decl *g = g_prog.fns.data[i];
+        for (int k = 0; k < g->inline_callees.len; k++) {
+            Decl *f = g->inline_callees.data[k];
+            if (!inline_reaches(f, g, ++mark)) continue;
+            if (f == g)
+                diag_error(g->inline_call_spans.data[k], "E0314", "inline function '%s' calls itself (an inline function cannot be recursive)", g->name);
+            else
+                diag_error(g->inline_call_spans.data[k], "E0314",
+                           "this call to inline function '%s' leads back to '%s' (inline functions cannot be recursive)", f->name, g->name);
+        }
+    }
+}
+
 bool sema_run(const char *path, SemaOptions *opts) {
     g_std_dir = opts->std_dir;
     if (!getcwd(g_cwd, sizeof g_cwd)) g_cwd[0] = 0;
@@ -815,5 +851,6 @@ bool sema_run(const char *path, SemaOptions *opts) {
             }
         }
     }
+    check_inline_cycles();
     return diag_error_count() == 0;
 }

@@ -1699,6 +1699,7 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     }
     fi.fnv.fnp.features = fi.feats;
     fi.fnv.fnp.has_features = true;
+    fi.fnv.fnp.always_inline = (d.kind == ast.D_FN) and d.is_inline;
     add_ext_attrs(fi.fnv, fi.fnty, fi.sret, false);
     if d.kind == ast.D_HOST_FN {
         if d.extern_c {
@@ -2758,6 +2759,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         if s == rt {
             return v;
         }
+        if s.kind == ast.TY_BOOL {
+            return zext(v, lty(rt));
+        }
         if (s.kind == ast.TY_INT) and (rt.kind == ast.TY_INT) {
             return ext_int(v, lty(rt), s.is_signed);
         }
@@ -3268,6 +3272,58 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         }
         let mut dargs: [2]*mut ir.Value = [x, y];
         return ir.intr(B, ir.IN_DOT_I16, lty(rt), dargs[..]);
+    }
+    if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
+        // lane by lane: WebAssembly's extend_low/extend_high
+        let vt = ct(barg(e, 0).ty);
+        let v = gen(barg(e, 0));
+        let n = @as(u64, @bit_cast(u32, rt.lanes));
+        let mut base: u64 = 0;
+        if id == ast.BI_WIDEN_HIGH {
+            base = n;
+        }
+        let lt = lty(rt.elem);
+        let mut r = ir.czero(lty(rt));
+        for i in @as(u64, 0)..n {
+            let x = ext_int(ext_elem(v, ci32(base + i)), lt, vt.elem.is_signed);
+            r = ins_elem(r, x, ci32(i));
+        }
+        return r;
+    }
+    if id == ast.BI_NARROW {
+        // lane by lane, each saturated to the result's range: WebAssembly's
+        // narrow_*_sat, by the operand and result lane types
+        let vt = ct(barg(e, 1).ty);
+        let x = gen(barg(e, 1));
+        let y = gen(barg(e, 2));
+        let n = @as(u64, @bit_cast(u32, vt.lanes));
+        let wt = lty(vt.elem);
+        let lt = lty(rt.elem);
+        let bits = @as(u64, @bit_cast(u32, rt.elem.bits));
+        let mut hi: u64 = (@as(u64, 1) << bits) - 1;
+        let mut lo: u64 = 0;
+        if rt.elem.is_signed {
+            hi = (@as(u64, 1) << (bits - 1)) - 1;
+            lo = 0 -% (@as(u64, 1) << (bits - 1));
+        }
+        let mut r = ir.czero(lty(rt));
+        for i in @as(u64, 0)..(2 * n) {
+            let mut src = x;
+            let mut k = i;
+            if i >= n {
+                src = y;
+                k = i - n;
+            }
+            let mut l = ext_elem(src, ci32(k));
+            if vt.elem.is_signed {
+                l = sel(icmp(ir.IntSLT, l, ci(wt, lo)), ci(wt, lo), l);
+                l = sel(icmp(ir.IntSGT, l, ci(wt, hi)), ci(wt, hi), l);
+            } else {
+                l = sel(icmp(ir.IntUGT, l, ci(wt, hi)), ci(wt, hi), l);
+            }
+            r = ins_elem(r, trunc(l, lt), ci32(i));
+        }
+        return r;
     }
     if id == ast.BI_TRAP {
         emit_trap(T_TRAP);

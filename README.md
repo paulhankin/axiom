@@ -20,6 +20,7 @@ axiom new geometry                 # a package: axiom.toml + src/lib.ax (spec §
 axiom test geometry                # build/check/test also take a package directory
 axiom profile prog.ax              # sampling profiler: hot functions, call sites, flame graph input
 axiom build prog.ax --sanitize=address   # trap on use after free, double free, overflows; report leaks
+axiom build prog.ax --target=native -O2 -g   # DWARF line tables, for perf annotate, gdb, addr2line -i
 axiom build app --verbose          # modules compile separately and are cached (spec §16.7)
 node tests/run.mjs                    # run the test suite
 selfhost/bootstrap.sh                 # build the self-hosted compiler (stage 1, 2, 3)

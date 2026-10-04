@@ -29,6 +29,11 @@ typedef struct Parser {
 static Token *peek(Parser *P) { return &P->t[P->pos]; }
 static Token *peek2(Parser *P) { return &P->t[P->pos + 1 < P->n ? P->pos + 1 : P->n - 1]; }
 static TokKind pk(Parser *P) { return P->t[P->pos].kind; }
+// `inline` is a keyword only before `fn` (spec §9.5)
+static bool at_inline(Parser *P) {
+    return pk(P) == TK_IDENT && !strcmp(peek(P)->name, "inline") && peek2(P)->kind == KW_FN;
+}
+
 static Token *advance(Parser *P) {
     Token *t = &P->t[P->pos];
     if (P->pos < P->n - 1) P->pos++;
@@ -119,7 +124,7 @@ static TypeExpr *new_te(TEKind k, Span sp) {
 
 static void parse_field_list(Parser *P, FieldVec *out) {
     // Field ( "," Field )* ","?
-    while (pk(P) == TK_IDENT) {
+    while (pk(P) == TK_IDENT && !at_inline(P)) {
         Field f = {0};
         f.name = expect_ident(P, &f.span);
         expect(P, TK_COLON);
@@ -930,11 +935,21 @@ static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     return d;
 }
 
+static Decl *parse_fn_inline(Parser *P, Span start, bool is_pub, bool is_export) {
+    Span is = peek(P)->span;
+    bool inl = at_inline(P);
+    if (inl) advance(P);
+    Decl *d = parse_fn(P, start, is_pub, is_export);
+    d->is_inline = inl;
+    d->inline_span = is;
+    return d;
+}
+
 static void parse_methods(Parser *P, Decl *owner) {
-    while (pk(P) == KW_PUB || pk(P) == KW_FN) {
+    while (pk(P) == KW_PUB || pk(P) == KW_FN || at_inline(P)) {
         Span ms = peek(P)->span;
         bool mp = accept(P, KW_PUB);
-        Decl *m = parse_fn(P, ms, mp, false);
+        Decl *m = parse_fn_inline(P, ms, mp, false);
         m->owner = owner;
         vec_push(owner->methods, m);
     }
@@ -1044,12 +1059,12 @@ static void parse_top(Parser *P) {
     }
     if (t->kind == KW_EXPORT) {
         advance(P);
-        if (pk(P) != KW_FN) {
+        if (pk(P) != KW_FN && !at_inline(P)) {
             syntax_error(P, "'fn' after 'export'");
             sync_stmt(P);
             return;
         }
-        vec_push(P->mod->decls, parse_fn(P, start, false, true));
+        vec_push(P->mod->decls, parse_fn_inline(P, start, false, true));
         return;
     }
     bool is_pub = accept(P, KW_PUB);
@@ -1085,6 +1100,10 @@ static void parse_top(Parser *P) {
     // `threadlocal` is a keyword only here, before a module-level `let`
     bool tls = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "threadlocal") && peek2(P)->kind == KW_LET;
     if (tls) advance(P);
+    if (at_inline(P)) {
+        vec_push(P->mod->decls, parse_fn_inline(P, start, is_pub, false));
+        return;
+    }
     switch (pk(P)) {
     case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
     case KW_STRUCT: {
@@ -1108,7 +1127,7 @@ static void parse_top(Parser *P) {
         d->name = expect_ident(P, &d->name_span);
         parse_generic_params(P, d);
         expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT) {
+        while (pk(P) == TK_IDENT && !at_inline(P)) {
             Variant v = {0};
             v.name = expect_ident(P, &v.span);
             if (accept(P, TK_COLON)) v.te = parse_type(P);
@@ -1128,7 +1147,7 @@ static void parse_top(Parser *P) {
         d->name = expect_ident(P, &d->name_span);
         if (accept(P, TK_COLON)) d->te = parse_type(P);
         expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT) {
+        while (pk(P) == TK_IDENT && !at_inline(P)) {
             Variant v = {0};
             v.name = expect_ident(P, &v.span);
             if (accept(P, TK_EQ)) {

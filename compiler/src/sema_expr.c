@@ -1170,6 +1170,10 @@ static Type *check_call(Expr *e, Type *expected) {
         e->gargs = gargs;
         e->ngargs = nall;
         e->op = CALLK_DIRECT;
+        if (fn->is_inline && C->fn && C->fn->is_inline) {
+            vec_push(C->fn->inline_callees, fn);
+            vec_push(C->fn->inline_call_spans, e->span);
+        }
         // receiver
         if (method) {
             Expr *recv = callee->b;

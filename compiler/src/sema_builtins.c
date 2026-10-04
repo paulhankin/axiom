@@ -157,6 +157,7 @@ static Type *mask_type(Type *v) {
 
 static bool lossless(Type *from, Type *to) {
     if (from == to) return true;
+    if (from->kind == TY_BOOL) return to->kind == TY_INT;  // false 0, true 1
     if (from->kind == TY_INT && to->kind == TY_INT) {
         // usize/isize are at least 32 and at most 64 bits, portably.
         int fmax = from->is_size ? 64 : from->bits;
@@ -265,6 +266,10 @@ Type *builtin_check(Expr *e, Type *expected) {
             e->cval = a->cval;
             e->fval = a->fval;
             return e->type = t;
+        }
+        if (s->kind == TY_BOOL && t->kind == TY_INT && (*earg(e, 1))->kind == E_BOOL) {
+            e->is_const = true;
+            e->cval = (*earg(e, 1))->bval ? 1 : 0;
         }
         if (s->kind != TY_INVALID && t->kind != TY_INVALID && !lossless(s, t)) {
             Diag *d = diag_error(e->span, "E0510", "@as cannot convert %s to %s without possible loss of information",
@@ -723,6 +728,41 @@ Type *builtin_check(Expr *e, Type *expected) {
         if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, t->lanes / 2);
         diag_error(e->span, "E0812", "@dot requires float vectors or i16 lanes, found %s", type_str(t));
         return e->type = t_invalid;
+    }
+    case BI_WIDEN_LOW:
+    case BI_WIDEN_HIGH: {
+        // half the lanes, each twice as wide, extended by the lane type's sign
+        Type *t = operand(earg(e, 0), NULL);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!ty_is_vec_int(t) || t->elem->bits > 32) {
+            diag_error((*earg(e, 0))->span, "E0812", "@%s requires an integer vector with 8-, 16- or 32-bit lanes, found %s",
+                       e->name, type_str(t));
+            return e->type = t_invalid;
+        }
+        return e->type = type_vec(type_int(t->elem->bits * 2, t->elem->is_signed, false), t->lanes / 2);
+    }
+    case BI_NARROW: {
+        // the lanes of a then b, each saturated to the narrower lane type
+        Type *t = targ(e, 0);
+        e->tval = t;
+        Type *s = operand(earg(e, 1), NULL);
+        Type *s2 = operand(earg(e, 2), NULL);
+        if (s != s2 && s->kind != TY_INVALID && s2->kind != TY_INVALID) {
+            Diag *d = diag_error(e->span, "E0412", "@narrow operands have different types: %s and %s", type_str(s),
+                                 type_str(s2));
+            diag_types(d, type_str(s), type_str(s2));
+            return e->type = t;
+        }
+        if (s->kind == TY_INVALID || s2->kind == TY_INVALID || t->kind == TY_INVALID) return e->type = t;
+        if (!ty_is_vec_int(s) || s->elem->bits < 16) {
+            diag_error((*earg(e, 1))->span, "E0812", "@narrow requires integer vectors with 16-, 32- or 64-bit lanes, found %s",
+                       type_str(s));
+            return e->type = t;
+        }
+        if (!ty_is_vec_int(t) || t->elem->bits * 2 != s->elem->bits || t->lanes != s->lanes * 2)
+            diag_error(e->span, "E0812", "@narrow of %s gives i%dx%d or u%dx%d, not %s", type_str(s), s->elem->bits / 2,
+                       s->lanes * 2, s->elem->bits / 2, s->lanes * 2, type_str(t));
+        return e->type = t;
     }
     case BI_TRAP: return e->type = t_never;
     case BI_MEMORY_ERROR: return e->type = t_never;

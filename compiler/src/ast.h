@@ -299,6 +299,11 @@ struct Decl {
     bool variadic;     // C varargs: `...` after the fixed parameters
     Sym link_lib;      // extern "C" "lib": library to link
     Sym abi;
+    bool is_inline;    // `inline fn`: always inlined (spec §9.5)
+    Span inline_span;
+    Vec(Decl *) inline_callees;  // inline functions this one calls directly (sema)
+    Vec(Span) inline_call_spans;
+    int inline_mark;  // sema: visited by the cycle check
     bool is_test;      // `test "name" { }` (a D_FN returning !void)
     Sym test_name;
     int test_trap;     // -1: must not trap; -2: must trap; n >= 0: must trap with Tn

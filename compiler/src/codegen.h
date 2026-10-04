@@ -23,6 +23,7 @@ typedef struct CgOptions {
     bool stack_traces;       // shadow stack for traces and profiles (--stack-traces=on, default)
     bool profile;            // axiom profile: the shadow stack is sampled concurrently
     bool sanitize_address;   // --sanitize=address: heap accesses are checked (spec §16.8)
+    int debug_info;          // -g / --debug-info=lines: DWARF line tables (1); none (0)
     CgUnit unit;
     Module *module;          // CG_MODULE
 } CgOptions;

@@ -14,6 +14,7 @@
 //   --link=<file>              extra C source, object or library to link (repeatable)
 //   -l<lib> -L<dir> -I<dir>    C libraries, library and include directories
 //   --emit-header=<path>       write a C header for the exported functions
+//   -g, --debug-info=lines|none   DWARF line tables (default none)
 //   -o <path>                  output path
 #include <limits.h>
 #include <spawn.h>
@@ -46,6 +47,7 @@ static void usage(void) {
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
             "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n"
             "  --sanitize=address|none  check heap accesses: use after free, overflows, double frees, leaks\n"
+            "  -g, --debug-info=lines|none   DWARF line tables for debuggers and profilers (default none)\n"
             "  --units=module|program   compile modules separately (cached) or as one unit\n"
             "                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
 }
@@ -714,6 +716,8 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
         else if (!strcmp(a, "--stack-traces=on")) co.stack_traces = true;
         else if (!strcmp(a, "--stack-traces=off")) co.stack_traces = false;
+        else if (!strcmp(a, "-g") || !strcmp(a, "--debug-info=lines")) co.debug_info = 1;
+        else if (!strcmp(a, "--debug-info=none")) co.debug_info = 0;
         else if (!strcmp(a, "--sanitize=address")) co.sanitize_address = true;
         else if (!strcmp(a, "--sanitize=none")) co.sanitize_address = false;
         else if (!strcmp(a, "--units=module")) units_mode = 1;

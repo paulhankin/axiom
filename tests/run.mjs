@@ -10,7 +10,7 @@
 //   // link: file.c            C source (next to the test) compiled and linked in
 //   // header: name.h          generate a C header for the exports (for the C source)
 //
-// Usage: node tests/run.mjs [--native] [--filter=substr] [-O2] [--units=module|program]
+// Usage: node tests/run.mjs [--native] [--filter=substr] [-O2] [--units=module|program] [-g]
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -35,7 +35,7 @@ const execWrap = (process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => 
 const testTimeout = execWrap.length ? ['--timeout=60000'] : [];
 const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
-const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a));
+const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a) || a === '-g');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'axiom-tests-'));
 
 function files(dir) {

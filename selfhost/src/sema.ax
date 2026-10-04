@@ -792,6 +792,19 @@ fn resolve_fn(d: *mut ast.Decl) void {
     } else if d.variadic and (d.params.len == 0) {
         _ = dg.err(d.abi_span, "E0307", "a variadic C function needs at least one fixed parameter");
     }
+    if d.is_inline {
+        if d.is_export {
+            _ = dg.err(d.inline_span, "E0313",
+                       "an exported function cannot be inline (its callers are outside the program)");
+        } else if d.attr != ast.ATTR_NONE {
+            let mut an: []u8 = "multiversion";
+            if d.attr == ast.ATTR_FEATURES {
+                an = "features";
+            }
+            _ = dg.err(d.inline_span, "E0313",
+                       u.f1("an inline function cannot have @%s (it is compiled as part of its callers)", an));
+        }
+    }
     if d.is_export or (d.kind == ast.D_HOST_FN) {
         let mut what: []u8 = "imported";
         if d.is_export {
@@ -2610,6 +2623,10 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         e.decl = f;
         e.gargs = gargs;
         e.op = ast.CALLK_DIRECT;
+        if f.is_inline and u.notnil(C.fnd) and C.fnd.is_inline {
+            C.fnd.inline_callees.push(f);
+            C.fnd.inline_call_spans.push(e.span);
+        }
         // receiver
         if method {
             let recv = callee.b;
@@ -3308,6 +3325,9 @@ fn lossless(from: *ast.Type, to: *ast.Type) bool {
     if from == to {
         return true;
     }
+    if from.kind == ast.TY_BOOL {
+        return to.kind == ast.TY_INT;  // false 0, true 1
+    }
     if (from.kind == ast.TY_INT) and (to.kind == ast.TY_INT) {
         // usize/isize are at least 32 and at most 64 bits, portably.
         let mut fmax = from.bits;
@@ -3459,6 +3479,13 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             e.cval = a.cval;
             e.fval = a.fval;
             return set_ty(e, t);
+        }
+        if (s.kind == ast.TY_BOOL) and (t.kind == ast.TY_INT) and (barg(e, 1).kind == ast.E_BOOL) {
+            e.is_const = true;
+            e.cval = u.I128.zero();
+            if barg(e, 1).bval {
+                e.cval = u.I128.ofu(1);
+            }
         }
         if (s.kind != ast.TY_INVALID) and (t.kind != ast.TY_INVALID) and not lossless(s, t) {
             let d = dg.err(e.span, "E0510", u.f2("@as cannot convert %s to %s without possible loss of information",
@@ -4033,6 +4060,47 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         }
         _ = dg.err(e.span, "E0812", u.f1("@dot requires float vectors or i16 lanes, found %s", tstr(t)));
         return set_ty(e, ty.t_invalid);
+    }
+    if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
+        // half the lanes, each twice as wide, extended by the lane type's sign
+        let t = operand(earg(e, 0), tnil());
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not ty.is_vec_int(t) or (t.elem.bits > 32) {
+            _ = dg.err(barg(e, 0).span, "E0812",
+                       u.f2("@%s requires an integer vector with 8-, 16- or 32-bit lanes, found %s", e.name, tstr(t)));
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, ty.type_vec(ty.type_int(t.elem.bits * 2, t.elem.is_signed, false), t.lanes / 2));
+    }
+    if id == ast.BI_NARROW {
+        // the lanes of a then b, each saturated to the narrower lane type
+        let t = targ(e, 0);
+        e.tval = t;
+        let s = operand(earg(e, 1), tnil());
+        let s2 = operand(earg(e, 2), tnil());
+        if (s != s2) and (s.kind != ast.TY_INVALID) and (s2.kind != ast.TY_INVALID) {
+            let d = dg.err(e.span, "E0412", u.f2("@narrow operands have different types: %s and %s", tstr(s),
+                                                 tstr(s2)));
+            dg.set_types(d, tstr(s), tstr(s2));
+            return set_ty(e, t);
+        }
+        if (s.kind == ast.TY_INVALID) or (s2.kind == ast.TY_INVALID) or (t.kind == ast.TY_INVALID) {
+            return set_ty(e, t);
+        }
+        if not ty.is_vec_int(s) or (s.elem.bits < 16) {
+            _ = dg.err(barg(e, 1).span, "E0812",
+                       u.f1("@narrow requires integer vectors with 16-, 32- or 64-bit lanes, found %s", tstr(s)));
+            return set_ty(e, t);
+        }
+        if not ty.is_vec_int(t) or ((t.elem.bits * 2) != s.elem.bits) or (t.lanes != (s.lanes * 2)) {
+            let hb = u.idec(s.elem.bits / 2);
+            let n2 = u.idec(s.lanes * 2);
+            _ = dg.err(e.span, "E0812", u.f6("@narrow of %s gives i%sx%s or u%sx%s, not %s", tstr(s), hb, n2, hb, n2,
+                                             tstr(t)));
+        }
+        return set_ty(e, t);
     }
     if (id == ast.BI_TRAP) or (id == ast.BI_MEMORY_ERROR) {
         return set_ty(e, ty.t_never);
@@ -5323,5 +5391,48 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
             }
         }
     }
+    check_inline_cycles();
     return dg.error_count() == 0;
+}
+
+// Whether inline function `from` reaches `to` through calls between inline
+// functions.
+fn inline_reaches(from: *mut ast.Decl, to: *mut ast.Decl, mark: i32) bool {
+    if from == to {
+        return true;
+    }
+    if from.inline_mark == mark {
+        return false;
+    }
+    from.inline_mark = mark;
+    for i in 0..from.inline_callees.len {
+        if inline_reaches(from.inline_callees.get(i), to, mark) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An inline function cannot be recursive, directly or through other inline
+// functions (spec §9.5): every call on such a cycle is reported.
+fn check_inline_cycles() void {
+    let mut mark: i32 = 0;
+    for i in 0..g_prog.fns.len {
+        let g = g_prog.fns.get(i);
+        for k in 0..g.inline_callees.len {
+            let f = g.inline_callees.get(k);
+            mark += 1;
+            if not inline_reaches(f, g, mark) {
+                continue;
+            }
+            if f == g {
+                _ = dg.err(g.inline_call_spans.get(k), "E0314",
+                           u.f1("inline function '%s' calls itself (an inline function cannot be recursive)", g.name));
+            } else {
+                _ = dg.err(g.inline_call_spans.get(k), "E0314",
+                           u.f2("this call to inline function '%s' leads back to '%s' (inline functions cannot be recursive)",
+                                f.name, g.name));
+            }
+        }
+    }
 }

@@ -70,6 +70,9 @@
     X(BITMASK, "bitmask", "e")                \
     X(REDUCE_ADD, "reduce_add", "e")          \
     X(DOT, "dot", "ee")                       \
+    X(WIDEN_LOW, "widen_low", "e")            \
+    X(WIDEN_HIGH, "widen_high", "e")          \
+    X(NARROW, "narrow", "tee")                \
     X(TRAP, "trap", "")                       \
     X(ATOMIC_LOAD, "atomic_load", "e")        \
     X(ATOMIC_STORE, "atomic_store", "ee")     \

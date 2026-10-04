@@ -116,7 +116,8 @@ while
 ```
 
 `threadlocal` is not a keyword. It is an identifier that has its special meaning
-only at the start of a module-level `let` (§12.8.6).
+only at the start of a module-level `let` (§12.8.6). Likewise `inline` has its meaning
+only directly before `fn` (§9.5).
 
 **Reserved type names.** These lex as keywords:
 
@@ -225,7 +226,7 @@ Member        ::= IDENT ( "=" "-"? ( INT_LIT | CHAR_LIT ) )?
 
 MethodDecl    ::= "pub"? FnDecl
 
-FnDecl        ::= "fn" IDENT GenericParams? "(" ParamList? ")" Type FnAttr? Block
+FnDecl        ::= "inline"? "fn" IDENT GenericParams? "(" ParamList? ")" Type FnAttr? Block   (* §9.5 *)
 FnAttr        ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"   (* §13.4 *)
 ParamList     ::= Param ( "," Param )* ","?
 Param         ::= IDENT ":" Type
@@ -237,7 +238,9 @@ Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "
 
 The trailing-comma forms are LL(1). After a `,`, an `IDENT` begins another element, and
 anything else ends the list. The FIRST sets of `Field` (`IDENT`) and `MethodDecl`
-(`pub`, `fn`) are disjoint.
+(`pub`, `fn`) are disjoint, except for `inline`, an identifier: `inline` followed by
+`fn` begins a method, which takes one more token of lookahead (as `threadlocal let`
+does).
 
 ### 3.3 Types
 
@@ -709,7 +712,7 @@ All other conversions use builtins (Appendix A):
 
 | Builtin | Meaning | Failure |
 |---|---|---|
-| `@as(T, x)` | Lossless numeric widening (for example `u8 → u32`, `i16 → i64`, `u32 → i64`, `f32 → f64`) | A conversion that can lose information is a compile error (`E0510`) |
+| `@as(T, x)` | Lossless numeric widening (for example `u8 → u32`, `i16 → i64`, `u32 → i64`, `f32 → f64`), and `bool` to any integer type (`false` is 0, `true` is 1) | A conversion that can lose information is a compile error (`E0510`) |
 | `@int_cast(T, x)` | Integer-to-integer conversion, checked at runtime | Traps if the value is out of range (`T0004`) |
 | `@truncate(T, x)` | Integer-to-integer conversion keeping the low bits | Never fails |
 | `@int_from_float(T, x)` | Truncates toward zero and **saturates** | Never fails. NaN becomes 0 (matches WASM `trunc_sat`) |
@@ -1079,6 +1082,34 @@ auto-ref of temporaries, and no trait lookup.
 Using a function name as a value (without a call) produces a function-pointer value.
 Calling through it is written like any other call: `a.alloc_fn(a.ctx, n, 8)`. This is a
 field access followed by a call, not a method call, because `alloc_fn` is a field.
+
+### 9.5 Inline functions
+
+```axiom
+inline fn bit(x: u64, k: u32) u64 { return (x >> k) & 1; }
+```
+
+A function (or method) declared `inline` is **always inlined**: every direct call is
+replaced by the function's body (at every optimization level), so a small helper called
+with constant arguments costs what the same code written out would, the way macros or
+`#[inline(always)]` are used elsewhere. It changes no behavior: traps, overflow checks
+and stack traces are the same.
+
+- An inline function cannot be recursive, directly or through other inline functions
+  (`E0314`, reported at each call on the cycle). Recursion through a function that is not
+  inline is allowed.
+- It cannot be `export`ed, and cannot have `@features` or `@multiversion` (`E0313`).
+- It may be generic, and it may be used as a value (§9.4); a call through a function
+  pointer is an ordinary call.
+- Stack traces (§16.4.1) keep its frames. A direct call to it does not record its call
+  site; the site is passed to the inlined body, which records it only on the paths that
+  need it, before a trap or before calling a function that is not inline. On every other
+  path the call costs nothing. A fault that is not a check (an out-of-bounds raw pointer
+  access, say) inside an inlined body is reported as if it were in the caller.
+- With separate compilation (§16.7), every module that calls an inline function compiles
+  its own copy.
+- The self-hosted compiler inlines such calls wherever its inliner can (at `-O1` and
+  above), and keeps ordinary call-site records.
 
 ---
 
@@ -1583,6 +1614,16 @@ Appendix A has full signatures.
 - Conversions: `@float_from_int(F, v)` and `@int_from_float(I, v)` convert lane by lane
   between vectors of the same lane count, with the scalar rules (round to nearest;
   truncate and saturate, NaN to 0).
+- Lane width: `@widen_low(v)` and `@widen_high(v)` take the low or high half of the lanes
+  of an integer vector with 8-, 16- or 32-bit lanes and extend each to twice its width,
+  sign- or zero-extended by the lane type, keeping the vector's size: `u8x16 → u16x8`,
+  `i32x8 → i64x4` (WebAssembly's `extend_low`/`extend_high`, x86's `pmovsx`/`pmovzx`).
+  `@narrow(T, a, b)` is the reverse: `a` and `b` are integer vectors of one type with
+  16-, 32- or 64-bit lanes, and `T` an integer vector with twice as many lanes of half the
+  width; the result holds the lanes of `a` then those of `b`, each saturated to `T`'s
+  lane range, the source lanes read by their own type. So `@narrow(u8x16, a, b)` of two
+  `i16x8` clamps each lane to `0..255` (WebAssembly's `i8x16.narrow_i16x8_u`, x86's
+  `packuswb`), and of two `u16x8` clamps it to `..255`.
 
 ### 13.3 Native targets
 
@@ -2002,6 +2043,7 @@ in which case it is linked against the C library as before.
 axiom build <file.ax> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
                           [--sanitize=address]    # check heap accesses (§16.8)
                           [--cpu=<preset>] [--features=+ext,-ext]   # processor extensions (§13.4)
+                          [-g | --debug-info=lines|none]            # DWARF line tables (below)
 axiom check <file.ax>                  # parse and type-check only; no codegen
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
 axiom run   <file.ax> [--export=name]  # build for wasm32 and execute in the reference runtime
@@ -2016,6 +2058,17 @@ axiom cache [path|clean]               # the compiled-module cache (§16.7)
 package in the current directory (§4.6.4).
 
 Every command accepts `--format=human` (the default) or `--format=agent-json`.
+
+`-g` (or `--debug-info=lines`) adds DWARF line tables to the output: a compile unit per
+object, a subprogram per function and a source line and column for each instruction,
+so that native profilers (`perf annotate`, `perf report --sort srcline`), debuggers and
+`addr2line -i` map machine code back to Axiom source, inlined functions included
+(`DW_TAG_inlined_subroutine`). It is off by default (`--debug-info=none`), at every
+optimization level: the shadow stack (§16.4) needs no debug information, and outputs
+stay small and independent of the directory they were built in. It does not change
+the generated instructions. `build`, `test` and `profile` accept it; the C compiler emits line tables
+for native and WebAssembly targets, and the self-hosted compiler accepts the option and
+emits none.
 
 - Compiler output is **deterministic**. The same inputs and flags produce byte-identical
   `.wasm` files and diagnostics.
@@ -2152,6 +2205,8 @@ Initial registry, not exhaustive:
 | E0309 | Two enum members with the same value |
 | E0311 | Unknown trap code in `expect trap(...)` |
 | E0312 | Duplicate test name in a module |
+| E0313 | `inline` on an exported function, or with `@features` / `@multiversion` (§9.5) |
+| E0314 | Recursion through inline functions (§9.5) |
 | E0354 | Thread-local global without `mut` |
 | E0801 | Type not allowed at the export or import boundary |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
@@ -2195,7 +2250,8 @@ The trace is built from a **shadow stack**, not by unwinding the machine stack:
 - Each call writes its call-site record (location, calling function, called
   function) at `depth % 256` and increments `depth`. When the call returns, `depth`
   goes back to its old value. No code runs at function entry or exit, and
-  inlining does not remove frames.
+  inlining does not remove frames. A call to an `inline` function writes its record
+  only when a trap or another call inside it needs it (§9.5).
 - After a trap, the frames are still in place, because nothing unwinds them. A host
   reads them through the export `axiom_shadow_stack()` (WebAssembly) or the third
   argument of `ax_on_trap` (native).
@@ -2215,7 +2271,8 @@ stacks:
    as a machine address that must be mapped back to source.
 3. **It doubles as the profiler's stack sampler** (§16.6).
 
-The cost is three stores and one load per call. On call-heavy microbenchmarks (for
+The cost is three stores and one load per call (none for a call to an `inline`
+function). On call-heavy microbenchmarks (for
 example, a naive recursive Fibonacci) it roughly doubles run time. On typical code it
 is within measurement noise. Stack traces are on by default, and
 `--stack-traces=off` removes the instrumentation.
@@ -2341,12 +2398,14 @@ How samples are taken:
 
 Profile builds are otherwise identical to ordinary builds with stack traces on (the
 default), except that shadow-stack stores are volatile, so optimization can't remove
-them. A program's behavior never depends on whether it is being profiled.
+them, and that calls to `inline` functions (§9.5) record their call sites like any other,
+so time spent in them is attributed to them. A program's behavior never depends on
+whether it is being profiled.
 
 Limitations in v0.1:
 
 - Time is attributed to functions and call sites, not to individual lines inside the
-  innermost function.
+  innermost function. For that, build with `-g` (§16.1) and use a native profiler.
 - On WebAssembly, only the main thread is sampled.
 - Stacks deeper than 256 calls lose their outermost frames. These samples are
   counted and reported as truncated.
@@ -2671,7 +2730,8 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@bitmask(v)` | `→ u32`, one bit per lane (`u64` for 64 lanes) |
 | `@reduce_add(v)` | Halves folded (§13.2). Integer lanes wrap |
 | `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes |
-| `@narrow`, `@widen_low`, `@widen_high` | Lane-width changes per WASM |
+| `@widen_low(v)`, `@widen_high(v)` | Integer `Vec` of 8-, 16- or 32-bit lanes → half its lanes, twice as wide, extended by the lane type (§13.2) |
+| `@narrow(T, a, b)` | `Vec, Vec → T`: the lanes of `a` then `b`, saturated to `T`'s narrower lanes (§13.2) |
 
 ### A.6 Atomics
 
@@ -2784,6 +2844,9 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C35 | 256- and 512-bit vector types (`f32x8`, `i32x16`, `v512`, ...), with every operator and builtin of the 128-bit ones; passed in memory between functions (§5.8, §13.3) | Issue 0015: AVX2 and AVX-512 process 32 and 64 bytes at a time. On narrower targets the compiler splits them, so code written for the wide types is portable |
 | C36 | Builtins for the processors' cryptographic instructions: AES, carry-less multiplication, SHA-1, SHA-256, SHA-512, SHA-3 and CRC (`@x86_*`, `@arm_*`, §13.5) | Issue 0016: AES-GCM, SHA-2 and CRC run several times faster with them, and std chooses them at run time with `@multiversion` |
 | C37 | Vectors gained per-lane shift counts, lane-wise `@clz`/`@ctz`/`@popcount` and int/float conversions, `@swizzle` of any lane type and `@swizzle2`, and `@load_partial`/`@store_partial` (§13.1, §13.2) | Issues 0024 to 0027, from porting the benchmark's AVX-512 kernels: each is one instruction on x86 (and mostly on Arm and WebAssembly), and without them the port had to fall back to scalar code |
+| C38 | `inline fn`: functions that are always inlined, never recursive, whose calls record no stack-trace site unless a trap or call needs it (§9.5). `inline` is a keyword only before `fn` | Issue 0032: Axiom has no macros, and code ported from Rust's `macro_rules!` and `#[inline(always)]` became calls (with the shadow-stack record making them look bigger to LLVM's inliner) |
+| C39 | `@widen_low`, `@widen_high` and `@narrow` are specified (§13.2: lane types decide the sign, the result type of `@narrow` is given) and implemented; until then Appendix A listed them "per WASM" but no compiler had them. `@as(T, b)` converts a `bool` to any integer type (§6.2) | Issue 0035. Branch-free counting (`n += @as(u32, x > 0)`, Rust's `b as i32`) needed a helper function. `@as`, not a new builtin: the conversion is lossless and names its type |
+| C40 | `-g` / `--debug-info=lines`: DWARF line tables (§16.1) | Issue 0034: native profilers and debuggers could not map code back to Axiom source, and after inlining one symbol holds many functions |
 
 ---
 

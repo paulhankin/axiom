@@ -88,7 +88,15 @@ adding an error name never invalidates the cache.
 faults in C code) prints the call path with source locations, and failing tests show
 it too, or, for a test that returned an error, the error return trace. They come
 from a per-thread shadow stack of call sites. Each call costs three stores and a
-load; `--stack-traces=off` removes them.
+load; `--stack-traces=off` removes them. A call to an `inline fn` (always inlined, LLVM's
+`alwaysinline`) passes its call-site record as an extra argument instead, which the
+inlined body pushes only before a trap or a call that is not inline (`INL_SITES` in
+`codegen.c`).
+
+**Line tables** (spec §16.1): `-g` / `--debug-info=lines` attaches a `DISubprogram` to
+each function and a `DILocation` (from the same spans as the trap sites) to each
+instruction, through LLVM's DIBuilder; inlined functions appear as
+`DW_TAG_inlined_subroutine`.
 
 **Profiling** (spec §16.6): `axiom profile` samples the shadow stack, using a
 CPU-clock `SIGPROF` natively (`runtime/profile.c`) or a worker reading shared memory
