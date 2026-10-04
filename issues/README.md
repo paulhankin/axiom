@@ -81,3 +81,4 @@ they travel with the code they describe.
 | [0049](0049-address-of-temporary.md) | feature | language | Cannot take the address of a temporary |
 | [0050](0050-test-output.md) | feature | tools | `axiom test` hides what a test prints |
 | [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic |
+| [0052](0052-runtime-cpu-dispatch.md) | feature | language, compiler, std | No runtime CPU feature dispatch: x86-64 builds never use AVX2/AVX-512 |
