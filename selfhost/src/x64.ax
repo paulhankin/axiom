@@ -1261,11 +1261,16 @@ fn gen_cast(v: *mut ir.Value) void {
 
 // Unary SSE op d = op(s) (scalar forms merge into d's upper lanes, which we
 // do not care about).
+// With AVX the merge source (VEX.vvvv) is s itself when s is a register;
+// otherwise d, zeroed first so that the result does not depend on (and the
+// register allocator does not keep alive) whatever d held before.
 fn sse_unary(id: i32, d: i32, s: mc.MOp) void {
     if AVX {
         let mut vv = d;
         if s.kind == mc.K_REG {
             vv = s.reg;
+        } else {
+            vzero(d);
         }
         let i = e4(xe.SSE, 0, W(d), s, R(vv), NONE());
         i.cc = id;
@@ -1280,10 +1285,27 @@ fn sse_unary_packed(id: i32, d: i32, s: mc.MOp) void {
     _ = sse2(id, W(d), s);
 }
 
+// d = r converted to floating point (signed, or with AVX-512 unsigned). The
+// instruction merges into d's upper lanes: with AVX the merge source is d,
+// zeroed first, which breaks the dependency on d's previous value (and does
+// not make d live before the conversion: a zeroing idiom reads nothing).
 fn cvt_si2f(d: i32, r: i32, is64int: bool, single: bool) void {
+    cvt_i2f(d, r, is64int, single, false);
+}
+
+fn cvt_i2f(d: i32, r: i32, is64int: bool, single: bool, unsigned: bool) void {
     let mut id = xe.CVTSI2SD;
     if single {
         id = xe.CVTSI2SS;
+    }
+    if unsigned {
+        id = xe.VCVTUSI2SD;
+        if single {
+            id = xe.VCVTUSI2SS;
+        }
+    }
+    if AVX {
+        vzero(d);
     }
     let i = sse2(id, W(d), R(r));
     if is64int {
@@ -1291,8 +1313,12 @@ fn cvt_si2f(d: i32, r: i32, is64int: bool, single: bool) void {
     }
     if AVX {
         i.ops[2] = R(d);
-        i.ops[0].role = mc.RUD;
     }
+}
+
+// u32 and u64 conversions in one instruction (vcvtusi2ss/sd).
+fn has_cvtusi() bool {
+    return AVX and tg.has(tg.X_AVX512F);
 }
 
 fn gen_int_to_float(v: *mut ir.Value, d: i32) void {
@@ -1306,6 +1332,10 @@ fn gen_int_to_float(v: *mut ir.Value, d: i32) void {
     }
     if sg {
         cvt_si2f(d, r, fb == 64, single);
+        return;
+    }
+    if has_cvtusi() {
+        cvt_i2f(d, r, fb == 64, single, true);
         return;
     }
     if fb <= 32 {

@@ -7,7 +7,9 @@
 //
 // simplify(i) returns the value i can be replaced by, or nil; it may insert
 // new instructions before i. Floating point is left alone (no rewrite may
-// change a result, spec §7.7), and so are vectors and 128-bit integers.
+// change a result, spec §7.7) but for division by a power of two, which is
+// multiplication by its exact reciprocal; vectors and 128-bit integers are
+// left alone too.
 // =============================================================================
 import "ir.ax" as ir;
 import "util.ax" as u;
@@ -913,11 +915,53 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         }
         return vnil();
     }
+    if op == ir.OP_FDIV {
+        let r = exact_recip(i.b);
+        if u.notnil(r) {
+            return ir.binop(B, ir.OP_FMUL, i.a, r);
+        }
+        return vnil();
+    }
     if op == ir.OP_FNEG {
         if is_op(i.a, ir.OP_FNEG) {
             return i.a.a;
         }
         return vnil();
+    }
+    return vnil();
+}
+
+// 1 / c when c is a floating point constant (or a vector of them) whose
+// reciprocal is exact: a power of two, positive or negative, with both it
+// and its reciprocal normal numbers of its type. Then x / c and x * (1 / c)
+// are the same real number, rounded the same way, for every x (NaNs and
+// infinities included). Else nil.
+fn exact_recip(c: *mut ir.Value) *mut ir.Value {
+    if c.kind == ir.V_CFP {
+        let bits = @bit_cast(u64, c.fv);
+        if (bits & 0xfffffffffffff) != 0 {
+            return vnil();
+        }
+        let e = @as(i64, @bit_cast(i64, (bits >> 52) & 0x7ff)) - 1023;  // c = ±2^e
+        let mut lim: i64 = 1022;  // f64: normal exponents -1022..1023
+        if c.ty.bits == 32 {
+            lim = 126;  // f32: -126..127
+        }
+        if (e < -lim) or (e > lim) {
+            return vnil();
+        }
+        return ir.cfp(c.ty, 1.0 / c.fv);
+    }
+    if (c.kind == ir.V_CAGG) and (c.ty.kind == ir.T_VEC) {
+        let xs = u.newn.[*mut ir.Value](c.xs.len + 1);
+        for k in 0..c.xs.len {
+            let r = exact_recip(c.xs.get(k));
+            if u.isnil(r) {
+                return vnil();
+            }
+            xs[k] = r;
+        }
+        return ir.cagg(c.ty, xs[0..c.xs.len]);
     }
     return vnil();
 }
