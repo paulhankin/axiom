@@ -2276,64 +2276,24 @@ fn gen_store(v: *mut ir.Value) void {
     _ = e2(xe.STORE, sz, m, R(reg(x)));
 }
 
-// memcpy / memmove / memset
+// memcpy / memmove / memset. Of a constant size: copies of up to 256 bytes
+// as loads (all of them first: then the operands may overlap) and stores,
+// in vectors (up to 32 bytes wide: ymm needs no AVX-512 frequency licence)
+// and, at the end, one more vector overlapping the last, or below 16 bytes
+// integer moves; fills with a constant byte likewise as vector stores, and
+// up to 2 KiB as a loop of them. Others are rep movsb / stosb.
 fn gen_memop(v: *mut ir.Value) void {
     let o = v.op;
-    if (o != ir.OP_MEMSET) and is_c(v.c) and (cval(v.c) <= 128) and (o == ir.OP_MEMCPY) {
-        let n = cval(v.c);
-        let dm = addr(v.a);
-        let sm = addr(v.b);
-        let mut k: i64 = 0;
-        while k < n {
-            let rem = n - k;
-            if rem >= 16 {
-                let t = vxmm();
-                let mut s2 = sm;
-                s2.disp += k;
-                let mut d2 = dm;
-                d2.disp += k;
-                _ = sse2(xe.MOVDQU_LD, W(t), s2);
-                _ = sse2(xe.MOVDQU_ST, R(t), d2);
-                k += 16;
-                continue;
-            }
-            let mut w: i64 = 8;
-            while w > rem {
-                w = w / 2;
-            }
-            let t = vgpr();
-            let mut s2 = sm;
-            s2.disp += k;
-            let mut d2 = dm;
-            d2.disp += k;
-            let sz = @truncate(u8, @bit_cast(u64, w));
-            let li = e2(xe.LOAD, sz, W(t), s2);
-            if sz < 4 {
-                li.cc = 1;
-            }
-            _ = e2(xe.STORE, sz, d2, R(t));
-            k += w;
-        }
+    if is_c(v.c) and (cval(v.c) > 0) and (cval(v.c) <= 256) and (o != ir.OP_MEMSET) {
+        small_copy(addr(v.a), addr(v.b), cval(v.c));
         return;
     }
-    if (o == ir.OP_MEMSET) and is_c(v.c) and (cval(v.c) <= 64) and is_c(v.b) {
-        let n = cval(v.c);
-        let dm = addr(v.a);
-        let byte = cval(v.b) & 0xff;
-        let pat = byte *% 0x0101_0101_0101_0101;
-        let t = vgpr();
-        _ = e2(xe.MOV_RI, 8, W(t), I(pat));
-        let mut k: i64 = 0;
-        while k < n {
-            let mut w: i64 = 8;
-            while w > (n - k) {
-                w = w / 2;
-            }
-            let mut d2 = dm;
-            d2.disp += k;
-            _ = e2(xe.STORE, @truncate(u8, @bit_cast(u64, w)), d2, R(t));
-            k += w;
-        }
+    if is_c(v.c) and (cval(v.c) > 0) and (cval(v.c) <= 2048) and (o == ir.OP_MEMCPY) {
+        copy_loop(v, cval(v.c));
+        return;
+    }
+    if is_c(v.c) and (cval(v.c) > 0) and (cval(v.c) <= 2048) and is_c(v.b) and (o == ir.OP_MEMSET) {
+        small_fill(v, cval(v.c), cval(v.b) & 0xff);
         return;
     }
     let dst = reg(v.a);
@@ -2357,6 +2317,203 @@ fn gen_memop(v: *mut ir.Value) void {
         let i = emit(xe.REP, 0, ops[..]);
         i.cc = 2;
     }
+}
+
+// The widest vector moves for memory operations (memop_chunk), in bytes.
+fn memop_width() i64 {
+    if AVX and (vector_bits() >= 256) {
+        return 32;
+    }
+    return 16;
+}
+
+// The pieces of an n-byte memory operation as (offset, width) pairs:
+// vectors as wide as fit, the rest (below 16 bytes) one vector overlapping
+// the end when n is at least 16, else 8, 4, 2 and 1 bytes.
+fn memop_chunks(n: i64, out: *mut u.List.[i64]) void {
+    let mut k: i64 = 0;
+    let mut w = memop_width();
+    while w >= 16 {
+        while (n - k) >= w {
+            out.push(k);
+            out.push(w);
+            k += w;
+        }
+        w = w / 2;
+    }
+    if k == n {
+        return;
+    }
+    if n >= 16 {
+        out.push(n - 16);
+        out.push(16);
+        return;
+    }
+    w = 8;
+    while k < n {
+        while w > (n - k) {
+            w = w / 2;
+        }
+        out.push(k);
+        out.push(w);
+        k += w;
+    }
+}
+
+fn chunk_vl(w: i64) u8 {
+    if w > 16 {
+        return @truncate(u8, @bit_cast(u64, w));
+    }
+    return 0;
+}
+
+fn small_copy(dm: mc.MOp, sm: mc.MOp, n: i64) void {
+    let mut ch = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+    memop_chunks(n, &mut ch);
+    let mut regs = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    let outer_vl = VL;
+    let mut j: usize = 0;
+    while j < ch.len {
+        let k = ch.get(j);
+        let w = ch.get(j + 1);
+        let mut s2 = sm;
+        s2.disp += k;
+        if w >= 16 {
+            VL = chunk_vl(w);
+            let t = vxmm();
+            _ = sse2(xe.MOVDQU_LD, W(t), s2);
+            regs.push(t);
+        } else {
+            let t = vgpr();
+            let li = e2(xe.LOAD, @truncate(u8, @bit_cast(u64, w)), W(t), s2);
+            if w < 4 {
+                li.cc = 1;
+            }
+            regs.push(t);
+        }
+        j += 2;
+    }
+    j = 0;
+    while j < ch.len {
+        let k = ch.get(j);
+        let w = ch.get(j + 1);
+        let mut d2 = dm;
+        d2.disp += k;
+        let t = regs.get(j / 2);
+        if w >= 16 {
+            VL = chunk_vl(w);
+            _ = sse2(xe.MOVDQU_ST, R(t), d2);
+        } else {
+            _ = e2(xe.STORE, @truncate(u8, @bit_cast(u64, w)), d2, R(t));
+        }
+        j += 2;
+    }
+    VL = outer_vl;
+    u.free(@ptr_cast(*mut void, ch.data));
+    u.free(@ptr_cast(*mut void, regs.data));
+}
+
+// A memcpy of 256 to 2048 bytes: a loop of vector loads and stores, then
+// one more overlapping the end.
+fn copy_loop(v: *mut ir.Value, n: i64) void {
+    let w = memop_width();
+    let full = n - (n % w);
+    let outer_vl = VL;
+    VL = chunk_vl(w);
+    let d = reg(v.a);
+    let s = reg(v.b);
+    let i = vgpr();
+    _ = e2(xe.MOV_RI, 4, W(i), I(0));
+    let top = new_label();
+    place(top);
+    let t = vxmm();
+    _ = sse2(xe.MOVDQU_LD, W(t), mc.mem(s, i, 1, 0));
+    _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(d, i, 1, 0));
+    let a = e2(xe.ALU, 8, RW(i), I(w));
+    a.cc = 0;
+    let c = e2(xe.ALU, 8, R(i), I(full));
+    c.cc = 7;
+    let ops: [4]mc.MOp = [mc.label(top), R(i), R(d), R(s)];
+    let j = emit(xe.JCC, 0, ops[..]);
+    j.cc = xe.CC_B;
+    if full != n {
+        let u2 = vxmm();
+        _ = sse2(xe.MOVDQU_LD, W(u2), mc.mem(s, -1, 0, n - w));
+        _ = sse2(xe.MOVDQU_ST, R(u2), mc.mem(d, -1, 0, n - w));
+    }
+    VL = outer_vl;
+}
+
+fn small_fill(v: *mut ir.Value, n: i64, byte: i64) void {
+    let dm = addr(v.a);
+    let pat = byte *% 0x0101_0101_0101_0101;
+    let outer_vl = VL;
+    if n < 16 {
+        let t = vgpr();
+        _ = e2(xe.MOV_RI, 8, W(t), I(pat));
+        let mut ch = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+        memop_chunks(n, &mut ch);
+        let mut j: usize = 0;
+        while j < ch.len {
+            let mut d2 = dm;
+            d2.disp += ch.get(j);
+            _ = e2(xe.STORE, @truncate(u8, @bit_cast(u64, ch.get(j + 1))), d2, R(t));
+            j += 2;
+        }
+        u.free(@ptr_cast(*mut void, ch.data));
+        return;
+    }
+    // the pattern in a vector register as wide as the widest store
+    let mut wmax = memop_width();
+    while wmax > n {
+        wmax = wmax / 2;
+    }
+    VL = chunk_vl(wmax);
+    let t = vxmm();
+    if byte == 0 {
+        vzero(t);
+    } else {
+        _ = sse2(xe.MOVDQU_LD, W(t), const16(@bit_cast(u64, pat), @bit_cast(u64, pat)));
+    }
+    if n > 256 {
+        // a loop over the whole vectors: [p + i] for i = 0, w, ... < n - n % w
+        let full = n - (n % wmax);
+        let p = reg(v.a);
+        let i = vgpr();
+        _ = e2(xe.MOV_RI, 4, W(i), I(0));
+        let top = new_label();
+        place(top);
+        _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(p, i, 1, 0));
+        let a = e2(xe.ALU, 8, RW(i), I(wmax));
+        a.cc = 0;
+        let c = e2(xe.ALU, 8, R(i), I(full));
+        c.cc = 7;
+        let ops: [4]mc.MOp = [mc.label(top), R(i), R(p), R(t)];
+        let j = emit(xe.JCC, 0, ops[..]);
+        j.cc = xe.CC_B;
+        if full == n {
+            VL = outer_vl;
+            return;
+        }
+        // the rest: one vector overlapping the end
+        let mut d2 = dm;
+        d2.disp += n - wmax;
+        _ = sse2(xe.MOVDQU_ST, R(t), d2);
+        VL = outer_vl;
+        return;
+    }
+    let mut ch = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+    memop_chunks(n, &mut ch);
+    let mut j: usize = 0;
+    while j < ch.len {
+        let mut d2 = dm;
+        d2.disp += ch.get(j);
+        VL = chunk_vl(ch.get(j + 1));
+        _ = sse2(xe.MOVDQU_ST, R(t), d2);
+        j += 2;
+    }
+    u.free(@ptr_cast(*mut void, ch.data));
+    VL = outer_vl;
 }
 
 // -----------------------------------------------------------------------------
