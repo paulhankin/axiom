@@ -663,6 +663,9 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     let mut any = false;
     let mut changed = true;
     let mut rounds: i32 = 0;
+    if combine and cb.narrow_bool_phis(f) {
+        any = true;
+    }
     // in reverse postorder, definitions come before their uses (but for
     // phis on back edges), so a round or two reach the fixed point
     compute_preds(f);
@@ -1267,4 +1270,110 @@ pub fn split_critical_edges(f: *mut ir.Func) void {
         b = b.next;
     }
     compute_preds(f);
+}
+
+// -----------------------------------------------------------------------------
+// Comparisons tested in other blocks (for the native backends, before
+// instruction selection): a branch or select in block X on a comparison
+// computed in another block compares again in X, where the flags are set
+// right before the jump, instead of testing a 0/1 value kept in a register
+// (or spilled) from where it was computed. Only when the operands are
+// constants, parameters or values used elsewhere too (so likely live
+// anyway); `(x & k) == 0` is computed again with the `and`.
+// -----------------------------------------------------------------------------
+
+fn sink_operand_ok(o: *ir.Value) bool {
+    return (o.kind != ir.V_INST) or (o.aux >= 2);
+}
+
+fn sinkable_cmp(c: *ir.Value) bool {
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.ty.kind != ir.T_INT) {
+        return false;
+    }
+    let at = c.a.ty;
+    if ((at.kind != ir.T_INT) and (at.kind != ir.T_PTR)) or (at.bits > 64) {
+        return false;
+    }
+    if sink_and(c) {
+        return sink_operand_ok(c.a.a);
+    }
+    return sink_operand_ok(c.a) and sink_operand_ok(c.b);
+}
+
+// c is `(x & k) ==/!= 0` with the `and` used only there.
+fn sink_and(c: *ir.Value) bool {
+    let x = c.a;
+    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    return ((p == ir.IntEQ) or (p == ir.IntNE)) and ir.is_cint(c.b) and (ir.cint_val(c.b) == 0) and
+           (x.kind == ir.V_INST) and (x.op == ir.OP_AND) and (x.aux == 1) and ir.is_cint(x.b) and
+           (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64);
+}
+
+fn clone_inst(f: *mut ir.Func, i: *ir.Value, before: *mut ir.Value) *mut ir.Value {
+    let y = ir.new_inst(f, i.op, i.ty);
+    y.cv = i.cv;
+    y.a = i.a;
+    y.b = i.b;
+    y.src = i.src;
+    ir.insert_before(before, y);
+    return y;
+}
+
+pub fn sink_compares(f: *mut ir.Func) void {
+    // use counts (aux)
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if u.notnil(i.a) and (i.a.kind == ir.V_INST) {
+                i.a.aux += 1;
+            }
+            if u.notnil(i.b) and (i.b.kind == ir.V_INST) {
+                i.b.aux += 1;
+            }
+            if u.notnil(i.c) and (i.c.kind == ir.V_INST) {
+                i.c.aux += 1;
+            }
+            for k in 0..i.xs.len {
+                let o = i.xs.get(k);
+                if o.kind == ir.V_INST {
+                    o.aux += 1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut any = false;
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ((i.op == ir.OP_CONDBR) or (i.op == ir.OP_SELECT)) and (i.a.kind == ir.V_INST) and (i.a.blk != b) and
+               sinkable_cmp(i.a) {
+                let c = i.a;
+                let y = clone_inst(f, c, i);
+                if sink_and(c) {
+                    y.a = clone_inst(f, c.a, y);
+                }
+                i.a = y;
+                c.aux -= 1;
+                any = true;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if any {
+        dce(f);
+    }
 }

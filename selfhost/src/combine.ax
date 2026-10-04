@@ -1177,3 +1177,141 @@ fn use1(o: *mut ir.Value, i: *mut ir.Value) void {
         o.user = i;
     }
 }
+
+// -----------------------------------------------------------------------------
+// Boolean phis: a `bool` local lives in a byte, so after mem2reg it is a phi
+// of i8 whose inputs are `zext` of comparisons and the constants 0 and 1,
+// tested with `!= 0`. Such phis (and the phis of them, around loops) become
+// phis of i1; their other uses read a `zext` of the new phi. Then a branch
+// on the phi branches on the i1 itself, which jump threading can follow
+// into the predecessors.
+// -----------------------------------------------------------------------------
+
+// v as an i1 when it is 0/1-valued (a constant, undef, or a zext of an i1),
+// else nil; phis are handled by the caller.
+fn bool_input(v: *mut ir.Value) *mut ir.Value {
+    if is_k(v) {
+        let k = kval(v);
+        if k <= 1 {
+            return kt(ir.t_int(1), k);
+        }
+        return vnil();
+    }
+    if v.kind == ir.V_UNDEF {
+        return kfalse();
+    }
+    if is_op(v, ir.OP_ZEXT) and (v.a.ty.kind == ir.T_INT) and (v.a.ty.bits == 1) {
+        return v.a;
+    }
+    return vnil();
+}
+
+fn bool_phi_candidate(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.op == ir.OP_PHI) and (v.ty.kind == ir.T_INT) and (v.ty.bits > 1) and
+           (v.ty.bits <= 64);
+}
+
+// True if f changed. (Uses the phis' aux2 and auxp as scratch.)
+pub fn narrow_bool_phis(f: *mut ir.Func) bool {
+    let mut any = false;
+    let mut web = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    // aux2: 0 not seen, 1 in the web being built, 2 done (not convertible or converted)
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) and (i.op == ir.OP_PHI) {
+            i.aux2 = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let B = ir.new_builder();
+    b = f.first;
+    while u.notnil(b) {
+        let mut p0 = b.first;
+        while u.notnil(p0) and (p0.op == ir.OP_PHI) {
+            let next0 = p0.next;
+            if not bool_phi_candidate(p0) or (p0.aux2 != 0) {
+                p0 = next0;
+                continue;
+            }
+            // the web of phis of the same type that feed each other
+            web.clear();
+            web.push(p0);
+            p0.aux2 = 1;
+            let mut ok = true;
+            let mut k: usize = 0;
+            while ok and (k < web.len) {
+                let p = web.get(k);
+                k += 1;
+                for j in 0..p.xs.len {
+                    let x = ir.resolve(p.xs.get(j));
+                    if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
+                        if x.ty != p0.ty {
+                            ok = false;
+                        } else if x.aux2 == 0 {
+                            x.aux2 = 1;
+                            web.push(x);
+                        } else if x.aux2 == 2 {
+                            ok = false;
+                        }
+                    } else if u.isnil(bool_input(x)) {
+                        ok = false;
+                    }
+                }
+            }
+            if ok {
+                // the i1 phis first (they may refer to each other)
+                for w in 0..web.len {
+                    let p = web.get(w);
+                    ir.at_before(B, p);
+                    let q = ir.phi(B, ir.t_int(1));
+                    p.auxp = @ptr_cast(*mut void, q);
+                }
+                for w in 0..web.len {
+                    let p = web.get(w);
+                    let q = @ptr_cast(*mut ir.Value, p.auxp);
+                    for j in 0..p.xs.len {
+                        let x = ir.resolve(p.xs.get(j));
+                        let mut y = vnil();
+                        if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
+                            y = @ptr_cast(*mut ir.Value, x.auxp);
+                        } else {
+                            y = bool_input(x);
+                        }
+                        ir.add_incoming(q, y, p.bs.get(j));
+                    }
+                }
+                for w in 0..web.len {
+                    let p = web.get(w);
+                    let q = @ptr_cast(*mut ir.Value, p.auxp);
+                    let mut at = p.blk.first;
+                    while u.notnil(at) and (at.op == ir.OP_PHI) {
+                        at = at.next;
+                    }
+                    if u.notnil(at) {
+                        ir.at_before(B, at);
+                    } else {
+                        ir.at_end(B, p.blk);
+                    }
+                    let z = ir.zext(B, q, p.ty);
+                    p.aux2 = 2;
+                    ir.forward(p, z);
+                }
+                for w in 0..web.len {
+                    ir.remove_inst(web.get(w));
+                }
+                any = true;
+                p0 = b.first;  // (next0 may have gone with them)
+            } else {
+                for w in 0..web.len {
+                    web.get(w).aux2 = 2;
+                }
+                p0 = next0;
+            }
+        }
+        b = b.next;
+    }
+    u.free(@ptr_cast(*mut void, web.data));
+    return any;
+}

@@ -10,9 +10,8 @@
 // error-union results of inlined calls (a phi of the error code, tested
 // right away) are the usual cases.
 //
-// Values of B used outside it: uses under S get a phi at S (S's only
-// predecessor was B), uses under B's other successor are unaffected (when B
-// is its only predecessor); any other use, and the edge stays.
+// Values of B used outside it get B's value or N's copy, whichever reaches
+// the use, and a phi where both do (SSA repair).
 // =============================================================================
 import "combine.ax" as cb;
 import "ir.ax" as ir;
@@ -254,7 +253,8 @@ fn implied(c: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
     let mut x = vnil();
     let mut p1: i32 = 0;
     let mut k1: u64 = 0;
-    if not split_cmp(c, &mut x, &mut p1, &mut k1) {
+    let is_cmp = split_cmp(c, &mut x, &mut p1, &mut k1);
+    if not is_cmp and ((c.kind != ir.V_INST) or (c.ty.kind != ir.T_INT) or (c.ty.bits != 1)) {
         return vnil();
     }
     let mut to = b;
@@ -262,10 +262,13 @@ fn implied(c: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
     for _depth in @as(i32, 0)..4 {
         let t = ir.terminator(from);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and ((t.t1 == to) or (t.t2 == to)) {
+            if ir.resolve(t.a) == c {
+                return kbool(t.t1 == to);
+            }
             let mut x0 = vnil();
             let mut p0: i32 = 0;
             let mut k0: u64 = 0;
-            if split_cmp(t.a, &mut x0, &mut p0, &mut k0) and (x0 == x) {
+            if is_cmp and split_cmp(t.a, &mut x0, &mut p0, &mut k0) and (x0 == x) {
                 let r = decide(p0, k0, t.t1 == to, p1, k1, x.ty);
                 if u.notnil(r) {
                     return r;
@@ -358,33 +361,6 @@ fn outside_uses(b: *mut ir.Block) void {
     u.free(@ptr_cast(*mut void, work.data));
 }
 
-// Can B's values still be used where they are after P is sent to S?
-fn uses_ok(b: *mut ir.Block, s: *mut ir.Block, other: *mut ir.Block) bool {
-    let s_owned = (s.preds.len == 1) and (s.rpo >= 0);
-    let o_owned = u.notnil(other) and (other.preds.len == 1) and (other.rpo >= 0);
-    for k in 0..uses.len {
-        let us = uses.get(k);
-        if us.phi_from_b {
-            continue;  // B -> Y edges stay (Y == S gets an input from N)
-        }
-        let x = us.at;
-        if x == b {
-            continue;
-        }
-        if x.rpo < 0 {
-            continue;  // unreachable
-        }
-        if s_owned and opt.dominates(s, x) {
-            continue;
-        }
-        if o_owned and opt.dominates(other, x) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
 fn remove_phi_input(s: *mut ir.Block, from: *mut ir.Block) void {
     let mut p = s.first;
     while u.notnil(p) and (p.op == ir.OP_PHI) {
@@ -414,8 +390,10 @@ fn mapped(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
     return v;
 }
 
-// Sends P to S through a copy of B's instructions.
-fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block) void {
+// Sends P to S through a copy of B's instructions. With cond, the copy
+// ends in B's own branch instead (on its condition as seen from P), to
+// both of B's successors (S is then nil).
+fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block, cond: bool) void {
     let n = ir.append_block(f, "thread");
     ir.move_block_after(n, p);
     let mut i = b.first;
@@ -443,51 +421,32 @@ fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block)
         }
         i = i.next;
     }
-    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
-    br.t1 = s;
-    ir.append_inst(n, br);
-    // S's phis: the input from B, as seen through N
-    let mut q = s.first;
-    while u.notnil(q) and (q.op == ir.OP_PHI) {
-        let x = incoming(q, b);
-        if u.notnil(x) {
-            ir.add_incoming(q, mapped(x, b, p), n);
-        }
-        q = q.next;
+    let bt = ir.terminator(b);
+    let mut ss: [2]*mut ir.Block = [s, s];
+    let mut nsucc: usize = 1;
+    if cond {
+        let br = ir.new_inst(f, ir.OP_CONDBR, ir.t_void());
+        br.a = mapped(bt.a, b, p);
+        br.t1 = bt.t1;
+        br.t2 = bt.t2;
+        ir.append_inst(n, br);
+        ss[0] = bt.t1;
+        ss[1] = bt.t2;
+        nsucc = 2;
+    } else {
+        let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+        br.t1 = s;
+        ir.append_inst(n, br);
     }
-    // uses under S: a phi at S of B's value and N's
-    let bld = ir.new_builder();
-    for k in 0..uses.len {
-        let us = uses.get(k);
-        if us.phi_from_b or (us.at == b) or (us.at.rpo < 0) {
-            continue;
-        }
-        if not ((s.preds.len == 1) and opt.dominates(s, us.at)) {
-            continue;
-        }
-        let user = us.user;
-        let ops: [3]*mut ir.Value = [user.a, user.b, user.c];
-        for j in @as(usize, 0)..3 {
-            let o = ops[j];
-            if u.notnil(o) and (o.kind == ir.V_INST) and (o.blk == b) {
-                let r = repair_phi(bld, o, b, p, n, s);
-                if j == 0 {
-                    user.a = r;
-                } else if j == 1 {
-                    user.b = r;
-                } else {
-                    user.c = r;
-                }
+    // the successors' phis: the input from B, as seen through N
+    for j in 0..nsucc {
+        let mut q = ss[j].first;
+        while u.notnil(q) and (q.op == ir.OP_PHI) {
+            let x = incoming(q, b);
+            if u.notnil(x) {
+                ir.add_incoming(q, mapped(x, b, p), n);
             }
-        }
-        for j in 0..user.xs.len {
-            let o = user.xs.get(j);
-            if (o.kind == ir.V_INST) and (o.blk == b) {
-                let skip = (user.op == ir.OP_PHI) and (user.bs.get(j) != us.at);
-                if not skip {
-                    user.xs.set(j, repair_phi(bld, o, b, p, n, s));
-                }
-            }
+            q = q.next;
         }
     }
     // P goes to N instead of B
@@ -497,29 +456,127 @@ fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block)
             ir.set_succ(t, k, n);
         }
     }
+    // the predecessor lists, for the repair
+    let mut k: usize = 0;
+    while k < b.preds.len {
+        if b.preds.get(k) == p {
+            b.preds.set(k, b.preds.get(b.preds.len - 1));
+            b.preds.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+    n.preds.clear();
+    n.preds.push(p);
+    n.rpo = p.rpo;
+    for j in 0..nsucc {
+        if (j == 0) or (ss[j] != ss[0]) {
+            ss[j].preds.push(n);
+        }
+    }
+    // uses of B's values beyond it: B's value or N's, whichever reaches
+    // them, merged by phis where both do
+    for k2 in 0..uses.len {
+        let us = uses.get(k2);
+        if us.phi_from_b or (us.at == b) or (us.at.rpo < 0) {
+            continue;
+        }
+        let user = us.user;
+        if user.op == ir.OP_PHI {
+            for j in 0..user.xs.len {
+                let o = user.xs.get(j);
+                if (o.kind == ir.V_INST) and (o.blk == b) and (user.bs.get(j) == us.at) {
+                    user.xs.set(j, at_end(o, us.at, b, p, n));
+                }
+            }
+            continue;
+        }
+        if u.notnil(user.a) and (user.a.kind == ir.V_INST) and (user.a.blk == b) {
+            user.a = at_entry(user.a, us.at, b, p, n);
+        }
+        if u.notnil(user.b) and (user.b.kind == ir.V_INST) and (user.b.blk == b) {
+            user.b = at_entry(user.b, us.at, b, p, n);
+        }
+        if u.notnil(user.c) and (user.c.kind == ir.V_INST) and (user.c.blk == b) {
+            user.c = at_entry(user.c, us.at, b, p, n);
+        }
+        for j in 0..user.xs.len {
+            let o = user.xs.get(j);
+            if (o.kind == ir.V_INST) and (o.blk == b) {
+                user.xs.set(j, at_entry(o, us.at, b, p, n));
+            }
+        }
+    }
+    for k3 in 0..repaired.len {
+        repaired.get(k3).blk.aux = 0;
+    }
+    repaired.clear();
     remove_phi_input(b, p);
 }
 
+// SSA repair after threading: the value of v (B's) that reaches the end,
+// or the entry, of block x, which B dominated: v from B, its copy from N, a
+// phi where both reach (memoised per value in the blocks' aux / auxp).
 let mut repaired: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
                                                                     cap: 0 };
+let mut repair_bld: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
 
-// The phi at S merging v (from B) and its copy (from N); made once per value.
-fn repair_phi(bld: *mut ir.Builder, v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, n: *mut ir.Block,
-              s: *mut ir.Block) *mut ir.Value {
-    for k in 0..repaired.len {
-        let ph = repaired.get(k);
-        if ph.xs.get(0) == v {
-            return ph;
+fn memo_key(v: *ir.Value) i64 {
+    return -1 - @as(i64, v.id);
+}
+
+fn at_end(v: *mut ir.Value, x0: *mut ir.Block, b: *mut ir.Block, p: *mut ir.Block, n: *mut ir.Block) *mut ir.Value {
+    let mut x = x0;
+    // a chain of single predecessors leads to where the value is decided
+    while true {
+        if x == b {
+            return v;
         }
+        if x == n {
+            return mapped(v, b, p);
+        }
+        if x.aux == memo_key(v) {
+            return @ptr_cast(*mut ir.Value, x.auxp);
+        }
+        if x.preds.len != 1 {
+            break;
+        }
+        x = x.preds.get(0);
     }
-    if u.notnil(s.first) {
-        ir.at_before(bld, s.first);
+    return at_entry(v, x, b, p, n);
+}
+
+fn at_entry(v: *mut ir.Value, x: *mut ir.Block, b: *mut ir.Block, p: *mut ir.Block, n: *mut ir.Block) *mut ir.Value {
+    if x.aux == memo_key(v) {
+        return @ptr_cast(*mut ir.Value, x.auxp);
+    }
+    if x.preds.len == 0 {
+        return ir.undef(v.ty);
+    }
+    if x.preds.len == 1 {
+        return at_end(v, x.preds.get(0), b, p, n);
+    }
+    if u.isnil(repair_bld) {
+        repair_bld = ir.new_builder();
+    }
+    if u.notnil(x.first) {
+        ir.at_before(repair_bld, x.first);
     } else {
-        ir.at_end(bld, s);
+        ir.at_end(repair_bld, x);
     }
-    let ph = ir.phi(bld, v.ty);
-    ir.add_incoming(ph, v, b);
-    ir.add_incoming(ph, mapped(v, b, p), n);
+    let ph = ir.phi(repair_bld, v.ty);
+    x.aux = memo_key(v);
+    x.auxp = @ptr_cast(*mut void, ph);
+    for k in 0..x.preds.len {
+        let q = x.preds.get(k);
+        let mut y = vnil();
+        if (q.rpo < 0) and (q != n) {
+            y = ir.undef(v.ty);
+        } else {
+            y = at_end(v, q, b, p, n);
+        }
+        ir.add_incoming(ph, y, q);
+    }
     repaired.push(ph);
     return ph;
 }
@@ -553,7 +610,7 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
         if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) or (b.preds.len < 2) {
             continue;
         }
-        if (t.a.kind != ir.V_INST) or (t.a.blk != b) or (copy_cost(b) > MAX_COPY) {
+        if (t.a.kind != ir.V_INST) or (copy_cost(b) > MAX_COPY) {
             continue;
         }
         // not through a loop header: that would peel iterations, one per round
@@ -574,27 +631,23 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             }
             let c = known_on_edge(t.a, b, p);
             if u.isnil(c) {
+                if phi_branch(b, t, p) {
+                    outside_uses(b);
+                    thread(f, b, p, u.nil.[ir.Block](), true);
+                    done = true;
+                    break;
+                }
                 continue;
             }
             let mut s = t.t2;
-            let mut other = t.t1;
             if ir.cint_val(c) != 0 {
                 s = t.t1;
-                other = t.t2;
             }
             if s == b {
                 continue;
             }
-            if b.mark == gen {
-                continue;  // its values cannot be repaired (found earlier)
-            }
             outside_uses(b);
-            if not uses_ok(b, s, other) {
-                b.mark = gen;
-                continue;
-            }
-            repaired.clear();
-            thread(f, b, p, s);
+            thread(f, b, p, s, false);
             done = true;
             break;
         }
@@ -606,7 +659,28 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
     return done;
 }
 
-let mut gen: i64 = 0;
+// B (ending in t) branches on a phi of its own whose input from P is a
+// condition P computes, and P only goes to B: P can branch on it itself,
+// through a copy of B (tail duplication). The conditions of `legal = a < 2`
+// in one arm and `legal = b == n` in the other, merged only to branch on
+// `legal`, are each branched on where they are computed.
+fn phi_branch(b: *mut ir.Block, t: *mut ir.Value, p: *mut ir.Block) bool {
+    let c = t.a;
+    if (c.op != ir.OP_PHI) or (c.blk != b) or (t.t1 == b) or (t.t2 == b) {
+        return false;
+    }
+    let pt = ir.terminator(p);
+    if u.isnil(pt) or (pt.op != ir.OP_BR) {
+        return false;
+    }
+    let x = incoming(c, p);
+    if u.isnil(x) or (x.kind != ir.V_INST) or (x.blk != p) {
+        return false;
+    }
+    let op = x.op;
+    return (op == ir.OP_ICMP) or (op == ir.OP_FCMP) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) or
+           (op == ir.OP_INTR);
+}
 
 // Could thread_one find anything (before it works out dominators): a
 // block, cheap to copy, that branches on a value it computes, known on the
@@ -617,7 +691,7 @@ fn candidates(f: *mut ir.Func) bool {
     while u.notnil(b) {
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (b.preds.len >= 2) and
-           (t.a.kind == ir.V_INST) and (t.a.blk == b) and (copy_cost(b) <= MAX_COPY) {
+           (t.a.kind == ir.V_INST) and (copy_cost(b) <= MAX_COPY) {
             for k in 0..b.preds.len {
                 let p = b.preds.get(k);
                 if p == b {
@@ -625,6 +699,9 @@ fn candidates(f: *mut ir.Func) bool {
                 }
                 let c = known_on_edge(t.a, b, p);
                 if u.isnil(c) {
+                    if phi_branch(b, t, p) {
+                        return true;
+                    }
                     continue;
                 }
                 let mut s = t.t2;
@@ -644,10 +721,13 @@ fn candidates(f: *mut ir.Func) bool {
 // Threads edges until none is left (or a limit); true if any. When it
 // returns false, f's predecessor lists are up to date.
 pub fn jump_thread(f: *mut ir.Func) bool {
+    let pc = phi_conditions(f);
     if u.isnil(f.first) or not candidates(f) {
-        return false;
+        return pc;
     }
-    gen += 1;
+    // (dead phis, of a value set in each iteration of a loop, would count as
+    // uses that keep blocks from being threaded)
+    opt.dce(f);
     let mut n: i32 = 0;
     while (n < 256) and thread_one(f, n == 0) {
         n += 1;
@@ -1217,6 +1297,147 @@ pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     }
     if any {
         ir.remove_unreachable(f);
+    }
+    return any;
+}
+
+// -----------------------------------------------------------------------------
+// Phis of conditions: an i1 phi of constants at M whose inputs a branch
+// decides (the branch of M's immediate dominator D: each input comes along
+// one of D's edges, true on the one, false on the other) is D's condition,
+// or its negation. `off = false` in one arm of `if i >= r` and `off = true`
+// in the other make `off` the test `i < r` again, which later branches (and
+// threading) can follow.
+// -----------------------------------------------------------------------------
+
+fn bool_const(v: *ir.Value) bool {
+    return is_k(v) and (v.ty.bits == 1);
+}
+
+// Which edge of D's branch t leads to p, the predecessor of M: 1 the true
+// one, 0 the false one, -1 neither alone.
+fn edge_of(t: *mut ir.Value, d: *mut ir.Block, m: *mut ir.Block, p: *mut ir.Block) i32 {
+    if p == d {
+        if t.t1 == m {
+            return 1;
+        }
+        if t.t2 == m {
+            return 0;
+        }
+        return -1;
+    }
+    if (p.rpo < 0) {
+        return -1;
+    }
+    if (t.t1 != m) and (t.t1.preds.len == 1) and opt.dominates(t.t1, p) {
+        return 1;
+    }
+    if (t.t2 != m) and (t.t2.preds.len == 1) and opt.dominates(t.t2, p) {
+        return 0;
+    }
+    return -1;
+}
+
+fn has_const_bool_phi(f: *mut ir.Func) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) and (i.op == ir.OP_PHI) {
+            if (i.ty.kind == ir.T_INT) and (i.ty.bits == 1) and (i.xs.len >= 2) {
+                let mut all = true;
+                for k in 0..i.xs.len {
+                    if not bool_const(ir.resolve(i.xs.get(k))) {
+                        all = false;
+                    }
+                }
+                if all {
+                    return true;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+// True if any phi was replaced. (Leaves f's predecessor lists up to date.)
+pub fn phi_conditions(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or not has_const_bool_phi(f) {
+        return false;
+    }
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    let bld = ir.new_builder();
+    let mut any = false;
+    for bi in 1..order.len {
+        let m = order.get(bi);
+        let d = m.idom;
+        if u.isnil(d) or (d == m) {
+            continue;
+        }
+        let t = ir.terminator(d);
+        if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+            continue;
+        }
+        let mut i = m.first;
+        while u.notnil(i) and (i.op == ir.OP_PHI) {
+            let next = i.next;
+            if (i.ty.kind == ir.T_INT) and (i.ty.bits == 1) and (i.xs.len >= 2) {
+                // the value on the true edges and on the false ones (-1: none yet)
+                let mut vt: i64 = -1;
+                let mut vf: i64 = -1;
+                let mut ok = true;
+                for k in 0..i.xs.len {
+                    let x = ir.resolve(i.xs.get(k));
+                    if not bool_const(x) {
+                        ok = false;
+                        break;
+                    }
+                    let xv = @as(i64, @bit_cast(i64, ir.cint_val(x)));
+                    let e = edge_of(t, d, m, i.bs.get(k));
+                    if e == 1 {
+                        if (vt >= 0) and (vt != xv) {
+                            ok = false;
+                        }
+                        vt = xv;
+                    } else if e == 0 {
+                        if (vf >= 0) and (vf != xv) {
+                            ok = false;
+                        }
+                        vf = xv;
+                    } else {
+                        ok = false;
+                    }
+                    if not ok {
+                        break;
+                    }
+                }
+                if ok and (vt >= 0) and (vf >= 0) and (vt != vf) {
+                    let mut r = ir.resolve(t.a);
+                    if vt == 0 {
+                        let mut at = m.first;
+                        while u.notnil(at) and (at.op == ir.OP_PHI) {
+                            at = at.next;
+                        }
+                        if u.notnil(at) {
+                            ir.at_before(bld, at);
+                        } else {
+                            ir.at_end(bld, m);
+                        }
+                        r = ir.xor(bld, r, kbool(true));
+                    }
+                    ir.forward(i, r);
+                    ir.remove_inst(i);
+                    any = true;
+                }
+            }
+            i = next;
+        }
+    }
+    u.free(@ptr_cast(*mut void, order.data));
+    if any {
+        ir.apply_forwarding(f);
     }
     return any;
 }

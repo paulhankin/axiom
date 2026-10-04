@@ -958,6 +958,18 @@ fn gen_alu(v: *mut ir.Value) void {
         b = v.a;
     }
     let d = vreg(v);
+    if (o == ir.OP_AND) and
+       (((a.kind == ir.V_INST) and ((a.flag & F_ANDN) != 0)) or ((b.kind == ir.V_INST) and ((b.flag & F_ANDN) != 0))) {
+        // ~y & x: andn d, y, x
+        let mut n = b;
+        let mut x = a;
+        if (a.kind == ir.V_INST) and ((a.flag & F_ANDN) != 0) {
+            n = a;
+            x = b;
+        }
+        _ = e3(xe.ANDN, sz, W(d), R(reg(x)), R(reg(n.a)));
+        return;
+    }
     if is_c(a) and fits32(cval(a)) {
         // (k - x: the constant straight into d)
         _ = e2(xe.MOV_RI, sz, W(d), I(cval(a)));
@@ -1403,9 +1415,64 @@ const F_VALUE: i32 = 8192;
 const F_RMW: i32 = 16384;     // a load, operation and store as one instruction (mark_rmw)
 const F_RUN: i32 = 32768;     // the first of a run of constant stores, which stores them all (aux2: how many)
 const F_IN_RUN: i32 = 65536;  // a later store of such a run
+const F_ANDN: i32 = 131072;   // a `not` that its only user, an `and`, computes as andn (BMI1)
 
 fn is_scalar_cmp(v: *ir.Value) bool {
     return (v.kind == ir.V_INST) and ((v.op == ir.OP_ICMP) or (v.op == ir.OP_FCMP)) and (v.a.ty.kind != ir.T_VEC);
+}
+
+// Is v an @any / @all of a vector of 16 or 32 bytes, which ptest decides
+// (SSE4.1): then a branch or select on it can jump on ptest's flags.
+fn ptest_cond(v: *ir.Value) bool {
+    if (v.kind != ir.V_INST) or (v.op != ir.OP_INTR) or (v.xs.len != 1) or not has41() {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if (id != ir.IN_ANYTRUE) and (id != ir.IN_ALLTRUE) {
+        return false;
+    }
+    let at = v.xs.get(0).ty;
+    if at.kind != ir.T_VEC {
+        return false;
+    }
+    return (at.size == 16) or ((at.size == 32) and AVX);
+}
+
+// ptest for ptest_cond(v): the condition code that is true when v is.
+fn ptest_cc(v: *mut ir.Value) i32 {
+    let a0 = v.xs.get(0);
+    let at = a0.ty;
+    let outer_vl = VL;
+    VL = vl_of(at);
+    let a = reg(a0);
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    let mut cc = xe.CC_NE;  // some bit set
+    let mut x = a;
+    if id == ir.IN_ALLTRUE {
+        // no lane equal to zero
+        let k = lk(at);
+        let z = vxmm();
+        vzero(z);
+        x = vxmm();
+        if k == 3 {
+            sse3(xe.PCMPEQQ, x, a, R(z));
+        } else {
+            sse3(xe.PCMPEQB + k, x, a, R(z));
+        }
+        cc = xe.CC_E;
+    }
+    let t = sse2(xe.PTEST, R(x), R(x));
+    t.sz = VL;
+    VL = outer_vl;
+    return cc;
+}
+
+// Is n a `not` (xor with all ones) of a value in a register, used only by
+// the `and` i, which can be andn?
+fn andn_not(n: *mut ir.Value, i: *mut ir.Value) bool {
+    return (n.kind == ir.V_INST) and (n.op == ir.OP_XOR) and (n.uses == 1) and (n.blk == i.blk) and is_c(n.b) and
+           ((@bit_cast(u64, cval(n.b)) & ir.mask_bits(n.ty.bits)) == ir.mask_bits(n.ty.bits)) and
+           (n.a.kind != ir.V_CINT) and not folded_load(n.a) and (n.flag == 0) and (n.ty.bits >= 32);
 }
 
 // Is v a `not` of an i1 (xor with 1)?
@@ -1478,6 +1545,9 @@ fn branch_tree(c: *mut ir.Value, t: i32, f: i32, next: i32) void {
 
 fn cond_code(c: *mut ir.Value) i32 {
     if fused(c) {
+        if c.op == ir.OP_INTR {
+            return ptest_cc(c);
+        }
         if c.op == ir.OP_ICMP {
             return int_compare(c);
         }
@@ -1553,9 +1623,14 @@ fn gen_icmp(v: *mut ir.Value) void {
         vec_icmp(v);
         return;
     }
+    // d zeroed before the compare (then xor, flags being dead) and set
+    // after it: no movzx (as LLVM; d is live across the compare, so it is
+    // none of its operands)
     let d = vreg(v);
+    _ = e2(xe.MOV_RI, 4, W(d), I(0));
     let cc = int_compare(v);
-    materialize_cc(d, cc);
+    let i = e1(xe.SETCC, 1, RW(d));
+    i.cc = cc;
 }
 
 fn gen_fcmp(v: *mut ir.Value) void {
@@ -4384,6 +4459,10 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
             }
             return;
         }
+        if ptest_cond(v) {
+            materialize_cc(d, ptest_cc(v));
+            return;
+        }
         let z = vxmm();
         vzero(z);
         if id == ir.IN_ANYTRUE {
@@ -5585,7 +5664,7 @@ fn gen_inst_at(v: *mut ir.Value) void {
         gen_remat(v);
         return;
     }
-    if (v.flag & ((16 | 32) | 256)) != 0 {
+    if (v.flag & (((16 | 32) | 256) | F_ANDN)) != 0 {
         return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
     if (v.flag & 64) != 0 {
@@ -5716,6 +5795,9 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if o == ir.OP_INTR {
+        if fused(v) {
+            return;  // (a ptest at each branch and select on it)
+        }
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         if id == ir.IN_TRAP {
             _ = e0(xe.UD2, 0);
@@ -6074,7 +6156,7 @@ fn prepare(f: *mut ir.Func) void {
             let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
             for k in @as(usize, 0)..3 {
                 let o = ops[k];
-                if u.notnil(o) and is_scalar_cmp(o) {
+                if u.notnil(o) and (is_scalar_cmp(o) or ptest_cond(o)) {
                     let cond = (o.blk == b) and
                                (((k == 0) and ((i.op == ir.OP_CONDBR) or (i.op == ir.OP_SELECT))) or
                                 ((k <= 1) and ((i.flag & F_BRANCH) != 0)));
@@ -6085,7 +6167,7 @@ fn prepare(f: *mut ir.Func) void {
             }
             for k in 0..i.xs.len {
                 let o = i.xs.get(k);
-                if is_scalar_cmp(o) {
+                if is_scalar_cmp(o) or ptest_cond(o) {
                     o.flag = o.flag | F_VALUE;
                 }
             }
@@ -6097,7 +6179,7 @@ fn prepare(f: *mut ir.Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            if is_scalar_cmp(i) and (i.uses >= 1) and ((i.flag & F_VALUE) == 0) {
+            if (is_scalar_cmp(i) or ptest_cond(i)) and (i.uses >= 1) and ((i.flag & F_VALUE) == 0) {
                 i.flag = i.flag | 2;
             }
             if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
@@ -6165,6 +6247,26 @@ fn prepare(f: *mut ir.Func) void {
         b = b.next;
     }
     mark_fused_vectors(f);
+    // x & ~y as andn (BMI1), the `not` used only there
+    if tg.has(tg.X_BMI1) {
+        b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i.op == ir.OP_AND) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 32) and (i.ty.bits <= 64) and
+                   not is_c(i.a) and not is_c(i.b) and (i.a != i.b) and ((i.flag & ((4 | 8) | F_RMW)) == 0) and
+                   not folded_load(i.a) and not folded_load(i.b) {
+                    if andn_not(i.b, i) {
+                        i.b.flag = i.b.flag | F_ANDN;
+                    } else if andn_not(i.a, i) {
+                        i.a.flag = i.a.flag | F_ANDN;
+                    }
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+    }
     // consecutive stores of constants filling memory: vector stores (after
     // mark_fused_vectors, which clears aux2)
     b = f.first;
@@ -6710,6 +6812,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.loop_depths(f, &order);
     opt.hoist_constants(f, &order, const_needs_reg);
     opt.layout(&mut order);
+    opt.sink_compares(f);
     prepare(f);
     MF = mc.new_func();
     for i in 0..order.len {
@@ -7473,6 +7576,24 @@ fn enc_inst(i: *mut mc.MInst) void {
                 (((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2));
         b8(((w << 7) | (((~@as(u64, @bit_cast(u32, c))) & 15) << 3)) | pp);
         b8(0xf7);
+        xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, d)), @as(u64, @bit_cast(u32, s)));
+        return;
+    }
+    if op == xe.ANDN {
+        // VEX.LZ.0F38.W F2 /r: reg = dst, vvvv = the negated source, rm = the other
+        let d = P(i.ops[0].reg);
+        let s = P(i.ops[1].reg);
+        let c = P(i.ops[2].reg);
+        let mut w: u64 = 0;
+        if sz == 8 {
+            w = 1;
+        }
+        b8(0xc4);
+        b8(
+            ((((~@as(u64, @bit_cast(u32, d >> 3))) & 1) << 7) | (1 << 6)) | (
+                (((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2));
+        b8((w << 7) | (((~@as(u64, @bit_cast(u32, c))) & 15) << 3));
+        b8(0xf2);
         xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, d)), @as(u64, @bit_cast(u32, s)));
         return;
     }
