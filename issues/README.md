@@ -68,3 +68,4 @@ they travel with the code they describe.
 | [0036](0036-dot-lowering.md) | bug | compiler (C) | `@dot` on `i16` lanes does not become `pmaddwd` / `i32x4.dot_i16x8_s` |
 | [0037](0037-native-stack-trace-cost.md) | feature | compiler (C), runtime | Stack traces cost 15% in call-heavy native code |
 | [0038](0038-pointer-offsets.md) | feature | language, compiler (C and selfhost) | Pointer offsets (`@ptr_add`): in-bounds element offsets for raw pointers |
+| [0039](0039-selfhost-tls-sse-operand.md) | bug | compiler (selfhost) | Self-hosted x86-64 backend: "TLS operand in an SSE instruction" |
