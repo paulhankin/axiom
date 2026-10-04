@@ -1,7 +1,7 @@
 # 0054: Self-hosted register allocator spills hot values and copies around its spill code
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (3530ca4)
 - Area: compiler (selfhost: mach, register allocation)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against the C compiler's
@@ -104,3 +104,51 @@ spill traffic is the largest single part of `generate_moves_sub` (1.6x the sampl
 LLVM's version) and `save_moves` (1.3x). Estimate: 10-20% of movegen (100-200 ns), about 5%
 of `contact_inputs` and of the net kernels' output layers. Together that is about
 150-250 ns summed over the kernels, the largest item after 0053.
+
+## Fixed (3530ca4)
+
+`mach.ax` now splits live ranges instead of reloading a spilled value at every use:
+
+- **Splitting.** A spilled interval gets a stack slot and is split: across the calls
+  it is live over and along loop entries/exits it is in the slot, and each connected
+  stretch in between becomes a new vreg that competes again in the next round (so a
+  value can be in a caller-saved register between calls and in a loop while it is in
+  memory across them). Pieces that lose again are split at every block boundary
+  (reloaded before their first use in the block, copied along edges between
+  adjacent pieces, which coalesce through hints); only those are spilled everywhere.
+  A region that defines the value stores it after each definition or where it leaves
+  the region, whichever runs less often; stretches that never use it stay in memory,
+  and after a call the value is reloaded where it is next used (in a successor), not
+  in bulk after the call.
+- **Spill weights by block frequency.** `block_freqs` estimates per-block frequencies
+  on the machine CFG (natural loops x10 per entry, branches split evenly, loops
+  rarely left, trap paths cold) instead of 10^depth; weights are uses x frequency per
+  (size + 50) positions, and rematerializable values (0056) weigh half.
+- **Copies folded into spill code.** A copy from a spilled value becomes a load into
+  the copy's destination (`mov rdi,[slot]`), a copy to one a store of its source;
+  dead reloads left by splitting are deleted.
+- Target hooks: `spill_move`, `is_label`, and `MBlock.cold` (x64.ax, a64.ax).
+
+Deterministic counts (ptrace single-stepping a fixed number of kernel calls, the benchmark
+`bench_kernels`, against main before this commit):
+
+| kernel (calls) | instructions | stack loads | stack stores |
+|---|---|---|---|
+| movegen (100 `generate_moves_into`) | 1361k -> 1261k (-7%) | 189k -> 109k (-43%) | 57.5k -> 44.6k (-22%) |
+| `generate_moves_sub` alone | 925k -> 837k | 167k -> 96k | 42k -> 29k |
+| `save_moves` alone | 252k -> 244k | 11.5k -> 6.1k | 7.7k -> 7.8k |
+| contact_net (16 batches) | 1106k -> 1088k | 27.7k -> 7.5k | 6.9k -> 6.7k |
+| pruned_single (400 evals) | 321k -> 319k | 5.6k -> 4.4k | 4.4k -> 4.4k |
+
+`dim128_pair`'s output loop no longer reloads activations (item 4): its remaining
+stack accesses run once per call. Timings (min of 15 on a loaded machine): movegen
+992 -> 884 ns (LLVM 709), contact_net 320 -> 304 (LLVM 272), others within noise
+(race_inputs moved 198 -> 214 with byte-identical `calculate_race_inputs`: code
+placement). AArch64: the compiler built for aarch64 by itself, run under qemu,
+produces the same x86-64 and aarch64 compilers. the benchmark results bit-identical.
+
+Left: generate_moves_sub still has about 4x LLVM's stack loads. The loop keeps
+~17 values live across its recursive call (more than LLVM's IR does), and the
+in-loop pieces of the losers are reloaded per block; a register-pressure-aware
+region split (LLVM's spill placement) or a priority (largest-first) allocator
+would pick better. Critical edges into loop latches block per-edge splitting.
