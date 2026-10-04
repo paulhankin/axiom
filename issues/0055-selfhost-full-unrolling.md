@@ -1,7 +1,7 @@
 # 0055: Self-hosted optimizer does not unroll small constant-trip loops
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (0dd4738, b18d0de)
 - Area: compiler (selfhost: opt / passes, then combine and gvn)
 
 Part of the set 0053-0064 (the benchmark `bench_kernels`, selfhost against LLVM; see 0053).
@@ -83,3 +83,28 @@ Partial unrolling (by 2-4) of hot counted loops with small bodies, as LLVM does 
 Measured: -6 to -11% `contact_inputs` from one loop, -14% `race_inputs`. With
 `pruning_inputs` (24 iterations), the output layers and the three 5-iteration loops,
 about 60-90 ns summed over the kernels.
+
+## Resolution
+
+Fixed in 0dd4738 and b18d0de. `selfhost/src/unroll.ax` unrolls, after inlining
+(`passes.ax`, the last per-function phase, before loop splitting), every loop whose header
+tests its induction variable against a constant: the trip count is found by simulating the
+variable (start a constant on every way in, the same step on every back edge), and the loop
+is copied that many times when the count times its size (instructions without phis, jumps,
+address additions and extensions) is at most 300, LLVM's budget. Inner loops go first;
+each copy folds its constants as it is made, so an inner loop whose start depends on the
+outer variable (the 3x6 crossover sums) is unrolled next. Side exits (`break`, failed
+checks) are copied with their phi inputs. The function is then optimized again (SROA takes
+`min_upto` apart, the shifts become constants). Integer-to-float conversions of constants
+now fold (`opt.ax`), which the unrolled `@float_from_int(f32, i)` needed.
+
+The one-hot loop (`if men_off == k + 1 { inputs[OFF + k] = 1.0 }`) is, once unrolled and
+threaded (0063), a chain of tests storing one value at addresses linear in the constant;
+`unroll.onehot_stores` makes it a range check and one store.
+
+Measured (bench_kernels, min of 41, against main at 51b2245, noisy machine): race_inputs
+191 -> 147 ns (-23%), contact_inputs 280 -> 242 ns (-13%); the other kernels within noise.
+bench_search results identical. The compiler's size, built from the same source, +0.5%; its
+build time unchanged (the time jump threading took was halved, below).
+
+Partial unrolling of the 23- and 24-point loops is left.

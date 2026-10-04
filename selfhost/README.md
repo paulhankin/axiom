@@ -191,7 +191,8 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `copies.ax` | Copies of aggregates that are only read: a stack slot filled by one whole copy and then only read (loaded, copied, passed by value) reads the source instead, when the source cannot change while it is read (a constant, a by-value parameter, a slot written only before the copy); a copy of a copy reads the first source when nothing writes memory between them; a call's result copied into the function's own result is written there directly. Lowering marks by-value arguments and result slots (`ir.EXT_BYVAL`, `ir.EXT_SRET`) |
 | `sroa.ax` | Scalar replacement of aggregates: stack slots split into scalar fields, copies of constants replaced by the constant |
 | `gvn.ax` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions and bounds between values (bounds and overflow checks), dead stores, shadow stack pushes and pops (and their records moved to the paths that read them), loop-invariant code motion, memset idioms, loop ranges split at bounds checks, code sinking |
-| `thread.ax` | Jump threading and if-conversion (selects; stores in both arms merged) |
+| `thread.ax` | Jump threading (also over comparisons of one value that branches above decide) and if-conversion (selects; stores in both arms merged; a load from a constant global speculated through a select of its address; nested tests of one value merged into one range check) |
+| `unroll.ax` | Full unrolling of loops with a small constant trip count (after inlining), and chains of `x == k` tests storing one value at addresses linear in `k` made one range check and one store |
 | `inline.ax` | Inlining bottom-up over the call graph (and the calls inlining brings in), interprocedural constant propagation, dead functions |
 | `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own |
 | `wasm.ax`, `wobj.ax` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
@@ -274,7 +275,8 @@ dead store elimination, shadow stack push/pop removal, memset idioms,
 loop-invariant code motion and code sinking. `-O2` and `-O3` add cold
 region outlining, interprocedural constant propagation and inlining
 (whole-program units by default), after which each function is simplified
-again, and then split loop ranges at their bounds checks. The backends
+again, then fully unroll loops with a small constant trip count (and
+simplify those functions again), and split loop ranges at their bounds checks. The backends
 then lay out loops, hoist constants, fold loads into memory operands
 (x86-64) and allocate registers with live ranges that have holes.
 
