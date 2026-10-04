@@ -245,6 +245,17 @@ fn sse3(id: i32, d: i32, a: i32, b: mc.MOp) void {
     i.cc = id;
 }
 
+// d <- 0: pxor d, d, which does not read d (its operands besides the
+// destination have no role, so d is not live before it).
+fn vzero(d: i32) void {
+    let i = e4(xe.SSE, 0, W(d), mc.reg(d, 0), NONE(), NONE());
+    if AVX {
+        i.ops[2] = mc.reg(d, 0);
+    }
+    i.cc = xe.PXOR;
+    _ = vlz(i);
+}
+
 fn sse3_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64) void {
     if AVX {
         let i = e4(xe.SSE, 0, W(d), b, R(a), I(x));
@@ -387,6 +398,9 @@ fn vreg(v: *mut ir.Value) i32 {
 // A register holding v (materializing constants and addresses here).
 fn reg(v: *mut ir.Value) i32 {
     let k = v.kind;
+    if remat(v) {
+        return remat_reg(v);
+    }
     if (k == ir.V_INST) and ((v.op == ir.OP_ALLOCA) or ((v.flag & 1) != 0)) {
         // folded into memory operands where it is used; recomputed here
         let r = vgpr();
@@ -443,7 +457,7 @@ fn reg(v: *mut ir.Value) i32 {
         VL = vl_of(t);
         let r = vxmm();
         if ir.is_zero(v) or (k == ir.V_UNDEF) {
-            sse3(xe.PXOR, r, r, R(r));
+            vzero(r);
         } else {
             let mut b = bn.new_bytes();
             const_le(v, &mut b, 0);
@@ -461,7 +475,7 @@ fn reg(v: *mut ir.Value) i32 {
         VL = 0;  // (a 128-bit constant, whatever the instruction using it)
         let r = vxmm();
         if ir.is_zero(v) or (k == ir.V_UNDEF) {
-            sse3(xe.PXOR, r, r, R(r));
+            vzero(r);
             VL = outer_vl;
             return r;
         }
@@ -521,6 +535,63 @@ fn const_le(x: *mut ir.Value, out: *mut bn.Bytes, base: usize) void {
             const_le(x.xs.get(i), out, base + @truncate(usize, ir.field_off(t, i)));
         }
     }
+}
+
+// A vector the selector computes again at each use instead of keeping it in
+// a register: a splat of a constant, or a load from a constant global (one
+// instruction each, from memory). The optimizer hoists those out of loops,
+// and a 512-bit function using many would otherwise hold them all through
+// its loops.
+fn remat(v: *ir.Value) bool {
+    if (v.kind != ir.V_INST) or (v.ty.kind != ir.T_VEC) {
+        return false;
+    }
+    if v.op == ir.OP_SPLAT {
+        let x = v.a;
+        return (x.kind == ir.V_CINT) or (x.kind == ir.V_CFP) or (x.kind == ir.V_ZERO);
+    }
+    if (v.op != ir.OP_LOAD) or (v.flags != 0) {
+        return false;
+    }
+    let mut p = v.a;
+    if is_inst(p, ir.OP_PTRADD) and imm_ok(p.b) {
+        p = p.a;
+    }
+    return (p.kind == ir.V_GLOBAL) and p.gv.is_const and not p.gv.tls and not extern_global(p.gv);
+}
+
+fn remat_reg(v: *mut ir.Value) i32 {
+    let outer_vl = VL;
+    VL = vl_of(v.ty);
+    let r = vxmm();
+    if v.op == ir.OP_LOAD {
+        _ = sse2(xe.MOVDQU_LD, W(r), addr(v.a));
+        VL = outer_vl;
+        return r;
+    }
+    let mut b = bn.new_bytes();
+    let n = @as(usize, @bit_cast(u32, v.ty.lanes));
+    let lb = @truncate(usize, v.ty.elem.size);
+    let mut one = bn.new_bytes();
+    const_le(v.a, &mut one, 0);
+    let lane = one.view();
+    for _k in 0..n {
+        for j in 0..lb {
+            b.u8_(lane[j]);
+        }
+    }
+    one.free();
+    let mut n_bytes = @as(usize, VL);
+    if n_bytes == 0 {
+        n_bytes = 16;
+    }
+    while b.len() < n_bytes {
+        b.u8_(0);
+    }
+    _ = sse2(xe.MOVDQU_LD, W(r), const_bytes(&b, n_bytes));
+    b.free();
+    VL = outer_vl;
+    return r;
 }
 
 // A memory operand for address p.
@@ -1940,10 +2011,10 @@ const WIN_SHADOW: u64 = 32;
 fn caller_saved() u64 {
     if WIN {
         // rax rcx rdx r8-r11, xmm0-xmm5 (rsi, rdi and xmm6-xmm15 are callee-saved)
-        return (0x0f07 | (@as(u64, 0x3f) << 16));
+        return (0x0f07 | (@as(u64, 0x3f) << 16)) | (@as(u64, 0xffff) << 48);
     }
     // rax rcx rdx rsi rdi r8-r11, all xmm
-    return (0x0fc7 | (@as(u64, 0xffff) << 16));
+    return (0x0fc7 | (@as(u64, 0xffff) << 16)) | (@as(u64, 0xffff) << 48);
 }
 
 // The register an argument or parameter arrives in (-1: on the stack),
@@ -2733,7 +2804,7 @@ fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
         }
         return;
     }
-    let cnt = vxmm();
+    let cnt = mc.new_vreg(MF, XMM);  // (the count: 64 bits, whatever the width)
     let cs = reg(c.a);
     let z = vgpr();
     let e = e2(xe.EXT, 4, W(z), R(cs));
@@ -2893,8 +2964,18 @@ fn gen_cpuid(v: *mut ir.Value) void {
 // Part k (16 bytes) of wide vector register a (of VL bytes), in an xmm
 // register (the register itself for part 0).
 fn part128(a: i32, k: i64) i32 {
-    if k == 0 {
+    if (k == 0) and ((VL < 64) or not zmm16()) {
         return a;
+    }
+    if k == 0 {
+        // (a 512-bit register may be one of xmm16-31, which only EVEX
+        // encodes: a copy of the low part)
+        let wl = VL;
+        VL = 0;
+        let p = vxmm();
+        VL = wl;
+        copy(p, a, XMM);
+        return p;
     }
     let wl = VL;
     VL = 0;
@@ -3185,7 +3266,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         } else {
             // lanes equal to zero
             let z = vxmm();
-            sse3(xe.PXOR, z, z, R(z));
+            vzero(z);
             let mut eq = xe.PCMPEQB + k;
             if k == 3 {
                 eq = xe.PCMPEQQ;
@@ -3237,7 +3318,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
             return;
         }
         let z = vxmm();
-        sse3(xe.PXOR, z, z, R(z));
+        vzero(z);
         if id == ir.IN_ANYTRUE {
             // some byte nonzero: not all bytes equal to zero
             let e = vxmm();
@@ -3510,7 +3591,7 @@ fn vec_cvt(v: *mut ir.Value) void {
         return;
     }
     let z = vxmm();
-    sse3(xe.PXOR, z, z, R(z));
+    vzero(z);
     if o == ir.OP_FPTOUI_SAT {
         // max(x, 0) is 0 for NaN (its second operand) and negative lanes;
         // the conversion gives all ones above the range
@@ -3889,6 +3970,9 @@ fn gen_inst(v: *mut ir.Value) void {
 fn gen_inst_at(v: *mut ir.Value) void {
     let o = v.op;
     let t = v.ty;
+    if remat(v) {
+        return;  // (at its uses)
+    }
     if o == ir.OP_COPY {
         copy(vreg(v), reg(v.a), class_of(t));
         return;
@@ -4047,7 +4131,10 @@ fn gen_inst_at(v: *mut ir.Value) void {
     fail(u.f1("cannot select %s", ir.inst_str(v)));
 }
 
-// Copies into the successors' phis (as one parallel assignment).
+// Copies into the successors' phis (as one parallel assignment): each
+// as soon as no other copy still reads its destination, and a cycle broken
+// by a temporary (rather than every value through one, which would keep
+// twice as many registers live across a loop's back edge).
 fn phi_copies(b: *mut ir.Block) void {
     let t = ir.terminator(b);
     for k in 0..ir.succ_count(t) {
@@ -4061,43 +4148,65 @@ fn phi_copies(b: *mut ir.Block) void {
         if dup {
             continue;
         }
-        let mut tmps = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+        let mut ds = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+        let mut ss = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+        let mut cs = u.List.[u8].{ data: u.nil.[u8](), len: 0, cap: 0 };
         let mut p = s.first;
         while u.notnil(p) and (p.op == ir.OP_PHI) {
-            let mut x = ir.undef(p.ty);
-            for j in 0..p.bs.len {
-                if p.bs.get(j) == b {
-                    x = p.xs.get(j);
-                }
-            }
-            let c = class_of(p.ty);
-            let tr = mc.new_vreg(MF, c);
-            if x.kind != ir.V_UNDEF {
-                copy(tr, reg(x), c);
-            }
-            tmps.push(tr);
-            p = p.next;
-        }
-        p = s.first;
-        let mut k2: usize = 0;
-        while u.notnil(p) and (p.op == ir.OP_PHI) {
-            let c = class_of(p.ty);
-            let tr = tmps.get(k2);
-            let d = vreg(p);
-            // an undefined input leaves the phi as it is
-            let mut defined = false;
+            // (an undefined input leaves the phi as it is)
             for j in 0..p.bs.len {
                 if (p.bs.get(j) == b) and (p.xs.get(j).kind != ir.V_UNDEF) {
-                    defined = true;
+                    let r = reg(p.xs.get(j));
+                    let d = vreg(p);
+                    if r != d {
+                        ds.push(d);
+                        ss.push(r);
+                        cs.push(class_of(p.ty));
+                    }
+                    break;
                 }
             }
-            if defined {
-                copy(d, tr, c);
-            }
-            k2 += 1;
             p = p.next;
         }
-        u.free(@ptr_cast(*mut void, tmps.data));
+        while ds.len > 0 {
+            let mut ready: isize = -1;
+            for i in 0..ds.len {
+                let mut read = false;
+                for j in 0..ss.len {
+                    if (j != i) and (ss.get(j) == ds.get(i)) {
+                        read = true;
+                    }
+                }
+                if not read {
+                    ready = @bit_cast(isize, i);
+                    break;
+                }
+            }
+            if ready < 0 {
+                // a cycle: the first destination's value kept in a temporary
+                let d = ds.get(0);
+                let tr = mc.new_vreg(MF, cs.get(0));
+                copy(tr, d, cs.get(0));
+                for j in 0..ss.len {
+                    if ss.get(j) == d {
+                        ss.set(j, tr);
+                    }
+                }
+                continue;
+            }
+            let i = @bit_cast(usize, ready);
+            copy(ds.get(i), ss.get(i), cs.get(i));
+            let last = ds.len - 1;
+            ds.set(i, ds.get(last));
+            ss.set(i, ss.get(last));
+            cs.set(i, cs.get(last));
+            ds.len = last;
+            ss.len = last;
+            cs.len = last;
+        }
+        u.free(@ptr_cast(*mut void, ds.data));
+        u.free(@ptr_cast(*mut void, ss.data));
+        u.free(@ptr_cast(*mut void, cs.data));
     }
 }
 
@@ -4351,6 +4460,16 @@ let xmm_order: [16]i32 = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
 // Windows preserves only the low halves of xmm6-15 across calls: wide
 // values stay in xmm0-5 there.
 let win_wide_order: [6]i32 = [16, 17, 18, 19, 20, 21];
+// With AVX-512 (and VL, for the moves of their low parts), 512-bit values
+// also have xmm16-31, caller-saved everywhere: first, so that xmm0-15 stay
+// free for the narrower values (scalars, and what VEX encodes).
+let zmm_order: [32]i32 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 16, 17, 18, 19, 20, 21, 22,
+                          23, 24, 25, 26, 27, 28, 29, 30, 31];
+let win_zmm_order: [22]i32 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 16, 17, 18, 19, 20, 21];
+
+fn zmm16() bool {
+    return tg.has((tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL);
+}
 
 fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     if class == 0 {
@@ -4515,8 +4634,16 @@ fn compile_func(f: *mut ir.Func) void {
         gorder = win_gpr_order[..];
     }
     let mut wide_order = xmm_order[..];
+    let mut zorder = xmm_order[..];
     if WIN {
         wide_order = win_wide_order[..];
+        zorder = win_wide_order[..];
+    }
+    if zmm16() {
+        zorder = zmm_order[..];
+        if WIN {
+            zorder = win_zmm_order[..];
+        }
     }
     UPPER = false;
     for k in 0..MF.vclass.len {
@@ -4524,7 +4651,7 @@ fn compile_func(f: *mut ir.Func) void {
             UPPER = true;
         }
     }
-    let tgt = mc.Target.{ nclasses: 4, alloc_order: [gorder, xmm_order[..], wide_order, wide_order],
+    let tgt = mc.Target.{ nclasses: 4, alloc_order: [gorder, xmm_order[..], wide_order, zorder],
                           caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store };
     mc.dce(MF, pure_inst);
     mc.allocate(MF, &tgt);
