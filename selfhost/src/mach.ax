@@ -12,9 +12,13 @@
 // used explicitly (argument and result registers, division, shifts) and
 // registers clobbered by calls are fixed ranges an interval must avoid.
 // When registers run out, the interval with the lowest spill weight (uses,
-// weighted by loop depth, per position covered) is spilled to a stack slot
-// and its uses and definitions are rewritten through short-lived registers;
-// allocation then runs again (those never spill).
+// weighted by the estimated frequency of their blocks, per position covered)
+// loses its register and is split (see split): it goes to a stack slot across
+// the calls it is live over and along loop boundaries, and each stretch in
+// between becomes a new vreg; pieces that lose again are split at every block
+// boundary, and those are finally spilled everywhere, their uses and
+// definitions rewritten through short-lived registers (which never spill).
+// Allocation runs again after each rewrite.
 // =============================================================================
 import "util.ax" as u;
 
@@ -75,6 +79,8 @@ pub struct MBlock {
     succs: u.List.[i32],
     preds: u.List.[i32],
     loop_depth: i32,
+    cold: bool,  // ends in a trap (set by the target)
+    freq: f64,   // estimated runs per call (block_freqs)
     live_in: []mut u64,
     live_out: []mut u64,
     start: i32,
@@ -97,6 +103,10 @@ pub struct Target {
     // spill code: load/store of register r (class c) from/to a slot
     spill_load: fn(*mut MFunc, i32, i32, i32) *mut MInst,
     spill_store: fn(*mut MFunc, i32, i32, i32) *mut MInst,
+    // a copy of register s to d (class c), marked is_move
+    spill_move: fn(*mut MFunc, i32, i32, i32) *mut MInst,
+    // a label within a block (the target of jumps from within the block)
+    is_label: fn(*MInst) bool,
     // a rematerialized value read from memory instead (see set_remat):
     // makes instruction i read vreg r's value straight from where its
     // definition `def` loads it, if it can
@@ -114,6 +124,8 @@ pub struct MFunc {
     used_regs: u64,     // physical registers used (for callee-saved saves)
     ninst: i32,
     has_calls: bool,
+    level: u.List.[u8],   // how far each vreg has been split (see split)
+    vslot: u.List.[i32],  // its spill slot, shared by the pieces of a split vreg (-1: none yet)
 }
 
 pub fn new_func() *mut MFunc {
@@ -125,6 +137,8 @@ pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
     f.nospill.push(false);
     f.remat.push(u.nil.[MInst]());
     f.hint.push(-1);
+    f.level.push(0);
+    f.vslot.push(-1);
     return VREG0 + @int_cast(i32, f.vclass.len - 1);
 }
 
@@ -400,6 +414,369 @@ fn liveness(f: *mut MFunc) void {
 }
 
 // -----------------------------------------------------------------------------
+// Block frequencies (estimated statically: how often each block runs per call
+// of the function). Branches split evenly, except that blocks leading only to
+// a trap (cold) are rarely taken and loops are rarely left; a loop runs its
+// body LOOP_SCALE times per entry. Loops are found on the machine CFG (back
+// edges of a depth-first search, natural loop bodies) and handled innermost
+// first: each one's iteration (header 1) is computed with the loops inside it
+// collapsed to their headers, whose exits it reaches in proportion.
+// -----------------------------------------------------------------------------
+const LOOP_SCALE: f64 = 10.0;
+const COLD_WEIGHT: f64 = 0.001;
+const EXIT_WEIGHT: f64 = 0.125;
+
+struct Loop {
+    head: i32,
+    blocks: []mut u64,  // bitset
+    size: i32,
+    parent: i32,
+    fin: f64,  // entries per call of the function
+}
+
+fn in_loop(l: *Loop, b: i32) bool {
+    return bget(l.blocks, @int_cast(usize, b));
+}
+
+// The probability of each edge out of b (in b.succs order) into pr.
+fn edge_probs(f: *MFunc, cold: []bool, inner: []i32, loops: *u.List.[Loop], b: usize, pr: *mut u.List.[f64]) void {
+    pr.clear();
+    let blk = f.blocks.get(b);
+    let mut tot: f64 = 0.0;
+    let li = inner[b];
+    for k in 0..blk.succs.len {
+        let s = @int_cast(usize, blk.succs.get(k));
+        let mut w: f64 = 1.0;
+        if cold[s] and not cold[b] {
+            w = COLD_WEIGHT;
+        } else if (li >= 0) and not in_loop(loops.at(@int_cast(usize, li)), @int_cast(i32, s)) {
+            w = EXIT_WEIGHT;
+        }
+        pr.push(w);
+        tot += w;
+    }
+    for k in 0..pr.len {
+        pr.set(k, pr.get(k) / tot);
+    }
+}
+
+fn block_freqs(f: *mut MFunc) void {
+    let nb = f.blocks.len;
+    if nb == 0 {
+        return;
+    }
+    let w = words(nb);
+    // depth-first search: reverse postorder, back edges
+    let color = u.newn.[u8](nb + 1);
+    let cold = u.newn.[bool](nb + 1);
+    let inner = u.newn.[i32](nb + 1);
+    let mass = u.newn.[f64](nb + 1);
+    for bi in 0..nb {
+        color[bi] = 0;
+        cold[bi] = f.blocks.get(bi).cold;
+        inner[bi] = -1;
+        mass[bi] = 0.0;
+        f.blocks.get(bi).freq = COLD_WEIGHT;  // (unreachable)
+    }
+    let mut post = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    let mut stk = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    let mut sidx = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    let mut heads = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };  // back edges: header, source
+    let mut srcs = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    stk.push(0);
+    sidx.push(0);
+    color[0] = 1;
+    while stk.len > 0 {
+        let b = @int_cast(usize, stk.get(stk.len - 1));
+        let k = sidx.get(sidx.len - 1);
+        let blk = f.blocks.get(b);
+        if k < blk.succs.len {
+            sidx.set(sidx.len - 1, k + 1);
+            let s = @int_cast(usize, blk.succs.get(k));
+            if color[s] == 0 {
+                color[s] = 1;
+                stk.push(@int_cast(i32, s));
+                sidx.push(0);
+            } else if color[s] == 1 {
+                heads.push(@int_cast(i32, s));
+                srcs.push(@int_cast(i32, b));
+            }
+        } else {
+            color[b] = 2;
+            post.push(@int_cast(i32, b));
+            stk.len -= 1;
+            sidx.len -= 1;
+        }
+    }
+    // cold: marked, or every way on leads to a cold block
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in 0..post.len {
+            let b = @int_cast(usize, post.get(k));
+            let blk = f.blocks.get(b);
+            if cold[b] or (blk.succs.len == 0) {
+                continue;
+            }
+            let mut all = true;
+            for j in 0..blk.succs.len {
+                if not cold[@int_cast(usize, blk.succs.get(j))] {
+                    all = false;
+                }
+            }
+            if all {
+                cold[b] = true;
+                changed = true;
+            }
+        }
+    }
+    // predecessors
+    let preds = u.newn.[u.List.[i32]](nb + 1);
+    for bi in 0..nb {
+        preds[bi] = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    }
+    for bi in 0..nb {
+        let blk = f.blocks.get(bi);
+        for k in 0..blk.succs.len {
+            preds[@int_cast(usize, blk.succs.get(k))].push(@int_cast(i32, bi));
+        }
+    }
+    // natural loops, one per header
+    let mut loops = u.List.[Loop].{ data: u.nil.[Loop](), len: 0, cap: 0 };
+    let mut work = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    for e in 0..heads.len {
+        let h = heads.get(e);
+        let mut li: usize = loops.len;
+        for j in 0..loops.len {
+            if loops.get(j).head == h {
+                li = j;
+            }
+        }
+        if li == loops.len {
+            let bs = u.newn.[u64](w + 1);
+            for j in 0..w {
+                bs[j] = 0;
+            }
+            bset(bs, @int_cast(usize, h));
+            loops.push(Loop.{ head: h, blocks: bs, size: 1, parent: -1, fin: 0.0 });
+        }
+        let l = loops.at(li);
+        work.clear();
+        work.push(srcs.get(e));
+        while work.len > 0 {
+            let x = work.pop();
+            if in_loop(l, x) or (color[@int_cast(usize, x)] == 0) {
+                continue;
+            }
+            bset(l.blocks, @int_cast(usize, x));
+            l.size += 1;
+            let ps = &preds[@int_cast(usize, x)];
+            for j in 0..ps.len {
+                work.push(ps.get(j));
+            }
+        }
+    }
+    // nesting: the smallest loop containing a block, or another loop's header
+    let nl = loops.len;
+    for bi in 0..nb {
+        let mut best: i32 = -1;
+        for j in 0..nl {
+            let l = loops.at(j);
+            if in_loop(l, @int_cast(i32, bi)) and ((best < 0) or (l.size < loops.at(@int_cast(usize, best)).size)) {
+                best = @int_cast(i32, j);
+            }
+        }
+        inner[bi] = best;
+    }
+    for j in 0..nl {
+        let l = loops.at(j);
+        let mut best: i32 = -1;
+        for q in 0..nl {
+            let m = loops.at(q);
+            if (q != j) and in_loop(m, l.head) and (m.size > l.size) and
+               ((best < 0) or (m.size < loops.at(@int_cast(usize, best)).size)) {
+                best = @int_cast(i32, q);
+            }
+        }
+        l.parent = best;
+    }
+    // innermost loops first (by size); the function body (-1) last
+    let mut order = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    for j in 0..nl {
+        order.push(@int_cast(i32, j));
+    }
+    for a in 0..nl {
+        for b2 in (a + 1)..nl {
+            if loops.at(@int_cast(usize, order.get(b2))).size < loops.at(@int_cast(usize, order.get(a))).size {
+                let t = order.get(a);
+                order.set(a, order.get(b2));
+                order.set(b2, t);
+            }
+        }
+    }
+    order.push(-1);
+    // per loop: the mass of each of its blocks per iteration, and where it exits
+    let rel = u.newn.[f64](nb + 1);  // within the innermost loop (for headers: within the parent)
+    let exits = u.newn.[u.List.[i32]](nl + 1);
+    let exitp = u.newn.[u.List.[f64]](nl + 1);
+    for j in 0..nl {
+        exits[j] = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+        exitp[j] = u.List.[f64].{ data: u.nil.[f64](), len: 0, cap: 0 };
+    }
+    let mut pr = u.List.[f64].{ data: u.nil.[f64](), len: 0, cap: 0 };
+    for oi in 0..order.len {
+        let li = order.get(oi);
+        let mut head: i32 = 0;
+        if li >= 0 {
+            head = loops.at(@int_cast(usize, li)).head;
+        }
+        for bi in 0..nb {
+            mass[bi] = 0.0;
+        }
+        mass[@int_cast(usize, head)] = 1.0;
+        let mut k = post.len;
+        while k > 0 {
+            k -= 1;
+            let b = @int_cast(usize, post.get(k));
+            // a block of this loop, or the header of a loop directly inside it
+            let mut child: i32 = -1;
+            if inner[b] != li {
+                let c = inner[b];
+                if (c < 0) or (loops.at(@int_cast(usize, c)).head != @int_cast(i32, b)) or
+                   (loops.at(@int_cast(usize, c)).parent != li) {
+                    continue;
+                }
+                child = c;
+            }
+            let m = mass[b];
+            if m == 0.0 {
+                continue;
+            }
+            if child >= 0 {
+                let ex = &exits[@int_cast(usize, child)];
+                let ep = &exitp[@int_cast(usize, child)];
+                for j in 0..ex.len {
+                    route(&loops, inner[0..nb], li, head, ex.get(j), m * ep.get(j), mass, exits[0..nl], exitp[0..nl]);
+                }
+            } else {
+                edge_probs(f, cold[0..nb], inner[0..nb], &loops, b, &mut pr);
+                let blk = f.blocks.get(b);
+                for j in 0..blk.succs.len {
+                    route(&loops, inner[0..nb], li, head, blk.succs.get(j), m * pr.get(j), mass, exits[0..nl],
+                          exitp[0..nl]);
+                }
+            }
+        }
+        for bi in 0..nb {
+            if (inner[bi] == li) or
+               ((inner[bi] >= 0) and (loops.at(@int_cast(usize, inner[bi])).head == @int_cast(i32, bi)) and
+                (loops.at(@int_cast(usize, inner[bi])).parent == li)) {
+                rel[bi] = mass[bi];
+            }
+        }
+        if li >= 0 {
+            // exits in proportion
+            let ep = &mut exitp[@int_cast(usize, li)];
+            let mut tot: f64 = 0.0;
+            for j in 0..ep.len {
+                tot += ep.get(j);
+            }
+            if tot > 0.0 {
+                for j in 0..ep.len {
+                    ep.set(j, ep.get(j) / tot);
+                }
+            }
+        }
+    }
+    // entries of each loop, outermost first
+    let mut oi = order.len;
+    while oi > 0 {
+        oi -= 1;
+        let li = order.get(oi);
+        if li < 0 {
+            continue;
+        }
+        let l = loops.at(@int_cast(usize, li));
+        let h = @int_cast(usize, l.head);
+        if l.parent < 0 {
+            l.fin = rel[h];
+        } else {
+            l.fin = loops.at(@int_cast(usize, l.parent)).fin * LOOP_SCALE * rel[h];
+        }
+    }
+    for bi in 0..nb {
+        if color[bi] == 0 {
+            continue;
+        }
+        let li = inner[bi];
+        let mut fq = rel[bi];
+        if li >= 0 {
+            let l = loops.at(@int_cast(usize, li));
+            if l.head == @int_cast(i32, bi) {
+                fq = l.fin * LOOP_SCALE;
+            } else {
+                fq = l.fin * LOOP_SCALE * rel[bi];
+            }
+        }
+        if fq < 1.0e-6 {
+            fq = 1.0e-6;
+        }
+        if fq > 1.0e6 {
+            fq = 1.0e6;
+        }
+        f.blocks.get(bi).freq = fq;
+    }
+    for bi in 0..nb {
+        u.free(@ptr_cast(*mut void, preds[bi].data));
+    }
+    for j in 0..nl {
+        u.free(@ptr_cast(*mut void, exits[j].data));
+        u.free(@ptr_cast(*mut void, exitp[j].data));
+    }
+    u.free(@ptr_cast(*mut void, post.data));
+    u.free(@ptr_cast(*mut void, stk.data));
+    u.free(@ptr_cast(*mut void, sidx.data));
+    u.free(@ptr_cast(*mut void, heads.data));
+    u.free(@ptr_cast(*mut void, srcs.data));
+    u.free(@ptr_cast(*mut void, loops.data));
+    u.free(@ptr_cast(*mut void, work.data));
+    u.free(@ptr_cast(*mut void, order.data));
+    u.free(@ptr_cast(*mut void, pr.data));
+}
+
+// Mass m reaches block x from inside loop li (-1: the function body): back to
+// the header (dropped: the loop scale stands for it), into a block of the
+// loop (for one inside a nested loop, that loop's header), or out (an exit).
+fn route(loops: *u.List.[Loop], inner: []i32, li: i32, head: i32, x: i32, m: f64, mass: []mut f64,
+         exits: []mut u.List.[i32], exitp: []mut u.List.[f64]) void {
+    if x == head {
+        return;
+    }
+    let xi = @int_cast(usize, x);
+    if (li < 0) or in_loop(loops.at(@int_cast(usize, li)), x) {
+        // the outermost loop inside li containing x
+        let mut c = inner[xi];
+        let mut node = x;
+        while (c >= 0) and (c != li) {
+            node = loops.at(@int_cast(usize, c)).head;
+            c = loops.at(@int_cast(usize, c)).parent;
+        }
+        mass[@int_cast(usize, node)] += m;
+        return;
+    }
+    let ex = &mut exits[@int_cast(usize, li)];
+    let ep = &mut exitp[@int_cast(usize, li)];
+    for j in 0..ex.len {
+        if ex.get(j) == x {
+            ep.set(j, ep.get(j) + m);
+            return;
+        }
+    }
+    ex.push(x);
+    ep.push(m);
+}
+
+// -----------------------------------------------------------------------------
 // Intervals and fixed ranges
 // -----------------------------------------------------------------------------
 struct Range {
@@ -544,20 +921,16 @@ struct Interval {
     size: i32,               // positions covered
 }
 
+const WEIGHT_PAD: i32 = 50;
+
 // The cost of spilling an interval: its (weighted) uses per position covered.
 fn weight(f: *MFunc, x: *Interval) f64 {
     if f.nospill.get(@int_cast(usize, x.v)) {
         return 1.0e300;
     }
-    return x.uses / @float_from_int(f64, x.size + 1);
-}
-
-fn depth_weight(d: i32) f64 {
-    let mut w: f64 = 1.0;
-    let mut k: i32 = 0;
-    while (k < d) and (k < 6) {
-        w = w * 10.0;
-        k += 1;
+    let w = x.uses / @float_from_int(f64, x.size + WEIGHT_PAD);
+    if u.notnil(f.remat.get(@int_cast(usize, x.v))) {
+        return w * 0.5;  // (rebuilt where it is used: no stores, no slot)
     }
     return w;
 }
@@ -606,7 +979,7 @@ fn build_intervals(f: *mut MFunc) []mut Interval {
     while bi > 0 {
         bi -= 1;
         let b = f.blocks.get(bi);
-        let dw = depth_weight(b.loop_depth);
+        let dw = b.freq;
         for j in 0..w {
             live[j] = b.live_out[j];
             let lo = b.live_out[j];
@@ -924,39 +1297,647 @@ fn in_order(order: []i32, r: i32) bool {
     return false;
 }
 
-// Rewrites spilled vregs: each instruction reading one gets a load into a
-// fresh (unspillable) vreg before it; each writing one, a store after it.
-fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
-    let nv = iv.len;
-    let slot = u.newn.[i32](nv + 1);
-    for k in 0..nv {
-        slot[k] = -1;
-        if iv[k].spilled and u.notnil(f.remat.get(k)) {
-            slot[k] = -2;  // (rematerialized)
-        } else if iv[k].spilled {
-            let c = f.vclass.get(k);
-            let mut sz: u64 = 8;
-            if c >= 1 {
-                sz = @as(u64, 16) << @truncate(u32, @as(u64, c) - 1);  // (16, 32 or 64 bytes)
-            }
-            slot[k] = new_slot(f, sz, sz);
+// -----------------------------------------------------------------------------
+// Spilling and live-range splitting
+//
+// A spilled vreg gets a stack slot, which its pieces share. It is first split
+// into pieces rather than spilled everywhere: where it is live across a call,
+// or along the edges into and out of loops, it is in its slot, and in between
+// each connected stretch (a region) becomes a new vreg, which takes part in the
+// next round like any other: in a register inside a loop or between calls,
+// say, while it stays in memory across them. A region is reloaded where it
+// is entered from memory (after a call, at a loop's entry), or copied from the
+// region before it along an edge (a copy the allocator can coalesce, and which
+// becomes a reload or a store if either side is spilled in turn). The slot
+// holds the value wherever it is in memory: a region that defines it stores
+// it after each definition, or where it leaves the region, whichever is
+// cheaper (by loop depth).
+//
+// level 0 vregs are split around calls and at loop boundaries; their pieces
+// (level 1) at every block boundary; and those pieces (level 2) are spilled
+// everywhere, each use and definition through a short-lived register.
+// -----------------------------------------------------------------------------
+fn writes_reg(i: *MInst, v: i32) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and (o.reg == v) and ((o.role & RD) != 0) {
+            return true;
         }
     }
-    // A rematerialized value read only in the block defining it is built
-    // again at each use; one read elsewhere is built once in each block that
-    // reads it, as a value of its own (which may be rematerialized in turn).
-    let local = u.newn.[bool](nv + 1);
-    let bv = u.newn.[i32](nv + 1);  // the value's copy in block bb[x]
-    let bb = u.newn.[i32](nv + 1);
-    remat_locality(f, slot, local);
-    for k in 0..nv {
-        bb[k] = -1;
+    return false;
+}
+
+fn mentions(i: *MInst, v: i32) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and (o.reg == v) {
+            return true;
+        }
+        if (o.kind == K_MEM) and ((o.base == v) or (o.index == v)) {
+            return true;
+        }
     }
+    return false;
+}
+
+fn replace_reg(i: *mut MInst, v: i32, w: i32) void {
+    if (i.spill != 0) and (i.sreg == v) {
+        i.sreg = w;
+    }
+    for k in 0..i.ops.len {
+        let o = &mut i.ops[k];
+        if (o.kind == K_REG) and (o.reg == v) {
+            o.reg = w;
+        }
+        if o.kind == K_MEM {
+            if o.base == v {
+                o.base = w;
+            }
+            if o.index == v {
+                o.index = w;
+            }
+        }
+    }
+}
+
+// The destination and source registers of a copy (is_move).
+fn move_dst(i: *MInst) i32 {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and ((o.role & RD) != 0) {
+            return o.reg;
+        }
+    }
+    return -1;
+}
+
+fn move_src(i: *MInst) i32 {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == K_REG) and ((o.role & RD) == 0) and ((o.role & RU) != 0) {
+            return o.reg;
+        }
+    }
+    return -1;
+}
+
+fn is_jump(i: *MInst) bool {
+    for k in 0..i.ops.len {
+        if i.ops[k].kind == K_LABEL {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Inserts i at the end of b, before the jumps that end it (spill code changes
+// no flags).
+fn insert_end(b: *mut MBlock, i: *mut MInst) void {
+    let mut j = b.last;
+    let mut pos = u.nil.[MInst]();
+    while u.notnil(j) and is_jump(j) {
+        pos = j;
+        j = j.prev;
+    }
+    if u.notnil(pos) {
+        insert_before(b, pos, i);
+    } else {
+        append(b, i);
+    }
+}
+
+fn insert_start(b: *mut MBlock, i: *mut MInst) void {
+    if u.notnil(b.first) {
+        insert_before(b, b.first, i);
+    } else {
+        append(b, i);
+    }
+}
+
+fn slot_of(f: *mut MFunc, x: usize) i32 {
+    let mut s = f.vslot.get(x);
+    if s < 0 {
+        let c = f.vclass.get(x);
+        let mut sz: u64 = 8;
+        if c >= 1 {
+            sz = @as(u64, 16) << @truncate(u32, @as(u64, c) - 1);  // (16, 32 or 64 bytes)
+        }
+        s = new_slot(f, sz, sz);
+        f.vslot.set(x, s);
+    }
+    return s;
+}
+
+fn reload(f: *mut MFunc, t: *Target, r: i32, c: u8, slot: i32) *mut MInst {
+    let i = t.spill_load(f, r, @as(i32, c), slot);
+    i.spill = 1;
+    i.sreg = r;
+    i.sslot = slot;
+    return i;
+}
+
+fn store(f: *mut MFunc, t: *Target, r: i32, c: u8, slot: i32) *mut MInst {
+    let i = t.spill_store(f, r, @as(i32, c), slot);
+    i.spill = 2;
+    i.sreg = r;
+    i.sslot = slot;
+    return i;
+}
+
+// A call clobbering most of class c's registers: values live across it are
+// split there.
+fn call_cut(t: *Target, c: u8, i: *MInst) bool {
+    if i.clobber == 0 {
+        return false;
+    }
+    let order = t.alloc_order[@as(usize, c)];
+    let mut n: usize = 0;
+    for r in order {
+        if (i.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            n += 1;
+        }
+    }
+    return (2 * n) > order.len;
+}
+
+struct Cfg {
+    npred: []mut i32,
+    nsucc: []mut i32,
+    simple: []mut bool,  // the block's jumps all come at its end (spill code can go before them)
+    endok: []mut bool,   // every predecessor is simple and has the block as its only successor
+}
+
+fn find(p: *mut u.List.[i32], x: i32) i32 {
+    let mut r = x;
+    while p.get(@int_cast(usize, r)) != r {
+        r = p.get(@int_cast(usize, r));
+    }
+    let mut y = x;
+    while p.get(@int_cast(usize, y)) != r {
+        let n = p.get(@int_cast(usize, y));
+        p.set(@int_cast(usize, y), r);
+        y = n;
+    }
+    return r;
+}
+
+fn depth_of(f: *MFunc, bi: usize) i32 {
+    return f.blocks.get(bi).loop_depth;
+}
+
+// Spill code between v and its slot, or a copy between v and another piece of
+// the same vreg (made where it was split, where the slot holds the value too):
+// i sets v to what the slot holds (in) or passes it on (out).
+fn same_slot(f: *MFunc, r: i32, sl: i32) bool {
+    return is_vreg(r) and (f.vslot.get(@int_cast(usize, r - VREG0)) == sl);
+}
+
+fn transfer_in(f: *MFunc, i: *MInst, v: i32) bool {
+    let sl = f.vslot.get(@int_cast(usize, v - VREG0));
+    if sl < 0 {
+        return false;
+    }
+    if (i.spill == 1) and (i.sreg == v) and (i.sslot == sl) {
+        return true;
+    }
+    return i.is_move and (move_dst(i) == v) and same_slot(f, move_src(i), sl);
+}
+
+fn transfer_out(f: *MFunc, i: *MInst, v: i32) bool {
+    let sl = f.vslot.get(@int_cast(usize, v - VREG0));
+    if sl < 0 {
+        return false;
+    }
+    if (i.spill == 2) and (i.sreg == v) and (i.sslot == sl) {
+        return true;
+    }
+    return i.is_move and (move_src(i) == v) and same_slot(f, move_dst(i), sl);
+}
+
+// A use or definition of v other than its spill code.
+fn real_use(f: *MFunc, i: *MInst, v: i32) bool {
+    return mentions(i, v) and not transfer_in(f, i, v) and not transfer_out(f, i, v);
+}
+
+// Is the edge from block p to block s (where the vreg is live) a split point?
+// Spill code goes at the start of s if p is its only predecessor or every
+// edge into s is a split point, else at the end of p if s is its only
+// successor.
+fn edge_cut(f: *MFunc, g: *Cfg, allin: []bool, memtail: []bool, all_edges: bool, p: usize, s: usize) bool {
+    if not all_edges and not memtail[p] and (depth_of(f, p) == depth_of(f, s)) {
+        return false;
+    }
+    return allin[s] or (g.npred[s] == 1) or ((g.nsucc[p] == 1) and g.simple[p]);
+}
+
+// Splits vreg x into regions (see above), at calls and loop boundaries, or at
+// every block boundary (all_edges). Returns false, changing nothing, if there
+// is nothing to split.
+fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u8) bool {
+    let v = VREG0 + @int_cast(i32, x);
+    let c = f.vclass.get(x);
+    let nb = f.blocks.len;
+    let head = u.newn.[i32](nb + 1);
+    let tail = u.newn.[i32](nb + 1);
+    let allin = u.newn.[bool](nb + 1);
+    let mut par = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };                 // union-find over segments
+    let mut occ = u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 };               // the vreg is read or written there
+    let mut rel = u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 };               // ... or live
+    let mut defc = u.List.[f64].{ data: u.nil.[f64](), len: 0, cap: 0 };                // definitions, by loop depth
+    let mut cuts = u.List.[*mut MInst].{ data: u.nil.[*mut MInst](), len: 0, cap: 0 };  // calls it is live across
+    let mut cut_seg = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };             // the segment before each
+    let mut cut_fq = u.List.[f64].{ data: u.nil.[f64](), len: 0, cap: 0 };
+    let mut arr = u.List.[*mut MInst].{ data: u.nil.[*mut MInst](), len: 0, cap: 0 };
+    let mut la = u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 };
+    // segments: the stretches of each block between the calls it is live across
+    for bi in 0..nb {
+        let b = f.blocks.get(bi);
+        let fq = b.freq;
+        arr.clear();
+        la.clear();
+        let mut i = b.first;
+        while u.notnil(i) {
+            arr.push(i);
+            la.push(false);
+            i = i.next;
+        }
+        let mut live = bget(b.live_out, x);
+        let mut k = arr.len;
+        while k > 0 {
+            k -= 1;
+            let j = arr.get(k);
+            la.set(k, live);
+            if writes_reg(j, v) {
+                live = false;
+            }
+            if each_reg_use(j, v) {
+                live = true;
+            }
+        }
+        let mut seg = @int_cast(i32, par.len);
+        par.push(seg);
+        occ.push(false);
+        rel.push(bget(b.live_in, x));
+        defc.push(0.0);
+        head[bi] = seg;
+        for k2 in 0..arr.len {
+            let j = arr.get(k2);
+            let s = @int_cast(usize, seg);
+            let w = writes_reg(j, v);
+            if mentions(j, v) {
+                rel.set(s, true);
+            }
+            if real_use(f, j, v) {
+                occ.set(s, true);
+                if w {
+                    defc.set(s, defc.get(s) + fq);
+                }
+            }
+            if g.simple[bi] and not w and la.get(k2) and call_cut(t, c, j) {
+                cuts.push(j);
+                cut_seg.push(seg);
+                cut_fq.push(fq);
+                rel.set(s, true);
+                seg = @int_cast(i32, par.len);
+                par.push(seg);
+                occ.push(false);
+                rel.push(true);
+                defc.push(0.0);
+            }
+        }
+        if bget(b.live_out, x) {
+            rel.set(@int_cast(usize, seg), true);
+        }
+        tail[bi] = seg;
+    }
+    // edges: joined, or split points (always after a call it is not used after
+    // in the block: reloaded where it is used next)
+    let memtail = u.newn.[bool](nb + 1);
+    for bi in 0..nb {
+        let tl = @int_cast(usize, tail[bi]);
+        memtail[bi] = (tail[bi] != head[bi]) and not occ.get(tl);
+    }
+    for si in 0..nb {
+        allin[si] = true;
+    }
+    for pi in 0..nb {
+        let pb = f.blocks.get(pi);
+        for k in 0..pb.succs.len {
+            let si = @int_cast(usize, pb.succs.get(k));
+            if not all_edges and not memtail[pi] and (depth_of(f, pi) == depth_of(f, si)) {
+                allin[si] = false;
+            }
+        }
+    }
+    let mut nedge: usize = 0;
+    for pi in 0..nb {
+        let pb = f.blocks.get(pi);
+        for k in 0..pb.succs.len {
+            let si = @int_cast(usize, pb.succs.get(k));
+            if not bget(f.blocks.get(si).live_in, x) {
+                continue;
+            }
+            if edge_cut(f, g, allin[0..nb], memtail[0..nb], all_edges, pi, si) {
+                nedge += 1;
+            } else {
+                let a = find(&mut par, tail[pi]);
+                let b2 = find(&mut par, head[si]);
+                par.set(@int_cast(usize, a), b2);
+            }
+        }
+    }
+    let ns = par.len;
+    // nothing to split: one region, live across no call
+    let mut progress = cuts.len > 0;
+    if not progress {
+        let mut root: i32 = -1;
+        for s in 0..ns {
+            if rel.get(s) {
+                let r = find(&mut par, @int_cast(i32, s));
+                if (root >= 0) and (r != root) {
+                    progress = true;
+                }
+                root = r;
+            }
+        }
+    }
+    _ = nedge;
+    if not progress {
+        u.free(@ptr_cast(*mut void, par.data));
+        u.free(@ptr_cast(*mut void, occ.data));
+        u.free(@ptr_cast(*mut void, rel.data));
+        u.free(@ptr_cast(*mut void, defc.data));
+        u.free(@ptr_cast(*mut void, cuts.data));
+        u.free(@ptr_cast(*mut void, cut_seg.data));
+        u.free(@ptr_cast(*mut void, cut_fq.data));
+        u.free(@ptr_cast(*mut void, arr.data));
+        u.free(@ptr_cast(*mut void, la.data));
+        return false;
+    }
+    // regions: whether they use it (else it stays in memory there), their
+    // definitions and exits
+    let rocc = u.newn.[bool](ns + 1);
+    let rdef = u.newn.[f64](ns + 1);
+    let rexit = u.newn.[f64](ns + 1);
+    let wreg = u.newn.[i32](ns + 1);
+    for s in 0..ns {
+        rocc[s] = false;
+        rdef[s] = 0.0;
+        rexit[s] = 0.0;
+        wreg[s] = -1;
+    }
+    for s in 0..ns {
+        let r = @int_cast(usize, find(&mut par, @int_cast(i32, s)));
+        if occ.get(s) {
+            rocc[r] = true;
+        }
+        rdef[r] += defc.get(s);
+    }
+    for k in 0..cuts.len {
+        rexit[@int_cast(usize, find(&mut par, cut_seg.get(k)))] += cut_fq.get(k);
+    }
+    for pi in 0..nb {
+        let pb = f.blocks.get(pi);
+        let mut any = false;
+        for k in 0..pb.succs.len {
+            let si = @int_cast(usize, pb.succs.get(k));
+            if bget(f.blocks.get(si).live_in, x) and edge_cut(f, g, allin[0..nb], memtail[0..nb], all_edges, pi, si) {
+                any = true;
+            }
+        }
+        if any {
+            let r = @int_cast(usize, find(&mut par, tail[pi]));
+            if g.simple[pi] {
+                rexit[r] += pb.freq;
+            } else {
+                rexit[r] = 1.0e300;  // (no place for a store there: after each definition)
+            }
+        }
+    }
+    let slot = slot_of(f, x);
+    for s in 0..ns {
+        if (find(&mut par, @int_cast(i32, s)) == @int_cast(i32, s)) and rocc[s] {
+            let w = new_vreg(f, c);
+            let wx = @int_cast(usize, w - VREG0);
+            f.level.set(wx, level);
+            f.vslot.set(wx, slot);
+            wreg[s] = w;
+        }
+    }
+    // stores where it leaves a region (if cheaper than after each definition)
+    let at_exit = u.newn.[bool](ns + 1);
+    for s in 0..ns {
+        at_exit[s] = (rdef[s] > 0.0) and (rexit[s] <= rdef[s]);
+    }
+    // blocks reloading it themselves (every edge in is a split point): before
+    // its first use there
+    let sload = u.newn.[i32](nb + 1);
+    for si in 0..nb {
+        sload[si] = -1;
+        if allin[si] and (g.npred[si] > 1) and not g.endok[si] and bget(f.blocks.get(si).live_in, x) {
+            let r2 = @int_cast(usize, find(&mut par, head[si]));
+            if rocc[r2] {
+                sload[si] = @int_cast(i32, r2);
+            }
+        }
+    }
+    // rewrite
+    let mut ck: usize = 0;
+    for bi in 0..nb {
+        let b = f.blocks.get(bi);
+        let mut seg = head[bi];
+        let mut lbl = false;
+        let mut i = b.first;
+        while u.notnil(i) {
+            if t.is_label(i) {
+                lbl = true;
+            }
+            i = i.next;
+        }
+        let mut pend: i32 = sload[bi];  // a region to reload before the next use
+        if (pend >= 0) and not g.simple[bi] {
+            insert_start(b, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));
+            pend = -1;
+        }
+        i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            let r = @int_cast(usize, find(&mut par, seg));
+            if (pend >= 0) and is_jump(i) and not mentions(i, v) {
+                insert_before(b, i, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));
+                pend = -1;
+            }
+            if mentions(i, v) and not rocc[r] {
+                // spill code of a region left in memory
+                if transfer_out(f, i, v) and i.is_move {
+                    let d = move_dst(i);
+                    insert_before(b, i, reload(f, t, d, c, slot));
+                }
+                remove(b, i);
+                i = next;
+                continue;
+            }
+            if mentions(i, v) {
+                let w = wreg[r];
+                let wx = @int_cast(usize, w - VREG0);
+                if pend >= 0 {
+                    if not transfer_in(f, i, v) {
+                        insert_before(b, i, reload(f, t, w, c, slot));
+                    }
+                    pend = -1;
+                }
+                if i.is_move {
+                    let mut o = move_dst(i);
+                    if o == v {
+                        o = move_src(i);
+                    }
+                    if (o >= 0) and (o != v) {
+                        if f.hint.get(wx) < 0 {
+                            f.hint.set(wx, o);
+                        }
+                        if is_vreg(o) and (f.hint.get(@int_cast(usize, o - VREG0)) == v) {
+                            f.hint.set(@int_cast(usize, o - VREG0), w);
+                        }
+                    }
+                }
+                let fresh = writes_reg(i, v) and real_use(f, i, v);
+                replace_reg(i, v, w);
+                if fresh and not at_exit[r] {
+                    insert_after(b, i, store(f, t, w, c, slot));
+                }
+            }
+            if (ck < cuts.len) and (cuts.get(ck) == i) {
+                if pend >= 0 {
+                    insert_before(b, i, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));  // (not used before the next call)
+                    pend = -1;
+                }
+                if at_exit[r] {
+                    insert_before(b, i, store(f, t, wreg[r], c, slot));
+                }
+                seg = cut_seg.get(ck) + 1;
+                ck += 1;
+                let r2 = @int_cast(usize, find(&mut par, seg));
+                if rocc[r2] {
+                    if lbl {
+                        insert_after(b, i, reload(f, t, wreg[r2], c, slot));
+                    } else {
+                        pend = @int_cast(i32, r2);
+                    }
+                }
+            }
+            i = next;
+        }
+        if pend >= 0 {
+            insert_end(b, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));
+        }
+    }
+    // along the edges that are split points
+    for pi in 0..nb {
+        let pb = f.blocks.get(pi);
+        let r = @int_cast(usize, find(&mut par, tail[pi]));
+        let mut stored = false;
+        for k in 0..pb.succs.len {
+            let si = @int_cast(usize, pb.succs.get(k));
+            let sb = f.blocks.get(si);
+            if not bget(sb.live_in, x) or not edge_cut(f, g, allin[0..nb], memtail[0..nb], all_edges, pi, si) {
+                continue;
+            }
+            if at_exit[r] and not stored {
+                insert_end(pb, store(f, t, wreg[r], c, slot));  // (pb is simple: see rexit)
+                stored = true;
+            }
+            let r2 = @int_cast(usize, find(&mut par, head[si]));
+            if not rocc[r2] or (r2 == r) {
+                continue;
+            }
+            let w2 = wreg[r2];
+            if allin[si] and (g.npred[si] > 1) and not g.endok[si] {
+                continue;  // (sload)
+            }
+            let mut ins = u.nil.[MInst]();
+            if rocc[r] {
+                ins = t.spill_move(f, w2, wreg[r], @as(i32, c));
+                f.hint.set(@int_cast(usize, w2 - VREG0), wreg[r]);
+            } else {
+                ins = reload(f, t, w2, c, slot);
+            }
+            if g.npred[si] == 1 {
+                insert_start(sb, ins);
+            } else {
+                insert_end(pb, ins);
+            }
+        }
+    }
+    // pieces without a hint of their own take the vreg's
+    for s in 0..ns {
+        if wreg[s] >= 0 {
+            let wx = @int_cast(usize, wreg[s] - VREG0);
+            if f.hint.get(wx) < 0 {
+                f.hint.set(wx, f.hint.get(x));
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, par.data));
+    u.free(@ptr_cast(*mut void, occ.data));
+    u.free(@ptr_cast(*mut void, rel.data));
+    u.free(@ptr_cast(*mut void, defc.data));
+    u.free(@ptr_cast(*mut void, cuts.data));
+    u.free(@ptr_cast(*mut void, cut_seg.data));
+    u.free(@ptr_cast(*mut void, cut_fq.data));
+    u.free(@ptr_cast(*mut void, arr.data));
+    u.free(@ptr_cast(*mut void, la.data));
+    return true;
+}
+
+// Is r a vreg (of this round) spilled everywhere?
+fn spilled_ev(sp: []bool, r: i32) bool {
+    if not is_vreg(r) {
+        return false;
+    }
+    let x = @int_cast(usize, r - VREG0);
+    return (x < sp.len) and sp[x];
+}
+
+// Spills the vregs sp marks everywhere: each instruction reading one gets a
+// load into a fresh (unspillable) vreg before it; each writing one, a store
+// after it. A copy from one becomes a load into the copy's destination, a
+// copy to one a store of the copy's source, and its own spill code goes.
+fn spill_everywhere(f: *mut MFunc, t: *Target, sp: []bool) void {
     for bi in 0..f.blocks.len {
         let b = f.blocks.get(bi);
         let mut i = b.first;
         while u.notnil(i) {
             let next = i.next;
+            if (i.spill != 0) and spilled_ev(sp, i.sreg) and (i.sslot == slot_of(f, @int_cast(usize, i.sreg - VREG0))) {
+                remove(b, i);  // (it lives in that slot now)
+                i = next;
+                continue;
+            }
+            if i.is_move {
+                let d = move_dst(i);
+                let s = move_src(i);
+                let ds = spilled_ev(sp, d);
+                let ss = spilled_ev(sp, s);
+                if ds and ss and (slot_of(f, @int_cast(usize, d - VREG0)) == slot_of(f, @int_cast(usize, s - VREG0))) {
+                    remove(b, i);
+                    i = next;
+                    continue;
+                }
+                if ss and not ds and (d >= 0) {
+                    let x = @int_cast(usize, s - VREG0);
+                    insert_before(b, i, reload(f, t, d, f.vclass.get(x), slot_of(f, x)));
+                    remove(b, i);
+                    i = next;
+                    continue;
+                }
+                if ds and not ss and (s >= 0) {
+                    let x = @int_cast(usize, d - VREG0);
+                    insert_before(b, i, store(f, t, s, f.vclass.get(x), slot_of(f, x)));
+                    remove(b, i);
+                    i = next;
+                    continue;
+                }
+            }
             // distinct spilled vregs of this instruction
             let mut done: [8]i32 = [-1; 8];
             let mut nd: usize = 0;
@@ -971,7 +1952,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                     if (ci > 0) and (o.kind != K_MEM) {
                         continue;
                     }
-                    if not is_vreg(r) or (slot[@int_cast(usize, r - VREG0)] == -1) {
+                    if not spilled_ev(sp, r) {
                         continue;
                     }
                     let mut seen = false;
@@ -990,50 +1971,14 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                 let r = done[j];
                 let x = @int_cast(usize, r - VREG0);
                 let c = f.vclass.get(x);
-                if slot[x] == -2 {
-                    let def = f.remat.get(x);
-                    if i == def {
-                        remove(b, i);
-                        break;
-                    }
-                    if not local[x] {
-                        let mut nr = bv[x];
-                        if bb[x] != @int_cast(i32, bi) {
-                            nr = new_vreg(f, c);
-                            let cd = clone_def(def, r, nr);
-                            insert_before(b, i, cd);
-                            set_remat(f, nr, cd);
-                            bv[x] = nr;
-                            bb[x] = @int_cast(i32, bi);
-                        }
-                        for k in 0..i.ops.len {
-                            if (i.ops[k].kind == K_REG) and (i.ops[k].reg == r) {
-                                i.ops[k].reg = nr;
-                            }
-                        }
-                        continue;
-                    }
-                    if t.fold_remat(f, i, r, def) {
-                        continue;
-                    }
-                    let nr = new_vreg(f, c);
-                    f.nospill.set(@int_cast(usize, nr - VREG0), true);
-                    for k in 0..i.ops.len {
-                        if (i.ops[k].kind == K_REG) and (i.ops[k].reg == r) {
-                            i.ops[k].reg = nr;
-                        }
-                    }
-                    let ld = clone_def(def, r, nr);
-                    ld.spill = 1;
-                    ld.sreg = nr;
-                    ld.sslot = -2 - @int_cast(i32, x);  // (a slot of its own: drop_reloads drops repeats)
-                    insert_before(b, i, ld);
-                    continue;
-                }
+                let slot = slot_of(f, x);
                 let nr = new_vreg(f, c);
                 f.nospill.set(@int_cast(usize, nr - VREG0), true);
                 let mut reads = false;
                 let mut writes = false;
+                if (i.spill != 0) and (i.sreg == r) {
+                    i.sreg = nr;
+                }
                 for k in 0..i.ops.len {
                     let o = &mut i.ops[k];
                     if (o.kind == K_REG) and (o.reg == r) {
@@ -1057,18 +2002,10 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                     }
                 }
                 if reads {
-                    let ld = t.spill_load(f, nr, @as(i32, c), slot[x]);
-                    ld.spill = 1;
-                    ld.sreg = nr;
-                    ld.sslot = slot[x];
-                    insert_before(b, i, ld);
+                    insert_before(b, i, reload(f, t, nr, c, slot));
                 }
                 if writes {
-                    let st = t.spill_store(f, nr, @as(i32, c), slot[x]);
-                    st.spill = 2;
-                    st.sreg = nr;
-                    st.sslot = slot[x];
-                    insert_after(b, i, st);
+                    insert_after(b, i, store(f, t, nr, c, slot));
                 }
             }
             i = next;
@@ -1090,8 +2027,8 @@ fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
         while u.notnil(i) {
             for k in 0..i.ops.len {
                 let o = i.ops[k];
-                if (o.kind == K_REG) and is_vreg(o.reg) and local[@int_cast(usize, o.reg - VREG0)] and
-                   (f.remat.get(@int_cast(usize, o.reg - VREG0)) == i) {
+                if (o.kind == K_REG) and is_vreg(o.reg) and (@int_cast(usize, o.reg - VREG0) < nv) and
+                   local[@int_cast(usize, o.reg - VREG0)] and (f.remat.get(@int_cast(usize, o.reg - VREG0)) == i) {
                     db[@int_cast(usize, o.reg - VREG0)] = @int_cast(i32, bi);
                 }
             }
@@ -1103,8 +2040,19 @@ fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
         while u.notnil(i) {
             for k in 0..i.ops.len {
                 let o = i.ops[k];
-                if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RU) != 0) {
-                    let x = @int_cast(usize, o.reg - VREG0);
+                let cands: [3]i32 = [o.reg, o.base, o.index];
+                for ci in @as(usize, 0)..3 {
+                    let r = cands[ci];
+                    if (ci == 0) and ((o.kind != K_REG) or ((o.role & RU) == 0)) {
+                        continue;
+                    }
+                    if (ci > 0) and (o.kind != K_MEM) {
+                        continue;
+                    }
+                    if not is_vreg(r) or (@int_cast(usize, r - VREG0) >= nv) {
+                        continue;
+                    }
+                    let x = @int_cast(usize, r - VREG0);
                     if (slot[x] == -2) and (db[x] != @int_cast(i32, bi)) {
                         local[x] = false;
                     }
@@ -1115,13 +2063,219 @@ fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
     }
 }
 
+// Rewrites the spilled rematerialized vregs rm marks (see set_remat): no
+// stack slot. One read only in the block defining it is built again at each
+// use (or folded into it); one read elsewhere is built once in each block
+// that reads it, as a value of its own (which may be rematerialized in turn).
+fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
+    let nv = rm.len;
+    let slot = u.newn.[i32](nv + 1);
+    for k in 0..nv {
+        slot[k] = -1;
+        if rm[k] {
+            slot[k] = -2;
+        }
+    }
+    let local = u.newn.[bool](nv + 1);
+    let bv = u.newn.[i32](nv + 1);  // the value's copy in block bb[x]
+    let bb = u.newn.[i32](nv + 1);
+    remat_locality(f, slot[0..nv], local[0..nv]);
+    for k in 0..nv {
+        bb[k] = -1;
+    }
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            let mut done: [8]i32 = [-1; 8];
+            let mut nd: usize = 0;
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                let cands: [3]i32 = [o.reg, o.base, o.index];
+                for ci in @as(usize, 0)..3 {
+                    let r = cands[ci];
+                    if ((ci == 0) and (o.kind != K_REG)) or ((ci > 0) and (o.kind != K_MEM)) {
+                        continue;
+                    }
+                    if not is_vreg(r) or (@int_cast(usize, r - VREG0) >= nv) or not rm[@int_cast(usize, r - VREG0)] {
+                        continue;
+                    }
+                    let mut seen = false;
+                    for j in 0..nd {
+                        if done[j] == r {
+                            seen = true;
+                        }
+                    }
+                    if not seen and (nd < 8) {
+                        done[nd] = r;
+                        nd += 1;
+                    }
+                }
+            }
+            for j in 0..nd {
+                let r = done[j];
+                let x = @int_cast(usize, r - VREG0);
+                let c = f.vclass.get(x);
+                let def = f.remat.get(x);
+                if i == def {
+                    remove(b, i);
+                    break;
+                }
+                if not local[x] {
+                    let mut nr = bv[x];
+                    if bb[x] != @int_cast(i32, bi) {
+                        nr = new_vreg(f, c);
+                        let cd = clone_def(def, r, nr);
+                        insert_before(b, i, cd);
+                        set_remat(f, nr, cd);
+                        bv[x] = nr;
+                        bb[x] = @int_cast(i32, bi);
+                    }
+                    replace_reg(i, r, nr);
+                    continue;
+                }
+                if t.fold_remat(f, i, r, def) {
+                    continue;
+                }
+                let nr = new_vreg(f, c);
+                f.nospill.set(@int_cast(usize, nr - VREG0), true);
+                replace_reg(i, r, nr);
+                let ld = clone_def(def, r, nr);
+                ld.spill = 1;
+                ld.sreg = nr;
+                ld.sslot = -2 - @int_cast(i32, x);  // (a slot of its own: drop_reloads drops repeats)
+                insert_before(b, i, ld);
+            }
+            i = next;
+        }
+    }
+}
+
+// Rewrites the spilled vregs: split (see above), spilled everywhere, or
+// rematerialized.
+fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
+    let nv = iv.len;
+    let nb = f.blocks.len;
+    let g = Cfg.{ npred: u.newn.[i32](nb + 1), nsucc: u.newn.[i32](nb + 1), simple: u.newn.[bool](nb + 1),
+                  endok: u.newn.[bool](nb + 1) };
+    for bi in 0..nb {
+        g.npred[bi] = 0;
+        // simple: no labels, and nothing but jumps after the first jump
+        let b = f.blocks.get(bi);
+        let mut ok = true;
+        let mut jumped = false;
+        let mut i = b.first;
+        while u.notnil(i) {
+            if t.is_label(i) {
+                ok = false;
+            }
+            if is_jump(i) {
+                jumped = true;
+            } else if jumped {
+                ok = false;
+            }
+            i = i.next;
+        }
+        g.simple[bi] = ok;
+    }
+    for bi in 0..nb {
+        g.endok[bi] = true;
+    }
+    for bi in 0..nb {
+        let b = f.blocks.get(bi);
+        for k in 0..b.succs.len {
+            if (b.succs.len != 1) or not g.simple[bi] {
+                g.endok[@int_cast(usize, b.succs.get(k))] = false;
+            }
+        }
+    }
+    for bi in 0..nb {
+        let b = f.blocks.get(bi);
+        g.nsucc[bi] = @int_cast(i32, b.succs.len);
+        for k in 0..b.succs.len {
+            g.npred[@int_cast(usize, b.succs.get(k))] += 1;
+        }
+    }
+    let every = u.newn.[bool](nv + 1);
+    let rm = u.newn.[bool](nv + 1);
+    for k in 0..nv {
+        every[k] = false;
+        rm[k] = false;
+        if not iv[k].spilled {
+            continue;
+        }
+        if u.notnil(f.remat.get(k)) {
+            rm[k] = true;
+            continue;
+        }
+        let lv = f.level.get(k);
+        let mut done = false;
+        if lv == 0 {
+            done = split(f, t, &g, k, false, 1);
+        }
+        if not done and (lv <= 1) {
+            done = split(f, t, &g, k, true, 2);
+        }
+        every[k] = not done;
+    }
+    spill_everywhere(f, t, every[0..nv]);
+    spill_remat(f, t, rm[0..nv]);
+}
+
+// Reloads of values nothing reads (splitting leaves them behind) are
+// deleted. (They read no vreg, so liveness stays as it is.)
+fn drop_dead_reloads(f: *mut MFunc) void {
+    let nv = nvregs(f);
+    let w = words(nv);
+    let live = u.newn.[u64](w + 1);
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        for j in 0..w {
+            live[j] = b.live_out[j];
+        }
+        let mut i = b.last;
+        while u.notnil(i) {
+            let prev = i.prev;
+            if (i.spill == 1) and is_vreg(i.sreg) and not bget(live, @int_cast(usize, i.sreg - VREG0)) {
+                remove(b, i);
+                i = prev;
+                continue;
+            }
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RD) != 0) and ((o.role & RU) == 0) {
+                    bclr(live, @int_cast(usize, o.reg - VREG0));
+                }
+            }
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RU) != 0) {
+                    bset(live, @int_cast(usize, o.reg - VREG0));
+                }
+                if o.kind == K_MEM {
+                    if is_vreg(o.base) {
+                        bset(live, @int_cast(usize, o.base - VREG0));
+                    }
+                    if is_vreg(o.index) {
+                        bset(live, @int_cast(usize, o.index - VREG0));
+                    }
+                }
+            }
+            i = prev;
+        }
+    }
+}
+
 // Allocates registers; afterwards f.assign maps every vreg to a physical
 // register.
 pub fn allocate(f: *mut MFunc, t: *Target) void {
     let mut rounds: i32 = 0;
+    block_freqs(f);
     loop {
-        number(f);
         liveness(f);
+        drop_dead_reloads(f);
+        number(f);
         build_fixed(f);
         let iv = build_intervals(f);
         let ns = scan(f, t, iv);
