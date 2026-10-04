@@ -4029,7 +4029,7 @@ fn gen_shuffle(v: *mut ir.Value) void {
         wide_shuffle(v);
         return;
     }
-    if shuffle_insn(v) {
+    if shuffle_insn(v) or pack_shuffle(v) {
         return;
     }
     let t = v.ty;
@@ -4076,6 +4076,142 @@ fn gen_shuffle(v: *mut ir.Value) void {
         _ = e2(xe.STORE, sz, mc.mem_slot(r, @int_cast(i64, i) * @bit_cast(i64, lb)), R(tmp));
     }
     _ = sse2(xe.MOVDQU_LD, W(d), mc.mem_slot(r, 0));
+}
+
+// The even (or odd) 8- or 16-bit lanes of a then b (a narrowing truncation,
+// or the high halves): each source with its other halves cleared (or shifted
+// down), then a pack, which does not saturate those. Without SSSE3 the
+// alternative is the bytes one by one through memory.
+fn pack_shuffle(v: *mut ir.Value) bool {
+    let t = v.ty;
+    let bits = lane_bits(t);
+    if (VL != 0) or (t.size != 16) or (v.a.ty.size != 16) or (v.mask.len != @int_cast(usize, t.lanes)) or
+       ((bits != 8) and (bits != 16)) {
+        return false;
+    }
+    let n = @int_cast(i32, t.lanes);
+    let same = ir.resolve(v.a) == ir.resolve(v.b);
+    let mut parity: i32 = -1;
+    for p in @as(i32, 0)..2 {
+        let mut ok = true;
+        for i in @as(i32, 0)..n {
+            ok = ok and lane_is(v.mask[@int_cast(usize, i)], (2 * i) + p, n, same);
+        }
+        if ok {
+            parity = p;
+            break;
+        }
+    }
+    if parity < 0 {
+        return false;
+    }
+    let srcs: [2]*mut ir.Value = [v.a, v.b];
+    let mut r: [2]i32 = [0, 0];
+    let mut ns: usize = 2;
+    if same {
+        ns = 1;
+    }
+    let mut id = xe.PACKUSWB;
+    for k in @as(usize, 0)..ns {
+        let x = srcs[k];
+        let a = reg(x);
+        if bits == 8 {
+            if parity == 1 {
+                r[k] = vxmm();
+                vshift_imm(xe.PSRLW_I, r[k], a, 8);
+            } else if halves_zero(x, 2) {
+                r[k] = a;
+            } else {
+                r[k] = vxmm();
+                sse3(xe.PAND, r[k], a, splat_const(0x00ff, 2, 16));
+            }
+        } else if parity == 1 {
+            // (the high halves sign-extended: the signed pack keeps them)
+            id = xe.PACKSSDW;
+            r[k] = vxmm();
+            vshift_imm(xe.PSRAD_I, r[k], a, 16);
+        } else if has41() {
+            id = xe.PACKUSDW;
+            if halves_zero(x, 4) {
+                r[k] = a;
+            } else {
+                r[k] = vxmm();
+                sse3(xe.PAND, r[k], a, splat_const(0xffff, 4, 16));
+            }
+        } else {
+            id = xe.PACKSSDW;
+            let l = vxmm();
+            vshift_imm(xe.PSLLD_I, l, a, 16);
+            r[k] = vxmm();
+            vshift_imm(xe.PSRAD_I, r[k], l, 16);
+        }
+    }
+    if same {
+        r[1] = r[0];
+    }
+    sse3(id, vreg(v), r[0], R(r[1]));
+    return true;
+}
+
+// d = a shifted by an immediate (id one of the PS*_I forms), 128 bits.
+fn vshift_imm(id: i32, d: i32, a: i32, n: i64) void {
+    // (immediate forms: legacy encodes the destination in r/m)
+    if AVX {
+        let i = e4(xe.SSE, 0, NONE(), R(a), W(d), I(n));
+        i.cc = id;
+        return;
+    }
+    copy(d, a, XMM);
+    let i = e4(xe.SSE, 0, NONE(), RW(d), NONE(), I(n));
+    i.cc = id;
+}
+
+// Are the upper halves of x's groups of g bytes known to be zero (x is a
+// constant, or an and with one, that has them zero)?
+fn halves_zero(x0: *mut ir.Value, g: usize) bool {
+    let mut x = x0;
+    while is_inst(x, ir.OP_COPY) or is_inst(x, ir.OP_BITCAST) {
+        x = x.a;
+    }
+    let mut b = bn.new_bytes();
+    let mut ok = vconst_bytes(x, &mut b);
+    if not ok and is_inst(x, ir.OP_AND) {
+        ok = vconst_bytes(x.b, &mut b) or vconst_bytes(x.a, &mut b);
+    }
+    if ok {
+        let bv = b.view();
+        for i in 0..bv.len {
+            if ((i % g) >= (g / 2)) and (bv[i] != 0) {
+                ok = false;
+            }
+        }
+    }
+    b.free();
+    return ok;
+}
+
+// The bytes of a constant vector (an aggregate, zero, or a splat of a
+// constant, through copies and bit casts) into out, which is empty.
+fn vconst_bytes(x0: *mut ir.Value, out: *mut bn.Bytes) bool {
+    let mut x = x0;
+    while is_inst(x, ir.OP_COPY) or is_inst(x, ir.OP_BITCAST) {
+        x = x.a;
+    }
+    if x.ty.kind != ir.T_VEC {
+        return false;
+    }
+    if (x.kind == ir.V_CAGG) or (x.kind == ir.V_ZERO) {
+        const_le(x, out, 0);
+        return true;
+    }
+    if is_inst(x, ir.OP_SPLAT) and ((x.a.kind == ir.V_CINT) or (x.a.kind == ir.V_CFP) or is_c(x.a)) {
+        let lb = @truncate(usize, x.a.ty.size);
+        for k in @as(usize, 0)..@int_cast(usize, x.ty.lanes) {
+            const_le(x.a, out, k * lb);
+        }
+        return true;
+    }
+    return false;
 }
 
 // The shuffles vsplit.ax makes: two halves joined, or a part of a vector;
@@ -4180,8 +4316,9 @@ fn lane_is(x: i32, e: i32, n: i32, same: bool) bool {
 }
 
 // punpckl* (hi false) / punpckh* of x and y (0: a, 1: b) on lanes of
-// 128 / (lanes per group) bits.
-fn unpack_match(m: []i32, hi: bool, x: i32, y: i32, same: bool) bool {
+// 128 / (lanes per group) bits. zy: y is the zero vector, any of whose
+// lanes will do.
+fn unpack_match(m: []i32, hi: bool, x: i32, y: i32, same: bool, zy: bool) bool {
     let n = @int_cast(i32, m.len);
     let g = @int_cast(i32, (16 * m.len) / @as(usize, VLbytes()));  // lanes per 128-bit group
     let mut off: i32 = 0;
@@ -4196,6 +4333,9 @@ fn unpack_match(m: []i32, hi: bool, x: i32, y: i32, same: bool) bool {
             e += x * n;
         } else {
             e += y * n;
+            if zy and ((m[@int_cast(usize, i)] / n) == y) {
+                continue;
+            }
         }
         if not lane_is(m[@int_cast(usize, i)], e, n, same) {
             return false;
@@ -4305,7 +4445,7 @@ fn shuffle_match(v: *mut ir.Value, gen: bool) bool {
     let t = v.ty;
     let at = v.a.ty;
     if (t.kind != ir.T_VEC) or (t.lanes != at.lanes) or (lane_bits(t) != lane_bits(at)) or (t.size != at.size) or
-       not tg.has(tg.X_AVX) {
+       ((VL > 0) and not tg.has(tg.X_AVX)) {
         return false;
     }
     let n = @int_cast(i32, t.lanes);
@@ -4314,7 +4454,9 @@ fn shuffle_match(v: *mut ir.Value, gen: bool) bool {
     let same = ir.resolve(v.a) == ir.resolve(v.b);
     let srcs: [2]*mut ir.Value = [v.a, v.b];
     // zero extension of the low half's lanes: x's lanes, then zero lanes
-    if (bits <= 32) and ((VL < 64) or (bits > 8) or tg.has(tg.X_AVX512BW)) and ((VL == 0) or tg.has(tg.X_AVX2)) {
+    // (without SSE4.1, an interleave with the zero vector below)
+    if (bits <= 32) and ((VL < 64) or (bits > 8) or tg.has(tg.X_AVX512BW)) and ((VL == 0) or tg.has(tg.X_AVX2)) and
+       ((VL > 0) or has41()) {
         for zi in @as(i32, 0)..2 {
             if not is_vzero(srcs[@int_cast(usize, zi)]) or same {
                 continue;
@@ -4358,7 +4500,7 @@ fn shuffle_match(v: *mut ir.Value, gen: bool) bool {
         let k = pki(wb == 8, 0, pki(wb == 16, 1, pki(wb == 32, 2, 3)));
         for hi in @as(i32, 0)..2 {
             for x in @as(i32, 0)..2 {
-                if unpack_match(w, hi == 1, x, 1 - x, same) {
+                if unpack_match(w, hi == 1, x, 1 - x, same, not same and is_vzero(srcs[@int_cast(usize, 1 - x)])) {
                     if not gen {
                         return true;
                     }
