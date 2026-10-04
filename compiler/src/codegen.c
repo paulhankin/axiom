@@ -61,6 +61,7 @@ typedef struct FnInst {
 } FnInst;
 
 static SymMap inst_map;
+static uint64_t g_build_features;  // the build's extensions (--cpu, --features)
 static FnInst *pending_head, *pending_tail;
 
 typedef struct LoopCtx {
@@ -1400,17 +1401,42 @@ static void add_str_fn_attr(LLVMValueRef fn, const char *k, const char *v) {
 // @features or @multiversion function, or std/os/cpu.ax, compiled for the
 // bare architecture) says so to LLVM.
 static void set_fn_features(LLVMValueRef fn, uint64_t feats) {
-    if (g_target.wasm || feats == g_features) return;
+    if (g_target.wasm || feats == g_build_features) return;
     add_str_fn_attr(fn, "target-features", llvm_features(feats));
     if (feats == 0) add_str_fn_attr(fn, "target-cpu", g_arch == ARCH_X64 ? "x86-64" : "generic");
 }
 
-static FnInst *get_inst(Decl *d, Type **gargs, int n) {
+// The extensions a function's code may use, without an attribute: the
+// build's (not g_features, which is the current function's while a body is
+// generated).
+static uint64_t base_features(Decl *d) { return baseline_fn(d) ? 0 : g_build_features; }
+
+static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats);
+
+static FnInst *get_inst(Decl *d, Type **gargs, int n) { return get_inst_feats(d, gargs, n, base_features(d)); }
+
+// The callee of a direct call from the current function. An inline function
+// is compiled with its caller's extensions (spec §9.5): one instance per set
+// of extensions it is called with, so that @target_has, and lowering that
+// depends on extensions, answer for the caller (a version of an @features or
+// @multiversion function) into which it is inlined.
+static FnInst *get_callee(Decl *d, Type **gargs, int n) {
+    if (d->kind == D_FN && d->is_inline) return get_inst_feats(d, gargs, n, g_features);
+    return get_inst(d, gargs, n);
+}
+
+static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
     CharVec key = {0};
     const char *p = arena_printf("%p", (void *)d);
     while (*p) vec_push(key, *p++);
     for (int i = 0; i < n; i++) {
         const char *s = arena_printf(",%d", gargs[i]->id);
+        while (*s) vec_push(key, *s++);
+    }
+    // (an inline function compiled for its caller's extensions)
+    bool own_feats = feats != base_features(d);
+    if (own_feats) {
+        const char *s = arena_printf("#f%llx", (unsigned long long)feats);
         while (*s) vec_push(key, *s++);
     }
     Sym k = intern(key.data, (size_t)key.len);
@@ -1422,7 +1448,7 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
     fi->gargs = gargs;
     fi->ngargs = n;
     fi->key = k;
-    fi->feats = fn_base_features(d);
+    fi->feats = feats;
     fi->dispatch = d->kind == D_FN && d->attr != ATTR_NONE;
     for (int i = 0; i < n; i++)
         if (gargs[i]->has_params) internal_error("generic instance with unsubstituted arguments");
@@ -1466,6 +1492,11 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
                 while (*ts) vec_push(nb, *ts++);
             }
             vec_push(nb, ']');
+        }
+        if (own_feats) {
+            const char *sfx = features_string(feats & ~g_build_features);
+            const char *o = arena_printf(".%s", *sfx ? sfx : "base");
+            while (*o) vec_push(nb, *o++);
         }
         vec_push(nb, 0);
         name = arena_strndup(nb.data, strlen(nb.data));
@@ -2250,7 +2281,7 @@ static LLVMValueRef gen_call(Expr *e) {
         return emit_call(fty, fp, ft, sret, av, n, ft->params, NULL, 0);
     }
     Decl *d = e->decl;
-    FnInst *fi = get_inst(d, subst_gargs(e->gargs, e->ngargs), e->ngargs);
+    FnInst *fi = get_callee(d, subst_gargs(e->gargs, e->ngargs), e->ngargs);
     int n = e->args.len + (e->b ? 1 : 0);
     LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
     int k = 0;
@@ -4484,7 +4515,7 @@ static FnInst *get_version(FnInst *fi, int k, uint64_t feats) {
     v->key = key;
     v->feats = feats;
     v->dispatch = false;
-    const char *suffix = features_string(feats & ~g_features);
+    const char *suffix = features_string(feats & ~g_build_features);
     if (!*suffix) suffix = "base";
     size_t nl;
     const char *base = LLVMGetValueName2(fi->fn, &nl);
@@ -4678,6 +4709,7 @@ static bool setup_target(void) {
     // the target's extensions (target.c); functions with @features or
     // @multiversion versions add their own (the target-features attribute)
     // (not multivalue on wasm: LLVM would change how structs are returned)
+    g_build_features = g_features;
     const char *features = llvm_features(g_target.wasm ? g_features & ~(uint64_t)0x40 : g_features);
     LLVMCodeGenOptLevel ol = O->opt_level == 0   ? LLVMCodeGenLevelNone
                              : O->opt_level == 1 ? LLVMCodeGenLevelLess

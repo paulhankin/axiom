@@ -97,6 +97,7 @@ struct FnInst {
 let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
                                                                     vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0,
                                                                     len: 0 };
+let mut g_build_features: u64 = 0;  // the build's extensions (--cpu, --features)
 let mut pending_head: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 let mut pending_tail: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 
@@ -1619,13 +1620,45 @@ fn type_mentions_error(t: *mut ast.Type) bool {
 // ---------------------------------------------------------------------------
 // Function instances
 // ---------------------------------------------------------------------------
+// The extensions a function's code may use, without an attribute: the
+// build's (not tg.g_features, which is the current function's while a body
+// is generated).
+fn base_features(d: *mut ast.Decl) u64 {
+    if sema.baseline_fn(d) {
+        return 0;
+    }
+    return g_build_features;
+}
+
 fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
+    return get_inst_feats(d, gargs, base_features(d));
+}
+
+// The callee of a direct call from the current function. An inline function
+// is compiled with its caller's extensions (spec §9.5): one instance per set
+// of extensions it is called with, so that @target_has, and lowering that
+// depends on extensions, answer for the caller (a version of an @features or
+// @multiversion function) into which it is inlined.
+fn get_callee(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
+    if (d.kind == ast.D_FN) and d.is_inline {
+        return get_inst_feats(d, gargs, tg.g_features);
+    }
+    return get_inst(d, gargs);
+}
+
+fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut FnInst {
     let n = gargs.len;
     let mut kb = u.Buf.init();
     kb.s(u.udec(@as(u64, @int_from_ptr(d))));
     for i in 0..n {
         kb.s(",");
         kb.s(u.idec(gargs[i].id));
+    }
+    // (an inline function compiled for its caller's extensions)
+    let own_feats = feats != base_features(d);
+    if own_feats {
+        kb.s("#f");
+        kb.s(u.udec(feats));
     }
     let k = u.intern(kb.done());
     let found = inst_map.get(k);
@@ -1636,7 +1669,7 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     fi.decl = d;
     fi.gargs = gargs;
     fi.key = k;
-    fi.feats = tg.func_features(0, sema.baseline_fn(d));
+    fi.feats = feats;
     fi.dispatch = (d.kind == ast.D_FN) and (d.attr != ast.ATTR_NONE);
     for i in 0..n {
         if gargs[i].has_params {
@@ -1690,6 +1723,15 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
             }
             nb.s("]");
         }
+        if own_feats {
+            let sfx = tg.features_string(feats & ~g_build_features);
+            nb.s(".");
+            if sfx.len == 0 {
+                nb.s("base");
+            } else {
+                nb.s(sfx);
+            }
+        }
         name = nb.done();
     }
     if d.variadic {
@@ -1730,9 +1772,9 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
         if O.unit == CG_LINK {
             define = false;
         } else if (O.unit == CG_MODULE) and (n == 0) {
-            define = d.module == O.module;
+            define = (d.module == O.module) or own_feats;
         }
-        if (O.unit == CG_WHOLE) and not d.is_export {
+        if ((O.unit == CG_WHOLE) and not d.is_export) or own_feats {
             set_linkage(fi.fnv, ir.LINK_INTERNAL);
         } else if define and (n > 0) {
             set_linkage(fi.fnv, ir.LINK_LINKONCE);
@@ -1772,7 +1814,7 @@ fn get_version(fi: *mut FnInst, k: usize, feats: u64) *mut FnInst {
     v.sret = fi.sret;
     v.display = fi.display;
     v.feats = feats;
-    let mut suffix = tg.features_string(feats & ~tg.g_features);
+    let mut suffix = tg.features_string(feats & ~g_build_features);
     if suffix.len == 0 {
         suffix = "base";
     }
@@ -2511,7 +2553,7 @@ fn gen_call(e: *mut ast.Expr) *mut ir.Value {
         return emit_call(fl.t, fp, ft, fl.sret, av[0..n], ft.params, u.nosym());
     }
     let d = e.decl;
-    let fi = get_inst(d, subst_gargs(e.gargs));
+    let fi = get_callee(d, subst_gargs(e.gargs));
     let has_recv = u.notnil(e.b);
     let mut n = e.args.len;
     if has_recv {
@@ -4976,6 +5018,7 @@ pub fn default_triple() []u8 {
 // through diag or printed to stderr).
 pub fn codegen_program(o: *mut CgOptions) bool {
     O = o;
+    g_build_features = tg.g_features;
     let P = sema.g_prog;
     ir.init_types(@int_cast(u64, ty.g_target.ptr_bits / 8));
     M = ir.new_module(u.file_of(P.root.file.id).display);

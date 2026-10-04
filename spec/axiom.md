@@ -1156,6 +1156,10 @@ and stack traces are the same.
   (`E0314`, reported at each call on the cycle). Recursion through a function that is not
   inline is allowed.
 - It cannot be `export`ed, and cannot have `@features` or `@multiversion` (`E0313`).
+- A direct call compiles it with its caller's processor extensions (§13.4): called from a
+  function with `@features`, or from a version of a `@multiversion` function, its body is
+  compiled for those extensions too, and `@target_has` inside it answers for them. Used as
+  a value, it has the build's extensions.
 - It may be generic, and it may be used as a value (§9.4); a call through a function
   pointer is an ordinary call.
 - Stack traces (§16.4.1) keep its frames. A direct call to it does not record its call
@@ -1720,7 +1724,9 @@ one with `--features=-x` removes the extensions that need it.
 
 - `@target_has("ext")`: whether the code being compiled may use extension `ext`, that is,
   the build's extensions plus those of the enclosing function (`@features`, or the version
-  of a `@multiversion` function being compiled). `ext` is a string literal naming an
+  of a `@multiversion` function being compiled, and for an `inline` function, those of the
+  function it is inlined into, §9.5). A function that is not inline has the build's
+  extensions whichever function calls it. `ext` is a string literal naming an
   extension of any architecture (`E0827` otherwise); another architecture's extension is
   simply absent.
 - `@target_arch("x86_64")`: the architecture, one of `wasm32`, `wasm64`, `x86_64`, `aarch64`.

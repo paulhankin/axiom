@@ -7,6 +7,7 @@
 //   // flags: --overflow=trap  extra compiler flags
 //   // wasm-only               skip on the native target
 //   // native-only             skip on wasm
+//   // x86-64-flags: --cpu=x86-64  extra flags for a native build on an x86-64 host
 //   // link: file.c            C source (next to the test) compiled and linked in
 //   // header: name.h          generate a C header for the exports (for the C source)
 //
@@ -43,13 +44,14 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], flags: [], wasmOnly: false, nativeOnly: false, links: [], header: null };
+  const d = { expect: [], trap: false, errors: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, links: [], header: null };
   for (const line of src.split('\n')) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
     else if (/\/\/ expect-trap\b/.test(line)) d.trap = true;
     else if ((m = line.match(/\/\/ expect-error: (E\d+)/))) d.errors.push(m[1]);
     else if ((m = line.match(/\/\/ flags: (.*)$/))) d.flags.push(...m[1].trim().split(/\s+/));
+    else if ((m = line.match(/\/\/ x86-64-flags: (.*)$/))) d.x64Flags.push(...m[1].trim().split(/\s+/));
     else if (/\/\/ wasm-only\b/.test(line)) d.wasmOnly = true;
     else if (/\/\/ native-only\b/.test(line)) d.nativeOnly = true;
     else if ((m = line.match(/\/\/ link: (\S+)/))) d.links.push(m[1]);
@@ -113,6 +115,7 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   const out = path.join(tmp, path.basename(f, '.ax') + (native ? '' : '.wasm'));
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
   if (native) args.push(nativeTarget, `--link=${path.join(root, noC ? 'tests/native_rt.ax' : 'tests/native_rt.c')}`);
+  if (native && process.arch === 'x64' && !process.env.AXIOM_NATIVE_TARGET) args.push(...d.x64Flags);
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
   if (d.header) args.push(`--emit-header=${path.join(tmp, d.header)}`);
   const t0 = process.hrtime.bigint();

@@ -81,7 +81,9 @@ what is missing, rather than dying on an unsupported instruction.
 
 Each function is compiled with the build's extensions, or with more: a function declared
 `@features(...)` or each version of an `@multiversion(...)` one (spec §13.4) carries its
-own set in the IR (`ir.Func.features`). The backends switch to it while they compile the
+own set in the IR (`ir.Func.features`). An `inline` function gets one instance per set of
+extensions it is called with (codegen.ax `get_callee`), so its `@target_has` answers for
+the function it is inlined into. The backends switch to the set while they compile the
 function, and the inliner never moves code into a function with fewer extensions.
 Without an extension the backends use a baseline sequence with the same result, so the
 choice never changes what a program computes:
