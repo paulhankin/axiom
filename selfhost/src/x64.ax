@@ -564,11 +564,19 @@ fn remat_reg(v: *mut ir.Value) i32 {
     let outer_vl = VL;
     VL = vl_of(v.ty);
     let r = vxmm();
+    _ = sse2(xe.MOVDQU_LD, W(r), remat_mem(v));
+    VL = outer_vl;
+    return r;
+}
+
+// Where a rematerialized vector is in memory: the constant pool, or its
+// global.
+fn remat_mem(v: *mut ir.Value) mc.MOp {
     if v.op == ir.OP_LOAD {
-        _ = sse2(xe.MOVDQU_LD, W(r), addr(v.a));
-        VL = outer_vl;
-        return r;
+        return addr(v.a);
     }
+    let outer_vl = VL;
+    VL = vl_of(v.ty);
     let mut b = bn.new_bytes();
     let n = @as(usize, @bit_cast(u32, v.ty.lanes));
     let lb = @truncate(usize, v.ty.elem.size);
@@ -588,10 +596,23 @@ fn remat_reg(v: *mut ir.Value) i32 {
     while b.len() < n_bytes {
         b.u8_(0);
     }
-    _ = sse2(xe.MOVDQU_LD, W(r), const_bytes(&b, n_bytes));
+    let m = const_bytes(&b, n_bytes);
     b.free();
     VL = outer_vl;
-    return r;
+    return m;
+}
+
+// The second source of a vector instruction (its r/m operand): memory for
+// a rematerialized vector or a load folded into its only user (flag 8,
+// with VEX or EVEX, which take unaligned memory), else a register.
+fn vsrc(x: *mut ir.Value) mc.MOp {
+    if AVX and (x.ty.kind == ir.T_VEC) and (remat(x) or (is_inst(x, ir.OP_LOAD) and ((x.flag & 8) != 0))) {
+        if remat(x) {
+            return remat_mem(x);
+        }
+        return addr(x.a);
+    }
+    return R(reg(x));
 }
 
 // A memory operand for address p.
@@ -1472,8 +1493,8 @@ fn is_f32(t: *ir.Ty) bool {
 fn gen_fbin(v: *mut ir.Value) void {
     let d = vreg(v);
     let a = reg(v.a);
-    let b = reg(v.b);
-    sse3(fop(v.op, is_f32(v.ty), v.ty.kind == ir.T_VEC), d, a, R(b));
+    let b = vsrc(v.b);
+    sse3(fop(v.op, is_f32(v.ty), v.ty.kind == ir.T_VEC), d, a, b);
 }
 
 // sign-bit masks
@@ -1713,7 +1734,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
     }
     if id == ir.IN_FMA {
         // d = a * b + c: vfmadd231 d(=c) += a * b
-        let b = reg(v.xs.get(1));
+        let b = vsrc(v.xs.get(1));
         let c = reg(v.xs.get(2));
         copy(d, c, vclass());
         let mut op = xe.VFMADD231SD;
@@ -1724,7 +1745,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         } else if single {
             op = xe.VFMADD231SS;
         }
-        let i = e4(xe.SSE, 0, RW(d), R(b), R(a), NONE());
+        let i = e4(xe.SSE, 0, RW(d), b, R(a), NONE());
         i.cc = op;
         _ = vlz(i);
         return;
@@ -2730,8 +2751,11 @@ fn own_vec_op(v: *mut ir.Value) bool {
         return false;
     }
     let id = @truncate(i32, @bit_cast(i64, v.cv));
-    if (id >= ir.IN_PERM) and (id <= ir.IN_ASHRV) {
+    if (id >= ir.IN_PERM) and (id <= ir.IN_STORE_PARTIAL) {
         return true;
+    }
+    if (id >= ir.IN_SHLV) and (id <= ir.IN_ASHRV) {
+        return shiftv_ok(id, lane_bits(v.ty), v.ty.lanes);
     }
     if ((id == ir.IN_CTLZ) or (id == ir.IN_CTPOP) or (id == ir.IN_CTTZ)) and (v.ty.kind == ir.T_VEC) {
         return bitcount_ok(id, lane_bits(v.ty), v.ty.lanes);
@@ -2748,7 +2772,7 @@ fn vec_binop(v: *mut ir.Value) void {
         vec_shift(v, d, a);
         return;
     }
-    let b = reg(v.b);
+    let b = vsrc(v.b);
     let k = lk(t);
     let mut id: i32 = 0;
     if o == ir.OP_ADD {
@@ -2770,7 +2794,7 @@ fn vec_binop(v: *mut ir.Value) void {
         fail(u.f1("vector op %s", u.idec(o)));
         return;
     }
-    sse3(id, d, a, R(b));
+    sse3(id, d, a, b);
 }
 
 fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
@@ -2850,6 +2874,13 @@ fn vec_icmp(v: *mut ir.Value) void {
     let t = v.a.ty;
     let p = @truncate(i32, @bit_cast(i64, v.cv));
     let d = vreg(v);
+    if VL == 64 {
+        // AVX-512: any predicate into a mask register, expanded to lanes
+        cmp_to_k1(v);
+        let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
+        m.cc = xe.VPMOVM2B + lk(t);
+        return;
+    }
     let mut a = reg(v.a);
     let mut b = reg(v.b);
     let k = lk(t);
@@ -3255,6 +3286,15 @@ fn le8(b: []u8) u64 {
 fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let a0 = v.xs.get(0);
     let at = a0.ty;
+    if (id == ir.IN_BITMASK) and (VL == 64) and ((a0.flag & 32) != 0) {
+        // the compare into the mask register
+        cmp_to_k1(a0);
+        let r = vgpr();
+        let mv = e4(xe.SSE, 8, W(r), R(xe.K1), NONE(), NONE());
+        mv.cc = xe.KMOVQ_RK;
+        copy(vreg(v), r, GPR);
+        return;
+    }
     if ((id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK)) and (VL == 64) {
         // AVX-512: through a mask register
         let d = vreg(v);
@@ -3505,16 +3545,17 @@ pub fn partial_ok(bits: i32, lanes: i32) bool {
 }
 
 // A shift of each lane by its own count: vpsllv[dq], vpsrlv[dq], vpsravd
-// (AVX2), vpsravq and the 16-bit ones (AVX-512).
+// (AVX2; 512 bits in two halves, which vsplit.ax makes), vpsravq and the
+// 16-bit ones (AVX-512).
 pub fn shiftv_ok(id: i32, bits: i32, lanes: i32) bool {
     let n = vbytes(bits, lanes);
     if (n != 16) and (n != 32) and (n != 64) {
         return false;
     }
-    if (n == 64) or (bits == 16) or ((bits == 64) and (id == ir.IN_ASHRV)) {
-        return ((bits == 16) or (bits == 32) or (bits == 64)) and avx512_for(n);
+    if ((bits == 16) or (bits == 32) or (bits == 64)) and avx512_for(n) {
+        return true;
     }
-    return ((bits == 32) or (bits == 64)) and tg.has(tg.X_AVX2);
+    return ((bits == 32) or ((bits == 64) and (id != ir.IN_ASHRV))) and tg.has(tg.X_AVX2);
 }
 
 // Leading-zero counts, population counts and trailing-zero counts of each
@@ -3761,6 +3802,180 @@ fn perm_shuffle(v: *mut ir.Value) void {
     i.cc = op;
 }
 
+// k1 <- vector compare c (AVX-512), lane by lane.
+fn cmp_to_k1(c: *mut ir.Value) void {
+    let t = c.a.ty;
+    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    let mut a = reg(c.a);
+    let mut b = reg(c.b);
+    let mut imm: i64 = 0;
+    let mut op: i32 = 0;
+    if c.op == ir.OP_FCMP {
+        op = pki(lane_bits(t) == 32, xe.CMPPS, xe.CMPPD);
+        if p == ir.RealUNE {
+            imm = 4;
+        } else if (p == ir.RealOLT) or (p == ir.RealOGT) {
+            imm = 1;
+        } else if (p == ir.RealOLE) or (p == ir.RealOGE) {
+            imm = 2;
+        }
+        if (p == ir.RealOGT) or (p == ir.RealOGE) {
+            let x = a;
+            a = b;
+            b = x;
+        }
+    } else {
+        // vpcmp[u]: 0 eq, 1 lt, 2 le, 4 ne, 5 nlt, 6 nle
+        let k = lk(t);
+        op = xe.VPCMPUB + k;
+        if (p == ir.IntSLT) or (p == ir.IntSLE) or (p == ir.IntSGT) or (p == ir.IntSGE) {
+            op = xe.VPCMPB + k;
+        }
+        if p == ir.IntNE {
+            imm = 4;
+        } else if (p == ir.IntULT) or (p == ir.IntSLT) {
+            imm = 1;
+        } else if (p == ir.IntULE) or (p == ir.IntSLE) {
+            imm = 2;
+        } else if (p == ir.IntUGE) or (p == ir.IntSGE) {
+            imm = 5;
+        } else if (p == ir.IntUGT) or (p == ir.IntSGT) {
+            imm = 6;
+        }
+    }
+    let i = e4(xe.SSE, VL, W(xe.K1), R(b), R(a), I(imm));  // a cmp b
+    i.cc = op;
+}
+
+// @select as codegen.ax makes it: (x & m) | (y & ~m), for a lane mask m.
+struct Sel {
+    x: *mut ir.Value,
+    y: *mut ir.Value,
+    m: *mut ir.Value,
+    p: *mut ir.Value,  // x & m
+    q: *mut ir.Value,  // y & ~m
+    n: *mut ir.Value,  // ~m
+}
+
+fn all_ones(v: *ir.Value) bool {
+    if v.kind == ir.V_CAGG {
+        for k in 0..v.xs.len {
+            let c = v.xs.get(k);
+            if (c.kind != ir.V_CINT) or ((c.cv & ir.mask_bits(c.ty.bits)) != ir.mask_bits(c.ty.bits)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return is_inst(v, ir.OP_SPLAT) and (v.a.kind == ir.V_CINT) and
+           ((v.a.cv & ir.mask_bits(v.a.ty.bits)) == ir.mask_bits(v.a.ty.bits));
+}
+
+fn sel_parts(o: *mut ir.Value) Sel {
+    let mut r = Sel.{ x: vnil(), y: vnil(), m: vnil(), p: vnil(), q: vnil(), n: vnil() };
+    if not is_inst(o, ir.OP_OR) or (o.ty.kind != ir.T_VEC) or not avx512_for(o.ty.size) {
+        return r;
+    }
+    let ors: [2]*mut ir.Value = [o.a, o.b];
+    for j in @as(usize, 0)..2 {
+        let p = ors[j];
+        let q = ors[1 - j];
+        if not is_inst(p, ir.OP_AND) or not is_inst(q, ir.OP_AND) {
+            continue;
+        }
+        let ps: [2]*mut ir.Value = [p.a, p.b];
+        let qs: [2]*mut ir.Value = [q.a, q.b];
+        for k in @as(usize, 0)..2 {
+            let m = ps[1 - k];
+            for l in @as(usize, 0)..2 {
+                let n = qs[1 - l];
+                if is_inst(n, ir.OP_XOR) and (((n.a == m) and all_ones(n.b)) or ((n.b == m) and all_ones(n.a))) {
+                    r.x = ps[k];
+                    r.y = qs[l];
+                    r.m = m;
+                    r.p = p;
+                    r.q = q;
+                    r.n = n;
+                    return r;
+                }
+            }
+        }
+    }
+    return r;
+}
+
+// A select (sel_parts) as one vpternlogd: m ? x : y bit by bit (0xca).
+fn gen_blend(v: *mut ir.Value) void {
+    let s = sel_parts(v);
+    let d = vreg(v);
+    let x = reg(s.x);
+    let y = reg(s.y);
+    copy(d, reg(s.m), class_of(v.ty));
+    let i = e4(xe.SSE, VL, RW(d), R(y), R(x), I(0xca));
+    i.cc = xe.VPTERNLOGD;
+}
+
+// Marks the selects and compares that the instructions using them do:
+// the and, and and xor of a blend (flag 16, when they have no other use),
+// and a compare into a mask register for @bitmask (flag 32).
+fn mark_fused_vectors(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let s = sel_parts(i);
+            if u.notnil(s.x) {
+                i.flag = i.flag | 64;
+                if (s.p.uses == 1) and (s.q.uses == 1) {
+                    s.p.flag = s.p.flag | 16;
+                    s.q.flag = s.q.flag | 16;
+                    if s.n.uses == 1 {
+                        s.n.flag = s.n.flag | 16;
+                    }
+                }
+            }
+            if (i.op == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, i.cv)) == ir.IN_BITMASK) and (inst_vl(i) == 64) {
+                let c = i.xs.get(0);
+                if (is_inst(c, ir.OP_ICMP) or is_inst(c, ir.OP_FCMP)) and (c.uses == 1) {
+                    c.flag = c.flag | 32;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // vector loads that are the memory operand of their only user (vsrc)
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if AVX and (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
+               not remat(i) and u.notnil(i.user) and (i.user.blk == b) and ((i.user.flag & (16 | 32 | 64)) == 0) and
+               reads_as_rm(i.user, i) and quiet_between(i, i.user) {
+                i.flag = i.flag | 8;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// Does vector instruction us read x (only) as its r/m operand, through vsrc?
+fn reads_as_rm(us: *ir.Value, x: *mut ir.Value) bool {
+    let o = us.op;
+    if us.ty.kind != ir.T_VEC {
+        return false;
+    }
+    if ((o >= ir.OP_FADD) and (o <= ir.OP_FDIV)) or (o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_AND) or
+       (o == ir.OP_OR) or (o == ir.OP_XOR) or (o == ir.OP_MUL) {
+        return (us.b == x) and (us.a != x);
+    }
+    if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, us.cv)) == ir.IN_FMA) {
+        return (us.xs.get(1) == x) and (us.xs.get(0) != x) and (us.xs.get(2) != x);
+    }
+    return false;
+}
+
 // IN_PERM and IN_PERM2 (perm_ok).
 fn gen_perm(v: *mut ir.Value, id: i32) void {
     let t = v.ty;
@@ -3972,6 +4187,13 @@ fn gen_inst_at(v: *mut ir.Value) void {
     let t = v.ty;
     if remat(v) {
         return;  // (at its uses)
+    }
+    if (v.flag & (16 | 32)) != 0 {
+        return;  // (part of its user: a blend, or a compare into a mask register)
+    }
+    if (v.flag & 64) != 0 {
+        gen_blend(v);
+        return;
     }
     if o == ir.OP_COPY {
         copy(vreg(v), reg(v.a), class_of(t));
@@ -4437,6 +4659,7 @@ fn prepare(f: *mut ir.Func) void {
         }
         b = b.next;
     }
+    mark_fused_vectors(f);
 }
 
 // Does nothing after `from` and before `to` (in its block) write memory?
