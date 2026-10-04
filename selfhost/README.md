@@ -192,7 +192,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `sroa.ax` | Scalar replacement of aggregates: stack slots split into scalar fields, copies of constants replaced by the constant |
 | `gvn.ax` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions, bounds between values and upper bounds of values (bit counts, masks, minimums, constant tables, loop phis by induction), which decide bounds and overflow checks and shift guards, dead stores, shadow stack pushes and pops (and their records moved to the paths that read them), loop-invariant code motion, memset idioms, loop ranges split at bounds checks, code sinking |
 | `thread.ax` | Jump threading (also over comparisons of one value that branches above decide) and if-conversion (selects; stores in both arms merged; a load from a constant global speculated through a select of its address; nested tests of one value merged into one range check) |
-| `unroll.ax` | Full unrolling of loops with a small constant trip count (after inlining), and chains of `x == k` tests storing one value at addresses linear in `k` made one range check and one store |
+| `unroll.ax` | Full unrolling of loops with a small constant trip count (after inlining), partial unrolling (up to four times, the leftover iterations peeled) of larger ones, and chains of `x == k` tests storing one value at addresses linear in `k` made one range check and one store |
 | `inline.ax` | Inlining bottom-up over the call graph (and the calls inlining brings in), interprocedural constant propagation, dead functions |
 | `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own |
 | `wasm.ax`, `wobj.ax` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
@@ -275,8 +275,8 @@ dead store elimination, shadow stack push/pop removal, memset idioms,
 loop-invariant code motion and code sinking. `-O2` and `-O3` add cold
 region outlining, interprocedural constant propagation and inlining
 (whole-program units by default), after which each function is simplified
-again, then fully unroll loops with a small constant trip count (and
-simplify those functions again), and split loop ranges at their bounds checks. The backends
+again, then unroll loops with a constant trip count (fully when small,
+else partially; and simplify those functions again), and split loop ranges at their bounds checks. The backends
 then lay out loops, hoist constants, fold loads into memory operands
 (x86-64) and allocate registers with live ranges that have holes.
 

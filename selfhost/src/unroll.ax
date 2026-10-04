@@ -19,7 +19,9 @@
 // Values of the loop used after it are the header's (the original header
 // runs last, as before). Other exits (a `break`, a failed check) are copied
 // with each copy, adding an input to each phi of the block they lead to; a
-// loop whose values are otherwise used past such an exit stays as it is.
+// loop whose values are otherwise used past such an exit stays as it is
+// (unless the exit only traps: then the header's values may be used after
+// the loop).
 // =============================================================================
 import "ir.ax" as ir;
 import "opt.ax" as opt;
@@ -33,6 +35,13 @@ fn vnil() *mut ir.Value {
 // phis and jumps, times the trip count), and the most copies.
 const UNROLL_SIZE: i64 = 300;
 const UNROLL_TRIPS: i64 = 64;
+
+// Partial unrolling, of a loop with a constant trip count too large to
+// unroll fully: the unrolled body's size, the largest factor, and the most
+// trips counted (simulating the induction variable).
+const PARTIAL_SIZE: i64 = 120;
+const PARTIAL_MAX: i64 = 4;
+const PARTIAL_TRIPS: i64 = 4096;
 
 let mut unroll_mark: i64 = 0x7000_0000_0000;
 
@@ -224,7 +233,7 @@ fn trip_count(h: *mut ir.Block, tag: i64, stay: *mut *mut ir.Block) i64 {
             return n;
         }
         n += 1;
-        if n > UNROLL_TRIPS {
+        if n > PARTIAL_TRIPS {
             return -1;
         }
         v = eval(step, iv, v, tag, 4);
@@ -258,7 +267,34 @@ fn loop_size(members: *u.List.[*mut ir.Block]) i64 {
     return n;
 }
 
-fn has_side_exits(h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+// Does the block s, outside the loop, only trap (end in `unreachable`),
+// computing nothing from the loop's values but its phis' inputs? Leaving the
+// loop for it never reaches the uses of the loop's values after the loop.
+fn trap_exit(s: *mut ir.Block, tag: i64) bool {
+    let t = ir.terminator(s);
+    if u.isnil(t) or (t.op != ir.OP_UNREACHABLE) {
+        return false;
+    }
+    let mut i = s.first;
+    while u.notnil(i) {
+        if i.op != ir.OP_PHI {
+            if in_loop(ir.resolve(i.a), tag) or in_loop(ir.resolve(i.b), tag) or in_loop(ir.resolve(i.c), tag) {
+                return false;
+            }
+            for k in 0..i.xs.len {
+                if in_loop(ir.resolve(i.xs.get(k)), tag) {
+                    return false;
+                }
+            }
+        }
+        i = i.next;
+    }
+    return true;
+}
+
+// Does the loop leave other than from its header? With traps false, exits
+// to blocks that only trap (a failed check) do not count.
+fn has_side_exits(h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], traps: bool) bool {
     for k in 0..members.len {
         let x = members.get(k);
         if x == h {
@@ -266,7 +302,8 @@ fn has_side_exits(h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) 
         }
         let t = ir.terminator(x);
         for j in 0..ir.succ_count(t) {
-            if ir.succ(t, j).mark != tag {
+            let s = ir.succ(t, j);
+            if (s.mark != tag) and (traps or not trap_exit(s, tag)) {
                 return true;
             }
         }
@@ -472,6 +509,136 @@ fn retarget(b: *mut ir.Block, from: *mut ir.Block, to: *mut ir.Block) void {
     }
 }
 
+// The exits of the copy just made (other than its header's): an input to
+// each phi where they lead, the copy's value along the copy's edge.
+fn copy_exit_inputs(members: *u.List.[*mut ir.Block], h: *mut ir.Block, tag: i64) void {
+    for k in 0..members.len {
+        let x = members.get(k);
+        if x == h {
+            continue;
+        }
+        let t = ir.terminator(x);
+        for j in 0..ir.succ_count(t) {
+            let s = ir.succ(t, j);
+            if (s.mark == tag) or ((j > 0) and (ir.succ(t, j - 1) == s)) {
+                continue;
+            }
+            let mut sp = s.first;
+            while u.notnil(sp) and (sp.op == ir.OP_PHI) {
+                let cnt = sp.bs.len;
+                for e in 0..cnt {
+                    if sp.bs.get(e) == x {
+                        ir.add_incoming(sp, map_v(ir.resolve(sp.xs.get(e)), tag), @ptr_cast(*mut ir.Block, x.auxp));
+                    }
+                }
+                sp = sp.next;
+            }
+        }
+    }
+}
+
+// The header phis' inputs along the back edges (latches), in the copy just
+// made (in the loop itself unless copied): ins[i * latches.len + k] for phi
+// i and latch k.
+fn latch_inputs(h: *mut ir.Block, latches: *u.List.[*mut ir.Block], tag: i64, copied: bool,
+                ins: *mut u.List.[*mut ir.Value]) void {
+    ins.clear();
+    let mut q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for k in 0..latches.len {
+            let mut x = vnil();
+            for j in 0..q.bs.len {
+                if q.bs.get(j) == latches.get(k) {
+                    x = ir.resolve(q.xs.get(j));
+                }
+            }
+            if copied {
+                x = map_v(x, tag);
+            }
+            ins.push(ir.resolve(x));
+        }
+        q = q.next;
+    }
+}
+
+// Makes a copy of the loop's blocks whose header goes straight into the
+// body (its test dropped), entered along the edges `from` (now into cur_h;
+// retargeted unless not link) with the header phis' inputs `ins` along
+// them; then sets from and ins to the copy's back edges and the values
+// along them. Returns the copy's header.
+fn chain_copy(f: *mut ir.Func, h: *mut ir.Block, stay: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block],
+              latches: *u.List.[*mut ir.Block], side: bool, cur_h: *mut ir.Block, from: *mut u.List.[*mut ir.Block],
+              ins: *mut u.List.[*mut ir.Value], fold: bool, link: bool) *mut ir.Block {
+    clone_members(f, members, tag);
+    let nh = @ptr_cast(*mut ir.Block, h.auxp);
+    let mut i: usize = 0;
+    let mut q = nh.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        q.xs.clear();
+        q.bs.clear();
+        for k in 0..from.len {
+            q.xs.push(ins.get((i * from.len) + k));
+            q.bs.push(from.get(k));
+        }
+        i += 1;
+        q = q.next;
+    }
+    if link {
+        for k in 0..from.len {
+            retarget(from.get(k), cur_h, nh);
+        }
+    }
+    let nt = ir.terminator(nh);
+    nt.op = ir.OP_BR;
+    nt.a = vnil();
+    nt.t1 = @ptr_cast(*mut ir.Block, stay.auxp);
+    nt.t2 = ir.bnil();
+    if fold {
+        fold_copy(members);
+    }
+    if side {
+        copy_exit_inputs(members, h, tag);
+    }
+    latch_inputs(h, latches, tag, true, ins);
+    from.clear();
+    for k in 0..latches.len {
+        from.push(@ptr_cast(*mut ir.Block, latches.get(k).auxp));
+    }
+    return nh;
+}
+
+// Headers of loops of the current function already unrolled partially (so
+// not again).
+let mut partial_f: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut partial_done: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0),
+                                                                        len: 0, cap: 0 };
+
+// The factor to unroll by when the loop is too large to unroll fully: 0 for
+// none.
+fn partial_factor(f: *mut ir.Func, h: *mut ir.Block, n: i64, size: i64) i64 {
+    if f != partial_f {
+        partial_f = f;
+        partial_done.clear();
+    }
+    for k in 0..partial_done.len {
+        if partial_done.get(k) == h {
+            return 0;
+        }
+    }
+    let mut factor = PARTIAL_SIZE / @max(size, 1);
+    if factor > PARTIAL_MAX {
+        factor = PARTIAL_MAX;
+    }
+    // (at least two runs of the unrolled body)
+    while (factor > 1) and (n < (2 * factor)) {
+        factor -= 1;
+    }
+    if factor < 2 {
+        return 0;
+    }
+    return factor;
+}
+
 fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
     let mut stay = ir.bnil();
     let n = trip_count(h, tag, &mut stay);
@@ -479,12 +646,22 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         return false;
     }
     let size = loop_size(members);
-
-    if (size < 0) or ((size * n) > UNROLL_SIZE) {
+    if size < 0 {
         return false;
     }
-    let side = has_side_exits(h, tag, members);
-    if not uses_ok(h, tag, side) {
+    // fully, or else partially: the body `factor` times, after the
+    // iterations left over (n % factor) peeled off in front
+    let mut factor: i64 = 0;
+    if (n > UNROLL_TRIPS) or ((size * n) > UNROLL_SIZE) {
+        factor = partial_factor(f, h, n, size);
+        if factor == 0 {
+            return false;
+        }
+    }
+    let side = has_side_exits(h, tag, members, true);
+    // (the header's values may be used after the loop when its other exits
+    // only trap)
+    if not uses_ok(h, tag, has_side_exits(h, tag, members, false)) {
         return false;
     }
     let ht = ir.terminator(h);
@@ -504,15 +681,9 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
             from.push(p);
         }
     }
-    let mut nphi: usize = 0;
-    let mut p = h.first;
-    while u.notnil(p) and (p.op == ir.OP_PHI) {
-        nphi += 1;
-        p = p.next;
-    }
     // ins[i * from.len + k]: phi i's input along edge from[k]
     let mut ins = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
-    p = h.first;
+    let mut p = h.first;
     while u.notnil(p) and (p.op == ir.OP_PHI) {
         for k in 0..from.len {
             let mut x = vnil();
@@ -525,84 +696,20 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         }
         p = p.next;
     }
-    let mut cur_h = h;  // where the edges in `from` lead now
-    for _copy in 0..n {
-        clone_members(f, members, tag);
-        let nh = @ptr_cast(*mut ir.Block, h.auxp);
-        // the copy's header phis: the inputs along `from`
-        let mut i: usize = 0;
-        let mut q = nh.first;
-        while u.notnil(q) and (q.op == ir.OP_PHI) {
-            q.xs.clear();
-            q.bs.clear();
-            for k in 0..from.len {
-                q.xs.push(ins.get((i * from.len) + k));
-                q.bs.push(from.get(k));
-            }
-            i += 1;
-            q = q.next;
-        }
-        for k in 0..from.len {
-            retarget(from.get(k), cur_h, nh);
-        }
-        // the copy stays in the loop
-        let nt = ir.terminator(nh);
-        nt.op = ir.OP_BR;
-        nt.a = vnil();
-        nt.t1 = @ptr_cast(*mut ir.Block, stay.auxp);
-        nt.t2 = ir.bnil();
-        fold_copy(members);
-        // its other exits: inputs to the phis where they lead
-        if side {
-            for k in 0..members.len {
-                let x = members.get(k);
-                if x == h {
-                    continue;
-                }
-                let t = ir.terminator(x);
-                for j in 0..ir.succ_count(t) {
-                    let s = ir.succ(t, j);
-                    if (s.mark == tag) or ((j > 0) and (ir.succ(t, j - 1) == s)) {
-                        continue;
-                    }
-                    let mut sp = s.first;
-                    while u.notnil(sp) and (sp.op == ir.OP_PHI) {
-                        let cnt = sp.bs.len;
-                        for e in 0..cnt {
-                            if sp.bs.get(e) == x {
-                                ir.add_incoming(
-                                    sp, map_v(ir.resolve(sp.xs.get(e)), tag), @ptr_cast(*mut ir.Block, x.auxp));
-                            }
-                        }
-                        sp = sp.next;
-                    }
-                }
-            }
-        }
-        // the next header is entered along this copy's back edges
-        let mut nins = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
-        q = h.first;
-        while u.notnil(q) and (q.op == ir.OP_PHI) {
-            for k in 0..latches.len {
-                let mut x = vnil();
-                for j in 0..q.bs.len {
-                    if q.bs.get(j) == latches.get(k) {
-                        x = ir.resolve(q.xs.get(j));
-                    }
-                }
-                nins.push(ir.resolve(map_v(x, tag)));
-            }
-            q = q.next;
-        }
-        u.free(@ptr_cast(*mut void, ins.data));
-        ins = nins;
-        from.clear();
-        for k in 0..latches.len {
-            from.push(@ptr_cast(*mut ir.Block, latches.get(k).auxp));
-        }
-        cur_h = nh;
+    let mut copies = n;
+    if factor > 0 {
+        copies = n % factor;
     }
-    // the original header runs last, entered along `from`, and leaves
+    let mut cur_h = h;  // where the edges in `from` lead now
+    for _copy in 0..copies {
+        cur_h = chain_copy(f, h, stay, tag, members, &latches, side, cur_h, &mut from, &mut ins, true, true);
+    }
+    // the original header next, entered along `from`
+    let mut back = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    if factor > 0 {
+        // (its inputs along its own back edges, before they are replaced)
+        latch_inputs(h, &latches, tag, false, &mut back);
+    }
     let mut i: usize = 0;
     p = h.first;
     while u.notnil(p) and (p.op == ir.OP_PHI) {
@@ -612,20 +719,70 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
             p.xs.push(ins.get((i * from.len) + k));
             p.bs.push(from.get(k));
         }
+        if factor > 0 {
+            for k in 0..latches.len {
+                p.xs.push(back.get((i * latches.len) + k));
+                p.bs.push(latches.get(k));
+            }
+        }
         i += 1;
         p = p.next;
     }
     for k in 0..from.len {
         retarget(from.get(k), cur_h, h);
     }
-    ht.op = ir.OP_BR;
-    ht.a = vnil();
-    ht.t1 = exit;
-    ht.t2 = ir.bnil();
+    if factor == 0 {
+        // it runs last, and leaves
+        ht.op = ir.OP_BR;
+        ht.a = vnil();
+        ht.t1 = exit;
+        ht.t2 = ir.bnil();
+    } else {
+        // the loop's body `factor` times: copies entered along the back
+        // edges of the one before, the last going back to the header
+        from.clear();
+        for k in 0..latches.len {
+            from.push(latches.get(k));
+        }
+        u.free(@ptr_cast(*mut void, ins.data));
+        ins = back;
+        back = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        // (the loop's own back edges go to the first copy only once all are
+        // made: the copies are of the loop as it was)
+        cur_h = h;
+        let mut first = ir.bnil();
+        for c in 1..factor {
+            cur_h = chain_copy(f, h, stay, tag, members, &latches, side, cur_h, &mut from, &mut ins, false, c > 1);
+            if c == 1 {
+                first = cur_h;
+            }
+        }
+        p = h.first;
+        i = 0;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            for j in 0..p.bs.len {
+                for k in 0..latches.len {
+                    if p.bs.get(j) == latches.get(k) {
+                        p.xs.set(j, ins.get((i * latches.len) + k));
+                        p.bs.set(j, from.get(k));
+                    }
+                }
+            }
+            i += 1;
+            p = p.next;
+        }
+        for k in 0..from.len {
+            retarget(from.get(k), cur_h, h);
+        }
+        for k in 0..latches.len {
+            retarget(latches.get(k), h, first);
+        }
+        partial_done.push(h);
+    }
+    u.free(@ptr_cast(*mut void, back.data));
     u.free(@ptr_cast(*mut void, ins.data));
     u.free(@ptr_cast(*mut void, from.data));
     u.free(@ptr_cast(*mut void, latches.data));
-    _ = nphi;
     // the rest of the original loop is unreachable now
     ir.remove_unreachable(f);
     ir.apply_forwarding(f);
@@ -1077,11 +1234,16 @@ pub fn onehot_stores(f: *mut ir.Func) bool {
         found = false;
         rounds += 1;
         opt.compute_preds(f);
-        b = f.first;
-        while u.notnil(b) and not found {
-            found = try_onehot(f, b, &mut arms);
-            b = b.next;
+        // in reverse postorder: a chain's first test before the rest (a
+        // chain merged from its middle would leave the tests before it)
+        let order = opt.rpo(f);
+        for k in 0..order.len {
+            if try_onehot(f, order.get(k), &mut arms) {
+                found = true;
+                break;
+            }
         }
+        u.free(@ptr_cast(*mut void, order.data));
         did = did or found;
     }
     u.free(@ptr_cast(*mut void, arms.data));
