@@ -31,13 +31,14 @@ mkdir -p $B
 if [ "$(uname -s)" = Darwin ]; then
     # The C compiler does not build native Mac programs (issues/0013), but it
     # builds WebAssembly: stage 1 is the self-hosted compiler for wasm32,
-    # run under node, building itself for the Mac.
+    # run under node, building itself for the Mac (by name: under node it
+    # cannot tell that it is on one).
     echo "stage 1: compiler/build/axiom -> $B/axiom1.wasm (node) -> $B/axiom1"
     start=$(date +%s)
     # shellcheck disable=SC2086
     compiler/build/axiom build selfhost/src/main.ax --target=wasm32 $OPT -o $B/axiom1.wasm
     # shellcheck disable=SC2086
-    node runtime/host.mjs $B/axiom1.wasm -- build selfhost/src/main.ax --target=native $OPT -o $B/axiom1
+    node runtime/host.mjs $B/axiom1.wasm -- build selfhost/src/main.ax --target=aarch64-macos $OPT -o $B/axiom1
     echo "         $(($(date +%s) - start)) s, $(wc -c < "$B/axiom1") bytes"
 else
     stage compiler/build/axiom $B/axiom1 1
