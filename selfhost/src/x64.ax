@@ -6995,6 +6995,7 @@ fn compile_func(f: *mut ir.Func) void {
     PRE_RA = true;
     for bi in 0..MF.blocks.len {
         reuse_flags(MF.blocks.get(bi));
+        reuse_k1(MF.blocks.get(bi));
     }
     PRE_RA = false;
     mc.dce(MF, pure_inst);
@@ -8040,6 +8041,80 @@ fn reuse_flags(b: *mut mc.MBlock) void {
     }
 }
 
+// Likewise a compare into k1 that an identical earlier one in the block
+// makes redundant: nothing between writes k1 or the compared registers
+// (k1 is the only mask register the selection uses, so two masks used by
+// turns are compared again; this drops the repeats that are not).
+fn reuse_k1(b: *mut mc.MBlock) void {
+    let mut last = u.nil.[mc.MInst]();
+    let mut i = b.first;
+    while u.notnil(i) {
+        let nx = i.next;
+        let wk = writes_k1(i);
+        if wk and (i.op == xe.SSE) and ((i.aux & 1) == 0) and plain_ops(i) {
+            if u.notnil(last) and (last.cc == i.cc) and (last.sz == i.sz) and (last.aux == i.aux) and
+               (last.ops.len == i.ops.len) and same_ops(last, i) {
+                mc.remove(b, i);
+            } else {
+                last = i;
+            }
+        } else if wk or (i.op == xe.CALL) or (i.op == xe.LABEL) {
+            last = u.nil.[mc.MInst]();
+        } else if u.notnil(last) and writes_reg_of_any(i, last) {
+            last = u.nil.[mc.MInst]();
+        }
+        i = nx;
+    }
+}
+
+fn writes_k1(i: *mc.MInst) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) and (P(o.reg) == xe.K1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Only registers, immediates and nothing as operands (no memory)?
+fn plain_ops(i: *mc.MInst) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind != mc.K_REG) and (o.kind != mc.K_IMM) and (o.kind != mc.K_NONE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn same_ops(a: *mc.MInst, b: *mc.MInst) bool {
+    for k in 0..a.ops.len {
+        let x = a.ops[k];
+        let y = b.ops[k];
+        if (x.kind != y.kind) or ((x.kind != mc.K_NONE) and not same_mop(x, y)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Does i write a register that c reads?
+fn writes_reg_of_any(i: *mc.MInst, c: *mc.MInst) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) {
+            let r = P(o.reg);
+            for j in 0..c.ops.len {
+                if (c.ops[j].kind == mc.K_REG) and ((c.ops[j].role & mc.RU) != 0) and (P(c.ops[j].reg) == r) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 fn same_mop(a: mc.MOp, b: mc.MOp) bool {
     if a.kind != b.kind {
         return false;
@@ -8174,6 +8249,7 @@ fn tidy_branches() []mut bool {
         }
         drop_local_jumps(MF.blocks.get(bi));
         reuse_flags(MF.blocks.get(bi));
+        reuse_k1(MF.blocks.get(bi));
         peephole(MF.blocks.get(bi));
         let b = MF.blocks.get(bi);
         let l = b.last;
