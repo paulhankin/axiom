@@ -97,12 +97,17 @@ pub struct Target {
     // spill code: load/store of register r (class c) from/to a slot
     spill_load: fn(*mut MFunc, i32, i32, i32) *mut MInst,
     spill_store: fn(*mut MFunc, i32, i32, i32) *mut MInst,
+    // a rematerialized value read from memory instead (see set_remat):
+    // makes instruction i read vreg r's value straight from where its
+    // definition `def` loads it, if it can
+    fold_remat: fn(*mut MFunc, *mut MInst, i32, *MInst) bool,
 }
 
 pub struct MFunc {
     blocks: u.List.[*mut MBlock],
     vclass: u.List.[u8],  // class of each virtual register (index: vreg - VREG0)
     nospill: u.List.[bool],
+    remat: u.List.[*mut MInst],  // the definition of a vreg rematerialized when spilled (nil: none)
     hint: u.List.[i32],
     slots: u.List.[Slot],
     assign: []mut i32,  // after allocation: vreg - VREG0 -> physical register
@@ -118,8 +123,38 @@ pub fn new_func() *mut MFunc {
 pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
     f.vclass.push(class);
     f.nospill.push(false);
+    f.remat.push(u.nil.[MInst]());
     f.hint.push(-1);
     return VREG0 + @int_cast(i32, f.vclass.len - 1);
+}
+
+// Vreg r is defined once, by instruction def, which reads no register
+// (a constant from memory, or one computed from nothing). When r would be
+// spilled, the definition is repeated (or folded) at each use instead:
+// no stack slot, no stores.
+pub fn set_remat(f: *mut MFunc, r: i32, def: *mut MInst) void {
+    f.remat.set(@int_cast(usize, r - VREG0), def);
+}
+
+pub fn remat_def(f: *MFunc, r: i32) *mut MInst {
+    if not is_vreg(r) {
+        return u.nil.[MInst]();
+    }
+    return f.remat.get(@int_cast(usize, r - VREG0));
+}
+
+// A copy of definition `def` writing nr instead of r.
+pub fn clone_def(def: *MInst, r: i32, nr: i32) *mut MInst {
+    let c = new_inst(def.op, def.sz, def.ops);
+    c.cc = def.cc;
+    c.aux = def.aux;
+    c.src = def.src;
+    for k in 0..c.ops.len {
+        if (c.ops[k].kind == K_REG) and (c.ops[k].reg == r) {
+            c.ops[k].reg = nr;
+        }
+    }
+    return c;
 }
 
 pub fn nvregs(f: *MFunc) usize {
@@ -896,7 +931,9 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
     let slot = u.newn.[i32](nv + 1);
     for k in 0..nv {
         slot[k] = -1;
-        if iv[k].spilled {
+        if iv[k].spilled and u.notnil(f.remat.get(k)) {
+            slot[k] = -2;  // (rematerialized)
+        } else if iv[k].spilled {
             let c = f.vclass.get(k);
             let mut sz: u64 = 8;
             if c >= 1 {
@@ -904,6 +941,16 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             }
             slot[k] = new_slot(f, sz, sz);
         }
+    }
+    // A rematerialized value read only in the block defining it is built
+    // again at each use; one read elsewhere is built once in each block that
+    // reads it, as a value of its own (which may be rematerialized in turn).
+    let local = u.newn.[bool](nv + 1);
+    let bv = u.newn.[i32](nv + 1);  // the value's copy in block bb[x]
+    let bb = u.newn.[i32](nv + 1);
+    remat_locality(f, slot, local);
+    for k in 0..nv {
+        bb[k] = -1;
     }
     for bi in 0..f.blocks.len {
         let b = f.blocks.get(bi);
@@ -924,7 +971,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                     if (ci > 0) and (o.kind != K_MEM) {
                         continue;
                     }
-                    if not is_vreg(r) or (slot[@int_cast(usize, r - VREG0)] < 0) {
+                    if not is_vreg(r) or (slot[@int_cast(usize, r - VREG0)] == -1) {
                         continue;
                     }
                     let mut seen = false;
@@ -943,6 +990,46 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                 let r = done[j];
                 let x = @int_cast(usize, r - VREG0);
                 let c = f.vclass.get(x);
+                if slot[x] == -2 {
+                    let def = f.remat.get(x);
+                    if i == def {
+                        remove(b, i);
+                        break;
+                    }
+                    if not local[x] {
+                        let mut nr = bv[x];
+                        if bb[x] != @int_cast(i32, bi) {
+                            nr = new_vreg(f, c);
+                            let cd = clone_def(def, r, nr);
+                            insert_before(b, i, cd);
+                            set_remat(f, nr, cd);
+                            bv[x] = nr;
+                            bb[x] = @int_cast(i32, bi);
+                        }
+                        for k in 0..i.ops.len {
+                            if (i.ops[k].kind == K_REG) and (i.ops[k].reg == r) {
+                                i.ops[k].reg = nr;
+                            }
+                        }
+                        continue;
+                    }
+                    if t.fold_remat(f, i, r, def) {
+                        continue;
+                    }
+                    let nr = new_vreg(f, c);
+                    f.nospill.set(@int_cast(usize, nr - VREG0), true);
+                    for k in 0..i.ops.len {
+                        if (i.ops[k].kind == K_REG) and (i.ops[k].reg == r) {
+                            i.ops[k].reg = nr;
+                        }
+                    }
+                    let ld = clone_def(def, r, nr);
+                    ld.spill = 1;
+                    ld.sreg = nr;
+                    ld.sslot = -2 - @int_cast(i32, x);  // (a slot of its own: drop_reloads drops repeats)
+                    insert_before(b, i, ld);
+                    continue;
+                }
                 let nr = new_vreg(f, c);
                 f.nospill.set(@int_cast(usize, nr - VREG0), true);
                 let mut reads = false;
@@ -985,6 +1072,45 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                 }
             }
             i = next;
+        }
+    }
+}
+
+// Which spilled rematerialized values (slot -2) are read only in the block
+// that defines them.
+fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
+    let nv = local.len;
+    let db = u.newn.[i32](nv + 1);
+    for k in 0..nv {
+        local[k] = slot[k] == -2;
+        db[k] = -1;
+    }
+    for bi in 0..f.blocks.len {
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == K_REG) and is_vreg(o.reg) and local[@int_cast(usize, o.reg - VREG0)] and
+                   (f.remat.get(@int_cast(usize, o.reg - VREG0)) == i) {
+                    db[@int_cast(usize, o.reg - VREG0)] = @int_cast(i32, bi);
+                }
+            }
+            i = i.next;
+        }
+    }
+    for bi in 0..f.blocks.len {
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RU) != 0) {
+                    let x = @int_cast(usize, o.reg - VREG0);
+                    if (slot[x] == -2) and (db[x] != @int_cast(i32, bi)) {
+                        local[x] = false;
+                    }
+                }
+            }
+            i = i.next;
         }
     }
 }

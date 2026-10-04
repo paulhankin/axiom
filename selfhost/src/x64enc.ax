@@ -737,6 +737,38 @@ fn build_avx512() void {
     set(KMOVQ_KR, x);
 }
 
+// The element an EVEX embedded broadcast ({1toN}, a memory r/m operand of one
+// element repeated) has for the instruction: 4 or 8 bytes, 0 if it has none.
+pub fn bcast(id: i32) u8 {
+    let d4: [47]i32 = [ADDPS, MULPS, SUBPS, MINPS, DIVPS, MAXPS, SQRTPS, ANDPS, ANDNPS, ORPS, XORPS, CMPPS, PMULLD,
+                       PAND, PANDN, POR, PXOR, PCMPEQD, PCMPGTD, PADDB + 2, PADDB + 6, PMINSB + 1, PMINSB + 3,
+                       PMINSB + 5, PMINSB + 7, PABSD, PSHUFD, SHUFPS, PUNPCKLDQ, VFMADD231PS, VPERMD, VPERMPS, VPERMT2D,
+                       VPERMT2PS, CVTDQ2PS, CVTTPS2DQ, VCVTUDQ2PS, VCVTTPS2UDQ, VPSLLVD, VPSRLVD, VPSRAVD, VPCMPUD,
+                       VPCMPD, VPTERNLOGD, VRNDSCALEPS, VPLZCNTD, VPOPCNTD];
+    let d8: [36]i32 = [ADDPD, MULPD, SUBPD, MINPD, DIVPD, MAXPD, SQRTPD, ANDPD, ANDNPD, ORPD, XORPD, CMPPD, PCMPEQQ,
+                       PCMPGTQ, PADDQ, PSUBQ, PMULUDQ, PUNPCKLQDQ, PUNPCKHQDQ, VFMADD231PD, VPERMQV, VPERMPDV, VPERMT2Q,
+                       VPERMT2PD, VCVTQQ2PD, VCVTUQQ2PD, VCVTTPD2QQ, VCVTTPD2UQQ, VPSLLVQ, VPSRLVQ, VPSRAVQ, VPCMPUQ,
+                       VPCMPQ, VRNDSCALEPD, VPLZCNTQ, VPOPCNTQ];
+    for x in d4 {
+        if x == id {
+            return 4;
+        }
+    }
+    for x in d8 {
+        if x == id {
+            return 8;
+        }
+    }
+    return 0;
+}
+
+// Bit by bit: any lane width reads the same as the element's.
+pub fn bitwise(id: i32) bool {
+    return (id == PAND) or (id == PANDN) or (id == POR) or (id == PXOR) or (id == ANDPS) or (id == ANDNPS) or
+           (id == ORPS) or (id == XORPS) or (id == ANDPD) or (id == ANDNPD) or (id == ORPD) or (id == XORPD) or
+           (id == VPTERNLOGD);
+}
+
 pub fn desc(id: i32) SseDesc {
     if not built {
         build();
@@ -897,8 +929,8 @@ pub fn modrm_mem(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64) void {
 
 // EVEX (AVX-512): 62 P0 P1 P2 opcode ModRM, where an 8-bit displacement
 // counts in units of the vector (16 << vl bytes). vl: 0, 1, 2 for 128, 256
-// and 512 bits. kz: the mask register (aaa, 0: none), plus 8 for zeroing.
-// Registers 0-15 only, no broadcast.
+// and 512 bits. kz: the mask register (aaa, 0: none), plus 8 for zeroing,
+// plus 16 for an embedded broadcast (the memory operand one element).
 fn evex(e: *mut Enc, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm: i64, has_imm: bool, vl: u64,
         kz: u64) void {
     let rmem = rm_reg < 0;
@@ -940,14 +972,22 @@ fn evex(e: *mut Enc, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
     byte(e, 0x62);
     byte(e, (((((~rr) & 1) << 7) | (((~xb) & 1) << 6)) | ((((~bb) & 1) << 5) | (((~r4) & 1) << 4))) | @as(u64, x.map));
     byte(e, (((w << 7) | (v << 3)) | 4) | pp);
-    byte(e, ((((kz >> 3) & 1) << 7) | ((vl << 5) | (((~v4) & 1) << 3))) | (kz & 7));  // z, L'L, b 0, V', aaa
+    let bc = (kz >> 4) & 1;
+    byte(e, ((((kz >> 3) & 1) << 7) | ((vl << 5) | ((bc << 4) | (((~v4) & 1) << 3)))) | (kz & 7));  // z, L'L, b, V', aaa
     byte(e, @as(u64, x.opc));
     let mut imm_len: i64 = 0;
     if has_imm {
         imm_len = 1;
     }
     if rmem {
-        modrm_mem_n(e, regf, m, imm_len, @bit_cast(i64, @as(u64, 16) << vl));
+        let mut n = @bit_cast(i64, @as(u64, 16) << vl);
+        if bc != 0 {
+            n = 4;
+            if w != 0 {
+                n = 8;
+            }
+        }
+        modrm_mem_n(e, regf, m, imm_len, n);
     } else {
         modrm_rr(e, regf, gpr(rm_reg));
     }

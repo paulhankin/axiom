@@ -279,6 +279,7 @@ fn new_label() i32 {
 
 fn place(l: i32) void {
     addr_regs.clear();
+    ccache.clear();  // (reached by jumps: what the block built so far may not have been)
     let i = e0(xe.LABEL, 0);
     i.aux = @as(i64, l);
 }
@@ -402,9 +403,6 @@ fn vreg(v: *mut ir.Value) i32 {
 // A register holding v (materializing constants and addresses here).
 fn reg(v: *mut ir.Value) i32 {
     let k = v.kind;
-    if remat(v) {
-        return remat_reg(v);
-    }
     if (k == ir.V_INST) and ((v.op == ir.OP_ALLOCA) or ((v.flag & 1) != 0)) {
         // folded into memory operands where it is used; recomputed here
         let r = vgpr();
@@ -461,51 +459,30 @@ fn reg(v: *mut ir.Value) i32 {
         _ = e2(xe.LEA, 8, W(r), mc.mem_sym(func_sym(f), 0));
         return r;
     }
-    if (t.kind == ir.T_VEC) and (t.size > 16) {
+    if (t.kind == ir.T_VEC) or (class_of(t) == XMM) {
         let outer_vl = VL;
-        VL = vl_of(t);
-        let r = vxmm();
+        VL = vl_of(t);  // (a constant as wide as its type, whatever the instruction using it)
+        let mut r: i32 = 0;
         if ir.is_zero(v) or (k == ir.V_UNDEF) {
-            vzero(r);
+            r = const_zero();
         } else {
             let mut b = bn.new_bytes();
             const_le(v, &mut b, 0);
-            while b.len() < @as(usize, VL) {
+            let mut n = @as(usize, VL);
+            if n == 0 {
+                n = 16;
+            }
+            while b.len() < n {
                 b.u8_(0);
             }
-            _ = sse2(xe.MOVDQU_LD, W(r), const_bytes(&b, @as(usize, VL)));
+            if t.kind == ir.T_VEC {
+                r = const_vreg(xe.MOVDQU_LD, const_bytes(&b, n), 0, 0);
+            } else if t.bits == 32 {
+                r = const_vreg(xe.MOVSS_LD, const16(b.get_u64(0), 0), 0, 0);
+            } else {
+                r = const_vreg(xe.MOVSD_LD, const16(b.get_u64(0), 0), 0, 0);
+            }
             b.free();
-        }
-        VL = outer_vl;
-        return r;
-    }
-    if class_of(t) == XMM {
-        let outer_vl = VL;
-        VL = 0;  // (a 128-bit constant, whatever the instruction using it)
-        let r = vxmm();
-        if ir.is_zero(v) or (k == ir.V_UNDEF) {
-            vzero(r);
-            VL = outer_vl;
-            return r;
-        }
-        let mut b = bn.new_bytes();
-        const_le(v, &mut b, 0);
-        while b.len() < 16 {
-            b.u8_(0);
-        }
-        let lo = b.get_u64(0);
-        let mut hi: u64 = 0;
-        if b.len() >= 16 {
-            hi = b.get_u64(8);
-        }
-        b.free();
-        let m = const16(lo, hi);
-        if t.kind == ir.T_VEC {
-            _ = sse2(xe.MOVDQU_LD, W(r), m);
-        } else if t.bits == 32 {
-            _ = sse2(xe.MOVSS_LD, W(r), m);
-        } else {
-            _ = sse2(xe.MOVSD_LD, W(r), m);
         }
         VL = outer_vl;
         return r;
@@ -598,56 +575,219 @@ fn remat(v: *ir.Value) bool {
     return (p.kind == ir.V_GLOBAL) and p.gv.is_const and not p.gv.tls and not extern_global(p.gv);
 }
 
-fn remat_reg(v: *mut ir.Value) i32 {
-    let outer_vl = VL;
-    VL = vl_of(v.ty);
-    let r = vxmm();
-    _ = sse2(xe.MOVDQU_LD, W(r), remat_mem(v));
-    VL = outer_vl;
+// Rematerialized values (mc.set_remat): what each one is, for the
+// instructions that read it from memory instead of a register.
+struct Remat {
+    full: mc.MOp,  // the value in memory (K_NONE: built without memory, or a splat's lane)
+    lane: u64,     // a splat: its lane's bits
+    lb: u8,        // and the lane's bytes (0: not a splat)
+    bytes: u8,     // the value's bytes (16, 32, 64; 4 or 8 for a float scalar)
+}
+
+let mut rinfo: u.List.[Remat] = u.List.[Remat].{ data: @ptr_from_int(*mut Remat, 0), len: 0, cap: 0 };
+
+// Constants built in the current block, up to a local label: (sym, op,
+// width, vreg), reused while their definition is on every path.
+struct CEnt {
+    sym: i32,
+    disp: i64,
+    op: i32,
+    sz: u8,
+    r: i32,
+}
+
+let mut ccache: u.List.[CEnt] = u.List.[CEnt].{ data: @ptr_from_int(*mut CEnt, 0), len: 0, cap: 0 };
+
+// (The definition's aux holds the entry's index + 1 above bit 32, and so do
+// the copies the allocator makes of it.)
+fn note_remat(r: i32, def: *mut mc.MInst, full: mc.MOp, lane: u64, lb: u8, bytes: u8) void {
+    mc.set_remat(MF, r, def);
+    rinfo.push(Remat.{ full: full, lane: lane, lb: lb, bytes: bytes });
+    def.aux = def.aux | (@as(i64, @int_cast(i64, rinfo.len)) << 32);
+}
+
+fn vbytes_now() u8 {
+    if VL == 0 {
+        return 16;
+    }
+    return VL;
+}
+
+fn const_cached(sym: i32, disp: i64, op: i32) i32 {
+    for k in 0..ccache.len {
+        let c = ccache.get(k);
+        if (c.sym == sym) and (c.disp == disp) and (c.op == op) and (c.sz == VL) {
+            return c.r;
+        }
+    }
+    return -1;
+}
+
+// A register holding the constant at m (loaded by op, at the current width).
+fn const_vreg(op: i32, m: mc.MOp, lane: u64, lb: u8) i32 {
+    let c = const_cached(m.sym, m.disp, op);
+    if c >= 0 {
+        return c;
+    }
+    return const_into(vxmm(), op, m, lane, lb);
+}
+
+fn const_into(r: i32, op: i32, m: mc.MOp, lane: u64, lb: u8) i32 {
+    let i = sse2(op, W(r), m);
+    let mut full = m;
+    let mut bytes = vbytes_now();
+    if (op == xe.MOVSS_LD) or (op == xe.MOVSD_LD) {
+        bytes = pick8(op == xe.MOVSS_LD, 4, 8);
+    }
+    if lb != 0 {
+        full = NONE();
+    }
+    note_remat(r, i, full, lane, lb, bytes);
+    ccache.push(CEnt.{ sym: m.sym, disp: m.disp, op: op, sz: VL, r: r });
     return r;
 }
 
-// Where a rematerialized vector is in memory: the constant pool, or its
-// global.
-fn remat_mem(v: *mut ir.Value) mc.MOp {
-    if v.op == ir.OP_LOAD {
-        return addr(v.a);
+fn pick8(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
     }
-    let outer_vl = VL;
-    VL = vl_of(v.ty);
+    return b;
+}
+
+// Zero, or all ones, at the current width: built without memory.
+fn const_zero() i32 {
+    let c = const_cached(-1, 0, xe.PXOR);
+    if c >= 0 {
+        return c;
+    }
+    return zero_into(vxmm());
+}
+
+fn zero_into(r: i32) i32 {
+    vzero(r);
+    note_remat(r, CB.last, NONE(), 0, 0, vbytes_now());
+    ccache.push(CEnt.{ sym: -1, disp: 0, op: xe.PXOR, sz: VL, r: r });
+    return r;
+}
+
+fn const_ones() i32 {
+    let c = const_cached(-1, 0, xe.PCMPEQD);
+    if c >= 0 {
+        return c;
+    }
+    return ones_into(vxmm());
+}
+
+fn ones_into(r: i32) i32 {
+    if VL == 64 {
+        let i = e4(xe.SSE, 64, W(r), mc.reg(r, 0), mc.reg(r, 0), I(0xff));
+        i.cc = xe.VPTERNLOGD;
+        note_remat(r, i, NONE(), 0, 0, 64);
+    } else {
+        let i = e4(xe.SSE, 0, W(r), mc.reg(r, 0), NONE(), NONE());
+        if AVX {
+            i.ops[2] = mc.reg(r, 0);
+        }
+        i.cc = xe.PCMPEQD;
+        note_remat(r, vlz(i), NONE(), 0, 0, vbytes_now());
+    }
+    ccache.push(CEnt.{ sym: -1, disp: 0, op: xe.PCMPEQD, sz: VL, r: r });
+    return r;
+}
+
+// A constant of n (4 or 8) bytes in the pool.
+fn const_small(x: u64, n: usize) mc.MOp {
+    let key = u.intern(u.f2("%s:%s", u.hex16(x), u.udec(@as(u64, n))));
+    let found = consts.get(key);
+    if found != 0 {
+        return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
+    }
+    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    s.data.align(n);
+    let off = @as(u64, s.data.len());
+    if n == 4 {
+        s.data.u32_(x & 0xffff_ffff);
+    } else {
+        s.data.u64_(x);
+    }
+    if @as(u64, n) > s.align {
+        s.align = @as(u64, n);
+    }
+    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: @as(u64, n), bind: elf.B_LOCAL,
+                                         ty: elf.T_OBJECT, hidden: false });
+    consts.put(key, sym + 1);
+    return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
+}
+
+// lane (of lb bytes) repeated to n bytes, as a pool constant.
+fn splat_const(lane: u64, lb: u8, n: usize) mc.MOp {
     let mut b = bn.new_bytes();
-    let n = @as(usize, @bit_cast(u32, v.ty.lanes));
-    let lb = @truncate(usize, v.ty.elem.size);
-    let mut one = bn.new_bytes();
-    const_le(v.a, &mut one, 0);
-    let lane = one.view();
-    for _k in 0..n {
-        for j in 0..lb {
-            b.u8_(lane[j]);
+    while b.len() < n {
+        for j in @as(usize, 0)..@as(usize, lb) {
+            b.u8_(@truncate(u8, lane >> @int_cast(u32, j * 8)));
         }
     }
-    one.free();
-    let mut n_bytes = @as(usize, VL);
-    if n_bytes == 0 {
-        n_bytes = 16;
-    }
-    while b.len() < n_bytes {
-        b.u8_(0);
-    }
-    let m = const_bytes(&b, n_bytes);
+    let m = const_bytes(&b, n);
     b.free();
-    VL = outer_vl;
     return m;
 }
 
+// A rematerialized value (remat), at its definition: a register built
+// from memory, which the allocator builds again where it would spill it.
+fn gen_remat(v: *mut ir.Value) void {
+    if v.op == ir.OP_LOAD {
+        let d = vreg(v);
+        let m = addr(v.a);
+        let i = sse2(xe.MOVDQU_LD, W(d), m);
+        note_remat(d, i, m, 0, 0, vbytes_now());
+        return;
+    }
+    let lb = @truncate(u8, v.ty.elem.size);
+    let mut one = bn.new_bytes();
+    const_le(v.a, &mut one, 0);
+    let lv = one.view();
+    let mut lane: u64 = 0;
+    for j in @as(usize, 0)..@as(usize, lb) {
+        lane = lane | (@as(u64, lv[j]) << @int_cast(u32, j * 8));
+    }
+    one.free();
+    let mut op = xe.MOVDQU_LD;
+    let mut m = NONE();
+    if lane == 0 {
+        op = xe.PXOR;
+    } else if ((lb < 8) and (lane == ((@as(u64, 1) << @int_cast(u32, lb * 8)) - 1))) or
+              (lane == 0xffff_ffff_ffff_ffff) {
+        op = xe.PCMPEQD;
+    } else if ((lb == 4) or (lb == 8)) and tg.has(tg.X_AVX2) {
+        op = pki(lb == 4, xe.VPBROADCASTD, xe.VPBROADCASTQ);
+        m = const_small(lane, @as(usize, lb));
+    } else {
+        m = splat_const(lane, lb, @as(usize, vbytes_now()));
+    }
+    let c = const_cached(m.sym, m.disp, op);
+    if (c >= 0) and (v.loc < 0) {
+        v.loc = c;  // (the same constant built earlier in the block)
+        return;
+    }
+    if c >= 0 {
+        copy(v.loc, c, vclass());
+        return;
+    }
+    let d = vreg(v);
+    if op == xe.PXOR {
+        _ = zero_into(d);
+    } else if op == xe.PCMPEQD {
+        _ = ones_into(d);
+    } else {
+        _ = const_into(d, op, m, lane, lb);
+    }
+}
+
 // The second source of a vector instruction (its r/m operand): memory for
-// a rematerialized vector or a load folded into its only user (flag 8,
-// with VEX or EVEX, which take unaligned memory), else a register.
+// a load folded into its only user (flag 8, with VEX or EVEX, which take
+// unaligned memory), else a register (constants: fold_remats).
 fn vsrc(x: *mut ir.Value) mc.MOp {
-    if AVX and (x.ty.kind == ir.T_VEC) and (remat(x) or (is_inst(x, ir.OP_LOAD) and ((x.flag & 8) != 0))) {
-        if remat(x) {
-            return remat_mem(x);
-        }
+    if AVX and (x.ty.kind == ir.T_VEC) and is_inst(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
         return addr(x.a);
     }
     return R(reg(x));
@@ -3185,8 +3325,7 @@ fn vec_icmp(v: *mut ir.Value) void {
     if VL == 64 {
         // AVX-512: any predicate into a mask register, expanded to lanes
         cmp_to_k1(v);
-        let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
-        m.cc = xe.VPMOVM2B + lk(t);
+        expand_k1(d, lk(t));
         return;
     }
     let mut a = reg(v.a);
@@ -3262,8 +3401,7 @@ fn vcmp(id: i32, d: i32, a: i32, b: mc.MOp, k: i32) void {
     if VL == 64 {
         let c = e4(xe.SSE, 64, W(xe.K1), b, R(a), NONE());
         c.cc = id;
-        let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
-        m.cc = xe.VPMOVM2B + k;
+        expand_k1(d, k);
         return;
     }
     sse3(id, d, a, b);
@@ -3273,11 +3411,21 @@ fn vcmp_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64, k: i32) void {
     if VL == 64 {
         let c = e4(xe.SSE, 64, W(xe.K1), b, R(a), I(x));
         c.cc = id;
-        let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
-        m.cc = xe.VPMOVM2B + k;
+        expand_k1(d, k);
         return;
     }
     sse3_i(id, d, a, b, x);
+}
+
+// d <- k1 expanded into lanes (k: 0..3 for 8- to 64-bit lanes). vpmovm2*
+// waits for d's previous value (a false dependency, on Sapphire Rapids at
+// least), which in a loop chains each iteration to the last: d is zeroed
+// first, an idiom the processor does without waiting or executing.
+fn expand_k1(d: i32, k: i32) void {
+    let z = e4(xe.SSE, 64, W(d), mc.reg(d, 0), mc.reg(d, 0), NONE());
+    z.cc = xe.PXOR;
+    let m = e4(xe.SSE, 64, W(d), R(xe.K1), NONE(), NONE());
+    m.cc = xe.VPMOVM2B + k;
 }
 
 // Lanes through a 16-byte stack slot.
@@ -4490,13 +4638,32 @@ fn gen_inst_at(v: *mut ir.Value) void {
     let o = v.op;
     let t = v.ty;
     if remat(v) {
-        return;  // (at its uses)
+        gen_remat(v);
+        return;
     }
     if (v.flag & (16 | 32)) != 0 {
         return;  // (part of its user: a blend, or a compare into a mask register)
     }
     if (v.flag & 64) != 0 {
         gen_blend(v);
+        return;
+    }
+    if ((o == ir.OP_COPY) or (o == ir.OP_BITCAST)) and (class_of(t) != GPR) and (class_of(t) == class_of(v.a.ty)) {
+        let sr = reg(v.a);
+        let def = mc.remat_def(MF, sr);
+        if u.notnil(def) and (v.loc < 0) {
+            v.loc = sr;  // a copy of a constant: the constant's register
+            return;
+        }
+        if u.notnil(def) {
+            // (its register is taken already: the constant built again)
+            let d = vreg(v);
+            let c = mc.clone_def(def, sr, d);
+            mc.append(CB, c);
+            mc.set_remat(MF, d, c);
+            return;
+        }
+        copy(vreg(v), sr, class_of(t));
         return;
     }
     if o == ir.OP_COPY {
@@ -5159,6 +5326,156 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     return i;
 }
 
+// Constants read once, in the block that builds them, are read from
+// memory instead (as an instruction's r/m operand); unread ones go.
+fn fold_remats() void {
+    let nv = mc.nvregs(MF);
+    let nread = u.newn.[i32](nv + 1);
+    let user = u.newn.[*mut mc.MInst](nv + 1);
+    let ublk = u.newn.[i32](nv + 1);
+    let dblk = u.newn.[i32](nv + 1);
+    for k in 0..nv {
+        nread[k] = 0;
+        ublk[k] = -1;
+        dblk[k] = -1;
+    }
+    for bi in 0..MF.blocks.len {
+        let b = MF.blocks.get(bi);
+        let mut i = b.first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                let mut rs: [3]i32 = [-1, -1, -1];
+                if (o.kind == mc.K_REG) and ((o.role & mc.RU) != 0) {
+                    rs[0] = o.reg;
+                } else if (o.kind == mc.K_REG) and ((o.role & mc.RD) != 0) and mc.is_vreg(o.reg) {
+                    let x = @int_cast(usize, o.reg - mc.VREG0);
+                    if MF.remat.get(x) == i {
+                        dblk[x] = @int_cast(i32, bi);
+                    }
+                } else if o.kind == mc.K_MEM {
+                    rs[1] = o.base;
+                    rs[2] = o.index;
+                }
+                for r in rs {
+                    if mc.is_vreg(r) {
+                        let x = @int_cast(usize, r - mc.VREG0);
+                        if user[x] != i {
+                            nread[x] += 1;
+                        }
+                        user[x] = i;
+                        ublk[x] = @int_cast(i32, bi);
+                    }
+                }
+            }
+            i = i.next;
+        }
+    }
+    for k in 0..nv {
+        let def = MF.remat.get(k);
+        if u.isnil(def) or (dblk[k] < 0) {
+            continue;
+        }
+        let r = @int_cast(i32, k) + mc.VREG0;
+        let b = MF.blocks.get(@int_cast(usize, dblk[k]));
+        if nread[k] == 0 {
+            mc.remove(b, def);
+            MF.remat.set(k, u.nil.[mc.MInst]());
+        } else if (nread[k] == 1) and (ublk[k] == dblk[k]) and fold_remat(MF, user[k], r, def) {
+            mc.remove(b, def);
+            MF.remat.set(k, u.nil.[mc.MInst]());
+        }
+    }
+}
+
+// Can instruction i read vreg r, the value its definition def builds, from
+// memory? Then it does (mc.Target.fold_remat): the r/m operand becomes the
+// constant (a broadcast element with EVEX where the instruction has one),
+// or a copy of r becomes a copy of def.
+fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
+    if (i.op != xe.SSE) or (i.ops.len < 4) {
+        return false;
+    }
+    let ri = @bit_cast(u64, def.aux) >> 32;
+    if (ri == 0) or (ri > @as(u64, rinfo.len)) {
+        return false;
+    }
+    let info = rinfo.get(@truncate(usize, ri - 1));
+    let x = @int_cast(usize, r - mc.VREG0);
+    if (i.cc == xe.MOVAPS) and (i.ops[0].kind == mc.K_REG) and (i.ops[1].kind == mc.K_REG) and (i.ops[1].reg == r) and
+       (i.ops[0].reg != r) and (i.ops[0].role == mc.RD) and (class_bytes(f.vclass.get(x)) == i.sz) {
+        // a copy: the definition itself, into the copy's register
+        let d = i.ops[0].reg;
+        i.cc = def.cc;
+        i.sz = def.sz;
+        i.aux = def.aux & 0xffff_ffff;
+        i.is_move = false;
+        for k in @as(usize, 1)..4 {
+            i.ops[k] = def.ops[k];
+            if (i.ops[k].kind == mc.K_REG) and (i.ops[k].reg == r) {
+                i.ops[k].reg = d;
+            }
+        }
+        return true;
+    }
+    if not AVX or (i.ops[1].kind != mc.K_REG) or (i.ops[1].reg != r) or (i.ops[1].role != mc.RU) {
+        return false;
+    }
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (k != 1) and (o.kind == mc.K_REG) and (o.reg == r) {
+            return false;
+        }
+    }
+    let id = i.cc;
+    let d = xe.desc(id);
+    if d.gpr_rm or d.legacy or (d.digit >= 0) or not rm_mem_ok(id) {
+        return false;
+    }
+    if (info.lb != 0) and (i.sz == 64) {
+        let eb = xe.bcast(id);
+        if (eb != 0) and ((eb == info.lb) or ((info.lb < eb) and xe.bitwise(id))) {
+            // EVEX embedded broadcast: one element, repeated
+            let mut e = info.lane;
+            let mut w = info.lb;
+            while w < eb {
+                e = e | (e << @int_cast(u32, w * 8));
+                w = w * 2;
+            }
+            i.ops[1] = const_small(e, @as(usize, eb));
+            i.aux = i.aux | 16;
+            return true;
+        }
+    }
+    if info.lb != 0 {
+        i.ops[1] = splat_const(info.lane, info.lb, @as(usize, info.bytes));
+        return true;
+    }
+    if info.full.kind != mc.K_MEM {
+        return false;
+    }
+    i.ops[1] = info.full;
+    return true;
+}
+
+// Instructions whose r/m operand may be memory with the meaning a register
+// there has (unaligned, any width up to the register's).
+fn rm_mem_ok(id: i32) bool {
+    if (id == xe.MOVAPS) or (id == xe.MOVSS_LD) or (id == xe.MOVSD_LD) or (id == xe.MOVQ_XM) or (id == xe.MOVD_XM) {
+        return false;  // (aligned, or different with memory)
+    }
+    if (id >= xe.VPMOVM2B) and (id <= xe.KMOVQ_RK) {
+        return false;  // (mask registers)
+    }
+    if (id == xe.PMOVMSKB) or (id == xe.MOVMSKPS) or (id == xe.MOVMSKPD) or (id == xe.KMOVQ_KR) {
+        return false;
+    }
+    if (id >= xe.VMOVDQU8_LD) and (id <= xe.VMOVDQU8_ST + 3) {
+        return false;
+    }
+    return true;
+}
+
 fn mk2(a: mc.MOp, b: mc.MOp) [2]mc.MOp {
     return [a, b];
 }
@@ -5200,6 +5517,8 @@ fn pure_inst(i: *mc.MInst) bool {
 fn compile_func(f: *mut ir.Func) void {
     F = f;
     nlocal = 0;
+    rinfo.clear();
+    ccache.clear();
     out_area = 0;
     opt.split_critical_edges(f);
     lower.scalarize(f, legal);
@@ -5276,6 +5595,7 @@ fn compile_func(f: *mut ir.Func) void {
         CB = MF.blocks.get(bi);
         addr_regs.clear();
         addr_block = CB;
+        ccache.clear();
         let mut i = ib.first;
         while u.notnil(i) {
             if i.src != 0 {
@@ -5320,8 +5640,10 @@ fn compile_func(f: *mut ir.Func) void {
         }
     }
     let tgt = mc.Target.{ nclasses: 4, alloc_order: [gorder, xmm_order[..], wide_order, zorder],
-                          caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store };
+                          caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store,
+                          fold_remat: fold_remat };
     mc.dce(MF, pure_inst);
+    fold_remats();
     mc.allocate(MF, &tgt);
     mc.drop_reloads(MF, is_label);
     encode_func(f);
@@ -5750,7 +6072,7 @@ fn enc_sse(i: *mut mc.MInst) void {
         xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 15);
     } else {
         let mut m = to_mem(o1);
-        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 15);
+        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 31);
     }
     _ = d;
 }
