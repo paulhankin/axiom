@@ -907,8 +907,9 @@ static LLVMValueRef alloca_in_entry(LLVMTypeRef t, const char *name) {
     return a;
 }
 
+// A temporary only the expression that makes it can reach (see in_mem).
 static LLVMValueRef temp_alloca(Type *t) {
-    LLVMValueRef a = alloca_in_entry(lty(t), "tmp");
+    LLVMValueRef a = alloca_in_entry(lty(t), "agg.tmp");
     LLVMSetAlignment(a, (unsigned)type_align(t));
     return a;
 }
@@ -922,49 +923,109 @@ static LLVMValueRef from_mem(Type *t, LLVMValueRef v) {
     return v;
 }
 
+// Aggregates larger than two registers are never SSA values (issue 0040):
+// LLVM's instruction selection takes a load, store or insertvalue chain of
+// one apart into a node per scalar, and its combiner is quadratic in them
+// (a 20k-line program took minutes at -O2). Such a value is instead the
+// address of memory holding it (or an LLVM constant): copied with
+// memcpy/memmove, built in place by GEPs and stores, and passed and returned
+// by pointer (by_ptr) or loaded only at a call boundary. An address may be
+// that of a place (a local, a field, ...): it is read at once, and copied
+// where it must outlive the evaluation of other code (call arguments, return
+// values). Temporaries (temp_alloca) are named "agg.tmp" (no Axiom name has
+// a dot): only the expression that made one can reach it.
+static bool in_mem(Type *t) { return ty_is_aggregate(t) && type_size(t) > 16; }
+static bool is_addr(Type *t, LLVMValueRef v) { return v && in_mem(t) && LLVMTypeOf(v) == T_ptr; }
+
+static bool is_fresh(LLVMValueRef v) {
+    if (!LLVMIsAAllocaInst(v)) return false;
+    size_t n;
+    const char *name = LLVMGetValueName2(v, &n);
+    return n >= 7 && !strncmp(name, "agg.tmp", 7);
+}
+
+static unsigned known_align(LLVMValueRef p) {
+    if (LLVMIsAAllocaInst(p) || LLVMIsAGlobalVariable(p)) return LLVMGetAlignment(p);
+    return 1;
+}
+
+// A read-only global holding a constant aggregate.
+static LLVMValueRef const_global(LLVMValueRef v) {
+    LLVMValueRef g = LLVMAddGlobal(mod, LLVMTypeOf(v), "aggregate.const");
+    LLVMSetInitializer(g, v);
+    LLVMSetGlobalConstant(g, true);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr);
+    LLVMSetAlignment(g, LLVMABIAlignmentOfType(TD, LLVMTypeOf(v)));
+    return g;
+}
+
 // align: 0 = natural (known-aligned storage), 1 = unknown (through pointers)
+// An in-memory aggregate "loads" as its address.
 static LLVMValueRef load(Type *t, LLVMValueRef p, bool unaligned) {
+    if (in_mem(t)) return p;
     LLVMValueRef v = LLVMBuildLoad2(B, lty(t), p, "");
     if (unaligned) LLVMSetAlignment(v, 1);
     return from_mem(t, v);
 }
-// Aggregates are first-class values here, but LLVM's instruction selection
-// takes a large one apart element by element (and fails on very large ones):
-// zero it with memset, and copy a constant one (from a global) or one just
-// loaded from memory with memmove.
-#define BIG_AGGREGATE 256
 
 static void store(Type *t, LLVMValueRef v, LLVMValueRef p, bool unaligned) {
-    if (ty_is_aggregate(t) && type_size(t) > BIG_AGGREGATE) {
+    if (in_mem(t)) {
         LLVMValueRef size = usz(type_size(t));
+        unsigned da = unaligned ? 1 : (unsigned)type_align(t);
+        if (is_addr(t, v)) {
+            if (v == p) return;
+            // a temporary cannot overlap the destination; a place can
+            if (is_fresh(v)) LLVMBuildMemCpy(B, p, da, v, known_align(v), size);
+            else LLVMBuildMemMove(B, p, da, v, known_align(v), size);
+            return;
+        }
+        if (LLVMIsUndef(v)) return;  // (a diverging expression's placeholder)
         if (LLVMIsConstant(v) && LLVMIsNull(v)) {
-            LLVMBuildMemSet(B, p, LLVMConstInt(T_i8, 0, false), size, 1);
+            LLVMBuildMemSet(B, p, LLVMConstInt(T_i8, 0, false), size, da);
             return;
         }
         if (LLVMIsConstant(v)) {
-            LLVMValueRef g = LLVMAddGlobal(mod, LLVMTypeOf(v), "aggregate.const");
-            LLVMSetInitializer(g, v);
-            LLVMSetGlobalConstant(g, true);
-            LLVMSetLinkage(g, LLVMPrivateLinkage);
-            LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr);
-            LLVMBuildMemMove(B, p, 1, g, 1, size);
+            LLVMValueRef g = const_global(v);
+            LLVMBuildMemCpy(B, p, da, g, known_align(g), size);
             return;
         }
-        if (LLVMIsALoadInst(v) && !LLVMGetFirstUse(v)) {
-            LLVMValueRef src = LLVMGetOperand(v, 0);
-            LLVMInstructionEraseFromParent(v);
-            LLVMBuildMemMove(B, p, 1, src, 1, size);
-            return;
-        }
+        // an SSA value: the result of a call returning one in registers
     }
     LLVMValueRef s = LLVMBuildStore(B, to_mem(t, v), p);
     if (unaligned) LLVMSetAlignment(s, 1);
 }
 
+// Memory holding v, to read from (not a copy if v is already in memory).
 static LLVMValueRef spill(Type *t, LLVMValueRef v) {
+    if (is_addr(t, v)) return v;
+    if (in_mem(t) && LLVMIsConstant(v) && !LLVMIsUndef(v)) return const_global(v);
     LLVMValueRef a = temp_alloca(t);
     store(t, v, a, false);
     return a;
+}
+
+// A copy of v that nothing else can change (for a by_ptr argument).
+static LLVMValueRef fresh_copy(Type *t, LLVMValueRef v) {
+    if (is_addr(t, v) && is_fresh(v)) return v;
+    if (!is_addr(t, v) && LLVMIsConstant(v) && !LLVMIsUndef(v)) return const_global(v);
+    LLVMValueRef a = temp_alloca(t);
+    store(t, v, a, false);
+    return a;
+}
+
+// v as an SSA value (where one is passed or returned in registers).
+static LLVMValueRef as_val(Type *t, LLVMValueRef v) {
+    if (!is_addr(t, v)) return v;
+    LLVMValueRef r = LLVMBuildLoad2(B, lty(t), v, "");
+    LLVMSetAlignment(r, known_align(v));
+    return r;
+}
+
+// Field `idx` (of type ft) of an aggregate value of type st.
+static LLVMValueRef field_value(Type *st, LLVMValueRef v, unsigned idx, Type *ft) {
+    if (is_addr(st, v)) return load(ft, LLVMBuildStructGEP2(B, lty(st), v, idx, ""), !is_fresh(v));
+    return from_mem(ft, LLVMBuildExtractValue(B, v, idx, ""));
 }
 
 static LLVMValueRef local_ptr(Local *l) {
@@ -1542,19 +1603,30 @@ static void emit_defers(int down_to) {
     }
 }
 
+// v: NULL when the result is already in F->sret_ptr
 static void emit_ret(LLVMValueRef v) {
     if (F->sret_ptr) {
-        store(F->ret, v, F->sret_ptr, false);
+        if (v) store(F->ret, v, F->sret_ptr, false);
         LLVMBuildRetVoid(B);
     } else if (F->ret->kind == TY_VOID) {
         LLVMBuildRetVoid(B);
     } else {
-        LLVMBuildRet(B, v);
+        LLVMBuildRet(B, as_val(F->ret, v));
     }
 }
 
+static LLVMValueRef errunion_code(Type *eu, LLVMValueRef v) { return field_value(eu, v, 0, t_error); }
+
 static LLVMValueRef errunion_value(Type *eu, LLVMValueRef code, LLVMValueRef payload) {
     LLVMTypeRef t = lty(eu);
+    if (in_mem(eu)) {
+        LLVMValueRef tmp = temp_alloca(eu);
+        LLVMBuildStore(B, code, LLVMBuildStructGEP2(B, t, tmp, 0, ""));
+        LLVMValueRef pp = LLVMBuildStructGEP2(B, t, tmp, 1, "");
+        if (payload) store(eu->elem, payload, pp, false);
+        else LLVMBuildMemSet(B, pp, LLVMConstInt(T_i8, 0, false), usz(type_size(eu->elem)), (unsigned)type_align(eu->elem));
+        return tmp;
+    }
     LLVMValueRef v = LLVMGetUndef(t);
     v = LLVMBuildInsertValue(B, v, code, 0, "");
     if (eu->elem->kind != TY_VOID)
@@ -1562,12 +1634,21 @@ static LLVMValueRef errunion_value(Type *eu, LLVMValueRef code, LLVMValueRef pay
     return v;
 }
 
+static void gen_into(Expr *e, LLVMValueRef dest, bool fresh, bool unaligned);
+
 static void gen_return(Expr *e) {
     LLVMValueRef v = NULL;
-    if (e) {
+    if (e && F->sret_ptr) {
+        // straight into the caller's result slot, which nothing here can
+        // read (before the defers run)
+        gen_into(e, F->sret_ptr, true, false);
+        if (terminated()) return;
+        if (F->ret->kind == TY_ERRUNION) etrace_push(errunion_code(F->ret, F->sret_ptr));
+    } else if (e) {
         v = gen(e);
         if (terminated()) return;
-        if (F->ret->kind == TY_ERRUNION) etrace_push(LLVMBuildExtractValue(B, v, 0, ""));
+        if (in_mem(F->ret)) v = as_val(F->ret, v);  // (before the defers run)
+        if (F->ret->kind == TY_ERRUNION) etrace_push(errunion_code(F->ret, v));
     } else if (F->ret->kind == TY_ERRUNION) {
         v = errunion_value(F->ret, LLVMConstInt(T_i16, 0, false), NULL);
     }
@@ -2121,16 +2202,41 @@ static LLVMValueRef rt_call_lanes(const char *name, LLVMValueRef *args, int n) {
     return r;
 }
 
+// An argument for a parameter of type pt, evaluated now: an in-memory
+// aggregate passed by pointer is a copy that nothing else can change (built
+// in place if it is a literal), one passed in registers is loaded now.
+static LLVMValueRef arg_from(Type *pt, LLVMValueRef v) {
+    if (!in_mem(pt)) return v;
+    return by_ptr(pt) ? fresh_copy(pt, v) : as_val(pt, v);
+}
+
+static bool is_literal(Expr *e) { return e->kind == E_STRUCT_LIT || e->kind == E_ARRAY_LIT || e->kind == E_ARRAY_REPEAT; }
+
+static LLVMValueRef gen_arg(Expr *a, Type *pt) {
+    if (in_mem(pt) && by_ptr(pt) && is_literal(a)) {
+        LLVMValueRef tmp = temp_alloca(pt);
+        gen_into(a, tmp, true, false);
+        return tmp;
+    }
+    return arg_from(pt, gen(a));
+}
+
+// A union value of variant e->index built at dest.
+static void gen_variant_into(Expr *e, LLVMValueRef dest) {
+    Type *ut = ct(e->tval);
+    LLVMValueRef tagp = LLVMBuildStructGEP2(B, lty(ut), dest, 0, "");
+    LLVMValueRef payload = gen(e->args.data[0]);
+    LLVMBuildStore(B, LLVMConstInt(lty(union_tag_type(ut)), (unsigned long long)e->index, false), tagp);
+    Type *pt = type_variant(ut, e->index);
+    LLVMValueRef pp = LLVMBuildStructGEP2(B, lty(ut), dest, 1, "");
+    store(pt, payload, pp, true);
+}
+
 static LLVMValueRef gen_call(Expr *e) {
     if (e->op == CALLK_VARIANT) {
         Type *ut = ct(e->tval);
         LLVMValueRef tmp = temp_alloca(ut);
-        LLVMValueRef tagp = LLVMBuildStructGEP2(B, lty(ut), tmp, 0, "");
-        LLVMValueRef payload = gen(e->args.data[0]);
-        LLVMBuildStore(B, LLVMConstInt(lty(union_tag_type(ut)), (unsigned long long)e->index, false), tagp);
-        Type *pt = type_variant(ut, e->index);
-        LLVMValueRef pp = LLVMBuildStructGEP2(B, lty(ut), tmp, 1, "");
-        store(pt, payload, pp, true);
+        gen_variant_into(e, tmp);
         return load(ut, tmp, false);
     }
     if (e->op == CALLK_INDIRECT) {
@@ -2138,7 +2244,7 @@ static LLVMValueRef gen_call(Expr *e) {
         LLVMValueRef fp = gen(e->a);
         int n = e->args.len;
         LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
-        for (int i = 0; i < n; i++) av[i] = gen(e->args.data[i]);
+        for (int i = 0; i < n; i++) av[i] = gen_arg(e->args.data[i], ft->params[i]);
         bool sret;
         LLVMTypeRef fty = fn_lty(ft, &sret);
         return emit_call(fty, fp, ft, sret, av, n, ft->params, NULL, 0);
@@ -2150,19 +2256,22 @@ static LLVMValueRef gen_call(Expr *e) {
     int k = 0;
     if (e->b) {
         Expr *recv = e->b;
+        Type *p0 = fi->fnty->params[0];
         switch (e->self_mode) {
-        case SELF_VALUE: av[k++] = gen(recv); break;
         case SELF_DEREF: {
             Type *pt = ct(recv->type);
-            av[k++] = load(pt->elem, gen(recv), true);
+            av[k++] = arg_from(p0, load(pt->elem, gen(recv), true));
             break;
         }
         case SELF_ADDR: av[k++] = gen_addr(recv); break;
-        case SELF_PASS: av[k++] = gen(recv); break;
-        default: av[k++] = gen(recv); break;
+        default: av[k++] = gen_arg(recv, p0); break;
         }
     }
-    for (int i = 0; i < e->args.len; i++) av[k++] = gen(e->args.data[i]);
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *a = e->args.data[i];
+        av[k] = gen_arg(a, k < fi->fnty->nparams ? fi->fnty->params[k] : ct(a->type));
+        k++;
+    }
     Type **argt = fi->fnty->params;
     if (d->variadic) {  // types of the extra (promoted) arguments
         argt = NEWN(Type *, n + 1);
@@ -2178,7 +2287,7 @@ static LLVMValueRef gen_call(Expr *e) {
 static LLVMValueRef gen_try(Expr *e) {
     Type *eu = ct(e->a->type);
     LLVMValueRef v = gen(e->a);
-    LLVMValueRef code = LLVMBuildExtractValue(B, v, 0, "");
+    LLVMValueRef code = errunion_code(eu, v);
     LLVMValueRef is_err = LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstInt(T_i16, 0, false), "");
     LLVMBasicBlockRef err_bb = new_bb("try.err"), ok_bb = new_bb("try.ok");
     LLVMBuildCondBr(B, is_err, err_bb, ok_bb);
@@ -2189,14 +2298,14 @@ static LLVMValueRef gen_try(Expr *e) {
     if (!terminated()) emit_ret(rv);
     LLVMPositionBuilderAtEnd(B, ok_bb);
     if (eu->elem->kind == TY_VOID) return NULL;
-    return from_mem(eu->elem, LLVMBuildExtractValue(B, v, 1, ""));
+    return field_value(eu, v, 1, eu->elem);
 }
 
 static LLVMValueRef gen_catch(Expr *e) {
     Type *eu = ct(e->a->type);
     Type *vt = eu->elem;
     LLVMValueRef v = gen(e->a);
-    LLVMValueRef code = LLVMBuildExtractValue(B, v, 0, "");
+    LLVMValueRef code = errunion_code(eu, v);
     LLVMValueRef is_err = LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstInt(T_i16, 0, false), "");
     LLVMBasicBlockRef err_bb = new_bb("catch.err"), ok_bb = new_bb("catch.ok"), merge = new_bb("catch.end");
     LLVMBuildCondBr(B, is_err, err_bb, ok_bb);
@@ -2211,6 +2320,7 @@ static LLVMValueRef gen_catch(Expr *e) {
         // a diverging handler (@trap()) leaves the builder in a dead block
         // that is deleted later: it must not feed the phi
         if (!terminated() && (LLVMGetInsertBlock(B) == err_bb || LLVMGetFirstUse(LLVMBasicBlockAsValue(LLVMGetInsertBlock(B))))) {
+            if (hv && in_mem(vt)) hv = spill(vt, hv);  // the phi joins addresses
             hbb = LLVMGetInsertBlock(B);
             LLVMBuildBr(B, merge);
         }
@@ -2225,13 +2335,14 @@ static LLVMValueRef gen_catch(Expr *e) {
     }
     if (!terminated()) LLVMBuildUnreachable(B);
     LLVMPositionBuilderAtEnd(B, ok_bb);
-    LLVMValueRef ov = vt->kind == TY_VOID ? NULL : from_mem(vt, LLVMBuildExtractValue(B, v, 1, ""));
+    LLVMValueRef ov = vt->kind == TY_VOID ? NULL : field_value(eu, v, 1, vt);
+    if (ov && in_mem(vt) && hbb && hv) ov = spill(vt, ov);
     LLVMBasicBlockRef obb = LLVMGetInsertBlock(B);
     LLVMBuildBr(B, merge);
     LLVMPositionBuilderAtEnd(B, merge);
     if (vt->kind == TY_VOID) return NULL;
     if (!hbb || !hv) return ov;
-    LLVMValueRef phi = LLVMBuildPhi(B, vty(vt), "");
+    LLVMValueRef phi = LLVMBuildPhi(B, in_mem(vt) ? T_ptr : vty(vt), "");
     LLVMValueRef vals[2] = {ov, hv};
     LLVMBasicBlockRef bbs[2] = {obb, hbb};
     LLVMAddIncoming(phi, vals, bbs, 2);
@@ -3184,6 +3295,17 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_EXPECT: check_or_trap(gen(a[0].e), T_EXPECT); return NULL;
     case BI_EXPECT_EQ: gen_expect_eq(e); return NULL;
     case BI_FENCE: LLVMBuildFence(B, LLVMAtomicOrderingSequentiallyConsistent, false, ""); return NULL;
+    case BI_PREFETCH: {
+        // A hint (spec §5.7): read, keep in every cache level (prefetcht0,
+        // prfm pldl1keep). WebAssembly has no prefetch.
+        LLVMValueRef p = gen(a[0].e);
+        if (g_target.wasm) return NULL;
+        LLVMTypeRef tys[1] = {T_ptr};
+        LLVMValueRef args[4] = {p, LLVMConstInt(T_i32, 0, false), LLVMConstInt(T_i32, 3, false),
+                                LLVMConstInt(T_i32, 1, false)};
+        intrinsic("llvm.prefetch", tys, 1, args, 4);
+        return NULL;
+    }
     case BI_ATOMIC_LOAD:
     case BI_ATOMIC_STORE:
     case BI_ATOMIC_ADD:
@@ -3509,8 +3631,142 @@ static LLVMValueRef mem_grow(LLVMValueRef pages) {
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
+// [x; n] at dest: x is copied first if it is a place (which dest may
+// contain), then stored n times.
+static void repeat_into(Type *t, LLVMValueRef x, LLVMValueRef dest, bool un) {
+    Type *et = t->elem;
+    LLVMTypeRef lt = lty(t);
+    if (LLVMIsConstant(x) && LLVMIsNull(x)) {
+        LLVMBuildMemSet(B, dest, LLVMConstInt(T_i8, 0, false), usz(type_size(t)), un ? 1 : (unsigned)type_align(t));
+        return;
+    }
+    if (is_addr(et, x) && !is_fresh(x)) x = fresh_copy(et, x);
+    if (t->len <= 16 && !in_mem(et)) {
+        for (int64_t i = 0; i < t->len; i++) {
+            LLVMValueRef ix[2] = {usz(0), usz(i)};
+            store(et, x, LLVMBuildInBoundsGEP2(B, lt, dest, ix, 2, ""), un);
+        }
+        return;
+    }
+    LLVMValueRef iv = alloca_in_entry(T_isz, "i");
+    LLVMBuildStore(B, usz(0), iv);
+    LLVMBasicBlockRef cond = new_bb("fill.cond"), body = new_bb("fill.body"), end = new_bb("fill.end");
+    LLVMBuildBr(B, cond);
+    LLVMPositionBuilderAtEnd(B, cond);
+    LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, usz(t->len), ""), body, end);
+    LLVMPositionBuilderAtEnd(B, body);
+    LLVMValueRef ix[2] = {usz(0), i};
+    store(et, x, LLVMBuildInBoundsGEP2(B, lt, dest, ix, 2, ""), un);
+    LLVMBuildStore(B, LLVMBuildAdd(B, i, usz(1), ""), iv);
+    LLVMBuildBr(B, cond);
+    LLVMPositionBuilderAtEnd(B, end);
+}
+
+// The struct or array literal e, of an in-memory type, built in place at
+// dest: a store (or memset, memcpy) per field or element.
+static void lit_into(Expr *e, Type *t, LLVMValueRef dest, bool fresh, bool un) {
+    LLVMTypeRef lt = lty(t);
+    if (e->kind == E_STRUCT_LIT) {
+        for (int i = 0; i < e->inits.len; i++)
+            gen_into(e->inits.data[i].value, LLVMBuildStructGEP2(B, lt, dest, (unsigned)i, ""), fresh, un);
+        return;
+    }
+    if (e->kind == E_ARRAY_LIT) {
+        for (int i = 0; i < e->args.len; i++) {
+            LLVMValueRef ix[2] = {usz(0), usz(i)};
+            gen_into(e->args.data[i], LLVMBuildInBoundsGEP2(B, lt, dest, ix, 2, ""), fresh, un);
+        }
+        return;
+    }
+    repeat_into(t, gen(e->a), dest, un);
+}
+
+// Whether evaluating e reads no memory a destination could hold: constants,
+// and locals whose address is never taken (literals of these can be built
+// in place at any destination).
+static bool reads_no_memory(Expr *e) {
+    if (e->is_const) return true;
+    switch (e->kind) {
+    case E_INT:
+    case E_FLOAT:
+    case E_BOOL:
+    case E_STRING:
+    case E_ERROR_VAL: return true;
+    case E_IDENT:
+        if (e->local) return !e->local->addr_taken;
+        return e->decl && e->decl->kind == D_CONST;
+    case E_FIELD: return e->op == FK_CONST || e->op == FK_VARIANT_UNIT || e->op == FK_ARRAY_LEN;
+    case E_STRUCT_LIT:
+        for (int i = 0; i < e->inits.len; i++)
+            if (!reads_no_memory(e->inits.data[i].value)) return false;
+        return true;
+    case E_ARRAY_LIT:
+        for (int i = 0; i < e->args.len; i++)
+            if (!reads_no_memory(e->args.data[i])) return false;
+        return true;
+    case E_ARRAY_REPEAT:
+    case E_CONV: return reads_no_memory(e->a);
+    case E_UNARY: return e->op != TK_AMP && reads_no_memory(e->a);
+    case E_BINARY: return reads_no_memory(e->a) && reads_no_memory(e->b);
+    default: return false;
+    }
+}
+
+static void gen_into_inner(Expr *e, LLVMValueRef dest, bool fresh, bool un) {
+    Type *t = ct(e->type);
+    if (in_mem(t)) {
+        switch (e->kind) {
+        case E_STRUCT_LIT:
+        case E_ARRAY_LIT:
+            if (!fresh && !reads_no_memory(e)) break;
+            lit_into(e, t, dest, fresh, un);
+            return;
+        case E_ARRAY_REPEAT: lit_into(e, t, dest, fresh, un); return;
+        case E_CONV:
+            if (e->op == CONV_NOOP) {
+                gen_into(e->a, dest, fresh, un);
+                return;
+            }
+            if (e->op == CONV_WRAP_OK && fresh && t->elem->kind != TY_VOID) {
+                LLVMBuildStore(B, LLVMConstInt(T_i16, 0, false), LLVMBuildStructGEP2(B, lty(t), dest, 0, ""));
+                gen_into(e->a, LLVMBuildStructGEP2(B, lty(t), dest, 1, ""), fresh, un);
+                return;
+            }
+            break;
+        case E_CALL:
+            if (e->op == CALLK_VARIANT && fresh) {
+                gen_variant_into(e, dest);
+                return;
+            }
+            break;
+        default: break;
+        }
+    }
+    LLVMValueRef v = gen(e);
+    if (!v || (t && t->kind == TY_NEVER)) return;
+    store(t, v, dest, un);
+}
+
+// Generates e's value into memory at dest. `fresh`: nothing e reads can be
+// at dest (a new local, a temporary, a result slot), so literals are built
+// there directly.
+static void gen_into(Expr *e, LLVMValueRef dest, bool fresh, bool un) {
+    Span saved = g_cur_span;
+    g_cur_span = e->span;
+    if (DIB) dbg_at(e->span);
+    gen_into_inner(e, dest, fresh, un);
+    g_cur_span = saved;
+    if (DIB) dbg_at(saved);
+}
+
 static LLVMValueRef gen_struct_lit(Expr *e) {
     Type *t = ct(e->type);
+    if (in_mem(t)) {
+        LLVMValueRef tmp = temp_alloca(t);
+        lit_into(e, t, tmp, true, false);
+        return tmp;
+    }
     LLVMValueRef v = LLVMGetUndef(lty(t));
     for (int i = 0; i < e->inits.len; i++) {
         Type *ft = type_field(t, i);
@@ -3522,6 +3778,14 @@ static LLVMValueRef gen_struct_lit(Expr *e) {
 
 static LLVMValueRef gen_array_lit(Expr *e) {
     Type *t = ct(e->type);
+    if (in_mem(t)) {
+        LLVMValueRef x = e->kind == E_ARRAY_REPEAT ? gen(e->a) : NULL;
+        if (x && LLVMIsConstant(x) && LLVMIsNull(x)) return LLVMConstNull(lty(t));  // (memset where it is stored)
+        LLVMValueRef tmp = temp_alloca(t);
+        if (x) repeat_into(t, x, tmp, false);
+        else lit_into(e, t, tmp, true, false);
+        return tmp;
+    }
     if (e->kind == E_ARRAY_LIT) {
         LLVMValueRef v = LLVMGetUndef(lty(t));
         for (int i = 0; i < e->args.len; i++)
@@ -3530,26 +3794,10 @@ static LLVMValueRef gen_array_lit(Expr *e) {
     }
     LLVMValueRef x = gen(e->a);
     if (LLVMIsConstant(x) && LLVMIsNull(x)) return LLVMConstNull(lty(t));
-    if (t->len <= 16) {
-        LLVMValueRef v = LLVMGetUndef(lty(t));
-        for (int64_t i = 0; i < t->len; i++) v = LLVMBuildInsertValue(B, v, to_mem(t->elem, x), (unsigned)i, "");
-        return v;
-    }
-    LLVMValueRef tmp = temp_alloca(t);
-    LLVMValueRef iv = alloca_in_entry(T_isz, "i");
-    LLVMBuildStore(B, usz(0), iv);
-    LLVMBasicBlockRef cond = new_bb("fill.cond"), body = new_bb("fill.body"), end = new_bb("fill.end");
-    LLVMBuildBr(B, cond);
-    LLVMPositionBuilderAtEnd(B, cond);
-    LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
-    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, usz(t->len), ""), body, end);
-    LLVMPositionBuilderAtEnd(B, body);
-    LLVMValueRef ix[2] = {usz(0), i};
-    store(t->elem, x, LLVMBuildGEP2(B, lty(t), tmp, ix, 2, ""), false);
-    LLVMBuildStore(B, LLVMBuildAdd(B, i, usz(1), ""), iv);
-    LLVMBuildBr(B, cond);
-    LLVMPositionBuilderAtEnd(B, end);
-    return load(t, tmp, false);
+    // (at most 16 bytes: at most 16 elements)
+    LLVMValueRef v = LLVMGetUndef(lty(t));
+    for (int64_t i = 0; i < t->len; i++) v = LLVMBuildInsertValue(B, v, to_mem(t->elem, x), (unsigned)i, "");
+    return v;
 }
 
 static LLVMValueRef gen_unary(Expr *e) {
@@ -3669,7 +3917,7 @@ static LLVMValueRef gen_inner(Expr *e) {
         case FK_STRUCT:
             if (is_place(e)) return load(t, asan_place(e, gen_addr(e)), via_pointer(e));
             if (e->self_mode == SELF_DEREF) return load(t, asan_place(e, gen_addr(e)), true);
-            return from_mem(t, LLVMBuildExtractValue(B, gen(e->a), (unsigned)e->index, ""));
+            return field_value(ct(e->a->type), gen(e->a), (unsigned)e->index, t);
         case FK_SLICE_LEN: return LLVMBuildExtractValue(B, gen(e->a), 1, "");
         case FK_SLICE_PTR: return LLVMBuildExtractValue(B, gen(e->a), 0, "");
         case FK_ARRAY_LEN: return usz(ct(e->a->type)->len);
@@ -4001,9 +4249,15 @@ static void gen_match(Stmt *s) {
 static void gen_stmt_inner(Stmt *s) {
     switch (s->kind) {
     case S_LET: {
+        Type *lt = ct(s->local->type);
+        if (in_mem(lt)) {
+            gen_into(s->e, local_ptr(s->local), true, false);  // (a new local: nothing reads it yet)
+            if (!s->local->mut) F->inits[s->local->index] = s->e;
+            return;
+        }
         LLVMValueRef v = gen(s->e);
         if (terminated() || !v) return;
-        store(ct(s->local->type), v, local_ptr(s->local), false);
+        store(lt, v, local_ptr(s->local), false);
         if (!s->local->mut) F->inits[s->local->index] = s->e;
         return;
     }
@@ -4013,6 +4267,10 @@ static void gen_stmt_inner(Stmt *s) {
         Type *t = ct(s->e->type);
         LLVMValueRef addr = gen_addr(s->e);
         bool un = via_pointer(s->e);
+        if (s->op == TK_EQ && in_mem(t)) {
+            gen_into(s->e2, asan_place(s->e, addr), false, un);
+            return;
+        }
         if (s->op == TK_EQ) {
             LLVMValueRef v = gen(s->e2);
             if (!v) return;

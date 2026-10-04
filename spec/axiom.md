@@ -558,6 +558,7 @@ only operations on pointers are:
 - the conversion builtins `@int_from_ptr`, `@ptr_from_int`, `@ptr_cast`, and
   `@slice_from_ptr`
 - the offset builtins `@ptr_add` and `@ptr_sub`
+- the cache hint `@prefetch`
 
 There is no pointer arithmetic operator. `@ptr_add(p, n)`, with `p` a `*T` or `*mut T`
 and `n` a `usize`, is the pointer `n` elements of `T` past `p`, of the same type as `p`:
@@ -580,6 +581,18 @@ acc = acc + @ptr_add(row, 1).* * x;       // the second f32x4 of the row
 
 For an offset in bytes, or one that may leave the object, use
 `@ptr_from_int(*T, @int_from_ptr(p) + k)`, which is checked arithmetic on the address.
+
+`@prefetch(p)`, with `p` any pointer, is a hint that the program will soon read the
+memory at `p`: native compilers start loading its cache line into every level of the
+cache (x86 `prefetcht0`, Arm `prfm pldl1keep`). It has no other effect. `p` is evaluated,
+but nothing is read: whatever `p` is (past the end of memory, freed, misaligned), it never
+traps, and it may compile to nothing (WebAssembly has no prefetch instruction).
+
+```axiom
+for i in @as(usize, 0)..n {
+    @prefetch(&table[bucket(keys[i])]);   // start the loads, then look the keys up
+}
+```
 
 ### 5.8 SIMD vectors
 
@@ -2772,6 +2785,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 |---|---|---|
 | `@ptr_add(p, n)` / `@ptr_sub(p, n)` | `*T, usize → *T` (`*mut T → *mut T`) | `n` elements of `T` past (before) `p`. Never traps; the result must stay in `p`'s object (§5.7) |
 | `@slice_from_ptr(p, n)` | `*T, usize → []T` (`*mut T → []mut T`) | No check at creation. Accesses are bounds-checked against linear memory |
+| `@prefetch(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be read soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
 | `@cast_slice(T, s)` | `[]U → []T` (keeps mutability) | Traps `T0006` if `s.len * size_of(U)` is not a multiple of `size_of(T)` |
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
@@ -2931,6 +2945,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C41 | `@ptr_add(p, n)` and `@ptr_sub(p, n)`: pointers moved by whole elements, which the program promises stay inside their object (§5.7). This is the one unchecked promise beside C13's defined memory: breaking it gives unspecified addresses, not a trap | Issue 0038: `@ptr_from_int(*T, @int_from_ptr(p) + 16)` is either an overflow check per access (`+`) or, wrapping (`+%`), an address WebAssembly cannot fold into the load's offset. Kernels reading rows of weights (the benchmark's) ran 1.15–1.25x slower than Rust's `p.add(n)`. `@ptr_sub` because walking back from an end pointer is as common; no signed variant, since the name gives the direction and `n` stays `usize` like every length |
 | C42 | Native x86-64 Linux builds of the C compiler find stack-trace frames by walking frame pointers, through a table from return addresses to call-site records, instead of a shadow stack written on every call (§16.4.1). Profile and sanitizer builds, WebAssembly and the self-hosted compiler keep the shadow stack | Issue 0037: the stores cost 15% in the benchmark's recursive move generator, and about double the time of a recursive Fibonacci. Traces are on by default, so their cost should be nothing on the hot path |
 | C43 | Integer overflow **wraps** in every build mode by default: `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)` compute modulo 2ⁿ (§7.6). Trapping (`T0002`) is the opt-in `--overflow=trap`; `--overflow=saturate` stays; `--release` no longer changes semantics. Integer vectors take `+`, `-`, `*` and unary `-` (wrapping). `+%`, `-%`, `*%` stay, as explicit spellings. Constant evaluation keeps `E0530` | Issue 0047, the owner's decision on Appendix D, Q1 (option (c)). Checks were the largest remaining cost of the benchmark against Rust's release build: its move generator's core function had 85 branches and 30 trap sites in WebAssembly where Rust's has 40 and 13, ports sprinkled `+%`/`*%` through hot paths, and the checks kept LLVM from vectorizing reductions (issue 0029). Bounds checks keep memory safe whatever an index computation does |
+| C44 | `@prefetch(p)`: a cache hint with no semantics, which never traps (§5.7) | Issue 0041: the benchmark's evaluator prefetches the cache bucket of each position of a batch before evaluating it (`_mm_prefetch`), and the port had no way to say so. One form (read, all cache levels): the one the port needs, and what `_mm_prefetch(.., _MM_HINT_T0)` and Rust's `prefetch_read_data(p, 3)` mean |
 
 ---
 
