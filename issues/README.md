@@ -67,3 +67,4 @@ they travel with the code they describe.
 | [0035](0035-widen-narrow-and-bool-to-int.md) | bug, feature | compiler (C), language | `@widen_low`/`@widen_high`/`@narrow` unimplemented; no bool to integer |
 | [0036](0036-dot-lowering.md) | bug | compiler (C) | `@dot` on `i16` lanes does not become `pmaddwd` / `i32x4.dot_i16x8_s` |
 | [0037](0037-native-stack-trace-cost.md) | feature | compiler (C), runtime | Stack traces cost 15% in call-heavy native code |
+| [0038](0038-pointer-offsets.md) | feature | language, compiler (C and selfhost) | Pointer offsets (`@ptr_add`): in-bounds element offsets for raw pointers |
