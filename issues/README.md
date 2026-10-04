@@ -82,3 +82,15 @@ they travel with the code they describe.
 | [0050](0050-test-output.md) | feature | tools | `axiom test` hides what a test prints |
 | [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic |
 | [0052](0052-runtime-cpu-dispatch.md) | feature | language, compiler, std | No runtime CPU feature dispatch: x86-64 builds never use AVX2/AVX-512 |
+| [0053](0053-selfhost-native-shadow-stack.md) | feature | compiler (selfhost: codegen, x64, elink), runtime | Self-hosted x86-64: calls still pay for the shadow stack (no frame tables) |
+| [0054](0054-selfhost-regalloc-spills.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator spills hot values and copies around its spill code |
+| [0055](0055-selfhost-full-unrolling.md) | feature | compiler (selfhost: opt/passes) | Self-hosted optimizer does not unroll small constant-trip loops |
+| [0056](0056-selfhost-vector-constants.md) | feature | compiler (selfhost: x64, opt) | Self-hosted x86-64: vector constants reloaded at every use, splats not broadcast |
+| [0057](0057-selfhost-scalar-isel.md) | feature | compiler (selfhost: x64, x64enc, opt layout) | Self-hosted x86-64: scalar instruction selection leaves extensions, flag materialisation and copies |
+| [0058](0058-selfhost-avx512-masks.md) | feature | compiler (selfhost: x64, combine) | Self-hosted x86-64: AVX-512 compares are expanded to vectors instead of used as k-masks |
+| [0059](0059-selfhost-int-to-float.md) | feature | compiler (selfhost: x64, combine) | Self-hosted x86-64: int-to-float conversions go through the stack; float division by powers of two |
+| [0060](0060-selfhost-shift-guards-and-ranges.md) | feature | compiler (selfhost: codegen, combine, gvn) | Self-hosted optimizer keeps shift guards and checks that value ranges rule out |
+| [0061](0061-selfhost-addressing-modes.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64: addressing modes not folded, address arithmetic recomputed in loops |
+| [0062](0062-selfhost-shuffles-and-reductions.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: constant shuffles as table permutes, lane extracts and reductions |
+| [0063](0063-selfhost-correlated-branches.md) | feature | compiler (selfhost: thread) | Self-hosted optimizer: correlated branches not threaded, data-dependent table branches not if-converted |
+| [0064](0064-selfhost-memset-and-zeroing.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64: small constant-size memset/memcpy as `rep stosb`/`rep movsb`, arrays zeroed eight bytes at a time |
