@@ -139,7 +139,10 @@
     X(ARM_RAX1, "arm_rax1", "ee") \
     X(ARM_XAR, "arm_xar", "eee") \
     X(ARM_CRC32, "arm_crc32", "ee") \
-    X(ARM_CRC32C, "arm_crc32c", "ee")
+    X(ARM_CRC32C, "arm_crc32c", "ee") \
+    X(LOAD_PARTIAL, "load_partial", "te") \
+    X(STORE_PARTIAL, "store_partial", "ee") \
+    X(SWIZZLE2, "swizzle2", "eee")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

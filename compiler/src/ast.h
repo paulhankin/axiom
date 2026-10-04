@@ -224,6 +224,8 @@ struct Stmt {
     // sema
     Local *local;
     bool diverges;  // block never completes normally
+    // codegen
+    bool no_overflow;  // `x += e` that cannot overflow (codegen.c, mark_bounded_sums)
 };
 
 // ---------------------------------------------------------------------------

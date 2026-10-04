@@ -1684,7 +1684,10 @@ fn check_shift_count(pb: *mut *mut ast.Expr) bool {
     if ((r.kind == ast.TY_INT) and not r.is_signed) or param_has(r, ast.C_UNSIGNED) {
         return true;
     }
-    if (r.kind == ast.TY_INT) or param_has(r, ast.C_SIGNED) {
+    if ty.is_vec_int(r) and not r.elem.is_signed {
+        return true;  // per lane (spec §13.1)
+    }
+    if (r.kind == ast.TY_INT) or param_has(r, ast.C_SIGNED) or ty.is_vec_int(r) {
         _ = dg.err(pb.*.span, "E0525", u.f1("shift count must be unsigned, found %s", tstr(r)));
         return false;
     }
@@ -1730,6 +1733,15 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         if (l.kind != ast.TY_INT) and not ty.is_vec_int(l) and not param_has(l, ast.C_INT) and
            (l.kind != ast.TY_INVALID) {
             _ = dg.err(e.a.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(l)));
+            e.ty = ty.t_invalid;
+            return e.ty;
+        }
+        let k = e.b.ty;
+        if ok and ty.is_vec_int(k) and (l.kind != ast.TY_INVALID) and
+           not (ty.is_vec_int(l) and (l.lanes == k.lanes) and (l.elem.bits == k.elem.bits)) {
+            _ = dg.err(e.b.span, "E0412",
+                       u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(l),
+                            tstr(k)));
             e.ty = ty.t_invalid;
             return e.ty;
         }
@@ -3535,6 +3547,16 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_INT_FROM_FLOAT {
         let t = targ(e, 0);
         e.tval = t;
+        if ty.is_vec_int(t) {
+            // lane-wise (spec §13.2)
+            let s = operand(earg(e, 1), tnil());
+            if (s.kind != ast.TY_INVALID) and not (ty.is_vec_float(s) and (s.lanes == t.lanes)) {
+                _ = dg.err(barg(e, 1).span, "E0822",
+                           u.f3("@int_from_float to %s requires a float vector of %s lanes, found %s", tstr(t),
+                                u.idec(t.lanes), tstr(s)));
+            }
+            return set_ty(e, t);
+        }
         if not is_int_like(t) {
             _ = dg.err(e.span, "E0822", "@int_from_float requires an integer target type");
         }
@@ -3547,6 +3569,16 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_FLOAT_FROM_INT {
         let t = targ(e, 0);
         e.tval = t;
+        if ty.is_vec_float(t) {
+            // lane-wise (spec §13.2)
+            let s = operand(earg(e, 1), tnil());
+            if (s.kind != ast.TY_INVALID) and not (ty.is_vec_int(s) and (s.lanes == t.lanes)) {
+                _ = dg.err(barg(e, 1).span, "E0822",
+                           u.f3("@float_from_int to %s requires an integer vector of %s lanes, found %s", tstr(t),
+                                u.idec(t.lanes), tstr(s)));
+            }
+            return set_ty(e, t);
+        }
         if not is_float_like(t) {
             _ = dg.err(e.span, "E0822", "@float_from_int requires a float target type");
         }
@@ -3698,7 +3730,7 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT) {
         let t = operand(earg(e, 0), x);
-        if not is_int_like(t) {
+        if not is_int_like(t) and not ty.is_vec_int(t) {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires an integer, found %s", e.name, tstr(t)));
         }
         return set_ty(e, t);
@@ -3883,12 +3915,55 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         idx.ty = ty.type_array(ty.t_u32, @as(i64, t.lanes));
         return set_ty(e, t);
     }
-    if id == ast.BI_SWIZZLE {
-        let t = pair(e, x);
-        if (t.kind != ast.TY_INVALID) and not ((t.kind == ast.TY_VEC) and (t.elem.bits == 8)) {
-            _ = dg.err(e.span, "E0812", "@swizzle requires byte vectors (u8x16, i8x16, u8x32, ...)");
+    if (id == ast.BI_SWIZZLE) or (id == ast.BI_SWIZZLE2) {
+        // a table of any lanes, indices of the same width taken as unsigned (spec §13.2)
+        let two = id == ast.BI_SWIZZLE2;
+        let mut ii: usize = 1;
+        let mut t = ty.t_invalid;
+        if two {
+            ii = 2;
+            t = pair(e, x);
+        } else {
+            t = check_expr(barg(e, 0), x);
+        }
+        if not require_vec(e, barg(e, 0), t) or (t.kind == ast.TY_INVALID) {
+            _ = check_expr(barg(e, ii), tnil());
+            return set_ty(e, ty.t_invalid);
+        }
+        let it = check_expr(barg(e, ii), ty.type_vec(ty.type_int(t.elem.bits, false, false), t.lanes));
+        if (it.kind != ast.TY_INVALID) and
+           not (ty.is_vec_int(it) and (it.lanes == t.lanes) and (it.elem.bits == t.elem.bits)) {
+            _ = dg.err(barg(e, ii).span, "E0812",
+                       u.f4("@%s indices must be an integer vector of %s %s-bit lanes, found %s", e.name,
+                            u.idec(t.lanes), u.idec(t.elem.bits), tstr(it)));
         }
         return set_ty(e, t);
+    }
+    if id == ast.BI_LOAD_PARTIAL {
+        let v = targ(e, 0);
+        e.tval = v;
+        if (v.kind != ast.TY_VEC) and (v.kind != ast.TY_INVALID) {
+            _ = dg.err(e.span, "E0812", u.f1("@load_partial requires a vector type, found %s", tstr(v)));
+        }
+        let s = check_expr(barg(e, 1), tnil());
+        if (v.kind == ast.TY_VEC) and (s.kind != ast.TY_INVALID) and
+           not ((s.kind == ast.TY_SLICE) and (s.elem == v.elem)) {
+            _ = dg.err(barg(e, 1).span, "E0822", u.f2("@load_partial reads from a []%s slice, found %s", tstr(v.elem),
+                                                      tstr(s)));
+        }
+        return set_ty(e, v);
+    }
+    if id == ast.BI_STORE_PARTIAL {
+        let s = check_expr(barg(e, 0), tnil());
+        let v = check_expr(barg(e, 1), tnil());
+        if (v.kind != ast.TY_VEC) and (v.kind != ast.TY_INVALID) {
+            _ = dg.err(barg(e, 1).span, "E0812", u.f1("@store_partial requires a vector value, found %s", tstr(v)));
+        } else if (v.kind == ast.TY_VEC) and (s.kind != ast.TY_INVALID) and
+                  not ((s.kind == ast.TY_SLICE) and s.is_mut and (s.elem == v.elem)) {
+            _ = dg.err(barg(e, 0).span, "E0822", u.f2("@store_partial writes to a []mut %s slice, found %s",
+                                                      tstr(v.elem), tstr(s)));
+        }
+        return set_ty(e, ty.t_void);
     }
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let t = pair(e, tnil());
@@ -4273,6 +4348,14 @@ fn check_assign(s: *mut ast.Stmt) void {
         let r = check_expr(s.e2, tnil());
         if r.kind == ast.TY_UNTYPED_INT {
             coerce(&mut s.e2, ty.t_u32);
+        } else if ty.is_vec_int(r) and not r.elem.is_signed {
+            // per lane (spec §13.1)
+            if (lt.kind != ast.TY_INVALID) and
+               not (ty.is_vec_int(lt) and (lt.lanes == r.lanes) and (lt.elem.bits == r.elem.bits)) {
+                _ = dg.err(s.e2.span, "E0412",
+                           u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(lt),
+                                tstr(r)));
+            }
         } else if not ((r.kind == ast.TY_INT) and not r.is_signed) and (r.kind != ast.TY_INVALID) and
                   not ((r.kind == ast.TY_PARAM) and ty.satisfies(r, ast.C_UNSIGNED)) {
             _ = dg.err(s.e2.span, "E0525", u.f1("shift count must be an unsigned integer, found %s", tstr(r)));

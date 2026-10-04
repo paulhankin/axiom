@@ -141,8 +141,14 @@ static void check_assign(Stmt *s) {
     if (op == TK_SHL || op == TK_SHR) {
         Type *r = check_expr(s->e2, NULL);
         if (r->kind == TY_UNTYPED_INT) coerce(&s->e2, t_u32);
-        else if (!(r->kind == TY_INT && !r->is_signed) && r->kind != TY_INVALID &&
-                 !(r->kind == TY_PARAM && type_satisfies(r, C_UNSIGNED)))
+        else if (ty_is_vec_int(r) && !r->elem->is_signed) {
+            // per lane (spec §13.1)
+            if (lt->kind != TY_INVALID && !(ty_is_vec_int(lt) && lt->lanes == r->lanes && lt->elem->bits == r->elem->bits))
+                diag_error(s->e2->span, "E0412",
+                           "per-lane shift counts must have the shape of the shifted vector: %s and %s", type_str(lt),
+                           type_str(r));
+        } else if (!(r->kind == TY_INT && !r->is_signed) && r->kind != TY_INVALID &&
+                   !(r->kind == TY_PARAM && type_satisfies(r, C_UNSIGNED)))
             diag_error(s->e2->span, "E0525", "shift count must be an unsigned integer, found %s", type_str(r));
         if (lt->kind != TY_INT && !ty_is_vec_int(lt) && !(lt->kind == TY_PARAM && type_satisfies(lt, C_INT)))
             diag_error(s->span, "E0513", "shift requires an integer operand, found %s", type_str(lt));

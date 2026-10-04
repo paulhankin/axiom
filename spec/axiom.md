@@ -1536,7 +1536,7 @@ every module's cache key.
 | `/` | lane-wise IEEE | no | no |
 | `+%` `-%` `*%` | no | lane-wise wrapping (`*%` not for 8-bit lanes; WASM has no `i8x16.mul`) | no |
 | `&` `\|` `^` `~` | no | yes | yes |
-| `<<` `>>` | no | scalar unsigned count, with the §7.6 semantics applied per lane (`k ≥` lane width gives `0` or sign fill) | no |
+| `<<` `>>` | no | an unsigned count: a scalar for every lane, or a vector of the same shape with one count per lane (`v << w`: lane i shifted by `w[i]`). The §7.6 semantics apply per lane (`k ≥` lane width gives `0` or sign fill) | no |
 | unary `-` | yes | `-%` only | no |
 | `==` `<` … | no. Use `@lanes_eq`, `@lanes_lt`, … | no | no |
 
@@ -1553,18 +1553,32 @@ Appendix A has full signatures.
 - Lanes: `@extract_lane`, `@replace_lane`. The lane index must be a constant expression.
 - Memory: `@load(V, s)` / `@store(s, v)`. `s` is a slice, and the program traps if
   `s.len * size_of(elem)` is less than the vector's size (`T0006`).
-- Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices, and
-  `@swizzle(a, idx)` takes runtime indices into a byte vector of any width (an index
-  past the end gives 0).
+  `@load_partial(V, s)` reads lanes `0..min(s.len, n)` of an `n`-lane vector from a slice
+  of its lane type, the others zero, and `@store_partial(s, v)` writes those lanes: neither
+  touches memory past `s`, so a loop over vectors needs no scalar loop for its tail. x86
+  does them with masked moves.
+- Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices. `@swizzle(a, idx)`
+  takes runtime indices: `a` is a vector of any lanes and `idx` an integer vector with as
+  many lanes of the same width, taken as unsigned; lane i of the result is `a[idx[i]]`, or
+  0 when `idx[i]` is not a lane of `a`. `@swizzle2(a, b, idx)` is the same over the `2n`
+  lanes of `a` then `b`, so a table of 32 `f32` is two `f32x16` (x86: `vpermps`,
+  `vpermt2ps`, and their kin for other lane widths; elsewhere byte lookups such as
+  `i8x16.swizzle`, `pshufb` and `tbl`).
 - Comparison: `@lanes_eq`, `@lanes_ne`, `@lanes_lt`, `@lanes_le`, `@lanes_gt`,
   `@lanes_ge`. Each returns an all-ones or all-zeros integer vector of the same shape.
 - Selection and tests: `@select(mask, a, b)`, `@any_true`, `@all_true`, `@bitmask`.
 - Reductions: `@reduce_add(v)` and `@dot(a, b)`. For floats, the association order is
-  fixed as **pairwise**: `(l0 + l1) + (l2 + l3)` for 4 lanes and `l0 + l1` for 2 lanes, and
-  for more lanes the sum of each half, added. The result is therefore deterministic across
-  targets.
+  fixed as **folding the halves**: the high half is added to the low half, lane `i` plus
+  lane `i + n/2`, and so on until one lane is left. For 4 lanes that is
+  `(l0 + l2) + (l1 + l3)`, for 2 lanes `l0 + l1`, and for 16 lanes lanes `8..16` onto
+  `0..8`, then `4..8` onto `0..4`, `2..4` onto `0..2` and lane 1 onto lane 0 (the order
+  of x86's `_mm512_reduce_add_ps`). The result is therefore deterministic across targets,
+  and it is the shortest sequence on every machine (no horizontal adds).
 - Lane-wise math: `@min`, `@max`, `@abs`, `@sqrt`, `@floor`, `@ceil`, `@trunc`,
-  `@nearest`, `@fma`.
+  `@nearest`, `@fma`; on integer vectors `@clz`, `@ctz` and `@popcount`.
+- Conversions: `@float_from_int(F, v)` and `@int_from_float(I, v)` convert lane by lane
+  between vectors of the same lane count, with the scalar rules (round to nearest;
+  truncate and saturate, NaN to 0).
 
 ### 13.3 Native targets
 
@@ -2626,7 +2640,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 
 | Builtin | Notes |
 |---|---|
-| `@clz(x)`, `@ctz(x)`, `@popcount(x)` | Return the same type as `x` |
+| `@clz(x)`, `@ctz(x)`, `@popcount(x)` | Return the same type as `x`; lane-wise on integer vectors |
 | `@rotl(x, k)`, `@rotr(x, k)` | `k` is taken modulo the width |
 | `@add_sat(a, b)`, `@sub_sat(a, b)`, `@mul_sat(a, b)` | Saturating, in every overflow mode. Also lane-wise on 8/16-bit integer vectors (add/sub only) |
 | `@add_checked`, `@sub_checked`, `@mul_checked` | Returns `!T`, with `error.Overflow`, in every mode |
@@ -2643,13 +2657,15 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@extract_lane(v, const i)` | `Vec → lane` |
 | `@replace_lane(v, const i, x)` | `Vec → Vec` |
 | `@load(V, s)` / `@store(s, v)` | Slice-checked load/store of the vector's size (§13.2) |
+| `@load_partial(V, s)` / `@store_partial(s, v)` | The first `min(s.len, lanes)` lanes, from or to a slice of the lane type; the rest of a load is zero (§13.2) |
 | `@shuffle(a, b, const [i0, …])` | Two-input byte-granular or lane-granular shuffle. Indices must be in range (`E0820`) |
-| `@swizzle(a, idx)` | Byte vectors (`u8x16`, `u8x32`, ...): runtime indices into the whole vector. Out-of-range indices give 0 (WASM semantics) |
+| `@swizzle(a, idx)` | Runtime indices (an integer vector of the same shape, unsigned) into the whole vector, of any lanes. Out-of-range indices give 0 (WASM semantics) |
+| `@swizzle2(a, b, idx)` | `@swizzle` over the lanes of `a` then `b` |
 | `@lanes_eq/ne/lt/le/gt/ge(a, b)` | Produce a mask vector |
 | `@select(mask, a, b)` | Bitwise select |
 | `@any_true(v)`, `@all_true(v)` | `→ bool` |
 | `@bitmask(v)` | `→ u32`, one bit per lane (`u64` for 64 lanes) |
-| `@reduce_add(v)` | Pairwise order (§13.2). Integer lanes wrap |
+| `@reduce_add(v)` | Halves folded (§13.2). Integer lanes wrap |
 | `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes |
 | `@narrow`, `@widen_low`, `@widen_high` | Lane-width changes per WASM |
 
@@ -2743,7 +2759,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C14 | Error names must be declared (`error { … }`) | Prevents typos in `error.X` from silently creating new errors |
 | C15 | Added `for`, `loop`, compound assignment, `_ =` discards, and a no-shadowing rule | Needed by the notes' examples, or by the agent-ergonomics goal |
 | C16 | The diagnostic `suggested_fix.confidence` float became `fixes[].applicability` (an enum) plus byte-range `edits` | A float confidence is hard to act on. Byte-range edits can be applied mechanically |
-| C17 | Horizontal float reductions have a fixed pairwise association order | Determinism across WASM and native |
+| C17 | Horizontal float reductions have a fixed association order: folding the halves (§13.2). Until issue 0028 the order was pairwise over neighbours, `(l0 + l1) + (l2 + l3)`; the change alters float results of `@reduce_add` and `@dot` by rounding | Determinism across WASM and native. Folding the halves is the order of x86's reductions and most SIMD code, and the cheapest one with wide registers |
 | C18 | Shift counts are **not** clamped. `x << k` and `x >> k` have their mathematical meaning for every `k`, so `k ≥ width` gives `0` or sign fill | Design review, draft 2. `x << 40` has a clear meaning, and clamping it to `x << 31` would be surprising |
 | C19 | Added monomorphized generics with builtin constraints (§10) | Design review, draft 2 |
 | C20 | The language was briefly renamed Phalange (source files `.ph`); it is Axiom again, with the extension `.ax` | Design review, draft 2; the original name was preferred |
@@ -2763,6 +2779,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C34 | Processor extensions in the language: target conditions (`@target_has`, `@target_arch`, `@target_os`) that select what is compiled, `@cpu_has`, and functions compiled for more extensions (`@features`, `@multiversion`) (§13.4) | Issue 0015: wider instruction sets need a way to choose between a fast path and a portable one, at build time or at run time. The dead branch is still type-checked, so it cannot rot unnoticed |
 | C35 | 256- and 512-bit vector types (`f32x8`, `i32x16`, `v512`, ...), with every operator and builtin of the 128-bit ones; passed in memory between functions (§5.8, §13.3) | Issue 0015: AVX2 and AVX-512 process 32 and 64 bytes at a time. On narrower targets the compiler splits them, so code written for the wide types is portable |
 | C36 | Builtins for the processors' cryptographic instructions: AES, carry-less multiplication, SHA-1, SHA-256, SHA-512, SHA-3 and CRC (`@x86_*`, `@arm_*`, §13.5) | Issue 0016: AES-GCM, SHA-2 and CRC run several times faster with them, and std chooses them at run time with `@multiversion` |
+| C37 | Vectors gained per-lane shift counts, lane-wise `@clz`/`@ctz`/`@popcount` and int/float conversions, `@swizzle` of any lane type and `@swizzle2`, and `@load_partial`/`@store_partial` (§13.1, §13.2) | Issues 0024 to 0027, from porting the benchmark's AVX-512 kernels: each is one instruction on x86 (and mostly on Arm and WebAssembly), and without them the port had to fall back to scalar code |
 
 ---
 

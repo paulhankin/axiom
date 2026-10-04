@@ -2159,6 +2159,15 @@ fn gen_shift(op: i32, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut
     if t.kind == ast.TY_VEC {
         lane = t.elem;
     }
+    if k.ty.kind == ir.T_VEC {
+        // a count per lane: lane by lane
+        let mut r = ir.undef(x.ty);
+        for i in @as(u64, 0)..@as(u64, @bit_cast(u32, t.lanes)) {
+            let y = gen_shift(op, lane, ir.extract_elem(B, x, i), ir.extract_elem(B, k, i));
+            r = ir.insert_elem(B, r, y, i);
+        }
+        return r;
+    }
     let n = @int_cast(u32, lane.bits);
     let kty = k.ty;
     let ge = icmp(ir.IntUGE, k, ci(kty, @as(u64, n)));
@@ -2590,27 +2599,47 @@ fn splat(vt: *mut ir.Ty, x: *mut ir.Value, lanes: u32) *mut ir.Value {
     return ir.splat(B, vt, x);
 }
 
-fn pairwise_sum(xs: []mut *mut ir.Value, is_float: bool) *mut ir.Value {
-    let n = xs.len;
-    if n == 1 {
-        return xs[0];
+// The lanes summed by folding the halves (spec §13.2): lane i plus lane
+// i + n/2, until one lane is left. Vectors while the halves are 128 bits or
+// more, then lane by lane.
+fn reduce_add(vt: *mut ast.Type, v0: *mut ir.Value) *mut ir.Value {
+    let is_float = vt.elem.kind == ast.TY_FLOAT;
+    let mut v = v0;
+    let mut n = @int_cast(usize, vt.lanes);
+    let lb = @int_cast(usize, vt.bits);
+    while (n > 1) and (((n / 2) * lb) >= 128) {
+        let h = n / 2;
+        let lo = u.newn.[i32](h);
+        let hi = u.newn.[i32](h);
+        for i in 0..h {
+            lo[i] = @truncate(i32, @bit_cast(isize, i));
+            hi[i] = @truncate(i32, @bit_cast(isize, i + h));
+        }
+        let a = ir.shuffle(B, v, v, lo);
+        let b = ir.shuffle(B, v, v, hi);
+        if is_float {
+            v = ir.binop(B, ir.OP_FADD, a, b);
+        } else {
+            v = b_add(a, b);
+        }
+        n = h;
     }
-    let h = n / 2;
-    let a = pairwise_sum(xs[0..h], is_float);
-    let b = pairwise_sum(xs[h..n], is_float);
-    if is_float {
-        return ir.binop(B, ir.OP_FADD, a, b);
-    }
-    return b_add(a, b);
-}
-
-fn reduce_add(vt: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
-    let n = @int_cast(usize, vt.lanes);
     let xs = u.newn.[*mut ir.Value](n);
     for i in 0..n {
         xs[i] = ext_elem(v, ci32(@as(u64, i)));
     }
-    return pairwise_sum(xs, vt.elem.kind == ast.TY_FLOAT);
+    while n > 1 {
+        let h = n / 2;
+        for i in 0..h {
+            if is_float {
+                xs[i] = ir.binop(B, ir.OP_FADD, xs[i], xs[i + h]);
+            } else {
+                xs[i] = b_add(xs[i], xs[i + h]);
+            }
+        }
+        n = h;
+    }
+    return xs[0];
 }
 
 fn ext_int(v: *mut ir.Value, to: *mut ir.Ty, is_signed: bool) *mut ir.Value {
@@ -2626,6 +2655,78 @@ fn ext_int(v: *mut ir.Value, to: *mut ir.Ty, is_signed: bool) *mut ir.Value {
         return sext(v, to);
     }
     return zext(v, to);
+}
+
+// A lane-wise builtin on a vector (spec §13.2) that the backends have for
+// scalars only: lane by lane. `src_signed`: the operand's lanes, for
+// @float_from_int.
+fn lanewise(id: i32, rt: *mut ast.Type, v: *mut ir.Value, src_signed: bool) *mut ir.Value {
+    let n = @as(u64, @bit_cast(u32, rt.lanes));
+    let lt = lty(rt.elem);
+    let mut r = ir.undef(lty(rt));
+    for k in @as(u64, 0)..n {
+        let x = ir.extract_elem(B, v, k);
+        let mut y = x;
+        if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) {
+            let mut t: [1]*mut ir.Ty = [x.ty];
+            let mut args: [2]*mut ir.Value = [x, ci(T_i1, 0)];
+            y = intrinsic(u.pick(id == ast.BI_CLZ, "llvm.ctlz", "llvm.cttz"), t[..], args[..]);
+        } else if id == ast.BI_POPCOUNT {
+            y = intr1("llvm.ctpop", x);
+        } else if id == ast.BI_INT_FROM_FLOAT {
+            let mut tys: [2]*mut ir.Ty = [lt, x.ty];
+            let mut args: [1]*mut ir.Value = [x];
+            y = intrinsic(u.pick(rt.is_signed, "llvm.fptosi.sat", "llvm.fptoui.sat"), tys[..], args[..]);
+        } else if src_signed {
+            y = ir.cast(B, ir.OP_SITOFP, x, lt);
+        } else {
+            y = ir.cast(B, ir.OP_UITOFP, x, lt);
+        }
+        r = ir.insert_elem(B, r, y, k);
+    }
+    return r;
+}
+
+// A vector of n lanes of type lt, each v.
+fn const_lanes(lt: *mut ir.Ty, n: usize, v: u64) *mut ir.Value {
+    let xs = u.newn.[*mut ir.Value](n);
+    for i in 0..n {
+        xs[i] = ci(lt, v);
+    }
+    return ir.cagg(ir.t_vec(lt, @truncate(u32, n)), xs);
+}
+
+// @swizzle (spec §13.2): lane i of the result is lane idx[i] of the table, or
+// 0 when idx[i] (unsigned) is not a lane. Wider lanes become byte indices,
+// min(idx, n) * lanebytes + k for byte k of a lane (at most 64 + 7).
+fn swizzle_lanes(t: *mut ast.Type, x: *mut ir.Value, idx: *mut ir.Value) *mut ir.Value {
+    let n = @int_cast(usize, t.lanes);
+    let lb = @int_cast(usize, t.bits) / 8;
+    if lb == 1 {
+        let mut sargs: [2]*mut ir.Value = [x, idx];
+        return ir.intr(B, ir.IN_SWIZZLE, x.ty, sargs[..]);
+    }
+    let nb = n * lb;
+    let bt = ir.t_vec(T_i8, @truncate(u32, nb));
+    let it = idx.ty;
+    let cn = const_lanes(it.elem, n, @as(u64, n));
+    let m = sext(icmp(ir.IntULT, idx, cn), it);
+    let mut cl = b_or(b_and(idx, m), b_and(cn, b_not(m)));
+    let mut k: usize = 1;
+    while k < lb {
+        cl = b_add(cl, cl);
+        k *= 2;
+    }
+    let bytes = bitcast(cl, bt);
+    let rep = u.newn.[i32](nb);
+    let kk = u.newn.[*mut ir.Value](nb);
+    for i in 0..nb {
+        rep[i] = @truncate(i32, @bit_cast(isize, (i / lb) * lb));
+        kk[i] = ci(T_i8, @as(u64, i % lb));
+    }
+    let bi = b_add(ir.shuffle(B, bytes, bytes, rep), ir.cagg(bt, kk));
+    let mut sargs: [2]*mut ir.Value = [bitcast(x, bt), bi];
+    return bitcast(ir.intr(B, ir.IN_SWIZZLE, bt, sargs[..]), x.ty);
 }
 
 fn barg(e: *mut ast.Expr, i: usize) *mut ast.Expr {
@@ -2731,6 +2832,12 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_TRUNCATE {
         let s = ct(barg(e, 1).ty);
         return ext_int(gen(barg(e, 1)), lty(rt), s.is_signed);
+    }
+    if ((id == ast.BI_INT_FROM_FLOAT) or (id == ast.BI_FLOAT_FROM_INT)) and (rt.kind == ast.TY_VEC) {
+        return lanewise(id, rt, gen(barg(e, 1)), ct(barg(e, 1).ty).is_signed);
+    }
+    if ((id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT)) and (rt.kind == ast.TY_VEC) {
+        return lanewise(id, rt, gen(barg(e, 0)), false);
     }
     if id == ast.BI_INT_FROM_FLOAT {
         let v = gen(barg(e, 1));
@@ -3072,8 +3179,43 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_SWIZZLE {
         let x = gen(barg(e, 0));
         let idx = gen(barg(e, 1));
-        let mut sargs: [2]*mut ir.Value = [x, idx];
-        return ir.intr(B, ir.IN_SWIZZLE, lty(rt), sargs[..]);
+        return swizzle_lanes(rt, x, idx);
+    }
+    if id == ast.BI_SWIZZLE2 {
+        let x = gen(barg(e, 0));
+        let y = gen(barg(e, 1));
+        let idx = gen(barg(e, 2));
+        // indices below n pick from x (in y they wrap to beyond its lanes),
+        // the others from y
+        let lo = swizzle_lanes(rt, x, idx);
+        let cn = const_lanes(idx.ty.elem, @int_cast(usize, rt.lanes), @as(u64, @bit_cast(u32, rt.lanes)));
+        let hi = swizzle_lanes(rt, y, b_sub(idx, cn));
+        return bitcast(b_or(bitcast(lo, idx.ty), bitcast(hi, idx.ty)), x.ty);
+    }
+    if id == ast.BI_LOAD_PARTIAL {
+        // the first min(len, n) lanes copied to a zeroed vector
+        let s = gen(barg(e, 1));
+        let p = extract(s, 0);
+        let len = extract(s, 1);
+        let n = usz(@as(i64, rt.lanes));
+        let k = sel(icmp(ir.IntULT, len, n), len, n);
+        let tmp = alloca_in_entry(lty(rt), "partial".ptr);
+        _ = ir.memop(B, ir.OP_MEMSET, tmp, ci(T_i8, 0), usz(ty.type_size(rt)));
+        _ = ir.memop(B, ir.OP_MEMMOVE, tmp, p, b_mul(k, usz(ty.type_size(rt.elem))));
+        return load(rt, tmp, true);
+    }
+    if id == ast.BI_STORE_PARTIAL {
+        let vt = ct(barg(e, 1).ty);
+        let s = gen(barg(e, 0));
+        let v = gen(barg(e, 1));
+        let p = extract(s, 0);
+        let len = extract(s, 1);
+        let n = usz(@as(i64, vt.lanes));
+        let k = sel(icmp(ir.IntULT, len, n), len, n);
+        let tmp = alloca_in_entry(lty(vt), "partial".ptr);
+        store(vt, v, tmp, true);
+        _ = ir.memop(B, ir.OP_MEMMOVE, p, tmp, b_mul(k, usz(ty.type_size(vt.elem))));
+        return vnil();
     }
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let vt = ct(barg(e, 0).ty);

@@ -342,6 +342,14 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_INT_FROM_FLOAT: {
         Type *t = targ(e, 0);
         e->tval = t;
+        if (ty_is_vec_int(t)) {
+            // lane-wise (spec §13.2)
+            Type *s = operand(earg(e, 1), NULL);
+            if (s->kind != TY_INVALID && !(ty_is_vec_float(s) && s->lanes == t->lanes))
+                diag_error((*earg(e, 1))->span, "E0822", "@int_from_float to %s requires a float vector of %d lanes, found %s",
+                           type_str(t), t->lanes, type_str(s));
+            return e->type = t;
+        }
         if (!is_int_like(t)) diag_error(e->span, "E0822", "@int_from_float requires an integer target type");
         Type *s = operand(earg(e, 1), t_f64);
         if (!is_float_like(s)) diag_error((*earg(e, 1))->span, "E0822", "@int_from_float requires a float operand");
@@ -350,6 +358,15 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_FLOAT_FROM_INT: {
         Type *t = targ(e, 0);
         e->tval = t;
+        if (ty_is_vec_float(t)) {
+            // lane-wise (spec §13.2)
+            Type *s = operand(earg(e, 1), NULL);
+            if (s->kind != TY_INVALID && !(ty_is_vec_int(s) && s->lanes == t->lanes))
+                diag_error((*earg(e, 1))->span, "E0822",
+                           "@float_from_int to %s requires an integer vector of %d lanes, found %s", type_str(t), t->lanes,
+                           type_str(s));
+            return e->type = t;
+        }
         if (!is_float_like(t)) diag_error(e->span, "E0822", "@float_from_int requires a float target type");
         Type *s = operand(earg(e, 1), t_i64);
         if (!is_int_like(s)) diag_error((*earg(e, 1))->span, "E0822", "@float_from_int requires an integer operand");
@@ -468,7 +485,7 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_CTZ:
     case BI_POPCOUNT: {
         Type *t = operand(earg(e, 0), x);
-        if (!is_int_like(t)) diag_error(e->span, "E0822", "@%s requires an integer, found %s", e->name, type_str(t));
+        if (!is_int_like(t) && !ty_is_vec_int(t)) diag_error(e->span, "E0822", "@%s requires an integer, found %s", e->name, type_str(t));
         return e->type = t;
     }
     case BI_ROTL:
@@ -623,11 +640,42 @@ Type *builtin_check(Expr *e, Type *expected) {
         idx->type = type_array(t_u32, t->lanes);
         return e->type = t;
     }
-    case BI_SWIZZLE: {
-        Type *t = pair(e, x);
-        if (t->kind != TY_INVALID && !(t->kind == TY_VEC && t->elem->bits == 8))
-            diag_error(e->span, "E0812", "@swizzle requires byte vectors (u8x16, i8x16, u8x32, ...)");
+    case BI_SWIZZLE:
+    case BI_SWIZZLE2: {
+        // a table of any lanes, indices of the same width taken as unsigned (spec §13.2)
+        bool two = e->index == BI_SWIZZLE2;
+        int ii = two ? 2 : 1;
+        Type *t = two ? pair(e, x) : check_expr(*earg(e, 0), x);
+        if (!require_vec(e, *earg(e, 0), t) || t->kind == TY_INVALID) {
+            check_expr(*earg(e, ii), NULL);
+            return e->type = t_invalid;
+        }
+        Type *it = check_expr(*earg(e, ii), type_vec(type_int(t->elem->bits, false, false), t->lanes));
+        if (it->kind != TY_INVALID && !(ty_is_vec_int(it) && it->lanes == t->lanes && it->elem->bits == t->elem->bits))
+            diag_error((*earg(e, ii))->span, "E0812", "@%s indices must be an integer vector of %d %d-bit lanes, found %s",
+                       e->name, t->lanes, t->elem->bits, type_str(it));
         return e->type = t;
+    }
+    case BI_LOAD_PARTIAL: {
+        Type *v = targ(e, 0);
+        e->tval = v;
+        if (v->kind != TY_VEC && v->kind != TY_INVALID)
+            diag_error(e->span, "E0812", "@load_partial requires a vector type, found %s", type_str(v));
+        Type *s = check_expr(*earg(e, 1), NULL);
+        if (v->kind == TY_VEC && s->kind != TY_INVALID && !(s->kind == TY_SLICE && s->elem == v->elem))
+            diag_error((*earg(e, 1))->span, "E0822", "@load_partial reads from a []%s slice, found %s",
+                       type_str(v->elem), type_str(s));
+        return e->type = v;
+    }
+    case BI_STORE_PARTIAL: {
+        Type *s = check_expr(*earg(e, 0), NULL);
+        Type *v = check_expr(*earg(e, 1), NULL);
+        if (v->kind != TY_VEC && v->kind != TY_INVALID)
+            diag_error((*earg(e, 1))->span, "E0812", "@store_partial requires a vector value, found %s", type_str(v));
+        else if (v->kind == TY_VEC && s->kind != TY_INVALID && !(s->kind == TY_SLICE && s->mut && s->elem == v->elem))
+            diag_error((*earg(e, 0))->span, "E0822", "@store_partial writes to a []mut %s slice, found %s",
+                       type_str(v->elem), type_str(s));
+        return e->type = t_void;
     }
     case BI_LANES_EQ:
     case BI_LANES_NE:

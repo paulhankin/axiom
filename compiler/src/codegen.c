@@ -7,6 +7,7 @@
 
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Transforms/PassBuilder.h>
@@ -1324,10 +1325,24 @@ static LLVMValueRef overflow_op(const char *base, bool is_signed, LLVMValueRef l
 static LLVMValueRef gen_shift(int op, Type *t, LLVMValueRef x, LLVMValueRef k, Type *kt) {
     Type *lane = t->kind == TY_VEC ? t->elem : t;
     int n = lane->bits;
+    bool arith = op == TK_SHR && lane->is_signed;
+    if (kt && kt->kind == TY_VEC) {
+        // a count per lane, of the lanes' width (vpsllvd, ushl, ...)
+        LLVMTypeRef vt = LLVMTypeOf(x);
+        LLVMValueRef cn[64], cf[64];
+        for (int i = 0; i < t->lanes; i++) {
+            cn[i] = LLVMConstInt(LLVMGetElementType(vt), (unsigned long long)n, false);
+            cf[i] = LLVMConstInt(LLVMGetElementType(vt), arith ? (unsigned long long)(n - 1) : 0, false);
+        }
+        LLVMValueRef vge = LLVMBuildICmp(B, LLVMIntUGE, k, LLVMConstVector(cn, (unsigned)t->lanes), "");
+        LLVMValueRef vk = LLVMBuildSelect(B, vge, LLVMConstVector(cf, (unsigned)t->lanes), k, "");
+        if (arith) return LLVMBuildAShr(B, x, vk, "");
+        LLVMValueRef vr = op == TK_SHL ? LLVMBuildShl(B, x, vk, "") : LLVMBuildLShr(B, x, vk, "");
+        return LLVMBuildSelect(B, vge, LLVMConstNull(vt), vr, "");
+    }
     LLVMTypeRef kty = LLVMTypeOf(k);
     LLVMValueRef ge = LLVMBuildICmp(B, LLVMIntUGE, k, LLVMConstInt(kty, (unsigned long long)n, false), "");
     LLVMTypeRef laneTy = LLVMIntTypeInContext(ctx, (unsigned)n);
-    bool arith = op == TK_SHR && lane->is_signed;
     LLVMValueRef kc = LLVMBuildSelect(B, ge, LLVMConstInt(kty, arith ? (unsigned long long)(n - 1) : 0, false), k, "");
     unsigned kb = LLVMGetIntTypeWidth(kty);
     if (kb > (unsigned)n) kc = LLVMBuildTrunc(B, kc, laneTy, "");
@@ -1481,14 +1496,16 @@ static LLVMValueRef gen_addr_inner(Expr *e) {
             LLVMValueRef ptr = LLVMBuildExtractValue(B, s, 0, "");
             LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
             check_or_trap(LLVMBuildICmp(B, LLVMIntULT, idx, len, ""), T_BOUNDS);
-            return LLVMBuildGEP2(B, lty(at->elem), ptr, &idx, 1, "");
+            // in bounds (checked): the address cannot wrap, so a constant part
+            // of the index can fold into the access (wasm's offset=)
+            return LLVMBuildInBoundsGEP2(B, lty(at->elem), ptr, &idx, 1, "");
         }
         Type *arr = e->op == IDX_PTR_ARRAY ? at->elem : at;
         LLVMValueRef base = e->op == IDX_PTR_ARRAY ? gen(e->a) : addr_or_spill(e->a);
         LLVMValueRef idx = gen(e->b);
         check_or_trap(LLVMBuildICmp(B, LLVMIntULT, idx, array_len_value(arr), ""), T_BOUNDS);
         LLVMValueRef ix[2] = {usz(0), idx};
-        return LLVMBuildGEP2(B, lty(arr), base, ix, 2, "");
+        return LLVMBuildInBoundsGEP2(B, lty(arr), base, ix, 2, "");
     }
     default: break;
     }
@@ -1771,18 +1788,22 @@ static LLVMValueRef splat(LLVMTypeRef vt, LLVMValueRef x, unsigned lanes) {
     return LLVMBuildShuffleVector(B, v, LLVMGetUndef(vt), LLVMConstNull(LLVMVectorType(T_i32, lanes)), "");
 }
 
-static LLVMValueRef pairwise_sum(LLVMValueRef *xs, int n, bool is_float) {
-    if (n == 1) return xs[0];
-    int h = n / 2;
-    LLVMValueRef a = pairwise_sum(xs, h, is_float), b = pairwise_sum(xs + h, n - h, is_float);
-    return is_float ? LLVMBuildFAdd(B, a, b, "") : LLVMBuildAdd(B, a, b, "");
-}
-
+// The lanes summed by folding the halves (spec §13.2): lane i plus lane
+// i + n/2, until one lane is left.
 static LLVMValueRef reduce_add(Type *vt, LLVMValueRef v) {
-    int n = vt->lanes;
-    LLVMValueRef *xs = NEWN(LLVMValueRef, n);
-    for (int i = 0; i < n; i++) xs[i] = LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, (unsigned)i, false), "");
-    return pairwise_sum(xs, n, vt->elem->kind == TY_FLOAT);
+    bool is_float = vt->elem->kind == TY_FLOAT;
+    for (unsigned n = (unsigned)vt->lanes; n > 1; n /= 2) {
+        unsigned h = n / 2;
+        LLVMValueRef lo[32], hi[32];
+        for (unsigned i = 0; i < h; i++) {
+            lo[i] = LLVMConstInt(T_i32, i, false);
+            hi[i] = LLVMConstInt(T_i32, i + h, false);
+        }
+        LLVMValueRef a = LLVMBuildShuffleVector(B, v, v, LLVMConstVector(lo, h), "");
+        LLVMValueRef b = LLVMBuildShuffleVector(B, v, v, LLVMConstVector(hi, h), "");
+        v = is_float ? LLVMBuildFAdd(B, a, b, "") : LLVMBuildAdd(B, a, b, "");
+    }
+    return LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, 0, false), "");
 }
 
 static LLVMValueRef ext_int(LLVMValueRef v, LLVMTypeRef to, bool is_signed) {
@@ -1835,6 +1856,120 @@ static LLVMValueRef piece16(LLVMValueRef v, unsigned k) {
     LLVMValueRef m[16];
     for (unsigned i = 0; i < 16; i++) m[i] = LLVMConstInt(T_i32, 16 * k + i, false);
     return LLVMBuildShuffleVector(B, v, LLVMGetUndef(LLVMTypeOf(v)), LLVMConstVector(m, 16), "");
+}
+
+// @swizzle of a byte table of n bytes (n a multiple of 16).
+static LLVMValueRef swizzle_bytes(LLVMValueRef x, LLVMValueRef idx, unsigned n) {
+    if (n == 16) return swizzle16(x, idx);
+    if (n == 64 && g_arch == ARCH_X64 && (g_features & feature_bit("avx512vbmi"))) {
+        // vpermb: the index modulo 64, so out-of-range lanes are cleared after
+        LLVMValueRef args[2] = {x, idx};
+        LLVMValueRef r = intrinsic("llvm.x86.avx512.permvar.qi.512", NULL, 0, args, 2);
+        LLVMValueRef c[64];
+        for (int i = 0; i < 64; i++) c[i] = LLVMConstInt(T_i8, 64, false);
+        LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, LLVMConstVector(c, 64), "");
+        return LLVMBuildSelect(B, out, LLVMConstNull(LLVMTypeOf(x)), r, "");
+    }
+    // one 16-byte lookup per table piece, with the indices moved down by its
+    // offset (out of range there: 0), OR-ed; the pieces of the result joined
+    unsigned np = n / 16;
+    LLVMTypeRef v16 = LLVMVectorType(T_i8, 16);
+    LLVMValueRef ps[4];
+    for (unsigned k = 0; k < np; k++) {
+        LLVMValueRef ix = piece16(idx, k);
+        LLVMValueRef acc = LLVMConstNull(v16);
+        for (unsigned j = 0; j < np; j++) {
+            LLVMValueRef off[16];
+            for (int i = 0; i < 16; i++) off[i] = LLVMConstInt(T_i8, 16 * j, false);
+            LLVMValueRef ij = LLVMBuildSub(B, ix, LLVMConstVector(off, 16), "");
+            acc = LLVMBuildOr(B, acc, swizzle16(piece16(x, j), ij), "");
+        }
+        ps[k] = acc;
+    }
+    for (unsigned w = 16; np > 1; np /= 2, w *= 2) {
+        LLVMValueRef m[64];
+        for (unsigned i = 0; i < 2 * w; i++) m[i] = LLVMConstInt(T_i32, i, false);
+        for (unsigned k = 0; k < np / 2; k++) ps[k] = LLVMBuildShuffleVector(B, ps[2 * k], ps[2 * k + 1], LLVMConstVector(m, 2 * w), "");
+    }
+    return ps[0];
+}
+
+static LLVMValueRef const_lanes(LLVMTypeRef lane, unsigned n, unsigned long long v) {
+    LLVMValueRef c[64];
+    for (unsigned i = 0; i < n; i++) c[i] = LLVMConstInt(lane, v, false);
+    return LLVMConstVector(c, n);
+}
+
+// x86's one-instruction permutes of a table's lanes by indices of the same
+// width (the index modulo the lanes, or the lanes of both tables), where the
+// function's extensions have them: the intrinsic's name, or NULL.
+static const char *x86_permute(Type *t, bool two) {
+    if (g_arch != ARCH_X64) return NULL;
+    int w = t->elem->bits, bytes = w * t->lanes / 8;
+    bool f = (g_features & feature_bit("avx512f")) != 0;
+    if (bytes == 64 && w == 32 && f) return two ? "llvm.x86.avx512.vpermi2var.d.512" : "llvm.x86.avx512.permvar.si.512";
+    if (bytes == 64 && w == 64 && f) return two ? "llvm.x86.avx512.vpermi2var.q.512" : "llvm.x86.avx512.permvar.di.512";
+    if (bytes == 64 && w == 16 && (g_features & feature_bit("avx512bw")))
+        return two ? "llvm.x86.avx512.vpermi2var.hi.512" : "llvm.x86.avx512.permvar.hi.512";
+    if (bytes == 64 && w == 8 && (g_features & feature_bit("avx512vbmi")))
+        return two ? "llvm.x86.avx512.vpermi2var.qi.512" : "llvm.x86.avx512.permvar.qi.512";
+    if (!two && bytes == 32 && w == 32 && (g_features & feature_bit("avx2"))) return "llvm.x86.avx2.permd";
+    return NULL;
+}
+
+// @swizzle (spec §13.2): lane i of the result is lane idx[i] of the table, or
+// 0 when idx[i] (unsigned) is not a lane.
+static LLVMValueRef swizzle_lanes(Type *t, LLVMValueRef x, LLVMValueRef idx) {
+    unsigned n = (unsigned)t->lanes, w = (unsigned)t->elem->bits, lb = w / 8, nb = n * lb;
+    LLVMTypeRef vt = LLVMTypeOf(x), it = LLVMTypeOf(idx);
+    const char *perm = x86_permute(t, false);
+    if (perm && w > 8) {
+        LLVMValueRef args[2] = {LLVMBuildBitCast(B, x, it, ""), idx};
+        LLVMValueRef r = intrinsic(perm, NULL, 0, args, 2);
+        LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, const_lanes(LLVMGetElementType(it), n, n), "");
+        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(it), r, ""), vt, "");
+    }
+    LLVMTypeRef bt = LLVMVectorType(T_i8, nb);
+    if (w == 8) return LLVMBuildBitCast(B, swizzle_bytes(LLVMBuildBitCast(B, x, bt, ""), idx, nb), vt, "");
+    // byte indices: min(idx, n) * lb + k for byte k of each lane (at most 64 + 7)
+    LLVMValueRef mn[2] = {idx, const_lanes(LLVMGetElementType(it), n, n)};
+    LLVMValueRef cl = intrinsic("llvm.umin", &it, 1, mn, 2);
+    cl = LLVMBuildTrunc(B, cl, LLVMVectorType(T_i8, n), "");
+    LLVMValueRef rep[64], kk[64];
+    for (unsigned i = 0; i < nb; i++) {
+        rep[i] = LLVMConstInt(T_i32, i / lb, false);
+        kk[i] = LLVMConstInt(T_i8, i % lb, false);
+    }
+    LLVMValueRef bi = LLVMBuildShuffleVector(B, cl, LLVMGetUndef(LLVMTypeOf(cl)), LLVMConstVector(rep, nb), "");
+    bi = LLVMBuildAdd(B, LLVMBuildMul(B, bi, const_lanes(T_i8, nb, lb), ""), LLVMConstVector(kk, nb), "");
+    return LLVMBuildBitCast(B, swizzle_bytes(LLVMBuildBitCast(B, x, bt, ""), bi, nb), vt, "");
+}
+
+// @swizzle2: the same over the 2n lanes of a, then b.
+static LLVMValueRef swizzle2_lanes(Type *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef idx) {
+    unsigned n = (unsigned)t->lanes;
+    LLVMTypeRef vt = LLVMTypeOf(x), it = LLVMTypeOf(idx);
+    const char *perm = x86_permute(t, true);
+    if (perm) {
+        LLVMValueRef args[3] = {LLVMBuildBitCast(B, x, it, ""), idx, LLVMBuildBitCast(B, y, it, "")};
+        LLVMValueRef r = intrinsic(perm, NULL, 0, args, 3);
+        LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, const_lanes(LLVMGetElementType(it), n, 2 * n), "");
+        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(it), r, ""), vt, "");
+    }
+    // indices below n pick from x (in y they wrap to beyond its lanes), the
+    // others from y
+    LLVMValueRef lo = swizzle_lanes(t, x, idx);
+    LLVMValueRef hi = swizzle_lanes(t, y, LLVMBuildSub(B, idx, const_lanes(LLVMGetElementType(it), n, n), ""));
+    LLVMValueRef r = LLVMBuildOr(B, LLVMBuildBitCast(B, lo, it, ""), LLVMBuildBitCast(B, hi, it, ""), "");
+    return LLVMBuildBitCast(B, r, vt, "");
+}
+
+// The mask of a vector's first min(len, n) lanes.
+static LLVMValueRef first_lanes(int n, LLVMValueRef len) {
+    LLVMValueRef c[64];
+    for (int i = 0; i < n; i++) c[i] = LLVMConstInt(LLVMTypeOf(len), (unsigned long long)i, false);
+    LLVMValueRef lv = splat(LLVMVectorType(LLVMTypeOf(len), (unsigned)n), len, (unsigned)n);
+    return LLVMBuildICmp(B, LLVMIntULT, LLVMConstVector(c, (unsigned)n), lv, "");
 }
 
 // The processor instructions of spec §13.5, as LLVM's intrinsics. A
@@ -2291,31 +2426,27 @@ static LLVMValueRef gen_builtin(Expr *e) {
         for (int i = 0; i < idx->args.len; i++) m[i] = LLVMConstInt(T_i32, (unsigned long long)idx->args.data[i]->cval, false);
         return LLVMBuildShuffleVector(B, x, y, LLVMConstVector(m, (unsigned)idx->args.len), "");
     }
-    case BI_SWIZZLE: {
-        LLVMValueRef x = gen(a[0].e), idx = gen(a[1].e);
-        unsigned nl = (unsigned)ct(a[0].e->type)->lanes;
-        if (nl > 16) {
-            // a wider table: one 16-byte lookup per table piece, with the
-            // indices moved down by its offset (out of range there: 0)
-            unsigned np = nl / 16;
-            LLVMTypeRef v16 = LLVMVectorType(T_i8, 16);
-            LLVMValueRef r = LLVMConstNull(LLVMTypeOf(x));
-            for (unsigned k = 0; k < np; k++) {
-                LLVMValueRef ix = piece16(idx, k);
-                LLVMValueRef acc = LLVMConstNull(v16);
-                for (unsigned j = 0; j < np; j++) {
-                    LLVMValueRef off[16];
-                    for (int i = 0; i < 16; i++) off[i] = LLVMConstInt(T_i8, 16 * j, false);
-                    LLVMValueRef ij = LLVMBuildSub(B, ix, LLVMConstVector(off, 16), "");
-                    acc = LLVMBuildOr(B, acc, swizzle16(piece16(x, j), ij), "");
-                }
-                for (unsigned i = 0; i < 16; i++)
-                    r = LLVMBuildInsertElement(B, r, LLVMBuildExtractElement(B, acc, LLVMConstInt(T_i32, i, false), ""),
-                                               LLVMConstInt(T_i32, 16 * k + i, false), "");
-            }
-            return r;
-        }
-        return swizzle16(x, idx);
+    case BI_SWIZZLE: return swizzle_lanes(ct(a[0].e->type), gen(a[0].e), gen(a[1].e));
+    case BI_SWIZZLE2: return swizzle2_lanes(ct(a[0].e->type), gen(a[0].e), gen(a[1].e), gen(a[2].e));
+    case BI_LOAD_PARTIAL: {
+        LLVMValueRef s = gen(a[1].e);
+        LLVMValueRef p = LLVMBuildExtractValue(B, s, 0, "");
+        LLVMValueRef mask = first_lanes(rt->lanes, LLVMBuildExtractValue(B, s, 1, ""));
+        LLVMTypeRef tys[2] = {lty(rt), LLVMTypeOf(p)};
+        LLVMValueRef args[4] = {p, LLVMConstInt(T_i32, (unsigned long long)type_size(rt->elem), false), mask,
+                                LLVMConstNull(lty(rt))};
+        return intrinsic("llvm.masked.load", tys, 2, args, 4);
+    }
+    case BI_STORE_PARTIAL: {
+        Type *vt = ct(a[1].e->type);
+        LLVMValueRef s = gen(a[0].e);
+        LLVMValueRef v = gen(a[1].e);
+        LLVMValueRef p = LLVMBuildExtractValue(B, s, 0, "");
+        LLVMValueRef mask = first_lanes(vt->lanes, LLVMBuildExtractValue(B, s, 1, ""));
+        LLVMTypeRef tys[2] = {lty(vt), LLVMTypeOf(p)};
+        LLVMValueRef args[4] = {v, p, LLVMConstInt(T_i32, (unsigned long long)type_size(vt->elem), false), mask};
+        intrinsic("llvm.masked.store", tys, 2, args, 4);
+        return NULL;
     }
     case BI_LANES_EQ:
     case BI_LANES_NE:
@@ -2847,7 +2978,7 @@ static LLVMValueRef gen_slice(Expr *e) {
     LLVMValueRef hi = e->c ? gen(e->c) : len;
     LLVMValueRef ok = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntULE, lo, hi, ""), LLVMBuildICmp(B, LLVMIntULE, hi, len, ""), "");
     check_or_trap(ok, T_BOUNDS);
-    LLVMValueRef np = LLVMBuildGEP2(B, lty(rt->elem), ptr, &lo, 1, "");
+    LLVMValueRef np = LLVMBuildInBoundsGEP2(B, lty(rt->elem), ptr, &lo, 1, "");
     LLVMValueRef s = LLVMGetUndef(lty(rt));
     s = LLVMBuildInsertValue(B, s, np, 0, "");
     return LLVMBuildInsertValue(B, s, LLVMBuildSub(B, hi, lo, ""), 1, "");
@@ -2943,10 +3074,120 @@ static LLVMValueRef gen_inner(Expr *e) {
 // ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Accumulations that cannot overflow (issue 0029). In a loop with a known
+// trip count, `acc += x` with x of a bounded, non-negative range (a narrower
+// integer widened with @as, a constant), where acc is a local set to a
+// constant just before the loop and changed nowhere else in it, cannot
+// overflow when start + trips * the most added per trip fits acc's type: its
+// check is left out, so LLVM can unroll and vectorize the loop (summing 25
+// u8 into a u32, counting).
+// ---------------------------------------------------------------------------
+static bool ident_char(char c) { return c == '_' || (c >= '0' && c <= '9') || ((c | 32) >= 'a' && (c | 32) <= 'z'); }
+
+// Whether the source text of sp has the word `name` (names are never
+// shadowed, so this over-approximates the uses of a local).
+static bool span_mentions(Span sp, Sym name) {
+    SourceFile *f = g_files.data[sp.file];
+    size_t n = strlen(name);
+    for (size_t i = (size_t)sp.start; i + n <= (size_t)sp.end && i + n <= f->len; i++) {
+        if (memcmp(f->text + i, name, n) != 0) continue;
+        if (i > 0 && ident_char(f->text[i - 1])) continue;
+        if (i + n < f->len && ident_char(f->text[i + n])) continue;
+        return true;
+    }
+    return false;
+}
+
+// The range of an integer expression, when it is narrower than its type.
+static void expr_bounds(Expr *e, Type *t, i128 *lo, i128 *hi) {
+    int_range(t, lo, hi);
+    if (e->is_const) {
+        *lo = *hi = e->cval;
+    } else if (e->kind == E_BUILTIN && e->index == BI_AS && e->bargs.len == 2) {
+        Type *s = ct(e->bargs.data[1].e->type);
+        if (s->kind == TY_INT) int_range(s, lo, hi);
+    }
+}
+
+// The adds to acc in a loop body, summing their largest values into *hi;
+// false if acc is mentioned anywhere else (or in a nested loop), or an add
+// can be negative.
+static bool loop_adds(Stmt *s, Local *acc, Sym name, i128 *hi, StmtVec *adds) {
+    switch (s->kind) {
+    case S_BLOCK:
+        for (int i = 0; i < s->stmts.len; i++)
+            if (!loop_adds(s->stmts.data[i], acc, name, hi, adds)) return false;
+        return true;
+    case S_ASSIGN:
+        if (s->e->kind == E_IDENT && s->e->local == acc && s->op == TK_PLUS_EQ && s->e3 && s->e3->op == TK_PLUS) {
+            Type *t = ct(acc->type);
+            if (t->kind != TY_INT || span_mentions(s->e2->span, name)) return false;
+            i128 l, h;
+            expr_bounds(s->e2, t, &l, &h);
+            if (l < 0 || h > ((i128)1 << 70)) return false;
+            *hi += h;
+            vec_push(*adds, s);
+            return true;
+        }
+        return !span_mentions(s->span, name);
+    case S_IF:
+        if (span_mentions(s->e->span, name) || !loop_adds(s->body, acc, name, hi, adds)) return false;
+        return !s->els || loop_adds(s->els, acc, name, hi, adds);
+    case S_MATCH:
+        if (span_mentions(s->e->span, name)) return false;
+        for (int i = 0; i < s->arms.len; i++)
+            if (!loop_adds(s->arms.data[i].body, acc, name, hi, adds)) return false;
+        return true;
+    default: return !span_mentions(s->span, name);
+    }
+}
+
+static void mark_bounded_sums(Stmt *blk, int at) {
+    Stmt *loop = blk->stmts.data[at];
+    i128 trips;
+    if (loop->e2) {
+        if (!loop->e->is_const || !loop->e2->is_const) return;
+        trips = loop->e2->cval > loop->e->cval ? loop->e2->cval - loop->e->cval : 0;
+    } else {
+        Type *it = ct(loop->e->type);
+        if (it->kind != TY_ARRAY) return;
+        trips = it->len;
+    }
+    if (trips > ((i128)1 << 40)) return;
+    // the accumulators: locals set to a constant by the last statement
+    // before the loop that mentions them
+    for (int j = at - 1; j >= 0; j--) {
+        Stmt *d = blk->stmts.data[j];
+        Local *acc = NULL;
+        Expr *init = NULL;
+        if (d->kind == S_LET && d->local && d->e) {
+            acc = d->local;
+            init = d->e;
+        } else if (d->kind == S_ASSIGN && d->op == TK_EQ && d->e->kind == E_IDENT && d->e->local) {
+            acc = d->e->local;
+            init = d->e2;
+        }
+        if (!acc || acc->addr_taken || !init->is_const || ct(acc->type)->kind != TY_INT || init->cval < 0) continue;
+        bool later = false;  // mentioned between it and the loop
+        for (int k = j + 1; k < at && !later; k++) later = span_mentions(blk->stmts.data[k]->span, acc->name);
+        if (later || span_mentions(loop->e->span, acc->name) || (loop->e2 && span_mentions(loop->e2->span, acc->name)))
+            continue;
+        i128 per = 0;
+        StmtVec adds = {0};
+        if (!loop_adds(loop->body, acc, acc->name, &per, &adds) || adds.len == 0) continue;
+        i128 lo, hi;
+        int_range(ct(acc->type), &lo, &hi);
+        if (init->cval + trips * per <= hi)
+            for (int k = 0; k < adds.len; k++) adds.data[k]->no_overflow = true;
+    }
+}
+
 static void gen_block(Stmt *b) {
     int height = F->defers.len;
     for (int i = 0; i < b->stmts.len; i++) {
         if (terminated()) break;
+        if (b->stmts.data[i]->kind == S_FOR && O->opt_level > 0) mark_bounded_sums(b, i);
         gen_stmt(b->stmts.data[i]);
     }
     if (!terminated()) emit_defers(height);
@@ -3032,7 +3273,7 @@ static void gen_for(Stmt *s) {
     LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
     LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, len, ""), body, end);
     LLVMPositionBuilderAtEnd(B, body);
-    LLVMValueRef ep = LLVMBuildGEP2(B, lty(vt), ptr, &i, 1, "");
+    LLVMValueRef ep = LLVMBuildInBoundsGEP2(B, lty(vt), ptr, &i, 1, "");
     if (ct_->kind == TY_SLICE) asan_check(ep, usz(type_size(vt)));
     store(vt, load(vt, ep, ct_->kind == TY_SLICE), var, false);
     push_loop(end, step);
@@ -3146,7 +3387,8 @@ static void gen_stmt_inner(Stmt *s) {
         asan_place(s->e, addr);
         LLVMValueRef old = load(t, addr, un);
         LLVMValueRef r = gen(s->e2);
-        LLVMValueRef nv = gen_binop(s->e3->op, t, old, r, ct(s->e2->type));
+        LLVMValueRef nv = s->no_overflow ? (t->is_signed ? LLVMBuildNSWAdd(B, old, r, "") : LLVMBuildNUWAdd(B, old, r, ""))
+                                         : gen_binop(s->e3->op, t, old, r, ct(s->e2->type));
         store(t, nv, addr, un);
         return;
     }
@@ -3266,10 +3508,49 @@ static void delete_unreachable(LLVMValueRef fn) {
 
 // The end of a wasm function's entry block (where its allocas are): trap
 // with T0008 unless its frame fits above the thread's stack limit.
+// Whether the function calls anything but LLVM's intrinsics and the trap
+// (so it cannot recurse, and it uses no stack beyond its own frame).
+static bool is_leaf(LLVMValueRef fn) {
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+        for (LLVMValueRef i = LLVMGetFirstInstruction(bb); i; i = LLVMGetNextInstruction(i)) {
+            if (!LLVMIsACallInst(i) && !LLVMIsAInvokeInst(i)) continue;
+            LLVMValueRef callee = LLVMGetCalledValue(i);
+            if (!LLVMIsAFunction(callee)) return false;
+            size_t n;
+            const char *name = LLVMGetValueName2(callee, &n);
+            if (strncmp(name, "llvm.", 5) != 0 && strcmp(name, "axiom.trap") != 0) return false;
+        }
+    return true;
+}
+
+// Whether an alloca will become a register (mem2reg): it is only loaded and
+// stored whole, as a scalar or vector.
+static bool promotable(LLVMValueRef a) {
+    LLVMTypeRef t = LLVMGetAllocatedType(a);
+    LLVMTypeKind k = LLVMGetTypeKind(t);
+    if (k == LLVMStructTypeKind || k == LLVMArrayTypeKind) return false;
+    for (LLVMUseRef u = LLVMGetFirstUse(a); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsALoadInst(user)) {
+            if (LLVMTypeOf(user) != t || LLVMGetVolatile(user)) return false;
+        } else if (LLVMIsAStoreInst(user)) {
+            if (LLVMGetOperand(user, 0) == a || LLVMTypeOf(LLVMGetOperand(user, 0)) != t || LLVMGetVolatile(user))
+                return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void check_stack(Decl *d, LLVMBasicBlockRef entry, LLVMBasicBlockRef start) {
     unsigned long long frame = 0;
+    // a leaf whose locals all become registers has no frame on the stack
+    // (issue 0029: the check was most of the cost of small hot functions)
+    bool leaf = is_leaf(LLVMGetBasicBlockParent(entry));
     for (LLVMValueRef i = LLVMGetFirstInstruction(entry); i; i = LLVMGetNextInstruction(i)) {
         if (!LLVMIsAAllocaInst(i)) continue;
+        if (leaf && promotable(i)) continue;
         unsigned long long a = LLVMGetAlignment(i);
         if (a < 1) a = 1;
         frame = (frame + a - 1) / a * a + LLVMABISizeOfType(TD, LLVMGetAllocatedType(i));
@@ -3483,6 +3764,18 @@ static bool setup_target(void) {
                     : g_arch == ARCH_X64 ? "x86-64" : "generic";
     // @swizzle becomes pshufb when the target has SSSE3
     g_has_ssse3 = g_arch == ARCH_X64 && (g_features & 0x2);
+    if (g_target.wasm) {
+        // LLVM 18's loop strength reduction rewrites element addresses
+        // without `inbounds`, after which a constant offset can no longer
+        // fold into a load or store (offset=); wasm has no addressing modes
+        // for it to improve (issue 0029)
+        static bool parsed;
+        if (!parsed) {
+            const char *argv[] = {"axiom", "-disable-lsr"};
+            LLVMParseCommandLineOptions(2, argv, NULL);
+            parsed = true;
+        }
+    }
     TM = LLVMCreateTargetMachine(target, triple, cpu, features, ol, g_target.wasm ? LLVMRelocStatic : LLVMRelocPIC,
                                  LLVMCodeModelDefault);
     TD = LLVMCreateTargetDataLayout(TM);
