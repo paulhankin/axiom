@@ -1400,7 +1400,9 @@ fn fused(v: *mut ir.Value) bool {
 // as jumps), and a comparison whose 0/1 value something uses.
 const F_BRANCH: i32 = 4096;
 const F_VALUE: i32 = 8192;
-const F_RMW: i32 = 16384;  // a load, operation and store as one instruction (mark_rmw)
+const F_RMW: i32 = 16384;     // a load, operation and store as one instruction (mark_rmw)
+const F_RUN: i32 = 32768;     // the first of a run of constant stores, which stores them all (aux2: how many)
+const F_IN_RUN: i32 = 65536;  // a later store of such a run
 
 fn is_scalar_cmp(v: *ir.Value) bool {
     return (v.kind == ir.V_INST) and ((v.op == ir.OP_ICMP) or (v.op == ir.OP_FCMP)) and (v.a.ty.kind != ir.T_VEC);
@@ -2242,6 +2244,13 @@ fn mem_size(t: *ir.Ty) u8 {
 }
 
 fn gen_store(v: *mut ir.Value) void {
+    if (v.flag & F_IN_RUN) != 0 {
+        return;  // (stored by the first of its run)
+    }
+    if (v.flag & F_RUN) != 0 {
+        store_run(v);
+        return;
+    }
     let x = v.a;
     let t = x.ty;
     let m = addr(v.b);
@@ -6156,6 +6165,13 @@ fn prepare(f: *mut ir.Func) void {
         b = b.next;
     }
     mark_fused_vectors(f);
+    // consecutive stores of constants filling memory: vector stores (after
+    // mark_fused_vectors, which clears aux2)
+    b = f.first;
+    while u.notnil(b) {
+        mark_store_runs(b);
+        b = b.next;
+    }
 }
 
 // A store of (load p) op x to p, where the load and the operation are used
@@ -6210,6 +6226,195 @@ fn same_addr(p: *ir.Value, q: *ir.Value, depth: i32) bool {
         return (cval(p.b) == cval(q.b)) and same_addr(p.a, q.a, depth - 1);
     }
     return (p.b == q.b) and same_addr(p.a, q.a, depth - 1);
+}
+
+// A store of a scalar constant, at a constant offset from root (returned;
+// the offset in *k).
+fn const_store(i: *mut ir.Value, k: *mut i64) *mut ir.Value {
+    if (i.op != ir.OP_STORE) or (i.flags != 0) or ((i.flag & ~(F_RUN | F_IN_RUN)) != 0) {
+        return vnil();
+    }
+    let x = i.a;
+    let t = x.ty;
+    let scalar = ((t.kind == ir.T_INT) and (t.bits <= 64)) or (t.kind == ir.T_FLOAT) or (t.kind == ir.T_PTR);
+    if not scalar or ((x.kind != ir.V_CINT) and (x.kind != ir.V_CFP) and (x.kind != ir.V_ZERO)) {
+        return vnil();
+    }
+    let mut p = i.b;
+    k.* = 0;
+    while is_inst(p, ir.OP_PTRADD) and imm_ok(p.b) {
+        k.* = k.* + cval(p.b);
+        p = p.a;
+    }
+    return p;
+}
+
+// Does instruction x neither read nor write memory?
+fn no_memory(x: *ir.Value) bool {
+    let op = x.op;
+    return (op != ir.OP_LOAD) and (op != ir.OP_STORE) and (op != ir.OP_CALL) and (op != ir.OP_MEMCPY) and
+           (op != ir.OP_MEMMOVE) and (op != ir.OP_MEMSET) and (op != ir.OP_RMW) and (op != ir.OP_CMPXCHG) and
+           (op != ir.OP_FENCE) and (op != ir.OP_INTR) and (op != ir.OP_PHI) and (op != ir.OP_UDIV) and
+           (op != ir.OP_SDIV) and (op != ir.OP_UREM) and (op != ir.OP_SREM);  // (division traps)
+}
+
+// Marks runs of constant stores (with nothing between them that touches
+// memory) that fill 16 to 64 contiguous bytes from one root exactly once, such as a
+// local array set to [36; 11]u32: the first stores them all (store_run).
+fn mark_store_runs(b: *mut ir.Block) void {
+    let mut i = b.first;
+    while u.notnil(i) {
+        let mut k0: i64 = 0;
+        let root = const_store(i, &mut k0);
+        if u.isnil(root) {
+            i = i.next;
+            continue;
+        }
+        // the run: the same root, within 64 bytes, no byte twice
+        let mut cover: u64 = 0;
+        let mut lo = k0;
+        let mut hi = k0;
+        let mut n: i64 = 0;
+        let mut j = i;
+        let mut last = i;
+        while u.notnil(j) {
+            // (instructions that touch no memory may come between)
+            while u.notnil(j) and not ir.is_term(j.op) and no_memory(j) {
+                j = j.next;
+            }
+            if u.isnil(j) {
+                break;
+            }
+            let mut k: i64 = 0;
+            let r = const_store(j, &mut k);
+            if u.isnil(r) or (r != root) {
+                break;
+            }
+            let w = @as(i64, mem_size(j.a.ty));
+            let mut l2 = lo;
+            let mut h2 = hi;
+            if k < l2 {
+                l2 = k;
+            }
+            if (k + w) > h2 {
+                h2 = k + w;
+            }
+            if (h2 - l2) > 64 {
+                break;
+            }
+            // (the cover as bits from lo: shifted when lo moves down)
+            let mut c2 = cover;
+            if l2 < lo {
+                c2 = cover << @int_cast(u32, lo - l2);
+            }
+            let bits = ((@as(u64, 1) << @int_cast(u32, w)) - 1) << @int_cast(u32, k - l2);
+            if (c2 & bits) != 0 {
+                break;
+            }
+            cover = c2 | bits;
+            lo = l2;
+            hi = h2;
+            n += 1;
+            last = j;
+            j = j.next;
+        }
+        let span = hi - lo;
+        let mut all: u64 = 0xffff_ffff_ffff_ffff;
+        if span < 64 {
+            all = (@as(u64, 1) << @int_cast(u32, span)) - 1;
+        }
+        let full = cover == all;
+        if (n >= 2) and (span >= 16) and full {
+            i.flag = i.flag | F_RUN;
+            i.aux2 = n;
+            let mut x = i.next;
+            while x != last.next {
+                if x.op == ir.OP_STORE {
+                    x.flag = x.flag | F_IN_RUN;
+                }
+                x = x.next;
+            }
+            i = last.next;
+            continue;
+        }
+        i = i.next;
+    }
+}
+
+// The stores of a run (mark_store_runs) as vector stores of their bytes.
+fn store_run(v: *mut ir.Value) void {
+    let mut lo: i64 = 0x7fff_ffff;
+    let mut hi: i64 = -0x8000_0000;
+    let mut x = v;
+    let mut root = vnil();
+    for _q in @as(i64, 0)..v.aux2 {
+        while x.op != ir.OP_STORE {
+            x = x.next;
+        }
+        let mut k: i64 = 0;
+        root = const_store(x, &mut k);
+        let w = @as(i64, mem_size(x.a.ty));
+        if k < lo {
+            lo = k;
+        }
+        if (k + w) > hi {
+            hi = k + w;
+        }
+        x = x.next;
+    }
+    let span = hi - lo;
+    let mut data = bn.new_bytes();
+    data.zeros(@int_cast(usize, span));
+    x = v;
+    for _q in @as(i64, 0)..v.aux2 {
+        while x.op != ir.OP_STORE {
+            x = x.next;
+        }
+        let mut k: i64 = 0;
+        _ = const_store(x, &mut k);
+        let mut b = bn.new_bytes();
+        const_le(x.a, &mut b, 0);
+        let w = @as(usize, mem_size(x.a.ty));
+        for e in 0..w {
+            data.set_u8(@int_cast(usize, k - lo) + e, b.view()[e]);
+        }
+        b.free();
+        x = x.next;
+    }
+    let mut m = addr(root);
+    m.disp += lo;
+    let mut ch = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+    memop_chunks(span, &mut ch);
+    let outer_vl = VL;
+    let mut j: usize = 0;
+    while j < ch.len {
+        let off = ch.get(j);
+        let w = ch.get(j + 1);
+        VL = chunk_vl(w);
+        let t = vxmm();
+        let mut part = bn.new_bytes();
+        let mut zero = true;
+        for e in @as(i64, 0)..w {
+            let c = data.view()[@int_cast(usize, off + e)];
+            part.u8_(c);
+            if c != 0 {
+                zero = false;
+            }
+        }
+        if zero {
+            vzero(t);
+        } else {
+            _ = sse2(xe.MOVDQU_LD, W(t), const_bytes(&part, @int_cast(usize, w)));
+        }
+        part.free();
+        let mut d2 = m;
+        d2.disp += off;
+        _ = sse2(xe.MOVDQU_ST, R(t), d2);
+        j += 2;
+    }
+    VL = outer_vl;
+    data.free();
+    u.free(@ptr_cast(*mut void, ch.data));
 }
 
 // Does nothing after `from` and before `to` (in its block) write memory?
