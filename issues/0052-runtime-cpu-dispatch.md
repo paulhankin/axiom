@@ -1,7 +1,7 @@
 # 0052: No runtime CPU feature dispatch
 
 - Type: feature
-- Status: fixed (COMMIT): filed in error, the feature exists (issue 0015, spec §13.4); two bugs found while checking it are fixed
+- Status: fixed (a749803): filed in error, the feature exists (issue 0015, spec §13.4); two bugs found while checking it are fixed
 - Area: language, compiler (C and selfhost), std
 
 `@target_has("avx512f")` is a compile-time constant, so an Axiom program uses the vector
@@ -47,7 +47,7 @@ Filed in error: the language has had this since issue 0015 (5f8febd, f67d888), i
 
 Checking it on a `--cpu=x86-64` build with a version for
 `avx512f,avx512bw,avx512cd,avx512dq,avx512vl` turned up two bugs, in both compilers,
-fixed in COMMIT:
+fixed in a749803:
 
 - **`inline fn` helpers did not get the version's extensions.** A helper is inlined into an
   AVX-512 version, but its body was generated once, for the build, so `@target_has` inside it
