@@ -275,6 +275,7 @@ fn new_label() i32 {
 }
 
 fn place(l: i32) void {
+    addr_regs.clear();
     let i = e0(xe.LABEL, 0);
     i.aux = @as(i64, l);
 }
@@ -428,15 +429,20 @@ fn reg(v: *mut ir.Value) i32 {
             _ = e2(xe.LEA, 8, W(r), m);
             return r;
         }
+        let cached = cached_addr(@ptr_cast(*void, g));
+        if cached >= 0 {
+            return cached;
+        }
         if extern_global(g) {
             // possibly in a shared library: its address comes from the GOT
             // (the linker turns this into a lea when it is not)
             let mut m = mc.mem_sym(global_sym(g), 0);
             m.scale = 99;
             _ = e2(xe.LOAD, 8, W(r), m);
-            return r;
+        } else {
+            _ = e2(xe.LEA, 8, W(r), mc.mem_sym(global_sym(g), 0));
         }
-        _ = e2(xe.LEA, 8, W(r), mc.mem_sym(global_sym(g), 0));
+        cache_addr(@ptr_cast(*void, g), r);
         return r;
     }
     if k == ir.V_FUNC {
@@ -512,6 +518,35 @@ fn reg(v: *mut ir.Value) i32 {
         _ = e2(xe.MOV_RI, 8, W(r), I(x));
     }
     return r;
+}
+
+// The addresses of globals computed so far in the current machine block,
+// since its last label (which code after a conditional jump may reach
+// without them): later uses in the block take the same register.
+struct AddrReg {
+    key: *void,
+    r: i32,
+}
+
+let mut addr_regs: u.List.[AddrReg] = u.List.[AddrReg].{ data: @ptr_from_int(*mut AddrReg, 0), len: 0, cap: 0 };
+let mut addr_block: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
+
+fn cached_addr(key: *void) i32 {
+    if addr_block != CB {
+        addr_regs.clear();
+        addr_block = CB;
+    }
+    for k in 0..addr_regs.len {
+        let x = addr_regs.get(k);
+        if x.key == key {
+            return x.r;
+        }
+    }
+    return -1;
+}
+
+fn cache_addr(key: *void, r: i32) void {
+    addr_regs.push(AddrReg.{ key: key, r: r });
 }
 
 fn const_le(x: *mut ir.Value, out: *mut bn.Bytes, base: usize) void {
@@ -646,14 +681,7 @@ fn addr(p: *mut ir.Value) mc.MOp {
             return m;
         }
         if (p.flag & 1) != 0 {
-            let b = reg(p.a);
-            if is_inst(off, ir.OP_MUL) and is_c(off.b) {
-                let s = cval(off.b);
-                if (s == 1) or (s == 2) or (s == 4) or (s == 8) {
-                    return mc.mem(b, reg(off.a), @truncate(u8, @bit_cast(u64, s)), 0);
-                }
-            }
-            return mc.mem(b, reg(off), 1, 0);
+            return index_mem(p);
         }
     }
     if (p.kind == ir.V_GLOBAL) and not p.gv.tls and not extern_global(p.gv) {
@@ -663,6 +691,52 @@ fn addr(p: *mut ir.Value) mc.MOp {
         return tls_mem(p);
     }
     return mc.mem(reg(p), -1, 0, 0);
+}
+
+// [base + disp + index*scale] for ptradd p with a variable offset: a
+// constant offset of the base, or of the index, goes into the displacement.
+fn index_mem(p: *mut ir.Value) mc.MOp {
+    let off = p.b;
+    let mut m = base_mem(p.a);
+    let mut x = off;
+    let mut s: i64 = 1;
+    if is_inst(off, ir.OP_MUL) and is_c(off.b) {
+        let k = cval(off.b);
+        if (k == 1) or (k == 2) or (k == 4) or (k == 8) {
+            x = off.a;
+            s = k;
+        }
+    } else if is_inst(off, ir.OP_SHL) and is_c(off.b) and (cval(off.b) >= 0) and (cval(off.b) <= 3) {
+        x = off.a;
+        s = @as(i64, 1) << @int_cast(u32, cval(off.b));
+    }
+    if is_inst(x, ir.OP_ADD) and imm_ok(x.b) and (x.ty.bits == 64) and not folded_load(x.a) {
+        let nd = m.disp + (cval(x.b) * s);
+        if fits32(nd) and (cval(x.b) > -0x1000_0000) and (cval(x.b) < 0x1000_0000) {
+            m.disp = nd;
+            x = x.a;
+        }
+    }
+    m.index = reg(x);
+    m.scale = @truncate(u8, @bit_cast(u64, s));
+    return m;
+}
+
+// The base of an indexed memory operand: a register, a stack slot or a
+// register plus a constant (folded address arithmetic), with no index.
+fn base_mem(q: *mut ir.Value) mc.MOp {
+    if is_inst(q, ir.OP_ALLOCA) {
+        return mc.mem_slot(@truncate(i32, q.aux), 0);
+    }
+    if is_inst(q, ir.OP_PTRADD) and ((q.flag & 1) != 0) and imm_ok(q.b) {
+        let mut m = base_mem(q.a);
+        let nd = m.disp + cval(q.b);
+        if fits32(nd) {
+            m.disp = nd;
+            return m;
+        }
+    }
+    return mc.mem(reg(q), -1, 0, 0);
 }
 
 fn tls_global(p: *ir.Value) bool {
@@ -740,9 +814,14 @@ fn gen_alu(v: *mut ir.Value) void {
         b = v.a;
     }
     let d = vreg(v);
-    let ra = reg(a);
-    copy(d, ra, GPR);
-    hint(d, ra);
+    if is_c(a) and fits32(cval(a)) {
+        // (k - x: the constant straight into d)
+        _ = e2(xe.MOV_RI, sz, W(d), I(cval(a)));
+    } else {
+        let ra = reg(a);
+        copy(d, ra, GPR);
+        hint(d, ra);
+    }
     if folded_load(b) {
         // op d, [m]
         if o == ir.OP_MUL {
@@ -830,12 +909,81 @@ fn ext_kind(bits: i32, sign: bool) i32 {
 
 // A register with v extended to 32 bits (narrow) or v itself.
 fn reg_ext(v: *mut ir.Value, sign: bool) i32 {
-    let r = reg(v);
     let b = v.ty.bits;
     if (v.ty.kind == ir.T_INT) and (b < 32) and (b > 1) {
-        return ext_reg(r, b, sign, false);
+        if is_c(v) {
+            // the constant, extended
+            let r = vgpr();
+            let mut x = cval(v);
+            if not sign {
+                x = @bit_cast(i64, ir.cint_val(v));
+            }
+            _ = e2(xe.MOV_RI, 4, W(r), I(x & 0xffff_ffff));
+            return r;
+        }
+        if not sign and zext_known(v, 4) {
+            return reg(v);
+        }
+        return ext_reg(reg(v), b, sign, false);
     }
-    return r;
+    return reg(v);
+}
+
+// Does the register of integer v (of 8, 16 or 32 bits) have zeros above
+// its bits (up to 64), from how the selector computes it? 32-bit
+// operations clear the upper half, and loads and zero extensions of
+// narrower integers clear the rest; arithmetic on them leaves garbage in
+// the bits above (see the head of this file), but not a logical shift
+// right, an unsigned division, a bit count, or an `and` with a mask that
+// has them clear.
+fn zext_known(v: *ir.Value, depth: i32) bool {
+    let t = v.ty;
+    if (t.kind != ir.T_INT) or (t.bits > 32) or (t.bits < 8) {
+        return false;
+    }
+    if is_c(v) {
+        return cval(v) >= 0;  // (materialized sign-extended)
+    }
+    if (v.kind != ir.V_INST) or (depth <= 0) or ((v.flag & (4 | 8)) != 0) {
+        return false;  // (no register of its own: a test's `and`, a folded load)
+    }
+    let o = v.op;
+    if (o == ir.OP_LOAD) or (o == ir.OP_LSHR) or (o == ir.OP_UDIV) or (o == ir.OP_UREM) {
+        return true;
+    }
+    if o == ir.OP_ZEXT {
+        return v.a.ty.bits >= 8;  // (an i1 is 0 or 1 in the low 32 bits)
+    }
+    if o == ir.OP_INTR {
+        let id = pred_id(v);
+        if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_CTPOP) {
+            return true;
+        }
+        if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            return zext_known(v.xs.get(0), depth - 1) and zext_known(v.xs.get(1), depth - 1);
+        }
+        return false;
+    }
+    if o == ir.OP_SELECT {
+        return zext_known(v.b, depth - 1) and zext_known(v.c, depth - 1);
+    }
+    if t.bits == 32 {
+        // 32-bit operations
+        return (o == ir.OP_ADD) or (o == ir.OP_SUB) or (o == ir.OP_MUL) or (o == ir.OP_AND) or (o == ir.OP_OR) or
+               (o == ir.OP_XOR) or (o == ir.OP_SHL) or (o == ir.OP_ASHR) or (o == ir.OP_SDIV) or (o == ir.OP_SREM) or
+               (o == ir.OP_SEXT);
+    }
+    if o == ir.OP_AND {
+        return zext_known(v.a, depth - 1) or zext_known(v.b, depth - 1);
+    }
+    if (o == ir.OP_OR) or (o == ir.OP_XOR) {
+        return zext_known(v.a, depth - 1) and zext_known(v.b, depth - 1);
+    }
+    return false;
+}
+
+fn pred_id(v: *ir.Value) i32 {
+    return @truncate(i32, @bit_cast(i64, v.cv));
 }
 
 fn gen_div(v: *mut ir.Value) void {
@@ -873,7 +1021,7 @@ fn gen_shift(v: *mut ir.Value) void {
     let mut a = reg(v.a);
     if (bits < 32) and (bits > 1) {
         if o == ir.OP_LSHR {
-            a = ext_reg(a, bits, false, false);
+            a = reg_ext(v.a, false);
         } else if o == ir.OP_ASHR {
             a = ext_reg(a, bits, true, false);
         }
@@ -1078,9 +1226,89 @@ fn invert(cc: i32) i32 {
     return cc ^ 1;
 }
 
-// Is v a comparison fused into its only user (branch or select)?
+// Is v a comparison fused into its users (branches and selects, which
+// each compare again)?
 fn fused(v: *mut ir.Value) bool {
     return (v.kind == ir.V_INST) and ((v.flag & 2) != 0);
+}
+
+// Instruction flags (ir.Value.flag) of prepare beyond 1-64: a node of a
+// branch tree (an i1 and / or / not of conditions that its branch computes
+// as jumps), and a comparison whose 0/1 value something uses.
+const F_BRANCH: i32 = 4096;
+const F_VALUE: i32 = 8192;
+const F_RMW: i32 = 16384;  // a load, operation and store as one instruction (mark_rmw)
+
+fn is_scalar_cmp(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and ((v.op == ir.OP_ICMP) or (v.op == ir.OP_FCMP)) and (v.a.ty.kind != ir.T_VEC);
+}
+
+// Is v a `not` of an i1 (xor with 1)?
+fn is_not(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.op == ir.OP_XOR) and is_c(v.b) and (cval(v.b) == 1);
+}
+
+// Marks the and / or / not nodes of condition c of branch `us` that are
+// used only there (in its block), as jumps (F_BRANCH): the leaves are
+// compared where the branch is.
+fn mark_branch_tree(c: *mut ir.Value, us: *mut ir.Value) void {
+    if (c.kind != ir.V_INST) or (c.uses != 1) or (c.blk != us.blk) or (c.ty.kind != ir.T_INT) or (c.ty.bits != 1) {
+        return;
+    }
+    if (c.op == ir.OP_AND) or (c.op == ir.OP_OR) {
+        c.flag = c.flag | F_BRANCH;
+        mark_branch_tree(c.a, c);
+        mark_branch_tree(c.b, c);
+    } else if is_not(c) {
+        c.flag = c.flag | F_BRANCH;
+        mark_branch_tree(c.a, c);
+    }
+}
+
+// Jumps to t if c, else to f, for a branch tree (mark_branch_tree); next is
+// the label that follows (t, f or neither: -1), which needs no jump.
+fn branch_tree(c: *mut ir.Value, t: i32, f: i32, next: i32) void {
+    if (c.kind == ir.V_INST) and ((c.flag & F_BRANCH) != 0) {
+        if is_not(c) {
+            branch_tree(c.a, f, t, next);
+            return;
+        }
+        let m = new_label();
+        if c.op == ir.OP_AND {
+            branch_tree(c.a, m, f, m);
+        } else {
+            branch_tree(c.a, t, m, m);
+        }
+        place(m);
+        branch_tree(c.b, t, f, next);
+        return;
+    }
+    let cc = cond_code(c);
+    if cc == -1 {
+        // equal and ordered
+        jcc(xe.CC_NE, f);
+        jcc(xe.CC_P, f);
+        if next != t {
+            jmp(t);
+        }
+        return;
+    }
+    if cc == -2 {
+        jcc(xe.CC_NE, t);
+        jcc(xe.CC_P, t);
+        if next != f {
+            jmp(f);
+        }
+        return;
+    }
+    if next == t {
+        jcc(invert(cc), f);
+        return;
+    }
+    jcc(cc, t);
+    if next != f {
+        jmp(f);
+    }
 }
 
 fn cond_code(c: *mut ir.Value) i32 {
@@ -1108,10 +1336,11 @@ fn gen_select(v: *mut ir.Value) void {
     let d = vreg(v);
     let cls = class_of(v.ty);
     if cls == GPR {
+        // (the copy after the compare, which may read rf for the last time)
         let rt = reg(v.b);
         let rf = reg(v.c);
-        copy(d, rf, GPR);
         let cc = cond_code(v.a);
+        copy(d, rf, GPR);
         if cc >= 0 {
             let i = e2(xe.CMOV, isz(v.ty), RW(d), R(rt));
             i.cc = cc;
@@ -1135,8 +1364,8 @@ fn gen_select(v: *mut ir.Value) void {
     // floats and vectors: a branch around the move
     let rt = reg(v.b);
     let rf = reg(v.c);
-    copy(d, rf, cls);
     let cc = cond_code(v.a);
+    copy(d, rf, cls);
     let skip = new_label();
     if cc >= 0 {
         jcc(invert(cc), skip);
@@ -1191,8 +1420,8 @@ fn gen_cast(v: *mut ir.Value) void {
         let r = reg(v.a);
         let fb = from.bits;
         let to64 = to.bits > 32;
-        if not sg and is_inst(v.a, ir.OP_LOAD) and (fb >= 8) and (fb <= 16) {
-            copy(d, r, GPR);  // byte and halfword loads zero-extend
+        if not sg and zext_known(v.a, 4) {
+            copy(d, r, GPR);  // (e.g. byte and halfword loads, 32-bit operations)
             return;
         }
         if fb == 32 {
@@ -1325,10 +1554,12 @@ fn gen_int_to_float(v: *mut ir.Value, d: i32) void {
     let sg = v.op == ir.OP_SITOFP;
     let from = v.a.ty;
     let single = v.ty.bits == 32;
-    let mut r = reg(v.a);
     let fb = from.bits;
-    if fb < 32 {
-        r = ext_reg(r, fb, sg, false);
+    let mut r: i32 = 0;
+    if fb == 1 {
+        r = ext_reg(reg(v.a), fb, sg, false);
+    } else {
+        r = reg_ext(v.a, sg);
     }
     if sg {
         cvt_si2f(d, r, fb == 64, single);
@@ -1340,6 +1571,10 @@ fn gen_int_to_float(v: *mut ir.Value, d: i32) void {
     }
     if fb <= 32 {
         // zero-extended to 64 bits, then a signed 64-bit conversion
+        if (fb == 32) and zext_known(v.a, 4) {
+            cvt_si2f(d, r, true, single);
+            return;
+        }
         let z = vgpr();
         let i = e2(xe.EXT, 4, W(z), R(r));
         i.cc = 6;
@@ -1787,7 +2022,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
 // Memory
 // -----------------------------------------------------------------------------
 fn gen_load(v: *mut ir.Value) void {
-    if (v.flag & 8) != 0 {
+    if (v.flag & (8 | F_RMW)) != 0 {
         return;  // a memory operand of its user
     }
     let t = v.ty;
@@ -1851,6 +2086,22 @@ fn gen_store(v: *mut ir.Value) void {
         return;
     }
     let sz = mem_size(t);
+    if (v.flag & F_RMW) != 0 {
+        // op [m], x
+        let mut y = x.b;
+        if (x.op != ir.OP_SUB) and (x.b.kind == ir.V_INST) and (x.b.op == ir.OP_LOAD) and ((x.b.flag & F_RMW) != 0) {
+            y = x.a;
+        }
+        let digit = @truncate(i32, alu_digit(x.op));
+        if imm_ok(y) {
+            let i = e2(xe.ALU, sz, m, I(narrow_imm(cval(y), sz)));
+            i.cc = digit;
+        } else {
+            let i = e2(xe.ALU, sz, m, R(reg(y)));
+            i.cc = digit;
+        }
+        return;
+    }
     if imm_ok(x) {
         let mut c = cval(x);
         if sz == 1 {
@@ -2313,22 +2564,31 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
-        let sg = (id == ir.IN_SMIN) or (id == ir.IN_SMAX);
-        let a = reg_ext(a0, sg);
-        let b = reg_ext(v.xs.get(1), sg);
-        copy(d, a, GPR);
-        let c = e2(xe.ALU, sz, R(a), R(b));
-        c.cc = 7;
-        let m = e2(xe.CMOV, sz, RW(d), R(b));
-        if id == ir.IN_SMIN {
-            m.cc = xe.CC_G;
-        } else if id == ir.IN_SMAX {
-            m.cc = xe.CC_L;
-        } else if id == ir.IN_UMIN {
-            m.cc = xe.CC_A;
-        } else {
-            m.cc = xe.CC_B;
+        // compared at their own width (no extensions), a constant as an
+        // immediate; cmov at 32 or 64 bits
+        let mut x = a0;
+        let mut y = v.xs.get(1);
+        if is_c(x) and not is_c(y) {
+            x = v.xs.get(1);
+            y = a0;
         }
+        let mut csz = sz;
+        if bits == 8 {
+            csz = 1;
+        } else if bits == 16 {
+            csz = 2;
+        }
+        let a = reg(x);
+        let b = reg(y);
+        if imm_ok(y) {
+            let c = e2(xe.ALU, csz, R(a), I(narrow_imm(cval(y), csz)));
+            c.cc = 7;
+        } else {
+            let c = e2(xe.ALU, csz, R(a), R(b));
+            c.cc = 7;
+        }
+        copy(d, a, GPR);  // (after the compare: a may end there)
+        minmax_cmov(id, sz, d, b);
         return;
     }
     if id == ir.IN_ABS {
@@ -2417,6 +2677,20 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     fail(u.f1("integer intrinsic %s", u.idec(id)));
+}
+
+// d = b where the compare of d (a) with b says b is the minimum / maximum.
+fn minmax_cmov(id: i32, sz: u8, d: i32, b: i32) void {
+    let m = e2(xe.CMOV, sz, RW(d), R(b));
+    if id == ir.IN_SMIN {
+        m.cc = xe.CC_G;
+    } else if id == ir.IN_SMAX {
+        m.cc = xe.CC_L;
+    } else if id == ir.IN_UMIN {
+        m.cc = xe.CC_A;
+    } else {
+        m.cc = xe.CC_B;
+    }
 }
 
 // popcount without POPCNT: the classic SWAR reduction.
@@ -4176,16 +4450,12 @@ fn gen_ptradd(v: *mut ir.Value) void {
             return;
         }
     }
-    let a = reg(v.a);
-    let off = v.b;
-    if is_inst(off, ir.OP_MUL) and is_c(off.b) {
-        let s = cval(off.b);
-        if (s == 1) or (s == 2) or (s == 4) or (s == 8) {
-            _ = e2(xe.LEA, 8, W(d), mc.mem(a, reg(off.a), @truncate(u8, @bit_cast(u64, s)), 0));
-            return;
-        }
+    if tls_global(v.a) {
+        let a = reg(v.a);
+        _ = e2(xe.LEA, 8, W(d), mc.mem(a, reg(v.b), 1, 0));
+        return;
     }
-    _ = e2(xe.LEA, 8, W(d), mc.mem(a, reg(off), 1, 0));
+    _ = e2(xe.LEA, 8, W(d), index_mem(v));
 }
 
 // The widest vector an instruction computes or reads, as VL.
@@ -4230,8 +4500,8 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if (o >= ir.OP_ADD) and (o <= ir.OP_ASHR) {
-        if (v.flag & 4) != 0 {
-            return;  // an `and` computed by the test of its comparison
+        if (v.flag & (4 | F_BRANCH | F_RMW)) != 0 {
+            return;  // an `and` computed by the test of its comparison, part of a branch tree, or of a store
         }
         if t.kind == ir.T_VEC {
             vec_binop(v);
@@ -4481,10 +4751,21 @@ fn gen_term(b: *mut ir.Block) void {
         return;
     }
     if o == ir.OP_CONDBR {
-        let cc = cond_code(t.a);
-        phi_copies(b);
         let tt = t.t1;
         let ff = t.t2;
+        if (t.a.kind == ir.V_INST) and ((t.a.flag & F_BRANCH) != 0) {
+            phi_copies(b);
+            let mut next: i32 = -1;
+            if next_block_is(b, tt) {
+                next = blk(tt);
+            } else if next_block_is(b, ff) {
+                next = blk(ff);
+            }
+            branch_tree(t.a, blk(tt), blk(ff), next);
+            return;
+        }
+        let cc = cond_code(t.a);
+        phi_copies(b);
         if cc == -1 {
             // equal and ordered
             jcc(xe.CC_NE, blk(ff));
@@ -4628,18 +4909,74 @@ fn prepare(f: *mut ir.Func) void {
         }
         b = b.next;
     }
-    // comparisons fused into their branch / select
+    // an address-only ptradd with a variable offset that is the base of
+    // another one with a variable offset needs a register (base_mem): where
+    // that is in another block (perhaps a loop), compute it once instead
     b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
-                let us = i.user;
-                if (us.blk == b) and (us.a == i) {
-                    if (us.op == ir.OP_CONDBR) or (us.op == ir.OP_SELECT) {
-                        i.flag = i.flag | 2;
+            let q = i.a;
+            if (i.op == ir.OP_PTRADD) and not imm_ok(i.b) and is_inst(q, ir.OP_PTRADD) and ((q.flag & 1) != 0) and
+               not imm_ok(q.b) {
+                let mut away = i.blk != q.blk;
+                if ((i.flag & 1) != 0) and ((i.uses != 1) or u.isnil(i.user) or (i.user.blk != q.blk)) {
+                    away = true;
+                }
+                if away {
+                    q.flag = q.flag & ~1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // the and / or / not of comparisons a branch tests (branch_tree)
+    b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) {
+            mark_branch_tree(t.a, t);
+        }
+        b = b.next;
+    }
+    // comparisons fused into their branches and selects: every use is the
+    // condition of a branch or a select in its block (each compares again),
+    // or a leaf of a branch tree
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+            for k in @as(usize, 0)..3 {
+                let o = ops[k];
+                if u.notnil(o) and is_scalar_cmp(o) {
+                    let cond = (o.blk == b) and
+                               (((k == 0) and ((i.op == ir.OP_CONDBR) or (i.op == ir.OP_SELECT))) or
+                                ((k <= 1) and ((i.flag & F_BRANCH) != 0)));
+                    if not cond {
+                        o.flag = o.flag | F_VALUE;
                     }
                 }
+            }
+            for k in 0..i.xs.len {
+                let o = i.xs.get(k);
+                if is_scalar_cmp(o) {
+                    o.flag = o.flag | F_VALUE;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if is_scalar_cmp(i) and (i.uses >= 1) and ((i.flag & F_VALUE) == 0) {
+                i.flag = i.flag | 2;
+            }
+            if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
                 // (x & y) cmp 0: test x, y
                 let x = i.a;
                 if (i.op == ir.OP_ICMP) and is_c(i.b) and (cval(i.b) == 0) and (x.kind == ir.V_INST) and
@@ -4652,6 +4989,16 @@ fn prepare(f: *mut ir.Func) void {
         }
         b = b.next;
     }
+    // load; op; store to the same address: one read-modify-write instruction
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            mark_rmw(i);
+            i = i.next;
+        }
+        b = b.next;
+    }
     // loads that are memory operands of their only user (a compare, or an
     // add, sub, and, or, xor, mul) when nothing between writes memory
     b = f.first;
@@ -4659,7 +5006,7 @@ fn prepare(f: *mut ir.Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_INT) and
-               u.notnil(i.user) and (i.user.blk == b) {
+               u.notnil(i.user) and (i.user.blk == b) and ((i.flag & F_RMW) == 0) {
                 let us = i.user;
                 let bits = i.ty.bits;
                 let mut ok = false;
@@ -4668,9 +5015,13 @@ fn prepare(f: *mut ir.Func) void {
                    ((bits == 8) or (bits == 16) or (bits == 32) or (bits == 64)) {
                     ok = ((us.a == i) and (us.b != i) and imm_ok(us.b)) or ((us.b == i) and (us.a != i));
                     if fused(us) {
+                        // (compared at its branch or select, or a branch tree's branch)
                         end = us.user;
+                        while (end.flag & F_BRANCH) != 0 {
+                            end = end.user;
+                        }
                     }
-                } else if ((bits == 32) or (bits == 64)) and ((us.flag & 4) == 0) and (us.a != us.b) and
+                } else if ((bits == 32) or (bits == 64)) and ((us.flag & (4 | F_RMW)) == 0) and (us.a != us.b) and
                           ((us.op == ir.OP_ADD) or (us.op == ir.OP_SUB) or (us.op == ir.OP_AND) or
                            (us.op == ir.OP_OR) or (us.op == ir.OP_XOR) or (us.op == ir.OP_MUL)) {
                     ok = (us.b == i) or ((us.a == i) and (us.op != ir.OP_SUB));
@@ -4690,6 +5041,60 @@ fn prepare(f: *mut ir.Func) void {
         b = b.next;
     }
     mark_fused_vectors(f);
+}
+
+// A store of (load p) op x to p, where the load and the operation are used
+// only there, as op [p], x (F_RMW on all three: the store computes them).
+fn mark_rmw(st: *mut ir.Value) void {
+    if (st.op != ir.OP_STORE) or (st.flags != 0) {
+        return;
+    }
+    let y = st.a;
+    let t = y.ty;
+    if (y.kind != ir.V_INST) or (t.kind != ir.T_INT) or (t.bits < 8) or (t.bits > 64) or (y.uses != 1) or
+       (y.blk != st.blk) or (y.flag != 0) {
+        return;
+    }
+    let o = y.op;
+    if (o != ir.OP_ADD) and (o != ir.OP_SUB) and (o != ir.OP_AND) and (o != ir.OP_OR) and (o != ir.OP_XOR) {
+        return;
+    }
+    let mut ld = y.a;
+    let mut x = y.b;
+    if not rmw_load(ld, st) and (o != ir.OP_SUB) {
+        ld = y.b;
+        x = y.a;
+    }
+    if not rmw_load(ld, st) or (x == ld) or folded_load(x) {
+        return;
+    }
+    if not quiet_between(ld, st) {
+        return;
+    }
+    ld.flag = ld.flag | F_RMW;
+    y.flag = y.flag | F_RMW;
+    st.flag = st.flag | F_RMW;
+}
+
+// Is ld a plain load, used once, of what store st writes (the same address)?
+fn rmw_load(ld: *mut ir.Value, st: *mut ir.Value) bool {
+    return (ld.kind == ir.V_INST) and (ld.op == ir.OP_LOAD) and (ld.uses == 1) and (ld.flags == 0) and
+           (ld.blk == st.blk) and (ld.flag == 0) and (ld.ty == st.a.ty) and same_addr(ld.a, st.b, 4);
+}
+
+// Are p and q the same address (the same value, or the same constant
+// offset from the same address)?
+fn same_addr(p: *ir.Value, q: *ir.Value, depth: i32) bool {
+    if p == q {
+        return true;
+    }
+    if (depth <= 0) or not is_inst(p, ir.OP_PTRADD) or not is_inst(q, ir.OP_PTRADD) {
+        return false;
+    }
+    if is_c(p.b) and is_c(q.b) {
+        return (cval(p.b) == cval(q.b)) and same_addr(p.a, q.a, depth - 1);
+    }
+    return (p.b == q.b) and same_addr(p.a, q.a, depth - 1);
 }
 
 // Does nothing after `from` and before `to` (in its block) write memory?
@@ -4861,6 +5266,8 @@ fn compile_func(f: *mut ir.Func) void {
         let ib = order.get(bi);
         IB = ib;
         CB = MF.blocks.get(bi);
+        addr_regs.clear();
+        addr_block = CB;
         let mut i = ib.first;
         while u.notnil(i) {
             if i.src != 0 {
@@ -4975,6 +5382,13 @@ fn byte_reg_force(r: i32) bool {
 
 // opcode (1-2 bytes) with reg field `reg` and r/m operand `rm` (register or memory)
 fn enc_op(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i64, byte_op: bool) void {
+    enc_op2(sz, nop, op0, op1, rf, rm, imm_after, byte_op, byte_op);
+}
+
+// enc_op where byte_rf and byte_rm say which of the reg field (not a /digit
+// or a wider register) and the r/m operand is a byte register: spl, bpl,
+// sil and dil need a REX prefix, al-bl do not.
+fn enc_op2(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i64, byte_rf: bool, byte_rm: bool) void {
     if sz == 2 {
         b8(0x66);
     }
@@ -4984,7 +5398,7 @@ fn enc_op(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i6
     }
     if rm.kind == mc.K_REG {
         let rr = P(rm.reg);
-        let force = byte_op and (byte_reg_force(rf) or byte_reg_force(rr));
+        let force = (byte_rf and byte_reg_force(rf)) or (byte_rm and byte_reg_force(rr));
         let v = ((w << 3) | ((@as(u64, @bit_cast(u32, rf & 15)) >> 3) << 2)) | (@as(u64, @bit_cast(u32, rr & 15)) >> 3);
         if (v != 0) or force {
             b8(0x40 | v);
@@ -4993,7 +5407,7 @@ fn enc_op(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i6
         xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, rf)), @as(u64, @bit_cast(u32, rr)));
         return;
     }
-    rex_for_mem(w, rf, rm, byte_op and byte_reg_force(rf));
+    rex_for_mem(w, rf, rm, byte_rf and byte_reg_force(rf));
     opcode(nop, op0, op1);
     enc_mem(rf, rm, imm_after);
 }
@@ -5425,7 +5839,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.LEA {
-        enc_op(8, 1, 0x8d, 0, P(i.ops[0].reg), i.ops[1], 0, false);
+        enc_op(u.pick(sz == 4, "\x04", "\x08")[0], 1, 0x8d, 0, P(i.ops[0].reg), i.ops[1], 0, false);
         return;
     }
     if op == xe.ALU {
@@ -5437,7 +5851,7 @@ fn enc_inst(i: *mut mc.MInst) void {
             let x = s.disp;
             let rm = i.ops[0];
             if sz == 1 {
-                enc_op(1, 1, 0x80, 0, digit, rm, 1, true);
+                enc_op2(1, 1, 0x80, 0, digit, rm, 1, false, true);
                 enc_imm(x, 1);
             } else if (x >= -128) and (x <= 127) {
                 enc_op(sz, 1, 0x83, 0, digit, rm, 1, false);
@@ -5449,6 +5863,16 @@ fn enc_inst(i: *mut mc.MInst) void {
             return;
         }
         let base = @truncate(u8, @bit_cast(u32, digit)) * 8;
+        if i.ops[0].kind == mc.K_MEM {
+            // op [m], r
+            let r = P(s.reg);
+            if sz == 1 {
+                enc_op(1, 1, base, 0, r, i.ops[0], 0, true);
+            } else {
+                enc_op(sz, 1, base + 1, 0, r, i.ops[0], 0, false);
+            }
+            return;
+        }
         if sz == 1 {
             enc_op(1, 1, base + 2, 0, d, s, 0, true);
         } else {
@@ -5461,7 +5885,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         let s = i.ops[1];
         if s.kind == mc.K_IMM {
             if sz == 1 {
-                enc_op(1, 1, 0xf6, 0, 0, a, 1, true);
+                enc_op2(1, 1, 0xf6, 0, 0, a, 1, false, true);
                 enc_imm(s.disp, 1);
             } else {
                 enc_op(sz, 1, 0xf7, 0, 0, a, imm_len(sz), false);
@@ -5496,13 +5920,13 @@ fn enc_inst(i: *mut mc.MInst) void {
         let dst = i.ops[0];
         if i.ops[2].kind == mc.K_IMM {
             if sz == 1 {
-                enc_op(1, 1, 0xc0, 0, digit, dst, 1, true);
+                enc_op2(1, 1, 0xc0, 0, digit, dst, 1, false, true);
             } else {
                 enc_op(sz, 1, 0xc1, 0, digit, dst, 1, false);
             }
             enc_imm(i.ops[2].disp, 1);
         } else if sz == 1 {
-            enc_op(1, 1, 0xd2, 0, digit, dst, 0, true);
+            enc_op2(1, 1, 0xd2, 0, digit, dst, 0, false, true);
         } else {
             enc_op(sz, 1, 0xd3, 0, digit, dst, 0, false);
         }
@@ -5534,7 +5958,7 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == xe.UNARY {
         if sz == 1 {
-            enc_op(1, 1, 0xf6, 0, i.cc, i.ops[0], 0, true);
+            enc_op2(1, 1, 0xf6, 0, i.cc, i.ops[0], 0, false, true);
         } else {
             enc_op(sz, 1, 0xf7, 0, i.cc, i.ops[0], 0, false);
         }
@@ -5545,11 +5969,11 @@ fn enc_inst(i: *mut mc.MInst) void {
         let s = i.ops[1];
         let k = i.cc;
         if k == 1 {
-            enc_op(4, 2, 0x0f, 0xb6, d, s, 0, true);
+            enc_op2(4, 2, 0x0f, 0xb6, d, s, 0, false, true);
         } else if k == 2 {
             enc_op(4, 2, 0x0f, 0xb7, d, s, 0, false);
         } else if k == 3 {
-            enc_op(sz, 2, 0x0f, 0xbe, d, s, 0, true);
+            enc_op2(sz, 2, 0x0f, 0xbe, d, s, 0, false, true);
         } else if k == 4 {
             enc_op(sz, 2, 0x0f, 0xbf, d, s, 0, false);
         } else if k == 5 {
@@ -5571,7 +5995,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.SETCC {
-        enc_op(1, 2, 0x0f, 0x90 + @truncate(u8, @bit_cast(u32, i.cc)), 0, i.ops[0], 0, true);
+        enc_op2(1, 2, 0x0f, 0x90 + @truncate(u8, @bit_cast(u32, i.cc)), 0, i.ops[0], 0, false, true);
         return;
     }
     if op == xe.CMOV {
@@ -5789,7 +6213,7 @@ fn noop_move(i: *mc.MInst) bool {
 
 fn jump_target(b: *mc.MBlock) i32 {
     let mut i = b.first;
-    while u.notnil(i) and noop_move(i) {
+    while u.notnil(i) and (noop_move(i) or (i.op == xe.LABEL)) {
         i = i.next;
     }
     if u.notnil(i) and (i.op == xe.JMP) and u.isnil(i.next) and (i.ops[0].label < xe.LOCAL_BASE) {
@@ -5801,6 +6225,173 @@ fn jump_target(b: *mc.MBlock) i32 {
 fn ends_flow(b: *mc.MBlock) bool {
     let l = b.last;
     return u.notnil(l) and ((l.op == xe.JMP) or (l.op == xe.RET) or (l.op == xe.UD2));
+}
+
+// Does the code after block bi start with block t (with nothing encoded
+// between)?
+fn falls_to(skip: []bool, bi: usize, t: i32) bool {
+    let nb = MF.blocks.len;
+    let mut k = bi + 1;
+    while k < nb {
+        if @int_cast(usize, t) == k {
+            return true;
+        }
+        if not skip[k] {
+            let mut i = MF.blocks.get(k).first;
+            while u.notnil(i) {
+                if not noop_move(i) and (i.op != xe.LABEL) {
+                    return false;
+                }
+                i = i.next;
+            }
+        }
+        k += 1;
+    }
+    return false;
+}
+
+// Jumps to a local label that nothing but no-op moves and labels precede.
+fn drop_local_jumps(b: *mut mc.MBlock) void {
+    let mut i = b.first;
+    while u.notnil(i) {
+        let nx = i.next;
+        if (i.op == xe.JMP) and (i.ops[0].label >= xe.LOCAL_BASE) {
+            let mut j = nx;
+            while u.notnil(j) and (noop_move(j) or ((j.op == xe.LABEL) and (j.aux != @as(i64, i.ops[0].label)))) {
+                j = j.next;
+            }
+            if u.notnil(j) and (j.op == xe.LABEL) and (j.aux == @as(i64, i.ops[0].label)) {
+                mc.remove(b, i);
+            }
+        }
+        i = nx;
+    }
+}
+
+// After allocation, where nothing reads the flags before they are set
+// again: `mov r, 0` becomes `xor r32, r32` (shorter, and a zeroing idiom),
+// and `mov d, a; add d, b|k` (or sub k) becomes `lea d, [a + b|k]`. Flags
+// are never live into a block; a label or jump makes them live
+// (conservatively), as do the instructions that read them.
+fn peephole(b: *mut mc.MBlock) void {
+    let mut live = false;  // (after i)
+    let mut i = b.last;
+    while u.notnil(i) {
+        let op = i.op;
+        if not live and three_address(b, i) {
+            i = i.prev;
+            continue;
+        }
+        if (op == xe.JMP) and (i.ops[0].label < xe.LOCAL_BASE) {
+            live = false;  // (to another block)
+        } else if (op == xe.JCC) or (op == xe.CMOV) or (op == xe.SETCC) or (op == xe.JMP) or (op == xe.LABEL) {
+            live = true;
+        } else if (op == xe.ALU) or (op == xe.TEST) or (op == xe.CMP_M) or (op == xe.CALL) {
+            live = false;
+        } else if (op == xe.MOV_RI) and (i.ops[1].disp == 0) and not live {
+            i.op = xe.ALU;
+            i.cc = 6;
+            i.sz = 4;
+            i.ops[1] = i.ops[0];
+        }
+        i = i.prev;
+    }
+}
+
+// After allocation: a compare of registers (or a register and a constant)
+// that an identical earlier one in the block makes redundant, with nothing
+// between that sets the flags or writes the registers, is dropped.
+fn reuse_flags(b: *mut mc.MBlock) void {
+    let mut last = u.nil.[mc.MInst]();
+    let mut i = b.first;
+    while u.notnil(i) {
+        let nx = i.next;
+        let op = i.op;
+        let is_cmp = (((op == xe.ALU) and (i.cc == 7)) or (op == xe.TEST)) and (i.ops[0].kind == mc.K_REG) and
+                     ((i.ops[1].kind == mc.K_REG) or (i.ops[1].kind == mc.K_IMM));
+        if is_cmp {
+            if u.notnil(last) and (last.op == op) and (last.sz == i.sz) and (last.cc == i.cc) and
+               same_mop(last.ops[0], i.ops[0]) and same_mop(last.ops[1], i.ops[1]) {
+                mc.remove(b, i);
+            } else {
+                last = i;
+            }
+        } else if (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or (op == xe.STORE_I) or
+                  (op == xe.LEA) or (op == xe.EXT) or (op == xe.SETCC) or (op == xe.CMOV) or (op == xe.SHIFTX) or
+                  (op == xe.JCC) or
+                  ((op == xe.SSE) and (i.cc != xe.UCOMISS) and (i.cc != xe.UCOMISD) and (i.cc != xe.PTEST)) {
+            if u.notnil(last) and writes_reg_of(i, last) {
+                last = u.nil.[mc.MInst]();
+            }
+        } else {
+            last = u.nil.[mc.MInst]();
+        }
+        i = nx;
+    }
+}
+
+fn same_mop(a: mc.MOp, b: mc.MOp) bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    if a.kind == mc.K_REG {
+        return P(a.reg) == P(b.reg);
+    }
+    return (a.kind == mc.K_IMM) and (a.disp == b.disp);
+}
+
+// Does i write a register that compare c reads?
+fn writes_reg_of(i: *mc.MInst, c: *mc.MInst) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) {
+            let r = P(o.reg);
+            for j in @as(usize, 0)..2 {
+                if (c.ops[j].kind == mc.K_REG) and (P(c.ops[j].reg) == r) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// `mov d, a; add d, b|k` (sub k) as `lea d, [a + b|k]` at i (the add),
+// when d is not a.
+fn three_address(b: *mut mc.MBlock, i: *mut mc.MInst) bool {
+    let mv = i.prev;
+    if (i.op != xe.ALU) or ((i.cc != 0) and (i.cc != 5)) or ((i.sz != 4) and (i.sz != 8)) or u.isnil(mv) or
+       (mv.op != xe.MOV_RR) or (i.ops[0].kind != mc.K_REG) {
+        return false;
+    }
+    let d = P(i.ops[0].reg);
+    if (P(mv.ops[0].reg) != d) or (P(mv.ops[1].reg) == d) or ((mv.sz != 8) and (i.sz == 8)) {
+        return false;
+    }
+    let a = mv.ops[1].reg;
+    let s = i.ops[1];
+    let mut m = mc.mem(a, -1, 0, 0);
+    if s.kind == mc.K_IMM {
+        let mut k = s.disp;
+        if i.cc == 5 {
+            k = 0 - k;
+        }
+        if not fits32(k) {
+            return false;
+        }
+        m.disp = k;
+    } else if (s.kind == mc.K_REG) and (i.cc == 0) and (P(s.reg) != d) {
+        m.index = s.reg;
+        m.scale = 1;
+    } else {
+        return false;
+    }
+    i.op = xe.LEA;
+    i.cc = 0;
+    i.ops[0] = W(i.ops[0].reg);
+    i.ops[1] = m;
+    mc.remove(b, mv);
+    return true;
 }
 
 fn tidy_branches() []mut bool {
@@ -5841,27 +6432,29 @@ fn tidy_branches() []mut bool {
         }
         skip[bi] = true;
     }
-    // fall-throughs
-    for bi in 0..nb {
+    // fall-throughs (into the next block, or past blocks that encode
+    // nothing: skipped ones, and ones left with only no-op moves; from the
+    // last block back, so that a chain of jumps to one place all go)
+    for bj in 0..nb {
+        let bi = nb - 1 - bj;
         if skip[bi] {
             continue;
         }
-        let mut next = bi + 1;
-        while (next < nb) and skip[next] {
-            next += 1;
-        }
+        drop_local_jumps(MF.blocks.get(bi));
+        reuse_flags(MF.blocks.get(bi));
+        peephole(MF.blocks.get(bi));
         let b = MF.blocks.get(bi);
         let l = b.last;
         if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
             continue;
         }
-        if @int_cast(usize, l.ops[0].label) == next {
+        if falls_to(skip, bi, l.ops[0].label) {
             mc.remove(b, l);
             continue;
         }
         let pj = l.prev;
         if u.notnil(pj) and (pj.op == xe.JCC) and (pj.ops[0].label < xe.LOCAL_BASE) and
-           (@int_cast(usize, pj.ops[0].label) == next) {
+           falls_to(skip, bi, pj.ops[0].label) {
             pj.cc = invert(pj.cc);
             pj.ops[0].label = l.ops[0].label;
             mc.remove(b, l);
