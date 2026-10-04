@@ -59,3 +59,5 @@ they travel with the code they describe.
 | [0027](0027-partial-vector-loads.md) | feature | language, compiler (C and selfhost) | Loads and stores of a vector's first lanes (masked tails) |
 | [0028](0028-reduce-add-order.md) | feature | language (spec §13.2), compiler (C and selfhost) | @reduce_add's fixed order: fold the halves |
 | [0029](0029-codegen-checks-in-hot-code.md) | feature | compiler (C) | Code generation: address offsets, stack checks and overflow checks in hot code |
+| [0030](0030-vector-float-to-int-scalarized.md) | bug | compiler (C) | Vector `@int_from_float` is scalarized on x86 |
+| [0031](0031-select-and-constant-multiply-checks.md) | feature | compiler (C), language | `@select` through bitwise operations, checked multiplication by a constant through a division, no widening `@shuffle` |
