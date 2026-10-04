@@ -61,3 +61,7 @@ they travel with the code they describe.
 | [0029](0029-codegen-checks-in-hot-code.md) | feature | compiler (C) | Code generation: address offsets, stack checks and overflow checks in hot code |
 | [0030](0030-vector-float-to-int-scalarized.md) | bug | compiler (C) | Vector `@int_from_float` is scalarized on x86 |
 | [0031](0031-select-and-constant-multiply-checks.md) | feature | compiler (C), language | `@select` through bitwise operations, checked multiplication by a constant through a division, no widening `@shuffle` |
+| [0032](0032-forced-inlining.md) | feature | language, compiler (C and selfhost) | Forced inlining (`inline fn`) |
+| [0033](0033-checked-multiply-on-native.md) | feature | compiler (C) | Checked 64-bit multiplication divides back natively |
+| [0034](0034-debug-line-info.md) | feature | compiler (C), tools | Line tables (DWARF) for native profilers |
+| [0035](0035-widen-narrow-and-bool-to-int.md) | bug, feature | compiler (C), language | `@widen_low`/`@widen_high`/`@narrow` unimplemented; no bool to integer |
