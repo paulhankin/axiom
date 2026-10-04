@@ -36,7 +36,6 @@ they travel with the code they describe.
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
-| [0066](0066-selfhost-regalloc-movegen.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: reloads around calls in movegen's recursive loop |
 
 ## Closed
 
@@ -96,3 +95,4 @@ they travel with the code they describe.
 | [0062](0062-selfhost-shuffles-and-reductions.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: constant shuffles as table permutes, lane extracts and reductions |
 | [0063](0063-selfhost-correlated-branches.md) | feature | compiler (selfhost: thread) | Self-hosted optimizer: correlated branches not threaded, data-dependent table branches not if-converted (fixed in b18d0de, 360066b) |
 | [0064](0064-selfhost-memset-and-zeroing.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64: small constant-size memset/memcpy as `rep stosb`/`rep movsb`, arrays zeroed eight bytes at a time (fixed in 163832e, 4710d95) |
+| [0066](0066-selfhost-regalloc-movegen.md) | feature | compiler (selfhost: mach, x64, gvn) | Self-hosted register allocator: reloads around calls in movegen's recursive loop (fixed in 50cbebd) |
