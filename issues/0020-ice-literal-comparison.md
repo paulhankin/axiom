@@ -1,7 +1,7 @@
 # 0020: Internal compiler error comparing two integer literals
 
 - Type: bug
-- Status: open
+- Status: fixed (04f5fc3)
 - Area: compiler (C)
 
 ## What happens
@@ -32,3 +32,7 @@ wrote `(p == n - 1)` with both sides constant). `axiom check` accepts it.
 Give the comparison of two literals a type (fold it to a `bool` constant in
 sema, as `true`/`false`), or report a diagnostic in sema; either way not an
 ICE.
+
+## Resolution
+
+Sema folds a comparison of two untyped constants to a `bool` constant (both compilers); tests/run/control.ax has the example.

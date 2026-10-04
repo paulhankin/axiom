@@ -1,7 +1,7 @@
 # 0021: Self-hosted compiler crashes splitting wide vectors (fill_phis)
 
 - Type: bug
-- Status: open
+- Status: fixed (04f5fc3)
 - Area: compiler (selfhost)
 
 ## What happens
@@ -25,3 +25,7 @@ stack trace (innermost first):
 code keeps `f32x16` accumulators live around loops (`eval/net.ax`'s
 `dim128_wide`, and since then `eval/simd_avx512.ax`), so a phi of a wide
 vector type whose split pieces are not all created is the likely cause.
+
+## Resolution
+
+vsplit keeps its per-value state (`Rep`) in `Value.auxp`, which inlining, loop splitting (gvn), threading and outlining also use for the clones they make, without clearing it. A phi with such a stale pointer looked split, and `fill_phis` read the first fields of the clone (`kind`, `op` of a phi: 0x35_00000008) as a `Pieces` pointer. `split_wide` now clears `auxp` of every instruction before it starts. (std/graphics/shape.ax and webp.ax had such stale pointers too.)

@@ -35,10 +35,6 @@ they travel with the code they describe.
 | [0012](0012-windows-native-target.md) | feature | compiler, runtime | Native Windows binaries (x86-64 done; runs on Windows 11) |
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
-| [0020](0020-ice-literal-comparison.md) | bug | compiler (C) | Internal compiler error comparing two integer literals |
-| [0021](0021-selfhost-vsplit-crash.md) | bug | compiler (selfhost) | Self-hosted compiler crashes splitting wide vectors (fill_phis) |
-| [0022](0022-profile-program-arguments.md) | bug | tools, compiler (C) | `axiom profile` (C compiler) does not pass arguments to the program |
-| [0023](0023-aligned-allocation.md) | feature | std/mem | Aligned allocation in std/mem |
 | [0024](0024-lane-permutes.md) | feature | language, compiler (C and selfhost) | Runtime permutes of 16-, 32- and 64-bit lanes (and fast wide byte swizzles) |
 | [0025](0025-variable-vector-shifts.md) | feature | language, compiler (C and selfhost) | Per-lane shift counts |
 | [0026](0026-lanewise-bit-counts-and-conversions.md) | feature | language, compiler (C and selfhost) | Lane-wise @clz/@ctz/@popcount and int/float conversions on vectors |
@@ -59,3 +55,7 @@ they travel with the code they describe.
 | [0017](0017-windows-absolute-import-paths.md) | bug | compiler | An import of an absolute Windows path (`C:/...`) is taken as relative |
 | [0015](0015-wide-simd-and-cpu-dispatch.md) | feature | language, compiler, std | AVX-512, SVE and wider vectors; conditional compilation; runtime CPU detection and dispatch |
 | [0016](0016-native-crypto-instructions.md) | feature | compiler, std/crypto | AES-NI, PCLMULQDQ, SHA and CRC instructions (x86-64 and AArch64) used in std/crypto with portable fallbacks |
+| [0020](0020-ice-literal-comparison.md) | bug | compiler (C) | Internal compiler error comparing two integer literals |
+| [0021](0021-selfhost-vsplit-crash.md) | bug | compiler (selfhost) | Self-hosted compiler crashes splitting wide vectors (fill_phis) |
+| [0022](0022-profile-program-arguments.md) | bug | tools, compiler (C) | `axiom profile` (C compiler) does not pass arguments to the program |
+| [0023](0023-aligned-allocation.md) | feature | std/mem | Aligned allocation in std/mem |

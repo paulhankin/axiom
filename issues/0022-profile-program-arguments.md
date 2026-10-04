@@ -1,7 +1,7 @@
 # 0022: `axiom profile` (C compiler) does not pass arguments to the program
 
 - Type: bug
-- Status: open
+- Status: fixed (04f5fc3)
 - Area: tools, compiler (C)
 
 ## What happens
@@ -22,3 +22,7 @@ environment variable instead when profiled.
 ## Fix
 
 Accept `--` and pass what follows to the program, natively and on wasm.
+
+## Resolution
+
+The C compiler takes `--` and passes the rest to the program, natively and on wasm (after the `--` that runtime/host.mjs expects, which the self-hosted compiler did not pass either). tests/profile/hot.ax now does its work only when given two arguments.

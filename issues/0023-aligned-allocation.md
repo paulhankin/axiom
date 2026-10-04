@@ -1,7 +1,7 @@
 # 0023: Aligned allocation in std/mem
 
 - Type: feature
-- Status: open
+- Status: fixed (04f5fc3)
 - Area: std/mem
 
 ## Today
@@ -41,3 +41,7 @@ allocation (to free) and an aligned view, in every type that owns such data.
   aligned. Slab classes of 64 bytes and up can be laid out that way, and
   large allocations already start near a span boundary.
 - `mem.dup_aligned` for copies.
+
+## Resolution
+
+`mem.alloc_aligned.[T](n, align)`, `alloc_zeroed_aligned`, `dup_aligned` and `alloc_aligned_bytes(size, align)` (spec §15.1): `align` a power of two up to 4096, freed with `mem.free`. Up to 128, the first size class whose objects start at multiples of `align` (spans and their headers are 128-aligned; a smaller free size than the class's is accepted); large objects are already at 128. Beyond 128, a large block holds the object at the boundary with an alias header in front of it naming the block, which `free` recognizes. Under `--sanitize=address` the header is padded so the allocation stays aligned.
