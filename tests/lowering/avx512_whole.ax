@@ -1,0 +1,131 @@
+// The vector builtins the benchmark's AVX-512 kernels use, each one instruction at
+// the full 512 bits (issue 0046): @swizzle2 as vpermt2* / vpermi2*, @swizzle
+// as vpermd (zeroing out-of-range lanes through a mask), the unsigned
+// conversions, @load_partial / @store_partial as masked moves, per-lane
+// shifts and @clz, @bitmask of a compare through a mask register only; and
+// the two-position kernel's sixteen accumulators, eight rows and two
+// broadcasts without spilling (xmm16-31). With AVX2 only, per-lane shifts of
+// 512-bit vectors are two 256-bit ones.
+//
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvperm[it]2(d|ps)\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvpermd\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvcvttps2udq\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvcvtudq2ps\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \{%k[1-7]\}\s*\{z\} | 2
+// lower: --target=native --cpu=x86-64-v4 -O2 | \)\s*\{%k[1-7]\} | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvpsllvd\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvpsrlvd\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvpsravd\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvplzcntd\b[^\n]*zmm | 1
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvfmadd\d{3}ps\b[^\n]*zmm | 16
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvmov\w*\s+%zmm\d+,\s*-?(0x)?[0-9a-f]*\(%r[sb]p\) | 0
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bvpmovm2d\b|\bvpmovd2m\b | 0
+// lower: --target=native --cpu=x86-64-v4 -O2 | \bv?pextr|\bv?pinsr|\bvextract|\bvinsert | 0
+// lower: --target=native --cpu=x86-64-v3 -O2 | \bvpsllvd\b[^\n]*ymm | 2
+// lower: --target=native --cpu=x86-64-v3 -O2 | \bvpsrlvd\b[^\n]*ymm | 2
+// lower: --target=native --cpu=x86-64-v3 -O2 | \bvpsravd\b[^\n]*ymm | 2
+
+export fn swz2(p: *f32, i: *u32, q: *mut f32) void {
+    let s = @slice_from_ptr(p, 32);
+    let idx = @load(u32x16, @slice_from_ptr(i, 16)) & @as(u32x16, @splat(31));
+    @store(@slice_from_ptr(q, 16), @swizzle2(@load(f32x16, s[0..16]), @load(f32x16, s[16..32]), idx));
+}
+
+export fn swz(p: *i32, i: *u32, q: *mut i32) void {
+    let idx = @load(u32x16, @slice_from_ptr(i, 16));
+    @store(@slice_from_ptr(q, 16), @swizzle(@load(i32x16, @slice_from_ptr(p, 16)), idx));
+}
+
+export fn cvt(p: *f32, q: *mut u32, r: *mut f32) void {
+    let x = @load(f32x16, @slice_from_ptr(p, 16));
+    let u = @int_from_float(u32x16, x);
+    @store(@slice_from_ptr(q, 16), u);
+    @store(@slice_from_ptr(r, 16), @float_from_int(f32x16, u));
+}
+
+export fn partial(p: *f32, n: usize, q: *mut f32) void {
+    let v = @load_partial(f32x16, @slice_from_ptr(p, n));
+    @store_partial(@slice_from_ptr(q, n), v + v);
+}
+
+export fn shifts(p: *u32, c: *u32, q: *mut u32) void {
+    let x = @load(u32x16, @slice_from_ptr(p, 16));
+    let k = @load(u32x16, @slice_from_ptr(c, 16));
+    let s = @bit_cast(i32x16, x) >> k;
+    @store(@slice_from_ptr(q, 16), ((x << k) ^ (x >> k)) ^ @bit_cast(u32x16, s) ^ @clz(x));
+}
+
+export fn mask(p: *f32) u32 {
+    let x = @load(f32x16, @slice_from_ptr(p, 16));
+    return @bitmask(@lanes_ne(x, @as(f32x16, @splat(0.0))));
+}
+
+// sixteen accumulators, eight rows and two broadcasts: no spills
+export fn acc(w: *f32, a: *f32, b: *f32, n: usize, out: *mut f32) void {
+    let rows = @slice_from_ptr(w, n * 128);
+    let xa = @slice_from_ptr(a, n);
+    let xb = @slice_from_ptr(b, n);
+    let z: f32x16 = @splat(0.0);
+    let mut a0 = z;
+    let mut a1 = z;
+    let mut a2 = z;
+    let mut a3 = z;
+    let mut a4 = z;
+    let mut a5 = z;
+    let mut a6 = z;
+    let mut a7 = z;
+    let mut b0 = z;
+    let mut b1 = z;
+    let mut b2 = z;
+    let mut b3 = z;
+    let mut b4 = z;
+    let mut b5 = z;
+    let mut b6 = z;
+    let mut b7 = z;
+    for i in 0..n {
+        let r = rows[(i * 128)..];
+        let w0 = @load(f32x16, r[0..]);
+        let w1 = @load(f32x16, r[16..]);
+        let w2 = @load(f32x16, r[32..]);
+        let w3 = @load(f32x16, r[48..]);
+        let w4 = @load(f32x16, r[64..]);
+        let w5 = @load(f32x16, r[80..]);
+        let w6 = @load(f32x16, r[96..]);
+        let w7 = @load(f32x16, r[112..]);
+        let sa: f32x16 = @splat(xa[i]);
+        let sb: f32x16 = @splat(xb[i]);
+        a0 = @fma(sa, w0, a0);
+        a1 = @fma(sa, w1, a1);
+        a2 = @fma(sa, w2, a2);
+        a3 = @fma(sa, w3, a3);
+        a4 = @fma(sa, w4, a4);
+        a5 = @fma(sa, w5, a5);
+        a6 = @fma(sa, w6, a6);
+        a7 = @fma(sa, w7, a7);
+        b0 = @fma(sb, w0, b0);
+        b1 = @fma(sb, w1, b1);
+        b2 = @fma(sb, w2, b2);
+        b3 = @fma(sb, w3, b3);
+        b4 = @fma(sb, w4, b4);
+        b5 = @fma(sb, w5, b5);
+        b6 = @fma(sb, w6, b6);
+        b7 = @fma(sb, w7, b7);
+    }
+    let o = @slice_from_ptr(out, 256);
+    @store(o[0..], a0);
+    @store(o[16..], a1);
+    @store(o[32..], a2);
+    @store(o[48..], a3);
+    @store(o[64..], a4);
+    @store(o[80..], a5);
+    @store(o[96..], a6);
+    @store(o[112..], a7);
+    @store(o[128..], b0);
+    @store(o[144..], b1);
+    @store(o[160..], b2);
+    @store(o[176..], b3);
+    @store(o[192..], b4);
+    @store(o[208..], b5);
+    @store(o[224..], b6);
+    @store(o[240..], b7);
+}

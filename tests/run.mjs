@@ -249,23 +249,38 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 // Instruction selection: each "// lower: <flags> | <regex> | <count>" line
 // of tests/lowering/*.ax builds the file with --emit=asm and those flags,
 // and the regex must match exactly <count> times. x86-64 lines run only on
-// x86-64 hosts (--target=native is the host). They check the C compiler's
-// LLVM code; a compiler without --emit=asm (the self-hosted one) skips them.
+// x86-64 hosts (--target=native is the host). A compiler without
+// --emit=asm (the self-hosted one) is checked on its object file as
+// objdump disassembles it (AT&T syntax, as LLVM's): its x86-64 lines, where
+// objdump is installed; it skips the others.
 for (const f of files(path.join(root, 'tests/lowering'))) {
   const name = path.relative(root, f) + ' [instruction selection]';
   if (filter && !name.includes(filter)) continue;
-  let problem = null, skipped = false;
+  let problem = null, checked = 0;
   for (const [, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower: (.+?) \| (.+?) \| (\d+)$/gm)) {
     const fl = flags.trim().split(/\s+/);
     if (fl.includes('--target=native') && (process.arch !== 'x64' || process.env.AXIOM_NATIVE_TARGET)) continue;
     const out = path.join(tmp, 'lower.s');
     const c = spawnSync(compiler, ['build', f, '--emit=asm', '-o', out, ...fl], { encoding: 'utf8' });
-    if (c.status !== 0 && /--emit=asm is not supported/.test(c.stderr + c.stdout)) { skipped = true; break; }
-    if (c.status !== 0) { problem = `${flags}: build failed:\n${c.stdout}${c.stderr}`; break; }
-    const n = (fs.readFileSync(out, 'utf8').match(new RegExp(re, 'g')) || []).length;
+    let text = null;
+    if (c.status !== 0 && /--emit=asm is not supported/.test(c.stderr + c.stdout)) {
+      if (!fl.includes('--target=native')) continue;
+      const obj = path.join(tmp, 'lower.o');
+      const o = spawnSync(compiler, ['build', f, '--emit=obj', '-o', obj, ...fl], { encoding: 'utf8' });
+      if (o.status !== 0) { problem = `${flags}: build failed:\n${o.stdout}${o.stderr}`; break; }
+      const d = spawnSync('objdump', ['-d', '--no-show-raw-insn', obj], { encoding: 'utf8', maxBuffer: 1 << 28 });
+      if (d.error || d.status !== 0) continue;
+      text = d.stdout;
+    } else if (c.status !== 0) {
+      problem = `${flags}: build failed:\n${c.stdout}${c.stderr}`; break;
+    } else {
+      text = fs.readFileSync(out, 'utf8');
+    }
+    checked++;
+    const n = (text.match(new RegExp(re, 'g')) || []).length;
     if (n !== Number(count)) { problem = `${flags}: /${re}/ matches ${n} times, expected ${count}`; break; }
   }
-  if (skipped) { skip++; continue; }
+  if (!problem && checked === 0) { skip++; continue; }
   if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
   else { pass++; console.log(`ok   ${name}`); }
 }
