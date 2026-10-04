@@ -37,6 +37,7 @@ they travel with the code they describe.
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
 | [0067](0067-selfhost-booleans-in-branches.md) | feature | compiler (selfhost: combine, gvn, thread, x64) | Self-hosted optimizer: booleans materialised as 0/1 and tested again |
+| [0069](0069-selfhost-input-kernels-remaining.md) | feature | compiler (selfhost: opt layout, x64, mach) | Self-hosted x86-64: what is left between the input encoders and LLVM's |
 
 ## Closed
 
@@ -97,3 +98,4 @@ they travel with the code they describe.
 | [0063](0063-selfhost-correlated-branches.md) | feature | compiler (selfhost: thread) | Self-hosted optimizer: correlated branches not threaded, data-dependent table branches not if-converted (fixed in b18d0de, 360066b) |
 | [0064](0064-selfhost-memset-and-zeroing.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64: small constant-size memset/memcpy as `rep stosb`/`rep movsb`, arrays zeroed eight bytes at a time (fixed in 163832e, 4710d95) |
 | [0066](0066-selfhost-regalloc-movegen.md) | feature | compiler (selfhost: mach, x64, gvn) | Self-hosted register allocator: reloads around calls in movegen's recursive loop (fixed in 50cbebd) |
+| [0068](0068-selfhost-input-kernels-unrolling.md) | feature | compiler (selfhost: unroll) | Self-hosted optimizer: the benchmark's input encoders keep long point loops rolled (fixed in 95c7657) |
