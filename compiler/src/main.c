@@ -38,7 +38,7 @@ extern char **environ;
 static void usage(void) {
     fprintf(stderr,
             "usage: axiom <build|check|test> [<file.ax> | <package dir>] [options]\n"
-            "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>]\n"
+            "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n"
             "       axiom new <name>      create a package skeleton\n"
             "       axiom cache [path|clean]   the compiled-module cache\n"
             "  test: --filter=<text> --timeout=<ms>\n"
@@ -440,7 +440,8 @@ static int spawn_program(char *const argv[], char *const envp[], bool out_to_err
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
-static int run_profile(const char *bin, const char *std_dir, const char *folded_path, int hz, bool json) {
+static int run_profile(const char *bin, char **prog_args, int nprog_args, const char *std_dir, const char *folded_path,
+                       int hz, bool json) {
     const char *tmpdir = getenv("TMPDIR");
     const char *raw = arena_printf("%s/axiom-profile-%d.raw", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid());
     unlink(raw);
@@ -463,6 +464,8 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
         vec_push(env, arena_printf("AXIOM_PROFILE_HZ=%d", hz));
     }
     vec_push(av, (char *)bin);
+    if (g_target.wasm && nprog_args > 0) vec_push(av, (char *)"--");  // host.mjs: the program's arguments follow
+    for (int i = 0; i < nprog_args; i++) vec_push(av, prog_args[i]);
     vec_push(av, NULL);
     vec_push(env, NULL);
     int status = spawn_program(av.data, env.data, json);
@@ -698,6 +701,8 @@ int main(int argc, char **argv) {
     int units_mode = -1;  // -1: by optimization level
     bool verbose = false;
     const char *folded_path = NULL;
+    char **prog_args = NULL;  // profile: the program's arguments, after `--`
+    int nprog_args = 0;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
@@ -727,7 +732,11 @@ int main(int argc, char **argv) {
         else if (profiling && !strncmp(a, "--folded=", 9)) folded_path = a + 9;
         else if ((a[1] == 'l' || a[1] == 'L') && a[0] == '-' && a[2]) vec_push(link_flags, (char *)a);
         else if (a[0] == '-' && a[1] == 'I' && a[2]) vec_push(inc_flags, (char *)a);
-        else if (a[0] == '-') {
+        else if (profiling && !strcmp(a, "--")) {
+            prog_args = argv + i + 1;
+            nprog_args = argc - i - 1;
+            break;
+        } else if (a[0] == '-') {
             diag_emit_fatal(json, "E9001", arena_printf("unknown option '%s'", a));
             return 2;
         } else if (!input) input = a;
@@ -1063,7 +1072,7 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (profiling) {
-        int rc = run_profile(out, so.std_dir, folded_path, prof_hz, json);
+        int rc = run_profile(out, prog_args, nprog_args, so.std_dir, folded_path, prof_hz, json);
         unlink(out);
         return rc;
     }

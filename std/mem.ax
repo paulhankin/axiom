@@ -29,6 +29,12 @@
 //
 // Sizes are passed to free (a slice knows its length), so objects carry no
 // header. Freeing memory that did not come from here traps.
+//
+// Objects are aligned to 16; alloc_aligned asks for more (up to 4096). Up
+// to 128 a size class whose objects all start on such a boundary serves
+// (spans and their headers are aligned to 128); beyond, a large block holds
+// the object at the boundary with a second, alias header in front naming the
+// block's start, so that free finds it from the pointer.
 // =============================================================================
 
 error { OutOfMemory }
@@ -48,6 +54,8 @@ const DISCARD_MIN: usize = 1 << 20;  // the smallest free block given back
 const MAGIC_SPAN: u64 = 0x5350_414E_9E37_79B9;
 const MAGIC_USED: u64 = 0x5553_4544_7F4A_7C15;
 const MAGIC_FREE: u64 = 0x4652_4545_85EB_CA6B;
+const MAGIC_ALIGNED: u64 = 0x414C_4947_C2B2_AE35;  // the alias header of an over-aligned object
+const MAX_ALIGN: usize = 4096;
 
 // span states
 const ACTIVE: u32 = 1;   // a heap allocates from it
@@ -559,12 +567,14 @@ fn small_alloc(c: usize) usize {
     return r;
 }
 
-fn small_free(p: usize, c: usize) void {
+fn small_free(p: usize, c0: usize) void {
     let s = p & ~(PAGE - 1);
     let sp = span(s);
-    if (sp.magic != tag(MAGIC_SPAN, s)) or (sp.cls != @truncate(u32, c)) or (sp.state == CACHED) {
+    // (an aligned allocation may come from a larger class than its size's)
+    if (sp.magic != tag(MAGIC_SPAN, s)) or (sp.cls < @truncate(u32, c0)) or (sp.state == CACHED) {
         @trap();  // not an object of this size from the allocator
     }
+    let c = @as(usize, sp.cls);
     // the start of an object handed out (not inside one), and not the one
     // freed last (a double free would put it on the list twice)
     if not is_object_start(sp, s, p) or (p == sp.free) {
@@ -662,12 +672,46 @@ fn large_check(s: usize) void {
 }
 
 fn large_free(p: usize) void {
-    let s = p - HDR;
+    let mut s = p - HDR;
+    if is_over_aligned(p) {
+        block(s).magic = 0;
+        s = block(s).size;
+    }
     pool_enter();
     large_check(s);
     large_bytes -= block(s).size;
     release_block(s, block(s).size);
     pool_leave();
+}
+
+/// Whether p is an object of large_alloc_aligned (aligned beyond 128): its
+/// alias header in front names the block it is in.
+fn is_over_aligned(p: usize) bool {
+    return ((p & ((2 * HDR) - 1)) == 0) and (magic_at(p - HDR) == tag(MAGIC_ALIGNED, p - HDR));
+}
+
+/// A large object at a multiple of `align` (256 to MAX_ALIGN): the block's
+/// first `align` bytes hold its header, then the alias header right before
+/// the object.
+fn large_alloc_aligned(size: usize, align: usize) usize {
+    if too_big(size) {
+        return 0;
+    }
+    let bs = block_size_for((size + align) + HDR);
+    pool_enter();
+    let s = block_alloc(bs);
+    if s != 0 {
+        large_bytes += block(s).size;
+    }
+    pool_leave();
+    if s == 0 {
+        return 0;
+    }
+    let p = ((s + (2 * HDR)) + (align - 1)) & ~(align - 1);
+    let a = p - HDR;
+    block(a).magic = tag(MAGIC_ALIGNED, a);
+    block(a).size = s;
+    return p;
 }
 
 // Resizes the large object at p in place if it can; true if it did.
@@ -773,7 +817,7 @@ const H_SIZE: usize = 1;
 const H_PREV: usize = 2;
 const H_NEXT: usize = 3;
 const H_SITE: usize = 4;   // 4, 5, 6: innermost call sites outside this module
-const H_FLAGS: usize = 7;  // 1: not a leak
+const H_FLAGS: usize = 7;  // 1: not a leak; above 8 bits, the padding before the header (alloc_aligned)
 
 fn as_enter() void {
     if multi {
@@ -1189,6 +1233,12 @@ fn as_total(size: usize) usize {
 }
 
 fn asan_alloc(size: usize) usize {
+    return asan_alloc_aligned(size, 16);
+}
+
+// With `align` above 64, the header is `pad` bytes into memory aligned to
+// `align`, so the allocation after it is aligned too.
+fn asan_alloc_aligned(size: usize, align: usize) usize {
     if (size == 0) or too_big(size) {
         return 0;
     }
@@ -1198,11 +1248,22 @@ fn asan_alloc(size: usize) usize {
         as_ready = true;
     }
     let total = as_total(size);
-    let raw = alloc_slow(total);
-    if raw == 0 {
+    let mut pad: usize = 0;
+    let mut q: usize = 0;
+    if align <= 16 {
+        q = alloc_slow(total);
+    } else {
+        if align > AS_HDR {
+            pad = align - AS_HDR;
+        }
+        q = aligned_alloc(total + pad, align);
+    }
+    if q == 0 {
         as_leave();
         return 0;
     }
+    as_set(q, pad, SH_LEFT);
+    let raw = q + pad;
     let p = raw + AS_HDR;
     let body = (size + 7) & ~@as(usize, 7);
     as_set(raw, AS_HDR, SH_LEFT);
@@ -1217,9 +1278,9 @@ fn asan_alloc(size: usize) usize {
     }
     as_live = raw;
     as_live_bytes += size;
-    hfield(raw, H_FLAGS).* = 0;
+    hfield(raw, H_FLAGS).* = @as(u64, pad) << 8;
     if as_ignoring > 0 {
-        hfield(raw, H_FLAGS).* = 1;
+        hfield(raw, H_FLAGS).* |= 1;
     }
     as_record_sites(raw);
     as_leave();
@@ -1284,12 +1345,13 @@ fn asan_free(p: usize, size: usize) void {
     while as_q_bytes > AS_QUARANTINE {
         let old = as_q_first;
         let n = as_total(@truncate(usize, hfield(old, H_SIZE).*));
+        let pad = @truncate(usize, hfield(old, H_FLAGS).* >> 8);
         as_q_first = @truncate(usize, hfield(old, H_NEXT).*);
         if as_q_first == 0 {
             as_q_last = 0;
         }
         as_q_bytes -= n;
-        free_slow(old, n);
+        free_slow(old - pad, n + pad);
     }
     as_leave();
 }
@@ -1340,7 +1402,7 @@ fn asan_report_leaks() u64 {
     let mut o = AsOut.{ buf: [0; 1024], n: 0 };
     let mut a = as_live;
     while a != 0 {
-        if hfield(a, H_FLAGS).* == 0 {
+        if (hfield(a, H_FLAGS).* & 1) == 0 {
             count += 1;
             bytes += hfield(a, H_SIZE).*;
             if count <= 10 {
@@ -1457,7 +1519,7 @@ fn free_slow(p: usize, size: usize) void {
     if size == 0 {
         return;
     }
-    if size <= SMALL_MAX {
+    if (size <= SMALL_MAX) and not is_over_aligned(p) {
         small_free(p, class_of(size));
         return;
     }
@@ -1482,7 +1544,7 @@ pub fn realloc_bytes(p: usize, old: usize, size: usize) usize {
         if class_of(old) == class_of(size) {
             return p;
         }
-    } else if (old > SMALL_MAX) and (size > SMALL_MAX) and large_resize(p, size) {
+    } else if (old > SMALL_MAX) and (size > SMALL_MAX) and not is_over_aligned(p) and large_resize(p, size) {
         return p;
     }
     let q = alloc_bytes(size);
@@ -1497,6 +1559,42 @@ pub fn realloc_bytes(p: usize, old: usize, size: usize) usize {
 
 fn empty[T]() []mut T {
     return @slice_from_ptr(@ptr_from_int(*mut T, @align_of(T)), 0);
+}
+
+// size > 0 bytes at a multiple of align (32 to MAX_ALIGN, a power of two).
+fn aligned_alloc(size: usize, align: usize) usize {
+    if align > HDR {
+        return large_alloc_aligned(size, align);
+    }
+    if size > SMALL_MAX {
+        return large_alloc(size);  // (at a block's start + HDR)
+    }
+    // the first class whose objects all start at multiples of align (spans
+    // are aligned to PAGE and their objects start at HDR)
+    let mut c = class_of(size);
+    while (@as(usize, class_size[c]) & (align - 1)) != 0 {
+        c += 1;
+    }
+    return small_alloc(c);
+}
+
+/// `size` bytes at a multiple of `align`, a power of two up to 4096 (other
+/// values trap); 0 if memory is exhausted (or size is 0). Freed with
+/// free_bytes like any other; realloc_bytes keeps only the usual alignment.
+pub fn alloc_aligned_bytes(size: usize, align: usize) usize {
+    if (align == 0) or ((align & (align - 1)) != 0) or (align > MAX_ALIGN) {
+        @trap();  // not a power of two up to 4096
+    }
+    if align <= 16 {
+        return alloc_bytes(size);
+    }
+    if @sanitize_address() {
+        return asan_alloc_aligned(size, align);
+    }
+    if size == 0 {
+        return 0;
+    }
+    return aligned_alloc(size, align);
 }
 
 /// `n` values of type T. Contents are unspecified.
@@ -1553,6 +1651,40 @@ pub fn realloc[T](s: []mut T, n: usize) ![]mut T {
 /// A copy of `s` in new memory.
 pub fn dup[T](s: []T) ![]mut T {
     let d = alloc.[T](s.len)!;
+    @mem_copy(d, s);
+    return d;
+}
+
+/// `n` values of type T starting at a multiple of `align` bytes, a power of
+/// two up to 4096 (other values trap): for tables read with wide vector
+/// loads, say, aligned to 64 so that no f32x16 load crosses a cache line.
+/// Contents are unspecified. Freed with free like any slice (realloc keeps
+/// only the usual alignment, 16).
+pub fn alloc_aligned[T](n: usize, align: usize) ![]mut T {
+    let bytes = @mul_checked(n, @size_of(T)) catch return error.OutOfMemory;
+    if bytes == 0 {
+        if (align == 0) or ((align & (align - 1)) != 0) or (align > MAX_ALIGN) {
+            @trap();  // not a power of two up to 4096
+        }
+        return @slice_from_ptr(@ptr_from_int(*mut T, @max(align, @align_of(T))), 0);
+    }
+    let p = alloc_aligned_bytes(bytes, align);
+    if p == 0 {
+        return error.OutOfMemory;
+    }
+    return @slice_from_ptr(@ptr_from_int(*mut T, p), n);
+}
+
+/// alloc_aligned with every byte zero.
+pub fn alloc_zeroed_aligned[T](n: usize, align: usize) ![]mut T {
+    let s = alloc_aligned.[T](n, align)!;
+    @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, s.ptr), n * @size_of(T)), 0);
+    return s;
+}
+
+/// A copy of `s` in new memory at a multiple of `align` (as alloc_aligned).
+pub fn dup_aligned[T](s: []T, align: usize) ![]mut T {
+    let d = alloc_aligned.[T](s.len, align)!;
     @mem_copy(d, s);
     return d;
 }
@@ -1762,6 +1894,63 @@ test "random allocations, frees and reallocs keep every object intact" {
     free(objs);
     free(keys);
     @expect_eq(in_use(), base);
+}
+
+test "aligned allocations are aligned, intact and freed with free" {
+    let before = in_use();
+    let sizes: [12]usize = [1, 3, 5, 16, 25, 64, 100, 250, 700, 2047, 3000, 9000];
+    let aligns: [8]usize = [1, 16, 32, 64, 128, 256, 1024, 4096];
+    let mut all: [96][]mut u32 = [empty.[u32](); 96];
+    let mut k: usize = 0;
+    for n in sizes {
+        for al in aligns {
+            let x = alloc_aligned.[u32](n, al)!;
+            @expect((@int_from_ptr(x.ptr) % @max(al, 4)) == 0);
+            for i in 0..n {
+                x[i] = @truncate(u32, (k * 7919) + i);
+            }
+            all[k] = x;
+            k += 1;
+        }
+    }
+    for j in 0..k {
+        let x = all[j];
+        for i in 0..x.len {
+            @expect(x[i] == @truncate(u32, (j * 7919) + i));
+        }
+    }
+    // freed in another order, some after a move by realloc
+    var_free(all[..k]);
+    @expect(in_use() == before);
+    let z = alloc_zeroed_aligned.[u8](5000, 4096)!;
+    @expect((@int_from_ptr(z.ptr) % 4096) == 0);
+    for b in z {
+        @expect(b == 0);
+    }
+    let d = dup_aligned.[u8](z[0..100], 64)!;
+    @expect(((@int_from_ptr(d.ptr) % 64) == 0) and (d.len == 100) and (d[99] == 0));
+    free(d);
+    free(z);
+    let e = alloc_aligned.[u64](0, 256)!;
+    @expect(e.len == 0);
+    @expect(in_use() == before);
+}
+
+fn var_free(xs: []mut []mut u32) void {
+    let mut j = xs.len;
+    while j > 0 {
+        j -= 1;
+        if (j % 3) == 0 {
+            let r = realloc.[u32](xs[j], xs[j].len + 50) catch @trap();
+            free(r);
+        } else {
+            free(xs[j]);
+        }
+    }
+}
+
+test "an alignment that is not a power of two traps" expect trap {
+    _ = alloc_aligned.[u8](10, 48) catch return;
 }
 
 test "freeing a large block twice traps" expect trap {

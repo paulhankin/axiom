@@ -556,6 +556,23 @@ static Type *check_binary(Expr *e, Type *expected) {
     }
     if (cmp) {
         check_cmp_op(op, t, e->span);
+        if (ty_is_untyped(t) && e->a->is_const && e->b->is_const) {
+            // two untyped constants: the comparison is a bool constant
+            bool fl = t->kind == TY_UNTYPED_FLOAT;
+            i128 a = e->a->cval, b = e->b->cval;
+            double fa = e->a->fval, fb = e->b->fval;
+            bool r = false;
+            switch (op) {
+            case TK_EQEQ: r = fl ? fa == fb : a == b; break;
+            case TK_NE: r = fl ? fa != fb : a != b; break;
+            case TK_LT: r = fl ? fa < fb : a < b; break;
+            case TK_LE: r = fl ? fa <= fb : a <= b; break;
+            case TK_GT: r = fl ? fa > fb : a > b; break;
+            case TK_GE: r = fl ? fa >= fb : a >= b; break;
+            }
+            e->bval = r;
+            e->is_const = true;
+        }
         return e->type = t_bool;
     }
     if (!check_arith_op(op, t, e->span)) return e->type = t_invalid;

@@ -1903,11 +1903,15 @@ pub fn alloc_zeroed[T](n: usize) ![]mut T   // every byte 0
 pub fn free[T](s: []mut T) void
 pub fn realloc[T](s: []mut T, n: usize) ![]mut T
 pub fn dup[T](s: []T) ![]mut T
+pub fn alloc_aligned[T](n: usize, align: usize) ![]mut T          // at a multiple of align
+pub fn alloc_zeroed_aligned[T](n: usize, align: usize) ![]mut T
+pub fn dup_aligned[T](s: []T, align: usize) ![]mut T
 pub fn new[T]() !*mut T                    // one value, contents unspecified
 pub fn new_zeroed[T]() !*mut T             // one value, every byte 0
 pub fn create[T](v: T) !*mut T             // one value, initialized to v
 pub fn destroy[T](p: *mut T) void          // frees a value from new, new_zeroed or create
 pub fn alloc_bytes(size: usize) usize        // 0 if there is no memory (or size is 0)
+pub fn alloc_aligned_bytes(size: usize, align: usize) usize
 pub fn free_bytes(p: usize, size: usize) void
 pub fn realloc_bytes(p: usize, old: usize, size: usize) usize
 pub fn in_use() usize                        // bytes allocated and not freed
@@ -1924,7 +1928,11 @@ These are ordinary functions (§10), not builtins. The rules:
 - **Failure.** `alloc`, `realloc`, `dup`, `new` and `create` return `error.OutOfMemory` when the
   system has no more memory or the byte count overflows. `realloc` leaves the old slice
   valid when it fails.
-- **Alignment.** Memory is aligned to 16 bytes, enough for every type (§12.5).
+- **Alignment.** Memory is aligned to 16 bytes, enough for every type (§12.5). The
+  `_aligned` functions ask for more: `align` is a power of two up to 4096 (anything else
+  traps), and the memory starts at a multiple of it, for data read with wide vector loads
+  (64 bytes for `f32x16`) or by the page. It is freed with `free` like any other;
+  `realloc` keeps only the usual 16.
 - **Zero sizes.** `alloc.[T](0)` returns an empty slice that owns no memory; freeing it
   does nothing.
 - **Threads.** The allocator is safe to use from every thread. `std/thread` calls

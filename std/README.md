@@ -10,7 +10,7 @@ that owns memory has `deinit`).
 
 | Module | Contents |
 |---|---|
-| [`mem`](mem.ax) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `new.[T]()`, `new_zeroed`, `create(v)` / `destroy(p)`, `in_use()`; under `--sanitize=address`, shadow memory, quarantine and leak reports (`leaks_ignored`) |
+| [`mem`](mem.ax) | The global allocator: `alloc.[T](n)`, `free(s)`, `realloc(s, n)`, `alloc_zeroed`, `dup`, `alloc_aligned.[T](n, align)` (and `_zeroed`, `dup_aligned`), `new.[T]()`, `new_zeroed`, `create(v)` / `destroy(p)`, `in_use()`; under `--sanitize=address`, shadow memory, quarantine and leak reports (`leaks_ignored`) |
 | [`str`](str.ax) | Strings as `[]u8`: comparison, search, `trim`, `cut`, `split` / `lines` / `fields` iterators, ASCII case, `join` / `replace`, UTF-8 (`decode_rune`, `encode_rune`, `valid_utf8`, `runes`); `String`, a growable string with a `Writer` |
 | [`fmt`](fmt.ax) | Templates: `fmt.print("{} is {:>5.2}\n", [fmt.str(s), fmt.float(x)])`, also `write`, `alloc`, `bufprint`; `parse_int[T]`, `parse_float` (correctly rounded), `format_float` (shortest round trip), `format_int` |
 | [`io`](io.ax) | `Writer` / `Reader` interfaces; `stdout`/`stderr`/`stdin`; files (with `seek` from a `Whence`, `size`); `BufferWriter`, `SliceReader`, `BufWriter`; integer/float formatting and parsing |
