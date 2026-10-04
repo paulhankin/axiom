@@ -2421,7 +2421,7 @@ fn gen_store(v: *mut ir.Value) void {
 // in vectors (up to 32 bytes wide: ymm needs no AVX-512 frequency licence)
 // and, at the end, one more vector overlapping the last, or below 16 bytes
 // integer moves; fills with a constant byte likewise as vector stores, and
-// up to 2 KiB as a loop of them. Others are rep movsb / stosb.
+// up to 2 KiB as a loop of them (four a time). Others are rep movsb / stosb.
 fn gen_memop(v: *mut ir.Value) void {
     let o = v.op;
     if is_c(v.c) and (cval(v.c) > 0) and (cval(v.c) <= 256) and (o != ir.OP_MEMSET) {
@@ -2616,21 +2616,32 @@ fn small_fill(v: *mut ir.Value, n: i64, byte: i64) void {
         _ = sse2(xe.MOVDQU_LD, W(t), const16(@bit_cast(u64, pat), @bit_cast(u64, pat)));
     }
     if n > 256 {
-        // a loop over the whole vectors: [p + i] for i = 0, w, ... < n - n % w
+        // a loop over the whole vectors, four a time: [p + i], ... [p + i + 3w]
+        // for i = 0, 4w, ... < n - n % 4w; then the whole vectors left
         let full = n - (n % wmax);
+        let full4 = n - (n % (4 * wmax));
         let p = reg(v.a);
         let i = vgpr();
         _ = e2(xe.MOV_RI, 4, W(i), I(0));
         let top = new_label();
         place(top);
-        _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(p, i, 1, 0));
-        let a = e2(xe.ALU, 8, RW(i), I(wmax));
+        for k in @as(i64, 0)..4 {
+            _ = sse2(xe.MOVDQU_ST, R(t), mc.mem(p, i, 1, k * wmax));
+        }
+        let a = e2(xe.ALU, 8, RW(i), I(4 * wmax));
         a.cc = 0;
-        let c = e2(xe.ALU, 8, R(i), I(full));
+        let c = e2(xe.ALU, 8, R(i), I(full4));
         c.cc = 7;
         let ops: [4]mc.MOp = [mc.label(top), R(i), R(p), R(t)];
         let j = emit(xe.JCC, 0, ops[..]);
         j.cc = xe.CC_B;
+        let mut k = full4;
+        while k < full {
+            let mut d2 = dm;
+            d2.disp += k;
+            _ = sse2(xe.MOVDQU_ST, R(t), d2);
+            k += wmax;
+        }
         if full == n {
             VL = outer_vl;
             return;
