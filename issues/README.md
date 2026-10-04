@@ -69,3 +69,9 @@ they travel with the code they describe.
 | [0037](0037-native-stack-trace-cost.md) | feature | compiler (C), runtime | Stack traces cost 15% in call-heavy native code |
 | [0038](0038-pointer-offsets.md) | feature | language, compiler (C and selfhost) | Pointer offsets (`@ptr_add`): in-bounds element offsets for raw pointers |
 | [0039](0039-selfhost-tls-sse-operand.md) | bug | compiler (selfhost) | Self-hosted x86-64 backend: "TLS operand in an SSE instruction" |
+| [0040](0040-aggregate-values-compile-time.md) | bug | compiler (C) | Large aggregates as LLVM values make -O2 builds take minutes |
+| [0041](0041-prefetch.md) | feature | language, compiler | No prefetch builtin |
+| [0042](0042-u128.md) | feature | language, compiler | No 128-bit integers |
+| [0043](0043-optional-pointers.md) | feature | language | No optional pointers or optional values |
+| [0044](0044-global-initializers-and-thread-exit.md) | feature | language, std/thread | Restricted global initializers; no thread-exit cleanup for thread-locals |
+| [0045](0045-closures.md) | feature | language | No closures |
