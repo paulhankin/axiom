@@ -1,7 +1,7 @@
 # 0039: Self-hosted x86-64 backend: "TLS operand in an SSE instruction"
 
 - Type: bug
-- Status: open
+- Status: fixed (8d1375a)
 - Area: compiler (selfhost, x86-64 backend)
 
 ## Today
@@ -30,3 +30,28 @@ operands on SSE instructions (they are legal on x86-64: an `fs` override prefix 
 
 A regression test: a `threadlocal let mut buf: [16]f32` written with `@store(buf[4..], v)`
 and read back with `@load`, natively at -O0 and -O2.
+
+## Resolution
+
+The fs segment prefix was already emitted ahead of every instruction with a
+thread-local operand; only the ModRM encoding was missing. `x64enc.modrm_mem`
+now encodes all thread-local forms: `[index*scale + sym@tpoff]` (SIB with no
+base, as before) and, with a base register (Windows' thread block, or a
+folded pointer), mod 10 with the displacement relocated as `TPOFF32`. It serves
+the SSE/VEX/EVEX encoder (whose check is gone) and the integer encoder's
+`enc_mem`, which had its own copy of the base form. Legacy SSE (`64 f3 0f 6f`),
+VEX and EVEX encodings were checked with objdump for Linux and Windows objects.
+
+tests/run/threadlocal_simd.ax stores and loads `f32x4`, `u32x4`, `f32x8` and
+`f32x16` in thread-local arrays at constant and run-time offsets, through a
+pointer to a thread-local struct (inlined at -O2, as in the benchmark), and on a second
+thread; it passes natively and on wasm at -O0 and -O2 with both compilers.
+
+the benchmark's `bench_kernels` (axiom/src/bin) now builds natively with the
+self-hosted compiler at -O0 and -O2, and its twelve checksums equal the C
+compiler's build natively (the AVX-512 kernels, e.g. `contact_net`
+16852.3878) and on wasm (`contact_net` 16852.3868). The self-hosted native
+build is correct but slow on the AVX-512 kernels (`contact_net` 3.5 us
+against the C compiler's 0.34 us, slower than its own wasm build's 1.2 us): 512-bit
+operations it does not select whole are split into 128-bit pieces
+(`vextracti32x4`/`vpshufb`/`vinserti32x4`), and some conversions go lane by lane.
