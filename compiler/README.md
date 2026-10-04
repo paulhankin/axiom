@@ -44,8 +44,9 @@ current directory (spec §4.6).
                                   preset of selfhost/README.md (spec §13.4)
   --features=+ext,-ext            add or remove extensions
   -O0 | -O1 | -O2 | -O3           optimization level; never changes program behavior
-  --release                       integer overflow saturates (= --overflow=saturate)
-  --overflow=trap|saturate        default: trap
+  --overflow=wrap|trap|saturate   integer overflow (spec §7.6): wraps by default; trap (T0002) is
+                                  an opt-in check for unintended overflows
+  --release                       accepted for compatibility; changes nothing (was = saturate)
   --emit=exe|obj|llvm|asm         default exe: a .wasm module or native executable
   --format=human|agent-json       diagnostics format (spec §16.2)
   --link=<file>                   C source, object or library to link in (repeatable). On wasm, C
@@ -175,7 +176,7 @@ Design choices that keep it fast and small:
   already-typed AST.
 - **Lazy code generation.** Only functions reachable from `export fn`s (and the
   globals they touch) are lowered, so unused library code costs nothing in LLVM.
-- **Friendly to LLVM's -O0 fast path.** Overflow checks use plain instructions instead
+- **Friendly to LLVM's -O0 fast path.** Overflow checks (`--overflow=trap`) use plain instructions instead
   of `llvm.*.with.overflow`, and traps go through one cold helper function instead of
   inline `llvm.trap`. Both keep the wasm backend on its fast instruction selector. At
   `-O1` and above LLVM turns them back into the efficient forms.
@@ -194,7 +195,8 @@ Implemented: the whole language described in spec v0.1-draft.3:
 - modules and imports, `pub` / `export`, the no-shadowing rule
 - all primitive, pointer, slice, array, struct, union, error-union and function-pointer
   types, with the spec's layouts
-- implicit and explicit conversions, both overflow modes, mathematical shifts
+- implicit and explicit conversions, the three overflow modes (wrap, the default; trap;
+  saturate), mathematical shifts
 - `defer`, `match` exhaustiveness, `!` / `catch`
 - generics with constraints, deduction and `const` parameters
 - SIMD types and builtins

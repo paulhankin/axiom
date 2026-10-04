@@ -6,8 +6,8 @@
 // Options:
 //   --target=wasm32|native     (default wasm32; wasm32-freestanding accepted)
 //   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
-//   --release                  same as --overflow=saturate
-//   --overflow=trap|saturate   integer overflow mode (default trap)
+//   --overflow=wrap|trap|saturate   integer overflow mode (default wrap)
+//   --release                  accepted for compatibility; changes nothing
 //   --emit=exe|obj|llvm|asm    output kind (default: exe = .wasm module / native executable)
 //   --format=human|agent-json  diagnostic format
 //   --std=<dir>                standard library directory
@@ -43,7 +43,7 @@ static void usage(void) {
             "       axiom new <name>      create a package skeleton\n"
             "       axiom cache [path|clean]   the compiled-module cache\n"
             "  test: --filter=<text> --timeout=<ms>\n"
-            "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
+            "  --target=wasm32|native   -O0..-O3   --overflow=wrap|trap|saturate (default wrap)\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
             "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n"
             "  --sanitize=address|none  check heap accesses: use after free, overflows, double frees, leaks\n"
@@ -710,9 +710,10 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
         else if (!strncmp(a, "--target=", 9)) target = a + 9;
         else if (!strcmp(a, "-O0") || !strcmp(a, "-O1") || !strcmp(a, "-O2") || !strcmp(a, "-O3")) co.opt_level = a[2] - '0';
-        else if (!strcmp(a, "--release")) co.overflow_saturate = true;
-        else if (!strcmp(a, "--overflow=trap")) co.overflow_saturate = false;
-        else if (!strcmp(a, "--overflow=saturate")) co.overflow_saturate = true;
+        else if (!strcmp(a, "--release")) continue;  // once --overflow=saturate: no build mode changes semantics
+        else if (!strcmp(a, "--overflow=wrap")) co.overflow = OVF_WRAP;
+        else if (!strcmp(a, "--overflow=trap")) co.overflow = OVF_TRAP;
+        else if (!strcmp(a, "--overflow=saturate")) co.overflow = OVF_SATURATE;
         else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
         else if (!strcmp(a, "--stack-traces=on")) co.stack_traces = true;
         else if (!strcmp(a, "--stack-traces=off")) co.stack_traces = false;

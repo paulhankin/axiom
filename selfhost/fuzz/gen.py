@@ -36,16 +36,12 @@ def pr(expr, t):
 for t, bits, s in INTS:
     P('fn t_%s(a: %s, b: %s) void {' % (t, t, t))
     P('    print_u64(9000001);')
-    for op in ['+%', '-%', '*%', '&', '|', '^']:
+    for op in ['+%', '-%', '*%', '+', '-', '*', '&', '|', '^']:  # (+ - * wrap by default)
         P('    %s' % pr('a %s b' % op, t))
     for op in ['==', '!=', '<', '<=', '>', '>=']:
         P('    print_u64(bv(a %s b));' % op)
     P('    if b != 0 {')
-    if s:
-        P('        if not ((a == @min_value(%s)) and (b == -1)) {' % t)
-        P('            %s' % pr('a / b', t)); P('            %s' % pr('a % b', t)); P('        }')
-    else:
-        P('        %s' % pr('a / b', t)); P('        %s' % pr('a % b', t))
+    P('        %s' % pr('a / b', t)); P('        %s' % pr('a % b', t))  # (MIN / -1 wraps to MIN)
     P('    }')
     P('    %s' % pr('@min(a, b)', t)); P('    %s' % pr('@max(a, b)', t))
     P('    %s' % pr('@add_sat(a, b)', t)); P('    %s' % pr('@sub_sat(a, b)', t)); P('    %s' % pr('@mul_sat(a, b)', t))
@@ -56,7 +52,7 @@ for t, bits, s in INTS:
     for f in ['@clz(a)', '@ctz(a)', '@popcount(a)', '~a', '-%a']:
         P('    %s' % pr(f, t))
     if s:
-        P('    if a != @min_value(%s) { %s }' % (t, pr('@abs(a)', t)))
+        P('    %s %s' % (pr('@abs(a)', t), pr('-a', t)))  # (wrapping: MIN for MIN)
     P('    for k in cnt { %s %s %s %s }' % (pr('a << k', t), pr('a >> k', t), pr('@rotl(a, k)', t), pr('@rotr(a, k)', t)))
     P('    for k in cnt64 { %s %s }' % (pr('a << k', t), pr('a >> k', t)))
     # conversions
@@ -97,8 +93,10 @@ for vt, lt, n in VT:
     P('fn mk_%s(o: usize) %s { return @vec(%s, %s); }' % (vt, vt, vt, ', '.join('v_%s[(o + %d) %% %d]' % (lt, i, N[lt]) for i in range(n))))
     P('fn s_%s(a: %s, b: %s) void {' % (vt, vt, vt))
     P('    print_u64(9000005);')
-    for op in ['+%', '-%', '&', '|', '^'] + (['*%'] if lt[1:] != '8' else []):
+    for op in ['+%', '-%', '+', '-', '&', '|', '^'] + (['*%', '*'] if lt[1:] != '8' else []):
         P('    pv_%s(a %s b);' % (vt, op))
+    if lt.startswith('i'):
+        P('    pv_%s(-a);' % vt)
     P('    pv_%s(~a);' % vt)
     for f in ['eq', 'ne', 'lt', 'le', 'gt', 'ge']:
         P('    pv_%s(@bit_cast(%s, @lanes_%s(a, b)));' % (vt, vt, f))

@@ -4,7 +4,7 @@
 //   // expect: <line>          expected output line (in order)
 //   // expect-trap             `run` must trap
 //   // expect-error: E0412     compilation must fail with this code (repeatable)
-//   // flags: --release        extra compiler flags
+//   // flags: --overflow=trap  extra compiler flags
 //   // wasm-only               skip on the native target
 //   // native-only             skip on wasm
 //   // link: file.c            C source (next to the test) compiled and linked in

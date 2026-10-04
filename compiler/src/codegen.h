@@ -14,9 +14,13 @@ typedef enum EmitKind { EMIT_OBJ, EMIT_LLVM, EMIT_ASM } EmitKind;
 //              runtime state, test and host exports
 typedef enum CgUnit { CG_WHOLE, CG_MODULE, CG_LINK } CgUnit;
 
+// Integer overflow of + - * unary - and MIN / -1 (spec §7.6): wraps (the
+// default), traps with T0002, or saturates.
+typedef enum OverflowMode { OVF_WRAP, OVF_TRAP, OVF_SATURATE } OverflowMode;
+
 typedef struct CgOptions {
     int opt_level;           // 0..3
-    bool overflow_saturate;  // --overflow=saturate (--release)
+    OverflowMode overflow;   // --overflow=wrap|trap|saturate (default wrap)
     const char *cpu;         // NULL = generic
     EmitKind emit;
     const char *out_path;    // file to write

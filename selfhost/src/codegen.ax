@@ -29,10 +29,16 @@ pub const EMIT_OBJ: i32 = 0;
 pub const EMIT_IR: i32 = 1;
 pub const EMIT_ASM: i32 = 2;
 
+// Integer overflow of + - * unary - and MIN / -1 (spec §7.6): wraps (the
+// default), traps with T0002, or saturates.
+pub const OVF_WRAP: i32 = 0;
+pub const OVF_TRAP: i32 = 1;
+pub const OVF_SATURATE: i32 = 2;
+
 pub struct CgOptions {
-    opt_level: i32,           // 0..3
-    overflow_saturate: bool,  // --overflow=saturate (--release)
-    cpu: []u8,                // nil = generic
+    opt_level: i32,  // 0..3
+    overflow: i32,   // --overflow=wrap|trap|saturate: OVF_WRAP (default), OVF_TRAP, OVF_SATURATE
+    cpu: []u8,       // nil = generic
     emit: i32,
     out_path: []u8,          // file to write
     stack_traces: bool,      // shadow stack for traces and profiles (--stack-traces=on, default)
@@ -2124,9 +2130,18 @@ fn saturated(t: *mut ir.Ty, neg_direction: *mut ir.Value) *mut ir.Value {
 }
 
 fn overflow_op(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    if O.overflow == OVF_WRAP {
+        if base == 0 {
+            return b_add(l, r);
+        }
+        if base == 1 {
+            return b_sub(l, r);
+        }
+        return b_mul(l, r);
+    }
     let t = l.ty;
     let o = op_with_overflow(base, is_signed, l, r);
-    if not O.overflow_saturate {
+    if O.overflow == OVF_TRAP {
         check_or_trap(b_not(o.ovf), T_OVERFLOW);
         return o.val;
     }
@@ -2208,9 +2223,13 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut
     } else if t.kind == ast.TY_VEC {
         sgn = t.elem.is_signed;
     }
+    let is_vec = t.kind == ast.TY_VEC;  // integer vectors wrap in every mode
     if op == lx.TK_PLUS {
         if is_float {
             return ir.binop(B, ir.OP_FADD, l, r);
+        }
+        if is_vec {
+            return b_add(l, r);
         }
         return overflow_op(0, sgn, l, r);
     }
@@ -2218,11 +2237,17 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut
         if is_float {
             return ir.binop(B, ir.OP_FSUB, l, r);
         }
+        if is_vec {
+            return b_sub(l, r);
+        }
         return overflow_op(1, sgn, l, r);
     }
     if op == lx.TK_STAR {
         if is_float {
             return ir.binop(B, ir.OP_FMUL, l, r);
+        }
+        if is_vec {
+            return b_mul(l, r);
         }
         return overflow_op(2, sgn, l, r);
     }
@@ -2235,9 +2260,15 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut
         if not sgn {
             return ir.binop(B, ir.OP_UDIV, l, r);
         }
+        if O.overflow == OVF_WRAP {
+            // MIN / -1 wraps to MIN: a divisor of -1 negates (as `%` gives 0)
+            let m1 = icmp(ir.IntEQ, r, ir.cones(tt));
+            let q = ir.binop(B, ir.OP_SDIV, l, sel(m1, ci(tt, 1), r));
+            return sel(m1, ir.neg(B, l), q);
+        }
         let rm1 = icmp(ir.IntEQ, r, ir.cones(tt));  // (right to left, as in the C implementation)
         let ovf = b_and(icmp(ir.IntEQ, l, int_min(tt)), rm1);
-        if not O.overflow_saturate {
+        if O.overflow == OVF_TRAP {
             check_or_trap(b_not(ovf), T_OVERFLOW);
             return ir.binop(B, ir.OP_SDIV, l, r);
         }
@@ -3041,12 +3072,12 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return intr2(nm, a0, a1);
     }
     if id == ast.BI_MUL_SAT {
-        let saved = O.overflow_saturate;
-        O.overflow_saturate = true;
         let l = gen(barg(e, 0));
         let r = gen(barg(e, 1));
+        let saved = O.overflow;
+        O.overflow = OVF_SATURATE;
         let v = overflow_op(2, rt.is_signed, l, r);
-        O.overflow_saturate = saved;
+        O.overflow = saved;
         return v;
     }
     if (id == ast.BI_ADD_CHECKED) or (id == ast.BI_SUB_CHECKED) or (id == ast.BI_MUL_CHECKED) {
@@ -3086,13 +3117,16 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let t = v.ty;
         let mut tys: [1]*mut ir.Ty = [t];
         if rt.kind == ast.TY_INT {
-            let is_min = icmp(ir.IntEQ, v, int_min(t));
-            if not O.overflow_saturate {
+            let mut is_min = vnil();
+            if O.overflow != OVF_WRAP {
+                is_min = icmp(ir.IntEQ, v, int_min(t));
+            }
+            if O.overflow == OVF_TRAP {
                 check_or_trap(b_not(is_min), T_OVERFLOW);
             }
             let mut args: [2]*mut ir.Value = [v, ci(T_i1, 0)];
-            let mut r = intrinsic("llvm.abs", tys[..], args[..]);
-            if O.overflow_saturate {
+            let mut r = intrinsic("llvm.abs", tys[..], args[..]);  // @abs(MIN) wraps to MIN
+            if O.overflow == OVF_SATURATE {
                 r = sel(is_min, int_max(t, true), r);
             }
             return r;
@@ -4008,6 +4042,9 @@ fn gen_unary(e: *mut ast.Expr) *mut ir.Value {
         let v = gen(e.a);
         if (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t) {
             return ir.fneg(B, v);
+        }
+        if t.kind == ast.TY_VEC {
+            return ir.neg(B, v);  // integer vectors wrap in every mode
         }
         return overflow_op(1, true, ir.czero(v.ty), v);
     }

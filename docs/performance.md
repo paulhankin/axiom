@@ -64,6 +64,8 @@ scalar lane operations. The self-hosted compiler already did this.
 time, but in the innermost loops of Poly1305, Montgomery multiplication and
 YCbCr conversion they took most of the time. Those sums provably cannot
 overflow; wrapping operators (`+%`, `*%`) now say so, with a comment on why.
+(Since issue 0047 plain `+` and `*` wrap too, and checks exist only in
+`--overflow=trap` builds.)
 
 | Module | Change | Speed-up |
 |---|---|---|

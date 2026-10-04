@@ -1723,9 +1723,14 @@ static LLVMValueRef saturated(bool is_signed, LLVMTypeRef t, LLVMValueRef neg_di
 static LLVMValueRef overflow_op(const char *base, bool is_signed, LLVMValueRef l, LLVMValueRef r, bool mul) {
     // base: "add", "sub", "mul"
     LLVMTypeRef t = LLVMTypeOf(l);
+    if (O->overflow == OVF_WRAP) {
+        if (!strcmp(base, "add")) return LLVMBuildAdd(B, l, r, "");
+        if (!strcmp(base, "sub")) return LLVMBuildSub(B, l, r, "");
+        return LLVMBuildMul(B, l, r, "");
+    }
     LLVMValueRef val, ovf;
     op_with_overflow(base, is_signed, l, r, &val, &ovf);
-    if (!O->overflow_saturate) {
+    if (O->overflow == OVF_TRAP) {
         check_or_trap(LLVMBuildNot(B, ovf, ""), T_OVERFLOW);
         return val;
     }
@@ -1788,21 +1793,30 @@ static LLVMValueRef gen_binop(int op, Type *t, LLVMValueRef l, LLVMValueRef r, T
     switch (op) {
     case TK_PLUS:
         if (is_float) return LLVMBuildFAdd(B, l, r, "");
+        if (is_vec) return LLVMBuildAdd(B, l, r, "");  // integer vectors wrap in every mode
         return overflow_op("add", sgn, l, r, false);
     case TK_MINUS:
         if (is_float) return LLVMBuildFSub(B, l, r, "");
+        if (is_vec) return LLVMBuildSub(B, l, r, "");
         return overflow_op("sub", sgn, l, r, false);
     case TK_STAR:
         if (is_float) return LLVMBuildFMul(B, l, r, "");
+        if (is_vec) return LLVMBuildMul(B, l, r, "");
         return overflow_op("mul", sgn, l, r, true);
     case TK_SLASH: {
         if (is_float) return LLVMBuildFDiv(B, l, r, "");
         LLVMTypeRef ty = LLVMTypeOf(l);
         check_or_trap(LLVMBuildICmp(B, LLVMIntNE, r, LLVMConstNull(ty), ""), T_DIVZERO);
         if (!sgn) return LLVMBuildUDiv(B, l, r, "");
+        if (O->overflow == OVF_WRAP) {
+            // MIN / -1 wraps to MIN: a divisor of -1 negates (as `%` gives 0)
+            LLVMValueRef m1 = LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstAllOnes(ty), "");
+            LLVMValueRef q = LLVMBuildSDiv(B, l, LLVMBuildSelect(B, m1, LLVMConstInt(ty, 1, false), r, ""), "");
+            return LLVMBuildSelect(B, m1, LLVMBuildNeg(B, l, ""), q, "");
+        }
         LLVMValueRef ovf = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntEQ, l, int_min(ty), ""),
                                         LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstAllOnes(ty), ""), "");
-        if (!O->overflow_saturate) {
+        if (O->overflow == OVF_TRAP) {
             check_or_trap(LLVMBuildNot(B, ovf, ""), T_OVERFLOW);
             return LLVMBuildSDiv(B, l, r, "");
         }
@@ -2861,11 +2875,11 @@ static LLVMValueRef gen_builtin(Expr *e) {
         return intr2(nm, gen(a[0].e), gen(a[1].e));
     }
     case BI_MUL_SAT: {
-        bool saved = O->overflow_saturate;
-        O->overflow_saturate = true;
         LLVMValueRef l = gen(a[0].e), r = gen(a[1].e);
+        OverflowMode saved = O->overflow;
+        O->overflow = OVF_SATURATE;
         LLVMValueRef v = overflow_op("mul", rt->is_signed, l, r, true);
-        O->overflow_saturate = saved;
+        O->overflow = saved;
         return v;
     }
     case BI_ADD_CHECKED:
@@ -2894,10 +2908,10 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMTypeRef t = LLVMTypeOf(v);
         if (rt->kind == TY_INT) {
             LLVMValueRef is_min = LLVMBuildICmp(B, LLVMIntEQ, v, int_min(t), "");
-            if (!O->overflow_saturate) check_or_trap(LLVMBuildNot(B, is_min, ""), T_OVERFLOW);
+            if (O->overflow == OVF_TRAP) check_or_trap(LLVMBuildNot(B, is_min, ""), T_OVERFLOW);
             LLVMValueRef args[2] = {v, LLVMConstInt(T_i1, 0, false)};
-            LLVMValueRef r = intrinsic("llvm.abs", &t, 1, args, 2);
-            if (O->overflow_saturate) r = LLVMBuildSelect(B, is_min, int_max(t, true), r, "");
+            LLVMValueRef r = intrinsic("llvm.abs", &t, 1, args, 2);  // @abs(MIN) wraps to MIN
+            if (O->overflow == OVF_SATURATE) r = LLVMBuildSelect(B, is_min, int_max(t, true), r, "");
             return r;
         }
         LLVMValueRef args[2] = {v, LLVMConstInt(T_i1, 0, false)};
@@ -3548,6 +3562,7 @@ static LLVMValueRef gen_unary(Expr *e) {
     case TK_MINUS: {
         LLVMValueRef v = gen(e->a);
         if (t->kind == TY_FLOAT || ty_is_vec_float(t)) return LLVMBuildFNeg(B, v, "");
+        if (t->kind == TY_VEC) return LLVMBuildNeg(B, v, "");  // integer vectors wrap in every mode
         return overflow_op("sub", true, LLVMConstNull(LLVMTypeOf(v)), v, false);
     }
     }

@@ -785,8 +785,8 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 
 | Family | Operators | Operand types | Notes |
 |---|---|---|---|
-| **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0 |
-| **A**dditive | `+` `-` `+%` `-%` | int, float | `%`-suffixed forms wrap, int only |
+| **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0. Integer `*` wraps (§7.6) |
+| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` wrap (§7.6). The `%`-suffixed forms always wrap, int only |
 | **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
 | **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer, enum | result `bool` |
@@ -853,38 +853,58 @@ than unary operators: `-a.b` is `-(a.b)`, and `&a[i]` is `&(a[i])`.
 
 | Operator | Operand | Meaning |
 |---|---|---|
-| `-x` | signed int, float, SIMD | Negation. For integers, `-MIN` overflows (§7.6) |
-| `-%x` | signed or unsigned int | Wrapping negation |
+| `-x` | signed int, float, SIMD (float or signed int lanes) | Negation. For integers, `-MIN` overflows: it is `MIN` by default (§7.6) |
+| `-%x` | signed or unsigned int, SIMD int | Wrapping negation, in every overflow mode |
 | `~x` | int, SIMD int, `v128` | Bitwise NOT |
 | `not x` | bool | Logical NOT |
 | `&x` | place | Address, of type `*T` |
 | `&mut x` | mutable place | Address, of type `*mut T` |
 
-Applying `-` to an unsigned type is a compile error (`E0520`). Use `-%` or subtract from 0.
+Applying `-` to an unsigned type, or a vector of unsigned lanes, is a compile error (`E0520`).
+Use `-%` or subtract from 0.
 
 ### 7.6 Integer arithmetic semantics
 
-**Overflow mode.** Each build has an *overflow mode*, chosen with a compiler flag (§16.1):
+**Overflow wraps.** `+`, `-`, `*` and unary `-` on integers, the compound assignments
+built from them (`+=`, `-=`, `*=`), and `MIN / -1` compute their result **modulo 2ⁿ**,
+where `n` is the bit width: the result is the one value of the type congruent to the
+mathematical result. For example, with `x: u8 = 250`, `x + 10` is `4`; with
+`m: i32 = @min_value(i32)`, `-m`, `m * -1`, `m / -1` and `@abs(m)` are all `m`, and
+`m - 1` is `@max_value(i32)`. This is the meaning in every build, at every optimization
+level, on every target (as in Go and Java, and Rust's release builds).
 
-- `trap` (the default): if the mathematical result of `+`, `-`, `*`, unary `-`, or
-  `MIN / -1` is not representable, the program traps (`T0002`).
-- `saturate` (selected by `--release`): the result is clamped to the type's MIN or MAX.
+`+%`, `-%`, `*%` and unary `-%` are explicit spellings of the same wrapping arithmetic.
+They are still valid, and they keep wrapping in every overflow mode, so code that relies on
+wrapping (hashes, checksums, random number generators) can say so and stays correct
+under `--overflow=trap`. Use `@add_checked`, `@sub_checked` and `@mul_checked` (which
+return `error.Overflow`) where an overflow must be detected, for example in sizes computed
+from untrusted input, and `@add_sat`, `@sub_sat` and `@mul_sat` to clamp (Appendix A).
 
-The overflow mode is the **only** way build configuration can change a program's meaning.
-Optimization level (`-O0`…`-O3`) MUST NOT change observable behavior. (See Appendix D, Q1.)
+**Overflow modes.** A build may ask for another overflow mode with a compiler flag
+(§16.1). They are debugging aids, not the language's meaning:
 
-**Wrapping operators.** `+%`, `-%`, `*%` and unary `-%` compute the result modulo 2ⁿ in
-every mode.
+- `wrap` (the default): as above.
+- `trap` (`--overflow=trap`): if the mathematical result of `+`, `-`, `*`, unary `-`,
+  `MIN / -1` or `@abs(MIN)` is not representable, the program traps (`T0002`). A program
+  that wraps nowhere behaves the same in both modes, so the mode finds unintended
+  overflows (in tests, say) at the cost of a check on every operation.
+- `saturate` (`--overflow=saturate`): the result is clamped to the type's MIN or MAX.
+
+In every mode, the `%`-suffixed operators, the `@atomic_*` arithmetic and integer vector
+arithmetic (§13.1) wrap, and the `_sat` and `_checked` builtins behave as their names say.
+The overflow mode is the **only** way build configuration can change a program's meaning,
+and only for a program whose arithmetic overflows. Optimization level (`-O0`…`-O3`) MUST
+NOT change observable behavior. (See Appendix D, Q1, and Appendix C, C43.)
 
 **Division.** `/` truncates toward zero. `%` gives a result with the sign of the dividend,
-so `a == (a / b) * b + (a % b)` whenever `a / b` does not overflow. A divisor of 0 traps
-(`T0003`) in **every** mode. `MIN % -1` is `0`.
+so `a == (a / b) * b + (a % b)` (with wrapping arithmetic, this holds for `MIN / -1` too).
+A divisor of 0 traps (`T0003`) in **every** mode. `MIN % -1` is `0`.
 
 **Shifts.** A shift has its mathematical meaning for **every** count, including counts at or
 above the bit width. Let `x` have `n` bits and let the count be `k`:
 
 - `x << k` is `x · 2ᵏ` reduced modulo `2ⁿ`: bits shifted out of the top are discarded.
-  When `k ≥ n` the result is `0`. `<<` never traps in either overflow mode.
+  When `k ≥ n` the result is `0`. `<<` never traps, in any overflow mode.
 - For unsigned `x`, `x >> k` is `⌊x / 2ᵏ⌋`, so `k ≥ n` gives `0`.
 - For signed `x`, `x >> k` is the arithmetic shift `⌊x / 2ᵏ⌋`, which rounds toward −∞. When
   `k ≥ n` the result is `0` if `x ≥ 0` and `-1` if `x < 0`.
@@ -899,8 +919,12 @@ visible.
 *Codegen note:* WebAssembly's `i32.shl` family takes the count modulo the width. When `k` is
 not a constant known to be less than `n`, the compiler emits a compare-and-select.
 
-**Constant evaluation.** In a `const` initializer or an array length, an overflow is a
-compile error (`E0530`) in every mode.
+**Constant evaluation.** An integer operation whose operands are all constants is
+evaluated by the compiler: in a `const` initializer or an array length, and anywhere else
+(`A + 100` for a `const A: u8 = 200`). There, an overflow of `+`, `-`, `*`, unary `-` or
+a conversion to the expression's type is a compile error (`E0530`) in every mode: an
+expression that always overflows is almost certainly a mistake, and the check costs
+nothing. Write the `%`-suffixed operators (`A +% 100`) to wrap a constant on purpose.
 
 ### 7.7 Floating-point semantics
 
@@ -1497,7 +1521,7 @@ This section defines shared-memory concurrency. The design follows from three fa
 |---|---|
 | `@atomic_load(p)` | `T` |
 | `@atomic_store(p, v)` | `void` |
-| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in either overflow mode |
+| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in any overflow mode |
 | `@atomic_cas(p, expected, desired)` | the previous value. The exchange happened iff it equals `expected` |
 | `@atomic_wait(p, expected, timeout_ns: i64)` | `u32`: `0` woken by a notify, `1` the value was not `expected`, `2` timed out. A negative timeout waits forever. `p: *i32` or `*u32` only |
 | `@atomic_notify(p, count: u32)` | `u32`: the number of threads woken. `p: *i32` or `*u32` only. `0xFFFF_FFFF` wakes all |
@@ -1584,16 +1608,18 @@ every module's cache key.
 
 | Operator | Float vectors | Integer vectors | `v128` |
 |---|---|---|---|
-| `+` `-` `*` | lane-wise IEEE | **not allowed**. Use `+%` `-%` `*%` (wrapping) or `@add_sat`/`@sub_sat` | no |
+| `+` `-` `*` | lane-wise IEEE | lane-wise, wrapping in every overflow mode (`*` not for 8-bit lanes; WASM has no `i8x16.mul`). `@add_sat`/`@sub_sat` saturate | no |
 | `/` | lane-wise IEEE | no | no |
-| `+%` `-%` `*%` | no | lane-wise wrapping (`*%` not for 8-bit lanes; WASM has no `i8x16.mul`) | no |
+| `+%` `-%` `*%` | no | the same as `+` `-` `*` | no |
 | `&` `\|` `^` `~` | no | yes | yes |
 | `<<` `>>` | no | an unsigned count: a scalar for every lane, or a vector of the same shape with one count per lane (`v << w`: lane i shifted by `w[i]`). The §7.6 semantics apply per lane (`k ≥` lane width gives `0` or sign fill) | no |
-| unary `-` | yes | `-%` only | no |
+| unary `-` | yes | signed lanes, wrapping; `-%` on any lanes | no |
 | `==` `<` … | no. Use `@lanes_eq`, `@lanes_lt`, … | no | no |
 
-Requiring `+%` on integer vectors keeps §7.6 honest. Checking overflow on every lane would
-be expensive, and silently wrapping under the `+` symbol would contradict the scalar rules.
+Integer vector arithmetic wraps, like scalar arithmetic by default (§7.6). It wraps under
+`--overflow=trap` and `--overflow=saturate` too: checking every lane would be expensive,
+and WebAssembly and most processors have no lane-wise overflow flags. (Until issue 0047,
+when scalars trapped by default, integer vectors required `+%`; it remains valid.)
 
 Scalars are **never** broadcast implicitly. Write `@splat(x)`.
 
@@ -2061,7 +2087,7 @@ in which case it is linked against the C library as before.
 ### 16.1 Commands
 
 ```
-axiom build <file.ax> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
+axiom build <file.ax> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o <out>
                           [--sanitize=address]    # check heap accesses (§16.8)
                           [--cpu=<preset>] [--features=+ext,-ext]   # processor extensions (§13.4)
                           [-g | --debug-info=lines|none]            # DWARF line tables (below)
@@ -2079,6 +2105,12 @@ axiom cache [path|clean]               # the compiled-module cache (§16.7)
 package in the current directory (§4.6.4).
 
 Every command accepts `--format=human` (the default) or `--format=agent-json`.
+
+`--overflow=wrap|trap|saturate` selects the overflow mode (§7.6). `wrap`, the default, is
+the language's meaning; `trap` checks every `+`, `-`, `*`, unary `-`, `MIN / -1` and
+`@abs` on integers and traps (`T0002`) on overflow, to find unintended overflows; `saturate`
+clamps. `build`, `test` and `profile` accept it. `--release` is accepted for
+compatibility and changes nothing (it selected `saturate` until issue 0047).
 
 `-g` (or `--debug-info=lines`) adds DWARF line tables to the output: a compile unit per
 object, a subprogram per function and a source line and column for each instruction,
@@ -2757,7 +2789,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@add_sat(a, b)`, `@sub_sat(a, b)`, `@mul_sat(a, b)` | Saturating, in every overflow mode. Also lane-wise on 8/16-bit integer vectors (add/sub only) |
 | `@add_checked`, `@sub_checked`, `@mul_checked` | Returns `!T`, with `error.Overflow`, in every mode |
 | `@min(a, b)`, `@max(a, b)` | Floats: a NaN operand gives NaN, and `-0.0 < +0.0` (WASM semantics) |
-| `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6) |
+| `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6): it is `MIN` by default, traps under `--overflow=trap`. Lane-wise on vectors, where it always wraps |
 | `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@rem(a, b)`, `@copysign(a, b)` | Floats |
 
 ### A.5 SIMD
@@ -2831,7 +2863,7 @@ This is the complete list of runtime traps. Each has a stable code.
 |---|---|
 | `T0000` | `@trap()` or WASM `unreachable` |
 | `T0001` | Index or slice bounds violation |
-| `T0002` | Integer overflow (in `trap` overflow mode) |
+| `T0002` | Integer overflow, only in the opt-in `trap` overflow mode (`--overflow=trap`, §7.6); by default overflow wraps |
 | `T0003` | Integer division or remainder by zero |
 | `T0004` | `@int_cast` value out of range |
 | `T0005` | Linear-memory access out of bounds |
@@ -2866,7 +2898,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C9 | `arena.allocator().alloc(u32, 1024)` became `arena.allocator().alloc.[u32](1024)` | Type arguments are written `.[…]` (§10.3). A type passed as an ordinary argument would need types to be parseable as expressions |
 | C10 | `&mut HEAP_BYTES` passed as a slice became `HEAP_BYTES[..]` | Array-pointer-to-slice would be an implicit conversion |
 | C11 | `pub` (module visibility) and `export` (WASM export) are distinct. Top-level `let`/`let mut` globals and `error { }` declarations were added to the grammar | The notes used these without grammar support |
-| C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
+| C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only. *Superseded by C43*: `+`, `-`, `*` wrap on integer vectors | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
 | C13 | Raw pointers are fully defined through the linear-memory model (§12) | "Zero UB" and "raw pointers" conflict unless memory itself has defined semantics. WASM's model provides this, and it is adopted on all targets |
 | C14 | The notes' arena-centric memory (no global allocator; every allocation names an `Allocator`; `Arena`, `FixedBuffer`, `page_allocator`) was replaced by one global allocator, `std/mem` (§12.4, §15.1) | An allocator parameter on every container and every function that allocates spread through all APIs, and choosing among allocators was a decision agents got wrong more often than they gained from it. Allocation stays explicit: a call, never a language construct |
 | C14 | Error names must be declared (`error { … }`) | Prevents typos in `error.X` from silently creating new errors |
@@ -2898,6 +2930,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C40 | `-g` / `--debug-info=lines`: DWARF line tables (§16.1) | Issue 0034: native profilers and debuggers could not map code back to Axiom source, and after inlining one symbol holds many functions |
 | C41 | `@ptr_add(p, n)` and `@ptr_sub(p, n)`: pointers moved by whole elements, which the program promises stay inside their object (§5.7). This is the one unchecked promise beside C13's defined memory: breaking it gives unspecified addresses, not a trap | Issue 0038: `@ptr_from_int(*T, @int_from_ptr(p) + 16)` is either an overflow check per access (`+`) or, wrapping (`+%`), an address WebAssembly cannot fold into the load's offset. Kernels reading rows of weights (the benchmark's) ran 1.15–1.25x slower than Rust's `p.add(n)`. `@ptr_sub` because walking back from an end pointer is as common; no signed variant, since the name gives the direction and `n` stays `usize` like every length |
 | C42 | Native x86-64 Linux builds of the C compiler find stack-trace frames by walking frame pointers, through a table from return addresses to call-site records, instead of a shadow stack written on every call (§16.4.1). Profile and sanitizer builds, WebAssembly and the self-hosted compiler keep the shadow stack | Issue 0037: the stores cost 15% in the benchmark's recursive move generator, and about double the time of a recursive Fibonacci. Traces are on by default, so their cost should be nothing on the hot path |
+| C43 | Integer overflow **wraps** in every build mode by default: `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)` compute modulo 2ⁿ (§7.6). Trapping (`T0002`) is the opt-in `--overflow=trap`; `--overflow=saturate` stays; `--release` no longer changes semantics. Integer vectors take `+`, `-`, `*` and unary `-` (wrapping). `+%`, `-%`, `*%` stay, as explicit spellings. Constant evaluation keeps `E0530` | Issue 0047, the owner's decision on Appendix D, Q1 (option (c)). Checks were the largest remaining cost of the benchmark against Rust's release build: its move generator's core function had 85 branches and 30 trap sites in WebAssembly where Rust's has 40 and 13, ports sprinkled `+%`/`*%` through hot paths, and the checks kept LLVM from vectorizing reductions (issue 0029). Bounds checks keep memory safe whatever an index computation does |
 
 ---
 
@@ -2905,17 +2938,23 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 
 Each question is followed by the options and the current leaning.
 
-1. **Integer overflow.** This is undecided. The current text (§7.6) traps in the default
-   mode and saturates under `--release`. The options are:
+1. **Integer overflow.** *Resolved* (2026-10-04, issue 0047): option (c). Overflow wraps
+   in every build mode (§7.6, Appendix C, C43); `--overflow=trap` remains as an opt-in
+   debugging mode and `--overflow=saturate` as before. The options were:
 
    | Option | Pros | Cons |
    |---|---|---|
-   | **(a)** Trap in debug, saturate in release (current) | Release builds never trap on overflow | Tested and shipped programs can differ. Saturation silently gives wrong answers (for example, a length stuck at `MAX`) |
+   | **(a)** Trap in debug, saturate in release (the draft's rule until 2026-10) | Release builds never trap on overflow | Tested and shipped programs can differ. Saturation silently gives wrong answers (for example, a length stuck at `MAX`) |
    | **(b)** Trap in every mode, plus explicit `+\|` `-\|` `*\|` saturating operators next to `+%` | One meaning everywhere. Bugs are loud. The chosen behavior is visible at each use | A check on every operation. WASM has no overflow flag, so a check costs an extra compare and branch, and multiplication needs a wider multiply |
-   | **(c)** Wrap in every mode (Go, Java) | Cheapest. Deterministic | Overflow bugs are silent. `+%` becomes redundant |
+   | **(c)** Wrap in every mode (Go, Java): **chosen** | Cheapest. Deterministic | Overflow bugs are silent. `+%` becomes redundant |
    | **(d)** Trap in every mode, with a per-module or per-function attribute to opt into wrapping | Keeps (b)'s semantics with a performance escape hatch | Adds an attribute syntax that v0.1 otherwise does not have |
 
-   *Leaning:* (b). Measuring the cost of the checks on real WASM engines should settle it.
+   The leaning had been (b). Measuring settled it the other way: in the benchmark the
+   checks were the largest remaining cost against Rust's release build (which wraps), and
+   they blocked vectorization. Overflow bugs are caught by bounds checks where they would
+   matter for memory, by `--overflow=trap` in tests, and by `@*_checked` where a program
+   must handle them.
+
 2. **`and`/`or` mixing.** Should `a and b or c` be allowed as `(a and b) or c`? *Leaning:*
    no, keep requiring parentheses.
 3. **Optionals.** This is undecided. Generics make an optional type possible as a library

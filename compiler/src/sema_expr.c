@@ -387,9 +387,10 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     case TK_SLASH:
         if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM)) return true;
         if (ty_is_vec_int(t)) {
+            // lane-wise and wrapping, in every overflow mode (§13.1)
             if (op == TK_SLASH) diag_error(sp, "E0811", "integer vectors do not support '/'");
-            else
-                diag_error(sp, "E0811", "integer vectors use wrapping arithmetic: write '%s%%' instead of '%s'", opn, opn);
+            else if (op == TK_STAR && t->elem->bits == 8) diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
+            else return true;
             return false;
         }
         break;
@@ -638,7 +639,7 @@ static Type *check_unary(Expr *e, Type *expected) {
             }
             return e->type = t;
         }
-        if (t->kind == TY_INT && !t->is_signed) {
+        if ((t->kind == TY_INT && !t->is_signed) || (ty_is_vec_int(t) && !t->elem->is_signed)) {
             Diag *d = diag_error(e->span, "E0520", "unary '-' cannot be applied to unsigned type %s", type_str(t));
             DiagFix *fx = diag_fix(d, "use wrapping negation", "suggestion");
             diag_fix_edit(fx, (Span){e->span.file, e->span.start, e->span.start + 1}, "-%");
@@ -656,10 +657,7 @@ static Type *check_unary(Expr *e, Type *expected) {
             }
             return e->type = t;
         }
-        if (ty_is_vec_int(t)) {
-            diag_error(e->span, "E0811", "integer vectors use wrapping negation: write '-%%'");
-            return e->type = t_invalid;
-        }
+        if (ty_is_vec_int(t)) return e->type = t;  // lane-wise, wrapping (§13.1)
         diag_error(e->span, "E0513", "unary '-' cannot be applied to %s", type_str(t));
         return e->type = t_invalid;
     }
