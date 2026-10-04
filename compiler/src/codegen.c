@@ -2181,6 +2181,45 @@ static LLVMValueRef const_lanes(LLVMTypeRef lane, unsigned n, unsigned long long
     return LLVMConstVector(c, n);
 }
 
+// @dot on i16 lanes as the target's instruction (issue 0036): pmaddwd on
+// x86 (one per register of the widest width the function's extensions
+// have), i32x4.dot_i16x8_s on wasm. Pairs of lanes are multiplied and added
+// in i32, which wraps only for (-32768 * -32768) * 2, as both instructions
+// do. NULL where there is none (other architectures, or odd widths), for
+// the generic IR. Pieces of the operands, then the pieces of the result joined.
+static LLVMValueRef dot_i16_native(LLVMValueRef x, LLVMValueRef y, unsigned nl) {
+    unsigned per;  // i16 lanes per instruction
+    const char *name;
+    if (g_target.wasm) {
+        if (!(g_features & feature_bit("simd128"))) return NULL;
+        per = 8, name = "llvm.wasm.dot";
+    } else if (g_arch == ARCH_X64) {
+        if (nl >= 32 && (g_features & feature_bit("avx512bw"))) per = 32, name = "llvm.x86.avx512.pmaddw.d.512";
+        else if (nl >= 16 && (g_features & feature_bit("avx2"))) per = 16, name = "llvm.x86.avx2.pmadd.wd";
+        else per = 8, name = "llvm.x86.sse2.pmadd.wd";
+    } else {
+        return NULL;
+    }
+    if (nl % per || ((nl / per) & (nl / per - 1))) return NULL;
+    unsigned np = nl / per;
+    LLVMValueRef *ps = NEWN(LLVMValueRef, np), *m = NEWN(LLVMValueRef, nl);
+    for (unsigned k = 0; k < np; k++) {
+        LLVMValueRef args[2] = {x, y};
+        if (np > 1) {
+            for (unsigned i = 0; i < per; i++) m[i] = LLVMConstInt(T_i32, k * per + i, false);
+            LLVMValueRef mask = LLVMConstVector(m, per);
+            args[0] = LLVMBuildShuffleVector(B, x, LLVMGetUndef(LLVMTypeOf(x)), mask, "");
+            args[1] = LLVMBuildShuffleVector(B, y, LLVMGetUndef(LLVMTypeOf(y)), mask, "");
+        }
+        ps[k] = intrinsic(name, NULL, 0, args, 2);
+    }
+    for (unsigned w = per / 2; np > 1; np /= 2, w *= 2) {
+        for (unsigned i = 0; i < 2 * w; i++) m[i] = LLVMConstInt(T_i32, i, false);
+        for (unsigned k = 0; k < np / 2; k++) ps[k] = LLVMBuildShuffleVector(B, ps[2 * k], ps[2 * k + 1], LLVMConstVector(m, 2 * w), "");
+    }
+    return ps[0];
+}
+
 // x86's one-instruction permutes of a table's lanes by indices of the same
 // width (the index modulo the lanes, or the lanes of both tables), where the
 // function's extensions have them: the intrinsic's name, or NULL.
@@ -2794,6 +2833,8 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e);
         if (vt->elem->kind == TY_FLOAT) return reduce_add(vt, LLVMBuildFMul(B, x, y, ""));
         unsigned nl = (unsigned)vt->lanes;
+        LLVMValueRef d = dot_i16_native(x, y, nl);
+        if (d) return d;
         LLVMTypeRef w = LLVMVectorType(T_i32, nl);
         LLVMValueRef p = LLVMBuildMul(B, LLVMBuildSExt(B, x, w, ""), LLVMBuildSExt(B, y, w, ""), "");
         LLVMValueRef ev[16], od[16];

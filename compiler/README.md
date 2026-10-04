@@ -136,7 +136,10 @@ $ node tests/std_opt.mjs          # std's tests at -O2, wasm32 and native, in pa
 
 `tests/run/*.ax` are run-and-compare tests. `// expect:` lines give the expected output,
 `// expect-trap` means `run` must trap, and `// flags:` adds compiler options.
-`tests/errors/*.ax` must fail to compile with the `// expect-error:` codes. The suite
+`tests/errors/*.ax` must fail to compile with the `// expect-error:` codes.
+`tests/lowering/*.ax` check instruction selection: each `// lower: <flags> | <regex> | <count>`
+line builds the file with `--emit=asm` and counts the regex's matches (for example, one
+`vpmaddwd` per `@dot` of `i16x32` with AVX-512, issue 0036). The suite
 passes on wasm32 and native at every optimization level, and under ASan/UBSan.
 
 ## Architecture

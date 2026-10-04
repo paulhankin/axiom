@@ -2750,7 +2750,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@any_true(v)`, `@all_true(v)` | `→ bool` |
 | `@bitmask(v)` | `→ u32`, one bit per lane (`u64` for 64 lanes) |
 | `@reduce_add(v)` | Halves folded (§13.2). Integer lanes wrap |
-| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes |
+| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes; lane `i` is `a[2i] * b[2i] + a[2i+1] * b[2i+1]` in `i32`, which wraps only when both products are `-32768 * -32768`. One instruction per register on x86 (`pmaddwd`) and WebAssembly |
 | `@widen_low(v)`, `@widen_high(v)` | Integer `Vec` of 8-, 16- or 32-bit lanes → half its lanes, twice as wide, extended by the lane type (§13.2) |
 | `@narrow(T, a, b)` | `Vec, Vec → T`: the lanes of `a` then `b`, saturated to `T`'s narrower lanes (§13.2) |
 
