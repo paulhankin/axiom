@@ -309,11 +309,17 @@ fn note(o: *mut ir.Value, i: *mut ir.Value, at: *mut ir.Block, b: *mut ir.Block,
     }
 }
 
-// Every use outside B of a value defined in B.
-fn outside_uses(f: *mut ir.Func, b: *mut ir.Block) void {
+// Every use outside B of a value defined in B: in the blocks B dominates,
+// or as the input of a phi from one of them (needs dominators).
+fn outside_uses(b: *mut ir.Block) void {
     uses.clear();
-    let mut x = f.first;
-    while u.notnil(x) {
+    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    work.push(b);
+    while work.len > 0 {
+        let x = work.pop();
+        for k in 0..x.dom_kids.len {
+            work.push(x.dom_kids.get(k));
+        }
         let mut i = x.first;
         while u.notnil(i) {
             if i.op == ir.OP_PHI {
@@ -331,8 +337,25 @@ fn outside_uses(f: *mut ir.Func, b: *mut ir.Block) void {
             }
             i = i.next;
         }
-        x = x.next;
+        // phis of the blocks it leads to beyond B's
+        let t = ir.terminator(x);
+        for j in 0..ir.succ_count(t) {
+            let sb = ir.succ(t, j);
+            if ((j > 0) and (ir.succ(t, j - 1) == sb)) or ((sb.rpo >= 0) and opt.dominates(b, sb)) {
+                continue;
+            }
+            let mut p = sb.first;
+            while u.notnil(p) and (p.op == ir.OP_PHI) {
+                for k in 0..p.xs.len {
+                    if p.bs.get(k) == x {
+                        note(p.xs.get(k), p, x, b, x == b);
+                    }
+                }
+                p = p.next;
+            }
+        }
     }
+    u.free(@ptr_cast(*mut void, work.data));
 }
 
 // Can B's values still be used where they are after P is sent to S?
@@ -565,7 +588,7 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             if b.mark == gen {
                 continue;  // its values cannot be repaired (found earlier)
             }
-            outside_uses(f, b);
+            outside_uses(b);
             if not uses_ok(b, s, other) {
                 b.mark = gen;
                 continue;
