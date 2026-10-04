@@ -1,7 +1,7 @@
 # 0027: Loads and stores of a vector's first lanes (masked tails)
 
 - Type: feature
-- Status: open
+- Status: fixed (107a199)
 - Area: language, compiler (C and selfhost)
 
 ## Today
@@ -22,3 +22,7 @@ one of 10.
 Both never touch memory beyond `s`. Lowering: AVX-512 masked moves (mask
 `(1 << n) - 1`), AVX2 `vmaskmovps/d` for 32-bit lanes, elsewhere a full load
 when the slice is known long enough and lane-by-lane otherwise.
+
+## Resolution
+
+`@load_partial(V, s)` and `@store_partial(s, v)` (spec §13.2): the first `min(s.len, n)` lanes, from or to a slice of the lane type, the rest of a load zero, never touching memory past `s`. The C compiler emits `llvm.masked.load/store` (AVX-512 masked moves, AVX `vmaskmov`, scalarized elsewhere); the self-hosted compiler copies through a zeroed temporary.

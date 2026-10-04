@@ -1,7 +1,7 @@
 # 0025: Per-lane shift counts
 
 - Type: feature
-- Status: open
+- Status: fixed (107a199)
 - Area: language, compiler (C and selfhost)
 
 ## Today
@@ -27,3 +27,7 @@ Allow the count to be an unsigned integer vector of the same shape:
 signed lanes). That is exactly `vpsllvd`/`vpsrlvd`/`vpsravd`'s behaviour, so
 x86 needs no fix-ups; AArch64's `ushl` shifts right with negative counts
 (negate the count); wasm32 and SSE2 shift lane by lane.
+
+## Resolution
+
+`v << w` and `v >> w` take a count vector of the same shape (unsigned lanes), lane i shifted by `w[i]` with §7.6 per lane (spec §13.1), also in `<<=`/`>>=`. The C compiler emits LLVM's vector shifts (`vpsllvd`/`vpsrlvd`/`vpsravd`, `ushl`/`sshl`) with a select for counts of at least the lane width; the self-hosted compiler shifts lane by lane.

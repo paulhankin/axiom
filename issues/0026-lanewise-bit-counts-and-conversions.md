@@ -1,7 +1,7 @@
 # 0026: Lane-wise @clz/@ctz/@popcount and int/float conversions on vectors
 
 - Type: feature
-- Status: open
+- Status: fixed (107a199)
 - Area: language, compiler (C and selfhost)
 
 ## Today
@@ -31,3 +31,7 @@ too.
   by adding pairs); `@clz`/`@ctz` there and on SSE2/AVX2 by the
   float-exponent method or a nibble `pshufb` table; AVX-512 has single
   instructions for all of them; NEON has `clz`, `cnt`, `scvtf`, `fcvtzs`.
+
+## Resolution
+
+`@clz`, `@ctz` and `@popcount` work lane-wise on integer vectors, and `@float_from_int(F, v)` / `@int_from_float(I, v)` convert between vectors of the same lane count with the scalar rules (spec §13.2). The C compiler uses LLVM's vector intrinsics and conversions (`vplzcntd`, `vpopcnt*`, `vcvtdq2ps`, ... where the processor has them); the self-hosted compiler converts lane by lane.

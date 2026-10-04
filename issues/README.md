@@ -35,12 +35,6 @@ they travel with the code they describe.
 | [0012](0012-windows-native-target.md) | feature | compiler, runtime | Native Windows binaries (x86-64 done; runs on Windows 11) |
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
-| [0024](0024-lane-permutes.md) | feature | language, compiler (C and selfhost) | Runtime permutes of 16-, 32- and 64-bit lanes (and fast wide byte swizzles) |
-| [0025](0025-variable-vector-shifts.md) | feature | language, compiler (C and selfhost) | Per-lane shift counts |
-| [0026](0026-lanewise-bit-counts-and-conversions.md) | feature | language, compiler (C and selfhost) | Lane-wise @clz/@ctz/@popcount and int/float conversions on vectors |
-| [0027](0027-partial-vector-loads.md) | feature | language, compiler (C and selfhost) | Loads and stores of a vector's first lanes (masked tails) |
-| [0028](0028-reduce-add-order.md) | feature | language (spec §13.2), compiler (C and selfhost) | @reduce_add's fixed order: fold the halves |
-| [0029](0029-codegen-checks-in-hot-code.md) | feature | compiler (C) | Code generation: address offsets, stack checks and overflow checks in hot code |
 
 ## Closed
 
@@ -59,3 +53,9 @@ they travel with the code they describe.
 | [0021](0021-selfhost-vsplit-crash.md) | bug | compiler (selfhost) | Self-hosted compiler crashes splitting wide vectors (fill_phis) |
 | [0022](0022-profile-program-arguments.md) | bug | tools, compiler (C) | `axiom profile` (C compiler) does not pass arguments to the program |
 | [0023](0023-aligned-allocation.md) | feature | std/mem | Aligned allocation in std/mem |
+| [0024](0024-lane-permutes.md) | feature | language, compiler (C and selfhost) | Runtime permutes of 16-, 32- and 64-bit lanes (and fast wide byte swizzles) |
+| [0025](0025-variable-vector-shifts.md) | feature | language, compiler (C and selfhost) | Per-lane shift counts |
+| [0026](0026-lanewise-bit-counts-and-conversions.md) | feature | language, compiler (C and selfhost) | Lane-wise @clz/@ctz/@popcount and int/float conversions on vectors |
+| [0027](0027-partial-vector-loads.md) | feature | language, compiler (C and selfhost) | Loads and stores of a vector's first lanes (masked tails) |
+| [0028](0028-reduce-add-order.md) | feature | language (spec §13.2), compiler (C and selfhost) | @reduce_add's fixed order: fold the halves |
+| [0029](0029-codegen-checks-in-hot-code.md) | feature | compiler (C) | Code generation: address offsets, stack checks and overflow checks in hot code |

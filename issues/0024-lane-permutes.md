@@ -1,7 +1,7 @@
 # 0024: Runtime permutes of 16-, 32- and 64-bit lanes (and fast wide byte swizzles)
 
 - Type: feature
-- Status: open
+- Status: fixed (107a199)
 - Area: language, compiler (C and selfhost)
 
 ## Today
@@ -65,3 +65,7 @@ this alone is about 75 ns of the 130 ns per position between the Axiom port
 - `@gather(slice, idx)`: a memory gather (`vgatherdps`) is slower than a
   register permute for tables that fit in registers, and needs bounds
   checks or masking per lane.
+
+## Resolution
+
+`@swizzle(a, idx)` takes a vector of any lanes, with indices of the same shape (an integer vector of the lanes' width, taken as unsigned; out of range gives 0), and `@swizzle2(a, b, idx)` looks up the 2n lanes of `a` then `b` (spec §13.2). The C compiler uses `vpermd/q`, `vpermw` (BW), `vpermb` (VBMI) and `vpermt2*` for 512-bit tables, `vpermd`/`vpermps` for 8 lanes with AVX2, with a compare to clear out-of-range lanes (which LLVM drops when the indices are masked, e.g. `idx & @splat(31)` gives one `vpermt2d`); elsewhere the indices become byte indices into a byte `@swizzle`. Wide byte swizzles join their 16-byte pieces with shuffles instead of an insert per byte, and `u8x64` uses `vpermb` where the processor has VBMI. The self-hosted compiler lowers every lane type to byte swizzles (`i8x16.swizzle`, `pshufb`, `tbl` per piece). tests/run/simd_lanes.ax checks both.
