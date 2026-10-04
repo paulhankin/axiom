@@ -971,6 +971,201 @@ pub fn layout(order: *mut u.List.[*mut ir.Block]) void {
     }
     u.free(@ptr_cast(*mut void, cold.data));
     rotate_loops(order);
+    place_unlikely(order);
+}
+
+// Static branch prediction: the successor of b's conditional branch that is
+// the less likely one, or nil when neither is. An equality is predicted
+// false (most values are not the one compared with, and a pointer is rarely
+// null), except for a boolean or a test of one bit, and so is a signed
+// integer below zero. (Loops and trap paths are
+// laid out by their own rules; the register allocator's block frequencies,
+// mach.ax, weigh the same edges with mc.UNLIKELY_WEIGHT.)
+pub fn unlikely_succ(b: *ir.Block) *mut ir.Block {
+    let t = ir.terminator(b);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+        return bnil();
+    }
+    let c = t.a;
+    if (c.kind != ir.V_INST) or ((c.op != ir.OP_ICMP) and (c.op != ir.OP_FCMP)) or (c.a.ty.kind == ir.T_VEC) {
+        return bnil();
+    }
+    let p = @as(i32, @truncate(i32, @bit_cast(i64, c.cv)));
+    if c.op == ir.OP_ICMP {
+        let x = c.a;
+        if is_bool(x, 0) or ((x.kind == ir.V_INST) and (x.op == ir.OP_AND) and (one_bit(x.a) or one_bit(x.b))) {
+            return bnil();  // (a boolean, or a test of one bit: either way)
+        }
+        if p == ir.IntEQ {
+            return t.t1;
+        }
+        if p == ir.IntNE {
+            return t.t2;
+        }
+        if (c.b.kind == ir.V_CINT) and (c.a.ty.kind == ir.T_INT) {
+            let k = ir.sval(c.b);
+            if ((p == ir.IntSLT) and (k == 0)) or ((p == ir.IntSLE) and (k == -1)) {
+                return t.t1;
+            }
+            if ((p == ir.IntSGT) and (k == -1)) or ((p == ir.IntSGE) and (k == 0)) {
+                return t.t2;
+            }
+        }
+        return bnil();
+    }
+    if p == ir.RealOEQ {
+        return t.t1;
+    }
+    if p == ir.RealUNE {
+        return t.t2;
+    }
+    return bnil();
+}
+
+// Is v 0 or 1, a boolean (an i1, or one kept in a wider integer)?
+fn is_bool(v: *ir.Value, depth: i32) bool {
+    if (v.ty.kind == ir.T_INT) and (v.ty.bits == 1) {
+        return true;
+    }
+    if v.kind == ir.V_CINT {
+        return ir.cint_val(v) <= 1;
+    }
+    if (v.kind != ir.V_INST) or (depth > 3) {
+        return false;
+    }
+    if v.op == ir.OP_ZEXT {
+        return is_bool(v.a, depth + 1);
+    }
+    if v.op == ir.OP_SELECT {
+        return is_bool(v.b, depth + 1) and is_bool(v.c, depth + 1);
+    }
+    if v.op == ir.OP_PHI {
+        for k in 0..v.xs.len {
+            if not is_bool(v.xs.get(k), depth + 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+fn one_bit(m: *ir.Value) bool {
+    if m.kind == ir.V_CINT {
+        let k = ir.cint_val(m);
+        return (k & (k - 1)) == 0;
+    }
+    return (m.kind == ir.V_INST) and (m.op == ir.OP_SHL) and (m.a.kind == ir.V_CINT) and (ir.cint_val(m.a) == 1);
+}
+
+// Could control pass from a to b without a jump (b is a successor of a)?
+fn falls_into(a: *ir.Block, b: *mut ir.Block) bool {
+    let t = ir.terminator(a);
+    if u.isnil(t) {
+        return true;
+    }
+    let n = ir.succ_count(t);
+    for k in 0..n {
+        if ir.succ(t, k) == b {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An unlikely successor (unlikely_succ) that the layout put between two
+// blocks that could otherwise follow each other without a jump (its branch
+// and the likely successor, or the two arms' join) moves out of the way, to
+// the nearest place no block falls into (after a jump or a return): the
+// likely path then runs straight through, and the unlikely one takes the
+// jumps. What moves is the successor and the blocks after it that it
+// dominates, in the same loop (a few). Needs dominators; sets b.rpo.
+fn place_unlikely(order: *mut u.List.[*mut ir.Block]) void {
+    let n = order.len;
+    for k in 0..n {
+        order.get(k).aux = 0;  // 1: moves, 2: stays where it is
+    }
+    // the regions that move, [s, e) in the order, each with the block after it
+    let mut rs = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    let mut re = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    for i in 0..n {
+        let b = order.get(i);
+        let us = unlikely_succ(b);
+        if (b.aux == 1) or u.isnil(us) or (us.preds.len != 1) or (us.rpo <= b.rpo) {
+            continue;
+        }
+        let s = @int_cast(usize, us.rpo);
+        let mut e = s;
+        while (e < n) and (e - s <= 8) and (order.get(e).aux == 0) and (order.get(e).loop_depth == b.loop_depth) and
+              dominates(us, order.get(e)) {
+            e += 1;
+        }
+        if (e == s) or (e - s > 8) or (e >= n) or (order.get(e).aux == 1) or (order.get(s - 1).aux == 1) or
+           not falls_into(order.get(s - 1), order.get(e)) {
+            continue;
+        }
+        for k in s..e {
+            order.get(k).aux = 1;
+        }
+        order.get(s - 1).aux = 2;
+        order.get(e).aux = 2;
+        rs.push(s);
+        re.push(e);
+    }
+    if rs.len == 0 {
+        return;
+    }
+    let all = u.calloc_slice.[*mut ir.Block](n + 1);
+    for k in 0..n {
+        all[k] = order.get(k);
+    }
+    let mut w: usize = 0;
+    for k in 0..n {
+        if all[k].aux != 1 {
+            order.set(w, all[k]);
+            w += 1;
+        }
+    }
+    order.len = w;
+    // each region at the gap nearest to where it was
+    for r in 0..rs.len {
+        for k in 0..order.len {
+            order.get(k).rpo = @int_cast(i32, k);
+        }
+        let s = @int_cast(usize, all[re.get(r)].rpo);  // (where it would go back)
+        let mut at = order.len;
+        let mut d: usize = 0;
+        while d <= 64 {
+            if (s > d) and not falls_into(order.get((s - d) - 1), order.get(s - d)) {
+                at = s - d;
+                break;
+            }
+            if (d > 0) and (s + d < order.len) and not falls_into(order.get((s + d) - 1), order.get(s + d)) {
+                at = s + d;
+                break;
+            }
+            d += 1;
+        }
+        let m = re.get(r) - rs.get(r);
+        let old = order.len;
+        for k in 0..m {
+            order.push(all[0]);
+        }
+        let mut k = old;
+        while k > at {
+            k -= 1;
+            order.set(k + m, order.get(k));
+        }
+        for j in 0..m {
+            order.set(at + j, all[rs.get(r) + j]);
+        }
+    }
+    for k in 0..order.len {
+        order.get(k).rpo = @int_cast(i32, k);
+    }
+    u.free_slice.[*mut ir.Block](all);
+    u.free(@ptr_cast(*mut void, rs.data));
+    u.free(@ptr_cast(*mut void, re.data));
 }
 
 // A loop whose header tests for the exit (a `while` loop) has its header
@@ -1136,8 +1331,11 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
         }
     }
     u.free(@ptr_cast(*mut void, work.data));
-    // copies per header: (constant, copy) in the preheader
+    // copies per header: (constant, copy) in the preheader; a loop inside
+    // another uses the copies of the loops around it (whose preheaders
+    // dominate it) rather than making its own
     let mut made = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let kept = u.calloc_slice.[u.List.[*mut ir.Value]](headers.len + 1);
     for hi in 0..headers.len {
         let h = headers.get(hi);
         // the preheader: the one predecessor outside the loop, ending in br h
@@ -1158,6 +1356,13 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
             continue;
         }
         made.clear();
+        for j in 0..hi {
+            if pre.auxp == @ptr_cast(*mut void, headers.get(j)) {
+                for k in 0..kept[j].len {
+                    made.push(kept[j].get(k));
+                }
+            }
+        }
         for bi in 0..order.len {
             let b = order.get(bi);
             if b.auxp != @ptr_cast(*mut void, h) {
@@ -1176,7 +1381,14 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
                 i = i.next;
             }
         }
+        for k in 0..made.len {
+            kept[hi].push(made.get(k));
+        }
     }
+    for hi in 0..headers.len {
+        u.free(@ptr_cast(*mut void, kept[hi].data));
+    }
+    u.free_slice.[u.List.[*mut ir.Value]](kept);
     u.free(@ptr_cast(*mut void, headers.data));
     u.free(@ptr_cast(*mut void, made.data));
 }

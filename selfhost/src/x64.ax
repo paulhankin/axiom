@@ -279,6 +279,7 @@ fn new_label() i32 {
 
 fn place(l: i32) void {
     addr_regs.clear();
+    imm_regs.clear();
     ccache.clear();  // (reached by jumps: what the block built so far may not have been)
     pcache.clear();
     let i = e0(xe.LABEL, 0);
@@ -512,11 +513,24 @@ struct AddrReg {
 let mut addr_regs: u.List.[AddrReg] = u.List.[AddrReg].{ data: @ptr_from_int(*mut AddrReg, 0), len: 0, cap: 0 };
 let mut addr_block: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 
-fn cached_addr(key: *void) i32 {
+// (And so are integer constants a cmov reads, which has no immediate form.)
+struct ImmReg {
+    x: i64,
+    r: i32,
+}
+
+let mut imm_regs: u.List.[ImmReg] = u.List.[ImmReg].{ data: @ptr_from_int(*mut ImmReg, 0), len: 0, cap: 0 };
+
+fn same_block() void {
     if addr_block != CB {
         addr_regs.clear();
+        imm_regs.clear();
         addr_block = CB;
     }
+}
+
+fn cached_addr(key: *void) i32 {
+    same_block();
     for k in 0..addr_regs.len {
         let x = addr_regs.get(k);
         if x.key == key {
@@ -528,6 +542,24 @@ fn cached_addr(key: *void) i32 {
 
 fn cache_addr(key: *void, r: i32) void {
     addr_regs.push(AddrReg.{ key: key, r: r });
+}
+
+// A register holding integer constant v (reg), shared in the block.
+fn imm_reg(v: *mut ir.Value) i32 {
+    if v.kind != ir.V_CINT {
+        return reg(v);
+    }
+    same_block();
+    let x = cval(v);
+    for k in 0..imm_regs.len {
+        let c = imm_regs.get(k);
+        if c.x == x {
+            return c.r;
+        }
+    }
+    let r = reg(v);
+    imm_regs.push(ImmReg.{ x: x, r: r });
+    return r;
 }
 
 fn const_le(x: *mut ir.Value, out: *mut bn.Bytes, base: usize) void {
@@ -968,6 +1000,11 @@ fn gen_alu(v: *mut ir.Value) void {
             x = b;
         }
         _ = e3(xe.ANDN, sz, W(d), R(reg(x)), R(reg(n.a)));
+        return;
+    }
+    if (o == ir.OP_MUL) and not is_c(a) and not folded_load(b) and imm_ok(b) and ((cval(b) & (cval(b) - 1)) != 0) {
+        // imul d, a, k (three operands: no copy of a)
+        _ = e3(xe.IMUL_I, sz, W(d), R(reg(a)), I(cval(b)));
         return;
     }
     if is_c(a) and fits32(cval(a)) {
@@ -1572,7 +1609,7 @@ fn gen_select(v: *mut ir.Value) void {
     let cls = class_of(v.ty);
     if cls == GPR {
         // (the copy after the compare, which may read rf for the last time)
-        let rt = reg(v.b);
+        let rt = imm_reg(v.b);
         let rf = reg(v.c);
         let cc = cond_code(v.a);
         copy(d, rf, GPR);
@@ -3001,7 +3038,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             csz = 2;
         }
         let a = reg(x);
-        let b = reg(y);
+        let b = imm_reg(y);
         if imm_ok(y) {
             let c = e2(xe.ALU, csz, R(a), I(narrow_imm(cval(y), csz)));
             c.cc = 7;
@@ -6823,6 +6860,12 @@ fn compile_func(f: *mut ir.Func) void {
         let bt = ir.terminator(b);
         mb.cold = u.notnil(bt) and (bt.op == ir.OP_UNREACHABLE);
     }
+    for i in 0..order.len {
+        let us = opt.unlikely_succ(order.get(i));
+        if u.notnil(us) {
+            MF.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
+        }
+    }
     // stack slots for allocas
     let mut b = f.first;
     while u.notnil(b) {
@@ -6883,6 +6926,7 @@ fn compile_func(f: *mut ir.Func) void {
         IB = ib;
         CB = MF.blocks.get(bi);
         addr_regs.clear();
+        imm_regs.clear();
         addr_block = CB;
         ccache.clear();
         pcache.clear();
@@ -6934,6 +6978,14 @@ fn compile_func(f: *mut ir.Func) void {
                           spill_move: spill_move, is_label: is_label, fold_remat: fold_remat };
     let dn = u.env("AXIOM_DEBUG_RA");
     mc.debug_ra = (dn.len > 0) and (dn.len <= f.name.len) and u.str_eq(f.name[(f.name.len - dn.len)..f.name.len], dn);
+    // a select or branch comparing again what the flags already hold (the
+    // second of two selects of one condition) does not keep the compared
+    // registers alive past the first
+    PRE_RA = true;
+    for bi in 0..MF.blocks.len {
+        reuse_flags(MF.blocks.get(bi));
+    }
+    PRE_RA = false;
     mc.dce(MF, pure_inst);
     fold_remats();
     mc.allocate(MF, &tgt);
@@ -6955,8 +7007,13 @@ let mut xsaved: [10]i32 = [0; 10];
 let mut local_off: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 
 fn P(r: i32) i32 {
+    if PRE_RA {
+        return r;
+    }
     return mc.phys(MF, r);
 }
+
+let mut PRE_RA: bool = false;  // (P names virtual registers: before allocation)
 
 fn b8(x: u64) void {
     E.b.u8_(@truncate(u8, x));
@@ -7939,9 +7996,10 @@ fn peephole(b: *mut mc.MBlock) void {
     }
 }
 
-// After allocation: a compare of registers (or a register and a constant)
-// that an identical earlier one in the block makes redundant, with nothing
-// between that sets the flags or writes the registers, is dropped.
+// A compare of registers (or a register and a constant) that an identical
+// earlier one in the block makes redundant, with nothing between that sets
+// the flags or writes the registers, is dropped (before allocation, and
+// again after it, when copies may have made two compares the same).
 fn reuse_flags(b: *mut mc.MBlock) void {
     let mut last = u.nil.[mc.MInst]();
     let mut i = b.first;
@@ -7998,9 +8056,31 @@ fn writes_reg_of(i: *mc.MInst, c: *mc.MInst) bool {
 }
 
 // `mov d, a; add d, b|k` (sub k) as `lea d, [a + b|k]` at i (the add),
-// when d is not a.
+// when d is not a; and `mov d, a; shl d, 1-3` as `lea d, [a * 2-8]`.
 fn three_address(b: *mut mc.MBlock, i: *mut mc.MInst) bool {
     let mv = i.prev;
+    if (i.op == xe.SHIFT) and (i.cc == 4) and (i.ops[2].kind == mc.K_IMM) and (i.ops[2].disp >= 1) and
+       (i.ops[2].disp <= 3) and ((i.sz == 4) or (i.sz == 8)) and u.notnil(mv) and (mv.op == xe.MOV_RR) and
+       (i.ops[0].kind == mc.K_REG) {
+        // `mov d, a; shl d, k` as `lea d, [a * 2^k]`
+        let d = P(i.ops[0].reg);
+        if (P(mv.ops[0].reg) != d) or (P(mv.ops[1].reg) == d) or ((mv.sz != 8) and (i.sz == 8)) {
+            return false;
+        }
+        let a = mv.ops[1].reg;
+        let k = i.ops[2].disp;
+        let mut m = mc.mem(-1, a, @truncate(u8, @as(i64, 1) << @int_cast(u32, k)), 0);
+        if k == 1 {
+            m = mc.mem(a, a, 1, 0);
+        }
+        i.op = xe.LEA;
+        i.cc = 0;
+        i.ops[0] = W(i.ops[0].reg);
+        i.ops[1] = m;
+        i.ops[2] = NONE();
+        mc.remove(b, mv);
+        return true;
+    }
     if (i.op != xe.ALU) or ((i.cc != 0) and (i.cc != 5)) or ((i.sz != 4) and (i.sz != 8)) or u.isnil(mv) or
        (mv.op != xe.MOV_RR) or (i.ops[0].kind != mc.K_REG) {
         return false;
