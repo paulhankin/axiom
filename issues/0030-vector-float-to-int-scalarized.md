@@ -1,7 +1,7 @@
 # 0030: Vector @int_from_float is scalarized on x86
 
 - Type: bug (performance)
-- Status: open
+- Status: fixed (d1b9c1a)
 - Area: compiler (C)
 
 ## Today
@@ -62,3 +62,7 @@ The experiment above was the unsigned rule (a dozen lines in
 `fptosi.sat`/`fptoui.sat` on `<4 x float>` to `i32x4.trunc_sat_f32x4_s/u`
 directly. A test could check the instruction count of a 16-lane conversion
 in `--emit=asm`, as for the other lowering checks.
+
+## Resolution
+
+For vector operands (not on wasm, where the intrinsics are `trunc_sat`), `BI_INT_FROM_FLOAT` clamps with ordered compares (NaN and negatives give 0; signed: to `-2^(n-1)`) and to the largest float below `2^n` (or `2^(n-1)`), converts with a plain `fptoui`/`fptosi`, and selects the maximum for inputs of at least `2^n` (the clamp alone would give `2^32 - 256` for `u32`) and 0 for NaN (signed). `u32x16` from `f32x16` is now `vcmpgeps`, `vmaxps`, `vminps`, `vcvttps2udq` and a masked move; the signed form `vcvttps2dq` with two masked moves. tests/run/simd_lanes.ax compares every lane with the scalar conversion on edge values (±0, 255.9, 2^31, 2^32, ±inf, NaN, ...) for `u32`, `i32`, `u8`, `i8`, and 64-bit lanes from `f64`.

@@ -1,7 +1,7 @@
 # 0031: Code generation and shuffles: @select through bitwise operations, checked multiplication by a constant, no widening @shuffle
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (d1b9c1a)
 - Area: compiler (C), language (§13.2)
 
 Three smaller things seen in the same AVX-512 kernels as issue 0030. Fixing
@@ -62,3 +62,9 @@ row with `@load_partial`.
 Proposal: let the index list's length set the result's lane count, as LLVM's
 `shufflevector` does: `@shuffle(a, zero, [0, 1, ..., 7, 8, 8, ...])` for a
 zero-extension, `@shuffle(a, a, [8, ..., 15])` for the high half.
+
+## Resolution
+
+1. `@select` whose mask is a lane comparison, `&`/`|`/`^`/`~` of such masks, or an immutable local initialized with one (recognized on the AST, since at code generation locals are still loads) is emitted as `select` on the mask's sign bits, the same bit for bit; other masks keep the bitwise form. the benchmark's four-way sigmoid select is two `vptestnmd` and three masked moves (the table loads folded in).
+2. A checked 64-bit multiply with a constant operand compares the other with `MAX / k` (unsigned) or the two quotient bounds (signed; `k = -1` checks for `MIN`) instead of dividing back: `n * 128` has no `div`.
+3. `@shuffle`'s index count sets the result's lanes, any count making a 128-, 256- or 512-bit vector (spec §13.2), in both compilers: `@shuffle(a, zero, [0, ..., 7, 8, ..., 8])` widens an `f32x8`, `@shuffle(a, a, [8, ..., 15])` takes a half.
