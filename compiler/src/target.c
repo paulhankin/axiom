@@ -64,6 +64,7 @@ static const Feature TABLE[] = {
     {"sm3", X, B(36), B(8), "sm3"},
     {"sm4", X, B(37), B(9), "sm4"},
     {"avx10.1", X, B(38), AVX512_ALL, "avx10.1-512"},
+    {"prfchw", X, B(39), 0, "prfchw"},
     {"lse", A, B(0), 0, "lse"},
     {"rcpc", A, B(1), 0, "rcpc"},
     {"dotprod", A, B(2), 0, "dotprod"},
@@ -159,7 +160,7 @@ static uint64_t x86_preset(const char *n, bool *ok) {
     uint64_t v3 = v2 | B(8) | B(9) | B(6) | B(7) | B(10) | B(5) | B(15) | B(16);
     uint64_t v4 = v3 | B(18) | B(19) | B(20) | B(21) | B(22);
     uint64_t haswell = v3 | B(12) | B(13);
-    uint64_t skylake = haswell | B(17);
+    uint64_t skylake = haswell | B(17) | B(39);  // (Broadwell added adx and prfchw)
     uint64_t icelake = skylake | v4 | B(14) | B(23) | B(24) | B(25) | B(26) | B(27) | B(28) | B(31) | B(32) | B(33);
     uint64_t spr = icelake | B(29) | B(30) | B(34) | B(38);
     uint64_t alderlake = skylake | B(14) | B(31) | B(32) | B(33) | B(34);

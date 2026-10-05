@@ -3406,14 +3406,17 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_EXPECT: check_or_trap(gen(a[0].e), T_EXPECT); return NULL;
     case BI_EXPECT_EQ: gen_expect_eq(e); return NULL;
     case BI_FENCE: LLVMBuildFence(B, LLVMAtomicOrderingSequentiallyConsistent, false, ""); return NULL;
-    case BI_PREFETCH: {
-        // A hint (spec §5.7): read, keep in every cache level (prefetcht0,
-        // prfm pldl1keep). WebAssembly has no prefetch.
+    case BI_PREFETCH:
+    case BI_PREFETCH_WRITE: {
+        // A hint (spec §5.7): read (prefetcht0, prfm pldl1keep) or write
+        // (prefetchw with the prfchw extension, else prefetcht0; prfm
+        // pstl1keep), keeping the line in every cache level. WebAssembly has
+        // no prefetch.
         LLVMValueRef p = gen(a[0].e);
         if (g_target.wasm) return NULL;
         LLVMTypeRef tys[1] = {T_ptr};
-        LLVMValueRef args[4] = {p, LLVMConstInt(T_i32, 0, false), LLVMConstInt(T_i32, 3, false),
-                                LLVMConstInt(T_i32, 1, false)};
+        LLVMValueRef args[4] = {p, LLVMConstInt(T_i32, e->index == BI_PREFETCH_WRITE, false),
+                                LLVMConstInt(T_i32, 3, false), LLVMConstInt(T_i32, 1, false)};
         intrinsic("llvm.prefetch", tys, 1, args, 4);
         return NULL;
     }

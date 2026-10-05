@@ -29,6 +29,7 @@
     X(MEM_SET, "mem_set", "ee")               \
     X(MEM_EQ, "mem_eq", "ee")                 \
     X(PREFETCH, "prefetch", "e")              \
+    X(PREFETCH_WRITE, "prefetch_write", "e")  \
     X(MEMORY_SIZE, "memory_size", "")         \
     X(MEMORY_GROW, "memory_grow", "e")        \
     X(CLZ, "clz", "e")                        \

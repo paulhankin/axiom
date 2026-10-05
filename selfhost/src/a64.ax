@@ -54,6 +54,7 @@ const CALL: i32 = 15;   // sym | reg, uses..., defs...
 const RET: i32 = 16;    // uses
 const LABEL: i32 = 17;  // aux: local label
 const RAW: i32 = 18;    // up to 4 register operands: Rd, Rn, Rm, Ra fields; aux: the instruction word
+const PRFM: i32 = 19;   // mem; cc: the operation (0 pldl1keep, 0x10 pstl1keep)
 
 const LOCAL_BASE: i32 = 1_000_000;
 
@@ -1184,6 +1185,14 @@ fn gen_store(v: *mut ir.Value) void {
         return;
     }
     _ = e2(STR, mem_size(t), m, R(reg(x)));
+}
+
+// prfm pldl1keep (IN_PREFETCH) or pstl1keep (IN_PREFETCHW) at the address.
+fn gen_prefetch(v: *mut ir.Value, id: i32) void {
+    let i = e1(PRFM, 8, addr(v.xs.get(0)));
+    if id == ir.IN_PREFETCHW {
+        i.cc = 0x10;
+    }
 }
 
 fn raw_none(w: u64) void {
@@ -2420,6 +2429,10 @@ fn gen_inst(v: *mut ir.Value) void {
             _ = e2(MOV, 8, W(vreg(v)), R(FP));
             return;
         }
+        if ir.is_prefetch(id) {
+            gen_prefetch(v, id);
+            return;
+        }
         if is_insn(id) {
             gen_insn(v, id);
             return;
@@ -2619,8 +2632,9 @@ fn prepare(f: *mut ir.Func) void {
                 if o.kind == ir.V_INST {
                     o.uses += 1;
                     o.user = i;
-                    if o.op == ir.OP_PTRADD {
-                        o.flag = o.flag & ~1;
+                    let prefetch = (i.op == ir.OP_INTR) and ir.is_prefetch(@truncate(i32, @bit_cast(i64, i.cv)));
+                    if (o.op == ir.OP_PTRADD) and not prefetch {
+                        o.flag = o.flag & ~1;  // (a prefetch's address is its memory operand)
                     }
                 }
             }
@@ -3216,6 +3230,10 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == LDR {
         ldst(size_code(sz), false, 1, @as(u64, sz), P(i.ops[0].reg), i.ops[1]);
+        return;
+    }
+    if op == PRFM {
+        ldst(3, false, 2, 8, i.cc, i.ops[0]);  // (the loads' encodings with opc 2: prfm, prfum)
         return;
     }
     if op == STR {

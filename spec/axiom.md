@@ -558,7 +558,7 @@ only operations on pointers are:
 - the conversion builtins `@int_from_ptr`, `@ptr_from_int`, `@ptr_cast`, and
   `@slice_from_ptr`
 - the offset builtins `@ptr_add` and `@ptr_sub`
-- the cache hint `@prefetch`
+- the cache hints `@prefetch` and `@prefetch_write`
 
 There is no pointer arithmetic operator. `@ptr_add(p, n)`, with `p` a `*T` or `*mut T`
 and `n` a `usize`, is the pointer `n` elements of `T` past `p`, of the same type as `p`:
@@ -593,6 +593,12 @@ for i in @as(usize, 0)..n {
     @prefetch(&table[bucket(keys[i])]);   // start the loads, then look the keys up
 }
 ```
+
+`@prefetch_write(p)` is the same hint for memory the program will soon write: native
+compilers fetch the line ready to be modified, so that the store that follows does not
+have to ask the other cores for it again (x86 `prefetchw` where the function's extensions
+include `prfchw` (§13.4), else `prefetcht0`; Arm `prfm pstl1keep`). It reads and writes
+nothing, never traps, and may compile to nothing, exactly as `@prefetch` does.
 
 ### 5.8 SIMD vectors
 
@@ -1712,7 +1718,7 @@ same result with or without one. Extensions have the names `--features` takes:
 
 | Architecture | Extensions |
 |---|---|
-| `x86_64` (SSE2 is the baseline) | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1` |
+| `x86_64` (SSE2 is the baseline) | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
 | `aarch64` (FP and Advanced SIMD are the baseline) | `lse`, `rcpc`, `dotprod`, `cssc`, `aes` (with PMULL), `sha2` (SHA-1 and SHA-256), `sha3`, `sha512`, `sm4` (SM3 and SM4), `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
 | `wasm32`, `wasm64` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
 
@@ -2796,6 +2802,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@ptr_add(p, n)` / `@ptr_sub(p, n)` | `*T, usize → *T` (`*mut T → *mut T`) | `n` elements of `T` past (before) `p`. Never traps; the result must stay in `p`'s object (§5.7) |
 | `@slice_from_ptr(p, n)` | `*T, usize → []T` (`*mut T → []mut T`) | No check at creation. Accesses are bounds-checked against linear memory |
 | `@prefetch(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be read soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
+| `@prefetch_write(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be written soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
 | `@cast_slice(T, s)` | `[]U → []T` (keeps mutability) | Traps `T0006` if `s.len * size_of(U)` is not a multiple of `size_of(T)` |
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
@@ -2956,6 +2963,7 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C42 | Native x86-64 Linux builds of the C compiler find stack-trace frames by walking frame pointers, through a table from return addresses to call-site records, instead of a shadow stack written on every call (§16.4.1). Profile and sanitizer builds, WebAssembly and the self-hosted compiler keep the shadow stack | Issue 0037: the stores cost 15% in the benchmark's recursive move generator, and about double the time of a recursive Fibonacci. Traces are on by default, so their cost should be nothing on the hot path |
 | C43 | Integer overflow **wraps** in every build mode by default: `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)` compute modulo 2ⁿ (§7.6). Trapping (`T0002`) is the opt-in `--overflow=trap`; `--overflow=saturate` stays; `--release` no longer changes semantics. Integer vectors take `+`, `-`, `*` and unary `-` (wrapping). `+%`, `-%`, `*%` stay, as explicit spellings. Constant evaluation keeps `E0530` | Issue 0047, the owner's decision on Appendix D, Q1 (option (c)). Checks were the largest remaining cost of the benchmark against Rust's release build: its move generator's core function had 85 branches and 30 trap sites in WebAssembly where Rust's has 40 and 13, ports sprinkled `+%`/`*%` through hot paths, and the checks kept LLVM from vectorizing reductions (issue 0029). Bounds checks keep memory safe whatever an index computation does |
 | C44 | `@prefetch(p)`: a cache hint with no semantics, which never traps (§5.7) | Issue 0041: the benchmark's evaluator prefetches the cache bucket of each position of a batch before evaluating it (`_mm_prefetch`), and the port had no way to say so. One form (read, all cache levels): the one the port needs, and what `_mm_prefetch(.., _MM_HINT_T0)` and Rust's `prefetch_read_data(p, 3)` mean |
+| C45 | `@prefetch_write(p)`: the cache hint for memory about to be written (§5.7); the x86-64 extension `prfchw` (`prefetchw`, §13.4) | Issue 0093: the benchmark's evaluation cache prefetches each bucket of a batch, then locks and updates it; Rust asks for the lines with `_MM_HINT_ET0` (`prefetchw`, Arm `prfm pstl1keep`), so a later write needs no second coherence transaction. A separate builtin rather than a second argument to `@prefetch`: every builtin has a fixed arity and no options argument (the atomics, `@widen_low`/`@widen_high`, the `_last` AES rounds are separate names), and a constant selector would be one more thing to check |
 
 ---
 

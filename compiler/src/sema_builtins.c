@@ -498,10 +498,11 @@ Type *builtin_check(Expr *e, Type *expected) {
         check_expr_to(earg(e, 0), t_usize);
         check_expr_to(earg(e, 1), t_usize);
         return e->type = t_void;
-    case BI_PREFETCH: {
+    case BI_PREFETCH:
+    case BI_PREFETCH_WRITE: {
         Type *p = check_expr(*earg(e, 0), NULL);
         if (p->kind != TY_PTR && p->kind != TY_INVALID)
-            diag_error(e->span, "E0822", "@prefetch requires a pointer, found %s", type_str(p));
+            diag_error(e->span, "E0822", "@%s requires a pointer, found %s", e->name, type_str(p));
         return e->type = t_void;
     }
     case BI_CLZ:

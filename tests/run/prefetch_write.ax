@@ -1,0 +1,98 @@
+// @prefetch_write (issue 0093): the cache hint for memory about to be
+// written, with no semantics, like @prefetch. A batch of buckets is
+// prefetched, then each is updated, as the benchmark's evaluation cache does; the
+// results are those without the hints. Any pointer compiles and never traps,
+// and the pointer is evaluated exactly once, in code built with and without
+// the prfchw extension (prefetchw, or prefetcht0 without it).
+import "../lib/io.ax" as io;
+
+struct Slot {
+    key: u64,
+    hits: u32,
+}
+
+let mut table: [64]Slot = [Slot.{ key: 0, hits: 0 }; 64];
+let mut calls: u32 = 0;
+
+fn bucket(k: u64) usize {
+    return @as(usize, @truncate(u8, (k *% 0x9e3779b97f4a7c15) >> 58));
+}
+
+fn counted(p: *mut Slot) *mut Slot {
+    calls += 1;
+    return p;
+}
+
+// Prefetch each key's bucket for writing, then count the key there (or
+// claim the bucket); the number of keys that were already there.
+fn update(keys: []u64) u32 {
+    for k in keys {
+        @prefetch_write(&mut table[bucket(k)]);
+    }
+    let mut found: u32 = 0;
+    for k in keys {
+        let s = &mut table[bucket(k)];
+        if s.key == k {
+            s.hits += 1;
+            found += 1;
+        } else {
+            s.* = Slot.{ key: k, hits: 1 };
+        }
+    }
+    return found;
+}
+
+fn update_prfchw(keys: []u64) u32 @features("prfchw") {
+    for k in keys {
+        @prefetch_write(&mut table[bucket(k)]);
+        @prefetch(&table[bucket(k)]);
+    }
+    let mut found: u32 = 0;
+    for k in keys {
+        let s = &mut table[bucket(k)];
+        if s.key == k {
+            s.hits += 1;
+            found += 1;
+        }
+    }
+    return found;
+}
+
+export fn run() void {
+    let keys: [5]u64 = [3, 17, 99, 1000, 123456789];
+    io.uint(@as(u64, update(keys[..])));  // expect: 0
+    io.uint(@as(u64, update(keys[..])));  // expect: 5
+    let mut hits: u64 = 0;
+    for s in table {
+        hits += @as(u64, s.hits);
+    }
+    io.uint(hits);  // expect: 10
+
+    let mut again: u32 = 5;
+    if @cpu_has("prfchw") {
+        again = update_prfchw(keys[..]);
+    }
+    io.uint(@as(u64, again));  // expect: 5
+
+    // evaluated once
+    @prefetch_write(counted(&mut table[0]));
+    io.uint(@as(u64, calls));  // expect: 1
+
+    odd_addresses();
+}
+
+fn odd_addresses() void {
+    let mut local: u64 = 7;
+    @prefetch_write(&local);
+    @prefetch_write(&mut local);
+    let v: *mut void = @ptr_cast(*mut void, &mut local);
+    @prefetch_write(v);
+    io.uint(local);  // expect: 7
+
+    // never traps, whatever the address
+    @prefetch_write(@ptr_from_int(*mut u8, 1));
+    @prefetch_write(@ptr_from_int(*u64, 3));
+    @prefetch_write(@ptr_from_int(*mut u8, @max_value(usize) - 63));
+    @prefetch_write(@ptr_add(&table[0], 64));  // one past the end
+    @prefetch_write(@ptr_add(&table[0], 7));
+}
