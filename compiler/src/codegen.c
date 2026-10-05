@@ -1404,10 +1404,13 @@ static void add_str_fn_attr(LLVMValueRef fn, const char *k, const char *v) {
 // loops of table loads with them, but Skylake-SP to Tiger Lake run them in
 // microcode (the Gather Data Sampling mitigation, which a guest cannot see):
 // 25-31 cycles a gather against about one a load. the benchmark's move generation
-// hashes its board with twelve (issue 0091). Newer LLVMs no longer gather
-// there; these processors (the host's name, or a --cpu preset) are told to
-// prefer the loads. Axiom has no gather of its own: only the vectorizers
-// are affected.
+// hashes its board with twelve (issue 0091). LLVM itself marks no processor
+// so, not even LLVM 21 (rustc 1.94 with target-cpu=cascadelake still gathers
+// in an indexed loop, and only +prefer-no-gather stops it); its newer cost
+// model merely keeps that hash scalar. So the processors with the
+// mitigation (the host's name, or a --cpu preset) are told here to prefer
+// the loads. Axiom has no gather of its own: only the vectorizers are
+// affected.
 static const char *x86_tuning_features(const char *cpu) {
     static const char *const gds[] = {"skylake", "skylake-avx512", "cascadelake", "cooperlake", "cannonlake",
                                       "icelake-client", "icelake-server", "rocketlake", "tigerlake", "kabylake",
