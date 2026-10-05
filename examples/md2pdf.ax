@@ -6,12 +6,17 @@
 //   axiom build examples/md2pdf.ax --target=native -O2 -o md2pdf
 //   ./md2pdf README.md readme.pdf
 //   ./md2pdf notes.md notes.pdf --letter --justify --size 10
+//   ./md2pdf paper.md paper.pdf --math latinmodern-math.otf
 //
 // Images are read from the Markdown file's directory. The text is set in
-// DejaVu Sans, Liberation Sans or Arial, whichever the system has.
+// Liberation Sans, DejaVu Sans or Arial, whichever the system has; math in
+// --math, or an installed math font (STIX Two Math, Latin Modern Math,
+// Cambria Math), or else the STIX Two Math subset in std/text/math/testdata
+// (found when md2pdf runs from the repository's root).
 // =============================================================================
 
 import "std/collections/vec" as vec;
+import "std/compress/xz" as xz;
 import "std/fmt" as fmt;
 import "std/graphics/pdf" as pdf;
 import "std/io" as io;
@@ -19,7 +24,20 @@ import "std/mem" as mem;
 import "std/os" as os;
 import "std/os/cli" as cli;
 import "std/os/fs" as fs;
+import "std/str" as strs;
 import "std/text/markdown/pdf" as mdpdf;
+
+let BUNDLED_MATH: []u8 = "std/text/math/testdata/STIXTwoMath-subset.ttf.xz";
+
+/// The bytes of a font file, decompressed if it ends in .xz.
+fn font_bytes(path: []u8) ![]mut u8 {
+    let data = fs.read_file(path)!;
+    if not strs.ends_with(path, ".xz") {
+        return data;
+    }
+    defer mem.free(data);
+    return xz.decompress(data, 64000000);
+}
 
 /// The directory part of a path ("." if none).
 fn dir_of(path: []u8) []u8 {
@@ -42,6 +60,7 @@ fn run() !i32 {
     p.flag("letter", 'l', "US Letter pages (default A4)")!;
     p.flag("justify", 'j', "justify paragraphs")!;
     p.option("size", 's', "PT", "the body text size in points (default 11)")!;
+    p.option("math", 'm', "FILE", "the math font (.otf, .ttf, .ttc, or .xz of one), with a MATH table")!;
     p.positional("IN", "the Markdown file", cli.Arity.REQUIRED)!;
     p.positional("OUT", "the PDF to write", cli.Arity.REQUIRED)!;
     let mut args = os.args()!;
@@ -68,6 +87,21 @@ fn run() !i32 {
         return 1;
     };
     defer fonts.deinit();
+    // the math font: --math, else an installed one, else the bundled subset
+    let mut math_path = m.get("math", "");
+    if (math_path.len == 0) and not fonts.has_math() and fs.exists(BUNDLED_MATH) {
+        math_path = BUNDLED_MATH;
+    }
+    if math_path.len > 0 {
+        let mf = mdpdf.math_face(font_bytes(math_path)!) catch {
+            fmt.eprint("md2pdf: {} is not a math font (no MATH table)\n", [fmt.str(math_path)])!;
+            return 1;
+        };
+        fonts.set_math(mf)!;
+    }
+    if not fonts.has_math() {
+        io.stderr().println("md2pdf: no math font: math is set in the text font (see --math)")!;
+    }
     let mut o = mdpdf.Options.init(fonts.fonts());
     o.image_dir = dir_of(input);
     o.justify = m.has("justify");

@@ -30,8 +30,11 @@
 // - tables: columns sized to their contents (shrunk to fit, cells wrapped),
 //   the column alignments, a shaded header row repeated on each page
 // - TeX math ($...$, $$...$$, ```math) typeset by std/text/math/typeset in
-//   Fonts.math (a font with a MATH table sets it best; any font works);
-//   formulas that do not parse are shown as their source
+//   Fonts.math: FontSet.find picks up an installed math font (STIX Two
+//   Math, Latin Modern Math, Cambria Math), or set_math takes one. Without
+//   one, math is set in the regular face, which works but looks poor:
+//   upright letters, radicals and delimiters stretched by scaling, small
+//   big operators. Formulas that do not parse are shown as their source
 // - images that are paragraphs of their own, from files under
 //   Options.image_dir (nothing is read from disk unless it is set, and then
 //   only relative paths without ".." are); JPEG files are embedded as they
@@ -45,6 +48,7 @@
 // =============================================================================
 
 import "../../collections/vec.ax" as vec;
+import "../../compress/xz.ax" as xz;
 import "../../graphics/color.ax" as color;
 import "../../graphics/draw.ax" as draw;
 import "../../graphics/font.ax" as font;
@@ -60,7 +64,7 @@ import "../markdown.ax" as markdown;
 import "../math.ax" as tex;
 import "../math/typeset.ax" as typeset;
 
-error { OutOfMemory, FontNotFound }
+error { OutOfMemory, FontNotFound, InvalidFont }
 
 const NONE: u32 = 0xffffffff;
 
@@ -101,13 +105,15 @@ const BOLD: usize = 1;
 const ITALIC: usize = 2;
 const BOLD_ITALIC: usize = 3;
 const MONO: usize = 4;
+const MATH: usize = 5;
 const MISSING: usize = 255;
 
-/// A family of system fonts, loaded: regular, bold, italic, bold italic and
-/// a monospaced face. Missing faces fall back to the regular one.
+/// A family of system fonts, loaded: regular, bold, italic, bold italic, a
+/// monospaced face, and a math font (one with an OpenType MATH table) if
+/// the system has one. Missing faces fall back to the regular one.
 pub struct FontSet {
     faces: vec.Vec.[font.Font],
-    index: [5]usize,  // into faces, or MISSING
+    index: [6]usize,  // into faces, or MISSING
 
     /// Looks for DejaVu Sans, Liberation Sans or Arial (and a monospaced
     /// font) where Linux, macOS and Windows keep them, preferring a family
@@ -168,7 +174,7 @@ pub struct FontSet {
         if best == nfam {
             return error.FontNotFound;
         }
-        let mut set = FontSet.{ faces: vec.Vec.[font.Font].init(), index: [MISSING; 5] };
+        let mut set = FontSet.{ faces: vec.Vec.[font.Font].init(), index: [MISSING; 6] };
         for k in @as(usize, 0)..5 {
             let f = font.Font.load(paths[(best * 5) + k]) catch continue;
             set.faces.push(f) catch |e| {
@@ -197,7 +203,39 @@ pub struct FontSet {
                 break;
             }
         }
+        let mf = find_math_font() catch |e| {
+            if e == error.FontNotFound {
+                return set;
+            }
+            set.deinit();
+            return e;
+        };
+        set.set_math(mf) catch |e| {
+            set.deinit();
+            return e;
+        };
         return set;
+    }
+
+    /// Whether the set has a math font.
+    pub fn has_math(self: *FontSet) bool {
+        return self.index[MATH] != MISSING;
+    }
+
+    /// Makes f (which the set now owns) its math font. Call fonts() after
+    /// this: it may move the faces.
+    pub fn set_math(self: *mut FontSet, f: font.Font) !void {
+        if self.index[MATH] != MISSING {
+            self.faces.get_ptr(self.index[MATH]).deinit();
+            self.faces.set(self.index[MATH], f);
+            return;
+        }
+        self.faces.push(f) catch |e| {
+            let mut g = f;
+            g.deinit();
+            return e;
+        };
+        self.index[MATH] = self.faces.len - 1;
     }
 
     pub fn deinit(self: *mut FontSet) void {
@@ -225,8 +263,58 @@ pub struct FontSet {
         f.italic = self.face(ITALIC, REGULAR);
         f.bold_italic = self.face(BOLD_ITALIC, BOLD);
         f.mono = self.face(MONO, REGULAR);
+        f.math = self.face(MATH, REGULAR);
         return f;
     }
+}
+
+/// A math font from the system: STIX Two Math, Latin Modern Math or Cambria
+/// Math where Linux distributions, TeX Live, macOS and Windows put them;
+/// only a face with a MATH table counts. FontNotFound if there is none.
+pub fn find_math_font() !font.Font {
+    let paths: [13][]u8 = [
+        "/usr/share/fonts/opentype/stix/STIXTwoMath-Regular.otf",
+        "/usr/share/fonts/opentype/stix-two/STIXTwoMath-Regular.otf",
+        "/usr/share/fonts/OTF/STIXTwoMath-Regular.otf",
+        "/usr/share/fonts/stix-two-math/STIXTwoMath-Regular.otf",
+        "/usr/share/fonts/opentype/stix/STIXMath-Regular.otf",
+        "/usr/share/fonts/OTF/latinmodern-math.otf",
+        "/usr/share/fonts/opentype/lmodern/latinmodern-math.otf",
+        "/usr/share/texmf/fonts/opentype/public/lm-math/latinmodern-math.otf",
+        "/usr/share/texlive/texmf-dist/fonts/opentype/public/lm-math/latinmodern-math.otf",
+        "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+        "/Library/Fonts/STIXTwoMath-Regular.otf",
+        "/Library/TeX/Root/texmf-dist/fonts/opentype/public/lm-math/latinmodern-math.otf",
+        "C:/Windows/Fonts/cambria.ttc",  // Cambria Math is its second face
+    ];
+    for p in paths {
+        if not fs.exists(p) {
+            continue;
+        }
+        let bytes = fs.read_file(p) catch continue;
+        let f = math_face(bytes) catch continue;
+        return f;
+    }
+    return error.FontNotFound;
+}
+
+/// The first face of a font file (or collection) with a MATH table, which
+/// then owns `bytes`; if there is none, InvalidFont, and `bytes` is freed.
+pub fn math_face(bytes: []mut u8) !font.Font {
+    let mut n: u32 = 1;
+    if (bytes.len >= 12) and @mem_eq(bytes[..4], "ttcf") {
+        n = (@as(u32, bytes[8]) << 24) | (@as(u32, bytes[9]) << 16) | (@as(u32, bytes[10]) << 8) | @as(u32, bytes[11]);
+        n = @min(n, 64);
+    }
+    for i in @as(u32, 0)..n {
+        let mut f = font.Font.init_index(bytes, i) catch continue;
+        if f.table("MATH").len > 0 {
+            f.owned = bytes;
+            return f;
+        }
+    }
+    mem.free(bytes);
+    return error.InvalidFont;
 }
 
 /// A colour from 0xRRGGBB (sRGB).
@@ -1745,4 +1833,38 @@ test "onto a document of one's own, with one font" {
     let t = pdf_text(bytes)!;
     defer mem.free(t);
     @expect(strs.contains(t, "more text"));
+}
+
+test "math fonts are fonts with a MATH table" {
+    let packed = fs.read_file("std/text/math/testdata/STIXTwoMath-subset.ttf.xz")!;
+    defer mem.free(packed);
+    let data = xz.decompress(packed, 4000000)!;
+    let mut f = math_face(data)!;  // it owns data now
+    defer f.deinit();
+    @expect(f.table("MATH").len > 0);
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    // a text font is not one
+    @expect(not is_math_font(mem.dup(set.fonts().regular.data)!));
+    // a set takes one, and typesets with it
+    let d = mem.dup(f.data)!;
+    let mut stix = font.Font.init(d) catch |e| {
+        mem.free(d);
+        return e;
+    };
+    stix.owned = d;
+    set.set_math(stix)!;
+    @expect(set.has_math());
+    let fonts = set.fonts();
+    @expect(fonts.math.table("MATH").len > 0);
+    let bytes = to_pdf("$$x^2$$\n", Options.init(fonts))!;
+    defer mem.free(bytes);
+    @expect(strs.starts_with(bytes, "%PDF-"));
+}
+
+/// Whether math_face takes the bytes (which it frees either way).
+fn is_math_font(bytes: []mut u8) bool {
+    let mut f = math_face(bytes) catch return false;
+    f.deinit();
+    return true;
 }
