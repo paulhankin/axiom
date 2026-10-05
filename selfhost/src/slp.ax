@@ -331,3 +331,892 @@ pub fn compare_masks(f: *mut ir.Func) bool {
     }
     return any;
 }
+
+// =============================================================================
+// Stores of neighbouring elements as one vector store (x86-64), as LLVM's
+// SLP vectorizer makes them: a run of scalar stores to consecutive
+// addresses whose values are the same operations lane by lane, bottom-up
+// from the stores: selects (of a lane mask, `x & m` when the other side is
+// zero), compares (of one value against constants, also with different
+// predicates: `x - lo <= hi - lo` lane by lane), arithmetic, conversions,
+// loads of neighbouring elements; other values are put together from
+// constants, splats and inserted scalars. Taken when the vector code is
+// smaller than the scalar code it replaces. the benchmark's race inputs:
+//
+//   inputs[k] = select(nc == 1, 1.0, 0.0); inputs[k + 1] = select(nc == 2, 1.0, 0.0); ...
+//
+// are a broadcast of nc, a compare into a mask and a masked move per vector.
+// =============================================================================
+const SLP_DEPTH: i32 = 6;
+
+struct Slp {
+    B: *mut ir.Builder,
+    emit: bool,
+    ok: bool,
+    cost: i32,                     // vector instructions
+    first: *mut ir.Value,          // the chunk's first store (vector loads go before it)
+    tree: u.List.[*mut ir.Value],  // the scalar instructions done in vector lanes
+}
+
+fn new_lanes(n: usize) []mut *mut ir.Value {
+    return u.calloc_slice.[*mut ir.Value](n);
+}
+
+fn lane_const(v: *ir.Value) bool {
+    return (v.kind == ir.V_CINT) or (v.kind == ir.V_CFP) or ((v.kind == ir.V_ZERO) and (v.ty.kind != ir.T_VEC));
+}
+
+fn all_same(xs: []mut *mut ir.Value) bool {
+    for k in 1..xs.len {
+        if xs[k] != xs[0] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn all_op(xs: []mut *mut ir.Value, op: i32) bool {
+    for k in 0..xs.len {
+        if not is_op(xs[k], op) or (xs[k].blk != xs[0].blk) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn note_tree(s: *mut Slp, v: *mut ir.Value) void {
+    if s.emit {
+        return;
+    }
+    for k in 0..s.tree.len {
+        if s.tree.get(k) == v {
+            return;
+        }
+    }
+    s.tree.push(v);
+}
+
+// The operand lanes of xs: operand j (0: a, 1: b, 2: c) of each.
+fn operands(xs: []mut *mut ir.Value, j: i32) []mut *mut ir.Value {
+    let ys = new_lanes(xs.len);
+    for k in 0..xs.len {
+        let x = xs[k];
+        if j == 0 {
+            ys[k] = ir.resolve(x.a);
+        } else if j == 1 {
+            ys[k] = ir.resolve(x.b);
+        } else {
+            ys[k] = ir.resolve(x.c);
+        }
+    }
+    return ys;
+}
+
+// A constant vector of the lanes (each a constant of vt's lane type, or
+// nil: zero there).
+fn const_vec(xs: []mut *mut ir.Value, vt: *mut ir.Ty) *mut ir.Value {
+    let mut zero = true;
+    let cs = u.newn.[*mut ir.Value](xs.len);
+    for k in 0..xs.len {
+        let x = xs[k];
+        if u.isnil(x) or ((x.kind == ir.V_ZERO) or ((x.kind == ir.V_CINT) and (x.cv == 0))) {
+            if vt.elem.kind == ir.T_FLOAT {
+                cs[k] = ir.cfp(vt.elem, 0.0);
+            } else {
+                cs[k] = ir.cint(vt.elem, 0);
+            }
+            if u.notnil(x) and (x.kind == ir.V_CFP) {
+                cs[k] = x;
+            }
+        } else {
+            cs[k] = x;
+        }
+        if (cs[k].kind == ir.V_CFP) and (@bit_cast(u64, cs[k].fv) != 0) {
+            zero = false;
+        } else if (cs[k].kind == ir.V_CINT) and (cs[k].cv != 0) {
+            zero = false;
+        }
+    }
+    if zero {
+        return ir.czero(vt);
+    }
+    return ir.cagg(vt, cs);
+}
+
+fn is_zero_vec(v: *ir.Value) bool {
+    if v.kind == ir.V_ZERO {
+        return true;
+    }
+    if v.kind != ir.V_CAGG {
+        return false;
+    }
+    for k in 0..v.xs.len {
+        let x = v.xs.get(k);
+        if not (((x.kind == ir.V_CINT) and (x.cv == 0)) or ((x.kind == ir.V_CFP) and (@bit_cast(u64, x.fv) == 0)) or
+                (x.kind == ir.V_ZERO)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn all_i1(xs: []mut *mut ir.Value) bool {
+    for k in 0..xs.len {
+        let c = ir.resolve(xs[k].a);
+        if (c.ty.kind != ir.T_INT) or (c.ty.bits != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Integer lanes as wide as vt's.
+fn int_vec(vt: *mut ir.Ty) *mut ir.Ty {
+    return ir.t_vec(ir.t_int(vt.elem.bits), @int_cast(u32, vt.lanes));
+}
+
+fn as_ty(s: *mut Slp, v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if not s.emit or (v.ty == t) {
+        return v;
+    }
+    return ir.bitcast(s.B, v, t);
+}
+
+// The interval [lo, hi] of x's values (b bits, signed or not) for which
+// `x p k` holds; false when it is not one interval that does not wrap.
+fn interval_of(p: i32, k: u64, b: i32, signed: bool, lo: *mut i64, hi: *mut i64) bool {
+    let mut mn: i64 = 0;
+    let mut mx: i64 = 0;
+    let mut kv: i64 = 0;
+    if signed {
+        mn = -(@as(i64, 1) << @int_cast(u32, b - 1));
+        mx = (@as(i64, 1) << @int_cast(u32, b - 1)) - 1;
+        let sh = @int_cast(u32, 64 - b);
+        kv = @bit_cast(i64, k << sh) >> sh;
+    } else {
+        mx = @bit_cast(i64, ir.mask_bits(b));
+        kv = @bit_cast(i64, k & ir.mask_bits(b));
+    }
+    if p == ir.IntEQ {
+        lo.* = kv;
+        hi.* = kv;
+    } else if p == ir.IntNE {
+        if kv == mn {
+            lo.* = mn + 1;
+            hi.* = mx;
+        } else if kv == mx {
+            lo.* = mn;
+            hi.* = mx - 1;
+        } else {
+            return false;
+        }
+    } else if (p == ir.IntULT) or (p == ir.IntSLT) {
+        if kv == mn {
+            return false;
+        }
+        lo.* = mn;
+        hi.* = kv - 1;
+    } else if (p == ir.IntULE) or (p == ir.IntSLE) {
+        lo.* = mn;
+        hi.* = kv;
+    } else if (p == ir.IntUGT) or (p == ir.IntSGT) {
+        if kv == mx {
+            return false;
+        }
+        lo.* = kv + 1;
+        hi.* = mx;
+    } else {
+        lo.* = kv;
+        hi.* = mx;
+    }
+    return true;
+}
+
+fn signed_pred(p: i32) bool {
+    return (p == ir.IntSGT) or (p == ir.IntSGE) or (p == ir.IntSLT) or (p == ir.IntSLE);
+}
+
+fn unsigned_pred(p: i32) bool {
+    return (p == ir.IntUGT) or (p == ir.IntUGE) or (p == ir.IntULT) or (p == ir.IntULE);
+}
+
+// The lane mask (all ones where the condition holds) of the i1 lanes cs,
+// lanes of ivt's width.
+fn mask_of(s: *mut Slp, cs: []mut *mut ir.Value, ivt: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let n = cs.len;
+    let w = ivt.elem.bits;
+    if all_same(cs) {
+        // one condition: its mask in every lane
+        s.cost += 2;
+        if not s.emit {
+            return vnil();
+        }
+        return ir.splat(s.B, ivt, ir.sext(s.B, cs[0], ivt.elem));
+    }
+    if all_op(cs, ir.OP_ICMP) {
+        let x = ir.resolve(cs[0].a);
+        let mut one_x = (x.ty.kind == ir.T_INT) and (x.ty.bits <= w) and (x.ty.bits <= 32);
+        let mut same_p = true;
+        let mut sg = false;
+        let mut us = false;
+        let p0 = @truncate(i32, @bit_cast(i64, cs[0].cv));
+        for k in 0..n {
+            let c = cs[k];
+            let p = @truncate(i32, @bit_cast(i64, c.cv));
+            if (ir.resolve(c.a) != x) or not ir.is_cint(ir.resolve(c.b)) {
+                one_x = false;
+            }
+            if p != p0 {
+                same_p = false;
+            }
+            sg = sg or signed_pred(p);
+            us = us or unsigned_pred(p);
+        }
+        if one_x and not (sg and us) {
+            // one value against constants: a splat of it, compared with the
+            // constants (extended to the lanes' width as the predicates read
+            // them), or (several predicates) each lane's interval of values
+            let b = x.ty.bits;
+            let mut ext_op = ir.OP_ZEXT;
+            if sg {
+                ext_op = ir.OP_SEXT;
+            }
+            let los = new_lanes(n);
+            let spans = new_lanes(n);
+            let mut ok = true;
+            for k in 0..n {
+                let c = cs[k];
+                let p = @truncate(i32, @bit_cast(i64, c.cv));
+                let kv = ir.cint_val(ir.resolve(c.b));
+                if same_p {
+                    let mut kx = kv & ir.mask_bits(b);
+                    if sg and (b < 64) {
+                        let sh = @int_cast(u32, 64 - b);
+                        kx = @bit_cast(u64, @bit_cast(i64, kv << sh) >> sh);
+                    }
+                    los[k] = ir.cint(ivt.elem, kx);
+                } else {
+                    let mut lo: i64 = 0;
+                    let mut hi: i64 = 0;
+                    if not interval_of(p, kv, b, sg, &mut lo, &mut hi) {
+                        ok = false;
+                        break;
+                    }
+                    los[k] = ir.cint(ivt.elem, @bit_cast(u64, lo));
+                    spans[k] = ir.cint(ivt.elem, @bit_cast(u64, hi - lo));
+                }
+            }
+            if ok {
+                for k in 0..n {
+                    note_tree(s, cs[k]);
+                }
+                let mut r = vnil();
+                s.cost += 2;  // the splat, the compare
+                if b < w {
+                    s.cost += 1;
+                }
+                if not same_p {
+                    s.cost += 1;  // the subtraction
+                }
+                if s.emit {
+                    let xe = ir.cast(s.B, ext_op, x, ivt.elem);
+                    let v = ir.splat(s.B, ivt, xe);
+                    if same_p {
+                        r = ir.icmp(s.B, p0, v, const_vec(los, ivt));
+                    } else {
+                        // (x - lo < span + 1: without AVX-512 one compare
+                        // after the signs are flipped, where <= is two)
+                        let mut p = ir.IntULE;
+                        let mut wide = true;
+                        for k in 0..n {
+                            if spans[k].cv == ir.mask_bits(w) {
+                                wide = false;
+                            }
+                        }
+                        if wide {
+                            p = ir.IntULT;
+                            for k in 0..n {
+                                spans[k] = ir.cint(ivt.elem, spans[k].cv + 1);
+                            }
+                        }
+                        let d = ir.binop(s.B, ir.OP_SUB, v, const_vec(los, ivt));
+                        r = ir.icmp(s.B, p, d, const_vec(spans, ivt));
+                    }
+                }
+                u.free_slice(los);
+                u.free_slice(spans);
+                return r;
+            }
+            u.free_slice(los);
+            u.free_slice(spans);
+        }
+        if same_p and (x.ty.kind == ir.T_INT) and (x.ty.bits == w) {
+            // the same compare of lanes as wide as the mask's
+            let xs = operands(cs, 0);
+            let ys = operands(cs, 1);
+            for k in 0..n {
+                note_tree(s, cs[k]);
+            }
+            let a = vec_of(s, xs, ivt, depth + 1);
+            let bb = vec_of(s, ys, ivt, depth + 1);
+            u.free_slice(xs);
+            u.free_slice(ys);
+            s.cost += 1;
+            if not s.emit {
+                return vnil();
+            }
+            return ir.icmp(s.B, p0, a, bb);
+        }
+        s.ok = false;
+        return vnil();
+    }
+    if all_op(cs, ir.OP_FCMP) {
+        let p0 = cs[0].cv;
+        let ft = ir.resolve(cs[0].a).ty;
+        for k in 0..n {
+            if (cs[k].cv != p0) or (ir.resolve(cs[k].a).ty != ft) {
+                s.ok = false;
+                return vnil();
+            }
+        }
+        if (ft.kind != ir.T_FLOAT) or (ft.bits != w) {
+            s.ok = false;
+            return vnil();
+        }
+        for k in 0..n {
+            note_tree(s, cs[k]);
+        }
+        let fvt = ir.t_vec(ft, @int_cast(u32, ivt.lanes));
+        let xs = operands(cs, 0);
+        let ys = operands(cs, 1);
+        let a = vec_of(s, xs, fvt, depth + 1);
+        let bb = vec_of(s, ys, fvt, depth + 1);
+        u.free_slice(xs);
+        u.free_slice(ys);
+        s.cost += 1;
+        if not s.emit {
+            return vnil();
+        }
+        return ir.fcmp(s.B, @truncate(i32, @bit_cast(i64, p0)), a, bb);
+    }
+    s.ok = false;
+    return vnil();
+}
+
+// Can a load of lanes xs (in order) be one vector load: neighbouring
+// elements, read before the chunk's first store with nothing writing
+// memory in between?
+fn neighbour_loads(s: *mut Slp, xs: []mut *mut ir.Value) bool {
+    let t = xs[0].ty;
+    let size = @bit_cast(i64, t.size);
+    let mut base = vnil();
+    let mut off0: i64 = 0;
+    for k in 0..xs.len {
+        let ld = xs[k];
+        if (ld.flags != 0) or (ld.ty != t) or (ld.blk != s.first.blk) or not before(ld, s.first) {
+            return false;
+        }
+        let mut p = ir.resolve(ld.a);
+        let mut off: i64 = 0;
+        if is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+            off = ir.sval(ir.resolve(p.b));
+            p = ir.resolve(p.a);
+        }
+        if k == 0 {
+            base = p;
+            off0 = off;
+        } else if (p != base) or (off != (off0 + (@as(i64, @int_cast(i64, k)) * size))) {
+            return false;
+        }
+    }
+    let mut earliest = xs[0];
+    for k in 1..xs.len {
+        if before(xs[k], earliest) {
+            earliest = xs[k];
+        }
+    }
+    return not writes_between(earliest, s.first);
+}
+
+// The lanes xs (scalars of vt's lane type) as a vector of type vt; in a
+// dry run (not s.emit) only the cost, and s.ok false when it cannot be done.
+fn vec_of(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let n = xs.len;
+    if not s.ok {
+        return vnil();
+    }
+    let mut consts = true;
+    for k in 0..n {
+        if xs[k].ty != vt.elem {
+            s.ok = false;
+            return vnil();
+        }
+        if not lane_const(xs[k]) {
+            consts = false;
+        }
+    }
+    if consts {
+        let c = const_vec(xs, vt);
+        if not is_zero_vec(c) {
+            s.cost += 1;  // (a load of it)
+        }
+        return c;
+    }
+    if all_same(xs) {
+        s.cost += 1;
+        if not s.emit {
+            return vnil();
+        }
+        return ir.splat(s.B, vt, xs[0]);
+    }
+    let x0 = xs[0];
+    let gather = (depth >= SLP_DEPTH) or (x0.kind != ir.V_INST) or (x0.blk != s.first.blk) or not all_op(xs, x0.op);
+    if not gather {
+        let op = x0.op;
+        if op == ir.OP_SELECT {
+            let mut conds_i1 = true;
+            for k in 0..n {
+                let c = ir.resolve(xs[k].a);
+                if (c.ty.kind != ir.T_INT) or (c.ty.bits != 1) {
+                    conds_i1 = false;
+                }
+            }
+            if conds_i1 {
+                for k in 0..n {
+                    note_tree(s, xs[k]);
+                }
+                let ivt = int_vec(vt);
+                let cs = operands(xs, 0);
+                let ts = operands(xs, 1);
+                let fs = operands(xs, 2);
+                let m = mask_of(s, cs, ivt, depth + 1);
+                let a = vec_of(s, ts, vt, depth + 1);
+                let bb = vec_of(s, fs, vt, depth + 1);
+                u.free_slice(cs);
+                u.free_slice(ts);
+                u.free_slice(fs);
+                if not s.ok {
+                    return vnil();
+                }
+                // x & m (zero elsewhere), or (x & m) | (y & ~m): one blend
+                // (or masked move) with AVX-512, else and, and-not and or
+                let zf = u.notnil(bb) and is_zero_vec(bb);
+                if zf {
+                    s.cost += 1;
+                } else {
+                    s.cost += 3;
+                }
+                if not s.emit {
+                    return vnil();
+                }
+                let xa = as_ty(s, a, ivt);
+                let mut r = ir.binop(s.B, ir.OP_AND, xa, m);
+                if not zf {
+                    let nm = ir.binop(s.B, ir.OP_XOR, m, ir.cones(ivt));
+                    let yb = ir.binop(s.B, ir.OP_AND, as_ty(s, bb, ivt), nm);
+                    r = ir.binop(s.B, ir.OP_OR, r, yb);
+                }
+                return as_ty(s, r, vt);
+            }
+        } else if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT)) and (vt.elem.kind == ir.T_INT) and
+                  (ir.resolve(x0.a).ty.bits == 1) and all_i1(xs) {
+            // a condition as 0 / 1 (or 0 / -1): its lane mask (and 1)
+            for k in 0..n {
+                note_tree(s, xs[k]);
+            }
+            let cs = operands(xs, 0);
+            let m = mask_of(s, cs, vt, depth + 1);
+            u.free_slice(cs);
+            if op == ir.OP_ZEXT {
+                s.cost += 2;  // (and the constant)
+            }
+            if not s.emit or not s.ok {
+                return vnil();
+            }
+            if op == ir.OP_SEXT {
+                return m;
+            }
+            return ir.binop(s.B, ir.OP_AND, m, ir.splat(s.B, vt, ir.cint(vt.elem, 1)));
+        } else if ((op >= ir.OP_ADD) and (op <= ir.OP_MUL)) or ((op >= ir.OP_AND) and (op <= ir.OP_XOR)) or
+                  ((op >= ir.OP_FADD) and (op <= ir.OP_FDIV)) {
+            for k in 0..n {
+                note_tree(s, xs[k]);
+            }
+            let as_ = operands(xs, 0);
+            let bs = operands(xs, 1);
+            let a = vec_of(s, as_, vt, depth + 1);
+            let bb = vec_of(s, bs, vt, depth + 1);
+            u.free_slice(as_);
+            u.free_slice(bs);
+            s.cost += 1;
+            if not s.emit or not s.ok {
+                return vnil();
+            }
+            return ir.binop(s.B, op, a, bb);
+        } else if (op == ir.OP_SITOFP) or (op == ir.OP_BITCAST) {
+            // conversions of lanes as wide
+            let ft = ir.resolve(x0.a).ty;
+            let mut same_ty = (ft.kind == ir.T_INT) or (ft.kind == ir.T_FLOAT);
+            for k in 0..n {
+                if ir.resolve(xs[k].a).ty != ft {
+                    same_ty = false;
+                }
+            }
+            if same_ty and (ft.bits == vt.elem.bits) {
+                for k in 0..n {
+                    note_tree(s, xs[k]);
+                }
+                let svt = ir.t_vec(ft, @int_cast(u32, vt.lanes));
+                let as_ = operands(xs, 0);
+                let a = vec_of(s, as_, svt, depth + 1);
+                u.free_slice(as_);
+                s.cost += 1;
+                if not s.emit or not s.ok {
+                    return vnil();
+                }
+                return ir.cast(s.B, op, a, vt);
+            }
+        } else if (op == ir.OP_LOAD) and neighbour_loads(s, xs) {
+            for k in 0..n {
+                note_tree(s, xs[k]);
+            }
+            s.cost += 1;
+            if not s.emit {
+                return vnil();
+            }
+            // (before the first store, where the scalar loads were read)
+            let B2 = ir.new_builder();
+            ir.at_before(B2, s.first);
+            let ld = ir.load(B2, vt, ir.resolve(x0.a));
+            ld.align = 1;
+            return ld;
+        }
+    }
+    // put together: the constants, then each other lane inserted
+    let cs = new_lanes(n);
+    for k in 0..n {
+        if lane_const(xs[k]) {
+            cs[k] = xs[k];
+        } else {
+            s.cost += 1;
+        }
+    }
+    let mut r = vnil();
+    if s.emit {
+        r = const_vec(cs, vt);
+        for k in 0..n {
+            if not lane_const(xs[k]) {
+                r = ir.insert_elem(s.B, r, xs[k], @as(u64, k));
+            }
+        }
+    }
+    u.free_slice(cs);
+    return r;
+}
+
+// Scalar cost of an instruction the vector code makes dead.
+fn scalar_cost(i: *ir.Value) i32 {
+    if i.op == ir.OP_SELECT {
+        if i.ty.kind == ir.T_INT {
+            return 2;
+        }
+        return 3;  // a branch around a move
+    }
+    return 1;
+}
+
+// The scalar instructions of s.tree that only the tree and the stores use
+// (s.tree marked with aux = 1 while it is), weighed by scalar_cost.
+fn dead_cost(s: *mut Slp, sts: []mut *mut ir.Value) i32 {
+    let n = s.tree.len;
+    for k in 0..n {
+        s.tree.get(k).aux2 = 1;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in 0..n {
+            let i = s.tree.get(k);
+            if i.aux2 != 1 {
+                continue;
+            }
+            let mut refs: i32 = 0;
+            for j in 0..n {
+                let o = s.tree.get(j);
+                if o.aux2 == 1 {
+                    if ir.resolve(o.a) == i {
+                        refs += 1;
+                    }
+                    if ir.resolve(o.b) == i {
+                        refs += 1;
+                    }
+                    if ir.resolve(o.c) == i {
+                        refs += 1;
+                    }
+                }
+            }
+            for j in 0..sts.len {
+                if ir.resolve(sts[j].a) == i {
+                    refs += 1;
+                }
+            }
+            if refs < i.uses {
+                i.aux2 = 0;
+                changed = true;
+            }
+        }
+    }
+    let mut c: i32 = 0;
+    for k in 0..n {
+        let i = s.tree.get(k);
+        if i.aux2 == 1 {
+            c += scalar_cost(i);
+        }
+        i.aux2 = 0;
+    }
+    return c;
+}
+
+// Is anything but the stores sts reading or writing memory from the first
+// of them to the last (which the vector store replaces)?
+fn others_between(first: *mut ir.Value, last: *mut ir.Value, sts: []mut *mut ir.Value) bool {
+    let mut i = first;
+    while u.notnil(i) and (i != last) {
+        let op = i.op;
+        if op == ir.OP_STORE {
+            let mut mine = false;
+            for k in 0..sts.len {
+                if sts[k] == i {
+                    mine = true;
+                }
+            }
+            if not mine {
+                return true;
+            }
+        } else if (op == ir.OP_LOAD) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
+                  (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
+                  (op == ir.OP_INTR) {
+            return true;
+        }
+        i = i.next;
+    }
+    return false;
+}
+
+// The stores sts (in address order: neighbouring elements, nbytes in all,
+// 8, 16 or 32) as one vector store, if that is cheaper. True if done.
+fn store_chunk(f: *mut ir.Func, sts: []mut *mut ir.Value, nbytes: i64) bool {
+    let n = sts.len;
+    let et = sts[0].a.ty;
+    // program order: the first and the last of them
+    let mut first = sts[0];
+    let mut last = sts[0];
+    for k in 1..n {
+        if before(sts[k], first) {
+            first = sts[k];
+        }
+        if before(last, sts[k]) {
+            last = sts[k];
+        }
+    }
+    if others_between(first, last, sts) {
+        return false;
+    }
+    // (8 bytes: the lanes twice over in a 16-byte vector, its low half stored)
+    let mut reps: usize = 1;
+    if nbytes == 8 {
+        reps = 2;
+    }
+    let lanes = new_lanes(n * reps);
+    for k in 0..(n * reps) {
+        lanes[k] = ir.resolve(sts[k % n].a);
+    }
+    let vt = ir.t_vec(et, @int_cast(u32, n * reps));
+    let mut s = Slp.{ B: ir.new_builder(), emit: false, ok: true, cost: 1, first: first,
+                      tree: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 } };
+    ir.at_before(s.B, last);
+    _ = vec_of(&mut s, lanes, vt, 0);
+    if reps == 2 {
+        s.cost += 1;  // the low half out
+    }
+    let mut done = false;
+    if s.ok {
+        let sc = dead_cost(&mut s, sts) + @int_cast(i32, n);
+        if s.cost < sc {
+            s.emit = true;
+            let v = vec_of(&mut s, lanes, vt, 0);
+            let mut x = v;
+            if reps == 2 {
+                // (a double: lane 0 of the register stored, movsd)
+                let f64t = ir.t_float(64);
+                let w = ir.bitcast(s.B, v, ir.t_vec(f64t, 2));
+                x = ir.extract_elem(s.B, w, 0);
+            }
+            let st = ir.store(s.B, x, sts[0].b);
+            st.align = 1;
+            for k in 0..n {
+                ir.remove_inst(sts[k]);
+            }
+            done = true;
+        }
+    }
+    u.free_slice(lanes);
+    u.free(@ptr_cast(*mut void, s.tree.data));
+    _ = f;
+    return done;
+}
+
+// A store this pass may combine: of a scalar, plain, at base + a constant.
+fn store_parts(st: *mut ir.Value, base: *mut *mut ir.Value, off: *mut i64) bool {
+    if (st.op != ir.OP_STORE) or (st.flags != 0) {
+        return false;
+    }
+    let t = ir.resolve(st.a).ty;
+    if ((t.kind != ir.T_INT) and (t.kind != ir.T_FLOAT)) or
+       ((t.size != 1) and (t.size != 2) and (t.size != 4) and (t.size != 8)) or
+       (@as(u64, @int_cast(u64, t.bits)) != (t.size * 8)) {
+        return false;
+    }
+    let mut p = ir.resolve(st.b);
+    let mut o: i64 = 0;
+    if is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+        o = ir.sval(ir.resolve(p.b));
+        p = ir.resolve(p.a);
+    }
+    base.* = p;
+    off.* = o;
+    return true;
+}
+
+// The runs of stores of block b to neighbouring elements, from its last
+// store up, each in vector-sized chunks. True if any changed.
+let mut slp_gen: i64 = 0x5_1900_0000_0000;  // (marks no other pass leaves in aux)
+
+fn block_stores(f: *mut ir.Func, b: *mut ir.Block, vbytes: i64) bool {
+    let mut any = false;
+    slp_gen += 1;
+    let mut i = b.last;
+    while u.notnil(i) {
+        let mut base = vnil();
+        let mut off: i64 = 0;
+        if (i.aux == slp_gen) or not store_parts(i, &mut base, &mut off) {
+            i = i.prev;
+            continue;
+        }
+        let t = ir.resolve(i.a).ty;
+        let size = @bit_cast(i64, t.size);
+        // the stores of the same type to base + off + k * size before i in
+        // b, back to the first other access to memory
+        let mut sts = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        let mut offs = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+        let mut j = i;
+        while u.notnil(j) {
+            let mut jb = vnil();
+            let mut jo: i64 = 0;
+            if store_parts(j, &mut jb, &mut jo) {
+                if (jb == base) and (ir.resolve(j.a).ty == t) and (((jo - off) % size) == 0) {
+                    let mut dup = false;
+                    for k in 0..offs.len {
+                        if offs.get(k) == jo {
+                            dup = true;
+                        }
+                    }
+                    if dup {
+                        break;
+                    }
+                    sts.push(j);
+                    offs.push(jo);
+                    j.aux = slp_gen;
+                }
+            } else if (j.op == ir.OP_STORE) or (j.op == ir.OP_LOAD) or (j.op == ir.OP_CALL) or (j.op == ir.OP_MEMCPY) or
+                      (j.op == ir.OP_MEMMOVE) or (j.op == ir.OP_MEMSET) or (j.op == ir.OP_RMW) or
+                      (j.op == ir.OP_CMPXCHG) or (j.op == ir.OP_FENCE) or (j.op == ir.OP_INTR) {
+                break;
+            }
+            j = j.prev;
+        }
+        // sorted by offset (insertion: runs are short)
+        let m = sts.len;
+        for a in 1..m {
+            let mut k = a;
+            while (k > 0) and (offs.get(k - 1) > offs.get(k)) {
+                let to = offs.get(k);
+                offs.set(k, offs.get(k - 1));
+                offs.set(k - 1, to);
+                let ts = sts.get(k);
+                sts.set(k, sts.get(k - 1));
+                sts.set(k - 1, ts);
+                k -= 1;
+            }
+        }
+        // runs of neighbours, cut into chunks of vbytes, 16 and 8 bytes
+        let mut changed = false;
+        let mut r: usize = 0;
+        while r < m {
+            let mut e = r + 1;
+            while (e < m) and (offs.get(e) == (offs.get(e - 1) + size)) {
+                e += 1;
+            }
+            let mut c = r;
+            while c < e {
+                let left = @as(i64, @int_cast(i64, e - c)) * size;
+                let mut cb: i64 = 0;
+                if left >= vbytes {
+                    cb = vbytes;
+                } else if left >= 16 {
+                    cb = 16;
+                } else if (left >= 8) and (size < 8) {
+                    cb = 8;
+                } else {
+                    break;
+                }
+                let cn = @int_cast(usize, cb / size);
+                let chunk = new_lanes(cn);
+                for k in 0..cn {
+                    chunk[k] = sts.get(c + k);
+                }
+                if store_chunk(f, chunk, cb) {
+                    changed = true;
+                    count_uses(f);
+                }
+                u.free_slice(chunk);
+                c += cn;
+            }
+            r = e;
+        }
+        u.free(@ptr_cast(*mut void, sts.data));
+        u.free(@ptr_cast(*mut void, offs.data));
+        if changed {
+            // (the stores combined are gone: from the end again, past those
+            // already looked at)
+            any = true;
+            i = b.last;
+        } else {
+            i = i.prev;
+        }
+    }
+    return any;
+}
+
+// Stores of neighbouring elements as vector stores (x86-64). True if any
+// changed.
+pub fn store_groups(f: *mut ir.Func) bool {
+    if tg.g_arch != tg.ARCH_X64 {
+        return false;
+    }
+    let feats = tg.fn_features(f);
+    let mut vbytes: i64 = 16;
+    if (feats & tg.X_AVX2) != 0 {
+        vbytes = 32;
+    }
+    count_uses(f);
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        if block_stores(f, b, vbytes) {
+            any = true;
+        }
+        b = b.next;
+    }
+    return any;
+}

@@ -3183,9 +3183,10 @@ static LLVMValueRef gen_builtin(Expr *e) {
         Type *st = ct(a[1].e->type);
         LLVMValueRef s = gen(a[1].e);
         LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
-        LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(st->elem)), "");
         int64_t vb = type_size(rt);
-        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, bytes, usz(vb), ""), T_LENGTH);
+        // s.len * size >= vb, as a count of elements (which cannot wrap)
+        int64_t es = type_size(st->elem) > 0 ? type_size(st->elem) : 1;
+        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, len, usz((vb + es - 1) / es), ""), T_LENGTH);
         asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(vb));
         return load(rt, LLVMBuildExtractValue(B, s, 0, ""), true);
     }
@@ -3195,9 +3196,10 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef s = gen(a[0].e);
         LLVMValueRef v = gen(a[1].e);
         LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
-        LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(st->elem)), "");
         int64_t vb = type_size(vt);
-        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, bytes, usz(vb), ""), T_LENGTH);
+        // s.len * size >= vb, as a count of elements (which cannot wrap)
+        int64_t es = type_size(st->elem) > 0 ? type_size(st->elem) : 1;
+        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, len, usz((vb + es - 1) / es), ""), T_LENGTH);
         asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(vb));
         store(vt, v, LLVMBuildExtractValue(B, s, 0, ""), true);
         return NULL;

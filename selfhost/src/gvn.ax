@@ -36,6 +36,7 @@ const K_KNOWN: i32 = 2;  // key: a value, val: the constant it equals
 const K_LE: i32 = 3;     // key <= val + off (unsigned, as natural numbers; val nil: 0)
 const K_FILL: i32 = 4;   // key: base pointer, off; val: a memset of constant bytes there
 const K_COPY: i32 = 5;   // key: base pointer, off: of the destination of val, a memcpy or memmove
+const K_GE: i32 = 6;     // key >= off (unsigned, off a small constant)
 
 struct Ent {
     kind: i32,
@@ -930,6 +931,18 @@ fn add_le(x: *mut ir.Value, y: *mut ir.Value, c: i64) void {
     push_ent(K_LE, le_hash(x), x, c, x.ty, y);
 }
 
+fn ge_hash(v: *ir.Value) u64 {
+    return mix(hp(v), 0x4745);
+}
+
+// x >= c (unsigned): a lower bound, which decides x >= c' for c' <= c
+fn add_ge(x: *mut ir.Value, c: i64) void {
+    if ir.is_const(x) or (c <= 0) {
+        return;
+    }
+    push_ent(K_GE, ge_hash(x), x, c, x.ty, vnil());
+}
+
 fn small_k(v: *ir.Value) bool {
     return cb.is_k(v) and (v.ty.kind == ir.T_INT) and (ir.cint_val(v) < 0x4000_0000_0000_0000);
 }
@@ -958,6 +971,7 @@ fn assume_range(a: *mut ir.Value, n: u64) void {
         return;
     }
     add_le(x, vnil(), @bit_cast(i64, lo + (n - 1)));
+    add_ge(x, @bit_cast(i64, lo));
     add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), kbool(true));
     add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), kbool(true));
 }
@@ -1010,6 +1024,19 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     if is_inst(a, ir.OP_SUB) and not ir.is_const(a.a) and not ir.is_const(a.b) {
         return prove_le(a.b, a.a, 0 - k);  // (then x <= n: no wrap)
     }
+    // x - d (or x + -d) with x >= k + d: no wrap, and at least k
+    let mut d: i64 = 0;
+    if is_inst(a, ir.OP_ADD) and cb.is_k(ir.resolve(a.b)) {
+        d = @bit_cast(i64, (0 -% ir.cint_val(ir.resolve(a.b))) & ir.mask_bits(a.ty.bits));
+    } else if is_inst(a, ir.OP_SUB) and small_k(ir.resolve(a.b)) {
+        d = kv(ir.resolve(a.b));
+    }
+    if (d >= 1) and (d < 0x1_0000_0000) {
+        return at_least(ir.resolve(a.a), k + d, depth + 1);
+    }
+    if is_inst(a, ir.OP_ZEXT) {
+        return at_least(ir.resolve(a.a), k, depth + 1);
+    }
     let mut c: i64 = 0;
     if is_inst(a, ir.OP_MUL) and small_k(a.b) {
         c = kv(a.b);
@@ -1046,6 +1073,9 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
         } else if not ir.is_const(b) {
             add_le(a, b, -1);
             assume_sum_le(a, b, -1);
+            if small_k(a) {
+                add_ge(b, kv(a) + 1);  // k < b
+            }
         }
     } else if tp == ir.IntULE {
         if small_k(b) {
@@ -1053,11 +1083,16 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
         } else if not ir.is_const(b) {
             add_le(a, b, 0);
             assume_sum_le(a, b, 0);
+            if small_k(a) {
+                add_ge(b, kv(a));  // k <= b
+            }
         }
     } else if (tp == ir.IntUGT) or (tp == ir.IntUGE) {
         let sw = cb.swap_pred(tp);
         if not ir.is_const(b) {
             assume_bounds(sw, b, a);
+        } else if small_k(b) {
+            add_ge(a, kv(b) + pick1(tp == ir.IntUGT));  // a > k, a >= k
         }
     } else if tp == ir.IntEQ {
         if not ir.is_const(a) and not ir.is_const(b) {
@@ -1101,12 +1136,27 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
     if small_k(x) {
         return kv(x) >= c;
     }
+    if c <= 0 {
+        return true;
+    }
     if c == 1 {
         if known_true(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0))) {
             return true;
         }
     }
-    return known_true(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c))));
+    if known_true(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c)))) {
+        return true;
+    }
+    // lower bounds x >= k with k >= c
+    let mut e = bk.get(@truncate(usize, ge_hash(x)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.at(@int_cast(usize, e));
+        if (en.kind == K_GE) and (en.key == x) and fact_ok(e) and (en.off >= c) {
+            return true;
+        }
+        e = en.next;
+    }
+    return false;
 }
 
 // Is the comparison i known to hold (by a fact fact_ok allows)?
@@ -1905,6 +1955,17 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
         }
         if at_least(a, need, 0) {
             return kbool((p == ir.IntUGE) or (p == ir.IntUGT));
+        }
+    }
+    // k <= x, k < x (and their negations) likewise
+    if small_k(a) and not ir.is_const(b) and
+       ((p == ir.IntUGE) or (p == ir.IntUGT) or (p == ir.IntULT) or (p == ir.IntULE)) {
+        let mut need = kv(a);
+        if (p == ir.IntULT) or (p == ir.IntUGE) {
+            need += 1;
+        }
+        if at_least(b, need, 0) {
+            return kbool((p == ir.IntULE) or (p == ir.IntULT));
         }
     }
     // (x - d) against k >= 0, signed, with x in [0, ub(x)] and no overflow:
