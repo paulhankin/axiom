@@ -25,11 +25,11 @@ Follow-up to 0088, measured on the benchmark 1d00a0e (`axiom/src/bin/bench_kerne
    the loop uses) removed 10k loads but measured slower (see item 1); a
    final allocation round that lets split pieces of one slot inside a loop join again
    may do better.
-3. **Race inputs**: `calculate_race_inputs` (300 calls) is 356k instructions against
+3. **Race inputs** (fixed in fbe0dc3, 0096): `calculate_race_inputs` (300 calls) is 356k instructions against
    LLVM's 305k, and `race_inputs` 137 ns against 93 (Rust 110) since the benchmark stores
    the race inputs unconditionally: LLVM vectorizes the stores and compares (29k mask
    writes), the self-hosted compiler does not.
-4. **Bounds checks at `dim128`'s start**: the eight threshold loads
+4. **Bounds checks at `dim128`'s start** (fixed in fbe0dc3, 0096): the eight threshold loads
    (`@load(f32x16, ht[16 * k..])`, after `@expect(ht.len >= 128)`) each keep two
    compares; LLVM keeps one range check. About 40 instructions per evaluation
    (`contact_single`: 558 instructions per call outside the main loop against 436).
