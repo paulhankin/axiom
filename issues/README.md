@@ -41,7 +41,7 @@ they travel with the code they describe.
 | [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
 | [0102](0102-c-stack-slot-copies-store-forwarding.md) | feature | compiler (C: codegen) | C compiler: aggregates copied through stack slots whose reloads straddle the stores (store-forwarding stalls) |
 | [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | C compiler: `@bit_cast` between a function pointer and an integer is invalid LLVM IR |
-| [0105](0105-selfhost-one-ply-after-0101.md) | feature | compiler (selfhost: gvn, mach, x64, slp) | Self-hosted x86-64: what is left at 1-ply after 0101 |
+| [0105](0105-selfhost-one-ply-after-0101.md) | feature | compiler (selfhost: gvn, mach, x64, slp) | Self-hosted x86-64: what is left at 1-ply after 0101 (instruction counts at LLVM's since fce0821; per-instruction cost left) |
 
 ## Closed
 
