@@ -40,6 +40,8 @@ they travel with the code they describe.
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
 | [0089](0089-c-vector-float-to-u32-avx512.md) | feature | compiler (C) | Vector `@int_from_float` to `u32` is five instructions on AVX-512 where two do |
+| [0090](0090-selfhost-conditional-table-reductions.md) | feature | compiler (selfhost: combine) | Reductions of table loads under a condition (the benchmark's Zobrist hash): gathers or scalar |
+| [0091](0091-c-compiler-gathers-on-skylake-sp.md) | feature | compiler (C) | LLVM 18 vectorizes with gathers on Skylake-SP/Cascade Lake, where they are slow |
 
 ## Closed
 
