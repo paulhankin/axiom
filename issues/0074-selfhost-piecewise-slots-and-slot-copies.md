@@ -1,7 +1,7 @@
 # 0074: Self-hosted optimizer: copies out of slots filled piece by piece, and whole-slot copies between locals
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (7810756, 6e9b5ac)
 - Area: compiler (selfhost: copies)
 
 Outside the evaluation kernels, the benchmark's search code (`src/eval/search.ax`,
@@ -24,3 +24,18 @@ Outside the evaluation kernels, the benchmark's search code (`src/eval/search.ax
 
 The gbr evaluator (`bench_search --mode gbr`) was 1.20x Rust's time per position against
 LLVM-backed Axiom's 1.05x, rollouts 1.31x against 1.29x.
+
+Fix (`copies.ax`): `split_copies` splits a copy or vector load out of a slot filled piece by
+piece at the pieces, each part taken from where it was written (a stored value, a fill, a
+copy's source that has not changed since and cannot overlap the destination), skipping
+bytes nothing writes (padding); `unread_writes` then removes writes to slots of bytes
+nothing reads; `renamable` makes a whole slot copied into a variable's slot (not used
+before the copy, the source not used after it, nor around a loop) that slot. On x86-64 a
+small copy from or to a stack slot uses parts that do not overlap (16 + 8 + 1 bytes for 25,
+not two overlapping 16-byte moves), so a copy out of what one copied in reads each part
+from one store. `tests/run/slot_copies.ax` checks the cases that must not change: a copy
+inside a loop whose source is needed again, halves swapped through a slot.
+
+Effect (bench_search, min of 5, against main before them; this machine's Xeon, AVX-512):
+1ply 1.23 -> 1.18 of Rust's time, 2ply 1.24 -> 1.22, rollouts 1.26 -> 1.21; then the
+x86-64 part and the parts copied from anywhere: 1ply -4%, 2ply -1.5%, gbr -2%.

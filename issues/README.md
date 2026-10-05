@@ -107,6 +107,9 @@ they travel with the code they describe.
 | [0071](0071-selfhost-half-inputs-remaining.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: what is left in the benchmark's contact half-inputs (fixed in d5130b0, 30d8bc2, 106658d) |
 | [0072](0072-selfhost-sse2-shuffles.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without AVX: constant shuffles through memory (fixed in b2dccf2) |
 | [0073](0073-selfhost-outlining-inline-helpers.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: inline helpers' hot bodies outlined as cold functions (fixed in 4b49fd9) |
+| [0074](0074-selfhost-piecewise-slots-and-slot-copies.md) | feature | compiler (selfhost: copies, x64) | Self-hosted optimizer: copies out of slots filled piece by piece, and whole-slot copies between locals (fixed in 7810756, 6e9b5ac) |
+| [0075](0075-selfhost-tail-recursion.md) | feature | compiler (selfhost: passes) | Self-hosted optimizer: calls of a function itself in tail position stay calls (fixed in 50ef28c) |
+| [0076](0076-selfhost-outlining-in-loops.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: hot loop bodies outlined as cold functions (fixed in 9f11191) |
 | [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) (fixed in part in f38d897: shrink-wrapping, global addresses hoisted; the rest in 0088) |
 | [0079](0079-selfhost-sinking-lengthens-lives.md) | bug | compiler (selfhost: gvn) | Self-hosted optimizer: sinking makes operands live instead of results (fixed in d00826d) |
 | [0080](0080-selfhost-ctlz-without-lzcnt.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64 without LZCNT: k - ctlz(x) and the shifts it bounds (fixed in b16d1ee) |
