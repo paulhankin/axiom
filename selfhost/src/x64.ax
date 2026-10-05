@@ -8426,6 +8426,7 @@ fn compile_func(f: *mut ir.Func) void {
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
     opt.hoist_constants(f, &order, const_needs_reg, true);
+    opt.share_constants(f, &order, const_needs_reg);
     opt.layout(&mut order);
     opt.sink_compares(f);
     prepare(f);
@@ -10343,6 +10344,139 @@ fn flags_live_out(b: *mut mc.MBlock) bool {
     return false;
 }
 
+// Can x, at the end of a block that then compares (cmp) and branches to
+// block `other` or falls on, move after the branch: an operation on general
+// registers only, that writes one the compare does not read and that is not
+// needed at `other`?
+fn movable_to_fall(x: *mc.MInst, cmp: *mc.MInst, skip: []bool, other: i32) bool {
+    let op = x.op;
+    if not ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.IMUL_I) or
+            ((op == xe.SHIFT) and (x.ops[1].kind != mc.K_REG)) or
+            ((op == xe.ALU) and (x.cc != 2) and (x.cc != 3) and (x.cc != 7))) {
+        return false;
+    }
+    if (x.ops.len == 0) or (x.ops[0].kind != mc.K_REG) or (x.sz < 4) {
+        return false;
+    }
+    let d = P(x.ops[0].reg);
+    if d >= 16 {
+        return false;
+    }
+    for k in 1..x.ops.len {
+        let o = x.ops[k];
+        if (o.kind == mc.K_MEM) and (op != xe.LEA) {
+            return false;
+        }
+        if (o.kind == mc.K_REG) and (P(o.reg) >= 16) {
+            return false;
+        }
+    }
+    if names_phys(cmp, d) {
+        return false;
+    }
+    let seen = u.calloc_slice.[bool](MF.blocks.len + 1);
+    let mut budget: i32 = 48;
+    let dead = dead_at(@int_cast(usize, other), d, skip, seen, &mut budget);
+    u.free_slice(seen);
+    return dead;
+}
+
+// Is general register r written before it is read on every way from the
+// start of block b (looking at `budget` blocks at most)? False when not
+// known. (A block seen before is not looked at again: a read from there on
+// is found the first time.)
+fn dead_at(b0: usize, r: i32, skip: []bool, seen: []mut bool, budget: *mut i32) bool {
+    let mut b = b0;
+    while (b < MF.blocks.len) and skip[b] {
+        b += 1;
+    }
+    if b >= MF.blocks.len {
+        return false;
+    }
+    if seen[b] {
+        return true;
+    }
+    seen[b] = true;
+    budget.* -= 1;
+    if budget.* < 0 {
+        return false;
+    }
+    if MF.blocks.get(b).cold {
+        return true;  // (a trap)
+    }
+    let mut i = MF.blocks.get(b).first;
+    while u.notnil(i) {
+        let op = i.op;
+        if (op == xe.JMP) or (op == xe.JCC) {
+            let t = i.ops[0].label;
+            if (t >= xe.LOCAL_BASE) or (t < 0) or not dead_at(@int_cast(usize, t), r, skip, seen, budget) {
+                return false;
+            }
+            if op == xe.JMP {
+                return true;
+            }
+        } else if op == xe.CALL {
+            // (its argument registers are its operands; what it clobbers is
+            // written)
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if ((o.kind == mc.K_REG) and (P(o.reg) == r)) or
+                   ((o.kind == mc.K_MEM) and
+                    (((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r)))) {
+                    return false;
+                }
+            }
+            if (i.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+                return true;
+            }
+        } else if op == xe.RET {
+            // (registers no calling convention keeps or returns in)
+            return (r == xe.RCX) or (r == xe.R8) or (r == xe.R9) or (r == xe.R10) or (r == xe.R11);
+        } else if op != xe.LABEL {
+            if not ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or
+                    (op == xe.STORE_I) or (op == xe.LEA) or (op == xe.ALU) or (op == xe.TEST) or (op == xe.IMUL) or
+                    (op == xe.IMUL_I) or (op == xe.SHIFT) or (op == xe.EXT) or (op == xe.CMOV) or (op == xe.SETCC) or
+                    (op == xe.CMP_M) or (op == xe.ANDN) or (op == xe.BLS) or (op == xe.NOP) or (op == xe.BITSCAN) or
+                    (op == xe.SHIFTX) or (op == xe.BT) or (op == xe.SSE) or (op == xe.PREFETCH) or
+                    (op == xe.VZEROUPPER)) {
+                return false;
+            }
+            // (shift by cl: rcx is its operand)
+            let mut reads = false;
+            let mut full = false;
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if o.kind == mc.K_REG {
+                    if P(o.reg) == r {
+                        if (o.role & mc.RU) != 0 {
+                            reads = true;
+                        } else if (o.role & (mc.RD | mc.RE)) != 0 {
+                            full = true;
+                        }
+                    }
+                } else if o.kind == mc.K_MEM {
+                    if ((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r)) {
+                        reads = true;
+                    }
+                }
+            }
+            if reads {
+                return false;
+            }
+            if full {
+                // a write of 8 or 16 bits keeps the rest
+                if (op == xe.SETCC) or ((op == xe.LOAD) and (i.sz < 4) and (i.cc == 0)) or (op == xe.SSE) or
+                   ((op == xe.BITSCAN) and (i.cc < 2)) or ((op != xe.LOAD) and (op != xe.EXT) and (i.sz < 4)) {
+                    return false;
+                }
+                return true;
+            }
+        }
+        i = i.next;
+    }
+    return dead_at(b + 1, r, skip, seen, budget);
+}
+
 fn dup_exit_tests(skip: []bool) void {
     flags_out.clear();
     let nb = MF.blocks.len;
@@ -10378,14 +10512,59 @@ fn dup_exit_tests(skip: []bool) void {
             after = @int_cast(i32, n);
         }
         mc.remove(p, l);
+        // the operations at p's end whose results only the way p falls
+        // into needs (the loop's preheader work, as `b * 16` before an inner
+        // loop) go after the branch, onto that way
+        let fall = @int_cast(i32, next_kept(skip, bi));
+        let tl = ins[1].ops[0].label;
+        let mut cc = ins[1].cc;
+        let mut other: i32 = -1;
+        if tl == fall {
+            other = after;
+            cc = cc ^ 1;
+        } else if after == fall {
+            other = tl;
+        }
+        let mut s = p.last;  // (the first of them, or nil)
+        let mut moved = false;
+        if other >= 0 {
+            let mut x = p.last;
+            while u.notnil(x) and movable_to_fall(x, ins[0], skip, other) {
+                s = x;
+                moved = true;
+                x = x.prev;
+            }
+        }
+        let mut tail = u.List.[*mut mc.MInst].{ data: u.nil.[*mut mc.MInst](), len: 0, cap: 0 };
+        if moved {
+            let mut x = s;
+            while u.notnil(x) {
+                let nx = x.next;
+                mc.remove(p, x);
+                tail.push(x);
+                x = nx;
+            }
+        }
         for k in @as(usize, 0)..2 {
             let c = mc.new_inst(ins[k].op, ins[k].sz, ins[k].ops);
             c.cc = ins[k].cc;
             c.aux = ins[k].aux;
             c.src = ins[k].src;
+            if moved and (k == 1) {
+                c.cc = cc;
+                c.ops[0] = mc.label(other);
+            }
             mc.append(p, c);
         }
-        let ops: [1]mc.MOp = [mc.label(after)];
+        let mut to = after;
+        if moved {
+            for k in 0..tail.len {
+                mc.append(p, tail.get(k));
+            }
+            to = fall;
+        }
+        u.free(@ptr_cast(*mut void, tail.data));
+        let ops: [1]mc.MOp = [mc.label(to)];
         mc.append(p, mc.new_inst(xe.JMP, 0, ops[..]));
     }
     // blocks entered only by falling from the one before

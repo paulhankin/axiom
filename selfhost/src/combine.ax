@@ -524,6 +524,33 @@ fn rotation(B: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value, t: *mut ir.T
     return ir.intr(B, ir.IN_ROTL, t, args[..]);
 }
 
+// A select of two integer constants on a scalar condition, used once (where
+// a 0/1 value times a constant becomes one: `side * 100`).
+fn const_select(v: *mut ir.Value) bool {
+    return is_op(v, ir.OP_SELECT) and (v.a.ty.kind == ir.T_INT) and is_k(v.b) and is_k(v.c) and (uses_of(v) <= 1);
+}
+
+// x + (c ? k : 0), x + (c ? 0 : k): c ? x + k : x (a `lea` and a `cmov`
+// rather than materializing the select's constants), or nil.
+fn add_select(B: *mut ir.Builder, x: *mut ir.Value, s: *mut ir.Value) *mut ir.Value {
+    if is_k(x) or not const_select(s) {
+        return vnil();
+    }
+    // (c ? x1 : x2) + (c ? k1 : k2) = c ? x1 + k1 : x2 + k2
+    if is_op(x, ir.OP_SELECT) and (x.a == s.a) and (uses_of(x) <= 1) {
+        return ir.select(B, s.a, ir.add(B, x.b, s.b), ir.add(B, x.c, s.c));
+    }
+    if not (is_kv(s.b, 0) or is_kv(s.c, 0)) {
+        return vnil();
+    }
+    return ir.select(B, s.a, ir.add(B, x, s.b), ir.add(B, x, s.c));
+}
+
+// Is v x + k for a constant k?
+fn plus_const(v: *mut ir.Value, x: *mut ir.Value) bool {
+    return is_op(v, ir.OP_ADD) and (v.a == x) and is_k(v.b);
+}
+
 fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let t = i.ty;
@@ -574,6 +601,16 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if is_op(b, ir.OP_ADD) and is_k(b.b) and not is_k(a) and (uses_of(b) <= 1) and (t.kind == ir.T_INT) {
             return ir.add(B, ir.add(B, a, b.a), b.b);
         }
+        if t.kind == ir.T_INT {
+            let r = add_select(B, a, b);
+            if u.notnil(r) {
+                return r;
+            }
+            let r2 = add_select(B, b, a);
+            if u.notnil(r2) {
+                return r2;
+            }
+        }
         // (x - y) + y
         if is_op(a, ir.OP_SUB) and (a.b == b) {
             return a.a;
@@ -602,6 +639,10 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
                 return a;
             }
             return ir.add(B, a, kt(t, 0 -% k));
+        }
+        // x - (c ? k : 0) = c ? x - k : x
+        if (t.kind == ir.T_INT) and not is_k(a) and const_select(b) and (is_kv(b.b, 0) or is_kv(b.c, 0)) {
+            return ir.select(B, b.a, ir.sub(B, a, b.b), ir.sub(B, a, b.c));
         }
         // (x + y) - y ; (x + y) - x
         if is_op(a, ir.OP_ADD) and (a.b == b) {
@@ -654,6 +695,16 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
                 i.a = a.a;
                 i.b = kt(t, k *% kval(a.b));
                 return simplify_bin(B, i);
+            }
+            // zext(c) * k: c ? k : 0 (a 0/1 value as a select, which an
+            // addition or subtraction then takes into its arms)
+            if is_op(a, ir.OP_ZEXT) and (a.a.ty.kind == ir.T_INT) and (a.a.ty.bits == 1) {
+                return ir.select(B, a.a, b, kt(t, 0));
+            }
+            // (c ? k1 : k2) * k, and (c ? x + k1 : x) * k = c ? x*k + k1*k : x*k
+            if is_op(a, ir.OP_SELECT) and (a.a.ty.kind == ir.T_INT) and (uses_of(a) <= 1) and
+               ((is_k(a.b) and is_k(a.c)) or plus_const(a.b, a.c) or plus_const(a.c, a.b)) {
+                return ir.select(B, a.a, ir.mul(B, a.b, b), ir.mul(B, a.c, b));
             }
             // (x + c1) * c2 = x * c2 + c1 * c2: the constant outermost, where
             // an address takes it as its displacement ((row + 3) * 64)
@@ -801,6 +852,28 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// v where the condition c is known to be `when`: the arm of a select on c,
+// or an integer operation on such values (each used once, at most `depth`
+// deep; not a division, which the select's arm would then compute where c
+// is not `when`), or v.
+fn under(B: *mut ir.Builder, c: *mut ir.Value, v: *mut ir.Value, when: bool, depth: i32) *mut ir.Value {
+    if is_op(v, ir.OP_SELECT) and (v.a == c) {
+        if when {
+            return v.b;
+        }
+        return v.c;
+    }
+    if (depth > 0) and (v.kind == ir.V_INST) and (v.op >= ir.OP_ADD) and (v.op <= ir.OP_ASHR) and
+       ((v.op < ir.OP_UDIV) or (v.op > ir.OP_SREM)) and small_int(v.ty) and (uses_of(v) <= 1) {
+        let x = under(B, c, v.a, when, depth - 1);
+        let y = under(B, c, v.b, when, depth - 1);
+        if (x != v.a) or (y != v.b) {
+            return ir.binop(B, v.op, x, y);
+        }
+    }
+    return v;
+}
+
 fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let c = i.a;
     if c.kind == ir.V_CINT {
@@ -822,6 +895,12 @@ fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         i.b = i.c;
         i.c = x;
         return simplify_select(B, i);
+    }
+    // an arm that is (or computes from) a select on c: its value there
+    let nb = under(B, c, i.b, true, 3);
+    let nc = under(B, c, i.c, false, 3);
+    if (nb != i.b) or (nc != i.c) {
+        return ir.select(B, c, nb, nc);
     }
     let t = i.ty;
     // x != 0 ? f(ctlz(x)) : k, where f(bits) is k (the count of a zero x is
@@ -1104,6 +1183,30 @@ fn narrowed(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
     return vnil();
 }
 
+// Is v, an integer, known to be below 2^bits?
+fn fits_unsigned(v: *mut ir.Value, bits: i32) bool {
+    if bits >= 64 {
+        return true;
+    }
+    if is_k(v) {
+        return kval(v) < (@as(u64, 1) << @as(u64, @bit_cast(u32, bits)));
+    }
+    if is_op(v, ir.OP_ZEXT) {
+        return v.a.ty.bits <= bits;
+    }
+    if is_op(v, ir.OP_AND) and is_k(v.b) {
+        return fits_unsigned(v.b, bits);
+    }
+    if is_op(v, ir.OP_INTR) {
+        // a count of bits is at most the width (which needs 7 bits)
+        let id = pred_of(v);
+        if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_CTPOP) {
+            return (bits >= 8) or (v.ty.bits < (@as(i32, 1) << @as(u32, @bit_cast(u32, bits))));
+        }
+    }
+    return false;
+}
+
 fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let a = i.a;
@@ -1121,6 +1224,11 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if (op == ir.OP_ZEXT) and is_op(a, ir.OP_ZEXT) {
             i.a = a.a;
             return vnil();
+        }
+        // zext (trunc x) to x's type, where x fits the narrow type: x (a
+        // count of bits as an index, `@as(usize, @truncate(u32, @ctz(m)))`)
+        if (op == ir.OP_ZEXT) and is_op(a, ir.OP_TRUNC) and (a.a.ty == t) and fits_unsigned(a.a, a.ty.bits) {
+            return a.a;
         }
         if (op == ir.OP_SEXT) and (is_op(a, ir.OP_SEXT) or is_op(a, ir.OP_ZEXT)) {
             // sext (zext x) = zext x: the top bit is 0

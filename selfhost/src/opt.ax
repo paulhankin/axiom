@@ -1433,6 +1433,121 @@ fn any_value(v: *ir.Value) bool {
     return true;
 }
 
+// Constants outside loops that the target must build in a register
+// (`needs`), used more than once: built once, by a copy at a use whose block
+// dominates other uses, which use the copy (a 64-bit multiplier used three
+// times in a block, a floating point bound compared with in a run of
+// branches). The register allocator builds a copy of a constant again where
+// it would otherwise spill it. After hoist_constants, which takes the uses
+// in loops; needs dominators.
+struct SharedConst {
+    k: *mut ir.Value,
+    blocks: u.List.[*mut ir.Block],  // (of its uses)
+    copies: u.List.[*mut ir.Value],
+}
+
+pub fn share_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value) bool) void {
+    let mut cs = u.List.[SharedConst].{ data: u.nil.[SharedConst](), len: 0, cap: 0 };
+    for pass in @as(i32, 0)..2 {
+        // (in reverse postorder: a use in a dominating block comes first)
+        for bi in 0..order.len {
+            let b = order.get(bi);
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i.op != ir.OP_PHI) and (i.op != ir.OP_COPY) {
+                    if pass == 0 {
+                        note_const(&mut cs, i.a, b, needs);
+                        note_const(&mut cs, i.b, b, needs);
+                        note_const(&mut cs, i.c, b, needs);
+                        for k in 0..i.xs.len {
+                            note_const(&mut cs, i.xs.get(k), b, needs);
+                        }
+                    } else {
+                        i.a = shared(f, &mut cs, i.a, i, needs);
+                        i.b = shared(f, &mut cs, i.b, i, needs);
+                        i.c = shared(f, &mut cs, i.c, i, needs);
+                        for k in 0..i.xs.len {
+                            i.xs.set(k, shared(f, &mut cs, i.xs.get(k), i, needs));
+                        }
+                    }
+                }
+                i = i.next;
+            }
+        }
+        if cs.len == 0 {
+            break;
+        }
+    }
+    for k in 0..cs.len {
+        u.free(@ptr_cast(*mut void, cs.at(k).blocks.data));
+        u.free(@ptr_cast(*mut void, cs.at(k).copies.data));
+    }
+    u.free(@ptr_cast(*mut void, cs.data));
+}
+
+fn find_const(cs: *mut u.List.[SharedConst], v: *mut ir.Value) i64 {
+    for k in 0..cs.len {
+        if same_const(cs.at(k).k, v) {
+            return @int_cast(i64, k);
+        }
+    }
+    return -1;
+}
+
+fn note_const(cs: *mut u.List.[SharedConst], v: *mut ir.Value, b: *mut ir.Block, needs: fn(*ir.Value) bool) void {
+    if u.isnil(v) or not needs(v) {
+        return;
+    }
+    let mut k = find_const(cs, v);
+    if k < 0 {
+        if cs.len >= 64 {
+            return;
+        }
+        cs.push(SharedConst.{ k: v, blocks: u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 },
+                              copies: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 } });
+        k = @int_cast(i64, cs.len) - 1;
+    }
+    let c = cs.at(@int_cast(usize, k));
+    if c.blocks.len < 64 {
+        c.blocks.push(b);
+    }
+}
+
+// v, an operand of i, or a shared copy of it: one made before an earlier
+// use that dominates i, or one made here when i's block dominates another
+// use.
+fn shared(f: *mut ir.Func, cs: *mut u.List.[SharedConst], v: *mut ir.Value, i: *mut ir.Value,
+          needs: fn(*ir.Value) bool) *mut ir.Value {
+    if u.isnil(v) or not needs(v) {
+        return v;
+    }
+    let k = find_const(cs, v);
+    if k < 0 {
+        return v;
+    }
+    let c = cs.at(@int_cast(usize, k));
+    let b = i.blk;
+    for j in 0..c.copies.len {
+        if dominates(c.copies.get(j).blk, b) {
+            return c.copies.get(j);
+        }
+    }
+    let mut n: i32 = 0;
+    for j in 0..c.blocks.len {
+        if dominates(b, c.blocks.get(j)) {
+            n += 1;
+        }
+    }
+    if n < 2 {
+        return v;
+    }
+    let cp = ir.new_inst(f, ir.OP_COPY, v.ty);
+    cp.a = v;
+    ir.insert_before(i, cp);
+    c.copies.push(cp);
+    return cp;
+}
+
 // Values `needs` picks (thread-local addresses on AArch64) are built once in
 // the entry block, for the whole function.
 pub fn hoist_to_entry(f: *mut ir.Func, needs: fn(*ir.Value) bool) void {
