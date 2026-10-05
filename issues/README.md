@@ -113,3 +113,4 @@ they travel with the code they describe.
 | [0083](0083-selfhost-x64-baseline-selection.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: rel32 jumps, two-micro-op cmovs, and SSE2 details (fixed in 32f7a7f, d97dcc9) |
 | [0084](0084-selfhost-padded-board-loads.md) | feature | compiler (selfhost: gvn, x64) | Self-hosted optimizer: loads of a buffer filled by memcpy, and vector and-not without AVX-512 (fixed in dbca74e) |
 | [0085](0085-selfhost-offset-facts.md) | feature | compiler (selfhost: gvn) | Self-hosted optimizer: x - d checks after a test of k - x (fixed in 92ab39d) |
+| [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
