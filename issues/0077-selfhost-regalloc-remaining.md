@@ -1,7 +1,7 @@
 # 0077: Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits)
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed in part (f38d897); the rest in 0088
 - Area: compiler (selfhost: mach, x64)
 
 Follow-up to 0070. After it, the benchmark's move generator (`src/core/moves.ax`, 100
@@ -31,3 +31,42 @@ is left is mostly in the register allocator:
 Also seen: no loop rotation, so loads from parameters at the head of a loop are not
 hoisted out of it; and a RIP-relative global address used as an indexed base is computed
 (`lea r,[rip+...]`) inside the loop that uses it rather than once before it.
+
+## Resolution
+
+f38d897, measured on the benchmark's `bench_kernels` (deterministic counts by single-stepping)
+against main before it (7eecc69):
+
+- **Shrink-wrapping** (new, `mach.ax` `shrink_wrap`, x64.ax): the frame is set up only past
+  the blocks that can return without it. `generate_moves_sub` returns at once in 2728 of its
+  3813 calls (`rolls[depth] == 0`); those now run 6 instructions instead of 22. The frame
+  tables mark each stretch run without the frame (`ftab.ax`), so traps there (bounds checks
+  call `axiom.trap` without the frame) and profiles find the return address
+  (`tests/traces/traces.ax`, "trap before the frame"). `save_moves` pays the copies into
+  callee-saved registers without using its early return (its caller tests the same).
+- **Global addresses not hoisted**: done (`opt.hoist_constants` with `globals`): a global
+  indexed by a variable is addressed from a register built once before the loop
+  (rematerialized if it loses its register); `ZOBRIST` in `generate_moves_into`.
+- **Call arguments shuffled through temporaries** (item 1): a copy only copied again
+  before its register dies is forwarded (`forward_copy`), and `drop_reloads` drops copies to
+  a register that already holds the value.
+- **Stack arguments / reloads read once** (part of item 5): folded into `test`, `cmp`
+  and ALU operands after allocation (`fold_stack_reads`, physical-register liveness).
+- **Stores repeated at joins** (item 2): no longer seen in `generate_moves_sub` after 0081.
+
+| | before | after | LLVM |
+|---|---|---|---|
+| 100 `generate_moves_into` | 997k | 971k | 901k |
+| `generate_moves_sub` | 583k | 548k | 546k |
+| `generate_moves_into` alone | 84.5k | 79.9k | 32k (gathers) |
+| `save_moves` | 220k | 233k | 226k |
+| contact half-inputs (300) | 491k | 487k | 448k |
+
+Timings (min of 9, 4 shared cores, about ±4%) moved within noise: movegen 851 -> 861 ns
+(LLVM 929, Rust 835), 2ply 0.130 -> 0.126 s, gbr 0.98 -> 0.96 s, 1ply 0.032 -> 0.034 s. An
+earlier measurement on the main of the day before gave movegen 895 -> 838 from
+shrink-wrapping alone; on top of 0081-0085 it no longer shows. the benchmark results bit-identical.
+
+Left (0088): mask registers, rematerialized values rebuilt per block (`af_input`, the
+eighth argument of `calculate_half_inputs_with_masks`, is loaded 9 times per call), splits
+at loop edges, loop rotation.

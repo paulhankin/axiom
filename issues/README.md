@@ -36,10 +36,10 @@ they travel with the code they describe.
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
-| [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) |
 | [0078](0078-selfhost-half-inputs-idioms.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: idioms left in the benchmark's contact half-inputs (bswap, byte compares, kortest) |
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
+| [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
 
 ## Closed
 
@@ -107,6 +107,7 @@ they travel with the code they describe.
 | [0071](0071-selfhost-half-inputs-remaining.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: what is left in the benchmark's contact half-inputs (fixed in d5130b0, 30d8bc2, 106658d) |
 | [0072](0072-selfhost-sse2-shuffles.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without AVX: constant shuffles through memory (fixed in b2dccf2) |
 | [0073](0073-selfhost-outlining-inline-helpers.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: inline helpers' hot bodies outlined as cold functions (fixed in 4b49fd9) |
+| [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) (fixed in part in f38d897: shrink-wrapping, global addresses hoisted; the rest in 0088) |
 | [0079](0079-selfhost-sinking-lengthens-lives.md) | bug | compiler (selfhost: gvn) | Self-hosted optimizer: sinking makes operands live instead of results (fixed in d00826d) |
 | [0080](0080-selfhost-ctlz-without-lzcnt.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64 without LZCNT: k - ctlz(x) and the shifts it bounds (fixed in b16d1ee) |
 | [0081](0081-selfhost-regalloc-split-gaps.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator: values split at every block boundary (fixed in 56caaec) |
