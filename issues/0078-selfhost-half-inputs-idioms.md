@@ -1,7 +1,7 @@
 # 0078: Self-hosted x86-64: idioms left in the benchmark's contact half-inputs (bswap, byte compares, kortest)
 
 - Type: feature (performance)
-- Status: fixed (6d3f272)
+- Status: fixed (b42340e)
 - Area: compiler (selfhost: x64, combine, thread)
 
 Follow-up to 0071. After it, `contact_inputs` (300 positions, the benchmark
@@ -25,7 +25,7 @@ Mask registers (0071 item 1) moved to 0077 with the rest of the register allocat
 
 ## Resolution
 
-Fixed in 6d3f272:
+Fixed in b42340e:
 
 1. **Byte swaps** (`combine.ax` `byte_swap`): `rotl(((x >> 8) & 0x00FF00FF) |
    ((x & 0x00FF00FF) << 8), 16)` (either half also masked after the shift; for 64
