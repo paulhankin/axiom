@@ -105,3 +105,30 @@ every use: 545 frame loads in the function against LLVM's 285, with the same num
 instructions and branches executed (callgrind). Evicting them only around the interfering
 stretch (region splitting, as LLVM's greedy allocator) is what is needed. Item 4 (code
 placement) and 5 stand.
+
+## After 0113 and 0114 (c942ef2)
+
+0113 (548b145) clears the destination of `bsf` / `tzcnt` and the other bit scans, which
+waited for the previous iteration's result in the set-bit loops; 0114 (73b2664) builds
+`dim128`'s five outputs with four `insertps` and one broadcast rather than sixteen
+broadcasts in a row.
+
+bench_search, interleaved min-of-N under `chrt -f 10` (time / min(Rust, LLVM-built port),
+the benchmark 3023b3d). `--cpu=x86-64`, before (main at e36c8ad) -> after:
+
+| 0ply | 1ply | 2ply | 3ply | 4ply | gbr | gbr+ | gbr++ | rollout |
+|---|---|---|---|---|---|---|---|---|
+| 1.105 -> 1.010 | 1.030 -> 0.963 | 1.052 -> 0.987 | 1.036 -> 0.968 | 1.028 -> 0.986 | 1.108 -> 1.040 | 1.074 -> 0.954 | 1.027 -> 1.007 | 1.063 -> 1.005 |
+
+Repeated (12 runs each): 0ply 0.997, gbr 0.962. Every mode is within 2% of the bar or
+faster, within the noise of these measurements (the Rust reference itself moves about 3%
+from run to run). The AVX-512 build after the same changes: 0ply 1.01-1.04, 1ply 1.067,
+2ply 1.051, 3ply 1.118, 4ply 1.002, gbr 1.081, gbr+ 1.080, gbr++ 0.999, rollout 1.048 of
+min(Rust, LLVM); there the LLVM-built port is itself 3-13% slower than Rust in most modes
+(1ply 1.07, 3ply 1.13), and the selfhost is within about 2% of it except gbr / gbr+
+(about 4%, varying from run to run).
+
+Kernels (ns, min of 7, `--cpu=x86-64`, selfhost / LLVM): contact_inputs 455 / 446,
+race_inputs 99 / 114, contact_net 369 / 371, race_net 278 / 276, contact_single 418 / 413,
+pruned_single 190 / 187, movegen 804 / 916. What is left in `calculate_half_inputs_with_masks`
+is still the register allocation described above (reloads of long-lived values).
