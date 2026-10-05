@@ -397,6 +397,12 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if u.notnil(x.obj) and u.notnil(w.obj) and (x.obj != w.obj) {
         return false;
     }
+    // a pointer the function was given cannot point into its own stack
+    // slots (they did not exist yet)
+    if (u.notnil(x.obj) and is_inst(x.obj, ir.OP_ALLOCA) and from_param(w.base)) or
+       (u.notnil(w.obj) and is_inst(w.obj, ir.OP_ALLOCA) and from_param(x.base)) {
+        return false;
+    }
     if (private_obj(x.obj) and (w.obj != x.obj)) or (private_obj(w.obj) and (x.obj != w.obj)) {
         return false;
     }
@@ -404,6 +410,17 @@ fn may_alias(x: *Loc, w: *Write) bool {
         return false;
     }
     return true;
+}
+
+// Is p a parameter, or computed from one by offsets?
+fn from_param(p0: *ir.Value) bool {
+    let mut p = p0;
+    let mut n: i32 = 0;
+    while u.notnil(p) and is_inst(p, ir.OP_PTRADD) and (n < 16) {
+        p = p.a;
+        n += 1;
+    }
+    return u.notnil(p) and (p.kind == ir.V_PARAM);
 }
 
 fn push_write(kind: i32, l: Loc) void {
@@ -1340,6 +1357,11 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     }
     if u.isnil(x) {
         return bound >= 0;  // 0 <= y + bound
+    }
+    if small_k(x) and (y.ty.kind == ir.T_INT) and (y.ty.bits <= 64) {
+        // k <= y + bound: y >= k - bound
+        let need = kv(x) - bound;
+        return (need <= 0) or ((need < 0x1_0000_0000) and known_at_least(y, need));
     }
     if (depth > 5) or (prove_budget <= 0) {
         return false;
@@ -2496,9 +2518,340 @@ pub fn gvn(f: *mut ir.Func) bool {
     escapes(f);
     walk(order.get(0));
     pop_to(0);
+    ir.apply_forwarding(f);
+    pre_loads(f, &order);
     u.free(@ptr_cast(*mut void, order.data));
     ir.apply_forwarding(f);
     return changed;
+}
+
+// -----------------------------------------------------------------------------
+// Loads at joins (partial redundancy): a load at the start of a block (no
+// write to its location before it there) whose value each predecessor knows
+// at its end (stored or loaded there, nothing possibly writing the location
+// since) is a phi of those values; when one predecessor does not know it,
+// the load moves there (onto the edge), so the paths that know it do not
+// load again: `if a[1] > a[0] { a[1] = a[0] }` then `a[1]` again, or a
+// vector's length loaded again after the call that grows it on the rare
+// path. Not across back edges.
+// -----------------------------------------------------------------------------
+struct PrePhi {
+    blk: *mut ir.Block,
+    base: *mut ir.Value,
+    off: i64,
+    ty: *mut ir.Ty,
+    val: *mut ir.Value,
+}
+
+let mut pre_phis: u.List.[PrePhi] = u.List.[PrePhi].{ data: @ptr_from_int(*mut PrePhi, 0), len: 0, cap: 0 };
+
+// The value at l (of type t) at the start of b is v (nil: not known).
+fn set_pre(b: *mut ir.Block, l: *Loc, t: *mut ir.Ty, v: *mut ir.Value) void {
+    for k in 0..pre_phis.len {
+        let e = pre_phis.at(k);
+        if (e.blk == b) and (e.base == l.base) and (e.off == l.off) and (e.ty == t) {
+            e.val = v;
+            return;
+        }
+    }
+    pre_phis.push(PrePhi.{ blk: b, base: l.base, off: l.off, ty: t, val: v });
+}
+
+// Does instruction x possibly write l?
+fn writes_loc(x: *mut ir.Value, l: *Loc) bool {
+    let h = writes.len;
+    note_writes(x);
+    let mut hit = false;
+    for w in h..writes.len {
+        if may_alias(l, writes.at(w)) {
+            hit = true;
+        }
+    }
+    writes.len = h;
+    return hit;
+}
+
+// The value at l (of type t) at the end of block p, or nil: from a store or
+// load of it there (or in the blocks before p while each has one
+// successor... while p has one predecessor), with nothing writing it since.
+fn value_at_end(p0: *mut ir.Block, l: *Loc, t: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let mut p = p0;
+    let mut budget: i32 = 400;
+    let mut hops: i32 = 0;
+    loop {
+        let mut x = p.last;
+        while u.notnil(x) {
+            budget -= 1;
+            if budget <= 0 {
+                return vnil();
+            }
+            if (x.op == ir.OP_STORE) and (x.flags == 0) {
+                let sl = loc_of(x.b, @bit_cast(i64, x.a.ty.size));
+                if (sl.base == l.base) and (sl.off == l.off) and (x.a.ty == t) {
+                    return x.a;
+                }
+                // a lane of a vector stored over it
+                let vt = x.a.ty;
+                if (sl.base == l.base) and (vt.kind == ir.T_VEC) and (vt.elem == t) and
+                   (@as(u64, @bit_cast(u32, t.bits)) == (t.size * 8)) and (l.off >= sl.off) and
+                   ((l.off + l.size) <= (sl.off + sl.size)) and (((l.off - sl.off) % l.size) == 0) {
+                    ir.at_before(B, x.next);
+                    return ir.extract_elem(B, x.a, @bit_cast(u64, (l.off - sl.off) / l.size));
+                }
+            } else if (x.op == ir.OP_LOAD) and (x.flags == 0) and (x.ty == t) {
+                let ll = loc_of(x.a, @bit_cast(i64, t.size));
+                if (ll.base == l.base) and (ll.off == l.off) {
+                    return x;
+                }
+            }
+            if writes_loc(x, l) {
+                return vnil();
+            }
+            x = x.prev;
+        }
+        for k in 0..pre_phis.len {
+            let e = pre_phis.at(k);
+            if (e.blk == p) and (e.base == l.base) and (e.off == l.off) and (e.ty == t) {
+                return e.val;  // (nil: not known)
+            }
+        }
+        if (p.preds.len >= 2) and (depth < 8) {
+            return value_at_join(p, l, t, depth + 1);
+        }
+        if (p.preds.len != 1) or (hops >= 8) {
+            return vnil();
+        }
+        let q = p.preds.get(0);
+        if (q.rpo < 0) or (q.rpo >= p.rpo) {
+            return vnil();
+        }
+        p = q;
+        hops += 1;
+    }
+}
+
+// The value at l at the start of join b when each predecessor knows it at
+// its end: theirs, or a phi of them made there; else nil.
+fn value_at_join(b: *mut ir.Block, l: *Loc, t: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let np = b.preds.len;
+    if (np > 4) or not avail_over(l.base, b) {
+        return vnil();
+    }
+    for k in 0..pre_phis.len {
+        let e = pre_phis.at(k);
+        if (e.blk == b) and (e.base == l.base) and (e.off == l.off) and (e.ty == t) {
+            return e.val;  // (nil: not known)
+        }
+    }
+    let r = join_value(b, l, t, depth);
+    pre_phis.push(PrePhi.{ blk: b, base: l.base, off: l.off, ty: t, val: r });
+    return r;
+}
+
+fn join_value(b: *mut ir.Block, l: *Loc, t: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let np = b.preds.len;
+    let mut vs: [4]*mut ir.Value = [vnil(), vnil(), vnil(), vnil()];
+    for k in 0..np {
+        let p = b.preds.get(k);
+        if (p.rpo < 0) or (p.rpo >= b.rpo) {
+            return vnil();
+        }
+        for j in 0..k {
+            if b.preds.get(j) == p {
+                return vnil();
+            }
+        }
+        let v = value_at_end(p, l, t, depth);
+        if u.isnil(v) {
+            return vnil();
+        }
+        vs[k] = v;
+    }
+    let mut same = true;
+    for k in 1..np {
+        if vs[k] != vs[0] {
+            same = false;
+        }
+    }
+    if same {
+        return vs[0];
+    }
+    return make_phi(b, t, vs[0..np]);
+}
+
+// A phi in b of vs (from b's predecessors in order): one already there with
+// those incoming values, or a new one.
+fn make_phi(b: *mut ir.Block, t: *mut ir.Ty, vs: []*mut ir.Value) *mut ir.Value {
+    let np = b.preds.len;
+    let mut ph = b.first;
+    while u.notnil(ph) and (ph.op == ir.OP_PHI) {
+        if (ph.ty == t) and (ph.xs.len == np) {
+            let mut eq = true;
+            for k in 0..np {
+                let mut found = false;
+                for j in 0..np {
+                    if (ph.bs.get(j) == b.preds.get(k)) and (ir.resolve(ph.xs.get(j)) == vs[k]) {
+                        found = true;
+                    }
+                }
+                if not found {
+                    eq = false;
+                }
+            }
+            if eq {
+                return ph;
+            }
+        }
+        ph = ph.next;
+    }
+    ir.at_before(B, b.first);
+    let r = ir.phi(B, t);
+    for k in 0..np {
+        ir.add_incoming(r, vs[k], b.preds.get(k));
+    }
+    changed = true;
+    return r;
+}
+
+// Is v available at the end of every predecessor of b (not defined in b,
+// and in a block dominating it)?
+fn avail_over(v: *mut ir.Value, b: *mut ir.Block) bool {
+    if v.kind != ir.V_INST {
+        return true;
+    }
+    return u.notnil(v.blk) and (v.blk != b) and (v.blk.rpo >= 0) and opt.dominates(v.blk, b);
+}
+
+fn pre_loads(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
+    pre_phis.clear();
+    let vals = u.newn.[*mut ir.Value](8);
+    for oi in 0..order.len {
+        let b = order.get(oi);
+        let np = b.preds.len;
+        if (np < 2) or (np > 4) {
+            continue;
+        }
+        let mut fwd = true;
+        for k in 0..np {
+            let p = b.preds.get(k);
+            if (p.rpo < 0) or (p.rpo >= b.rpo) {
+                fwd = false;
+            }
+            for j in 0..k {
+                if b.preds.get(j) == p {
+                    fwd = false;  // (two edges from one block)
+                }
+            }
+        }
+        if not fwd {
+            continue;
+        }
+        let mut i = b.first;
+        let mut seen: i32 = 0;
+        while u.notnil(i) and (seen < 64) {
+            let next = i.next;
+            seen += 1;
+            if (i.op == ir.OP_LOAD) and (i.flags == 0) and ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and
+               (i.ty.bits <= 64) {
+                pre_load(f, b, i, vals);
+            }
+            i = next;
+        }
+    }
+}
+
+fn pre_load(f: *mut ir.Func, b: *mut ir.Block, i: *mut ir.Value, vals: []mut *mut ir.Value) void {
+    let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+    if not avail_over(l.base, b) {
+        return;
+    }
+    // nothing before i in b writes l
+    let mut x = b.first;
+    while x != i {
+        if writes_loc(x, &l) {
+            return;
+        }
+        x = x.next;
+    }
+    let np = b.preds.len;
+    let mut missing: i32 = -1;
+    for k in 0..np {
+        let v = value_at_end(b.preds.get(k), &l, i.ty, 0);
+        vals[k] = v;
+        if u.isnil(v) {
+            if missing >= 0 {
+                return;
+            }
+            missing = @int_cast(i32, k);
+        }
+    }
+    if (missing >= 0) and (np < 2) {
+        return;
+    }
+    if missing >= 0 {
+        // the load on the edge from that predecessor
+        let p = b.preds.get(@int_cast(usize, missing));
+        let t = ir.terminator(p);
+        let mut at = p;
+        if ir.succ_count(t) != 1 {
+            let mut n: i32 = 0;
+            for k in 0..ir.succ_count(t) {
+                if ir.succ(t, k) == b {
+                    n += 1;
+                }
+            }
+            if n != 1 {
+                return;
+            }
+            at = ir.append_block(f, "pre");
+            at.rpo = -1;
+            let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+            br.t1 = b;
+            ir.append_inst(at, br);
+            for k in 0..ir.succ_count(t) {
+                if ir.succ(t, k) == b {
+                    ir.set_succ(t, k, at);
+                }
+            }
+            let mut ph = b.first;
+            while u.notnil(ph) and (ph.op == ir.OP_PHI) {
+                for k in 0..ph.bs.len {
+                    if ph.bs.get(k) == p {
+                        ph.bs.set(k, at);
+                    }
+                }
+                ph = ph.next;
+            }
+            b.preds.set(@int_cast(usize, missing), at);
+        }
+        ir.at_before(B, ir.terminator(at));
+        let mut addr = i.a;
+        if not avail_over(addr, b) {
+            addr = l.base;
+            if l.off != 0 {
+                addr = ir.ptradd(B, l.base, ir.cint(ir.isz(), @bit_cast(u64, l.off)));
+            }
+        }
+        let ld = ir.load(B, i.ty, addr);
+        ld.align = i.align;
+        vals[@int_cast(usize, missing)] = ld;
+    }
+    if missing < 0 {
+        let mut same = true;
+        for k in 1..np {
+            if vals[k] != vals[0] {
+                same = false;
+            }
+        }
+        if same {
+            set_pre(b, &l, i.ty, vals[0]);
+            replace(i, vals[0]);
+            return;
+        }
+    }
+    let ph = make_phi(b, i.ty, vals[0..np]);
+    set_pre(b, &l, i.ty, ph);
+    replace(i, ph);
 }
 
 // -----------------------------------------------------------------------------
