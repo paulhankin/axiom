@@ -1,7 +1,7 @@
 # 0091: C compiler: LLVM 18 vectorizes with gathers on Skylake-SP/Cascade Lake, where they are slow
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (cd8a2a4, c38fb46)
 - Area: compiler (C)
 
 With `--target=native` the C compiler passes the host CPU (`LLVMGetHostCPUName()`,
@@ -22,3 +22,22 @@ Approach: add `+prefer-no-gather` (and `+prefer-no-scatter`) for the CPUs newer 
 tune that way (Skylake-SP through Tiger Lake; check LLVM's `X86.td` for the list) when the
 CPU comes from the host or `--cpu`, where `codegen.c` makes the target machine and in
 the per-function `target-features` attribute.
+
+## Fixed
+
+cd8a2a4, c38fb46 (`codegen.c`, `x86_tuning_features`): when the processor is
+one of Skylake(-SP) to Tiger Lake (the host's name with `--target=native`, or
+the `skylake`/`icelake-*` `--cpu` presets), `+prefer-no-gather,+prefer-no-scatter`
+are added to the target machine's features and to every function's
+`target-features` attribute. Axiom has no gather builtin, so only LLVM's
+vectorizers are affected. Test: `tests/lowering/x64_no_gather.ax`.
+
+On what LLVM does: no LLVM marks these processors `prefer-no-gather`, not even
+Rust's LLVM 21 (the statement above is wrong). rustc 1.94 with
+`-C target-cpu=cascadelake` still vectorizes an indexed loop
+(`out[i] = t[idx[i]]`) with four gathers, and only `+prefer-no-gather` stops it;
+it keeps the benchmark's hash scalar through its newer cost model, not through tuning.
+So the list is ours: the processors with the Gather Data Sampling mitigation.
+
+Measured (the benchmark bc2f24b `bench_kernels` movegen, ns a position, min of 9):
+934.1 -> 888.2 (Rust 843.3). `bench_search` results are unchanged.

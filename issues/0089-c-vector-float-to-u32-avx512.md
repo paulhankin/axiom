@@ -1,7 +1,7 @@
 # 0089: C compiler: vector `@int_from_float` to `u32` is five instructions on AVX-512 where two do
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (4c1d5fc)
 - Area: compiler (C)
 
 ## Today
@@ -78,3 +78,41 @@ signed ones to the plain conversion with the two fix-ups. `tests/run/simd_lanes.
 already compares every lane with the scalar conversion on the edge values
 (±0, -0.5, -1, 2^31, 2^32, ±inf, NaN); an `--emit=asm` check could count the
 instructions, as for 0030.
+
+## Fixed
+
+4c1d5fc (`codegen.c`, `x86_cvtt`): where the function's extensions have a
+whole-vector conversion, `vec_int_from_float` uses it, called unmasked
+(`llvm.x86.avx512.mask.cvtt{ps,pd}2{u,}{dq,qq}.{128,256,512}`, or SSE2's and
+AVX's signed `cvttps2dq` / `cvttpd2dq`):
+
+- unsigned: `select(x >= 0 (ordered), cvt(x), 0)`, which LLVM makes the
+  zero-masked conversion: `vcmpleps k1, zero, x; vcvttps2udq r{k1}{z}, x`;
+- signed: the conversion, then `x >= 2^31` (or 2^63) to the maximum and NaN
+  to 0: `vcmpordps`, `vcmpgeps`, `vcvttps2dq` and two masked moves.
+
+Other widths (8- and 16-bit lanes, vectors wider than the registers, half a
+register of results) keep the clamps. `@swizzle` / `@swizzle2` of float lanes
+use the floating-point permutes (`vpermps`, `vpermt2ps`, `vpermt2pd`); as noted
+above that made no measurable difference.
+
+Tests: `tests/lowering/x64_int_from_float.ax` (no `vminps`, one conversion
+each; the self-hosted compiler passes it too), `tests/run/simd_lanes.ax`
+gains `conversion_widths` (every width x86 converts in one instruction
+against the scalar conversions; checked at `--cpu=x86-64`, `-v3`, `-v4`,
+`-O0` and `-O2`, with both compilers), and `tests/lowering/avx512_whole.ax`
+counts zeroing masks on moves only (the conversion has one now).
+
+Measured (the benchmark bc2f24b `bench_kernels`, ns a position, min of 9
+alternating runs, the machine shared, ±3%): base = the C compiler at bada176,
+fixed = with this and 0091.
+
+| kernel | base | fixed | Rust |
+|---|---|---|---|
+| contact net | 382.3 | 372.4 | 369.7 |
+| race net | 284.4 | 275.7 | 272.9 |
+| pruned boards | 61.0 | 58.6 | 54.2 |
+| contact single | 409.9 | 401.1 | 439.9 |
+
+The checksums are unchanged and the benchmark's `bench_search` results stay
+bit-identical to Rust's in every mode.
