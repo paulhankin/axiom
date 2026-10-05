@@ -608,6 +608,32 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
     for bi in 1..order.len {
         let b = order.get(bi);
         let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
+           (copy_cost(b) <= MAX_COPY) and not loop_header(b) {
+            // a switch on a value known on the edge from P: P goes to the case
+            for k in 0..b.preds.len {
+                let p = b.preds.get(k);
+                if (p == b) or (p.rpo < 0) {
+                    continue;
+                }
+                let c = eval(t.a, b, p, 0);
+                if u.isnil(c) {
+                    continue;
+                }
+                let s = switch_target(t, c);
+                if s == b {
+                    continue;
+                }
+                outside_uses(b);
+                thread(f, b, p, s, false);
+                done = true;
+                break;
+            }
+            if done {
+                break;
+            }
+            continue;
+        }
         if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) or (b.preds.len < 2) {
             continue;
         }
@@ -660,6 +686,28 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
     return done;
 }
 
+// The block switch t goes to for the constant c.
+fn switch_target(t: *ir.Value, c: *ir.Value) *mut ir.Block {
+    let m = ir.mask_bits(c.ty.bits);
+    for k in 0..t.xs.len {
+        if (ir.cint_val(t.xs.get(k)) & m) == (ir.cint_val(c) & m) {
+            return t.bs.get(k);
+        }
+    }
+    return t.t1;
+}
+
+// Is b a loop header (a predecessor it dominates)?
+fn loop_header(b: *mut ir.Block) bool {
+    for k in 0..b.preds.len {
+        let p = b.preds.get(k);
+        if (p.rpo >= 0) and opt.dominates(b, p) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // B (ending in t) branches on a phi of its own whose input from P is a
 // condition P computes, and P only goes to B: P can branch on it itself,
 // through a copy of B (tail duplication). The conditions of `legal = a < 2`
@@ -691,6 +739,15 @@ fn candidates(f: *mut ir.Func) bool {
     let mut b = f.first.next;
     while u.notnil(b) {
         let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
+           (copy_cost(b) <= MAX_COPY) {
+            for k in 0..b.preds.len {
+                let p = b.preds.get(k);
+                if (p != b) and u.notnil(eval(t.a, b, p, 0)) {
+                    return true;
+                }
+            }
+        }
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (b.preds.len >= 2) and
            (t.a.kind == ir.V_INST) and (copy_cost(b) <= MAX_COPY) {
             for k in 0..b.preds.len {
