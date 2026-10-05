@@ -1165,6 +1165,25 @@ fn gen_alu(v: *mut ir.Value) void {
         i.cc = k;
         return;
     }
+    if ((o == ir.OP_XOR) or (o == ir.OP_OR)) and ((v.ty.bits == 32) or (v.ty.bits == 64)) and not is_c(a) and
+       not is_c(b) and not folded_load(a) and not folded_load(b) and (btx_part(a, v) or btx_part(b, v)) {
+        // x ^ (1 << k): btc d, k; x | (1 << k): bts d, k
+        let mut s = b;
+        let mut x = a;
+        if btx_part(a, v) {
+            s = a;
+            x = b;
+        }
+        let rx = reg(x);
+        copy(d, rx, GPR);
+        hint(d, rx);
+        let i = e2(xe.BT, sz, RW(d), R(reg(s.b)));
+        i.cc = 1;
+        if o == ir.OP_XOR {
+            i.cc = 3;
+        }
+        return;
+    }
     if (o == ir.OP_MUL) and not is_c(a) and not folded_load(b) and imm_ok(b) and ((cval(b) & (cval(b) - 1)) != 0) {
         // imul d, a, k (three operands: no copy of a)
         _ = e3(xe.IMUL_I, sz, W(d), R(reg(a)), I(cval(b)));
@@ -1681,6 +1700,16 @@ const F_BLS: i32 = 262144;     // an x - 1 or 0 - x that its only user (x & or ^
 const F_BSR: i32 = 1048576;    // a ctlz whose users are all k - it or it + k: holds bsr(x) instead (no LZCNT)
 const F_BT: i32 = 2097152;     // a 1 << k that its only user, an and tested against 0, computes as bt
 const F_SCALE: i32 = 4194304;  // an x << 1-3 that its only user (an add, or an or of disjoint bits) computes as lea
+const F_BTX: i32 = 8388608;    // a 1 << k that its only user, an xor or or, computes as btc or bts
+
+// Is s a 1 << k that v (an xor or or) computes as btc or bts: one it
+// computes alone (F_BTX), or one computed for other users too?
+fn btx_part(s: *mut ir.Value, v: *ir.Value) bool {
+    if not is_inst(s, ir.OP_SHL) or not is_c(s.a) or (cval(s.a) != 1) or is_c(s.b) or (s.ty != v.ty) {
+        return false;
+    }
+    return ((s.flag & F_BTX) != 0) or ((s.uses > 1) and ((s.flag & ~F_BSR) == 0));
+}
 
 // Is v a 1 << k in block b used only there (by an and, see F_BT)?
 fn one_shl(v: *mut ir.Value, b: *mut ir.Block) bool {
@@ -6582,7 +6611,7 @@ fn gen_inst_at(v: *mut ir.Value) void {
         gen_remat(v);
         return;
     }
-    if (v.flag & (((((((16 | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE)) != 0 {
+    if (v.flag & ((((((((16 | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | F_BTX)) != 0 {
         return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
     if (v.flag & 64) != 0 {
@@ -7226,6 +7255,24 @@ fn prepare(f: *mut ir.Func) void {
             }
             b = b.next;
         }
+    }
+    // x ^ (1 << k) and x | (1 << k) as btc and bts, the shift used only there
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ((i.op == ir.OP_XOR) or (i.op == ir.OP_OR)) and (i.ty.kind == ir.T_INT) and
+               ((i.ty.bits == 32) or (i.ty.bits == 64)) and not is_c(i.a) and not is_c(i.b) and (i.a != i.b) and
+               ((i.flag & ((4 | 8) | F_RMW)) == 0) and not folded_load(i.a) and not folded_load(i.b) {
+                if one_shl(i.b, b) and (i.b.ty == i.ty) {
+                    i.b.flag = i.b.flag | F_BTX;
+                } else if one_shl(i.a, b) and (i.a.ty == i.ty) {
+                    i.a.flag = i.a.flag | F_BTX;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
     }
     // ~y & x on vectors of up to 256 bits as pandn, the `not` used only there
     // (AVX-512 forms of and-not are blends and ternary logic: see sel_parts)
@@ -10064,8 +10111,9 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.BT {
-        // [REX] 0F A3 /r: bt r/m, r
-        enc_op(i.sz, 2, 0x0f, 0xa3, P(i.ops[1].reg), i.ops[0], 0, false);
+        // [REX] 0F A3 /r: bt r/m, r (cc 1: bts 0F AB, 2: btr 0F B3, 3: btc 0F BB)
+        let opc: [4]u8 = [0xa3, 0xab, 0xb3, 0xbb];
+        enc_op(i.sz, 2, 0x0f, opc[@int_cast(usize, i.cc & 3)], P(i.ops[1].reg), i.ops[0], 0, false);
         return;
     }
     if op == xe.CRC32 {
