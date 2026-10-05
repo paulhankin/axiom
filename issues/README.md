@@ -38,7 +38,7 @@ they travel with the code they describe.
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
-| [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
+| [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
 
 ## Closed
 
@@ -105,6 +105,7 @@ they travel with the code they describe.
 | [0070](0070-selfhost-copies-around-reloads.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: copies after reloads and rematerialized arguments, call arguments shuffled (fixed in d5130b0, 30d8bc2, 106658d) |
 | [0071](0071-selfhost-half-inputs-remaining.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: what is left in the benchmark's contact half-inputs (fixed in d5130b0, 30d8bc2, 106658d) |
 | [0078](0078-selfhost-half-inputs-idioms.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: idioms left in the benchmark's contact half-inputs (bswap, byte compares, kortest) (fixed in b42340e) |
+| [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 (fixed in part in 14c2504: rematerialized values split, phi operations sunk; the rest in 0094) |
 | [0072](0072-selfhost-sse2-shuffles.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without AVX: constant shuffles through memory (fixed in b2dccf2) |
 | [0073](0073-selfhost-outlining-inline-helpers.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: inline helpers' hot bodies outlined as cold functions (fixed in 4b49fd9) |
 | [0074](0074-selfhost-piecewise-slots-and-slot-copies.md) | feature | compiler (selfhost: copies, x64) | Self-hosted optimizer: copies out of slots filled piece by piece, and whole-slot copies between locals (fixed in 7810756, 6e9b5ac) |
