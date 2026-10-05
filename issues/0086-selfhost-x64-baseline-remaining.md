@@ -80,3 +80,28 @@ compiler and the selfhost, before and after these changes): they check
 `@target_has` at compile time to choose which results to expect, while the
 kernels are chosen at run time. That is the port's tests, not a compiler
 bug.
+
+## After 0106-0112
+
+Items 1 and 3 are done (0110 inlines `hitting_shots_not_on_bar`; 0109 folds
+`half_point_sums_simd128`'s constant masks, and its accumulators no longer spill). Also
+fixed: lane inserts through the stack (0106), branches for floats chosen between constants
+(0108, `race_inputs` now faster than LLVM's and Rust's), the zero test of `bsf` in loops
+over set bits (0111), and twelve masks held to the end of their block before being stored
+(0112, part of item 2).
+
+Kernels at `--cpu=x86-64` (ns per position, min of 9, loaded machine):
+
+| kernel | before | after | LLVM |
+|---|---|---|---|
+| contact_inputs | 488 | 458 | 448 |
+| race_inputs | 137 | 97 | 114 |
+
+What is left of item 2 is the register allocator's: in `calculate_half_inputs_with_masks`
+(both hitting-shot functions inlined) long-lived values used everywhere (the hitters `e`,
+the stack argument `blot_mask_opp`) lose their registers to short intervals of higher
+weight (reload pieces at the joins of the bar-one loop) and are then reloaded at almost
+every use: 545 frame loads in the function against LLVM's 285, with the same number of
+instructions and branches executed (callgrind). Evicting them only around the interfering
+stretch (region splitting, as LLVM's greedy allocator) is what is needed. Item 4 (code
+placement) and 5 stand.

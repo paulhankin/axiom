@@ -514,16 +514,137 @@ fn is_ci(v: *ir.Value) bool {
     return (v.kind == ir.V_CINT) or ((v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_INT));
 }
 
+// Lane k of an integer vector known at compile time (a constant vector, or
+// a splat of a constant), or nil.
+fn const_lane(v: *mut ir.Value, k: usize) *mut ir.Value {
+    if (v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_VEC) {
+        return ir.czero(v.ty.elem);
+    }
+    if v.kind == ir.V_CAGG {
+        let x = v.xs.get(k);
+        if is_ci(x) {
+            return x;
+        }
+        return vnil();
+    }
+    if (v.kind == ir.V_INST) and (v.op == ir.OP_SPLAT) and is_ci(v.a) {
+        return v.a;
+    }
+    return vnil();
+}
+
+// An integer vector operation or comparison of constant lanes, folded lane by
+// lane (the masks and point numbers of an unrolled loop over constant
+// vectors), or nil.
+fn fold_vec(i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    let at = i.a.ty;
+    if (at.kind != ir.T_VEC) or (at.elem.kind != ir.T_INT) or (at.elem.bits > 64) or (i.ty.kind != ir.T_VEC) {
+        return vnil();
+    }
+    let n = @as(usize, @bit_cast(u32, at.lanes));
+    if (n == 0) or u.isnil(const_lane(i.a, 0)) or u.isnil(const_lane(i.b, 0)) {
+        return vnil();
+    }
+    let xs = u.newn.[*mut ir.Value](n);
+    for k in 0..n {
+        let x = const_lane(i.a, k);
+        let y = const_lane(i.b, k);
+        if u.isnil(x) or u.isnil(y) {
+            return vnil();
+        }
+        if op == ir.OP_ICMP {
+            let mut r: u64 = 0;
+            if ir.cint_val(ir.icmp(FB, @truncate(i32, @bit_cast(i64, i.cv)), x, y)) != 0 {
+                r = ir.mask_bits(i.ty.elem.bits);
+            }
+            xs[k] = ir.cint(i.ty.elem, r);
+        } else {
+            let r = ir.fold_int_bin(op, at.elem, x, y);
+            if u.isnil(r) {
+                return vnil();
+            }
+            xs[k] = r;
+        }
+    }
+    return ir.cagg(i.ty, xs[0..n]);
+}
+
+fn cfp_val(v: *ir.Value, out: *mut f64) bool {
+    if v.kind == ir.V_CFP {
+        out.* = v.fv;
+        return true;
+    }
+    if (v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_FLOAT) {
+        out.* = 0.0;
+        return true;
+    }
+    return false;
+}
+
+// + - * / of two float constants, computed in the type's own precision (an
+// f32 operation in f32, rounded once as at run time; a division by a
+// constant of a count that is itself constant on a path). Not for NaNs,
+// whose payloads the target decides.
+fn fold_float_bin(i: *mut ir.Value) *mut ir.Value {
+    let mut a: f64 = 0.0;
+    let mut b: f64 = 0.0;
+    if not cfp_val(i.a, &mut a) or not cfp_val(i.b, &mut b) or (a != a) or (b != b) {
+        return vnil();
+    }
+    let op = i.op;
+    let mut r: f64 = 0.0;
+    if i.ty.bits == 32 {
+        let x = @float_cast(f32, a);
+        let y = @float_cast(f32, b);
+        let mut z: f32 = 0.0;
+        if op == ir.OP_FADD {
+            z = x + y;
+        } else if op == ir.OP_FSUB {
+            z = x - y;
+        } else if op == ir.OP_FMUL {
+            z = x * y;
+        } else {
+            z = x / y;
+        }
+        r = @float_cast(f64, z);
+    } else if i.ty.bits == 64 {
+        if op == ir.OP_FADD {
+            r = a + b;
+        } else if op == ir.OP_FSUB {
+            r = a - b;
+        } else if op == ir.OP_FMUL {
+            r = a * b;
+        } else {
+            r = a / b;
+        }
+    } else {
+        return vnil();
+    }
+    if r != r {
+        return vnil();
+    }
+    return ir.cfp(i.ty, r);
+}
+
 // A constant for i, or nil.
 fn fold(i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let B = FB;
     ir.at_before(B, i);
+    if ((op >= ir.OP_ADD) and (op <= ir.OP_ASHR)) or (op == ir.OP_ICMP) {
+        if (i.ty.kind == ir.T_VEC) and u.notnil(i.a) and u.notnil(i.b) {
+            return fold_vec(i);
+        }
+    }
     if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) {
         if is_ci(i.a) and is_ci(i.b) {
             return ir.fold_int_bin(op, i.ty, i.a, i.b);
         }
         return vnil();
+    }
+    if (op >= ir.OP_FADD) and (op <= ir.OP_FDIV) and (i.ty.kind == ir.T_FLOAT) {
+        return fold_float_bin(i);
     }
     if (op == ir.OP_ICMP) and (i.ty.kind == ir.T_INT) and is_ci(i.a) and is_ci(i.b) and (i.a.ty.kind == ir.T_INT) {
         return ir.icmp(B, @truncate(i32, @bit_cast(i64, i.cv)), i.a, i.b);
@@ -549,6 +670,15 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     }
     if op == ir.OP_INSERTELEM {
         return fold_insert(i);
+    }
+    if (op == ir.OP_EXTRACTELEM) and (i.a.ty.kind == ir.T_VEC) and (i.a.ty.elem.kind == ir.T_INT) and
+       (i.cv < @as(u64, @bit_cast(u32, i.a.ty.lanes))) {
+        // a lane of a constant vector (folded lane by lane above)
+        let x = const_lane(i.a, @truncate(usize, i.cv));
+        if u.notnil(x) and (x.ty == i.ty) {
+            return x;
+        }
+        return vnil();
     }
     if op == ir.OP_PHI {
         // all inputs the same (ignoring the phi itself)

@@ -1044,10 +1044,56 @@ fn clz_user(i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// Is phi x, which dominates block b, not zero there: is every value it
+// takes a constant other than zero, or one its incoming edge is taken only
+// when it is not zero (the loop `while m != 0 { .. m &= m - 1 }` rotated:
+// the test before it and the one at its end)?
+fn nonzero_phi(x: *mut ir.Value, b: *mut ir.Block) bool {
+    let pb = x.blk;
+    let mut w = b;
+    let mut k: i32 = 0;
+    while (w != pb) and (k < 16) {
+        w = w.idom;
+        if u.isnil(w) {
+            return false;
+        }
+        k += 1;
+    }
+    if w != pb {
+        return false;
+    }
+    for j in 0..x.xs.len {
+        let v = ir.resolve(x.xs.get(j));
+        if is_c(v) {
+            if cval(v) == 0 {
+                return false;
+            }
+            continue;
+        }
+        let p = x.bs.get(j);
+        let t = ir.terminator(p);
+        if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+            return false;
+        }
+        let c = t.a;
+        if not is_inst(c, ir.OP_ICMP) or (ir.resolve(c.a) != v) or not is_c(c.b) or (cval(c.b) != 0) {
+            return false;
+        }
+        let pr = @truncate(i32, @bit_cast(i64, c.cv));
+        if not (((pr == ir.IntNE) and (t.t1 == pb)) or ((pr == ir.IntEQ) and (t.t2 == pb))) {
+            return false;
+        }
+    }
+    return x.xs.len > 0;
+}
+
 // Is x known to be nonzero where block b runs: b is reached only through the
-// side of a branch on x != 0 (or x == 0) where it holds?
+// side of a branch on x != 0 (or x == 0) where it holds (or x is such a phi)?
 fn nonzero_at(x0: *mut ir.Value, b0: *mut ir.Block) bool {
     let x = ir.resolve(x0);
+    if is_inst(x, ir.OP_PHI) and nonzero_phi(x, b0) {
+        return true;
+    }
     let mut w = b0;
     for _k in @as(i32, 0)..16 {
         let p = w.idom;
@@ -1979,6 +2025,30 @@ fn last_use(v: *ir.Value) bool {
     return (v.kind == ir.V_INST) and (v.uses == 1);
 }
 
+// The bits of a scalar float constant (or of a copy of one), into out.
+fn float_bits(x0: *ir.Value, out: *mut u64) bool {
+    let mut x = x0;
+    if is_inst(x, ir.OP_COPY) {
+        x = x.a;
+    }
+    if (x.ty.kind != ir.T_FLOAT) or ((x.ty.bits != 32) and (x.ty.bits != 64)) {
+        return false;
+    }
+    if x.kind == ir.V_ZERO {
+        out.* = 0;
+        return true;
+    }
+    if x.kind != ir.V_CFP {
+        return false;
+    }
+    if x.ty.bits == 32 {
+        out.* = @as(u64, @bit_cast(u32, @float_cast(f32, x.fv)));
+    } else {
+        out.* = @bit_cast(u64, x.fv);
+    }
+    return true;
+}
+
 fn gen_select(v: *mut ir.Value) void {
     let d = vreg(v);
     let cls = class_of(v.ty);
@@ -2052,6 +2122,36 @@ fn gen_select(v: *mut ir.Value) void {
         let i = e4(xe.SSE, 0, W(d), R(rt), R(rf), NONE());
         i.cc = pki(v.ty.bits == 32, xe.VPBLENDMD, xe.VPBLENDMQ);
         i.aux = 1;
+        return;
+    }
+    let mut kt: u64 = 0;
+    let mut kf: u64 = 0;
+    if (v.ty.kind == ir.T_FLOAT) and float_bits(v.b, &mut kt) and float_bits(v.c, &mut kf) {
+        // one of two constants: picked as integers (cmov) and moved over,
+        // not a branch (which mispredicts when the condition follows the
+        // data: the 0.0 or 1.0 of a feature)
+        let sz = @truncate(u8, @bit_cast(u64, v.ty.size));
+        let g = vgpr();
+        let gt = vgpr();
+        _ = e2(xe.MOV_RI, sz, W(g), I(@bit_cast(i64, kf)));
+        _ = e2(xe.MOV_RI, sz, W(gt), I(@bit_cast(i64, kt)));
+        let cc = cond_code(v.a);
+        if cc >= 0 {
+            let i = e2(xe.CMOV, sz, RW(g), R(gt));
+            i.cc = cc;
+        } else if cc == -1 {
+            let skip = new_label();
+            jcc(xe.CC_P, skip);
+            let i = e2(xe.CMOV, sz, RW(g), R(gt));
+            i.cc = xe.CC_E;
+            place(skip);
+        } else {
+            let i = e2(xe.CMOV, sz, RW(g), R(gt));
+            i.cc = xe.CC_NE;
+            let j = e2(xe.CMOV, sz, RW(g), R(gt));
+            j.cc = xe.CC_P;
+        }
+        _ = sse2(pki(sz == 4, xe.MOVD_XR, xe.MOVQ_XR), W(d), R(g));
         return;
     }
     // floats and vectors: a branch around the move
@@ -3485,6 +3585,13 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             i.cc = 2;
             return;
         }
+        if (bits < 32) or nonzero_at(a0, v.blk) {
+            // bsf alone: x is not zero (a bit set above a narrow x, or a
+            // loop over the set bits of a mask)
+            let i = e2(xe.BITSCAN, sz, W(d), R(x));
+            i.cc = 0;
+            return;
+        }
         let w = vgpr();
         _ = e2(xe.MOV_RI, 4, W(w), I(@as(i64, sz) * 8));
         let i = e2(xe.BITSCAN, sz, W(d), R(x));
@@ -4460,6 +4567,17 @@ fn extract_lane(v: *mut ir.Value, d: i32, a: i32, t: *ir.Ty, lane: i64) void {
 }
 
 fn gen_insert(v: *mut ir.Value) void {
+    if (v.ty.size == 16) and (v.cv == 0) and is_vzero(v.a) and not lane_float(v.ty) and
+       ((lane_bits(v.ty) == 32) or (lane_bits(v.ty) == 64)) {
+        // an integer into lane 0 of zeros: movd / movq, which zero the rest
+        // (not a zero vector stored, the lane stored over it and the whole
+        // loaded back, a load that waits for both stores)
+        let wl = VL;
+        VL = 0;
+        _ = sse2(pki(lane_bits(v.ty) == 32, xe.MOVD_XR, xe.MOVQ_XR), W(vreg(v)), R(reg(v.b)));
+        VL = wl;
+        return;
+    }
     if AVX and has41() and lane_float(v.ty) and (lane_bits(v.ty) == 32) and (v.cv < 4) and upper_zero(v.a, 8) {
         // into the low 128 bits of a vector zero above them: insertps,
         // which zeroes the register above (VEX and EVEX)
@@ -4565,6 +4683,30 @@ fn insert_lane(d: i32, a: i32, x: i32, t: *ir.Ty, lane: i64) void {
         let di: [4]i64 = [0xe8, 0xe2, 0x84, 0x24];
         let tm = vxmm();
         sse3_i(xe.SHUFPS, tm, x, R(a), ti[@int_cast(usize, lane)]);
+        if lane < 2 {
+            sse3_i(xe.SHUFPS, d, tm, R(a), di[@int_cast(usize, lane)]);
+        } else {
+            sse3_i(xe.SHUFPS, d, a, R(tm), di[@int_cast(usize, lane)]);
+        }
+        return;
+    }
+    if not lane_float(t) and ((b == 64) or ((b == 32) and (lane < 4))) {
+        // the integer into an xmm register (movd / movq), then into its lane
+        // as a float lane would be (shuffles of bits: no arithmetic)
+        let xm = vxmm();
+        _ = sse2(pki(b == 32, xe.MOVD_XR, xe.MOVQ_XR), W(xm), R(x));
+        if b == 64 {
+            if lane == 0 {
+                sse3_i(xe.SHUFPD, d, xm, R(a), 2);  // [x, a1]
+            } else {
+                sse3(xe.PUNPCKLQDQ, d, a, R(xm));  // [a0, x]
+            }
+            return;
+        }
+        let ti: [4]i64 = [0x50, 0x00, 0xf0, 0xa0];
+        let di: [4]i64 = [0xe8, 0xe2, 0x84, 0x24];
+        let tm = vxmm();
+        sse3_i(xe.SHUFPS, tm, xm, R(a), ti[@int_cast(usize, lane)]);
         if lane < 2 {
             sse3_i(xe.SHUFPS, d, tm, R(a), di[@int_cast(usize, lane)]);
         } else {
@@ -7835,8 +7977,8 @@ fn rm_mem_ok(id: i32) bool {
     if (id >= xe.VPMOVM2B) and (id <= xe.KMOVQ_RK) {
         return false;  // (mask registers)
     }
-    if (id == xe.PMOVMSKB) or (id == xe.MOVMSKPS) or (id == xe.MOVMSKPD) or (id == xe.KMOVQ_KR) {
-        return false;
+    if (id == xe.PMOVMSKB) or (id == xe.MOVMSKPS) or (id == xe.MOVMSKPD) or (id == xe.KMOVQ_KR) or (id == xe.PEXTRW) {
+        return false;  // (a register only: 0f c5 has no memory form)
     }
     if (id >= xe.VMOVDQU8_LD) and (id <= xe.VMOVDQU8_ST + 3) {
         return false;

@@ -47,6 +47,13 @@ they travel with the code they describe.
 
 | # | Type | Area | Title |
 |---|------|------|-------|
+| [0106](0106-selfhost-sse2-lane-inserts.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without SSE4.1: integers put into vector lanes through the stack (fixed in COMMIT) |
+| [0107](0107-selfhost-pextrw-memory-operand.md) | bug | compiler (selfhost: x64) | Self-hosted x86-64: a constant vector folded into `pextrw` as a memory operand (SIGILL) (fixed in COMMIT) |
+| [0108](0108-selfhost-float-selects-of-constants.md) | feature | compiler (selfhost: thread, x64) | Self-hosted x86-64 without AVX-512: floats chosen between two constants by branches (fixed in COMMIT) |
+| [0109](0109-selfhost-constant-vector-folding.md) | feature | compiler (selfhost: opt, combine) | Self-hosted optimizer: integer vector operations of constant lanes, and float constant arithmetic, not folded (fixed in COMMIT) |
+| [0110](0110-selfhost-sroa-leaf-limit.md) | feature | compiler (selfhost: sroa, inline) | Self-hosted SROA: aggregates of more than 16 scalars stay in memory (fixed in COMMIT) |
+| [0111](0111-selfhost-ctz-known-nonzero.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without BMI1: trailing zeros of a mask that cannot be zero still test for zero (fixed in COMMIT) |
+| [0112](0112-selfhost-spill-stores-at-exit.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator: a region that only defines a spilled value stores it at its exit (fixed in COMMIT) |
 | [0104](0104-vdso-clock.md) | feature | runtime | Native Linux programs read the clock with a system call, not the vDSO |
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
