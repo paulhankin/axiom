@@ -39,7 +39,6 @@ they travel with the code they describe.
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
-| [0095](0095-selfhost-x64-code-alignment.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: code alignment (functions, loop headers, the JCC erratum) |
 | [0102](0102-c-stack-slot-copies-store-forwarding.md) | feature | compiler (C: codegen) | C compiler: aggregates copied through stack slots whose reloads straddle the stores (store-forwarding stalls) |
 | [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | C compiler: `@bit_cast` between a function pointer and an integer is invalid LLVM IR |
 | [0105](0105-selfhost-one-ply-after-0101.md) | feature | compiler (selfhost: gvn, mach, x64, slp) | Self-hosted x86-64: what is left at 1-ply after 0101 |
@@ -130,6 +129,7 @@ they travel with the code they describe.
 | [0092](0092-selfhost-stack-slot-liveness.md) | feature | compiler (selfhost: slots, passes) | Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space) (fixed in bd0e213) |
 | [0093](0093-prefetch-for-write.md) | feature | language, compiler | `@prefetch` cannot ask for a line to be written (Rust's the benchmark cache uses `_MM_HINT_ET0`): `@prefetch_write` |
 | [0096](0096-selfhost-slp-stores.md) | feature | compiler (selfhost: slp, thread, x64) | Self-hosted x86-64: neighbouring stores of computed values not vectorized (the benchmark's race inputs) (fixed in fbe0dc3; also 0094's items 3 and 4) |
+| [0095](0095-selfhost-x64-code-alignment.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: code alignment (functions, loop headers, the JCC erratum) (fixed in ca18a93, 82fbc4c: knobs for measuring; none on by default, none measurably helps on Cascade Lake) |
 | [0097](0097-selfhost-float-selects-branch.md) | feature | compiler (selfhost: x64, thread, passes) | Self-hosted x86-64: selects of floats are branches, and threading turns `if c { x = k }` runs into branch trees (fixed in 0753e8d) |
 | [0098](0098-selfhost-block-bounds-facts.md) | feature | compiler (selfhost: gvn) | Self-hosted optimizer: bounds checks of a block after a test that it fits (fixed in 0753e8d) |
 | [0099](0099-selfhost-global-alignment-checks.md) | feature | compiler (selfhost: combine) | Self-hosted optimizer: atomics on globals check their alignment at run time (fixed in 0753e8d) |

@@ -1,7 +1,7 @@
 # 0095: Self-hosted x86-64: code alignment (functions, loop headers, the JCC erratum)
 
 - Type: feature (performance)
-- Status: fixed (COMMITS): the knobs and the measurement are in; none is on by default, as none measurably helps (below)
+- Status: fixed (ca18a93, 82fbc4c): the knobs and the measurement are in; none is on by default, as none measurably helps (below)
 - Area: compiler (selfhost: x64, x64enc)
 
 Item 1 of 0094. The self-hosted x86-64 backend aligns each function to 16 bytes and
