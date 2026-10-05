@@ -20,7 +20,8 @@
 // function without a frame is also bracketed by markers (F_MARKER): at its
 // start, and at its end (with F_FRAMELESS), so that a crash in it knows
 // where its return address is (runtime: the first entry after the faulting
-// instruction is one with F_FRAMELESS).
+// instruction is one with F_FRAMELESS). So is the start of a function that
+// sets its frame up only after it (x64.ax: shrink-wrapping).
 // =============================================================================
 import "elf.ax" as elf;
 import "ir.ax" as ir;
@@ -28,6 +29,8 @@ import "util.ax" as u;
 
 pub const F_FRAMELESS: u64 = 1;
 pub const F_MARKER: u64 = 2;
+// (func's calls: an offset with this bit is a call made without the frame)
+pub const CALL_FRAMELESS: u64 = @as(u64, 1) << 63;
 
 pub struct Tab {
     on: bool,
@@ -135,7 +138,7 @@ fn entry(t: *Tab, at: u64, chain: u64, flags: u64) void {
 
 // A function's entries, once its code is at `base` in .text (`size` bytes):
 // `calls` holds pairs of the offset after a call and its MInst.aux.
-pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, calls: []u64) void {
+pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, noframe: []u64, calls: []u64) void {
     if not t.on {
         return;
     }
@@ -144,15 +147,40 @@ pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, calls: []u64) void {
         fl = F_FRAMELESS;
         entry(t, base, t.empty, F_MARKER);
     }
+    // (shrink-wrapped: the stretches [noframe[2i], noframe[2i+1]) run before
+    // the frame is set up, and so do the calls marked CALL_FRAMELESS in them:
+    // calls of traps, which do not return)
+    let mut n: usize = 0;
     let mut k: usize = 0;
-    while (k + 1) < calls.len {
+    let mut end: u64 = 0;  // (the end of the stretch without the frame the calls are in, if any)
+    while ((k + 1) < calls.len) or ((n + 1) < noframe.len) or (end != 0) {
+        let more = (k + 1) < calls.len;
+        let mut at: u64 = 0;
+        if more {
+            at = calls[k] & ~CALL_FRAMELESS;
+        }
+        if (end != 0) and (not more or (end < at)) {
+            entry(t, base + end, t.empty, F_MARKER | F_FRAMELESS);
+            end = 0;
+            continue;
+        }
+        if (end == 0) and ((n + 1) < noframe.len) and (not more or (noframe[n] < at)) {
+            entry(t, base + noframe[n], t.empty, F_MARKER);
+            end = noframe[n + 1];
+            n += 2;
+            continue;
+        }
         let aux = calls[k + 1];
         let mut chain = t.empty;
         if aux != 0 {
             chain = aux - 1;
         }
-        if (aux != 0) or frameless {
-            entry(t, base + calls[k], chain, fl);
+        let mut cf = fl;
+        if (calls[k] & CALL_FRAMELESS) != 0 {
+            cf = F_FRAMELESS;
+        }
+        if (aux != 0) or (cf != 0) {
+            entry(t, base + at, chain, cf);
         }
         k += 2;
     }

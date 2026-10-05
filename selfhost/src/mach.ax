@@ -68,7 +68,8 @@ pub struct MInst {
     spill: i32,  // 1: a reload, 2: a spill store (of `sreg`, slot `sslot`)
     sreg: i32,
     sslot: i32,
-    src: u32,  // the source location of the IR it was made for (ir.src_loc), 0: not known
+    src: u32,    // the source location of the IR it was made for (ir.src_loc), 0: not known
+    keep: bool,  // a copy coalescing leaves (see shrink_wrap)
 }
 
 // The source location new instructions get: instruction selection sets it
@@ -89,7 +90,8 @@ pub struct MBlock {
     live_out: []mut u64,
     start: i32,
     end: i32,
-    offset: u64,  // encoder: code offset
+    offset: u64,    // encoder: code offset
+    noframe: bool,  // runs before the frame is set up (see shrink_wrap)
 }
 
 pub struct Slot {
@@ -130,6 +132,7 @@ pub struct MFunc {
     has_calls: bool,
     level: u.List.[u8],   // how far each vreg has been split (see split)
     vslot: u.List.[i32],  // its spill slot, shared by the pieces of a split vreg (-1: none yet)
+    noframe_regs: u64,    // registers the noframe blocks must not use (shrink_wrap)
 }
 
 pub fn new_func() *mut MFunc {
@@ -468,7 +471,7 @@ fn edge_probs(f: *MFunc, cold: []bool, inner: []i32, loops: *u.List.[Loop], b: u
     }
 }
 
-fn block_freqs(f: *mut MFunc) void {
+pub fn block_freqs(f: *mut MFunc) void {
     let nb = f.blocks.len;
     if nb == 0 {
         return;
@@ -911,6 +914,13 @@ fn build_fixed(f: *mut MFunc) void {
         for r in @as(usize, 0)..64 {
             if next_use[r] >= 0 {
                 add_fixed(@int_cast(i32, r), b.start, next_use[r]);
+            }
+        }
+        if b.noframe {
+            for r in @as(u32, 0)..64 {
+                if (f.noframe_regs & (@as(u64, 1) << r)) != 0 {
+                    add_fixed(@as(i32, @bit_cast(i32, r)), b.start, b.end);
+                }
             }
         }
     }
@@ -2549,7 +2559,7 @@ fn coalesce(f: *mut MFunc) void {
                     dpos[x] = i.pos;
                 }
             }
-            if i.is_move {
+            if i.is_move and not i.keep {
                 let d = move_dst(i);
                 let sr = move_src(i);
                 if is_vreg(d) and is_vreg(sr) and (d != sr) and
@@ -2682,6 +2692,9 @@ fn coalesce(f: *mut MFunc) void {
 pub fn allocate(f: *mut MFunc, t: *Target) void {
     let mut rounds: i32 = 0;
     block_freqs(f);
+    if debug_ra {
+        dump(f, "before allocation");
+    }
     coalesce(f);
     loop {
         liveness(f);
@@ -2715,6 +2728,9 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
                     f.used_regs = f.used_regs | (@as(u64, 1) << @int_cast(u32, iv[k].reg));
                 }
             }
+            if debug_ra {
+                dump(f, "allocated");
+            }
             return;
         }
         if rounds > 40 {
@@ -2722,6 +2738,236 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
         }
         rewrite_spills(f, t, iv);
     }
+}
+
+// -----------------------------------------------------------------------------
+// Shrink-wrapping: a function that can return early, before it needs its
+// frame (a recursion's base case, a guard), sets the frame up only past that.
+// The blocks reachable from the entry without passing block k (the
+// frameless ones, MBlock.noframe) reach only each other, returns and block k,
+// which only they reach; they make no calls and use no stack and none of
+// `regs` (the callee-saved registers, which block k saves). The values live
+// into block k continue there as new vregs (copies the coalescing keeps, or
+// a constant built again), so that the ones a call clobbers can live in the
+// frameless blocks in registers it does not save. Of the blocks k that
+// qualify, the one whose frameless blocks return most often is taken.
+// Returns k, or -1 when there is none (or no early return). `frame_free` says
+// an instruction needs no frame, `movable` that it is a rematerialized
+// definition (a stack argument's load) that can be made in block k instead,
+// when only later blocks read its value. The target checks again after
+// allocation (a spill in those blocks needs the frame after all).
+// -----------------------------------------------------------------------------
+fn names_vreg(i: *MInst, v: i32) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if ((o.kind == K_REG) and (o.reg == v)) or ((o.kind == K_MEM) and ((o.base == v) or (o.index == v))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn movable_def(f: *MFunc, i: *MInst, movable: fn(*MInst) bool) bool {
+    if not movable(i) {
+        return false;
+    }
+    let d = move_dst(i);
+    return is_vreg(d) and (@ptr_cast(*MInst, f.remat.get(@int_cast(usize, d - VREG0))) == i);
+}
+
+// The blocks reachable from `from` without entering one `stop` marks: mark[b] = tag.
+fn reach(f: *MFunc, from: usize, stop: []i32, stop_tag: i32, mark: []mut i32, tag: i32, stk: *mut u.List.[i32]) void {
+    stk.clear();
+    mark[from] = tag;
+    stk.push(@int_cast(i32, from));
+    while stk.len > 0 {
+        let b = f.blocks.get(@int_cast(usize, stk.pop()));
+        for j in 0..b.succs.len {
+            let s = @int_cast(usize, b.succs.get(j));
+            if (mark[s] != tag) and (stop[s] != stop_tag) {
+                mark[s] = tag;
+                stk.push(@int_cast(i32, s));
+            }
+        }
+    }
+}
+
+pub fn shrink_wrap(f: *mut MFunc, t: *Target, regs: u64, frame_free: fn(*MInst) bool, movable: fn(*MInst) bool,
+                   is_ret: fn(*MInst) bool) i32 {
+    let nb = f.blocks.len;
+    if (nb < 3) or (nb > 1000) {
+        return -1;
+    }
+    let ff = u.newn.[bool](nb + 1);   // needs no frame
+    let ret = u.newn.[bool](nb + 1);  // returns
+    let mut any = false;
+    for bi in 0..nb {
+        ff[bi] = true;
+        ret[bi] = false;
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            if not frame_free(i) and not movable_def(f, i, movable) {
+                ff[bi] = false;
+            }
+            if is_ret(i) {
+                ret[bi] = true;
+            }
+            i = i.next;
+        }
+        if ff[bi] and ret[bi] and (bi > 0) {
+            any = true;
+        }
+    }
+    if not ff[0] or not any {
+        return -1;
+    }
+    block_freqs(f);
+    let body = u.newn.[i32](nb + 1);  // body[b] == k: reachable from block k
+    let pre = u.newn.[i32](nb + 1);   // pre[b] == k: reachable from the entry before block k
+    for bi in 0..nb {
+        body[bi] = -1;
+        pre[bi] = -1;
+    }
+    let mut stk = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    let mut best: i32 = -1;
+    let mut best_fq: f64 = 0.0;
+    for k in @as(usize, 1)..nb {
+        let tag = @int_cast(i32, k);
+        reach(f, k, body[0..nb], -2, body[0..nb], tag, &mut stk);
+        if body[0] == tag {
+            continue;  // (block k reaches the entry: a loop around the whole function)
+        }
+        reach(f, 0, body[0..nb], tag, pre[0..nb], tag, &mut stk);
+        let mut ok = true;
+        let mut fq: f64 = 0.0;
+        for bi in 0..nb {
+            if pre[bi] != tag {
+                continue;
+            }
+            let b = f.blocks.get(bi);
+            if not ff[bi] {
+                ok = false;
+                break;
+            }
+            if ret[bi] {
+                fq += b.freq;
+            }
+            for j in 0..b.succs.len {
+                let s = @int_cast(usize, b.succs.get(j));
+                if (pre[s] != tag) and (s != k) {
+                    ok = false;  // (into the body past block k)
+                }
+            }
+        }
+        // block k is entered only from the frameless blocks
+        for bi in 0..nb {
+            let b = f.blocks.get(bi);
+            for j in 0..b.succs.len {
+                if (@int_cast(usize, b.succs.get(j)) == k) and (pre[bi] != tag) {
+                    ok = false;
+                }
+            }
+        }
+        if ok and (fq > best_fq) {
+            best = tag;
+            best_fq = fq;
+        }
+    }
+    u.free(@ptr_cast(*mut void, stk.data));
+    if best < 0 {
+        return -1;
+    }
+    let k = @int_cast(usize, best);
+    // the frameless blocks again
+    reach(f, k, body[0..nb], -2, body[0..nb], -3, &mut stk);
+    reach(f, 0, body[0..nb], -3, pre[0..nb], -3, &mut stk);
+    liveness(f);
+    let tb = f.blocks.get(k);
+    let nv = nvregs(f);
+    let mut ren = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };  // (old, new) pairs
+    for x in 0..nv {
+        if bget(tb.live_in, x) {
+            ren.push(VREG0 + @int_cast(i32, x));
+            ren.push(new_vreg(f, f.vclass.get(x)));
+        }
+    }
+    // block k and those after it name the new vregs, which block k sets first
+    for bi in 0..nb {
+        if body[bi] != -3 {
+            continue;
+        }
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            let mut j: usize = 0;
+            while j < ren.len {
+                if names_vreg(i, ren.get(j)) {
+                    replace_reg(i, ren.get(j), ren.get(j + 1));
+                }
+                j += 2;
+            }
+            i = i.next;
+        }
+    }
+    let first = tb.first;
+    let mut j: usize = 0;
+    while j < ren.len {
+        let v = ren.get(j);
+        let w = ren.get(j + 1);
+        let x = @int_cast(usize, v - VREG0);
+        let c = f.vclass.get(x);
+        let def = f.remat.get(x);
+        let mut ins = u.nil.[MInst]();
+        if u.notnil(def) {
+            ins = clone_def(def, v, w);
+            set_remat(f, w, ins);
+        } else {
+            ins = t.spill_move(f, w, v, @as(i32, c));
+            ins.keep = true;
+            f.hint.set(@int_cast(usize, w - VREG0), v);
+        }
+        if u.notnil(first) {
+            insert_before(tb, first, ins);
+        } else {
+            append(tb, ins);
+        }
+        j += 2;
+    }
+    // definitions left without a reader in the frameless blocks
+    for bi in 0..nb {
+        if pre[bi] != -3 {
+            continue;
+        }
+        let b = f.blocks.get(bi);
+        b.noframe = true;
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if movable_def(f, i, movable) {
+                let d = move_dst(i);
+                let mut read = false;
+                for bj in 0..nb {
+                    if pre[bj] != -3 {
+                        continue;
+                    }
+                    let mut q = f.blocks.get(bj).first;
+                    while u.notnil(q) {
+                        if (q != i) and names_vreg(q, d) {
+                            read = true;
+                        }
+                        q = q.next;
+                    }
+                }
+                if not read {
+                    remove(b, i);
+                    f.remat.set(@int_cast(usize, d - VREG0), u.nil.[MInst]());
+                }
+            }
+            i = next;
+        }
+    }
+    f.noframe_regs = regs;
+    u.free(@ptr_cast(*mut void, ren.data));
+    return best;
 }
 
 // The physical register for r (a vreg after allocation, or physical).
@@ -2831,15 +3077,27 @@ pub fn dce(f: *mut MFunc, pure: fn(*MInst) bool) void {
 // predecessor done).
 const HOLDS_NONE: i32 = -1000000000;
 const HOLDS_ANY: i32 = -1000000001;
+const HOLDS_COPY: i32 = -500000000;  // minus the position of a copy: the value it copied
 
 // The holdings of registers after instruction i (a reload, a spill store, or
 // anything writing registers); false at a local label (reached by jumps
 // too: nothing known).
-fn holds_step(f: *MFunc, i: *MInst, holds: []mut i32, is_label: fn(*MInst) bool) void {
+fn holds_step(f: *MFunc, i: *MInst, holds: []mut i32, is_label: fn(*MInst) bool, full_copy: fn(*MInst) bool) void {
     if is_label(i) {
         for q in @as(usize, 0)..64 {
             holds[q] = HOLDS_NONE;
         }
+        return;
+    }
+    if (i.spill == 0) and full_copy(i) {
+        // a copy: the destination holds what the source does (a value
+        // named by this copy, if nothing else)
+        let d = @int_cast(usize, phys(f, move_dst(i)));
+        let sr = @int_cast(usize, phys(f, move_src(i)));
+        if holds[sr] == HOLDS_NONE {
+            holds[sr] = HOLDS_COPY - i.pos;
+        }
+        holds[d] = holds[sr];
         return;
     }
     if i.spill != 0 {
@@ -2876,7 +3134,7 @@ fn holds_step(f: *MFunc, i: *MInst, holds: []mut i32, is_label: fn(*MInst) bool)
 // before, in this block or on every path into it: a value kept in its
 // register around a loop that does not touch it) are deleted, and so are
 // spill stores nothing reads before the slot is stored again.
-pub fn drop_reloads(f: *mut MFunc, is_label: fn(*MInst) bool) void {
+pub fn drop_reloads(f: *mut MFunc, is_label: fn(*MInst) bool, full_copy: fn(*MInst) bool) void {
     let nb = f.blocks.len;
     let ins = u.newn.[i32]((nb * 64) + 1);  // per block: what each register holds at its start
     let outs = u.newn.[i32]((nb * 64) + 1);
@@ -2942,7 +3200,7 @@ pub fn drop_reloads(f: *mut MFunc, is_label: fn(*MInst) bool) void {
             }
             let mut i = b.first;
             while u.notnil(i) {
-                holds_step(f, i, cur, is_label);
+                holds_step(f, i, cur, is_label, full_copy);
                 i = i.next;
             }
             for q in @as(usize, 0)..64 {
@@ -2972,6 +3230,12 @@ pub fn drop_reloads(f: *mut MFunc, is_label: fn(*MInst) bool) void {
         let mut i = b.first;
         while u.notnil(i) {
             let next = i.next;
+            if (i.spill == 0) and full_copy(i) and (cur[@int_cast(usize, phys(f, move_dst(i)))] != HOLDS_NONE) and
+               (cur[@int_cast(usize, phys(f, move_dst(i)))] == cur[@int_cast(usize, phys(f, move_src(i)))]) {
+                remove(b, i);  // a copy of a register to one holding the same already
+                i = next;
+                continue;
+            }
             if (i.spill != 0) and not is_label(i) {
                 let r = phys(f, i.sreg);
                 if cur[@int_cast(usize, r)] == i.sslot {
@@ -3010,9 +3274,78 @@ pub fn drop_reloads(f: *mut MFunc, is_label: fn(*MInst) bool) void {
                     }
                 }
             }
-            holds_step(f, i, cur, is_label);
+            holds_step(f, i, cur, is_label, full_copy);
             i = next;
         }
     }
     u.free(@ptr_cast(*mut void, pend.data));
+}
+
+// Debugging (AXIOM_DEBUG_RA): the function's machine code, with virtual
+// registers (v), physical ones (r) and target opcodes as numbers.
+fn dump_reg(r: i32) []u8 {
+    if is_vreg(r) {
+        return u.f1("v%s", u.idec(r - VREG0));
+    }
+    return u.f1("r%s", u.idec(r));
+}
+
+pub fn dump(f: *MFunc, tag: []u8) void {
+    u.eprint(u.f1("== %s\n", tag));
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        let mut s = u.f2("b%s freq %s preds", u.zdec(bi), u.dec(@int_from_float(i64, b.freq * 100.0)));
+        for k in 0..b.preds.len {
+            s = u.f2("%s %s", s, u.idec(b.preds.get(k)));
+        }
+        s = u.f1("%s succs", s);
+        for k in 0..b.succs.len {
+            s = u.f2("%s %s", s, u.idec(b.succs.get(k)));
+        }
+        u.eprint(u.f1("%s\n", s));
+        let mut i = b.first;
+        while u.notnil(i) {
+            let mut l = u.f3("  %s: op%s.%s", u.idec(i.pos), u.idec(i.op), u.idec(i.cc));
+            l = u.f2("%s sz%s", l, u.idec(@as(i32, i.sz)));
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                let mut t: []u8 = "_";
+                if o.kind == K_REG {
+                    t = dump_reg(o.reg);
+                    if (o.role & RD) != 0 {
+                        t = u.f1("%s=", t);
+                    }
+                } else if o.kind == K_IMM {
+                    t = u.f1("#%s", u.dec(o.disp));
+                } else if o.kind == K_MEM {
+                    t = "[";
+                    if o.slot >= 0 {
+                        t = u.f2("%sslot%s", t, u.idec(o.slot));
+                    } else if o.sym >= 0 {
+                        t = u.f2("%ssym%s", t, u.idec(o.sym));
+                    }
+                    if o.base >= 0 {
+                        t = u.f2("%s %s", t, dump_reg(o.base));
+                    }
+                    if o.index >= 0 {
+                        t = u.f3("%s+%s*%s", t, dump_reg(o.index), u.idec(@as(i32, o.scale)));
+                    }
+                    t = u.f2("%s+%s]", t, u.dec(o.disp));
+                } else if o.kind == K_SYM {
+                    t = u.f1("sym%s", u.idec(o.sym));
+                } else if o.kind == K_LABEL {
+                    t = u.f1("L%s", u.idec(o.label));
+                }
+                l = u.f2("%s %s", l, t);
+            }
+            if i.spill != 0 {
+                l = u.f3("%s  ; spill%s slot%s", l, u.idec(i.spill), u.idec(i.sslot));
+            }
+            if i.is_move {
+                l = u.f1("%s  ; move", l);
+            }
+            u.eprint(u.f1("%s\n", l));
+            i = i.next;
+        }
+    }
 }

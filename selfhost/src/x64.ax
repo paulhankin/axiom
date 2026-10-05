@@ -1815,14 +1815,28 @@ fn cond_code(c: *mut ir.Value) i32 {
     return xe.CC_NE;
 }
 
+// Is this (an instruction's only use) the last use of v?
+fn last_use(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.uses == 1);
+}
+
 fn gen_select(v: *mut ir.Value) void {
     let d = vreg(v);
     let cls = class_of(v.ty);
     if cls == GPR {
         // (the copy after the compare, which may read rf for the last time)
-        let rt = imm_reg(v.b);
-        let rf = reg(v.c);
-        let cc = cond_code(v.a);
+        let mut rt = imm_reg(v.b);
+        let mut rf = reg(v.c);
+        let mut cc = cond_code(v.a);
+        if (cc >= 0) and last_use(v.b) and is_inst(v.c, ir.OP_COPY) and ir.is_const(v.c.a) {
+            // the other way round: the value read here for the last time is
+            // overwritten, not a copy of a constant hoisted out of the loop
+            // (which lives on)
+            let t = rt;
+            rt = rf;
+            rf = t;
+            cc = invert(cc);
+        }
         copy(d, rf, GPR);
         if cc >= 0 {
             let i = e2(xe.CMOV, isz(v.ty), RW(d), R(rt));
@@ -6426,6 +6440,19 @@ fn gen_inst_at(v: *mut ir.Value) void {
         copy(vreg(v), sr, class_of(t));
         return;
     }
+    if (o == ir.OP_COPY) and (v.a.kind == ir.V_GLOBAL) and not v.a.gv.tls {
+        // a global's address, hoisted out of a loop (opt.hoist_constants):
+        // built again rather than spilled
+        let d = vreg(v);
+        let mut m = mc.mem_sym(global_sym(v.a.gv), 0);
+        let mut op = xe.LEA;
+        if extern_global(v.a.gv) {
+            m.scale = 99;  // (from the GOT)
+            op = xe.LOAD;
+        }
+        mc.set_remat(MF, d, e2(op, 8, W(d), m));
+        return;
+    }
     if o == ir.OP_COPY {
         copy(vreg(v), reg(v.a), class_of(t));
         return;
@@ -7595,6 +7622,12 @@ fn const_needs_reg(v: *ir.Value) bool {
 
 // Instructions whose only effect is their register result (for mc.dce;
 // not loads: a volatile load must happen).
+// A copy of a whole general purpose register (for mc.drop_reloads).
+fn full_copy(i: *mc.MInst) bool {
+    return (i.op == xe.MOV_RR) and (i.sz == 8) and (i.ops[0].kind == mc.K_REG) and (i.ops[1].kind == mc.K_REG) and
+           (P(i.ops[0].reg) < 16) and (P(i.ops[1].reg) < 16);
+}
+
 fn is_label(i: *mc.MInst) bool {
     return i.op == xe.LABEL;
 }
@@ -7799,6 +7832,291 @@ fn unlink_inst(v: *mut ir.Value) void {
     }
 }
 
+// Physical registers (general purpose and vector: the low 64) that i reads
+// and writes. Instructions whose operands do not list every register they use
+// read them all.
+fn phys_rw(i: *mc.MInst, rd: *mut u64, wr: *mut u64) void {
+    let op = i.op;
+    rd.* = 0;
+    wr.* = i.clobber;
+    if (op == xe.REP) or (op == xe.CPUID) or (op == xe.XGETBV) or (op == xe.LABEL) or (op == xe.PARAM) or
+       (op == xe.VZEROUPPER) or (op == xe.CQO) or (op == xe.DIV) {
+        rd.* = ~@as(u64, 0);
+    }
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and (o.reg >= 0) {
+            let r = P(o.reg);
+            if (r < 0) or (r >= 64) {
+                continue;
+            }
+            let bit = @as(u64, 1) << @int_cast(u32, r);
+            if ((o.role & mc.RU) != 0) or (i.sz < 4) {
+                rd.* = rd.* | bit;  // (an 8- or 16-bit write keeps the rest)
+            }
+            if (o.role & (mc.RD | mc.RE)) != 0 {
+                wr.* = wr.* | bit;
+            }
+        } else if o.kind == mc.K_MEM {
+            let rs: [2]i32 = [o.base, o.index];
+            for x in rs {
+                if x >= 0 {
+                    let r = P(x);
+                    if (r >= 0) and (r < 64) {
+                        rd.* = rd.* | (@as(u64, 1) << @int_cast(u32, r));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A reload of a spilled value, or a stack argument's load, read once
+// before the register dies, by an instruction that can read memory instead:
+// `test r, r`, `cmp r, k`, `cmp/test r, x`, `op x, r` (add, or, and, sub,
+// xor, cmp). That instruction reads the stack itself and the load goes.
+// (After drop_reloads, which may have the register's value read later under
+// another name: liveness here is of physical registers.)
+fn fold_stack_reads() void {
+    let nb = MF.blocks.len;
+    let lin = u.newn.[u64](nb + 1);
+    let lout = u.newn.[u64](nb + 1);
+    let use_s = u.newn.[u64](nb + 1);
+    let def_s = u.newn.[u64](nb + 1);
+    for bi in 0..nb {
+        let mut uu: u64 = 0;
+        let mut dd: u64 = 0;
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            let mut rd: u64 = 0;
+            let mut wr: u64 = 0;
+            phys_rw(i, &mut rd, &mut wr);
+            if (i.op == xe.JCC) or (i.op == xe.JMP) {
+                if i.ops[0].label >= xe.LOCAL_BASE {
+                    rd = ~@as(u64, 0);  // (a jump within the block: anything may be read again)
+                }
+            }
+            uu = uu | (rd & ~dd);
+            dd = dd | wr;
+            i = i.next;
+        }
+        use_s[bi] = uu;
+        def_s[bi] = dd;
+        lin[bi] = 0;
+        lout[bi] = 0;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut bi = nb;
+        while bi > 0 {
+            bi -= 1;
+            let b = MF.blocks.get(bi);
+            let mut o: u64 = 0;
+            for k in 0..b.succs.len {
+                o = o | lin[@int_cast(usize, b.succs.get(k))];
+            }
+            if b.succs.len == 0 {
+                o = ~@as(u64, 0);  // (returns and traps: everything, conservatively)
+            }
+            lout[bi] = o;
+            let n = use_s[bi] | (o & ~def_s[bi]);
+            if n != lin[bi] {
+                lin[bi] = n;
+                changed = true;
+            }
+        }
+    }
+    let mut after = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };  // live after each instruction
+    let mut insts = u.List.[*mut mc.MInst].{ data: u.nil.[*mut mc.MInst](), len: 0, cap: 0 };
+    for bi in 0..nb {
+        let b = MF.blocks.get(bi);
+        let mut again = true;
+        let mut rounds: i32 = 0;
+        while again and (rounds < 8) {
+            again = false;
+            rounds += 1;
+            insts.clear();
+            after.clear();
+            let mut local = false;
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i.op == xe.LABEL) or
+                   (((i.op == xe.JCC) or (i.op == xe.JMP)) and (i.ops[0].label >= xe.LOCAL_BASE)) {
+                    local = true;
+                }
+                insts.push(i);
+                after.push(0);
+                i = i.next;
+            }
+            if local {
+                break;
+            }
+            let mut live = lout[bi];
+            let mut k = insts.len;
+            while k > 0 {
+                k -= 1;
+                after.set(k, live);
+                let mut rd: u64 = 0;
+                let mut wr: u64 = 0;
+                phys_rw(insts.get(k), &mut rd, &mut wr);
+                live = (live & ~wr) | rd;
+            }
+            for li in 0..insts.len {
+                if fold_stack_read(b, insts.items(), after.items(), li) or
+                   forward_copy(b, insts.items(), after.items(), li) {
+                    again = true;  // (the liveness of the block again)
+                    break;
+                }
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, after.data));
+    u.free(@ptr_cast(*mut void, insts.data));
+}
+
+// fold_stack_reads: the load insts[li], into its reader if it can.
+fn fold_stack_read(b: *mut mc.MBlock, insts: []*mut mc.MInst, after: []u64, li: usize) bool {
+    let l = insts[li];
+    if (l.op != xe.LOAD) or (l.ops.len != 2) or (l.cc != 0) or (l.sz != 8) or (l.ops[1].kind != mc.K_MEM) or
+       (l.ops[0].kind != mc.K_REG) {
+        return false;
+    }
+    let m = l.ops[1];
+    if not ((m.slot >= 0) or ((m.base == xe.RBP) and (m.index < 0) and (m.disp > 0))) {
+        return false;  // (a spill slot, or a stack argument: nothing else writes either)
+    }
+    let r = P(l.ops[0].reg);
+    if (r < 0) or (r >= 16) {
+        return false;
+    }
+    let bit = @as(u64, 1) << @int_cast(u32, r);
+    let mut ui = li + 1;
+    while ui < insts.len {
+        let j = insts[ui];
+        let mut rd: u64 = 0;
+        let mut wr: u64 = 0;
+        phys_rw(j, &mut rd, &mut wr);
+        if (rd & bit) != 0 {
+            if ((wr & bit) != 0) or ((after[ui] & bit) != 0) or not fold_read(j, r, m) {
+                return false;
+            }
+            mc.remove(b, l);
+            return true;
+        }
+        if ((wr & bit) != 0) or (j.op == xe.CALL) or writes_slot(j, m) {
+            return false;
+        }
+        ui += 1;
+    }
+    return false;
+}
+
+// fold_stack_reads: a copy insts[li] (b <- a) whose register is only copied
+// again (c <- b) before it dies: c <- a, and the first copy goes. (Call
+// arguments moved through registers that are themselves arguments.)
+fn forward_copy(mb: *mut mc.MBlock, insts: []*mut mc.MInst, after: []u64, li: usize) bool {
+    let c1 = insts[li];
+    if not full_copy(c1) {
+        return false;
+    }
+    let rb = P(c1.ops[0].reg);
+    let ra = P(c1.ops[1].reg);
+    if ra == rb {
+        return false;
+    }
+    let bb = @as(u64, 1) << @int_cast(u32, rb);
+    let ba = @as(u64, 1) << @int_cast(u32, ra);
+    let mut ui = li + 1;
+    while ui < insts.len {
+        let j = insts[ui];
+        let mut rd: u64 = 0;
+        let mut wr: u64 = 0;
+        phys_rw(j, &mut rd, &mut wr);
+        if (rd & bb) != 0 {
+            if not full_copy(j) or ((after[ui] & bb) != 0) or (P(j.ops[1].reg) != rb) {
+                return false;
+            }
+            j.ops[1] = c1.ops[1];  // (a, by its vreg)
+            mc.remove(mb, c1);
+            if P(j.ops[0].reg) == ra {
+                mc.remove(mb, j);
+            }
+            return true;
+        }
+        if ((wr & (ba | bb)) != 0) or (j.op == xe.CALL) {
+            return false;
+        }
+        ui += 1;
+    }
+    return false;
+}
+
+// Does i store to the stack slot (or argument) m?
+fn writes_slot(i: *mc.MInst, m: mc.MOp) bool {
+    if (i.op == xe.LOAD) or (i.op == xe.LEA) or (i.op == xe.TEST) or (i.op == xe.CMP_M) {
+        return false;
+    }
+    if (i.op == xe.ALU) and (i.cc == 7) {
+        return false;
+    }
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_MEM) and (o.slot == m.slot) and ((m.slot >= 0) or (o.base == xe.RBP)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Makes i read memory m where it reads register r (once), if it can.
+fn fold_read(i: *mut mc.MInst, r: i32, m: mc.MOp) bool {
+    let op = i.op;
+    if (op != xe.TEST) and (op != xe.ALU) {
+        return false;
+    }
+    let a = i.ops[0];
+    let b = i.ops[1];
+    if (a.kind != mc.K_REG) or ((b.kind != mc.K_REG) and (b.kind != mc.K_IMM)) {
+        return false;
+    }
+    let ra = P(a.reg);
+    let mut rb: i32 = -1;
+    if b.kind == mc.K_REG {
+        rb = P(b.reg);
+    }
+    if op == xe.TEST {
+        if (ra == r) and (rb == r) {
+            // test r, r: cmp [m], 0
+            i.op = xe.ALU;
+            i.cc = 7;
+            i.ops[0] = m;
+            i.ops[1] = mc.imm(0);
+            return true;
+        }
+        if ra == r {
+            i.ops[0] = m;  // test [m], k / test [m], x
+            return true;
+        }
+        if rb == r {
+            i.ops[1] = i.ops[0];
+            i.ops[0] = m;
+            return true;
+        }
+        return false;
+    }
+    let c = i.cc;
+    if (rb == r) and (ra != r) and ((c == 0) or (c == 1) or (c == 4) or (c == 5) or (c == 6) or (c == 7)) {
+        i.ops[1] = m;  // op x, [m]
+        return true;
+    }
+    if (c == 7) and (ra == r) and (rb != r) {
+        i.ops[0] = m;  // cmp [m], k / cmp [m], x
+        return true;
+    }
+    return false;
+}
+
 // A load into a register that is only copied to another (a stack argument
 // or spilled value reloaded, then moved where it is needed: a call's
 // argument register), with nothing between naming either register, loads
@@ -7937,7 +8255,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
-    opt.hoist_constants(f, &order, const_needs_reg);
+    opt.hoist_constants(f, &order, const_needs_reg, true);
     opt.layout(&mut order);
     opt.sink_compares(f);
     prepare(f);
@@ -8080,9 +8398,16 @@ fn compile_func(f: *mut ir.Func) void {
     PRE_RA = false;
     mc.dce(MF, pure_inst);
     fold_remats();
+    SW = -1;
+    if not WIN {
+        PRE_RA = true;
+        SW = mc.shrink_wrap(MF, &tgt, CALLEE_SAVED, sw_frame_free, sw_movable, is_ret);
+        PRE_RA = false;
+    }
     mc.allocate(MF, &tgt);
     fold_load_copies();
-    mc.drop_reloads(MF, is_label);
+    mc.drop_reloads(MF, is_label, full_copy);
+    fold_stack_reads();
     encode_func(f);
 }
 
@@ -8324,6 +8649,54 @@ fn relax_jumps(boff: []u64) bool {
 // A leaf with nothing on the stack needs no frame.
 let mut frameless: bool = false;
 
+// Shrink-wrapping (mc.shrink_wrap; not on Windows, whose unwind tables
+// describe a prologue at the start): blocks before SW run without the frame,
+// which block SW sets up; in_noframe while they are encoded.
+let mut SW: i32 = -1;
+let mut in_noframe: bool = false;
+const CALLEE_SAVED: u64 = (
+    ((@as(u64, 1) << 3) | (@as(u64, 1) << 12)) | ((@as(u64, 1) << 13) | (@as(u64, 1) << 14))) | (@as(u64, 1) << 15);  // rbx r12-r15
+
+// Does i need no frame: no call, no stack, no callee-saved register?
+fn sw_frame_free(i: *mc.MInst) bool {
+    if (i.clobber != 0) or (i.op == xe.CPUID) or (i.op == xe.REP) {
+        return false;  // (a call that does not return clobbers nothing: a trap's is fine)
+    }
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if o.kind == mc.K_REG {
+            let r = P(o.reg);
+            if (r == xe.RSP) or (r == xe.RBP) or
+               ((r >= 0) and (r < 64) and ((CALLEE_SAVED & (@as(u64, 1) << @int_cast(u32, r))) != 0)) {
+                return false;
+            }
+        } else if o.kind == mc.K_MEM {
+            if o.slot >= 0 {
+                return false;
+            }
+            let rs: [2]i32 = [o.base, o.index];
+            for x in rs {
+                let r = P(x);
+                if (r == xe.RSP) or (r == xe.RBP) or
+                   ((r >= 0) and (r < 64) and ((CALLEE_SAVED & (@as(u64, 1) << @int_cast(u32, r))) != 0)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// A stack argument's load (rematerialized: see compile_func).
+fn sw_movable(i: *mc.MInst) bool {
+    return (i.op == xe.LOAD) and (i.ops.len == 2) and (i.ops[1].kind == mc.K_MEM) and (i.ops[1].base == xe.RBP) and
+           (i.ops[1].disp > 0) and (i.ops[1].index < 0);
+}
+
+fn is_ret(i: *mc.MInst) bool {
+    return i.op == xe.RET;
+}
+
 fn needs_frame() bool {
     if (nsaved > 0) or (nxsaved > 0) or (MF.slots.len > 0) or (out_area != 0) {
         return true;
@@ -8372,7 +8745,7 @@ fn xmm_save_off(k: i64) i64 {
 }
 
 fn epilogue() void {
-    if frameless {
+    if frameless or in_noframe {
         b8(0xc3);
         return;
     }
@@ -8947,7 +9320,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         if UPPER {
             vzeroupper();
         }
-        if frameless {
+        if frameless or in_noframe {
             // sub rsp, 8: the call (which does not return) needs rsp aligned
             b8(0x48);
             b8(0x83);
@@ -9529,10 +9902,16 @@ fn tidy_branches() []mut bool {
     }
     // where a jump to each block ends up
     for bi in 1..nb {
+        if @as(i32, @int_cast(i32, bi)) == SW {
+            continue;  // (where the frame is set up: jumps there stay)
+        }
         let mut t = jump_target(MF.blocks.get(bi));
         let mut steps: usize = 0;
         while (t >= 0) and (steps < nb) {
             fin[bi] = t;
+            if t == SW {
+                break;
+            }
             t = jump_target(MF.blocks.get(@int_cast(usize, t)));
             steps += 1;
         }
@@ -9658,7 +10037,7 @@ fn dup_exit_tests(skip: []bool) void {
             continue;
         }
         let t = @int_cast(usize, l.ops[0].label);
-        if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) {
+        if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) or (l.ops[0].label == SW) {
             continue;
         }
         let ins = few_insts(MF.blocks.get(t), 3);
@@ -9711,7 +10090,7 @@ fn dup_exit_tests(skip: []bool) void {
         }
         let pb = prev;
         prev = bi;
-        if (pb == nb) or (refs[bi] != 0) or ends_flow(MF.blocks.get(pb)) {
+        if (pb == nb) or (refs[bi] != 0) or ends_flow(MF.blocks.get(pb)) or (@as(i32, @int_cast(i32, bi)) == SW) {
             continue;
         }
         let tb = MF.blocks.get(bi);
@@ -9859,6 +10238,28 @@ fn encode_func(f: *mut ir.Func) void {
     }
     let total = (cur + @bit_cast(i64, out_area) + 15) & ~@as(i64, 15);
     let sub = total - (8 * nsaved);
+    frameless = not needs_frame();
+    let mut sw = SW;
+    if frameless or WIN {
+        sw = -1;
+    }
+    if sw >= 0 {
+        for bi in 0..MF.blocks.len {
+            if not MF.blocks.get(bi).noframe {
+                continue;
+            }
+            let mut i = MF.blocks.get(bi).first;
+            while u.notnil(i) {
+                if not sw_frame_free(i) {
+                    sw = -1;  // (spilled there after all)
+                }
+                i = i.next;
+            }
+        }
+    }
+    SW = sw;
+    // (shrink-wrapped: where each run of frameless blocks starts and ends)
+    let mut noframe = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
     let nb = MF.blocks.len;
     let skip = tidy_branches();
     let boff = u.newn.[u64](nb + 1);
@@ -9877,8 +10278,11 @@ fn encode_func(f: *mut ir.Func) void {
         jnext = 0;
         rows.clear();
         calls.clear();
-        frameless = not needs_frame();
-        prologue(sub);
+        noframe.clear();
+        in_noframe = false;
+        if sw < 0 {
+            prologue(sub);
+        }
         let mut last_src = f.src;
         if WIN and (f.src != 0) {
             rows.push(@as(u64, f.src));
@@ -9886,8 +10290,15 @@ fn encode_func(f: *mut ir.Func) void {
         for bi in 0..nb {
             let b = MF.blocks.get(bi);
             boff[bi] = @as(u64, E.b.len());
+            if @as(i32, @int_cast(i32, bi)) == sw {
+                prologue(sub);  // (jumps into the block go here)
+            }
             if skip[bi] {
                 continue;
+            }
+            if (sw >= 0) and (b.noframe != in_noframe) {
+                noframe.push(@as(u64, E.b.len()));
+                in_noframe = b.noframe;
             }
             let mut i = b.first;
             while u.notnil(i) {
@@ -9897,7 +10308,11 @@ fn encode_func(f: *mut ir.Func) void {
                 }
                 enc_inst(i);
                 if FT.on and (i.op == xe.CALL) {
-                    calls.push(@as(u64, E.b.len()));
+                    let mut at = @as(u64, E.b.len());
+                    if in_noframe {
+                        at = at | ft.CALL_FRAMELESS;  // (a call that does not return, before the frame is set up)
+                    }
+                    calls.push(at);
                     calls.push(@bit_cast(u64, i.aux));
                 }
                 i = i.next;
@@ -9907,6 +10322,10 @@ fn encode_func(f: *mut ir.Func) void {
             break;
         }
         E.b.free();
+    }
+    if in_noframe {
+        noframe.push(@as(u64, E.b.len()));
+        in_noframe = false;
     }
     // branch targets
     for k in 0..E.fixups.len {
@@ -9940,7 +10359,8 @@ fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, E.b.len());
-    ft.func(&FT, base, s.size, frameless, calls.items());
+    ft.func(&FT, base, s.size, frameless, noframe.items(), calls.items());
+    u.free(@ptr_cast(*mut void, noframe.data));
     if WIN and not frameless {
         emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
     }

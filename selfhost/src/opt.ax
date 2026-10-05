@@ -1262,7 +1262,9 @@ fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
 // -----------------------------------------------------------------------------
 // Constants in loops: those the target must build in a register (`needs`:
 // 64-bit immediates, floating point constants) are built once in the loop's
-// preheader, by a copy instruction, instead of at every use. Needs
+// preheader, by a copy instruction, instead of at every use. With `globals`,
+// so are the addresses of globals indexed by a variable (a pc-relative
+// operand has no index register: the address is built in one first). Needs
 // dominators and predecessors.
 // -----------------------------------------------------------------------------
 fn same_const(a: *ir.Value, b: *ir.Value) bool {
@@ -1278,7 +1280,7 @@ fn same_const(a: *ir.Value, b: *ir.Value) bool {
     return a == b;
 }
 
-pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value) bool) void {
+pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value) bool, globals: bool) void {
     // headers, outermost first; each block's innermost header in auxp
     let mut headers = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     for i in 0..order.len {
@@ -1371,6 +1373,22 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
             let mut i = b.first;
             while u.notnil(i) {
                 if i.op != ir.OP_PHI {
+                    if globals {
+                        if global_in_reg(i, i.a, 0) {
+                            i.a = hoisted(f, i.a, pt, &mut made, any_value);
+                        }
+                        if global_in_reg(i, i.b, 1) {
+                            i.b = hoisted(f, i.b, pt, &mut made, any_value);
+                        }
+                        if global_in_reg(i, i.c, 2) {
+                            i.c = hoisted(f, i.c, pt, &mut made, any_value);
+                        }
+                        for k in 0..i.xs.len {
+                            if global_in_reg(i, i.xs.get(k), 3) {
+                                i.xs.set(k, hoisted(f, i.xs.get(k), pt, &mut made, any_value));
+                            }
+                        }
+                    }
                     i.a = hoisted(f, i.a, pt, &mut made, needs);
                     i.b = hoisted(f, i.b, pt, &mut made, needs);
                     i.c = hoisted(f, i.c, pt, &mut made, needs);
@@ -1391,6 +1409,25 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
     u.free_slice.[u.List.[*mut ir.Value]](kept);
     u.free(@ptr_cast(*mut void, headers.data));
     u.free(@ptr_cast(*mut void, made.data));
+}
+
+// Is g, operand k of i (0: a, 1: b, 2: c, 3: xs), the address of a (not
+// thread-local) global that i reads from a register? Not the address a load
+// or store goes to, or one with a constant added: those are pc-relative.
+fn global_in_reg(i: *ir.Value, g: *ir.Value, k: i32) bool {
+    if u.isnil(g) or (g.kind != ir.V_GLOBAL) or g.gv.tls {
+        return false;
+    }
+    let o = i.op;
+    if ((o == ir.OP_LOAD) and (k == 0)) or ((o == ir.OP_STORE) and (k == 1)) {
+        return false;
+    }
+    return (o != ir.OP_PTRADD) or (k != 0) or not ir.is_cint(i.b);
+}
+
+fn any_value(v: *ir.Value) bool {
+    _ = v;
+    return true;
 }
 
 // Values `needs` picks (thread-local addresses on AArch64) are built once in
