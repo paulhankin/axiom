@@ -110,7 +110,7 @@ they travel with the code they describe.
 | [0074](0074-selfhost-piecewise-slots-and-slot-copies.md) | feature | compiler (selfhost: copies, x64) | Self-hosted optimizer: copies out of slots filled piece by piece, and whole-slot copies between locals (fixed in 7810756, 6e9b5ac) |
 | [0075](0075-selfhost-tail-recursion.md) | feature | compiler (selfhost: passes) | Self-hosted optimizer: calls of a function itself in tail position stay calls (fixed in 50ef28c) |
 | [0076](0076-selfhost-outlining-in-loops.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: hot loop bodies outlined as cold functions (fixed in 9f11191) |
-| [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) (fixed in part in f38d897: shrink-wrapping, global addresses hoisted; the rest in 0088) |
+| [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) (fixed in part in 635bcd1: shrink-wrapping, global addresses hoisted; the rest in 0088) |
 | [0079](0079-selfhost-sinking-lengthens-lives.md) | bug | compiler (selfhost: gvn) | Self-hosted optimizer: sinking makes operands live instead of results (fixed in d00826d) |
 | [0080](0080-selfhost-ctlz-without-lzcnt.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64 without LZCNT: k - ctlz(x) and the shifts it bounds (fixed in b16d1ee) |
 | [0081](0081-selfhost-regalloc-split-gaps.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator: values split at every block boundary (fixed in 56caaec) |

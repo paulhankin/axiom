@@ -1,7 +1,7 @@
 # 0077: Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits)
 
 - Type: feature (performance)
-- Status: fixed in part (f38d897); the rest in 0088
+- Status: fixed in part (635bcd1); the rest in 0088
 - Area: compiler (selfhost: mach, x64)
 
 Follow-up to 0070. After it, the benchmark's move generator (`src/core/moves.ax`, 100
@@ -34,7 +34,7 @@ hoisted out of it; and a RIP-relative global address used as an indexed base is 
 
 ## Resolution
 
-f38d897, measured on the benchmark's `bench_kernels` (deterministic counts by single-stepping)
+635bcd1, measured on the benchmark's `bench_kernels` (deterministic counts by single-stepping)
 against main before it (7eecc69):
 
 - **Shrink-wrapping** (new, `mach.ax` `shrink_wrap`, x64.ax): the frame is set up only past
