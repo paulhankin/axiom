@@ -40,10 +40,9 @@ they travel with the code they describe.
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
 | [0095](0095-selfhost-x64-code-alignment.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: code alignment (functions, loop headers, the JCC erratum) |
-| [0100](0100-selfhost-inlining-cold-init.md) | feature | compiler (selfhost: inline) | Self-hosted inliner: a one-time initialisation inlined into a hot wrapper keeps the wrapper out of line |
-| [0101](0101-selfhost-one-ply-remaining.md) | feature | compiler (selfhost: combine, slp, x64, mach) | Self-hosted x86-64: what is left at 1-ply against the LLVM-built port |
 | [0102](0102-c-stack-slot-copies-store-forwarding.md) | feature | compiler (C: codegen) | C compiler: aggregates copied through stack slots whose reloads straddle the stores (store-forwarding stalls) |
 | [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | C compiler: `@bit_cast` between a function pointer and an integer is invalid LLVM IR |
+| [0105](0105-selfhost-one-ply-after-0101.md) | feature | compiler (selfhost: gvn, mach, x64, slp) | Self-hosted x86-64: what is left at 1-ply after 0101 |
 
 ## Closed
 
@@ -134,3 +133,5 @@ they travel with the code they describe.
 | [0097](0097-selfhost-float-selects-branch.md) | feature | compiler (selfhost: x64, thread, passes) | Self-hosted x86-64: selects of floats are branches, and threading turns `if c { x = k }` runs into branch trees (fixed in 0753e8d) |
 | [0098](0098-selfhost-block-bounds-facts.md) | feature | compiler (selfhost: gvn) | Self-hosted optimizer: bounds checks of a block after a test that it fits (fixed in 0753e8d) |
 | [0099](0099-selfhost-global-alignment-checks.md) | feature | compiler (selfhost: combine) | Self-hosted optimizer: atomics on globals check their alignment at run time (fixed in 0753e8d) |
+| [0100](0100-selfhost-inlining-cold-init.md) | feature | compiler (selfhost: inline) | Self-hosted inliner: a one-time initialisation inlined into a hot wrapper keeps the wrapper out of line (fixed in 827630b) |
+| [0101](0101-selfhost-one-ply-remaining.md) | feature | compiler (selfhost: combine, slp, x64, mach) | Self-hosted x86-64: what is left at 1-ply against the LLVM-built port (fixed in part in 9b8d0bc, e3fee8f; the rest in 0105) |

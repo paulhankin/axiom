@@ -1,7 +1,7 @@
 # 0100: Self-hosted inliner: a one-time initialisation inlined into a hot wrapper keeps the wrapper out of line
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (827630b)
 - Area: compiler (selfhost: inline)
 
 the benchmark's `sanity_check(board, out)` (the benchmark `axiom/src/eval/eval.ax`) is
@@ -29,3 +29,16 @@ around `@atomic_wait`, a call through a pointer) so that `SMALL` means cheap to 
 few instructions; or treat a call that is only reached when an atomic flag is not yet set
 as cold (the shape of every lazy initialisation); or a `cold` attribute in the language
 (the IR has `Func.cold`, set only by the outliner).
+
+## Fix (827630b)
+
+`inline.ax`: after a function's calls are inlined (bottom-up), if it is no longer small,
+the outliner (`outline.ax`, `outline_one`) may move one uncommon path that makes calls
+into a function of its own (cold, never inlined; a node of its own in the call graph), as
+`outline_module` does before inlining, and the function is simplified again. An inlined
+lazy initialisation's check stays inline and its slow path (`load_default_db` with
+`Once.call`) goes out of line again, so the benchmark's `sanity_check` is small and inlined into
+the 0-ply loops: the wrapper's 43k instructions in five 1-ply positions are gone (the
+`Once` test stays, twice: the `done()` before the call and `Once.call`'s own fast path, as
+in the LLVM build). Cold parts' names get a `.N` suffix when the name is taken (a function
+can be outlined from twice, and inlined functions' cold parts are named after them).
