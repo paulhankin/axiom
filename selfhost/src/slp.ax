@@ -113,12 +113,20 @@ fn writes_between(from: *mut ir.Value, to: *mut ir.Value) bool {
         let op = i.op;
         if (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
            (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
-           (op == ir.OP_INTR) {
+           ((op == ir.OP_INTR) and writing_intr(i)) {
             return true;
         }
         i = i.next;
     }
     return false;
+}
+
+// An intrinsic with an effect on memory (or the stack, or a trap); not the
+// arithmetic ones (min, max, bit counts ...).
+fn writing_intr(i: *ir.Value) bool {
+    let id = @truncate(i32, @bit_cast(i64, i.cv));
+    return ((id >= ir.IN_TRAP) and (id <= ir.IN_SET_SP)) or (id == ir.IN_GET_SP) or (id == ir.IN_STORE_PARTIAL) or
+           (id > ir.IN_BSWAP);
 }
 
 // The leaves of the `or` tree at root (or-s of one use in its block).
@@ -1218,5 +1226,367 @@ pub fn store_groups(f: *mut ir.Func) bool {
         }
         b = b.next;
     }
+    return any;
+}
+
+// =============================================================================
+// Scalars only broadcast, neighbouring lanes of one vector: values each used
+// only by splats (a lane times a row of weights), the same operations on
+// neighbouring elements lane by lane, are computed as one vector, and each
+// splat broadcasts its lane of it (a splat of an extracted lane). Phis of
+// such values merge the vectors computed on each way in. the benchmark's board
+// deltas:
+//
+//   d0 = vn[0] - vo[0]; ... d3 = vn[3] - vo[3]  (or the same from INPVECB)
+//   acc0 = fma(splat(d0), w0, acc0); ...
+//
+// are two vector loads and one subtraction on each way, and a broadcast of
+// each lane.
+// =============================================================================
+
+// The splats of lane v in block b (all its uses, else false) into out.
+fn splat_users(b: *mut ir.Block, v: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) bool {
+    out.clear();
+    let mut i = b.first;
+    while u.notnil(i) {
+        if (i.op == ir.OP_SPLAT) and (ir.resolve(i.a) == v) {
+            out.push(i);
+        }
+        i = i.next;
+    }
+    return (out.len > 0) and (@as(i32, @int_cast(i32, out.len)) == v.uses);
+}
+
+// The load v's lane computation starts from (following first operands), and
+// its element offset from base; false when there is none.
+fn lane_leaf(v0: *mut ir.Value, base: *mut *mut ir.Value, off: *mut i64) bool {
+    let mut v = v0;
+    for _d in @as(i32, 0)..4 {
+        if v.kind != ir.V_INST {
+            return false;
+        }
+        if v.op == ir.OP_LOAD {
+            let mut p = ir.resolve(v.a);
+            let mut o: i64 = 0;
+            if is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+                o = ir.sval(ir.resolve(p.b));
+                p = ir.resolve(p.a);
+            }
+            base.* = p;
+            off.* = o;
+            return true;
+        }
+        if u.isnil(v.a) or (v.op == ir.OP_PHI) {
+            return false;
+        }
+        v = ir.resolve(v.a);
+    }
+    return false;
+}
+
+// What pred p brings to phi x.
+fn incoming(x: *mut ir.Value, p: *mut ir.Block) *mut ir.Value {
+    for k in 0..x.bs.len {
+        if x.bs.get(k) == p {
+            return ir.resolve(x.xs.get(k));
+        }
+    }
+    return vnil();
+}
+
+// The scalar instructions of s.tree made dead when the lane roots go (each
+// root's `uses` all go), weighed by scalar_cost.
+fn dead_cost_roots(s: *mut Slp, roots: []mut *mut ir.Value) i32 {
+    let n = s.tree.len;
+    for k in 0..n {
+        s.tree.get(k).aux2 = 1;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in 0..n {
+            let i = s.tree.get(k);
+            if i.aux2 != 1 {
+                continue;
+            }
+            let mut refs: i32 = 0;
+            for j in 0..n {
+                let o = s.tree.get(j);
+                if o.aux2 == 1 {
+                    if ir.resolve(o.a) == i {
+                        refs += 1;
+                    }
+                    if ir.resolve(o.b) == i {
+                        refs += 1;
+                    }
+                    if ir.resolve(o.c) == i {
+                        refs += 1;
+                    }
+                }
+            }
+            for j in 0..roots.len {
+                if roots[j] == i {
+                    refs = i.uses;
+                }
+            }
+            if refs < i.uses {
+                i.aux2 = 0;
+                changed = true;
+            }
+        }
+    }
+    let mut c: i32 = 0;
+    for k in 0..n {
+        let i = s.tree.get(k);
+        if i.aux2 == 1 {
+            c += scalar_cost(i);
+        }
+        i.aux2 = 0;
+    }
+    return c;
+}
+
+// The lanes xs (phis of block b, or instructions of it) as one vector, each
+// splat of them a broadcast of its lane, if cheaper. True if done.
+fn splat_group(f: *mut ir.Func, b: *mut ir.Block, xs: []mut *mut ir.Value) bool {
+    let n = xs.len;
+    let vt = ir.t_vec(xs[0].ty, @int_cast(u32, n));
+    let phis = xs[0].op == ir.OP_PHI;
+    let mut nways: usize = 1;
+    if phis {
+        nways = b.preds.len;
+    }
+    let mut vcost = @as(i32, @int_cast(i32, n)) - 1;  // (the lanes but the first moved down)
+    let mut scost: i32 = 0;
+    let mut ok = true;
+    let mut users = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    // where each way's vector is built: before the first splat, or at the
+    // end of each predecessor
+    let mut at = vnil();
+    if not phis {
+        let mut i = b.first;
+        while u.notnil(i) and u.isnil(at) {
+            if i.op == ir.OP_SPLAT {
+                for k in 0..n {
+                    if ir.resolve(i.a) == xs[k] {
+                        at = i;
+                    }
+                }
+            }
+            i = i.next;
+        }
+        for k in 0..n {
+            if u.isnil(at) or not before(xs[k], at) {
+                ok = false;
+            }
+        }
+    }
+    let lanes = new_lanes(n);
+    for w in 0..nways {
+        if not ok {
+            break;
+        }
+        let mut first = at;
+        if phis {
+            first = ir.terminator(b.preds.get(w));
+        }
+        for k in 0..n {
+            lanes[k] = xs[k];
+            if phis {
+                lanes[k] = incoming(xs[k], b.preds.get(w));
+                if u.isnil(lanes[k]) {
+                    ok = false;
+                }
+            }
+        }
+        if not ok {
+            break;
+        }
+        let mut s = Slp.{ B: ir.new_builder(), emit: false, ok: true, cost: 0, first: first,
+                          tree: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 } };
+        ir.at_before(s.B, first);
+        _ = vec_of(&mut s, lanes, vt, 0);
+        ok = s.ok;
+        vcost += s.cost;
+        if ok {
+            scost += dead_cost_roots(&mut s, lanes);
+        }
+        u.free(@ptr_cast(*mut void, s.tree.data));
+    }
+    if not ok or (vcost >= scost) {
+        u.free_slice(lanes);
+        u.free(@ptr_cast(*mut void, users.data));
+        return false;
+    }
+    // the vector (a phi of each way's)
+    let mut v = vnil();
+    let B = ir.new_builder();
+    if phis {
+        ir.at_before(B, b.first);
+        v = ir.phi(B, vt);
+    }
+    for w in 0..nways {
+        let mut first = at;
+        if phis {
+            first = ir.terminator(b.preds.get(w));
+        }
+        for k in 0..n {
+            lanes[k] = xs[k];
+            if phis {
+                lanes[k] = incoming(xs[k], b.preds.get(w));
+            }
+        }
+        let mut s = Slp.{ B: ir.new_builder(), emit: true, ok: true, cost: 0, first: first,
+                          tree: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 } };
+        ir.at_before(s.B, first);
+        let x = vec_of(&mut s, lanes, vt, 0);
+        if phis {
+            ir.add_incoming(v, x, b.preds.get(w));
+        } else {
+            v = x;
+        }
+        u.free(@ptr_cast(*mut void, s.tree.data));
+    }
+    // each splat a broadcast of its lane
+    for k in 0..n {
+        _ = splat_users(b, xs[k], &mut users);
+        for j in 0..users.len {
+            let sp = users.get(j);
+            ir.at_before(B, sp);
+            let r = ir.splat(B, sp.ty, ir.extract_elem(B, v, @as(u64, k)));
+            ir.forward(sp, r);
+            ir.remove_inst(sp);
+        }
+    }
+    u.free_slice(lanes);
+    u.free(@ptr_cast(*mut void, users.data));
+    return true;
+}
+
+const SPLAT_TAG: i64 = 0x5a1a_7000_0000;
+
+// Scalars only broadcast, neighbouring lanes, as vectors (x86-64). True if
+// any changed.
+pub fn splat_groups(f: *mut ir.Func) bool {
+    if tg.g_arch != tg.ARCH_X64 {
+        return false;
+    }
+    let feats = tg.fn_features(f);
+    let mut vbytes: i64 = 16;
+    if (feats & tg.X_AVX2) != 0 {
+        vbytes = 32;
+    }
+    let mut any = false;
+    count_uses(f);
+    let mut users = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut cands = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut offs = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+    let mut bases = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        // the candidates: scalars of b used only by splats, with the load
+        // their lane starts from (for phis, on the first way in)
+        cands.clear();
+        offs.clear();
+        bases.clear();
+        // (the splats of each value in b counted in aux2, from SPLAT_TAG)
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_SPLAT {
+                ir.resolve(i.a).aux2 = SPLAT_TAG;
+            }
+            i = i.next;
+        }
+        i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_SPLAT {
+                ir.resolve(i.a).aux2 += 1;
+            }
+            i = i.next;
+        }
+        i = b.first;
+        while u.notnil(i) and (cands.len < 64) {
+            let t = i.ty;
+            if ((t.kind == ir.T_FLOAT) or ((t.kind == ir.T_INT) and (t.bits >= 8))) and (i.uses > 0) and
+               (i.aux2 == (SPLAT_TAG + @as(i64, i.uses))) and
+               ((i.op != ir.OP_PHI) or ((b.preds.len == 2) and (i.xs.len == 2))) {
+                let mut x = i;
+                if i.op == ir.OP_PHI {
+                    x = incoming(i, b.preds.get(0));
+                }
+                let mut base = vnil();
+                let mut off: i64 = 0;
+                if u.notnil(x) and lane_leaf(x, &mut base, &mut off) {
+                    cands.push(i);
+                    offs.push(off);
+                    bases.push(base);
+                }
+            }
+            i = i.next;
+        }
+        i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_SPLAT {
+                ir.resolve(i.a).aux2 = 0;
+            }
+            i = i.next;
+        }
+        // runs of neighbouring lanes of one type, base and kind (phi or
+        // not), a vector's worth each
+        let m = cands.len;
+        for a in 0..m {
+            let x = cands.get(a);
+            if u.isnil(x) {
+                continue;
+            }
+            let size = @bit_cast(i64, x.ty.size);
+            let nl = @int_cast(usize, vbytes / size);
+            let mut lanes_ok = true;
+            let group = new_lanes(nl);
+            group[0] = x;
+            let mut want = nl;
+            // (the widest that is there: vbytes, then 16 bytes)
+            while want >= 2 {
+                lanes_ok = true;
+                for k in 1..want {
+                    let mut found = vnil();
+                    for c in 0..m {
+                        let y = cands.get(c);
+                        if u.notnil(y) and (y.ty == x.ty) and (bases.get(c) == bases.get(a)) and
+                           ((y.op == ir.OP_PHI) == (x.op == ir.OP_PHI)) and
+                           (offs.get(c) == (offs.get(a) + (@as(i64, @int_cast(i64, k)) * size))) {
+                            found = y;
+                        }
+                    }
+                    if u.isnil(found) {
+                        lanes_ok = false;
+                        break;
+                    }
+                    group[k] = found;
+                }
+                if lanes_ok or ((want * @int_cast(usize, size)) <= 16) {
+                    break;
+                }
+                want = want / 2;
+            }
+            if lanes_ok and ((want * @int_cast(usize, size)) >= 16) and splat_group(f, b, group[0..want]) {
+                any = true;
+                for k in 0..want {
+                    for c in 0..m {
+                        if cands.get(c) == group[k] {
+                            cands.set(c, vnil());
+                        }
+                    }
+                }
+                count_uses(f);
+            }
+            u.free_slice(group);
+        }
+        b = b.next;
+    }
+    u.free(@ptr_cast(*mut void, users.data));
+    u.free(@ptr_cast(*mut void, cands.data));
+    u.free(@ptr_cast(*mut void, offs.data));
+    u.free(@ptr_cast(*mut void, bases.data));
     return any;
 }
