@@ -202,7 +202,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `wlink.ax` | The wasm linker: memory layout, function table, exports, shared memory for threads |
 | `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
 | `mach.ax` | Machine IR shared by the native backends, liveness, static block frequencies (with the layout's prediction), copy coalescing and greedy register allocation (largest intervals first, evicting cheaper ones) with live-range splitting (around calls, at loop and block boundaries; reloads placed where the value is next used) and spilling (values rebuilt rather than stored, such as stack arguments and hoisted constants, split the same way, built again where a piece starts; their uses weighed by what a register saves), redundant reloads and spill stores removed (`AXIOM_DEBUG_RA=<function name suffix>` prints the allocator's decisions for x86-64) |
-| `x64.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding |
+| `x64.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding (code placement knobs for measuring it, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64.ax` and issue 0095) |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
