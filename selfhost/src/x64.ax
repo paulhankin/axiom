@@ -984,12 +984,91 @@ fn alu_digit(op: i32) i64 {
     return 6;  // xor
 }
 
+// A ctlz of 32 or 64 bits, computed by nothing else.
+fn full_clz(c: *ir.Value) bool {
+    return (c.kind == ir.V_INST) and (c.op == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, c.cv)) == ir.IN_CTLZ) and
+           (c.ty.kind == ir.T_INT) and ((c.ty.bits == 32) or (c.ty.bits == 64)) and ((c.flag & ~F_BSR) == 0);
+}
+
+// The ctlz that i computes k - ctlz(x) or (32 bits) ctlz(x) + k of (a
+// constant k), else nil. (A 64-bit add of a constant can be folded into an
+// address, which would read the ctlz's register itself: not those.)
+fn clz_user(i: *mut ir.Value) *mut ir.Value {
+    if (i.kind != ir.V_INST) or (i.flag != 0) or (i.ty.kind != ir.T_INT) {
+        return vnil();
+    }
+    let top = @as(i64, i.ty.bits - 1);
+    if (i.op == ir.OP_SUB) and is_c(i.a) and full_clz(i.b) and (i.b.ty == i.ty) and fits32(cval(i.a) - top) {
+        return i.b;
+    }
+    if (i.op != ir.OP_ADD) or (i.ty.bits != 32) {
+        return vnil();
+    }
+    if is_c(i.b) and full_clz(i.a) and (i.a.ty == i.ty) and fits32(cval(i.b) + top) {
+        return i.a;
+    }
+    if is_c(i.a) and full_clz(i.b) and (i.b.ty == i.ty) and fits32(cval(i.a) + top) {
+        return i.b;
+    }
+    return vnil();
+}
+
+// Is x known to be nonzero where block b runs: b is reached only through the
+// side of a branch on x != 0 (or x == 0) where it holds?
+fn nonzero_at(x0: *mut ir.Value, b0: *mut ir.Block) bool {
+    let x = ir.resolve(x0);
+    let mut w = b0;
+    for _k in @as(i32, 0)..16 {
+        let p = w.idom;
+        if u.isnil(p) {
+            return false;
+        }
+        let t = ir.terminator(p);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (w.preds.len == 1) and (w.preds.get(0) == p) {
+            let c = t.a;
+            if is_inst(c, ir.OP_ICMP) and (ir.resolve(c.a) == x) and is_c(c.b) and (cval(c.b) == 0) {
+                let pr = @truncate(i32, @bit_cast(i64, c.cv));
+                if ((pr == ir.IntNE) and (t.t1 == w)) or ((pr == ir.IntEQ) and (t.t2 == w)) {
+                    return true;
+                }
+            }
+        }
+        w = p;
+    }
+    return false;
+}
+
 // d = a op b (add, sub, and, or, xor, mul)
 fn gen_alu(v: *mut ir.Value) void {
     let o = v.op;
     let sz = isz(v.ty);
     let mut a = v.a;
     let mut b = v.b;
+    let bc = clz_user(v);
+    if u.notnil(bc) and ((bc.flag & F_BSR) != 0) {
+        // the ctlz's register holds bsr(x) = (bits - 1) - ctlz(x)
+        let d = vreg(v);
+        let top = @as(i64, v.ty.bits - 1);
+        if o == ir.OP_SUB {
+            // k - ctlz(x) = bsr(x) + (k - (bits - 1))
+            copy(d, reg(bc), GPR);
+            let k = cval(a) - top;
+            if k != 0 {
+                let i = e2(xe.ALU, sz, RW(d), I(k));
+                i.cc = 0;
+            }
+        } else {
+            // ctlz(x) + k = (k + bits - 1) - bsr(x)
+            let mut k = b;
+            if a != bc {
+                k = a;
+            }
+            _ = e2(xe.MOV_RI, sz, W(d), I(cval(k) + top));
+            let i = e2(xe.ALU, sz, RW(d), R(reg(bc)));
+            i.cc = 5;
+        }
+        return;
+    }
     // commute so that a constant or a folded load ends up second (a folded
     // load has no register: it must stay the memory operand)
     if (o != ir.OP_SUB) and (folded_load(a) or (is_c(a) and not is_c(b) and not folded_load(b))) {
@@ -1480,6 +1559,7 @@ const F_IN_RUN: i32 = 65536;  // a later store of such a run
 const F_ANDN: i32 = 131072;   // a `not` that its only user, an `and`, computes as andn (BMI1)
 const F_BCST: i32 = 524288;   // a splat of a load that its only user, an @fma, reads as an embedded broadcast
 const F_BLS: i32 = 262144;    // an x - 1 or 0 - x that its only user (x & or ^ it) computes as blsr / blsmsk / blsi
+const F_BSR: i32 = 1048576;   // a ctlz whose users are all k - it or it + k: holds bsr(x) instead (no LZCNT)
 
 fn is_scalar_cmp(v: *ir.Value) bool {
     return (v.kind == ir.V_INST) and ((v.op == ir.OP_ICMP) or (v.op == ir.OP_FCMP)) and (v.a.ty.kind != ir.T_VEC);
@@ -3029,6 +3109,18 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         }
         return;
     }
+    if (id == ir.IN_CTLZ) and ((v.flag & F_BSR) != 0) {
+        // bsr(x), for users that want k - ctlz(x) (prepare); -1 for x == 0
+        let i = e2(xe.BITSCAN, sz, W(d), R(reg(a0)));
+        i.cc = 1;
+        if not nonzero_at(a0, v.blk) {
+            let m1 = vgpr();
+            _ = e2(xe.MOV_RI, sz, W(m1), I(-1));
+            let c = e2(xe.CMOV, sz, RW(d), R(m1));
+            c.cc = xe.CC_E;
+        }
+        return;
+    }
     if id == ir.IN_CTLZ {
         let x = reg_ext(a0, false);
         if tg.has(tg.X_LZCNT) {
@@ -3040,8 +3132,20 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             }
             return;
         }
-        // bits - 1 - bsr(x), with bsr(0) taken as -1
         let wbits = @as(i64, sz) * 8;
+        if nonzero_at(a0, v.blk) {
+            // bits - 1 - bsr(x), bsr(x) in [0, bits - 1]
+            let i = e2(xe.BITSCAN, sz, W(d), R(x));
+            i.cc = 1;
+            let s = e2(xe.ALU, sz, RW(d), I(wbits - 1));
+            s.cc = 6;
+            if bits < 32 {
+                let s2 = e2(xe.ALU, 4, RW(d), I(@as(i64, 32 - bits)));
+                s2.cc = 5;
+            }
+            return;
+        }
+        // bits - 1 - bsr(x), with bsr(0) taken as -1
         let m1 = vgpr();
         _ = e2(xe.MOV_RI, sz, W(m1), I(-1));
         let b = vgpr();
@@ -6744,6 +6848,34 @@ fn prepare(f: *mut ir.Func) void {
                 i = i.next;
             }
             b = b.next;
+        }
+    }
+    // ctlz(x) used only as k - ctlz(x) or ctlz(x) + k: bsr(x), the index of
+    // the highest set bit, and k - ctlz(x) = bsr(x) + (k - (bits - 1)),
+    // ctlz(x) + k = (k + bits - 1) - bsr(x) (bsr(0) taken as -1)
+    if not tg.has(tg.X_LZCNT) {
+        for pass in @as(i32, 0)..3 {
+            b = f.first;
+            while u.notnil(b) {
+                let mut i = b.first;
+                while u.notnil(i) {
+                    if (pass == 0) and full_clz(i) {
+                        i.aux2 = 0;
+                    } else if pass == 1 {
+                        let c = clz_user(i);
+                        if u.notnil(c) {
+                            c.aux2 += 1;
+                        }
+                    } else if (pass == 2) and full_clz(i) {
+                        if (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
+                            i.flag = i.flag | F_BSR;
+                        }
+                        i.aux2 = 0;
+                    }
+                    i = i.next;
+                }
+                b = b.next;
+            }
         }
     }
     // consecutive stores of constants filling memory: vector stores (after
