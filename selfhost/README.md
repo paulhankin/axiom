@@ -195,7 +195,7 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `thread.ax` | Jump threading (also over comparisons of one value that branches above decide, with SSA repair of the values used beyond; a block that branches on a phi of conditions copied into the predecessors computing them; a phi of constants that a dominating branch decides replaced by its condition) and if-conversion (selects; stores in both arms merged; a load from a constant global speculated through a select of its address; nested tests of one value merged into one range check) |
 | `unroll.ax` | Full unrolling of loops with a small constant trip count (after inlining), partial unrolling (up to four times, the leftover iterations peeled) of larger ones, and chains of `x == k` tests storing one value at addresses linear in `k` made one range check and one store |
 | `inline.ax` | Inlining bottom-up over the call graph (and the calls inlining brings in), interprocedural constant propagation, dead functions |
-| `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own |
+| `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own (not from a branch inside a loop, where neither side is known to be uncommon) |
 | `wasm.ax`, `wobj.ax` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
 | `wlink.ax` | The wasm linker: memory layout, function table, exports, shared memory for threads |
 | `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
