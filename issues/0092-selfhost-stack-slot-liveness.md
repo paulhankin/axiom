@@ -1,7 +1,7 @@
 # 0092: Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space)
 
 - Type: feature (performance)
-- Status: in progress
+- Status: fixed (bd0e213)
 - Area: compiler (selfhost: copies, passes)
 
 Every alloca is a stack slot of its own for the whole function, and the only way two
@@ -36,3 +36,30 @@ Two miscompiles to guard against (the previous attempt at merging slots met both
   (the source is live around the loop's back edge);
 - copies split in parts whose halves overlap once the slots are merged (a copy between
   different offsets of two slots that share bytes).
+
+Fix (`slots.ax`, bd0e213): run once the IR passes are done (they tell slots apart by their
+allocas). Per slot over the CFG: live backwards from reads to writes that fill it whole,
+only where some write of it may have run, and everywhere from where its address escapes.
+A write of X where Y is live after it (or read by the same instruction) makes them
+interfere, except a copy of Y into X at the same offset, which writes what is there once
+they share. The graph is coalesced along such copies (hottest first, then the copy goes),
+then coloured greedily, largest first. A module-wide analysis finds pointer parameters no
+call can keep (only read, written and copied through, compared, passed on to parameters
+that keep none); passing a slot's address there uses it at the call only. Tests:
+`tests/run/slot_liveness.ax` (a copy in a loop whose source is read again after the copy
+changed, halves swapped through a temporary, kept and returned addresses, address
+comparisons); checked to fail with the liveness or escape parts of the interference
+removed.
+
+Effect (the benchmark bc2f24b, this machine's Xeon, AVX-512): the swapped board in
+`find_best_moves_0ply_cross_roll_scored` is built once, in the slot passed on.
+bench_search's frames 746 KB -> 530 KB (LLVM-backed Axiom: 397 KB);
+`find_best_move_ply_for_rollout` 102 -> 43 KB, `bench_search.run` 145 -> 48 KB,
+`play_trial` 76 -> 53 KB, `cross_scratch` 39 -> 28 KB; 543 allocas left of 1136. Results
+bit-identical. Search time is within noise (user time, min of 7: 1ply 0.157 -> 0.146 s,
+2ply 0.483 -> 0.485 s, gbr 2.13 -> 2.05 s; kernels unchanged). Matrix (one run, ratio to
+Rust): 1ply 1.23x (LLVM 0.84x), 2ply 1.06x (1.04x), gbr 1.07x (1.15x).
+
+Left: copies of a whole slot into a field of another (different offsets: 255 in
+bench_search, e.g. `ScoredMove` built from a `Move`) would need slots placed at an offset
+inside others; parameters passed to indirect calls and declarations still escape.

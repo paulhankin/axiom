@@ -39,7 +39,6 @@ they travel with the code they describe.
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
-| [0092](0092-selfhost-stack-slot-liveness.md) | feature | compiler (selfhost: copies, passes) | Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space) |
 | [0093](0093-prefetch-for-write.md) | feature | language, compiler | `@prefetch` cannot ask for a line to be written (Rust's the benchmark cache uses `_MM_HINT_ET0`) |
 
 ## Closed
@@ -123,3 +122,4 @@ they travel with the code they describe.
 | [0089](0089-c-vector-float-to-u32-avx512.md) | feature | compiler (C) | Vector `@int_from_float` to `u32` is five instructions on AVX-512 where two do (fixed in 4c1d5fc) |
 | [0090](0090-selfhost-conditional-table-reductions.md) | feature | compiler (selfhost: combine) | Reductions of table loads under a condition (the benchmark's Zobrist hash): no gathers (slow here); the select goes (fixed in bf39971) |
 | [0091](0091-c-compiler-gathers-on-skylake-sp.md) | feature | compiler (C) | LLVM 18 vectorizes with gathers on Skylake-SP/Cascade Lake, where they are slow (fixed in cd8a2a4, c38fb46) |
+| [0092](0092-selfhost-stack-slot-liveness.md) | feature | compiler (selfhost: slots, passes) | Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space) (fixed in bd0e213) |
