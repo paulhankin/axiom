@@ -3282,9 +3282,11 @@ pub fn split_loops(f: *mut ir.Func) bool {
 // the other paths skip it: the shadow stack's slot for the calls of a slow
 // path, values only a trap reports. A load moves into a successor reached
 // only from its block when nothing after it there writes memory. Where every
-// path from the block reaches the target anyway, an instruction does not
-// move past a call unless its operands are live there regardless (else they,
-// not its result, would be live across the call).
+// path from the block reaches the target anyway (moving saves nothing), an
+// instruction moves only when its operands are live there regardless: else
+// they, not its result, would be live on the way (across a call, or through
+// a chain of sums each sunk to the next one's use, all their terms live to
+// the end of the function).
 // -----------------------------------------------------------------------------
 fn lca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
     if u.isnil(a0) {
@@ -3466,21 +3468,10 @@ fn note_use(uses: *mut u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, x: *mu
     }
 }
 
-fn has_call(b: *mut ir.Block) bool {
-    let mut x = b.first;
-    while u.notnil(x) {
-        if x.op == ir.OP_CALL {
-            return true;
-        }
-        x = x.next;
-    }
-    return false;
-}
-
 // Is there a path from blk that skips t: back to blk, or to a return (not
 // to a trap), without passing t? If not, moving an instruction from blk to
-// t saves nothing. (calls: whether the blocks on the way call.)
-fn skips(blk: *mut ir.Block, t: *mut ir.Block, seen: []mut bool, calls: *mut bool) bool {
+// t saves nothing.
+fn skips(blk: *mut ir.Block, t: *mut ir.Block, seen: []mut bool) bool {
     for k in 0..seen.len {
         seen[k] = false;
     }
@@ -3505,10 +3496,7 @@ fn skips(blk: *mut ir.Block, t: *mut ir.Block, seen: []mut bool, calls: *mut boo
         let n = ir.succ_count(xt);
         if n == 0 {
             found = u.notnil(xt) and (xt.op != ir.OP_UNREACHABLE);
-            continue;  // (a trap's calls do not count)
-        }
-        if has_call(x) {
-            calls.* = true;
+            continue;  // (a trap does not count)
         }
         for k in 0..n {
             work.push(ir.succ(xt, k));
@@ -3613,7 +3601,6 @@ pub fn sink(f: *mut ir.Func) bool {
     let mut last_from = ir.bnil();
     let mut last_to = ir.bnil();
     let mut last_skips = false;
-    let mut last_calls = false;
     let mut bi = order.len;
     while bi > 0 {
         bi -= 1;
@@ -3661,17 +3648,10 @@ pub fn sink(f: *mut ir.Func) bool {
                         if (t != last_to) or (blk != last_from) {
                             last_from = blk;
                             last_to = t;
-                            last_calls = false;
-                            last_skips = skips(blk, t, seen[0..order.len], &mut last_calls);
+                            last_skips = skips(blk, t, seen[0..order.len]);
                         }
-                        let mut calls = last_calls;
-                        let mut x = i.next;
-                        while u.notnil(x) and not calls {
-                            calls = x.op == ir.OP_CALL;
-                            x = x.next;
-                        }
-                        if not last_skips and calls and not operands_live_at(&uses, i, t) {
-                            t = blk;  // (its operands would live across calls instead of it)
+                        if not last_skips and not operands_live_at(&uses, i, t) {
+                            t = blk;  // (its operands would live on the way instead of it)
                         }
                     }
                     if t != blk {
