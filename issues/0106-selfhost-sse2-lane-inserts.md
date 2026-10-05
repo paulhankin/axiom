@@ -1,7 +1,7 @@
 # 0106: Self-hosted x86-64 without SSE4.1: integers put into vector lanes through the stack
 
 - Type: feature (performance)
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: x64)
 
 Follow-up to 0086 (the benchmark's `axiom/` port built with `--cpu=x86-64`). Without

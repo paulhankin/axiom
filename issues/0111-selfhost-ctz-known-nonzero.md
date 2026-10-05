@@ -1,7 +1,7 @@
 # 0111: Self-hosted x86-64 without BMI1: trailing zeros of a mask that cannot be zero still test for zero
 
 - Type: feature (performance)
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: x64)
 
 Without `tzcnt`, `@ctz(x)` was `mov w, 32; bsf d, x; cmove d, w` everywhere. the benchmark's loops

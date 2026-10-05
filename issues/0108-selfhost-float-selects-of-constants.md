@@ -1,7 +1,7 @@
 # 0108: Self-hosted x86-64 without AVX-512: floats chosen between two constants by branches
 
 - Type: feature (performance)
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: thread, x64)
 
 0097 made float selects AVX-512 blends; without AVX-512 they stay branches, and

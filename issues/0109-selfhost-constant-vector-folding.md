@@ -1,7 +1,7 @@
 # 0109: Self-hosted optimizer: integer vector operations of constant lanes, and float constant arithmetic, not folded
 
 - Type: feature (performance)
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: opt, combine)
 
 the benchmark's `half_point_sums_simd128` (the `--cpu=x86-64` build's `half_point_sums`, 0086

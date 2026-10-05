@@ -1,7 +1,7 @@
 # 0112: Self-hosted register allocator: a region that only defines a spilled value stores it at its exit
 
 - Type: feature (performance)
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: mach)
 
 `split` (mach.ax) stores a spilled value where a region leaves it when that is no more

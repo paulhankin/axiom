@@ -1,7 +1,7 @@
 # 0110: Self-hosted SROA: aggregates of more than 16 scalars stay in memory
 
 - Type: feature (performance)
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: sroa, inline)
 
 `sroa.ax` split a slot into scalars only up to `MAX_LEAVES = 16` leaves. the benchmark's

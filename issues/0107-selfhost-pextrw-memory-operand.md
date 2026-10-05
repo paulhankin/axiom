@@ -1,7 +1,7 @@
 # 0107: Self-hosted x86-64: a constant vector folded into `pextrw` as a memory operand (SIGILL)
 
 - Type: bug
-- Status: fixed (see below)
+- Status: fixed (1fb5609)
 - Area: compiler (selfhost: x64)
 
 `rm_mem_ok` (x64.ax) lets the r/m operand of an SSE instruction be a constant from the
