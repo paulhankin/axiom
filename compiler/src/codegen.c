@@ -2456,6 +2456,42 @@ static LLVMValueRef swizzle16(LLVMValueRef x, LLVMValueRef idx) {
 // compares and blends); LLVM 18 splits the vector fptosi.sat/fptoui.sat into
 // one scalar conversion per lane there (issue 0030). wasm keeps the
 // intrinsics, which are its trunc_sat instructions.
+// x86's truncating conversion of a whole vector of floats to integers of
+// the same lane count, where the function's extensions have one (NULL
+// otherwise): out of range and NaN give the integer type's all-ones
+// (unsigned, AVX-512) or its minimum (signed). AVX-512's are its masked
+// forms, called unmasked; the 512-bit ones also take the rounding mode.
+static LLVMValueRef x86_cvtt(Type *rt, Type *ft, LLVMValueRef v) {
+    if (g_arch != ARCH_X64) return NULL;
+    unsigned n = (unsigned)rt->lanes, ib = (unsigned)rt->elem->bits, fb = (unsigned)ft->elem->bits;
+    unsigned fbytes = n * fb / 8;
+    bool s = rt->elem->is_signed, f = (g_features & feature_bit("avx512f")) != 0;
+    bool vl = f && (g_features & feature_bit("avx512vl")), dq = f && (g_features & feature_bit("avx512dq"));
+    bool wide = n * (fb > ib ? fb : ib) == 512;
+    // the widths an instruction converts all lanes of, register to register
+    if (ib != 32 && ib != 64) return NULL;
+    if (n * fb != 128 && n * fb != 256 && n * fb != 512) return NULL;
+    if (n * ib != 128 && n * ib != 256 && n * ib != 512) return NULL;
+    if ((wide ? !f : !vl) || (s && ib == 32 && !wide)) {
+        // the signed 32-bit conversions of SSE2 and AVX (AVX-512VL adds
+        // only the masked forms of these)
+        if (!s || ib != 32) return NULL;
+        LLVMValueRef a[1] = {v};
+        if (fb == 32 && fbytes == 16) return intrinsic("llvm.x86.sse2.cvttps2dq", NULL, 0, a, 1);
+        if (fb == 32 && fbytes == 32 && (g_features & feature_bit("avx"))) return intrinsic("llvm.x86.avx.cvtt.ps2dq.256", NULL, 0, a, 1);
+        if (fb == 64 && fbytes == 32 && (g_features & feature_bit("avx"))) return intrinsic("llvm.x86.avx.cvtt.pd2dq.256", NULL, 0, a, 1);
+        return NULL;
+    }
+    if (ib == 64 && !dq) return NULL;
+    if (fb == 64 && ib == 32 && n == 2) return NULL;  // (the result is half a register)
+    if (fb == 32 && ib == 64 && n == 2) return NULL;
+    const char *name = arena_printf("llvm.x86.avx512.mask.cvtt%s2%s%s.%u", fb == 32 ? "ps" : "pd",
+                                    s ? "" : "u", ib == 32 ? "dq" : "qq", wide ? 512 : n * (fb > ib ? fb : ib));
+    LLVMTypeRef mt = LLVMIntTypeInContext(ctx, n < 8 ? 8 : n);
+    LLVMValueRef a[4] = {v, LLVMGetUndef(lty(rt)), LLVMConstAllOnes(mt), LLVMConstInt(T_i32, 4, false)};
+    return intrinsic(name, NULL, 0, a, wide ? 4 : 3);
+}
+
 static LLVMValueRef vec_int_from_float(Type *rt, Type *ft, LLVMValueRef v) {
     unsigned n = (unsigned)rt->lanes, bits = (unsigned)rt->elem->bits;
     LLVMTypeRef fv = LLVMTypeOf(v), fl = LLVMGetElementType(fv), iv = lty(rt), il = LLVMGetElementType(iv);
@@ -2473,6 +2509,17 @@ static LLVMValueRef vec_int_from_float(Type *rt, Type *ft, LLVMValueRef v) {
     LLVMValueRef vb = LLVMConstVector(cb, n), vt = LLVMConstVector(ct2, n), vz = LLVMConstVector(cz, n);
     for (unsigned i = 0; i < n; i++) cz[i] = int_max(il, rt->elem->is_signed);
     LLVMValueRef top = LLVMConstVector(cz, n);
+    LLVMValueRef x = x86_cvtt(rt, ft, v);
+    if (x && !rt->elem->is_signed) {
+        // (issue 0089) the rest saturate already: lanes not >= 0 (ordered:
+        // NaN too) are 0, which zero-masks the conversion
+        return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGE, v, vz, ""), x, LLVMConstNull(iv), "");
+    }
+    if (x) {
+        // NaN and both overflows give the minimum: fix up the large and NaN
+        LLVMValueRef r = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGE, v, vt, ""), top, x, "");
+        return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealUNO, v, v, ""), LLVMConstNull(iv), r, "");
+    }
     LLVMValueRef big = LLVMBuildFCmp(B, LLVMRealOGE, v, vt, "");
     if (!rt->elem->is_signed) {
         // ordered compares: NaN and negatives give 0
@@ -2598,6 +2645,14 @@ static const char *x86_permute(Type *t, bool two) {
     if (g_arch != ARCH_X64) return NULL;
     int w = t->elem->bits, bytes = w * t->lanes / 8;
     bool f = (g_features & feature_bit("avx512f")) != 0;
+    if (t->elem->kind == TY_FLOAT) {
+        // the floating-point forms (vpermps, vpermt2ps, ...), so that the
+        // lanes stay in that domain (issue 0089)
+        if (bytes == 64 && w == 32 && f) return two ? "llvm.x86.avx512.vpermi2var.ps.512" : "llvm.x86.avx512.permvar.sf.512";
+        if (bytes == 64 && w == 64 && f) return two ? "llvm.x86.avx512.vpermi2var.pd.512" : "llvm.x86.avx512.permvar.df.512";
+        if (!two && bytes == 32 && w == 32 && (g_features & feature_bit("avx2"))) return "llvm.x86.avx2.permps";
+        return NULL;
+    }
     if (bytes == 64 && w == 32 && f) return two ? "llvm.x86.avx512.vpermi2var.d.512" : "llvm.x86.avx512.permvar.si.512";
     if (bytes == 64 && w == 64 && f) return two ? "llvm.x86.avx512.vpermi2var.q.512" : "llvm.x86.avx512.permvar.di.512";
     if (bytes == 64 && w == 16 && (g_features & feature_bit("avx512bw")))
@@ -2615,10 +2670,11 @@ static LLVMValueRef swizzle_lanes(Type *t, LLVMValueRef x, LLVMValueRef idx) {
     LLVMTypeRef vt = LLVMTypeOf(x), it = LLVMTypeOf(idx);
     const char *perm = x86_permute(t, false);
     if (perm && w > 8) {
-        LLVMValueRef args[2] = {LLVMBuildBitCast(B, x, it, ""), idx};
+        LLVMTypeRef pt = t->elem->kind == TY_FLOAT ? vt : it;
+        LLVMValueRef args[2] = {LLVMBuildBitCast(B, x, pt, ""), idx};
         LLVMValueRef r = intrinsic(perm, NULL, 0, args, 2);
         LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, const_lanes(LLVMGetElementType(it), n, n), "");
-        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(it), r, ""), vt, "");
+        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(pt), r, ""), vt, "");
     }
     LLVMTypeRef bt = LLVMVectorType(T_i8, nb);
     if (w == 8) return LLVMBuildBitCast(B, swizzle_bytes(LLVMBuildBitCast(B, x, bt, ""), idx, nb), vt, "");
@@ -2642,10 +2698,11 @@ static LLVMValueRef swizzle2_lanes(Type *t, LLVMValueRef x, LLVMValueRef y, LLVM
     LLVMTypeRef vt = LLVMTypeOf(x), it = LLVMTypeOf(idx);
     const char *perm = x86_permute(t, true);
     if (perm) {
-        LLVMValueRef args[3] = {LLVMBuildBitCast(B, x, it, ""), idx, LLVMBuildBitCast(B, y, it, "")};
+        LLVMTypeRef pt = t->elem->kind == TY_FLOAT ? vt : it;
+        LLVMValueRef args[3] = {LLVMBuildBitCast(B, x, pt, ""), idx, LLVMBuildBitCast(B, y, pt, "")};
         LLVMValueRef r = intrinsic(perm, NULL, 0, args, 3);
         LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, const_lanes(LLVMGetElementType(it), n, 2 * n), "");
-        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(it), r, ""), vt, "");
+        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(pt), r, ""), vt, "");
     }
     // indices below n pick from x (in y they wrap to beyond its lanes), the
     // others from y
