@@ -40,6 +40,7 @@ they travel with the code they describe.
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
 | [0095](0095-selfhost-x64-code-alignment.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: code alignment (functions, loop headers, the JCC erratum) |
+| [0096](0096-selfhost-slp-stores.md) | feature | compiler (selfhost: slp, thread, x64) | Self-hosted x86-64: neighbouring stores of computed values not vectorized (the benchmark's race inputs) |
 
 ## Closed
 
