@@ -318,6 +318,9 @@ static void dead_block(void) { LLVMPositionBuilderAtEnd(B, new_bb("dead")); }
 
 // Set by setup_target: the native CPU can do @swizzle with pshufb.
 static bool g_has_ssse3;
+// Tuning added to every target-features string ("" or ",+..."): see
+// x86_tuning_features.
+static const char *g_tuning_features = "";
 
 static LLVMValueRef intrinsic(const char *name, LLVMTypeRef *tys, int ntys, LLVMValueRef *args, int nargs) {
     unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
@@ -1397,12 +1400,29 @@ static void add_str_fn_attr(LLVMValueRef fn, const char *k, const char *v) {
                             LLVMCreateStringAttribute(ctx, k, (unsigned)strlen(k), v, (unsigned)strlen(v)));
 }
 
+// LLVM 18 takes gathers as fast on every AVX-512 processor and vectorizes
+// loops of table loads with them, but Skylake-SP to Tiger Lake run them in
+// microcode (the Gather Data Sampling mitigation, which a guest cannot see):
+// 25-31 cycles a gather against about one a load. the benchmark's move generation
+// hashes its board with twelve (issue 0091). Newer LLVMs no longer gather
+// there; these processors (the host's name, or a --cpu preset) are told to
+// prefer the loads. Axiom has no gather of its own: only the vectorizers
+// are affected.
+static const char *x86_tuning_features(const char *cpu) {
+    static const char *const gds[] = {"skylake", "skylake-avx512", "cascadelake", "cooperlake", "cannonlake",
+                                      "icelake-client", "icelake-server", "rocketlake", "tigerlake", "kabylake",
+                                      "coffeelake", "whiskeylake", "cometlake", "amberlake"};
+    for (size_t i = 0; i < sizeof gds / sizeof *gds; i++)
+        if (!strcmp(cpu, gds[i])) return ",+prefer-no-gather,+prefer-no-scatter";
+    return "";
+}
+
 // A function whose extensions differ from the target's (a version of an
 // @features or @multiversion function, or std/os/cpu.ax, compiled for the
 // bare architecture) says so to LLVM.
 static void set_fn_features(LLVMValueRef fn, uint64_t feats) {
     if (g_target.wasm || feats == g_build_features) return;
-    add_str_fn_attr(fn, "target-features", llvm_features(feats));
+    add_str_fn_attr(fn, "target-features", arena_printf("%s%s", llvm_features(feats), g_tuning_features));
     if (feats == 0) add_str_fn_attr(fn, "target-cpu", g_arch == ARCH_X64 ? "x86-64" : "generic");
 }
 
@@ -4774,6 +4794,8 @@ static bool setup_target(void) {
                                                  : LLVMCodeGenLevelAggressive;
     const char *cpu = g_target.wasm ? "generic" : !strcmp(g_cpu, "native") ? LLVMGetHostCPUName()
                     : g_arch == ARCH_X64 ? "x86-64" : "generic";
+    g_tuning_features = g_arch == ARCH_X64 ? x86_tuning_features(!strcmp(g_cpu, "native") ? cpu : g_cpu) : "";
+    features = arena_printf("%s%s", features, g_tuning_features);
     // @swizzle becomes pshufb when the target has SSSE3
     g_has_ssse3 = g_arch == ARCH_X64 && (g_features & 0x2);
     if (g_target.wasm) {
