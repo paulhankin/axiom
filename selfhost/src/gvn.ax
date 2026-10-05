@@ -1085,6 +1085,18 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     if (d >= 1) and (d < 0x1_0000_0000) {
         return at_least(ir.resolve(a.a), k + d, depth + 1);
     }
+    // x + j (j >= 1) that does not wrap: at least j, and at least k when x >= k - j
+    if is_inst(a, ir.OP_ADD) and small_k(ir.resolve(a.b)) and (kv(ir.resolve(a.b)) >= 1) and
+       (kv(ir.resolve(a.b)) < 0x1_0000_0000) and (a.ty.bits == 64) {
+        let j = kv(ir.resolve(a.b));
+        let saved = prove_budget;
+        prove_budget = 64;
+        let nowrap = below_max(ir.resolve(a.a), j, 0);
+        prove_budget = saved;
+        if nowrap {
+            return (j >= k) or at_least(ir.resolve(a.a), k - j, depth + 1);
+        }
+    }
     if is_inst(a, ir.OP_ZEXT) {
         return at_least(ir.resolve(a.a), k, depth + 1);
     }
@@ -1198,7 +1210,22 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
     if known_true(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c)))) {
         return true;
     }
-    // lower bounds x >= k with k >= c
+    if ge_fact(x, c) {
+        return true;
+    }
+    // x >= c - 1 and x != c - 1
+    if (c >= 2) and known_true(synth_icmp(ir.IntNE, x, ir.cint(x.ty, @bit_cast(u64, c - 1)))) and
+       known_at_least(x, c - 1) {
+        return true;
+    }
+    if is_inst(x, ir.OP_PHI) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) and (c < 0x1_0000_0000) {
+        return phi_at_least(x, c);
+    }
+    return false;
+}
+
+// A lower bound fact x >= k with k >= c.
+fn ge_fact(x: *mut ir.Value, c: i64) bool {
     let mut e = bk.get(@truncate(usize, ge_hash(x)) & (nb - 1));
     while e >= 0 {
         let en = ents.at(@int_cast(usize, e));
@@ -1208,6 +1235,83 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
         e = en.next;
     }
     return false;
+}
+
+// The loop phis whose lower bounds are being proved by induction.
+let mut ind_ge: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+
+// Is phi x >= c (c >= 1)? When each incoming value is, under its edge's
+// condition; the values that come around a loop by induction: with x assumed
+// at least c, proved with the facts known at the back edge (those of the
+// scope hold for this iteration's values) and the edge's condition (a loop
+// counter counting up from 1, or down from a value at least 1 and leaving
+// at 1).
+fn phi_at_least(x: *mut ir.Value, c: i64) bool {
+    if (x.xs.len > 4) or (ind_ge.len >= 2) {
+        return false;
+    }
+    for k in 0..ind_ge.len {
+        if ind_ge.get(k) == x {
+            return false;
+        }
+    }
+    let mut loops = false;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if v == x {
+            continue;
+        }
+        if (p.rpo < 0) or (p.rpo >= x.blk.rpo) {
+            loops = true;
+            continue;
+        }
+        let mark = ents.len;
+        edge_assume(p, x.blk);
+        path_assume(p);
+        let ok = at_least(v, c, 1);
+        pop_to(mark);
+        if not ok {
+            return false;
+        }
+    }
+    if not loops {
+        return true;
+    }
+    let lo0 = fact_lo;
+    let hi0 = fact_hi;
+    ind_ge.push(x);
+    let mut ok = true;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if (v == x) or not ((p.rpo < 0) or (p.rpo >= x.blk.rpo)) {
+            continue;
+        }
+        let mut lo = ents.len;
+        if p.rpo >= 0 {
+            lo = facts_at(p);
+        }
+        if (hi0 > lo0) and (lo0 < lo) {
+            lo = lo0;
+        }
+        fact_lo = lo;
+        fact_hi = ents.len;
+        let mark = ents.len;
+        add_ge(x, c);
+        edge_assume(p, x.blk);
+        path_assume(p);
+        ok = at_least(v, c, 1);
+        pop_to(mark);
+        if not ok {
+            break;
+        }
+    }
+    _ = ind_ge.pop();
+    fact_lo = lo0;
+    fact_hi = hi0;
+    return ok;
 }
 
 // Is the comparison i known to hold (by a fact fact_ok allows)?
@@ -1245,7 +1349,7 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
     while e >= 0 {
         let en = ents.at(@int_cast(usize, e));
-        if (en.kind == K_LE) and (en.key == x) {
+        if (en.kind == K_LE) and (en.key == x) and fact_ok(e) {
             if le_path(en.val, y, bound - en.off, depth + 1) {
                 return true;
             }
@@ -1317,24 +1421,94 @@ fn pick1(c: bool) i64 {
 // A phi is bounded when every incoming value is, at the end of its block
 // with the condition of the edge (the facts in scope hold there too: they
 // come from branches every path to the phi's block goes through).
+//
+// The values that come around a loop are bounded by induction: with x
+// assumed at most y + bound, each must be too, proved with the facts known
+// at the back edge (those of the scope hold for this iteration's values) and
+// the edge's condition (a counter counting down from below a length). y must
+// be the same in every iteration: defined before the loop.
 fn phi_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     if x.xs.len > 4 {
         return false;
     }
+    let mut loops = false;
     for k in 0..x.xs.len {
         let v = x.xs.get(k);
+        let p = x.bs.get(k);
         if v == x {
             continue;
         }
+        if (p.rpo < 0) or (p.rpo >= x.blk.rpo) {
+            loops = true;
+            continue;
+        }
         let mark = ents.len;
-        edge_assume(x.bs.get(k), x.blk);
+        edge_assume(p, x.blk);
         let ok = le_path(v, y, bound, depth + 1);
         pop_to(mark);
         if not ok {
             return false;
         }
     }
-    return true;
+    if not loops {
+        return true;
+    }
+    if (ind_le.len >= 2) or not invariant_in(y, x.blk) {
+        return false;
+    }
+    for k in 0..ind_le.len {
+        if ind_le.get(k) == x {
+            return false;
+        }
+    }
+    let lo0 = fact_lo;
+    let hi0 = fact_hi;
+    ind_le.push(x);
+    let mut ok = true;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if (v == x) or not ((p.rpo < 0) or (p.rpo >= x.blk.rpo)) {
+            continue;
+        }
+        let mut lo = ents.len;
+        if p.rpo >= 0 {
+            lo = facts_at(p);
+        }
+        if (hi0 > lo0) and (lo0 < lo) {
+            lo = lo0;
+        }
+        fact_lo = lo;
+        fact_hi = ents.len;
+        let mark = ents.len;
+        add_le(x, y, bound);
+        edge_assume(p, x.blk);
+        path_assume(p);
+        ok = le_path(v, y, bound, depth + 1);
+        pop_to(mark);
+        if not ok {
+            break;
+        }
+    }
+    _ = ind_le.pop();
+    fact_lo = lo0;
+    fact_hi = hi0;
+    return ok;
+}
+
+// The loop phis whose upper bounds (against values) are being proved by
+// induction.
+let mut ind_le: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+
+// Is y (nil, a constant, a parameter or an instruction) the same in every
+// iteration of the loop headed by h: defined in a block that strictly
+// dominates h?
+fn invariant_in(y: *mut ir.Value, h: *mut ir.Block) bool {
+    if u.isnil(y) or (y.kind != ir.V_INST) {
+        return true;
+    }
+    return u.notnil(y.blk) and (y.blk != h) and (y.blk.rpo >= 0) and opt.dominates(y.blk, h);
 }
 
 fn edge_assume(p: *mut ir.Block, b: *mut ir.Block) void {
@@ -1380,7 +1554,7 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
     let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
     while e >= 0 {
         let en = ents.at(@int_cast(usize, e));
-        if (en.kind == K_LE) and (en.key == x) {
+        if (en.kind == K_LE) and (en.key == x) and fact_ok(e) {
             if (en.off <= -d) or u.isnil(en.val) {
                 return true;  // x <= w - d, or x <= a small constant
             }

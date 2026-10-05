@@ -1653,6 +1653,49 @@ pub fn split_critical_edges(f: *mut ir.Func) void {
     compute_preds(f);
 }
 
+// Splits the edges that leave a loop from a block with several successors
+// into a block with several predecessors (LLVM's dedicated exits), so the
+// register allocator has a place for code on the way out: reloads of values
+// live through the loop that are in memory inside it (around a call on a
+// rare path) go there rather than at the end of the loop body. A block left
+// empty costs nothing (jumps to it go where it does).
+pub fn split_loop_exits(f: *mut ir.Func) void {
+    compute_preds(f);
+    let order = dominators(f);
+    loop_depths(f, &order);
+    for oi in 0..order.len {
+        let b = order.get(oi);
+        let t = ir.terminator(b);
+        let n = ir.succ_count(t);
+        if (n < 2) or (b.loop_depth == 0) {
+            continue;
+        }
+        for k in 0..n {
+            let s = ir.succ(t, k);
+            if (s.preds.len < 2) or (s.loop_depth >= b.loop_depth) {
+                continue;
+            }
+            let mut dup = false;
+            for j in 0..k {
+                if ir.succ(t, j) == s {
+                    dup = true;
+                }
+            }
+            if dup {
+                continue;  // (both successors one block: left alone)
+            }
+            let nb = ir.append_block(f, "exit");
+            let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+            br.t1 = s;
+            ir.append_inst(nb, br);
+            replace_phi_block(s, b, nb);
+            ir.set_succ(t, k, nb);
+        }
+    }
+    u.free(@ptr_cast(*mut void, order.data));
+    compute_preds(f);
+}
+
 // -----------------------------------------------------------------------------
 // Comparisons tested in other blocks (for the native backends, before
 // instruction selection): a branch or select in block X on a comparison
