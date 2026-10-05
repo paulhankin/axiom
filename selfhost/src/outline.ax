@@ -218,7 +218,7 @@ fn map_blk(r: *Region, b: *mut ir.Block, ret: *mut ir.Block) *mut ir.Block {
     return ret;  // the join
 }
 
-fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region, n: i32) void {
+fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region, n: i32) *mut ir.Func {
     // the new function
     let ptys = u.newn.[*mut ir.Ty](r.ins.len + 1);
     for k in 0..r.ins.len {
@@ -229,7 +229,15 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
         rty = r.res.ty;
     }
     let fty = ir.t_fn(rty, ptys[0..r.ins.len], false);
-    let g = ir.add_function(m, u.f2("%s.cold%s", f.name, u.idec(n)), fty);
+    // (f may have been outlined from before, and inlined functions' cold
+    // parts are named after them)
+    let mut name = u.f2("%s.cold%s", f.name, u.idec(n));
+    let mut dup: i32 = 1;
+    while m.fmap.has(name) {
+        name = u.f3("%s.cold%s.%s", f.name, u.idec(n), u.idec(dup));
+        dup += 1;
+    }
+    let g = ir.add_function(m, name, fty);
     g.linkage = ir.LINK_INTERNAL;
     g.cold = true;
     g.noinline = true;
@@ -350,18 +358,19 @@ fn outline(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, r: *mut Region,
     for k in 0..r.blocks.len {
         ir.remove_block(r.blocks.get(k));
     }
+    return g;
 }
 
-// Outlines at most one region of f; true if it did.
-fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) bool {
+// Outlines at most one region of f; the new function, or nil.
+fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) *mut ir.Func {
     if ir.is_decl(f) or f.cold or f.noinline or f.ty.vararg or (inl.cost(f) <= REST_MAX) {
-        return false;
+        return u.nil.[ir.Func]();
     }
     ir.apply_forwarding(f);
     opt.compute_preds(f);
     let order = opt.dominators(f);
     opt.loop_depths(f, &order);
-    let mut done = false;
+    let mut done = u.nil.[ir.Func]();
     for i in 0..order.len {
         let b = order.get(i);
         let t = ir.terminator(b);
@@ -373,12 +382,11 @@ fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) bool {
         for k in @as(usize, 0)..2 {
             let s = ir.succ(t, k);
             if region_of(f, b, s, r) {
-                outline(m, f, b, r, @int_cast(i32, i));
-                done = true;
+                done = outline(m, f, b, r, @int_cast(i32, i));
                 break;
             }
         }
-        if done {
+        if u.notnil(done) {
             break;
         }
     }
@@ -395,7 +403,7 @@ pub fn outline_module(m: *mut ir.Module, changed: *mut u.List.[*mut ir.Func]) bo
     let n = m.funcs.len;
     for i in 0..n {
         let f = m.funcs.get(i);
-        if outline_func(m, f, &mut r) {
+        if u.notnil(outline_func(m, f, &mut r)) {
             changed.push(f);
             any = true;
         }
@@ -403,4 +411,17 @@ pub fn outline_module(m: *mut ir.Module, changed: *mut u.List.[*mut ir.Func]) bo
     u.free(@ptr_cast(*mut void, r.blocks.data));
     u.free(@ptr_cast(*mut void, r.ins.data));
     return any;
+}
+
+// Outlines at most one region of f (whose calls were just inlined, so that
+// it may now have an uncommon path that makes calls: a lazy initialisation
+// inlined with the check before it); the new function, or nil.
+pub fn outline_one(m: *mut ir.Module, f: *mut ir.Func) *mut ir.Func {
+    let mut r = Region.{ blocks: u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 },
+                         ins: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 }, join: ir.bnil(),
+                         res: vnil(), tag: 0 };
+    let g = outline_func(m, f, &mut r);
+    u.free(@ptr_cast(*mut void, r.blocks.data));
+    u.free(@ptr_cast(*mut void, r.ins.data));
+    return g;
 }
