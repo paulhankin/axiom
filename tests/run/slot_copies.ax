@@ -1,0 +1,153 @@
+// Copies out of stack slots filled piece by piece, split at the pieces
+// (selfhost/src/copies.ax: split_copy, split_load), writes of bytes that
+// nothing reads, and a value returned into one slot then copied into the
+// variable it is bound to (renamable), including inside a loop where the
+// copy's source must stay as it was for the next time around.
+// flags: -O2
+import "../lib/io.ax" as io;
+
+struct Eval {
+    win: f32,
+    gammon: f32,
+    equity: f32,
+    class: u8,  // (then padding)
+}
+
+struct Scored {
+    board: [16]u8,
+    eval: Eval,
+    tag: u32,
+    rest: [24]u8,
+}
+
+struct Opt {
+    present: u8,  // (then padding)
+    value: Scored,
+}
+
+fn make(b: *[16]u8, w: f32, g: f32, k: u32) Scored {
+    return Scored.{ board: b.*, eval: Eval.{ win: w, gammon: g, equity: (2.0 * w) - 1.0, class: @truncate(u8, k) },
+                    tag: k * 3, rest: [0; 24] };
+}
+
+fn digest(s: *Scored) u64 {
+    let mut h: u64 = 1469598103934665603;
+    for x in s.board {
+        h = (h ^ @as(u64, x)) *% 1099511628211;
+    }
+    h = (h ^ @as(u64, @bit_cast(u32, s.eval.win))) *% 1099511628211;
+    h = (h ^ @as(u64, @bit_cast(u32, s.eval.gammon))) *% 1099511628211;
+    h = (h ^ @as(u64, @bit_cast(u32, s.eval.equity))) *% 1099511628211;
+    h = (h ^ @as(u64, s.eval.class)) *% 1099511628211;
+    h = (h ^ @as(u64, s.tag)) *% 1099511628211;
+    for x in s.rest {
+        h = (h ^ @as(u64, x)) *% 1099511628211;
+    }
+    return h;
+}
+
+// the best of n, each built in a slot field by field and copied out
+fn best(boards: *[4][16]u8, n: u32, out: *mut [4]Opt) u64 {
+    let mut acc: u64 = 0;
+    for i in @as(u32, 0)..n {
+        let b = &boards[@int_cast(usize, i)];
+        let s = make(b, 0.25 * @float_from_int(f32, i), 0.125, i + 1);
+        out[@int_cast(usize, i)] = Opt.{ present: 1, value: s };
+        acc +%= digest(&out[@int_cast(usize, i)].value);
+        // the slot read as a whole again after one field changes
+        let mut t = s;
+        t.eval.equity = 9.0;
+        acc +%= digest(&t);
+    }
+    return acc;
+}
+
+// a vector load across two halves copied in
+fn halves(a: *[2]u64, b: *[2]u64) u64 {
+    let mut p: [4]u64 = [0; 4];
+    p[0] = a[0];
+    p[1] = a[1];
+    p[2] = b[0];
+    p[3] = b[1];
+    let v = @load(u64x4, p[0..4]);
+    return @reduce_add(v);
+}
+
+struct Addr {
+    base: u64,
+    disp: i64,
+    scale: u8,
+}
+
+// (recursive: not inlined, its result in a slot of the caller)
+fn addr(x: u64, depth: u32) Addr {
+    if depth > 0 {
+        let a = addr(x, depth - 1);
+        return Addr.{ base: a.base + 1, disp: a.disp, scale: a.scale };
+    }
+    return Addr.{ base: x, disp: 0, scale: 1 };
+}
+
+// (selfhost's x64.small_fill: `let mut d2 = dm;` in a loop, dm returned by
+// a call before it: d2 cannot be dm)
+fn fill_like(x: u64, chunks: *[3]i64) i64 {
+    let dm = addr(x, 2);
+    let mut total: i64 = 0;
+    for c in chunks.* {
+        let mut d2 = dm;
+        d2.disp += c;
+        total += d2.disp * @as(i64, d2.scale) + @bit_cast(i64, d2.base);
+    }
+    return total;
+}
+
+struct Two {
+    raw: [2][25]u8,
+}
+
+fn swapped(b: *Two) Two {
+    return Two.{ raw: [b.raw[1], b.raw[0]] };
+}
+
+// (recursive: not inlined, so the board's address goes somewhere)
+fn digest2(b: *Two, depth: u32) u64 {
+    if depth > 0 {
+        return digest2(b, depth - 1) *% 3;
+    }
+    let mut h: u64 = 0;
+    for r in b.raw {
+        for x in r {
+            h = (h *% 31) +% @as(u64, x);
+        }
+    }
+    return h;
+}
+
+// the halves swapped through a slot: each half's source is the other half
+// of the destination, which the half copied in first has changed
+fn swaps(n: u32) u64 {
+    let mut b = Two.{ raw: [[1; 25], [2; 25]] };
+    b.raw[0][3] = 9;
+    b.raw[1][20] = 7;
+    let mut h: u64 = 0;
+    for i in @as(u32, 0)..n {
+        h +%= digest2(&b, i & 1);
+        b = swapped(&b);
+        b.raw[0][@int_cast(usize, i % 25)] +%= 1;
+    }
+    return h +% digest2(&b, n & 1);
+}
+
+export fn run() void {
+    let boards: [4][16]u8 = [[1; 16], [2; 16], [3; 16], [4; 16]];
+    let mut out: [4]Opt = [Opt.{ present: 0, value: make(&boards[0], 0.0, 0.0, 0) }; 4];
+    io.uint(best(&boards, 4, &mut out));  // expect: 5767337539052328024
+    io.uint(@as(u64, out[3].present));    // expect: 1
+    io.uint(@as(u64, out[2].value.tag));  // expect: 9
+    let a: [2]u64 = [1, 2];
+    let b: [2]u64 = [30, 400];
+    io.uint(halves(&a, &b));  // expect: 433
+    let ch: [3]i64 = [5, 7, 11];
+    io.int(fill_like(100, &ch));  // expect: 329
+    io.uint(swaps(7));            // expect: 11537695002364711788
+}
