@@ -16,6 +16,7 @@
 import "combine.ax" as cb;
 import "ir.ax" as ir;
 import "opt.ax" as opt;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 fn vnil() *mut ir.Value {
@@ -1075,6 +1076,13 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
         if p0.aux2 == addr_gen {
             return false;
         }
+        if values_only and
+           (((p0.ty.kind == ir.T_INT) and (p0.ty.bits == 1)) or (p0.ty.kind == ir.T_VEC) or
+            ((p0.ty.kind == ir.T_FLOAT) and not float_selects)) {
+            // a condition, which threading may decide the tests of; or a
+            // select the target would make a branch anyway
+            return false;
+        }
         p0 = p0.next;
     }
     // the values arriving at m on the true and the false path
@@ -1380,6 +1388,42 @@ fn hoist_all(a: *mut ir.Block, before: *mut ir.Value) void {
 }
 
 // (preds_ok: f's predecessor lists are up to date)
+// Before jump threading (if_convert_values): merges with a phi of a
+// condition are left to threading, which may decide the branches testing it.
+let mut values_only: bool = false;
+let mut float_selects: bool = false;
+
+// The diamonds and triangles whose phis are all values (no conditions),
+// before jump threading: `if c { x = k }` in a row, each threaded into the
+// next test, would make a tree of branches to merges of constants instead
+// of a select each.
+pub fn if_convert_values(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    opt.compute_preds(f);
+    mark_addrs(f);
+    let outer = tg.begin_fn(f);  // (its own extensions: @features)
+    float_selects = tg.branchless_float_select();
+    tg.end_fn(outer);
+    values_only = true;
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a.ty.kind == ir.T_INT) and convert(f, b) {
+            any = true;
+            opt.compute_preds(f);
+        }
+        b = b.next;
+    }
+    values_only = false;
+    if any {
+        ir.remove_unreachable(f);
+    }
+    return any;
+}
+
 pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     if u.isnil(f.first) {
         return false;

@@ -1,0 +1,120 @@
+// Floats chosen by conditions: `if c { x = k }` in a row (if-converted before
+// jump threading, as selects; with AVX-512 a masked blend each), selects of
+// f32 and f64 on integer and float compares (NaN included: OEQ and UNE take
+// the parity flag too), a condition computed in another block, and the
+// alignment check of an atomic global (folded). The results are LLVM's.
+import "../lib/io.ax" as io;
+
+fn race(side: *[25]u8, out: *mut [100]f32) void {
+    for i in @as(usize, 0)..23 {
+        let nc = side[i];
+        let mut one: f32 = 0.0;
+        let mut two: f32 = 0.0;
+        let mut three: f32 = 0.0;
+        let mut more: f32 = 0.0;
+        if nc == 1 {
+            one = 1.0;
+        }
+        if nc == 2 {
+            two = 1.0;
+        }
+        if nc >= 3 {
+            three = 1.0;
+        }
+        if nc > 3 {
+            more = @float_from_int(f32, nc - 3) / 2.0;
+        }
+        out[i * 4] = one;
+        out[(i * 4) + 1] = two;
+        out[(i * 4) + 2] = three;
+        out[(i * 4) + 3] = more;
+    }
+}
+
+fn pick64(a: f64, b: f64, x: f64, y: f64) f64 {
+    let mut r = y;
+    if a == b {
+        r = x;
+    }
+    let mut s = x;
+    if a != b {
+        s = y * 2.0;
+    }
+    let mut t: f64 = -1.5;
+    if a < b {
+        t = a;
+    }
+    return (r + s) + t;
+}
+
+fn pick32(a: i32, x: f32, y: f32) f32 {
+    let mut r = x;
+    if a > 7 {
+        r = y;
+    }
+    return r;
+}
+
+// the condition made once, used after a call (in another block)
+fn later(n: u32, x: f32) f32 {
+    let c = (n & 3) == 1;
+    io.uint(@as(u64, n));
+    let mut r: f32 = 2.5;
+    if c {
+        r = x;
+    }
+    return r;
+}
+
+let mut G: u32 = 0;
+
+fn bits32(x: f32) u64 {
+    return @as(u64, @bit_cast(u32, x));
+}
+
+export fn run() void {
+    let mut side: [25]u8 = [0; 25];
+    let mut h: u32 = 99;
+    for i in @as(usize, 0)..25 {
+        h = (h *% 1103515245) +% 12345;
+        side[i] = @truncate(u8, (h >> 16) % 7);
+    }
+    let mut out: [100]f32 = [9.0; 100];
+    race(&side, &mut out);
+    let mut s: u64 = 0;
+    for i in @as(usize, 0)..100 {
+        s = (s *% 31) +% bits32(out[i]);
+    }
+    io.uint(s);
+    let nan: f64 = 0.0 / 0.0;
+    let vals: [5]f64 = [1.0, 2.0, -3.0, nan, 1.0];
+    let mut t: f64 = 0.0;
+    for i in @as(usize, 0)..5 {
+        for j in @as(usize, 0)..5 {
+            let p = pick64(vals[i], vals[j], 0.25 * @float_from_int(f64, i), 8.0);
+            if p == p {
+                t += p;
+            } else {
+                t += 1000.0;
+            }
+        }
+    }
+    io.int(@int_from_float(i64, t * 4.0));
+    let mut u: f32 = 0.0;
+    for a in @as(i32, 0)..12 {
+        u += pick32(a, 1.0, 3.0);
+    }
+    io.int(@int_from_float(i64, u));
+    io.int(@int_from_float(i64, (later(5, 7.0) + later(6, 7.0)) * 2.0));
+    _ = @atomic_load(&G);
+    @atomic_store(&mut G, 3);
+    io.uint(@as(u64, @atomic_load(&G)));
+}
+
+// expect: 2738930933175418880
+// expect: 1698
+// expect: 20
+// expect: 5
+// expect: 6
+// expect: 19
+// expect: 3

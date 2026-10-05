@@ -962,6 +962,76 @@ fn assume_range(a: *mut ir.Value, n: u64) void {
     add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), kbool(true));
 }
 
+// a <= b + c with a = x + k (k a small constant, the sum not wrapping):
+// x <= b + c - k, a fact about x itself (a block of k elements from x
+// tested against a length: x is within it too, and so is x + j for j <= k).
+let mut sum_le_busy: bool = false;
+
+fn assume_sum_le(a: *mut ir.Value, b: *mut ir.Value, c: i64) void {
+    if not is_inst(a, ir.OP_ADD) or not small_k(a.b) or ir.is_const(a.a) or (a.ty.bits > 64) {
+        return;
+    }
+    let k = kv(a.b);
+    if (k < 1) or (k >= 0x1_0000_0000) {
+        return;
+    }
+    if sum_le_busy {
+        return;  // (ub follows phis, assuming their edges' conditions)
+    }
+    sum_le_busy = true;
+    let saved = prove_budget;
+    prove_budget = 64;
+    let m = ub(a.a, 0);
+    prove_budget = 64;
+    // (below_max answers for 64-bit values only)
+    let ok = ((m >= 0) and fits_type(m + k, a.ty)) or ((a.ty.bits == 64) and below_max(a.a, k, 0));
+    prove_budget = saved;
+    sum_le_busy = false;
+    if ok {
+        add_le(a.a, b, c - k);
+    }
+}
+
+// Is a >= k (unsigned, k >= 0)? From the facts: n - x >= k when x <= n - k,
+// s * c >= k when s >= k / c (rounded up) and the product cannot wrap.
+fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
+    if k <= 0 {
+        return true;
+    }
+    if small_k(a) {
+        return kv(a) >= k;
+    }
+    if (depth > 3) or (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) or (k >= 0x1_0000_0000) {
+        return false;
+    }
+    if known_at_least(a, k) {
+        return true;
+    }
+    if is_inst(a, ir.OP_SUB) and not ir.is_const(a.a) and not ir.is_const(a.b) {
+        return prove_le(a.b, a.a, 0 - k);  // (then x <= n: no wrap)
+    }
+    let mut c: i64 = 0;
+    if is_inst(a, ir.OP_MUL) and small_k(a.b) {
+        c = kv(a.b);
+    } else if is_inst(a, ir.OP_SHL) and small_k(a.b) and (kv(a.b) < 32) {
+        c = @as(i64, 1) << @truncate(u32, kv(a.b));
+    }
+    if (c < 1) or (c >= 0x1_0000_0000) {
+        return false;
+    }
+    let s = a.a;
+    prove_budget = 64;
+    let mut m = ub(s, 0);
+    if (m < 0) and is_inst(s, ir.OP_SUB) and prove_le(s.b, s.a, 0) {
+        prove_budget = 64;
+        m = ub(s.a, 0);  // n - x <= n when x <= n
+    }
+    if (m < 0) or (m >= 0x1_0000_0000) or not fits_type(m * c, a.ty) {
+        return false;
+    }
+    return at_least(s, (k + c - 1) / c, depth + 1);
+}
+
 // Unsigned comparison facts: tp holds for (a, b).
 fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
@@ -975,12 +1045,14 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
             }
         } else if not ir.is_const(b) {
             add_le(a, b, -1);
+            assume_sum_le(a, b, -1);
         }
     } else if tp == ir.IntULE {
         if small_k(b) {
             add_le(a, vnil(), kv(b));
         } else if not ir.is_const(b) {
             add_le(a, b, 0);
+            assume_sum_le(a, b, 0);
         }
     } else if (tp == ir.IntUGT) or (tp == ir.IntUGE) {
         let sw = cb.swap_pred(tp);
@@ -1823,6 +1895,16 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             if ((p == ir.IntULE) and (m <= kv(b))) or ((p == ir.IntUGT) and (m <= kv(b))) {
                 return kbool(p == ir.IntULE);
             }
+        }
+    }
+    // lower bounds: n - x >= k when x + k <= n, and multiples of them
+    if small_k(b) and ((p == ir.IntUGE) or (p == ir.IntUGT) or (p == ir.IntULT) or (p == ir.IntULE)) {
+        let mut need = kv(b);
+        if (p == ir.IntUGT) or (p == ir.IntULE) {
+            need += 1;
+        }
+        if at_least(a, need, 0) {
+            return kbool((p == ir.IntUGE) or (p == ir.IntUGT));
         }
     }
     // (x - d) against k >= 0, signed, with x in [0, ub(x)] and no overflow:
