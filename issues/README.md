@@ -43,6 +43,8 @@ they travel with the code they describe.
 | [0096](0096-selfhost-slp-stores.md) | feature | compiler (selfhost: slp, thread, x64) | Self-hosted x86-64: neighbouring stores of computed values not vectorized (the benchmark's race inputs) |
 | [0100](0100-selfhost-inlining-cold-init.md) | feature | compiler (selfhost: inline) | Self-hosted inliner: a one-time initialisation inlined into a hot wrapper keeps the wrapper out of line |
 | [0101](0101-selfhost-one-ply-remaining.md) | feature | compiler (selfhost: combine, slp, x64, mach) | Self-hosted x86-64: what is left at 1-ply against the LLVM-built port |
+| [0102](0102-c-stack-slot-copies-store-forwarding.md) | feature | compiler (C: codegen) | C compiler: aggregates copied through stack slots whose reloads straddle the stores (store-forwarding stalls) |
+| [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | C compiler: `@bit_cast` between a function pointer and an integer is invalid LLVM IR |
 
 ## Closed
 
