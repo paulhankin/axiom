@@ -256,6 +256,94 @@ fn vzero(v: *ir.Value) bool {
     return ir.is_zero(v) or (is_op(v, ir.OP_SPLAT) and ir.is_zero(v.a));
 }
 
+fn scalar_const(x: *ir.Value) bool {
+    return (x.kind == ir.V_CINT) or (x.kind == ir.V_CFP) or (x.kind == ir.V_ZERO);
+}
+
+// Are scalar constants x and y the same bits?
+fn same_const(x: *ir.Value, y: *ir.Value) bool {
+    if ir.is_zero(x) or ir.is_zero(y) {
+        return ir.is_zero(x) and ir.is_zero(y);
+    }
+    if (x.kind == ir.V_CINT) and (y.kind == ir.V_CINT) {
+        return (x.ty == y.ty) and (x.cv == y.cv);
+    }
+    if (x.kind == ir.V_CFP) and (y.kind == ir.V_CFP) {
+        return (x.ty == y.ty) and (@bit_cast(u64, x.fv) == @bit_cast(u64, y.fv));
+    }
+    return false;
+}
+
+// A constant lane put into a vector built by inserting lanes into a
+// constant (`@vec(f32x16, x0, .., x4, 0.0, ..)` is such a chain, from an
+// undefined vector): the constant goes into that constant instead, under
+// the other inserts, which are made again on it (each used only by the
+// next, so the old ones die). The variable lanes then go into a vector
+// whose other lanes are known (zero, for insertps), rather than every lane
+// being inserted one after the other. An insert of the lane further down is
+// dropped (overwritten). The undefined lanes of the constant become zero.
+fn sink_const_insert(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let c = i.b;
+    let t = i.ty;
+    if not scalar_const(c) {
+        return vnil();
+    }
+    let lane = i.cv;
+    let n = @as(u64, @bit_cast(u32, t.lanes));
+    if lane >= n {
+        return vnil();
+    }
+    let mut chain = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut cur = ir.resolve(i.a);
+    let mut dropped = false;
+    while is_op(cur, ir.OP_INSERTELEM) and (chain.len < 64) and (uses_of(cur) == 1) {
+        if cur.cv == lane {
+            dropped = true;
+        } else {
+            chain.push(cur);
+        }
+        cur = ir.resolve(cur.a);
+    }
+    let ck = cur.kind;
+    if ((ck != ir.V_CAGG) and (ck != ir.V_ZERO) and (ck != ir.V_UNDEF)) or (cur.ty != t) or
+       ((chain.len == 0) and not dropped) {
+        u.free(@ptr_cast(*mut void, chain.data));
+        return vnil();  // (a constant into a constant: fold_insert)
+    }
+    if not dropped and
+       (((ck == ir.V_ZERO) and ir.is_zero(c)) or
+        ((ck == ir.V_CAGG) and same_const(cur.xs.get(@truncate(usize, lane)), c))) {
+        u.free(@ptr_cast(*mut void, chain.data));
+        return ir.resolve(i.a);  // the lane holds c already
+    }
+    let xs = u.newn.[*mut ir.Value](@truncate(usize, n));
+    for k in @as(u64, 0)..n {
+        let mut x = ir.czero(t.elem);
+        if k == lane {
+            x = c;
+        } else if ck == ir.V_CAGG {
+            x = cur.xs.get(@truncate(usize, k));
+            if x.kind == ir.V_UNDEF {
+                x = ir.czero(t.elem);
+            }
+        }
+        xs[@truncate(usize, k)] = x;
+    }
+    let mut r = ir.cagg(t, xs[0..@truncate(usize, n)]);
+    if ir.is_zero(r) {
+        r = ir.czero(t);
+    }
+    let mut k = chain.len;
+    while k > 0 {
+        k -= 1;
+        let x = chain.get(k);
+        r = ir.insert_elem(B, r, x.b, x.cv);
+    }
+    u.free(@ptr_cast(*mut void, chain.data));
+    uses_stale = true;
+    return r;
+}
+
 fn pick_pred(c: bool, a: i32, b: i32) i32 {
     if c {
         return a;
@@ -1526,6 +1614,9 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             }
         }
         return vnil();
+    }
+    if (op == ir.OP_INSERTELEM) and (i.ty.kind == ir.T_VEC) {
+        return sink_const_insert(B, i);
     }
     if (op == ir.OP_SHUFFLE) and (i.ty.kind == ir.T_VEC) {
         // every lane from a vector of zeros
