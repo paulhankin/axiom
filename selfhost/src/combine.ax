@@ -1816,3 +1816,172 @@ pub fn narrow_bool_phis(f: *mut ir.Func) bool {
     u.free(@ptr_cast(*mut void, web.data));
     return any;
 }
+
+// -----------------------------------------------------------------------------
+// Operations common to a phi's inputs: phi(op(x1, c), op(x2, c)) is
+// op(phi(x1, x2), c), computed once after the join, when each op(xk, c) is
+// used only by the phi (the operands that differ are at most one). The
+// arms of `if full { m = @bitmask(load(p) != 0) } else { m =
+// @bitmask(load_partial(p) != 0) }` then only load, and the compare and
+// the mask come after them: one vector live across the join rather than
+// a mask per arm, and the code once.
+// -----------------------------------------------------------------------------
+fn sinkable_op(i: *ir.Value) bool {
+    if (i.kind != ir.V_INST) or (i.flags != 0) {
+        return false;
+    }
+    let op = i.op;
+    if ((op >= ir.OP_ADD) and (op <= ir.OP_FNEG)) or (op == ir.OP_ICMP) or (op == ir.OP_FCMP) or (op == ir.OP_SELECT) or
+       ((op >= ir.OP_ZEXT) and (op <= ir.OP_FPTOUI_SAT)) or (op == ir.OP_PTRADD) or (op == ir.OP_EXTRACTELEM) or
+       (op == ir.OP_INSERTELEM) or (op == ir.OP_SPLAT) {
+        return true;
+    }
+    if op == ir.OP_INTR {
+        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        return ((id >= ir.IN_CTLZ) and (id <= ir.IN_ABS)) or (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or
+               (id == ir.IN_BITMASK) or (id == ir.IN_PERM) or (id == ir.IN_PERM2) or (id == ir.IN_SHLV) or
+               (id == ir.IN_LSHRV) or (id == ir.IN_ASHRV) or (id == ir.IN_BSWAP);
+    }
+    return false;
+}
+
+fn same_operand(x: *ir.Value, y: *ir.Value) bool {
+    if x == y {
+        return true;
+    }
+    return u.notnil(x) and u.notnil(y) and ir.is_cint(x) and ir.is_cint(y) and (x.ty == y.ty) and
+           (ir.cint_val(x) == ir.cint_val(y));
+}
+
+// Operand k of i: a, b, c, then xs.
+fn operand(i: *ir.Value, k: usize) *mut ir.Value {
+    if k == 0 {
+        return i.a;
+    }
+    if k == 1 {
+        return i.b;
+    }
+    if k == 2 {
+        return i.c;
+    }
+    return i.xs.get(k - 3);
+}
+
+fn set_operand(i: *mut ir.Value, k: usize, x: *mut ir.Value) void {
+    if k == 0 {
+        i.a = x;
+    } else if k == 1 {
+        i.b = x;
+    } else if k == 2 {
+        i.c = x;
+    } else {
+        i.xs.set(k - 3, x);
+    }
+}
+
+// The operand the inputs of phi p differ in (3 + xs.len: none), or -1 if
+// they are not one operation with at most one operand differing.
+fn common_op(p: *ir.Value) i64 {
+    let n = p.xs.len;
+    if n < 2 {
+        return -1;
+    }
+    let i0 = ir.resolve(p.xs.get(0));
+    if not sinkable_op(i0) or (i0.uses != 1) {
+        return -1;
+    }
+    let nops = 3 + i0.xs.len;
+    let mut diff: i64 = @int_cast(i64, nops);
+    for j in 1..n {
+        let ij = ir.resolve(p.xs.get(j));
+        if (ij == i0) or (ij.kind != ir.V_INST) or (ij.op != i0.op) or (ij.ty != i0.ty) or (ij.cv != i0.cv) or
+           (ij.flags != 0) or (ij.uses != 1) or (ij.xs.len != i0.xs.len) {
+            return -1;
+        }
+        for j2 in 0..j {
+            if ir.resolve(p.xs.get(j2)) == ij {
+                return -1;
+            }
+        }
+        for k in 0..nops {
+            let x = operand(i0, k);
+            let y = operand(ij, k);
+            if (u.isnil(x) != u.isnil(y)) {
+                return -1;
+            }
+            if u.isnil(x) or same_operand(ir.resolve(x), ir.resolve(y)) {
+                continue;
+            }
+            if (diff != @int_cast(i64, nops)) and (diff != @int_cast(i64, k)) {
+                return -1;
+            }
+            diff = @int_cast(i64, k);
+            if ir.resolve(x).ty != ir.resolve(y).ty {
+                return -1;
+            }
+        }
+    }
+    return diff;
+}
+
+// True if f changed.
+pub fn sink_phi_ops(f: *mut ir.Func) bool {
+    let mut any = false;
+    count_uses(f);
+    uses_stale = false;
+    let B = ir.new_builder();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut p = b.first;
+            while u.notnil(p) and (p.op == ir.OP_PHI) {
+                let d = common_op(p);
+                if d < 0 {
+                    p = p.next;
+                    continue;
+                }
+                let k = @int_cast(usize, d);
+                let i0 = ir.resolve(p.xs.get(0));
+                let mut at = b.first;
+                while u.notnil(at) and (at.op == ir.OP_PHI) {
+                    at = at.next;
+                }
+                if k < (3 + i0.xs.len) {
+                    // the differing operands through a phi of their own
+                    ir.at_before(B, p);
+                    let q = ir.phi(B, ir.resolve(operand(i0, k)).ty);
+                    for j in 0..p.xs.len {
+                        let ij = ir.resolve(p.xs.get(j));
+                        ir.add_incoming(q, ir.resolve(operand(ij, k)), p.bs.get(j));
+                    }
+                    set_operand(i0, k, q);
+                    q.uses = 1;
+                    q.user = i0;
+                }
+                for j in 1..p.xs.len {
+                    ir.remove_inst(ir.resolve(p.xs.get(j)));
+                }
+                ir.remove_inst(i0);
+                if u.notnil(at) {
+                    ir.insert_before(at, i0);
+                } else {
+                    ir.append_inst(b, i0);
+                }
+                i0.uses = p.uses;
+                i0.user = p.user;
+                ir.forward(p, i0);
+                ir.remove_inst(p);
+                ir.apply_forwarding(f);
+                count_uses(f);
+                changed = true;
+                any = true;
+                break;
+            }
+        }
+        b = b.next;
+    }
+    uses_stale = true;
+    return any;
+}

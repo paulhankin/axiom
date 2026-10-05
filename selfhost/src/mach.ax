@@ -21,7 +21,10 @@
 // stretches of code that use them (where uses are far apart), then at every
 // block boundary, and those are finally spilled everywhere, their uses and
 // definitions rewritten through short-lived registers (which never spill).
-// Allocation runs again after each rewrite.
+// A value that is rebuilt rather than stored (set_remat: a stack argument,
+// a constant) is split the same way, its pieces built again where they are
+// entered, and at last built again where it is read (or read from memory
+// there). Allocation runs again after each rewrite.
 // =============================================================================
 import "util.ax" as u;
 
@@ -1503,6 +1506,19 @@ fn slot_of(f: *mut MFunc, x: usize) i32 {
     return s;
 }
 
+// A reload in split: of a rematerialized value (rd, the definition of v;
+// slot: below -1), its definition again.
+fn sreload(f: *mut MFunc, t: *Target, rd: *MInst, v: i32, r: i32, c: u8, slot: i32) *mut MInst {
+    if slot >= 0 {
+        return reload(f, t, r, c, slot);
+    }
+    let i = clone_def(rd, v, r);
+    i.spill = 1;
+    i.sreg = r;
+    i.sslot = slot;
+    return i;
+}
+
 fn reload(f: *mut MFunc, t: *Target, r: i32, c: u8, slot: i32) *mut MInst {
     let i = t.spill_load(f, r, @as(i32, c), slot);
     i.spill = 1;
@@ -1569,7 +1585,7 @@ fn same_slot(f: *MFunc, r: i32, sl: i32) bool {
 
 fn transfer_in(f: *MFunc, i: *MInst, v: i32) bool {
     let sl = f.vslot.get(@int_cast(usize, v - VREG0));
-    if sl < 0 {
+    if sl == -1 {
         return false;
     }
     if (i.spill == 1) and (i.sreg == v) and (i.sslot == sl) {
@@ -1580,7 +1596,7 @@ fn transfer_in(f: *MFunc, i: *MInst, v: i32) bool {
 
 fn transfer_out(f: *MFunc, i: *MInst, v: i32) bool {
     let sl = f.vslot.get(@int_cast(usize, v - VREG0));
-    if sl < 0 {
+    if sl == -1 {
         return false;
     }
     if (i.spill == 2) and (i.sreg == v) and (i.sslot == sl) {
@@ -1666,6 +1682,11 @@ fn use_clusters(f: *MFunc, v: i32, cl: []mut i32) void {
 fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) bool {
     let v = VREG0 + @int_cast(i32, x);
     let c = f.vclass.get(x);
+    let mut rd = f.remat.get(x);
+    let isrm = u.notnil(rd);
+    if isrm {
+        rd = clone_def(rd, v, v);  // (the definition itself is rewritten below)
+    }
     let nb = f.blocks.len;
     let cl = u.newn.[i32](nb + 1);
     if mode == SPLIT_GAPS {
@@ -1683,6 +1704,8 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
     let mut cut_fq = u.List.[f64].{ data: u.nil.[f64](), len: 0, cap: 0 };
     let mut arr = u.List.[*mut MInst].{ data: u.nil.[*mut MInst](), len: 0, cap: 0 };
     let mut la = u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 };
+    let mut nrd = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };     // instructions reading it
+    let mut deep = u.List.[bool].{ data: u.nil.[bool](), len: 0, cap: 0 };  // ... in a loop
     // segments: the stretches of each block between the calls it is live across
     for bi in 0..nb {
         let b = f.blocks.get(bi);
@@ -1713,6 +1736,8 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
         occ.push(false);
         rel.push(bget(b.live_in, x));
         defc.push(0.0);
+        nrd.push(0);
+        deep.push(false);
         head[bi] = seg;
         for k2 in 0..arr.len {
             let j = arr.get(k2);
@@ -1725,6 +1750,11 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
                 occ.set(s, true);
                 if w {
                     defc.set(s, defc.get(s) + fq);
+                } else {
+                    nrd.set(s, nrd.get(s) + 1);
+                    if b.loop_depth > 0 {
+                        deep.set(s, true);
+                    }
                 }
             }
             if g.simple[bi] and not w and la.get(k2) and call_cut(t, c, j) {
@@ -1737,6 +1767,8 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
                 occ.push(false);
                 rel.push(true);
                 defc.push(0.0);
+                nrd.push(0);
+                deep.push(false);
             }
         }
         if bget(b.live_out, x) {
@@ -1837,6 +1869,8 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
         u.free(@ptr_cast(*mut void, cut_fq.data));
         u.free(@ptr_cast(*mut void, arr.data));
         u.free(@ptr_cast(*mut void, la.data));
+        u.free(@ptr_cast(*mut void, nrd.data));
+        u.free(@ptr_cast(*mut void, deep.data));
         return false;
     }
     // regions: whether they use it (else it stays in memory there), their
@@ -1851,12 +1885,35 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
         rexit[s] = 0.0;
         wreg[s] = -1;
     }
+    let rnrd = u.newn.[i32](ns + 1);
+    let rdeep = u.newn.[bool](ns + 1);
+    let fold1 = u.newn.[bool](ns + 1);
+    for s in 0..ns {
+        rnrd[s] = 0;
+        rdeep[s] = false;
+        fold1[s] = false;
+    }
     for s in 0..ns {
         let r = @int_cast(usize, find(&mut par, @int_cast(i32, s)));
         if occ.get(s) {
             rocc[r] = true;
         }
         rdef[r] += defc.get(s);
+        rnrd[r] += nrd.get(s);
+        if deep.get(s) {
+            rdeep[r] = true;
+        }
+    }
+    // a rematerialized value read once in a region (not one around a loop)
+    // is built again where it is read, or read from memory there: a register
+    // for it would cost an instruction more
+    if isrm {
+        for s in 0..ns {
+            if rocc[s] and (rnrd[s] == 1) and (rdef[s] == 0.0) and ((mode != SPLIT_LOOPS) or not rdeep[s]) {
+                fold1[s] = true;
+                rocc[s] = false;
+            }
+        }
     }
     for k in 0..cuts.len {
         rexit[@int_cast(usize, find(&mut par, cut_seg.get(k)))] += cut_fq.get(k);
@@ -1880,20 +1937,30 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
             }
         }
     }
-    let slot = slot_of(f, x);
+    // (a rematerialized value is rebuilt where a piece is entered from
+    // "memory", and never stored: its pieces are rematerialized in turn)
+    let mut slot = f.vslot.get(x);
+    if not isrm {
+        slot = slot_of(f, x);
+    } else if slot == -1 {
+        slot = -2 - @int_cast(i32, x);
+    }
     for s in 0..ns {
         if (find(&mut par, @int_cast(i32, s)) == @int_cast(i32, s)) and rocc[s] {
             let w = new_vreg(f, c);
             let wx = @int_cast(usize, w - VREG0);
             f.level.set(wx, level);
             f.vslot.set(wx, slot);
+            if isrm {
+                set_remat(f, w, clone_def(rd, v, w));
+            }
             wreg[s] = w;
         }
     }
     // stores where it leaves a region (if cheaper than after each definition)
     let at_exit = u.newn.[bool](ns + 1);
     for s in 0..ns {
-        at_exit[s] = (rdef[s] > 0.0) and (rexit[s] <= rdef[s]);
+        at_exit[s] = (rdef[s] > 0.0) and (rexit[s] <= rdef[s]) and not isrm;
     }
     // blocks reloading it themselves (every edge in is a split point): before
     // its first use there
@@ -1905,6 +1972,16 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
             if rocc[r2] {
                 sload[si] = @int_cast(i32, r2);
             }
+        }
+    }
+    if debug_ra {
+        u.eprint(u.f2("split v%s mode %s\n", u.zdec(x), u.idec(mode)));
+        for bi in 0..nb {
+            let hr = find(&mut par, head[bi]);
+            let tr = find(&mut par, tail[bi]);
+            u.eprint(u.f6("  b%s head %s(w%s) tail %s(w%s) sload %s\n", u.zdec(bi), u.idec(hr),
+                          u.idec(wreg[@int_cast(usize, hr)]), u.idec(tr), u.idec(wreg[@int_cast(usize, tr)]),
+                          u.idec(sload[bi])));
         }
     }
     // rewrite
@@ -1922,7 +1999,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
         }
         let mut pend: i32 = sload[bi];  // a region to reload before the next use
         if (pend >= 0) and not g.simple[bi] {
-            insert_start(b, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));
+            insert_start(b, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));
             pend = -1;
         }
         i = b.first;
@@ -1930,14 +2007,24 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
             let next = i.next;
             let r = @int_cast(usize, find(&mut par, seg));
             if (pend >= 0) and is_jump(i) and not mentions(i, v) {
-                insert_before(b, i, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));
+                insert_before(b, i, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));
                 pend = -1;
+            }
+            if fold1[r] and real_use(f, i, v) {
+                if not t.fold_remat(f, i, v, rd) {
+                    let nr = new_vreg(f, c);
+                    f.nospill.set(@int_cast(usize, nr - VREG0), true);
+                    replace_reg(i, v, nr);
+                    insert_before(b, i, sreload(f, t, rd, v, nr, c, slot));
+                }
+                i = next;
+                continue;
             }
             if mentions(i, v) and not rocc[r] {
                 // spill code of a region left in memory
                 if transfer_out(f, i, v) and i.is_move {
                     let d = move_dst(i);
-                    insert_before(b, i, reload(f, t, d, c, slot));
+                    insert_before(b, i, sreload(f, t, rd, v, d, c, slot));
                 }
                 remove(b, i);
                 i = next;
@@ -1948,7 +2035,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
                 let wx = @int_cast(usize, w - VREG0);
                 if pend >= 0 {
                     if not transfer_in(f, i, v) {
-                        insert_before(b, i, reload(f, t, w, c, slot));
+                        insert_before(b, i, sreload(f, t, rd, v, w, c, slot));
                     }
                     pend = -1;
                 }
@@ -1968,13 +2055,13 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
                 }
                 let fresh = writes_reg(i, v) and real_use(f, i, v);
                 replace_reg(i, v, w);
-                if fresh and not at_exit[r] {
+                if fresh and not at_exit[r] and not isrm {
                     insert_after(b, i, store(f, t, w, c, slot));
                 }
             }
             if (ck < cuts.len) and (cuts.get(ck) == i) {
                 if pend >= 0 {
-                    insert_before(b, i, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));  // (not used before the next call)
+                    insert_before(b, i, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));  // (not used before the next call)
                     pend = -1;
                 }
                 if at_exit[r] {
@@ -1985,7 +2072,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
                 let r2 = @int_cast(usize, find(&mut par, seg));
                 if rocc[r2] {
                     if lbl {
-                        insert_after(b, i, reload(f, t, wreg[r2], c, slot));
+                        insert_after(b, i, sreload(f, t, rd, v, wreg[r2], c, slot));
                     } else {
                         pend = @int_cast(i32, r2);
                     }
@@ -1994,7 +2081,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
             i = next;
         }
         if pend >= 0 {
-            insert_end(b, reload(f, t, wreg[@int_cast(usize, pend)], c, slot));
+            insert_end(b, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));
         }
     }
     // along the edges that are split points
@@ -2025,7 +2112,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
                 ins = t.spill_move(f, w2, wreg[r], @as(i32, c));
                 f.hint.set(@int_cast(usize, w2 - VREG0), wreg[r]);
             } else {
-                ins = reload(f, t, w2, c, slot);
+                ins = sreload(f, t, rd, v, w2, c, slot);
             }
             if g.npred[si] == 1 {
                 insert_start(sb, ins);
@@ -2052,6 +2139,8 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
     u.free(@ptr_cast(*mut void, cut_fq.data));
     u.free(@ptr_cast(*mut void, arr.data));
     u.free(@ptr_cast(*mut void, la.data));
+    u.free(@ptr_cast(*mut void, nrd.data));
+    u.free(@ptr_cast(*mut void, deep.data));
     return true;
 }
 
@@ -2179,8 +2268,21 @@ fn spill_everywhere(f: *mut MFunc, t: *Target, sp: []bool) void {
     }
 }
 
-// Which spilled rematerialized values (slot -2) are read only in the block
-// that defines them.
+// Does i define rematerialized vreg r: its definition, or (for the pieces
+// of a split one, see split) a copy of it made where a piece is entered, or a
+// copy from another piece?
+fn remat_defines(f: *MFunc, i: *MInst, r: i32) bool {
+    if @ptr_cast(*MInst, f.remat.get(@int_cast(usize, r - VREG0))) == i {
+        return true;
+    }
+    if (i.spill == 1) and (i.sreg == r) {
+        return true;
+    }
+    return i.is_move and (move_dst(i) == r);
+}
+
+// Which spilled rematerialized values (slot -2) are defined and read in one
+// block only.
 fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
     let nv = local.len;
     let db = u.newn.[i32](nv + 1);
@@ -2193,9 +2295,14 @@ fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
         while u.notnil(i) {
             for k in 0..i.ops.len {
                 let o = i.ops[k];
-                if (o.kind == K_REG) and is_vreg(o.reg) and (@int_cast(usize, o.reg - VREG0) < nv) and
-                   local[@int_cast(usize, o.reg - VREG0)] and (f.remat.get(@int_cast(usize, o.reg - VREG0)) == i) {
-                    db[@int_cast(usize, o.reg - VREG0)] = @int_cast(i32, bi);
+                if (o.kind == K_REG) and is_vreg(o.reg) and ((o.role & RD) != 0) and
+                   (@int_cast(usize, o.reg - VREG0) < nv) and local[@int_cast(usize, o.reg - VREG0)] and
+                   remat_defines(f, i, o.reg) {
+                    let x = @int_cast(usize, o.reg - VREG0);
+                    if (db[x] >= 0) and (db[x] != @int_cast(i32, bi)) {
+                        local[x] = false;
+                    }
+                    db[x] = @int_cast(i32, bi);
                 }
             }
             i = i.next;
@@ -2230,9 +2337,10 @@ fn remat_locality(f: *MFunc, slot: []i32, local: []mut bool) void {
 }
 
 // Rewrites the spilled rematerialized vregs rm marks (see set_remat): no
-// stack slot. One read only in the block defining it is built again at each
-// use (or folded into it); one read elsewhere is built once in each block
-// that reads it, as a value of its own (which may be rematerialized in turn).
+// stack slot, its definitions go. One read only in the block defining it is
+// built again at each use (or folded into it); one read elsewhere is built
+// once in each block that reads it, as a value of its own (which may be
+// rematerialized in turn).
 fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
     let nv = rm.len;
     let slot = u.newn.[i32](nv + 1);
@@ -2256,6 +2364,7 @@ fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
             let next = i.next;
             let mut done: [8]i32 = [-1; 8];
             let mut nd: usize = 0;
+            let mut gone = false;
             for k in 0..i.ops.len {
                 let o = i.ops[k];
                 let cands: [3]i32 = [o.reg, o.base, o.index];
@@ -2266,6 +2375,9 @@ fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
                     }
                     if not is_vreg(r) or (@int_cast(usize, r - VREG0) >= nv) or not rm[@int_cast(usize, r - VREG0)] {
                         continue;
+                    }
+                    if (ci == 0) and ((o.role & RD) != 0) and remat_defines(f, i, r) {
+                        gone = true;
                     }
                     let mut seen = false;
                     for j in 0..nd {
@@ -2279,15 +2391,16 @@ fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
                     }
                 }
             }
+            if gone {
+                remove(b, i);
+                i = next;
+                continue;
+            }
             for j in 0..nd {
                 let r = done[j];
                 let x = @int_cast(usize, r - VREG0);
                 let c = f.vclass.get(x);
                 let def = f.remat.get(x);
-                if i == def {
-                    remove(b, i);
-                    break;
-                }
                 if not local[x] {
                     let mut nr = bv[x];
                     if bb[x] != @int_cast(i32, bi) {
@@ -2310,7 +2423,10 @@ fn spill_remat(f: *mut MFunc, t: *Target, rm: []bool) void {
                 let ld = clone_def(def, r, nr);
                 ld.spill = 1;
                 ld.sreg = nr;
-                ld.sslot = -2 - @int_cast(i32, x);  // (a slot of its own: drop_reloads drops repeats)
+                ld.sslot = f.vslot.get(x);  // (the value's own pseudo slot (see split): drop_reloads drops repeats)
+                if ld.sslot >= -1 {
+                    ld.sslot = -2 - @int_cast(i32, x);
+                }
                 insert_before(b, i, ld);
             }
             i = next;
@@ -2371,11 +2487,20 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
         if not iv[k].spilled {
             continue;
         }
+        let lv = f.level.get(k);
         if u.notnil(f.remat.get(k)) {
-            rm[k] = true;
+            // split around calls and loops, then between the stretches of
+            // code that use it; then built again in each block reading it
+            let mut sp = false;
+            if lv == 0 {
+                sp = split(f, t, &g, k, SPLIT_LOOPS, 1);
+            }
+            if not sp and (lv <= 1) {
+                sp = split(f, t, &g, k, SPLIT_GAPS, 2);
+            }
+            rm[k] = not sp;
             continue;
         }
-        let lv = f.level.get(k);
         let mut done = false;
         if lv == 0 {
             done = split(f, t, &g, k, SPLIT_LOOPS, 1);
@@ -2689,6 +2814,80 @@ fn coalesce(f: *mut MFunc) void {
 
 // Allocates registers; afterwards f.assign maps every vreg to a physical
 // register.
+// The uses of rematerialized values, counted by what keeping them in a
+// register saves: nothing at their definition (it goes) or where they are
+// copied (built straight into the copy's register instead), little where
+// an instruction can read them from memory (only outside loops: there the
+// read repeats), else an instruction.
+fn remat_uses(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
+    let nv = iv.len;
+    let mut any = false;
+    for k in 0..nv {
+        if u.notnil(f.remat.get(k)) and (iv[k].e >= 0) {
+            iv[k].uses = 0.0;
+            any = true;
+        }
+    }
+    if not any {
+        return;
+    }
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        let fq = b.freq;
+        let mut i = b.first;
+        while u.notnil(i) {
+            let mut done: [8]i32 = [-1; 8];
+            let mut nd: usize = 0;
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                let cands: [3]i32 = [o.reg, o.base, o.index];
+                for ci in @as(usize, 0)..3 {
+                    let r = cands[ci];
+                    if ((ci == 0) and ((o.kind != K_REG) or ((o.role & RU) == 0))) or ((ci > 0) and (o.kind != K_MEM)) {
+                        continue;
+                    }
+                    if not is_vreg(r) or (@int_cast(usize, r - VREG0) >= nv) or
+                       u.isnil(f.remat.get(@int_cast(usize, r - VREG0))) {
+                        continue;
+                    }
+                    let mut seen = false;
+                    for j in 0..nd {
+                        if done[j] == r {
+                            seen = true;
+                        }
+                    }
+                    if not seen and (nd < 8) {
+                        done[nd] = r;
+                        nd += 1;
+                    }
+                }
+            }
+            for j in 0..nd {
+                let r = done[j];
+                let x = @int_cast(usize, r - VREG0);
+                let def = f.remat.get(x);
+                if def == i {
+                    continue;  // ((reading itself: a zeroing idiom))
+                }
+                let mut cost: f64 = 1.0;
+                if i.is_move and (move_src(i) == r) {
+                    cost = 0.0;
+                } else {
+                    let tr = clone_def(i, -1, -1);
+                    if t.fold_remat(f, tr, r, def) {
+                        cost = 0.5;
+                        if b.loop_depth == 0 {
+                            cost = 0.0;
+                        }
+                    }
+                }
+                iv[x].uses += cost * fq;
+            }
+            i = i.next;
+        }
+    }
+}
+
 pub fn allocate(f: *mut MFunc, t: *Target) void {
     let mut rounds: i32 = 0;
     block_freqs(f);
@@ -2702,6 +2901,7 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
         number(f);
         build_fixed(f);
         let iv = build_intervals(f);
+        remat_uses(f, t, iv);
         if debug_ra {
             for k in 0..iv.len {
                 let x = &iv[k];
@@ -2737,6 +2937,9 @@ pub fn allocate(f: *mut MFunc, t: *Target) void {
             u.die("internal compiler error: register allocation did not converge");
         }
         rewrite_spills(f, t, iv);
+        if debug_ra {
+            dump(f, "rewritten");
+        }
     }
 }
 
