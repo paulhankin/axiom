@@ -40,6 +40,7 @@ they travel with the code they describe.
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
+| [0089](0089-c-vector-float-to-u32-avx512.md) | feature | compiler (C) | Vector `@int_from_float` to `u32` is five instructions on AVX-512 where two do |
 
 ## Closed
 
