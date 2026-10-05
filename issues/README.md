@@ -42,6 +42,7 @@ they travel with the code they describe.
 | [0089](0089-c-vector-float-to-u32-avx512.md) | feature | compiler (C) | Vector `@int_from_float` to `u32` is five instructions on AVX-512 where two do |
 | [0090](0090-selfhost-conditional-table-reductions.md) | feature | compiler (selfhost: combine) | Reductions of table loads under a condition (the benchmark's Zobrist hash): gathers or scalar |
 | [0091](0091-c-compiler-gathers-on-skylake-sp.md) | feature | compiler (C) | LLVM 18 vectorizes with gathers on Skylake-SP/Cascade Lake, where they are slow |
+| [0092](0092-selfhost-stack-slot-liveness.md) | feature | compiler (selfhost: copies, passes) | Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space) |
 
 ## Closed
 
