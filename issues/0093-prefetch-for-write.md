@@ -1,7 +1,7 @@
 # 0093: `@prefetch` cannot ask for a line to be written
 
 - Type: feature
-- Status: open
+- Status: fixed (f63eded)
 - Area: language (§5.7), compiler (C and selfhost)
 
 `@prefetch(p)` (issue 0041) is a hint that the program will soon read the line at `p`
