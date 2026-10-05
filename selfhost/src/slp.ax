@@ -1,0 +1,333 @@
+// =============================================================================
+// slp.ax - straight-line code as vector operations (x86-64).
+//
+// A mask built from the comparisons of neighbouring array elements with one
+// constant, (a[0] == c) | (a[1] == c) << 1 | ... | (a[n-1] == c) << (n-1),
+// is one vector comparison of the n elements loaded together, and @bitmask:
+// with AVX-512 a masked load of just those elements, otherwise scalar loads
+// of them put together in the low half of a vector (n elements of up to 8
+// bytes in all). The shifts may start at any bit and the mask may be part
+// of a larger `or`.
+// =============================================================================
+import "ir.ax" as ir;
+import "target.ax" as tg;
+import "util.ax" as u;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+fn is_op(v: *ir.Value, op: i32) bool {
+    return (v.kind == ir.V_INST) and (v.op == op);
+}
+
+fn count_uses(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.uses = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            use1(i.a, i);
+            use1(i.b, i);
+            use1(i.c, i);
+            for k in 0..i.xs.len {
+                use1(i.xs.get(k), i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+fn use1(v: *mut ir.Value, i: *mut ir.Value) void {
+    if u.notnil(v) and (v.kind == ir.V_INST) {
+        v.uses += 1;
+        v.user = i;
+    }
+}
+
+// One term (cmp(load(base + off), c) as 0 or 1) << shift of a mask.
+struct Term {
+    v: *mut ir.Value,    // the term
+    ld: *mut ir.Value,   // the load
+    cmp: *mut ir.Value,  // the comparison
+    base: *mut ir.Value,
+    off: i64,
+    shift: i64,
+}
+
+// The term v, if it is one (ok false otherwise).
+fn term(v: *mut ir.Value, t: *mut Term) bool {
+    let mut z = v;
+    let mut s: i64 = 0;
+    if is_op(v, ir.OP_SHL) and ir.is_cint(v.b) {
+        z = v.a;
+        s = @bit_cast(i64, ir.cint_val(v.b));
+        if s >= 64 {
+            return false;
+        }
+    }
+    if not is_op(z, ir.OP_ZEXT) or (z.a.ty.kind != ir.T_INT) or (z.a.ty.bits != 1) {
+        return false;
+    }
+    let c = z.a;
+    if not is_op(c, ir.OP_ICMP) or not ir.is_cint(c.b) {
+        return false;
+    }
+    let ld = c.a;
+    if not is_op(ld, ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.blk != v.blk) {
+        return false;
+    }
+    let lb = ld.ty.bits;
+    if (lb != 8) and (lb != 16) and (lb != 32) {
+        return false;
+    }
+    let mut base = ld.a;
+    let mut off: i64 = 0;
+    if is_op(base, ir.OP_PTRADD) and ir.is_cint(base.b) {
+        off = @bit_cast(i64, ir.cint_val(base.b));
+        base = base.a;
+    }
+    t.v = v;
+    t.ld = ld;
+    t.cmp = c;
+    t.base = base;
+    t.off = off;
+    t.shift = s;
+    return true;
+}
+
+// Does anything from the first instruction of b at or after `from` up to
+// `to` (not included) write memory?
+fn writes_between(from: *mut ir.Value, to: *mut ir.Value) bool {
+    let mut i = from;
+    while u.notnil(i) and (i != to) {
+        let op = i.op;
+        if (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
+           (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
+           (op == ir.OP_INTR) {
+            return true;
+        }
+        i = i.next;
+    }
+    return false;
+}
+
+// The leaves of the `or` tree at root (or-s of one use in its block).
+fn leaves(v: *mut ir.Value, root: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) void {
+    if is_op(v, ir.OP_OR) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 64) {
+        leaves(v.a, root, out);
+        leaves(v.b, root, out);
+        return;
+    }
+    out.push(v);
+}
+
+// Is i earlier than j in their block?
+fn before(i: *mut ir.Value, j: *mut ir.Value) bool {
+    let mut x = i;
+    while u.notnil(x) {
+        if x == j {
+            return true;
+        }
+        x = x.next;
+    }
+    return false;
+}
+
+// The n elements (each `bits` wide, n * bits / 8 <= 8 bytes) at p, in the
+// low lanes of a 16-byte vector of them, the others zero.
+fn load_low(B: *mut ir.Builder, p: *mut ir.Value, bits: i32, n: i64, avx512: bool) *mut ir.Value {
+    let lanes = @as(u32, @bit_cast(u32, 128 / bits));
+    let vt = ir.t_vec(ir.t_int(bits), lanes);
+    if avx512 {
+        let mut args: [2]*mut ir.Value = [p, ir.cint(ir.t_int(64), ir.mask_bits(@int_cast(i32, n)))];
+        return ir.intr(B, ir.IN_LOAD_PARTIAL, vt, args[..]);
+    }
+    let bytes = (n * @as(i64, bits)) / 8;
+    let t64 = ir.t_int(64);
+    let mut x = vnil();
+    let mut at: i64 = 0;
+    let mut size: i64 = 8;
+    while at < bytes {
+        while (at + size) > bytes {
+            size = size / 2;
+        }
+        let mut q = p;
+        if at > 0 {
+            q = ir.ptradd(B, p, ir.cint(ir.isz(), @bit_cast(u64, at)));
+        }
+        let mut piece = ir.load(B, ir.t_int(@int_cast(i32, size * 8)), q);
+        piece.align = 1;
+        if size < 8 {
+            piece = ir.zext(B, piece, t64);
+        }
+        if at > 0 {
+            piece = ir.binop(B, ir.OP_SHL, piece, ir.cint(t64, @bit_cast(u64, at * 8)));
+        }
+        if u.isnil(x) {
+            x = piece;
+        } else {
+            x = ir.binop(B, ir.OP_OR, x, piece);
+        }
+        at += size;
+    }
+    let v2 = ir.t_vec(t64, 2);
+    let w = ir.insert_elem(B, ir.czero(v2), x, 0);
+    return ir.bitcast(B, w, vt);
+}
+
+// The mask at root, an `or` of terms, as a vector comparison (and the other
+// leaves or-ed in); true if it was.
+fn vectorize_mask(B: *mut ir.Builder, f: *mut ir.Func, root: *mut ir.Value, avx512: bool) bool {
+    let t = root.ty;
+    let mut ls = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    leaves(root, root, &mut ls);
+    let ts = u.calloc_slice.[Term](ls.len + 1);
+    let mut nt: usize = 0;
+    let mut first = Term.{ v: vnil(), ld: vnil(), cmp: vnil(), base: vnil(), off: 0, shift: 0 };
+    let mut ok = true;
+    for k in 0..ls.len {
+        let mut x = Term.{ v: vnil(), ld: vnil(), cmp: vnil(), base: vnil(), off: 0, shift: 0 };
+        if not term(ls.get(k), &mut x) or (x.v.blk != root.blk) {
+            continue;
+        }
+        if nt == 0 {
+            first = x;
+        } else if (x.base != first.base) or (x.ld.ty.bits != first.ld.ty.bits) or (x.cmp.cv != first.cmp.cv) or
+                  (ir.cint_val(x.cmp.b) != ir.cint_val(first.cmp.b)) {
+            continue;
+        }
+        ts[nt] = x;
+        nt += 1;
+    }
+    if nt < 3 {
+        u.free_slice(ts);
+        u.free(@ptr_cast(*mut void, ls.data));
+        return false;
+    }
+    let bits = first.ld.ty.bits;
+    let size = @as(i64, bits / 8);
+    // n neighbouring elements, each its own bit, in order
+    let n = @int_cast(i64, nt);
+    let mut lo_off: i64 = 0;
+    let mut lo_shift: i64 = 0;
+    if ((n * size) > 16) or (not avx512 and ((n * size) > 8)) {
+        ok = false;
+    }
+    if ok {
+        lo_off = ts[0].off;
+        lo_shift = ts[0].shift;
+        for k in 0..nt {
+            if ts[k].off < lo_off {
+                lo_off = ts[k].off;
+                lo_shift = ts[k].shift;
+            }
+        }
+        let mut seen: u64 = 0;
+        for k in 0..nt {
+            let d = ts[k].off - lo_off;
+            if ((d % size) != 0) or ((d / size) >= n) or ((ts[k].shift - lo_shift) != (d / size)) or
+               ((lo_shift + n) > @as(i64, t.bits)) {
+                ok = false;
+                break;
+            }
+            let bit = @as(u64, 1) << @int_cast(u32, d / size);
+            if (seen & bit) != 0 {
+                ok = false;
+                break;
+            }
+            seen = seen | bit;
+        }
+    }
+    // nothing writes memory between the first load and the root (the loads
+    // move there)
+    let mut earliest = vnil();
+    if ok {
+        earliest = ts[0].ld;
+        for k in 1..nt {
+            if before(ts[k].ld, earliest) {
+                earliest = ts[k].ld;
+            }
+        }
+        ok = not writes_between(earliest, root);
+    }
+    if not ok {
+        u.free_slice(ts);
+        u.free(@ptr_cast(*mut void, ls.data));
+        return false;
+    }
+    ir.at_before(B, root);
+    let p = ir.ptradd(B, first.base, ir.cint(ir.isz(), @bit_cast(u64, lo_off)));
+    let v = load_low(B, p, bits, n, avx512);
+    let c = ir.icmp(B, @truncate(i32, @bit_cast(i64, first.cmp.cv)), v, ir.splat(B, v.ty, first.cmp.b));
+    let mut bargs: [1]*mut ir.Value = [c];
+    let i32t = ir.t_int(32);
+    let mut m = ir.intr(B, ir.IN_BITMASK, i32t, bargs[..]);
+    m = ir.binop(B, ir.OP_AND, m, ir.cint(i32t, ir.mask_bits(@int_cast(i32, n))));
+    if t.bits > 32 {
+        m = ir.zext(B, m, t);
+    } else if t.bits < 32 {
+        m = ir.trunc(B, m, t);
+    }
+    if lo_shift > 0 {
+        m = ir.binop(B, ir.OP_SHL, m, ir.cint(t, @bit_cast(u64, lo_shift)));
+    }
+    // the other leaves
+    for k in 0..ls.len {
+        let x = ls.get(k);
+        let mut used = false;
+        for j in 0..nt {
+            if ts[j].v == x {
+                used = true;
+            }
+        }
+        if not used {
+            m = ir.binop(B, ir.OP_OR, m, x);
+        }
+    }
+    ir.replace_uses(f, root, m);
+    u.free_slice(ts);
+    u.free(@ptr_cast(*mut void, ls.data));
+    return true;
+}
+
+// Masks of comparisons of neighbouring elements as vector comparisons
+// (x86-64). True if any changed.
+pub fn compare_masks(f: *mut ir.Func) bool {
+    if tg.g_arch != tg.ARCH_X64 {
+        return false;
+    }
+    let feats = tg.fn_features(f);
+    let need = (tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL;
+    let avx512 = (feats & need) == need;
+    count_uses(f);
+    let B = ir.new_builder();
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.last;
+        while u.notnil(i) {
+            let prev = i.prev;
+            // a root: an `or` of integers not itself part of a larger one
+            if is_op(i, ir.OP_OR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and (i.uses > 0) and
+               not ((i.uses == 1) and is_op(i.user, ir.OP_OR) and (i.user.blk == b)) {
+                if vectorize_mask(B, f, i, avx512) {
+                    any = true;
+                    count_uses(f);
+                }
+            }
+            i = prev;
+        }
+        b = b.next;
+    }
+    return any;
+}

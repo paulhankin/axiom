@@ -12,6 +12,7 @@
 // left alone too.
 // =============================================================================
 import "ir.ax" as ir;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 fn vnil() *mut ir.Value {
@@ -817,6 +818,17 @@ fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         return simplify_select(B, i);
     }
     let t = i.ty;
+    // x != 0 ? f(ctlz(x)) : k, where f(bits) is k (the count of a zero x is
+    // its width): f(ctlz(x)) (31 - clz(x), or -1 for no bit)
+    if is_op(c, ir.OP_ICMP) and is_k(c.b) and (kval(c.b) == 0) and small_int(t) {
+        let p = pred_of(c);
+        if (p == ir.IntNE) and zero_count_default(i.b, c.a, i.c) {
+            return i.b;
+        }
+        if (p == ir.IntEQ) and zero_count_default(i.c, c.a, i.b) {
+            return i.c;
+        }
+    }
     if (t.kind == ir.T_INT) and (t.bits == 1) {
         if is_kv(i.b, 1) and is_kv(i.c, 0) {
             return c;
@@ -1145,6 +1157,12 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
             return simplify_mul_ov(B, i, id == ir.IN_SMUL_OV);
         }
+        if (id == ir.IN_BITMASK) and (i.xs.len == 1) {
+            return simplify_bitmask(B, i);
+        }
+        if (id == ir.IN_ROTL) and (i.xs.len == 2) and not tg.is_wasm() {
+            return byte_swap(B, i);
+        }
         if (id == ir.IN_FMA) and (i.xs.len == 3) {
             // fma(1, x, y) = x + y exactly (1 * x is x, then one rounding)
             if fone(i.xs.get(0)) {
@@ -1170,6 +1188,159 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         return vnil();
     }
     return vnil();
+}
+
+// Is v, an expression of ctlz(x) or cttz(x) (the count itself, or it plus,
+// minus or xor a constant), equal to the constant k when x is 0 (when the
+// count is x's width)?
+fn zero_count_default(v: *ir.Value, x: *ir.Value, k: *ir.Value) bool {
+    if not is_k(k) {
+        return false;
+    }
+    let mut z = v;
+    let mut op: i32 = 0;
+    let mut cst: u64 = 0;
+    let mut left = false;
+    if (is_op(v, ir.OP_ADD) or is_op(v, ir.OP_XOR)) and is_k(v.b) {
+        z = v.a;
+        op = v.op;
+        cst = kval(v.b);
+    } else if is_op(v, ir.OP_SUB) and is_k(v.a) {
+        z = v.b;
+        op = ir.OP_SUB;
+        cst = kval(v.a);
+        left = true;
+    }
+    if not is_op(z, ir.OP_INTR) or (z.xs.len != 1) or (@int_from_ptr(z.xs.get(0)) != @int_from_ptr(x)) or
+       (@int_from_ptr(z.ty) != @int_from_ptr(v.ty)) {
+        return false;
+    }
+    let id = pred_of(z);
+    if (id != ir.IN_CTLZ) and (id != ir.IN_CTTZ) {
+        return false;
+    }
+    let w = @as(u64, @bit_cast(u32, x.ty.bits));
+    let mut r = w;
+    if op == ir.OP_ADD {
+        r = w +% cst;
+    } else if op == ir.OP_XOR {
+        r = w ^ cst;
+    } else if left {
+        r = cst -% w;
+    }
+    return (r & ir.mask_bits(v.ty.bits)) == kval(k);
+}
+
+// The top bits of the lanes of a constant integer vector (bit k: lane k's),
+// in out; false if c is not one.
+fn const_top_bits(c: *ir.Value, out: *mut u64) bool {
+    if (c.ty.kind != ir.T_VEC) or (c.ty.elem.kind != ir.T_INT) or (c.ty.lanes > 64) {
+        return false;
+    }
+    let top = @as(u64, 1) << @int_cast(u32, c.ty.elem.bits - 1);
+    if ir.is_zero(c) {
+        out.* = 0;
+        return true;
+    }
+    if is_op(c, ir.OP_SPLAT) and ir.is_cint(c.a) {
+        out.* = 0;
+        if (ir.cint_val(c.a) & top) != 0 {
+            out.* = ir.mask_bits(@int_cast(i32, c.ty.lanes));
+        }
+        return true;
+    }
+    if c.kind != ir.V_CAGG {
+        return false;
+    }
+    let mut m: u64 = 0;
+    for k in 0..c.xs.len {
+        let x = c.xs.get(k);
+        if not ir.is_cint(x) {
+            return false;
+        }
+        if (ir.cint_val(x) & top) != 0 {
+            m = m | (@as(u64, 1) << @int_cast(u32, k));
+        }
+    }
+    out.* = m;
+    return true;
+}
+
+// @bitmask(v & c) = @bitmask(v) & @bitmask(c) for a constant c (a lane's
+// top bit is set in v & c when it is in both): the masked lanes of a count
+// of compares are one scalar and.
+fn simplify_bitmask(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let a = i.xs.get(0);
+    if not is_op(a, ir.OP_AND) or (i.ty.kind != ir.T_INT) {
+        return vnil();
+    }
+    let mut m: u64 = 0;
+    let mut x = a.a;
+    if not const_top_bits(a.b, &mut m) {
+        if not const_top_bits(a.a, &mut m) {
+            return vnil();
+        }
+        x = a.b;
+    }
+    let mut args: [1]*mut ir.Value = [x];
+    let r = ir.intr(B, ir.IN_BITMASK, i.ty, args[..]);
+    return ir.binop(B, ir.OP_AND, r, kt(i.ty, m));
+}
+
+// The x of v = ((x >> s) & m) | ((x & m) << s) (two halves of each 2s-bit
+// group swapped; either half also as (x & (m << s)) >> s, (x << s) & (m <<
+// s)), or nil.
+fn swap_stage(v: *ir.Value, s: u64, m: u64) *mut ir.Value {
+    if not is_op(v, ir.OP_OR) {
+        return vnil();
+    }
+    let bits = v.ty.bits;
+    let mh = (m << @int_cast(u32, s)) & ir.mask_bits(bits);
+    let ps: [2]*mut ir.Value = [v.a, v.b];
+    let mut lo = vnil();
+    let mut hi = vnil();
+    for k in @as(usize, 0)..2 {
+        let p = ps[k];
+        if is_op(p, ir.OP_AND) and is_kv(p.b, m) and is_op(p.a, ir.OP_LSHR) and is_kv(p.a.b, s) {
+            lo = p.a.a;
+        } else if is_op(p, ir.OP_LSHR) and is_kv(p.b, s) and is_op(p.a, ir.OP_AND) and is_kv(p.a.b, mh) {
+            lo = p.a.a;
+        } else if is_op(p, ir.OP_SHL) and is_kv(p.b, s) and is_op(p.a, ir.OP_AND) and is_kv(p.a.b, m) {
+            hi = p.a.a;
+        } else if is_op(p, ir.OP_AND) and is_kv(p.b, mh) and is_op(p.a, ir.OP_SHL) and is_kv(p.a.b, s) {
+            hi = p.a.a;
+        }
+    }
+    if u.isnil(lo) or (lo != hi) {
+        return vnil();
+    }
+    return lo;
+}
+
+// rotl(swap of the bytes in each half, half the bits): the bytes of x
+// reversed, one bswap (x86-64) or rev (AArch64), for a 32- or 64-bit x
+// (the last stages of a bit reversal by swaps).
+fn byte_swap(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let t = i.ty;
+    let y = i.xs.get(0);
+    let r = i.xs.get(1);
+    if (t.kind != ir.T_INT) or ((t.bits != 32) and (t.bits != 64)) or
+       not is_kv(r, @as(u64, @bit_cast(u32, t.bits / 2))) {
+        return vnil();
+    }
+    let mut z = y;
+    if t.bits == 64 {
+        z = swap_stage(y, 16, 0x0000FFFF0000FFFF);
+        if u.isnil(z) {
+            return vnil();
+        }
+    }
+    let x = swap_stage(z, 8, 0x00FF00FF00FF00FF & ir.mask_bits(t.bits));
+    if u.isnil(x) {
+        return vnil();
+    }
+    let mut args: [1]*mut ir.Value = [x];
+    return ir.intr(B, ir.IN_BSWAP, t, args[..]);
 }
 
 // 1 / c when c is a floating point constant (or a vector of them) whose
@@ -1213,7 +1384,10 @@ pub fn simplify_branch(t: *mut ir.Value) bool {
         return false;
     }
     let c = t.a;
-    if is_op(c, ir.OP_XOR) and is_kv(c.b, 1) {
+    // (not x: x ^ 1, x == 0, x != 1 of an i1 x)
+    if (is_op(c, ir.OP_XOR) and is_kv(c.b, 1)) or
+       (is_op(c, ir.OP_ICMP) and (c.a.ty.kind == ir.T_INT) and (c.a.ty.bits == 1) and
+        (((pred_of(c) == ir.IntEQ) and is_kv(c.b, 0)) or ((pred_of(c) == ir.IntNE) and is_kv(c.b, 1)))) {
         t.a = c.a;
         let x = t.t1;
         t.t1 = t.t2;

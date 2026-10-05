@@ -18,8 +18,8 @@
 // Alias analysis: a pointer is a base plus a constant offset; the object
 // under a chain of ptradds is identified when it is an alloca or a global.
 // Distinct identified objects never alias, an alloca whose address never
-// escapes is not written by calls, and no computed pointer reaches a noalias
-// global (the shadow stack).
+// escapes is not written by calls, no computed pointer reaches a noalias
+// global (the shadow stack), and nothing writes a constant global.
 // =============================================================================
 import "combine.ax" as cb;
 import "ir.ax" as ir;
@@ -378,6 +378,9 @@ fn overlap(a: i64, an: i64, b: i64, bn: i64) bool {
 }
 
 fn may_alias(x: *Loc, w: *Write) bool {
+    if u.notnil(x.obj) and (x.obj.kind == ir.V_GLOBAL) and x.obj.gv.is_const and not x.obj.gv.tls {
+        return false;  // (constant data: nothing writes it)
+    }
     if w.kind == W_ALL {
         return true;
     }
@@ -822,6 +825,10 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
         add_expr(synth_icmp(cb.inv_pred(tp), c.a, c.b), kbool(false));
         add_expr(synth_icmp(cb.swap_pred(tp), c.b, c.a), kbool(true));
         add_expr(synth_icmp(cb.inv_pred(cb.swap_pred(tp)), c.b, c.a), kbool(false));
+        // x > K is x >= K + 1, x >= K is x > K - 1, and so on
+        if cb.is_k(c.b) and not ir.is_const(c.a) {
+            assume_adjacent(tp, c.a, c.b);
+        }
         // x == K: x is K
         if (tp == ir.IntEQ) and ir.is_const(c.b) and not ir.is_const(c.a) {
             add_known(c.a, c.b);
@@ -850,6 +857,42 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     } else if (c.op == ir.OP_XOR) and (c.ty.bits == 1) and cb.is_k(c.b) {
         assume(c.a, val != (ir.cint_val(c.b) != 0), depth + 1);
     }
+}
+
+// The fact x tp k as the same comparison with the neighbouring constant:
+// x > k as x >= k + 1, x >= k as x > k - 1, x < k as x <= k - 1, x <= k as
+// x < k + 1 (signed or unsigned), where k +- 1 does not wrap.
+fn assume_adjacent(tp: i32, x: *mut ir.Value, k: *mut ir.Value) void {
+    let t = k.ty;
+    let bits = t.bits;
+    if (t.kind != ir.T_INT) or (bits > 64) {
+        return;
+    }
+    let all = ir.mask_bits(bits);
+    let kc = ir.cint_val(k) & all;
+    let smax = all >> 1;
+    let smin = smax + 1;
+    let mut np: i32 = -1;
+    let mut nk: u64 = 0;
+    if ((tp == ir.IntSGT) and (kc != smax)) or ((tp == ir.IntUGT) and (kc != all)) {
+        np = tp + 1;  // ge
+        nk = (kc + 1) & all;
+    } else if ((tp == ir.IntSGE) and (kc != smin)) or ((tp == ir.IntUGE) and (kc != 0)) {
+        np = tp - 1;  // gt
+        nk = (kc -% 1) & all;
+    } else if ((tp == ir.IntSLT) and (kc != smin)) or ((tp == ir.IntULT) and (kc != 0)) {
+        np = tp + 1;  // le
+        nk = (kc -% 1) & all;
+    } else if ((tp == ir.IntSLE) and (kc != smax)) or ((tp == ir.IntULE) and (kc != all)) {
+        np = tp - 1;  // lt
+        nk = (kc + 1) & all;
+    }
+    if np < 0 {
+        return;
+    }
+    let c = ir.cint(t, nk);
+    add_expr(synth_icmp(np, x, c), kbool(true));
+    add_expr(synth_icmp(cb.inv_pred(np), x, c), kbool(false));
 }
 
 const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
