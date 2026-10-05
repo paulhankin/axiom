@@ -40,6 +40,7 @@ they travel with the code they describe.
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
 | [0092](0092-selfhost-stack-slot-liveness.md) | feature | compiler (selfhost: copies, passes) | Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space) |
+| [0093](0093-prefetch-for-write.md) | feature | language, compiler | `@prefetch` cannot ask for a line to be written (Rust's the benchmark cache uses `_MM_HINT_ET0`) |
 
 ## Closed
 
