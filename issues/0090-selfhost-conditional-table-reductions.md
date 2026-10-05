@@ -1,7 +1,7 @@
 # 0090: Self-hosted x86-64: reductions of table loads under a condition (the benchmark's Zobrist hash)
 
 - Type: feature (performance)
-- Status: in progress
+- Status: fixed (bf39971)
 - Area: compiler (selfhost: combine, slp)
 
 the benchmark's `compute_board_hash` (the benchmark `axiom/src/core/moves.ax`, the same as the
@@ -65,3 +65,35 @@ element is the identity of the reduction (`ZOBRIST[0]` is 0: count 0 has key 0),
 `select(c, h ^ load(select(c, &T[i], &T[0])), h)` is just
 `h ^ load(select(c, &T[i], &T[0]))`: one instruction on the reduction's chain
 (`xor h, [addr]`) and one fewer `cmp`/`cmov` per element.
+
+## Resolution
+
+Fixed in bf39971 (`combine.ax` `spec_reduction`): `c ? h op f(T[i]) : h` where if-conversion
+loads `T[i]` from `c ? &T[i] : &T[0]` and `f(T[0])` is the identity of `op` (`add`,
+`sub`, `or`, `xor`, `and`, `mul`; integers only), is `h op f(load)`; likewise
+`c ? f(T[i]) : k` when `f(T[0])` is `k`. `f` is up to four casts and operations
+with a constant (`T[c] << k`). When `T[0]` does not do, an element of the table
+that does (among the first 1024) is loaded instead. the benchmark's hash is then seven
+instructions a point (`movzx; lea; lea; lea; cmp; cmovae; xor h, [p]`) with one
+instruction on the chain, and the smaller body lets the inner loop be unrolled fully.
+
+Counts per 100 `generate_moves_into` (single-stepped): 79.9k to 59.7k instructions
+(LLVM 32.1k, but twelve of its instructions a call are microcoded gathers).
+The hash alone (50 points, 64 boards in turn): 44 to 30 ns (LLVM 106).
+
+Measured (ns per position, min of 11 runs in one session, ±5%):
+
+| kernel | base | fixed | LLVM | Rust |
+|---|---|---|---|---|
+| movegen | 836.4 | 817.0 | 934.0 | 835.7 |
+
+The other kernels are unchanged (no other function's code changes). `bench_search`
+(50 positions, min of 7-15 runs, us a position): 1-ply 188.6 / 188.9 (LLVM 187.8),
+2-ply 2493 / 2493 (LLVM 2765): the hash is too small a part of a search to show.
+
+`bench_search` results (1 and 2 ply) are bit-identical. Test: `tests/run/table_reductions.ax`.
+
+Left: the address of each point is `lea t, [side_base + c]; lea p, [Z + t*8 + 128k]`;
+with `Z + side_base*8` computed once (address reassociation) it would be one `lea`
+(50 instructions a call). A gather vectorizer remains possible for CPUs with fast
+gathers, with a per-CPU cost model (see above).

@@ -40,7 +40,6 @@ they travel with the code they describe.
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0088](0088-selfhost-mask-registers.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: mask registers and what is left after 0077 |
 | [0089](0089-c-vector-float-to-u32-avx512.md) | feature | compiler (C) | Vector `@int_from_float` to `u32` is five instructions on AVX-512 where two do |
-| [0090](0090-selfhost-conditional-table-reductions.md) | feature | compiler (selfhost: combine) | Reductions of table loads under a condition (the benchmark's Zobrist hash): gathers or scalar |
 | [0091](0091-c-compiler-gathers-on-skylake-sp.md) | feature | compiler (C) | LLVM 18 vectorizes with gathers on Skylake-SP/Cascade Lake, where they are slow |
 | [0092](0092-selfhost-stack-slot-liveness.md) | feature | compiler (selfhost: copies, passes) | Self-hosted optimizer: stack-slot liveness (copies between slots, frames that share space) |
 
@@ -122,3 +121,4 @@ they travel with the code they describe.
 | [0083](0083-selfhost-x64-baseline-selection.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: rel32 jumps, two-micro-op cmovs, and SSE2 details (fixed in 32f7a7f, d97dcc9) |
 | [0084](0084-selfhost-padded-board-loads.md) | feature | compiler (selfhost: gvn, x64) | Self-hosted optimizer: loads of a buffer filled by memcpy, and vector and-not without AVX-512 (fixed in dbca74e) |
 | [0085](0085-selfhost-offset-facts.md) | feature | compiler (selfhost: gvn) | Self-hosted optimizer: x - d checks after a test of k - x (fixed in 92ab39d) |
+| [0090](0090-selfhost-conditional-table-reductions.md) | feature | compiler (selfhost: combine) | Reductions of table loads under a condition (the benchmark's Zobrist hash): no gathers (slow here); the select goes (fixed in bf39971) |
