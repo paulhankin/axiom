@@ -3331,6 +3331,135 @@ fn use_block(users: *u.List.[*mut ir.Value], v: *mut ir.Value) *mut ir.Block {
     return l;
 }
 
+// A memset of a stack slot that nothing else in its block uses moves down
+// to where the slot's users are: to the start of the block that dominates
+// them, and where that block branches with users on each way, to each way's
+// start (into a block entered only from it), so that paths that never use
+// the slot do not fill it (a zeroed scratch buffer only fallback paths
+// read). Never into a loop it is outside: there it would fill the slot
+// again each time round.
+fn sink_fills(f: *mut ir.Func, uses: *u.List.[u.List.[*mut ir.Value]]) bool {
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if (i.op == ir.OP_MEMSET) and (b.rpo >= 0) and (i.aux >= 0) and is_inst(i.a, ir.OP_ALLOCA) and
+               (i.a.aux >= 0) {
+                let mut users = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+                let mut ok = true;
+                let us = uses.at(@int_cast(usize, i.a.aux));
+                for k in 0..us.len {
+                    let x = us.get(k);
+                    if u.isnil(x.blk) {
+                        ok = false;  // (moved by this pass)
+                    } else if x != i {
+                        if (x.op == ir.OP_PHI) or (x.blk == b) or (x.blk.rpo < 0) {
+                            ok = false;
+                        }
+                        users.push(x);
+                    }
+                }
+                let mut to = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+                if ok and (users.len > 0) and fill_places(b, users.items(), &mut to, 0) and
+                   not ((to.len == 1) and (to.get(0) == b)) {
+                    for k in 0..to.len {
+                        let mut at = to.get(k).first;
+                        while at.op == ir.OP_PHI {
+                            at = at.next;
+                        }
+                        ir.at_before(B, at);
+                        let c = ir.memop(B, ir.OP_MEMSET, i.a, i.b, i.c);
+                        c.src = i.src;
+                        c.aux = -1;  // (new: not looked at again)
+                    }
+                    ir.remove_inst(i);
+                    any = true;
+                }
+                u.free(@ptr_cast(*mut void, users.data));
+                u.free(@ptr_cast(*mut void, to.data));
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    return any;
+}
+
+// The blocks below r (or r) whose starts can fill a slot for users (all
+// dominated by r) instead of r: into `to`; false if there are too many.
+fn fill_places(r: *mut ir.Block, users: []*mut ir.Value, to: *mut u.List.[*mut ir.Block], depth: i32) bool {
+    let mut l = ir.bnil();
+    for x in users {
+        l = lca(l, x.blk);
+    }
+    if u.isnil(l) or not opt.dominates(r, l) {
+        return false;
+    }
+    // not into a loop r is outside: above the loop header nearest r
+    let mut t = l;
+    let mut c = l;
+    while c != r {
+        for k in 0..c.preds.len {
+            let p = c.preds.get(k);
+            if (p.rpo >= 0) and opt.dominates(c, p) {
+                t = c.idom;
+            }
+        }
+        c = c.idom;
+    }
+    // where t branches, each way with users entered only from t
+    let mut here = false;
+    for x in users {
+        if x.blk == t {
+            here = true;
+        }
+    }
+    let term = ir.terminator(t);
+    if not here and (depth < 4) and u.notnil(term) and (ir.succ_count(term) >= 2) {
+        let mut split = true;
+        let mut parts = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        let mut covered: usize = 0;
+        for k in 0..ir.succ_count(term) {
+            let s = ir.succ(term, k);
+            let mut n: usize = 0;
+            for x in users {
+                if opt.dominates(s, x.blk) {
+                    n += 1;
+                }
+            }
+            if (n > 0) and ((s.preds.len != 1) or (s == t)) {
+                split = false;
+            }
+            covered += n;
+        }
+        if split and (covered == users.len) {
+            for k in 0..ir.succ_count(term) {
+                let s = ir.succ(term, k);
+                parts.clear();
+                for x in users {
+                    if opt.dominates(s, x.blk) {
+                        parts.push(x);
+                    }
+                }
+                if (parts.len > 0) and not fill_places(s, parts.items(), to, depth + 1) {
+                    u.free(@ptr_cast(*mut void, parts.data));
+                    return false;
+                }
+            }
+            u.free(@ptr_cast(*mut void, parts.data));
+            return to.len <= 4;
+        }
+        u.free(@ptr_cast(*mut void, parts.data));
+    }
+    to.push(t);
+    return to.len <= 4;
+}
+
 fn note_use(uses: *mut u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, x: *mut ir.Value) void {
     if u.notnil(o) and (o.kind == ir.V_INST) and (o.aux >= 0) {
         uses.at(@int_cast(usize, o.aux)).push(x);
@@ -3430,15 +3559,7 @@ fn operands_live_at(uses: *u.List.[u.List.[*mut ir.Value]], i: *mut ir.Value, t:
     return true;
 }
 
-pub fn sink(f: *mut ir.Func) bool {
-    if u.isnil(f.first) {
-        return false;
-    }
-    ir.apply_forwarding(f);
-    opt.compute_preds(f);
-    let order = opt.dominators(f);
-    opt.loop_depths(f, &order);
-    // users of each instruction (reachable ones)
+fn sink_uses(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) u.List.[u.List.[*mut ir.Value]] {
     let mut uses = u.List.[u.List.[*mut ir.Value]].{ data: u.nil.[u.List.[*mut ir.Value]](), len: 0, cap: 0 };
     let mut b = f.first;
     while u.notnil(b) {
@@ -3465,13 +3586,34 @@ pub fn sink(f: *mut ir.Func) bool {
             i = i.next;
         }
     }
+    return uses;
+}
+
+pub fn sink(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    opt.loop_depths(f, &order);
+    // users of each instruction (reachable ones): again when sink_fills
+    // moved memsets (the lists hold the ones it took out)
+    let mut uses = sink_uses(f, &order);
+    let mut any = sink_fills(f, &uses);
+    if any {
+        for k in 0..uses.len {
+            u.free(@ptr_cast(*mut void, uses.at(k).data));
+        }
+        u.free(@ptr_cast(*mut void, uses.data));
+        uses = sink_uses(f, &order);
+    }
     // bottom-up: users move before what they use is considered
     let seen = u.newn.[bool](order.len + 1);
     let mut last_from = ir.bnil();
     let mut last_to = ir.bnil();
     let mut last_skips = false;
     let mut last_calls = false;
-    let mut any = false;
     let mut bi = order.len;
     while bi > 0 {
         bi -= 1;

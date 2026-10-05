@@ -872,8 +872,15 @@ fn addr(p: *mut ir.Value) mc.MOp {
 // [base + disp + index*scale] for ptradd p with a variable offset: a
 // constant offset of the base, or of the index, goes into the displacement.
 fn index_mem(p: *mut ir.Value) mc.MOp {
-    let off = p.b;
+    let mut off = p.b;
     let mut m = base_mem(p.a);
+    // a constant added last (combine puts constants outermost): into the
+    // displacement, then the scale of what is left
+    if is_inst(off, ir.OP_ADD) and imm_ok(off.b) and (off.ty.bits == 64) and not folded_load(off.a) and
+       (cval(off.b) > -0x1000_0000) and (cval(off.b) < 0x1000_0000) and fits32(m.disp + cval(off.b)) {
+        m.disp = m.disp + cval(off.b);
+        off = off.a;
+    }
     let mut x = off;
     let mut s: i64 = 1;
     if is_inst(off, ir.OP_MUL) and is_c(off.b) {
@@ -3123,6 +3130,25 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             csz = 2;
         }
         let a = reg(x);
+        if is_c(y) and imm_ok(y) and (x.uses > 1) {
+            // the constant into d, then x where x wins: no copy of x, which
+            // lives on (min(n, 3) with n used after); with x ending here, d
+            // takes x's register and the constant's (hoisted) is cmoved in
+            let c = e2(xe.ALU, csz, R(a), I(narrow_imm(cval(y), csz)));
+            c.cc = 7;
+            _ = e2(xe.MOV_RI, 8, W(d), I(cval(y)));
+            let m = e2(xe.CMOV, sz, RW(d), R(a));
+            if id == ir.IN_SMIN {
+                m.cc = xe.CC_LE;
+            } else if id == ir.IN_SMAX {
+                m.cc = xe.CC_GE;
+            } else if id == ir.IN_UMIN {
+                m.cc = xe.CC_BE;
+            } else {
+                m.cc = xe.CC_AE;
+            }
+            return;
+        }
         let b = imm_reg(y);
         if imm_ok(y) {
             let c = e2(xe.ALU, csz, R(a), I(narrow_imm(cval(y), csz)));
@@ -5414,7 +5440,36 @@ fn maskable_op(x: *mut ir.Value, lanes: i32) *mut ir.Value {
     if ((k == ir.OP_AND) or (k == ir.OP_OR) or (k == ir.OP_XOR)) and (lane_bits(o.ty) == 32) {
         return o;
     }
+    if (minmax_op(o) != 0) and (o.xs.get(0) != o.xs.get(1)) {
+        return o;  // (vpmaxsd zmm{k1}: select(m, max(x, y), x))
+    }
     return vnil();
+}
+
+// The instruction of an integer vector min or max of 8-, 16- or 32-bit
+// lanes, else 0.
+fn minmax_op(o: *ir.Value) i32 {
+    if (o.op != ir.OP_INTR) or (o.ty.kind != ir.T_VEC) or lane_float(o.ty) or (o.xs.len != 2) {
+        return 0;
+    }
+    let id = @truncate(i32, @bit_cast(i64, o.cv));
+    let k = lk(o.ty);
+    if k > 2 {
+        return 0;
+    }
+    if id == ir.IN_SMIN {
+        return pki(k == 0, xe.PMINSB, pki(k == 1, xe.PMINSW, xe.PMINSD));
+    }
+    if id == ir.IN_SMAX {
+        return pki(k == 0, xe.PMAXSB, pki(k == 1, xe.PMAXSW, xe.PMAXSD));
+    }
+    if id == ir.IN_UMIN {
+        return pki(k == 0, xe.PMINUB, pki(k == 1, xe.PMINUW, xe.PMINUD));
+    }
+    if id == ir.IN_UMAX {
+        return pki(k == 0, xe.PMAXUB, pki(k == 1, xe.PMAXUW, xe.PMAXUD));
+    }
+    return 0;
 }
 
 // The operation computing x when a masked instruction does (flag 256).
@@ -5430,17 +5485,25 @@ fn fused_op(x: *mut ir.Value) *mut ir.Value {
 // zeros elsewhere.
 fn masked_op(o: *mut ir.Value, d: i32, zero: bool, src: *mut ir.Value) void {
     // (an operand that is the value merged into, d's lanes already: d)
+    let mut oa = o.a;
+    let mut ob = o.b;
+    if o.op == ir.OP_INTR {
+        oa = o.xs.get(0);
+        ob = o.xs.get(1);
+    }
     let mut a = d;
-    if o.a != src {
-        a = reg(o.a);
+    if oa != src {
+        a = reg(oa);
     }
     let mut b = R(d);
-    if o.b != src {
-        b = R(reg(o.b));
+    if ob != src {
+        b = R(reg(ob));
     }
     let k = o.op;
     let mut id: i32 = 0;
-    if (k >= ir.OP_FADD) and (k <= ir.OP_FDIV) {
+    if k == ir.OP_INTR {
+        id = minmax_op(o);
+    } else if (k >= ir.OP_FADD) and (k <= ir.OP_FDIV) {
         id = fop(k, is_f32(o.ty), true);
     } else if k == ir.OP_ADD {
         id = xe.PADDB + lk(o.ty);
@@ -7390,6 +7453,113 @@ fn unlink_inst(v: *mut ir.Value) void {
     }
 }
 
+// A load into a register that is only copied to another (a stack argument
+// or spilled value reloaded, then moved where it is needed: a call's
+// argument register), with nothing between naming either register, loads
+// into the copy's register instead. (Before drop_reloads, which takes a
+// register a reload wrote to hold the slot from then on.)
+fn fold_load_copies() void {
+    let nv = mc.nvregs(MF);
+    let reads = u.newn.[i32](nv + 1);
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if (o.kind == mc.K_REG) and mc.is_vreg(o.reg) and ((o.role & mc.RU) != 0) {
+                    reads[@int_cast(usize, o.reg - mc.VREG0)] += 1;
+                } else if o.kind == mc.K_MEM {
+                    if mc.is_vreg(o.base) {
+                        reads[@int_cast(usize, o.base - mc.VREG0)] += 1;
+                    }
+                    if mc.is_vreg(o.index) {
+                        reads[@int_cast(usize, o.index - mc.VREG0)] += 1;
+                    }
+                }
+            }
+            i = i.next;
+        }
+    }
+    for bi in 0..MF.blocks.len {
+        let b = MF.blocks.get(bi);
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            let gload = (i.op == xe.LOAD) and (i.ops.len == 2);
+            let vload = (i.op == xe.SSE) and
+                        ((i.cc == xe.MOVDQU_LD) or (i.cc == xe.MOVSS_LD) or (i.cc == xe.MOVSD_LD)) and (i.aux == 0);
+            if (gload or vload) and (i.ops[0].kind == mc.K_REG) and (i.ops[0].role == mc.RD) and
+               mc.is_vreg(i.ops[0].reg) and (i.ops[1].kind == mc.K_MEM) and
+               (reads[@int_cast(usize, i.ops[0].reg - mc.VREG0)] == 1) {
+                let c = load_copy(i, gload);
+                if u.notnil(c) {
+                    i.ops[0].reg = c.ops[0].reg;
+                    if i.spill != 0 {
+                        i.sreg = c.ops[0].reg;  // (for drop_reloads: that register holds the slot now)
+                    }
+                    mc.remove(b, c);
+                }
+            }
+            i = next;
+        }
+    }
+}
+
+// The copy of load l's register after it, when nothing between names that
+// register or the copy's (or branches, calls or is a label); else nil.
+fn load_copy(l: *mut mc.MInst, gpr: bool) *mut mc.MInst {
+    let a = l.ops[0].reg;
+    let ra = P(a);
+    let mut j = l.next;
+    while u.notnil(j) {
+        let op = j.op;
+        if (op == xe.CALL) or (op == xe.LABEL) or (op == xe.JMP) or (op == xe.JCC) or (op == xe.RET) or
+           (op == xe.REP) or (op == xe.VZEROUPPER) or (op == xe.PARAM) {
+            return u.nil.[mc.MInst]();
+        }
+        let is_copy = ((gpr and (op == xe.MOV_RR) and (j.sz == 8)) or
+                       (not gpr and (op == xe.SSE) and (j.cc == xe.MOVAPS))) and (j.ops[0].kind == mc.K_REG) and
+                      (j.ops[0].role == mc.RD) and (j.ops[1].kind == mc.K_REG) and (j.ops[1].reg == a);
+        if is_copy {
+            let rb = P(j.ops[0].reg);
+            if rb == ra {
+                return u.nil.[mc.MInst]();
+            }
+            // (nothing between names the copy's register: checked on the way)
+            let mut x = l.next;
+            while x != j {
+                if names_phys(x, rb) {
+                    return u.nil.[mc.MInst]();
+                }
+                x = x.next;
+            }
+            return j;
+        }
+        if names_phys(j, ra) {
+            return u.nil.[mc.MInst]();
+        }
+        j = j.next;
+    }
+    return u.nil.[mc.MInst]();
+}
+
+// Does i name physical register r (an operand, or in a memory operand)?
+fn names_phys(i: *mc.MInst, r: i32) bool {
+    if (i.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+        return true;
+    }
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and (P(o.reg) == r) {
+            return true;
+        }
+        if (o.kind == mc.K_MEM) and (((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Are the flags i sets read by nothing? (Flags are never live into a block;
 // a local label or jump within the block is taken to read them.)
 fn flags_dead_after(i: *mc.MInst) bool {
@@ -7565,6 +7735,7 @@ fn compile_func(f: *mut ir.Func) void {
     mc.dce(MF, pure_inst);
     fold_remats();
     mc.allocate(MF, &tgt);
+    fold_load_copies();
     mc.drop_reloads(MF, is_label);
     encode_func(f);
 }
@@ -8607,6 +8778,10 @@ fn reuse_flags(b: *mut mc.MBlock) void {
                       sets_flags_of(last) and same_mop(last.ops[0], i.ops[0]) and
                       flags_read_as_test(i, logic_flags(last)) {
                 mc.remove(b, i);  // (the flags of the operation that computed the register)
+            } else if (((op == xe.TEST) and same_mop(i.ops[0], i.ops[1])) or
+                       ((op == xe.ALU) and (i.ops[1].kind == mc.K_IMM) and (i.ops[1].disp == 0))) and
+                      sink_setter(b, i) {
+                mc.remove(b, i);  // (that operation moved down to here)
             } else {
                 last = i;
             }
@@ -8624,6 +8799,70 @@ fn reuse_flags(b: *mut mc.MBlock) void {
         }
         i = nx;
     }
+}
+
+// test r, r (t) after the operation that last wrote r in the block, which
+// sets the flags as it would, with nothing between naming that operation's
+// registers or reading the flags: the operation moves down to t, which is
+// then not needed (blsr early in a loop body, its test at the end). True if
+// it did.
+fn sink_setter(b: *mut mc.MBlock, t: *mut mc.MInst) bool {
+    let r = P(t.ops[0].reg);
+    let mut w = t.prev;
+    while u.notnil(w) and (noop_move(w) or not writes_phys(w, r)) {
+        let op = w.op;
+        if (op == xe.LABEL) or (op == xe.JMP) or (op == xe.JCC) or (op == xe.CALL) {
+            return false;
+        }
+        w = w.prev;
+    }
+    if u.isnil(w) {
+        return false;
+    }
+    // what reads the flags between reads another instruction's, set after w
+    let mut from_w = true;
+    let mut x = w.next;
+    while x != t {
+        let op = x.op;
+        let reads = (op == xe.SETCC) or (op == xe.CMOV) or ((op == xe.ALU) and ((x.cc == 2) or (x.cc == 3)));
+        if reads and from_w {
+            return false;
+        }
+        if not keeps_flags(x) {
+            from_w = false;
+        }
+        x = x.next;
+    }
+    if u.isnil(w) or not sets_flags_of(w) or (w.sz != t.sz) or not flags_read_as_test(t, logic_flags(w)) {
+        return false;
+    }
+    for k in 0..w.ops.len {
+        let o = w.ops[k];
+        if (o.kind != mc.K_REG) and (o.kind != mc.K_IMM) and (o.kind != mc.K_NONE) {
+            return false;
+        }
+    }
+    let mut j = w.next;
+    while j != t {
+        if touches_any(j, w) {
+            return false;
+        }
+        j = j.next;
+    }
+    if w.next == t {
+        return false;  // (reuse_flags' own case)
+    }
+    mc.remove(b, w);
+    mc.insert_before(b, t, w);
+    return true;
+}
+
+// Does i leave the flags as they are?
+fn keeps_flags(i: *mc.MInst) bool {
+    let op = i.op;
+    return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or (op == xe.STORE_I) or
+           (op == xe.LEA) or (op == xe.EXT) or (op == xe.SETCC) or (op == xe.CMOV) or (op == xe.SHIFTX) or
+           ((op == xe.SSE) and (i.cc != xe.UCOMISS) and (i.cc != xe.UCOMISD) and (i.cc != xe.PTEST));
 }
 
 // Does i set ZF and SF from the register it writes (its first operand), as
@@ -9035,6 +9274,7 @@ fn dup_exit_tests(skip: []bool) void {
             }
         }
         let mut j = w.next;
+        let mut set_after = false;  // (flags set since w: what reads them reads those)
         while u.notnil(j) {
             let op = j.op;
             if not noop_move(j) {
@@ -9048,9 +9288,13 @@ fn dup_exit_tests(skip: []bool) void {
                             (op == xe.STORE_I) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.SHIFT) or
                             (op == xe.SHIFTX) or (op == xe.IMUL) or (op == xe.IMUL_I) or (op == xe.TEST) or
                             (op == xe.BITSCAN) or (op == xe.SSE) or (op == xe.BLS) or (op == xe.ANDN) or
-                            ((op == xe.ALU) and (j.cc != 2) and (j.cc != 3));
+                            ((op == xe.ALU) and (j.cc != 2) and (j.cc != 3)) or
+                            (((op == xe.SETCC) or (op == xe.CMOV)) and set_after);
                 if not plain or touches_any(j, w) {
                     movable = false;
+                }
+                if not keeps_flags(j) {
+                    set_after = true;
                 }
             }
             j = j.next;
