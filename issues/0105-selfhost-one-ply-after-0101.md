@@ -4,7 +4,7 @@
 - Status: open
 - Area: compiler (selfhost: gvn, mach, x64, slp)
 
-After 0100 and 0101 (e3fee8f), five 1-ply positions run 5.00M instructions in the
+After 0100 and 0101 (e3fee8f; 79f60f2: 4.99M), five 1-ply positions run 5.00M instructions in the
 self-hosted build against 4.86M in the LLVM-built one (both counts include single-stepped
 `rep` iterations: about 0.10M here, 0.13M there; so about 3.6% more). By function
 (self-hosted / LLVM):
@@ -22,11 +22,12 @@ self-hosted build against 4.86M in the LLVM-built one (both counts include singl
   edge and a jump each, which cost more than the loads. Phi coalescing that prefers the
   input on the likely edge would be needed first.
 - `calculate_contact_inputs` + `eval_batch_cross_roll_into_with_scratch`: 336k / 313k.
-- Sorting (`insertion_sort`, `partition_lt` and the rest for `IdxScore`): 168k / 135k.
-  The f32 score is loaded into an xmm register and moved to a general register for its
-  total-order key (LLVM loads it as an integer; the value is only bit-cast and stored);
-  `v[j - 1]` is bounds-checked although `1 <= j < len`; `tmp`'s index goes through a
-  stack slot.
+- Sorting (`insertion_sort`, `partition_lt` and the rest for `IdxScore`): 168k / 135k
+  (164k since 79f60f2, which loads the f32 score as an integer where it is only bit-cast
+  for its total-order key). `v[j - 1]` is bounds-checked although `1 <= j < len`;
+  `tmp`'s index is spilled to the stack around the inner loop (callee-saved registers
+  are free); storing the score from the integer register (`store(bitcast(x))` as
+  `store(x)`) was tried and moved it to a second spill.
 - `dim128_pair`'s hot loop (15k iterations): `mov r14, r13; shl r14, 9` where LLVM
   shifts in place after the two broadcasts that read the unshifted index (they come after
   the eight weight loads in the source; nothing schedules them first).
