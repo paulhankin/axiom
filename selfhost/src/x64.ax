@@ -8466,6 +8466,207 @@ fn flags_dead_after(i: *mc.MInst) bool {
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Before allocation: a copy d = s (that a two-operand instruction then
+// overwrites) where s is read again further on in the block by instructions
+// that can go first (loads and register arithmetic that leave the flags
+// alone): those move up in front of the copy, so s dies there and the copy
+// can be coalesced away (`idx << 9` for the weight rows, then broadcasts of
+// in[idx]: a shift in place after the broadcasts, not a copy first).
+// -----------------------------------------------------------------------------
+fn op_reads(o: mc.MOp, r: i32) bool {
+    if o.kind == mc.K_REG {
+        return (o.reg == r) and ((o.role & mc.RU) != 0);
+    }
+    if o.kind == mc.K_MEM {
+        return (o.base == r) or (o.index == r);
+    }
+    return false;
+}
+
+fn inst_reads(i: *mc.MInst, r: i32) bool {
+    for k in 0..i.ops.len {
+        if op_reads(i.ops[k], r) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn inst_writes(i: *mc.MInst, r: i32) bool {
+    for k in 0..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and (o.reg == r) and ((o.role & mc.RD) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn reads_memory(i: *mc.MInst) bool {
+    for k in 0..i.ops.len {
+        if i.ops[k].kind == mc.K_MEM {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An instruction that only writes its first operand (a register), reads no
+// flags and sets none, and has no other effect.
+fn hoistable(i: *mc.MInst) bool {
+    let op = i.op;
+    if (i.ops.len == 0) or (i.ops[0].kind != mc.K_REG) or ((i.ops[0].role & mc.RD) == 0) or (i.clobber != 0) or
+       i.keep or (i.spill != 0) {
+        return false;
+    }
+    for k in 1..i.ops.len {
+        let o = i.ops[k];
+        if (o.kind == mc.K_REG) and ((o.role & mc.RD) != 0) {
+            return false;
+        }
+    }
+    if (op == xe.LOAD) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.MOV_RR) or (op == xe.MOV_RI) {
+        return true;
+    }
+    return (op == xe.SSE) and (i.cc != xe.UCOMISS) and (i.cc != xe.UCOMISD) and (i.cc != xe.PTEST) and
+           (i.cc != xe.KORTESTQ) and (i.ops[0].reg != xe.K1);
+}
+
+// May i write memory?
+fn may_store(i: *mc.MInst) bool {
+    let op = i.op;
+    if (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.LEA) or (op == xe.EXT) or
+       (op == xe.SETCC) or (op == xe.CMOV) or (op == xe.LABEL) or (op == xe.TEST) or (op == xe.CMP_M) or
+       (op == xe.JCC) or (op == xe.JMP) {
+        return false;
+    }
+    if ((op == xe.ALU) or (op == xe.SHIFT) or (op == xe.SSE)) and (i.ops.len > 0) and (i.ops[0].kind == mc.K_REG) {
+        return false;
+    }
+    return true;
+}
+
+fn hoist_source_reads(f: *mut mc.MFunc) void {
+    let nv = mc.nvregs(f);
+    // the block each vreg is mentioned in (-2: several)
+    let home = u.newn.[i32](nv + 1);
+    for k in 0..nv {
+        home[k] = -1;
+    }
+    for bi in 0..f.blocks.len {
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                let mut rs: [3]i32 = [-1, -1, -1];
+                if o.kind == mc.K_REG {
+                    rs[0] = o.reg;
+                } else if o.kind == mc.K_MEM {
+                    rs[1] = o.base;
+                    rs[2] = o.index;
+                }
+                for j in @as(usize, 0)..3 {
+                    let r = rs[j];
+                    if r >= mc.VREG0 {
+                        let x = @int_cast(usize, r - mc.VREG0);
+                        let b = @int_cast(i32, bi);
+                        if home[x] == -1 {
+                            home[x] = b;
+                        } else if home[x] != b {
+                            home[x] = -2;
+                        }
+                    }
+                }
+            }
+            i = i.next;
+        }
+    }
+    for bi in 0..f.blocks.len {
+        let b = f.blocks.get(bi);
+        let mut m = b.first;
+        while u.notnil(m) {
+            let nx = m.next;
+            let mut s: i32 = -1;
+            if m.is_move and (m.op == xe.MOV_RR) and u.notnil(nx) and inst_writes(nx, m.ops[0].reg) and
+               inst_reads(nx, m.ops[0].reg) {
+                s = m.ops[1].reg;
+                if (s >= mc.VREG0) and (home[@int_cast(usize, s - mc.VREG0)] != @int_cast(i32, bi)) {
+                    s = -1;  // (s lives on past the block)
+                }
+            } else if (m.op == xe.LEA) and (m.ops[1].kind == mc.K_MEM) and (m.ops[1].index < 0) and
+                      (m.ops[1].base >= mc.VREG0) and (m.ops[1].base != m.ops[0].reg) {
+                // d = s + k, with copies of s after (the phis of `gap = r;
+                // r += 1`): those first, then s can be overwritten in place
+                s = m.ops[1].base;
+            }
+            if s >= mc.VREG0 {
+                hoist_reads_of(b, m, s);
+            }
+            m = m.next;  // (m stays; what moved went in front of it)
+        }
+    }
+}
+
+// Moves the later readers of s in m's block in front of m, if they all can.
+fn hoist_reads_of(b: *mut mc.MBlock, m: *mut mc.MInst, s: i32) void {
+    let mut cand = u.List.[*mut mc.MInst].{ data: u.nil.[*mut mc.MInst](), len: 0, cap: 0 };
+    let mut ok = true;
+    let mut j = m.next;
+    let mut n: i32 = 0;
+    while u.notnil(j) {
+        n += 1;
+        if inst_writes(j, s) and not inst_reads(j, s) {
+            break;  // (s's next value from here)
+        }
+        if inst_reads(j, s) or inst_writes(j, s) {
+            if (n > 40) or inst_writes(j, s) or not hoistable(j) {
+                ok = false;
+                break;
+            }
+            // nothing from m up to j writes what j reads or touches what it
+            // writes, or stores when j loads
+            let d = j.ops[0].reg;
+            let mut k = m;
+            while k != j {
+                for q in 0..j.ops.len {
+                    let o = j.ops[q];
+                    if (o.kind == mc.K_REG) and (o.reg != d) and inst_writes(k, o.reg) {
+                        ok = false;
+                    }
+                    if (o.kind == mc.K_MEM) and
+                       (((o.base >= 0) and inst_writes(k, o.base)) or ((o.index >= 0) and inst_writes(k, o.index))) {
+                        ok = false;
+                    }
+                }
+                if inst_reads(k, d) or inst_writes(k, d) {
+                    ok = false;
+                }
+                if reads_memory(j) and may_store(k) {
+                    ok = false;
+                }
+                if (k.op == xe.JCC) or (k.op == xe.JMP) or (k.op == xe.LABEL) or (k.clobber != 0) {
+                    ok = false;  // (j may run only on some paths)
+                }
+                k = k.next;
+            }
+            if not ok {
+                break;
+            }
+            cand.push(j);
+        }
+        j = j.next;
+    }
+    if ok and (cand.len > 0) {
+        for k in 0..cand.len {
+            let c = cand.get(k);
+            mc.remove(b, c);
+            mc.insert_before(b, m, c);
+        }
+    }
+    u.free(@ptr_cast(*mut void, cand.data));
+}
+
 fn compile_func(f: *mut ir.Func) void {
     F = f;
     nlocal = 0;
@@ -8621,6 +8822,7 @@ fn compile_func(f: *mut ir.Func) void {
     }
     PRE_RA = false;
     mc.dce(MF, pure_inst);
+    hoist_source_reads(MF);
     fold_remats();
     SW = -1;
     if not WIN {
