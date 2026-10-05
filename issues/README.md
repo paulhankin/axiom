@@ -38,6 +38,7 @@ they travel with the code they describe.
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
 | [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) |
 | [0078](0078-selfhost-half-inputs-idioms.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: idioms left in the benchmark's contact half-inputs (bswap, byte compares, kortest) |
+| [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 
 ## Closed
 
@@ -105,3 +106,10 @@ they travel with the code they describe.
 | [0071](0071-selfhost-half-inputs-remaining.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: what is left in the benchmark's contact half-inputs (fixed in d5130b0, 30d8bc2, 106658d) |
 | [0072](0072-selfhost-sse2-shuffles.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without AVX: constant shuffles through memory (fixed in b2dccf2) |
 | [0073](0073-selfhost-outlining-inline-helpers.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: inline helpers' hot bodies outlined as cold functions (fixed in 4b49fd9) |
+| [0079](0079-selfhost-sinking-lengthens-lives.md) | bug | compiler (selfhost: gvn) | Self-hosted optimizer: sinking makes operands live instead of results (fixed in d00826d) |
+| [0080](0080-selfhost-ctlz-without-lzcnt.md) | feature | compiler (selfhost: x64, gvn) | Self-hosted x86-64 without LZCNT: k - ctlz(x) and the shifts it bounds (fixed in b16d1ee) |
+| [0081](0081-selfhost-regalloc-split-gaps.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator: values split at every block boundary (fixed in 56caaec) |
+| [0082](0082-selfhost-if-conversion-or-tests.md) | feature | compiler (selfhost: thread) | Self-hosted if-conversion: stack-slot loads and `if (a or b)` arms (fixed in 3ca2d14) |
+| [0083](0083-selfhost-x64-baseline-selection.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: rel32 jumps, two-micro-op cmovs, and SSE2 details (fixed in 32f7a7f, d97dcc9) |
+| [0084](0084-selfhost-padded-board-loads.md) | feature | compiler (selfhost: gvn, x64) | Self-hosted optimizer: loads of a buffer filled by memcpy, and vector and-not without AVX-512 (fixed in dbca74e) |
+| [0085](0085-selfhost-offset-facts.md) | feature | compiler (selfhost: gvn) | Self-hosted optimizer: x - d checks after a test of k - x (fixed in 92ab39d) |
