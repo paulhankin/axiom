@@ -847,8 +847,243 @@ fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if is_kv(i.b, 1) and is_kv(i.c, 0) {
             return ir.zext(B, c, t);
         }
+        let r = spec_reduction(B, c, i.b, i.c, true);
+        if u.notnil(r) {
+            return r;
+        }
+        return spec_reduction(B, c, i.c, i.b, false);
     }
     return vnil();
+}
+
+// The constant global p points into (through constant offsets, added to
+// *off), or nil.
+fn const_global(p: *mut ir.Value, off: *mut u64) *mut ir.Value {
+    let mut q = p;
+    while is_op(q, ir.OP_PTRADD) and is_k(q.b) {
+        off.* = off.* +% kval(q.b);
+        q = q.a;
+    }
+    if (q.kind != ir.V_GLOBAL) or not q.gv.is_const or u.isnil(q.gv.init) or q.gv.tls or
+       (q.gv.linkage == ir.LINK_WEAK) or (q.gv.linkage == ir.LINK_EXTWEAK) {
+        return vnil();
+    }
+    return q;
+}
+
+// The base of address p, through additions.
+fn addr_base(p: *mut ir.Value) *mut ir.Value {
+    let mut q = p;
+    while is_op(q, ir.OP_PTRADD) {
+        q = q.a;
+    }
+    return q;
+}
+
+// The load v is computed from by extensions, truncations and operations
+// with a constant (`T[i] << k`, `zext(T[i])`), or nil.
+fn leaf_load(v: *mut ir.Value, depth: i32) *mut ir.Value {
+    if is_op(v, ir.OP_LOAD) {
+        return v;
+    }
+    if (depth >= 4) or (v.kind != ir.V_INST) or not small_int(v.ty) {
+        return vnil();
+    }
+    let op = v.op;
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
+        if not small_int(v.a.ty) {
+            return vnil();
+        }
+        return leaf_load(v.a, depth + 1);
+    }
+    if (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) {
+        if not is_k(v.b) or (kval(v.b) >= @bit_cast(u64, @as(i64, v.ty.bits))) {
+            return vnil();
+        }
+        return leaf_load(v.a, depth + 1);
+    }
+    if (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_MUL) or (op == ir.OP_AND) or (op == ir.OP_OR) or
+       (op == ir.OP_XOR) {
+        if not is_k(v.b) {
+            return vnil();
+        }
+        return leaf_load(v.a, depth + 1);
+    }
+    return vnil();
+}
+
+// x, of `bits` bits, sign-extended to 64.
+fn sext_bits(x: u64, bits: i32) u64 {
+    if bits >= 64 {
+        return x;
+    }
+    let sh = @int_cast(u32, 64 - bits);
+    return @bit_cast(u64, @bit_cast(i64, x << sh) >> sh);
+}
+
+// The value of v (a leaf_load chain) when its load reads k.
+fn leaf_value(v: *mut ir.Value, ld: *mut ir.Value, k: u64) u64 {
+    if v == ld {
+        return k & ir.mask_bits(v.ty.bits);
+    }
+    let m = ir.mask_bits(v.ty.bits);
+    let x = leaf_value(v.a, ld, k);
+    let op = v.op;
+    if op == ir.OP_ZEXT {
+        return x;
+    }
+    if op == ir.OP_SEXT {
+        return sext_bits(x, v.a.ty.bits) & m;
+    }
+    if op == ir.OP_TRUNC {
+        return x & m;
+    }
+    let y = kval(v.b);
+    if op == ir.OP_SHL {
+        return (x << @truncate(u32, y)) & m;
+    }
+    if op == ir.OP_LSHR {
+        return x >> @truncate(u32, y);
+    }
+    if op == ir.OP_ASHR {
+        return @bit_cast(u64, @bit_cast(i64, sext_bits(x, v.ty.bits)) >> @truncate(u32, y)) & m;
+    }
+    if op == ir.OP_ADD {
+        return (x +% y) & m;
+    }
+    if op == ir.OP_SUB {
+        return (x -% y) & m;
+    }
+    if op == ir.OP_MUL {
+        return (x *% y) & m;
+    }
+    if op == ir.OP_AND {
+        return x & y;
+    }
+    if op == ir.OP_OR {
+        return x | y;
+    }
+    return x ^ y;
+}
+
+// v (a leaf_load chain) computed from r instead of its load.
+fn leaf_with(B: *mut ir.Builder, v: *mut ir.Value, ld: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    if v == ld {
+        return r;
+    }
+    let x = leaf_with(B, v.a, ld, r);
+    let op = v.op;
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
+        return ir.cast(B, op, x, v.ty);
+    }
+    return ir.binop(B, op, x, v.b);
+}
+
+// The element of type t at byte offset `at` of constant global g, if it is
+// an integer constant (ok false otherwise).
+fn table_int(g: *mut ir.Value, at: u64, t: *mut ir.Ty, ok: *mut bool) u64 {
+    ok.* = false;
+    if (at >= g.gv.ty.size) or ((at + t.size) > g.gv.ty.size) {
+        return 0;
+    }
+    let k = const_at(g.gv.init, at, t);
+    if u.isnil(k) or not is_k(k) {
+        return 0;
+    }
+    ok.* = true;
+    return kval(k);
+}
+
+// If-conversion speculates a load from a constant table under a condition
+// by loading from the table's start instead where the condition fails:
+// `c ? h op f(T[i]) : h` is `h op f(load(c ? &T[i] : &T[0]))` when f(T[0])
+// is op's identity (and `c ? f(T[i]) : k` is the second operand when
+// f(T[0]) is k), where f is a few casts and operations with constants
+// (`T[i] << s`), so the select goes: a reduction like `if (ok) h ^= T[i]`
+// costs one instruction on its chain, not two. When T[0] does not do,
+// an element of T that does replaces it. x is the select's value when c
+// is `when`, y the other.
+fn spec_reduction(B: *mut ir.Builder, c: *mut ir.Value, x: *mut ir.Value, y: *mut ir.Value, when: bool) *mut ir.Value {
+    let t = x.ty;
+    let mut leaf = vnil();
+    let mut op: i32 = -1;
+    let mut want: u64 = 0;
+    let mut swapped = false;
+    if is_k(y) {
+        leaf = x;
+        want = kval(y);
+    } else if is_op(x, ir.OP_ADD) or is_op(x, ir.OP_SUB) or is_op(x, ir.OP_OR) or is_op(x, ir.OP_XOR) or
+              is_op(x, ir.OP_AND) or is_op(x, ir.OP_MUL) {
+        op = x.op;
+        if x.a == y {
+            leaf = x.b;
+        } else if (x.b == y) and (op != ir.OP_SUB) {
+            leaf = x.a;
+            swapped = true;
+        } else {
+            return vnil();
+        }
+        if op == ir.OP_AND {
+            want = ir.mask_bits(t.bits);
+        } else if op == ir.OP_MUL {
+            want = 1;
+        }
+    } else {
+        return vnil();
+    }
+    let ld = leaf_load(leaf, 0);
+    if u.isnil(ld) or (ld.flags != 0) or not small_int(ld.ty) or not is_op(ld.a, ir.OP_SELECT) or (ld.a.a != c) {
+        return vnil();
+    }
+    // the address: p where x is taken, q (in the table) where y is
+    let mut p = ld.a.b;
+    let mut q = ld.a.c;
+    if not when {
+        p = ld.a.c;
+        q = ld.a.b;
+    }
+    let mut off: u64 = 0;
+    let g = const_global(q, &mut off);
+    if u.isnil(g) or (addr_base(p) != g) {
+        return vnil();
+    }
+    let lt = ld.ty;
+    let mut ok = false;
+    let k0 = table_int(g, off, lt, &mut ok);
+    if ok and (leaf_value(leaf, ld, k0) == want) {
+        return x;
+    }
+    // another element of the table that does
+    let n = @min(g.gv.ty.size / lt.size, @as(u64, 1024));
+    let mut at: u64 = 0;
+    let mut found = false;
+    let mut j: u64 = 0;
+    while (j < n) and not found {
+        let kj = table_int(g, j * lt.size, lt, &mut ok);
+        if ok and (leaf_value(leaf, ld, kj) == want) {
+            at = j * lt.size;
+            found = true;
+        }
+        j += 1;
+    }
+    if not found {
+        return vnil();
+    }
+    let q2 = ir.ptradd(B, g, ir.cint(ir.isz(), at));
+    let mut a2 = ir.select(B, c, p, q2);
+    if not when {
+        a2 = ir.select(B, c, q2, p);
+    }
+    let l2 = ir.load(B, lt, a2);
+    l2.align = ld.align;
+    let v = leaf_with(B, leaf, ld, l2);
+    if op < 0 {
+        return v;
+    }
+    if swapped {
+        return ir.binop(B, op, v, y);
+    }
+    return ir.binop(B, op, y, v);
 }
 
 // v as a value of the narrower type t, when that is free: an extension from

@@ -19,8 +19,6 @@ add `+prefer-no-gather` to the x86-64 features: movegen 936 -> 887 ns a position
 gives 12 gathers for the hash, as does `-march=icelake-server`.
 
 Approach: add `+prefer-no-gather` (and `+prefer-no-scatter`) for the CPUs newer LLVMs
-tune that way (`skylake-avx512`, `cascadelake`, `cooperlake`, `cannonlake`,
-`icelake-client`, `icelake-server`, `rocketlake`, `tigerlake`, and the AVX2 client
-cores `skylake`... `alderlake` per LLVM's list) when the CPU comes from the host or
-`--cpu`, in `codegen.c` where the target machine is made and in the per-function
-`target-features` attribute.
+tune that way (Skylake-SP through Tiger Lake; check LLVM's `X86.td` for the list) when the
+CPU comes from the host or `--cpu`, where `codegen.c` makes the target machine and in
+the per-function `target-features` attribute.
