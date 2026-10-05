@@ -1,7 +1,7 @@
 # 0071: Self-hosted x86-64: what is left in the benchmark's contact half-inputs
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (d5130b0, 30d8bc2, 106658d)
 - Area: compiler (selfhost: x64, combine, thread)
 
 Follow-up to 0069. After it, `race_inputs` and `pruning_inputs` run about as many
@@ -40,3 +40,14 @@ anchors 23k (14k), back escapes 14k (4k), the rest about equal. What the code sh
    256 and 128 bits with `vmovaps ymm0,ymm19` / `vmovaps xmm1,xmm0` copies (a shuffle
    to a narrower class, which coalescing cannot merge); LLVM reads the low half of the
    wider register directly. Two copies per reduction, six reductions a call.
+
+## Resolution
+
+Item 5 is done (a reduction reads the low half of the wide register, `low_alias`).
+Besides it: equal values propagated through branches (gvn), vector loads assembled
+from stored lanes and memsets sunk to the paths that use them, `insertps` and masked
+broadcasts for inserts, embedded broadcasts in FMAs, `blsr`/`blsmsk`/`blsi`, integer
+vector min/max under a mask, constants gathered outermost in sums and products. 300
+`contact_inputs` calls went from 999k to 963k instructions (LLVM: 992k); the
+half-inputs from 522k to 490k (448k). Items 2-4 moved to 0078, item 1 (mask registers)
+to 0077.

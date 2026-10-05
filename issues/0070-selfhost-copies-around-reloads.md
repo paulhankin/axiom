@@ -1,7 +1,7 @@
 # 0070: Self-hosted register allocator: copies after reloads and rematerialized arguments, call arguments shuffled
 
 - Type: feature (performance)
-- Status: open
+- Status: fixed (d5130b0, 30d8bc2, 106658d)
 - Area: compiler (selfhost: mach, x64)
 
 Follow-up to 0066 and 0067. After 0067, the benchmark's `MoveGenerator.generate_moves_sub`
@@ -28,3 +28,14 @@ LLVM's 539k. The booleans are branches now; most of the rest is register copies 
 
 Also left from 0067: `@any_true`/`@all_true` of 512-bit vectors go through `kmovq`, a
 compare and `setcc` where `kortest` and a jump would do.
+
+## Resolution
+
+d5130b0, 30d8bc2 and 106658d: a load whose value is only copied loads straight into
+the copy's register (`fold_load_copies`, for stack arguments and spill slots), reloads of
+a slot whose register still holds it are dropped across blocks as well as within one
+(`drop_reloads` as a dataflow over the function), and a test after a flag-setting
+instruction uses its flags. With the rest of these commits `generate_moves_sub` went from
+614k to 595k instructions (LLVM: 546k) and the 100 `generate_moves_into` calls from
+1049k to 1017k (901k). Call-argument shuffles, stores at joins, splits at loop edges,
+mask registers and the rest moved to 0077; `kortest` to 0078.

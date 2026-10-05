@@ -36,8 +36,8 @@ they travel with the code they describe.
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
-| [0070](0070-selfhost-copies-around-reloads.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: copies after reloads and rematerialized arguments, call arguments shuffled |
-| [0071](0071-selfhost-half-inputs-remaining.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: what is left in the benchmark's contact half-inputs |
+| [0077](0077-selfhost-regalloc-remaining.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: what is left after 0070 (movegen, mask registers, loop splits) |
+| [0078](0078-selfhost-half-inputs-idioms.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: idioms left in the benchmark's contact half-inputs (bswap, byte compares, kortest) |
 
 ## Closed
 
@@ -101,5 +101,7 @@ they travel with the code they describe.
 | [0067](0067-selfhost-booleans-in-branches.md) | feature | compiler (selfhost: combine, thread, opt, x64, mach) | Self-hosted optimizer: booleans materialised as 0/1 and tested again (fixed in b5484e8, c35afe7, c77857d) |
 | [0068](0068-selfhost-input-kernels-unrolling.md) | feature | compiler (selfhost: unroll) | Self-hosted optimizer: the benchmark's input encoders keep long point loops rolled (fixed in 95c7657) |
 | [0069](0069-selfhost-input-kernels-remaining.md) | feature | compiler (selfhost: opt layout, x64, mach) | Self-hosted x86-64: what is left between the input encoders and LLVM's (fixed in 7133181, 62d2e71, f8011f3, f40fe96) |
+| [0070](0070-selfhost-copies-around-reloads.md) | feature | compiler (selfhost: mach, x64) | Self-hosted register allocator: copies after reloads and rematerialized arguments, call arguments shuffled (fixed in d5130b0, 30d8bc2, 106658d) |
+| [0071](0071-selfhost-half-inputs-remaining.md) | feature | compiler (selfhost: x64, combine, thread) | Self-hosted x86-64: what is left in the benchmark's contact half-inputs (fixed in d5130b0, 30d8bc2, 106658d) |
 | [0072](0072-selfhost-sse2-shuffles.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without AVX: constant shuffles through memory (fixed in b2dccf2) |
 | [0073](0073-selfhost-outlining-inline-helpers.md) | bug | compiler (selfhost: outline) | Self-hosted outliner: inline helpers' hot bodies outlined as cold functions (fixed in 4b49fd9) |
