@@ -39,6 +39,7 @@ they travel with the code they describe.
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
+| [0095](0095-selfhost-x64-code-alignment.md) | feature | compiler (selfhost: x64, x64enc) | Self-hosted x86-64: code alignment (functions, loop headers, the JCC erratum) |
 
 ## Closed
 
