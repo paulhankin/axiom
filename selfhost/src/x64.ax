@@ -1613,7 +1613,7 @@ const F_VALUE: i32 = 8192;
 const F_RMW: i32 = 16384;     // a load, operation and store as one instruction (mark_rmw)
 const F_RUN: i32 = 32768;     // the first of a run of constant stores, which stores them all (aux2: how many)
 const F_IN_RUN: i32 = 65536;  // a later store of such a run
-const F_ANDN: i32 = 131072;   // a `not` that its only user, an `and`, computes as andn (BMI1)
+const F_ANDN: i32 = 131072;   // a `not` that its only user, an `and`, computes as andn (BMI1) or pandn
 const F_BCST: i32 = 524288;   // a splat of a load that its only user, an @fma, reads as an embedded broadcast
 const F_BLS: i32 = 262144;    // an x - 1 or 0 - x that its only user (x & or ^ it) computes as blsr / blsmsk / blsi
 const F_BSR: i32 = 1048576;   // a ctlz whose users are all k - it or it + k: holds bsr(x) instead (no LZCNT)
@@ -1706,6 +1706,21 @@ fn bls_source(n: *mut ir.Value) *mut ir.Value {
 
 fn bcast_splat(v: *ir.Value) bool {
     return (v.kind == ir.V_INST) and (v.op == ir.OP_SPLAT) and ((v.flag & F_BCST) != 0);
+}
+
+// The value a vector `not` (an xor with all ones) negates.
+fn vnot_of(n: *mut ir.Value) *mut ir.Value {
+    if all_ones(n.b) {
+        return n.a;
+    }
+    return n.b;
+}
+
+// Is n a vector `not` of a register value, used only by `and` i (in its
+// block), which computes it as pandn?
+fn vandn_not(n: *mut ir.Value, i: *mut ir.Value) bool {
+    return (n.kind == ir.V_INST) and (n.op == ir.OP_XOR) and (n.uses == 1) and (n.blk == i.blk) and (n.flag == 0) and
+           (all_ones(n.b) or all_ones(n.a)) and not folded_load(n.a) and not folded_load(n.b);
 }
 
 // Is v a `not` of an i1 (xor with 1)?
@@ -3838,6 +3853,21 @@ fn vec_binop(v: *mut ir.Value) void {
         vec_shift(v, d, reg(v.a));
         return;
     }
+    if o == ir.OP_AND {
+        // ~n & x: pandn (the not marked F_ANDN by prepare)
+        let sa = (v.a.kind == ir.V_INST) and ((v.a.flag & F_ANDN) != 0);
+        let sb = (v.b.kind == ir.V_INST) and ((v.b.flag & F_ANDN) != 0);
+        if sa or sb {
+            let mut n = v.b;
+            let mut x = v.a;
+            if sa {
+                n = v.a;
+                x = v.b;
+            }
+            sse3(xe.PANDN, d, reg(vnot_of(n)), vsrc(x));
+            return;
+        }
+    }
     let mut ra: i32 = 0;
     let b = vsrc_of(v, &mut ra);
     let k = lk(t);
@@ -4882,6 +4912,45 @@ fn shuffle_match(v: *mut ir.Value, gen: bool) bool {
         }
         w = widen_mask(w);
         wb = wb * 2;
+    }
+    // one source's lanes moved down or up by whole bytes, zeros shifted in
+    // (the other source zero): psrldq, pslldq
+    if t.size == 16 {
+        for zi in @as(i32, 0)..2 {
+            if same or not is_vzero(srcs[@int_cast(usize, zi)]) {
+                continue;
+            }
+            let x = 1 - zi;
+            for left in @as(i32, 0)..2 {
+                for s in @as(i32, 1)..n {
+                    let mut ok = true;
+                    for i in @as(i32, 0)..n {
+                        let l = m[@int_cast(usize, i)];
+                        if l < 0 {
+                            continue;
+                        }
+                        let mut from = i + s;
+                        if left == 1 {
+                            from = i - s;
+                        }
+                        if (from >= 0) and (from < n) {
+                            ok = ok and (l == ((x * n) + from));
+                        } else {
+                            ok = ok and ((l / n) == zi);
+                        }
+                    }
+                    if ok and not gen {
+                        return true;
+                    }
+                    if ok {
+                        let d = vreg(v);
+                        let a = reg(srcs[@int_cast(usize, x)]);
+                        vshift_imm(pki(left == 1, xe.PSLLDQ_I, xe.PSRLDQ_I), d, a, @as(i64, s * (bits / 8)));
+                        return true;
+                    }
+                }
+            }
+        }
     }
     // 32-bit lanes permuted within each group (one source)
     let mut m32 = m;
@@ -6948,6 +7017,24 @@ fn prepare(f: *mut ir.Func) void {
             }
             b = b.next;
         }
+    }
+    // ~y & x on vectors of up to 256 bits as pandn, the `not` used only there
+    // (AVX-512 forms of and-not are blends and ternary logic: see sel_parts)
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_AND) and (i.ty.kind == ir.T_VEC) and (i.ty.size <= 32) and not avx512_for(i.ty.size) and
+               (i.flag == 0) and (i.a != i.b) and not folded_load(i.a) {
+                if vandn_not(i.b, i) {
+                    i.b.flag = i.b.flag | F_ANDN;
+                } else if vandn_not(i.a, i) {
+                    i.a.flag = i.a.flag | F_ANDN;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
     }
     // ctlz(x) used only as k - ctlz(x) or ctlz(x) + k: bsr(x), the index of
     // the highest set bit, and k - ctlz(x) = bsr(x) + (k - (bits - 1)),

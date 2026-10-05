@@ -35,6 +35,7 @@ const K_MEM: i32 = 1;    // key: base pointer, off, ty; val: the value in memory
 const K_KNOWN: i32 = 2;  // key: a value, val: the constant it equals
 const K_LE: i32 = 3;     // key <= val + off (unsigned, as natural numbers; val nil: 0)
 const K_FILL: i32 = 4;   // key: base pointer, off; val: a memset of constant bytes there
+const K_COPY: i32 = 5;   // key: base pointer, off: of the destination of val, a memcpy or memmove
 
 struct Ent {
     kind: i32,
@@ -658,6 +659,116 @@ fn compose_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
     }
     changed = true;
     return v;
+}
+
+// -----------------------------------------------------------------------------
+// Loads of what a memcpy (or memmove) of a constant size put in memory read
+// its source instead, when nothing has written either since: a buffer that is
+// zeroed, filled from elsewhere and loaded as vectors (the benchmark's padded board)
+// otherwise goes through the stack, its loads straddling the copy's stores
+// (which the processor cannot forward). A load that ends in a zeroed tail
+// (memset 0) past the copied bytes is the copy's last bytes, shifted down
+// with zeros (a byte shift).
+// -----------------------------------------------------------------------------
+fn copy_hash(base: *ir.Value) u64 {
+    return mix(hp(base), 0x434f_5059);
+}
+
+fn note_copy(i: *mut ir.Value) void {
+    let n = size_of(i.c);
+    if (n <= 0) or (i.flags != 0) {
+        return;
+    }
+    let l = loc_of(i.a, n);
+    push_ent(K_COPY, copy_hash(l.base), l.base, l.off, i.ty, i);
+}
+
+// Has nothing written l since the write list was h long?
+fn quiet_since(h: usize, l: *Loc) bool {
+    if (writes.len - h) > 256 {
+        return false;
+    }
+    for w in h..writes.len {
+        if may_alias(l, writes.at(w)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sub_loc(l: *Loc, off: i64, size: i64) Loc {
+    return Loc.{ base: l.base, obj: l.obj, off: l.off + off, size: size, rok: l.rok, rlo: l.rlo + off,
+                 rhi: l.rhi + off };
+}
+
+// The value of load i (at l) from its copy's source, or nil.
+fn forward_copy(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let t = i.ty;
+    let size = l.size;
+    if (size <= 0) or ((t.kind != ir.T_INT) and (t.kind != ir.T_FLOAT) and (t.kind != ir.T_VEC)) {
+        return vnil();
+    }
+    let mut e = bk.get(@truncate(usize, copy_hash(l.base)) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at(@int_cast(usize, e));
+        e = x.next;
+        if (x.kind != K_COPY) or (x.key != l.base) {
+            continue;
+        }
+        let c = x.val;
+        let n = size_of(c.c);
+        let end = x.off + n;
+        if (l.off < x.off) or (l.off >= end) or (n < size) {
+            continue;
+        }
+        let head = @min(l.off + size, end) - l.off;  // bytes from the copy
+        let hl = sub_loc(l, 0, head);
+        if not quiet_since(x.height, &hl) {
+            return vnil();
+        }
+        // the source bytes the load reads: [from, from + size)
+        let mut from = l.off - x.off;
+        let tail = size - head;
+        if tail > 0 {
+            from = n - size;
+            if (t.kind != ir.T_VEC) or ((tail % @bit_cast(i64, t.elem.size)) != 0) or
+               not zero_since(sub_loc(l, head, tail)) {
+                return vnil();
+            }
+        }
+        let src = loc_of(c.b, n);
+        let sl = sub_loc(&src, from, size);
+        let dw = Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: x.off, size: n, rok: false, rlo: 0, rhi: 0 };
+        if may_alias(&sl, &dw) or not quiet_since(x.height, &sl) {
+            return vnil();
+        }
+        let bld = ir.new_builder();
+        ir.at_before(bld, i);
+        let ld = ir.load(bld, t, ir.ptradd(bld, c.b, ir.cint(ir.isz(), @bit_cast(u64, from))));
+        ld.align = 1;
+        if tail == 0 {
+            return ld;
+        }
+        // lanes from the copy's last bytes, then zeros
+        let lanes = @int_cast(i32, t.lanes);
+        let sh = @int_cast(i32, tail / @bit_cast(i64, t.elem.size));
+        let mask = u.newn.[i32](@int_cast(usize, lanes) + 1)[0..@int_cast(usize, lanes)];
+        for k in @as(i32, 0)..lanes {
+            if (k + sh) < lanes {
+                mask[@int_cast(usize, k)] = k + sh;
+            } else {
+                mask[@int_cast(usize, k)] = lanes;
+            }
+        }
+        return ir.shuffle(bld, ld, ir.czero(t), mask);
+    }
+    return vnil();
+}
+
+// Is l zero, set by a memset of 0 with nothing written there since?
+fn zero_since(l: Loc) bool {
+    let b = find_fill(&l);
+    return u.notnil(b) and ir.is_cint(b) and ((ir.cint_val(b) & 0xff) == 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -1827,6 +1938,9 @@ fn visit_block(b: *mut ir.Block) void {
                 if u.isnil(r) {
                     r = compose_load(i, &l);
                 }
+                if u.isnil(r) {
+                    r = forward_copy(i, &l);
+                }
                 if u.notnil(r) {
                     replace(i, r);
                 } else {
@@ -1852,6 +1966,8 @@ fn visit_block(b: *mut ir.Block) void {
             if (op == ir.OP_MEMSET) and ir.is_cint(i.b) and (size_of(i.c) > 0) {
                 let l = loc_of(i.a, size_of(i.c));
                 push_ent(K_FILL, fill_hash(l.base), l.base, l.off, ir.t_void(), i);
+            } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+                note_copy(i);
             }
         }
         i = next;
