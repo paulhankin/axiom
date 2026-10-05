@@ -5626,7 +5626,10 @@ fn vec_cvt(v: *mut ir.Value) void {
 // Are the lanes of index vector x all below n (unsigned), as constants or
 // masked by one?
 fn known_below(x0: *ir.Value, n: u64) bool {
-    let x = x0;
+    let mut x = x0;
+    while is_inst(x, ir.OP_COPY) {
+        x = x.a;  // (a constant hoisted out of a loop)
+    }
     if x.kind == ir.V_ZERO {
         return true;
     }
@@ -8728,6 +8731,50 @@ fn hoist_reads_of(b: *mut mc.MBlock, m: *mut mc.MInst, s: i32) void {
     u.free(@ptr_cast(*mut void, cand.data));
 }
 
+// AVX-512: a broadcast of lane k >= 1 of a vector of 32-bit lanes into
+// 512 bits (splat(extract(v, k)), which SLP makes of the deltas of the
+// pruning nets' inputs) is one vpermd/vpermps by a constant index vector,
+// which goes out of loops with the other constants, rather than a shuffle
+// to lane 0 and a broadcast from there.
+fn perm_lane_splats(f: *mut ir.Func) void {
+    if not avx512_for(64) {
+        return;
+    }
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let nx = i.next;
+            if (i.op == ir.OP_SPLAT) and (i.ty.kind == ir.T_VEC) and (i.ty.size == 64) and (lane_bits(i.ty) == 32) and
+               is_inst(i.a, ir.OP_EXTRACTELEM) and (i.a.a.ty.kind == ir.T_VEC) and (lane_bits(i.a.a.ty) == 32) and
+               (lane_float(i.a.a.ty) == lane_float(i.ty)) and (i.a.a.ty.lanes <= 16) and (i.a.cv >= 1) and
+               (i.a.cv < @as(u64, @bit_cast(u32, i.a.a.ty.lanes))) {
+                let k = i.a.cv;
+                let it = ir.t_int(32);
+                let lanes = u.newn.[*mut ir.Value](16);
+                for j in @as(usize, 0)..16 {
+                    lanes[j] = ir.cint(it, k);
+                }
+                let idx = ir.cagg(ir.t_vec(it, 16), lanes);
+                let bd = ir.new_builder();
+                ir.at_before(bd, i);
+                let mut args: [2]*mut ir.Value = [i.a.a, idx];
+                let p = ir.intr(bd, ir.IN_PERM, i.ty, args[..]);
+                ir.forward(i, p);
+                ir.remove_inst(i);
+                any = true;
+            }
+            i = nx;
+        }
+        b = b.next;
+    }
+    if any {
+        ir.apply_forwarding(f);
+        opt.dce(f);  // (the extracts, when nothing else reads them)
+    }
+}
+
 fn compile_func(f: *mut ir.Func) void {
     F = f;
     nlocal = 0;
@@ -8737,6 +8784,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.split_critical_edges(f);
     opt.split_loop_exits(f);
     lower.scalarize(f, legal);
+    perm_lane_splats(f);
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
