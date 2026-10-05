@@ -49,6 +49,7 @@ they travel with the code they describe.
 
 | # | Type | Area | Title |
 |---|------|------|-------|
+| [0104](0104-vdso-clock.md) | feature | runtime | Native Linux programs read the clock with a system call, not the vDSO |
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
 | [0007](0007-profile-program-arguments.md) | feature | compiler: `axiom profile` | `axiom profile` cannot pass arguments to the program |
