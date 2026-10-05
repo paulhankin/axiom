@@ -502,8 +502,152 @@ pub fn ppoll(fds: *mut void, n: u64, timeout_ms: i32) isize {
     return ax_syscall(nr(SYS_PPOLL), @int_from_ptr(fds), @truncate(usize, n), tsp, 0, 8, 0);
 }
 
+// clock_gettime through the vDSO, the kernel's code mapped into every process, which reads
+// the clock without entering the kernel (a system call costs several times as much, and a
+// program that times short pieces of work measures it); the system call when there is no
+// vDSO or it has no clock_gettime, or it answers that it cannot read this clock.
 pub fn clock_gettime(clock: i32, ts: *mut Timespec) isize {
+    let f = vdso_clock_gettime();
+    if f != 0 {
+        let call = @bit_cast(fn(i32, *mut Timespec) i32, f);
+        let r = call(clock, ts);
+        if r == 0 {
+            return 0;
+        }
+    }
     return sys2(SYS_CLOCK_GETTIME, si(clock), @int_from_ptr(ts));
+}
+
+// The address of the vDSO's clock_gettime, or 0: looked up once (every thread finds the same).
+let mut vdso_cgt: usize = 0;
+let mut vdso_looked_up: u32 = 0;
+
+fn vdso_clock_gettime() usize {
+    if @atomic_load(&vdso_looked_up) != 0 {
+        return @atomic_load(&vdso_cgt);
+    }
+    let mut name: []u8 = "__vdso_clock_gettime";
+    if axiom_target_arch() == 2 {
+        name = "__kernel_clock_gettime";
+    }
+    let f = vdso_symbol(@truncate(usize, auxv(33)), name);  // AT_SYSINFO_EHDR
+    @atomic_store(&mut vdso_cgt, f);
+    @atomic_store(&mut vdso_looked_up, 1);
+    return f;
+}
+
+fn rd8(a: usize) u8 {
+    return @ptr_from_int(*u8, a).*;
+}
+
+fn rd16(a: usize) u16 {
+    return @ptr_from_int(*u16, a).*;
+}
+
+fn rd32(a: usize) u32 {
+    return @ptr_from_int(*u32, a).*;
+}
+
+fn rd64(a: usize) u64 {
+    return @ptr_from_int(*u64, a).*;
+}
+
+// The address of the function `name` defined by the ELF image (the vDSO) at `base`, or 0.
+fn vdso_symbol(base: usize, name: []u8) usize {
+    if base == 0 {
+        return 0;
+    }
+    // ELF64, little-endian ("\x7fELF", class 2, data 1)
+    if (rd32(base) != 0x464c457f) or (rd8(base + 4) != 2) or (rd8(base + 5) != 1) {
+        return 0;
+    }
+    let phoff = @truncate(usize, rd64(base + 32));
+    let phentsize = @as(usize, rd16(base + 54));
+    let phnum = @as(usize, rd16(base + 56));
+    // Addresses in the image are virtual addresses of its first PT_LOAD.
+    let mut load_bias: usize = 0;
+    let mut have_load = false;
+    let mut dynamic: usize = 0;
+    for i in @as(usize, 0)..phnum {
+        let ph = (base + phoff) + (i * phentsize);
+        let kind = rd32(ph);
+        let offset = @truncate(usize, rd64(ph + 8));
+        let vaddr = @truncate(usize, rd64(ph + 16));
+        if (kind == 1) and not have_load {  // PT_LOAD
+            load_bias = (base + offset) -% vaddr;
+            have_load = true;
+        } else if kind == 2 {  // PT_DYNAMIC
+            dynamic = base + offset;
+        }
+    }
+    if (dynamic == 0) or not have_load {
+        return 0;
+    }
+    let mut strtab: usize = 0;
+    let mut symtab: usize = 0;
+    let mut hash: usize = 0;
+    let mut gnu_hash: usize = 0;
+    let mut d = dynamic;
+    loop {
+        let tag = rd64(d);
+        if tag == 0 {
+            break;
+        }
+        let v = load_bias +% @truncate(usize, rd64(d + 8));
+        if tag == 5 {  // DT_STRTAB
+            strtab = v;
+        } else if tag == 6 {  // DT_SYMTAB
+            symtab = v;
+        } else if tag == 4 {  // DT_HASH
+            hash = v;
+        } else if tag == 0x6ffffef5 {  // DT_GNU_HASH
+            gnu_hash = v;
+        }
+        d += 16;
+    }
+    if (strtab == 0) or (symtab == 0) {
+        return 0;
+    }
+    // The number of symbols: DT_HASH's chain count, else one past the last symbol a
+    // DT_GNU_HASH chain reaches.
+    let mut nsyms: usize = 0;
+    if hash != 0 {
+        nsyms = @as(usize, rd32(hash + 4));
+    } else if gnu_hash != 0 {
+        let nbuckets = @as(usize, rd32(gnu_hash));
+        let symoffset = @as(usize, rd32(gnu_hash + 4));
+        let bloom_size = @as(usize, rd32(gnu_hash + 8));
+        let buckets = (gnu_hash + 16) + (bloom_size * 8);
+        let chains = buckets + (nbuckets * 4);
+        let mut last: usize = 0;
+        for b in @as(usize, 0)..nbuckets {
+            last = @max(last, @as(usize, rd32(buckets + (b * 4))));
+        }
+        if last >= symoffset {
+            while (rd32(chains + ((last - symoffset) * 4)) & 1) == 0 {
+                last += 1;
+            }
+            nsyms = last + 1;
+        }
+    }
+    for i in @as(usize, 0)..nsyms {
+        let sym = symtab + (i * 24);
+        let info = rd8(sym + 4);
+        let shndx = rd16(sym + 6);
+        // a defined function (STT_FUNC), global or weak
+        if ((info & 0xf) != 2) or (((info >> 4) != 1) and ((info >> 4) != 2)) or (shndx == 0) {
+            continue;
+        }
+        let s = strtab + @as(usize, rd32(sym));
+        let mut k: usize = 0;
+        while (k < name.len) and (rd8(s + k) == name[k]) {
+            k += 1;
+        }
+        if (k == name.len) and (rd8(s + k) == 0) {
+            return load_bias +% @truncate(usize, rd64(sym + 8));
+        }
+    }
+    return 0;
 }
 
 // The number of processors the program may run on.
