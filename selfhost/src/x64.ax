@@ -50,10 +50,37 @@ let mut AVX: bool = false;
 let mut VL: u8 = 0;           // the vector width of the instruction being selected: 0 (128 bits), 32 or 64 bytes
 let mut UPPER: bool = false;  // the function uses ymm or zmm registers (vzeroupper before calls and returns)
 let mut WIN: bool = false;    // Windows x64: its calling convention, and thread-locals through the TEB
-// Measuring code placement: AXIOM_X64_FPAD=n puts n bytes in front of every
-// function (before it is aligned), so that builds of one program with
-// different n place its code differently (see units.options_id).
+// Code placement (encode_func), with knobs for measuring it (issue 0095),
+// read from the environment and part of the object cache's key:
+//
+//   AXIOM_X64_FPAD=n    n bytes in front of every function (before it is
+//                       aligned): builds of one program with different n
+//                       place its code differently
+//   AXIOM_X64_FALIGN=a  functions start at multiples of a bytes (default 16)
+//   AXIOM_X64_LALIGN=a  hot loop tops start at multiples of a bytes (default
+//                       0: not aligned), with no more than AXIOM_X64_LMAX
+//                       (default 15) bytes of nops; AXIOM_X64_LMODE=1
+//                       (default) aligns the targets of jumps back, 2 any
+//                       block in a loop that is not often fallen into (as
+//                       LLVM does)
+//   AXIOM_X64_JCC=1     no jump, call or return (with the compare a jcc
+//                       fuses with) crosses or ends on a 32-byte boundary:
+//                       Intel's JCC erratum, whose microcode fix keeps such
+//                       a jump out of the decoded-µop cache on Skylake-family
+//                       cores; nops move it to the boundary
+//
+// .text is aligned to 64 bytes, so where each instruction will sit relative
+// to 32- and 64-byte boundaries is known while encoding (FBASE: where the
+// function being encoded will start). Measured on the benchmark (Cascade Lake,
+// 0095), neither aligned loops nor the JCC padding made the code faster
+// (the padding made it slower), so none is on by default.
 let mut FPAD: usize = 0;
+let mut FALIGN: u64 = 16;
+let mut LALIGN: u64 = 0;
+let mut LMAX: u64 = 15;
+let mut LMODE: i32 = 1;
+let mut JCC: bool = false;
+let mut FBASE: u64 = 0;
 
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
@@ -8737,6 +8764,8 @@ let mut jshort: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0
 let mut jstart: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 let mut jlabel: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
 let mut jnext: usize = 0;
+// the rel8 jumps of a pass: jump number << 32 | its fixup
+let mut jfix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 
 // A jump (jmp: 0xe9 / 0xeb; jcc: 0x0f 0x80+cc / 0x70+cc) to label l.
 fn enc_jump(l: i32, cond: bool, cc: i32) void {
@@ -8753,6 +8782,7 @@ fn enc_jump(l: i32, cond: bool, cc: i32) void {
         } else {
             b8(0xeb);
         }
+        jfix.push((@as(u64, k) << 32) | @as(u64, E.fixups.len));
         xe.rel8_fixup(&mut E, l);
         return;
     }
@@ -8832,6 +8862,234 @@ fn relax_jumps(boff: []u64) bool {
         }
     }
     return any;
+}
+
+// After a pass with rel8 jumps: those whose targets ended up out of reach
+// (padding, see encode_func, can lengthen what relax_jumps expected to
+// shrink) take a rel32 from now on. True if any does: encode again.
+fn unrelax_jumps(boff: []u64) bool {
+    let mut any = false;
+    for n in 0..jfix.len {
+        let x = jfix.get(n);
+        let f = E.fixups.get(@truncate(usize, x & 0xffff_ffff));
+        let mut target: u64 = 0;
+        if f.label >= xe.LOCAL_BASE {
+            target = local_off.get(@int_cast(usize, f.label - xe.LOCAL_BASE));
+        } else {
+            target = boff[@int_cast(usize, f.label)];
+        }
+        let rel = @bit_cast(i64, target) - @bit_cast(i64, f.off + 1);
+        if (rel < -128) or (rel > 127) {
+            jshort.set(@truncate(usize, x >> 32), false);
+            any = true;
+        }
+    }
+    return any;
+}
+
+// Multi-byte nops (as LLVM writes them), n bytes in all.
+// (the k-byte one at k * (k - 1) / 2)
+let NOPS: [55]u8 = [0x90, 0x66, 0x90, 0x0f, 0x1f, 0x00, 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66,
+                    0x0f, 0x1f, 0x44, 0x00, 0x00, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x84, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x2e, 0x0f,
+                    0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+fn emit_nops(n0: u64) void {
+    let mut n = n0;
+    while n > 0 {
+        let k = @min(n, 10);
+        let at = @truncate(usize, (k * (k - 1)) / 2);
+        E.b.put(NOPS[at..at + @truncate(usize, k)]);
+        n -= k;
+    }
+}
+
+// What the encoder has written so far, to take back an instruction encoded
+// in the wrong place (see enc_unit).
+struct EncMark {
+    b: usize,
+    relocs: usize,
+    fixups: usize,
+    jnext: usize,
+    jlen: usize,
+    jfix: usize,
+}
+
+fn enc_mark() EncMark {
+    return EncMark.{ b: E.b.len(), relocs: E.relocs.len, fixups: E.fixups.len, jnext: jnext, jlen: jshort.len,
+                     jfix: jfix.len };
+}
+
+fn enc_rewind(m: EncMark) void {
+    E.b.b.len = m.b;
+    E.relocs.len = m.relocs;
+    E.fixups.len = m.fixups;
+    jnext = m.jnext;
+    jshort.len = m.jlen;
+    jstart.len = m.jlen;
+    jlabel.len = m.jlen;
+    jfix.len = m.jfix;
+}
+
+// Encodes nothing (a no-op move, a local label).
+fn enc_nothing(i: *mc.MInst) bool {
+    return noop_move(i) or (i.op == xe.LABEL) or (i.op == xe.NOP);
+}
+
+// A compare or test that a jcc right after it fuses with (Skylake: cmp, test,
+// add, sub, and; inc and dec are adds here).
+fn fuses_with_jcc(i: *mc.MInst) bool {
+    if (i.op == xe.TEST) or (i.op == xe.CMP_M) {
+        return true;
+    }
+    return (i.op == xe.ALU) and ((i.cc == 0) or (i.cc == 4) or (i.cc == 5) or (i.cc == 7));
+}
+
+// Does code at s of length n cross or end on a 32-byte boundary?
+fn crosses32(s: u64, n: u64) bool {
+    return (s % 32) + n >= 32;
+}
+
+// Encodes i, or (JCC) the jump i starts with the compare it fuses with
+// through last: if that crosses or ends on a 32-byte boundary, it is
+// encoded again after nops that move it to the boundary. `extra`: the
+// length of a jcc that follows (at the start of the next block).
+fn enc_unit(i: *mut mc.MInst, last: *mut mc.MInst, extra: u64) void {
+    let m = enc_mark();
+    let mut x = i;
+    loop {
+        enc_inst(x);
+        if x == last {
+            break;
+        }
+        x = x.next;
+    }
+    if i.op == xe.RET {
+        // (only the ret itself, the epilogue's last byte)
+        let e = FBASE + @as(u64, E.b.len());
+        if (e % 32) == 0 {
+            let n = E.b.len();
+            if E.b.view()[n - 1] != 0xc3 {
+                fail("internal compiler error: an epilogue that does not end in ret");
+            }
+            E.b.b.len = n - 1;
+            emit_nops(1);
+            b8(0xc3);
+        }
+        return;
+    }
+    let s = FBASE + @as(u64, m.b);
+    let mut pad: u64 = 0;
+    if i.op == xe.REP {
+        // memmove's own jumps: a fused cmp + jae at 6, a jmp at 25 (see enc_inst)
+        while crosses32(s + pad + 6, 5) or crosses32(s + pad + 25, 2) {
+            pad += 1;
+        }
+    } else {
+        let len = @as(u64, E.b.len()) - @as(u64, m.b) + extra;
+        if crosses32(s, len) and (len < 32) {
+            pad = 32 - (s % 32);
+        }
+    }
+    if pad == 0 {
+        return;
+    }
+    enc_rewind(m);
+    emit_nops(pad);
+    x = i;
+    loop {
+        enc_inst(x);
+        if x == last {
+            break;
+        }
+        x = x.next;
+    }
+}
+
+// The length of the jcc that the blocks after bi start with, if they fall
+// into it with nothing between (no padding, no prologue); else 0.
+fn jcc_next_block(bi: usize, skip: []bool, lal: []bool, sw: i32) u64 {
+    let mut n = bi + 1;
+    while (n < MF.blocks.len) and skip[n] and not lal[n] and (@as(i32, @int_cast(i32, n)) != sw) {
+        n += 1;
+    }
+    if (n >= MF.blocks.len) or lal[n] or (@as(i32, @int_cast(i32, n)) == sw) {
+        return 0;
+    }
+    let mut j = MF.blocks.get(n).first;
+    while u.notnil(j) and enc_nothing(j) {
+        j = j.next;
+    }
+    if u.isnil(j) or (j.op != xe.JCC) {
+        return 0;
+    }
+    if (jnext < jshort.len) and jshort.get(jnext) {
+        return 2;
+    }
+    return 6;
+}
+
+// The blocks whose start is aligned to LALIGN bytes: hot loop tops (LMODE 1:
+// targets of a jump back from later in the function; 2: like LLVM, any
+// block in a loop, run at least a fifth as often as a loop header, that
+// its layout predecessor does not fall into as often as a fifth of its runs).
+fn loop_aligned(skip: []bool) []mut bool {
+    let nb = MF.blocks.len;
+    let al = u.newn.[bool](nb + 1);
+    for bi in 0..nb {
+        al[bi] = false;
+    }
+    if LALIGN == 0 {
+        return al;
+    }
+    let back = u.newn.[bool](nb + 1);
+    for bi in 0..nb {
+        back[bi] = false;
+    }
+    for bi in 0..nb {
+        if skip[bi] {
+            continue;
+        }
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) and
+               (@as(usize, @int_cast(usize, i.ops[0].label)) <= bi) {
+                back[@int_cast(usize, i.ops[0].label)] = true;
+            }
+            i = i.next;
+        }
+    }
+    for bi in 1..nb {
+        let b = MF.blocks.get(bi);
+        if skip[bi] or (b.loop_depth == 0) or b.cold {
+            continue;
+        }
+        if LMODE == 1 {
+            if not back[bi] {
+                continue;
+            }
+        } else if b.freq < 0.2 * mc.LOOP_SCALE {
+            continue;
+        }
+        // the layout predecessor, and how often it falls into b
+        let mut p = bi - 1;
+        while (p > 0) and skip[p] {
+            p -= 1;
+        }
+        let pb = MF.blocks.get(p);
+        let mut fall: f64 = 0.0;
+        if not ends_flow(pb) {
+            fall = pb.freq;
+            let l = pb.last;
+            if u.notnil(l) and (l.op == xe.JCC) {
+                fall = pb.freq * 0.5;
+            }
+        }
+        if fall <= 0.2 * b.freq {
+            al[bi] = true;
+        }
+    }
+    return al;
 }
 
 // A leaf with nothing on the stack needs no frame.
@@ -10787,12 +11045,19 @@ fn encode_func(f: *mut ir.Func) void {
     jshort.clear();
     jstart.clear();
     jlabel.clear();
-    // twice if relax_jumps finds jumps that take a rel8: then encoded again
-    for pass in @as(i32, 0)..2 {
+    // where the function will start (see FALIGN)
+    let text = OBJ.secs.get(@int_cast(usize, TEXT));
+    FBASE = (@as(u64, text.data.len()) + @as(u64, FPAD) + FALIGN - 1) & ~(FALIGN - 1);
+    let lal = loop_aligned(skip);
+    // again if relax_jumps finds jumps that take a rel8, and after that while
+    // unrelax_jumps finds that padding left some of them out of reach
+    let mut pass: i32 = 0;
+    loop {
         E = xe.Enc.{ b: bn.new_bytes(), relocs: u.List.[xe.Reloc].{ data: u.nil.[xe.Reloc](), len: 0, cap: 0 },
                      fixups: u.List.[xe.Fixup].{ data: u.nil.[xe.Fixup](), len: 0, cap: 0 }, avx: AVX };
         local_off.clear();
         jnext = 0;
+        jfix.clear();
         rows.clear();
         calls.clear();
         noframe.clear();
@@ -10806,6 +11071,12 @@ fn encode_func(f: *mut ir.Func) void {
         }
         for bi in 0..nb {
             let b = MF.blocks.get(bi);
+            if lal[bi] {
+                let at = (FBASE + @as(u64, E.b.len())) % LALIGN;
+                if (at != 0) and (LALIGN - at <= LMAX) {
+                    emit_nops(LALIGN - at);
+                }
+            }
             boff[bi] = @as(u64, E.b.len());
             if @as(i32, @int_cast(i32, bi)) == sw {
                 prologue(sub);  // (jumps into the block go here)
@@ -10823,7 +11094,32 @@ fn encode_func(f: *mut ir.Func) void {
                     rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
                     last_src = i.src;
                 }
-                enc_inst(i);
+                let mut last = i;
+                let mut unit = false;
+                let mut extra: u64 = 0;
+                if JCC {
+                    let op = i.op;
+                    unit = (op == xe.JCC) or (op == xe.JMP) or (op == xe.CALL) or (op == xe.RET) or
+                           ((op == xe.REP) and (i.cc == 2));
+                    if fuses_with_jcc(i) {
+                        let mut j = i.next;
+                        while u.notnil(j) and enc_nothing(j) {
+                            j = j.next;
+                        }
+                        if u.notnil(j) and (j.op == xe.JCC) {
+                            unit = true;
+                            last = j;
+                        } else if u.isnil(j) {
+                            extra = jcc_next_block(bi, skip, lal, sw);
+                            unit = extra > 0;
+                        }
+                    }
+                }
+                if unit {
+                    enc_unit(i, last, extra);
+                } else {
+                    enc_inst(i);
+                }
                 if FT.on and (i.op == xe.CALL) {
                     let mut at = @as(u64, E.b.len());
                     if in_noframe {
@@ -10832,12 +11128,17 @@ fn encode_func(f: *mut ir.Func) void {
                     calls.push(at);
                     calls.push(@bit_cast(u64, i.aux));
                 }
-                i = i.next;
+                i = last.next;
             }
         }
-        if (pass == 1) or not relax_jumps(boff[0..nb]) {
+        if pass == 0 {
+            if not relax_jumps(boff[0..nb]) {
+                break;
+            }
+        } else if not unrelax_jumps(boff[0..nb]) {
             break;
         }
+        pass += 1;
         E.b.free();
     }
     if in_noframe {
@@ -10865,10 +11166,12 @@ fn encode_func(f: *mut ir.Func) void {
         E.b.set_u32(@truncate(usize, x.off), @bit_cast(u64, rel));
     }
     // into .text
-    let text = OBJ.secs.get(@int_cast(usize, TEXT));
     text.data.zeros(FPAD);
-    text.data.align(16);
+    text.data.align(@truncate(usize, FALIGN));
     let base = @as(u64, text.data.len());
+    if base != FBASE {
+        fail("internal compiler error: a function placed elsewhere than expected");
+    }
     text.data.put(E.b.view());
     for k in 0..E.relocs.len {
         let r = E.relocs.get(k);
@@ -10941,18 +11244,33 @@ fn has_addresses(x: *ir.Value) bool {
     return false;
 }
 
+// (experiments) a number from the environment
+fn env_num(name: []u8, dflt: u64) u64 {
+    let e = u.env(name);
+    if u.isnos(e) or (e.len == 0) {
+        return dflt;
+    }
+    let mut x: u64 = 0;
+    for ch in e {
+        x = (x * 10) + @as(u64, ch - '0');
+    }
+    return x;
+}
+
 pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     errors = false;
     AVX = tg.has(tg.X_AVX);
     WIN = tg.is_windows();
-    FPAD = 0;
-    for ch in u.env("AXIOM_X64_FPAD") {
-        FPAD = (FPAD * 10) + @as(usize, ch - '0');
-    }
+    FPAD = @truncate(usize, env_num("AXIOM_X64_FPAD", 0));
+    FALIGN = env_num("AXIOM_X64_FALIGN", 16);
+    LALIGN = env_num("AXIOM_X64_LALIGN", 0);
+    LMAX = env_num("AXIOM_X64_LMAX", 15);
+    LMODE = @truncate(i32, @bit_cast(i64, env_num("AXIOM_X64_LMODE", 1)));
+    JCC = env_num("AXIOM_X64_JCC", 0) != 0;
     tls_index_si = -1;
     OBJ = elf.new_obj(elf.EM_X86_64);
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 16);
+    TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 64);
     RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
     XDATA = -1;
     PDATA = -1;
