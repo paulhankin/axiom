@@ -3520,8 +3520,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
     }
     if (id == ir.IN_CTLZ) and ((v.flag & F_BSR) != 0) {
         // bsr(x), for users that want k - ctlz(x) (prepare); -1 for x == 0
-        let i = e2(xe.BITSCAN, sz, W(d), R(reg(a0)));
-        i.cc = 1;
+        _ = bitscan(sz, d, reg(a0), 1);
         if not nonzero_at(a0, v.blk) {
             let m1 = vgpr();
             _ = e2(xe.MOV_RI, sz, W(m1), I(-1));
@@ -3533,8 +3532,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
     if id == ir.IN_CTLZ {
         let x = reg_ext(a0, false);
         if tg.has(tg.X_LZCNT) {
-            let i = e2(xe.BITSCAN, sz, W(d), R(x));
-            i.cc = 3;
+            _ = bitscan(sz, d, x, 3);
             if bits < 32 {
                 let s = e2(xe.ALU, 4, RW(d), I(@as(i64, 32 - bits)));
                 s.cc = 5;
@@ -3544,8 +3542,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         let wbits = @as(i64, sz) * 8;
         if nonzero_at(a0, v.blk) {
             // bits - 1 - bsr(x), bsr(x) in [0, bits - 1]
-            let i = e2(xe.BITSCAN, sz, W(d), R(x));
-            i.cc = 1;
+            _ = bitscan(sz, d, x, 1);
             let s = e2(xe.ALU, sz, RW(d), I(wbits - 1));
             s.cc = 6;
             if bits < 32 {
@@ -3558,8 +3555,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         let m1 = vgpr();
         _ = e2(xe.MOV_RI, sz, W(m1), I(-1));
         let b = vgpr();
-        let i = e2(xe.BITSCAN, sz, W(b), R(x));
-        i.cc = 1;
+        _ = bitscan(sz, b, x, 1);
         let c = e2(xe.CMOV, sz, RW(b), R(m1));
         c.cc = xe.CC_E;
         _ = e2(xe.MOV_RI, sz, W(d), I(wbits - 1));
@@ -3581,21 +3577,18 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             x = y;
         }
         if tg.has(tg.X_BMI1) {
-            let i = e2(xe.BITSCAN, sz, W(d), R(x));
-            i.cc = 2;
+            _ = bitscan(sz, d, x, 2);
             return;
         }
         if (bits < 32) or nonzero_at(a0, v.blk) {
             // bsf alone: x is not zero (a bit set above a narrow x, or a
             // loop over the set bits of a mask)
-            let i = e2(xe.BITSCAN, sz, W(d), R(x));
-            i.cc = 0;
+            _ = bitscan(sz, d, x, 0);
             return;
         }
         let w = vgpr();
         _ = e2(xe.MOV_RI, 4, W(w), I(@as(i64, sz) * 8));
-        let i = e2(xe.BITSCAN, sz, W(d), R(x));
-        i.cc = 0;
+        _ = bitscan(sz, d, x, 0);
         let c = e2(xe.CMOV, sz, RW(d), R(w));
         c.cc = xe.CC_E;
         return;
@@ -3603,8 +3596,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
     if id == ir.IN_CTPOP {
         let x = reg_ext(a0, false);
         if tg.has(tg.X_POPCNT) {
-            let i = e2(xe.BITSCAN, sz, W(d), R(x));
-            i.cc = 4;
+            _ = bitscan(sz, d, x, 4);
             return;
         }
         popcount_swar(d, x, sz);
@@ -3787,6 +3779,20 @@ fn minmax_cmov(id: i32, sz: u8, d: i32, b: i32) void {
     } else {
         m.cc = xe.CC_B;
     }
+}
+
+// d <- bsf / bsr / tzcnt / lzcnt / popcnt (cc 0..4) of x. Each waits for
+// d's previous value: bsf and bsr keep it when x is zero, and Skylake-family
+// processors (Cascade Lake among them) give tzcnt, lzcnt and popcnt the same
+// false dependency. In a loop over the set bits of a mask, d is the register
+// of the last iteration's result, and every iteration then waits for the one
+// before. d is cleared first (an idiom renaming does without executing), and
+// read by the scan so that it is never x's register.
+fn bitscan(sz: u8, d: i32, x: i32, cc: i32) *mut mc.MInst {
+    _ = e2(xe.MOV_RI, 4, W(d), I(0));
+    let i = e2(xe.BITSCAN, sz, RW(d), R(x));
+    i.cc = cc;
+    return i;
 }
 
 // popcount without POPCNT: the classic SWAR reduction.
