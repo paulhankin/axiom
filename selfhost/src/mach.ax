@@ -17,8 +17,9 @@
 // per position covered), which are queued again, or else it is spilled: it
 // is split (see split): it goes to a stack slot across
 // the calls it is live over and along loop boundaries, and each stretch in
-// between becomes a new vreg; pieces that lose again are split at every block
-// boundary, and those are finally spilled everywhere, their uses and
+// between becomes a new vreg; pieces that lose again are split between the
+// stretches of code that use them (where uses are far apart), then at every
+// block boundary, and those are finally spilled everywhere, their uses and
 // definitions rewritten through short-lived registers (which never spill).
 // Allocation runs again after each rewrite.
 // =============================================================================
@@ -1583,24 +1584,83 @@ fn real_use(f: *MFunc, i: *MInst, v: i32) bool {
     return mentions(i, v) and not transfer_in(f, i, v) and not transfer_out(f, i, v);
 }
 
+// Where split cuts a vreg: at calls and loop boundaries, also between the
+// stretches of code that use it (clusters), or at every block boundary.
+const SPLIT_LOOPS: i32 = 0;
+const SPLIT_GAPS: i32 = 1;
+const SPLIT_ALL: i32 = 2;
+
+// Uses further apart than this many instructions are in different clusters.
+const SPLIT_GAP: i32 = 16;
+
+// Should the edge from block p to block s be a split point (if there is a
+// place for the spill code)?
+fn wants_cut(f: *MFunc, memtail: []bool, cl: []i32, mode: i32, p: usize, s: usize) bool {
+    if (mode == SPLIT_ALL) or memtail[p] or (depth_of(f, p) != depth_of(f, s)) {
+        return true;
+    }
+    return (mode == SPLIT_GAPS) and (cl[p] != cl[s]);
+}
+
 // Is the edge from block p to block s (where the vreg is live) a split point?
 // Spill code goes at the start of s if p is its only predecessor or every
 // edge into s is a split point, else at the end of p if s is its only
 // successor.
-fn edge_cut(f: *MFunc, g: *Cfg, allin: []bool, memtail: []bool, all_edges: bool, p: usize, s: usize) bool {
-    if not all_edges and not memtail[p] and (depth_of(f, p) == depth_of(f, s)) {
+fn edge_cut(f: *MFunc, g: *Cfg, allin: []bool, memtail: []bool, cl: []i32, mode: i32, p: usize, s: usize) bool {
+    if not wants_cut(f, memtail, cl, mode, p, s) {
         return false;
     }
     return allin[s] or (g.npred[s] == 1) or ((g.nsucc[p] == 1) and g.simple[p]);
 }
 
-// Splits vreg x into regions (see above), at calls and loop boundaries, or at
-// every block boundary (all_edges). Returns false, changing nothing, if there
-// is nothing to split.
-fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u8) bool {
+// The clusters of vreg v's uses (see SPLIT_GAPS): uses in blocks laid out
+// in order, at most SPLIT_GAP instructions apart, are one cluster, which the
+// blocks between them also belong to; the other blocks belong to none (-1).
+fn use_clusters(f: *MFunc, v: i32, cl: []mut i32) void {
+    let mut n: i32 = -1;
+    let mut prev_last: i32 = -1;  // the last use in the last block with one (-1: none yet)
+    let mut prev: usize = 0;
+    for bi in 0..f.blocks.len {
+        cl[bi] = -1;
+        let mut first: i32 = -1;
+        let mut last: i32 = -1;
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            if real_use(f, i, v) {
+                if first < 0 {
+                    first = i.pos;
+                }
+                last = i.pos;
+            }
+            i = i.next;
+        }
+        if first < 0 {
+            continue;
+        }
+        if (prev_last >= 0) and ((first - prev_last) <= SPLIT_GAP) {
+            for q in (prev + 1)..bi {
+                cl[q] = n;
+            }
+        } else {
+            n += 1;
+        }
+        cl[bi] = n;
+        prev = bi;
+        prev_last = last;
+    }
+}
+
+// Splits vreg x into regions (see above), where mode says (SPLIT_LOOPS,
+// SPLIT_GAPS, SPLIT_ALL). Returns false, changing nothing, if there is
+// nothing to split.
+fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) bool {
     let v = VREG0 + @int_cast(i32, x);
     let c = f.vclass.get(x);
     let nb = f.blocks.len;
+    let cl = u.newn.[i32](nb + 1);
+    if mode == SPLIT_GAPS {
+        use_clusters(f, v, cl[0..nb]);
+    }
     let head = u.newn.[i32](nb + 1);
     let tail = u.newn.[i32](nb + 1);
     let allin = u.newn.[bool](nb + 1);
@@ -1719,7 +1779,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u
         let pb = f.blocks.get(pi);
         for k in 0..pb.succs.len {
             let si = @int_cast(usize, pb.succs.get(k));
-            if not all_edges and not memtail[pi] and (depth_of(f, pi) == depth_of(f, si)) {
+            if not wants_cut(f, memtail[0..nb], cl[0..nb], mode, pi, si) {
                 allin[si] = false;
             }
         }
@@ -1732,7 +1792,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u
             if not bget(f.blocks.get(si).live_in, x) {
                 continue;
             }
-            if edge_cut(f, g, allin[0..nb], memtail[0..nb], all_edges, pi, si) {
+            if edge_cut(f, g, allin[0..nb], memtail[0..nb], cl[0..nb], mode, pi, si) {
                 nedge += 1;
             } else {
                 let a = find(&mut par, tail[pi]);
@@ -1796,7 +1856,8 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u
         let mut any = false;
         for k in 0..pb.succs.len {
             let si = @int_cast(usize, pb.succs.get(k));
-            if bget(f.blocks.get(si).live_in, x) and edge_cut(f, g, allin[0..nb], memtail[0..nb], all_edges, pi, si) {
+            if bget(f.blocks.get(si).live_in, x) and
+               edge_cut(f, g, allin[0..nb], memtail[0..nb], cl[0..nb], mode, pi, si) {
                 any = true;
             }
         }
@@ -1934,7 +1995,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, all_edges: bool, level: u
         for k in 0..pb.succs.len {
             let si = @int_cast(usize, pb.succs.get(k));
             let sb = f.blocks.get(si);
-            if not bget(sb.live_in, x) or not edge_cut(f, g, allin[0..nb], memtail[0..nb], all_edges, pi, si) {
+            if not bget(sb.live_in, x) or not edge_cut(f, g, allin[0..nb], memtail[0..nb], cl[0..nb], mode, pi, si) {
                 continue;
             }
             if at_exit[r] and not stored {
@@ -2307,10 +2368,13 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
         let lv = f.level.get(k);
         let mut done = false;
         if lv == 0 {
-            done = split(f, t, &g, k, false, 1);
+            done = split(f, t, &g, k, SPLIT_LOOPS, 1);
         }
         if not done and (lv <= 1) {
-            done = split(f, t, &g, k, true, 2);
+            done = split(f, t, &g, k, SPLIT_GAPS, 2);
+        }
+        if not done and (lv <= 2) {
+            done = split(f, t, &g, k, SPLIT_ALL, 3);
         }
         every[k] = not done;
     }
