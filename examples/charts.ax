@@ -1,0 +1,206 @@
+// =============================================================================
+// File: charts.ax
+// Four charts (grouped bars with a line, a scatter plot over a model curve,
+// stacked areas and a donut) drawn with std/graphics/chart onto every
+// backend: a 2 by 2 dashboard as one PNG and one SVG, and a PDF with a
+// chart a page.
+//
+//   axiom build examples/charts.ax --target=native -O2 -o charts
+//   ./charts out          (writes out.png, out.svg and out.pdf)
+//
+// Text needs a system font (DejaVu Sans, Liberation Sans or Arial); without
+// one the SVG still has its text, and the PNG and PDF have none.
+// =============================================================================
+
+import "std/fmt" as fmt;
+import "std/graphics/chart" as chart;
+import "std/graphics/draw" as draw;
+import "std/graphics/font" as font;
+import "std/graphics/image" as image;
+import "std/graphics/image/formats" as formats;
+import "std/graphics/pdf" as pdf;
+import "std/graphics/svg" as svg;
+import "std/io" as io;
+import "std/math" as math;
+import "std/os" as os;
+import "std/str" as strs;
+
+const W: f64 = 640.0;
+const H: f64 = 400.0;
+
+const MONTHS: usize = 12;
+const POINTS: usize = 60;
+
+/// The data, made up but plausible.
+struct Data {
+    rain_a: [12]f64,
+    rain_b: [12]f64,
+    rain_avg: [12]f64,
+    t: [60]f64,
+    model: [60]f64,
+    measured: [60]f64,
+    gas: [6]f64,
+    wind: [6]f64,
+    solar: [6]f64,
+    share: [5]f64,
+}
+
+fn make_data() Data {
+    let mut d = Data.{
+        rain_a: [78.0, 52.0, 61.0, 49.0, 55.0, 45.0, 44.0, 50.0, 49.0, 69.0, 64.0, 70.0],
+        rain_b: [60.0, 41.0, 39.0, 55.0, 63.0, 50.0, 31.0, 62.0, 52.0, 81.0, 75.0, 58.0],
+        rain_avg: [0.0; 12],
+        t: [0.0; 60],
+        model: [0.0; 60],
+        measured: [0.0; 60],
+        gas: [40.0, 38.0, 35.0, 30.0, 26.0, 22.0],
+        wind: [20.0, 22.0, 26.0, 29.0, 33.0, 38.0],
+        solar: [10.0, 12.0, 13.0, 15.0, 18.0, 21.0],
+        share: [64.0, 19.0, 5.0, 3.0, 9.0],
+    };
+    for i in @as(usize, 0)..MONTHS {
+        d.rain_avg[i] = (d.rain_a[i] + d.rain_b[i]) / 2.0;
+    }
+    // a damped oscillation, and "measurements" of it with deterministic noise
+    let mut seed: u32 = 12345;
+    for i in @as(usize, 0)..POINTS {
+        let x = @float_from_int(f64, i) / 6.0;
+        d.t[i] = x;
+        d.model[i] = math.exp(-x / 4.0) * math.cos(2.0 * x);
+        seed = (seed *% 1103515245) +% 12345;
+        let noise = (@float_from_int(f64, (seed >> 16) & 0x7fff) / 32767.0) - 0.5;
+        d.measured[i] = d.model[i] + (0.3 * noise);
+    }
+    return d;
+}
+
+/// Sets up chart k (0 to 3) of the dashboard.
+fn build(c: *mut chart.Chart, k: usize, d: *Data) !void {
+    let months: [12][]u8 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let years: [6][]u8 = ["2019", "2020", "2021", "2022", "2023", "2024"];
+    let browsers: [5][]u8 = ["Chrome", "Safari", "Edge", "Firefox", "Other"];
+    match k {
+        0 => {
+            c.set_title("Rainfall by month")!;
+            c.set_axis_titles("", "mm")!;
+            c.set_categories(months[..])!;
+            _ = c.bar("2023", d.rain_a[..])!;
+            _ = c.bar("2024", d.rain_b[..])!;
+            let i = c.line("Average", d.rain_avg[..0], d.rain_avg[..])!;
+            c.set_marker(i, chart.Marker.CIRCLE);
+            c.set_dashed(i, true);
+        }
+        1 => {
+            c.set_title("Damped oscillation")!;
+            c.set_axis_titles("t (s)", "amplitude")!;
+            _ = c.line("model", d.t[..], d.model[..])!;
+            let i = c.scatter("measured", d.t[..], d.measured[..])!;
+            c.set_marker(i, chart.Marker.DIAMOND);
+            c.legend = chart.Legend.BOTTOM;
+            c.x.grid = true;
+        }
+        2 => {
+            c.set_title("Electricity generated")!;
+            c.set_axis_titles("", "TWh")!;
+            c.set_categories(years[..])!;
+            _ = c.area("Gas", d.gas[..0], d.gas[..])!;
+            _ = c.area("Wind", d.wind[..0], d.wind[..])!;
+            _ = c.area("Solar", d.solar[..0], d.solar[..])!;
+            c.stacked = true;
+        }
+        else => {
+            c.set_title("Browser share (%)")!;
+            c.set_categories(browsers[..])!;
+            _ = c.pie(d.share[..])!;
+            c.donut = 0.5;
+        }
+    }
+}
+
+/// Draws the four charts in a 2 by 2 grid onto a surface.
+fn dashboard(surf: chart.Surface, fnt: *font.Font, has_font: bool, d: *Data) !void {
+    for k in @as(usize, 0)..4 {
+        let mut c = chart.Chart.init();
+        defer c.deinit();
+        if has_font {
+            c.set_font(fnt);
+        }
+        build(&mut c, k, d)!;
+        let x = @float_from_int(f64, k % 2) * W;
+        let y = @float_from_int(f64, k / 2) * H;
+        c.draw(surf, x, y, W, H)!;
+    }
+}
+
+fn with_ext(buf: *mut strs.String, prefix: []u8, ext: []u8) ![]u8 {
+    buf.clear();
+    buf.push_str(prefix)!;
+    buf.push_str(ext)!;
+    return buf.bytes();
+}
+
+fn run() !i32 {
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut prefix: []u8 = "charts";
+    if args.items.len > 1 {
+        prefix = args.items.get(1);
+    }
+    let d = make_data();
+    let mut fnt = chart.find_font() catch {
+        io.stderr().println("charts: no system font found; the PNG and PDF will have no text")!;
+        return run_with(prefix, &d, @ptr_from_int(*font.Font, 8), false);
+    };
+    defer fnt.deinit();
+    return run_with(prefix, &d, &fnt, true);
+}
+
+fn run_with(prefix: []u8, d: *Data, fnt: *font.Font, has_font: bool) !i32 {
+    let mut name = strs.String.init();
+    defer name.deinit();
+
+    // one bitmap
+    let mut img = image.Image.init(@int_from_float(usize, 2.0 * W), @int_from_float(usize, 2.0 * H), 4,
+                                   image.Depth.U8)!;
+    defer img.deinit();
+    {
+        let mut cv = draw.Canvas.init(&mut img);
+        defer cv.deinit();
+        dashboard(chart.Surface.Canvas(&mut cv), fnt, has_font, d)!;
+    }
+    formats.save(with_ext(&mut name, prefix, ".png")!, &img, formats.Options.default())!;
+
+    // one SVG document
+    let f = io.create(with_ext(&mut name, prefix, ".svg")!)!;
+    {
+        defer f.close();
+        let mut w = svg.Writer.begin(f.writer(), 2.0 * W, 2.0 * H)!;
+        defer w.deinit();
+        dashboard(chart.Surface.Svg(&mut w), fnt, has_font, d)!;
+        w.finish()!;
+    }
+
+    // a PDF, a chart a page (A4 landscape, in points)
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    doc.set_info("Title", "Charts")!;
+    for k in @as(usize, 0)..4 {
+        let mut c = chart.Chart.init();
+        defer c.deinit();
+        if has_font {
+            c.set_font(fnt);
+        }
+        build(&mut c, k, d)!;
+        c.add_page(&mut doc, pdf.A4_HEIGHT, pdf.A4_WIDTH)!;
+    }
+    doc.save(with_ext(&mut name, prefix, ".pdf")!)!;
+    fmt.print("wrote {}.png, {}.svg and {}.pdf\n", [fmt.str(prefix), fmt.str(prefix), fmt.str(prefix)])!;
+    return 0;
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        fmt.eprint("charts: {}\n", [fmt.str(@error_name(e))]) catch {};
+        return 1;
+    };
+}
