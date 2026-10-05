@@ -330,6 +330,26 @@ fn copy_of_copy(c2: *mut ir.Value) *mut ir.Value {
     return c1;
 }
 
+// A copy of a fill: c2 copies slot D1, which only c1 wrote, filling the
+// whole of it with one byte (memset) before it in the same block, and
+// nothing else reads D1. c2 can fill its destination itself (then c1 is
+// dead): a zeroed struct returned and bound copies 0 into the variable.
+fn copy_of_fill(c2: *mut ir.Value) *mut ir.Value {
+    let d1 = c2.b;
+    if not whole(c2, d1) {
+        return u.nil.[ir.Value]();
+    }
+    let o = obj_of(d1);
+    if o.escaped or (o.writers.len != 1) or (o.readers.len != 1) {
+        return u.nil.[ir.Value]();
+    }
+    let c1 = o.writers.get(0);
+    if (c1.op != ir.OP_MEMSET) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or (c1.pos >= c2.pos) {
+        return u.nil.[ir.Value]();
+    }
+    return c1;
+}
+
 // The result of a call copied into this function's own result: the call
 // can write it there itself. The result's memory (the sret parameter) is
 // the caller's fresh slot, which nothing else here reads or writes, so it
@@ -402,8 +422,8 @@ pub fn forward_copies(f: *mut ir.Func) bool {
         number(f);
         scan(f);
         let mut done = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
-        // and pairs for the local rules: (copy, the copy before it) or
-        // (copy into the result, the call that made it)
+        // and pairs for the local rules: (copy, the copy or fill before it)
+        // or (copy into the result, the call that made it)
         let mut pairs = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
         let mut b = f.first;
         while u.notnil(b) {
@@ -413,7 +433,10 @@ pub fn forward_copies(f: *mut ir.Func) bool {
                     if removable(i) {
                         done.push(i);
                     } else {
-                        let c1 = copy_of_copy(i);
+                        let mut c1 = copy_of_copy(i);
+                        if u.isnil(c1) {
+                            c1 = copy_of_fill(i);
+                        }
                         let k = result_into_result(f, i);
                         if u.notnil(c1) {
                             pairs.push(i);
@@ -444,6 +467,10 @@ pub fn forward_copies(f: *mut ir.Func) bool {
                 }
                 if x.op == ir.OP_MEMCPY {
                     c.b = x.b;  // copy the source itself; the first copy is dead
+                    ir.remove_inst(x);
+                } else if x.op == ir.OP_MEMSET {
+                    c.op = ir.OP_MEMSET;  // fill the destination itself; the first fill is dead
+                    c.b = x.b;
                     ir.remove_inst(x);
                 } else {
                     x.xs.set(0, c.a);  // the call writes the result; no copy

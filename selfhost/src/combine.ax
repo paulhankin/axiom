@@ -499,6 +499,30 @@ fn and_ranges(B: *mut ir.Builder, c1: *mut ir.Value, c2: *mut ir.Value) *mut ir.
     return mk_icmp(B, ir.IntULT, ir.sub(B, x, kt(t, lo)), kt(t, (hi - lo) + 1));
 }
 
+// a | b as rotl(x, c) when one is x << c and the other x >> (bits - c)
+// (logical; 32 or 64 bits), else nil.
+fn rotation(B: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if (t.kind != ir.T_INT) or ((t.bits != 32) and (t.bits != 64)) {
+        return vnil();
+    }
+    let mut l = a;
+    let mut r = b;
+    if is_op(b, ir.OP_SHL) {
+        l = b;
+        r = a;
+    }
+    if not is_op(l, ir.OP_SHL) or not is_op(r, ir.OP_LSHR) or (l.a != r.a) or not is_k(l.b) or not is_k(r.b) {
+        return vnil();
+    }
+    let c = kval(l.b);
+    let bits = @int_cast(u64, t.bits);
+    if (c == 0) or (c >= bits) or ((c + kval(r.b)) != bits) {
+        return vnil();
+    }
+    let mut args: [2]*mut ir.Value = [l.a, l.b];
+    return ir.intr(B, ir.IN_ROTL, t, args[..]);
+}
+
 fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let t = i.ty;
@@ -580,6 +604,31 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         // (x + c) - x  = c ; x - (x - y) = y
         if is_op(b, ir.OP_SUB) and (b.a == a) {
             return b.b;
+        }
+        // x*c1 - x*c2 = x*(c1 - c2), and with x for x*1: the length of
+        // s[k*n..(k + 1)*n] is n
+        let am = is_op(a, ir.OP_MUL) and is_k(a.b);
+        let bm = is_op(b, ir.OP_MUL) and is_k(b.b);
+        if am or bm {
+            let mut xa = a;
+            let mut ca: u64 = 1;
+            if am {
+                xa = a.a;
+                ca = kval(a.b);
+            }
+            let mut xb = b;
+            let mut cb: u64 = 1;
+            if bm {
+                xb = b.a;
+                cb = kval(b.b);
+            }
+            if xa == xb {
+                let c = (ca -% cb) & all;
+                if c == 1 {
+                    return xa;
+                }
+                return ir.mul(B, xa, kt(t, c));
+            }
         }
         return vnil();
     }
@@ -682,6 +731,11 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         }
         if a == b {
             return a;
+        }
+        // (x << c) | (x >> (bits - c)): a rotation
+        let r = rotation(B, a, b, t);
+        if u.notnil(r) {
+            return r;
         }
         return vnil();
     }

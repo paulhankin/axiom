@@ -34,6 +34,7 @@ const K_EXPR: i32 = 0;   // key: an instruction (representative), val: its value
 const K_MEM: i32 = 1;    // key: base pointer, off, ty; val: the value in memory
 const K_KNOWN: i32 = 2;  // key: a value, val: the constant it equals
 const K_LE: i32 = 3;     // key <= val + off (unsigned, as natural numbers; val nil: 0)
+const K_FILL: i32 = 4;   // key: base pointer, off; val: a memset of constant bytes there
 
 struct Ent {
     kind: i32,
@@ -586,6 +587,79 @@ fn add_mem(l: *Loc, t: *mut ir.Ty, v: *mut ir.Value) void {
     push_ent(K_MEM, mem_hash(l.base, l.off, t), l.base, l.off, t, v);
 }
 
+fn fill_hash(base: *ir.Value) u64 {
+    return mix(hp(base), 0x46494c4c);
+}
+
+// The byte (a constant) a memset filled the whole of l with, when nothing
+// that may write l came since; else nil.
+fn find_fill(l: *Loc) *mut ir.Value {
+    let mut e = bk.get(@truncate(usize, fill_hash(l.base)) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at(@int_cast(usize, e));
+        if (x.kind == K_FILL) and (x.key == l.base) and (x.off <= l.off) and
+           ((l.off + l.size) <= (x.off + size_of(x.val.c))) {
+            if (writes.len - x.height) > 256 {
+                return vnil();
+            }
+            for w in x.height..writes.len {
+                if may_alias(l, writes.at(w)) {
+                    return vnil();
+                }
+            }
+            return x.val.b;
+        }
+        e = x.next;
+    }
+    return vnil();
+}
+
+// A vector load whose lanes are known, each stored as a scalar or filled
+// by a memset since (an array of floats written element by element and
+// read as one vector): the vector built from them, else nil.
+fn compose_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let t = i.ty;
+    let et = t.elem;
+    if (t.kind != ir.T_VEC) or ((et.kind != ir.T_INT) and (et.kind != ir.T_FLOAT)) or (t.lanes > 16) or (l.size < 0) {
+        return vnil();
+    }
+    let n = @int_cast(usize, t.lanes);
+    let es = @bit_cast(i64, et.size);
+    let vals = u.newn.[*mut ir.Value](n);
+    let mut nset: usize = 0;
+    let mut fill = vnil();
+    for j in 0..n {
+        let mut lj = l.*;
+        lj.off = l.off + (@int_cast(i64, j) * es);
+        lj.size = es;
+        lj.rlo = l.rlo + (@int_cast(i64, j) * es);
+        lj.rhi = l.rhi + (@int_cast(i64, j) * es);
+        let v = find_mem(&lj, et);
+        if u.notnil(v) {
+            vals[j] = v;
+            nset += 1;
+            continue;
+        }
+        let b = find_fill(&lj);
+        if u.isnil(b) or not ir.is_cint(b) or ((ir.cint_val(b) & 0xff) != 0) {
+            return vnil();  // (zero fills only: a float of other bytes is not built here)
+        }
+        fill = b;
+    }
+    if (nset == 0) or (nset > 8) or u.isnil(fill) {
+        return vnil();  // (all from stores: not built from parts here)
+    }
+    ir.at_before(B, i);
+    let mut v = ir.splat(B, t, ir.czero(et));
+    for j in 0..n {
+        if u.notnil(vals[j]) {
+            v = ir.insert_elem(B, v, vals[j], @as(u64, j));
+        }
+    }
+    changed = true;
+    return v;
+}
+
 // -----------------------------------------------------------------------------
 // Conditions
 // -----------------------------------------------------------------------------
@@ -641,6 +715,19 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
         if (tp == ir.IntEQ) and ir.is_const(c.b) and not ir.is_const(c.a) {
             add_known(c.a, c.b);
         }
+        // x == y: the later of them is the earlier (the lengths of slices
+        // known to be equal: then their bounds checks are the same)
+        if (tp == ir.IntEQ) and not ir.is_const(c.a) and not ir.is_const(c.b) and (c.a != c.b) {
+            let ra = def_rank(c.a);
+            let rb = def_rank(c.b);
+            if (ra != NO_RANK) and (rb != NO_RANK) {
+                if ra < rb {
+                    add_known(c.b, c.a);
+                } else if rb < ra {
+                    add_known(c.a, c.b);
+                }
+            }
+        }
         return;
     }
     if (c.op == ir.OP_AND) and val and (c.ty.bits == 1) {
@@ -652,6 +739,21 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     } else if (c.op == ir.OP_XOR) and (c.ty.bits == 1) and cb.is_k(c.b) {
         assume(c.a, val != (ir.cint_val(c.b) != 0), depth + 1);
     }
+}
+
+const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
+
+// An order of values for replacing one by another known equal: parameters
+// first, then instructions by number (the replacement is never replaced
+// back, whichever comparison says they are equal).
+fn def_rank(v: *ir.Value) i64 {
+    if v.kind == ir.V_PARAM {
+        return @bit_cast(i64, v.cv) - 0x1_0000_0000;
+    }
+    if v.kind == ir.V_INST {
+        return @as(i64, v.id);
+    }
+    return NO_RANK;
 }
 
 // -----------------------------------------------------------------------------
@@ -1713,7 +1815,10 @@ fn visit_block(b: *mut ir.Block) void {
                 note_writes(i);
             } else {
                 let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
-                let r = find_mem(&l, i.ty);
+                let mut r = find_mem(&l, i.ty);
+                if u.isnil(r) {
+                    r = compose_load(i, &l);
+                }
                 if u.notnil(r) {
                     replace(i, r);
                 } else {
@@ -1736,6 +1841,10 @@ fn visit_block(b: *mut ir.Block) void {
             }
         } else {
             note_writes(i);
+            if (op == ir.OP_MEMSET) and ir.is_cint(i.b) and (size_of(i.c) > 0) {
+                let l = loc_of(i.a, size_of(i.c));
+                push_ent(K_FILL, fill_hash(l.base), l.base, l.off, ir.t_void(), i);
+            }
         }
         i = next;
     }
