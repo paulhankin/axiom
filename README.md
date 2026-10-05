@@ -50,6 +50,7 @@ On a Mac, `selfhost/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`examples/c_interop/`](examples/c_interop/stats.ax) | An Axiom library called from C through a generated header |
 | [`examples/pi.ax`](examples/pi.ax) | π to 2000 places (Machin's formula in big integers) on an A4 PDF page with typeset mathematics |
 | [`examples/charts.ax`](examples/charts.ax) | Bar, line, scatter, stacked-area and donut charts (std/graphics/chart) drawn as one PNG, one SVG and a four-page PDF |
+| [`examples/md2pdf.ax`](examples/md2pdf.ax) | Markdown to PDF (std/text/markdown/pdf): headings in the outline, lists, tables, code, links, TeX math and images |
 | [`examples/metal.ax`](examples/metal.ax) | Metal on macOS: a window with a spinning triangle drawn by MSL shaders and a Core Text caption (std/os/cocoa, std/graphics/metal, std/graphics/quartz) |
 | [`examples/directx.ax`](examples/directx.ax) | Direct3D 11 on Windows: a window with a spinning triangle drawn by HLSL shaders and a Direct2D caption (std/os/win32, std/graphics/d3d11, std/graphics/d2d) |
 | [`examples/game.ax`](examples/game.ax) | A small game on Windows and macOS: Direct3D 12 or Metal graphics, keyboard and controllers (with rumble), sound effects and music (std/graphics/gpu, std/os/window, std/os/gamepad, std/audio/output) |

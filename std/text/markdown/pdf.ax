@@ -1,0 +1,1748 @@
+// =============================================================================
+// std/text/markdown/pdf.ax - Markdown typeset as PDF: pages of text in real
+// fonts, with headings, lists, tables, code, quotes, links, images and math.
+//
+//     let mut fonts = mdpdf.FontSet.find()!;            // DejaVu, Liberation or Arial
+//     defer fonts.deinit();
+//     let opts = mdpdf.Options.init(fonts.fonts());
+//     mdpdf.save(text, "notes.pdf", opts)!;             // or to_pdf (bytes), write (an io.Writer)
+//
+//     let mut doc = pdf.Document.init();                 // or onto pages of your own document
+//     mdpdf.render_text(text, &mut doc, &opts)!;        // render(&md, ...) for a parsed one
+//
+// The Markdown is parsed by std/text/markdown (CommonMark with the GitHub
+// extensions, and TeX math: Options.init turns markdown.Options.math on) and
+// set with std/graphics/text (line breaking, bidirectional text, shaping,
+// font fallback) onto std/graphics/pdf pages:
+//
+// - paragraphs (left-aligned or justified), split across pages by lines;
+//   emphasis, strong (the family's italic, bold and bold italic faces),
+//   strikethrough, code spans (monospaced on a tint), hard and soft breaks
+// - links: coloured, underlined and clickable (URI annotations; "#..."
+//   links within the document are left as text)
+// - headings 1 to 6, kept with what follows, in the PDF's outline
+//   (bookmarks) unless Options.bookmarks is off; the first one is the
+//   document's title unless Options.title gives one
+// - bulleted, numbered and task lists (drawn boxes, ticked when done),
+//   nested, tight or loose; block quotes with a bar down the side (across
+//   page breaks); thematic breaks
+// - code blocks: monospaced on a tinted box, long lines wrapped
+// - tables: columns sized to their contents (shrunk to fit, cells wrapped),
+//   the column alignments, a shaded header row repeated on each page
+// - TeX math ($...$, $$...$$, ```math) typeset by std/text/math/typeset in
+//   Fonts.math (a font with a MATH table sets it best; any font works);
+//   formulas that do not parse are shown as their source
+// - images that are paragraphs of their own, from files under
+//   Options.image_dir (nothing is read from disk unless it is set, and then
+//   only relative paths without ".." are); JPEG files are embedded as they
+//   are. Other images, and images that cannot be read, show their alt text
+// - page numbers at the foot of each page (Options.page_numbers)
+//
+// Raw HTML is left out, as std/text/markdown's safe HTML output does.
+// Nesting deeper than MAX_DEPTH blocks is set as plain text, and indents
+// stop growing when the column gets narrow, so hostile input still gives
+// readable pages.
+// =============================================================================
+
+import "../../collections/vec.ax" as vec;
+import "../../graphics/color.ax" as color;
+import "../../graphics/draw.ax" as draw;
+import "../../graphics/font.ax" as font;
+import "../../graphics/image/formats.ax" as formats;
+import "../../graphics/pdf.ax" as pdf;
+import "../../graphics/pdf/read.ax" as read;
+import "../../graphics/text.ax" as gtext;
+import "../../io.ax" as io;
+import "../../mem.ax" as mem;
+import "../../os/fs.ax" as fs;
+import "../../str.ax" as strs;
+import "../markdown.ax" as markdown;
+import "../math.ax" as tex;
+import "../math/typeset.ax" as typeset;
+
+error { OutOfMemory, FontNotFound }
+
+const NONE: u32 = 0xffffffff;
+
+/// Blocks nested deeper than this are set as plain text.
+pub const MAX_DEPTH: u32 = 48;
+
+// -----------------------------------------------------------------------------
+// Fonts and options
+// -----------------------------------------------------------------------------
+
+/// The faces text is set in (they must outlive the rendering, and the PDF
+/// document, which embeds them when it is written).
+pub struct Fonts {
+    regular: *font.Font,
+    bold: *font.Font,
+    italic: *font.Font,
+    bold_italic: *font.Font,
+    mono: *font.Font,
+    math: *font.Font,         // for TeX math
+    fallbacks: []*font.Font,  // for characters the faces lack
+
+    /// One font for everything.
+    pub fn single(f: *font.Font) Fonts {
+        return Fonts.{
+            regular: f,
+            bold: f,
+            italic: f,
+            bold_italic: f,
+            mono: f,
+            math: f,
+            fallbacks: @slice_from_ptr(@ptr_from_int(**font.Font, 8), 0),
+        };
+    }
+}
+
+const REGULAR: usize = 0;
+const BOLD: usize = 1;
+const ITALIC: usize = 2;
+const BOLD_ITALIC: usize = 3;
+const MONO: usize = 4;
+const MISSING: usize = 255;
+
+/// A family of system fonts, loaded: regular, bold, italic, bold italic and
+/// a monospaced face. Missing faces fall back to the regular one.
+pub struct FontSet {
+    faces: vec.Vec.[font.Font],
+    index: [5]usize,  // into faces, or MISSING
+
+    /// Looks for DejaVu Sans, Liberation Sans or Arial (and a monospaced
+    /// font) where Linux, macOS and Windows keep them, preferring a family
+    /// with all four faces.
+    pub fn find() !FontSet {
+        // per family: regular, bold, italic, bold italic, monospaced
+        let paths: [30][]u8 = [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/liberation-sans/LiberationSans-Italic.ttf",
+            "/usr/share/fonts/liberation-sans/LiberationSans-BoldItalic.ttf",
+            "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/ariali.ttf",
+            "C:/Windows/Fonts/arialbi.ttf",
+            "C:/Windows/Fonts/cour.ttf",
+        ];
+        // the first family with its four faces, else the first with a regular one
+        let nfam = paths.len / 5;
+        let mut best = nfam;
+        for fam in @as(usize, 0)..nfam {
+            let mut all = true;
+            for k in @as(usize, 0)..4 {
+                if not fs.exists(paths[(fam * 5) + k]) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                best = fam;
+                break;
+            }
+            if (best == nfam) and fs.exists(paths[fam * 5]) {
+                best = fam;
+            }
+        }
+        if best == nfam {
+            return error.FontNotFound;
+        }
+        let mut set = FontSet.{ faces: vec.Vec.[font.Font].init(), index: [MISSING; 5] };
+        for k in @as(usize, 0)..5 {
+            let f = font.Font.load(paths[(best * 5) + k]) catch continue;
+            set.faces.push(f) catch |e| {
+                let mut g = f;
+                g.deinit();
+                set.deinit();
+                return e;
+            };
+            set.index[k] = set.faces.len - 1;
+        }
+        if set.index[REGULAR] == MISSING {
+            set.deinit();
+            return error.FontNotFound;
+        }
+        if set.index[MONO] == MISSING {
+            // any family's monospaced face
+            for fam in @as(usize, 0)..nfam {
+                let f = font.Font.load(paths[(fam * 5) + 4]) catch continue;
+                set.faces.push(f) catch |e| {
+                    let mut g = f;
+                    g.deinit();
+                    set.deinit();
+                    return e;
+                };
+                set.index[MONO] = set.faces.len - 1;
+                break;
+            }
+        }
+        return set;
+    }
+
+    pub fn deinit(self: *mut FontSet) void {
+        for i in @as(usize, 0)..self.faces.len {
+            self.faces.get_ptr(i).deinit();
+        }
+        self.faces.deinit();
+    }
+
+    fn face(self: *FontSet, k: usize, otherwise: usize) *font.Font {
+        let mut i = self.index[k];
+        if i == MISSING {
+            i = self.index[otherwise];
+        }
+        if i == MISSING {
+            i = self.index[REGULAR];
+        }
+        return &self.faces.items()[i];
+    }
+
+    /// The faces (pointers into the set, valid until deinit).
+    pub fn fonts(self: *FontSet) Fonts {
+        let mut f = Fonts.single(self.face(REGULAR, REGULAR));
+        f.bold = self.face(BOLD, REGULAR);
+        f.italic = self.face(ITALIC, REGULAR);
+        f.bold_italic = self.face(BOLD_ITALIC, BOLD);
+        f.mono = self.face(MONO, REGULAR);
+        return f;
+    }
+}
+
+/// A colour from 0xRRGGBB (sRGB).
+pub fn srgb(rgb: u32) color.Color {
+    let r = @float_from_int(f32, (rgb >> 16) & 0xff) / 255.0;
+    let g = @float_from_int(f32, (rgb >> 8) & 0xff) / 255.0;
+    let b = @float_from_int(f32, rgb & 0xff) / 255.0;
+    return color.Color.from_srgb(r, g, b, 1.0);
+}
+
+/// Page geometry, type and colours (lengths in points).
+pub struct Options {
+    markdown: markdown.Options,
+    fonts: Fonts,
+    page_width: f64,
+    page_height: f64,
+    margin: f64,
+    size: f64,          // of body text
+    line_spacing: f64,  // a multiple of the fonts' line height
+    justify: bool,
+    page_numbers: bool,
+    bookmarks: bool,
+    title: []u8,      // the document's title ("": its first heading)
+    image_dir: []u8,  // where images are read from ("": nowhere)
+    text_color: color.Color,
+    link_color: color.Color,
+    muted_color: color.Color,  // block quotes, page numbers
+    rule_color: color.Color,   // rules, table lines, quote bars
+    tint: color.Color,         // behind code and table headers
+
+    /// A4, 11-point text, GitHub Flavored Markdown with math.
+    pub fn init(fonts: Fonts) Options {
+        let mut md = markdown.Options.init();
+        md.math = true;
+        return Options.{
+            markdown: md,
+            fonts: fonts,
+            page_width: pdf.A4_WIDTH,
+            page_height: pdf.A4_HEIGHT,
+            margin: 64.0,
+            size: 11.0,
+            line_spacing: 1.25,
+            justify: false,
+            page_numbers: true,
+            bookmarks: true,
+            title: "",
+            image_dir: "",
+            text_color: srgb(0x1f2328),
+            link_color: srgb(0x0b5cad),
+            muted_color: srgb(0x5d636b),
+            rule_color: srgb(0xd0d7de),
+            tint: srgb(0xf2f4f6),
+        };
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Output
+// -----------------------------------------------------------------------------
+
+/// Parses Markdown and renders it as a PDF document (free it with mem.free).
+pub fn to_pdf(text: []u8, o: Options) ![]mut u8 {
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    render_owned(text, &mut doc, &o)!;
+    return doc.bytes();
+}
+
+/// Writes the PDF to an io.Writer.
+pub fn write(w: io.Writer, text: []u8, o: Options) !void {
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    render_owned(text, &mut doc, &o)!;
+    doc.write(w)!;
+}
+
+/// Writes the PDF to a file.
+pub fn save(text: []u8, path: []u8, o: Options) !void {
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    render_owned(text, &mut doc, &o)!;
+    doc.save(path)!;
+}
+
+fn render_owned(text: []u8, doc: *mut pdf.Document, o: *Options) !void {
+    let mut md = markdown.parse(text, o.markdown)!;
+    defer md.deinit();
+    let mut title = strs.String.init();
+    defer title.deinit();
+    render_with(&md, doc, o, &mut title)!;
+    if o.title.len > 0 {
+        doc.set_info("Title", o.title)!;
+    } else if title.len > 0 {
+        doc.set_info("Title", title.bytes())!;
+    }
+}
+
+/// Parses Markdown and adds it to a document as pages of its own.
+pub fn render_text(text: []u8, doc: *mut pdf.Document, o: *Options) !void {
+    let mut md = markdown.parse(text, o.markdown)!;
+    defer md.deinit();
+    render(&md, doc, o)!;
+}
+
+/// Adds a parsed Markdown document to a PDF document as pages of its own.
+pub fn render(md: *markdown.Document, doc: *mut pdf.Document, o: *Options) !void {
+    let mut title = strs.String.init();
+    defer title.deinit();
+    render_with(md, doc, o, &mut title)!;
+}
+
+fn render_with(md: *markdown.Document, doc: *mut pdf.Document, o: *Options, title: *mut strs.String) !void {
+    let first = doc.page(o.page_width, o.page_height)!;
+    let mut r = R.{
+        md: md,
+        doc: doc,
+        o: o,
+        page: first,
+        y: 0.0,
+        top: o.margin,
+        bottom: o.page_height - o.margin,
+        pending: 0.0,
+        fresh: true,
+        bars: vec.Vec.[Bar].init(),
+        marks: vec.Vec.[Mark].init(),
+        mark_level: -1,
+        marker: Marker.none(),
+        list_level: 0,
+        quote: 0,
+        title: title,
+        last_top: 0.0,
+    };
+    defer r.deinit();
+    r.start_page()!;
+    r.children(md.root(), o.margin, o.page_width - o.margin, 0, false)!;
+    r.finish()!;
+}
+
+// -----------------------------------------------------------------------------
+// Paragraphs: styled spans, laid out
+// -----------------------------------------------------------------------------
+
+/// What a span is, beyond its style.
+struct Meta {
+    link: u32,  // the LINK node, or NONE
+    code: bool,
+    math: u32,  // index into Para.maths, or NONE
+}
+
+struct Para {
+    spans: vec.Vec.[gtext.Span],
+    meta: vec.Vec.[Meta],
+    maths: vec.Vec.[typeset.Typeset],
+    l: gtext.Layout,
+    width: f64,
+    tabs: f64,  // tab stops (0: the layout's default)
+
+    fn init() Para {
+        return Para.{
+            spans: vec.Vec.[gtext.Span].init(),
+            meta: vec.Vec.[Meta].init(),
+            maths: vec.Vec.[typeset.Typeset].init(),
+            l: empty_layout(),
+            width: 0.0,
+            tabs: 0.0,
+        };
+    }
+
+    fn deinit(self: *mut Para) void {
+        self.spans.deinit();
+        self.meta.deinit();
+        for i in @as(usize, 0)..self.maths.len {
+            self.maths.get_ptr(i).deinit();
+        }
+        self.maths.deinit();
+        self.l.deinit();
+    }
+
+    fn add(self: *mut Para, s: []u8, st: gtext.Style, m: Meta) !void {
+        if s.len == 0 {
+            return;
+        }
+        self.spans.push(gtext.Span.{ text: s, style: st })!;
+        self.meta.push(m) catch |e| {
+            _ = self.spans.pop() catch gtext.Span.{ text: s, style: st };
+            return e;
+        };
+    }
+
+    /// Lays the spans out in lines at most width wide (0: unbounded).
+    fn lay(self: *mut Para, width: f64, align: gtext.Align, spacing: f64) !void {
+        let mut opts = gtext.Options.init(width);
+        opts.align = align;
+        opts.line_spacing = spacing;
+        opts.tab_stops = self.tabs;
+        let l = gtext.layout(self.spans.items(), opts)!;
+        self.l.deinit();
+        self.l = l;
+        self.width = width;
+    }
+
+    /// The top of line i (from the layout's top); i = lines: its bottom.
+    fn bound(self: *Para, i: usize) f64 {
+        let lines = self.l.lines.items();
+        if i == 0 {
+            return 0.0;
+        }
+        if i >= lines.len {
+            return self.l.height;
+        }
+        let a = lines[i - 1];
+        let b = lines[i];
+        return ((a.baseline + a.descent) + (b.baseline - b.ascent)) / 2.0;
+    }
+}
+
+fn empty_layout() gtext.Layout {
+    return gtext.Layout.{
+        glyphs: vec.Vec.[gtext.Glyph].init(),
+        lines: vec.Vec.[gtext.Line].init(),
+        spans: vec.Vec.[gtext.Span].init(),
+        width: 0.0,
+        height: 0.0,
+    };
+}
+
+fn plain_meta() Meta {
+    return Meta.{ link: NONE, code: false, math: NONE };
+}
+
+/// The look a run of inlines starts from.
+struct Base {
+    size: f64,
+    bold: bool,
+    col: color.Color,
+}
+
+// -----------------------------------------------------------------------------
+// The renderer
+// -----------------------------------------------------------------------------
+
+struct Bar {
+    x: f64,
+    y0: f64,
+}
+
+struct Mark {
+    level: u32,
+    title: []mut u8,
+    page: usize,
+    y: f64,
+}
+
+/// A list item's marker, drawn by the first line of the item.
+struct Marker {
+    pending: bool,
+    kind: u8,  // 'b' bullet, 'n' number, 'o' open task, 'x' done task
+    level: u32,
+    number: u32,
+    delim: u8,
+    x: f64,  // where the item's content starts
+
+    fn none() Marker {
+        return Marker.{ pending: false, kind: 'b', level: 0, number: 0, delim: '.', x: 0.0 };
+    }
+}
+
+struct R {
+    md: *markdown.Document,
+    doc: *mut pdf.Document,
+    o: *Options,
+    page: pdf.Page,
+    y: f64,
+    top: f64,
+    bottom: f64,
+    pending: f64,  // space owed before the next block (gaps collapse)
+    fresh: bool,   // the next block starts a container: no gap
+    bars: vec.Vec.[Bar],
+    marks: vec.Vec.[Mark],
+    mark_level: i32,
+    marker: Marker,
+    list_level: u32,
+    quote: u32,
+    title: *mut strs.String,
+    last_top: f64,  // where the last paragraph flowed began (after any page break)
+
+    fn deinit(self: *mut R) void {
+        self.page.deinit();
+        self.bars.deinit();
+        for i in @as(usize, 0)..self.marks.len {
+            mem.free(self.marks.get(i).title);
+        }
+        self.marks.deinit();
+    }
+
+    // --- pages ---
+
+    fn start_page(self: *mut R) !void {
+        self.y = self.top;
+        self.pending = 0.0;
+        for i in @as(usize, 0)..self.bars.len {
+            self.bars.get_ptr(i).y0 = self.top;
+        }
+        if self.o.page_numbers {
+            let mut nb: [24]u8 = [0; 24];
+            let s = io.fmt_u64(nb[..], @as(u64, self.doc.page_count() + 1));
+            let f = self.o.fonts.regular;
+            let size = self.o.size * 0.8;
+            let w = font.measure(f, s, size);
+            let y = self.o.page_height - (self.o.margin / 2.0);
+            self.page.text(f, size, (self.o.page_width - w) / 2.0, y, s, self.o.muted_color)!;
+        }
+    }
+
+    fn close_bars(self: *mut R) !void {
+        for i in @as(usize, 0)..self.bars.len {
+            let b = self.bars.get(i);
+            self.vline(b.x, b.y0, self.y, 2.5)!;
+        }
+    }
+
+    fn new_page(self: *mut R) !void {
+        self.close_bars()!;
+        let mut next = self.doc.page(self.o.page_width, self.o.page_height)!;
+        self.doc.add_page(&mut self.page) catch |e| {
+            next.deinit();
+            return e;
+        };
+        self.page.deinit();
+        self.page = next;
+        self.start_page()!;
+    }
+
+    fn finish(self: *mut R) !void {
+        self.close_bars()!;
+        self.doc.add_page(&mut self.page)!;
+        if self.o.bookmarks {
+            for i in @as(usize, 0)..self.marks.len {
+                let m = self.marks.get(i);
+                self.doc.bookmark(m.level, m.title, m.page, m.y)!;
+            }
+        }
+    }
+
+    // --- vertical space ---
+
+    fn at_top(self: *R) bool {
+        return self.y <= self.top + 0.01;
+    }
+
+    /// Asks for a gap of at least g before the next block.
+    fn space(self: *mut R, g: f64) void {
+        self.pending = @max(self.pending, g);
+    }
+
+    /// Makes room for h that must not be split: the owed gap, then a new
+    /// page if h does not fit on this one.
+    fn place(self: *mut R, h: f64) !void {
+        if not self.at_top() and not self.fresh {
+            self.y += self.pending;
+        }
+        self.pending = 0.0;
+        self.fresh = false;
+        if ((self.y + h) > self.bottom) and not self.at_top() {
+            self.new_page()!;
+        }
+    }
+
+    /// Takes the owed gap now, and none before the next block (which starts
+    /// a container).
+    fn commit(self: *mut R) void {
+        if not self.at_top() and not self.fresh {
+            self.y += self.pending;
+        }
+        self.pending = 0.0;
+        self.fresh = true;
+    }
+
+    fn line_height(self: *R) f64 {
+        let f = self.o.fonts.regular;
+        let em = @float_from_int(f64, f.ascent - f.descent) * font.scale_for(f, self.o.size);
+        return em * self.o.line_spacing;
+    }
+
+    // --- drawing helpers ---
+
+    fn vline(self: *mut R, x: f64, y0: f64, y1: f64, w: f64) !void {
+        if y1 <= y0 {
+            return;
+        }
+        self.page.fill_rect(x, y0, w, y1 - y0, draw.Paint.solid(self.o.rule_color))!;
+    }
+
+    fn hline(self: *mut R, x0: f64, x1: f64, y: f64, w: f64) !void {
+        self.page.fill_rect(x0, y - (w / 2.0), x1 - x0, w, draw.Paint.solid(self.o.rule_color))!;
+    }
+
+    // --- blocks ---
+
+    /// x0 moved right by d, unless the column would get too narrow.
+    fn indent(self: *R, x0: f64, x1: f64, d: f64) f64 {
+        if (x1 - (x0 + d)) < (self.o.size * 10.0) {
+            return x0;
+        }
+        return x0 + d;
+    }
+
+    fn children(self: *mut R, id: u32, x0: f64, x1: f64, depth: u32, tight: bool) !void {
+        let mut c = self.md.node(id).first;
+        while c != NONE {
+            self.block(c, x0, x1, depth, tight)!;
+            c = self.md.node(c).next;
+        }
+    }
+
+    fn block(self: *mut R, id: u32, x0: f64, x1: f64, depth: u32, tight: bool) !void {
+        let n = self.md.node(id);
+        let size = self.o.size;
+        if depth > MAX_DEPTH {
+            return self.plain_block(id, x0, x1);
+        }
+        match n.kind {
+            .PARAGRAPH => {
+                if tight {
+                    self.space(size * 0.25);
+                } else {
+                    self.space(size * 0.75);
+                }
+                self.paragraph(id, x0, x1)!;
+                if tight {
+                    self.space(size * 0.25);
+                } else {
+                    self.space(size * 0.75);
+                }
+            }
+            .HEADING => { self.heading(id, x0, x1)!; }
+            .BLOCK_QUOTE => {
+                self.space(size * 0.75);
+                self.commit();
+                // a bar down the side, unless the column is too narrow to indent
+                let cx = self.indent(x0, x1, size * 1.2);
+                if cx == x0 {
+                    self.quote += 1;
+                    let r = self.children(id, x0, x1, depth + 1, false);
+                    self.quote -= 1;
+                    r!;
+                    self.space(size * 0.75);
+                    return;
+                }
+                self.bars.push(Bar.{ x: x0, y0: self.y })!;
+                self.quote += 1;
+                self.children(id, cx, x1, depth + 1, false) catch |e| {
+                    self.quote -= 1;
+                    _ = self.bars.pop() catch Bar.{ x: 0.0, y0: 0.0 };
+                    return e;
+                };
+                self.quote -= 1;
+                let b = self.bars.pop()!;
+                self.vline(b.x, b.y0, self.y, 2.5)!;
+                self.space(size * 0.75);
+            }
+            .LIST => { self.list(id, x0, x1, depth, tight)!; }
+            .CODE_BLOCK => {
+                self.space(size * 0.75);
+                if self.o.markdown.math and is_math_info(self.md.info(id)) {
+                    self.display_math(strip_newline(self.md.text(id)), x0, x1)!;
+                } else {
+                    self.code_block(id, x0, x1)!;
+                }
+                self.space(size * 0.75);
+            }
+            .THEMATIC_BREAK => {
+                self.space(size);
+                self.place(1.0)!;
+                self.hline(x0, x1, self.y, 1.0)!;
+                self.y += 1.0;
+                self.space(size);
+            }
+            .TABLE => {
+                self.space(size * 0.75);
+                self.table(id, x0, x1)!;
+                self.space(size * 0.75);
+            }
+            else => {}  // raw HTML is left out
+        }
+    }
+
+    /// A block's text, as one plain paragraph.
+    fn plain_block(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let s = self.md.plain_text(id)!;
+        defer mem.free(s);
+        let mut p = Para.init();
+        defer p.deinit();
+        p.add(s, self.style(self.base(), false, false, false, false, false), plain_meta())!;
+        self.space(self.o.size * 0.75);
+        self.set(&mut p, x0, x1, 0.0)!;
+    }
+
+    fn base(self: *R) Base {
+        let mut c = self.o.text_color;
+        if self.quote > 0 {
+            c = self.o.muted_color;
+        }
+        return Base.{ size: self.o.size, bold: false, col: c };
+    }
+
+    /// Lays a paragraph out in [x0, x1] and flows it down the pages.
+    fn set(self: *mut R, p: *mut Para, x0: f64, x1: f64, keep: f64) !void {
+        let mut align = gtext.Align.START;
+        if self.o.justify {
+            align = gtext.Align.JUSTIFY;
+        }
+        p.lay(x1 - x0, align, self.o.line_spacing)!;
+        self.flow(p, x0, 0.0, keep)!;
+    }
+
+    fn paragraph(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let n = self.md.node(id);
+        if self.images_only(id) {
+            let mut c = n.first;
+            while c != NONE {
+                if self.md.node(c).kind == markdown.Kind.IMAGE {
+                    self.image_block(c, x0, x1)!;
+                }
+                c = self.md.node(c).next;
+            }
+            return;
+        }
+        // runs of inlines, with displayed math between them
+        let mut start = n.first;
+        let mut c = n.first;
+        while c != NONE {
+            let cn = self.md.node(c);
+            if cn.kind == markdown.Kind.DISPLAY_MATH {
+                self.inline_run(id, start, c, x0, x1)!;
+                self.space(self.o.size * 0.5);
+                self.display_math(self.md.text(c), x0, x1)!;
+                self.space(self.o.size * 0.5);
+                start = cn.next;
+            }
+            c = cn.next;
+        }
+        self.inline_run(id, start, NONE, x0, x1)!;
+    }
+
+    fn inline_run(self: *mut R, block: u32, first: u32, stop: u32, x0: f64, x1: f64) !void {
+        if first == stop {
+            return;
+        }
+        let mut p = Para.init();
+        defer p.deinit();
+        self.inlines(&mut p, block, first, stop, self.base())!;
+        if p.spans.len == 0 {
+            return;
+        }
+        self.set(&mut p, x0, x1, 0.0)!;
+    }
+
+    fn heading(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let n = self.md.node(id);
+        let scales: [6]f64 = [1.9, 1.5, 1.25, 1.1, 1.0, 0.9];
+        let lvl = @min(@max(@as(usize, n.level), 1), 6);
+        let size = self.o.size * scales[lvl - 1];
+        self.space(size * 1.1);
+        let mut p = Para.init();
+        defer p.deinit();
+        let mut b = self.base();
+        b.size = size;
+        b.bold = true;
+        self.inlines(&mut p, id, n.first, NONE, b)!;
+        if p.spans.len == 0 {
+            return;
+        }
+        // kept with two lines of what follows (and the gap and rule before them)
+        self.set(&mut p, x0, x1, (self.line_height() * 2.0) + (size * 0.8))!;
+        if lvl <= 2 {
+            self.y += size * 0.2;
+            self.hline(x0, x1, self.y, 0.75)!;
+            self.y += size * 0.1;
+        }
+        self.space(size * 0.5);
+        // the outline, and the title
+        let t = self.md.plain_text(id)!;
+        if (self.title.len == 0) and (t.len > 0) {
+            self.title.push_str(t) catch {};
+        }
+        let mut level = @int_cast(i32, lvl) - 1;
+        if level > self.mark_level + 1 {
+            level = self.mark_level + 1;
+        }
+        self.mark_level = level;
+        let m = Mark.{ level: @int_cast(u32, level), title: t, page: self.doc.page_count(), y: self.last_top };
+        self.marks.push(m) catch |e| {
+            mem.free(t);
+            return e;
+        };
+    }
+
+    fn code_block(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let size = self.o.size * 0.88;
+        let pad = size * 0.7;
+        let mut p = Para.init();
+        defer p.deinit();
+        let mut st = gtext.Style.init(self.o.fonts.mono, size, self.base().col);
+        st.fallbacks = self.o.fonts.fallbacks;
+        let s = strip_newline(self.md.text(id));
+        if s.len == 0 {
+            p.add(" ", st, plain_meta())!;
+        } else {
+            p.add(s, st, plain_meta())!;
+        }
+        p.tabs = 4.0 * font.measure(self.o.fonts.mono, " ", size);
+        p.lay((x1 - x0) - (2.0 * pad), gtext.Align.LEFT, 1.15)!;
+        self.flow(&mut p, x0 + pad, pad, 0.0)!;
+    }
+
+    fn display_math(self: *mut R, src: []u8, x0: f64, x1: f64) !void {
+        let mut f = tex.parse(src) catch {
+            // shown as its source
+            let mut p = Para.init();
+            defer p.deinit();
+            let mut st = gtext.Style.init(self.o.fonts.mono, self.o.size * 0.9, self.base().col);
+            st.fallbacks = self.o.fonts.fallbacks;
+            p.add(src, st, plain_meta())!;
+            p.lay(x1 - x0, gtext.Align.CENTER, self.o.line_spacing)!;
+            self.flow(&mut p, x0, 0.0, 0.0)!;
+            return;
+        };
+        let mut t = typeset.typeset(&f, self.o.fonts.math, self.o.size * 1.1, tex.Display.BLOCK) catch |e| {
+            f.deinit();
+            return e;
+        };
+        f.deinit();
+        defer t.deinit();
+        let h = t.height + t.depth;
+        self.place(h)!;
+        let x = x0 + @max(((x1 - x0) - t.width) / 2.0, 0.0);
+        t.draw_pdf(&mut self.page, x, self.y + t.height, self.base().col)!;
+        self.y += h;
+    }
+
+    // --- lists ---
+
+    fn list(self: *mut R, id: u32, x0: f64, x1: f64, depth: u32, in_tight: bool) !void {
+        let n = self.md.node(id);
+        let size = self.o.size;
+        let mut gap = size * 0.75;
+        if n.tight {
+            gap = size * 0.25;
+        }
+        // around the list: a paragraph's gap, or an item's within a tight list
+        let mut around = size * 0.75;
+        if in_tight {
+            around = size * 0.25;
+        }
+        self.space(around);
+        // the marker column: as wide as the widest number
+        let mut count: u32 = 0;
+        let mut c = n.first;
+        while c != NONE {
+            count += 1;
+            c = self.md.node(c).next;
+        }
+        let mut col = size * 1.5;
+        if n.ordered {
+            let mut nb: [24]u8 = [0; 24];
+            let s = number_text(nb[..], n.start + @max(count, 1) - 1, n.delim);
+            col = @max(col, font.measure(self.o.fonts.regular, s, size) + (size * 0.5));
+        }
+        let cx = self.indent(x0, x1, col);
+        self.list_level += 1;
+        let mut number = n.start;
+        c = n.first;
+        let mut first = true;
+        while c != NONE {
+            let item = self.md.node(c);
+            if not first {
+                self.space(gap);
+            }
+            first = false;
+            self.commit();
+            let mut kind: u8 = 'b';
+            if n.ordered {
+                kind = 'n';
+            }
+            if item.task == markdown.Task.OPEN {
+                kind = 'o';
+            } else if item.task == markdown.Task.DONE {
+                kind = 'x';
+            }
+            self.marker = Marker.{ pending: true, kind: kind, level: self.list_level - 1, number: number,
+                                   delim: n.delim, x: cx };
+            self.children(c, cx, x1, depth + 1, n.tight) catch |e| {
+                self.list_level -= 1;
+                return e;
+            };
+            if self.marker.pending {
+                // an empty item, or one that starts with an image or a rule
+                self.place(self.line_height())!;
+                let f = self.o.fonts.regular;
+                let asc = @float_from_int(f64, f.ascent) * font.scale_for(f, size);
+                self.draw_marker(self.y + asc)!;
+                if item.first == NONE {
+                    self.y += self.line_height();
+                }
+            }
+            number += 1;
+            c = item.next;
+        }
+        self.list_level -= 1;
+        self.space(around);
+    }
+
+    fn draw_marker(self: *mut R, baseline: f64) !void {
+        let m = self.marker;
+        self.marker.pending = false;
+        let size = self.o.size;
+        let col = self.base().col;
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        if m.kind == 'n' {
+            let mut nb: [24]u8 = [0; 24];
+            let s = number_text(nb[..], m.number, m.delim);
+            let f = self.o.fonts.regular;
+            let w = font.measure(f, s, size);
+            self.page.text(f, size, (m.x - (size * 0.4)) - w, baseline, s, col)!;
+            return;
+        }
+        if (m.kind == 'o') or (m.kind == 'x') {
+            let side = size * 0.72;
+            let bx = (m.x - (size * 0.45)) - side;
+            let by = (baseline - (size * 0.36)) - (side / 2.0);
+            p.rounded_rect(bx, by, side, side, side * 0.15)!;
+            self.page.stroke(&p, draw.Paint.solid(col), draw.Stroke.width(0.8))!;
+            if m.kind == 'x' {
+                p.clear();
+                p.move_to(bx + (side * 0.2), by + (side * 0.5))!;
+                p.line_to(bx + (side * 0.42), by + (side * 0.75))!;
+                p.line_to(bx + (side * 0.82), by + (side * 0.22))!;
+                let mut st = draw.Stroke.width(1.3);
+                st.cap = draw.Cap.ROUND;
+                st.join = draw.Join.ROUND;
+                self.page.stroke(&p, draw.Paint.solid(col), st)!;
+            }
+            return;
+        }
+        let r = size * 0.16;
+        let bx = m.x - (size * 0.75);
+        let by = baseline - (size * 0.33);
+        let style = m.level % 3;
+        if style == 2 {
+            p.rect(bx - r, by - r, 2.0 * r, 2.0 * r)!;
+            self.page.fill(&p, draw.Paint.solid(col), draw.FillRule.NONZERO)!;
+        } else {
+            p.circle(bx, by, r)!;
+            if style == 0 {
+                self.page.fill(&p, draw.Paint.solid(col), draw.FillRule.NONZERO)!;
+            } else {
+                self.page.stroke(&p, draw.Paint.solid(col), draw.Stroke.width(0.8))!;
+            }
+        }
+    }
+
+    // --- inlines ---
+
+    fn style(self: *R, b: Base, emph: bool, strong: bool, strike: bool, link: bool, code: bool) gtext.Style {
+        let fs_ = &self.o.fonts;
+        let bold = b.bold or strong;
+        let mut f = fs_.regular;
+        if bold and emph {
+            f = fs_.bold_italic;
+        } else if bold {
+            f = fs_.bold;
+        } else if emph {
+            f = fs_.italic;
+        }
+        let mut size = b.size;
+        if code {
+            f = fs_.mono;
+            size = size * 0.9;
+        }
+        let mut c = b.col;
+        if link {
+            c = self.o.link_color;
+        }
+        let mut st = gtext.Style.init(f, size, c);
+        st.fallbacks = fs_.fallbacks;
+        st.underline = link;
+        st.strike = strike;
+        return st;
+    }
+
+    /// Adds the inlines of `block` from `first` up to (not including) its
+    /// child `stop` to p as spans. The walk goes down and back up the tree
+    /// without recursing.
+    fn inlines(self: *mut R, p: *mut Para, block: u32, first: u32, stop: u32, b: Base) !void {
+        let md = self.md;
+        let mut emph: u32 = 0;
+        let mut strong: u32 = 0;
+        let mut strike: u32 = 0;
+        let mut img: u32 = 0;
+        let mut link = NONE;
+        let mut id = first;
+        while (id != NONE) and (id != stop) {
+            let n = md.node(id);
+            let st = self.style(b, (emph + img) > 0, strong > 0, strike > 0, link != NONE, false);
+            let mut meta = plain_meta();
+            meta.link = link;
+            let mut down = false;
+            match n.kind {
+                .TEXT       => { p.add(md.text(id), st, meta)!; }
+                .SOFT_BREAK => { p.add(" ", st, meta)!; }
+                .HARD_BREAK => { p.add("\n", st, meta)!; }
+                .CODE => {
+                    meta.code = true;
+                    p.add(md.text(id), self.style(b, false, false, strike > 0, link != NONE, true), meta)!;
+                }
+                .MATH         => { self.inline_math(p, md.text(id), st, meta)!; }
+                .DISPLAY_MATH => { self.inline_math(p, md.text(id), st, meta)!; }
+                .EMPH => {
+                    emph += 1;
+                    down = true;
+                }
+                .STRONG => {
+                    strong += 1;
+                    down = true;
+                }
+                .STRIKETHROUGH => {
+                    strike += 1;
+                    down = true;
+                }
+                .LINK => {
+                    link = id;
+                    down = true;
+                }
+                .IMAGE => {
+                    img += 1;
+                    down = true;
+                }
+                else => {}  // raw HTML
+            }
+            if down and (n.first != NONE) {
+                id = n.first;
+                continue;
+            }
+            // the next node: a sibling, or the next sibling of an ancestor
+            let mut cur = id;
+            let mut leaving = down;  // an empty container is left at once
+            loop {
+                let cn = md.node(cur);
+                if leaving {
+                    match cn.kind {
+                        .EMPH          => { emph -= 1; }
+                        .STRONG        => { strong -= 1; }
+                        .STRIKETHROUGH => { strike -= 1; }
+                        .LINK          => { link = NONE; }
+                        .IMAGE         => { img -= 1; }
+                        else => {}
+                    }
+                }
+                if (cn.parent == block) or (cn.next != NONE) {
+                    id = cn.next;
+                    break;
+                }
+                cur = cn.parent;
+                leaving = true;
+            }
+        }
+    }
+
+    /// Inline math: a no-break space as wide as the typeset formula, which
+    /// is drawn over it.
+    fn inline_math(self: *mut R, p: *mut Para, src: []u8, st: gtext.Style, meta: Meta) !void {
+        let mut f = tex.parse(src) catch {
+            let mut m = meta;
+            m.code = true;
+            let mut cst = st;
+            cst.font = self.o.fonts.mono;
+            cst.size = st.size * 0.9;
+            p.add(src, cst, m)!;
+            return;
+        };
+        let t = typeset.typeset(&f, self.o.fonts.math, st.size, tex.Display.INLINE) catch |e| {
+            f.deinit();
+            return e;
+        };
+        f.deinit();
+        p.maths.push(t) catch |e| {
+            let mut tt = t;
+            tt.deinit();
+            return e;
+        };
+        let nbsp = "\xc2\xa0";
+        let mut s = st;
+        s.underline = false;
+        s.letter_spacing = t.width - font.measure(st.font, nbsp, st.size);
+        let mut m = meta;
+        m.math = @truncate(u32, p.maths.len - 1);
+        p.add(nbsp, s, m)!;
+    }
+
+    // --- flowing laid-out text down the pages ---
+
+    /// Draws a laid-out paragraph with its left edge at x, splitting it
+    /// between lines where the page ends. With pad > 0, it sits in a tinted
+    /// box pad bigger all round. keep: room wanted below its first lines.
+    fn flow(self: *mut R, p: *mut Para, x: f64, pad: f64, keep: f64) !void {
+        let n = p.l.lines.len;
+        if n == 0 {
+            return;
+        }
+        let head = p.bound(@min(n, 2)) + (2.0 * pad) + keep;
+        self.place(head)!;
+        self.last_top = self.y;
+        self.y += pad;
+        let mut i: usize = 0;
+        let mut first = true;
+        while i < n {
+            let room = self.bottom - self.y;
+            let mut j = i;
+            while j < n {
+                let mut extra: f64 = 0.0;
+                if (j + 1) == n {
+                    extra = pad;
+                }
+                if ((p.bound(j + 1) - p.bound(i)) + extra) > room {
+                    break;
+                }
+                j += 1;
+            }
+            if j == i {
+                if self.y > (self.top + pad + 0.01) {
+                    self.new_page()!;
+                    self.y += pad;
+                    if first {
+                        self.last_top = self.top;
+                    }
+                    continue;
+                }
+                j = i + 1;
+            }
+            let h = p.bound(j) - p.bound(i);
+            if pad > 0.0 {
+                let mut tp: f64 = 0.0;
+                let mut bp: f64 = 0.0;
+                if first {
+                    tp = pad;
+                }
+                if j == n {
+                    bp = pad;
+                }
+                self.page.fill_rect(x - pad, self.y - tp, p.width + (2.0 * pad), h + tp + bp,
+                                    draw.Paint.solid(self.o.tint))!;
+            }
+            self.draw_lines(p, i, j, x, self.y - p.bound(i))!;
+            self.y += h;
+            i = j;
+            first = false;
+            if i < n {
+                self.new_page()!;
+                self.y += pad;
+            }
+        }
+        self.y += pad;
+    }
+
+    /// Lines [i, j) of p, the layout's top left at (x, oy): code tints and
+    /// link areas, the glyphs, then math and a pending list marker.
+    fn draw_lines(self: *mut R, p: *mut Para, i: usize, j: usize, x: f64, oy: f64) !void {
+        let lines = p.l.lines.items();
+        let gs = p.l.glyphs.items();
+        let spans = p.spans.items();
+        for li in i..j {
+            let ln = lines[li];
+            let end = ln.first_glyph + ln.glyph_count;
+            let mut k = ln.first_glyph;
+            while k < end {
+                let sp = gs[k].span;
+                let mut gx0 = gs[k].x;
+                let mut gx1 = gs[k].x + gs[k].advance;
+                let mut k2 = k + 1;
+                while (k2 < end) and (gs[k2].span == sp) {
+                    gx0 = @min(gx0, gs[k2].x);
+                    gx1 = @max(gx1, gs[k2].x + gs[k2].advance);
+                    k2 += 1;
+                }
+                let m = p.meta.get(sp);
+                if m.code {
+                    let size = spans[sp].style.size;
+                    let mut box = draw.Path.init();
+                    defer box.deinit();
+                    box.rounded_rect((x + gx0) - 1.5, (oy + ln.baseline) - (size * 0.95), (gx1 - gx0) + 3.0, size * 1.3,
+                                     2.0)!;
+                    self.page.fill(&box, draw.Paint.solid(self.o.tint), draw.FillRule.NONZERO)!;
+                }
+                if m.link != NONE {
+                    let url = self.md.url(m.link);
+                    if (url.len > 0) and (url[0] != '#') {
+                        self.page.link(x + gx0, (oy + ln.baseline) - ln.ascent, gx1 - gx0, ln.ascent + ln.descent,
+                                       url)!;
+                    }
+                }
+                k = k2;
+            }
+        }
+        self.page.draw_layout_lines(&p.l, i, j, x, oy)!;
+        if (i < j) and (j <= lines.len) {
+            let g0 = lines[i].first_glyph;
+            let g1 = lines[j - 1].first_glyph + lines[j - 1].glyph_count;
+            for k in g0..g1 {
+                let m = p.meta.get(gs[k].span);
+                if m.math != NONE {
+                    let t = p.maths.get_ptr(@as(usize, m.math));
+                    t.draw_pdf(&mut self.page, x + gs[k].x, oy + gs[k].y, spans[gs[k].span].style.color)!;
+                }
+            }
+            if self.marker.pending {
+                self.draw_marker(oy + lines[i].baseline)!;
+            }
+        }
+    }
+
+    // --- tables ---
+
+    fn table(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let md = self.md;
+        let size = self.o.size;
+        let pad = size * 0.45;
+        // rows and columns
+        let mut rows = vec.Vec.[u32].init();
+        defer rows.deinit();
+        let mut ncols: usize = 0;
+        let mut r = md.node(id).first;
+        while r != NONE {
+            rows.push(r)!;
+            let mut k: usize = 0;
+            let mut c = md.node(r).first;
+            while c != NONE {
+                k += 1;
+                c = md.node(c).next;
+            }
+            ncols = @max(ncols, k);
+            r = md.node(r).next;
+        }
+        if (rows.len == 0) or (ncols == 0) {
+            return;
+        }
+        let nrows = rows.len;
+        // a paragraph a cell (empty where a row is short)
+        let mut cells = vec.Vec.[Para].init();
+        defer {
+            for i in @as(usize, 0)..cells.len {
+                cells.get_ptr(i).deinit();
+            }
+            cells.deinit();
+        }
+        let mut aligns = vec.Vec.[gtext.Align].init();
+        defer aligns.deinit();
+        for _c in @as(usize, 0)..ncols {
+            aligns.push(gtext.Align.START)!;
+        }
+        let nat = mem.alloc_zeroed.[f64](ncols)!;
+        defer mem.free(nat);
+        let low = mem.alloc_zeroed.[f64](ncols)!;
+        defer mem.free(low);
+        for ri in @as(usize, 0)..nrows {
+            let row = md.node(rows.get(ri));
+            let mut c = row.first;
+            for ci in @as(usize, 0)..ncols {
+                cells.push(Para.init())!;
+                let p = cells.get_ptr(cells.len - 1);
+                if c == NONE {
+                    continue;
+                }
+                let cn = md.node(c);
+                let mut b = self.base();
+                b.bold = row.header;
+                self.inlines(p, c, cn.first, NONE, b)!;
+                if ri == 0 {
+                    match cn.align {
+                        .LEFT   => { aligns.set(ci, gtext.Align.LEFT); }
+                        .CENTER => { aligns.set(ci, gtext.Align.CENTER); }
+                        .RIGHT  => { aligns.set(ci, gtext.Align.RIGHT); }
+                        .NONE => {}
+                    }
+                }
+                p.lay(0.0, gtext.Align.START, self.o.line_spacing)!;
+                nat[ci] = @max(nat[ci], p.l.width + (2.0 * pad));
+                low[ci] = @max(low[ci], @min(p.l.width, size * 4.0) + (2.0 * pad));
+                c = cn.next;
+            }
+        }
+        // column widths: as they are when they fit; else the narrow columns
+        // keep theirs and the wide ones share what is left
+        let avail = x1 - x0;
+        let widths = mem.dup(nat[..])!;
+        defer mem.free(widths);
+        let mut total: f64 = 0.0;
+        for w in nat {
+            total = total + w;
+        }
+        if total > avail {
+            let fair = avail / @float_from_int(f64, ncols);
+            let mut left = avail;
+            let mut wide: f64 = 0.0;
+            for ci in @as(usize, 0)..ncols {
+                if nat[ci] <= fair {
+                    left = left - nat[ci];
+                } else {
+                    wide = wide + nat[ci];
+                }
+            }
+            for ci in @as(usize, 0)..ncols {
+                if nat[ci] > fair {
+                    widths[ci] = @max(left * (nat[ci] / wide), low[ci]);
+                }
+            }
+        }
+        let mut tw: f64 = 0.0;
+        for w in widths {
+            tw = tw + w;
+        }
+        // the cells at their widths, and the rows' heights
+        let heights = mem.alloc_zeroed.[f64](nrows)!;
+        defer mem.free(heights);
+        for ri in @as(usize, 0)..nrows {
+            for ci in @as(usize, 0)..ncols {
+                let p = cells.get_ptr((ri * ncols) + ci);
+                if p.spans.len == 0 {
+                    continue;
+                }
+                p.lay(@max(widths[ci] - (2.0 * pad), 1.0), aligns.get(ci), self.o.line_spacing)!;
+                heights[ri] = @max(heights[ri], p.l.height);
+            }
+            heights[ri] = @max(heights[ri], self.line_height()) + (2.0 * pad);
+        }
+        let header = md.node(rows.get(0)).header;
+        for ri in @as(usize, 0)..nrows {
+            let mut need = heights[ri];
+            if header and (ri == 0) and (nrows > 1) {
+                need = need + heights[1];  // a header is kept with a row
+            }
+            let before = self.doc.page_count();
+            self.place(need)!;
+            if header and (ri > 0) and (self.doc.page_count() != before) {
+                self.table_row(&mut cells, 0, ncols, widths, heights[0], x0, pad, true, tw)!;
+            }
+            self.table_row(&mut cells, ri, ncols, widths, heights[ri], x0, pad, header and (ri == 0), tw)!;
+        }
+    }
+
+    fn table_row(self: *mut R, cells: *mut vec.Vec.[Para], ri: usize, ncols: usize, widths: []f64, h: f64, x0: f64,
+                 pad: f64, shade: bool, tw: f64) !void {
+        let y = self.y;
+        if shade {
+            self.page.fill_rect(x0, y, tw, h, draw.Paint.solid(self.o.tint))!;
+        }
+        let mut cx = x0;
+        for ci in @as(usize, 0)..ncols {
+            let p = cells.get_ptr((ri * ncols) + ci);
+            if p.spans.len > 0 {
+                self.draw_lines(p, 0, p.l.lines.len, cx + pad, y + pad)!;
+            }
+            cx = cx + widths[ci];
+        }
+        // the grid
+        self.hline(x0, x0 + tw, y, 0.6)!;
+        self.hline(x0, x0 + tw, y + h, 0.6)!;
+        cx = x0;
+        for ci in @as(usize, 0)..ncols + 1 {
+            self.page.fill_rect(cx - 0.3, y, 0.6, h, draw.Paint.solid(self.o.rule_color))!;
+            if ci < ncols {
+                cx = cx + widths[ci];
+            }
+        }
+        self.y = y + h;
+    }
+
+    // --- images ---
+
+    /// Whether a paragraph holds images and nothing else but spaces.
+    fn images_only(self: *R, id: u32) bool {
+        if self.o.image_dir.len == 0 {
+            return false;
+        }
+        let mut seen = false;
+        let mut c = self.md.node(id).first;
+        while c != NONE {
+            let n = self.md.node(c);
+            if n.kind == markdown.Kind.IMAGE {
+                seen = true;
+            } else if n.kind == markdown.Kind.TEXT {
+                for ch in self.md.text(c) {
+                    if (ch != ' ') and (ch != '\t') {
+                        return false;
+                    }
+                }
+            } else if (n.kind != markdown.Kind.SOFT_BREAK) and (n.kind != markdown.Kind.HARD_BREAK) {
+                return false;
+            }
+            c = n.next;
+        }
+        return seen;
+    }
+
+    /// An image on its own, at its size (96 pixels an inch) or shrunk to
+    /// fit; its alt text if it cannot be read.
+    fn image_block(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let url = self.md.url(id);
+        let mut path = strs.String.init();
+        defer path.deinit();
+        if safe_path(url) {
+            path.push_str(self.o.image_dir)!;
+            path.push('/')!;
+            path.push_str(url)!;
+        }
+        let data = fs.read_file(path.bytes()) catch {
+            return self.alt_text(id, x0, x1);
+        };
+        defer mem.free(data);
+        let mut img = formats.decode(data) catch {
+            return self.alt_text(id, x0, x1);
+        };
+        defer img.deinit();
+        let mut w = @float_from_int(f64, img.width) * 0.75;
+        let mut h = @float_from_int(f64, img.height) * 0.75;
+        let maxw = x1 - x0;
+        let maxh = (self.bottom - self.top) * 0.9;
+        if w > maxw {
+            h = h * (maxw / w);
+            w = maxw;
+        }
+        if h > maxh {
+            w = w * (maxh / h);
+            h = maxh;
+        }
+        self.space(self.o.size * 0.75);
+        self.place(h)!;
+        if self.marker.pending {
+            let f = self.o.fonts.regular;
+            self.draw_marker(self.y + (@float_from_int(f64, f.ascent) * font.scale_for(f, self.o.size)))!;
+        }
+        if formats.detect(data) == formats.Format.JPEG {
+            self.page.jpeg(data, x0, self.y, w, h)!;
+        } else {
+            self.page.image(&img, x0, self.y, w, h)!;
+        }
+        self.y += h;
+        self.space(self.o.size * 0.75);
+    }
+
+    fn alt_text(self: *mut R, id: u32, x0: f64, x1: f64) !void {
+        let mut p = Para.init();
+        defer p.deinit();
+        let n = self.md.node(id);
+        // the image node itself: its alt text in italics
+        self.inlines(&mut p, n.parent, id, n.next, self.base())!;
+        if p.spans.len > 0 {
+            self.set(&mut p, x0, x1, 0.0)!;
+        }
+    }
+}
+
+/// A relative path that stays inside the directory it is taken from.
+fn safe_path(url: []u8) bool {
+    if (url.len == 0) or (url[0] == '/') {
+        return false;
+    }
+    for ch in url {
+        if (ch == '\\') or (ch == ':') or (ch == 0) {
+            return false;
+        }
+    }
+    let mut segs = strs.split(url, "/");
+    loop {
+        let s = segs.next() catch break;
+        if strs.eq(s, "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn is_math_info(info: []u8) bool {
+    return strs.starts_with(info, "math") and ((info.len == 4) or (info[4] == ' ') or (info[4] == '\t'));
+}
+
+fn strip_newline(s: []u8) []u8 {
+    if (s.len > 0) and (s[s.len - 1] == '\n') {
+        return s[..s.len - 1];
+    }
+    return s;
+}
+
+/// "12." (or "12)") in buf.
+fn number_text(buf: []mut u8, n: u32, delim: u8) []u8 {
+    let s = io.fmt_u64(buf[..buf.len - 1], @as(u64, n));
+    let k = s.len;
+    // fmt_u64 may have written at the start of buf: copy to be sure
+    let mut tmp: [24]u8 = [0; 24];
+    @mem_copy(tmp[..k], s);
+    @mem_copy(buf[..k], tmp[..k]);
+    buf[k] = '.';
+    if delim == ')' {
+        buf[k] = ')';
+    }
+    return buf[..k + 1];
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+/// The text of every page of a PDF, one after the other.
+fn pdf_text(bytes: []u8) ![]mut u8 {
+    let mut r = read.Reader.open(bytes)!;
+    defer r.deinit();
+    let mut out = strs.String.init();
+    for i in @as(usize, 0)..r.page_count() {
+        let t = r.page_text(i) catch |e| {
+            out.deinit();
+            return e;
+        };
+        defer mem.free(t);
+        out.push_str(t) catch |e| {
+            out.deinit();
+            return e;
+        };
+        out.push('\n') catch |e| {
+            out.deinit();
+            return e;
+        };
+    }
+    return out.take();
+}
+
+fn page_count(bytes: []u8) !usize {
+    let mut r = read.Reader.open(bytes)!;
+    defer r.deinit();
+    return r.page_count();
+}
+
+test "paths for images stay in their directory" {
+    @expect(safe_path("a.png"));
+    @expect(safe_path("img/a b.png"));
+    @expect(not safe_path(""));
+    @expect(not safe_path("/etc/passwd"));
+    @expect(not safe_path("../secret.png"));
+    @expect(not safe_path("img/../../x.png"));
+    @expect(not safe_path("C:/x.png"));
+    @expect(not safe_path("https://example.org/x.png"));
+    @expect(not safe_path("a\\b.png"));
+    let mut nb: [24]u8 = [0; 24];
+    @expect_eq(number_text(nb[..], 12, '.'), "12.");
+    @expect_eq(number_text(nb[..], 7, ')'), "7)");
+}
+
+test "a document reads back" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let o = Options.init(set.fonts());
+    let mut sb = strs.String.init();
+    defer sb.deinit();
+    sb.push_str("# Report title\n\nSome *emphasis*, **strong** and `code`, with a [link](https://example.org/x).\n\n")!;
+    sb.push_str("- apples\n- pears\n\n1. first\n2. second\n\n> quoted words\n\n```\nlet x = 1;\n```\n\n")!;
+    sb.push_str("| Name | Count |\n|---|--:|\n| alpha | 3 |\n| beta | 14 |\n\n## Second heading\n\nThe end.\n")!;
+    let src = sb.bytes();
+    let bytes = to_pdf(src, o)!;
+    defer mem.free(bytes);
+    @expect(strs.starts_with(bytes, "%PDF-"));
+    let t = pdf_text(bytes)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "Report title"));
+    @expect(strs.contains(t, "emphasis"));
+    @expect(strs.contains(t, "apples"));
+    @expect(strs.contains(t, "2."));
+    @expect(strs.contains(t, "quoted words"));
+    @expect(strs.contains(t, "let x = 1;"));
+    @expect(strs.contains(t, "alpha"));
+    @expect(strs.contains(t, "14"));
+    @expect(strs.contains(t, "Second heading"));
+    // the title, the outline and the link
+    let mut r = read.Reader.open(bytes)!;
+    defer r.deinit();
+    let title = r.info("Title")!;
+    defer mem.free(title);
+    @expect_eq(title, "Report title");
+    @expect(strs.contains(bytes, "/Outlines"));
+    @expect(strs.contains(bytes, "/URI (https://example.org/x)"));
+    // write streams the same document
+    let mut s = strs.String.init();
+    defer s.deinit();
+    write(s.writer(), src, o)!;
+    @expect(s.len > 1000);
+}
+
+test "long documents run onto more pages" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let mut o = Options.init(set.fonts());
+    let mut src = strs.String.init();
+    defer src.deinit();
+    for i in @as(usize, 0)..60 {
+        _ = i;
+        src.push_str("A paragraph of filler text that runs to two lines or so on an A4 page, ")!;
+        src.push_str("with enough words in it to wrap at least once.\n\n")!;
+    }
+    src.push_str("```\n")!;
+    for i in @as(usize, 0)..80 {
+        _ = i;
+        src.push_str("code line\n")!;
+    }
+    src.push_str("```\n\nlast words\n")!;
+    let bytes = to_pdf(src.bytes(), o)!;
+    defer mem.free(bytes);
+    let pages = page_count(bytes)!;
+    @expect(pages >= 3);
+    let t = pdf_text(bytes)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "last words"));
+    // nothing is lost: every code line is there
+    let mut n: usize = 0;
+    let mut rest = t[..];
+    loop {
+        let k = strs.index_of(rest, "code line") catch break;
+        n += 1;
+        rest = rest[k + 9..];
+    }
+    @expect_eq(n, 80);
+    // a smaller page holds less
+    o.page_width = 300.0;
+    o.page_height = 400.0;
+    o.margin = 30.0;
+    let small = to_pdf(src.bytes(), o)!;
+    defer mem.free(small);
+    @expect(page_count(small)! > pages);
+}
+
+test "images are read only from image_dir" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let o = Options.init(set.fonts());
+    let bytes = to_pdf("![the alt text](std/graphics/qr/testdata/none.png)\n", o)!;
+    defer mem.free(bytes);
+    let t = pdf_text(bytes)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "the alt text"));
+    @expect(not strs.contains(bytes, "/Subtype /Image"));
+}
+
+test "math, and math that does not parse" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let o = Options.init(set.fonts());
+    let bytes = to_pdf("Energy $E = mc^2$ here.\n\n$$\\frac{1}{2}$$\n\nBad $\\frac{1}$ math.\n", o)!;
+    defer mem.free(bytes);
+    let t = pdf_text(bytes)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "Energy"));
+    @expect(strs.contains(t, "here."));
+    @expect(strs.contains(t, "\\frac{1}"));  // shown as its source
+}
+
+test "hostile nesting stays readable" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let o = Options.init(set.fonts());
+    let mut src = strs.String.init();
+    defer src.deinit();
+    for i in @as(usize, 0)..2000 {
+        _ = i;
+        src.push_str("> ")!;
+    }
+    src.push_str("deep quote\n\n")!;
+    for i in @as(usize, 0)..300 {
+        _ = i;
+        src.push_str("- ")!;
+    }
+    src.push_str("deep list\n\n")!;
+    for i in @as(usize, 0)..2000 {
+        _ = i;
+        src.push_str("*")!;
+    }
+    src.push_str("x\n")!;
+    let bytes = to_pdf(src.bytes(), o)!;
+    defer mem.free(bytes);
+    let t = pdf_text(bytes)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "deep quote"));
+    @expect(strs.contains(t, "deep list"));
+}
+
+test "an empty document is a page" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let o = Options.init(set.fonts());
+    let bytes = to_pdf("", o)!;
+    defer mem.free(bytes);
+    @expect_eq(page_count(bytes)!, 1);
+}
+
+test "onto a document of one's own, with one font" {
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let mut o = Options.init(Fonts.single(set.fonts().regular));
+    o.page_numbers = false;
+    o.bookmarks = false;
+    let mut doc = pdf.Document.init();
+    defer doc.deinit();
+    render_text("# One\n\ntext\n", &mut doc, &o)!;
+    render_text("# Two\n\nmore text\n", &mut doc, &o)!;
+    @expect_eq(doc.page_count(), 2);
+    let bytes = doc.bytes()!;
+    defer mem.free(bytes);
+    @expect(not strs.contains(bytes, "/Outlines"));
+    let t = pdf_text(bytes)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "more text"));
+}
