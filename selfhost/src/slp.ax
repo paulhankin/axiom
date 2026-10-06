@@ -126,7 +126,7 @@ fn writes_between(from: *mut ir.Value, to: *mut ir.Value) bool {
 fn writing_intr(i: *ir.Value) bool {
     let id = @truncate(i32, @bit_cast(i64, i.cv));
     return ((id >= ir.IN_TRAP) and (id <= ir.IN_SET_SP)) or (id == ir.IN_GET_SP) or (id == ir.IN_STORE_PARTIAL) or
-           (id > ir.IN_BSWAP);
+           ((id > ir.IN_BSWAP) and (id != ir.IN_SAD_U8));
 }
 
 // The leaves of the `or` tree at root (or-s of one use in its block).
@@ -1588,5 +1588,235 @@ pub fn splat_groups(f: *mut ir.Func) bool {
     u.free(@ptr_cast(*mut void, cands.data));
     u.free(@ptr_cast(*mut void, offs.data));
     u.free(@ptr_cast(*mut void, bases.data));
+    return any;
+}
+
+// =============================================================================
+// Sums of neighbouring bytes (x86-64), as LLVM's SLP vectorizer makes them:
+// a tree of integer adds whose leaves include n >= 8 loads of the bytes at
+// p, p + 1, ..., p + n - 1 (zero-extended to the sum's width, or summed as
+// bytes) is vector loads of those bytes, each summed by psadbw against zero.
+// The sum wraps at its width as the scalar adds do (it is the exact sum
+// truncated). Sixteen bytes at a time; with AVX-512 the last ones in one
+// masked load, otherwise in a load of up to 8 bytes (fewer than 4 left stay
+// scalar). the benchmark's checker counts:
+//
+//   for i in 0..24 { tot_men0 += raw[0][i]; tot_men1 += raw[1][i]; }
+// =============================================================================
+
+// One byte of a sum: load(base + off), zero-extended or not.
+struct ByteTerm {
+    v: *mut ir.Value,   // the leaf
+    ld: *mut ir.Value,  // its load
+    base: *mut ir.Value,
+    off: i64,
+    rank: usize,  // the first term with this base
+}
+
+// The leaf v as a byte of a sum of type t, if it is one.
+fn byte_term(v: *mut ir.Value, t: *ir.Ty, x: *mut ByteTerm) bool {
+    let mut ld = v;
+    if is_op(v, ir.OP_ZEXT) {
+        ld = v.a;
+    } else if t.bits != 8 {
+        return false;
+    }
+    if not is_op(ld, ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.ty.bits != 8) or
+       (ld.blk != v.blk) {
+        return false;
+    }
+    let mut base = ld.a;
+    let mut off: i64 = 0;
+    if is_op(base, ir.OP_PTRADD) and ir.is_cint(base.b) {
+        off = @bit_cast(i64, ir.cint_val(base.b));
+        base = base.a;
+    }
+    x.v = v;
+    x.ld = ld;
+    x.base = base;
+    x.off = off;
+    return true;
+}
+
+// The leaves of the `add` tree at root (adds of one use in its block).
+fn add_leaves(v: *mut ir.Value, root: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) void {
+    if is_op(v, ir.OP_ADD) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 256) {
+        add_leaves(v.a, root, out);
+        add_leaves(v.b, root, out);
+        return;
+    }
+    out.push(v);
+}
+
+// By base (in the order the bases first appear), then offset.
+fn by_base_off(a: ByteTerm, b: ByteTerm) i32 {
+    if a.rank != b.rank {
+        if a.rank < b.rank {
+            return -1;
+        }
+        return 1;
+    }
+    if a.off < b.off {
+        return -1;
+    }
+    if a.off > b.off {
+        return 1;
+    }
+    return 0;
+}
+
+// The sums of the bytes of v (<16 x i8>) added into acc (<2 x i64>, or nil).
+fn add_sad(B: *mut ir.Builder, acc: *mut ir.Value, v: *mut ir.Value) *mut ir.Value {
+    let mut args: [1]*mut ir.Value = [v];
+    let s = ir.intr(B, ir.IN_SAD_U8, ir.t_vec(ir.t_int(64), 2), args[..]);
+    if u.isnil(acc) {
+        return s;
+    }
+    return ir.binop(B, ir.OP_ADD, acc, s);
+}
+
+// The sum at root as vector sums of its bytes; true if it was.
+fn vectorize_sum(B: *mut ir.Builder, f: *mut ir.Func, root: *mut ir.Value, avx512: bool) bool {
+    let t = root.ty;
+    let mut ls = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    add_leaves(root, root, &mut ls);
+    let ts = u.calloc_slice.[ByteTerm](ls.len + 1);
+    let mut nt: usize = 0;
+    for k in 0..ls.len {
+        let mut x = ByteTerm.{ v: vnil(), ld: vnil(), base: vnil(), off: 0, rank: nt };
+        if byte_term(ls.get(k), t, &mut x) {
+            for j in 0..nt {
+                if ts[j].base == x.base {
+                    x.rank = ts[j].rank;
+                    break;
+                }
+            }
+            ts[nt] = x;
+            nt += 1;
+        }
+    }
+    // the longest run of neighbouring bytes from one base
+    let mut best_at: usize = 0;
+    let mut best_n: usize = 0;
+    if nt >= 8 {
+        u.sort.[ByteTerm](ts[0..nt], by_base_off);
+        let mut k: usize = 0;
+        while k < nt {
+            let mut n: usize = 1;
+            let mut j = k + 1;
+            while (j < nt) and (ts[j].base == ts[k].base) and (ts[j].off == (ts[j - 1].off + 1)) {
+                n += 1;
+                j += 1;
+            }
+            if n > best_n {
+                best_n = n;
+                best_at = k;
+            }
+            k = j;
+        }
+    }
+    let mut ok = best_n >= 8;
+    if ok {
+        let mut earliest = ts[best_at].ld;
+        for k in (best_at + 1)..(best_at + best_n) {
+            if before(ts[k].ld, earliest) {
+                earliest = ts[k].ld;
+            }
+        }
+        // nothing writes memory between the first load and the root (the
+        // loads move there)
+        ok = not writes_between(earliest, root);
+    }
+    if not ok {
+        u.free_slice(ts);
+        u.free(@ptr_cast(*mut void, ls.data));
+        return false;
+    }
+    let n = @int_cast(i64, best_n);
+    let lo = ts[best_at].off;
+    ir.at_before(B, root);
+    let isz = ir.isz();
+    let p = ir.ptradd(B, ts[best_at].base, ir.cint(isz, @bit_cast(u64, lo)));
+    let v16 = ir.t_vec(ir.t_int(8), 16);
+    let mut acc = vnil();
+    let mut at: i64 = 0;
+    while (n - at) >= 16 {
+        let mut q = p;
+        if at > 0 {
+            q = ir.ptradd(B, p, ir.cint(isz, @bit_cast(u64, at)));
+        }
+        let ld = ir.load(B, v16, q);
+        ld.align = 1;
+        acc = add_sad(B, acc, ld);
+        at += 16;
+    }
+    let left = n - at;
+    if (left > 0) and (avx512 or (left >= 4)) {
+        let mut q = p;
+        if at > 0 {
+            q = ir.ptradd(B, p, ir.cint(isz, @bit_cast(u64, at)));
+        }
+        let mut take = left;
+        if not avx512 and (take > 8) {
+            take = 8;
+        }
+        // (a whole 4 or 8 bytes in a plain load)
+        acc = add_sad(B, acc, load_low(B, q, 8, take, avx512 and (take != 4) and (take != 8)));
+        at += take;
+    }
+    // the two halves' sums
+    let mut hi: [2]i32 = [1, 0];
+    let s2 = ir.binop(B, ir.OP_ADD, acc, ir.shuffle(B, acc, acc, hi[..]));
+    let mut m = ir.extract_elem(B, s2, 0);
+    if t.bits < 64 {
+        m = ir.trunc(B, m, t);
+    }
+    // the other leaves (and the bytes past those vectorized)
+    for k in 0..ls.len {
+        let x = ls.get(k);
+        let mut used = false;
+        for j in best_at..(best_at + best_n) {
+            if (ts[j].v == x) and ((ts[j].off - lo) < at) {
+                used = true;
+            }
+        }
+        if not used {
+            m = ir.binop(B, ir.OP_ADD, m, x);
+        }
+    }
+    ir.replace_uses(f, root, m);
+    u.free_slice(ts);
+    u.free(@ptr_cast(*mut void, ls.data));
+    return true;
+}
+
+// Sums of neighbouring bytes as vector sums (x86-64). True if any changed.
+pub fn byte_sums(f: *mut ir.Func) bool {
+    if tg.g_arch != tg.ARCH_X64 {
+        return false;
+    }
+    let feats = tg.fn_features(f);
+    let need = (tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL;
+    let avx512 = (feats & need) == need;
+    count_uses(f);
+    let B = ir.new_builder();
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.last;
+        while u.notnil(i) {
+            let prev = i.prev;
+            // a root: an `add` of integers not itself part of a larger one
+            if is_op(i, ir.OP_ADD) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
+               (i.uses > 0) and not ((i.uses == 1) and is_op(i.user, ir.OP_ADD) and (i.user.blk == b)) {
+                if vectorize_sum(B, f, i, avx512) {
+                    any = true;
+                    count_uses(f);
+                }
+            }
+            i = prev;
+        }
+        b = b.next;
+    }
     return any;
 }
