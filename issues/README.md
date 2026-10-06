@@ -59,6 +59,7 @@ they travel with the code they describe.
 | [0115](0115-selfhost-dead-remat-piece-definitions.md) | bug | compiler (selfhost: mach) | Self-hosted x86-64: dead loads of rematerialized constants left behind by splitting (fixed in d5317ce) |
 | [0116](0116-selfhost-sroa-whole-copies.md) | feature | compiler (selfhost: sroa) | Self-hosted optimizer: a slot that is only ever copied whole is split into its fields (fixed in 99ffec5) |
 | [0117](0117-selfhost-bitscan-dependency-avx512.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: tzcnt and lzcnt cleared first on processors without the false dependency (fixed in a3bc1cd) |
+| [0118](0118-selfhost-float-to-int-branches.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: saturating float -> int conversions branch three times (fixed in a92501d) |
 | [0104](0104-vdso-clock.md) | feature | runtime | Native Linux programs read the clock with a system call, not the vDSO |
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
