@@ -34,6 +34,8 @@
 //     s0 (linear, wrapping)        [[sampler(0)]]
 //     s1 (shadow comparison)       [[sampler(1)]]: sample_compare, less or
 //                                    equal; outside the map, not in shadow
+//     s2 (linear, clamped)         [[sampler(2)]]: for targets read by a
+//                                    later pass (set_target_texture)
 //     vertex attributes            [[attribute(0)]], [[attribute(1)]], ...
 //                                    in the order the Attributes are given
 //     u0, u1, ... (compute)        [[buffer(1)]], [[buffer(2)]], ...
@@ -41,8 +43,12 @@
 // Metal's conventions are Direct3D's: clip space has y up and depth 0..1,
 // a target's pixels and a texture's coordinates start at the top left.
 // Front faces are counter-clockwise as seen, as in std/graphics/d3d12.
-// Targets are 8-bit BGRA (what a window's layer takes); read_pixels gives
-// RGBA.
+// Targets are 8-bit BGRA (what a window's layer takes; read_pixels gives
+// RGBA) or, offscreen, half floats for linear light beyond 1 (HDR) and
+// other formats (target_with), drawn multisampled (MSAA) if asked and read
+// by later passes' shaders (set_target_texture): a scene drawn into an
+// HDR target, then tone-mapped into the window. Textures can have
+// mipmaps (texture_mipmapped), sRGB-decoded or half-float (HDR).
 //
 // Simplest correct use of the API, not the fastest: a frame is submitted
 // and waited for before the next is recorded, so buffers can be rewritten
@@ -99,9 +105,19 @@ pub const CULL_NONE: u32 = 1;
 pub const CULL_FRONT: u32 = 2;
 pub const CULL_BACK: u32 = 3;
 
+// What a target holds (target_with, PipelineOptions.format)
+pub const TARGET_BGRA8: u32 = 0;    // 8-bit BGRA, what a window shows
+pub const TARGET_RGBA16F: u32 = 1;  // half floats: linear light beyond 1 (HDR), for later passes to read
+pub const TARGET_RG16F: u32 = 2;    // two half floats (velocities, moments)
+pub const TARGET_R32F: u32 = 3;     // one float (depths, distances)
+
 const BGRA8: u64 = 80;  // MTLPixelFormatBGRA8Unorm
 const DEPTH32: u64 = 252;
 const RGBA8: u64 = 70;
+const RGBA8_SRGB: u64 = 71;
+const RGBA16F: u64 = 115;
+const RG16F: u64 = 65;
+const R32F: u64 = 55;
 const VERTEX_BUFFER: u64 = 30;  // the buffer index vertices come from
 const MAX_CONSTANTS: usize = 64;
 
@@ -192,6 +208,7 @@ pub struct Texture {
     p: usize,  // id<MTLTexture>
     width: u32,
     height: u32,
+    levels: u32,  // mipmap levels (1: none)
 
     pub fn release(self: *mut Texture) void {
         objc.release(self.p);
@@ -213,17 +230,25 @@ pub struct StorageBuffer {
     }
 }
 
-/// Something to draw into: the window (its layer's next drawable) or a texture.
+/// Something to draw into: the window (its layer's next drawable) or a
+/// texture. With samples > 1 it is drawn multisampled (MSAA) into `msaa`
+/// and resolved into `tex` at the end of each pass; shaders of later
+/// passes read `tex` (set_target_texture).
 pub struct Target {
     tex: usize,  // id<MTLTexture> (the screen's: this frame's drawable's)
     width: u32,
     height: u32,
     screen: bool,
+    format: u32,   // TARGET_*
+    samples: u32,  // 1, or 2, 4, 8: multisampled
+    msaa: usize,   // the multisampled texture (0: none)
 
     pub fn release(self: *mut Target) void {
         if not self.screen {
             objc.release(self.tex);
         }
+        objc.release(self.msaa);
+        self.msaa = 0;
         self.tex = 0;
     }
 }
@@ -235,6 +260,7 @@ pub struct DepthBuffer {
     width: u32,
     height: u32,
     sampled: bool,
+    samples: u32,  // as its target's
 
     pub fn release(self: *mut DepthBuffer) void {
         objc.release(self.tex);
@@ -246,7 +272,8 @@ pub struct DepthBuffer {
 /// bias (constant, in steps of the depth's precision, and scaled by the
 /// slope) against shadow acne; depth_only for a pass without a target (a
 /// shadow map: the fragment function is not used); the vertex stride (0:
-/// the end of the last attribute).
+/// the end of the last attribute); the target's format (TARGET_*) and
+/// samples, which must be those of the targets it draws into.
 pub struct PipelineOptions {
     topology: u32,
     blend: u32,
@@ -256,11 +283,15 @@ pub struct PipelineOptions {
     slope_bias: f32,
     depth_only: bool,
     stride: u32,
+    format: u32,
+    samples: u32,
 
-    /// Triangles, no blending, depth or culling, no bias.
+    /// Triangles, no blending, depth or culling, no bias; into an 8-bit
+    /// BGRA target (the window's), one sample.
     pub fn defaults() PipelineOptions {
         return PipelineOptions.{ topology: TRIANGLE_LIST, blend: BLEND_NONE, depth: DEPTH_NONE, cull: CULL_NONE,
-                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0 };
+                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0, format: TARGET_BGRA8,
+                                 samples: 1 };
     }
 }
 
@@ -330,7 +361,7 @@ pub struct Device {
     consts_dirty: bool,
     index_buffer: usize,
     index_type: u64,
-    samplers: [2]usize,
+    samplers: [3]usize,
     vsync: bool,
 
     /// A device for drawing offscreen (into textures).
@@ -339,12 +370,12 @@ pub struct Device {
         if dev == 0 {
             return error.Unsupported;
         }
-        let mut d = Device.{ dev: dev, queue: 0, layer: 0, back: Target.{ tex: 0, width: 0, height: 0, screen: true },
+        let mut d = Device.{ dev: dev, queue: 0, layer: 0, back: screen_target(0, 0),
                              drawable: 0, cmd: 0, enc: 0, computing: false, pool: 0,
                              pass_target: @ptr_from_int(*mut Target, 0), pass_depth: @ptr_from_int(*mut DepthBuffer, 0),
                              clear_color: [0.0; 4], clearing: false, clearing_depth: false,
                              cur: @ptr_from_int(*Pipeline, 0), consts: [0; 64], nconsts: 0, consts_dirty: false,
-                             index_buffer: 0, index_type: 0, samplers: [0, 0], vsync: true };
+                             index_buffer: 0, index_type: 0, samplers: [0, 0, 0], vsync: true };
         d.queue = objc.call(dev, "newCommandQueue");
         if d.queue == 0 {
             d.deinit();
@@ -385,21 +416,27 @@ pub struct Device {
         }
         _ = objc.call1(view, "setLayer:", layer);
         _ = objc.send_b(view, objc.sel("setWantsLayer:"), true);
-        d.back = Target.{ tex: 0, width: width, height: height, screen: true };
+        d.back = screen_target(width, height);
         return d;
     }
 
     fn make_samplers(self: *mut Device) !void {
         let pool = objc.pool_push();
         defer objc.pool_pop(pool);
-        for k in @as(usize, 0)..2 {
+        for k in @as(usize, 0)..3 {
             let sd = objc.new("MTLSamplerDescriptor");
             _ = objc.call1(sd, "setMinFilter:", 1);  // linear
             _ = objc.call1(sd, "setMagFilter:", 1);
             if k == 0 {
                 _ = objc.call1(sd, "setMipFilter:", 2);     // (linear, if there are mips)
+                _ = objc.call1(sd, "setMaxAnisotropy:", 8);  // (if there are mips)
                 _ = objc.call1(sd, "setSAddressMode:", 2);  // repeat
                 _ = objc.call1(sd, "setTAddressMode:", 2);
+            } else if k == 2 {
+                // a target's, read by a later pass: clamped to the edge
+                _ = objc.call1(sd, "setMipFilter:", 2);
+                _ = objc.call1(sd, "setSAddressMode:", 0);  // clamp to edge
+                _ = objc.call1(sd, "setTAddressMode:", 0);
             } else {
                 // a shadow map's: compared (less or equal), white outside
                 _ = objc.call1(sd, "setSAddressMode:", 5);  // clamp to border colour
@@ -421,10 +458,13 @@ pub struct Device {
         }
         objc.release(self.samplers[0]);
         objc.release(self.samplers[1]);
+        objc.release(self.samplers[2]);
+        objc.release(self.back.msaa);
+        self.back.msaa = 0;
         objc.release(self.layer);
         objc.release(self.queue);
         objc.release(self.dev);
-        self.samplers = [0, 0];
+        self.samplers = [0, 0, 0];
         self.layer = 0;
         self.queue = 0;
         self.dev = 0;
@@ -457,36 +497,127 @@ pub struct Device {
             self.layer, objc.sel("setDrawableSize:"), @float_from_int(f64, width), @float_from_int(f64, height));
         self.back.width = width;
         self.back.height = height;
+        if self.back.samples > 1 {
+            self.set_screen_samples(self.back.samples)!;
+        }
+    }
+
+    /// Draws the window multisampled: `samples` (2, 4 or 8) a pixel,
+    /// resolved when each pass ends (1: not multisampled). The pipelines
+    /// that draw into it need the same `samples`, and its depth buffer too.
+    pub fn set_screen_samples(self: *mut Device, samples: u32) !void {
+        self.wait_idle();
+        objc.release(self.back.msaa);
+        self.back.msaa = 0;
+        self.back.samples = 1;
+        if samples <= 1 {
+            return;
+        }
+        let m = self.texture_ms(BGRA8, self.back.width, self.back.height, samples, 0x4);
+        if m == 0 {
+            return error.Unsupported;
+        }
+        self.back.msaa = m;
+        self.back.samples = samples;
     }
 
     fn texture_2d(self: *mut Device, format: u64, width: u32, height: u32, usage: u64, storage: u64) usize {
+        return self.texture_mip(format, width, height, usage, storage, false);
+    }
+
+    fn texture_mip(self: *mut Device, format: u64, width: u32, height: u32, usage: u64, storage: u64,
+                   mipmapped: bool) usize {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let f = @bit_cast(fn(usize, usize, u64, u64, u64, u8) usize, objc.msg_send());
+        let mut mips: u8 = 0;
+        if mipmapped {
+            mips = 1;
+        }
+        let td = f(objc.class("MTLTextureDescriptor"),
+                   objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), format, @as(u64, width),
+                   @as(u64, height), mips);
+        _ = objc.call1(td, "setUsage:", @truncate(usize, usage));
+        _ = objc.call1(td, "setStorageMode:", @truncate(usize, storage));
+        return objc.call1(self.dev, "newTextureWithDescriptor:", td);
+    }
+
+    // A multisampled texture (private: the GPU's alone).
+    fn texture_ms(self: *mut Device, format: u64, width: u32, height: u32, samples: u32, usage: u64) usize {
+        let ok = @bit_cast(fn(usize, usize, u64) u8, objc.msg_send());
+        if ok(self.dev, objc.sel("supportsTextureSampleCount:"), @as(u64, samples)) == 0 {
+            return 0;
+        }
         let pool = objc.pool_push();
         defer objc.pool_pop(pool);
         let f = @bit_cast(fn(usize, usize, u64, u64, u64, u8) usize, objc.msg_send());
         let td = f(objc.class("MTLTextureDescriptor"),
                    objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), format, @as(u64, width),
                    @as(u64, height), 0);
+        _ = objc.call1(td, "setTextureType:", 4);  // MTLTextureType2DMultisample
+        _ = objc.call1(td, "setSampleCount:", @as(usize, samples));
         _ = objc.call1(td, "setUsage:", @truncate(usize, usage));
-        _ = objc.call1(td, "setStorageMode:", @truncate(usize, storage));
+        _ = objc.call1(td, "setStorageMode:", 2);  // private
         return objc.call1(self.dev, "newTextureWithDescriptor:", td);
     }
 
     /// A texture of width × height pixels to draw into offscreen.
     pub fn target(self: *mut Device, width: u32, height: u32) !Target {
-        let t = self.texture_2d(BGRA8, width, height, 0x5, 0);  // render target, shader read; shared
+        return self.target_with(width, height, TARGET_BGRA8, 1);
+    }
+
+    /// A texture of width × height pixels to draw into offscreen, holding
+    /// `format` (TARGET_*), drawn with `samples` a pixel (1, or 2, 4, 8:
+    /// multisampled, resolved as each pass ends). Later passes read it
+    /// with set_target_texture.
+    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) !Target {
+        let pf = pixel_format(format);
+        let t = self.texture_2d(pf, width, height, 0x5, 0);  // render target, shader read; shared
         if t == 0 {
             return error.Failed;
         }
-        return Target.{ tex: t, width: width, height: height, screen: false };
+        let mut m: usize = 0;
+        if samples > 1 {
+            m = self.texture_ms(pf, width, height, samples, 0x4);
+            if m == 0 {
+                objc.release(t);
+                return error.Unsupported;
+            }
+        }
+        return Target.{ tex: t, width: width, height: height, screen: false, format: format, samples: @max(samples, 1),
+                        msaa: m };
+    }
+
+    /// Makes an offscreen target width × height (after the window's size
+    /// changed), keeping its format and samples.
+    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) !void {
+        if t.screen or (width == 0) or (height == 0) or ((width == t.width) and (height == t.height)) {
+            return;
+        }
+        self.wait_idle();
+        let n = self.target_with(width, height, t.format, t.samples)!;
+        t.release();
+        t.* = n;
     }
 
     /// A depth buffer of width × height, for a target of that size.
     pub fn depth_buffer(self: *mut Device, width: u32, height: u32) !DepthBuffer {
-        let t = self.texture_2d(DEPTH32, width, height, 0x4, 2);  // render target; private
+        return self.depth_buffer_with(width, height, 1);
+    }
+
+    /// A depth buffer of width × height for a target of that size drawn
+    /// with `samples` a pixel.
+    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) !DepthBuffer {
+        let mut t: usize = 0;
+        if samples > 1 {
+            t = self.texture_ms(DEPTH32, width, height, samples, 0x4);
+        } else {
+            t = self.texture_2d(DEPTH32, width, height, 0x4, 2);  // render target; private
+        }
         if t == 0 {
             return error.Failed;
         }
-        return DepthBuffer.{ tex: t, width: width, height: height, sampled: false };
+        return DepthBuffer.{ tex: t, width: width, height: height, sampled: false, samples: @max(samples, 1) };
     }
 
     /// A depth buffer of size × size to draw into alone (begin_shadow) and
@@ -498,7 +629,7 @@ pub struct Device {
         if t == 0 {
             return error.Failed;
         }
-        return DepthBuffer.{ tex: t, width: size, height: size, sampled: true };
+        return DepthBuffer.{ tex: t, width: size, height: size, sampled: true, samples: 1 };
     }
 
     /// Makes d width × height (after the window's size changed).
@@ -511,7 +642,12 @@ pub struct Device {
         if d.sampled {
             usage = 0x5;
         }
-        let t = self.texture_2d(DEPTH32, width, height, usage, 2);
+        let mut t: usize = 0;
+        if d.samples > 1 {
+            t = self.texture_ms(DEPTH32, width, height, d.samples, usage);
+        } else {
+            t = self.texture_2d(DEPTH32, width, height, usage, 2);
+        }
         if t == 0 {
             return error.Failed;
         }
@@ -573,7 +709,96 @@ pub struct Device {
             return error.Failed;
         }
         replace(t, w, h, img.data, img.width * 4);
-        return Texture.{ p: t, width: w, height: h };
+        return Texture.{ p: t, width: w, height: h, levels: 1 };
+    }
+
+    /// A texture holding img with a full chain of mipmaps (made by the GPU,
+    /// box-filtered), read through sampler(0) trilinearly and
+    /// anisotropically. 8-bit images become 8-bit RGBA: with `srgb`, their
+    /// values are sRGB-encoded and shaders read linear light (colours);
+    /// without, as they are (normals, masks, heights). 16-bit and float
+    /// images become half-float RGBA (`srgb` ignored): linear light, HDR.
+    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) !Texture {
+        let w = @truncate(u32, img.width);
+        let h = @truncate(u32, img.height);
+        let mut t: usize = 0;
+        if img.depth == image.Depth.U8 {
+            let mut pf = RGBA8;
+            if srgb {
+                pf = RGBA8_SRGB;
+            }
+            t = self.texture_mip(pf, w, h, 0x1, 0, true);
+            if t == 0 {
+                return error.Failed;
+            }
+            if img.channels == 4 {
+                replace(t, w, h, img.data, img.width * 4);
+            } else {
+                let mut conv = img.convert(4, image.Depth.U8)!;
+                defer conv.deinit();
+                replace(t, w, h, conv.data, conv.width * 4);
+            }
+        } else {
+            t = self.texture_mip(RGBA16F, w, h, 0x1, 0, true);
+            if t == 0 {
+                return error.Failed;
+            }
+            self.replace_half(t, img) catch |e| {
+                objc.release(t);
+                return e;
+            };
+        }
+        let levels = @truncate(u32, objc.call(t, "mipmapLevelCount"));
+        self.generate_mipmaps(t)!;
+        return Texture.{ p: t, width: w, height: h, levels: levels };
+    }
+
+    /// A half-float RGBA texture holding img (any depth: 8- and 16-bit
+    /// samples are decoded to linear light first), without mipmaps: HDR
+    /// images, lookup tables, data.
+    pub fn texture_hdr(self: *mut Device, img: *image.Image) !Texture {
+        let w = @truncate(u32, img.width);
+        let h = @truncate(u32, img.height);
+        let t = self.texture_2d(RGBA16F, w, h, 0x1, 0);
+        if t == 0 {
+            return error.Failed;
+        }
+        self.replace_half(t, img) catch |e| {
+            objc.release(t);
+            return e;
+        };
+        return Texture.{ p: t, width: w, height: h, levels: 1 };
+    }
+
+    // Writes img into a half-float RGBA texture's first level.
+    fn replace_half(self: *mut Device, t: usize, img: *image.Image) !void {
+        _ = self;
+        let mut conv = img.convert(4, image.Depth.F32)!;
+        defer conv.deinit();
+        let src = conv.samples32();
+        let mut half = image.Image.init(img.width, img.height, 4, image.Depth.U16)!;  // (as storage)
+        defer half.deinit();
+        let dst = half.samples16();
+        for i in 0..src.len {
+            dst[i] = image.f32_to_half(src[i]);
+        }
+        replace(t, @truncate(u32, img.width), @truncate(u32, img.height), half.data, img.width * 8);
+    }
+
+    // Fills a texture's mipmaps from its first level, on the GPU, before
+    // anything submitted later.
+    fn generate_mipmaps(self: *mut Device, t: usize) !void {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let cb = objc.call(self.queue, "commandBuffer");
+        if cb == 0 {
+            return error.Failed;
+        }
+        let be = objc.call(cb, "blitCommandEncoder");
+        _ = objc.call1(be, "generateMipmapsForTexture:", t);
+        _ = objc.call(be, "endEncoding");
+        _ = objc.call(cb, "commit");
+        _ = objc.call(cb, "waitUntilCompleted");
     }
 
     /// A storage buffer holding data (its length a multiple of 4), for
@@ -696,7 +921,7 @@ pub struct Device {
         }
         if not o.depth_only {
             let ca = objc.call1(objc.call(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
-            _ = objc.call1(ca, "setPixelFormat:", @truncate(usize, BGRA8));
+            _ = objc.call1(ca, "setPixelFormat:", @truncate(usize, pixel_format(o.format)));
             if o.blend != BLEND_NONE {
                 _ = objc.send_b(ca, objc.sel("setBlendingEnabled:"), true);
                 _ = objc.call1(ca, "setRgbBlendOperation:", 0);  // add
@@ -715,6 +940,9 @@ pub struct Device {
         }
         if (o.depth != DEPTH_NONE) or o.depth_only {
             _ = objc.call1(pd, "setDepthAttachmentPixelFormat:", @truncate(usize, DEPTH32));
+        }
+        if o.samples > 1 {
+            _ = objc.call1(pd, "setRasterSampleCount:", @as(usize, o.samples));
         }
         _ = objc.call1(pd, "setInputPrimitiveTopology:", @truncate(usize, topology_class(o.topology)));
         let mut err: usize = 0;
@@ -891,8 +1119,15 @@ pub struct Device {
         let mut h: u32 = 0;
         if @int_from_ptr(t) != 0 {
             let ca = objc.call1(objc.call(rpd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
-            _ = objc.call1(ca, "setTexture:", t.tex);
-            _ = objc.call1(ca, "setStoreAction:", 1);  // store
+            if t.msaa != 0 {
+                // drawn multisampled, kept for later passes, resolved
+                _ = objc.call1(ca, "setTexture:", t.msaa);
+                _ = objc.call1(ca, "setResolveTexture:", t.tex);
+                _ = objc.call1(ca, "setStoreAction:", 3);  // store and multisample resolve
+            } else {
+                _ = objc.call1(ca, "setTexture:", t.tex);
+                _ = objc.call1(ca, "setStoreAction:", 1);  // store
+            }
             if self.clearing {
                 _ = objc.call1(ca, "setLoadAction:", 2);  // clear
                 _ = objc.send_dddd(ca, objc.sel("setClearColor:"), self.clear_color[0], self.clear_color[1],
@@ -929,8 +1164,10 @@ pub struct Device {
         _ = objc.call1(self.enc, "setFrontFacingWinding:", 1);                      // counter-clockwise
         _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[0], 0);
         _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[1], 1);
+        _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[2], 2);
         _ = objc.call2(self.enc, "setVertexSamplerState:atIndex:", self.samplers[0], 0);
         _ = objc.call2(self.enc, "setVertexSamplerState:atIndex:", self.samplers[1], 1);
+        _ = objc.call2(self.enc, "setVertexSamplerState:atIndex:", self.samplers[2], 2);
         self.consts_dirty = self.nconsts > 0;
         if @int_from_ptr(self.cur) != 0 {
             self.apply_pipeline(self.cur);
@@ -1005,6 +1242,18 @@ pub struct Device {
         let e = self.encoder();
         _ = objc.send2(e, objc.sel("setFragmentTexture:atIndex:"), t.p, @as(usize, slot));
         _ = objc.send2(e, objc.sel("setVertexTexture:atIndex:"), t.p, @as(usize, slot));
+    }
+
+    /// Texture texture(slot) of the pipeline's shaders: an offscreen target
+    /// drawn earlier in the frame (resolved, if multisampled), a
+    /// texture2d<float>; sampler(2) reads it clamped to its edges.
+    pub fn set_target_texture(self: *mut Device, slot: u32, t: *Target) void {
+        if t.screen {
+            return;
+        }
+        let e = self.encoder();
+        _ = objc.send2(e, objc.sel("setFragmentTexture:atIndex:"), t.tex, @as(usize, slot));
+        _ = objc.send2(e, objc.sel("setVertexTexture:atIndex:"), t.tex, @as(usize, slot));
     }
 
     /// The pipeline's constants (buffer(0)), as 32-bit words.
@@ -1165,7 +1414,7 @@ pub struct Device {
         if self.cmd != 0 {
             self.submit()!;
         }
-        if t.tex == 0 {
+        if (t.tex == 0) or (t.format != TARGET_BGRA8) {
             return error.Failed;
         }
         let w = @as(usize, t.width);
@@ -1224,6 +1473,10 @@ pub struct Device {
         _ = objc.call1(pd, "setFragmentFunction:", ff);
         let ca = objc.call1(objc.call(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
         _ = objc.call1(ca, "setPixelFormat:", @truncate(usize, BGRA8));
+        if self.back.samples > 1 {
+            // (over the window as it is drawn when the overlay is made)
+            _ = objc.call1(pd, "setRasterSampleCount:", @as(usize, self.back.samples));
+        }
         _ = objc.send_b(ca, objc.sel("setBlendingEnabled:"), true);
         _ = objc.call1(ca, "setSourceRGBBlendFactor:", 1);       // one
         _ = objc.call1(ca, "setDestinationRGBBlendFactor:", 5);  // one minus source alpha
@@ -1273,6 +1526,23 @@ pub struct Device {
             self.apply_pipeline(self.cur);
         }
     }
+}
+
+fn screen_target(width: u32, height: u32) Target {
+    return Target.{ tex: 0, width: width, height: height, screen: true, format: TARGET_BGRA8, samples: 1, msaa: 0 };
+}
+
+fn pixel_format(format: u32) u64 {
+    if format == TARGET_RGBA16F {
+        return RGBA16F;
+    }
+    if format == TARGET_RG16F {
+        return RG16F;
+    }
+    if format == TARGET_R32F {
+        return R32F;
+    }
+    return BGRA8;
 }
 
 // Writes rows of pixels into a shared texture.
