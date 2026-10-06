@@ -51,11 +51,30 @@
 //     ... draw ...
 //
 // Images become textures that shaders read like a shadow map, through s0
-// (linear, wrapping), with set_image. Textures and storage buffers are made
-// between frames (each upload is submitted and waited for).
+// (linear, wrapping), with set_image; texture_mipmapped gives them mipmaps
+// (made on the CPU, box-filtered), read trilinearly. Textures and storage
+// buffers are made between frames (each upload is submitted and waited
+// for).
 //
 //     let mut tex = gpu.texture(&img)!;
 //     gpu.set_image(0, &tex);                              // t0
+//
+// Offscreen targets can hold other formats (TARGET_*: half floats for
+// linear light beyond 1, HDR) and be drawn multisampled (target_with, with
+// a depth buffer of as many samples, depth_buffer_with, and pipelines that
+// say so, PipelineOptions.format and samples). A multisampled target is
+// resolved when its pass ends (the next begin, begin_depth or begin_shadow,
+// finish, present). Later passes read targets with set_target_texture,
+// through s2 (linear, clamped): a scene drawn into an HDR target, then
+// tone-mapped into the window.
+//
+//     let mut hdr = gpu.target_with(w, h, d3d12.TARGET_RGBA16F, 4)!;
+//     let mut z = gpu.depth_buffer_with(w, h, 4)!;
+//     gpu.begin_depth(&mut hdr, &mut z)!;                  // pipelines: format RGBA16F, 4 samples
+//     ... draw ...
+//     gpu.begin(gpu.screen())!;                            // (hdr is resolved)
+//     gpu.set_target_texture(0, &mut hdr);                 // t0
+//     gpu.draw(3, 0);
 //
 // Compute shaders work on storage buffers (RWStructuredBuffer<T> at u0, u1,
 // ...), which can be read back or drawn as vertices, in a frame of their
@@ -81,7 +100,9 @@
 // run Direct3D 12 the device is WARP's, in software.
 // =============================================================================
 
+import "../mem.ax" as mem;
 import "../os/com.ax" as com;
+import "color.ax" as color;
 import "hlsl.ax" as hlsl;
 import "image.ax" as image;
 
@@ -117,6 +138,28 @@ pub const R16_UINT: u32 = 57;
 pub const R32_UINT: u32 = 42;
 const D32_FLOAT: u32 = 40;
 const R32_TYPELESS: u32 = 39;
+const R16G16B16A16_FLOAT: u32 = 10;
+const R16G16_FLOAT: u32 = 34;
+const R8G8B8A8_UNORM_SRGB: u32 = 29;
+
+// What offscreen targets hold (target_with), as std/graphics/metal names them
+pub const TARGET_BGRA8: u32 = 0;    // 8-bit colour, what a window shows (here RGBA)
+pub const TARGET_RGBA16F: u32 = 1;  // half floats: linear light beyond 1 (HDR), for later passes to read
+pub const TARGET_RG16F: u32 = 2;    // two half floats (velocities, moments)
+pub const TARGET_R32F: u32 = 3;     // one float (depths, distances)
+
+fn target_format(format: u32) u32 {
+    if format == TARGET_RGBA16F {
+        return R16G16B16A16_FLOAT;
+    }
+    if format == TARGET_RG16F {
+        return R16G16_FLOAT;
+    }
+    if format == TARGET_R32F {
+        return R32_FLOAT;
+    }
+    return R8G8B8A8_UNORM;
+}
 
 // Primitive topologies
 pub const POINT_LIST: u32 = 1;
@@ -151,13 +194,46 @@ const DEPTH_WRITE_STATE: u32 = 0x10;
 const PIXEL_SHADER_RESOURCE: u32 = 0x80;
 const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
+const RESOLVE_DEST: u32 = 0x1000;
+const RESOLVE_SOURCE: u32 = 0x2000;
 const GENERIC_READ: u32 = 0xac3;
 
-const MAX_TARGETS: u32 = 64;  // render target views in the device's heap
-const MAX_DEPTHS: u32 = 16;   // depth stencil views in the device's heap
-const MAX_VIEWS: u32 = 64;    // shader resource views in the device's heap
+const MAX_TARGETS: usize = 2048;  // render target views in the device's heap (2 the window's)
+const MAX_DEPTHS: usize = 64;     // depth stencil views in the device's heap
+const MAX_VIEWS: usize = 4096;    // shader resource views in the device's heap
 const MAX_ROOT_BUFFERS: u32 = 4;
 const MAX_ROOT_TEXTURES: u32 = 4;
+const NO_SLOT: u32 = 0xffff_ffff;
+
+// Which places in the device's heaps of views are taken. Things made by the
+// device keep a pointer to it, and give their places back when released.
+struct Slots {
+    rtv: [MAX_TARGETS]u8,
+    dsv: [MAX_DEPTHS]u8,
+    srv: [MAX_VIEWS]u8,
+}
+
+// The first free place in `used`, now taken (NO_SLOT: none is free).
+fn take(used: []mut u8) u32 {
+    for k in 0..used.len {
+        if used[k] == 0 {
+            used[k] = 1;
+            return @truncate(u32, k);
+        }
+    }
+    return NO_SLOT;
+}
+
+fn give_back(used: []mut u8, slot: *mut u32) void {
+    if (slot.* != NO_SLOT) and (@as(usize, slot.*) < used.len) {
+        used[@as(usize, slot.*)] = 0;
+    }
+    slot.* = NO_SLOT;
+}
+
+fn no_slots() *mut Slots {
+    return @ptr_from_int(*mut Slots, 0);
+}
 
 let IID_DEVICE: [16]u8 = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85,
                           0xf7];
@@ -260,10 +336,20 @@ pub struct Texture {
     srv: u32,  // its shader resource view's index in the device's heap
     width: u32,
     height: u32,
+    levels: u32,  // mipmap levels (1: none)
+    slots: *mut Slots,
+
+    /// A texture that is not there yet (release does nothing).
+    pub fn empty() Texture {
+        return Texture.{ res: 0, srv: NO_SLOT, width: 0, height: 0, levels: 1, slots: no_slots() };
+    }
 
     pub fn release(self: *mut Texture) void {
         com.release(self.res);
         self.res = 0;
+        if @int_from_ptr(self.slots) != 0 {
+            give_back(self.slots.srv[..], &mut self.srv);
+        }
     }
 }
 
@@ -318,18 +404,36 @@ pub struct Overlay {
 
 /// Something to draw into: a back buffer of the window's swap chain or a texture.
 pub struct Target {
-    res: usize,  // ID3D12Resource
-    rtv: usize,  // its view (a CPU descriptor handle)
+    res: usize,  // ID3D12Resource: drawn into, or (multisampled) resolved into; what shaders read
+    rtv: usize,  // the view drawn into (a CPU descriptor handle)
     width: u32,
     height: u32,
-    state: u32,
+    state: u32,  // res's
     owned: bool,
+    format: u32,    // TARGET_*
+    samples: u32,   // 1, or 2, 4, 8: multisampled
+    msaa: usize,    // the multisampled resource drawn into (0: none), always a render target
+    rtv_slot: u32,  // the view's place in the device's heap (NO_SLOT: not the device's to give back)
+    srv: u32,       // the shader resource view's place, for set_target_texture (NO_SLOT: none)
+    slots: *mut Slots,
+
+    /// A target that is not there yet (release does nothing).
+    pub fn empty() Target {
+        return Target.{ res: 0, rtv: 0, width: 0, height: 0, state: 0, owned: false, format: TARGET_BGRA8, samples: 1,
+                        msaa: 0, rtv_slot: NO_SLOT, srv: NO_SLOT, slots: no_slots() };
+    }
 
     pub fn release(self: *mut Target) void {
         if self.owned {
             com.release(self.res);
+            com.release(self.msaa);
         }
         self.res = 0;
+        self.msaa = 0;
+        if @int_from_ptr(self.slots) != 0 {
+            give_back(self.slots.rtv[..], &mut self.rtv_slot);
+            give_back(self.slots.srv[..], &mut self.srv);
+        }
     }
 }
 
@@ -343,17 +447,34 @@ pub struct DepthBuffer {
     width: u32,
     height: u32,
     state: u32,
+    samples: u32,  // as its target's
+    dsv_slot: u32,
+    slots: *mut Slots,
+
+    /// A depth buffer that is not there yet (release does nothing).
+    pub fn empty() DepthBuffer {
+        return DepthBuffer.{ res: 0, dsv: 0, srv: NO_SLOT, sampled: false, width: 0, height: 0, state: 0, samples: 1,
+                             dsv_slot: NO_SLOT, slots: no_slots() };
+    }
 
     pub fn release(self: *mut DepthBuffer) void {
         com.release(self.res);
         self.res = 0;
+        if @int_from_ptr(self.slots) != 0 {
+            give_back(self.slots.dsv[..], &mut self.dsv_slot);
+            if self.sampled {
+                give_back(self.slots.srv[..], &mut self.srv);
+            }
+        }
     }
 }
 
 /// How a pipeline draws: the topology, BLEND_*, DEPTH_* and CULL_*; depth
 /// bias (constant, in steps of the depth's precision, and scaled by the
 /// slope) against shadow acne; depth_only for a pass without a target
-/// (a shadow map: the pixel shader is not used).
+/// (a shadow map: the pixel shader is not used); the format of the targets
+/// it draws into (TARGET_*) and their samples. (stride, a vertex's bytes,
+/// is std/graphics/metal's; here set_vertices says it.)
 pub struct PipelineOptions {
     topology: u32,
     blend: u32,
@@ -362,11 +483,16 @@ pub struct PipelineOptions {
     depth_bias: i32,
     slope_bias: f32,
     depth_only: bool,
+    stride: u32,
+    format: u32,
+    samples: u32,
 
-    /// Triangles, no blending, depth or culling, no bias.
+    /// Triangles, no blending, depth or culling, no bias, into 8-bit
+    /// targets of one sample.
     pub fn defaults() PipelineOptions {
         return PipelineOptions.{ topology: TRIANGLE_LIST, blend: BLEND_NONE, depth: DEPTH_NONE, cull: CULL_NONE,
-                                 depth_bias: 0, slope_bias: 0.0, depth_only: false };
+                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0, format: TARGET_BGRA8,
+                                 samples: 1 };
     }
 }
 
@@ -382,20 +508,18 @@ pub struct Device {
     rtv_heap: usize,
     rtv_base: usize,
     rtv_size: u32,
-    rtv_next: u32,
     dsv_heap: usize,
     dsv_base: usize,
     dsv_size: u32,
-    dsv_next: u32,
     srv_heap: usize,  // shader-visible: views of textures shaders read
     srv_cpu: usize,
     srv_gpu: u64,
     srv_size: u32,
-    srv_next: u32,
+    slots: *mut Slots,  // which places in the heaps are taken
     swap: usize,
     back: [2]Target,
     frame: u32,
-    cur: *mut Target,  // the target of the frame being recorded
+    cur: *mut Target,  // the target of the pass being recorded (null: none)
     recording: bool,
     heaps_set: bool,   // the frame's list has the view heap
     cur_buffers: u32,  // the current pipeline's root signature's
@@ -404,11 +528,13 @@ pub struct Device {
     /// A device for drawing offscreen (into textures).
     pub fn init() !Device {
         let mut d = Device.{ dev: 0, queue: 0, alloc: 0, list: 0, fence: 0, fence_value: 0, event: 0, factory: 0,
-                             rtv_heap: 0, rtv_base: 0, rtv_size: 0, rtv_next: 2, dsv_heap: 0, dsv_base: 0, dsv_size: 0,
-                             dsv_next: 0, srv_heap: 0, srv_cpu: 0, srv_gpu: 0, srv_size: 0, srv_next: 0, swap: 0,
-                             back: [Target.{ res: 0, rtv: 0, width: 0, height: 0, state: 0, owned: false }; 2],
+                             rtv_heap: 0, rtv_base: 0, rtv_size: 0, dsv_heap: 0, dsv_base: 0, dsv_size: 0, srv_heap: 0,
+                             srv_cpu: 0, srv_gpu: 0, srv_size: 0, slots: no_slots(), swap: 0, back: [Target.empty(); 2],
                              frame: 0, cur: @ptr_from_int(*mut Target, 0), recording: false, heaps_set: false,
                              cur_buffers: 0, cur_textures: 0 };
+        d.slots = mem.new_zeroed.[Slots]()!;
+        d.slots.rtv[0] = 1;  // (the window's back buffers')
+        d.slots.rtv[1] = 1;
         d.create() catch |e| {
             d.deinit();
             return e;
@@ -486,7 +612,7 @@ pub struct Device {
         }
         self.event = CreateEventW(@ptr_from_int(*void, 0), 0, 0, @ptr_from_int(*u16, 0));
         // D3D12_DESCRIPTOR_HEAP_DESC: RTV, count, flags, node mask
-        let hd: [4]u32 = [2, MAX_TARGETS, 0, 0];
+        let hd: [4]u32 = [2, @truncate(u32, MAX_TARGETS), 0, 0];
         let ch = @bit_cast(fn(usize, *u32, *u8, *mut usize) i32, com.method(self.dev, 14));
         if ch(self.dev, &hd[0], &IID_HEAP[0], &mut self.rtv_heap) < 0 {
             return error.Failed;
@@ -497,7 +623,7 @@ pub struct Device {
         _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.rtv_heap, 9))(self.rtv_heap, &mut h);
         self.rtv_base = h;
         // and one of depth stencil views
-        let dd: [4]u32 = [3, MAX_DEPTHS, 0, 0];
+        let dd: [4]u32 = [3, @truncate(u32, MAX_DEPTHS), 0, 0];
         if ch(self.dev, &dd[0], &IID_HEAP[0], &mut self.dsv_heap) < 0 {
             return error.Failed;
         }
@@ -505,7 +631,7 @@ pub struct Device {
         _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.dsv_heap, 9))(self.dsv_heap, &mut h);
         self.dsv_base = h;
         // and a shader-visible one of shader resource views
-        let sd: [4]u32 = [0, MAX_VIEWS, 1, 0];
+        let sd: [4]u32 = [0, @truncate(u32, MAX_VIEWS), 1, 0];
         if ch(self.dev, &sd[0], &IID_HEAP[0], &mut self.srv_heap) < 0 {
             return error.Failed;
         }
@@ -526,7 +652,14 @@ pub struct Device {
             }
             let rtv = self.rtv_base + (i * @as(usize, self.rtv_size));
             self.view(res, rtv);
-            self.back[i] = Target.{ res: res, rtv: rtv, width: width, height: height, state: PRESENT, owned: true };
+            let mut t = Target.empty();
+            t.res = res;
+            t.rtv = rtv;
+            t.width = width;
+            t.height = height;
+            t.state = PRESENT;
+            t.owned = true;
+            self.back[i] = t;
         }
         self.frame = @bit_cast(fn(usize) u32, com.method(self.swap, 36))(self.swap);  // GetCurrentBackBufferIndex
     }
@@ -555,8 +688,13 @@ pub struct Device {
         if self.event != 0 {
             _ = CloseHandle(self.event);
         }
+        if @int_from_ptr(self.slots) != 0 {
+            mem.destroy(self.slots);
+            self.slots = no_slots();
+        }
         self.dev = 0;
         self.queue = 0;
+        self.event = 0;
     }
 
     /// Waits until the GPU has done everything submitted.
@@ -593,31 +731,90 @@ pub struct Device {
 
     /// A texture of width × height RGBA pixels to draw into offscreen.
     pub fn target(self: *mut Device, width: u32, height: u32) !Target {
-        if self.rtv_next >= MAX_TARGETS {
+        return self.target_with(width, height, TARGET_BGRA8, 1);
+    }
+
+    /// A texture of width × height pixels to draw into offscreen, holding
+    /// `format` (TARGET_*), drawn with `samples` a pixel (1, or 2, 4, 8:
+    /// multisampled, resolved as each pass ends). Later passes read it
+    /// with set_target_texture.
+    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) !Target {
+        let f = target_format(format);
+        let n = @max(samples, 1);
+        let mut t = Target.empty();
+        t.width = width;
+        t.height = height;
+        t.owned = true;
+        t.format = format;
+        t.samples = n;
+        t.slots = self.slots;
+        t.rtv_slot = take(self.slots.rtv[..]);
+        t.srv = take(self.slots.srv[..]);
+        if (t.rtv_slot == NO_SLOT) or (t.srv == NO_SLOT) {
+            t.release();
             return error.Failed;
         }
-        let mut rd: [56]u8 = [0; 56];
-        texture_desc(rd[..], width, height, R8G8B8A8_UNORM, 1);  // ALLOW_RENDER_TARGET
         // D3D12_CLEAR_VALUE: format, colour
         let mut cv: [20]u8 = [0; 20];
-        com.put32(cv[..], 0, R8G8B8A8_UNORM);
-        let res = self.committed(1, rd[..], RENDER_TARGET, &cv[0])!;
-        let rtv = self.rtv_base + (@as(usize, self.rtv_next) * @as(usize, self.rtv_size));
-        self.rtv_next += 1;
-        self.view(res, rtv);
-        return Target.{ res: res, rtv: rtv, width: width, height: height, state: RENDER_TARGET, owned: true };
+        com.put32(cv[..], 0, f);
+        let mut rd: [56]u8 = [0; 56];
+        texture_desc_with(rd[..], width, height, f, 1, 1, 1);  // ALLOW_RENDER_TARGET
+        t.res = self.committed(1, rd[..], RENDER_TARGET, &cv[0]) catch |e| {
+            t.release();
+            return e;
+        };
+        t.state = RENDER_TARGET;
+        let mut drawn = t.res;
+        if n > 1 {
+            let mut md: [56]u8 = [0; 56];
+            texture_desc_with(md[..], width, height, f, 1, 1, n);
+            t.msaa = self.committed(1, md[..], RENDER_TARGET, &cv[0]) catch {
+                t.release();
+                return error.Unsupported;
+            };
+            drawn = t.msaa;
+        }
+        t.rtv = self.rtv_base + (@as(usize, t.rtv_slot) * @as(usize, self.rtv_size));
+        self.view(drawn, t.rtv);
+        let handle = self.srv_cpu + (@as(usize, t.srv) * @as(usize, self.srv_size));
+        @bit_cast(fn(usize, usize, *void, usize) void, com.method(self.dev, 18))(  // CreateShaderResourceView
+            self.dev, t.res, @ptr_from_int(*void, 0), handle);
+        return t;
+    }
+
+    /// Makes an offscreen target width × height (after the window's size
+    /// changed), keeping its format and samples.
+    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) !void {
+        if not t.owned or (t.rtv_slot == NO_SLOT) or (width == 0) or (height == 0) or
+           ((width == t.width) and (height == t.height)) {
+            return;
+        }
+        self.wait_idle();
+        let n = self.target_with(width, height, t.format, t.samples)!;
+        t.release();
+        t.* = n;
     }
 
     /// A depth buffer of width × height, for a target of that size.
     pub fn depth_buffer(self: *mut Device, width: u32, height: u32) !DepthBuffer {
-        if self.dsv_next >= MAX_DEPTHS {
+        return self.depth_buffer_with(width, height, 1);
+    }
+
+    /// A depth buffer of width × height for a target of that size drawn
+    /// with `samples` a pixel.
+    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) !DepthBuffer {
+        let mut d = DepthBuffer.empty();
+        d.samples = @max(samples, 1);
+        d.slots = self.slots;
+        d.dsv_slot = take(self.slots.dsv[..]);
+        if d.dsv_slot == NO_SLOT {
             return error.Failed;
         }
-        let dsv = self.dsv_base + (@as(usize, self.dsv_next) * @as(usize, self.dsv_size));
-        let mut d = DepthBuffer.{ res: 0, dsv: dsv, srv: 0, sampled: false, width: 0, height: 0,
-                                  state: DEPTH_WRITE_STATE };
-        self.depth_resource(&mut d, width, height)!;
-        self.dsv_next += 1;
+        d.dsv = self.dsv_base + (@as(usize, d.dsv_slot) * @as(usize, self.dsv_size));
+        self.depth_resource(&mut d, width, height) catch |e| {
+            d.release();
+            return e;
+        };
         return d;
     }
 
@@ -626,15 +823,20 @@ pub struct Device {
     /// a Texture2D<float> through register s1, a comparison sampler
     /// (less or equal; outside the map, nothing is in shadow).
     pub fn shadow_map(self: *mut Device, size: u32) !DepthBuffer {
-        if (self.dsv_next >= MAX_DEPTHS) or (self.srv_next >= MAX_VIEWS) {
+        let mut d = DepthBuffer.empty();
+        d.sampled = true;
+        d.slots = self.slots;
+        d.dsv_slot = take(self.slots.dsv[..]);
+        d.srv = take(self.slots.srv[..]);
+        if (d.dsv_slot == NO_SLOT) or (d.srv == NO_SLOT) {
+            d.release();
             return error.Failed;
         }
-        let dsv = self.dsv_base + (@as(usize, self.dsv_next) * @as(usize, self.dsv_size));
-        let mut d = DepthBuffer.{ res: 0, dsv: dsv, srv: self.srv_next, sampled: true, width: 0, height: 0,
-                                  state: DEPTH_WRITE_STATE };
-        self.depth_resource(&mut d, size, size)!;
-        self.dsv_next += 1;
-        self.srv_next += 1;
+        d.dsv = self.dsv_base + (@as(usize, d.dsv_slot) * @as(usize, self.dsv_size));
+        self.depth_resource(&mut d, size, size) catch |e| {
+            d.release();
+            return e;
+        };
         return d;
     }
 
@@ -644,7 +846,8 @@ pub struct Device {
             return;
         }
         self.wait_idle();
-        d.release();
+        com.release(d.res);
+        d.res = 0;
         self.depth_resource(d, width, height)!;
     }
 
@@ -655,7 +858,7 @@ pub struct Device {
             format = R32_TYPELESS;
         }
         let mut rd: [56]u8 = [0; 56];
-        texture_desc(rd[..], width, height, format, 2);  // ALLOW_DEPTH_STENCIL
+        texture_desc_with(rd[..], width, height, format, 2, 1, d.samples);  // ALLOW_DEPTH_STENCIL
         // D3D12_CLEAR_VALUE: format, depth (1: the far plane), stencil
         let mut cv: [20]u8 = [0; 20];
         com.put32(cv[..], 0, D32_FLOAT);
@@ -664,10 +867,14 @@ pub struct Device {
         d.state = DEPTH_WRITE_STATE;
         d.width = width;
         d.height = height;
-        // D3D12_DEPTH_STENCIL_VIEW_DESC: format, dimension (TEXTURE2D), flags, mip
+        // D3D12_DEPTH_STENCIL_VIEW_DESC: format, dimension (TEXTURE2D, or
+        // TEXTURE2DMS), flags, mip
         let mut dv: [24]u8 = [0; 24];
         com.put32(dv[..], 0, D32_FLOAT);
         com.put32(dv[..], 4, 3);
+        if d.samples > 1 {
+            com.put32(dv[..], 4, 5);
+        }
         @bit_cast(fn(usize, usize, *u8, usize) void, com.method(self.dev, 21))(  // CreateDepthStencilView
             self.dev, d.res, &dv[0], d.dsv);
         if d.sampled {
@@ -770,55 +977,162 @@ pub struct Device {
     }
 
     fn texture_rgba(self: *mut Device, img: *image.Image) !Texture {
-        if self.recording or (self.srv_next >= MAX_VIEWS) {
+        return self.texture_levels(@truncate(u32, img.width), @truncate(u32, img.height), R8G8B8A8_UNORM, 4,
+                                   img.data[0..(img.width * img.height) * 4], 1);
+    }
+
+    /// A texture holding img with a full chain of mipmaps (made here,
+    /// box-filtered), read through s0 trilinearly. 8-bit images become
+    /// 8-bit RGBA: with `srgb`, their values are sRGB-encoded and shaders
+    /// read linear light (colours); without, as they are (normals, masks,
+    /// heights, distance fields). 16-bit and float images become half-float
+    /// RGBA (`srgb` ignored): linear light, HDR. Made between frames.
+    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) !Texture {
+        let w = img.width;
+        let h = img.height;
+        if (w == 0) or (h == 0) {
             return error.Failed;
         }
-        let w = @truncate(u32, img.width);
-        let h = @truncate(u32, img.height);
+        let levels = mip_levels(w, h);
+        let pixels = chain_pixels(w, h, levels);
+        if img.depth == image.Depth.U8 {
+            let mut data = mem.alloc.[u8](pixels * 4)!;
+            defer mem.free(data);
+            if img.channels == 4 {
+                @mem_copy(data[0..(w * h) * 4], img.data[0..(w * h) * 4]);
+            } else {
+                let mut conv = img.convert(4, image.Depth.U8)!;
+                defer conv.deinit();
+                @mem_copy(data[0..(w * h) * 4], conv.data[0..(w * h) * 4]);
+            }
+            let mut at: usize = 0;
+            for k in @as(u32, 1)..levels {
+                let pw = level_size(w, k - 1);
+                let ph = level_size(h, k - 1);
+                let next = at + ((pw * ph) * 4);
+                halve_u8(data[at..next], pw, ph, data[next..], level_size(w, k), level_size(h, k), srgb);
+                at = next;
+            }
+            let mut format = R8G8B8A8_UNORM;
+            if srgb {
+                format = R8G8B8A8_UNORM_SRGB;
+            }
+            return self.texture_levels(@truncate(u32, w), @truncate(u32, h), format, 4, data, levels);
+        }
+        let mut conv = img.convert(4, image.Depth.F32)!;
+        defer conv.deinit();
+        let mut lin = mem.alloc.[f32](pixels * 4)!;
+        defer mem.free(lin);
+        @mem_copy(lin[0..(w * h) * 4], conv.samples32()[0..(w * h) * 4]);
+        let mut at: usize = 0;
+        for k in @as(u32, 1)..levels {
+            let pw = level_size(w, k - 1);
+            let ph = level_size(h, k - 1);
+            let next = at + ((pw * ph) * 4);
+            halve_f32(lin[at..next], pw, ph, lin[next..], level_size(w, k), level_size(h, k));
+            at = next;
+        }
+        let mut half = mem.alloc.[u16](pixels * 4)!;
+        defer mem.free(half);
+        for i in 0..half.len {
+            half[i] = image.f32_to_half(lin[i]);
+        }
+        return self.texture_levels(@truncate(u32, w), @truncate(u32, h), R16G16B16A16_FLOAT, 8,
+                                   @slice_from_ptr(@ptr_cast(*u8, half.ptr), half.len * 2), levels);
+    }
+
+    // A texture of `format`, `bpp` bytes a pixel, from `levels` mip levels
+    // one after the other in data (each w × h halved, rounded down, at
+    // least 1; rows packed).
+    fn texture_levels(self: *mut Device, w: u32, h: u32, format: u32, bpp: usize, data: []u8, levels: u32) !Texture {
+        if self.recording or (levels == 0) or (levels > 16) {
+            return error.Failed;
+        }
+        let mut t = Texture.empty();
+        t.slots = self.slots;
+        t.srv = take(self.slots.srv[..]);
+        if t.srv == NO_SLOT {
+            return error.Failed;
+        }
         let mut rd: [56]u8 = [0; 56];
-        texture_desc(rd[..], w, h, R8G8B8A8_UNORM, 0);
-        let res = self.committed(1, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;
-        let pitch = ((img.width * 4) + 255) & ~@as(usize, 255);
-        let up = self.staging(img.data, img.width * 4, img.height, pitch) catch |e| {
-            com.release(res);
+        texture_desc_with(rd[..], w, h, format, 0, levels, 1);
+        t.res = self.committed(1, rd[..], COPY_DEST, @ptr_from_int(*u8, 0)) catch |e| {
+            t.release();
+            return e;
+        };
+        t.width = w;
+        t.height = h;
+        t.levels = levels;
+        // the levels in an upload buffer, each at a multiple of 512 bytes,
+        // its rows at multiples of 256
+        let mut offs: [16]usize = [0; 16];
+        let mut pitches: [16]usize = [0; 16];
+        let mut size: usize = 0;
+        for k in @as(u32, 0)..levels {
+            let lw = level_size(@as(usize, w), k);
+            let lh = level_size(@as(usize, h), k);
+            size = (size + 511) & ~@as(usize, 511);
+            offs[@as(usize, k)] = size;
+            pitches[@as(usize, k)] = ((lw * bpp) + 255) & ~@as(usize, 255);
+            size += pitches[@as(usize, k)] * lh;
+        }
+        let mut bd: [56]u8 = [0; 56];
+        buffer_desc(bd[..], @as(u64, size));
+        let up = self.committed(2, bd[..], GENERIC_READ, @ptr_from_int(*u8, 0)) catch |e| {  // UPLOAD heap
+            t.release();
             return e;
         };
         defer com.release(up);
-        // D3D12_TEXTURE_COPY_LOCATIONs: the texture's subresource 0, the
-        // buffer's placed footprint
-        let mut dst: [48]u8 = [0; 48];
-        com.ptr(dst[..], 0, res);
-        let mut src: [48]u8 = [0; 48];
-        com.ptr(src[..], 0, up);
-        com.put32(src[..], 8, 1);
-        com.put32(src[..], 24, R8G8B8A8_UNORM);
-        com.put32(src[..], 28, w);
-        com.put32(src[..], 32, h);
-        com.put32(src[..], 36, 1);
-        com.put32(src[..], 40, @truncate(u32, pitch));
+        let mut p: usize = 0;
+        let range: [2]u64 = [0, 0];
+        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(up, 8))(up, 0, &range[0], &mut p) < 0 {
+            t.release();
+            return error.Failed;
+        }
+        let mut at: usize = 0;
+        for k in @as(u32, 0)..levels {
+            let lw = level_size(@as(usize, w), k);
+            let lh = level_size(@as(usize, h), k);
+            let row = lw * bpp;
+            for y in 0..lh {
+                let dst = p + offs[@as(usize, k)] + (y * pitches[@as(usize, k)]);
+                @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, dst), row),
+                          data[at + (y * row)..at + ((y + 1) * row)]);
+            }
+            at += row * lh;
+        }
+        @bit_cast(fn(usize, u32, *void) void, com.method(up, 9))(up, 0, @ptr_from_int(*void, 0));  // Unmap
         self.open() catch |e| {
-            com.release(res);
+            t.release();
             return e;
         };
+        // D3D12_TEXTURE_COPY_LOCATIONs: the texture's subresource k, the
+        // buffer's placed footprint of level k
         let f = @bit_cast(fn(usize, *u8, u32, u32, u32, *u8, *void) void, com.method(self.list, 16));  // CopyTextureRegion
-        f(self.list, &dst[0], 0, 0, 0, &src[0], @ptr_from_int(*void, 0));
-        self.barrier(res, COPY_DEST, SHADER_RESOURCE);
+        for k in @as(u32, 0)..levels {
+            let mut dst: [48]u8 = [0; 48];
+            com.ptr(dst[..], 0, t.res);
+            com.put32(dst[..], 16, k);
+            let mut src: [48]u8 = [0; 48];
+            com.ptr(src[..], 0, up);
+            com.put32(src[..], 8, 1);
+            com.put64(src[..], 16, @as(u64, offs[@as(usize, k)]));
+            com.put32(src[..], 24, format);
+            com.put32(src[..], 28, @truncate(u32, level_size(@as(usize, w), k)));
+            com.put32(src[..], 32, @truncate(u32, level_size(@as(usize, h), k)));
+            com.put32(src[..], 36, 1);
+            com.put32(src[..], 40, @truncate(u32, pitches[@as(usize, k)]));
+            f(self.list, &dst[0], 0, 0, 0, &src[0], @ptr_from_int(*void, 0));
+        }
+        self.barrier(t.res, COPY_DEST, SHADER_RESOURCE);
         self.submit() catch |e| {
-            com.release(res);
+            t.release();
             return e;
         };
-        let t = Texture.{ res: res, srv: self.srv_next, width: w, height: h };
-        self.srv_next += 1;
-        // D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension (TEXTURE2D), the
-        // default component mapping, then at 16 the most detailed mip and
-        // the number of mips
-        let mut sv: [40]u8 = [0; 40];
-        com.put32(sv[..], 0, R8G8B8A8_UNORM);
-        com.put32(sv[..], 4, 4);
-        com.put32(sv[..], 8, 0x1688);
-        com.put32(sv[..], 20, 1);
+        // (the view's format and levels are the texture's)
         let handle = self.srv_cpu + (@as(usize, t.srv) * @as(usize, self.srv_size));
-        @bit_cast(fn(usize, usize, *u8, usize) void, com.method(self.dev, 18))(self.dev, res, &sv[0], handle);
+        @bit_cast(fn(usize, usize, *void, usize) void, com.method(self.dev, 18))(
+            self.dev, t.res, @ptr_from_int(*void, 0), handle);
         return t;
     }
 
@@ -951,9 +1265,10 @@ pub struct Device {
 
     /// A root signature with `constants` 32-bit constants at b0 (0: none),
     /// `buffers` constant buffers at b1, b2, ... (set_buffer) and `textures`
-    /// textures at t0, t1, ... (set_texture), for both shaders. Two samplers
-    /// are always there: s0 linear and wrapping, s1 a comparison (less or
-    /// equal, linear, white outside) for shadow maps.
+    /// textures at t0, t1, ... (set_texture), for both shaders. Three
+    /// samplers are always there: s0 linear (trilinear) and wrapping, s1 a
+    /// comparison (less or equal, linear, white outside) for shadow maps,
+    /// s2 linear and clamped, for targets read by later passes.
     pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32, textures: u32) !RootSignature {
         if (buffers > MAX_ROOT_BUFFERS) or (textures > MAX_ROOT_TEXTURES) {
             return error.Failed;
@@ -990,8 +1305,8 @@ pub struct Device {
         }
         // D3D12_STATIC_SAMPLER_DESCs: filter, address u, v, w, mip bias,
         // anisotropy, comparison, border colour, min and max LOD, register
-        let mut samplers: [2][52]u8 = [[0; 52]; 2];
-        for k in @as(usize, 0)..2 {
+        let mut samplers: [3][52]u8 = [[0; 52]; 3];
+        for k in @as(usize, 0)..3 {
             com.put32(samplers[k][..], 0, 0x15);  // MIN_MAG_MIP_LINEAR
             com.put32(samplers[k][..], 4, 1);     // WRAP
             com.put32(samplers[k][..], 8, 1);
@@ -1007,13 +1322,16 @@ pub struct Device {
         com.put32(samplers[1][..], 12, 4);
         com.put32(samplers[1][..], 24, 4);  // LESS_EQUAL
         com.put32(samplers[1][..], 28, 2);  // OPAQUE_WHITE
+        com.put32(samplers[2][..], 4, 3);   // CLAMP
+        com.put32(samplers[2][..], 8, 3);
+        com.put32(samplers[2][..], 12, 3);
         // D3D12_ROOT_SIGNATURE_DESC: count, parameters, static samplers, flags
         let mut desc: [40]u8 = [0; 40];
         if n > 0 {
             com.put32(desc[..], 0, n);
             com.ptr(desc[..], 8, @int_from_ptr(&params[0][0]));
         }
-        com.put32(desc[..], 16, 2);
+        com.put32(desc[..], 16, 3);
         com.ptr(desc[..], 24, @int_from_ptr(&samplers[0][0]));
         com.put32(desc[..], 32, 1);  // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
         let p = self.serialize_root(desc[..])!;
@@ -1036,7 +1354,8 @@ pub struct Device {
 
     /// A pipeline drawing as `o` says: blending, the depth test (DEPTH_NONE:
     /// for begin, without a depth buffer; others for begin_depth or
-    /// begin_shadow), culling, depth bias.
+    /// begin_shadow), culling, depth bias, into targets of o.format and
+    /// o.samples.
     pub fn pipeline_with(self: *mut Device, root: *RootSignature, vs: *hlsl.Code, ps: *hlsl.Code, attrs: []Attribute,
                          o: PipelineOptions) !Pipeline {
         let topology = o.topology;
@@ -1103,6 +1422,10 @@ pub struct Device {
         com.put32(d[..], 464, @bit_cast(u32, o.depth_bias));
         com.put32(d[..], 472, @bit_cast(u32, o.slope_bias));
         com.put32(d[..], 476, 1);  // depth clip
+        let samples = @max(o.samples, 1);
+        if samples > 1 {
+            com.put32(d[..], 480, 1);  // multisampling
+        }
         // the depth stencil state at 496: depth enable, write mask, function,
         // stencil enable, read and write masks, front and back faces' ops
         if o.depth != DEPTH_NONE {
@@ -1139,9 +1462,9 @@ pub struct Device {
         com.put32(d[..], 572, kind);
         if not o.depth_only {
             com.put32(d[..], 576, 1);
-            com.put32(d[..], 580, R8G8B8A8_UNORM);
+            com.put32(d[..], 580, target_format(o.format));
         }
-        com.put32(d[..], 616, 1);  // one sample
+        com.put32(d[..], 616, samples);
         let mut p: usize = 0;
         let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(self.dev, 10));
         if f(self.dev, &d[0], &IID_PSO[0], &mut p) < 0 {
@@ -1210,6 +1533,7 @@ pub struct Device {
     /// shadow map's pass.
     pub fn begin_shadow(self: *mut Device, d: *mut DepthBuffer) !void {
         self.open()!;
+        self.end_pass();
         self.barrier(d.res, d.state, DEPTH_WRITE_STATE);
         d.state = DEPTH_WRITE_STATE;
         @bit_cast(fn(usize, u32, *usize, i32, *usize) void, com.method(self.list, 46))(
@@ -1219,12 +1543,34 @@ pub struct Device {
 
     fn begin_with(self: *mut Device, t: *mut Target, dsv: *usize) !void {
         self.open()!;
-        self.barrier(t.res, t.state, RENDER_TARGET);
-        t.state = RENDER_TARGET;
+        self.end_pass();
+        if t.msaa == 0 {
+            self.barrier(t.res, t.state, RENDER_TARGET);
+            t.state = RENDER_TARGET;
+        }
         self.cur = t;
         let rtvs: [1]usize = [t.rtv];
         @bit_cast(fn(usize, u32, *usize, i32, *usize) void, com.method(self.list, 46))(self.list, 1, &rtvs[0], 0, dsv);
         self.viewport(t.width, t.height);
+    }
+
+    // Ends the pass drawing into cur: a multisampled target is resolved,
+    // for later passes to read.
+    fn end_pass(self: *mut Device) void {
+        if @int_from_ptr(self.cur) == 0 {
+            return;
+        }
+        let t = self.cur;
+        self.cur = @ptr_from_int(*mut Target, 0);
+        if (t.msaa == 0) or not self.recording {
+            return;
+        }
+        self.barrier(t.msaa, RENDER_TARGET, RESOLVE_SOURCE);
+        self.barrier(t.res, t.state, RESOLVE_DEST);
+        @bit_cast(fn(usize, usize, u32, usize, u32, u32) void, com.method(self.list, 19))(  // ResolveSubresource
+            self.list, t.res, 0, t.msaa, 0, target_format(t.format));
+        self.barrier(t.msaa, RESOLVE_SOURCE, RENDER_TARGET);
+        t.state = RESOLVE_DEST;
     }
 
     fn viewport(self: *mut Device, width: u32, height: u32) void {
@@ -1275,6 +1621,17 @@ pub struct Device {
 
     /// Texture t(slot) of the pipeline's root signature: an image (texture).
     pub fn set_image(self: *mut Device, slot: u32, t: *Texture) void {
+        self.bind_view(slot, t.srv);
+    }
+
+    /// Texture t(slot) of the pipeline's root signature: a target drawn in
+    /// an earlier pass (resolved, if multisampled), read through s2.
+    pub fn set_target_texture(self: *mut Device, slot: u32, t: *mut Target) void {
+        if t.srv == NO_SLOT {
+            return;
+        }
+        self.barrier(t.res, t.state, PIXEL_SHADER_RESOURCE);
+        t.state = PIXEL_SHADER_RESOURCE;
         self.bind_view(slot, t.srv);
     }
 
@@ -1384,6 +1741,7 @@ pub struct Device {
             self.wait_idle();
             return;
         }
+        self.end_pass();
         self.submit()!;
     }
 
@@ -1444,6 +1802,7 @@ pub struct Device {
     /// draws onto it until end_overlay.
     pub fn begin_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) !void {
         let w = self.overlay_texture(o, t)!;
+        self.end_pass();
         if self.recording or (t.state != RENDER_TARGET) {
             self.open()!;
             self.barrier(t.res, t.state, RENDER_TARGET);
@@ -1471,6 +1830,7 @@ pub struct Device {
     /// Submits the frame drawn into screen() and shows it; with vsync, at
     /// the display's next refresh.
     pub fn present(self: *mut Device, vsync: bool) !void {
+        self.end_pass();
         let t = self.screen();
         if self.recording or (t.state != PRESENT) {
             self.open()!;
@@ -1491,6 +1851,10 @@ pub struct Device {
     /// The pixels of a target (after finish()), as an RGBA image (free it
     /// with deinit).
     pub fn read_pixels(self: *mut Device, t: *mut Target) !image.Image {
+        if t.format != TARGET_BGRA8 {
+            return error.Failed;
+        }
+        self.end_pass();
         let pitch = (t.width * 4 + 255) & ~@as(u32, 255);
         let size = @as(u64, pitch) * @as(u64, t.height);
         let mut rd: [56]u8 = [0; 56];
@@ -1536,14 +1900,101 @@ pub struct Device {
 // at 24, depth at 28, mips at 30, format at 32, samples at 36, layout at 44,
 // flags at 48
 fn texture_desc(d: []mut u8, width: u32, height: u32, format: u32, flags: u32) void {
+    texture_desc_with(d, width, height, format, flags, 1, 1);
+}
+
+// ... of `mips` levels and `samples` a pixel
+fn texture_desc_with(d: []mut u8, width: u32, height: u32, format: u32, flags: u32, mips: u32, samples: u32) void {
     com.put32(d, 0, 3);  // TEXTURE2D
     com.put64(d, 16, @as(u64, width));
     com.put32(d, 24, height);
     com.put16(d, 28, 1);
-    com.put16(d, 30, 1);
+    com.put16(d, 30, @truncate(u16, mips));
     com.put32(d, 32, format);
-    com.put32(d, 36, 1);
+    com.put32(d, 36, samples);
     com.put32(d, 48, flags);
+}
+
+// --- mipmaps ---
+
+// A full chain's levels for w × h: down to 1 × 1.
+fn mip_levels(w: usize, h: usize) u32 {
+    let mut n: u32 = 1;
+    let mut m = @max(w, h);
+    while m > 1 {
+        m /= 2;
+        n += 1;
+    }
+    return n;
+}
+
+// Level k's width (or height) for a level 0 of `n`.
+fn level_size(n: usize, k: u32) usize {
+    return @max(n >> @as(usize, k), 1);
+}
+
+// The pixels of all the levels together.
+fn chain_pixels(w: usize, h: usize, levels: u32) usize {
+    let mut n: usize = 0;
+    for k in @as(u32, 0)..levels {
+        n += level_size(w, k) * level_size(h, k);
+    }
+    return n;
+}
+
+// The next level down from an RGBA level of pw × ph: each pixel the mean
+// of the (up to) 2 × 2 above it, of their linear light if `srgb` (alpha as
+// it is).
+fn halve_u8(src: []u8, pw: usize, ph: usize, dst: []mut u8, w: usize, h: usize, srgb: bool) void {
+    for y in 0..h {
+        for x in 0..w {
+            let x0 = @min(x * 2, pw - 1);
+            let x1 = @min((x * 2) + 1, pw - 1);
+            let y0 = @min(y * 2, ph - 1);
+            let y1 = @min((y * 2) + 1, ph - 1);
+            for c in @as(usize, 0)..4 {
+                let a = src[(((y0 * pw) + x0) * 4) + c];
+                let b = src[(((y0 * pw) + x1) * 4) + c];
+                let e = src[(((y1 * pw) + x0) * 4) + c];
+                let g = src[(((y1 * pw) + x1) * 4) + c];
+                let mut v: u8 = 0;
+                if srgb and (c < 3) {
+                    let m =
+                        (color.srgb_decode(unit8(a)) + color.srgb_decode(unit8(b)) + color.srgb_decode(unit8(e)) +
+                         color.srgb_decode(unit8(g))) * 0.25;
+                    v = byte(color.srgb_encode(m));
+                } else {
+                    v = @truncate(u8, ((@as(u32, a) + @as(u32, b) + @as(u32, e) + @as(u32, g)) + 2) / 4);
+                }
+                dst[(((y * w) + x) * 4) + c] = v;
+            }
+        }
+    }
+}
+
+// The same for float RGBA.
+fn halve_f32(src: []f32, pw: usize, ph: usize, dst: []mut f32, w: usize, h: usize) void {
+    for y in 0..h {
+        for x in 0..w {
+            let x0 = @min(x * 2, pw - 1);
+            let x1 = @min((x * 2) + 1, pw - 1);
+            let y0 = @min(y * 2, ph - 1);
+            let y1 = @min((y * 2) + 1, ph - 1);
+            for c in @as(usize, 0)..4 {
+                dst[(((y * w) + x) * 4) + c] =
+                    (src[(((y0 * pw) + x0) * 4) + c] + src[(((y0 * pw) + x1) * 4) + c] +
+                     src[(((y1 * pw) + x0) * 4) + c] + src[(((y1 * pw) + x1) * 4) + c]) * 0.25;
+            }
+        }
+    }
+}
+
+fn unit8(v: u8) f32 {
+    return @float_from_int(f32, v) / 255.0;
+}
+
+fn byte(v: f32) u8 {
+    return @int_from_float(u8, @nearest(@min(@max(v, 0.0), 1.0) * 255.0));
 }
 
 fn buffer_desc(d: []mut u8, size: u64) void {

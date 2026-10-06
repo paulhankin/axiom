@@ -21,8 +21,22 @@
 //         gpu.present(true)!;
 //     }
 //
+// Offscreen targets can hold half floats for linear light beyond 1 (HDR)
+// and be drawn multisampled, then read by later passes (target_with,
+// depth_buffer_with, set_target_texture, through s2 / sampler(2): linear,
+// clamped); textures can have mipmaps (texture_mipmapped):
+//
+//     let mut hdr = gpu.target_with(w, h, gpu.TARGET_RGBA16F, 4)!;
+//     let mut z = gpu.depth_buffer_with(w, h, 4)!;
+//     ... pipelines into it: PipelineOptions.format TARGET_RGBA16F, samples 4
+//     gpu.begin_depth(&mut hdr, &mut z)!;
+//     ... draw the scene ...
+//     gpu.begin(gpu.screen())!;            // (hdr is resolved)
+//     gpu.set_target_texture(0, &mut hdr);
+//     gpu.draw(3, 0);                       // tone-mapped into the window
+//
 // Constants (formats, topologies, BLEND_*, DEPTH_*, CULL_*) are Direct3D's,
-// as std/graphics/d3d12 has them.
+// as std/graphics/d3d12 has them; TARGET_* are as both have them.
 // =============================================================================
 
 import "../mem.ax" as mem;
@@ -64,6 +78,12 @@ pub const DEPTH_WRITE: u32 = 3;
 pub const CULL_NONE: u32 = 1;
 pub const CULL_FRONT: u32 = 2;
 pub const CULL_BACK: u32 = 3;
+
+// What offscreen targets hold (target_with)
+pub const TARGET_BGRA8: u32 = 0;    // 8-bit colour, what a window shows
+pub const TARGET_RGBA16F: u32 = 1;  // half floats: linear light beyond 1 (HDR), for later passes to read
+pub const TARGET_RG16F: u32 = 2;    // two half floats
+pub const TARGET_R32F: u32 = 3;     // one float
 
 /// Which GPU interface the program draws with here: Metal on macOS,
 /// Direct3D 12 elsewhere.
@@ -142,6 +162,12 @@ pub struct RootSignature {
     d: d3d12.RootSignature,
     m: metal.RootSignature,
 
+    /// A root signature that is not there yet (release does nothing).
+    pub fn empty() RootSignature {
+        return RootSignature.{ d: d3d12.RootSignature.{ p: 0, constants: 0, buffers: 0, textures: 0 },
+                               m: metal.RootSignature.{ constants: 0, buffers: 0, textures: 0 } };
+    }
+
     pub fn release(self: *mut RootSignature) void {
         if not is_metal() {
             self.d.release();
@@ -152,6 +178,11 @@ pub struct RootSignature {
 pub struct Pipeline {
     d: d3d12.Pipeline,
     m: metal.Pipeline,
+
+    /// A pipeline that is not there yet (release does nothing).
+    pub fn empty() Pipeline {
+        return Pipeline.{ d: no_d_pipeline(), m: no_m_pipeline() };
+    }
 
     pub fn release(self: *mut Pipeline) void {
         if is_metal() {
@@ -206,6 +237,12 @@ pub struct Texture {
     d: d3d12.Texture,
     m: metal.Texture,
 
+    /// A texture that is not there yet (release does nothing).
+    pub fn empty() Texture {
+        return Texture.{
+            width: 0, height: 0, d: d3d12.Texture.empty(), m: metal.Texture.{ p: 0, width: 0, height: 0, levels: 1 } };
+    }
+
     pub fn release(self: *mut Texture) void {
         if is_metal() {
             self.m.release();
@@ -222,6 +259,11 @@ pub struct Target {
     screen: bool,
     d: d3d12.Target,
     m: metal.Target,
+
+    /// A target that is not there yet (release does nothing).
+    pub fn empty() Target {
+        return Target.{ width: 0, height: 0, screen: false, d: no_d_target(), m: no_m_target() };
+    }
 
     pub fn release(self: *mut Target) void {
         if self.screen {
@@ -242,6 +284,11 @@ pub struct DepthBuffer {
     d: d3d12.DepthBuffer,
     m: metal.DepthBuffer,
 
+    /// A depth buffer that is not there yet (release does nothing).
+    pub fn empty() DepthBuffer {
+        return DepthBuffer.{ width: 0, height: 0, d: no_d_depth(), m: no_m_depth() };
+    }
+
     pub fn release(self: *mut DepthBuffer) void {
         if is_metal() {
             self.m.release();
@@ -251,7 +298,9 @@ pub struct DepthBuffer {
     }
 }
 
-/// How a pipeline draws (as std/graphics/d3d12's).
+/// How a pipeline draws (as std/graphics/d3d12's and metal's): into
+/// targets of `format` (TARGET_*) and `samples`; `stride`, a vertex's bytes
+/// (0: as its attributes end).
 pub struct PipelineOptions {
     topology: u32,
     blend: u32,
@@ -260,16 +309,21 @@ pub struct PipelineOptions {
     depth_bias: i32,
     slope_bias: f32,
     depth_only: bool,
+    stride: u32,
+    format: u32,
+    samples: u32,
 
-    /// Triangles, no blending, depth or culling, no bias.
+    /// Triangles, no blending, depth or culling, no bias, into 8-bit
+    /// targets of one sample.
     pub fn defaults() PipelineOptions {
         return PipelineOptions.{ topology: TRIANGLE_LIST, blend: BLEND_NONE, depth: DEPTH_NONE, cull: CULL_NONE,
-                                 depth_bias: 0, slope_bias: 0.0, depth_only: false };
+                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0, format: TARGET_BGRA8,
+                                 samples: 1 };
     }
 }
 
 fn no_d_target() d3d12.Target {
-    return d3d12.Target.{ res: 0, rtv: 0, width: 0, height: 0, state: 0, owned: false };
+    return d3d12.Target.empty();
 }
 
 fn no_m_target() metal.Target {
@@ -277,7 +331,7 @@ fn no_m_target() metal.Target {
 }
 
 fn no_d_depth() d3d12.DepthBuffer {
-    return d3d12.DepthBuffer.{ res: 0, dsv: 0, srv: 0, sampled: false, width: 0, height: 0, state: 0 };
+    return d3d12.DepthBuffer.empty();
 }
 
 fn no_m_depth() metal.DepthBuffer {
@@ -405,12 +459,59 @@ pub struct Device {
         return t;
     }
 
+    /// A texture of width × height pixels to draw into offscreen, holding
+    /// `format` (TARGET_*), drawn with `samples` a pixel (1, or 2, 4, 8:
+    /// multisampled, resolved as each pass ends). Later passes read it
+    /// with set_target_texture.
+    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) !Target {
+        let mut t = Target.{ width: width, height: height, screen: false, d: no_d_target(), m: no_m_target() };
+        if is_metal() {
+            t.m = self.m.target_with(width, height, format, samples) catch |e| {
+                if e == error.Unsupported {
+                    return error.Unsupported;
+                }
+                return error.Failed;
+            };
+        } else {
+            t.d = self.d.target_with(width, height, format, samples) catch |e| {
+                if e == error.Unsupported {
+                    return error.Unsupported;
+                }
+                return error.Failed;
+            };
+        }
+        return t;
+    }
+
+    /// Makes an offscreen target width × height, keeping its format and
+    /// samples.
+    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) !void {
+        if t.screen {
+            return;
+        }
+        if is_metal() {
+            self.m.resize_target(&mut t.m, width, height) catch return error.Failed;
+        } else {
+            self.d.resize_target(&mut t.d, width, height) catch return error.Failed;
+        }
+        if (width != 0) and (height != 0) {
+            t.width = width;
+            t.height = height;
+        }
+    }
+
     pub fn depth_buffer(self: *mut Device, width: u32, height: u32) !DepthBuffer {
+        return self.depth_buffer_with(width, height, 1);
+    }
+
+    /// A depth buffer of width × height for a target of that size drawn
+    /// with `samples` a pixel.
+    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) !DepthBuffer {
         let mut z = DepthBuffer.{ width: width, height: height, d: no_d_depth(), m: no_m_depth() };
         if is_metal() {
-            z.m = self.m.depth_buffer(width, height) catch return error.Failed;
+            z.m = self.m.depth_buffer_with(width, height, samples) catch return error.Failed;
         } else {
-            z.d = self.d.depth_buffer(width, height) catch return error.Failed;
+            z.d = self.d.depth_buffer_with(width, height, samples) catch return error.Failed;
         }
         return z;
     }
@@ -462,12 +563,27 @@ pub struct Device {
 
     pub fn texture(self: *mut Device, img: *image.Image) !Texture {
         let mut t = Texture.{ width: @truncate(u32, img.width), height: @truncate(u32, img.height),
-                              d: d3d12.Texture.{ res: 0, srv: 0, width: 0, height: 0 },
-                              m: metal.Texture.{ p: 0, width: 0, height: 0, levels: 1 } };
+                              d: d3d12.Texture.empty(), m: metal.Texture.{ p: 0, width: 0, height: 0, levels: 1 } };
         if is_metal() {
             t.m = self.m.texture(img) catch return error.Failed;
         } else {
             t.d = self.d.texture(img) catch return error.Failed;
+        }
+        return t;
+    }
+
+    /// A texture holding img with a full chain of mipmaps, read through
+    /// s0 / sampler(0) trilinearly: 8-bit images as 8-bit RGBA (with
+    /// `srgb`, sRGB-encoded colours, read as linear light), others as half
+    /// floats (see std/graphics/d3d12 and metal).
+    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) !Texture {
+        let mut t = Texture.empty();
+        t.width = @truncate(u32, img.width);
+        t.height = @truncate(u32, img.height);
+        if is_metal() {
+            t.m = self.m.texture_mipmapped(img, srgb) catch return error.Failed;
+        } else {
+            t.d = self.d.texture_mipmapped(img, srgb) catch return error.Failed;
         }
         return t;
     }
@@ -537,6 +653,9 @@ pub struct Device {
             mo.depth_bias = o.depth_bias;
             mo.slope_bias = o.slope_bias;
             mo.depth_only = o.depth_only;
+            mo.stride = o.stride;
+            mo.format = o.format;
+            mo.samples = o.samples;
             p.m = self.m.pipeline_with(&root.m, &sh.lib, vs, ps, ma[0..attrs.len], mo) catch |e| {
                 if e == error.CompileError {
                     set_message(metal.message());
@@ -584,6 +703,9 @@ pub struct Device {
         dopt.depth_bias = o.depth_bias;
         dopt.slope_bias = o.slope_bias;
         dopt.depth_only = o.depth_only;
+        dopt.stride = o.stride;
+        dopt.format = o.format;
+        dopt.samples = o.samples;
         p.d = self.d.pipeline_with(&root.d, &vcode, &pcode, da[0..attrs.len], dopt) catch return error.Failed;
         return p;
     }
@@ -666,6 +788,19 @@ pub struct Device {
             self.m.set_texture(slot, &mut z.m);
         } else {
             self.d.set_texture(slot, &mut z.d);
+        }
+    }
+
+    /// A target drawn earlier in the frame (resolved, if multisampled),
+    /// for the shaders to read through s2 / sampler(2).
+    pub fn set_target_texture(self: *mut Device, slot: u32, t: *mut Target) void {
+        if t.screen {
+            return;
+        }
+        if is_metal() {
+            self.m.set_target_texture(slot, &t.m);
+        } else {
+            self.d.set_target_texture(slot, &mut t.d);
         }
     }
 
