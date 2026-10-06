@@ -1009,11 +1009,30 @@ pub fn modrm_mem(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64) void {
     }
 }
 
+// The unit an EVEX 8-bit displacement counts in for instruction id (the
+// processor scales it by the size of the memory operand, which depends on
+// the instruction: Intel SDM vol. 2, 2.7.5, "compressed displacement"): the
+// vector (16 << vl bytes) for instructions that read or write a whole one,
+// the element for a broadcast; 0 for the others (scalars, inserts and
+// extracts of lanes or halves, widening loads, shift counts), which take a
+// 32-bit displacement, always right.
+fn disp8_unit(id: i32, x: SseDesc, vl: u64) i64 {
+    if (id >= VPBROADCASTB) and (id <= VPBROADCASTQ) {
+        return @as(i64, 1) << @truncate(u32, @bit_cast(u64, @as(i64, id - VPBROADCASTB)));
+    }
+    if not x.vl_ok or x.gpr_rm or x.gpr_reg or ((id >= PSLLW) and (id <= PSRAD)) or (id == VEXTRACTI128) or
+       (id == VINSERTI128) or (id == VEXTRACTI64X4) or (id == VINSERTI64X4) or (id == VPMOVZXBW) or (id == VPMOVZXWD) or
+       (id == VPMOVZXDQ) {
+        return 0;
+    }
+    return @bit_cast(i64, @as(u64, 16) << vl);
+}
+
 // EVEX (AVX-512): 62 P0 P1 P2 opcode ModRM, where an 8-bit displacement
-// counts in units of the vector (16 << vl bytes). vl: 0, 1, 2 for 128, 256
-// and 512 bits. kz: the mask register (aaa, 0: none), plus 8 for zeroing,
-// plus 16 for an embedded broadcast (the memory operand one element).
-fn evex(e: *mut Enc, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm: i64, has_imm: bool, vl: u64,
+// counts in units of the memory operand (disp8_unit). vl: 0, 1, 2 for 128,
+// 256 and 512 bits. kz: the mask register (aaa, 0: none), plus 8 for
+// zeroing, plus 16 for an embedded broadcast (the memory operand one element).
+fn evex(e: *mut Enc, id: i32, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm: i64, has_imm: bool, vl: u64,
         kz: u64) void {
     let rmem = rm_reg < 0;
     let mut regf = gpr(reg);
@@ -1062,7 +1081,7 @@ fn evex(e: *mut Enc, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
         imm_len = 1;
     }
     if rmem {
-        let mut n = @bit_cast(i64, @as(u64, 16) << vl);
+        let mut n = disp8_unit(id, x, vl);
         if bc != 0 {
             n = 4;
             if w != 0 {
@@ -1078,7 +1097,8 @@ fn evex(e: *mut Enc, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
     }
 }
 
-// modrm_mem with EVEX's compressed displacement: disp8 counts n-byte units.
+// modrm_mem with EVEX's compressed displacement: disp8 counts n-byte units
+// (n 0: no 8-bit displacement).
 fn modrm_mem_n(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64, n: i64) void {
     if m.tpoff or (m.base < 0) or (m.disp == 0) {
         modrm_mem(e, reg, m, imm_after);
@@ -1087,9 +1107,12 @@ fn modrm_mem_n(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64, n: i64) void {
     let rf = (reg & 7) << 3;
     let bb = gpr(m.base) & 7;
     let mut md: u64 = 2;
-    let q = m.disp / n;
-    if ((m.disp % n) == 0) and (q >= -128) and (q <= 127) {
-        md = 1;
+    let mut q: i64 = 0;
+    if n > 0 {
+        q = m.disp / n;
+        if ((m.disp % n) == 0) and (q >= -128) and (q <= 127) {
+            md = 1;
+        }
     }
     if (m.index >= 0) or (bb == 4) {
         byte(e, ((md << 6) | rf) | 4);
@@ -1186,7 +1209,7 @@ pub fn sse(e: *mut Enc, id: i32, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
         x.w = 1;
     }
     if (vl == 2) or x.evex or (kz != 0) {
-        evex(e, x, reg, rm_reg, m, vvvv, imm, has_imm, vl, kz);
+        evex(e, id, x, reg, rm_reg, m, vvvv, imm, has_imm, vl, kz);
         return;
     }
     if (reg >= XMM16) or (rm_reg >= XMM16) or (vvvv >= XMM16) {
@@ -1194,7 +1217,7 @@ pub fn sse(e: *mut Enc, id: i32, reg: i32, rm_reg: i32, m: *Mem, vvvv: i32, imm:
         if not high_ok(id) {
             u.die(u.f1("internal compiler error: xmm16-31 in a VEX instruction (%s)", u.idec(id)));
         }
-        evex(e, x, reg, rm_reg, m, vvvv, imm, has_imm, vl, 0);
+        evex(e, id, x, reg, rm_reg, m, vvvv, imm, has_imm, vl, 0);
         return;
     }
     let mut w = @as(u64, x.w);
