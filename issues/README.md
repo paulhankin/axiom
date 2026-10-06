@@ -56,6 +56,7 @@ they travel with the code they describe.
 | [0112](0112-selfhost-spill-stores-at-exit.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator: a region that only defines a spilled value stores it at its exit (fixed in 1fb5609) |
 | [0113](0113-selfhost-bitscan-false-dependency.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: bsf/bsr/tzcnt/lzcnt/popcnt wait for their destination's old value (fixed in 548b145) |
 | [0114](0114-selfhost-vec-constant-lanes.md) | feature | compiler (selfhost: combine, x64) | Self-hosted optimizer: `@vec` with constant lanes inserts every lane, one after the other (fixed in 73b2664) |
+| [0115](0115-selfhost-dead-remat-piece-definitions.md) | bug | compiler (selfhost: mach) | Self-hosted x86-64: dead loads of rematerialized constants left behind by splitting (fixed in d5317ce) |
 | [0104](0104-vdso-clock.md) | feature | runtime | Native Linux programs read the clock with a system call, not the vDSO |
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
