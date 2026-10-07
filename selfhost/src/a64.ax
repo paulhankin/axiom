@@ -14,7 +14,9 @@
 // =============================================================================
 import "a64enc.ax" as ae;
 import "bin.ax" as bn;
+import "combine.ax" as cb;
 import "elf.ax" as elf;
+import "ftab.ax" as ft;
 import "ir.ax" as ir;
 import "lower.ax" as lower;
 import "mach.ax" as mc;
@@ -53,6 +55,7 @@ const CALL: i32 = 15;   // sym | reg, uses..., defs...
 const RET: i32 = 16;    // uses
 const LABEL: i32 = 17;  // aux: local label
 const RAW: i32 = 18;    // up to 4 register operands: Rd, Rn, Rm, Ra fields; aux: the instruction word
+const PRFM: i32 = 19;   // mem; cc: the operation (0 pldl1keep, 0x10 pstl1keep)
 
 const LOCAL_BASE: i32 = 1_000_000;
 
@@ -302,10 +305,31 @@ fn const16(lo: u64, hi: u64) mc.MOp {
 }
 
 fn vconst(lo: u64, hi: u64) i32 {
+    if vc_blk != CB {
+        vcs.clear();
+        vc_blk = CB;
+    }
+    for q in 0..vcs.len {
+        let c = vcs.get(q);
+        if (c.lo == lo) and (c.hi == hi) {
+            return c.r;  // (loaded earlier in the block)
+        }
+    }
     let r = vvr();
     _ = e2(FLDR, 16, W(r), const16(lo, hi));
+    vcs.push(VConst.{ lo: lo, hi: hi, r: r });
     return r;
 }
+
+// The vector constants vconst loaded in the current block.
+struct VConst {
+    lo: u64,
+    hi: u64,
+    r: i32,
+}
+
+let mut vcs: u.List.[VConst] = u.List.[VConst].{ data: @ptr_from_int(*mut VConst, 0), len: 0, cap: 0 };
+let mut vc_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 
 // -----------------------------------------------------------------------------
 // Values
@@ -335,6 +359,15 @@ fn vreg(v: *mut ir.Value) i32 {
     return v.loc;
 }
 
+// The addresses of globals built in a register in the current block (reg).
+struct GAddr {
+    g: *mut ir.Value,
+    r: i32,
+}
+
+let mut gaddr: u.List.[GAddr] = u.List.[GAddr].{ data: @ptr_from_int(*mut GAddr, 0), len: 0, cap: 0 };
+let mut gaddr_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
+
 // A register holding v (materializing constants and addresses here).
 fn reg(v: *mut ir.Value) i32 {
     let k = v.kind;
@@ -347,9 +380,23 @@ fn reg(v: *mut ir.Value) i32 {
         return vreg(v);
     }
     let t = v.ty;
+    if (k == ir.V_GLOBAL) and not v.gv.tls and (gaddr_blk == CB) {
+        for q in 0..gaddr.len {
+            if gaddr.get(q).g == v {
+                return gaddr.get(q).r;  // (built earlier in the block)
+            }
+        }
+    }
     if k == ir.V_GLOBAL {
         let r = vgpr();
         let g = v.gv;
+        if not g.tls {
+            if gaddr_blk != CB {
+                gaddr.clear();
+                gaddr_blk = CB;
+            }
+            gaddr.push(GAddr.{ g: v, r: r });
+        }
         if g.tls {
             _ = e2(TLS, 8, W(r), mc.symop(global_sym(g), 0));
         } else if extern_global(g) {
@@ -387,6 +434,16 @@ fn reg(v: *mut ir.Value) i32 {
             _ = e2(FLDR, 16, W(r), const16(lo, hi));
             return r;
         }
+        let imm = fp_imm8(lo, t.bits == 32);
+        if imm >= 0 {
+            // fmov s/d, #imm
+            let mut ty: u64 = 0;
+            if t.bits == 64 {
+                ty = 1;
+            }
+            raw1((0x1E20_1000 | (ty << 22)) | (@bit_cast(u64, imm) << 13), r);
+            return r;
+        }
         // a scalar through a general register
         let g = vgpr();
         if t.bits == 32 {
@@ -410,6 +467,40 @@ fn reg(v: *mut ir.Value) i32 {
         movi(r, x, 1);
     }
     return r;
+}
+
+// The 8-bit immediate of FMOV for the float with these bits, or -1: a sign,
+// a 4-bit fraction and an exponent in -3..4.
+fn fp_imm8(bits: u64, single: bool) i64 {
+    let mut sign: u64 = 0;
+    let mut e: i64 = 0;
+    let mut frac: u64 = 0;
+    if single {
+        sign = (bits >> 31) & 1;
+        e = @bit_cast(i64, (bits >> 23) & 0xff) - 127;
+        if (bits & 0x7_ffff) != 0 {
+            return -1;
+        }
+        frac = (bits >> 19) & 15;
+    } else {
+        sign = (bits >> 63) & 1;
+        e = @bit_cast(i64, (bits >> 52) & 0x7ff) - 1023;
+        if (bits & 0xffff_ffff_ffff) != 0 {
+            return -1;
+        }
+        frac = (bits >> 48) & 15;
+    }
+    if (e < -3) or (e > 4) {
+        return -1;
+    }
+    // exponent bits NOT(b):b...b:c:d, with b = 1 for -3..0 and 0 for 1..4
+    let mut bcd: u64 = 0;
+    if e <= 0 {
+        bcd = 4 | @bit_cast(u64, e + 3);
+    } else {
+        bcd = @bit_cast(u64, e - 1);
+    }
+    return @bit_cast(i64, ((sign << 7) | (bcd << 4)) | frac);
 }
 
 fn const_le(x: *mut ir.Value, out: *mut bn.Bytes, base: usize) void {
@@ -444,7 +535,7 @@ fn addr(p: *mut ir.Value) mc.MOp {
     if is_inst(p, ir.OP_ALLOCA) {
         return mc.mem_slot(@truncate(i32, p.aux), 0);
     }
-    if is_inst(p, ir.OP_PTRADD) {
+    if is_inst(p, ir.OP_PTRADD) and ((p.flag & 1) != 0) {
         let off = p.b;
         if is_c(off) {
             let mut m = addr(p.a);
@@ -520,7 +611,11 @@ fn gen_alu(v: *mut ir.Value) void {
     let d = vreg(v);
     let ra = reg(a);
     if o == ir.OP_MUL {
-        raw3(ae.madd(sf, false, 0, 0, 0, 31), d, ra, reg(b));
+        if is_c(b) and (cval(b) > 0) and ((cval(b) & (cval(b) - 1)) == 0) {
+            raw2(ae.lsl_imm(sf, 0, 0, @as(u64, @ctz(@bit_cast(u64, cval(b))))), d, ra);
+        } else {
+            raw3(ae.madd(sf, false, 0, 0, 0, 31), d, ra, reg(b));
+        }
     } else if (o == ir.OP_ADD) or (o == ir.OP_SUB) {
         if is_c(b) and addsub_imm_ok(cval(b)) {
             let mut x = cval(b);
@@ -534,7 +629,22 @@ fn gen_alu(v: *mut ir.Value) void {
     } else {
         let opc = logic_opc(o);
         let mut done = false;
-        if is_c(b) {
+        // with an operand inverted: bic, orn, eon (and mvn: x ^ ~0); the inversion is
+        // left dead
+        let mut na = scalar_not(a);
+        let mut other = b;
+        if u.isnil(na) {
+            na = scalar_not(b);
+            other = a;
+        }
+        if (o == ir.OP_XOR) and (t.bits > 1) and is_c(b) and all_ones_int(b) {
+            raw_dm(ae.logic_reg(sf, 1, true, 0, 31, 0, 0, 0), d, ra);  // mvn (orn d, zr, a)
+            done = true;
+        } else if u.notnil(na) and not is_c(other) {
+            raw3(ae.logic_reg(sf, opc, true, 0, 0, 0, 0, 0), d, reg(other), reg(na));
+            done = true;
+        }
+        if not done and is_c(b) {
             let mut width: u32 = 32;
             if sf == 1 {
                 width = 64;
@@ -552,6 +662,20 @@ fn gen_alu(v: *mut ir.Value) void {
     if (t.bits == 1) and (o != ir.OP_AND) and (o != ir.OP_OR) and (o != ir.OP_XOR) {
         raw2(ae.logic_imm(0, 0, 0, 0, @bit_cast(u64, ae.logical_imm(1, 32))), d, d);
     }
+}
+
+fn all_ones_int(c: *ir.Value) bool {
+    let m = ir.mask_bits(c.ty.bits);
+    return (@bit_cast(u64, cval(c)) & m) == m;
+}
+
+// x for an integer v = x ^ ~0 (32 or 64 bits), or nil.
+fn scalar_not(v: *mut ir.Value) *mut ir.Value {
+    if is_inst(v, ir.OP_XOR) and (v.ty.kind == ir.T_INT) and ((v.ty.bits == 32) or (v.ty.bits == 64)) and is_c(v.b) and
+       all_ones_int(v.b) and not is_c(v.a) {
+        return v.a;
+    }
+    return vnil();
 }
 
 // Extends the narrow integer in r into a fresh register (32 or 64 bits).
@@ -586,10 +710,39 @@ fn ext_reg(r: i32, bits: i32, sign: bool, to64: bool) i32 {
     return d;
 }
 
+// Is the integer v known to be zero-extended from `bits` in its register (the
+// upper bits of a narrower value are otherwise unspecified)? Loads zero-extend
+// into the whole register, and so does every instruction writing a W
+// register: those computing 32-bit values.
+fn zext_clean(v: *ir.Value, bits: i32) bool {
+    if (v.kind != ir.V_INST) or (v.ty.kind != ir.T_INT) {
+        return false;
+    }
+    let o = v.op;
+    if (o == ir.OP_LOAD) and (v.ty.bits <= bits) {
+        return true;
+    }
+    if (o == ir.OP_AND) and is_c(v.b) and (cval(v.b) >= 0) and (bits < 64) and
+       (cval(v.b) <= ((@as(i64, 1) << @int_cast(u32, bits)) - 1)) {
+        return true;
+    }
+    if (o == ir.OP_EXTRACTELEM) and (v.ty.bits <= bits) {
+        return true;  // (umov)
+    }
+    if (bits == 32) and (v.ty.bits == 32) {
+        return ((o >= ir.OP_ADD) and (o <= ir.OP_ASHR)) or (o == ir.OP_SELECT) or (o == ir.OP_ZEXT) or
+               (o == ir.OP_SEXT) or (o == ir.OP_FPTOSI_SAT) or (o == ir.OP_FPTOUI_SAT);
+    }
+    return false;
+}
+
 // A register with v extended to 32 bits (narrow) or v itself.
 fn reg_ext(v: *mut ir.Value, sign: bool) i32 {
     let r = reg(v);
     let b = v.ty.bits;
+    if not sign and zext_clean(v, b) {
+        return r;
+    }
     if (v.ty.kind == ir.T_INT) and (b < 32) and (b > 1) {
         return ext_reg(r, b, sign, false);
     }
@@ -842,9 +995,25 @@ fn gen_cast(v: *mut ir.Value) void {
     let from = v.a.ty;
     let to = v.ty;
     let d = vreg(v);
+    if (to.kind == ir.T_VEC) and (o >= ir.OP_SITOFP) and (o <= ir.OP_FPTOUI_SAT) {
+        let mut u_: u64 = 0;
+        if (o == ir.OP_UITOFP) or (o == ir.OP_FPTOUI_SAT) {
+            u_ = 1;
+        }
+        if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) {
+            raw2(ae.v2(1, u_, fsz(to), 0x1d, 0, 0), d, reg(v.a));  // scvtf / ucvtf
+        } else {
+            raw2(ae.v2(1, u_, 2 | fsz(from), 0x1b, 0, 0), d, reg(v.a));  // fcvtzs / fcvtzu
+        }
+        return;
+    }
     if (o == ir.OP_ZEXT) or (o == ir.OP_SEXT) {
         if to.kind == ir.T_VEC {
             copy(d, reg(v.a), VR);  // lane masks are already all ones / zeros
+            return;
+        }
+        if (o == ir.OP_ZEXT) and zext_clean(v.a, from.bits) {
+            copy(d, reg(v.a), GPR);
             return;
         }
         let x = ext_reg(reg(v.a), from.bits, o == ir.OP_SEXT, to.bits > 32);
@@ -1185,6 +1354,14 @@ fn gen_store(v: *mut ir.Value) void {
     _ = e2(STR, mem_size(t), m, R(reg(x)));
 }
 
+// prfm pldl1keep (IN_PREFETCH) or pstl1keep (IN_PREFETCHW) at the address.
+fn gen_prefetch(v: *mut ir.Value, id: i32) void {
+    let i = e1(PRFM, 8, addr(v.xs.get(0)));
+    if id == ir.IN_PREFETCHW {
+        i.cc = 0x10;
+    }
+}
+
 fn raw_none(w: u64) void {
     _ = raw(w, NONE(), NONE(), NONE(), NONE());
 }
@@ -1508,6 +1685,7 @@ fn gen_call(v: *mut ir.Value) void {
         ops.push(W(rreg));
     }
     let ci = emit(CALL, 0, ops.items());
+    ci.aux = ft.call_aux(v);  // (frame tables)
     ci.clobber = caller_saved();
     if (v.a.kind == ir.V_FUNC) and v.a.fnp.noreturn {
         ci.clobber = 0;  // nothing is live after it
@@ -1560,6 +1738,17 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
             _ = raw(ae.addsub_reg(1, true, true, 31, 0, 0, 2, 63), NONE(), R(h), R(l), NONE());
         }
         cset(d, NE);
+        return;
+    }
+    if id == ir.IN_BSWAP {
+        let x = cb.bit_reversed(v);
+        if u.notnil(x) {
+            // a bit reversal by swaps (combine.ax): rbit (the swaps are left dead)
+            raw2(ae.dp1(sf, 0, 0, 0), d, reg(x));
+            return;
+        }
+        // rev (32 bits: opc 2, 64 bits: opc 3)
+        raw2(ae.dp1(sf, 2 + sf, 0, 0), d, reg(a0));
         return;
     }
     if id == ir.IN_CTLZ {
@@ -1740,9 +1929,128 @@ fn lk(t: *ir.Ty) u64 {
 
 // Can the instruction selector handle this vector instruction directly?
 // (Everything else is split into lanes by lower.scalarize.)
+// The processor instructions (spec §13.5).
+fn is_insn(id: i32) bool {
+    return (id >= ir.IN_AESENC) and (id <= ir.IN_CRC32C_A);
+}
+
+// An S register (lane 0 of a vector register) holding the u32 in r.
+fn s_reg(r: i32) i32 {
+    let s = vvr();
+    raw2(ae.ins_gen(2, 0, 0, 0), s, r);
+    return s;
+}
+
+// AES rounds, polynomial multiply, SHA steps, the SHA-3 instructions, CRC32.
+// Most of them accumulate into their destination: it starts as a copy of
+// the first operand.
+fn gen_insn(v: *mut ir.Value, id: i32) void {
+    let d = vreg(v);
+    let a = reg(v.xs.get(0));
+    if (id == ir.IN_CRC32) or (id == ir.IN_CRC32C_A) {
+        let x = v.xs.get(1);
+        let sz = x.ty.size;
+        let mut w: u64 = 0x1AC0_4000;
+        if sz == 2 {
+            w = 0x1AC0_4400;
+        } else if sz == 4 {
+            w = 0x1AC0_4800;
+        } else if sz == 8 {
+            w = 0x9AC0_4C00;
+        }
+        if id == ir.IN_CRC32C_A {
+            w = w | 0x1000;
+        }
+        raw3(w, d, a, reg(x));
+        return;
+    }
+    if id == ir.IN_AESMC {
+        raw2(0x4E28_6800, d, a);
+        return;
+    }
+    if id == ir.IN_AESIMC_A {
+        raw2(0x4E28_7800, d, a);
+        return;
+    }
+    if id == ir.IN_SHA1H {
+        let s = s_reg(a);
+        let r = vvr();
+        raw2(0x5E28_0800, r, s);
+        raw2(ae.umov(2, 0, 0, 0), d, r);
+        return;
+    }
+    let b = reg(v.xs.get(1));
+    if (id == ir.IN_PMULL) or (id == ir.IN_PMULL2) {
+        let mut w: u64 = 0x0EE0_E000;
+        if id == ir.IN_PMULL2 {
+            w = 0x4EE0_E000;
+        }
+        raw3(w, d, a, b);
+        return;
+    }
+    if id == ir.IN_RAX1 {
+        raw3(0xCE60_8C00, d, a, b);
+        return;
+    }
+    if id == ir.IN_XAR {
+        let k = @bit_cast(u64, cval(v.xs.get(2))) & 63;
+        raw3(0xCE80_0000 | (k << 10), d, a, b);
+        return;
+    }
+    if (id == ir.IN_EOR3) or (id == ir.IN_BCAX) {
+        let c = reg(v.xs.get(2));
+        let mut w: u64 = 0xCE00_0000;
+        if id == ir.IN_BCAX {
+            w = 0xCE20_0000;
+        }
+        _ = raw(w, W(d), R(a), R(b), R(c));
+        return;
+    }
+    // destructive: Vd (= a) op= Vn [, Vm]
+    let t = vvr();
+    copy(t, a, VR);
+    if (id == ir.IN_AESE) or (id == ir.IN_AESD) {
+        let mut w: u64 = 0x4E28_4800;
+        if id == ir.IN_AESD {
+            w = 0x4E28_5800;
+        }
+        _ = raw(w, RW(t), R(b), NONE(), NONE());
+    } else if (id == ir.IN_SHA1SU1) or (id == ir.IN_SHA256SU0) {
+        let mut w: u64 = 0x5E28_1800;
+        if id == ir.IN_SHA256SU0 {
+            w = 0x5E28_2800;
+        }
+        _ = raw(w, RW(t), R(b), NONE(), NONE());
+    } else if id == ir.IN_SHA512SU0 {
+        _ = raw(0xCEC0_8000, RW(t), R(b), NONE(), NONE());
+    } else {
+        // three operands: Vd op= Vn, Vm
+        let c = reg(v.xs.get(2));
+        let mut n = b;
+        if (id == ir.IN_SHA1C) or (id == ir.IN_SHA1P) or (id == ir.IN_SHA1M) {
+            n = s_reg(b);  // (e: an S register)
+        }
+        let ids: [10]i32 = [ir.IN_SHA1C, ir.IN_SHA1P, ir.IN_SHA1M, ir.IN_SHA1SU0, ir.IN_SHA256H, ir.IN_SHA256H2,
+                            ir.IN_SHA256SU1, ir.IN_SHA512H, ir.IN_SHA512H2, ir.IN_SHA512SU1];
+        let ws: [10]u64 = [0x5E00_0000, 0x5E00_1000, 0x5E00_2000, 0x5E00_3000, 0x5E00_4000, 0x5E00_5000, 0x5E00_6000,
+                           0xCE60_8000, 0xCE60_8400, 0xCE60_8800];
+        let mut w: u64 = 0;
+        for k in @as(usize, 0)..10 {
+            if ids[k] == id {
+                w = ws[k];
+            }
+        }
+        _ = raw(w, RW(t), R(n), R(c), NONE());
+    }
+    copy(d, t, VR);
+}
+
 pub fn legal(v: *mut ir.Value) bool {
     let t = v.ty;
     let o = v.op;
+    if (o == ir.OP_INTR) and is_insn(@truncate(i32, @bit_cast(i64, v.cv))) {
+        return true;  // (sema allowed it only where the extension is there)
+    }
     if o == ir.OP_ICMP {
         return true;
     }
@@ -1780,9 +2088,115 @@ pub fn legal(v: *mut ir.Value) bool {
         return false;
     }
     if (o >= ir.OP_ZEXT) and (o <= ir.OP_FPTOUI_SAT) {
+        if (o == ir.OP_SITOFP) or (o == ir.OP_UITOFP) or (o == ir.OP_FPTOSI_SAT) or (o == ir.OP_FPTOUI_SAT) {
+            // lane for lane (FCVTZS / FCVTZU saturate, NaN -> 0, as WebAssembly's trunc_sat)
+            return (v.a.ty.kind == ir.T_VEC) and (lane_bits(v.a.ty) == lane_bits(t)) and (lane_bits(t) >= 32);
+        }
         return (o == ir.OP_BITCAST) or (o == ir.OP_SEXT) or (o == ir.OP_ZEXT);
     }
     return true;
+}
+
+fn all_ones(v: *ir.Value) bool {
+    if is_inst(v, ir.OP_COPY) {
+        return all_ones(v.a);  // (a constant hoisted out of a loop)
+    }
+    if v.kind == ir.V_CAGG {
+        for k in 0..v.xs.len {
+            let c = v.xs.get(k);
+            if (c.kind != ir.V_CINT) or ((c.cv & ir.mask_bits(c.ty.bits)) != ir.mask_bits(c.ty.bits)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return is_inst(v, ir.OP_SPLAT) and (v.a.kind == ir.V_CINT) and
+           ((v.a.cv & ir.mask_bits(v.a.ty.bits)) == ir.mask_bits(v.a.ty.bits));
+}
+
+// ~m (m ^ all ones): m, or nil.
+fn not_of(n: *mut ir.Value) *mut ir.Value {
+    if is_inst(n, ir.OP_XOR) and (n.ty.kind == ir.T_VEC) {
+        if all_ones(n.b) {
+            return n.a;
+        }
+        if all_ones(n.a) {
+            return n.b;
+        }
+    }
+    return vnil();
+}
+
+// The operand of an and that is a not (the and is a bit clear), or nil.
+fn not_operand(i: *mut ir.Value) *mut ir.Value {
+    if u.notnil(not_of(i.b)) {
+        return i.b;
+    }
+    if u.notnil(not_of(i.a)) {
+        return i.a;
+    }
+    return vnil();
+}
+
+// A lane select o = (x & m) | (y & ~m): its parts (p = x & m, q = y & ~m,
+// n = ~m), or m nil.
+struct Sel {
+    x: *mut ir.Value,
+    y: *mut ir.Value,
+    m: *mut ir.Value,
+    p: *mut ir.Value,
+    q: *mut ir.Value,
+    n: *mut ir.Value,
+}
+
+fn sel_parts(o: *mut ir.Value) Sel {
+    let mut r = Sel.{ x: vnil(), y: vnil(), m: vnil(), p: vnil(), q: vnil(), n: vnil() };
+    let ors: [2]*mut ir.Value = [o.a, o.b];
+    for j in @as(usize, 0)..2 {
+        let p = ors[j];
+        let q = ors[1 - j];
+        if not is_inst(p, ir.OP_AND) or not is_inst(q, ir.OP_AND) {
+            continue;
+        }
+        let ps: [2]*mut ir.Value = [p.a, p.b];
+        let qs: [2]*mut ir.Value = [q.a, q.b];
+        for k in @as(usize, 0)..2 {
+            let m = ps[1 - k];
+            for l in @as(usize, 0)..2 {
+                let n = qs[1 - l];
+                if u.notnil(m) and (not_of(n) == m) {
+                    r.x = ps[k];
+                    r.y = qs[l];
+                    r.m = m;
+                    r.p = p;
+                    r.q = q;
+                    r.n = n;
+                    return r;
+                }
+            }
+        }
+    }
+    return r;
+}
+
+// m ? x : y, bit by bit: BSL (the destination starts as the mask)
+fn gen_bsl(v: *mut ir.Value) void {
+    let s = sel_parts(v);
+    let d = vreg(v);
+    let rx = reg(s.x);
+    let ry = reg(s.y);
+    copy(d, reg(s.m), VR);
+    _ = raw(ae.v3(1, 1, 1, 3, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+}
+
+// y & ~m: BIC
+fn gen_bic(v: *mut ir.Value) void {
+    let n = not_operand(v);
+    let mut y = v.a;
+    if n == v.a {
+        y = v.b;
+    }
+    raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), vreg(v), reg(y), reg(not_of(n)));
 }
 
 fn vec_binop(v: *mut ir.Value) void {
@@ -2055,7 +2469,11 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
             _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 1), W(d), R(l0), R(l1), NONE());
             return;
         }
-        raw2(ae.vshift(1, 0, 0, esize, false, esize - 1, 0, 0), bitv, a);  // sshr: top bits as all ones
+        if is_inst(a0, ir.OP_ICMP) or is_inst(a0, ir.OP_FCMP) {
+            copy(bitv, a, VR);  // (a compare's lanes are all ones or zeros already)
+        } else {
+            raw2(ae.vshift(1, 0, 0, esize, false, esize - 1, 0, 0), bitv, a);  // sshr: top bits as all ones
+        }
         let mut wl: u64 = 0;
         let mut wh: u64 = 0;
         if k == 0 {
@@ -2156,7 +2574,7 @@ fn gen_ptradd(v: *mut ir.Value) void {
     let off = v.b;
     if is_inst(off, ir.OP_MUL) and is_c(off.b) {
         let s = cval(off.b);
-        if (s > 0) and ((s & (s - 1)) == 0) {
+        if (s > 0) and (s <= 128) and ((s & (s - 1)) == 0) {  // (a scale is a u8)
             _ = e2(LEA, 8, W(d), mc.mem(a, reg(off.a), @truncate(u8, @bit_cast(u64, s)), 0));
             return;
         }
@@ -2187,6 +2605,17 @@ fn const_needs_reg(v: *ir.Value) bool {
 fn gen_inst(v: *mut ir.Value) void {
     let o = v.op;
     let t = v.ty;
+    if (v.flag & 4) != 0 {
+        return;  // (part of its user: a bit select or a bit clear)
+    }
+    if (v.flag & 8) != 0 {
+        gen_bsl(v);
+        return;
+    }
+    if (v.flag & 16) != 0 {
+        gen_bic(v);
+        return;
+    }
     if o == ir.OP_COPY {
         copy(vreg(v), reg(v.a), class_of(t));
         return;
@@ -2288,6 +2717,18 @@ fn gen_inst(v: *mut ir.Value) void {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         if id == ir.IN_TRAP {
             raw_none(ae.UDF);
+            return;
+        }
+        if id == ir.IN_FRAME_ADDR {
+            _ = e2(MOV, 8, W(vreg(v)), R(FP));
+            return;
+        }
+        if ir.is_prefetch(id) {
+            gen_prefetch(v, id);
+            return;
+        }
+        if is_insn(id) {
+            gen_insn(v, id);
             return;
         }
         if (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
@@ -2475,7 +2916,10 @@ fn prepare(f: *mut ir.Func) void {
                     let is_addr = ((i.op == ir.OP_LOAD) and (k == 0)) or ((i.op == ir.OP_STORE) and (k == 1)) or
                                   ((i.op == ir.OP_PTRADD) and (k == 0)) or
                                   (((i.op == ir.OP_RMW) or (i.op == ir.OP_CMPXCHG)) and (k == 0));
-                    if not is_addr {
+                    // There is no [base + index + disp]: a register offset under further
+                    // pointer arithmetic is added once, into a register its users share.
+                    let indexed_base = (i.op == ir.OP_PTRADD) and (k == 0) and not is_c(o.b);
+                    if not is_addr or indexed_base {
                         o.flag = o.flag & ~1;
                     }
                 }
@@ -2485,9 +2929,43 @@ fn prepare(f: *mut ir.Func) void {
                 if o.kind == ir.V_INST {
                     o.uses += 1;
                     o.user = i;
-                    if o.op == ir.OP_PTRADD {
-                        o.flag = o.flag & ~1;
+                    let prefetch = (i.op == ir.OP_INTR) and ir.is_prefetch(@truncate(i32, @bit_cast(i64, i.cv)));
+                    if (o.op == ir.OP_PTRADD) and not prefetch {
+                        o.flag = o.flag & ~1;  // (a prefetch's address is its memory operand)
                     }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // vector bit selects, (x & m) | (y & ~m), and bit clears, y & ~m
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.ty.kind == ir.T_VEC) and (i.op == ir.OP_OR) {
+                let s = sel_parts(i);
+                if u.notnil(s.m) and (s.p.uses == 1) and (s.q.uses == 1) and (s.n.uses == 1) {
+                    s.p.flag = s.p.flag | 4;
+                    s.q.flag = s.q.flag | 4;
+                    s.n.flag = s.n.flag | 4;
+                    i.flag = i.flag | 8;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.ty.kind == ir.T_VEC) and (i.op == ir.OP_AND) and ((i.flag & 4) == 0) {
+                let n = not_operand(i);
+                if u.notnil(n) and (n.uses == 1) {
+                    n.flag = n.flag | 4;
+                    i.flag = i.flag | 16;
                 }
             }
             i = i.next;
@@ -2502,7 +2980,8 @@ fn prepare(f: *mut ir.Func) void {
             if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
                 let us = i.user;
                 if (us.blk == b) and (us.a == i) {
-                    if (us.op == ir.OP_CONDBR) or ((us.op == ir.OP_SELECT) and (i.next == us)) {
+                    // (the compare is made at its user, whose condition it is)
+                    if (us.op == ir.OP_CONDBR) or (us.op == ir.OP_SELECT) {
                         i.flag = i.flag | 2;
                     }
                 }
@@ -2519,8 +2998,64 @@ let gpr_order: [25]i32 = [9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 
 let vr_order: [32]i32 = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 32, 33, 34, 35, 36, 37, 38, 39,
                          40, 41, 42, 43, 44, 45, 46, 47];
 
+// Instructions whose only effect is their register result (for mc.dce; not
+// loads: a volatile load must happen, and not instructions setting flags).
+fn pure_inst(i: *mc.MInst) bool {
+    let op = i.op;
+    if (op == MOV) or (op == FMOV) or (op == MOVI) or (op == LEA) or (op == ADDR) or (op == GOT) {
+        return true;
+    }
+    return (op == RAW) and pure_word(@bit_cast(u64, i.aux));
+}
+
+// The instruction word of a RAW that only computes its destination register.
+fn pure_word(w: u64) bool {
+    let op0 = (w >> 25) & 15;  // bits 28..25
+    if (op0 & 14) == 8 {
+        // data processing (immediate): add/sub (S: flags), logical (ANDS: flags), move wide,
+        // bitfield, extract, adr
+        let k = (w >> 23) & 7;
+        if (k == 2) or (k == 3) {
+            return ((w >> 29) & 1) == 0;
+        }
+        if k == 4 {
+            return ((w >> 29) & 3) != 3;
+        }
+        return true;
+    }
+    if (op0 & 7) == 5 {
+        // data processing (register)
+        if ((w >> 28) & 1) == 0 {
+            if ((w >> 24) & 1) == 0 {
+                return ((w >> 29) & 3) != 3;  // logical (ANDS / BICS: flags)
+            }
+            return ((w >> 29) & 1) == 0;  // add/sub (S: flags)
+        }
+        let k = (w >> 21) & 15;
+        if k == 0 {
+            return ((w >> 29) & 1) == 0;  // adc / sbc
+        }
+        return (k == 4) or (k == 6) or (k >= 8);  // csel, 1-/2-source, 3-source (not ccmp)
+    }
+    if (op0 & 7) == 7 {
+        // SIMD and floating point: all but the comparisons that set flags (fcmp, fccmp)
+        if (((w >> 24) & 0xff) == 0x1e) and (((w >> 21) & 1) == 1) {
+            if (((w >> 10) & 15) == 8) or (((w >> 10) & 3) == 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 fn mk2(a: mc.MOp, b: mc.MOp) [2]mc.MOp {
     return [a, b];
+}
+
+// (nothing is rematerialized on AArch64)
+fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
+    return false;
 }
 
 fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
@@ -2539,12 +3074,31 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     return mc.new_inst(FSTR, 16, ops[..]);
 }
 
+fn spill_move(f: *mut mc.MFunc, d: i32, s: i32, class: i32) *mut mc.MInst {
+    let ops = mk2(W(d), R(s));
+    let mut i = mc.new_inst(MOV, 8, ops[..]);
+    if class != 0 {
+        i = mc.new_inst(FMOV, 16, ops[..]);
+    }
+    i.is_move = true;
+    return i;
+}
+
+fn no_copy(i: *mc.MInst) bool {
+    _ = i;
+    return false;
+}
+
 fn is_label(i: *mc.MInst) bool {
     return i.op == LABEL;
 }
 
 fn compile_func(f: *mut ir.Func) void {
     F = f;
+    gaddr.clear();
+    gaddr_blk = @ptr_from_int(*mut mc.MBlock, 0);
+    vcs.clear();
+    vc_blk = @ptr_from_int(*mut mc.MBlock, 0);
     nlocal = 0;
     out_area = 0;
     opt.split_critical_edges(f);
@@ -2552,7 +3106,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
     opt.loop_depths(f, &order);
-    opt.hoist_constants(f, &order, const_needs_reg);
+    opt.hoist_constants(f, &order, const_needs_reg, true, opt.no_operand_needs);
     opt.hoist_to_entry(f, is_tls_global);
     opt.layout(&mut order);
     prepare(f);
@@ -2562,6 +3116,14 @@ fn compile_func(f: *mut ir.Func) void {
         b.aux = @int_cast(i64, i);
         let mb = mc.new_block(MF);
         mb.loop_depth = b.loop_depth;
+        let bt = ir.terminator(b);
+        mb.cold = u.notnil(bt) and (bt.op == ir.OP_UNREACHABLE);
+    }
+    for i in 0..order.len {
+        let us = opt.unlikely_succ(order.get(i));
+        if u.notnil(us) {
+            MF.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
+        }
     }
     let mut b = f.first;
     while u.notnil(b) {
@@ -2632,10 +3194,12 @@ fn compile_func(f: *mut ir.Func) void {
     if errors {
         return;
     }
-    let tgt = mc.Target.{ nclasses: 2, alloc_order: [gpr_order[..], vr_order[..]], caller_saved: caller_saved(),
-                          spill_load: spill_load, spill_store: spill_store };
+    let tgt = mc.Target.{ nclasses: 2, alloc_order: [gpr_order[..], vr_order[..], vr_order[..], vr_order[..]],
+                          caller_saved: caller_saved(), spill_load: spill_load, spill_store: spill_store,
+                          spill_move: spill_move, is_label: is_label, fold_remat: fold_remat };
+    mc.dce(MF, pure_inst);
     mc.allocate(MF, &tgt);
-    mc.drop_reloads(MF, is_label);
+    mc.drop_reloads(MF, is_label, no_copy);
     encode_func(f);
 }
 
@@ -2928,8 +3492,28 @@ fn label_ref(l: i32, kind: i32) void {
 }
 
 fn save_restore(load: bool) void {
-    for k in 0..nsaved {
+    let mut k: usize = 0;
+    while k < nsaved {
         let r = saved[k];
+        // neighbours of a class in neighbouring slots: one STP / LDP
+        let mut size: i64 = 8;
+        if r >= V0 {
+            size = 16;
+        }
+        if ((k + 1) < nsaved) and ((saved[k + 1] >= V0) == (r >= V0)) and (save_off[k + 1] == (save_off[k] + size)) and
+           ((save_off[k] / size) <= 63) {
+            let mut w: u64 = 0xA900_0000;  // stp x (signed offset)
+            if r >= V0 {
+                w = 0xAD00_0000;  // stp q
+            }
+            if load {
+                w = w | (1 << 22);
+            }
+            let imm7 = @bit_cast(u64, save_off[k] / size) & 0x7f;
+            w32(((w | (imm7 << 15)) | (ae.r5(saved[k + 1]) << 10)) | ((ae.r5(SP) << 5) | ae.r5(r)));
+            k += 2;
+            continue;
+        }
         let m = mc.mem(SP, -1, 0, save_off[k]);
         if r >= V0 {
             let mut opc: u64 = 2;
@@ -2944,12 +3528,16 @@ fn save_restore(load: bool) void {
             }
             ldst(3, false, opc, 8, r, m);
         }
+        k += 1;
     }
 }
 
 // A leaf with nothing on the stack needs no frame (a call that does not
-// return may still clobber the link register).
+// return may still clobber the link register; with frame tables, where the
+// walk needs the caller's return address, it does not).
 let mut frameless: bool = false;
+let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
+                              chains_sym: 0, rel32: 0, abs64: 0, empty: 0 };  // frame tables (ftab.ax)
 
 fn needs_frame() bool {
     if (frame != 0) or (nsaved > 0) {
@@ -2958,7 +3546,7 @@ fn needs_frame() bool {
     for bi in 0..MF.blocks.len {
         let mut i = MF.blocks.get(bi).first;
         while u.notnil(i) {
-            if i.clobber != 0 {
+            if (i.clobber != 0) or (FT.on and (i.op == CALL)) {
                 return true;
             }
             for k in 0..i.ops.len {
@@ -3050,6 +3638,10 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == LDR {
         ldst(size_code(sz), false, 1, @as(u64, sz), P(i.ops[0].reg), i.ops[1]);
+        return;
+    }
+    if op == PRFM {
+        ldst(3, false, 2, 8, i.cc, i.ops[0]);  // (the loads' encodings with opc 2: prfm, prfum)
         return;
     }
     if op == STR {
@@ -3168,6 +3760,33 @@ fn enc_inst(i: *mut mc.MInst) void {
     fail(u.f1("cannot encode machine op %s", u.idec(op)));
 }
 
+// A block's closing jump to a later block that only empty blocks separate
+// from it falls through instead.
+fn drop_jumps_to_next() void {
+    let nb = MF.blocks.len;
+    for bi in 0..nb {
+        let b = MF.blocks.get(bi);
+        let j = b.last;
+        if u.isnil(j) or (j.op != B) or (j.ops[0].kind != mc.K_LABEL) or (j.ops[0].label >= LOCAL_BASE) {
+            continue;
+        }
+        let t = @int_cast(usize, j.ops[0].label);
+        if t <= bi {
+            continue;
+        }
+        let mut empty = true;
+        for k in (bi + 1)..t {
+            if u.notnil(MF.blocks.get(k).first) {
+                empty = false;
+                break;
+            }
+        }
+        if empty {
+            mc.remove(b, j);
+        }
+    }
+}
+
 fn encode_func(f: *mut ir.Func) void {
     // callee-saved registers in use
     nsaved = 0;
@@ -3204,6 +3823,7 @@ fn encode_func(f: *mut ir.Func) void {
         }
     }
     frame = (cur + 15) & ~@as(i64, 15);
+    drop_jumps_to_next();
     code = bn.new_bytes();
     rls.clear();
     fxs.clear();
@@ -3212,12 +3832,18 @@ fn encode_func(f: *mut ir.Func) void {
     prologue();
     let nb = MF.blocks.len;
     let boff = u.newn.[u64](nb + 1);
+    // frame tables: (offset after each call, its chain)
+    let mut calls = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
         boff[bi] = here();
         let mut i = b.first;
         while u.notnil(i) {
             enc_inst(i);
+            if FT.on and (i.op == CALL) {
+                calls.push(here());
+                calls.push(@bit_cast(u64, i.aux));
+            }
             i = i.next;
         }
     }
@@ -3256,6 +3882,7 @@ fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, code.len());
+    ft.func(&FT, base, s.size, frameless, calls.items()[0..0], calls.items());
     code.free();
 }
 
@@ -3348,7 +3975,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         }
         galign.push(al);
         if u.isnil(g.init) {
-            let si = elf.ext_sym(OBJ, g.name, false);
+            let si = elf.ext_sym(OBJ, g.name, g.linkage == ir.LINK_EXTWEAK);
             if g.tls {
                 OBJ.syms.at(@as(usize, si)).ty = elf.T_TLS;
             }
@@ -3402,12 +4029,16 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         }
         emit_data(sec, s.value, g.init);
     }
+    FT = ft.begin(OBJ, m, TEXT, relro, gsym.items(), elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if not ir.is_decl(f) {
             // the function's machine code is all that outlives it
             u.scratch_begin();
+            let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
+            LSE_ = tg.has(tg.A_LSE);
             compile_func(f);
+            tg.end_fn(outer);
             u.scratch_end();
             if errors {
                 return u.nil.[elf.Obj]();

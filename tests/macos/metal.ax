@@ -1,0 +1,516 @@
+// Metal (std/graphics/metal), drawn offscreen and read back pixel by pixel:
+// clears, root constants, vertex and index buffers, depth, culling,
+// blending, textures, shadow maps, compute, the 2D overlay. macOS only:
+// axiom test tests/macos/metal.ax --target=aarch64-macos (tests/run.mjs runs
+// it on a Mac).
+
+import "std/graphics/image" as image;
+import "std/graphics/metal" as metal;
+import "std/graphics/quartz" as quartz;
+import "std/io" as io;
+
+let mut src_buf: [8192]u8 = [0; 8192];
+
+// The lines of a shader, joined.
+fn src(lines: [][]u8) []u8 {
+    let mut n: usize = 0;
+    for l in lines {
+        @mem_copy(src_buf[n..n + l.len], l);
+        src_buf[n + l.len] = '\n';
+        n += l.len + 1;
+    }
+    return src_buf[0..n];
+}
+
+// Vertices: x, y, z in clip space; root constants: a colour (r, g, b, a) and
+// whether to read texture 0 (point sampled) instead; texture 0 a shadow map
+// for ps_shadow.
+let SHADER: [31][]u8 = ["#include <metal_stdlib>", "using namespace metal;",
+                        "struct K { float4 color; float textured; float3 pad; };",
+                        "struct VIn { float3 pos [[attribute(0)]]; };",
+                        "struct VOut { float4 pos [[position]]; float2 uv; };", "vertex VOut vs(VIn i [[stage_in]]) {",
+                        "    VOut o = { float4(i.pos, 1.0), float2(i.pos.x * 0.5 + 0.5, 0.5 - i.pos.y * 0.5) };",
+                        "    return o;", "}",
+                        "fragment float4 ps(VOut i [[stage_in]], constant K& k [[buffer(0)]], texture2d<float> t [[texture(0)]]) {",
+                        "    constexpr sampler pt(filter::nearest);",
+                        "    return k.textured > 0.5 ? t.sample(pt, i.uv) : k.color;", "}",
+                        "fragment float4 ps_plain(VOut i [[stage_in]], constant K& k [[buffer(0)]]) {",
+                        "    return k.color;", "}",
+                        "fragment float4 ps_shadow(VOut i [[stage_in]], depth2d<float> sm [[texture(0)]], sampler cmp [[sampler(1)]]) {",
+                        "    float lit = sm.sample_compare(cmp, i.uv, 0.5, level(0));",
+                        "    return float4(lit, lit, lit, 1.0);", "}",
+                        "kernel void twice(device float* data [[buffer(1)]], constant uint& n [[buffer(0)]],",
+                        "                  uint id [[thread_position_in_grid]]) {",
+                        "    if (id < n) { data[id] = data[id] * 2.0 + 1.0; }", "}",
+                        "struct UIn { float3 pos [[attribute(0)]]; };",
+                        "vertex VOut vs_upload(UIn i [[stage_in]]) { VOut o = { float4(i.pos, 1.0), float2(0.0) }; return o; }",
+                        "", "", "", "", ""];
+
+struct Kit {
+    gpu: metal.Device,
+    lib: metal.Library,
+    root: metal.RootSignature,
+}
+
+fn kit() !Kit {
+    let mut gpu = metal.Device.init()!;
+    let lib = gpu.library(src(SHADER[..])) catch |e| {
+        if e == error.CompileError {
+            io.stderr().println(metal.message()) catch {};
+            @expect(false);
+        }
+        return e;
+    };
+    let root = gpu.root_signature_with(8, 0, 1)!;
+    return Kit.{ gpu: gpu, lib: lib, root: root };
+}
+
+fn release(k: *mut Kit) void {
+    k.lib.release();
+    k.gpu.deinit();
+}
+
+fn attrs() [1]metal.Attribute {
+    return [metal.Attribute.{ semantic: "POSITION", index: 0, format: metal.R32G32B32_FLOAT, offset: 0 }];
+}
+
+fn bytes(p: []f32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}
+
+fn color(r: f32, g: f32, b: f32, a: f32) [8]u32 {
+    return [@bit_cast(u32, r), @bit_cast(u32, g), @bit_cast(u32, b), @bit_cast(u32, a), 0, 0, 0, 0];
+}
+
+// A quad over the whole target at depth z (two triangles, counter-clockwise).
+fn quad(z: f32) [18]f32 {
+    return [-1.0, -1.0, z, 1.0, -1.0, z, 1.0, 1.0, z, -1.0, -1.0, z, 1.0, 1.0, z, -1.0, 1.0, z];
+}
+
+fn pixel(img: *image.Image, x: usize, y: usize) [4]u8 {
+    let at = ((y * img.width) + x) * 4;
+    return [img.data[at], img.data[at + 1], img.data[at + 2], img.data[at + 3]];
+}
+
+fn near(a: u8, b: u8) bool {
+    return (@as(i32, a) - @as(i32, b) <= 2) and (@as(i32, b) - @as(i32, a) <= 2);
+}
+
+test "clear and read back" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let mut t = k.gpu.target(8, 8)!;
+    defer t.release();
+    k.gpu.begin(&mut t)!;
+    k.gpu.clear(&t, 1.0, 0.5, 0.0, 1.0);
+    k.gpu.finish()!;
+    let mut img = k.gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let p = pixel(&img, 3, 3);
+    @expect((p[0] == 255) and near(p[1], 128) and (p[2] == 0) and (p[3] == 255));
+}
+
+test "constants, vertices, indexes, culling" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut o = metal.PipelineOptions.defaults();
+    o.cull = metal.CULL_BACK;
+    let mut p = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_plain", a[..], o)!;
+    defer p.release();
+    let q = quad(0.5);
+    let mut vb = k.gpu.buffer(bytes(q[..]))!;
+    defer vb.release();
+    // the left half as two indexed triangles, wound clockwise (culled) and
+    // counter-clockwise
+    let verts: [12]f32 = [-1.0, -1.0, 0.5, 0.0, -1.0, 0.5, 0.0, 1.0, 0.5, -1.0, 1.0, 0.5];
+    let mut lb = k.gpu.buffer(bytes(verts[..]))!;
+    defer lb.release();
+    let idx: [6]u16 = [0, 1, 2, 0, 2, 1];
+    let mut ib = k.gpu.buffer(@slice_from_ptr(@ptr_cast(*u8, &idx[0]), 12))!;
+    defer ib.release();
+    let mut t = k.gpu.target(16, 16)!;
+    defer t.release();
+    k.gpu.begin(&mut t)!;
+    k.gpu.clear(&t, 0.0, 0.0, 0.0, 1.0);
+    k.gpu.set_pipeline(&p);
+    let green = color(0.0, 1.0, 0.0, 1.0);
+    k.gpu.set_constants(green[..]);
+    k.gpu.set_vertices(&lb, 12);
+    k.gpu.set_indices(&ib, metal.R16_UINT);
+    k.gpu.draw_indexed(3, 0, 0);  // counter-clockwise: drawn
+    let blue = color(0.0, 0.0, 1.0, 1.0);
+    k.gpu.set_constants(blue[..]);
+    k.gpu.draw_indexed(3, 3, 0);  // clockwise: culled
+    k.gpu.finish()!;
+    let mut img = k.gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let inside = pixel(&img, 6, 12);  // below the diagonal of the left half
+    @expect((inside[1] == 255) and (inside[2] == 0));
+    let right = pixel(&img, 12, 8);
+    @expect((right[0] == 0) and (right[1] == 0) and (right[2] == 0));
+}
+
+test "depth, blending" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut o = metal.PipelineOptions.defaults();
+    o.depth = metal.DEPTH_WRITE;
+    let mut solid = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_plain", a[..], o)!;
+    defer solid.release();
+    o.depth = metal.DEPTH_OFF;
+    o.blend = metal.BLEND_ALPHA;
+    let mut glass = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_plain", a[..], o)!;
+    defer glass.release();
+    o.blend = metal.BLEND_ADD;
+    let mut glow = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_plain", a[..], o)!;
+    defer glow.release();
+    let qn = quad(0.25);
+    let qf = quad(0.75);
+    let mut near_q = k.gpu.buffer(bytes(qn[..]))!;
+    defer near_q.release();
+    let mut far_q = k.gpu.buffer(bytes(qf[..]))!;
+    defer far_q.release();
+    let mut t = k.gpu.target(8, 8)!;
+    defer t.release();
+    let mut z = k.gpu.depth_buffer(8, 8)!;
+    defer z.release();
+    k.gpu.begin_depth(&mut t, &mut z)!;
+    k.gpu.clear(&t, 0.0, 0.0, 0.0, 1.0);
+    k.gpu.clear_depth(&z);
+    k.gpu.set_pipeline(&solid);
+    let red = color(1.0, 0.0, 0.0, 1.0);
+    k.gpu.set_constants(red[..]);
+    k.gpu.set_vertices(&near_q, 12);
+    k.gpu.draw(6, 0);
+    let green = color(0.0, 1.0, 0.0, 1.0);
+    k.gpu.set_constants(green[..]);
+    k.gpu.set_vertices(&far_q, 12);
+    k.gpu.draw(6, 0);  // behind: hidden
+    // half-transparent blue over it, then a glow added
+    k.gpu.set_pipeline(&glass);
+    let half_blue = color(0.0, 0.0, 1.0, 0.5);
+    k.gpu.set_constants(half_blue[..]);
+    k.gpu.draw(6, 0);
+    k.gpu.set_pipeline(&glow);
+    let dim_green = color(0.0, 1.0, 0.0, 0.25);
+    k.gpu.set_constants(dim_green[..]);
+    k.gpu.draw(6, 0);
+    k.gpu.finish()!;
+    let mut img = k.gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let px = pixel(&img, 4, 4);
+    @expect(near(px[0], 128) and near(px[1], 64) and near(px[2], 128));
+}
+
+test "textures" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut p = k.gpu.pipeline(&k.root, &k.lib, "vs", "ps", a[..], metal.TRIANGLE_LIST, false)!;
+    defer p.release();
+    // 2 × 2: red, green / blue, white
+    let mut img = image.Image.init(2, 2, 4, image.Depth.U8)!;
+    defer img.deinit();
+    let px: [16]u8 = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+    @mem_copy(img.data[0..16], px[..]);
+    let mut tex = k.gpu.texture(&img)!;
+    defer tex.release();
+    let q = quad(0.5);
+    let mut vb = k.gpu.buffer(bytes(q[..]))!;
+    defer vb.release();
+    let mut t = k.gpu.target(8, 8)!;
+    defer t.release();
+    k.gpu.begin(&mut t)!;
+    k.gpu.set_pipeline(&p);
+    let tc: [8]u32 = [0, 0, 0, 0, @bit_cast(u32, @as(f32, 1.0)), 0, 0, 0];
+    k.gpu.set_constants(tc[..]);
+    k.gpu.set_image(0, &tex);
+    k.gpu.set_vertices(&vb, 12);
+    k.gpu.draw(6, 0);
+    k.gpu.finish()!;
+    let mut out = k.gpu.read_pixels(&mut t)!;
+    defer out.deinit();
+    let tl = pixel(&out, 1, 1);
+    let tr = pixel(&out, 6, 1);
+    let bl = pixel(&out, 1, 6);
+    let br = pixel(&out, 6, 6);
+    @expect((tl[0] == 255) and (tl[1] == 0));
+    @expect((tr[1] == 255) and (tr[0] == 0));
+    @expect((bl[2] == 255) and (bl[0] == 0));
+    @expect((br[0] == 255) and (br[1] == 255) and (br[2] == 255));
+}
+
+test "a shadow map" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut o = metal.PipelineOptions.defaults();
+    o.depth_only = true;
+    o.depth = metal.DEPTH_WRITE;
+    let mut caster = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "", a[..], o)!;
+    defer caster.release();
+    let mut look = k.gpu.pipeline(&k.root, &k.lib, "vs", "ps_shadow", a[..], metal.TRIANGLE_LIST, false)!;
+    defer look.release();
+    let mut sm = k.gpu.shadow_map(16)!;
+    defer sm.release();
+    // a caster over the left half of the map at depth 0.25 (nearer than 0.5)
+    let left: [18]f32 = [-1.0, -1.0, 0.25, 0.0, -1.0, 0.25, 0.0, 1.0, 0.25, -1.0, -1.0, 0.25, 0.0, 1.0, 0.25, -1.0, 1.0,
+                         0.25];
+    let mut lb = k.gpu.buffer(bytes(left[..]))!;
+    defer lb.release();
+    let q = quad(0.5);
+    let mut vb = k.gpu.buffer(bytes(q[..]))!;
+    defer vb.release();
+    let mut t = k.gpu.target(16, 16)!;
+    defer t.release();
+    k.gpu.begin_shadow(&mut sm)!;
+    k.gpu.clear_depth(&sm);
+    k.gpu.set_pipeline(&caster);
+    k.gpu.set_vertices(&lb, 12);
+    k.gpu.draw(6, 0);
+    k.gpu.begin(&mut t)!;
+    k.gpu.set_pipeline(&look);
+    k.gpu.set_texture(0, &mut sm);
+    k.gpu.set_vertices(&vb, 12);
+    k.gpu.draw(6, 0);
+    k.gpu.finish()!;
+    let mut img = k.gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    @expect(pixel(&img, 3, 8)[0] < 10);    // in shadow
+    @expect(pixel(&img, 12, 8)[0] > 245);  // lit
+}
+
+test "compute" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let rs = k.gpu.compute_signature(1, 1)!;
+    let mut cp = k.gpu.compute_pipeline(&rs, &k.lib, "twice", 64, 1, 1)!;
+    defer cp.release();
+    let mut data: [100]f32 = [0.0; 100];
+    for i in @as(usize, 0)..100 {
+        data[i] = @float_from_int(f32, i);
+    }
+    let mut sb = k.gpu.storage_buffer(bytes(data[..]))!;
+    defer sb.release();
+    k.gpu.set_compute_pipeline(&cp)!;
+    let n: [1]u32 = [100];
+    k.gpu.set_compute_constants(n[..]);
+    k.gpu.set_storage(0, &mut sb);
+    k.gpu.dispatch(2, 1, 1);
+    let mut out: [100]f32 = [0.0; 100];
+    k.gpu.read_buffer(&mut sb, @slice_from_ptr(@ptr_cast(*mut u8, &mut out[0]), 400))!;
+    @expect((out[0] == 1.0) and (out[1] == 3.0) and (out[99] == 199.0));
+}
+
+test "upload buffers and the 2D overlay" {
+    let mut k = kit()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut p = k.gpu.pipeline(&k.root, &k.lib, "vs_upload", "ps_plain", a[..], metal.TRIANGLE_LIST, false)!;
+    defer p.release();
+    let mut ub = k.gpu.upload_buffer(18 * 4)!;
+    defer ub.release();
+    let mut t = k.gpu.target(16, 16)!;
+    defer t.release();
+    let mut ov = k.gpu.overlay(16, 16)!;
+    defer ov.release();
+    let mut c = quartz.Canvas.init(16, 16)!;
+    defer c.deinit();
+    c.begin();
+    c.fill_rect(0.0, 0.0, 8.0, 16.0, quartz.rgba(1.0, 1.0, 1.0, 0.5));  // the left half, half white
+    c.end()!;
+    for frame in @as(usize, 0)..2 {
+        // the buffer rewritten between frames: the whole target, then nothing
+        let f = ub.floats();
+        let q = quad(0.5);
+        for i in @as(usize, 0)..18 {
+            f[i] = q[i];
+            if frame == 1 {
+                f[i] = 0.0;
+            }
+        }
+        k.gpu.begin(&mut t)!;
+        k.gpu.clear(&t, 0.0, 0.0, 0.0, 1.0);
+        k.gpu.set_pipeline(&p);
+        let blue = color(0.0, 0.0, 1.0, 1.0);
+        k.gpu.set_constants(blue[..]);
+        k.gpu.set_vertices(&ub, 12);
+        k.gpu.draw(6, 0);
+        k.gpu.draw_overlay(&mut ov, c.pixels());
+        k.gpu.finish()!;
+        let mut img = k.gpu.read_pixels(&mut t)!;
+        defer img.deinit();
+        let l = pixel(&img, 3, 8);
+        let r = pixel(&img, 12, 8);
+        if frame == 0 {
+            @expect(near(l[0], 128) and near(l[2], 255) and (r[0] == 0) and (r[2] == 255));
+        } else {
+            @expect(near(l[0], 128) and near(l[2], 128) and (r[2] == 0));
+        }
+    }
+}
+
+// Multisampled and HDR targets read by a later pass, mipmapped textures.
+let SHADER2: [25][]u8 = ["#include <metal_stdlib>", "using namespace metal;",
+                         "struct VIn { float3 pos [[attribute(0)]]; };",
+                         "struct VOut { float4 pos [[position]]; float2 uv; };",
+                         "vertex VOut vs(VIn i [[stage_in]]) {",
+                         "    VOut o = { float4(i.pos, 1.0), float2(i.pos.x * 0.5 + 0.5, 0.5 - i.pos.y * 0.5) };",
+                         "    return o;", "}",
+                         "fragment float4 ps_white(VOut i [[stage_in]]) { return float4(1.0); }",
+                         "fragment float4 ps_hdr(VOut i [[stage_in]]) { return float4(4.0, 2.0, 0.5, 1.0); }",
+                         "fragment float4 ps_read(VOut i [[stage_in]], texture2d<float> t [[texture(0)]],",
+                         "                        sampler s [[sampler(2)]]) {",
+                         "    float4 c = t.sample(s, i.uv);", "    return float4(c.rgb / 8.0, 1.0);", "}",
+                         "fragment float4 ps_mip(VOut i [[stage_in]], texture2d<float> t [[texture(0)]],",
+                         "                       sampler s [[sampler(0)]]) {",
+                         "    return float4(t.sample(s, i.uv, level(2)).rgb, 1.0);", "}",
+                         "fragment float4 ps_top(VOut i [[stage_in]], texture2d<float> t [[texture(0)]],",
+                         "                       sampler s [[sampler(0)]]) {",
+                         "    return float4(t.sample(s, float2(0.125, 0.125), level(0)).rgb, 1.0);", "}", "", ""];
+
+fn kit2() !Kit {
+    let mut gpu = metal.Device.init()!;
+    let lib = gpu.library(src(SHADER2[..])) catch |e| {
+        if e == error.CompileError {
+            io.stderr().println(metal.message()) catch {};
+            @expect(false);
+        }
+        return e;
+    };
+    let root = gpu.root_signature_with(0, 0, 1)!;
+    return Kit.{ gpu: gpu, lib: lib, root: root };
+}
+
+test "multisampled target and depth, resolved" {
+    let mut k = kit2()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut o = metal.PipelineOptions.defaults();
+    o.samples = 4;
+    o.depth = metal.DEPTH_WRITE;
+    let mut p = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_white", a[..], o)!;
+    defer p.release();
+    // the lower-left half of the target, below its diagonal
+    let tri: [9]f32 = [-1.0, -1.0, 0.5, 1.0, -1.0, 0.5, -1.0, 1.0, 0.5];
+    let mut vb = k.gpu.buffer(bytes(tri[..]))!;
+    defer vb.release();
+    let mut t = k.gpu.target_with(16, 16, metal.TARGET_BGRA8, 4)!;
+    defer t.release();
+    let mut z = k.gpu.depth_buffer_with(16, 16, 4)!;
+    defer z.release();
+    k.gpu.begin_depth(&mut t, &mut z)!;
+    k.gpu.clear(&t, 0.0, 0.0, 0.0, 1.0);
+    k.gpu.clear_depth(&z);
+    k.gpu.set_pipeline(&p);
+    k.gpu.set_vertices(&vb, 12);
+    k.gpu.draw(3, 0);
+    k.gpu.finish()!;
+    let mut img = k.gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    @expect(pixel(&img, 2, 13)[0] == 255);  // inside
+    @expect(pixel(&img, 13, 2)[0] == 0);    // outside
+    // on the diagonal: partly covered, so neither
+    let mut between: u32 = 0;
+    for x in @as(usize, 0)..16 {
+        let v = pixel(&img, x, x)[0];
+        if (v > 20) and (v < 235) {
+            between += 1;
+        }
+    }
+    @expect(between >= 8);
+}
+
+test "an HDR target read by a later pass" {
+    let mut k = kit2()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut o = metal.PipelineOptions.defaults();
+    o.format = metal.TARGET_RGBA16F;
+    let mut hdr = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_hdr", a[..], o)!;
+    defer hdr.release();
+    let mut read = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_read", a[..], metal.PipelineOptions.defaults())!;
+    defer read.release();
+    let q = quad(0.5);
+    let mut vb = k.gpu.buffer(bytes(q[..]))!;
+    defer vb.release();
+    let mut scene = k.gpu.target_with(8, 8, metal.TARGET_RGBA16F, 1)!;
+    defer scene.release();
+    let mut t = k.gpu.target(8, 8)!;
+    defer t.release();
+    k.gpu.begin(&mut scene)!;
+    k.gpu.set_pipeline(&hdr);
+    k.gpu.set_vertices(&vb, 12);
+    k.gpu.draw(6, 0);
+    k.gpu.begin(&mut t)!;
+    k.gpu.set_pipeline(&read);
+    k.gpu.set_target_texture(0, &scene);
+    k.gpu.set_vertices(&vb, 12);
+    k.gpu.draw(6, 0);
+    k.gpu.finish()!;
+    let mut img = k.gpu.read_pixels(&mut t)!;
+    defer img.deinit();
+    let px = pixel(&img, 4, 4);
+    @expect(near(px[0], 128) and near(px[1], 64) and near(px[2], 16));
+}
+
+test "mipmapped textures, sRGB and HDR" {
+    let mut k = kit2()!;
+    defer release(&mut k);
+    let a = attrs();
+    let mut mip = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_mip", a[..], metal.PipelineOptions.defaults())!;
+    defer mip.release();
+    let mut top = k.gpu.pipeline_with(&k.root, &k.lib, "vs", "ps_top", a[..], metal.PipelineOptions.defaults())!;
+    defer top.release();
+    let q = quad(0.5);
+    let mut vb = k.gpu.buffer(bytes(q[..]))!;
+    defer vb.release();
+    // a 4 × 4 checkerboard of black and white pixels: its 1 × 1 level is grey
+    let mut img = image.Image.init(4, 4, 4, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..16 {
+        let mut v: u8 = 0;
+        if (((i % 4) + (i / 4)) % 2) == 0 {
+            v = 255;
+        }
+        img.data[i * 4] = v;
+        img.data[i * 4 + 1] = v;
+        img.data[i * 4 + 2] = v;
+        img.data[i * 4 + 3] = 255;
+    }
+    let mut plain = k.gpu.texture_mipmapped(&img, false)!;
+    defer plain.release();
+    @expect(plain.levels == 3);
+    let mut srgb = k.gpu.texture_mipmapped(&img, true)!;
+    defer srgb.release();
+    let mut f = img.convert(4, image.Depth.F32)!;
+    defer f.deinit();
+    let px = f.samples32();
+    px[0] = 3.0;  // beyond 1 at the top left
+    let mut hdr = k.gpu.texture_hdr(&f)!;
+    defer hdr.release();
+    let mut t = k.gpu.target(4, 4)!;
+    defer t.release();
+    let texs: [3]*metal.Texture = [&plain, &srgb, &hdr];
+    let mut got: [3]u8 = [0; 3];
+    for n in @as(usize, 0)..3 {
+        k.gpu.begin(&mut t)!;
+        if n == 2 {
+            k.gpu.set_pipeline(&top);
+        } else {
+            k.gpu.set_pipeline(&mip);
+        }
+        k.gpu.set_image(0, texs[n]);
+        k.gpu.set_vertices(&vb, 12);
+        k.gpu.draw(6, 0);
+        k.gpu.finish()!;
+        let mut out = k.gpu.read_pixels(&mut t)!;
+        defer out.deinit();
+        got[n] = pixel(&out, 1, 1)[0];
+    }
+    @expect(near(got[0], 128));  // the average of the encoded values
+    @expect(near(got[1], 128));  // the average in linear light (0.5)
+    @expect(got[2] == 255);      // 3.0, clamped as it is written
+}

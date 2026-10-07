@@ -11,8 +11,8 @@
 //   --cpu=<name>               processor preset (e.g. x86-64-v3, armv8.1-a, native, mvp)
 //   --features=+a,-b           enable / disable processor extensions
 //   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
-//   --release                  same as --overflow=saturate
-//   --overflow=trap|saturate   integer overflow mode (default trap)
+//   --overflow=wrap|trap|saturate   integer overflow mode (default wrap)
+//   --release                  accepted for compatibility; changes nothing
 //   --emit=exe|obj|ir          output kind (default: exe = .wasm module / native executable)
 //   --format=human|agent-json  diagnostic format
 //   --std=<dir>                standard library directory
@@ -54,10 +54,11 @@ fn usage() void {
     u.eprint("       axiom cache [path|clean]   the compiled-module cache\n");
     u.eprint("  test: --filter=<text> --timeout=<ms>\n");
     u.eprint("  --target=wasm32|wasm64|x86_64|aarch64|aarch64-macos|x86_64-windows|native   --cpu=<name>   --features=+ext,-ext\n");
-    u.eprint("  -O0..-O3   --release | --overflow=trap|saturate\n");
+    u.eprint("  -O0..-O3   --overflow=wrap|trap|saturate (default wrap)\n");
     u.eprint("  --emit=exe|obj|ir  --format=human|agent-json  --std=<dir>  -o <out>\n");
     u.eprint("  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n");
     u.eprint("  --sanitize=address|none  check heap accesses: use after free, overflows, double frees, leaks\n");
+    u.eprint("  -g, --debug-info=lines|none   accepted; line tables only from the C compiler (LLVM)\n");
     u.eprint("  --subsystem=console|windows  x86_64-windows: a console program (default) or a GUI one\n");
     u.eprint("  --pdb=on|off             x86_64-windows: debug symbols in <out>.pdb (default on)\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
@@ -593,6 +594,9 @@ fn run_profile(bin: []u8, prog_args: [][]u8, std_dir: []u8, folded_path: []u8, h
         env.push(u.f1("AXIOM_PROFILE_HZ=%s", u.idec(hz)));
     }
     av.push(bin);
+    if ty.g_target.is_wasm and (prog_args.len > 0) {
+        av.push("--");  // host.mjs: the program's arguments follow
+    }
     for a in prog_args {
         av.push(a);
     }
@@ -1005,17 +1009,22 @@ fn driver(args: [][]u8) i32 {
         } else if u.str_eq(a, "-O0") or u.str_eq(a, "-O1") or u.str_eq(a, "-O2") or u.str_eq(a, "-O3") {
             co.opt_level = @as(i32, a[2] - '0');
         } else if u.str_eq(a, "--release") {
-            co.overflow_saturate = true;
+            // once --overflow=saturate: no build mode changes semantics
+        } else if u.str_eq(a, "--overflow=wrap") {
+            co.overflow = cg.OVF_WRAP;
         } else if u.str_eq(a, "--overflow=trap") {
-            co.overflow_saturate = false;
+            co.overflow = cg.OVF_TRAP;
         } else if u.str_eq(a, "--overflow=saturate") {
-            co.overflow_saturate = true;
+            co.overflow = cg.OVF_SATURATE;
         } else if u.starts(a, "--emit=") {
             emit = a[7..];
         } else if u.str_eq(a, "--stack-traces=on") {
             co.stack_traces = true;
         } else if u.str_eq(a, "--stack-traces=off") {
             co.stack_traces = false;
+        } else if u.str_eq(a, "-g") or u.str_eq(a, "--debug-info=lines") or u.str_eq(a, "--debug-info=none") {
+            // DWARF line tables come from the C compiler's LLVM backend; this
+            // compiler's own backends accept the option and emit none
         } else if u.str_eq(a, "--sanitize=address") {
             co.sanitize_address = true;
         } else if u.str_eq(a, "--sanitize=none") {
@@ -1195,14 +1204,21 @@ fn driver(args: [][]u8) i32 {
         if u.file_exists(rtp) {
             pkg_files.push(rtp);
         }
+        // std/os/cpu.ax: @cpu_has, @features and @multiversion ask it about
+        // the processor, and native programs built for more than the
+        // baseline check the processor with it before main.
+        let cpup = u.f1("%s/os/cpu.ax", std_dir);
+        if u.file_exists(cpup) {
+            pkg_files.push(cpup);
+        }
         // --sanitize=address checks accesses with std/mem.ax's shadow memory
         if co.sanitize_address {
             pkg_files.push(u.f1("%s/mem.ax", std_dir));
         }
         // Native programs: the host ABI, crash reports, the test runner and
         // the profiler are Axiom code too.
-        if tg.is_darwin() and (testing or profiling) {
-            dg.emit_fatal(json, "E9001", u.f2("axiom %s does not support --target=%s yet", cmd, tg.os_target_name()));
+        if tg.is_darwin() and (testing or profiling) and (tg.host_os() != tg.OS_DARWIN) {
+            dg.emit_fatal(json, "E9001", u.f2("axiom %s for --target=%s runs only on a Mac", cmd, tg.os_target_name()));
             return 2;
         }
         if not ty.g_target.is_wasm {
@@ -1216,12 +1232,16 @@ fn driver(args: [][]u8) i32 {
                 names[1] = "test_main.ax";
                 if tg.is_windows() {
                     names[1] = "test_main_windows.ax";  // no fork: a process per test
+                } else if tg.is_darwin() {
+                    names[1] = "test_main_darwin.ax";  // fork, over libSystem
                 }
             }
             if profiling {
                 names[2] = "profile.ax";
                 if tg.is_windows() {
                     names[2] = "profile_windows.ax";  // a sampler thread: no SIGPROF
+                } else if tg.is_darwin() {
+                    names[2] = "profile_darwin.ax";  // setitimer: no POSIX CPU-time timers
                 }
             }
             for nm in names {
@@ -1382,8 +1402,10 @@ fn driver(args: [][]u8) i32 {
         let own_link = (n_user_inputs == 0) and (link_flags.len == 0) and (cg.g_link_libs.len == 0);
         let mut native_own = false;
         if tg.g_os != tg.OS_LINUX {
-            // (on Windows, extern "C" "name" blocks name DLLs: plink.ax imports from them)
-            if (n_user_inputs != 0) or (link_flags.len != 0) or ((cg.g_link_libs.len != 0) and not tg.is_windows()) {
+            // (extern "C" "name" blocks name DLLs on Windows, which plink.ax
+            // imports from, and dylibs or frameworks on macOS, which mlink.ax
+            // loads)
+            if (n_user_inputs != 0) or (link_flags.len != 0) {
                 dg.emit_fatal(json, "E9004", u.f1("linking C code or libraries for %s is not supported yet",
                                                   tg.os_target_name()));
                 _ = u.unlink(u.cz(objpath));
@@ -1513,6 +1535,9 @@ fn driver(args: [][]u8) i32 {
             }
             let mut av = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
             av.push(cc);
+            // C code keeps frame pointers: stack traces walk through it
+            // (codegen.ax: frame_tables)
+            av.push("-fno-omit-frame-pointer");
             av.push(objpath);
             // the system call stubs the runtime uses (selfhost/src/lstub.ax)
             let mut machine = elf.EM_X86_64;

@@ -1,0 +1,138 @@
+// Loads from a buffer that is zeroed, then partly filled by a copy, read
+// the copy's source instead (and, past the copied bytes, the source's last
+// bytes shifted down with zeros): the bytes they return are checked here,
+// with writes to the buffer or the source in between that must keep the
+// loads where they are. Also byte shifts of vectors with zeros (psrldq and
+// pslldq without AVX) and and-not of vectors (pandn).
+// x86-64-flags: --cpu=x86-64
+import "../lib/io.ax" as io;
+
+let mut SRC: [48]u8 = [0; 48];
+
+fn hash(v: u8x16) u64 {
+    let mut b: [16]u8 = [0; 16];
+    @store(b[..], v);
+    let mut h: u64 = 0;
+    for i in @as(usize, 0)..16 {
+        h = (h *% 131) +% @as(u64, b[i]);
+    }
+    return h;
+}
+
+fn padded(src: *[48]u8, n: usize, k: usize) u64 {
+    let mut buf: [32]u8 = [0; 32];
+    @mem_copy(buf[0..25], src[k..(k + 25)]);
+    let lo = @load(u8x16, buf[0..16]);
+    let hi = @load(u8x16, buf[16..32]);
+    let mid = @load(u8x16, buf[8..24]);
+    _ = n;
+    return (hash(lo) ^ (hash(hi) *% 3)) ^ (hash(mid) *% 7);
+}
+
+fn padded_words(src: *[48]u8) u64 {
+    let mut buf: [40]u8 = [0; 40];
+    @mem_copy(buf[0..36], src[0..36]);
+    let a = @load(u32x4, buf[24..40]);
+    let b = @load(u16x8, buf[20..36]);
+    let c = @bit_cast(u8x16, a) +% @bit_cast(u8x16, b);
+    return hash(c);
+}
+
+fn written_after(src: *mut [48]u8, x: u8) u64 {
+    let mut buf: [32]u8 = [0; 32];
+    @mem_copy(buf[0..20], src[0..20]);
+    buf[5] = x;
+    src[3] = x +% 1;
+    let lo = @load(u8x16, buf[0..16]);
+    let hi = @load(u8x16, buf[16..32]);
+    return hash(lo) ^ (hash(hi) *% 5);
+}
+
+fn source_written(src: *mut [48]u8, x: u8) u64 {
+    let mut buf: [32]u8 = [0; 32];
+    @mem_copy(buf[0..30], src[2..32]);
+    src[20] = x;
+    let hi = @load(u8x16, buf[14..30]);
+    return hash(hi);
+}
+
+// A copy within the buffer (a memmove whose source and destination overlap):
+// the destination's bytes are not the source's after it.
+fn overlapping(src: *[48]u8) u64 {
+    let mut buf: [48]u8 = [0; 48];
+    @mem_copy(buf[0..24], src[0..24]);
+    @mem_copy(buf[6..30], buf[0..24]);
+    let a = @load(u8x16, buf[6..22]);
+    let b = @load(u8x16, buf[20..36]);
+    return hash(a) ^ (hash(b) *% 3);
+}
+
+fn shifts(v: u8x16) u64 {
+    let z: u8x16 = @splat(0);
+    let r1 = @shuffle(v, z, [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 16]);
+    let r2 = @shuffle(z, v, [0, 0, 0, 0, 0, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+    let w = @bit_cast(u32x4, v);
+    let zw: u32x4 = @splat(0);
+    let r3 = @bit_cast(u8x16, @shuffle(w, zw, [1, 2, 3, 4]));
+    let r4 = @bit_cast(u8x16, @shuffle(zw, w, [0, 4, 5, 6]));
+    return ((hash(r1) ^ (hash(r2) *% 3)) ^ (hash(r3) *% 5)) ^ (hash(r4) *% 7);
+}
+
+fn and_not(a: u8x16, b: u8x16) u64 {
+    let ones: u8x16 = @splat(0xff);
+    let n = (a ^ ones) & b;
+    let m = b & (a ^ ones);
+    let s = @select(@lanes_gt(a, b), a, b);
+    return (hash(n) ^ (hash(m) *% 3)) ^ (hash(s) *% 5);
+}
+
+export fn run() void {
+    for i in @as(usize, 0)..48 {
+        SRC[i] = @truncate(u8, (i * 37) + 11);
+    }
+    for k in @as(usize, 0)..20 {
+        io.uint(padded(&SRC, 25, k));
+    }
+    io.uint(padded_words(&SRC));
+    io.uint(written_after(&mut SRC, 200));
+    io.uint(source_written(&mut SRC, 99));
+    io.uint(overlapping(&SRC));
+    for k in @as(usize, 0)..3 {
+        let v = @load(u8x16, SRC[(k * 16)..((k * 16) + 16)]);
+        let w = @load(u8x16, SRC[(32 - (k * 16))..(48 - (k * 16))]);
+        io.uint(shifts(v));
+        io.uint(and_not(v, w));
+    }
+}
+
+// The C compiler's (LLVM's) results:
+// expect: 3381192959377738303
+// expect: 4276848639297463604
+// expect: 16499672333608337225
+// expect: 1458998452115648606
+// expect: 7246303757871239123
+// expect: 2840730992793870568
+// expect: 14129460268857687933
+// expect: 9660829384216182130
+// expect: 3071139442595387015
+// expect: 17811692176255811996
+// expect: 5446079765671010577
+// expect: 11408424972256981286
+// expect: 15159440058128810427
+// expect: 12625933204421828784
+// expect: 8437358874900754373
+// expect: 1297502593029327066
+// expect: 12268825398221080431
+// expect: 6015068325875257444
+// expect: 13049657493334083577
+// expect: 10868083646080043662
+// expect: 17611031329342405534
+// expect: 14719786278582872598
+// expect: 3633514040694783688
+// expect: 3442398442327092580
+// expect: 9763267772592316059
+// expect: 4919592285407480423
+// expect: 18103863099775659952
+// expect: 2708968785335811476
+// expect: 14612313568951383920
+// expect: 10585084431415851233

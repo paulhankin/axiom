@@ -56,9 +56,9 @@ static const char *compiler_id(void) {
 }
 
 static const char *options_id(CgOptions *o) {
-    return arena_printf("unit-v1|%s|%d|%d|%d|%d|%d|%d|%d|%d|%s", g_target.triple, g_target.ptr_bits, o->opt_level,
-                        o->overflow_saturate, o->stack_traces, o->profile, o->sanitize_address, g_test_mode, o->emit,
-                        o->cpu ? o->cpu : "");
+    return arena_printf("unit-v1|%s|%d|%d|%d|%d|%d|%d|%d|%d|%s|%d", g_target.triple, g_target.ptr_bits, o->opt_level,
+                        (int)o->overflow, o->stack_traces, o->profile, o->sanitize_address, g_test_mode, o->emit,
+                        o->cpu ? o->cpu : "", o->debug_info);
 }
 
 typedef struct Unit {
@@ -223,7 +223,7 @@ const char *cached_runtime_object(const char *cc, const char *src) {
     char *text = read_entire_file(src, &len);
     if (!text) return NULL;
     Hasher h = hasher();
-    hash_str(&h, "runtime-v1");
+    hash_str(&h, "runtime-v2");
     hash_str(&h, cc);
     hash_str(&h, compiler_id());
     hash_bytes(&h, text, len);
@@ -243,7 +243,8 @@ const char *cached_runtime_object(const char *cc, const char *src) {
     const char *tmp = arena_printf("%s.tmp%d", obj, (int)getpid());
     pid_t pid = fork();
     if (pid == 0) {
-        execlp(cc, cc, "-O2", "-c", "-pthread", src, "-o", tmp, (char *)NULL);
+        // frame pointers: stack traces walk through these frames (issue 0037)
+        execlp(cc, cc, "-O2", "-fno-omit-frame-pointer", "-c", "-pthread", src, "-o", tmp, (char *)NULL);
         _exit(127);
     }
     int status;

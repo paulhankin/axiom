@@ -64,11 +64,27 @@ compiler does (`../../std` from the executable, or `--std`, or `$AXIOM_STD`).
 | Target | `--cpu` presets | Extensions (`--features`) |
 |---|---|---|
 | wasm32, wasm64 | `mvp`, `generic` (default), `bleeding-edge` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
-| x86_64, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16` |
-| aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `apple-m1`, `neoverse-n1`, `native` | `lse`, `rcpc`, `dotprod`, `cssc` |
+| x86_64, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `icelake-server`, `sapphirerapids`, `graniterapids`, `alderlake`, `arrowlake`, `znver3`, `znver4`, `znver5`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
+| aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `neoverse-n1`, `neoverse-n2`, `neoverse-v1`, `neoverse-v2`, `apple-m1` ... `apple-m4`, `native` | `lse`, `rcpc`, `dotprod`, `cssc`, `aes`, `sha2`, `sha3`, `sha512`, `sm4`, `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
 
-`--target=native` means this machine's architecture with `--cpu=native` (its extensions,
-from `/proc/cpuinfo`); `--target=x86_64` and `--target=aarch64` default to the baseline.
+The names and their bits are std/os/cpu.ax's, which the compiler imports: programs see
+the same names through `@target_has` and `@cpu_has` (spec §13.4). An extension implies the
+ones it builds on (`+avx512bw` adds `avx512f`, `avx2`, `avx`, ...), and `-avx` removes
+everything that needs AVX.
+
+`--target=native` means this machine's architecture with `--cpu=native`: the extensions
+the processor reports (`cpuid` on x86-64, so also on Windows; the system on AArch64),
+through std/os/cpu.ax. `--target=x86_64` and `--target=aarch64` default to the baseline.
+A native program built for more than the baseline checks the processor before `main`
+(std/os/cpu.ax's `require`, compiled for the baseline) and exits with a message naming
+what is missing, rather than dying on an unsupported instruction.
+
+Each function is compiled with the build's extensions, or with more: a function declared
+`@features(...)` or each version of an `@multiversion(...)` one (spec §13.4) carries its
+own set in the IR (`ir.Func.features`). An `inline` function gets one instance per set of
+extensions it is called with (codegen.ax `get_callee`), so its `@target_has` answers for
+the function it is inlined into. The backends switch to the set while they compile the
+function, and the inliner never moves code into a function with fewer extensions.
 Without an extension the backends use a baseline sequence with the same result, so the
 choice never changes what a program computes:
 
@@ -76,10 +92,36 @@ choice never changes what a program computes:
 - **x86-64**: SSE2 is the baseline. SSSE3 (`pshufb` shuffles, `pabs`), SSE4.1 (rounding,
   `pmulld`, `pextr`/`pinsr`, 64-bit lane equality, min/max), SSE4.2 (64-bit lane
   compares), POPCNT, LZCNT, BMI1 (`tzcnt`), BMI2 (`shlx`...), AVX (three-operand VEX
-  encoding of all SSE instructions) and FMA are used when enabled.
+  encoding of all SSE instructions) and FMA are used when enabled. With AVX2, 256-bit
+  vectors live in ymm registers (VEX.L); with AVX-512 F and BW, 512-bit vectors live in
+  zmm registers (EVEX, with the compressed displacements; with VL, zmm16-31 first),
+  compares go through a mask register (`k1`): a select of a compare picks lanes
+  with `vpblendm*` or merges the operation computing one side into the other
+  (`vsubps zmm{k1}`), an and of a compare zeroes lanes (`{k1}{z}`), ands of
+  compares are masked compares, tests against zero are `vptestm*`, and
+  `@bitmask` reads `k1`; the compare is expanded into lanes (`vpmovm2*`) only
+  where a vector of it is needed. `@bitmask`, `@any_true` and `@all_true` of
+  other vectors go through `vpmov*2m`/`kmovq`. Constants stay in registers,
+  splats of 32- and 64-bit ones broadcast from 4 or 8 bytes (an EVEX `{1toN}`
+  operand where they are read once), and the register allocator builds them
+  again where it would otherwise spill them (`mc.set_remat`). Where the extensions
+  have them, `@swizzle`/`@swizzle2` are one `vpermd`/`vperm*`/`vpermt2*` (out-of-range
+  lanes zeroed through a mask), constant shuffles one instruction (`vpmovzx*` for a
+  widening with zeros, `punpck*`, `pshufd`, `vshufi64x2`) or else a permute, vector `@int_from_float`/`@float_from_int` `cvt*` instructions,
+  `@load_partial`/`@store_partial` masked moves, per-lane shift counts `vpsllv*`/`vpsrlv*`/
+  `vpsrav*`, vector `@clz`/`@popcount` `vplzcnt`/`vpopcnt`, and `@select` of
+  other masks one `vpternlogd`: `codegen.ax` makes intrinsics (`ir.IN_PERM` ...) or vector casts for the
+  builtins where `x64.ax` says it selects them (`perm_ok` and the like), and lowers them
+  generically elsewhere. Operations without a single instruction at that width are split
+  into halves first (`vsplit.ax`), so the choice never changes a result.
 - **AArch64**: the FP and Advanced SIMD (NEON) baseline covers everything; LSE replaces
   the load-exclusive / store-exclusive loops of atomic read-modify-write and
   compare-and-swap with single instructions.
+
+The cryptographic builtins (`@x86_aesenc`, `@x86_clmul`, `@arm_sha256h`, ..., spec §13.5)
+are IR intrinsics (`ir.IN_AESENC` to `ir.IN_CRC32C_A`) that each backend encodes as its one
+instruction; `@x86_*` ones on 256- and 512-bit vectors are split into 128-bit parts unless
+the function has VAES or VPCLMULQDQ.
 
 Programs for another architecture are linked without a cross toolchain. `axiom test`
 and `axiom profile` run them under `qemu-<arch>` (with the target's C library from
@@ -91,9 +133,22 @@ against `/usr/lib/libSystem.B.dylib`, with an ad-hoc code signature (macOS refus
 unsigned arm64 code), so it runs without Xcode. The CPU defaults to `apple-m1`. On a Mac,
 `--target=native` means this target. Apple's ABI differs from AAPCS64 in two ways the
 backend follows: variadic arguments go on the stack in 8-byte slots, and `x18` is
-reserved (it already was). Not yet: `axiom test` and `axiom profile` for this target,
-and linking C code or `-l` libraries. The Mac output has been checked structurally
-(`tests/macho.mjs`) but not yet run on a Mac (issue 0011).
+reserved (it already was). The compiler bootstraps on a Mac (`bootstrap.sh` starts
+from the wasm32 build under node) and the test suite passes there natively. `axiom
+test` runs each test in a new process of the test binary (forked, then exec'd: macOS's
+system services do not work in a forked process that has not exec'd); `axiom profile`
+samples with a thread that meters each thread's CPU time through Mach
+(`runtime/profile_darwin.ax`; `setitimer` fires at a third of the rate asked for).
+
+An `extern "C" "name"` block names the library its functions come from: a framework
+(`"AppKit"`, `"Metal"`, `"AudioToolbox"`, ...), `"objc"`, `"System"` (libSystem), a
+library in `/usr/lib` (`"z"`, `"libz.1.dylib"`) or a path; each is an `LC_LOAD_DYLIB`,
+its symbols bound with its ordinal. Functions of another system's libraries (Windows
+DLLs here, Apple frameworks in `plink.ax`) are linked to the runtime's
+`ax_unavailable`, which reports the call: a program can support both systems and
+choose at run time (std/graphics/gpu, std/os/window). Not yet: linking C code or `-l`
+libraries, and structs passed to or returned from C functions (std/os/objc explains
+the workarounds).
 
 `--target=x86_64-windows` (also `x86_64-pc-windows-msvc` or `windows`) builds a PE32+
 console executable for Windows 10 or later, from any host: position independent (base
@@ -127,25 +182,31 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | Module | What |
 |---|---|
 | `ir.ax` | The SSA IR: types, values, instructions, blocks, functions, globals; a builder that folds constants; a printer (`--emit=ir`) |
-| `codegen.ax` | The checked program to IR (monomorphization, traps, the shadow stack for stack traces, each instruction's source line) |
+| `codegen.ax` | The checked program to IR (monomorphization, traps, stack traces: each call's site record, or the shadow stack, each instruction's source line) |
+| `vsplit.ax` | 256- and 512-bit vector instructions the target cannot compute at that width become instructions on halves (down to 128 bits, which every target has): lane-wise operations piece by piece, the rest combined (reductions per piece and across them, a swizzle per table piece, shuffles of the pieces they read). Where a kept instruction meets split values, or the reverse, the pieces are joined or taken apart with shuffles a wide target selects as `vinserti128`/`vextracti128` (`*64x4` for 512 bits) |
 | `lower.ax` | Target-independent lowering: aggregates to memory, the internal calling convention (aggregates of up to four scalars as those scalars, larger ones by pointer to a copy the callee only reads, results through an sret pointer), and splitting vector operations a target cannot do into lanes |
 | `passes.ax` | The optimization pipeline (below) |
-| `opt.ax` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting; code layout (loops contiguous, exit tests after the body, trap paths last) and constants hoisted out of loops for the native backends |
-| `combine.ax` | Instruction combining: algebraic identities, canonical forms, comparisons (constant ranges, extensions, the forms overflow checks take), narrowing, loads of constants |
-| `copies.ax` | Copies of aggregates that are only read: a stack slot filled by one whole copy and then only read (loaded, copied, passed by value) reads the source instead, when the source cannot change while it is read (a constant, a by-value parameter, a slot written only before the copy); a copy of a copy reads the first source when nothing writes memory between them; a call's result copied into the function's own result is written there directly. Lowering marks by-value arguments and result slots (`ir.EXT_BYVAL`, `ir.EXT_SRET`) |
+| `opt.ax` | mem2reg (SSA construction), constant folding, CFG simplification, dead code elimination; dominators, loops, critical edge splitting; code layout (loops contiguous, exit tests after the body, trap paths last, the successors static prediction says are unlikely out of the straight path: equalities false, signed values not negative), constants hoisted out of loops and comparisons compared again in the blocks that branch on them, for the native backends |
+| `combine.ax` | Instruction combining: algebraic identities, canonical forms, comparisons (constant ranges, extensions, the forms overflow checks take), narrowing (phis of booleans kept as `i8` to `i1`), loads of constants, an operation common to a phi's inputs done once after the join, idioms (the byte swaps ending a bit reversal as `bswap`/`rev` on the native targets, `@bitmask` of a vector and-ed with a constant, a select of `x != 0` and a function of `clz(x)` that gives the same for 0), and a select between `h op T[i]` and `h` where if-conversion loads `T[i]` from an element of the constant table `T` that is `op`'s identity where the condition fails (the select goes) |
+| `copies.ax` | Copies of aggregates that are only read: a stack slot filled by one whole copy and then only read (loaded, copied, passed by value) reads the source instead, when the source cannot change while it is read (a constant, a by-value parameter, a slot written only before the copy); a copy of a copy reads the first source when nothing writes memory between them; a call's result copied into the function's own result is written there directly; a slot copied whole into a variable's slot and not used again is that variable's slot. Copies and vector loads out of a slot filled piece by piece (fields stored one at a time, halves copied in) are split at the pieces, each part taken from where it was written, since a processor cannot forward several narrow stores to one wide load; writes to slots of bytes nothing reads go. Lowering marks by-value arguments and result slots (`ir.EXT_BYVAL`, `ir.EXT_SRET`) |
+| `tailrec.ax` | A function's calls of itself in tail position (`return f(...)`, or `return x + f(...)` with an associative and commutative integer operation, gathered in an accumulator) as a loop |
+| `slots.ax` | Stack-slot liveness, once the other passes are done: per slot over the CFG, from where some write of it may have run to the last read before it is overwritten whole, and everywhere after its address goes where it cannot be followed (a call parameter that keeps no pointer, found over the module, is not such a place). Slots copied into each other at the same offset whose contents are never needed at the same time become one and the copy goes; then slots that never interfere share their bytes (stack colouring), the largest first |
 | `sroa.ax` | Scalar replacement of aggregates: stack slots split into scalar fields, copies of constants replaced by the constant |
-| `gvn.ax` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions and bounds between values (bounds and overflow checks), dead stores, shadow stack pushes and pops (and their records moved to the paths that read them), loop-invariant code motion, memset idioms, loop ranges split at bounds checks, code sinking |
-| `thread.ax` | Jump threading and if-conversion (selects; stores in both arms merged) |
+| `gvn.ax` | Global value numbering over the dominator tree with memory (redundant loads, store-to-load forwarding, alias analysis), facts from branch conditions, bounds between values and upper bounds of values (bit counts, masks, minimums, constant tables, loop phis by induction), which decide bounds and overflow checks and shift guards, dead stores, shadow stack pushes and pops (and their records moved to the paths that read them), loop-invariant code motion, memset idioms, loop ranges split at bounds checks, code sinking |
+| `thread.ax` | Jump threading (also over comparisons of one value that branches above decide, with SSA repair of the values used beyond; a block that branches on a phi of conditions copied into the predecessors computing them; a phi of constants that a dominating branch decides replaced by its condition) and if-conversion (selects; stores in both arms merged; a load from a constant global speculated through a select of its address; nested tests of one value merged into one range check) |
+| `slp.ax` | Straight-line code as vector operations (x86-64): a mask of comparisons of neighbouring array elements with one constant (`a[k] == c` in bit k, or-ed together) is one vector compare of the elements loaded together (a masked load with AVX-512, else scalar loads put in a vector) and `@bitmask`; a sum of neighbouring bytes (`s += a[k]` unrolled, zero-extended or wrapping at 8 bits) is vector loads of them summed by `psadbw` |
+| `unroll.ax` | Full unrolling of loops with a small constant trip count (after inlining), partial unrolling (up to four times, the leftover iterations peeled) of larger ones, and chains of `x == k` tests storing one value at addresses linear in `k` made one range check and one store |
 | `inline.ax` | Inlining bottom-up over the call graph (and the calls inlining brings in), interprocedural constant propagation, dead functions |
-| `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own |
+| `outline.ax` | Cold region outlining: the uncommon path of a small function that makes calls moves into a function of its own (not from a branch inside a loop, where neither side is known to be uncommon) |
 | `wasm.ax`, `wobj.ax` | WebAssembly: structured control flow from the CFG, stackification, the encoder, relocatable object files (the same format as LLVM's) |
 | `wlink.ax` | The wasm linker: memory layout, function table, exports, shared memory for threads |
-| `mach.ax` | Machine IR shared by the native backends, liveness and linear-scan register allocation with spilling, redundant reloads and spill stores removed |
-| `x64.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding |
+| `ftab.ax` | Native frame tables: each call's return address mapped to its call-site records (below) |
+| `mach.ax` | Machine IR shared by the native backends, liveness, static block frequencies (with the layout's prediction), copy coalescing and greedy register allocation (largest intervals first, evicting cheaper ones) with live-range splitting (around calls, at loop and block boundaries; reloads placed where the value is next used) and spilling (values rebuilt rather than stored, such as stack arguments and hoisted constants, split the same way, built again where a piece starts; their uses weighed by what a register saves), redundant reloads and spill stores removed (`AXIOM_DEBUG_RA=<function name suffix>` prints the allocator's decisions for x86-64) |
+| `x64.ax`, `x64enc.ax` | x86-64 instruction selection (System V ABI; loads folded into memory operands), frame layout, encoding (code placement knobs for measuring it, such as `AXIOM_X64_FPAD=<bytes>` in front of every function: see the head of `x64.ax` and issue 0095) |
 | `a64.ax`, `a64enc.ax` | AArch64 instruction selection (AAPCS64), frame layout, encoding |
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
-| `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes, rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
+| `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes (libSystem, frameworks and dylibs by ordinal), rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
 | `plink.ax` | The PE linker for `x86_64-windows`: the same ELF objects in `.text`, `.rdata`, `.idata`, `.data` and `.reloc` sections; the import directory (each Windows function's DLL from its name), thunks, a GOT for our own symbols, base relocations, the TLS directory and the entry point |
 | `lstub.ax` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ax` | Architectures, CPU presets, extensions, host detection |
@@ -193,8 +254,9 @@ and leaks.
 runs the test suite for wasm32 and native code at `-O0` and `-O2` and in whole-program
 mode (and for AArch64 under qemu when available), and fuzzes the backends. The fuzzer
 (`fuzz/gen.py`) writes programs that apply every integer, floating point and SIMD
-operation to edge values; the output of every backend and extension level must match the
-C compiler's LLVM-generated code exactly.
+operation to edge values, on vectors of 128, 256 and 512 bits; the output of every backend
+and extension level (x86-64 from SSE2 to AVX-512, AArch64 under qemu) must match the C
+compiler's LLVM-generated code exactly.
 
 The test suite can run AArch64 code on an x86-64 machine:
 
@@ -216,7 +278,8 @@ dead store elimination, shadow stack push/pop removal, memset idioms,
 loop-invariant code motion and code sinking. `-O2` and `-O3` add cold
 region outlining, interprocedural constant propagation and inlining
 (whole-program units by default), after which each function is simplified
-again, and then split loop ranges at their bounds checks. The backends
+again, then unroll loops with a constant trip count (fully when small,
+else partially; and simplify those functions again), and split loop ranges at their bounds checks. The backends
 then lay out loops, hoist constants, fold loads into memory operands
 (x86-64) and allocate registers with live ranges that have holes.
 
@@ -224,7 +287,19 @@ If-conversion keeps a branch when the chosen value goes into the address of
 a load (a heap or tree walk), where a predicted branch lets the load start
 early.
 
-The shadow stack for stack traces is ordinary memory to the optimizer, with
+Native code keeps stack traces without the shadow stack's call records (spec
+§17.4.1, "Frame tables"): every function that makes a call keeps a frame
+pointer, each call carries its chain of site records (`ir.Chain`: its own,
+then those of the calls inlined around it, which the inliner appends as it
+inlines), and the backends follow each call with an entry in the section
+`axiom_rets` (`ftab.ax`) that the linkers place together. A trap
+(`axiom.trap` calls the runtime's `ax_stack_walk` with its own frame) or a
+crash (from the signal's context) walks the frame pointers and fills the
+thread's shadow stack as the calls would have (`runtime/trap_format.ax`,
+`walk_frames`). Profile builds, `--sanitize=address` and WebAssembly keep
+the shadow stack.
+
+There, the shadow stack for stack traces is ordinary memory to the optimizer, with
 two facts it may use: the program never computes a pointer to it, and every
 call leaves its depth as it found it. A call site's record is written just
 before the calls and traps that can read it, so the common path of an

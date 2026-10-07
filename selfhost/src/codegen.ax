@@ -14,6 +14,7 @@ import "sema.ax" as sema;
 import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
+import "x64.ax" as x64;
 
 // What one codegen run produces (spec §16.8):
 //   CG_WHOLE   the whole program in one object (-O2 and above by default)
@@ -29,10 +30,16 @@ pub const EMIT_OBJ: i32 = 0;
 pub const EMIT_IR: i32 = 1;
 pub const EMIT_ASM: i32 = 2;
 
+// Integer overflow of + - * unary - and MIN / -1 (spec §7.6): wraps (the
+// default), traps with T0002, or saturates.
+pub const OVF_WRAP: i32 = 0;
+pub const OVF_TRAP: i32 = 1;
+pub const OVF_SATURATE: i32 = 2;
+
 pub struct CgOptions {
-    opt_level: i32,           // 0..3
-    overflow_saturate: bool,  // --overflow=saturate (--release)
-    cpu: []u8,                // nil = generic
+    opt_level: i32,  // 0..3
+    overflow: i32,   // --overflow=wrap|trap|saturate: OVF_WRAP (default), OVF_TRAP, OVF_SATURATE
+    cpu: []u8,       // nil = generic
     emit: i32,
     out_path: []u8,          // file to write
     stack_traces: bool,      // shadow stack for traces and profiles (--stack-traces=on, default)
@@ -81,11 +88,16 @@ struct FnInst {
     sret: bool,
     display: []u8,  // user-facing name, for stack traces and profiles
     next: *mut FnInst,
+    feats: u64,      // the processor extensions its code may use
+    dispatch: bool,  // @features / @multiversion: chooses a version (vers) and calls it
+    vers: []mut *mut FnInst,
+    key: []u8,
 }
 
 let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
                                                                     vals: @ptr_from_int(*mut *mut FnInst, 0), cap: 0,
                                                                     len: 0 };
+let mut g_build_features: u64 = 0;  // the build's extensions (--cpu, --features)
 let mut pending_head: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 let mut pending_tail: *mut FnInst = @ptr_from_int(*mut FnInst, 0);
 
@@ -307,6 +319,9 @@ fn align_unit(a: i64) *mut ir.Ty {
     if a == 8 {
         return T_i64;
     }
+    if a >= 32 {
+        return ir.t_vec(T_i32, @int_cast(u32, a / 4));
+    }
     return T_v128;
 }
 
@@ -342,7 +357,7 @@ fn lty(t: *mut ast.Type) *mut ir.Ty {
         }
         r = ir.t_vec(lane, @int_cast(u32, t.lanes));
     } else if k == ast.TY_V128 {
-        r = T_v128;
+        r = ir.t_vec(T_i32, @int_cast(u32, t.bits / 32));
     } else if (k == ast.TY_PTR) or (k == ast.TY_FN) {
         r = T_ptr;
     } else if k == ast.TY_ERROR {
@@ -398,7 +413,14 @@ fn vty(t: *mut ast.Type) *mut ir.Ty {
     return lty(t);
 }
 
+// Passed by pointer to a copy the callee only reads (results: through a
+// pointer to the caller's memory): aggregates larger than 32 bytes, and
+// 256- and 512-bit vectors, so that functions compiled for different
+// processor extensions (spec §13.4) agree on how they arrive.
 fn by_ptr(t: *mut ast.Type) bool {
+    if ty.is_simd(t) {
+        return ty.type_size(t) > 16;
+    }
     return ty.is_aggregate(t) and (ty.type_size(t) > 32);
 }
 
@@ -444,6 +466,15 @@ fn cint(t: *mut ir.Ty, v: u.I128) *mut ir.Value {
 
 fn usz(v: i64) *mut ir.Value {
     return ir.cint(T_isz, @bit_cast(u64, v));
+}
+
+// The elements of `size` bytes that a slice needs to hold `bytes` (@load and
+// @store: s.len * size >= bytes, as a count of elements, which cannot wrap).
+fn elems_for(bytes: i64, size: i64) i64 {
+    if size <= 0 {
+        return bytes;
+    }
+    return (bytes + (size - 1)) / size;
 }
 
 fn terminated() bool {
@@ -553,6 +584,7 @@ const T_STACK: i32 = 8;
 const T_ATOMIC_ALIGN: i32 = 10;
 const T_EXPECT: i32 = 11;
 const T_MEMORY: i32 = 12;
+const T_CPU: i32 = 13;
 const SITE_ERR_RETURN: i32 = 254;
 const SITE_CALL: i32 = 255;  // not traps: shadow stack records
 
@@ -745,6 +777,22 @@ fn program_traces() bool {
     return u.notnil(O) and O.stack_traces;
 }
 
+// Native code keeps stack traces without the shadow stack's call records
+// (issue 0053, as the C compiler's issue 0037): every function that makes a
+// call keeps a frame pointer, and each call is followed by an entry in the
+// object's frame table (section axiom_rets, written by the backend) that
+// maps its return address to its chain of call-site records: its own and
+// those of the calls inlined around it (ir.Chain; inline.ax extends the
+// chains of the code it inlines). A trap or crash walks the frames and
+// fills the thread's shadow stack as the stores would have (runtime:
+// trap_format.ax, walk_frames). Profile builds, which sample the stack while
+// the program runs, and --sanitize=address, which records allocation sites,
+// keep the shadow stack, as does WebAssembly, whose stack cannot be walked.
+// Error-return traces use the shadow stack's ring in every mode.
+fn frame_tables() bool {
+    return program_traces() and not ty.g_target.is_wasm and not O.profile and not O.sanitize_address;
+}
+
 // The native runtime (runtime/*.ax) reports stack traces; it is not part of
 // them.
 fn is_runtime_module(m: *ast.Module) bool {
@@ -752,8 +800,9 @@ fn is_runtime_module(m: *ast.Module) bool {
         return false;
     }
     let names = ["/runtime/native.ax", "/runtime/darwin.ax", "/runtime/windows.ax", "/runtime/trap_format.ax",
-                 "/runtime/test_main.ax", "/runtime/test_main_windows.ax", "/runtime/test_report.ax",
-                 "/runtime/profile.ax", "/runtime/rt.ax"];
+                 "/runtime/test_main.ax", "/runtime/test_main_darwin.ax", "/runtime/test_main_windows.ax",
+                 "/runtime/test_report.ax", "/runtime/profile.ax", "/runtime/profile_darwin.ax",
+                 "/runtime/profile_windows.ax", "/runtime/rt.ax"];
     for n in names {
         if u.ends(m.path, n) {
             return true;
@@ -851,6 +900,7 @@ fn ss_slot(ss: *mut ir.Value, field: u64, idx: *mut ir.Value) *mut ir.Value {
 struct SsFrame {
     ss: *mut ir.Value,
     depth: *mut ir.Value,
+    site: *mut ir.Value,  // frame tables: the call's record (its chain)
 }
 
 // In profiling builds another thread (or a signal handler) reads the stack at
@@ -865,8 +915,12 @@ fn ss_store(v: *mut ir.Value, p: *mut ir.Value) void {
 }
 
 fn ss_push(callee: []u8) SsFrame {
-    let mut f = SsFrame.{ ss: vnil(), depth: vnil() };
+    let mut f = SsFrame.{ ss: vnil(), depth: vnil(), site: vnil() };
     if not stack_traces_on() or u.isnil(F) {
+        return f;
+    }
+    if frame_tables() {
+        f.site = site_record_ex(SITE_CALL, g_cur_span, callee);
         return f;
     }
     if u.isnil(F.ss_depth) {
@@ -890,7 +944,11 @@ fn ss_push(callee: []u8) SsFrame {
     return f;
 }
 
-fn ss_pop(f: SsFrame) void {
+// After the call `c`.
+fn ss_pop(f: SsFrame, c: *mut ir.Value) void {
+    if u.notnil(f.site) {
+        c.chain = ir.chain1(f.site);
+    }
     if u.notnil(f.ss) {
         ss_store(f.depth, ss_field(f.ss, 0));
     }
@@ -1028,6 +1086,23 @@ fn call_trap_site(site: *mut ir.Value) void {
             let mut ssv = ir.czero(T_ptr);
             if program_traces() {
                 ssv = ss_ptr();
+            }
+            if frame_tables() {
+                // the frames, from this function's own (its return address
+                // is the trap's): runtime/trap_format.ax
+                let mut wps: [1]*mut ir.Ty = [T_ptr];
+                let wty = fn_type(T_void, wps[..], false);
+                let walk = ir.add_function(M, "ax_stack_walk", wty).val;
+                set_linkage(walk, ir.LINK_EXTWEAK);
+                let walk_bb = ir.append_block(f.fnp, "walk");
+                let hook_bb = ir.append_block(f.fnp, "hook.call");
+                condbr(icmp(ir.IntNE, walk, ir.czero(T_ptr)), walk_bb, hook_bb);
+                at_end(walk_bb);
+                let mut none: [1]*mut ir.Value = [vnil()];
+                let mut wargs: [1]*mut ir.Value = [ir.intr(B, ir.IN_FRAME_ADDR, T_ptr, none[0..0])];
+                _ = call(wty, walk, wargs[..]);
+                br(hook_bb);
+                at_end(hook_bb);
             }
             let mut args: [3]*mut ir.Value = [sp, trap_info_global(), ssv];
             _ = call(hty, trap_hook, args[..]);
@@ -1596,13 +1671,45 @@ fn type_mentions_error(t: *mut ast.Type) bool {
 // ---------------------------------------------------------------------------
 // Function instances
 // ---------------------------------------------------------------------------
+// The extensions a function's code may use, without an attribute: the
+// build's (not tg.g_features, which is the current function's while a body
+// is generated).
+fn base_features(d: *mut ast.Decl) u64 {
+    if sema.baseline_fn(d) {
+        return 0;
+    }
+    return g_build_features;
+}
+
 fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
+    return get_inst_feats(d, gargs, base_features(d));
+}
+
+// The callee of a direct call from the current function. An inline function
+// is compiled with its caller's extensions (spec §9.5): one instance per set
+// of extensions it is called with, so that @target_has, and lowering that
+// depends on extensions, answer for the caller (a version of an @features or
+// @multiversion function) into which it is inlined.
+fn get_callee(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
+    if (d.kind == ast.D_FN) and d.is_inline {
+        return get_inst_feats(d, gargs, tg.g_features);
+    }
+    return get_inst(d, gargs);
+}
+
+fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut FnInst {
     let n = gargs.len;
     let mut kb = u.Buf.init();
     kb.s(u.udec(@as(u64, @int_from_ptr(d))));
     for i in 0..n {
         kb.s(",");
         kb.s(u.idec(gargs[i].id));
+    }
+    // (an inline function compiled for its caller's extensions)
+    let own_feats = feats != base_features(d);
+    if own_feats {
+        kb.s("#f");
+        kb.s(u.udec(feats));
     }
     let k = u.intern(kb.done());
     let found = inst_map.get(k);
@@ -1612,6 +1719,9 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     let fi = u.new.[FnInst]();
     fi.decl = d;
     fi.gargs = gargs;
+    fi.key = k;
+    fi.feats = feats;
+    fi.dispatch = (d.kind == ast.D_FN) and (d.attr != ast.ATTR_NONE);
     for i in 0..n {
         if gargs[i].has_params {
             internal_error("generic instance with unsubstituted arguments");
@@ -1664,6 +1774,15 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
             }
             nb.s("]");
         }
+        if own_feats {
+            let sfx = tg.features_string(feats & ~g_build_features);
+            nb.s(".");
+            if sfx.len == 0 {
+                nb.s("base");
+            } else {
+                nb.s(sfx);
+            }
+        }
         name = nb.done();
     }
     if d.variadic {
@@ -1678,13 +1797,17 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     } else {
         fi.fnv = ir.add_function(M, name, fi.llty).val;
     }
+    fi.fnv.fnp.features = fi.feats;
+    fi.fnv.fnp.has_features = true;
+    fi.fnv.fnp.always_inline = (d.kind == ast.D_FN) and d.is_inline;
     add_ext_attrs(fi.fnv, fi.fnty, fi.sret, false);
     if d.kind == ast.D_HOST_FN {
         if d.extern_c {
             // libraries: see collect_link_names; on Windows the library is
-            // the function's DLL, which the linker reads from a constant
-            // axiom.import.<name> holding its name (selfhost/src/plink.ax)
-            if tg.is_windows() and not u.isnos(d.link_lib) {
+            // the function's DLL, and on macOS its dylib or framework, which
+            // the linker reads from a constant axiom.import.<name> holding
+            // its name (selfhost/src/plink.ax, selfhost/src/mlink.ax)
+            if (tg.is_windows() or tg.is_darwin()) and not u.isnos(d.link_lib) {
                 dll_import(name, d.link_lib);
             }
         } else if ty.g_target.is_wasm {
@@ -1700,9 +1823,9 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
         if O.unit == CG_LINK {
             define = false;
         } else if (O.unit == CG_MODULE) and (n == 0) {
-            define = d.module == O.module;
+            define = (d.module == O.module) or own_feats;
         }
-        if (O.unit == CG_WHOLE) and not d.is_export {
+        if ((O.unit == CG_WHOLE) and not d.is_export) or own_feats {
             set_linkage(fi.fnv, ir.LINK_INTERNAL);
         } else if define and (n > 0) {
             set_linkage(fi.fnv, ir.LINK_LINKONCE);
@@ -1722,6 +1845,123 @@ fn get_inst(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     }
     inst_map.put(k, fi);
     return fi;
+}
+
+// Version k of a function with @features or @multiversion: its body
+// compiled with extensions `feats`, under the name of the dispatcher (fi)
+// with a suffix, and shown under the function's own name in traces.
+fn get_version(fi: *mut FnInst, k: usize, feats: u64) *mut FnInst {
+    let key = u.intern(u.f2("%s#v%s", fi.key, u.zdec(k)));
+    let found = inst_map.get(key);
+    if u.notnil(found) {
+        return found;
+    }
+    let v = u.new.[FnInst]();
+    v.decl = fi.decl;
+    v.gargs = fi.gargs;
+    v.key = key;
+    v.fnty = fi.fnty;
+    v.llty = fi.llty;
+    v.sret = fi.sret;
+    v.display = fi.display;
+    v.feats = feats;
+    let mut suffix = tg.features_string(feats & ~g_build_features);
+    if suffix.len == 0 {
+        suffix = "base";
+    }
+    v.fnv = ir.add_function(M, u.f2("%s.%s", fi.fnv.fnp.name, suffix), v.llty).val;
+    v.fnv.fnp.features = feats;
+    v.fnv.fnp.has_features = true;
+    set_linkage(v.fnv, ir.LINK_INTERNAL);
+    add_ext_attrs(v.fnv, v.fnty, v.sret, false);
+    if u.notnil(pending_tail) {
+        pending_tail.next = v;
+    } else {
+        pending_head = v;
+    }
+    pending_tail = v;
+    inst_map.put(key, v);
+    return v;
+}
+
+// The body of a function with @features or @multiversion: the first
+// version whose extensions the running processor has (the build's own
+// count as present), else the @multiversion fallback (the target's
+// extensions only), or trap T0013 for @features.
+fn gen_dispatch(fi: *mut FnInst) void {
+    let d = fi.decl;
+    let f = fi.fnv;
+    at_end(ir.append_block(f.fnp, "entry"));
+    set_span(d.attr_span);
+    let nparams = f.fnp.params.len;
+    let args = u.newn.[*mut ir.Value](nparams + 1);
+    for i in 0..nparams {
+        args[i] = param(f, @int_cast(u32, i));
+    }
+    let base = fi.feats;
+    let mut k: usize = 0;
+    let mut done = false;
+    for set in d.feat_sets {
+        k += 1;
+        if (set == sema.NO_VERSION) or done {
+            continue;
+        }
+        let want = base | set;
+        let v = get_version(fi, k, want);
+        let missing = want & ~tg.g_features;
+        if missing == 0 {
+            dispatch_call(fi, v, args[0..nparams]);
+            done = true;
+            continue;
+        }
+        let yes = ir.append_block(f.fnp, "version");
+        let no = ir.append_block(f.fnp, "next");
+        condbr(cpu_has_bits(missing), yes, no);
+        at_end(yes);
+        dispatch_call(fi, v, args[0..nparams]);
+        at_end(no);
+    }
+    if done {
+        return;
+    }
+    if d.attr == ast.ATTR_MULTIVERSION {
+        dispatch_call(fi, get_version(fi, 0, base), args[0..nparams]);
+    } else {
+        call_trap_site(site_record(T_CPU, d.attr_span));
+        ir.unreachable(B);
+    }
+}
+
+fn dispatch_call(fi: *mut FnInst, v: *mut FnInst, args: []mut *mut ir.Value) void {
+    let r = call(fi.llty, v.fnv, args);
+    add_ext_attrs(r, fi.fnty, fi.sret, true);
+    if fi.llty.ret.kind == ir.T_VOID {
+        ir.ret_void(B);
+    } else {
+        ir.ret(B, r);
+    }
+}
+
+// std/os/cpu.ax, which every build includes (the start-up check, @cpu_has).
+fn cpu_fn(name: []u8) *mut FnInst {
+    let P = sema.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.ends(u.file_of(d.module.file.id).display, "std/os/cpu.ax") {
+            return get_inst(d, ty.no_types());
+        }
+    }
+    internal_error(u.f1("std/os/cpu.ax has no %s (is --std right?)", name));
+    return u.nil.[FnInst]();
+}
+
+// Does the running processor have every extension in `bits`? (i1)
+fn cpu_has_bits(bits: u64) *mut ir.Value {
+    let fi = cpu_fn("features");
+    let have = call(fi.llty, fi.fnv, no_vals());
+    let m = ci(T_i64, bits);
+    return icmp(ir.IntEQ, b_and(have, m), m);
 }
 
 // C ABI detail: integers narrower than 32 bits and bool are passed and
@@ -1984,9 +2224,18 @@ fn saturated(t: *mut ir.Ty, neg_direction: *mut ir.Value) *mut ir.Value {
 }
 
 fn overflow_op(base: i32, is_signed: bool, l: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    if O.overflow == OVF_WRAP {
+        if base == 0 {
+            return b_add(l, r);
+        }
+        if base == 1 {
+            return b_sub(l, r);
+        }
+        return b_mul(l, r);
+    }
     let t = l.ty;
     let o = op_with_overflow(base, is_signed, l, r);
-    if not O.overflow_saturate {
+    if O.overflow == OVF_TRAP {
         check_or_trap(b_not(o.ovf), T_OVERFLOW);
         return o.val;
     }
@@ -2020,6 +2269,30 @@ fn gen_shift(op: i32, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut
     if t.kind == ast.TY_VEC {
         lane = t.elem;
     }
+    if (k.ty.kind == ir.T_VEC) and on_x64() and (k.ty.elem.bits == x.ty.elem.bits) {
+        // a count per lane, where x86-64 shifts each lane by its own (and
+        // counts beyond the lane give 0, or the sign, as here)
+        let mut sid = ir.IN_SHLV;
+        if op != lx.TK_SHL {
+            sid = ir.IN_LSHRV;
+            if lane.is_signed {
+                sid = ir.IN_ASHRV;
+            }
+        }
+        if x64.shiftv_ok(sid, x.ty.elem.bits, x.ty.lanes) {
+            let mut sargs: [2]*mut ir.Value = [x, k];
+            return ir.intr(B, sid, x.ty, sargs[..]);
+        }
+    }
+    if k.ty.kind == ir.T_VEC {
+        // a count per lane: lane by lane
+        let mut r = ir.undef(x.ty);
+        for i in @as(u64, 0)..@as(u64, @bit_cast(u32, t.lanes)) {
+            let y = gen_shift(op, lane, ir.extract_elem(B, x, i), ir.extract_elem(B, k, i));
+            r = ir.insert_elem(B, r, y, i);
+        }
+        return r;
+    }
     let n = @int_cast(u32, lane.bits);
     let kty = k.ty;
     let ge = icmp(ir.IntUGE, k, ci(kty, @as(u64, n)));
@@ -2029,7 +2302,15 @@ fn gen_shift(op: i32, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut
     if arith {
         fill = @as(u64, n - 1);
     }
-    let mut kc = sel(ge, ci(kty, fill), k);
+    // Only an arithmetic shift needs its count clamped (to fill with the
+    // sign); a shift left or a logical shift right by an out-of-range count
+    // computes some value (each backend masks the count) that the select
+    // below replaces with 0. The optimizer removes the selects when the
+    // count's range is below the width.
+    let mut kc = k;
+    if arith or ir.is_cint(k) {
+        kc = sel(ge, ci(kty, fill), k);
+    }
     let kb = ir.int_width(kty);
     if kb > n {
         kc = trunc(kc, lane_ty);
@@ -2059,9 +2340,13 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut
     } else if t.kind == ast.TY_VEC {
         sgn = t.elem.is_signed;
     }
+    let is_vec = t.kind == ast.TY_VEC;  // integer vectors wrap in every mode
     if op == lx.TK_PLUS {
         if is_float {
             return ir.binop(B, ir.OP_FADD, l, r);
+        }
+        if is_vec {
+            return b_add(l, r);
         }
         return overflow_op(0, sgn, l, r);
     }
@@ -2069,11 +2354,17 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut
         if is_float {
             return ir.binop(B, ir.OP_FSUB, l, r);
         }
+        if is_vec {
+            return b_sub(l, r);
+        }
         return overflow_op(1, sgn, l, r);
     }
     if op == lx.TK_STAR {
         if is_float {
             return ir.binop(B, ir.OP_FMUL, l, r);
+        }
+        if is_vec {
+            return b_mul(l, r);
         }
         return overflow_op(2, sgn, l, r);
     }
@@ -2086,9 +2377,15 @@ fn gen_binop(op: i32, t: *mut ast.Type, l: *mut ir.Value, r: *mut ir.Value) *mut
         if not sgn {
             return ir.binop(B, ir.OP_UDIV, l, r);
         }
+        if O.overflow == OVF_WRAP {
+            // MIN / -1 wraps to MIN: a divisor of -1 negates (as `%` gives 0)
+            let m1 = icmp(ir.IntEQ, r, ir.cones(tt));
+            let q = ir.binop(B, ir.OP_SDIV, l, sel(m1, ci(tt, 1), r));
+            return sel(m1, ir.neg(B, l), q);
+        }
         let rm1 = icmp(ir.IntEQ, r, ir.cones(tt));  // (right to left, as in the C implementation)
         let ovf = b_and(icmp(ir.IntEQ, l, int_min(tt)), rm1);
-        if not O.overflow_saturate {
+        if O.overflow == OVF_TRAP {
             check_or_trap(b_not(ovf), T_OVERFLOW);
             return ir.binop(B, ir.OP_SDIV, l, r);
         }
@@ -2280,7 +2577,7 @@ fn emit_call(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: boo
     }
     let sf = ss_push(callee);
     let r = call(fty, fnv, av[0..n]);
-    ss_pop(sf);
+    ss_pop(sf, r);
     add_ext_attrs(r, fnty, sret, true);
     if sret {
         return load(fnty.ret, ret_tmp, false);
@@ -2315,7 +2612,7 @@ fn gen_call(e: *mut ast.Expr) *mut ir.Value {
         return emit_call(fl.t, fp, ft, fl.sret, av[0..n], ft.params, u.nosym());
     }
     let d = e.decl;
-    let fi = get_inst(d, subst_gargs(e.gargs));
+    let fi = get_callee(d, subst_gargs(e.gargs));
     let has_recv = u.notnil(e.b);
     let mut n = e.args.len;
     if has_recv {
@@ -2451,27 +2748,67 @@ fn splat(vt: *mut ir.Ty, x: *mut ir.Value, lanes: u32) *mut ir.Value {
     return ir.splat(B, vt, x);
 }
 
-fn pairwise_sum(xs: []mut *mut ir.Value, is_float: bool) *mut ir.Value {
-    let n = xs.len;
-    if n == 1 {
-        return xs[0];
+// The lanes summed by folding the halves (spec §13.2): lane i plus lane
+// i + n/2, until one lane is left. Vectors while the halves are 128 bits or
+// more, then lane by lane.
+fn reduce_add(vt: *mut ast.Type, v0: *mut ir.Value) *mut ir.Value {
+    let is_float = vt.elem.kind == ast.TY_FLOAT;
+    let mut v = v0;
+    let mut n = @int_cast(usize, vt.lanes);
+    let lb = @int_cast(usize, vt.bits);
+    while (n > 1) and (((n / 2) * lb) >= 128) {
+        let h = n / 2;
+        let lo = u.newn.[i32](h);
+        let hi = u.newn.[i32](h);
+        for i in 0..h {
+            lo[i] = @truncate(i32, @bit_cast(isize, i));
+            hi[i] = @truncate(i32, @bit_cast(isize, i + h));
+        }
+        let a = ir.shuffle(B, v, v, lo);
+        let b = ir.shuffle(B, v, v, hi);
+        if is_float {
+            v = ir.binop(B, ir.OP_FADD, a, b);
+        } else {
+            v = b_add(a, b);
+        }
+        n = h;
     }
-    let h = n / 2;
-    let a = pairwise_sum(xs[0..h], is_float);
-    let b = pairwise_sum(xs[h..n], is_float);
-    if is_float {
-        return ir.binop(B, ir.OP_FADD, a, b);
+    if (n > 1) and ((n * lb) == 128) {
+        // within the 128-bit vector: its upper half's lanes shuffled down and
+        // added, the lanes above them ignored
+        let l = n;
+        while n > 1 {
+            let h = n / 2;
+            let m = u.newn.[i32](l);
+            for i in 0..l {
+                m[i] = @truncate(i32, @bit_cast(isize, (i % h) + h));
+            }
+            let b = ir.shuffle(B, v, v, m);
+            if is_float {
+                v = ir.binop(B, ir.OP_FADD, v, b);
+            } else {
+                v = b_add(v, b);
+            }
+            n = h;
+        }
+        return ext_elem(v, ci32(0));
     }
-    return b_add(a, b);
-}
-
-fn reduce_add(vt: *mut ast.Type, v: *mut ir.Value) *mut ir.Value {
-    let n = @int_cast(usize, vt.lanes);
     let xs = u.newn.[*mut ir.Value](n);
     for i in 0..n {
         xs[i] = ext_elem(v, ci32(@as(u64, i)));
     }
-    return pairwise_sum(xs, vt.elem.kind == ast.TY_FLOAT);
+    while n > 1 {
+        let h = n / 2;
+        for i in 0..h {
+            if is_float {
+                xs[i] = ir.binop(B, ir.OP_FADD, xs[i], xs[i + h]);
+            } else {
+                xs[i] = b_add(xs[i], xs[i + h]);
+            }
+        }
+        n = h;
+    }
+    return xs[0];
 }
 
 fn ext_int(v: *mut ir.Value, to: *mut ir.Ty, is_signed: bool) *mut ir.Value {
@@ -2487,6 +2824,97 @@ fn ext_int(v: *mut ir.Value, to: *mut ir.Ty, is_signed: bool) *mut ir.Value {
         return sext(v, to);
     }
     return zext(v, to);
+}
+
+// x86-64 code generation, which selects some vector builtins whole (where
+// the function's extensions have them: x64.perm_ok and the like).
+fn on_x64() bool {
+    return tg.g_arch == tg.ARCH_X64;
+}
+
+fn on_a64() bool {
+    return tg.g_arch == tg.ARCH_A64;
+}
+
+// The mask (i64) of the first k lanes, k <= 64: (1 << k) - 1 in two shifts,
+// each below 64.
+fn lane_mask(k: *mut ir.Value) *mut ir.Value {
+    let h = ir.binop(B, ir.OP_LSHR, k, usz(1));
+    let one = ci(T_i64, 1);
+    let m = ir.binop(B, ir.OP_SHL, ir.binop(B, ir.OP_SHL, one, h), b_sub(k, h));
+    return b_sub(m, one);
+}
+
+// A lane-wise builtin on a vector (spec §13.2) that the backends have for
+// scalars only: lane by lane. `src_signed`: the operand's lanes, for
+// @float_from_int.
+fn lanewise(id: i32, rt: *mut ast.Type, v: *mut ir.Value, src_signed: bool) *mut ir.Value {
+    let n = @as(u64, @bit_cast(u32, rt.lanes));
+    let lt = lty(rt.elem);
+    let mut r = ir.undef(lty(rt));
+    for k in @as(u64, 0)..n {
+        let x = ir.extract_elem(B, v, k);
+        let mut y = x;
+        if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) {
+            let mut t: [1]*mut ir.Ty = [x.ty];
+            let mut args: [2]*mut ir.Value = [x, ci(T_i1, 0)];
+            y = intrinsic(u.pick(id == ast.BI_CLZ, "llvm.ctlz", "llvm.cttz"), t[..], args[..]);
+        } else if id == ast.BI_POPCOUNT {
+            y = intr1("llvm.ctpop", x);
+        } else if id == ast.BI_INT_FROM_FLOAT {
+            let mut tys: [2]*mut ir.Ty = [lt, x.ty];
+            let mut args: [1]*mut ir.Value = [x];
+            y = intrinsic(u.pick(rt.is_signed, "llvm.fptosi.sat", "llvm.fptoui.sat"), tys[..], args[..]);
+        } else if src_signed {
+            y = ir.cast(B, ir.OP_SITOFP, x, lt);
+        } else {
+            y = ir.cast(B, ir.OP_UITOFP, x, lt);
+        }
+        r = ir.insert_elem(B, r, y, k);
+    }
+    return r;
+}
+
+// A vector of n lanes of type lt, each v.
+fn const_lanes(lt: *mut ir.Ty, n: usize, v: u64) *mut ir.Value {
+    let xs = u.newn.[*mut ir.Value](n);
+    for i in 0..n {
+        xs[i] = ci(lt, v);
+    }
+    return ir.cagg(ir.t_vec(lt, @truncate(u32, n)), xs);
+}
+
+// @swizzle (spec §13.2): lane i of the result is lane idx[i] of the table, or
+// 0 when idx[i] (unsigned) is not a lane. Wider lanes become byte indices,
+// min(idx, n) * lanebytes + k for byte k of a lane (at most 64 + 7).
+fn swizzle_lanes(t: *mut ast.Type, x: *mut ir.Value, idx: *mut ir.Value) *mut ir.Value {
+    let n = @int_cast(usize, t.lanes);
+    let lb = @int_cast(usize, t.bits) / 8;
+    if lb == 1 {
+        let mut sargs: [2]*mut ir.Value = [x, idx];
+        return ir.intr(B, ir.IN_SWIZZLE, x.ty, sargs[..]);
+    }
+    let nb = n * lb;
+    let bt = ir.t_vec(T_i8, @truncate(u32, nb));
+    let it = idx.ty;
+    let cn = const_lanes(it.elem, n, @as(u64, n));
+    let m = sext(icmp(ir.IntULT, idx, cn), it);
+    let mut cl = b_or(b_and(idx, m), b_and(cn, b_not(m)));
+    let mut k: usize = 1;
+    while k < lb {
+        cl = b_add(cl, cl);
+        k *= 2;
+    }
+    let bytes = bitcast(cl, bt);
+    let rep = u.newn.[i32](nb);
+    let kk = u.newn.[*mut ir.Value](nb);
+    for i in 0..nb {
+        rep[i] = @truncate(i32, @bit_cast(isize, (i / lb) * lb));
+        kk[i] = ci(T_i8, @as(u64, i % lb));
+    }
+    let bi = b_add(ir.shuffle(B, bytes, bytes, rep), ir.cagg(bt, kk));
+    let mut sargs: [2]*mut ir.Value = [bitcast(x, bt), bi];
+    return bitcast(ir.intr(B, ir.IN_SWIZZLE, bt, sargs[..]), x.ty);
 }
 
 fn barg(e: *mut ast.Expr, i: usize) *mut ast.Expr {
@@ -2517,6 +2945,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let v = gen(barg(e, 1));
         if s == rt {
             return v;
+        }
+        if s.kind == ast.TY_BOOL {
+            return zext(v, lty(rt));
         }
         if (s.kind == ast.TY_INT) and (rt.kind == ast.TY_INT) {
             return ext_int(v, lty(rt), s.is_signed);
@@ -2593,6 +3024,39 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let s = ct(barg(e, 1).ty);
         return ext_int(gen(barg(e, 1)), lty(rt), s.is_signed);
     }
+    if ((id == ast.BI_INT_FROM_FLOAT) or (id == ast.BI_FLOAT_FROM_INT)) and (rt.kind == ast.TY_VEC) {
+        let srct = ct(barg(e, 1).ty);
+        let v = gen(barg(e, 1));
+        if (on_x64() or on_a64()) and (srct.elem.bits == rt.elem.bits) {
+            // whole vectors (x64.ax and a64.ax convert them, or the lanes one by one)
+            let mut op = ir.OP_UITOFP;
+            if id == ast.BI_INT_FROM_FLOAT {
+                op = ir.OP_FPTOUI_SAT;
+                if rt.is_signed {
+                    op = ir.OP_FPTOSI_SAT;
+                }
+            } else if srct.is_signed {
+                op = ir.OP_SITOFP;
+            }
+            return ir.cast(B, op, v, lty(rt));
+        }
+        return lanewise(id, rt, v, srct.is_signed);
+    }
+    if ((id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT)) and (rt.kind == ast.TY_VEC) {
+        let v = gen(barg(e, 0));
+        if on_x64() and (v.ty.elem.bits == lty(rt).elem.bits) {
+            // whole vectors (x64.ax counts them, or the lanes one by one)
+            let mut iid = ir.IN_CTPOP;
+            if id == ast.BI_CLZ {
+                iid = ir.IN_CTLZ;
+            } else if id == ast.BI_CTZ {
+                iid = ir.IN_CTTZ;
+            }
+            let mut args: [1]*mut ir.Value = [v];
+            return ir.intr(B, iid, lty(rt), args[..]);
+        }
+        return lanewise(id, rt, v, false);
+    }
     if id == ast.BI_INT_FROM_FLOAT {
         let v = gen(barg(e, 1));
         let mut tys: [2]*mut ir.Ty = [lty(rt), v.ty];
@@ -2643,6 +3107,14 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     }
     if id == ast.BI_PTR_CAST {
         return gen(barg(e, 1));
+    }
+    if (id == ast.BI_PTR_ADD) or (id == ast.BI_PTR_SUB) {
+        let p = gen(barg(e, 0));
+        let mut off = b_mul(gen(barg(e, 1)), usz(ty.type_size(rt.elem)));
+        if id == ast.BI_PTR_SUB {
+            off = ir.neg(B, off);
+        }
+        return ir.ptradd(B, p, off);
     }
     if id == ast.BI_SLICE_FROM_PTR {
         let p = gen(barg(e, 0));
@@ -2783,12 +3255,12 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return intr2(nm, a0, a1);
     }
     if id == ast.BI_MUL_SAT {
-        let saved = O.overflow_saturate;
-        O.overflow_saturate = true;
         let l = gen(barg(e, 0));
         let r = gen(barg(e, 1));
+        let saved = O.overflow;
+        O.overflow = OVF_SATURATE;
         let v = overflow_op(2, rt.is_signed, l, r);
-        O.overflow_saturate = saved;
+        O.overflow = saved;
         return v;
     }
     if (id == ast.BI_ADD_CHECKED) or (id == ast.BI_SUB_CHECKED) or (id == ast.BI_MUL_CHECKED) {
@@ -2828,13 +3300,16 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let t = v.ty;
         let mut tys: [1]*mut ir.Ty = [t];
         if rt.kind == ast.TY_INT {
-            let is_min = icmp(ir.IntEQ, v, int_min(t));
-            if not O.overflow_saturate {
+            let mut is_min = vnil();
+            if O.overflow != OVF_WRAP {
+                is_min = icmp(ir.IntEQ, v, int_min(t));
+            }
+            if O.overflow == OVF_TRAP {
                 check_or_trap(b_not(is_min), T_OVERFLOW);
             }
             let mut args: [2]*mut ir.Value = [v, ci(T_i1, 0)];
-            let mut r = intrinsic("llvm.abs", tys[..], args[..]);
-            if O.overflow_saturate {
+            let mut r = intrinsic("llvm.abs", tys[..], args[..]);  // @abs(MIN) wraps to MIN
+            if O.overflow == OVF_SATURATE {
                 r = sel(is_min, int_max(t, true), r);
             }
             return r;
@@ -2901,9 +3376,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let stt = ct(barg(e, 1).ty);
         let s = gen(barg(e, 1));
         let len = extract(s, 1);
-        let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
-        check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
-        asan_check(extract(s, 0), usz(16));
+        let vb = ty.type_size(rt);
+        check_or_trap(icmp(ir.IntUGE, len, usz(elems_for(vb, ty.type_size(stt.elem)))), T_LENGTH);
+        asan_check(extract(s, 0), usz(vb));
         return load(rt, extract(s, 0), true);
     }
     if id == ast.BI_STORE {
@@ -2912,9 +3387,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let s = gen(barg(e, 0));
         let v = gen(barg(e, 1));
         let len = extract(s, 1);
-        let bytes = b_mul(len, usz(ty.type_size(stt.elem)));
-        check_or_trap(icmp(ir.IntUGE, bytes, usz(16)), T_LENGTH);
-        asan_check(extract(s, 0), usz(16));
+        let vb = ty.type_size(vt);
+        check_or_trap(icmp(ir.IntUGE, len, usz(elems_for(vb, ty.type_size(stt.elem)))), T_LENGTH);
+        asan_check(extract(s, 0), usz(vb));
         store(vt, v, extract(s, 0), true);
         return vnil();
     }
@@ -2931,8 +3406,60 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_SWIZZLE {
         let x = gen(barg(e, 0));
         let idx = gen(barg(e, 1));
-        let mut sargs: [2]*mut ir.Value = [x, idx];
-        return ir.intr(B, ir.IN_SWIZZLE, lty(rt), sargs[..]);
+        if on_x64() and (idx.ty.elem.bits == x.ty.elem.bits) and x64.perm_ok(x.ty.elem.bits, x.ty.lanes, false) {
+            let mut pargs: [2]*mut ir.Value = [x, idx];
+            return ir.intr(B, ir.IN_PERM, x.ty, pargs[..]);
+        }
+        return swizzle_lanes(rt, x, idx);
+    }
+    if id == ast.BI_SWIZZLE2 {
+        let x = gen(barg(e, 0));
+        let y = gen(barg(e, 1));
+        let idx = gen(barg(e, 2));
+        if on_x64() and (idx.ty.elem.bits == x.ty.elem.bits) and x64.perm_ok(x.ty.elem.bits, x.ty.lanes, true) {
+            let mut pargs: [3]*mut ir.Value = [x, y, idx];
+            return ir.intr(B, ir.IN_PERM2, x.ty, pargs[..]);
+        }
+        // indices below n pick from x (in y they wrap to beyond its lanes),
+        // the others from y
+        let lo = swizzle_lanes(rt, x, idx);
+        let cn = const_lanes(idx.ty.elem, @int_cast(usize, rt.lanes), @as(u64, @bit_cast(u32, rt.lanes)));
+        let hi = swizzle_lanes(rt, y, b_sub(idx, cn));
+        return bitcast(b_or(bitcast(lo, idx.ty), bitcast(hi, idx.ty)), x.ty);
+    }
+    if id == ast.BI_LOAD_PARTIAL {
+        // the first min(len, n) lanes copied to a zeroed vector
+        let s = gen(barg(e, 1));
+        let p = extract(s, 0);
+        let len = extract(s, 1);
+        let n = usz(@as(i64, rt.lanes));
+        let k = sel(icmp(ir.IntULT, len, n), len, n);
+        if on_x64() and x64.partial_ok(@int_cast(i32, rt.elem.bits), @int_cast(i32, rt.lanes)) {
+            let mut pargs: [2]*mut ir.Value = [p, lane_mask(k)];
+            return ir.intr(B, ir.IN_LOAD_PARTIAL, lty(rt), pargs[..]);
+        }
+        let tmp = alloca_in_entry(lty(rt), "partial".ptr);
+        _ = ir.memop(B, ir.OP_MEMSET, tmp, ci(T_i8, 0), usz(ty.type_size(rt)));
+        _ = ir.memop(B, ir.OP_MEMMOVE, tmp, p, b_mul(k, usz(ty.type_size(rt.elem))));
+        return load(rt, tmp, true);
+    }
+    if id == ast.BI_STORE_PARTIAL {
+        let vt = ct(barg(e, 1).ty);
+        let s = gen(barg(e, 0));
+        let v = gen(barg(e, 1));
+        let p = extract(s, 0);
+        let len = extract(s, 1);
+        let n = usz(@as(i64, vt.lanes));
+        let k = sel(icmp(ir.IntULT, len, n), len, n);
+        if on_x64() and x64.partial_ok(@int_cast(i32, vt.elem.bits), @int_cast(i32, vt.lanes)) {
+            let mut pargs: [3]*mut ir.Value = [v, p, lane_mask(k)];
+            _ = ir.intr(B, ir.IN_STORE_PARTIAL, T_void, pargs[..]);
+            return vnil();
+        }
+        let tmp = alloca_in_entry(lty(vt), "partial".ptr);
+        store(vt, v, tmp, true);
+        _ = ir.memop(B, ir.OP_MEMMOVE, p, tmp, b_mul(k, usz(ty.type_size(vt.elem))));
+        return vnil();
     }
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let vt = ct(barg(e, 0).ty);
@@ -2971,7 +3498,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_BITMASK {
         let v = gen(barg(e, 0));
         let mut bargs: [1]*mut ir.Value = [v];
-        return ir.intr(B, ir.IN_BITMASK, T_i32, bargs[..]);
+        return ir.intr(B, ir.IN_BITMASK, lty(rt), bargs[..]);  // (u64 for 64 lanes)
     }
     if id == ast.BI_REDUCE_ADD {
         return reduce_add(ct(barg(e, 0).ty), gen(barg(e, 0)));
@@ -2985,6 +3512,58 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         }
         let mut dargs: [2]*mut ir.Value = [x, y];
         return ir.intr(B, ir.IN_DOT_I16, lty(rt), dargs[..]);
+    }
+    if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
+        // lane by lane: WebAssembly's extend_low/extend_high
+        let vt = ct(barg(e, 0).ty);
+        let v = gen(barg(e, 0));
+        let n = @as(u64, @bit_cast(u32, rt.lanes));
+        let mut base: u64 = 0;
+        if id == ast.BI_WIDEN_HIGH {
+            base = n;
+        }
+        let lt = lty(rt.elem);
+        let mut r = ir.czero(lty(rt));
+        for i in @as(u64, 0)..n {
+            let x = ext_int(ext_elem(v, ci32(base + i)), lt, vt.elem.is_signed);
+            r = ins_elem(r, x, ci32(i));
+        }
+        return r;
+    }
+    if id == ast.BI_NARROW {
+        // lane by lane, each saturated to the result's range: WebAssembly's
+        // narrow_*_sat, by the operand and result lane types
+        let vt = ct(barg(e, 1).ty);
+        let x = gen(barg(e, 1));
+        let y = gen(barg(e, 2));
+        let n = @as(u64, @bit_cast(u32, vt.lanes));
+        let wt = lty(vt.elem);
+        let lt = lty(rt.elem);
+        let bits = @as(u64, @bit_cast(u32, rt.elem.bits));
+        let mut hi: u64 = (@as(u64, 1) << bits) - 1;
+        let mut lo: u64 = 0;
+        if rt.elem.is_signed {
+            hi = (@as(u64, 1) << (bits - 1)) - 1;
+            lo = 0 -% (@as(u64, 1) << (bits - 1));
+        }
+        let mut r = ir.czero(lty(rt));
+        for i in @as(u64, 0)..(2 * n) {
+            let mut src = x;
+            let mut k = i;
+            if i >= n {
+                src = y;
+                k = i - n;
+            }
+            let mut l = ext_elem(src, ci32(k));
+            if vt.elem.is_signed {
+                l = sel(icmp(ir.IntSLT, l, ci(wt, lo)), ci(wt, lo), l);
+                l = sel(icmp(ir.IntSGT, l, ci(wt, hi)), ci(wt, hi), l);
+            } else {
+                l = sel(icmp(ir.IntUGT, l, ci(wt, hi)), ci(wt, hi), l);
+            }
+            r = ins_elem(r, trunc(l, lt), ci32(i));
+        }
+        return r;
     }
     if id == ast.BI_TRAP {
         emit_trap(T_TRAP);
@@ -3000,6 +3579,34 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         }
         return ci(T_i1, 0);
     }
+    if (id == ast.BI_TARGET_HAS) or (id == ast.BI_TARGET_ARCH) or (id == ast.BI_TARGET_OS) or (id == ast.BI_CPU_HAS) {
+        let tc = sema.target_cond(e, tg.g_features);
+        if tc >= 0 {
+            return ci(T_i1, @as(u64, @bit_cast(u32, tc)));
+        }
+        // @cpu_has of an extension the build does not assume
+        let b = tg.feature_bit(barg(e, 0).str);
+        if (b == 0) or ty.g_target.is_wasm {
+            return ci(T_i1, 0);
+        }
+        return cpu_has_bits(b);
+    }
+    if id == ast.BI_X86_CPUID {
+        let mut cargs: [2]*mut ir.Value = [gen(barg(e, 0)), gen(barg(e, 1))];
+        return ir.intr(B, ir.IN_CPUID, lty(rt), cargs[..]);
+    }
+    if id == ast.BI_X86_XGETBV {
+        let mut xargs: [1]*mut ir.Value = [gen(barg(e, 0))];
+        return ir.intr(B, ir.IN_XGETBV, T_i64, xargs[..]);
+    }
+    if (id >= ast.BI_X86_AESENC) and (id <= ast.BI_ARM_CRC32C) {
+        let n = e.bargs.len;
+        let args = u.newn.[*mut ir.Value](n + 1);
+        for k in 0..n {
+            args[k] = gen(barg(e, k));
+        }
+        return ir.intr(B, ir.IN_AESENC + (id - ast.BI_X86_AESENC), lty(rt), args[0..n]);
+    }
     if id == ast.BI_EXPECT {
         check_or_trap(gen(barg(e, 0)), T_EXPECT);
         return vnil();
@@ -3010,6 +3617,20 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     }
     if id == ast.BI_FENCE {
         ir.fence(B);
+        return vnil();
+    }
+    if (id == ast.BI_PREFETCH) or (id == ast.BI_PREFETCH_WRITE) {
+        // a hint (spec §5.7): the pointer is evaluated; WebAssembly has no
+        // prefetch
+        let p = gen(barg(e, 0));
+        if not ty.g_target.is_wasm {
+            let mut args: [1]*mut ir.Value = [p];
+            let mut k = ir.IN_PREFETCH;
+            if id == ast.BI_PREFETCH_WRITE {
+                k = ir.IN_PREFETCHW;
+            }
+            _ = ir.intr(B, k, T_void, args[..]);
+        }
         return vnil();
     }
     if (id >= ast.BI_ATOMIC_LOAD) and (id <= ast.BI_ATOMIC_NOTIFY) {
@@ -3634,6 +4255,9 @@ fn gen_unary(e: *mut ast.Expr) *mut ir.Value {
         if (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t) {
             return ir.fneg(B, v);
         }
+        if t.kind == ast.TY_VEC {
+            return ir.neg(B, v);  // integer vectors wrap in every mode
+        }
         return overflow_op(1, true, ir.czero(v.ty), v);
     }
     internal_error("bad unary");
@@ -3644,6 +4268,14 @@ fn gen_binary(e: *mut ast.Expr) *mut ir.Value {
     if (e.op == lx.KW_AND) or (e.op == lx.KW_OR) {
         let is_and = e.op == lx.KW_AND;
         let l = gen(e.a);
+        if l.kind == ir.V_CINT {
+            // a constant left operand (a target condition): the builder
+            // would fold the branch, and the right operand runs or not
+            if (l.cv != 0) == is_and {
+                return gen(e.b);
+            }
+            return l;
+        }
         let lbb = ir.insert_block(B);
         let rhs = new_bb(u.pick(is_and, "and.rhs", "or.rhs").ptr);
         let end = new_bb(u.pick(is_and, "and.end", "or.end").ptr);
@@ -3873,6 +4505,22 @@ fn gen_block(b: *mut ast.Stmt) void {
 }
 
 fn gen_if(s: *mut ast.Stmt) void {
+    // A target condition (spec §13.4): only the branch it selects is compiled.
+    let tc = sema.target_cond(s.e, tg.g_features);
+    if tc == 1 {
+        gen_block(s.body);
+        return;
+    }
+    if tc == 0 {
+        if u.notnil(s.els) {
+            if s.els.kind == ast.S_IF {
+                gen_if(s.els);
+            } else {
+                gen_block(s.els);
+            }
+        }
+        return;
+    }
     let c = gen(s.e);
     let then_bb = new_bb("if.then".ptr);
     let end = new_bb("if.end".ptr);
@@ -4190,6 +4838,25 @@ fn gen_stmt(s: *mut ast.Stmt) void {
 // Function bodies
 // ---------------------------------------------------------------------------
 fn gen_fn_body(fi: *mut FnInst) void {
+    let saved_feats = tg.g_features;
+    tg.g_features = fi.feats;  // (@target_has, and lowering that depends on extensions)
+    if fi.dispatch {
+        let saved_f = F;
+        let stt = u.new.[FnState]();
+        stt.inst = fi;
+        stt.decl = fi.decl;
+        stt.fnv = fi.fnv;
+        stt.no_trace = true;
+        F = stt;
+        gen_dispatch(fi);
+        F = saved_f;
+    } else {
+        gen_fn_body_of(fi);
+    }
+    tg.g_features = saved_feats;
+}
+
+fn gen_fn_body_of(fi: *mut FnInst) void {
     let d = fi.decl;
     let stt = u.new.[FnState]();
     stt.inst = fi;
@@ -4272,6 +4939,34 @@ fn emit_shadow_stack_export() void {
     } else {
         ir.ret(B, ir.czero(T_ptr));
     }
+}
+
+// axiom_frame_table(): the frame table's bounds {start, end}: the
+// linked program's axiom_rets sections (the linkers place them together
+// and define these symbols, as the system's linker does), or null when calls
+// record themselves on the shadow stack (see frame_tables).
+fn emit_frame_table_export() void {
+    let mut g = ir.czero(T_ptr);
+    if frame_tables() {
+        let start = ir.add_global(M, T_i8, "__start_axiom_rets").val;
+        let stop = ir.add_global(M, T_i8, "__stop_axiom_rets").val;
+        set_linkage(start, ir.LINK_EXTWEAK);
+        set_linkage(stop, ir.LINK_EXTWEAK);
+        g = ir.add_global(M, ir.t_array(T_ptr, 2), "axiom.rets").val;
+        let mut el: [2]*mut ir.Value = [start, stop];
+        set_init(g, ir.carray(T_ptr, el[..]));
+        set_linkage(g, ir.LINK_INTERNAL);
+        g.gv.is_const = true;
+        set_align(g, 8);
+    }
+    _ = add_export("axiom_frame_table", T_ptr, no_tys());
+    ir.ret(B, g);
+    // axiom_frame_address(): its own frame record, whose first word is the
+    // caller's frame address (for the runtime's walks from its own frames)
+    let f = add_export("axiom_frame_address", T_ptr, no_tys());
+    f.fnp.noinline = true;
+    let mut none: [1]*mut ir.Value = [vnil()];
+    ir.ret(B, ir.intr(B, ir.IN_FRAME_ADDR, T_ptr, none[0..0]));
 }
 
 // axiom_trap_info(): address of {site, kind, a, b, alen, blen} (64-bit
@@ -4379,9 +5074,28 @@ fn emit_native_entry() void {
     }
     let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
     let f = add_export("main", T_i32, pi[..]);
+    // Built for more than the architecture's baseline: check the processor
+    // first (std/os/cpu.ax; it and this entry are compiled for the baseline).
+    f.fnp.features = 0;
+    f.fnp.has_features = true;
     let aty = fn_type(T_void, pi[..], false);
     let mut aargs: [2]*mut ir.Value = [param(f, 0), param(f, 1)];
-    _ = call(aty, ir.add_function(M, "ax_rt_args", aty).val, aargs[..]);
+    // On macOS the check comes after ax_rt_args, which makes the thread-local
+    // block: before it, std/os/cpu's shadow stack would be written through
+    // TSD slot 0, into the thread's own structure. (Every Mac has apple-m1's
+    // extensions, what the runtime is built for.)
+    if tg.is_darwin() {
+        _ = call(aty, ir.add_function(M, "ax_rt_args", aty).val, aargs[..]);
+    }
+    if tg.g_features != 0 {
+        let req = cpu_fn("require");
+        let mut rargs: [2]*mut ir.Value = [
+            ci(T_i64, tg.g_features), const_slice(string_ptr(tg.g_cpu), @int_cast(i64, tg.g_cpu.len))];
+        _ = call(req.llty, req.fnv, rargs[..]);
+    }
+    if not tg.is_darwin() {
+        _ = call(aty, ir.add_function(M, "ax_rt_args", aty).val, aargs[..]);
+    }
     call_runtime("ax_rt_init");
     if O.profile {
         call_runtime("ax_profile_start");
@@ -4421,9 +5135,11 @@ pub fn default_triple() []u8 {
 // through diag or printed to stderr).
 pub fn codegen_program(o: *mut CgOptions) bool {
     O = o;
+    g_build_features = tg.g_features;
     let P = sema.g_prog;
     ir.init_types(@int_cast(u64, ty.g_target.ptr_bits / 8));
     M = ir.new_module(u.file_of(P.root.file.id).display);
+    M.frame_tables = frame_tables();
     B = ir.new_builder();
     T_i1 = ir.t_int(1);
     T_i8 = ir.t_int(8);
@@ -4507,6 +5223,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         }
         emit_shadow_stack_export();
         if not ty.g_target.is_wasm {
+            emit_frame_table_export();
             emit_native_entry();
         } else if O.sanitize_address and not g_test_mode {
             emit_asan_main_wasm();

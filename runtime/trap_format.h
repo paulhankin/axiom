@@ -32,6 +32,7 @@ static const char *const ax_trap_names[] = {
     "trap", "index out of bounds", "integer overflow", "division by zero", "int_cast out of range",
     "memory access out of bounds", "length precondition failed", "invalid union tag or enum value", "stack exhausted",
     "invalid function pointer", "misaligned atomic access", "expectation failed", "memory error",
+    "processor lacks a required extension",
 };
 
 static inline void ax_format_value(char *out, size_t cap, uint64_t kind, uint64_t v, uint64_t len) {

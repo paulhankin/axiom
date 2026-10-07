@@ -1,0 +1,236 @@
+// Stores of neighbouring elements as vector stores (issue 0096): lanes that
+// are the same operation become one vector operation, other values are put
+// together; compares of one value against constants with different
+// predicates are one compare of each lane's interval. The results must be
+// those of the scalar stores, whatever the inputs (and with the arrays
+// overlapping).
+import "../lib/io.ax" as io;
+
+fn sel[T](c: bool, a: T, b: T) T {
+    let mut r = b;
+    if c {
+        r = a;
+    }
+    return r;
+}
+
+// the benchmark's race inputs: four lanes of a point, then flags of a count
+fn race(b: *[25]u8, out: *mut [120]f32) void {
+    let mut men_off: u8 = 15;
+    for i in @as(usize, 0)..23 {
+        let nc = b[i];
+        men_off -= @min(nc, men_off);
+        let mut one: f32 = 0.0;
+        let mut two: f32 = 0.0;
+        let mut three: f32 = 0.0;
+        let mut more: f32 = 0.0;
+        if nc == 1 {
+            one = 1.0;
+        }
+        if nc == 2 {
+            two = 1.0;
+        }
+        if nc >= 3 {
+            three = 1.0;
+        }
+        if nc > 3 {
+            more = @float_from_int(f32, nc - 3) / 2.0;
+        }
+        out[i * 4] = one;
+        out[(i * 4) + 1] = two;
+        out[(i * 4) + 2] = three;
+        out[(i * 4) + 3] = more;
+    }
+    for k in @as(usize, 0)..14 {
+        let mut flag: f32 = 0.0;
+        if @as(usize, men_off) == (k + 1) {
+            flag = 1.0;
+        }
+        out[92 + k] = flag;
+    }
+}
+
+// signed predicates (and equalities) of one value
+fn signed_lanes(x: i8, out: *mut [8]f32) void {
+    out[0] = sel.[f32](x < -1, 1.0, 0.0);
+    out[1] = sel.[f32](x >= 0, 2.0, 0.0);
+    out[2] = sel.[f32](x == 5, 3.0, 0.0);
+    out[3] = sel.[f32](x > 3, 4.0, 0.0);
+    out[4] = sel.[f32](x <= -128, 5.0, 0.0);
+    out[5] = sel.[f32](x != 127, 6.0, 0.0);
+    out[6] = sel.[f32](x != -128, 7.0, 0.0);
+    out[7] = sel.[f32](x > -3, 8.0, 0.0);
+}
+
+// signed and unsigned predicates mixed (stays scalar), and inequalities
+fn mixed_lanes(x: i32, out: *mut [4]i32) void {
+    out[0] = sel.[i32](x < 3, 1, 0);
+    out[1] = sel.[i32](@bit_cast(u32, x) > 7, 1, 0);
+    out[2] = sel.[i32](x != 4, 1, 0);
+    out[3] = sel.[i32](x == 2, 1, 0);
+}
+
+// unsigned intervals, with both sides of the selects not zero
+fn blend_lanes(x: u16, a: i32, out: *mut [8]i32) void {
+    out[0] = sel.[i32](x == 0, a, 7);
+    out[1] = sel.[i32](x < 10, 1, a);
+    out[2] = sel.[i32](x > 65534, a, -1);
+    out[3] = sel.[i32](x != 0, a, 3);
+    out[4] = sel.[i32](x >= 100, a, 4);
+    out[5] = sel.[i32](x <= 1000, 5, a);
+    out[6] = sel.[i32](x != 65535, a, 6);
+    out[7] = sel.[i32](x == 7, a, 8);
+}
+
+// two lanes (eight bytes), and halfwords
+fn small(x: u32, o2: *mut [2]f32, o4: *mut [4]u16) void {
+    o2[0] = sel.[f32](x == 1, 1.5, 0.0);
+    o2[1] = sel.[f32](x == 2, 2.5, 0.0);
+    o4[0] = sel.[u16](x > 1, 9, 0);
+    o4[1] = sel.[u16](x > 2, 9, 0);
+    o4[2] = sel.[u16](x > 3, 9, 0);
+    o4[3] = sel.[u16](x > 4, 9, 0);
+}
+
+// lanes from neighbouring loads, read before any store, or between them
+fn loads(a: *[8]i32, o: *mut [8]i32) void {
+    let x0 = a[0];
+    let x1 = a[1];
+    let x2 = a[2];
+    let x3 = a[3];
+    o[0] = x0 + 1;
+    o[1] = x1 + 2;
+    o[2] = x2 + 3;
+    o[3] = x3 + 4;
+}
+
+fn loads_between(a: *[8]i32, o: *mut [8]i32) void {
+    o[0] = a[0] * 3;
+    o[1] = a[1] * 3;
+    o[2] = a[2] * 3;
+    o[3] = a[3] * 3;
+}
+
+// float compares of loaded lanes, and conversions
+fn fcmps(x: *[4]f32, y: *[4]f32, n: *[4]i32, o: *mut [4]f32) void {
+    let a0 = x[0];
+    let a1 = x[1];
+    let a2 = x[2];
+    let a3 = x[3];
+    let b0 = y[0];
+    let b1 = y[1];
+    let b2 = y[2];
+    let b3 = y[3];
+    let c0 = @float_from_int(f32, n[0]);
+    let c1 = @float_from_int(f32, n[1]);
+    let c2 = @float_from_int(f32, n[2]);
+    let c3 = @float_from_int(f32, n[3]);
+    o[0] = sel.[f32](a0 < b0, c0, 0.0);
+    o[1] = sel.[f32](a1 < b1, c1, 0.0);
+    o[2] = sel.[f32](a2 < b2, c2, 0.0);
+    o[3] = sel.[f32](a3 < b3, c3, 0.0);
+}
+
+// bytes and quadwords
+fn bytes(x: u8, o: *mut [16]u8) void {
+    for k in @as(usize, 0)..16 {
+        o[k] = sel.[u8](x == @truncate(u8, k), 1, 0);
+    }
+}
+
+fn quads(x: u64, o: *mut [4]u64) void {
+    o[0] = sel.[u64](x == 1, 11, 0);
+    o[1] = sel.[u64](x == 2, 12, 0);
+    o[2] = sel.[u64](x == 3, 13, 0);
+    o[3] = sel.[u64](x == 4, 14, 0);
+}
+
+// The bytes at p (n of them): loads narrower than the stores, which store
+// forwarding does not take from them, so the stores' values are dead after.
+fn hash_bytes(h0: u64, p: *u8, n: usize) u64 {
+    let bs = @slice_from_ptr(p, n);
+    let mut h = h0;
+    for k in 0..n {
+        h = (h *% 131) +% @as(u64, bs[k]);
+    }
+    return h;
+}
+
+// (globals: stores to them stay stores once the functions are inlined)
+let mut B: [25]u8 = [0; 25];
+let mut OUT: [120]f32 = [0.0; 120];
+let mut O8: [8]f32 = [0.0; 8];
+let mut O4: [4]i32 = [0; 4];
+let mut I8S: [8]i32 = [0; 8];
+let mut F2: [2]f32 = [0.0; 2];
+let mut S4: [4]u16 = [0; 4];
+let mut A: [9]i32 = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+let mut O: [8]i32 = [0; 8];
+let mut C: [9]i32 = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+let mut X: [4]f32 = [1.0, 5.0, -2.0, 0.5];
+let mut Y: [4]f32 = [2.0, 4.0, -1.0, 0.5];
+let mut N: [4]i32 = [-3, 7, 100000, 9];
+let mut OF: [4]f32 = [9.0; 4];
+let mut OB: [16]u8 = [0; 16];
+let mut OQ: [4]u64 = [0; 4];
+// (inputs read from memory: the loops over them may be unrolled)
+let mut XS: [10]u16 = [0, 1, 6, 7, 9, 10, 100, 1000, 65534, 65535];
+let mut VS: [20]u32 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+
+export fn run() void {
+    let mut r: u32 = 12345;
+    let mut h: u64 = 0;
+    for _it in @as(usize, 0)..300 {
+        for k in @as(usize, 0)..25 {
+            r = (r *% 1103515245) +% 12345;
+            B[k] = @truncate(u8, (r >> 16) % 7);
+        }
+        race(&B, &mut OUT);
+        h = hash_bytes(h, @ptr_cast(*u8, &OUT), 424);
+    }
+    io.uint(h);  // expect: 2873144196862153197
+    let mut h2: u64 = 0;
+    for v in @as(i32, -128)..128 {
+        signed_lanes(@truncate(i8, v), &mut O8);
+        h2 = hash_bytes(h2, @ptr_cast(*u8, &O8), 32);
+    }
+    io.uint(h2);  // expect: 11927556539423811891
+    let mut h3: u64 = 0;
+    for v in @as(i32, -10)..20 {
+        mixed_lanes(v, &mut O4);
+        h3 = hash_bytes(h3, @ptr_cast(*u8, &O4), 16);
+    }
+    for k in @as(usize, 0)..10 {
+        blend_lanes(XS[k], @as(i32, @int_cast(i32, k)) * 100, &mut I8S);
+        h3 = hash_bytes(h3, @ptr_cast(*u8, &I8S), 32);
+    }
+    io.uint(h3);  // expect: 10401739260769158596
+    let mut h4: u64 = 0;
+    for i in @as(usize, 0)..6 {
+        small(VS[i], &mut F2, &mut S4);
+        h4 = hash_bytes(h4, @ptr_cast(*u8, &F2), 8);
+        h4 = hash_bytes(h4, @ptr_cast(*u8, &S4), 8);
+    }
+    io.uint(h4);  // expect: 8319245382347861981
+    // loads, the output apart from the input and one element on
+    loads(@ptr_cast(*[8]i32, &A), &mut O);
+    io.uint(hash_bytes(0, @ptr_cast(*u8, &O), 16));  // expect: 9941429545708994268
+    let p = @ptr_cast(*mut [8]i32, &mut A[1]);
+    loads(@ptr_cast(*[8]i32, &A), p);
+    io.uint(hash_bytes(0, @ptr_cast(*u8, &A), 20));  // expect: 6608105997920233527
+    loads_between(@ptr_cast(*[8]i32, &C), @ptr_cast(*mut [8]i32, &mut C[1]));
+    io.uint(hash_bytes(0, @ptr_cast(*u8, &C), 20));  // expect: 15952445167079879587
+    fcmps(&X, &Y, &N, &mut OF);
+    io.float(@as(f64, OF[0]));  // expect: -3
+    io.float(@as(f64, OF[1]));  // expect: 0
+    io.float(@as(f64, OF[2]));  // expect: 100000
+    io.float(@as(f64, OF[3]));  // expect: 0
+    let mut h5: u64 = 0;
+    for j in @as(usize, 0)..20 {
+        bytes(@truncate(u8, VS[j]), &mut OB);
+        quads(@as(u64, VS[j]), &mut OQ);
+        h5 = hash_bytes(h5, @ptr_cast(*u8, &OB), 16);
+        h5 = hash_bytes(h5, @ptr_cast(*u8, &OQ), 32);
+    }
+    io.uint(h5);  // expect: 12301306364964703238
+}

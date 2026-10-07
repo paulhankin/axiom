@@ -166,6 +166,29 @@ let SOCKET_FNS: [22][]u8 = ["accept", "bind", "closesocket", "connect", "freeadd
                             "getpeername", "getsockname", "getsockopt", "htonl", "htons", "inet_ntop", "inet_pton",
                             "ioctlsocket", "listen", "recv", "recvfrom", "select", "send", "sendto", "setsockopt"];
 
+// Functions of another system's libraries (macOS frameworks and dylibs):
+// they are the runtime's ax_unavailable, which says so if it is ever called,
+// so that a program can support several systems and choose at run time.
+let mut foreign: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                   cap: 0, len: 0 };
+
+let APPLE_LIBS: [24][]u8 = ["AVFAudio", "AppKit", "ApplicationServices", "AudioToolbox", "AudioUnit", "CoreAudio",
+                            "CoreFoundation", "CoreGraphics", "CoreHaptics", "CoreServices", "CoreText", "CoreVideo",
+                            "Foundation", "GameController", "IOKit", "ImageIO", "Metal", "MetalKit", "QuartzCore",
+                            "Security", "System", "UniformTypeIdentifiers", "objc", "Carbon"];
+
+fn is_apple_lib(name: []u8) bool {
+    if u.ends(name, ".dylib") or u.ends(name, ".framework") or (u.find(name, '/') >= 0) {
+        return true;
+    }
+    for d in APPLE_LIBS {
+        if u.str_eq(d, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The DLLs that extern blocks named (the axiom.import.* constants).
 fn collect_dll_names() void {
     for oi in 0..objs.len {
@@ -180,6 +203,10 @@ fn collect_dll_names() void {
             let start = e;
             while (e < d.len) and (d[e] != 0) {
                 e += 1;
+            }
+            if is_apple_lib(d[start..e]) {
+                foreign.put(u.intern(s.name[13..]), 1);
+                continue;
             }
             let mut dll = u.dup(d[start..e]);
             if u.find(dll, '.') < 0 {
@@ -262,6 +289,19 @@ fn collect_symbols() void {
                     err(u.f1("duplicate symbol '%s'", s.name));
                 }
             }
+        }
+    }
+    let un = gsym_index("ax_unavailable");
+    for gi in 0..gsyms.len {
+        let g = gsyms.at(gi);
+        if (g.obj < 0) and (foreign.get(u.intern(g.name)) != 0) {
+            let target = gsyms.get(@as(usize, un));
+            if target.obj < 0 {
+                err(u.f1("'%s' is from another system's library, and there is no ax_unavailable", g.name));
+            }
+            g.obj = target.obj;
+            g.sym = target.sym;
+            g.weak = false;
         }
     }
     // What is still undefined must be a Windows function, never one of our
@@ -381,16 +421,26 @@ fn scan_relocs() void {
 // -----------------------------------------------------------------------------
 fn place(cls: i32, at: u64) u64 {
     let mut cur = at;
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            if sec_cls.get(oi)[k] != cls {
-                continue;
+    // read-only data, then the frame tables together (elf.rets_rank)
+    let mut passes: i32 = 1;
+    if cls == C_CONST {
+        passes = 4;
+    }
+    for pass in 0..passes {
+        for oi in 0..objs.len {
+            let o = objs.get(oi);
+            for k in 0..o.secs.len {
+                if sec_cls.get(oi)[k] != cls {
+                    continue;
+                }
+                let s = o.secs.get(k);
+                if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
+                    continue;
+                }
+                cur = align_up(cur, s.align);
+                sec_addr.get(oi)[k] = cur;
+                cur += elf.sec_size(s);
             }
-            let s = o.secs.get(k);
-            cur = align_up(cur, s.align);
-            sec_addr.get(oi)[k] = cur;
-            cur += elf.sec_size(s);
         }
     }
     return cur;
@@ -727,6 +777,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         objs.push(inputs[i]);
     }
     objs.push(own_object());
+    objs.push(elf.rets_bounds(elf.EM_X86_64));
     collect_dll_names();
     collect_symbols();
     if gsyms.at(@as(usize, gsym_index("main"))).obj < 0 {

@@ -18,12 +18,13 @@
 // Alias analysis: a pointer is a base plus a constant offset; the object
 // under a chain of ptradds is identified when it is an alloca or a global.
 // Distinct identified objects never alias, an alloca whose address never
-// escapes is not written by calls, and no computed pointer reaches a noalias
-// global (the shadow stack).
+// escapes is not written by calls, no computed pointer reaches a noalias
+// global (the shadow stack), and nothing writes a constant global.
 // =============================================================================
 import "combine.ax" as cb;
 import "ir.ax" as ir;
 import "opt.ax" as opt;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 fn vnil() *mut ir.Value {
@@ -34,6 +35,9 @@ const K_EXPR: i32 = 0;   // key: an instruction (representative), val: its value
 const K_MEM: i32 = 1;    // key: base pointer, off, ty; val: the value in memory
 const K_KNOWN: i32 = 2;  // key: a value, val: the constant it equals
 const K_LE: i32 = 3;     // key <= val + off (unsigned, as natural numbers; val nil: 0)
+const K_FILL: i32 = 4;   // key: base pointer, off; val: a memset of constant bytes there
+const K_COPY: i32 = 5;   // key: base pointer, off: of the destination of val, a memcpy or memmove
+const K_GE: i32 = 6;     // key >= off (unsigned, off a small constant)
 
 struct Ent {
     kind: i32,
@@ -376,6 +380,9 @@ fn overlap(a: i64, an: i64, b: i64, bn: i64) bool {
 }
 
 fn may_alias(x: *Loc, w: *Write) bool {
+    if u.notnil(x.obj) and (x.obj.kind == ir.V_GLOBAL) and x.obj.gv.is_const and not x.obj.gv.tls {
+        return false;  // (constant data: nothing writes it)
+    }
     if w.kind == W_ALL {
         return true;
     }
@@ -391,6 +398,12 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if u.notnil(x.obj) and u.notnil(w.obj) and (x.obj != w.obj) {
         return false;
     }
+    // a pointer the function was given cannot point into its own stack
+    // slots (they did not exist yet)
+    if (u.notnil(x.obj) and is_inst(x.obj, ir.OP_ALLOCA) and from_param(w.base)) or
+       (u.notnil(w.obj) and is_inst(w.obj, ir.OP_ALLOCA) and from_param(x.base)) {
+        return false;
+    }
     if (private_obj(x.obj) and (w.obj != x.obj)) or (private_obj(w.obj) and (x.obj != w.obj)) {
         return false;
     }
@@ -398,6 +411,17 @@ fn may_alias(x: *Loc, w: *Write) bool {
         return false;
     }
     return true;
+}
+
+// Is p a parameter, or computed from one by offsets?
+fn from_param(p0: *ir.Value) bool {
+    let mut p = p0;
+    let mut n: i32 = 0;
+    while u.notnil(p) and is_inst(p, ir.OP_PTRADD) and (n < 16) {
+        p = p.a;
+        n += 1;
+    }
+    return u.notnil(p) and (p.kind == ir.V_PARAM);
 }
 
 fn push_write(kind: i32, l: Loc) void {
@@ -490,7 +514,26 @@ fn leak(v: *mut ir.Value) void {
 // -----------------------------------------------------------------------------
 fn pure_intr(id: i32) bool {
     return (id != ir.IN_TRAP) and (id != ir.IN_MEMGROW) and (id != ir.IN_WAIT32) and (id != ir.IN_NOTIFY) and
-           (id != ir.IN_SET_SP) and (id != ir.IN_GET_SP) and (id != ir.IN_MEMSIZE);
+           (id != ir.IN_SET_SP) and (id != ir.IN_GET_SP) and (id != ir.IN_FRAME_ADDR) and (id != ir.IN_MEMSIZE) and
+           (id != ir.IN_CPUID) and (id != ir.IN_XGETBV) and (id != ir.IN_LOAD_PARTIAL) and
+           (id != ir.IN_STORE_PARTIAL) and not ir.is_prefetch(id);
+}
+
+// x86-64's masked vector loads and stores (codegen.ax makes them for
+// @load_partial and @store_partial): memory accesses at their pointer, of at
+// most the vector's size.
+fn intr_id(i: *ir.Value) i32 {
+    if i.op != ir.OP_INTR {
+        return 0;
+    }
+    return @truncate(i32, @bit_cast(i64, i.cv));
+}
+
+fn partial_loc(i: *ir.Value) Loc {
+    if intr_id(i) == ir.IN_LOAD_PARTIAL {
+        return loc_of(i.xs.get(0), @bit_cast(i64, i.ty.size));
+    }
+    return loc_of(i.xs.get(1), @bit_cast(i64, i.xs.get(0).ty.size));
 }
 
 fn cse_able(i: *ir.Value) bool {
@@ -534,7 +577,10 @@ fn note_writes(i: *mut ir.Value) void {
         push_write(W_ALL, nowhere());
     } else if (op == ir.OP_LOAD) and (i.flags != 0) {
         push_write(W_ALL, nowhere());
-    } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
+    } else if intr_id(i) == ir.IN_STORE_PARTIAL {
+        push_write(W_LOC, partial_loc(i));
+    } else if (op == ir.OP_INTR) and not pure_intr(intr_id(i)) and (intr_id(i) != ir.IN_LOAD_PARTIAL) and
+              not ir.is_prefetch(intr_id(i)) {
         push_write(W_ALL, nowhere());
     }
 }
@@ -564,6 +610,240 @@ fn find_mem(l: *Loc, t: *mut ir.Ty) *mut ir.Value {
 
 fn add_mem(l: *Loc, t: *mut ir.Ty, v: *mut ir.Value) void {
     push_ent(K_MEM, mem_hash(l.base, l.off, t), l.base, l.off, t, v);
+}
+
+fn fill_hash(base: *ir.Value) u64 {
+    return mix(hp(base), 0x46494c4c);
+}
+
+// The byte (a constant) a memset filled the whole of l with, when nothing
+// that may write l came since; else nil.
+fn find_fill(l: *Loc) *mut ir.Value {
+    let mut e = bk.get(@truncate(usize, fill_hash(l.base)) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at(@int_cast(usize, e));
+        if (x.kind == K_FILL) and (x.key == l.base) and (x.off <= l.off) and
+           ((l.off + l.size) <= (x.off + size_of(x.val.c))) {
+            if (writes.len - x.height) > 256 {
+                return vnil();
+            }
+            for w in x.height..writes.len {
+                if may_alias(l, writes.at(w)) {
+                    return vnil();
+                }
+            }
+            return x.val.b;
+        }
+        e = x.next;
+    }
+    return vnil();
+}
+
+// A vector load whose lanes are known, each stored as a scalar or filled
+// by a memset since (an array of floats written element by element and
+// read as one vector): the vector built from them, else nil.
+fn compose_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let t = i.ty;
+    let et = t.elem;
+    if (t.kind != ir.T_VEC) or ((et.kind != ir.T_INT) and (et.kind != ir.T_FLOAT)) or (t.lanes > 16) or (l.size < 0) {
+        return vnil();
+    }
+    let n = @int_cast(usize, t.lanes);
+    let es = @bit_cast(i64, et.size);
+    let vals = u.newn.[*mut ir.Value](n);
+    let mut nset: usize = 0;
+    let mut fill = vnil();
+    for j in 0..n {
+        let mut lj = l.*;
+        lj.off = l.off + (@int_cast(i64, j) * es);
+        lj.size = es;
+        lj.rlo = l.rlo + (@int_cast(i64, j) * es);
+        lj.rhi = l.rhi + (@int_cast(i64, j) * es);
+        let v = find_mem(&lj, et);
+        if u.notnil(v) {
+            vals[j] = v;
+            nset += 1;
+            continue;
+        }
+        let b = find_fill(&lj);
+        if u.isnil(b) or not ir.is_cint(b) or ((ir.cint_val(b) & 0xff) != 0) {
+            return vnil();  // (zero fills only: a float of other bytes is not built here)
+        }
+        fill = b;
+    }
+    if (nset == 0) or (nset > 8) or u.isnil(fill) {
+        return vnil();  // (all from stores: not built from parts here)
+    }
+    ir.at_before(B, i);
+    let mut v = ir.splat(B, t, ir.czero(et));
+    for j in 0..n {
+        if u.notnil(vals[j]) {
+            v = ir.insert_elem(B, v, vals[j], @as(u64, j));
+        }
+    }
+    changed = true;
+    return v;
+}
+
+// A vector load of what is known at l as a vector of other lanes of the same
+// size (the bytes of a board loaded to compare them and again as 64-bit
+// words to add them up), or a scalar load of what is known there as an
+// integer or float of its size: that, bitcast; or nil.
+fn punned_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let size = i.ty.size;
+    if i.ty.kind != ir.T_VEC {
+        // a float's bits loaded as an integer before, or the reverse
+        if (i.ty.bits != 32) and (i.ty.bits != 64) {
+            return vnil();
+        }
+        let mut o = ir.t_float(i.ty.bits);
+        if i.ty.kind == ir.T_FLOAT {
+            o = ir.t_int(i.ty.bits);
+        }
+        let x = find_mem(l, o);
+        if u.isnil(x) {
+            return vnil();
+        }
+        if u.isnil(B) {
+            B = ir.new_builder();
+        }
+        ir.at_before(B, i);
+        return ir.bitcast(B, x, i.ty);
+    }
+    for k in @as(i32, 0)..6 {
+        let mut lane = ir.t_float(64);
+        if k < 4 {
+            lane = ir.t_int(@as(i32, 8) << @as(u32, @bit_cast(u32, k)));
+        } else if k == 4 {
+            lane = ir.t_float(32);
+        }
+        if (lane.size > size) or ((size % lane.size) != 0) {
+            continue;
+        }
+        let t = ir.t_vec(lane, @truncate(u32, size / lane.size));
+        if t == i.ty {
+            continue;
+        }
+        let x = find_mem(l, t);
+        if u.notnil(x) {
+            if u.isnil(B) {
+                B = ir.new_builder();
+            }
+            ir.at_before(B, i);
+            return ir.bitcast(B, x, i.ty);
+        }
+    }
+    return vnil();
+}
+
+// -----------------------------------------------------------------------------
+// Loads of what a memcpy (or memmove) of a constant size put in memory read
+// its source instead, when nothing has written either since: a buffer that is
+// zeroed, filled from elsewhere and loaded as vectors (the benchmark's padded board)
+// otherwise goes through the stack, its loads straddling the copy's stores
+// (which the processor cannot forward). A load that ends in a zeroed tail
+// (memset 0) past the copied bytes is the copy's last bytes, shifted down
+// with zeros (a byte shift).
+// -----------------------------------------------------------------------------
+fn copy_hash(base: *ir.Value) u64 {
+    return mix(hp(base), 0x434f_5059);
+}
+
+fn note_copy(i: *mut ir.Value) void {
+    let n = size_of(i.c);
+    if (n <= 0) or (i.flags != 0) {
+        return;
+    }
+    let l = loc_of(i.a, n);
+    push_ent(K_COPY, copy_hash(l.base), l.base, l.off, i.ty, i);
+}
+
+// Has nothing written l since the write list was h long?
+fn quiet_since(h: usize, l: *Loc) bool {
+    if (writes.len - h) > 256 {
+        return false;
+    }
+    for w in h..writes.len {
+        if may_alias(l, writes.at(w)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sub_loc(l: *Loc, off: i64, size: i64) Loc {
+    return Loc.{ base: l.base, obj: l.obj, off: l.off + off, size: size, rok: l.rok, rlo: l.rlo + off,
+                 rhi: l.rhi + off };
+}
+
+// The value of load i (at l) from its copy's source, or nil.
+fn forward_copy(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let t = i.ty;
+    let size = l.size;
+    if (size <= 0) or ((t.kind != ir.T_INT) and (t.kind != ir.T_FLOAT) and (t.kind != ir.T_VEC)) {
+        return vnil();
+    }
+    let mut e = bk.get(@truncate(usize, copy_hash(l.base)) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at(@int_cast(usize, e));
+        e = x.next;
+        if (x.kind != K_COPY) or (x.key != l.base) {
+            continue;
+        }
+        let c = x.val;
+        let n = size_of(c.c);
+        let end = x.off + n;
+        if (l.off < x.off) or (l.off >= end) or (n < size) {
+            continue;
+        }
+        let head = @min(l.off + size, end) - l.off;  // bytes from the copy
+        let hl = sub_loc(l, 0, head);
+        if not quiet_since(x.height, &hl) {
+            return vnil();
+        }
+        // the source bytes the load reads: [from, from + size)
+        let mut from = l.off - x.off;
+        let tail = size - head;
+        if tail > 0 {
+            from = n - size;
+            if (t.kind != ir.T_VEC) or ((tail % @bit_cast(i64, t.elem.size)) != 0) or
+               not zero_since(sub_loc(l, head, tail)) {
+                return vnil();
+            }
+        }
+        let src = loc_of(c.b, n);
+        let sl = sub_loc(&src, from, size);
+        let dw = Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: x.off, size: n, rok: false, rlo: 0, rhi: 0 };
+        if may_alias(&sl, &dw) or not quiet_since(x.height, &sl) {
+            return vnil();
+        }
+        let bld = ir.new_builder();
+        ir.at_before(bld, i);
+        let ld = ir.load(bld, t, ir.ptradd(bld, c.b, ir.cint(ir.isz(), @bit_cast(u64, from))));
+        ld.align = 1;
+        if tail == 0 {
+            return ld;
+        }
+        // lanes from the copy's last bytes, then zeros
+        let lanes = @int_cast(i32, t.lanes);
+        let sh = @int_cast(i32, tail / @bit_cast(i64, t.elem.size));
+        let mask = u.newn.[i32](@int_cast(usize, lanes) + 1)[0..@int_cast(usize, lanes)];
+        for k in @as(i32, 0)..lanes {
+            if (k + sh) < lanes {
+                mask[@int_cast(usize, k)] = k + sh;
+            } else {
+                mask[@int_cast(usize, k)] = lanes;
+            }
+        }
+        return ir.shuffle(bld, ld, ir.czero(t), mask);
+    }
+    return vnil();
+}
+
+// Is l zero, set by a memset of 0 with nothing written there since?
+fn zero_since(l: Loc) bool {
+    let b = find_fill(&l);
+    return u.notnil(b) and ir.is_cint(b) and ((ir.cint_val(b) & 0xff) == 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -617,9 +897,26 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
         add_expr(synth_icmp(cb.inv_pred(tp), c.a, c.b), kbool(false));
         add_expr(synth_icmp(cb.swap_pred(tp), c.b, c.a), kbool(true));
         add_expr(synth_icmp(cb.inv_pred(cb.swap_pred(tp)), c.b, c.a), kbool(false));
+        // x > K is x >= K + 1, x >= K is x > K - 1, and so on
+        if cb.is_k(c.b) and not ir.is_const(c.a) {
+            assume_adjacent(tp, c.a, c.b);
+        }
         // x == K: x is K
         if (tp == ir.IntEQ) and ir.is_const(c.b) and not ir.is_const(c.a) {
             add_known(c.a, c.b);
+        }
+        // x == y: the later of them is the earlier (the lengths of slices
+        // known to be equal: then their bounds checks are the same)
+        if (tp == ir.IntEQ) and not ir.is_const(c.a) and not ir.is_const(c.b) and (c.a != c.b) {
+            let ra = def_rank(c.a);
+            let rb = def_rank(c.b);
+            if (ra != NO_RANK) and (rb != NO_RANK) {
+                if ra < rb {
+                    add_known(c.b, c.a);
+                } else if rb < ra {
+                    add_known(c.a, c.b);
+                }
+            }
         }
         return;
     }
@@ -632,6 +929,57 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     } else if (c.op == ir.OP_XOR) and (c.ty.bits == 1) and cb.is_k(c.b) {
         assume(c.a, val != (ir.cint_val(c.b) != 0), depth + 1);
     }
+}
+
+// The fact x tp k as the same comparison with the neighbouring constant:
+// x > k as x >= k + 1, x >= k as x > k - 1, x < k as x <= k - 1, x <= k as
+// x < k + 1 (signed or unsigned), where k +- 1 does not wrap.
+fn assume_adjacent(tp: i32, x: *mut ir.Value, k: *mut ir.Value) void {
+    let t = k.ty;
+    let bits = t.bits;
+    if (t.kind != ir.T_INT) or (bits > 64) {
+        return;
+    }
+    let all = ir.mask_bits(bits);
+    let kc = ir.cint_val(k) & all;
+    let smax = all >> 1;
+    let smin = smax + 1;
+    let mut np: i32 = -1;
+    let mut nk: u64 = 0;
+    if ((tp == ir.IntSGT) and (kc != smax)) or ((tp == ir.IntUGT) and (kc != all)) {
+        np = tp + 1;  // ge
+        nk = (kc + 1) & all;
+    } else if ((tp == ir.IntSGE) and (kc != smin)) or ((tp == ir.IntUGE) and (kc != 0)) {
+        np = tp - 1;  // gt
+        nk = (kc -% 1) & all;
+    } else if ((tp == ir.IntSLT) and (kc != smin)) or ((tp == ir.IntULT) and (kc != 0)) {
+        np = tp + 1;  // le
+        nk = (kc -% 1) & all;
+    } else if ((tp == ir.IntSLE) and (kc != smax)) or ((tp == ir.IntULE) and (kc != all)) {
+        np = tp - 1;  // lt
+        nk = (kc + 1) & all;
+    }
+    if np < 0 {
+        return;
+    }
+    let c = ir.cint(t, nk);
+    add_expr(synth_icmp(np, x, c), kbool(true));
+    add_expr(synth_icmp(cb.inv_pred(np), x, c), kbool(false));
+}
+
+const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
+
+// An order of values for replacing one by another known equal: parameters
+// first, then instructions by number (the replacement is never replaced
+// back, whichever comparison says they are equal).
+fn def_rank(v: *ir.Value) i64 {
+    if v.kind == ir.V_PARAM {
+        return @bit_cast(i64, v.cv) - 0x1_0000_0000;
+    }
+    if v.kind == ir.V_INST {
+        return @as(i64, v.id);
+    }
+    return NO_RANK;
 }
 
 // -----------------------------------------------------------------------------
@@ -652,12 +1000,144 @@ fn add_le(x: *mut ir.Value, y: *mut ir.Value, c: i64) void {
     push_ent(K_LE, le_hash(x), x, c, x.ty, y);
 }
 
+fn ge_hash(v: *ir.Value) u64 {
+    return mix(hp(v), 0x4745);
+}
+
+// x >= c (unsigned): a lower bound, which decides x >= c' for c' <= c
+fn add_ge(x: *mut ir.Value, c: i64) void {
+    if ir.is_const(x) or (c <= 0) {
+        return;
+    }
+    push_ent(K_GE, ge_hash(x), x, c, x.ty, vnil());
+}
+
 fn small_k(v: *ir.Value) bool {
     return cb.is_k(v) and (v.ty.kind == ir.T_INT) and (ir.cint_val(v) < 0x4000_0000_0000_0000);
 }
 
 fn kv(v: *ir.Value) i64 {
     return @bit_cast(i64, ir.cint_val(v));
+}
+
+// x - lo < n (a range check, as x + -lo): x is in [lo, lo + n - 1] when
+// that does not wrap.
+fn assume_range(a: *mut ir.Value, n: u64) void {
+    if not is_inst(a, ir.OP_ADD) and not is_inst(a, ir.OP_SUB) {
+        return;
+    }
+    let x = ir.resolve(a.a);
+    let k = ir.resolve(a.b);
+    if not cb.is_k(k) or ir.is_const(x) {
+        return;
+    }
+    let m = ir.mask_bits(x.ty.bits);
+    let mut lo = ir.cint_val(k);
+    if a.op == ir.OP_ADD {
+        lo = (0 -% lo) & m;
+    }
+    if (lo == 0) or (lo > (m - (n - 1))) or ((lo + (n - 1)) >= 0x4000_0000_0000_0000) {
+        return;
+    }
+    add_le(x, vnil(), @bit_cast(i64, lo + (n - 1)));
+    add_ge(x, @bit_cast(i64, lo));
+    add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), kbool(true));
+    add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), kbool(true));
+}
+
+// a <= b + c with a = x + k (k a small constant, the sum not wrapping):
+// x <= b + c - k, a fact about x itself (a block of k elements from x
+// tested against a length: x is within it too, and so is x + j for j <= k).
+let mut sum_le_busy: bool = false;
+
+fn assume_sum_le(a: *mut ir.Value, b: *mut ir.Value, c: i64) void {
+    if not is_inst(a, ir.OP_ADD) or not small_k(a.b) or ir.is_const(a.a) or (a.ty.bits > 64) {
+        return;
+    }
+    let k = kv(a.b);
+    if (k < 1) or (k >= 0x1_0000_0000) {
+        return;
+    }
+    if sum_le_busy {
+        return;  // (ub follows phis, assuming their edges' conditions)
+    }
+    sum_le_busy = true;
+    let saved = prove_budget;
+    prove_budget = 64;
+    let m = ub(a.a, 0);
+    prove_budget = 64;
+    // (below_max answers for 64-bit values only)
+    let ok = ((m >= 0) and fits_type(m + k, a.ty)) or ((a.ty.bits == 64) and below_max(a.a, k, 0));
+    prove_budget = saved;
+    sum_le_busy = false;
+    if ok {
+        add_le(a.a, b, c - k);
+    }
+}
+
+// Is a >= k (unsigned, k >= 0)? From the facts: n - x >= k when x <= n - k,
+// s * c >= k when s >= k / c (rounded up) and the product cannot wrap.
+fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
+    if k <= 0 {
+        return true;
+    }
+    if small_k(a) {
+        return kv(a) >= k;
+    }
+    if (depth > 3) or (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) or (k >= 0x1_0000_0000) {
+        return false;
+    }
+    if known_at_least(a, k) {
+        return true;
+    }
+    if is_inst(a, ir.OP_SUB) and not ir.is_const(a.a) and not ir.is_const(a.b) {
+        return prove_le(a.b, a.a, 0 - k);  // (then x <= n: no wrap)
+    }
+    // x - d (or x + -d) with x >= k + d: no wrap, and at least k
+    let mut d: i64 = 0;
+    if is_inst(a, ir.OP_ADD) and cb.is_k(ir.resolve(a.b)) {
+        d = @bit_cast(i64, (0 -% ir.cint_val(ir.resolve(a.b))) & ir.mask_bits(a.ty.bits));
+    } else if is_inst(a, ir.OP_SUB) and small_k(ir.resolve(a.b)) {
+        d = kv(ir.resolve(a.b));
+    }
+    if (d >= 1) and (d < 0x1_0000_0000) {
+        return at_least(ir.resolve(a.a), k + d, depth + 1);
+    }
+    // x + j (j >= 1) that does not wrap: at least j, and at least k when x >= k - j
+    if is_inst(a, ir.OP_ADD) and small_k(ir.resolve(a.b)) and (kv(ir.resolve(a.b)) >= 1) and
+       (kv(ir.resolve(a.b)) < 0x1_0000_0000) and (a.ty.bits == 64) {
+        let j = kv(ir.resolve(a.b));
+        let saved = prove_budget;
+        prove_budget = 64;
+        let nowrap = below_max(ir.resolve(a.a), j, 0);
+        prove_budget = saved;
+        if nowrap {
+            return (j >= k) or at_least(ir.resolve(a.a), k - j, depth + 1);
+        }
+    }
+    if is_inst(a, ir.OP_ZEXT) {
+        return at_least(ir.resolve(a.a), k, depth + 1);
+    }
+    let mut c: i64 = 0;
+    if is_inst(a, ir.OP_MUL) and small_k(a.b) {
+        c = kv(a.b);
+    } else if is_inst(a, ir.OP_SHL) and small_k(a.b) and (kv(a.b) < 32) {
+        c = @as(i64, 1) << @truncate(u32, kv(a.b));
+    }
+    if (c < 1) or (c >= 0x1_0000_0000) {
+        return false;
+    }
+    let s = a.a;
+    prove_budget = 64;
+    let mut m = ub(s, 0);
+    if (m < 0) and is_inst(s, ir.OP_SUB) and prove_le(s.b, s.a, 0) {
+        prove_budget = 64;
+        m = ub(s.a, 0);  // n - x <= n when x <= n
+    }
+    if (m < 0) or (m >= 0x1_0000_0000) or not fits_type(m * c, a.ty) {
+        return false;
+    }
+    return at_least(s, (k + c - 1) / c, depth + 1);
 }
 
 // Unsigned comparison facts: tp holds for (a, b).
@@ -669,25 +1149,65 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
         if small_k(b) {
             if kv(b) >= 1 {
                 add_le(a, vnil(), kv(b) - 1);
+                assume_range(a, ir.cint_val(b));
             }
         } else if not ir.is_const(b) {
             add_le(a, b, -1);
+            assume_sum_le(a, b, -1);
+            if small_k(a) {
+                add_ge(b, kv(a) + 1);  // k < b
+            }
         }
     } else if tp == ir.IntULE {
         if small_k(b) {
             add_le(a, vnil(), kv(b));
         } else if not ir.is_const(b) {
             add_le(a, b, 0);
+            assume_sum_le(a, b, 0);
+            if small_k(a) {
+                add_ge(b, kv(a));  // k <= b
+            }
         }
     } else if (tp == ir.IntUGT) or (tp == ir.IntUGE) {
         let sw = cb.swap_pred(tp);
         if not ir.is_const(b) {
             assume_bounds(sw, b, a);
+        } else if small_k(b) {
+            add_ge(a, kv(b) + pick1(tp == ir.IntUGT));  // a > k, a >= k
         }
     } else if tp == ir.IntEQ {
         if not ir.is_const(a) and not ir.is_const(b) {
             add_le(a, b, 0);
             add_le(b, a, 0);
+        }
+    } else if (tp >= ir.IntSGT) and (tp <= ir.IntSLE) and cb.is_k(a) and not ir.is_const(b) {
+        assume_bounds(cb.swap_pred(tp), b, a);
+    } else if ((tp == ir.IntSGT) or (tp == ir.IntSGE)) and cb.is_k(b) and not ir.is_const(a) {
+        // a >= lo >= 0 (signed): a is not negative, and at least lo
+        let lo = ir.sval(b) + pick1(tp == ir.IntSGT);
+        if lo >= 0 {
+            add_expr(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0)), kbool(true));
+            add_expr(synth_icmp(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo))), kbool(true));
+            if lo >= 1 {
+                add_expr(synth_icmp(ir.IntNE, a, ir.cint(a.ty, 0)), kbool(true));
+            }
+        }
+    } else if ((tp == ir.IntSLT) or (tp == ir.IntSLE)) and cb.is_k(b) and not ir.is_const(a) {
+        // a <= hi (signed) with a not negative: a <= hi
+        let hi = ir.sval(b) - pick1(tp == ir.IntSLT);
+        if (hi >= 0) and known_true(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0))) {
+            add_le(a, vnil(), hi);
+        }
+        // k - x <= hi with x in [0, ub(x)] (no signed overflow): x >= k - hi
+        if is_inst(a, ir.OP_SUB) and small_k(a.a) and not ir.is_const(a.b) and (kv(a.a) <= smax_of(a.ty)) and
+           (hi > -0x4000_0000_0000_0000) {
+            prove_budget = 64;
+            let m = ub(a.b, 0);
+            let lo = kv(a.a) - hi;
+            if (m >= 0) and (m <= smax_of(a.ty)) and (lo >= 1) and (lo <= m) {
+                add_expr(synth_icmp(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo))), kbool(true));
+                add_expr(synth_icmp(ir.IntNE, a.b, ir.cint(a.ty, 0)), kbool(true));
+            }
         }
     }
 }
@@ -697,14 +1217,133 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
     if small_k(x) {
         return kv(x) >= c;
     }
+    if c <= 0 {
+        return true;
+    }
     if c == 1 {
-        let r = find_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)));
-        if u.notnil(r) and cb.is_k(r) and (ir.cint_val(r) == 1) {
+        if known_true(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0))) {
             return true;
         }
     }
-    let r = find_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c))));
-    return u.notnil(r) and cb.is_k(r) and (ir.cint_val(r) == 1);
+    if known_true(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, @bit_cast(u64, c)))) {
+        return true;
+    }
+    if ge_fact(x, c) {
+        return true;
+    }
+    // x >= c - 1 and x != c - 1
+    if (c >= 2) and known_true(synth_icmp(ir.IntNE, x, ir.cint(x.ty, @bit_cast(u64, c - 1)))) and
+       known_at_least(x, c - 1) {
+        return true;
+    }
+    if is_inst(x, ir.OP_PHI) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) and (c < 0x1_0000_0000) {
+        return phi_at_least(x, c);
+    }
+    return false;
+}
+
+// A lower bound fact x >= k with k >= c.
+fn ge_fact(x: *mut ir.Value, c: i64) bool {
+    let mut e = bk.get(@truncate(usize, ge_hash(x)) & (nb - 1));
+    while e >= 0 {
+        let en = ents.at(@int_cast(usize, e));
+        if (en.kind == K_GE) and (en.key == x) and fact_ok(e) and (en.off >= c) {
+            return true;
+        }
+        e = en.next;
+    }
+    return false;
+}
+
+// The loop phis whose lower bounds are being proved by induction.
+let mut ind_ge: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+
+// Is phi x >= c (c >= 1)? When each incoming value is, under its edge's
+// condition; the values that come around a loop by induction: with x assumed
+// at least c, proved with the facts known at the back edge (those of the
+// scope hold for this iteration's values) and the edge's condition (a loop
+// counter counting up from 1, or down from a value at least 1 and leaving
+// at 1).
+fn phi_at_least(x: *mut ir.Value, c: i64) bool {
+    if (x.xs.len > 4) or (ind_ge.len >= 2) {
+        return false;
+    }
+    for k in 0..ind_ge.len {
+        if ind_ge.get(k) == x {
+            return false;
+        }
+    }
+    let mut loops = false;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if v == x {
+            continue;
+        }
+        if (p.rpo < 0) or (p.rpo >= x.blk.rpo) {
+            loops = true;
+            continue;
+        }
+        let mark = ents.len;
+        edge_assume(p, x.blk);
+        path_assume(p);
+        let ok = at_least(v, c, 1);
+        pop_to(mark);
+        if not ok {
+            return false;
+        }
+    }
+    if not loops {
+        return true;
+    }
+    let lo0 = fact_lo;
+    let hi0 = fact_hi;
+    ind_ge.push(x);
+    let mut ok = true;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if (v == x) or not ((p.rpo < 0) or (p.rpo >= x.blk.rpo)) {
+            continue;
+        }
+        let mut lo = ents.len;
+        if p.rpo >= 0 {
+            lo = facts_at(p);
+        }
+        if (hi0 > lo0) and (lo0 < lo) {
+            lo = lo0;
+        }
+        fact_lo = lo;
+        fact_hi = ents.len;
+        let mark = ents.len;
+        add_ge(x, c);
+        edge_assume(p, x.blk);
+        path_assume(p);
+        ok = at_least(v, c, 1);
+        pop_to(mark);
+        if not ok {
+            break;
+        }
+    }
+    _ = ind_ge.pop();
+    fact_lo = lo0;
+    fact_hi = hi0;
+    return ok;
+}
+
+// Is the comparison i known to hold (by a fact fact_ok allows)?
+fn known_true(i: *ir.Value) bool {
+    let h = hash_expr(i);
+    let mut e = bk.get(@truncate(usize, h) & (nb - 1));
+    while e >= 0 {
+        let x = ents.at(@int_cast(usize, e));
+        if (x.kind == K_EXPR) and same_expr(x.key, i) {
+            return fact_ok(e) and cb.is_k(x.val) and (ir.cint_val(x.val) == 1);
+        }
+        e = x.next;
+    }
+    return false;
 }
 
 let mut prove_budget: i32 = 0;
@@ -720,6 +1359,11 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     if u.isnil(x) {
         return bound >= 0;  // 0 <= y + bound
     }
+    if small_k(x) and (y.ty.kind == ir.T_INT) and (y.ty.bits <= 64) {
+        // k <= y + bound: y >= k - bound
+        let need = kv(x) - bound;
+        return (need <= 0) or ((need < 0x1_0000_0000) and known_at_least(y, need));
+    }
     if (depth > 5) or (prove_budget <= 0) {
         return false;
     }
@@ -728,7 +1372,7 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
     while e >= 0 {
         let en = ents.at(@int_cast(usize, e));
-        if (en.kind == K_LE) and (en.key == x) {
+        if (en.kind == K_LE) and (en.key == x) and fact_ok(e) {
             if le_path(en.val, y, bound - en.off, depth + 1) {
                 return true;
             }
@@ -800,24 +1444,94 @@ fn pick1(c: bool) i64 {
 // A phi is bounded when every incoming value is, at the end of its block
 // with the condition of the edge (the facts in scope hold there too: they
 // come from branches every path to the phi's block goes through).
+//
+// The values that come around a loop are bounded by induction: with x
+// assumed at most y + bound, each must be too, proved with the facts known
+// at the back edge (those of the scope hold for this iteration's values) and
+// the edge's condition (a counter counting down from below a length). y must
+// be the same in every iteration: defined before the loop.
 fn phi_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     if x.xs.len > 4 {
         return false;
     }
+    let mut loops = false;
     for k in 0..x.xs.len {
         let v = x.xs.get(k);
+        let p = x.bs.get(k);
         if v == x {
             continue;
         }
+        if (p.rpo < 0) or (p.rpo >= x.blk.rpo) {
+            loops = true;
+            continue;
+        }
         let mark = ents.len;
-        edge_assume(x.bs.get(k), x.blk);
+        edge_assume(p, x.blk);
         let ok = le_path(v, y, bound, depth + 1);
         pop_to(mark);
         if not ok {
             return false;
         }
     }
-    return true;
+    if not loops {
+        return true;
+    }
+    if (ind_le.len >= 2) or not invariant_in(y, x.blk) {
+        return false;
+    }
+    for k in 0..ind_le.len {
+        if ind_le.get(k) == x {
+            return false;
+        }
+    }
+    let lo0 = fact_lo;
+    let hi0 = fact_hi;
+    ind_le.push(x);
+    let mut ok = true;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if (v == x) or not ((p.rpo < 0) or (p.rpo >= x.blk.rpo)) {
+            continue;
+        }
+        let mut lo = ents.len;
+        if p.rpo >= 0 {
+            lo = facts_at(p);
+        }
+        if (hi0 > lo0) and (lo0 < lo) {
+            lo = lo0;
+        }
+        fact_lo = lo;
+        fact_hi = ents.len;
+        let mark = ents.len;
+        add_le(x, y, bound);
+        edge_assume(p, x.blk);
+        path_assume(p);
+        ok = le_path(v, y, bound, depth + 1);
+        pop_to(mark);
+        if not ok {
+            break;
+        }
+    }
+    _ = ind_le.pop();
+    fact_lo = lo0;
+    fact_hi = hi0;
+    return ok;
+}
+
+// The loop phis whose upper bounds (against values) are being proved by
+// induction.
+let mut ind_le: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+
+// Is y (nil, a constant, a parameter or an instruction) the same in every
+// iteration of the loop headed by h: defined in a block that strictly
+// dominates h?
+fn invariant_in(y: *mut ir.Value, h: *mut ir.Block) bool {
+    if u.isnil(y) or (y.kind != ir.V_INST) {
+        return true;
+    }
+    return u.notnil(y.blk) and (y.blk != h) and (y.blk.rpo >= 0) and opt.dominates(y.blk, h);
 }
 
 fn edge_assume(p: *mut ir.Block, b: *mut ir.Block) void {
@@ -863,7 +1577,7 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
     let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
     while e >= 0 {
         let en = ents.at(@int_cast(usize, e));
-        if (en.kind == K_LE) and (en.key == x) {
+        if (en.kind == K_LE) and (en.key == x) and fact_ok(e) {
             if (en.off <= -d) or u.isnil(en.val) {
                 return true;  // x <= w - d, or x <= a small constant
             }
@@ -904,12 +1618,104 @@ fn prove_le(x: *mut ir.Value, y: *mut ir.Value, bound: i64) bool {
 // incoming value under its edge's condition).
 const UB_LIM: i64 = 0x4000_0000_0000_0000;
 
+// Facts in the table at indices from fact_lo to fact_hi are not used: while
+// a loop phi's bound is proved by induction (ub_phi), the facts of the scope
+// that are not known at the back edge hold for the current iteration's
+// values, not for those the back edge carries.
+let mut fact_lo: usize = 0;
+let mut fact_hi: usize = 0;
+
+fn fact_ok(e: i64) bool {
+    let k = @int_cast(usize, e);
+    return (k < fact_lo) or (k >= fact_hi);
+}
+
+// The walk's path in the dominator tree, and the size of the table when
+// each block on it was entered.
+let mut wblocks: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                   cap: 0 };
+let mut wmarks: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
+
+// Assumes the conditions on entry to the blocks that dominate p below the
+// walk's path (where the facts in the table end), up to a few of them.
+fn path_assume(p: *mut ir.Block) void {
+    if p.rpo < 0 {
+        return;
+    }
+    let mut j = wblocks.len;
+    let mut top = ir.bnil();
+    while j > 0 {
+        j -= 1;
+        if opt.dominates(wblocks.get(j), p) {
+            top = wblocks.get(j);
+            break;
+        }
+    }
+    let mut b = p;
+    let mut n: i32 = 0;
+    while u.notnil(b) and (b != top) and (n < 6) {
+        if b.preds.len == 1 {
+            edge_assume(b.preds.get(0), b);
+        }
+        b = b.idom;
+        n += 1;
+    }
+}
+
+// The size of the table up to which its facts hold at the end of block p
+// (those entered at the blocks of the walk's path that dominate p).
+fn facts_at(p: *mut ir.Block) usize {
+    let mut j = wblocks.len;
+    while j > 0 {
+        j -= 1;
+        if opt.dominates(wblocks.get(j), p) {
+            if (j + 1) < wblocks.len {
+                return wmarks.get(j + 1);
+            }
+            return ents.len;
+        }
+    }
+    return 0;
+}
+
+// The loop phis whose bounds are being proved by induction, and the bound
+// assumed for each (-1: none).
+let mut ind_phi: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                   cap: 0 };
+let mut ind_bound: u.List.[i64] = u.List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+
+// The number of bits needed for v >= 0 (0 for 0).
+fn bit_len(v: i64) i64 {
+    let mut n: i64 = 0;
+    while (n < 63) and ((v >> @truncate(u32, n)) != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+fn smax_of(t: *ir.Ty) i64 {
+    return @bit_cast(i64, ir.mask_bits(t.bits) >> 1);
+}
+
+// The smaller of two upper bounds, either of which may be unknown (-1).
+fn ub_min(a: i64, b: i64) i64 {
+    if (a < 0) or ((b >= 0) and (b < a)) {
+        return b;
+    }
+    return a;
+}
+
 fn ub(x: *mut ir.Value, depth: i32) i64 {
     if small_k(x) {
         return kv(x);
     }
     if u.isnil(x) or (x.ty.kind != ir.T_INT) or (depth > 6) or (prove_budget <= 0) {
         return -1;
+    }
+    for k in 0..ind_phi.len {
+        if ind_phi.get(k) == x {
+            return ind_bound.get(k);
+        }
     }
     prove_budget -= 1;
     let mut best: i64 = -1;
@@ -920,7 +1726,7 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
     let mut e = bk.get(@truncate(usize, le_hash(x)) & (nb - 1));
     while e >= 0 {
         let en = ents.at(@int_cast(usize, e));
-        if (en.kind == K_LE) and (en.key == x) {
+        if (en.kind == K_LE) and (en.key == x) and fact_ok(e) {
             let mut w: i64 = 0;
             if u.notnil(en.val) {
                 w = ub(en.val, depth + 1);
@@ -936,8 +1742,60 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
     }
     let op = x.op;
     let mut d: i64 = -1;
-    if (op == ir.OP_AND) and small_k(x.b) {
-        d = kv(x.b);
+    if op == ir.OP_AND {
+        if small_k(x.b) {
+            d = ub_min(kv(x.b), ub(x.a, depth + 1));
+        } else {
+            d = ub_min(ub(x.a, depth + 1), ub(x.b, depth + 1));
+        }
+    } else if (op == ir.OP_XOR) and small_k(x.b) and (kv(x.b) >= 1) and ((kv(x.b) & (kv(x.b) + 1)) == 0) and
+              (ub(x.a, depth + 1) >= 0) and (ub(x.a, depth + 1) <= kv(x.b)) {
+        // k ^ y with k = 2^n - 1 and y <= k: k - y <= k - lb(y)
+        d = kv(x.b) - lb(x.a, depth + 1);
+    } else if (op == ir.OP_OR) or (op == ir.OP_XOR) {
+        let a = ub(x.a, depth + 1);
+        let b = ub(x.b, depth + 1);
+        if (a >= 0) and (b >= 0) {
+            let mut m = a;
+            if b > m {
+                m = b;
+            }
+            d = @bit_cast(i64, ir.mask_bits(@truncate(i32, bit_len(m))));
+        }
+    } else if (op == ir.OP_SUB) and small_k(x.a) {
+        // c - y <= c - lb(y) when y <= c (no wrap)
+        let b = ub(x.b, depth + 1);
+        if (b >= 0) and (b <= kv(x.a)) {
+            d = kv(x.a) - lb(x.b, depth + 1);
+        }
+    } else if (op == ir.OP_SHL) and not cb.is_k(x.b) {
+        // by a count below the width
+        let a = ub(x.a, depth + 1);
+        let k = ub(x.b, depth + 1);
+        if (a >= 0) and (a < 0x1_0000_0000) and (k >= 0) and (k < 32) and (k < @as(i64, x.ty.bits)) and
+           fits_type(a << @truncate(u32, k), x.ty) {
+            d = a << @truncate(u32, k);
+        }
+    } else if (op == ir.OP_SUB) and
+              (known_true(synth_icmp(ir.IntUGE, x.a, x.b)) or known_true(synth_icmp(ir.IntUGT, x.a, x.b))) {
+        d = ub(x.a, depth + 1);  // y - z <= y when z <= y
+    } else if (op == ir.OP_SEXT) or ((op == ir.OP_ASHR) and not small_k(x.b)) {
+        // a value known not negative
+        let a = ub(x.a, depth + 1);
+        if (a >= 0) and (a <= smax_of(x.a.ty)) {
+            d = a;
+        }
+    } else if (op == ir.OP_ASHR) and (ir.cint_val(x.b) < 63) {
+        let a = ub(x.a, depth + 1);
+        if (a >= 0) and (a <= smax_of(x.a.ty)) {
+            d = a >> @truncate(u32, ir.cint_val(x.b));
+        }
+    } else if (op == ir.OP_LSHR) and not cb.is_k(x.b) {
+        d = ub(x.a, depth + 1);
+    } else if op == ir.OP_INTR {
+        d = ub_intr(x, depth);
+    } else if op == ir.OP_LOAD {
+        d = table_max(x);
     } else if (op == ir.OP_LSHR) and cb.is_k(x.b) and (ir.cint_val(x.b) < 63) {
         let a = ub(x.a, depth + 1);
         if a >= 0 {
@@ -960,6 +1818,24 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
         }
     } else if (op == ir.OP_ZEXT) or (op == ir.OP_TRUNC) {
         d = ub(x.a, depth + 1);
+    } else if (op == ir.OP_ADD) and cb.is_k(x.b) and (x.ty.bits > 1) and
+              (ir.cint_val(x.b) > (ir.mask_bits(x.ty.bits) >> 1)) {
+        // y - c, exact when y >= c, which a result known not negative also
+        // shows when y is: else it would be y - c + 2^bits, at least
+        // 2^bits - c, which is negative for c up to 2^(bits - 1)
+        let c = (ir.mask_bits(x.ty.bits) - ir.cint_val(x.b)) + 1;
+        if (c < 0x1_0000_0000) and known_at_least(x.a, @bit_cast(i64, c)) {
+            let a = ub(x.a, depth + 1);
+            if a >= 0 {
+                d = a - @bit_cast(i64, c);
+            }
+        } else if (c < 0x1_0000_0000) and (x.ty.bits <= 64) and (c <= (ir.mask_bits(x.ty.bits) >> 1) + 1) and
+                  known_true(synth_icmp(ir.IntSGE, x, ir.cint(x.ty, 0))) {
+            let a = ub(x.a, depth + 1);
+            if (a >= 0) and (a <= smax_of(x.ty)) and (a >= @bit_cast(i64, c)) {
+                d = a - @bit_cast(i64, c);
+            }
+        }
     } else if (op == ir.OP_ADD) and small_k(x.b) and (kv(x.b) < 0x1_0000_0000) {
         // no wrap when the bound stays below the type's maximum
         let a = ub(x.a, depth + 1);
@@ -985,38 +1861,288 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
             d = a << @truncate(u32, ir.cint_val(x.b));
         }
     } else if (op == ir.OP_SELECT) {
+        // each arm under its condition (min(y, c) <= c)
+        let mark = ents.len;
+        if x.a.ty.kind == ir.T_INT {
+            assume(x.a, true, 0);
+        }
         let a = ub(x.b, depth + 1);
-        let b = ub(x.c, depth + 1);
-        if (a >= 0) and (b >= 0) {
-            d = a;
-            if b > a {
-                d = b;
+        pop_to(mark);
+        if a >= 0 {
+            if x.a.ty.kind == ir.T_INT {
+                assume(x.a, false, 0);
+            }
+            let b = ub(x.c, depth + 1);
+            pop_to(mark);
+            if b >= 0 {
+                d = a;
+                if b > a {
+                    d = b;
+                }
             }
         }
     } else if (op == ir.OP_PHI) and (x.xs.len <= 4) {
-        d = 0;
-        for k in 0..x.xs.len {
-            let v = x.xs.get(k);
-            if v == x {
-                continue;
-            }
-            let mark = ents.len;
-            edge_assume(x.bs.get(k), x.blk);
-            let b = ub(v, depth + 1);
-            pop_to(mark);
-            if b < 0 {
-                d = -1;
-                break;
-            }
-            if b > d {
-                d = b;
-            }
-        }
+        d = ub_phi(x, depth);
+    }
+    if d >= UB_LIM {
+        d = -1;
     }
     if (d >= 0) and ((best < 0) or (d < best)) {
         best = d;
     }
     return best;
+}
+
+// A lower bound of x (0 when none is known): constants, and the leading
+// zeros of a value with a known upper bound.
+fn lb(x: *mut ir.Value, depth: i32) i64 {
+    if small_k(x) {
+        return kv(x);
+    }
+    if is_inst(x, ir.OP_INTR) and (intr_id(x) == ir.IN_CTLZ) and (x.xs.len == 1) and (x.ty.kind == ir.T_INT) {
+        let a = x.xs.get(0);
+        let m = ub(a, depth + 1);
+        if (m >= 0) and (a.ty.bits <= 64) {
+            return @as(i64, a.ty.bits) - bit_len(m);
+        }
+    }
+    return 0;
+}
+
+// A phi's bound: the largest of its incoming values' bounds. Values that
+// come around a loop (from a block not before the phi's in reverse
+// postorder) are bounded by induction: with the phi assumed at most the
+// bound of the others, each must stay within it, proved without the facts
+// of the scope (they hold for this iteration's values) but with the
+// condition of the edge.
+fn ub_phi(x: *mut ir.Value, depth: i32) i64 {
+    let mut d: i64 = 0;
+    let mut loops = false;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if v == x {
+            continue;
+        }
+        if (p.rpo < 0) or (p.rpo >= x.blk.rpo) {
+            loops = true;
+            continue;
+        }
+        let mark = ents.len;
+        edge_assume(p, x.blk);
+        path_assume(p);
+        let b = ub(v, depth + 1);
+        pop_to(mark);
+        if b < 0 {
+            return -1;
+        }
+        if b > d {
+            d = b;
+        }
+    }
+    if not loops {
+        return d;
+    }
+    let lo0 = fact_lo;
+    let hi0 = fact_hi;
+    ind_phi.push(x);
+    ind_bound.push(d);
+    let mut ok = true;
+    for k in 0..x.xs.len {
+        let v = x.xs.get(k);
+        let p = x.bs.get(k);
+        if (v == x) or not ((p.rpo < 0) or (p.rpo >= x.blk.rpo)) {
+            continue;
+        }
+        let mut lo = ents.len;
+        if p.rpo >= 0 {
+            lo = facts_at(p);
+        }
+        if (hi0 > lo0) and (lo0 < lo) {
+            lo = lo0;
+        }
+        fact_lo = lo;
+        fact_hi = ents.len;
+        let mark = ents.len;
+        edge_assume(p, x.blk);
+        path_assume(p);
+        let b = ub(v, depth + 1);
+        pop_to(mark);
+        if (b < 0) or (b > d) {
+            ok = false;
+            break;
+        }
+    }
+    _ = ind_phi.pop();
+    _ = ind_bound.pop();
+    fact_lo = lo0;
+    fact_hi = hi0;
+    if ok {
+        return d;
+    }
+    return -1;
+}
+
+// Bounds of the integer intrinsics: bit counts are at most the width (less
+// one for leading or trailing zeros of a value known not zero, and trailing
+// zeros are below its highest possible bit), minimums and maximums.
+fn ub_intr(x: *mut ir.Value, depth: i32) i64 {
+    let id = intr_id(x);
+    if x.xs.len < 1 {
+        return -1;
+    }
+    let a = x.xs.get(0);
+    if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
+        return -1;
+    }
+    let bits = @as(i64, a.ty.bits);
+    if id == ir.IN_CTPOP {
+        return ub_min(bits, bit_len(ub(a, depth + 1)));
+    }
+    if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) {
+        if not known_at_least(a, 1) {
+            return bits;
+        }
+        if id == ir.IN_CTTZ {
+            let m = ub(a, depth + 1);
+            if m >= 1 {
+                return bit_len(m) - 1;
+            }
+        }
+        return bits - 1;
+    }
+    if x.xs.len != 2 {
+        return -1;
+    }
+    let b = x.xs.get(1);
+    if id == ir.IN_UMIN {
+        return ub_min(ub(a, depth + 1), ub(b, depth + 1));
+    }
+    if (id == ir.IN_UMAX) or (id == ir.IN_SMIN) or (id == ir.IN_SMAX) {
+        // (signed: both known not negative)
+        let mut p = ub(a, depth + 1);
+        let mut q = ub(b, depth + 1);
+        if id == ir.IN_SMAX {
+            // the larger with a constant not negative is not negative
+            if cb.is_k(b) and (ir.sval(b) >= 0) and ((p < 0) or (p > smax_of(a.ty))) {
+                p = smax_of(a.ty);
+            }
+            if cb.is_k(a) and (ir.sval(a) >= 0) and ((q < 0) or (q > smax_of(a.ty))) {
+                q = smax_of(a.ty);
+            }
+        }
+        if (p < 0) or (q < 0) {
+            return -1;
+        }
+        if (id != ir.IN_UMAX) and ((p > smax_of(a.ty)) or (q > smax_of(a.ty))) {
+            return -1;
+        }
+        if (id == ir.IN_SMIN) and (q < p) {
+            return q;
+        }
+        if (id == ir.IN_SMIN) or (p >= q) {
+            return p;
+        }
+        return q;
+    }
+    return -1;
+}
+
+// Constant tables: the largest element a load from a constant global can
+// read, when the global holds only integers of the load's type and the
+// load's offsets are multiples of its size (or -1). Cached per run of gvn.
+let mut tab_key: u.List.[*mut ir.Global] = u.List.[*mut ir.Global].{ data: @ptr_from_int(*mut *mut ir.Global, 0),
+                                                                     len: 0, cap: 0 };
+let mut tab_ty: u.List.[*mut ir.Ty] = u.List.[*mut ir.Ty].{ data: @ptr_from_int(*mut *mut ir.Ty, 0), len: 0, cap: 0 };
+let mut tab_max: u.List.[i64] = u.List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+
+fn table_max(i: *mut ir.Value) i64 {
+    if (i.flags != 0) or (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or (i.ty.size == 0) {
+        return -1;
+    }
+    let sz = i.ty.size;
+    let mut p = i.a;
+    let mut n: i32 = 0;
+    while is_inst(p, ir.OP_PTRADD) {
+        n += 1;
+        if (n > 8) or not mult_of(p.b, sz, 0) {
+            return -1;
+        }
+        p = p.a;
+    }
+    if (p.kind != ir.V_GLOBAL) or not p.gv.is_const or u.isnil(p.gv.init) or p.gv.tls or
+       (p.gv.linkage == ir.LINK_WEAK) or (p.gv.linkage == ir.LINK_EXTWEAK) {
+        return -1;
+    }
+    for k in 0..tab_key.len {
+        if (tab_key.get(k) == p.gv) and (tab_ty.get(k) == i.ty) {
+            return tab_max.get(k);
+        }
+    }
+    let mut budget: i64 = 1 << 16;
+    let m = leaf_max(p.gv.init, i.ty, &mut budget);
+    tab_key.push(p.gv);
+    tab_ty.push(i.ty);
+    tab_max.push(m);
+    return m;
+}
+
+// Is v (a byte offset) a multiple of sz?
+fn mult_of(v: *ir.Value, sz: u64, depth: i32) bool {
+    if sz == 1 {
+        return true;
+    }
+    if cb.is_k(v) {
+        return (ir.cint_val(v) % sz) == 0;
+    }
+    if (v.kind != ir.V_INST) or (depth > 4) {
+        return false;
+    }
+    if (v.op == ir.OP_MUL) and (mult_of(v.a, sz, depth + 1) or mult_of(v.b, sz, depth + 1)) {
+        return true;
+    }
+    if (v.op == ir.OP_SHL) and cb.is_k(v.b) and (ir.cint_val(v.b) < 32) {
+        return (((@as(u64, 1) << @truncate(u32, ir.cint_val(v.b))) % sz) == 0) or mult_of(v.a, sz, depth + 1);
+    }
+    if (v.op == ir.OP_ADD) or (v.op == ir.OP_SUB) {
+        return mult_of(v.a, sz, depth + 1) and mult_of(v.b, sz, depth + 1);
+    }
+    if (v.op == ir.OP_SEXT) or (v.op == ir.OP_ZEXT) {
+        return mult_of(v.a, sz, depth + 1);
+    }
+    return false;
+}
+
+// The largest of the integers of type t that make up constant c (zeros
+// count as 0), or -1 when it holds anything else.
+fn leaf_max(c: *ir.Value, t: *mut ir.Ty, budget: *mut i64) i64 {
+    budget.* -= 1;
+    if budget.* < 0 {
+        return -1;
+    }
+    if c.kind == ir.V_ZERO {
+        return 0;
+    }
+    if (c.kind == ir.V_CINT) and (c.ty == t) {
+        if ir.cint_val(c) >= @bit_cast(u64, UB_LIM) {
+            return -1;
+        }
+        return @bit_cast(i64, ir.cint_val(c));
+    }
+    if (c.kind == ir.V_CAGG) and ir.is_agg(c.ty) {
+        let mut m: i64 = 0;
+        for k in 0..c.xs.len {
+            let x = leaf_max(c.xs.get(k), t, budget);
+            if x < 0 {
+                return -1;
+            }
+            if x > m {
+                m = x;
+            }
+        }
+        return m;
+    }
+    return -1;
 }
 
 fn fits_type(v: i64, t: *ir.Ty) bool {
@@ -1028,7 +2154,7 @@ fn fits_type(v: i64, t: *ir.Ty) bool {
 
 // The value of an unsigned comparison the bounds decide, or nil.
 fn decide(i: *mut ir.Value) *mut ir.Value {
-    let p = cb.pred_of(i);
+    let mut p = cb.pred_of(i);
     let a = i.a;
     let b = i.b;
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) or (i.ty.kind != ir.T_INT) {
@@ -1058,6 +2184,12 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
     prove_budget = 64;
     if small_k(b) {
         let m = ub(a, 0);
+        if (m >= 0) and (p >= ir.IntSGT) and (p <= ir.IntSLE) and (kv(b) <= smax_of(a.ty)) and (m <= smax_of(a.ty)) {
+            p = p - (ir.IntSGT - ir.IntUGT);  // both not negative: the unsigned comparison
+        }
+        if (kv(b) == 0) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
+            return kbool(p == ir.IntUGE);
+        }
         if m >= 0 {
             if ((p == ir.IntULT) and (m < kv(b))) or ((p == ir.IntUGE) and (m < kv(b))) {
                 return kbool(p == ir.IntULT);
@@ -1065,6 +2197,42 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             if ((p == ir.IntULE) and (m <= kv(b))) or ((p == ir.IntUGT) and (m <= kv(b))) {
                 return kbool(p == ir.IntULE);
             }
+        }
+    }
+    // lower bounds: n - x >= k when x + k <= n, and multiples of them
+    if small_k(b) and ((p == ir.IntUGE) or (p == ir.IntUGT) or (p == ir.IntULT) or (p == ir.IntULE)) {
+        let mut need = kv(b);
+        if (p == ir.IntUGT) or (p == ir.IntULE) {
+            need += 1;
+        }
+        if at_least(a, need, 0) {
+            return kbool((p == ir.IntUGE) or (p == ir.IntUGT));
+        }
+    }
+    // k <= x, k < x (and their negations) likewise
+    if small_k(a) and not ir.is_const(b) and
+       ((p == ir.IntUGE) or (p == ir.IntUGT) or (p == ir.IntULT) or (p == ir.IntULE)) {
+        let mut need = kv(a);
+        if (p == ir.IntULT) or (p == ir.IntUGE) {
+            need += 1;
+        }
+        if at_least(b, need, 0) {
+            return kbool((p == ir.IntULE) or (p == ir.IntULT));
+        }
+    }
+    // (x - d) against k >= 0, signed, with x in [0, ub(x)] and no overflow:
+    // x - d >= k exactly when x >= d + k
+    if small_k(b) and is_inst(a, ir.OP_ADD) and cb.is_k(a.b) and not ir.is_const(a.a) and (p >= ir.IntSGT) and
+       (p <= ir.IntSLE) and (a.ty.bits > 1) {
+        let d = 0 - ir.sval(a.b);
+        let m = ub(a.a, 0);
+        let mut need = d + kv(b);
+        if (p == ir.IntSGT) or (p == ir.IntSLE) {
+            need += 1;
+        }
+        if (d >= 1) and (d < 0x1_0000_0000) and (m >= 0) and (m <= smax_of(a.ty)) and (need >= 1) and
+           (need <= smax_of(a.ty)) and known_at_least(a.a, need) {
+            return kbool((p == ir.IntSGT) or (p == ir.IntSGE));
         }
     }
     if is_inst(a, ir.OP_ADD) and ((a.a == b) or (a.b == b)) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
@@ -1217,6 +2385,21 @@ fn visit_block(b: *mut ir.Block) void {
         for k in 0..i.xs.len {
             i.xs.set(k, known_operand(i.xs.get(k)));
         }
+        if (op == ir.OP_SUB) and small_k(i.a) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and
+           not ir.is_const(i.b) and (kv(i.a) >= 1) and ((kv(i.a) & (kv(i.a) + 1)) == 0) and
+           not (tg.clz_is_bsr() and is_inst(i.b, ir.OP_INTR) and (intr_id(i.b) == ir.IN_CTLZ)) {
+            // k - y with k = 2^n - 1 and y <= k: k ^ y (no borrow; one
+            // instruction in place on x86-64, 31 - ctlz(x) after lzcnt)
+            prove_budget = 64;
+            let m = ub(i.b, 0);
+            if (m >= 0) and (m <= kv(i.a)) {
+                let k = i.a;
+                i.op = ir.OP_XOR;
+                i.a = i.b;
+                i.b = k;
+                changed = true;
+            }
+        }
         if cse_able(i) {
             let mut r = find_expr(i);
             if u.isnil(r) and (op == ir.OP_ICMP) {
@@ -1232,7 +2415,16 @@ fn visit_block(b: *mut ir.Block) void {
                 note_writes(i);
             } else {
                 let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
-                let r = find_mem(&l, i.ty);
+                let mut r = find_mem(&l, i.ty);
+                if u.isnil(r) {
+                    r = compose_load(i, &l);
+                }
+                if u.isnil(r) {
+                    r = forward_copy(i, &l);
+                }
+                if u.isnil(r) and ((i.ty.kind == ir.T_VEC) or (i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) {
+                    r = punned_load(i, &l);
+                }
                 if u.notnil(r) {
                     replace(i, r);
                 } else {
@@ -1255,15 +2447,23 @@ fn visit_block(b: *mut ir.Block) void {
             }
         } else {
             note_writes(i);
+            if (op == ir.OP_MEMSET) and ir.is_cint(i.b) and (size_of(i.c) > 0) {
+                let l = loc_of(i.a, size_of(i.c));
+                push_ent(K_FILL, fill_hash(l.base), l.base, l.off, ir.t_void(), i);
+            } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+                note_copy(i);
+            }
         }
         i = next;
     }
 }
 
 fn walk(entry: *mut ir.Block) void {
-    let mut blocks = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let blocks = &mut wblocks;
+    blocks.clear();
     let mut kids = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
-    let mut ent_marks = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    let ent_marks = &mut wmarks;
+    ent_marks.clear();
     let mut wr_marks = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
     blocks.push(entry);
     kids.push(0);
@@ -1278,11 +2478,11 @@ fn walk(entry: *mut ir.Block) void {
             let c = b.dom_kids.get(k);
             ent_marks.push(ents.len);
             wr_marks.push(writes.len);
+            blocks.push(c);
+            kids.push(0);
             region_writes(c);
             edge_facts(c);
             visit_block(c);
-            blocks.push(c);
-            kids.push(0);
         } else {
             pop_to(ent_marks.pop());
             writes.len = wr_marks.pop();
@@ -1290,9 +2490,7 @@ fn walk(entry: *mut ir.Block) void {
             _ = kids.pop();
         }
     }
-    u.free(@ptr_cast(*mut void, blocks.data));
     u.free(@ptr_cast(*mut void, kids.data));
-    u.free(@ptr_cast(*mut void, ent_marks.data));
     u.free(@ptr_cast(*mut void, wr_marks.data));
 }
 
@@ -1332,12 +2530,348 @@ pub fn gvn(f: *mut ir.Func) bool {
     ents.clear();
     writes.clear();
     n_synth = 0;
+    fact_lo = 0;
+    fact_hi = 0;
+    tab_key.clear();
+    tab_ty.clear();
+    tab_max.clear();
     escapes(f);
     walk(order.get(0));
     pop_to(0);
+    ir.apply_forwarding(f);
+    pre_loads(f, &order);
     u.free(@ptr_cast(*mut void, order.data));
     ir.apply_forwarding(f);
     return changed;
+}
+
+// -----------------------------------------------------------------------------
+// Loads at joins (partial redundancy): a load at the start of a block (no
+// write to its location before it there) whose value each predecessor knows
+// at its end (stored or loaded there, nothing possibly writing the location
+// since) is a phi of those values; when one predecessor does not know it,
+// the load moves there (onto the edge), so the paths that know it do not
+// load again: `if a[1] > a[0] { a[1] = a[0] }` then `a[1]` again, or a
+// vector's length loaded again after the call that grows it on the rare
+// path. Not across back edges.
+// -----------------------------------------------------------------------------
+struct PrePhi {
+    blk: *mut ir.Block,
+    base: *mut ir.Value,
+    off: i64,
+    ty: *mut ir.Ty,
+    val: *mut ir.Value,
+}
+
+let mut pre_phis: u.List.[PrePhi] = u.List.[PrePhi].{ data: @ptr_from_int(*mut PrePhi, 0), len: 0, cap: 0 };
+
+// The value at l (of type t) at the start of b is v (nil: not known).
+fn set_pre(b: *mut ir.Block, l: *Loc, t: *mut ir.Ty, v: *mut ir.Value) void {
+    for k in 0..pre_phis.len {
+        let e = pre_phis.at(k);
+        if (e.blk == b) and (e.base == l.base) and (e.off == l.off) and (e.ty == t) {
+            e.val = v;
+            return;
+        }
+    }
+    pre_phis.push(PrePhi.{ blk: b, base: l.base, off: l.off, ty: t, val: v });
+}
+
+// Does instruction x possibly write l?
+fn writes_loc(x: *mut ir.Value, l: *Loc) bool {
+    let h = writes.len;
+    note_writes(x);
+    let mut hit = false;
+    for w in h..writes.len {
+        if may_alias(l, writes.at(w)) {
+            hit = true;
+        }
+    }
+    writes.len = h;
+    return hit;
+}
+
+// The value at l (of type t) at the end of block p, or nil: from a store or
+// load of it there (or in the blocks before p while each has one
+// successor... while p has one predecessor), with nothing writing it since.
+fn value_at_end(p0: *mut ir.Block, l: *Loc, t: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let mut p = p0;
+    let mut budget: i32 = 400;
+    let mut hops: i32 = 0;
+    loop {
+        let mut x = p.last;
+        while u.notnil(x) {
+            budget -= 1;
+            if budget <= 0 {
+                return vnil();
+            }
+            if (x.op == ir.OP_STORE) and (x.flags == 0) {
+                let sl = loc_of(x.b, @bit_cast(i64, x.a.ty.size));
+                if (sl.base == l.base) and (sl.off == l.off) and (x.a.ty == t) {
+                    return x.a;
+                }
+                // a lane of a vector stored over it
+                let vt = x.a.ty;
+                if (sl.base == l.base) and (vt.kind == ir.T_VEC) and (vt.elem == t) and
+                   (@as(u64, @bit_cast(u32, t.bits)) == (t.size * 8)) and (l.off >= sl.off) and
+                   ((l.off + l.size) <= (sl.off + sl.size)) and (((l.off - sl.off) % l.size) == 0) {
+                    ir.at_before(B, x.next);
+                    return ir.extract_elem(B, x.a, @bit_cast(u64, (l.off - sl.off) / l.size));
+                }
+            } else if (x.op == ir.OP_LOAD) and (x.flags == 0) and (x.ty == t) {
+                let ll = loc_of(x.a, @bit_cast(i64, t.size));
+                if (ll.base == l.base) and (ll.off == l.off) {
+                    return x;
+                }
+            }
+            if writes_loc(x, l) {
+                return vnil();
+            }
+            x = x.prev;
+        }
+        for k in 0..pre_phis.len {
+            let e = pre_phis.at(k);
+            if (e.blk == p) and (e.base == l.base) and (e.off == l.off) and (e.ty == t) {
+                return e.val;  // (nil: not known)
+            }
+        }
+        if (p.preds.len >= 2) and (depth < 8) {
+            return value_at_join(p, l, t, depth + 1);
+        }
+        if (p.preds.len != 1) or (hops >= 8) {
+            return vnil();
+        }
+        let q = p.preds.get(0);
+        if (q.rpo < 0) or (q.rpo >= p.rpo) {
+            return vnil();
+        }
+        p = q;
+        hops += 1;
+    }
+}
+
+// The value at l at the start of join b when each predecessor knows it at
+// its end: theirs, or a phi of them made there; else nil.
+fn value_at_join(b: *mut ir.Block, l: *Loc, t: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let np = b.preds.len;
+    if (np > 4) or not avail_over(l.base, b) {
+        return vnil();
+    }
+    for k in 0..pre_phis.len {
+        let e = pre_phis.at(k);
+        if (e.blk == b) and (e.base == l.base) and (e.off == l.off) and (e.ty == t) {
+            return e.val;  // (nil: not known)
+        }
+    }
+    let r = join_value(b, l, t, depth);
+    pre_phis.push(PrePhi.{ blk: b, base: l.base, off: l.off, ty: t, val: r });
+    return r;
+}
+
+fn join_value(b: *mut ir.Block, l: *Loc, t: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let np = b.preds.len;
+    let mut vs: [4]*mut ir.Value = [vnil(), vnil(), vnil(), vnil()];
+    for k in 0..np {
+        let p = b.preds.get(k);
+        if (p.rpo < 0) or (p.rpo >= b.rpo) {
+            return vnil();
+        }
+        for j in 0..k {
+            if b.preds.get(j) == p {
+                return vnil();
+            }
+        }
+        let v = value_at_end(p, l, t, depth);
+        if u.isnil(v) {
+            return vnil();
+        }
+        vs[k] = v;
+    }
+    let mut same = true;
+    for k in 1..np {
+        if vs[k] != vs[0] {
+            same = false;
+        }
+    }
+    if same {
+        return vs[0];
+    }
+    return make_phi(b, t, vs[0..np]);
+}
+
+// A phi in b of vs (from b's predecessors in order): one already there with
+// those incoming values, or a new one.
+fn make_phi(b: *mut ir.Block, t: *mut ir.Ty, vs: []*mut ir.Value) *mut ir.Value {
+    let np = b.preds.len;
+    let mut ph = b.first;
+    while u.notnil(ph) and (ph.op == ir.OP_PHI) {
+        if (ph.ty == t) and (ph.xs.len == np) {
+            let mut eq = true;
+            for k in 0..np {
+                let mut found = false;
+                for j in 0..np {
+                    if (ph.bs.get(j) == b.preds.get(k)) and (ir.resolve(ph.xs.get(j)) == vs[k]) {
+                        found = true;
+                    }
+                }
+                if not found {
+                    eq = false;
+                }
+            }
+            if eq {
+                return ph;
+            }
+        }
+        ph = ph.next;
+    }
+    ir.at_before(B, b.first);
+    let r = ir.phi(B, t);
+    for k in 0..np {
+        ir.add_incoming(r, vs[k], b.preds.get(k));
+    }
+    changed = true;
+    return r;
+}
+
+// Is v available at the end of every predecessor of b (not defined in b,
+// and in a block dominating it)?
+fn avail_over(v: *mut ir.Value, b: *mut ir.Block) bool {
+    if v.kind != ir.V_INST {
+        return true;
+    }
+    return u.notnil(v.blk) and (v.blk != b) and (v.blk.rpo >= 0) and opt.dominates(v.blk, b);
+}
+
+fn pre_loads(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
+    pre_phis.clear();
+    let vals = u.newn.[*mut ir.Value](8);
+    for oi in 0..order.len {
+        let b = order.get(oi);
+        let np = b.preds.len;
+        if (np < 2) or (np > 4) {
+            continue;
+        }
+        let mut fwd = true;
+        for k in 0..np {
+            let p = b.preds.get(k);
+            if (p.rpo < 0) or (p.rpo >= b.rpo) {
+                fwd = false;
+            }
+            for j in 0..k {
+                if b.preds.get(j) == p {
+                    fwd = false;  // (two edges from one block)
+                }
+            }
+        }
+        if not fwd {
+            continue;
+        }
+        let mut i = b.first;
+        let mut seen: i32 = 0;
+        while u.notnil(i) and (seen < 64) {
+            let next = i.next;
+            seen += 1;
+            if (i.op == ir.OP_LOAD) and (i.flags == 0) and ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and
+               (i.ty.bits <= 64) {
+                pre_load(f, b, i, vals);
+            }
+            i = next;
+        }
+    }
+}
+
+fn pre_load(f: *mut ir.Func, b: *mut ir.Block, i: *mut ir.Value, vals: []mut *mut ir.Value) void {
+    let l = loc_of(i.a, @bit_cast(i64, i.ty.size));
+    if not avail_over(l.base, b) {
+        return;
+    }
+    // nothing before i in b writes l
+    let mut x = b.first;
+    while x != i {
+        if writes_loc(x, &l) {
+            return;
+        }
+        x = x.next;
+    }
+    let np = b.preds.len;
+    let mut missing: i32 = -1;
+    for k in 0..np {
+        let v = value_at_end(b.preds.get(k), &l, i.ty, 0);
+        vals[k] = v;
+        if u.isnil(v) {
+            if missing >= 0 {
+                return;
+            }
+            missing = @int_cast(i32, k);
+        }
+    }
+    if (missing >= 0) and (np < 2) {
+        return;
+    }
+    if missing >= 0 {
+        // the load on the edge from that predecessor
+        let p = b.preds.get(@int_cast(usize, missing));
+        let t = ir.terminator(p);
+        let mut at = p;
+        if ir.succ_count(t) != 1 {
+            let mut n: i32 = 0;
+            for k in 0..ir.succ_count(t) {
+                if ir.succ(t, k) == b {
+                    n += 1;
+                }
+            }
+            if n != 1 {
+                return;
+            }
+            at = ir.append_block(f, "pre");
+            at.rpo = -1;
+            let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+            br.t1 = b;
+            ir.append_inst(at, br);
+            for k in 0..ir.succ_count(t) {
+                if ir.succ(t, k) == b {
+                    ir.set_succ(t, k, at);
+                }
+            }
+            let mut ph = b.first;
+            while u.notnil(ph) and (ph.op == ir.OP_PHI) {
+                for k in 0..ph.bs.len {
+                    if ph.bs.get(k) == p {
+                        ph.bs.set(k, at);
+                    }
+                }
+                ph = ph.next;
+            }
+            b.preds.set(@int_cast(usize, missing), at);
+        }
+        ir.at_before(B, ir.terminator(at));
+        let mut addr = i.a;
+        if not avail_over(addr, b) {
+            addr = l.base;
+            if l.off != 0 {
+                addr = ir.ptradd(B, l.base, ir.cint(ir.isz(), @bit_cast(u64, l.off)));
+            }
+        }
+        let ld = ir.load(B, i.ty, addr);
+        ld.align = i.align;
+        vals[@int_cast(usize, missing)] = ld;
+    }
+    if missing < 0 {
+        let mut same = true;
+        for k in 1..np {
+            if vals[k] != vals[0] {
+                same = false;
+            }
+        }
+        if same {
+            set_pre(b, &l, i.ty, vals[0]);
+            replace(i, vals[0]);
+            return;
+        }
+    }
+    let ph = make_phi(b, i.ty, vals[0..np]);
+    set_pre(b, &l, i.ty, ph);
+    replace(i, ph);
 }
 
 // -----------------------------------------------------------------------------
@@ -1505,6 +3039,18 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             killed.clear();
             at_ret = false;
             ss_reads();
+        } else if intr_id(i) == ir.IN_LOAD_PARTIAL {
+            let l = partial_loc(i);
+            read_loc(killed, &l);
+            if noalias_global(l.obj) and (ss_field(&l) != 0) {
+                ss_reads();
+            }
+            if u.notnil(l.obj) {
+                read_objs.push(l.obj);
+            }
+        } else if (intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(intr_id(i)) {
+            // (writes part of its location: nothing it makes dead, nothing it
+            // reads; a prefetch neither reads nor writes)
         } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
             killed.clear();
             at_ret = false;
@@ -1561,6 +3107,13 @@ fn ss_reader(i: *mut ir.Value, depth: bool) bool {
     let op = i.op;
     if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
         return true;
+    }
+    if intr_id(i) == ir.IN_LOAD_PARTIAL {
+        let l = partial_loc(i);
+        return noalias_global(l.obj);
+    }
+    if (intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(intr_id(i)) {
+        return false;
     }
     if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
         return true;
@@ -2470,6 +4023,7 @@ fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64) vo
             y.align = v.align;
             y.aty = v.aty;
             y.fty = v.fty;
+            y.chain = v.chain;
             y.mask = v.mask;
             y.ext = v.ext;
             y.name = v.name;
@@ -2667,7 +4221,12 @@ pub fn split_loops(f: *mut ir.Func) bool {
 // the nearest block dominating all its uses (not into a deeper loop), so
 // the other paths skip it: the shadow stack's slot for the calls of a slow
 // path, values only a trap reports. A load moves into a successor reached
-// only from its block when nothing after it there writes memory.
+// only from its block when nothing after it there writes memory. Where every
+// path from the block reaches the target anyway (moving saves nothing), an
+// instruction moves only when its operands are live there regardless: else
+// they, not its result, would be live on the way (across a call, or through
+// a chain of sums each sunk to the next one's use, all their terms live to
+// the end of the function).
 // -----------------------------------------------------------------------------
 fn lca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
     if u.isnil(a0) {
@@ -2692,7 +4251,8 @@ fn writes_mem(x: *ir.Value) bool {
     let op = x.op;
     return (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
            (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
-           ((op == ir.OP_INTR) and not cse_able(x)) or ((op == ir.OP_LOAD) and (x.flags != 0));
+           ((op == ir.OP_INTR) and not cse_able(x) and (intr_id(x) != ir.IN_LOAD_PARTIAL) and
+            not ir.is_prefetch(intr_id(x))) or ((op == ir.OP_LOAD) and (x.flags != 0));
 }
 
 // The blocks using v: their common dominator (nil: no uses).
@@ -2713,21 +4273,221 @@ fn use_block(users: *u.List.[*mut ir.Value], v: *mut ir.Value) *mut ir.Block {
     return l;
 }
 
+// A memset of a stack slot that nothing else in its block uses moves down
+// to where the slot's users are: to the start of the block that dominates
+// them, and where that block branches with users on each way, to each way's
+// start (into a block entered only from it), so that paths that never use
+// the slot do not fill it (a zeroed scratch buffer only fallback paths
+// read). Never into a loop it is outside: there it would fill the slot
+// again each time round.
+fn sink_fills(f: *mut ir.Func, uses: *u.List.[u.List.[*mut ir.Value]]) bool {
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if (i.op == ir.OP_MEMSET) and (b.rpo >= 0) and (i.aux >= 0) and is_inst(i.a, ir.OP_ALLOCA) and
+               (i.a.aux >= 0) {
+                let mut users = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+                let mut ok = true;
+                let us = uses.at(@int_cast(usize, i.a.aux));
+                for k in 0..us.len {
+                    let x = us.get(k);
+                    if u.isnil(x.blk) {
+                        ok = false;  // (moved by this pass)
+                    } else if x != i {
+                        if (x.op == ir.OP_PHI) or (x.blk == b) or (x.blk.rpo < 0) {
+                            ok = false;
+                        }
+                        users.push(x);
+                    }
+                }
+                let mut to = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+                if ok and (users.len > 0) and fill_places(b, users.items(), &mut to, 0) and
+                   not ((to.len == 1) and (to.get(0) == b)) {
+                    for k in 0..to.len {
+                        let mut at = to.get(k).first;
+                        while at.op == ir.OP_PHI {
+                            at = at.next;
+                        }
+                        ir.at_before(B, at);
+                        let c = ir.memop(B, ir.OP_MEMSET, i.a, i.b, i.c);
+                        c.src = i.src;
+                        c.aux = -1;  // (new: not looked at again)
+                    }
+                    ir.remove_inst(i);
+                    any = true;
+                }
+                u.free(@ptr_cast(*mut void, users.data));
+                u.free(@ptr_cast(*mut void, to.data));
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    return any;
+}
+
+// The blocks below r (or r) whose starts can fill a slot for users (all
+// dominated by r) instead of r: into `to`; false if there are too many.
+fn fill_places(r: *mut ir.Block, users: []*mut ir.Value, to: *mut u.List.[*mut ir.Block], depth: i32) bool {
+    let mut l = ir.bnil();
+    for x in users {
+        l = lca(l, x.blk);
+    }
+    if u.isnil(l) or not opt.dominates(r, l) {
+        return false;
+    }
+    // not into a loop r is outside: above the loop header nearest r
+    let mut t = l;
+    let mut c = l;
+    while c != r {
+        for k in 0..c.preds.len {
+            let p = c.preds.get(k);
+            if (p.rpo >= 0) and opt.dominates(c, p) {
+                t = c.idom;
+            }
+        }
+        c = c.idom;
+    }
+    // where t branches, each way with users entered only from t
+    let mut here = false;
+    for x in users {
+        if x.blk == t {
+            here = true;
+        }
+    }
+    let term = ir.terminator(t);
+    if not here and (depth < 4) and u.notnil(term) and (ir.succ_count(term) >= 2) {
+        let mut split = true;
+        let mut parts = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        let mut covered: usize = 0;
+        for k in 0..ir.succ_count(term) {
+            let s = ir.succ(term, k);
+            let mut n: usize = 0;
+            for x in users {
+                if opt.dominates(s, x.blk) {
+                    n += 1;
+                }
+            }
+            if (n > 0) and ((s.preds.len != 1) or (s == t)) {
+                split = false;
+            }
+            covered += n;
+        }
+        if split and (covered == users.len) {
+            for k in 0..ir.succ_count(term) {
+                let s = ir.succ(term, k);
+                parts.clear();
+                for x in users {
+                    if opt.dominates(s, x.blk) {
+                        parts.push(x);
+                    }
+                }
+                if (parts.len > 0) and not fill_places(s, parts.items(), to, depth + 1) {
+                    u.free(@ptr_cast(*mut void, parts.data));
+                    return false;
+                }
+            }
+            u.free(@ptr_cast(*mut void, parts.data));
+            return to.len <= 4;
+        }
+        u.free(@ptr_cast(*mut void, parts.data));
+    }
+    to.push(t);
+    return to.len <= 4;
+}
+
 fn note_use(uses: *mut u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, x: *mut ir.Value) void {
     if u.notnil(o) and (o.kind == ir.V_INST) and (o.aux >= 0) {
         uses.at(@int_cast(usize, o.aux)).push(x);
     }
 }
 
-pub fn sink(f: *mut ir.Func) bool {
-    if u.isnil(f.first) {
+// Is there a path from blk that skips t: back to blk, or to a return (not
+// to a trap), without passing t? If not, moving an instruction from blk to
+// t saves nothing.
+fn skips(blk: *mut ir.Block, t: *mut ir.Block, seen: []mut bool) bool {
+    for k in 0..seen.len {
+        seen[k] = false;
+    }
+    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let bt = ir.terminator(blk);
+    for k in 0..ir.succ_count(bt) {
+        work.push(ir.succ(bt, k));
+    }
+    let mut found = false;
+    while (work.len > 0) and not found {
+        let x = work.get(work.len - 1);
+        work.len -= 1;
+        if (x == t) or (x.rpo < 0) or seen[@int_cast(usize, x.rpo)] {
+            continue;
+        }
+        seen[@int_cast(usize, x.rpo)] = true;
+        if x == blk {
+            found = true;
+            break;
+        }
+        let xt = ir.terminator(x);
+        let n = ir.succ_count(xt);
+        if n == 0 {
+            found = u.notnil(xt) and (xt.op != ir.OP_UNREACHABLE);
+            continue;  // (a trap does not count)
+        }
+        for k in 0..n {
+            work.push(ir.succ(xt, k));
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+    return found;
+}
+
+// Is operand o of i used below t anyway (by something else in a block t
+// dominates), so that it is live into t whether or not i moves there?
+fn used_below(uses: *u.List.[u.List.[*mut ir.Value]], o: *mut ir.Value, i: *mut ir.Value, t: *mut ir.Block) bool {
+    if u.isnil(o) or (o.kind != ir.V_INST) {
+        return true;  // (a constant, parameter or global)
+    }
+    if o.aux < 0 {
         return false;
     }
-    ir.apply_forwarding(f);
-    opt.compute_preds(f);
-    let order = opt.dominators(f);
-    opt.loop_depths(f, &order);
-    // users of each instruction (reachable ones)
+    let us = uses.at(@int_cast(usize, o.aux));
+    for k in 0..us.len {
+        let x = us.get(k);
+        if x == i {
+            continue;
+        }
+        if x.op == ir.OP_PHI {
+            for j in 0..x.xs.len {
+                if (ir.resolve(x.xs.get(j)) == o) and (x.bs.get(j).rpo >= 0) and opt.dominates(t, x.bs.get(j)) {
+                    return true;
+                }
+            }
+        } else if (x.blk.rpo >= 0) and opt.dominates(t, x.blk) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn operands_live_at(uses: *u.List.[u.List.[*mut ir.Value]], i: *mut ir.Value, t: *mut ir.Block) bool {
+    if not used_below(uses, ir.resolve(i.a), i, t) or not used_below(uses, ir.resolve(i.b), i, t) or
+       not used_below(uses, ir.resolve(i.c), i, t) {
+        return false;
+    }
+    for k in 0..i.xs.len {
+        if not used_below(uses, ir.resolve(i.xs.get(k)), i, t) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sink_uses(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) u.List.[u.List.[*mut ir.Value]] {
     let mut uses = u.List.[u.List.[*mut ir.Value]].{ data: u.nil.[u.List.[*mut ir.Value]](), len: 0, cap: 0 };
     let mut b = f.first;
     while u.notnil(b) {
@@ -2754,8 +4514,33 @@ pub fn sink(f: *mut ir.Func) bool {
             i = i.next;
         }
     }
+    return uses;
+}
+
+pub fn sink(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    opt.loop_depths(f, &order);
+    // users of each instruction (reachable ones): again when sink_fills
+    // moved memsets (the lists hold the ones it took out)
+    let mut uses = sink_uses(f, &order);
+    let mut any = sink_fills(f, &uses);
+    if any {
+        for k in 0..uses.len {
+            u.free(@ptr_cast(*mut void, uses.at(k).data));
+        }
+        u.free(@ptr_cast(*mut void, uses.data));
+        uses = sink_uses(f, &order);
+    }
     // bottom-up: users move before what they use is considered
-    let mut any = false;
+    let seen = u.newn.[bool](order.len + 1);
+    let mut last_from = ir.bnil();
+    let mut last_to = ir.bnil();
+    let mut last_skips = false;
     let mut bi = order.len;
     while bi > 0 {
         bi -= 1;
@@ -2797,6 +4582,16 @@ pub fn sink(f: *mut ir.Func) bool {
                         }
                         if not quiet {
                             t = blk;
+                        }
+                    }
+                    if t != blk {
+                        if (t != last_to) or (blk != last_from) {
+                            last_from = blk;
+                            last_to = t;
+                            last_skips = skips(blk, t, seen[0..order.len]);
+                        }
+                        if not last_skips and not operands_live_at(&uses, i, t) {
+                            t = blk;  // (its operands would live on the way instead of it)
                         }
                     }
                     if t != blk {
@@ -2924,6 +4719,102 @@ fn iv_start(bld: *mut ir.Builder, v0: *mut ir.Value, h: *mut ir.Block, tag: i64,
     return ir.binop(bld, ir.OP_SHL, a, b);
 }
 
+// Is base + off0 a constant (d) from base1 + off1? Both as a root pointer
+// plus a linear combination of values plus a constant (lin_add): the same
+// root and the same combination.
+fn start_diff(base: *mut ir.Value, off0: *mut ir.Value, base1: *mut ir.Value, off1: *mut ir.Value, d: *mut i64) bool {
+    let mut x = Lin.{ terms: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 },
+                      coefs: u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 }, k: 0, ok: true };
+    let mut y = Lin.{ terms: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 },
+                      coefs: u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 }, k: 0, ok: true };
+    let r = lin_ptr(base, &mut x);
+    let r1 = lin_ptr(base1, &mut y);
+    lin_add(off0, 1, &mut x, 0);
+    lin_add(off1, 1, &mut y, 0);
+    let mut same = x.ok and y.ok and (r == r1);
+    if same {
+        // the same coefficient for each term (y's terms negated into x's)
+        for k in 0..y.terms.len {
+            lin_term(&mut x, y.terms.get(k), 0 -% y.coefs.get(k));
+        }
+        for k in 0..x.coefs.len {
+            if x.coefs.get(k) != 0 {
+                same = false;
+            }
+        }
+    }
+    d.* = x.k -% y.k;
+    u.free(@ptr_cast(*mut void, x.terms.data));
+    u.free(@ptr_cast(*mut void, x.coefs.data));
+    u.free(@ptr_cast(*mut void, y.terms.data));
+    u.free(@ptr_cast(*mut void, y.coefs.data));
+    return same;
+}
+
+// A linear combination: the sum of terms[i] * coefs[i], plus k.
+struct Lin {
+    terms: u.List.[*mut ir.Value],
+    coefs: u.List.[i64],
+    k: i64,
+    ok: bool,
+}
+
+fn lin_term(l: *mut Lin, v: *mut ir.Value, c: i64) void {
+    for i in 0..l.terms.len {
+        if l.terms.get(i) == v {
+            l.coefs.set(i, l.coefs.get(i) +% c);
+            return;
+        }
+    }
+    l.terms.push(v);
+    l.coefs.push(c);
+}
+
+// Adds integer v * s to l.
+fn lin_add(v0: *mut ir.Value, s: i64, l: *mut Lin, depth: i32) void {
+    let v = ir.resolve(v0);
+    if cb.is_k(v) {
+        l.k = l.k +% (ir.sval(v) *% s);
+        return;
+    }
+    if depth > 8 {
+        l.ok = false;
+        return;
+    }
+    if is_inst(v, ir.OP_ADD) {
+        lin_add(v.a, s, l, depth + 1);
+        lin_add(v.b, s, l, depth + 1);
+        return;
+    }
+    if is_inst(v, ir.OP_SUB) {
+        lin_add(v.a, s, l, depth + 1);
+        lin_add(v.b, 0 -% s, l, depth + 1);
+        return;
+    }
+    if is_inst(v, ir.OP_MUL) and cb.is_k(ir.resolve(v.b)) {
+        lin_add(v.a, s *% ir.sval(ir.resolve(v.b)), l, depth + 1);
+        return;
+    }
+    if is_inst(v, ir.OP_SHL) and cb.is_k(ir.resolve(v.b)) and (ir.sval(ir.resolve(v.b)) >= 0) and
+       (ir.sval(ir.resolve(v.b)) < 63) {
+        lin_add(v.a, s *% (@as(i64, 1) << @truncate(u32, @bit_cast(u64, ir.sval(ir.resolve(v.b))))), l, depth + 1);
+        return;
+    }
+    lin_term(l, v, s);
+}
+
+// The root of pointer p through ptradds, their offsets added to l.
+fn lin_ptr(p0: *mut ir.Value, l: *mut Lin) *mut ir.Value {
+    let mut p = ir.resolve(p0);
+    let mut n: i32 = 0;
+    while is_inst(p, ir.OP_PTRADD) and (n < 8) {
+        lin_add(p.b, 1, l, 0);
+        p = ir.resolve(p.a);
+        n += 1;
+    }
+    return p;
+}
+
 fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], no_modes: bool) bool {
     // one latch
     let mut latch = ir.bnil();
@@ -2966,17 +4857,25 @@ fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
                     ir.at_before(bld, ir.terminator(pre));
                     let base = ir.resolve(p.a);
                     let off0 = iv_start(bld, p.b, h, tag, pre);
-                    // a pointer already made for this base and step, a constant away?
+                    // a pointer already made for this step that starts a
+                    // constant away?
                     let mut q = vnil();
                     let mut d: i64 = 0;
                     for k in 0..ivps.len {
                         let e = ivps.at(k);
-                        if (e.base == base) and (e.step == st) {
-                            if e.off0 == off0 {
+                        if u.isnil(q) and (e.step == st) {
+                            if (e.base == base) and (e.off0 == off0) {
                                 q = e.q;
-                            } else if cb.is_k(e.off0) and cb.is_k(off0) {
+                            } else if (e.base == base) and cb.is_k(e.off0) and cb.is_k(off0) {
                                 q = e.q;
                                 d = @bit_cast(i64, ir.cint_val(off0)) -% @bit_cast(i64, ir.cint_val(e.off0));
+                            } else if not no_modes {
+                                // (wasm's offsets cannot be negative)
+                                let mut dd: i64 = 0;
+                                if start_diff(base, off0, e.base, e.off0, &mut dd) {
+                                    q = e.q;
+                                    d = dd;
+                                }
                             }
                         }
                     }

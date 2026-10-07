@@ -1,0 +1,439 @@
+// =============================================================================
+// std/os/cpu.ax - processor extensions: what the running CPU can do.
+//
+//     if cpu.has("avx2") { ... }               // by name (cpu.names() lists them)
+//     let f = cpu.features();                  // bits for this architecture
+//     if (f & cpu.X_AES) != 0 { ... }
+//
+// A program usually asks the language instead (spec §13.4): @target_has("avx2")
+// is a constant, true when the build may use the extension everywhere, and
+// @cpu_has("avx2") asks the running CPU (through features()). Functions
+// declared with @features or @multiversion use extensions the build does
+// not assume.
+//
+// On x86-64 the answer comes from the cpuid instruction, and an extension
+// that needs register state the operating system does not save (AVX,
+// AVX-512) counts as missing. On AArch64 it comes from the system
+// (getauxval on Linux, sysctl on macOS). WebAssembly has no run-time
+// detection: features() is 0 and has() is false.
+//
+// The compiler shares this table (selfhost/src/target.ax): the names are the
+// ones --features takes, and a bit means the same in both.
+// =============================================================================
+
+import host "axiom" {
+    fn ax_cpu_features() u64;
+    fn ax_write(fd: i32, p: *u8, n: usize) isize;
+    fn ax_exit(code: i32) void;
+}
+
+pub const ARCH_WASM32: i32 = 1;
+pub const ARCH_WASM64: i32 = 2;
+pub const ARCH_X86_64: i32 = 3;
+pub const ARCH_AARCH64: i32 = 4;
+
+// x86-64 (SSE2 is always available)
+pub const X_SSE3: u64 = 0x1;
+pub const X_SSSE3: u64 = 0x2;
+pub const X_SSE41: u64 = 0x4;
+pub const X_SSE42: u64 = 0x8;
+pub const X_POPCNT: u64 = 0x10;
+pub const X_LZCNT: u64 = 0x20;
+pub const X_BMI1: u64 = 0x40;
+pub const X_BMI2: u64 = 0x80;
+pub const X_AVX: u64 = 0x100;
+pub const X_AVX2: u64 = 0x200;
+pub const X_FMA: u64 = 0x400;
+pub const X_CMPXCHG16B: u64 = 0x800;
+pub const X_AES: u64 = 0x1000;     // AES-NI
+pub const X_PCLMUL: u64 = 0x2000;  // carry-less multiply (pclmulqdq)
+pub const X_SHA: u64 = 0x4000;     // SHA-1 and SHA-256 (SHA-NI)
+pub const X_F16C: u64 = 0x8000;
+pub const X_MOVBE: u64 = 0x10000;
+pub const X_ADX: u64 = 0x20000;  // adcx, adox
+pub const X_AVX512F: u64 = 0x40000;
+pub const X_AVX512CD: u64 = 0x80000;
+pub const X_AVX512BW: u64 = 0x100000;
+pub const X_AVX512DQ: u64 = 0x200000;
+pub const X_AVX512VL: u64 = 0x400000;
+pub const X_AVX512IFMA: u64 = 0x800000;
+pub const X_AVX512VBMI: u64 = 0x1000000;
+pub const X_AVX512VBMI2: u64 = 0x2000000;
+pub const X_AVX512VNNI: u64 = 0x4000000;
+pub const X_AVX512BITALG: u64 = 0x8000000;
+pub const X_AVX512VPOPCNTDQ: u64 = 0x10000000;
+pub const X_AVX512BF16: u64 = 0x20000000;
+pub const X_AVX512FP16: u64 = 0x40000000;
+pub const X_GFNI: u64 = 0x80000000;
+pub const X_VAES: u64 = 0x100000000;        // AES on 256- and 512-bit registers
+pub const X_VPCLMULQDQ: u64 = 0x200000000;  // carry-less multiply on 256- and 512-bit registers
+pub const X_AVXVNNI: u64 = 0x400000000;
+pub const X_SHA512: u64 = 0x800000000;
+pub const X_SM3: u64 = 0x1000000000;
+pub const X_SM4: u64 = 0x2000000000;
+pub const X_AVX10_1: u64 = 0x4000000000;  // AVX10.1: the AVX-512 set of Sapphire Rapids, as one level
+pub const X_PRFCHW: u64 = 0x8000000000;   // prefetchw (Broadwell and later; every AMD64 processor)
+
+// AArch64 (FP and Advanced SIMD are always available)
+pub const A_LSE: u64 = 0x1;      // atomic memory operations (ARMv8.1)
+pub const A_RCPC: u64 = 0x2;     // load-acquire RCpc (ARMv8.3)
+pub const A_DOTPROD: u64 = 0x4;  // SDOT/UDOT (ARMv8.2)
+pub const A_CSSC: u64 = 0x8;     // common short sequence compression (abs, cnt, ctz, min/max on GPRs)
+pub const A_AES: u64 = 0x10;     // AESE/AESD/AESMC/AESIMC and PMULL/PMULL2
+pub const A_SHA2: u64 = 0x20;    // SHA-1 and SHA-256
+pub const A_SHA3: u64 = 0x40;    // EOR3, RAX1, XAR, BCAX
+pub const A_SHA512: u64 = 0x80;
+pub const A_SM4: u64 = 0x100;   // SM3 and SM4
+pub const A_CRC: u64 = 0x200;   // CRC32 and CRC32C
+pub const A_RDM: u64 = 0x400;   // SQRDMLAH/SQRDMLSH (ARMv8.1)
+pub const A_FP16: u64 = 0x800;  // half-precision arithmetic
+pub const A_FHM: u64 = 0x1000;  // FMLAL/FMLSL
+pub const A_BF16: u64 = 0x2000;
+pub const A_I8MM: u64 = 0x4000;  // 8-bit integer matrix multiply
+pub const A_SVE: u64 = 0x8000;
+pub const A_SVE2: u64 = 0x10000;
+pub const A_DIT: u64 = 0x20000;  // data-independent timing
+pub const A_SME: u64 = 0x40000;
+
+// WebAssembly (chosen at build time only)
+pub const W_SIMD128: u64 = 0x1;
+pub const W_BULK_MEMORY: u64 = 0x2;
+pub const W_NONTRAPPING_FPTOINT: u64 = 0x4;
+pub const W_SIGN_EXT: u64 = 0x8;
+pub const W_MUTABLE_GLOBALS: u64 = 0x10;
+pub const W_ATOMICS: u64 = 0x20;
+pub const W_MULTIVALUE: u64 = 0x40;
+pub const W_RELAXED_SIMD: u64 = 0x80;
+pub const W_TAIL_CALL: u64 = 0x100;
+
+/// An extension: its --features name, its architecture (ARCH_*), its bit,
+/// and the extensions it implies (enabling it enables them too).
+pub struct Feature {
+    name: []u8,
+    arch: i32,
+    bit: u64,
+    implies: u64,
+}
+
+const X: i32 = 3;
+const A: i32 = 4;
+const W: i32 = 1;
+const AVX512_ALL: u64 = X_AVX512F | X_AVX512CD | X_AVX512BW | X_AVX512DQ | X_AVX512VL | X_AVX512IFMA | X_AVX512VBMI |
+                        X_AVX512VBMI2 | X_AVX512VNNI | X_AVX512BITALG | X_AVX512VPOPCNTDQ | X_AVX512BF16 | X_AVX512FP16;
+
+let TABLE: [68]Feature = [
+    Feature.{ name: "sse3", arch: X, bit: X_SSE3, implies: 0 },
+    Feature.{ name: "ssse3", arch: X, bit: X_SSSE3, implies: X_SSE3 },
+    Feature.{ name: "sse4.1", arch: X, bit: X_SSE41, implies: X_SSSE3 },
+    Feature.{ name: "sse4.2", arch: X, bit: X_SSE42, implies: X_SSE41 },
+    Feature.{ name: "popcnt", arch: X, bit: X_POPCNT, implies: 0 },
+    Feature.{ name: "lzcnt", arch: X, bit: X_LZCNT, implies: 0 },
+    Feature.{ name: "bmi", arch: X, bit: X_BMI1, implies: 0 },
+    Feature.{ name: "bmi2", arch: X, bit: X_BMI2, implies: 0 },
+    Feature.{ name: "avx", arch: X, bit: X_AVX, implies: X_SSE42 },
+    Feature.{ name: "avx2", arch: X, bit: X_AVX2, implies: X_AVX },
+    Feature.{ name: "fma", arch: X, bit: X_FMA, implies: X_AVX },
+    Feature.{ name: "cx16", arch: X, bit: X_CMPXCHG16B, implies: 0 },
+    Feature.{ name: "aes", arch: X, bit: X_AES, implies: 0 },
+    Feature.{ name: "pclmul", arch: X, bit: X_PCLMUL, implies: 0 },
+    Feature.{ name: "sha", arch: X, bit: X_SHA, implies: 0 },
+    Feature.{ name: "f16c", arch: X, bit: X_F16C, implies: X_AVX },
+    Feature.{ name: "movbe", arch: X, bit: X_MOVBE, implies: 0 },
+    Feature.{ name: "adx", arch: X, bit: X_ADX, implies: 0 },
+    Feature.{ name: "avx512f", arch: X, bit: X_AVX512F, implies: X_AVX2 | X_FMA | X_F16C },
+    Feature.{ name: "avx512cd", arch: X, bit: X_AVX512CD, implies: X_AVX512F },
+    Feature.{ name: "avx512bw", arch: X, bit: X_AVX512BW, implies: X_AVX512F },
+    Feature.{ name: "avx512dq", arch: X, bit: X_AVX512DQ, implies: X_AVX512F },
+    Feature.{ name: "avx512vl", arch: X, bit: X_AVX512VL, implies: X_AVX512F },
+    Feature.{ name: "avx512ifma", arch: X, bit: X_AVX512IFMA, implies: X_AVX512F },
+    Feature.{ name: "avx512vbmi", arch: X, bit: X_AVX512VBMI, implies: X_AVX512BW },
+    Feature.{ name: "avx512vbmi2", arch: X, bit: X_AVX512VBMI2, implies: X_AVX512BW },
+    Feature.{ name: "avx512vnni", arch: X, bit: X_AVX512VNNI, implies: X_AVX512F },
+    Feature.{ name: "avx512bitalg", arch: X, bit: X_AVX512BITALG, implies: X_AVX512BW },
+    Feature.{ name: "avx512vpopcntdq", arch: X, bit: X_AVX512VPOPCNTDQ, implies: X_AVX512F },
+    Feature.{ name: "avx512bf16", arch: X, bit: X_AVX512BF16, implies: X_AVX512BW },
+    Feature.{ name: "avx512fp16", arch: X, bit: X_AVX512FP16, implies: X_AVX512BW | X_AVX512DQ | X_AVX512VL },
+    Feature.{ name: "gfni", arch: X, bit: X_GFNI, implies: 0 },
+    Feature.{ name: "vaes", arch: X, bit: X_VAES, implies: X_AES | X_AVX },
+    Feature.{ name: "vpclmulqdq", arch: X, bit: X_VPCLMULQDQ, implies: X_PCLMUL | X_AVX },
+    Feature.{ name: "avxvnni", arch: X, bit: X_AVXVNNI, implies: X_AVX2 },
+    Feature.{ name: "sha512", arch: X, bit: X_SHA512, implies: X_AVX2 },
+    Feature.{ name: "sm3", arch: X, bit: X_SM3, implies: X_AVX },
+    Feature.{ name: "sm4", arch: X, bit: X_SM4, implies: X_AVX2 },
+    Feature.{ name: "avx10.1", arch: X, bit: X_AVX10_1, implies: AVX512_ALL },
+    Feature.{ name: "prfchw", arch: X, bit: X_PRFCHW, implies: 0 },
+    Feature.{ name: "lse", arch: A, bit: A_LSE, implies: 0 },
+    Feature.{ name: "rcpc", arch: A, bit: A_RCPC, implies: 0 },
+    Feature.{ name: "dotprod", arch: A, bit: A_DOTPROD, implies: 0 },
+    Feature.{ name: "cssc", arch: A, bit: A_CSSC, implies: 0 },
+    Feature.{ name: "aes", arch: A, bit: A_AES, implies: 0 },
+    Feature.{ name: "sha2", arch: A, bit: A_SHA2, implies: 0 },
+    Feature.{ name: "sha3", arch: A, bit: A_SHA3, implies: A_SHA2 },
+    Feature.{ name: "sha512", arch: A, bit: A_SHA512, implies: A_SHA2 },
+    Feature.{ name: "sm4", arch: A, bit: A_SM4, implies: 0 },
+    Feature.{ name: "crc", arch: A, bit: A_CRC, implies: 0 },
+    Feature.{ name: "rdm", arch: A, bit: A_RDM, implies: 0 },
+    Feature.{ name: "fp16", arch: A, bit: A_FP16, implies: 0 },
+    Feature.{ name: "fhm", arch: A, bit: A_FHM, implies: A_FP16 },
+    Feature.{ name: "bf16", arch: A, bit: A_BF16, implies: 0 },
+    Feature.{ name: "i8mm", arch: A, bit: A_I8MM, implies: 0 },
+    Feature.{ name: "sve", arch: A, bit: A_SVE, implies: A_FP16 },
+    Feature.{ name: "sve2", arch: A, bit: A_SVE2, implies: A_SVE },
+    Feature.{ name: "dit", arch: A, bit: A_DIT, implies: 0 },
+    Feature.{ name: "sme", arch: A, bit: A_SME, implies: A_BF16 | A_FP16 },
+    Feature.{ name: "simd128", arch: W, bit: W_SIMD128, implies: 0 },
+    Feature.{ name: "bulk-memory", arch: W, bit: W_BULK_MEMORY, implies: 0 },
+    Feature.{ name: "nontrapping-fptoint", arch: W, bit: W_NONTRAPPING_FPTOINT, implies: 0 },
+    Feature.{ name: "sign-ext", arch: W, bit: W_SIGN_EXT, implies: 0 },
+    Feature.{ name: "mutable-globals", arch: W, bit: W_MUTABLE_GLOBALS, implies: 0 },
+    Feature.{ name: "atomics", arch: W, bit: W_ATOMICS, implies: 0 },
+    Feature.{ name: "multivalue", arch: W, bit: W_MULTIVALUE, implies: 0 },
+    Feature.{ name: "relaxed-simd", arch: W, bit: W_RELAXED_SIMD, implies: W_SIMD128 },
+    Feature.{ name: "tail-call", arch: W, bit: W_TAIL_CALL, implies: 0 },
+];
+
+/// Every extension the compiler knows, for every architecture.
+pub fn table() []Feature {
+    return TABLE[..];
+}
+
+fn family(a: i32) i32 {
+    if a == ARCH_WASM64 {
+        return ARCH_WASM32;
+    }
+    return a;
+}
+
+/// The bit of extension `name` on architecture `arch` (ARCH_*), or 0.
+pub fn bit_of(arch: i32, name: []u8) u64 {
+    for f in TABLE {
+        if (f.arch == family(arch)) and @mem_eq(f.name, name) {
+            return f.bit;
+        }
+    }
+    return 0;
+}
+
+/// Whether `name` is an extension of any architecture.
+pub fn known(name: []u8) bool {
+    for f in TABLE {
+        if @mem_eq(f.name, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `bits` with everything they imply (on architecture `arch`).
+pub fn closure(arch: i32, bits: u64) u64 {
+    let mut b = bits;
+    loop {
+        let mut next = b;
+        for f in TABLE {
+            if (f.arch == family(arch)) and ((b & f.bit) != 0) {
+                next = next | f.implies;
+            }
+        }
+        if next == b {
+            return b;
+        }
+        b = next;
+    }
+}
+
+/// The extensions of `bits` that need `bit`, directly or not (removing
+/// `bit` removes them too).
+pub fn dependents(arch: i32, bit: u64) u64 {
+    let mut d = bit;
+    for f in TABLE {
+        if (f.arch == family(arch)) and ((closure(arch, f.bit) & bit) != 0) {
+            d = d | f.bit;
+        }
+    }
+    return d;
+}
+
+/// This program's architecture (ARCH_*).
+pub fn this_arch() i32 {
+    if @target_arch("x86_64") {
+        return ARCH_X86_64;
+    }
+    if @target_arch("aarch64") {
+        return ARCH_AARCH64;
+    }
+    if @target_arch("wasm64") {
+        return ARCH_WASM64;
+    }
+    return ARCH_WASM32;
+}
+
+// -----------------------------------------------------------------------------
+// Detection
+// -----------------------------------------------------------------------------
+let mut detected: u64 = 0;
+let mut detected_done: bool = false;
+
+/// The running CPU's extensions: X_* bits on x86-64, A_* bits on AArch64,
+/// 0 on WebAssembly. (Detected once; the answer does not change.)
+pub fn features() u64 {
+    if not detected_done {
+        detected = detect();
+        detected_done = true;
+    }
+    return detected;
+}
+
+/// Whether the running CPU has extension `name` (false for a name this
+/// architecture does not have).
+pub fn has(name: []u8) bool {
+    let b = bit_of(this_arch(), name);
+    return (b != 0) and ((features() & b) == b);
+}
+
+fn flag(r: u32, n: u32, f: u64) u64 {
+    if ((r >> n) & 1) != 0 {
+        return f;
+    }
+    return 0;
+}
+
+fn detect() u64 {
+    if @target_arch("x86_64") {
+        return detect_x86();
+    }
+    if @target_arch("aarch64") {
+        return ax_cpu_features();
+    }
+    return 0;
+}
+
+fn detect_x86() u64 {
+    if @target_arch("x86_64") {
+        let l0 = @x86_cpuid(0, 0);
+        let max = @extract_lane(l0, 0);
+        let mut f: u64 = 0;
+        let l1 = @x86_cpuid(1, 0);
+        let c1 = @extract_lane(l1, 2);
+        f = f | flag(c1, 0, X_SSE3) | flag(c1, 1, X_PCLMUL) | flag(c1, 9, X_SSSE3) | flag(c1, 12, X_FMA) | flag(
+            c1, 13, X_CMPXCHG16B) | flag(c1, 19, X_SSE41) | flag(c1, 20, X_SSE42) | flag(c1, 22, X_MOVBE) | flag(
+                c1, 23, X_POPCNT) | flag(c1, 25, X_AES) | flag(c1, 28, X_AVX) | flag(c1, 29, X_F16C);
+        // Register state the system saves (XCR0): xmm and ymm for AVX;
+        // opmask, zmm upper halves and zmm16-31 too for AVX-512.
+        let mut xcr0: u64 = 0;
+        if ((c1 >> 27) & 1) != 0 {
+            xcr0 = @x86_xgetbv(0);
+        }
+        let avx_os = (xcr0 & 0x6) == 0x6;
+        let avx512_os = (xcr0 & 0xe6) == 0xe6;
+        if max >= 7 {
+            let l7 = @x86_cpuid(7, 0);
+            let b7 = @extract_lane(l7, 1);
+            let c7 = @extract_lane(l7, 2);
+            let d7 = @extract_lane(l7, 3);
+            f = f | flag(b7, 3, X_BMI1) | flag(b7, 5, X_AVX2) | flag(b7, 8, X_BMI2) | flag(b7, 16, X_AVX512F) | flag(
+                b7, 17, X_AVX512DQ) | flag(b7, 19, X_ADX) | flag(b7, 21, X_AVX512IFMA) | flag(
+                    b7, 28, X_AVX512CD) | flag(b7, 29, X_SHA) | flag(b7, 30, X_AVX512BW) | flag(b7, 31, X_AVX512VL);
+            f = f | flag(c7, 1, X_AVX512VBMI) | flag(c7, 6, X_AVX512VBMI2) | flag(c7, 8, X_GFNI) | flag(
+                c7, 9, X_VAES) | flag(c7, 10, X_VPCLMULQDQ) | flag(c7, 11, X_AVX512VNNI) | flag(
+                    c7, 12, X_AVX512BITALG) | flag(c7, 14, X_AVX512VPOPCNTDQ);
+            f = f | flag(d7, 23, X_AVX512FP16);
+            if @extract_lane(l7, 0) >= 1 {
+                let l71 = @x86_cpuid(7, 1);
+                let a71 = @extract_lane(l71, 0);
+                f = f | flag(a71, 0, X_SHA512) | flag(a71, 1, X_SM3) | flag(a71, 2, X_SM4) | flag(
+                    a71, 4, X_AVXVNNI) | flag(a71, 5, X_AVX512BF16);
+                if (((@extract_lane(l71, 3) >> 19) & 1) != 0) and (max >= 0x24) {
+                    let l24 = @x86_cpuid(0x24, 0);
+                    if (@extract_lane(l24, 1) & 0xff) >= 1 {
+                        f = f | X_AVX10_1;
+                    }
+                }
+            }
+        }
+        let e0 = @x86_cpuid(0x80000000, 0);
+        if @extract_lane(e0, 0) >= 0x80000001 {
+            let e1 = @x86_cpuid(0x80000001, 0);
+            f = f | flag(@extract_lane(e1, 2), 5, X_LZCNT) | flag(@extract_lane(e1, 2), 8, X_PRFCHW);
+        }
+        if not avx512_os {
+            f = f & ~(AVX512_ALL | X_AVX10_1);
+        }
+        if not avx_os {
+            f = f & ~dependents(ARCH_X86_64, X_AVX);
+        }
+        return f;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// The start-up check of programs built for more than the baseline (the
+// compiler calls it before main, compiled for the baseline itself).
+// -----------------------------------------------------------------------------
+fn put(s: []u8) void {
+    _ = ax_write(2, s.ptr, s.len);
+}
+
+/// Exits with a message unless the running CPU has every extension in
+/// `need`. `cpu` names the build's --cpu, for the message.
+pub fn require(need: u64, cpu: []u8) void {
+    let have = features();
+    if (have & need) == need {
+        return;
+    }
+    put("axiom: this program was built for processors with extensions this one lacks (--cpu=");
+    put(cpu);
+    put("); missing:");
+    let a = this_arch();
+    for f in TABLE {
+        if (f.arch == a) and ((need & f.bit) != 0) and ((have & f.bit) == 0) {
+            put(" ");
+            put(f.name);
+        }
+    }
+    put("\n");
+    ax_exit(1);
+}
+
+test "names and bits agree" {
+    @expect_eq(bit_of(ARCH_X86_64, "avx2"), X_AVX2);
+    @expect_eq(bit_of(ARCH_AARCH64, "aes"), A_AES);
+    @expect_eq(bit_of(ARCH_X86_64, "aes"), X_AES);
+    @expect_eq(bit_of(ARCH_AARCH64, "avx2"), 0);
+    @expect_eq(bit_of(ARCH_WASM64, "simd128"), W_SIMD128);
+    @expect(known("sve2"));
+    @expect(not known("avx3"));
+    // every bit is used once per architecture
+    for i in 0..TABLE.len {
+        for j in 0..TABLE.len {
+            if (i != j) and (TABLE[i].arch == TABLE[j].arch) {
+                @expect(TABLE[i].bit != TABLE[j].bit);
+                @expect(not @mem_eq(TABLE[i].name, TABLE[j].name));
+            }
+        }
+    }
+}
+
+test "implications" {
+    let c = closure(ARCH_X86_64, X_AVX512BW);
+    @expect((c & X_AVX512F) != 0);
+    @expect((c & X_AVX2) != 0);
+    @expect((c & X_SSE3) != 0);
+    @expect((dependents(ARCH_X86_64, X_AVX) & X_AVX512VL) != 0);
+    @expect((dependents(ARCH_X86_64, X_AVX) & X_SSE42) == 0);
+    @expect_eq(closure(ARCH_AARCH64, A_SVE2), (A_SVE2 | A_SVE) | A_FP16);
+}
+
+test "the running CPU" {
+    let f = features();
+    @expect_eq(f, features());
+    if @target_has("avx2") {
+        @expect(has("avx2"));  // the build may use it, so this CPU has it
+    }
+    if @target_arch("x86_64") and ((f & X_SSE42) != 0) {
+        @expect((f & X_SSE41) != 0);  // (any CPU with SSE4.2 has SSE4.1)
+    }
+    if @target_arch("wasm32") {
+        @expect_eq(f, 0);
+    }
+}

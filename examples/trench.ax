@@ -1,6 +1,6 @@
 // =============================================================================
 // File: trench.ax
-// A trench run in 3D on Windows with Direct3D 12, after the vector arcade
+// A trench run in 3D on Windows (Direct3D 12) and macOS (Metal), after the
 // games of the early 1980s, with filled, lit and subtly textured surfaces in
 // place of their line art. Dive into a trench on a space station, weave over
 // and under the catwalks and around the baffles, shoot the turrets and their
@@ -9,15 +9,16 @@
 // starts the next wave, faster and better defended.
 //
 //   axiom build examples/trench.ax --target=x86_64-windows -O2 --subsystem=windows -o trench.exe
-//   trench.exe                  (arrows or WASD to steer, Space or Ctrl to
+//   axiom build examples/trench.ax --target=aarch64-macos -O2 -o trench
+//   trench                      (arrows or WASD to steer, Space or Ctrl to
 //                                fire; a controller's left stick or d-pad,
 //                                A or the right trigger; Escape or Back quits)
-//   trench.exe --autopilot      (it plays itself)
-//   trench.exe --png out.png --frames 600   (plays 600 frames by itself
+//   trench --autopilot          (it plays itself)
+//   trench --png out.png --frames 600   (plays 600 frames by itself
 //                                offscreen, then saves the last as a PNG)
 //
-// It draws with std/graphics/d3d12 (a depth buffer, culling, additive glows,
-// a shadow map, a constant buffer of lights) and std/graphics/hlsl; the
+// It draws with std/graphics/gpu (a depth buffer, culling, additive glows,
+// a shadow map, a constant buffer of lights; its shaders in HLSL and MSL); the
 // camera is std/math/geometry's look_at and perspective_zo, the sun's
 // shadow map its orthographic_zo. The station is one static mesh per wave:
 // walls, floor and surface greebled with blocks, pipe runs, conduits, vents,
@@ -32,15 +33,15 @@
 // fireballs, shots, explosions and turrets about to fire, with a little
 // shine; then fogged. Hits shake and roll the view and fill it with red
 // and static.
-// Sound is made with std/audio and played with std/audio/xaudio2.
+// Sound is made with std/audio and played with std/audio/output; the window,
+// keys and controllers are std/os/window and std/os/gamepad.
 // =============================================================================
 
 import "std/audio" as audio;
-import "std/audio/xaudio2" as xaudio2;
+import "std/audio/output" as output;
 import "std/collections/vec" as vec;
 import "std/fmt" as fmt;
-import "std/graphics/d3d12" as d3d;
-import "std/graphics/hlsl" as hlsl;
+import "std/graphics/gpu" as gx;
 import "std/graphics/image/png" as png;
 import "std/io" as io;
 import "std/math" as math;
@@ -51,8 +52,8 @@ import "std/mem" as mem;
 import "std/os" as os;
 import "std/os/cli" as cli;
 import "std/os/fs" as fs;
-import "std/os/win32" as win32;
-import "std/os/xinput" as xinput;
+import "std/os/gamepad" as gamepad;
+import "std/os/window" as window;
 import "std/str" as strs;
 import "std/time" as time;
 
@@ -167,6 +168,119 @@ let SHADER_LINES: [187][]u8 = ["cbuffer C : register(b0) {", "    float4x4 viewp
                                "        float d = length(i.uv * float2(1.0, 0.85));",
                                "        return float4(color.rgb, smoothstep(0.55, 1.4, d) * color.a);", "    }",
                                "    return color;", "}"];
+
+// The same shaders in MSL, for Metal: the constants as structs at buffer(0)
+// and buffer(1), the shadow map a depth2d read with sample_compare.
+let MSL_LINES: [194][]u8 = ["#include <metal_stdlib>", "using namespace metal;", "struct C {", "    float4x4 viewproj;",
+                            "    float4 eye;", "    float4 light;", "    float4 right;", "    float4 up;",
+                            "    float4 m0;", "    float4 m1;", "    float4 m2;", "    float4 color;",
+                            "    float4 params;", "};", "struct L {", "    float4x4 sunvp;", "    float4 info;",
+                            "    float4 lpos[24];", "    float4 lcol[24];", "    float4 lcount;", "};", "struct VIn {",
+                            "    float3 pos [[attribute(0)]];", "    float3 nrm [[attribute(1)]];",
+                            "    float4 col [[attribute(2)]];", "};", "struct VOut {", "    float4 pos [[position]];",
+                            "    float3 w;", "    float3 n;", "    float4 col;", "};",
+                            "float3 world(constant C& c, float3 p) {", "    float4 q = float4(p, 1.0);",
+                            "    return float3(dot(c.m0, q), dot(c.m1, q), dot(c.m2, q));", "}",
+                            "vertex VOut vs(VIn i [[stage_in]], constant C& c [[buffer(0)]]) {", "    VOut o;",
+                            "    o.w = world(c, i.pos);",
+                            "    o.n = float3(dot(c.m0.xyz, i.nrm), dot(c.m1.xyz, i.nrm), dot(c.m2.xyz, i.nrm));",
+                            "    o.pos = c.viewproj * float4(o.w, 1.0);",
+                            "    o.col = float4(i.col.rgb * c.color.rgb, c.params.x < 0.0 ? i.col.a : c.params.x);",
+                            "    return o;", "}", "struct SOut {", "    float4 pos [[position]];", "};",
+                            "vertex SOut vs_shadow(VIn i [[stage_in]], constant C& c [[buffer(0)]], constant L& lt [[buffer(1)]]) {",
+                            "    SOut o;", "    o.pos = lt.sunvp * float4(world(c, i.pos), 1.0);", "    return o;", "}",
+                            "float hash(float2 p) {",
+                            "    return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);", "}",
+                            "float noise(float2 p) {", "    float2 c = floor(p);", "    float2 f = fract(p);",
+                            "    f = f * f * (3.0 - 2.0 * f);",
+                            "    float a = mix(hash(c), hash(c + float2(1.0, 0.0)), f.x);",
+                            "    float b = mix(hash(c + float2(0.0, 1.0)), hash(c + float2(1.0, 1.0)), f.x);",
+                            "    return mix(a, b, f.y);", "}",
+                            "float3 fog(constant C& c, float3 col, float3 w, float amount) {",
+                            "    float k = exp(-length(w - c.eye.xyz) * c.light.w * amount);",
+                            "    return mix(float3(0.006, 0.008, 0.014), col, k);", "}",
+                            "float trench_shadow(constant C& c, float3 w) {",
+                            "    if (abs(w.x) > 7.01 || w.y > 12.0) {", "        return 1.0;", "    }",
+                            "    float3 l = -c.light.xyz;", "    float side = l.x > 0.0 ? 7.0 : -7.0;",
+                            "    float t = (side - w.x) / l.x;", "    return smoothstep(11.6, 12.4, w.y + t * l.y);",
+                            "}",
+                            "float sun_shadow(constant C& c, constant L& lt, depth2d<float> shadowmap, sampler cmp, float3 w, float3 n) {",
+                            "    float4 p = lt.sunvp * float4(w + n * 0.08, 1.0);",
+                            "    float2 uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);",
+                            "    if (lt.info.y < 0.5 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 || p.z > 1.0) {",
+                            "        return trench_shadow(c, w);", "    }", "    float s = 0.0;",
+                            "    for (int y = -1; y <= 1; y++) {", "        for (int x = -1; x <= 1; x++) {",
+                            "            s += shadowmap.sample_compare(cmp, uv + float2(x, y) * lt.info.x, p.z, level(0));",
+                            "        }", "    }", "    return s / 9.0;", "}",
+                            "float3 point_light(float3 w, float3 n, float3 v, float3 lp, float r, float3 c) {",
+                            "    float3 d = lp - w;", "    float dist = length(d);",
+                            "    float att = saturate(1.0 - dist / r);", "    att *= att;",
+                            "    float3 ld = d / max(dist, 0.001);",
+                            "    float diff = saturate(dot(n, ld)) * 0.85 + 0.15;",
+                            "    float spec = pow(saturate(dot(n, normalize(ld + v))), 24.0) * 0.5;",
+                            "    return c * att * (diff + spec);", "}",
+                            "fragment float4 ps(VOut i [[stage_in]], constant C& c [[buffer(0)]], constant L& lt [[buffer(1)]],",
+                            "                   depth2d<float> shadowmap [[texture(0)]], sampler cmp [[sampler(1)]]) {",
+                            "    float3 n = normalize(i.n);", "    float mat = i.col.a;", "    if (mat > 2.5) {",
+                            "        float on = step(0.6, fract(c.eye.w * 1.3 - i.w.x * 0.09 + i.w.y * 0.03));",
+                            "        return float4(fog(c, i.col.rgb * (0.12 + 2.2 * on), i.w, 0.3), 1.0);", "    }",
+                            "    if (mat > 0.5 && mat < 1.5) {",
+                            "        float pulse = 0.85 + 0.15 * sin(c.eye.w * 5.0 + i.w.z * 0.15);",
+                            "        return float4(fog(c, i.col.rgb * pulse * 1.6, i.w, 0.3), 1.0);", "    }",
+                            "    float3 a = abs(n);",
+                            "    float2 uv = a.x > max(a.y, a.z) ? i.w.zy : (a.y > a.z ? i.w.xz : i.w.xy);",
+                            "    float size = mat > 1.5 ? 0.75 : 2.0;", "    float2 q = uv / size;",
+                            "    float2 cell = floor(q);", "    float2 f = fract(q);",
+                            "    float edge = min(min(f.x, f.y), min(1.0 - f.x, 1.0 - f.y));",
+                            "    float seam = smoothstep(0.0, 0.045, edge);",
+                            "    float tint = 0.8 + 0.32 * hash(cell);",
+                            "    float grain = 0.86 + 0.28 * noise(uv * 3.0) * noise(uv * 0.6 + 3.1);",
+                            "    float3 base = i.col.rgb * tint * grain * (0.5 + 0.5 * seam);",
+                            "    float shine = (mat > 1.5 ? 0.25 : 0.45) * (0.6 + 0.4 * hash(cell + 17.0));",
+                            "    float3 toeye = c.eye.xyz - i.w;", "    float dist = length(toeye);",
+                            "    float3 v = toeye / dist;", "    float3 l = -c.light.xyz;",
+                            "    float lambert = saturate(dot(n, l));",
+                            "    float shadow = lambert > 0.0 ? sun_shadow(c, lt, shadowmap, cmp, i.w, n) : 0.0;",
+                            "    float3 sun = float3(0.2, 0.24, 0.34) * shadow * (lambert * 0.95 + pow(saturate(dot(n, normalize(l + v))), 32.0) * shine);",
+                            "    float outside = saturate((abs(i.w.x) - 7.4) * 4.0);",
+                            "    float ao = mix(0.55 + 0.45 * saturate(i.w.y / 12.0), 1.0, outside);",
+                            "    float3 sky = float3(0.03, 0.035, 0.05) * (0.7 + 0.3 * n.y) * ao;",
+                            "    float3 fwd = cross(c.up.xyz, c.right.xyz);",
+                            "    float spot = smoothstep(0.8, 0.95, dot(-v, fwd));",
+                            "    float head = (spot * 0.8 + 0.05) * saturate(dot(n, v)) / (1.0 + dist * dist * 0.0012);",
+                            "    float3 local = float3(0.0);", "    int count = int(lt.lcount.x);",
+                            "    for (int k = 0; k < count; k++) {",
+                            "        local += point_light(i.w, n, v, lt.lpos[k].xyz, lt.lpos[k].w, lt.lcol[k].rgb * lt.lcol[k].w);",
+                            "    }", "    if (i.w.z > -864.0 && i.w.z < 40.0 && i.w.y < 12.0) {",
+                            "        float zc = round((i.w.z - 5.2) / 8.0) * 8.0 + 5.2;",
+                            "        float3 amber = float3(1.0, 0.5, 0.14) * 2.4;",
+                            "        local += point_light(i.w, n, v, float3(-6.7, 0.65, zc), 6.5, amber);",
+                            "        local += point_light(i.w, n, v, float3(6.7, 0.65, zc), 6.5, amber);", "    }",
+                            "    float3 lit = base * (sun + sky + head + local) + local * shine * 0.15;",
+                            "    return float4(fog(c, lit, i.w, 1.0), 1.0);", "}", "struct GOut {",
+                            "    float4 pos [[position]];", "    float2 uv;", "    float3 w;", "};",
+                            "vertex GOut vs_glow(VIn i [[stage_in]], constant C& c [[buffer(0)]]) {",
+                            "    float3 w = c.m0.xyz + (c.right.xyz * i.pos.x + c.up.xyz * i.pos.y) * c.m0.w;",
+                            "    GOut o;", "    o.pos = c.viewproj * float4(w, 1.0);", "    o.uv = i.pos.xy;",
+                            "    o.w = w;", "    return o;", "}",
+                            "fragment float4 ps_glow(GOut i [[stage_in]], constant C& c [[buffer(0)]]) {",
+                            "    float k = saturate(1.0 - length(i.uv));",
+                            "    float glow = k * k + pow(k, 8.0) * 2.0;",
+                            "    float f = c.params.y > 0.5 ? exp(-length(i.w - c.eye.xyz) * c.light.w * 0.5) : 1.0;",
+                            "    return float4(c.color.rgb * glow * c.color.a * f, 1.0);", "}", "struct HOut {",
+                            "    float4 pos [[position]];", "    float2 uv;", "};",
+                            "vertex HOut vs_hud(VIn i [[stage_in]], constant C& c [[buffer(0)]]) {", "    HOut o;",
+                            "    o.pos = float4(c.m0.xy + i.pos.xy * c.m0.zw, 0.0, 1.0);", "    o.uv = i.pos.xy;",
+                            "    return o;", "}",
+                            "fragment float4 ps_hud(HOut i [[stage_in]], constant C& c [[buffer(0)]]) {",
+                            "    if (c.params.x > 1.5) {", "        float row = floor(i.pos.y / 3.0);",
+                            "        float band = fract(sin(row * 12.9898 + floor(c.eye.w * 40.0) * 78.233) * 43758.5453);",
+                            "        float speck = fract(sin(dot(floor(i.pos.xy / 2.0), float2(12.9898, 78.233)) + c.eye.w * 13.0) * 43758.5453);",
+                            "        return float4(c.color.rgb, (step(0.96, band) * 0.5 + step(0.985, speck) * 0.5) * c.color.a);",
+                            "    }", "    if (c.params.x > 0.5) {",
+                            "        float d = length(i.uv * float2(1.0, 0.85));",
+                            "        return float4(c.color.rgb, smoothstep(0.55, 1.4, d) * c.color.a);", "    }",
+                            "    return c.color;", "}", ""];
 
 // -----------------------------------------------------------------------------
 // The world: a trench along -z, x in -W..W, floor at 0, rim at H
@@ -1043,7 +1157,7 @@ fn build_level(g: *mut Game, m: *mut Mesh) !void {
             let ly1 = @min(b.y1, H - 0.3) - 0.25;
             let mut x = b.x0 + 0.4;
             while x < b.x1 - 0.3 {
-                for y in [ly0, ly1]{
+                for y in [ly0, ly1] {
                     warning_light(m, style, v3(x, y, b.z1), lc)!;
                 }
                 x += spacing;
@@ -1063,18 +1177,18 @@ fn build_level(g: *mut Game, m: *mut Mesh) !void {
 // Graphics
 // -----------------------------------------------------------------------------
 struct Gfx {
-    root: d3d.RootSignature,
-    solid: d3d.Pipeline,
-    glow: d3d.Pipeline,
-    hud: d3d.Pipeline,
-    shadow_pipe: d3d.Pipeline,
-    shadow: d3d.DepthBuffer,  // the sun's shadow map
-    lights: d3d.Buffer,       // b1: the sun's matrix and the lights near the ship
-    cube_v: d3d.Buffer,
-    cube_i: d3d.Buffer,
-    quad: d3d.Buffer,
-    world_v: d3d.Buffer,
-    world_i: d3d.Buffer,
+    root: gx.RootSignature,
+    solid: gx.Pipeline,
+    glow: gx.Pipeline,
+    hud: gx.Pipeline,
+    shadow_pipe: gx.Pipeline,
+    shadow: gx.DepthBuffer,  // the sun's shadow map
+    lights: gx.Buffer,       // b1: the sun's matrix and the lights near the ship
+    cube_v: gx.Buffer,
+    cube_i: gx.Buffer,
+    quad: gx.Buffer,
+    world_v: gx.Buffer,
+    world_i: gx.Buffer,
     world_n: u32,
 }
 
@@ -1086,72 +1200,68 @@ fn u32_bytes(p: []u32) []u8 {
     return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
 }
 
-fn shader_source() !strs.String {
+fn source(lines: [][]u8) !strs.String {
     let mut s = strs.String.init();
-    for l in SHADER_LINES {
+    for l in lines {
         s.push_str(l)!;
         s.push('\n')!;
     }
     return s;
 }
 
-fn shader(src: []u8, entry: []u8, target: []u8) !hlsl.Code {
-    return hlsl.compile(src, entry, target) catch |e| {
-        if e == error.CompileError {
-            fmt.eprint("trench: {}\n", [fmt.str(hlsl.message())]) catch {};
-        }
+// The shaders, from both sources.
+fn shaders(gpu: *mut gx.Device) !gx.Shaders {
+    let mut hlsl_src = source(SHADER_LINES[..])!;
+    defer hlsl_src.deinit();
+    let mut msl_src = source(MSL_LINES[..])!;
+    defer msl_src.deinit();
+    return gpu.shaders(hlsl_src.bytes(), msl_src.bytes()) catch |e| {
+        fmt.eprint("trench: {}\n", [fmt.str(gx.message())]) catch {};
         return e;
     };
 }
 
 // A pipeline from the shaders' entry points vs and ps (none for depth_only).
-fn pipe(gpu: *mut d3d.Device, root: *d3d.RootSignature, src: []u8, vs: []u8, ps: []u8,
-        o: d3d.PipelineOptions) !d3d.Pipeline {
-    let mut vcode = shader(src, vs, "vs_5_0")!;
-    defer vcode.release();
-    if o.depth_only {
-        let attrs = attributes();
-        return gpu.pipeline_with(root, &vcode, &vcode, attrs[..], o);
-    }
-    let mut pcode = shader(src, ps, "ps_5_0")!;
-    defer pcode.release();
+fn pipe(gpu: *mut gx.Device, root: *gx.RootSignature, sh: *gx.Shaders, vs: []u8, ps: []u8,
+        o: gx.PipelineOptions) !gx.Pipeline {
     let attrs = attributes();
-    return gpu.pipeline_with(root, &vcode, &pcode, attrs[..], o);
+    return gpu.pipeline_with(root, sh, vs, ps, attrs[..], o) catch |e| {
+        fmt.eprint("trench: {}\n", [fmt.str(gx.message())]) catch {};
+        return e;
+    };
 }
 
-fn attributes() [3]d3d.Attribute {
-    let attrs: [3]d3d.Attribute = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32B32_FLOAT,
-                                                   offset: 0 }, d3d.Attribute.{
-                                                       semantic: "NORMAL", index: 0, format: d3d.R32G32B32_FLOAT,
-                                                       offset: 12 }, d3d.Attribute.{
-                                                           semantic: "COLOR", index: 0, format: d3d.R32G32B32A32_FLOAT,
-                                                           offset: 24 }];
+fn attributes() [3]gx.Attribute {
+    let attrs: [3]gx.Attribute = [gx.Attribute.{ semantic: "POSITION", index: 0, format: gx.R32G32B32_FLOAT,
+                                                 offset: 0 }, gx.Attribute.{
+                                                     semantic: "NORMAL", index: 0, format: gx.R32G32B32_FLOAT,
+                                                     offset: 12 }, gx.Attribute.{
+                                                         semantic: "COLOR", index: 0, format: gx.R32G32B32A32_FLOAT,
+                                                         offset: 24 }];
     return attrs;
 }
 
-fn options(blend: u32, depth: u32, cull: u32) d3d.PipelineOptions {
-    let mut o = d3d.PipelineOptions.defaults();
+fn options(blend: u32, depth: u32, cull: u32) gx.PipelineOptions {
+    let mut o = gx.PipelineOptions.defaults();
     o.blend = blend;
     o.depth = depth;
     o.cull = cull;
     return o;
 }
 
-fn graphics(gpu: *mut d3d.Device) !Gfx {
-    let mut src = shader_source()!;
-    defer src.deinit();
+fn graphics(gpu: *mut gx.Device) !Gfx {
+    let mut sh = shaders(gpu)!;
+    defer sh.release();
     let mut root = gpu.root_signature_with(52, 1, 1)!;
-    let solid = pipe(gpu, &root, src.bytes(), "vs", "ps", options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_BACK))!;
-    let glow_pipe = pipe(
-        gpu, &root, src.bytes(), "vs_glow", "ps_glow", options(d3d.BLEND_ADD, d3d.DEPTH_TEST, d3d.CULL_NONE))!;
-    let hud = pipe(gpu, &root, src.bytes(), "vs_hud", "ps_hud", options(d3d.BLEND_ALPHA, d3d.DEPTH_OFF,
-                                                                        d3d.CULL_NONE))!;
+    let solid = pipe(gpu, &root, &sh, "vs", "ps", options(gx.BLEND_NONE, gx.DEPTH_WRITE, gx.CULL_BACK))!;
+    let glow_pipe = pipe(gpu, &root, &sh, "vs_glow", "ps_glow", options(gx.BLEND_ADD, gx.DEPTH_TEST, gx.CULL_NONE))!;
+    let hud = pipe(gpu, &root, &sh, "vs_hud", "ps_hud", options(gx.BLEND_ALPHA, gx.DEPTH_OFF, gx.CULL_NONE))!;
     // the shadow map's pass: depth alone, pushed back a little against acne
-    let mut so = options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_NONE);
+    let mut so = options(gx.BLEND_NONE, gx.DEPTH_WRITE, gx.CULL_NONE);
     so.depth_only = true;
     so.depth_bias = 1500;
     so.slope_bias = 2.5;
-    let shadow_pipe = pipe(gpu, &root, src.bytes(), "vs_shadow", "", so)!;
+    let shadow_pipe = pipe(gpu, &root, &sh, "vs_shadow", "", so)!;
     let mut unit = mesh();
     defer mesh_deinit(&mut unit);
     add_box(&mut unit, -0.5, -0.5, -0.5, 0.5, 0.5, 0.5, v3(1.0, 1.0, 1.0), 0.0)!;
@@ -1164,14 +1274,14 @@ fn graphics(gpu: *mut d3d.Device) !Gfx {
         quad[k * 10 + 7] = 1.0;
         quad[k * 10 + 8] = 1.0;
     }
-    let empty = d3d.Buffer.{ p: 0, gpu: 0, size: 0, mapped: 0 };
+    let empty = gx.Buffer.empty();
     return Gfx.{ root: root, solid: solid, glow: glow_pipe, hud: hud, shadow_pipe: shadow_pipe,
                  shadow: gpu.shadow_map(SHADOW_SIZE)!, lights: gpu.constant_buffer(LIGHT_FLOATS * 4)!,
                  cube_v: gpu.buffer(f32_bytes(unit.v.items()))!, cube_i: gpu.buffer(u32_bytes(unit.i.items()))!,
                  quad: gpu.buffer(f32_bytes(quad[..]))!, world_v: empty, world_i: empty, world_n: 0 };
 }
 
-fn upload_world(gpu: *mut d3d.Device, gfx: *mut Gfx, g: *mut Game) !void {
+fn upload_world(gpu: *mut gx.Device, gfx: *mut Gfx, g: *mut Game) !void {
     let mut m = mesh();
     defer mesh_deinit(&mut m);
     build_level(g, &mut m)!;
@@ -1388,7 +1498,7 @@ fn light_data(g: *Game, out: []mut f32) void {
     out[LCOUNT] = @float_from_int(f32, count);
 }
 
-fn put_draw(gpu: *mut d3d.Device, vals: [20]f32) void {
+fn put_draw(gpu: *mut gx.Device, vals: [20]f32) void {
     let mut u: [20]u32 = [0; 20];
     for k in @as(usize, 0)..20 {
         u[k] = @bit_cast(u32, vals[k]);
@@ -1398,7 +1508,7 @@ fn put_draw(gpu: *mut d3d.Device, vals: [20]f32) void {
 
 // A box from the cube mesh: centre, size, turned by ang about y; mat -1 is
 // plating.
-fn cube(gpu: *mut d3d.Device, p: geo.Vec3.[f32], s: geo.Vec3.[f32], ang: f32, c: geo.Vec3.[f32], mat: f32) void {
+fn cube(gpu: *mut gx.Device, p: geo.Vec3.[f32], s: geo.Vec3.[f32], ang: f32, c: geo.Vec3.[f32], mat: f32) void {
     let co = math.cosf(ang);
     let si = math.sinf(ang);
     put_draw(gpu, [s.x * co, 0.0, s.z * si, p.x, 0.0, s.y, 0.0, p.y, -s.x * si, 0.0, s.z * co, p.z, c.x, c.y, c.z, 1.0,
@@ -1406,7 +1516,7 @@ fn cube(gpu: *mut d3d.Device, p: geo.Vec3.[f32], s: geo.Vec3.[f32], ang: f32, c:
     gpu.draw_indexed(36, 0, 0);
 }
 
-fn glow(gpu: *mut d3d.Device, p: geo.Vec3.[f32], size: f32, c: geo.Vec3.[f32], a: f32, fogged: bool) void {
+fn glow(gpu: *mut gx.Device, p: geo.Vec3.[f32], size: f32, c: geo.Vec3.[f32], a: f32, fogged: bool) void {
     let mut f: f32 = 0.0;
     if fogged {
         f = 1.0;
@@ -1416,7 +1526,7 @@ fn glow(gpu: *mut d3d.Device, p: geo.Vec3.[f32], size: f32, c: geo.Vec3.[f32], a
 }
 
 // A rectangle on the screen: centre and size with y in -1..1, x in -aspect..aspect.
-fn rect(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, r: f32, gr: f32, b: f32, a: f32) void {
+fn rect(gpu: *mut gx.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, r: f32, gr: f32, b: f32, a: f32) void {
     put_draw(gpu, [x / aspect, y, w * 0.5 / aspect, h * 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, r, gr, b, a, 0.0,
                    0.0, 0.0, 0.0]);
     gpu.draw(6, 0);
@@ -1424,7 +1534,7 @@ fn rect(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, r: f3
 
 // The whole screen, drawn by the HUD shader's kind 1 (a vignette, darker
 // toward the edges) or 2 (interference).
-fn overlay(gpu: *mut d3d.Device, kind: f32, c: geo.Vec3.[f32], a: f32) void {
+fn overlay(gpu: *mut gx.Device, kind: f32, c: geo.Vec3.[f32], a: f32) void {
     put_draw(gpu, [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, kind, 0.0, 0.0, 0.0]);
     gpu.draw(6, 0);
 }
@@ -1432,7 +1542,7 @@ fn overlay(gpu: *mut d3d.Device, kind: f32, c: geo.Vec3.[f32], a: f32) void {
 // Seven-segment digits: bit 0 is the top, then clockwise, bit 6 the middle.
 let DIGITS: [10]u8 = [0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f];
 
-fn digit(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, h: f32, d: u32, c: geo.Vec3.[f32]) void {
+fn digit(gpu: *mut gx.Device, aspect: f32, x: f32, y: f32, h: f32, d: u32, c: geo.Vec3.[f32]) void {
     let w = h * 0.55;
     let t = h * 0.13;
     let m = DIGITS[@as(usize, d % 10)];
@@ -1448,7 +1558,7 @@ fn digit(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, h: f32, d: u32, c: g
     }
 }
 
-fn number(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, h: f32, n: u32, places: u32, c: geo.Vec3.[f32]) void {
+fn number(gpu: *mut gx.Device, aspect: f32, x: f32, y: f32, h: f32, n: u32, places: u32, c: geo.Vec3.[f32]) void {
     let mut v = n;
     let mut k: u32 = 0;
     while k < places {
@@ -1459,7 +1569,7 @@ fn number(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, h: f32, n: u32, pla
     }
 }
 
-fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.DepthBuffer, g: *Game) !void {
+fn draw(gpu: *mut gx.Device, gfx: *mut Gfx, t: *mut gx.Target, z: *mut gx.DepthBuffer, g: *Game) !void {
     let aspect = @float_from_int(f32, t.width) / @float_from_int(f32, t.height);
     let cam = camera(g);
     let fc = frame_constants(cam, aspect, g.time);
@@ -1499,14 +1609,14 @@ fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.Dep
 }
 
 // The trench, the turrets and debris (into the shadow map, or lit).
-fn solids(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game) void {
+fn solids(gpu: *mut gx.Device, gfx: *Gfx, g: *Game) void {
     gpu.set_vertices(&gfx.world_v, 40);
-    gpu.set_indices(&gfx.world_i, d3d.R32_UINT);
+    gpu.set_indices(&gfx.world_i, gx.R32_UINT);
     put_draw(gpu, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 0.0,
                    0.0]);
     gpu.draw_indexed(gfx.world_n, 0, 0);
     gpu.set_vertices(&gfx.cube_v, 40);
-    gpu.set_indices(&gfx.cube_i, d3d.R32_UINT);
+    gpu.set_indices(&gfx.cube_i, gx.R32_UINT);
     let metal = v3(0.5, 0.5, 0.55);
     for i in 0..g.nturrets {
         let tu = g.turrets[i];
@@ -1533,7 +1643,7 @@ fn solids(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game) void {
 
 // Stars, the port's glow, turrets' eyes, fireballs, shots and sparks, added
 // over the scene.
-fn glows(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game, cam: Camera, fc: [32]u32, open: bool) void {
+fn glows(gpu: *mut gx.Device, gfx: *Gfx, g: *Game, cam: Camera, fc: [32]u32, open: bool) void {
     gpu.set_pipeline(&gfx.glow);
     gpu.set_constants_at(0, fc[..]);
     gpu.set_vertices(&gfx.quad, 40);
@@ -1596,7 +1706,7 @@ fn glows(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game, cam: Camera, fc: [32]u32, op
 }
 
 // The crosshair, score, wave, shields, the way to the port, flashes.
-fn instruments(gpu: *mut d3d.Device, gfx: *Gfx, g: *Game, aspect: f32, open: bool, fc: [32]u32) void {
+fn instruments(gpu: *mut gx.Device, gfx: *Gfx, g: *Game, aspect: f32, open: bool, fc: [32]u32) void {
     gpu.set_pipeline(&gfx.hud);
     gpu.set_constants_at(0, fc[..]);
     let jolt = g.shake * g.shake;
@@ -1712,32 +1822,32 @@ fn engine_sound() !audio.Sound {
 }
 
 struct Sound {
-    engine: xaudio2.Engine,
+    engine: output.Engine,
     on: bool,
     laser: audio.Sound,
     boom: audio.Sound,
     big: audio.Sound,
     hit: audio.Sound,
     hum: audio.Sound,
-    lasers: [4]xaudio2.Voice,
-    booms: [4]xaudio2.Voice,
-    big_v: xaudio2.Voice,
-    hit_v: xaudio2.Voice,
-    hum_v: xaudio2.Voice,
+    lasers: [4]output.Voice,
+    booms: [4]output.Voice,
+    big_v: output.Voice,
+    hit_v: output.Voice,
+    hum_v: output.Voice,
     next_laser: usize,
     next_boom: usize,
 }
 
 fn sound(enabled: bool) !Sound {
-    let none = xaudio2.Voice.{ v: 0, block: 0 };
-    let mut s = Sound.{ engine: xaudio2.Engine.{ x: 0, master: 0 }, on: false, laser: laser_sound()!,
+    let none = output.Voice.none();
+    let mut s = Sound.{ engine: output.Engine.none(), on: false, laser: laser_sound()!,
                         boom: boom_sound(0.9, 4.5, 60.0, 11)!, big: boom_sound(3.0, 1.3, 38.0, 23)!, hit: hit_sound()!,
                         hum: engine_sound()!, lasers: [none; 4], booms: [none; 4], big_v: none, hit_v: none,
                         hum_v: none, next_laser: 0, next_boom: 0 };
     if not enabled {
         return s;
     }
-    s.engine = xaudio2.Engine.init() catch {
+    s.engine = output.Engine.init() catch {
         return s;  // no audio device: silence
     };
     for i in @as(usize, 0)..4 {
@@ -1827,15 +1937,15 @@ struct Keys {
 }
 
 fn key(k: *mut Keys, code: u32, down: bool) void {
-    if (code == win32.KEY_LEFT) or (code == 'A') {
+    if (code == window.KEY_LEFT) or (code == 'A') {
         k.left = down;
-    } else if (code == win32.KEY_RIGHT) or (code == 'D') {
+    } else if (code == window.KEY_RIGHT) or (code == 'D') {
         k.right = down;
-    } else if (code == win32.KEY_UP) or (code == 'W') {
+    } else if (code == window.KEY_UP) or (code == 'W') {
         k.up = down;
-    } else if (code == win32.KEY_DOWN) or (code == 'S') {
+    } else if (code == window.KEY_DOWN) or (code == 'S') {
         k.down = down;
-    } else if (code == win32.KEY_SPACE) or (code == win32.KEY_CONTROL) {
+    } else if (code == window.KEY_SPACE) or (code == window.KEY_CONTROL) {
         k.fire = down;
     }
 }
@@ -1926,7 +2036,7 @@ fn hurt(g: *mut Game, s: *mut Sound) void {
     g.kick = if_else(g.rng.float32() < 0.5, -1.0, 1.0) * g.rng.float32_range(0.18, 0.35);
     g.static_t = 0.45;
     g.rumble = 0.45;
-    _ = xinput.vibrate(0, 1.0, 1.0);
+    _ = gamepad.vibrate(0, 1.0, 1.0);
     play_hit(s);
     play_boom(s, 0.6, 1.0);
     let ahead = g.pos.add(camera(g).fwd.scale(2.5));
@@ -1952,7 +2062,7 @@ fn update(g: *mut Game, inp: Input, s: *mut Sound, dt: f32) void {
     if g.rumble > 0.0 {
         g.rumble -= dt;
         if g.rumble <= 0.0 {
-            _ = xinput.vibrate(0, 0.0, 0.0);
+            _ = gamepad.vibrate(0, 0.0, 0.0);
         }
     }
 
@@ -2093,7 +2203,7 @@ fn update(g: *mut Game, inp: Input, s: *mut Sound, dt: f32) void {
                     g.flash_white = 1.6;
                     g.shake = 1.2;
                     g.rumble = 1.0;
-                    _ = xinput.vibrate(0, 1.0, 1.0);
+                    _ = gamepad.vibrate(0, 1.0, 1.0);
                     play_big(s);
                     for k in @as(usize, 0)..6 {
                         explode(g, v3(g.rng.float32_range(-5.0, 5.0), g.rng.float32_range(2.0, 11.0), -LEN + 2.0), 2.0);
@@ -2183,10 +2293,10 @@ fn status(g: *Game, buf: []mut u8) ![]u8 {
 }
 
 fn windowed(frames: i64, auto: bool) !i32 {
-    let mut w = win32.Window.open("Trench run", 1280, 720)!;
+    let mut w = window.Window.open("Trench run", 1280, 720)!;
     defer w.deinit();
     let sz = w.size();
-    let mut gpu = d3d.Device.init_window(w.handle(), sz[0], sz[1])!;
+    let mut gpu = gx.Device.init_window(w.handle(), sz[0], sz[1])!;
     defer gpu.deinit();
     let mut zbuf = gpu.depth_buffer(sz[0], sz[1])!;
     defer zbuf.release();
@@ -2197,7 +2307,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
     let mut g = new_game(@bit_cast(u64, time.Instant.now().ns));
     upload_world(&mut gpu, &mut gfx, &mut g)!;
     let mut keys = Keys.{ left: false, right: false, up: false, down: false, fire: false };
-    let mut pads = xinput.Tracker.init();
+    let mut pads = gamepad.Tracker.init();
     let mut title: [96]u8 = [0; 96];
     let mut shown: [96]u8 = [0; 96];
     let mut shown_len: usize = 0;
@@ -2205,36 +2315,40 @@ fn windowed(frames: i64, auto: bool) !i32 {
     let mut n: i64 = 0;
     loop {
         let e = w.next_event();
-        if (e.kind == win32.EventKind.CLOSE) or ((e.kind == win32.EventKind.KEY_DOWN) and (e.key == win32.KEY_ESCAPE)) {
+        if (e.kind == window.EventKind.CLOSE) or
+           ((e.kind == window.EventKind.KEY_DOWN) and (e.key == window.KEY_ESCAPE)) {
             break;
         }
-        if e.kind == win32.EventKind.KEY_DOWN {
+        if e.kind == window.EventKind.KEY_DOWN {
             key(&mut keys, e.key, true);
             continue;
         }
-        if e.kind == win32.EventKind.KEY_UP {
+        if e.kind == window.EventKind.KEY_UP {
             key(&mut keys, e.key, false);
             continue;
         }
-        if e.kind == win32.EventKind.RESIZE {
+        if e.kind == window.EventKind.RESIZE {
             gpu.resize(e.width, e.height)!;
             gpu.resize_depth(&mut zbuf, e.width, e.height)!;
             continue;
         }
-        if e.kind != win32.EventKind.NONE {
+        if e.kind != window.EventKind.NONE {
             continue;
         }
         let p = pads.update();
-        if pads.pressed(0, xinput.BACK) {
+        if pads.pressed(0, gamepad.BACK) {
             break;
         }
         let dt = @float_cast(f32, @min(@float_from_int(f64, last.elapsed().ns) / 1e9, 0.05));
         last = time.Instant.now();
         let pad = p[0];
         let mut inp = Input.{
-            x: axis(keys.left, keys.right) + pad.left_x + axis(pad.down(xinput.DPAD_LEFT), pad.down(xinput.DPAD_RIGHT)),
-            y: axis(keys.down, keys.up) + pad.left_y + axis(pad.down(xinput.DPAD_DOWN), pad.down(xinput.DPAD_UP)),
-            fire: keys.fire or pad.down(xinput.A) or (pad.right_trigger > 0.3) };
+            x: axis(keys.left, keys.right) + pad.left_x + axis(pad.down(gamepad.DPAD_LEFT),
+                                                               pad.down(gamepad.DPAD_RIGHT)), y: axis(
+                                                                   keys.down,
+                                                                   keys.up) + pad.left_y +
+            axis(pad.down(gamepad.DPAD_DOWN), pad.down(gamepad.DPAD_UP)), fire: keys.fire or pad.down(gamepad.A) or
+            (pad.right_trigger > 0.3) };
         if auto {
             inp = autopilot(&g);
         }
@@ -2262,7 +2376,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
             break;
         }
     }
-    _ = xinput.vibrate(0, 0.0, 0.0);
+    _ = gamepad.vibrate(0, 0.0, 0.0);
     fmt.print("{} frames, wave {}, score {}\n", [fmt.int(n), fmt.int(g.wave), fmt.int(g.score)])!;
     return 0;
 }
@@ -2270,7 +2384,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
 // Plays `frames` frames by itself (at 60 a second) offscreen, then saves
 // the last as a PNG.
 fn offscreen(out: []u8, frames: i64) !i32 {
-    let mut gpu = d3d.Device.init()!;
+    let mut gpu = gx.Device.init()!;
     defer gpu.deinit();
     let mut gfx = graphics(&mut gpu)!;
     defer release(&mut gfx);
@@ -2305,7 +2419,7 @@ fn offscreen(out: []u8, frames: i64) !i32 {
 }
 
 fn run() !i32 {
-    let mut p = cli.Parser.init("trench", "A trench run in 3D: Direct3D 12, XInput and XAudio2 (Windows).");
+    let mut p = cli.Parser.init("trench", "A trench run in 3D (Windows and macOS).");
     defer p.deinit();
     p.option("png", 'o', "FILE", "play by itself offscreen, then save the last frame as a PNG")!;
     p.option("frames", 'n', "N", "quit after N frames (with --png: how many to play first)")!;
@@ -2325,8 +2439,8 @@ fn run() !i32 {
         fmt.eprint("trench: {}\n", [fmt.str(p.message())])!;
         return 2;
     };
-    if not os.is_windows() {
-        io.stderr().println("trench: this needs Windows (--target=x86_64-windows)")!;
+    if not os.is_windows() and not os.is_macos() {
+        io.stderr().println("trench: this needs Windows or macOS")!;
         return 1;
     }
     if m.has("png") {

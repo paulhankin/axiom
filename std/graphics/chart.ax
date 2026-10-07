@@ -1,0 +1,1994 @@
+// =============================================================================
+// std/graphics/chart.ax - charts: line, step, scatter, area, bar and pie charts
+// with axes, ticks, grids, titles and a legend, drawn into a bitmap (through
+// std/graphics/draw), an SVG document (std/graphics/svg) or a PDF page
+// (std/graphics/pdf).
+//
+//     let mut f = chart.find_font()!;                  // or font.Font.load(path)
+//     defer f.deinit();
+//     let mut c = chart.Chart.init();
+//     defer c.deinit();
+//     c.set_font(&f);
+//     c.set_title("Rainfall")!;
+//     c.set_axis_titles("Month", "mm")!;
+//     c.set_categories(months[..])!;
+//     _ = c.bar("2023", rain23[..])!;
+//     let i = c.line("Average", xs[..0], avg[..])!;    // no xs: one point a category
+//     c.set_marker(i, chart.Marker.CIRCLE);
+//     c.save("rain.png", 800.0, 500.0)!;               // .svg, .pdf, or any image format
+//
+//     let mut img = c.render_image(800, 500)!;        // an RGBA image.Image
+//     let svg_text = c.svg(800.0, 500.0)!;              // mem.free it
+//     c.write_svg(w, 800.0, 500.0)!;                    // to an io.Writer
+//     let pdf_bytes = c.pdf(400.0, 250.0)!;             // a one-page document, in points
+//     c.draw(chart.Surface.Pdf(&mut page), x, y, w, h)!;  // into part of a page you are making
+//
+// A chart holds series (copies of the data) of a Kind: LINE, STEP, SCATTER
+// and AREA plot (x, y) points (with no xs, x is the point's index); BAR
+// plots one value a category, bars of several series side by side, or
+// stacked when Chart.stacked is set (areas stack too); PIE draws its values
+// as slices labelled by the categories (a donut when Chart.donut > 0).
+// Series take their colours from a palette unless set_color gives one;
+// lines can be dashed and have markers.
+//
+// Axes are linear or logarithmic (Axis.scale), with "nice" ranges and ticks
+// (steps of 1, 2 or 5 times a power of ten; decades on a log axis) unless
+// set_x_range/set_y_range fix the ends, grid lines, and titles. When there
+// are categories, or bars, the x axis is one band a category, labelled with
+// the category names (thinned out when they would overlap). Values that
+// are NaN, or not positive on a log axis, are left out. Drawing is clipped
+// to the plot area.
+//
+// Text needs a font (set_font) to be drawn into a bitmap or a PDF page, and
+// to be measured; without one, bitmaps and PDF pages get no text, and SVG
+// gets <text> elements in Style.font_family placed with widths estimated
+// from the number of characters. SVG text is anchored (text-anchor), so a
+// viewer's font centres and right-aligns it whatever its metrics.
+//
+// The same layout code draws onto every backend through Surface, so a
+// chart looks the same in each: user units are pixels in a bitmap and in
+// SVG, and points on a PDF page.
+// =============================================================================
+
+import "../collections/vec.ax" as vec;
+import "../fmt.ax" as fmt;
+import "../io.ax" as io;
+import "../math.ax" as math;
+import "../mem.ax" as mem;
+import "../str.ax" as strs;
+import "color.ax" as color;
+import "draw.ax" as draw;
+import "font.ax" as font;
+import "image.ax" as image;
+import "image/formats.ax" as formats;
+import "pdf.ax" as pdf;
+import "pdf/read.ax" as read;
+import "svg.ax" as svg;
+
+error { OutOfMemory, InvalidSeries, FontNotFound, Unsupported }
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// How a series is drawn.
+pub enum Kind: u8 {
+    LINE,     // points joined by straight lines
+    STEP,     // a horizontal line from each point to the next x, then vertical
+    SCATTER,  // markers only
+    AREA,     // a line with the area down to the axis (or the series below) filled
+    BAR,      // a bar a category
+    PIE,      // slices, labelled by the categories
+}
+
+/// A marker drawn at each point of a series.
+pub enum Marker: u8 {
+    NONE,
+    CIRCLE,
+    SQUARE,
+    DIAMOND,
+    TRIANGLE,
+    CROSS,
+}
+
+pub enum Scale: u8 {
+    LINEAR,
+    LOG,  // base 10; values that are not positive are left out
+}
+
+/// Where the legend goes: AUTO puts it on the right when there is more than
+/// one series (or a pie), and leaves it out otherwise.
+pub enum Legend: u8 {
+    AUTO,
+    NONE,
+    RIGHT,
+    BOTTOM,
+}
+
+/// Where Surface.text's x falls on the text.
+pub enum Anchor: u8 {
+    START,
+    MIDDLE,
+    END,
+}
+
+/// One set of data and how to draw it.
+pub struct Series {
+    name: []mut u8,
+    kind: Kind,
+    xs: []mut f64,  // empty: x is the index (a category)
+    ys: []mut f64,
+    color: color.Color,
+    has_color: bool,  // else the palette's colour for the series' index
+    line_width: f64,
+    marker: Marker,
+    marker_size: f64,  // radius
+    dashed: bool,
+    fill_opacity: f32,  // AREA
+
+    pub fn deinit(self: *mut Series) void {
+        mem.free(self.name);
+        mem.free(self.xs);
+        mem.free(self.ys);
+    }
+
+    /// The x of point i.
+    pub fn x_at(self: *Series, i: usize) f64 {
+        if self.xs.len > 0 {
+            return self.xs[i];
+        }
+        return @float_from_int(f64, i);
+    }
+
+    /// The number of points (the shorter of xs and ys, when xs is given).
+    pub fn count(self: *Series) usize {
+        if self.xs.len > 0 {
+            return @min(self.xs.len, self.ys.len);
+        }
+        return self.ys.len;
+    }
+}
+
+pub struct Axis {
+    title: []mut u8,
+    scale: Scale,
+    min: f64,
+    max: f64,
+    fixed_min: bool,  // min is used as it is (else from the data, rounded out to a tick)
+    fixed_max: bool,
+    grid: bool,  // grid lines at the ticks
+
+    pub fn init(grid: bool) Axis {
+        return Axis.{
+            title: no_text(),
+            scale: Scale.LINEAR,
+            min: 0.0,
+            max: 1.0,
+            fixed_min: false,
+            fixed_max: false,
+            grid: grid,
+        };
+    }
+}
+
+/// Colours, sizes and spacing (sizes in user units: pixels, or points on a
+/// PDF page).
+pub struct Style {
+    background: color.Color,  // alpha 0: none
+    text: color.Color,
+    axis: color.Color,
+    grid: color.Color,
+    palette: [10]color.Color,
+    title_size: f64,
+    label_size: f64,  // axis titles and the legend
+    tick_size: f64,   // tick labels
+    margin: f64,
+    font_family: []u8,  // SVG's font-family
+
+    pub fn default() Style {
+        return Style.{
+            background: srgb(0xffffff),
+            text: srgb(0x222222),
+            axis: srgb(0x555555),
+            grid: srgb(0xe2e2e2),
+            palette: [
+                srgb(0x4e79a7),
+                srgb(0xf28e2b),
+                srgb(0xe15759),
+                srgb(0x76b7b2),
+                srgb(0x59a14f),
+                srgb(0xedc948),
+                srgb(0xb07aa1),
+                srgb(0xff9da7),
+                srgb(0x9c755f),
+                srgb(0xbab0ac),
+            ],
+            title_size: 16.0,
+            label_size: 12.0,
+            tick_size: 11.0,
+            margin: 12.0,
+            font_family: "DejaVu Sans, Helvetica, Arial, sans-serif",
+        };
+    }
+}
+
+/// An empty string that mem.free accepts.
+fn no_text() []mut u8 {
+    return @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+}
+
+/// A colour from 0xRRGGBB (sRGB).
+pub fn srgb(rgb: u32) color.Color {
+    let r = @float_from_int(f32, (rgb >> 16) & 0xff) / 255.0;
+    let g = @float_from_int(f32, (rgb >> 8) & 0xff) / 255.0;
+    let b = @float_from_int(f32, rgb & 0xff) / 255.0;
+    return color.Color.from_srgb(r, g, b, 1.0);
+}
+
+/// A sans-serif font from the system (DejaVu Sans, Liberation Sans or
+/// Arial), or FontNotFound.
+pub fn find_font() !font.Font {
+    // places they are often found, on Linux, macOS and Windows
+    let paths: [9][]u8 = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    ];
+    for p in paths {
+        let f = font.Font.load(p) catch continue;
+        return f;
+    }
+    return error.FontNotFound;
+}
+
+// -----------------------------------------------------------------------------
+// Surfaces: what a chart draws onto
+// -----------------------------------------------------------------------------
+
+/// A bitmap canvas, an SVG document being written, or a PDF page.
+pub union Surface {
+    Canvas: *mut draw.Canvas,
+    Svg: *mut svg.Writer,
+    Pdf: *mut pdf.Page,
+
+    pub fn fill(self: Surface, p: *draw.Path, paint: draw.Paint) !void {
+        match self {
+            .Canvas(cv) => { cv.fill(p, paint, draw.FillRule.NONZERO)!; }
+            .Svg(w)     => { w.fill(p, paint, draw.FillRule.NONZERO)!; }
+            .Pdf(pg)    => { pg.fill(p, paint, draw.FillRule.NONZERO)!; }
+        }
+    }
+
+    pub fn stroke(self: Surface, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) !void {
+        match self {
+            .Canvas(cv) => { cv.stroke(p, paint, style)!; }
+            .Svg(w)     => { w.stroke(p, paint, style)!; }
+            .Pdf(pg)    => { pg.stroke(p, paint, style)!; }
+        }
+    }
+
+    /// Clips what follows, until end_clip, to a path.
+    pub fn begin_clip(self: Surface, p: *draw.Path) !void {
+        match self {
+            .Canvas(cv) => {
+                cv.save()!;
+                cv.clip_to(p, draw.FillRule.NONZERO)!;
+            }
+            .Svg(w) => { w.begin_clip(p, draw.FillRule.NONZERO)!; }
+            .Pdf(pg) => {
+                pg.save()!;
+                pg.clip(p, draw.FillRule.NONZERO)!;
+            }
+        }
+    }
+
+    pub fn end_clip(self: Surface) !void {
+        match self {
+            .Canvas(cv) => { cv.restore(); }
+            .Svg(w)     => { w.end_group()!; }
+            .Pdf(pg)    => { pg.restore()!; }
+        }
+    }
+
+    /// A line of text on the baseline through (x, y), its start, middle or
+    /// end at x, turned by angle radians (clockwise) about (x, y). width is
+    /// its measured width; f (when has_font) draws it into bitmaps and PDF.
+    pub fn text(self: Surface, f: *font.Font, has_font: bool, family: []u8, s: []u8, size: f64, x: f64, y: f64,
+                width: f64, anchor: Anchor, angle: f64, c: color.Color) !void {
+        let mut shift: f64 = 0.0;
+        if anchor == Anchor.MIDDLE {
+            shift = width / 2.0;
+        } else if anchor == Anchor.END {
+            shift = width;
+        }
+        match self {
+            .Canvas(cv) => {
+                if not has_font {
+                    return;
+                }
+                cv.save()!;
+                cv.translate(x, y);
+                if angle != 0.0 {
+                    cv.rotate(angle);
+                }
+                font.draw_text(cv, f, s, -shift, 0.0, size, draw.Paint.solid(c)) catch |e| {
+                    cv.restore();
+                    return e;
+                };
+                cv.restore();
+            }
+            .Svg(w) => {
+                let mut a = svg.Anchor.START;
+                if anchor == Anchor.MIDDLE {
+                    a = svg.Anchor.MIDDLE;
+                } else if anchor == Anchor.END {
+                    a = svg.Anchor.END;
+                }
+                if angle == 0.0 {
+                    w.text_anchored(x, y, s, size, family, c, a)!;
+                } else {
+                    w.begin_group(draw.Affine.rotation(angle).then(draw.Affine.translation(x, y)), 1.0)!;
+                    w.text_anchored(0.0, 0.0, s, size, family, c, a)!;
+                    w.end_group()!;
+                }
+            }
+            .Pdf(pg) => {
+                if not has_font {
+                    return;
+                }
+                pg.save()!;
+                pg.translate(x, y)!;
+                if angle != 0.0 {
+                    pg.rotate(angle)!;
+                }
+                pg.text(f, size, -shift, 0.0, s, c)!;
+                pg.restore()!;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Scales and ticks
+// -----------------------------------------------------------------------------
+
+const MAX_TICKS: usize = 64;
+
+/// An axis's range and its ticks.
+struct Ticks {
+    lo: f64,
+    hi: f64,
+    log: bool,
+    band: bool,  // categories: a band a category, ticks at their centres
+    v: [64]f64,
+    n: usize,
+    decimals: u32,
+
+    fn empty() Ticks {
+        return Ticks.{ lo: 0.0, hi: 1.0, log: false, band: false, v: [0.0; 64], n: 0, decimals: 0 };
+    }
+
+    /// Where v falls, 0 at lo and 1 at hi.
+    fn frac(self: *Ticks, v: f64) f64 {
+        if self.log {
+            let l0 = math.log10(self.lo);
+            let l1 = math.log10(self.hi);
+            return (math.log10(v) - l0) / (l1 - l0);
+        }
+        return (v - self.lo) / (self.hi - self.lo);
+    }
+
+    /// Whether v can be shown at all.
+    fn valid(self: *Ticks, v: f64) bool {
+        if v != v {
+            return false;
+        }
+        if self.log {
+            return v > 0.0;
+        }
+        return true;
+    }
+
+    /// The label of tick i.
+    fn label(self: *Ticks, buf: []mut u8, i: usize) []u8 {
+        let v = self.v[i];
+        if self.log {
+            // each decade with the digits it needs
+            let mut d: u32 = 0;
+            if v < 1.0 {
+                d = @int_from_float(u32, @ceil(-math.log10(v) - 1.0e-9));
+            }
+            return format_number(buf, v, d);
+        }
+        return format_number(buf, v, self.decimals);
+    }
+
+    fn push(self: *mut Ticks, v: f64) void {
+        if self.n < MAX_TICKS {
+            self.v[self.n] = v;
+            self.n += 1;
+        }
+    }
+}
+
+fn pow10(e: f64) f64 {
+    return math.pow(10.0, e);
+}
+
+/// 1, 2 or 5 times a power of ten, the nearest to raw (Heckbert's "nice numbers").
+fn nice_step(raw: f64) f64 {
+    let e = @floor(math.log10(raw));
+    let p = pow10(e);
+    let f = raw / p;
+    if f < 1.5 {
+        return p;
+    }
+    if f < 3.0 {
+        return 2.0 * p;
+    }
+    if f < 7.0 {
+        return 5.0 * p;
+    }
+    return 10.0 * p;
+}
+
+/// Ticks for a linear axis over [lo, hi] (rounded out to whole steps at the
+/// ends that are not fixed), about `want` of them.
+fn linear_ticks(lo0: f64, hi0: f64, fixed_lo: bool, fixed_hi: bool, want: usize) Ticks {
+    let mut t = Ticks.empty();
+    let mut lo = lo0;
+    let mut hi = hi0;
+    if not (hi > lo) {
+        // one value (or none): a range around it
+        let d = @max(@abs(lo) * 0.1, 1.0);
+        if not fixed_lo {
+            lo = lo - d;
+        }
+        if not fixed_hi or not (hi > lo) {
+            hi = lo + (2.0 * d);
+        }
+    }
+    let n = @float_from_int(f64, @max(want, 2) - 1);
+    let step = nice_step((hi - lo) / n);
+    if not fixed_lo {
+        lo = @floor((lo / step) + 1.0e-9) * step;
+    }
+    if not fixed_hi {
+        hi = @ceil((hi / step) - 1.0e-9) * step;
+    }
+    t.lo = lo;
+    t.hi = hi;
+    let mut k = @ceil((lo / step) - 1.0e-9);
+    loop {
+        let mut v = k * step;
+        if v > hi + (step * 1.0e-9) {
+            break;
+        }
+        if @abs(v) < step * 1.0e-9 {
+            v = 0.0;
+        }
+        t.push(v);
+        if t.n == MAX_TICKS {
+            break;
+        }
+        k = k + 1.0;
+    }
+    let e = @floor(math.log10(step) + 1.0e-9);
+    if e < 0.0 {
+        t.decimals = @int_from_float(u32, -e);
+    }
+    return t;
+}
+
+/// Ticks for a log axis: the decades over [lo, hi] (lo, hi > 0), every one
+/// or every few so that there are at most about `want`.
+fn log_ticks(lo0: f64, hi0: f64, fixed_lo: bool, fixed_hi: bool, want: usize) Ticks {
+    let mut t = Ticks.empty();
+    t.log = true;
+    let mut lo = lo0;
+    let mut hi = hi0;
+    if not (lo > 0.0) {
+        lo = 1.0;
+    }
+    if not (hi > lo) {
+        hi = lo * 10.0;
+    }
+    let mut e0 = @floor(math.log10(lo) + 1.0e-9);
+    let mut e1 = @ceil(math.log10(hi) - 1.0e-9);
+    if e1 <= e0 {
+        e1 = e0 + 1.0;
+    }
+    if not fixed_lo {
+        lo = pow10(e0);
+    } else {
+        e0 = @ceil(math.log10(lo) - 1.0e-9);
+    }
+    if not fixed_hi {
+        hi = pow10(e1);
+    } else {
+        e1 = @floor(math.log10(hi) + 1.0e-9);
+    }
+    t.lo = lo;
+    t.hi = hi;
+    let decades = @max(e1 - e0, 1.0);
+    let stride = @max(@ceil(decades / @float_from_int(f64, @max(want, 2))), 1.0);
+    let mut e = e0;
+    while e <= e1 {
+        t.push(pow10(e));
+        if t.n == MAX_TICKS {
+            break;
+        }
+        e = e + stride;
+    }
+    return t;
+}
+
+/// v with `decimals` digits after the point, into buf.
+pub fn format_number(buf: []mut u8, v: f64, decimals: u32) []u8 {
+    let mut x = v;
+    if x == 0.0 {
+        x = 0.0;  // not -0
+    }
+    if (@abs(x) >= 1.0e15) or (decimals > 9) {
+        return fmt.bufprint(buf, "{}", [fmt.float(x)]) catch "?";
+    }
+    let mut tmpl: []u8 = "{:.0}";
+    match decimals {
+        1 => { tmpl = "{:.1}"; }
+        2 => { tmpl = "{:.2}"; }
+        3 => { tmpl = "{:.3}"; }
+        4 => { tmpl = "{:.4}"; }
+        5 => { tmpl = "{:.5}"; }
+        6 => { tmpl = "{:.6}"; }
+        7 => { tmpl = "{:.7}"; }
+        8 => { tmpl = "{:.8}"; }
+        9 => { tmpl = "{:.9}"; }
+        else => {}
+    }
+    let s = fmt.bufprint(buf, tmpl, [fmt.float(x)]) catch "?";
+    if (s.len > 1) and (s[0] == '-') {
+        // -0.00 (a small negative number rounded) is 0.00
+        for ch in s[1..] {
+            if (ch != '0') and (ch != '.') {
+                return s;
+            }
+        }
+        return s[1..];
+    }
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// Charts
+// -----------------------------------------------------------------------------
+
+/// The plot area: a rectangle and the scales that map data into it.
+struct Plot {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    xt: Ticks,
+    yt: Ticks,
+
+    fn px(self: *Plot, v: f64) f64 {
+        return self.x + (self.xt.frac(v) * self.w);
+    }
+
+    fn py(self: *Plot, v: f64) f64 {
+        return (self.y + self.h) - (self.yt.frac(v) * self.h);
+    }
+
+    /// Where bars and areas start: 0, or the end of the axis nearest it.
+    fn base_value(self: *Plot) f64 {
+        if self.yt.log {
+            return self.yt.lo;
+        }
+        return @min(@max(0.0, @min(self.yt.lo, self.yt.hi)), @max(self.yt.lo, self.yt.hi));
+    }
+}
+
+pub struct Chart {
+    title: []mut u8,
+    series: vec.Vec.[Series],
+    categories: vec.Vec.[[]mut u8],
+    x: Axis,
+    y: Axis,
+    stacked: bool,  // bars (and areas) of the series are stacked
+    legend: Legend,
+    donut: f64,  // pie: the hole's radius as a fraction of the pie's (0: none)
+    style: Style,
+    fnt: *font.Font,
+    has_font: bool,
+
+    pub fn init() Chart {
+        return Chart.{
+            title: no_text(),
+            series: vec.Vec.[Series].init(),
+            categories: vec.Vec.[[]mut u8].init(),
+            x: Axis.init(false),
+            y: Axis.init(true),
+            stacked: false,
+            legend: Legend.AUTO,
+            donut: 0.0,
+            style: Style.default(),
+            fnt: @ptr_from_int(*font.Font, 8),
+            has_font: false,
+        };
+    }
+
+    pub fn deinit(self: *mut Chart) void {
+        mem.free(self.title);
+        mem.free(self.x.title);
+        mem.free(self.y.title);
+        for i in @as(usize, 0)..self.series.len {
+            self.ser(i).deinit();
+        }
+        self.series.deinit();
+        self.clear_categories();
+        self.categories.deinit();
+    }
+
+    /// The font text is measured and drawn with (it must outlive the chart's use).
+    pub fn set_font(self: *mut Chart, f: *font.Font) void {
+        self.fnt = f;
+        self.has_font = true;
+    }
+
+    pub fn set_title(self: *mut Chart, s: []u8) !void {
+        let t = mem.dup(s)!;
+        mem.free(self.title);
+        self.title = t;
+    }
+
+    pub fn set_axis_titles(self: *mut Chart, xtitle: []u8, ytitle: []u8) !void {
+        let a = mem.dup(xtitle)!;
+        let b = mem.dup(ytitle) catch |e| {
+            mem.free(a);
+            return e;
+        };
+        mem.free(self.x.title);
+        mem.free(self.y.title);
+        self.x.title = a;
+        self.y.title = b;
+    }
+
+    fn clear_categories(self: *mut Chart) void {
+        for i in @as(usize, 0)..self.categories.len {
+            mem.free(self.categories.get(i));
+        }
+        self.categories.clear();
+    }
+
+    /// Names for the categories: bars, points without xs, and pie slices.
+    pub fn set_categories(self: *mut Chart, names: [][]u8) !void {
+        self.clear_categories();
+        for s in names {
+            let d = mem.dup(s)!;
+            self.categories.push(d) catch |e| {
+                mem.free(d);
+                return e;
+            };
+        }
+    }
+
+    /// Fixes the x axis's range (each end used as given).
+    pub fn set_x_range(self: *mut Chart, lo: f64, hi: f64) void {
+        self.x.min = lo;
+        self.x.max = hi;
+        self.x.fixed_min = true;
+        self.x.fixed_max = true;
+    }
+
+    pub fn set_y_range(self: *mut Chart, lo: f64, hi: f64) void {
+        self.y.min = lo;
+        self.y.max = hi;
+        self.y.fixed_min = true;
+        self.y.fixed_max = true;
+    }
+
+    /// Adds a series, copying its data, and returns its index. xs may be
+    /// empty (x is then each point's index: its category); otherwise it is
+    /// as long as ys.
+    pub fn add(self: *mut Chart, kind: Kind, name: []u8, xs: []f64, ys: []f64) !usize {
+        if (xs.len > 0) and (xs.len != ys.len) {
+            return error.InvalidSeries;
+        }
+        let n = mem.dup(name)!;
+        let dx = mem.dup(xs) catch |e| {
+            mem.free(n);
+            return e;
+        };
+        let dy = mem.dup(ys) catch |e| {
+            mem.free(n);
+            mem.free(dx);
+            return e;
+        };
+        let mut marker = Marker.NONE;
+        if kind == Kind.SCATTER {
+            marker = Marker.CIRCLE;
+        }
+        let s = Series.{
+            name: n,
+            kind: kind,
+            xs: dx,
+            ys: dy,
+            color: srgb(0),
+            has_color: false,
+            line_width: 2.0,
+            marker: marker,
+            marker_size: 3.5,
+            dashed: false,
+            fill_opacity: 0.3,
+        };
+        self.series.push(s) catch |e| {
+            mem.free(n);
+            mem.free(dx);
+            mem.free(dy);
+            return e;
+        };
+        return self.series.len - 1;
+    }
+
+    pub fn line(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+        return self.add(Kind.LINE, name, xs, ys);
+    }
+
+    pub fn step(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+        return self.add(Kind.STEP, name, xs, ys);
+    }
+
+    pub fn scatter(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+        return self.add(Kind.SCATTER, name, xs, ys);
+    }
+
+    pub fn area(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+        return self.add(Kind.AREA, name, xs, ys);
+    }
+
+    /// Bars: one value a category.
+    pub fn bar(self: *mut Chart, name: []u8, values: []f64) !usize {
+        return self.add(Kind.BAR, name, values[..0], values);
+    }
+
+    /// A pie of the values (negative ones count as 0), its slices named by
+    /// the categories. A chart with a pie draws only the pie.
+    pub fn pie(self: *mut Chart, values: []f64) !usize {
+        return self.add(Kind.PIE, "", values[..0], values);
+    }
+
+    pub fn set_color(self: *mut Chart, i: usize, c: color.Color) void {
+        let s = self.ser(i);
+        s.color = c;
+        s.has_color = true;
+    }
+
+    pub fn set_line_width(self: *mut Chart, i: usize, w: f64) void {
+        self.ser(i).line_width = w;
+    }
+
+    pub fn set_marker(self: *mut Chart, i: usize, m: Marker) void {
+        self.ser(i).marker = m;
+    }
+
+    pub fn set_dashed(self: *mut Chart, i: usize, dashed: bool) void {
+        self.ser(i).dashed = dashed;
+    }
+
+    /// Series i's colour: its own, or the palette's.
+    pub fn color_of(self: *Chart, i: usize) color.Color {
+        let s = self.ser(i);
+        if s.has_color {
+            return s.color;
+        }
+        return self.style.palette[i % self.style.palette.len];
+    }
+
+    // --- text ---
+
+    /// The width of a line of text (estimated without a font).
+    pub fn text_width(self: *Chart, s: []u8, size: f64) f64 {
+        if self.has_font {
+            return font.measure(self.fnt, s, size);
+        }
+        let mut n: usize = 0;
+        for b in s {
+            if (b & 0xc0) != 0x80 {
+                n += 1;
+            }
+        }
+        return @float_from_int(f64, n) * size * 0.56;
+    }
+
+    fn ascent(self: *Chart, size: f64) f64 {
+        if self.has_font and (self.fnt.units_per_em > 0) {
+            return @float_from_int(f64, self.fnt.ascent) * font.scale_for(self.fnt, size);
+        }
+        return size * 0.76;
+    }
+
+    fn descent(self: *Chart, size: f64) f64 {
+        if self.has_font and (self.fnt.units_per_em > 0) {
+            return @float_from_int(f64, -self.fnt.descent) * font.scale_for(self.fnt, size);
+        }
+        return size * 0.24;
+    }
+
+    fn line_height(self: *Chart, size: f64) f64 {
+        return self.ascent(size) + self.descent(size);
+    }
+
+    fn text(self: *Chart, surf: Surface, s: []u8, size: f64, x: f64, y: f64, anchor: Anchor, angle: f64,
+            c: color.Color) !void {
+        if s.len == 0 {
+            return;
+        }
+        let w = self.text_width(s, size);
+        surf.text(self.fnt, self.has_font, self.style.font_family, s, size, x, y, w, anchor, angle, c)!;
+    }
+
+    // --- layout ---
+
+    /// Series i.
+    pub fn ser(self: *Chart, i: usize) *mut Series {
+        return &mut self.series.items()[i];
+    }
+
+    fn has_pie(self: *Chart) bool {
+        _ = self.pie_index() catch return false;
+        return true;
+    }
+
+    fn pie_index(self: *Chart) !usize {
+        for i in @as(usize, 0)..self.series.len {
+            if self.ser(i).kind == Kind.PIE {
+                return i;
+            }
+        }
+        return error.InvalidSeries;
+    }
+
+    /// Whether the x axis is a band a category.
+    fn banded(self: *Chart) bool {
+        if self.categories.len > 0 {
+            return true;
+        }
+        for i in @as(usize, 0)..self.series.len {
+            if self.ser(i).kind == Kind.BAR {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The number of categories: named ones, or the longest series without xs.
+    fn category_count(self: *Chart) usize {
+        let mut n = self.categories.len;
+        for i in @as(usize, 0)..self.series.len {
+            let s = self.ser(i);
+            if s.xs.len == 0 {
+                n = @max(n, s.ys.len);
+            }
+        }
+        return n;
+    }
+
+    fn stacks(self: *Chart, s: *Series) bool {
+        return self.stacked and ((s.kind == Kind.BAR) or (s.kind == Kind.AREA)) and (s.xs.len == 0);
+    }
+
+    /// The x range of the data.
+    fn x_ticks(self: *Chart, want: usize) Ticks {
+        if self.banded() {
+            let mut t = Ticks.empty();
+            t.band = true;
+            let n = @max(self.category_count(), 1);
+            t.lo = -0.5;
+            t.hi = @float_from_int(f64, n) - 0.5;
+            if self.x.fixed_min {
+                t.lo = self.x.min;
+            }
+            if self.x.fixed_max {
+                t.hi = self.x.max;
+            }
+            for i in @as(usize, 0)..n {
+                t.push(@float_from_int(f64, i));
+            }
+            return t;
+        }
+        let log = self.x.scale == Scale.LOG;
+        let mut lo = math.inf();
+        let mut hi = -math.inf();
+        for i in @as(usize, 0)..self.series.len {
+            let s = self.ser(i);
+            for k in @as(usize, 0)..s.count() {
+                let v = s.x_at(k);
+                if (v != v) or (log and not (v > 0.0)) {
+                    continue;
+                }
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+        }
+        return self.finish_ticks(&self.x, lo, hi, log, want);
+    }
+
+    fn finish_ticks(self: *Chart, a: *Axis, lo0: f64, hi0: f64, log: bool, want: usize) Ticks {
+        let mut lo = lo0;
+        let mut hi = hi0;
+        if lo > hi {
+            // no data
+            lo = 0.0;
+            hi = 1.0;
+            if log {
+                lo = 1.0;
+                hi = 10.0;
+            }
+        }
+        if a.fixed_min {
+            lo = a.min;
+        }
+        if a.fixed_max {
+            hi = a.max;
+        }
+        if log {
+            return log_ticks(lo, hi, a.fixed_min, a.fixed_max, want);
+        }
+        return linear_ticks(lo, hi, a.fixed_min, a.fixed_max, want);
+    }
+
+    /// The y range of the data, stacked where it stacks.
+    fn y_ticks(self: *Chart, want: usize) !Ticks {
+        let log = self.y.scale == Scale.LOG;
+        let mut lo = math.inf();
+        let mut hi = -math.inf();
+        let ncat = self.category_count();
+        let pos = mem.alloc_zeroed.[f64](ncat)!;
+        defer mem.free(pos);
+        let neg = mem.alloc_zeroed.[f64](ncat)!;
+        defer mem.free(neg);
+        let mut zero = false;
+        for i in @as(usize, 0)..self.series.len {
+            let s = self.ser(i);
+            if (s.kind == Kind.BAR) or (s.kind == Kind.AREA) {
+                zero = true;
+            }
+            let stack = self.stacks(s);
+            for k in @as(usize, 0)..s.count() {
+                let mut v = s.ys[k];
+                if v != v {
+                    continue;
+                }
+                if stack and (k < ncat) {
+                    if v >= 0.0 {
+                        pos[k] = pos[k] + v;
+                        v = pos[k];
+                    } else {
+                        neg[k] = neg[k] + v;
+                        v = neg[k];
+                    }
+                }
+                if log and not (v > 0.0) {
+                    continue;
+                }
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+        }
+        if zero and not log and (lo <= hi) {
+            lo = @min(lo, 0.0);
+            hi = @max(hi, 0.0);
+        }
+        return self.finish_ticks(&self.y, lo, hi, log, want);
+    }
+
+    /// Legend entries: series names, or the categories of a pie.
+    fn legend_count(self: *Chart, pie: bool) usize {
+        if pie {
+            return self.categories.len;
+        }
+        let mut n: usize = 0;
+        for i in @as(usize, 0)..self.series.len {
+            if self.ser(i).name.len > 0 {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    fn legend_place(self: *Chart, pie: bool) Legend {
+        if self.legend != Legend.AUTO {
+            return self.legend;
+        }
+        let n = self.legend_count(pie);
+        if (pie and (n > 0)) or (n > 1) {
+            return Legend.RIGHT;
+        }
+        return Legend.NONE;
+    }
+
+    /// Draws the chart into the rectangle (x, y, w, h) of a surface.
+    pub fn draw(self: *Chart, surf: Surface, x: f64, y: f64, w: f64, h: f64) !void {
+        let st = &self.style;
+        if st.background.a > 0.0 {
+            let mut bg = draw.Path.init();
+            defer bg.deinit();
+            bg.rect(x, y, w, h)!;
+            surf.fill(&bg, draw.Paint.solid(st.background))!;
+        }
+        let gap = st.label_size * 0.5;
+        let mut top = y + st.margin;
+        let mut left = x + st.margin;
+        let mut right = (x + w) - st.margin;
+        let mut bottom = (y + h) - st.margin;
+        if self.title.len > 0 {
+            self.text(surf, self.title, st.title_size, x + (w / 2.0), top + self.ascent(st.title_size), Anchor.MIDDLE,
+                      0.0, st.text)!;
+            top = top + self.line_height(st.title_size) + gap;
+        }
+        let pie = self.has_pie();
+        let place = self.legend_place(pie);
+        let entry_h = self.line_height(st.label_size) + (gap * 0.6);
+        let swatch = st.label_size * 1.6;
+        if place == Legend.RIGHT {
+            let mut lw: f64 = 0.0;
+            for i in @as(usize, 0)..self.legend_entries(pie) {
+                lw = @max(lw, self.text_width(self.legend_name(pie, i), st.label_size));
+            }
+            let width = lw + swatch + gap;
+            self.draw_legend_column(surf, pie, right - width, top)!;
+            right = right - (width + gap);
+        } else if place == Legend.BOTTOM {
+            let rows = self.legend_rows(pie, right - left, false, surf, left, 0.0)!;
+            bottom = bottom - ((@float_from_int(f64, rows) * entry_h) + gap);
+            _ = self.legend_rows(pie, right - left, true, surf, left, bottom + gap)!;
+        }
+        if pie {
+            return self.draw_pie(surf, left, top, right - left, bottom - top);
+        }
+        self.draw_axes(surf, left, top, right, bottom)!;
+    }
+
+    fn legend_entries(self: *Chart, pie: bool) usize {
+        if pie {
+            return self.categories.len;
+        }
+        return self.series.len;
+    }
+
+    fn legend_name(self: *Chart, pie: bool, i: usize) []u8 {
+        if pie {
+            return self.categories.get(i);
+        }
+        return self.ser(i).name;
+    }
+
+    /// The swatch and name of entry i, the swatch's left side at x and the
+    /// row centred on cy.
+    fn legend_entry(self: *Chart, surf: Surface, pie: bool, i: usize, x: f64, cy: f64) !void {
+        let st = &self.style;
+        let sw = st.label_size;
+        let mut c = st.palette[i % st.palette.len];
+        let mut kind = Kind.BAR;
+        if not pie {
+            c = self.color_of(i);
+            kind = self.ser(i).kind;
+        }
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        if (kind == Kind.LINE) or (kind == Kind.STEP) or (kind == Kind.SCATTER) {
+            let s = self.ser(i);
+            if kind != Kind.SCATTER {
+                p.move_to(x, cy)!;
+                p.line_to(x + sw, cy)!;
+                surf.stroke(&p, draw.Paint.solid(c), line_stroke(s.line_width, s.dashed))!;
+                p.clear();
+            }
+            if s.marker != Marker.NONE {
+                marker_path(&mut p, s.marker, x + (sw / 2.0), cy, s.marker_size)!;
+                paint_marker(surf, &p, s.marker, c)!;
+            }
+        } else {
+            p.rect(x, cy - (sw / 2.0), sw, sw)!;
+            surf.fill(&p, draw.Paint.solid(c))!;
+        }
+        let baseline = cy + ((self.ascent(st.label_size) - self.descent(st.label_size)) / 2.0);
+        self.text(surf, self.legend_name(pie, i), st.label_size, x + sw + (sw * 0.6), baseline, Anchor.START, 0.0,
+                  st.text)!;
+    }
+
+    fn draw_legend_column(self: *Chart, surf: Surface, pie: bool, x: f64, y: f64) !void {
+        let entry_h = self.line_height(self.style.label_size) + (self.style.label_size * 0.3);
+        let mut cy = y + (entry_h / 2.0);
+        for i in @as(usize, 0)..self.legend_entries(pie) {
+            if self.legend_name(pie, i).len == 0 {
+                continue;
+            }
+            self.legend_entry(surf, pie, i, x, cy)!;
+            cy = cy + entry_h;
+        }
+    }
+
+    /// Lays the legend out in rows across width (drawing them from y when
+    /// draw_it), centred; returns the number of rows.
+    fn legend_rows(self: *Chart, pie: bool, width: f64, draw_it: bool, surf: Surface, x: f64, y: f64) !usize {
+        let st = &self.style;
+        let entry_h = self.line_height(st.label_size) + (st.label_size * 0.3);
+        let sw = st.label_size;
+        let n = self.legend_entries(pie);
+        let mut rows: usize = 0;
+        let mut i: usize = 0;
+        while i < n {
+            // the entries that fit on this row
+            let mut used: f64 = 0.0;
+            let mut j = i;
+            while j < n {
+                let name = self.legend_name(pie, j);
+                if name.len == 0 {
+                    j += 1;
+                    continue;
+                }
+                let ew = sw * 1.6 + self.text_width(name, st.label_size) + (sw * 1.5);
+                if (used > 0.0) and ((used + ew) > width) {
+                    break;
+                }
+                used = used + ew;
+                j += 1;
+            }
+            if used == 0.0 {
+                break;
+            }
+            if draw_it {
+                let mut ex = x + ((width - used) / 2.0);
+                let cy = y + (@float_from_int(f64, rows) * entry_h) + (entry_h / 2.0);
+                for k in i..j {
+                    let name = self.legend_name(pie, k);
+                    if name.len == 0 {
+                        continue;
+                    }
+                    self.legend_entry(surf, pie, k, ex, cy)!;
+                    ex = ex + (sw * 1.6) + self.text_width(name, st.label_size) + (sw * 1.5);
+                }
+            }
+            rows += 1;
+            i = j;
+        }
+        return rows;
+    }
+
+    // --- axes and series ---
+
+    fn draw_axes(self: *Chart, surf: Surface, left0: f64, top: f64, right0: f64, bottom0: f64) !void {
+        let st = &self.style;
+        let gap = st.label_size * 0.4;
+        let tick_len = st.tick_size * 0.4;
+        let tick_h = self.line_height(st.tick_size);
+        let mut left = left0;
+        let mut bottom = bottom0 - (tick_len + gap + tick_h);
+        let right = right0 - (st.tick_size * 1.5);
+        if self.x.title.len > 0 {
+            bottom = bottom - (self.line_height(st.label_size) + gap);
+        }
+        if self.y.title.len > 0 {
+            left = left + self.line_height(st.label_size) + gap;
+        }
+        let plot_h = @max(bottom - top, 1.0);
+        let want_y = @max(@int_from_float(usize, plot_h / (st.tick_size * 3.5)), 2);
+        let yt = self.y_ticks(want_y)!;
+        let mut nb: [48]u8 = [0; 48];
+        let mut label_w: f64 = 0.0;
+        for i in @as(usize, 0)..yt.n {
+            label_w = @max(label_w, self.text_width(yt.label(nb[..], i), st.tick_size));
+        }
+        left = left + label_w + gap + tick_len;
+        let plot_w = @max(right - left, 1.0);
+        let want_x = @max(@int_from_float(usize, plot_w / (st.tick_size * 7.0)), 2);
+        let xt = self.x_ticks(want_x);
+        let pl = Plot.{ x: left, y: top, w: plot_w, h: plot_h, xt: xt, yt: yt };
+
+        // grid
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        let grid = draw.Paint.solid(st.grid);
+        let gs = draw.Stroke.width(1.0);
+        if self.y.grid {
+            for i in @as(usize, 0)..yt.n {
+                let gy = pl.py(yt.v[i]);
+                p.move_to(pl.x, gy)!;
+                p.line_to(pl.x + pl.w, gy)!;
+            }
+        }
+        if self.x.grid {
+            for i in @as(usize, 0)..xt.n {
+                let gx = pl.px(xt.v[i]);
+                p.move_to(gx, pl.y)!;
+                p.line_to(gx, pl.y + pl.h)!;
+            }
+        }
+        if p.verbs.len > 0 {
+            surf.stroke(&p, grid, gs)!;
+        }
+
+        // series, clipped to the plot
+        p.clear();
+        p.rect(pl.x, pl.y, pl.w, pl.h)!;
+        surf.begin_clip(&p)!;
+        self.draw_series(surf, &pl, false) catch |e| {
+            surf.end_clip() catch {};
+            return e;
+        };
+        surf.end_clip()!;
+        let d = self.overhang();
+        p.clear();
+        p.rect(pl.x - d, pl.y - d, pl.w + (2.0 * d), pl.h + (2.0 * d))!;
+        surf.begin_clip(&p)!;
+        self.draw_series(surf, &pl, true) catch |e| {
+            surf.end_clip() catch {};
+            return e;
+        };
+        surf.end_clip()!;
+
+        // axis lines and ticks
+        p.clear();
+        p.move_to(pl.x, pl.y)!;
+        p.line_to(pl.x, pl.y + pl.h)!;
+        p.line_to(pl.x + pl.w, pl.y + pl.h)!;
+        for i in @as(usize, 0)..yt.n {
+            let ty = pl.py(yt.v[i]);
+            p.move_to(pl.x - tick_len, ty)!;
+            p.line_to(pl.x, ty)!;
+        }
+        // x labels: every stride-th, so that they do not overlap
+        let mut widest: f64 = 0.0;
+        for i in @as(usize, 0)..xt.n {
+            widest = @max(widest, self.text_width(self.x_label(nb[..], &xt, i), st.tick_size));
+        }
+        let mut stride: usize = 1;
+        if xt.n > 1 {
+            let spacing = @abs(pl.px(xt.v[1]) - pl.px(xt.v[0]));
+            if spacing > 0.0 {
+                stride = @max(@int_from_float(usize, @ceil((widest + st.tick_size) / spacing)), 1);
+            }
+        }
+        let mut i: usize = 0;
+        while i < xt.n {
+            let tx = pl.px(xt.v[i]);
+            if (tx >= pl.x - 0.5) and (tx <= (pl.x + pl.w) + 0.5) {
+                p.move_to(tx, pl.y + pl.h)!;
+                p.line_to(tx, pl.y + pl.h + tick_len)!;
+            }
+            i += stride;
+        }
+        let mut axis_stroke = draw.Stroke.width(1.0);
+        axis_stroke.cap = draw.Cap.SQUARE;
+        surf.stroke(&p, draw.Paint.solid(st.axis), axis_stroke)!;
+
+        // labels
+        let tick_mid = (self.ascent(st.tick_size) - self.descent(st.tick_size)) / 2.0;
+        for k in @as(usize, 0)..yt.n {
+            let s = yt.label(nb[..], k);
+            self.text(surf, s, st.tick_size, pl.x - (tick_len + gap), pl.py(yt.v[k]) + tick_mid, Anchor.END, 0.0,
+                      st.text)!;
+        }
+        let label_y = pl.y + pl.h + tick_len + gap + self.ascent(st.tick_size);
+        i = 0;
+        while i < xt.n {
+            let tx = pl.px(xt.v[i]);
+            if (tx >= pl.x - 0.5) and (tx <= (pl.x + pl.w) + 0.5) {
+                self.text(surf, self.x_label(nb[..], &xt, i), st.tick_size, tx, label_y, Anchor.MIDDLE, 0.0, st.text)!;
+            }
+            i += stride;
+        }
+        if self.x.title.len > 0 {
+            let ty = label_y + self.descent(st.tick_size) + gap + self.ascent(st.label_size);
+            self.text(surf, self.x.title, st.label_size, pl.x + (pl.w / 2.0), ty, Anchor.MIDDLE, 0.0, st.text)!;
+        }
+        if self.y.title.len > 0 {
+            let tx = left0 + self.ascent(st.label_size);
+            self.text(surf, self.y.title, st.label_size, tx, pl.y + (pl.h / 2.0), Anchor.MIDDLE, -(math.PI / 2.0),
+                      st.text)!;
+        }
+    }
+
+    /// The label of x tick i: a category name, or the number.
+    fn x_label(self: *Chart, buf: []mut u8, xt: *Ticks, i: usize) []u8 {
+        if xt.band {
+            let k = @int_from_float(usize, xt.v[i]);
+            if k < self.categories.len {
+                return self.categories.get(k);
+            }
+            return format_number(buf, xt.v[i], 0);
+        }
+        return xt.label(buf, i);
+    }
+
+    /// Draws the series' fills (areas and bars) or, with lines, their
+    /// lines and markers.
+    fn draw_series(self: *Chart, surf: Surface, pl: *Plot, lines: bool) !void {
+        let ncat = self.category_count();
+        // stacks: the running tops of bars (positive and negative) and areas
+        let pos = mem.alloc_zeroed.[f64](ncat)!;
+        defer mem.free(pos);
+        let neg = mem.alloc_zeroed.[f64](ncat)!;
+        defer mem.free(neg);
+        let acc = mem.alloc_zeroed.[f64](ncat)!;
+        defer mem.free(acc);
+        let mut nbars: usize = 0;
+        for i in @as(usize, 0)..self.series.len {
+            if self.ser(i).kind == Kind.BAR {
+                nbars += 1;
+            }
+        }
+        if not lines {
+            for i in @as(usize, 0)..self.series.len {
+                if self.ser(i).kind == Kind.AREA {
+                    self.draw_area(surf, pl, i, acc, false)!;
+                }
+            }
+            let mut bar_index: usize = 0;
+            for i in @as(usize, 0)..self.series.len {
+                if self.ser(i).kind == Kind.BAR {
+                    self.draw_bars(surf, pl, i, bar_index, nbars, pos, neg)!;
+                    bar_index += 1;
+                }
+            }
+            return;
+        }
+        for i in @as(usize, 0)..self.series.len {
+            let s = self.ser(i);
+            if s.kind == Kind.AREA {
+                self.draw_area(surf, pl, i, acc, true)!;
+            } else if (s.kind == Kind.LINE) or (s.kind == Kind.STEP) {
+                self.draw_line(surf, pl, i)!;
+            }
+            self.draw_markers(surf, pl, i)!;
+        }
+    }
+
+    /// How far lines and markers may reach past the plot: as far as the
+    /// widest of them, so that points on its edges are drawn whole.
+    fn overhang(self: *Chart) f64 {
+        let mut d: f64 = 0.0;
+        for i in @as(usize, 0)..self.series.len {
+            let s = self.ser(i);
+            d = @max(d, s.line_width / 2.0);
+            if s.marker != Marker.NONE {
+                d = @max(d, (s.marker_size * 1.3) + 1.0);
+            }
+        }
+        return d;
+    }
+
+    fn draw_bars(self: *Chart, surf: Surface, pl: *Plot, i: usize, k: usize, nbars: usize, pos: []mut f64,
+                 neg: []mut f64) !void {
+        let s = self.ser(i);
+        let band = pl.w / (pl.xt.hi - pl.xt.lo);
+        let mut bw = (band * 0.8) / @float_from_int(f64, @max(nbars, 1));
+        let mut off = (-(band * 0.4)) + (bw * @float_from_int(f64, k));
+        let stack = self.stacks(s);
+        if stack {
+            bw = band * 0.6;
+            off = -(bw / 2.0);
+        }
+        let gap = @min(bw * 0.08, 1.0);
+        let base = pl.base_value();
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        for j in @as(usize, 0)..s.ys.len {
+            let v = s.ys[j];
+            if v != v {
+                continue;
+            }
+            let mut v0 = base;
+            let mut v1 = v;
+            if stack and (j < pos.len) {
+                if v >= 0.0 {
+                    v0 = pos[j];
+                    pos[j] = pos[j] + v;
+                    v1 = pos[j];
+                } else {
+                    v0 = neg[j];
+                    neg[j] = neg[j] + v;
+                    v1 = neg[j];
+                }
+                if pl.yt.log and not (v0 > 0.0) {
+                    v0 = base;
+                }
+            }
+            if not pl.yt.valid(v1) or not pl.yt.valid(v0) {
+                continue;
+            }
+            let cx = pl.px(@float_from_int(f64, j));
+            let y0 = pl.py(v0);
+            let y1 = pl.py(v1);
+            p.rect(cx + off + (gap / 2.0), @min(y0, y1), bw - gap, @abs(y1 - y0))!;
+        }
+        if p.verbs.len > 0 {
+            surf.fill(&p, draw.Paint.solid(self.color_of(i)))!;
+        }
+    }
+
+    /// The points of series i in plot coordinates, skipping what cannot be
+    /// shown; a NaN pair marks a break.
+    fn points(self: *Chart, pl: *Plot, i: usize, out: *mut vec.Vec.[f64]) !void {
+        let s = self.ser(i);
+        out.clear();
+        for k in @as(usize, 0)..s.count() {
+            let vx = s.x_at(k);
+            let vy = s.ys[k];
+            if not pl.xt.valid(vx) or not pl.yt.valid(vy) {
+                out.push(math.nan())!;
+                out.push(math.nan())!;
+                continue;
+            }
+            out.push(pl.px(vx))!;
+            out.push(pl.py(vy))!;
+        }
+    }
+
+    fn draw_line(self: *Chart, surf: Surface, pl: *Plot, i: usize) !void {
+        let s = self.ser(i);
+        let mut pts = vec.Vec.[f64].init();
+        defer pts.deinit();
+        self.points(pl, i, &mut pts)!;
+        let xy = pts.items();
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        let mut open = false;
+        let mut ly: f64 = 0.0;
+        let mut k: usize = 0;
+        while (k + 1) < xy.len {
+            let px = xy[k];
+            let py = xy[k + 1];
+            k += 2;
+            if px != px {
+                open = false;
+                continue;
+            }
+            if not open {
+                p.move_to(px, py)!;
+                open = true;
+            } else {
+                if s.kind == Kind.STEP {
+                    p.line_to(px, ly)!;
+                }
+                p.line_to(px, py)!;
+            }
+            ly = py;
+        }
+        if p.verbs.len > 0 {
+            surf.stroke(&p, draw.Paint.solid(self.color_of(i)), line_stroke(s.line_width, s.dashed))!;
+        }
+    }
+
+    /// Fills series i's area, or strokes its top edge (and draws its markers).
+    fn draw_area(self: *Chart, surf: Surface, pl: *Plot, i: usize, acc: []mut f64, outline: bool) !void {
+        let s = self.ser(i);
+        let stack = self.stacks(s);
+        let base = pl.base_value();
+        let n = s.count();
+        // the top and bottom edges, as plot coordinates
+        let mut top = vec.Vec.[f64].init();
+        defer top.deinit();
+        let mut bot = vec.Vec.[f64].init();
+        defer bot.deinit();
+        for k in @as(usize, 0)..n {
+            let vx = s.x_at(k);
+            let mut v = s.ys[k];
+            if v != v {
+                v = 0.0;
+            }
+            let mut lo = base;
+            if stack and (k < acc.len) {
+                lo = acc[k];
+                acc[k] = acc[k] + v;
+                v = acc[k];
+                if pl.yt.log and not (lo > 0.0) {
+                    lo = base;
+                }
+            }
+            if not pl.xt.valid(vx) or not pl.yt.valid(v) {
+                continue;
+            }
+            top.push(pl.px(vx))!;
+            top.push(pl.py(v))!;
+            bot.push(pl.px(vx))!;
+            bot.push(pl.py(lo))!;
+        }
+        let t = top.items();
+        let b = bot.items();
+        if t.len < 4 {
+            return;
+        }
+        let c = self.color_of(i);
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        p.move_to(t[0], t[1])!;
+        let mut k: usize = 2;
+        while k < t.len {
+            p.line_to(t[k], t[k + 1])!;
+            k += 2;
+        }
+        if outline {
+            surf.stroke(&p, draw.Paint.solid(c), line_stroke(s.line_width, s.dashed))!;
+            return;
+        }
+        k = b.len;
+        while k >= 2 {
+            p.line_to(b[k - 2], b[k - 1])!;
+            k -= 2;
+        }
+        p.close()!;
+        let mut fc = c;
+        fc.a = c.a * s.fill_opacity;
+        surf.fill(&p, draw.Paint.solid(fc))!;
+    }
+
+    fn draw_markers(self: *Chart, surf: Surface, pl: *Plot, i: usize) !void {
+        let s = self.ser(i);
+        if s.marker == Marker.NONE {
+            return;
+        }
+        let mut pts = vec.Vec.[f64].init();
+        defer pts.deinit();
+        if self.stacks(s) {
+            return;  // stacked areas: the markers would sit off their values
+        }
+        self.points(pl, i, &mut pts)!;
+        let xy = pts.items();
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        let mut k: usize = 0;
+        while (k + 1) < xy.len {
+            if xy[k] == xy[k] {
+                marker_path(&mut p, s.marker, xy[k], xy[k + 1], s.marker_size)!;
+            }
+            k += 2;
+        }
+        if p.verbs.len > 0 {
+            paint_marker(surf, &p, s.marker, self.color_of(i))!;
+        }
+    }
+
+    fn draw_pie(self: *Chart, surf: Surface, x: f64, y: f64, w: f64, h: f64) !void {
+        let s = self.ser(self.pie_index()!);
+        let mut total: f64 = 0.0;
+        for v in s.ys {
+            if v > 0.0 {
+                total = total + v;
+            }
+        }
+        if not (total > 0.0) {
+            return;
+        }
+        let st = &self.style;
+        let cx = x + (w / 2.0);
+        let cy = y + (h / 2.0);
+        let r = @max(@min(w, h) / 2.0 - 2.0, 1.0);
+        let hole = r * @min(@max(self.donut, 0.0), 0.95);
+        let mut edge = st.background;
+        if edge.a == 0.0 {
+            edge = srgb(0xffffff);
+        }
+        let mut p = draw.Path.init();
+        defer p.deinit();
+        let mut a0 = -(math.PI / 2.0);
+        let mut nb: [48]u8 = [0; 48];
+        for j in @as(usize, 0)..s.ys.len {
+            let v = s.ys[j];
+            if not (v > 0.0) {
+                continue;
+            }
+            let frac = v / total;
+            let a1 = a0 + (frac * math.TAU);
+            p.clear();
+            if hole > 0.0 {
+                p.arc(cx, cy, r, a0, a1, false)!;
+                p.arc(cx, cy, hole, a1, a0, true)!;
+            } else {
+                p.move_to(cx, cy)!;
+                p.arc(cx, cy, r, a0, a1, false)!;
+            }
+            p.close()!;
+            surf.fill(&p, draw.Paint.solid(st.palette[j % st.palette.len]))!;
+            if s.ys.len > 1 {
+                surf.stroke(&p, draw.Paint.solid(edge), draw.Stroke.width(1.5))!;
+            }
+            if frac >= 0.04 {
+                let mid = (a0 + a1) / 2.0;
+                let rr = (r + @max(hole, r * 0.3)) / 2.0;
+                let sc = math.sincos(mid);
+                let pct = format_number(nb[..46], frac * 100.0, 0);
+                nb[pct.len] = '%';
+                let lbl = nb[..pct.len + 1];
+                let ly = (cy + (rr * sc.sin)) + ((self.ascent(st.tick_size) - self.descent(st.tick_size)) / 2.0);
+                self.text(surf, lbl, st.tick_size, cx + (rr * sc.cos), ly, Anchor.MIDDLE, 0.0, srgb(0xffffff))!;
+            }
+            a0 = a1;
+        }
+    }
+
+    // --- output ---
+
+    /// The chart as a w by h RGBA image (8 bits a sample).
+    pub fn render_image(self: *Chart, w: usize, h: usize) !image.Image {
+        let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
+        let mut cv = draw.Canvas.init(&mut img);
+        defer cv.deinit();
+        cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+        self.draw(Surface.Canvas(&mut cv), 0.0, 0.0, @float_from_int(f64, w), @float_from_int(f64, h)) catch |e| {
+            img.deinit();
+            return e;
+        };
+        return img;
+    }
+
+    /// Writes the chart as an SVG document w by h pixels big.
+    pub fn write_svg(self: *Chart, out: io.Writer, w: f64, h: f64) !void {
+        let mut sw = svg.Writer.begin(out, w, h)!;
+        defer sw.deinit();
+        self.draw(Surface.Svg(&mut sw), 0.0, 0.0, w, h)!;
+        sw.finish()!;
+    }
+
+    /// The chart as an SVG document (free it with mem.free).
+    pub fn svg(self: *Chart, w: f64, h: f64) ![]mut u8 {
+        let mut s = strs.String.init();
+        self.write_svg(s.writer(), w, h) catch |e| {
+            s.deinit();
+            return e;
+        };
+        return s.take();
+    }
+
+    /// Draws the chart on its own page (w by h points) of a PDF document.
+    pub fn add_page(self: *Chart, doc: *mut pdf.Document, w: f64, h: f64) !void {
+        let mut page = doc.page(w, h)!;
+        defer page.deinit();
+        self.draw(Surface.Pdf(&mut page), 0.0, 0.0, w, h)!;
+        doc.add_page(&mut page)!;
+    }
+
+    /// The chart as a one-page PDF document, w by h points (free it with mem.free).
+    pub fn pdf(self: *Chart, w: f64, h: f64) ![]mut u8 {
+        let mut doc = pdf.Document.init();
+        defer doc.deinit();
+        self.add_page(&mut doc, w, h)!;
+        return doc.bytes();
+    }
+
+    /// Saves the chart, in the format the file name's extension names:
+    /// .svg, .pdf (w by h points), or an image format of
+    /// std/graphics/image/formats (w by h pixels, rounded).
+    pub fn save(self: *Chart, path: []u8, w: f64, h: f64) !void {
+        if ends_with_ignore_case(path, ".svg") {
+            let f = io.create(path)!;
+            defer f.close();
+            self.write_svg(f.writer(), w, h)!;
+            return;
+        }
+        if ends_with_ignore_case(path, ".pdf") {
+            let mut doc = pdf.Document.init();
+            defer doc.deinit();
+            self.add_page(&mut doc, w, h)!;
+            doc.save(path)!;
+            return;
+        }
+        if formats.from_extension(path) == formats.Format.UNKNOWN {
+            return error.Unsupported;
+        }
+        let iw = @max(@int_from_float(usize, @nearest(w)), 1);
+        let ih = @max(@int_from_float(usize, @nearest(h)), 1);
+        let mut img = self.render_image(iw, ih)!;
+        defer img.deinit();
+        formats.save(path, &img, formats.Options.default())!;
+    }
+}
+
+fn ends_with_ignore_case(s: []u8, suffix: []u8) bool {
+    return (s.len >= suffix.len) and strs.eq_ignore_case(s[s.len - suffix.len..], suffix);
+}
+
+let DASH: [2]f64 = [6.0, 4.0];
+
+fn line_stroke(width: f64, dashed: bool) draw.Stroke {
+    let mut st = draw.Stroke.width(width);
+    st.join = draw.Join.ROUND;
+    st.cap = draw.Cap.ROUND;
+    if dashed {
+        st.cap = draw.Cap.BUTT;
+        st.dash = DASH[..];
+    }
+    return st;
+}
+
+/// Adds a marker of radius r at (x, y) to p.
+fn marker_path(p: *mut draw.Path, m: Marker, x: f64, y: f64, r: f64) !void {
+    match m {
+        .NONE => {}
+        .CIRCLE => { p.circle(x, y, r)!; }
+        .SQUARE => { p.rect(x - (r * 0.9), y - (r * 0.9), r * 1.8, r * 1.8)!; }
+        .DIAMOND => {
+            let d = r * 1.25;
+            let xy: [8]f64 = [x, y - d, x + d, y, x, y + d, x - d, y];
+            p.polygon(xy[..])!;
+        }
+        .TRIANGLE => {
+            let d = r * 1.3;
+            let xy: [6]f64 = [x, y - d, x + (d * 0.866), y + (d * 0.5), x - (d * 0.866), y + (d * 0.5)];
+            p.polygon(xy[..])!;
+        }
+        .CROSS => {
+            p.move_to(x - r, y - r)!;
+            p.line_to(x + r, y + r)!;
+            p.move_to(x + r, y - r)!;
+            p.line_to(x - r, y + r)!;
+        }
+    }
+}
+
+fn paint_marker(surf: Surface, p: *draw.Path, m: Marker, c: color.Color) !void {
+    if m == Marker.CROSS {
+        surf.stroke(p, draw.Paint.solid(c), draw.Stroke.width(1.5))!;
+    } else {
+        surf.fill(p, draw.Paint.solid(c))!;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+fn expect_ticks(t: *Ticks, want: []f64) void {
+    @expect_eq(t.n, want.len);
+    for i in @as(usize, 0)..want.len {
+        @expect(@abs(t.v[i] - want[i]) < 1.0e-9);
+    }
+}
+
+test "nice ticks" {
+    let a = linear_ticks(0.0, 81.0, false, false, 6);
+    let wa: [6]f64 = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0];
+    expect_ticks(&a, wa[..]);
+    @expect_eq(a.lo, 0.0);
+    @expect_eq(a.hi, 100.0);
+    let b = linear_ticks(-0.79, 1.06, false, false, 6);
+    let wb: [5]f64 = [-1.0, -0.5, 0.0, 0.5, 1.0];
+    @expect_eq(b.lo, -1.0);
+    @expect_eq(b.hi, 1.5);
+    @expect_eq(b.decimals, 1);
+    @expect_eq(b.n, 6);
+    for i in @as(usize, 0)..wb.len {
+        @expect(@abs(b.v[i] - wb[i]) < 1.0e-9);
+    }
+    // fixed ends are kept; ticks fall inside them
+    let c = linear_ticks(0.3, 9.7, true, true, 5);
+    @expect_eq(c.lo, 0.3);
+    @expect_eq(c.hi, 9.7);
+    let wc: [4]f64 = [2.0, 4.0, 6.0, 8.0];
+    expect_ticks(&c, wc[..]);
+    // one value: a range around it
+    let d = linear_ticks(5.0, 5.0, false, false, 5);
+    @expect(d.lo < 5.0);
+    @expect(d.hi > 5.0);
+    // decades
+    let e = log_ticks(0.5, 6561.0, false, false, 8);
+    let we: [6]f64 = [0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0];
+    expect_ticks(&e, we[..]);
+    let mut nb: [48]u8 = [0; 48];
+    @expect_eq(e.label(nb[..], 0), "0.1");
+    @expect_eq(e.label(nb[..], 5), "10000");
+    let f = log_ticks(1.0, 1.0e12, false, false, 4);
+    @expect_eq(f.n, 5);  // every third decade
+    @expect(@abs(f.v[1] - 1000.0) < 1.0e-6);
+}
+
+test "number labels" {
+    let mut nb: [48]u8 = [0; 48];
+    @expect_eq(format_number(nb[..], 0.30000000000000004, 1), "0.3");
+    @expect_eq(format_number(nb[..], -0.0, 0), "0");
+    @expect_eq(format_number(nb[..], -0.01, 1), "0.0");
+    @expect_eq(format_number(nb[..], -0.01, 0), "0");
+    @expect_eq(format_number(nb[..], 2.5, 1), "2.5");
+    @expect_eq(format_number(nb[..], 1250000.0, 0), "1250000");
+    @expect_eq(format_number(nb[..], -40.0, 0), "-40");
+}
+
+test "series are copied and checked" {
+    let mut c = Chart.init();
+    defer c.deinit();
+    let mut xs: [3]f64 = [1.0, 2.0, 3.0];
+    let ys: [3]f64 = [4.0, 5.0, 6.0];
+    let i = c.line("a", xs[..], ys[..])!;
+    xs[0] = 100.0;
+    @expect_eq(c.ser(i).xs[0], 1.0);
+    @expect_eq(c.ser(i).count(), 3);
+    let bad = c.scatter("b", xs[..2], ys[..]) catch |e| {
+        @expect_eq(e, error.InvalidSeries);
+        return;
+    };
+    _ = bad;
+    @trap();
+}
+
+/// The colour at (x, y) is near rgb (0xRRGGBB, sRGB).
+fn pixel_is(img: *image.Image, x: usize, y: usize, rgb: u32) bool {
+    let p = img.get(x, y).to_rgba8();
+    let want = srgb(rgb).to_rgba8();
+    let near = near8(p.r, want.r) and near8(p.g, want.g) and near8(p.b, want.b);
+    return near;
+}
+
+fn near8(a: u8, b: u8) bool {
+    return @abs(@as(i32, a) - @as(i32, b)) <= 2;
+}
+
+test "bars in a bitmap" {
+    let mut c = Chart.init();
+    defer c.deinit();
+    c.style.margin = 0.0;
+    let v: [2]f64 = [1.0, 2.0];
+    _ = c.bar("", v[..])!;
+    let mut img = c.render_image(300, 200)!;
+    defer img.deinit();
+    @expect_eq(img.width, 300);
+    @expect(pixel_is(&img, 0, 0, 0xffffff));
+    // the second bar reaches the top tick (2), the first halfway; between
+    // them is the background
+    let mut first: usize = 0;
+    let mut last: usize = 0;
+    let row: usize = 150;
+    for x in @as(usize, 0)..300 {
+        if pixel_is(&img, x, row, 0x4e79a7) {
+            if first == 0 {
+                first = x;
+            }
+            last = x;
+        }
+    }
+    @expect(first > 0);
+    @expect(last > first + 100);
+    @expect(pixel_is(&img, (first + last) / 2, row, 0xffffff));
+    // the second bar is taller than the first
+    let mut top1: usize = 200;
+    let mut top2: usize = 200;
+    for y in @as(usize, 0)..200 {
+        if (top1 == 200) and pixel_is(&img, first + 5, y, 0x4e79a7) {
+            top1 = y;
+        }
+        if (top2 == 200) and pixel_is(&img, last - 5, y, 0x4e79a7) {
+            top2 = y;
+        }
+    }
+    @expect(top2 < top1);
+    // the style's colours
+    c.style.background = srgb(0x102030);
+    c.set_color(0, srgb(0xff0000));
+    let mut img2 = c.render_image(300, 200)!;
+    defer img2.deinit();
+    @expect(pixel_is(&img2, 0, 0, 0x102030));
+    @expect(pixel_is(&img2, last - 5, row, 0xff0000));
+}
+
+test "a pie in a bitmap" {
+    let mut c = Chart.init();
+    defer c.deinit();
+    c.legend = Legend.NONE;
+    c.style.margin = 0.0;
+    let v: [2]f64 = [3.0, 1.0];
+    _ = c.pie(v[..])!;
+    let mut img = c.render_image(200, 200)!;
+    defer img.deinit();
+    // the first slice is three quarters, clockwise from the top
+    @expect(pixel_is(&img, 150, 100, 0x4e79a7));
+    @expect(pixel_is(&img, 100, 160, 0x4e79a7));
+    @expect(pixel_is(&img, 50, 60, 0xf28e2b));
+    // a donut has a hole
+    c.donut = 0.5;
+    let mut img2 = c.render_image(200, 200)!;
+    defer img2.deinit();
+    @expect(pixel_is(&img2, 110, 110, 0xffffff));
+}
+
+test "svg documents" {
+    let mut c = Chart.init();
+    defer c.deinit();
+    c.set_title("Sales & costs")!;
+    c.set_axis_titles("Year", "Units")!;
+    let years: [3][]u8 = ["2022", "2023", "2024"];
+    c.set_categories(years[..])!;
+    let a: [3]f64 = [3.0, 5.0, 4.0];
+    let b: [3]f64 = [1.0, 2.0, 6.0];
+    _ = c.bar("Sales", a[..])!;
+    let i = c.line("Costs", b[..0], b[..])!;
+    c.set_dashed(i, true);
+    c.set_marker(i, Marker.CROSS);
+    let text = c.svg(400.0, 300.0)!;
+    defer mem.free(text);
+    @expect(strs.starts_with(text, "<?xml"));
+    @expect(strs.contains(text, "Sales &amp; costs"));
+    @expect(strs.contains(text, "text-anchor=\"middle\""));
+    @expect(strs.contains(text, "text-anchor=\"end\""));
+    @expect(strs.contains(text, ">2023</text>"));
+    @expect(strs.contains(text, "stroke-dasharray"));
+    @expect(strs.contains(text, "clip-path"));
+    // and it reads back
+    let mut doc = svg.parse(text)!;
+    defer doc.deinit();
+    let mut img = svg.render_image(&doc, 400, 300)!;
+    defer img.deinit();
+    @expect_eq(img.height, 300);
+    // write_svg streams the same document
+    let mut s = strs.String.init();
+    defer s.deinit();
+    c.write_svg(s.writer(), 400.0, 300.0)!;
+    @expect_eq(s.bytes(), text);
+}
+
+test "pdf documents" {
+    let mut c = Chart.init();
+    defer c.deinit();
+    let xs: [4]f64 = [1.0, 10.0, 100.0, 1000.0];
+    let ys: [4]f64 = [2.0, 3.0, 5.0, 8.0];
+    _ = c.scatter("", xs[..], ys[..])!;
+    c.x.scale = Scale.LOG;
+    let bytes = c.pdf(300.0, 200.0)!;
+    defer mem.free(bytes);
+    @expect(strs.starts_with(bytes, "%PDF-"));
+    let mut r = read.Reader.open(bytes)!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 1);
+    let size = r.page_size(0)!;
+    @expect_eq(size[0], 300.0);
+    @expect_eq(size[1], 200.0);
+}
+
+test "text with a font" {
+    let mut f = find_font() catch return;
+    defer f.deinit();
+    let mut c = Chart.init();
+    defer c.deinit();
+    c.set_font(&f);
+    c.set_title("Quarterly totals")!;
+    let q: [2][]u8 = ["Q1", "Q2"];
+    c.set_categories(q[..])!;
+    let v: [2]f64 = [10.0, 20.0];
+    _ = c.bar("Total", v[..])!;
+    @expect(c.text_width("Quarterly", 12.0) > c.text_width("Q", 12.0));
+    let bytes = c.pdf(400.0, 300.0)!;
+    defer mem.free(bytes);
+    let mut r = read.Reader.open(bytes)!;
+    defer r.deinit();
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(strs.contains(t, "Quarterly totals"));
+    @expect(strs.contains(t, "Q2"));
+    // text is drawn into bitmaps: the title row has dark pixels
+    let mut img = c.render_image(400, 300)!;
+    defer img.deinit();
+    let mut dark: usize = 0;
+    for y in @as(usize, 10)..30 {
+        for x in @as(usize, 100)..300 {
+            if img.get(x, y).to_rgba8().r < 128 {
+                dark += 1;
+            }
+        }
+    }
+    @expect(dark > 50);
+}
+
+test "saving needs a known extension" {
+    let mut c = Chart.init();
+    defer c.deinit();
+    c.save("chart.unknown", 100.0, 100.0) catch |e| {
+        @expect_eq(e, error.Unsupported);
+        return;
+    };
+    @trap();
+}

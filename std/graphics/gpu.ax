@@ -1,0 +1,903 @@
+// =============================================================================
+// std/graphics/gpu.ax - the GPU on Windows and macOS: std/graphics/d3d12's
+// interface (devices, frames, root signatures with constants, pipelines,
+// buffers, targets, depth buffers and shadow maps, textures), drawing with
+// Direct3D 12 on Windows and Metal on macOS, chosen when the program runs.
+// Its shaders come in both languages, HLSL for Direct3D and MSL for Metal,
+// with the same entry points (see std/graphics/metal for where Direct3D's
+// registers are in MSL):
+//
+//     let mut gpu = gpu.Device.init_window(w.handle(), size[0], size[1])!;   // w: a std/os/window
+//     defer gpu.deinit();
+//     let mut sh = gpu.shaders(hlsl_source, msl_source)!;   // functions vs and ps in each
+//     defer sh.release();
+//     let rs = gpu.root_signature(4)!;
+//     let p = gpu.pipeline(&rs, &sh, "vs", "ps", attrs[..], gpu.TRIANGLE_LIST, false)!;
+//     loop {
+//         let t = gpu.screen();
+//         gpu.begin(t)!;
+//         gpu.clear(t, 0.1, 0.1, 0.2, 1.0);
+//         ...
+//         gpu.present(true)!;
+//     }
+//
+// Offscreen targets can hold half floats for linear light beyond 1 (HDR)
+// and be drawn multisampled, then read by later passes (target_with,
+// depth_buffer_with, set_target_texture, through s2 / sampler(2): linear,
+// clamped); textures can have mipmaps (texture_mipmapped):
+//
+//     let mut hdr = gpu.target_with(w, h, gpu.TARGET_RGBA16F, 4)!;
+//     let mut z = gpu.depth_buffer_with(w, h, 4)!;
+//     ... pipelines into it: PipelineOptions.format TARGET_RGBA16F, samples 4
+//     gpu.begin_depth(&mut hdr, &mut z)!;
+//     ... draw the scene ...
+//     gpu.begin(gpu.screen())!;            // (hdr is resolved)
+//     gpu.set_target_texture(0, &mut hdr);
+//     gpu.draw(3, 0);                       // tone-mapped into the window
+//
+// Constants (formats, topologies, BLEND_*, DEPTH_*, CULL_*) are Direct3D's,
+// as std/graphics/d3d12 has them; TARGET_* are as both have them.
+// =============================================================================
+
+import "../mem.ax" as mem;
+import "d3d12.ax" as d3d12;
+import "hlsl.ax" as hlsl;
+import "image.ax" as image;
+import "metal.ax" as metal;
+
+error { Unsupported, Failed, CompileError, OutOfMemory }
+
+import host "axiom" {
+    fn ax_os() i32;
+}
+
+// Formats (vertex attributes; R16_UINT and R32_UINT also for indexes)
+pub const R8G8B8A8_UNORM: u32 = 28;
+pub const R32_FLOAT: u32 = 41;
+pub const R32G32_FLOAT: u32 = 16;
+pub const R32G32B32_FLOAT: u32 = 6;
+pub const R32G32B32A32_FLOAT: u32 = 2;
+pub const R16_UINT: u32 = 57;
+pub const R32_UINT: u32 = 42;
+
+pub const POINT_LIST: u32 = 1;
+pub const LINE_LIST: u32 = 2;
+pub const LINE_STRIP: u32 = 3;
+pub const TRIANGLE_LIST: u32 = 4;
+pub const TRIANGLE_STRIP: u32 = 5;
+
+pub const BLEND_NONE: u32 = 0;
+pub const BLEND_ALPHA: u32 = 1;
+pub const BLEND_ADD: u32 = 2;
+
+pub const DEPTH_NONE: u32 = 0;
+pub const DEPTH_OFF: u32 = 1;
+pub const DEPTH_TEST: u32 = 2;
+pub const DEPTH_WRITE: u32 = 3;
+
+pub const CULL_NONE: u32 = 1;
+pub const CULL_FRONT: u32 = 2;
+pub const CULL_BACK: u32 = 3;
+
+// What offscreen targets hold (target_with)
+pub const TARGET_BGRA8: u32 = 0;    // 8-bit colour, what a window shows
+pub const TARGET_RGBA16F: u32 = 1;  // half floats: linear light beyond 1 (HDR), for later passes to read
+pub const TARGET_RG16F: u32 = 2;    // two half floats
+pub const TARGET_R32F: u32 = 3;     // one float
+
+/// Which GPU interface the program draws with here: Metal on macOS,
+/// Direct3D 12 elsewhere.
+pub fn is_metal() bool {
+    return ax_os() == 2;
+}
+
+/// The interface's name: "Metal" or "Direct3D 12".
+pub fn api_name() []u8 {
+    if is_metal() {
+        return "Metal";
+    }
+    return "Direct3D 12";
+}
+
+fn metal_format(f: u32) u32 {
+    if f == R8G8B8A8_UNORM {
+        return metal.R8G8B8A8_UNORM;
+    }
+    if f == R32_FLOAT {
+        return metal.R32_FLOAT;
+    }
+    if f == R32G32_FLOAT {
+        return metal.R32G32_FLOAT;
+    }
+    if f == R32G32B32_FLOAT {
+        return metal.R32G32B32_FLOAT;
+    }
+    if f == R32_UINT {
+        return metal.R32_UINT;
+    }
+    return metal.R32G32B32A32_FLOAT;
+}
+
+/// An attribute of a vertex: its HLSL semantic name and index, its format,
+/// its byte offset in the vertex. In MSL the k-th attribute given is
+/// [[attribute(k)]].
+pub struct Attribute {
+    semantic: []u8,
+    index: u32,
+    format: u32,
+    offset: u32,
+}
+
+/// Shaders in both languages: HLSL source (compiled for each pipeline's
+/// entry points on Windows) and MSL source (compiled as a library on
+/// macOS).
+pub struct Shaders {
+    hlsl: []mut u8,  // a copy of the HLSL (Windows)
+    lib: metal.Library,
+
+    pub fn release(self: *mut Shaders) void {
+        if self.hlsl.len > 0 {
+            mem.free(self.hlsl);
+            self.hlsl = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        }
+        self.lib.release();
+    }
+}
+
+let mut msg_buf: [4096]u8 = [0; 4096];
+let mut msg_len: usize = 0;
+
+/// What the shader compiler said about the last CompileError.
+pub fn message() []u8 {
+    return msg_buf[0..msg_len];
+}
+
+fn set_message(s: []u8) void {
+    let n = @min(s.len, msg_buf.len);
+    @mem_copy(msg_buf[0..n], s[0..n]);
+    msg_len = n;
+}
+
+pub struct RootSignature {
+    d: d3d12.RootSignature,
+    m: metal.RootSignature,
+
+    /// A root signature that is not there yet (release does nothing).
+    pub fn empty() RootSignature {
+        return RootSignature.{ d: d3d12.RootSignature.{ p: 0, constants: 0, buffers: 0, textures: 0 },
+                               m: metal.RootSignature.{ constants: 0, buffers: 0, textures: 0 } };
+    }
+
+    pub fn release(self: *mut RootSignature) void {
+        if not is_metal() {
+            self.d.release();
+        }
+    }
+}
+
+pub struct Pipeline {
+    d: d3d12.Pipeline,
+    m: metal.Pipeline,
+
+    /// A pipeline that is not there yet (release does nothing).
+    pub fn empty() Pipeline {
+        return Pipeline.{ d: no_d_pipeline(), m: no_m_pipeline() };
+    }
+
+    pub fn release(self: *mut Pipeline) void {
+        if is_metal() {
+            self.m.release();
+        } else {
+            self.d.release();
+        }
+    }
+}
+
+/// A buffer the CPU writes and the GPU reads (vertices, indexes, constants).
+pub struct Buffer {
+    d: d3d12.Buffer,
+    m: metal.Buffer,
+
+    /// A buffer that is not there yet (release does nothing).
+    pub fn empty() Buffer {
+        return Buffer.{
+            d: d3d12.Buffer.{ p: 0, gpu: 0, size: 0, mapped: 0 }, m: metal.Buffer.{ p: 0, size: 0, mapped: 0 } };
+    }
+
+    /// Writes a constant or upload buffer's contents.
+    pub fn write(self: *mut Buffer, data: []u8) !void {
+        if is_metal() {
+            self.m.write(data) catch return error.Failed;
+            return;
+        }
+        self.d.write(data) catch return error.Failed;
+    }
+
+    /// An upload buffer's memory as floats, to write in place.
+    pub fn floats(self: *mut Buffer) []mut f32 {
+        if is_metal() {
+            return self.m.floats();
+        }
+        return self.d.floats();
+    }
+
+    pub fn release(self: *mut Buffer) void {
+        if is_metal() {
+            self.m.release();
+        } else {
+            self.d.release();
+        }
+    }
+}
+
+/// An image on the GPU for shaders to read (set_image).
+pub struct Texture {
+    width: u32,
+    height: u32,
+    d: d3d12.Texture,
+    m: metal.Texture,
+
+    /// A texture that is not there yet (release does nothing).
+    pub fn empty() Texture {
+        return Texture.{
+            width: 0, height: 0, d: d3d12.Texture.empty(), m: metal.Texture.{ p: 0, width: 0, height: 0, levels: 1 } };
+    }
+
+    pub fn release(self: *mut Texture) void {
+        if is_metal() {
+            self.m.release();
+        } else {
+            self.d.release();
+        }
+    }
+}
+
+/// Something to draw into: the window or a texture.
+pub struct Target {
+    width: u32,
+    height: u32,
+    screen: bool,
+    d: d3d12.Target,
+    m: metal.Target,
+
+    /// A target that is not there yet (release does nothing).
+    pub fn empty() Target {
+        return Target.{ width: 0, height: 0, screen: false, d: no_d_target(), m: no_m_target() };
+    }
+
+    pub fn release(self: *mut Target) void {
+        if self.screen {
+            return;
+        }
+        if is_metal() {
+            self.m.release();
+        } else {
+            self.d.release();
+        }
+    }
+}
+
+/// A depth buffer, or a shadow map.
+pub struct DepthBuffer {
+    width: u32,
+    height: u32,
+    d: d3d12.DepthBuffer,
+    m: metal.DepthBuffer,
+
+    /// A depth buffer that is not there yet (release does nothing).
+    pub fn empty() DepthBuffer {
+        return DepthBuffer.{ width: 0, height: 0, d: no_d_depth(), m: no_m_depth() };
+    }
+
+    pub fn release(self: *mut DepthBuffer) void {
+        if is_metal() {
+            self.m.release();
+        } else {
+            self.d.release();
+        }
+    }
+}
+
+/// How a pipeline draws (as std/graphics/d3d12's and metal's): into
+/// targets of `format` (TARGET_*) and `samples`; `stride`, a vertex's bytes
+/// (0: as its attributes end).
+pub struct PipelineOptions {
+    topology: u32,
+    blend: u32,
+    depth: u32,
+    cull: u32,
+    depth_bias: i32,
+    slope_bias: f32,
+    depth_only: bool,
+    stride: u32,
+    format: u32,
+    samples: u32,
+
+    /// Triangles, no blending, depth or culling, no bias, into 8-bit
+    /// targets of one sample.
+    pub fn defaults() PipelineOptions {
+        return PipelineOptions.{ topology: TRIANGLE_LIST, blend: BLEND_NONE, depth: DEPTH_NONE, cull: CULL_NONE,
+                                 depth_bias: 0, slope_bias: 0.0, depth_only: false, stride: 0, format: TARGET_BGRA8,
+                                 samples: 1 };
+    }
+}
+
+fn no_d_target() d3d12.Target {
+    return d3d12.Target.empty();
+}
+
+fn no_m_target() metal.Target {
+    return metal.Target.{ tex: 0, width: 0, height: 0, screen: false, format: 0, samples: 1, msaa: 0 };
+}
+
+fn no_d_depth() d3d12.DepthBuffer {
+    return d3d12.DepthBuffer.empty();
+}
+
+fn no_m_depth() metal.DepthBuffer {
+    return metal.DepthBuffer.{ tex: 0, width: 0, height: 0, sampled: false, samples: 1 };
+}
+
+fn no_d_pipeline() d3d12.Pipeline {
+    return d3d12.Pipeline.{ p: 0, root: 0, topology: 0, buffers: 0, textures: 0 };
+}
+
+fn no_m_pipeline() metal.Pipeline {
+    return metal.Pipeline.{ p: 0, depth: 0, prim: 0, cull: 0, depth_bias: 0.0, slope_bias: 0.0, constants: 0, stride: 0,
+                            group: [1, 1, 1] };
+}
+
+pub struct Device {
+    d: *mut d3d12.Device,  // (null on macOS)
+    m: *mut metal.Device,  // (null elsewhere)
+    screen_t: Target,
+
+    /// A device for drawing offscreen (into textures).
+    pub fn init() !Device {
+        let mut dev = Device.{ d: @ptr_from_int(*mut d3d12.Device, 0), m: @ptr_from_int(*mut metal.Device, 0),
+                               screen_t: Target.{ width: 0, height: 0, screen: true, d: no_d_target(),
+                                                  m: no_m_target() } };
+        if is_metal() {
+            let m = metal.Device.init() catch return error.Unsupported;
+            dev.m = mem.create.[metal.Device](m) catch |e| {
+                var_deinit_m(m);
+                return e;
+            };
+        } else {
+            let d = d3d12.Device.init() catch return error.Unsupported;
+            dev.d = mem.create.[d3d12.Device](d) catch |e| {
+                var_deinit_d(d);
+                return e;
+            };
+        }
+        return dev;
+    }
+
+    /// A device drawing into a window (std/os/window's handle()) of width ×
+    /// height pixels.
+    pub fn init_window(handle: usize, width: u32, height: u32) !Device {
+        let mut dev = Device.{ d: @ptr_from_int(*mut d3d12.Device, 0), m: @ptr_from_int(*mut metal.Device, 0),
+                               screen_t: Target.{ width: width, height: height, screen: true, d: no_d_target(),
+                                                  m: no_m_target() } };
+        if is_metal() {
+            let m = metal.Device.init_window(handle, width, height) catch return error.Unsupported;
+            dev.m = mem.create.[metal.Device](m) catch |e| {
+                var_deinit_m(m);
+                return e;
+            };
+        } else {
+            let d = d3d12.Device.init_window(handle, width, height) catch return error.Unsupported;
+            dev.d = mem.create.[d3d12.Device](d) catch |e| {
+                var_deinit_d(d);
+                return e;
+            };
+        }
+        return dev;
+    }
+
+    pub fn deinit(self: *mut Device) void {
+        if @int_from_ptr(self.m) != 0 {
+            self.m.deinit();
+            mem.destroy(self.m);
+            self.m = @ptr_from_int(*mut metal.Device, 0);
+        }
+        if @int_from_ptr(self.d) != 0 {
+            self.d.deinit();
+            mem.destroy(self.d);
+            self.d = @ptr_from_int(*mut d3d12.Device, 0);
+        }
+    }
+
+    /// The GPU's name ("Apple M2"), where the interface says.
+    pub fn name(self: *Device) []u8 {
+        if @int_from_ptr(self.m) != 0 {
+            return self.m.name();
+        }
+        return "";
+    }
+
+    pub fn wait_idle(self: *mut Device) void {
+        if is_metal() {
+            self.m.wait_idle();
+        } else {
+            self.d.wait_idle();
+        }
+    }
+
+    /// The window to draw the next frame into.
+    pub fn screen(self: *mut Device) *mut Target {
+        if is_metal() {
+            let s = self.m.screen();
+            self.screen_t.width = s.width;
+            self.screen_t.height = s.height;
+        } else {
+            let s = self.d.screen();
+            self.screen_t.width = s.width;
+            self.screen_t.height = s.height;
+        }
+        return &mut self.screen_t;
+    }
+
+    pub fn resize(self: *mut Device, width: u32, height: u32) !void {
+        if is_metal() {
+            self.m.resize(width, height) catch return error.Failed;
+        } else {
+            self.d.resize(width, height) catch return error.Failed;
+        }
+        self.screen_t.width = width;
+        self.screen_t.height = height;
+    }
+
+    /// A texture of width × height pixels to draw into offscreen.
+    pub fn target(self: *mut Device, width: u32, height: u32) !Target {
+        let mut t = Target.{ width: width, height: height, screen: false, d: no_d_target(), m: no_m_target() };
+        if is_metal() {
+            t.m = self.m.target(width, height) catch return error.Failed;
+        } else {
+            t.d = self.d.target(width, height) catch return error.Failed;
+        }
+        return t;
+    }
+
+    /// A texture of width × height pixels to draw into offscreen, holding
+    /// `format` (TARGET_*), drawn with `samples` a pixel (1, or 2, 4, 8:
+    /// multisampled, resolved as each pass ends). Later passes read it
+    /// with set_target_texture.
+    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) !Target {
+        let mut t = Target.{ width: width, height: height, screen: false, d: no_d_target(), m: no_m_target() };
+        if is_metal() {
+            t.m = self.m.target_with(width, height, format, samples) catch |e| {
+                if e == error.Unsupported {
+                    return error.Unsupported;
+                }
+                return error.Failed;
+            };
+        } else {
+            t.d = self.d.target_with(width, height, format, samples) catch |e| {
+                if e == error.Unsupported {
+                    return error.Unsupported;
+                }
+                return error.Failed;
+            };
+        }
+        return t;
+    }
+
+    /// Makes an offscreen target width × height, keeping its format and
+    /// samples.
+    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) !void {
+        if t.screen {
+            return;
+        }
+        if is_metal() {
+            self.m.resize_target(&mut t.m, width, height) catch return error.Failed;
+        } else {
+            self.d.resize_target(&mut t.d, width, height) catch return error.Failed;
+        }
+        if (width != 0) and (height != 0) {
+            t.width = width;
+            t.height = height;
+        }
+    }
+
+    pub fn depth_buffer(self: *mut Device, width: u32, height: u32) !DepthBuffer {
+        return self.depth_buffer_with(width, height, 1);
+    }
+
+    /// A depth buffer of width × height for a target of that size drawn
+    /// with `samples` a pixel.
+    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) !DepthBuffer {
+        let mut z = DepthBuffer.{ width: width, height: height, d: no_d_depth(), m: no_m_depth() };
+        if is_metal() {
+            z.m = self.m.depth_buffer_with(width, height, samples) catch return error.Failed;
+        } else {
+            z.d = self.d.depth_buffer_with(width, height, samples) catch return error.Failed;
+        }
+        return z;
+    }
+
+    /// A shadow map of size × size (see std/graphics/d3d12 and metal).
+    pub fn shadow_map(self: *mut Device, size: u32) !DepthBuffer {
+        let mut z = DepthBuffer.{ width: size, height: size, d: no_d_depth(), m: no_m_depth() };
+        if is_metal() {
+            z.m = self.m.shadow_map(size) catch return error.Failed;
+        } else {
+            z.d = self.d.shadow_map(size) catch return error.Failed;
+        }
+        return z;
+    }
+
+    pub fn resize_depth(self: *mut Device, z: *mut DepthBuffer, width: u32, height: u32) !void {
+        if is_metal() {
+            self.m.resize_depth(&mut z.m, width, height) catch return error.Failed;
+        } else {
+            self.d.resize_depth(&mut z.d, width, height) catch return error.Failed;
+        }
+        z.width = width;
+        z.height = height;
+    }
+
+    pub fn buffer(self: *mut Device, data: []u8) !Buffer {
+        let mut b = Buffer.empty();
+        if is_metal() {
+            b.m = self.m.buffer(data) catch return error.Failed;
+        } else {
+            b.d = self.d.buffer(data) catch return error.Failed;
+        }
+        return b;
+    }
+
+    pub fn constant_buffer(self: *mut Device, size: usize) !Buffer {
+        return self.upload_buffer(size);
+    }
+
+    pub fn upload_buffer(self: *mut Device, size: usize) !Buffer {
+        let mut b = Buffer.empty();
+        if is_metal() {
+            b.m = self.m.upload_buffer(size) catch return error.Failed;
+        } else {
+            b.d = self.d.upload_buffer(size) catch return error.Failed;
+        }
+        return b;
+    }
+
+    pub fn texture(self: *mut Device, img: *image.Image) !Texture {
+        let mut t = Texture.{ width: @truncate(u32, img.width), height: @truncate(u32, img.height),
+                              d: d3d12.Texture.empty(), m: metal.Texture.{ p: 0, width: 0, height: 0, levels: 1 } };
+        if is_metal() {
+            t.m = self.m.texture(img) catch return error.Failed;
+        } else {
+            t.d = self.d.texture(img) catch return error.Failed;
+        }
+        return t;
+    }
+
+    /// A texture holding img with a full chain of mipmaps, read through
+    /// s0 / sampler(0) trilinearly: 8-bit images as 8-bit RGBA (with
+    /// `srgb`, sRGB-encoded colours, read as linear light), others as half
+    /// floats (see std/graphics/d3d12 and metal).
+    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) !Texture {
+        let mut t = Texture.empty();
+        t.width = @truncate(u32, img.width);
+        t.height = @truncate(u32, img.height);
+        if is_metal() {
+            t.m = self.m.texture_mipmapped(img, srgb) catch return error.Failed;
+        } else {
+            t.d = self.d.texture_mipmapped(img, srgb) catch return error.Failed;
+        }
+        return t;
+    }
+
+    /// Shaders from their HLSL and MSL sources (each with the same entry
+    /// points). On a CompileError, message() says why.
+    pub fn shaders(self: *mut Device, hlsl_src: []u8, msl_src: []u8) !Shaders {
+        let mut s = Shaders.{ hlsl: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0), lib: metal.Library.{ p: 0 } };
+        if is_metal() {
+            s.lib = self.m.library(msl_src) catch |e| {
+                if e == error.CompileError {
+                    set_message(metal.message());
+                    return error.CompileError;
+                }
+                return error.Failed;
+            };
+        } else {
+            s.hlsl = mem.dup(hlsl_src)!;
+        }
+        return s;
+    }
+
+    pub fn root_signature(self: *mut Device, constants: u32) !RootSignature {
+        return self.root_signature_with(constants, 0, 0);
+    }
+
+    pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32, textures: u32) !RootSignature {
+        let mut r = RootSignature.{ d: d3d12.RootSignature.{ p: 0, constants: 0, buffers: 0, textures: 0 },
+                                    m: metal.RootSignature.{ constants: 0, buffers: 0, textures: 0 } };
+        if is_metal() {
+            r.m = self.m.root_signature_with(constants, buffers, textures) catch return error.Failed;
+        } else {
+            r.d = self.d.root_signature_with(constants, buffers, textures) catch return error.Failed;
+        }
+        return r;
+    }
+
+    pub fn pipeline(self: *mut Device, root: *RootSignature, sh: *Shaders, vs: []u8, ps: []u8, attrs: []Attribute,
+                    topology: u32, blend: bool) !Pipeline {
+        let mut o = PipelineOptions.defaults();
+        o.topology = topology;
+        if blend {
+            o.blend = BLEND_ALPHA;
+        }
+        return self.pipeline_with(root, sh, vs, ps, attrs, o);
+    }
+
+    /// A pipeline from the shaders' entry points vs and ps (ps unused for
+    /// depth_only), drawing as `o` says.
+    pub fn pipeline_with(self: *mut Device, root: *RootSignature, sh: *Shaders, vs: []u8, ps: []u8, attrs: []Attribute,
+                         o: PipelineOptions) !Pipeline {
+        if attrs.len > 16 {
+            return error.Failed;
+        }
+        let mut p = Pipeline.{ d: no_d_pipeline(), m: no_m_pipeline() };
+        if is_metal() {
+            let mut ma: [16]metal.Attribute = [metal.Attribute.{ semantic: "", index: 0, format: 0, offset: 0 }; 16];
+            for k in 0..attrs.len {
+                ma[k] = metal.Attribute.{ semantic: attrs[k].semantic, index: attrs[k].index,
+                                          format: metal_format(attrs[k].format), offset: attrs[k].offset };
+            }
+            let mut mo = metal.PipelineOptions.defaults();
+            mo.topology = o.topology;
+            mo.blend = o.blend;
+            mo.depth = o.depth;
+            mo.cull = o.cull;
+            mo.depth_bias = o.depth_bias;
+            mo.slope_bias = o.slope_bias;
+            mo.depth_only = o.depth_only;
+            mo.stride = o.stride;
+            mo.format = o.format;
+            mo.samples = o.samples;
+            p.m = self.m.pipeline_with(&root.m, &sh.lib, vs, ps, ma[0..attrs.len], mo) catch |e| {
+                if e == error.CompileError {
+                    set_message(metal.message());
+                    return error.CompileError;
+                }
+                return error.Failed;
+            };
+            return p;
+        }
+        let mut vcode = hlsl.compile(sh.hlsl, vs, "vs_5_0") catch |e| {
+            set_message(hlsl.message());
+            if e == error.CompileError {
+                return error.CompileError;
+            }
+            return error.Failed;
+        };
+        defer vcode.release();
+        let mut pcode = vcode;
+        let mut own_p = false;
+        if not o.depth_only {
+            pcode = hlsl.compile(sh.hlsl, ps, "ps_5_0") catch |e| {
+                set_message(hlsl.message());
+                if e == error.CompileError {
+                    return error.CompileError;
+                }
+                return error.Failed;
+            };
+            own_p = true;
+        }
+        defer {
+            if own_p {
+                pcode.release();
+            }
+        }
+        let mut da: [16]d3d12.Attribute = [d3d12.Attribute.{ semantic: "", index: 0, format: 0, offset: 0 }; 16];
+        for k in 0..attrs.len {
+            da[k] = d3d12.Attribute.{ semantic: attrs[k].semantic, index: attrs[k].index, format: attrs[k].format,
+                                      offset: attrs[k].offset };
+        }
+        let mut dopt = d3d12.PipelineOptions.defaults();
+        dopt.topology = o.topology;
+        dopt.blend = o.blend;
+        dopt.depth = o.depth;
+        dopt.cull = o.cull;
+        dopt.depth_bias = o.depth_bias;
+        dopt.slope_bias = o.slope_bias;
+        dopt.depth_only = o.depth_only;
+        dopt.stride = o.stride;
+        dopt.format = o.format;
+        dopt.samples = o.samples;
+        p.d = self.d.pipeline_with(&root.d, &vcode, &pcode, da[0..attrs.len], dopt) catch return error.Failed;
+        return p;
+    }
+
+    // --- recording a frame ---
+
+    fn d_target(self: *mut Device, t: *mut Target) *mut d3d12.Target {
+        if t.screen {
+            return self.d.screen();
+        }
+        return &mut t.d;
+    }
+
+    fn m_target(self: *mut Device, t: *mut Target) *mut metal.Target {
+        if t.screen {
+            return self.m.screen();
+        }
+        return &mut t.m;
+    }
+
+    pub fn begin(self: *mut Device, t: *mut Target) !void {
+        if is_metal() {
+            self.m.begin(self.m_target(t)) catch return error.Failed;
+        } else {
+            self.d.begin(self.d_target(t)) catch return error.Failed;
+        }
+    }
+
+    pub fn begin_depth(self: *mut Device, t: *mut Target, z: *mut DepthBuffer) !void {
+        if is_metal() {
+            self.m.begin_depth(self.m_target(t), &mut z.m) catch return error.Failed;
+        } else {
+            self.d.begin_depth(self.d_target(t), &mut z.d) catch return error.Failed;
+        }
+    }
+
+    pub fn begin_shadow(self: *mut Device, z: *mut DepthBuffer) !void {
+        if is_metal() {
+            self.m.begin_shadow(&mut z.m) catch return error.Failed;
+        } else {
+            self.d.begin_shadow(&mut z.d) catch return error.Failed;
+        }
+    }
+
+    pub fn clear(self: *mut Device, t: *mut Target, r: f32, g: f32, b: f32, a: f32) void {
+        if is_metal() {
+            self.m.clear(self.m_target(t), r, g, b, a);
+        } else {
+            self.d.clear(self.d_target(t), r, g, b, a);
+        }
+    }
+
+    pub fn clear_depth(self: *mut Device, z: *DepthBuffer) void {
+        if is_metal() {
+            self.m.clear_depth(&z.m);
+        } else {
+            self.d.clear_depth(&z.d);
+        }
+    }
+
+    pub fn set_pipeline(self: *mut Device, p: *Pipeline) void {
+        if is_metal() {
+            self.m.set_pipeline(&p.m);
+        } else {
+            self.d.set_pipeline(&p.d);
+        }
+    }
+
+    pub fn set_buffer(self: *mut Device, slot: u32, b: *Buffer) void {
+        if is_metal() {
+            self.m.set_buffer(slot, &b.m);
+        } else {
+            self.d.set_buffer(slot, &b.d);
+        }
+    }
+
+    /// A shadow map drawn earlier in the frame, for the shaders to read.
+    pub fn set_texture(self: *mut Device, slot: u32, z: *mut DepthBuffer) void {
+        if is_metal() {
+            self.m.set_texture(slot, &mut z.m);
+        } else {
+            self.d.set_texture(slot, &mut z.d);
+        }
+    }
+
+    /// A target drawn earlier in the frame (resolved, if multisampled),
+    /// for the shaders to read through s2 / sampler(2).
+    pub fn set_target_texture(self: *mut Device, slot: u32, t: *mut Target) void {
+        if t.screen {
+            return;
+        }
+        if is_metal() {
+            self.m.set_target_texture(slot, &t.m);
+        } else {
+            self.d.set_target_texture(slot, &mut t.d);
+        }
+    }
+
+    pub fn set_image(self: *mut Device, slot: u32, t: *Texture) void {
+        if is_metal() {
+            self.m.set_image(slot, &t.m);
+        } else {
+            self.d.set_image(slot, &t.d);
+        }
+    }
+
+    pub fn set_constants(self: *mut Device, values: []u32) void {
+        if is_metal() {
+            self.m.set_constants(values);
+        } else {
+            self.d.set_constants(values);
+        }
+    }
+
+    pub fn set_constants_at(self: *mut Device, offset: u32, values: []u32) void {
+        if is_metal() {
+            self.m.set_constants_at(offset, values);
+        } else {
+            self.d.set_constants_at(offset, values);
+        }
+    }
+
+    pub fn set_vertices(self: *mut Device, b: *Buffer, stride: u32) void {
+        if is_metal() {
+            self.m.set_vertices(&b.m, stride);
+        } else {
+            self.d.set_vertices(&b.d, stride);
+        }
+    }
+
+    /// The index buffer, of R16_UINT or R32_UINT indexes.
+    pub fn set_indices(self: *mut Device, b: *Buffer, format: u32) void {
+        if is_metal() {
+            let mut f = metal.R32_UINT_INDEX;
+            if format == R16_UINT {
+                f = metal.R16_UINT;
+            }
+            self.m.set_indices(&b.m, f);
+        } else {
+            self.d.set_indices(&b.d, format);
+        }
+    }
+
+    pub fn draw(self: *mut Device, count: u32, first: u32) void {
+        if is_metal() {
+            self.m.draw(count, first);
+        } else {
+            self.d.draw(count, first);
+        }
+    }
+
+    pub fn draw_indexed(self: *mut Device, count: u32, first: u32, base: i32) void {
+        if is_metal() {
+            self.m.draw_indexed(count, first, base);
+        } else {
+            self.d.draw_indexed(count, first, base);
+        }
+    }
+
+    /// Submits the frame drawn into a texture and waits for it.
+    pub fn finish(self: *mut Device) !void {
+        if is_metal() {
+            self.m.finish() catch return error.Failed;
+        } else {
+            self.d.finish() catch return error.Failed;
+        }
+    }
+
+    /// Submits the frame drawn into screen() and shows it.
+    pub fn present(self: *mut Device, vsync: bool) !void {
+        if is_metal() {
+            self.m.present(vsync) catch return error.Failed;
+        } else {
+            self.d.present(vsync) catch return error.Failed;
+        }
+    }
+
+    /// The pixels of a target (after finish()), as an RGBA image.
+    pub fn read_pixels(self: *mut Device, t: *mut Target) !image.Image {
+        if is_metal() {
+            return self.m.read_pixels(self.m_target(t)) catch return error.Failed;
+        }
+        return self.d.read_pixels(self.d_target(t)) catch return error.Failed;
+    }
+}
+
+fn var_deinit_m(m: metal.Device) void {
+    let mut x = m;
+    x.deinit();
+}
+
+fn var_deinit_d(d: d3d12.Device) void {
+    let mut x = d;
+    x.deinit();
+}

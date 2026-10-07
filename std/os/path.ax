@@ -8,10 +8,12 @@
 //     path.matches("src/**/*.ax", "src/a/b/x.ax")          // true
 //
 // Paths are POSIX paths: '/' separates elements, a leading '/' makes a path
-// absolute. On Windows a drive ("C:/", "C:\\") or a leading '\\' also makes
-// a path absolute (the system accepts '/' as a separator, and std's paths
-// from the system use it). Functions that build a new path return memory to
-// free with mem.free; the others return slices of their argument.
+// absolute. On Windows '\\' also separates elements, and a drive ("C:/",
+// "C:\\") or a leading '\\' also makes a path absolute; clean() writes the
+// root as "/", "C:/" or "//" (a UNC path) and separators as '/' (the system
+// accepts it, and std's paths from the system use it). Functions that build
+// a new path return memory to free with mem.free; the others return slices
+// of their argument.
 // =============================================================================
 
 import "../mem.ax" as mem;
@@ -26,14 +28,34 @@ import host "axiom" {
 pub const SEP: u8 = '/';
 
 pub fn is_abs(p: []u8) bool {
-    if (p.len > 0) and (p[0] == '/') {
-        return true;
+    return root_len(p, windows()) > 0;
+}
+
+fn windows() bool {
+    return ax_os() == 3;
+}
+
+// Whether c separates elements (w: on Windows).
+fn is_sep(c: u8, w: bool) bool {
+    return (c == '/') or (w and (c == '\\'));
+}
+
+// How many bytes of p are its root: 0 for a relative path, 1 for "/", and
+// on Windows (w) 3 for a drive ("C:/") and 2 for a UNC path ("//server").
+fn root_len(p: []u8, w: bool) usize {
+    if (p.len == 0) or not is_sep(p[0], w) {
+        if w and (p.len >= 3) and (p[1] == ':') and is_sep(p[2], w) {
+            let l = p[0] | 0x20;
+            if (l >= 'a') and (l <= 'z') {
+                return 3;
+            }
+        }
+        return 0;
     }
-    if (p.len == 0) or (ax_os() != 3) {
-        return false;
+    if w and (p.len >= 3) and is_sep(p[1], w) and not is_sep(p[2], w) {
+        return 2;
     }
-    let letter = ((p[0] | 0x20) >= 'a') and ((p[0] | 0x20) <= 'z');
-    return (p[0] == '\\') or (letter and (p.len >= 3) and (p[1] == ':') and ((p[2] == '/') or (p[2] == '\\')));
+    return 1;
 }
 
 /// The shortest path equivalent to p, by pure text rules: repeated
@@ -50,19 +72,26 @@ pub fn clean(p: []u8) ![]mut u8 {
 }
 
 fn clean_into(p: []u8, out: *mut strs.String) !void {
-    let abs = is_abs(p);
+    let w = windows();
+    let mut i = root_len(p, w);
+    let abs = i > 0;
+    if i == 3 {
+        out.push(p[0])!;
+        out.push(':')!;
+    } else if i == 2 {
+        out.push('/')!;
+    }
     if abs {
         out.push('/')!;
     }
     let root = out.len;
     let mut dots: usize = 0;  // how many leading ".." a relative path keeps
-    let mut i: usize = 0;
     while i < p.len {
-        while (i < p.len) and (p[i] == '/') {
+        while (i < p.len) and is_sep(p[i], w) {
             i += 1;
         }
         let start = i;
-        while (i < p.len) and (p[i] != '/') {
+        while (i < p.len) and not is_sep(p[i], w) {
             i += 1;
         }
         let el = p[start..i];
@@ -137,15 +166,17 @@ pub fn base(p: []u8) []u8 {
     if p.len == 0 {
         return ".";
     }
+    let w = windows();
+    let root = root_len(p, w);
     let mut end = p.len;
-    while (end > 0) and (p[end - 1] == '/') {
+    while (end > root) and is_sep(p[end - 1], w) {
         end -= 1;
     }
-    if end == 0 {
-        return "/";
+    if end == root {
+        return p[..root];
     }
     let mut start = end;
-    while (start > 0) and (p[start - 1] != '/') {
+    while (start > 0) and not is_sep(p[start - 1], w) {
         start -= 1;
     }
     return p[start..end];
@@ -154,22 +185,24 @@ pub fn base(p: []u8) []u8 {
 /// Everything before the last element, without its trailing separators:
 /// "a/b/c" gives "a/b", "a" gives ".", "/a" gives "/". Not cleaned.
 pub fn dir(p: []u8) []u8 {
+    let w = windows();
+    let root = root_len(p, w);
     let mut end = p.len;
-    while (end > 0) and (p[end - 1] == '/') {
+    while (end > root) and is_sep(p[end - 1], w) {
         end -= 1;
     }
-    while (end > 0) and (p[end - 1] != '/') {
+    while (end > root) and not is_sep(p[end - 1], w) {
         end -= 1;
     }
-    // end is just after the separator before the last element
+    // end is just after the separator before the last element, or the root
     if end == 0 {
-        if is_abs(p) {
-            return "/";
-        }
         return ".";
     }
+    if end == root {
+        return p[..root];
+    }
     let mut d = end;
-    while (d > 1) and (p[d - 1] == '/') {
+    while (d > root) and (d > 1) and is_sep(p[d - 1], w) {
         d -= 1;
     }
     return p[..d];
@@ -221,6 +254,11 @@ pub fn rel(from: []u8, to: []u8) ![]mut u8 {
     defer mem.free(a);
     let b = clean(to)!;
     defer mem.free(b);
+    let w = windows();
+    let ra = root_len(a, w);
+    if (ra != root_len(b, w)) or not @mem_eq(a[..ra], b[..ra]) {
+        return error.BadPattern;  // on Windows, different drives
+    }
     let ae = elements(a);
     let be = elements(b);
     // the common prefix, in whole elements
@@ -293,8 +331,9 @@ fn elements(p: []u8) []u8 {
 }
 
 fn trim_seps(p: []u8) []u8 {
+    let w = windows();
     let mut s: usize = 0;
-    while (s < p.len) and (p[s] == '/') {
+    while (s < p.len) and is_sep(p[s], w) {
         s += 1;
     }
     return p[s..];
@@ -302,11 +341,12 @@ fn trim_seps(p: []u8) []u8 {
 
 /// The next element of p from position *i (empty at the end).
 fn next_element(p: []u8, i: *mut usize) []u8 {
-    while (i.* < p.len) and (p[i.*] == '/') {
+    let w = windows();
+    while (i.* < p.len) and is_sep(p[i.*], w) {
         i.* += 1;
     }
     let s = i.*;
-    while (i.* < p.len) and (p[i.*] != '/') {
+    while (i.* < p.len) and not is_sep(p[i.*], w) {
         i.* += 1;
     }
     return p[s..i.*];
@@ -632,4 +672,39 @@ test "many double stars stay fast" {
     @expect(not matches(pat.bytes(), p.bytes()));
     p.push_str("/z")!;
     @expect(matches(pat.bytes(), p.bytes()));
+}
+
+test "Windows roots and separators" {
+    if not windows() {
+        return;
+    }
+    let cases: [9][2][]u8 = [
+        ["C:\\Users\\me\\Temp", "C:/Users/me/Temp"],
+        ["c:/a/../..", "c:/"],
+        ["C:\\", "C:/"],
+        ["\\a\\.\\b\\", "/a/b"],
+        ["\\\\server\\share\\x", "//server/share/x"],
+        ["a\\b/../c", "a/c"],
+        ["C:a", "C:a"],
+        ["/", "/"],
+        ["//", "/"],
+    ];
+    for c in cases {
+        expect_clean(c[0], c[1])!;
+    }
+    let j = join2("C:\\Users\\me\\AppData\\Local\\Temp", "x")!;
+    defer mem.free(j);
+    @expect_eq(j, "C:/Users/me/AppData/Local/Temp/x");
+    @expect(is_abs("C:\\x") and is_abs("c:/") and is_abs("\\x") and not is_abs("C:x"));
+    @expect_eq(base("C:\\a\\b.txt"), "b.txt");
+    @expect_eq(base("C:/"), "C:/");
+    @expect_eq(dir("C:\\a\\b"), "C:\\a");
+    @expect_eq(dir("C:/a"), "C:/");
+    @expect_eq(dir("C:/"), "C:/");
+    expect_rel("C:/a/b", "C:\\a\\c", "../c")!;
+    _ = rel("C:/a", "D:/a") catch |e| {
+        @expect_eq(e, error.BadPattern);
+        return;
+    };
+    @trap();
 }

@@ -1,6 +1,6 @@
 // =============================================================================
 // File: swarm.ax
-// A 3D formation shooter on Windows with Direct3D 12, after the arcade
+// A 3D formation shooter on Windows (Direct3D 12) and macOS (Metal), after the
 // games of the early 1980s, in which everything is made of small cubes.
 // Waves of aliens swoop in and take their places in a swaying formation,
 // then peel off and dive at your ship, firing as they come. Shoot them down
@@ -11,11 +11,12 @@
 // the game playing itself; Escape gives up a game, and quits from there.
 //
 //   axiom build examples/swarm.ax --target=x86_64-windows -O2 --subsystem=windows -o swarm.exe
-//   swarm.exe                   (left/right or A/D to move, Space or Ctrl to
+//   axiom build examples/swarm.ax --target=aarch64-macos -O2 -o swarm
+//   swarm                       (left/right or A/D to move, Space or Ctrl to
 //                                fire; a controller's left stick or d-pad
 //                                and A; Escape or Back quits)
-//   swarm.exe --autopilot       (it plays itself)
-//   swarm.exe --png out.png --frames 600   (plays 600 frames by itself
+//   swarm --autopilot           (it plays itself)
+//   swarm --png out.png --frames 600   (plays 600 frames by itself
 //                                offscreen, then saves the last as a PNG)
 //
 // Every frame the cubes of the aliens, the ship, the shots and the debris
@@ -25,16 +26,15 @@
 // nearest of the point lights (shots, explosions, the aliens' flashing
 // lights, the ship's engines). The aliens are pixel-art sprites made into
 // voxels: a second layer where a cell is surrounded, their lights raised
-// above them. Sound is made with std/audio and played with
-// std/audio/xaudio2.
+// above them. It draws with std/graphics/gpu (its shaders in HLSL and MSL);
+// sound is made with std/audio and played with std/audio/output.
 // =============================================================================
 
 import "std/audio" as audio;
-import "std/audio/xaudio2" as xaudio2;
+import "std/audio/output" as output;
 import "std/collections/vec" as vec;
 import "std/fmt" as fmt;
-import "std/graphics/d3d12" as d3d;
-import "std/graphics/hlsl" as hlsl;
+import "std/graphics/gpu" as gx;
 import "std/graphics/image/png" as png;
 import "std/io" as io;
 import "std/math" as math;
@@ -45,8 +45,8 @@ import "std/mem" as mem;
 import "std/os" as os;
 import "std/os/cli" as cli;
 import "std/os/fs" as fs;
-import "std/os/win32" as win32;
-import "std/os/xinput" as xinput;
+import "std/os/gamepad" as gamepad;
+import "std/os/window" as window;
 import "std/str" as strs;
 import "std/time" as time;
 
@@ -136,6 +136,94 @@ let SHADER_LINES: [157][]u8 = ["cbuffer C : register(b0) {", "    float4x4 viewp
                                "    if (params.x > 0.5) {", "        float d = length(i.uv * float2(1.0, 0.85));",
                                "        return float4(color.rgb, smoothstep(0.55, 1.4, d) * color.a);", "    }",
                                "    return color;", "}"];
+
+// The same shaders in MSL, for Metal: the constants as structs at buffer(0)
+// and buffer(1), the shadow map a depth2d read with sample_compare.
+let MSL_LINES: [164][]u8 = ["#include <metal_stdlib>", "using namespace metal;", "struct C {", "    float4x4 viewproj;",
+                            "    float4 eye;", "    float4 light;", "    float4 right;", "    float4 up;",
+                            "    float4 m0;", "    float4 m1;", "    float4 m2;", "    float4 color;",
+                            "    float4 params;", "};", "struct L {", "    float4x4 sunvp;", "    float4 info;",
+                            "    float4 lpos[48];", "    float4 lcol[48];", "    float4 lcount;", "};", "struct VIn {",
+                            "    float3 pos [[attribute(0)]];", "    float3 nrm [[attribute(1)]];",
+                            "    float4 col [[attribute(2)]];", "    float2 uv [[attribute(3)]];", "};",
+                            "struct VOut {", "    float4 pos [[position]];", "    float3 w;", "    float3 n;",
+                            "    float4 col;", "    float2 uv;", "};",
+                            "vertex VOut vs(VIn i [[stage_in]], constant C& c [[buffer(0)]]) {", "    VOut o;",
+                            "    o.w = i.pos;", "    o.n = i.nrm;", "    o.pos = c.viewproj * float4(i.pos, 1.0);",
+                            "    o.col = i.col;", "    o.uv = i.uv;", "    return o;", "}", "struct SOut {",
+                            "    float4 pos [[position]];", "};",
+                            "vertex SOut vs_shadow(VIn i [[stage_in]], constant L& lt [[buffer(1)]]) {", "    SOut o;",
+                            "    o.pos = lt.sunvp * float4(i.pos, 1.0);", "    return o;", "}",
+                            "float3 fog(constant C& c, float3 col, float3 w) {",
+                            "    float k = exp(-length(w - c.eye.xyz) * c.light.w);",
+                            "    return mix(float3(0.004, 0.005, 0.012), col, k);", "}",
+                            "float sun_shadow(constant L& lt, depth2d<float> shadowmap, sampler cmp, float3 w, float3 n) {",
+                            "    float4 p = lt.sunvp * float4(w + n * 0.03, 1.0);",
+                            "    float2 uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);",
+                            "    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 || p.z > 1.0) {",
+                            "        return 1.0;", "    }", "    float s = 0.0;", "    for (int y = -1; y <= 1; y++) {",
+                            "        for (int x = -1; x <= 1; x++) {",
+                            "            s += shadowmap.sample_compare(cmp, uv + float2(x, y) * lt.info.x, p.z, level(0));",
+                            "        }", "    }", "    return s / 9.0;", "}",
+                            "float3 point_light(float3 w, float3 n, float3 v, float3 lp, float r, float3 c, float shine) {",
+                            "    float3 d = lp - w;", "    float dist = length(d);",
+                            "    float att = saturate(1.0 - dist / r);", "    att *= att;",
+                            "    float3 ld = d / max(dist, 0.001);",
+                            "    float diff = saturate(dot(n, ld)) * 0.9 + 0.1;",
+                            "    float spec = pow(saturate(dot(n, normalize(ld + v))), 32.0) * shine;",
+                            "    return c * att * (diff + spec);", "}",
+                            "fragment float4 ps(VOut i [[stage_in]], constant C& c [[buffer(0)]], constant L& lt [[buffer(1)]],",
+                            "                   depth2d<float> shadowmap [[texture(0)]], sampler cmp [[sampler(1)]]) {",
+                            "    float3 n = normalize(i.n);", "    float mat = i.col.a;",
+                            "    float edge = max(abs(i.uv.x), abs(i.uv.y));",
+                            "    float bevel = 1.0 - 0.45 * smoothstep(0.7, 1.0, edge);",
+                            "    if (mat > 0.5 && mat < 1.5) {",
+                            "        float3 glow = i.col.rgb * (0.8 + 0.4 * (1.0 - edge));",
+                            "        return float4(fog(c, glow, i.w), 1.0);", "    }",
+                            "    float3 toeye = c.eye.xyz - i.w;", "    float dist = length(toeye);",
+                            "    float3 v = toeye / dist;", "    float shine = 0.6;",
+                            "    float3 base = i.col.rgb * bevel;", "    float3 extra = float3(0.0);",
+                            "    if (mat > 1.5 && mat < 2.5) {",
+                            "        // the floor: darker tiles, a cyan glow along their seams that pulses",
+                            "        // down the field", "        shine = 0.25;",
+                            "        float seam = smoothstep(0.86, 1.0, edge) * (n.y > 0.5 ? 1.0 : 0.0);",
+                            "        float pulse = 0.5 + 0.5 * sin(i.w.z * 0.35 + c.eye.w * 2.5);",
+                            "        extra = float3(0.0, 0.35, 0.5) * seam * (0.15 + 0.35 * pulse);", "    }",
+                            "    float3 l = -c.light.xyz;", "    float lambert = saturate(dot(n, l));",
+                            "    float shadow = lambert > 0.0 ? sun_shadow(lt, shadowmap, cmp, i.w, n) : 0.0;",
+                            "    float3 sun = float3(0.32, 0.36, 0.5) * shadow * (lambert + pow(saturate(dot(n, normalize(l + v))), 32.0) * shine);",
+                            "    float3 sky = float3(0.035, 0.04, 0.06) * (0.6 + 0.4 * n.y);",
+                            "    float3 local = float3(0.0);", "    int count = int(lt.lcount.x);",
+                            "    for (int k = 0; k < count; k++) {",
+                            "        local += point_light(i.w, n, v, lt.lpos[k].xyz, lt.lpos[k].w, lt.lcol[k].rgb * lt.lcol[k].w, shine);",
+                            "    }", "    if (mat > 2.5) {",
+                            "        // ships and aliens: lit a little from within, and a rim of light",
+                            "        // round their edges, so they stand out from the floor and debris",
+                            "        float rim = pow(1.0 - saturate(dot(n, v)), 2.0);",
+                            "        extra = base * (0.42 + 0.5 * rim);", "    }",
+                            "    float3 lit = base * (sun + sky + local) + extra;",
+                            "    return float4(fog(c, lit, i.w), 1.0);", "}", "struct GOut {",
+                            "    float4 pos [[position]];", "    float2 uv;", "    float3 w;", "};",
+                            "vertex GOut vs_glow(VIn i [[stage_in]], constant C& c [[buffer(0)]]) {",
+                            "    float3 w = c.m0.xyz + (c.right.xyz * i.pos.x + c.up.xyz * i.pos.y) * c.m0.w;",
+                            "    GOut o;", "    o.pos = c.viewproj * float4(w, 1.0);", "    o.uv = i.pos.xy;",
+                            "    o.w = w;", "    return o;", "}",
+                            "fragment float4 ps_glow(GOut i [[stage_in]], constant C& c [[buffer(0)]]) {",
+                            "    float k = saturate(1.0 - length(i.uv));",
+                            "    float glow = k * k + pow(k, 8.0) * 2.0;",
+                            "    float f = c.params.y > 0.5 ? exp(-length(i.w - c.eye.xyz) * c.light.w * 0.5) : 1.0;",
+                            "    return float4(c.color.rgb * glow * c.color.a * f, 1.0);", "}", "struct HOut {",
+                            "    float4 pos [[position]];", "    float2 uv;", "};",
+                            "vertex HOut vs_hud(VIn i [[stage_in]], constant C& c [[buffer(0)]]) {", "    HOut o;",
+                            "    o.pos = float4(c.m0.xy + i.pos.xy * c.m0.zw, 0.0, 1.0);", "    o.uv = i.pos.xy;",
+                            "    return o;", "}",
+                            "fragment float4 ps_hud(HOut i [[stage_in]], constant C& c [[buffer(0)]]) {",
+                            "    if (c.params.x > 1.5) {", "        float row = floor(i.pos.y / 3.0);",
+                            "        float band = fract(sin(row * 12.9898 + floor(c.eye.w * 40.0) * 78.233) * 43758.5453);",
+                            "        return float4(c.color.rgb, step(0.95, band) * 0.6 * c.color.a);", "    }",
+                            "    if (c.params.x > 0.5) {", "        float d = length(i.uv * float2(1.0, 0.85));",
+                            "        return float4(c.color.rgb, smoothstep(0.55, 1.4, d) * c.color.a);", "    }",
+                            "    return c.color;", "}", ""];
 
 // -----------------------------------------------------------------------------
 // The world: the play plane is horizontal, PLAY_Y above the floor; the ship
@@ -610,14 +698,14 @@ fn boom_sound(secs: f64, decay: f64, low: f64, seed: u64) !audio.Sound {
 }
 
 struct Sound {
-    engine: xaudio2.Engine,
+    engine: output.Engine,
     on: bool,
     shot: audio.Sound,
     zap: audio.Sound,
     pop: audio.Sound,
     big: audio.Sound,
     dive: audio.Sound,
-    voices: [8]xaudio2.Voice,
+    voices: [8]output.Voice,
     sounds: [8]u32,  // which sound each voice was made for
     next: usize,
     haptics: bool,  // rumble the controller (not for the demo behind the menu)
@@ -630,16 +718,15 @@ const S_BIG: u32 = 3;
 const S_DIVE: u32 = 4;
 
 fn sound(enabled: bool) !Sound {
-    let none = xaudio2.Voice.{ v: 0, block: 0 };
-    let mut s = Sound.{ engine: xaudio2.Engine.{ x: 0, master: 0 }, on: false,
-                        shot: sweep(0.16, 1900.0, 600.0, 18.0, 0.18)!, zap: sweep(0.25, 700.0, 180.0, 10.0, 0.16)!,
-                        pop: boom_sound(0.6, 6.0, 90.0, 7)!, big: boom_sound(2.2, 1.6, 45.0, 13)!,
-                        dive: sweep(0.9, 1400.0, 300.0, 1.5, 0.08)!, voices: [none; 8], sounds: [0; 8], next: 0,
-                        haptics: enabled };
+    let none = output.Voice.none();
+    let mut s = Sound.{ engine: output.Engine.none(), on: false, shot: sweep(0.16, 1900.0, 600.0, 18.0, 0.18)!,
+                        zap: sweep(0.25, 700.0, 180.0, 10.0, 0.16)!, pop: boom_sound(0.6, 6.0, 90.0, 7)!,
+                        big: boom_sound(2.2, 1.6, 45.0, 13)!, dive: sweep(0.9, 1400.0, 300.0, 1.5, 0.08)!,
+                        voices: [none; 8], sounds: [0; 8], next: 0, haptics: enabled };
     if not enabled {
         return s;
     }
-    s.engine = xaudio2.Engine.init() catch {
+    s.engine = output.Engine.init() catch {
         return s;  // no audio device: silence
     };
     for i in @as(usize, 0)..8 {
@@ -674,7 +761,7 @@ fn play(s: *mut Sound, which: u32, pitch: f32, volume: f32) void {
 // The controller's motors, if this game may use them.
 fn rumble(s: *Sound, strength: f32) void {
     if s.haptics {
-        _ = xinput.vibrate(0, strength, strength);
+        _ = gamepad.vibrate(0, strength, strength);
     }
 }
 
@@ -707,11 +794,11 @@ struct Keys {
 }
 
 fn key(k: *mut Keys, code: u32, down: bool) void {
-    if (code == win32.KEY_LEFT) or (code == 'A') {
+    if (code == window.KEY_LEFT) or (code == 'A') {
         k.left = down;
-    } else if (code == win32.KEY_RIGHT) or (code == 'D') {
+    } else if (code == window.KEY_RIGHT) or (code == 'D') {
         k.right = down;
-    } else if (code == win32.KEY_SPACE) or (code == win32.KEY_CONTROL) or (code == win32.KEY_ENTER) {
+    } else if (code == window.KEY_SPACE) or (code == window.KEY_CONTROL) or (code == window.KEY_ENTER) {
         k.fire = down;
     }
 }
@@ -1538,16 +1625,16 @@ fn make_title(q: *mut Quads, cam: Camera, t: f32) void {
 // Graphics
 // -----------------------------------------------------------------------------
 struct Gfx {
-    root: d3d.RootSignature,
-    solid: d3d.Pipeline,
-    glow: d3d.Pipeline,
-    hud: d3d.Pipeline,
-    shadow_pipe: d3d.Pipeline,
-    shadow: d3d.DepthBuffer,
-    lights: d3d.Buffer,
-    cubes: d3d.Buffer,  // this frame's cubes (written in place)
-    index: d3d.Buffer,  // 0 1 2 0 2 3 for every quad
-    quad: d3d.Buffer,   // the billboards' and instruments' square
+    root: gx.RootSignature,
+    solid: gx.Pipeline,
+    glow: gx.Pipeline,
+    hud: gx.Pipeline,
+    shadow_pipe: gx.Pipeline,
+    shadow: gx.DepthBuffer,
+    lights: gx.Buffer,
+    cubes: gx.Buffer,  // this frame's cubes (written in place)
+    index: gx.Buffer,  // 0 1 2 0 2 3 for every quad
+    quad: gx.Buffer,   // the billboards' and instruments' square
 }
 
 fn f32_bytes(p: []f32) []u8 {
@@ -1558,71 +1645,69 @@ fn u32_bytes(p: []u32) []u8 {
     return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
 }
 
-fn shader_source() !strs.String {
+fn source(lines: [][]u8) !strs.String {
     let mut s = strs.String.init();
-    for l in SHADER_LINES {
+    for l in lines {
         s.push_str(l)!;
         s.push('\n')!;
     }
     return s;
 }
 
-fn shader(src: []u8, entry: []u8, target: []u8) !hlsl.Code {
-    return hlsl.compile(src, entry, target) catch |e| {
-        if e == error.CompileError {
-            fmt.eprint("swarm: {}\n", [fmt.str(hlsl.message())]) catch {};
-        }
+// The shaders, from both sources.
+fn shaders(gpu: *mut gx.Device) !gx.Shaders {
+    let mut hlsl_src = source(SHADER_LINES[..])!;
+    defer hlsl_src.deinit();
+    let mut msl_src = source(MSL_LINES[..])!;
+    defer msl_src.deinit();
+    return gpu.shaders(hlsl_src.bytes(), msl_src.bytes()) catch |e| {
+        fmt.eprint("swarm: {}\n", [fmt.str(gx.message())]) catch {};
         return e;
     };
 }
 
-fn attributes() [4]d3d.Attribute {
-    let attrs: [4]d3d.Attribute = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32G32B32_FLOAT,
-                                                   offset: 0 }, d3d.Attribute.{
-                                                       semantic: "NORMAL", index: 0, format: d3d.R32G32B32_FLOAT,
-                                                       offset: 12 }, d3d.Attribute.{
-                                                           semantic: "COLOR", index: 0, format: d3d.R32G32B32A32_FLOAT,
-                                                           offset: 24 }, d3d.Attribute.{
-                                                               semantic: "TEXCOORD", index: 0, format: d3d.R32G32_FLOAT,
-                                                               offset: 40 }];
+// A pipeline from the shaders' entry points vs and ps (none for depth_only).
+fn pipe(gpu: *mut gx.Device, root: *gx.RootSignature, sh: *gx.Shaders, vs: []u8, ps: []u8,
+        o: gx.PipelineOptions) !gx.Pipeline {
+    let attrs = attributes();
+    return gpu.pipeline_with(root, sh, vs, ps, attrs[..], o) catch |e| {
+        fmt.eprint("swarm: {}\n", [fmt.str(gx.message())]) catch {};
+        return e;
+    };
+}
+
+fn attributes() [4]gx.Attribute {
+    let attrs: [4]gx.Attribute = [gx.Attribute.{ semantic: "POSITION", index: 0, format: gx.R32G32B32_FLOAT,
+                                                 offset: 0 }, gx.Attribute.{
+                                                     semantic: "NORMAL", index: 0, format: gx.R32G32B32_FLOAT,
+                                                     offset: 12 }, gx.Attribute.{
+                                                         semantic: "COLOR", index: 0, format: gx.R32G32B32A32_FLOAT,
+                                                         offset: 24 }, gx.Attribute.{
+                                                             semantic: "TEXCOORD", index: 0, format: gx.R32G32_FLOAT,
+                                                             offset: 40 }];
     return attrs;
 }
 
-fn pipe(gpu: *mut d3d.Device, root: *d3d.RootSignature, src: []u8, vs: []u8, ps: []u8,
-        o: d3d.PipelineOptions) !d3d.Pipeline {
-    let mut vcode = shader(src, vs, "vs_5_0")!;
-    defer vcode.release();
-    let attrs = attributes();
-    if o.depth_only {
-        return gpu.pipeline_with(root, &vcode, &vcode, attrs[..], o);
-    }
-    let mut pcode = shader(src, ps, "ps_5_0")!;
-    defer pcode.release();
-    return gpu.pipeline_with(root, &vcode, &pcode, attrs[..], o);
-}
-
-fn options(blend: u32, depth: u32, cull: u32) d3d.PipelineOptions {
-    let mut o = d3d.PipelineOptions.defaults();
+fn options(blend: u32, depth: u32, cull: u32) gx.PipelineOptions {
+    let mut o = gx.PipelineOptions.defaults();
     o.blend = blend;
     o.depth = depth;
     o.cull = cull;
     return o;
 }
 
-fn graphics(gpu: *mut d3d.Device) !Gfx {
-    let mut src = shader_source()!;
-    defer src.deinit();
+fn graphics(gpu: *mut gx.Device) !Gfx {
+    let mut sh = shaders(gpu)!;
+    defer sh.release();
     let mut root = gpu.root_signature_with(52, 1, 1)!;
-    let solid = pipe(gpu, &root, src.bytes(), "vs", "ps", options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_BACK))!;
-    let glow_pipe = pipe(
-        gpu, &root, src.bytes(), "vs_glow", "ps_glow", options(d3d.BLEND_ADD, d3d.DEPTH_TEST, d3d.CULL_NONE))!;
-    let hud = pipe(gpu, &root, src.bytes(), "vs_hud", "ps_hud", options(d3d.BLEND_ALPHA, d3d.DEPTH_OFF,
-                                                                        d3d.CULL_NONE))!;
-    let mut so = options(d3d.BLEND_NONE, d3d.DEPTH_WRITE, d3d.CULL_NONE);
+    let solid = pipe(gpu, &root, &sh, "vs", "ps", options(gx.BLEND_NONE, gx.DEPTH_WRITE, gx.CULL_BACK))!;
+    let glow_pipe = pipe(gpu, &root, &sh, "vs_glow", "ps_glow", options(gx.BLEND_ADD, gx.DEPTH_TEST, gx.CULL_NONE))!;
+    let hud = pipe(gpu, &root, &sh, "vs_hud", "ps_hud", options(gx.BLEND_ALPHA, gx.DEPTH_OFF, gx.CULL_NONE))!;
+    let mut so = options(gx.BLEND_NONE, gx.DEPTH_WRITE, gx.CULL_NONE);
     so.depth_only = true;
     so.depth_bias = 1200;
     so.slope_bias = 2.0;
-    let shadow_pipe = pipe(gpu, &root, src.bytes(), "vs_shadow", "", so)!;
+    let shadow_pipe = pipe(gpu, &root, &sh, "vs_shadow", "", so)!;
     // indices: 0 1 2 0 2 3 for every quad
     let mut iv = vec.Vec.[u32].init();
     defer iv.deinit();
@@ -1959,7 +2044,7 @@ fn light_data(g: *Game, art: *Art, ui: *Ui, cam: Camera, out: []mut f32) void {
     out[LCOUNT] = @float_from_int(f32, l.n);
 }
 
-fn put_draw(gpu: *mut d3d.Device, vals: [20]f32) void {
+fn put_draw(gpu: *mut gx.Device, vals: [20]f32) void {
     let mut u: [20]u32 = [0; 20];
     for k in @as(usize, 0)..20 {
         u[k] = @bit_cast(u32, vals[k]);
@@ -1967,19 +2052,19 @@ fn put_draw(gpu: *mut d3d.Device, vals: [20]f32) void {
     gpu.set_constants_at(32, u[..]);
 }
 
-fn glow(gpu: *mut d3d.Device, p: geo.Vec3.[f32], size: f32, c: geo.Vec3.[f32], a: f32, fogged: bool) void {
+fn glow(gpu: *mut gx.Device, p: geo.Vec3.[f32], size: f32, c: geo.Vec3.[f32], a: f32, fogged: bool) void {
     let f = if_else(fogged, 1.0, 0.0);
     put_draw(gpu, [p.x, p.y, p.z, size, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, 0.0, f, 0.0, 0.0]);
     gpu.draw_indexed(6, 0, 0);
 }
 
-fn rect(gpu: *mut d3d.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, c: geo.Vec3.[f32], a: f32) void {
+fn rect(gpu: *mut gx.Device, aspect: f32, x: f32, y: f32, w: f32, h: f32, c: geo.Vec3.[f32], a: f32) void {
     put_draw(gpu, [x / aspect, y, w * 0.5 / aspect, h * 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a,
                    0.0, 0.0, 0.0, 0.0]);
     gpu.draw_indexed(6, 0, 0);
 }
 
-fn overlay(gpu: *mut d3d.Device, kind: f32, c: geo.Vec3.[f32], a: f32) void {
+fn overlay(gpu: *mut gx.Device, kind: f32, c: geo.Vec3.[f32], a: f32) void {
     put_draw(gpu, [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, kind, 0.0, 0.0, 0.0]);
     gpu.draw_indexed(6, 0, 0);
 }
@@ -1992,7 +2077,7 @@ struct Screen {
 }
 
 // A rectangle of whole pixels: x, y its top left, w × h (pixels).
-fn pixels(gpu: *mut d3d.Device, sc: *Screen, x: f32, y: f32, w: f32, h: f32, c: geo.Vec3.[f32], a: f32) void {
+fn pixels(gpu: *mut gx.Device, sc: *Screen, x: f32, y: f32, w: f32, h: f32, c: geo.Vec3.[f32], a: f32) void {
     let cx = (x + w * 0.5) / sc.w * 2.0 - 1.0;
     let cy = 1.0 - (y + h * 0.5) / sc.h * 2.0;
     put_draw(gpu, [cx, cy, w / sc.w, h / sc.h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, c.x, c.y, c.z, a, 0.0, 0.0, 0.0,
@@ -2018,7 +2103,7 @@ fn gap_px(cell: f32) f32 {
 // Text in the pixel font, every square the same size and every gap the
 // same width: x (-aspect..aspect) is its centre (anchor 0), left edge (-1)
 // or right edge (1); y (-1..1) its top.
-fn text_at(gpu: *mut d3d.Device, sc: *Screen, s: []u8, x: f32, y: f32, anchor: f32, size: f32, c: geo.Vec3.[f32],
+fn text_at(gpu: *mut gx.Device, sc: *Screen, s: []u8, x: f32, y: f32, anchor: f32, size: f32, c: geo.Vec3.[f32],
            a: f32) void {
     let cell = cell_px(sc, size);
     let gap = gap_px(cell);
@@ -2042,14 +2127,14 @@ fn text_at(gpu: *mut d3d.Device, sc: *Screen, s: []u8, x: f32, y: f32, anchor: f
     }
 }
 
-fn text(gpu: *mut d3d.Device, sc: *Screen, s: []u8, cx: f32, y: f32, size: f32, c: geo.Vec3.[f32], a: f32) void {
+fn text(gpu: *mut gx.Device, sc: *Screen, s: []u8, cx: f32, y: f32, size: f32, c: geo.Vec3.[f32], a: f32) void {
     text_at(gpu, sc, s, cx, y, 0.0, size, c, a);
 }
 
 // A ship left, as a small bitmap on the same grid.
 let LIFE_ICON: [5]u8 = [0x04, 0x0e, 0x1f, 0x1f, 0x11];
 
-fn life_icon(gpu: *mut d3d.Device, sc: *Screen, x0: f32, y0: f32, cell: f32, c: geo.Vec3.[f32]) void {
+fn life_icon(gpu: *mut gx.Device, sc: *Screen, x0: f32, y0: f32, cell: f32, c: geo.Vec3.[f32]) void {
     let gap = gap_px(cell);
     for row in @as(usize, 0)..5 {
         for col in @as(usize, 0)..5 {
@@ -2061,7 +2146,7 @@ fn life_icon(gpu: *mut d3d.Device, sc: *Screen, x0: f32, y0: f32, cell: f32, c: 
     }
 }
 
-fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.DepthBuffer, g: *Game, art: *Art,
+fn draw(gpu: *mut gx.Device, gfx: *mut Gfx, t: *mut gx.Target, z: *mut gx.DepthBuffer, g: *Game, art: *Art,
         ui: *Ui) !void {
     let aspect = @float_from_int(f32, t.width) / @float_from_int(f32, t.height);
     let cam = camera(g, aspect);
@@ -2076,7 +2161,7 @@ fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.Dep
     gpu.clear_depth(&gfx.shadow);
     gpu.set_pipeline(&gfx.shadow_pipe);
     gpu.set_buffer(0, &gfx.lights);
-    gpu.set_indices(&gfx.index, d3d.R32_UINT);
+    gpu.set_indices(&gfx.index, gx.R32_UINT);
     gpu.set_vertices(&gfx.cubes, @truncate(u32, VERT * 4));
     gpu.draw_indexed(nq * 6, 0, 0);
 
@@ -2087,7 +2172,7 @@ fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.Dep
     gpu.set_constants_at(0, fc[..]);
     gpu.set_buffer(0, &gfx.lights);
     gpu.set_texture(0, &mut gfx.shadow);
-    gpu.set_indices(&gfx.index, d3d.R32_UINT);
+    gpu.set_indices(&gfx.index, gx.R32_UINT);
     gpu.set_vertices(&gfx.cubes, @truncate(u32, VERT * 4));
     gpu.draw_indexed(nq * 6, 0, 0);
 
@@ -2095,7 +2180,7 @@ fn draw(gpu: *mut d3d.Device, gfx: *mut Gfx, t: *mut d3d.Target, z: *mut d3d.Dep
     gpu.set_pipeline(&gfx.glow);
     gpu.set_constants_at(0, fc[..]);
     gpu.set_vertices(&gfx.quad, @truncate(u32, VERT * 4));
-    gpu.set_indices(&gfx.index, d3d.R32_UINT);
+    gpu.set_indices(&gfx.index, gx.R32_UINT);
     for s in g.stars {
         let tw = 0.6 + 0.4 * math.sinf(g.time * 1.7 + s.x * 40.0);
         glow(gpu, cam.eye.add(s.normalize().scale(300.0)), 0.9 + 0.6 * @abs(s.x), v3(0.75, 0.82, 1.0), tw, false);
@@ -2215,7 +2300,7 @@ fn wave_line(buf: []mut u8, wave: u32) []u8 {
 
 // The front screen, over the game playing itself: the title (in cubes,
 // made with the rest), the high scores, how to start.
-fn menu(gpu: *mut d3d.Device, sc: *Screen, ui: *Ui) void {
+fn menu(gpu: *mut gx.Device, sc: *Screen, ui: *Ui) void {
     let aspect = sc.aspect;
     let t = ui.menu_t;
     let fade = @min(t * 2.0, 1.0);
@@ -2293,10 +2378,10 @@ fn status(g: *Game, on_menu: bool, buf: []mut u8) ![]u8 {
 }
 
 fn windowed(frames: i64, auto: bool) !i32 {
-    let mut w = win32.Window.open("Swarm", 675, 900)!;
+    let mut w = window.Window.open("Swarm", 675, 900)!;
     defer w.deinit();
     let sz = w.size();
-    let mut gpu = d3d.Device.init_window(w.handle(), sz[0], sz[1])!;
+    let mut gpu = gx.Device.init_window(w.handle(), sz[0], sz[1])!;
     defer gpu.deinit();
     let mut zbuf = gpu.depth_buffer(sz[0], sz[1])!;
     defer zbuf.release();
@@ -2318,7 +2403,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
         ui.menu = false;  // straight into a game, played by itself
     }
     let mut keys = Keys.{ left: false, right: false, fire: false };
-    let mut pads = xinput.Tracker.init();
+    let mut pads = gamepad.Tracker.init();
     let mut was_firing = true;  // (a press that started the program does not count)
     let mut title: [96]u8 = [0; 96];
     let mut shown: [96]u8 = [0; 96];
@@ -2328,10 +2413,10 @@ fn windowed(frames: i64, auto: bool) !i32 {
     let mut quit = false;
     while not quit {
         let e = w.next_event();
-        if e.kind == win32.EventKind.CLOSE {
+        if e.kind == window.EventKind.CLOSE {
             break;
         }
-        if (e.kind == win32.EventKind.KEY_DOWN) and (e.key == win32.KEY_ESCAPE) {
+        if (e.kind == window.EventKind.KEY_DOWN) and (e.key == window.KEY_ESCAPE) {
             // in a game: give it up; on the menu: quit
             if ui.menu {
                 break;
@@ -2339,27 +2424,27 @@ fn windowed(frames: i64, auto: bool) !i32 {
             ui.menu = true;
             ui.menu_t = 0.0;
             ui.latest = -1;
-            _ = xinput.vibrate(0, 0.0, 0.0);
+            _ = gamepad.vibrate(0, 0.0, 0.0);
             continue;
         }
-        if e.kind == win32.EventKind.KEY_DOWN {
+        if e.kind == window.EventKind.KEY_DOWN {
             key(&mut keys, e.key, true);
             continue;
         }
-        if e.kind == win32.EventKind.KEY_UP {
+        if e.kind == window.EventKind.KEY_UP {
             key(&mut keys, e.key, false);
             continue;
         }
-        if e.kind == win32.EventKind.RESIZE {
+        if e.kind == window.EventKind.RESIZE {
             gpu.resize(e.width, e.height)!;
             gpu.resize_depth(&mut zbuf, e.width, e.height)!;
             continue;
         }
-        if e.kind != win32.EventKind.NONE {
+        if e.kind != window.EventKind.NONE {
             continue;
         }
         let p = pads.update();
-        if pads.pressed(0, xinput.BACK) {
+        if pads.pressed(0, gamepad.BACK) {
             if ui.menu {
                 break;
             }
@@ -2370,12 +2455,12 @@ fn windowed(frames: i64, auto: bool) !i32 {
         let dt = @float_cast(f32, @min(@float_from_int(f64, last.elapsed().ns) / 1e9, 0.05));
         last = time.Instant.now();
         let pad = p[0];
-        let firing = keys.fire or pad.down(xinput.A) or pad.down(xinput.START) or (pad.right_trigger > 0.3);
+        let firing = keys.fire or pad.down(gamepad.A) or pad.down(gamepad.START) or (pad.right_trigger > 0.3);
         let pressed = firing and not was_firing;
         was_firing = firing;
         let mut inp = Input.{
-            x: axis(keys.left, keys.right) + pad.left_x + axis(pad.down(xinput.DPAD_LEFT), pad.down(xinput.DPAD_RIGHT)),
-            fire: firing };
+            x: axis(keys.left, keys.right) + pad.left_x + axis(pad.down(gamepad.DPAD_LEFT),
+                                                               pad.down(gamepad.DPAD_RIGHT)), fire: firing };
         let mut shown_game = game;
         if ui.menu {
             ui.menu_t += dt;
@@ -2398,7 +2483,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
             }
             update(game, art, inp, &mut snd, dt);
             if game.over > 4.0 {
-                _ = xinput.vibrate(0, 0.0, 0.0);
+                _ = gamepad.vibrate(0, 0.0, 0.0);
                 record(&mut ui, game.score, game.wave);
                 ui.menu = true;
                 ui.menu_t = 0.0;
@@ -2424,7 +2509,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
             break;
         }
     }
-    _ = xinput.vibrate(0, 0.0, 0.0);
+    _ = gamepad.vibrate(0, 0.0, 0.0);
     fmt.print("{} frames, wave {}, score {}\n", [fmt.int(n), fmt.int(game.wave), fmt.int(game.score)])!;
     return 0;
 }
@@ -2432,7 +2517,7 @@ fn windowed(frames: i64, auto: bool) !i32 {
 // Plays `frames` frames by itself (at 60 a second) offscreen, then saves
 // the last as a PNG.
 fn offscreen(out: []u8, frames: i64, on_menu: bool) !i32 {
-    let mut gpu = d3d.Device.init()!;
+    let mut gpu = gx.Device.init()!;
     defer gpu.deinit();
     let mut gfx = graphics(&mut gpu)!;
     defer release(&mut gfx);
@@ -2470,7 +2555,7 @@ fn offscreen(out: []u8, frames: i64, on_menu: bool) !i32 {
 }
 
 fn run() !i32 {
-    let mut p = cli.Parser.init("swarm", "A formation shooter in cubes: Direct3D 12, XInput and XAudio2 (Windows).");
+    let mut p = cli.Parser.init("swarm", "A formation shooter in cubes (Windows and macOS).");
     defer p.deinit();
     p.option("png", 'o', "FILE", "play by itself offscreen, then save the last frame as a PNG")!;
     p.option("frames", 'n', "N", "quit after N frames (with --png: how many to play first)")!;
@@ -2491,8 +2576,8 @@ fn run() !i32 {
         fmt.eprint("swarm: {}\n", [fmt.str(p.message())])!;
         return 2;
     };
-    if not os.is_windows() {
-        io.stderr().println("swarm: this needs Windows (--target=x86_64-windows)")!;
+    if not os.is_windows() and not os.is_macos() {
+        io.stderr().println("swarm: this needs Windows or macOS")!;
         return 1;
     }
     if m.has("png") {

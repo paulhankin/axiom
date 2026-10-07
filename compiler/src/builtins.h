@@ -21,11 +21,15 @@
     X(INT_FROM_PTR, "int_from_ptr", "e")      \
     X(PTR_FROM_INT, "ptr_from_int", "te")     \
     X(PTR_CAST, "ptr_cast", "te")             \
+    X(PTR_ADD, "ptr_add", "ee")               \
+    X(PTR_SUB, "ptr_sub", "ee")               \
     X(SLICE_FROM_PTR, "slice_from_ptr", "ee") \
     X(CAST_SLICE, "cast_slice", "te")         \
     X(MEM_COPY, "mem_copy", "ee")             \
     X(MEM_SET, "mem_set", "ee")               \
     X(MEM_EQ, "mem_eq", "ee")                 \
+    X(PREFETCH, "prefetch", "e")              \
+    X(PREFETCH_WRITE, "prefetch_write", "e")  \
     X(MEMORY_SIZE, "memory_size", "")         \
     X(MEMORY_GROW, "memory_grow", "e")        \
     X(CLZ, "clz", "e")                        \
@@ -70,6 +74,9 @@
     X(BITMASK, "bitmask", "e")                \
     X(REDUCE_ADD, "reduce_add", "e")          \
     X(DOT, "dot", "ee")                       \
+    X(WIDEN_LOW, "widen_low", "e")            \
+    X(WIDEN_HIGH, "widen_high", "e")          \
+    X(NARROW, "narrow", "tee")                \
     X(TRAP, "trap", "")                       \
     X(ATOMIC_LOAD, "atomic_load", "e")        \
     X(ATOMIC_STORE, "atomic_store", "ee")     \
@@ -92,7 +99,57 @@
     X(SANITIZE_ADDRESS, "sanitize_address", "") \
     X(MEMORY_ERROR, "memory_error", "")       \
     X(INT_FROM_ENUM, "int_from_enum", "e")    \
-    X(ENUM_FROM_INT, "enum_from_int", "te")
+    X(ENUM_FROM_INT, "enum_from_int", "te")   \
+    X(TARGET_HAS, "target_has", "e")          \
+    X(TARGET_ARCH, "target_arch", "e")        \
+    X(TARGET_OS, "target_os", "e")            \
+    X(CPU_HAS, "cpu_has", "e")                \
+    X(X86_CPUID, "x86_cpuid", "ee")           \
+    X(X86_XGETBV, "x86_xgetbv", "e")          \
+    X(X86_AESENC, "x86_aesenc", "ee") \
+    X(X86_AESENCLAST, "x86_aesenclast", "ee") \
+    X(X86_AESDEC, "x86_aesdec", "ee") \
+    X(X86_AESDECLAST, "x86_aesdeclast", "ee") \
+    X(X86_AESIMC, "x86_aesimc", "e") \
+    X(X86_AESKEYGENASSIST, "x86_aeskeygenassist", "ee") \
+    X(X86_CLMUL, "x86_clmul", "eee") \
+    X(X86_SHA1RNDS4, "x86_sha1rnds4", "eee") \
+    X(X86_SHA1NEXTE, "x86_sha1nexte", "ee") \
+    X(X86_SHA1MSG1, "x86_sha1msg1", "ee") \
+    X(X86_SHA1MSG2, "x86_sha1msg2", "ee") \
+    X(X86_SHA256RNDS2, "x86_sha256rnds2", "eee") \
+    X(X86_SHA256MSG1, "x86_sha256msg1", "ee") \
+    X(X86_SHA256MSG2, "x86_sha256msg2", "ee") \
+    X(X86_CRC32C, "x86_crc32c", "ee") \
+    X(ARM_AESE, "arm_aese", "ee") \
+    X(ARM_AESD, "arm_aesd", "ee") \
+    X(ARM_AESMC, "arm_aesmc", "e") \
+    X(ARM_AESIMC, "arm_aesimc", "e") \
+    X(ARM_PMULL, "arm_pmull", "ee") \
+    X(ARM_PMULL2, "arm_pmull2", "ee") \
+    X(ARM_SHA1C, "arm_sha1c", "eee") \
+    X(ARM_SHA1P, "arm_sha1p", "eee") \
+    X(ARM_SHA1M, "arm_sha1m", "eee") \
+    X(ARM_SHA1H, "arm_sha1h", "e") \
+    X(ARM_SHA1SU0, "arm_sha1su0", "eee") \
+    X(ARM_SHA1SU1, "arm_sha1su1", "ee") \
+    X(ARM_SHA256H, "arm_sha256h", "eee") \
+    X(ARM_SHA256H2, "arm_sha256h2", "eee") \
+    X(ARM_SHA256SU0, "arm_sha256su0", "ee") \
+    X(ARM_SHA256SU1, "arm_sha256su1", "eee") \
+    X(ARM_SHA512H, "arm_sha512h", "eee") \
+    X(ARM_SHA512H2, "arm_sha512h2", "eee") \
+    X(ARM_SHA512SU0, "arm_sha512su0", "ee") \
+    X(ARM_SHA512SU1, "arm_sha512su1", "eee") \
+    X(ARM_EOR3, "arm_eor3", "eee") \
+    X(ARM_BCAX, "arm_bcax", "eee") \
+    X(ARM_RAX1, "arm_rax1", "ee") \
+    X(ARM_XAR, "arm_xar", "eee") \
+    X(ARM_CRC32, "arm_crc32", "ee") \
+    X(ARM_CRC32C, "arm_crc32c", "ee") \
+    X(LOAD_PARTIAL, "load_partial", "te") \
+    X(STORE_PARTIAL, "store_partial", "ee") \
+    X(SWIZZLE2, "swizzle2", "eee")
 
 typedef enum BuiltinId {
 #define X(id, name, sig) BI_##id,

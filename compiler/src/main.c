@@ -6,14 +6,15 @@
 // Options:
 //   --target=wasm32|native     (default wasm32; wasm32-freestanding accepted)
 //   -O0 -O1 -O2 -O3            optimization level (never changes behavior)
-//   --release                  same as --overflow=saturate
-//   --overflow=trap|saturate   integer overflow mode (default trap)
+//   --overflow=wrap|trap|saturate   integer overflow mode (default wrap)
+//   --release                  accepted for compatibility; changes nothing
 //   --emit=exe|obj|llvm|asm    output kind (default: exe = .wasm module / native executable)
 //   --format=human|agent-json  diagnostic format
 //   --std=<dir>                standard library directory
 //   --link=<file>              extra C source, object or library to link (repeatable)
 //   -l<lib> -L<dir> -I<dir>    C libraries, library and include directories
 //   --emit-header=<path>       write a C header for the exported functions
+//   -g, --debug-info=lines|none   DWARF line tables (default none)
 //   -o <path>                  output path
 #include <limits.h>
 #include <spawn.h>
@@ -28,22 +29,25 @@
 #include "package.h"
 #include "units.h"
 #include "sema.h"
+#include "target.h"
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void);
+const char *LLVMGetHostCPUFeatures_wrapper(void);
 
 extern char **environ;
 
 static void usage(void) {
     fprintf(stderr,
             "usage: axiom <build|check|test> [<file.ax> | <package dir>] [options]\n"
-            "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>]\n"
+            "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n"
             "       axiom new <name>      create a package skeleton\n"
             "       axiom cache [path|clean]   the compiled-module cache\n"
             "  test: --filter=<text> --timeout=<ms>\n"
-            "  --target=wasm32|native   -O0..-O3   --release | --overflow=trap|saturate\n"
+            "  --target=wasm32|native   -O0..-O3   --overflow=wrap|trap|saturate (default wrap)\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
             "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n"
             "  --sanitize=address|none  check heap accesses: use after free, overflows, double frees, leaks\n"
+            "  -g, --debug-info=lines|none   DWARF line tables for debuggers and profilers (default none)\n"
             "  --units=module|program   compile modules separately (cached) or as one unit\n"
             "                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
 }
@@ -438,7 +442,8 @@ static int spawn_program(char *const argv[], char *const envp[], bool out_to_err
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
-static int run_profile(const char *bin, const char *std_dir, const char *folded_path, int hz, bool json) {
+static int run_profile(const char *bin, char **prog_args, int nprog_args, const char *std_dir, const char *folded_path,
+                       int hz, bool json) {
     const char *tmpdir = getenv("TMPDIR");
     const char *raw = arena_printf("%s/axiom-profile-%d.raw", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid());
     unlink(raw);
@@ -461,6 +466,8 @@ static int run_profile(const char *bin, const char *std_dir, const char *folded_
         vec_push(env, arena_printf("AXIOM_PROFILE_HZ=%d", hz));
     }
     vec_push(av, (char *)bin);
+    if (g_target.wasm && nprog_args > 0) vec_push(av, (char *)"--");  // host.mjs: the program's arguments follow
+    for (int i = 0; i < nprog_args; i++) vec_push(av, prog_args[i]);
     vec_push(av, NULL);
     vec_push(env, NULL);
     int status = spawn_program(av.data, env.data, json);
@@ -687,6 +694,7 @@ int main(int argc, char **argv) {
     bool json = false;
     CgOptions co = {.stack_traces = true};
     Vec(char *) link_inputs = {0};
+    Vec(char *) feature_args = {0};  // --features
     Vec(char *) link_flags = {0};  // -l / -L
     Vec(char *) inc_flags = {0};   // -I, for C sources
     const char *header_path = NULL;
@@ -695,17 +703,22 @@ int main(int argc, char **argv) {
     int units_mode = -1;  // -1: by optimization level
     bool verbose = false;
     const char *folded_path = NULL;
+    char **prog_args = NULL;  // profile: the program's arguments, after `--`
+    int nprog_args = 0;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-o") && i + 1 < argc) out = argv[++i];
         else if (!strncmp(a, "--target=", 9)) target = a + 9;
         else if (!strcmp(a, "-O0") || !strcmp(a, "-O1") || !strcmp(a, "-O2") || !strcmp(a, "-O3")) co.opt_level = a[2] - '0';
-        else if (!strcmp(a, "--release")) co.overflow_saturate = true;
-        else if (!strcmp(a, "--overflow=trap")) co.overflow_saturate = false;
-        else if (!strcmp(a, "--overflow=saturate")) co.overflow_saturate = true;
+        else if (!strcmp(a, "--release")) continue;  // once --overflow=saturate: no build mode changes semantics
+        else if (!strcmp(a, "--overflow=wrap")) co.overflow = OVF_WRAP;
+        else if (!strcmp(a, "--overflow=trap")) co.overflow = OVF_TRAP;
+        else if (!strcmp(a, "--overflow=saturate")) co.overflow = OVF_SATURATE;
         else if (!strncmp(a, "--emit=", 7)) emit = a + 7;
         else if (!strcmp(a, "--stack-traces=on")) co.stack_traces = true;
         else if (!strcmp(a, "--stack-traces=off")) co.stack_traces = false;
+        else if (!strcmp(a, "-g") || !strcmp(a, "--debug-info=lines")) co.debug_info = 1;
+        else if (!strcmp(a, "--debug-info=none")) co.debug_info = 0;
         else if (!strcmp(a, "--sanitize=address")) co.sanitize_address = true;
         else if (!strcmp(a, "--sanitize=none")) co.sanitize_address = false;
         else if (!strcmp(a, "--units=module")) units_mode = 1;
@@ -715,6 +728,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--format=human")) json = false;
         else if (!strncmp(a, "--std=", 6)) std_dir = a + 6;
         else if (!strncmp(a, "--cpu=", 6)) co.cpu = a + 6;
+        else if (!strncmp(a, "--features=", 11)) vec_push(feature_args, (char *)a + 11);
         else if (!strncmp(a, "--link=", 7)) vec_push(link_inputs, (char *)a + 7);
         else if (!strncmp(a, "--emit-header=", 14)) header_path = a + 14;
         else if (testing && !strncmp(a, "--filter=", 9)) test_filter = a;
@@ -723,7 +737,11 @@ int main(int argc, char **argv) {
         else if (profiling && !strncmp(a, "--folded=", 9)) folded_path = a + 9;
         else if ((a[1] == 'l' || a[1] == 'L') && a[0] == '-' && a[2]) vec_push(link_flags, (char *)a);
         else if (a[0] == '-' && a[1] == 'I' && a[2]) vec_push(inc_flags, (char *)a);
-        else if (a[0] == '-') {
+        else if (profiling && !strcmp(a, "--")) {
+            prog_args = argv + i + 1;
+            nprog_args = argc - i - 1;
+            break;
+        } else if (a[0] == '-') {
             diag_emit_fatal(json, "E9001", arena_printf("unknown option '%s'", a));
             return 2;
         } else if (!input) input = a;
@@ -764,6 +782,30 @@ int main(int argc, char **argv) {
         diag_emit_fatal(json, "E9002", arena_printf("unknown target '%s' (expected wasm32, wasm64 or native)", target));
         return 2;
     }
+    // Processor extensions: a --cpu preset (default: the host's for native,
+    // a baseline for wasm), then --features edits (target.c).
+    if (g_target.wasm) {
+        g_arch = g_target.ptr_bits == 64 ? ARCH_WASM64 : ARCH_WASM32;
+    } else {
+        g_arch = (strstr(g_target.triple, "aarch64") || strstr(g_target.triple, "arm64")) ? ARCH_A64 : ARCH_X64;
+#ifdef __APPLE__
+        g_os = OS_DARWIN;
+#endif
+    }
+    g_cpu = co.cpu ? co.cpu : g_target.wasm ? "generic" : "native";
+    if (!strcmp(g_cpu, "native") && !g_target.wasm) {
+        g_features = feature_closure(features_from_llvm(LLVMGetHostCPUFeatures_wrapper()));
+    } else if (!cpu_preset(g_arch, g_cpu, &g_features)) {
+        diag_emit_fatal(json, "E9002", arena_printf("unknown --cpu '%s' for target %s", g_cpu, target));
+        return 2;
+    }
+    for (int k = 0; k < feature_args.len; k++) {
+        const char *bad = apply_features(feature_args.data[k]);
+        if (bad) {
+            diag_emit_fatal(json, "E9002", arena_printf("unknown processor extension '%s' (known: %s)", bad, feature_names()));
+            return 2;
+        }
+    }
     if (!file_exists(input)) {
         diag_emit_fatal(json, "E0211", arena_printf("cannot read '%s'", input));
         return 2;
@@ -774,6 +816,13 @@ int main(int argc, char **argv) {
     if (g_target.wasm && strcmp(cmd, "check") != 0) {
         const char *rtp = arena_printf("%s/../runtime/rt.ax", std_path);
         if (file_exists(rtp)) vec_push(pkg_files, (char *)rtp);
+    }
+    // std/os/cpu.ax: @cpu_has, @features and @multiversion ask it about the
+    // processor, and native programs built for more than the baseline check
+    // the processor with it before main.
+    if (strcmp(cmd, "check") != 0) {
+        const char *cpup = arena_printf("%s/os/cpu.ax", std_path);
+        if (file_exists(cpup)) vec_push(pkg_files, (char *)cpup);
     }
     // --sanitize=address checks accesses with std/mem.ax's shadow memory
     if (co.sanitize_address) vec_push(pkg_files, (char *)arena_printf("%s/mem.ax", std_path));
@@ -1028,7 +1077,7 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (profiling) {
-        int rc = run_profile(out, so.std_dir, folded_path, prof_hz, json);
+        int rc = run_profile(out, prog_args, nprog_args, so.std_dir, folded_path, prof_hz, json);
         unlink(out);
         return rc;
     }

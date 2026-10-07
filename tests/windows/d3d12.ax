@@ -1,5 +1,6 @@
 // Direct3D 12 (std/graphics/d3d12), drawn offscreen and read back pixel by
-// pixel: textures from images, compute shaders, vertices a compute shader
+// pixel: textures from images (with mipmaps), multisampled half-float
+// targets read by a later pass, compute shaders, vertices a compute shader
 // made, and Direct2D on top (D3D11On12). Windows only:
 // axiom test tests/windows/d3d12.ax --target=x86_64-windows
 
@@ -74,6 +75,144 @@ test "a texture from an image" {
     for i in @as(usize, 0)..16 {
         let g = @as(u32, @truncate(u8, i * 16));
         @expect_eq(px(&out, i % 4, i / 4), (((g << 24) | (g << 16)) | (g << 8)) | 255);
+    }
+}
+
+// A half-plane of light beyond 1 (HDR), below the diagonal from the top
+// left; then a pass showing it tone-mapped (x / (1 + x)), or a texture's
+// level `lod`.
+let PASSES: [14][]u8 = ["cbuffer K : register(b0) { float lod; };", "Texture2D tex : register(t0);",
+                        "SamplerState lin : register(s0);", "SamplerState clamped : register(s2);",
+                        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD; };",
+                        "VSOut full(uint id : SV_VertexID) {", "    VSOut o;",
+                        "    float2 p = float2(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0);",
+                        "    o.pos = float4(p, 0.5, 1.0); o.uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); return o; }",
+                        "float4 corner(uint id : SV_VertexID) : SV_Position { return float4(id == 1 ? 1.0 : -1.0, id == 0 ? 1.0 : -1.0, 0.5, 1.0); }",
+                        "float4 bright(float4 p : SV_Position) : SV_Target { return float4(4.0, 1.0, 0.0, 1.0); }",
+                        "float4 tone(VSOut i) : SV_Target { float4 c = tex.Sample(clamped, i.uv); return float4(c.rgb / (1.0 + c.rgb), 1.0); }",
+                        "float4 level(VSOut i) : SV_Target { return tex.SampleLevel(lin, i.uv, lod); }", ""];
+
+test "a multisampled half-float target, resolved and read by the next pass" {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    let s = src(PASSES[..]);
+    let mut vc = hlsl.compile(s, "corner", "vs_5_0")!;
+    defer vc.release();
+    let mut pc = hlsl.compile(s, "bright", "ps_5_0")!;
+    defer pc.release();
+    let mut fc = hlsl.compile(s, "full", "vs_5_0")!;
+    defer fc.release();
+    let mut tc = hlsl.compile(s, "tone", "ps_5_0")!;
+    defer tc.release();
+    let mut rs = gpu.root_signature_with(1, 0, 1)!;
+    defer rs.release();
+    let none = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32_FLOAT, offset: 0 }];
+    let mut o = d3d.PipelineOptions.defaults();
+    o.format = d3d.TARGET_RGBA16F;
+    o.samples = 4;
+    o.depth = d3d.DEPTH_WRITE;
+    let mut p = gpu.pipeline_with(&rs, &vc, &pc, none[0..0], o)!;
+    defer p.release();
+    let mut q = gpu.pipeline(&rs, &fc, &tc, none[0..0], d3d.TRIANGLE_LIST, false)!;
+    defer q.release();
+    let mut hdr = gpu.target_with(16, 16, d3d.TARGET_RGBA16F, 4)!;
+    defer hdr.release();
+    let mut z = gpu.depth_buffer_with(16, 16, 4)!;
+    defer z.release();
+    let mut t = gpu.target(16, 16)!;
+    defer t.release();
+    gpu.begin_depth(&mut hdr, &mut z)!;
+    gpu.clear(&hdr, 0.0, 0.0, 0.0, 1.0);
+    gpu.clear_depth(&z);
+    gpu.set_pipeline(&p);
+    gpu.draw(3, 0);
+    gpu.begin(&mut t)!;
+    gpu.set_pipeline(&q);
+    gpu.set_target_texture(0, &mut hdr);
+    gpu.draw(3, 0);
+    gpu.finish()!;
+    let mut out = gpu.read_pixels(&mut t)!;
+    defer out.deinit();
+    // inside: 4 / 5 and 1 / 2 (204, 128); outside: black
+    let inside = px(&out, 2, 12);
+    @expect((inside >> 24) >= 203 and (inside >> 24) <= 205);
+    @expect(((inside >> 16) & 255) >= 127 and ((inside >> 16) & 255) <= 128);
+    @expect_eq(px(&out, 12, 2), 255);
+    // on the diagonal, half its samples covered: 2 / 3
+    let edge = px(&out, 7, 7) >> 24;
+    @expect(edge > 150 and edge < 190);
+}
+
+test "mipmaps" {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    let s = src(PASSES[..]);
+    let mut fc = hlsl.compile(s, "full", "vs_5_0")!;
+    defer fc.release();
+    let mut lc = hlsl.compile(s, "level", "ps_5_0")!;
+    defer lc.release();
+    let mut rs = gpu.root_signature_with(1, 0, 1)!;
+    defer rs.release();
+    let none = [d3d.Attribute.{ semantic: "POSITION", index: 0, format: d3d.R32_FLOAT, offset: 0 }];
+    let mut p = gpu.pipeline(&rs, &fc, &lc, none[0..0], d3d.TRIANGLE_LIST, false)!;
+    defer p.release();
+    // a checkerboard of 8 × 8 pixels, white and black: its other levels grey
+    let mut img = image.Image.init(8, 8, 4, image.Depth.U8)!;
+    defer img.deinit();
+    for i in @as(usize, 0)..64 {
+        let mut v: u8 = 0;
+        if (((i % 8) + (i / 8)) % 2) == 0 {
+            v = 255;
+        }
+        img.data[i * 4] = v;
+        img.data[(i * 4) + 1] = v;
+        img.data[(i * 4) + 2] = 255 - v;
+        img.data[(i * 4) + 3] = 255;
+    }
+    let mut tex = gpu.texture_mipmapped(&img, false)!;
+    defer tex.release();
+    @expect_eq(tex.levels, 4);
+    let mut t = gpu.target(8, 8)!;
+    defer t.release();
+    let lods: [2]f32 = [0.0, 3.0];
+    for lod in lods {
+        gpu.begin(&mut t)!;
+        gpu.set_pipeline(&p);
+        let k: [1]u32 = [@bit_cast(u32, lod)];
+        gpu.set_constants(k[..]);
+        gpu.set_image(0, &tex);
+        gpu.draw(3, 0);
+        gpu.finish()!;
+        let mut out = gpu.read_pixels(&mut t)!;
+        defer out.deinit();
+        if lod == 0.0 {
+            @expect_eq(px(&out, 0, 0), 0xffff00ff);
+            @expect_eq(px(&out, 1, 0), 0x0000ffff);
+        } else {
+            for i in @as(usize, 0)..64 {
+                let c = px(&out, i % 8, i / 8);
+                @expect_eq(c, 0x808080ff);
+            }
+        }
+    }
+}
+
+test "views are given back" {
+    let mut gpu = d3d.Device.init()!;
+    defer gpu.deinit();
+    // more targets, depth buffers and textures than the heaps hold, made
+    // and released one after another
+    let mut img = image.Image.init(2, 2, 4, image.Depth.U8)!;
+    defer img.deinit();
+    for k in @as(u32, 0)..2200 {
+        let mut t = gpu.target_with(4, 4, d3d.TARGET_RGBA16F, 1 + ((k & 1) * 3))!;
+        t.release();
+        if (k % 32) == 0 {
+            let mut z = gpu.depth_buffer(4, 4)!;
+            z.release();
+        }
+        let mut x = gpu.texture(&img)!;
+        x.release();
     }
 }
 

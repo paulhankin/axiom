@@ -7,9 +7,12 @@
 //
 // simplify(i) returns the value i can be replaced by, or nil; it may insert
 // new instructions before i. Floating point is left alone (no rewrite may
-// change a result, spec §7.7), and so are vectors and 128-bit integers.
+// change a result, spec §7.7) but for division by a power of two, which is
+// multiplication by its exact reciprocal; vectors and 128-bit integers are
+// left alone too.
 // =============================================================================
 import "ir.ax" as ir;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 fn vnil() *mut ir.Value {
@@ -208,11 +211,165 @@ fn cmp_const_range(p: i32, bits: i32, k: u64) i32 {
     return -1;
 }
 
+// The float 1.0, or a vector of them.
+fn fone(v: *ir.Value) bool {
+    if v.kind == ir.V_CFP {
+        return v.fv == 1.0;
+    }
+    if is_op(v, ir.OP_SPLAT) {
+        return fone(v.a);
+    }
+    if (v.kind == ir.V_CAGG) and (v.ty.kind == ir.T_VEC) {
+        for k in 0..v.xs.len {
+            if not fone(v.xs.get(k)) {
+                return false;
+            }
+        }
+        return v.xs.len > 0;
+    }
+    return false;
+}
+
+// A vector of integer lanes with every bit set (a constant, or a splat of one).
+fn vones(v: *ir.Value) bool {
+    if (v.ty.kind != ir.T_VEC) or (v.ty.elem.kind != ir.T_INT) {
+        return false;
+    }
+    let all = ir.mask_bits(v.ty.elem.bits);
+    if is_op(v, ir.OP_SPLAT) {
+        return (v.a.kind == ir.V_CINT) and ((v.a.cv & all) == all);
+    }
+    if v.kind != ir.V_CAGG {
+        return false;
+    }
+    for k in 0..v.xs.len {
+        let x = v.xs.get(k);
+        if (x.kind != ir.V_CINT) or ((x.cv & all) != all) {
+            return false;
+        }
+    }
+    return v.xs.len > 0;
+}
+
+// A vector of zeros (a constant, or a splat of zero).
+fn vzero(v: *ir.Value) bool {
+    return ir.is_zero(v) or (is_op(v, ir.OP_SPLAT) and ir.is_zero(v.a));
+}
+
+fn scalar_const(x: *ir.Value) bool {
+    return (x.kind == ir.V_CINT) or (x.kind == ir.V_CFP) or (x.kind == ir.V_ZERO);
+}
+
+// Are scalar constants x and y the same bits?
+fn same_const(x: *ir.Value, y: *ir.Value) bool {
+    if ir.is_zero(x) or ir.is_zero(y) {
+        return ir.is_zero(x) and ir.is_zero(y);
+    }
+    if (x.kind == ir.V_CINT) and (y.kind == ir.V_CINT) {
+        return (x.ty == y.ty) and (x.cv == y.cv);
+    }
+    if (x.kind == ir.V_CFP) and (y.kind == ir.V_CFP) {
+        return (x.ty == y.ty) and (@bit_cast(u64, x.fv) == @bit_cast(u64, y.fv));
+    }
+    return false;
+}
+
+// A constant lane put into a vector built by inserting lanes into a
+// constant (`@vec(f32x16, x0, .., x4, 0.0, ..)` is such a chain, from an
+// undefined vector): the constant goes into that constant instead, under
+// the other inserts, which are made again on it (each used only by the
+// next, so the old ones die). The variable lanes then go into a vector
+// whose other lanes are known (zero, for insertps), rather than every lane
+// being inserted one after the other. An insert of the lane further down is
+// dropped (overwritten). The undefined lanes of the constant become zero.
+fn sink_const_insert(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let c = i.b;
+    let t = i.ty;
+    if not scalar_const(c) {
+        return vnil();
+    }
+    let lane = i.cv;
+    let n = @as(u64, @bit_cast(u32, t.lanes));
+    if lane >= n {
+        return vnil();
+    }
+    let mut chain = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut cur = ir.resolve(i.a);
+    let mut dropped = false;
+    while is_op(cur, ir.OP_INSERTELEM) and (chain.len < 64) and (uses_of(cur) == 1) {
+        if cur.cv == lane {
+            dropped = true;
+        } else {
+            chain.push(cur);
+        }
+        cur = ir.resolve(cur.a);
+    }
+    let ck = cur.kind;
+    if ((ck != ir.V_CAGG) and (ck != ir.V_ZERO) and (ck != ir.V_UNDEF)) or (cur.ty != t) or
+       ((chain.len == 0) and not dropped) {
+        u.free(@ptr_cast(*mut void, chain.data));
+        return vnil();  // (a constant into a constant: fold_insert)
+    }
+    if not dropped and
+       (((ck == ir.V_ZERO) and ir.is_zero(c)) or
+        ((ck == ir.V_CAGG) and same_const(cur.xs.get(@truncate(usize, lane)), c))) {
+        u.free(@ptr_cast(*mut void, chain.data));
+        return ir.resolve(i.a);  // the lane holds c already
+    }
+    let xs = u.newn.[*mut ir.Value](@truncate(usize, n));
+    for k in @as(u64, 0)..n {
+        let mut x = ir.czero(t.elem);
+        if k == lane {
+            x = c;
+        } else if ck == ir.V_CAGG {
+            x = cur.xs.get(@truncate(usize, k));
+            if x.kind == ir.V_UNDEF {
+                x = ir.czero(t.elem);
+            }
+        }
+        xs[@truncate(usize, k)] = x;
+    }
+    let mut r = ir.cagg(t, xs[0..@truncate(usize, n)]);
+    if ir.is_zero(r) {
+        r = ir.czero(t);
+    }
+    let mut k = chain.len;
+    while k > 0 {
+        k -= 1;
+        let x = chain.get(k);
+        r = ir.insert_elem(B, r, x.b, x.cv);
+    }
+    u.free(@ptr_cast(*mut void, chain.data));
+    uses_stale = true;
+    return r;
+}
+
+fn pick_pred(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
 fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let mut p = pred_of(i);
     let mut a = i.a;
     let mut b = i.b;
     let at = a.ty;
+    if (at.kind == ir.T_VEC) and (at.elem.kind == ir.T_INT) {
+        // lanes >u 0 -> lanes != 0, lanes <=u 0 -> lanes == 0 (and with the
+        // zero on the left)
+        if vzero(a) and not vzero(b) {
+            i.a = b;
+            i.b = a;
+            i.cv = @as(u64, @bit_cast(u32, swap_pred(p)));
+            p = pred_of(i);
+        }
+        if vzero(i.b) and ((p == ir.IntUGT) or (p == ir.IntULE)) {
+            i.cv = @as(u64, @bit_cast(u32, pick_pred(p == ir.IntUGT, ir.IntNE, ir.IntEQ)));
+        }
+        return vnil();
+    }
     if (at.kind != ir.T_INT) and (at.kind != ir.T_PTR) {
         return vnil();
     }
@@ -240,6 +397,24 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         let r = cmp_const_range(p, bits, k);
         if r >= 0 {
             return kbool(r == 1);
+        }
+        // the bits of y reversed (shifted right by s) == 0: y's low bits that
+        // survive the shift == 0
+        if (k == 0) and ((p == ir.IntEQ) or (p == ir.IntNE)) {
+            let mut rv = a;
+            let mut s: u64 = 0;
+            if is_op(rv, ir.OP_LSHR) and is_k(rv.b) and (kval(rv.b) < @as(u64, @bit_cast(u32, bits))) {
+                s = kval(rv.b);
+                rv = rv.a;
+            }
+            let y = bit_reversed(rv);
+            if u.notnil(y) {
+                let mut z = y;
+                if s > 0 {
+                    z = ir.binop(B, ir.OP_AND, y, kt(at, ir.mask_bits(bits - @int_cast(i32, s))));
+                }
+                return mk_icmp(B, p, z, kt(at, 0));
+            }
         }
         // x <u 1 -> x == 0; x >u 0 -> x != 0 and friends
         if (p == ir.IntULT) and (k == 1) {
@@ -390,6 +565,119 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// The unsigned values of x where the comparison c (x p k, k a constant) is
+// true, when they are one interval [lo, hi]; nil x if not.
+fn unsigned_range(c: *mut ir.Value, lo: *mut u64, hi: *mut u64) *mut ir.Value {
+    let x = c.a;
+    if (x.ty.kind != ir.T_INT) or (x.ty.bits > 64) or not is_k(c.b) or is_k(x) {
+        return vnil();
+    }
+    let k = kval(c.b);
+    let max = ir.mask_bits(x.ty.bits);
+    let p = pred_of(c);
+    lo.* = 0;
+    hi.* = max;
+    if p == ir.IntEQ {
+        lo.* = k;
+        hi.* = k;
+    } else if (p == ir.IntNE) and (k == 0) {
+        lo.* = 1;
+    } else if (p == ir.IntNE) and (k == max) {
+        hi.* = max - 1;
+    } else if (p == ir.IntULT) and (k > 0) {
+        hi.* = k - 1;
+    } else if p == ir.IntULE {
+        hi.* = k;
+    } else if (p == ir.IntUGT) and (k < max) {
+        lo.* = k + 1;
+    } else if p == ir.IntUGE {
+        lo.* = k;
+    } else {
+        return vnil();
+    }
+    return x;
+}
+
+// (x in [a, b]) and (x in [c, d]): one comparison, of x - lo against the
+// length of the intersection (or nil).
+fn and_ranges(B: *mut ir.Builder, c1: *mut ir.Value, c2: *mut ir.Value) *mut ir.Value {
+    let mut lo1: u64 = 0;
+    let mut hi1: u64 = 0;
+    let mut lo2: u64 = 0;
+    let mut hi2: u64 = 0;
+    let x = unsigned_range(c1, &mut lo1, &mut hi1);
+    if u.isnil(x) or (unsigned_range(c2, &mut lo2, &mut hi2) != x) {
+        return vnil();
+    }
+    let t = x.ty;
+    let lo = @max(lo1, lo2);
+    let hi = @min(hi1, hi2);
+    if lo > hi {
+        return kfalse();
+    }
+    if lo == hi {
+        return mk_icmp(B, ir.IntEQ, x, kt(t, lo));
+    }
+    if lo == 0 {
+        return mk_icmp(B, ir.IntULE, x, kt(t, hi));
+    }
+    if hi == ir.mask_bits(t.bits) {
+        return mk_icmp(B, ir.IntUGE, x, kt(t, lo));
+    }
+    return mk_icmp(B, ir.IntULT, ir.sub(B, x, kt(t, lo)), kt(t, (hi - lo) + 1));
+}
+
+// a | b as rotl(x, c) when one is x << c and the other x >> (bits - c)
+// (logical; 32 or 64 bits), else nil.
+fn rotation(B: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if (t.kind != ir.T_INT) or ((t.bits != 32) and (t.bits != 64)) {
+        return vnil();
+    }
+    let mut l = a;
+    let mut r = b;
+    if is_op(b, ir.OP_SHL) {
+        l = b;
+        r = a;
+    }
+    if not is_op(l, ir.OP_SHL) or not is_op(r, ir.OP_LSHR) or (l.a != r.a) or not is_k(l.b) or not is_k(r.b) {
+        return vnil();
+    }
+    let c = kval(l.b);
+    let bits = @int_cast(u64, t.bits);
+    if (c == 0) or (c >= bits) or ((c + kval(r.b)) != bits) {
+        return vnil();
+    }
+    let mut args: [2]*mut ir.Value = [l.a, l.b];
+    return ir.intr(B, ir.IN_ROTL, t, args[..]);
+}
+
+// A select of two integer constants on a scalar condition, used once (where
+// a 0/1 value times a constant becomes one: `side * 100`).
+fn const_select(v: *mut ir.Value) bool {
+    return is_op(v, ir.OP_SELECT) and (v.a.ty.kind == ir.T_INT) and is_k(v.b) and is_k(v.c) and (uses_of(v) <= 1);
+}
+
+// x + (c ? k : 0), x + (c ? 0 : k): c ? x + k : x (a `lea` and a `cmov`
+// rather than materializing the select's constants), or nil.
+fn add_select(B: *mut ir.Builder, x: *mut ir.Value, s: *mut ir.Value) *mut ir.Value {
+    if is_k(x) or not const_select(s) {
+        return vnil();
+    }
+    // (c ? x1 : x2) + (c ? k1 : k2) = c ? x1 + k1 : x2 + k2
+    if is_op(x, ir.OP_SELECT) and (x.a == s.a) and (uses_of(x) <= 1) {
+        return ir.select(B, s.a, ir.add(B, x.b, s.b), ir.add(B, x.c, s.c));
+    }
+    if not (is_kv(s.b, 0) or is_kv(s.c, 0)) {
+        return vnil();
+    }
+    return ir.select(B, s.a, ir.add(B, x, s.b), ir.add(B, x, s.c));
+}
+
+// Is v x + k for a constant k?
+fn plus_const(v: *mut ir.Value, x: *mut ir.Value) bool {
+    return is_op(v, ir.OP_ADD) and (v.a == x) and is_k(v.b);
+}
+
 fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let t = i.ty;
@@ -417,6 +705,39 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             i.b = kt(t, k +% kval(a.b));
             return simplify_bin(B, i);
         }
+        // (c1 - x) + c2 = (c1 + c2) - x
+        if bk and is_op(a, ir.OP_SUB) and is_k(a.a) {
+            return ir.sub(B, kt(t, kval(a.a) +% k), a.b);
+        }
+        // p*c + q*c = (p + q)*c, and (x + p*c) + q*c = x + (p + q)*c: a
+        // weighted sum's terms of one weight added first (one use each)
+        if is_op(b, ir.OP_MUL) and is_k(b.b) and (uses_of(b) <= 1) {
+            if is_op(a, ir.OP_MUL) and is_k(a.b) and (kval(a.b) == kval(b.b)) and (uses_of(a) <= 1) {
+                return ir.mul(B, ir.add(B, a.a, b.a), b.b);
+            }
+            if is_op(a, ir.OP_ADD) and (uses_of(a) <= 1) and is_op(a.b, ir.OP_MUL) and is_k(a.b.b) and
+               (kval(a.b.b) == kval(b.b)) and (uses_of(a.b) <= 1) {
+                return ir.add(B, a.a, ir.mul(B, ir.add(B, a.b.a, b.a), b.b));
+            }
+        }
+        // (x + c) + y = (x + y) + c: constants outermost (an address's
+        // displacement)
+        if is_op(a, ir.OP_ADD) and is_k(a.b) and not bk and (uses_of(a) <= 1) and (t.kind == ir.T_INT) {
+            return ir.add(B, ir.add(B, a.a, b), a.b);
+        }
+        if is_op(b, ir.OP_ADD) and is_k(b.b) and not is_k(a) and (uses_of(b) <= 1) and (t.kind == ir.T_INT) {
+            return ir.add(B, ir.add(B, a, b.a), b.b);
+        }
+        if t.kind == ir.T_INT {
+            let r = add_select(B, a, b);
+            if u.notnil(r) {
+                return r;
+            }
+            let r2 = add_select(B, b, a);
+            if u.notnil(r2) {
+                return r2;
+            }
+        }
         // (x - y) + y
         if is_op(a, ir.OP_SUB) and (a.b == b) {
             return a.a;
@@ -430,12 +751,25 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if a == b {
             return kt(t, 0);
         }
+        if is_k(a) {
+            // c1 - (x + c2) = (c1 - c2) - x; c1 - (c2 - x) = x + (c1 - c2)
+            if is_op(b, ir.OP_ADD) and is_k(b.b) {
+                return ir.sub(B, kt(t, kval(a) -% kval(b.b)), b.a);
+            }
+            if is_op(b, ir.OP_SUB) and is_k(b.a) {
+                return ir.add(B, b.b, kt(t, kval(a) -% kval(b.a)));
+            }
+        }
         if bk {
             // canonical: x + (-c)
             if k == 0 {
                 return a;
             }
             return ir.add(B, a, kt(t, 0 -% k));
+        }
+        // x - (c ? k : 0) = c ? x - k : x
+        if (t.kind == ir.T_INT) and not is_k(a) and const_select(b) and (is_kv(b.b, 0) or is_kv(b.c, 0)) {
+            return ir.select(B, b.a, ir.sub(B, a, b.b), ir.sub(B, a, b.c));
         }
         // (x + y) - y ; (x + y) - x
         if is_op(a, ir.OP_ADD) and (a.b == b) {
@@ -447,6 +781,31 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         // (x + c) - x  = c ; x - (x - y) = y
         if is_op(b, ir.OP_SUB) and (b.a == a) {
             return b.b;
+        }
+        // x*c1 - x*c2 = x*(c1 - c2), and with x for x*1: the length of
+        // s[k*n..(k + 1)*n] is n
+        let am = is_op(a, ir.OP_MUL) and is_k(a.b);
+        let bm = is_op(b, ir.OP_MUL) and is_k(b.b);
+        if am or bm {
+            let mut xa = a;
+            let mut ca: u64 = 1;
+            if am {
+                xa = a.a;
+                ca = kval(a.b);
+            }
+            let mut xb = b;
+            let mut cb: u64 = 1;
+            if bm {
+                xb = b.a;
+                cb = kval(b.b);
+            }
+            if xa == xb {
+                let c = (ca -% cb) & all;
+                if c == 1 {
+                    return xa;
+                }
+                return ir.mul(B, xa, kt(t, c));
+            }
         }
         return vnil();
     }
@@ -463,6 +822,22 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
                 i.a = a.a;
                 i.b = kt(t, k *% kval(a.b));
                 return simplify_bin(B, i);
+            }
+            // zext(c) * k: c ? k : 0 (a 0/1 value as a select, which an
+            // addition or subtraction then takes into its arms)
+            if is_op(a, ir.OP_ZEXT) and (a.a.ty.kind == ir.T_INT) and (a.a.ty.bits == 1) {
+                return ir.select(B, a.a, b, kt(t, 0));
+            }
+            // (c ? k1 : k2) * k, and (c ? x + k1 : x) * k = c ? x*k + k1*k : x*k
+            if is_op(a, ir.OP_SELECT) and (a.a.ty.kind == ir.T_INT) and (uses_of(a) <= 1) and
+               ((is_k(a.b) and is_k(a.c)) or plus_const(a.b, a.c) or plus_const(a.c, a.b)) {
+                return ir.select(B, a.a, ir.mul(B, a.b, b), ir.mul(B, a.c, b));
+            }
+            // (x + c1) * c2 = x * c2 + c1 * c2: the constant outermost, where
+            // an address takes it as its displacement ((row + 3) * 64)
+            if is_op(a, ir.OP_ADD) and is_k(a.b) and (t.kind == ir.T_INT) and
+               ((uses_of(a) <= 1) or ((k & (k -% 1)) == 0)) {
+                return ir.add(B, ir.mul(B, a.a, b), kt(t, kval(a.b) *% k));
             }
             // (multiplication by a power of two stays: the backends fold it
             // into scaled addressing and select shifts themselves)
@@ -505,6 +880,12 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         return vnil();
     }
     if op == ir.OP_AND {
+        if (t.bits == 1) and is_op(a, ir.OP_ICMP) and is_op(b, ir.OP_ICMP) {
+            let r = and_ranges(B, a, b);
+            if u.notnil(r) {
+                return r;
+            }
+        }
         if bk {
             if k == 0 {
                 return b;
@@ -516,6 +897,12 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
                 i.a = a.a;
                 i.b = kt(t, k & kval(a.b));
                 return simplify_bin(B, i);
+            }
+            // the low bits of a global's address, below its alignment (an
+            // atomic's alignment check): zero
+            if is_op(a, ir.OP_PTRTOINT) and (a.a.kind == ir.V_GLOBAL) and not a.a.gv.wasm_global and
+               (a.a.gv.align > 1) and ((k & ~(a.a.gv.align - 1)) == 0) {
+                return kt(t, 0);
             }
             // (zext x) & mask covering x's bits
             if is_op(a, ir.OP_ZEXT) and (a.a.ty.kind == ir.T_INT) and ((ir.mask_bits(a.a.ty.bits) & ~k) == 0) {
@@ -543,6 +930,11 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         }
         if a == b {
             return a;
+        }
+        // (x << c) | (x >> (bits - c)): a rotation
+        let r = rotation(B, a, b, t);
+        if u.notnil(r) {
+            return r;
         }
         return vnil();
     }
@@ -587,6 +979,28 @@ fn simplify_bin(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// v where the condition c is known to be `when`: the arm of a select on c,
+// or an integer operation on such values (each used once, at most `depth`
+// deep; not a division, which the select's arm would then compute where c
+// is not `when`), or v.
+fn under(B: *mut ir.Builder, c: *mut ir.Value, v: *mut ir.Value, when: bool, depth: i32) *mut ir.Value {
+    if is_op(v, ir.OP_SELECT) and (v.a == c) {
+        if when {
+            return v.b;
+        }
+        return v.c;
+    }
+    if (depth > 0) and (v.kind == ir.V_INST) and (v.op >= ir.OP_ADD) and (v.op <= ir.OP_ASHR) and
+       ((v.op < ir.OP_UDIV) or (v.op > ir.OP_SREM)) and small_int(v.ty) and (uses_of(v) <= 1) {
+        let x = under(B, c, v.a, when, depth - 1);
+        let y = under(B, c, v.b, when, depth - 1);
+        if (x != v.a) or (y != v.b) {
+            return ir.binop(B, v.op, x, y);
+        }
+    }
+    return v;
+}
+
 fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let c = i.a;
     if c.kind == ir.V_CINT {
@@ -609,7 +1023,24 @@ fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         i.c = x;
         return simplify_select(B, i);
     }
+    // an arm that is (or computes from) a select on c: its value there
+    let nb = under(B, c, i.b, true, 3);
+    let nc = under(B, c, i.c, false, 3);
+    if (nb != i.b) or (nc != i.c) {
+        return ir.select(B, c, nb, nc);
+    }
     let t = i.ty;
+    // x != 0 ? f(ctlz(x)) : k, where f(bits) is k (the count of a zero x is
+    // its width): f(ctlz(x)) (31 - clz(x), or -1 for no bit)
+    if is_op(c, ir.OP_ICMP) and is_k(c.b) and (kval(c.b) == 0) and small_int(t) {
+        let p = pred_of(c);
+        if (p == ir.IntNE) and zero_count_default(i.b, c.a, i.c) {
+            return i.b;
+        }
+        if (p == ir.IntEQ) and zero_count_default(i.c, c.a, i.b) {
+            return i.c;
+        }
+    }
     if (t.kind == ir.T_INT) and (t.bits == 1) {
         if is_kv(i.b, 1) and is_kv(i.c, 0) {
             return c;
@@ -628,8 +1059,243 @@ fn simplify_select(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if is_kv(i.b, 1) and is_kv(i.c, 0) {
             return ir.zext(B, c, t);
         }
+        let r = spec_reduction(B, c, i.b, i.c, true);
+        if u.notnil(r) {
+            return r;
+        }
+        return spec_reduction(B, c, i.c, i.b, false);
     }
     return vnil();
+}
+
+// The constant global p points into (through constant offsets, added to
+// *off), or nil.
+fn const_global(p: *mut ir.Value, off: *mut u64) *mut ir.Value {
+    let mut q = p;
+    while is_op(q, ir.OP_PTRADD) and is_k(q.b) {
+        off.* = off.* +% kval(q.b);
+        q = q.a;
+    }
+    if (q.kind != ir.V_GLOBAL) or not q.gv.is_const or u.isnil(q.gv.init) or q.gv.tls or
+       (q.gv.linkage == ir.LINK_WEAK) or (q.gv.linkage == ir.LINK_EXTWEAK) {
+        return vnil();
+    }
+    return q;
+}
+
+// The base of address p, through additions.
+fn addr_base(p: *mut ir.Value) *mut ir.Value {
+    let mut q = p;
+    while is_op(q, ir.OP_PTRADD) {
+        q = q.a;
+    }
+    return q;
+}
+
+// The load v is computed from by extensions, truncations and operations
+// with a constant (`T[i] << k`, `zext(T[i])`), or nil.
+fn leaf_load(v: *mut ir.Value, depth: i32) *mut ir.Value {
+    if is_op(v, ir.OP_LOAD) {
+        return v;
+    }
+    if (depth >= 4) or (v.kind != ir.V_INST) or not small_int(v.ty) {
+        return vnil();
+    }
+    let op = v.op;
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
+        if not small_int(v.a.ty) {
+            return vnil();
+        }
+        return leaf_load(v.a, depth + 1);
+    }
+    if (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) {
+        if not is_k(v.b) or (kval(v.b) >= @bit_cast(u64, @as(i64, v.ty.bits))) {
+            return vnil();
+        }
+        return leaf_load(v.a, depth + 1);
+    }
+    if (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_MUL) or (op == ir.OP_AND) or (op == ir.OP_OR) or
+       (op == ir.OP_XOR) {
+        if not is_k(v.b) {
+            return vnil();
+        }
+        return leaf_load(v.a, depth + 1);
+    }
+    return vnil();
+}
+
+// x, of `bits` bits, sign-extended to 64.
+fn sext_bits(x: u64, bits: i32) u64 {
+    if bits >= 64 {
+        return x;
+    }
+    let sh = @int_cast(u32, 64 - bits);
+    return @bit_cast(u64, @bit_cast(i64, x << sh) >> sh);
+}
+
+// The value of v (a leaf_load chain) when its load reads k.
+fn leaf_value(v: *mut ir.Value, ld: *mut ir.Value, k: u64) u64 {
+    if v == ld {
+        return k & ir.mask_bits(v.ty.bits);
+    }
+    let m = ir.mask_bits(v.ty.bits);
+    let x = leaf_value(v.a, ld, k);
+    let op = v.op;
+    if op == ir.OP_ZEXT {
+        return x;
+    }
+    if op == ir.OP_SEXT {
+        return sext_bits(x, v.a.ty.bits) & m;
+    }
+    if op == ir.OP_TRUNC {
+        return x & m;
+    }
+    let y = kval(v.b);
+    if op == ir.OP_SHL {
+        return (x << @truncate(u32, y)) & m;
+    }
+    if op == ir.OP_LSHR {
+        return x >> @truncate(u32, y);
+    }
+    if op == ir.OP_ASHR {
+        return @bit_cast(u64, @bit_cast(i64, sext_bits(x, v.ty.bits)) >> @truncate(u32, y)) & m;
+    }
+    if op == ir.OP_ADD {
+        return (x +% y) & m;
+    }
+    if op == ir.OP_SUB {
+        return (x -% y) & m;
+    }
+    if op == ir.OP_MUL {
+        return (x *% y) & m;
+    }
+    if op == ir.OP_AND {
+        return x & y;
+    }
+    if op == ir.OP_OR {
+        return x | y;
+    }
+    return x ^ y;
+}
+
+// v (a leaf_load chain) computed from r instead of its load.
+fn leaf_with(B: *mut ir.Builder, v: *mut ir.Value, ld: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    if v == ld {
+        return r;
+    }
+    let x = leaf_with(B, v.a, ld, r);
+    let op = v.op;
+    if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
+        return ir.cast(B, op, x, v.ty);
+    }
+    return ir.binop(B, op, x, v.b);
+}
+
+// The element of type t at byte offset `at` of constant global g, if it is
+// an integer constant (ok false otherwise).
+fn table_int(g: *mut ir.Value, at: u64, t: *mut ir.Ty, ok: *mut bool) u64 {
+    ok.* = false;
+    if (at >= g.gv.ty.size) or ((at + t.size) > g.gv.ty.size) {
+        return 0;
+    }
+    let k = const_at(g.gv.init, at, t);
+    if u.isnil(k) or not is_k(k) {
+        return 0;
+    }
+    ok.* = true;
+    return kval(k);
+}
+
+// If-conversion speculates a load from a constant table under a condition
+// by loading from the table's start instead where the condition fails:
+// `c ? h op f(T[i]) : h` is `h op f(load(c ? &T[i] : &T[0]))` when f(T[0])
+// is op's identity (and `c ? f(T[i]) : k` is the second operand when
+// f(T[0]) is k), where f is a few casts and operations with constants
+// (`T[i] << s`), so the select goes: a reduction like `if (ok) h ^= T[i]`
+// costs one instruction on its chain, not two. When T[0] does not do,
+// an element of T that does replaces it. x is the select's value when c
+// is `when`, y the other.
+fn spec_reduction(B: *mut ir.Builder, c: *mut ir.Value, x: *mut ir.Value, y: *mut ir.Value, when: bool) *mut ir.Value {
+    let t = x.ty;
+    let mut leaf = vnil();
+    let mut op: i32 = -1;
+    let mut want: u64 = 0;
+    let mut swapped = false;
+    if is_k(y) {
+        leaf = x;
+        want = kval(y);
+    } else if is_op(x, ir.OP_ADD) or is_op(x, ir.OP_SUB) or is_op(x, ir.OP_OR) or is_op(x, ir.OP_XOR) or
+              is_op(x, ir.OP_AND) or is_op(x, ir.OP_MUL) {
+        op = x.op;
+        if x.a == y {
+            leaf = x.b;
+        } else if (x.b == y) and (op != ir.OP_SUB) {
+            leaf = x.a;
+            swapped = true;
+        } else {
+            return vnil();
+        }
+        if op == ir.OP_AND {
+            want = ir.mask_bits(t.bits);
+        } else if op == ir.OP_MUL {
+            want = 1;
+        }
+    } else {
+        return vnil();
+    }
+    let ld = leaf_load(leaf, 0);
+    if u.isnil(ld) or (ld.flags != 0) or not small_int(ld.ty) or not is_op(ld.a, ir.OP_SELECT) or (ld.a.a != c) {
+        return vnil();
+    }
+    // the address: p where x is taken, q (in the table) where y is
+    let mut p = ld.a.b;
+    let mut q = ld.a.c;
+    if not when {
+        p = ld.a.c;
+        q = ld.a.b;
+    }
+    let mut off: u64 = 0;
+    let g = const_global(q, &mut off);
+    if u.isnil(g) or (addr_base(p) != g) {
+        return vnil();
+    }
+    let lt = ld.ty;
+    let mut ok = false;
+    let k0 = table_int(g, off, lt, &mut ok);
+    if ok and (leaf_value(leaf, ld, k0) == want) {
+        return x;
+    }
+    // another element of the table that does
+    let n = @min(g.gv.ty.size / lt.size, @as(u64, 1024));
+    let mut at: u64 = 0;
+    let mut found = false;
+    let mut j: u64 = 0;
+    while (j < n) and not found {
+        let kj = table_int(g, j * lt.size, lt, &mut ok);
+        if ok and (leaf_value(leaf, ld, kj) == want) {
+            at = j * lt.size;
+            found = true;
+        }
+        j += 1;
+    }
+    if not found {
+        return vnil();
+    }
+    let q2 = ir.ptradd(B, g, ir.cint(ir.isz(), at));
+    let mut a2 = ir.select(B, c, p, q2);
+    if not when {
+        a2 = ir.select(B, c, q2, p);
+    }
+    let l2 = ir.load(B, lt, a2);
+    l2.align = ld.align;
+    let v = leaf_with(B, leaf, ld, l2);
+    if op < 0 {
+        return v;
+    }
+    if swapped {
+        return ir.binop(B, op, v, y);
+    }
+    return ir.binop(B, op, y, v);
 }
 
 // v as a value of the narrower type t, when that is free: an extension from
@@ -642,6 +1308,30 @@ fn narrowed(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
         return kt(t, kval(v));
     }
     return vnil();
+}
+
+// Is v, an integer, known to be below 2^bits?
+fn fits_unsigned(v: *mut ir.Value, bits: i32) bool {
+    if bits >= 64 {
+        return true;
+    }
+    if is_k(v) {
+        return kval(v) < (@as(u64, 1) << @as(u64, @bit_cast(u32, bits)));
+    }
+    if is_op(v, ir.OP_ZEXT) {
+        return v.a.ty.bits <= bits;
+    }
+    if is_op(v, ir.OP_AND) and is_k(v.b) {
+        return fits_unsigned(v.b, bits);
+    }
+    if is_op(v, ir.OP_INTR) {
+        // a count of bits is at most the width (which needs 7 bits)
+        let id = pred_of(v);
+        if (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_CTPOP) {
+            return (bits >= 8) or (v.ty.bits < (@as(i32, 1) << @as(u32, @bit_cast(u32, bits))));
+        }
+    }
+    return false;
 }
 
 fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
@@ -661,6 +1351,11 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if (op == ir.OP_ZEXT) and is_op(a, ir.OP_ZEXT) {
             i.a = a.a;
             return vnil();
+        }
+        // zext (trunc x) to x's type, where x fits the narrow type: x (a
+        // count of bits as an index, `@as(usize, @truncate(u32, @ctz(m)))`)
+        if (op == ir.OP_ZEXT) and is_op(a, ir.OP_TRUNC) and (a.a.ty == t) and fits_unsigned(a.a, a.ty.bits) {
+            return a.a;
         }
         if (op == ir.OP_SEXT) and (is_op(a, ir.OP_SEXT) or is_op(a, ir.OP_ZEXT)) {
             // sext (zext x) = zext x: the top bit is 0
@@ -710,11 +1405,26 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if is_op(a, ir.OP_PTRTOINT) and (a.ty.bits == @int_cast(i32, ir.ptr_bytes * 8)) {
             return a.a;
         }
+        // an address computed in integers: as pointer arithmetic, which
+        // the backends fold into addressing modes
+        if is_op(a, ir.OP_ADD) and (a.ty.bits == @int_cast(i32, ir.ptr_bytes * 8)) {
+            return ir.ptradd(B, ir.inttoptr(B, a.a), a.b);
+        }
         return vnil();
     }
     if op == ir.OP_BITCAST {
         if a.ty == t {
             return a;
+        }
+        // a scalar loaded only to be bit-cast: loaded as the other type (a
+        // float's bits as an integer key, without a move between registers)
+        if is_op(a, ir.OP_LOAD) and (a.flags == 0) and (uses_of(a) <= 1) and
+           ((t.kind == ir.T_INT) or (t.kind == ir.T_FLOAT)) and
+           ((a.ty.kind == ir.T_INT) or (a.ty.kind == ir.T_FLOAT)) and (t.size == a.ty.size) and (t.bits == a.ty.bits) {
+            ir.at_before(B, a);
+            let ld = ir.load(B, t, a.a);
+            ld.align = a.align;
+            return ld;
         }
         if is_op(a, ir.OP_BITCAST) {
             if a.a.ty == t {
@@ -881,10 +1591,71 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if small_int(i.ty) {
             return simplify_bin(B, i);
         }
+        if (i.ty.kind == ir.T_VEC) and (i.ty.elem.kind == ir.T_INT) {
+            // lanes plus, minus, or, xor zero; and zero
+            if ((op == ir.OP_ADD) or (op == ir.OP_OR) or (op == ir.OP_XOR)) and vzero(i.a) {
+                return i.b;
+            }
+            if ((((op == ir.OP_ADD) or (op == ir.OP_SUB)) or (op == ir.OP_OR)) or (op == ir.OP_XOR)) and vzero(i.b) {
+                return i.a;
+            }
+            if (op == ir.OP_AND) and (vzero(i.a) or vzero(i.b)) {
+                return ir.czero(i.ty);
+            }
+            // and all ones; or all ones (constant masks folded lane by lane)
+            if (op == ir.OP_AND) and vones(i.b) {
+                return i.a;
+            }
+            if (op == ir.OP_AND) and vones(i.a) {
+                return i.b;
+            }
+            if (op == ir.OP_OR) and (vones(i.a) or vones(i.b)) {
+                return ir.cones(i.ty);
+            }
+        }
+        return vnil();
+    }
+    if (op == ir.OP_INSERTELEM) and (i.ty.kind == ir.T_VEC) {
+        return sink_const_insert(B, i);
+    }
+    if (op == ir.OP_SHUFFLE) and (i.ty.kind == ir.T_VEC) {
+        // every lane from a vector of zeros
+        let n = @as(i32, @bit_cast(i32, i.a.ty.lanes));
+        let mut z = true;
+        for k in 0..i.mask.len {
+            let x = i.mask[k];
+            if ((x >= 0) and (x < n) and not vzero(i.a)) or ((x >= n) and not vzero(i.b)) {
+                z = false;
+            }
+        }
+        if z and (vzero(i.a) or vzero(i.b)) {
+            return ir.czero(i.ty);
+        }
+        // every lane one lane of a source of another width: a splat of it
+        // (a broadcast, where the targets would take the shuffle apart)
+        let mut k: i32 = -1;
+        let mut one = i.ty.lanes != i.a.ty.lanes;
+        for j in 0..i.mask.len {
+            let x = i.mask[j];
+            if (x >= 0) and (k >= 0) and (x != k) {
+                one = false;
+            }
+            if x >= 0 {
+                k = x;
+            }
+        }
+        if one and (k >= 0) {
+            let mut src = i.a;
+            if k >= n {
+                src = i.b;
+                k -= n;
+            }
+            return ir.splat(B, i.ty, ir.extract_elem(B, src, @as(u64, @bit_cast(u32, k))));
+        }
         return vnil();
     }
     if op == ir.OP_ICMP {
-        if i.ty.kind == ir.T_INT {
+        if (i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_VEC) {
             return simplify_icmp(B, i);
         }
         return vnil();
@@ -906,6 +1677,28 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
             return simplify_mul_ov(B, i, id == ir.IN_SMUL_OV);
         }
+        if (id == ir.IN_BITMASK) and (i.xs.len == 1) {
+            return simplify_bitmask(B, i);
+        }
+        if (id == ir.IN_ROTL) and (i.xs.len == 2) and not tg.is_wasm() {
+            return byte_swap(B, i);
+        }
+        if (id == ir.IN_FMA) and (i.xs.len == 3) {
+            // fma(1, x, y) = x + y exactly (1 * x is x, then one rounding)
+            if fone(i.xs.get(0)) {
+                return ir.binop(B, ir.OP_FADD, i.xs.get(1), i.xs.get(2));
+            }
+            if fone(i.xs.get(1)) {
+                return ir.binop(B, ir.OP_FADD, i.xs.get(0), i.xs.get(2));
+            }
+        }
+        return vnil();
+    }
+    if op == ir.OP_FDIV {
+        let r = exact_recip(i.b);
+        if u.notnil(r) {
+            return ir.binop(B, ir.OP_FMUL, i.a, r);
+        }
         return vnil();
     }
     if op == ir.OP_FNEG {
@@ -917,13 +1710,224 @@ pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// Is v, an expression of ctlz(x) or cttz(x) (the count itself, or it plus,
+// minus or xor a constant), equal to the constant k when x is 0 (when the
+// count is x's width)?
+fn zero_count_default(v: *ir.Value, x: *ir.Value, k: *ir.Value) bool {
+    if not is_k(k) {
+        return false;
+    }
+    let mut z = v;
+    let mut op: i32 = 0;
+    let mut cst: u64 = 0;
+    let mut left = false;
+    if (is_op(v, ir.OP_ADD) or is_op(v, ir.OP_XOR)) and is_k(v.b) {
+        z = v.a;
+        op = v.op;
+        cst = kval(v.b);
+    } else if is_op(v, ir.OP_SUB) and is_k(v.a) {
+        z = v.b;
+        op = ir.OP_SUB;
+        cst = kval(v.a);
+        left = true;
+    }
+    if not is_op(z, ir.OP_INTR) or (z.xs.len != 1) or (@int_from_ptr(z.xs.get(0)) != @int_from_ptr(x)) or
+       (@int_from_ptr(z.ty) != @int_from_ptr(v.ty)) {
+        return false;
+    }
+    let id = pred_of(z);
+    if (id != ir.IN_CTLZ) and (id != ir.IN_CTTZ) {
+        return false;
+    }
+    let w = @as(u64, @bit_cast(u32, x.ty.bits));
+    let mut r = w;
+    if op == ir.OP_ADD {
+        r = w +% cst;
+    } else if op == ir.OP_XOR {
+        r = w ^ cst;
+    } else if left {
+        r = cst -% w;
+    }
+    return (r & ir.mask_bits(v.ty.bits)) == kval(k);
+}
+
+// The top bits of the lanes of a constant integer vector (bit k: lane k's),
+// in out; false if c is not one.
+fn const_top_bits(c: *ir.Value, out: *mut u64) bool {
+    if (c.ty.kind != ir.T_VEC) or (c.ty.elem.kind != ir.T_INT) or (c.ty.lanes > 64) {
+        return false;
+    }
+    let top = @as(u64, 1) << @int_cast(u32, c.ty.elem.bits - 1);
+    if ir.is_zero(c) {
+        out.* = 0;
+        return true;
+    }
+    if is_op(c, ir.OP_SPLAT) and ir.is_cint(c.a) {
+        out.* = 0;
+        if (ir.cint_val(c.a) & top) != 0 {
+            out.* = ir.mask_bits(@int_cast(i32, c.ty.lanes));
+        }
+        return true;
+    }
+    if c.kind != ir.V_CAGG {
+        return false;
+    }
+    let mut m: u64 = 0;
+    for k in 0..c.xs.len {
+        let x = c.xs.get(k);
+        if not ir.is_cint(x) {
+            return false;
+        }
+        if (ir.cint_val(x) & top) != 0 {
+            m = m | (@as(u64, 1) << @int_cast(u32, k));
+        }
+    }
+    out.* = m;
+    return true;
+}
+
+// @bitmask(v & c) = @bitmask(v) & @bitmask(c) for a constant c (a lane's
+// top bit is set in v & c when it is in both): the masked lanes of a count
+// of compares are one scalar and.
+fn simplify_bitmask(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let a = i.xs.get(0);
+    if not is_op(a, ir.OP_AND) or (i.ty.kind != ir.T_INT) {
+        return vnil();
+    }
+    let mut m: u64 = 0;
+    let mut x = a.a;
+    if not const_top_bits(a.b, &mut m) {
+        if not const_top_bits(a.a, &mut m) {
+            return vnil();
+        }
+        x = a.b;
+    }
+    let mut args: [1]*mut ir.Value = [x];
+    let r = ir.intr(B, ir.IN_BITMASK, i.ty, args[..]);
+    return ir.binop(B, ir.OP_AND, r, kt(i.ty, m));
+}
+
+// The x of v = ((x >> s) & m) | ((x & m) << s) (two halves of each 2s-bit
+// group swapped; either half also as (x & (m << s)) >> s, (x << s) & (m <<
+// s)), or nil.
+fn swap_stage(v: *ir.Value, s: u64, m: u64) *mut ir.Value {
+    if not is_op(v, ir.OP_OR) {
+        return vnil();
+    }
+    let bits = v.ty.bits;
+    let mh = (m << @int_cast(u32, s)) & ir.mask_bits(bits);
+    let ps: [2]*mut ir.Value = [v.a, v.b];
+    let mut lo = vnil();
+    let mut hi = vnil();
+    for k in @as(usize, 0)..2 {
+        let p = ps[k];
+        if is_op(p, ir.OP_AND) and is_kv(p.b, m) and is_op(p.a, ir.OP_LSHR) and is_kv(p.a.b, s) {
+            lo = p.a.a;
+        } else if is_op(p, ir.OP_LSHR) and is_kv(p.b, s) and is_op(p.a, ir.OP_AND) and is_kv(p.a.b, mh) {
+            lo = p.a.a;
+        } else if is_op(p, ir.OP_SHL) and is_kv(p.b, s) and is_op(p.a, ir.OP_AND) and is_kv(p.a.b, m) {
+            hi = p.a.a;
+        } else if is_op(p, ir.OP_AND) and is_kv(p.b, mh) and is_op(p.a, ir.OP_SHL) and is_kv(p.a.b, s) {
+            hi = p.a.a;
+        }
+    }
+    if u.isnil(lo) or (lo != hi) {
+        return vnil();
+    }
+    return lo;
+}
+
+// The x of v = x with its bits reversed (32 or 64 bits): the swaps of
+// neighbouring bits, pairs and nibbles, then a byte swap; or nil.
+pub fn bit_reversed(v: *ir.Value) *mut ir.Value {
+    let t = v.ty;
+    if not is_op(v, ir.OP_INTR) or (pred_of(v) != ir.IN_BSWAP) or (v.xs.len != 1) or (t.kind != ir.T_INT) or
+       ((t.bits != 32) and (t.bits != 64)) {
+        return vnil();
+    }
+    let m = ir.mask_bits(t.bits);
+    let s4 = swap_stage(v.xs.get(0), 4, 0x0F0F0F0F0F0F0F0F & m);
+    if u.isnil(s4) {
+        return vnil();
+    }
+    let s2 = swap_stage(s4, 2, 0x3333333333333333 & m);
+    if u.isnil(s2) {
+        return vnil();
+    }
+    return swap_stage(s2, 1, 0x5555555555555555 & m);
+}
+
+// rotl(swap of the bytes in each half, half the bits): the bytes of x
+// reversed, one bswap (x86-64) or rev (AArch64), for a 32- or 64-bit x
+// (the last stages of a bit reversal by swaps).
+fn byte_swap(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let t = i.ty;
+    let y = i.xs.get(0);
+    let r = i.xs.get(1);
+    if (t.kind != ir.T_INT) or ((t.bits != 32) and (t.bits != 64)) or
+       not is_kv(r, @as(u64, @bit_cast(u32, t.bits / 2))) {
+        return vnil();
+    }
+    let mut z = y;
+    if t.bits == 64 {
+        z = swap_stage(y, 16, 0x0000FFFF0000FFFF);
+        if u.isnil(z) {
+            return vnil();
+        }
+    }
+    let x = swap_stage(z, 8, 0x00FF00FF00FF00FF & ir.mask_bits(t.bits));
+    if u.isnil(x) {
+        return vnil();
+    }
+    let mut args: [1]*mut ir.Value = [x];
+    return ir.intr(B, ir.IN_BSWAP, t, args[..]);
+}
+
+// 1 / c when c is a floating point constant (or a vector of them) whose
+// reciprocal is exact: a power of two, positive or negative, with both it
+// and its reciprocal normal numbers of its type. Then x / c and x * (1 / c)
+// are the same real number, rounded the same way, for every x (NaNs and
+// infinities included). Else nil.
+fn exact_recip(c: *mut ir.Value) *mut ir.Value {
+    if c.kind == ir.V_CFP {
+        let bits = @bit_cast(u64, c.fv);
+        if (bits & 0xfffffffffffff) != 0 {
+            return vnil();
+        }
+        let e = @as(i64, @bit_cast(i64, (bits >> 52) & 0x7ff)) - 1023;  // c = ±2^e
+        let mut lim: i64 = 1022;  // f64: normal exponents -1022..1023
+        if c.ty.bits == 32 {
+            lim = 126;  // f32: -126..127
+        }
+        if (e < -lim) or (e > lim) {
+            return vnil();
+        }
+        return ir.cfp(c.ty, 1.0 / c.fv);
+    }
+    if (c.kind == ir.V_CAGG) and (c.ty.kind == ir.T_VEC) {
+        let xs = u.newn.[*mut ir.Value](c.xs.len + 1);
+        for k in 0..c.xs.len {
+            let r = exact_recip(c.xs.get(k));
+            if u.isnil(r) {
+                return vnil();
+            }
+            xs[k] = r;
+        }
+        return ir.cagg(c.ty, xs[0..c.xs.len]);
+    }
+    return vnil();
+}
+
 // condbr (not c), x, y  ->  condbr c, y, x. True if changed.
 pub fn simplify_branch(t: *mut ir.Value) bool {
     if t.op != ir.OP_CONDBR {
         return false;
     }
     let c = t.a;
-    if is_op(c, ir.OP_XOR) and is_kv(c.b, 1) {
+    // (not x: x ^ 1, x == 0, x != 1 of an i1 x)
+    if (is_op(c, ir.OP_XOR) and is_kv(c.b, 1)) or
+       (is_op(c, ir.OP_ICMP) and (c.a.ty.kind == ir.T_INT) and (c.a.ty.bits == 1) and
+        (((pred_of(c) == ir.IntEQ) and is_kv(c.b, 0)) or ((pred_of(c) == ir.IntNE) and is_kv(c.b, 1)))) {
         t.a = c.a;
         let x = t.t1;
         t.t1 = t.t2;
@@ -978,4 +1982,311 @@ fn use1(o: *mut ir.Value, i: *mut ir.Value) void {
         o.uses += 1;
         o.user = i;
     }
+}
+
+// -----------------------------------------------------------------------------
+// Boolean phis: a `bool` local lives in a byte, so after mem2reg it is a phi
+// of i8 whose inputs are `zext` of comparisons and the constants 0 and 1,
+// tested with `!= 0`. Such phis (and the phis of them, around loops) become
+// phis of i1; their other uses read a `zext` of the new phi. Then a branch
+// on the phi branches on the i1 itself, which jump threading can follow
+// into the predecessors.
+// -----------------------------------------------------------------------------
+
+// v as an i1 when it is 0/1-valued (a constant, undef, or a zext of an i1),
+// else nil; phis are handled by the caller.
+fn bool_input(v: *mut ir.Value) *mut ir.Value {
+    if is_k(v) {
+        let k = kval(v);
+        if k <= 1 {
+            return kt(ir.t_int(1), k);
+        }
+        return vnil();
+    }
+    if v.kind == ir.V_UNDEF {
+        return kfalse();
+    }
+    if is_op(v, ir.OP_ZEXT) and (v.a.ty.kind == ir.T_INT) and (v.a.ty.bits == 1) {
+        return v.a;
+    }
+    return vnil();
+}
+
+fn bool_phi_candidate(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and (v.op == ir.OP_PHI) and (v.ty.kind == ir.T_INT) and (v.ty.bits > 1) and
+           (v.ty.bits <= 64);
+}
+
+// True if f changed. (Uses the phis' aux2 and auxp as scratch.)
+pub fn narrow_bool_phis(f: *mut ir.Func) bool {
+    let mut any = false;
+    let mut web = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    // aux2: 0 not seen, 1 in the web being built, 2 done (not convertible or converted)
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) and (i.op == ir.OP_PHI) {
+            i.aux2 = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let B = ir.new_builder();
+    b = f.first;
+    while u.notnil(b) {
+        let mut p0 = b.first;
+        while u.notnil(p0) and (p0.op == ir.OP_PHI) {
+            let next0 = p0.next;
+            if not bool_phi_candidate(p0) or (p0.aux2 != 0) {
+                p0 = next0;
+                continue;
+            }
+            // the web of phis of the same type that feed each other
+            web.clear();
+            web.push(p0);
+            p0.aux2 = 1;
+            let mut ok = true;
+            let mut k: usize = 0;
+            while ok and (k < web.len) {
+                let p = web.get(k);
+                k += 1;
+                for j in 0..p.xs.len {
+                    let x = ir.resolve(p.xs.get(j));
+                    if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
+                        if x.ty != p0.ty {
+                            ok = false;
+                        } else if x.aux2 == 0 {
+                            x.aux2 = 1;
+                            web.push(x);
+                        } else if x.aux2 == 2 {
+                            ok = false;
+                        }
+                    } else if u.isnil(bool_input(x)) {
+                        ok = false;
+                    }
+                }
+            }
+            if ok {
+                // the i1 phis first (they may refer to each other)
+                for w in 0..web.len {
+                    let p = web.get(w);
+                    ir.at_before(B, p);
+                    let q = ir.phi(B, ir.t_int(1));
+                    p.auxp = @ptr_cast(*mut void, q);
+                }
+                for w in 0..web.len {
+                    let p = web.get(w);
+                    let q = @ptr_cast(*mut ir.Value, p.auxp);
+                    for j in 0..p.xs.len {
+                        let x = ir.resolve(p.xs.get(j));
+                        let mut y = vnil();
+                        if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
+                            y = @ptr_cast(*mut ir.Value, x.auxp);
+                        } else {
+                            y = bool_input(x);
+                        }
+                        ir.add_incoming(q, y, p.bs.get(j));
+                    }
+                }
+                for w in 0..web.len {
+                    let p = web.get(w);
+                    let q = @ptr_cast(*mut ir.Value, p.auxp);
+                    let mut at = p.blk.first;
+                    while u.notnil(at) and (at.op == ir.OP_PHI) {
+                        at = at.next;
+                    }
+                    if u.notnil(at) {
+                        ir.at_before(B, at);
+                    } else {
+                        ir.at_end(B, p.blk);
+                    }
+                    let z = ir.zext(B, q, p.ty);
+                    p.aux2 = 2;
+                    ir.forward(p, z);
+                }
+                for w in 0..web.len {
+                    ir.remove_inst(web.get(w));
+                }
+                any = true;
+                p0 = b.first;  // (next0 may have gone with them)
+            } else {
+                for w in 0..web.len {
+                    web.get(w).aux2 = 2;
+                }
+                p0 = next0;
+            }
+        }
+        b = b.next;
+    }
+    u.free(@ptr_cast(*mut void, web.data));
+    return any;
+}
+
+// -----------------------------------------------------------------------------
+// Operations common to a phi's inputs: phi(op(x1, c), op(x2, c)) is
+// op(phi(x1, x2), c), computed once after the join, when each op(xk, c) is
+// used only by the phi (the operands that differ are at most one). The
+// arms of `if full { m = @bitmask(load(p) != 0) } else { m =
+// @bitmask(load_partial(p) != 0) }` then only load, and the compare and
+// the mask come after them: one vector live across the join rather than
+// a mask per arm, and the code once.
+// -----------------------------------------------------------------------------
+fn sinkable_op(i: *ir.Value) bool {
+    if (i.kind != ir.V_INST) or (i.flags != 0) {
+        return false;
+    }
+    let op = i.op;
+    if ((op >= ir.OP_ADD) and (op <= ir.OP_FNEG)) or (op == ir.OP_ICMP) or (op == ir.OP_FCMP) or (op == ir.OP_SELECT) or
+       ((op >= ir.OP_ZEXT) and (op <= ir.OP_FPTOUI_SAT)) or (op == ir.OP_PTRADD) or (op == ir.OP_EXTRACTELEM) or
+       (op == ir.OP_INSERTELEM) or (op == ir.OP_SPLAT) {
+        return true;
+    }
+    if op == ir.OP_INTR {
+        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        return ((id >= ir.IN_CTLZ) and (id <= ir.IN_ABS)) or (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or
+               (id == ir.IN_BITMASK) or (id == ir.IN_PERM) or (id == ir.IN_PERM2) or (id == ir.IN_SHLV) or
+               (id == ir.IN_LSHRV) or (id == ir.IN_ASHRV) or (id == ir.IN_BSWAP);
+    }
+    return false;
+}
+
+fn same_operand(x: *ir.Value, y: *ir.Value) bool {
+    if x == y {
+        return true;
+    }
+    return u.notnil(x) and u.notnil(y) and ir.is_cint(x) and ir.is_cint(y) and (x.ty == y.ty) and
+           (ir.cint_val(x) == ir.cint_val(y));
+}
+
+// Operand k of i: a, b, c, then xs.
+fn operand(i: *ir.Value, k: usize) *mut ir.Value {
+    if k == 0 {
+        return i.a;
+    }
+    if k == 1 {
+        return i.b;
+    }
+    if k == 2 {
+        return i.c;
+    }
+    return i.xs.get(k - 3);
+}
+
+fn set_operand(i: *mut ir.Value, k: usize, x: *mut ir.Value) void {
+    if k == 0 {
+        i.a = x;
+    } else if k == 1 {
+        i.b = x;
+    } else if k == 2 {
+        i.c = x;
+    } else {
+        i.xs.set(k - 3, x);
+    }
+}
+
+// The operand the inputs of phi p differ in (3 + xs.len: none), or -1 if
+// they are not one operation with at most one operand differing.
+fn common_op(p: *ir.Value) i64 {
+    let n = p.xs.len;
+    if n < 2 {
+        return -1;
+    }
+    let i0 = ir.resolve(p.xs.get(0));
+    if not sinkable_op(i0) or (i0.uses != 1) {
+        return -1;
+    }
+    let nops = 3 + i0.xs.len;
+    let mut diff: i64 = @int_cast(i64, nops);
+    for j in 1..n {
+        let ij = ir.resolve(p.xs.get(j));
+        if (ij == i0) or (ij.kind != ir.V_INST) or (ij.op != i0.op) or (ij.ty != i0.ty) or (ij.cv != i0.cv) or
+           (ij.flags != 0) or (ij.uses != 1) or (ij.xs.len != i0.xs.len) {
+            return -1;
+        }
+        for j2 in 0..j {
+            if ir.resolve(p.xs.get(j2)) == ij {
+                return -1;
+            }
+        }
+        for k in 0..nops {
+            let x = operand(i0, k);
+            let y = operand(ij, k);
+            if (u.isnil(x) != u.isnil(y)) {
+                return -1;
+            }
+            if u.isnil(x) or same_operand(ir.resolve(x), ir.resolve(y)) {
+                continue;
+            }
+            if (diff != @int_cast(i64, nops)) and (diff != @int_cast(i64, k)) {
+                return -1;
+            }
+            diff = @int_cast(i64, k);
+            if ir.resolve(x).ty != ir.resolve(y).ty {
+                return -1;
+            }
+        }
+    }
+    return diff;
+}
+
+// True if f changed.
+pub fn sink_phi_ops(f: *mut ir.Func) bool {
+    let mut any = false;
+    count_uses(f);
+    uses_stale = false;
+    let B = ir.new_builder();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut p = b.first;
+            while u.notnil(p) and (p.op == ir.OP_PHI) {
+                let d = common_op(p);
+                if d < 0 {
+                    p = p.next;
+                    continue;
+                }
+                let k = @int_cast(usize, d);
+                let i0 = ir.resolve(p.xs.get(0));
+                let mut at = b.first;
+                while u.notnil(at) and (at.op == ir.OP_PHI) {
+                    at = at.next;
+                }
+                if k < (3 + i0.xs.len) {
+                    // the differing operands through a phi of their own
+                    ir.at_before(B, p);
+                    let q = ir.phi(B, ir.resolve(operand(i0, k)).ty);
+                    for j in 0..p.xs.len {
+                        let ij = ir.resolve(p.xs.get(j));
+                        ir.add_incoming(q, ir.resolve(operand(ij, k)), p.bs.get(j));
+                    }
+                    set_operand(i0, k, q);
+                    q.uses = 1;
+                    q.user = i0;
+                }
+                for j in 1..p.xs.len {
+                    ir.remove_inst(ir.resolve(p.xs.get(j)));
+                }
+                ir.remove_inst(i0);
+                if u.notnil(at) {
+                    ir.insert_before(at, i0);
+                } else {
+                    ir.append_inst(b, i0);
+                }
+                i0.uses = p.uses;
+                i0.user = p.user;
+                ir.forward(p, i0);
+                ir.remove_inst(p);
+                ir.apply_forwarding(f);
+                count_uses(f);
+                changed = true;
+                any = true;
+                break;
+            }
+        }
+        b = b.next;
+    }
+    uses_stale = true;
+    return any;
 }

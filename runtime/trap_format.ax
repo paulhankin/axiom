@@ -143,7 +143,7 @@ pub fn trap_name(code: u32) []u8 {
     let names = ["trap", "index out of bounds", "integer overflow", "division by zero", "int_cast out of range",
                  "memory access out of bounds", "length precondition failed", "invalid union tag or enum value",
                  "stack exhausted", "invalid function pointer", "misaligned atomic access", "expectation failed",
-                 "memory error"];
+                 "memory error", "processor lacks a required extension"];
     if code < @int_cast(u32, names.len) {
         return names[@as(usize, code)];
     }
@@ -508,4 +508,212 @@ pub fn format_error_trace(o: *mut Fmt, ss: *ShadowStack) void {
         o.s(cstr(e.text));
         o.s("\n");
     }
+}
+
+// -----------------------------------------------------------------------------
+// Stack traces from frame pointers (issue 0053). Natively, calls do not
+// record themselves on the shadow stack: code keeps frame pointers, and the
+// frame table (selfhost/src/ftab.ax; axiom_frame_table() gives its bounds)
+// maps each call's return address to its call-site records, innermost first
+// (its own, then those of the calls inlined around it). A trap or a crash
+// walks the frame-pointer chain and fills the thread's shadow stack (calls
+// and depth) as the calls would have, so reports are made as before.
+// -----------------------------------------------------------------------------
+const RET_FRAMELESS: u32 = 1;  // in a function without a frame
+const RET_MARKER: u32 = 2;     // not a call: the start or end of such a function
+
+fn rd_usize(a: usize) usize {
+    return @ptr_from_int(*usize, a).*;
+}
+
+fn rd_i32(a: usize) i32 {
+    return @ptr_from_int(*i32, a).*;
+}
+
+fn ent_ret(e: usize) usize {
+    return e +% @bit_cast(usize, @as(isize, rd_i32(e)));
+}
+
+fn ent_flags(e: usize) u32 {
+    return @bit_cast(u32, rd_i32(e + 4)) & 3;
+}
+
+fn ent_chain(e: usize) usize {
+    return (e + 4) +% @bit_cast(usize, @as(isize, rd_i32(e + 4) & ~@as(i32, 3)));
+}
+
+// 0: not yet checked, 1: sorted, 2: not (then searched linearly)
+let mut rets_order: u32 = 0;
+
+fn rets_sorted(a: usize, n: usize) bool {
+    if rets_order == 0 {
+        let mut ok = true;
+        for i in 1..n {
+            if ent_ret(a + (8 * i)) < ent_ret(a + (8 * (i - 1))) {
+                ok = false;
+                break;
+            }
+        }
+        rets_order = 2;
+        if ok {
+            rets_order = 1;
+        }
+    }
+    return rets_order == 1;
+}
+
+// The first entry whose label is at or after x (or n).
+fn rets_lower(a: usize, n: usize, x: usize) usize {
+    let mut lo: usize = 0;
+    let mut hi = n;
+    while lo < hi {
+        let m = lo + ((hi - lo) / 2);
+        if ent_ret(a + (8 * m)) < x {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    return lo;
+}
+
+// The entry of the call returning to ra, or 0.
+fn rets_find(a: usize, n: usize, ra: usize) usize {
+    if rets_sorted(a, n) {
+        let mut i = rets_lower(a, n, ra);
+        while (i < n) and (ent_ret(a + (8 * i)) == ra) {
+            if (ent_flags(a + (8 * i)) & RET_MARKER) == 0 {
+                return a + (8 * i);
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    for i in 0..n {
+        let e = a + (8 * i);
+        if (ent_ret(e) == ra) and ((ent_flags(e) & RET_MARKER) == 0) {
+            return e;
+        }
+    }
+    return 0;
+}
+
+// Is pc in a function without a frame (its return address is then at the
+// stack pointer, or in the link register)? The first entry after pc says.
+fn rets_frameless(a: usize, n: usize, pc: usize) bool {
+    let mut best: usize = 0;
+    if rets_sorted(a, n) {
+        let i = rets_lower(a, n, pc + 1);
+        if i < n {
+            best = a + (8 * i);
+        }
+    } else {
+        for i in 0..n {
+            let e = a + (8 * i);
+            if (ent_ret(e) > pc) and ((best == 0) or (ent_ret(e) < ent_ret(best))) {
+                best = e;
+            }
+        }
+    }
+    return (best != 0) and ((ent_flags(best) & RET_FRAMELESS) != 0);
+}
+
+// The frame table: its first entry and their number (0: there is none).
+fn rets_table(tab: *usize, n: *mut usize) usize {
+    n.* = 0;
+    if is_null(@ptr_cast(*void, tab)) {
+        return 0;
+    }
+    let a = rd_usize(@int_from_ptr(tab));
+    let b = rd_usize(@int_from_ptr(tab) + 8);
+    if (a == 0) or (b <= a) {
+        return 0;
+    }
+    n.* = (b - a) / 8;
+    return a;
+}
+
+// A walk: counts the records (innermost first) and, when `ss` is set,
+// stores the innermost SS_CAP of the `total` there.
+struct Walk {
+    a: usize,
+    n: usize,
+    k: u64,
+    total: u64,
+    ss: *mut ShadowStack,
+}
+
+fn walk_add(w: *mut Walk, ra: usize) usize {
+    let e = rets_find(w.a, w.n, ra);
+    if e == 0 {
+        return 0;
+    }
+    let mut c = ent_chain(e);
+    while rd_usize(c) != 0 {
+        if not is_null(@ptr_cast(*void, w.ss)) and (w.k < @as(u64, SS_CAP)) {
+            w.ss.calls[@truncate(usize, (w.total - 1 - w.k) & @as(u64, SS_CAP - 1))] = @ptr_from_int(
+                *Site, rd_usize(c));
+        }
+        w.k += 1;
+        c += 8;
+    }
+    return e;
+}
+
+fn walk_once(w: *mut Walk, fp: usize, sp: usize, top: usize, leaf_ra: usize, x64: bool) void {
+    if leaf_ra != 0 {
+        _ = walk_add(w, leaf_ra);
+    }
+    let mut f = fp;
+    while (f >= sp) and ((f + 32) <= top) and ((f & 7) == 0) {
+        let e = walk_add(w, rd_usize(f + 8));
+        if x64 and (e != 0) and ((ent_flags(e) & RET_FRAMELESS) != 0) {
+            _ = walk_add(w, rd_usize(f + 24));
+        }
+        let next = rd_usize(f);
+        if next <= f {
+            break;
+        }
+        f = next;
+    }
+}
+
+// Is pc in a function without a frame? (Then a crash there finds that
+// function's return address at the stack pointer (x86-64) or in the link
+// register (AArch64), and walk_frames is given it as leaf_ra.)
+pub fn frameless_at(tab: *usize, pc: usize) bool {
+    let mut n: usize = 0;
+    let a = rets_table(tab, &mut n);
+    return (n != 0) and rets_frameless(a, n, pc);
+}
+
+// Fills `ss` from the frames, starting at the frame record `fp` ({the
+// caller's frame pointer, the return address}), after `leaf_ra` (when not
+// 0: the return address of a function without a frame that the walk starts
+// in). The walk reads frames between `sp` and `hi`, the top of the stack's
+// Axiom frames (0: not known, then up to 1 GiB). On x86-64 (`x64`) a
+// function without a frame calls only functions that do not return, after
+// aligning the stack: its own return address is 16 bytes above theirs.
+pub fn walk_frames(tab: *usize, ss: *mut ShadowStack, fp: usize, sp: usize, hi: usize, leaf_ra: usize, x64: bool) void {
+    let mut n: usize = 0;
+    let a = rets_table(tab, &mut n);
+    if (n == 0) or is_null(@ptr_cast(*void, ss)) {
+        return;
+    }
+    let mut top = sp +% (@as(usize, 1) << 30);
+    if hi > sp {
+        top = hi;
+    }
+    // count, then store (no buffer: this runs on whatever stack is left)
+    let mut w = Walk.{ a: a, n: n, k: 0, total: 0, ss: @ptr_from_int(*mut ShadowStack, 0) };
+    walk_once(&mut w, fp, sp, top, leaf_ra, x64);
+    w.total = w.k;
+    w.k = 0;
+    w.ss = ss;
+    walk_once(&mut w, fp, sp, top, leaf_ra, x64);
+    let mut d = w.total;
+    if d > 0xFFFF_FFFF {
+        d = 0xFFFF_FFFF;
+    }
+    ss.depth = @truncate(u32, d);
 }

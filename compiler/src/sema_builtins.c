@@ -1,5 +1,6 @@
 // sema_builtins.c - type checking of @builtin calls.
 #include "sema_int.h"
+#include "target.h"
 
 static Type *targ(Expr *e, int i) {
     if (i >= e->bargs.len || !e->bargs.data[i].t) return t_invalid;
@@ -47,6 +48,80 @@ static Type *operand(Expr **pe, Type *hint) {
     return t;
 }
 
+// The operands of the processor-instruction builtins (spec §13.5), one
+// letter each: W a byte vector (u8x16, u8x32, u8x64), Y a u64 vector (u64x2,
+// u64x4, u64x8), B u8x16, Q u64x2, D u32x4, V a 128-bit integer vector, S
+// u32, C u8, u16, u32 or u64 (CRC data), I a constant.
+static const char *insn_ops(int id) {
+    static const char *const t[] = {"WW", "WW", "WW", "WW", "B", "BI", "YYI", "DDI", "DD", "DD", "DD", "DDD", "DD",
+                                    "DD", "SC", "BB", "BB", "B", "B", "QQ", "QQ", "DSD", "DSD", "DSD", "S", "DDD", "DD",
+                                    "DDD", "DDD", "DD", "DDD", "QQQ", "QQQ", "QQ", "QQQ", "VVV", "VVV", "QQ", "QQI",
+                                    "SC", "SC"};
+    return t[id - BI_X86_AESENC];
+}
+
+static bool insn_kind_ok(char c, Type *t) {
+    if (t->kind == TY_INVALID) return true;
+    switch (c) {
+    case 'W': return t->kind == TY_VEC && t->elem == t_u8;
+    case 'Y': return t->kind == TY_VEC && t->elem == t_u64;
+    case 'B': return t == type_vec(t_u8, 16);
+    case 'Q': return t == type_vec(t_u64, 2);
+    case 'D': return t == type_vec(t_u32, 4);
+    default: return ty_is_vec_int(t) && simd_bits(t) == 128;
+    }
+}
+
+static const char *insn_kind_name(char c) {
+    switch (c) {
+    case 'W': return "u8x16, u8x32 or u8x64";
+    case 'Y': return "u64x2, u64x4 or u64x8";
+    case 'B': return "u8x16";
+    case 'Q': return "u64x2";
+    case 'D': return "u32x4";
+    default: return "a 128-bit integer vector";
+    }
+}
+
+static Type *insn_check(Expr *e) {
+    int id = e->index;
+    const char *ops = insn_ops(id);
+    Type *first = NULL;
+    char first_kind = 0;
+    for (int k = 0; ops[k]; k++) {
+        char c = ops[k];
+        Expr **pe = earg(e, k);
+        if (c == 'I') {
+            long long max = id == BI_X86_SHA1RNDS4 ? 3 : id == BI_ARM_XAR ? 63 : 255;
+            Type *t = check_expr(*pe, t_u32);
+            if (ty_is_untyped(t)) coerce(pe, t_u32);
+            Expr *a = *pe;
+            if (!a->is_const || a->cval < 0 || a->cval > max)
+                diag_error(a->span, "E0820", "@%s needs a constant in 0..%lld here", e->name, max);
+        } else if (c == 'S') {
+            check_expr_to(pe, t_u32);
+        } else if (c == 'C') {
+            Type *t = check_expr(*pe, NULL);
+            if (ty_is_untyped(t)) finalize_untyped(pe);
+            else if (!(t->kind == TY_INT && !t->is_signed && !t->is_size) && t->kind != TY_INVALID)
+                diag_error((*pe)->span, "E0822", "@%s takes u8, u16, u32 or u64 data, found %s", e->name, type_str(t));
+        } else if (first && c == first_kind) {
+            check_expr_to(pe, first);
+        } else {
+            Type *t = check_expr(*pe, NULL);
+            if (!insn_kind_ok(c, t))
+                diag_error((*pe)->span, "E0812", "@%s needs %s operands, found %s", e->name, insn_kind_name(c), type_str(t));
+            if (!first) {
+                first = t;
+                first_kind = c;
+            }
+        }
+    }
+    if (ops[0] == 'S' || !first) return t_u32;
+    if (!insn_kind_ok(first_kind, first)) return t_invalid;
+    return first;
+}
+
 // Two operands of the same type.
 static Type *pair(Expr *e, Type *expected) {
     Type *a = check_expr(*earg(e, 0), expected);
@@ -82,6 +157,7 @@ static Type *mask_type(Type *v) {
 
 static bool lossless(Type *from, Type *to) {
     if (from == to) return true;
+    if (from->kind == TY_BOOL) return to->kind == TY_INT;  // false 0, true 1
     if (from->kind == TY_INT && to->kind == TY_INT) {
         // usize/isize are at least 32 and at most 64 bits, portably.
         int fmax = from->is_size ? 64 : from->bits;
@@ -191,6 +267,10 @@ Type *builtin_check(Expr *e, Type *expected) {
             e->fval = a->fval;
             return e->type = t;
         }
+        if (s->kind == TY_BOOL && t->kind == TY_INT && (*earg(e, 1))->kind == E_BOOL) {
+            e->is_const = true;
+            e->cval = (*earg(e, 1))->bval ? 1 : 0;
+        }
         if (s->kind != TY_INVALID && t->kind != TY_INVALID && !lossless(s, t)) {
             Diag *d = diag_error(e->span, "E0510", "@as cannot convert %s to %s without possible loss of information",
                                  type_str(s), type_str(t));
@@ -267,6 +347,14 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_INT_FROM_FLOAT: {
         Type *t = targ(e, 0);
         e->tval = t;
+        if (ty_is_vec_int(t)) {
+            // lane-wise (spec §13.2)
+            Type *s = operand(earg(e, 1), NULL);
+            if (s->kind != TY_INVALID && !(ty_is_vec_float(s) && s->lanes == t->lanes))
+                diag_error((*earg(e, 1))->span, "E0822", "@int_from_float to %s requires a float vector of %d lanes, found %s",
+                           type_str(t), t->lanes, type_str(s));
+            return e->type = t;
+        }
         if (!is_int_like(t)) diag_error(e->span, "E0822", "@int_from_float requires an integer target type");
         Type *s = operand(earg(e, 1), t_f64);
         if (!is_float_like(s)) diag_error((*earg(e, 1))->span, "E0822", "@int_from_float requires a float operand");
@@ -275,6 +363,15 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_FLOAT_FROM_INT: {
         Type *t = targ(e, 0);
         e->tval = t;
+        if (ty_is_vec_float(t)) {
+            // lane-wise (spec §13.2)
+            Type *s = operand(earg(e, 1), NULL);
+            if (s->kind != TY_INVALID && !(ty_is_vec_int(s) && s->lanes == t->lanes))
+                diag_error((*earg(e, 1))->span, "E0822",
+                           "@float_from_int to %s requires an integer vector of %d lanes, found %s", type_str(t), t->lanes,
+                           type_str(s));
+            return e->type = t;
+        }
         if (!is_float_like(t)) diag_error(e->span, "E0822", "@float_from_int requires a float target type");
         Type *s = operand(earg(e, 1), t_i64);
         if (!is_int_like(s)) diag_error((*earg(e, 1))->span, "E0822", "@float_from_int requires an integer operand");
@@ -328,6 +425,18 @@ Type *builtin_check(Expr *e, Type *expected) {
         if (s->kind == TY_PTR && t->kind == TY_PTR && t->mut && !s->mut)
             diag_error(e->span, "E0706", "@ptr_cast cannot add 'mut' to a pointer");
         return e->type = t;
+    }
+    case BI_PTR_ADD:
+    case BI_PTR_SUB: {
+        const char *name = builtin_info[e->index].name;
+        Type *p = check_expr(*earg(e, 0), NULL);
+        check_expr_to(earg(e, 1), t_usize);
+        if (p->kind != TY_PTR) {
+            if (p->kind != TY_INVALID) diag_error(e->span, "E0822", "@%s requires a pointer, found %s", name, type_str(p));
+            return e->type = t_invalid;
+        }
+        if (p->elem->kind == TY_VOID) diag_error(e->span, "E0822", "@%s needs a pointer to sized elements, not *void", name);
+        return e->type = p;
     }
     case BI_SLICE_FROM_PTR: {
         Type *p = check_expr(*earg(e, 0), NULL);
@@ -389,11 +498,18 @@ Type *builtin_check(Expr *e, Type *expected) {
         check_expr_to(earg(e, 0), t_usize);
         check_expr_to(earg(e, 1), t_usize);
         return e->type = t_void;
+    case BI_PREFETCH:
+    case BI_PREFETCH_WRITE: {
+        Type *p = check_expr(*earg(e, 0), NULL);
+        if (p->kind != TY_PTR && p->kind != TY_INVALID)
+            diag_error(e->span, "E0822", "@%s requires a pointer, found %s", e->name, type_str(p));
+        return e->type = t_void;
+    }
     case BI_CLZ:
     case BI_CTZ:
     case BI_POPCOUNT: {
         Type *t = operand(earg(e, 0), x);
-        if (!is_int_like(t)) diag_error(e->span, "E0822", "@%s requires an integer, found %s", e->name, type_str(t));
+        if (!is_int_like(t) && !ty_is_vec_int(t)) diag_error(e->span, "E0822", "@%s requires an integer, found %s", e->name, type_str(t));
         return e->type = t;
     }
     case BI_ROTL:
@@ -533,8 +649,11 @@ Type *builtin_check(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         Expr *idx = *earg(e, 2);
-        if (idx->kind != E_ARRAY_LIT || idx->args.len != t->lanes) {
-            diag_error(idx->span, "E0820", "@shuffle needs an array literal of %d constant lane indices", t->lanes);
+        // the indices' count sets the result's lanes: a vector of 128, 256 or 512 bits
+        int nb = idx->kind == E_ARRAY_LIT ? idx->args.len * t->elem->bits : 0;
+        if (nb != 128 && nb != 256 && nb != 512) {
+            diag_error(idx->span, "E0820", "@shuffle needs an array literal of %d, %d or %d constant lane indices",
+                       128 / t->elem->bits, 256 / t->elem->bits, 512 / t->elem->bits);
             check_expr(idx, NULL);
             return e->type = t;
         }
@@ -545,14 +664,45 @@ Type *builtin_check(Expr *e, Type *expected) {
                 diag_error((*pi)->span, "E0820", "shuffle index must be a constant in 0..%d", 2 * t->lanes - 1);
             if (ty_is_untyped((*pi)->type)) coerce(pi, t_u32);
         }
-        idx->type = type_array(t_u32, t->lanes);
+        idx->type = type_array(t_u32, idx->args.len);
+        return e->type = idx->args.len == t->lanes ? t : type_vec(t->elem, idx->args.len);
+    }
+    case BI_SWIZZLE:
+    case BI_SWIZZLE2: {
+        // a table of any lanes, indices of the same width taken as unsigned (spec §13.2)
+        bool two = e->index == BI_SWIZZLE2;
+        int ii = two ? 2 : 1;
+        Type *t = two ? pair(e, x) : check_expr(*earg(e, 0), x);
+        if (!require_vec(e, *earg(e, 0), t) || t->kind == TY_INVALID) {
+            check_expr(*earg(e, ii), NULL);
+            return e->type = t_invalid;
+        }
+        Type *it = check_expr(*earg(e, ii), type_vec(type_int(t->elem->bits, false, false), t->lanes));
+        if (it->kind != TY_INVALID && !(ty_is_vec_int(it) && it->lanes == t->lanes && it->elem->bits == t->elem->bits))
+            diag_error((*earg(e, ii))->span, "E0812", "@%s indices must be an integer vector of %d %d-bit lanes, found %s",
+                       e->name, t->lanes, t->elem->bits, type_str(it));
         return e->type = t;
     }
-    case BI_SWIZZLE: {
-        Type *t = pair(e, x);
-        if (t->kind != TY_INVALID && !(t->kind == TY_VEC && t->elem->bits == 8))
-            diag_error(e->span, "E0812", "@swizzle requires u8x16 or i8x16 operands");
-        return e->type = t;
+    case BI_LOAD_PARTIAL: {
+        Type *v = targ(e, 0);
+        e->tval = v;
+        if (v->kind != TY_VEC && v->kind != TY_INVALID)
+            diag_error(e->span, "E0812", "@load_partial requires a vector type, found %s", type_str(v));
+        Type *s = check_expr(*earg(e, 1), NULL);
+        if (v->kind == TY_VEC && s->kind != TY_INVALID && !(s->kind == TY_SLICE && s->elem == v->elem))
+            diag_error((*earg(e, 1))->span, "E0822", "@load_partial reads from a []%s slice, found %s",
+                       type_str(v->elem), type_str(s));
+        return e->type = v;
+    }
+    case BI_STORE_PARTIAL: {
+        Type *s = check_expr(*earg(e, 0), NULL);
+        Type *v = check_expr(*earg(e, 1), NULL);
+        if (v->kind != TY_VEC && v->kind != TY_INVALID)
+            diag_error((*earg(e, 1))->span, "E0812", "@store_partial requires a vector value, found %s", type_str(v));
+        else if (v->kind == TY_VEC && s->kind != TY_INVALID && !(s->kind == TY_SLICE && s->mut && s->elem == v->elem))
+            diag_error((*earg(e, 0))->span, "E0822", "@store_partial writes to a []mut %s slice, found %s",
+                       type_str(v->elem), type_str(s));
+        return e->type = t_void;
     }
     case BI_LANES_EQ:
     case BI_LANES_NE:
@@ -583,7 +733,7 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_BITMASK: {
         Type *t = check_expr(*earg(e, 0), NULL);
         if (!ty_is_vec_int(t) && t->kind != TY_INVALID) diag_error(e->span, "E0812", "@bitmask requires an integer vector");
-        return e->type = t_u32;
+        return e->type = t->kind == TY_VEC && t->lanes > 32 ? t_u64 : t_u32;
     }
     case BI_REDUCE_ADD: {
         Type *t = check_expr(*earg(e, 0), NULL);
@@ -594,13 +744,83 @@ Type *builtin_check(Expr *e, Type *expected) {
         Type *t = pair(e, NULL);
         if (t->kind == TY_INVALID) return e->type = t_invalid;
         if (ty_is_vec_float(t)) return e->type = t->elem;
-        if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, 4);
-        diag_error(e->span, "E0812", "@dot requires float vectors or i16x8, found %s", type_str(t));
+        if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, t->lanes / 2);
+        diag_error(e->span, "E0812", "@dot requires float vectors or i16 lanes, found %s", type_str(t));
         return e->type = t_invalid;
+    }
+    case BI_WIDEN_LOW:
+    case BI_WIDEN_HIGH: {
+        // half the lanes, each twice as wide, extended by the lane type's sign
+        Type *t = operand(earg(e, 0), NULL);
+        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        if (!ty_is_vec_int(t) || t->elem->bits > 32) {
+            diag_error((*earg(e, 0))->span, "E0812", "@%s requires an integer vector with 8-, 16- or 32-bit lanes, found %s",
+                       e->name, type_str(t));
+            return e->type = t_invalid;
+        }
+        return e->type = type_vec(type_int(t->elem->bits * 2, t->elem->is_signed, false), t->lanes / 2);
+    }
+    case BI_NARROW: {
+        // the lanes of a then b, each saturated to the narrower lane type
+        Type *t = targ(e, 0);
+        e->tval = t;
+        Type *s = operand(earg(e, 1), NULL);
+        Type *s2 = operand(earg(e, 2), NULL);
+        if (s != s2 && s->kind != TY_INVALID && s2->kind != TY_INVALID) {
+            Diag *d = diag_error(e->span, "E0412", "@narrow operands have different types: %s and %s", type_str(s),
+                                 type_str(s2));
+            diag_types(d, type_str(s), type_str(s2));
+            return e->type = t;
+        }
+        if (s->kind == TY_INVALID || s2->kind == TY_INVALID || t->kind == TY_INVALID) return e->type = t;
+        if (!ty_is_vec_int(s) || s->elem->bits < 16) {
+            diag_error((*earg(e, 1))->span, "E0812", "@narrow requires integer vectors with 16-, 32- or 64-bit lanes, found %s",
+                       type_str(s));
+            return e->type = t;
+        }
+        if (!ty_is_vec_int(t) || t->elem->bits * 2 != s->elem->bits || t->lanes != s->lanes * 2)
+            diag_error(e->span, "E0812", "@narrow of %s gives i%dx%d or u%dx%d, not %s", type_str(s), s->elem->bits / 2,
+                       s->lanes * 2, s->elem->bits / 2, s->lanes * 2, type_str(t));
+        return e->type = t;
     }
     case BI_TRAP: return e->type = t_never;
     case BI_MEMORY_ERROR: return e->type = t_never;
     case BI_SANITIZE_ADDRESS: return e->type = t_bool;
+    case BI_TARGET_HAS:
+    case BI_CPU_HAS: {
+        Expr *a = *earg(e, 0);
+        if (a->kind != E_STRING) {
+            check_expr(a, NULL);
+            diag_error(a->span, "E0827", "@%s expects a string literal naming a processor extension", e->name);
+        } else if (!feature_known(a->str)) {
+            diag_error(a->span, "E0827", "unknown processor extension '%s' (this target has: %s)", a->str, feature_names());
+        } else {
+            a->type = type_slice(t_u8, false);
+        }
+        return e->type = t_bool;
+    }
+    case BI_TARGET_ARCH:
+    case BI_TARGET_OS: {
+        Expr *a = *earg(e, 0);
+        const char *names = e->index == BI_TARGET_ARCH ? "wasm32, wasm64, x86_64, aarch64" : "linux, macos, windows, none";
+        if (a->kind != E_STRING) {
+            check_expr(a, NULL);
+            diag_error(a->span, "E0827", "@%s expects a string literal: one of %s", e->name, names);
+        } else if (target_name_value(e->index, a->str) < 0) {
+            diag_error(a->span, "E0827", "unknown %s '%s' (expected one of %s)",
+                       e->index == BI_TARGET_ARCH ? "architecture" : "operating system", a->str, names);
+        } else {
+            a->type = type_slice(t_u8, false);
+        }
+        return e->type = t_bool;
+    }
+    case BI_X86_CPUID:
+        check_expr_to(earg(e, 0), t_u32);
+        check_expr_to(earg(e, 1), t_u32);
+        return e->type = type_vec(t_u32, 4);
+    case BI_X86_XGETBV:
+        check_expr_to(earg(e, 0), t_u32);
+        return e->type = t_u64;
     case BI_EXPECT:
         check_expr_to(earg(e, 0), t_bool);
         return e->type = t_void;
@@ -697,7 +917,9 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_ERROR_NAME:
         check_expr_to(earg(e, 0), t_error);
         return e->type = type_slice(t_u8, false);
-    default: break;
+    default:
+        if (e->index >= BI_X86_AESENC && e->index <= BI_ARM_CRC32C) return e->type = insn_check(e);
+        break;
     }
     return e->type = t_invalid;
 }

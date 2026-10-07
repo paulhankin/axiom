@@ -70,12 +70,16 @@ export function checkMachO(d) {
       }
     } else { E(`unexpected rebase opcode ${op.toString(16)}`); break; }
   }
-  // Binds: all from libSystem (ordinal 1), into __DATA, never also rebased.
+  // Binds: each from a library a load command names (libSystem is 1), into
+  // __DATA, never also rebased.
+  let ndylibs = 0;
+  for (let k = 0, o = 32; k < ncmds; k++) { if (u32(o) === 0xc) ndylibs++; o += u32(o + 4); }
   let nbinds = 0;
   for (let s = { i: bo }, name = '', seg = 0, so = 0; s.i < bo + bs;) {
     const b = d[s.i++], op = b & 0xf0, imm = b & 0xf;
     if (op === 0x00) continue;
-    else if (op === 0x10) { if (imm !== 1) E('bind to a library other than libSystem'); }
+    else if (op === 0x10) { if (imm < 1 || imm > ndylibs) E(`bind to library ${imm}, of ${ndylibs}`); }
+    else if (op === 0x20) { const o = uleb(s); if (o < 1 || o > ndylibs) E(`bind to library ${o}, of ${ndylibs}`); }
     else if (op === 0x40) { name = cstr(s.i); s.i += name.length + 1; }
     else if (op === 0x50) continue;
     else if (op === 0x60) sleb(s);
@@ -99,7 +103,7 @@ export function checkMachO(d) {
     names.push(nm);
     if (k < nl && ty & 1) E(`local symbol ${nm} is external`);
     if (k >= nl && k < iu && ty !== 0x0f) E(`external symbol ${nm} has type ${ty}`);
-    if (k >= iu && (ty !== 0x01 || desc >> 8 !== 1)) E(`import ${nm} is malformed`);
+    if (k >= iu && (ty !== 0x01 || (desc >> 8) < 1 || (desc >> 8) > ndylibs)) E(`import ${nm} is malformed`);
     if ((ty & 0x0e) === 0x0e && (val < lo || val >= hi)) E(`symbol ${nm} points outside the image`);
   }
   const sorted = (a) => a.every((x, k) => k === 0 || Buffer.compare(Buffer.from(a[k - 1]), Buffer.from(x)) < 0);

@@ -191,8 +191,16 @@ void types_init(void) {
     t_isize = type_int(g_target.ptr_bits, true, true);
     t_f32 = type_float(32);
     t_f64 = type_float(64);
-    t_v128 = simple(TY_V128);
+    t_v128 = type_vraw(128);
 }
+
+// v128, v256, v512: raw bits without lanes (TY_V128 of that width).
+Type *type_vraw(int bits) {
+    Type p = {.kind = TY_V128, .bits = bits};
+    return intern_type(&p);
+}
+
+int simd_bits(const Type *t) { return t->kind == TY_VEC ? t->lanes * t->elem->bits : t->bits; }
 
 Type *type_prim(PrimKind p) {
     switch (p) {
@@ -221,8 +229,20 @@ Type *type_prim(PrimKind p) {
     case PRIM_F32X4: return type_vec(t_f32, 4);
     case PRIM_F64X2: return type_vec(t_f64, 2);
     case PRIM_V128: return t_v128;
-    default: return t_invalid;
+    default: break;
     }
+    // the wider vectors: the 128-bit ones' lane types, with 2x or 4x the lanes
+    if (p >= PRIM_I8X32 && p <= PRIM_V512) {
+        int k = p - PRIM_I8X32, scale = 2;
+        if (p >= PRIM_I8X64) {
+            k = p - PRIM_I8X64;
+            scale = 4;
+        }
+        Type *narrow = type_prim((PrimKind)(PRIM_I8X16 + k));
+        if (narrow->kind == TY_V128) return type_vraw(128 * scale);
+        return type_vec(narrow->elem, narrow->lanes * scale);
+    }
+    return t_invalid;
 }
 
 // Anonymous struct decls are interned by (field names, field types).
@@ -363,7 +383,7 @@ static void tstr(CharVec *b, Type *t) {
                  t->elem->bits, t->lanes);
         puts_b(b, tmp);
         return;
-    case TY_V128: puts_b(b, "v128"); return;
+    case TY_V128: snprintf(tmp, sizeof tmp, "v%d", t->bits); puts_b(b, tmp); return;
     case TY_PTR: puts_b(b, t->mut ? "*mut " : "*"); tstr(b, t->elem); return;
     case TY_SLICE: puts_b(b, t->mut ? "[]mut " : "[]"); tstr(b, t->elem); return;
     case TY_ARRAY:
@@ -485,7 +505,7 @@ static void layout(Type *t) {
     case TY_INT:
     case TY_FLOAT: t->size = t->align = t->bits / 8; break;
     case TY_VEC:
-    case TY_V128: t->size = t->align = 16; break;
+    case TY_V128: t->size = t->align = simd_bits(t) / 8; break;
     case TY_PTR:
     case TY_FN: t->size = t->align = ps; break;
     case TY_SLICE: t->size = 2 * ps; t->align = ps; break;

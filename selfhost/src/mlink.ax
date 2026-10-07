@@ -16,10 +16,15 @@
 //                    the runtime's TLS record), then __bss (zero-filled)
 //   __LINKEDIT  r--  rebase and bind opcodes for dyld, the export trie,
 //                    the symbol and string tables, the code signature
-// Undefined symbols are libSystem's (bound by name, with a leading
-// underscore, through LC_DYLD_INFO_ONLY): calls go through a stub that jumps
-// through the GOT, and data words holding their addresses are bound in
-// place. Every absolute address the image holds is rebased.
+// Undefined symbols are bound by name, with a leading underscore, through
+// LC_DYLD_INFO_ONLY: calls go through a stub that jumps through the GOT, and
+// data words holding their addresses are bound in place. Every absolute
+// address the image holds is rebased. They are libSystem's, unless an
+// extern block named a library (codegen leaves the name in a constant
+// axiom.import.<function>): a framework ("AppKit", "Metal", ...), "objc"
+// (libobjc), a library in /usr/lib ("libz.1.dylib", or "z"), or a path.
+// Each library is an LC_LOAD_DYLIB, and its symbols are bound with its
+// ordinal (two-level namespace).
 //
 // Thread-locals: macOS gives programs no thread pointer of their own, so the
 // code generator addresses them as a per-thread block found through a TSD
@@ -78,6 +83,11 @@ let mut stubs: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), l
 let mut rebases: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };  // __DATA offsets
 let mut binds: u.List.[Import] = u.List.[Import].{ data: @ptr_from_int(*mut Import, 0), len: 0, cap: 0 };
 let mut errors: u32 = 0;
+// libraries beyond libSystem (ordinal 1), as install names: ordinal k + 2
+let mut dylibs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+// function name -> its library's ordinal (from axiom.import.* constants)
+let mut import_ord: u.SymMap.[u32] = u.SymMap.[u32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 
 let mut text_addr: u64 = 0;
 let mut stub_addr: u64 = 0;
@@ -181,6 +191,21 @@ fn collect_symbols() void {
             }
         }
     }
+    // Functions of another system's libraries (a Windows DLL) are the
+    // runtime's ax_unavailable, which says so if it is ever called: a
+    // program can support several systems and choose at run time.
+    let un = gsym_index("ax_unavailable");
+    for gi in 0..gsyms.len {
+        let g = gsyms.at(gi);
+        if (g.obj < 0) and (import_ord.get(u.intern(g.name)) == FOREIGN) {
+            let target = gsyms.get(@as(usize, un));
+            if target.obj < 0 {
+                err(u.f1("'%s' is from another system's library, and there is no ax_unavailable", g.name));
+            }
+            g.obj = target.obj;
+            g.sym = target.sym;
+        }
+    }
     // What is still undefined must come from libSystem: C library names,
     // never our own (module-qualified) ones.
     for gi in 0..gsyms.len {
@@ -188,6 +213,123 @@ fn collect_symbols() void {
         if (g.obj < 0) and ((u.find(g.name, '.') >= 0) or (u.find(g.name, '/') >= 0)) {
             err(u.f1("undefined symbol '%s'", g.name));
         }
+    }
+}
+
+// The ordinal of a function from another system's library.
+const FOREIGN: u32 = 0xffff_fffe;
+
+// Windows system DLLs (and any name ending in .dll).
+let WINDOWS_DLLS: [26][]u8 = ["advapi32", "bcrypt", "d2d1", "d3d11", "d3d12", "d3dcompiler_47", "dbghelp", "dwrite",
+                              "dxcompiler", "dxgi", "gdi32", "kernel32", "ntdll", "ole32", "oleaut32", "shell32",
+                              "shlwapi", "user32", "uxtheme", "windowscodecs", "winmm", "ws2_32", "xaudio2_9",
+                              "xinput1_4", "xinput9_1_0", "comdlg32"];
+
+fn is_windows_dll(name: []u8) bool {
+    if u.ends(name, ".dll") or u.ends(name, ".DLL") {
+        return true;
+    }
+    for d in WINDOWS_DLLS {
+        if u.str_eq(d, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Frameworks whose install names are not Versions/A.
+let FRAMEWORKS_C: [2][]u8 = ["AppKit", "Foundation"];
+
+// The install name of the library an extern block names; "" for libSystem.
+fn dylib_path(name: []u8) []u8 {
+    if u.find(name, '/') >= 0 {
+        return name;  // a path
+    }
+    if u.str_eq(name, "c") or u.str_eq(name, "m") or u.str_eq(name, "pthread") or u.str_eq(name, "System") or
+       u.str_eq(name, "dl") {
+        return "";
+    }
+    if u.str_eq(name, "objc") {
+        return "/usr/lib/libobjc.A.dylib";
+    }
+    if u.ends(name, ".dylib") {
+        return u.cat2("/usr/lib/", name);
+    }
+    if (name.len > 0) and (name[0] >= 'a') and (name[0] <= 'z') {
+        return u.cat3("/usr/lib/lib", name, ".dylib");  // "z": libz
+    }
+    let mut ver: []u8 = "A";
+    for f in FRAMEWORKS_C {
+        if u.str_eq(f, name) {
+            ver = "C";
+        }
+    }
+    return u.f3("/System/Library/Frameworks/%s.framework/Versions/%s/%s", name, ver, name);
+}
+
+// The libraries that extern blocks named (the axiom.import.* constants).
+fn collect_dylibs() void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let s = o.syms.get(si);
+            if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
+                continue;
+            }
+            let d = o.secs.get(@as(usize, @bit_cast(u32, s.sec))).data.view();
+            let start = @truncate(usize, s.value);
+            let mut e = start;
+            while (e < d.len) and (d[e] != 0) {
+                e += 1;
+            }
+            if is_windows_dll(d[start..e]) {
+                import_ord.put(u.intern(s.name[13..]), FOREIGN);
+                continue;
+            }
+            let path = dylib_path(d[start..e]);
+            let mut ord: u32 = 1;
+            if path.len > 0 {
+                let mut k = dylibs.len;
+                for j in 0..dylibs.len {
+                    if u.str_eq(dylibs.get(j), path) {
+                        k = j;
+                    }
+                }
+                if k == dylibs.len {
+                    dylibs.push(u.dup(path));
+                }
+                ord = @int_cast(u32, k) + 2;
+            }
+            import_ord.put(u.intern(s.name[13..]), ord);
+        }
+    }
+}
+
+// The ordinal of the library that exports name (without its underscore).
+fn ordinal_of(name: []u8) u32 {
+    let k = import_ord.get(u.intern(name));
+    if k == 0 {
+        return 1;
+    }
+    return k;
+}
+
+// An LC_LOAD_DYLIB's size for an install name.
+fn dylib_cmd_size(path: []u8) u64 {
+    return align_up(24 + @as(u64, path.len) + 1, 8);
+}
+
+fn load_dylib(h: *mut bn.Bytes, path: []u8, current: u64) void {
+    let size = dylib_cmd_size(path);
+    h.u32_(0xc);  // LC_LOAD_DYLIB
+    h.u32_(size);
+    h.u32_(24);           // the name's offset
+    h.u32_(2);            // timestamp
+    h.u32_(current);      // current version
+    h.u32_(0x0001_0000);  // compatibility version 1.0
+    h.put(path);
+    for _k in @as(u64, path.len) + 24..size {
+        h.u8_(0);
     }
 }
 
@@ -199,7 +341,7 @@ fn global_of(oi: usize, si: u32) i32 {
     return @int_cast(i32, gmap.get(u.intern(s.name))) - 1;
 }
 
-// From libSystem?
+// From a library?
 fn is_import(oi: usize, si: u32) bool {
     let gi = global_of(oi, si);
     return (gi >= 0) and (gsyms.at(@int_cast(usize, gi)).obj < 0);
@@ -279,7 +421,7 @@ fn scan_relocs() void {
                     } else if not is_abs64(r.ty) {
                         err(
                             u.f1(
-                                "'%s' (from libSystem) cannot be referenced this way",
+                                "'%s' (from a library) cannot be referenced this way",
                                 objs.get(oi).syms.get(@as(usize, r.sym)).name));
                     }
                 }
@@ -293,16 +435,26 @@ fn scan_relocs() void {
 // -----------------------------------------------------------------------------
 fn place(cls: i32, at: u64) u64 {
     let mut cur = at;
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            if sec_cls.get(oi)[k] != cls {
-                continue;
+    // read-only data, then the frame tables together (elf.rets_rank)
+    let mut passes: i32 = 1;
+    if cls == C_CONST {
+        passes = 4;
+    }
+    for pass in 0..passes {
+        for oi in 0..objs.len {
+            let o = objs.get(oi);
+            for k in 0..o.secs.len {
+                if sec_cls.get(oi)[k] != cls {
+                    continue;
+                }
+                let s = o.secs.get(k);
+                if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
+                    continue;
+                }
+                cur = align_up(cur, s.align);
+                sec_addr.get(oi)[k] = cur;
+                cur += elf.sec_size(s);
             }
-            let s = o.secs.get(k);
-            cur = align_up(cur, s.align);
-            sec_addr.get(oi)[k] = cur;
-            cur += elf.sec_size(s);
         }
     }
     return cur;
@@ -684,9 +836,19 @@ fn cmp_u64(a: u64, b: u64) i32 {
 
 fn bind_info() []u8 {
     let mut b = bn.new_bytes();
-    b.u8_(0x11);  // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM 1: libSystem
     b.u8_(0x51);  // BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER
+    let mut ord: u32 = 0;
     for x in binds.items() {
+        let o = ordinal_of(x.name[1..]);
+        if o != ord {
+            ord = o;
+            if o < 16 {
+                b.u8_(0x10 | @truncate(u8, o));  // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM
+            } else {
+                b.u8_(0x20);  // BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB
+                b.uleb(@as(u64, o));
+            }
+        }
         b.u8_(0x40);  // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
         b.put(x.name);
         b.u8_(0);
@@ -715,6 +877,8 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         objs.push(inputs[i]);
     }
     objs.push(own_object());
+    objs.push(elf.rets_bounds(elf.EM_AARCH64));
+    collect_dylibs();
     collect_symbols();
     let mn = gsym_index("main");
     if gsyms.at(@as(usize, mn)).obj < 0 {
@@ -739,8 +903,13 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
 
     // the load commands' size, which places everything after them
     let ident = basename(out);
-    let ncmds: u64 = 13;
-    let sizeofcmds: u64 = (72 + (72 + (2 * 80)) + (72 + (3 * 80)) + 72) + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 + 16;
+    let mut ncmds: u64 = 13;
+    let mut sizeofcmds: u64 = (72 + (72 + (2 * 80)) + (72 + (3 * 80)) + 72) + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 +
+                              16;
+    for d in dylibs.items() {
+        ncmds += 1;
+        sizeofcmds += dylib_cmd_size(d);
+    }
 
     // __TEXT
     text_addr = align_up(BASE + 32 + sizeofcmds, 16);
@@ -859,7 +1028,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     // external: the header (for dyld) and main
     syms.push(NSym.{ name: "__mh_execute_header", ty: 0x0f, sect: 1, desc: 0x10, value: BASE });
     syms.push(NSym.{ name: "_main", ty: 0x0f, sect: 1, desc: 0, value: global_addr("main") });
-    // undefined: libSystem's, in library 1
+    // undefined: each with its library's ordinal (libSystem's is 1)
     let nlocal = locals.len;
     let mut undef = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
     for gi in 0..gsyms.len {
@@ -870,7 +1039,8 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     }
     u.sort.[[]u8](undef.items(), u.str_cmp);
     for nm in undef.items() {
-        syms.push(NSym.{ name: nm, ty: 0x01, sect: 0, desc: 0x0100, value: 0 });
+        let desc = @as(u64, ordinal_of(nm[1..])) << 8;  // SET_LIBRARY_ORDINAL
+        syms.push(NSym.{ name: nm, ty: 0x01, sect: 0, desc: desc, value: 0 });
     }
     let nundef = syms.len - (nlocal + 2);
     let mut symtab = bn.new_bytes();
@@ -963,17 +1133,10 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     h.u32_(0x8000_0028);  // LC_MAIN
     h.u32_(24);
     h.u64_(file_of(global_addr("main")));
-    h.u64_(0);    // default stack size
-    h.u32_(0xc);  // LC_LOAD_DYLIB
-    h.u32_(56);
-    h.u32_(24);           // the name's offset
-    h.u32_(2);            // timestamp
-    h.u32_(0x0547_0000);  // current version 1351
-    h.u32_(0x0001_0000);  // compatibility version 1.0
-    let lib = "/usr/lib/libSystem.B.dylib";
-    h.put(lib);
-    for _k in lib.len..32 {
-        h.u8_(0);
+    h.u64_(0);  // default stack size
+    load_dylib(&mut h, "/usr/lib/libSystem.B.dylib", 0x0547_0000);  // current version 1351
+    for d in dylibs.items() {
+        load_dylib(&mut h, d, 0x0001_0000);
     }
     h.u32_(0x1d);  // LC_CODE_SIGNATURE
     h.u32_(16);
@@ -1010,11 +1173,20 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     }
     let sig = signature(fv, ident, sig_off, text_size);
     f.put(sig);
-    if not u.write_file(out, f.view()) {
+    // a new file renamed over the output: macOS caches an executable's code
+    // signature with its file, and kills a program rewritten in place
+    let tmp = u.f2("%s.tmp%s", out, u.idec(u.getpid()));
+    if not u.write_file(tmp, f.view()) {
+        _ = u.unlink(u.cz(tmp));
         err(u.f1("cannot write %s", out));
         return 1;
     }
-    _ = u.chmod(u.cz(out), 0o755);
+    _ = u.chmod(u.cz(tmp), 0o755);
+    if u.rename(u.cz(tmp), u.cz(out)) != 0 {
+        _ = u.unlink(u.cz(tmp));
+        err(u.f1("cannot write %s", out));
+        return 1;
+    }
     return 0;
 }
 

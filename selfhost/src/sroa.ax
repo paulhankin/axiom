@@ -13,7 +13,7 @@ import "ir.ax" as ir;
 import "opt.ax" as opt;
 import "util.ax" as u;
 
-const MAX_LEAVES: usize = 16;
+const MAX_LEAVES: usize = 32;
 const MAX_SIZE: u64 = 256;
 
 struct Leaf {
@@ -449,6 +449,56 @@ fn const_copy(p: *mut Part) bool {
     return (g.kind == ir.V_GLOBAL) and g.gv.is_const and u.notnil(g.gv.init) and (g.gv.ty.size >= p.a.aty.size);
 }
 
+// Is every use of the slot a copy or fill of all of it? Then nothing reads
+// its fields, and it is split into integers as wide as fit (8 bytes) rather
+// than into its fields: a `{u32, f32}` element copied from one place to
+// another through it is one load and one store, not two of each.
+fn whole_copies_only(p: *mut Part) bool {
+    let n = p.a.aty.size;
+    for ui in 0..p.uses.len {
+        let i = p.uses.get(ui);
+        if (i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE) or (i.op == ir.OP_MEMSET) {
+            if not is_k(i.c) or (cval(i.c) != n) {
+                return false;
+            }
+            if (part_of(i.a) == p) and (off_of(i.a) != 0) {
+                return false;
+            }
+            if (i.op != ir.OP_MEMSET) and (part_of(i.b) == p) and (off_of(i.b) != 0) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Does the slot hold a vector? Its pieces then stay vectors: as integers they
+// would be moved between register files at every use.
+fn vector_leaves(p: *mut Part) bool {
+    for k in 0..p.leaves.len {
+        if p.leaves.get(k).ty.kind == ir.T_VEC {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn int_leaves(p: *mut Part) void {
+    p.leaves.clear();
+    let size = p.a.aty.size;
+    let mut pos: u64 = 0;
+    while pos < size {
+        let mut n: u64 = 8;
+        while n > (size - pos) {
+            n = n / 2;
+        }
+        p.leaves.push(Leaf.{ off: pos, ty: ir.t_int(@int_cast(i32, n * 8)), slot: vnil() });
+        pos += n;
+    }
+}
+
 // True if anything changed.
 pub fn sroa(f: *mut ir.Func) bool {
     if u.isnil(B) {
@@ -536,6 +586,9 @@ pub fn sroa(f: *mut ir.Func) bool {
                 }
             }
             if not trivial {
+                if whole_copies_only(p) and not vector_leaves(p) {
+                    int_leaves(p);
+                }
                 defer_partners(p);
                 rewrite(f, p);
                 ir.remove_inst(p.a);

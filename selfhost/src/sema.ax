@@ -7,6 +7,7 @@ import "diag.ax" as dg;
 import "lexer.ax" as lx;
 import "package.ax" as pkg;
 import "parser.ax" as parser;
+import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
 
@@ -159,6 +160,15 @@ fn display_path(real: []u8) []u8 {
     return real;
 }
 
+// Whether an import path is relative and uses only '/' between its parts
+// (not "/a", "C:/a" or "a\b"), so that it means the same on every host.
+fn relative_import(ip: []u8) bool {
+    if (ip.len == 0) or (ip[0] == '/') or ((ip.len >= 2) and (ip[1] == ':')) {
+        return false;
+    }
+    return u.find(ip, '\\') < 0;
+}
+
 fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
     let rp = u.real_path(fs_path);
     if u.isnos(rp) {
@@ -207,8 +217,10 @@ fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
             }
         } else if u.starts(ip, "std/") {
             path = u.f3("%s/%s%s", g_std_dir, ip[4..], ext);
-        } else if (ip.len > 0) and (ip[0] == '/') {
-            path = u.cat2(ip, ext);
+        } else if not relative_import(ip) {
+            _ = dg.err(d.import_path_span, "E0218",
+                       u.f1("import path '%s' must be relative, with '/' between its parts", ip));
+            continue;
         } else {
             path = u.f3("%s/%s%s", dir, ip, ext);
         }
@@ -700,8 +712,10 @@ fn boundary_type_ok(t: *ast.Type, is_ret: bool) bool {
         }
         return boundary_type_ok(t.ret, true);
     }
-    if (k == ast.TY_BOOL) or (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_PTR) or (k == ast.TY_VEC) or
-       (k == ast.TY_V128) or (k == ast.TY_INVALID) {
+    if (k == ast.TY_VEC) or (k == ast.TY_V128) {
+        return ty.simd_bits(t) == 128;  // (WebAssembly has nothing wider)
+    }
+    if (k == ast.TY_BOOL) or (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_PTR) or (k == ast.TY_INVALID) {
         return true;
     }
     if k == ast.TY_VOID {
@@ -777,6 +791,19 @@ fn resolve_fn(d: *mut ast.Decl) void {
         _ = dg.err(d.abi_span, "E0307", "'...' (C varargs) is only allowed in extern \"C\" declarations");
     } else if d.variadic and (d.params.len == 0) {
         _ = dg.err(d.abi_span, "E0307", "a variadic C function needs at least one fixed parameter");
+    }
+    if d.is_inline {
+        if d.is_export {
+            _ = dg.err(d.inline_span, "E0313",
+                       "an exported function cannot be inline (its callers are outside the program)");
+        } else if d.attr != ast.ATTR_NONE {
+            let mut an: []u8 = "multiversion";
+            if d.attr == ast.ATTR_FEATURES {
+                an = "features";
+            }
+            _ = dg.err(d.inline_span, "E0313",
+                       u.f1("an inline function cannot have @%s (it is compiled as part of its callers)", an));
+        }
     }
     if d.is_export or (d.kind == ast.D_HOST_FN) {
         let mut what: []u8 = "imported";
@@ -1577,11 +1604,13 @@ fn check_arith_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
             return true;
         }
         if ty.is_vec_int(t) {
+            // lane-wise and wrapping, in every overflow mode (§13.1)
             if op == lx.TK_SLASH {
                 _ = dg.err(sp, "E0811", "integer vectors do not support '/'");
+            } else if (op == lx.TK_STAR) and (t.elem.bits == 8) {
+                _ = dg.err(sp, "E0811", "8-bit lane vectors have no multiplication");
             } else {
-                _ = dg.err(sp, "E0811", u.f2("integer vectors use wrapping arithmetic: write '%s%%' instead of '%s'",
-                                             opn, opn));
+                return true;
             }
             return false;
         }
@@ -1670,7 +1699,10 @@ fn check_shift_count(pb: *mut *mut ast.Expr) bool {
     if ((r.kind == ast.TY_INT) and not r.is_signed) or param_has(r, ast.C_UNSIGNED) {
         return true;
     }
-    if (r.kind == ast.TY_INT) or param_has(r, ast.C_SIGNED) {
+    if ty.is_vec_int(r) and not r.elem.is_signed {
+        return true;  // per lane (spec §13.1)
+    }
+    if (r.kind == ast.TY_INT) or param_has(r, ast.C_SIGNED) or ty.is_vec_int(r) {
         _ = dg.err(pb.*.span, "E0525", u.f1("shift count must be unsigned, found %s", tstr(r)));
         return false;
     }
@@ -1716,6 +1748,15 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         if (l.kind != ast.TY_INT) and not ty.is_vec_int(l) and not param_has(l, ast.C_INT) and
            (l.kind != ast.TY_INVALID) {
             _ = dg.err(e.a.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(l)));
+            e.ty = ty.t_invalid;
+            return e.ty;
+        }
+        let k = e.b.ty;
+        if ok and ty.is_vec_int(k) and (l.kind != ast.TY_INVALID) and
+           not (ty.is_vec_int(l) and (l.lanes == k.lanes) and (l.elem.bits == k.elem.bits)) {
+            _ = dg.err(e.b.span, "E0412",
+                       u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(l),
+                            tstr(k)));
             e.ty = ty.t_invalid;
             return e.ty;
         }
@@ -1789,6 +1830,54 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if cmp {
         _ = check_cmp_op(op, t, e.span);
+        if ty.is_untyped(t) and e.a.is_const and e.b.is_const {
+            // two untyped constants: the comparison is a bool constant
+            let fa = e.a.fval;
+            let fb = e.b.fval;
+            let a = e.a.cval;
+            let b = e.b.cval;
+            let fl = t.kind == ast.TY_UNTYPED_FLOAT;
+            let mut res = false;
+            if op == lx.TK_EQEQ {
+                if fl {
+                    res = fa == fb;
+                } else {
+                    res = a.eq(b);
+                }
+            } else if op == lx.TK_NE {
+                if fl {
+                    res = fa != fb;
+                } else {
+                    res = not a.eq(b);
+                }
+            } else if op == lx.TK_LT {
+                if fl {
+                    res = fa < fb;
+                } else {
+                    res = a.lt(b);
+                }
+            } else if op == lx.TK_LE {
+                if fl {
+                    res = fa <= fb;
+                } else {
+                    res = a.le(b);
+                }
+            } else if op == lx.TK_GT {
+                if fl {
+                    res = fa > fb;
+                } else {
+                    res = a.gt(b);
+                }
+            } else if op == lx.TK_GE {
+                if fl {
+                    res = fa >= fb;
+                } else {
+                    res = a.ge(b);
+                }
+            }
+            e.bval = res;
+            e.is_const = true;
+        }
         e.ty = ty.t_bool;
         return e.ty;
     }
@@ -1877,7 +1966,7 @@ fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             e.ty = t;
             return e.ty;
         }
-        if (t.kind == ast.TY_INT) and not t.is_signed {
+        if ((t.kind == ast.TY_INT) and not t.is_signed) or (ty.is_vec_int(t) and not t.elem.is_signed) {
             let d = dg.err(e.span, "E0520", u.f1("unary '-' cannot be applied to unsigned type %s", tstr(t)));
             let fx = dg.fix(d, "use wrapping negation", "suggestion");
             dg.edit(fx, u.mkspan(e.span.file, e.span.start, e.span.start + 1), "-%");
@@ -1900,8 +1989,7 @@ fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return e.ty;
         }
         if ty.is_vec_int(t) {
-            _ = dg.err(e.span, "E0811", "integer vectors use wrapping negation: write '-%'");
-            e.ty = ty.t_invalid;
+            e.ty = t;  // lane-wise, wrapping (§13.1)
             return e.ty;
         }
         _ = dg.err(e.span, "E0513", u.f1("unary '-' cannot be applied to %s", tstr(t)));
@@ -2536,6 +2624,10 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         e.decl = f;
         e.gargs = gargs;
         e.op = ast.CALLK_DIRECT;
+        if f.is_inline and u.notnil(C.fnd) and C.fnd.is_inline {
+            C.fnd.inline_callees.push(f);
+            C.fnd.inline_call_spans.push(e.span);
+        }
         // receiver
         if method {
             let recv = callee.b;
@@ -3234,6 +3326,9 @@ fn lossless(from: *ast.Type, to: *ast.Type) bool {
     if from == to {
         return true;
     }
+    if from.kind == ast.TY_BOOL {
+        return to.kind == ast.TY_INT;  // false 0, true 1
+    }
     if (from.kind == ast.TY_INT) and (to.kind == ast.TY_INT) {
         // usize/isize are at least 32 and at most 64 bits, portably.
         let mut fmax = from.bits;
@@ -3386,6 +3481,13 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             e.fval = a.fval;
             return set_ty(e, t);
         }
+        if (s.kind == ast.TY_BOOL) and (t.kind == ast.TY_INT) and (barg(e, 1).kind == ast.E_BOOL) {
+            e.is_const = true;
+            e.cval = u.I128.zero();
+            if barg(e, 1).bval {
+                e.cval = u.I128.ofu(1);
+            }
+        }
         if (s.kind != ast.TY_INVALID) and (t.kind != ast.TY_INVALID) and not lossless(s, t) {
             let d = dg.err(e.span, "E0510", u.f2("@as cannot convert %s to %s without possible loss of information",
                                                  tstr(s), tstr(t)));
@@ -3473,6 +3575,16 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_INT_FROM_FLOAT {
         let t = targ(e, 0);
         e.tval = t;
+        if ty.is_vec_int(t) {
+            // lane-wise (spec §13.2)
+            let s = operand(earg(e, 1), tnil());
+            if (s.kind != ast.TY_INVALID) and not (ty.is_vec_float(s) and (s.lanes == t.lanes)) {
+                _ = dg.err(barg(e, 1).span, "E0822",
+                           u.f3("@int_from_float to %s requires a float vector of %s lanes, found %s", tstr(t),
+                                u.idec(t.lanes), tstr(s)));
+            }
+            return set_ty(e, t);
+        }
         if not is_int_like(t) {
             _ = dg.err(e.span, "E0822", "@int_from_float requires an integer target type");
         }
@@ -3485,6 +3597,16 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_FLOAT_FROM_INT {
         let t = targ(e, 0);
         e.tval = t;
+        if ty.is_vec_float(t) {
+            // lane-wise (spec §13.2)
+            let s = operand(earg(e, 1), tnil());
+            if (s.kind != ast.TY_INVALID) and not (ty.is_vec_int(s) and (s.lanes == t.lanes)) {
+                _ = dg.err(barg(e, 1).span, "E0822",
+                           u.f3("@float_from_int to %s requires an integer vector of %s lanes, found %s", tstr(t),
+                                u.idec(t.lanes), tstr(s)));
+            }
+            return set_ty(e, t);
+        }
         if not is_float_like(t) {
             _ = dg.err(e.span, "E0822", "@float_from_int requires a float target type");
         }
@@ -3558,6 +3680,21 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             _ = dg.err(e.span, "E0706", "@ptr_cast cannot add 'mut' to a pointer");
         }
         return set_ty(e, t);
+    }
+    if (id == ast.BI_PTR_ADD) or (id == ast.BI_PTR_SUB) {
+        let name = ast.builtin_name(id);
+        let p = check_expr(barg(e, 0), tnil());
+        _ = check_expr_to(earg(e, 1), ty.t_usize);
+        if p.kind != ast.TY_PTR {
+            if p.kind != ast.TY_INVALID {
+                _ = dg.err(e.span, "E0822", u.f2("@%s requires a pointer, found %s", name, tstr(p)));
+            }
+            return set_ty(e, ty.t_invalid);
+        }
+        if p.elem.kind == ast.TY_VOID {
+            _ = dg.err(e.span, "E0822", u.f1("@%s needs a pointer to sized elements, not *void", name));
+        }
+        return set_ty(e, p);
     }
     if id == ast.BI_SLICE_FROM_PTR {
         let p = check_expr(barg(e, 0), tnil());
@@ -3634,9 +3771,16 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         _ = check_expr_to(earg(e, 1), ty.t_usize);
         return set_ty(e, ty.t_void);
     }
+    if (id == ast.BI_PREFETCH) or (id == ast.BI_PREFETCH_WRITE) {
+        let p = check_expr(barg(e, 0), tnil());
+        if (p.kind != ast.TY_PTR) and (p.kind != ast.TY_INVALID) {
+            _ = dg.err(e.span, "E0822", u.f2("@%s requires a pointer, found %s", e.name, tstr(p)));
+        }
+        return set_ty(e, ty.t_void);
+    }
     if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT) {
         let t = operand(earg(e, 0), x);
-        if not is_int_like(t) {
+        if not is_int_like(t) and not ty.is_vec_int(t) {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires an integer, found %s", e.name, tstr(t)));
         }
         return set_ty(e, t);
@@ -3801,9 +3945,15 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return set_ty(e, ty.t_invalid);
         }
         let idx = barg(e, 2);
-        if (idx.kind != ast.E_ARRAY_LIT) or (idx.args.len != @int_cast(usize, t.lanes)) {
-            _ = dg.err(idx.span, "E0820", u.f1("@shuffle needs an array literal of %s constant lane indices",
-                                               u.idec(t.lanes)));
+        // the indices' count sets the result's lanes: a vector of 128, 256 or 512 bits
+        let mut nb: i32 = 0;
+        if idx.kind == ast.E_ARRAY_LIT {
+            nb = @int_cast(i32, idx.args.len) * t.elem.bits;
+        }
+        if (nb != 128) and (nb != 256) and (nb != 512) {
+            _ = dg.err(idx.span, "E0820", u.f3("@shuffle needs an array literal of %s, %s or %s constant lane indices",
+                                               u.idec(128 / t.elem.bits), u.idec(256 / t.elem.bits),
+                                               u.idec(512 / t.elem.bits)));
             _ = check_expr(idx, tnil());
             return set_ty(e, t);
         }
@@ -3818,15 +3968,61 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                 coerce(pi, ty.t_u32);
             }
         }
-        idx.ty = ty.type_array(ty.t_u32, @as(i64, t.lanes));
-        return set_ty(e, t);
+        idx.ty = ty.type_array(ty.t_u32, @int_cast(i64, idx.args.len));
+        if idx.args.len == @int_cast(usize, t.lanes) {
+            return set_ty(e, t);
+        }
+        return set_ty(e, ty.type_vec(t.elem, @int_cast(i32, idx.args.len)));
     }
-    if id == ast.BI_SWIZZLE {
-        let t = pair(e, x);
-        if (t.kind != ast.TY_INVALID) and not ((t.kind == ast.TY_VEC) and (t.elem.bits == 8)) {
-            _ = dg.err(e.span, "E0812", "@swizzle requires u8x16 or i8x16 operands");
+    if (id == ast.BI_SWIZZLE) or (id == ast.BI_SWIZZLE2) {
+        // a table of any lanes, indices of the same width taken as unsigned (spec §13.2)
+        let two = id == ast.BI_SWIZZLE2;
+        let mut ii: usize = 1;
+        let mut t = ty.t_invalid;
+        if two {
+            ii = 2;
+            t = pair(e, x);
+        } else {
+            t = check_expr(barg(e, 0), x);
+        }
+        if not require_vec(e, barg(e, 0), t) or (t.kind == ast.TY_INVALID) {
+            _ = check_expr(barg(e, ii), tnil());
+            return set_ty(e, ty.t_invalid);
+        }
+        let it = check_expr(barg(e, ii), ty.type_vec(ty.type_int(t.elem.bits, false, false), t.lanes));
+        if (it.kind != ast.TY_INVALID) and
+           not (ty.is_vec_int(it) and (it.lanes == t.lanes) and (it.elem.bits == t.elem.bits)) {
+            _ = dg.err(barg(e, ii).span, "E0812",
+                       u.f4("@%s indices must be an integer vector of %s %s-bit lanes, found %s", e.name,
+                            u.idec(t.lanes), u.idec(t.elem.bits), tstr(it)));
         }
         return set_ty(e, t);
+    }
+    if id == ast.BI_LOAD_PARTIAL {
+        let v = targ(e, 0);
+        e.tval = v;
+        if (v.kind != ast.TY_VEC) and (v.kind != ast.TY_INVALID) {
+            _ = dg.err(e.span, "E0812", u.f1("@load_partial requires a vector type, found %s", tstr(v)));
+        }
+        let s = check_expr(barg(e, 1), tnil());
+        if (v.kind == ast.TY_VEC) and (s.kind != ast.TY_INVALID) and
+           not ((s.kind == ast.TY_SLICE) and (s.elem == v.elem)) {
+            _ = dg.err(barg(e, 1).span, "E0822", u.f2("@load_partial reads from a []%s slice, found %s", tstr(v.elem),
+                                                      tstr(s)));
+        }
+        return set_ty(e, v);
+    }
+    if id == ast.BI_STORE_PARTIAL {
+        let s = check_expr(barg(e, 0), tnil());
+        let v = check_expr(barg(e, 1), tnil());
+        if (v.kind != ast.TY_VEC) and (v.kind != ast.TY_INVALID) {
+            _ = dg.err(barg(e, 1).span, "E0812", u.f1("@store_partial requires a vector value, found %s", tstr(v)));
+        } else if (v.kind == ast.TY_VEC) and (s.kind != ast.TY_INVALID) and
+                  not ((s.kind == ast.TY_SLICE) and s.is_mut and (s.elem == v.elem)) {
+            _ = dg.err(barg(e, 0).span, "E0822", u.f2("@store_partial writes to a []mut %s slice, found %s",
+                                                      tstr(v.elem), tstr(s)));
+        }
+        return set_ty(e, ty.t_void);
     }
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let t = pair(e, tnil());
@@ -3862,6 +4058,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         if not ty.is_vec_int(t) and (t.kind != ast.TY_INVALID) {
             _ = dg.err(e.span, "E0812", "@bitmask requires an integer vector");
         }
+        if (t.kind == ast.TY_VEC) and (t.lanes > 32) {
+            return set_ty(e, ty.t_u64);
+        }
         return set_ty(e, ty.t_u32);
     }
     if id == ast.BI_REDUCE_ADD {
@@ -3880,16 +4079,98 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return set_ty(e, t.elem);
         }
         if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i16) {
-            return set_ty(e, ty.type_vec(ty.t_i32, 4));
+            return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 2));
         }
-        _ = dg.err(e.span, "E0812", u.f1("@dot requires float vectors or i16x8, found %s", tstr(t)));
+        _ = dg.err(e.span, "E0812", u.f1("@dot requires float vectors or i16 lanes, found %s", tstr(t)));
         return set_ty(e, ty.t_invalid);
+    }
+    if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
+        // half the lanes, each twice as wide, extended by the lane type's sign
+        let t = operand(earg(e, 0), tnil());
+        if t.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if not ty.is_vec_int(t) or (t.elem.bits > 32) {
+            _ = dg.err(barg(e, 0).span, "E0812",
+                       u.f2("@%s requires an integer vector with 8-, 16- or 32-bit lanes, found %s", e.name, tstr(t)));
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, ty.type_vec(ty.type_int(t.elem.bits * 2, t.elem.is_signed, false), t.lanes / 2));
+    }
+    if id == ast.BI_NARROW {
+        // the lanes of a then b, each saturated to the narrower lane type
+        let t = targ(e, 0);
+        e.tval = t;
+        let s = operand(earg(e, 1), tnil());
+        let s2 = operand(earg(e, 2), tnil());
+        if (s != s2) and (s.kind != ast.TY_INVALID) and (s2.kind != ast.TY_INVALID) {
+            let d = dg.err(e.span, "E0412", u.f2("@narrow operands have different types: %s and %s", tstr(s),
+                                                 tstr(s2)));
+            dg.set_types(d, tstr(s), tstr(s2));
+            return set_ty(e, t);
+        }
+        if (s.kind == ast.TY_INVALID) or (s2.kind == ast.TY_INVALID) or (t.kind == ast.TY_INVALID) {
+            return set_ty(e, t);
+        }
+        if not ty.is_vec_int(s) or (s.elem.bits < 16) {
+            _ = dg.err(barg(e, 1).span, "E0812",
+                       u.f1("@narrow requires integer vectors with 16-, 32- or 64-bit lanes, found %s", tstr(s)));
+            return set_ty(e, t);
+        }
+        if not ty.is_vec_int(t) or ((t.elem.bits * 2) != s.elem.bits) or (t.lanes != (s.lanes * 2)) {
+            let hb = u.idec(s.elem.bits / 2);
+            let n2 = u.idec(s.lanes * 2);
+            _ = dg.err(e.span, "E0812", u.f6("@narrow of %s gives i%sx%s or u%sx%s, not %s", tstr(s), hb, n2, hb, n2,
+                                             tstr(t)));
+        }
+        return set_ty(e, t);
     }
     if (id == ast.BI_TRAP) or (id == ast.BI_MEMORY_ERROR) {
         return set_ty(e, ty.t_never);
     }
     if id == ast.BI_SANITIZE_ADDRESS {
         return set_ty(e, ty.t_bool);
+    }
+    if (id == ast.BI_TARGET_HAS) or (id == ast.BI_CPU_HAS) {
+        let a = barg(e, 0);
+        if a.kind != ast.E_STRING {
+            _ = check_expr(a, tnil());
+            _ = dg.err(a.span, "E0827", u.f1("@%s expects a string literal naming a processor extension", e.name));
+        } else if not tg.feature_known(a.str) {
+            _ = dg.err(a.span, "E0827", u.f2("unknown processor extension '%s' (this target has: %s)", a.str,
+                                             tg.feature_names()));
+        } else {
+            a.ty = ty.type_slice(ty.t_u8, false);
+        }
+        return set_ty(e, ty.t_bool);
+    }
+    if (id == ast.BI_TARGET_ARCH) or (id == ast.BI_TARGET_OS) {
+        let a = barg(e, 0);
+        let names = u.pick(id == ast.BI_TARGET_ARCH, "wasm32, wasm64, x86_64, aarch64", "linux, macos, windows, none");
+        if a.kind != ast.E_STRING {
+            _ = check_expr(a, tnil());
+            _ = dg.err(a.span, "E0827", u.f2("@%s expects a string literal: one of %s", e.name, names));
+        } else if target_name_value(id, a.str) < 0 {
+            _ = dg.err(a.span, "E0827",
+                       u.f3(
+                           "unknown %s '%s' (expected one of %s)",
+                           u.pick(id == ast.BI_TARGET_ARCH, "architecture", "operating system"), a.str, names));
+        } else {
+            a.ty = ty.type_slice(ty.t_u8, false);
+        }
+        return set_ty(e, ty.t_bool);
+    }
+    if id == ast.BI_X86_CPUID {
+        _ = check_expr_to(earg(e, 0), ty.t_u32);
+        _ = check_expr_to(earg(e, 1), ty.t_u32);
+        return set_ty(e, ty.type_vec(ty.t_u32, 4));
+    }
+    if id == ast.BI_X86_XGETBV {
+        _ = check_expr_to(earg(e, 0), ty.t_u32);
+        return set_ty(e, ty.t_u64);
+    }
+    if (id >= ast.BI_X86_AESENC) and (id <= ast.BI_ARM_CRC32C) {
+        return set_ty(e, insn_check(e, id));
     }
     if id == ast.BI_EXPECT {
         _ = check_expr_to(earg(e, 0), ty.t_bool);
@@ -4167,6 +4448,14 @@ fn check_assign(s: *mut ast.Stmt) void {
         let r = check_expr(s.e2, tnil());
         if r.kind == ast.TY_UNTYPED_INT {
             coerce(&mut s.e2, ty.t_u32);
+        } else if ty.is_vec_int(r) and not r.elem.is_signed {
+            // per lane (spec §13.1)
+            if (lt.kind != ast.TY_INVALID) and
+               not (ty.is_vec_int(lt) and (lt.lanes == r.lanes) and (lt.elem.bits == r.elem.bits)) {
+                _ = dg.err(s.e2.span, "E0412",
+                           u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(lt),
+                                tstr(r)));
+            }
         } else if not ((r.kind == ast.TY_INT) and not r.is_signed) and (r.kind != ast.TY_INVALID) and
                   not ((r.kind == ast.TY_PARAM) and ty.satisfies(r, ast.C_UNSIGNED)) {
             _ = dg.err(s.e2.span, "E0525", u.f1("shift count must be an unsigned integer, found %s", tstr(r)));
@@ -4524,6 +4813,7 @@ fn check_fn_body(f: *mut ast.Decl) void {
     }
     f.checked = true;
     resolve_decl(f);
+    check_fn_attr(f);
     let mut oself = tnil();
     if u.notnil(f.owner) {
         oself = f.owner.ty;
@@ -4556,6 +4846,457 @@ fn check_fn_body(f: *mut ast.Decl) void {
     u.free(@ptr_cast(*mut void, ctx.marks.data));
     u.free(@ptr_cast(*mut void, ctx.loop_breaks.data));
     C = saved;
+    gate_fn(f);
+}
+
+// ---------------------------------------------------------------------------
+// Processor extensions (spec §13.4): target conditions, @features and
+// @multiversion, and builtins that need an extension.
+// ---------------------------------------------------------------------------
+pub const NO_VERSION: u64 = 0xFFFF_FFFF_FFFF_FFFF;  // a version naming another architecture's extension
+
+// The value a target name stands for: an architecture (@target_arch) or an
+// operating system (@target_os). -1 for an unknown name.
+fn target_name_value(id: i32, name: []u8) i32 {
+    if id == ast.BI_TARGET_ARCH {
+        let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
+        for i in 0..t.len {
+            if u.str_eq(t[i], name) {
+                return @int_cast(i32, i) + tg.ARCH_WASM32;
+            }
+        }
+        return -1;
+    }
+    let t = ["linux", "macos", "windows", "none"];
+    for i in 0..t.len {
+        if u.str_eq(t[i], name) {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+// The operating system as @target_os numbers it (none: WebAssembly).
+fn target_os_value() i32 {
+    if tg.is_wasm() {
+        return 3;
+    }
+    if tg.g_os == tg.OS_DARWIN {
+        return 1;
+    }
+    if tg.g_os == tg.OS_WINDOWS {
+        return 2;
+    }
+    return 0;
+}
+
+fn tri(c: bool) i32 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+// The value of a target condition in code compiled with extensions
+// `feats`: 1 true, 0 false, -1 not a target condition. Target conditions
+// are @target_has, @target_arch, @target_os, @cpu_has of an extension the
+// code may use (true), true and false, combined with not, and, or.
+pub fn target_cond(e: *ast.Expr, feats: u64) i32 {
+    if e.kind == ast.E_BOOL {
+        return tri(e.bval);
+    }
+    if e.kind == ast.E_BUILTIN {
+        let id = e.index;
+        if (e.bargs.len != 1) or u.isnil(e.bargs.at(0).e) or (e.bargs.at(0).e.kind != ast.E_STRING) {
+            return -1;
+        }
+        let name = e.bargs.at(0).e.str;
+        if (id == ast.BI_TARGET_HAS) or (id == ast.BI_CPU_HAS) {
+            let b = tg.feature_bit(name);
+            let on = (b != 0) and ((feats & b) == b);
+            if (id == ast.BI_CPU_HAS) and not on {
+                return -1;
+            }
+            return tri(on);
+        }
+        if id == ast.BI_TARGET_ARCH {
+            return tri(target_name_value(id, name) == tg.g_arch);
+        }
+        if id == ast.BI_TARGET_OS {
+            return tri(target_name_value(id, name) == target_os_value());
+        }
+        return -1;
+    }
+    if (e.kind == ast.E_UNARY) and (e.op == lx.KW_NOT) {
+        let a = target_cond(e.a, feats);
+        if a < 0 {
+            return -1;
+        }
+        return 1 - a;
+    }
+    if (e.kind == ast.E_BINARY) and ((e.op == lx.KW_AND) or (e.op == lx.KW_OR)) {
+        let a = target_cond(e.a, feats);
+        let b = target_cond(e.b, feats);
+        if e.op == lx.KW_AND {
+            if (a == 0) or (b == 0) {
+                return 0;
+            }
+            if (a == 1) and (b == 1) {
+                return 1;
+            }
+            return -1;
+        }
+        if (a == 1) or (b == 1) {
+            return 1;
+        }
+        if (a == 0) and (b == 0) {
+            return 0;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+// Is this function's code exempt from --cpu (compiled for the bare
+// architecture)? std/os/cpu.ax's detection and start-up check, which must
+// run on any processor of the architecture.
+pub fn baseline_fn(d: *ast.Decl) bool {
+    return u.notnil(d.module) and u.ends(u.file_of(d.module.file.id).display, "std/os/cpu.ax");
+}
+
+// @features / @multiversion: the extension sets, closed under implication.
+// A set naming another architecture's extension is NO_VERSION.
+fn check_fn_attr(f: *mut ast.Decl) void {
+    if f.attr == ast.ATTR_NONE {
+        return;
+    }
+    let n = f.attr_args.len;
+    f.feat_sets = u.newn.[u64](n + 1)[0..n];
+    let what = u.pick(f.attr == ast.ATTR_FEATURES, "features", "multiversion");
+    if n == 0 {
+        _ = dg.err(f.attr_span, "E0829", u.f1("@%s needs at least one set of extensions, such as \"avx2,fma\"", what));
+        return;
+    }
+    if (f.attr == ast.ATTR_FEATURES) and (n != 1) {
+        _ = dg.err(f.attr_span, "E0829",
+                   "@features takes one set of extensions (\"a,b\"); @multiversion takes several");
+    }
+    for i in 0..n {
+        let spec = f.attr_args.get(i);
+        let sp = f.attr_arg_spans.get(i);
+        let mut bits: u64 = 0;
+        let mut foreign = false;
+        let mut empty = true;
+        let mut k: usize = 0;
+        while k <= spec.len {
+            let mut j = k;
+            while (j < spec.len) and (spec[j] != ',') {
+                j += 1;
+            }
+            let mut name = spec[k..j];
+            k = j + 1;
+            while (name.len > 0) and (name[0] == ' ') {
+                name = name[1..];
+            }
+            if (name.len > 0) and (name[0] == '+') {
+                name = name[1..];
+            }
+            if name.len == 0 {
+                continue;
+            }
+            empty = false;
+            if not tg.feature_known(name) {
+                _ = dg.err(sp, "E0827", u.f2("unknown processor extension '%s' (this target has: %s)", name,
+                                             tg.feature_names()));
+                continue;
+            }
+            let b = tg.feature_bit(name);
+            if b == 0 {
+                foreign = true;
+            }
+            bits = bits | b;
+        }
+        if empty {
+            _ = dg.err(sp, "E0829", "empty set of extensions");
+        }
+        if foreign {
+            f.feat_sets[i] = NO_VERSION;
+        } else {
+            f.feat_sets[i] = tg.parse_features(spec).bits;
+        }
+    }
+}
+
+// The extension sets the function's versions are compiled with: the
+// @multiversion fallback first (the target's own), then one per listed set
+// this architecture has.
+pub fn fn_versions(f: *ast.Decl) []mut u64 {
+    let base = tg.func_features(0, baseline_fn(f));
+    if f.attr == ast.ATTR_NONE {
+        let r = u.newn.[u64](1);
+        r[0] = base;
+        return r[0..1];
+    }
+    let r = u.newn.[u64](f.feat_sets.len + 2);
+    let mut n: usize = 0;
+    if f.attr == ast.ATTR_MULTIVERSION {
+        r[n] = base;
+        n += 1;
+    }
+    for x in f.feat_sets {
+        if x != NO_VERSION {
+            r[n] = base | x;
+            n += 1;
+        }
+    }
+    return r[0..n];
+}
+
+// What a builtin needs: an architecture (0: any) and extensions.
+pub struct Need {
+    arch: i32,
+    feats: u64,
+}
+
+pub fn builtin_need(id: i32) Need {
+    if (id == ast.BI_X86_CPUID) or (id == ast.BI_X86_XGETBV) {
+        return Need.{ arch: tg.ARCH_X64, feats: 0 };
+    }
+    if (id >= ast.BI_X86_AESENC) and (id <= ast.BI_X86_AESKEYGENASSIST) {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_AES };
+    }
+    if id == ast.BI_X86_CLMUL {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_PCLMUL };
+    }
+    if (id >= ast.BI_X86_SHA1RNDS4) and (id <= ast.BI_X86_SHA256MSG2) {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_SHA };
+    }
+    if id == ast.BI_X86_CRC32C {
+        return Need.{ arch: tg.ARCH_X64, feats: tg.X_SSE42 };
+    }
+    if (id >= ast.BI_ARM_AESE) and (id <= ast.BI_ARM_PMULL2) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_AES };
+    }
+    if (id >= ast.BI_ARM_SHA1C) and (id <= ast.BI_ARM_SHA256SU1) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA2 };
+    }
+    if (id >= ast.BI_ARM_SHA512H) and (id <= ast.BI_ARM_SHA512SU1) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA512 };
+    }
+    if (id >= ast.BI_ARM_EOR3) and (id <= ast.BI_ARM_XAR) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_SHA3 };
+    }
+    if (id == ast.BI_ARM_CRC32) or (id == ast.BI_ARM_CRC32C) {
+        return Need.{ arch: tg.ARCH_A64, feats: tg.A_CRC };
+    }
+    return Need.{ arch: 0, feats: 0 };
+}
+
+// The operands of the processor-instruction builtins (spec §13.5), one
+// letter each: W a byte vector (u8x16, u8x32, u8x64), Y a u64 vector (u64x2,
+// u64x4, u64x8), B u8x16, Q u64x2, D u32x4, V a 128-bit integer vector, S
+// u32, C u8, u16, u32 or u64 (CRC data), I a constant.
+fn insn_ops(id: i32) []u8 {
+    let t = ["WW", "WW", "WW", "WW", "B", "BI", "YYI", "DDI", "DD", "DD", "DD", "DDD", "DD", "DD", "SC", "BB", "BB",
+             "B", "B", "QQ", "QQ", "DSD", "DSD", "DSD", "S", "DDD", "DD", "DDD", "DDD", "DD", "DDD", "QQQ", "QQQ", "QQ",
+             "QQQ", "VVV", "VVV", "QQ", "QQI", "SC", "SC"];
+    return t[@int_cast(usize, id - ast.BI_X86_AESENC)];
+}
+
+fn insn_kind_ok(c: u8, t: *mut ast.Type) bool {
+    if t.kind == ast.TY_INVALID {
+        return true;
+    }
+    if c == 'W' {
+        return (t.kind == ast.TY_VEC) and (t.elem == ty.t_u8);
+    }
+    if c == 'Y' {
+        return (t.kind == ast.TY_VEC) and (t.elem == ty.t_u64);
+    }
+    if c == 'B' {
+        return t == ty.type_vec(ty.t_u8, 16);
+    }
+    if c == 'Q' {
+        return t == ty.type_vec(ty.t_u64, 2);
+    }
+    if c == 'D' {
+        return t == ty.type_vec(ty.t_u32, 4);
+    }
+    return ty.is_vec_int(t) and (ty.simd_bits(t) == 128);  // V
+}
+
+fn insn_kind_name(c: u8) []u8 {
+    if c == 'W' {
+        return "u8x16, u8x32 or u8x64";
+    }
+    if c == 'Y' {
+        return "u64x2, u64x4 or u64x8";
+    }
+    if c == 'B' {
+        return "u8x16";
+    }
+    if c == 'Q' {
+        return "u64x2";
+    }
+    if c == 'D' {
+        return "u32x4";
+    }
+    return "a 128-bit integer vector";
+}
+
+fn insn_check(e: *mut ast.Expr, id: i32) *mut ast.Type {
+    let ops = insn_ops(id);
+    let mut first = tnil();
+    let mut first_kind: u8 = 0;
+    for k in 0..ops.len {
+        let c = ops[k];
+        let pe = earg(e, k);
+        if c == 'I' {
+            let mut max: i64 = 255;
+            if id == ast.BI_X86_SHA1RNDS4 {
+                max = 3;
+            } else if id == ast.BI_ARM_XAR {
+                max = 63;
+            }
+            let t = check_expr(pe.*, ty.t_u32);
+            if ty.is_untyped(t) {
+                coerce(pe, ty.t_u32);
+            }
+            let a = pe.*;
+            if not a.is_const or a.cval.is_neg() or a.cval.ge(u.I128.of(max + 1)) {
+                _ = dg.err(a.span, "E0820", u.f2("@%s needs a constant in 0..%s here", e.name, u.dec(max)));
+            }
+        } else if c == 'S' {
+            _ = check_expr_to(pe, ty.t_u32);
+        } else if c == 'C' {
+            let t = check_expr(pe.*, tnil());
+            if ty.is_untyped(t) {
+                _ = finalize_untyped(pe);
+            } else if not ((t.kind == ast.TY_INT) and not t.is_signed and not t.is_size) and
+                      (t.kind != ast.TY_INVALID) {
+                _ = dg.err(pe.*.span, "E0822", u.f2("@%s takes u8, u16, u32 or u64 data, found %s", e.name, tstr(t)));
+            }
+        } else if u.notnil(first) and (c == first_kind) {
+            _ = check_expr_to(pe, first);
+        } else {
+            let t = check_expr(pe.*, tnil());
+            if not insn_kind_ok(c, t) {
+                _ = dg.err(pe.*.span, "E0812", u.f3("@%s needs %s operands, found %s", e.name, insn_kind_name(c),
+                                                    tstr(t)));
+            }
+            if u.isnil(first) {
+                first = t;
+                first_kind = c;
+            }
+        }
+    }
+    if (ops[0] == 'S') or (u.isnil(first)) {
+        return ty.t_u32;
+    }
+    if not insn_kind_ok(first_kind, first) {
+        return ty.t_invalid;
+    }
+    return first;
+}
+
+let mut gate_reported: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+
+fn arch_name(a: i32) []u8 {
+    let t = ["wasm32", "wasm64", "x86_64", "aarch64"];
+    return t[@int_cast(usize, a - tg.ARCH_WASM32)];
+}
+
+fn need_text(nd: Need, feats: u64) []u8 {
+    if nd.arch != tg.g_arch {
+        let saved = tg.g_arch;
+        tg.g_arch = nd.arch;
+        let mut t = u.f1("the %s architecture", arch_name(nd.arch));
+        if nd.feats != 0 {
+            t = u.f2("%s with %s", t, tg.features_string(nd.feats));
+        }
+        tg.g_arch = saved;
+        return t;
+    }
+    return u.f1("the extensions %s", tg.features_string(nd.feats & ~feats));
+}
+
+fn gate_expr(e: *ast.Expr, feats: u64) void {
+    if u.isnil(e) {
+        return;
+    }
+    if e.kind == ast.E_BUILTIN {
+        let nd = builtin_need(e.index);
+        if ((nd.arch != 0) and (nd.arch != tg.g_arch)) or ((feats & nd.feats) != nd.feats) {
+            let mut seen = false;
+            for i in 0..gate_reported.len {
+                if gate_reported.get(i) == e.span.start {
+                    seen = true;
+                }
+            }
+            if not seen {
+                gate_reported.push(e.span.start);
+                let d = dg.err(e.span, "E0828", u.f2("@%s needs %s, which this code is not compiled for", e.name,
+                                                     need_text(nd, feats)));
+                dg.note(d, e.span,
+                        "use it under `if @target_has(...)` or `if @target_arch(...)`, or in a function declared with @features or @multiversion");
+            }
+        }
+        for i in 0..e.bargs.len {
+            gate_expr(e.bargs.at(i).e, feats);
+        }
+        return;
+    }
+    gate_expr(e.a, feats);
+    gate_expr(e.b, feats);
+    gate_expr(e.c, feats);
+    for i in 0..e.args.len {
+        gate_expr(e.args.get(i), feats);
+    }
+    for i in 0..e.inits.len {
+        gate_expr(e.inits.at(i).value, feats);
+    }
+    gate_expr(e.hexpr, feats);
+    gate_stmt(e.hblock, feats);
+}
+
+fn gate_stmt(s: *ast.Stmt, feats: u64) void {
+    if u.isnil(s) {
+        return;
+    }
+    if s.kind == ast.S_IF {
+        let c = target_cond(s.e, feats);
+        if c == 1 {
+            gate_stmt(s.body, feats);
+            return;
+        }
+        if c == 0 {
+            gate_stmt(s.els, feats);
+            return;
+        }
+    }
+    gate_expr(s.e, feats);
+    gate_expr(s.e2, feats);
+    gate_expr(s.e3, feats);
+    gate_stmt(s.body, feats);
+    gate_stmt(s.els, feats);
+    for i in 0..s.stmts.len {
+        gate_stmt(s.stmts.get(i), feats);
+    }
+    for i in 0..s.arms.len {
+        gate_stmt(s.arms.at(i).body, feats);
+    }
+}
+
+// Each version of a function may use only the builtins its extensions
+// allow (in the code it compiles: a branch a target condition rules out
+// is not compiled).
+fn gate_fn(f: *ast.Decl) void {
+    if u.isnil(f.body) {
+        return;
+    }
+    for v in fn_versions(f) {
+        gate_stmt(f.body, v);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4673,5 +5414,48 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
             }
         }
     }
+    check_inline_cycles();
     return dg.error_count() == 0;
+}
+
+// Whether inline function `from` reaches `to` through calls between inline
+// functions.
+fn inline_reaches(from: *mut ast.Decl, to: *mut ast.Decl, mark: i32) bool {
+    if from == to {
+        return true;
+    }
+    if from.inline_mark == mark {
+        return false;
+    }
+    from.inline_mark = mark;
+    for i in 0..from.inline_callees.len {
+        if inline_reaches(from.inline_callees.get(i), to, mark) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An inline function cannot be recursive, directly or through other inline
+// functions (spec §9.5): every call on such a cycle is reported.
+fn check_inline_cycles() void {
+    let mut mark: i32 = 0;
+    for i in 0..g_prog.fns.len {
+        let g = g_prog.fns.get(i);
+        for k in 0..g.inline_callees.len {
+            let f = g.inline_callees.get(k);
+            mark += 1;
+            if not inline_reaches(f, g, mark) {
+                continue;
+            }
+            if f == g {
+                _ = dg.err(g.inline_call_spans.get(k), "E0314",
+                           u.f1("inline function '%s' calls itself (an inline function cannot be recursive)", g.name));
+            } else {
+                _ = dg.err(g.inline_call_spans.get(k), "E0314",
+                           u.f2("this call to inline function '%s' leads back to '%s' (inline functions cannot be recursive)",
+                                f.name, g.name));
+            }
+        }
+    }
 }

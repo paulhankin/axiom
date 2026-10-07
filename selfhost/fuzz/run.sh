@@ -46,7 +46,9 @@ while [ "$seed" -le "$last" ]; do
     else
         echo "  wasm32: build failed"; fail=$((fail + 1))
     fi
-    for cfg in "x86-64:--cpu=x86-64" "x86-64-v2:--cpu=x86-64-v2" "x86-64-v3:--cpu=x86-64-v3" "x86-64-O2:--cpu=x86-64-v3 -O2"; do
+    for cfg in "x86-64:--cpu=x86-64" "x86-64-v2:--cpu=x86-64-v2" "x86-64-v3:--cpu=x86-64-v3" "x86-64-O2:--cpu=x86-64-v3 -O2" \
+               "x86-64-v4:--cpu=x86-64-v4" "x86-64-v4-O2:--cpu=x86-64-v4 -O2" \
+               "avx512bw:--cpu=x86-64-v3 --features=+avx512bw"; do
         name=${cfg%%:*}
         # shellcheck disable=SC2086
         if $NEW build "$f" --target=x86_64 ${cfg#*:} --link=$RT -o "$T/x" > "$T/log" 2>&1; then

@@ -6,11 +6,14 @@ how to go on checking.
 
 ## What "safe" means here
 
-Axiom checks bounds and integer overflow, so bad input can't corrupt
-memory. It can still cause harm in four ways:
+Axiom checks bounds, so bad input can't corrupt memory. Integer overflow
+wraps (spec §7.6; until issue 0047 it trapped): sizes computed from input
+use `@mul_checked`/`@add_checked`, and a wrapped index still meets a
+bounds check. Input can still cause harm in four ways:
 
-- **Traps.** An out-of-bounds index or an overflow that input can reach
-  kills the process. For a server, that is a denial of service.
+- **Traps.** An out-of-bounds index (or an overflow, in an
+  `--overflow=trap` build) that input can reach kills the process. For a
+  server, that is a denial of service.
 - **Resource exhaustion.** Input can make the program allocate without
   limit, or do work that grows faster than linearly: nested structures,
   backtracking, quadratic loops, decompression bombs.

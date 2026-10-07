@@ -1,0 +1,88 @@
+// Loads at joins (issue 0105): a location stored on one path and loaded on
+// the other is a phi after the join, also through several joins in a row,
+// from lanes of a vector stored over it, and with the load moved onto the
+// one path that does not know it (after a call). The results are the same.
+import "../lib/io.ax" as io;
+
+fn clamp(o: *mut [5]f32) void {
+    if o[1] > o[0] {
+        o[1] = o[0];
+    }
+    let lose = 1.0 - o[0];
+    if o[3] > lose {
+        o[3] = lose;
+    }
+    if o[2] > o[1] {
+        o[2] = o[1];
+    }
+    if o[4] > o[3] {
+        o[4] = o[3];
+    }
+    for k in @as(usize, 1)..5 {
+        if o[k] < 0.0001 {
+            o[k] = 0.0;
+        }
+    }
+}
+
+let mut CALLS: u32 = 0;
+
+fn other(o: *mut [5]f32) void {
+    CALLS += 1;
+    o[2] = o[2] * 0.5;
+}
+
+// a copy on the stack, clamped in place or by a call, then copied out
+fn through_slot(src: *[5]f32, out: *mut [5]f32, which: bool) f32 {
+    let mut t: [5]f32 = src.*;
+    if which {
+        clamp(&mut t);
+    } else {
+        other(&mut t);
+    }
+    out.* = t;
+    return ((t[0] + t[1]) - t[2]) + (t[3] * t[4]);
+}
+
+struct V {
+    buf: [8]u32,
+    len: usize,
+    grows: u32,
+}
+
+fn grow(v: *mut V) void {
+    v.grows += 1;
+    v.len = 0;
+}
+
+fn push_all(v: *mut V, n: u32) u64 {
+    let mut s: u64 = 0;
+    for i in @as(u32, 0)..n {
+        if v.len == 8 {
+            grow(v);
+        }
+        v.buf[v.len] = i;
+        v.len += 1;
+        s += @as(u64, v.len);
+    }
+    return s;
+}
+
+export fn run() void {
+    let mut a: [5]f32 = [0.6, 0.7, 0.2, 0.5, 0.00001];
+    clamp(&mut a);
+    io.float(@as(f64, a[0]));  // expect: 0.6000000238418579
+    io.float(@as(f64, a[1]));  // expect: 0.6000000238418579
+    io.float(@as(f64, a[3]));  // expect: 0.3999999761581421
+    io.float(@as(f64, a[4]));  // expect: 0
+    let src: [5]f32 = [0.25, 0.5, 0.75, 0.125, 0.5];
+    let mut out: [5]f32 = [0.0; 5];
+    io.float(@as(f64, through_slot(&src, &mut out, true)));  // expect: 0.265625
+    io.float(@as(f64, out[2]));  // expect: 0.25
+    io.float(@as(f64, through_slot(&src, &mut out, false)));  // expect: 0.4375
+    io.float(@as(f64, out[2]));  // expect: 0.375
+    io.uint(@as(u64, CALLS));    // expect: 1
+    let mut v = V.{ buf: [0; 8], len: 5, grows: 0 };
+    io.uint(push_all(&mut v, 30));  // expect: 135
+    io.uint(@as(u64, v.grows));     // expect: 4
+}

@@ -1,0 +1,188 @@
+// Idioms the self-hosted x86-64 backend selects specially for baseline
+// x86-64 (issues 0080-0083): k - ctlz and ctlz + k as bsr (no LZCNT),
+// single-bit tests as bt, unsigned min and above / below-or-equal compares
+// as one-micro-op cmov conditions, popcount with immediate masks, int-to-
+// float conversions, a shift whose count a sign check bounds, `if (a or b)`
+// with a load of a stack slot if-converted, and vector constants as memory
+// operands of legacy SSE instructions. Each result is folded into a hash.
+// x86-64-flags: --cpu=x86-64
+import "../lib/io.ax" as io;
+
+let mut H: u64 = 0;
+
+fn mix(x: u64) void {
+    H = (H *% 1099511628211) ^ x;
+}
+
+let mut XS: [24]u32 = [
+    0,
+    1,
+    2,
+    3,
+    5,
+    7,
+    8,
+    15,
+    16,
+    31,
+    127,
+    128,
+    255,
+    1000,
+    65535,
+    65536,
+    0x7fff_fffe,
+    0x7fff_ffff,
+    0x8000_0000,
+    0x8000_0001,
+    0xffff_fffe,
+    0xffff_ffff,
+    0x1234_5678,
+    0xdead_beef,
+];
+
+fn top(x: u32) i32 {
+    return 31 - @int_cast(i32, @clz(x));
+}
+
+fn shots(x: u32, k: i32) i32 {
+    // 23 - top(x), checked not negative, as a shift count
+    if (x != 0) and (top(x) <= 23) {
+        return @int_cast(i32, (k >> @int_cast(u32, 23 - top(x))) & 0xff);
+    }
+    return -1;
+}
+
+fn bits(x: u32, y: u64) void {
+    for k in @as(u32, 0)..32 {
+        mix(@as(u64, (x & (@as(u32, 1) << k)) != 0));
+        mix(@as(u64, (y & (@as(u64, 1) << @as(u64, k + 31))) == 0));
+    }
+}
+
+fn pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn compares(x: u32, y: u32) void {
+    mix(@as(u64, @min(x, 15)));
+    mix(@as(u64, @min(x, y)));
+    mix(@as(u64, @max(x, y)));
+    let a = pick(x > 127, x, y);
+    let b = pick(x <= 0x7fff_fffe, x, 3);
+    let c = pick(x > y, 1, 2);
+    let d = pick(x <= y, x, y);
+    let e = pick(x > 0, 5, 6);
+    let f = pick(x <= 0, y, x);
+    let g = pick(x > 126, x, 9);
+    mix(
+        (((((@as(u64, a) +% @as(u64, b)) +% @as(u64, c)) +% @as(u64, d)) +% @as(u64, e)) +% @as(u64, f)) +% @as(
+            u64, g));
+    mix(((@as(u64, x > 254) + (@as(u64, x <= 254) * 2)) + (@as(u64, y > x) * 4)) + (@as(u64, y <= x) * 8));
+}
+
+fn counts(x: u32, y: u64) void {
+    mix(@as(u64, @popcount(x)));
+    mix(@popcount(y));
+    mix(@as(u64, @clz(x)));
+    mix(@as(u64, @bit_cast(u32, @int_cast(i32, @clz(x)) + 3)));
+    mix(@as(u64, @bit_cast(u32, 40 - @int_cast(i32, @clz(x)))));
+    mix(@as(u64, @bit_cast(u32, top(x | 1))));
+    mix(@as(u64, @bit_cast(u32, shots(x, @bit_cast(i32, x ^ 0x5555)))));
+}
+
+fn floats(x: u32, y: u64) void {
+    let f = @float_from_int(f32, @bit_cast(i32, x));
+    let d = @float_from_int(f64, @bit_cast(i64, y));
+    let s = @sqrt(@abs(f));
+    mix(@as(u64, @bit_cast(u32, f / 36.0)));
+    mix(@bit_cast(u64, d / 432.0));
+    mix(@as(u64, @bit_cast(u32, s)));
+    mix(@bit_cast(u64, @as(f64, s) * 0.5));
+    mix(@as(u64, @bit_cast(u32, @float_cast(f32, d))));
+}
+
+struct Arms {
+    k: [4]i32,
+    blocked: [4]bool,
+}
+
+fn either(a: *Arms, d0: usize, d1: usize, n0: i32) i32 {
+    var_sink();
+    let mut n = n0;
+    let k0 = a.k[d0];
+    let k1 = a.k[d1];
+    if (k0 != k1) or a.blocked[d1] {
+        n += 1;
+    }
+    return n;
+}
+
+fn var_sink() void {}
+
+fn arms(x: u32) void {
+    let mut a = Arms.{ k: [-1; 4], blocked: [false; 4] };
+    for i in @as(usize, 0)..4 {
+        if ((x >> @int_cast(u32, i)) & 1) != 0 {
+            a.k[i] = @int_cast(i32, i) & 2;
+            a.blocked[i] = ((x >> @int_cast(u32, i + 4)) & 1) != 0;
+        }
+    }
+    for i in @as(usize, 0)..4 {
+        for j in @as(usize, 0)..4 {
+            mix(@as(u64, @bit_cast(u32, either(&a, i, j, @int_cast(i32, x & 3)))));
+        }
+    }
+}
+
+fn vectors(x: u32) void {
+    let v: i16x8 = @splat(@truncate(i16, x));
+    let p = @vec(i16x8, 0, 1, 2, 3, 4, 5, 6, 7);
+    let w = @lanes_gt(v, p) & (p +% @as(i16x8, @splat(1)));
+    let s = @bit_cast(i16x8, @sub_sat(@bit_cast(u16x8, v), @as(u16x8, @splat(2))));
+    let t = @dot(w, p) +% @dot(s, @vec(i16x8, 9, 8, 7, 6, 5, 4, 3, 2));
+    mix(@as(u64, @bit_cast(u32, @reduce_add(t))));
+}
+
+export fn run() void {
+    for i in @as(usize, 0)..XS.len {
+        let x = XS[i];
+        let y = (@as(u64, XS[(i + 7) % XS.len]) << 32) | @as(u64, x ^ 0x9e37_79b9);
+        bits(x, y);
+        compares(x, XS[(i + 3) % XS.len]);
+        counts(x, y);
+        floats(x, y);
+        arms(x);
+        vectors(x);
+        io.uint(H);
+    }
+}
+
+// The C compiler's (LLVM's) results:
+// expect: 8682663458161299670
+// expect: 14626093458723484203
+// expect: 437822174564565248
+// expect: 10049992097110978868
+// expect: 1529534856864904464
+// expect: 3497852024074800855
+// expect: 12277354854631574309
+// expect: 11994383947603717459
+// expect: 4885538114240969572
+// expect: 15366033870906711837
+// expect: 1837124909959724039
+// expect: 8160578255345569718
+// expect: 17181907380189229235
+// expect: 854328933868203011
+// expect: 17232084225966652555
+// expect: 3201147802454372030
+// expect: 2195580061980876064
+// expect: 11445488564478653802
+// expect: 6974910567363799300
+// expect: 8500379989857373001
+// expect: 2351376543626011779
+// expect: 11755758544943421712
+// expect: 10844950254722293204
+// expect: 15255826300459445559

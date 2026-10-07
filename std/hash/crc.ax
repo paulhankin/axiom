@@ -23,9 +23,17 @@
 // reflected, the others keep it in the top bits of a u64, so every width
 // works the same way.
 //
-// std/compress/deflate (crc32), std/compress/xz (crc64) and the formats
-// built on them keep their own slicing-by-8 code, which is faster.
+// CRC-32 and CRC-32C have faster code of their own (crc32 and crc32c,
+// which Crc uses for those two): eight bytes at a time through tables, or
+// the processor's instructions where it has them (spec §13.5): crc32 on
+// x86-64 (SSE4.2) and AArch64 (the CRC extension) for CRC-32C, and for
+// CRC-32 the AArch64 crc32 instruction or, on x86-64, folding with
+// carry-less multiplication (PCLMULQDQ; Intel, "Fast CRC Computation for
+// Generic Polynomials Using PCLMULQDQ Instruction", 2009). std/compress
+// (gzip, zip, PNG) uses crc32; std/compress/xz keeps its own CRC-64.
 // =============================================================================
+
+import "../sync.ax" as sync;
 
 /// A CRC algorithm in the Rocksoft model.
 pub struct Params {
@@ -154,6 +162,16 @@ pub struct Crc {
 
     /// The register after data.
     pub fn update(self: *Crc, reg: u64, data: []u8) u64 {
+        if self.p.refin and (self.p.width == 32) {
+            // (the register is the reflected 32 bits)
+            let poly = self.p.poly & 0xffff_ffff;
+            if poly == 0x04c1_1db7 {
+                return @as(u64, update32(@truncate(u32, reg), data));
+            }
+            if poly == 0x1edc_6f41 {
+                return @as(u64, update32c(@truncate(u32, reg), data));
+            }
+        }
         let mut r = reg;
         let t = &self.table;
         if self.p.refin {
@@ -217,6 +235,223 @@ pub struct Digest {
 pub fn checksum(p: Params, data: []u8) u64 {
     let c = Crc.init(p);
     return c.checksum(data);
+}
+
+// -----------------------------------------------------------------------------
+// CRC-32 and CRC-32C
+// -----------------------------------------------------------------------------
+
+/// Updates a CRC-32 (CRC-32/ISO-HDLC: zlib, gzip, zip, PNG) with data;
+/// start from 0.
+pub fn crc32(crc: u32, data: []u8) u32 {
+    return ~update32(~crc, data);
+}
+
+/// Updates a CRC-32C (Castagnoli) with data; start from 0.
+pub fn crc32c(crc: u32, data: []u8) u32 {
+    return ~update32c(~crc, data);
+}
+
+// slicing by 8: eight tables of 256 for CRC-32, then eight for CRC-32C
+let mut TABLES: [4096]u32 = [0; 4096];
+let mut ONCE32: sync.Once = sync.Once.{ state: 0 };
+let mut ONCE32C: sync.Once = sync.Once.{ state: 0 };
+
+fn build_tables(which: u8) void {
+    let base = @as(usize, which) * 2048;
+    let mut rpoly: u32 = 0xedb8_8320;
+    if which != 0 {
+        rpoly = 0x82f6_3b78;
+    }
+    for n in @as(usize, 0)..256 {
+        let mut c = @as(u32, @truncate(u8, n));
+        for _k in @as(usize, 0)..8 {
+            if (c & 1) != 0 {
+                c = rpoly ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        TABLES[base + n] = c;
+    }
+    for n in @as(usize, 0)..256 {
+        let mut c = TABLES[base + n];
+        for t in @as(usize, 1)..8 {
+            c = TABLES[base + @as(usize, c & 0xff)] ^ (c >> 8);
+            TABLES[(base + (t * 256)) + n] = c;
+        }
+    }
+}
+
+fn tables(castagnoli: bool) []u32 {
+    if castagnoli {
+        ONCE32C.call(build_tables, @as(u8, 1));
+        return TABLES[2048..];
+    }
+    ONCE32.call(build_tables, @as(u8, 0));
+    return TABLES[..2048];
+}
+
+/// The register (reflected, not inverted) after data, eight bytes at a time.
+fn slice8(t: []u32, reg: u32, data: []u8) u32 {
+    let mut c = reg;
+    let mut i: usize = 0;
+    while (i + 8) <= data.len {
+        let one = c ^ (
+            ((@as(u32, data[i]) | (@as(u32, data[i + 1]) << 8)) | (@as(u32, data[i + 2]) << 16)) | (
+                @as(u32, data[i + 3]) << 24));
+        let two = ((@as(u32, data[i + 4]) | (@as(u32, data[i + 5]) << 8)) | (@as(u32, data[i + 6]) << 16)) | (
+            @as(u32, data[i + 7]) << 24);
+        c = (
+            (t[1792 + @as(usize, one & 0xff)] ^ t[1536 + @as(usize, (one >> 8) & 0xff)]) ^ (
+                t[1280 + @as(usize, (one >> 16) & 0xff)] ^ t[1024 + @as(usize, one >> 24)])) ^ (
+                    (t[768 + @as(usize, two & 0xff)] ^ t[512 + @as(usize, (two >> 8) & 0xff)]) ^ (
+                        t[256 + @as(usize, (two >> 16) & 0xff)] ^ t[@as(usize, two >> 24)]));
+        i += 8;
+    }
+    while i < data.len {
+        c = t[@as(usize, (c ^ @as(u32, data[i])) & 0xff)] ^ (c >> 8);
+        i += 1;
+    }
+    return c;
+}
+
+fn le64(p: []u8) u64 {
+    let mut v: u64 = 0;
+    for k in @as(usize, 0)..8 {
+        v |= @as(u64, p[k]) << @as(u64, 8 * k);
+    }
+    return v;
+}
+
+/// The CRC-32 register after data.
+fn update32(reg: u32, data: []u8) u32 @multiversion("pclmul", "crc") {
+    if @target_arch("x86_64") and @target_has("pclmul") {
+        if data.len >= 64 {
+            let n = data.len - (data.len % 16);
+            return slice8(tables(false), fold_x86(reg, data[..n]), data[n..]);
+        }
+        return slice8(tables(false), reg, data);
+    }
+    if @target_arch("aarch64") and @target_has("crc") {
+        let mut c = reg;
+        let mut i: usize = 0;
+        while (i + 16) <= data.len {
+            let v = ld(data, i);
+            c = @arm_crc32(c, @extract_lane(v, 0));
+            c = @arm_crc32(c, @extract_lane(v, 1));
+            i += 16;
+        }
+        if (i + 8) <= data.len {
+            c = @arm_crc32(c, le64(data[i..i + 8]));
+            i += 8;
+        }
+        while i < data.len {
+            c = @arm_crc32(c, data[i]);
+            i += 1;
+        }
+        return c;
+    }
+    return slice8(tables(false), reg, data);
+}
+
+/// The CRC-32C register after data.
+fn update32c(reg: u32, data: []u8) u32 @multiversion("sse4.2", "crc") {
+    if @target_arch("x86_64") and @target_has("sse4.2") {
+        let mut c = reg;
+        let mut i: usize = 0;
+        while (i + 16) <= data.len {
+            let v = ld(data, i);
+            c = @x86_crc32c(c, @extract_lane(v, 0));
+            c = @x86_crc32c(c, @extract_lane(v, 1));
+            i += 16;
+        }
+        if (i + 8) <= data.len {
+            c = @x86_crc32c(c, le64(data[i..i + 8]));
+            i += 8;
+        }
+        while i < data.len {
+            c = @x86_crc32c(c, data[i]);
+            i += 1;
+        }
+        return c;
+    }
+    if @target_arch("aarch64") and @target_has("crc") {
+        let mut c = reg;
+        let mut i: usize = 0;
+        while (i + 16) <= data.len {
+            let v = ld(data, i);
+            c = @arm_crc32c(c, @extract_lane(v, 0));
+            c = @arm_crc32c(c, @extract_lane(v, 1));
+            i += 16;
+        }
+        if (i + 8) <= data.len {
+            c = @arm_crc32c(c, le64(data[i..i + 8]));
+            i += 8;
+        }
+        while i < data.len {
+            c = @arm_crc32c(c, data[i]);
+            i += 1;
+        }
+        return c;
+    }
+    return slice8(tables(true), reg, data);
+}
+
+fn ld(p: []u8, i: usize) u64x2 {
+    return @bit_cast(u64x2, @load(u8x16, p[i..i + 16]));
+}
+
+// x * k folded: its low half times k's low, its high half times k's high.
+fn fold1(x: u64x2, k: u64x2) u64x2 @features("pclmul") {
+    if @target_arch("x86_64") {
+        return @x86_clmul(x, k, 0x00) ^ @x86_clmul(x, k, 0x11);
+    }
+    return x;
+}
+
+/// The CRC-32 register after p (at least 64 bytes, a multiple of 16): four
+/// 128-bit lanes folded 64 bytes at a time, then into one, reduced to 64
+/// bits and to 32 (Barrett). The constants are x^n mod P for the fold
+/// distances, bit-reflected, with P' and u' for the reduction (as in
+/// Linux's crc32-pclmul_asm.S).
+fn fold_x86(reg: u32, p: []u8) u32 @features("pclmul") {
+    let mut r: u32 = 0;
+    if @target_arch("x86_64") {
+        let k12 = @vec(u64x2, 0x1_5444_2bd4, 0x1_c6e4_1596);
+        let k34 = @vec(u64x2, 0x1_7519_97d0, 0xccaa_009e);
+        let k5 = @vec(u64x2, 0x1_63cd_6124, 0);
+        let ku = @vec(u64x2, 0x1_db71_0641, 0x1_f701_1641);
+        let mut x1 = ld(p, 0) ^ @vec(u64x2, @as(u64, reg), 0);
+        let mut x2 = ld(p, 16);
+        let mut x3 = ld(p, 32);
+        let mut x4 = ld(p, 48);
+        let mut i: usize = 64;
+        while (i + 64) <= p.len {
+            x1 = fold1(x1, k12) ^ ld(p, i);
+            x2 = fold1(x2, k12) ^ ld(p, i + 16);
+            x3 = fold1(x3, k12) ^ ld(p, i + 32);
+            x4 = fold1(x4, k12) ^ ld(p, i + 48);
+            i += 64;
+        }
+        x1 = fold1(x1, k34) ^ x2;
+        x1 = fold1(x1, k34) ^ x3;
+        x1 = fold1(x1, k34) ^ x4;
+        while i < p.len {
+            x1 = fold1(x1, k34) ^ ld(p, i);
+            i += 16;
+        }
+        // to 64 bits (with 32 zero bits appended), then 32
+        x1 = @vec(u64x2, @extract_lane(x1, 1), 0) ^ @x86_clmul(k34, x1, 0x01);
+        let lo = @extract_lane(x1, 0);
+        let hi = @extract_lane(x1, 1);
+        x1 = @x86_clmul(@vec(u64x2, lo & 0xffff_ffff, 0), k5, 0x00) ^ @vec(u64x2, (lo >> 32) | (hi << 32), hi >> 32);
+        let y = x1;
+        x1 = @x86_clmul(@vec(u64x2, @extract_lane(x1, 0) & 0xffff_ffff, 0), ku, 0x10);
+        x1 = @x86_clmul(@vec(u64x2, @extract_lane(x1, 0) & 0xffff_ffff, 0), ku, 0x00) ^ y;
+        r = @truncate(u32, @extract_lane(x1, 0) >> 32);
+    }
+    return r;
 }
 
 // -----------------------------------------------------------------------------
@@ -296,5 +531,47 @@ test "crc longer inputs and streaming" {
             s.reset();
             @expect_eq(s.finish(), c.checksum(""));
         }
+    }
+}
+
+// a deterministic stream of test bytes (xorshift)
+fn fill(state: *mut u64, out: []mut u8) void {
+    for i in 0..out.len {
+        let mut x = state.*;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state.* = x;
+        out[i] = @truncate(u8, x >> 24);
+    }
+}
+
+test "crc32 and crc32c agree with the bytewise tables" {
+    @expect_eq(crc32(0, "123456789"), 0xcbf4_3926);
+    @expect_eq(crc32c(0, "123456789"), 0xe306_9283);
+    @expect_eq(crc32(crc32(0, "1234"), "56789"), 0xcbf4_3926);
+    @expect_eq(crc32(0, ""), 0);
+    let mut st: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut data: [700]u8 = [0; 700];
+    let mut t32: [256]u32 = [0; 256];
+    let mut t32c: [256]u32 = [0; 256];
+    for n in @as(usize, 0)..256 {
+        t32[n] = @truncate(u32, Crc.init(CRC32).table[n]);
+        t32c[n] = @truncate(u32, Crc.init(CRC32C).table[n]);
+    }
+    for t in @as(usize, 0)..60 {
+        let n = (t * 47) % 700;
+        fill(&mut st, data[..n]);
+        let seed = @truncate(u32, st);
+        let mut a = seed;
+        let mut b = seed;
+        for x in data[..n] {
+            a = t32[@as(usize, @truncate(u8, a) ^ x)] ^ (a >> 8);
+            b = t32c[@as(usize, @truncate(u8, b) ^ x)] ^ (b >> 8);
+        }
+        @expect_eq(update32(seed, data[..n]), a);
+        @expect_eq(update32c(seed, data[..n]), b);
+        @expect_eq(slice8(tables(false), seed, data[..n]), a);
+        @expect_eq(slice8(tables(true), seed, data[..n]), b);
     }
 }

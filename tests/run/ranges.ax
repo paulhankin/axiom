@@ -1,0 +1,202 @@
+// Shifts by every count (issue 0060: the guard for counts at or beyond the
+// width is left out when the count's range is below it, and is one select
+// otherwise), and checks that the ranges of values decide: bit counts, @min
+// and @max, masks, loads from constant tables, loop counters.
+import "../lib/io.ax" as io;
+
+fn shl8(x: u8, k: u32) u8 {
+    return x << k;
+}
+
+fn shr8(x: u8, k: u64) u8 {
+    return x >> k;
+}
+
+fn sar8(x: i8, k: u8) i8 {
+    return x >> k;
+}
+
+fn shl16(x: u16, k: u8) u16 {
+    return x << k;
+}
+
+fn sar16(x: i16, k: u64) i16 {
+    return x >> k;
+}
+
+fn shl32(x: u32, k: u64) u32 {
+    return x << k;
+}
+
+fn shr32(x: u32, k: u8) u32 {
+    return x >> k;
+}
+
+fn sar32(x: i32, k: u32) i32 {
+    return x >> k;
+}
+
+fn shl64(x: u64, k: u32) u64 {
+    return x << k;
+}
+
+fn shr64(x: u64, k: u64) u64 {
+    return x >> k;
+}
+
+fn sar64(x: i64, k: u16) i64 {
+    return x >> k;
+}
+
+// A hash of every shift by counts 0 to 299 (so wrapping counts are seen).
+fn shifts() u64 {
+    let mut h: u64 = 0;
+    for k in @as(u32, 0)..300 {
+        let w = @as(u64, k);
+        h = (h *% 31) +% @as(u64, shl8(0xA5, k)) +% @as(u64, shr8(0xA5, w));
+        h = (h *% 31) +% @as(u64, @bit_cast(u8, sar8(-91, @truncate(u8, k))));
+        h = (h *% 31) +% @as(u64, shl16(0xBEEF, @truncate(u8, k))) +% @as(u64, @bit_cast(u16, sar16(-12345, w)));
+        h = (h *% 31) +% @as(u64, shl32(0xDEADBEEF, w)) +% @as(u64, shr32(0xDEADBEEF, @truncate(u8, k)));
+        h = (h *% 31) +% @as(u64, @bit_cast(u32, sar32(-559038737, k)));
+        h = (h *% 31) +% shl64(0x0123_4567_89AB_CDEF, k) +% shr64(0xFEDC_BA98_7654_3210, w);
+        h = (h *% 31) +% @bit_cast(u64, sar64(-81985529216486896, @truncate(u16, k)));
+    }
+    return h;
+}
+
+// The set bits from the top: 31 - @clz is in 0..32 while the mask is not 0.
+fn top_bits(m: u32) u32 {
+    let mut mask = m;
+    let mut acc: u32 = 0;
+    let mut idx: [32]u8 = [0; 32];
+    while mask != 0 {
+        let i = 31 - @clz(mask);
+        mask ^= @as(u32, 1) << i;
+        idx[@as(usize, i)] += 1;
+        acc = (acc *% 33) +% i;
+    }
+    for i in @as(usize, 0)..32 {
+        acc +%= @as(u32, idx[i]) * @as(u32, @truncate(u8, i));
+    }
+    return acc;
+}
+
+let TABLE: [8]u32 = [3, 1, 4, 1, 5, 9, 2, 6];
+let POINTS: [13]u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+// The shape of the benchmark's half_mobility: a bit count, a minimum, a table
+// load and an index the mask bounds.
+fn mobility(board: *[25]u8, occupied: u32, blocked: u32) i32 {
+    let mut n: i32 = 0;
+    let mut m = (occupied >> 6) & 0x7FFFF;
+    while m != 0 {
+        let idx = 6 + @ctz(m);
+        m &= m - 1;
+        let k = @as(usize, @min(idx, 12));
+        let e = @int_cast(i32, TABLE[@as(usize, (blocked >> (24 - idx)) & 7)]);
+        n += ((@int_cast(i32, idx) - 5) * @as(i32, board[@as(usize, idx)])) * e + @as(i32, POINTS[k]);
+    }
+    return n;
+}
+
+// A count down that stays an index.
+fn countdown(xs: *[25]u8, start: i32) u32 {
+    let mut i: i32 = start;
+    let mut s: u32 = 0;
+    while i > 0 {
+        i -= 1;
+        s += @as(u32, xs[@int_cast(usize, i)]);
+    }
+    return s;
+}
+
+// Bit counts of values that may be 0, as shifts.
+fn counts(x: u32, y: u64) u64 {
+    let a = @as(u64, 1) << @ctz(x);                 // 1 << 32 when x == 0
+    let b = @as(u64, 1) << @clz(y);                 // 0 when y == 0 (count 64)
+    let c = @as(u32, 0x8000_0000) >> @popcount(x);  // 0 when every bit is set
+    return a +% b +% @as(u64, c);
+}
+
+fn pick(xs: *[33]u8, x: u32) u8 {
+    return xs[@as(usize, @ctz(x))];  // 32 when x == 0
+}
+
+fn minmax(a: u32, b: i32) u64 {
+    let s = @as(usize, @max(@min(a, 20), 3));
+    let t: [21]u8 = [7; 21];
+    let mut r = @as(u64, t[s]);
+    if b >= 0 {
+        let c = @as(u32, 1) << @int_cast(u32, @min(b, 31));
+        r += @as(u64, c);
+    }
+    return r;
+}
+
+// A clamped index (issue 0069): @max with 0 is not negative, so the cast
+// and the bounds check go; and weighted sums whose terms of one weight are
+// added first, which wrap the same.
+fn clamp_index(n: i32, m: i64) u64 {
+    let t: [11]u64 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+    let a = t[@int_cast(usize, @min(@max(9 - n, 0), 10))];
+    let b = t[@int_cast(usize, @min(@max(m, 0), 10))];
+    let c = @as(u64, @bit_cast(u32, @max(n, -3)));
+    return (a + (b << 11)) + (c << 22);
+}
+
+fn weighted(b: *[24]u32) u32 {
+    let mut s: u32 = 0;
+    for k in @as(usize, 1)..4 {
+        for i in (6 * k)..((6 * k) + 6) {
+            s +%= b[i] *% @truncate(u32, k);
+        }
+    }
+    return s +% ((b[0] *% 7) +% (b[1] *% 7));
+}
+
+// Constants gathered: c1 - (x + c2), c1 - (c2 - x), (c1 - x) + c2, which wrap
+// the same.
+fn gathered(x: u32, y: u8, z: i64) u64 {
+    let a = 24 -% (12 +% (31 -% x));
+    let b = (5 -% y) +% 250;
+    let c = 9 -% (3 -% z);
+    return (@as(u64, a) +% @as(u64, b)) +% @bit_cast(u64, c);
+}
+
+export fn run() void {
+    io.uint(shifts());  // expect: 16423940634647741274
+    io.uint(@as(u64, top_bits(0xFFFF_FFFF)));  // expect: 2016000480
+    io.uint(@as(u64, top_bits(0x8000_0001)));  // expect: 1054
+    io.uint(@as(u64, top_bits(0)));            // expect: 0
+    let mut board: [25]u8 = [0; 25];
+    for i in @as(usize, 0)..25 {
+        board[i] = @truncate(u8, (i * 7) % 5);
+    }
+    io.int(@as(i64, mobility(&board, 0xFFFF_FFFF, 0x00AB_CDEF)));  // expect: 1943
+    io.int(@as(i64, mobility(&board, 0x0155_5540, 0x0012_3456)));  // expect: 1250
+    io.uint(@as(u64, countdown(&board, 25)));                      // expect: 50
+    io.uint(@as(u64, countdown(&board, 0)));                       // expect: 0
+    io.uint(counts(0, 0));                                         // expect: 6442450944
+    io.uint(counts(0xFFFF_FFFF, 1));                               // expect: 9223372036854775809
+    io.uint(counts(8, 0x10));                                      // expect: 576460753377165320
+    let mut xs: [33]u8 = [0; 33];
+    for i in @as(usize, 0)..33 {
+        xs[i] = @truncate(u8, i * 3);
+    }
+    io.uint(@as(u64, pick(&xs, 0)));     // expect: 96
+    io.uint(@as(u64, pick(&xs, 0x40)));  // expect: 18
+    io.uint(minmax(0, -5));              // expect: 7
+    io.uint(minmax(100, 40));            // expect: 2147483655
+    io.uint(minmax(5, 4));               // expect: 23
+    io.uint(clamp_index(-100, -5));      // expect: 18014398496902144
+    io.uint(clamp_index(4, 3));          // expect: 16793632
+    io.uint(clamp_index(20, 99));        // expect: 85983233
+    let mut w: [24]u32 = [0; 24];
+    for i in @as(usize, 0)..24 {
+        w[i] = 0x2345_6789 *% @truncate(u32, i + 1);
+    }
+    io.uint(@as(u64, weighted(&w)));                    // expect: 2977843555
+    io.uint(gathered(0, 0, 0));                         // expect: 4294967538
+    io.uint(gathered(0xFFFF_FFF0, 9, -9));              // expect: 4294967504
+    io.uint(gathered(40, 255, 0x7FFF_FFFF_FFFF_FFFF));  // expect: 9223372036854775834
+}

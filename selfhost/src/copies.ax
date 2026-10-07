@@ -21,6 +21,14 @@
 //     the function's entry too, and the copy would not dominate it.
 // D's readers then read P instead, and the copy goes. A chain of copies
 // collapses in a round: each link's source only gains readers.
+//
+// Also (renamable): a whole slot S copied into a slot D that is not used
+// before, S not used after: D is S. And (split_copies, after scalar
+// replacement): a copy or vector load out of a slot filled piece by piece
+// is split at the pieces, each part taken from where it was written (a
+// stored value, a fill, a copy's unchanged source), since a processor cannot
+// forward several narrow stores to one wide load; then the writes of bytes
+// nothing reads go (unread_writes).
 // =============================================================================
 import "ir.ax" as ir;
 import "opt.ax" as opt;
@@ -31,6 +39,7 @@ import "util.ax" as u;
 struct Obj {
     writers: u.List.[*mut ir.Value],
     readers: u.List.[*mut ir.Value],
+    escapers: u.List.[*mut ir.Value],  // where the address escapes (not for parameters)
     escaped: bool,
     readonly: bool,  // a constant global or a by-value parameter: never written
 }
@@ -84,6 +93,7 @@ fn obj_of(r: *mut ir.Value) *mut Obj {
     nobjs += 1;
     o.writers.clear();
     o.readers.clear();
+    o.escapers.clear();
     o.escaped = false;
     o.readonly = false;
     if r.kind == ir.V_PARAM {
@@ -120,6 +130,7 @@ fn note(i: *mut ir.Value, p: *mut ir.Value, how: i32) void {
         o.writers.push(i);
     } else {
         o.escaped = true;
+        o.escapers.push(i);
     }
 }
 
@@ -330,6 +341,26 @@ fn copy_of_copy(c2: *mut ir.Value) *mut ir.Value {
     return c1;
 }
 
+// A copy of a fill: c2 copies slot D1, which only c1 wrote, filling the
+// whole of it with one byte (memset) before it in the same block, and
+// nothing else reads D1. c2 can fill its destination itself (then c1 is
+// dead): a zeroed struct returned and bound copies 0 into the variable.
+fn copy_of_fill(c2: *mut ir.Value) *mut ir.Value {
+    let d1 = c2.b;
+    if not whole(c2, d1) {
+        return u.nil.[ir.Value]();
+    }
+    let o = obj_of(d1);
+    if o.escaped or (o.writers.len != 1) or (o.readers.len != 1) {
+        return u.nil.[ir.Value]();
+    }
+    let c1 = o.writers.get(0);
+    if (c1.op != ir.OP_MEMSET) or (c1.a != d1) or not whole(c1, d1) or (c1.blk != c2.blk) or (c1.pos >= c2.pos) {
+        return u.nil.[ir.Value]();
+    }
+    return c1;
+}
+
 // The result of a call copied into this function's own result: the call
 // can write it there itself. The result's memory (the sret parameter) is
 // the caller's fresh slot, which nothing else here reads or writes, so it
@@ -379,12 +410,579 @@ fn uses_address(i: *ir.Value, p: *mut ir.Value) bool {
     return false;
 }
 
+// The constant offset of address p from its root (false if it has none).
+fn const_off(p0: *mut ir.Value, off: *mut i64) bool {
+    let mut p = p0;
+    let mut o: i64 = 0;
+    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        if not ir.is_cint(p.b) {
+            return false;
+        }
+        o +%= ir.sval(p.b);
+        p = p.a;
+    }
+    off.* = o;
+    return true;
+}
+
+// The bytes [lo, hi) of its slot that writer w writes (false if they are
+// not constant).
+fn written(w: *mut ir.Value, lo: *mut i64, hi: *mut i64) bool {
+    let mut p = w.a;
+    let mut n: i64 = 0;
+    if w.op == ir.OP_STORE {
+        p = w.b;
+        n = @bit_cast(i64, w.a.ty.size);
+    } else if (w.op == ir.OP_MEMCPY) or (w.op == ir.OP_MEMMOVE) or (w.op == ir.OP_MEMSET) {
+        if not ir.is_cint(w.c) {
+            return false;
+        }
+        n = ir.sval(w.c);
+    } else {
+        return false;
+    }
+    if not const_off(p, lo) {
+        return false;
+    }
+    hi.* = lo.* + n;
+    return true;
+}
+
+// Does the source of copy w (into a slot) hold the same bytes when copy c
+// below it in the block runs? Only writes to other slots whose addresses go
+// nowhere (which the source, read through another object, cannot be) may
+// come between them.
+fn source_unchanged(w: *mut ir.Value, c: *mut ir.Value) bool {
+    if ((w.op != ir.OP_MEMCPY) and (w.op != ir.OP_MEMMOVE)) or (w.blk != c.blk) {
+        return false;
+    }
+    let rs = root(w.b);
+    let mut i = w.next;
+    while u.notnil(i) and (i != c) {
+        if writes_memory(i) {
+            let op = i.op;
+            let mut p = i.a;
+            if op == ir.OP_STORE {
+                p = i.b;
+            } else if (op != ir.OP_MEMCPY) and (op != ir.OP_MEMMOVE) and (op != ir.OP_MEMSET) {
+                return false;
+            }
+            let rd = root(p);
+            if u.isnil(rd) or (rd.kind != ir.V_INST) or (rd.op != ir.OP_ALLOCA) or (rd == rs) or obj_of(rd).escaped {
+                return false;
+            }
+        }
+        i = i.next;
+    }
+    return i == c;
+}
+
+const MAX_PIECES: usize = 16;
+
+// A copy out of a stack slot that was filled piece by piece (fields
+// stored one at a time, halves copied in): the copy reads across the
+// pieces' stores, which a processor cannot forward to one wider load (a
+// stall of a dozen cycles or more). Split at the pieces' boundaries, each
+// part reads what one write wrote; a part that a store wrote just before
+// (in the block, nothing writing it since) stores that value instead, and
+// the slot may then not be read at all. Splitting a copy is always exact:
+// the slot's address goes nowhere else, so the copy cannot overlap it.
+fn split_copy(c: *mut ir.Value, B: *mut ir.Builder) bool {
+    if ((c.op != ir.OP_MEMCPY) and (c.op != ir.OP_MEMMOVE)) or not ir.is_cint(c.c) {
+        return false;
+    }
+    let r = root(c.b);
+    if u.isnil(r) or (r.kind != ir.V_INST) or (r.op != ir.OP_ALLOCA) or (root(c.a) == r) or (r.flag == 78) {
+        return false;
+    }
+    let o = obj_of(r);
+    let mut base: i64 = 0;
+    if o.escaped or not const_off(c.b, &mut base) {
+        return false;
+    }
+    let n = ir.sval(c.c);
+    if (n <= 0) or (n > 256) {
+        return false;
+    }
+    let mut cuts = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+    if not cuts_of(o, base, n, &mut cuts) {
+        u.free(@ptr_cast(*mut void, cuts.data));
+        return false;
+    }
+    // what each part can be had from instead of the slot
+    let mut froms = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut nfrom: usize = 0;
+    for j in 0..(cuts.len - 1) {
+        let mut x = exact_writer(o, cuts.get(j), cuts.get(j + 1), c);
+        // (a part copied from elsewhere: the parts written before it must
+        // not change its source, which must then be apart from the
+        // destination)
+        if u.notnil(x) and ((x.op == ir.OP_MEMCPY) or (x.op == ir.OP_MEMMOVE)) and not apart(root(x.b), root(c.a)) {
+            x = u.nil.[ir.Value]();
+        }
+        if u.isnil(x) and unwritten(o, cuts.get(j), cuts.get(j + 1)) {
+            x = c;  // (nothing to copy)
+        }
+        if u.notnil(x) {
+            nfrom += 1;
+        }
+        froms.push(x);
+    }
+    let changed = (cuts.len > 2) or (nfrom > 0);
+    if changed {
+        ir.at_before(B, c);
+        for j in 0..(cuts.len - 1) {
+            let off = ir.cint(ir.isz(), @bit_cast(u64, cuts.get(j) - base));
+            let size = ir.cint(ir.isz(), @bit_cast(u64, cuts.get(j + 1) - cuts.get(j)));
+            let d = ir.ptradd(B, c.a, off);
+            let w = froms.get(j);
+            if w == c {
+                // bytes nothing writes (a struct's padding): their content is
+                // not defined, and the destination's will do
+            } else if u.isnil(w) {
+                let s = ir.ptradd(B, c.b, off);
+                _ = ir.memop(B, c.op, d, s, size);
+            } else if w.op == ir.OP_STORE {
+                let s = ir.store(B, w.a, d);
+                s.align = 1;
+            } else if w.op == ir.OP_MEMSET {
+                _ = ir.memop(B, ir.OP_MEMSET, d, w.b, size);
+            } else {
+                _ = ir.memop(B, ir.OP_MEMCPY, d, w.b, size);  // (apart)
+            }
+        }
+        // (the copy's destination has new writers: copies out of it wait
+        // for the next round)
+        let rd = root(c.a);
+        if u.notnil(rd) and (rd.kind == ir.V_INST) {
+            rd.flag = 78;
+            marked_split.push(rd);
+        }
+        ir.remove_inst(c);
+    }
+    u.free(@ptr_cast(*mut void, cuts.data));
+    u.free(@ptr_cast(*mut void, froms.data));
+    return changed;
+}
+
+// Are objects s (a copy's source) and d (its destination; nil: not known)
+// known not to overlap: different, and one of them a stack slot whose
+// address goes nowhere else (which nothing else can point into), or s
+// never written?
+fn apart(s: *mut ir.Value, d: *mut ir.Value) bool {
+    if s == d {
+        return false;
+    }
+    if u.notnil(s) and obj_of(s).readonly {
+        return true;
+    }
+    let xs: [2]*mut ir.Value = [s, d];
+    for x in xs {
+        if u.notnil(x) and (x.kind == ir.V_INST) and (x.op == ir.OP_ALLOCA) and not obj_of(x).escaped {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The cuts [base, ..., base + n) that the writes of slot o make in the
+// bytes it reads there, sorted (false if a write's bytes are not constant
+// or there are too many).
+fn cuts_of(o: *mut Obj, base: i64, n: i64, cuts: *mut u.List.[i64]) bool {
+    cuts.push(base);
+    cuts.push(base + n);
+    for k in 0..o.writers.len {
+        let mut lo: i64 = 0;
+        let mut hi: i64 = 0;
+        if not written(o.writers.get(k), &mut lo, &mut hi) {
+            return false;
+        }
+        let ends: [2]i64 = [lo, hi];
+        for e in ends {
+            if (e > base) and (e < (base + n)) {
+                let mut seen = false;
+                for x in cuts.items() {
+                    seen = seen or (x == e);
+                }
+                if not seen {
+                    cuts.push(e);
+                }
+            }
+        }
+    }
+    if (cuts.len - 1) > MAX_PIECES {
+        return false;
+    }
+    // (sorted: a few elements)
+    for a in 1..cuts.len {
+        let mut b = a;
+        while (b > 0) and (cuts.get(b - 1) > cuts.get(b)) {
+            let t = cuts.get(b);
+            cuts.set(b, cuts.get(b - 1));
+            cuts.set(b - 1, t);
+            b -= 1;
+        }
+    }
+    return true;
+}
+
+// Does no write of slot o write any of bytes [lo, hi)? (Every write's bytes
+// are known.)
+fn unwritten(o: *mut Obj, lo: i64, hi: i64) bool {
+    for k in 0..o.writers.len {
+        let mut wl: i64 = 0;
+        let mut wh: i64 = 0;
+        _ = written(o.writers.get(k), &mut wl, &mut wh);
+        if (wh > lo) and (wl < hi) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The write of slot o that last wrote bytes [lo, hi) before x in x's block,
+// when it wrote exactly those bytes and what it wrote can be had where x
+// is: a store's value, a fill, or a copy's source unchanged since. Else nil.
+fn exact_writer(o: *mut Obj, lo: i64, hi: i64, x: *mut ir.Value) *mut ir.Value {
+    let mut last = u.nil.[ir.Value]();
+    for k in 0..o.writers.len {
+        let w = o.writers.get(k);
+        let mut wl: i64 = 0;
+        let mut wh: i64 = 0;
+        _ = written(w, &mut wl, &mut wh);
+        // (a write in another block cannot run between a write above x in
+        // its block and x)
+        if (wh > lo) and (wl < hi) and (w.blk == x.blk) and (w.pos < x.pos) and (u.isnil(last) or (last.pos < w.pos)) {
+            last = w;
+        }
+    }
+    if u.isnil(last) or (last.flags != 0) {
+        return u.nil.[ir.Value]();
+    }
+    let mut wl: i64 = 0;
+    let mut wh: i64 = 0;
+    _ = written(last, &mut wl, &mut wh);
+    if (wl == lo) and (wh == hi) and
+       ((last.op == ir.OP_STORE) or (last.op == ir.OP_MEMSET) or
+        ((root(last.b) != root(last.a)) and source_unchanged(last, x))) {
+        return last;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// A vector load from a slot filled in equal pieces of 1 to 8 bytes (two
+// halves copied in, say): the load reads across the pieces' stores, which
+// cannot be forwarded to it. It becomes the pieces as integer lanes, each
+// taken from where its write took it (or loaded from the slot by itself).
+fn split_load(l: *mut ir.Value, B: *mut ir.Builder) bool {
+    if (l.op != ir.OP_LOAD) or (l.flags != 0) or (l.ty.kind != ir.T_VEC) {
+        return false;
+    }
+    let r = root(l.a);
+    if u.isnil(r) or (r.kind != ir.V_INST) or (r.op != ir.OP_ALLOCA) or (r.flag == 78) {
+        return false;
+    }
+    let o = obj_of(r);
+    let mut base: i64 = 0;
+    if o.escaped or not const_off(l.a, &mut base) {
+        return false;
+    }
+    let n = @bit_cast(i64, l.ty.size);
+    let mut cuts = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
+    let mut ok = cuts_of(o, base, n, &mut cuts) and (cuts.len > 2);
+    let mut w: i64 = 0;
+    if ok {
+        w = cuts.get(1) - cuts.get(0);
+        ok = (w <= 8) and ((w & (w - 1)) == 0);
+        for j in 0..(cuts.len - 1) {
+            ok = ok and ((cuts.get(j + 1) - cuts.get(j)) == w);
+        }
+    }
+    if not ok {
+        u.free(@ptr_cast(*mut void, cuts.data));
+        return false;
+    }
+    let lt = ir.t_int(@truncate(i32, w * 8));
+    let vt = ir.t_vec(lt, @truncate(u32, @bit_cast(u64, n / w)));
+    ir.at_before(B, l);
+    let mut v = ir.undef(vt);
+    for j in 0..(cuts.len - 1) {
+        let lo = cuts.get(j);
+        let x = exact_writer(o, lo, lo + w, l);
+        let mut e = u.nil.[ir.Value]();
+        if u.isnil(x) {
+            let q = ir.load(B, lt, ir.ptradd(B, l.a, ir.cint(ir.isz(), @bit_cast(u64, lo - base))));
+            q.align = 1;
+            e = q;
+        } else if x.op == ir.OP_STORE {
+            e = x.a;
+            if e.ty.kind == ir.T_PTR {
+                e = ir.ptrtoint(B, e, lt);
+            } else if (e.ty.kind == ir.T_INT) and (e.ty.bits < lt.bits) {
+                e = ir.zext(B, e, lt);  // (a bool: a byte holding 0 or 1)
+            } else if e.ty != lt {
+                e = ir.bitcast(B, e, lt);
+            }
+        } else if x.op == ir.OP_MEMSET {
+            if ir.is_cint(x.b) {
+                let byte = ir.cint_val(x.b) & 0xff;
+                let mut k: u64 = 0;
+                for _b in 0..@bit_cast(u64, w) {
+                    k = (k << 8) | byte;
+                }
+                e = ir.cint(lt, k);
+            } else {
+                let q = ir.load(B, lt, ir.ptradd(B, l.a, ir.cint(ir.isz(), @bit_cast(u64, lo - base))));
+                q.align = 1;
+                e = q;
+            }
+        } else {
+            let q = ir.load(B, lt, x.b);
+            q.align = 1;
+            e = q;
+        }
+        v = ir.insert_elem(B, v, e, @as(u64, j));
+    }
+    if vt != l.ty {
+        v = ir.bitcast(B, v, l.ty);
+    }
+    ir.forward(l, v);
+    ir.remove_inst(l);
+    u.free(@ptr_cast(*mut void, cuts.data));
+    return true;
+}
+
+let mut SB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+let mut marked_split: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                        len: 0, cap: 0 };
+
+/// Splits copies and vector loads out of slots filled piece by piece
+/// (split_copy, split_load); true if it changed any.
+pub fn split_copies(f: *mut ir.Func) bool {
+    if u.isnil(SB) {
+        SB = ir.new_builder();
+    }
+    let mut any = false;
+    for _round in @as(i32, 0)..4 {
+        number(f);
+        scan(f);
+        let mut cs = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE) or (i.op == ir.OP_LOAD) {
+                    cs.push(i);
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+        let mut changed = false;
+        for c in cs.items() {
+            if c.op == ir.OP_LOAD {
+                if split_load(c, SB) {
+                    changed = true;
+                }
+            } else if split_copy(c, SB) {
+                changed = true;
+            }
+        }
+        if changed {
+            ir.apply_forwarding(f);
+        }
+        u.free(@ptr_cast(*mut void, cs.data));
+        for x in marked_split.items() {
+            x.flag = 0;
+        }
+        marked_split.clear();
+        clear();
+        if not changed {
+            break;
+        }
+        any = true;
+    }
+    if unread_writes(f) {
+        any = true;
+    }
+    return any;
+}
+
+/// Removes the writes to stack slots of bytes that nothing reads (see
+/// remove_unread_writes); true if it removed any.
+pub fn unread_writes(f: *mut ir.Func) bool {
+    number(f);
+    scan(f);
+    let any = remove_unread_writes(f);
+    clear();
+    return any;
+}
+
+// The bytes [lo, hi) of slot r that reader x reads (false if they are not
+// constant: then it may read any).
+fn read_range(x: *mut ir.Value, r: *mut ir.Value, lo: *mut i64, hi: *mut i64) bool {
+    if (x.op == ir.OP_LOAD) and const_off(x.a, lo) {
+        hi.* = lo.* + @bit_cast(i64, x.ty.size);
+        return true;
+    }
+    if ((x.op == ir.OP_MEMCPY) or (x.op == ir.OP_MEMMOVE)) and ir.is_cint(x.c) and (root(x.b) == r) and
+       (root(x.a) != r) and const_off(x.b, lo) {
+        hi.* = lo.* + ir.sval(x.c);
+        return true;
+    }
+    return false;
+}
+
+// Removes the writes to stack slots whose addresses go nowhere of bytes that
+// nothing reads: what is left of a value built in a slot once the copies
+// out of it are split (split_copy), each part taken from where it was
+// written. True if it removed any.
+fn remove_unread_writes(f: *mut ir.Func) bool {
+    let mut dead = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let op = i.op;
+            let mut p = i.a;
+            if op == ir.OP_STORE {
+                p = i.b;
+            }
+            let mut lo: i64 = 0;
+            let mut hi: i64 = 0;
+            if ((op == ir.OP_STORE) or (op == ir.OP_MEMSET) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE)) and
+               (i.flags == 0) and written(i, &mut lo, &mut hi) {
+                let r = root(p);
+                let copy = (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE);
+                if u.notnil(r) and (r.kind == ir.V_INST) and (r.op == ir.OP_ALLOCA) and
+                   not (copy and (root(i.b) == r)) {
+                    let o = obj_of(r);
+                    let mut read = o.escaped;
+                    for k in 0..o.readers.len {
+                        let x = o.readers.get(k);
+                        let mut rl: i64 = 0;
+                        let mut rh: i64 = 0;
+                        if not read_range(x, r, &mut rl, &mut rh) or ((rh > lo) and (rl < hi)) {
+                            read = true;
+                            break;
+                        }
+                    }
+                    if not read {
+                        dead.push(i);
+                    }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    for i in dead.items() {
+        ir.remove_inst(i);
+    }
+    let any = dead.len > 0;
+    u.free(@ptr_cast(*mut void, dead.data));
+    return any;
+}
+
 fn clear() void {
     for k in 0..marked.len {
         marked.get(k).aux2 = 0;
     }
     marked.clear();
     nobjs = 0;
+}
+
+// Is any of the instructions marked (flag 79) reachable from c: after c in
+// its block, or in a block reachable from c's block (c's own block again
+// included, when c is in a loop)?
+fn reaches_marked(c: *mut ir.Value) bool {
+    let mut i = c.next;
+    while u.notnil(i) {
+        if i.flag == 79 {
+            return true;
+        }
+        i = i.next;
+    }
+    let mut stack = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let mut seen = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    let t = c.blk.last;
+    for k in 0..ir.succ_count(t) {
+        stack.push(ir.succ(t, k));
+    }
+    let mut found = false;
+    while (stack.len > 0) and not found {
+        let b = stack.get(stack.len - 1);
+        stack.len -= 1;
+        if b.aux == 79 {
+            continue;
+        }
+        b.aux = 79;
+        seen.push(b);
+        let mut j = b.first;
+        while u.notnil(j) {
+            if j.flag == 79 {
+                found = true;
+            }
+            j = j.next;
+        }
+        let bt = b.last;
+        for k in 0..ir.succ_count(bt) {
+            stack.push(ir.succ(bt, k));
+        }
+    }
+    for b in seen.items() {
+        b.aux = 0;
+    }
+    u.free(@ptr_cast(*mut void, stack.data));
+    u.free(@ptr_cast(*mut void, seen.data));
+    return found;
+}
+
+// A copy of a whole slot S into slot D (at its start) after which S is
+// never used again, before which D is not used: D can be S itself (S made
+// as large as D), and the copy goes. A value built in a function's local
+// and returned, then bound to a variable, is one slot instead of three.
+fn renamable(c: *mut ir.Value) bool {
+    if (c.op != ir.OP_MEMCPY) or not ir.is_cint(c.c) {
+        return false;
+    }
+    let d = c.a;
+    let s = c.b;
+    if (d.kind != ir.V_INST) or (d.op != ir.OP_ALLOCA) or (s.kind != ir.V_INST) or (s.op != ir.OP_ALLOCA) or (d == s) or
+       (ir.cint_val(c.c) != s.aty.size) or (s.aty.size > d.aty.size) {
+        return false;
+    }
+    let od = obj_of(d);
+    let os = obj_of(s);
+    if os.escaped {
+        return false;  // (D's address may go anywhere, from below the copy)
+    }
+    let lists: [3]*u.List.[*mut ir.Value] = [&od.readers, &od.writers, &od.escapers];
+    for l in lists {
+        for k in 0..l.len {
+            let x = l.get(k);
+            if (x != c) and not dominates(c, x) {
+                return false;
+            }
+        }
+    }
+    // (the copy itself included: in a loop it reads S again, which must
+    // then still hold what it held, not what D became)
+    let slists: [2]*u.List.[*mut ir.Value] = [&os.readers, &os.writers];
+    for l in slists {
+        for k in 0..l.len {
+            l.get(k).flag = 79;
+        }
+    }
+    c.flag = 79;
+    let ok = not reaches_marked(c);
+    for l in slists {
+        for k in 0..l.len {
+            l.get(k).flag = 0;
+        }
+    }
+    c.flag = 0;
+    return ok;
 }
 
 /// Removes copies of aggregates into stack slots that are only read; true
@@ -402,9 +1000,10 @@ pub fn forward_copies(f: *mut ir.Func) bool {
         number(f);
         scan(f);
         let mut done = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
-        // and pairs for the local rules: (copy, the copy before it) or
-        // (copy into the result, the call that made it)
+        // and pairs for the local rules: (copy, the copy or fill before it)
+        // or (copy into the result, the call that made it)
         let mut pairs = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+        let mut renames = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
         let mut b = f.first;
         while u.notnil(b) {
             let mut i = b.first;
@@ -412,8 +1011,13 @@ pub fn forward_copies(f: *mut ir.Func) bool {
                 if i.op == ir.OP_MEMCPY {
                     if removable(i) {
                         done.push(i);
+                    } else if renamable(i) {
+                        renames.push(i);
                     } else {
-                        let c1 = copy_of_copy(i);
+                        let mut c1 = copy_of_copy(i);
+                        if u.isnil(c1) {
+                            c1 = copy_of_fill(i);
+                        }
                         let k = result_into_result(f, i);
                         if u.notnil(c1) {
                             pairs.push(i);
@@ -445,6 +1049,10 @@ pub fn forward_copies(f: *mut ir.Func) bool {
                 if x.op == ir.OP_MEMCPY {
                     c.b = x.b;  // copy the source itself; the first copy is dead
                     ir.remove_inst(x);
+                } else if x.op == ir.OP_MEMSET {
+                    c.op = ir.OP_MEMSET;  // fill the destination itself; the first fill is dead
+                    c.b = x.b;
+                    ir.remove_inst(x);
                 } else {
                     x.xs.set(0, c.a);  // the call writes the result; no copy
                     ir.remove_inst(c);
@@ -461,6 +1069,32 @@ pub fn forward_copies(f: *mut ir.Func) bool {
             u.free(@ptr_cast(*mut void, touched.data));
         }
         u.free(@ptr_cast(*mut void, pairs.data));
+        // renames when nothing else is left, one per slot a round (each
+        // slot's uses were found before any)
+        if (done.len == 0) and not changed {
+            let mut touched = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+            for c in renames.items() {
+                let d = c.a;
+                let s = c.b;
+                if (d.flag == 77) or (s.flag == 77) {
+                    continue;
+                }
+                s.aty = d.aty;
+                s.align = @max(s.align, d.align);
+                ir.remove_inst(c);
+                ir.forward(d, s);
+                d.flag = 77;
+                s.flag = 77;
+                touched.push(d);
+                touched.push(s);
+                changed = true;
+            }
+            for t in touched.items() {
+                t.flag = 0;
+            }
+            u.free(@ptr_cast(*mut void, touched.data));
+        }
+        u.free(@ptr_cast(*mut void, renames.data));
         for k in 0..done.len {
             let c = done.get(k);
             let d = c.a;

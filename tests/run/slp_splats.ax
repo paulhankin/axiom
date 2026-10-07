@@ -1,0 +1,135 @@
+// Scalars only broadcast, neighbouring lanes, as one vector (issue 0101):
+// lanes that are the same operation on neighbouring elements, each used only
+// by splats, are computed as one vector whose lanes are broadcast; phis of
+// them merge each way's vector. The results must be those of the scalars.
+import "../lib/io.ax" as io;
+
+let mut TA: [16][4]f32 = [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0],
+                          [0.0, 0.0, 1.0, 0.5], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.5], [0.0, 0.0, 1.0, 2.0],
+                          [0.0, 0.0, 1.0, 2.5], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 1.0, 3.5], [0.0, 0.0, 1.0, 4.0],
+                          [0.0, 0.0, 1.0, 4.5], [0.0, 0.0, 1.0, 5.0], [0.0, 0.0, 1.0, 5.5], [0.0, 0.0, 1.0, 6.0]];
+let mut TB: [16][4]f32 = [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0],
+                          [1.0, 1.0, 1.0, 0.5], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.5], [1.0, 1.0, 1.0, 2.0],
+                          [1.0, 1.0, 1.0, 2.5], [1.0, 1.0, 1.0, 3.0], [1.0, 1.0, 1.0, 3.5], [1.0, 1.0, 1.0, 4.0],
+                          [1.0, 1.0, 1.0, 4.5], [1.0, 1.0, 1.0, 5.0], [1.0, 1.0, 1.0, 5.5], [1.0, 1.0, 1.0, 6.0]];
+let mut TI: [8][8]i32 = [[1, -2, 3, -4, 5, -6, 7, -8], [9, 10, 11, 12, 13, 14, 15, 16], [0, 0, 0, 0, 0, 0, 0, 1],
+                         [-1, -1, -1, -1, 2, 2, 2, 2], [100, 200, 300, 400, 500, 600, 700, 800],
+                         [7, 7, 7, 7, 7, 7, 7, 7], [-100000, 3, 99999, -7, 0, 1, 2, 3], [5, 4, 3, 2, 1, 0, -1, -2]];
+let mut W: [64]f32 = [0.0; 64];
+let mut A: [50]u8 = [0; 50];
+let mut P: [50]u8 = [0; 50];
+
+// the benchmark's board deltas: a difference of two table rows on each way in (a
+// phi of each lane), each lane times a row of weights
+fn deltas(a: *[50]u8, p: *[50]u8, acc: f32x16) f32x16 {
+    let mut s0 = acc;
+    let mut s1: f32x16 = @splat(0.0);
+    for pos in @as(usize, 0)..50 {
+        if a[pos] == p[pos] {
+            continue;
+        }
+        let vn = TA[@as(usize, @min(a[pos], 15))];
+        let vo = TA[@as(usize, @min(p[pos], 15))];
+        let mut d0 = vn[0] - vo[0];
+        let mut d1 = vn[1] - vo[1];
+        let mut d2 = vn[2] - vo[2];
+        let mut d3 = vn[3] - vo[3];
+        if (pos % 25) == 24 {
+            let bn = TB[@as(usize, @min(a[pos], 15))];
+            let bo = TB[@as(usize, @min(p[pos], 15))];
+            d0 = bn[0] - bo[0];
+            d1 = bn[1] - bo[1];
+            d2 = bn[2] - bo[2];
+            d3 = bn[3] - bo[3];
+        }
+        s0 = @fma(@as(f32x16, @splat(d0)), @load(f32x16, W[0..]), s0);
+        s1 = @fma(@as(f32x16, @splat(d1)), @load(f32x16, W[16..]), s1);
+        s0 = @fma(@as(f32x16, @splat(d2)), @load(f32x16, W[32..]), s0);
+        s1 = @fma(@as(f32x16, @splat(d3)), @load(f32x16, W[48..]), s1);
+    }
+    return s0 + s1;
+}
+
+// no phis: the lanes straight from the loads, broadcast to 8 lanes; and one
+// lane broadcast twice
+fn straight(r: usize, q: usize) f32x8 {
+    let x = TA[r];
+    let y = TB[q];
+    let e0 = x[0] * y[0];
+    let e1 = x[1] * y[1];
+    let e2 = x[2] * y[2];
+    let e3 = x[3] * y[3];
+    let w = @load(f32x8, W[8..]);
+    return (
+        ((@as(f32x8, @splat(e0)) * w) + (@as(f32x8, @splat(e1)) - w)) + (
+            @as(f32x8, @splat(e2)) * @as(f32x8, @splat(e2)))) + (@as(f32x8, @splat(e3)) + @as(f32x8, @splat(e0)));
+}
+
+// integer lanes, eight of them (with AVX2)
+fn ints(r: usize, q: usize) i32x8 {
+    let x = TI[r];
+    let y = TI[q];
+    let mut acc: i32x8 = @splat(0);
+    let k = @vec(i32x8, 1, 2, 3, 4, 5, 6, 7, 8);
+    acc = acc +% (@as(i32x8, @splat(x[0] -% y[0])) *% k);
+    acc = acc +% (@as(i32x8, @splat(x[1] -% y[1])) *% k);
+    acc = acc +% (@as(i32x8, @splat(x[2] -% y[2])) ^ k);
+    acc = acc +% (@as(i32x8, @splat(x[3] -% y[3])) *% k);
+    acc = acc +% (@as(i32x8, @splat(x[4] -% y[4])) *% k);
+    acc = acc +% (@as(i32x8, @splat(x[5] -% y[5])) & k);
+    acc = acc +% (@as(i32x8, @splat(x[6] -% y[6])) *% k);
+    acc = acc +% (@as(i32x8, @splat(x[7] -% y[7])) *% k);
+    return acc;
+}
+
+fn hash_f(h: u64, v: f32) u64 {
+    return (h *% 1000003) +% @as(u64, @bit_cast(u32, v));
+}
+
+export fn run() void {
+    for k in @as(usize, 0)..64 {
+        W[k] = (@float_from_int(f32, k) * 0.37) - 5.0;
+    }
+    let mut r: u32 = 777;
+    let mut h: u64 = 0;
+    for _it in @as(usize, 0)..200 {
+        for k in @as(usize, 0)..50 {
+            r = (r *% 1103515245) +% 12345;
+            A[k] = @truncate(u8, (r >> 16) % 20);
+            r = (r *% 1103515245) +% 12345;
+            if ((r >> 16) % 3) == 0 {
+                P[k] = @truncate(u8, (r >> 20) % 20);
+            } else {
+                P[k] = A[k];
+            }
+        }
+        let mut v: [16]f32 = [0.0; 16];
+        @store(v[0..], deltas(&A, &P, @splat(0.5)));
+        for l in @as(usize, 0)..16 {
+            h = hash_f(h, v[l]);
+        }
+    }
+    io.uint(h);  // expect: 18269347283182712348
+    let mut h2: u64 = 0;
+    for x in @as(usize, 0)..16 {
+        for y in @as(usize, 0)..16 {
+            let mut v: [8]f32 = [0.0; 8];
+            @store(v[0..], straight(x, y));
+            for l in @as(usize, 0)..8 {
+                h2 = hash_f(h2, v[l]);
+            }
+        }
+    }
+    io.uint(h2);  // expect: 17409121398806727949
+    let mut h3: u64 = 0;
+    for x in @as(usize, 0)..8 {
+        for y in @as(usize, 0)..8 {
+            let mut v: [8]i32 = [0; 8];
+            @store(v[0..], ints(x, y));
+            for l in @as(usize, 0)..8 {
+                h3 = (h3 *% 1000003) +% @as(u64, @bit_cast(u32, v[l]));
+            }
+        }
+    }
+    io.uint(h3);  // expect: 2518230545019038384
+}

@@ -7,6 +7,9 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -24,6 +27,7 @@ uint32_t axiom_test_leaks(void);
 static int result_fd = -1;
 
 const struct ax_shadow_stack *axiom_shadow_stack(void);
+void ax_stack_walk_signal(void *ucontext);  // runtime/native_host.c
 
 // Stack frames in the AXT protocol: frames separated by \x1e, fields by \x1f:
 // kind (T trap site, C call, E error return, R repeat, O omitted), file id,
@@ -83,7 +87,6 @@ void ax_on_trap(const struct ax_trap_site *site, const struct ax_trap_info *info
 // Crashes other than traps (stack overflow, faults in C code): report the
 // shadow stack, then die from the signal.
 static void on_crash(int sig, siginfo_t *si, void *uc) {
-    (void)uc;
     static char rec[32768];
     int code = 5;  // memory access out of bounds, unless the fault is at the stack's end
     pthread_attr_t attr;
@@ -97,6 +100,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc) {
         pthread_attr_destroy(&attr);
     }
     int n = snprintf(rec, sizeof rec, "CRASH\t%d\t", code);
+    ax_stack_walk_signal(uc);
     n += (int)encode_stack(rec + n, sizeof rec - (size_t)n, NULL, axiom_shadow_stack());
     if (result_fd >= 0) (void)!write(result_fd, rec, (size_t)n);
     signal(sig, SIG_DFL);
@@ -142,6 +146,12 @@ int main(int argc, char **argv) {
             dup2(out[1], 1);
             dup2(out[1], 2);
             result_fd = res[1];
+#ifdef __linux__
+            // A trap or crash ends the child without a core dump: with a piped
+            // core_pattern (as under WSL) RLIMIT_CORE is ignored, and a dump into
+            // a helper that does not read it never ends.
+            prctl(PR_SET_DUMPABLE, 0);
+#endif
             struct itimerval it = {{0, 0}, {timeout_ms / 1000, (timeout_ms % 1000) * 1000}};
             setitimer(ITIMER_REAL, &it, NULL);
             static char altstack[65536];

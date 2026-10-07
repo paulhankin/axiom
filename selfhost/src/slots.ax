@@ -1,0 +1,777 @@
+// =============================================================================
+// slots.ax - stack-slot liveness: copies between slots coalesced, and slots
+// whose lifetimes do not overlap sharing frame space (stack colouring).
+//
+// Every alloca (all are in the entry block) is a stack slot of its own. Once
+// the IR passes are done (they tell slots apart by their allocas), a slot
+// whose contents are no longer needed can hand its bytes to another:
+//
+//   - a copy of slot S into slot D, both at the same offset, after which S
+//     is not needed, before which D is not: D can be S, and the copy goes (a
+//     board swapped into a temporary and passed on is built in one slot);
+//   - slots that are never needed at the same time can share their bytes,
+//     which makes big frames smaller and keeps them in fewer cache lines.
+//
+// When is a slot needed? Its liveness is computed over the CFG, per slot:
+//   - live backwards from a read (a load, a copy's source, a by-value
+//     argument) to the writes that fill it whole (a write of part of it, or
+//     at a variable offset, leaves it live: it may be read around that part);
+//   - only where some write of it may have run before (until the first write,
+//     its bytes are not defined, and any others will do);
+//   - from where its address goes anywhere we cannot follow (passed to a call
+//     not by value, stored, compared, put in a phi ...) on, everywhere: the
+//     address may be kept and used by anything that runs later. Such an
+//     escape counts as a read and a write at that point.
+// Two slots X and Y interfere when a write of X runs where Y is live just
+// after it (or read by the same instruction: a copy between their parts must
+// not be made to overlap). Then sharing would overwrite what Y still holds;
+// slots that never interfere never hold needed values at the same time. A
+// copy of Y into X at the same offset does not make them interfere, even
+// with Y needed later (the other half of a copy split in two, say): if they
+// share their bytes it writes what is there already, and goes.
+//
+// The interference graph of the slots is coalesced along such copies first
+// (hottest first), then coloured greedily, the largest slots first; each
+// group of slots becomes the largest of them, with the strictest alignment.
+// =============================================================================
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "util.ax" as u;
+
+const MAX_SLOTS: usize = 4096;
+
+// How an instruction uses a slot (bits).
+const E_READ: u64 = 1;
+const E_WRITE: u64 = 2;
+const E_KILL: u64 = 4;  // writes all of it
+const E_ESC: u64 = 8;   // its address goes somewhere: read and written, and live from then on
+
+// The slots (numbered in their allocas' aux2: 1 + index; 0: not a slot).
+let mut slots: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                 cap: 0 };
+// The effects of the instruction being looked at: (slot << 4) | bits.
+let mut effs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+// A copy between two slots at the same offset: (destination, source) + 1, else 0.
+let mut same_dst: usize = 0;
+let mut same_src: usize = 0;
+
+// The alloca an address points into, through constant or variable offsets,
+// and the constant offset (false in `known` when it is not constant).
+fn root(p0: *mut ir.Value, off: *mut i64, known: *mut bool) *mut ir.Value {
+    let mut p = p0;
+    let mut o: i64 = 0;
+    let mut k = true;
+    while u.notnil(p) and (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+        if ir.is_cint(p.b) {
+            o +%= ir.sval(p.b);
+        } else {
+            k = false;
+        }
+        p = p.a;
+    }
+    off.* = o;
+    known.* = k;
+    return p;
+}
+
+// The slot index + 1 of address p (0 if it is not in a slot).
+fn slot_of(p: *mut ir.Value) usize {
+    if u.isnil(p) or (p.ty.kind != ir.T_PTR) {
+        return 0;
+    }
+    let mut off: i64 = 0;
+    let mut known = false;
+    let r = root(p, &mut off, &mut known);
+    if u.isnil(r) or (r.kind != ir.V_INST) or (r.op != ir.OP_ALLOCA) {
+        return 0;
+    }
+    return @int_cast(usize, r.aux2);
+}
+
+fn add(p: *mut ir.Value, bits: u64) void {
+    let s = slot_of(p);
+    if s > 0 {
+        effs.push((@as(u64, s - 1) << 4) | bits);
+    }
+}
+
+// A write of n bytes at p (n < 0: not known): all of its slot when it starts
+// at its start and covers it.
+fn add_write(p: *mut ir.Value, n: i64) void {
+    let s = slot_of(p);
+    if s == 0 {
+        return;
+    }
+    let mut off: i64 = 0;
+    let mut known = false;
+    _ = root(p, &mut off, &mut known);
+    let mut bits = E_WRITE;
+    if known and (off == 0) and (n >= @bit_cast(i64, slots.get(s - 1).aty.size)) {
+        bits |= E_KILL;
+    }
+    effs.push((@as(u64, s - 1) << 4) | bits);
+}
+
+// Fills effs with what instruction i does to slots.
+fn effects(i: *mut ir.Value) void {
+    effs.clear();
+    same_dst = 0;
+    same_src = 0;
+    let op = i.op;
+    if op == ir.OP_LOAD {
+        add(i.a, E_READ);
+    } else if op == ir.OP_STORE {
+        add(i.a, E_ESC);  // (an address stored somewhere)
+        add_write(i.b, @bit_cast(i64, i.a.ty.size));
+    } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) {
+        let mut n: i64 = -1;
+        if ir.is_cint(i.c) {
+            n = ir.sval(i.c);
+        }
+        add_write(i.a, n);
+        add(i.b, E_READ);
+        let d = slot_of(i.a);
+        let s = slot_of(i.b);
+        if (d > 0) and (s > 0) and (d != s) {
+            let mut od: i64 = 0;
+            let mut os: i64 = 0;
+            let mut kd = false;
+            let mut ks = false;
+            _ = root(i.a, &mut od, &mut kd);
+            _ = root(i.b, &mut os, &mut ks);
+            if kd and ks and (od == os) {
+                same_dst = d;
+                same_src = s;
+            }
+        }
+    } else if op == ir.OP_MEMSET {
+        let mut n: i64 = -1;
+        if ir.is_cint(i.c) {
+            n = ir.sval(i.c);
+        }
+        add_write(i.a, n);
+        add(i.b, E_ESC);
+    } else if op == ir.OP_CALL {
+        add(i.a, E_ESC);
+        for k in 0..i.xs.len {
+            let mut e: u8 = 0;
+            if (k + 1) < i.ext.len {
+                e = i.ext[k + 1];
+            }
+            if e == ir.EXT_BYVAL {
+                add(i.xs.get(k), E_READ);
+            } else if e == ir.EXT_SRET {
+                add(i.xs.get(k), E_WRITE);
+            } else if (i.a.kind == ir.V_FUNC) and not ir.is_decl(i.a.fnp) and (k < i.a.fnp.params.len) and (k < 64) and
+                      ((kept_bits(i.a.fnp) & (@as(u64, 1) << @truncate(u32, k))) == 0) {
+                add(i.xs.get(k), E_READ | E_WRITE);  // (used during the call only)
+            } else {
+                add(i.xs.get(k), E_ESC);
+            }
+        }
+    } else if (op != ir.OP_ALLOCA) and (op != ir.OP_PTRADD) {
+        // (an offset address: what is done with it is looked at there)
+        add(i.a, E_ESC);
+        add(i.b, E_ESC);
+        add(i.c, E_ESC);
+        for k in 0..i.xs.len {
+            add(i.xs.get(k), E_ESC);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parameters that keep no pointer: a function that only reads and writes
+// through a pointer parameter, compares it and passes it on to parameters
+// that keep none, cannot have it used after it returns. Passing a slot's
+// address there is a read and a write of the slot at the call, not an
+// escape. (Per function id: bit k set when parameter k may be kept.)
+// -----------------------------------------------------------------------------
+let mut kept: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+fn kept_bits(g: *mut ir.Func) u64 {
+    let k = @int_cast(usize, g.id);
+    if (g.id < 0) or (k >= kept.len) {
+        return ~@as(u64, 0);
+    }
+    return kept.get(k);
+}
+
+// The parameters value v may point into (as a mask), from derived (one
+// entry per value id).
+fn derived_from(v: *mut ir.Value, derived: []mut u64) u64 {
+    if u.isnil(v) {
+        return 0;
+    }
+    if v.kind == ir.V_PARAM {
+        if (v.cv < 64) and (v.ty.kind == ir.T_PTR) {
+            return @as(u64, 1) << @truncate(u32, v.cv);
+        }
+        return 0;
+    }
+    if (v.kind == ir.V_INST) and (v.id >= 0) and (@int_cast(usize, v.id) < derived.len) {
+        return derived[@int_cast(usize, v.id)];
+    }
+    return 0;
+}
+
+// The parameters of f that may be kept, given what is known of the others.
+fn kept_params(f: *mut ir.Func) u64 {
+    let derived = u.calloc_slice.[u64](@int_cast(usize, f.nvals) + 1);
+    let mut again = true;
+    while again {
+        again = false;
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let op = i.op;
+                let mut m: u64 = 0;
+                if op == ir.OP_PTRADD {
+                    m = derived_from(i.a, derived);
+                } else if op == ir.OP_SELECT {
+                    m = derived_from(i.b, derived) | derived_from(i.c, derived);
+                } else if op == ir.OP_PHI {
+                    for k in 0..i.xs.len {
+                        m |= derived_from(i.xs.get(k), derived);
+                    }
+                }
+                if (m != 0) and (i.id >= 0) and (@int_cast(usize, i.id) < derived.len) and
+                   ((derived[@int_cast(usize, i.id)] | m) != derived[@int_cast(usize, i.id)]) {
+                    derived[@int_cast(usize, i.id)] |= m;
+                    again = true;
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+    }
+    let mut out: u64 = 0;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let op = i.op;
+            if op == ir.OP_LOAD {
+                // (reads through it)
+            } else if op == ir.OP_STORE {
+                out |= derived_from(i.a, derived);
+            } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) {
+                // (copies through it)
+            } else if (op == ir.OP_PTRADD) or (op == ir.OP_SELECT) or (op == ir.OP_PHI) or (op == ir.OP_ICMP) {
+                // (followed above; a comparison keeps nothing)
+            } else if op == ir.OP_CALL {
+                out |= derived_from(i.a, derived);
+                let mut kg = ~@as(u64, 0);
+                let mut np: usize = 0;
+                if (i.a.kind == ir.V_FUNC) and not ir.is_decl(i.a.fnp) {
+                    kg = kept_bits(i.a.fnp);
+                    np = i.a.fnp.params.len;
+                }
+                for k in 0..i.xs.len {
+                    let mut e: u8 = 0;
+                    if (k + 1) < i.ext.len {
+                        e = i.ext[k + 1];
+                    }
+                    let keeps = (k >= np) or (k >= 64) or ((kg & (@as(u64, 1) << @truncate(u32, k))) != 0);
+                    if (e != ir.EXT_BYVAL) and (e != ir.EXT_SRET) and keeps {
+                        out |= derived_from(i.xs.get(k), derived);
+                    }
+                }
+            } else {
+                out |= derived_from(i.a, derived) | derived_from(i.b, derived) | derived_from(i.c, derived);
+                for k in 0..i.xs.len {
+                    out |= derived_from(i.xs.get(k), derived);
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    u.free_slice.[u64](derived);
+    return out;  // (parameters past the 64th: callers take them as kept)
+}
+
+/// Finds the pointer parameters of m's functions that no call can keep
+/// (for colour_slots); a function whose definition may be replaced keeps
+/// all.
+pub fn find_kept_params(m: *mut ir.Module) void {
+    kept.clear();
+    for k in 0..m.funcs.len {
+        let f = m.funcs.get(k);
+        let mut x: u64 = 0;
+        if ir.is_decl(f) or (f.linkage == ir.LINK_WEAK) or (f.linkage == ir.LINK_EXTWEAK) or
+           (f.id != @int_cast(i32, k)) {
+            x = ~@as(u64, 0);
+        }
+        kept.push(x);
+    }
+    let mut again = true;
+    while again {
+        again = false;
+        for k in 0..m.funcs.len {
+            let f = m.funcs.get(k);
+            if kept.get(k) == ~@as(u64, 0) {
+                continue;
+            }
+            let x = kept.get(k) | kept_params(f);
+            if x != kept.get(k) {
+                kept.set(k, x);
+                again = true;
+            }
+        }
+    }
+}
+
+/// Forgets what find_kept_params found.
+pub fn forget_kept_params() void {
+    kept.clear();
+}
+
+// Bit sets of the slots, W words each, in one array.
+fn has(s: []mut u64, at: usize, k: usize) bool {
+    return (s[at + (k >> 6)] & (@as(u64, 1) << @truncate(u32, k & 63))) != 0;
+}
+
+fn set(s: []mut u64, at: usize, k: usize) void {
+    s[at + (k >> 6)] |= @as(u64, 1) << @truncate(u32, k & 63);
+}
+
+fn unset(s: []mut u64, at: usize, k: usize) void {
+    s[at + (k >> 6)] &= ~(@as(u64, 1) << @truncate(u32, k & 63));
+}
+
+// Per block (index b.aux): gen, kill (backward liveness), live in and out,
+// writes and escapes in it, reached (some write may have run) and escaped
+// at its start.
+const GEN: usize = 0;
+const KILL: usize = 1;
+const LIN: usize = 2;
+const LOUT: usize = 3;
+const WR: usize = 4;
+const ES: usize = 5;
+const RIN: usize = 6;
+const EIN: usize = 7;
+const NSETS: usize = 8;
+
+/// Coalesces copies between stack slots whose source is no longer needed
+/// and lets slots that are never needed at the same time share their bytes
+/// (see above); true if it changed anything.
+pub fn colour_slots(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    slots.clear();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_ALLOCA {
+                i.aux2 = 0;
+                if (b == f.first) and (i.aty.size > 0) and (slots.len < MAX_SLOTS) {
+                    slots.push(i);
+                    i.aux2 = @bit_cast(i64, @as(u64, slots.len));
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut changed = false;
+    if slots.len >= 2 {
+        changed = colour(f);
+    }
+    for s in slots.items() {
+        s.aux2 = 0;
+    }
+    slots.clear();
+    return changed;
+}
+
+fn colour(f: *mut ir.Func) bool {
+    let n = slots.len;
+    let W = (n + 63) >> 6;
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    opt.loop_depths(f, &order);
+    let nb = order.len;
+    for k in 0..nb {
+        order.get(k).aux = @int_cast(i64, k);
+    }
+    let sets = u.calloc_slice.[u64](nb * NSETS * W);
+    // gen and kill (walking each block backwards), writes and escapes
+    for k in 0..nb {
+        let blk = order.get(k);
+        let at = k * NSETS * W;
+        let mut i = blk.last;
+        while u.notnil(i) {
+            effects(i);
+            // (kills first, then reads: an instruction reads before it writes)
+            for e in effs.items() {
+                let s = @truncate(usize, e >> 4);
+                if (e & E_KILL) != 0 {
+                    set(sets, at + (KILL * W), s);
+                    unset(sets, at + (GEN * W), s);
+                }
+                if (e & (E_WRITE | E_ESC)) != 0 {
+                    set(sets, at + (WR * W), s);
+                }
+                if (e & E_ESC) != 0 {
+                    set(sets, at + (ES * W), s);
+                }
+            }
+            for e in effs.items() {
+                let s = @truncate(usize, e >> 4);
+                if (e & (E_READ | E_ESC)) != 0 {
+                    set(sets, at + (GEN * W), s);
+                }
+            }
+            i = i.prev;
+        }
+    }
+    // liveness, backwards
+    let mut again = true;
+    while again {
+        again = false;
+        let mut k = nb;
+        while k > 0 {
+            k -= 1;
+            let blk = order.get(k);
+            let at = k * NSETS * W;
+            let t = ir.terminator(blk);
+            for j in 0..ir.succ_count(t) {
+                let s = ir.succ(t, j);
+                if s.rpo < 0 {
+                    continue;
+                }
+                let sat = @int_cast(usize, s.aux) * NSETS * W;
+                for w in 0..W {
+                    sets[at + (LOUT * W) + w] |= sets[sat + (LIN * W) + w];
+                }
+            }
+            for w in 0..W {
+                let x = sets[at + (GEN * W) + w] | (sets[at + (LOUT * W) + w] & ~sets[at + (KILL * W) + w]);
+                if x != sets[at + (LIN * W) + w] {
+                    sets[at + (LIN * W) + w] = x;
+                    again = true;
+                }
+            }
+        }
+    }
+    // reached by a write, and escaped, forwards
+    again = true;
+    while again {
+        again = false;
+        for k in 0..nb {
+            let blk = order.get(k);
+            let at = k * NSETS * W;
+            for p in blk.preds.items() {
+                if p.rpo < 0 {
+                    continue;
+                }
+                let pat = @int_cast(usize, p.aux) * NSETS * W;
+                for w in 0..W {
+                    let r = sets[at + (RIN * W) + w] | sets[pat + (RIN * W) + w] | sets[pat + (WR * W) + w];
+                    let e = sets[at + (EIN * W) + w] | sets[pat + (EIN * W) + w] | sets[pat + (ES * W) + w];
+                    if (r != sets[at + (RIN * W) + w]) or (e != sets[at + (EIN * W) + w]) {
+                        sets[at + (RIN * W) + w] = r;
+                        sets[at + (EIN * W) + w] = e;
+                        again = true;
+                    }
+                }
+            }
+        }
+    }
+    // interference: a write of X where Y is live after it (or read by it)
+    let ig = u.calloc_slice.[u64](n * W);
+    let live = u.calloc_slice.[u64](W);
+    let rd = u.calloc_slice.[u64](W);
+    let mut snaps = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
+    let mut effd = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut copies = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let r = u.calloc_slice.[u64](W);
+    let es = u.calloc_slice.[u64](W);
+    for k in 0..nb {
+        let blk = order.get(k);
+        let at = k * NSETS * W;
+        // forwards: reached and escaped after each instruction that uses a slot
+        for w in 0..W {
+            r[w] = sets[at + (RIN * W) + w];
+            es[w] = sets[at + (EIN * W) + w];
+        }
+        snaps.clear();
+        effd.clear();
+        let mut i = blk.first;
+        while u.notnil(i) {
+            effects(i);
+            if effs.len > 0 {
+                for e in effs.items() {
+                    let s = @truncate(usize, e >> 4);
+                    if (e & (E_WRITE | E_ESC)) != 0 {
+                        set(r, 0, s);
+                    }
+                    if (e & E_ESC) != 0 {
+                        set(es, 0, s);
+                    }
+                }
+                effd.push(i);
+                for w in 0..W {
+                    snaps.push(r[w]);
+                }
+                for w in 0..W {
+                    snaps.push(es[w]);
+                }
+            }
+            i = i.next;
+        }
+        // backwards: live after each
+        for w in 0..W {
+            live[w] = sets[at + (LOUT * W) + w];
+        }
+        let mut j = effd.len;
+        while j > 0 {
+            j -= 1;
+            let x = effd.get(j);
+            effects(x);
+            let sat = j * 2 * W;
+            for w in 0..W {
+                rd[w] = 0;
+            }
+            for e in effs.items() {
+                if (e & (E_READ | E_ESC)) != 0 {
+                    set(rd, 0, @truncate(usize, e >> 4));
+                }
+            }
+            if same_dst > 0 {
+                copies.push(x);
+            }
+            for e in effs.items() {
+                if (e & (E_WRITE | E_ESC)) == 0 {
+                    continue;
+                }
+                let s = @truncate(usize, e >> 4);
+                for w in 0..W {
+                    let mut m = (live[w] & snaps.get(sat + w)) | snaps.get(sat + W + w) | rd[w];
+                    if (same_dst == s + 1) and (w == ((same_src - 1) >> 6)) {
+                        // (a copy from the other at the same offset writes
+                        // what that one holds there: nothing, if they share)
+                        m &= ~(@as(u64, 1) << @truncate(u32, (same_src - 1) & 63));
+                    }
+                    if w == (s >> 6) {
+                        m &= ~(@as(u64, 1) << @truncate(u32, s & 63));
+                    }
+                    if m != 0 {
+                        ig[(s * W) + w] |= m;
+                        let mut mm = m;
+                        while mm != 0 {
+                            let y = (w << 6) + @truncate(usize, @ctz(mm));
+                            mm &= mm - 1;
+                            set(ig, y * W, s);
+                        }
+                    }
+                }
+            }
+            for e in effs.items() {
+                if (e & E_KILL) != 0 {
+                    unset(live, 0, @truncate(usize, e >> 4));
+                }
+            }
+            for w in 0..W {
+                live[w] |= rd[w];
+            }
+        }
+    }
+    u.free_slice.[u64](r);
+    u.free_slice.[u64](es);
+    u.free_slice.[u64](live);
+    u.free_slice.[u64](rd);
+    u.free_slice.[u64](sets);
+    u.free(@ptr_cast(*mut void, snaps.data));
+    u.free(@ptr_cast(*mut void, effd.data));
+    let changed = merge(f, ig, W, &mut copies);
+    u.free_slice.[u64](ig);
+    u.free(@ptr_cast(*mut void, copies.data));
+    u.free(@ptr_cast(*mut void, order.data));
+    return changed;
+}
+
+// Group of slot k (union-find over grp).
+fn find(grp: []mut usize, k0: usize) usize {
+    let mut k = k0;
+    while grp[k] != k {
+        grp[k] = grp[grp[k]];
+        k = grp[k];
+    }
+    return k;
+}
+
+// Can the groups of a and b (their representatives) share: no member of one
+// interferes with any of the other? (Each representative's row of ig holds
+// what its whole group interferes with, its members' row in mem.)
+fn can_join(ig: []mut u64, mem: []mut u64, W: usize, a: usize, b: usize) bool {
+    for w in 0..W {
+        if (ig[(a * W) + w] & mem[(b * W) + w]) != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn join(grp: []mut usize, ig: []mut u64, mem: []mut u64, W: usize, a: usize, b: usize) void {
+    grp[b] = a;
+    for w in 0..W {
+        ig[(a * W) + w] |= ig[(b * W) + w];
+        mem[(a * W) + w] |= mem[(b * W) + w];
+    }
+}
+
+fn slot_size(k: usize) u64 {
+    return slots.get(k).aty.size;
+}
+
+fn merge(f: *mut ir.Func, ig: []mut u64, W: usize, copies: *mut u.List.[*mut ir.Value]) bool {
+    let n = slots.len;
+    let grp = u.calloc_slice.[usize](n);
+    let mem = u.calloc_slice.[u64](n * W);
+    for k in 0..n {
+        grp[k] = k;
+        set(mem, k * W, k);
+    }
+    // copies, hottest (then largest) first
+    let cs = copies.items();
+    for a in 1..cs.len {
+        let mut b = a;
+        while (b > 0) and copy_before(cs[b], cs[b - 1]) {
+            let t = cs[b];
+            cs[b] = cs[b - 1];
+            cs[b - 1] = t;
+            b -= 1;
+        }
+    }
+    let mut any = false;
+    for c in cs {
+        let ga = find(grp, slot_of(c.a) - 1);
+        let gb = find(grp, slot_of(c.b) - 1);
+        if (ga != gb) and can_join(ig, mem, W, ga, gb) {
+            if slot_size(ga) >= slot_size(gb) {
+                join(grp, ig, mem, W, ga, gb);
+            } else {
+                join(grp, ig, mem, W, gb, ga);
+            }
+            any = true;
+        }
+    }
+    // then colouring: each group, largest first, into the first group made
+    // before it that it does not interfere with
+    let mut reps = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    for k in 0..n {
+        if find(grp, k) == k {
+            reps.push(k);
+        }
+    }
+    let gsize = u.calloc_slice.[u64](n);
+    for k in 0..n {
+        let g = find(grp, k);
+        gsize[g] = @max(gsize[g], slot_size(k));
+    }
+    let rs = reps.items();
+    for a in 1..rs.len {
+        let mut b = a;
+        while (b > 0) and (gsize[rs[b]] > gsize[rs[b - 1]]) {
+            let t = rs[b];
+            rs[b] = rs[b - 1];
+            rs[b - 1] = t;
+            b -= 1;
+        }
+    }
+    for a in 1..rs.len {
+        let g = rs[a];
+        for b in 0..a {
+            let h = find(grp, rs[b]);
+            if (h != g) and (find(grp, g) == g) and can_join(ig, mem, W, h, g) {
+                join(grp, ig, mem, W, h, g);
+                any = true;
+                break;
+            }
+        }
+    }
+    if any {
+        rewrite(f, grp);
+    }
+    u.free(@ptr_cast(*mut void, reps.data));
+    u.free_slice.[u64](gsize);
+    u.free_slice.[usize](grp);
+    u.free_slice.[u64](mem);
+    return any;
+}
+
+fn copy_before(a: *mut ir.Value, b: *mut ir.Value) bool {
+    if a.blk.loop_depth != b.blk.loop_depth {
+        return a.blk.loop_depth > b.blk.loop_depth;
+    }
+    return slot_size(slot_of(a.b) - 1) > slot_size(slot_of(b.b) - 1);
+}
+
+// Each group's slots become its largest one (with the strictest alignment);
+// copies between them at the same offset go.
+fn rewrite(f: *mut ir.Func, grp: []mut usize) void {
+    let n = slots.len;
+    // the largest member of each group stands for it
+    let big = u.calloc_slice.[usize](n);
+    let al = u.calloc_slice.[u64](n);
+    for k in 0..n {
+        big[k] = n;
+    }
+    for k in 0..n {
+        let g = find(grp, k);
+        let s = slots.get(k);
+        if (big[g] == n) or (s.aty.size > slots.get(big[g]).aty.size) {
+            big[g] = k;
+        }
+        al[g] = @max(al[g], @max(s.aty.align, @as(u64, s.align)));
+    }
+    for k in 0..n {
+        let g = find(grp, k);
+        let rep = slots.get(big[g]);
+        if big[g] == k {
+            if al[g] > @max(rep.aty.align, @as(u64, rep.align)) {
+                rep.align = @truncate(u32, al[g]);
+            }
+        } else {
+            ir.forward(slots.get(k), rep);
+        }
+    }
+    ir.apply_forwarding(f);
+    for k in 0..n {
+        if big[find(grp, k)] != k {
+            ir.remove_inst(slots.get(k));
+        }
+    }
+    // copies of a slot onto itself
+    let mut dead = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE) {
+                let mut od: i64 = 0;
+                let mut os: i64 = 0;
+                let mut kd = false;
+                let mut ks = false;
+                let rd = root(i.a, &mut od, &mut kd);
+                let rs = root(i.b, &mut os, &mut ks);
+                if (rd == rs) and kd and ks and (od == os) and (rd.kind == ir.V_INST) and (rd.op == ir.OP_ALLOCA) {
+                    dead.push(i);
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    for i in dead.items() {
+        ir.remove_inst(i);
+    }
+    u.free(@ptr_cast(*mut void, dead.data));
+    u.free_slice.[usize](big);
+    u.free_slice.[u64](al);
+}

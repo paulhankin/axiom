@@ -1,0 +1,187 @@
+// Idioms the native backends compute in fewer instructions (issue 0078):
+// byte reversals by swaps (bswap / rev), the last stages of a bit reversal;
+// @bitmask of compares and-ed with a constant; masks of comparisons of
+// neighbouring array elements (one vector compare); x != 0 ? 31 - clz(x)
+// : -1; or-s of disjoint bits as additions (lea); a compare repeated at
+// the start of the next block; @any_true / @all_true of 512-bit vectors of
+// every lane width.
+import "../lib/io.ax" as io;
+
+fn reverse24(mask: u32) u32 {
+    let mut x = mask;
+    x = ((x >> 1) & 0x55555555) | ((x & 0x55555555) << 1);
+    x = ((x >> 2) & 0x33333333) | ((x & 0x33333333) << 2);
+    x = ((x >> 4) & 0x0F0F0F0F) | ((x & 0x0F0F0F0F) << 4);
+    x = ((x >> 8) & 0x00FF00FF) | ((x & 0x00FF00FF) << 8);
+    x = (x >> 16) | (x << 16);
+    return x >> 8;
+}
+
+fn swap64(v: u64) u64 {
+    let mut x = v;
+    x = ((x >> 8) & 0x00FF00FF00FF00FF) | ((x & 0x00FF00FF00FF00FF) << 8);
+    x = ((x >> 16) & 0x0000FFFF0000FFFF) | ((x << 16) & 0xFFFF0000FFFF0000);
+    return (x >> 32) | (x << 32);
+}
+
+// (not a byte swap: the masks are wrong)
+fn not_swap(v: u32) u32 {
+    let x = ((v >> 8) & 0x00FF00F0) | ((v & 0x00FF00FF) << 8);
+    return (x >> 16) | (x << 16);
+}
+
+fn reversals() u64 {
+    let mut s: u64 = 0;
+    let mut x: u32 = 0x12345;
+    for i in @as(u32, 0)..200 {
+        x = (x *% 1103515245) +% 12345;
+        s = (s *% 31) +% @as(u64, reverse24(x & 0xFFFFFF));
+        s = s ^ swap64(s +% @as(u64, i));
+        s = s +% @as(u64, not_swap(x));
+    }
+    return s;
+}
+
+fn count_masked(v: i32x16, w: i32x16) u32 {
+    let m = @lanes_gt(v, w) & @vec(i32x16, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1);
+    return @popcount(@bitmask(m));
+}
+
+fn bits_masked(v: i8x16) u32 {
+    return @bitmask(@as(i8x16, @splat(-128)) & v) + (@bitmask(v & @vec(i8x16, 1, -1, 0, -128, 1, -1, 0, -128, 1, -1, 0,
+                                                                       -128, 1, -1, 0, -128)) << 16);
+}
+
+fn twos(b: *[25]u8) u32 {
+    return (
+        (@as(u32, b[0] == 2) | (@as(u32, b[1] == 2) << 1)) | (
+            (@as(u32, b[2] == 2) << 2) | (@as(u32, b[3] == 2) << 3))) | (
+                (@as(u32, b[4] == 2) << 4) | (@as(u32, b[5] == 2) << 5));
+}
+
+// from bit 3, in another order, and with other bits or-ed in
+fn above(b: *[25]u8, extra: u32) u32 {
+    return (((@as(u32, b[9] > 1) << 5) | extra) | ((@as(u32, b[7] > 1) << 3) | (@as(u32, b[8] > 1) << 4))) | (
+        @as(u32, b[10] > 1) << 6);
+}
+
+fn signed_lanes(p: *[8]i16) u64 {
+    return ((@as(u64, p[1] < -3) << 40) | (@as(u64, p[2] < -3) << 41)) | (
+        (@as(u64, p[3] < -3) << 42) | (@as(u64, p[4] < -3) << 43));
+}
+
+fn words(p: *[6]u32) u32 {
+    return ((@as(u32, p[0] != 7) | (@as(u32, p[1] != 7) << 1)) | (@as(u32, p[2] != 7) << 2)) | (
+        @as(u32, p[3] != 7) << 3);
+}
+
+fn masks() u64 {
+    let mut b: [25]u8 = [0; 25];
+    let mut s: u64 = 0;
+    for r in @as(usize, 0)..40 {
+        for i in @as(usize, 0)..25 {
+            b[i] = @truncate(u8, ((i * 7) + (r * 3)) % 5);
+        }
+        s = (s *% 131) +% @as(u64, twos(&b));
+        s = (s *% 131) +% @as(u64, above(&b, @truncate(u32, r)));
+    }
+    let mut h: [8]i16 = [0, -4, 3, -3, -100, 5, 0, 0];
+    s = s +% signed_lanes(&h);
+    h[2] = -5;
+    s = s +% (signed_lanes(&h) >> 3);
+    let mut w: [6]u32 = [7, 0, 7, 0xFFFF_FFFF, 7, 7];
+    s = (s *% 7) +% @as(u64, words(&w));
+    w[0] = 6;
+    s = (s *% 7) +% @as(u64, words(&w));
+    return s;
+}
+
+fn top(m: u32) i32 {
+    if m != 0 {
+        return 31 - @int_cast(i32, @clz(m));
+    }
+    return -1;
+}
+
+fn low(m: u64) u64 {
+    if m == 0 {
+        return 64 + 5;
+    }
+    return @ctz(m) + 5;
+}
+
+fn disjoint(x: u32, y: u32) u32 {
+    return ((x >> 2) & 0x33333333) | ((y & 0x33333333) << 2);
+}
+
+fn steps(b: *[8]u8) i32 {
+    let mut t: i32 = 0;
+    for i in @as(usize, 0)..8 {
+        let c = @as(i32, b[i]);
+        if c > 2 {
+            t += c * 3;
+        } else if c < 2 {
+            t -= 7;
+        }
+    }
+    return t;
+}
+
+fn any64(v: u8x64) i32 {
+    if @any_true(v) {
+        return 1;
+    }
+    return 0;
+}
+
+fn all16(v: i32x16) i32 {
+    if @all_true(v) {
+        return 7;
+    }
+    return 3;
+}
+
+fn anyq(v: i64x8) bool {
+    return @any_true(v);
+}
+
+fn allw(v: i16x32) bool {
+    return @all_true(v);
+}
+
+export fn run() void {
+    io.uint(reversals());                    // expect: 1793955411635272279
+    io.uint(@as(u64, reverse24(0x123456)));  // expect: 6958152
+    io.uint(swap64(0x0102030405060708));     // expect: 578437695752307201
+    let v = @vec(i32x16, 1, -1, 2, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 7);
+    io.uint(@as(u64, count_masked(v, @splat(0))));  // expect: 3
+    io.uint(@as(u64, count_masked(v, @splat(1))));  // expect: 2
+    io.uint(@as(u64, bits_masked(@vec(i8x16, -1, -1, 3, -7, 0, -2, -3, 4, 5, 6, -1, -1, -1, -1, 9, -128))));  // expect: 2821373035
+    io.uint(masks());                                       // expect: 4870151120891180437
+    io.int(@as(i64, top(0)));                               // expect: -1
+    io.int(@as(i64, top(1)));                               // expect: 0
+    io.int(@as(i64, top(0x8000_0000)));                     // expect: 31
+    io.uint(low(0));                                        // expect: 69
+    io.uint(low(0x100));                                    // expect: 13
+    io.uint(@as(u64, disjoint(0xFFFF_FFFF, 0x1234_5678)));  // expect: 2079554547
+    let mut b: [8]u8 = [0, 1, 2, 3, 4, 2, 1, 9];
+    io.int(@as(i64, steps(&b)));  // expect: 27
+    b[2] = 0;
+    io.int(@as(i64, steps(&b)));  // expect: 20
+    let mut a: u8x64 = @splat(0);
+    io.int(@as(i64, any64(a)));  // expect: 0
+    a = @replace_lane(a, 63, 1);
+    io.int(@as(i64, any64(a)));  // expect: 1
+    let mut x: i32x16 = @splat(5);
+    io.int(@as(i64, all16(x)));  // expect: 7
+    x = @replace_lane(x, 7, 0);
+    io.int(@as(i64, all16(x)));  // expect: 3
+    let mut q: i64x8 = @splat(0);
+    io.boolean(anyq(q));  // expect: false
+    q = @replace_lane(q, 3, 0x1_0000_0000);
+    io.boolean(anyq(q));  // expect: true
+    let mut h: i16x32 = @splat(-1);
+    io.boolean(allw(h));  // expect: true
+    h = @replace_lane(h, 31, 0);
+    io.boolean(allw(h));  // expect: false
+}

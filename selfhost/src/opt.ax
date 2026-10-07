@@ -504,7 +504,8 @@ fn has_side_effects(i: *ir.Value) bool {
     if op == ir.OP_INTR {
         let id = @truncate(i32, @bit_cast(i64, i.cv));
         return (id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_WAIT32) or (id == ir.IN_NOTIFY) or
-               (id == ir.IN_SET_SP) or (id == ir.IN_GET_SP) or (id == ir.IN_MEMSIZE);
+               (id == ir.IN_SET_SP) or (id == ir.IN_GET_SP) or (id == ir.IN_FRAME_ADDR) or (id == ir.IN_MEMSIZE) or
+               (id == ir.IN_CPUID) or (id == ir.IN_XGETBV) or (id == ir.IN_STORE_PARTIAL) or ir.is_prefetch(id);
     }
     return false;
 }
@@ -513,16 +514,137 @@ fn is_ci(v: *ir.Value) bool {
     return (v.kind == ir.V_CINT) or ((v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_INT));
 }
 
+// Lane k of an integer vector known at compile time (a constant vector, or
+// a splat of a constant), or nil.
+fn const_lane(v: *mut ir.Value, k: usize) *mut ir.Value {
+    if (v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_VEC) {
+        return ir.czero(v.ty.elem);
+    }
+    if v.kind == ir.V_CAGG {
+        let x = v.xs.get(k);
+        if is_ci(x) {
+            return x;
+        }
+        return vnil();
+    }
+    if (v.kind == ir.V_INST) and (v.op == ir.OP_SPLAT) and is_ci(v.a) {
+        return v.a;
+    }
+    return vnil();
+}
+
+// An integer vector operation or comparison of constant lanes, folded lane by
+// lane (the masks and point numbers of an unrolled loop over constant
+// vectors), or nil.
+fn fold_vec(i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    let at = i.a.ty;
+    if (at.kind != ir.T_VEC) or (at.elem.kind != ir.T_INT) or (at.elem.bits > 64) or (i.ty.kind != ir.T_VEC) {
+        return vnil();
+    }
+    let n = @as(usize, @bit_cast(u32, at.lanes));
+    if (n == 0) or u.isnil(const_lane(i.a, 0)) or u.isnil(const_lane(i.b, 0)) {
+        return vnil();
+    }
+    let xs = u.newn.[*mut ir.Value](n);
+    for k in 0..n {
+        let x = const_lane(i.a, k);
+        let y = const_lane(i.b, k);
+        if u.isnil(x) or u.isnil(y) {
+            return vnil();
+        }
+        if op == ir.OP_ICMP {
+            let mut r: u64 = 0;
+            if ir.cint_val(ir.icmp(FB, @truncate(i32, @bit_cast(i64, i.cv)), x, y)) != 0 {
+                r = ir.mask_bits(i.ty.elem.bits);
+            }
+            xs[k] = ir.cint(i.ty.elem, r);
+        } else {
+            let r = ir.fold_int_bin(op, at.elem, x, y);
+            if u.isnil(r) {
+                return vnil();
+            }
+            xs[k] = r;
+        }
+    }
+    return ir.cagg(i.ty, xs[0..n]);
+}
+
+fn cfp_val(v: *ir.Value, out: *mut f64) bool {
+    if v.kind == ir.V_CFP {
+        out.* = v.fv;
+        return true;
+    }
+    if (v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_FLOAT) {
+        out.* = 0.0;
+        return true;
+    }
+    return false;
+}
+
+// + - * / of two float constants, computed in the type's own precision (an
+// f32 operation in f32, rounded once as at run time; a division by a
+// constant of a count that is itself constant on a path). Not for NaNs,
+// whose payloads the target decides.
+fn fold_float_bin(i: *mut ir.Value) *mut ir.Value {
+    let mut a: f64 = 0.0;
+    let mut b: f64 = 0.0;
+    if not cfp_val(i.a, &mut a) or not cfp_val(i.b, &mut b) or (a != a) or (b != b) {
+        return vnil();
+    }
+    let op = i.op;
+    let mut r: f64 = 0.0;
+    if i.ty.bits == 32 {
+        let x = @float_cast(f32, a);
+        let y = @float_cast(f32, b);
+        let mut z: f32 = 0.0;
+        if op == ir.OP_FADD {
+            z = x + y;
+        } else if op == ir.OP_FSUB {
+            z = x - y;
+        } else if op == ir.OP_FMUL {
+            z = x * y;
+        } else {
+            z = x / y;
+        }
+        r = @float_cast(f64, z);
+    } else if i.ty.bits == 64 {
+        if op == ir.OP_FADD {
+            r = a + b;
+        } else if op == ir.OP_FSUB {
+            r = a - b;
+        } else if op == ir.OP_FMUL {
+            r = a * b;
+        } else {
+            r = a / b;
+        }
+    } else {
+        return vnil();
+    }
+    if r != r {
+        return vnil();
+    }
+    return ir.cfp(i.ty, r);
+}
+
 // A constant for i, or nil.
 fn fold(i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
     let B = FB;
     ir.at_before(B, i);
+    if ((op >= ir.OP_ADD) and (op <= ir.OP_ASHR)) or (op == ir.OP_ICMP) {
+        if (i.ty.kind == ir.T_VEC) and u.notnil(i.a) and u.notnil(i.b) {
+            return fold_vec(i);
+        }
+    }
     if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) {
         if is_ci(i.a) and is_ci(i.b) {
             return ir.fold_int_bin(op, i.ty, i.a, i.b);
         }
         return vnil();
+    }
+    if (op >= ir.OP_FADD) and (op <= ir.OP_FDIV) and (i.ty.kind == ir.T_FLOAT) {
+        return fold_float_bin(i);
     }
     if (op == ir.OP_ICMP) and (i.ty.kind == ir.T_INT) and is_ci(i.a) and is_ci(i.b) and (i.a.ty.kind == ir.T_INT) {
         return ir.icmp(B, @truncate(i32, @bit_cast(i64, i.cv)), i.a, i.b);
@@ -541,6 +663,22 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     }
     if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC)) and is_ci(i.a) and (i.ty.kind == ir.T_INT) {
         return ir.cast(B, op, i.a, i.ty);
+    }
+    if ((op == ir.OP_SITOFP) or (op == ir.OP_UITOFP)) and is_ci(i.a) and (i.a.ty.bits <= 64) and
+       (i.ty.kind == ir.T_FLOAT) {
+        return fold_int_to_float(op == ir.OP_SITOFP, i.a, i.ty);
+    }
+    if op == ir.OP_INSERTELEM {
+        return fold_insert(i);
+    }
+    if (op == ir.OP_EXTRACTELEM) and (i.a.ty.kind == ir.T_VEC) and (i.a.ty.elem.kind == ir.T_INT) and
+       (i.cv < @as(u64, @bit_cast(u32, i.a.ty.lanes))) {
+        // a lane of a constant vector (folded lane by lane above)
+        let x = const_lane(i.a, @truncate(usize, i.cv));
+        if u.notnil(x) and (x.ty == i.ty) {
+            return x;
+        }
+        return vnil();
     }
     if op == ir.OP_PHI {
         // all inputs the same (ignoring the phi itself)
@@ -580,6 +718,21 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
+// An integer constant converted to a float type, rounded once to that type
+// as the conversion at run time is (an unrolled loop's counter).
+fn fold_int_to_float(signed: bool, x: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if t.bits == 32 {
+        if signed {
+            return ir.cfp(t, @float_cast(f64, @float_from_int(f32, ir.sval(x))));
+        }
+        return ir.cfp(t, @float_cast(f64, @float_from_int(f32, ir.cint_val(x))));
+    }
+    if signed {
+        return ir.cfp(t, @float_from_int(f64, ir.sval(x)));
+    }
+    return ir.cfp(t, @float_from_int(f64, ir.cint_val(x)));
+}
+
 let mut FB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
 
 // Dominators for fold, computed when first needed in each fold_combine:
@@ -600,6 +753,33 @@ fn fold_dominates(a: *mut ir.Block, b: *mut ir.Block) bool {
     return dominates(a, b);
 }
 
+// A constant lane into a constant vector (@vec of constants is a chain of
+// these): a constant vector, its undefined lanes 0.
+fn fold_insert(i: *mut ir.Value) *mut ir.Value {
+    let a = i.a;
+    let x = i.b;
+    let t = i.ty;
+    if (t.kind != ir.T_VEC) or ((x.kind != ir.V_CINT) and (x.kind != ir.V_CFP) and (x.kind != ir.V_ZERO)) {
+        return vnil();
+    }
+    if (a.kind != ir.V_CAGG) and (a.kind != ir.V_ZERO) and (a.kind != ir.V_UNDEF) {
+        return vnil();
+    }
+    let n = @as(usize, @bit_cast(u32, t.lanes));
+    let lane = @truncate(usize, i.cv);
+    let xs = u.newn.[*mut ir.Value](n);
+    for k in 0..n {
+        if k == lane {
+            xs[k] = x;
+        } else if a.kind == ir.V_CAGG {
+            xs[k] = a.xs.get(k);
+        } else {
+            xs[k] = ir.czero(t.elem);
+        }
+    }
+    return ir.cagg(t, xs);
+}
+
 // Folds constants and trivial phis to a fixed point; with `combine`, also
 // the rewrites of combine.ax. True if anything changed.
 pub fn fold_constants(f: *mut ir.Func) bool {
@@ -613,6 +793,12 @@ pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     let mut any = false;
     let mut changed = true;
     let mut rounds: i32 = 0;
+    if combine and cb.narrow_bool_phis(f) {
+        any = true;
+    }
+    if combine and cb.sink_phi_ops(f) {
+        any = true;
+    }
     // in reverse postorder, definitions come before their uses (but for
     // phis on back edges), so a round or two reach the fixed point
     compute_preds(f);
@@ -918,6 +1104,201 @@ pub fn layout(order: *mut u.List.[*mut ir.Block]) void {
     }
     u.free(@ptr_cast(*mut void, cold.data));
     rotate_loops(order);
+    place_unlikely(order);
+}
+
+// Static branch prediction: the successor of b's conditional branch that is
+// the less likely one, or nil when neither is. An equality is predicted
+// false (most values are not the one compared with, and a pointer is rarely
+// null), except for a boolean or a test of one bit, and so is a signed
+// integer below zero. (Loops and trap paths are
+// laid out by their own rules; the register allocator's block frequencies,
+// mach.ax, weigh the same edges with mc.UNLIKELY_WEIGHT.)
+pub fn unlikely_succ(b: *ir.Block) *mut ir.Block {
+    let t = ir.terminator(b);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+        return bnil();
+    }
+    let c = t.a;
+    if (c.kind != ir.V_INST) or ((c.op != ir.OP_ICMP) and (c.op != ir.OP_FCMP)) or (c.a.ty.kind == ir.T_VEC) {
+        return bnil();
+    }
+    let p = @as(i32, @truncate(i32, @bit_cast(i64, c.cv)));
+    if c.op == ir.OP_ICMP {
+        let x = c.a;
+        if is_bool(x, 0) or ((x.kind == ir.V_INST) and (x.op == ir.OP_AND) and (one_bit(x.a) or one_bit(x.b))) {
+            return bnil();  // (a boolean, or a test of one bit: either way)
+        }
+        if p == ir.IntEQ {
+            return t.t1;
+        }
+        if p == ir.IntNE {
+            return t.t2;
+        }
+        if (c.b.kind == ir.V_CINT) and (c.a.ty.kind == ir.T_INT) {
+            let k = ir.sval(c.b);
+            if ((p == ir.IntSLT) and (k == 0)) or ((p == ir.IntSLE) and (k == -1)) {
+                return t.t1;
+            }
+            if ((p == ir.IntSGT) and (k == -1)) or ((p == ir.IntSGE) and (k == 0)) {
+                return t.t2;
+            }
+        }
+        return bnil();
+    }
+    if p == ir.RealOEQ {
+        return t.t1;
+    }
+    if p == ir.RealUNE {
+        return t.t2;
+    }
+    return bnil();
+}
+
+// Is v 0 or 1, a boolean (an i1, or one kept in a wider integer)?
+fn is_bool(v: *ir.Value, depth: i32) bool {
+    if (v.ty.kind == ir.T_INT) and (v.ty.bits == 1) {
+        return true;
+    }
+    if v.kind == ir.V_CINT {
+        return ir.cint_val(v) <= 1;
+    }
+    if (v.kind != ir.V_INST) or (depth > 3) {
+        return false;
+    }
+    if v.op == ir.OP_ZEXT {
+        return is_bool(v.a, depth + 1);
+    }
+    if v.op == ir.OP_SELECT {
+        return is_bool(v.b, depth + 1) and is_bool(v.c, depth + 1);
+    }
+    if v.op == ir.OP_PHI {
+        for k in 0..v.xs.len {
+            if not is_bool(v.xs.get(k), depth + 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+fn one_bit(m: *ir.Value) bool {
+    if m.kind == ir.V_CINT {
+        let k = ir.cint_val(m);
+        return (k & (k - 1)) == 0;
+    }
+    return (m.kind == ir.V_INST) and (m.op == ir.OP_SHL) and (m.a.kind == ir.V_CINT) and (ir.cint_val(m.a) == 1);
+}
+
+// Could control pass from a to b without a jump (b is a successor of a)?
+fn falls_into(a: *ir.Block, b: *mut ir.Block) bool {
+    let t = ir.terminator(a);
+    if u.isnil(t) {
+        return true;
+    }
+    let n = ir.succ_count(t);
+    for k in 0..n {
+        if ir.succ(t, k) == b {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An unlikely successor (unlikely_succ) that the layout put between two
+// blocks that could otherwise follow each other without a jump (its branch
+// and the likely successor, or the two arms' join) moves out of the way, to
+// the nearest place no block falls into (after a jump or a return): the
+// likely path then runs straight through, and the unlikely one takes the
+// jumps. What moves is the successor and the blocks after it that it
+// dominates, in the same loop (a few). Needs dominators; sets b.rpo.
+fn place_unlikely(order: *mut u.List.[*mut ir.Block]) void {
+    let n = order.len;
+    for k in 0..n {
+        order.get(k).aux = 0;  // 1: moves, 2: stays where it is
+    }
+    // the regions that move, [s, e) in the order, each with the block after it
+    let mut rs = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    let mut re = u.List.[usize].{ data: u.nil.[usize](), len: 0, cap: 0 };
+    for i in 0..n {
+        let b = order.get(i);
+        let us = unlikely_succ(b);
+        if (b.aux == 1) or u.isnil(us) or (us.preds.len != 1) or (us.rpo <= b.rpo) {
+            continue;
+        }
+        let s = @int_cast(usize, us.rpo);
+        let mut e = s;
+        while (e < n) and (e - s <= 8) and (order.get(e).aux == 0) and (order.get(e).loop_depth == b.loop_depth) and
+              dominates(us, order.get(e)) {
+            e += 1;
+        }
+        if (e == s) or (e - s > 8) or (e >= n) or (order.get(e).aux == 1) or (order.get(s - 1).aux == 1) or
+           not falls_into(order.get(s - 1), order.get(e)) {
+            continue;
+        }
+        for k in s..e {
+            order.get(k).aux = 1;
+        }
+        order.get(s - 1).aux = 2;
+        order.get(e).aux = 2;
+        rs.push(s);
+        re.push(e);
+    }
+    if rs.len == 0 {
+        return;
+    }
+    let all = u.calloc_slice.[*mut ir.Block](n + 1);
+    for k in 0..n {
+        all[k] = order.get(k);
+    }
+    let mut w: usize = 0;
+    for k in 0..n {
+        if all[k].aux != 1 {
+            order.set(w, all[k]);
+            w += 1;
+        }
+    }
+    order.len = w;
+    // each region at the gap nearest to where it was
+    for r in 0..rs.len {
+        for k in 0..order.len {
+            order.get(k).rpo = @int_cast(i32, k);
+        }
+        let s = @int_cast(usize, all[re.get(r)].rpo);  // (where it would go back)
+        let mut at = order.len;
+        let mut d: usize = 0;
+        while d <= 64 {
+            if (s > d) and not falls_into(order.get((s - d) - 1), order.get(s - d)) {
+                at = s - d;
+                break;
+            }
+            if (d > 0) and (s + d < order.len) and not falls_into(order.get((s + d) - 1), order.get(s + d)) {
+                at = s + d;
+                break;
+            }
+            d += 1;
+        }
+        let m = re.get(r) - rs.get(r);
+        let old = order.len;
+        for k in 0..m {
+            order.push(all[0]);
+        }
+        let mut k = old;
+        while k > at {
+            k -= 1;
+            order.set(k + m, order.get(k));
+        }
+        for j in 0..m {
+            order.set(at + j, all[rs.get(r) + j]);
+        }
+    }
+    for k in 0..order.len {
+        order.get(k).rpo = @int_cast(i32, k);
+    }
+    u.free_slice.[*mut ir.Block](all);
+    u.free(@ptr_cast(*mut void, rs.data));
+    u.free(@ptr_cast(*mut void, re.data));
 }
 
 // A loop whose header tests for the exit (a `while` loop) has its header
@@ -1014,7 +1395,9 @@ fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
 // -----------------------------------------------------------------------------
 // Constants in loops: those the target must build in a register (`needs`:
 // 64-bit immediates, floating point constants) are built once in the loop's
-// preheader, by a copy instruction, instead of at every use. Needs
+// preheader, by a copy instruction, instead of at every use. With `globals`,
+// so are the addresses of globals indexed by a variable (a pc-relative
+// operand has no index register: the address is built in one first). Needs
 // dominators and predecessors.
 // -----------------------------------------------------------------------------
 fn same_const(a: *ir.Value, b: *ir.Value) bool {
@@ -1030,7 +1413,8 @@ fn same_const(a: *ir.Value, b: *ir.Value) bool {
     return a == b;
 }
 
-pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value) bool) void {
+pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value) bool, globals: bool,
+                       needs_at: fn(*ir.Value, *ir.Value) bool) void {
     // headers, outermost first; each block's innermost header in auxp
     let mut headers = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     for i in 0..order.len {
@@ -1083,8 +1467,11 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
         }
     }
     u.free(@ptr_cast(*mut void, work.data));
-    // copies per header: (constant, copy) in the preheader
+    // copies per header: (constant, copy) in the preheader; a loop inside
+    // another uses the copies of the loops around it (whose preheaders
+    // dominate it) rather than making its own
     let mut made = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let kept = u.calloc_slice.[u.List.[*mut ir.Value]](headers.len + 1);
     for hi in 0..headers.len {
         let h = headers.get(hi);
         // the preheader: the one predecessor outside the loop, ending in br h
@@ -1105,6 +1492,13 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
             continue;
         }
         made.clear();
+        for j in 0..hi {
+            if pre.auxp == @ptr_cast(*mut void, headers.get(j)) {
+                for k in 0..kept[j].len {
+                    made.push(kept[j].get(k));
+                }
+            }
+        }
         for bi in 0..order.len {
             let b = order.get(bi);
             if b.auxp != @ptr_cast(*mut void, h) {
@@ -1113,19 +1507,189 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
             let mut i = b.first;
             while u.notnil(i) {
                 if i.op != ir.OP_PHI {
+                    if globals {
+                        if global_in_reg(i, i.a, 0) {
+                            i.a = hoisted(f, i.a, pt, &mut made, any_value);
+                        }
+                        if global_in_reg(i, i.b, 1) {
+                            i.b = hoisted(f, i.b, pt, &mut made, any_value);
+                        }
+                        if global_in_reg(i, i.c, 2) {
+                            i.c = hoisted(f, i.c, pt, &mut made, any_value);
+                        }
+                        for k in 0..i.xs.len {
+                            if global_in_reg(i, i.xs.get(k), 3) {
+                                i.xs.set(k, hoisted(f, i.xs.get(k), pt, &mut made, any_value));
+                            }
+                        }
+                    }
                     i.a = hoisted(f, i.a, pt, &mut made, needs);
                     i.b = hoisted(f, i.b, pt, &mut made, needs);
                     i.c = hoisted(f, i.c, pt, &mut made, needs);
                     for k in 0..i.xs.len {
-                        i.xs.set(k, hoisted(f, i.xs.get(k), pt, &mut made, needs));
+                        let x = i.xs.get(k);
+                        if u.notnil(x) and needs_at(i, x) {
+                            i.xs.set(k, hoisted(f, x, pt, &mut made, any_value));
+                        } else {
+                            i.xs.set(k, hoisted(f, x, pt, &mut made, needs));
+                        }
                     }
                 }
                 i = i.next;
             }
         }
+        for k in 0..made.len {
+            kept[hi].push(made.get(k));
+        }
     }
+    for hi in 0..headers.len {
+        u.free(@ptr_cast(*mut void, kept[hi].data));
+    }
+    u.free_slice.[u.List.[*mut ir.Value]](kept);
     u.free(@ptr_cast(*mut void, headers.data));
     u.free(@ptr_cast(*mut void, made.data));
+}
+
+// Is g, operand k of i (0: a, 1: b, 2: c, 3: xs), the address of a (not
+// thread-local) global that i reads from a register? Not the address a load
+// or store goes to, or one with a constant added: those are pc-relative.
+fn global_in_reg(i: *ir.Value, g: *ir.Value, k: i32) bool {
+    if u.isnil(g) or (g.kind != ir.V_GLOBAL) or g.gv.tls {
+        return false;
+    }
+    let o = i.op;
+    if ((o == ir.OP_LOAD) and (k == 0)) or ((o == ir.OP_STORE) and (k == 1)) {
+        return false;
+    }
+    return (o != ir.OP_PTRADD) or (k != 0) or not ir.is_cint(i.b);
+}
+
+fn any_value(v: *ir.Value) bool {
+    _ = v;
+    return true;
+}
+
+// (for hoist_constants: no operand needs a register for its instruction)
+pub fn no_operand_needs(i: *ir.Value, v: *ir.Value) bool {
+    _ = i;
+    _ = v;
+    return false;
+}
+
+// Constants outside loops that the target must build in a register (`needs`
+// says which, for an instruction using them), used more than once: built once, by a copy at a use whose block
+// dominates other uses, which use the copy (a 64-bit multiplier used three
+// times in a block, a floating point bound compared with in a run of
+// branches). The register allocator builds a copy of a constant again where
+// it would otherwise spill it. After hoist_constants, which takes the uses
+// in loops; needs dominators.
+struct SharedConst {
+    k: *mut ir.Value,
+    blocks: u.List.[*mut ir.Block],  // (of its uses)
+    copies: u.List.[*mut ir.Value],
+}
+
+pub fn share_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: fn(*ir.Value, *ir.Value) bool) void {
+    let mut cs = u.List.[SharedConst].{ data: u.nil.[SharedConst](), len: 0, cap: 0 };
+    for pass in @as(i32, 0)..2 {
+        // (in reverse postorder: a use in a dominating block comes first)
+        for bi in 0..order.len {
+            let b = order.get(bi);
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i.op != ir.OP_PHI) and (i.op != ir.OP_COPY) {
+                    if pass == 0 {
+                        note_const(&mut cs, i, i.a, b, needs);
+                        note_const(&mut cs, i, i.b, b, needs);
+                        note_const(&mut cs, i, i.c, b, needs);
+                        for k in 0..i.xs.len {
+                            note_const(&mut cs, i, i.xs.get(k), b, needs);
+                        }
+                    } else {
+                        i.a = shared(f, &mut cs, i.a, i, needs);
+                        i.b = shared(f, &mut cs, i.b, i, needs);
+                        i.c = shared(f, &mut cs, i.c, i, needs);
+                        for k in 0..i.xs.len {
+                            i.xs.set(k, shared(f, &mut cs, i.xs.get(k), i, needs));
+                        }
+                    }
+                }
+                i = i.next;
+            }
+        }
+        if cs.len == 0 {
+            break;
+        }
+    }
+    for k in 0..cs.len {
+        u.free(@ptr_cast(*mut void, cs.at(k).blocks.data));
+        u.free(@ptr_cast(*mut void, cs.at(k).copies.data));
+    }
+    u.free(@ptr_cast(*mut void, cs.data));
+}
+
+fn find_const(cs: *mut u.List.[SharedConst], v: *mut ir.Value) i64 {
+    for k in 0..cs.len {
+        if same_const(cs.at(k).k, v) {
+            return @int_cast(i64, k);
+        }
+    }
+    return -1;
+}
+
+fn note_const(cs: *mut u.List.[SharedConst], i: *mut ir.Value, v: *mut ir.Value, b: *mut ir.Block,
+              needs: fn(*ir.Value, *ir.Value) bool) void {
+    if u.isnil(v) or not needs(i, v) {
+        return;
+    }
+    let mut k = find_const(cs, v);
+    if k < 0 {
+        if cs.len >= 64 {
+            return;
+        }
+        cs.push(SharedConst.{ k: v, blocks: u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 },
+                              copies: u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 } });
+        k = @int_cast(i64, cs.len) - 1;
+    }
+    let c = cs.at(@int_cast(usize, k));
+    if c.blocks.len < 64 {
+        c.blocks.push(b);
+    }
+}
+
+// v, an operand of i, or a shared copy of it: one made before an earlier
+// use that dominates i, or one made here when i's block dominates another
+// use.
+fn shared(f: *mut ir.Func, cs: *mut u.List.[SharedConst], v: *mut ir.Value, i: *mut ir.Value,
+          needs: fn(*ir.Value, *ir.Value) bool) *mut ir.Value {
+    if u.isnil(v) or not needs(i, v) {
+        return v;
+    }
+    let k = find_const(cs, v);
+    if k < 0 {
+        return v;
+    }
+    let c = cs.at(@int_cast(usize, k));
+    let b = i.blk;
+    for j in 0..c.copies.len {
+        if dominates(c.copies.get(j).blk, b) {
+            return c.copies.get(j);
+        }
+    }
+    let mut n: i32 = 0;
+    for j in 0..c.blocks.len {
+        if dominates(b, c.blocks.get(j)) {
+            n += 1;
+        }
+    }
+    if n < 2 {
+        return v;
+    }
+    let cp = ir.new_inst(f, ir.OP_COPY, v.ty);
+    cp.a = v;
+    ir.insert_before(i, cp);
+    c.copies.push(cp);
+    return cp;
 }
 
 // Values `needs` picks (thread-local addresses on AArch64) are built once in
@@ -1217,4 +1781,153 @@ pub fn split_critical_edges(f: *mut ir.Func) void {
         b = b.next;
     }
     compute_preds(f);
+}
+
+// Splits the edges that leave a loop from a block with several successors
+// into a block with several predecessors (LLVM's dedicated exits), so the
+// register allocator has a place for code on the way out: reloads of values
+// live through the loop that are in memory inside it (around a call on a
+// rare path) go there rather than at the end of the loop body. A block left
+// empty costs nothing (jumps to it go where it does).
+pub fn split_loop_exits(f: *mut ir.Func) void {
+    compute_preds(f);
+    let order = dominators(f);
+    loop_depths(f, &order);
+    for oi in 0..order.len {
+        let b = order.get(oi);
+        let t = ir.terminator(b);
+        let n = ir.succ_count(t);
+        if (n < 2) or (b.loop_depth == 0) {
+            continue;
+        }
+        for k in 0..n {
+            let s = ir.succ(t, k);
+            if (s.preds.len < 2) or (s.loop_depth >= b.loop_depth) {
+                continue;
+            }
+            let mut dup = false;
+            for j in 0..k {
+                if ir.succ(t, j) == s {
+                    dup = true;
+                }
+            }
+            if dup {
+                continue;  // (both successors one block: left alone)
+            }
+            let nb = ir.append_block(f, "exit");
+            let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+            br.t1 = s;
+            ir.append_inst(nb, br);
+            replace_phi_block(s, b, nb);
+            ir.set_succ(t, k, nb);
+        }
+    }
+    u.free(@ptr_cast(*mut void, order.data));
+    compute_preds(f);
+}
+
+// -----------------------------------------------------------------------------
+// Comparisons tested in other blocks (for the native backends, before
+// instruction selection): a branch or select in block X on a comparison
+// computed in another block compares again in X, where the flags are set
+// right before the jump, instead of testing a 0/1 value kept in a register
+// (or spilled) from where it was computed. Only when the operands are
+// constants, parameters or values used elsewhere too (so likely live
+// anyway); `(x & k) == 0` is computed again with the `and`.
+// -----------------------------------------------------------------------------
+
+fn sink_operand_ok(o: *ir.Value) bool {
+    return (o.kind != ir.V_INST) or (o.aux >= 2);
+}
+
+fn sinkable_cmp(c: *ir.Value) bool {
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.ty.kind != ir.T_INT) {
+        return false;
+    }
+    let at = c.a.ty;
+    if ((at.kind != ir.T_INT) and (at.kind != ir.T_PTR)) or (at.bits > 64) {
+        return false;
+    }
+    if sink_and(c) {
+        return sink_operand_ok(c.a.a);
+    }
+    return sink_operand_ok(c.a) and sink_operand_ok(c.b);
+}
+
+// c is `(x & k) ==/!= 0` with the `and` used only there.
+fn sink_and(c: *ir.Value) bool {
+    let x = c.a;
+    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    return ((p == ir.IntEQ) or (p == ir.IntNE)) and ir.is_cint(c.b) and (ir.cint_val(c.b) == 0) and
+           (x.kind == ir.V_INST) and (x.op == ir.OP_AND) and (x.aux == 1) and ir.is_cint(x.b) and
+           (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64);
+}
+
+fn clone_inst(f: *mut ir.Func, i: *ir.Value, before: *mut ir.Value) *mut ir.Value {
+    let y = ir.new_inst(f, i.op, i.ty);
+    y.cv = i.cv;
+    y.a = i.a;
+    y.b = i.b;
+    y.src = i.src;
+    ir.insert_before(before, y);
+    return y;
+}
+
+pub fn sink_compares(f: *mut ir.Func) void {
+    // use counts (aux)
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if u.notnil(i.a) and (i.a.kind == ir.V_INST) {
+                i.a.aux += 1;
+            }
+            if u.notnil(i.b) and (i.b.kind == ir.V_INST) {
+                i.b.aux += 1;
+            }
+            if u.notnil(i.c) and (i.c.kind == ir.V_INST) {
+                i.c.aux += 1;
+            }
+            for k in 0..i.xs.len {
+                let o = i.xs.get(k);
+                if o.kind == ir.V_INST {
+                    o.aux += 1;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut any = false;
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ((i.op == ir.OP_CONDBR) or (i.op == ir.OP_SELECT)) and (i.a.kind == ir.V_INST) and (i.a.blk != b) and
+               sinkable_cmp(i.a) {
+                let c = i.a;
+                let y = clone_inst(f, c, i);
+                if sink_and(c) {
+                    y.a = clone_inst(f, c.a, y);
+                }
+                i.a = y;
+                c.aux -= 1;
+                any = true;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if any {
+        dce(f);
+    }
 }

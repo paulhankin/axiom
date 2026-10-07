@@ -22,6 +22,7 @@ export const TRAP_NAMES = [
   'trap', 'index out of bounds', 'integer overflow', 'division by zero', 'int_cast out of range',
   'memory access out of bounds', 'length precondition failed', 'invalid union tag or enum value', 'stack exhausted',
   'invalid function pointer', 'misaligned atomic access', 'expectation failed', 'memory error',
+  'processor lacks a required extension',
 ];
 
 export function trapCodeName(n) { return 'T' + String(n).padStart(4, '0'); }
@@ -696,6 +697,8 @@ export function createHost(opts = {}) {
     },
     ax_thread_stack_size: () => THREAD_STACK,
     ax_os: () => ({ linux: 1, darwin: 2, win32: 3 }[process.platform] || 0),
+    // WebAssembly cannot ask the processor (std/os/cpu.ax): no extensions.
+    ax_cpu_features: () => 0n,
     ax_cpu_count: () => (os.availableParallelism ? os.availableParallelism() : os.cpus().length),
     ax_sleep_ns(ns) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ns) / 1e6);

@@ -5,14 +5,21 @@
 // type-checked body by substituting the type arguments.
 #include "codegen.h"
 
+#include <limits.h>
+#include <math.h>
+#include <stdlib.h>
+
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/DebugInfo.h>
+#include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 
 #include "builtins.h"
 #include "diag.h"
+#include "target.h"
 
 // sema helpers reused by codegen
 bool is_place(Expr *e);
@@ -45,9 +52,16 @@ typedef struct FnInst {
     bool sret;
     const char *display;  // user-facing name, for stack traces and profiles
     struct FnInst *next;
+    uint64_t feats;  // the processor extensions its code may use
+    bool dispatch;   // @features / @multiversion: chooses a version and calls it
+    Sym key;
+    int ninl;           // inline fn: trailing parameters for its callers' call sites (INL_SITES or 0)
+    LLVMTypeRef ref_llty;  // its type without them
+    LLVMValueRef ref;   // inline fn used as a value: a function without them that calls it
 } FnInst;
 
 static SymMap inst_map;
+static uint64_t g_build_features;  // the build's extensions (--cpu, --features)
 static FnInst *pending_head, *pending_tail;
 
 typedef struct LoopCtx {
@@ -62,15 +76,90 @@ typedef struct FnState {
     int nsub;
     LLVMValueRef fn;
     LLVMValueRef *locals;
+    Expr **inits;  // the initializers of immutable locals (lane masks: is_mask)
     int nlocals;
     LLVMValueRef sret_ptr;
     Type *ret;  // concrete
     Vec(Stmt *) defers;
     Vec(LoopCtx) loops;
     LLVMBasicBlockRef entry, trap_bb;
+    LLVMValueRef *inl;  // inline fn: its callers' call-site records, innermost first (NULL: none)
+    int ninl;
+    LLVMMetadataRef di_sp;  // -g: the function's DISubprogram
+    int di_file;            // and its source file
 } FnState;
 
 static FnState *F;
+
+// ---------------------------------------------------------------------------
+// Line tables (-g, --debug-info=lines): a compile unit per object, a
+// DISubprogram per function and a DILocation per instruction, from the
+// spans that the trap sites use. LLVM keeps them through inlining
+// (DW_TAG_inlined_subroutine).
+// ---------------------------------------------------------------------------
+static LLVMDIBuilderRef DIB;
+static LLVMMetadataRef di_cu;
+static SymMap di_files;
+
+static LLVMMetadataRef di_file(int id) {
+    SourceFile *f = g_files.data[id];
+    Sym key = intern_cstr(arena_printf("%d", id));
+    LLVMMetadataRef m = symmap_get(&di_files, key);
+    if (m) return m;
+    char buf[PATH_MAX];
+    const char *full = realpath(f->path, buf) ? buf : f->display;
+    const char *slash = strrchr(full, '/');
+    const char *dir = slash ? arena_strndup(full, (size_t)(slash - full)) : ".";
+    const char *base = slash ? slash + 1 : full;
+    m = LLVMDIBuilderCreateFile(DIB, base, strlen(base), dir, strlen(dir));
+    symmap_put(&di_files, key, m);
+    return m;
+}
+
+static bool frame_traces(void);
+static void frame_tables_reset(void);
+
+static void dbg_init(void) {
+    DIB = NULL;
+    di_files = (SymMap){0};
+    frame_tables_reset();
+    // Frame-walked stack traces find inline frames through the locations'
+    // inlinedAt chains, so they need subprograms and call locations even
+    // without -g (and strip them after optimization).
+    if (!O->debug_info && !frame_traces()) return;
+    DIB = LLVMCreateDIBuilder(mod);
+    LLVMMetadataRef file = di_file(O->unit == CG_MODULE ? O->module->file->id : g_prog.root->file->id);
+    const char *producer = "axiom";
+    di_cu = LLVMDIBuilderCreateCompileUnit(DIB, LLVMDWARFSourceLanguageC, file, producer, strlen(producer),
+                                           O->opt_level > 0, "", 0, 0, "", 0, LLVMDWARFEmissionLineTablesOnly, 0,
+                                           false, false, "", 0, "", 0);
+    LLVMAddModuleFlag(mod, LLVMModuleFlagBehaviorWarning, "Debug Info Version", 18,
+                      LLVMValueAsMetadata(LLVMConstInt(T_i32, LLVMDebugMetadataVersion(), false)));
+    LLVMAddModuleFlag(mod, LLVMModuleFlagBehaviorWarning, "Dwarf Version", 13,
+                      LLVMValueAsMetadata(LLVMConstInt(T_i32, 4, false)));
+}
+
+// -g: every instruction gets a location (otherwise only calls do).
+static bool dbg_lines(void) { return DIB && O->debug_info; }
+
+// The current function's instructions are attributed to `sp` from here on.
+static void dbg_at(Span sp) {
+    if (!F || !F->di_sp || sp.file < 0 || sp.file >= g_files.len) return;
+    int l, c, el, ec;
+    span_linecol(sp, &l, &c, &el, &ec);
+    LLVMMetadataRef scope = F->di_sp;
+    if (sp.file != F->di_file) scope = LLVMDIBuilderCreateLexicalBlockFile(DIB, scope, di_file(sp.file), 0);
+    LLVMSetCurrentDebugLocation2(B, LLVMDIBuilderCreateDebugLocation(ctx, (unsigned)l, (unsigned)c, scope, NULL));
+}
+
+// Code generated into another function (a helper made on first use) has no
+// location from the current one.
+static LLVMMetadataRef dbg_suspend(void) {
+    LLVMMetadataRef loc = LLVMGetCurrentDebugLocation2(B);
+    LLVMSetCurrentDebugLocation2(B, NULL);
+    return loc;
+}
+static void dbg_resume(LLVMMetadataRef loc) { LLVMSetCurrentDebugLocation2(B, loc); }
 
 static LLVMValueRef errcode_value(uint32_t code);
 static bool type_mentions_error(Type *t);
@@ -87,6 +176,8 @@ static void gen_stmt(Stmt *s);
 static void gen_block(Stmt *b);
 static LLVMTypeRef lty(Type *t);
 static FnInst *get_inst(Decl *d, Type **gargs, int n);
+static LLVMValueRef fn_ref(FnInst *fi);
+static LLVMValueRef cpu_has_bits(uint64_t bits);
 static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
 
 // The concrete type of t in the function being generated. An enum is its
@@ -110,7 +201,7 @@ static LLVMTypeRef align_unit(int64_t a) {
     case 2: return T_i16;
     case 4: return T_i32;
     case 8: return T_i64;
-    default: return T_v128;
+    default: return a >= 32 ? LLVMVectorType(T_i32, (unsigned)(a / 4)) : T_v128;
     }
 }
 
@@ -130,7 +221,7 @@ static LLVMTypeRef lty(Type *t) {
         r = LLVMVectorType(lane, (unsigned)t->lanes);
         break;
     }
-    case TY_V128: r = T_v128; break;
+    case TY_V128: r = LLVMVectorType(T_i32, (unsigned)(t->bits / 32)); break;
     case TY_PTR:
     case TY_FN: r = T_ptr; break;
     case TY_ERROR: r = T_i16; break;
@@ -182,7 +273,14 @@ static LLVMTypeRef lty(Type *t) {
 // SSA representation: bool is i1; everything else as in memory.
 static LLVMTypeRef vty(Type *t) { return t->kind == TY_BOOL ? T_i1 : lty(t); }
 
-static bool by_ptr(Type *t) { return ty_is_aggregate(t) && type_size(t) > 32; }
+// Passed by pointer to a copy the callee only reads (results: through a
+// pointer to the caller's memory): aggregates larger than 32 bytes, and
+// 256- and 512-bit vectors, so that functions compiled for different
+// processor extensions (spec §13.4) agree on how they arrive.
+static bool by_ptr(Type *t) {
+    if (ty_is_simd(t)) return type_size(t) > 16;
+    return ty_is_aggregate(t) && type_size(t) > 32;
+}
 
 static LLVMTypeRef fn_lty(Type *fnty, bool *sret_out) {
     Type *ret = fnty->ret;
@@ -220,6 +318,9 @@ static void dead_block(void) { LLVMPositionBuilderAtEnd(B, new_bb("dead")); }
 
 // Set by setup_target: the native CPU can do @swizzle with pshufb.
 static bool g_has_ssse3;
+// Tuning added to every target-features string ("" or ",+..."): see
+// x86_tuning_features.
+static const char *g_tuning_features = "";
 
 static LLVMValueRef intrinsic(const char *name, LLVMTypeRef *tys, int ntys, LLVMValueRef *args, int nargs) {
     unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
@@ -251,7 +352,7 @@ static LLVMValueRef intr2(const char *name, LLVMValueRef a, LLVMValueRef b) {
 // ---------------------------------------------------------------------------
 enum {
     T_TRAP = 0, T_BOUNDS = 1, T_OVERFLOW = 2, T_DIVZERO = 3, T_INTCAST = 4, T_LENGTH = 6, T_UNIONTAG = 7,
-    T_STACK = 8, T_ATOMIC_ALIGN = 10, T_EXPECT = 11, T_MEMORY = 12,
+    T_STACK = 8, T_ATOMIC_ALIGN = 10, T_EXPECT = 11, T_MEMORY = 12, T_CPU = 13,
     SITE_ERR_RETURN = 254, SITE_CALL = 255,  // not traps: shadow stack records
 };
 
@@ -308,12 +409,21 @@ static const char *cur_fn_display(void) { return F && F->inst ? F->inst->display
 // A constant site record {code, file id, start, end, line, col, file, text,
 // fn, callee}. `fn` is the enclosing function; `callee` is set for call sites.
 // Codes: a trap code, SITE_CALL for a call, SITE_ERR_RETURN for an error return.
+static LLVMValueRef make_site_record(int code, Span sp, const char *fn, const char *callee);
+
 static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
     const char *fn = cur_fn_display();
     if (!callee) callee = "";
     Sym key = intern_cstr(arena_printf("%d:%d:%u:%u:%s:%s", code, sp.file, sp.start, sp.end, fn, callee));
     LLVMValueRef g = symmap_get(&site_map, key);
     if (g) return g;
+    g = make_site_record(code, sp, fn, callee);
+    symmap_put(&site_map, key, g);
+    return g;
+}
+
+static LLVMValueRef make_site_record(int code, Span sp, const char *fn, const char *callee) {
+    LLVMValueRef g;
     if (!site_ty) {
         LLVMTypeRef el[10] = {T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr};
         site_ty = LLVMStructTypeInContext(ctx, el, 10, false);
@@ -348,7 +458,6 @@ static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
     LLVMSetLinkage(g, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(g, true);
     LLVMSetAlignment(g, 8);
-    symmap_put(&site_map, key, g);
     return g;
 }
 
@@ -392,6 +501,21 @@ static LLVMValueRef stack_pointer_global(void) {
 }
 
 static bool stack_traces_on(void) { return O && O->stack_traces; }
+
+// Native x86-64 Linux keeps stack traces without a shadow stack (issue
+// 0037): code keeps frame pointers, and a table maps the return address of
+// each call to its call-site records (see frame_tables_emit); a trap or crash
+// walks the frames (runtime/native_host.c: ax_stack_walk). Profile builds,
+// which sample the stack from a signal handler, and --sanitize=address, which
+// records allocation sites, keep the shadow stack, as does WebAssembly,
+// whose stack cannot be walked.
+static bool frame_traces(void) {
+    return stack_traces_on() && !g_target.wasm && g_arch == ARCH_X64 && g_os == OS_LINUX && !O->profile &&
+           !O->sanitize_address;
+}
+
+// The shadow stack's call records (error returns use it in every mode).
+static bool ss_calls_on(void) { return stack_traces_on() && !frame_traces(); }
 
 static LLVMTypeRef ss_type(void) {
     if (!ss_ty) {
@@ -448,20 +572,220 @@ static void ss_store(LLVMValueRef v, LLVMValueRef p) {
     if (O->profile) LLVMSetVolatile(st, true);
 }
 
+// Inline functions (spec §9.5) have no call-site records of their own: a
+// call to one passes the record as an argument instead (with those of the
+// inline calls that led to the caller, innermost first, up to INL_SITES),
+// and the function pushes them only where they are needed: before it calls
+// a function that is not inline, and before it traps. Once inlined the
+// arguments are constants, so a call to an inline function costs nothing
+// at run time. (Profiling builds record every call, so that time spent in
+// inline functions is attributed to them.)
+#define INL_SITES 4
+
+static bool inline_sites_on(void) { return ss_calls_on() && !O->profile; }
+
+// Pushes call-site record `p` unless it is null (a constant once inlined).
+static void ss_push_site(LLVMValueRef ss, LLVMValueRef p) {
+    LLVMBasicBlockRef doit = new_bb("ss.inline"), next = new_bb("ss.inline.done");
+    LLVMBuildCondBr(B, LLVMBuildIsNotNull(B, p, ""), doit, next);
+    LLVMPositionBuilderAtEnd(B, doit);
+    LLVMValueRef dp = ss_field(ss, 0);
+    LLVMValueRef d = LLVMBuildLoad2(B, T_i32, dp, "");
+    ss_store(p, ss_slot(ss, 2, LLVMBuildAnd(B, d, LLVMConstInt(T_i32, SS_CAP - 1, false), "")));
+    ss_store(LLVMBuildAdd(B, d, LLVMConstInt(T_i32, 1, false), ""), dp);
+    LLVMBuildBr(B, next);
+    LLVMPositionBuilderAtEnd(B, next);
+}
+
+// In an inline function: pushes its callers' records [lo, hi), outermost first.
+static void ss_push_inline_sites(LLVMValueRef ss, int lo, int hi) {
+    for (int i = hi - 1; i >= lo; i--) ss_push_site(ss, F->inl[i]);
+}
+
 static SsFrame ss_push(const char *callee) {
     SsFrame f = {0};
-    if (!stack_traces_on() || !F) return f;
+    if (!ss_calls_on() || !F) return f;
     f.ss = ss_ptr();
     LLVMValueRef dp = ss_field(f.ss, 0);
     f.depth = LLVMBuildLoad2(B, T_i32, dp, "depth");
-    LLVMValueRef idx = LLVMBuildAnd(B, f.depth, LLVMConstInt(T_i32, SS_CAP - 1, false), "");
+    LLVMValueRef d = f.depth;
+    if (F->ninl) {
+        ss_push_inline_sites(f.ss, 0, F->ninl);
+        d = LLVMBuildLoad2(B, T_i32, dp, "depth");
+    }
+    LLVMValueRef idx = LLVMBuildAnd(B, d, LLVMConstInt(T_i32, SS_CAP - 1, false), "");
     ss_store(site_record_ex(SITE_CALL, g_cur_span, callee), ss_slot(f.ss, 2, idx));
-    ss_store(LLVMBuildAdd(B, f.depth, LLVMConstInt(T_i32, 1, false), ""), dp);
+    ss_store(LLVMBuildAdd(B, d, LLVMConstInt(T_i32, 1, false), ""), dp);
     return f;
 }
 
 static void ss_pop(SsFrame f) {
     if (f.ss) ss_store(f.depth, ss_field(f.ss, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Frame tables (frame_traces). Each call site the shadow stack would record
+// gets a DILocation of its own (in a lexical block made for it, so the
+// locations of different calls never coincide), and the call is `nomerge`,
+// so that optimization keeps one call per site and context. After
+// optimization the inlinedAt chain of each call's location names the inline
+// calls (of `inline` functions and of the ones LLVM inlined) around it, so
+// every remaining call is followed by a label and an entry in the section
+// `axiom_rets`: {label - &entry, chain - &entry.chain}, where `chain` holds
+// the call's site record (none for a trap) and then those of the inline calls
+// that led to it, innermost first, null-terminated (empty for calls that
+// record nothing). The label is the return address or a few bytes after it
+// (copies of the result may come first); runtime/native_host.c looks a
+// return address up as the first label at or after it.
+// ---------------------------------------------------------------------------
+static Sym ptr_key(void *p) { return intern_cstr(arena_printf("%p", p)); }
+
+// A call site's record, made after optimization (which deletes the records
+// that nothing refers to yet).
+typedef struct FtSite {
+    Span sp;
+    const char *fn, *callee;
+    LLVMValueRef g;
+} FtSite;
+
+typedef Vec(LLVMValueRef) ValueVec;
+
+static SymMap ft_scope_sites;  // per-call lexical block -> its FtSite
+static SymMap ft_chains;       // chain contents -> the chain global
+static int ft_nchains;
+static LLVMValueRef ft_walk_fn;  // ax_stack_walk (weak)
+
+static void frame_tables_reset(void) {
+    ft_scope_sites = (SymMap){0};
+    ft_chains = (SymMap){0};
+    ft_nchains = 0;
+    ft_walk_fn = NULL;
+}
+
+static void add_nomerge(LLVMValueRef call) {
+    unsigned k = LLVMGetEnumAttributeKindForName("nomerge", 7);
+    LLVMAddCallSiteAttribute(call, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(ctx, k, 0));
+}
+
+// Before a call to `callee` at g_cur_span: its own location (and its
+// record, for after optimization); returns the previous location, for
+// frame_call_end.
+static LLVMMetadataRef frame_call_begin(const char *callee) {
+    LLVMMetadataRef saved = LLVMGetCurrentDebugLocation2(B);
+    if (!frame_traces() || !F || !F->di_sp) return saved;
+    Span sp = g_cur_span;
+    int l = 0, c = 0, el, ec;
+    LLVMMetadataRef file = di_file(F->di_file);
+    if (sp.file >= 0 && sp.file < g_files.len) {
+        span_linecol(sp, &l, &c, &el, &ec);
+        file = di_file(sp.file);
+    }
+    LLVMMetadataRef blk = LLVMDIBuilderCreateLexicalBlock(DIB, F->di_sp, file, (unsigned)l, (unsigned)c);
+    FtSite *site = NEW(FtSite);
+    site->sp = sp;
+    site->fn = cur_fn_display();
+    site->callee = callee ? callee : "";
+    symmap_put(&ft_scope_sites, ptr_key(blk), site);
+    LLVMSetCurrentDebugLocation2(B, LLVMDIBuilderCreateDebugLocation(ctx, (unsigned)l, (unsigned)c, blk, NULL));
+    return saved;
+}
+
+static void frame_call_end(LLVMValueRef call, LLVMMetadataRef saved) {
+    if (!frame_traces() || !F || !F->di_sp) return;
+    add_nomerge(call);
+    LLVMSetCurrentDebugLocation2(B, saved);
+}
+
+static LLVMValueRef ft_site(FtSite *s) {
+    if (!s->g) s->g = make_site_record(SITE_CALL, s->sp, s->fn, s->callee);
+    return s->g;
+}
+
+// The chain global for these records (made once; all of them are listed in
+// `used`, since only assembly refers to them).
+static LLVMValueRef frame_chain(LLVMValueRef *sites, int n, ValueVec *used) {
+    CharVec key = {0};
+    for (int i = 0; i < n; i++) {
+        const char *k = arena_printf("%p,", (void *)sites[i]);
+        while (*k) vec_push(key, *k++);
+    }
+    vec_push(key, 0);
+    Sym ks = intern_cstr(key.data);
+    free(key.data);
+    LLVMValueRef g = symmap_get(&ft_chains, ks);
+    if (g) return g;
+    LLVMValueRef *vals = NEWN(LLVMValueRef, n + 1);
+    for (int i = 0; i < n; i++) vals[i] = sites[i];
+    vals[n] = LLVMConstNull(T_ptr);
+    LLVMTypeRef t = LLVMArrayType2(T_ptr, (uint64_t)n + 1);
+    // named, and internal rather than private: the table's inline assembly
+    // refers to it by name
+    g = LLVMAddGlobal(mod, t, arena_printf("axiom.chain.%d", ft_nchains++));
+    LLVMSetInitializer(g, LLVMConstArray2(T_ptr, vals, (uint64_t)n + 1));
+    LLVMSetLinkage(g, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(g, true);
+    LLVMSetAlignment(g, 8);
+    symmap_put(&ft_chains, ks, g);
+    vec_push(*used, g);
+    return g;
+}
+
+static void frame_tables_emit(void) {
+    if (!frame_traces()) return;
+    ValueVec used = {0}, chain = {0};
+    LLVMTypeRef asm_ty = LLVMFunctionType(T_void, NULL, 0, false);
+    LLVMMetadataRef saved_loc = LLVMGetCurrentDebugLocation2(B);
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+            for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
+                if (!LLVMIsACallInst(in)) continue;
+                LLVMValueRef callee = LLVMGetCalledValue(in);
+                if (LLVMIsAInlineAsm(callee)) continue;
+                if (LLVMIsAFunction(callee) && LLVMGetIntrinsicID(callee)) continue;
+                // Every call gets an entry, with an empty chain if it records
+                // nothing, so that a return address never finds the label of
+                // a later call.
+                LLVMMetadataRef loc = LLVMInstructionGetDebugLoc(in);
+                chain.len = 0;
+                if (loc) {
+                    FtSite *own = symmap_get(&ft_scope_sites, ptr_key(LLVMDILocationGetScope(loc)));
+                    if (own) vec_push(chain, ft_site(own));
+                    for (LLVMMetadataRef at = LLVMDILocationGetInlinedAt(loc); at; at = LLVMDILocationGetInlinedAt(at)) {
+                        FtSite *s = symmap_get(&ft_scope_sites, ptr_key(LLVMDILocationGetScope(at)));
+                        if (s) vec_push(chain, ft_site(s));
+                    }
+                }
+                LLVMValueRef g = frame_chain(chain.data, chain.len, &used);
+                size_t n;
+                const char *gname = LLVMGetValueName2(g, &n);
+                const char *text = arena_printf(".Laxr${:uid}:\n"
+                                                "\t.pushsection axiom_rets,\"aw\",@progbits\n"
+                                                "\t.balign 8\n"
+                                                "\t.quad .Laxr${:uid}-.\n"
+                                                "\t.quad %s-.\n"
+                                                "\t.popsection",
+                                                gname);
+                LLVMValueRef ia = LLVMGetInlineAsm(asm_ty, (char *)text, strlen(text), "", 0, true, false,
+                                                   LLVMInlineAsmDialectATT, false);
+                LLVMValueRef next = LLVMGetNextInstruction(in);
+                LLVMPositionBuilderBefore(B, next);
+                LLVMSetCurrentDebugLocation2(B, NULL);
+                LLVMBuildCall2(B, asm_ty, ia, NULL, 0, "");
+                in = LLVMGetNextInstruction(in);  // (the label)
+            }
+        }
+    }
+    if (used.len) {
+        // referenced only from assembly: keep them
+        LLVMTypeRef t = LLVMArrayType2(T_ptr, (uint64_t)used.len);
+        LLVMValueRef u = LLVMAddGlobal(mod, t, "llvm.compiler.used");
+        LLVMSetInitializer(u, LLVMConstArray2(T_ptr, used.data, (uint64_t)used.len));
+        LLVMSetLinkage(u, LLVMAppendingLinkage);
+        LLVMSetSection(u, "llvm.metadata");
+    }
+    free(used.data);
+    free(chain.data);
+    LLVMSetCurrentDebugLocation2(B, saved_loc);
 }
 
 // Appends an error-return record when `code` (an error code, i16) is nonzero.
@@ -493,6 +817,7 @@ static void etrace_clear(void) {
 }
 
 static void call_trap_site(LLVMValueRef site) {
+    if (F && F->ninl) ss_push_inline_sites(ss_ptr(), 0, F->ninl);  // (a trap does not return)
     if (!trap_fn) {
         trap_fnty = LLVMFunctionType(T_void, &T_ptr, 1, false);
         trap_fn = LLVMAddFunction(mod, "axiom.trap", trap_fnty);
@@ -503,6 +828,7 @@ static void call_trap_site(LLVMValueRef site) {
             LLVMAddAttributeAtIndex(trap_fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(ctx, k, 0));
         }
         LLVMBasicBlockRef cur = LLVMGetInsertBlock(B);
+        LLVMMetadataRef loc = dbg_suspend();
         LLVMValueRef fn = trap_fn;
         LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
         LLVMValueRef sp = LLVMGetParam(fn, 0);
@@ -519,6 +845,22 @@ static void call_trap_site(LLVMValueRef site) {
             LLVMBuildCondBr(B, has, call_bb, done_bb);
             LLVMPositionBuilderAtEnd(B, call_bb);
             LLVMValueRef args[3] = {sp, trap_info_global(), stack_traces_on() ? ss_ptr() : LLVMConstNull(T_ptr)};
+            if (frame_traces()) {
+                // the frames, from this function's own (its return address is the trap's)
+                LLVMTypeRef wty = LLVMFunctionType(T_void, &T_ptr, 1, false);
+                ft_walk_fn = LLVMAddFunction(mod, "ax_stack_walk", wty);
+                LLVMSetLinkage(ft_walk_fn, LLVMExternalWeakLinkage);
+                LLVMBasicBlockRef walk_bb = LLVMAppendBasicBlockInContext(ctx, fn, "walk");
+                LLVMBasicBlockRef hook_bb = LLVMAppendBasicBlockInContext(ctx, fn, "hook.call");
+                LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntNE, ft_walk_fn, LLVMConstNull(T_ptr), ""), walk_bb, hook_bb);
+                LLVMPositionBuilderAtEnd(B, walk_bb);
+                LLVMValueRef zero = LLVMConstInt(T_i32, 0, false);
+                LLVMTypeRef pt = T_ptr;
+                LLVMValueRef fa = intrinsic("llvm.frameaddress", &pt, 1, &zero, 1);
+                LLVMBuildCall2(B, wty, ft_walk_fn, &fa, 1, "");
+                LLVMBuildBr(B, hook_bb);
+                LLVMPositionBuilderAtEnd(B, hook_bb);
+            }
             LLVMBuildCall2(B, hty, trap_hook, args, 3, "");
             LLVMBuildBr(B, done_bb);
             LLVMPositionBuilderAtEnd(B, done_bb);
@@ -526,8 +868,10 @@ static void call_trap_site(LLVMValueRef site) {
         intrinsic("llvm.trap", NULL, 0, NULL, 0);
         LLVMBuildUnreachable(B);
         LLVMPositionBuilderAtEnd(B, cur);
+        dbg_resume(loc);
     }
-    LLVMBuildCall2(B, trap_fnty, trap_fn, &site, 1, "");
+    LLVMValueRef call = LLVMBuildCall2(B, trap_fnty, trap_fn, &site, 1, "");
+    if (frame_traces() && F && F->di_sp) add_nomerge(call);
 }
 
 // A block that traps with `code` at the current source span.
@@ -557,16 +901,19 @@ static void emit_trap(int code) {
 
 static LLVMValueRef alloca_in_entry(LLVMTypeRef t, const char *name) {
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(B);
+    LLVMMetadataRef loc = LLVMGetCurrentDebugLocation2(B);
     LLVMValueRef term = LLVMGetBasicBlockTerminator(F->entry);
     if (term) LLVMPositionBuilderBefore(B, term);
     else LLVMPositionBuilderAtEnd(B, F->entry);
     LLVMValueRef a = LLVMBuildAlloca(B, t, name);
     LLVMPositionBuilderAtEnd(B, cur);
+    dbg_resume(loc);
     return a;
 }
 
+// A temporary only the expression that makes it can reach (see in_mem).
 static LLVMValueRef temp_alloca(Type *t) {
-    LLVMValueRef a = alloca_in_entry(lty(t), "tmp");
+    LLVMValueRef a = alloca_in_entry(lty(t), "agg.tmp");
     LLVMSetAlignment(a, (unsigned)type_align(t));
     return a;
 }
@@ -580,49 +927,109 @@ static LLVMValueRef from_mem(Type *t, LLVMValueRef v) {
     return v;
 }
 
+// Aggregates larger than two registers are never SSA values (issue 0040):
+// LLVM's instruction selection takes a load, store or insertvalue chain of
+// one apart into a node per scalar, and its combiner is quadratic in them
+// (a 20k-line program took minutes at -O2). Such a value is instead the
+// address of memory holding it (or an LLVM constant): copied with
+// memcpy/memmove, built in place by GEPs and stores, and passed and returned
+// by pointer (by_ptr) or loaded only at a call boundary. An address may be
+// that of a place (a local, a field, ...): it is read at once, and copied
+// where it must outlive the evaluation of other code (call arguments, return
+// values). Temporaries (temp_alloca) are named "agg.tmp" (no Axiom name has
+// a dot): only the expression that made one can reach it.
+static bool in_mem(Type *t) { return ty_is_aggregate(t) && type_size(t) > 16; }
+static bool is_addr(Type *t, LLVMValueRef v) { return v && in_mem(t) && LLVMTypeOf(v) == T_ptr; }
+
+static bool is_fresh(LLVMValueRef v) {
+    if (!LLVMIsAAllocaInst(v)) return false;
+    size_t n;
+    const char *name = LLVMGetValueName2(v, &n);
+    return n >= 7 && !strncmp(name, "agg.tmp", 7);
+}
+
+static unsigned known_align(LLVMValueRef p) {
+    if (LLVMIsAAllocaInst(p) || LLVMIsAGlobalVariable(p)) return LLVMGetAlignment(p);
+    return 1;
+}
+
+// A read-only global holding a constant aggregate.
+static LLVMValueRef const_global(LLVMValueRef v) {
+    LLVMValueRef g = LLVMAddGlobal(mod, LLVMTypeOf(v), "aggregate.const");
+    LLVMSetInitializer(g, v);
+    LLVMSetGlobalConstant(g, true);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr);
+    LLVMSetAlignment(g, LLVMABIAlignmentOfType(TD, LLVMTypeOf(v)));
+    return g;
+}
+
 // align: 0 = natural (known-aligned storage), 1 = unknown (through pointers)
+// An in-memory aggregate "loads" as its address.
 static LLVMValueRef load(Type *t, LLVMValueRef p, bool unaligned) {
+    if (in_mem(t)) return p;
     LLVMValueRef v = LLVMBuildLoad2(B, lty(t), p, "");
     if (unaligned) LLVMSetAlignment(v, 1);
     return from_mem(t, v);
 }
-// Aggregates are first-class values here, but LLVM's instruction selection
-// takes a large one apart element by element (and fails on very large ones):
-// zero it with memset, and copy a constant one (from a global) or one just
-// loaded from memory with memmove.
-#define BIG_AGGREGATE 256
 
 static void store(Type *t, LLVMValueRef v, LLVMValueRef p, bool unaligned) {
-    if (ty_is_aggregate(t) && type_size(t) > BIG_AGGREGATE) {
+    if (in_mem(t)) {
         LLVMValueRef size = usz(type_size(t));
+        unsigned da = unaligned ? 1 : (unsigned)type_align(t);
+        if (is_addr(t, v)) {
+            if (v == p) return;
+            // a temporary cannot overlap the destination; a place can
+            if (is_fresh(v)) LLVMBuildMemCpy(B, p, da, v, known_align(v), size);
+            else LLVMBuildMemMove(B, p, da, v, known_align(v), size);
+            return;
+        }
+        if (LLVMIsUndef(v)) return;  // (a diverging expression's placeholder)
         if (LLVMIsConstant(v) && LLVMIsNull(v)) {
-            LLVMBuildMemSet(B, p, LLVMConstInt(T_i8, 0, false), size, 1);
+            LLVMBuildMemSet(B, p, LLVMConstInt(T_i8, 0, false), size, da);
             return;
         }
         if (LLVMIsConstant(v)) {
-            LLVMValueRef g = LLVMAddGlobal(mod, LLVMTypeOf(v), "aggregate.const");
-            LLVMSetInitializer(g, v);
-            LLVMSetGlobalConstant(g, true);
-            LLVMSetLinkage(g, LLVMPrivateLinkage);
-            LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr);
-            LLVMBuildMemMove(B, p, 1, g, 1, size);
+            LLVMValueRef g = const_global(v);
+            LLVMBuildMemCpy(B, p, da, g, known_align(g), size);
             return;
         }
-        if (LLVMIsALoadInst(v) && !LLVMGetFirstUse(v)) {
-            LLVMValueRef src = LLVMGetOperand(v, 0);
-            LLVMInstructionEraseFromParent(v);
-            LLVMBuildMemMove(B, p, 1, src, 1, size);
-            return;
-        }
+        // an SSA value: the result of a call returning one in registers
     }
     LLVMValueRef s = LLVMBuildStore(B, to_mem(t, v), p);
     if (unaligned) LLVMSetAlignment(s, 1);
 }
 
+// Memory holding v, to read from (not a copy if v is already in memory).
 static LLVMValueRef spill(Type *t, LLVMValueRef v) {
+    if (is_addr(t, v)) return v;
+    if (in_mem(t) && LLVMIsConstant(v) && !LLVMIsUndef(v)) return const_global(v);
     LLVMValueRef a = temp_alloca(t);
     store(t, v, a, false);
     return a;
+}
+
+// A copy of v that nothing else can change (for a by_ptr argument).
+static LLVMValueRef fresh_copy(Type *t, LLVMValueRef v) {
+    if (is_addr(t, v) && is_fresh(v)) return v;
+    if (!is_addr(t, v) && LLVMIsConstant(v) && !LLVMIsUndef(v)) return const_global(v);
+    LLVMValueRef a = temp_alloca(t);
+    store(t, v, a, false);
+    return a;
+}
+
+// v as an SSA value (where one is passed or returned in registers).
+static LLVMValueRef as_val(Type *t, LLVMValueRef v) {
+    if (!is_addr(t, v)) return v;
+    LLVMValueRef r = LLVMBuildLoad2(B, lty(t), v, "");
+    LLVMSetAlignment(r, known_align(v));
+    return r;
+}
+
+// Field `idx` (of type ft) of an aggregate value of type st.
+static LLVMValueRef field_value(Type *st, LLVMValueRef v, unsigned idx, Type *ft) {
+    if (is_addr(st, v)) return load(ft, LLVMBuildStructGEP2(B, lty(st), v, idx, ""), !is_fresh(v));
+    return from_mem(ft, LLVMBuildExtractValue(B, v, idx, ""));
 }
 
 static LLVMValueRef local_ptr(Local *l) {
@@ -664,8 +1071,6 @@ static LLVMValueRef const_slice(LLVMValueRef ptr, int64_t len) {
 }
 
 static SymMap global_vals;  // Decl* name -> LLVMValueRef (keyed by arena string of pointer)
-
-static Sym ptr_key(void *p) { return intern_cstr(arena_printf("%p", p)); }
 
 static LLVMValueRef global_ref(Decl *d);
 
@@ -728,10 +1133,10 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
             LLVMValueRef el[2] = {tag, LLVMConstNull(LLVMStructGetTypeAtIndex(ut, 1))};
             return LLVMConstNamedStruct(ut, el, 2);
         }
-        if (e->op == FK_DECL && e->decl && e->decl->kind == D_FN) return get_inst(e->decl, NULL, 0)->fn;
+        if (e->op == FK_DECL && e->decl && e->decl->kind == D_FN) return fn_ref(get_inst(e->decl, NULL, 0));
         break;
     case E_IDENT:
-        if (e->decl && e->decl->kind == D_FN) return get_inst(e->decl, NULL, 0)->fn;
+        if (e->decl && e->decl->kind == D_FN) return fn_ref(get_inst(e->decl, NULL, 0));
         if (e->decl && e->decl->kind == D_HOST_FN) return get_inst(e->decl, NULL, 0)->fn;
         break;
     case E_BUILTIN:
@@ -990,12 +1395,71 @@ static bool type_mentions_error(Type *t) {
 // ---------------------------------------------------------------------------
 // Function instances
 // ---------------------------------------------------------------------------
-static FnInst *get_inst(Decl *d, Type **gargs, int n) {
+static void add_str_fn_attr(LLVMValueRef fn, const char *k, const char *v) {
+    LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                            LLVMCreateStringAttribute(ctx, k, (unsigned)strlen(k), v, (unsigned)strlen(v)));
+}
+
+// LLVM 18 takes gathers as fast on every AVX-512 processor and vectorizes
+// loops of table loads with them, but Skylake-SP to Tiger Lake run them in
+// microcode (the Gather Data Sampling mitigation, which a guest cannot see):
+// 25-31 cycles a gather against about one a load. the benchmark's move generation
+// hashes its board with twelve (issue 0091). LLVM itself marks no processor
+// so, not even LLVM 21 (rustc 1.94 with target-cpu=cascadelake still gathers
+// in an indexed loop, and only +prefer-no-gather stops it); its newer cost
+// model merely keeps that hash scalar. So the processors with the
+// mitigation (the host's name, or a --cpu preset) are told here to prefer
+// the loads. Axiom has no gather of its own: only the vectorizers are
+// affected.
+static const char *x86_tuning_features(const char *cpu) {
+    static const char *const gds[] = {"skylake", "skylake-avx512", "cascadelake", "cooperlake", "cannonlake",
+                                      "icelake-client", "icelake-server", "rocketlake", "tigerlake", "kabylake",
+                                      "coffeelake", "whiskeylake", "cometlake", "amberlake"};
+    for (size_t i = 0; i < sizeof gds / sizeof *gds; i++)
+        if (!strcmp(cpu, gds[i])) return ",+prefer-no-gather,+prefer-no-scatter";
+    return "";
+}
+
+// A function whose extensions differ from the target's (a version of an
+// @features or @multiversion function, or std/os/cpu.ax, compiled for the
+// bare architecture) says so to LLVM.
+static void set_fn_features(LLVMValueRef fn, uint64_t feats) {
+    if (g_target.wasm || feats == g_build_features) return;
+    add_str_fn_attr(fn, "target-features", arena_printf("%s%s", llvm_features(feats), g_tuning_features));
+    if (feats == 0) add_str_fn_attr(fn, "target-cpu", g_arch == ARCH_X64 ? "x86-64" : "generic");
+}
+
+// The extensions a function's code may use, without an attribute: the
+// build's (not g_features, which is the current function's while a body is
+// generated).
+static uint64_t base_features(Decl *d) { return baseline_fn(d) ? 0 : g_build_features; }
+
+static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats);
+
+static FnInst *get_inst(Decl *d, Type **gargs, int n) { return get_inst_feats(d, gargs, n, base_features(d)); }
+
+// The callee of a direct call from the current function. An inline function
+// is compiled with its caller's extensions (spec §9.5): one instance per set
+// of extensions it is called with, so that @target_has, and lowering that
+// depends on extensions, answer for the caller (a version of an @features or
+// @multiversion function) into which it is inlined.
+static FnInst *get_callee(Decl *d, Type **gargs, int n) {
+    if (d->kind == D_FN && d->is_inline) return get_inst_feats(d, gargs, n, g_features);
+    return get_inst(d, gargs, n);
+}
+
+static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
     CharVec key = {0};
     const char *p = arena_printf("%p", (void *)d);
     while (*p) vec_push(key, *p++);
     for (int i = 0; i < n; i++) {
         const char *s = arena_printf(",%d", gargs[i]->id);
+        while (*s) vec_push(key, *s++);
+    }
+    // (an inline function compiled for its caller's extensions)
+    bool own_feats = feats != base_features(d);
+    if (own_feats) {
+        const char *s = arena_printf("#f%llx", (unsigned long long)feats);
         while (*s) vec_push(key, *s++);
     }
     Sym k = intern(key.data, (size_t)key.len);
@@ -1006,6 +1470,9 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
     fi->decl = d;
     fi->gargs = gargs;
     fi->ngargs = n;
+    fi->key = k;
+    fi->feats = feats;
+    fi->dispatch = d->kind == D_FN && d->attr != ATTR_NONE;
     for (int i = 0; i < n; i++)
         if (gargs[i]->has_params) internal_error("generic instance with unsubstituted arguments");
     fi->fnty = n ? type_subst(d->type, d->all_gparams, gargs, n) : d->type;
@@ -1049,6 +1516,11 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
             }
             vec_push(nb, ']');
         }
+        if (own_feats) {
+            const char *sfx = features_string(feats & ~g_build_features);
+            const char *o = arena_printf(".%s", *sfx ? sfx : "base");
+            while (*o) vec_push(nb, *o++);
+        }
         vec_push(nb, 0);
         name = arena_strndup(nb.data, strlen(nb.data));
         free(nb.data);
@@ -1059,8 +1531,23 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         LLVMGetParamTypes(fi->llty, pts);
         fi->llty = LLVMFunctionType(LLVMGetReturnType(fi->llty), pts, np, true);
     }
+    fi->ref_llty = fi->llty;
+    if (d->kind == D_FN && d->is_inline && inline_sites_on()) {
+        // trailing parameters: the callers' call-site records (see INL_SITES)
+        unsigned np = LLVMCountParamTypes(fi->llty);
+        LLVMTypeRef *pts = NEWN(LLVMTypeRef, np + INL_SITES);
+        LLVMGetParamTypes(fi->llty, pts);
+        for (int i = 0; i < INL_SITES; i++) pts[np + i] = T_ptr;
+        fi->llty = LLVMFunctionType(LLVMGetReturnType(fi->llty), pts, np + INL_SITES, false);
+        fi->ninl = INL_SITES;
+    }
     LLVMValueRef existing = d->kind == D_HOST_FN ? LLVMGetNamedFunction(mod, name) : NULL;
     fi->fn = existing ? existing : LLVMAddFunction(mod, name, fi->llty);
+    if (d->kind == D_FN && d->is_inline) {
+        unsigned k = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+        LLVMAddAttributeAtIndex(fi->fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(ctx, k, 0));
+    }
+    if (d->kind == D_FN) set_fn_features(fi->fn, fi->feats);
     add_ext_attrs(fi->fn, fi->fnty, fi->sret, false);
     if (d->kind == D_HOST_FN) {
         if (d->extern_c) {
@@ -1078,10 +1565,11 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
         // a non-generic function is defined (externally visible) by its own
         // module's unit and only declared elsewhere; generic instances are
         // defined link-once by every unit that uses them.
+        // Inline functions are defined (internal) by every unit that calls them.
         bool define = true;
         if (O->unit == CG_LINK) define = false;
-        else if (O->unit == CG_MODULE && n == 0) define = d->module == O->module;
-        if (O->unit == CG_WHOLE && !d->is_export) LLVMSetLinkage(fi->fn, LLVMInternalLinkage);
+        else if (O->unit == CG_MODULE && n == 0) define = d->module == O->module || d->is_inline;
+        if ((O->unit == CG_WHOLE && !d->is_export) || d->is_inline) LLVMSetLinkage(fi->fn, LLVMInternalLinkage);
         else if (define && n > 0) LLVMSetLinkage(fi->fn, LLVMLinkOnceODRLinkage);
         bool asan_main = O->sanitize_address && !g_test_mode && !strcmp(d->name, "main");
         if (define && d->is_export && g_target.wasm && !asan_main)
@@ -1096,6 +1584,34 @@ static FnInst *get_inst(Decl *d, Type **gargs, int n) {
     }
     symmap_put(&inst_map, k, fi);
     return fi;
+}
+
+// A function as a value. An inline function taking its callers' call sites
+// (INL_SITES) is called through a function with the ordinary signature,
+// into which it is inlined.
+static LLVMValueRef fn_ref(FnInst *fi) {
+    if (!fi->ninl) return fi->fn;
+    if (fi->ref) return fi->ref;
+    size_t len;
+    const char *name = LLVMGetValueName2(fi->fn, &len);
+    fi->ref = LLVMAddFunction(mod, arena_printf("%s.ref", name), fi->ref_llty);
+    LLVMSetLinkage(fi->ref, LLVMInternalLinkage);
+    add_ext_attrs(fi->ref, fi->fnty, fi->sret, false);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
+    LLVMMetadataRef loc = dbg_suspend();
+    LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fi->ref, "entry"));
+    unsigned np = LLVMCountParams(fi->ref);
+    LLVMValueRef *av = NEWN(LLVMValueRef, np + INL_SITES);
+    for (unsigned i = 0; i < np; i++) av[i] = LLVMGetParam(fi->ref, i);
+    for (int i = 0; i < fi->ninl; i++) av[np + i] = LLVMConstNull(T_ptr);
+    LLVMValueRef r = LLVMBuildCall2(B, fi->llty, fi->fn, av, np + (unsigned)fi->ninl, "");
+    add_ext_attrs(r, fi->fnty, fi->sret, true);
+    if (LLVMGetTypeKind(LLVMGetReturnType(fi->ref_llty)) == LLVMVoidTypeKind) LLVMBuildRetVoid(B);
+    else LLVMBuildRet(B, r);
+    if (saved) LLVMPositionBuilderAtEnd(B, saved);
+    else LLVMClearInsertionPosition(B);
+    dbg_resume(loc);
+    return fi->ref;
 }
 
 // C ABI detail: integers narrower than 32 bits and bool are passed and
@@ -1141,19 +1657,30 @@ static void emit_defers(int down_to) {
     }
 }
 
+// v: NULL when the result is already in F->sret_ptr
 static void emit_ret(LLVMValueRef v) {
     if (F->sret_ptr) {
-        store(F->ret, v, F->sret_ptr, false);
+        if (v) store(F->ret, v, F->sret_ptr, false);
         LLVMBuildRetVoid(B);
     } else if (F->ret->kind == TY_VOID) {
         LLVMBuildRetVoid(B);
     } else {
-        LLVMBuildRet(B, v);
+        LLVMBuildRet(B, as_val(F->ret, v));
     }
 }
 
+static LLVMValueRef errunion_code(Type *eu, LLVMValueRef v) { return field_value(eu, v, 0, t_error); }
+
 static LLVMValueRef errunion_value(Type *eu, LLVMValueRef code, LLVMValueRef payload) {
     LLVMTypeRef t = lty(eu);
+    if (in_mem(eu)) {
+        LLVMValueRef tmp = temp_alloca(eu);
+        LLVMBuildStore(B, code, LLVMBuildStructGEP2(B, t, tmp, 0, ""));
+        LLVMValueRef pp = LLVMBuildStructGEP2(B, t, tmp, 1, "");
+        if (payload) store(eu->elem, payload, pp, false);
+        else LLVMBuildMemSet(B, pp, LLVMConstInt(T_i8, 0, false), usz(type_size(eu->elem)), (unsigned)type_align(eu->elem));
+        return tmp;
+    }
     LLVMValueRef v = LLVMGetUndef(t);
     v = LLVMBuildInsertValue(B, v, code, 0, "");
     if (eu->elem->kind != TY_VOID)
@@ -1161,12 +1688,21 @@ static LLVMValueRef errunion_value(Type *eu, LLVMValueRef code, LLVMValueRef pay
     return v;
 }
 
+static void gen_into(Expr *e, LLVMValueRef dest, bool fresh, bool unaligned);
+
 static void gen_return(Expr *e) {
     LLVMValueRef v = NULL;
-    if (e) {
+    if (e && F->sret_ptr) {
+        // straight into the caller's result slot, which nothing here can
+        // read (before the defers run)
+        gen_into(e, F->sret_ptr, true, false);
+        if (terminated()) return;
+        if (F->ret->kind == TY_ERRUNION) etrace_push(errunion_code(F->ret, F->sret_ptr));
+    } else if (e) {
         v = gen(e);
         if (terminated()) return;
-        if (F->ret->kind == TY_ERRUNION) etrace_push(LLVMBuildExtractValue(B, v, 0, ""));
+        if (in_mem(F->ret)) v = as_val(F->ret, v);  // (before the defers run)
+        if (F->ret->kind == TY_ERRUNION) etrace_push(errunion_code(F->ret, v));
     } else if (F->ret->kind == TY_ERRUNION) {
         v = errunion_value(F->ret, LLVMConstInt(T_i16, 0, false), NULL);
     }
@@ -1212,12 +1748,63 @@ static void mul_wide_overflow(bool is_signed, LLVMValueRef l, LLVMValueRef r, LL
     *ovf = LLVMBuildICmp(B, LLVMIntNE, back, p, "");
 }
 
-// 64-bit multiply: no 128-bit multiply needed (freestanding wasm has no
-// compiler-rt); overflow is detected by dividing back.
+// Bits of `v` that can be nonzero (unsigned), or that can differ from the
+// sign bit (signed), if `v` is a zero or sign extension; 0 if unknown.
+static unsigned ext_bits(LLVMValueRef v, bool is_signed) {
+    if (!LLVMIsAZExtInst(v) && !LLVMIsASExtInst(v)) return 0;
+    unsigned from = LLVMGetIntTypeWidth(LLVMTypeOf(LLVMGetOperand(v, 0)));
+    if (LLVMIsAZExtInst(v)) return is_signed ? from + 1 : from;  // signed: the (zero) sign bit
+    return is_signed ? from : 0;
+}
+
+// 64-bit multiply. Operands extended from at most half the width cannot
+// overflow. On native targets, and on wasm at -O1 and above, the overflow
+// intrinsics give it from one multiply (x86: `mul`/`imul` and `seto`).
+// At -O0 on wasm they would force LLVM's slow SelectionDAG path, so there
+// overflow is detected by dividing back (no 128-bit multiply: freestanding
+// wasm has no compiler-rt). With a constant operand the other is compared
+// with the quotients of the limits.
 static void mul64_overflow(bool is_signed, LLVMValueRef l, LLVMValueRef r, LLVMValueRef *val, LLVMValueRef *ovf) {
     LLVMTypeRef t = LLVMTypeOf(l);
     LLVMValueRef zero = LLVMConstNull(t), one = LLVMConstInt(t, 1, false);
+    unsigned half = LLVMGetIntTypeWidth(t) / 2;
+    unsigned lb = ext_bits(l, is_signed), rb = ext_bits(r, is_signed);
+    if (lb && rb && lb <= half && rb <= half) {
+        // |l| < 2^lb and |r| < 2^rb (signed: |x| <= 2^(b-1)), so the product fits
+        *val = LLVMBuildMul(B, l, r, "");
+        *ovf = LLVMConstInt(T_i1, 0, false);
+        return;
+    }
+    if (!LLVMIsAConstantInt(l) && !LLVMIsAConstantInt(r) && (!g_target.wasm || O->opt_level > 0)) {
+        LLVMValueRef args[2] = {l, r};
+        LLVMValueRef res = intrinsic(is_signed ? "llvm.smul.with.overflow" : "llvm.umul.with.overflow", &t, 1, args, 2);
+        *val = LLVMBuildExtractValue(B, res, 0, "");
+        *ovf = LLVMBuildExtractValue(B, res, 1, "");
+        return;
+    }
     LLVMValueRef prod = LLVMBuildMul(B, l, r, "");
+    if (LLVMIsAConstantInt(l) || LLVMIsAConstantInt(r)) {
+        LLVMValueRef kc = LLVMIsAConstantInt(r) ? r : l, x = kc == r ? l : r;
+        unsigned bits = LLVMGetIntTypeWidth(t);
+        *val = prod;
+        if (!is_signed) {
+            unsigned __int128 k = (unsigned long long)LLVMConstIntGetZExtValue(kc);
+            unsigned __int128 mx = ((unsigned __int128)1 << bits) - 1;
+            *ovf = k == 0 ? LLVMConstInt(T_i1, 0, false) : LLVMBuildICmp(B, LLVMIntUGT, x, cint(t, (i128)(mx / k)), "");
+            return;
+        }
+        i128 k = (i128)LLVMConstIntGetSExtValue(kc);
+        i128 mx = ((i128)1 << (bits - 1)) - 1, mn = -mx - 1;
+        if (k == 0) *ovf = LLVMConstInt(T_i1, 0, false);
+        else if (k == -1) *ovf = LLVMBuildICmp(B, LLVMIntEQ, x, cint(t, mn), "");
+        else if (k > 0)  // (division truncates: floor(mx / k), ceil(mn / k))
+            *ovf = LLVMBuildOr(B, LLVMBuildICmp(B, LLVMIntSGT, x, cint(t, mx / k), ""),
+                               LLVMBuildICmp(B, LLVMIntSLT, x, cint(t, mn / k), ""), "");
+        else
+            *ovf = LLVMBuildOr(B, LLVMBuildICmp(B, LLVMIntSLT, x, cint(t, mx / k), ""),
+                               LLVMBuildICmp(B, LLVMIntSGT, x, cint(t, mn / k), ""), "");
+        return;
+    }
     LLVMValueRef lz = LLVMBuildICmp(B, LLVMIntEQ, l, zero, "");
     if (!is_signed) {
         LLVMValueRef div = LLVMBuildSelect(B, lz, one, l, "");
@@ -1271,9 +1858,14 @@ static LLVMValueRef saturated(bool is_signed, LLVMTypeRef t, LLVMValueRef neg_di
 static LLVMValueRef overflow_op(const char *base, bool is_signed, LLVMValueRef l, LLVMValueRef r, bool mul) {
     // base: "add", "sub", "mul"
     LLVMTypeRef t = LLVMTypeOf(l);
+    if (O->overflow == OVF_WRAP) {
+        if (!strcmp(base, "add")) return LLVMBuildAdd(B, l, r, "");
+        if (!strcmp(base, "sub")) return LLVMBuildSub(B, l, r, "");
+        return LLVMBuildMul(B, l, r, "");
+    }
     LLVMValueRef val, ovf;
     op_with_overflow(base, is_signed, l, r, &val, &ovf);
-    if (!O->overflow_saturate) {
+    if (O->overflow == OVF_TRAP) {
         check_or_trap(LLVMBuildNot(B, ovf, ""), T_OVERFLOW);
         return val;
     }
@@ -1294,10 +1886,24 @@ static LLVMValueRef overflow_op(const char *base, bool is_signed, LLVMValueRef l
 static LLVMValueRef gen_shift(int op, Type *t, LLVMValueRef x, LLVMValueRef k, Type *kt) {
     Type *lane = t->kind == TY_VEC ? t->elem : t;
     int n = lane->bits;
+    bool arith = op == TK_SHR && lane->is_signed;
+    if (kt && kt->kind == TY_VEC) {
+        // a count per lane, of the lanes' width (vpsllvd, ushl, ...)
+        LLVMTypeRef vt = LLVMTypeOf(x);
+        LLVMValueRef cn[64], cf[64];
+        for (int i = 0; i < t->lanes; i++) {
+            cn[i] = LLVMConstInt(LLVMGetElementType(vt), (unsigned long long)n, false);
+            cf[i] = LLVMConstInt(LLVMGetElementType(vt), arith ? (unsigned long long)(n - 1) : 0, false);
+        }
+        LLVMValueRef vge = LLVMBuildICmp(B, LLVMIntUGE, k, LLVMConstVector(cn, (unsigned)t->lanes), "");
+        LLVMValueRef vk = LLVMBuildSelect(B, vge, LLVMConstVector(cf, (unsigned)t->lanes), k, "");
+        if (arith) return LLVMBuildAShr(B, x, vk, "");
+        LLVMValueRef vr = op == TK_SHL ? LLVMBuildShl(B, x, vk, "") : LLVMBuildLShr(B, x, vk, "");
+        return LLVMBuildSelect(B, vge, LLVMConstNull(vt), vr, "");
+    }
     LLVMTypeRef kty = LLVMTypeOf(k);
     LLVMValueRef ge = LLVMBuildICmp(B, LLVMIntUGE, k, LLVMConstInt(kty, (unsigned long long)n, false), "");
     LLVMTypeRef laneTy = LLVMIntTypeInContext(ctx, (unsigned)n);
-    bool arith = op == TK_SHR && lane->is_signed;
     LLVMValueRef kc = LLVMBuildSelect(B, ge, LLVMConstInt(kty, arith ? (unsigned long long)(n - 1) : 0, false), k, "");
     unsigned kb = LLVMGetIntTypeWidth(kty);
     if (kb > (unsigned)n) kc = LLVMBuildTrunc(B, kc, laneTy, "");
@@ -1322,21 +1928,30 @@ static LLVMValueRef gen_binop(int op, Type *t, LLVMValueRef l, LLVMValueRef r, T
     switch (op) {
     case TK_PLUS:
         if (is_float) return LLVMBuildFAdd(B, l, r, "");
+        if (is_vec) return LLVMBuildAdd(B, l, r, "");  // integer vectors wrap in every mode
         return overflow_op("add", sgn, l, r, false);
     case TK_MINUS:
         if (is_float) return LLVMBuildFSub(B, l, r, "");
+        if (is_vec) return LLVMBuildSub(B, l, r, "");
         return overflow_op("sub", sgn, l, r, false);
     case TK_STAR:
         if (is_float) return LLVMBuildFMul(B, l, r, "");
+        if (is_vec) return LLVMBuildMul(B, l, r, "");
         return overflow_op("mul", sgn, l, r, true);
     case TK_SLASH: {
         if (is_float) return LLVMBuildFDiv(B, l, r, "");
         LLVMTypeRef ty = LLVMTypeOf(l);
         check_or_trap(LLVMBuildICmp(B, LLVMIntNE, r, LLVMConstNull(ty), ""), T_DIVZERO);
         if (!sgn) return LLVMBuildUDiv(B, l, r, "");
+        if (O->overflow == OVF_WRAP) {
+            // MIN / -1 wraps to MIN: a divisor of -1 negates (as `%` gives 0)
+            LLVMValueRef m1 = LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstAllOnes(ty), "");
+            LLVMValueRef q = LLVMBuildSDiv(B, l, LLVMBuildSelect(B, m1, LLVMConstInt(ty, 1, false), r, ""), "");
+            return LLVMBuildSelect(B, m1, LLVMBuildNeg(B, l, ""), q, "");
+        }
         LLVMValueRef ovf = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntEQ, l, int_min(ty), ""),
                                         LLVMBuildICmp(B, LLVMIntEQ, r, LLVMConstAllOnes(ty), ""), "");
-        if (!O->overflow_saturate) {
+        if (O->overflow == OVF_TRAP) {
             check_or_trap(LLVMBuildNot(B, ovf, ""), T_OVERFLOW);
             return LLVMBuildSDiv(B, l, r, "");
         }
@@ -1451,14 +2066,16 @@ static LLVMValueRef gen_addr_inner(Expr *e) {
             LLVMValueRef ptr = LLVMBuildExtractValue(B, s, 0, "");
             LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
             check_or_trap(LLVMBuildICmp(B, LLVMIntULT, idx, len, ""), T_BOUNDS);
-            return LLVMBuildGEP2(B, lty(at->elem), ptr, &idx, 1, "");
+            // in bounds (checked): the address cannot wrap, so a constant part
+            // of the index can fold into the access (wasm's offset=)
+            return LLVMBuildInBoundsGEP2(B, lty(at->elem), ptr, &idx, 1, "");
         }
         Type *arr = e->op == IDX_PTR_ARRAY ? at->elem : at;
         LLVMValueRef base = e->op == IDX_PTR_ARRAY ? gen(e->a) : addr_or_spill(e->a);
         LLVMValueRef idx = gen(e->b);
         check_or_trap(LLVMBuildICmp(B, LLVMIntULT, idx, array_len_value(arr), ""), T_BOUNDS);
         LLVMValueRef ix[2] = {usz(0), idx};
-        return LLVMBuildGEP2(B, lty(arr), base, ix, 2, "");
+        return LLVMBuildInBoundsGEP2(B, lty(arr), base, ix, 2, "");
     }
     default: break;
     }
@@ -1470,10 +2087,11 @@ static LLVMValueRef gen_addr_inner(Expr *e) {
 // ---------------------------------------------------------------------------
 // Calls
 // ---------------------------------------------------------------------------
+// `ninl`: the callee is an inline function taking its callers' call sites.
 static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool sret, LLVMValueRef *argv, int argc,
-                              Type **argt, const char *callee) {
+                              Type **argt, const char *callee, int ninl) {
     int n = argc + (sret ? 1 : 0);
-    LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
+    LLVMValueRef *av = NEWN(LLVMValueRef, n + ninl + 1);
     int k = 0;
     LLVMValueRef ret_tmp = NULL;
     if (sret) {
@@ -1481,9 +2099,31 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
         av[k++] = ret_tmp;
     }
     for (int i = 0; i < argc; i++) av[k++] = by_ptr(argt[i]) ? spill(argt[i], argv[i]) : argv[i];
-    SsFrame sf = ss_push(callee);
-    LLVMValueRef r = LLVMBuildCall2(B, fty, fn, av, (unsigned)n, "");
-    ss_pop(sf);
+    LLVMValueRef r;
+    if (ninl) {
+        // this call's record, then the caller's own (if it is inline too);
+        // one that does not fit is pushed around the call
+        av[k++] = site_record_ex(SITE_CALL, g_cur_span, callee);
+        for (int i = 0; i < ninl - 1; i++) av[k++] = F && i < F->ninl ? F->inl[i] : LLVMConstNull(T_ptr);
+        LLVMValueRef extra = F && F->ninl >= ninl ? F->inl[ninl - 1] : NULL, ss = NULL;
+        if (extra) ss_push_site(ss = ss_ptr(), extra);
+        r = LLVMBuildCall2(B, fty, fn, av, (unsigned)(n + ninl), "");
+        if (extra) {
+            LLVMBasicBlockRef doit = new_bb("ss.inline.pop"), next = new_bb("ss.inline.popped");
+            LLVMBuildCondBr(B, LLVMBuildIsNotNull(B, extra, ""), doit, next);
+            LLVMPositionBuilderAtEnd(B, doit);
+            LLVMValueRef dp = ss_field(ss, 0);
+            ss_store(LLVMBuildSub(B, LLVMBuildLoad2(B, T_i32, dp, ""), LLVMConstInt(T_i32, 1, false), ""), dp);
+            LLVMBuildBr(B, next);
+            LLVMPositionBuilderAtEnd(B, next);
+        }
+    } else {
+        SsFrame sf = ss_push(callee);
+        LLVMMetadataRef loc = frame_call_begin(callee);
+        r = LLVMBuildCall2(B, fty, fn, av, (unsigned)n, "");
+        frame_call_end(r, loc);
+        ss_pop(sf);
+    }
     add_ext_attrs(r, fnty, sret, true);
     if (sret) return load(fnty->ret, ret_tmp, false);
     if (fnty->ret->kind == TY_VOID) return NULL;
@@ -1584,7 +2224,7 @@ static void asan_check(LLVMValueRef addr, LLVMValueRef size) {
     LLVMPositionBuilderAtEnd(B, slow);
     FnInst *fi = mem_fn("asan_check");
     LLVMValueRef args[2] = {a, sz};
-    LLVMValueRef ok = emit_call(fi->llty, fi->fn, fi->fnty, false, args, 2, fi->fnty->params, NULL);
+    LLVMValueRef ok = emit_call(fi->llty, fi->fn, fi->fnty, false, args, 2, fi->fnty->params, NULL, fi->ninl);
     check_or_trap(LLVMBuildICmp(B, LLVMIntNE, ok, LLVMConstInt(LLVMTypeOf(ok), 0, false), ""), T_MEMORY);
     LLVMBuildBr(B, done);
     LLVMPositionBuilderAtEnd(B, done);
@@ -1602,7 +2242,7 @@ static LLVMValueRef rt_call_lanes(const char *name, LLVMValueRef *args, int n) {
     FnInst *fi = rt_fn(name);
     LLVMTypeRef t = LLVMTypeOf(args[0]);
     if (LLVMGetTypeKind(t) != LLVMVectorTypeKind) {
-        return emit_call(fi->llty, fi->fn, fi->fnty, false, args, n, fi->fnty->params, NULL);
+        return emit_call(fi->llty, fi->fn, fi->fnty, false, args, n, fi->fnty->params, NULL, fi->ninl);
     }
     unsigned lanes = LLVMGetVectorSize(t);
     LLVMValueRef r = LLVMGetUndef(t);
@@ -1610,22 +2250,47 @@ static LLVMValueRef rt_call_lanes(const char *name, LLVMValueRef *args, int n) {
         LLVMValueRef ls[3];
         LLVMValueRef ix = LLVMConstInt(T_i32, l, false);
         for (int k = 0; k < n; k++) ls[k] = LLVMBuildExtractElement(B, args[k], ix, "");
-        LLVMValueRef v = emit_call(fi->llty, fi->fn, fi->fnty, false, ls, n, fi->fnty->params, NULL);
+        LLVMValueRef v = emit_call(fi->llty, fi->fn, fi->fnty, false, ls, n, fi->fnty->params, NULL, fi->ninl);
         r = LLVMBuildInsertElement(B, r, v, ix, "");
     }
     return r;
+}
+
+// An argument for a parameter of type pt, evaluated now: an in-memory
+// aggregate passed by pointer is a copy that nothing else can change (built
+// in place if it is a literal), one passed in registers is loaded now.
+static LLVMValueRef arg_from(Type *pt, LLVMValueRef v) {
+    if (!in_mem(pt)) return v;
+    return by_ptr(pt) ? fresh_copy(pt, v) : as_val(pt, v);
+}
+
+static bool is_literal(Expr *e) { return e->kind == E_STRUCT_LIT || e->kind == E_ARRAY_LIT || e->kind == E_ARRAY_REPEAT; }
+
+static LLVMValueRef gen_arg(Expr *a, Type *pt) {
+    if (in_mem(pt) && by_ptr(pt) && is_literal(a)) {
+        LLVMValueRef tmp = temp_alloca(pt);
+        gen_into(a, tmp, true, false);
+        return tmp;
+    }
+    return arg_from(pt, gen(a));
+}
+
+// A union value of variant e->index built at dest.
+static void gen_variant_into(Expr *e, LLVMValueRef dest) {
+    Type *ut = ct(e->tval);
+    LLVMValueRef tagp = LLVMBuildStructGEP2(B, lty(ut), dest, 0, "");
+    LLVMValueRef payload = gen(e->args.data[0]);
+    LLVMBuildStore(B, LLVMConstInt(lty(union_tag_type(ut)), (unsigned long long)e->index, false), tagp);
+    Type *pt = type_variant(ut, e->index);
+    LLVMValueRef pp = LLVMBuildStructGEP2(B, lty(ut), dest, 1, "");
+    store(pt, payload, pp, true);
 }
 
 static LLVMValueRef gen_call(Expr *e) {
     if (e->op == CALLK_VARIANT) {
         Type *ut = ct(e->tval);
         LLVMValueRef tmp = temp_alloca(ut);
-        LLVMValueRef tagp = LLVMBuildStructGEP2(B, lty(ut), tmp, 0, "");
-        LLVMValueRef payload = gen(e->args.data[0]);
-        LLVMBuildStore(B, LLVMConstInt(lty(union_tag_type(ut)), (unsigned long long)e->index, false), tagp);
-        Type *pt = type_variant(ut, e->index);
-        LLVMValueRef pp = LLVMBuildStructGEP2(B, lty(ut), tmp, 1, "");
-        store(pt, payload, pp, true);
+        gen_variant_into(e, tmp);
         return load(ut, tmp, false);
     }
     if (e->op == CALLK_INDIRECT) {
@@ -1633,38 +2298,41 @@ static LLVMValueRef gen_call(Expr *e) {
         LLVMValueRef fp = gen(e->a);
         int n = e->args.len;
         LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
-        for (int i = 0; i < n; i++) av[i] = gen(e->args.data[i]);
+        for (int i = 0; i < n; i++) av[i] = gen_arg(e->args.data[i], ft->params[i]);
         bool sret;
         LLVMTypeRef fty = fn_lty(ft, &sret);
-        return emit_call(fty, fp, ft, sret, av, n, ft->params, NULL);
+        return emit_call(fty, fp, ft, sret, av, n, ft->params, NULL, 0);
     }
     Decl *d = e->decl;
-    FnInst *fi = get_inst(d, subst_gargs(e->gargs, e->ngargs), e->ngargs);
+    FnInst *fi = get_callee(d, subst_gargs(e->gargs, e->ngargs), e->ngargs);
     int n = e->args.len + (e->b ? 1 : 0);
     LLVMValueRef *av = NEWN(LLVMValueRef, n + 1);
     int k = 0;
     if (e->b) {
         Expr *recv = e->b;
+        Type *p0 = fi->fnty->params[0];
         switch (e->self_mode) {
-        case SELF_VALUE: av[k++] = gen(recv); break;
         case SELF_DEREF: {
             Type *pt = ct(recv->type);
-            av[k++] = load(pt->elem, gen(recv), true);
+            av[k++] = arg_from(p0, load(pt->elem, gen(recv), true));
             break;
         }
         case SELF_ADDR: av[k++] = gen_addr(recv); break;
-        case SELF_PASS: av[k++] = gen(recv); break;
-        default: av[k++] = gen(recv); break;
+        default: av[k++] = gen_arg(recv, p0); break;
         }
     }
-    for (int i = 0; i < e->args.len; i++) av[k++] = gen(e->args.data[i]);
+    for (int i = 0; i < e->args.len; i++) {
+        Expr *a = e->args.data[i];
+        av[k] = gen_arg(a, k < fi->fnty->nparams ? fi->fnty->params[k] : ct(a->type));
+        k++;
+    }
     Type **argt = fi->fnty->params;
     if (d->variadic) {  // types of the extra (promoted) arguments
         argt = NEWN(Type *, n + 1);
         for (int i = 0; i < n; i++)
             argt[i] = i < fi->fnty->nparams ? fi->fnty->params[i] : ct(e->args.data[i - (e->b ? 1 : 0)]->type);
     }
-    return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, argt, fi->display);
+    return emit_call(fi->llty, fi->fn, fi->fnty, fi->sret, av, n, argt, fi->display, fi->ninl);
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,7 +2341,7 @@ static LLVMValueRef gen_call(Expr *e) {
 static LLVMValueRef gen_try(Expr *e) {
     Type *eu = ct(e->a->type);
     LLVMValueRef v = gen(e->a);
-    LLVMValueRef code = LLVMBuildExtractValue(B, v, 0, "");
+    LLVMValueRef code = errunion_code(eu, v);
     LLVMValueRef is_err = LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstInt(T_i16, 0, false), "");
     LLVMBasicBlockRef err_bb = new_bb("try.err"), ok_bb = new_bb("try.ok");
     LLVMBuildCondBr(B, is_err, err_bb, ok_bb);
@@ -1684,14 +2352,14 @@ static LLVMValueRef gen_try(Expr *e) {
     if (!terminated()) emit_ret(rv);
     LLVMPositionBuilderAtEnd(B, ok_bb);
     if (eu->elem->kind == TY_VOID) return NULL;
-    return from_mem(eu->elem, LLVMBuildExtractValue(B, v, 1, ""));
+    return field_value(eu, v, 1, eu->elem);
 }
 
 static LLVMValueRef gen_catch(Expr *e) {
     Type *eu = ct(e->a->type);
     Type *vt = eu->elem;
     LLVMValueRef v = gen(e->a);
-    LLVMValueRef code = LLVMBuildExtractValue(B, v, 0, "");
+    LLVMValueRef code = errunion_code(eu, v);
     LLVMValueRef is_err = LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstInt(T_i16, 0, false), "");
     LLVMBasicBlockRef err_bb = new_bb("catch.err"), ok_bb = new_bb("catch.ok"), merge = new_bb("catch.end");
     LLVMBuildCondBr(B, is_err, err_bb, ok_bb);
@@ -1706,6 +2374,7 @@ static LLVMValueRef gen_catch(Expr *e) {
         // a diverging handler (@trap()) leaves the builder in a dead block
         // that is deleted later: it must not feed the phi
         if (!terminated() && (LLVMGetInsertBlock(B) == err_bb || LLVMGetFirstUse(LLVMBasicBlockAsValue(LLVMGetInsertBlock(B))))) {
+            if (hv && in_mem(vt)) hv = spill(vt, hv);  // the phi joins addresses
             hbb = LLVMGetInsertBlock(B);
             LLVMBuildBr(B, merge);
         }
@@ -1720,13 +2389,14 @@ static LLVMValueRef gen_catch(Expr *e) {
     }
     if (!terminated()) LLVMBuildUnreachable(B);
     LLVMPositionBuilderAtEnd(B, ok_bb);
-    LLVMValueRef ov = vt->kind == TY_VOID ? NULL : from_mem(vt, LLVMBuildExtractValue(B, v, 1, ""));
+    LLVMValueRef ov = vt->kind == TY_VOID ? NULL : field_value(eu, v, 1, vt);
+    if (ov && in_mem(vt) && hbb && hv) ov = spill(vt, ov);
     LLVMBasicBlockRef obb = LLVMGetInsertBlock(B);
     LLVMBuildBr(B, merge);
     LLVMPositionBuilderAtEnd(B, merge);
     if (vt->kind == TY_VOID) return NULL;
     if (!hbb || !hv) return ov;
-    LLVMValueRef phi = LLVMBuildPhi(B, vty(vt), "");
+    LLVMValueRef phi = LLVMBuildPhi(B, in_mem(vt) ? T_ptr : vty(vt), "");
     LLVMValueRef vals[2] = {ov, hv};
     LLVMBasicBlockRef bbs[2] = {obb, hbb};
     LLVMAddIncoming(phi, vals, bbs, 2);
@@ -1741,18 +2411,22 @@ static LLVMValueRef splat(LLVMTypeRef vt, LLVMValueRef x, unsigned lanes) {
     return LLVMBuildShuffleVector(B, v, LLVMGetUndef(vt), LLVMConstNull(LLVMVectorType(T_i32, lanes)), "");
 }
 
-static LLVMValueRef pairwise_sum(LLVMValueRef *xs, int n, bool is_float) {
-    if (n == 1) return xs[0];
-    int h = n / 2;
-    LLVMValueRef a = pairwise_sum(xs, h, is_float), b = pairwise_sum(xs + h, n - h, is_float);
-    return is_float ? LLVMBuildFAdd(B, a, b, "") : LLVMBuildAdd(B, a, b, "");
-}
-
+// The lanes summed by folding the halves (spec §13.2): lane i plus lane
+// i + n/2, until one lane is left.
 static LLVMValueRef reduce_add(Type *vt, LLVMValueRef v) {
-    int n = vt->lanes;
-    LLVMValueRef *xs = NEWN(LLVMValueRef, n);
-    for (int i = 0; i < n; i++) xs[i] = LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, (unsigned)i, false), "");
-    return pairwise_sum(xs, n, vt->elem->kind == TY_FLOAT);
+    bool is_float = vt->elem->kind == TY_FLOAT;
+    for (unsigned n = (unsigned)vt->lanes; n > 1; n /= 2) {
+        unsigned h = n / 2;
+        LLVMValueRef lo[32], hi[32];
+        for (unsigned i = 0; i < h; i++) {
+            lo[i] = LLVMConstInt(T_i32, i, false);
+            hi[i] = LLVMConstInt(T_i32, i + h, false);
+        }
+        LLVMValueRef a = LLVMBuildShuffleVector(B, v, v, LLVMConstVector(lo, h), "");
+        LLVMValueRef b = LLVMBuildShuffleVector(B, v, v, LLVMConstVector(hi, h), "");
+        v = is_float ? LLVMBuildFAdd(B, a, b, "") : LLVMBuildAdd(B, a, b, "");
+    }
+    return LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, 0, false), "");
 }
 
 static LLVMValueRef ext_int(LLVMValueRef v, LLVMTypeRef to, bool is_signed) {
@@ -1768,6 +2442,436 @@ static LLVMValueRef native_rt_fn(const char *name, LLVMTypeRef ret, LLVMTypeRef 
 static LLVMValueRef error_name_table(void);
 static void gen_expect_eq(Expr *e);
 static LLVMValueRef gen_atomic(Expr *e);
+
+// @swizzle of one 16-byte table (WebAssembly's semantics: an index past
+// the table gives 0).
+static LLVMValueRef swizzle16(LLVMValueRef x, LLVMValueRef idx) {
+    if (g_target.wasm) {
+        LLVMValueRef args[2] = {x, idx};
+        return intrinsic("llvm.wasm.swizzle", NULL, 0, args, 2);
+    }
+    if (g_has_ssse3) {
+        // pshufb zeroes lanes whose index has its top bit set; adding
+        // 0x70 with saturation sets it exactly for indices >= 16
+        LLVMTypeRef vt = LLVMTypeOf(idx);
+        LLVMValueRef c70[16];
+        for (int i = 0; i < 16; i++) c70[i] = LLVMConstInt(T_i8, 0x70, false);
+        LLVMValueRef sat[2] = {idx, LLVMConstVector(c70, 16)};
+        LLVMValueRef k = intrinsic("llvm.uadd.sat", &vt, 1, sat, 2);
+        LLVMValueRef args[2] = {x, k};
+        return intrinsic("llvm.x86.ssse3.pshuf.b.128", NULL, 0, args, 2);
+    }
+    LLVMValueRef r = LLVMConstNull(LLVMTypeOf(x));
+    for (unsigned i = 0; i < 16; i++) {
+        LLVMValueRef li = LLVMConstInt(T_i32, i, false);
+        LLVMValueRef k = LLVMBuildExtractElement(B, idx, li, "");
+        LLVMValueRef inb = LLVMBuildICmp(B, LLVMIntULT, k, LLVMConstInt(T_i8, 16, false), "");
+        LLVMValueRef kk = LLVMBuildAnd(B, k, LLVMConstInt(T_i8, 15, false), "");
+        LLVMValueRef el = LLVMBuildExtractElement(B, x, LLVMBuildZExt(B, kk, T_i32, ""), "");
+        el = LLVMBuildSelect(B, inb, el, LLVMConstInt(T_i8, 0, false), "");
+        r = LLVMBuildInsertElement(B, r, el, li, "");
+    }
+    return r;
+}
+
+// @int_from_float on vectors (spec §13.2: truncate, saturate, NaN to 0)
+// from operations x86 lowers to vector instructions (vcvttps2dq/udq, vmaxps,
+// compares and blends); LLVM 18 splits the vector fptosi.sat/fptoui.sat into
+// one scalar conversion per lane there (issue 0030). wasm keeps the
+// intrinsics, which are its trunc_sat instructions.
+// x86's truncating conversion of a whole vector of floats to integers of
+// the same lane count, where the function's extensions have one (NULL
+// otherwise): out of range and NaN give the integer type's all-ones
+// (unsigned, AVX-512) or its minimum (signed). AVX-512's are its masked
+// forms, called unmasked; the 512-bit ones also take the rounding mode.
+static LLVMValueRef x86_cvtt(Type *rt, Type *ft, LLVMValueRef v) {
+    if (g_arch != ARCH_X64) return NULL;
+    unsigned n = (unsigned)rt->lanes, ib = (unsigned)rt->elem->bits, fb = (unsigned)ft->elem->bits;
+    unsigned fbytes = n * fb / 8;
+    bool s = rt->elem->is_signed, f = (g_features & feature_bit("avx512f")) != 0;
+    bool vl = f && (g_features & feature_bit("avx512vl")), dq = f && (g_features & feature_bit("avx512dq"));
+    bool wide = n * (fb > ib ? fb : ib) == 512;
+    // the widths an instruction converts all lanes of, register to register
+    if (ib != 32 && ib != 64) return NULL;
+    if (n * fb != 128 && n * fb != 256 && n * fb != 512) return NULL;
+    if (n * ib != 128 && n * ib != 256 && n * ib != 512) return NULL;
+    if ((wide ? !f : !vl) || (s && ib == 32 && !wide)) {
+        // the signed 32-bit conversions of SSE2 and AVX (AVX-512VL adds
+        // only the masked forms of these)
+        if (!s || ib != 32) return NULL;
+        LLVMValueRef a[1] = {v};
+        if (fb == 32 && fbytes == 16) return intrinsic("llvm.x86.sse2.cvttps2dq", NULL, 0, a, 1);
+        if (fb == 32 && fbytes == 32 && (g_features & feature_bit("avx"))) return intrinsic("llvm.x86.avx.cvtt.ps2dq.256", NULL, 0, a, 1);
+        if (fb == 64 && fbytes == 32 && (g_features & feature_bit("avx"))) return intrinsic("llvm.x86.avx.cvtt.pd2dq.256", NULL, 0, a, 1);
+        return NULL;
+    }
+    if (ib == 64 && !dq) return NULL;
+    if (fb == 64 && ib == 32 && n == 2) return NULL;  // (the result is half a register)
+    if (fb == 32 && ib == 64 && n == 2) return NULL;
+    const char *name = arena_printf("llvm.x86.avx512.mask.cvtt%s2%s%s.%u", fb == 32 ? "ps" : "pd",
+                                    s ? "" : "u", ib == 32 ? "dq" : "qq", wide ? 512 : n * (fb > ib ? fb : ib));
+    LLVMTypeRef mt = LLVMIntTypeInContext(ctx, n < 8 ? 8 : n);
+    LLVMValueRef a[4] = {v, LLVMGetUndef(lty(rt)), LLVMConstAllOnes(mt), LLVMConstInt(T_i32, 4, false)};
+    return intrinsic(name, NULL, 0, a, wide ? 4 : 3);
+}
+
+static LLVMValueRef vec_int_from_float(Type *rt, Type *ft, LLVMValueRef v) {
+    unsigned n = (unsigned)rt->lanes, bits = (unsigned)rt->elem->bits;
+    LLVMTypeRef fv = LLVMTypeOf(v), fl = LLVMGetElementType(fv), iv = lty(rt), il = LLVMGetElementType(iv);
+    bool f32 = ft->elem->bits == 32;
+    // the largest float below 2^e, and 2^e
+    double two = ldexp(1.0, rt->elem->is_signed ? (int)bits - 1 : (int)bits);
+    double below = f32 ? (double)nextafterf((float)two, 0.0f) : nextafter(two, 0.0);
+    LLVMValueRef cb[64], ct2[64], cmn[64], cz[64];
+    for (unsigned i = 0; i < n; i++) {
+        cb[i] = LLVMConstReal(fl, below);
+        ct2[i] = LLVMConstReal(fl, two);
+        cmn[i] = LLVMConstReal(fl, -two);
+        cz[i] = LLVMConstReal(fl, 0.0);
+    }
+    LLVMValueRef vb = LLVMConstVector(cb, n), vt = LLVMConstVector(ct2, n), vz = LLVMConstVector(cz, n);
+    for (unsigned i = 0; i < n; i++) cz[i] = int_max(il, rt->elem->is_signed);
+    LLVMValueRef top = LLVMConstVector(cz, n);
+    LLVMValueRef x = x86_cvtt(rt, ft, v);
+    if (x && !rt->elem->is_signed) {
+        // (issue 0089) the rest saturate already: lanes not >= 0 (ordered:
+        // NaN too) are 0, which zero-masks the conversion
+        return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGE, v, vz, ""), x, LLVMConstNull(iv), "");
+    }
+    if (x) {
+        // NaN and both overflows give the minimum: fix up the large and NaN
+        LLVMValueRef r = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGE, v, vt, ""), top, x, "");
+        return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealUNO, v, v, ""), LLVMConstNull(iv), r, "");
+    }
+    LLVMValueRef big = LLVMBuildFCmp(B, LLVMRealOGE, v, vt, "");
+    if (!rt->elem->is_signed) {
+        // ordered compares: NaN and negatives give 0
+        LLVMValueRef c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGT, v, vz, ""), v, vz, "");
+        c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOLT, c, vb, ""), c, vb, "");
+        return LLVMBuildSelect(B, big, top, LLVMBuildFPToUI(B, c, iv, ""), "");
+    }
+    LLVMValueRef vm = LLVMConstVector(cmn, n);
+    LLVMValueRef c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGT, v, vm, ""), v, vm, "");
+    c = LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOLT, c, vb, ""), c, vb, "");
+    LLVMValueRef r = LLVMBuildSelect(B, big, top, LLVMBuildFPToSI(B, c, iv, ""), "");
+    return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealUNO, v, v, ""), LLVMConstNull(iv), r, "");
+}
+
+// Whether every lane of a mask expression is all ones or all zeros: a lane
+// comparison, &, |, ^ or ~ of such masks, or an immutable local set to one.
+static bool is_mask(Expr *e, int depth) {
+    if (depth > 16) return false;
+    switch (e->kind) {
+    case E_BUILTIN: return e->index >= BI_LANES_EQ && e->index <= BI_LANES_GE;
+    case E_BINARY:
+        return (e->op == TK_AMP || e->op == TK_PIPE || e->op == TK_CARET) && is_mask(e->a, depth + 1) &&
+               is_mask(e->b, depth + 1);
+    case E_UNARY: return e->op == TK_TILDE && is_mask(e->a, depth + 1);
+    case E_IDENT:
+        return e->local && !e->local->mut && F->inits[e->local->index] && is_mask(F->inits[e->local->index], depth + 1);
+    default: return false;
+    }
+}
+
+// Bytes 16k..16k+15 of a byte vector.
+static LLVMValueRef piece16(LLVMValueRef v, unsigned k) {
+    LLVMValueRef m[16];
+    for (unsigned i = 0; i < 16; i++) m[i] = LLVMConstInt(T_i32, 16 * k + i, false);
+    return LLVMBuildShuffleVector(B, v, LLVMGetUndef(LLVMTypeOf(v)), LLVMConstVector(m, 16), "");
+}
+
+// @swizzle of a byte table of n bytes (n a multiple of 16).
+static LLVMValueRef swizzle_bytes(LLVMValueRef x, LLVMValueRef idx, unsigned n) {
+    if (n == 16) return swizzle16(x, idx);
+    if (n == 64 && g_arch == ARCH_X64 && (g_features & feature_bit("avx512vbmi"))) {
+        // vpermb: the index modulo 64, so out-of-range lanes are cleared after
+        LLVMValueRef args[2] = {x, idx};
+        LLVMValueRef r = intrinsic("llvm.x86.avx512.permvar.qi.512", NULL, 0, args, 2);
+        LLVMValueRef c[64];
+        for (int i = 0; i < 64; i++) c[i] = LLVMConstInt(T_i8, 64, false);
+        LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, LLVMConstVector(c, 64), "");
+        return LLVMBuildSelect(B, out, LLVMConstNull(LLVMTypeOf(x)), r, "");
+    }
+    // one 16-byte lookup per table piece, with the indices moved down by its
+    // offset (out of range there: 0), OR-ed; the pieces of the result joined
+    unsigned np = n / 16;
+    LLVMTypeRef v16 = LLVMVectorType(T_i8, 16);
+    LLVMValueRef ps[4];
+    for (unsigned k = 0; k < np; k++) {
+        LLVMValueRef ix = piece16(idx, k);
+        LLVMValueRef acc = LLVMConstNull(v16);
+        for (unsigned j = 0; j < np; j++) {
+            LLVMValueRef off[16];
+            for (int i = 0; i < 16; i++) off[i] = LLVMConstInt(T_i8, 16 * j, false);
+            LLVMValueRef ij = LLVMBuildSub(B, ix, LLVMConstVector(off, 16), "");
+            acc = LLVMBuildOr(B, acc, swizzle16(piece16(x, j), ij), "");
+        }
+        ps[k] = acc;
+    }
+    for (unsigned w = 16; np > 1; np /= 2, w *= 2) {
+        LLVMValueRef m[64];
+        for (unsigned i = 0; i < 2 * w; i++) m[i] = LLVMConstInt(T_i32, i, false);
+        for (unsigned k = 0; k < np / 2; k++) ps[k] = LLVMBuildShuffleVector(B, ps[2 * k], ps[2 * k + 1], LLVMConstVector(m, 2 * w), "");
+    }
+    return ps[0];
+}
+
+static LLVMValueRef const_lanes(LLVMTypeRef lane, unsigned n, unsigned long long v) {
+    LLVMValueRef c[64];
+    for (unsigned i = 0; i < n; i++) c[i] = LLVMConstInt(lane, v, false);
+    return LLVMConstVector(c, n);
+}
+
+// @dot on i16 lanes as the target's instruction (issue 0036): pmaddwd on
+// x86 (one per register of the widest width the function's extensions
+// have), i32x4.dot_i16x8_s on wasm. Pairs of lanes are multiplied and added
+// in i32, which wraps only for (-32768 * -32768) * 2, as both instructions
+// do. NULL where there is none (other architectures, or odd widths), for
+// the generic IR. Pieces of the operands, then the pieces of the result joined.
+static LLVMValueRef dot_i16_native(LLVMValueRef x, LLVMValueRef y, unsigned nl) {
+    unsigned per;  // i16 lanes per instruction
+    const char *name;
+    if (g_target.wasm) {
+        if (!(g_features & feature_bit("simd128"))) return NULL;
+        per = 8, name = "llvm.wasm.dot";
+    } else if (g_arch == ARCH_X64) {
+        if (nl >= 32 && (g_features & feature_bit("avx512bw"))) per = 32, name = "llvm.x86.avx512.pmaddw.d.512";
+        else if (nl >= 16 && (g_features & feature_bit("avx2"))) per = 16, name = "llvm.x86.avx2.pmadd.wd";
+        else per = 8, name = "llvm.x86.sse2.pmadd.wd";
+    } else {
+        return NULL;
+    }
+    if (nl % per || ((nl / per) & (nl / per - 1))) return NULL;
+    unsigned np = nl / per;
+    LLVMValueRef *ps = NEWN(LLVMValueRef, np), *m = NEWN(LLVMValueRef, nl);
+    for (unsigned k = 0; k < np; k++) {
+        LLVMValueRef args[2] = {x, y};
+        if (np > 1) {
+            for (unsigned i = 0; i < per; i++) m[i] = LLVMConstInt(T_i32, k * per + i, false);
+            LLVMValueRef mask = LLVMConstVector(m, per);
+            args[0] = LLVMBuildShuffleVector(B, x, LLVMGetUndef(LLVMTypeOf(x)), mask, "");
+            args[1] = LLVMBuildShuffleVector(B, y, LLVMGetUndef(LLVMTypeOf(y)), mask, "");
+        }
+        ps[k] = intrinsic(name, NULL, 0, args, 2);
+    }
+    for (unsigned w = per / 2; np > 1; np /= 2, w *= 2) {
+        for (unsigned i = 0; i < 2 * w; i++) m[i] = LLVMConstInt(T_i32, i, false);
+        for (unsigned k = 0; k < np / 2; k++) ps[k] = LLVMBuildShuffleVector(B, ps[2 * k], ps[2 * k + 1], LLVMConstVector(m, 2 * w), "");
+    }
+    return ps[0];
+}
+
+// x86's one-instruction permutes of a table's lanes by indices of the same
+// width (the index modulo the lanes, or the lanes of both tables), where the
+// function's extensions have them: the intrinsic's name, or NULL.
+static const char *x86_permute(Type *t, bool two) {
+    if (g_arch != ARCH_X64) return NULL;
+    int w = t->elem->bits, bytes = w * t->lanes / 8;
+    bool f = (g_features & feature_bit("avx512f")) != 0;
+    if (t->elem->kind == TY_FLOAT) {
+        // the floating-point forms (vpermps, vpermt2ps, ...), so that the
+        // lanes stay in that domain (issue 0089)
+        if (bytes == 64 && w == 32 && f) return two ? "llvm.x86.avx512.vpermi2var.ps.512" : "llvm.x86.avx512.permvar.sf.512";
+        if (bytes == 64 && w == 64 && f) return two ? "llvm.x86.avx512.vpermi2var.pd.512" : "llvm.x86.avx512.permvar.df.512";
+        if (!two && bytes == 32 && w == 32 && (g_features & feature_bit("avx2"))) return "llvm.x86.avx2.permps";
+        return NULL;
+    }
+    if (bytes == 64 && w == 32 && f) return two ? "llvm.x86.avx512.vpermi2var.d.512" : "llvm.x86.avx512.permvar.si.512";
+    if (bytes == 64 && w == 64 && f) return two ? "llvm.x86.avx512.vpermi2var.q.512" : "llvm.x86.avx512.permvar.di.512";
+    if (bytes == 64 && w == 16 && (g_features & feature_bit("avx512bw")))
+        return two ? "llvm.x86.avx512.vpermi2var.hi.512" : "llvm.x86.avx512.permvar.hi.512";
+    if (bytes == 64 && w == 8 && (g_features & feature_bit("avx512vbmi")))
+        return two ? "llvm.x86.avx512.vpermi2var.qi.512" : "llvm.x86.avx512.permvar.qi.512";
+    if (!two && bytes == 32 && w == 32 && (g_features & feature_bit("avx2"))) return "llvm.x86.avx2.permd";
+    return NULL;
+}
+
+// @swizzle (spec §13.2): lane i of the result is lane idx[i] of the table, or
+// 0 when idx[i] (unsigned) is not a lane.
+static LLVMValueRef swizzle_lanes(Type *t, LLVMValueRef x, LLVMValueRef idx) {
+    unsigned n = (unsigned)t->lanes, w = (unsigned)t->elem->bits, lb = w / 8, nb = n * lb;
+    LLVMTypeRef vt = LLVMTypeOf(x), it = LLVMTypeOf(idx);
+    const char *perm = x86_permute(t, false);
+    if (perm && w > 8) {
+        LLVMTypeRef pt = t->elem->kind == TY_FLOAT ? vt : it;
+        LLVMValueRef args[2] = {LLVMBuildBitCast(B, x, pt, ""), idx};
+        LLVMValueRef r = intrinsic(perm, NULL, 0, args, 2);
+        LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, const_lanes(LLVMGetElementType(it), n, n), "");
+        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(pt), r, ""), vt, "");
+    }
+    LLVMTypeRef bt = LLVMVectorType(T_i8, nb);
+    if (w == 8) return LLVMBuildBitCast(B, swizzle_bytes(LLVMBuildBitCast(B, x, bt, ""), idx, nb), vt, "");
+    // byte indices: min(idx, n) * lb + k for byte k of each lane (at most 64 + 7)
+    LLVMValueRef mn[2] = {idx, const_lanes(LLVMGetElementType(it), n, n)};
+    LLVMValueRef cl = intrinsic("llvm.umin", &it, 1, mn, 2);
+    cl = LLVMBuildTrunc(B, cl, LLVMVectorType(T_i8, n), "");
+    LLVMValueRef rep[64], kk[64];
+    for (unsigned i = 0; i < nb; i++) {
+        rep[i] = LLVMConstInt(T_i32, i / lb, false);
+        kk[i] = LLVMConstInt(T_i8, i % lb, false);
+    }
+    LLVMValueRef bi = LLVMBuildShuffleVector(B, cl, LLVMGetUndef(LLVMTypeOf(cl)), LLVMConstVector(rep, nb), "");
+    bi = LLVMBuildAdd(B, LLVMBuildMul(B, bi, const_lanes(T_i8, nb, lb), ""), LLVMConstVector(kk, nb), "");
+    return LLVMBuildBitCast(B, swizzle_bytes(LLVMBuildBitCast(B, x, bt, ""), bi, nb), vt, "");
+}
+
+// @swizzle2: the same over the 2n lanes of a, then b.
+static LLVMValueRef swizzle2_lanes(Type *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef idx) {
+    unsigned n = (unsigned)t->lanes;
+    LLVMTypeRef vt = LLVMTypeOf(x), it = LLVMTypeOf(idx);
+    const char *perm = x86_permute(t, true);
+    if (perm) {
+        LLVMTypeRef pt = t->elem->kind == TY_FLOAT ? vt : it;
+        LLVMValueRef args[3] = {LLVMBuildBitCast(B, x, pt, ""), idx, LLVMBuildBitCast(B, y, pt, "")};
+        LLVMValueRef r = intrinsic(perm, NULL, 0, args, 3);
+        LLVMValueRef out = LLVMBuildICmp(B, LLVMIntUGE, idx, const_lanes(LLVMGetElementType(it), n, 2 * n), "");
+        return LLVMBuildBitCast(B, LLVMBuildSelect(B, out, LLVMConstNull(pt), r, ""), vt, "");
+    }
+    // indices below n pick from x (in y they wrap to beyond its lanes), the
+    // others from y
+    LLVMValueRef lo = swizzle_lanes(t, x, idx);
+    LLVMValueRef hi = swizzle_lanes(t, y, LLVMBuildSub(B, idx, const_lanes(LLVMGetElementType(it), n, n), ""));
+    LLVMValueRef r = LLVMBuildOr(B, LLVMBuildBitCast(B, lo, it, ""), LLVMBuildBitCast(B, hi, it, ""), "");
+    return LLVMBuildBitCast(B, r, vt, "");
+}
+
+// The mask of a vector's first min(len, n) lanes.
+static LLVMValueRef first_lanes(int n, LLVMValueRef len) {
+    LLVMValueRef c[64];
+    for (int i = 0; i < n; i++) c[i] = LLVMConstInt(LLVMTypeOf(len), (unsigned long long)i, false);
+    LLVMValueRef lv = splat(LLVMVectorType(LLVMTypeOf(len), (unsigned)n), len, (unsigned)n);
+    return LLVMBuildICmp(B, LLVMIntULT, LLVMConstVector(c, (unsigned)n), lv, "");
+}
+
+// The processor instructions of spec §13.5, as LLVM's intrinsics. A
+// 256- or 512-bit AES round or carry-less multiply in a function without
+// VAES / VPCLMULQDQ is done on each 128-bit part.
+static LLVMValueRef insn_call(const char *name, LLVMTypeRef ret, LLVMValueRef *args, int n) {
+    LLVMTypeRef ps[4];
+    for (int i = 0; i < n; i++) ps[i] = LLVMTypeOf(args[i]);
+    LLVMTypeRef fty = LLVMFunctionType(ret, ps, (unsigned)n, false);
+    LLVMValueRef f = LLVMGetNamedFunction(mod, name);
+    if (!f) f = LLVMAddFunction(mod, name, fty);
+    return LLVMBuildCall2(B, fty, f, args, (unsigned)n, "");
+}
+
+static LLVMValueRef v2i64(LLVMValueRef v, unsigned lanes) {
+    return LLVMBuildBitCast(B, v, LLVMVectorType(T_i64, lanes), "");
+}
+
+static LLVMValueRef part_of(LLVMValueRef v, unsigned k, unsigned n) {
+    LLVMValueRef m[8];
+    for (unsigned i = 0; i < n; i++) m[i] = LLVMConstInt(T_i32, k * n + i, false);
+    return LLVMBuildShuffleVector(B, v, LLVMGetUndef(LLVMTypeOf(v)), LLVMConstVector(m, n), "");
+}
+
+static LLVMValueRef gen_insn(Expr *e, Type *rt) {
+    int id = e->index;
+    int n = e->bargs.len;
+    LLVMValueRef a[3];
+    for (int i = 0; i < n; i++) a[i] = gen(e->bargs.data[i].e);
+    LLVMTypeRef t = lty(rt);
+    LLVMTypeRef v4 = LLVMVectorType(T_i32, 4), v2 = LLVMVectorType(T_i64, 2), v16 = LLVMVectorType(T_i8, 16);
+    if ((id >= BI_X86_AESENC && id <= BI_X86_AESDECLAST) || id == BI_X86_CLMUL) {
+        static const char *const nm[] = {"aesenc", "aesenclast", "aesdec", "aesdeclast"};
+        bool clmul = id == BI_X86_CLMUL;
+        unsigned bytes = (unsigned)type_size(rt), q = bytes / 8;
+        bool wide_ok = bytes == 16 || (g_features & (clmul ? ((uint64_t)1 << 33) : ((uint64_t)1 << 32)));
+        if (!wide_ok) {
+            // each 128-bit part on its own
+            LLVMValueRef r = LLVMGetUndef(LLVMVectorType(T_i64, q));
+            for (unsigned k = 0; k < q / 2; k++) {
+                LLVMValueRef args[3] = {part_of(v2i64(a[0], q), k, 2), part_of(v2i64(a[1], q), k, 2),
+                                        clmul ? LLVMBuildTrunc(B, a[2], T_i8, "") : NULL};
+                LLVMValueRef p = insn_call(clmul ? "llvm.x86.pclmulqdq" : arena_printf("llvm.x86.aesni.%s", nm[id - BI_X86_AESENC]),
+                                           v2, args, clmul ? 3 : 2);
+                for (unsigned j = 0; j < 2; j++)
+                    r = LLVMBuildInsertElement(B, r, LLVMBuildExtractElement(B, p, LLVMConstInt(T_i32, j, false), ""),
+                                               LLVMConstInt(T_i32, 2 * k + j, false), "");
+            }
+            return LLVMBuildBitCast(B, r, t, "");
+        }
+        const char *suffix = bytes == 32 ? ".256" : bytes == 64 ? ".512" : "";
+        LLVMValueRef args[3] = {v2i64(a[0], q), v2i64(a[1], q), clmul ? LLVMBuildTrunc(B, a[2], T_i8, "") : NULL};
+        const char *name = clmul ? arena_printf("llvm.x86.pclmulqdq%s", suffix)
+                                 : arena_printf("llvm.x86.aesni.%s%s", nm[id - BI_X86_AESENC], suffix);
+        return LLVMBuildBitCast(B, insn_call(name, LLVMVectorType(T_i64, q), args, clmul ? 3 : 2), t, "");
+    }
+    switch (id) {
+    case BI_X86_AESIMC: {
+        LLVMValueRef x = v2i64(a[0], 2);
+        return LLVMBuildBitCast(B, insn_call("llvm.x86.aesni.aesimc", v2, &x, 1), t, "");
+    }
+    case BI_X86_AESKEYGENASSIST: {
+        LLVMValueRef args[2] = {v2i64(a[0], 2), LLVMBuildTrunc(B, a[1], T_i8, "")};
+        return LLVMBuildBitCast(B, insn_call("llvm.x86.aesni.aeskeygenassist", v2, args, 2), t, "");
+    }
+    case BI_X86_SHA1RNDS4: {
+        LLVMValueRef args[3] = {a[0], a[1], LLVMBuildTrunc(B, a[2], T_i8, "")};
+        return insn_call("llvm.x86.sha1rnds4", v4, args, 3);
+    }
+    case BI_X86_SHA1NEXTE: return insn_call("llvm.x86.sha1nexte", v4, a, 2);
+    case BI_X86_SHA1MSG1: return insn_call("llvm.x86.sha1msg1", v4, a, 2);
+    case BI_X86_SHA1MSG2: return insn_call("llvm.x86.sha1msg2", v4, a, 2);
+    case BI_X86_SHA256RNDS2: return insn_call("llvm.x86.sha256rnds2", v4, a, 3);
+    case BI_X86_SHA256MSG1: return insn_call("llvm.x86.sha256msg1", v4, a, 2);
+    case BI_X86_SHA256MSG2: return insn_call("llvm.x86.sha256msg2", v4, a, 2);
+    case BI_X86_CRC32C: {
+        unsigned bits = LLVMGetIntTypeWidth(LLVMTypeOf(a[1]));
+        if (bits == 64) {
+            LLVMValueRef args[2] = {LLVMBuildZExt(B, a[0], T_i64, ""), a[1]};
+            return LLVMBuildTrunc(B, insn_call("llvm.x86.sse42.crc32.64.64", T_i64, args, 2), T_i32, "");
+        }
+        return insn_call(arena_printf("llvm.x86.sse42.crc32.32.%u", bits), T_i32, a, 2);
+    }
+    case BI_ARM_AESE: return insn_call("llvm.aarch64.crypto.aese", v16, a, 2);
+    case BI_ARM_AESD: return insn_call("llvm.aarch64.crypto.aesd", v16, a, 2);
+    case BI_ARM_AESMC: return insn_call("llvm.aarch64.crypto.aesmc", v16, a, 1);
+    case BI_ARM_AESIMC: return insn_call("llvm.aarch64.crypto.aesimc", v16, a, 1);
+    case BI_ARM_PMULL:
+    case BI_ARM_PMULL2: {
+        unsigned lane = id == BI_ARM_PMULL2;
+        LLVMValueRef args[2] = {LLVMBuildExtractElement(B, a[0], LLVMConstInt(T_i32, lane, false), ""),
+                                LLVMBuildExtractElement(B, a[1], LLVMConstInt(T_i32, lane, false), "")};
+        return LLVMBuildBitCast(B, insn_call("llvm.aarch64.neon.pmull64", v16, args, 2), t, "");
+    }
+    case BI_ARM_SHA1C: return insn_call("llvm.aarch64.crypto.sha1c", v4, a, 3);
+    case BI_ARM_SHA1P: return insn_call("llvm.aarch64.crypto.sha1p", v4, a, 3);
+    case BI_ARM_SHA1M: return insn_call("llvm.aarch64.crypto.sha1m", v4, a, 3);
+    case BI_ARM_SHA1H: return insn_call("llvm.aarch64.crypto.sha1h", T_i32, a, 1);
+    case BI_ARM_SHA1SU0: return insn_call("llvm.aarch64.crypto.sha1su0", v4, a, 3);
+    case BI_ARM_SHA1SU1: return insn_call("llvm.aarch64.crypto.sha1su1", v4, a, 2);
+    case BI_ARM_SHA256H: return insn_call("llvm.aarch64.crypto.sha256h", v4, a, 3);
+    case BI_ARM_SHA256H2: return insn_call("llvm.aarch64.crypto.sha256h2", v4, a, 3);
+    case BI_ARM_SHA256SU0: return insn_call("llvm.aarch64.crypto.sha256su0", v4, a, 2);
+    case BI_ARM_SHA256SU1: return insn_call("llvm.aarch64.crypto.sha256su1", v4, a, 3);
+    case BI_ARM_SHA512H: return insn_call("llvm.aarch64.crypto.sha512h", v2, a, 3);
+    case BI_ARM_SHA512H2: return insn_call("llvm.aarch64.crypto.sha512h2", v2, a, 3);
+    case BI_ARM_SHA512SU0: return insn_call("llvm.aarch64.crypto.sha512su0", v2, a, 2);
+    case BI_ARM_SHA512SU1: return insn_call("llvm.aarch64.crypto.sha512su1", v2, a, 3);
+    case BI_ARM_EOR3:
+    case BI_ARM_BCAX: {
+        LLVMValueRef args[3] = {LLVMBuildBitCast(B, a[0], v16, ""), LLVMBuildBitCast(B, a[1], v16, ""),
+                                LLVMBuildBitCast(B, a[2], v16, "")};
+        const char *name = id == BI_ARM_EOR3 ? "llvm.aarch64.crypto.eor3u.v16i8" : "llvm.aarch64.crypto.bcaxu.v16i8";
+        return LLVMBuildBitCast(B, insn_call(name, v16, args, 3), t, "");
+    }
+    case BI_ARM_RAX1: return insn_call("llvm.aarch64.crypto.rax1", v2, a, 2);
+    case BI_ARM_XAR: {
+        LLVMValueRef args[3] = {a[0], a[1], LLVMBuildZExt(B, a[2], T_i64, "")};
+        return insn_call("llvm.aarch64.crypto.xar", v2, args, 3);
+    }
+    case BI_ARM_CRC32:
+    case BI_ARM_CRC32C: {
+        unsigned bits = LLVMGetIntTypeWidth(LLVMTypeOf(a[1]));
+        const char *sfx = bits == 8 ? "b" : bits == 16 ? "h" : bits == 32 ? "w" : "x";
+        LLVMValueRef args[2] = {a[0], bits < 32 ? LLVMBuildZExt(B, a[1], T_i32, "") : a[1]};
+        return insn_call(arena_printf("llvm.aarch64.crc32%s%s", id == BI_ARM_CRC32C ? "c" : "", sfx), T_i32, args, 2);
+    }
+    }
+    internal_error("processor instruction builtin");
+    return NULL;
+}
 
 static LLVMValueRef gen_builtin(Expr *e) {
     BuiltinArg *a = e->bargs.data;
@@ -1786,6 +2890,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         Type *s = ct(a[1].e->type);
         LLVMValueRef v = gen(a[1].e);
         if (s == rt) return v;
+        if (s->kind == TY_BOOL) return LLVMBuildZExt(B, v, lty(rt), "");
         if (s->kind == TY_INT && rt->kind == TY_INT) return ext_int(v, lty(rt), s->is_signed);
         if (s->kind == TY_FLOAT && rt->kind == TY_FLOAT) return LLVMBuildFPExt(B, v, lty(rt), "");
         if (s->kind == TY_INT && rt->kind == TY_FLOAT)
@@ -1838,6 +2943,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
     }
     case BI_INT_FROM_FLOAT: {
         LLVMValueRef v = gen(a[1].e);
+        if (rt->kind == TY_VEC && !g_target.wasm) return vec_int_from_float(rt, ct(a[1].e->type), v);
         LLVMTypeRef tys[2] = {lty(rt), LLVMTypeOf(v)};
         return intrinsic(rt->is_signed ? "llvm.fptosi.sat" : "llvm.fptoui.sat", tys, 2, &v, 1);
     }
@@ -1864,6 +2970,16 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_INT_FROM_PTR: return LLVMBuildPtrToInt(B, gen(a[0].e), T_isz, "");
     case BI_PTR_FROM_INT: return LLVMBuildIntToPtr(B, gen(a[1].e), T_ptr, "");
     case BI_PTR_CAST: return gen(a[1].e);
+    case BI_PTR_ADD:
+    case BI_PTR_SUB: {
+        // In-bounds (spec §5.7): LLVM may then fold constant offsets into
+        // addressing, such as wasm's `offset=` and x86 displacements. The
+        // stride is exactly the element's size.
+        LLVMValueRef p = gen(a[0].e), n = gen(a[1].e);
+        if (e->index == BI_PTR_SUB) n = LLVMBuildNeg(B, n, "");
+        LLVMTypeRef st = LLVMArrayType2(T_i8, (uint64_t)type_size(rt->elem));
+        return LLVMBuildInBoundsGEP2(B, st, p, &n, 1, "");
+    }
     case BI_SLICE_FROM_PTR: {
         LLVMValueRef p = gen(a[0].e), n = gen(a[1].e);
         LLVMValueRef s = LLVMGetUndef(lty(rt));
@@ -1981,11 +3097,11 @@ static LLVMValueRef gen_builtin(Expr *e) {
         return intr2(nm, gen(a[0].e), gen(a[1].e));
     }
     case BI_MUL_SAT: {
-        bool saved = O->overflow_saturate;
-        O->overflow_saturate = true;
         LLVMValueRef l = gen(a[0].e), r = gen(a[1].e);
+        OverflowMode saved = O->overflow;
+        O->overflow = OVF_SATURATE;
         LLVMValueRef v = overflow_op("mul", rt->is_signed, l, r, true);
-        O->overflow_saturate = saved;
+        O->overflow = saved;
         return v;
     }
     case BI_ADD_CHECKED:
@@ -2014,10 +3130,10 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMTypeRef t = LLVMTypeOf(v);
         if (rt->kind == TY_INT) {
             LLVMValueRef is_min = LLVMBuildICmp(B, LLVMIntEQ, v, int_min(t), "");
-            if (!O->overflow_saturate) check_or_trap(LLVMBuildNot(B, is_min, ""), T_OVERFLOW);
+            if (O->overflow == OVF_TRAP) check_or_trap(LLVMBuildNot(B, is_min, ""), T_OVERFLOW);
             LLVMValueRef args[2] = {v, LLVMConstInt(T_i1, 0, false)};
-            LLVMValueRef r = intrinsic("llvm.abs", &t, 1, args, 2);
-            if (O->overflow_saturate) r = LLVMBuildSelect(B, is_min, int_max(t, true), r, "");
+            LLVMValueRef r = intrinsic("llvm.abs", &t, 1, args, 2);  // @abs(MIN) wraps to MIN
+            if (O->overflow == OVF_SATURATE) r = LLVMBuildSelect(B, is_min, int_max(t, true), r, "");
             return r;
         }
         LLVMValueRef args[2] = {v, LLVMConstInt(T_i1, 0, false)};
@@ -2067,9 +3183,11 @@ static LLVMValueRef gen_builtin(Expr *e) {
         Type *st = ct(a[1].e->type);
         LLVMValueRef s = gen(a[1].e);
         LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
-        LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(st->elem)), "");
-        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, bytes, usz(16), ""), T_LENGTH);
-        asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(16));
+        int64_t vb = type_size(rt);
+        // s.len * size >= vb, as a count of elements (which cannot wrap)
+        int64_t es = type_size(st->elem) > 0 ? type_size(st->elem) : 1;
+        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, len, usz((vb + es - 1) / es), ""), T_LENGTH);
+        asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(vb));
         return load(rt, LLVMBuildExtractValue(B, s, 0, ""), true);
     }
     case BI_STORE: {
@@ -2078,9 +3196,11 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef s = gen(a[0].e);
         LLVMValueRef v = gen(a[1].e);
         LLVMValueRef len = LLVMBuildExtractValue(B, s, 1, "");
-        LLVMValueRef bytes = LLVMBuildMul(B, len, usz(type_size(st->elem)), "");
-        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, bytes, usz(16), ""), T_LENGTH);
-        asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(16));
+        int64_t vb = type_size(vt);
+        // s.len * size >= vb, as a count of elements (which cannot wrap)
+        int64_t es = type_size(st->elem) > 0 ? type_size(st->elem) : 1;
+        check_or_trap(LLVMBuildICmp(B, LLVMIntUGE, len, usz((vb + es - 1) / es), ""), T_LENGTH);
+        asan_check(LLVMBuildExtractValue(B, s, 0, ""), usz(vb));
         store(vt, v, LLVMBuildExtractValue(B, s, 0, ""), true);
         return NULL;
     }
@@ -2091,34 +3211,27 @@ static LLVMValueRef gen_builtin(Expr *e) {
         for (int i = 0; i < idx->args.len; i++) m[i] = LLVMConstInt(T_i32, (unsigned long long)idx->args.data[i]->cval, false);
         return LLVMBuildShuffleVector(B, x, y, LLVMConstVector(m, (unsigned)idx->args.len), "");
     }
-    case BI_SWIZZLE: {
-        LLVMValueRef x = gen(a[0].e), idx = gen(a[1].e);
-        if (g_target.wasm) {
-            LLVMValueRef args[2] = {x, idx};
-            return intrinsic("llvm.wasm.swizzle", NULL, 0, args, 2);
-        }
-        if (g_has_ssse3) {
-            // pshufb zeroes lanes whose index has its top bit set; adding
-            // 0x70 with saturation sets it exactly for indices >= 16
-            LLVMTypeRef vt = LLVMTypeOf(idx);
-            LLVMValueRef c70[16];
-            for (int i = 0; i < 16; i++) c70[i] = LLVMConstInt(T_i8, 0x70, false);
-            LLVMValueRef sat[2] = {idx, LLVMConstVector(c70, 16)};
-            LLVMValueRef k = intrinsic("llvm.uadd.sat", &vt, 1, sat, 2);
-            LLVMValueRef args[2] = {x, k};
-            return intrinsic("llvm.x86.ssse3.pshuf.b.128", NULL, 0, args, 2);
-        }
-        LLVMValueRef r = LLVMConstNull(lty(rt));
-        for (unsigned i = 0; i < 16; i++) {
-            LLVMValueRef li = LLVMConstInt(T_i32, i, false);
-            LLVMValueRef k = LLVMBuildExtractElement(B, idx, li, "");
-            LLVMValueRef inb = LLVMBuildICmp(B, LLVMIntULT, k, LLVMConstInt(T_i8, 16, false), "");
-            LLVMValueRef kk = LLVMBuildAnd(B, k, LLVMConstInt(T_i8, 15, false), "");
-            LLVMValueRef el = LLVMBuildExtractElement(B, x, LLVMBuildZExt(B, kk, T_i32, ""), "");
-            el = LLVMBuildSelect(B, inb, el, LLVMConstInt(T_i8, 0, false), "");
-            r = LLVMBuildInsertElement(B, r, el, li, "");
-        }
-        return r;
+    case BI_SWIZZLE: return swizzle_lanes(ct(a[0].e->type), gen(a[0].e), gen(a[1].e));
+    case BI_SWIZZLE2: return swizzle2_lanes(ct(a[0].e->type), gen(a[0].e), gen(a[1].e), gen(a[2].e));
+    case BI_LOAD_PARTIAL: {
+        LLVMValueRef s = gen(a[1].e);
+        LLVMValueRef p = LLVMBuildExtractValue(B, s, 0, "");
+        LLVMValueRef mask = first_lanes(rt->lanes, LLVMBuildExtractValue(B, s, 1, ""));
+        LLVMTypeRef tys[2] = {lty(rt), LLVMTypeOf(p)};
+        LLVMValueRef args[4] = {p, LLVMConstInt(T_i32, (unsigned long long)type_size(rt->elem), false), mask,
+                                LLVMConstNull(lty(rt))};
+        return intrinsic("llvm.masked.load", tys, 2, args, 4);
+    }
+    case BI_STORE_PARTIAL: {
+        Type *vt = ct(a[1].e->type);
+        LLVMValueRef s = gen(a[0].e);
+        LLVMValueRef v = gen(a[1].e);
+        LLVMValueRef p = LLVMBuildExtractValue(B, s, 0, "");
+        LLVMValueRef mask = first_lanes(vt->lanes, LLVMBuildExtractValue(B, s, 1, ""));
+        LLVMTypeRef tys[2] = {lty(vt), LLVMTypeOf(p)};
+        LLVMValueRef args[4] = {v, p, LLVMConstInt(T_i32, (unsigned long long)type_size(vt->elem), false), mask};
+        intrinsic("llvm.masked.store", tys, 2, args, 4);
+        return NULL;
     }
     case BI_LANES_EQ:
     case BI_LANES_NE:
@@ -2135,14 +3248,20 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_SELECT: {
         LLVMValueRef m = gen(a[0].e), x = gen(a[1].e), y = gen(a[2].e);
         LLVMTypeRef mt = LLVMTypeOf(m);
+        // a mask of lane comparisons: a select on its i1 lanes is the same bit
+        // for bit, and becomes a blend (issue 0031)
+        Type *mty = ct(a[0].e->type);
+        if (rt->kind == TY_VEC && mty->kind == TY_VEC && mty->lanes == rt->lanes && is_mask(a[0].e, 0))
+            return LLVMBuildSelect(B, LLVMBuildICmp(B, LLVMIntSLT, m, LLVMConstNull(mt), ""), x, y, "");
         LLVMValueRef xm = LLVMBuildBitCast(B, x, mt, ""), ym = LLVMBuildBitCast(B, y, mt, "");
         LLVMValueRef r = LLVMBuildOr(B, LLVMBuildAnd(B, xm, m, ""), LLVMBuildAnd(B, ym, LLVMBuildNot(B, m, ""), ""), "");
         return LLVMBuildBitCast(B, r, lty(rt), "");
     }
     case BI_ANY_TRUE: {
         LLVMValueRef v = gen(a[0].e);
-        LLVMValueRef bits = LLVMBuildBitCast(B, v, T_i128, "");
-        return LLVMBuildICmp(B, LLVMIntNE, bits, LLVMConstNull(T_i128), "");
+        LLVMTypeRef it = LLVMIntTypeInContext(ctx, (unsigned)simd_bits(ct(a[0].e->type)));
+        LLVMValueRef bits = LLVMBuildBitCast(B, v, it, "");
+        return LLVMBuildICmp(B, LLVMIntNE, bits, LLVMConstNull(it), "");
     }
     case BI_ALL_TRUE: {
         LLVMValueRef v = gen(a[0].e);
@@ -2159,30 +3278,150 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef v = gen(a[0].e);
         LLVMValueRef neg = LLVMBuildICmp(B, LLVMIntSLT, v, LLVMConstNull(LLVMTypeOf(v)), "");
         LLVMValueRef bits = LLVMBuildBitCast(B, neg, LLVMIntTypeInContext(ctx, (unsigned)vt->lanes), "");
-        return LLVMBuildZExt(B, bits, T_i32, "");
+        return vt->lanes >= 32 ? bits : LLVMBuildZExt(B, bits, T_i32, "");  // (u64 for 64 lanes)
     }
     case BI_REDUCE_ADD: return reduce_add(ct(a[0].e->type), gen(a[0].e));
     case BI_DOT: {
         Type *vt = ct(a[0].e->type);
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e);
         if (vt->elem->kind == TY_FLOAT) return reduce_add(vt, LLVMBuildFMul(B, x, y, ""));
-        LLVMTypeRef w = LLVMVectorType(T_i32, 8);
+        unsigned nl = (unsigned)vt->lanes;
+        LLVMValueRef d = dot_i16_native(x, y, nl);
+        if (d) return d;
+        LLVMTypeRef w = LLVMVectorType(T_i32, nl);
         LLVMValueRef p = LLVMBuildMul(B, LLVMBuildSExt(B, x, w, ""), LLVMBuildSExt(B, y, w, ""), "");
-        LLVMValueRef ev[4], od[4];
-        for (unsigned i = 0; i < 4; i++) {
+        LLVMValueRef ev[16], od[16];
+        for (unsigned i = 0; i < nl / 2; i++) {
             ev[i] = LLVMConstInt(T_i32, 2 * i, false);
             od[i] = LLVMConstInt(T_i32, 2 * i + 1, false);
         }
-        LLVMValueRef pe = LLVMBuildShuffleVector(B, p, LLVMGetUndef(w), LLVMConstVector(ev, 4), "");
-        LLVMValueRef po = LLVMBuildShuffleVector(B, p, LLVMGetUndef(w), LLVMConstVector(od, 4), "");
+        LLVMValueRef pe = LLVMBuildShuffleVector(B, p, LLVMGetUndef(w), LLVMConstVector(ev, nl / 2), "");
+        LLVMValueRef po = LLVMBuildShuffleVector(B, p, LLVMGetUndef(w), LLVMConstVector(od, nl / 2), "");
         return LLVMBuildAdd(B, pe, po, "");
+    }
+    case BI_WIDEN_LOW:
+    case BI_WIDEN_HIGH: {
+        // WebAssembly's extend_low/extend_high (x86 pmovsx/pmovzx, Arm sxtl/uxtl)
+        Type *vt = ct(a[0].e->type);
+        LLVMValueRef v = gen(a[0].e);
+        unsigned n = (unsigned)rt->lanes, base = e->index == BI_WIDEN_HIGH ? n : 0;
+        LLVMValueRef *mask = NEWN(LLVMValueRef, n);
+        for (unsigned i = 0; i < n; i++) mask[i] = LLVMConstInt(T_i32, base + i, false);
+        LLVMValueRef half = LLVMBuildShuffleVector(B, v, LLVMGetUndef(LLVMTypeOf(v)), LLVMConstVector(mask, n), "");
+        return vt->elem->is_signed ? LLVMBuildSExt(B, half, lty(rt), "") : LLVMBuildZExt(B, half, lty(rt), "");
+    }
+    case BI_NARROW: {
+        // WebAssembly's narrow_*_sat, by the operand and result lane types:
+        // each lane saturated to the result's range, a's lanes then b's
+        Type *vt = ct(a[1].e->type);
+        LLVMValueRef x = gen(a[1].e), y = gen(a[2].e);
+        unsigned n = (unsigned)vt->lanes, bits = (unsigned)rt->elem->bits;
+        LLVMTypeRef xt = LLVMTypeOf(x), lane = LLVMGetElementType(xt);
+        i128 hi = rt->elem->is_signed ? ((i128)1 << (bits - 1)) - 1 : ((i128)1 << bits) - 1;
+        i128 lo = rt->elem->is_signed ? -((i128)1 << (bits - 1)) : 0;
+        if (g_target.wasm && bits <= 16) {
+            // narrow_*_sat per pair of 128-bit pieces; they take signed
+            // lanes, so unsigned ones are first limited to the result's range
+            if (!vt->elem->is_signed) {
+                x = intr2("llvm.umin", x, splat(xt, cint(lane, hi), n));
+                y = intr2("llvm.umin", y, splat(xt, cint(lane, hi), n));
+            }
+            unsigned per = 128 / (2 * bits), np = n / per;  // source lanes per piece, pieces per operand
+            LLVMTypeRef pt = LLVMVectorType(lane, per), qt = LLVMVectorType(LLVMIntTypeInContext(ctx, bits), 2 * per);
+            LLVMValueRef *pieces = NEWN(LLVMValueRef, 2 * np), *mask = NEWN(LLVMValueRef, n * 2);
+            for (unsigned k = 0; k < 2 * np; k++) {
+                LLVMValueRef src = k < np ? x : y;
+                for (unsigned i = 0; i < per; i++) mask[i] = LLVMConstInt(T_i32, (k % np) * per + i, false);
+                pieces[k] = np == 1 ? src : LLVMBuildShuffleVector(B, src, LLVMGetUndef(xt), LLVMConstVector(mask, per), "");
+            }
+            LLVMTypeRef tys[2] = {qt, pt};
+            const char *name = rt->elem->is_signed ? "llvm.wasm.narrow.signed" : "llvm.wasm.narrow.unsigned";
+            LLVMValueRef *q = NEWN(LLVMValueRef, np);
+            for (unsigned k = 0; k < np; k++) {
+                LLVMValueRef args[2] = {pieces[2 * k], pieces[2 * k + 1]};
+                q[k] = intrinsic(name, tys, 2, args, 2);
+            }
+            // join the results pairwise (np is 1, 2 or 4)
+            for (unsigned m = np, len = 2 * per; m > 1; m /= 2, len *= 2) {
+                for (unsigned i = 0; i < 2 * len; i++) mask[i] = LLVMConstInt(T_i32, i, false);
+                for (unsigned k = 0; k < m / 2; k++)
+                    q[k] = LLVMBuildShuffleVector(B, q[2 * k], q[2 * k + 1], LLVMConstVector(mask, 2 * len), "");
+            }
+            LLVMValueRef r = q[0];
+            return r;
+        }
+        LLVMValueRef *mask = NEWN(LLVMValueRef, 2 * n);
+        for (unsigned i = 0; i < 2 * n; i++) mask[i] = LLVMConstInt(T_i32, i, false);
+        LLVMValueRef v = LLVMBuildShuffleVector(B, x, y, LLVMConstVector(mask, 2 * n), "");
+        LLVMTypeRef wt = LLVMTypeOf(v);
+        if (vt->elem->is_signed) {
+            v = intr2("llvm.smax", v, splat(wt, cint(lane, lo), 2 * n));
+            v = intr2("llvm.smin", v, splat(wt, cint(lane, hi), 2 * n));
+        } else {
+            v = intr2("llvm.umin", v, splat(wt, cint(lane, hi), 2 * n));
+        }
+        return LLVMBuildTrunc(B, v, lty(rt), "");
     }
     case BI_TRAP: emit_trap(T_TRAP); return NULL;
     case BI_MEMORY_ERROR: emit_trap(T_MEMORY); return NULL;
     case BI_SANITIZE_ADDRESS: return LLVMConstInt(T_i1, O->sanitize_address ? 1 : 0, false);
+    case BI_TARGET_HAS:
+    case BI_TARGET_ARCH:
+    case BI_TARGET_OS:
+    case BI_CPU_HAS: {
+        int tc = target_cond(e, g_features);
+        if (tc >= 0) return LLVMConstInt(T_i1, (unsigned long long)tc, false);
+        // @cpu_has of an extension the build does not assume
+        uint64_t b = feature_bit(e->bargs.data[0].e->str);
+        if (!b || g_target.wasm) return LLVMConstInt(T_i1, 0, false);
+        return cpu_has_bits(b);
+    }
+    case BI_X86_CPUID: {
+        LLVMValueRef leaf = gen(e->bargs.data[0].e), sub = gen(e->bargs.data[1].e);
+        LLVMTypeRef rt[4] = {T_i32, T_i32, T_i32, T_i32};
+        LLVMTypeRef st = LLVMStructTypeInContext(ctx, rt, 4, false);
+        LLVMTypeRef ps[2] = {T_i32, T_i32};
+        LLVMTypeRef fty = LLVMFunctionType(st, ps, 2, false);
+        const char *cons = "={ax},={bx},={cx},={dx},{ax},{cx}";
+        LLVMValueRef asmv = LLVMGetInlineAsm(fty, "cpuid", 5, (char *)cons, strlen(cons), true, false,
+                                             LLVMInlineAsmDialectATT, false);
+        LLVMValueRef args[2] = {leaf, sub};
+        LLVMValueRef r = LLVMBuildCall2(B, fty, asmv, args, 2, "");
+        LLVMValueRef v = LLVMGetUndef(LLVMVectorType(T_i32, 4));
+        for (unsigned i = 0; i < 4; i++)
+            v = LLVMBuildInsertElement(B, v, LLVMBuildExtractValue(B, r, i, ""), LLVMConstInt(T_i32, i, false), "");
+        return v;
+    }
+    case BI_X86_XGETBV: {
+        LLVMValueRef x = gen(e->bargs.data[0].e);
+        LLVMTypeRef rt[2] = {T_i32, T_i32};
+        LLVMTypeRef st = LLVMStructTypeInContext(ctx, rt, 2, false);
+        LLVMTypeRef fty = LLVMFunctionType(st, &T_i32, 1, false);
+        const char *cons = "={ax},={dx},{cx}";
+        LLVMValueRef asmv = LLVMGetInlineAsm(fty, "xgetbv", 6, (char *)cons, strlen(cons), true, false,
+                                             LLVMInlineAsmDialectATT, false);
+        LLVMValueRef r = LLVMBuildCall2(B, fty, asmv, &x, 1, "");
+        LLVMValueRef lo = LLVMBuildZExt(B, LLVMBuildExtractValue(B, r, 0, ""), T_i64, "");
+        LLVMValueRef hi = LLVMBuildZExt(B, LLVMBuildExtractValue(B, r, 1, ""), T_i64, "");
+        return LLVMBuildOr(B, lo, LLVMBuildShl(B, hi, LLVMConstInt(T_i64, 32, false), ""), "");
+    }
     case BI_EXPECT: check_or_trap(gen(a[0].e), T_EXPECT); return NULL;
     case BI_EXPECT_EQ: gen_expect_eq(e); return NULL;
     case BI_FENCE: LLVMBuildFence(B, LLVMAtomicOrderingSequentiallyConsistent, false, ""); return NULL;
+    case BI_PREFETCH:
+    case BI_PREFETCH_WRITE: {
+        // A hint (spec §5.7): read (prefetcht0, prfm pldl1keep) or write
+        // (prefetchw with the prfchw extension, else prefetcht0; prfm
+        // pstl1keep), keeping the line in every cache level. WebAssembly has
+        // no prefetch.
+        LLVMValueRef p = gen(a[0].e);
+        if (g_target.wasm) return NULL;
+        LLVMTypeRef tys[1] = {T_ptr};
+        LLVMValueRef args[4] = {p, LLVMConstInt(T_i32, e->index == BI_PREFETCH_WRITE, false),
+                                LLVMConstInt(T_i32, 3, false), LLVMConstInt(T_i32, 1, false)};
+        intrinsic("llvm.prefetch", tys, 1, args, 4);
+        return NULL;
+    }
     case BI_ATOMIC_LOAD:
     case BI_ATOMIC_STORE:
     case BI_ATOMIC_ADD:
@@ -2213,7 +3452,9 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef f = error_name_fn(&fty);
         return LLVMBuildCall2(B, fty, f, &code, 1, "");
     }
-    default: break;
+    default:
+        if (e->index >= BI_X86_AESENC && e->index <= BI_ARM_CRC32C) return gen_insn(e, rt);
+        break;
     }
     internal_error(arena_printf("builtin @%s not implemented", e->name));
     return NULL;
@@ -2466,6 +3707,7 @@ static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out) {
     if (O->unit == CG_MODULE) return f;
     if (O->unit == CG_WHOLE) LLVMSetLinkage(f, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(B);
+    LLVMMetadataRef loc = dbg_suspend();
     LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, f, "entry"));
     LLVMValueRef tab = error_name_table();
     int n = g_prog.error_names.len;
@@ -2474,6 +3716,7 @@ static LLVMValueRef error_name_fn(LLVMTypeRef *fty_out) {
     LLVMValueRef ix[2] = {usz(0), c};
     LLVMBuildRet(B, LLVMBuildLoad2(B, st, LLVMBuildGEP2(B, LLVMArrayType2(st, (uint64_t)n + 1), tab, ix, 2, ""), ""));
     if (saved) LLVMPositionBuilderAtEnd(B, saved);
+    dbg_resume(loc);
     return f;
 }
 
@@ -2504,8 +3747,142 @@ static LLVMValueRef mem_grow(LLVMValueRef pages) {
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
+// [x; n] at dest: x is copied first if it is a place (which dest may
+// contain), then stored n times.
+static void repeat_into(Type *t, LLVMValueRef x, LLVMValueRef dest, bool un) {
+    Type *et = t->elem;
+    LLVMTypeRef lt = lty(t);
+    if (LLVMIsConstant(x) && LLVMIsNull(x)) {
+        LLVMBuildMemSet(B, dest, LLVMConstInt(T_i8, 0, false), usz(type_size(t)), un ? 1 : (unsigned)type_align(t));
+        return;
+    }
+    if (is_addr(et, x) && !is_fresh(x)) x = fresh_copy(et, x);
+    if (t->len <= 16 && !in_mem(et)) {
+        for (int64_t i = 0; i < t->len; i++) {
+            LLVMValueRef ix[2] = {usz(0), usz(i)};
+            store(et, x, LLVMBuildInBoundsGEP2(B, lt, dest, ix, 2, ""), un);
+        }
+        return;
+    }
+    LLVMValueRef iv = alloca_in_entry(T_isz, "i");
+    LLVMBuildStore(B, usz(0), iv);
+    LLVMBasicBlockRef cond = new_bb("fill.cond"), body = new_bb("fill.body"), end = new_bb("fill.end");
+    LLVMBuildBr(B, cond);
+    LLVMPositionBuilderAtEnd(B, cond);
+    LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, usz(t->len), ""), body, end);
+    LLVMPositionBuilderAtEnd(B, body);
+    LLVMValueRef ix[2] = {usz(0), i};
+    store(et, x, LLVMBuildInBoundsGEP2(B, lt, dest, ix, 2, ""), un);
+    LLVMBuildStore(B, LLVMBuildAdd(B, i, usz(1), ""), iv);
+    LLVMBuildBr(B, cond);
+    LLVMPositionBuilderAtEnd(B, end);
+}
+
+// The struct or array literal e, of an in-memory type, built in place at
+// dest: a store (or memset, memcpy) per field or element.
+static void lit_into(Expr *e, Type *t, LLVMValueRef dest, bool fresh, bool un) {
+    LLVMTypeRef lt = lty(t);
+    if (e->kind == E_STRUCT_LIT) {
+        for (int i = 0; i < e->inits.len; i++)
+            gen_into(e->inits.data[i].value, LLVMBuildStructGEP2(B, lt, dest, (unsigned)i, ""), fresh, un);
+        return;
+    }
+    if (e->kind == E_ARRAY_LIT) {
+        for (int i = 0; i < e->args.len; i++) {
+            LLVMValueRef ix[2] = {usz(0), usz(i)};
+            gen_into(e->args.data[i], LLVMBuildInBoundsGEP2(B, lt, dest, ix, 2, ""), fresh, un);
+        }
+        return;
+    }
+    repeat_into(t, gen(e->a), dest, un);
+}
+
+// Whether evaluating e reads no memory a destination could hold: constants,
+// and locals whose address is never taken (literals of these can be built
+// in place at any destination).
+static bool reads_no_memory(Expr *e) {
+    if (e->is_const) return true;
+    switch (e->kind) {
+    case E_INT:
+    case E_FLOAT:
+    case E_BOOL:
+    case E_STRING:
+    case E_ERROR_VAL: return true;
+    case E_IDENT:
+        if (e->local) return !e->local->addr_taken;
+        return e->decl && e->decl->kind == D_CONST;
+    case E_FIELD: return e->op == FK_CONST || e->op == FK_VARIANT_UNIT || e->op == FK_ARRAY_LEN;
+    case E_STRUCT_LIT:
+        for (int i = 0; i < e->inits.len; i++)
+            if (!reads_no_memory(e->inits.data[i].value)) return false;
+        return true;
+    case E_ARRAY_LIT:
+        for (int i = 0; i < e->args.len; i++)
+            if (!reads_no_memory(e->args.data[i])) return false;
+        return true;
+    case E_ARRAY_REPEAT:
+    case E_CONV: return reads_no_memory(e->a);
+    case E_UNARY: return e->op != TK_AMP && reads_no_memory(e->a);
+    case E_BINARY: return reads_no_memory(e->a) && reads_no_memory(e->b);
+    default: return false;
+    }
+}
+
+static void gen_into_inner(Expr *e, LLVMValueRef dest, bool fresh, bool un) {
+    Type *t = ct(e->type);
+    if (in_mem(t)) {
+        switch (e->kind) {
+        case E_STRUCT_LIT:
+        case E_ARRAY_LIT:
+            if (!fresh && !reads_no_memory(e)) break;
+            lit_into(e, t, dest, fresh, un);
+            return;
+        case E_ARRAY_REPEAT: lit_into(e, t, dest, fresh, un); return;
+        case E_CONV:
+            if (e->op == CONV_NOOP) {
+                gen_into(e->a, dest, fresh, un);
+                return;
+            }
+            if (e->op == CONV_WRAP_OK && fresh && t->elem->kind != TY_VOID) {
+                LLVMBuildStore(B, LLVMConstInt(T_i16, 0, false), LLVMBuildStructGEP2(B, lty(t), dest, 0, ""));
+                gen_into(e->a, LLVMBuildStructGEP2(B, lty(t), dest, 1, ""), fresh, un);
+                return;
+            }
+            break;
+        case E_CALL:
+            if (e->op == CALLK_VARIANT && fresh) {
+                gen_variant_into(e, dest);
+                return;
+            }
+            break;
+        default: break;
+        }
+    }
+    LLVMValueRef v = gen(e);
+    if (!v || (t && t->kind == TY_NEVER)) return;
+    store(t, v, dest, un);
+}
+
+// Generates e's value into memory at dest. `fresh`: nothing e reads can be
+// at dest (a new local, a temporary, a result slot), so literals are built
+// there directly.
+static void gen_into(Expr *e, LLVMValueRef dest, bool fresh, bool un) {
+    Span saved = g_cur_span;
+    g_cur_span = e->span;
+    if (DIB) dbg_at(e->span);
+    gen_into_inner(e, dest, fresh, un);
+    g_cur_span = saved;
+    if (DIB) dbg_at(saved);
+}
+
 static LLVMValueRef gen_struct_lit(Expr *e) {
     Type *t = ct(e->type);
+    if (in_mem(t)) {
+        LLVMValueRef tmp = temp_alloca(t);
+        lit_into(e, t, tmp, true, false);
+        return tmp;
+    }
     LLVMValueRef v = LLVMGetUndef(lty(t));
     for (int i = 0; i < e->inits.len; i++) {
         Type *ft = type_field(t, i);
@@ -2517,6 +3894,14 @@ static LLVMValueRef gen_struct_lit(Expr *e) {
 
 static LLVMValueRef gen_array_lit(Expr *e) {
     Type *t = ct(e->type);
+    if (in_mem(t)) {
+        LLVMValueRef x = e->kind == E_ARRAY_REPEAT ? gen(e->a) : NULL;
+        if (x && LLVMIsConstant(x) && LLVMIsNull(x)) return LLVMConstNull(lty(t));  // (memset where it is stored)
+        LLVMValueRef tmp = temp_alloca(t);
+        if (x) repeat_into(t, x, tmp, false);
+        else lit_into(e, t, tmp, true, false);
+        return tmp;
+    }
     if (e->kind == E_ARRAY_LIT) {
         LLVMValueRef v = LLVMGetUndef(lty(t));
         for (int i = 0; i < e->args.len; i++)
@@ -2525,26 +3910,10 @@ static LLVMValueRef gen_array_lit(Expr *e) {
     }
     LLVMValueRef x = gen(e->a);
     if (LLVMIsConstant(x) && LLVMIsNull(x)) return LLVMConstNull(lty(t));
-    if (t->len <= 16) {
-        LLVMValueRef v = LLVMGetUndef(lty(t));
-        for (int64_t i = 0; i < t->len; i++) v = LLVMBuildInsertValue(B, v, to_mem(t->elem, x), (unsigned)i, "");
-        return v;
-    }
-    LLVMValueRef tmp = temp_alloca(t);
-    LLVMValueRef iv = alloca_in_entry(T_isz, "i");
-    LLVMBuildStore(B, usz(0), iv);
-    LLVMBasicBlockRef cond = new_bb("fill.cond"), body = new_bb("fill.body"), end = new_bb("fill.end");
-    LLVMBuildBr(B, cond);
-    LLVMPositionBuilderAtEnd(B, cond);
-    LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
-    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, usz(t->len), ""), body, end);
-    LLVMPositionBuilderAtEnd(B, body);
-    LLVMValueRef ix[2] = {usz(0), i};
-    store(t->elem, x, LLVMBuildGEP2(B, lty(t), tmp, ix, 2, ""), false);
-    LLVMBuildStore(B, LLVMBuildAdd(B, i, usz(1), ""), iv);
-    LLVMBuildBr(B, cond);
-    LLVMPositionBuilderAtEnd(B, end);
-    return load(t, tmp, false);
+    // (at most 16 bytes: at most 16 elements)
+    LLVMValueRef v = LLVMGetUndef(lty(t));
+    for (int64_t i = 0; i < t->len; i++) v = LLVMBuildInsertValue(B, v, to_mem(t->elem, x), (unsigned)i, "");
+    return v;
 }
 
 static LLVMValueRef gen_unary(Expr *e) {
@@ -2557,6 +3926,7 @@ static LLVMValueRef gen_unary(Expr *e) {
     case TK_MINUS: {
         LLVMValueRef v = gen(e->a);
         if (t->kind == TY_FLOAT || ty_is_vec_float(t)) return LLVMBuildFNeg(B, v, "");
+        if (t->kind == TY_VEC) return LLVMBuildNeg(B, v, "");  // integer vectors wrap in every mode
         return overflow_op("sub", true, LLVMConstNull(LLVMTypeOf(v)), v, false);
     }
     }
@@ -2606,7 +3976,7 @@ static LLVMValueRef gen_slice(Expr *e) {
     LLVMValueRef hi = e->c ? gen(e->c) : len;
     LLVMValueRef ok = LLVMBuildAnd(B, LLVMBuildICmp(B, LLVMIntULE, lo, hi, ""), LLVMBuildICmp(B, LLVMIntULE, hi, len, ""), "");
     check_or_trap(ok, T_BOUNDS);
-    LLVMValueRef np = LLVMBuildGEP2(B, lty(rt->elem), ptr, &lo, 1, "");
+    LLVMValueRef np = LLVMBuildInBoundsGEP2(B, lty(rt->elem), ptr, &lo, 1, "");
     LLVMValueRef s = LLVMGetUndef(lty(rt));
     s = LLVMBuildInsertValue(B, s, np, 0, "");
     return LLVMBuildInsertValue(B, s, LLVMBuildSub(B, hi, lo, ""), 1, "");
@@ -2636,7 +4006,7 @@ static LLVMValueRef gen_inner(Expr *e) {
             switch (e->decl->kind) {
             case D_GLOBAL: return load(t, global_addr(e->decl), false);
             case D_FN:
-            case D_HOST_FN: return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
+            case D_HOST_FN: return fn_ref(get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs));
             case D_CONST:
                 if (O->unit == CG_MODULE && type_mentions_error(t)) return gen(e->decl->cexpr);
                 return gen_const(e->decl->cexpr, t);
@@ -2663,7 +4033,7 @@ static LLVMValueRef gen_inner(Expr *e) {
         case FK_STRUCT:
             if (is_place(e)) return load(t, asan_place(e, gen_addr(e)), via_pointer(e));
             if (e->self_mode == SELF_DEREF) return load(t, asan_place(e, gen_addr(e)), true);
-            return from_mem(t, LLVMBuildExtractValue(B, gen(e->a), (unsigned)e->index, ""));
+            return field_value(ct(e->a->type), gen(e->a), (unsigned)e->index, t);
         case FK_SLICE_LEN: return LLVMBuildExtractValue(B, gen(e->a), 1, "");
         case FK_SLICE_PTR: return LLVMBuildExtractValue(B, gen(e->a), 0, "");
         case FK_ARRAY_LEN: return usz(ct(e->a->type)->len);
@@ -2676,13 +4046,13 @@ static LLVMValueRef gen_inner(Expr *e) {
         case FK_CONST: return gen_const(e->decl->cexpr, t);
         case FK_DECL:
             if (e->decl->kind == D_GLOBAL) return load(t, global_addr(e->decl), false);
-            return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
+            return fn_ref(get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs));
         }
         break;
     case E_DEREF: return load(t, asan_place(e, gen_addr(e)), true);
     case E_INDEX: return load(t, asan_place(e, gen_addr(e)), via_pointer(e) || e->op != IDX_ARRAY);
     case E_SLICE: return gen_slice(e);
-    case E_APPLY: return get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs)->fn;
+    case E_APPLY: return fn_ref(get_inst(e->decl, subst_gargs(e->gargs, e->ngargs), e->ngargs));
     case E_CONV:
         switch ((ConvKind)e->op) {
         case CONV_NOOP: return gen(e->a);
@@ -2702,10 +4072,120 @@ static LLVMValueRef gen_inner(Expr *e) {
 // ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Accumulations that cannot overflow (issue 0029). In a loop with a known
+// trip count, `acc += x` with x of a bounded, non-negative range (a narrower
+// integer widened with @as, a constant), where acc is a local set to a
+// constant just before the loop and changed nowhere else in it, cannot
+// overflow when start + trips * the most added per trip fits acc's type: its
+// check is left out, so LLVM can unroll and vectorize the loop (summing 25
+// u8 into a u32, counting).
+// ---------------------------------------------------------------------------
+static bool ident_char(char c) { return c == '_' || (c >= '0' && c <= '9') || ((c | 32) >= 'a' && (c | 32) <= 'z'); }
+
+// Whether the source text of sp has the word `name` (names are never
+// shadowed, so this over-approximates the uses of a local).
+static bool span_mentions(Span sp, Sym name) {
+    SourceFile *f = g_files.data[sp.file];
+    size_t n = strlen(name);
+    for (size_t i = (size_t)sp.start; i + n <= (size_t)sp.end && i + n <= f->len; i++) {
+        if (memcmp(f->text + i, name, n) != 0) continue;
+        if (i > 0 && ident_char(f->text[i - 1])) continue;
+        if (i + n < f->len && ident_char(f->text[i + n])) continue;
+        return true;
+    }
+    return false;
+}
+
+// The range of an integer expression, when it is narrower than its type.
+static void expr_bounds(Expr *e, Type *t, i128 *lo, i128 *hi) {
+    int_range(t, lo, hi);
+    if (e->is_const) {
+        *lo = *hi = e->cval;
+    } else if (e->kind == E_BUILTIN && e->index == BI_AS && e->bargs.len == 2) {
+        Type *s = ct(e->bargs.data[1].e->type);
+        if (s->kind == TY_INT) int_range(s, lo, hi);
+    }
+}
+
+// The adds to acc in a loop body, summing their largest values into *hi;
+// false if acc is mentioned anywhere else (or in a nested loop), or an add
+// can be negative.
+static bool loop_adds(Stmt *s, Local *acc, Sym name, i128 *hi, StmtVec *adds) {
+    switch (s->kind) {
+    case S_BLOCK:
+        for (int i = 0; i < s->stmts.len; i++)
+            if (!loop_adds(s->stmts.data[i], acc, name, hi, adds)) return false;
+        return true;
+    case S_ASSIGN:
+        if (s->e->kind == E_IDENT && s->e->local == acc && s->op == TK_PLUS_EQ && s->e3 && s->e3->op == TK_PLUS) {
+            Type *t = ct(acc->type);
+            if (t->kind != TY_INT || span_mentions(s->e2->span, name)) return false;
+            i128 l, h;
+            expr_bounds(s->e2, t, &l, &h);
+            if (l < 0 || h > ((i128)1 << 70)) return false;
+            *hi += h;
+            vec_push(*adds, s);
+            return true;
+        }
+        return !span_mentions(s->span, name);
+    case S_IF:
+        if (span_mentions(s->e->span, name) || !loop_adds(s->body, acc, name, hi, adds)) return false;
+        return !s->els || loop_adds(s->els, acc, name, hi, adds);
+    case S_MATCH:
+        if (span_mentions(s->e->span, name)) return false;
+        for (int i = 0; i < s->arms.len; i++)
+            if (!loop_adds(s->arms.data[i].body, acc, name, hi, adds)) return false;
+        return true;
+    default: return !span_mentions(s->span, name);
+    }
+}
+
+static void mark_bounded_sums(Stmt *blk, int at) {
+    Stmt *loop = blk->stmts.data[at];
+    i128 trips;
+    if (loop->e2) {
+        if (!loop->e->is_const || !loop->e2->is_const) return;
+        trips = loop->e2->cval > loop->e->cval ? loop->e2->cval - loop->e->cval : 0;
+    } else {
+        Type *it = ct(loop->e->type);
+        if (it->kind != TY_ARRAY) return;
+        trips = it->len;
+    }
+    if (trips > ((i128)1 << 40)) return;
+    // the accumulators: locals set to a constant by the last statement
+    // before the loop that mentions them
+    for (int j = at - 1; j >= 0; j--) {
+        Stmt *d = blk->stmts.data[j];
+        Local *acc = NULL;
+        Expr *init = NULL;
+        if (d->kind == S_LET && d->local && d->e) {
+            acc = d->local;
+            init = d->e;
+        } else if (d->kind == S_ASSIGN && d->op == TK_EQ && d->e->kind == E_IDENT && d->e->local) {
+            acc = d->e->local;
+            init = d->e2;
+        }
+        if (!acc || acc->addr_taken || !init->is_const || ct(acc->type)->kind != TY_INT || init->cval < 0) continue;
+        bool later = false;  // mentioned between it and the loop
+        for (int k = j + 1; k < at && !later; k++) later = span_mentions(blk->stmts.data[k]->span, acc->name);
+        if (later || span_mentions(loop->e->span, acc->name) || (loop->e2 && span_mentions(loop->e2->span, acc->name)))
+            continue;
+        i128 per = 0;
+        StmtVec adds = {0};
+        if (!loop_adds(loop->body, acc, acc->name, &per, &adds) || adds.len == 0) continue;
+        i128 lo, hi;
+        int_range(ct(acc->type), &lo, &hi);
+        if (init->cval + trips * per <= hi)
+            for (int k = 0; k < adds.len; k++) adds.data[k]->no_overflow = true;
+    }
+}
+
 static void gen_block(Stmt *b) {
     int height = F->defers.len;
     for (int i = 0; i < b->stmts.len; i++) {
         if (terminated()) break;
+        if (b->stmts.data[i]->kind == S_FOR && O->opt_level > 0) mark_bounded_sums(b, i);
         gen_stmt(b->stmts.data[i]);
     }
     if (!terminated()) emit_defers(height);
@@ -2713,6 +4193,19 @@ static void gen_block(Stmt *b) {
 }
 
 static void gen_if(Stmt *s) {
+    // A target condition (spec §13.4): only the branch it selects is compiled.
+    int tc = target_cond(s->e, g_features);
+    if (tc == 1) {
+        gen_block(s->body);
+        return;
+    }
+    if (tc == 0) {
+        if (s->els) {
+            if (s->els->kind == S_IF) gen_if(s->els);
+            else gen_block(s->els);
+        }
+        return;
+    }
     LLVMValueRef c = gen(s->e);
     LLVMBasicBlockRef then_bb = new_bb("if.then"), end = new_bb("if.end");
     LLVMBasicBlockRef else_bb = s->els ? new_bb("if.else") : end;
@@ -2778,7 +4271,7 @@ static void gen_for(Stmt *s) {
     LLVMValueRef i = LLVMBuildLoad2(B, T_isz, iv, "");
     LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntULT, i, len, ""), body, end);
     LLVMPositionBuilderAtEnd(B, body);
-    LLVMValueRef ep = LLVMBuildGEP2(B, lty(vt), ptr, &i, 1, "");
+    LLVMValueRef ep = LLVMBuildInBoundsGEP2(B, lty(vt), ptr, &i, 1, "");
     if (ct_->kind == TY_SLICE) asan_check(ep, usz(type_size(vt)));
     store(vt, load(vt, ep, ct_->kind == TY_SLICE), var, false);
     push_loop(end, step);
@@ -2872,9 +4365,16 @@ static void gen_match(Stmt *s) {
 static void gen_stmt_inner(Stmt *s) {
     switch (s->kind) {
     case S_LET: {
+        Type *lt = ct(s->local->type);
+        if (in_mem(lt)) {
+            gen_into(s->e, local_ptr(s->local), true, false);  // (a new local: nothing reads it yet)
+            if (!s->local->mut) F->inits[s->local->index] = s->e;
+            return;
+        }
         LLVMValueRef v = gen(s->e);
         if (terminated() || !v) return;
-        store(ct(s->local->type), v, local_ptr(s->local), false);
+        store(lt, v, local_ptr(s->local), false);
+        if (!s->local->mut) F->inits[s->local->index] = s->e;
         return;
     }
     case S_EXPR: gen(s->e); return;
@@ -2883,6 +4383,10 @@ static void gen_stmt_inner(Stmt *s) {
         Type *t = ct(s->e->type);
         LLVMValueRef addr = gen_addr(s->e);
         bool un = via_pointer(s->e);
+        if (s->op == TK_EQ && in_mem(t)) {
+            gen_into(s->e2, asan_place(s->e, addr), false, un);
+            return;
+        }
         if (s->op == TK_EQ) {
             LLVMValueRef v = gen(s->e2);
             if (!v) return;
@@ -2892,7 +4396,8 @@ static void gen_stmt_inner(Stmt *s) {
         asan_place(s->e, addr);
         LLVMValueRef old = load(t, addr, un);
         LLVMValueRef r = gen(s->e2);
-        LLVMValueRef nv = gen_binop(s->e3->op, t, old, r, ct(s->e2->type));
+        LLVMValueRef nv = s->no_overflow ? (t->is_signed ? LLVMBuildNSWAdd(B, old, r, "") : LLVMBuildNUWAdd(B, old, r, ""))
+                                         : gen_binop(s->e3->op, t, old, r, ct(s->e2->type));
         store(t, nv, addr, un);
         return;
     }
@@ -2934,27 +4439,34 @@ static void gen_stmt_inner(Stmt *s) {
 
 // Wrappers that track the source span of the code being generated, for
 // trap sites.
+// (and, with -g, for line tables).
 static LLVMValueRef gen(Expr *e) {
     Span saved = g_cur_span;
     g_cur_span = e->span;
+    if (dbg_lines()) dbg_at(e->span);
     LLVMValueRef v = gen_inner(e);
     g_cur_span = saved;
+    if (dbg_lines()) dbg_at(saved);
     return v;
 }
 
 static LLVMValueRef gen_addr(Expr *e) {
     Span saved = g_cur_span;
     g_cur_span = e->span;
+    if (dbg_lines()) dbg_at(e->span);
     LLVMValueRef v = gen_addr_inner(e);
     g_cur_span = saved;
+    if (dbg_lines()) dbg_at(saved);
     return v;
 }
 
 static void gen_stmt(Stmt *s) {
     Span saved = g_cur_span;
     g_cur_span = s->span;
+    if (dbg_lines()) dbg_at(s->span);
     gen_stmt_inner(s);
     g_cur_span = saved;
+    if (dbg_lines()) dbg_at(saved);
 }
 
 // ---------------------------------------------------------------------------
@@ -3012,10 +4524,50 @@ static void delete_unreachable(LLVMValueRef fn) {
 
 // The end of a wasm function's entry block (where its allocas are): trap
 // with T0008 unless its frame fits above the thread's stack limit.
+// Whether the function calls anything but LLVM's intrinsics and the trap
+// (so it cannot recurse, and it uses no stack beyond its own frame).
+static bool is_leaf(LLVMValueRef fn) {
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+        for (LLVMValueRef i = LLVMGetFirstInstruction(bb); i; i = LLVMGetNextInstruction(i)) {
+            if (!LLVMIsACallInst(i) && !LLVMIsAInvokeInst(i)) continue;
+            LLVMValueRef callee = LLVMGetCalledValue(i);
+            if (!LLVMIsAFunction(callee)) return false;
+            size_t n;
+            const char *name = LLVMGetValueName2(callee, &n);
+            if (strncmp(name, "llvm.", 5) != 0 && strcmp(name, "axiom.trap") != 0) return false;
+        }
+    return true;
+}
+
+// Whether an alloca will become a register (mem2reg): it is only loaded and
+// stored whole, as a scalar or vector.
+static bool promotable(LLVMValueRef a) {
+    LLVMTypeRef t = LLVMGetAllocatedType(a);
+    LLVMTypeKind k = LLVMGetTypeKind(t);
+    if (k == LLVMStructTypeKind || k == LLVMArrayTypeKind) return false;
+    for (LLVMUseRef u = LLVMGetFirstUse(a); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsALoadInst(user)) {
+            if (LLVMTypeOf(user) != t || LLVMGetVolatile(user)) return false;
+        } else if (LLVMIsAStoreInst(user)) {
+            if (LLVMGetOperand(user, 0) == a || LLVMTypeOf(LLVMGetOperand(user, 0)) != t || LLVMGetVolatile(user))
+                return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void check_stack(Decl *d, LLVMBasicBlockRef entry, LLVMBasicBlockRef start) {
     unsigned long long frame = 0;
+    // a leaf whose locals all become registers has no frame on the stack
+    // (issue 0029: the check was most of the cost of small hot functions)
+    // (an inline function cannot recurse either: its calls are its callers')
+    bool leaf = d->is_inline || is_leaf(LLVMGetBasicBlockParent(entry));
     for (LLVMValueRef i = LLVMGetFirstInstruction(entry); i; i = LLVMGetNextInstruction(i)) {
         if (!LLVMIsAAllocaInst(i)) continue;
+        if (leaf && promotable(i)) continue;
         unsigned long long a = LLVMGetAlignment(i);
         if (a < 1) a = 1;
         frame = (frame + a - 1) / a * a + LLVMABISizeOfType(TD, LLVMGetAllocatedType(i));
@@ -3035,7 +4587,124 @@ static void check_stack(Decl *d, LLVMBasicBlockRef entry, LLVMBasicBlockRef star
     g_cur_span = saved;
 }
 
+// Version k of a function with @features or @multiversion: its body
+// compiled with extensions `feats`, under the dispatcher's name with a
+// suffix, and shown under the function's own name in traces.
+static FnInst *get_version(FnInst *fi, int k, uint64_t feats) {
+    Sym key = intern_cstr(arena_printf("%s#v%d", fi->key, k));
+    FnInst *v = symmap_get(&inst_map, key);
+    if (v) return v;
+    v = NEW(FnInst);
+    *v = *fi;
+    v->next = NULL;
+    v->key = key;
+    v->feats = feats;
+    v->dispatch = false;
+    const char *suffix = features_string(feats & ~g_build_features);
+    if (!*suffix) suffix = "base";
+    size_t nl;
+    const char *base = LLVMGetValueName2(fi->fn, &nl);
+    v->fn = LLVMAddFunction(mod, arena_printf("%.*s.%s", (int)nl, base, suffix), v->llty);
+    set_fn_features(v->fn, feats);
+    LLVMSetLinkage(v->fn, LLVMInternalLinkage);
+    add_ext_attrs(v->fn, v->fnty, v->sret, false);
+    if (pending_tail) pending_tail->next = v;
+    else pending_head = v;
+    pending_tail = v;
+    symmap_put(&inst_map, key, v);
+    return v;
+}
+
+// std/os/cpu.ax, which every build includes (the start-up check, @cpu_has).
+static FnInst *cpu_fn(const char *name) {
+    for (int i = 0; i < g_prog.fns.len; i++) {
+        Decl *d = g_prog.fns.data[i];
+        if (strcmp(d->name, name) || !d->module) continue;
+        if (baseline_fn(d)) return get_inst(d, NULL, 0);
+    }
+    internal_error(arena_printf("std/os/cpu.ax has no %s (is --std right?)", name));
+    return NULL;
+}
+
+// Does the running processor have every extension in `bits`? (i1)
+static LLVMValueRef cpu_has_bits(uint64_t bits) {
+    FnInst *fi = cpu_fn("features");
+    LLVMValueRef have = LLVMBuildCall2(B, fi->llty, fi->fn, NULL, 0, "");
+    LLVMValueRef m = LLVMConstInt(T_i64, bits, false);
+    return LLVMBuildICmp(B, LLVMIntEQ, LLVMBuildAnd(B, have, m, ""), m, "");
+}
+
+static void dispatch_call(FnInst *fi, FnInst *v, LLVMValueRef *args, unsigned n) {
+    LLVMValueRef r = LLVMBuildCall2(B, fi->llty, v->fn, args, n, "");
+    add_ext_attrs(r, fi->fnty, fi->sret, true);
+    if (LLVMGetTypeKind(LLVMGetReturnType(fi->llty)) == LLVMVoidTypeKind) LLVMBuildRetVoid(B);
+    else LLVMBuildRet(B, r);
+}
+
+// The body of a function with @features or @multiversion: the first
+// version whose extensions the running processor has (the build's own
+// count as present), else the @multiversion fallback (the target's
+// extensions only), or trap T0013 for @features.
+static void gen_dispatch(FnInst *fi) {
+    Decl *d = fi->decl;
+    LLVMValueRef fn = fi->fn;
+    LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+    g_cur_span = d->attr_span;
+    unsigned np = LLVMCountParams(fn);
+    LLVMValueRef *args = NEWN(LLVMValueRef, np + 1);
+    for (unsigned i = 0; i < np; i++) args[i] = LLVMGetParam(fn, i);
+    uint64_t base = fi->feats;
+    bool done = false;
+    for (int k = 1; k <= d->attr_args.len; k++) {
+        uint64_t set = d->feat_sets[k - 1];
+        if (set == SEMA_NO_VERSION || done) continue;
+        uint64_t want = base | set;
+        FnInst *v = get_version(fi, k, want);
+        uint64_t missing = want & ~g_features;
+        if (!missing) {
+            dispatch_call(fi, v, args, np);
+            done = true;
+            continue;
+        }
+        LLVMBasicBlockRef yes = LLVMAppendBasicBlockInContext(ctx, fn, "version");
+        LLVMBasicBlockRef no = LLVMAppendBasicBlockInContext(ctx, fn, "next");
+        LLVMBuildCondBr(B, cpu_has_bits(missing), yes, no);
+        LLVMPositionBuilderAtEnd(B, yes);
+        dispatch_call(fi, v, args, np);
+        LLVMPositionBuilderAtEnd(B, no);
+    }
+    if (done) return;
+    if (d->attr == ATTR_MULTIVERSION) {
+        dispatch_call(fi, get_version(fi, 0, base), args, np);
+    } else {
+        call_trap_site(site_record(T_CPU, d->attr_span));
+        LLVMBuildUnreachable(B);
+    }
+}
+
+static void gen_fn_body_of(FnInst *fi);
+
 static void gen_fn_body(FnInst *fi) {
+    if (DIB) LLVMSetCurrentDebugLocation2(B, NULL);
+    uint64_t saved_feats = g_features;
+    g_features = fi->feats;  // (@target_has, and lowering that depends on extensions)
+    if (fi->dispatch) {
+        FnState st = {0};
+        st.inst = fi;
+        st.decl = fi->decl;
+        st.fn = fi->fn;
+        FnState *saved = F;
+        F = &st;
+        gen_dispatch(fi);
+        F = saved;
+    } else {
+        gen_fn_body_of(fi);
+    }
+    g_features = saved_feats;
+    if (DIB) LLVMSetCurrentDebugLocation2(B, NULL);
+}
+
+static void gen_fn_body_of(FnInst *fi) {
     Decl *d = fi->decl;
     FnState st = {0};
     st.inst = fi;
@@ -3046,8 +4715,23 @@ static void gen_fn_body(FnInst *fi) {
     st.fn = fi->fn;
     st.nlocals = d->locals.len;
     st.locals = NEWN(LLVMValueRef, st.nlocals + 1);
+    st.inits = NEWN(Expr *, st.nlocals + 1);
     FnState *saved = F;
     F = &st;
+    if (DIB && d->span.file >= 0 && d->span.file < g_files.len) {
+        int l, c, el, ec;
+        span_linecol(d->span, &l, &c, &el, &ec);
+        st.di_file = d->span.file;
+        LLVMMetadataRef file = di_file(d->span.file);
+        LLVMMetadataRef ty = LLVMDIBuilderCreateSubroutineType(DIB, file, NULL, 0, LLVMDIFlagZero);
+        size_t ln;
+        const char *link = LLVMGetValueName2(fi->fn, &ln);
+        st.di_sp = LLVMDIBuilderCreateFunction(DIB, file, fi->display, strlen(fi->display), link, ln, file, (unsigned)l, ty,
+                                               LLVMGetLinkage(fi->fn) == LLVMInternalLinkage, true, (unsigned)l,
+                                               LLVMDIFlagPrototyped, O->opt_level > 0);
+        LLVMSetSubprogram(fi->fn, st.di_sp);
+        dbg_at(d->span);
+    }
     st.ret = fi->fnty->ret;
     st.entry = LLVMAppendBasicBlockInContext(ctx, fi->fn, "entry");
     LLVMBasicBlockRef start = LLVMAppendBasicBlockInContext(ctx, fi->fn, "start");
@@ -3063,6 +4747,11 @@ static void gen_fn_body(FnInst *fi) {
         } else {
             store(pt, p, local_ptr(l), false);
         }
+    }
+    if (fi->ninl) {
+        st.ninl = fi->ninl;
+        st.inl = NEWN(LLVMValueRef, fi->ninl);
+        for (int i = 0; i < fi->ninl; i++) st.inl[i] = LLVMGetParam(fi->fn, (unsigned)k++);
     }
     gen_block(d->body);
     if (!terminated()) {
@@ -3095,24 +4784,39 @@ static bool setup_target(void) {
     } else {
         LLVMInitializeNativeTarget();
         LLVMInitializeNativeAsmPrinter();
+        LLVMInitializeNativeAsmParser();  // (inline asm: @x86_cpuid, @x86_xgetbv)
     }
     if (LLVMGetTargetFromTriple(triple, &target, &err)) {
         fprintf(stderr, "axiom: cannot find LLVM target '%s': %s\n", triple, err);
         LLVMDisposeMessage(err);
         return false;
     }
-    const char *features = g_target.wasm ? "+simd128,+bulk-memory,+nontrapping-fptoint,+sign-ext,+mutable-globals,+atomics" : "";
+    // the target's extensions (target.c); functions with @features or
+    // @multiversion versions add their own (the target-features attribute)
+    // (not multivalue on wasm: LLVM would change how structs are returned)
+    g_build_features = g_features;
+    const char *features = llvm_features(g_target.wasm ? g_features & ~(uint64_t)0x40 : g_features);
     LLVMCodeGenOptLevel ol = O->opt_level == 0   ? LLVMCodeGenLevelNone
                              : O->opt_level == 1 ? LLVMCodeGenLevelLess
                              : O->opt_level == 2 ? LLVMCodeGenLevelDefault
                                                  : LLVMCodeGenLevelAggressive;
-    const char *cpu = O->cpu ? O->cpu : (g_target.wasm ? "generic" : LLVMGetHostCPUName());
-    // @swizzle becomes pshufb when the host has it (for its own CPU only:
-    // the features of a named --cpu are not known here)
-    if (!g_target.wasm && !O->cpu && strstr(triple, "x86_64")) {
-        char *hf = LLVMGetHostCPUFeatures();
-        g_has_ssse3 = hf && strstr(hf, "+ssse3") != NULL;
-        LLVMDisposeMessage(hf);
+    const char *cpu = g_target.wasm ? "generic" : !strcmp(g_cpu, "native") ? LLVMGetHostCPUName()
+                    : g_arch == ARCH_X64 ? "x86-64" : "generic";
+    g_tuning_features = g_arch == ARCH_X64 ? x86_tuning_features(!strcmp(g_cpu, "native") ? cpu : g_cpu) : "";
+    features = arena_printf("%s%s", features, g_tuning_features);
+    // @swizzle becomes pshufb when the target has SSSE3
+    g_has_ssse3 = g_arch == ARCH_X64 && (g_features & 0x2);
+    if (g_target.wasm) {
+        // LLVM 18's loop strength reduction rewrites element addresses
+        // without `inbounds`, after which a constant offset can no longer
+        // fold into a load or store (offset=); wasm has no addressing modes
+        // for it to improve (issue 0029)
+        static bool parsed;
+        if (!parsed) {
+            const char *argv[] = {"axiom", "-disable-lsr"};
+            LLVMParseCommandLineOptions(2, argv, NULL);
+            parsed = true;
+        }
     }
     TM = LLVMCreateTargetMachine(target, triple, cpu, features, ol, g_target.wasm ? LLVMRelocStatic : LLVMRelocPIC,
                                  LLVMCodeModelDefault);
@@ -3168,6 +4872,31 @@ static LLVMValueRef add_export(const char *name, LLVMTypeRef ret, LLVMTypeRef *p
     vec_push(g_export_names, intern_cstr(name));
     LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
     return fn;
+}
+
+// Native programs built for more than the architecture's baseline check the
+// processor before main (std/os/cpu.ax's require, from a constructor; both
+// are compiled for the baseline).
+static void emit_cpu_check(void) {
+    FnInst *req = cpu_fn("require");
+    LLVMTypeRef fty = LLVMFunctionType(T_void, NULL, 0, false);
+    LLVMValueRef fn = LLVMAddFunction(mod, "axiom.cpu_check", fty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    set_fn_features(fn, 0);
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(B);
+    LLVMPositionBuilderAtEnd(B, LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+    LLVMValueRef args[2] = {LLVMConstInt(T_i64, g_features, false),
+                            const_slice(string_ptr(g_cpu, (uint32_t)strlen(g_cpu)), (int64_t)strlen(g_cpu))};
+    LLVMBuildCall2(B, req->llty, req->fn, args, 2, "");
+    LLVMBuildRetVoid(B);
+    if (cur) LLVMPositionBuilderAtEnd(B, cur);
+    LLVMTypeRef et[3] = {T_i32, T_ptr, T_ptr};
+    LLVMTypeRef ety = LLVMStructTypeInContext(ctx, et, 3, false);
+    LLVMValueRef ev[3] = {LLVMConstInt(T_i32, 0, false), fn, LLVMConstNull(T_ptr)};
+    LLVMValueRef entry = LLVMConstNamedStruct(ety, ev, 3);
+    LLVMValueRef g = LLVMAddGlobal(mod, LLVMArrayType(ety, 1), "llvm.global_ctors");
+    LLVMSetLinkage(g, LLVMAppendingLinkage);
+    LLVMSetInitializer(g, LLVMConstArray(ety, &entry, 1));
 }
 
 // --sanitize=address: `main` is the user's main followed by the leak check
@@ -3290,6 +5019,7 @@ static void emit_test_exports(void) {
 }
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void) { return LLVMGetDefaultTargetTriple(); }
+const char *LLVMGetHostCPUFeatures_wrapper(void) { return LLVMGetHostCPUFeatures(); }
 
 bool codegen_program(CgOptions *o) {
     O = o;
@@ -3310,6 +5040,7 @@ bool codegen_program(CgOptions *o) {
     T_f64 = LLVMDoubleTypeInContext(ctx);
     T_v128 = LLVMVectorType(T_i32, 4);
 
+    dbg_init();
     if (g_target.wasm) emit_multi3();
     bool program_parts = O->unit != CG_MODULE;
     if (program_parts && g_target.wasm && g_threads) emit_thread_start();
@@ -3356,6 +5087,7 @@ bool codegen_program(CgOptions *o) {
         if (g_target.wasm) emit_trap_info_export();
         emit_shadow_stack_export();
         if (O->sanitize_address && !g_test_mode) emit_asan_main();
+        if (!g_target.wasm && g_features) emit_cpu_check();
     }
     while (pending_head) {
         FnInst *fi = pending_head;
@@ -3364,6 +5096,14 @@ bool codegen_program(CgOptions *o) {
         gen_fn_body(fi);
     }
     if (diag_error_count()) return false;
+    if (DIB) LLVMDIBuilderFinalize(DIB);
+    if (frame_traces()) {
+        // every frame on the chain that a trap or crash walks
+        for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn))
+            if (LLVMCountBasicBlocks(fn))
+                LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                        LLVMCreateStringAttribute(ctx, "frame-pointer", 13, "all", 3));
+    }
 
     char *err = NULL;
     if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &err)) {
@@ -3374,9 +5114,10 @@ bool codegen_program(CgOptions *o) {
     }
     LLVMDisposeMessage(err);
     // At -O0 a very cheap cleanup (promote locals to SSA, merge trivial
-    // blocks) makes the backend faster than skipping it.
+    // blocks) makes the backend faster than skipping it. Inline functions
+    // (spec §9.5) are inlined at every level.
     const char *o0_pipeline = getenv("AXIOM_O0_PIPELINE");
-    if (!o0_pipeline) o0_pipeline = "function(mem2reg,simplifycfg)";
+    if (!o0_pipeline) o0_pipeline = "always-inline,function(mem2reg,simplifycfg)";
     if (!*o0_pipeline) o0_pipeline = NULL;
     if (O->opt_level > 0 || o0_pipeline) {
         LLVMPassBuilderOptionsRef po = LLVMCreatePassBuilderOptions();
@@ -3390,6 +5131,11 @@ bool codegen_program(CgOptions *o) {
             return false;
         }
     }
+    // (optimization deleted the strings nothing referred to: the records
+    // made now get their own)
+    string_globals = (SymMap){0};
+    frame_tables_emit();
+    if (DIB && !O->debug_info) LLVMStripModuleDebugInfo(mod);
     if (O->emit == EMIT_LLVM) {
         if (LLVMPrintModuleToFile(mod, O->out_path, &err)) {
             fprintf(stderr, "axiom: cannot write %s: %s\n", O->out_path, err);

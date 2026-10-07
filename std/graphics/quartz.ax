@@ -1,0 +1,780 @@
+// =============================================================================
+// std/graphics/quartz.ax - 2D drawing and text on macOS with Core Graphics
+// (Quartz) and Core Text: anti-aliased rectangles, rounded rectangles,
+// ellipses, lines, polygons, images and text in any installed font, into
+// pixels in memory (premultiplied BGRA) that std/graphics/metal draws over a
+// frame (Device.draw_overlay) or that are saved as an image. The same
+// interface as std/graphics/d2d on Windows:
+//
+//     let mut c = quartz.Canvas.init(800, 600)!;
+//     defer c.deinit();
+//     let mut f = c.font("Helvetica Neue", 24.0, quartz.BOLD, false)!;
+//     defer f.release();
+//     c.begin();                                   // (clears it: transparent)
+//     c.fill_ellipse(400.0, 300.0, 100.0, 100.0, quartz.rgb(1.0, 0.5, 0.0));
+//     c.text(&f, "Hello", 10.0, 10.0, 300.0, 40.0, quartz.WHITE)!;
+//     c.end()!;
+//     gpu.draw_overlay(&mut ov, c.pixels());       // or c.to_image()
+//
+// Coordinates are pixels, from the top left. macOS only
+// (--target=aarch64-macos).
+// =============================================================================
+
+import "../math.ax" as math;
+import "../mem.ax" as mem;
+import "../os/objc.ax" as objc;
+import "image.ax" as image;
+
+error { Unsupported, Failed, OutOfMemory }
+
+// Functions taking a CGRect or CGAffineTransform are declared without
+// parameters and called through a cast (see std/os/objc: such structs go in
+// registers as their fields, or a large one by address).
+extern "C" "CoreGraphics" {
+    fn CGColorSpaceCreateDeviceRGB() usize;
+    fn CGColorSpaceRelease(cs: usize) void;
+    fn CGBitmapContextCreate(data: *mut u8, w: usize, h: usize, bits: usize, row: usize, cs: usize, info: u32) usize;
+    fn CGContextRelease(c: usize) void;
+    fn CGContextSaveGState(c: usize) void;
+    fn CGContextRestoreGState(c: usize) void;
+    fn CGContextTranslateCTM(c: usize, x: f64, y: f64) void;
+    fn CGContextScaleCTM(c: usize, x: f64, y: f64) void;
+    fn CGContextConcatCTM() void;
+    fn CGContextSetRGBFillColor(c: usize, r: f64, g: f64, b: f64, a: f64) void;
+    fn CGContextSetRGBStrokeColor(c: usize, r: f64, g: f64, b: f64, a: f64) void;
+    fn CGContextSetLineWidth(c: usize, w: f64) void;
+    fn CGContextSetLineCap(c: usize, cap: i32) void;
+    fn CGContextSetLineJoin(c: usize, join: i32) void;
+    fn CGContextFillRect() void;
+    fn CGContextStrokeRectWithWidth() void;
+    fn CGContextFillEllipseInRect() void;
+    fn CGContextStrokeEllipseInRect() void;
+    fn CGContextClipToRect() void;
+    fn CGContextDrawImage() void;
+    fn CGContextBeginPath(c: usize) void;
+    fn CGContextMoveToPoint(c: usize, x: f64, y: f64) void;
+    fn CGContextAddLineToPoint(c: usize, x: f64, y: f64) void;
+    fn CGContextClosePath(c: usize) void;
+    fn CGContextAddPath(c: usize, p: usize) void;
+    fn CGContextFillPath(c: usize) void;
+    fn CGContextStrokePath(c: usize) void;
+    fn CGContextSetInterpolationQuality(c: usize, q: i32) void;
+    fn CGContextSetShouldAntialias(c: usize, on: u8) void;
+    fn CGContextSetBlendMode(c: usize, mode: i32) void;
+    fn CGContextSetAlpha(c: usize, a: f64) void;
+    fn CGPathCreateWithRoundedRect() void;
+    fn CGPathCreateWithRect() void;
+    fn CGPathRelease(p: usize) void;
+    fn CGColorCreateGenericRGB(r: f64, g: f64, b: f64, a: f64) usize;
+    fn CGColorRelease(c: usize) void;
+    fn CGImageCreate(w: usize, h: usize, bits: usize, bpp: usize, row: usize, cs: usize, info: u32, provider: usize,
+                     decode: *f64, interpolate: u8, intent: i32) usize;
+    fn CGImageRelease(i: usize) void;
+    fn CGDataProviderCreateWithData(info: usize, data: *u8, size: usize, release: usize) usize;
+    fn CGDataProviderRelease(p: usize) void;
+}
+
+extern "C" "CoreText" {
+    fn CTFontCreateWithName(name: usize, size: f64, matrix: *f64) usize;
+    fn CTFontCreateUIFontForLanguage(kind: u32, size: f64, language: usize) usize;
+    fn CTFontCreateCopyWithSymbolicTraits(font: usize, size: f64, matrix: *f64, value: u32, mask: u32) usize;
+    fn CTFontCopyFamilyName(font: usize) usize;
+    fn CTParagraphStyleCreate(settings: *u8, count: usize) usize;
+    fn CTFramesetterCreateWithAttributedString(s: usize) usize;
+    fn CTFramesetterCreateFrame(fs: usize, loc: isize, len: isize, path: usize, attrs: usize) usize;
+    fn CTFrameGetLines(frame: usize) usize;
+    fn CTFrameGetLineOrigins(frame: usize, loc: isize, len: isize, origins: *mut f64) void;
+    fn CTFrameDraw(frame: usize, ctx: usize) void;
+    fn CTLineGetTypographicBounds(line: usize, ascent: *mut f64, descent: *mut f64, leading: *mut f64) f64;
+}
+
+extern "C" "CoreFoundation" {
+    fn CFRelease(obj: usize) void;
+    fn CFRetain(obj: usize) usize;
+    fn CFArrayGetCount(a: usize) isize;
+    fn CFArrayGetValueAtIndex(a: usize, i: isize) usize;
+}
+
+extern "C" "System" {
+    fn dlsym(handle: usize, name: *u8) usize;
+}
+
+/// A colour: red, green, blue and opacity, 0..1.
+pub struct Color {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
+
+pub fn rgb(r: f32, g: f32, b: f32) Color {
+    return Color.{ r: r, g: g, b: b, a: 1.0 };
+}
+
+pub fn rgba(r: f32, g: f32, b: f32, a: f32) Color {
+    return Color.{ r: r, g: g, b: b, a: a };
+}
+
+pub let BLACK: Color = Color.{ r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+pub let WHITE: Color = Color.{ r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+pub let TRANSPARENT: Color = Color.{ r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+
+// Font weights
+pub const LIGHT: u32 = 300;
+pub const NORMAL: u32 = 400;
+pub const BOLD: u32 = 700;
+
+/// Where text sits in its box.
+pub enum Align: u8 {
+    START,  // left (top)
+    END,    // right (bottom)
+    CENTER,
+}
+
+/// A font (CTFont) and how text in it is laid out.
+pub struct Font {
+    f: usize,  // CTFontRef
+    h: Align,
+    v: Align,
+    wrap: bool,
+
+    /// Horizontal and vertical alignment in the boxes text is drawn in.
+    pub fn align(self: *mut Font, h: Align, v: Align) void {
+        self.h = h;
+        self.v = v;
+    }
+
+    /// Lines are not broken to fit the box.
+    pub fn no_wrap(self: *mut Font) void {
+        self.wrap = false;
+    }
+
+    pub fn release(self: *mut Font) void {
+        if self.f != 0 {
+            CFRelease(self.f);
+        }
+        self.f = 0;
+    }
+}
+
+/// An image to draw (Canvas.image).
+pub struct Bitmap {
+    img: usize,  // CGImageRef
+    pixels: []mut u8,
+    width: u32,
+    height: u32,
+
+    pub fn release(self: *mut Bitmap) void {
+        if self.img != 0 {
+            CGImageRelease(self.img);
+        }
+        if self.pixels.len > 0 {
+            mem.free(self.pixels);
+        }
+        self.img = 0;
+        self.pixels = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+}
+
+/// The size of laid-out text.
+pub struct Size {
+    width: f32,
+    height: f32,
+    lines: u32,
+}
+
+// A rectangle's four doubles, for the functions that take a CGRect.
+fn rect(x: f32, y: f32, w: f32, h: f32) [4]f64 {
+    return [@float_cast(f64, x), @float_cast(f64, y), @float_cast(f64, w), @float_cast(f64, h)];
+}
+
+// Core Text's attribute keys (constants it exports).
+let mut key_font: usize = 0;
+let mut key_color: usize = 0;
+let mut key_paragraph: usize = 0;
+
+fn keys() bool {
+    if key_font != 0 {
+        return true;
+    }
+    // RTLD_DEFAULT: every image loaded; each symbol is a CFStringRef's address
+    let h = @bit_cast(usize, @as(isize, -2));
+    let a = dlsym(h, "kCTFontAttributeName\x00".ptr);
+    let b = dlsym(h, "kCTForegroundColorAttributeName\x00".ptr);
+    let c = dlsym(h, "kCTParagraphStyleAttributeName\x00".ptr);
+    if (a == 0) or (b == 0) or (c == 0) {
+        return false;
+    }
+    key_font = @ptr_from_int(*usize, a).*;
+    key_color = @ptr_from_int(*usize, b).*;
+    key_paragraph = @ptr_from_int(*usize, c).*;
+    return true;
+}
+
+/// A surface to draw on: width × height pixels in memory.
+pub struct Canvas {
+    ctx: usize,  // CGContextRef (a bitmap context)
+    space: usize,
+    data: []mut u8,
+    width: u32,
+    height: u32,
+    depth: u32,  // graphics states saved by clip and set_transform
+
+    /// A canvas of width × height pixels, transparent.
+    pub fn init(width: u32, height: u32) !Canvas {
+        let mut c = Canvas.{ ctx: 0, space: CGColorSpaceCreateDeviceRGB(),
+                             data: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0), width: 0, height: 0, depth: 0 };
+        if c.space == 0 {
+            return error.Unsupported;
+        }
+        c.resize(width, height) catch |e| {
+            c.deinit();
+            return e;
+        };
+        return c;
+    }
+
+    /// Makes the canvas width × height (what was drawn is lost).
+    pub fn resize(self: *mut Canvas, width: u32, height: u32) !void {
+        if (width == 0) or (height == 0) {
+            return error.Failed;
+        }
+        let n = @as(usize, width) * @as(usize, height) * 4;
+        let data = mem.alloc_zeroed.[u8](n)!;
+        // premultiplied, alpha first, 32-bit little-endian: B, G, R, A in memory
+        let ctx = CGBitmapContextCreate(data.ptr, @as(usize, width), @as(usize, height), 8, @as(usize, width) * 4,
+                                        self.space, 0x2002);
+        if ctx == 0 {
+            mem.free(data);
+            return error.Failed;
+        }
+        self.release_context();
+        self.ctx = ctx;
+        self.data = data;
+        self.width = width;
+        self.height = height;
+        // from the top left, in pixels
+        CGContextTranslateCTM(ctx, 0.0, @float_from_int(f64, height));
+        CGContextScaleCTM(ctx, 1.0, -1.0);
+        CGContextSetLineCap(ctx, 1);  // round
+        CGContextSetLineJoin(ctx, 1);
+        CGContextSetInterpolationQuality(ctx, 3);
+        CGContextSaveGState(ctx);  // the state set_transform and unclip go back to
+    }
+
+    fn release_context(self: *mut Canvas) void {
+        if self.ctx != 0 {
+            CGContextRelease(self.ctx);
+            self.ctx = 0;
+        }
+        if self.data.len > 0 {
+            mem.free(self.data);
+            self.data = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        }
+        self.depth = 0;
+    }
+
+    pub fn deinit(self: *mut Canvas) void {
+        self.release_context();
+        if self.space != 0 {
+            CGColorSpaceRelease(self.space);
+            self.space = 0;
+        }
+    }
+
+    /// The pixels: premultiplied BGRA, width × 4 bytes a row, from the top.
+    pub fn pixels(self: *Canvas) []u8 {
+        return self.data;
+    }
+
+    /// The pixels as an RGBA image, not premultiplied (free it with deinit).
+    pub fn to_image(self: *Canvas) !image.Image {
+        let w = @as(usize, self.width);
+        let h = @as(usize, self.height);
+        let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
+        for i in 0..(w * h) {
+            let b = @as(u32, self.data[i * 4]);
+            let g = @as(u32, self.data[(i * 4) + 1]);
+            let r = @as(u32, self.data[(i * 4) + 2]);
+            let a = @as(u32, self.data[(i * 4) + 3]);
+            if a == 0 {
+                img.data[i * 4] = 0;
+                img.data[(i * 4) + 1] = 0;
+                img.data[(i * 4) + 2] = 0;
+            } else {
+                img.data[i * 4] = @truncate(u8, @min(((r * 255) + (a / 2)) / a, 255));
+                img.data[(i * 4) + 1] = @truncate(u8, @min(((g * 255) + (a / 2)) / a, 255));
+                img.data[(i * 4) + 2] = @truncate(u8, @min(((b * 255) + (a / 2)) / a, 255));
+            }
+            img.data[(i * 4) + 3] = @truncate(u8, a);
+        }
+        return img;
+    }
+
+    /// Starts a frame of drawing: the canvas is cleared (transparent) and
+    /// the transform and clip reset.
+    pub fn begin(self: *mut Canvas) void {
+        self.reset_transform();
+        @mem_set(self.data, 0);
+    }
+
+    /// Ends the frame: everything is drawn into the pixels.
+    pub fn end(self: *mut Canvas) !void {
+        if self.ctx == 0 {
+            return error.Failed;
+        }
+        self.reset_transform();
+    }
+
+    pub fn clear(self: *mut Canvas, c: Color) void {
+        CGContextSaveGState(self.ctx);
+        CGContextSetBlendMode(self.ctx, 17);  // kCGBlendModeCopy
+        self.fill_rect(0.0, 0.0, @float_from_int(f32, self.width), @float_from_int(f32, self.height), c);
+        CGContextRestoreGState(self.ctx);
+    }
+
+    fn fill_color(self: *mut Canvas, c: Color) void {
+        CGContextSetRGBFillColor(self.ctx, @float_cast(f64, c.r), @float_cast(f64, c.g), @float_cast(f64, c.b),
+                                 @float_cast(f64, c.a));
+    }
+
+    fn stroke_color(self: *mut Canvas, c: Color, width: f32) void {
+        CGContextSetRGBStrokeColor(self.ctx, @float_cast(f64, c.r), @float_cast(f64, c.g), @float_cast(f64, c.b),
+                                   @float_cast(f64, c.a));
+        CGContextSetLineWidth(self.ctx, @float_cast(f64, width));
+    }
+
+    pub fn fill_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, c: Color) void {
+        self.fill_color(c);
+        let r = rect(x, y, w, h);
+        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextFillRect)(self.ctx, r[0], r[1], r[2], r[3]);
+    }
+
+    /// A rectangle's outline, `width` pixels thick.
+    pub fn draw_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, c: Color, width: f32) void {
+        CGContextSetRGBStrokeColor(self.ctx, @float_cast(f64, c.r), @float_cast(f64, c.g), @float_cast(f64, c.b),
+                                   @float_cast(f64, c.a));
+        let r = rect(x, y, w, h);
+        @bit_cast(fn(usize, f64, f64, f64, f64, f64) void, CGContextStrokeRectWithWidth)(
+            self.ctx, r[0], r[1], r[2], r[3], @float_cast(f64, width));
+    }
+
+    fn round_path(x: f32, y: f32, w: f32, h: f32, radius: f32) usize {
+        let rr = @float_cast(f64, @min(radius, @min(w, h) / 2.0));
+        let r = rect(x, y, w, h);
+        return @bit_cast(fn(f64, f64, f64, f64, f64, f64, usize) usize, CGPathCreateWithRoundedRect)(
+            r[0], r[1], r[2], r[3], rr, rr, 0);
+    }
+
+    /// A rectangle with corners rounded to `radius`.
+    pub fn fill_round_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Color) void {
+        if (w <= 0.0) or (h <= 0.0) {
+            return;
+        }
+        let p = Canvas.round_path(x, y, w, h, radius);
+        self.fill_color(c);
+        CGContextAddPath(self.ctx, p);
+        CGContextFillPath(self.ctx);
+        CGPathRelease(p);
+    }
+
+    pub fn draw_round_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Color, width: f32) void {
+        if (w <= 0.0) or (h <= 0.0) {
+            return;
+        }
+        let p = Canvas.round_path(x, y, w, h, radius);
+        self.stroke_color(c, width);
+        CGContextAddPath(self.ctx, p);
+        CGContextStrokePath(self.ctx);
+        CGPathRelease(p);
+    }
+
+    /// An ellipse centred on (cx, cy) with radii rx and ry.
+    pub fn fill_ellipse(self: *mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, c: Color) void {
+        self.fill_color(c);
+        let r = rect(cx - rx, cy - ry, rx * 2.0, ry * 2.0);
+        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextFillEllipseInRect)(self.ctx, r[0], r[1], r[2], r[3]);
+    }
+
+    pub fn draw_ellipse(self: *mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, c: Color, width: f32) void {
+        self.stroke_color(c, width);
+        let r = rect(cx - rx, cy - ry, rx * 2.0, ry * 2.0);
+        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextStrokeEllipseInRect)(self.ctx, r[0], r[1], r[2], r[3]);
+    }
+
+    pub fn line(self: *mut Canvas, x0: f32, y0: f32, x1: f32, y1: f32, c: Color, width: f32) void {
+        self.stroke_color(c, width);
+        CGContextBeginPath(self.ctx);
+        CGContextMoveToPoint(self.ctx, @float_cast(f64, x0), @float_cast(f64, y0));
+        CGContextAddLineToPoint(self.ctx, @float_cast(f64, x1), @float_cast(f64, y1));
+        CGContextStrokePath(self.ctx);
+    }
+
+    // A path through points (x0, y0, x1, y1, ...) in the context.
+    fn path(self: *mut Canvas, pts: []f32, closed: bool) !void {
+        if pts.len < 4 {
+            return error.Failed;
+        }
+        CGContextBeginPath(self.ctx);
+        CGContextMoveToPoint(self.ctx, @float_cast(f64, pts[0]), @float_cast(f64, pts[1]));
+        let mut i: usize = 2;
+        while (i + 1) < pts.len {
+            CGContextAddLineToPoint(self.ctx, @float_cast(f64, pts[i]), @float_cast(f64, pts[i + 1]));
+            i += 2;
+        }
+        if closed {
+            CGContextClosePath(self.ctx);
+        }
+    }
+
+    /// A filled polygon through points (x0, y0, x1, y1, ...).
+    pub fn fill_polygon(self: *mut Canvas, pts: []f32, c: Color) !void {
+        self.path(pts, true)!;
+        self.fill_color(c);
+        CGContextFillPath(self.ctx);
+    }
+
+    /// Lines through points (x0, y0, x1, y1, ...), back to the first when
+    /// `closed`.
+    pub fn draw_lines(self: *mut Canvas, pts: []f32, closed: bool, c: Color, width: f32) !void {
+        self.path(pts, closed)!;
+        self.stroke_color(c, width);
+        CGContextStrokePath(self.ctx);
+    }
+
+    /// Is a font family installed?
+    pub fn has_font(self: *mut Canvas, family: []u8) bool {
+        _ = self;
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let f = CTFontCreateWithName(objc.string(family), 12.0, @ptr_from_int(*f64, 0));
+        if f == 0 {
+            return false;
+        }
+        defer CFRelease(f);
+        // (Core Text falls back to another font for a name it does not know)
+        let name = CTFontCopyFamilyName(f);
+        if name == 0 {
+            return false;
+        }
+        defer CFRelease(name);
+        return objc.send1(name, objc.sel("caseInsensitiveCompare:"), objc.string(family)) == 0;
+    }
+
+    /// A font: a family name ("Helvetica Neue", "Menlo", ...; or several
+    /// separated by commas, the first installed one used; "system-ui" or
+    /// none installed: the system's font), a size in pixels, a weight
+    /// (NORMAL, BOLD, 100..900) and italic or not.
+    pub fn font(self: *mut Canvas, families: []u8, size: f32, weight: u32, italic: bool) !Font {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let mut base: usize = 0;
+        let mut rest = families;
+        loop {
+            let mut i: usize = 0;
+            while (i < rest.len) and (rest[i] != ',') {
+                i += 1;
+            }
+            let mut a: usize = 0;
+            let mut b = i;
+            while (a < b) and (rest[a] == ' ') {
+                a += 1;
+            }
+            while (b > a) and (rest[b - 1] == ' ') {
+                b -= 1;
+            }
+            let family = rest[a..b];
+            if (family.len > 0) and not eq(family, "system-ui") and self.has_font(family) {
+                base = CTFontCreateWithName(objc.string(family), @float_cast(f64, size), @ptr_from_int(*f64, 0));
+                break;
+            }
+            if i == rest.len {
+                break;
+            }
+            rest = rest[i + 1..];
+        }
+        if base == 0 {
+            let mut kind: u32 = 2;  // kCTFontUIFontSystem
+            if weight >= 600 {
+                kind = 3;  // kCTFontUIFontEmphasizedSystem
+            }
+            base = CTFontCreateUIFontForLanguage(kind, @float_cast(f64, size), 0);
+        }
+        if base == 0 {
+            return error.Failed;
+        }
+        let mut traits: u32 = 0;
+        if weight >= 600 {
+            traits = traits | 2;  // kCTFontBoldTrait
+        }
+        if italic {
+            traits = traits | 1;  // kCTFontItalicTrait
+        }
+        if traits != 0 {
+            let styled = CTFontCreateCopyWithSymbolicTraits(base, 0.0, @ptr_from_int(*f64, 0), traits, traits);
+            if styled != 0 {
+                CFRelease(base);
+                base = styled;
+            }
+        }
+        return Font.{ f: base, h: Align.START, v: Align.START, wrap: true };
+    }
+
+    // Lays out s in font f in boxes `width` wide (very tall): a CTFrame
+    // (release it), with the laid-out text's height and line count.
+    fn layout(self: *mut Canvas, font: *Font, s: []u8, width: f64, c: Color, out_h: *mut f64, out_w: *mut f64,
+              out_lines: *mut u32) !usize {
+        _ = self;
+        if not keys() {
+            return error.Unsupported;
+        }
+        let color = CGColorCreateGenericRGB(@float_cast(f64, c.r), @float_cast(f64, c.g), @float_cast(f64, c.b),
+                                            @float_cast(f64, c.a));
+        defer CGColorRelease(color);
+        // CTParagraphStyleSettings: specifier, value size, value
+        let mut align: u8 = 0;  // left
+        if font.h == Align.END {
+            align = 1;
+        } else if font.h == Align.CENTER {
+            align = 2;
+        }
+        let mut brk: u8 = 0;  // by word
+        if not font.wrap {
+            brk = 2;  // clipping: one line
+        }
+        let mut settings: [48]u8 = [0; 48];
+        put64(settings[..], 0, 0);  // alignment
+        put64(settings[..], 8, 1);
+        put64(settings[..], 16, @as(u64, @int_from_ptr(&align)));
+        put64(settings[..], 24, 6);  // line break mode
+        put64(settings[..], 32, 1);
+        put64(settings[..], 40, @as(u64, @int_from_ptr(&brk)));
+        let para = CTParagraphStyleCreate(&settings[0], 2);
+        defer CFRelease(para);
+        let ks: [3]usize = [key_font, key_color, key_paragraph];
+        let vs: [3]usize = [font.f, color, para];
+        let dict = objc.send3(objc.class("NSDictionary"), objc.sel("dictionaryWithObjects:forKeys:count:"),
+                              @int_from_ptr(&vs[0]), @int_from_ptr(&ks[0]), 3);
+        let astr = objc.send2(objc.alloc("NSAttributedString"), objc.sel("initWithString:attributes:"), objc.string(s),
+                              dict);
+        if astr == 0 {
+            return error.Failed;
+        }
+        defer objc.release(astr);
+        let fs = CTFramesetterCreateWithAttributedString(astr);
+        if fs == 0 {
+            return error.Failed;
+        }
+        defer CFRelease(fs);
+        let path = @bit_cast(fn(f64, f64, f64, f64, usize) usize, CGPathCreateWithRect)(0.0, 0.0, width, BIG, 0);
+        defer CGPathRelease(path);
+        let frame = CTFramesetterCreateFrame(fs, 0, 0, path, 0);
+        if frame == 0 {
+            return error.Failed;
+        }
+        // its height: from the top of the box to the bottom of the last line
+        let lines = CTFrameGetLines(frame);
+        let n = CFArrayGetCount(lines);
+        let mut h: f64 = 0.0;
+        let mut w: f64 = 0.0;
+        if n > 0 {
+            let mut origin: [2]f64 = [0.0, 0.0];
+            CTFrameGetLineOrigins(frame, n - 1, 1, &mut origin[0]);
+            let mut asc: f64 = 0.0;
+            let mut desc: f64 = 0.0;
+            let mut lead: f64 = 0.0;
+            for k in @as(isize, 0)..n {
+                let lw = CTLineGetTypographicBounds(CFArrayGetValueAtIndex(lines, k), &mut asc, &mut desc, &mut lead);
+                w = @max(w, lw);
+            }
+            _ = CTLineGetTypographicBounds(CFArrayGetValueAtIndex(lines, n - 1), &mut asc, &mut desc, &mut lead);
+            h = BIG - (origin[1] - desc);
+        }
+        out_h.* = h;
+        out_w.* = w;
+        out_lines.* = @truncate(u32, @bit_cast(usize, n));
+        return frame;
+    }
+
+    /// Draws text (UTF-8) in the box at (x, y) of w × h pixels, wrapping
+    /// at its width.
+    pub fn text(self: *mut Canvas, font: *Font, s: []u8, x: f32, y: f32, w: f32, h: f32, c: Color) !void {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let mut th: f64 = 0.0;
+        let mut tw: f64 = 0.0;
+        let mut lines: u32 = 0;
+        let mut width = @float_cast(f64, w);
+        if not font.wrap {
+            width = 1.0e6;  // (one line, aligned in the box below)
+        }
+        let frame = self.layout(font, s, width, c, &mut th, &mut tw, &mut lines)!;
+        defer CFRelease(frame);
+        let bh = @float_cast(f64, h);
+        let mut top: f64 = 0.0;  // the text's top, down from the box's
+        if font.v == Align.CENTER {
+            top = (bh - th) / 2.0;
+        } else if font.v == Align.END {
+            top = bh - th;
+        }
+        let mut left: f64 = 0.0;
+        if not font.wrap {
+            // laid out in a wide box: place the line's width in this one
+            if font.h == Align.CENTER {
+                left = ((@float_cast(f64, w) - tw) / 2.0) - ((1.0e6 - tw) / 2.0);
+            } else if font.h == Align.END {
+                left = (@float_cast(f64, w) - tw) - (1.0e6 - tw);
+            }
+        }
+        // Core Text draws upright in Core Graphics' own coordinates (y up):
+        // the box's bottom left is the origin, the frame's box BIG high
+        // above (bh - top - BIG)
+        CGContextSaveGState(self.ctx);
+        CGContextTranslateCTM(self.ctx, @float_cast(f64, x) + left, @float_cast(f64, y) + bh);
+        CGContextScaleCTM(self.ctx, 1.0, -1.0);
+        CGContextTranslateCTM(self.ctx, 0.0, (bh - top) - BIG);
+        CTFrameDraw(frame, self.ctx);
+        CGContextRestoreGState(self.ctx);
+    }
+
+    /// The size of text laid out in boxes `max_width` wide.
+    pub fn measure(self: *mut Canvas, font: *Font, s: []u8, max_width: f32) !Size {
+        let pool = objc.pool_push();
+        defer objc.pool_pop(pool);
+        let mut th: f64 = 0.0;
+        let mut tw: f64 = 0.0;
+        let mut lines: u32 = 0;
+        let frame = self.layout(font, s, @float_cast(f64, max_width), BLACK, &mut th, &mut tw, &mut lines)!;
+        CFRelease(frame);
+        return Size.{ width: @float_cast(f32, tw), height: @float_cast(f32, th), lines: lines };
+    }
+
+    /// An image (8-bit gray, gray + alpha, RGB or RGBA) as a Bitmap to draw.
+    pub fn bitmap(self: *mut Canvas, img: *image.Image) !Bitmap {
+        if img.depth != image.Depth.U8 {
+            return error.Unsupported;
+        }
+        let n = img.width * img.height;
+        let px = mem.alloc.[u8](n * 4)!;
+        // premultiplied BGRA, as the canvas's own pixels
+        for i in 0..n {
+            let ch = img.channels;
+            let s = img.data[i * ch..(i + 1) * ch];
+            let mut r = s[0];
+            let mut g = s[0];
+            let mut b = s[0];
+            let mut a: u8 = 255;
+            if ch >= 3 {
+                g = s[1];
+                b = s[2];
+            }
+            if ch == 2 {
+                a = s[1];
+            } else if ch == 4 {
+                a = s[3];
+            }
+            let a32 = @as(u32, a);
+            px[i * 4] = @truncate(u8, ((@as(u32, b) * a32) + 127) / 255);
+            px[(i * 4) + 1] = @truncate(u8, ((@as(u32, g) * a32) + 127) / 255);
+            px[(i * 4) + 2] = @truncate(u8, ((@as(u32, r) * a32) + 127) / 255);
+            px[(i * 4) + 3] = a;
+        }
+        let prov = CGDataProviderCreateWithData(0, px.ptr, px.len, 0);
+        if prov == 0 {
+            mem.free(px);
+            return error.Failed;
+        }
+        defer CGDataProviderRelease(prov);
+        let ci = CGImageCreate(img.width, img.height, 8, 32, img.width * 4, self.space, 0x2002, prov,
+                               @ptr_from_int(*f64, 0), 1, 0);
+        if ci == 0 {
+            mem.free(px);
+            return error.Failed;
+        }
+        return Bitmap.{ img: ci, pixels: px, width: @truncate(u32, img.width), height: @truncate(u32, img.height) };
+    }
+
+    /// Draws a bitmap scaled into the box at (x, y) of w × h pixels.
+    pub fn image(self: *mut Canvas, bm: *Bitmap, x: f32, y: f32, w: f32, h: f32, opacity: f32) void {
+        // upright: Core Graphics draws images with y up
+        CGContextSaveGState(self.ctx);
+        CGContextSetAlpha(self.ctx, @float_cast(f64, opacity));
+        CGContextTranslateCTM(self.ctx, @float_cast(f64, x), @float_cast(f64, y + h));
+        CGContextScaleCTM(self.ctx, 1.0, -1.0);
+        @bit_cast(fn(usize, f64, f64, f64, f64, usize) void, CGContextDrawImage)(
+            self.ctx, 0.0, 0.0, @float_cast(f64, w), @float_cast(f64, h), bm.img);
+        CGContextRestoreGState(self.ctx);
+    }
+
+    // Back to the state saved after the canvas was set up (no transform,
+    // no clip).
+    fn base_state(self: *mut Canvas) void {
+        while self.depth > 0 {
+            CGContextRestoreGState(self.ctx);
+            self.depth -= 1;
+        }
+        CGContextRestoreGState(self.ctx);
+        CGContextSaveGState(self.ctx);
+    }
+
+    /// Transforms what is drawn next: (x, y) becomes
+    /// (a·x + c·y + e, b·x + d·y + f). (It also ends a clip.)
+    pub fn set_transform(self: *mut Canvas, a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) void {
+        self.base_state();
+        CGContextSaveGState(self.ctx);
+        self.depth += 1;
+        // a CGAffineTransform (six doubles) is passed by address
+        let m: [6]f64 = [@float_cast(f64, a), @float_cast(f64, b), @float_cast(f64, c), @float_cast(f64, d),
+                         @float_cast(f64, e), @float_cast(f64, f)];
+        @bit_cast(fn(usize, *f64) void, CGContextConcatCTM)(self.ctx, &m[0]);
+    }
+
+    pub fn reset_transform(self: *mut Canvas) void {
+        if self.ctx != 0 {
+            self.base_state();
+        }
+    }
+
+    /// Draws next around (cx, cy), rotated by `angle` radians
+    /// (clockwise) and scaled by `scale`.
+    pub fn rotate_scale(self: *mut Canvas, cx: f32, cy: f32, angle: f32, scale: f32) void {
+        let c = math.cosf(angle) * scale;
+        let s = math.sinf(angle) * scale;
+        self.set_transform(c, s, -s, c, cx - ((c * cx) - (s * cy)), cy - ((s * cx) + (c * cy)));
+    }
+
+    /// Only draws inside the box at (x, y) of w × h pixels, until unclip.
+    pub fn clip(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32) void {
+        CGContextSaveGState(self.ctx);
+        self.depth += 1;
+        let r = rect(x, y, w, h);
+        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextClipToRect)(self.ctx, r[0], r[1], r[2], r[3]);
+    }
+
+    pub fn unclip(self: *mut Canvas) void {
+        if self.depth > 0 {
+            CGContextRestoreGState(self.ctx);
+            self.depth -= 1;
+        }
+    }
+}
+
+const BIG: f64 = 100000.0;  // the height text is laid out in
+
+fn eq(a: []u8, b: []u8) bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn put64(b: []mut u8, at: usize, x: u64) void {
+    for k in @as(usize, 0)..8 {
+        b[at + k] = @truncate(u8, x >> @as(u64, k * 8));
+    }
+}

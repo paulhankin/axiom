@@ -1,0 +1,225 @@
+// Stack slots that share their bytes when their contents are never needed
+// at the same time, and copies between slots coalesced
+// (selfhost/src/slots.ax): the cases that must keep their slots apart.
+// flags: -O2
+import "../lib/io.ax" as io;
+
+struct Big {
+    a: [12]u64,
+    tag: u32,
+}
+
+fn mix(h: u64, x: u64) u64 {
+    return (h ^ x) *% 1099511628211;
+}
+
+fn digest(b: *Big) u64 {
+    let mut h: u64 = 1469598103934665603;
+    for x in b.a {
+        h = mix(h, x);
+    }
+    return mix(h, @as(u64, b.tag));
+}
+
+// (recursive: not inlined, so the address passed goes somewhere)
+fn digest_far(b: *Big, depth: u32) u64 {
+    if depth > 0 {
+        return digest_far(b, depth - 1) *% 5;
+    }
+    return digest(b);
+}
+
+fn make(k: u64) Big {
+    let mut b = Big.{ a: [0; 12], tag: @truncate(u32, k) };
+    for i in @as(usize, 0)..12 {
+        b.a[i] = k *% @as(u64, i + 1);
+    }
+    return b;
+}
+
+// a copy in a loop whose source is read again the next time around, after
+// the copy was changed
+fn loop_copy(n: u64) u64 {
+    let s = make(n);
+    let mut h: u64 = 0;
+    for i in @as(u64, 0)..n {
+        let mut d = s;
+        d.a[@int_cast(usize, i % 12)] +%= i;
+        h = mix(h, digest_far(&d, @truncate(u32, i & 1)));
+    }
+    return h;
+}
+
+// the copy goes back into its source at the end of each time around, but
+// the source is read after the copy changed
+fn loop_back(n: u64) u64 {
+    let mut s = make(3);
+    let mut h: u64 = 0;
+    for i in @as(u64, 0)..n {
+        let mut d = s;
+        d.a[@int_cast(usize, i % 12)] +%= 7;
+        h = mix(h, digest_far(&s, 1));
+        h = mix(h, digest_far(&d, 0));
+        s = d;
+    }
+    return mix(h, digest(&s));
+}
+
+struct Two {
+    raw: [2][25]u8,
+}
+
+fn digest2(b: *Two, depth: u32) u64 {
+    if depth > 0 {
+        return digest2(b, depth - 1) *% 3;
+    }
+    let mut h: u64 = 0;
+    for r in b.raw {
+        for x in r {
+            h = (h *% 31) +% @as(u64, x);
+        }
+    }
+    return h;
+}
+
+// halves swapped through a temporary: the halves are copied between
+// different offsets, so the temporary and the board must stay apart
+fn swaps(n: u32) u64 {
+    let mut b = Two.{ raw: [[1; 25], [2; 25]] };
+    b.raw[0][3] = 9;
+    b.raw[1][20] = 7;
+    let mut h: u64 = 0;
+    for i in @as(u32, 0)..n {
+        let t = Two.{ raw: [b.raw[1], b.raw[0]] };
+        h +%= digest2(&b, i & 1);
+        b = t;
+        b.raw[1][@int_cast(usize, i % 25)] +%= 3;
+    }
+    return h +% digest2(&b, 0);
+}
+
+// a swapped copy passed on (the benchmark's board.swapped()): the temporary can be
+// the board passed on
+fn swapped_once(b: *Two) u64 {
+    let t = Two.{ raw: [b.raw[1], b.raw[0]] };
+    return digest2(&t, 2);
+}
+
+let mut kept: *Big = @ptr_from_int(*Big, 0);
+
+// (recursive: not inlined; keeps the address)
+fn keep(b: *Big, depth: u32) void {
+    if depth > 0 {
+        keep(b, depth - 1);
+        return;
+    }
+    kept = b;
+}
+
+// a slot whose address is kept is needed from then on, though nothing here
+// reads it directly again
+fn escaped(k: u64) u64 {
+    let a = make(k);
+    keep(&a, 1);
+    let mut b = make(k + 1);
+    b.a[5] = 77;
+    let hb = digest(&b);
+    let mut c = make(k + 2);
+    c.tag = 1;
+    return mix(mix(hb, digest(&c)), digest(kept));
+}
+
+let mut passes: u32 = 0;
+
+// (recursive, not in tail position, to a depth not known where it is
+// called: a call is left; returns the address it was given)
+fn pass_back(b: *Big, depth: u32) *Big {
+    if depth > 0 {
+        let r = pass_back(b, depth - 1);
+        passes += 1;
+        return r;
+    }
+    return b;
+}
+
+// an address given back by a call is the slot's: needed while it is used
+fn returned(k: u64) u64 {
+    let a = make(k);
+    let p = pass_back(&a, passes + 2);
+    let mut b = make(k + 3);
+    b.a[1] = 5;
+    let hb = digest_far(&b, 1);
+    return mix(hb, digest(p));
+}
+
+// slots needed one after the other share their bytes; their contents
+// must still be right
+fn sequence(k: u64) u64 {
+    let mut h: u64 = 0;
+    {
+        let mut x = make(k);
+        x.a[0] = 1;
+        h = mix(h, digest_far(&x, 1));
+    }
+    {
+        let mut y = make(k + 1);
+        y.a[11] = 2;
+        h = mix(h, digest_far(&y, 1));
+    }
+    {
+        let mut z = make(k + 2);
+        z.tag = 3;
+        h = mix(h, digest_far(&z, 1));
+    }
+    return h;
+}
+
+struct Pair {
+    lo: u32,
+    hi: u32,
+    pad: [6]u64,
+}
+
+// a slot filled field by field in a loop, read the next time around
+// before it is filled again; another slot written in between
+fn partial(n: u32) u64 {
+    let mut p = Pair.{ lo: 1, hi: 2, pad: [0; 6] };
+    let mut h: u64 = 0;
+    for i in @as(u32, 0)..n {
+        let q = Pair.{ lo: p.hi, hi: p.lo +% i, pad: [@as(u64, i); 6] };
+        h = mix(h, @as(u64, p.lo) +% (@as(u64, p.hi) << 32));
+        let r = Big.{ a: [@as(u64, q.lo); 12], tag: q.hi };
+        h = mix(h, digest_far(&r, 0));
+        p.lo = q.lo;
+        p.hi = q.hi;
+        p.pad[@int_cast(usize, i % 6)] = q.pad[0];
+    }
+    return mix(h, p.pad[2]);
+}
+
+// two slots' addresses compared: different slots, different addresses
+fn compare(k: u64) u64 {
+    let a = make(k);
+    let ha = digest_far(&a, 1);
+    let b = make(k + 1);
+    let pa: *Big = &a;
+    let pb: *Big = &b;
+    let mut same: u64 = 0;
+    if @int_from_ptr(pa) == @int_from_ptr(pb) {
+        same = 1;
+    }
+    return mix(mix(ha, digest_far(&b, 1)), same);
+}
+
+export fn run() void {
+    io.uint(loop_copy(20));  // expect: 1741415682096329532
+    io.uint(loop_back(9));   // expect: 3301119276082715154
+    io.uint(swaps(7));       // expect: 6931039969450684718
+    let t = Two.{ raw: [[4; 25], [5; 25]] };
+    io.uint(swapped_once(&t));  // expect: 13444557948081633815
+    io.uint(escaped(5));        // expect: 3722502952513055906
+    io.uint(returned(6));       // expect: 1435905787728016714
+    io.uint(sequence(9));       // expect: 125246361912677251
+    io.uint(partial(11));       // expect: 4726211245203676120
+    io.uint(compare(4));        // expect: 12995660989603627851
+}

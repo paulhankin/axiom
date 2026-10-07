@@ -36,16 +36,12 @@ def pr(expr, t):
 for t, bits, s in INTS:
     P('fn t_%s(a: %s, b: %s) void {' % (t, t, t))
     P('    print_u64(9000001);')
-    for op in ['+%', '-%', '*%', '&', '|', '^']:
+    for op in ['+%', '-%', '*%', '+', '-', '*', '&', '|', '^']:  # (+ - * wrap by default)
         P('    %s' % pr('a %s b' % op, t))
     for op in ['==', '!=', '<', '<=', '>', '>=']:
         P('    print_u64(bv(a %s b));' % op)
     P('    if b != 0 {')
-    if s:
-        P('        if not ((a == @min_value(%s)) and (b == -1)) {' % t)
-        P('            %s' % pr('a / b', t)); P('            %s' % pr('a % b', t)); P('        }')
-    else:
-        P('        %s' % pr('a / b', t)); P('        %s' % pr('a % b', t))
+    P('        %s' % pr('a / b', t)); P('        %s' % pr('a % b', t))  # (MIN / -1 wraps to MIN)
     P('    }')
     P('    %s' % pr('@min(a, b)', t)); P('    %s' % pr('@max(a, b)', t))
     P('    %s' % pr('@add_sat(a, b)', t)); P('    %s' % pr('@sub_sat(a, b)', t)); P('    %s' % pr('@mul_sat(a, b)', t))
@@ -56,7 +52,7 @@ for t, bits, s in INTS:
     for f in ['@clz(a)', '@ctz(a)', '@popcount(a)', '~a', '-%a']:
         P('    %s' % pr(f, t))
     if s:
-        P('    if a != @min_value(%s) { %s }' % (t, pr('@abs(a)', t)))
+        P('    %s %s' % (pr('@abs(a)', t), pr('-a', t)))  # (wrapping: MIN for MIN)
     P('    for k in cnt { %s %s %s %s }' % (pr('a << k', t), pr('a >> k', t), pr('@rotl(a, k)', t), pr('@rotr(a, k)', t)))
     P('    for k in cnt64 { %s %s }' % (pr('a << k', t), pr('a >> k', t)))
     # conversions
@@ -85,8 +81,11 @@ for ft in ['f64', 'f32']:
     P('    pf(@float_cast(f64, @float_cast(f32, @float_cast(f64, a))));')
     P('}')
 P('fn pf(x: f64) void { if x != x { print_u64(12345); } else { print_u64(@bit_cast(u64, x)); } }')
-# SIMD
-VT = [('i8x16','i8',16),('u8x16','u8',16),('i16x8','i16',8),('u16x8','u16',8),('i32x4','i32',4),('u32x4','u32',4),('i64x2','i64',2),('u64x2','u64',2)]
+# SIMD: 128-bit vectors, and the 256- and 512-bit ones (spec §5.8)
+VT = []
+for scale in (1, 2, 4):
+    for lt, n in (('i8',16),('u8',16),('i16',8),('u16',8),('i32',4),('u32',4),('i64',2),('u64',2)):
+        VT.append(('%sx%d' % (lt, n * scale), lt, n * scale))
 for vt, lt, n in VT:
     P('fn pv_%s(v: %s) void {' % (vt, vt))
     for i in range(n): P('    %s' % pr('@extract_lane(v, %d)' % i, lt))
@@ -94,8 +93,10 @@ for vt, lt, n in VT:
     P('fn mk_%s(o: usize) %s { return @vec(%s, %s); }' % (vt, vt, vt, ', '.join('v_%s[(o + %d) %% %d]' % (lt, i, N[lt]) for i in range(n))))
     P('fn s_%s(a: %s, b: %s) void {' % (vt, vt, vt))
     P('    print_u64(9000005);')
-    for op in ['+%', '-%', '&', '|', '^'] + (['*%'] if lt[1:] != '8' else []):
+    for op in ['+%', '-%', '+', '-', '&', '|', '^'] + (['*%', '*'] if lt[1:] != '8' else []):
         P('    pv_%s(a %s b);' % (vt, op))
+    if lt.startswith('i'):
+        P('    pv_%s(-a);' % vt)
     P('    pv_%s(~a);' % vt)
     for f in ['eq', 'ne', 'lt', 'le', 'gt', 'ge']:
         P('    pv_%s(@bit_cast(%s, @lanes_%s(a, b)));' % (vt, vt, f))
@@ -116,19 +117,62 @@ for vt, lt, n in VT:
     idx = [random.randint(0, 2*n-1) for _ in range(n)]
     P('    pv_%s(@shuffle(a, b, [%s]));' % (vt, ', '.join(map(str, idx))))
     P('    pv_%s(@select(@bit_cast(%s, @lanes_lt(a, b)), a, b));' % (vt, vt))
+    # per-lane counts and indices (unsigned, of the lane width): some beyond
+    # the lanes, or the lane's bits
+    bits = int(lt[1:])
+    ut = 'u%dx%d' % (bits, n)
+    P('    let ub = @bit_cast(%s, b);' % ut)
+    P('    let us = ub & @as(%s, @splat(%d));' % (ut, 2 * bits - 1))
+    P('    let ui = ub & @as(%s, @splat(%d));' % (ut, 4 * n - 1))
+    P('    pv_%s(a << ub); pv_%s(a >> ub); pv_%s(a << us); pv_%s(a >> us);' % (vt, vt, vt, vt))
+    P('    pv_%s(@clz(a)); pv_%s(@ctz(a)); pv_%s(@popcount(a));' % (vt, vt, vt))
+    P('    pv_%s(@swizzle(a, ub)); pv_%s(@swizzle(a, ui));' % (vt, vt))
+    P('    pv_%s(@swizzle2(a, b, ub)); pv_%s(@swizzle2(a, b, ui));' % (vt, vt))
+    P('    pv_%s(@swizzle2(a, b, ui & @as(%s, @splat(%d))));' % (vt, ut, 2 * n - 1))
+    if bits >= 32:
+        ft = 'f%dx%d' % (bits, n)
+        P('    let fa = @float_from_int(%s, a);' % ft)
+        P('    pv_%s(@bit_cast(%s, fa));' % (vt, vt))
+        P('    pv_%s(@int_from_float(%s, fa)); pv_%s(@bit_cast(%s, @int_from_float(%s, fa)));' % (vt, vt, vt, vt, ut))
+    # partial loads and stores of every length
+    P('    var_partial_%s(a);' % vt)
     P('}')
-P('fn pvf(v: f32x4) void { pf(@float_cast(f64, @extract_lane(v, 0))); pf(@float_cast(f64, @extract_lane(v, 1))); pf(@float_cast(f64, @extract_lane(v, 2))); pf(@float_cast(f64, @extract_lane(v, 3))); }')
-P('fn pvd(v: f64x2) void { pf(@extract_lane(v, 0)); pf(@extract_lane(v, 1)); }')
-P('fn sf(a: f32x4, b: f32x4, c: f64x2, d: f64x2) void {')
-for e in ['a + b', 'a - b', 'a * b', 'a / b', '@min(a, b)', '@max(a, b)', '@sqrt(@abs(a))', '@floor(a)', '@ceil(a)', '@trunc(a)', '@nearest(a)', '-a', '@fma(a, b, a)']:
-    P('    pvf(%s);' % e)
-for e in ['c + d', 'c - d', 'c * d', 'c / d', '@min(c, d)', '@max(c, d)', '@sqrt(@abs(c))', '@floor(c)', '@nearest(c)', '-c', '@fma(c, d, c)']:
-    P('    pvd(%s);' % e)
-P('    pf(@float_cast(f64, @reduce_add(a))); pf(@reduce_add(c)); pf(@float_cast(f64, @dot(a, b)));')
-P('    print_u64(@as(u64, @bitmask(@lanes_lt(a, b)))); print_u64(@as(u64, @bitmask(@lanes_ge(c, d))));')
-P('}')
-P('fn sw(a: u8x16, idx: u8x16) void { pv_u8x16(@swizzle(a, idx)); }')
-P('fn dt(a: i16x8, b: i16x8) void { pv_i32x4(@dot(a, b)); }')
+    P('fn var_partial_%s(a: %s) void {' % (vt, vt))
+    P('    let mut buf: [%d]%s = [@as(%s, 7); %d];' % (n + 2, lt, lt, n + 2))
+    P('    @store(buf[0..%d], a +%% @as(%s, @splat(1)));' % (n, vt))
+    P('    for k in @as(usize, 0)..%d {' % (n + 2))
+    P('        pv_%s(@load_partial(%s, buf[0..k]));' % (vt, vt))
+    P('        pv_%s(@load_partial(%s, buf[1..k + 1]));' % (vt, vt))
+    P('        let mut out: [%d]%s = [@as(%s, 5); %d];' % (n + 2, lt, lt, n + 2))
+    P('        @store_partial(out[1..k + 1], a);')
+    P('        for j in 0..out.len { %s }' % pr('out[j]', lt))
+    P('    }')
+    P('}')
+for scale in (1, 2, 4):
+    f4, d2 = 'f32x%d' % (4 * scale), 'f64x%d' % (2 * scale)
+    P('fn pvf_%s(v: %s) void { %s }' % (f4, f4, ' '.join('pf(@float_cast(f64, @extract_lane(v, %d)));' % i for i in range(4 * scale))))
+    P('fn pvd_%s(v: %s) void { %s }' % (d2, d2, ' '.join('pf(@extract_lane(v, %d));' % i for i in range(2 * scale))))
+    P('fn sf_%d(a: %s, b: %s, c: %s, d: %s) void {' % (scale, f4, f4, d2, d2))
+    for e in ['a + b', 'a - b', 'a * b', 'a / b', '@min(a, b)', '@max(a, b)', '@sqrt(@abs(a))', '@floor(a)', '@ceil(a)', '@trunc(a)', '@nearest(a)', '-a', '@fma(a, b, a)']:
+        P('    pvf_%s(%s);' % (f4, e))
+    for e in ['c + d', 'c - d', 'c * d', 'c / d', '@min(c, d)', '@max(c, d)', '@sqrt(@abs(c))', '@floor(c)', '@nearest(c)', '-c', '@fma(c, d, c)']:
+        P('    pvd_%s(%s);' % (d2, e))
+    P('    pf(@float_cast(f64, @reduce_add(a))); pf(@reduce_add(c)); pf(@float_cast(f64, @dot(a, b)));')
+    P('    print_u64(@as(u64, @bitmask(@lanes_lt(a, b)))); print_u64(@as(u64, @bitmask(@lanes_ge(c, d))));')
+    P('    pvf_%s(@select(@lanes_gt(a, b), a, b));' % f4)
+    i4, u4, i2, u2 = 'i32x%d' % (4 * scale), 'u32x%d' % (4 * scale), 'i64x%d' % (2 * scale), 'u64x%d' % (2 * scale)
+    for e in ['a', 'b', 'a * b', '-a', 'a * @as(%s, @splat(1e9))' % f4]:
+        P('    pv_%s(@int_from_float(%s, %s)); pv_%s(@int_from_float(%s, %s));' % (i4, i4, e, u4, u4, e))
+    for e in ['c', 'd', 'c * d', '-c', 'c * @as(%s, @splat(1e19))' % d2]:
+        P('    pv_%s(@int_from_float(%s, %s)); pv_%s(@int_from_float(%s, %s));' % (i2, i2, e, u2, u2, e))
+    P('    pvf_%s(@swizzle(a, @as(%s, @splat(1)))); pvd_%s(@swizzle2(c, d, @as(%s, @splat(%d))));' % (f4, u4, d2, u2, 2 * scale + 1))
+    P('    let mut fb: [%d]f32 = [1.5; %d];' % (4 * scale + 1, 4 * scale + 1))
+    P('    for k in @as(usize, 0)..%d { pvf_%s(@load_partial(%s, fb[0..k])); @store_partial(fb[0..k], b); }' % (4 * scale + 2, f4, f4))
+    P('    for k in @as(usize, 0)..fb.len { pf(@float_cast(f64, fb[k])); }')
+    P('}')
+    b8, i16, i32 = 'u8x%d' % (16 * scale), 'i16x%d' % (8 * scale), 'i32x%d' % (4 * scale)
+    P('fn sw_%d(a: %s, idx: %s) void { pv_%s(@swizzle(a, idx)); }' % (scale, b8, b8, b8))
+    P('fn dt_%d(a: %s, b: %s) void { pv_%s(@dot(a, b)); }' % (scale, i16, i16, i32))
 P('export fn run() void {')
 for t, bits, s in INTS:
     P('    for i in 0..v_%s.len { u_%s(v_%s[i]); for j in 0..v_%s.len { t_%s(v_%s[i], v_%s[j]); } }' % (t,t,t,t,t,t,t))
@@ -136,13 +180,22 @@ for ft in ['f64', 'f32']:
     P('    for i in 0..v_%s.len { g_%s(v_%s[i]); for j in 0..v_%s.len { f_%s(v_%s[i], v_%s[j]); } }' % (ft,ft,ft,ft,ft,ft,ft))
 for vt, lt, n in VT:
     P('    for i in @as(usize, 0)..6 { s_%s(mk_%s(i), mk_%s(i + 3)); }' % (vt, vt, vt))
-P('    for i in @as(usize, 0)..4 { sw(mk_u8x16(i), mk_u8x16(i + 5)); dt(mk_i16x8(i), mk_i16x8(i + 2)); }')
-P('    for i in @as(usize, 0)..5 {')
-P('        let a = @vec(f32x4, v_f32[i], v_f32[i + 1], v_f32[i + 2], v_f32[i + 3]);')
-P('        let b = @vec(f32x4, v_f32[i + 4], v_f32[i + 5], v_f32[i + 6], v_f32[i + 7]);')
-P('        let c = @vec(f64x2, v_f64[i], v_f64[i + 3]);')
-P('        let d = @vec(f64x2, v_f64[i + 5], v_f64[i + 7]);')
-P('        sf(a, b, c, d);')
-P('    }')
+for scale in (1, 2, 4):
+    P('    for i in @as(usize, 0)..4 { sw_%d(mk_u8x%d(i), mk_u8x%d(i + 5)); dt_%d(mk_i16x%d(i), mk_i16x%d(i + 2)); }' % (scale, 16 * scale, 16 * scale, scale, 8 * scale, 8 * scale))
+    nf, nd = 4 * scale, 2 * scale
+    P('    for i in @as(usize, 0)..5 {')
+    P('        let a = @vec(f32x%d, %s);' % (nf, ', '.join('v_f32[(i + %d) %% v_f32.len]' % k for k in range(nf))))
+    P('        let b = @vec(f32x%d, %s);' % (nf, ', '.join('v_f32[(i + %d) %% v_f32.len]' % (k + 4) for k in range(nf))))
+    P('        let c = @vec(f64x%d, %s);' % (nd, ', '.join('v_f64[(i + %d) %% v_f64.len]' % (3 * k) for k in range(nd))))
+    P('        let d = @vec(f64x%d, %s);' % (nd, ', '.join('v_f64[(i + %d) %% v_f64.len]' % (3 * k + 5) for k in range(nd))))
+    P('        sf_%d(a, b, c, d);' % scale)
+    P('    }')
+    # NaN, infinities and the bounds of the conversions
+    sp32 = ['0x7fc00000', '0x7f800000', '0xff800000', '0x4f000000', '0x4effffff', '0xcf000000', '0xcf000001', '0x4f800000',
+            '0x4f7fffff', '0xbf7fffff', '0xbf800000', '0x80000000', '0x3f000000', '0xffc00001', '0x5f000000', '0x3f800001']
+    sp64 = ['0x7ff8000000000000', '0x7ff0000000000000', '0xfff0000000000000', '0x43e0000000000000', '0xc3e0000000000000',
+            '0x43f0000000000000', '0x43efffffffffffff', '0xbfefffffffffffff']
+    P('    sf_%d(@bit_cast(f32x%d, @vec(u32x%d, %s)), @bit_cast(f32x%d, @vec(u32x%d, %s)), @bit_cast(f64x%d, @vec(u64x%d, %s)), @bit_cast(f64x%d, @vec(u64x%d, %s)));' %
+      (scale, nf, nf, ', '.join(sp32[:nf]), nf, nf, ', '.join(sp32[16 - nf:]), nd, nd, ', '.join(sp64[:nd]), nd, nd, ', '.join(sp64[8 - nd:])))
 P('}')
 print('\n'.join(out))

@@ -1,0 +1,63 @@
+// EVEX's compressed 8-bit displacement counts in units of the instruction's
+// memory operand: a vector for whole-vector loads, one element for a
+// broadcast, half a vector for a widening load. A broadcast of p[64] (256
+// bytes on) was encoded as 256 / 64 (the unit of a whole 512-bit vector),
+// which the processor reads as 4 elements on: p[4]. Run where the processor
+// has AVX-512, compared with the same sums computed without it.
+import "../lib/io.ax" as io;
+
+let mut DATA: [512]f32 = [0.0; 512];
+let mut BYTES: [512]u8 = [0; 512];
+
+fn bcast_sum(p: *[512]f32) f32 @features("avx512f,avx512bw,avx512vl") {
+    let a: f32x16 = @splat(p[64]);
+    let b: f32x16 = @splat(p[128]);
+    let c: f32x16 = @splat(p[3]);
+    let d: f32x16 = @splat(p[96]);
+    return @reduce_add(((a + b) + c) * d);
+}
+
+fn bcast_sum_scalar(p: *[512]f32) f32 {
+    return (((p[64] + p[128]) + p[3]) * p[96]) * 16.0;
+}
+
+fn widen_sum(p: *[512]u8) u32 @features("avx512f,avx512bw,avx512vl") {
+    let z: u8x32 = @splat(0);
+    let w = @bit_cast(u16x32, @shuffle(@load(u8x32, p[64..96]), z, [0, 32, 1, 32, 2, 32, 3, 32, 4, 32, 5, 32, 6, 32, 7,
+                                                                    32, 8, 32, 9, 32, 10, 32, 11, 32, 12, 32, 13, 32,
+                                                                    14, 32, 15, 32, 16, 32, 17, 32, 18, 32, 19, 32, 20,
+                                                                    32, 21, 32, 22, 32, 23, 32, 24, 32, 25, 32, 26, 32,
+                                                                    27, 32, 28, 32, 29, 32, 30, 32, 31, 32]));
+    let x = @bit_cast(u16x32, @shuffle(@load(u8x32, p[128..160]), z, [0, 32, 1, 32, 2, 32, 3, 32, 4, 32, 5, 32, 6, 32,
+                                                                      7, 32, 8, 32, 9, 32, 10, 32, 11, 32, 12, 32, 13,
+                                                                      32, 14, 32, 15, 32, 16, 32, 17, 32, 18, 32, 19,
+                                                                      32, 20, 32, 21, 32, 22, 32, 23, 32, 24, 32, 25,
+                                                                      32, 26, 32, 27, 32, 28, 32, 29, 32, 30, 32, 31,
+                                                                      32]));
+    return @as(u32, @reduce_add(w +% x));
+}
+
+fn widen_sum_scalar(p: *[512]u8) u32 {
+    let mut t: u32 = 0;
+    for i in @as(usize, 0)..32 {
+        t += @as(u32, p[64 + i]) + @as(u32, p[128 + i]);
+    }
+    return t;
+}
+
+export fn run() void {
+    for i in @as(usize, 0)..512 {
+        DATA[i] = @float_from_int(f32, @truncate(u32, i)) * 0.25;
+        BYTES[i] = @truncate(u8, (i * 37) + 1);
+    }
+    let mut a = bcast_sum_scalar(&DATA);
+    let mut b = widen_sum_scalar(&BYTES);
+    if @cpu_has("avx512f") and @cpu_has("avx512bw") and @cpu_has("avx512vl") {
+        // (through an address computed at run time, so that it is in a register)
+        let k = @as(usize, BYTES[0] & 0x80);
+        a = bcast_sum(@ptr_cast(*[512]f32, @ptr_add(&DATA[0], k)));
+        b = widen_sum(@ptr_cast(*[512]u8, @ptr_add(&BYTES[0], k)));
+    }
+    io.float(@as(f64, a));  // expect: 18720
+    io.uint(@as(u64, b));   // expect: 8608
+}

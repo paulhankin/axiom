@@ -6,10 +6,13 @@
 //         if-conversion (thread.ax), removing copies of aggregates that are
 //         only read (copies.ax), scalar replacement of aggregates (sroa.ax),
 //         global value numbering, dead stores, bounds and loop-invariant code
-//         motion (gvn.ax)
+//         motion (gvn.ax), calls of a function itself in tail position as a
+//         loop (tailrec.ax); at the end, stack slots whose contents are
+//         never needed at the same time sharing their bytes (slots.ax)
 //   -O2+  also interprocedural constant propagation and inlining
 //         (inline.ax), bottom-up over the call graph, each function simplified
-//         again after its calls are inlined
+//         again after its calls are inlined; then small loops with a constant
+//         trip count unrolled (unroll.ax), and the function simplified again
 // =============================================================================
 import "copies.ax" as copies;
 import "gvn.ax" as gvn;
@@ -17,9 +20,13 @@ import "inline.ax" as inl;
 import "ir.ax" as ir;
 import "opt.ax" as opt;
 import "outline.ax" as outl;
+import "slots.ax" as slots;
+import "slp.ax" as slp;
 import "sroa.ax" as sroa;
+import "tailrec.ax" as tre;
 import "target.ax" as tg;
 import "thread.ax" as thr;
+import "unroll.ax" as unr;
 import "util.ax" as u;
 
 // Runs the sub-passes in turn until each has run on the current IR without
@@ -29,7 +36,7 @@ fn cleanup(f: *mut ir.Func, level: i32) bool {
     let mut any = false;
     let mut npasses: i32 = 2;
     if level > 0 {
-        npasses = 4;
+        npasses = 5;
     }
     let mut quiet: i32 = 0;  // passes in a row that changed nothing
     let mut threaded = false;
@@ -42,11 +49,15 @@ fn cleanup(f: *mut ir.Func, level: i32) bool {
         } else if p == 1 {
             c = opt.simplify_cfg(f);
         } else if p == 2 {
+            // selects of values that no branch tests, before threading
+            // duplicates their merges into trees of constants
+            c = thr.if_convert_values(f);
+        } else if p == 3 {
             c = thr.jump_thread(f);
         } else {
             c = thr.if_convert(f, not threaded);
         }
-        if p == 2 {
+        if p == 3 {
             threaded = c;
         }
         if c {
@@ -64,6 +75,10 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
     opt.mem2reg(f);
     _ = cleanup(f, level);
     if level > 0 {
+        // calls of itself in tail position: a loop
+        if tre.eliminate_tail_calls(f) {
+            _ = cleanup(f, level);
+        }
         // copies of aggregates that are only read (before scalar
         // replacement, which then takes the source apart instead)
         if copies.forward_copies(f) {
@@ -75,12 +90,27 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
             _ = cleanup(f, level);
             rounds += 1;
         }
+        // copies and loads out of slots filled piece by piece (once scalar
+        // replacement has taken apart the slices that held their addresses)
+        if copies.split_copies(f) {
+            _ = cleanup(f, level);
+            rounds = 0;
+            while (rounds < 6) and sroa.sroa(f) {
+                opt.mem2reg(f);
+                _ = cleanup(f, level);
+                rounds += 1;
+            }
+        }
         // again only when the cleanup after it found more to do
         rounds = 0;
         while (rounds < 3) and gvn.gvn(f) and cleanup(f, level) {
             rounds += 1;
         }
-        if gvn.dse(f) {
+        if unr.onehot_stores(f) {
+            _ = cleanup(f, level);
+        }
+        let dead = gvn.dse(f);
+        if copies.unread_writes(f) or dead {
             _ = gvn.gvn(f);
             _ = cleanup(f, level);
         }
@@ -97,6 +127,12 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
             _ = gvn.gvn(f);
             _ = cleanup(f, level);
         }
+        if slp.compare_masks(f) {
+            _ = cleanup(f, level);
+        }
+        if slp.byte_sums(f) {
+            _ = cleanup(f, level);
+        }
         opt.dce(f);
         _ = gvn.sink(f);
     }
@@ -105,8 +141,27 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
     ir.recycle(f);
 }
 
+// Unrolls loops with a small constant trip count, one at a time (an inner
+// loop's start may be a constant once its outer loop is unrolled). True if
+// any was.
+fn unroll(f: *mut ir.Func) bool {
+    let mut n: i32 = 0;
+    while (n < 32) and unr.full_unroll(f) {
+        n += 1;
+    }
+    return n > 0;
+}
+
 fn resimplify(f: *mut ir.Func) void {
     optimize_func(f, 2);
+}
+
+fn split_cold(m: *mut ir.Module, f: *mut ir.Func) *mut ir.Func {
+    let g = outl.outline_one(m, f);
+    if u.notnil(g) {
+        optimize_func(f, 2);
+    }
+    return g;
 }
 
 pub fn optimize_module(m: *mut ir.Module, level: i32) void {
@@ -132,12 +187,15 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
             for i in 0..consts.len {
                 optimize_func(consts.get(i), level);
             }
-            inl.inline_module(m, resimplify);
+            inl.inline_module(m, resimplify, split_cold);
         }
         for i in 0..m.funcs.len {
             let f = m.funcs.get(i);
             if ir.is_decl(f) {
                 continue;
+            }
+            if unroll(f) {
+                optimize_func(f, level);
             }
             let split = gvn.split_loops(f);
             if split or gvn.reduce_addresses(f, tg.is_wasm()) {
@@ -152,6 +210,31 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
                 }
                 opt.dce(f);
             }
+            // stores of neighbouring elements as vector stores, once the
+            // scalar passes (store forwarding, dead stores) are done
+            if slp.store_groups(f) {
+                _ = cleanup(f, level);
+                _ = gvn.gvn(f);
+                opt.dce(f);
+            }
+            // and scalars only broadcast, neighbouring lanes, as vectors
+            if slp.splat_groups(f) {
+                _ = cleanup(f, level);
+                opt.dce(f);
+            }
         }
+    }
+    if level > 0 {
+        // stack slots: copies between them coalesced, and those never
+        // needed at the same time sharing their bytes (once the passes,
+        // which tell slots apart by their allocas, are done)
+        slots.find_kept_params(m);
+        for i in 0..m.funcs.len {
+            let f = m.funcs.get(i);
+            if not ir.is_decl(f) {
+                _ = slots.colour_slots(f);
+            }
+        }
+        slots.forget_kept_params();
     }
 }

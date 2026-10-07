@@ -1,0 +1,195 @@
+// @widen_low, @widen_high and @narrow (WebAssembly's extend_low/high and
+// narrow_*_sat, by lane type), on 128-bit vectors and wide ones (which
+// narrower targets split), compared lane by lane with the scalar
+// conversions; and @as from bool to integers (issue 0035).
+import "../lib/io.ax" as io;
+
+let mut b8: [64]u8 = [0; 64];
+let mut b16: [64]u16 = [0; 64];
+let mut b32: [32]u32 = [0; 32];
+
+fn fill() void {
+    let edges: [8]u16 = [0, 1, 0x7F, 0x80, 0xFF, 0x100, 0x7FFF, 0x8000];
+    for i in @as(usize, 0)..64 {
+        b8[i] = @truncate(u8, i * 37 + 3);
+        b16[i] = edges[i % 8] +% @truncate(u16, (i / 8) * 0x2001);
+    }
+    b8[0] = 0x80;
+    b8[1] = 0xFF;
+    b8[2] = 0x7F;
+    for i in @as(usize, 0)..32 {
+        b32[i] = @as(u32, b16[i]) *% 0x1_0001 +% @truncate(u32, i * 0x3000);
+    }
+    b32[0] = 0x8000_0000;
+    b32[1] = 0xFFFF_FFFF;
+    b32[2] = 0x0001_0000;
+    b32[3] = 0x7FFF;
+    b32[4] = 0xFFFF_8000;
+}
+
+fn sat(x: i64, lo: i64, hi: i64) i64 {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+// mismatches of the widenings of b8 (as u8 and i8 lanes), 128 and 512 bits
+fn widen8() u32 {
+    let mut bad: u32 = 0;
+    let u = @load(u8x16, b8[0..16]);
+    let s = @bit_cast(i8x16, u);
+    let ul = @widen_low(u);
+    let uh = @widen_high(u);
+    let sl = @widen_low(s);
+    let sh = @widen_high(s);
+    let mut r: [8]u16 = [0; 8];
+    let mut q: [8]i16 = [0; 8];
+    @store(r[..], ul);
+    for i in @as(usize, 0)..8 {
+        bad += @as(u32, r[i] != @as(u16, b8[i]));
+    }
+    @store(r[..], uh);
+    for i in @as(usize, 0)..8 {
+        bad += @as(u32, r[i] != @as(u16, b8[8 + i]));
+    }
+    @store(q[..], sl);
+    for i in @as(usize, 0)..8 {
+        bad += @as(u32, q[i] != @as(i16, @bit_cast(i8, b8[i])));
+    }
+    @store(q[..], sh);
+    for i in @as(usize, 0)..8 {
+        bad += @as(u32, q[i] != @as(i16, @bit_cast(i8, b8[8 + i])));
+    }
+    let w = @load(i8x64, @cast_slice(i8, b8[..]));
+    let mut wr: [32]i16 = [0; 32];
+    @store(wr[..], @widen_high(w));
+    for i in @as(usize, 0)..32 {
+        bad += @as(u32, wr[i] != @as(i16, @bit_cast(i8, b8[32 + i])));
+    }
+    @store(wr[..], @widen_low(w));
+    for i in @as(usize, 0)..32 {
+        bad += @as(u32, wr[i] != @as(i16, @bit_cast(i8, b8[i])));
+    }
+    return bad;
+}
+
+fn widen32() u32 {
+    let mut bad: u32 = 0;
+    let s = @load(i32x8, @cast_slice(i32, b32[0..8]));
+    let mut r: [4]i64 = [0; 4];
+    @store(r[..], @widen_high(s));
+    for i in @as(usize, 0)..4 {
+        bad += @as(u32, r[i] != @as(i64, @bit_cast(i32, b32[4 + i])));
+    }
+    let u = @load(u32x4, b32[0..4]);
+    let mut q: [2]u64 = [0; 2];
+    @store(q[..], @widen_low(u));
+    for i in @as(usize, 0)..2 {
+        bad += @as(u32, q[i] != @as(u64, b32[i]));
+    }
+    return bad;
+}
+
+// mismatches of the four narrowings of b16 to 8-bit lanes
+fn narrow16() u32 {
+    let mut bad: u32 = 0;
+    let ua = @load(u16x8, b16[0..8]);
+    let ub = @load(u16x8, b16[8..16]);
+    let sa = @bit_cast(i16x8, ua);
+    let sb = @bit_cast(i16x8, ub);
+    let mut r: [16]u8 = [0; 16];
+    let mut q: [16]i8 = [0; 16];
+    @store(q[..], @narrow(i8x16, sa, sb));
+    for i in @as(usize, 0)..16 {
+        let x = @as(i64, @bit_cast(i16, b16[i]));
+        bad += @as(u32, @as(i64, q[i]) != sat(x, -128, 127));
+    }
+    @store(r[..], @narrow(u8x16, sa, sb));
+    for i in @as(usize, 0)..16 {
+        let x = @as(i64, @bit_cast(i16, b16[i]));
+        bad += @as(u32, @as(i64, r[i]) != sat(x, 0, 255));
+    }
+    @store(q[..], @narrow(i8x16, ua, ub));
+    for i in @as(usize, 0)..16 {
+        bad += @as(u32, @as(i64, q[i]) != sat(@as(i64, b16[i]), -128, 127));
+    }
+    @store(r[..], @narrow(u8x16, ua, ub));
+    for i in @as(usize, 0)..16 {
+        bad += @as(u32, @as(i64, r[i]) != sat(@as(i64, b16[i]), 0, 255));
+    }
+    // 512 bits: the lanes of a, then b
+    let wa = @load(i16x32, @cast_slice(i16, b16[0..32]));
+    let wb = @load(i16x32, @cast_slice(i16, b16[32..64]));
+    let mut wr: [64]u8 = [0; 64];
+    @store(wr[..], @narrow(u8x64, wa, wb));
+    for i in @as(usize, 0)..64 {
+        let x = @as(i64, @bit_cast(i16, b16[i]));
+        bad += @as(u32, @as(i64, wr[i]) != sat(x, 0, 255));
+    }
+    return bad;
+}
+
+fn narrow32() u32 {
+    let mut bad: u32 = 0;
+    let sa = @load(i32x8, @cast_slice(i32, b32[0..8]));
+    let sb = @load(i32x8, @cast_slice(i32, b32[8..16]));
+    let mut q: [16]i16 = [0; 16];
+    @store(q[..], @narrow(i16x16, sa, sb));
+    for i in @as(usize, 0)..16 {
+        let x = @as(i64, @bit_cast(i32, b32[i]));
+        bad += @as(u32, @as(i64, q[i]) != sat(x, -32768, 32767));
+    }
+    let ua = @load(u32x4, b32[0..4]);
+    let ub = @load(u32x4, b32[4..8]);
+    let mut r: [8]u16 = [0; 8];
+    @store(r[..], @narrow(u16x8, ua, ub));
+    for i in @as(usize, 0)..8 {
+        bad += @as(u32, @as(i64, r[i]) != sat(@as(i64, b32[i]), 0, 65535));
+    }
+    let ea = @load(i64x2, @cast_slice(i64, b32[0..4]));
+    let mut e: [4]u32 = [0; 4];
+    @store(e[..], @narrow(u32x4, ea, ea));
+    for i in @as(usize, 0)..4 {
+        let x = @as(i64, b32[(i % 2) * 2]) | (@as(i64, b32[(i % 2) * 2 + 1] & 0x7FFF_FFFF) << 32);
+        let neg = (b32[(i % 2) * 2 + 1] & 0x8000_0000) != 0;
+        let mut want: i64 = sat(x, 0, 0xFFFF_FFFF);
+        if neg {
+            want = 0;
+        }
+        bad += @as(u32, @as(i64, e[i]) != want);
+    }
+    return bad;
+}
+
+fn count(xs: []i32) u32 {
+    let mut n: u32 = 0;
+    for i in @as(usize, 0)..xs.len {
+        n += @as(u32, xs[i] > 0);
+    }
+    return n;
+}
+
+export fn run() void {
+    fill();
+    io.uint(@as(u64, widen8()));    // expect: 0
+    io.uint(@as(u64, widen32()));   // expect: 0
+    io.uint(@as(u64, narrow16()));  // expect: 0
+    io.uint(@as(u64, narrow32()));  // expect: 0
+    let v = @narrow(u8x16, @vec(i16x8, -1, 0, 1, 255, 256, -32768, 32767, 128), @as(i16x8, @splat(7)));
+    io.uint(@as(u64, @extract_lane(v, 0)));  // expect: 0
+    io.uint(@as(u64, @extract_lane(v, 4)));  // expect: 255
+    io.uint(@as(u64, @extract_lane(v, 7)));  // expect: 128
+    io.uint(@as(u64, @extract_lane(v, 8)));  // expect: 7
+    let w = @widen_high(@vec(i16x8, 0, 0, 0, 0, -5, 6, -32768, 32767));
+    io.int(@as(i64, @extract_lane(w, 0)));  // expect: -5
+    io.int(@as(i64, @extract_lane(w, 2)));  // expect: -32768
+    let xs: [5]i32 = [3, -1, 0, 7, 9];
+    io.uint(@as(u64, count(xs[..])));          // expect: 3
+    io.int(@as(i64, true) - @as(i64, false));  // expect: 1
+    let t: u8 = @as(u8, xs[0] == 3) + @as(u8, true);
+    io.uint(@as(u64, t));  // expect: 2
+}

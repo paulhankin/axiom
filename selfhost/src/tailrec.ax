@@ -1,0 +1,211 @@
+// =============================================================================
+// tailrec.ax - turns a function's calls of itself in tail position into a
+// loop.
+//
+// A call of f in f whose result f returns straight away (`return f(...)`),
+// or combines with another value by an associative and commutative integer
+// operation first (`return x + f(...)`, with +, *, &, | or ^), becomes a
+// jump back to f's start with the call's arguments as the parameters. The
+// combined values are gathered in an accumulator, which every other return
+// then combines with what it returns: f(n) = a(n) + f(n - 1) computes
+// ((0 + a(n)) + a(n - 1)) + ... + f(base), the same integer (wrapping
+// operations reassociate exactly). The loop is then inlined and optimized
+// like any other: the benchmark's endgame-table index (`position_f`) recursed once per
+// point. A function with stack slots keeps its calls (a slot's address
+// passed down would then be the same slot in each round), and so does one
+// with no other return (it can only end by running out of stack, which as
+// a loop it never would).
+// =============================================================================
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+// Is c a call of f that is followed only by returning its result, or its
+// result combined with something else (acc: the combining instruction,
+// else nil)? Calls with arguments passed by address (byval, sret) are not.
+fn tail_site(f: *mut ir.Func, c: *mut ir.Value, acc: *mut *mut ir.Value) bool {
+    if (c.op != ir.OP_CALL) or (c.a.kind != ir.V_FUNC) or (c.a.fnp != f) or (c.xs.len != f.params.len) {
+        return false;
+    }
+    for k in 0..c.ext.len {
+        if (c.ext[k] == ir.EXT_BYVAL) or (c.ext[k] == ir.EXT_SRET) {
+            return false;
+        }
+    }
+    acc.* = u.nil.[ir.Value]();
+    let n = c.next;
+    if u.isnil(n) {
+        return false;
+    }
+    if n.op == ir.OP_RET {
+        return u.isnil(n.a) or (n.a == c);
+    }
+    let r = n.next;
+    if u.isnil(r) or (r.op != ir.OP_RET) or (r.a != n) or (n.ty.kind != ir.T_INT) {
+        return false;
+    }
+    let op = n.op;
+    if (op != ir.OP_ADD) and (op != ir.OP_MUL) and (op != ir.OP_AND) and (op != ir.OP_OR) and (op != ir.OP_XOR) {
+        return false;
+    }
+    // (the other operand is computed before the call, or is a constant or
+    // a parameter)
+    if ((n.a == c) and (n.b != c)) or ((n.b == c) and (n.a != c)) {
+        acc.* = n;
+        return true;
+    }
+    return false;
+}
+
+// The value x for which `x op y` is y.
+fn identity(op: i32, t: *mut ir.Ty) *mut ir.Value {
+    if op == ir.OP_MUL {
+        return ir.cint(t, 1);
+    }
+    if op == ir.OP_AND {
+        return ir.cint(t, ~@as(u64, 0));
+    }
+    return ir.cint(t, 0);
+}
+
+let mut TB: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+
+/// Replaces f's calls of itself in tail position by a loop; true if it
+/// replaced any.
+pub fn eliminate_tail_calls(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or f.sret {
+        return false;
+    }
+    let mut sites = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut accs = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut rets = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    let mut op: i32 = 0;  // the accumulator's operation (0: none)
+    let mut ok = true;
+    let mut b = f.first;
+    while ok and u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_ALLOCA {
+                ok = false;
+            }
+            let mut acc = u.nil.[ir.Value]();
+            if tail_site(f, i, &mut acc) {
+                if u.notnil(acc) {
+                    if (op != 0) and (op != acc.op) {
+                        ok = false;
+                    }
+                    op = acc.op;
+                }
+                sites.push(i);
+                accs.push(acc);
+                // (its return goes with it)
+                i = i.next;
+                if i.op != ir.OP_RET {
+                    i = i.next;
+                }
+            } else if i.op == ir.OP_RET {
+                rets.push(i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // (with no other return, the calls only end when the stack runs out:
+    // as a loop, they would never end)
+    let found = ok and (sites.len > 0) and (rets.len > 0);
+    if found {
+        rewrite(f, sites.items(), accs.items(), rets.items(), op);
+    }
+    u.free(@ptr_cast(*mut void, sites.data));
+    u.free(@ptr_cast(*mut void, accs.data));
+    u.free(@ptr_cast(*mut void, rets.data));
+    return found;
+}
+
+fn rewrite(f: *mut ir.Func, sites: []*mut ir.Value, accs: []*mut ir.Value, rets: []*mut ir.Value, op: i32) void {
+    if u.isnil(TB) {
+        TB = ir.new_builder();
+    }
+    let B = TB;
+    // the entry's instructions move to a new block, the loop's header; the
+    // entry jumps to it
+    let entry = f.first;
+    let h = ir.append_block(f, "tailrec");
+    h.first = entry.first;
+    h.last = entry.last;
+    entry.first = u.nil.[ir.Value]();
+    entry.last = u.nil.[ir.Value]();
+    let mut i = h.first;
+    while u.notnil(i) {
+        i.blk = h;
+        i = i.next;
+    }
+    ir.move_block_after(h, entry);
+    ir.at_end(B, entry);
+    ir.br(B, h);
+    // (phis in the header's successors came from the entry)
+    let t = h.last;
+    for k in 0..ir.succ_count(t) {
+        let s = ir.succ(t, k);
+        let mut p = s.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            for j in 0..p.bs.len {
+                if p.bs.get(j) == entry {
+                    p.bs.set(j, h);
+                }
+            }
+            p = p.next;
+        }
+    }
+    // a phi per parameter, and the accumulator
+    let mut phis = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
+    for p in f.params {
+        ir.at_before(B, h.first);
+        let x = ir.phi(B, p.ty);
+        ir.replace_uses(f, p, x);
+        ir.add_incoming(x, p, entry);
+        phis.push(x);
+    }
+    let mut acc = u.nil.[ir.Value]();
+    if op != 0 {
+        let rt = f.ty.ret;
+        ir.at_before(B, h.first);
+        acc = ir.phi(B, rt);
+        ir.add_incoming(acc, identity(op, rt), entry);
+        for r in rets {
+            if u.notnil(r.a) {
+                ir.at_before(B, r);
+                r.a = ir.binop(B, op, acc, r.a);
+            }
+        }
+    }
+    for k in 0..sites.len {
+        let c = sites[k];
+        let blk = c.blk;
+        for j in 0..phis.len {
+            ir.add_incoming(phis.get(j), c.xs.get(j), blk);
+        }
+        let a = accs[k];
+        if u.notnil(acc) {
+            let mut next = acc;
+            if u.notnil(a) {
+                let mut x = a.a;
+                if x == c {
+                    x = a.b;
+                }
+                ir.at_before(B, c);
+                next = ir.binop(B, op, acc, x);
+            }
+            ir.add_incoming(acc, next, blk);
+        }
+        // the call, the combining and the return go
+        let r = blk.last;
+        ir.remove_inst(r);
+        if u.notnil(a) {
+            ir.remove_inst(a);
+        }
+        ir.remove_inst(c);
+        ir.at_end(B, blk);
+        ir.br(B, h);
+    }
+    u.free(@ptr_cast(*mut void, phis.data));
+}

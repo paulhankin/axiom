@@ -387,9 +387,10 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     case TK_SLASH:
         if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM)) return true;
         if (ty_is_vec_int(t)) {
+            // lane-wise and wrapping, in every overflow mode (§13.1)
             if (op == TK_SLASH) diag_error(sp, "E0811", "integer vectors do not support '/'");
-            else
-                diag_error(sp, "E0811", "integer vectors use wrapping arithmetic: write '%s%%' instead of '%s'", opn, opn);
+            else if (op == TK_STAR && t->elem->bits == 8) diag_error(sp, "E0811", "8-bit lane vectors have no multiplication");
+            else return true;
             return false;
         }
         break;
@@ -461,7 +462,8 @@ static bool check_shift_count(Expr **pb) {
     }
     if (r->kind == TY_INVALID) return true;
     if ((r->kind == TY_INT && !r->is_signed) || param_has(r, C_UNSIGNED)) return true;
-    if (r->kind == TY_INT || param_has(r, C_SIGNED)) {
+    if (ty_is_vec_int(r) && !r->elem->is_signed) return true;  // per lane (spec §13.1)
+    if (r->kind == TY_INT || param_has(r, C_SIGNED) || ty_is_vec_int(r)) {
         Diag *d = diag_error((*pb)->span, "E0525", "shift count must be unsigned, found %s", type_str(r));
         (void)d;
         return false;
@@ -502,6 +504,13 @@ static Type *check_binary(Expr *e, Type *expected) {
         }
         if (l->kind != TY_INT && !ty_is_vec_int(l) && !param_has(l, C_INT) && l->kind != TY_INVALID) {
             diag_error(e->a->span, "E0513", "shift requires an integer operand, found %s", type_str(l));
+            return e->type = t_invalid;
+        }
+        Type *k = e->b->type;
+        if (ok && ty_is_vec_int(k) && l->kind != TY_INVALID &&
+            !(ty_is_vec_int(l) && l->lanes == k->lanes && l->elem->bits == k->elem->bits)) {
+            diag_error(e->b->span, "E0412", "per-lane shift counts must have the shape of the shifted vector: %s and %s",
+                       type_str(l), type_str(k));
             return e->type = t_invalid;
         }
         if (ok && e->a->is_const && e->b->is_const && l->kind == TY_INT) {
@@ -556,6 +565,23 @@ static Type *check_binary(Expr *e, Type *expected) {
     }
     if (cmp) {
         check_cmp_op(op, t, e->span);
+        if (ty_is_untyped(t) && e->a->is_const && e->b->is_const) {
+            // two untyped constants: the comparison is a bool constant
+            bool fl = t->kind == TY_UNTYPED_FLOAT;
+            i128 a = e->a->cval, b = e->b->cval;
+            double fa = e->a->fval, fb = e->b->fval;
+            bool r = false;
+            switch (op) {
+            case TK_EQEQ: r = fl ? fa == fb : a == b; break;
+            case TK_NE: r = fl ? fa != fb : a != b; break;
+            case TK_LT: r = fl ? fa < fb : a < b; break;
+            case TK_LE: r = fl ? fa <= fb : a <= b; break;
+            case TK_GT: r = fl ? fa > fb : a > b; break;
+            case TK_GE: r = fl ? fa >= fb : a >= b; break;
+            }
+            e->bval = r;
+            e->is_const = true;
+        }
         return e->type = t_bool;
     }
     if (!check_arith_op(op, t, e->span)) return e->type = t_invalid;
@@ -613,7 +639,7 @@ static Type *check_unary(Expr *e, Type *expected) {
             }
             return e->type = t;
         }
-        if (t->kind == TY_INT && !t->is_signed) {
+        if ((t->kind == TY_INT && !t->is_signed) || (ty_is_vec_int(t) && !t->elem->is_signed)) {
             Diag *d = diag_error(e->span, "E0520", "unary '-' cannot be applied to unsigned type %s", type_str(t));
             DiagFix *fx = diag_fix(d, "use wrapping negation", "suggestion");
             diag_fix_edit(fx, (Span){e->span.file, e->span.start, e->span.start + 1}, "-%");
@@ -631,10 +657,7 @@ static Type *check_unary(Expr *e, Type *expected) {
             }
             return e->type = t;
         }
-        if (ty_is_vec_int(t)) {
-            diag_error(e->span, "E0811", "integer vectors use wrapping negation: write '-%%'");
-            return e->type = t_invalid;
-        }
+        if (ty_is_vec_int(t)) return e->type = t;  // lane-wise, wrapping (§13.1)
         diag_error(e->span, "E0513", "unary '-' cannot be applied to %s", type_str(t));
         return e->type = t_invalid;
     }
@@ -1145,6 +1168,10 @@ static Type *check_call(Expr *e, Type *expected) {
         e->gargs = gargs;
         e->ngargs = nall;
         e->op = CALLK_DIRECT;
+        if (fn->is_inline && C->fn && C->fn->is_inline) {
+            vec_push(C->fn->inline_callees, fn);
+            vec_push(C->fn->inline_call_spans, e->span);
+        }
         // receiver
         if (method) {
             Expr *recv = callee->b;

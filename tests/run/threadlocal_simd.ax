@@ -1,0 +1,72 @@
+// Vector loads and stores of thread-local memory (issues/0039): natively the
+// address is %fs:[index + sym@tpoff], with a base register once a pointer to
+// the global is folded in, and the SSE/AVX encodings must take it.
+import "../lib/io.ax" as io;
+import "std/thread" as thread;
+
+struct Scratch {
+    idx: [16]u32,
+    val: [16]f32,
+}
+
+threadlocal let mut buf: [16]f32 = [0.0; 16];
+threadlocal let mut scratch: Scratch = Scratch.{ idx: [0; 16], val: [0.0; 16] };
+threadlocal let mut wide: [32]f32 = [0.0; 32];
+
+// Like the benchmark's collect_nonzero: stores at a running offset through a pointer
+// to thread-local data (inlined at -O2, so the address folds into the store).
+fn compact(input: []f32, s: *mut Scratch) usize {
+    let zero: f32x4 = @splat(0.0);
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while (i + 4) <= input.len {
+        let v = @load(f32x4, input[i..]);
+        let m = @bitmask(@lanes_ne(v, zero));
+        let ids = @vec(u32x4, 0, 1, 2, 3) +% @splat(@truncate(u32, i));
+        @store(s.idx[n..], ids);
+        @store(s.val[n..], v);
+        n += @as(usize, @popcount(m));
+        i += 4;
+    }
+    return n;
+}
+
+fn work(r: *mut f64) void {
+    // a fresh thread's copy starts zeroed
+    @store(buf[8..], @load(f32x4, buf[8..]) + @splat(2.5));
+    r.* = @as(f64, @reduce_add(@load(f32x4, buf[8..12])));
+}
+
+export fn run() void {
+    @store(buf[4..], @vec(f32x4, 1.0, 2.0, 3.0, 4.0));
+    let v = @load(f32x4, buf[4..8]);
+    io.float(@as(f64, @reduce_add(v)));  // expect: 10
+    io.float(@as(f64, buf[7]));          // expect: 4
+    // a run-time offset
+    let mut k: usize = 0;
+    while k < 12 {
+        @store(buf[k..], @load(f32x4, buf[k..]) + @splat(1.0));
+        k += 4;
+    }
+    io.float(@as(f64, @reduce_add(@load(f32x4, buf[0..4]))));  // expect: 4
+    io.float(@as(f64, buf[5]));  // expect: 3
+    let input: [8]f32 = [0.0, 1.0, 0.0, 2.0, 3.0, 0.0, 0.0, 0.0];
+    let n = compact(input[..], &mut scratch);
+    io.uint(@as(u64, n));                // expect: 3
+    io.uint(@as(u64, scratch.idx[2]));   // expect: 4
+    io.uint(@as(u64, scratch.idx[5]));   // expect: 7
+    io.float(@as(f64, scratch.val[2]));  // expect: 3
+    // integer vectors and 256/512-bit vectors
+    @store(scratch.idx[8..], @load(u32x4, scratch.idx[0..4]) *% @splat(3));
+    io.uint(@as(u64, scratch.idx[11]));  // expect: 15
+    let h: f32x16 = @splat(1.5);
+    @store(wide[0..16], h);
+    @store(wide[8..16], @load(f32x8, wide[0..8]) + @splat(1.0));
+    let w = @load(f32x16, wide[0..16]);
+    io.float(@as(f64, @reduce_add(w)));  // expect: 32
+    let mut r: f64 = 0.0;
+    let t = thread.spawn(work, &mut r) catch return;
+    t.join();
+    io.float(r);                 // expect: 10
+    io.float(@as(f64, buf[8]));  // expect: 1
+}

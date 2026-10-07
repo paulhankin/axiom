@@ -1,0 +1,64 @@
+// @prefetch (issue 0041): a hint with no semantics. Any pointer, mutable or
+// not, to any type (void, a struct, an element of a table, a local, the
+// heap end, an address outside memory, a misaligned one) compiles and never
+// traps; the program's results are unchanged. The pointer is evaluated
+// (its side effects happen) exactly once.
+import "../lib/io.ax" as io;
+
+struct Slot {
+    key: u64,
+    value: u32,
+}
+
+let mut table: [64]Slot = [Slot.{ key: 0, value: 0 }; 64];
+let mut calls: u32 = 0;
+
+fn bucket(k: u64) usize {
+    return @as(usize, @truncate(u8, (k *% 0x9e3779b97f4a7c15) >> 58));
+}
+
+fn counted(p: *Slot) *Slot {
+    calls += 1;
+    return p;
+}
+
+fn lookup(keys: []u64) u32 {
+    // start the loads for the whole batch, then do the lookups
+    for k in keys {
+        @prefetch(&table[bucket(k)]);
+    }
+    let mut sum: u32 = 0;
+    for k in keys {
+        let s = &table[bucket(k)];
+        if s.key == k {
+            sum += s.value;
+        }
+    }
+    return sum;
+}
+
+export fn run() void {
+    let keys: [5]u64 = [3, 17, 99, 1000, 123456789];
+    for i in @as(usize, 0)..5 {
+        let k = keys[i];
+        table[bucket(k)] = Slot.{ key: k, value: @as(u32, @truncate(u8, i)) + 1 };
+    }
+    io.uint(@as(u64, lookup(keys[..])));  // expect: 15
+
+    let mut local: u64 = 7;
+    @prefetch(&local);
+    @prefetch(&mut local);
+    let v: *void = @ptr_cast(*void, &local);
+    @prefetch(v);
+    io.uint(local);  // expect: 7
+
+    // never traps, whatever the address
+    @prefetch(@ptr_from_int(*u8, 1));
+    @prefetch(@ptr_from_int(*u64, 3));
+    @prefetch(@ptr_from_int(*u8, @max_value(usize) - 63));
+    @prefetch(@ptr_add(&table[0], 64));  // one past the end
+
+    // evaluated once
+    @prefetch(counted(&table[0]));
+    io.uint(@as(u64, calls));  // expect: 1
+}

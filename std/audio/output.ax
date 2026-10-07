@@ -1,0 +1,201 @@
+// =============================================================================
+// std/audio/output.ax - playing sound on Windows (std/audio/xaudio2) and
+// macOS (std/audio/coreaudio), chosen when the program runs: an engine and
+// voices that play std/audio Sounds (16-bit or 32-bit float samples), with
+// volume, pitch and looping; many voices mix.
+//
+//     let mut eng = output.Engine.init()!;
+//     defer eng.deinit();
+//     let mut v = eng.voice(&snd)!;            // snd's format
+//     defer v.destroy();
+//     v.play(&snd, false)!;                    // snd must outlive the playing
+// =============================================================================
+
+import "../audio.ax" as audio;
+import "../mem.ax" as mem;
+import "coreaudio.ax" as coreaudio;
+import "xaudio2.ax" as xaudio2;
+
+error { Unsupported, Failed }
+
+import host "axiom" {
+    fn ax_os() i32;
+}
+
+fn mac() bool {
+    return ax_os() == 2;
+}
+
+pub struct Engine {
+    x: xaudio2.Engine,
+    c: *mut coreaudio.Engine,  // (null when not in use)
+
+    /// An engine that is not there: what init gives where there is no
+    /// audio device (deinit does nothing).
+    pub fn none() Engine {
+        return Engine.{ x: xaudio2.Engine.{ x: 0, master: 0 }, c: @ptr_from_int(*mut coreaudio.Engine, 0) };
+    }
+
+    /// The engine, playing to the default audio device.
+    pub fn init() !Engine {
+        let mut e = Engine.none();
+        if mac() {
+            let c = coreaudio.Engine.init() catch return error.Unsupported;
+            e.c = mem.create.[coreaudio.Engine](c) catch {
+                let mut cc = c;
+                cc.deinit();
+                return error.Failed;
+            };
+        } else {
+            e.x = xaudio2.Engine.init() catch return error.Unsupported;
+        }
+        return e;
+    }
+
+    pub fn deinit(self: *mut Engine) void {
+        if @int_from_ptr(self.c) != 0 {
+            self.c.deinit();
+            mem.destroy(self.c);
+            self.c = @ptr_from_int(*mut coreaudio.Engine, 0);
+        }
+        if self.x.x != 0 {
+            self.x.deinit();
+        }
+    }
+
+    /// The overall volume (1: as is, 0: silent).
+    pub fn set_volume(self: *mut Engine, v: f32) void {
+        if @int_from_ptr(self.c) != 0 {
+            self.c.set_volume(v);
+        } else if self.x.x != 0 {
+            self.x.set_volume(v);
+        }
+    }
+
+    /// A voice for sounds of s's format.
+    pub fn voice(self: *mut Engine, s: *audio.Sound) !Voice {
+        return self.voice_for(@truncate(u32, s.channels), s.rate, s.format);
+    }
+
+    pub fn voice_for(self: *mut Engine, channels: u32, rate: u32, format: audio.SampleFormat) !Voice {
+        let mut v = Voice.none();
+        if @int_from_ptr(self.c) != 0 {
+            v.c = self.c.voice_for(channels, rate, format) catch return error.Failed;
+        } else if self.x.x != 0 {
+            v.x = self.x.voice_for(channels, rate, format) catch return error.Failed;
+        } else {
+            return error.Unsupported;
+        }
+        return v;
+    }
+}
+
+pub struct Voice {
+    x: xaudio2.Voice,
+    c: coreaudio.Voice,
+
+    /// A voice that is not there (its methods do nothing).
+    pub fn none() Voice {
+        return Voice.{ x: xaudio2.Voice.{ v: 0, block: 0 }, c: coreaudio.Voice.none() };
+    }
+
+    fn mine(self: *Voice) bool {
+        return self.c.live();
+    }
+
+    fn theirs(self: *Voice) bool {
+        return self.x.v != 0;
+    }
+
+    /// Plays a sound (all of it; again and again when `looping`) after what
+    /// is queued. Its samples must stay alive until it has played.
+    pub fn play(self: *mut Voice, s: *audio.Sound, looping: bool) !void {
+        if self.mine() {
+            self.c.play(s, looping) catch return error.Failed;
+        } else if self.theirs() {
+            self.x.play(s, looping) catch return error.Failed;
+        }
+    }
+
+    /// Queues raw samples in the voice's format.
+    pub fn queue(self: *mut Voice, data: []u8, looping: bool) !void {
+        if self.mine() {
+            self.c.queue(data, looping) catch return error.Failed;
+        } else if self.theirs() {
+            self.x.queue(data, looping) catch return error.Failed;
+        }
+    }
+
+    pub fn start(self: *mut Voice) void {
+        if self.mine() {
+            self.c.start();
+        } else if self.theirs() {
+            self.x.start();
+        }
+    }
+
+    /// Stops and forgets what was queued.
+    pub fn stop(self: *mut Voice) void {
+        if self.mine() {
+            self.c.stop();
+        } else if self.theirs() {
+            self.x.stop();
+        }
+    }
+
+    /// Ends a looping sound after its current pass.
+    pub fn end_loop(self: *mut Voice) void {
+        if self.mine() {
+            self.c.end_loop();
+        } else if self.theirs() {
+            self.x.end_loop();
+        }
+    }
+
+    pub fn set_volume(self: *mut Voice, v: f32) void {
+        if self.mine() {
+            self.c.set_volume(v);
+        } else if self.theirs() {
+            self.x.set_volume(v);
+        }
+    }
+
+    /// Plays faster and higher (> 1) or slower and lower (< 1), up to 4.
+    pub fn set_pitch(self: *mut Voice, ratio: f32) void {
+        if self.mine() {
+            self.c.set_pitch(ratio);
+        } else if self.theirs() {
+            self.x.set_pitch(ratio);
+        }
+    }
+
+    /// Is something still queued?
+    pub fn playing(self: *Voice) bool {
+        if self.mine() {
+            return self.c.playing();
+        }
+        if self.theirs() {
+            return self.x.playing();
+        }
+        return false;
+    }
+
+    /// Frames played since the voice started.
+    pub fn frames_played(self: *Voice) u64 {
+        if self.mine() {
+            return self.c.frames_played();
+        }
+        if self.theirs() {
+            return self.x.frames_played();
+        }
+        return 0;
+    }
+
+    pub fn destroy(self: *mut Voice) void {
+        if self.mine() {
+            self.c.destroy();
+        } else if self.theirs() {
+            self.x.destroy();
+        }
+    }
+}

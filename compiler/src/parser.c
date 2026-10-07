@@ -29,6 +29,11 @@ typedef struct Parser {
 static Token *peek(Parser *P) { return &P->t[P->pos]; }
 static Token *peek2(Parser *P) { return &P->t[P->pos + 1 < P->n ? P->pos + 1 : P->n - 1]; }
 static TokKind pk(Parser *P) { return P->t[P->pos].kind; }
+// `inline` is a keyword only before `fn` (spec §9.5)
+static bool at_inline(Parser *P) {
+    return pk(P) == TK_IDENT && !strcmp(peek(P)->name, "inline") && peek2(P)->kind == KW_FN;
+}
+
 static Token *advance(Parser *P) {
     Token *t = &P->t[P->pos];
     if (P->pos < P->n - 1) P->pos++;
@@ -119,7 +124,7 @@ static TypeExpr *new_te(TEKind k, Span sp) {
 
 static void parse_field_list(Parser *P, FieldVec *out) {
     // Field ( "," Field )* ","?
-    while (pk(P) == TK_IDENT) {
+    while (pk(P) == TK_IDENT && !at_inline(P)) {
         Field f = {0};
         f.name = expect_ident(P, &f.span);
         expect(P, TK_COLON);
@@ -879,6 +884,36 @@ static void parse_params(Parser *P, Decl *d) {
     expect(P, TK_RPAREN);
 }
 
+// FnAttr ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"
+static void parse_fn_attr(Parser *P, Decl *d) {
+    Token *t = advance(P);
+    int kind = ATTR_NONE;
+    if (!strcmp(t->name, "features")) kind = ATTR_FEATURES;
+    else if (!strcmp(t->name, "multiversion")) kind = ATTR_MULTIVERSION;
+    else diag_error(t->span, "E0829", "unknown function attribute '@%s' (expected @features or @multiversion)", t->name);
+    if (kind != ATTR_NONE && d->attr != ATTR_NONE) {
+        diag_error(t->span, "E0829", "a function has at most one attribute (@features or @multiversion)");
+        kind = ATTR_NONE;
+    }
+    Span ts = t->span;
+    if (kind != ATTR_NONE) {
+        d->attr = kind;
+        d->attr_span = ts;
+    }
+    expect(P, TK_LPAREN);
+    while (pk(P) == TK_STRING) {
+        Token *s = advance(P);
+        if (kind != ATTR_NONE) {
+            vec_push(d->attr_args, intern(s->str.bytes, s->str.len));
+            vec_push(d->attr_arg_spans, s->span);
+        }
+        if (!accept(P, TK_COMMA)) break;
+    }
+    if (pk(P) != TK_RPAREN) syntax_error(P, "a string (the extensions)");
+    expect(P, TK_RPAREN);
+    if (kind != ATTR_NONE) d->attr_span = sp_from(P, ts);
+}
+
 static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     expect(P, KW_FN);
     Decl *d = new_decl(P, D_FN, start);
@@ -894,16 +929,27 @@ static Decl *parse_fn(Parser *P, Span start, bool is_pub, bool is_export) {
     } else {
         d->ret_te = parse_type(P);
     }
+    while (pk(P) == TK_BUILTIN) parse_fn_attr(P, d);
     d->body = parse_block(P);
     d->span = sp_from(P, start);
     return d;
 }
 
+static Decl *parse_fn_inline(Parser *P, Span start, bool is_pub, bool is_export) {
+    Span is = peek(P)->span;
+    bool inl = at_inline(P);
+    if (inl) advance(P);
+    Decl *d = parse_fn(P, start, is_pub, is_export);
+    d->is_inline = inl;
+    d->inline_span = is;
+    return d;
+}
+
 static void parse_methods(Parser *P, Decl *owner) {
-    while (pk(P) == KW_PUB || pk(P) == KW_FN) {
+    while (pk(P) == KW_PUB || pk(P) == KW_FN || at_inline(P)) {
         Span ms = peek(P)->span;
         bool mp = accept(P, KW_PUB);
-        Decl *m = parse_fn(P, ms, mp, false);
+        Decl *m = parse_fn_inline(P, ms, mp, false);
         m->owner = owner;
         vec_push(owner->methods, m);
     }
@@ -989,8 +1035,8 @@ static void parse_top(Parser *P) {
                     if (c[0] == 'T' && strlen(c) == 5 && isdigit((unsigned char)c[1]) && isdigit((unsigned char)c[2]) &&
                         isdigit((unsigned char)c[3]) && isdigit((unsigned char)c[4]))
                         v = atoi(c + 1);
-                    if (v < 0 || v > 11)
-                        diag_error(code->span, "E0311", "unknown trap code '%s' (expected T0000 ... T0011)", c);
+                    if (v < 0 || v > 13)
+                        diag_error(code->span, "E0311", "unknown trap code '%s' (expected T0000 ... T0013)", c);
                     else d->test_trap = v;
                 } else {
                     syntax_error(P, "trap code such as T0001");
@@ -1013,12 +1059,12 @@ static void parse_top(Parser *P) {
     }
     if (t->kind == KW_EXPORT) {
         advance(P);
-        if (pk(P) != KW_FN) {
+        if (pk(P) != KW_FN && !at_inline(P)) {
             syntax_error(P, "'fn' after 'export'");
             sync_stmt(P);
             return;
         }
-        vec_push(P->mod->decls, parse_fn(P, start, false, true));
+        vec_push(P->mod->decls, parse_fn_inline(P, start, false, true));
         return;
     }
     bool is_pub = accept(P, KW_PUB);
@@ -1054,6 +1100,10 @@ static void parse_top(Parser *P) {
     // `threadlocal` is a keyword only here, before a module-level `let`
     bool tls = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "threadlocal") && peek2(P)->kind == KW_LET;
     if (tls) advance(P);
+    if (at_inline(P)) {
+        vec_push(P->mod->decls, parse_fn_inline(P, start, is_pub, false));
+        return;
+    }
     switch (pk(P)) {
     case KW_FN: vec_push(P->mod->decls, parse_fn(P, start, is_pub, false)); return;
     case KW_STRUCT: {
@@ -1077,7 +1127,7 @@ static void parse_top(Parser *P) {
         d->name = expect_ident(P, &d->name_span);
         parse_generic_params(P, d);
         expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT) {
+        while (pk(P) == TK_IDENT && !at_inline(P)) {
             Variant v = {0};
             v.name = expect_ident(P, &v.span);
             if (accept(P, TK_COLON)) v.te = parse_type(P);
@@ -1097,7 +1147,7 @@ static void parse_top(Parser *P) {
         d->name = expect_ident(P, &d->name_span);
         if (accept(P, TK_COLON)) d->te = parse_type(P);
         expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT) {
+        while (pk(P) == TK_IDENT && !at_inline(P)) {
             Variant v = {0};
             v.name = expect_ident(P, &v.span);
             if (accept(P, TK_EQ)) {

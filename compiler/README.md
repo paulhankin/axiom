@@ -40,9 +40,13 @@ build, check and test also take a package directory, or no path for the package 
 current directory (spec §4.6).
 
   --target=wasm32|wasm64|native   default wasm32 (alias: wasm32-freestanding)
+  --cpu=<preset>                  processor extensions: native (the default for native), a baseline, or a
+                                  preset of selfhost/README.md (spec §13.4)
+  --features=+ext,-ext            add or remove extensions
   -O0 | -O1 | -O2 | -O3           optimization level; never changes program behavior
-  --release                       integer overflow saturates (= --overflow=saturate)
-  --overflow=trap|saturate        default: trap
+  --overflow=wrap|trap|saturate   integer overflow (spec §7.6): wraps by default; trap (T0002) is
+                                  an opt-in check for unintended overflows
+  --release                       accepted for compatibility; changes nothing (was = saturate)
   --emit=exe|obj|llvm|asm         default exe: a .wasm module or native executable
   --format=human|agent-json       diagnostics format (spec §16.2)
   --link=<file>                   C source, object or library to link in (repeatable). On wasm, C
@@ -85,7 +89,23 @@ adding an error name never invalidates the cache.
 faults in C code) prints the call path with source locations, and failing tests show
 it too, or, for a test that returned an error, the error return trace. They come
 from a per-thread shadow stack of call sites. Each call costs three stores and a
-load; `--stack-traces=off` removes them.
+load; `--stack-traces=off` removes them. A call to an `inline fn` (always inlined, LLVM's
+`alwaysinline`) passes its call-site record as an extra argument instead, which the
+inlined body pushes only before a trap or a call that is not inline (`INL_SITES` in
+`codegen.c`). On x86-64 Linux, except in profile and `--sanitize=address` builds,
+calls cost nothing instead (issue 0037, `frame_tables_emit` in `codegen.c`): functions
+keep frame pointers, each call gets a lexical-block `DILocation` of its own and
+`nomerge`, and after optimization the inlinedAt chain of each remaining call's
+location gives its records, which an inline-assembly label after the call puts in
+the section `axiom_rets`. A trap or crash walks the frame pointers and fills the
+shadow stack's ring from the table (`ax_stack_walk` in `runtime/native_host.c`), so
+everything that reads the shadow stack is unchanged. The debug information that
+this needs is stripped after optimization without `-g`.
+
+**Line tables** (spec §16.1): `-g` / `--debug-info=lines` attaches a `DISubprogram` to
+each function and a `DILocation` (from the same spans as the trap sites) to each
+instruction, through LLVM's DIBuilder; inlined functions appear as
+`DW_TAG_inlined_subroutine`.
 
 **Profiling** (spec §16.6): `axiom profile` samples the shadow stack, using a
 CPU-clock `SIGPROF` natively (`runtime/profile.c`) or a worker reading shared memory
@@ -125,7 +145,10 @@ $ node tests/std_opt.mjs          # std's tests at -O2, wasm32 and native, in pa
 
 `tests/run/*.ax` are run-and-compare tests. `// expect:` lines give the expected output,
 `// expect-trap` means `run` must trap, and `// flags:` adds compiler options.
-`tests/errors/*.ax` must fail to compile with the `// expect-error:` codes. The suite
+`tests/errors/*.ax` must fail to compile with the `// expect-error:` codes.
+`tests/lowering/*.ax` check instruction selection: each `// lower: <flags> | <regex> | <count>`
+line builds the file with `--emit=asm` and counts the regex's matches (for example, one
+`vpmaddwd` per `@dot` of `i16x32` with AVX-512, issue 0036). The suite
 passes on wasm32 and native at every optimization level, and under ASan/UBSan.
 
 ## Architecture
@@ -153,7 +176,7 @@ Design choices that keep it fast and small:
   already-typed AST.
 - **Lazy code generation.** Only functions reachable from `export fn`s (and the
   globals they touch) are lowered, so unused library code costs nothing in LLVM.
-- **Friendly to LLVM's -O0 fast path.** Overflow checks use plain instructions instead
+- **Friendly to LLVM's -O0 fast path.** Overflow checks (`--overflow=trap`) use plain instructions instead
   of `llvm.*.with.overflow`, and traps go through one cold helper function instead of
   inline `llvm.trap`. Both keep the wasm backend on its fast instruction selector. At
   `-O1` and above LLVM turns them back into the efficient forms.
@@ -172,7 +195,8 @@ Implemented: the whole language described in spec v0.1-draft.3:
 - modules and imports, `pub` / `export`, the no-shadowing rule
 - all primitive, pointer, slice, array, struct, union, error-union and function-pointer
   types, with the spec's layouts
-- implicit and explicit conversions, both overflow modes, mathematical shifts
+- implicit and explicit conversions, the three overflow modes (wrap, the default; trap;
+  saturate), mathematical shifts
 - `defer`, `match` exhaustiveness, `!` / `catch`
 - generics with constraints, deduction and `const` parameters
 - SIMD types and builtins

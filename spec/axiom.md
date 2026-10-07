@@ -116,13 +116,16 @@ while
 ```
 
 `threadlocal` is not a keyword. It is an identifier that has its special meaning
-only at the start of a module-level `let` (§12.8.6).
+only at the start of a module-level `let` (§12.8.6). Likewise `inline` has its meaning
+only directly before `fn` (§9.5).
 
 **Reserved type names.** These lex as keywords:
 
 ```
 u8  u16  u32  u64  usize   i8  i16  i32  i64  isize   f32  f64   bool  void
-i8x16  u8x16  i16x8  u16x8  i32x4  u32x4  i64x2  u64x2  f32x4  f64x2  v128
+i8x16  u8x16  i16x8   u16x8   i32x4   u32x4   i64x2  u64x2  f32x4   f64x2  v128
+i8x32  u8x32  i16x16  u16x16  i32x8   u32x8   i64x4  u64x4  f32x8   f64x4  v256
+i8x64  u8x64  i16x32  u16x32  i32x16  u32x16  i64x8  u64x8  f32x16  f64x8  v512
 ```
 
 **Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
@@ -223,7 +226,8 @@ Member        ::= IDENT ( "=" "-"? ( INT_LIT | CHAR_LIT ) )?
 
 MethodDecl    ::= "pub"? FnDecl
 
-FnDecl        ::= "fn" IDENT GenericParams? "(" ParamList? ")" Type Block
+FnDecl        ::= "inline"? "fn" IDENT GenericParams? "(" ParamList? ")" Type FnAttr? Block   (* §9.5 *)
+FnAttr        ::= ( "@features" | "@multiversion" ) "(" STRING_LIT ( "," STRING_LIT )* ","? ")"   (* §13.4 *)
 ParamList     ::= Param ( "," Param )* ","?
 Param         ::= IDENT ":" Type
 
@@ -234,7 +238,9 @@ Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "
 
 The trailing-comma forms are LL(1). After a `,`, an `IDENT` begins another element, and
 anything else ends the list. The FIRST sets of `Field` (`IDENT`) and `MethodDecl`
-(`pub`, `fn`) are disjoint.
+(`pub`, `fn`) are disjoint, except for `inline`, an identifier: `inline` followed by
+`fn` begins a method, which takes one more token of lookahead (as `threadlocal let`
+does).
 
 ### 3.3 Types
 
@@ -366,10 +372,12 @@ An unknown builtin name is a compile error (`E0120`) raised by the parser.
 ### 4.1 Modules
 
 Each `.ax` file is a module. `import "path.ax" as name;` binds `name` to that module's `pub`
-declarations. Paths are relative to the importing file. A path beginning with `std/`
-resolves to the standard library, for example `import "std/mem" as mem;`. A path beginning
-with `pkg:` names a module of another package (§4.6). The `.ax` extension may be left out.
-A path that doesn't resolve to a readable file is `E0211`.
+declarations. Paths are relative to the importing file, with `/` between their parts on
+every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\` is `E0218`.
+A path beginning with `std/` resolves to the standard library, for example
+`import "std/mem" as mem;`. A path beginning with `pkg:` names a module of another package
+(§4.6). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
+is `E0211`.
 
 Import cycles are a compile error (`E0210`) in v0.1.
 
@@ -549,23 +557,65 @@ only operations on pointers are:
 - `==` and `!=`
 - the conversion builtins `@int_from_ptr`, `@ptr_from_int`, `@ptr_cast`, and
   `@slice_from_ptr`
+- the offset builtins `@ptr_add` and `@ptr_sub`
+- the cache hints `@prefetch` and `@prefetch_write`
 
-There is no pointer arithmetic operator. Write
-`@ptr_from_int(*T, @int_from_ptr(p) + k)`, which states the byte offset explicitly.
+There is no pointer arithmetic operator. `@ptr_add(p, n)`, with `p` a `*T` or `*mut T`
+and `n` a `usize`, is the pointer `n` elements of `T` past `p`, of the same type as `p`:
+the address `@int_from_ptr(p) + n * @size_of(T)` (C's `p + n`, Rust's `p.add(n)`).
+`@ptr_sub(p, n)` is the pointer `n` elements before `p` (Rust's `p.sub(n)`). `T` must
+not be `void`. Neither ever traps: each is the program's promise that the result stays
+inside the object `p` points into (a global, a local, an array, or one block from the
+allocator), or just past its end. Compilers rely on the promise to fold constant offsets
+into addressing (on WebAssembly, `v128.load offset=16` rather than an add and an overflow
+check). The promise is not checked. A result outside the object is a logic bug, like a
+wrong `@ptr_from_int` address, but with a weaker guarantee: code compiled on the promise
+may have moved or merged the accesses, so loads and stores through it reach unspecified
+addresses (still checked against linear memory where §12.1 applies) and comparisons
+with it give unspecified results.
+
+```axiom
+let row = @ptr_add(base, r * 8);          // base: *f32x4, after checking the matrix's length
+acc = acc + @ptr_add(row, 1).* * x;       // the second f32x4 of the row
+```
+
+For an offset in bytes, or one that may leave the object, use
+`@ptr_from_int(*T, @int_from_ptr(p) + k)`, which is checked arithmetic on the address.
+
+`@prefetch(p)`, with `p` any pointer, is a hint that the program will soon read the
+memory at `p`: native compilers start loading its cache line into every level of the
+cache (x86 `prefetcht0`, Arm `prfm pldl1keep`). It has no other effect. `p` is evaluated,
+but nothing is read: whatever `p` is (past the end of memory, freed, misaligned), it never
+traps, and it may compile to nothing (WebAssembly has no prefetch instruction).
+
+```axiom
+for i in @as(usize, 0)..n {
+    @prefetch(&table[bucket(keys[i])]);   // start the loads, then look the keys up
+}
+```
+
+`@prefetch_write(p)` is the same hint for memory the program will soon write: native
+compilers fetch the line ready to be modified, so that the store that follows does not
+have to ask the other cores for it again (x86 `prefetchw` where the function's extensions
+include `prfchw` (§13.4), else `prefetcht0`; Arm `prfm pstl1keep`). It reads and writes
+nothing, never traps, and may compile to nothing, exactly as `@prefetch` does.
 
 ### 5.8 SIMD vectors
 
-| Type | Lanes × lane type |
-|---|---|
-| `i8x16`, `u8x16` | 16 × 8-bit |
-| `i16x8`, `u16x8` | 8 × 16-bit |
-| `i32x4`, `u32x4` | 4 × 32-bit |
-| `i64x2`, `u64x2` | 2 × 64-bit |
-| `f32x4` | 4 × f32 |
-| `f64x2` | 2 × f64 |
-| `v128` | 128 raw bits (no lane interpretation) |
+| 128 bits | 256 bits | 512 bits | Lane type |
+|---|---|---|---|
+| `i8x16`, `u8x16` | `i8x32`, `u8x32` | `i8x64`, `u8x64` | 8-bit integer |
+| `i16x8`, `u16x8` | `i16x16`, `u16x16` | `i16x32`, `u16x32` | 16-bit integer |
+| `i32x4`, `u32x4` | `i32x8`, `u32x8` | `i32x16`, `u32x16` | 32-bit integer |
+| `i64x2`, `u64x2` | `i64x4`, `u64x4` | `i64x8`, `u64x8` | 64-bit integer |
+| `f32x4` | `f32x8` | `f32x16` | f32 |
+| `f64x2` | `f64x4` | `f64x8` | f64 |
+| `v128` | `v256` | `v512` | raw bits (no lane interpretation) |
 
-All vector types are 16 bytes with 16-byte alignment. See §13.
+A vector type's size and alignment are its width in bytes: 16, 32 or 64. Every operator and
+builtin of §13 applies to every width, lane by lane, with the same results. Where a target's
+registers are narrower (WebAssembly, AArch64's Advanced SIMD, x86-64 without AVX), a wider
+vector is computed in 128-bit pieces. See §13.
 
 ### 5.9 Structs
 
@@ -701,7 +751,7 @@ All other conversions use builtins (Appendix A):
 
 | Builtin | Meaning | Failure |
 |---|---|---|
-| `@as(T, x)` | Lossless numeric widening (for example `u8 → u32`, `i16 → i64`, `u32 → i64`, `f32 → f64`) | A conversion that can lose information is a compile error (`E0510`) |
+| `@as(T, x)` | Lossless numeric widening (for example `u8 → u32`, `i16 → i64`, `u32 → i64`, `f32 → f64`), and `bool` to any integer type (`false` is 0, `true` is 1) | A conversion that can lose information is a compile error (`E0510`) |
 | `@int_cast(T, x)` | Integer-to-integer conversion, checked at runtime | Traps if the value is out of range (`T0004`) |
 | `@truncate(T, x)` | Integer-to-integer conversion keeping the low bits | Never fails |
 | `@int_from_float(T, x)` | Truncates toward zero and **saturates** | Never fails. NaN becomes 0 (matches WASM `trunc_sat`) |
@@ -754,8 +804,8 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 
 | Family | Operators | Operand types | Notes |
 |---|---|---|---|
-| **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0 |
-| **A**dditive | `+` `-` `+%` `-%` | int, float | `%`-suffixed forms wrap, int only |
+| **M**ultiplicative | `*` `/` `%` `*%` | int, float (`%` int only) | `/` and `%` trap on divisor 0. Integer `*` wraps (§7.6) |
+| **A**dditive | `+` `-` `+%` `-%` | int, float | Integer `+` and `-` wrap (§7.6). The `%`-suffixed forms always wrap, int only |
 | **S**hift | `<<` `>>` | int; the count may be any unsigned int | §7.6 |
 | **B**itwise | `&` `\|` `^` | int, SIMD int, `v128` | each operator is its own family: `&`, `\|`, `^` |
 | **C**omparison | `==` `!=` `<` `<=` `>` `>=` | int, float; `==`/`!=` also on bool, pointer, error, fn pointer, enum | result `bool` |
@@ -822,38 +872,58 @@ than unary operators: `-a.b` is `-(a.b)`, and `&a[i]` is `&(a[i])`.
 
 | Operator | Operand | Meaning |
 |---|---|---|
-| `-x` | signed int, float, SIMD | Negation. For integers, `-MIN` overflows (§7.6) |
-| `-%x` | signed or unsigned int | Wrapping negation |
+| `-x` | signed int, float, SIMD (float or signed int lanes) | Negation. For integers, `-MIN` overflows: it is `MIN` by default (§7.6) |
+| `-%x` | signed or unsigned int, SIMD int | Wrapping negation, in every overflow mode |
 | `~x` | int, SIMD int, `v128` | Bitwise NOT |
 | `not x` | bool | Logical NOT |
 | `&x` | place | Address, of type `*T` |
 | `&mut x` | mutable place | Address, of type `*mut T` |
 
-Applying `-` to an unsigned type is a compile error (`E0520`). Use `-%` or subtract from 0.
+Applying `-` to an unsigned type, or a vector of unsigned lanes, is a compile error (`E0520`).
+Use `-%` or subtract from 0.
 
 ### 7.6 Integer arithmetic semantics
 
-**Overflow mode.** Each build has an *overflow mode*, chosen with a compiler flag (§16.1):
+**Overflow wraps.** `+`, `-`, `*` and unary `-` on integers, the compound assignments
+built from them (`+=`, `-=`, `*=`), and `MIN / -1` compute their result **modulo 2ⁿ**,
+where `n` is the bit width: the result is the one value of the type congruent to the
+mathematical result. For example, with `x: u8 = 250`, `x + 10` is `4`; with
+`m: i32 = @min_value(i32)`, `-m`, `m * -1`, `m / -1` and `@abs(m)` are all `m`, and
+`m - 1` is `@max_value(i32)`. This is the meaning in every build, at every optimization
+level, on every target (as in Go and Java, and Rust's release builds).
 
-- `trap` (the default): if the mathematical result of `+`, `-`, `*`, unary `-`, or
-  `MIN / -1` is not representable, the program traps (`T0002`).
-- `saturate` (selected by `--release`): the result is clamped to the type's MIN or MAX.
+`+%`, `-%`, `*%` and unary `-%` are explicit spellings of the same wrapping arithmetic.
+They are still valid, and they keep wrapping in every overflow mode, so code that relies on
+wrapping (hashes, checksums, random number generators) can say so and stays correct
+under `--overflow=trap`. Use `@add_checked`, `@sub_checked` and `@mul_checked` (which
+return `error.Overflow`) where an overflow must be detected, for example in sizes computed
+from untrusted input, and `@add_sat`, `@sub_sat` and `@mul_sat` to clamp (Appendix A).
 
-The overflow mode is the **only** way build configuration can change a program's meaning.
-Optimization level (`-O0`…`-O3`) MUST NOT change observable behavior. (See Appendix D, Q1.)
+**Overflow modes.** A build may ask for another overflow mode with a compiler flag
+(§16.1). They are debugging aids, not the language's meaning:
 
-**Wrapping operators.** `+%`, `-%`, `*%` and unary `-%` compute the result modulo 2ⁿ in
-every mode.
+- `wrap` (the default): as above.
+- `trap` (`--overflow=trap`): if the mathematical result of `+`, `-`, `*`, unary `-`,
+  `MIN / -1` or `@abs(MIN)` is not representable, the program traps (`T0002`). A program
+  that wraps nowhere behaves the same in both modes, so the mode finds unintended
+  overflows (in tests, say) at the cost of a check on every operation.
+- `saturate` (`--overflow=saturate`): the result is clamped to the type's MIN or MAX.
+
+In every mode, the `%`-suffixed operators, the `@atomic_*` arithmetic and integer vector
+arithmetic (§13.1) wrap, and the `_sat` and `_checked` builtins behave as their names say.
+The overflow mode is the **only** way build configuration can change a program's meaning,
+and only for a program whose arithmetic overflows. Optimization level (`-O0`…`-O3`) MUST
+NOT change observable behavior. (See Appendix D, Q1, and Appendix C, C43.)
 
 **Division.** `/` truncates toward zero. `%` gives a result with the sign of the dividend,
-so `a == (a / b) * b + (a % b)` whenever `a / b` does not overflow. A divisor of 0 traps
-(`T0003`) in **every** mode. `MIN % -1` is `0`.
+so `a == (a / b) * b + (a % b)` (with wrapping arithmetic, this holds for `MIN / -1` too).
+A divisor of 0 traps (`T0003`) in **every** mode. `MIN % -1` is `0`.
 
 **Shifts.** A shift has its mathematical meaning for **every** count, including counts at or
 above the bit width. Let `x` have `n` bits and let the count be `k`:
 
 - `x << k` is `x · 2ᵏ` reduced modulo `2ⁿ`: bits shifted out of the top are discarded.
-  When `k ≥ n` the result is `0`. `<<` never traps in either overflow mode.
+  When `k ≥ n` the result is `0`. `<<` never traps, in any overflow mode.
 - For unsigned `x`, `x >> k` is `⌊x / 2ᵏ⌋`, so `k ≥ n` gives `0`.
 - For signed `x`, `x >> k` is the arithmetic shift `⌊x / 2ᵏ⌋`, which rounds toward −∞. When
   `k ≥ n` the result is `0` if `x ≥ 0` and `-1` if `x < 0`.
@@ -868,8 +938,12 @@ visible.
 *Codegen note:* WebAssembly's `i32.shl` family takes the count modulo the width. When `k` is
 not a constant known to be less than `n`, the compiler emits a compare-and-select.
 
-**Constant evaluation.** In a `const` initializer or an array length, an overflow is a
-compile error (`E0530`) in every mode.
+**Constant evaluation.** An integer operation whose operands are all constants is
+evaluated by the compiler: in a `const` initializer or an array length, and anywhere else
+(`A + 100` for a `const A: u8 = 200`). There, an overflow of `+`, `-`, `*`, unary `-` or
+a conversion to the expression's type is a compile error (`E0530`) in every mode: an
+expression that always overflows is almost certainly a mistake, and the check costs
+nothing. Write the `%`-suffixed operators (`A +% 100`) to wrap a constant on purpose.
 
 ### 7.7 Floating-point semantics
 
@@ -1071,6 +1145,39 @@ auto-ref of temporaries, and no trait lookup.
 Using a function name as a value (without a call) produces a function-pointer value.
 Calling through it is written like any other call: `a.alloc_fn(a.ctx, n, 8)`. This is a
 field access followed by a call, not a method call, because `alloc_fn` is a field.
+
+### 9.5 Inline functions
+
+```axiom
+inline fn bit(x: u64, k: u32) u64 { return (x >> k) & 1; }
+```
+
+A function (or method) declared `inline` is **always inlined**: every direct call is
+replaced by the function's body (at every optimization level), so a small helper called
+with constant arguments costs what the same code written out would, the way macros or
+`#[inline(always)]` are used elsewhere. It changes no behavior: traps, overflow checks
+and stack traces are the same.
+
+- An inline function cannot be recursive, directly or through other inline functions
+  (`E0314`, reported at each call on the cycle). Recursion through a function that is not
+  inline is allowed.
+- It cannot be `export`ed, and cannot have `@features` or `@multiversion` (`E0313`).
+- A direct call compiles it with its caller's processor extensions (§13.4): called from a
+  function with `@features`, or from a version of a `@multiversion` function, its body is
+  compiled for those extensions too, and `@target_has` inside it answers for them. Used as
+  a value, it has the build's extensions.
+- It may be generic, and it may be used as a value (§9.4); a call through a function
+  pointer is an ordinary call.
+- Stack traces (§16.4.1) keep its frames. A direct call to it does not record its call
+  site; the site is passed to the inlined body, which records it only on the paths that
+  need it, before a trap or before calling a function that is not inline. On every other
+  path the call costs nothing. (With frame tables, §16.4.1, nothing is recorded at run
+  time at all: the inlined code's frames come from the table.) A fault that is not a check (an out-of-bounds raw pointer
+  access, say) inside an inlined body is reported as if it were in the caller.
+- With separate compilation (§16.7), every module that calls an inline function compiles
+  its own copy.
+- The self-hosted compiler inlines such calls wherever its inliner can (at `-O1` and
+  above), and keeps ordinary call-site records.
 
 ---
 
@@ -1437,7 +1544,7 @@ This section defines shared-memory concurrency. The design follows from three fa
 |---|---|
 | `@atomic_load(p)` | `T` |
 | `@atomic_store(p, v)` | `void` |
-| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in either overflow mode |
+| `@atomic_add`, `_sub`, `_and`, `_or`, `_xor`, `_xchg`, `_min`, `_max` `(p, v)` | the **previous** value. `add` and `sub` wrap: they never trap, in any overflow mode |
 | `@atomic_cas(p, expected, desired)` | the previous value. The exchange happened iff it equals `expected` |
 | `@atomic_wait(p, expected, timeout_ns: i64)` | `u32`: `0` woken by a notify, `1` the value was not `expected`, `2` timed out. A negative timeout waits forever. `p: *i32` or `*u32` only |
 | `@atomic_notify(p, count: u32)` | `u32`: the number of threads woken. `p: *i32` or `*u32` only. `0xFFFF_FFFF` wakes all |
@@ -1524,16 +1631,18 @@ every module's cache key.
 
 | Operator | Float vectors | Integer vectors | `v128` |
 |---|---|---|---|
-| `+` `-` `*` | lane-wise IEEE | **not allowed**. Use `+%` `-%` `*%` (wrapping) or `@add_sat`/`@sub_sat` | no |
+| `+` `-` `*` | lane-wise IEEE | lane-wise, wrapping in every overflow mode (`*` not for 8-bit lanes; WASM has no `i8x16.mul`). `@add_sat`/`@sub_sat` saturate | no |
 | `/` | lane-wise IEEE | no | no |
-| `+%` `-%` `*%` | no | lane-wise wrapping (`*%` not for 8-bit lanes; WASM has no `i8x16.mul`) | no |
+| `+%` `-%` `*%` | no | the same as `+` `-` `*` | no |
 | `&` `\|` `^` `~` | no | yes | yes |
-| `<<` `>>` | no | scalar unsigned count, with the §7.6 semantics applied per lane (`k ≥` lane width gives `0` or sign fill) | no |
-| unary `-` | yes | `-%` only | no |
+| `<<` `>>` | no | an unsigned count: a scalar for every lane, or a vector of the same shape with one count per lane (`v << w`: lane i shifted by `w[i]`). The §7.6 semantics apply per lane (`k ≥` lane width gives `0` or sign fill) | no |
+| unary `-` | yes | signed lanes, wrapping; `-%` on any lanes | no |
 | `==` `<` … | no. Use `@lanes_eq`, `@lanes_lt`, … | no | no |
 
-Requiring `+%` on integer vectors keeps §7.6 honest. Checking overflow on every lane would
-be expensive, and silently wrapping under the `+` symbol would contradict the scalar rules.
+Integer vector arithmetic wraps, like scalar arithmetic by default (§7.6). It wraps under
+`--overflow=trap` and `--overflow=saturate` too: checking every lane would be expensive,
+and WebAssembly and most processors have no lane-wise overflow flags. (Until issue 0047,
+when scalars trapped by default, integer vectors required `+%`; it remains valid.)
 
 Scalars are **never** broadcast implicitly. Write `@splat(x)`.
 
@@ -1544,24 +1653,214 @@ Appendix A has full signatures.
 - Construction: `@splat`, `@vec` (from lane values).
 - Lanes: `@extract_lane`, `@replace_lane`. The lane index must be a constant expression.
 - Memory: `@load(V, s)` / `@store(s, v)`. `s` is a slice, and the program traps if
-  `s.len * size_of(elem) < 16` (`T0006`).
-- Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices, and
-  `@swizzle(a, idx)` takes runtime indices.
+  `s.len * size_of(elem)` is less than the vector's size (`T0006`).
+  `@load_partial(V, s)` reads lanes `0..min(s.len, n)` of an `n`-lane vector from a slice
+  of its lane type, the others zero, and `@store_partial(s, v)` writes those lanes: neither
+  touches memory past `s`, so a loop over vectors needs no scalar loop for its tail. x86
+  does them with masked moves.
+- Rearrangement: `@shuffle(a, b, [i0, …])` takes constant indices into the lanes of `a`
+  then `b`; their count sets the result's lanes (any count making a 128-, 256- or 512-bit
+  vector), so `@shuffle(a, zero, [0, …, 7, 8, …, 8])` widens an `f32x8` to an `f32x16`
+  with zeros and `@shuffle(a, a, [8, …, 15])` takes the high half of an `f32x16`.
+  `@swizzle(a, idx)`
+  takes runtime indices: `a` is a vector of any lanes and `idx` an integer vector with as
+  many lanes of the same width, taken as unsigned; lane i of the result is `a[idx[i]]`, or
+  0 when `idx[i]` is not a lane of `a`. `@swizzle2(a, b, idx)` is the same over the `2n`
+  lanes of `a` then `b`, so a table of 32 `f32` is two `f32x16` (x86: `vpermps`,
+  `vpermt2ps`, and their kin for other lane widths; elsewhere byte lookups such as
+  `i8x16.swizzle`, `pshufb` and `tbl`).
 - Comparison: `@lanes_eq`, `@lanes_ne`, `@lanes_lt`, `@lanes_le`, `@lanes_gt`,
   `@lanes_ge`. Each returns an all-ones or all-zeros integer vector of the same shape.
 - Selection and tests: `@select(mask, a, b)`, `@any_true`, `@all_true`, `@bitmask`.
 - Reductions: `@reduce_add(v)` and `@dot(a, b)`. For floats, the association order is
-  fixed as **pairwise**: `(l0 + l1) + (l2 + l3)` for 4 lanes and `l0 + l1` for 2 lanes. The
-  result is therefore deterministic across targets.
+  fixed as **folding the halves**: the high half is added to the low half, lane `i` plus
+  lane `i + n/2`, and so on until one lane is left. For 4 lanes that is
+  `(l0 + l2) + (l1 + l3)`, for 2 lanes `l0 + l1`, and for 16 lanes lanes `8..16` onto
+  `0..8`, then `4..8` onto `0..4`, `2..4` onto `0..2` and lane 1 onto lane 0 (the order
+  of x86's `_mm512_reduce_add_ps`). The result is therefore deterministic across targets,
+  and it is the shortest sequence on every machine (no horizontal adds).
 - Lane-wise math: `@min`, `@max`, `@abs`, `@sqrt`, `@floor`, `@ceil`, `@trunc`,
-  `@nearest`, `@fma`.
+  `@nearest`, `@fma`; on integer vectors `@clz`, `@ctz` and `@popcount`.
+- Conversions: `@float_from_int(F, v)` and `@int_from_float(I, v)` convert lane by lane
+  between vectors of the same lane count, with the scalar rules (round to nearest;
+  truncate and saturate, NaN to 0).
+- Lane width: `@widen_low(v)` and `@widen_high(v)` take the low or high half of the lanes
+  of an integer vector with 8-, 16- or 32-bit lanes and extend each to twice its width,
+  sign- or zero-extended by the lane type, keeping the vector's size: `u8x16 → u16x8`,
+  `i32x8 → i64x4` (WebAssembly's `extend_low`/`extend_high`, x86's `pmovsx`/`pmovzx`).
+  `@narrow(T, a, b)` is the reverse: `a` and `b` are integer vectors of one type with
+  16-, 32- or 64-bit lanes, and `T` an integer vector with twice as many lanes of half the
+  width; the result holds the lanes of `a` then those of `b`, each saturated to `T`'s
+  lane range, the source lanes read by their own type. So `@narrow(u8x16, a, b)` of two
+  `i16x8` clamps each lane to `0..255` (WebAssembly's `i8x16.narrow_i16x8_u`, x86's
+  `packuswb`), and of two `u16x8` clamps it to `..255`.
 
 ### 13.3 Native targets
 
-On native targets, vector types lower to 128-bit registers (SSE2/AVX or NEON). The
-semantics are the WASM SIMD semantics, including saturation behavior and NaN rules, except
-that shift counts follow §7.6 rather than WASM's modulo rule. The compiler inserts fix-ups
-wherever host instructions differ.
+On native targets, vector types lower to the processor's vector registers (SSE2/AVX/AVX-512
+or NEON), in pieces where a type is wider than they are. The semantics are the WASM SIMD
+semantics, including saturation behavior and NaN rules, except that shift counts follow
+§7.6 rather than WASM's modulo rule. The compiler inserts fix-ups wherever host
+instructions differ.
+
+A 256- or 512-bit vector is passed to and returned from a function in memory, like a
+struct larger than 32 bytes: the caller passes the address of a copy, and a result is
+written through an address the caller passes. So functions compiled for different
+processor extensions (§13.4) agree on how such vectors arrive. Only 128-bit vectors may
+cross the export and import boundary (§14.2).
+
+### 13.4 Processor extensions
+
+A build targets an architecture and a set of **processor extensions** the code may use,
+chosen with `--cpu` and `--features` (§16.1). An extension changes how operations are
+lowered, never what a program computes: every operator and builtin of §13.1-13.2 has the
+same result with or without one. Extensions have the names `--features` takes:
+
+| Architecture | Extensions |
+|---|---|
+| `x86_64` (SSE2 is the baseline) | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
+| `aarch64` (FP and Advanced SIMD are the baseline) | `lse`, `rcpc`, `dotprod`, `cssc`, `aes` (with PMULL), `sha2` (SHA-1 and SHA-256), `sha3`, `sha512`, `sm4` (SM3 and SM4), `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
+| `wasm32`, `wasm64` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
+
+An extension implies those it builds on (`avx2` implies `avx`, which implies `sse4.2`, and
+so on; `avx512bw` implies `avx512f`, which implies `avx2`, `fma` and `f16c`), and removing
+one with `--features=-x` removes the extensions that need it.
+
+**Target conditions.** These builtins are constant `bool`s:
+
+- `@target_has("ext")`: whether the code being compiled may use extension `ext`, that is,
+  the build's extensions plus those of the enclosing function (`@features`, or the version
+  of a `@multiversion` function being compiled, and for an `inline` function, those of the
+  function it is inlined into, §9.5). A function that is not inline has the build's
+  extensions whichever function calls it. `ext` is a string literal naming an
+  extension of any architecture (`E0827` otherwise); another architecture's extension is
+  simply absent.
+- `@target_arch("x86_64")`: the architecture, one of `wasm32`, `wasm64`, `x86_64`, `aarch64`.
+- `@target_os("linux")`: the operating system of a native target, one of `linux`, `macos`,
+  `windows`, or `none` for WebAssembly (`os.system()` in std/os is the run-time answer:
+  under WebAssembly, the host's).
+
+A **target condition** is one of these, `true` or `false`, or `not`, `and` and `or` of target
+conditions (with parentheses). An `if` whose condition is a target condition compiles only
+the branch the condition selects. The other branch is still parsed and type-checked, but no
+code is generated for it, and it may use builtins that the code is not compiled for (below).
+So a portable fallback costs nothing where the faster path applies:
+
+```axiom
+fn crc32c(crc: u32, data: []u8) u32 {
+    if @target_arch("x86_64") and @target_has("sse4.2") {
+        return crc32c_hw(crc, data);    // uses @x86_crc32c
+    }
+    return crc32c_table(crc, data);
+}
+```
+
+**Run-time detection.** `@cpu_has("ext")` is a `bool`: whether the processor running the
+program has extension `ext`. It is the constant `true` where `@target_has("ext")` is (and
+then also counts as a target condition), and always `false` under WebAssembly, where
+programs cannot ask. Otherwise it asks std/os/cpu (`cpu.features()`, detected once:
+`cpuid` on x86-64, the system on AArch64). Every build includes std/os/cpu for this.
+
+**Functions compiled for more extensions.** A function declared with an attribute after
+its return type is compiled for extensions the build does not assume:
+
+- `fn f(...) T @features("ext,ext") { ... }` compiles the body with these extensions added.
+  A call checks the processor first and traps with `T0013` if it lacks one (the check
+  disappears where the build already has them). Call it after `@cpu_has`, or from a
+  function with the same extensions.
+- `fn f(...) T @multiversion("ext,ext", "ext", ...) { ... }` compiles the body once for
+  each listed set of extensions, and once for the build's own. A call runs the first
+  version, in the order listed, whose extensions the processor has, and the build's own
+  version otherwise. Within each version, `@target_has` answers for that version.
+
+Each string is a comma-separated list of extensions (a leading `+` is allowed). A set
+naming an extension of another architecture describes no version on this target: such a
+`@multiversion` version is left out, and an `@features` function always traps. A function
+has at most one attribute (`E0829`, as for an unknown attribute, no sets or an empty set).
+Every version is shown under the function's name in stack traces and profiles. The
+versions share one calling convention: a value passes between functions compiled for
+different extensions as it does between any two functions.
+
+**Builtins that need an extension.** Builtins that stand for one processor's instructions
+(`@x86_*`, `@arm_*`) exist only where the architecture and extensions they need are
+available: using one in code that is compiled (not in a branch a target condition rules
+out) for a target or function without them is `E0828`.
+
+| Builtin | Needs | Result |
+|---|---|---|
+| `@x86_cpuid(leaf, subleaf)` | `x86_64` | `u32x4`: `eax`, `ebx`, `ecx`, `edx` of the `cpuid` instruction |
+| `@x86_xgetbv(xcr)` | `x86_64` | `u64`: the extended control register (`xgetbv`; only when `cpuid` reports OSXSAVE) |
+
+The cryptographic instructions of §13.5 are builtins of this kind.
+
+**Start-up check.** A native program built for more than the architecture's baseline (any
+`--cpu` but the baseline, including the default `--target=native`, which means this
+machine's processor) checks the processor before `main` and exits with status 1 and a
+message naming the missing extensions, instead of failing on an unsupported instruction:
+
+```
+axiom: this program was built for processors with extensions this one lacks (--cpu=x86-64-v4); missing: avx512f avx512cd avx512bw avx512dq avx512vl
+```
+
+### 13.5 Processor instructions for cryptography
+
+These builtins are single instructions of one architecture: AES rounds, carry-less
+multiplication, SHA rounds and message schedules, and CRC steps. Each needs its
+architecture and extension (`E0828`, §13.4), so they appear under a target condition or
+in a function with `@features` or `@multiversion`, next to a portable fallback. Their
+results are exactly those of the instruction (Intel's and Arm's manuals define them).
+Operand types are checked (`E0812`); an immediate must be a constant in range (`E0820`).
+
+In the table, `B` is `u8x16`, `D` is `u32x4`, `Q` is `u64x2`, and `V` is any 128-bit
+integer vector (the result has its type).
+
+| Builtin | Needs | Signature | Instruction |
+|---|---|---|---|
+| `@x86_aesenc(s, k)`, `@x86_aesenclast`, `@x86_aesdec`, `@x86_aesdeclast` | `x86_64`, `aes` | `B, B → B` (also `u8x32`, `u8x64`: each 128-bit part) | one AES round (`aesenc`, ...) |
+| `@x86_aesimc(k)` | `x86_64`, `aes` | `B → B` | InvMixColumns of a round key |
+| `@x86_aeskeygenassist(k, rcon)` | `x86_64`, `aes` | `B, const u8 → B` | key expansion assist |
+| `@x86_clmul(a, b, imm)` | `x86_64`, `pclmul` | `Q, Q, const u8 → Q` (also `u64x4`, `u64x8`) | 64×64 → 128-bit carry-less product of the halves `imm` selects: bit 0 for `a`, bit 4 for `b` (`pclmulqdq`) |
+| `@x86_sha1rnds4(abcd, e, f)` | `x86_64`, `sha` | `D, D, const 0..3 → D` | four SHA-1 rounds with function `f` |
+| `@x86_sha1nexte(a, b)`, `@x86_sha1msg1`, `@x86_sha1msg2` | `x86_64`, `sha` | `D, D → D` | SHA-1 E and message schedule |
+| `@x86_sha256rnds2(cdgh, abef, wk)` | `x86_64`, `sha` | `D, D, D → D` | two SHA-256 rounds (the words in the low half of `wk`) |
+| `@x86_sha256msg1(a, b)`, `@x86_sha256msg2` | `x86_64`, `sha` | `D, D → D` | SHA-256 message schedule |
+| `@x86_crc32c(crc, x)` | `x86_64`, `sse4.2` | `u32, u8/u16/u32/u64 → u32` | CRC-32C of `x`'s bytes (reflected, not inverted: `crc32`) |
+| `@arm_aese(s, k)`, `@arm_aesd` | `aarch64`, `aes` | `B, B → B` | AddRoundKey, SubBytes, ShiftRows (or their inverses) |
+| `@arm_aesmc(s)`, `@arm_aesimc` | `aarch64`, `aes` | `B → B` | MixColumns (or its inverse) |
+| `@arm_pmull(a, b)`, `@arm_pmull2` | `aarch64`, `aes` | `Q, Q → Q` | carry-less product of the low (`pmull2`: high) halves |
+| `@arm_sha1c(abcd, e, wk)`, `@arm_sha1p`, `@arm_sha1m` | `aarch64`, `sha2` | `D, u32, D → D` | four SHA-1 rounds: choose, parity, majority |
+| `@arm_sha1h(e)` | `aarch64`, `sha2` | `u32 → u32` | rotate left by 30 |
+| `@arm_sha1su0(a, b, c)`, `@arm_sha1su1(a, b)` | `aarch64`, `sha2` | `D, D, D → D`; `D, D → D` | SHA-1 message schedule |
+| `@arm_sha256h(abcd, efgh, wk)`, `@arm_sha256h2(efgh, abcd, wk)` | `aarch64`, `sha2` | `D, D, D → D` | four SHA-256 rounds |
+| `@arm_sha256su0(a, b)`, `@arm_sha256su1(a, b, c)` | `aarch64`, `sha2` | `D, D → D`; `D, D, D → D` | SHA-256 message schedule |
+| `@arm_sha512h(a, b, c)`, `@arm_sha512h2` | `aarch64`, `sha512` | `Q, Q, Q → Q` | two SHA-512 rounds |
+| `@arm_sha512su0(a, b)`, `@arm_sha512su1(a, b, c)` | `aarch64`, `sha512` | `Q, Q → Q`; `Q, Q, Q → Q` | SHA-512 message schedule |
+| `@arm_eor3(a, b, c)` | `aarch64`, `sha3` | `V, V, V → V` | `a ^ b ^ c` |
+| `@arm_bcax(a, b, c)` | `aarch64`, `sha3` | `V, V, V → V` | `a ^ (b & ~c)` |
+| `@arm_rax1(a, b)` | `aarch64`, `sha3` | `Q, Q → Q` | `a ^ @rotl(b, 1)` in each lane |
+| `@arm_xar(a, b, k)` | `aarch64`, `sha3` | `Q, Q, const 0..63 → Q` | `@rotr(a ^ b, k)` in each lane |
+| `@arm_crc32(crc, x)`, `@arm_crc32c` | `aarch64`, `crc` | `u32, u8/u16/u32/u64 → u32` | CRC-32 (or CRC-32C) of `x`'s bytes, reflected, not inverted |
+
+The 256- and 512-bit forms of `@x86_aesenc` and its kin and of `@x86_clmul` act on each
+128-bit part. They are single instructions where the build has `vaes` (or `vpclmulqdq`),
+and one instruction per part otherwise. On AArch64 `@x86_*` builtins do not exist, and on
+x86-64 `@arm_*` ones do not, so code for both architectures keeps each under its own
+target condition:
+
+```axiom
+fn crc32c_step(crc: u32, x: u64) u32 @multiversion("sse4.2", "crc") {
+    if @target_arch("x86_64") and @target_has("sse4.2") {
+        return @x86_crc32c(crc, x);
+    }
+    if @target_arch("aarch64") and @target_has("crc") {
+        return @arm_crc32c(crc, x);
+    }
+    return crc32c_table(crc, x);
+}
+```
+
+The standard library uses them in std/crypto (`aes_gcm`, `sha1`, `sha2`, `sha3`) and
+std/hash/crc, with the portable code where they are absent.
 
 ---
 
@@ -1602,7 +1901,7 @@ must be one of the following (`E0801` otherwise):
 - a pointer,
 - a function pointer (a table index on WebAssembly) whose own parameter and return types
   are allowed here (C calls it with its calling convention),
-- a SIMD type,
+- a 128-bit SIMD type,
 - `void` as the return type.
 
 Exported functions MUST NOT return `!T`. Handle errors before the export boundary. The
@@ -1735,11 +2034,15 @@ pub fn alloc_zeroed[T](n: usize) ![]mut T   // every byte 0
 pub fn free[T](s: []mut T) void
 pub fn realloc[T](s: []mut T, n: usize) ![]mut T
 pub fn dup[T](s: []T) ![]mut T
+pub fn alloc_aligned[T](n: usize, align: usize) ![]mut T          // at a multiple of align
+pub fn alloc_zeroed_aligned[T](n: usize, align: usize) ![]mut T
+pub fn dup_aligned[T](s: []T, align: usize) ![]mut T
 pub fn new[T]() !*mut T                    // one value, contents unspecified
 pub fn new_zeroed[T]() !*mut T             // one value, every byte 0
 pub fn create[T](v: T) !*mut T             // one value, initialized to v
 pub fn destroy[T](p: *mut T) void          // frees a value from new, new_zeroed or create
 pub fn alloc_bytes(size: usize) usize        // 0 if there is no memory (or size is 0)
+pub fn alloc_aligned_bytes(size: usize, align: usize) usize
 pub fn free_bytes(p: usize, size: usize) void
 pub fn realloc_bytes(p: usize, old: usize, size: usize) usize
 pub fn in_use() usize                        // bytes allocated and not freed
@@ -1756,7 +2059,11 @@ These are ordinary functions (§10), not builtins. The rules:
 - **Failure.** `alloc`, `realloc`, `dup`, `new` and `create` return `error.OutOfMemory` when the
   system has no more memory or the byte count overflows. `realloc` leaves the old slice
   valid when it fails.
-- **Alignment.** Memory is aligned to 16 bytes, enough for every type (§12.5).
+- **Alignment.** Memory is aligned to 16 bytes, enough for every type (§12.5). The
+  `_aligned` functions ask for more: `align` is a power of two up to 4096 (anything else
+  traps), and the memory starts at a multiple of it, for data read with wide vector loads
+  (64 bytes for `f32x16`) or by the page. It is freed with `free` like any other;
+  `realloc` keeps only the usual 16.
 - **Zero sizes.** `alloc.[T](0)` returns an empty slice that owns no memory; freeing it
   does nothing.
 - **Threads.** The allocator is safe to use from every thread. `std/thread` calls
@@ -1805,8 +2112,10 @@ in which case it is linked against the C library as before.
 ### 16.1 Commands
 
 ```
-axiom build <file.ax> --target=<t> [-O0..-O3] [--release | --overflow=trap|saturate] -o <out>
+axiom build <file.ax> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o <out>
                           [--sanitize=address]    # check heap accesses (§16.8)
+                          [--cpu=<preset>] [--features=+ext,-ext]   # processor extensions (§13.4)
+                          [-g | --debug-info=lines|none]            # DWARF line tables (below)
 axiom check <file.ax>                  # parse and type-check only; no codegen
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
 axiom run   <file.ax> [--export=name]  # build for wasm32 and execute in the reference runtime
@@ -1821,6 +2130,23 @@ axiom cache [path|clean]               # the compiled-module cache (§16.7)
 package in the current directory (§4.6.4).
 
 Every command accepts `--format=human` (the default) or `--format=agent-json`.
+
+`--overflow=wrap|trap|saturate` selects the overflow mode (§7.6). `wrap`, the default, is
+the language's meaning; `trap` checks every `+`, `-`, `*`, unary `-`, `MIN / -1` and
+`@abs` on integers and traps (`T0002`) on overflow, to find unintended overflows; `saturate`
+clamps. `build`, `test` and `profile` accept it. `--release` is accepted for
+compatibility and changes nothing (it selected `saturate` until issue 0047).
+
+`-g` (or `--debug-info=lines`) adds DWARF line tables to the output: a compile unit per
+object, a subprogram per function and a source line and column for each instruction,
+so that native profilers (`perf annotate`, `perf report --sort srcline`), debuggers and
+`addr2line -i` map machine code back to Axiom source, inlined functions included
+(`DW_TAG_inlined_subroutine`). It is off by default (`--debug-info=none`), at every
+optimization level: stack traces (§16.4) need no debug information, and outputs
+stay small and independent of the directory they were built in. It does not change
+the generated instructions. `build`, `test` and `profile` accept it; the C compiler emits line tables
+for native and WebAssembly targets, and the self-hosted compiler accepts the option and
+emits none.
 
 - Compiler output is **deterministic**. The same inputs and flags produce byte-identical
   `.wasm` files and diagnostics.
@@ -1957,12 +2283,17 @@ Initial registry, not exhaustive:
 | E0309 | Two enum members with the same value |
 | E0311 | Unknown trap code in `expect trap(...)` |
 | E0312 | Duplicate test name in a module |
+| E0313 | `inline` on an exported function, or with `@features` / `@multiversion` (§9.5) |
+| E0314 | Recursion through inline functions (§9.5) |
 | E0354 | Thread-local global without `mut` |
 | E0801 | Type not allowed at the export or import boundary |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0824 | C variadic argument without a promoted type |
 | E0825 | `@expect_eq` operand type cannot be compared |
 | E0826 | `@enum_from_int` of a constant that is no member |
+| E0827 | Unknown processor extension, architecture or operating system name (§13.4) |
+| E0828 | Builtin used in code not compiled for the architecture or extensions it needs (§13.4) |
+| E0829 | Invalid function attribute (`@features`, `@multiversion`) |
 
 ### 16.4 Runtime trap reporting and stack traces
 
@@ -1997,7 +2328,8 @@ The trace is built from a **shadow stack**, not by unwinding the machine stack:
 - Each call writes its call-site record (location, calling function, called
   function) at `depth % 256` and increments `depth`. When the call returns, `depth`
   goes back to its old value. No code runs at function entry or exit, and
-  inlining does not remove frames.
+  inlining does not remove frames. A call to an `inline` function writes its record
+  only when a trap or another call inside it needs it (§9.5).
 - After a trap, the frames are still in place, because nothing unwinds them. A host
   reads them through the export `axiom_shadow_stack()` (WebAssembly) or the third
   argument of `ax_on_trap` (native).
@@ -2017,10 +2349,40 @@ stacks:
    as a machine address that must be mapped back to source.
 3. **It doubles as the profiler's stack sampler** (§16.6).
 
-The cost is three stores and one load per call. On call-heavy microbenchmarks (for
+The cost is three stores and one load per call (none for a call to an `inline`
+function). On call-heavy microbenchmarks (for
 example, a naive recursive Fibonacci) it roughly doubles run time. On typical code it
 is within measurement noise. Stack traces are on by default, and
 `--stack-traces=off` removes the instrumentation.
+
+**Frame tables.** Native code can be walked, so on x86-64 Linux the C compiler, and on
+every native target (x86-64 and AArch64 Linux, macOS, Windows) the self-hosted one,
+build the same records without a shadow stack, and calls cost nothing:
+
+- Every function keeps a frame pointer, and the executable has a table (the section
+  `axiom_rets`) that maps the return address of each call to its call-site record,
+  followed by the records of the calls inlined around it: calls to `inline` functions
+  and the ones the optimizer inlined. The C compiler takes these from the inlining
+  information LLVM keeps in its debug locations, and drops the debug information
+  afterwards unless `-g` asks for it; the self-hosted one keeps them with each call
+  as it inlines. (Its x86-64 code gives a leaf function, whose only calls are traps,
+  no frame: the table marks such functions, and the walk finds their return
+  addresses on the stack.)
+- A trap walks the frame-pointer chain from the trap's own frame, a crash from the
+  interrupted one, and looks each return address up. The frames fill the thread's
+  shadow-stack record (its calls and depth) as the stores would have, so the report,
+  `ax_on_trap`'s third argument and the test runner's frames are the same. Error-return
+  traces (§17.4.2) still use the record's ring.
+- The differences: a fault that is not a check (a raw pointer access, say) inside a
+  function the optimizer inlined is reported in the function it was inlined into, and
+  frames outside a callback from C code compiled without frame pointers can be missing
+  (C code built with the program, `--link=file.c`, keeps them).
+- Keeping frame pointers costs a register and a push and pop per function, and the
+  table 16 bytes per call. A recursive Fibonacci runs in about a third of the time it
+  takes with the shadow stack, the same as with `--stack-traces=off` to within noise.
+- `axiom profile` (§16.6) and `--sanitize=address` (§16.8) builds, which read the
+  records while the program runs, keep the shadow stack, as do WebAssembly and, with
+  the C compiler, other native targets.
 
 Traces are diagnostics only: whether they are on never changes a program's
 behavior. Record contents and layouts are toolchain ABI, not language semantics.
@@ -2142,13 +2504,16 @@ How samples are taken:
 | wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`runtime/profile_worker.mjs`) | main thread only |
 
 Profile builds are otherwise identical to ordinary builds with stack traces on (the
-default), except that shadow-stack stores are volatile, so optimization can't remove
-them. A program's behavior never depends on whether it is being profiled.
+default), except that they always use the shadow stack (also where ordinary builds use
+frame tables, §16.4.1), that shadow-stack stores are volatile, so optimization can't remove
+them, and that calls to `inline` functions (§9.5) record their call sites like any other,
+so time spent in them is attributed to them. A program's behavior never depends on
+whether it is being profiled.
 
 Limitations in v0.1:
 
 - Time is attributed to functions and call sites, not to individual lines inside the
-  innermost function.
+  innermost function. For that, build with `-g` (§16.1) and use a native profiler.
 - On WebAssembly, only the main thread is sampled.
 - Stacks deeper than 256 calls lose their outermost frames. These samples are
   counted and reported as truncated.
@@ -2251,7 +2616,8 @@ pointer made from an address, and never freeing it. `--sanitize=address` (accept
 
 The allocator and the runtime are not instrumented. Memory that is not from the heap
 (globals, locals, memory from `@memory_grow`) is not checked. Allocation sites come from
-the shadow stack, so they need `--stack-traces=on` (the default). Each checked access
+the shadow stack (which sanitizer builds keep also where other builds use frame tables,
+§16.4.1), so they need `--stack-traces=on` (the default). Each checked access
 looks its shadow byte up inline and calls into `std/mem.ax` only when that test fails, so
 programs typically run three to four times slower, and use more memory. In code,
 `@sanitize_address()` is a constant: whether the program is being built with the
@@ -2325,7 +2691,7 @@ With `--format=agent-json`, stdout holds one object:
 
 `failure.code` is one of:
 
-- a trap code (`T0000` to `T0012`);
+- a trap code (`T0000` to `T0013`);
 - `error`: the test returned an error, and the message names it;
 - `no_trap`: an `expect trap` test completed;
 - `timeout`.
@@ -2433,7 +2799,10 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 
 | Builtin | Signature | Notes |
 |---|---|---|
+| `@ptr_add(p, n)` / `@ptr_sub(p, n)` | `*T, usize → *T` (`*mut T → *mut T`) | `n` elements of `T` past (before) `p`. Never traps; the result must stay in `p`'s object (§5.7) |
 | `@slice_from_ptr(p, n)` | `*T, usize → []T` (`*mut T → []mut T`) | No check at creation. Accesses are bounds-checked against linear memory |
+| `@prefetch(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be read soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
+| `@prefetch_write(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be written soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
 | `@cast_slice(T, s)` | `[]U → []T` (keeps mutability) | Traps `T0006` if `s.len * size_of(U)` is not a multiple of `size_of(T)` |
 | `@mem_copy(dst, src)` | `[]mut T, []T → void` | Traps `T0006` if lengths differ. Overlap is allowed (memmove semantics) |
 | `@mem_set(dst, v)` | `[]mut T, T → void` | |
@@ -2446,12 +2815,12 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 
 | Builtin | Notes |
 |---|---|
-| `@clz(x)`, `@ctz(x)`, `@popcount(x)` | Return the same type as `x` |
+| `@clz(x)`, `@ctz(x)`, `@popcount(x)` | Return the same type as `x`; lane-wise on integer vectors |
 | `@rotl(x, k)`, `@rotr(x, k)` | `k` is taken modulo the width |
 | `@add_sat(a, b)`, `@sub_sat(a, b)`, `@mul_sat(a, b)` | Saturating, in every overflow mode. Also lane-wise on 8/16-bit integer vectors (add/sub only) |
 | `@add_checked`, `@sub_checked`, `@mul_checked` | Returns `!T`, with `error.Overflow`, in every mode |
 | `@min(a, b)`, `@max(a, b)` | Floats: a NaN operand gives NaN, and `-0.0 < +0.0` (WASM semantics) |
-| `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6) |
+| `@abs(x)` | Integer `@abs(MIN)` overflows (§7.6): it is `MIN` by default, traps under `--overflow=trap`. Lane-wise on vectors, where it always wraps |
 | `@sqrt`, `@floor`, `@ceil`, `@trunc`, `@nearest`, `@fma(a, b, c)`, `@rem(a, b)`, `@copysign(a, b)` | Floats |
 
 ### A.5 SIMD
@@ -2462,16 +2831,19 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@vec(V, l0, l1, …)` | Construct a vector from exactly `lanes(V)` lane values |
 | `@extract_lane(v, const i)` | `Vec → lane` |
 | `@replace_lane(v, const i, x)` | `Vec → Vec` |
-| `@load(V, s)` / `@store(s, v)` | Slice-checked 16-byte load/store (§13.2) |
-| `@shuffle(a, b, const [i0, …])` | Two-input byte-granular or lane-granular shuffle. Indices must be in range (`E0820`) |
-| `@swizzle(a, idx)` | `u8x16` runtime indices. Out-of-range indices give 0 (WASM semantics) |
+| `@load(V, s)` / `@store(s, v)` | Slice-checked load/store of the vector's size (§13.2) |
+| `@load_partial(V, s)` / `@store_partial(s, v)` | The first `min(s.len, lanes)` lanes, from or to a slice of the lane type; the rest of a load is zero (§13.2) |
+| `@shuffle(a, b, const [i0, …])` | Two-input lane shuffle; the result has as many lanes as indices (128, 256 or 512 bits). Indices must be in range (`E0820`) |
+| `@swizzle(a, idx)` | Runtime indices (an integer vector of the same shape, unsigned) into the whole vector, of any lanes. Out-of-range indices give 0 (WASM semantics) |
+| `@swizzle2(a, b, idx)` | `@swizzle` over the lanes of `a` then `b` |
 | `@lanes_eq/ne/lt/le/gt/ge(a, b)` | Produce a mask vector |
 | `@select(mask, a, b)` | Bitwise select |
 | `@any_true(v)`, `@all_true(v)` | `→ bool` |
-| `@bitmask(v)` | `→ u32`, one bit per lane |
-| `@reduce_add(v)` | Pairwise order (§13.2). Integer lanes wrap |
-| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16x8`: WASM `i32x4.dot_i16x8_s` |
-| `@narrow`, `@widen_low`, `@widen_high` | Lane-width changes per WASM |
+| `@bitmask(v)` | `→ u32`, one bit per lane (`u64` for 64 lanes) |
+| `@reduce_add(v)` | Halves folded (§13.2). Integer lanes wrap |
+| `@dot(a, b)` | Float vectors: `@reduce_add(a * b)`. `i16` lanes: WASM `i32x4.dot_i16x8_s`, giving half as many `i32` lanes; lane `i` is `a[2i] * b[2i] + a[2i+1] * b[2i+1]` in `i32`, which wraps only when both products are `-32768 * -32768`. One instruction per register on x86 (`pmaddwd`) and WebAssembly |
+| `@widen_low(v)`, `@widen_high(v)` | Integer `Vec` of 8-, 16- or 32-bit lanes → half its lanes, twice as wide, extended by the lane type (§13.2) |
+| `@narrow(T, a, b)` | `Vec, Vec → T`: the lanes of `a` then `b`, saturated to `T`'s narrower lanes (§13.2) |
 
 ### A.6 Atomics
 
@@ -2490,6 +2862,28 @@ See §12.8.3: `@atomic_load`, `@atomic_store`, `@atomic_add`, `@atomic_sub`,
 | `@memory_error()` | Diverges and traps with `T0012`: how `std/mem` reports a bad `free` under the address sanitizer (§16.8) |
 | `@sanitize_address()` | `→ bool`, a constant: whether the build uses `--sanitize=address` (§16.8) |
 
+### A.8 Processor extensions
+
+See §13.4 and §13.5.
+
+| Builtin | Notes |
+|---|---|
+| `@target_has("ext")` | `→ bool`, a constant: the code may use extension `ext` |
+| `@target_arch("arch")` | `→ bool`, a constant: `wasm32`, `wasm64`, `x86_64` or `aarch64` |
+| `@target_os("os")` | `→ bool`, a constant: `linux`, `macos`, `windows` or `none` (WebAssembly) |
+| `@cpu_has("ext")` | `→ bool`: the running processor has extension `ext` |
+| `@x86_cpuid(leaf, subleaf)` | `u32, u32 → u32x4`; needs `x86_64` |
+| `@x86_xgetbv(xcr)` | `u32 → u64`; needs `x86_64` |
+| `@x86_aesenc(s, k)`, `@x86_aesenclast`, `@x86_aesdec`, `@x86_aesdeclast`, `@x86_aesimc`, `@x86_aeskeygenassist` | AES rounds and key expansion; need `x86_64`, `aes` (§13.5) |
+| `@x86_clmul(a, b, imm)` | carry-less multiplication; needs `x86_64`, `pclmul` (§13.5) |
+| `@x86_sha1rnds4`, `@x86_sha1nexte`, `@x86_sha1msg1`, `@x86_sha1msg2`, `@x86_sha256rnds2`, `@x86_sha256msg1`, `@x86_sha256msg2` | SHA-1 and SHA-256; need `x86_64`, `sha` (§13.5) |
+| `@x86_crc32c(crc, x)` | CRC-32C; needs `x86_64`, `sse4.2` (§13.5) |
+| `@arm_aese`, `@arm_aesd`, `@arm_aesmc`, `@arm_aesimc`, `@arm_pmull`, `@arm_pmull2` | AES and carry-less multiplication; need `aarch64`, `aes` (§13.5) |
+| `@arm_sha1c`, `@arm_sha1p`, `@arm_sha1m`, `@arm_sha1h`, `@arm_sha1su0`, `@arm_sha1su1`, `@arm_sha256h`, `@arm_sha256h2`, `@arm_sha256su0`, `@arm_sha256su1` | SHA-1 and SHA-256; need `aarch64`, `sha2` (§13.5) |
+| `@arm_sha512h`, `@arm_sha512h2`, `@arm_sha512su0`, `@arm_sha512su1` | SHA-512; need `aarch64`, `sha512` (§13.5) |
+| `@arm_eor3`, `@arm_bcax`, `@arm_rax1`, `@arm_xar` | SHA-3; need `aarch64`, `sha3` (§13.5) |
+| `@arm_crc32(crc, x)`, `@arm_crc32c(crc, x)` | CRC-32 and CRC-32C; need `aarch64`, `crc` (§13.5) |
+
 ---
 
 ## Appendix B: Trap Conditions
@@ -2500,7 +2894,7 @@ This is the complete list of runtime traps. Each has a stable code.
 |---|---|
 | `T0000` | `@trap()` or WASM `unreachable` |
 | `T0001` | Index or slice bounds violation |
-| `T0002` | Integer overflow (in `trap` overflow mode) |
+| `T0002` | Integer overflow, only in the opt-in `trap` overflow mode (`--overflow=trap`, §7.6); by default overflow wraps |
 | `T0003` | Integer division or remainder by zero |
 | `T0004` | `@int_cast` value out of range |
 | `T0005` | Linear-memory access out of bounds |
@@ -2511,6 +2905,7 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0010` | Misaligned atomic access (§12.8.3) |
 | `T0011` | Expectation failed: `@expect` / `@expect_eq` (§17.1) |
 | `T0012` | Memory error found by the address sanitizer (§16.8) |
+| `T0013` | A function compiled for processor extensions the running processor lacks (`@features`, §13.4) |
 
 Nothing else traps, and nothing is undefined.
 
@@ -2534,13 +2929,13 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C9 | `arena.allocator().alloc(u32, 1024)` became `arena.allocator().alloc.[u32](1024)` | Type arguments are written `.[…]` (§10.3). A type passed as an ordinary argument would need types to be parseable as expressions |
 | C10 | `&mut HEAP_BYTES` passed as a slice became `HEAP_BYTES[..]` | Array-pointer-to-slice would be an implicit conversion |
 | C11 | `pub` (module visibility) and `export` (WASM export) are distinct. Top-level `let`/`let mut` globals and `error { }` declarations were added to the grammar | The notes used these without grammar support |
-| C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
+| C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only. *Superseded by C43*: `+`, `-`, `*` wrap on integer vectors | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
 | C13 | Raw pointers are fully defined through the linear-memory model (§12) | "Zero UB" and "raw pointers" conflict unless memory itself has defined semantics. WASM's model provides this, and it is adopted on all targets |
 | C14 | The notes' arena-centric memory (no global allocator; every allocation names an `Allocator`; `Arena`, `FixedBuffer`, `page_allocator`) was replaced by one global allocator, `std/mem` (§12.4, §15.1) | An allocator parameter on every container and every function that allocates spread through all APIs, and choosing among allocators was a decision agents got wrong more often than they gained from it. Allocation stays explicit: a call, never a language construct |
 | C14 | Error names must be declared (`error { … }`) | Prevents typos in `error.X` from silently creating new errors |
 | C15 | Added `for`, `loop`, compound assignment, `_ =` discards, and a no-shadowing rule | Needed by the notes' examples, or by the agent-ergonomics goal |
 | C16 | The diagnostic `suggested_fix.confidence` float became `fixes[].applicability` (an enum) plus byte-range `edits` | A float confidence is hard to act on. Byte-range edits can be applied mechanically |
-| C17 | Horizontal float reductions have a fixed pairwise association order | Determinism across WASM and native |
+| C17 | Horizontal float reductions have a fixed association order: folding the halves (§13.2). Until issue 0028 the order was pairwise over neighbours, `(l0 + l1) + (l2 + l3)`; the change alters float results of `@reduce_add` and `@dot` by rounding | Determinism across WASM and native. Folding the halves is the order of x86's reductions and most SIMD code, and the cheapest one with wide registers |
 | C18 | Shift counts are **not** clamped. `x << k` and `x >> k` have their mathematical meaning for every `k`, so `k ≥ width` gives `0` or sign fill | Design review, draft 2. `x << 40` has a clear meaning, and clamping it to `x << 31` would be surprising |
 | C19 | Added monomorphized generics with builtin constraints (§10) | Design review, draft 2 |
 | C20 | The language was briefly renamed Phalange (source files `.ph`); it is Axiom again, with the extension `.ax` | Design review, draft 2; the original name was preferred |
@@ -2557,6 +2952,18 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 | C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§16.7) | The user asked for independent compilation units |
 | C32 | Enums: distinct types over an integer representation, with members, methods, exhaustive `match`, `==`/`!=` and checked conversions (§5.14); `enum` is no longer reserved | The standard library passed alignments, modes and kinds as bare `u8`/`u32` constants, which any integer could be confused with |
 | C33 | Thread-local globals: `threadlocal let mut` (§12.8.6). This replaces the earlier "no thread-local storage" decision | The user asked for thread-locals. WebAssembly needed a per-instance block, set up by the thread start export |
+| C34 | Processor extensions in the language: target conditions (`@target_has`, `@target_arch`, `@target_os`) that select what is compiled, `@cpu_has`, and functions compiled for more extensions (`@features`, `@multiversion`) (§13.4) | Issue 0015: wider instruction sets need a way to choose between a fast path and a portable one, at build time or at run time. The dead branch is still type-checked, so it cannot rot unnoticed |
+| C35 | 256- and 512-bit vector types (`f32x8`, `i32x16`, `v512`, ...), with every operator and builtin of the 128-bit ones; passed in memory between functions (§5.8, §13.3) | Issue 0015: AVX2 and AVX-512 process 32 and 64 bytes at a time. On narrower targets the compiler splits them, so code written for the wide types is portable |
+| C36 | Builtins for the processors' cryptographic instructions: AES, carry-less multiplication, SHA-1, SHA-256, SHA-512, SHA-3 and CRC (`@x86_*`, `@arm_*`, §13.5) | Issue 0016: AES-GCM, SHA-2 and CRC run several times faster with them, and std chooses them at run time with `@multiversion` |
+| C37 | Vectors gained per-lane shift counts, lane-wise `@clz`/`@ctz`/`@popcount` and int/float conversions, `@swizzle` of any lane type and `@swizzle2`, and `@load_partial`/`@store_partial` (§13.1, §13.2) | Issues 0024 to 0027, from porting the benchmark's AVX-512 kernels: each is one instruction on x86 (and mostly on Arm and WebAssembly), and without them the port had to fall back to scalar code |
+| C38 | `inline fn`: functions that are always inlined, never recursive, whose calls record no stack-trace site unless a trap or call needs it (§9.5). `inline` is a keyword only before `fn` | Issue 0032: Axiom has no macros, and code ported from Rust's `macro_rules!` and `#[inline(always)]` became calls (with the shadow-stack record making them look bigger to LLVM's inliner) |
+| C39 | `@widen_low`, `@widen_high` and `@narrow` are specified (§13.2: lane types decide the sign, the result type of `@narrow` is given) and implemented; until then Appendix A listed them "per WASM" but no compiler had them. `@as(T, b)` converts a `bool` to any integer type (§6.2) | Issue 0035. Branch-free counting (`n += @as(u32, x > 0)`, Rust's `b as i32`) needed a helper function. `@as`, not a new builtin: the conversion is lossless and names its type |
+| C40 | `-g` / `--debug-info=lines`: DWARF line tables (§16.1) | Issue 0034: native profilers and debuggers could not map code back to Axiom source, and after inlining one symbol holds many functions |
+| C41 | `@ptr_add(p, n)` and `@ptr_sub(p, n)`: pointers moved by whole elements, which the program promises stay inside their object (§5.7). This is the one unchecked promise beside C13's defined memory: breaking it gives unspecified addresses, not a trap | Issue 0038: `@ptr_from_int(*T, @int_from_ptr(p) + 16)` is either an overflow check per access (`+`) or, wrapping (`+%`), an address WebAssembly cannot fold into the load's offset. Kernels reading rows of weights (the benchmark's) ran 1.15–1.25x slower than Rust's `p.add(n)`. `@ptr_sub` because walking back from an end pointer is as common; no signed variant, since the name gives the direction and `n` stays `usize` like every length |
+| C42 | Native x86-64 Linux builds of the C compiler find stack-trace frames by walking frame pointers, through a table from return addresses to call-site records, instead of a shadow stack written on every call (§16.4.1). Profile and sanitizer builds, WebAssembly and the self-hosted compiler keep the shadow stack | Issue 0037: the stores cost 15% in the benchmark's recursive move generator, and about double the time of a recursive Fibonacci. Traces are on by default, so their cost should be nothing on the hot path |
+| C43 | Integer overflow **wraps** in every build mode by default: `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)` compute modulo 2ⁿ (§7.6). Trapping (`T0002`) is the opt-in `--overflow=trap`; `--overflow=saturate` stays; `--release` no longer changes semantics. Integer vectors take `+`, `-`, `*` and unary `-` (wrapping). `+%`, `-%`, `*%` stay, as explicit spellings. Constant evaluation keeps `E0530` | Issue 0047, the owner's decision on Appendix D, Q1 (option (c)). Checks were the largest remaining cost of the benchmark against Rust's release build: its move generator's core function had 85 branches and 30 trap sites in WebAssembly where Rust's has 40 and 13, ports sprinkled `+%`/`*%` through hot paths, and the checks kept LLVM from vectorizing reductions (issue 0029). Bounds checks keep memory safe whatever an index computation does |
+| C44 | `@prefetch(p)`: a cache hint with no semantics, which never traps (§5.7) | Issue 0041: the benchmark's evaluator prefetches the cache bucket of each position of a batch before evaluating it (`_mm_prefetch`), and the port had no way to say so. One form (read, all cache levels): the one the port needs, and what `_mm_prefetch(.., _MM_HINT_T0)` and Rust's `prefetch_read_data(p, 3)` mean |
+| C45 | `@prefetch_write(p)`: the cache hint for memory about to be written (§5.7); the x86-64 extension `prfchw` (`prefetchw`, §13.4) | Issue 0093: the benchmark's evaluation cache prefetches each bucket of a batch, then locks and updates it; Rust asks for the lines with `_MM_HINT_ET0` (`prefetchw`, Arm `prfm pstl1keep`), so a later write needs no second coherence transaction. A separate builtin rather than a second argument to `@prefetch`: every builtin has a fixed arity and no options argument (the atomics, `@widen_low`/`@widen_high`, the `_last` AES rounds are separate names), and a constant selector would be one more thing to check |
 
 ---
 
@@ -2564,17 +2971,23 @@ Each change was made to resolve an inconsistency or to make a principle enforcea
 
 Each question is followed by the options and the current leaning.
 
-1. **Integer overflow.** This is undecided. The current text (§7.6) traps in the default
-   mode and saturates under `--release`. The options are:
+1. **Integer overflow.** *Resolved* (2026-10-04, issue 0047): option (c). Overflow wraps
+   in every build mode (§7.6, Appendix C, C43); `--overflow=trap` remains as an opt-in
+   debugging mode and `--overflow=saturate` as before. The options were:
 
    | Option | Pros | Cons |
    |---|---|---|
-   | **(a)** Trap in debug, saturate in release (current) | Release builds never trap on overflow | Tested and shipped programs can differ. Saturation silently gives wrong answers (for example, a length stuck at `MAX`) |
+   | **(a)** Trap in debug, saturate in release (the draft's rule until 2026-10) | Release builds never trap on overflow | Tested and shipped programs can differ. Saturation silently gives wrong answers (for example, a length stuck at `MAX`) |
    | **(b)** Trap in every mode, plus explicit `+\|` `-\|` `*\|` saturating operators next to `+%` | One meaning everywhere. Bugs are loud. The chosen behavior is visible at each use | A check on every operation. WASM has no overflow flag, so a check costs an extra compare and branch, and multiplication needs a wider multiply |
-   | **(c)** Wrap in every mode (Go, Java) | Cheapest. Deterministic | Overflow bugs are silent. `+%` becomes redundant |
+   | **(c)** Wrap in every mode (Go, Java): **chosen** | Cheapest. Deterministic | Overflow bugs are silent. `+%` becomes redundant |
    | **(d)** Trap in every mode, with a per-module or per-function attribute to opt into wrapping | Keeps (b)'s semantics with a performance escape hatch | Adds an attribute syntax that v0.1 otherwise does not have |
 
-   *Leaning:* (b). Measuring the cost of the checks on real WASM engines should settle it.
+   The leaning had been (b). Measuring settled it the other way: in the benchmark the
+   checks were the largest remaining cost against Rust's release build (which wraps), and
+   they blocked vectorization. Overflow bugs are caught by bounds checks where they would
+   matter for memory, by `--overflow=trap` in tests, and by `@*_checked` where a program
+   must handle them.
+
 2. **`and`/`or` mixing.** Should `a and b or c` be allowed as `(a and b) or c`? *Leaning:*
    no, keep requiring parentheses.
 3. **Optionals.** This is undecided. Generics make an optional type possible as a library
