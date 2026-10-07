@@ -1,0 +1,518 @@
+// =============================================================================
+// lsp.ax - the language server (axiom lsp): the Language Server Protocol
+// over standard input and output, for editors.
+//
+//   axiom lsp [--target=<t>] [--std=<dir>]
+//
+// The server keeps the text of the editor's open documents and answers each
+// request by running this compiler again as `axiom ide` (ide.ax), with those
+// texts on its standard input: one short process per question. Nothing
+// carries over from one check to the next, so the compiler stays the one-shot
+// program it is (an arena that is never freed, tables in globals). The options
+// given to `axiom lsp` are passed on to every `axiom ide`.
+//
+// Diagnostics are published for a document after it changes, once every
+// message that has already arrived has been handled, so a burst of edits
+// costs one check. Saving a document checks every open one again, since
+// they may import it.
+// =============================================================================
+import "diag.ax" as dg;
+import "std/encoding/json" as json;
+import "std/mem" as smem;
+import "std/os/process" as sproc;
+import "util.ax" as u;
+
+struct Doc {
+    uri: []mut u8,  // as the client sent it
+    path: []mut u8,
+    text: []mut u8,
+    dirty: bool,  // diagnostics to publish
+}
+
+let mut docs: u.List.[*mut Doc] = u.List.[*mut Doc].{ data: @ptr_from_int(*mut *mut Doc, 0), len: 0, cap: 0 };
+let mut self_exe: []u8 = "";
+let mut ide_args: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+let mut shutting_down: bool = false;
+
+// -----------------------------------------------------------------------------
+// Heap strings (documents outlive the scratch memory each message gets)
+// -----------------------------------------------------------------------------
+fn keep(s: []u8) []mut u8 {
+    let p = @ptr_cast(*mut u8, u.malloc(s.len + 1));
+    let out = @slice_from_ptr(p, s.len);
+    @mem_copy(out, s);
+    return out;
+}
+
+fn drop(s: []mut u8) void {
+    u.free(@ptr_cast(*mut void, s.ptr));
+}
+
+// -----------------------------------------------------------------------------
+// Messages: "Content-Length: n\r\n\r\n" and n bytes of JSON
+// -----------------------------------------------------------------------------
+let mut inbuf: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
+let mut inpos: usize = 0;  // where the next message starts
+
+// Reads more input; false at the end.
+fn fill() bool {
+    let mut chunk: [65536]u8 = [0; 65536];
+    let n = u.read(0, &mut chunk[0], 65536);
+    if n <= 0 {
+        return false;
+    }
+    for i in 0..@int_cast(usize, n) {
+        inbuf.push(chunk[i]);
+    }
+    return true;
+}
+
+fn lower(c: u8) u8 {
+    if (c >= 'A') and (c <= 'Z') {
+        return c + 32;
+    }
+    return c;
+}
+
+struct Frame {
+    ok: bool,      // a whole message is buffered
+    start: usize,  // its body
+    len: usize,
+}
+
+// The next whole message in the buffer, if there is one.
+fn frame() Frame {
+    let none = Frame.{ ok: false, start: 0, len: 0 };
+    let b = inbuf.items();
+    let mut i = inpos;
+    while (i + 3) < b.len {
+        if (b[i] == '\r') and (b[i + 1] == '\n') and (b[i + 2] == '\r') and (b[i + 3] == '\n') {
+            break;
+        }
+        i += 1;
+    }
+    if (i + 3) >= b.len {
+        return none;
+    }
+    // Content-Length, among the headers
+    let key = "content-length:";
+    let mut len: usize = 0;
+    let mut found = false;
+    let mut h = inpos;
+    while (h + key.len) <= i {
+        let mut same = true;
+        for k in 0..key.len {
+            if lower(b[h + k]) != key[k] {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            let mut j = h + key.len;
+            while (j < i) and (b[j] == ' ') {
+                j += 1;
+            }
+            while (j < i) and u.is_digit(b[j]) {
+                len = (len * 10) + @as(usize, b[j] - '0');
+                j += 1;
+            }
+            found = true;
+            break;
+        }
+        h += 1;
+    }
+    let start = i + 4;
+    if not found {
+        // not a message we can read: skip the header
+        inpos = start;
+        return none;
+    }
+    if (start + len) > b.len {
+        return none;
+    }
+    return Frame.{ ok: true, start: start, len: len };
+}
+
+fn have_message() bool {
+    return frame().ok;
+}
+
+// The next message's body (valid until the next call), or a nil slice at
+// the end of the input.
+fn next_message() []u8 {
+    // drop what has been handled
+    if inpos > 0 {
+        let b = inbuf.items();
+        let rest = b.len - inpos;
+        for i in 0..rest {
+            b[i] = b[inpos + i];
+        }
+        inbuf.len = rest;
+        inpos = 0;
+    }
+    loop {
+        let f = frame();
+        if f.ok {
+            inpos = f.start + f.len;
+            return inbuf.items()[f.start..f.start + f.len];
+        }
+        if not fill() {
+            return u.nosym();
+        }
+    }
+}
+
+fn send(body: []u8) void {
+    u.write_all(1, u.f1("Content-Length: %s\r\n\r\n", u.zdec(body.len)));
+    u.write_all(1, body);
+}
+
+fn respond(id: []u8, result: []u8) void {
+    send(u.f2("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}", id, result));
+}
+
+fn respond_error(id: []u8, code: i32, msg: []u8) void {
+    let mut b = u.Buf.init();
+    b.s(u.f2("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%s,\"message\":", id, u.idec(code)));
+    dg.json_str(&mut b, msg);
+    b.s("}}");
+    send(b.done());
+}
+
+fn log(msg: []u8) void {
+    u.eprint(u.cat2(msg, "\n"));
+}
+
+// -----------------------------------------------------------------------------
+// Reading requests
+// -----------------------------------------------------------------------------
+fn get(v: json.Value, key: []u8) json.Value {
+    return v.get(key) catch json.Value.Null;
+}
+
+fn str_of(v: json.Value) []u8 {
+    return v.as_str() catch "";
+}
+
+fn int_of(v: json.Value) i64 {
+    return v.as_i64() catch -1;
+}
+
+// The id of a request as JSON, or a nil slice for a notification.
+fn id_of(msg: json.Value) []u8 {
+    match get(msg, "id") {
+        .Int(x) => { return u.dec(x); }
+        .String(s) => {
+            let mut b = u.Buf.init();
+            dg.json_str(&mut b, s);
+            return b.done();
+        }
+        else => { return u.nosym(); }
+    }
+}
+
+fn hex_val(c: u8) i32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(i32, c - '0');
+    }
+    let l = lower(c);
+    if (l >= 'a') and (l <= 'f') {
+        return @as(i32, l - 'a') + 10;
+    }
+    return -1;
+}
+
+// file:///home/a/b.ax -> /home/a/b.ax; file:///c%3A/a/b.ax -> C:/a/b.ax
+fn path_of(uri: []u8) []u8 {
+    if not u.starts(uri, "file://") {
+        return uri;
+    }
+    let s = uri[7..];
+    let mut b = u.Buf.init();
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c == '%') and ((i + 2) < s.len) and (hex_val(s[i + 1]) >= 0) and (hex_val(s[i + 2]) >= 0) {
+            b.c(@int_cast(u8, (hex_val(s[i + 1]) * 16) + hex_val(s[i + 2])));
+            i += 3;
+            continue;
+        }
+        b.c(c);
+        i += 1;
+    }
+    let p = b.done();
+    if (p.len >= 3) and (p[0] == '/') and u.is_alnum(p[1]) and not u.is_digit(p[1]) and (p[2] == ':') {
+        let mut w = u.Buf.init();
+        let d = p[1];
+        if (d >= 'a') and (d <= 'z') {
+            w.c(d - 32);
+        } else {
+            w.c(d);
+        }
+        w.s(p[2..]);
+        return w.done();
+    }
+    return p;
+}
+
+fn find_doc(uri: []u8) *mut Doc {
+    for i in 0..docs.len {
+        let d = docs.get(i);
+        if u.str_eq(d.uri, uri) {
+            return d;
+        }
+    }
+    return u.nil.[Doc]();
+}
+
+fn set_text(d: *mut Doc, text: []u8) void {
+    drop(d.text);
+    d.text = keep(text);
+    d.dirty = true;
+}
+
+fn open_doc(uri: []u8, text: []u8) void {
+    let old = find_doc(uri);
+    if u.notnil(old) {
+        set_text(old, text);
+        return;
+    }
+    let d = @ptr_cast(*mut Doc, u.calloc(1, @size_of(Doc)));
+    d.uri = keep(uri);
+    d.path = keep(path_of(uri));
+    d.text = keep(text);
+    d.dirty = true;
+    docs.push(d);
+}
+
+fn close_doc(uri: []u8) void {
+    let xs = docs.items();
+    for i in 0..xs.len {
+        let d = xs[i];
+        if not u.str_eq(d.uri, uri) {
+            continue;
+        }
+        drop(d.uri);
+        drop(d.path);
+        drop(d.text);
+        u.free(@ptr_cast(*mut void, d));
+        for j in i + 1..xs.len {
+            xs[j - 1] = xs[j];
+        }
+        docs.len -= 1;
+        return;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Asking the compiler
+// -----------------------------------------------------------------------------
+// Runs `axiom ide <path> --query=<query> <more>... <ide_args>...` with the open
+// documents on its standard input; its answer (JSON), or a nil slice.
+fn ask(query: []u8, path: []u8, more: [][]u8) []u8 {
+    let mut cmd = sproc.Command.init(self_exe);
+    defer cmd.deinit();
+    let qa = u.cat2("--query=", query);
+    cmd.arg("ide") catch return u.nosym();
+    cmd.arg(path) catch return u.nosym();
+    cmd.arg(qa) catch return u.nosym();
+    cmd.args(more) catch return u.nosym();
+    cmd.args(ide_args.items()) catch return u.nosym();
+    cmd.stdin(sproc.Stdio.PIPE);
+    cmd.stdout(sproc.Stdio.PIPE);
+    let mut child = cmd.spawn() catch |e| {
+        log(u.f2("axiom lsp: cannot run %s: %s", self_exe, @error_name(e)));
+        return u.nosym();
+    };
+    let mut b = u.Buf.init();
+    for i in 0..docs.len {
+        let d = docs.get(i);
+        b.s(d.path);
+        b.c('\n');
+        b.s(u.zdec(d.text.len));
+        b.c('\n');
+        b.s(d.text);
+    }
+    child.stdin.write_all(b.view()) catch {};
+    child.stdin.close();
+    let out = child.stdout.read_all() catch u.nil_slice.[u8]();
+    let st = child.wait() catch sproc.Status.{ code: -1, signal: 0 };
+    let r = u.dup(out);
+    if out.len > 0 {
+        smem.free(out);
+    }
+    if not st.success() {
+        log(u.f3("axiom lsp: axiom ide --query=%s %s failed (exit status %s)", query, path, u.idec(st.code)));
+        return u.nosym();
+    }
+    if r.len == 0 {
+        return u.nosym();
+    }
+    return r;
+}
+
+fn publish(d: *mut Doc) void {
+    d.dirty = false;
+    if not u.ends(d.path, ".ax") {
+        return;
+    }
+    let r = ask("diagnostics", d.path, u.no_strs());
+    if u.isnos(r) {
+        return;
+    }
+    let mut b = u.Buf.init();
+    b.s("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    dg.json_str(&mut b, d.uri);
+    b.s(",\"diagnostics\":");
+    b.s(r);
+    b.s("}}");
+    send(b.done());
+}
+
+fn clear_diagnostics(uri: []u8) void {
+    let mut b = u.Buf.init();
+    b.s("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    dg.json_str(&mut b, uri);
+    b.s(",\"diagnostics\":[]}}");
+    send(b.done());
+}
+
+fn capabilities() []u8 {
+    return "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\"@\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentFormattingProvider\":true},\"serverInfo\":{\"name\":\"axiom lsp\",\"version\":\"0.1.0\"}}";
+}
+
+// The `axiom ide` query for a request about a document, or "".
+fn query_of(method: []u8) []u8 {
+    let pre = "textDocument/";
+    if not u.starts(method, pre) {
+        return "";
+    }
+    let m = method[pre.len..];
+    let qs = ["hover", "definition", "typeDefinition", "references", "documentHighlight", "rename", "documentSymbol",
+              "completion", "signatureHelp", "formatting"];
+    for q in qs {
+        if u.str_eq(m, q) {
+            return q;
+        }
+    }
+    return "";
+}
+
+// Handles one message; false once the client says to exit.
+fn handle(body: []u8) bool {
+    let mut doc = json.parse(body) catch {
+        log("axiom lsp: a message that is not JSON");
+        return true;
+    };
+    defer doc.deinit();
+    let msg = doc.root;
+    let method = str_of(get(msg, "method"));
+    let id = id_of(msg);
+    let params = get(msg, "params");
+    let td = get(params, "textDocument");
+    let uri = str_of(get(td, "uri"));
+    if u.str_eq(method, "initialize") {
+        respond(id, capabilities());
+        return true;
+    }
+    if u.str_eq(method, "shutdown") {
+        shutting_down = true;
+        respond(id, "null");
+        return true;
+    }
+    if u.str_eq(method, "exit") {
+        return false;
+    }
+    if u.str_eq(method, "textDocument/didOpen") {
+        open_doc(uri, str_of(get(td, "text")));
+        return true;
+    }
+    if u.str_eq(method, "textDocument/didChange") {
+        let d = find_doc(uri);
+        let changes = get(params, "contentChanges");
+        let n = changes.len();
+        if u.notnil(d) and (n > 0) {
+            // whole-document sync: the last change is the text
+            let last = changes.at(n - 1) catch json.Value.Null;
+            set_text(d, str_of(get(last, "text")));
+        }
+        return true;
+    }
+    if u.str_eq(method, "textDocument/didSave") {
+        for i in 0..docs.len {
+            let d = docs.get(i);
+            d.dirty = true;
+        }
+        return true;
+    }
+    if u.str_eq(method, "textDocument/didClose") {
+        close_doc(uri);
+        clear_diagnostics(uri);
+        return true;
+    }
+    let q = query_of(method);
+    if (q.len > 0) and not u.isnos(id) {
+        let mut more = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+        let pos = get(params, "position");
+        if not pos.is_null() {
+            more.push(u.f2("--pos=%s:%s", u.dec(int_of(get(pos, "line"))), u.dec(int_of(get(pos, "character")))));
+        }
+        if u.str_eq(q, "rename") {
+            more.push(u.cat2("--new-name=", str_of(get(params, "newName"))));
+        }
+        let incl = get(get(params, "context"), "includeDeclaration").as_bool() catch true;
+        if u.str_eq(q, "references") and not incl {
+            more.push("--exclude-declaration");
+        }
+        let r = ask(q, path_of(uri), more.items());
+        if u.str_eq(q, "rename") and (u.isnos(r) or u.str_eq(r, "null")) {
+            respond_error(id, -32803, "this name cannot be renamed here");
+            return true;
+        }
+        if u.isnos(r) {
+            respond(id, "null");
+        } else {
+            respond(id, r);
+        }
+        return true;
+    }
+    if not u.isnos(id) {
+        respond_error(id, -32601, u.f1("unsupported request %s", method));
+    }
+    return true;  // a notification we do not need
+}
+
+// Serves the client on standard input and output until it says to exit.
+pub fn run(args: [][]u8, exe: []u8) i32 {
+    self_exe = exe;
+    for a in args {
+        ide_args.push(a);
+    }
+    loop {
+        // between bursts of messages: diagnostics for what changed
+        if not have_message() {
+            for i in 0..docs.len {
+                let d = docs.get(i);
+                if d.dirty {
+                    u.scratch_begin();
+                    publish(d);
+                    u.scratch_end();
+                }
+            }
+        }
+        let body = next_message();
+        if u.isnos(body) {
+            break;
+        }
+        u.scratch_begin();
+        let go_on = handle(body);
+        u.scratch_end();
+        if not go_on {
+            break;
+        }
+    }
+    if shutting_down {
+        return 0;
+    }
+    return 1;
+}

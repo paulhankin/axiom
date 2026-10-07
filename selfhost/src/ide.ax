@@ -1,0 +1,2292 @@
+// =============================================================================
+// ide.ax - answers to an editor's questions about a program (axiom ide).
+//
+//   axiom ide <file.ax> --query=<q> [--pos=<line>:<character>] [--new-name=<n>]
+//             [--target=...] [--std=<dir>]
+//
+// The language server (lsp.ax) runs this once per question, with the text of
+// the editor's open buffers on standard input (each one as its path, a
+// newline, its length in bytes, a newline and the bytes), so that unsaved
+// edits are what gets checked. It loads, parses and checks the program the
+// way `axiom check` does, then prints the answer as the JSON `result` of the
+// matching Language Server Protocol request: positions are LSP positions
+// (lines from 0, characters in UTF-16 code units), files are file:// URIs.
+//
+// Queries: diagnostics, hover, definition, typeDefinition, references,
+// documentHighlight, rename, documentSymbol, completion, signatureHelp and
+// formatting (which only needs the text).
+//
+// Most of the work is one walk over the checked tree (sema annotates it in
+// place) that records every name in the source: where it is, whether it
+// declares something, and what it refers to - a local, a declaration, a
+// field or variant of one, a generic parameter, an error name or a builtin.
+// =============================================================================
+import "ast.ax" as ast;
+import "diag.ax" as dg;
+import "fmt.ax" as fmt;
+import "lexer.ax" as lx;
+import "package.ax" as pkg;
+import "sema.ax" as sema;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// The question, from the command line.
+let mut q_query: []u8 = "";
+let mut q_line: i64 = 0;
+let mut q_char: i64 = 0;
+let mut q_new_name: []u8 = "";
+let mut q_include_decl: bool = true;
+let mut g_std: []u8 = "";
+
+// Takes an `axiom ide` option; false if it is not one.
+pub fn option(a: []u8) bool {
+    if u.starts(a, "--query=") {
+        q_query = a[8..];
+        return true;
+    }
+    if u.starts(a, "--pos=") {
+        let p = a[6..];
+        let colon = u.find(p, ':');
+        if colon > 0 {
+            q_line = u.atol(p[0..@int_cast(usize, colon)]);
+            q_char = u.atol(p[@int_cast(usize, colon) + 1..]);
+        }
+        return true;
+    }
+    if u.starts(a, "--new-name=") {
+        q_new_name = a[11..];
+        return true;
+    }
+    if u.str_eq(a, "--exclude-declaration") {
+        q_include_decl = false;
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// The editor's buffers
+// -----------------------------------------------------------------------------
+fn read_stdin() []u8 {
+    let mut b = u.Buf.init();
+    let mut chunk: [65536]u8 = [0; 65536];
+    loop {
+        let n = u.read(0, &mut chunk[0], 65536);
+        if n <= 0 {
+            break;
+        }
+        b.s(chunk[0..@int_cast(usize, n)]);
+    }
+    return b.done();
+}
+
+// path "\n" length "\n" bytes, repeated
+fn read_overlays() void {
+    let s = read_stdin();
+    let mut i: usize = 0;
+    while i < s.len {
+        let mut e = i;
+        while (e < s.len) and (s[e] != '\n') {
+            e += 1;
+        }
+        let path = s[i..e];
+        let mut j = e + 1;
+        let mut k = j;
+        while (k < s.len) and (s[k] != '\n') {
+            k += 1;
+        }
+        if k >= s.len {
+            return;
+        }
+        let n = @int_cast(usize, u.atol(s[j..k]));
+        j = k + 1;
+        if (j + n) > s.len {
+            return;
+        }
+        u.add_overlay(path, s[j..j + n]);
+        i = j + n;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Positions: byte offsets <-> LSP positions
+// -----------------------------------------------------------------------------
+fn lines_of(f: *mut u.SourceFile) []mut u32 {
+    if f.line_starts.len == 0 {
+        f.line_starts.push(0);
+        for i in 0..f.text.len {
+            if f.text[i] == '\n' {
+                f.line_starts.push(@int_cast(u32, i) + 1);
+            }
+        }
+        f.nlines = f.line_starts.len;
+    }
+    return f.line_starts.items();
+}
+
+// UTF-16 code units in the character that starts with byte c.
+fn units(c: u8) i64 {
+    if c >= 0xF0 {
+        return 2;
+    }
+    return 1;
+}
+
+fn is_cont(c: u8) bool {
+    return (c & 0xC0) == 0x80;
+}
+
+struct Pos {
+    line: i64,
+    ch: i64,
+}
+
+fn pos_of(f: *mut u.SourceFile, off0: u32) Pos {
+    let ls = lines_of(f);
+    let mut off = off0;
+    if @as(usize, off) > f.text.len {
+        off = @int_cast(u32, f.text.len);
+    }
+    let mut lo: usize = 0;
+    let mut hi = ls.len - 1;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if ls[mid] <= off {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut ch: i64 = 0;
+    let mut i = @as(usize, ls[lo]);
+    while i < @as(usize, off) {
+        if not is_cont(f.text[i]) {
+            ch += units(f.text[i]);
+        }
+        i += 1;
+    }
+    return Pos.{ line: @int_cast(i64, lo), ch: ch };
+}
+
+// The byte offset of an LSP position in text (clamped to the line).
+fn offset_in(text: []u8, line: i64, ch: i64) u32 {
+    let mut i: usize = 0;
+    let mut l: i64 = 0;
+    while (l < line) and (i < text.len) {
+        if text[i] == '\n' {
+            l += 1;
+        }
+        i += 1;
+    }
+    let mut c: i64 = 0;
+    while (i < text.len) and (text[i] != '\n') and (text[i] != '\r') and (c < ch) {
+        c += units(text[i]);
+        i += 1;
+        while (i < text.len) and is_cont(text[i]) {
+            i += 1;
+        }
+    }
+    return @int_cast(u32, i);
+}
+
+// -----------------------------------------------------------------------------
+// JSON
+// -----------------------------------------------------------------------------
+fn uri_of(path: []u8) []u8 {
+    let mut b = u.Buf.init();
+    b.s("file://");
+    if (path.len > 1) and (path[1] == ':') {
+        b.c('/');
+    }
+    let hex = "0123456789ABCDEF";
+    for c0 in path {
+        let mut c = c0;
+        if c == '\\' {
+            c = '/';
+        }
+        if u.is_alnum(c) or (c == '/') or (c == '-') or (c == '.') or (c == '_') or (c == '~') or (c == ':') {
+            b.c(c);
+        } else {
+            b.c('%');
+            b.c(hex[@as(usize, c >> 4)]);
+            b.c(hex[@as(usize, c & 15)]);
+        }
+    }
+    return b.done();
+}
+
+fn jstr(b: *mut u.Buf, s: []u8) void {
+    dg.json_str(b, s);
+}
+
+fn jpos(b: *mut u.Buf, p: Pos) void {
+    b.s(u.f2("{\"line\":%s,\"character\":%s}", u.dec(p.line), u.dec(p.ch)));
+}
+
+fn jrange(b: *mut u.Buf, sp: u.Span) void {
+    let f = u.file_of(sp.file);
+    b.s("{\"start\":");
+    jpos(b, pos_of(f, sp.start));
+    b.s(",\"end\":");
+    jpos(b, pos_of(f, sp.end));
+    b.c('}');
+}
+
+fn jlocation(b: *mut u.Buf, sp: u.Span) void {
+    b.s("{\"uri\":");
+    jstr(b, uri_of(u.file_of(sp.file).path));
+    b.s(",\"range\":");
+    jrange(b, sp);
+    b.c('}');
+}
+
+// -----------------------------------------------------------------------------
+// Source text helpers
+// -----------------------------------------------------------------------------
+fn text_of(sp: u.Span) []u8 {
+    let t = u.file_of(sp.file).text;
+    let mut s = @as(usize, sp.start);
+    let mut e = @as(usize, sp.end);
+    if e > t.len {
+        e = t.len;
+    }
+    if s > e {
+        s = e;
+    }
+    return t[s..e];
+}
+
+fn is_space(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r');
+}
+
+fn trim(s: []u8) []u8 {
+    let mut a: usize = 0;
+    let mut e = s.len;
+    while (a < e) and is_space(s[a]) {
+        a += 1;
+    }
+    while (e > a) and is_space(s[e - 1]) {
+        e -= 1;
+    }
+    return s[a..e];
+}
+
+fn has_sub(s: []u8, sub: []u8) bool {
+    if sub.len == 0 {
+        return true;
+    }
+    let mut i: usize = 0;
+    while (i + sub.len) <= s.len {
+        if u.str_eq(s[i..i + sub.len], sub) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn is_ident_char(c: u8) bool {
+    return u.is_alnum(c) or (c == '_');
+}
+
+// The `///` comment lines just above the line holding `off`, without the
+// slashes; "" if there are none.
+fn doc_comment(file: i32, off: u32) []u8 {
+    let t = u.file_of(file).text;
+    let mut ls = @as(usize, off);
+    if ls > t.len {
+        ls = t.len;
+    }
+    while (ls > 0) and (t[ls - 1] != '\n') {
+        ls -= 1;
+    }
+    let mut lines = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    while ls > 0 {
+        let e = ls - 1;  // the '\n' ending the line above
+        let mut s = e;
+        while (s > 0) and (t[s - 1] != '\n') {
+            s -= 1;
+        }
+        let line = trim(t[s..e]);
+        if not u.starts(line, "///") {
+            break;
+        }
+        let mut body = line[3..];
+        if (body.len > 0) and (body[0] == ' ') {
+            body = body[1..];
+        }
+        lines.push(body);
+        ls = s;
+    }
+    let mut b = u.Buf.init();
+    let mut i = lines.len;
+    while i > 0 {
+        i -= 1;
+        b.s(lines.get(i));
+        b.c('\n');
+    }
+    return b.done();
+}
+
+// A `// ...` comment after `off` on the same line (as fields have), or "".
+fn trailing_comment(file: i32, off: u32) []u8 {
+    let t = u.file_of(file).text;
+    let mut i = @as(usize, off);
+    let mut in_str = false;
+    while (i < t.len) and (t[i] != '\n') {
+        if t[i] == '"' {
+            in_str = not in_str;
+        }
+        if not in_str and (t[i] == '/') and ((i + 1) < t.len) and (t[i + 1] == '/') {
+            let mut e = i;
+            while (e < t.len) and (t[e] != '\n') and (t[e] != '\r') {
+                e += 1;
+            }
+            return trim(t[i + 2..e]);
+        }
+        i += 1;
+    }
+    return "";
+}
+
+// Where `name` first appears as a whole word in [from, to), or -1.
+fn find_word(file: i32, from: u32, to: u32, name: []u8) i64 {
+    let t = u.file_of(file).text;
+    let mut i = @as(usize, from);
+    let mut end = @as(usize, to);
+    if end > t.len {
+        end = t.len;
+    }
+    while (i + name.len) <= end {
+        if u.str_eq(t[i..i + name.len], name) and ((i == 0) or not is_ident_char(t[i - 1])) and
+           (((i + name.len) >= t.len) or not is_ident_char(t[i + name.len])) {
+            return @int_cast(i64, i);
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn word_span(file: i32, from: u32, to: u32, name: []u8) u.Span {
+    let w = find_word(file, from, to, name);
+    if w < 0 {
+        return u.mkspan(file, from, from);
+    }
+    let s = @int_cast(u32, w);
+    return u.mkspan(file, s, s + @int_cast(u32, name.len));
+}
+
+fn contains(sp: u.Span, off: u32) bool {
+    return (sp.start <= off) and (off <= sp.end);
+}
+
+fn tname(t: *ast.Type) []u8 {
+    if u.isnil(t) {
+        return "?";
+    }
+    return ty.type_str(t);
+}
+
+// -----------------------------------------------------------------------------
+// Names in the source
+// -----------------------------------------------------------------------------
+const R_LOCAL: i32 = 0;
+const R_DECL: i32 = 1;     // decl
+const R_FIELD: i32 = 2;    // decl's field `index`
+const R_VARIANT: i32 = 3;  // decl's variant (or enum member) `index`
+const R_GPARAM: i32 = 4;   // decl's generic parameter `index`
+const R_ERROR: i32 = 5;    // error.name
+const R_BUILTIN: i32 = 6;  // builtin `index`
+
+struct Ref {
+    span: u.Span,  // the name in the source
+    kind: i32,
+    local: *mut ast.Local,
+    decl: *mut ast.Decl,
+    index: i32,
+    name: []u8,         // R_ERROR
+    ty: *mut ast.Type,  // the type here, when the use knows better than the declaration
+    def: bool,          // declares it
+}
+
+let mut refs: u.List.[Ref] = u.List.[Ref].{ data: @ptr_from_int(*mut Ref, 0), len: 0, cap: 0 };
+let mut w_mod: *mut ast.Module = @ptr_from_int(*mut ast.Module, 0);
+let mut w_fn: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+let mut w_owner: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+
+// What completion and signature help look for while walking: the member
+// access, qualified type name or error value whose name starts at
+// find_off, and the call whose argument list opens at call_off.
+let mut find_file: i32 = -1;
+let mut find_off: i64 = -1;
+let mut found_field: *mut ast.Expr = @ptr_from_int(*mut ast.Expr, 0);
+let mut found_te: *mut ast.TypeExpr = @ptr_from_int(*mut ast.TypeExpr, 0);
+let mut found_error: bool = false;
+let mut call_off: i64 = -1;
+let mut found_call: *mut ast.Expr = @ptr_from_int(*mut ast.Expr, 0);
+let mut found_call_end: u32 = 0;
+
+fn add(sp: u.Span, kind: i32, d: *mut ast.Decl, index: i32, l: *mut ast.Local, def: bool, t: *mut ast.Type) void {
+    if sp.end <= sp.start {
+        return;
+    }
+    refs.push(Ref.{ span: sp, kind: kind, local: l, decl: d, index: index, name: "", ty: t, def: def });
+}
+
+fn add_decl(sp: u.Span, d: *mut ast.Decl, def: bool, t: *mut ast.Type) void {
+    if u.notnil(d) {
+        add(sp, R_DECL, d, 0, u.nil.[ast.Local](), def, t);
+    }
+}
+
+fn add_local(sp: u.Span, l: *mut ast.Local, def: bool) void {
+    if u.notnil(l) {
+        add(sp, R_LOCAL, u.nil.[ast.Decl](), 0, l, def, l.ty);
+    }
+}
+
+fn add_error(sp: u.Span, name: []u8, def: bool) void {
+    if sp.end > sp.start {
+        refs.push(Ref.{ span: sp, kind: R_ERROR, local: u.nil.[ast.Local](), decl: u.nil.[ast.Decl](), index: 0,
+                        name: name, ty: u.nil.[ast.Type](), def: def });
+    }
+}
+
+fn has_decl(t: *ast.Type) bool {
+    return u.notnil(t) and ((t.kind == ast.TY_STRUCT) or (t.kind == ast.TY_UNION) or (t.kind == ast.TY_ENUM)) and
+           u.notnil(t.decl);
+}
+
+// A struct, union or enum type, or a pointer to one: the type.
+fn aggregate(t: *mut ast.Type) *mut ast.Type {
+    if u.notnil(t) and (t.kind == ast.TY_PTR) and has_decl(t.elem) {
+        return t.elem;
+    }
+    return t;
+}
+
+fn field_index(d: *mut ast.Decl, name: []u8) i32 {
+    for i in 0..d.fields.len {
+        if u.str_eq(d.fields.at(i).name, name) {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+fn variant_index(d: *mut ast.Decl, name: []u8) i32 {
+    for i in 0..d.variants.len {
+        if u.str_eq(d.variants.at(i).name, name) {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+fn gparam_index(d: *mut ast.Decl, name: []u8) i32 {
+    if u.isnil(d) {
+        return -1;
+    }
+    for i in 0..d.gparams.len {
+        if u.str_eq(d.gparams.at(i).name, name) {
+            return @int_cast(i32, i);
+        }
+    }
+    return -1;
+}
+
+// A generic parameter of the function or type being walked.
+fn gparam_ref(sp: u.Span, name: []u8) bool {
+    let i = gparam_index(w_fn, name);
+    if i >= 0 {
+        add(sp, R_GPARAM, w_fn, i, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        return true;
+    }
+    let j = gparam_index(w_owner, name);
+    if j >= 0 {
+        add(sp, R_GPARAM, w_owner, j, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        return true;
+    }
+    return false;
+}
+
+fn wte(te: *mut ast.TypeExpr) void {
+    if u.isnil(te) {
+        return;
+    }
+    let k = te.kind;
+    if k == ast.TE_NAMED {
+        let file = te.name_span.file;
+        if not u.isnos(te.qual) {
+            let qsp = u.mkspan(file, te.span.start, te.span.start + @int_cast(u32, te.qual.len));
+            let imp = w_mod.imports.get(te.qual);
+            if u.notnil(imp) {
+                add_decl(qsp, imp, false, u.nil.[ast.Type]());
+                add_decl(te.name_span, sema.module_lookup(imp.imported, te.name), false, u.nil.[ast.Type]());
+            }
+            if (file == find_file) and (@as(i64, te.name_span.start) == find_off) {
+                found_te = te;
+            }
+        } else if not gparam_ref(te.name_span, te.name) {
+            add_decl(te.name_span, sema.module_lookup(w_mod, te.name), false, u.nil.[ast.Type]());
+        }
+    } else if k == ast.TE_SELF {
+        add_decl(te.span, w_owner, false, u.nil.[ast.Type]());
+    }
+    wte(te.elem);
+    wte(te.len);
+    for i in 0..te.args.len {
+        wte(te.args.get(i));
+    }
+    for i in 0..te.fields.len {
+        wte(te.fields.at(i).te);
+    }
+}
+
+fn wident(e: *mut ast.Expr) void {
+    if u.notnil(e.local) {
+        add_local(e.span, e.local, false);
+    } else if u.notnil(e.decl) {
+        add_decl(e.span, e.decl, false, e.ty);
+    } else if e.cat == ast.CAT_MODULE {
+        add_decl(e.span, w_mod.imports.get(e.name), false, u.nil.[ast.Type]());
+    } else {
+        _ = gparam_ref(e.span, e.name);
+    }
+}
+
+fn wfield(e: *mut ast.Expr) void {
+    let sp = e.name_span;
+    if (sp.file == find_file) and (@as(i64, sp.start) == find_off) {
+        found_field = e;
+    }
+    if u.notnil(e.decl) {
+        add_decl(sp, e.decl, false, e.ty);  // module member, method
+        return;
+    }
+    let a = e.a;
+    if u.isnil(a) {
+        return;
+    }
+    if (a.cat == ast.CAT_TYPE) and has_decl(a.tval) {
+        let v = variant_index(a.tval.decl, e.name);
+        if v >= 0 {
+            add(sp, R_VARIANT, a.tval.decl, v, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        }
+        return;
+    }
+    let bt = aggregate(a.ty);
+    if has_decl(bt) and (bt.kind == ast.TY_STRUCT) {
+        let fi = field_index(bt.decl, e.name);
+        if fi >= 0 {
+            add(sp, R_FIELD, bt.decl, fi, u.nil.[ast.Local](), false, e.ty);
+        }
+    }
+}
+
+fn wexpr(e: *mut ast.Expr) void {
+    if u.isnil(e) {
+        return;
+    }
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        wident(e);
+        return;
+    }
+    if k == ast.E_SELF {
+        add_decl(e.span, w_owner, false, u.nil.[ast.Type]());
+        return;
+    }
+    if k == ast.E_FIELD {
+        wexpr(e.a);
+        wfield(e);
+        return;
+    }
+    if k == ast.E_STRUCT_LIT {
+        wexpr(e.a);
+        let st = e.ty;
+        for i in 0..e.inits.len {
+            let fi = e.inits.at(i);
+            if has_decl(st) and (st.kind == ast.TY_STRUCT) {
+                let x = field_index(st.decl, fi.name);
+                if x >= 0 {
+                    add(fi.span, R_FIELD, st.decl, x, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+                }
+            }
+            wexpr(fi.value);
+        }
+        return;
+    }
+    if k == ast.E_ERROR_VAL {
+        add_error(e.name_span, e.name, false);
+        if (e.name_span.file == find_file) and (@as(i64, e.name_span.start) == find_off) {
+            found_error = true;
+        }
+        return;
+    }
+    if k == ast.E_BUILTIN {
+        add(u.mkspan(e.span.file, e.span.start, e.span.start + 1 + @int_cast(u32, e.name.len)), R_BUILTIN,
+            u.nil.[ast.Decl](), e.index, u.nil.[ast.Local](), false, u.nil.[ast.Type]());
+        note_call(e, e.span.start + 1 + @int_cast(u32, e.name.len));
+        for i in 0..e.bargs.len {
+            let ba = e.bargs.at(i);
+            wte(ba.t);
+            wexpr(ba.e);
+        }
+        return;
+    }
+    if k == ast.E_CATCH {
+        wexpr(e.a);
+        add_local(e.capture_span, e.capture_local, true);
+        wexpr(e.hexpr);
+        wstmt(e.hblock);
+        return;
+    }
+    if k == ast.E_APPLY {
+        wexpr(e.a);
+        for i in 0..e.targs.len {
+            wte(e.targs.get(i));
+        }
+        return;
+    }
+    if (k == ast.E_CALL) and u.notnil(e.a) {
+        note_call(e, e.a.span.end);
+    }
+    wexpr(e.a);
+    wexpr(e.b);
+    wexpr(e.c);
+    for i in 0..e.args.len {
+        wexpr(e.args.get(i));
+    }
+}
+
+// Signature help: the call whose callee ends closest before call_off.
+fn note_call(e: *mut ast.Expr, callee_end: u32) void {
+    if (call_off < 0) or (e.span.file != find_file) or (@as(i64, callee_end) > call_off) {
+        return;
+    }
+    let t = u.file_of(e.span.file).text;
+    let mut i = @as(usize, callee_end);
+    while (i < t.len) and is_space(t[i]) {
+        i += 1;
+    }
+    if @int_cast(i64, i) != call_off {
+        return;
+    }
+    if u.isnil(found_call) or (callee_end >= found_call_end) {
+        found_call = e;
+        found_call_end = callee_end;
+    }
+}
+
+fn wstmt(s: *mut ast.Stmt) void {
+    if u.isnil(s) {
+        return;
+    }
+    let k = s.kind;
+    if (k == ast.S_LET) or (k == ast.S_FOR) {
+        add_local(s.name_span, s.local, true);
+    }
+    if k == ast.S_MATCH {
+        wexpr(s.e);
+        let mut st = u.nil.[ast.Type]();
+        if u.notnil(s.e) {
+            st = aggregate(s.e.ty);
+        }
+        for i in 0..s.arms.len {
+            let a = s.arms.at(i);
+            let file = a.span.file;
+            if (a.kind == ast.P_VARIANT) and has_decl(st) {
+                let v = variant_index(st.decl, a.name);
+                if v >= 0 {
+                    add(word_span(file, a.span.start, a.span.end, a.name), R_VARIANT, st.decl, v, u.nil.[ast.Local](),
+                        false, u.nil.[ast.Type]());
+                }
+            } else if a.kind == ast.P_ERROR {
+                add_error(word_span(file, a.span.start, a.span.end, a.name), a.name, false);
+            }
+            add_local(a.bind_span, a.bind_local, true);
+            wstmt(a.body);
+        }
+        return;
+    }
+    wte(s.te);
+    wexpr(s.e);
+    wexpr(s.e2);
+    wexpr(s.e3);
+    wstmt(s.body);
+    wstmt(s.els);
+    for i in 0..s.stmts.len {
+        wstmt(s.stmts.get(i));
+    }
+}
+
+fn wdecl(d: *mut ast.Decl) void {
+    let k = d.kind;
+    if k == ast.D_IMPORT {
+        add_decl(d.name_span, d, true, u.nil.[ast.Type]());
+        add_decl(d.import_path_span, d, false, u.nil.[ast.Type]());
+        return;
+    }
+    if k == ast.D_ERROR {
+        for j in 0..d.error_names.len {
+            add_error(d.error_spans.get(j), d.error_names.get(j), true);
+        }
+        return;
+    }
+    if not d.is_test {
+        add_decl(d.name_span, d, true, u.nil.[ast.Type]());
+    }
+    for i in 0..d.gparams.len {
+        let g = d.gparams.at(i);
+        add(g.span, R_GPARAM, d, @int_cast(i32, i), u.nil.[ast.Local](), true, u.nil.[ast.Type]());
+        wte(g.const_te);
+    }
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        let saved = w_fn;
+        w_fn = d;
+        for i in 0..d.params.len {
+            let p = d.params.at(i);
+            add_local(p.span, p.local, true);
+            wte(p.te);
+        }
+        wte(d.ret_te);
+        wstmt(d.body);
+        w_fn = saved;
+        return;
+    }
+    for i in 0..d.fields.len {
+        let f = d.fields.at(i);
+        add(f.span, R_FIELD, d, @int_cast(i32, i), u.nil.[ast.Local](), true, f.ty);
+        wte(f.te);
+    }
+    for i in 0..d.variants.len {
+        let v = d.variants.at(i);
+        add(v.span, R_VARIANT, d, @int_cast(i32, i), u.nil.[ast.Local](), true, u.nil.[ast.Type]());
+        wte(v.te);
+    }
+    wte(d.te);
+    wexpr(d.init);
+    let saved_owner = w_owner;
+    w_owner = d;
+    for i in 0..d.methods.len {
+        wdecl(d.methods.get(i));
+    }
+    w_owner = saved_owner;
+}
+
+fn walk_module(m: *mut ast.Module) void {
+    w_mod = m;
+    w_fn = u.nil.[ast.Decl]();
+    w_owner = u.nil.[ast.Decl]();
+    for i in 0..m.decls.len {
+        wdecl(m.decls.get(i));
+    }
+}
+
+fn cmp_u32(a: u32, b: u32) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+fn ref_cmp(a: Ref, b: Ref) i32 {
+    if a.span.file != b.span.file {
+        if a.span.file < b.span.file {
+            return -1;
+        }
+        return 1;
+    }
+    let c = cmp_u32(a.span.start, b.span.start);
+    if c != 0 {
+        return c;
+    }
+    let c2 = cmp_u32(a.span.end, b.span.end);
+    if c2 != 0 {
+        return c2;
+    }
+    if a.def != b.def {
+        if a.def {
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn same_target(a: *Ref, b: *Ref) bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    let k = a.kind;
+    if k == R_LOCAL {
+        return a.local == b.local;
+    }
+    if k == R_DECL {
+        return a.decl == b.decl;
+    }
+    if k == R_ERROR {
+        return u.str_eq(a.name, b.name);
+    }
+    if k == R_BUILTIN {
+        return a.index == b.index;
+    }
+    return (a.decl == b.decl) and (a.index == b.index);
+}
+
+// Sorts the names by position and drops repeats (sema shares some subtrees).
+fn sort_refs() void {
+    u.sort.[Ref](refs.items(), ref_cmp);
+    let xs = refs.items();
+    let mut n: usize = 0;
+    for i in 0..xs.len {
+        if n > 0 {
+            let p = &xs[n - 1];
+            let x = &xs[i];
+            if (p.span.file == x.span.file) and (p.span.start == x.span.start) and (p.span.end == x.span.end) and
+               same_target(p, x) {
+                continue;
+            }
+        }
+        xs[n] = xs[i];
+        n += 1;
+    }
+    refs.len = n;
+}
+
+// The name at `off` in `file`: an index into refs, or -1. A name the
+// cursor is inside beats one it is just after.
+fn ref_at(file: i32, off: u32) i64 {
+    let mut best: i64 = -1;
+    let mut best_len: u32 = 0;
+    let mut best_inside = false;
+    for i in 0..refs.len {
+        let r = refs.at(i);
+        if (r.span.file != file) or not contains(r.span, off) {
+            continue;
+        }
+        let inside = off < r.span.end;
+        let len = r.span.end - r.span.start;
+        if (best < 0) or (inside and not best_inside) or ((inside == best_inside) and (len < best_len)) {
+            best = @int_cast(i64, i);
+            best_len = len;
+            best_inside = inside;
+        }
+    }
+    return best;
+}
+
+// The name of what a name refers to.
+fn target_name(r: *Ref) []u8 {
+    let k = r.kind;
+    let i = @int_cast(usize, r.index);
+    if k == R_LOCAL {
+        return r.local.name;
+    }
+    if k == R_DECL {
+        return r.decl.name;
+    }
+    if k == R_FIELD {
+        return r.decl.fields.at(i).name;
+    }
+    if k == R_VARIANT {
+        return r.decl.variants.at(i).name;
+    }
+    if k == R_GPARAM {
+        return r.decl.gparams.at(i).name;
+    }
+    if k == R_ERROR {
+        return r.name;
+    }
+    return u.cat2("@", ast.builtin_name(r.index));
+}
+
+// x refers to what r does, and spells its name (`Self` for a type, or an
+// import's path for its alias, do not).
+fn same_use(r: *Ref, x: *Ref) bool {
+    return same_target(r, x) and u.str_eq(text_of(x.span), target_name(r));
+}
+
+// -----------------------------------------------------------------------------
+// Where things are declared
+// -----------------------------------------------------------------------------
+struct Where {
+    ok: bool,
+    span: u.Span,
+}
+
+// Where error `name` is declared: error names are shared by the whole
+// program, so several modules may declare the same one. The root module's
+// declaration comes first.
+fn error_defs(name: []u8) u.List.[u.Span] {
+    let mut out = u.List.[u.Span].{ data: u.nil.[u.Span](), len: 0, cap: 0 };
+    let ms = &sema.g_prog.modules;
+    for pass in @as(i32, 0)..2 {
+        for mi in 0..ms.len {
+            let m = ms.get(mi);
+            if (m == root_mod) != (pass == 0) {
+                continue;
+            }
+            for i in 0..m.decls.len {
+                let d = m.decls.get(i);
+                if d.kind != ast.D_ERROR {
+                    continue;
+                }
+                for j in 0..d.error_names.len {
+                    if u.str_eq(d.error_names.get(j), name) {
+                        out.push(d.error_spans.get(j));
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn error_def(name: []u8) Where {
+    let ds = error_defs(name);
+    if ds.len == 0 {
+        return Where.{ ok: false, span: u.mkspan(0, 0, 0) };
+    }
+    return Where.{ ok: true, span: ds.get(0) };
+}
+
+fn def_of(r: *Ref) Where {
+    let k = r.kind;
+    let i = @int_cast(usize, r.index);
+    if k == R_LOCAL {
+        return Where.{ ok: true, span: r.local.span };
+    }
+    if k == R_DECL {
+        let d = r.decl;
+        if d.kind == ast.D_IMPORT {
+            if u.isnil(d.imported) {
+                return Where.{ ok: false, span: r.span };
+            }
+            return Where.{ ok: true, span: u.mkspan(d.imported.file.id, 0, 0) };
+        }
+        return Where.{ ok: not d.anon, span: d.name_span };
+    }
+    if k == R_FIELD {
+        return Where.{ ok: true, span: r.decl.fields.at(i).span };
+    }
+    if k == R_VARIANT {
+        return Where.{ ok: true, span: r.decl.variants.at(i).span };
+    }
+    if k == R_GPARAM {
+        return Where.{ ok: true, span: r.decl.gparams.at(i).span };
+    }
+    if k == R_ERROR {
+        return error_def(r.name);
+    }
+    return Where.{ ok: false, span: r.span };
+}
+
+// -----------------------------------------------------------------------------
+// Describing things
+// -----------------------------------------------------------------------------
+// A builtin's parameters: T for a type, a, b, c ... for values.
+fn builtin_params(i: i32) u.List.[[]u8] {
+    let sig = ast.builtin_sig(i);
+    let mut out = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    let names = "abcdefgh";
+    let mut ne: usize = 0;
+    for j in 0..sig.len {
+        let c = sig[j];
+        if c == 't' {
+            out.push("T");
+        } else if c == '*' {
+            out.push("...");
+        } else {
+            out.push(names[ne..ne + 1]);
+            ne += 1;
+        }
+    }
+    return out;
+}
+
+fn builtin_label(i: i32) []u8 {
+    let ps = builtin_params(i);
+    let mut b = u.Buf.init();
+    b.c('@');
+    b.s(ast.builtin_name(i));
+    b.c('(');
+    for j in 0..ps.len {
+        if j != 0 {
+            b.s(", ");
+        }
+        b.s(ps.get(j));
+    }
+    b.c(')');
+    return b.done();
+}
+
+fn te_text(te: *mut ast.TypeExpr) []u8 {
+    if u.isnil(te) {
+        return "";
+    }
+    return trim(text_of(te.span));
+}
+
+// A declaration as it is written, without bodies, methods or long values.
+fn sig_of(d: *mut ast.Decl) []u8 {
+    let k = d.kind;
+    let file = d.span.file;
+    if d.is_test {
+        return u.f1("test \"%s\"", d.test_name);
+    }
+    if (k == ast.D_FN) and u.notnil(d.body) {
+        return trim(text_of(u.mkspan(file, d.span.start, d.body.span.start)));
+    }
+    if k == ast.D_HOST_FN {
+        let s = trim(text_of(d.span));
+        if d.extern_c {
+            return u.f2("extern \"%s\" %s", d.abi, s);
+        }
+        return u.f2("import host \"%s\" %s", d.host_module, s);
+    }
+    if (k == ast.D_STRUCT) or (k == ast.D_UNION) or (k == ast.D_ENUM) {
+        if d.anon {
+            return "struct";
+        }
+        let t = u.file_of(file).text;
+        let mut i = @as(usize, d.name_span.end);
+        while (i < t.len) and (t[i] != '{') {
+            i += 1;
+        }
+        let mut b = u.Buf.init();
+        b.s(trim(t[@as(usize, d.span.start)..i]));
+        b.s(" {\n");
+        for j in 0..d.fields.len {
+            let f = d.fields.at(j);
+            b.s(u.f2("    %s: %s,\n", f.name, te_text(f.te)));
+        }
+        for j in 0..d.variants.len {
+            let v = d.variants.at(j);
+            if k == ast.D_ENUM {
+                b.s(u.f2("    %s = %s,\n", v.name, v.value.str()));
+            } else if u.notnil(v.te) {
+                b.s(u.f2("    %s: %s,\n", v.name, te_text(v.te)));
+            } else {
+                b.s(u.f1("    %s,\n", v.name));
+            }
+        }
+        b.s("}");
+        return b.done();
+    }
+    if (k == ast.D_CONST) or (k == ast.D_GLOBAL) {
+        let whole = trim(text_of(d.span));
+        if (whole.len <= 120) or u.isnil(d.init) {
+            return whole;
+        }
+        return u.cat2(trim(text_of(u.mkspan(file, d.span.start, d.init.span.start))), " ...");
+    }
+    return trim(text_of(d.span));
+}
+
+// Documentation for something declared at sp: its `///` comment, or the
+// comment at the end of its line.
+fn doc_at(sp: u.Span) []u8 {
+    let d = doc_comment(sp.file, sp.start);
+    if d.len > 0 {
+        return d;
+    }
+    return trailing_comment(sp.file, sp.end);
+}
+
+fn markdown(code: []u8, extra: []u8, doc: []u8) []u8 {
+    let mut b = u.Buf.init();
+    b.s("```axiom\n");
+    b.s(code);
+    b.s("\n```");
+    if extra.len > 0 {
+        b.s("\n\n");
+        b.s(extra);
+    }
+    if doc.len > 0 {
+        b.s("\n\n");
+        b.s(doc);
+    }
+    return b.done();
+}
+
+fn describe(r: *Ref) []u8 {
+    let k = r.kind;
+    let i = @int_cast(usize, r.index);
+    if k == R_LOCAL {
+        let l = r.local;
+        if l.is_param {
+            return markdown(u.f2("%s: %s", l.name, tname(l.ty)), "parameter", "");
+        }
+        return markdown(u.f3("let %s%s: %s", u.pick(l.is_mut, "mut ", ""), l.name, tname(l.ty)), "", "");
+    }
+    if k == R_DECL {
+        let d = r.decl;
+        let mut extra: []u8 = "";
+        if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) {
+            extra = u.f1("`%s`", d.imported.file.display);
+        } else if u.notnil(d.owner) {
+            extra = u.f1("in `%s`", d.owner.name);
+        } else if (d.kind == ast.D_CONST) and u.notnil(d.cexpr) and d.cexpr.is_const and u.notnil(d.ty) and
+                  (d.ty.kind == ast.TY_INT) {
+            let v = d.cexpr.cval.str();
+            let whole = trim(text_of(d.span));
+            if not u.ends(whole, u.cat2(v, ";")) {
+                extra = u.f1("= %s", v);
+            }
+        }
+        let mut doc: []u8 = "";
+        if d.kind != ast.D_IMPORT {
+            doc = doc_comment(d.span.file, d.span.start);
+        }
+        return markdown(sig_of(d), extra, doc);
+    }
+    if k == R_FIELD {
+        let d = r.decl;
+        let f = d.fields.at(i);
+        let mut t = r.ty;
+        if u.isnil(t) {
+            t = f.ty;
+        }
+        let mut typ = te_text(f.te);
+        if u.notnil(t) {
+            typ = tname(t);
+        }
+        let mut code = u.f3("%s.%s: %s", d.name, f.name, typ);
+        if d.anon {
+            code = u.f2("%s: %s", f.name, typ);
+        }
+        return markdown(code, "field", doc_at(f.span));
+    }
+    if k == R_VARIANT {
+        let d = r.decl;
+        let v = d.variants.at(i);
+        let mut code = u.f2("%s.%s", d.name, v.name);
+        if d.kind == ast.D_ENUM {
+            code = u.f3("%s.%s = %s", d.name, v.name, v.value.str());
+        } else if u.notnil(v.te) {
+            code = u.f3("%s.%s: %s", d.name, v.name, te_text(v.te));
+        }
+        return markdown(code, u.pick(d.kind == ast.D_ENUM, "enum member", "variant"), doc_at(v.span));
+    }
+    if k == R_GPARAM {
+        let d = r.decl;
+        let g = d.gparams.at(i);
+        let mut code = g.name;
+        if g.is_const {
+            code = u.f2("const %s: %s", g.name, te_text(g.const_te));
+        } else if not u.isnos(g.constraint) {
+            code = u.f2("%s: %s", g.name, g.constraint);
+        }
+        return markdown(code, u.f1("generic parameter of `%s`", d.name), "");
+    }
+    if k == R_ERROR {
+        let w = error_def(r.name);
+        let mut doc: []u8 = "";
+        if w.ok {
+            doc = doc_at(w.span);
+        }
+        return markdown(u.f1("error.%s", r.name), "", doc);
+    }
+    return markdown(builtin_label(r.index), "builtin", "");
+}
+
+// -----------------------------------------------------------------------------
+// Hover, definitions, references, rename
+// -----------------------------------------------------------------------------
+let mut root_mod: *mut ast.Module = @ptr_from_int(*mut ast.Module, 0);
+
+fn cursor() u32 {
+    return offset_in(root_mod.file.text, q_line, q_char);
+}
+
+fn cursor_ref() i64 {
+    return ref_at(root_mod.file.id, cursor());
+}
+
+fn q_hover() []u8 {
+    let i = cursor_ref();
+    if i < 0 {
+        return "null";
+    }
+    let r = refs.at(@int_cast(usize, i));
+    let mut b = u.Buf.init();
+    b.s("{\"contents\":{\"kind\":\"markdown\",\"value\":");
+    jstr(&mut b, describe(r));
+    b.s("},\"range\":");
+    jrange(&mut b, r.span);
+    b.c('}');
+    return b.done();
+}
+
+fn q_definition() []u8 {
+    let i = cursor_ref();
+    if i < 0 {
+        return "null";
+    }
+    let r = refs.at(@int_cast(usize, i));
+    let mut b = u.Buf.init();
+    if r.kind == R_ERROR {
+        let ds = error_defs(r.name);
+        b.c('[');
+        for j in 0..ds.len {
+            if j != 0 {
+                b.c(',');
+            }
+            jlocation(&mut b, ds.get(j));
+        }
+        b.c(']');
+        return b.done();
+    }
+    let w = def_of(r);
+    if not w.ok {
+        return "null";
+    }
+    jlocation(&mut b, w.span);
+    return b.done();
+}
+
+fn is_type_decl(d: *mut ast.Decl) bool {
+    return (d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) or (d.kind == ast.D_ENUM);
+}
+
+fn q_type_definition() []u8 {
+    let i = cursor_ref();
+    if i < 0 {
+        return "null";
+    }
+    let r = refs.at(@int_cast(usize, i));
+    let k = r.kind;
+    let mut t = r.ty;
+    if k == R_LOCAL {
+        t = r.local.ty;
+    } else if (k == R_DECL) and is_type_decl(r.decl) {
+        t = r.decl.ty;
+    } else if (k == R_DECL) and u.isnil(t) {
+        t = r.decl.ty;
+        if (r.decl.kind == ast.D_FN) or (r.decl.kind == ast.D_HOST_FN) {
+            t = r.decl.ret_type;
+        }
+    } else if (k == R_FIELD) and u.isnil(t) {
+        t = r.decl.fields.at(@int_cast(usize, r.index)).ty;
+    } else if k == R_VARIANT {
+        t = r.decl.ty;
+    }
+    while u.notnil(t) and
+          ((t.kind == ast.TY_PTR) or (t.kind == ast.TY_SLICE) or (t.kind == ast.TY_ARRAY) or
+           (t.kind == ast.TY_ERRUNION)) {
+        t = t.elem;
+    }
+    if not has_decl(t) or t.decl.anon {
+        return "null";
+    }
+    let mut b = u.Buf.init();
+    jlocation(&mut b, t.decl.name_span);
+    return b.done();
+}
+
+fn q_references() []u8 {
+    let i = cursor_ref();
+    if i < 0 {
+        return "null";
+    }
+    let r = refs.at(@int_cast(usize, i));
+    let mut b = u.Buf.init();
+    b.c('[');
+    let mut first = true;
+    for j in 0..refs.len {
+        let x = refs.at(j);
+        if not same_use(r, x) or (x.def and not q_include_decl) {
+            continue;
+        }
+        if not first {
+            b.c(',');
+        }
+        first = false;
+        jlocation(&mut b, x.span);
+    }
+    b.c(']');
+    return b.done();
+}
+
+fn q_highlight() []u8 {
+    let i = cursor_ref();
+    if i < 0 {
+        return "null";
+    }
+    let r = refs.at(@int_cast(usize, i));
+    let mut b = u.Buf.init();
+    b.c('[');
+    let mut first = true;
+    for j in 0..refs.len {
+        let x = refs.at(j);
+        if (x.span.file != root_mod.file.id) or not same_use(r, x) {
+            continue;
+        }
+        if not first {
+            b.c(',');
+        }
+        first = false;
+        b.s("{\"range\":");
+        jrange(&mut b, x.span);
+        b.s(u.pick(x.def, ",\"kind\":3}", ",\"kind\":2}"));
+    }
+    b.c(']');
+    return b.done();
+}
+
+fn is_reserved(s: []u8) bool {
+    for i in 0..@int_cast(usize, (lx.KW_WHILE - lx.KW_AND) + 1) {
+        if u.str_eq(lx.kw_name(i), s) {
+            return true;
+        }
+    }
+    for i in 0..@int_cast(usize, lx.PRIM_COUNT) {
+        if u.str_eq(lx.prim_name(i), s) {
+            return true;
+        }
+    }
+    return u.str_eq(s, "_");
+}
+
+fn valid_name(s: []u8) bool {
+    if (s.len == 0) or u.is_digit(s[0]) or is_reserved(s) {
+        return false;
+    }
+    for c in s {
+        if not is_ident_char(c) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn in_std(file: i32) bool {
+    let sr = u.real_path(g_std);
+    if u.isnos(sr) {
+        return false;
+    }
+    let p = u.file_of(file).path;
+    return (p.len > sr.len) and u.same_path(p[0..sr.len], sr);
+}
+
+fn q_rename() []u8 {
+    let i = cursor_ref();
+    if (i < 0) or not valid_name(q_new_name) {
+        return "null";
+    }
+    let r = refs.at(@int_cast(usize, i));
+    let w = def_of(r);
+    if (r.kind == R_BUILTIN) or not w.ok or in_std(w.span.file) or not u.str_eq(text_of(r.span), target_name(r)) {
+        return "null";
+    }
+    let mut b = u.Buf.init();
+    b.s("{\"changes\":{");
+    let mut cur_file: i32 = -1;
+    for j in 0..refs.len {
+        let x = refs.at(j);
+        if not same_use(r, x) {
+            continue;
+        }
+        if x.span.file != cur_file {
+            if cur_file >= 0 {
+                b.s("],");
+            }
+            cur_file = x.span.file;
+            jstr(&mut b, uri_of(u.file_of(cur_file).path));
+            b.s(":[");
+        } else {
+            b.c(',');
+        }
+        b.s("{\"range\":");
+        jrange(&mut b, x.span);
+        b.s(",\"newText\":");
+        jstr(&mut b, q_new_name);
+        b.c('}');
+    }
+    if cur_file >= 0 {
+        b.c(']');
+    }
+    b.s("}}");
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// The outline
+// -----------------------------------------------------------------------------
+// LSP SymbolKind
+const SK_MODULE: i32 = 2;
+const SK_METHOD: i32 = 6;
+const SK_FIELD: i32 = 8;
+const SK_ENUM: i32 = 10;
+const SK_FUNCTION: i32 = 12;
+const SK_VARIABLE: i32 = 13;
+const SK_CONSTANT: i32 = 14;
+const SK_ENUM_MEMBER: i32 = 22;
+const SK_STRUCT: i32 = 23;
+
+// Opens a symbol; the caller adds its children and closes it with "]}".
+fn sym_open(b: *mut u.Buf, name: []u8, detail: []u8, kind: i32, full: u.Span, sel0: u.Span) void {
+    let mut sel = sel0;
+    if (sel.file != full.file) or (sel.start < full.start) or (sel.end > full.end) {
+        sel = full;
+    }
+    b.s("{\"name\":");
+    jstr(b, name);
+    b.s(",\"detail\":");
+    jstr(b, detail);
+    b.s(u.f1(",\"kind\":%s,\"range\":", u.idec(kind)));
+    jrange(b, full);
+    b.s(",\"selectionRange\":");
+    jrange(b, sel);
+    b.s(",\"children\":[");
+}
+
+// A function's parameters and result, as written.
+fn fn_detail(d: *mut ast.Decl) []u8 {
+    if u.notnil(d.body) {
+        return trim(text_of(u.mkspan(d.span.file, d.name_span.end, d.body.span.start)));
+    }
+    return trim(text_of(u.mkspan(d.span.file, d.name_span.end, d.span.end)));
+}
+
+fn span_to(sp: u.Span, te: *mut ast.TypeExpr) u.Span {
+    if u.notnil(te) and (te.span.file == sp.file) and (te.span.end > sp.end) {
+        return u.mkspan(sp.file, sp.start, te.span.end);
+    }
+    return sp;
+}
+
+fn decl_symbol(b: *mut u.Buf, d: *mut ast.Decl) void {
+    let k = d.kind;
+    if k == ast.D_IMPORT {
+        sym_open(b, d.name, d.import_path, SK_MODULE, d.span, d.name_span);
+        b.s("]}");
+        return;
+    }
+    if k == ast.D_ERROR {
+        sym_open(b, "error", "", SK_ENUM, d.span, d.span);
+        for j in 0..d.error_names.len {
+            if j != 0 {
+                b.c(',');
+            }
+            let sp = d.error_spans.get(j);
+            sym_open(b, d.error_names.get(j), "", SK_ENUM_MEMBER, sp, sp);
+            b.s("]}");
+        }
+        b.s("]}");
+        return;
+    }
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        if d.is_test {
+            sym_open(b, u.f1("test \"%s\"", d.test_name), "", SK_FUNCTION, d.span, d.name_span);
+        } else if u.notnil(d.owner) {
+            sym_open(b, d.name, fn_detail(d), SK_METHOD, d.span, d.name_span);
+        } else {
+            sym_open(b, d.name, fn_detail(d), SK_FUNCTION, d.span, d.name_span);
+        }
+        b.s("]}");
+        return;
+    }
+    if k == ast.D_CONST {
+        sym_open(b, d.name, te_text(d.te), SK_CONSTANT, d.span, d.name_span);
+        b.s("]}");
+        return;
+    }
+    if k == ast.D_GLOBAL {
+        sym_open(b, d.name, te_text(d.te), SK_VARIABLE, d.span, d.name_span);
+        b.s("]}");
+        return;
+    }
+    let mut sk = SK_STRUCT;
+    if k != ast.D_STRUCT {
+        sk = SK_ENUM;
+    }
+    sym_open(b, d.name, "", sk, d.span, d.name_span);
+    let mut n: usize = 0;
+    for j in 0..d.fields.len {
+        let f = d.fields.at(j);
+        if n != 0 {
+            b.c(',');
+        }
+        sym_open(b, f.name, te_text(f.te), SK_FIELD, span_to(f.span, f.te), f.span);
+        b.s("]}");
+        n += 1;
+    }
+    for j in 0..d.variants.len {
+        let v = d.variants.at(j);
+        if n != 0 {
+            b.c(',');
+        }
+        let mut full = span_to(v.span, v.te);
+        if v.has_value {
+            full = u.span_join(v.span, v.value_span);
+        }
+        sym_open(b, v.name, te_text(v.te), SK_ENUM_MEMBER, full, v.span);
+        b.s("]}");
+        n += 1;
+    }
+    for j in 0..d.methods.len {
+        if n != 0 {
+            b.c(',');
+        }
+        decl_symbol(b, d.methods.get(j));
+        n += 1;
+    }
+    b.s("]}");
+}
+
+fn q_symbols() []u8 {
+    let m = root_mod;
+    let mut b = u.Buf.init();
+    b.c('[');
+    for i in 0..m.decls.len {
+        if i != 0 {
+            b.c(',');
+        }
+        decl_symbol(&mut b, m.decls.get(i));
+    }
+    b.c(']');
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Completion
+// -----------------------------------------------------------------------------
+// LSP CompletionItemKind
+const CK_METHOD: i32 = 2;
+const CK_FUNCTION: i32 = 3;
+const CK_FIELD: i32 = 5;
+const CK_VARIABLE: i32 = 6;
+const CK_MODULE: i32 = 9;
+const CK_ENUM: i32 = 13;
+const CK_KEYWORD: i32 = 14;
+const CK_ENUM_MEMBER: i32 = 20;
+const CK_CONSTANT: i32 = 21;
+const CK_STRUCT: i32 = 22;
+const CK_TYPE_PARAM: i32 = 25;
+
+const C_SCOPE: i32 = 0;    // names in scope
+const C_MEMBER: i32 = 1;   // after `x.`
+const C_BUILTIN: i32 = 2;  // after `@`
+const C_NONE: i32 = 3;
+
+// What is being completed, from the text before sema changes anything.
+let mut c_mode: i32 = 0;
+let mut c_off: u32 = 0;    // the cursor
+let mut c_start: u32 = 0;  // where the word being typed starts
+
+// A name that stands in for the one not typed yet after `x.`, so that
+// the member access parses (and sema says what x is).
+fn placeholder() []u8 {
+    return "__axiom_complete__";
+}
+
+// Items go in a JSON array that starts with '['.
+fn item(b: *mut u.Buf, label: []u8, kind: i32, detail: []u8, sort: []u8) void {
+    if b.len() > 1 {
+        b.c(',');
+    }
+    b.s("{\"label\":");
+    jstr(b, label);
+    b.s(u.f1(",\"kind\":%s", u.idec(kind)));
+    if detail.len > 0 {
+        b.s(",\"detail\":");
+        jstr(b, detail);
+    }
+    b.s(",\"sortText\":");
+    jstr(b, u.cat2(sort, label));
+    b.c('}');
+}
+
+fn decl_item(b: *mut u.Buf, d: *mut ast.Decl, sort: []u8) void {
+    let k = d.kind;
+    if (k == ast.D_IMPORT) or (k == ast.D_ERROR) or d.is_test or d.anon {
+        return;
+    }
+    if (k == ast.D_FN) or (k == ast.D_HOST_FN) {
+        if u.notnil(d.owner) {
+            item(b, d.name, CK_METHOD, fn_detail(d), sort);
+        } else {
+            item(b, d.name, CK_FUNCTION, fn_detail(d), sort);
+        }
+    } else if k == ast.D_STRUCT {
+        item(b, d.name, CK_STRUCT, "struct", sort);
+    } else if k == ast.D_UNION {
+        item(b, d.name, CK_ENUM, "union", sort);
+    } else if k == ast.D_ENUM {
+        item(b, d.name, CK_ENUM, "enum", sort);
+    } else if k == ast.D_CONST {
+        item(b, d.name, CK_CONSTANT, te_text(d.te), sort);
+    } else if k == ast.D_GLOBAL {
+        item(b, d.name, CK_VARIABLE, te_text(d.te), sort);
+    }
+}
+
+fn module_items(b: *mut u.Buf, m: *mut ast.Module, sort: []u8) void {
+    let pub_only = m != root_mod;
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if pub_only and not d.is_pub {
+            continue;
+        }
+        decl_item(b, d, sort);
+    }
+}
+
+fn method_items(b: *mut u.Buf, d: *mut ast.Decl, values_only: bool) void {
+    for i in 0..d.methods.len {
+        let m = d.methods.get(i);
+        if (d.module != root_mod) and not m.is_pub {
+            continue;
+        }
+        if values_only and (m.self_kind == ast.SELF_NONE) {
+            continue;
+        }
+        decl_item(b, m, "1");
+    }
+}
+
+fn member_items(b: *mut u.Buf, e: *mut ast.Expr) void {
+    let a = e.a;
+    if u.isnil(a) {
+        return;
+    }
+    if a.cat == ast.CAT_MODULE {
+        if u.notnil(a.module) {
+            module_items(b, a.module, "1");
+        }
+        return;
+    }
+    if (a.cat == ast.CAT_TYPE) or (a.cat == ast.CAT_GENERIC) {
+        let mut d = u.nil.[ast.Decl]();
+        if (a.cat == ast.CAT_TYPE) and has_decl(a.tval) {
+            d = a.tval.decl;
+        } else if a.cat == ast.CAT_GENERIC {
+            d = a.decl;
+        }
+        if u.isnil(d) {
+            return;
+        }
+        for i in 0..d.variants.len {
+            let v = d.variants.at(i);
+            item(b, v.name, CK_ENUM_MEMBER, te_text(v.te), "0");
+        }
+        method_items(b, d, false);
+        return;
+    }
+    let t = aggregate(a.ty);
+    if u.isnil(t) {
+        return;
+    }
+    if has_decl(t) {
+        if t.kind == ast.TY_STRUCT {
+            for i in 0..t.decl.fields.len {
+                item(b, t.decl.fields.at(i).name, CK_FIELD, tname(ty.type_field(t, i)), "0");
+            }
+        }
+        method_items(b, t.decl, true);
+        return;
+    }
+    if t.kind == ast.TY_SLICE {
+        item(b, "len", CK_FIELD, "usize", "0");
+        item(b, "ptr", CK_FIELD, tname(ty.type_ptr(t.elem, t.is_mut)), "0");
+    } else if t.kind == ast.TY_ARRAY {
+        item(b, "len", CK_FIELD, "usize", "0");
+    }
+}
+
+// Locals in scope at the cursor.
+let mut in_scope: u.List.[*mut ast.Local] = u.List.[*mut ast.Local].{
+    data: @ptr_from_int(*mut *mut ast.Local, 0),
+    len: 0,
+    cap: 0,
+};
+
+fn sc_add(l: *mut ast.Local) void {
+    if u.notnil(l) {
+        in_scope.push(l);
+    }
+}
+
+fn sc_expr(e: *mut ast.Expr, off: u32) void {
+    if u.isnil(e) or not contains(e.span, off) {
+        return;
+    }
+    if e.kind == ast.E_CATCH {
+        if u.notnil(e.hblock) and contains(e.hblock.span, off) {
+            sc_add(e.capture_local);
+            sc_stmt(e.hblock, off);
+            return;
+        }
+        if u.notnil(e.hexpr) and contains(e.hexpr.span, off) {
+            sc_add(e.capture_local);
+            sc_expr(e.hexpr, off);
+            return;
+        }
+    }
+    sc_expr(e.a, off);
+    sc_expr(e.b, off);
+    sc_expr(e.c, off);
+    for i in 0..e.args.len {
+        sc_expr(e.args.get(i), off);
+    }
+    for i in 0..e.inits.len {
+        sc_expr(e.inits.at(i).value, off);
+    }
+}
+
+fn sc_stmt(s: *mut ast.Stmt, off: u32) void {
+    if u.isnil(s) {
+        return;
+    }
+    let k = s.kind;
+    if k == ast.S_BLOCK {
+        for i in 0..s.stmts.len {
+            let st = s.stmts.get(i);
+            if st.span.end <= off {
+                if st.kind == ast.S_LET {
+                    sc_add(st.local);
+                }
+            } else if st.span.start <= off {
+                sc_stmt(st, off);
+            }
+        }
+        return;
+    }
+    if k == ast.S_MATCH {
+        for i in 0..s.arms.len {
+            let a = s.arms.at(i);
+            if u.notnil(a.body) and contains(a.body.span, off) {
+                sc_add(a.bind_local);
+                sc_stmt(a.body, off);
+                return;
+            }
+        }
+        sc_expr(s.e, off);
+        return;
+    }
+    if u.notnil(s.body) and contains(s.body.span, off) {
+        if k == ast.S_FOR {
+            sc_add(s.local);
+        }
+        sc_stmt(s.body, off);
+        return;
+    }
+    if u.notnil(s.els) and contains(s.els.span, off) {
+        sc_stmt(s.els, off);
+        return;
+    }
+    sc_expr(s.e, off);
+    sc_expr(s.e2, off);
+    sc_expr(s.e3, off);
+}
+
+fn enclosing_fn(off: u32) *mut ast.Decl {
+    for i in 0..root_mod.decls.len {
+        let d = root_mod.decls.get(i);
+        if not contains(d.span, off) {
+            continue;
+        }
+        if d.kind == ast.D_FN {
+            return d;
+        }
+        for j in 0..d.methods.len {
+            let m = d.methods.get(j);
+            if contains(m.span, off) {
+                return m;
+            }
+        }
+    }
+    return u.nil.[ast.Decl]();
+}
+
+fn gparam_items(b: *mut u.Buf, d: *mut ast.Decl) void {
+    if u.isnil(d) {
+        return;
+    }
+    for i in 0..d.gparams.len {
+        item(b, d.gparams.at(i).name, CK_TYPE_PARAM, "generic parameter", "0");
+    }
+}
+
+fn scope_items(b: *mut u.Buf, off: u32) void {
+    let f = enclosing_fn(off);
+    if u.notnil(f) {
+        for i in 0..f.params.len {
+            let p = f.params.at(i);
+            if u.notnil(p.local) {
+                item(b, p.name, CK_VARIABLE, tname(p.local.ty), "0");
+            }
+        }
+        sc_stmt(f.body, off);
+        for i in 0..in_scope.len {
+            let l = in_scope.get(i);
+            item(b, l.name, CK_VARIABLE, tname(l.ty), "0");
+        }
+        gparam_items(b, f);
+        gparam_items(b, f.owner);
+        if u.notnil(f.owner) {
+            item(b, "Self", CK_STRUCT, f.owner.name, "1");
+        }
+    }
+    module_items(b, root_mod, "1");
+    for i in 0..root_mod.decls.len {
+        let d = root_mod.decls.get(i);
+        if d.kind == ast.D_IMPORT {
+            item(b, d.name, CK_MODULE, d.import_path, "1");
+        }
+    }
+    for i in 0..@int_cast(usize, (lx.KW_WHILE - lx.KW_AND) + 1) {
+        item(b, lx.kw_name(i), CK_KEYWORD, "", "2");
+    }
+    for i in 0..@int_cast(usize, lx.PRIM_COUNT) {
+        item(b, lx.prim_name(i), CK_KEYWORD, "type", "2");
+    }
+}
+
+fn builtin_items() []u8 {
+    let mut b = u.Buf.init();
+    b.c('[');
+    for i in 0..ast.BI_COUNT {
+        item(&mut b, u.cat2("@", ast.builtin_name(i)), CK_FUNCTION, builtin_label(i), "0");
+    }
+    b.c(']');
+    return b.done();
+}
+
+fn set_overlay(path: []u8, text: []u8) void {
+    for i in 0..u.g_overlays.len {
+        let o = u.g_overlays.at(i);
+        if u.same_path(o.path, path) {
+            let t = u.alloc(text.len + 1);
+            @mem_copy(@slice_from_ptr(t, text.len), text);
+            o.text = @slice_from_ptr(t, text.len);
+            return;
+        }
+    }
+    u.add_overlay(path, text);
+}
+
+// Decides what kind of completion this is, before the program is loaded;
+// after `x.` with nothing typed yet, puts a name there.
+fn prepare_completion(path: []u8) void {
+    c_mode = C_NONE;
+    let mut text = u.overlay_text(path);
+    if u.isnos(text) {
+        text = u.read_file(path);
+    }
+    if u.isnos(text) {
+        return;
+    }
+    let off = offset_in(text, q_line, q_char);
+    let mut s = @as(usize, off);
+    while (s > 0) and is_ident_char(text[s - 1]) {
+        s -= 1;
+    }
+    c_off = off;
+    c_start = @int_cast(u32, s);
+    if (s < @as(usize, off)) and u.is_digit(text[s]) {
+        return;
+    }
+    if (s > 0) and (text[s - 1] == '@') {
+        c_mode = C_BUILTIN;
+        return;
+    }
+    if (s > 0) and (text[s - 1] == '.') {
+        if (s >= 2) and ((text[s - 2] == '.') or is_space(text[s - 2])) {
+            return;
+        }
+        c_mode = C_MEMBER;
+        if s == @as(usize, off) {
+            let o = @as(usize, off);
+            set_overlay(path, u.cat3(text[0..o], placeholder(), text[o..]));
+        }
+        return;
+    }
+    c_mode = C_SCOPE;
+}
+
+fn q_completion() []u8 {
+    let mut b = u.Buf.init();
+    b.c('[');
+    if c_mode == C_MEMBER {
+        if u.notnil(found_field) {
+            member_items(&mut b, found_field);
+        } else if u.notnil(found_te) {
+            let imp = root_mod.imports.get(found_te.qual);
+            if u.notnil(imp) and u.notnil(imp.imported) {
+                module_items(&mut b, imp.imported, "1");
+            }
+        } else if found_error {
+            let names = &sema.g_prog.error_names;
+            for i in 0..names.len {
+                item(&mut b, names.get(i), CK_CONSTANT, "error", "0");
+            }
+        }
+    } else if c_mode == C_SCOPE {
+        scope_items(&mut b, c_off);
+    }
+    b.c(']');
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Signature help
+// -----------------------------------------------------------------------------
+let mut sig_commas: i64 = 0;
+
+// The '(' of the call whose arguments the cursor is in (counting the
+// commas before the cursor), or -1.
+fn open_paren(t: []u8, off: u32) i64 {
+    let mut depth: i64 = 0;
+    let mut commas: i64 = 0;
+    let mut i = @as(usize, off);
+    while i > 0 {
+        i -= 1;
+        let c = t[i];
+        if c == '"' {
+            // back over a string literal
+            while i > 0 {
+                i -= 1;
+                if (t[i] == '"') and ((i == 0) or (t[i - 1] != '\\')) {
+                    break;
+                }
+                if t[i] == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if (c == ')') or (c == ']') or (c == '}') {
+            depth += 1;
+        } else if (c == '(') or (c == '[') or (c == '{') {
+            if depth == 0 {
+                if c == '(' {
+                    sig_commas = commas;
+                    return @int_cast(i64, i);
+                }
+                return -1;
+            }
+            depth -= 1;
+        } else if (c == ',') and (depth == 0) {
+            commas += 1;
+        } else if (c == ';') and (depth == 0) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+fn q_signature() []u8 {
+    if u.isnil(found_call) {
+        return "null";
+    }
+    let e = found_call;
+    let mut label: []u8 = "";
+    let mut params = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    let mut doc: []u8 = "";
+    let mut active = sig_commas;
+    if e.kind == ast.E_BUILTIN {
+        if e.index < 0 {
+            return "null";
+        }
+        label = builtin_label(e.index);
+        params = builtin_params(e.index);
+    } else {
+        let c = e.a;
+        let d = c.decl;
+        if u.notnil(d) and ((d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN)) {
+            let mut b = u.Buf.init();
+            b.s(u.f1("fn %s(", d.name));
+            for i in 0..d.params.len {
+                let p = d.params.at(i);
+                let pl = u.f2("%s: %s", p.name, te_text(p.te));
+                if i != 0 {
+                    b.s(", ");
+                }
+                b.s(pl);
+                params.push(pl);
+            }
+            if d.variadic {
+                b.s(", ...");
+            }
+            b.s(") ");
+            b.s(te_text(d.ret_te));
+            label = b.done();
+            doc = doc_comment(d.span.file, d.span.start);
+            if (c.cat == ast.CAT_METHOD) and (d.self_kind != ast.SELF_NONE) {
+                active += 1;  // the receiver is the first parameter
+            }
+        } else if (c.cat == ast.CAT_VARIANT) and has_decl(c.tval) and (c.index >= 0) {
+            let v = c.tval.decl.variants.at(@int_cast(usize, c.index));
+            label = u.f3("%s.%s(%s)", c.tval.decl.name, v.name, te_text(v.te));
+            params.push(te_text(v.te));
+        } else if u.notnil(c.ty) and (c.ty.kind == ast.TY_FN) {
+            label = tname(c.ty);
+            for i in 0..c.ty.params.len {
+                params.push(tname(c.ty.params[i]));
+            }
+        } else {
+            return "null";
+        }
+    }
+    let mut b = u.Buf.init();
+    b.s("{\"signatures\":[{\"label\":");
+    jstr(&mut b, label);
+    if doc.len > 0 {
+        b.s(",\"documentation\":{\"kind\":\"markdown\",\"value\":");
+        jstr(&mut b, doc);
+        b.c('}');
+    }
+    b.s(",\"parameters\":[");
+    for i in 0..params.len {
+        if i != 0 {
+            b.c(',');
+        }
+        b.s("{\"label\":");
+        jstr(&mut b, params.get(i));
+        b.c('}');
+    }
+    b.s(u.f1("]}],\"activeSignature\":0,\"activeParameter\":%s}", u.dec(active)));
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Diagnostics
+// -----------------------------------------------------------------------------
+fn severity(s: i32) i32 {
+    if s == dg.SEV_ERROR {
+        return 1;
+    }
+    if s == dg.SEV_WARNING {
+        return 2;
+    }
+    return 3;
+}
+
+fn jdiag(b: *mut u.Buf, d: *mut dg.Diag, sp: u.Span, prefix: []u8) void {
+    b.s("{\"range\":");
+    jrange(b, sp);
+    b.s(u.f1(",\"severity\":%s,\"code\":", u.idec(severity(d.severity))));
+    jstr(b, d.code);
+    b.s(",\"source\":\"axiom\",\"message\":");
+    let mut msg = u.cat2(prefix, d.msg);
+    if not u.isnos(d.expected) and not u.isnos(d.found) and not has_sub(msg, d.found) {
+        msg = u.f3("%s\nexpected %s, found %s", msg, d.expected, d.found);
+    }
+    jstr(b, msg);
+    if (d.notes.len > 0) and (prefix.len == 0) {
+        b.s(",\"relatedInformation\":[");
+        for i in 0..d.notes.len {
+            let n = d.notes.at(i);
+            if i != 0 {
+                b.c(',');
+            }
+            b.s("{\"location\":");
+            jlocation(b, n.span);
+            b.s(",\"message\":");
+            jstr(b, n.msg);
+            b.c('}');
+        }
+        b.c(']');
+    }
+    b.c('}');
+}
+
+// The file's own diagnostics, and the first error in each module it
+// imports (on the import).
+fn q_diagnostics() []u8 {
+    let fid = root_mod.file.id;
+    let mut b = u.Buf.init();
+    b.c('[');
+    let mut done = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+    let ds = dg.all();
+    for d in ds {
+        let sp = d.span;
+        if sp.file == fid {
+            if b.len() > 1 {
+                b.c(',');
+            }
+            jdiag(&mut b, d, sp, "");
+            continue;
+        }
+        if d.severity != dg.SEV_ERROR {
+            continue;
+        }
+        let mut seen = false;
+        for i in 0..done.len {
+            if done.get(i) == sp.file {
+                seen = true;
+            }
+        }
+        if seen {
+            continue;
+        }
+        for i in 0..root_mod.decls.len {
+            let imp = root_mod.decls.get(i);
+            if (imp.kind == ast.D_IMPORT) and u.notnil(imp.imported) and (imp.imported.file.id == sp.file) {
+                if b.len() > 1 {
+                    b.c(',');
+                }
+                let lc = u.span_linecol(sp);
+                jdiag(&mut b, d, imp.import_path_span, u.f2("%s:%s: ", u.file_of(sp.file).display, u.idec(lc.sl)));
+                done.push(sp.file);
+                break;
+            }
+        }
+    }
+    b.c(']');
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Formatting
+// -----------------------------------------------------------------------------
+fn q_format(path: []u8) []u8 {
+    let mut text = u.overlay_text(path);
+    if u.isnos(text) {
+        text = u.read_file(path);
+    }
+    if u.isnos(text) {
+        return "null";
+    }
+    let r = fmt.format_text(path, text, g_std);
+    if r.status != fmt.FMT_CHANGED {
+        return "[]";
+    }
+    // the end of the old text
+    let mut line: i64 = 0;
+    let mut ch: i64 = 0;
+    for c in text {
+        if c == '\n' {
+            line += 1;
+            ch = 0;
+        } else if not is_cont(c) {
+            ch += units(c);
+        }
+    }
+    let mut b = u.Buf.init();
+    b.s("[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":");
+    jpos(&mut b, Pos.{ line: line, ch: ch });
+    b.s("},\"newText\":");
+    jstr(&mut b, r.text);
+    b.s("}]");
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// The driver
+// -----------------------------------------------------------------------------
+// References and renames look at the other files of the package (or, for a
+// file outside a package, of its directory) too, since they may use it.
+fn add_neighbours(path: []u8, out: *mut u.List.[[]u8]) void {
+    let p = pkg.for_file(path);
+    if u.notnil(p) {
+        pkg.source_files(p, out);
+        return;
+    }
+    let slash = u.rfind(path, '/');
+    if slash < 0 {
+        return;
+    }
+    let dir = path[0..@int_cast(usize, slash)];
+    let mut names = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    if not u.list_dir(dir, &mut names) {
+        return;
+    }
+    for i in 0..names.len {
+        let nm = names.get(i);
+        if u.ends(nm, ".ax") and (out.len < 200) {
+            out.push(u.cat3(dir, "/", nm));
+        }
+    }
+}
+
+// Answers q_query about the program rooted at `input`.
+pub fn run(input: []u8, std_dir: []u8) i32 {
+    g_std = std_dir;
+    read_overlays();
+    let q = q_query;
+    let mut path = u.real_path(input);
+    if u.isnos(path) {
+        path = input;
+    }
+    if u.str_eq(q, "formatting") {
+        u.print(q_format(path));
+        return 0;
+    }
+    let whole = u.str_eq(q, "references") or u.str_eq(q, "rename");
+    let mut extras = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
+    if whole {
+        add_neighbours(path, &mut extras);
+    }
+    if u.str_eq(q, "completion") {
+        prepare_completion(path);
+        if c_mode == C_BUILTIN {
+            u.print(builtin_items());
+            return 0;
+        }
+        if c_mode == C_NONE {
+            u.print("[]");
+            return 0;
+        }
+    }
+    let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: extras.items() };
+    _ = sema.run(input, &so);
+    root_mod = sema.g_prog.root;
+    if u.isnil(root_mod) {
+        u.print(u.pick(u.str_eq(q, "diagnostics") or u.str_eq(q, "completion"), "[]", "null"));
+        return 0;
+    }
+    if u.str_eq(q, "diagnostics") {
+        u.print(q_diagnostics());
+        return 0;
+    }
+    find_file = root_mod.file.id;
+    if u.str_eq(q, "completion") {
+        find_off = @as(i64, c_start);
+    }
+    if u.str_eq(q, "signatureHelp") {
+        call_off = open_paren(root_mod.file.text, cursor());
+    }
+    if whole {
+        let ms = &sema.g_prog.modules;
+        for i in 0..ms.len {
+            walk_module(ms.get(i));
+        }
+    } else {
+        walk_module(root_mod);
+    }
+    sort_refs();
+    let mut out: []u8 = "null";
+    if u.str_eq(q, "hover") {
+        out = q_hover();
+    } else if u.str_eq(q, "definition") {
+        out = q_definition();
+    } else if u.str_eq(q, "typeDefinition") {
+        out = q_type_definition();
+    } else if u.str_eq(q, "references") {
+        out = q_references();
+    } else if u.str_eq(q, "documentHighlight") {
+        out = q_highlight();
+    } else if u.str_eq(q, "rename") {
+        out = q_rename();
+    } else if u.str_eq(q, "documentSymbol") {
+        out = q_symbols();
+    } else if u.str_eq(q, "completion") {
+        out = q_completion();
+    } else if u.str_eq(q, "signatureHelp") {
+        out = q_signature();
+    } else {
+        u.eprint(u.f1("axiom ide: unknown query '%s'\n", q));
+        return 2;
+    }
+    u.print(out);
+    return 0;
+}

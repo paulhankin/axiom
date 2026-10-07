@@ -256,8 +256,10 @@ types share a module.
 | `codegen.ax` | `codegen.c` | IR generation (see above), monomorphization, traps, shadow stack |
 | `header.ax` | `header.c` | C headers for `export fn`s |
 | `units.ax` | `units.c` | separate compilation and the object cache |
-| `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`; linking |
+| `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`; linking |
 | `fmt.ax` | | `axiom fmt`: canonical layout from the token stream, imports tidied |
+| `ide.ax` | | `axiom ide`: answers an editor's questions (diagnostics, hover, definitions, references, rename, completion, signatures, outline, formatting) from the checked tree, with unsaved buffers on stdin |
+| `lsp.ax` | | `axiom lsp`: the Language Server Protocol over stdio, one `axiom ide` process per request (VS Code client in [`editors/vscode`](../editors/vscode/README.md)) |
 
 ## How C idioms map to Axiom
 
