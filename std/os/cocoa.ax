@@ -24,6 +24,7 @@
 // =============================================================================
 
 import "objc.ax" as objc;
+import "../mem.ax" as mem;
 
 error { Unsupported, Failed }
 
@@ -43,6 +44,7 @@ pub enum EventKind: u8 {
     MOUSE_DOWN,  // button: 0 left, 1 right, 2 middle
     MOUSE_UP,
     MOUSE_WHEEL,  // delta: + away from the user, 120 per notch
+    MENU,  // key: the id of the menu item chosen (add_item)
 }
 
 pub struct Event {
@@ -124,6 +126,24 @@ struct State {
 
 let mut states: [16]State = [State.{ win: 0, closing: false, resized: false }; 16];
 let mut app: usize = 0;  // NSApp, once set up
+let mut app_menu: usize = 0;   // the app's menu (About and Quit), once set up
+let mut app_items: usize = 0;  // the items added to it (before Quit)
+
+// The menus added (add_menu), the target of their items, and the ids of
+// the items chosen, waiting for next_event.
+let mut menus: [16]usize = [0; 16];
+let mut nmenus: usize = 0;
+let mut menu_target: usize = 0;
+let mut chosen: [32]u32 = [0; 32];
+let mut nchosen: usize = 0;
+
+// The menu items' action: the item's tag is its id.
+fn menu_item_chosen(self: usize, cmd: usize, sender: usize) void {
+    if nchosen < chosen.len {
+        chosen[nchosen] = @truncate(u32, objc.call(sender, "tag"));
+        nchosen += 1;
+    }
+}
 let mut delegate_class: usize = 0;
 
 fn state_of(w: usize) *mut State {
@@ -176,7 +196,7 @@ fn setup() !void {
     objc.release(quit);
     _ = objc.call1(item, "setSubmenu:", menu);
     _ = objc.call1(a, "setMainMenu:", bar);
-    objc.release(menu);
+    app_menu = menu;
     objc.release(item);
     objc.release(bar);
     _ = objc.call(a, "finishLaunching");
@@ -192,7 +212,126 @@ fn setup() !void {
         _ = objc.add_method(delegate_class, "windowDidChangeBackingProperties:", @bit_cast(usize, did_resize), "v@:@");
         objc.register_class(delegate_class);
     }
+    // the menu items' target
+    let tc = objc.class("AxiomMenuTarget");
+    let mut target_class = tc;
+    if tc == 0 {
+        target_class = objc.define_class("AxiomMenuTarget", "NSObject");
+        if target_class == 0 {
+            return error.Failed;
+        }
+        _ = objc.add_method(target_class, "menuItem:", @bit_cast(usize, menu_item_chosen), "v@:@");
+        objc.register_class(target_class);
+    }
+    menu_target = objc.new("AxiomMenuTarget");
     app = a;
+}
+
+// --- menus -----------------------------------------------------------------------
+
+/// The app's own menu (the one named after it, holding Quit), as add_item
+/// takes it: items added to it go before Quit.
+pub const APP_MENU: u32 = 0;
+
+/// Adds a menu called `title` to the menu bar: its number, for add_item.
+pub fn add_menu(title: []u8) !u32 {
+    setup()!;
+    if nmenus >= menus.len {
+        return error.Failed;
+    }
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    let bar = objc.call(app, "mainMenu");
+    let item = objc.new("NSMenuItem");
+    let menu = objc.call1(objc.alloc("NSMenu"), "initWithTitle:", objc.string(title));
+    _ = objc.call1(item, "setSubmenu:", menu);
+    _ = objc.call1(bar, "addItem:", item);
+    objc.release(item);
+    menus[nmenus] = menu;
+    nmenus += 1;
+    return @truncate(u32, nmenus);
+}
+
+fn menu_of(menu: u32) usize {
+    if menu == APP_MENU {
+        return app_menu;
+    }
+    if (menu > 0) and (@as(usize, menu) <= nmenus) {
+        return menus[@as(usize, menu) - 1];
+    }
+    return 0;
+}
+
+// Puts `item` in `menu`: in the app's menu, before Quit (and what was
+// added before).
+fn put_item(menu: u32, item: usize) void {
+    let m = menu_of(menu);
+    if m == 0 {
+        return;
+    }
+    if menu == APP_MENU {
+        _ = objc.send2(m, objc.sel("insertItem:atIndex:"), item, app_items);
+        app_items += 1;
+    } else {
+        _ = objc.call1(m, "addItem:", item);
+    }
+}
+
+/// Adds an item `title` to `menu` (add_menu's number, or APP_MENU), which,
+/// chosen, comes from next_event as a MENU event with key `id`; `key` is
+/// its shortcut with Command ("o", ","; "" for none).
+pub fn add_item(menu: u32, title: []u8, id: u32, key: []u8) !void {
+    setup()!;
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    let item = objc.send3(objc.alloc("NSMenuItem"), objc.sel("initWithTitle:action:keyEquivalent:"), objc.string(title),
+                          objc.sel("menuItem:"), objc.string(key));
+    _ = objc.call1(item, "setTarget:", menu_target);
+    _ = objc.call1(item, "setTag:", @as(usize, id));
+    put_item(menu, item);
+    objc.release(item);
+}
+
+/// A line between items of `menu`.
+pub fn add_separator(menu: u32) !void {
+    setup()!;
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    put_item(menu, objc.call(objc.class("NSMenuItem"), "separatorItem"));
+}
+
+/// Asks for a file to open in a standard dialog titled `title`, of the
+/// types `exts` ("mat"; none: any): its path, empty if none was chosen.
+/// The caller frees it.
+pub fn open_file(title: []u8, exts: [][]u8) ![]mut u8 {
+    setup()!;
+    let pool = objc.pool_push();
+    defer objc.pool_pop(pool);
+    let panel = objc.call(objc.class("NSOpenPanel"), "openPanel");
+    _ = objc.call1(panel, "setMessage:", objc.string(title));
+    _ = objc.send_b(panel, objc.sel("setCanChooseFiles:"), true);
+    _ = objc.send_b(panel, objc.sel("setCanChooseDirectories:"), false);
+    _ = objc.send_b(panel, objc.sel("setAllowsMultipleSelection:"), false);
+    if exts.len > 0 {
+        let types = objc.call(objc.class("NSMutableArray"), "array");
+        for x in exts {
+            _ = objc.call1(types, "addObject:", objc.string(x));
+        }
+        _ = objc.call1(panel, "setAllowedFileTypes:", types);
+    }
+    let mut out = mem.alloc.[u8](0)!;
+    if objc.call(panel, "runModal") == 1 {  // NSModalResponseOK
+        let url = objc.call(objc.call(panel, "URLs"), "firstObject");
+        if url != 0 {
+            let path = objc.string_of(objc.call(url, "path"));
+            mem.free(out);
+            out = mem.alloc.[u8](path.len)!;
+            for k in 0..path.len {
+                out[k] = path[k];
+            }
+        }
+    }
+    return out;
 }
 
 pub struct Window {
@@ -291,6 +430,15 @@ pub struct Window {
         let mut e = Event.{ kind: EventKind.NONE, key: 0, x: 0, y: 0, button: 0, delta: 0, width: 0, height: 0 };
         let st = state_of(self.win);
         loop {
+            if nchosen > 0 {
+                e.kind = EventKind.MENU;
+                e.key = chosen[0];
+                for k in 1..nchosen {
+                    chosen[k - 1] = chosen[k];
+                }
+                nchosen -= 1;
+                return e;
+            }
             if @int_from_ptr(st) != 0 {
                 if st.closing {
                     st.closing = false;
