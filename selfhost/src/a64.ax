@@ -729,6 +729,13 @@ fn zext_clean(v: *ir.Value, bits: i32) bool {
     if (o == ir.OP_EXTRACTELEM) and (v.ty.bits <= bits) {
         return true;  // (umov)
     }
+    if (o == ir.OP_INTR) and (v.xs.len == 2) and (v.ty.bits == bits) and (bits < 64) {
+        let id = @truncate(i32, @bit_cast(i64, v.cv));
+        if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            // (a csel of the operands as extended: reg_ext extends them, constants included)
+            return true;
+        }
+    }
     if (bits == 32) and (v.ty.bits == 32) {
         return ((o >= ir.OP_ADD) and (o <= ir.OP_ASHR)) or (o == ir.OP_SELECT) or (o == ir.OP_ZEXT) or
                (o == ir.OP_SEXT) or (o == ir.OP_FPTOSI_SAT) or (o == ir.OP_FPTOUI_SAT);
@@ -738,8 +745,19 @@ fn zext_clean(v: *ir.Value, bits: i32) bool {
 
 // A register with v extended to 32 bits (narrow) or v itself.
 fn reg_ext(v: *mut ir.Value, sign: bool) i32 {
-    let r = reg(v);
     let b = v.ty.bits;
+    if (v.kind == ir.V_CINT) and (v.ty.kind == ir.T_INT) and (b < 32) and (b > 1) {
+        // a constant extended here rather than by an instruction
+        let m = (@as(i64, 1) << @int_cast(u32, b)) - 1;
+        let mut x = cval(v) & m;
+        if sign and ((x >> @int_cast(u32, b - 1)) != 0) {
+            x = x - (m + 1);
+        }
+        let c = vgpr();
+        movi(c, x & 0xffff_ffff, 0);
+        return c;
+    }
+    let r = reg(v);
     if not sign and zext_clean(v, b) {
         return r;
     }
@@ -899,8 +917,12 @@ fn fty(t: *ir.Ty) u64 {
 fn float_compare(v: *mut ir.Value) i32 {
     let p = @truncate(i32, @bit_cast(i64, v.cv));
     let a = reg(v.a);
-    let b = reg(v.b);
-    _ = raw(ae.fcmp(fty(v.a.ty), 0, 0), NONE(), R(a), R(b), NONE());
+    if ((v.b.kind == ir.V_CFP) or (v.b.kind == ir.V_ZERO)) and ir.is_zero(v.b) {
+        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0) | 8, NONE(), R(a), NONE(), NONE());  // fcmp a, #0.0
+    } else {
+        let b = reg(v.b);
+        _ = raw(ae.fcmp(fty(v.a.ty), 0, 0), NONE(), R(a), R(b), NONE());
+    }
     if p == ir.RealOEQ {
         return EQ;
     }
@@ -1335,8 +1357,9 @@ fn gen_store(v: *mut ir.Value) void {
     if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) {
         let b = base_reg(m);
         let r = reg(x);
+        // STLR alone: with LDAR for atomic loads and the *AL read-modify-writes, it is
+        // sequentially consistent (the ARMv8 mapping of C++'s seq_cst store).
         _ = raw(ae.stlr(size_code(mem_size(t)), 0, 0), R(r), R(b), NONE(), NONE());
-        raw_none(ae.DMB_ISH);
         return;
     }
     if k == ir.T_VEC {
@@ -2469,7 +2492,20 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
             _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 1), W(d), R(l0), R(l1), NONE());
             return;
         }
-        if is_inst(a0, ir.OP_ICMP) or is_inst(a0, ir.OP_FCMP) {
+        let mut inverted = false;
+        if (is_inst(a0, ir.OP_ICMP) and (@truncate(i32, @bit_cast(i64, a0.cv)) == ir.IntNE)) or
+           (is_inst(a0, ir.OP_FCMP) and (@truncate(i32, @bit_cast(i64, a0.cv)) == ir.RealUNE)) {
+            // x != y: the equal lanes, cleared from the weights below (BIC) rather than
+            // inverted first (the compare's own instructions are left dead)
+            let ea = reg(a0.a);
+            let eb = reg(a0.b);
+            if is_inst(a0, ir.OP_ICMP) {
+                raw3(ae.v3(1, 1, k, 0x11, 0, 0, 0), bitv, ea, eb);  // cmeq
+            } else {
+                raw3(ae.v3(1, 0, fsz(a0.a.ty), 0x1c, 0, 0, 0), bitv, ea, eb);  // fcmeq
+            }
+            inverted = true;
+        } else if is_inst(a0, ir.OP_ICMP) or is_inst(a0, ir.OP_FCMP) {
             copy(bitv, a, VR);  // (a compare's lanes are all ones or zeros already)
         } else {
             raw2(ae.vshift(1, 0, 0, esize, false, esize - 1, 0, 0), bitv, a);  // sshr: top bits as all ones
@@ -2488,8 +2524,22 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         }
         let wv = vconst(wl, wh);
         let m = vvr();
-        raw3(ae.v3(1, 0, 0, 3, 0, 0, 0), m, bitv, wv);  // and
+        if inverted {
+            raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), m, wv, bitv);  // bic: weights of the lanes not equal
+        } else {
+            raw3(ae.v3(1, 0, 0, 3, 0, 0, 0), m, bitv, wv);  // and
+        }
         let s = vvr();
+        if k == 0 {
+            // the high half's bytes interleaved with the low half's, summed as halfwords
+            let hi = vvr();
+            raw3(0x6E00_4000, hi, m, m);  // ext hi.16b, m, m, #8
+            let z = vvr();
+            raw3(0x4E00_3800, z, m, hi);                  // zip1 z.16b, m, hi
+            raw2(ae.vacross(1, 0, 1, 0x1b, 0, 0), s, z);  // addv h
+            raw2(ae.umov(1, 0, 0, 0), d, s);
+            return;
+        }
         if k == 0 {
             // two halves of 8 bytes
             raw2(ae.vacross(0, 0, 0, 0x1b, 0, 0), s, m);
@@ -2918,7 +2968,9 @@ fn prepare(f: *mut ir.Func) void {
                                   (((i.op == ir.OP_RMW) or (i.op == ir.OP_CMPXCHG)) and (k == 0));
                     // There is no [base + index + disp]: a register offset under further
                     // pointer arithmetic is added once, into a register its users share.
-                    let indexed_base = (i.op == ir.OP_PTRADD) and (k == 0) and not is_c(o.b);
+                    // (and a constant offset under a register one, which needs its base in a
+                    // register: built once rather than at every use)
+                    let indexed_base = (i.op == ir.OP_PTRADD) and (k == 0) and (not is_c(o.b) or not is_c(i.b));
                     if not is_addr or indexed_base {
                         o.flag = o.flag & ~1;
                     }
