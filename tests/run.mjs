@@ -811,7 +811,10 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
       return j.status === 'pass' && names(j) === 'add' ? null : JSON.stringify(j);
     },
     'the solver example (examples/solver)': async () => {
-      const j = tested(path.join(root, 'examples/solver'));
+      // a native program: always tested natively, whatever the suite's target
+      const c = ph(['test', path.join(root, 'examples/solver'), '--format=agent-json', nativeTarget, '-O2']);
+      let j;
+      try { j = JSON.parse(c.stdout); } catch { return `bad output: ${c.stdout}${c.stderr}`; }
       return j.status === 'pass' && j.tests.length >= 17 ? null : JSON.stringify(j).slice(0, 2000);
     },
   };
