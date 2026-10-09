@@ -810,6 +810,10 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
       const j = tested('.', path.join(tmp, 'fresh'));
       return j.status === 'pass' && names(j) === 'add' ? null : JSON.stringify(j);
     },
+    'the solver example (examples/solver)': async () => {
+      const j = tested(path.join(root, 'examples/solver'));
+      return j.status === 'pass' && j.tests.length >= 17 ? null : JSON.stringify(j).slice(0, 2000);
+    },
   };
   for (const [cname, fn] of Object.entries(cases)) {
     const name = `packages: ${cname}`;
