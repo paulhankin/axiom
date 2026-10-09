@@ -127,6 +127,12 @@ struct State {
 let mut states: [16]State = [State.{ win: 0, closing: false, resized: false }; 16];
 let mut app: usize = 0;  // NSApp, once set up
 let mut app_menu: usize = 0;   // the app's menu (About and Quit), once set up
+// A program run outside an app bundle (from a terminal, say) comes up
+// frontmost, but its menu bar takes no clicks until it is really activated
+// again (a macOS bug; winit works round it the same way): the Dock is
+// activated as its first window opens, and the program again once it has
+// lost the activation (or after a while). 0: done; else the polls waited.
+let mut reactivating: u32 = 0;
 let mut app_items: usize = 0;  // the items added to it (before Quit)
 
 // The menus added (add_menu), the target of their items, and the ids of
@@ -369,6 +375,16 @@ pub struct Window {
         _ = objc.call(w, "center");
         _ = objc.call1(w, "makeKeyAndOrderFront:", 0);
         _ = objc.send_b(app, objc.sel("activateIgnoringOtherApps:"), true);
+        let bundle_id = objc.call(objc.call(objc.class("NSBundle"), "mainBundle"), "bundleIdentifier");
+        if (bundle_id == 0) and (reactivating == 0) {
+            let docks = objc.call1(objc.class("NSRunningApplication"), "runningApplicationsWithBundleIdentifier:",
+                                   objc.string("com.apple.dock"));
+            let dock = objc.call(docks, "firstObject");
+            if dock != 0 {
+                _ = objc.call1(dock, "activateWithOptions:", 2);  // NSApplicationActivateIgnoringOtherApps
+                reactivating = 1;
+            }
+        }
         return Window.{ win: w, view: view, delegate: d, buttons: 0, mods: 0 };
     }
 
@@ -461,6 +477,15 @@ pub struct Window {
             let ev = next(app, objc.sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), ~@as(u64, 0), past,
                           objc.string("kCFRunLoopDefaultMode"), 1);
             if ev == 0 {
+                if reactivating > 0 {
+                    // (the Dock activated: the program again, once it has let go)
+                    if not objc.send_bool(app, objc.sel("isActive")) or (reactivating > 240) {
+                        _ = objc.send_b(app, objc.sel("activateIgnoringOtherApps:"), true);
+                        reactivating = 0;
+                    } else {
+                        reactivating += 1;
+                    }
+                }
                 objc.pool_pop(pool);
                 return e;
             }
