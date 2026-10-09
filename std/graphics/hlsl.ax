@@ -12,15 +12,25 @@
 // dxil.dll (which signs the code), found next to the program, on the PATH,
 // in the directory $AXIOM_DXC names, or in the newest Windows SDK; without
 // them compile returns Unsupported.
+//
+// compile_cached keeps what it compiles in %LOCALAPPDATA%\axiom\shaders,
+// named by a hash of the source, the entry point and the profile, and reads
+// it back the next time instead of compiling again: d3dcompiler_47 can take
+// many seconds over a big shader, every time a program starts.
 // =============================================================================
 
+import "../mem.ax" as mem;
+import "../os.ax" as os;
 import "../os/com.ax" as com;
+import "../os/fs.ax" as fs;
+import "../str.ax" as strs;
 
 error { CompileError, Unsupported, Failed }
 
 extern "C" "d3dcompiler_47" {
     fn D3DCompile(src: *u8, size: usize, name: *u8, defines: *void, include: *void, entry: *u8, target: *u8,
                   flags1: u32, flags2: u32, code: *mut usize, errors: *mut usize) i32;
+    fn D3DCreateBlob(size: usize, blob: *mut usize) i32;
 }
 
 extern "C" "kernel32" {
@@ -104,6 +114,78 @@ pub fn compile(src: []u8, entry: []u8, target: []u8) !Code {
         return error.CompileError;
     }
     return Code.{ blob: code };
+}
+
+/// As compile, but kept on disk: compiled once, then read back (see the
+/// top). Anything going wrong with the cache just compiles.
+pub fn compile_cached(src: []u8, entry: []u8, target: []u8) !Code {
+    if not os.has_env("LOCALAPPDATA") {
+        return compile(src, entry, target);
+    }
+    let base = os.getenv("LOCALAPPDATA") catch return compile(src, entry, target);
+    defer mem.free(base);
+    let zero: [1]u8 = [0];
+    let mut h: u64 = 0xcbf29ce484222325;
+    h = fnv(h, target);
+    h = fnv(h, zero[..]);
+    h = fnv(h, entry);
+    h = fnv(h, zero[..]);
+    h = fnv(h, src);
+    let mut dir = strs.String.init();
+    defer dir.deinit();
+    let mut path = strs.String.init();
+    defer path.deinit();
+    let hex = "0123456789abcdef";
+    let mut name: [20]u8 = [0; 20];
+    for k in @as(usize, 0)..16 {
+        name[k] = hex[@as(usize, @truncate(u32, (h >> @as(u64, 60 - (4 * k))) & 15))];
+    }
+    name[16] = '.';
+    name[17] = 'c';
+    name[18] = 's';
+    name[19] = 'o';
+    if not cache_path(&mut dir, &mut path, base, name[..]) {
+        return compile(src, entry, target);
+    }
+    if fs.is_file(path.bytes()) {
+        let bytes = fs.read_file(path.bytes()) catch return compile(src, entry, target);
+        defer mem.free(bytes);
+        let mut blob: usize = 0;
+        if (bytes.len > 0) and (D3DCreateBlob(bytes.len, &mut blob) >= 0) and (blob != 0) {
+            let code = Code.{ blob: blob };
+            let p = @bit_cast(fn(usize) usize, com.method(blob, 3))(blob);
+            @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p), bytes.len), bytes);
+            return code;
+        }
+    }
+    let code = compile(src, entry, target)!;
+    // (written aside and renamed, so that a file there is always whole)
+    fs.mkdir_all(dir.bytes()) catch return code;
+    path.push_str(".new") catch return code;
+    let n = path.bytes().len;
+    fs.write_file(path.bytes(), code.bytes()) catch return code;
+    fs.rename(path.bytes(), path.bytes()[0..n - 4]) catch {
+        fs.remove(path.bytes()) catch {};
+    };
+    return code;
+}
+
+// dir: base\axiom\shaders; path: dir\name.
+fn cache_path(dir: *mut strs.String, path: *mut strs.String, base: []u8, name: []u8) bool {
+    dir.push_str(base) catch return false;
+    dir.push_str("\\axiom\\shaders") catch return false;
+    path.push_str(dir.bytes()) catch return false;
+    path.push('\\') catch return false;
+    path.push_str(name) catch return false;
+    return true;
+}
+
+fn fnv(h0: u64, b: []u8) u64 {
+    let mut h = h0;
+    for c in b {
+        h = (h ^ @as(u64, c)) *% 0x100000001b3;
+    }
+    return h;
 }
 
 // A profile's shader model: 6 for "cs_6_0".
