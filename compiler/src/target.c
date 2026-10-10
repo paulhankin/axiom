@@ -254,6 +254,9 @@ const char *llvm_features(uint64_t bits) {
         if (b.len) vec_push(b, ',');
         vec_push(b, '+');
         push_str(&b, TABLE[i].llvm);
+        // LLVM 18 split CRC32 (which @x86_crc32 lowers to) off SSE 4.2 into a feature of its
+        // own, which a named --cpu does not otherwise turn on
+        if (family(g_arch) == ARCH_X64 && !strcmp(TABLE[i].llvm, "sse4.2")) push_str(&b, ",+crc32");
     }
     vec_push(b, 0);
     return b.data;
