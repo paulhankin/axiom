@@ -20,6 +20,9 @@
 //                through it), the thread-local template, _tls_index, then
 //                zero-filled .bss (beyond the section's file data)
 //   .reloc  r--  base relocations: every absolute address the image holds
+//   .rsrc   r--  with --icon=FILE.ico: the program's icon, as resources (an
+//                RT_GROUP_ICON naming one RT_ICON per image in the file),
+//                which Explorer, the taskbar and shortcuts show
 //
 // Imports: what is still undefined after our own objects is a Windows
 // function. A function declared in an `extern "C" "name"` block comes from
@@ -54,6 +57,8 @@ pub let mut g_subsystem: u64 = 3;
 // Write a program database next to the executable (--pdb=on|off), for
 // debuggers and the system's symbol handler.
 pub let mut g_pdb: bool = true;
+// The program's icon (--icon=FILE.ico): the path of a Windows icon file, or "".
+pub let mut g_icon: []u8 = "";
 const SECT: u64 = 0x1000;   // section alignment in memory
 const FILEAL: u64 = 0x200;  // and in the file
 const STACK_RESERVE: u64 = 8 << 20;
@@ -459,7 +464,7 @@ fn class_align(cls: i32) u64 {
     return a;
 }
 
-let mut outs: [5]Out = [Out.{ name: "", rva: 0, vsize: 0, fsize: 0, foff: 0, flags: 0 }; 5];
+let mut outs: [6]Out = [Out.{ name: "", rva: 0, vsize: 0, fsize: 0, foff: 0, flags: 0 }; 6];
 
 // The file offset of an image address (in a section's file data).
 fn file_of(addr: u64) u64 {
@@ -795,10 +800,22 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     }
     scan_relocs();
     add_import(gsym_index("ExitProcess"));
+    let mut ico = u.nosym();
+    if g_icon.len > 0 {
+        ico = u.read_file(g_icon);
+        if u.isnos(ico) {
+            err(u.f1("cannot read the icon %s", g_icon));
+        } else if not ico_valid(ico) {
+            err(u.f1("%s is not a Windows icon file (.ico)", g_icon));
+        }
+    }
     if errors != 0 {
         return 1;
     }
-    let nsec: u64 = 5;
+    let mut nsec: u64 = 5;
+    if g_icon.len > 0 {
+        nsec = 6;
+    }
     let headers = align_up(0x40 + 4 + 20 + 240 + (nsec * 40), FILEAL);
 
     // .text: code, then the import thunks
@@ -929,7 +946,16 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
                     flags: 0x4200_0040 };
     f.put(rel.view());
     f.zeros(@truncate(usize, align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
-    let image_size = align_up(reloc_rva + outs[4].vsize, SECT);
+    let mut image_size = align_up(reloc_rva + outs[4].vsize, SECT);
+    if nsec == 6 {
+        let rsrc_rva = image_size;
+        let mut res = icon_resources(ico, rsrc_rva);
+        outs[5] = Out.{ name: ".rsrc", rva: rsrc_rva, vsize: @as(u64, res.len()), fsize: @as(u64, res.len()),
+                        foff: @as(u64, f.len()), flags: 0x4000_0040 };
+        f.put(res.view());
+        f.zeros(@truncate(usize, align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
+        image_size = align_up(rsrc_rva + outs[5].vsize, SECT);
+    }
 
     // headers
     let mut h = bn.new_bytes();
@@ -953,7 +979,8 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     h.u8_(14);
     h.u8_(0);
     h.u32_(align_up(outs[0].vsize, FILEAL));  // SizeOfCode
-    h.u32_(align_up(outs[1].fsize, FILEAL) + align_up(outs[2].fsize, FILEAL) + align_up(outs[3].fsize, FILEAL));  // initialized
+    h.u32_(((align_up(outs[1].fsize, FILEAL) + align_up(outs[2].fsize, FILEAL)) + align_up(outs[3].fsize, FILEAL))
+           + align_up(outs[5].fsize, FILEAL));  // initialized
     h.u32_(bss_end - data_file_end);  // uninitialized
     h.u32_(global_addr("axiom.entry") - BASE);
     h.u32_(text_rva);  // BaseOfCode
@@ -992,6 +1019,9 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         } else if (d == 6) and g_pdb {
             h.u32_(debug_at - BASE);
             h.u32_(28);
+        } else if (d == 2) and (nsec == 6) {
+            h.u32_(outs[5].rva);
+            h.u32_(outs[5].vsize);
         } else if d == 5 {
             h.u32_(reloc_rva);
             h.u32_(outs[4].vsize);
@@ -1006,7 +1036,8 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
             h.u32_(0);
         }
     }
-    for o in outs {
+    for k in @as(usize, 0)..@truncate(usize, nsec) {
+        let o = outs[k];
         name8(&mut h, o.name);
         h.u32_(o.vsize);
         h.u32_(o.rva);
@@ -1055,6 +1086,121 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         }
     }
     return 0;
+}
+
+// An icon file: ICONDIR (reserved 0, type 1, count), then per image a
+// 16-byte ICONDIRENTRY (width, height, colours, reserved, planes, bits per
+// pixel, size, offset) whose bytes lie in the file.
+fn ico_valid(ico: []u8) bool {
+    if (ico.len < 6) or (rd16(ico, 0) != 0) or (rd16(ico, 2) != 1) {
+        return false;
+    }
+    let n = @as(usize, rd16(ico, 4));
+    if (n == 0) or (ico.len < (6 + (n * 16))) {
+        return false;
+    }
+    for i in 0..n {
+        let e = 6 + (i * 16);
+        let size = @as(u64, rd32(ico, e + 8));
+        let at = @as(u64, rd32(ico, e + 12));
+        if (size == 0) or ((at + size) > @as(u64, ico.len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn rd16(b: []u8, at: usize) u32 {
+    return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8);
+}
+
+fn rd32(b: []u8, at: usize) u32 {
+    return rd16(b, at) | (rd16(b, at + 2) << 16);
+}
+
+// The resource section at rva for an icon file's n images: the type
+// directory (RT_ICON 3, RT_GROUP_ICON 14), a name directory for each (icons
+// 1..n; the group 1), a language directory per resource (US English), a data
+// entry per resource, then the group's GRPICONDIR (the ICONDIRENTRYs with an
+// icon's id in place of its offset) and the images, 8-byte aligned. A
+// directory's entries point at subdirectories (high bit set) or data entries
+// by their offset in the section; a data entry at its bytes by RVA.
+fn icon_resources(ico: []u8, rva: u64) bn.Bytes {
+    let n = @as(u64, rd16(ico, 4));
+    let root: u64 = 0;
+    let icons_dir = root + 16 + 16;
+    let group_dir = icons_dir + 16 + (n * 8);
+    let langs = group_dir + 16 + 8;  // n + 1 language directories, 24 bytes each
+    let entries = langs + ((n + 1) * 24);  // n + 1 data entries, 16 bytes each
+    let group = entries + ((n + 1) * 16);
+    let group_size = 6 + (n * 14);
+    let mut image_at = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
+    let mut at = align_up(group + group_size, 8);
+    for i in @as(u64, 0)..n {
+        image_at.push(at);
+        at = align_up(at + @as(u64, rd32(ico, @truncate(usize, 6 + (i * 16) + 8))), 8);
+    }
+    let mut r = bn.new_bytes();
+    // the type directory: two id entries
+    dir_header(&mut r, 2);
+    r.u32_(3);
+    r.u32_(0x8000_0000 | icons_dir);
+    r.u32_(14);
+    r.u32_(0x8000_0000 | group_dir);
+    // the icons' names: 1..n
+    dir_header(&mut r, n);
+    for i in @as(u64, 0)..n {
+        r.u32_(i + 1);
+        r.u32_(0x8000_0000 | (langs + (i * 24)));
+    }
+    // the group's name: 1
+    dir_header(&mut r, 1);
+    r.u32_(1);
+    r.u32_(0x8000_0000 | (langs + (n * 24)));
+    // a language for each resource
+    for i in @as(u64, 0)..(n + 1) {
+        dir_header(&mut r, 1);
+        r.u32_(0x409);
+        r.u32_(entries + (i * 16));
+    }
+    // the data entries: RVA, size, code page, reserved
+    for i in @as(u64, 0)..n {
+        r.u32_(rva + image_at.get(@truncate(usize, i)));
+        r.u32_(@as(u64, rd32(ico, @truncate(usize, 6 + (i * 16) + 8))));
+        r.u32_(0);
+        r.u32_(0);
+    }
+    r.u32_(rva + group);
+    r.u32_(group_size);
+    r.u32_(0);
+    r.u32_(0);
+    // GRPICONDIR
+    r.u16_(0);
+    r.u16_(1);
+    r.u16_(n);
+    for i in @as(u64, 0)..n {
+        let e = @truncate(usize, 6 + (i * 16));
+        r.put(ico[e..e + 12]);
+        r.u16_(i + 1);
+    }
+    for i in @as(u64, 0)..n {
+        r.zeros(@truncate(usize, image_at.get(@truncate(usize, i)) - @as(u64, r.len())));
+        let e = @truncate(usize, 6 + (i * 16));
+        let size = @as(usize, rd32(ico, e + 8));
+        let off = @as(usize, rd32(ico, e + 12));
+        r.put(ico[off..off + size]);
+    }
+    return r;
+}
+
+// IMAGE_RESOURCE_DIRECTORY: characteristics, time, version, no named
+// entries, `ids` id entries.
+fn dir_header(r: *mut bn.Bytes, ids: u64) void {
+    r.u32_(0);
+    r.u32_(0);
+    r.u32_(0);
+    r.u16_(0);
+    r.u16_(ids);
 }
 
 fn fnv(b: []u8, seed: u64) u64 {

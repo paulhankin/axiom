@@ -154,7 +154,9 @@ the workarounds).
 console executable for Windows 10 or later, from any host: position independent (base
 relocations), importing what the runtime calls from `kernel32`, `ntdll`, `ws2_32` and
 `bcrypt`; no C runtime. `--subsystem=windows` makes it a GUI program instead, which
-opens no console window (its standard streams are closed unless redirected). Every function uses the Windows x64 calling convention:
+opens no console window (its standard streams are closed unless redirected), and
+`--icon=app.ico` gives it an icon (an `.rsrc` section holding the icon file's images),
+which Explorer, the taskbar and shortcuts show. Every function uses the Windows x64 calling convention:
 arguments by position in `rcx`, `rdx`, `r8`, `r9` or `xmm0`-`xmm3`, then on the stack
 above 32 bytes of shadow space; `rsi`, `rdi` and `xmm6`-`xmm15` are callee-saved (the
 latter saved below the pushed registers). Every function with a frame has unwind
