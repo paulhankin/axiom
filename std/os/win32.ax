@@ -51,6 +51,16 @@ extern "C" "user32" {
     fn SetMenu(h: usize, m: usize) i32;
     fn DrawMenuBar(h: usize) i32;
     fn GetKeyState(vk: i32) i16;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) i32;
+    fn CreateIconIndirect(info: *u8) usize;
+    fn DestroyIcon(icon: usize) i32;
+    fn SendMessageW(h: usize, msg: u32, w: usize, l: isize) isize;
+}
+
+extern "C" "gdi32" {
+    fn CreateDIBSection(dc: usize, info: *u8, usage: u32, bits: *mut usize, section: usize, offset: u32) usize;
+    fn CreateBitmap(w: i32, h: i32, planes: u32, bits: u32, data: *void) usize;
+    fn DeleteObject(obj: usize) i32;
 }
 
 extern "C" "comdlg32" {
@@ -142,6 +152,8 @@ struct State {
 
 let mut states: [16]State = [State.{ hwnd: 0, closing: false, resized: false, width: 0, height: 0 }; 16];
 let mut class_ready: bool = false;
+// the icons set_icon gave the window last: big, small (destroyed when replaced)
+let mut icons: [2]usize = [0, 0];
 
 // The menu bar (one, on the first window given menus), its menus, the ids
 // of the items chosen waiting for next_event, and the shortcuts (Ctrl and
@@ -542,6 +554,72 @@ pub struct Window {
             return 1.0;
         }
         return @float_from_int(f64, dpi) / 96.0;
+    }
+
+    /// The sizes in pixels Windows shows the window's icons at for its DPI:
+    /// big (the taskbar, Alt+Tab), small (the title bar).
+    pub fn icon_sizes(self: *Window) [2]u32 {
+        let mut dpi = GetDpiForWindow(self.hwnd);
+        if dpi == 0 {
+            dpi = 96;
+        }
+        let big = GetSystemMetricsForDpi(11, dpi);    // SM_CXICON
+        let small = GetSystemMetricsForDpi(49, dpi);  // SM_CXSMICON
+        return [@bit_cast(u32, @max(big, 1)), @bit_cast(u32, @max(small, 1))];
+    }
+
+    /// Gives the window an icon (`big`: the taskbar and Alt+Tab; else the
+    /// title bar) from `rgba`: width × height pixels, rows top down, four
+    /// bytes each, alpha not premultiplied.
+    pub fn set_icon(self: *Window, big: bool, rgba: []u8, width: u32, height: u32) !void {
+        let n = @as(usize, width) * @as(usize, height);
+        if (n == 0) or (rgba.len < (n * 4)) {
+            return error.Failed;
+        }
+        // BITMAPINFOHEADER: a top-down 32-bit DIB (negative height)
+        let mut bi: [44]u8 = [0; 44];
+        put(bi[..], 0, 40, 4);
+        put(bi[..], 4, @as(u64, width), 4);
+        put(bi[..], 8, @as(u64, @bit_cast(u32, -@bit_cast(i32, height))), 4);
+        put(bi[..], 12, 1, 2);
+        put(bi[..], 14, 32, 2);
+        let mut bits: usize = 0;
+        let color = CreateDIBSection(0, &bi[0], 0, &mut bits, 0, 0);
+        if (color == 0) or (bits == 0) {
+            return error.Failed;
+        }
+        let px = @slice_from_ptr(@ptr_from_int(*mut u8, bits), n * 4);
+        for i in 0..n {
+            let o = i * 4;
+            px[o] = rgba[o + 2];  // BGRA
+            px[o + 1] = rgba[o + 1];
+            px[o + 2] = rgba[o];
+            px[o + 3] = rgba[o + 3];
+        }
+        // (with a 32-bit colour bitmap the mask is ignored but required)
+        let mask = CreateBitmap(@bit_cast(i32, width), @bit_cast(i32, height), 1, 1, @ptr_from_int(*void, 0));
+        // ICONINFO: fIcon, xHotspot, yHotspot, hbmMask at 16, hbmColor at 24
+        let mut ii: [32]u8 = [0; 32];
+        put(ii[..], 0, 1, 4);
+        put(ii[..], 16, @as(u64, mask), 8);
+        put(ii[..], 24, @as(u64, color), 8);
+        let icon = CreateIconIndirect(&ii[0]);
+        _ = DeleteObject(color);
+        if mask != 0 {
+            _ = DeleteObject(mask);
+        }
+        if icon == 0 {
+            return error.Failed;
+        }
+        let mut which: usize = 0;  // ICON_SMALL
+        if big {
+            which = 1;  // ICON_BIG
+        }
+        _ = SendMessageW(self.hwnd, 0x80, which, @bit_cast(isize, icon));  // WM_SETICON
+        if icons[which] != 0 {
+            _ = DestroyIcon(icons[which]);
+        }
+        icons[which] = icon;
     }
 
     /// The client area's size in the screen's pixels: width, height.
