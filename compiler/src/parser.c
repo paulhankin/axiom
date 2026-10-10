@@ -715,6 +715,9 @@ static Stmt *parse_stmt(Parser *P) {
         s->name = expect_ident(P, &s->name_span);
         if (accept(P, TK_COLON)) s->te = parse_type(P);
         expect(P, TK_EQ);
+        // `undefined` (contextual) as the whole initializer: the variable's bytes left
+        // unspecified until written
+        s->undef = pk(P) == TK_IDENT && !strcmp(peek(P)->name, "undefined") && peek2(P)->kind == TK_SEMI;
         s->e = parse_expr(P);
         if (!accept(P, TK_SEMI)) {
             syntax_error(P, "';'");

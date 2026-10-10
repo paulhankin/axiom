@@ -171,7 +171,7 @@ one-token way to pass an error up. The differences show up at the edges:
 | **Signed overflow** | Wraps (trap `T0002` with `--overflow=trap`) | Panic / undefined | Panic in debug, wrap in release | Undefined | Undefined |
 | **Division by zero** | Trap `T0003` | Panic / undefined | Panic | Undefined | Undefined |
 | **Shift by ≥ the width** | Defined: the mathematical result (`0`, or `-1` for a negative `>>`) | Rejected by the shift-amount type unless cast | Panic in debug, count masked in release | Undefined | Undefined |
-| **A read of uninitialized memory** | Impossible for variables (every `let` has an initializer); allocator memory holds unspecified bytes | Allowed through `undefined`; reading it is illegal behavior, mostly unchecked | Rejected at compile time | Undefined (erroneous behavior in C++26) | Undefined |
+| **A read of uninitialized memory** | Defined: a `let mut x: T = undefined` local, like allocator memory, holds unspecified bytes, never poison | Allowed through `undefined`; reading it is illegal behavior, mostly unchecked | Rejected at compile time | Undefined (erroneous behavior in C++26) | Undefined |
 | **A null pointer is used** | There is no null. Address 0 is ordinary memory | Only `?*T` (or `allowzero`) can be null; making a null `*T` is illegal behavior | No null in safe code | Undefined | Undefined |
 | **Use after free** | Reads whatever bytes are there now: a logic bug with defined behavior (`--sanitize=address` traps on it) | Undefined | Rejected at compile time | Undefined | Undefined |
 | **A data race** | Each byte reads a value some store wrote (tearing allowed) | Undefined | Rejected at compile time | Undefined | Undefined |

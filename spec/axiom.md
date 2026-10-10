@@ -1023,8 +1023,22 @@ Write `a + (f() catch 0)`.
 ### 8.1 `let`
 
 `let` introduces an immutable binding and `let mut` a mutable one. Every binding has an
-initializer, so no variable is ever uninitialized. The type annotation may be omitted when
-the initializer's type can be determined (§6.1).
+initializer. The type annotation may be omitted when the initializer's type can be
+determined (§6.1).
+
+A local's initializer may instead be `undefined`, which leaves its bytes unspecified until
+they are written, as memory from the allocator (§12.3): a buffer filled before it is read
+need not be cleared first.
+
+```axiom
+let mut rows: [64]usize = undefined;   // only rows[0..n] are written, and read
+```
+
+`undefined` is recognised only as the whole initializer of a `let` (elsewhere it is an
+ordinary identifier). The binding must be `let mut` (`E0413`: it could never be written)
+and must have a type annotation (`E0414`). Reading its bytes before they are written gives
+unspecified values, never poison (§12.3); an implementation may give them any values,
+zeroes included (it may zero a variable small enough to be kept in registers).
 
 ### 8.2 Expression statements and discards
 
@@ -1447,8 +1461,9 @@ Because of this:
 
 ### 12.3 No uninitialized values
 
-Every local and global has an initializer. Memory obtained from the allocator has
-unspecified contents (§12.1) but is never "poison".
+Every local and global has an initializer. Memory obtained from the allocator, and a
+local initialized with `undefined` (§8.1), has unspecified contents (§12.1) but is never
+"poison".
 
 ### 12.4 Allocation
 
@@ -2249,6 +2264,8 @@ Initial registry, not exhaustive:
 | E0216 | Git dependency can't be fetched |
 | E0217 | Package directory or manifest missing |
 | E0410 | Struct literal fields missing or out of order |
+| E0413 | `undefined` initializer on an immutable `let` |
+| E0414 | `undefined` initializer without a type annotation |
 | E0412 | Type mismatch |
 | E0460 | Generic type used without arguments |
 | E0461 | Operation not permitted by the parameter's constraint |

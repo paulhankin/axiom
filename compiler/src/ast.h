@@ -215,6 +215,7 @@ struct Stmt {
     Sym name;  // let / for variable
     Span name_span;
     bool mut;
+    bool undef;  // let ... = undefined (§8.1): `e` is that identifier, its bytes left unspecified
     TypeExpr *te;
     Expr *e, *e2, *e3;
     int op;  // assign op TokKind

@@ -295,6 +295,31 @@ bool check_stmt(Stmt *s) {
     switch (s->kind) {
     case S_LET: {
         Type *t;
+        if (s->undef) {
+            // `= undefined`: the type must be written, and the variable writable
+            t = t_invalid;
+            if (s->te) {
+                t = resolve_type(s->te, &C->tc);
+                if (t->kind == TY_VOID) {
+                    diag_error(s->te->span, "E0409", "a variable cannot have type void");
+                    t = t_invalid;
+                }
+            } else {
+                Diag *d = diag_error(s->e->span, "E0414", "'undefined' gives '%s' no type; add a type annotation", s->name);
+                DiagFix *fx = diag_fix(d, "annotate the type", "placeholder");
+                diag_fix_edit(fx, (Span){s->name_span.file, s->name_span.end, s->name_span.end}, ": <type>");
+            }
+            if (!s->mut) {
+                Diag *d = diag_error(s->e->span, "E0413",
+                                     "'%s' is left undefined but immutable, so it could never be written; use 'let mut'",
+                                     s->name);
+                DiagFix *fx = diag_fix(d, "make it mutable", "machine");
+                diag_fix_edit(fx, (Span){s->name_span.file, s->name_span.start, s->name_span.start}, "mut ");
+            }
+            s->e->type = t;
+            s->local = declare_local(s->name, s->name_span, t, s->mut, false);
+            break;
+        }
         if (s->te) {
             t = resolve_type(s->te, &C->tc);
             if (t->kind == TY_VOID) {

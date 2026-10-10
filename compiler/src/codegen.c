@@ -4159,7 +4159,7 @@ static void mark_bounded_sums(Stmt *blk, int at) {
         Stmt *d = blk->stmts.data[j];
         Local *acc = NULL;
         Expr *init = NULL;
-        if (d->kind == S_LET && d->local && d->e) {
+        if (d->kind == S_LET && d->local && d->e && !d->undef) {
             acc = d->local;
             init = d->e;
         } else if (d->kind == S_ASSIGN && d->op == TK_EQ && d->e->kind == E_IDENT && d->e->local) {
@@ -4366,6 +4366,12 @@ static void gen_stmt_inner(Stmt *s) {
     switch (s->kind) {
     case S_LET: {
         Type *lt = ct(s->local->type);
+        if (s->undef) {
+            // left unspecified (§8.1): zeroed here, as good a value as any (the self-hosted
+            // compiler leaves a large one's bytes as they are)
+            store(lt, LLVMConstNull(lty(lt)), local_ptr(s->local), false);
+            return;
+        }
         if (in_mem(lt)) {
             gen_into(s->e, local_ptr(s->local), true, false);  // (a new local: nothing reads it yet)
             if (!s->local->mut) F->inits[s->local->index] = s->e;
