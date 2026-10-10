@@ -2081,7 +2081,7 @@ pub fn legal(v: *mut ir.Value) bool {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         let at_ = v.xs.get(0).ty;
         if (id == ir.IN_ANYTRUE) or (id == ir.IN_BITMASK) or (id == ir.IN_DOT_I16) or (id == ir.IN_ALLTRUE) or
-           (id == ir.IN_SWIZZLE) {
+           (id == ir.IN_SWIZZLE) or ir.is_widen(id) {
             return true;
         }
         if lane_float(at_) {
@@ -2220,6 +2220,85 @@ fn gen_bic(v: *mut ir.Value) void {
         y = v.b;
     }
     raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), vreg(v), reg(y), reg(not_of(n)));
+}
+
+// A widening intrinsic's half (1: the high one) and sign (1: unsigned).
+fn widen_q(id: i32) u64 {
+    return @as(u64, @bit_cast(u32, (id - ir.IN_SWIDEN_LO) % 2));
+}
+
+fn widen_u(id: i32) u64 {
+    return @as(u64, @bit_cast(u32, (id - ir.IN_SWIDEN_LO) / 2));
+}
+
+// A widening intrinsic's id, or 0.
+fn widen_id(v: *ir.Value) i32 {
+    if is_inst(v, ir.OP_INTR) {
+        let id = @truncate(i32, @bit_cast(i64, v.cv));
+        if ir.is_widen(id) {
+            return id;
+        }
+    }
+    return 0;
+}
+
+// A vector multiply of two halves widened alike (SMULL, UMULL2 ...): their
+// intrinsic, or 0.
+fn widening_mul(m: *ir.Value) i32 {
+    if not is_inst(m, ir.OP_MUL) or (m.ty.kind != ir.T_VEC) {
+        return 0;
+    }
+    let id = widen_id(m.a);
+    if (id != 0) and (id == widen_id(m.b)) {
+        return id;
+    }
+    return 0;
+}
+
+// The multiply a vector add can take in, as MLA (or SMLAL, UMLAL2 ... when
+// it multiplies widened halves): its operand, or nil.
+fn mla_operand(i: *mut ir.Value) *mut ir.Value {
+    let ops: [2]*mut ir.Value = [i.b, i.a];
+    for k in @as(usize, 0)..2 {
+        let m = ops[k];
+        if is_inst(m, ir.OP_MUL) and (m.ty.kind == ir.T_VEC) and (m.uses == 1) and (m != ops[1 - k]) and
+           (((lane_bits(m.ty) < 64) and not lane_float(m.ty)) or (widening_mul(m) != 0)) {
+            return m;
+        }
+    }
+    return vnil();
+}
+
+// acc + x * y: MLA, or SMLAL, UMLAL2 ... of the widened halves' sources
+// (prepare marked the multiply, which is made here)
+fn gen_mla(v: *mut ir.Value) void {
+    let mut m = v.b;
+    let mut acc = v.a;
+    if not is_inst(m, ir.OP_MUL) or ((m.flag & 4) == 0) {
+        m = v.a;
+        acc = v.b;
+    }
+    let d = vreg(v);
+    let id = widening_mul(m);
+    if id != 0 {
+        let x = m.a.xs.get(0);
+        let rx = reg(x);
+        let ry = reg(m.b.xs.get(0));
+        copy(d, reg(acc), VR);
+        _ = raw(ae.mull(widen_q(id), widen_u(id), lk(x.ty), 8, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+        return;
+    }
+    let rx = reg(m.a);
+    let ry = reg(m.b);
+    copy(d, reg(acc), VR);
+    _ = raw(ae.v3(1, 0, lk(v.ty), 0x12, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+}
+
+// x * y of widened halves: SMULL, UMULL2 ... of their sources
+fn gen_mull(v: *mut ir.Value) void {
+    let id = widening_mul(v);
+    let x = v.a.xs.get(0);
+    raw3(ae.mull(widen_q(id), widen_u(id), lk(x.ty), 0xc, 0, 0, 0), vreg(v), reg(x), reg(v.b.xs.get(0)));
 }
 
 fn vec_binop(v: *mut ir.Value) void {
@@ -2412,11 +2491,103 @@ fn le8(b: []u8) u64 {
     return x;
 }
 
+// Lane i of the permute with opcode `op` (1 UZP1, 2 TRN1, 3 ZIP1, 5 UZP2, 6 TRN2,
+// 7 ZIP2) of n-lane vectors, indexing a's lanes, then b's.
+fn perm_lane(op: u64, i: i32, n: i32) i32 {
+    let h = i / 2;
+    let odd = (i % 2) == 1;
+    if op == 1 {
+        return 2 * i;
+    }
+    if op == 5 {
+        return (2 * i) + 1;
+    }
+    if op == 3 {
+        if odd {
+            return n + h;
+        }
+        return h;
+    }
+    if op == 7 {
+        if odd {
+            return (n + (n / 2)) + h;
+        }
+        return (n / 2) + h;
+    }
+    if op == 2 {
+        if odd {
+            return (n + i) - 1;
+        }
+        return i;
+    }
+    if odd {
+        return n + i;
+    }
+    return i + 1;
+}
+
+// The one instruction a shuffle of two 128-bit vectors is, when it is one:
+// UZP1, ZIP2, TRN1 ... or EXT; or 0 (TBL).
+fn permute_word(v: *mut ir.Value) u64 {
+    let t = v.ty;
+    let n = @truncate(i32, @as(u64, v.mask.len));
+    if (t.kind != ir.T_VEC) or ((t.lanes * lane_bits(t)) != 128) or (v.a.ty.lanes != t.lanes) or (n != t.lanes) {
+        return 0;
+    }
+    let same = v.a == v.b;  // (then lane i of b is lane i of a)
+    let ops: [6]u64 = [1, 5, 3, 7, 2, 6];
+    for c in @as(usize, 0)..6 {
+        let op = ops[c];
+        let mut ok = true;
+        for i in @as(i32, 0)..n {
+            let m = v.mask[@as(usize, @bit_cast(u32, i))];
+            let e = perm_lane(op, i, n);
+            if (m >= 0) and (m != e) and not (same and ((m % n) == (e % n))) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return ((0x4E00_0800 | (lk(t) << 22)) | (op << 12));
+        }
+    }
+    // EXT: lanes k, k + 1, ... of a, then b (k from the first lane given)
+    let mut k: i32 = -1;
+    for i in @as(i32, 0)..n {
+        let m = v.mask[@as(usize, @bit_cast(u32, i))];
+        if m < 0 {
+            continue;
+        }
+        if k < 0 {
+            k = m - i;
+            if same {
+                k = ((k % n) + n) % n;
+            }
+            if (k <= 0) or (k >= n) {
+                return 0;
+            }
+        }
+        if (m != (i + k)) and not (same and ((m % n) == ((i + k) % n))) {
+            return 0;
+        }
+    }
+    if k < 0 {
+        return 0;
+    }
+    let lb = @as(u64, @bit_cast(u32, lane_bits(t) / 8));
+    return 0x6E00_0000 | ((@as(u64, @bit_cast(u32, k)) * lb) << 11);
+}
+
 fn gen_shuffle(v: *mut ir.Value) void {
     let t = v.ty;
     let d = vreg(v);
     let a = reg(v.a);
     let b = reg(v.b);
+    let pw = permute_word(v);
+    if pw != 0 {
+        raw3(pw, d, a, b);
+        return;
+    }
     let lb = @int_cast(u64, lane_bits(t) / 8);
     let n = @as(u64, v.mask.len);
     // bytes from a and from b (out of range: zero), or'ed
@@ -2562,6 +2733,11 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         raw3(ae.tbl(0, 0, 0), d, reg(a0), reg(v.xs.get(1)));
         return;
     }
+    if ir.is_widen(id) {
+        // SSHLL / USHLL{2} #0 (SXTL, UXTL2 ...)
+        raw2(ae.vshift(widen_q(id), widen_u(id), 0x14, @as(u64, 8) << k, true, 0, 0, 0), d, reg(a0));
+        return;
+    }
     if id == ir.IN_DOT_I16 {
         let a = reg(a0);
         let b = reg(v.xs.get(1));
@@ -2664,6 +2840,14 @@ fn gen_inst(v: *mut ir.Value) void {
     }
     if (v.flag & 16) != 0 {
         gen_bic(v);
+        return;
+    }
+    if (v.flag & 32) != 0 {
+        gen_mla(v);
+        return;
+    }
+    if (v.flag & 64) != 0 {
+        gen_mull(v);
         return;
     }
     if o == ir.OP_COPY {
@@ -2941,6 +3125,7 @@ fn prepare(f: *mut ir.Func) void {
             i.loc = -1;
             i.flag = 0;
             i.uses = 0;
+            i.aux2 = 0;
             i.user = vnil();
             if i.op == ir.OP_PTRADD {
                 i.flag = 1;
@@ -3019,6 +3204,52 @@ fn prepare(f: *mut ir.Func) void {
                     n.flag = n.flag | 4;
                     i.flag = i.flag | 16;
                 }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // multiply-adds, acc + x * y (MLA; SMLAL, UMLAL2 ... of widened halves), then
+    // the other multiplies of widened halves (SMULL ...); a widening made only
+    // for them is not made (their own operands are read: aux2 counts its uses)
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_ADD) and (i.ty.kind == ir.T_VEC) and ((i.flag & 4) == 0) {
+                let m = mla_operand(i);
+                if u.notnil(m) and ((m.flag & 4) == 0) {
+                    m.flag = m.flag | 4;
+                    i.flag = i.flag | 32;
+                    if widening_mul(m) != 0 {
+                        m.a.aux2 += 1;
+                        m.b.aux2 += 1;
+                    }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ((i.flag & 4) == 0) and (widening_mul(i) != 0) {
+                i.flag = i.flag | 64;
+                i.a.aux2 += 1;
+                i.b.aux2 += 1;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (widen_id(i) != 0) and (i.aux2 == @as(i64, i.uses)) {
+                i.flag = i.flag | 4;
             }
             i = i.next;
         }
