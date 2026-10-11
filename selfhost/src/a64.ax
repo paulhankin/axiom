@@ -1956,8 +1956,9 @@ pub fn legal(v: *mut ir.Value) bool {
     if (o == ir.OP_INTR) and (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
         let id = @truncate(i32, @bit_cast(i64, v.cv));
         let at_ = v.xs.get(0).ty;
-        if (id == ir.IN_ANYTRUE) or (id == ir.IN_BITMASK) or (id == ir.IN_DOT_I16) or (id == ir.IN_ALLTRUE) or
-           (id == ir.IN_SWIZZLE) or ir.is_widen(id) {
+        if (id == ir.IN_ANYTRUE) or (id == ir.IN_BITMASK) or (id == ir.IN_DOT_I16) or (id == ir.IN_DOT_I8) or
+           (id == ir.IN_ALLTRUE) or ((id >= ir.IN_SHLV) and (id <= ir.IN_ASHRV)) or (id == ir.IN_SWIZZLE) or
+           ir.is_widen(id) {
             return true;
         }
         if is.lane_float(at_) {
@@ -2073,12 +2074,19 @@ fn widening_mul(m: *ir.Value) i32 {
     return 0;
 }
 
+fn is_dot8(m: *ir.Value) bool {
+    return (m.op == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, m.cv)) == ir.IN_DOT_I8);
+}
+
 // The multiply a vector add can take in, as MLA (or SMLAL, UMLAL2 ... when
 // it multiplies widened halves): its operand, or nil.
 fn mla_operand(i: *mut ir.Value) *mut ir.Value {
     let ops: [2]*mut ir.Value = [i.b, i.a];
     for k in @as(usize, 0)..2 {
         let m = ops[k];
+        if is_dot8(m) and (m.uses == 1) and (m != ops[1 - k]) {
+            return m;
+        }
         if ir.is_op(m, ir.OP_MUL) and (m.ty.kind == ir.T_VEC) and (m.uses == 1) and (m != ops[1 - k]) and
            (((is.lane_bits(m.ty) < 64) and not is.lane_float(m.ty)) or (widening_mul(m) != 0)) {
             return m;
@@ -2092,11 +2100,19 @@ fn mla_operand(i: *mut ir.Value) *mut ir.Value {
 fn gen_mla(v: *mut ir.Value) void {
     let mut m = v.b;
     let mut acc = v.a;
-    if not ir.is_op(m, ir.OP_MUL) or ((m.flag & 4) == 0) {
+    if not (ir.is_op(m, ir.OP_MUL) or is_dot8(m)) or ((m.flag & 4) == 0) {
         m = v.a;
         acc = v.b;
     }
     let d = vreg(v);
+    if is_dot8(m) {
+        // acc + @dot(x, y) of i8 lanes: SDOT
+        let rx = reg(m.xs.get(0));
+        let ry = reg(m.xs.get(1));
+        copy(d, reg(acc), VR);
+        _ = raw(ae.sdot(0, 0, 0), RW(d), R(rx), R(ry), NONE());
+        return;
+    }
     let id = widening_mul(m);
     if id != 0 {
         let x = m.a.xs.get(0);
@@ -2110,6 +2126,35 @@ fn gen_mla(v: *mut ir.Value) void {
     let ry = reg(m.b);
     copy(d, reg(acc), VR);
     _ = raw(ae.v3(1, 0, lk(v.ty), 0x12, 0, 0, 0), RW(d), R(rx), R(ry), NONE());
+}
+
+// The widened half an add (either operand) or a subtract (the second) can take
+// in, as SADDW, USUBW2 ...: it, or nil.
+fn addw_operand(i: *mut ir.Value) *mut ir.Value {
+    if (widen_id(i.b) != 0) and ((i.b.flag & 4) == 0) and (i.b != i.a) {
+        return i.b;
+    }
+    if (i.op == ir.OP_ADD) and (widen_id(i.a) != 0) and ((i.a.flag & 4) == 0) and (i.b != i.a) {
+        return i.a;
+    }
+    return ir.vnil();
+}
+
+// acc + x, acc - x of a widened half x: SADDW, USUBW2 ... of its source
+fn gen_addw(v: *mut ir.Value) void {
+    let mut w = v.b;
+    let mut acc = v.a;
+    if widen_id(w) == 0 {  // (addw_operand's choice: the second operand when it can)
+        w = v.a;
+        acc = v.b;
+    }
+    let id = widen_id(w);
+    let x = w.xs.get(0);
+    let mut opc: u64 = 1;
+    if v.op == ir.OP_SUB {
+        opc = 3;
+    }
+    raw3(ae.mull(widen_q(id), widen_u(id), lk(x.ty), opc, 0, 0, 0), vreg(v), reg(acc), reg(x));
 }
 
 // x * y of widened halves: SMULL, UMULL2 ... of their sources
@@ -2548,6 +2593,28 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         raw2(ae.vshift(widen_q(id), widen_u(id), 0x14, @as(u64, 8) << k, true, 0, 0, 0), d, reg(a0));
         return;
     }
+    if (id >= ir.IN_SHLV) and (id <= ir.IN_ASHRV) {
+        // USHL / SSHL by each lane's count (codegen.ax clamped it to the lane's
+        // bits), negated to shift right
+        let mut c = reg(v.xs.get(1));
+        if id != ir.IN_SHLV {
+            let n = vvr();
+            raw2(ae.v2(1, 1, k, 0x0b, 0, 0), n, c);
+            c = n;
+        }
+        let mut u_: u64 = 1;
+        if id == ir.IN_ASHRV {
+            u_ = 0;
+        }
+        raw3(ae.v3(1, u_, k, 0x08, 0, 0, 0), d, reg(a0), c);
+        return;
+    }
+    if id == ir.IN_DOT_I8 {
+        // SDOT into zero
+        raw1(ae.movi_zero(0), d);
+        _ = raw(ae.sdot(0, 0, 0), RW(d), R(reg(a0)), R(reg(v.xs.get(1))), NONE());
+        return;
+    }
     if id == ir.IN_DOT_I16 {
         let a = reg(a0);
         let b = reg(v.xs.get(1));
@@ -2658,6 +2725,10 @@ fn gen_inst(v: *mut ir.Value) void {
     }
     if (v.flag & 64) != 0 {
         gen_mull(v);
+        return;
+    }
+    if (v.flag & 128) != 0 {
+        gen_addw(v);
         return;
     }
     if o == ir.OP_COPY {
@@ -2918,6 +2989,22 @@ fn prepare(f: *mut ir.Func) void {
                         m.a.aux2 += 1;
                         m.b.aux2 += 1;
                     }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // acc + x and acc - x of a widened half x (SADDW, USUBW2 ...)
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if ((i.op == ir.OP_ADD) or (i.op == ir.OP_SUB)) and (i.ty.kind == ir.T_VEC) and ((i.flag & (4 | 32)) == 0) {
+                let w = addw_operand(i);
+                if u.notnil(w) {
+                    i.flag = i.flag | 128;
+                    w.aux2 += 1;
                 }
             }
             i = i.next;

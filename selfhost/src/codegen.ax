@@ -2264,6 +2264,24 @@ fn gen_shift(op: i32, t: *mut ast.Type, x: *mut ir.Value, k: *mut ir.Value) *mut
             return ir.intr(B, sid, x.ty, sargs[..]);
         }
     }
+    if (k.ty.kind == ir.T_VEC) and on_a64() and (k.ty.elem.bits == x.ty.elem.bits) and
+       ((@as(u64, @bit_cast(u32, x.ty.lanes * x.ty.elem.bits)) % 128) == 0) {
+        // a count per lane, clamped to the lane's bits: USHL / SSHL by it, or by
+        // its negation to the right (a64.ax), whose counts of the bits or more
+        // give 0, or the sign, as here
+        let mut sid = ir.IN_SHLV;
+        if op != lx.TK_SHL {
+            sid = ir.IN_LSHRV;
+            if lane.is_signed {
+                sid = ir.IN_ASHRV;
+            }
+        }
+        let bits = ir.splat(B, k.ty, ir.cint(k.ty.elem, @as(u64, @bit_cast(u32, x.ty.elem.bits))));
+        let mut margs: [2]*mut ir.Value = [k, bits];
+        let kc = ir.intr(B, ir.IN_UMIN, k.ty, margs[..]);
+        let mut sargs: [2]*mut ir.Value = [x, kc];
+        return ir.intr(B, sid, x.ty, sargs[..]);
+    }
     if k.ty.kind == ir.T_VEC {
         // a count per lane: lane by lane
         let mut r = ir.undef(x.ty);
@@ -3488,6 +3506,27 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let y = gen(barg(e, 1));
         if vt.elem.kind == ast.TY_FLOAT {
             return reduce_add(vt, ir.binop(B, ir.OP_FMUL, x, y));
+        }
+        if vt.elem.bits == 8 {
+            if on_a64() and ((@as(u64, @bit_cast(u32, vt.lanes)) % 16) == 0) {
+                // (sdot; or fused into the add it feeds: a64.ax)
+                let mut sargs: [2]*mut ir.Value = [x, y];
+                return ir.intr(B, ir.IN_DOT_I8, lty(rt), sargs[..]);
+            }
+            // lane by lane
+            let n = @as(u64, @bit_cast(u32, rt.lanes));
+            let lt = lty(rt.elem);
+            let mut r = ir.czero(lty(rt));
+            for i in @as(u64, 0)..n {
+                let mut s = ir.czero(lt);
+                for j in @as(u64, 0)..4 {
+                    let xa = ext_int(ext_elem(x, ci32((4 * i) + j)), lt, true);
+                    let ya = ext_int(ext_elem(y, ci32((4 * i) + j)), lt, true);
+                    s = ir.binop(B, ir.OP_ADD, s, ir.binop(B, ir.OP_MUL, xa, ya));
+                }
+                r = ins_elem(r, s, ci32(i));
+            }
+            return r;
         }
         let mut dargs: [2]*mut ir.Value = [x, y];
         return ir.intr(B, ir.IN_DOT_I16, lty(rt), dargs[..]);

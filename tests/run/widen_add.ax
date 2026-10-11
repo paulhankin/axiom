@@ -1,0 +1,82 @@
+// acc + @widen_low(x), acc - @widen_high(x) ... (on AArch64 fused: saddw,
+// ssubw2, uaddw ...) against the scalar values, signed and unsigned, 8- and
+// 16-bit lanes, 128- and 512-bit vectors, a widening also used alone.
+import "../lib/io.ax" as io;
+
+let mut xs: [64]i8 = [0; 64];
+let mut us: [64]u8 = [0; 64];
+let mut hs: [32]i16 = [0; 32];
+let mut acc: [32]i16 = [0; 32];
+let mut acc32: [16]i32 = [0; 16];
+
+fn fill() void {
+    let edges: [8]i8 = [-128, 127, -1, 0, 1, -127, 64, -64];
+    for i in @as(usize, 0)..64 {
+        xs[i] = edges[(i * 5) % 8];
+        us[i] = @bit_cast(u8, edges[(i * 3) % 8]);
+    }
+    for i in @as(usize, 0)..32 {
+        acc[i] = @truncate(i16, @bit_cast(i64, @as(u64, i)) *% 2741 - 30000);
+        hs[i] = @truncate(i16, @bit_cast(i64, @as(u64, i)) *% 4093 - 32768);
+    }
+    for i in @as(usize, 0)..16 {
+        acc32[i] = @truncate(i32, @bit_cast(i64, @as(u64, i)) *% 0x0123_4567);
+    }
+}
+
+fn check() u64 {
+    let mut bad: u64 = 0;
+    let x = @load(i8x16, xs[0..16]);
+    let xu = @load(u8x16, us[0..16]);
+    let a = @load(i16x8, acc[0..8]);
+    let wl = @widen_low(x);
+    let mut r: [6]i16x8 = [@splat(0); 6];
+    r[0] = a + wl;
+    r[1] = @widen_high(x) + a;
+    r[2] = a - @widen_high(x);
+    r[3] = (a - wl) + wl;
+    r[4] = a + @bit_cast(i16x8, @widen_low(xu));
+    r[5] = wl;
+    let mut got: [48]i16 = [0; 48];
+    for k in @as(usize, 0)..6 {
+        @store(got[(k * 8)..], r[k]);
+    }
+    for i in @as(usize, 0)..8 {
+        let lo = @as(i16, xs[i]);
+        let hi = @as(i16, xs[8 + i]);
+        bad += @as(u64, got[i] != (acc[i] +% lo));
+        bad += @as(u64, got[8 + i] != (acc[i] +% hi));
+        bad += @as(u64, got[16 + i] != (acc[i] -% hi));
+        bad += @as(u64, got[24 + i] != acc[i]);
+        bad += @as(u64, got[32 + i] != (acc[i] +% @as(i16, us[i])));
+        bad += @as(u64, got[40 + i] != lo);
+    }
+    // 512-bit: i8x64 halves into i16x32 sums, and 16-bit lanes into 32-bit
+    let x4 = @load(i8x64, xs[0..64]);
+    let mut s0 = @load(i16x32, acc[0..32]);
+    let mut s1 = s0;
+    s0 = s0 + @widen_low(x4);
+    s1 = s1 - @widen_high(x4);
+    let mut g0: [32]i16 = [0; 32];
+    let mut g1: [32]i16 = [0; 32];
+    @store(g0[0..32], s0);
+    @store(g1[0..32], s1);
+    for i in @as(usize, 0)..32 {
+        bad += @as(u64, g0[i] != (acc[i] +% @as(i16, xs[i])));
+        bad += @as(u64, g1[i] != (acc[i] -% @as(i16, xs[32 + i])));
+    }
+    let h = @load(i16x32, hs[0..32]);
+    let mut t = @load(i32x16, acc32[0..16]);
+    t = t + @widen_high(h);
+    let mut g2: [16]i32 = [0; 16];
+    @store(g2[0..16], t);
+    for i in @as(usize, 0)..16 {
+        bad += @as(u64, g2[i] != (acc32[i] +% @as(i32, hs[16 + i])));
+    }
+    return bad;
+}
+
+export fn run() void {
+    fill();
+    io.uint(check());  // expect: 0
+}
