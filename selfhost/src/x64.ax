@@ -882,6 +882,11 @@ fn base_mem(q: *mut ir.Value) mc.MOp {
             return m;
         }
     }
+    if tls_global(q) and not WIN {
+        // (fs-relative, with no base register: the thread pointer is not
+        // loaded for each access)
+        return tls_mem(q);
+    }
     return mc.mem(reg(q), -1, 0, 0);
 }
 
@@ -2752,6 +2757,9 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
             a = reg(pick_val(bcast_splat(x0), x1, x0));
             b = addr(s.a.a);
             bc = true;
+        } else if ir.is_op(x0, ir.OP_LOAD) and ((x0.flag & 8) != 0) {
+            a = reg(x1);
+            b = vsrc(x0);
         } else {
             b = vsrc(x1);
         }
@@ -5360,7 +5368,9 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if id == ir.IN_DOT_I16 {
-        sse3(xe.PMADDWD, d, reg(a0), R(reg(v.xs.get(1))));
+        let mut a: i32 = 0;
+        let b = intr_src(v, &mut a);
+        sse3(xe.PMADDWD, d, a, b);
         return;
     }
     if id == ir.IN_SAD_U8 {
@@ -5373,13 +5383,13 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         gen_float_intr(v, id);
         return;
     }
-    let a = reg(a0);
     let k = lk(at);
     if id == ir.IN_ABS {
-        sse_unary_packed(xe.PABSB + k, d, R(a));
+        sse_unary_packed(xe.PABSB + k, d, R(reg(a0)));
         return;
     }
-    let b = reg(v.xs.get(1));
+    let mut a: i32 = 0;
+    let b = intr_src(v, &mut a);
     let mut op: i32 = 0;
     if id == ir.IN_SMIN {
         if k == 0 {
@@ -5425,7 +5435,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         fail(u.f1("vector intrinsic %s", u.idec(id)));
         return;
     }
-    sse3(op, d, a, R(b));
+    sse3(op, d, a, b);
 }
 
 // -----------------------------------------------------------------------------
@@ -6273,9 +6283,56 @@ fn reads_as_rm(us: *ir.Value, x: *mut ir.Value) bool {
         return (us.b == x) and (us.a != x);
     }
     if (o == ir.OP_INTR) and (@truncate(i32, @bit_cast(i64, us.cv)) == ir.IN_FMA) {
-        return (us.xs.get(1) == x) and (us.xs.get(0) != x) and (us.xs.get(2) != x) and not bcast_splat(us.xs.get(0));
+        let x0 = us.xs.get(0);
+        let x1 = us.xs.get(1);
+        if (x0 == x) and (x1 != x) and (us.xs.get(2) != x) and not bcast_splat(x1) and not ir.is_op(x1, ir.OP_LOAD) {
+            return true;  // (the multiplicands swapped: gen_float_intr; one memory operand)
+        }
+        return (x1 == x) and (x0 != x) and (us.xs.get(2) != x) and not bcast_splat(x0);
+    }
+    if (o == ir.OP_INTR) and int_rm_intr(us) {
+        let x0 = us.xs.get(0);
+        let x1 = us.xs.get(1);
+        if intr_commutes(us) and (x0 == x) and (x1 != x) and not ir.is_op(x1, ir.OP_LOAD) {
+            return true;  // (the operands swapped: intr_src; one memory operand)
+        }
+        return (x1 == x) and (x0 != x);
     }
     return false;
+}
+
+// An integer vector intrinsic of two operands whose second the instruction
+// can read from memory (gen_vec_intr): pmaddwd, saturating adds and
+// subtractions, integer minimum and maximum.
+fn int_rm_intr(v: *ir.Value) bool {
+    if (v.xs.len != 2) or (v.xs.get(0).ty.kind != ir.T_VEC) or is.lane_float(v.xs.get(0).ty) {
+        return false;
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    let k = lk(v.xs.get(0).ty);
+    if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
+        return k <= 1;
+    }
+    return (id == ir.IN_DOT_I16) or (minmax_op(v) != 0);
+}
+
+fn intr_commutes(v: *ir.Value) bool {
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    return (id != ir.IN_SSUB_SAT) and (id != ir.IN_USUB_SAT);
+}
+
+// The operands of a two-operand intrinsic (int_rm_intr) as its instruction
+// reads them: the first a register, the second its r/m operand (a load folded
+// into it goes there).
+fn intr_src(v: *mut ir.Value, a: *mut i32) mc.MOp {
+    let x0 = v.xs.get(0);
+    let x1 = v.xs.get(1);
+    if intr_commutes(v) and ir.is_op(x0, ir.OP_LOAD) and ((x0.flag & 8) != 0) {
+        a.* = reg(x1);
+        return vsrc(x0);
+    }
+    a.* = reg(x0);
+    return vsrc(x1);
 }
 
 // IN_PERM and IN_PERM2 (perm_ok).
@@ -6491,7 +6548,13 @@ fn gen_ptradd(v: *mut ir.Value) void {
         _ = e2(xe.LEA, 8, W(d), mc.mem(a, reg(v.b), 1, 0));
         return;
     }
-    _ = e2(xe.LEA, 8, W(d), index_mem(v));
+    let mut m = index_mem(v);
+    if m.slot == -3 {
+        // lea ignores segments: the thread pointer is the base
+        m.base = tls_base();
+        m.slot = -2;
+    }
+    _ = e2(xe.LEA, 8, W(d), m);
 }
 
 // The widest vector an instruction computes or reads, as VL.
