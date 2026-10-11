@@ -503,13 +503,6 @@ fn leak(v: *mut ir.Value) void {
 // -----------------------------------------------------------------------------
 // Effects
 // -----------------------------------------------------------------------------
-fn pure_intr(id: i32) bool {
-    return (id != ir.IN_TRAP) and (id != ir.IN_MEMGROW) and (id != ir.IN_WAIT32) and (id != ir.IN_NOTIFY) and
-           (id != ir.IN_SET_SP) and (id != ir.IN_GET_SP) and (id != ir.IN_FRAME_ADDR) and (id != ir.IN_MEMSIZE) and
-           (id != ir.IN_CPUID) and (id != ir.IN_XGETBV) and (id != ir.IN_LOAD_PARTIAL) and
-           (id != ir.IN_STORE_PARTIAL) and not ir.is_prefetch(id);
-}
-
 // x86-64's masked vector loads and stores (codegen.ax makes them for
 // @load_partial and @store_partial): memory accesses at their pointer, of at
 // most the vector's size.
@@ -520,18 +513,14 @@ fn partial_loc(i: *ir.Value) Loc {
     return loc_of(i.xs.get(1), @bit_cast(i64, i.xs.get(0).ty.size));
 }
 
+// The pure operations (ir.OPF_PURE, ir.INF_PURE), but not the aggregate
+// ones (extractvalue, insertvalue), which value numbering leaves alone.
 fn cse_able(i: *ir.Value) bool {
     let op = i.op;
-    if ((op >= ir.OP_ADD) and (op <= ir.OP_FPTOUI_SAT)) or (op == ir.OP_PTRADD) {
-        return true;
-    }
-    if (op == ir.OP_EXTRACTELEM) or (op == ir.OP_INSERTELEM) or (op == ir.OP_SHUFFLE) or (op == ir.OP_SPLAT) {
-        return true;
-    }
     if op == ir.OP_INTR {
-        return pure_intr(ir.intr_id(i));
+        return ir.intr_pure(ir.intr_id(i));
     }
-    return false;
+    return ir.op_pure(op) and (op != ir.OP_EXTRACTVALUE) and (op != ir.OP_INSERTVALUE);
 }
 
 fn size_of(n: *ir.Value) i64 {
@@ -563,8 +552,7 @@ fn note_writes(i: *mut ir.Value) void {
         push_write(W_ALL, nowhere());
     } else if ir.intr_id(i) == ir.IN_STORE_PARTIAL {
         push_write(W_LOC, partial_loc(i));
-    } else if (op == ir.OP_INTR) and not pure_intr(ir.intr_id(i)) and (ir.intr_id(i) != ir.IN_LOAD_PARTIAL) and
-              not ir.is_prefetch(ir.intr_id(i)) {
+    } else if ir.intr_opaque(ir.intr_id(i)) {
         push_write(W_ALL, nowhere());
     }
 }
@@ -3011,7 +2999,7 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
         } else if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
             // (writes part of its location: nothing it makes dead, nothing it
             // reads; a prefetch neither reads nor writes)
-        } else if (op == ir.OP_INTR) and not pure_intr(ir.intr_id(i)) {
+        } else if ir.intr_opaque(ir.intr_id(i)) {
             killed.clear();
             at_ret = false;
             ss_reads();
@@ -3075,7 +3063,7 @@ fn ss_reader(i: *mut ir.Value, depth: bool) bool {
     if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
         return false;
     }
-    if (op == ir.OP_INTR) and not pure_intr(ir.intr_id(i)) {
+    if ir.intr_opaque(ir.intr_id(i)) {
         return true;
     }
     if (op == ir.OP_RET) and depth {
@@ -3426,7 +3414,7 @@ pub fn ss_opt(f: *mut ir.Func) bool {
 // -----------------------------------------------------------------------------
 fn licm_speculatable(i: *ir.Value) bool {
     let op = i.op;
-    if (op == ir.OP_UDIV) or (op == ir.OP_SDIV) or (op == ir.OP_UREM) or (op == ir.OP_SREM) {
+    if ir.is_int_div(op) {
         if not ir.is_cint(i.b) or (ir.cint_val(i.b) == 0) {
             return false;
         }
@@ -4078,10 +4066,7 @@ fn lca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
 
 fn writes_mem(x: *ir.Value) bool {
     let op = x.op;
-    return (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
-           (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
-           ((op == ir.OP_INTR) and not cse_able(x) and (ir.intr_id(x) != ir.IN_LOAD_PARTIAL) and
-            not ir.is_prefetch(ir.intr_id(x))) or ((op == ir.OP_LOAD) and (x.flags != 0));
+    return ir.op_writes_mem(op) or ir.intr_writes_mem(ir.intr_id(x)) or ((op == ir.OP_LOAD) and (x.flags != 0));
 }
 
 // The blocks using v: their common dominator (nil: no uses).

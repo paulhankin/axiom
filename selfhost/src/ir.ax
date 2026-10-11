@@ -550,7 +550,7 @@ pub const IN_FRAME_ADDR: i32 = 89;
 pub const IN_BSWAP: i32 = 90;
 // Cache hints (@prefetch, @prefetch_write) of the line at their one operand,
 // a pointer; codegen.ax makes them for the native targets only. They read
-// and write nothing and never trap, but are kept (has_side_effects) where
+// and write nothing and never trap, but are kept (has_effects) where
 // they are: optimizations that track memory pass over them.
 pub const IN_PREFETCH: i32 = 91;   // for reading (prefetcht0, prfm pldl1keep)
 pub const IN_PREFETCHW: i32 = 92;  // for writing (prefetchw with prfchw, else prefetcht0; prfm pstl1keep)
@@ -574,6 +574,272 @@ pub fn is_widen(id: i32) bool {
 
 pub fn is_prefetch(id: i32) bool {
     return (id == IN_PREFETCH) or (id == IN_PREFETCHW);
+}
+
+// -----------------------------------------------------------------------------
+// What opcodes and intrinsics are: one table each, which the passes' own
+// questions (may it be removed, computed once, moved, run early ...) are
+// answered from. A new opcode or intrinsic gets its row here.
+// -----------------------------------------------------------------------------
+// Opcode properties (op_props):
+pub const OPF_PURE: u32 = 1;           // the result is a function of the operands alone, and nothing else
+                                       // happens (with OPF_DIV: but a fault); OP_INTR: see INF_PURE
+pub const OPF_READS_MEM: u32 = 2;      // may read memory (a volatile load: see has_effects)
+pub const OPF_WRITES_MEM: u32 = 4;     // may write memory, or order accesses (fence, atomics), or run code
+pub const OPF_TERM: u32 = 8;           // ends its block
+pub const OPF_INT_BINOP: u32 = 16;     // integer operation of a and b (lane by lane for vectors)
+pub const OPF_FP_BINOP: u32 = 32;      // floating point operation of a and b
+pub const OPF_CAST: u32 = 64;          // a converted to the result's type (lane by lane)
+pub const OPF_COMMUTATIVE: u32 = 128;  // a op b == b op a (floating point: NaNs aside)
+pub const OPF_DIV: u32 = 256;          // integer division: a zero divisor (or signed MIN / -1) faults
+
+const OPF_PURE_INT: u32 = OPF_PURE | OPF_INT_BINOP;
+const OPF_PURE_FP: u32 = OPF_PURE | OPF_FP_BINOP;
+const OPF_PURE_CAST: u32 = OPF_PURE | OPF_CAST;
+const OPF_MEM: u32 = OPF_READS_MEM | OPF_WRITES_MEM;
+
+let OP_PROPS: [60]u32 = [
+    0,  // (no opcode 0)
+    OPF_PURE_INT | OPF_COMMUTATIVE,  // OP_ADD
+    OPF_PURE_INT,                    // OP_SUB
+    OPF_PURE_INT | OPF_COMMUTATIVE,  // OP_MUL
+    OPF_PURE_INT | OPF_DIV,          // OP_UDIV
+    OPF_PURE_INT | OPF_DIV,          // OP_SDIV
+    OPF_PURE_INT | OPF_DIV,          // OP_UREM
+    OPF_PURE_INT | OPF_DIV,          // OP_SREM
+    OPF_PURE_INT | OPF_COMMUTATIVE,  // OP_AND
+    OPF_PURE_INT | OPF_COMMUTATIVE,  // OP_OR
+    OPF_PURE_INT | OPF_COMMUTATIVE,  // OP_XOR
+    OPF_PURE_INT,                    // OP_SHL
+    OPF_PURE_INT,                    // OP_LSHR
+    OPF_PURE_INT,                    // OP_ASHR
+    OPF_PURE_FP | OPF_COMMUTATIVE,   // OP_FADD
+    OPF_PURE_FP,                     // OP_FSUB
+    OPF_PURE_FP | OPF_COMMUTATIVE,   // OP_FMUL
+    OPF_PURE_FP,                     // OP_FDIV
+    OPF_PURE_FP,                     // OP_FREM
+    OPF_PURE,                        // OP_FNEG
+    OPF_PURE,                        // OP_ICMP
+    OPF_PURE,                        // OP_FCMP
+    OPF_PURE,                        // OP_SELECT
+    OPF_PURE_CAST,                   // OP_ZEXT
+    OPF_PURE_CAST,                   // OP_SEXT
+    OPF_PURE_CAST,                   // OP_TRUNC
+    OPF_PURE_CAST,                   // OP_BITCAST
+    OPF_PURE_CAST,                   // OP_PTRTOINT
+    OPF_PURE_CAST,                   // OP_INTTOPTR
+    OPF_PURE_CAST,                   // OP_FPEXT
+    OPF_PURE_CAST,                   // OP_FPTRUNC
+    OPF_PURE_CAST,                   // OP_SITOFP
+    OPF_PURE_CAST,                   // OP_UITOFP
+    OPF_PURE_CAST,                   // OP_FPTOSI_SAT (saturates: never faults)
+    OPF_PURE_CAST,                   // OP_FPTOUI_SAT
+    0,                               // OP_ALLOCA (a new address each time it runs)
+    OPF_READS_MEM,                   // OP_LOAD
+    OPF_WRITES_MEM,                  // OP_STORE
+    OPF_PURE,                        // OP_PTRADD
+    OPF_MEM,                         // OP_MEMCPY
+    OPF_MEM,                         // OP_MEMMOVE
+    OPF_WRITES_MEM,                  // OP_MEMSET
+    OPF_MEM,                         // OP_RMW
+    OPF_MEM,                         // OP_CMPXCHG
+    OPF_MEM,                         // OP_FENCE
+    OPF_PURE,                        // OP_EXTRACTVALUE
+    OPF_PURE,                        // OP_INSERTVALUE
+    OPF_PURE,                        // OP_EXTRACTELEM
+    OPF_PURE,                        // OP_INSERTELEM
+    OPF_PURE,                        // OP_SHUFFLE
+    OPF_PURE,                        // OP_SPLAT
+    OPF_MEM,                         // OP_CALL
+    0,                               // OP_INTR (intr_props)
+    0,                               // OP_PHI
+    OPF_TERM,                        // OP_BR
+    OPF_TERM,                        // OP_CONDBR
+    OPF_TERM,                        // OP_SWITCH
+    OPF_TERM,                        // OP_RET
+    OPF_TERM,                        // OP_UNREACHABLE
+    0,                               // OP_COPY (backends only)
+];
+
+pub fn op_props(op: i32) u32 {
+    if (op < 0) or (op > OP_COPY) {
+        return 0;
+    }
+    return OP_PROPS[@int_cast(usize, op)];
+}
+
+// Intrinsic properties (intr_props); each intrinsic is one of PURE,
+// READS_MEM, WRITES_MEM, HINT and OPAQUE:
+pub const INF_PURE: u32 = 1;        // the result is a function of the operands alone, and nothing else happens
+pub const INF_READS_MEM: u32 = 2;   // reads memory at its pointer operand, and does nothing else
+pub const INF_WRITES_MEM: u32 = 4;  // writes memory at its pointer operand, and does nothing else
+pub const INF_HINT: u32 = 8;        // reads and writes nothing, but is kept where it is (prefetches)
+pub const INF_OPAQUE: u32 = 16;     // reads or changes state the passes do not model (the stack pointer,
+                                    // the memory's size, the CPU) or traps: as though it read and wrote
+                                    // any memory, and never removed or moved
+pub const INF_LANEWISE: u32 = 32;   // PURE, and the same operation on each lane of vector operands
+
+const INF_LANES: u32 = INF_PURE | INF_LANEWISE;
+
+let IN_PROPS: [98]u32 = [
+    0,               // (no intrinsic 0)
+    INF_LANES,       // IN_CTLZ
+    INF_LANES,       // IN_CTTZ
+    INF_LANES,       // IN_CTPOP
+    INF_LANES,       // IN_ROTL
+    INF_LANES,       // IN_ROTR
+    INF_LANES,       // IN_SADD_SAT
+    INF_LANES,       // IN_UADD_SAT
+    INF_LANES,       // IN_SSUB_SAT
+    INF_LANES,       // IN_USUB_SAT
+    INF_LANES,       // IN_SMIN
+    INF_LANES,       // IN_SMAX
+    INF_LANES,       // IN_UMIN
+    INF_LANES,       // IN_UMAX
+    INF_LANES,       // IN_FMIN
+    INF_LANES,       // IN_FMAX
+    INF_LANES,       // IN_FABS
+    INF_LANES,       // IN_SQRT
+    INF_LANES,       // IN_FLOOR
+    INF_LANES,       // IN_CEIL
+    INF_LANES,       // IN_FTRUNC
+    INF_LANES,       // IN_NEAREST
+    INF_LANES,       // IN_FMA
+    INF_LANES,       // IN_COPYSIGN
+    INF_LANES,       // IN_ABS
+    INF_OPAQUE,      // IN_TRAP
+    INF_OPAQUE,      // IN_MEMSIZE
+    INF_OPAQUE,      // IN_MEMGROW
+    INF_OPAQUE,      // IN_WAIT32
+    INF_OPAQUE,      // IN_NOTIFY
+    INF_OPAQUE,      // IN_SET_SP
+    INF_PURE,        // IN_ANYTRUE
+    INF_PURE,        // IN_ALLTRUE
+    INF_PURE,        // IN_BITMASK
+    INF_PURE,        // IN_SWIZZLE
+    INF_PURE,        // IN_DOT_I16
+    INF_PURE,        // IN_UMUL_OV
+    INF_PURE,        // IN_SMUL_OV
+    INF_OPAQUE,      // IN_GET_SP
+    INF_OPAQUE,      // IN_CPUID
+    INF_OPAQUE,      // IN_XGETBV
+    INF_PURE,        // IN_AESENC
+    INF_PURE,        // IN_AESENCLAST
+    INF_PURE,        // IN_AESDEC
+    INF_PURE,        // IN_AESDECLAST
+    INF_PURE,        // IN_AESIMC
+    INF_PURE,        // IN_AESKEYGEN
+    INF_PURE,        // IN_CLMUL
+    INF_PURE,        // IN_SHA1RNDS4
+    INF_PURE,        // IN_SHA1NEXTE
+    INF_PURE,        // IN_SHA1MSG1
+    INF_PURE,        // IN_SHA1MSG2
+    INF_PURE,        // IN_SHA256RNDS2
+    INF_PURE,        // IN_SHA256MSG1
+    INF_PURE,        // IN_SHA256MSG2
+    INF_PURE,        // IN_CRC32C
+    INF_PURE,        // IN_AESE
+    INF_PURE,        // IN_AESD
+    INF_PURE,        // IN_AESMC
+    INF_PURE,        // IN_AESIMC_A
+    INF_PURE,        // IN_PMULL
+    INF_PURE,        // IN_PMULL2
+    INF_PURE,        // IN_SHA1C
+    INF_PURE,        // IN_SHA1P
+    INF_PURE,        // IN_SHA1M
+    INF_PURE,        // IN_SHA1H
+    INF_PURE,        // IN_SHA1SU0
+    INF_PURE,        // IN_SHA1SU1
+    INF_PURE,        // IN_SHA256H
+    INF_PURE,        // IN_SHA256H2
+    INF_PURE,        // IN_SHA256SU0
+    INF_PURE,        // IN_SHA256SU1
+    INF_PURE,        // IN_SHA512H
+    INF_PURE,        // IN_SHA512H2
+    INF_PURE,        // IN_SHA512SU0
+    INF_PURE,        // IN_SHA512SU1
+    INF_PURE,        // IN_EOR3
+    INF_PURE,        // IN_BCAX
+    INF_PURE,        // IN_RAX1
+    INF_PURE,        // IN_XAR
+    INF_PURE,        // IN_CRC32
+    INF_PURE,        // IN_CRC32C_A
+    INF_PURE,        // IN_PERM
+    INF_PURE,        // IN_PERM2
+    INF_READS_MEM,   // IN_LOAD_PARTIAL
+    INF_WRITES_MEM,  // IN_STORE_PARTIAL
+    INF_LANES,       // IN_SHLV
+    INF_LANES,       // IN_LSHRV
+    INF_LANES,       // IN_ASHRV
+    INF_OPAQUE,      // IN_FRAME_ADDR
+    INF_PURE,        // IN_BSWAP (of a scalar only)
+    INF_HINT,        // IN_PREFETCH
+    INF_HINT,        // IN_PREFETCHW
+    INF_PURE,        // IN_SAD_U8
+    INF_PURE,        // IN_SWIDEN_LO
+    INF_PURE,        // IN_SWIDEN_HI
+    INF_PURE,        // IN_UWIDEN_LO
+    INF_PURE,        // IN_UWIDEN_HI
+];
+
+pub fn intr_props(id: i32) u32 {
+    if (id < 0) or (id > IN_UWIDEN_HI) {
+        return 0;
+    }
+    return IN_PROPS[@int_cast(usize, id)];
+}
+
+pub fn is_int_binop(op: i32) bool {
+    return (op_props(op) & OPF_INT_BINOP) != 0;
+}
+
+// Integer or floating point (OP_ADD .. OP_FREM).
+pub fn is_binop(op: i32) bool {
+    return (op_props(op) & (OPF_INT_BINOP | OPF_FP_BINOP)) != 0;
+}
+
+pub fn is_cast(op: i32) bool {
+    return (op_props(op) & OPF_CAST) != 0;
+}
+
+pub fn is_int_div(op: i32) bool {
+    return (op_props(op) & OPF_DIV) != 0;
+}
+
+pub fn op_pure(op: i32) bool {
+    return (op_props(op) & OPF_PURE) != 0;
+}
+
+pub fn op_writes_mem(op: i32) bool {
+    return (op_props(op) & OPF_WRITES_MEM) != 0;
+}
+
+// Reads or writes memory.
+pub fn op_accesses_mem(op: i32) bool {
+    return (op_props(op) & OPF_MEM) != 0;
+}
+
+pub fn intr_pure(id: i32) bool {
+    return (intr_props(id) & INF_PURE) != 0;
+}
+
+pub fn intr_lanewise(id: i32) bool {
+    return (intr_props(id) & INF_LANEWISE) != 0;
+}
+
+pub fn intr_opaque(id: i32) bool {
+    return (intr_props(id) & INF_OPAQUE) != 0;
+}
+
+// Writes memory, or might (the opaque ones).
+pub fn intr_writes_mem(id: i32) bool {
+    return (intr_props(id) & (INF_WRITES_MEM | INF_OPAQUE)) != 0;
+}
+
+// Must be kept though its result is unused: all but the pure ones and the
+// loads.
+pub fn intr_has_effects(id: i32) bool {
+    return (intr_props(id) & (INF_WRITES_MEM | INF_HINT | INF_OPAQUE)) != 0;
 }
 
 // Argument and parameter marks (CALL ext, Func.param_ext) besides 1 (zext)
@@ -1308,7 +1574,7 @@ pub fn terminator(b: *Block) *mut Value {
 }
 
 pub fn is_term(op: i32) bool {
-    return (op >= OP_BR) and (op <= OP_UNREACHABLE);
+    return (op_props(op) & OPF_TERM) != 0;
 }
 
 // Successor blocks of a terminator.
@@ -1442,6 +1708,23 @@ pub fn replace_in(i: *mut Value, old: *mut Value, new: *mut Value) void {
 // What the passes ask of instructions
 // -----------------------------------------------------------------------------
 
+// Must instruction i be kept though its result is unused (it writes memory,
+// ends its block, is a volatile or atomic load, or an intrinsic with an
+// effect)?
+pub fn has_effects(i: *Value) bool {
+    let op = i.op;
+    if (op_props(op) & (OPF_WRITES_MEM | OPF_TERM)) != 0 {
+        return true;
+    }
+    if op == OP_LOAD {
+        return i.flags != 0;
+    }
+    if op == OP_INTR {
+        return intr_has_effects(intr_id(i));
+    }
+    return false;
+}
+
 // Is v an instruction with opcode op (false for nil)?
 pub fn is_op(v: *Value, op: i32) bool {
     return u.notnil(v) and (v.kind == V_INST) and (v.op == op);
@@ -1527,12 +1810,12 @@ pub fn is_signed_pred(p: i32) bool {
 
 // Integer operations whose operands may be swapped.
 pub fn commutative_int(op: i32) bool {
-    return (op == OP_ADD) or (op == OP_MUL) or (op == OP_AND) or (op == OP_OR) or (op == OP_XOR);
+    return (op_props(op) & (OPF_COMMUTATIVE | OPF_INT_BINOP)) == (OPF_COMMUTATIVE | OPF_INT_BINOP);
 }
 
 // The same, and the floating point ones (the same result, NaNs aside).
 pub fn commutative(op: i32) bool {
-    return commutative_int(op) or (op == OP_FADD) or (op == OP_FMUL);
+    return (op_props(op) & OPF_COMMUTATIVE) != 0;
 }
 
 // The base of address p, through additions of any offsets.
