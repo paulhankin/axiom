@@ -46,7 +46,6 @@ they travel with the code they describe.
 
 | # | Type | Area | Title |
 |---|------|------|-------|
-| [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic (fixed in dc86baf) |
 | [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | `@bit_cast` between a function pointer and an integer is invalid LLVM IR (fixed in b3bf084) |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 (fixed in b3bf084) |
 | [0106](0106-selfhost-sse2-lane-inserts.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without SSE4.1: integers put into vector lanes through the stack (fixed in 1fb5609) |
@@ -105,7 +104,7 @@ they travel with the code they describe.
 | [0048](0048-constant-array-lengths.md) | feature | language, compilers | Array lengths cannot be constant expressions |
 | [0049](0049-address-of-temporary.md) | feature | language | Cannot take the address of a temporary |
 | [0050](0050-test-output.md) | feature | tools | `axiom test` hides what a test prints |
-| [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic |
+| [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic (fixed in dc86baf) |
 | [0052](0052-runtime-cpu-dispatch.md) | feature | language, compiler, std | No runtime CPU feature dispatch (filed in error: `@features`, `@multiversion`, `@cpu_has`, §13.4; fixed in a749803: inline helpers get a version's extensions) |
 | [0053](0053-selfhost-native-shadow-stack.md) | feature | compiler (selfhost: codegen, inline, x64, a64, linkers), runtime | Self-hosted x86-64: calls still pay for the shadow stack (no frame tables) |
 | [0054](0054-selfhost-regalloc-spills.md) | feature | compiler (selfhost: mach) | Self-hosted register allocator spills hot values and copies around its spill code (fixed in 3530ca4) |
