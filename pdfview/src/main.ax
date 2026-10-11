@@ -1,0 +1,1164 @@
+// =============================================================================
+// File: main.ax
+// Pdfview: a PDF viewer for macOS. The pages, one under another, scroll
+// continuously; a sidebar shows them small, to jump to; they can be zoomed
+// from 10% to 800%, and stay sharp: each page is drawn whole at up to some
+// eight million pixels, and when zooming in needs more, the part of it in
+// the window is drawn again at full detail once the zoom settles.
+//
+//   axiom build pdfview --target=aarch64-macos -O2 -o pdfview
+//   ./pdfview paper.pdf           (or no file, and File > Open…)
+//   ./pdfview paper.pdf --png view.png [--page 3] [--zoom 1.5]
+//                                 (draws the window offscreen, saves it)
+//
+// Scroll with the trackpad or wheel, or drag the page; Command and scroll
+// to zoom about the pointer. Keys: arrows (left and right a page at a
+// time), space, Page Up / Page Down, Home, End; Command = and - zoom,
+// Command 0 is actual size, Command 9 fits the width, Command T shows and
+// hides the sidebar, Command O opens a file.
+//
+// Core Graphics draws the pages (doc.ax); the window is std/os/cocoa, drawn
+// with std/graphics/quartz over std/graphics/metal.
+// =============================================================================
+
+import "doc.ax" as docs;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/image/png" as png;
+import "std/graphics/metal" as metal;
+import "std/graphics/quartz" as quartz;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/cocoa" as cocoa;
+import "std/os/fs" as fs;
+import "std/str" as strs;
+import "std/time" as time;
+
+// Layout, in points
+const TOOLBAR: f32 = 46.0;
+const SIDEBAR_W: f32 = 184.0;
+const MARGIN: f32 = 24.0;
+const GAP: f32 = 16.0;
+const THUMB_W: f32 = 112.0;
+const THUMB_H: f32 = 150.0;
+const THUMB_LABEL: f32 = 34.0;
+const MIN_ZOOM: f32 = 0.1;
+const MAX_ZOOM: f32 = 8.0;
+const MAX_PIXELS: f32 = 8.0e6;  // in a whole page's image
+const SETTLE_MS: i64 = 150;      // after a zoom, before drawing pages again
+
+// Menu items
+const OPEN: u32 = 1;
+const ZOOM_IN: u32 = 2;
+const ZOOM_OUT: u32 = 3;
+const ACTUAL: u32 = 4;
+const FIT: u32 = 5;
+const SIDEBAR: u32 = 6;
+const NEXT: u32 = 7;
+const PREVIOUS: u32 = 8;
+const FIRST: u32 = 9;
+const LAST: u32 = 10;
+
+struct Tile {
+    im: docs.Image,
+    scale: f32,  // pixels a point it was drawn at
+}
+
+// A part of a page drawn at full detail: x, y, w, h in the page's points.
+struct Detail {
+    im: docs.Image,
+    page: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    scale: f32,
+}
+
+struct App {
+    open: bool,
+    d: docs.Doc,
+    name: [256]u8,
+    name_len: usize,
+    message: []u8,
+    tiles: []mut Tile,
+    thumbs: []mut Tile,
+    details: [4]Detail,
+    tops: []mut f32,        // each page's top in the content, at the zoom
+    thumb_tops: []mut f32,  // each thumbnail's top in the sidebar
+    content_w: f32,
+    content_h: f32,
+    sidebar_h: f32,
+    zoom: f32,
+    fit: bool,
+    scroll_x: f32,
+    scroll_y: f32,
+    sidebar_scroll: f32,
+    sidebar: bool,
+    win_w: f32,  // points
+    win_h: f32,
+    px: f32,     // pixels a point
+    mouse_x: f32,
+    mouse_y: f32,
+    dragging: bool,
+    drag_x: f32,
+    drag_y: f32,
+    drag_sx: f32,
+    drag_sy: f32,
+    command: bool,
+    shift: bool,
+    zoomed: time.Instant,
+    patient: bool,  // draw detail without waiting for the zoom to settle
+    current: usize,
+    dirty: bool,
+    retitle: bool,
+}
+
+fn empty_f32() []mut f32 {
+    return @slice_from_ptr(@ptr_from_int(*mut f32, 8), 0);
+}
+
+fn empty_tiles() []mut Tile {
+    return @slice_from_ptr(@ptr_from_int(*mut Tile, 8), 0);
+}
+
+fn no_detail() Detail {
+    return Detail.{ im: docs.none(), page: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0, scale: 0.0 };
+}
+
+fn new_app(w: f32, h: f32, px: f32) App {
+    return App.{ open: false, d: docs.nothing(), name: [0; 256], name_len: 0, message: "", tiles: empty_tiles(),
+                 thumbs: empty_tiles(), details: [no_detail(); 4], tops: empty_f32(), thumb_tops: empty_f32(),
+                 content_w: 0.0, content_h: 0.0, sidebar_h: 0.0, zoom: 1.0, fit: true, scroll_x: 0.0,
+                 scroll_y: 0.0, sidebar_scroll: 0.0, sidebar: true, win_w: w, win_h: h, px: px, mouse_x: 0.0,
+                 mouse_y: 0.0, dragging: false, drag_x: 0.0, drag_y: 0.0, drag_sx: 0.0, drag_sy: 0.0,
+                 command: false, shift: false, zoomed: time.Instant.now(), patient: false, current: 0,
+                 dirty: true, retitle: true };
+}
+
+// -----------------------------------------------------------------------------
+// Geometry
+// -----------------------------------------------------------------------------
+fn view_x(a: *App) f32 {
+    if a.sidebar and a.open {
+        return SIDEBAR_W;
+    }
+    return 0.0;
+}
+
+fn view_w(a: *App) f32 {
+    return a.win_w - view_x(a);
+}
+
+fn view_h(a: *App) f32 {
+    return a.win_h - TOOLBAR;
+}
+
+fn page_w(a: *App, i: usize) f32 {
+    return a.d.pages[i].width * a.zoom;
+}
+
+fn page_h(a: *App, i: usize) f32 {
+    return a.d.pages[i].height * a.zoom;
+}
+
+// A page's thumbnail scale (points of thumbnail a point of page).
+fn thumb_scale(a: *App, i: usize) f32 {
+    let p = a.d.pages[i];
+    return @min(THUMB_W / p.width, THUMB_H / p.height);
+}
+
+fn widest(a: *App) f32 {
+    let mut w: f32 = 1.0;
+    for p in a.d.pages {
+        w = @max(w, p.width);
+    }
+    return w;
+}
+
+fn layout(a: *mut App) void {
+    let mut y = MARGIN;
+    let mut ty: f32 = 14.0;
+    for i in 0..a.d.count() {
+        a.tops[i] = y;
+        y += page_h(a, i) + GAP;
+        a.thumb_tops[i] = ty;
+        ty += (a.d.pages[i].height * thumb_scale(a, i)) + THUMB_LABEL;
+    }
+    a.content_h = (y - GAP) + MARGIN;
+    a.content_w = (widest(a) * a.zoom) + (2.0 * MARGIN);
+    a.sidebar_h = ty;
+}
+
+fn clamp(a: *mut App) void {
+    a.scroll_y = @max(@min(a.scroll_y, a.content_h - view_h(a)), 0.0);
+    a.scroll_x = @max(@min(a.scroll_x, a.content_w - view_w(a)), 0.0);
+    a.sidebar_scroll = @max(@min(a.sidebar_scroll, a.sidebar_h - view_h(a)), 0.0);
+}
+
+// Page i's place in the window: x, y, w, h.
+fn page_rect(a: *App, i: usize) [4]f32 {
+    let w = page_w(a, i);
+    let mut x = view_x(a) + ((view_w(a) - w) * 0.5);
+    if a.content_w > view_w(a) {
+        x = (view_x(a) + MARGIN + (((a.content_w - (2.0 * MARGIN)) - w) * 0.5)) - a.scroll_x;
+    }
+    return [x, (TOOLBAR + a.tops[i]) - a.scroll_y, w, page_h(a, i)];
+}
+
+// The page at height y of the content (the last that starts above it).
+fn page_at(a: *App, y: f32) usize {
+    let mut lo: usize = 0;
+    let mut hi = a.d.count();
+    while (hi - lo) > 1 {
+        let mid = (lo + hi) / 2;
+        if a.tops[mid] <= y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// The pages in the window: first, last (inclusive).
+fn visible(a: *App) [2]usize {
+    let first = page_at(a, a.scroll_y - GAP);
+    let last = page_at(a, a.scroll_y + view_h(a));
+    return [first, last];
+}
+
+fn thumbs_visible(a: *App) [2]usize {
+    let mut first: usize = 0;
+    let n = a.d.count();
+    while ((first + 1) < n) and (a.thumb_tops[first + 1] < a.sidebar_scroll) {
+        first += 1;
+    }
+    let mut last = first;
+    while ((last + 1) < n) and (a.thumb_tops[last + 1] < (a.sidebar_scroll + view_h(a))) {
+        last += 1;
+    }
+    return [first, last];
+}
+
+fn fit_zoom(a: *App) f32 {
+    return @max(@min((view_w(a) - (2.0 * MARGIN)) / widest(a), MAX_ZOOM), MIN_ZOOM);
+}
+
+// Zooms to z keeping the point (ax, ay) of the window where it is.
+fn zoom_to(a: *mut App, z0: f32, ax: f32, ay: f32) void {
+    if not a.open {
+        return;
+    }
+    let z = @max(@min(z0, MAX_ZOOM), MIN_ZOOM);
+    let vy = ay - TOOLBAR;
+    let doc_y = a.scroll_y + vy;
+    let i = page_at(a, doc_y);
+    let fy = (doc_y - a.tops[i]) / page_h(a, i);
+    let mut left = view_x(a) - a.scroll_x;
+    if a.content_w <= view_w(a) {
+        left = view_x(a) + ((view_w(a) - a.content_w) * 0.5);
+    }
+    let fx = (ax - left) / a.content_w;
+    a.zoom = z;
+    layout(a);
+    a.scroll_y = (a.tops[i] + (fy * page_h(a, i))) - vy;
+    a.scroll_x = (fx * a.content_w) - (ax - view_x(a));
+    clamp(a);
+    a.zoomed = time.Instant.now();
+    a.dirty = true;
+}
+
+fn zoom_by(a: *mut App, k: f32) void {
+    a.fit = false;
+    zoom_to(a, a.zoom * k, view_x(a) + (view_w(a) * 0.5), TOOLBAR + (view_h(a) * 0.5));
+}
+
+fn refit(a: *mut App) void {
+    if a.open and a.fit {
+        zoom_to(a, fit_zoom(a), view_x(a) + (view_w(a) * 0.5), TOOLBAR);
+    }
+}
+
+fn go_to(a: *mut App, i: usize) void {
+    if not a.open {
+        return;
+    }
+    a.scroll_y = a.tops[@min(i, a.d.count() - 1)] - (MARGIN * 0.5);
+    clamp(a);
+    a.dirty = true;
+}
+
+// The current page (the one a third of the way down the window), and the
+// sidebar scrolled to show it when it changes.
+fn track(a: *mut App) void {
+    if not a.open {
+        return;
+    }
+    let c = page_at(a, a.scroll_y + (view_h(a) * 0.3));
+    if c == a.current {
+        return;
+    }
+    a.current = c;
+    let top = a.thumb_tops[c] - 10.0;
+    let bottom = a.thumb_tops[c] + (a.d.pages[c].height * thumb_scale(a, c)) + THUMB_LABEL;
+    if top < a.sidebar_scroll {
+        a.sidebar_scroll = top;
+    } else if bottom > (a.sidebar_scroll + view_h(a)) {
+        a.sidebar_scroll = bottom - view_h(a);
+    }
+    clamp(a);
+    a.dirty = true;
+}
+
+// -----------------------------------------------------------------------------
+// Documents
+// -----------------------------------------------------------------------------
+fn forget(a: *mut App) void {
+    if not a.open {
+        return;
+    }
+    for i in 0..a.tiles.len {
+        docs.release(&mut a.tiles[i].im);
+        docs.release(&mut a.thumbs[i].im);
+    }
+    for k in @as(usize, 0)..4 {
+        docs.release(&mut a.details[k].im);
+    }
+    mem.free(a.tiles);
+    mem.free(a.thumbs);
+    mem.free(a.tops);
+    mem.free(a.thumb_tops);
+    a.tiles = empty_tiles();
+    a.thumbs = empty_tiles();
+    a.tops = empty_f32();
+    a.thumb_tops = empty_f32();
+    a.d.close();
+    a.d = docs.nothing();
+    a.open = false;
+}
+
+fn load(a: *mut App, path: []u8) void {
+    let d = docs.Doc.open(path) catch |e| {
+        if e == error.Encrypted {
+            a.message = "That PDF is protected by a password.";
+        } else if e == error.Unreadable {
+            a.message = "That file could not be read as a PDF.";
+        } else {
+            a.message = "That PDF could not be opened.";
+        }
+        a.dirty = true;
+        return;
+    };
+    let n = d.count();
+    if n == 0 {
+        let mut dd = d;
+        dd.close();
+        a.message = "That PDF has no pages.";
+        a.dirty = true;
+        return;
+    }
+    let tiles = mem.alloc.[Tile](n) catch return;
+    let thumbs = mem.alloc.[Tile](n) catch return;
+    let tops = mem.alloc.[f32](n) catch return;
+    let thumb_tops = mem.alloc.[f32](n) catch return;
+    forget(a);
+    for i in 0..n {
+        tiles[i] = Tile.{ im: docs.none(), scale: 0.0 };
+        thumbs[i] = Tile.{ im: docs.none(), scale: 0.0 };
+    }
+    a.d = d;
+    a.open = true;
+    a.tiles = tiles;
+    a.thumbs = thumbs;
+    a.tops = tops;
+    a.thumb_tops = thumb_tops;
+    a.message = "";
+    // the name: the path's last part
+    let mut start: usize = 0;
+    for k in 0..path.len {
+        if path[k] == '/' {
+            start = k + 1;
+        }
+    }
+    a.name_len = @min(path.len - start, a.name.len);
+    @mem_copy(a.name[..a.name_len], path[start..(start + a.name_len)]);
+    a.fit = true;
+    a.zoom = 1.0;
+    layout(a);
+    a.zoom = @min(fit_zoom(a), 2.0);
+    a.fit = a.zoom == fit_zoom(a);
+    layout(a);
+    a.scroll_x = 0.0;
+    a.scroll_y = 0.0;
+    a.sidebar_scroll = 0.0;
+    a.current = 0;
+    clamp(a);
+    a.dirty = true;
+    a.retitle = true;
+}
+
+fn ask_to_open(a: *mut App) void {
+    let exts: [1][]u8 = ["pdf"];
+    let path = cocoa.open_file("Open a PDF", exts[..]) catch return;
+    defer mem.free(path);
+    if path.len > 0 {
+        load(a, path);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Drawing pages, a little at a time
+// -----------------------------------------------------------------------------
+fn settled(a: *App) bool {
+    return a.patient or (a.zoomed.elapsed().as_millis() >= SETTLE_MS);
+}
+
+// The scale a whole page is drawn at: as sharp as the window, up to
+// MAX_PIXELS.
+fn whole_scale(a: *App, i: usize) f32 {
+    let p = a.d.pages[i];
+    return @min(a.zoom * a.px, @sqrt(MAX_PIXELS / (p.width * p.height)));
+}
+
+fn near_enough(have: f32, want: f32) bool {
+    return @abs(have - want) <= (want * 0.02);
+}
+
+// Draws one page, part or thumbnail that the window needs: false if none.
+fn work(a: *mut App) bool {
+    if not a.open {
+        return false;
+    }
+    let v = visible(a);
+    let middle = (v[0] + v[1]) / 2;
+    // whole pages: missing ones first, the middle first; then wrong sizes
+    let mut best: usize = 0;
+    let mut found = false;
+    let mut best_d: usize = 0;
+    for pass in @as(u32, 0)..2 {
+        if found {
+            break;
+        }
+        if (pass == 1) and not settled(a) {
+            break;
+        }
+        for i in v[0]..(v[1] + 1) {
+            let t = a.tiles[i];
+            let need = (t.im.img == 0) or ((pass == 1) and not near_enough(t.scale, whole_scale(a, i)));
+            let dist = @max(i, middle) - @min(i, middle);
+            if need and (not found or (dist < best_d)) {
+                best = i;
+                best_d = dist;
+                found = true;
+            }
+        }
+    }
+    if found {
+        let s = whole_scale(a, best);
+        let p = a.d.pages[best];
+        let im = a.d.render(best, 0.0, 0.0, p.width, p.height, s) catch return false;
+        docs.release(&mut a.tiles[best].im);
+        a.tiles[best] = Tile.{ im: im, scale: s };
+        a.dirty = true;
+        return true;
+    }
+    if settled(a) and detail(a, v) {
+        return true;
+    }
+    // thumbnails
+    if a.sidebar {
+        let tv = thumbs_visible(a);
+        for i in tv[0]..(tv[1] + 1) {
+            if a.thumbs[i].im.img == 0 {
+                let p = a.d.pages[i];
+                let s = thumb_scale(a, i) * a.px;
+                let im = a.d.render(i, 0.0, 0.0, p.width, p.height, s) catch return false;
+                a.thumbs[i] = Tile.{ im: im, scale: s };
+                a.dirty = true;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Where page i shows in the window, in its own points: x, y, w, h (w or h
+// 0 when it does not).
+fn shown_part(a: *App, i: usize) [4]f32 {
+    let r = page_rect(a, i);
+    let x0 = @max(r[0], view_x(a));
+    let y0 = @max(r[1], TOOLBAR);
+    let x1 = @min(r[0] + r[2], a.win_w);
+    let y1 = @min(r[1] + r[3], a.win_h);
+    if (x1 <= x0) or (y1 <= y0) {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    return [(x0 - r[0]) / a.zoom, (y0 - r[1]) / a.zoom, (x1 - x0) / a.zoom, (y1 - y0) / a.zoom];
+}
+
+// Draws the shown part of a page again at full detail, when its whole
+// image is less sharp than the window: true if it did.
+fn detail(a: *mut App, v: [2]usize) bool {
+    let want = a.zoom * a.px;
+    for i in v[0]..(v[1] + 1) {
+        if near_enough(whole_scale(a, i), want) {
+            continue;
+        }
+        let part = shown_part(a, i);
+        if part[2] <= 0.0 {
+            continue;
+        }
+        // is it already done?
+        let mut done = false;
+        for k in @as(usize, 0)..4 {
+            let dt = a.details[k];
+            if (dt.im.img != 0) and (dt.page == i) and near_enough(dt.scale, want) and (dt.x <= (part[0] + 0.5)) and
+               (dt.y <= (part[1] + 0.5)) and ((dt.x + dt.w) >= ((part[0] + part[2]) - 0.5)) and
+               ((dt.y + dt.h) >= ((part[1] + part[3]) - 0.5)) {
+                done = true;
+            }
+        }
+        if done {
+            continue;
+        }
+        // a little more than is shown, for small scrolls
+        let p = a.d.pages[i];
+        let mx = part[2] * 0.15;
+        let my = part[3] * 0.15;
+        let x0 = @max(part[0] - mx, 0.0);
+        let y0 = @max(part[1] - my, 0.0);
+        let x1 = @min(part[0] + part[2] + mx, p.width);
+        let y1 = @min(part[1] + part[3] + my, p.height);
+        let im = a.d.render(i, x0, y0, x1 - x0, y1 - y0, want) catch return false;
+        // in the slot this page had, else one of a page not shown
+        let mut slot: usize = 4;
+        for k in @as(usize, 0)..4 {
+            if (a.details[k].im.img != 0) and (a.details[k].page == i) {
+                slot = k;
+            }
+        }
+        if slot == 4 {
+            for k in @as(usize, 0)..4 {
+                let dp = a.details[k].page;
+                if (slot == 4) and ((a.details[k].im.img == 0) or (dp < v[0]) or (dp > v[1])) {
+                    slot = k;
+                }
+            }
+        }
+        if slot == 4 {
+            slot = 0;
+        }
+        docs.release(&mut a.details[slot].im);
+        a.details[slot] = Detail.{ im: im, page: i, x: x0, y: y0, w: x1 - x0, h: y1 - y0, scale: want };
+        a.dirty = true;
+        return true;
+    }
+    return false;
+}
+
+// Lets go of images far from the window.
+fn evict(a: *mut App) void {
+    if not a.open {
+        return;
+    }
+    let v = visible(a);
+    let lo = v[0] - @min(v[0], 4);
+    let hi = v[1] + 4;
+    let tv = thumbs_visible(a);
+    let tlo = tv[0] - @min(tv[0], 40);
+    let thi = tv[1] + 40;
+    for i in 0..a.tiles.len {
+        if ((i < lo) or (i > hi)) and (a.tiles[i].im.img != 0) {
+            docs.release(&mut a.tiles[i].im);
+        }
+        if ((i < tlo) or (i > thi)) and (a.thumbs[i].im.img != 0) {
+            docs.release(&mut a.thumbs[i].im);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The window
+// -----------------------------------------------------------------------------
+let BG: quartz.Color = quartz.Color.{ r: 0.125, g: 0.13, b: 0.145, a: 1.0 };
+let BAR: quartz.Color = quartz.Color.{ r: 0.17, g: 0.176, b: 0.196, a: 1.0 };
+let SIDE: quartz.Color = quartz.Color.{ r: 0.15, g: 0.156, b: 0.174, a: 1.0 };
+let LINE: quartz.Color = quartz.Color.{ r: 0.08, g: 0.084, b: 0.095, a: 1.0 };
+let BUTTON: quartz.Color = quartz.Color.{ r: 0.235, g: 0.243, b: 0.27, a: 1.0 };
+let TEXT: quartz.Color = quartz.Color.{ r: 0.92, g: 0.93, b: 0.95, a: 1.0 };
+let DIM: quartz.Color = quartz.Color.{ r: 0.58, g: 0.6, b: 0.64, a: 1.0 };
+let ACCENT: quartz.Color = quartz.Color.{ r: 0.3, g: 0.6, b: 1.0, a: 1.0 };
+
+struct Fonts {
+    name: quartz.Font,
+    small: quartz.Font,
+    button: quartz.Font,  // centred
+    label: quartz.Font,   // centred
+    big: quartz.Font,     // centred
+}
+
+fn font(c: *mut quartz.Canvas, size: f32, weight: u32, centred: bool) !quartz.Font {
+    let mut f = c.font("Helvetica Neue, Helvetica, system-ui", size, weight, false)!;
+    if centred {
+        f.align(quartz.Align.CENTER, quartz.Align.CENTER);
+    } else {
+        f.align(quartz.Align.START, quartz.Align.CENTER);
+    }
+    f.no_wrap();
+    return f;
+}
+
+fn fonts(c: *mut quartz.Canvas) !Fonts {
+    return Fonts.{ name: font(c, 13.0, quartz.BOLD, false)!, small: font(c, 11.0, quartz.NORMAL, false)!,
+                   button: font(c, 13.0, quartz.BOLD, true)!, label: font(c, 10.5, quartz.NORMAL, true)!,
+                   big: font(c, 17.0, quartz.NORMAL, true)! };
+}
+
+fn release_fonts(f: *mut Fonts) void {
+    f.name.release();
+    f.small.release();
+    f.button.release();
+    f.label.release();
+    f.big.release();
+}
+
+fn bitmap(im: docs.Image) quartz.Bitmap {
+    return quartz.Bitmap.{ img: im.img, pixels: @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0), width: im.width,
+                           height: im.height };
+}
+
+// The toolbar's buttons: x (from the left, or from the right if negative), width.
+const B_SIDEBAR: usize = 0;
+const B_OPEN: usize = 1;
+const B_OUT: usize = 2;
+const B_IN: usize = 3;
+const B_FIT: usize = 4;
+let BUTTON_X: [5]f32 = [12.0, -84.0, -258.0, -150.0, -116.0];
+let BUTTON_W: [5]f32 = [34.0, 72.0, 30.0, 30.0, 26.0];
+
+fn button_rect(a: *App, b: usize) [4]f32 {
+    let mut x = BUTTON_X[b];
+    if x < 0.0 {
+        x = a.win_w + x;
+    }
+    let mut w = BUTTON_W[b];
+    if b == B_FIT {
+        w = 26.0;
+    }
+    return [x, 9.0, w, 28.0];
+}
+
+fn inside(x: f32, y: f32, r: [4]f32) bool {
+    return (x >= r[0]) and (x < (r[0] + r[2])) and (y >= r[1]) and (y < (r[1] + r[3]));
+}
+
+fn button(c: *mut quartz.Canvas, f: *Fonts, r: [4]f32, label: []u8, on: bool) !void {
+    let mut col = BUTTON;
+    if on {
+        col = ACCENT;
+    }
+    c.fill_round_rect(r[0], r[1], r[2], r[3], 6.0, col);
+    c.text(&f.button, label, r[0], r[1] - 1.0, r[2], r[3], TEXT)!;
+}
+
+// s, or as much of it as fits in max_w points with the middle left out
+// (an ellipsis there), as the Finder shortens names: the start and the
+// extension stay.
+fn fit(c: *mut quartz.Canvas, f: *quartz.Font, s: []u8, max_w: f32, buf: []mut u8) ![]u8 {
+    if max_w <= 0.0 {
+        return "";
+    }
+    if c.measure(f, s, 1.0e6)!.width <= max_w {
+        return s;
+    }
+    // where each character starts
+    let mut starts: [257]usize = [0; 257];
+    let mut n: usize = 0;
+    for k in 0..s.len {
+        if ((s[k] & 0xc0) != 0x80) and (n < 256) {
+            starts[n] = k;
+            n += 1;
+        }
+    }
+    starts[n] = s.len;
+    // the most characters kept that fit (none always does: "…")
+    let mut lo: usize = 0;
+    let mut hi = n;
+    while (hi - lo) > 1 {
+        let mid = (lo + hi) / 2;
+        if c.measure(f, shorten(s, starts[..], n, mid, buf), 1.0e6)!.width <= max_w {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return shorten(s, starts[..], n, lo, buf);
+}
+
+// The first and last characters of s, `keep` of them, either side of "…".
+fn shorten(s: []u8, starts: []usize, n: usize, keep: usize, buf: []mut u8) []u8 {
+    let head = starts[(keep + 1) / 2];
+    let tail = starts[n - (keep / 2)];
+    let dots = "…";
+    let mut at: usize = 0;
+    @mem_copy(buf[at..(at + head)], s[..head]);
+    at += head;
+    @mem_copy(buf[at..(at + dots.len)], dots);
+    at += dots.len;
+    @mem_copy(buf[at..(at + (s.len - tail))], s[tail..]);
+    at += s.len - tail;
+    return buf[..at];
+}
+
+fn toolbar(c: *mut quartz.Canvas, f: *Fonts, a: *App) !void {
+    c.fill_rect(0.0, 0.0, a.win_w, TOOLBAR, BAR);
+    c.fill_rect(0.0, TOOLBAR - 1.0, a.win_w, 1.0, LINE);
+    // the sidebar's button: a page with a panel down its left
+    let r = button_rect(a, B_SIDEBAR);
+    c.fill_round_rect(r[0], r[1], r[2], r[3], 6.0, BUTTON);
+    c.draw_round_rect(r[0] + 8.0, r[1] + 7.0, r[2] - 16.0, r[3] - 14.0, 2.0, TEXT, 1.4);
+    let mut panel = DIM;
+    if a.sidebar {
+        panel = TEXT;
+    }
+    c.fill_rect(r[0] + 8.0, r[1] + 7.0, 6.0, r[3] - 14.0, panel);
+    let mut buf: [64]u8 = [0; 64];
+    if a.open {
+        // up to the zoom buttons, cut in the middle if it is longer
+        let room = (button_rect(a, B_OUT)[0] - 16.0) - 58.0;
+        let mut cut_buf: [260]u8 = [0; 260];
+        let name = fit(c, &f.name, a.name[..a.name_len], room, cut_buf[..])!;
+        c.text(&f.name, name, 58.0, 6.0, room, 18.0, TEXT)!;
+        let s = fmt.bufprint(buf[..], "Page {} of {}", [fmt.int(a.current + 1), fmt.int(a.d.count())])!;
+        c.text(&f.small, s, 58.0, 23.0, 200.0, 16.0, DIM)!;
+        button(c, f, button_rect(a, B_OUT), "−", false)!;
+        let z = fmt.bufprint(buf[..], "{}%", [fmt.int(@int_from_float(i32, @nearest(a.zoom * 100.0)))])!;
+        c.text(&f.button, z, a.win_w - 228.0, 9.0, 78.0, 28.0, TEXT)!;
+        button(c, f, button_rect(a, B_IN), "+", false)!;
+        button(c, f, button_rect(a, B_FIT), "↔", a.fit)!;
+    } else {
+        c.text(&f.name, "Pdfview", 58.0, 0.0, 300.0, TOOLBAR, TEXT)!;
+    }
+    button(c, f, button_rect(a, B_OPEN), "Open…", false)!;
+}
+
+fn pages(c: *mut quartz.Canvas, a: *App) !void {
+    let v = visible(a);
+    let want = a.zoom * a.px;
+    for i in v[0]..(v[1] + 1) {
+        let r = page_rect(a, i);
+        c.fill_rect(r[0] - 1.0, r[1] + 1.0, r[2] + 2.0, r[3] + 2.0, quartz.rgba(0.0, 0.0, 0.0, 0.18));
+        c.fill_rect(r[0] - 0.5, r[1] + 0.5, r[2] + 1.0, r[3] + 1.0, quartz.rgba(0.0, 0.0, 0.0, 0.3));
+        let t = a.tiles[i];
+        if t.im.img != 0 {
+            let bm = bitmap(t.im);
+            c.image(&bm, r[0], r[1], r[2], r[3], 1.0);
+        } else {
+            c.fill_rect(r[0], r[1], r[2], r[3], quartz.WHITE);
+        }
+        for k in @as(usize, 0)..4 {
+            let dt = a.details[k];
+            if (dt.im.img != 0) and (dt.page == i) and near_enough(dt.scale, want) {
+                let bm = bitmap(dt.im);
+                c.image(&bm, r[0] + (dt.x * a.zoom), r[1] + (dt.y * a.zoom), dt.w * a.zoom, dt.h * a.zoom, 1.0);
+            }
+        }
+    }
+    // the scroll bar
+    let vh = view_h(a);
+    if a.content_h > vh {
+        let h = @max((vh * vh) / a.content_h, 30.0);
+        let y = TOOLBAR + ((a.scroll_y / (a.content_h - vh)) * (vh - h));
+        c.fill_round_rect(a.win_w - 9.0, y + 2.0, 5.0, h - 4.0, 2.5, quartz.rgba(1.0, 1.0, 1.0, 0.28));
+    }
+}
+
+fn sidebar(c: *mut quartz.Canvas, f: *Fonts, a: *App) !void {
+    c.fill_rect(0.0, TOOLBAR, SIDEBAR_W, view_h(a), SIDE);
+    c.fill_rect(SIDEBAR_W - 1.0, TOOLBAR, 1.0, view_h(a), LINE);
+    let tv = thumbs_visible(a);
+    let mut buf: [16]u8 = [0; 16];
+    for i in tv[0]..(tv[1] + 1) {
+        let s = thumb_scale(a, i);
+        let w = a.d.pages[i].width * s;
+        let h = a.d.pages[i].height * s;
+        let x = (SIDEBAR_W - w) * 0.5;
+        let y = (TOOLBAR + a.thumb_tops[i]) - a.sidebar_scroll;
+        if i == a.current {
+            c.fill_round_rect(x - 6.0, y - 6.0, w + 12.0, h + 12.0, 5.0, quartz.rgba(0.3, 0.6, 1.0, 0.35));
+        }
+        let t = a.thumbs[i];
+        if t.im.img != 0 {
+            let bm = bitmap(t.im);
+            c.image(&bm, x, y, w, h, 1.0);
+        } else {
+            c.fill_rect(x, y, w, h, quartz.rgb(0.85, 0.85, 0.87));
+        }
+        let mut lc = DIM;
+        if i == a.current {
+            lc = TEXT;
+        }
+        c.text(&f.label, fmt.bufprint(buf[..], "{}", [fmt.int(i + 1)])!, 0.0, y + h + 6.0, SIDEBAR_W, 16.0, lc)!;
+    }
+}
+
+fn draw(c: *mut quartz.Canvas, f: *Fonts, a: *App) !void {
+    c.begin();
+    c.fill_rect(0.0, 0.0, @float_from_int(f32, c.width), @float_from_int(f32, c.height), BG);
+    c.set_transform(a.px, 0.0, 0.0, a.px, 0.0, 0.0);
+    if a.open {
+        pages(c, a)!;
+        if a.sidebar {
+            sidebar(c, f, a)!;
+        }
+    } else {
+        let mut msg = a.message;
+        if msg.len == 0 {
+            msg = "Open a PDF with File > Open… (⌘O)";
+        }
+        c.text(&f.big, msg, 0.0, TOOLBAR, a.win_w, view_h(a), DIM)!;
+    }
+    toolbar(c, f, a)!;
+    c.end()!;
+}
+
+// -----------------------------------------------------------------------------
+// Input
+// -----------------------------------------------------------------------------
+fn press(a: *mut App, x: f32, y: f32) void {
+    if y < TOOLBAR {
+        if inside(x, y, button_rect(a, B_SIDEBAR)) {
+            a.sidebar = not a.sidebar;
+            layout_again(a);
+        } else if inside(x, y, button_rect(a, B_OPEN)) {
+            ask_to_open(a);
+        } else if inside(x, y, button_rect(a, B_OUT)) {
+            zoom_by(a, 0.8);
+        } else if inside(x, y, button_rect(a, B_IN)) {
+            zoom_by(a, 1.25);
+        } else if inside(x, y, button_rect(a, B_FIT)) {
+            a.fit = true;
+            refit(a);
+        }
+        a.dirty = true;
+        return;
+    }
+    if not a.open {
+        return;
+    }
+    if a.sidebar and (x < SIDEBAR_W) {
+        let sy = (y - TOOLBAR) + a.sidebar_scroll;
+        for i in 0..a.d.count() {
+            let h = (a.d.pages[i].height * thumb_scale(a, i)) + THUMB_LABEL;
+            if (sy >= (a.thumb_tops[i] - 8.0)) and (sy < ((a.thumb_tops[i] + h) - 8.0)) {
+                go_to(a, i);
+                return;
+            }
+        }
+        return;
+    }
+    a.dragging = true;
+    a.drag_x = x;
+    a.drag_y = y;
+    a.drag_sx = a.scroll_x;
+    a.drag_sy = a.scroll_y;
+}
+
+fn moved(a: *mut App, x: f32, y: f32) void {
+    a.mouse_x = x;
+    a.mouse_y = y;
+    if a.dragging {
+        a.scroll_x = a.drag_sx - (x - a.drag_x);
+        a.scroll_y = a.drag_sy - (y - a.drag_y);
+        clamp(a);
+        a.dirty = true;
+    }
+}
+
+fn wheel(a: *mut App, delta: i32) void {
+    if not a.open {
+        return;
+    }
+    // a wheel's notches (120 each) go 40 points; a trackpad's are points
+    let mut d = @float_from_int(f32, delta) / 12.0;
+    if (delta % 120) == 0 {
+        d = @float_from_int(f32, delta / 120) * 40.0;
+    }
+    if a.command {
+        a.fit = false;
+        zoom_to(a, a.zoom * (1.0 + (d * 0.01)), a.mouse_x, a.mouse_y);
+    } else if a.sidebar and (a.mouse_x < SIDEBAR_W) {
+        a.sidebar_scroll -= d;
+    } else if a.shift {
+        a.scroll_x -= d;
+    } else {
+        a.scroll_y -= d;
+    }
+    clamp(a);
+    a.dirty = true;
+}
+
+fn layout_again(a: *mut App) void {
+    if not a.open {
+        return;
+    }
+    if a.fit {
+        refit(a);
+    } else {
+        layout(a);
+        clamp(a);
+    }
+    a.dirty = true;
+}
+
+fn key(a: *mut App, k: u32) void {
+    let page = view_h(a) - 40.0;
+    if k == cocoa.KEY_DOWN {
+        a.scroll_y += 48.0;
+    } else if k == cocoa.KEY_UP {
+        a.scroll_y -= 48.0;
+    } else if (k == cocoa.KEY_PAGE_DOWN) or ((k == cocoa.KEY_SPACE) and not a.shift) {
+        a.scroll_y += page;
+    } else if (k == cocoa.KEY_PAGE_UP) or (k == cocoa.KEY_SPACE) {
+        a.scroll_y -= page;
+    } else if k == cocoa.KEY_HOME {
+        a.scroll_y = 0.0;
+    } else if k == cocoa.KEY_END {
+        a.scroll_y = a.content_h;
+    } else if (k == cocoa.KEY_RIGHT) and a.open {
+        go_to(a, a.current + 1);
+    } else if (k == cocoa.KEY_LEFT) and a.open {
+        go_to(a, a.current - @min(a.current, 1));
+    }
+    clamp(a);
+    a.dirty = true;
+}
+
+fn menu(a: *mut App, id: u32) void {
+    if id == OPEN {
+        ask_to_open(a);
+    } else if id == ZOOM_IN {
+        zoom_by(a, 1.25);
+    } else if id == ZOOM_OUT {
+        zoom_by(a, 0.8);
+    } else if id == ACTUAL {
+        a.fit = false;
+        zoom_to(a, 1.0, view_x(a) + (view_w(a) * 0.5), TOOLBAR + (view_h(a) * 0.5));
+    } else if id == FIT {
+        a.fit = true;
+        refit(a);
+    } else if id == SIDEBAR {
+        a.sidebar = not a.sidebar;
+        layout_again(a);
+    } else if (id == NEXT) and a.open {
+        go_to(a, a.current + 1);
+    } else if (id == PREVIOUS) and a.open {
+        go_to(a, a.current - @min(a.current, 1));
+    } else if id == FIRST {
+        go_to(a, 0);
+    } else if (id == LAST) and a.open {
+        go_to(a, a.d.count() - 1);
+    }
+    a.dirty = true;
+}
+
+fn menus() !void {
+    let file = cocoa.add_menu("File")!;
+    cocoa.add_item(file, "Open…", OPEN, "o")!;
+    let view = cocoa.add_menu("View")!;
+    cocoa.add_item(view, "Zoom In", ZOOM_IN, "=")!;
+    cocoa.add_item(view, "Zoom Out", ZOOM_OUT, "-")!;
+    cocoa.add_item(view, "Actual Size", ACTUAL, "0")!;
+    cocoa.add_item(view, "Fit Width", FIT, "9")!;
+    cocoa.add_separator(view)!;
+    cocoa.add_item(view, "Show or Hide Sidebar", SIDEBAR, "t")!;
+    let go = cocoa.add_menu("Go")!;
+    cocoa.add_item(go, "Next Page", NEXT, "]")!;
+    cocoa.add_item(go, "Previous Page", PREVIOUS, "[")!;
+    cocoa.add_item(go, "First Page", FIRST, "")!;
+    cocoa.add_item(go, "Last Page", LAST, "")!;
+}
+
+// -----------------------------------------------------------------------------
+// Running
+// -----------------------------------------------------------------------------
+fn windowed(path: []u8, frames: i64) !i32 {
+    let mut w = cocoa.Window.open("Pdfview", 1100, 820)!;
+    defer w.deinit();
+    menus()!;
+    let mut sz = w.size();
+    let mut gpu = metal.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut c = quartz.Canvas.init(sz[0], sz[1])!;
+    defer c.deinit();
+    let mut f = fonts(&mut c)!;
+    defer release_fonts(&mut f);
+    let mut ov = gpu.overlay(sz[0], sz[1])!;
+    defer ov.release();
+    let px = @float_cast(f32, w.scale());
+    let mut a = new_app(@float_from_int(f32, sz[0]) / px, @float_from_int(f32, sz[1]) / px, px);
+    defer forget(&mut a);
+    if path.len > 0 {
+        load(&mut a, path);
+    }
+    let mut title: [300]u8 = [0; 300];
+    let mut n: i64 = 0;
+    loop {
+        let e = w.next_event();
+        let k = e.kind;
+        if k == cocoa.EventKind.CLOSE {
+            break;
+        }
+        if k == cocoa.EventKind.RESIZE {
+            sz = [e.width, e.height];
+            gpu.resize(e.width, e.height)!;
+            c.resize(e.width, e.height)!;
+            gpu.resize_overlay(&mut ov, e.width, e.height)!;
+            a.px = @float_cast(f32, w.scale());
+            a.win_w = @float_from_int(f32, e.width) / a.px;
+            a.win_h = @float_from_int(f32, e.height) / a.px;
+            layout_again(&mut a);
+            a.dirty = true;
+            continue;
+        }
+        if (k == cocoa.EventKind.KEY_DOWN) or (k == cocoa.EventKind.KEY_UP) {
+            let down = k == cocoa.EventKind.KEY_DOWN;
+            if e.key == cocoa.KEY_COMMAND {
+                a.command = down;
+            } else if e.key == cocoa.KEY_SHIFT {
+                a.shift = down;
+            } else if down {
+                key(&mut a, e.key);
+            }
+            continue;
+        }
+        if k == cocoa.EventKind.MENU {
+            menu(&mut a, e.key);
+            continue;
+        }
+        if k == cocoa.EventKind.MOUSE_DOWN {
+            press(&mut a, @float_from_int(f32, e.x) / a.px, @float_from_int(f32, e.y) / a.px);
+            continue;
+        }
+        if k == cocoa.EventKind.MOUSE_MOVE {
+            moved(&mut a, @float_from_int(f32, e.x) / a.px, @float_from_int(f32, e.y) / a.px);
+            continue;
+        }
+        if k == cocoa.EventKind.MOUSE_UP {
+            a.dragging = false;
+            continue;
+        }
+        if k == cocoa.EventKind.MOUSE_WHEEL {
+            wheel(&mut a, e.delta);
+            continue;
+        }
+        if k != cocoa.EventKind.NONE {
+            continue;
+        }
+        if a.retitle {
+            a.retitle = false;
+            if a.open {
+                w.set_title(fmt.bufprint(title[..], "{}", [fmt.str(a.name[..a.name_len])])!);
+            }
+        }
+        track(&mut a);
+        let busy = work(&mut a);
+        if not a.dirty {
+            if not busy {
+                time.sleep(time.Duration.milliseconds(4));
+            }
+            continue;
+        }
+        a.dirty = false;
+        evict(&mut a);
+        draw(&mut c, &f, &a)!;
+        let t = gpu.screen();
+        gpu.begin(t)!;
+        gpu.clear(t, BG.r, BG.g, BG.b, 1.0);
+        gpu.draw_overlay(&mut ov, c.pixels());
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    return 0;
+}
+
+// The window drawn offscreen, everything in it drawn first, saved as a PNG.
+fn offscreen(path: []u8, out: []u8, page: i64, zoom: f64) !i32 {
+    let mut a = new_app(1100.0, 820.0, 2.0);
+    defer forget(&mut a);
+    a.patient = true;
+    if path.len > 0 {
+        load(&mut a, path);
+    }
+    if a.open and (zoom > 0.0) {
+        a.fit = false;
+        zoom_to(&mut a, @float_cast(f32, zoom), view_x(&a), TOOLBAR);
+    }
+    if a.open and (page > 1) {
+        go_to(&mut a, @int_cast(usize, page - 1));
+    }
+    track(&mut a);
+    while work(&mut a) {}
+    let mut c = quartz.Canvas.init(2200, 1640)!;
+    defer c.deinit();
+    let mut f = fonts(&mut c)!;
+    defer release_fonts(&mut f);
+    draw(&mut c, &f, &a)!;
+    let mut img = c.to_image()!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    if a.message.len > 0 {
+        io.stderr().println(a.message)!;
+        return 1;
+    }
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("pdfview", "A PDF viewer (macOS).");
+    defer p.deinit();
+    p.positional("file", "the PDF to open", cli.Arity.OPTIONAL)!;
+    p.option("png", 'o', "FILE", "draw the window offscreen and save it as a PNG")!;
+    p.option("page", 'p', "N", "with --png: the page to show")!;
+    p.option("zoom", 'z', "Z", "with --png: the zoom (1 is actual size)")!;
+    p.option("frames", 'n', "N", "quit after N frames")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for x in args.items.items()[1..] {
+        argv.push(x)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("pdfview: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not strs.eq(os.system(), "macos") {
+        io.stderr().println("pdfview: this needs macOS (--target=aarch64-macos)")!;
+        return 1;
+    }
+    let file = m.get("file", "");
+    if m.has("png") {
+        return offscreen(file, m.get("png", ""), m.int("page", 1)!, m.float("zoom", 0.0)!);
+    }
+    return windowed(file, m.int("frames", 0)!);
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

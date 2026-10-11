@@ -1,0 +1,241 @@
+// =============================================================================
+// File: doc.ax
+// A PDF document opened with Core Graphics (CGPDFDocument), and its pages
+// drawn into images: the whole page, or a part of it, at any scale, turned
+// by the page's /Rotate. Core Graphics returns a page's boxes as CGRects,
+// structs Axiom does not take back from C, so the boxes are read from the
+// page's dictionary instead (inherited from the page tree, as PDF says).
+// =============================================================================
+
+import "std/mem" as mem;
+import "std/os/fs" as fs;
+
+error { Unreadable, Encrypted, Failed, OutOfMemory }
+
+extern "C" "CoreGraphics" {
+    fn CGDataProviderCreateWithData(info: usize, data: *u8, size: usize, release: usize) usize;
+    fn CGDataProviderRelease(p: usize) void;
+    fn CGPDFDocumentCreateWithProvider(p: usize) usize;
+    fn CGPDFDocumentRelease(d: usize) void;
+    fn CGPDFDocumentGetNumberOfPages(d: usize) usize;
+    fn CGPDFDocumentGetPage(d: usize, n: usize) usize;
+    fn CGPDFDocumentIsUnlocked(d: usize) bool;
+    fn CGPDFDocumentUnlockWithPassword(d: usize, password: *u8) bool;
+    fn CGPDFPageGetDictionary(p: usize) usize;
+    fn CGPDFPageGetRotationAngle(p: usize) i32;
+    fn CGPDFDictionaryGetArray(d: usize, key: *u8, out: *mut usize) bool;
+    fn CGPDFDictionaryGetDictionary(d: usize, key: *u8, out: *mut usize) bool;
+    fn CGPDFArrayGetCount(a: usize) usize;
+    fn CGPDFArrayGetNumber(a: usize, i: usize, out: *mut f64) bool;
+    fn CGColorSpaceCreateDeviceRGB() usize;
+    fn CGColorSpaceRelease(cs: usize) void;
+    fn CGBitmapContextCreate(data: usize, w: usize, h: usize, bits: usize, row: usize, cs: usize, info: u32) usize;
+    fn CGBitmapContextCreateImage(c: usize) usize;
+    fn CGContextRelease(c: usize) void;
+    fn CGContextScaleCTM(c: usize, x: f64, y: f64) void;
+    fn CGContextTranslateCTM(c: usize, x: f64, y: f64) void;
+    fn CGContextRotateCTM(c: usize, angle: f64) void;
+    fn CGContextSetRGBFillColor(c: usize, r: f64, g: f64, b: f64, a: f64) void;
+    fn CGContextFillRect() void;  // (CGContextRef, CGRect): called through a cast
+    fn CGContextSetInterpolationQuality(c: usize, q: i32) void;
+    fn CGContextDrawPDFPage(c: usize, page: usize) void;
+    fn CGImageRelease(img: usize) void;
+}
+
+/// A page as it is shown: its size in points, turned.
+pub struct Page {
+    width: f32,
+    height: f32,
+    box: [4]f32,  // the crop box in the page's space: x, y, width, height
+    rotate: i32,  // 0, 90, 180 or 270 (clockwise)
+}
+
+/// No document (close does nothing to it).
+pub fn nothing() Doc {
+    return Doc.{ data: @slice_from_ptr(@ptr_from_int(*mut u8, 8), 0), provider: 0, doc: 0, space: 0,
+                 pages: @slice_from_ptr(@ptr_from_int(*mut Page, 8), 0) };
+}
+
+pub struct Doc {
+    data: []mut u8,  // the file (Core Graphics reads it from here)
+    provider: usize,
+    doc: usize,
+    space: usize,
+    pages: []mut Page,
+
+    pub fn open(path: []u8) !Doc {
+        let data = fs.read_file(path) catch return error.Unreadable;
+        let provider = CGDataProviderCreateWithData(0, data.ptr, data.len, 0);
+        if provider == 0 {
+            mem.free(data);
+            return error.Failed;
+        }
+        let doc = CGPDFDocumentCreateWithProvider(provider);
+        if doc == 0 {
+            CGDataProviderRelease(provider);
+            mem.free(data);
+            return error.Unreadable;
+        }
+        let mut d = Doc.{ data: data, provider: provider, doc: doc, space: CGColorSpaceCreateDeviceRGB(),
+                          pages: mem.alloc.[Page](0)! };
+        if not CGPDFDocumentIsUnlocked(doc) and not CGPDFDocumentUnlockWithPassword(doc, "".ptr) {
+            d.close();
+            return error.Encrypted;
+        }
+        let n = CGPDFDocumentGetNumberOfPages(doc);
+        mem.free(d.pages);
+        d.pages = mem.alloc.[Page](n) catch {
+            d.pages = mem.alloc.[Page](0) catch @trap();
+            d.close();
+            return error.OutOfMemory;
+        };
+        for i in 0..n {
+            d.pages[i] = measure(CGPDFDocumentGetPage(doc, i + 1));
+        }
+        return d;
+    }
+
+    pub fn close(self: *mut Doc) void {
+        if self.doc == 0 {
+            return;
+        }
+        CGPDFDocumentRelease(self.doc);
+        CGDataProviderRelease(self.provider);
+        CGColorSpaceRelease(self.space);
+        mem.free(self.data);
+        mem.free(self.pages);
+        self.doc = 0;
+    }
+
+    pub fn count(self: *Doc) usize {
+        return self.pages.len;
+    }
+
+    /// Draws part of page i (x, y, w, h: in points, from the top left of
+    /// the page as shown) at `scale` pixels a point, on white: a CGImage,
+    /// to be released with release().
+    pub fn render(self: *Doc, i: usize, x: f32, y: f32, w: f32, h: f32, scale: f32) !Image {
+        let pw = @max(@int_from_float(usize, @ceil(w * scale)), 1);
+        let ph = @max(@int_from_float(usize, @ceil(h * scale)), 1);
+        // premultiplied BGRA, as std/graphics/quartz's own
+        let ctx = CGBitmapContextCreate(0, pw, ph, 8, pw * 4, self.space, 0x2002);
+        if ctx == 0 {
+            return error.OutOfMemory;
+        }
+        defer CGContextRelease(ctx);
+        CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextFillRect)(
+            ctx, 0.0, 0.0, @float_from_int(f64, pw), @float_from_int(f64, ph));
+        CGContextSetInterpolationQuality(ctx, 3);
+        let p = self.pages[i];
+        let s = @float_cast(f64, scale);
+        // Core Graphics' y goes up: the part's bottom left to the origin,
+        // then the page turned into the shown page's space
+        CGContextScaleCTM(ctx, s, s);
+        CGContextTranslateCTM(ctx, @float_cast(f64, -x), @float_cast(f64, -(p.height - y - h)));
+        let bw = @float_cast(f64, p.box[2]);
+        let bh = @float_cast(f64, p.box[3]);
+        if p.rotate == 90 {
+            CGContextTranslateCTM(ctx, 0.0, bw);
+            CGContextRotateCTM(ctx, -1.5707963267948966);
+        } else if p.rotate == 180 {
+            CGContextTranslateCTM(ctx, bw, bh);
+            CGContextRotateCTM(ctx, 3.141592653589793);
+        } else if p.rotate == 270 {
+            CGContextTranslateCTM(ctx, bh, 0.0);
+            CGContextRotateCTM(ctx, 1.5707963267948966);
+        }
+        CGContextTranslateCTM(ctx, @float_cast(f64, -p.box[0]), @float_cast(f64, -p.box[1]));
+        CGContextDrawPDFPage(ctx, CGPDFDocumentGetPage(self.doc, i + 1));
+        let img = CGBitmapContextCreateImage(ctx);
+        if img == 0 {
+            return error.Failed;
+        }
+        return Image.{ img: img, width: @truncate(u32, pw), height: @truncate(u32, ph) };
+    }
+}
+
+/// A rendered page (or part): a CGImageRef and its size in pixels.
+pub struct Image {
+    img: usize,
+    width: u32,
+    height: u32,
+}
+
+pub fn release(img: *mut Image) void {
+    if img.img != 0 {
+        CGImageRelease(img.img);
+    }
+    img.img = 0;
+}
+
+pub fn none() Image {
+    return Image.{ img: 0, width: 0, height: 0 };
+}
+
+// A box (an array of four numbers) of page dictionary d or the pages above
+// it in the tree: x, y, width, height; false if there is none.
+fn find_box(d0: usize, key: []u8, out: *mut [4]f32) bool {
+    let mut d = d0;
+    for depth in @as(u32, 0)..32 {
+        _ = depth;
+        let mut a: usize = 0;
+        if CGPDFDictionaryGetArray(d, key.ptr, &mut a) and (CGPDFArrayGetCount(a) == 4) {
+            let mut v: [4]f64 = [0.0; 4];
+            for k in @as(usize, 0)..4 {
+                if not CGPDFArrayGetNumber(a, k, &mut v[k]) {
+                    return false;
+                }
+            }
+            let x0 = @min(v[0], v[2]);
+            let y0 = @min(v[1], v[3]);
+            let w = @abs(v[2] - v[0]);
+            let h = @abs(v[3] - v[1]);
+            if (w < 1.0) or (h < 1.0) {
+                return false;
+            }
+            out.* = [@float_cast(f32, x0), @float_cast(f32, y0), @float_cast(f32, w), @float_cast(f32, h)];
+            return true;
+        }
+        let mut parent: usize = 0;
+        if not CGPDFDictionaryGetDictionary(d, "Parent".ptr, &mut parent) {
+            return false;
+        }
+        d = parent;
+    }
+    return false;
+}
+
+fn measure(page: usize) Page {
+    let mut p = Page.{ width: 612.0, height: 792.0, box: [0.0, 0.0, 612.0, 792.0], rotate: 0 };
+    if page == 0 {
+        return p;
+    }
+    let d = CGPDFPageGetDictionary(page);
+    let mut media: [4]f32 = [0.0, 0.0, 612.0, 792.0];
+    _ = find_box(d, "MediaBox", &mut media);
+    let mut crop = media;
+    if find_box(d, "CropBox", &mut crop) {
+        // (the crop box is clipped to the media box)
+        let x0 = @max(crop[0], media[0]);
+        let y0 = @max(crop[1], media[1]);
+        let x1 = @min(crop[0] + crop[2], media[0] + media[2]);
+        let y1 = @min(crop[1] + crop[3], media[1] + media[3]);
+        if (x1 - x0 >= 1.0) and (y1 - y0 >= 1.0) {
+            crop = [x0, y0, x1 - x0, y1 - y0];
+        } else {
+            crop = media;
+        }
+    }
+    p.box = crop;
+    let r = ((CGPDFPageGetRotationAngle(page) % 360) + 360) % 360;
+    p.rotate = r - (r % 90);
+    if (p.rotate == 90) or (p.rotate == 270) {
+        p.width = crop[3];
+        p.height = crop[2];
+    } else {
+        p.width = crop[2];
+        p.height = crop[3];
+    }
+    return p;
+}
