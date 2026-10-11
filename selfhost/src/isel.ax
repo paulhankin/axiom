@@ -258,6 +258,90 @@ pub fn count_uses(f: *mut ir.Func, index_disp: bool, mem_arg: fn(*ir.Value, usiz
 }
 
 // -----------------------------------------------------------------------------
+// Phis
+// -----------------------------------------------------------------------------
+// Copies into the successors' phis (as one parallel assignment): each
+// as soon as no other copy still reads its destination, and a cycle broken
+// by a temporary (rather than every value through one, which would keep
+// twice as many registers live across a loop's back edge). reg, vreg,
+// class_of and copy are the target's.
+pub fn phi_copies(f: *mut mc.MFunc, b: *mut ir.Block, reg: fn(*mut ir.Value) i32, vreg: fn(*mut ir.Value) i32,
+                  class_of: fn(*ir.Ty) u8, copy: fn(i32, i32, u8) void) void {
+    let t = ir.terminator(b);
+    for k in 0..ir.succ_count(t) {
+        let s = ir.succ(t, k);
+        let mut dup = false;
+        for j in 0..k {
+            if ir.succ(t, j) == s {
+                dup = true;
+            }
+        }
+        if dup {
+            continue;
+        }
+        let mut ds = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+        let mut ss = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
+        let mut cs = u.List.[u8].{ data: u.nil.[u8](), len: 0, cap: 0 };
+        let mut p = s.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            // (an undefined input leaves the phi as it is)
+            for j in 0..p.bs.len {
+                if (p.bs.get(j) == b) and (p.xs.get(j).kind != ir.V_UNDEF) {
+                    let r = reg(p.xs.get(j));
+                    let d = vreg(p);
+                    if r != d {
+                        ds.push(d);
+                        ss.push(r);
+                        cs.push(class_of(p.ty));
+                    }
+                    break;
+                }
+            }
+            p = p.next;
+        }
+        while ds.len > 0 {
+            let mut ready: isize = -1;
+            for i in 0..ds.len {
+                let mut read = false;
+                for j in 0..ss.len {
+                    if (j != i) and (ss.get(j) == ds.get(i)) {
+                        read = true;
+                    }
+                }
+                if not read {
+                    ready = @bit_cast(isize, i);
+                    break;
+                }
+            }
+            if ready < 0 {
+                // a cycle: the first destination's value kept in a temporary
+                let d = ds.get(0);
+                let tr = mc.new_vreg(f, cs.get(0));
+                copy(tr, d, cs.get(0));
+                for j in 0..ss.len {
+                    if ss.get(j) == d {
+                        ss.set(j, tr);
+                    }
+                }
+                continue;
+            }
+            let i = @bit_cast(usize, ready);
+            copy(ds.get(i), ss.get(i), cs.get(i));
+            let last = ds.len - 1;
+            ds.set(i, ds.get(last));
+            ss.set(i, ss.get(last));
+            cs.set(i, cs.get(last));
+            ds.len = last;
+            ss.len = last;
+            cs.len = last;
+        }
+        u.free(@ptr_cast(*mut void, ds.data));
+        u.free(@ptr_cast(*mut void, ss.data));
+        u.free(@ptr_cast(*mut void, cs.data));
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Module
 // -----------------------------------------------------------------------------
 pub fn bind_of(l: i32) u8 {

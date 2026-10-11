@@ -6739,90 +6739,11 @@ fn gen_inst_at(v: *mut ir.Value) void {
     fail(u.f1("cannot select %s", ir.inst_str(v)));
 }
 
-// Copies into the successors' phis (as one parallel assignment): each
-// as soon as no other copy still reads its destination, and a cycle broken
-// by a temporary (rather than every value through one, which would keep
-// twice as many registers live across a loop's back edge).
-fn phi_copies(b: *mut ir.Block) void {
-    let t = ir.terminator(b);
-    for k in 0..ir.succ_count(t) {
-        let s = ir.succ(t, k);
-        let mut dup = false;
-        for j in 0..k {
-            if ir.succ(t, j) == s {
-                dup = true;
-            }
-        }
-        if dup {
-            continue;
-        }
-        let mut ds = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
-        let mut ss = u.List.[i32].{ data: u.nil.[i32](), len: 0, cap: 0 };
-        let mut cs = u.List.[u8].{ data: u.nil.[u8](), len: 0, cap: 0 };
-        let mut p = s.first;
-        while u.notnil(p) and (p.op == ir.OP_PHI) {
-            // (an undefined input leaves the phi as it is)
-            for j in 0..p.bs.len {
-                if (p.bs.get(j) == b) and (p.xs.get(j).kind != ir.V_UNDEF) {
-                    let r = reg(p.xs.get(j));
-                    let d = vreg(p);
-                    if r != d {
-                        ds.push(d);
-                        ss.push(r);
-                        cs.push(class_of(p.ty));
-                    }
-                    break;
-                }
-            }
-            p = p.next;
-        }
-        while ds.len > 0 {
-            let mut ready: isize = -1;
-            for i in 0..ds.len {
-                let mut read = false;
-                for j in 0..ss.len {
-                    if (j != i) and (ss.get(j) == ds.get(i)) {
-                        read = true;
-                    }
-                }
-                if not read {
-                    ready = @bit_cast(isize, i);
-                    break;
-                }
-            }
-            if ready < 0 {
-                // a cycle: the first destination's value kept in a temporary
-                let d = ds.get(0);
-                let tr = mc.new_vreg(MF, cs.get(0));
-                copy(tr, d, cs.get(0));
-                for j in 0..ss.len {
-                    if ss.get(j) == d {
-                        ss.set(j, tr);
-                    }
-                }
-                continue;
-            }
-            let i = @bit_cast(usize, ready);
-            copy(ds.get(i), ss.get(i), cs.get(i));
-            let last = ds.len - 1;
-            ds.set(i, ds.get(last));
-            ss.set(i, ss.get(last));
-            cs.set(i, cs.get(last));
-            ds.len = last;
-            ss.len = last;
-            cs.len = last;
-        }
-        u.free(@ptr_cast(*mut void, ds.data));
-        u.free(@ptr_cast(*mut void, ss.data));
-        u.free(@ptr_cast(*mut void, cs.data));
-    }
-}
-
 fn gen_term(b: *mut ir.Block) void {
     let t = ir.terminator(b);
     let o = t.op;
     if o == ir.OP_BR {
-        phi_copies(b);
+        is.phi_copies(MF, b, reg, vreg, class_of, copy);
         if not is.next_block_is(b, t.t1) {
             jmp(is.blk(t.t1));
         }
@@ -6832,7 +6753,7 @@ fn gen_term(b: *mut ir.Block) void {
         let tt = t.t1;
         let ff = t.t2;
         if (t.a.kind == ir.V_INST) and ((t.a.flag & F_BRANCH) != 0) {
-            phi_copies(b);
+            is.phi_copies(MF, b, reg, vreg, class_of, copy);
             let mut next: i32 = -1;
             if is.next_block_is(b, tt) {
                 next = is.blk(tt);
@@ -6843,7 +6764,7 @@ fn gen_term(b: *mut ir.Block) void {
             return;
         }
         let cc = cond_code(t.a);
-        phi_copies(b);
+        is.phi_copies(MF, b, reg, vreg, class_of, copy);
         if cc == -1 {
             // equal and ordered
             jcc(xe.CC_NE, is.blk(ff));
@@ -6877,7 +6798,7 @@ fn gen_term(b: *mut ir.Block) void {
         let wide = isz(x.ty) == 8;
         let tr = vgpr();
         copy(tr, r, GPR);
-        phi_copies(b);
+        is.phi_copies(MF, b, reg, vreg, class_of, copy);
         let mut sz: u8 = 4;
         if wide {
             sz = 8;
