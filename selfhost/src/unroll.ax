@@ -59,10 +59,6 @@ fn is_k(v: *ir.Value) bool {
     return ir.is_cint(v) and (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64);
 }
 
-fn in_loop(v: *ir.Value, tag: i64) bool {
-    return u.notnil(v) and (v.kind == ir.V_INST) and u.notnil(v.blk) and (v.blk.mark == tag);
-}
-
 // v with the header phi i taking the constant iv: nil unless v is i, a
 // constant, or integer operations on those (up to `depth` levels), where a
 // phi outside the loop (marked tag) counts when its inputs are all the same.
@@ -123,32 +119,6 @@ fn depends(v: *mut ir.Value, i: *mut ir.Value, depth: i32) bool {
     }
     return (u.notnil(v.a) and depends(ir.resolve(v.a), i, depth - 1)) or
            (u.notnil(v.b) and depends(ir.resolve(v.b), i, depth - 1));
-}
-
-fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) void {
-    out.clear();
-    h.mark = tag;
-    out.push(h);
-    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
-    for k in 0..h.preds.len {
-        let p = h.preds.get(k);
-        if (p.rpo >= 0) and opt.dominates(h, p) and (p.mark != tag) {
-            p.mark = tag;
-            work.push(p);
-        }
-    }
-    while work.len > 0 {
-        let x = work.pop();
-        out.push(x);
-        for k in 0..x.preds.len {
-            let p = x.preds.get(k);
-            if (p.rpo >= 0) and (p.mark != tag) {
-                p.mark = tag;
-                work.push(p);
-            }
-        }
-    }
-    u.free(@ptr_cast(*mut void, work.data));
 }
 
 // The number of times the body of the loop at h (members marked tag) runs,
@@ -278,11 +248,12 @@ fn trap_exit(s: *mut ir.Block, tag: i64) bool {
     let mut i = s.first;
     while u.notnil(i) {
         if i.op != ir.OP_PHI {
-            if in_loop(ir.resolve(i.a), tag) or in_loop(ir.resolve(i.b), tag) or in_loop(ir.resolve(i.c), tag) {
+            if opt.in_members(ir.resolve(i.a), tag) or opt.in_members(ir.resolve(i.b), tag) or
+               opt.in_members(ir.resolve(i.c), tag) {
                 return false;
             }
             for k in 0..i.xs.len {
-                if in_loop(ir.resolve(i.xs.get(k)), tag) {
+                if opt.in_members(ir.resolve(i.xs.get(k)), tag) {
                     return false;
                 }
             }
@@ -359,78 +330,7 @@ fn uses_ok(h: *mut ir.Block, tag: i64, side_exits: bool) bool {
 }
 
 fn use_ok(o: *mut ir.Value, h: *mut ir.Block, tag: i64, side_exits: bool) bool {
-    return not in_loop(o, tag) or (not side_exits and (o.blk == h));
-}
-
-fn map_v(v: *mut ir.Value, tag: i64) *mut ir.Value {
-    if in_loop(v, tag) {
-        return @ptr_cast(*mut ir.Value, v.auxp);
-    }
-    return v;
-}
-
-fn map_b(b: *mut ir.Block, tag: i64) *mut ir.Block {
-    if u.notnil(b) and (b.mark == tag) {
-        return @ptr_cast(*mut ir.Block, b.auxp);
-    }
-    return b;
-}
-
-// Copies the members (marked tag) into new blocks of f; x.auxp is the copy
-// of each block and instruction, with operands and targets in the loop
-// mapped to the copies.
-fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64) void {
-    for k in 0..members.len {
-        let x = members.get(k);
-        let nb = ir.append_block(f, x.name);
-        x.auxp = @ptr_cast(*mut void, nb);
-        let mut v = x.first;
-        while u.notnil(v) {
-            let y = ir.new_inst(f, v.op, v.ty);
-            y.cv = v.cv;
-            y.fv = v.fv;
-            y.flags = v.flags;
-            y.src = v.src;
-            y.align = v.align;
-            y.aty = v.aty;
-            y.fty = v.fty;
-            y.mask = v.mask;
-            y.ext = v.ext;
-            y.name = v.name;
-            y.a = v.a;
-            y.b = v.b;
-            y.c = v.c;
-            y.t1 = v.t1;
-            y.t2 = v.t2;
-            for j in 0..v.xs.len {
-                y.xs.push(v.xs.get(j));
-            }
-            for j in 0..v.bs.len {
-                y.bs.push(v.bs.get(j));
-            }
-            v.auxp = @ptr_cast(*mut void, y);
-            ir.append_inst(nb, y);
-            v = v.next;
-        }
-    }
-    for k in 0..members.len {
-        let nb = @ptr_cast(*mut ir.Block, members.get(k).auxp);
-        let mut y = nb.first;
-        while u.notnil(y) {
-            y.a = map_v(ir.resolve(y.a), tag);
-            y.b = map_v(ir.resolve(y.b), tag);
-            y.c = map_v(ir.resolve(y.c), tag);
-            for j in 0..y.xs.len {
-                y.xs.set(j, map_v(ir.resolve(y.xs.get(j)), tag));
-            }
-            for j in 0..y.bs.len {
-                y.bs.set(j, map_b(y.bs.get(j), tag));
-            }
-            y.t1 = map_b(y.t1, tag);
-            y.t2 = map_b(y.t2, tag);
-            y = y.next;
-        }
-    }
+    return not opt.in_members(o, tag) or (not side_exits and (o.blk == h));
 }
 
 // Folds the instructions of a copy whose operands are constants (the
@@ -528,7 +428,8 @@ fn copy_exit_inputs(members: *u.List.[*mut ir.Block], h: *mut ir.Block, tag: i64
                 let cnt = sp.bs.len;
                 for e in 0..cnt {
                     if sp.bs.get(e) == x {
-                        ir.add_incoming(sp, map_v(ir.resolve(sp.xs.get(e)), tag), @ptr_cast(*mut ir.Block, x.auxp));
+                        let v = opt.member_copy(ir.resolve(sp.xs.get(e)), tag);
+                        ir.add_incoming(sp, v, @ptr_cast(*mut ir.Block, x.auxp));
                     }
                 }
                 sp = sp.next;
@@ -553,7 +454,7 @@ fn latch_inputs(h: *mut ir.Block, latches: *u.List.[*mut ir.Block], tag: i64, co
                 }
             }
             if copied {
-                x = map_v(x, tag);
+                x = opt.member_copy(x, tag);
             }
             ins.push(ir.resolve(x));
         }
@@ -569,7 +470,7 @@ fn latch_inputs(h: *mut ir.Block, latches: *u.List.[*mut ir.Block], tag: i64, co
 fn chain_copy(f: *mut ir.Func, h: *mut ir.Block, stay: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block],
               latches: *u.List.[*mut ir.Block], side: bool, cur_h: *mut ir.Block, from: *mut u.List.[*mut ir.Block],
               ins: *mut u.List.[*mut ir.Value], fold: bool, link: bool) *mut ir.Block {
-    clone_members(f, members, tag);
+    opt.clone_members(f, members, tag);
     let nh = @ptr_cast(*mut ir.Block, h.auxp);
     let mut i: usize = 0;
     let mut q = nh.first;
@@ -865,7 +766,7 @@ pub fn full_unroll(f: *mut ir.Func) bool {
             continue;
         }
         unroll_mark += 1;
-        members_of(h, unroll_mark, &mut members);
+        opt.members_of(h, unroll_mark, &mut members);
         did = try_unroll(f, h, unroll_mark, &members);
     }
     if did and (unroll_budget > 0) {
@@ -1045,7 +946,7 @@ fn used_elsewhere(f: *mut ir.Func, tag: i64) bool {
 }
 
 fn escapes_block(o: *mut ir.Value, at: *mut ir.Block, tag: i64) bool {
-    return in_loop(o, tag) and (o.blk != at);
+    return opt.in_members(o, tag) and (o.blk != at);
 }
 
 fn try_onehot(f: *mut ir.Func, b0: *mut ir.Block, arms: *mut u.List.[Arm]) bool {
@@ -1161,7 +1062,8 @@ fn try_onehot(f: *mut ir.Func, b0: *mut ir.Block, arms: *mut u.List.[Arm]) bool 
         }
     }
     // nothing computed in the arms or the later tests is used elsewhere
-    if in_loop(base.base, tag) or in_loop(base.sym, tag) or in_loop(val, tag) or used_elsewhere(f, tag) {
+    if opt.in_members(base.base, tag) or opt.in_members(base.sym, tag) or opt.in_members(val, tag) or
+       used_elsewhere(f, tag) {
         return false;
     }
     // b0: if x - cmin < n { store v at base + o0 + s * (x - cmin) }

@@ -8,13 +8,16 @@
 #
 # The result is selfhost/build/axiom (stage 2), which needs nothing but
 # the C library: no LLVM, no C compiler, no linker. Environment:
-#   OPT     optimization level for the stages (default: -O2)
+#   OPT     optimization level for stages 2 and 3 (default: -O2)
+#   OPT1    optimization level for stage 1 (default: -O0: LLVM takes a
+#           minute at -O2, and stage 2 comes out the same either way)
 #   CROSS   1: also check that stage 2 built for the other architecture (run
 #           with qemu) generates the same code as stage 2 itself
 set -eu
 cd "$(dirname "$0")/.."
 
 OPT=${OPT:--O2}
+OPT1=${OPT1:--O0}
 CROSS=${CROSS:-0}
 B=selfhost/build
 
@@ -22,7 +25,7 @@ stage() {
     echo "stage $3: $1 -> $2"
     start=$(date +%s)
     # shellcheck disable=SC2086
-    "$1" build selfhost/src/main.ax --target=native $OPT -o "$2"
+    "$1" build selfhost/src/main.ax --target=native ${4:-$OPT} -o "$2"
     echo "         $(($(date +%s) - start)) s, $(wc -c < "$2") bytes"
 }
 
@@ -41,7 +44,7 @@ if [ "$(uname -s)" = Darwin ]; then
     node runtime/host.mjs $B/axiom1.wasm -- build selfhost/src/main.ax --target=aarch64-macos $OPT -o $B/axiom1
     echo "         $(($(date +%s) - start)) s, $(wc -c < "$B/axiom1") bytes"
 else
-    stage compiler/build/axiom $B/axiom1 1
+    stage compiler/build/axiom $B/axiom1 1 "$OPT1"
 fi
 # (stages 2 and 3 have the same file name: a Mac executable's code
 # signature holds it)

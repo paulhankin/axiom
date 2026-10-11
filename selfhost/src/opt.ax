@@ -169,6 +169,90 @@ pub fn dominates(a: *mut ir.Block, b0: *mut ir.Block) bool {
     return b == a;
 }
 
+// The blocks of the loop with header h (h first): the blocks that reach a
+// back edge into h without passing through h, each marked tag.
+pub fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) void {
+    out.clear();
+    h.mark = tag;
+    out.push(h);
+    let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for k in 0..h.preds.len {
+        let p = h.preds.get(k);
+        if (p.rpo >= 0) and dominates(h, p) and (p.mark != tag) {
+            p.mark = tag;
+            work.push(p);
+        }
+    }
+    while work.len > 0 {
+        let x = work.pop();
+        out.push(x);
+        for k in 0..x.preds.len {
+            let p = x.preds.get(k);
+            if (p.rpo >= 0) and (p.mark != tag) {
+                p.mark = tag;
+                work.push(p);
+            }
+        }
+    }
+    u.free(@ptr_cast(*mut void, work.data));
+}
+
+// True if v is an instruction in a block marked tag.
+pub fn in_members(v: *ir.Value, tag: i64) bool {
+    return u.notnil(v) and (v.kind == ir.V_INST) and u.notnil(v.blk) and (v.blk.mark == tag);
+}
+
+// After clone_members: the copy of v if it is in a block marked tag, else v.
+pub fn member_copy(v: *mut ir.Value, tag: i64) *mut ir.Value {
+    if in_members(v, tag) {
+        return @ptr_cast(*mut ir.Value, v.auxp);
+    }
+    return v;
+}
+
+pub fn member_copy_blk(b: *mut ir.Block, tag: i64) *mut ir.Block {
+    if u.notnil(b) and (b.mark == tag) {
+        return @ptr_cast(*mut ir.Block, b.auxp);
+    }
+    return b;
+}
+
+// Copies the blocks of `members` (marked `tag`) into new blocks of f:
+// x.auxp is the copy of each block and instruction; operands and targets
+// inside the members are mapped to the copies.
+pub fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64) void {
+    for k in 0..members.len {
+        let x = members.get(k);
+        let nb = ir.append_block(f, x.name);
+        x.auxp = @ptr_cast(*mut void, nb);
+        let mut v = x.first;
+        while u.notnil(v) {
+            let y = ir.copy_inst(f, v);
+            v.auxp = @ptr_cast(*mut void, y);
+            ir.append_inst(nb, y);
+            v = v.next;
+        }
+    }
+    for k in 0..members.len {
+        let nb = @ptr_cast(*mut ir.Block, members.get(k).auxp);
+        let mut y = nb.first;
+        while u.notnil(y) {
+            y.a = member_copy(ir.resolve(y.a), tag);
+            y.b = member_copy(ir.resolve(y.b), tag);
+            y.c = member_copy(ir.resolve(y.c), tag);
+            for j in 0..y.xs.len {
+                y.xs.set(j, member_copy(ir.resolve(y.xs.get(j)), tag));
+            }
+            for j in 0..y.bs.len {
+                y.bs.set(j, member_copy_blk(y.bs.get(j), tag));
+            }
+            y.t1 = member_copy_blk(y.t1, tag);
+            y.t2 = member_copy_blk(y.t2, tag);
+            y = y.next;
+        }
+    }
+}
+
 // Loop nesting depth of each block (from back edges: an edge to a block
 // that dominates its source). Needs dominators.
 pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
@@ -190,7 +274,6 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
         }
         let mark = @int_cast(i64, i) + 1000000;
         h.aux = mark;
-        let mut n: usize = 0;
         let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
         members.push(h);
         while body.len > 0 {
@@ -206,7 +289,6 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
                     body.push(p);
                 }
             }
-            n += 1;
         }
         for k in 0..members.len {
             members.get(k).loop_depth += 1;
@@ -780,12 +862,6 @@ fn fold_insert(i: *mut ir.Value) *mut ir.Value {
     return ir.cagg(t, xs);
 }
 
-// Folds constants and trivial phis to a fixed point; with `combine`, also
-// the rewrites of combine.ax. True if anything changed.
-pub fn fold_constants(f: *mut ir.Func) bool {
-    return fold_combine(f, false);
-}
-
 pub fn fold_combine(f: *mut ir.Func, combine: bool) bool {
     if u.isnil(FB) {
         FB = ir.new_builder();
@@ -1062,21 +1138,6 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
     }
     ir.apply_forwarding(f);
     return any;
-}
-
-// The standard cleanup after lowering.
-pub fn optimize(f: *mut ir.Func, level: i32) void {
-    mem2reg(f);
-    let mut rounds: i32 = 0;
-    loop {
-        let a = fold_combine(f, level > 0);
-        let c = simplify_cfg(f);
-        rounds += 1;
-        if not (a or c) or (rounds > 8) {
-            break;
-        }
-    }
-    dce(f);
 }
 
 // The layout order for code generation: reverse postorder with the blocks
