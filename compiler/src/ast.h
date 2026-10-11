@@ -200,6 +200,7 @@ typedef struct MatchArm {
     Span bind_span;
     i128 ival;
     bool bval;
+    bool alt;  // another pattern of the arm before it (`p1, p2 => ...`): same body
     Stmt *body;
     // sema
     Local *bind_local;

@@ -111,6 +111,7 @@ static Expr *parse_expr(Parser *P);
 static Expr *parse_binexpr(Parser *P);
 static Stmt *parse_block(Parser *P);
 static Stmt *parse_stmt(Parser *P);
+static Stmt *parse_if(Parser *P);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -691,8 +692,107 @@ static Stmt *parse_expr_stmt(Parser *P) {
     return s;
 }
 
+// Pattern ::= "." IDENT ( "(" IDENT ")" )? | "error" "." IDENT | "-"? INT_LIT | CHAR_LIT
+//           | "true" | "false" | "else"
+static bool parse_pattern(Parser *P, MatchArm *arm, bool allow_else) {
+    arm->span = peek(P)->span;
+    if (accept(P, TK_DOT)) {
+        arm->kind = P_VARIANT;
+        arm->name = expect_ident(P, NULL);
+        if (accept(P, TK_LPAREN)) {
+            arm->bind = expect_ident(P, &arm->bind_span);
+            expect(P, TK_RPAREN);
+        }
+    } else if (accept(P, KW_ERROR)) {
+        arm->kind = P_ERROR;
+        expect(P, TK_DOT);
+        arm->name = expect_ident(P, NULL);
+    } else if (pk(P) == TK_MINUS || pk(P) == TK_INT || pk(P) == TK_CHAR) {
+        bool neg = accept(P, TK_MINUS);
+        arm->kind = P_INT;
+        Token *n = peek(P);
+        if (n->kind == TK_INT || n->kind == TK_CHAR) {
+            advance(P);
+            arm->ival = neg ? -(i128)n->ival : (i128)n->ival;
+        } else {
+            syntax_error(P, "integer literal");
+        }
+    } else if (pk(P) == KW_TRUE || pk(P) == KW_FALSE) {
+        arm->kind = P_BOOL;
+        arm->bval = advance(P)->kind == KW_TRUE;
+    } else if (allow_else && accept(P, KW_ELSE)) {
+        arm->kind = P_ELSE;
+    } else {
+        syntax_error(P, "match pattern");
+        return false;
+    }
+    arm->span = sp_from(P, arm->span);
+    return true;
+}
+
+// Pattern ( "," Pattern )*, one arm per pattern (all but the first `alt`);
+// `else` only alone. False after a syntax error.
+static bool parse_arm_patterns(Parser *P, Stmt *s, bool allow_else) {
+    int first = s->arms.len;
+    MatchArm arm = {0};
+    if (!parse_pattern(P, &arm, allow_else)) return false;
+    vec_push(s->arms, arm);
+    if (arm.kind == P_ELSE) return true;
+    while (accept(P, TK_COMMA)) {
+        MatchArm alt = {0};
+        alt.alt = true;
+        if (!parse_pattern(P, &alt, false)) {
+            s->arms.len = first;  // (the arm is dropped)
+            return false;
+        }
+        vec_push(s->arms, alt);
+    }
+    return true;
+}
+
+// The body of the arm just parsed, and of its other patterns.
+static void set_arm_body(Stmt *s, Stmt *body) {
+    for (int i = s->arms.len - 1; i >= 0; i--) {
+        s->arms.data[i].body = body;
+        if (!s->arms.data[i].alt) break;
+    }
+}
+
+// if let Pattern ( "," Pattern )* = Expr Block ( else ( IfStmt | Block ) )?
+// is `match Expr { Pattern => Block, else => ... }`.
+static Stmt *parse_if_let(Parser *P, Span start) {
+    expect(P, KW_LET);
+    Stmt *s = new_stmt(S_MATCH, start);
+    if (!parse_arm_patterns(P, s, false)) {
+        sync_stmt(P);
+        return NULL;
+    }
+    expect(P, TK_EQ);
+    s->e = parse_expr(P);
+    set_arm_body(s, parse_block(P));
+    MatchArm els = {0};
+    els.kind = P_ELSE;
+    els.span = peek(P)->span;
+    if (accept(P, KW_ELSE)) {
+        if (pk(P) == KW_IF) {
+            Span sp = peek(P)->span;
+            Stmt *inner = parse_if(P);
+            els.body = new_stmt(S_BLOCK, inner ? inner->span : sp);
+            if (inner) vec_push(els.body->stmts, inner);
+        } else {
+            els.body = parse_block(P);
+        }
+    } else {
+        els.body = new_stmt(S_BLOCK, els.span);
+    }
+    vec_push(s->arms, els);
+    s->span = sp_from(P, start);
+    return s;
+}
+
 static Stmt *parse_if(Parser *P) {
     Span start = advance(P)->span;
+    if (pk(P) == KW_LET) return parse_if_let(P, start);
     Stmt *s = new_stmt(S_IF, start);
     s->e = parse_expr(P);
     s->body = parse_block(P);
@@ -759,43 +859,12 @@ static Stmt *parse_stmt(Parser *P) {
         s->e = parse_expr(P);
         expect(P, TK_LBRACE);
         while (pk(P) != TK_RBRACE && pk(P) != TK_EOF) {
-            MatchArm arm = {0};
-            arm.span = peek(P)->span;
-            if (accept(P, TK_DOT)) {
-                arm.kind = P_VARIANT;
-                arm.name = expect_ident(P, NULL);
-                if (accept(P, TK_LPAREN)) {
-                    arm.bind = expect_ident(P, &arm.bind_span);
-                    expect(P, TK_RPAREN);
-                }
-            } else if (accept(P, KW_ERROR)) {
-                arm.kind = P_ERROR;
-                expect(P, TK_DOT);
-                arm.name = expect_ident(P, NULL);
-            } else if (pk(P) == TK_MINUS || pk(P) == TK_INT || pk(P) == TK_CHAR) {
-                bool neg = accept(P, TK_MINUS);
-                arm.kind = P_INT;
-                Token *n = peek(P);
-                if (n->kind == TK_INT || n->kind == TK_CHAR) {
-                    advance(P);
-                    arm.ival = neg ? -(i128)n->ival : (i128)n->ival;
-                } else {
-                    syntax_error(P, "integer literal");
-                }
-            } else if (pk(P) == KW_TRUE || pk(P) == KW_FALSE) {
-                arm.kind = P_BOOL;
-                arm.bval = advance(P)->kind == KW_TRUE;
-            } else if (accept(P, KW_ELSE)) {
-                arm.kind = P_ELSE;
-            } else {
-                syntax_error(P, "match pattern");
+            if (!parse_arm_patterns(P, s, true)) {
                 sync_stmt(P);
                 break;
             }
-            arm.span = sp_from(P, arm.span);
             expect(P, TK_FATARROW);
-            arm.body = parse_block(P);
-            vec_push(s->arms, arm);
+            set_arm_body(s, parse_block(P));
             accept(P, TK_COMMA);
         }
         expect(P, TK_RBRACE);

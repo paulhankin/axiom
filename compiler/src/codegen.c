@@ -4135,7 +4135,7 @@ static bool loop_adds(Stmt *s, Local *acc, Sym name, i128 *hi, StmtVec *adds) {
     case S_MATCH:
         if (span_mentions(s->e->span, name)) return false;
         for (int i = 0; i < s->arms.len; i++)
-            if (!loop_adds(s->arms.data[i].body, acc, name, hi, adds)) return false;
+            if (!s->arms.data[i].alt && !loop_adds(s->arms.data[i].body, acc, name, hi, adds)) return false;
         return true;
     default: return !span_mentions(s->span, name);
     }
@@ -4292,7 +4292,8 @@ static void gen_match(Stmt *s) {
     LLVMBasicBlockRef *bbs = NEWN(LLVMBasicBlockRef, n + 1);
     int else_idx = -1;
     for (int i = 0; i < n; i++) {
-        bbs[i] = new_bb("match.arm");
+        // an arm's other patterns branch to its block
+        bbs[i] = s->arms.data[i].alt ? bbs[i - 1] : new_bb("match.arm");
         if (s->arms.data[i].kind == P_ELSE && else_idx < 0) else_idx = i;
     }
     LLVMValueRef payload_ptr = NULL;
@@ -4351,6 +4352,7 @@ static void gen_match(Stmt *s) {
     }
     for (int i = 0; i < n; i++) {
         MatchArm *a = &s->arms.data[i];
+        if (a->alt) continue;
         LLVMPositionBuilderAtEnd(B, bbs[i]);
         if (a->bind_local && payload_ptr) {
             Type *pt = type_variant(t, a->variant);

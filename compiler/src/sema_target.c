@@ -211,7 +211,8 @@ static void gate_stmt(Stmt *s, uint64_t feats) {
     gate_stmt(s->body, feats);
     gate_stmt(s->els, feats);
     for (int i = 0; i < s->stmts.len; i++) gate_stmt(s->stmts.data[i], feats);
-    for (int i = 0; i < s->arms.len; i++) gate_stmt(s->arms.data[i].body, feats);
+    for (int i = 0; i < s->arms.len; i++)
+        if (!s->arms.data[i].alt) gate_stmt(s->arms.data[i].body, feats);
 }
 
 void gate_fn(Decl *f) {

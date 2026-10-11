@@ -287,16 +287,16 @@ DiscardStmt   ::= "_" "=" Expr ";"
 AssignOp      ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "+%=" | "-%=" | "*%="
                 | "&=" | "|=" | "^=" | "<<=" | ">>="
 
-IfStmt        ::= "if" Expr Block ( "else" ( IfStmt | Block ) )?
+IfStmt        ::= "if" ( Expr | "let" Patterns "=" Expr ) Block ( "else" ( IfStmt | Block ) )?
 WhileStmt     ::= "while" Expr Block
 LoopStmt      ::= "loop" Block
 ForStmt       ::= "for" IDENT "in" Expr ( ".." Expr )? Block
 MatchStmt     ::= "match" Expr "{" MatchArm* "}"
-MatchArm      ::= Pattern "=>" Block
+MatchArm      ::= ( Patterns | "else" ) "=>" Block
+Patterns      ::= Pattern ( "," Pattern )*
 Pattern       ::= "." IDENT ( "(" IDENT ")" )?      (* union variant *)
                 | "error" "." IDENT                 (* error value *)
                 | "-"? INT_LIT | CHAR_LIT | "true" | "false"
-                | "else"
 
 ReturnStmt    ::= "return" Expr? ";"
 BreakStmt     ::= "break" ";"
@@ -1053,6 +1053,17 @@ Discarding an error union with `_ =` is also rejected (`E0621`). Handle it with 
 The condition must be `bool`; Axiom has no truthiness. Braces are required. `else if`
 chains are written as `else if …`.
 
+`if let P = e { A } else { B }` tests `e` against the patterns `P` of a `match` arm
+(§8.6): it is exactly `match e { P => { A } else => { B } }`, so the scrutinee and the
+patterns follow the rules of `match`, and a binding `.Variant(x)` is in scope in `A` only.
+The `else` part is optional, and may be another `if` or `if let`.
+
+```axiom
+if let .Circle(c) = shape {
+    total += c.radius;
+}
+```
+
 ### 8.4 `while` and `loop`
 
 `while cond { … }` evaluates `cond` before each iteration. `loop { … }` repeats until it
@@ -1080,6 +1091,9 @@ allowed for `u8`), `bool`, or `error`.
   payload.
 - **Enum**: each arm is `.MEMBER`.
 - **Integer**, `bool`, or `error`: each arm is a literal or `error.Name`.
+- An arm may list several patterns, separated by commas: `.Sat, .Sun => { … }`. It is
+  taken when any of them matches. Such an arm cannot bind a payload (`E0635`), and
+  `else` stands alone.
 - Arms are tested in order. Each pattern may appear at most once (`E0631`).
 - The match must be **exhaustive** (`E0630`). A union or enum match must list every variant
   (member) or end with `else`. Integer and `error` matches always need `else`.
@@ -2289,6 +2303,7 @@ Initial registry, not exhaustive:
 | E0621 | Error union discarded with `_ =` |
 | E0630 | Non-exhaustive `match` |
 | E0631 | Duplicate `match` pattern |
+| E0635 | A `match` arm with several patterns binds a payload |
 | E0640 | Control flow leaves a `defer` |
 | E0650 | Undeclared error name |
 | E0701 | Assignment to an immutable place |

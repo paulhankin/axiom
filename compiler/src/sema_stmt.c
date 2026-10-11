@@ -185,7 +185,7 @@ static void check_match(Stmt *s, bool *diverges) {
         bool *seen = NEWN(bool, u->variants.len + 1);
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
-            if (has_else) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
+            if (has_else && !a->alt) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
             scope_push();
             if (a->kind == P_ELSE) {
                 has_else = true;
@@ -205,6 +205,8 @@ static void check_match(Stmt *s, bool *diverges) {
                         if (!pt)
                             diag_error(a->bind_span, "E0633", "%s '%s' has no payload to bind",
                                        is_enum ? "enum member" : "variant", a->name);
+                        else if (a->alt || (i + 1 < narms && s->arms.data[i + 1].alt))
+                            diag_error(a->bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
                         else a->bind_local = declare_local(a->bind, a->bind_span, pt, false, false);
                     }
                 }
@@ -212,7 +214,7 @@ static void check_match(Stmt *s, bool *diverges) {
                 diag_error(a->span, "E0634", "this pattern cannot match a value of %s type %s", is_enum ? "enum" : "union",
                            type_str(t));
             }
-            if (!check_block(a->body)) all_div = false;
+            if (!a->alt && !check_block(a->body)) all_div = false;
             scope_pop();
         }
         if (!has_else) {
@@ -240,7 +242,7 @@ static void check_match(Stmt *s, bool *diverges) {
         bool seen_true = false, seen_false = false;
         for (int i = 0; i < narms; i++) {
             MatchArm *a = &s->arms.data[i];
-            if (has_else) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
+            if (has_else && !a->alt) diag_warning(a->span, "W0631", "unreachable match arm after 'else'");
             scope_push();
             i128 key = 0;
             bool keyed = false;
@@ -268,7 +270,7 @@ static void check_match(Stmt *s, bool *diverges) {
                     if (seenv.data[k] == key) diag_error(a->span, "E0631", "pattern is matched more than once");
                 vec_push(seenv, key);
             }
-            if (!check_block(a->body)) all_div = false;
+            if (!a->alt && !check_block(a->body)) all_div = false;
             scope_pop();
         }
         free(seenv.data);
@@ -280,6 +282,7 @@ static void check_match(Stmt *s, bool *diverges) {
                        "cannot match on a value of type %s (only unions, enums, integers, bool and error)",
                        type_str(t));
         for (int i = 0; i < narms; i++) {
+            if (s->arms.data[i].alt) continue;
             scope_push();
             check_block(s->arms.data[i].body);
             scope_pop();

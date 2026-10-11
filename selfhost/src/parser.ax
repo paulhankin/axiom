@@ -787,8 +787,125 @@ fn parse_expr_stmt(P: *mut Parser) *mut ast.Stmt {
     return s;
 }
 
+// Pattern ::= "." IDENT ( "(" IDENT ")" )? | "error" "." IDENT | "-"? INT_LIT | CHAR_LIT
+//           | "true" | "false" | "else"
+fn parse_pattern(P: *mut Parser, arm: *mut ast.MatchArm, allow_else: bool) bool {
+    arm.span = peek(P).span;
+    if accept(P, lx.TK_DOT) {
+        let mut vp = ast.VariantPattern.{ name: expect_ident(P).name, bind: u.nosym(), bind_span: u.mkspan(0, 0, 0) };
+        if accept(P, lx.TK_LPAREN) {
+            let id = expect_ident(P);
+            vp.bind = id.name;
+            vp.bind_span = id.span;
+            _ = expect(P, lx.TK_RPAREN);
+        }
+        arm.pat = ast.Pattern.Variant(vp);
+    } else if accept(P, lx.KW_ERROR) {
+        _ = expect(P, lx.TK_DOT);
+        arm.pat = ast.Pattern.Error(expect_ident(P).name);
+    } else if (pk(P) == lx.TK_MINUS) or (pk(P) == lx.TK_INT) or (pk(P) == lx.TK_CHAR) {
+        let neg = accept(P, lx.TK_MINUS);
+        let mut v = u.I128.zero();
+        let n = peek(P);
+        if (n.kind == lx.TK_INT) or (n.kind == lx.TK_CHAR) {
+            _ = advance(P);
+            v = u.I128.ofu(n.ival);
+            if neg {
+                v = v.neg();
+            }
+        } else {
+            syntax_error(P, "integer literal");
+        }
+        arm.pat = ast.Pattern.Int(v);
+    } else if (pk(P) == lx.KW_TRUE) or (pk(P) == lx.KW_FALSE) {
+        arm.pat = ast.Pattern.Bool(advance(P).kind == lx.KW_TRUE);
+    } else if allow_else and accept(P, lx.KW_ELSE) {
+        arm.pat = ast.Pattern.Else;
+    } else {
+        syntax_error(P, "match pattern");
+        return false;
+    }
+    arm.span = sp_from(P, arm.span);
+    return true;
+}
+
+// Pattern ( "," Pattern )*, one arm per pattern (all but the first `alt`);
+// `else` only alone. False after a syntax error.
+fn parse_arm_patterns(P: *mut Parser, s: *mut ast.Stmt, allow_else: bool) bool {
+    let first = s.arms.len;
+    let arm = u.new.[ast.MatchArm]();
+    if not parse_pattern(P, arm, allow_else) {
+        return false;
+    }
+    s.arms.push(arm.*);
+    if arm.is_else() {
+        return true;
+    }
+    while accept(P, lx.TK_COMMA) {
+        let alt = u.new.[ast.MatchArm]();
+        alt.alt = true;
+        if not parse_pattern(P, alt, false) {
+            s.arms.len = first;  // (the arm is dropped)
+            return false;
+        }
+        s.arms.push(alt.*);
+    }
+    return true;
+}
+
+// The body of the arm just parsed, and of its other patterns.
+fn set_arm_body(s: *mut ast.Stmt, body: *mut ast.Stmt) void {
+    let mut i = s.arms.len;
+    while i > 0 {
+        i -= 1;
+        s.arms.at(i).body = body;
+        if not s.arms.at(i).alt {
+            break;
+        }
+    }
+}
+
+// if let Pattern ( "," Pattern )* = Expr Block ( else ( IfStmt | Block ) )?
+// is `match Expr { Pattern => Block, else => ... }`.
+fn parse_if_let(P: *mut Parser, start: u.Span) *mut ast.Stmt {
+    _ = expect(P, lx.KW_LET);
+    let s = ast.new_stmt(ast.S_MATCH, start);
+    if not parse_arm_patterns(P, s, false) {
+        sync_stmt(P);
+        return u.nil.[ast.Stmt]();
+    }
+    _ = expect(P, lx.TK_EQ);
+    s.e = parse_expr(P);
+    set_arm_body(s, parse_block(P));
+    let els = u.new.[ast.MatchArm]();
+    els.pat = ast.Pattern.Else;
+    els.span = peek(P).span;
+    if accept(P, lx.KW_ELSE) {
+        if pk(P) == lx.KW_IF {
+            let sp = peek(P).span;
+            let inner = parse_if(P);
+            if u.notnil(inner) {
+                els.body = ast.new_stmt(ast.S_BLOCK, inner.span);
+                els.body.stmts.push(inner);
+            } else {
+                els.body = ast.new_stmt(ast.S_BLOCK, sp);
+            }
+        } else {
+            els.body = parse_block(P);
+        }
+    } else {
+        els.body = ast.new_stmt(ast.S_BLOCK, els.span);
+    }
+    s.arms.push(els.*);
+    s.span = sp_from(P, start);
+    return s;
+}
+
 fn parse_if(P: *mut Parser) *mut ast.Stmt {
     let start = advance(P).span;
+    if pk(P) == lx.KW_LET {
+        return parse_if_let(P, start);
+    }
     let s = ast.new_stmt(ast.S_IF, start);
     s.e = parse_expr(P);
     s.body = parse_block(P);
@@ -869,48 +986,12 @@ fn parse_stmt(P: *mut Parser) *mut ast.Stmt {
         s.e = parse_expr(P);
         _ = expect(P, lx.TK_LBRACE);
         while (pk(P) != lx.TK_RBRACE) and (pk(P) != lx.TK_EOF) {
-            let arm = u.new.[ast.MatchArm]();
-            arm.span = peek(P).span;
-            if accept(P, lx.TK_DOT) {
-                let mut vp = ast.VariantPattern.{
-                    name: expect_ident(P).name, bind: u.nosym(), bind_span: u.mkspan(0, 0, 0) };
-                if accept(P, lx.TK_LPAREN) {
-                    let id = expect_ident(P);
-                    vp.bind = id.name;
-                    vp.bind_span = id.span;
-                    _ = expect(P, lx.TK_RPAREN);
-                }
-                arm.pat = ast.Pattern.Variant(vp);
-            } else if accept(P, lx.KW_ERROR) {
-                _ = expect(P, lx.TK_DOT);
-                arm.pat = ast.Pattern.Error(expect_ident(P).name);
-            } else if (pk(P) == lx.TK_MINUS) or (pk(P) == lx.TK_INT) or (pk(P) == lx.TK_CHAR) {
-                let neg = accept(P, lx.TK_MINUS);
-                let mut v = u.I128.zero();
-                let n = peek(P);
-                if (n.kind == lx.TK_INT) or (n.kind == lx.TK_CHAR) {
-                    _ = advance(P);
-                    v = u.I128.ofu(n.ival);
-                    if neg {
-                        v = v.neg();
-                    }
-                } else {
-                    syntax_error(P, "integer literal");
-                }
-                arm.pat = ast.Pattern.Int(v);
-            } else if (pk(P) == lx.KW_TRUE) or (pk(P) == lx.KW_FALSE) {
-                arm.pat = ast.Pattern.Bool(advance(P).kind == lx.KW_TRUE);
-            } else if accept(P, lx.KW_ELSE) {
-                arm.pat = ast.Pattern.Else;
-            } else {
-                syntax_error(P, "match pattern");
+            if not parse_arm_patterns(P, s, true) {
                 sync_stmt(P);
                 break;
             }
-            arm.span = sp_from(P, arm.span);
             _ = expect(P, lx.TK_FATARROW);
-            arm.body = parse_block(P);
-            s.arms.push(arm.*);
+            set_arm_body(s, parse_block(P));
             _ = accept(P, lx.TK_COMMA);
         }
         _ = expect(P, lx.TK_RBRACE);
