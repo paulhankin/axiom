@@ -1,0 +1,389 @@
+// =============================================================================
+// nlink.ax - what the native linkers share: elink.ax (ELF, Linux), mlink.ax
+// (Mach-O, macOS) and plink.ax (PE, Windows) all link the ELF relocatable
+// objects of x64.ax and a64.ax (read with elf.read).
+//
+// The state of a link lives here: the objects, their global symbols (resolved
+// by name: a strong definition wins over weak ones), each section's class and
+// address, and the GOT. A linker starts with begin(), classifies the sections
+// with classify(), places each class with place(), and copies them into its
+// file with copy_class(). Also here: the AArch64 instruction fields and
+// relocations that the ELF and Mach-O linkers both apply.
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "util.ax" as u;
+
+// Section classes (each linker's class_of says which sections go where).
+pub const C_TEXT: i32 = 0;
+pub const C_CONST: i32 = 1;  // read-only data, then the frame tables (elf.rets_rank)
+pub const C_DATA: i32 = 2;
+pub const C_TDATA: i32 = 3;
+pub const C_TBSS: i32 = 4;
+pub const C_BSS: i32 = 5;
+
+// A global (non-local) symbol of the link.
+pub struct GSym {
+    name: []u8,
+    obj: i32,  // defining object, -1: none (from a library, or missing)
+    sym: u32,
+    weak: bool,  // every reference / the definition is weak
+    got: i32,    // GOT slot, -1: none
+    stub: i32,   // PLT stub (ELF), stub (Mach-O) or import thunk (PE), -1: none
+    // dynamic linking (elink.ax)
+    dynamic: bool,  // from a shared library
+    dynidx: u32,    // .dynsym index
+    is_data: bool,  // a data object in its library
+    lib: i32,       // the library defining it
+    ver: []u8,      // its version there ("": unversioned)
+    vidx: u32,      // .gnu.version index (1: unversioned)
+}
+
+pub let mut objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0,
+                                                                  cap: 0 };
+pub let mut gsyms: u.List.[GSym] = u.List.[GSym].{ data: @ptr_from_int(*mut GSym, 0), len: 0, cap: 0 };
+pub let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+// per object: each section's class and address, each local symbol's GOT slot + 1
+pub let mut sec_cls: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
+pub let mut sec_addr: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0,
+                                                                cap: 0 };
+pub let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0,
+                                                                 cap: 0 };
+// per GOT slot: its symbol, and the .dynsym index + 1 it is bound to (0: our own)
+pub let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+pub let mut got_sym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+pub let mut got_dyn: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+pub let mut errors: u32 = 0;
+
+pub fn err(msg: []u8) void {
+    u.eprint(u.f1("axiom: link error: %s\n", msg));
+    errors += 1;
+}
+
+pub fn align_up(x: u64, a: u64) u64 {
+    if a <= 1 {
+        return x;
+    }
+    return (x + a - 1) & ~(a - 1);
+}
+
+// A new link of `inputs` (the linker adds its own objects after them).
+pub fn begin(inputs: []*mut elf.Obj) void {
+    objs = u.List.[*mut elf.Obj].{ data: u.nil.[*mut elf.Obj](), len: 0, cap: 0 };
+    gsyms = u.List.[GSym].{ data: u.nil.[GSym](), len: 0, cap: 0 };
+    gmap = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    sec_cls = u.List.[[]mut i32].{ data: u.nil.[[]mut i32](), len: 0, cap: 0 };
+    sec_addr = u.List.[[]mut u64].{ data: u.nil.[[]mut u64](), len: 0, cap: 0 };
+    local_got = u.List.[[]mut i32].{ data: u.nil.[[]mut i32](), len: 0, cap: 0 };
+    got_obj = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };
+    got_sym = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };
+    got_dyn = u.List.[u32].{ data: u.nil.[u32](), len: 0, cap: 0 };
+    errors = 0;
+    for i in 0..inputs.len {
+        objs.push(inputs[i]);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Symbols
+// -----------------------------------------------------------------------------
+pub fn gsym_index(name: []u8) u32 {
+    let k = u.intern(name);
+    let prev = gmap.get(k);
+    if prev != 0 {
+        return prev - 1;
+    }
+    gsyms.push(GSym.{ name: k, obj: -1, sym: 0, weak: true, got: -1, stub: -1, dynamic: false, dynidx: 0,
+                      is_data: false, lib: -1, ver: "", vidx: 1 });
+    gmap.put(k, @int_cast(u32, gsyms.len));
+    return @int_cast(u32, gsyms.len - 1);
+}
+
+// Every global symbol of the objects, with its definition (if any).
+pub fn define_globals() void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let s = o.syms.get(si);
+            if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
+                continue;
+            }
+            let gi = gsym_index(s.name);
+            let g = gsyms.at(@as(usize, gi));
+            if s.bind != elf.B_WEAK {
+                g.weak = false;
+            }
+            if s.sec < 0 {
+                continue;
+            }
+            if g.obj < 0 {
+                g.obj = @int_cast(i32, oi);
+                g.sym = @int_cast(u32, si);
+            } else if s.bind != elf.B_WEAK {
+                let prev = objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
+                if prev.bind == elf.B_WEAK {
+                    g.obj = @int_cast(i32, oi);
+                    g.sym = @int_cast(u32, si);
+                } else {
+                    err(u.f1("duplicate symbol '%s'", s.name));
+                }
+            }
+        }
+    }
+}
+
+// Functions of another system's libraries (a Windows DLL on macOS, a macOS
+// framework on Windows) are the runtime's ax_unavailable, which says so if it
+// is ever called: a program can support several systems and choose at run
+// time.
+pub fn use_unavailable(is_foreign: fn([]u8) bool) void {
+    let un = gsym_index("ax_unavailable");
+    for gi in 0..gsyms.len {
+        let g = gsyms.at(gi);
+        if (g.obj < 0) and is_foreign(g.name) {
+            let target = gsyms.get(@as(usize, un));
+            if target.obj < 0 {
+                err(u.f1("'%s' is from another system's library, and there is no ax_unavailable", g.name));
+            }
+            g.obj = target.obj;
+            g.sym = target.sym;
+            g.weak = false;
+        }
+    }
+}
+
+// The global a symbol of an object stands for, or -1 for local symbols.
+pub fn global_of(oi: usize, si: u32) i32 {
+    let s = objs.get(oi).syms.at(@as(usize, si));
+    if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
+        return -1;
+    }
+    return @int_cast(i32, gmap.get(u.intern(s.name))) - 1;
+}
+
+pub fn sym_addr_in(oi: usize, si: u32) u64 {
+    let s = objs.get(oi).syms.at(@as(usize, si));
+    if s.sec < 0 {
+        return 0;
+    }
+    return sec_addr.get(oi)[@as(usize, @bit_cast(u32, s.sec))] + s.value;
+}
+
+// The address of a symbol (0 for one the objects do not define).
+pub fn sym_addr(oi: usize, si: u32) u64 {
+    let gi = global_of(oi, si);
+    if gi < 0 {
+        return sym_addr_in(oi, si);
+    }
+    let g = gsyms.at(@int_cast(usize, gi));
+    if g.obj < 0 {
+        return 0;
+    }
+    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+}
+
+pub fn global_addr(name: []u8) u64 {
+    let g = gsyms.at(@as(usize, gsym_index(name)));
+    if g.obj < 0 {
+        return 0;
+    }
+    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+}
+
+// -----------------------------------------------------------------------------
+// The GOT
+// -----------------------------------------------------------------------------
+fn new_got(oi: usize, si: u32, dynidx: u32) i32 {
+    got_obj.push(@int_cast(u32, oi));
+    got_sym.push(si);
+    got_dyn.push(dynidx);
+    return @int_cast(i32, got_dyn.len - 1);
+}
+
+// The GOT slot of global gi (symbol si of object oi), allocated on first use.
+pub fn got_slot_g(gi: u32, oi: usize, si: u32) i32 {
+    let g = gsyms.at(@as(usize, gi));
+    if g.got < 0 {
+        let mut d: u32 = 0;
+        if g.dynamic {
+            d = g.dynidx;
+        }
+        g.got = new_got(oi, si, d);
+    }
+    return g.got;
+}
+
+// The GOT slot of a symbol, allocated on first use.
+pub fn got_slot(oi: usize, si: u32) i32 {
+    let gi = global_of(oi, si);
+    if gi >= 0 {
+        return got_slot_g(@bit_cast(u32, gi), oi, si);
+    }
+    let lg = local_got.get(oi);
+    if lg[@as(usize, si)] == 0 {
+        lg[@as(usize, si)] = new_got(oi, si, 0) + 1;
+    }
+    return lg[@as(usize, si)] - 1;
+}
+
+// -----------------------------------------------------------------------------
+// Layout
+// -----------------------------------------------------------------------------
+
+// Each object's section classes (by class_of), and room for the section
+// addresses and local GOT slots.
+pub fn classify(class_of: fn(*elf.Sec) i32) void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        let cls = u.newn.[i32](o.secs.len + 1);
+        for k in 0..o.secs.len {
+            cls[k] = class_of(o.secs.get(k));
+        }
+        sec_cls.push(cls);
+        sec_addr.push(u.newn.[u64](o.secs.len + 1));
+        local_got.push(u.newn.[i32](o.syms.len + 1));
+    }
+}
+
+// Places the sections of class `cls` from address `at`; returns the end.
+pub fn place(cls: i32, at: u64) u64 {
+    let mut cur = at;
+    // read-only data, then the frame tables together (elf.rets_rank)
+    let mut passes: i32 = 1;
+    if cls == C_CONST {
+        passes = 4;
+    }
+    for pass in 0..passes {
+        for oi in 0..objs.len {
+            let o = objs.get(oi);
+            for k in 0..o.secs.len {
+                if sec_cls.get(oi)[k] != cls {
+                    continue;
+                }
+                let s = o.secs.get(k);
+                if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
+                    continue;
+                }
+                cur = align_up(cur, s.align);
+                sec_addr.get(oi)[k] = cur;
+                cur += elf.sec_size(s);
+            }
+        }
+    }
+    return cur;
+}
+
+pub fn class_align(cls: i32) u64 {
+    let mut a: u64 = 1;
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            if (sec_cls.get(oi)[k] == cls) and (o.secs.get(k).align > a) {
+                a = o.secs.get(k).align;
+            }
+        }
+    }
+    return a;
+}
+
+// Copies the sections of class `cls` into the file b (file_of: an address's
+// offset in it).
+pub fn copy_class(b: []mut u8, cls: i32, file_of: fn(u64) u64) void {
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            if sec_cls.get(oi)[k] != cls {
+                continue;
+            }
+            let d = o.secs.get(k).data.view();
+            if d.len == 0 {
+                continue;
+            }
+            let fo = @truncate(usize, file_of(sec_addr.get(oi)[k]));
+            for i in 0..d.len {
+                b[fo + i] = d[i];
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Relocation
+// -----------------------------------------------------------------------------
+
+// x86-64: mov reg, [rip + GOT] -> lea reg, [rip + sym]. Rewrites the
+// instruction of a REX_GOTPCRELX at file offset fo, if it is such a mov, and
+// says whether it did (the displacement is then the symbol's).
+pub fn x64_relax(b: []mut u8, fo: u64, ty: u32) bool {
+    if (ty != elf.R_X86_64_REX_GOTPCRELX) or (fo < 2) or (b[@truncate(usize, fo - 2)] != 0x8b) {
+        return false;
+    }
+    b[@truncate(usize, fo - 2)] = 0x8d;
+    return true;
+}
+
+// AArch64 instruction fields.
+pub fn a64_adrp(b: []mut u8, off: u64, p: u64, target: u64) void {
+    let pages = (@bit_cast(i64, target & ~@as(u64, 0xfff)) - @bit_cast(i64, p & ~@as(u64, 0xfff))) >> 12;
+    if (pages < -0x10_0000) or (pages >= 0x10_0000) {
+        err("adrp out of range");
+    }
+    let v = @bit_cast(u64, pages) & 0x1f_ffff;
+    bn.w32(b, off, (rd32(b, off) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
+}
+
+pub fn a64_imm12(b: []mut u8, off: u64, x: u64) void {
+    bn.w32(b, off, (rd32(b, off) & 0xffc0_03ff) | ((x & 0xfff) << 10));
+}
+
+pub fn a64_branch(b: []mut u8, off: u64, p: u64, target: u64) void {
+    let d = @bit_cast(i64, target -% p);
+    if (d < -0x800_0000) or (d >= 0x800_0000) {
+        err("branch out of range");
+    }
+    bn.w32(b, off, (rd32(b, off) & 0xfc00_0000) | ((@bit_cast(u64, d) >> 2) & 0x3ff_ffff));
+}
+
+fn rd32(b: []u8, off: u64) u64 {
+    return bn.rd32(b, @truncate(usize, off));
+}
+
+// An AArch64 load of GOT slot address ga at p (file offset fo).
+pub fn a64_got(b: []mut u8, fo: u64, p: u64, ty: u32, ga: u64) void {
+    if ty == elf.R_AARCH64_ADR_GOT_PAGE {
+        a64_adrp(b, fo, p, ga);
+    } else {
+        a64_imm12(b, fo, (ga & 0xfff) >> 3);
+    }
+}
+
+// Applies an AArch64 relocation of type ty at p (file offset fo) to target
+// sa; false if it is not one of these (absolute, GOT and thread-local
+// relocations are the linker's).
+pub fn a64_reloc(b: []mut u8, fo: u64, p: u64, ty: u32, sa: u64) bool {
+    if ty == elf.R_AARCH64_PREL32 {
+        let v = @bit_cast(i64, sa) - @bit_cast(i64, p);
+        if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
+            err("relocation out of range (prel32)");
+        }
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+    } else if ty == elf.R_AARCH64_ADR_PREL_PG_HI21 {
+        a64_adrp(b, fo, p, sa);
+    } else if (ty == elf.R_AARCH64_ADD_ABS_LO12_NC) or (ty == elf.R_AARCH64_LDST8_ABS_LO12_NC) {
+        a64_imm12(b, fo, sa & 0xfff);
+    } else if ty == elf.R_AARCH64_LDST16_ABS_LO12_NC {
+        a64_imm12(b, fo, (sa & 0xfff) >> 1);
+    } else if ty == elf.R_AARCH64_LDST32_ABS_LO12_NC {
+        a64_imm12(b, fo, (sa & 0xfff) >> 2);
+    } else if ty == elf.R_AARCH64_LDST64_ABS_LO12_NC {
+        a64_imm12(b, fo, (sa & 0xfff) >> 3);
+    } else if ty == elf.R_AARCH64_LDST128_ABS_LO12_NC {
+        a64_imm12(b, fo, (sa & 0xfff) >> 4);
+    } else if (ty == elf.R_AARCH64_CALL26) or (ty == elf.R_AARCH64_JUMP26) {
+        a64_branch(b, fo, p, sa);
+    } else {
+        return false;
+    }
+    return true;
+}

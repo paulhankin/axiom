@@ -37,6 +37,7 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "nlink.ax" as nl;
 import "std/crypto/sha2" as sha2;
 import "util.ax" as u;
 
@@ -44,24 +45,9 @@ const BASE: u64 = 0x1_0000_0000;  // the image's address before sliding
 const PAGE: u64 = 0x4000;
 const CS_PAGE: u64 = 4096;  // the code signature hashes 4 KiB pages
 
-const C_TEXT: i32 = 0;
-const C_CONST: i32 = 1;
-const C_DATA: i32 = 2;
-const C_TDATA: i32 = 3;
-const C_TBSS: i32 = 4;
-const C_BSS: i32 = 5;
-
 // segment indexes for dyld's opcodes (in load-command order)
 const SEG_TEXT: u64 = 1;
 const SEG_DATA: u64 = 2;
-
-struct GSym {
-    name: []u8,
-    obj: i32,  // defining object, -1: from libSystem
-    sym: u32,
-    got: i32,   // GOT slot, -1: none
-    stub: i32,  // stub index, -1: none
-}
 
 struct Import {
     seg_off: u64,  // offset in __DATA
@@ -69,20 +55,9 @@ struct Import {
     addend: i64,
 }
 
-let mut objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0,
-                                                              cap: 0 };
-let mut gsyms: u.List.[GSym] = u.List.[GSym].{ data: @ptr_from_int(*mut GSym, 0), len: 0, cap: 0 };
-let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
-                                                cap: 0, len: 0 };
-let mut sec_addr: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0, cap: 0 };
-let mut sec_cls: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
-let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
-let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-let mut got_sym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut stubs: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };    // gsym per stub
 let mut rebases: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };  // __DATA offsets
 let mut binds: u.List.[Import] = u.List.[Import].{ data: @ptr_from_int(*mut Import, 0), len: 0, cap: 0 };
-let mut errors: u32 = 0;
 // libraries beyond libSystem (ordinal 1), as install names: ordinal k + 2
 let mut dylibs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 // function name -> its library's ordinal (from axiom.import.* constants)
@@ -98,18 +73,6 @@ let mut tls_addr: u64 = 0;  // the template's start
 let mut tls_filesz: u64 = 0;
 let mut tls_memsz: u64 = 0;
 let mut tls_align: u64 = 1;
-
-fn err(msg: []u8) void {
-    u.eprint(u.f1("axiom: link error: %s\n", msg));
-    errors += 1;
-}
-
-fn align_up(x: u64, a: u64) u64 {
-    if a <= 1 {
-        return x;
-    }
-    return (x + a - 1) & ~(a - 1);
-}
 
 fn is_abs64(ty: u32) bool {
     return ty == elf.R_AARCH64_ABS64;
@@ -128,96 +91,51 @@ fn is_call_reloc(ty: u32) bool {
 fn class_of(s: *elf.Sec) i32 {
     let k = s.kind;
     if k == elf.S_TEXT {
-        return C_TEXT;
+        return nl.C_TEXT;
     }
     if k == elf.S_RODATA {
         for r in s.relocs.items() {
             if is_abs64(r.ty) {
-                return C_DATA;
+                return nl.C_DATA;
             }
         }
-        return C_CONST;
+        return nl.C_CONST;
     }
     if k == elf.S_DATA {
-        return C_DATA;
+        return nl.C_DATA;
     }
     if k == elf.S_BSS {
-        return C_BSS;
+        return nl.C_BSS;
     }
     if k == elf.S_TDATA {
-        return C_TDATA;
+        return nl.C_TDATA;
     }
-    return C_TBSS;
+    return nl.C_TBSS;
 }
 
 // -----------------------------------------------------------------------------
 // Symbols
 // -----------------------------------------------------------------------------
-fn gsym_index(name: []u8) u32 {
-    let k = u.intern(name);
-    let prev = gmap.get(k);
-    if prev != 0 {
-        return prev - 1;
-    }
-    gsyms.push(GSym.{ name: k, obj: -1, sym: 0, got: -1, stub: -1 });
-    gmap.put(k, @int_cast(u32, gsyms.len));
-    return @int_cast(u32, gsyms.len - 1);
-}
-
 fn collect_symbols() void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for si in 0..o.syms.len {
-            let s = o.syms.get(si);
-            if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
-                continue;
-            }
-            let gi = gsym_index(s.name);
-            let g = gsyms.at(@as(usize, gi));
-            if s.sec < 0 {
-                continue;
-            }
-            if g.obj < 0 {
-                g.obj = @int_cast(i32, oi);
-                g.sym = @int_cast(u32, si);
-            } else if s.bind != elf.B_WEAK {
-                let prev = objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
-                if prev.bind == elf.B_WEAK {
-                    g.obj = @int_cast(i32, oi);
-                    g.sym = @int_cast(u32, si);
-                } else {
-                    err(u.f1("duplicate symbol '%s'", s.name));
-                }
-            }
-        }
-    }
-    // Functions of another system's libraries (a Windows DLL) are the
-    // runtime's ax_unavailable, which says so if it is ever called: a
-    // program can support several systems and choose at run time.
-    let un = gsym_index("ax_unavailable");
-    for gi in 0..gsyms.len {
-        let g = gsyms.at(gi);
-        if (g.obj < 0) and (import_ord.get(u.intern(g.name)) == FOREIGN) {
-            let target = gsyms.get(@as(usize, un));
-            if target.obj < 0 {
-                err(u.f1("'%s' is from another system's library, and there is no ax_unavailable", g.name));
-            }
-            g.obj = target.obj;
-            g.sym = target.sym;
-        }
-    }
+    nl.define_globals();
+    nl.use_unavailable(is_foreign);
     // What is still undefined must come from libSystem: C library names,
     // never our own (module-qualified) ones.
-    for gi in 0..gsyms.len {
-        let g = gsyms.at(gi);
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.at(gi);
         if (g.obj < 0) and ((u.find(g.name, '.') >= 0) or (u.find(g.name, '/') >= 0)) {
-            err(u.f1("undefined symbol '%s'", g.name));
+            nl.err(u.f1("undefined symbol '%s'", g.name));
         }
     }
 }
 
 // The ordinal of a function from another system's library.
 const FOREIGN: u32 = 0xffff_fffe;
+
+// From another system's library (a Windows DLL)?
+fn is_foreign(name: []u8) bool {
+    return import_ord.get(u.intern(name)) == FOREIGN;
+}
 
 // Windows system DLLs (and any name ending in .dll).
 let WINDOWS_DLLS: [26][]u8 = ["advapi32", "bcrypt", "d2d1", "d3d11", "d3d12", "d3dcompiler_47", "dbghelp", "dwrite",
@@ -269,8 +187,8 @@ fn dylib_path(name: []u8) []u8 {
 
 // The libraries that extern blocks named (the axiom.import.* constants).
 fn collect_dylibs() void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for si in 0..o.syms.len {
             let s = o.syms.get(si);
             if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
@@ -316,7 +234,7 @@ fn ordinal_of(name: []u8) u32 {
 
 // An LC_LOAD_DYLIB's size for an install name.
 fn dylib_cmd_size(path: []u8) u64 {
-    return align_up(24 + @as(u64, path.len) + 1, 8);
+    return nl.align_up(24 + @as(u64, path.len) + 1, 8);
 }
 
 fn load_dylib(h: *mut bn.Bytes, path: []u8, current: u64) void {
@@ -333,96 +251,36 @@ fn load_dylib(h: *mut bn.Bytes, path: []u8, current: u64) void {
     }
 }
 
-fn global_of(oi: usize, si: u32) i32 {
-    let s = objs.get(oi).syms.at(@as(usize, si));
-    if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
-        return -1;
-    }
-    return @int_cast(i32, gmap.get(u.intern(s.name))) - 1;
-}
-
 // From a library?
 fn is_import(oi: usize, si: u32) bool {
-    let gi = global_of(oi, si);
-    return (gi >= 0) and (gsyms.at(@int_cast(usize, gi)).obj < 0);
+    let gi = nl.global_of(oi, si);
+    return (gi >= 0) and (nl.gsyms.at(@int_cast(usize, gi)).obj < 0);
 }
 
 fn import_name(oi: usize, si: u32) []u8 {
-    return u.cat2("_", objs.get(oi).syms.get(@as(usize, si)).name);
-}
-
-fn sym_addr_in(oi: usize, si: u32) u64 {
-    let s = objs.get(oi).syms.at(@as(usize, si));
-    if s.sec < 0 {
-        return 0;
-    }
-    return sec_addr.get(oi)[@as(usize, @bit_cast(u32, s.sec))] + s.value;
-}
-
-fn sym_addr(oi: usize, si: u32) u64 {
-    let gi = global_of(oi, si);
-    if gi < 0 {
-        return sym_addr_in(oi, si);
-    }
-    let g = gsyms.at(@int_cast(usize, gi));
-    if g.obj < 0 {
-        return 0;
-    }
-    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
-}
-
-fn global_addr(name: []u8) u64 {
-    let g = gsyms.at(@as(usize, gsym_index(name)));
-    if g.obj < 0 {
-        return 0;
-    }
-    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
-}
-
-fn new_got(oi: usize, si: u32) i32 {
-    got_obj.push(@int_cast(u32, oi));
-    got_sym.push(si);
-    return @int_cast(i32, got_sym.len - 1);
-}
-
-fn got_slot(oi: usize, si: u32) i32 {
-    let gi = global_of(oi, si);
-    if gi >= 0 {
-        let g = gsyms.at(@int_cast(usize, gi));
-        if g.got < 0 {
-            g.got = new_got(oi, si);
-        }
-        return g.got;
-    }
-    let lg = local_got.get(oi);
-    if lg[@as(usize, si)] == 0 {
-        lg[@as(usize, si)] = new_got(oi, si) + 1;
-    }
-    return lg[@as(usize, si)] - 1;
+    return u.cat2("_", nl.objs.get(oi).syms.get(@as(usize, si)).name);
 }
 
 // GOT slots and stubs the relocations need.
 fn scan_relocs() void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
             for r in s.relocs.items() {
                 if is_got_reloc(r.ty) {
-                    _ = got_slot(oi, r.sym);
+                    _ = nl.got_slot(oi, r.sym);
                 } else if is_import(oi, r.sym) {
                     if is_call_reloc(r.ty) {
-                        _ = got_slot(oi, r.sym);
-                        let g = gsyms.at(@as(usize, @bit_cast(u32, global_of(oi, r.sym))));
+                        _ = nl.got_slot(oi, r.sym);
+                        let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, r.sym))));
                         if g.stub < 0 {
                             g.stub = @int_cast(i32, stubs.len);
-                            stubs.push(@bit_cast(u32, global_of(oi, r.sym)));
+                            stubs.push(@bit_cast(u32, nl.global_of(oi, r.sym)));
                         }
                     } else if not is_abs64(r.ty) {
-                        err(
-                            u.f1(
-                                "'%s' (from a library) cannot be referenced this way",
-                                objs.get(oi).syms.get(@as(usize, r.sym)).name));
+                        nl.err(u.f1("'%s' (from a library) cannot be referenced this way",
+                                    nl.objs.get(oi).syms.get(@as(usize, r.sym)).name));
                     }
                 }
             }
@@ -433,46 +291,6 @@ fn scan_relocs() void {
 // -----------------------------------------------------------------------------
 // Layout
 // -----------------------------------------------------------------------------
-fn place(cls: i32, at: u64) u64 {
-    let mut cur = at;
-    // read-only data, then the frame tables together (elf.rets_rank)
-    let mut passes: i32 = 1;
-    if cls == C_CONST {
-        passes = 4;
-    }
-    for pass in 0..passes {
-        for oi in 0..objs.len {
-            let o = objs.get(oi);
-            for k in 0..o.secs.len {
-                if sec_cls.get(oi)[k] != cls {
-                    continue;
-                }
-                let s = o.secs.get(k);
-                if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
-                    continue;
-                }
-                cur = align_up(cur, s.align);
-                sec_addr.get(oi)[k] = cur;
-                cur += elf.sec_size(s);
-            }
-        }
-    }
-    return cur;
-}
-
-fn class_align(cls: i32) u64 {
-    let mut a: u64 = 1;
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            if (sec_cls.get(oi)[k] == cls) and (o.secs.get(k).align > a) {
-                a = o.secs.get(k).align;
-            }
-        }
-    }
-    return a;
-}
-
 // File offset of an address in __TEXT or __DATA.
 fn file_of(addr: u64) u64 {
     if addr >= data_addr {
@@ -481,145 +299,69 @@ fn file_of(addr: u64) u64 {
     return addr - BASE;
 }
 
-fn copy_class(b: []mut u8, cls: i32) void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            if sec_cls.get(oi)[k] != cls {
-                continue;
-            }
-            let d = o.secs.get(k).data.view();
-            let fo = @truncate(usize, file_of(sec_addr.get(oi)[k]));
-            for i in 0..d.len {
-                b[fo + i] = d[i];
-            }
-        }
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Relocation
 // -----------------------------------------------------------------------------
-fn w32(b: []mut u8, off: u64, x: u64) void {
-    let o = @truncate(usize, off);
-    for k in @as(usize, 0)..4 {
-        b[o + k] = @truncate(u8, x >> @as(u64, k * 8));
-    }
-}
-
-fn w64(b: []mut u8, off: u64, x: u64) void {
-    w32(b, off, x & 0xFFFF_FFFF);
-    w32(b, off + 4, x >> 32);
-}
-
-fn r32(b: []u8, off: u64) u64 {
-    let o = @truncate(usize, off);
-    return @as(u64, b[o]) | (@as(u64, b[o + 1]) << 8) | (@as(u64, b[o + 2]) << 16) | (@as(u64, b[o + 3]) << 24);
-}
-
-fn a64_adrp(b: []mut u8, off: u64, p: u64, target: u64) void {
-    let pages = (@bit_cast(i64, target & ~@as(u64, 0xfff)) - @bit_cast(i64, p & ~@as(u64, 0xfff))) >> 12;
-    if (pages < -0x10_0000) or (pages >= 0x10_0000) {
-        err("adrp out of range");
-    }
-    let v = @bit_cast(u64, pages) & 0x1f_ffff;
-    w32(b, off, (r32(b, off) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
-}
-
-fn a64_imm12(b: []mut u8, off: u64, x: u64) void {
-    w32(b, off, (r32(b, off) & 0xffc0_03ff) | ((x & 0xfff) << 10));
-}
-
-fn a64_branch(b: []mut u8, off: u64, p: u64, target: u64) void {
-    let d = @bit_cast(i64, target -% p);
-    if (d < -0x800_0000) or (d >= 0x800_0000) {
-        err("branch out of range");
-    }
-    w32(b, off, (r32(b, off) & 0xfc00_0000) | ((@bit_cast(u64, d) >> 2) & 0x3ff_ffff));
-}
-
 // An absolute address at p (in __DATA): dyld slides it.
 fn rebase_at(p: u64) void {
     if p < data_addr {
-        err("internal: an absolute address outside __DATA");
+        nl.err("internal: an absolute address outside __DATA");
         return;
     }
     rebases.push(p - data_addr);
 }
 
 fn apply_relocs(b: []mut u8) void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
-            let cls = sec_cls.get(oi)[k];
-            if (cls == C_BSS) or (cls == C_TBSS) {
+            let cls = nl.sec_cls.get(oi)[k];
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) {
                 continue;
             }
-            let base = sec_addr.get(oi)[k];
+            let base = nl.sec_addr.get(oi)[k];
             for r in s.relocs.items() {
                 let p = base + r.off;
                 let fo = file_of(p);
                 let t = r.ty;
                 let imp = is_import(oi, r.sym);
-                let mut sv = sym_addr(oi, r.sym);
+                let mut sv = nl.sym_addr(oi, r.sym);
                 if imp and is_call_reloc(t) {
-                    let g = gsyms.at(@as(usize, @bit_cast(u32, global_of(oi, r.sym))));
+                    let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, r.sym))));
                     sv = stub_addr + (@as(u64, @bit_cast(u32, g.stub)) * 12);
                 }
                 if is_got_reloc(t) {
-                    let ga = got_addr + (@as(u64, @bit_cast(u32, got_slot(oi, r.sym))) * 8);
-                    if t == elf.R_AARCH64_ADR_GOT_PAGE {
-                        a64_adrp(b, fo, p, ga);
-                    } else {
-                        a64_imm12(b, fo, (ga & 0xfff) >> 3);
-                    }
+                    nl.a64_got(b, fo, p, t, got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, r.sym))) * 8));
                     continue;
                 }
                 let sa = sv +% @bit_cast(u64, r.addend);
                 if is_abs64(t) {
                     if imp {
                         binds.push(Import.{ seg_off: p - data_addr, name: import_name(oi, r.sym), addend: r.addend });
-                        w64(b, fo, 0);
+                        bn.w64(b, fo, 0);
                     } else {
                         rebase_at(p);
-                        w64(b, fo, sa);
+                        bn.w64(b, fo, sa);
                     }
                     continue;
                 }
-                if t == elf.R_AARCH64_PREL32 {
-                    let v = @bit_cast(i64, sa) - @bit_cast(i64, p);
-                    if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
-                        err("relocation out of range (prel32)");
-                    }
-                    w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
-                } else if t == elf.R_AARCH64_ADR_PREL_PG_HI21 {
-                    a64_adrp(b, fo, p, sa);
-                } else if (t == elf.R_AARCH64_ADD_ABS_LO12_NC) or (t == elf.R_AARCH64_LDST8_ABS_LO12_NC) {
-                    a64_imm12(b, fo, sa & 0xfff);
-                } else if t == elf.R_AARCH64_LDST16_ABS_LO12_NC {
-                    a64_imm12(b, fo, (sa & 0xfff) >> 1);
-                } else if t == elf.R_AARCH64_LDST32_ABS_LO12_NC {
-                    a64_imm12(b, fo, (sa & 0xfff) >> 2);
-                } else if t == elf.R_AARCH64_LDST64_ABS_LO12_NC {
-                    a64_imm12(b, fo, (sa & 0xfff) >> 3);
-                } else if t == elf.R_AARCH64_LDST128_ABS_LO12_NC {
-                    a64_imm12(b, fo, (sa & 0xfff) >> 4);
-                } else if is_call_reloc(t) {
-                    a64_branch(b, fo, p, sa);
-                } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
+                if nl.a64_reloc(b, fo, p, t, sa) {
+                    continue;
+                }
+                if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
                     // the offset in the thread's block
                     let v = @bit_cast(i64, sa -% tls_addr);
                     if (v < 0) or (v >= 0x100_0000) {
-                        err("thread-local offset out of range");
+                        nl.err("thread-local offset out of range");
                     }
                     if t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12 {
-                        a64_imm12(b, fo, @bit_cast(u64, v) >> 12);
+                        nl.a64_imm12(b, fo, @bit_cast(u64, v) >> 12);
                     } else {
-                        a64_imm12(b, fo, @bit_cast(u64, v) & 0xfff);
+                        nl.a64_imm12(b, fo, @bit_cast(u64, v) & 0xfff);
                     }
                 } else {
-                    err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
+                    nl.err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
                 }
             }
         }
@@ -713,13 +455,13 @@ fn be64(b: *mut bn.Bytes, x: u64) void {
 // page. Its size is known before the hashes are.
 fn signature_size(ident: []u8, limit: u64) u64 {
     let npages = (limit + CS_PAGE - 1) / CS_PAGE;
-    let cd = align_up(88 + @as(u64, ident.len) + 1, 16) + (npages * 32);
-    return align_up(24 + cd, 16);
+    let cd = nl.align_up(88 + @as(u64, ident.len) + 1, 16) + (npages * 32);
+    return nl.align_up(24 + cd, 16);
 }
 
 fn signature(file: []u8, ident: []u8, limit: u64, text_size: u64) []u8 {
     let npages = (limit + CS_PAGE - 1) / CS_PAGE;
-    let hash_off = align_up(88 + @as(u64, ident.len) + 1, 16);
+    let hash_off = nl.align_up(88 + @as(u64, ident.len) + 1, 16);
     let cd_len = hash_off + (npages * 32);
     let total = signature_size(ident, limit);
     let mut b = bn.new_bytes();
@@ -873,33 +615,22 @@ struct NSym {
 
 // Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
 pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
-    for i in 0..inputs.len {
-        objs.push(inputs[i]);
-    }
-    objs.push(own_object());
-    objs.push(elf.rets_bounds(elf.EM_AARCH64));
+    nl.begin(inputs);
+    nl.objs.push(own_object());
+    nl.objs.push(elf.rets_bounds(elf.EM_AARCH64));
     collect_dylibs();
     collect_symbols();
-    let mn = gsym_index("main");
-    if gsyms.at(@as(usize, mn)).obj < 0 {
-        err("no 'main' function");
+    let mn = nl.gsym_index("main");
+    if nl.gsyms.at(@as(usize, mn)).obj < 0 {
+        nl.err("no 'main' function");
     }
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        let cls = u.newn.[i32](o.secs.len + 1);
-        for k in 0..o.secs.len {
-            cls[k] = class_of(o.secs.get(k));
-        }
-        sec_cls.push(cls);
-        sec_addr.push(u.newn.[u64](o.secs.len + 1));
-        local_got.push(u.newn.[i32](o.syms.len + 1));
-    }
+    nl.classify(class_of);
     scan_relocs();
-    if errors != 0 {
+    if nl.errors != 0 {
         return 1;
     }
     // GOT slots that dyld binds (libSystem) or rebases (our own symbols)
-    let ngot = @as(u64, got_sym.len);
+    let ngot = @as(u64, nl.got_sym.len);
 
     // the load commands' size, which places everything after them
     let ident = basename(out);
@@ -912,75 +643,75 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     }
 
     // __TEXT
-    text_addr = align_up(BASE + 32 + sizeofcmds, 16);
-    let code_end = place(C_TEXT, text_addr);
-    stub_addr = align_up(code_end, 4);
+    text_addr = nl.align_up(BASE + 32 + sizeofcmds, 16);
+    let code_end = nl.place(nl.C_TEXT, text_addr);
+    stub_addr = nl.align_up(code_end, 4);
     let text_end = stub_addr + (@as(u64, stubs.len) * 12);
-    let const_addr = align_up(text_end, class_align(C_CONST));
-    let const_end = place(C_CONST, const_addr);
-    let text_size = align_up(const_end - BASE, PAGE);
+    let const_addr = nl.align_up(text_end, nl.class_align(nl.C_CONST));
+    let const_end = nl.place(nl.C_CONST, const_addr);
+    let text_size = nl.align_up(const_end - BASE, PAGE);
 
     // __DATA
     data_addr = BASE + text_size;
     data_off = text_size;
     got_addr = data_addr;
-    let data_start = align_up(got_addr + (ngot * 8), 16);
-    let mut data_end = place(C_DATA, data_start);
-    tls_align = @max(class_align(C_TDATA), class_align(C_TBSS));
-    tls_addr = align_up(data_end, @max(tls_align, 16));
-    let tdata_end = place(C_TDATA, tls_addr);
-    let tbss_end = place(C_TBSS, align_up(tdata_end, class_align(C_TBSS)));
+    let data_start = nl.align_up(got_addr + (ngot * 8), 16);
+    let mut data_end = nl.place(nl.C_DATA, data_start);
+    tls_align = @max(nl.class_align(nl.C_TDATA), nl.class_align(nl.C_TBSS));
+    tls_addr = nl.align_up(data_end, @max(tls_align, 16));
+    let tdata_end = nl.place(nl.C_TDATA, tls_addr);
+    let tbss_end = nl.place(nl.C_TBSS, nl.align_up(tdata_end, nl.class_align(nl.C_TBSS)));
     tls_filesz = tdata_end - tls_addr;
     tls_memsz = tbss_end - tls_addr;
     data_end = tdata_end;
-    let bss_addr = align_up(data_end, class_align(C_BSS));
-    let bss_end = place(C_BSS, bss_addr);
-    let data_filesize = align_up(data_end - data_addr, PAGE);
-    let data_vmsize = align_up(bss_end - data_addr, PAGE);
+    let bss_addr = nl.align_up(data_end, nl.class_align(nl.C_BSS));
+    let bss_end = nl.place(nl.C_BSS, bss_addr);
+    let data_filesize = nl.align_up(data_end - data_addr, PAGE);
+    let data_vmsize = nl.align_up(bss_end - data_addr, PAGE);
 
     let total_body = data_off + data_filesize;
     let mut fileb = bn.new_bytes();
     fileb.zeros(@truncate(usize, total_body));
     let b = fileb.view();
-    copy_class(b, C_TEXT);
-    copy_class(b, C_CONST);
-    copy_class(b, C_DATA);
-    copy_class(b, C_TDATA);
+    nl.copy_class(b, nl.C_TEXT, file_of);
+    nl.copy_class(b, nl.C_CONST, file_of);
+    nl.copy_class(b, nl.C_DATA, file_of);
+    nl.copy_class(b, nl.C_TDATA, file_of);
 
     // stubs: adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16
     for k in 0..stubs.len {
-        let g = gsyms.at(@as(usize, stubs.get(k)));
+        let g = nl.gsyms.at(@as(usize, stubs.get(k)));
         let at = stub_addr + (@as(u64, k) * 12);
         let slot = got_addr + (@as(u64, @bit_cast(u32, g.got)) * 8);
         let fo = file_of(at);
-        w32(b, fo, 0x9000_0010);
-        a64_adrp(b, fo, at, slot);
-        w32(b, fo + 4, 0xf940_0210);
-        a64_imm12(b, fo + 4, (slot & 0xfff) >> 3);
-        w32(b, fo + 8, 0xd61f_0200);
+        bn.w32(b, fo, 0x9000_0010);
+        nl.a64_adrp(b, fo, at, slot);
+        bn.w32(b, fo + 4, 0xf940_0210);
+        nl.a64_imm12(b, fo + 4, (slot & 0xfff) >> 3);
+        bn.w32(b, fo + 8, 0xd61f_0200);
     }
     // GOT slots
-    for k in 0..got_sym.len {
-        let oi = @as(usize, got_obj.get(k));
-        let si = got_sym.get(k);
+    for k in 0..nl.got_sym.len {
+        let oi = @as(usize, nl.got_obj.get(k));
+        let si = nl.got_sym.get(k);
         let at = got_addr + (@as(u64, k) * 8);
         if is_import(oi, si) {
             binds.push(Import.{ seg_off: at - data_addr, name: import_name(oi, si), addend: 0 });
         } else {
-            w64(b, file_of(at), sym_addr(oi, si));
+            bn.w64(b, file_of(at), nl.sym_addr(oi, si));
             rebase_at(at);
         }
     }
     apply_relocs(b);
     // the runtime's record of the thread-local template
-    let info = global_addr("axiom.tls_key");
+    let info = nl.global_addr("axiom.tls_key");
     let ifo = file_of(info);
-    w64(b, ifo + 8, tls_addr);
+    bn.w64(b, ifo + 8, tls_addr);
     rebase_at(info + 8);
-    w64(b, ifo + 16, tls_filesz);
-    w64(b, ifo + 24, tls_memsz);
-    w64(b, ifo + 32, @max(tls_align, 16));
-    if errors != 0 {
+    bn.w64(b, ifo + 16, tls_filesz);
+    bn.w64(b, ifo + 24, tls_memsz);
+    bn.w64(b, ifo + 32, @max(tls_align, 16));
+    if nl.errors != 0 {
         return 1;
     }
 
@@ -992,33 +723,33 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     strtab.u8_(0x20);
     strtab.u8_(0);
     let mut locals = u.List.[NSym].{ data: u.nil.[NSym](), len: 0, cap: 0 };
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for si in 0..o.syms.len {
             let s = o.syms.get(si);
             if (s.sec < 0) or (s.name.len == 0) or (s.ty == elf.T_TLS) {
                 continue;
             }
-            let cls = sec_cls.get(oi)[@as(usize, @bit_cast(u32, s.sec))];
-            if (cls == C_TDATA) or (cls == C_TBSS) {
+            let cls = nl.sec_cls.get(oi)[@as(usize, @bit_cast(u32, s.sec))];
+            if (cls == nl.C_TDATA) or (cls == nl.C_TBSS) {
                 continue;
             }
-            if (s.bind != elf.B_LOCAL) and (global_of(oi, @int_cast(u32, si)) >= 0) {
-                let g = gsyms.at(@as(usize, @bit_cast(u32, global_of(oi, @int_cast(u32, si)))));
+            if (s.bind != elf.B_LOCAL) and (nl.global_of(oi, @int_cast(u32, si)) >= 0) {
+                let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, @int_cast(u32, si)))));
                 if (g.obj != @int_cast(i32, oi)) or (g.sym != @int_cast(u32, si)) {
                     continue;  // a weak definition that lost
                 }
             }
             let mut sect: u8 = 1;  // __text
-            if cls == C_CONST {
+            if cls == nl.C_CONST {
                 sect = 2;
-            } else if cls == C_DATA {
+            } else if cls == nl.C_DATA {
                 sect = 4;
-            } else if cls == C_BSS {
+            } else if cls == nl.C_BSS {
                 sect = 5;
             }
             locals.push(
-                NSym.{ name: s.name, ty: 0x0e, sect: sect, desc: 0, value: sym_addr_in(oi, @int_cast(u32, si)) });
+                NSym.{ name: s.name, ty: 0x0e, sect: sect, desc: 0, value: nl.sym_addr_in(oi, @int_cast(u32, si)) });
         }
     }
     let mut syms = u.List.[NSym].{ data: u.nil.[NSym](), len: 0, cap: 0 };
@@ -1027,12 +758,12 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     }
     // external: the header (for dyld) and main
     syms.push(NSym.{ name: "__mh_execute_header", ty: 0x0f, sect: 1, desc: 0x10, value: BASE });
-    syms.push(NSym.{ name: "_main", ty: 0x0f, sect: 1, desc: 0, value: global_addr("main") });
+    syms.push(NSym.{ name: "_main", ty: 0x0f, sect: 1, desc: 0, value: nl.global_addr("main") });
     // undefined: each with its library's ordinal (libSystem's is 1)
     let nlocal = locals.len;
     let mut undef = u.List.[[]u8].{ data: u.nil.[[]u8](), len: 0, cap: 0 };
-    for gi in 0..gsyms.len {
-        let g = gsyms.at(gi);
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.at(gi);
         if g.obj < 0 {
             undef.push(u.cat2("_", g.name));
         }
@@ -1061,7 +792,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let export_off = bind_off + @as(u64, bind.len);
     let sym_off = export_off + @as(u64, exports.len);
     let str_off = sym_off + @as(u64, symtab.len());
-    let sig_off = align_up(str_off + @as(u64, strtab.len()), 16);
+    let sig_off = nl.align_up(str_off + @as(u64, strtab.len()), 16);
     let sig_size = signature_size(ident, sig_off);
     let le_size = (sig_off + sig_size) - le_off;
     let le_addr = data_addr + data_vmsize;
@@ -1080,12 +811,12 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     segment(&mut h, "__TEXT", BASE, text_size, 0, text_size, 5, 2);
     section(&mut h, "__text", "__TEXT", text_addr, text_end - text_addr, file_of(text_addr), 16, 0x8000_0400);
     section(&mut h, "__const", "__TEXT", const_addr, const_end - const_addr, file_of(const_addr),
-            @max(class_align(C_CONST), 1), 0);
+            @max(nl.class_align(nl.C_CONST), 1), 0);
     segment(&mut h, "__DATA", data_addr, data_vmsize, data_off, data_filesize, 3, 3);
     section(&mut h, "__got", "__DATA", got_addr, ngot * 8, data_off, 8, 0);
     section(&mut h, "__data", "__DATA", data_start, data_end - data_start, file_of(data_start), 16, 0);
-    section(&mut h, "__bss", "__DATA", bss_addr, bss_end - bss_addr, 0, @max(class_align(C_BSS), 1), 1);
-    segment(&mut h, "__LINKEDIT", le_addr, align_up(le_size, PAGE), le_off, le_size, 1, 0);
+    section(&mut h, "__bss", "__DATA", bss_addr, bss_end - bss_addr, 0, @max(nl.class_align(nl.C_BSS), 1), 1);
+    segment(&mut h, "__LINKEDIT", le_addr, nl.align_up(le_size, PAGE), le_off, le_size, 1, 0);
     h.u32_(0x8000_0022);  // LC_DYLD_INFO_ONLY
     h.u32_(48);
     h.u32_(rebase_off);
@@ -1132,7 +863,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     h.u32_(0);            // no tools
     h.u32_(0x8000_0028);  // LC_MAIN
     h.u32_(24);
-    h.u64_(file_of(global_addr("main")));
+    h.u64_(file_of(nl.global_addr("main")));
     h.u64_(0);  // default stack size
     load_dylib(&mut h, "/usr/lib/libSystem.B.dylib", 0x0547_0000);  // current version 1351
     for d in dylibs.items() {
@@ -1143,7 +874,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     h.u32_(sig_off);
     h.u32_(sig_size);
     if @as(u64, h.len()) != (32 + sizeofcmds) {
-        err("internal: load command size");
+        nl.err("internal: load command size");
         return 1;
     }
     let hv = h.view();
@@ -1178,13 +909,13 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let tmp = u.f2("%s.tmp%s", out, u.idec(u.getpid()));
     if not u.write_file(tmp, f.view()) {
         _ = u.unlink(u.cz(tmp));
-        err(u.f1("cannot write %s", out));
+        nl.err(u.f1("cannot write %s", out));
         return 1;
     }
     _ = u.chmod(u.cz(tmp), 0o755);
     if u.rename(u.cz(tmp), u.cz(out)) != 0 {
         _ = u.unlink(u.cz(tmp));
-        err(u.f1("cannot write %s", out));
+        nl.err(u.f1("cannot write %s", out));
         return 1;
     }
     return 0;

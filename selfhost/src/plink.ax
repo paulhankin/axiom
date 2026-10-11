@@ -44,6 +44,7 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "nlink.ax" as nl;
 import "pdb.ax" as pdb;
 import "util.ax" as u;
 
@@ -63,43 +64,17 @@ const SECT: u64 = 0x1000;   // section alignment in memory
 const FILEAL: u64 = 0x200;  // and in the file
 const STACK_RESERVE: u64 = 8 << 20;
 
-const C_TEXT: i32 = 0;
-const C_CONST: i32 = 1;
-const C_DATA: i32 = 2;
-const C_TDATA: i32 = 3;
-const C_TBSS: i32 = 4;
-const C_BSS: i32 = 5;
 const C_PDATA: i32 = 6;  // the function table (.pdata), one array at the end of .rdata
 const C_NONE: i32 = -1;  // not in the image (.axiom.lines: for the PDB)
-
-struct GSym {
-    name: []u8,
-    obj: i32,  // defining object, -1: imported
-    sym: u32,
-    got: i32,    // GOT slot, -1: none
-    thunk: i32,  // import index, -1: none
-    weak: bool,  // undefined and only weakly referenced: address 0
-}
 
 struct Dll {
     name: []u8,
     funcs: u.List.[u32],  // gsym indexes
 }
 
-let mut objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0,
-                                                              cap: 0 };
-let mut gsyms: u.List.[GSym] = u.List.[GSym].{ data: @ptr_from_int(*mut GSym, 0), len: 0, cap: 0 };
-let mut gmap: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
-                                                cap: 0, len: 0 };
-let mut sec_addr: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0, cap: 0 };
-let mut sec_cls: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
-let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
-let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
-let mut got_sym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut imports: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // gsym per thunk
 let mut dlls: u.List.[Dll] = u.List.[Dll].{ data: @ptr_from_int(*mut Dll, 0), len: 0, cap: 0 };
 let mut relocs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };  // RVAs of addresses
-let mut errors: u32 = 0;
 // function name -> index in import_dlls + 1 (from axiom.import.* constants)
 let mut import_map: u.SymMap.[u32] = u.SymMap.[u32].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
@@ -121,20 +96,8 @@ struct Out {
     flags: u64,
 }
 
-fn err(msg: []u8) void {
-    u.eprint(u.f1("axiom: link error: %s\n", msg));
-    errors += 1;
-}
-
-fn align_up(x: u64, a: u64) u64 {
-    if a <= 1 {
-        return x;
-    }
-    return (x + a - 1) & ~(a - 1);
-}
-
 fn is_got_reloc(ty: u32) bool {
-    return (ty == elf.R_X86_64_GOTPCREL) or (ty == 41) or (ty == elf.R_X86_64_REX_GOTPCRELX);
+    return (ty == elf.R_X86_64_GOTPCREL) or (ty == elf.R_X86_64_GOTPCRELX) or (ty == elf.R_X86_64_REX_GOTPCRELX);
 }
 
 fn is_call_reloc(ty: u32) bool {
@@ -150,21 +113,21 @@ fn class_of(s: *elf.Sec) i32 {
         return C_NONE;
     }
     if k == elf.S_TEXT {
-        return C_TEXT;
+        return nl.C_TEXT;
     }
     if k == elf.S_RODATA {
-        return C_CONST;  // (base relocations patch read-only pages too)
+        return nl.C_CONST;  // (base relocations patch read-only pages too)
     }
     if k == elf.S_DATA {
-        return C_DATA;
+        return nl.C_DATA;
     }
     if k == elf.S_BSS {
-        return C_BSS;
+        return nl.C_BSS;
     }
     if k == elf.S_TDATA {
-        return C_TDATA;
+        return nl.C_TDATA;
     }
-    return C_TBSS;
+    return nl.C_TBSS;
 }
 
 let SOCKET_FNS: [22][]u8 = ["accept", "bind", "closesocket", "connect", "freeaddrinfo", "getaddrinfo", "gethostname",
@@ -176,6 +139,10 @@ let SOCKET_FNS: [22][]u8 = ["accept", "bind", "closesocket", "connect", "freeadd
 // so that a program can support several systems and choose at run time.
 let mut foreign: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
                                                    cap: 0, len: 0 };
+
+fn is_foreign(name: []u8) bool {
+    return foreign.get(u.intern(name)) != 0;
+}
 
 let APPLE_LIBS: [24][]u8 = ["AVFAudio", "AppKit", "ApplicationServices", "AudioToolbox", "AudioUnit", "CoreAudio",
                             "CoreFoundation", "CoreGraphics", "CoreHaptics", "CoreServices", "CoreText", "CoreVideo",
@@ -196,8 +163,8 @@ fn is_apple_lib(name: []u8) bool {
 
 // The DLLs that extern blocks named (the axiom.import.* constants).
 fn collect_dll_names() void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for si in 0..o.syms.len {
             let s = o.syms.get(si);
             if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
@@ -255,141 +222,39 @@ fn dll_of(name: []u8) []u8 {
 // -----------------------------------------------------------------------------
 // Symbols
 // -----------------------------------------------------------------------------
-fn gsym_index(name: []u8) u32 {
-    let k = u.intern(name);
-    let prev = gmap.get(k);
-    if prev != 0 {
-        return prev - 1;
-    }
-    gsyms.push(GSym.{ name: k, obj: -1, sym: 0, got: -1, thunk: -1, weak: true });
-    gmap.put(k, @int_cast(u32, gsyms.len));
-    return @int_cast(u32, gsyms.len - 1);
-}
-
 fn collect_symbols() void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for si in 0..o.syms.len {
-            let s = o.syms.get(si);
-            if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
-                continue;
-            }
-            let gi = gsym_index(s.name);
-            let g = gsyms.at(@as(usize, gi));
-            if s.bind != elf.B_WEAK {
-                g.weak = false;
-            }
-            if s.sec < 0 {
-                continue;
-            }
-            if g.obj < 0 {
-                g.obj = @int_cast(i32, oi);
-                g.sym = @int_cast(u32, si);
-            } else if s.bind != elf.B_WEAK {
-                let prev = objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
-                if prev.bind == elf.B_WEAK {
-                    g.obj = @int_cast(i32, oi);
-                    g.sym = @int_cast(u32, si);
-                } else {
-                    err(u.f1("duplicate symbol '%s'", s.name));
-                }
-            }
-        }
-    }
-    let un = gsym_index("ax_unavailable");
-    for gi in 0..gsyms.len {
-        let g = gsyms.at(gi);
-        if (g.obj < 0) and (foreign.get(u.intern(g.name)) != 0) {
-            let target = gsyms.get(@as(usize, un));
-            if target.obj < 0 {
-                err(u.f1("'%s' is from another system's library, and there is no ax_unavailable", g.name));
-            }
-            g.obj = target.obj;
-            g.sym = target.sym;
-            g.weak = false;
-        }
-    }
+    nl.define_globals();
+    nl.use_unavailable(is_foreign);
     // What is still undefined must be a Windows function, never one of our
     // own (module-qualified) names.
-    for gi in 0..gsyms.len {
-        let g = gsyms.at(gi);
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.at(gi);
         if (g.obj < 0) and not g.weak and (dll_of(g.name).len == 0) {
-            err(u.f1("undefined symbol '%s'", g.name));
+            nl.err(u.f1("undefined symbol '%s'", g.name));
         }
     }
-}
-
-fn global_of(oi: usize, si: u32) i32 {
-    let s = objs.get(oi).syms.at(@as(usize, si));
-    if (s.bind == elf.B_LOCAL) or (s.name.len == 0) {
-        return -1;
-    }
-    return @int_cast(i32, gmap.get(u.intern(s.name))) - 1;
 }
 
 fn is_import(oi: usize, si: u32) bool {
-    let gi = global_of(oi, si);
-    return (gi >= 0) and (gsyms.at(@int_cast(usize, gi)).obj < 0) and not gsyms.at(@int_cast(usize, gi)).weak;
-}
-
-fn sym_addr_in(oi: usize, si: u32) u64 {
-    let s = objs.get(oi).syms.at(@as(usize, si));
-    if s.sec < 0 {
-        return 0;
-    }
-    return sec_addr.get(oi)[@as(usize, @bit_cast(u32, s.sec))] + s.value;
+    let gi = nl.global_of(oi, si);
+    return (gi >= 0) and (nl.gsyms.at(@int_cast(usize, gi)).obj < 0) and not nl.gsyms.at(@int_cast(usize, gi)).weak;
 }
 
 // A symbol's address; an imported function's is its thunk's.
 fn sym_addr(oi: usize, si: u32) u64 {
-    let gi = global_of(oi, si);
-    if gi < 0 {
-        return sym_addr_in(oi, si);
+    if is_import(oi, si) {
+        let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, si))));
+        return thunk_addr + (@as(u64, @bit_cast(u32, g.stub)) * 8);
     }
-    let g = gsyms.at(@int_cast(usize, gi));
-    if g.weak and (g.obj < 0) {
-        return 0;  // (an absolute 0 has no base relocation: see abs_at)
-    }
-    if g.obj < 0 {
-        return thunk_addr + (@as(u64, @bit_cast(u32, g.thunk)) * 8);
-    }
-    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
-}
-
-fn global_addr(name: []u8) u64 {
-    let g = gsyms.at(@as(usize, gsym_index(name)));
-    if g.obj < 0 {
-        return 0;
-    }
-    return sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
-}
-
-fn got_slot(oi: usize, si: u32) i32 {
-    let gi = global_of(oi, si);
-    if gi >= 0 {
-        let g = gsyms.at(@int_cast(usize, gi));
-        if g.got < 0 {
-            got_obj.push(@int_cast(u32, oi));
-            got_sym.push(si);
-            g.got = @int_cast(i32, got_sym.len - 1);
-        }
-        return g.got;
-    }
-    let lg = local_got.get(oi);
-    if lg[@as(usize, si)] == 0 {
-        got_obj.push(@int_cast(u32, oi));
-        got_sym.push(si);
-        lg[@as(usize, si)] = @int_cast(i32, got_sym.len);
-    }
-    return lg[@as(usize, si)] - 1;
+    return nl.sym_addr(oi, si);  // (0 for a missing weak one: see abs_at)
 }
 
 fn add_import(gi: u32) void {
-    let g = gsyms.at(@as(usize, gi));
-    if g.thunk >= 0 {
+    let g = nl.gsyms.at(@as(usize, gi));
+    if g.stub >= 0 {
         return;
     }
-    g.thunk = @int_cast(i32, imports.len);
+    g.stub = @int_cast(i32, imports.len);
     imports.push(gi);
     let dn = dll_of(g.name);
     for k in 0..dlls.len {
@@ -406,15 +271,15 @@ fn add_import(gi: u32) void {
 // Imports, and GOT slots that loads through the GOT need (a load of an
 // imported function's address reads its import address table slot instead).
 fn scan_relocs() void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
             for r in s.relocs.items() {
                 if is_import(oi, r.sym) {
-                    add_import(@bit_cast(u32, global_of(oi, r.sym)));
+                    add_import(@bit_cast(u32, nl.global_of(oi, r.sym)));
                 } else if is_got_reloc(r.ty) {
-                    _ = got_slot(oi, r.sym);
+                    _ = nl.got_slot(oi, r.sym);
                 }
             }
         }
@@ -424,46 +289,6 @@ fn scan_relocs() void {
 // -----------------------------------------------------------------------------
 // Layout
 // -----------------------------------------------------------------------------
-fn place(cls: i32, at: u64) u64 {
-    let mut cur = at;
-    // read-only data, then the frame tables together (elf.rets_rank)
-    let mut passes: i32 = 1;
-    if cls == C_CONST {
-        passes = 4;
-    }
-    for pass in 0..passes {
-        for oi in 0..objs.len {
-            let o = objs.get(oi);
-            for k in 0..o.secs.len {
-                if sec_cls.get(oi)[k] != cls {
-                    continue;
-                }
-                let s = o.secs.get(k);
-                if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
-                    continue;
-                }
-                cur = align_up(cur, s.align);
-                sec_addr.get(oi)[k] = cur;
-                cur += elf.sec_size(s);
-            }
-        }
-    }
-    return cur;
-}
-
-fn class_align(cls: i32) u64 {
-    let mut a: u64 = 1;
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            if (sec_cls.get(oi)[k] == cls) and (o.secs.get(k).align > a) {
-                a = o.secs.get(k).align;
-            }
-        }
-    }
-    return a;
-}
-
 let mut outs: [6]Out = [Out.{ name: "", rva: 0, vsize: 0, fsize: 0, foff: 0, flags: 0 }; 6];
 
 // The file offset of an image address (in a section's file data).
@@ -474,44 +299,16 @@ fn file_of(addr: u64) u64 {
             return o.foff + (rva - o.rva);
         }
     }
-    err("internal: an address outside the file's data");
+    nl.err("internal: an address outside the file's data");
     return 0;
 }
 
-fn copy_class(b: []mut u8, cls: i32) void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        for k in 0..o.secs.len {
-            if sec_cls.get(oi)[k] != cls {
-                continue;
-            }
-            let d = o.secs.get(k).data.view();
-            if d.len == 0 {
-                continue;
-            }
-            let fo = @truncate(usize, file_of(sec_addr.get(oi)[k]));
-            for i in 0..d.len {
-                b[fo + i] = d[i];
-            }
-        }
-    }
-}
-
-fn w32(b: []mut u8, off: u64, x: u64) void {
-    let o = @truncate(usize, off);
-    for k in @as(usize, 0)..4 {
-        b[o + k] = @truncate(u8, x >> @as(u64, k * 8));
-    }
-}
-
-fn w64(b: []mut u8, off: u64, x: u64) void {
-    w32(b, off, x & 0xFFFF_FFFF);
-    w32(b, off + 4, x >> 32);
-}
-
+// -----------------------------------------------------------------------------
+// Relocation
+// -----------------------------------------------------------------------------
 // An absolute address at addr: the loader adds the image's displacement.
 fn abs_at(b: []mut u8, addr: u64, value: u64) void {
-    w64(b, file_of(addr), value);
+    bn.w64(b, file_of(addr), value);
     if value != 0 {
         relocs.push(addr - BASE);
     }
@@ -520,21 +317,21 @@ fn abs_at(b: []mut u8, addr: u64, value: u64) void {
 fn rel32(b: []mut u8, p: u64, target: u64) void {
     let v = @bit_cast(i64, target) - @bit_cast(i64, p);
     if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
-        err("relocation out of range (pc32)");
+        nl.err("relocation out of range (pc32)");
     }
-    w32(b, file_of(p), @bit_cast(u64, v) & 0xFFFF_FFFF);
+    bn.w32(b, file_of(p), @bit_cast(u64, v) & 0xFFFF_FFFF);
 }
 
 fn apply_relocs(b: []mut u8) void {
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
-            let cls = sec_cls.get(oi)[k];
-            if (cls == C_BSS) or (cls == C_TBSS) {
+            let cls = nl.sec_cls.get(oi)[k];
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) {
                 continue;
             }
-            let base = sec_addr.get(oi)[k];
+            let base = nl.sec_addr.get(oi)[k];
             for r in s.relocs.items() {
                 let p = base + r.off;
                 let t = r.ty;
@@ -542,18 +339,15 @@ fn apply_relocs(b: []mut u8) void {
                 if is_got_reloc(t) {
                     if is_import(oi, r.sym) {
                         // the import address table slot holds the address
-                        let g = gsyms.at(@as(usize, @bit_cast(u32, global_of(oi, r.sym))));
-                        rel32(b, p, iat_slot.get(@as(usize, @bit_cast(u32, g.thunk))) +% @bit_cast(u64, r.addend));
+                        let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, r.sym))));
+                        rel32(b, p, iat_slot.get(@as(usize, @bit_cast(u32, g.stub))) +% @bit_cast(u64, r.addend));
                         continue;
                     }
-                    let fo = file_of(p);
-                    if (t == elf.R_X86_64_REX_GOTPCRELX) and (fo >= 2) and (b[@truncate(usize, fo - 2)] == 0x8b) {
-                        // mov reg, [rip+GOT] -> lea reg, [rip+sym]
-                        b[@truncate(usize, fo - 2)] = 0x8d;
+                    if nl.x64_relax(b, file_of(p), t) {
                         rel32(b, p, sa);
                         continue;
                     }
-                    let ga = got_addr + (@as(u64, @bit_cast(u32, got_slot(oi, r.sym))) * 8);
+                    let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, r.sym))) * 8);
                     rel32(b, p, ga +% @bit_cast(u64, r.addend));
                     continue;
                 }
@@ -562,16 +356,16 @@ fn apply_relocs(b: []mut u8) void {
                 } else if is_call_reloc(t) {
                     rel32(b, p, sa);
                 } else if t == elf.R_X86_64_RVA32 {
-                    w32(b, file_of(p), sa - BASE);
+                    bn.w32(b, file_of(p), sa - BASE);
                 } else if t == elf.R_X86_64_TPOFF32 {
                     // the offset in the thread's copy of the template
                     let v = @bit_cast(i64, sa -% tls_addr);
                     if (v < 0) or (v > 0x7fff_ffff) {
-                        err("thread-local offset out of range");
+                        nl.err("thread-local offset out of range");
                     }
-                    w32(b, file_of(p), @bit_cast(u64, v));
+                    bn.w32(b, file_of(p), @bit_cast(u64, v));
                 } else {
-                    err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
+                    nl.err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
                 }
             }
         }
@@ -639,7 +433,7 @@ fn sort_pdata(b: []mut u8, start: u64, end: u64) void {
     let n = @truncate(usize, (end - start) / 12);
     for i in @as(usize, 1)..n {
         let mut j = i;
-        while (j > 0) and (elf.rd32(b, fo + (j * 12)) < elf.rd32(b, fo + ((j - 1) * 12))) {
+        while (j > 0) and (bn.rd32(b, fo + (j * 12)) < bn.rd32(b, fo + ((j - 1) * 12))) {
             for k in @as(usize, 0)..12 {
                 let t = b[fo + (j * 12) + k];
                 b[fo + (j * 12) + k] = b[fo + ((j - 1) * 12) + k];
@@ -660,7 +454,7 @@ fn import_section(rva: u64) bn.Bytes {
     let ndll = @as(u64, dlls.len);
     let nimp = @as(u64, imports.len);
     let desc_size = (ndll + 1) * 20;
-    let ilt_at = align_up(desc_size, 8);
+    let ilt_at = nl.align_up(desc_size, 8);
     let table_size = (nimp + ndll) * 8;  // each DLL's list ends in a NULL
     let iat_at = ilt_at + table_size;
     let names_at = iat_at + table_size;
@@ -675,9 +469,9 @@ fn import_section(rva: u64) bn.Bytes {
     for d in 0..dlls.len {
         let dl = dlls.get(d);
         for gi in dl.funcs.items() {
-            let g = gsyms.get(@as(usize, gi));
+            let g = nl.gsyms.get(@as(usize, gi));
             names.align(2);
-            hint_name[@as(usize, @bit_cast(u32, g.thunk))] = rva + names_at + @as(u64, names.len());
+            hint_name[@as(usize, @bit_cast(u32, g.stub))] = rva + names_at + @as(u64, names.len());
             names.u16_(0);
             names.put(g.name);
             names.u8_(0);
@@ -704,7 +498,7 @@ fn import_section(rva: u64) bn.Bytes {
     for pass in @as(usize, 0)..2 {
         for d in 0..dlls.len {
             for gi in dlls.at(d).funcs.items() {
-                let th = @as(usize, @bit_cast(u32, gsyms.get(@as(usize, gi)).thunk));
+                let th = @as(usize, @bit_cast(u32, nl.gsyms.get(@as(usize, gi)).stub));
                 if pass == 1 {
                     iat_slot.items()[th] = BASE + rva + @as(u64, b.len());
                 }
@@ -769,83 +563,72 @@ fn name8(h: *mut bn.Bytes, s: []u8) void {
 
 // Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
 pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
-    for i in 0..inputs.len {
-        objs.push(inputs[i]);
-    }
-    objs.push(own_object());
-    objs.push(elf.rets_bounds(elf.EM_X86_64));
+    nl.begin(inputs);
+    nl.objs.push(own_object());
+    nl.objs.push(elf.rets_bounds(elf.EM_X86_64));
     collect_dll_names();
     collect_symbols();
-    if gsyms.at(@as(usize, gsym_index("main"))).obj < 0 {
-        err("no 'main' function");
+    if nl.gsyms.at(@as(usize, nl.gsym_index("main"))).obj < 0 {
+        nl.err("no 'main' function");
     }
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
-        let cls = u.newn.[i32](o.secs.len + 1);
-        for k in 0..o.secs.len {
-            cls[k] = class_of(o.secs.get(k));
-        }
-        sec_cls.push(cls);
-        sec_addr.push(u.newn.[u64](o.secs.len + 1));
-        local_got.push(u.newn.[i32](o.syms.len + 1));
-    }
+    nl.classify(class_of);
     scan_relocs();
-    add_import(gsym_index("ExitProcess"));
+    add_import(nl.gsym_index("ExitProcess"));
     let mut ico = u.nosym();
     if g_icon.len > 0 {
         ico = u.read_file(g_icon);
         if u.isnos(ico) {
-            err(u.f1("cannot read the icon %s", g_icon));
+            nl.err(u.f1("cannot read the icon %s", g_icon));
         } else if not ico_valid(ico) {
-            err(u.f1("%s is not a Windows icon file (.ico)", g_icon));
+            nl.err(u.f1("%s is not a Windows icon file (.ico)", g_icon));
         }
     }
-    if errors != 0 {
+    if nl.errors != 0 {
         return 1;
     }
     let mut nsec: u64 = 5;
     if g_icon.len > 0 {
         nsec = 6;
     }
-    let headers = align_up(0x40 + 4 + 20 + 240 + (nsec * 40), FILEAL);
+    let headers = nl.align_up(0x40 + 4 + 20 + 240 + (nsec * 40), FILEAL);
 
     // .text: code, then the import thunks
-    let text_rva = align_up(headers, SECT);
-    let code_end = place(C_TEXT, BASE + text_rva);
-    thunk_addr = align_up(code_end, 8);
+    let text_rva = nl.align_up(headers, SECT);
+    let code_end = nl.place(nl.C_TEXT, BASE + text_rva);
+    thunk_addr = nl.align_up(code_end, 8);
     let text_end = thunk_addr + (@as(u64, imports.len) * 8);
     // .rdata
-    let rdata_rva = align_up(text_end - BASE, SECT);
-    let pdata_start = align_up(place(C_CONST, BASE + rdata_rva), 4);
-    let pdata_end = place(C_PDATA, pdata_start);
+    let rdata_rva = nl.align_up(text_end - BASE, SECT);
+    let pdata_start = nl.align_up(nl.place(nl.C_CONST, BASE + rdata_rva), 4);
+    let pdata_end = nl.place(C_PDATA, pdata_start);
     // the debug directory: one CodeView entry, and its record (RSDS, the
     // GUID, the age, the PDB's path)
     let pdb_path = pdb_path_of(out);
-    let debug_at = align_up(pdata_end, 4);
+    let debug_at = nl.align_up(pdata_end, 4);
     let rsds_at = debug_at + 28;
     let mut rdata_end = pdata_end;
     if g_pdb {
         rdata_end = rsds_at + 24 + @as(u64, pdb_path.len) + 1;
     }
     // .idata
-    let idata_rva = align_up(rdata_end - BASE, SECT);
+    let idata_rva = nl.align_up(rdata_end - BASE, SECT);
     let mut idata = import_section(idata_rva);
     // .data: data, the GOT, the thread-local template, then .bss
-    let data_rva = align_up(idata_rva + @as(u64, idata.len()), SECT);
-    let mut cur = place(C_DATA, BASE + data_rva);
-    got_addr = align_up(cur, 8);
-    cur = got_addr + (@as(u64, got_sym.len) * 8);
-    let tls_align = @max(@max(class_align(C_TDATA), class_align(C_TBSS)), 16);
-    tls_addr = align_up(cur, tls_align);
-    let tdata_end = place(C_TDATA, tls_addr);
-    let tbss_start = align_up(tdata_end, class_align(C_TBSS));
+    let data_rva = nl.align_up(idata_rva + @as(u64, idata.len()), SECT);
+    let mut cur = nl.place(nl.C_DATA, BASE + data_rva);
+    got_addr = nl.align_up(cur, 8);
+    cur = got_addr + (@as(u64, nl.got_sym.len) * 8);
+    let tls_align = @max(@max(nl.class_align(nl.C_TDATA), nl.class_align(nl.C_TBSS)), 16);
+    tls_addr = nl.align_up(cur, tls_align);
+    let tdata_end = nl.place(nl.C_TDATA, tls_addr);
+    let tbss_start = nl.align_up(tdata_end, nl.class_align(nl.C_TBSS));
     // .tbss is part of the template, as zeros in the file: the Windows loader
     // ignores the TLS directory's SizeOfZeroFill (it allocates and copies
     // only the template, so zero-fill variables would be past the end of
     // each thread's block)
-    let tls_end = place(C_TBSS, tbss_start);
+    let tls_end = nl.place(nl.C_TBSS, tbss_start);
     let data_file_end = tls_end;
-    let bss_end = place(C_BSS, align_up(tls_end, class_align(C_BSS)));
+    let bss_end = nl.place(nl.C_BSS, nl.align_up(tls_end, nl.class_align(nl.C_BSS)));
 
     outs[0] = Out.{ name: ".text", rva: text_rva, vsize: text_end - (BASE + text_rva), fsize: 0, foff: 0,
                     flags: 0x6000_0020 };
@@ -862,18 +645,18 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let mut foff = headers;
     for k in @as(usize, 0)..4 {
         outs[k].foff = foff;
-        foff += align_up(outs[k].fsize, FILEAL);
+        foff += nl.align_up(outs[k].fsize, FILEAL);
     }
 
     // the file, without .reloc
     let mut f = bn.new_bytes();
     f.zeros(@truncate(usize, foff));
     let b = f.view();
-    copy_class(b, C_TEXT);
-    copy_class(b, C_CONST);
-    copy_class(b, C_PDATA);
-    copy_class(b, C_DATA);
-    copy_class(b, C_TDATA);
+    nl.copy_class(b, nl.C_TEXT, file_of);
+    nl.copy_class(b, nl.C_CONST, file_of);
+    nl.copy_class(b, C_PDATA, file_of);
+    nl.copy_class(b, nl.C_DATA, file_of);
+    nl.copy_class(b, nl.C_TDATA, file_of);
     let iv = idata.view();
     for i in 0..iv.len {
         b[@truncate(usize, outs[2].foff) + i] = iv[i];
@@ -891,8 +674,8 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         b[fo + 7] = 0xcc;
     }
     // GOT slots: the addresses of our own symbols
-    for k in 0..got_sym.len {
-        abs_at(b, got_addr + (@as(u64, k) * 8), sym_addr(@as(usize, got_obj.get(k)), got_sym.get(k)));
+    for k in 0..nl.got_sym.len {
+        abs_at(b, got_addr + (@as(u64, k) * 8), sym_addr(@as(usize, nl.got_obj.get(k)), nl.got_sym.get(k)));
     }
     apply_relocs(b);
     sort_pdata(b, pdata_start, pdata_end);
@@ -901,51 +684,51 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         // (CODEVIEW), size, address, file offset
         let at = @truncate(usize, file_of(debug_at));
         let size = (rdata_end - rsds_at);
-        w32(b, @as(u64, at) + 12, 2);
-        w32(b, @as(u64, at) + 16, size);
-        w32(b, @as(u64, at) + 20, rsds_at - BASE);
-        w32(b, @as(u64, at) + 24, file_of(rsds_at));
+        bn.w32(b, @as(u64, at) + 12, 2);
+        bn.w32(b, @as(u64, at) + 16, size);
+        bn.w32(b, @as(u64, at) + 20, rsds_at - BASE);
+        bn.w32(b, @as(u64, at) + 24, file_of(rsds_at));
         let r = @truncate(usize, file_of(rsds_at));
         b[r] = 'R';
         b[r + 1] = 'S';
         b[r + 2] = 'D';
         b[r + 3] = 'S';
-        w32(b, @as(u64, r) + 20, 1);  // age; the GUID (at 4) once the image is done
+        bn.w32(b, @as(u64, r) + 20, 1);  // age; the GUID (at 4) once the image is done
         @mem_copy(b[r + 24..r + 24 + pdb_path.len], pdb_path);
     }
     // the TLS directory: the template, the index's address, the (empty)
     // callback list, the zero fill, the alignment
-    let own = objs.len - 1;
-    let dir = sym_addr_in(own, own_tls_dir);
-    let tls_index = global_addr("axiom.tls_index");
+    let own = nl.objs.len - 1;
+    let dir = nl.sym_addr_in(own, own_tls_dir);
+    let tls_index = nl.global_addr("axiom.tls_index");
     abs_at(b, dir, tls_addr);
     abs_at(b, dir + 8, tls_end);
     abs_at(b, dir + 16, tls_index);
     abs_at(b, dir + 24, tls_index + 8);
-    w32(b, file_of(dir + 32), 0);  // SizeOfZeroFill
+    bn.w32(b, file_of(dir + 32), 0);  // SizeOfZeroFill
     let mut al_bits: u64 = 1;
     while (@as(u64, 1) << (al_bits - 1)) < tls_align {
         al_bits += 1;
     }
-    w32(b, file_of(dir + 36), al_bits << 20);
-    if errors != 0 {
+    bn.w32(b, file_of(dir + 36), al_bits << 20);
+    if nl.errors != 0 {
         return 1;
     }
     let mut rel = reloc_section();
-    let reloc_rva = align_up(data_rva + outs[3].vsize, SECT);
+    let reloc_rva = nl.align_up(data_rva + outs[3].vsize, SECT);
     outs[4] = Out.{ name: ".reloc", rva: reloc_rva, vsize: @as(u64, rel.len()), fsize: @as(u64, rel.len()), foff: foff,
                     flags: 0x4200_0040 };
     f.put(rel.view());
-    f.zeros(@truncate(usize, align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
-    let mut image_size = align_up(reloc_rva + outs[4].vsize, SECT);
+    f.zeros(@truncate(usize, nl.align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
+    let mut image_size = nl.align_up(reloc_rva + outs[4].vsize, SECT);
     if nsec == 6 {
         let rsrc_rva = image_size;
         let mut res = icon_resources(ico, rsrc_rva);
         outs[5] = Out.{ name: ".rsrc", rva: rsrc_rva, vsize: @as(u64, res.len()), fsize: @as(u64, res.len()),
                         foff: @as(u64, f.len()), flags: 0x4000_0040 };
         f.put(res.view());
-        f.zeros(@truncate(usize, align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
-        image_size = align_up(rsrc_rva + outs[5].vsize, SECT);
+        f.zeros(@truncate(usize, nl.align_up(@as(u64, f.len()), FILEAL) - @as(u64, f.len())));
+        image_size = nl.align_up(rsrc_rva + outs[5].vsize, SECT);
     }
 
     // headers
@@ -969,11 +752,11 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     h.u16_(0x20b);
     h.u8_(14);
     h.u8_(0);
-    h.u32_(align_up(outs[0].vsize, FILEAL));  // SizeOfCode
-    let init_size = align_up(outs[1].fsize, FILEAL) + align_up(outs[2].fsize, FILEAL);
-    h.u32_((init_size + align_up(outs[3].fsize, FILEAL)) + align_up(outs[5].fsize, FILEAL));  // initialized
+    h.u32_(nl.align_up(outs[0].vsize, FILEAL));  // SizeOfCode
+    let init_size = nl.align_up(outs[1].fsize, FILEAL) + nl.align_up(outs[2].fsize, FILEAL);
+    h.u32_((init_size + nl.align_up(outs[3].fsize, FILEAL)) + nl.align_up(outs[5].fsize, FILEAL));  // initialized
     h.u32_(bss_end - data_file_end);  // uninitialized
-    h.u32_(global_addr("axiom.entry") - BASE);
+    h.u32_(nl.global_addr("axiom.entry") - BASE);
     h.u32_(text_rva);  // BaseOfCode
     h.u64_(BASE);
     h.u32_(SECT);
@@ -1032,7 +815,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         name8(&mut h, o.name);
         h.u32_(o.vsize);
         h.u32_(o.rva);
-        h.u32_(align_up(o.fsize, FILEAL));
+        h.u32_(nl.align_up(o.fsize, FILEAL));
         if o.fsize == 0 {
             h.u32_(0);
         } else {
@@ -1062,7 +845,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         @mem_copy(fv[r + 4..r + 20], guid[..]);
     }
     if not u.write_file(out, fv) {
-        err(u.f1("cannot write %s", out));
+        nl.err(u.f1("cannot write %s", out));
         return 1;
     }
     _ = u.chmod(u.cz(out), 0o755);
@@ -1072,7 +855,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         let funcs = pdb_funcs(text_rva, &mut files);
         if not pdb.write(pdb_file_of(out), guid[..], 1, hv[sh..sh + @truncate(usize, nsec * 40)], files.items(),
                          funcs.items(), basename(out)) {
-            err(u.f1("cannot write %s", pdb_file_of(out)));
+            nl.err(u.f1("cannot write %s", pdb_file_of(out)));
             return 1;
         }
     }
@@ -1083,30 +866,22 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
 // 16-byte ICONDIRENTRY (width, height, colours, reserved, planes, bits per
 // pixel, size, offset) whose bytes lie in the file.
 fn ico_valid(ico: []u8) bool {
-    if (ico.len < 6) or (rd16(ico, 0) != 0) or (rd16(ico, 2) != 1) {
+    if (ico.len < 6) or (bn.rd16(ico, 0) != 0) or (bn.rd16(ico, 2) != 1) {
         return false;
     }
-    let n = @as(usize, rd16(ico, 4));
+    let n = @truncate(usize, bn.rd16(ico, 4));
     if (n == 0) or (ico.len < (6 + (n * 16))) {
         return false;
     }
     for i in 0..n {
         let e = 6 + (i * 16);
-        let size = @as(u64, rd32(ico, e + 8));
-        let at = @as(u64, rd32(ico, e + 12));
+        let size = bn.rd32(ico, e + 8);
+        let at = bn.rd32(ico, e + 12);
         if (size == 0) or ((at + size) > @as(u64, ico.len)) {
             return false;
         }
     }
     return true;
-}
-
-fn rd16(b: []u8, at: usize) u32 {
-    return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8);
-}
-
-fn rd32(b: []u8, at: usize) u32 {
-    return rd16(b, at) | (rd16(b, at + 2) << 16);
 }
 
 // The resource section at rva for an icon file's n images: the type
@@ -1117,7 +892,7 @@ fn rd32(b: []u8, at: usize) u32 {
 // directory's entries point at subdirectories (high bit set) or data entries
 // by their offset in the section; a data entry at its bytes by RVA.
 fn icon_resources(ico: []u8, rva: u64) bn.Bytes {
-    let n = @as(u64, rd16(ico, 4));
+    let n = bn.rd16(ico, 4);
     let root: u64 = 0;
     let icons_dir = root + 16 + 16;
     let group_dir = icons_dir + 16 + (n * 8);
@@ -1126,10 +901,10 @@ fn icon_resources(ico: []u8, rva: u64) bn.Bytes {
     let group = entries + ((n + 1) * 16);
     let group_size = 6 + (n * 14);
     let mut image_at = u.List.[u64].{ data: u.nil.[u64](), len: 0, cap: 0 };
-    let mut at = align_up(group + group_size, 8);
+    let mut at = nl.align_up(group + group_size, 8);
     for i in @as(u64, 0)..n {
         image_at.push(at);
-        at = align_up(at + @as(u64, rd32(ico, @truncate(usize, 6 + (i * 16) + 8))), 8);
+        at = nl.align_up(at + bn.rd32(ico, @truncate(usize, 6 + (i * 16) + 8)), 8);
     }
     let mut r = bn.new_bytes();
     // the type directory: two id entries
@@ -1157,7 +932,7 @@ fn icon_resources(ico: []u8, rva: u64) bn.Bytes {
     // the data entries: RVA, size, code page, reserved
     for i in @as(u64, 0)..n {
         r.u32_(rva + image_at.get(@truncate(usize, i)));
-        r.u32_(@as(u64, rd32(ico, @truncate(usize, 6 + (i * 16) + 8))));
+        r.u32_(bn.rd32(ico, @truncate(usize, 6 + (i * 16) + 8)));
         r.u32_(0);
         r.u32_(0);
     }
@@ -1177,8 +952,8 @@ fn icon_resources(ico: []u8, rva: u64) bn.Bytes {
     for i in @as(u64, 0)..n {
         r.zeros(@truncate(usize, image_at.get(@truncate(usize, i)) - @as(u64, r.len())));
         let e = @truncate(usize, 6 + (i * 16));
-        let size = @as(usize, rd32(ico, e + 8));
-        let off = @as(usize, rd32(ico, e + 12));
+        let size = @truncate(usize, bn.rd32(ico, e + 8));
+        let off = @truncate(usize, bn.rd32(ico, e + 12));
         r.put(ico[off..off + size]);
     }
     return r;
@@ -1250,25 +1025,25 @@ fn basename(p: []u8) []u8 {
 fn pdb_funcs(text_rva: u64, files: *mut u.List.[[]u8]) u.List.[pdb.Func] {
     let mut fs = u.List.[pdb.Func].{ data: u.nil.[pdb.Func](), len: 0, cap: 0 };
     let mut file_map = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    for oi in 0..objs.len {
-        let o = objs.get(oi);
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
         let mut lines = object_lines(o, files, &mut file_map);
         for si in 0..o.syms.len {
             let sy = o.syms.at(si);
             if (sy.ty != elf.T_FUNC) or (sy.sec < 0) or (sy.name.len == 0) {
                 continue;
             }
-            if sec_cls.get(oi)[@as(usize, @bit_cast(u32, sy.sec))] != C_TEXT {
+            if nl.sec_cls.get(oi)[@as(usize, @bit_cast(u32, sy.sec))] != nl.C_TEXT {
                 continue;
             }
-            let gi = global_of(oi, @truncate(u32, si));
+            let gi = nl.global_of(oi, @truncate(u32, si));
             if gi >= 0 {
-                let g = gsyms.at(@int_cast(usize, gi));
+                let g = nl.gsyms.at(@int_cast(usize, gi));
                 if (g.obj != @int_cast(i32, oi)) or (g.sym != @truncate(u32, si)) {
                     continue;
                 }
             }
-            let addr = sym_addr_in(oi, @truncate(u32, si));
+            let addr = nl.sym_addr_in(oi, @truncate(u32, si));
             let mut ls = u.nil_slice.[pdb.Line]();
             let found = lines.get(u.intern(sy.name));
             if u.notnil(found) {
@@ -1299,7 +1074,7 @@ fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8],
         let mut at: usize = 0;
         while (at + 5) <= d.len {
             let tag = d[at];
-            let n = @truncate(usize, elf.rd32(d, at + 1));
+            let n = @truncate(usize, bn.rd32(d, at + 1));
             let name = d[at + 5..at + 5 + n];
             at += 5 + n;
             if tag == 'F' {
@@ -1313,13 +1088,13 @@ fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8],
                 local.push(idx - 1);
                 continue;
             }
-            let nrows = @truncate(usize, elf.rd32(d, at));
+            let nrows = @truncate(usize, bn.rd32(d, at));
             at += 4;
             let ls = u.new.[u.List.[pdb.Line]]();
             for r in 0..nrows {
                 let b = at + (r * 12);
-                let f = @truncate(usize, elf.rd32(d, b + 4));
-                ls.push(pdb.Line.{ off: @truncate(u32, elf.rd32(d, b)), line: @truncate(u32, elf.rd32(d, b + 8)),
+                let f = @truncate(usize, bn.rd32(d, b + 4));
+                ls.push(pdb.Line.{ off: @truncate(u32, bn.rd32(d, b)), line: @truncate(u32, bn.rd32(d, b + 8)),
                                    file: local.get(f) });
             }
             at += nrows * 12;
