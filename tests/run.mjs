@@ -255,6 +255,7 @@ await inOrder([...stdFiles, ...files(path.join(root, 'tests/testing'))], async (
     let problem = null;
     let json = null;
     try { json = JSON.parse(c.stdout); } catch { problem = `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
+    if (json && !json.tests) { problem = `no test results (status ${c.status}):\n${c.stdout}${c.stderr}`; json = null; }
     const render = (frames) => frames.map((x) => (x.repeat ? `~${x.repeat}` : x.omitted ? null : x.line ? `${x.function}@${x.line}` : x.function))
       .filter((x) => x !== null).join(' ');
     for (const [, kind, tname, want] of json ? src.matchAll(/^\/\/ (stack|errors): (.+?) \| (.+)$/gm) : []) {
@@ -272,7 +273,9 @@ await inOrder([...stdFiles, ...files(path.join(root, 'tests/testing'))], async (
     const b = spawnSync(compiler, ['build', path.join(root, 'tests/traces/crash.ax'), '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags], { encoding: 'utf8' });
     let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
     if (!problem) {
-      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      // (a timeout: a recursion turned into a loop never overflows, issue 0051)
+      const r = native ? spawnExe(out, [], { encoding: 'utf8', timeout: 60000 })
+        : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8', timeout: 60000 });
       const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \((?:\S*\/)?tests\/traces\/crash\.ax:4:12\)/,
         /the frame above repeats 255 more times/, /\.\.\. \d+ more frames/];
       for (const w of want) if (!w.test(r.stderr)) { problem = `stderr lacks ${w}:\n${r.stderr}`; break; }
