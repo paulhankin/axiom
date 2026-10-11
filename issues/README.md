@@ -46,6 +46,7 @@ they travel with the code they describe.
 
 | # | Type | Area | Title |
 |---|------|------|-------|
+| [0051](0051-stack-overflow-tests-loop.md) | bug | tests | Stack-overflow tests turn into infinite loops at -O2 with wrapping arithmetic (fixed in dc86baf) |
 | [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | `@bit_cast` between a function pointer and an integer is invalid LLVM IR (fixed in b3bf084) |
 | [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 (fixed in b3bf084) |
 | [0106](0106-selfhost-sse2-lane-inserts.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without SSE4.1: integers put into vector lanes through the stack (fixed in 1fb5609) |
