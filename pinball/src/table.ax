@@ -1,0 +1,394 @@
+// =============================================================================
+// File: table.ax
+// The table's layout, in metres (physics.ax's coordinates): 54 cm across
+// and 107 long. From the bottom: the drain between two flippers, the
+// inlanes and outlanes, two slingshots; a bank of three standup targets
+// with a saucer (the lock) to their left; a bank of four drop targets on
+// the right; three pop bumpers under three rollover lanes at the top; a
+// ramp up the left that turns at the top onto a wire habitrail, which
+// carries the ball back down the left side to the left inlane; an orbit
+// round the top from the right lane (with a spinner) to the left; the
+// plunger lane on the right, its gate at the top.
+//
+// It builds the physics' world, and keeps for the renderer what it
+// needs that the world does not have: the ramp's and the rail's paths and
+// the lamps (inserts in the playfield, the bumpers' caps, the flashers).
+// =============================================================================
+
+import "physics.ax" as ph;
+import "std/math" as math;
+import "v3.ax" as vm;
+
+// Switches
+pub const SW_LANE: i32 = 0;      // + 0..2, the top lanes
+pub const SW_DROP: i32 = 3;      // + 0..3
+pub const SW_STANDUP: i32 = 7;   // + 0..2
+pub const SW_BUMPER: i32 = 10;   // + 0..2
+pub const SW_SLING: i32 = 13;    // + 0 (left), 1
+pub const SW_RAMP_IN: i32 = 15;
+pub const SW_RAMP_MADE: i32 = 16;
+pub const SW_ORBIT_RIGHT: i32 = 17;
+pub const SW_ORBIT_LEFT: i32 = 18;
+pub const SW_SPINNER: i32 = 19;
+pub const SW_INLANE: i32 = 20;   // + 0, 1
+pub const SW_OUTLANE: i32 = 22;  // + 0, 1
+pub const SW_SHOOTER: i32 = 24;
+
+// Lamps
+pub const L_LANE: usize = 0;      // + 0..2
+pub const L_DROP: usize = 3;      // + 0..3
+pub const L_STANDUP: usize = 7;   // + 0..2
+pub const L_LOCK: usize = 10;
+pub const L_RAMP: usize = 11;
+pub const L_ORBIT: usize = 12;
+pub const L_JACKPOT: usize = 13;
+pub const L_BONUS: usize = 14;    // + 0..3: 2x 3x 4x 5x
+pub const L_AGAIN: usize = 18;    // shoot again (ball save)
+pub const L_INLANE: usize = 19;   // + 0, 1
+pub const L_OUTLANE: usize = 21;  // + 0, 1
+pub const L_SUPER: usize = 23;    // super bumpers
+pub const L_BUMPER: usize = 24;   // + 0..2, in the caps
+pub const L_FLASH: usize = 27;    // + 0 (the ramp), 1 (the top)
+pub const LAMPS: usize = 32;
+pub const INSERTS: usize = 24;    // lamps 0..23 are inserts in the playfield
+
+pub const SHAPE_ROUND: u8 = 0;
+pub const SHAPE_ARROW: u8 = 1;
+pub const SHAPE_OBLONG: u8 = 2;
+
+pub struct Lamp {
+    p: vm.V3,
+    size: f32,
+    angle: f32,  // which way an arrow points
+    shape: u8,
+    color: vm.V3,
+}
+
+pub const RAMP_N: usize = 48;
+/// The rail's wires about the ball's centre: across, and up.
+pub let RAIL_LAT: [6]f32 = [-0.0080, 0.0080, -0.0158, 0.0158, -0.0106, 0.0106];
+pub let RAIL_RISE: [6]f32 = [-0.0132, -0.0132, 0.0010, 0.0010, 0.0118, 0.0118];
+pub const RAIL_N: usize = 160;
+pub const RAMP_W: f32 = 0.05;
+pub const RAMP_WALL: f32 = 0.03;
+
+pub let SAUCER: vm.V3 = vm.V3.{ x: -0.075, y: 0.585, z: 0.0 };
+pub const BUMPER_R: f32 = 0.032;
+pub const SPINNER_Y: f32 = 0.56;
+
+pub struct Table {
+    lamps: [32]Lamp,
+    ramp: [48]vm.V3,  // the ramp's floor along its middle
+    rail: [160]vm.V3,  // the ball's centre along the habitrail
+    bumpers: [3]vm.V3,
+    drops: [4]usize,     // their fences
+    standups: [3]usize,
+    slings: [2]usize,    // the kicking faces
+    gate: usize,
+    drop_a: vm.V3,       // the drop targets' line
+    drop_b: vm.V3,
+}
+
+fn lamp(p: vm.V3, size: f32, angle: f32, shape: u8, r: f32, g: f32, b: f32) Lamp {
+    return Lamp.{ p: p, size: size, angle: angle, shape: shape, color: vm.v(r, g, b) };
+}
+
+// A Catmull-Rom curve through pts at parameter t (0..len - 1).
+fn spline(pts: []vm.V3, t: f32) vm.V3 {
+    let segs = pts.len - 1;
+    let k = @min(@int_from_float(usize, t), segs - 1);
+    let u = t - @float_from_int(f32, k);
+    let p0 = pts[k - @min(k, 1)];
+    let p1 = pts[k];
+    let p2 = pts[k + 1];
+    let p3 = pts[@min(k + 2, segs)];
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let a = p1.scale(2.0);
+    let b = p2.sub(p0).scale(u);
+    let c = p0.scale(2.0).sub(p1.scale(5.0)).add(p2.scale(4.0)).sub(p3).scale(u2);
+    let d = p1.scale(3.0).sub(p0).sub(p2.scale(3.0)).add(p3).scale(u3);
+    return a.add(b).add(c).add(d).scale(0.5);
+}
+
+// The curve through pts, at n points evenly spaced along it.
+fn curve(pts: []vm.V3, out: []mut vm.V3) void {
+    let fine: usize = 1024;
+    let segs = @float_from_int(f32, pts.len - 1);
+    let mut lens: [1025]f32 = [0.0; 1025];
+    let mut prev = pts[0];
+    for i in 1..(fine + 1) {
+        let p = spline(pts, (segs * @float_from_int(f32, i)) / @float_from_int(f32, fine));
+        lens[i] = lens[i - 1] + p.sub(prev).len();
+        prev = p;
+    }
+    let n = out.len;
+    let mut j: usize = 0;
+    for i in 0..n {
+        let want = (lens[fine] * @float_from_int(f32, i)) / @float_from_int(f32, n - 1);
+        while ((j + 1) < fine) and (lens[j + 1] < want) {
+            j += 1;
+        }
+        let span = @max(lens[j + 1] - lens[j], 1.0e-9);
+        let f = vm.clampf((want - lens[j]) / span, 0.0, 1.0);
+        out[i] = spline(pts, (segs * (@float_from_int(f32, j) + f)) / @float_from_int(f32, fine));
+    }
+}
+
+/// Across a path at i (in the plane, to its right).
+pub fn across(path: []vm.V3, i: usize) vm.V3 {
+    let a = path[i - @min(i, 1)];
+    let b = path[@min(i + 1, path.len - 1)];
+    let d = b.sub(a).flat().norm();
+    return vm.v(d.y, -d.x, 0.0);
+}
+
+/// The ramp's half width at point i: it narrows at the top to the rail's.
+pub fn ramp_half(i: usize) f32 {
+    let t = @float_from_int(f32, i) / @float_from_int(f32, RAMP_N - 1);
+    let k = vm.clampf((t - 0.6) / 0.4, 0.0, 1.0);
+    return (RAMP_W * 0.5) - (k * k * (3.0 - (2.0 * k)) * ((RAMP_W * 0.5) - 0.0158));
+}
+
+fn build_ramp(w: *mut ph.World, t: *mut Table) !void {
+    let pts: [7]vm.V3 = [vm.v(-0.112, 0.462, 0.0), vm.v(-0.128, 0.53, 0.011), vm.v(-0.150, 0.61, 0.033),
+                         vm.v(-0.170, 0.70, 0.057), vm.v(-0.184, 0.79, 0.077), vm.v(-0.191, 0.87, 0.089),
+                         vm.v(-0.192, 0.905, 0.091)];
+    curve(pts[..], t.ramp[..]);
+    t.ramp[0].z = 0.0;
+    for i in 0..(RAMP_N - 1) {
+        let a = t.ramp[i];
+        let b = t.ramp[i + 1];
+        let sa = across(t.ramp[..], i).scale(ramp_half(i));
+        let sb = across(t.ramp[..], i + 1).scale(ramp_half(i + 1));
+        let al = a.sub(sa);
+        let ar = a.add(sa);
+        let bl = b.sub(sb);
+        let br = b.add(sb);
+        ph.tri(w, al, ar, br, ph.PLASTIC)!;
+        ph.tri(w, al, br, bl, ph.PLASTIC)!;
+        let up = vm.v(0.0, 0.0, RAMP_WALL);
+        ph.tri(w, al, bl, bl.add(up), ph.PLASTIC)!;
+        ph.tri(w, al, bl.add(up), al.add(up), ph.PLASTIC)!;
+        ph.tri(w, ar, br, br.add(up), ph.PLASTIC)!;
+        ph.tri(w, ar, br.add(up), ar.add(up), ph.PLASTIC)!;
+    }
+    ph.trigger(w, vm.v(-0.218, 0.86, 0.0), vm.v(-0.165, 0.86, 0.0), 0.06, 0.14, SW_RAMP_MADE)!;
+    ph.trigger(w, vm.v(-0.142, 0.47, 0.0), vm.v(-0.082, 0.47, 0.0), 0.0, 0.03, SW_RAMP_IN)!;
+}
+
+/// How far the side and top wires are flared out at rail point i.
+pub fn rail_flare(i: usize) f32 {
+    let k = vm.clampf(1.0 - ((@float_from_int(f32, i) - 12.0) / 10.0), 0.0, 1.0);
+    return 1.0 + (0.5 * k * k);
+}
+
+/// Wire k's offsets at rail point i, as multiples of RAIL_LAT and RAIL_RISE.
+pub fn wire_flare(k: usize, i: usize) f32 {
+    if k < 2 {
+        return 1.0;
+    }
+    return rail_flare(i);
+}
+
+pub fn wire_lift(k: usize, i: usize) f32 {
+    if k < 2 {
+        let f = vm.clampf(1.0 - (@float_from_int(f32, i) / 10.0), 0.0, 1.0);
+        return 1.0 + (0.6 * f * f);
+    }
+    return rail_flare(i);
+}
+
+fn build_rail(w: *mut ph.World, t: *mut Table) !void {
+    let mut pts: [20]vm.V3 = [vm.zero(); 20];
+    let top = t.ramp[RAMP_N - 1];
+    // from a little way back along the ramp, following its floor, the
+    // wires flush with it, so that the ball rolls onto them
+    let up = vm.v(0.0, 0.0, ph.R);
+    pts[0] = t.ramp[RAMP_N - 7].add(up);
+    pts[1] = t.ramp[RAMP_N - 4].add(up);
+    pts[2] = top.add(up);
+    pts[3] = vm.v(top.x - 0.001, top.y + 0.018, (top.z + ph.R) - 0.0015);
+    // the turn: half a circle over the top, about (-0.222, 0.923), downhill
+    for k in @as(usize, 0)..7 {
+        let a = (3.14159265 * @float_from_int(f32, k + 1)) / 8.0;
+        pts[4 + k] = vm.v(-0.222 + (0.030 * math.cosf(a)), 0.923 + (0.030 * math.sinf(a)),
+                          (top.z + ph.R) - 0.0015 - (0.010 * @float_from_int(f32, k + 1)) / 8.0);
+    }
+    let rest: [9]vm.V3 = [vm.v(-0.252, 0.923, 0.0915), vm.v(-0.252, 0.84, 0.088), vm.v(-0.252, 0.72, 0.080),
+                          vm.v(-0.250, 0.60, 0.070), vm.v(-0.244, 0.50, 0.062), vm.v(-0.228, 0.43, 0.056),
+                          vm.v(-0.200, 0.385, 0.052), vm.v(-0.180, 0.355, 0.049), vm.v(-0.1745, 0.325, 0.046)];
+    for k in @as(usize, 0)..9 {
+        pts[11 + k] = rest[k];
+    }
+    curve(pts[..], t.rail[..]);
+    // six wires round the ball: two under it, two at its sides, two over
+    let lat = RAIL_LAT;
+    let rise = RAIL_RISE;
+    for i in 0..(RAIL_N - 1) {
+        let a = t.rail[i];
+        let b = t.rail[i + 1];
+        let sa = across(t.rail[..], i);
+        let sb = across(t.rail[..], i + 1);
+        for k in @as(usize, 0)..6 {
+            // (the side wires start once the ball is clear of the ramp)
+            if (k >= 2) and (i < 12) {
+                continue;
+            }
+            // where the side and top wires start they flare out, so that
+            // the ball meets them at a glancing angle, never head on
+            // (and the bottom ones start under the ramp's floor and rise
+            // out of it)
+            let pa = a.add(sa.scale(lat[k] * wire_flare(k, i))).add(vm.v(0.0, 0.0, rise[k] * wire_lift(k, i)));
+            let pb = b.add(sb.scale(lat[k] * wire_flare(k, i + 1))).add(vm.v(0.0, 0.0,
+                                                                               rise[k] * wire_lift(k, i + 1)));
+            ph.wire(w, pa, pb, 0.0012)!;
+        }
+    }
+}
+
+/// The table's world (finished: ready to step) and what the renderer needs.
+pub fn build(w: *mut ph.World) !Table {
+    let mut t = Table.{ lamps: [lamp(vm.zero(), 0.0, 0.0, 0, 0.0, 0.0, 0.0); 32], ramp: [vm.zero(); 48],
+                        rail: [vm.zero(); 160], bumpers: [vm.zero(); 3], drops: [0; 4], standups: [0; 3],
+                        slings: [0; 2], gate: 0, drop_a: vm.zero(), drop_b: vm.zero() };
+    // the cabinet's walls, round the top
+    let left: [8]f32 = [-0.2375, 0.035, -0.2375, 0.40, -0.272, 0.50, -0.272, 0.93];
+    ph.fences(w, left[..], 0.004, 0.1, ph.WOOD, ph.S_WALL)!;
+    ph.arc(w, vm.v(-0.152, 0.93, 0.0), 0.12, 3.14159265, 1.5707963, 10, 0.004, 0.1, ph.WOOD, ph.S_WALL)!;
+    _ = ph.fence(w, vm.v(-0.152, 1.05, 0.0), vm.v(0.14, 1.05, 0.0), 0.004, 0.1, ph.WOOD, ph.S_WALL)!;
+    ph.arc(w, vm.v(0.14, 0.918, 0.0), 0.132, 1.5707963, 0.0, 12, 0.004, 0.1, ph.WOOD, ph.S_WALL)!;
+    _ = ph.fence(w, vm.v(0.272, 0.918, 0.0), vm.v(0.272, 0.0, 0.0), 0.002, 0.1, ph.WOOD, ph.S_WALL)!;
+    // the plunger lane: its wall, its gate
+    _ = ph.fence(w, vm.v(0.2375, 0.035, 0.0), vm.v(0.2375, 0.82, 0.0), 0.003, 0.045, ph.METAL, ph.S_GUIDE)!;
+    // (slanted, so that a ball coming down onto it rolls off to the left)
+    t.gate = ph.fence(w, vm.v(0.2405, 0.838, 0.0), vm.v(0.270, 0.862, 0.0), 0.002, 0.03, ph.METAL, ph.S_GATE)!;
+    w.fences.get_ptr(t.gate).pass = vm.v(-0.63, 0.78, 0.0);
+    ph.trigger(w, vm.v(0.2405, 0.80, 0.0), vm.v(0.270, 0.80, 0.0), 0.0, 0.05, SW_SHOOTER)!;
+    // at the bottom of the left lane, a deflector: what comes down the
+    // orbit goes out onto the playfield, not down the outlane
+    _ = ph.fence(w, vm.v(-0.268, 0.615, 0.0), vm.v(-0.214, 0.515, 0.0), 0.004, 0.034, ph.METAL, ph.S_PLASTIC)!;
+    _ = ph.fence(w, vm.v(-0.214, 0.515, 0.0), vm.v(-0.214, 0.515, 0.0), 0.0045, 0.028, ph.RUBBER, ph.S_POST)!;
+    // and at the bottom of the right lane, one into the right inlane
+    _ = ph.fence(w, vm.v(0.2345, 0.47, 0.0), vm.v(0.205, 0.405, 0.0), 0.004, 0.034, ph.METAL, ph.S_PLASTIC)!;
+    _ = ph.fence(w, vm.v(0.205, 0.405, 0.0), vm.v(0.205, 0.405, 0.0), 0.0045, 0.028, ph.RUBBER, ph.S_POST)!;
+    // the right orbit's inner wall, the spinner, the orbit's switches
+    _ = ph.fence(w, vm.v(0.195, 0.48, 0.0), vm.v(0.195, 0.80, 0.0), 0.004, 0.04, ph.METAL, ph.S_PLASTIC)!;
+    _ = ph.fence(w, vm.v(0.195, 0.80, 0.0), vm.v(0.182, 0.845, 0.0), 0.004, 0.04, ph.METAL, ph.S_PLASTIC)!;
+    ph.trigger(w, vm.v(0.199, SPINNER_Y, 0.0), vm.v(0.234, SPINNER_Y, 0.0), 0.0, 0.04, SW_SPINNER)!;
+    ph.trigger(w, vm.v(0.199, 0.76, 0.0), vm.v(0.234, 0.76, 0.0), 0.0, 0.04, SW_ORBIT_RIGHT)!;
+    ph.trigger(w, vm.v(-0.268, 0.78, 0.0), vm.v(-0.218, 0.78, 0.0), 0.0, 0.04, SW_ORBIT_LEFT)!;
+    // the bottom: outlanes, inlanes and slingshots, left and right alike
+    let sides: [2]f32 = [-1.0, 1.0];
+    for k in @as(usize, 0)..2 {
+        let s = sides[k];
+        let post = ph.fence(w, vm.v(s * 0.195, 0.36, 0.0), vm.v(s * 0.195, 0.36, 0.0), 0.0045, 0.028, ph.RUBBER,
+                            ph.S_POST)!;
+        _ = post;
+        _ = ph.fence(w, vm.v(s * 0.195, 0.355, 0.0), vm.v(s * 0.195, 0.235, 0.0), 0.003, 0.03, ph.METAL,
+                     ph.S_GUIDE)!;
+        // (ending just over the flipper's pivot, so that a ball rolls on over
+        // it onto the flipper rather than resting between them)
+        _ = ph.fence(w, vm.v(s * 0.195, 0.235, 0.0), vm.v(s * 0.0875, 0.1505, 0.0), 0.003, 0.03, ph.METAL,
+                     ph.S_GUIDE)!;
+        let top = vm.v(s * 0.152, 0.345, 0.0);
+        let outer = vm.v(s * 0.152, 0.255, 0.0);
+        let inner = vm.v(s * 0.100, 0.215, 0.0);
+        _ = ph.fence(w, top, outer, 0.005, 0.034, ph.RUBBER, ph.S_RUBBER)!;
+        _ = ph.fence(w, outer, inner, 0.005, 0.034, ph.RUBBER, ph.S_RUBBER)!;
+        let face = ph.fence(w, top, inner, 0.005, 0.034, ph.RUBBER, ph.S_SLING)!;
+        w.fences.get_ptr(face).kick = 1.15;
+        w.fences.get_ptr(face).id = SW_SLING + @int_cast(i32, k);
+        t.slings[k] = face;
+        let corners: [3]vm.V3 = [top, outer, inner];
+        for c in corners {
+            _ = ph.fence(w, c, c, 0.0055, 0.034, ph.RUBBER, ph.S_POST)!;
+        }
+        // the lanes' switches
+        let side_id = @int_cast(i32, k);
+        ph.trigger(w, vm.v(s * 0.198, 0.30, 0.0), vm.v(s * 0.155, 0.30, 0.0), 0.0, 0.03, SW_INLANE + side_id)!;
+        ph.trigger(w, vm.v(s * 0.2345, 0.30, 0.0), vm.v(s * 0.198, 0.30, 0.0), 0.0, 0.03, SW_OUTLANE + side_id)!;
+    }
+    // the top lanes
+    let guides: [4]f32 = [-0.09, -0.03, 0.03, 0.09];
+    for x in guides {
+        _ = ph.fence(w, vm.v(x, 0.915, 0.0), vm.v(x, 0.975, 0.0), 0.0035, 0.03, ph.METAL, ph.S_LANE)!;
+    }
+    for k in @as(usize, 0)..3 {
+        let x = -0.06 + (0.06 * @float_from_int(f32, k));
+        ph.trigger(w, vm.v(x - 0.025, 0.955, 0.0), vm.v(x + 0.025, 0.955, 0.0), 0.0, 0.03,
+                   SW_LANE + @int_cast(i32, k))!;
+    }
+    // the pop bumpers
+    let bumpers: [3]vm.V3 = [vm.v(-0.06, 0.82, 0.0), vm.v(0.06, 0.82, 0.0), vm.v(0.0, 0.735, 0.0)];
+    for k in @as(usize, 0)..3 {
+        let b = ph.fence(w, bumpers[k], bumpers[k], BUMPER_R, 0.045, ph.WOOD, ph.S_BUMPER)!;
+        w.fences.get_ptr(b).kick = 1.05;
+        w.fences.get_ptr(b).id = SW_BUMPER + @int_cast(i32, k);
+        t.bumpers[k] = bumpers[k];
+    }
+    // the drop targets, in a line facing the left flipper
+    t.drop_a = vm.v(0.172, 0.545, 0.0);
+    t.drop_b = vm.v(0.160, 0.685, 0.0);
+    let along = t.drop_b.sub(t.drop_a).norm();
+    for k in @as(usize, 0)..4 {
+        let a = t.drop_a.add(along.scale(0.004 + (0.035 * @float_from_int(f32, k))));
+        let b = a.add(along.scale(0.027));
+        let f = ph.fence(w, a, b, 0.0045, 0.03, ph.TARGET, ph.S_DROP)!;
+        w.fences.get_ptr(f).id = SW_DROP + @int_cast(i32, k);
+        t.drops[k] = f;
+    }
+    // the standups, under the bumpers
+    for k in @as(usize, 0)..3 {
+        let x = -0.045 + (0.045 * @float_from_int(f32, k));
+        let f = ph.fence(w, vm.v(x - 0.013, 0.665, 0.0), vm.v(x + 0.013, 0.665, 0.0), 0.004, 0.034, ph.TARGET,
+                         ph.S_STANDUP)!;
+        w.fences.get_ptr(f).id = SW_STANDUP + @int_cast(i32, k);
+        t.standups[k] = f;
+    }
+    build_ramp(w, &mut t)!;
+    build_rail(w, &mut t)!;
+    lamps(&mut t);
+    ph.finish(w)!;
+    return t;
+}
+
+fn lamps(t: *mut Table) void {
+    let up: f32 = 1.5707963;
+    for k in @as(usize, 0)..3 {
+        t.lamps[L_LANE + k] = lamp(vm.v(-0.06 + (0.06 * @float_from_int(f32, k)), 0.93, 0.0), 0.0085, 0.0,
+                                   SHAPE_ROUND, 1.0, 0.75, 0.15);
+    }
+    let along = t.drop_b.sub(t.drop_a).norm();
+    for k in @as(usize, 0)..4 {
+        let c = t.drop_a.add(along.scale(0.0175 + (0.035 * @float_from_int(f32, k))));
+        t.lamps[L_DROP + k] = lamp(c.add(vm.v(-0.032, -0.004, 0.0)), 0.0075, 0.0, SHAPE_ROUND, 1.0, 0.25, 0.1);
+    }
+    for k in @as(usize, 0)..3 {
+        t.lamps[L_STANDUP + k] = lamp(vm.v(-0.045 + (0.045 * @float_from_int(f32, k)), 0.636, 0.0), 0.0085, 0.0,
+                                      SHAPE_ROUND, 0.2, 1.0, 0.35);
+    }
+    t.lamps[L_LOCK] = lamp(vm.v(-0.074, 0.535, 0.0), 0.022, up, SHAPE_ARROW, 0.25, 0.5, 1.0);
+    t.lamps[L_RAMP] = lamp(vm.v(-0.098, 0.41, 0.0), 0.026, 1.85, SHAPE_ARROW, 1.0, 0.6, 0.1);
+    t.lamps[L_ORBIT] = lamp(vm.v(0.178, 0.44, 0.0), 0.022, 1.45, SHAPE_ARROW, 0.1, 0.85, 1.0);
+    t.lamps[L_JACKPOT] = lamp(vm.v(0.0, 0.50, 0.0), 0.021, 0.0, SHAPE_ROUND, 1.0, 0.15, 0.2);
+    for k in @as(usize, 0)..4 {
+        t.lamps[L_BONUS + k] = lamp(vm.v(-0.051 + (0.034 * @float_from_int(f32, k)), 0.405, 0.0), 0.0095, 0.0,
+                                    SHAPE_ROUND, 1.0, 0.85, 0.5);
+    }
+    t.lamps[L_AGAIN] = lamp(vm.v(0.0, 0.175, 0.0), 0.012, 0.0, SHAPE_ROUND, 1.0, 0.3, 0.15);
+    let sides: [2]f32 = [-1.0, 1.0];
+    for k in @as(usize, 0)..2 {
+        t.lamps[L_INLANE + k] = lamp(vm.v(sides[k] * 0.1735, 0.272, 0.0), 0.0065, 0.0, SHAPE_ROUND, 1.0, 0.95, 0.85);
+        t.lamps[L_OUTLANE + k] = lamp(vm.v(sides[k] * 0.2165, 0.272, 0.0), 0.0065, 0.0, SHAPE_ROUND, 1.0, 0.2,
+                                      0.1);
+    }
+    t.lamps[L_SUPER] = lamp(vm.v(0.0, 0.585, 0.0), 0.022, 0.0, SHAPE_OBLONG, 0.85, 0.3, 1.0);
+    let caps: [3]vm.V3 = [vm.v(1.0, 0.18, 0.12), vm.v(1.0, 0.78, 0.15), vm.v(0.2, 0.5, 1.0)];
+    for k in @as(usize, 0)..3 {
+        let c = caps[k];
+        t.lamps[L_BUMPER + k] = lamp(t.bumpers[k].add(vm.v(0.0, 0.0, 0.05)), 0.03, 0.0, SHAPE_ROUND, c.x, c.y, c.z);
+    }
+    t.lamps[L_FLASH] = lamp(vm.v(-0.235, 0.94, 0.07), 0.06, 0.0, SHAPE_ROUND, 1.0, 0.35, 0.1);
+    t.lamps[L_FLASH + 1] = lamp(vm.v(0.15, 1.0, 0.04), 0.06, 0.0, SHAPE_ROUND, 0.3, 0.6, 1.0);
+}

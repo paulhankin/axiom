@@ -1,0 +1,299 @@
+// =============================================================================
+// File: main.ax
+// Axiom Pinball: a pinball table in 3D on macOS (Metal), with the physics
+// of the ball (2400 steps a second), its sounds and its rules. See
+// physics.ax, table.ax, game.ax and render.ax.
+//
+//   axiom build pinball --target=aarch64-macos -O2 -o pinball/pinball
+//   pinball/pinball                (Enter starts a game; Left and Right
+//                                   arrows, or Z and M, flip; hold Space
+//                                   (or Down) to pull the plunger, let go
+//                                   to shoot; N, or B and V, nudge; Escape
+//                                   quits. A controller: the shoulders or
+//                                   triggers flip, A plunges, Start starts)
+//   pinball/pinball --autopilot    (it plays by itself)
+//   pinball/pinball --png out.png --frames 900
+//                                  (plays 900 frames by itself offscreen,
+//                                   then saves the last as a PNG)
+// =============================================================================
+
+import "game.ax" as gm;
+import "physics.ax" as ph;
+import "render.ax" as render;
+import "sound.ax" as snd;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/gpu" as gx;
+import "std/graphics/image/png" as png;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/fs" as fs;
+import "std/os/gamepad" as gamepad;
+import "std/os/window" as window;
+import "std/time" as time;
+
+struct Keys {
+    left: bool,
+    right: bool,
+    plunge: bool,
+}
+
+// The physics' steps for dt seconds (dt carried over between frames).
+fn simulate(g: *mut gm.Game, s: *mut snd.Sound, owed: *mut f32, dt: f32) void {
+    owed.* += dt;
+    var_steps(g, s, owed);
+}
+
+fn var_steps(g: *mut gm.Game, s: *mut snd.Sound, owed: *mut f32) void {
+    let mut n: u32 = 0;
+    while (owed.* >= ph.DT) and (n < 240) {
+        ph.step(&mut g.w);
+        gm.events(g, s);
+        owed.* -= ph.DT;
+        n += 1;
+    }
+    if n >= 240 {
+        owed.* = 0.0;
+    }
+}
+
+fn windowed(auto: bool, frames: i64) !i32 {
+    let mut w = window.Window.open("Axiom Pinball", 1440, 900)!;
+    defer w.deinit();
+    let mut sz = w.size();
+    let mut gpu = gx.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut s = snd.init()!;
+    defer snd.deinit(&mut s);
+    let mut g = gm.init()!;
+    defer gm.deinit(&mut g);
+    let mut gfx = render.init(&mut gpu, &g.w, &g.t, sz[0], sz[1])!;
+    defer render.deinit(&mut gfx);
+    let mut v = render.empty_view();
+    let mut keys = Keys.{ left: false, right: false, plunge: false };
+    let mut pads = gamepad.Tracker.init();
+    let mut seed: u64 = @bit_cast(u64, time.Instant.now().ns);
+    let mut owed: f32 = 0.0;
+    let mut last = time.Instant.now();
+    let mut n: i64 = 0;
+    if auto {
+        gm.start(&mut g, &mut s);
+    }
+    loop {
+        let e = w.next_event();
+        if e.kind == window.EventKind.CLOSE {
+            break;
+        }
+        if e.kind == window.EventKind.RESIZE {
+            sz = [e.width, e.height];
+            gpu.resize(e.width, e.height)!;
+            render.resize(&mut gpu, &mut gfx, e.width, e.height)!;
+            continue;
+        }
+        if (e.kind == window.EventKind.KEY_DOWN) or (e.kind == window.EventKind.KEY_UP) {
+            let down = e.kind == window.EventKind.KEY_DOWN;
+            let k = e.key;
+            if (k == window.KEY_ESCAPE) and down {
+                break;
+            }
+            if (k == window.KEY_LEFT) or (k == 'Z') or (k == window.KEY_SHIFT) {
+                keys.left = down;
+            } else if (k == window.KEY_RIGHT) or (k == 'M') or (k == '/') {
+                keys.right = down;
+            } else if (k == window.KEY_SPACE) or (k == window.KEY_DOWN) {
+                if down and (g.state != gm.PLAYING) {
+                    gm.start(&mut g, &mut s);
+                } else {
+                    keys.plunge = down;
+                }
+            } else if (k == window.KEY_ENTER) and down {
+                gm.start(&mut g, &mut s);
+            } else if ((k == 'N') or (k == window.KEY_UP)) and down {
+                gm.nudge(&mut g, &mut s, 0.0);
+            } else if (k == 'V') and down {
+                gm.nudge(&mut g, &mut s, -1.0);
+            } else if (k == 'B') and down {
+                gm.nudge(&mut g, &mut s, 1.0);
+            }
+            continue;
+        }
+        if e.kind != window.EventKind.NONE {
+            continue;
+        }
+        let dt = @float_cast(f32, @min(@float_from_int(f64, last.elapsed().ns) / 1e9, 0.05));
+        last = time.Instant.now();
+        let p = pads.update()[0];
+        if auto {
+            gm.autopilot(&mut g, &mut s, &mut seed);
+        } else {
+            let lf = keys.left or (p.connected and (p.down(gamepad.LEFT_SHOULDER) or (p.left_trigger > 0.4)));
+            let rf = keys.right or (p.connected and (p.down(gamepad.RIGHT_SHOULDER) or (p.right_trigger > 0.4)));
+            gm.flippers(&mut g, &mut s, lf, rf);
+            gm.plunger(&mut g, &mut s, keys.plunge or (p.connected and p.down(gamepad.A)));
+            if pads.pressed(0, gamepad.START) {
+                gm.start(&mut g, &mut s);
+            }
+            if pads.pressed(0, gamepad.B) {
+                gm.nudge(&mut g, &mut s, 0.0);
+            }
+        }
+        simulate(&mut g, &mut s, &mut owed, dt);
+        gm.update(&mut g, &mut s, dt);
+        gm.view(&mut g, &mut v);
+        render.draw(&mut gpu, &mut gfx, gpu.screen(), &v)!;
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    return 0;
+}
+
+// Plays by itself for `frames` frames (at 60 a second) with no window, then
+// saves the last as a PNG.
+fn var_offscreen(gpu: *mut gx.Device, out: []u8, frames: i64, width: u32, height: u32, multiball: bool) !i32 {
+    let mut s = snd.silent()!;
+    defer snd.deinit(&mut s);
+    let mut g = gm.init()!;
+    defer gm.deinit(&mut g);
+    let mut gfx = render.init(gpu, &g.w, &g.t, width, height)!;
+    defer render.deinit(&mut gfx);
+    let mut v = render.empty_view();
+    let mut seed: u64 = 12345;
+    let mut owed: f32 = 0.0;
+    gm.start(&mut g, &mut s);
+    let dt: f32 = 1.0 / 60.0;
+    let mut games: u32 = 1;
+    let mut total: u64 = 0;
+    let mut best: u64 = 0;
+    let mut since: i64 = -1;
+    for k in @as(i64, 0)..frames {
+        _ = k;
+        if multiball {
+            if (since < 0) and g.multiball {
+                since = 0;
+            }
+            if since >= 0 {
+                since += 1;
+                if since > 200 {
+                    break;
+                }
+            }
+        }
+        if (g.state != gm.PLAYING) and (g.msg.until < g.time) {
+            total += g.last;
+            best = @max(best, g.last);
+            games += 1;
+            gm.start(&mut g, &mut s);
+        }
+        gm.autopilot(&mut g, &mut s, &mut seed);
+        simulate(&mut g, &mut s, &mut owed, dt);
+        gm.update(&mut g, &mut s, dt);
+    }
+    gm.view(&mut g, &mut v);
+    let mut target = gpu.target(width, height)!;
+    defer target.release();
+    render.draw(gpu, &mut gfx, &mut target, &v)!;
+    gpu.finish()!;
+    let mut img = gpu.read_pixels(&mut target)!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    fmt.print("{} frames: score {}, ball {}, {} balls in play, state {}, high {}\n",
+              [fmt.int(frames), fmt.int(g.score), fmt.int(g.ball), fmt.int(ph.live_balls(&g.w)), fmt.int(g.state),
+               fmt.int(g.last)])!;
+    for b in g.w.balls {
+        if b.live {
+            fmt.print("  ball at ({:.4}, {:.4}, {:.4}) v ({:.3}, {:.3}, {:.3}) held {}\n",
+                      [fmt.float32(b.p.x), fmt.float32(b.p.y), fmt.float32(b.p.z), fmt.float32(b.v.x),
+                       fmt.float32(b.v.y), fmt.float32(b.v.z), fmt.boolean(b.held)])!;
+        }
+    }
+    fmt.print("{} games, average {}, best {}\n", [fmt.int(games), fmt.int(total / @as(u64, games)), fmt.int(best)])!;
+    for k in @as(usize, 0)..32 {
+        if g.stats[k] > 0 {
+            fmt.print("  switch {}: {}\n", [fmt.int(k), fmt.int(g.stats[k])])!;
+        }
+    }
+    return 0;
+}
+
+// Plays by itself without drawing, printing where the first ball goes.
+fn trace(frames: i64) !i32 {
+    let mut s = snd.silent()!;
+    defer snd.deinit(&mut s);
+    let mut g = gm.init()!;
+    defer gm.deinit(&mut g);
+    let mut seed: u64 = 12345;
+    let mut owed: f32 = 0.0;
+    gm.start(&mut g, &mut s);
+    let dt: f32 = 1.0 / 60.0;
+    for k in @as(i64, 0)..frames {
+        gm.autopilot(&mut g, &mut s, &mut seed);
+        let before = g.w.nevents;
+        _ = before;
+        simulate(&mut g, &mut s, &mut owed, dt);
+        gm.update(&mut g, &mut s, dt);
+        if (k % 6) == 0 {
+            for i in @as(usize, 0)..ph.MAX_BALLS {
+                let b = g.w.balls[i];
+                if b.live {
+                    fmt.print("{:.2} ball {} ({:.3}, {:.3}, {:.3}) v ({:.2}, {:.2}) flip {} {}\n",
+                              [fmt.float32(g.time), fmt.int(i), fmt.float32(b.p.x), fmt.float32(b.p.y),
+                               fmt.float32(b.p.z), fmt.float32(b.v.x), fmt.float32(b.v.y),
+                               fmt.boolean(g.w.flippers[0].held), fmt.boolean(g.w.flippers[1].held)])!;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("pinball", "A pinball table in 3D (macOS).");
+    defer p.deinit();
+    p.flag("autopilot", 'a', "play by itself")!;
+    p.flag("trace", 't', "play by itself with no window, printing where the balls go")!;
+    p.flag("multiball", 'm', "with --png: stop a few seconds into the first multiball")!;
+    p.option("png", 'o', "FILE", "play by itself offscreen, then save the last frame as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames (with --png: play N frames; 600)")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("pinball: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if not os.is_macos() {
+        io.stderr().println("pinball: this needs macOS (Metal)")!;
+        return 1;
+    }
+    if m.has("trace") {
+        return trace(m.int("frames", 600)!);
+    }
+    if m.has("png") {
+        let mut gpu = gx.Device.init()!;
+        defer gpu.deinit();
+        return var_offscreen(&mut gpu, m.get("png", ""), m.int("frames", 600)!, 1600, 1000, m.has("multiball"));
+    }
+    return windowed(m.has("autopilot"), m.int("frames", 0)!);
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

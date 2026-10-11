@@ -1,0 +1,376 @@
+// =============================================================================
+// File: sound.ax
+// The table's sounds, all made here at the start (std/audio) and played
+// through std/audio/output: the solenoids' clacks and thumps (flippers,
+// bumpers, slingshots, the saucer), targets, rollover chimes, the spinner,
+// the plunger's spring, the ball rolling on wood and rattling along the
+// wire rails (loops whose volume and pitch follow the balls), the drain;
+// tunes for the ramp, jackpots, multiball; and a music loop.
+// =============================================================================
+
+import "std/audio" as audio;
+import "std/audio/output" as output;
+import "std/math" as math;
+
+const RATE: u32 = 44100;
+const VOICES: usize = 16;
+
+pub const FLIP_UP: usize = 0;
+pub const FLIP_DOWN: usize = 1;
+pub const BUMPER: usize = 2;
+pub const SLING: usize = 3;
+pub const DROP: usize = 4;
+pub const STANDUP: usize = 5;
+pub const CHIME: usize = 6;
+pub const SPIN: usize = 7;
+pub const PLUNGE: usize = 8;
+pub const KNOCK: usize = 9;
+pub const CLACK: usize = 10;   // ball on ball
+pub const DRAIN: usize = 11;
+pub const RAMP: usize = 12;
+pub const JACKPOT: usize = 13;
+pub const MULTIBALL: usize = 14;
+pub const LOCK: usize = 15;
+pub const SAUCER: usize = 16;
+pub const SAVED: usize = 17;
+pub const TILT: usize = 18;
+pub const START: usize = 19;
+pub const RESET: usize = 20;
+pub const BONUS: usize = 21;
+const SOUNDS: usize = 22;
+
+struct Gen {
+    seed: u64,
+}
+
+fn noise(g: *mut Gen) f64 {
+    g.seed = (g.seed *% 6364136223846793005) +% 1442695040888963407;
+    return (@float_from_int(f64, g.seed >> 40) / 8388608.0) - 1.0;
+}
+
+fn frames(secs: f64) usize {
+    return @int_from_float(usize, secs * @float_from_int(f64, RATE));
+}
+
+fn new_sound(secs: f64) !audio.Sound {
+    return audio.Sound.init(frames(secs), 1, RATE, audio.SampleFormat.S16);
+}
+
+fn sine(t: f64, f: f64) f64 {
+    return math.sin(2.0 * math.PI * f * t);
+}
+
+fn tanh(x: f64) f64 {
+    let e = math.exp(2.0 * x);
+    return (e - 1.0) / (e + 1.0);
+}
+
+// A solenoid firing: a thump (pitch falling from hi to lo), a crack of
+// noise, a ring of the metal.
+fn solenoid(secs: f64, hi: f64, lo: f64, thump: f64, crack: f64, ring: f64, ring_f: f64, seed: u64) !audio.Sound {
+    let mut s = new_sound(secs)!;
+    let mut g = Gen.{ seed: seed };
+    let mut lp: f64 = 0.0;
+    let mut ph: f64 = 0.0;
+    for i in 0..s.len() {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let f = lo + ((hi - lo) * math.exp(-t * 40.0));
+        ph += f / @float_from_int(f64, RATE);
+        let body = math.sin(2.0 * math.PI * ph) * math.exp(-t * 28.0) * thump;
+        let n = noise(&mut g);
+        lp += (n - lp) * 0.35;
+        let snap = lp * math.exp(-t * 90.0) * crack;
+        let metal = (sine(t, ring_f) + (0.5 * sine(t, ring_f * 2.76))) * math.exp(-t * 30.0) * ring;
+        s.set_sample(i, tanh((body + snap + metal) * 1.4) * 0.8);
+    }
+    return s;
+}
+
+// A bell-like chime: partials decaying.
+fn chime(secs: f64, f: f64, vol: f64) !audio.Sound {
+    let mut s = new_sound(secs)!;
+    for i in 0..s.len() {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let a = math.exp(-t * 7.0) * @min(t * 800.0, 1.0);
+        let v = sine(t, f) + (0.45 * sine(t, f * 2.0)) * math.exp(-t * 4.0) + (0.25 * sine(t, f * 3.01));
+        s.set_sample(i, v * a * vol);
+    }
+    return s;
+}
+
+// Notes of square-ish waves (freqs in Hz, each `step` long), for tunes.
+fn tune(notes: []f64, step: f64, vol: f64, tail: f64) !audio.Sound {
+    let total = (@float_from_int(f64, notes.len) * step) + tail;
+    let mut s = new_sound(total)!;
+    for i in 0..s.len() {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let mut v: f64 = 0.0;
+        for k in 0..notes.len {
+            let t0 = @float_from_int(f64, k) * step;
+            if (t < t0) or (notes[k] <= 0.0) {
+                continue;
+            }
+            let u = t - t0;
+            let a = math.exp(-u * 5.0) * @min(u * 300.0, 1.0);
+            if a < 0.001 {
+                continue;
+            }
+            let f = notes[k];
+            v += (tanh(sine(u, f) * 3.0) * 0.5 + (0.3 * sine(u, f * 2.0)) + (0.2 * sine(u, f * 0.5))) * a;
+        }
+        s.set_sample(i, tanh(v * vol));
+    }
+    return s;
+}
+
+// The ball rolling: low rumbling noise, looped.
+fn rolling(metal: bool) !audio.Sound {
+    let mut s = new_sound(1.0)!;
+    let mut g = Gen.{ seed: 99 };
+    let mut a: f64 = 0.0;
+    let mut b: f64 = 0.0;
+    let mut delay: [64]f64 = [0.0; 64];
+    for i in 0..s.len() {
+        let n = noise(&mut g);
+        a += (n - a) * 0.04;
+        b += (a - b) * 0.08;
+        let mut v = b * 6.0;
+        if metal {
+            // a comb: the wires ring
+            let k = i % 41;
+            let y = (n * 0.12) + (delay[k] * 0.93);
+            delay[k] = y;
+            v = (y * 0.6) + (b * 3.0);
+        }
+        // (faded at the ends, so the loop does not click)
+        let t = @float_from_int(f64, i) / @float_from_int(f64, s.len());
+        let edge = @min(@min(t * 40.0, (1.0 - t) * 40.0), 1.0);
+        s.set_sample(i, tanh(v) * 0.7 * edge);
+    }
+    return s;
+}
+
+// The music: eight bars at 112 bpm of bass, chords and hats in A minor.
+fn music() !audio.Sound {
+    let bpm: f64 = 112.0;
+    let beat = 60.0 / bpm;
+    let bars: usize = 8;
+    let mut s = new_sound(@float_from_int(f64, bars * 4) * beat)!;
+    let roots: [8]f64 = [55.0, 55.0, 43.65, 43.65, 49.0, 49.0, 41.2, 46.25];  // A A F F G G E F#
+    let thirds: [8]f64 = [1.1892, 1.1892, 1.2599, 1.2599, 1.2599, 1.2599, 1.2599, 1.1892];
+    let mut g = Gen.{ seed: 5 };
+    let mut hp: f64 = 0.0;
+    let mut lpn: f64 = 0.0;
+    let n = s.len();
+    for i in 0..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, RATE);
+        let b = t / beat;
+        let bar = @min(@int_from_float(usize, b / 4.0), bars - 1);
+        let in_beat = b - @floor(b);
+        let eighth = (b * 2.0) - @floor(b * 2.0);
+        let root = roots[bar];
+        // bass: eighth notes, plucked
+        let bt = (eighth * beat) * 0.5;
+        let bass = tanh(sine(t, root * 2.0) * 2.5) * math.exp(-bt * 9.0) * 0.5;
+        // a pad: the chord, soft
+        let chord = (sine(t, root * 4.0) + sine(t, root * 4.0 * thirds[bar]) + sine(t, root * 6.0)) * 0.06;
+        // an arpeggio on sixteenths
+        let six = (b * 4.0) - @floor(b * 4.0);
+        let step = @int_from_float(usize, b * 4.0) % 4;
+        let arp_f: [4]f64 = [4.0, 6.0, 8.0, 6.0];
+        let mut af = root * arp_f[step];
+        if step == 1 {
+            af = root * 4.0 * thirds[bar] * 1.0;
+        }
+        let arp = sine(t, af * 2.0) * math.exp(-six * beat * 0.25 * 30.0) * 0.07;
+        // hats on the off-beats, a kick on the beats
+        let nz = noise(&mut g);
+        hp = nz - lpn;
+        lpn += (nz - lpn) * 0.3;
+        let off_beat = @float_from_int(f64, @int_from_float(i64, b * 2.0) % 2);
+        let hat = hp * math.exp(-((eighth * beat * 0.5) * 60.0)) * 0.12 * off_beat;
+        let kt = in_beat * beat;
+        let kick = math.sin(2.0 * math.PI * (50.0 * kt + (60.0 * (1.0 - math.exp(-kt * 30.0)) / 30.0))) *
+                   math.exp(-kt * 10.0) * 0.5;
+        let edge = @min(@min(t * 200.0, (@float_from_int(f64, n - i) / @float_from_int(f64, RATE)) * 200.0), 1.0);
+        s.set_sample(i, tanh((bass + chord + arp + hat + kick) * 1.2) * 0.55 * edge);
+    }
+    return s;
+}
+
+pub struct Sound {
+    engine: output.Engine,
+    on: bool,
+    sounds: [22]audio.Sound,
+    voices: [16]output.Voice,
+    next: usize,
+    roll: output.Voice,
+    rail: output.Voice,
+    tune: output.Voice,
+    roll_snd: audio.Sound,
+    rail_snd: audio.Sound,
+    music_snd: audio.Sound,
+}
+
+fn make(k: usize) !audio.Sound {
+    if k == FLIP_UP {
+        return solenoid(0.12, 160.0, 70.0, 0.9, 0.9, 0.25, 1900.0, 1);
+    }
+    if k == FLIP_DOWN {
+        return solenoid(0.06, 120.0, 60.0, 0.3, 0.4, 0.1, 1700.0, 2);
+    }
+    if k == BUMPER {
+        return solenoid(0.25, 240.0, 55.0, 1.0, 1.0, 0.35, 1400.0, 3);
+    }
+    if k == SLING {
+        return solenoid(0.18, 200.0, 70.0, 0.9, 1.0, 0.2, 2300.0, 4);
+    }
+    if k == DROP {
+        return solenoid(0.16, 130.0, 80.0, 0.8, 0.5, 0.4, 900.0, 5);
+    }
+    if k == STANDUP {
+        return solenoid(0.07, 600.0, 300.0, 0.3, 0.6, 0.1, 3000.0, 6);
+    }
+    if k == CHIME {
+        return chime(0.7, 1318.5, 0.35);
+    }
+    if k == SPIN {
+        return solenoid(0.03, 2000.0, 1200.0, 0.1, 0.6, 0.0, 1000.0, 7);
+    }
+    if k == PLUNGE {
+        return solenoid(0.35, 180.0, 90.0, 0.6, 0.5, 0.6, 620.0, 8);
+    }
+    if k == KNOCK {
+        return solenoid(0.05, 900.0, 400.0, 0.2, 0.7, 0.3, 2600.0, 9);
+    }
+    if k == CLACK {
+        return solenoid(0.08, 3000.0, 2500.0, 0.1, 0.4, 0.8, 4200.0, 10);
+    }
+    if k == DRAIN {
+        let notes: [4]f64 = [392.0, 311.13, 261.63, 196.0];
+        return tune(notes[..], 0.14, 0.9, 0.5);
+    }
+    if k == RAMP {
+        let notes: [4]f64 = [523.25, 659.25, 783.99, 1046.5];
+        return tune(notes[..], 0.07, 0.8, 0.4);
+    }
+    if k == JACKPOT {
+        let notes: [8]f64 = [523.25, 659.25, 783.99, 1046.5, 783.99, 1046.5, 1318.5, 1568.0];
+        return tune(notes[..], 0.09, 1.0, 0.8);
+    }
+    if k == MULTIBALL {
+        let notes: [8]f64 = [440.0, 554.37, 659.25, 880.0, 440.0, 554.37, 659.25, 880.0];
+        return tune(notes[..], 0.12, 1.0, 0.6);
+    }
+    if k == LOCK {
+        let notes: [3]f64 = [220.0, 329.63, 440.0];
+        return tune(notes[..], 0.15, 1.0, 0.6);
+    }
+    if k == SAUCER {
+        return solenoid(0.2, 150.0, 60.0, 1.0, 0.6, 0.3, 800.0, 11);
+    }
+    if k == SAVED {
+        let notes: [5]f64 = [784.0, 988.0, 1175.0, 988.0, 1568.0];
+        return tune(notes[..], 0.06, 0.8, 0.4);
+    }
+    if k == TILT {
+        let notes: [2]f64 = [110.0, 104.0];
+        return tune(notes[..], 0.3, 1.2, 0.5);
+    }
+    if k == START {
+        let notes: [6]f64 = [392.0, 523.25, 659.25, 783.99, 659.25, 1046.5];
+        return tune(notes[..], 0.1, 0.9, 0.6);
+    }
+    if k == RESET {
+        return solenoid(0.2, 100.0, 70.0, 1.0, 0.8, 0.3, 700.0, 12);
+    }
+    return chime(0.25, 880.0, 0.3);
+}
+
+/// The sounds, made, but no device: silence (for drawing offscreen).
+pub fn silent() !Sound {
+    return make_all(false);
+}
+
+pub fn init() !Sound {
+    return make_all(true);
+}
+
+fn make_all(device: bool) !Sound {
+    let none = output.Voice.none();
+    let mut made: [22]audio.Sound = undefined;
+    for k in @as(usize, 0)..SOUNDS {
+        made[k] = make(k)!;
+    }
+    let mut s = Sound.{ engine: output.Engine.none(), on: false, sounds: made, voices: [none; 16], next: 0,
+                        roll: none, rail: none, tune: none, roll_snd: rolling(false)!, rail_snd: rolling(true)!,
+                        music_snd: music()! };
+    if not device {
+        return s;
+    }
+    s.engine = output.Engine.init() catch {
+        return s;  // no audio device: silence
+    };
+    for k in @as(usize, 0)..VOICES {
+        s.voices[k] = s.engine.voice(&s.sounds[0])!;
+    }
+    s.roll = s.engine.voice(&s.roll_snd)!;
+    s.rail = s.engine.voice(&s.rail_snd)!;
+    s.tune = s.engine.voice(&s.music_snd)!;
+    s.roll.set_volume(0.0);
+    s.rail.set_volume(0.0);
+    s.roll.play(&s.roll_snd, true)!;
+    s.rail.play(&s.rail_snd, true)!;
+    s.tune.set_volume(0.0);
+    s.tune.play(&s.music_snd, true)!;
+    s.on = true;
+    return s;
+}
+
+/// Plays sound k at volume v (0..1), pitch p (1: as made).
+pub fn play(s: *mut Sound, k: usize, v: f32, p: f32) void {
+    if not s.on or (v < 0.01) {
+        return;
+    }
+    let voice = &mut s.voices[s.next];
+    s.next = (s.next + 1) % VOICES;
+    voice.stop();
+    voice.set_volume(@min(v, 1.0));
+    voice.set_pitch(vm_clamp(p, 0.25, 4.0));
+    voice.play(&s.sounds[k], false) catch {};
+}
+
+fn vm_clamp(x: f32, lo: f32, hi: f32) f32 {
+    return @min(@max(x, lo), hi);
+}
+
+/// The loops: rolling (by the balls' speed on the playfield and on the
+/// rails) and the music's volume.
+pub fn loops(s: *mut Sound, roll: f32, rail: f32, volume: f32) void {
+    if not s.on {
+        return;
+    }
+    s.roll.set_volume(vm_clamp(roll * 0.5, 0.0, 0.6));
+    s.roll.set_pitch(vm_clamp(0.6 + (roll * 0.5), 0.5, 1.6));
+    s.rail.set_volume(vm_clamp(rail * 0.6, 0.0, 0.7));
+    s.rail.set_pitch(vm_clamp(0.7 + (rail * 0.4), 0.5, 1.6));
+    s.tune.set_volume(volume);
+}
+
+pub fn deinit(s: *mut Sound) void {
+    if s.on {
+        for k in @as(usize, 0)..VOICES {
+            s.voices[k].destroy();
+        }
+        s.roll.destroy();
+        s.rail.destroy();
+        s.tune.destroy();
+        s.engine.deinit();
+    }
+    for k in @as(usize, 0)..SOUNDS {
+        s.sounds[k].deinit();
+    }
+    s.roll_snd.deinit();
+    s.rail_snd.deinit();
+    s.music_snd.deinit();
+}

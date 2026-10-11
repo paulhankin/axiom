@@ -1,0 +1,1046 @@
+// =============================================================================
+// File: game.ax
+// The rules, and everything else that is not physics or drawing: the
+// score, three balls a game, the lamps, the display, the sounds.
+//
+//   - Pop bumpers 1,000 (5,000 while SUPER BUMPERS is lit); slingshots 110.
+//   - The top lanes A X M: a lane lights as a ball rolls through it; all
+//     three raise the bonus multiplier (to 5x). The flippers move the lit
+//     lanes left and right (lane change). The lane flashing as a ball is
+//     plunged is the SKILL SHOT (50,000).
+//   - Drop targets 2,500 each; the whole bank 25,000 and LOCK IS LIT.
+//   - The saucer: with the lock lit, it locks the ball; the second lock
+//     starts a three-ball MULTIBALL. Unlit, it holds the ball a moment
+//     (5,000) and kicks it out.
+//   - In multiball the ramp scores the JACKPOT (from 250,000, up 100,000
+//     each time). Otherwise the ramp is 20,000 and the orbit (round the
+//     top, either way) 15,000; one after another within four seconds is
+//     a COMBO, doubled.
+//   - The standup targets light one by one; all three light SUPER BUMPERS
+//     for twenty seconds.
+//   - The spinner 100 a turn; inlanes 1,000; outlanes 5,000.
+//   - A ball drained within ten seconds of its launch is saved.
+//   - Each target, lane and ramp adds to the bonus, counted at the end of
+//     the ball times the multiplier.
+//   - Nudging the table moves the balls; nudge too hard and too often
+//     and it tilts.
+// =============================================================================
+
+import "dmd.ax" as dmd;
+import "physics.ax" as ph;
+import "render.ax" as render;
+import "sound.ax" as snd;
+import "std/math" as math;
+import "table.ax" as tb;
+import "v3.ax" as vm;
+
+pub const ATTRACT: u8 = 0;
+pub const PLAYING: u8 = 1;
+const BALLS: u32 = 3;
+const NONE: usize = 6;
+
+const OFF: u8 = 0;
+const ON: u8 = 1;
+const SLOW: u8 = 2;
+const FAST: u8 = 3;
+
+struct Message {
+    top: [24]u8,
+    top_len: usize,
+    bottom: [32]u8,
+    bottom_len: usize,
+    until: f32,
+    blink: bool,
+}
+
+pub struct Game {
+    w: ph.World,
+    t: tb.Table,
+    state: u8,
+    time: f32,
+    score: u64,
+    high: u64,
+    last: u64,
+    ball: u32,
+    mult: u32,
+    bonus: u64,
+    lanes: [3]bool,
+    drops_down: [4]bool,
+    drop_anim: [4]f32,
+    drop_reset: f32,
+    standups: [3]bool,
+    standup_anim: [3]f32,
+    bumper_anim: [3]f32,
+    lock_lit: bool,
+    locked: u32,
+    multiball: bool,
+    jackpot: u64,
+    pending: u32,       // balls the saucer has still to give out
+    super_time: f32,
+    save_time: f32,     // the ball save's time left
+    launched: bool,     // has this ball left the shooter lane
+    skill_lane: usize,
+    skill_time: f32,
+    orbit_time: f32,
+    orbit_way: i32,
+    combo_time: f32,
+    saucer_ball: usize,
+    saucer_timer: f32,
+    auto_plunge: f32,   // the plunger, pulled by itself for this long, then let go
+    spinner: f32,
+    spinner_speed: f32,
+    spin_count: f32,
+    gate: f32,
+    gate_speed: f32,
+    lamp_mode: [32]u8,
+    lamps: [32]f32,
+    lamp_flash: [32]f32,
+    gi: f32,
+    flash: f32,
+    shake: vm.V3,
+    shake_v: vm.V3,
+    tilt_meter: f32,
+    warnings: u32,
+    tilted: bool,
+    end_timer: f32,     // counting the bonus at the end of a ball
+    msg: Message,
+    dots: dmd.Dots,
+    held: [2]bool,      // the flipper buttons
+    plunger_button: bool,
+    knock_time: f32,
+    stats: [32]u32,     // how often each switch closed (for testing)
+    still: [6]f32,      // how long each ball has not moved (for the ball search)
+}
+
+fn no_message() Message {
+    return Message.{ top: [0; 24], top_len: 0, bottom: [0; 32], bottom_len: 0, until: -1.0, blink: false };
+}
+
+pub fn init() !Game {
+    let mut w = ph.new_world();
+    let t = tb.build(&mut w)!;
+    return Game.{ w: w, t: t, state: ATTRACT, time: 0.0, score: 0, high: 2500000, last: 0, ball: 0, mult: 1,
+                  bonus: 0, lanes: [false; 3], drops_down: [false; 4], drop_anim: [0.0; 4], drop_reset: 0.0,
+                  standups: [false; 3], standup_anim: [0.0; 3], bumper_anim: [0.0; 3], lock_lit: false, locked: 0,
+                  multiball: false, jackpot: 250000, pending: 0, super_time: 0.0, save_time: 0.0, launched: false,
+                  skill_lane: 1, skill_time: 0.0, orbit_time: 0.0, orbit_way: 0, combo_time: 0.0, saucer_ball: NONE,
+                  saucer_timer: 0.0, auto_plunge: 0.0, spinner: 0.0, spinner_speed: 0.0, spin_count: 0.0,
+                  gate: 0.0, gate_speed: 0.0, lamp_mode: [OFF; 32], lamps: [0.0; 32], lamp_flash: [0.0; 32],
+                  gi: 1.0, flash: 0.0, shake: vm.zero(), shake_v: vm.zero(), tilt_meter: 0.0, warnings: 0,
+                  tilted: false, end_timer: 0.0, msg: no_message(), dots: dmd.Dots.init(), held: [false; 2],
+                  plunger_button: false, knock_time: 0.0, stats: [0; 32], still: [0.0; 6] };
+}
+
+pub fn deinit(g: *mut Game) void {
+    ph.deinit(&mut g.w);
+}
+
+fn say(g: *mut Game, top: []u8, bottom: []u8, secs: f32, blink: bool) void {
+    let a = @min(top.len, g.msg.top.len);
+    @mem_copy(g.msg.top[..a], top[..a]);
+    g.msg.top_len = a;
+    let b = @min(bottom.len, g.msg.bottom.len);
+    @mem_copy(g.msg.bottom[..b], bottom[..b]);
+    g.msg.bottom_len = b;
+    g.msg.until = g.time + secs;
+    g.msg.blink = blink;
+}
+
+fn add(g: *mut Game, points: u64) void {
+    if (g.state == PLAYING) and not g.tilted {
+        g.score += points;
+    }
+}
+
+fn shooter_spot() vm.V3 {
+    return vm.v(0.2553, ph.PLUNGER_REST + 0.004 + ph.R + 0.001, ph.R);
+}
+
+// A ball into the shooter lane (if it is free); plunged by itself if `auto`.
+fn serve(g: *mut Game, auto: bool) void {
+    for b in g.w.balls {
+        if b.live and (b.p.x > 0.24) and (b.p.y < 0.3) {
+            if auto {
+                g.auto_plunge = 0.9;
+            }
+            return;
+        }
+    }
+    _ = ph.add_ball(&mut g.w, shooter_spot());
+    if auto {
+        g.auto_plunge = 1.0;
+    }
+}
+
+/// Starts a game (from the attract mode).
+pub fn start(g: *mut Game, s: *mut snd.Sound) void {
+    if g.state == PLAYING {
+        return;
+    }
+    for i in @as(usize, 0)..ph.MAX_BALLS {
+        g.w.balls[i].live = false;
+    }
+    g.state = PLAYING;
+    g.score = 0;
+    g.ball = 0;
+    g.locked = 0;
+    g.lock_lit = false;
+    g.multiball = false;
+    g.jackpot = 250000;
+    raise_drops(g);
+    g.standups = [false; 3];
+    snd.play(s, snd.START, 0.8, 1.0);
+    next_ball(g);
+}
+
+fn next_ball(g: *mut Game) void {
+    g.ball += 1;
+    g.mult = 1;
+    g.bonus = 0;
+    g.lanes = [false; 3];
+    g.launched = false;
+    g.save_time = 0.0;
+    g.skill_lane = 1;
+    g.skill_time = 0.0;
+    g.tilted = false;
+    g.warnings = 0;
+    g.tilt_meter = 0.0;
+    g.super_time = 0.0;
+    g.gi = 1.0;
+    serve(g, false);
+    var_say_ball(g);
+}
+
+fn var_say_ball(g: *mut Game) void {
+    let mut out: [8]u8 = [0; 8];
+    @mem_copy(out[0..5], "BALL ");
+    out[5] = '0' + @truncate(u8, g.ball);
+    say(g, out[..6], "SHOOT THE LIT LANE", 2.5, false);
+}
+
+fn raise_drops(g: *mut Game) void {
+    for k in @as(usize, 0)..4 {
+        g.drops_down[k] = false;
+        g.w.fences.get_ptr(g.t.drops[k]).on = true;
+    }
+}
+
+fn flash_lamp(g: *mut Game, k: usize, amount: f32) void {
+    g.lamp_flash[k] = @max(g.lamp_flash[k], amount);
+}
+
+fn combo(g: *mut Game) u64 {
+    if g.combo_time > 0.0 {
+        return 2;
+    }
+    return 1;
+}
+
+// -----------------------------------------------------------------------------
+// Switches
+// -----------------------------------------------------------------------------
+fn hit(g: *mut Game, s: *mut snd.Sound, id: i32, speed: f32) void {
+    let v = vm.clampf(0.4 + (speed * 0.4), 0.3, 1.0);
+    if (id >= tb.SW_BUMPER) and (id < (tb.SW_BUMPER + 3)) {
+        let k = @int_cast(usize, id - tb.SW_BUMPER);
+        g.bumper_anim[k] = 1.0;
+        flash_lamp(g, tb.L_BUMPER + k, 1.0);
+        snd.play(s, snd.BUMPER, 0.85, 0.95 + (0.05 * @float_from_int(f32, k)));
+        if g.super_time > 0.0 {
+            add(g, 5000);
+        } else {
+            add(g, 1000);
+        }
+        return;
+    }
+    if (id >= tb.SW_SLING) and (id < (tb.SW_SLING + 2)) {
+        snd.play(s, snd.SLING, 0.8, 1.0);
+        add(g, 110);
+        g.gi = @max(g.gi - 0.15, 0.6);
+        return;
+    }
+    if (id >= tb.SW_DROP) and (id < (tb.SW_DROP + 4)) {
+        let k = @int_cast(usize, id - tb.SW_DROP);
+        if g.drops_down[k] {
+            return;
+        }
+        g.drops_down[k] = true;
+        g.w.fences.get_ptr(g.t.drops[k]).on = false;
+        snd.play(s, snd.DROP, v, 1.0);
+        add(g, 2500);
+        g.bonus += 1000;
+        let mut all = true;
+        for d in g.drops_down {
+            all = all and d;
+        }
+        if all {
+            add(g, 25000);
+            g.drop_reset = 1.6;
+            if not g.multiball {
+                g.lock_lit = true;
+                say(g, "LOCK IS LIT", "SHOOT THE SAUCER", 2.5, true);
+            } else {
+                say(g, "TARGETS", "25,000", 1.5, false);
+            }
+            flash_lamp(g, tb.L_FLASH + 1, 1.0);
+            snd.play(s, snd.LOCK, 0.7, 1.0);
+        }
+        return;
+    }
+    if (id >= tb.SW_STANDUP) and (id < (tb.SW_STANDUP + 3)) {
+        let k = @int_cast(usize, id - tb.SW_STANDUP);
+        g.standup_anim[k] = 1.0;
+        g.standups[k] = true;
+        snd.play(s, snd.STANDUP, v, 1.0);
+        add(g, 3000);
+        g.bonus += 1000;
+        if g.standups[0] and g.standups[1] and g.standups[2] {
+            g.standups = [false; 3];
+            g.super_time = 20.0;
+            say(g, "SUPER", "BUMPERS 5,000", 2.0, true);
+            snd.play(s, snd.LOCK, 0.7, 1.5);
+        }
+        return;
+    }
+}
+
+fn crossed(g: *mut Game, s: *mut snd.Sound, id: i32, way: f32) void {
+    if (id >= tb.SW_LANE) and (id < (tb.SW_LANE + 3)) {
+        let k = @int_cast(usize, id - tb.SW_LANE);
+        if (g.skill_time > 0.0) and (k == g.skill_lane) {
+            add(g, 50000);
+            say(g, "SKILL SHOT", "50,000", 2.0, true);
+            snd.play(s, snd.JACKPOT, 0.8, 1.2);
+            flash_lamp(g, tb.L_FLASH + 1, 1.0);
+        }
+        g.skill_time = 0.0;
+        if g.lanes[k] {
+            add(g, 500);
+        } else {
+            g.lanes[k] = true;
+            add(g, 1000);
+            g.bonus += 1000;
+        }
+        let pitch: [3]f32 = [1.0, 1.25, 1.5];
+        snd.play(s, snd.CHIME, 0.6, pitch[k]);
+        flash_lamp(g, tb.L_LANE + k, 1.0);
+        if g.lanes[0] and g.lanes[1] and g.lanes[2] {
+            g.lanes = [false; 3];
+            for j in @as(usize, 0)..3 {
+                flash_lamp(g, tb.L_LANE + j, 1.5);
+            }
+            if g.mult < 5 {
+                g.mult += 1;
+                let names: [4][]u8 = ["2X BONUS", "3X BONUS", "4X BONUS", "5X BONUS"];
+                say(g, names[@as(usize, g.mult - 2)], "MULTIPLIER", 2.0, true);
+            } else {
+                add(g, 50000);
+                say(g, "A X M", "50,000", 1.5, false);
+            }
+        }
+        return;
+    }
+    if (id == tb.SW_RAMP_MADE) and (way > 0.0) {
+        flash_lamp(g, tb.L_FLASH, 1.2);
+        g.bonus += 5000;
+        if g.multiball {
+            g.stats[27] += 1;
+            add(g, g.jackpot);
+            let mut buf: [24]u8 = [0; 24];
+            say(g, "JACKPOT", dmd.commas(g.jackpot, buf[..]), 3.0, true);
+            g.jackpot += 100000;
+            g.flash = 1.0;
+            snd.play(s, snd.JACKPOT, 1.0, 1.0);
+            g.gi = 0.2;
+        } else {
+            let c = combo(g);
+            add(g, 20000 * c);
+            if c > 1 {
+                say(g, "COMBO", "40,000", 1.5, false);
+            } else {
+                say(g, "RAMP", "20,000", 1.2, false);
+            }
+            snd.play(s, snd.RAMP, 0.7, 1.0);
+        }
+        g.combo_time = 4.0;
+        return;
+    }
+    if (id == tb.SW_ORBIT_RIGHT) or (id == tb.SW_ORBIT_LEFT) {
+        // up one side, then down the other
+        let mut up = way > 0.0;
+        let mut side: i32 = 1;
+        if id == tb.SW_ORBIT_LEFT {
+            side = -1;
+        }
+        if up {
+            g.orbit_time = 2.5;
+            g.orbit_way = side;
+            return;
+        }
+        if (g.orbit_time > 0.0) and (g.orbit_way == -side) {
+            g.orbit_time = 0.0;
+            let c = combo(g);
+            add(g, 15000 * c);
+            g.bonus += 3000;
+            if c > 1 {
+                say(g, "COMBO", "30,000", 1.5, false);
+            } else {
+                say(g, "ORBIT", "15,000", 1.2, false);
+            }
+            flash_lamp(g, tb.L_FLASH + 1, 0.8);
+            snd.play(s, snd.RAMP, 0.6, 0.8);
+            g.combo_time = 4.0;
+        }
+        up = false;
+        _ = up;
+        return;
+    }
+    if id == tb.SW_SPINNER {
+        g.spinner_speed = way * 45.0;
+        return;
+    }
+    if (id >= tb.SW_INLANE) and (id < (tb.SW_INLANE + 2)) {
+        let k = @int_cast(usize, id - tb.SW_INLANE);
+        add(g, 1000);
+        flash_lamp(g, tb.L_INLANE + k, 1.5);
+        snd.play(s, snd.CHIME, 0.4, 0.75);
+        return;
+    }
+    if (id >= tb.SW_OUTLANE) and (id < (tb.SW_OUTLANE + 2)) {
+        let k = @int_cast(usize, id - tb.SW_OUTLANE);
+        add(g, 5000);
+        flash_lamp(g, tb.L_OUTLANE + k, 2.0);
+        return;
+    }
+    if id == tb.SW_SHOOTER {
+        if (way > 0.0) and not g.launched {
+            g.launched = true;
+            if g.save_time <= 0.0 {
+                g.save_time = 10.0;
+            }
+            g.skill_time = 2.5;
+        }
+        g.gate_speed = 14.0;
+        return;
+    }
+}
+
+fn drained(g: *mut Game, s: *mut snd.Sound) void {
+    if g.state != PLAYING {
+        return;
+    }
+    let live = ph.live_balls(&g.w) + @as(usize, g.pending);
+    if g.tilted {
+        if live == 0 {
+            end_ball(g, s);
+        }
+        return;
+    }
+    if g.save_time > 0.0 {
+        serve(g, true);
+        say(g, "BALL SAVED", "", 1.8, true);
+        snd.play(s, snd.SAVED, 0.8, 1.0);
+        return;
+    }
+    if live >= 2 {
+        return;
+    }
+    if live == 1 {
+        if g.multiball {
+            g.multiball = false;
+            say(g, "MULTIBALL", "OVER", 1.5, false);
+        }
+        return;
+    }
+    end_ball(g, s);
+}
+
+fn end_ball(g: *mut Game, s: *mut snd.Sound) void {
+    g.multiball = false;
+    g.end_timer = 3.0;
+    snd.play(s, snd.DRAIN, 0.8, 1.0);
+    if g.tilted {
+        say(g, "TILT", "", 3.0, false);
+        return;
+    }
+    let total = g.bonus * @as(u64, g.mult);
+    add(g, total);
+    let mut buf: [24]u8 = [0; 24];
+    let mut line: [32]u8 = [0; 32];
+    let n = dmd.commas(g.bonus, buf[..]);
+    let mut k = n.len;
+    @mem_copy(line[0..k], n);
+    let tail: [4]u8 = [' ', 'X', ' ', '0' + @truncate(u8, g.mult)];
+    @mem_copy(line[k..(k + 4)], tail[..]);
+    k += 4;
+    say(g, "BONUS", line[..k], 3.0, false);
+    snd.play(s, snd.BONUS, 0.5, 1.0);
+}
+
+/// What the switches did in the last step.
+pub fn events(g: *mut Game, s: *mut snd.Sound) void {
+    for k in 0..g.w.nevents {
+        let e = g.w.events[k];
+        if ((e.kind == ph.E_HIT) or (e.kind == ph.E_TRIGGER)) and (e.id >= 0) and (e.id < 32) {
+            g.stats[@int_cast(usize, e.id)] += 1;
+        }
+        if e.kind == ph.E_HIT {
+            hit(g, s, e.id, e.speed);
+        } else if e.kind == ph.E_TRIGGER {
+            crossed(g, s, e.id, e.speed);
+        } else if e.kind == ph.E_DRAIN {
+            drained(g, s);
+        } else if (e.kind == ph.E_KNOCK) or (e.kind == ph.E_FLIPPER) {
+            if (g.time - g.knock_time) > 0.03 {
+                g.knock_time = g.time;
+                snd.play(s, snd.KNOCK, vm.clampf((e.speed - 0.3) * 0.35, 0.0, 0.7), 0.8 + (e.speed * 0.1));
+            }
+        } else if e.kind == ph.E_BALLS {
+            snd.play(s, snd.CLACK, vm.clampf(e.speed * 0.4, 0.0, 0.8), 1.0);
+        }
+    }
+    g.w.nevents = 0;
+    saucer(g, s);
+}
+
+// The saucer: catching a ball, locking it, kicking it out.
+fn saucer(g: *mut Game, s: *mut snd.Sound) void {
+    if g.saucer_ball != NONE {
+        return;
+    }
+    for i in @as(usize, 0)..ph.MAX_BALLS {
+        let b = g.w.balls[i];
+        if not b.live or b.held {
+            continue;
+        }
+        let d = b.p.sub(tb.SAUCER).flat().len();
+        if (d < 0.012) and (b.v.len() < 0.9) and (b.p.z < (ph.R + 0.004)) {
+            g.w.balls[i].held = true;
+            g.w.balls[i].v = vm.zero();
+            g.w.balls[i].w = vm.zero();
+            g.w.balls[i].p = vm.v(tb.SAUCER.x, tb.SAUCER.y, ph.R - 0.008);
+            snd.play(s, snd.SAUCER, 0.6, 0.8);
+            if g.lock_lit and not g.multiball and not g.tilted {
+                g.lock_lit = false;
+                g.locked += 1;
+                g.w.balls[i].live = false;
+                g.drop_reset = 0.5;
+                if g.locked >= 2 {
+                    g.locked = 0;
+                    g.multiball = true;
+                    g.stats[26] += 1;
+                    g.pending = 3;
+                    g.saucer_timer = 1.5;
+                    say(g, "MULTIBALL", "SHOOT THE RAMP", 3.0, true);
+                    snd.play(s, snd.MULTIBALL, 1.0, 1.0);
+                    flash_lamp(g, tb.L_FLASH, 2.0);
+                    flash_lamp(g, tb.L_FLASH + 1, 2.0);
+                    g.gi = 0.0;
+                } else {
+                    say(g, "BALL 1 LOCKED", "", 2.0, true);
+                    snd.play(s, snd.LOCK, 0.8, 1.0);
+                    serve(g, true);
+                }
+                return;
+            }
+            g.saucer_ball = i;
+            g.saucer_timer = 1.0;
+            add(g, 5000);
+            return;
+        }
+    }
+}
+
+fn kick_out(g: *mut Game, s: *mut snd.Sound, i: usize) void {
+    let b = &mut g.w.balls[i];
+    b.held = false;
+    b.p = vm.v(tb.SAUCER.x, tb.SAUCER.y, ph.R + 0.002);
+    b.v = vm.v(0.42, -1.15, 0.35);
+    snd.play(s, snd.SAUCER, 0.9, 1.0);
+    flash_lamp(g, tb.L_LOCK, 1.0);
+}
+
+// -----------------------------------------------------------------------------
+// Each frame
+// -----------------------------------------------------------------------------
+/// The flipper buttons (and their sounds).
+pub fn flippers(g: *mut Game, s: *mut snd.Sound, left: bool, right: bool) void {
+    let want: [2]bool = [left, right];
+    for k in @as(usize, 0)..2 {
+        let on = want[k] and not g.tilted and (g.state == PLAYING);
+        if on and not g.held[k] {
+            snd.play(s, snd.FLIP_UP, 0.75, 1.0);
+            // lane change
+            if g.state == PLAYING {
+                if k == 0 {
+                    let first = g.lanes[0];
+                    g.lanes[0] = g.lanes[1];
+                    g.lanes[1] = g.lanes[2];
+                    g.lanes[2] = first;
+                    if not g.launched {
+                        g.skill_lane = (g.skill_lane + 2) % 3;
+                    }
+                } else {
+                    let last = g.lanes[2];
+                    g.lanes[2] = g.lanes[1];
+                    g.lanes[1] = g.lanes[0];
+                    g.lanes[0] = last;
+                    if not g.launched {
+                        g.skill_lane = (g.skill_lane + 1) % 3;
+                    }
+                }
+            }
+        } else if not on and g.held[k] {
+            snd.play(s, snd.FLIP_DOWN, 0.5, 1.0);
+        }
+        g.held[k] = on;
+        g.w.flippers[k].held = on;
+    }
+}
+
+/// The plunger's button: pulled while held, let go when released.
+pub fn plunger(g: *mut Game, s: *mut snd.Sound, down: bool) void {
+    if g.auto_plunge > 0.0 {
+        return;
+    }
+    if g.plunger_button and not down {
+        let pulled = g.w.plunger.rest - g.w.plunger.y;
+        snd.play(s, snd.PLUNGE, 0.3 + (pulled * 12.0), 1.0);
+    }
+    g.plunger_button = down;
+    g.w.plunger.pulling = down;
+}
+
+/// A nudge of the table (dir: -1 left, 1 right, 0 forward).
+pub fn nudge(g: *mut Game, s: *mut snd.Sound, dir: f32) void {
+    if (g.state != PLAYING) or g.tilted {
+        return;
+    }
+    let push = vm.v(dir * 0.10, 0.12, 0.0);
+    g.w.nudge = push;
+    g.shake_v = g.shake_v.add(vm.v(dir * 0.08, 0.06, -0.02));
+    g.tilt_meter += 1.0;
+    snd.play(s, snd.KNOCK, 0.5, 0.6);
+    if g.tilt_meter > 2.6 {
+        g.tilt_meter = 0.0;
+        g.warnings += 1;
+        if g.warnings >= 3 {
+            g.tilted = true;
+            say(g, "TILT", "", 3.0, true);
+            snd.play(s, snd.TILT, 1.0, 1.0);
+            for k in @as(usize, 0)..2 {
+                g.w.flippers[k].held = false;
+            }
+        } else {
+            say(g, "DANGER", "", 1.2, true);
+            snd.play(s, snd.TILT, 0.6, 1.4);
+        }
+    }
+}
+
+fn mode(g: *mut Game, k: usize, m: u8) void {
+    g.lamp_mode[k] = m;
+}
+
+fn lamp_modes(g: *mut Game) void {
+    for k in @as(usize, 0)..32 {
+        g.lamp_mode[k] = OFF;
+    }
+    if g.state != PLAYING {
+        return;
+    }
+    if g.tilted {
+        return;
+    }
+    for k in @as(usize, 0)..3 {
+        if g.lanes[k] {
+            mode(g, tb.L_LANE + k, ON);
+        }
+    }
+    if (not g.launched) or (g.skill_time > 0.0) {
+        mode(g, tb.L_LANE + g.skill_lane, FAST);
+    }
+    for k in @as(usize, 0)..4 {
+        if g.drops_down[k] {
+            mode(g, tb.L_DROP + k, ON);
+        }
+    }
+    for k in @as(usize, 0)..3 {
+        if g.standups[k] {
+            mode(g, tb.L_STANDUP + k, ON);
+        }
+    }
+    if g.lock_lit {
+        mode(g, tb.L_LOCK, FAST);
+    }
+    if g.multiball {
+        mode(g, tb.L_JACKPOT, FAST);
+        mode(g, tb.L_RAMP, FAST);
+    } else {
+        mode(g, tb.L_RAMP, SLOW);
+        if g.combo_time > 0.0 {
+            mode(g, tb.L_ORBIT, FAST);
+        } else {
+            mode(g, tb.L_ORBIT, SLOW);
+        }
+    }
+    for k in @as(usize, 0)..4 {
+        if g.mult >= @as(u32, @truncate(u32, k + 2)) {
+            mode(g, tb.L_BONUS + k, ON);
+        }
+    }
+    if (g.save_time > 2.0) or (not g.launched) {
+        mode(g, tb.L_AGAIN, ON);
+    } else if g.save_time > 0.0 {
+        mode(g, tb.L_AGAIN, FAST);
+    }
+    if g.super_time > 0.0 {
+        mode(g, tb.L_SUPER, FAST);
+    }
+}
+
+fn lamp_level(g: *Game, k: usize) f32 {
+    let m = g.lamp_mode[k];
+    if m == ON {
+        return 1.0;
+    }
+    if m == SLOW {
+        if @rem(g.time, 1.0) < 0.5 {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if m == FAST {
+        if @rem(g.time, 0.25) < 0.125 {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    return 0.0;
+}
+
+// The attract mode's lamps: waves across the inserts.
+fn attract_lamps(g: *mut Game) void {
+    for k in 0..tb.INSERTS {
+        let p = g.t.lamps[k].p;
+        let wave = math.sinf((g.time * 4.0) - (p.y * 18.0) + (math.sinf(p.x * 9.0 + g.time) * 1.5));
+        g.lamp_flash[k] = @max(g.lamp_flash[k], vm.clampf(wave * 1.4 - 0.4, 0.0, 1.0));
+    }
+}
+
+fn update_lamps(g: *mut Game, dt: f32) void {
+    lamp_modes(g);
+    if g.state != PLAYING {
+        attract_lamps(g);
+    }
+    for k in @as(usize, 0)..32 {
+        let mut target = @max(lamp_level(g, k), g.lamp_flash[k]);
+        if (k >= tb.L_BUMPER) and (k < (tb.L_BUMPER + 3)) {
+            target = @max(target, 0.3);
+            if g.super_time > 0.0 {
+                target = @max(target, 0.55 + (0.45 * math.sinf(g.time * 14.0)));
+            }
+        }
+        if g.tilted {
+            target = 0.0;
+        }
+        // incandescent bulbs take a moment to warm and to cool
+        let rate = @min(dt * 22.0, 1.0);
+        g.lamps[k] += (vm.clampf(target, 0.0, 2.0) - g.lamps[k]) * rate;
+        g.lamp_flash[k] = @max(g.lamp_flash[k] - (dt * 3.5), 0.0);
+    }
+    let mut gi_target: f32 = 1.0;
+    if g.tilted {
+        gi_target = 0.15;
+    }
+    g.gi += (gi_target - g.gi) * @min(dt * 3.0, 1.0);
+    g.lamps[render.L_GI] = g.gi;
+}
+
+fn text_line(g: *mut Game, s: []u8, y: i32, big: bool, level: u8) void {
+    if big and (s.len <= 10) {
+        g.dots.centre(s, y, 2, 2, level);
+    } else {
+        g.dots.centre(s, y + 3, 1, 1, level);
+    }
+}
+
+fn update_dmd(g: *mut Game) void {
+    g.dots.clear();
+    let mut buf: [24]u8 = [0; 24];
+    if g.msg.until > g.time {
+        let show = not g.msg.blink or (@rem(g.time, 0.4) < 0.28);
+        if show {
+            let top = g.msg.top[..g.msg.top_len];
+            if g.msg.bottom_len == 0 {
+                text_line(g, top, 9, true, 15);
+            } else {
+                text_line(g, top, 2, true, 15);
+                g.dots.centre(g.msg.bottom[..g.msg.bottom_len], 22, 1, 1, 11);
+            }
+        }
+        return;
+    }
+    if g.state == PLAYING {
+        let s = dmd.commas(g.score, buf[..]);
+        text_line(g, s, 3, true, 15);
+        let mut line: [24]u8 = [0; 24];
+        @mem_copy(line[0..5], "BALL ");
+        line[5] = '0' + @truncate(u8, g.ball);
+        g.dots.text(line[0..6], 2, 24, 1, 1, 8);
+        let mut right: []u8 = "";
+        if g.multiball {
+            right = "MULTIBALL";
+        } else if g.lock_lit {
+            right = "LOCK LIT";
+        } else if g.super_time > 0.0 {
+            right = "SUPER";
+        } else if g.mult > 1 {
+            let mults: [4][]u8 = ["2X", "3X", "4X", "5X"];
+            right = mults[@as(usize, g.mult - 2)];
+        }
+        g.dots.text(right, 126 - ((@int_cast(i32, right.len) * 6) - 1), 24, 1, 1, 8);
+        return;
+    }
+    // the attract mode: four screens in turn
+    let page = @int_from_float(u32, g.time / 3.0) % 4;
+    if page == 0 {
+        g.dots.centre("AXIOM", 2, 2, 2, 15);
+        g.dots.centre("P I N B A L L", 22, 1, 1, 9);
+    } else if page == 1 {
+        g.dots.centre("PRESS", 2, 2, 2, 15);
+        g.dots.centre("ENTER TO START", 22, 1, 1, 10);
+    } else if page == 2 {
+        g.dots.centre("HIGH SCORE", 2, 1, 1, 9);
+        text_line(g, dmd.commas(g.high, buf[..]), 13, true, 15);
+    } else {
+        if g.last > 0 {
+            g.dots.centre("LAST GAME", 2, 1, 1, 9);
+            text_line(g, dmd.commas(g.last, buf[..]), 13, true, 15);
+        } else {
+            g.dots.centre("ARROWS FLIP", 4, 1, 1, 12);
+            g.dots.centre("SPACE PLUNGES", 14, 1, 1, 12);
+            g.dots.centre("N NUDGES", 24, 1, 1, 12);
+        }
+    }
+}
+
+/// Everything that happens once a frame, after the physics' steps.
+pub fn update(g: *mut Game, s: *mut snd.Sound, dt: f32) void {
+    g.time += dt;
+    // timers
+    g.save_time = @max(g.save_time - dt, 0.0);
+    g.skill_time = @max(g.skill_time - dt, 0.0);
+    g.orbit_time = @max(g.orbit_time - dt, 0.0);
+    g.combo_time = @max(g.combo_time - dt, 0.0);
+    g.super_time = @max(g.super_time - dt, 0.0);
+    g.tilt_meter = @max(g.tilt_meter - (dt * 0.8), 0.0);
+    g.flash = @max(g.flash - (dt * 2.5), 0.0);
+    if g.launched == false {
+        // the ball save waits for the launch
+        g.save_time = @max(g.save_time, 0.0);
+    }
+    // the shooter: pulled and let go by itself
+    if g.auto_plunge > 0.0 {
+        g.auto_plunge -= dt;
+        g.w.plunger.pulling = g.auto_plunge > 0.35;
+        if g.auto_plunge <= 0.35 + dt and g.auto_plunge > 0.35 - dt {
+            snd.play(s, snd.PLUNGE, 0.6, 1.0);
+        }
+        if g.auto_plunge <= 0.0 {
+            g.auto_plunge = 0.0;
+            g.w.plunger.pulling = false;
+        }
+    }
+    // the saucer's ball, and balls it gives out in multiball
+    if g.saucer_timer > 0.0 {
+        g.saucer_timer -= dt;
+        if g.saucer_timer <= 0.0 {
+            if g.saucer_ball != NONE {
+                kick_out(g, s, g.saucer_ball);
+                g.saucer_ball = NONE;
+            }
+            if g.pending > 0 {
+                g.pending -= 1;
+                let i = ph.add_ball(&mut g.w, vm.v(tb.SAUCER.x, tb.SAUCER.y, ph.R));
+                if i < ph.MAX_BALLS {
+                    kick_out(g, s, i);
+                }
+                if g.pending > 0 {
+                    g.saucer_timer = 0.8;
+                }
+            }
+        }
+    }
+    // a ball that has stopped where nothing holds it is kicked free, as
+    // real machines do (a ball search)
+    for i in @as(usize, 0)..ph.MAX_BALLS {
+        let b = g.w.balls[i];
+        let waiting = (b.p.x > 0.24) and (b.p.y < 0.2);
+        if b.live and not b.held and not waiting and (b.v.len() < 0.02) {
+            g.still[i] += dt;
+            if g.still[i] > 6.0 {
+                g.still[i] = 0.0;
+                let a = g.time * 7.3;
+                g.w.balls[i].v = vm.v(math.cosf(a) * 0.35, 0.2 + (math.sinf(a) * 0.15), 0.25);
+                snd.play(s, snd.KNOCK, 0.6, 0.7);
+                g.stats[28] += 1;
+            }
+        } else {
+            g.still[i] = 0.0;
+        }
+    }
+    // the drop targets come back up
+    if g.drop_reset > 0.0 {
+        g.drop_reset -= dt;
+        if g.drop_reset <= 0.0 {
+            let mut clear = true;
+            for b in g.w.balls {
+                if b.live and (b.p.x > 0.12) and (b.p.y > 0.5) and (b.p.y < 0.72) and (b.p.x < 0.2) {
+                    clear = false;
+                }
+            }
+            if clear {
+                let mut any = false;
+                for d in g.drops_down {
+                    any = any or d;
+                }
+                if any {
+                    raise_drops(g);
+                    snd.play(s, snd.RESET, 0.7, 1.0);
+                }
+            } else {
+                g.drop_reset = 0.3;
+            }
+        }
+    }
+    // end of a ball: the bonus counted, then the next or the end
+    if g.end_timer > 0.0 {
+        g.end_timer -= dt;
+        if g.end_timer <= 0.0 {
+            if g.ball < BALLS {
+                next_ball(g);
+            } else {
+                g.state = ATTRACT;
+                g.last = g.score;
+                if g.score > g.high {
+                    g.high = g.score;
+                    say(g, "HIGH SCORE", "CONGRATULATIONS", 4.0, true);
+                } else {
+                    say(g, "GAME OVER", "", 3.0, false);
+                }
+            }
+        }
+    }
+    // animations: targets, bumpers, the spinner, the gate, the table's shake
+    for k in @as(usize, 0)..4 {
+        let want: f32 = if_else(g.drops_down[k], 1.0, 0.0);
+        g.drop_anim[k] += (want - g.drop_anim[k]) * @min(dt * 30.0, 1.0);
+    }
+    for k in @as(usize, 0)..3 {
+        g.standup_anim[k] = @max(g.standup_anim[k] - (dt * 8.0), 0.0);
+        g.bumper_anim[k] = @max(g.bumper_anim[k] - (dt * 12.0), 0.0);
+    }
+    let before = g.spinner;
+    g.spinner += g.spinner_speed * dt;
+    g.spinner_speed *= math.expf(-dt * 1.2);
+    if @abs(g.spinner_speed) < 0.5 {
+        // it settles hanging down
+        let rest = @nearest(g.spinner / 3.14159265) * 3.14159265;
+        g.spinner += (rest - g.spinner) * @min(dt * 6.0, 1.0);
+        g.spinner_speed = 0.0;
+    }
+    g.spin_count += @abs(g.spinner - before) / 3.14159265;
+    while g.spin_count >= 1.0 {
+        g.spin_count -= 1.0;
+        add(g, 100);
+        snd.play(s, snd.SPIN, 0.35, 1.0 + (@abs(g.spinner_speed) * 0.004));
+    }
+    g.gate += g.gate_speed * dt;
+    g.gate_speed -= (60.0 * math.sinf(g.gate) + (g.gate_speed * 2.5)) * dt;
+    g.gate = vm.clampf(g.gate, -0.2, 1.6);
+    let pull = g.shake.scale(-260.0).sub(g.shake_v.scale(12.0));
+    g.shake_v = g.shake_v.add(pull.scale(dt));
+    g.shake = g.shake.add(g.shake_v.scale(dt));
+    update_lamps(g, dt);
+    update_dmd(g);
+    // sounds that follow the balls
+    let mut roll: f32 = 0.0;
+    let mut rail: f32 = 0.0;
+    for b in g.w.balls {
+        if b.live and not b.held {
+            let sp = b.v.len();
+            if b.wire {
+                rail = @max(rail, sp);
+            } else if b.floor {
+                roll = @max(roll, sp);
+            }
+        }
+    }
+    let mut music: f32 = 0.12;
+    if g.state == PLAYING {
+        music = 0.3;
+    }
+    snd.loops(s, roll, rail, music);
+}
+
+fn if_else(c: bool, a: f32, b: f32) f32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+/// What the renderer needs this frame.
+pub fn view(g: *mut Game, v: *mut render.View) void {
+    v.balls = g.w.balls;
+    v.flippers = g.w.flippers;
+    v.drops = g.drop_anim;
+    v.standups = g.standup_anim;
+    v.bumpers = g.bumper_anim;
+    v.gate = g.gate;
+    v.spinner = g.spinner;
+    v.plunger = g.w.plunger.y;
+    v.lamps = g.lamps;
+    v.flash = g.flash;
+    v.shake = g.shake;
+    v.time = g.time;
+    g.dots.pack(&mut v.dmd);
+}
+
+/// Plays by itself: flips when a ball comes down onto a flipper, plunges.
+pub fn autopilot(g: *mut Game, s: *mut snd.Sound, seed: *mut u64) void {
+    let mut want: [2]bool = [false, false];
+    for b in g.w.balls {
+        if not b.live or b.held {
+            continue;
+        }
+        for k in @as(usize, 0)..2 {
+            let f = g.w.flippers[k];
+            let d = b.p.sub(f.pivot);
+            let along = d.x * f.side;
+            if (along > -0.005) and (along < (f.len + 0.01)) and (d.y < 0.06) and (d.y > -0.04) and (b.v.y < 0.6) and
+               (b.p.z < 0.03) {
+                // (sometimes early, sometimes late, to aim about)
+                seed.* = (seed.* *% 6364136223846793005) +% 1442695040888963407;
+                let r = @float_from_int(f32, seed.* >> 40) / 16777216.0;
+                if along > ((f.len * 0.25) + (r * f.len * 0.5)) {
+                    want[k] = true;
+                }
+            }
+            if f.held and (f.angle < f.up) {
+                want[k] = true;
+            }
+        }
+    }
+    flippers(g, s, want[0], want[1]);
+    // plunge a ball waiting in the shooter lane
+    for b in g.w.balls {
+        if b.live and (b.p.x > 0.24) and (b.p.y < 0.2) and (b.v.len() < 0.01) and (g.auto_plunge <= 0.0) {
+            // anything from a soft plunge into the lanes to a full one round the orbit
+            seed.* = (seed.* *% 6364136223846793005) +% 1442695040888963407;
+            let r = @float_from_int(f32, seed.* >> 40) / 16777216.0;
+            g.auto_plunge = 0.75 + (0.45 * r);
+        }
+    }
+}

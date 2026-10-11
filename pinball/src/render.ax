@@ -1,0 +1,628 @@
+// =============================================================================
+// File: render.ax
+// Drawing a frame (std/graphics/gpu, Metal):
+//
+//   1. the key light's shadow map, of everything solid;
+//   2. the scene into a half-float target, four samples a pixel: the
+//      static mesh, the moving parts, the balls (which reflect the
+//      playfield under them and the room above), then the clear ramp, then
+//      glows round the lit lamps, added;
+//   3. its bright parts, at a half and a quarter of the size, blurred
+//      (bloom);
+//   4. the scene and the blooms tone-mapped into the window, and the dot
+//      matrix display over the top.
+//
+// Lights: a warm key light from over the back of the table, which casts
+// the shadows; the general illumination's bulbs round the edges; the
+// bumpers' and flashers' lamps; the lit inserts, which glow (in the
+// playfield's shader) and light what is near. The balls hide the light
+// from what they nearly touch.
+// =============================================================================
+
+import "art.ax" as art;
+import "mesh.ax" as mesh;
+import "physics.ax" as ph;
+import "scene.ax" as scene;
+import "shaders.ax" as shaders;
+import "std/fmt" as fmt;
+import "std/graphics/gpu" as gx;
+import "std/math" as math;
+import "std/math/geometry" as geo;
+import "std/math/matrix" as matrix;
+import "std/mem" as mem;
+import "std/str" as strs;
+import "table.ax" as tb;
+import "v3.ax" as vm;
+
+pub const L_GI: usize = 29;
+const SHADOW_SIZE: u32 = 2048;
+const SAMPLES: u32 = 4;
+
+// The frame's constants (Frame in the shader), in floats
+const F_VIEWPROJ: usize = 0;
+const F_SHADOWVP: usize = 16;
+const F_EYE: usize = 32;
+const F_KEY: usize = 36;
+const F_KEYCOL: usize = 40;
+const F_BALLS: usize = 44;
+const F_LAMPS: usize = 68;
+const F_INS_A: usize = 100;
+const F_INS_B: usize = 196;
+const F_LPOS: usize = 292;
+const F_LCOL: usize = 388;
+const F_COUNTS: usize = 484;
+const F_SCREEN: usize = 488;
+const F_TABLE: usize = 492;
+const FRAME_FLOATS: usize = 496;
+const MAX_LIGHTS: usize = 24;
+
+/// What a frame shows.
+pub struct View {
+    balls: [6]ph.Ball,
+    flippers: [2]ph.Flipper,
+    drops: [4]f32,     // 0 up .. 1 down
+    standups: [3]f32,  // how far each is knocked back
+    bumpers: [3]f32,   // how far each has just fired
+    gate: f32,         // the gate's swing (radians)
+    spinner: f32,      // the spinner's turn
+    plunger: f32,      // the plunger's tip (y)
+    lamps: [32]f32,
+    flash: f32,        // the screen, flashed (jackpots)
+    shake: vm.V3,      // the table, nudged
+    dmd: [512]u32,
+    time: f32,
+}
+
+pub fn empty_view() View {
+    let none = ph.Ball.{ p: vm.zero(), v: vm.zero(), w: vm.zero(), prev: vm.zero(), live: false, held: false,
+                         floor: false, wire: false, roll: vm.zero(), spin: [0.0, 0.0, 0.0, 1.0] };
+    let f = ph.Flipper.{ pivot: vm.zero(), side: 1.0, len: 0.07, r1: 0.01, r2: 0.005, h: 0.02, rest: 0.0, up: 0.0,
+                         angle: 0.0, speed: 0.0, held: false };
+    return View.{ balls: [none; 6], flippers: [f; 2], drops: [0.0; 4], standups: [0.0; 3], bumpers: [0.0; 3],
+                  gate: 0.0, spinner: 0.0, plunger: ph.PLUNGER_REST, lamps: [0.0; 32], flash: 0.0, shake: vm.zero(),
+                  dmd: [0; 512], time: 0.0 };
+}
+
+struct Geo {
+    v: gx.Buffer,
+    i: gx.Buffer,
+    n: u32,
+}
+
+pub struct Gfx {
+    root: gx.RootSignature,
+    solid: gx.Pipeline,
+    ball: gx.Pipeline,
+    clear: gx.Pipeline,
+    glow: gx.Pipeline,
+    shadow_pipe: gx.Pipeline,
+    bright: gx.Pipeline,
+    blur: gx.Pipeline,
+    final_pipe: gx.Pipeline,
+    dmd_pipe: gx.Pipeline,
+    shadow: gx.DepthBuffer,
+    hdr: gx.Target,
+    depth: gx.DepthBuffer,
+    bloom: [4]gx.Target,  // half size twice, quarter size twice
+    frame: gx.Buffer,
+    dots: gx.Buffer,
+    stat: Geo,
+    ramp: Geo,
+    bulbs: Geo,
+    parts_geo: Geo,
+    parts: [10]scene.Part,
+    quad: gx.Buffer,
+    art: gx.Texture,
+    table: tb.Table,
+    width: u32,
+    height: u32,
+}
+
+fn attributes() [4]gx.Attribute {
+    return [gx.Attribute.{ semantic: "POSITION", index: 0, format: gx.R32G32B32_FLOAT, offset: 0 },
+            gx.Attribute.{ semantic: "NORMAL", index: 0, format: gx.R32G32B32_FLOAT, offset: 12 },
+            gx.Attribute.{ semantic: "COLOR", index: 0, format: gx.R32G32B32A32_FLOAT, offset: 24 },
+            gx.Attribute.{ semantic: "TEXCOORD", index: 0, format: gx.R32G32_FLOAT, offset: 40 }];
+}
+
+fn options(blend: u32, depth: u32, format: u32, samples: u32) gx.PipelineOptions {
+    let mut o = gx.PipelineOptions.defaults();
+    o.blend = blend;
+    o.depth = depth;
+    o.cull = gx.CULL_NONE;
+    o.format = format;
+    o.samples = samples;
+    o.stride = mesh.STRIDE;
+    return o;
+}
+
+fn pipe(gpu: *mut gx.Device, root: *gx.RootSignature, sh: *gx.Shaders, vs: []u8, ps: []u8, o: gx.PipelineOptions,
+        with_vertices: bool) !gx.Pipeline {
+    let attrs = attributes();
+    let mut n: usize = 0;
+    if with_vertices {
+        n = 4;
+    }
+    return gpu.pipeline_with(root, sh, vs, ps, attrs[0..n], o) catch |e| {
+        fmt.eprint("pinball: {}\n", [fmt.str(gx.message())]) catch {};
+        return e;
+    };
+}
+
+fn upload(gpu: *mut gx.Device, m: *mesh.Mesh) !Geo {
+    return Geo.{ v: gpu.buffer(mesh.bytes(m.v.items()))!, i: gpu.buffer(mesh.index_bytes(m.i.items()))!,
+                 n: m.indexes() };
+}
+
+fn release_geo(g: *mut Geo) void {
+    g.v.release();
+    g.i.release();
+}
+
+fn source() !strs.String {
+    let mut s = strs.String.init();
+    for l in shaders.MSL {
+        s.push_str(l)!;
+        s.push('\n')!;
+    }
+    return s;
+}
+
+/// Everything the frames need, for a target of width x height.
+pub fn init(gpu: *mut gx.Device, w: *ph.World, t: *tb.Table, width: u32, height: u32) !Gfx {
+    let mut src = source()!;
+    defer src.deinit();
+    let mut sh = gpu.shaders("", src.bytes()) catch |e| {
+        fmt.eprint("pinball: {}\n", [fmt.str(gx.message())]) catch {};
+        return e;
+    };
+    defer sh.release();
+    let root = gpu.root_signature_with(20, 2, 3)!;
+    let hdr_f = gx.TARGET_RGBA16F;
+    let screen_f = gx.TARGET_BGRA8;
+    let solid = pipe(gpu, &root, &sh, "vs", "ps", options(gx.BLEND_NONE, gx.DEPTH_WRITE, hdr_f, SAMPLES), true)!;
+    let ball_pipe = pipe(gpu, &root, &sh, "vs", "ps_ball", options(gx.BLEND_NONE, gx.DEPTH_WRITE, hdr_f, SAMPLES), true)!;
+    let clear_pipe = pipe(gpu, &root, &sh, "vs", "ps_clear", options(gx.BLEND_ALPHA, gx.DEPTH_TEST, hdr_f, SAMPLES), true)!;
+    let glow_pipe = pipe(gpu, &root, &sh, "vs_glow", "ps_glow", options(gx.BLEND_ADD, gx.DEPTH_TEST, hdr_f, SAMPLES),
+                    true)!;
+    let mut so = options(gx.BLEND_NONE, gx.DEPTH_WRITE, hdr_f, 1);
+    so.depth_only = true;
+    so.depth_bias = 800;
+    so.slope_bias = 2.0;
+    let shadow_pipe = pipe(gpu, &root, &sh, "vs_shadow", "", so, true)!;
+    let mut po = options(gx.BLEND_NONE, gx.DEPTH_NONE, hdr_f, 1);
+    po.stride = 0;
+    let bright_pipe = pipe(gpu, &root, &sh, "vs_full", "ps_bright", po, false)!;
+    let blur_pipe = pipe(gpu, &root, &sh, "vs_full", "ps_blur", po, false)!;
+    let mut fo = options(gx.BLEND_NONE, gx.DEPTH_NONE, screen_f, 1);
+    fo.stride = 0;
+    let final_pipe = pipe(gpu, &root, &sh, "vs_full", "ps_final", fo, false)!;
+    fo.blend = gx.BLEND_ALPHA;
+    let dmd_pipe = pipe(gpu, &root, &sh, "vs_dmd", "ps_dmd", fo, false)!;
+    // the meshes
+    let mut m = mesh.Mesh.init();
+    defer m.deinit();
+    scene.build_static(&mut m, w, t)!;
+    let stat = upload(gpu, &m)!;
+    let mut r = mesh.Mesh.init();
+    defer r.deinit();
+    scene.build_ramp(&mut r, t)!;
+    let ramp = upload(gpu, &r)!;
+    let mut b = mesh.Mesh.init();
+    defer b.deinit();
+    scene.build_bulbs(&mut b)!;
+    let bulbs = upload(gpu, &b)!;
+    let mut p = mesh.Mesh.init();
+    defer p.deinit();
+    let mut parts: [10]scene.Part = [scene.Part.{ first: 0, count: 0 }; 10];
+    scene.build_parts(&mut p, &mut parts)!;
+    let parts_geo = upload(gpu, &p)!;
+    // a quad for glows
+    let mut q = mesh.Mesh.init();
+    defer q.deinit();
+    let white = mesh.look(1.0, 1.0, 1.0, 0.0, 0.0);
+    q.quad(vm.v(-1.0, -1.0, 0.0), vm.v(1.0, -1.0, 0.0), vm.v(1.0, 1.0, 0.0), vm.v(-1.0, 1.0, 0.0), white)!;
+    // the artwork
+    let mut img = art.paint(t)!;
+    defer img.deinit();
+    let tex = gpu.texture_mipmapped(&img, true)!;
+    let mut g = Gfx.{ root: root, solid: solid, ball: ball_pipe, clear: clear_pipe, glow: glow_pipe, shadow_pipe: shadow_pipe,
+                      bright: bright_pipe, blur: blur_pipe, final_pipe: final_pipe, dmd_pipe: dmd_pipe,
+                      shadow: gpu.shadow_map(SHADOW_SIZE)!, hdr: gx.Target.empty(), depth: gx.DepthBuffer.empty(),
+                      bloom: [gx.Target.empty(); 4], frame: gpu.constant_buffer(FRAME_FLOATS * 4)!,
+                      dots: gpu.constant_buffer(512 * 4)!, stat: stat, ramp: ramp, bulbs: bulbs, parts_geo: parts_geo,
+                      parts: parts, quad: gpu.buffer(mesh.bytes(q.v.items()))!, art: tex, table: t.*, width: 0,
+                      height: 0 };
+    resize(gpu, &mut g, width, height)!;
+    return g;
+}
+
+/// The targets, for a window of width x height pixels.
+pub fn resize(gpu: *mut gx.Device, g: *mut Gfx, width: u32, height: u32) !void {
+    if (width == g.width) and (height == g.height) {
+        return;
+    }
+    let w = @max(width, 16);
+    let h = @max(height, 16);
+    g.hdr.release();
+    g.depth.release();
+    for k in @as(usize, 0)..4 {
+        g.bloom[k].release();
+    }
+    g.hdr = gpu.target_with(w, h, gx.TARGET_RGBA16F, SAMPLES)!;
+    g.depth = gpu.depth_buffer_with(w, h, SAMPLES)!;
+    g.bloom[0] = gpu.target_with(w / 2, h / 2, gx.TARGET_RGBA16F, 1)!;
+    g.bloom[1] = gpu.target_with(w / 2, h / 2, gx.TARGET_RGBA16F, 1)!;
+    g.bloom[2] = gpu.target_with(w / 8, h / 8, gx.TARGET_RGBA16F, 1)!;
+    g.bloom[3] = gpu.target_with(w / 8, h / 8, gx.TARGET_RGBA16F, 1)!;
+    g.width = width;
+    g.height = height;
+}
+
+pub fn deinit(g: *mut Gfx) void {
+    g.solid.release();
+    g.ball.release();
+    g.clear.release();
+    g.glow.release();
+    g.shadow_pipe.release();
+    g.bright.release();
+    g.blur.release();
+    g.final_pipe.release();
+    g.dmd_pipe.release();
+    g.root.release();
+    g.shadow.release();
+    g.hdr.release();
+    g.depth.release();
+    for k in @as(usize, 0)..4 {
+        g.bloom[k].release();
+    }
+    g.frame.release();
+    g.dots.release();
+    release_geo(&mut g.stat);
+    release_geo(&mut g.ramp);
+    release_geo(&mut g.bulbs);
+    release_geo(&mut g.parts_geo);
+    g.quad.release();
+    g.art.release();
+}
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+fn gv(v: vm.V3) geo.Vec3.[f32] {
+    return geo.Vec3.[f32].init(v.x, v.y, v.z);
+}
+
+fn put_matrix(m: matrix.Mat4, out: []mut f32, at: usize) void {
+    for c in @as(usize, 0)..4 {
+        let mut col: [4]f32 = [0.0; 4];
+        @store(col[..], m.cols[c]);
+        for k in @as(usize, 0)..4 {
+            out[(at + (c * 4)) + k] = col[k];
+        }
+    }
+}
+
+fn put4(out: []mut f32, at: usize, a: f32, b: f32, c: f32, d: f32) void {
+    out[at] = a;
+    out[at + 1] = b;
+    out[at + 2] = c;
+    out[at + 3] = d;
+}
+
+/// Where the player's eyes are, and what they look at (table coordinates).
+pub fn eye(v: *View) vm.V3 {
+    return vm.v(0.0, -0.43, 0.40).add(v.shake);
+}
+
+fn key_dir() vm.V3 {
+    return vm.v(0.10, -0.38, -1.0).norm();
+}
+
+// The key light's view of the table, for the shadow map.
+fn shadow_matrix() matrix.Mat4 {
+    let l = key_dir();
+    let centre = vm.v(0.0, 0.52, 0.0);
+    let view = geo.look_at(gv(centre.sub(l.scale(2.0))), gv(centre), geo.Vec3.[f32].init(0.0, 1.0, 0.0));
+    let mut lo = vm.v(1.0e9, 1.0e9, 1.0e9);
+    let mut hi = vm.v(-1.0e9, -1.0e9, -1.0e9);
+    for k in @as(usize, 0)..8 {
+        let mut x: f32 = -0.32;
+        if (k & 1) != 0 {
+            x = 0.32;
+        }
+        let mut y: f32 = -0.08;
+        if (k & 2) != 0 {
+            y = 1.13;
+        }
+        let mut z: f32 = -0.02;
+        if (k & 4) != 0 {
+            z = 0.16;
+        }
+        let p = geo.transform_point(view, geo.Vec3.[f32].init(x, y, z));
+        lo = vm.v(@min(lo.x, p.x), @min(lo.y, p.y), @min(lo.z, p.z));
+        hi = vm.v(@max(hi.x, p.x), @max(hi.y, p.y), @max(hi.z, p.z));
+    }
+    let proj = geo.orthographic_zo(lo.x, hi.x, lo.y, hi.y, -hi.z - 0.05, -lo.z + 0.05);
+    return proj.mul(view);
+}
+
+fn add_light(f: []mut f32, n: *mut usize, p: vm.V3, radius: f32, c: vm.V3) void {
+    if n.* >= MAX_LIGHTS {
+        return;
+    }
+    put4(f, F_LPOS + (n.* * 4), p.x, p.y, p.z, radius);
+    put4(f, F_LCOL + (n.* * 4), c.x, c.y, c.z, 0.0);
+    n.* += 1;
+}
+
+fn frame_constants(g: *Gfx, v: *View, f: []mut f32) void {
+    let aspect = @float_from_int(f32, g.width) / @float_from_int(f32, g.height);
+    let e = eye(v);
+    let target = vm.v(0.0, 0.46, 0.0).add(v.shake.scale(0.5));
+    let up = vm.v(0.0, math.sinf(ph.SLOPE), math.cosf(ph.SLOPE));
+    let view = geo.look_at(gv(e), gv(target), gv(up));
+    // a narrower view when the window is narrow, so that the table fits
+    let fov = vm.clampf(0.66 * (1.25 / aspect), 0.6, 1.2);
+    let proj = geo.perspective_zo(fov, aspect, 0.05, 6.0);
+    put_matrix(proj.mul(view), f, F_VIEWPROJ);
+    put_matrix(shadow_matrix(), f, F_SHADOWVP);
+    put4(f, F_EYE, e.x, e.y, e.z, v.time);
+    let k = key_dir();
+    put4(f, F_KEY, k.x, k.y, k.z, 1.0 / @float_from_int(f32, SHADOW_SIZE));
+    let gi = v.lamps[L_GI];
+    put4(f, F_KEYCOL, 1.7 * (0.4 + (0.6 * gi)), 1.55 * (0.4 + (0.6 * gi)), 1.3 * (0.4 + (0.6 * gi)), 0.05);
+    for i in @as(usize, 0)..6 {
+        let b = v.balls[i];
+        let mut r: f32 = 0.0;
+        if b.live {
+            r = ph.R;
+        }
+        put4(f, F_BALLS + (i * 4), b.p.x, b.p.y, b.p.z, r);
+    }
+    for i in @as(usize, 0)..32 {
+        f[F_LAMPS + i] = v.lamps[i];
+    }
+    for i in @as(usize, 0)..24 {
+        let l = g.table.lamps[i];
+        if i < tb.INSERTS {
+            put4(f, F_INS_A + (i * 4), l.p.x, l.p.y, l.size, l.angle);
+            put4(f, F_INS_B + (i * 4), l.color.x, l.color.y, l.color.z, @float_from_int(f32, l.shape));
+        } else {
+            put4(f, F_INS_A + (i * 4), 0.0, 0.0, 0.0, 0.0);
+        }
+    }
+    // the lights: the bulbs, the bumpers, the flashers, the brightest inserts
+    let mut n: usize = 0;
+    for p in scene.GI {
+        add_light(f, &mut n, p.add(vm.v(0.0, 0.0, 0.006)), 0.2, vm.v(1.0, 0.78, 0.5).scale(0.016 * gi));
+    }
+    for i in @as(usize, 0)..3 {
+        let on = v.lamps[tb.L_BUMPER + i];
+        let l = g.table.lamps[tb.L_BUMPER + i];
+        add_light(f, &mut n, l.p.add(vm.v(0.0, 0.0, 0.01)), 0.16, l.color.scale(0.03 * on));
+    }
+    for i in @as(usize, 0)..2 {
+        let on = v.lamps[tb.L_FLASH + i];
+        if on > 0.02 {
+            let l = g.table.lamps[tb.L_FLASH + i];
+            add_light(f, &mut n, l.p.add(vm.v(0.0, 0.0, 0.03)), 0.45, l.color.scale(0.25 * on));
+        }
+    }
+    let big: [5]usize = [tb.L_JACKPOT, tb.L_LOCK, tb.L_RAMP, tb.L_ORBIT, tb.L_SUPER];
+    for i in big {
+        let on = v.lamps[i];
+        if on > 0.05 {
+            let l = g.table.lamps[i];
+            add_light(f, &mut n, l.p.add(vm.v(0.0, 0.0, 0.006)), 0.08, l.color.scale(0.006 * on));
+        }
+    }
+    put4(f, F_COUNTS, @float_from_int(f32, n), 0.35 + (0.65 * gi), 1.0, v.flash);
+    put4(f, F_SCREEN, @float_from_int(f32, g.width), @float_from_int(f32, g.height), 0.85, aspect);
+    put4(f, F_TABLE, art.X0, art.Y0, art.WIDTH, art.HEIGHT);
+}
+
+// -----------------------------------------------------------------------------
+// Drawing
+// -----------------------------------------------------------------------------
+fn draw_constants(gpu: *mut gx.Device, rows: [12]f32, tint: [4]f32, extra: [4]f32) void {
+    let mut u: [20]u32 = [0; 20];
+    for k in @as(usize, 0)..12 {
+        u[k] = @bit_cast(u32, rows[k]);
+    }
+    for k in @as(usize, 0)..4 {
+        u[12 + k] = @bit_cast(u32, tint[k]);
+        u[16 + k] = @bit_cast(u32, extra[k]);
+    }
+    gpu.set_constants(u[..]);
+}
+
+let IDENTITY: [12]f32 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+let WHITE: [4]f32 = [1.0, 1.0, 1.0, 1.0];
+let PLAIN: [4]f32 = [-1.0, 0.0, -1.0, -1.0];
+
+// Turned by `a` about z, then moved to p.
+fn rows_z(a: f32, p: vm.V3) [12]f32 {
+    let c = math.cosf(a);
+    let s = math.sinf(a);
+    return [c, -s, 0.0, p.x, s, c, 0.0, p.y, 0.0, 0.0, 1.0, p.z];
+}
+
+// Turned by `b` about x, then by `a` about z, then moved to p.
+fn rows_zx(a: f32, b: f32, p: vm.V3) [12]f32 {
+    let c = math.cosf(a);
+    let s = math.sinf(a);
+    let cb = math.cosf(b);
+    let sb = math.sinf(b);
+    // Rz * Rx
+    return [c, -s * cb, s * sb, p.x, s, c * cb, -c * sb, p.y, 0.0, sb, cb, p.z];
+}
+
+fn rows_quat(q: [4]f32, p: vm.V3) [12]f32 {
+    let x = q[0];
+    let y = q[1];
+    let z = q[2];
+    let w = q[3];
+    return [1.0 - (2.0 * ((y * y) + (z * z))), 2.0 * ((x * y) - (w * z)), 2.0 * ((x * z) + (w * y)), p.x,
+            2.0 * ((x * y) + (w * z)), 1.0 - (2.0 * ((x * x) + (z * z))), 2.0 * ((y * z) - (w * x)), p.y,
+            2.0 * ((x * z) - (w * y)), 2.0 * ((y * z) + (w * x)), 1.0 - (2.0 * ((x * x) + (y * y))), p.z];
+}
+
+fn part(gpu: *mut gx.Device, g: *Gfx, which: usize, rows: [12]f32, tint: [4]f32, extra: [4]f32) void {
+    draw_constants(gpu, rows, tint, extra);
+    gpu.draw_indexed(g.parts[which].count, g.parts[which].first, 0);
+}
+
+// Everything solid but the balls (into the shadow map, or lit).
+fn solids(gpu: *mut gx.Device, g: *mut Gfx, v: *View, lit: bool) void {
+    gpu.set_vertices(&g.stat.v, mesh.STRIDE);
+    gpu.set_indices(&g.stat.i, gx.R32_UINT);
+    draw_constants(gpu, IDENTITY, WHITE, PLAIN);
+    gpu.draw_indexed(g.stat.n, 0, 0);
+    if lit {
+        gpu.set_vertices(&g.bulbs.v, mesh.STRIDE);
+        gpu.set_indices(&g.bulbs.i, gx.R32_UINT);
+        draw_constants(gpu, IDENTITY, WHITE, [@float_from_int(f32, L_GI), 1.4, -1.0, -1.0]);
+        gpu.draw_indexed(g.bulbs.n, 0, 0);
+    }
+    gpu.set_vertices(&g.parts_geo.v, mesh.STRIDE);
+    gpu.set_indices(&g.parts_geo.i, gx.R32_UINT);
+    for k in @as(usize, 0)..2 {
+        let rows = scene.flipper_rows(v.flippers[k]);
+        part(gpu, g, scene.P_FLIPPER, rows, WHITE, PLAIN);
+    }
+    for k in @as(usize, 0)..3 {
+        let b = g.table.bumpers[k];
+        let hit = v.bumpers[k];
+        let lamp = @float_from_int(f32, tb.L_BUMPER + k);
+        let c = g.table.lamps[tb.L_BUMPER + k].color;
+        part(gpu, g, scene.P_CAP, rows_z(0.0, b), [c.x, c.y, c.z, 1.0], [lamp, 4.0, -1.0, -1.0]);
+        part(gpu, g, scene.P_SKIRT, rows_z(0.0, b.sub(vm.v(0.0, 0.0, 0.008 * hit))), WHITE, PLAIN);
+    }
+    let along = g.table.drop_b.sub(g.table.drop_a).norm();
+    let ang = math.atan2f(along.y, along.x);
+    for k in @as(usize, 0)..4 {
+        let c = g.table.drop_a.add(along.scale(0.0175 + (0.035 * @float_from_int(f32, k))));
+        let down = v.drops[k];
+        if down < 0.99 {
+            part(gpu, g, scene.P_DROP, rows_z(ang + 1.5707963, c.sub(vm.v(0.0, 0.0, 0.034 * down))), WHITE, PLAIN);
+        }
+    }
+    for k in @as(usize, 0)..3 {
+        let c = vm.v(-0.045 + (0.045 * @float_from_int(f32, k)), 0.665, 0.0);
+        part(gpu, g, scene.P_STANDUP, rows_zx(0.0, -0.25 * v.standups[k], c), WHITE, PLAIN);
+    }
+    part(gpu, g, scene.P_GATE, rows_zx(0.68, v.gate, vm.v(0.2553, 0.85, 0.03)), WHITE, PLAIN);
+    part(gpu, g, scene.P_SPINNER, rows_zx(0.0, v.spinner, vm.v(0.2165, tb.SPINNER_Y, 0.03)), WHITE, PLAIN);
+    part(gpu, g, scene.P_PLUNGER, rows_z(0.0, vm.v(0.2553, v.plunger, 0.0)), WHITE, PLAIN);
+    for k in @as(usize, 0)..2 {
+        let l = g.table.lamps[tb.L_FLASH + k];
+        let lamp = @float_from_int(f32, tb.L_FLASH + k);
+        part(gpu, g, scene.P_FLASHER, rows_z(0.0, l.p), [l.color.x, l.color.y, l.color.z, 1.0],
+             [lamp, 6.0, -1.0, -1.0]);
+    }
+}
+
+fn balls(gpu: *mut gx.Device, g: *mut Gfx, v: *View) void {
+    for b in v.balls {
+        if b.live {
+            part(gpu, g, scene.P_BALL, rows_quat(b.spin, b.p), WHITE, PLAIN);
+        }
+    }
+}
+
+fn glow(gpu: *mut gx.Device, p: vm.V3, size: f32, c: vm.V3, a: f32) void {
+    if a < 0.01 {
+        return;
+    }
+    draw_constants(gpu, [p.x, p.y, p.z, size, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [c.x, c.y, c.z, a], PLAIN);
+    gpu.draw(6, 0);
+}
+
+fn glows(gpu: *mut gx.Device, g: *mut Gfx, v: *View) void {
+    gpu.set_vertices(&g.quad, mesh.STRIDE);
+    for k in 0..tb.INSERTS {
+        let l = g.table.lamps[k];
+        glow(gpu, l.p.add(vm.v(0.0, 0.0, 0.003)), l.size * 3.2, l.color, v.lamps[k] * 0.9);
+    }
+    for k in @as(usize, 0)..3 {
+        let l = g.table.lamps[tb.L_BUMPER + k];
+        glow(gpu, l.p.add(vm.v(0.0, 0.0, 0.008)), 0.075, l.color, v.lamps[tb.L_BUMPER + k] * 1.2);
+    }
+    for k in @as(usize, 0)..2 {
+        let l = g.table.lamps[tb.L_FLASH + k];
+        glow(gpu, l.p.add(vm.v(0.0, 0.0, 0.012)), 0.16, l.color, v.lamps[tb.L_FLASH + k] * 3.0);
+    }
+    for p in scene.GI {
+        glow(gpu, p.add(vm.v(0.0, 0.0, 0.002)), 0.012, vm.v(1.0, 0.8, 0.5), v.lamps[L_GI] * 0.18);
+    }
+}
+
+fn post(gpu: *mut gx.Device, g: *mut Gfx, to: *mut gx.Target, p: *gx.Pipeline, from: *mut gx.Target, extra: [4]f32,
+        tint: [4]f32) !void {
+    gpu.begin(to)!;
+    gpu.set_pipeline(p);
+    gpu.set_target_texture(0, from);
+    draw_constants(gpu, IDENTITY, tint, extra);
+    gpu.draw(3, 0);
+}
+
+/// Draws the frame into `out` (the window's screen, or a target).
+pub fn draw(gpu: *mut gx.Device, g: *mut Gfx, out: *mut gx.Target, v: *View) !void {
+    let f = g.frame.floats();
+    frame_constants(g, v, f);
+    g.dots.write(@slice_from_ptr(@ptr_cast(*u8, &v.dmd[0]), 512 * 4))!;
+    // the shadow map
+    gpu.begin_shadow(&mut g.shadow)!;
+    gpu.clear_depth(&g.shadow);
+    gpu.set_pipeline(&g.shadow_pipe);
+    gpu.set_buffer(0, &g.frame);
+    solids(gpu, g, v, false);
+    balls(gpu, g, v);
+    // the scene
+    gpu.begin_depth(&mut g.hdr, &mut g.depth)!;
+    gpu.clear(&mut g.hdr, 0.0, 0.0, 0.0, 1.0);
+    gpu.clear_depth(&g.depth);
+    gpu.set_pipeline(&g.solid);
+    gpu.set_buffer(0, &g.frame);
+    gpu.set_texture(0, &mut g.shadow);
+    gpu.set_image(1, &g.art);
+    solids(gpu, g, v, true);
+    gpu.set_pipeline(&g.ball);
+    gpu.set_vertices(&g.parts_geo.v, mesh.STRIDE);
+    gpu.set_indices(&g.parts_geo.i, gx.R32_UINT);
+    balls(gpu, g, v);
+    gpu.set_pipeline(&g.clear);
+    gpu.set_vertices(&g.ramp.v, mesh.STRIDE);
+    gpu.set_indices(&g.ramp.i, gx.R32_UINT);
+    draw_constants(gpu, IDENTITY, [1.0, 1.0, 1.0, 0.3], PLAIN);
+    gpu.draw_indexed(g.ramp.n, 0, 0);
+    gpu.set_pipeline(&g.glow);
+    glows(gpu, g, v);
+    // bloom: bright parts at half size, blurred; then at an eighth, blurred
+    let hw = 1.0 / @float_from_int(f32, g.width);
+    let hh = 1.0 / @float_from_int(f32, g.height);
+    post(gpu, g, &mut g.bloom[0], &g.bright, &mut g.hdr, [hw, hh, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0])!;
+    post(gpu, g, &mut g.bloom[1], &g.blur, &mut g.bloom[0], [hw * 2.0, 0.0, 0.0, 0.0], WHITE)!;
+    post(gpu, g, &mut g.bloom[0], &g.blur, &mut g.bloom[1], [0.0, hh * 2.0, 0.0, 0.0], WHITE)!;
+    post(gpu, g, &mut g.bloom[2], &g.bright, &mut g.bloom[0], [hw * 4.0, hh * 4.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])!;
+    post(gpu, g, &mut g.bloom[3], &g.blur, &mut g.bloom[2], [hw * 8.0, 0.0, 0.0, 0.0], WHITE)!;
+    post(gpu, g, &mut g.bloom[2], &g.blur, &mut g.bloom[3], [0.0, hh * 8.0, 0.0, 0.0], WHITE)!;
+    // into the window
+    gpu.begin(out)!;
+    gpu.set_pipeline(&g.final_pipe);
+    gpu.set_buffer(0, &g.frame);
+    gpu.set_target_texture(0, &mut g.hdr);
+    gpu.set_target_texture(1, &mut g.bloom[0]);
+    gpu.set_target_texture(2, &mut g.bloom[2]);
+    draw_constants(gpu, IDENTITY, WHITE, PLAIN);
+    gpu.draw(3, 0);
+    // the display, at the top right, 4:1
+    let aspect = @float_from_int(f32, g.width) / @float_from_int(f32, g.height);
+    let w = @min(0.62, 1.15 / aspect);
+    let h = (w * aspect) / 4.0;
+    gpu.set_pipeline(&g.dmd_pipe);
+    gpu.set_buffer(1, &g.dots);
+    draw_constants(gpu, IDENTITY, WHITE, [0.98 - w, 0.97, w, h]);
+    gpu.draw(6, 0);
+}

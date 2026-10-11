@@ -1,0 +1,329 @@
+// =============================================================================
+// File: mesh.ax
+// Building meshes: vertices of 12 floats (position, normal, colour with
+// the material in its fourth place, and uv: a texture's coordinates, or
+// for most materials the roughness in v) and triangles of indexes.
+// =============================================================================
+
+import "std/collections/vec" as vec;
+import "std/math" as math;
+import "v3.ax" as vm;
+
+pub const STRIDE: u32 = 48;
+
+// Materials (as the shaders have them)
+pub const PAINT: f32 = 0.0;
+pub const PLAYFIELD: f32 = 1.0;
+pub const METAL: f32 = 2.0;
+pub const RUBBER: f32 = 3.0;
+pub const CLEAR: f32 = 4.0;
+pub const WOOD: f32 = 5.0;
+pub const LAMP: f32 = 6.0;
+pub const LIT: f32 = 7.0;
+
+pub struct Look {
+    col: vm.V3,
+    mat: f32,
+    rough: f32,
+}
+
+pub fn look(r: f32, g: f32, b: f32, mat: f32, rough: f32) Look {
+    return Look.{ col: vm.v(r, g, b), mat: mat, rough: rough };
+}
+
+pub struct Mesh {
+    v: vec.Vec.[f32],
+    i: vec.Vec.[u32],
+
+    pub fn init() Mesh {
+        return Mesh.{ v: vec.Vec.[f32].init(), i: vec.Vec.[u32].init() };
+    }
+
+    pub fn deinit(self: *mut Mesh) void {
+        self.v.deinit();
+        self.i.deinit();
+    }
+
+    pub fn count(self: *Mesh) u32 {
+        return @truncate(u32, self.v.items().len / 12);
+    }
+
+    pub fn indexes(self: *Mesh) u32 {
+        return @truncate(u32, self.i.items().len);
+    }
+
+    pub fn vertex(self: *mut Mesh, p: vm.V3, n: vm.V3, l: Look, u: f32, v: f32) !u32 {
+        let k = self.count();
+        let vals: [12]f32 = [p.x, p.y, p.z, n.x, n.y, n.z, l.col.x, l.col.y, l.col.z, l.mat, u, v];
+        self.v.extend(vals[..])!;
+        return k;
+    }
+
+    /// A vertex whose uv is (0, its look's roughness).
+    pub fn vert(self: *mut Mesh, p: vm.V3, n: vm.V3, l: Look) !u32 {
+        return self.vertex(p, n, l, 0.0, l.rough);
+    }
+
+    pub fn tri(self: *mut Mesh, a: u32, b: u32, c: u32) !void {
+        let t: [3]u32 = [a, b, c];
+        self.i.extend(t[..])!;
+    }
+
+    pub fn quad_idx(self: *mut Mesh, a: u32, b: u32, c: u32, d: u32) !void {
+        self.tri(a, b, c)!;
+        self.tri(a, c, d)!;
+    }
+
+    /// A flat quad a b c d (in order round it), facing its winding's normal.
+    pub fn quad(self: *mut Mesh, a: vm.V3, b: vm.V3, c: vm.V3, d: vm.V3, l: Look) !void {
+        let n = b.sub(a).cross(c.sub(a)).norm();
+        let ia = self.vert(a, n, l)!;
+        let ib = self.vert(b, n, l)!;
+        let ic = self.vert(c, n, l)!;
+        let id = self.vert(d, n, l)!;
+        self.quad_idx(ia, ib, ic, id)!;
+    }
+
+    /// A box between lo and hi, turned by angle about z round its middle.
+    pub fn box(self: *mut Mesh, lo: vm.V3, hi: vm.V3, angle: f32, l: Look) !void {
+        let c = lo.add(hi).scale(0.5);
+        let h = hi.sub(lo).scale(0.5);
+        let ca = math.cosf(angle);
+        let sa = math.sinf(angle);
+        let mut p: [8]vm.V3 = [vm.zero(); 8];
+        for k in @as(usize, 0)..8 {
+            let mut x = -h.x;
+            if (k & 1) != 0 {
+                x = h.x;
+            }
+            let mut y = -h.y;
+            if (k & 2) != 0 {
+                y = h.y;
+            }
+            let mut z = -h.z;
+            if (k & 4) != 0 {
+                z = h.z;
+            }
+            p[k] = c.add(vm.v((x * ca) - (y * sa), (x * sa) + (y * ca), z));
+        }
+        let faces: [6][4]usize = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+        for f in faces {
+            self.quad(p[f[0]], p[f[1]], p[f[2]], p[f[3]], l)!;
+        }
+    }
+
+    /// A cylinder from a to b, radius r (ra at a, rb at b), smooth round.
+    pub fn cone(self: *mut Mesh, a: vm.V3, b: vm.V3, ra: f32, rb: f32, sides: u32, caps: bool, l: Look) !void {
+        let ax = b.sub(a).norm();
+        let mut u = vm.v(0.0, 0.0, 1.0).cross(ax);
+        if u.len() < 0.1 {
+            u = vm.v(1.0, 0.0, 0.0).cross(ax);
+        }
+        u = u.norm();
+        let w = ax.cross(u);
+        let base = self.count();
+        let len = b.sub(a).len();
+        let slope = (ra - rb) / @max(len, 1.0e-6);
+        for k in 0..(sides + 1) {
+            let t = (6.2831853 * @float_from_int(f32, k)) / @float_from_int(f32, sides);
+            let d = u.scale(math.cosf(t)).add(w.scale(math.sinf(t)));
+            let n = d.add(ax.scale(slope)).norm();
+            _ = self.vert(a.add(d.scale(ra)), n, l)!;
+            _ = self.vert(b.add(d.scale(rb)), n, l)!;
+        }
+        for k in 0..sides {
+            let i = base + (k * 2);
+            self.quad_idx(i, i + 2, i + 3, i + 1)!;
+        }
+        if caps {
+            self.disc(b, ax, rb, sides, l)!;
+            self.disc(a, ax.scale(-1.0), ra, sides, l)!;
+        }
+    }
+
+    pub fn cylinder(self: *mut Mesh, a: vm.V3, b: vm.V3, r: f32, sides: u32, caps: bool, l: Look) !void {
+        self.cone(a, b, r, r, sides, caps, l)!;
+    }
+
+    /// A disc at c facing n.
+    pub fn disc(self: *mut Mesh, c: vm.V3, n: vm.V3, r: f32, sides: u32, l: Look) !void {
+        let mut u = vm.v(0.0, 0.0, 1.0).cross(n);
+        if u.len() < 0.1 {
+            u = vm.v(1.0, 0.0, 0.0).cross(n);
+        }
+        u = u.norm();
+        let w = n.cross(u);
+        let mid = self.vert(c, n, l)!;
+        let first = self.count();
+        for k in 0..(sides + 1) {
+            let t = (6.2831853 * @float_from_int(f32, k)) / @float_from_int(f32, sides);
+            _ = self.vert(c.add(u.scale(r * math.cosf(t))).add(w.scale(r * math.sinf(t))), n, l)!;
+        }
+        for k in 0..sides {
+            self.tri(mid, first + k, first + k + 1)!;
+        }
+    }
+
+    /// A sphere (uv: longitude and latitude, for the ball's scuffs).
+    pub fn sphere(self: *mut Mesh, c: vm.V3, r: f32, rings: u32, segs: u32, l: Look) !void {
+        let base = self.count();
+        for j in 0..(rings + 1) {
+            let phi = (3.14159265 * @float_from_int(f32, j)) / @float_from_int(f32, rings);
+            for k in 0..(segs + 1) {
+                let th = (6.2831853 * @float_from_int(f32, k)) / @float_from_int(f32, segs);
+                let n = vm.v(math.sinf(phi) * math.cosf(th), math.sinf(phi) * math.sinf(th), math.cosf(phi));
+                _ = self.vertex(c.add(n.scale(r)), n, l, @float_from_int(f32, k) / @float_from_int(f32, segs),
+                                @float_from_int(f32, j) / @float_from_int(f32, rings))!;
+            }
+        }
+        for j in 0..rings {
+            for k in 0..segs {
+                let a = base + (j * (segs + 1)) + k;
+                let b = a + segs + 1;
+                self.quad_idx(a, b, b + 1, a + 1)!;
+            }
+        }
+    }
+
+    /// The top half of an ellipsoid at c: radius r across, h high.
+    pub fn dome(self: *mut Mesh, c: vm.V3, r: f32, h: f32, rings: u32, segs: u32, l: Look) !void {
+        let base = self.count();
+        for j in 0..(rings + 1) {
+            let phi = (1.5707963 * @float_from_int(f32, j)) / @float_from_int(f32, rings);
+            for k in 0..(segs + 1) {
+                let th = (6.2831853 * @float_from_int(f32, k)) / @float_from_int(f32, segs);
+                let s = math.sinf(phi);
+                let q = vm.v(s * math.cosf(th), s * math.sinf(th), math.cosf(phi));
+                let n = vm.v(q.x / r, q.y / r, q.z / h).norm();
+                _ = self.vert(c.add(vm.v(q.x * r, q.y * r, q.z * h)), n, l)!;
+            }
+        }
+        for j in 0..rings {
+            for k in 0..segs {
+                let a = base + (j * (segs + 1)) + k;
+                let b = a + segs + 1;
+                self.quad_idx(a, b, b + 1, a + 1)!;
+            }
+        }
+    }
+
+    /// A torus round the z axis at c: radius big to the tube's middle, the
+    /// tube small.
+    pub fn torus(self: *mut Mesh, c: vm.V3, big: f32, small: f32, segs: u32, sides: u32, l: Look) !void {
+        let base = self.count();
+        for j in 0..(segs + 1) {
+            let a = (6.2831853 * @float_from_int(f32, j)) / @float_from_int(f32, segs);
+            let d = vm.v(math.cosf(a), math.sinf(a), 0.0);
+            for k in 0..(sides + 1) {
+                let b = (6.2831853 * @float_from_int(f32, k)) / @float_from_int(f32, sides);
+                let n = d.scale(math.cosf(b)).add(vm.v(0.0, 0.0, math.sinf(b)));
+                _ = self.vert(c.add(d.scale(big)).add(n.scale(small)), n, l)!;
+            }
+        }
+        for j in 0..segs {
+            for k in 0..sides {
+                let a = base + (j * (sides + 1)) + k;
+                let b = a + sides + 1;
+                self.quad_idx(a, b, b + 1, a + 1)!;
+            }
+        }
+    }
+
+    /// A closed outline (pts in the plane, anticlockwise) stood up from z0
+    /// to z1: smooth sides if `smooth`, and a top.
+    pub fn extrude(self: *mut Mesh, pts: []vm.V3, z0: f32, z1: f32, smooth: bool, top: bool, l: Look) !void {
+        let n = pts.len;
+        for k in 0..n {
+            let a = pts[k];
+            let b = pts[(k + 1) % n];
+            let out = vm.v(b.y - a.y, a.x - b.x, 0.0).norm();
+            let mut na = out;
+            let mut nb = out;
+            if smooth {
+                let p = pts[(k + n - 1) % n];
+                let q = pts[(k + 2) % n];
+                na = out.add(vm.v(a.y - p.y, p.x - a.x, 0.0).norm()).norm();
+                nb = out.add(vm.v(q.y - b.y, b.x - q.x, 0.0).norm()).norm();
+            }
+            let i0 = self.vert(vm.v(a.x, a.y, z0), na, l)!;
+            let i1 = self.vert(vm.v(b.x, b.y, z0), nb, l)!;
+            let i2 = self.vert(vm.v(b.x, b.y, z1), nb, l)!;
+            let i3 = self.vert(vm.v(a.x, a.y, z1), na, l)!;
+            self.quad_idx(i0, i1, i2, i3)!;
+        }
+        if top {
+            // a fan from the middle (the outlines are star-shaped about it)
+            let mut c = vm.zero();
+            for p in pts {
+                c = c.add(p);
+            }
+            c = c.scale(1.0 / @float_from_int(f32, n));
+            let up = vm.v(0.0, 0.0, 1.0);
+            let mid = self.vert(vm.v(c.x, c.y, z1), up, l)!;
+            let first = self.count();
+            for p in pts {
+                _ = self.vert(vm.v(p.x, p.y, z1), up, l)!;
+            }
+            for k in 0..n {
+                self.tri(mid, first + @truncate(u32, k), first + @truncate(u32, (k + 1) % n))!;
+            }
+        }
+    }
+
+    /// A slab round the segment a..b (a stadium r wide each side), z0..z1.
+    pub fn slab(self: *mut Mesh, a: vm.V3, b: vm.V3, r: f32, z0: f32, z1: f32, l: Look) !void {
+        var_slab(self, a, b, r, r, z0, z1, l)!;
+    }
+}
+
+/// An outline round segment a..b, radius ra at a and rb at b (an uneven
+/// capsule, as a flipper is), anticlockwise, `n` points round each end.
+pub fn capsule_outline(a: vm.V3, b: vm.V3, ra: f32, rb: f32, n: usize, out: []mut vm.V3) usize {
+    let d = b.sub(a).flat();
+    let len = @max(d.len(), 1.0e-6);
+    let ang = math.atan2f(d.y, d.x);
+    // the tangent lines' angle off the axis's normal
+    let s = vm.clampf((ra - rb) / len, -0.99, 0.99);
+    let off = math.atan2f(s, @sqrt(1.0 - (s * s)));
+    let mut k: usize = 0;
+    // round b, from its right tangent to its left
+    let half: f32 = 1.5707963;
+    for i in 0..(n + 1) {
+        let t = ((-half + off) + (((2.0 * half) - (2.0 * off)) * @float_from_int(f32, i)) / @float_from_int(f32, n)) + ang;
+        out[k] = b.add(vm.dir(t).scale(rb));
+        k += 1;
+    }
+    // round a, the far way
+    for i in 0..(n + 1) {
+        let t = ((half - off) + (((2.0 * half) + (2.0 * off)) * @float_from_int(f32, i)) / @float_from_int(f32, n)) + ang;
+        out[k] = a.add(vm.dir(t).scale(ra));
+        k += 1;
+    }
+    return k;
+}
+
+fn var_slab(m: *mut Mesh, a: vm.V3, b: vm.V3, ra: f32, rb: f32, z0: f32, z1: f32, l: Look) !void {
+    let mut pts: [40]vm.V3 = [vm.zero(); 40];
+    let mut n: usize = 0;
+    if b.sub(a).flat().len() < 1.0e-5 {
+        for i in @as(usize, 0)..24 {
+            pts[i] = a.add(vm.dir((6.2831853 * @float_from_int(f32, i)) / 24.0).scale(ra));
+        }
+        n = 24;
+    } else {
+        n = capsule_outline(a, b, ra, rb, 9, pts[..]);
+    }
+    m.extrude(pts[..n], z0, z1, true, true, l)!;
+}
+
+pub fn tapered_slab(m: *mut Mesh, a: vm.V3, b: vm.V3, ra: f32, rb: f32, z0: f32, z1: f32, l: Look) !void {
+    var_slab(m, a, b, ra, rb, z0, z1, l)!;
+}
+
+pub fn bytes(p: []f32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}
+
+pub fn index_bytes(p: []u32) []u8 {
+    return @slice_from_ptr(@ptr_cast(*u8, p.ptr), p.len * 4);
+}

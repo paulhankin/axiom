@@ -1,0 +1,227 @@
+// =============================================================================
+// File: art.ax
+// The playfield's artwork, painted with std/graphics/quartz into an image
+// that the playfield's shader reads: a deep blue and violet night with a
+// starburst, rings round the jackpot, stars, the logo, painted lanes and
+// arrows, the inserts as they are unlit (dark coloured plastic) and their
+// legends. The shader lights the inserts over it.
+// =============================================================================
+
+import "std/graphics/image" as image;
+import "std/graphics/quartz" as quartz;
+import "std/math" as math;
+import "table.ax" as tb;
+import "v3.ax" as vm;
+
+// The image covers x0 .. x0 + WIDTH, y0 .. y0 + HEIGHT of the table.
+pub const X0: f32 = -0.28;
+pub const Y0: f32 = -0.03;
+pub const WIDTH: f32 = 0.56;
+pub const PX: u32 = 2048;
+pub const PY: u32 = 4024;
+pub const S: f32 = 3657.142857;  // pixels a metre
+pub const HEIGHT: f32 = 1.100313;  // PY / S
+
+fn c3(r: f32, g: f32, b: f32, a: f32) quartz.Color {
+    return quartz.rgba(r, g, b, a);
+}
+
+// Shapes in the table's metres (y up).
+fn table_space(c: *mut quartz.Canvas) void {
+    c.set_transform(S, 0.0, 0.0, -S, -X0 * S, (Y0 + HEIGHT) * S);
+}
+
+fn px(x: f32) f32 {
+    return (x - X0) * S;
+}
+
+fn py(y: f32) f32 {
+    return ((Y0 + HEIGHT) - y) * S;
+}
+
+// Text centred at (x, y), turned anticlockwise by `angle`.
+fn label(c: *mut quartz.Canvas, f: *quartz.Font, s: []u8, x: f32, y: f32, angle: f32, col: quartz.Color) !void {
+    c.rotate_scale(px(x), py(y), -angle, 1.0);
+    // a shadow, then the text
+    c.text(f, s, px(x) - 600.0 + 4.0, py(y) - 100.0 + 5.0, 1200.0, 200.0, c3(0.0, 0.0, 0.0, 0.55 * col.a))!;
+    c.text(f, s, px(x) - 600.0, py(y) - 100.0, 1200.0, 200.0, col)!;
+    table_space(c);
+}
+
+fn font(c: *mut quartz.Canvas, size: f32, weight: u32) !quartz.Font {
+    let mut f = c.font("Avenir Next Condensed, Futura, Helvetica Neue", size, weight, false)!;
+    f.align(quartz.Align.CENTER, quartz.Align.CENTER);
+    f.no_wrap();
+    return f;
+}
+
+fn ring(c: *mut quartz.Canvas, x: f32, y: f32, r: f32, col: quartz.Color, w: f32) void {
+    c.draw_ellipse(x, y, r, r, col, w);
+}
+
+fn rand(seed: *mut u64) f32 {
+    seed.* = (seed.* *% 6364136223846793005) +% 1442695040888963407;
+    return @float_from_int(f32, seed.* >> 40) / 16777216.0;
+}
+
+// An insert's outline (as the shader's), filled.
+fn insert_shape(c: *mut quartz.Canvas, l: tb.Lamp, grow: f32, col: quartz.Color) !void {
+    let ca = math.cosf(l.angle);
+    let sa = math.sinf(l.angle);
+    if l.shape == tb.SHAPE_ROUND {
+        c.fill_ellipse(l.p.x, l.p.y, l.size + grow, l.size + grow, col);
+        return;
+    }
+    if l.shape == tb.SHAPE_ARROW {
+        let s = l.size + grow;
+        let local: [6]f32 = [s, 0.0, -s * 0.7, s * 0.62, -s * 0.7, -s * 0.62];
+        let mut pts: [6]f32 = [0.0; 6];
+        for k in @as(usize, 0)..3 {
+            let u = local[k * 2];
+            let v = local[(k * 2) + 1];
+            pts[k * 2] = l.p.x + ((u * ca) - (v * sa));
+            pts[(k * 2) + 1] = l.p.y + ((u * sa) + (v * ca));
+        }
+        c.fill_polygon(pts[..], col)!;
+        return;
+    }
+    let w = l.size + grow;
+    let h = (l.size * 0.38) + grow;
+    c.fill_round_rect(l.p.x - w, l.p.y - h, w * 2.0, h * 2.0, h * 0.8, col);
+}
+
+/// The painted playfield, PX x PY, RGBA.
+pub fn paint(t: *tb.Table) !image.Image {
+    let mut c = quartz.Canvas.init(PX, PY)!;
+    defer c.deinit();
+    c.begin();
+    table_space(&mut c);
+    // the night: violet at the bottom to deep blue to teal at the top
+    let bands: usize = 220;
+    for k in 0..bands {
+        let t0 = @float_from_int(f32, k) / @float_from_int(f32, bands);
+        let y = Y0 + (t0 * HEIGHT);
+        let mut col = c3(0.0, 0.0, 0.0, 1.0);
+        if t0 < 0.5 {
+            let u = t0 / 0.5;
+            col = c3(0.20 - (0.17 * u), 0.03 + (0.02 * u), 0.26 - (0.06 * u), 1.0);
+        } else {
+            let u = (t0 - 0.5) / 0.5;
+            col = c3(0.03 - (0.02 * u), 0.05 + (0.09 * u), 0.20 + (0.02 * u), 1.0);
+        }
+        c.fill_rect(X0, y, WIDTH, (HEIGHT / @float_from_int(f32, bands)) + 0.001, col);
+    }
+    // a starburst from behind the bumpers
+    let centre = vm.v(0.0, 0.72, 0.0);
+    for k in @as(usize, 0)..36 {
+        let a0 = (6.2831853 * @float_from_int(f32, k)) / 36.0;
+        let a1 = a0 + 0.075;
+        let far: f32 = 1.4;
+        let pts: [6]f32 = [centre.x, centre.y, centre.x + (math.cosf(a0) * far), centre.y + (math.sinf(a0) * far),
+                           centre.x + (math.cosf(a1) * far), centre.y + (math.sinf(a1) * far)];
+        let mut col = c3(0.35, 0.75, 1.0, 0.07);
+        if (k % 2) == 1 {
+            col = c3(1.0, 0.4, 0.9, 0.05);
+        }
+        c.fill_polygon(pts[..], col)!;
+    }
+    // stars
+    let mut seed: u64 = 77;
+    for k in @as(usize, 0)..900 {
+        _ = k;
+        let x = X0 + (rand(&mut seed) * WIDTH);
+        let y = Y0 + (rand(&mut seed) * HEIGHT);
+        let r = 0.0004 + (rand(&mut seed) * rand(&mut seed) * 0.0016);
+        let b = 0.4 + (rand(&mut seed) * 0.6);
+        c.fill_ellipse(x, y, r, r, c3(b, b, 0.85 + (0.15 * b), 0.8));
+    }
+    // the pad under the bumpers, with rings
+    c.fill_ellipse(0.0, 0.79, 0.145, 0.145, c3(0.02, 0.18, 0.32, 0.55));
+    for k in @as(usize, 0)..5 {
+        ring(&mut c, 0.0, 0.79, 0.06 + (0.022 * @float_from_int(f32, k)), c3(0.3, 0.85, 1.0, 0.35), 0.0012);
+    }
+    // rings round the jackpot
+    for k in @as(usize, 0)..4 {
+        ring(&mut c, 0.0, 0.50, 0.034 + (0.016 * @float_from_int(f32, k)),
+             c3(1.0, 0.3, 0.5, 0.45 - (0.08 * @float_from_int(f32, k))), 0.0016);
+    }
+    // the lanes at the bottom: stripes down the inlanes and outlanes
+    let sides: [2]f32 = [-1.0, 1.0];
+    for s in sides {
+        let lane: [8]f32 = [s * 0.191, 0.36, s * 0.156, 0.36, s * 0.156, 0.25, s * 0.191, 0.23];
+        c.fill_polygon(lane[..], c3(0.95, 0.65, 0.1, 0.22))!;
+        let out_lane: [8]f32 = [s * 0.2345, 0.36, s * 0.199, 0.36, s * 0.199, 0.06, s * 0.2345, 0.06];
+        c.fill_polygon(out_lane[..], c3(0.9, 0.1, 0.15, 0.22))!;
+        // the slingshots' pads
+        let sling: [6]f32 = [s * 0.152, 0.345, s * 0.152, 0.255, s * 0.100, 0.215];
+        c.fill_polygon(sling[..], c3(0.0, 0.0, 0.0, 0.45))!;
+        // guide lines toward the flippers
+        c.line(s * 0.195, 0.235, s * 0.0875, 0.1505, c3(1.0, 0.8, 0.3, 0.6), 0.0018);
+    }
+    // the ramp's and the orbit's lanes
+    let ramp_lane: [8]f32 = [-0.142, 0.47, -0.082, 0.47, -0.11, 0.39, -0.135, 0.39];
+    c.fill_polygon(ramp_lane[..], c3(1.0, 0.6, 0.1, 0.18))!;
+    let orbit_lane: [8]f32 = [0.199, 0.48, 0.234, 0.48, 0.234, 0.80, 0.199, 0.80];
+    c.fill_polygon(orbit_lane[..], c3(0.1, 0.8, 1.0, 0.16))!;
+    let left_lane: [8]f32 = [-0.268, 0.50, -0.22, 0.50, -0.22, 0.90, -0.268, 0.90];
+    c.fill_polygon(left_lane[..], c3(0.1, 0.8, 1.0, 0.1))!;
+    // the drop targets' backing stripe
+    let along = t.drop_b.sub(t.drop_a).norm();
+    let side = vm.v(-along.y, along.x, 0.0);
+    let a = t.drop_a.sub(along.scale(0.01));
+    let b = t.drop_b.add(along.scale(0.01));
+    let strip: [8]f32 = [a.x, a.y, b.x, b.y, b.x + (side.x * 0.05), b.y + (side.y * 0.05), a.x + (side.x * 0.05),
+                         a.y + (side.y * 0.05)];
+    c.fill_polygon(strip[..], c3(1.0, 0.25, 0.1, 0.18))!;
+    // the plunger lane, the apron's shadow, under the flippers
+    c.fill_rect(0.2375, Y0, 0.05, 0.86, c3(0.02, 0.02, 0.03, 0.75));
+    c.fill_rect(X0, Y0, WIDTH, 0.10, c3(0.0, 0.0, 0.0, 0.85));
+    // the saucer's hole
+    c.fill_ellipse(tb.SAUCER.x, tb.SAUCER.y, 0.016, 0.016, c3(0.0, 0.0, 0.0, 1.0));
+    ring(&mut c, tb.SAUCER.x, tb.SAUCER.y, 0.019, c3(0.9, 0.9, 1.0, 0.5), 0.0015);
+    // the inserts, dark: a rim, then the coloured plastic
+    for k in 0..tb.INSERTS {
+        let l = t.lamps[k];
+        if l.size <= 0.0 {
+            continue;
+        }
+        insert_shape(&mut c, l, 0.0016, c3(0.95, 0.95, 0.9, 0.85))!;
+        insert_shape(&mut c, l, 0.0, c3(l.color.x * 0.32, l.color.y * 0.32, l.color.z * 0.32, 1.0))!;
+        // a sheen across the top of the plastic
+        insert_shape(&mut c, tb.Lamp.{ p: l.p.add(vm.v(-l.size * 0.2, l.size * 0.25, 0.0)), size: l.size * 0.45,
+                                       angle: l.angle, shape: l.shape, color: l.color },
+                     0.0, c3(1.0, 1.0, 1.0, 0.12))!;
+    }
+    // words
+    let mut big = font(&mut c, 260.0, quartz.BOLD)!;
+    defer big.release();
+    let mut mid = font(&mut c, 64.0, quartz.BOLD)!;
+    defer mid.release();
+    let mut small = font(&mut c, 46.0, quartz.BOLD)!;
+    defer small.release();
+    let white = c3(1.0, 1.0, 1.0, 0.95);
+    label(&mut c, &big, "AXIOM", 0.0, 0.29, 0.0, c3(1.0, 0.85, 0.35, 1.0))!;
+    label(&mut c, &small, "P  I  N  B  A  L  L", 0.0, 0.255, 0.0, c3(0.6, 0.9, 1.0, 0.95))!;
+    label(&mut c, &mid, "JACKPOT", 0.0, 0.465, 0.0, c3(1.0, 0.5, 0.6, 1.0))!;
+    label(&mut c, &mid, "LOCK", -0.074, 0.505, 0.0, white)!;
+    label(&mut c, &mid, "RAMP", -0.112, 0.378, 0.30, white)!;
+    label(&mut c, &mid, "ORBIT", 0.170, 0.405, -0.12, white)!;
+    label(&mut c, &small, "SHOOT AGAIN", 0.0, 0.148, 0.0, c3(1.0, 0.75, 0.6, 0.95))!;
+    label(&mut c, &small, "SUPER", 0.0, 0.585, 0.0, white)!;
+    let lanes: [3][]u8 = ["A", "X", "M"];
+    for k in @as(usize, 0)..3 {
+        let l = t.lamps[tb.L_LANE + k];
+        label(&mut c, &small, lanes[k], l.p.x, l.p.y, 0.0, c3(1.0, 1.0, 1.0, 0.8))!;
+    }
+    let mults: [4][]u8 = ["2X", "3X", "4X", "5X"];
+    for k in @as(usize, 0)..4 {
+        let l = t.lamps[tb.L_BONUS + k];
+        label(&mut c, &small, mults[k], l.p.x, l.p.y, 0.0, c3(1.0, 1.0, 1.0, 0.85))!;
+    }
+    label(&mut c, &small, "BONUS", 0.0, 0.43, 0.0, c3(1.0, 0.85, 0.5, 0.9))!;
+    label(&mut c, &small, "SPECIAL", -0.2165, 0.245, 1.5707963, c3(1.0, 0.4, 0.3, 0.8))!;
+    label(&mut c, &small, "SPECIAL", 0.2165, 0.245, -1.5707963, c3(1.0, 0.4, 0.3, 0.8))!;
+    label(&mut c, &small, "SKILL SHOT", 0.2545, 0.55, 1.5707963, c3(0.6, 0.9, 1.0, 0.8))!;
+    c.end()!;
+    return c.to_image();
+}
