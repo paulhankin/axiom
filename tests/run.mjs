@@ -12,7 +12,12 @@
 //   // header: name.h          generate a C header for the exports (for the C source)
 //
 // Usage: node tests/run.mjs [--native] [--filter=substr] [-O2] [--units=module|program] [-g]
-import { spawnSync } from 'child_process';
+//
+// Environment: AXIOM_TEST_JOBS (tests run at a time; default the CPUs, 1 is
+// serial); AXIOM_TEST_SKIP_PLATFORM=1 skips what does not depend on the
+// target and flags (fmt, macOS, Windows, the wasm32 check of selfhost/src,
+// a large example), for runs after the first of several configurations.
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
@@ -32,12 +37,54 @@ const nativeTarget = `--target=${process.env.AXIOM_NATIVE_TARGET || 'native'}`;
 // tests that call C are skipped.
 const noC = /windows|macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '');
 const execWrap = (process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => x);
-// Emulated tests run several times slower: give each test a minute.
-const testTimeout = execWrap.length ? ['--timeout=60000'] : [];
 const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a) || a === '-g');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'axiom-tests-'));
+const jobs = Math.max(1, Number(process.env.AXIOM_TEST_JOBS) || os.availableParallelism());
+const skipPlatform = !!process.env.AXIOM_TEST_SKIP_PLATFORM && process.env.AXIOM_TEST_SKIP_PLATFORM !== '0';
+// Emulated tests run several times slower, and tests sharing the CPUs
+// slower too: give each test a minute.
+const testTimeout = execWrap.length || jobs > 1 ? ['--timeout=60000'] : [];
+
+// spawnSync's result ({ status, signal, stdout, stderr, error }; text), as a
+// promise. Honors cwd, env and timeout.
+function spawnAsync(cmd, args, opts = {}) {
+  const { timeout, encoding, maxBuffer, ...rest } = opts;
+  return new Promise((resolve) => {
+    const out = [], err = [];
+    let error, timer, done = false;
+    const finish = (status, signal) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ status, signal, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8'), error });
+    };
+    let p;
+    try { p = spawn(cmd, args, { ...rest, stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { error = e; finish(null, null); return; }
+    p.stdout.on('data', (b) => out.push(b));
+    p.stderr.on('data', (b) => err.push(b));
+    p.on('error', (e) => { error = e; if (p.pid === undefined) finish(null, null); });
+    p.on('close', finish);
+    if (timeout) timer = setTimeout(() => { error = Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); p.kill('SIGTERM'); }, timeout);
+  });
+}
+const spawnExeAsync = (exe, args, opts) => execWrap.length ? spawnAsync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnAsync(exe, args, opts);
+
+// Runs fn over items, `jobs` at a time, and reports the results in order.
+async function inOrder(items, fn) {
+  const results = new Array(items.length), done = new Array(items.length).fill(false);
+  let next = 0, shown = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+      done[i] = true;
+      while (shown < items.length && done[shown]) report(results[shown++]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(jobs, items.length) }, worker));
+}
 
 function files(dir) {
   return fs.readdirSync(dir).filter(f => f.endsWith('.ax')).map(f => path.join(dir, f)).sort();
@@ -62,8 +109,8 @@ function directives(src) {
 
 async function runWasm(file) {
   // Output from the test print helpers (env) and from fd 1 (std/io) is
-  // collected as one text stream, in order.
-  let text = '';
+  // collected as one text stream, in order; fd 2's is kept for the report.
+  let text = '', errText = '';
   let mem;
   const dec = new TextDecoder();
   const line = (s) => { text += s + '\n'; };
@@ -71,6 +118,10 @@ async function runWasm(file) {
     write: (fd, bytes) => {
       if (fd === 1) {
         text += dec.decode(bytes);
+        return bytes.length;
+      }
+      if (fd === 2) {
+        errText += dec.decode(bytes);
         return bytes.length;
       }
       return fs.writeSync(fd, bytes);
@@ -88,17 +139,17 @@ async function runWasm(file) {
   const lines = () => { const o = text.split('\n'); if (o[o.length - 1] === '') o.pop(); return o; };
   try {
     (instance.exports.run || instance.exports.main)();
-    return { out: lines(), trapped: false };
+    return { out: lines(), trapped: false, stderr: errText };
   } catch (e) {
-    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) return { out: lines(), trapped: true, msg: e.message };
+    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) return { out: lines(), trapped: true, msg: e.message, stderr: errText };
     throw e;
   } finally {
     host.close();
   }
 }
 
-function runNative(exe) {
-  const r = spawnExe(exe, [], { encoding: 'utf8' });
+async function runNative(exe) {
+  const r = await spawnExeAsync(exe, [], { encoding: 'utf8' });
   const out = r.stdout.split('\n');
   if (out[out.length - 1] === '') out.pop();
   return { out, trapped: r.status !== 0, msg: r.signal || `exit ${r.status}` };
@@ -106,22 +157,35 @@ function runNative(exe) {
 
 let pass = 0, fail = 0, skip = 0;
 const failures = [];
-for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root, 'tests/errors'))]) {
+// A result: null (filtered out), { skip: true }, or { name, problem, ms, stderr }.
+function report(r) {
+  if (!r) return;
+  if (r.skip) { skip++; return; }
+  if (r.stderr) process.stderr.write(r.stderr);
+  if (r.problem) { fail++; failures.push(`FAIL ${r.name}: ${r.problem}`); console.log(`FAIL ${r.name}`); }
+  else { pass++; console.log(`ok   ${r.name}${r.ms === undefined ? '' : ` (${r.ms.toFixed(0)} ms)`}`); }
+}
+// Each test builds in a directory of its own (tests/run and tests/errors
+// share names).
+await inOrder([...files(path.join(root, 'tests/run')), ...files(path.join(root, 'tests/errors'))], async (f) => {
   const name = path.relative(root, f);
-  if (filter && !name.includes(filter)) continue;
-  const d = directives(fs.readFileSync(f, 'utf8'));
-  if ((native && d.wasmOnly) || (!native && d.nativeOnly)) { skip++; continue; }
-  if (native && noC && (d.links.length || /extern "C"/.test(fs.readFileSync(f, 'utf8')))) { skip++; continue; }
-  const out = path.join(tmp, path.basename(f, '.ax') + (native ? '' : '.wasm'));
+  if (filter && !name.includes(filter)) return null;
+  const src = fs.readFileSync(f, 'utf8');
+  const d = directives(src);
+  if ((native && d.wasmOnly) || (!native && d.nativeOnly)) return { skip: true };
+  if (native && noC && (d.links.length || /extern "C"/.test(src))) return { skip: true };
+  const dir = path.join(tmp, path.basename(path.dirname(f)) + '-' + path.basename(f, '.ax'));
+  fs.mkdirSync(dir);
+  const out = path.join(dir, path.basename(f, '.ax') + (native ? '' : '.wasm'));
   const args = ['build', f, '--format=agent-json', '-o', out, ...d.flags, ...extraFlags];
   if (native) args.push(nativeTarget, `--link=${path.join(root, noC ? 'tests/native_rt.ax' : 'tests/native_rt.c')}`);
   if (native && process.arch === 'x64' && !process.env.AXIOM_NATIVE_TARGET) args.push(...d.x64Flags);
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
-  if (d.header) args.push(`--emit-header=${path.join(tmp, d.header)}`);
+  if (d.header) args.push(`--emit-header=${path.join(dir, d.header)}`);
   const t0 = process.hrtime.bigint();
-  const c = spawnSync(compiler, args, { encoding: 'utf8' });
+  const c = await spawnAsync(compiler, args, { encoding: 'utf8' });
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-  let problem = null;
+  let problem = null, stderr = '';
   let json = null;
   try { json = JSON.parse(c.stdout); } catch { json = null; }
   if (d.errors.length) {
@@ -131,15 +195,15 @@ for (const f of [...files(path.join(root, 'tests/run')), ...files(path.join(root
   } else if (c.status !== 0) {
     problem = `compilation failed:\n${c.stdout}${c.stderr}`;
   } else {
-    const r = native ? runNative(out) : await runWasm(out);
+    const r = native ? await runNative(out) : await runWasm(out);
+    stderr = r.stderr;
     if (d.trap && !r.trapped) problem = 'expected a trap, but run completed';
     if (!d.trap && r.trapped) problem = `unexpected trap: ${r.msg}`;
     const want = d.expect.join('\n'), got = r.out.join('\n');
     if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;
   }
-  if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
-  else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
-}
+  return { name, problem, ms, stderr };
+});
 // `axiom test`: the standard library's own tests must pass, and the
 // self-tests in tests/testing/ must produce exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];
@@ -150,13 +214,13 @@ function dirsUnder(dir) {
 }
 const stdDirs = dirsUnder(path.join(root, 'std'));
 const stdFiles = stdDirs.flatMap(files).filter((f) => /^test "/m.test(fs.readFileSync(f, 'utf8')));
-for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
+await inOrder([...stdFiles, ...files(path.join(root, 'tests/testing'))], async (f) => {
   const name = path.relative(root, f) + ' [axiom test]';
-  if (filter && !name.includes(filter)) continue;
+  if (filter && !name.includes(filter)) return null;
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
   const t0 = process.hrtime.bigint();
-  const c = spawnSync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...d.flags, ...extraFlags], { encoding: 'utf8' });
+  const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...d.flags, ...extraFlags], { encoding: 'utf8' });
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   let problem = null;
   let json = null;
@@ -176,9 +240,8 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
       if (!problem && json.tests.length !== want.length) problem = `expected ${want.length} tests, got ${json.tests.length}`;
     }
   }
-  if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
-  else { pass++; console.log(`ok   ${name} (${ms.toFixed(0)} ms)`); }
-}
+  return { name, problem, ms };
+});
 
 // Stack traces (spec §16.4): `// stack:` and `// errors:` lines in
 // tests/traces/traces.ax give the expected frames of each failing test, and
@@ -224,19 +287,19 @@ for (const f of [...stdFiles, ...files(path.join(root, 'tests/testing'))]) {
 // built with --sanitize=address. Each states its exit status ("// status: N",
 // or "trap" for T0012) and lines its stderr must contain ("// stderr: ...");
 // "// status: 0" programs must not report anything.
-for (const f of files(path.join(root, 'tests/sanitize'))) {
+await inOrder(files(path.join(root, 'tests/sanitize')), async (f) => {
   const name = path.relative(root, f) + ' [--sanitize=address]';
-  if (filter && !name.includes(filter)) continue;
+  if (filter && !name.includes(filter)) return null;
   const src = fs.readFileSync(f, 'utf8');
   const st = (src.match(/^\/\/ status: (\w+)/m) || [null, '0'])[1];
   const wants = [...src.matchAll(/^\/\/ stderr: (.+)$/gm)].map((m) => m[1].trim());
   const out = path.join(tmp, 'asan-' + path.basename(f, '.ax') + (native ? '' : '.wasm'));
-  const b = spawnSync(compiler, ['build', f, '--sanitize=address', '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags],
+  const b = await spawnAsync(compiler, ['build', f, '--sanitize=address', '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags],
     { encoding: 'utf8' });
   let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
   if (!problem) {
-    const r = native ? spawnExe(out, [], { encoding: 'utf8' })
-      : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+    const r = native ? await spawnExeAsync(out, [], { encoding: 'utf8' })
+      : await spawnAsync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
     if (st === 'trap') {
       if (r.status === 0 || !/trap T0012 \(memory error\)/.test(r.stderr)) problem = `expected trap T0012, got status ${r.status}:\n${r.stderr}`;
     } else if (r.status !== Number(st)) {
@@ -245,9 +308,8 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
     if (!problem && st === '0' && /AddressSanitizer/.test(r.stderr)) problem = `unexpected report:\n${r.stderr}`;
     for (const w of wants) if (!problem && !r.stderr.includes(w)) problem = `stderr lacks "${w}":\n${r.stderr}`;
   }
-  if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
-  else { pass++; console.log(`ok   ${name}`); }
-}
+  return { name, problem };
+});
 
 // Instruction selection: each "// lower: <flags> | <regex> | <count>" line
 // of tests/lowering/*.ax builds the file with --emit=asm and those flags,
@@ -256,22 +318,22 @@ for (const f of files(path.join(root, 'tests/sanitize'))) {
 // --emit=asm (the self-hosted one) is checked on its object file as
 // objdump disassembles it (AT&T syntax, as LLVM's): its x86-64 lines, where
 // objdump is installed; it skips the others.
-for (const f of files(path.join(root, 'tests/lowering'))) {
+await inOrder(files(path.join(root, 'tests/lowering')), async (f) => {
   const name = path.relative(root, f) + ' [instruction selection]';
-  if (filter && !name.includes(filter)) continue;
+  if (filter && !name.includes(filter)) return null;
   let problem = null, checked = 0;
   for (const [, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower: (.+?) \| (.+?) \| (\d+)$/gm)) {
     const fl = flags.trim().split(/\s+/);
     if (fl.includes('--target=native') && (process.arch !== 'x64' || process.env.AXIOM_NATIVE_TARGET)) continue;
-    const out = path.join(tmp, 'lower.s');
-    const c = spawnSync(compiler, ['build', f, '--emit=asm', '-o', out, ...fl], { encoding: 'utf8' });
+    const out = path.join(tmp, `lower-${path.basename(f, '.ax')}.s`);
+    const c = await spawnAsync(compiler, ['build', f, '--emit=asm', '-o', out, ...fl], { encoding: 'utf8' });
     let text = null;
     if (c.status !== 0 && /--emit=asm is not supported/.test(c.stderr + c.stdout)) {
       if (!fl.includes('--target=native')) continue;
-      const obj = path.join(tmp, 'lower.o');
-      const o = spawnSync(compiler, ['build', f, '--emit=obj', '-o', obj, ...fl], { encoding: 'utf8' });
+      const obj = path.join(tmp, `lower-${path.basename(f, '.ax')}.o`);
+      const o = await spawnAsync(compiler, ['build', f, '--emit=obj', '-o', obj, ...fl], { encoding: 'utf8' });
       if (o.status !== 0) { problem = `${flags}: build failed:\n${o.stdout}${o.stderr}`; break; }
-      const d = spawnSync('objdump', ['-d', '--no-show-raw-insn', obj], { encoding: 'utf8', maxBuffer: 1 << 28 });
+      const d = await spawnAsync('objdump', ['-d', '--no-show-raw-insn', obj]);
       if (d.error || d.status !== 0) continue;
       text = d.stdout;
     } else if (c.status !== 0) {
@@ -283,10 +345,9 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
     const n = (text.match(new RegExp(re, 'g')) || []).length;
     if (n !== Number(count)) { problem = `${flags}: /${re}/ matches ${n} times, expected ${count}`; break; }
   }
-  if (!problem && checked === 0) { skip++; continue; }
-  if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
-  else { pass++; console.log(`ok   ${name}`); }
-}
+  if (!problem && checked === 0) return { skip: true };
+  return { name, problem };
+});
 
 // Profiling (spec §16.6).
 {
@@ -353,7 +414,7 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
 // The self-hosted compiler reaches the system only through the host ABI, so
 // it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
 // usize assumptions.
-{
+if (!skipPlatform) {
   const name = 'selfhost/src checks for wasm32';
   if (!filter || name.includes(filter)) {
     const c = spawnSync(compiler, ['check', path.join(root, 'selfhost/src/main.ax'), '--target=wasm32'], { encoding: 'utf8' });
@@ -398,7 +459,7 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
 // tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left
 // alone; the repository's own sources are canonical.
-{
+if (!skipPlatform) {
   const fdir = path.join(root, 'tests/fmt');
   const fmt = (args) => spawnSync(compiler, ['fmt', ...args], { encoding: 'utf8', cwd: root });
   const probe = fmt(['--check', path.join(fdir, 'layout.expected')]);
@@ -452,7 +513,7 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
 // kernel would; the compiler itself is among them. On a Mac they also run
 // (and the whole suite runs natively with AXIOM_NATIVE_TARGET=aarch64-macos);
 // elsewhere `axiom test` for the target says it needs a Mac.
-{
+if (!skipPlatform) {
   const onMac = process.platform === 'darwin' && os.arch() === 'arm64';
   const out = (n) => path.join(tmp, 'macos-' + n);
   const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=aarch64-macos', '-o', out(n), ...extra],
@@ -541,7 +602,7 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
 // compiler itself are cross-built for --target=x86_64-windows and their PE
 // headers checked; with Wine installed they also run (the whole suite runs
 // on Windows with AXIOM_NATIVE_TARGET=x86_64-windows AXIOM_NATIVE_EXEC=wine64).
-{
+if (!skipPlatform) {
   const out = (n) => path.join(tmp, `windows-${n}.exe`);
   const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'windows-cache'), WINEDEBUG: process.env.WINEDEBUG || '-all' };
   const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=x86_64-windows', '-o', out(n), ...extra],
@@ -750,7 +811,8 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
     const out = path.join(tmp, 'pkg-' + path.basename(dir) + (native ? '' : '.wasm'));
     const c = ph(['build', dir, '--format=agent-json', '-o', out, ...tgt], cwd);
     if (c.status !== 0) return { problem: `compilation failed:\n${c.stdout}${c.stderr}` };
-    const r = native ? runNative(out) : await runWasm(out);
+    const r = native ? await runNative(out) : await runWasm(out);
+    if (r.stderr) process.stderr.write(r.stderr);
     return { out: r.out.join('\n'), trapped: r.trapped };
   }
   function tested(dir, cwd) {
@@ -818,6 +880,7 @@ for (const f of files(path.join(root, 'tests/lowering'))) {
       return j.status === 'pass' && j.tests.length >= 17 ? null : JSON.stringify(j).slice(0, 2000);
     },
   };
+  if (skipPlatform) delete cases['the solver example (examples/solver)'];
   for (const [cname, fn] of Object.entries(cases)) {
     const name = `packages: ${cname}`;
     if (filter && !name.includes(filter)) continue;

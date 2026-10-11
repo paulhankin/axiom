@@ -15,28 +15,32 @@ OLD=compiler/build/axiom
 pass=0
 fail=0
 
-files=$(find tests std examples selfhost/src -name '*.ax' | sort)
-for f in $files; do
-    a=$($OLD check "$f" --format=agent-json 2>&1; echo "status $?")
-    b=$($NEW check "$f" --format=agent-json 2>&1; echo "status $?")
-    if [ "$a" = "$b" ]; then
-        pass=$((pass + 1))
-    else
-        fail=$((fail + 1))
-        echo "DIFF check $f"
-    fi
-done
+# Each file's verdict ("same f" or "DIFF check f"), several files at a time.
+export OLD NEW
+out=$(find tests std examples selfhost/src -name '*.ax' | sort |
+    xargs -P "$(nproc 2>/dev/null || echo 4)" -n 16 sh -c '
+        for f; do
+            a=$($OLD check "$f" --format=agent-json 2>&1; echo "status $?")
+            b=$($NEW check "$f" --format=agent-json 2>&1; echo "status $?")
+            if [ "$a" = "$b" ]; then echo "same $f"; else echo "DIFF check $f"; fi
+        done' sh)
+pass=$(printf '%s\n' "$out" | grep -c '^same ')
+fail=$(printf '%s\n' "$out" | grep -c '^DIFF ')
+printf '%s\n' "$out" | grep '^DIFF ' | sort -k3
 echo "diagnostics: $pass identical, $fail different"
 
+# The sections that do not depend on the configuration run with the first.
+skip_platform=
 suite() {
     echo "suite: $*"
-    if ! AXIOM=$NEW node tests/run.mjs "$@" > /tmp/axiom-difftest.$$ 2>&1; then
+    if ! AXIOM=$NEW AXIOM_TEST_SKIP_PLATFORM=$skip_platform node tests/run.mjs "$@" > /tmp/axiom-difftest.$$ 2>&1; then
         grep -v '^ok' /tmp/axiom-difftest.$$
         fail=$((fail + 1))
     else
         tail -1 /tmp/axiom-difftest.$$
     fi
     rm -f /tmp/axiom-difftest.$$
+    skip_platform=1
 }
 suite
 suite -O2
