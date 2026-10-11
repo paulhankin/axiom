@@ -2917,44 +2917,56 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
     if not u.isnos(e.capture) {
         e.capture_local = declare_local(e.capture, e.capture_span, ty.t_error, false, false);
     }
-    let hk = e.hkind;
-    if hk == ast.H_VALUE {
-        if vt.kind == ast.TY_VOID {
-            // For !void only a diverging handler (e.g. @trap()) makes sense.
-            let ht = check_expr(e.hexpr, tnil());
-            if (ht.kind != ast.TY_NEVER) and (ht.kind != ast.TY_INVALID) {
-                _ = dg.err(e.hexpr.span, "E0613", "a fallback value makes no sense for !void; use a block");
+    match e.handler {
+        .Value(h) => {
+            let mut x = h;
+            if vt.kind == ast.TY_VOID {
+                // For !void only a diverging handler (e.g. @trap()) makes sense.
+                let ht = check_expr(x, tnil());
+                if (ht.kind != ast.TY_NEVER) and (ht.kind != ast.TY_INVALID) {
+                    _ = dg.err(x.span, "E0613", "a fallback value makes no sense for !void; use a block");
+                }
+            } else {
+                _ = check_expr_to(&mut x, vt);
             }
-        } else {
-            _ = check_expr_to(&mut e.hexpr, vt);
+            e.handler = ast.Handler.Value(x);
         }
-    } else if hk == ast.H_RETURN {
-        if u.notnil(e.hexpr) {
-            check_return_value(&mut e.hexpr, e.span);
-        } else {
-            check_return_value(u.nil.[*mut ast.Expr](), e.span);
+        .Return(h) => {
+            let mut x = h;
+            if u.notnil(x) {
+                check_return_value(&mut x, e.span);
+            } else {
+                check_return_value(u.nil.[*mut ast.Expr](), e.span);
+            }
+            e.handler = ast.Handler.Return(x);
         }
-    } else if (hk == ast.H_BREAK) or (hk == ast.H_CONTINUE) {
-        if C.loop_depth == 0 {
-            _ = dg.err(e.span, "E0604", u.f1("'%s' outside of a loop", u.pick(hk == ast.H_BREAK, "break", "continue")));
-        } else {
-            _ = check_leave_ok(e.span, true);
-        }
-        if (hk == ast.H_BREAK) and (C.loop_breaks.len > 0) {
-            C.loop_breaks.set(C.loop_breaks.len - 1, true);
-        }
-    } else if hk == ast.H_BLOCK {
-        // For !void the block may complete normally: execution continues after
-        // the expression. For !T there is no value to produce, so it must diverge.
-        if not check_block(e.hblock) and (vt.kind != ast.TY_VOID) and (vt.kind != ast.TY_INVALID) {
-            _ = dg.err(e.hblock.span, "E0612",
-                       u.f1("this 'catch' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use 'catch <value>')",
-                            tstr(vt)));
+        .Break    => { check_catch_jump(e, true); }
+        .Continue => { check_catch_jump(e, false); }
+        .Block(blk) => {
+            // For !void the block may complete normally: execution continues after
+            // the expression. For !T there is no value to produce, so it must diverge.
+            if not check_block(blk) and (vt.kind != ast.TY_VOID) and (vt.kind != ast.TY_INVALID) {
+                _ = dg.err(blk.span, "E0612",
+                           u.f1("this 'catch' block must not complete normally, because the expression needs a value of type %s (end it with return, break, continue or @trap(), or use 'catch <value>')",
+                                tstr(vt)));
+            }
         }
     }
     scope_pop();
     e.ty = vt;
     return e.ty;
+}
+
+// catch break / catch continue
+fn check_catch_jump(e: *mut ast.Expr, is_break: bool) void {
+    if C.loop_depth == 0 {
+        _ = dg.err(e.span, "E0604", u.f1("'%s' outside of a loop", u.pick(is_break, "break", "continue")));
+    } else {
+        _ = check_leave_ok(e.span, true);
+    }
+    if is_break and (C.loop_breaks.len > 0) {
+        C.loop_breaks.set(C.loop_breaks.len - 1, true);
+    }
 }
 
 fn check_try(e: *mut ast.Expr) *mut ast.Type {
@@ -4330,8 +4342,15 @@ fn check_block(b: *mut ast.Stmt) bool {
 }
 
 fn is_leaving_catch(e: *mut ast.Expr) bool {
-    return u.notnil(e) and (e.kind == ast.E_CATCH) and
-           ((e.hkind == ast.H_RETURN) or (e.hkind == ast.H_BREAK) or (e.hkind == ast.H_CONTINUE));
+    if u.isnil(e) or (e.kind != ast.E_CATCH) {
+        return false;
+    }
+    match e.handler {
+        .Return   => { return true; }
+        .Break    => { return true; }
+        .Continue => { return true; }
+        else      => { return false; }
+    }
 }
 
 fn conv_probe(t: *mut ast.Type, sp: u.Span) *mut ast.Expr {
@@ -5277,8 +5296,10 @@ fn gate_expr(e: *ast.Expr, feats: u64) void {
     for i in 0..e.inits.len {
         gate_expr(e.inits.at(i).value, feats);
     }
-    gate_expr(e.hexpr, feats);
-    gate_stmt(e.hblock, feats);
+    if e.kind == ast.E_CATCH {
+        gate_expr(ast.handler_expr(e), feats);
+        gate_stmt(ast.handler_block(e), feats);
+    }
 }
 
 fn gate_stmt(s: *ast.Stmt, feats: u64) void {
