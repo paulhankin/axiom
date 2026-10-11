@@ -158,9 +158,7 @@ fn parse_generic_arg_list(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]) 
     while (pk(P) != lx.TK_RBRACKET) and (pk(P) != lx.TK_EOF) {
         if pk(P) == lx.TK_INT {
             let t = advance(P);
-            let te = ast.new_te(ast.TE_INTLIT, t.span);
-            te.ival = t.ival;
-            out.push(te);
+            out.push(ast.new_te(ast.TypeShape.IntLit(t.ival), t.span));
         } else {
             out.push(parse_type(P));
         }
@@ -171,130 +169,126 @@ fn parse_generic_arg_list(P: *mut Parser, out: *mut u.List.[*mut ast.TypeExpr]) 
     _ = expect(P, lx.TK_RBRACKET);
 }
 
+// The named type `n`, unqualified and without arguments so far.
+fn named_type(n: *lx.Token) ast.NamedType {
+    return ast.NamedType.{ qual: u.nosym(), name: n.name, name_span: n.span, args: u.List.[*mut ast.TypeExpr].empty(),
+                           has_args: false };
+}
+
+// An array's length, after '['.
+fn parse_array_len(P: *mut Parser) *mut ast.TypeExpr {
+    if pk(P) == lx.TK_INT {
+        let n = advance(P);
+        return ast.new_te(ast.TypeShape.IntLit(n.ival), n.span);
+    }
+    if pk(P) == lx.TK_IDENT {
+        let n = advance(P);
+        let mut nt = named_type(n);
+        let mut sp = n.span;
+        if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_IDENT) {
+            _ = advance(P);
+            let m = advance(P);
+            nt.qual = nt.name;
+            nt.name = m.name;
+            nt.name_span = m.span;
+            sp = u.span_join(n.span, m.span);
+        }
+        return ast.new_te(ast.TypeShape.Named(nt), sp);
+    }
+    syntax_error(P, "array length");
+    return u.nil.[ast.TypeExpr]();
+}
+
 fn parse_type(P: *mut Parser) *mut ast.TypeExpr {
     let t = peek(P);
     let start = t.span;
     let k = t.kind;
     if k == lx.TK_BANG {
         _ = advance(P);
-        let te = ast.new_te(ast.TE_ERRUNION, start);
-        te.elem = parse_type(P);
-        te.span = sp_from(P, start);
-        return te;
+        let elem = parse_type(P);
+        return ast.new_te(ast.TypeShape.ErrUnion(elem), sp_from(P, start));
     }
     if k == lx.TK_STAR {
         _ = advance(P);
-        let te = ast.new_te(ast.TE_PTR, start);
-        te.is_mut = accept(P, lx.KW_MUT);
-        te.elem = parse_type(P);
-        te.span = sp_from(P, start);
-        return te;
+        let is_mut = accept(P, lx.KW_MUT);
+        let pt = ast.PtrType.{ elem: parse_type(P), is_mut: is_mut };
+        return ast.new_te(ast.TypeShape.Ptr(pt), sp_from(P, start));
     }
     if k == lx.TK_LBRACKET {
         _ = advance(P);
         if accept(P, lx.TK_RBRACKET) {
-            let te = ast.new_te(ast.TE_SLICE, start);
-            te.is_mut = accept(P, lx.KW_MUT);
-            te.elem = parse_type(P);
-            te.span = sp_from(P, start);
-            return te;
+            let is_mut = accept(P, lx.KW_MUT);
+            let pt = ast.PtrType.{ elem: parse_type(P), is_mut: is_mut };
+            return ast.new_te(ast.TypeShape.Slice(pt), sp_from(P, start));
         }
-        let te = ast.new_te(ast.TE_ARRAY, start);
-        if pk(P) == lx.TK_INT {
-            let n = advance(P);
-            te.len = ast.new_te(ast.TE_INTLIT, n.span);
-            te.len.ival = n.ival;
-        } else if pk(P) == lx.TK_IDENT {
-            let n = advance(P);
-            te.len = ast.new_te(ast.TE_NAMED, n.span);
-            te.len.name = n.name;
-            te.len.name_span = n.span;
-            if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_IDENT) {
-                _ = advance(P);
-                let m = advance(P);
-                te.len.qual = te.len.name;
-                te.len.name = m.name;
-                te.len.name_span = m.span;
-                te.len.span = u.span_join(n.span, m.span);
-            }
-        } else {
-            syntax_error(P, "array length");
-        }
+        let len = parse_array_len(P);
         _ = expect(P, lx.TK_RBRACKET);
-        te.elem = parse_type(P);
-        te.span = sp_from(P, start);
-        return te;
+        let at = ast.ArrayType.{ elem: parse_type(P), len: len };
+        return ast.new_te(ast.TypeShape.Array(at), sp_from(P, start));
     }
     if k == lx.KW_FN {
         _ = advance(P);
-        let te = ast.new_te(ast.TE_FN, start);
+        let mut ps = u.List.[*mut ast.TypeExpr].empty();
         _ = expect(P, lx.TK_LPAREN);
         while (pk(P) != lx.TK_RPAREN) and (pk(P) != lx.TK_EOF) {
-            te.args.push(parse_type(P));
+            ps.push(parse_type(P));
             if not accept(P, lx.TK_COMMA) {
                 break;
             }
         }
         _ = expect(P, lx.TK_RPAREN);
-        te.elem = parse_type(P);
-        te.span = sp_from(P, start);
-        return te;
+        let ft = ast.FnType.{ params: ps, ret: parse_type(P) };
+        return ast.new_te(ast.TypeShape.Fn(ft), sp_from(P, start));
     }
     if k == lx.KW_STRUCT {
         _ = advance(P);
-        let te = ast.new_te(ast.TE_ANON_STRUCT, start);
+        let mut fields = u.List.[ast.Field].empty();
         _ = expect(P, lx.TK_LBRACE);
-        parse_field_list(P, &mut te.fields);
+        parse_field_list(P, &mut fields);
         _ = expect(P, lx.TK_RBRACE);
-        te.span = sp_from(P, start);
-        return te;
+        return ast.new_te(ast.TypeShape.AnonStruct(fields), sp_from(P, start));
     }
     if k == lx.KW_ERROR {
         _ = advance(P);
-        return ast.new_te(ast.TE_ERROR, start);
+        return ast.new_te(ast.TypeShape.Error, start);
     }
     if k == lx.KW_SELF {
         _ = advance(P);
-        return ast.new_te(ast.TE_SELF, start);
+        return ast.new_te(ast.TypeShape.SelfType, start);
     }
     if k == lx.TK_PRIM {
         _ = advance(P);
-        let te = ast.new_te(ast.TE_PRIM, start);
-        te.prim = t.prim;
-        return te;
+        return ast.new_te(ast.TypeShape.Prim(t.prim), start);
     }
     if k == lx.TK_IDENT {
         _ = advance(P);
-        let te = ast.new_te(ast.TE_NAMED, start);
-        te.name = t.name;
-        te.name_span = t.span;
+        let mut nt = named_type(t);
         // NamedType ::= IDENT ( "." ( IDENT GenericArgs? | "[" GenericArgList "]" ) )?
         if pk(P) == lx.TK_DOT {
             let k2 = peek2(P).kind;
             if k2 == lx.TK_IDENT {
                 _ = advance(P);
                 let m = advance(P);
-                te.qual = te.name;
-                te.name = m.name;
-                te.name_span = m.span;
+                nt.qual = nt.name;
+                nt.name = m.name;
+                nt.name_span = m.span;
                 if (pk(P) == lx.TK_DOT) and (peek2(P).kind == lx.TK_LBRACKET) {
                     _ = advance(P);
                     _ = advance(P);
-                    te.has_args = true;
-                    parse_generic_arg_list(P, &mut te.args);
+                    nt.has_args = true;
+                    parse_generic_arg_list(P, &mut nt.args);
                 }
             } else if k2 == lx.TK_LBRACKET {
                 _ = advance(P);
                 _ = advance(P);
-                te.has_args = true;
-                parse_generic_arg_list(P, &mut te.args);
+                nt.has_args = true;
+                parse_generic_arg_list(P, &mut nt.args);
             }
         }
-        te.span = sp_from(P, start);
-        return te;
+        return ast.new_te(ast.TypeShape.Named(nt), sp_from(P, start));
     }
     syntax_error(P, "type");
-    return ast.new_te(ast.TE_ERROR, start);
+    return ast.new_te(ast.TypeShape.Error, start);
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,10 +1228,8 @@ fn parse_top(P: *mut Parser) void {
                 _ = expect(P, lx.TK_RPAREN);
             }
         }
-        let v = ast.new_te(ast.TE_PRIM, start);
-        v.prim = lx.PRIM_VOID;
-        d.ret_te = ast.new_te(ast.TE_ERRUNION, start);
-        d.ret_te.elem = v;
+        let v = ast.new_te(ast.TypeShape.Prim(lx.PRIM_VOID), start);
+        d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(v), start);
         d.body = parse_block(P);
         d.span = sp_from(P, start);
         mdecls.push(d);

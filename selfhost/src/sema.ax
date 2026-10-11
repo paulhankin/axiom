@@ -449,62 +449,65 @@ fn lookup_gparam(tc: *TypeCtx, name: []u8) *mut ast.Type {
 // ---------------------------------------------------------------------------
 // Type resolution
 // ---------------------------------------------------------------------------
-fn resolve_named_decl(te: *mut ast.TypeExpr, tc: *mut TypeCtx, report: bool) *mut ast.Decl {
+fn resolve_named_decl(nt: ast.NamedType, sp: u.Span, tc: *mut TypeCtx, report: bool) *mut ast.Decl {
     let m = tc.mod;
-    if not u.isnos(te.qual) {
-        let imp = m.imports.get(te.qual);
+    if not u.isnos(nt.qual) {
+        let imp = m.imports.get(nt.qual);
         if u.isnil(imp) {
             if report {
-                _ = dg.err(te.span, "E0202", u.f1("unknown module '%s'", te.qual));
+                _ = dg.err(sp, "E0202", u.f1("unknown module '%s'", nt.qual));
             }
             return dnil();
         }
         if u.isnil(imp.imported) {
             return dnil();
         }
-        let d = module_lookup(imp.imported, te.name);
+        let d = module_lookup(imp.imported, nt.name);
         if u.isnil(d) {
             if report {
-                _ = dg.err(te.name_span, "E0202", u.f2("module '%s' has no declaration '%s'", te.qual, te.name));
+                _ = dg.err(nt.name_span, "E0202", u.f2("module '%s' has no declaration '%s'", nt.qual, nt.name));
             }
             return dnil();
         }
         if not d.is_pub {
             if report {
-                _ = dg.err(te.name_span, "E0203", u.f2("'%s' is not public in module '%s'", te.name, te.qual));
+                _ = dg.err(nt.name_span, "E0203", u.f2("'%s' is not public in module '%s'", nt.name, nt.qual));
             }
             return dnil();
         }
         return d;
     }
-    let d = module_lookup(m, te.name);
+    let d = module_lookup(m, nt.name);
     if u.isnil(d) and report {
-        _ = dg.err(te.name_span, "E0202", u.f1("unknown type '%s'", te.name));
+        _ = dg.err(nt.name_span, "E0202", u.f1("unknown type '%s'", nt.name));
     }
     return d;
 }
 
 // A generic argument: a type, an integer literal, or a const name.
 fn resolve_generic_arg(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
-    if te.kind == ast.TE_INTLIT {
-        return ty.type_constint(@bit_cast(i64, te.ival));
-    }
-    if (te.kind == ast.TE_NAMED) and not te.has_args {
-        if u.isnos(te.qual) {
-            let gp = lookup_gparam(tc, te.name);
-            if u.notnil(gp) {
-                return gp;
+    match te.shape {
+        .IntLit(v) => { return ty.type_constint(@bit_cast(i64, v)); }
+        .Named(nt) => {
+            if not nt.has_args {
+                if u.isnos(nt.qual) {
+                    let gp = lookup_gparam(tc, nt.name);
+                    if u.notnil(gp) {
+                        return gp;
+                    }
+                }
+                let d = resolve_named_decl(nt, te.span, tc, false);
+                if u.notnil(d) and (d.kind == ast.D_CONST) {
+                    resolve_decl(d);
+                    if u.notnil(d.cexpr) and d.cexpr.is_const and (d.ty.kind == ast.TY_INT) {
+                        return ty.type_constint(d.cexpr.cval.i64v());
+                    }
+                    _ = dg.err(te.span, "E0472", u.f1("const '%s' is not an integer constant", nt.name));
+                    return ty.t_invalid;
+                }
             }
         }
-        let d = resolve_named_decl(te, tc, false);
-        if u.notnil(d) and (d.kind == ast.D_CONST) {
-            resolve_decl(d);
-            if u.notnil(d.cexpr) and d.cexpr.is_const and (d.ty.kind == ast.TY_INT) {
-                return ty.type_constint(d.cexpr.cval.i64v());
-            }
-            _ = dg.err(te.span, "E0472", u.f1("const '%s' is not an integer constant", te.name));
-            return ty.t_invalid;
-        }
+        else => {}
     }
     return resolve_type(te, tc);
 }
@@ -560,137 +563,135 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
     if u.isnil(te) {
         return ty.t_invalid;
     }
-    let k = te.kind;
-    if k == ast.TE_PRIM {
-        return ty.type_prim(te.prim);
-    }
-    if k == ast.TE_ERROR {
-        return ty.t_error;
-    }
-    if k == ast.TE_SELF {
-        if u.isnil(tc.self_) {
-            _ = dg.err(te.span, "E0205", "'Self' is only available inside a struct or union");
-            return ty.t_invalid;
-        }
-        return tc.self_;
-    }
-    if k == ast.TE_INTLIT {
-        _ = dg.err(te.span, "E0400", "expected a type, found an integer");
-        return ty.t_invalid;
-    }
-    if k == ast.TE_ERRUNION {
-        let e = resolve_type(te.elem, tc);
-        if e.kind == ast.TY_ERRUNION {
-            _ = dg.err(te.span, "E0401", "nested error unions (!!T) are not allowed");
-            return e;
-        }
-        return ty.type_errunion(e);
-    }
-    if k == ast.TE_PTR {
-        return ty.type_ptr(resolve_type(te.elem, tc), te.is_mut);
-    }
-    if k == ast.TE_SLICE {
-        let e = resolve_type(te.elem, tc);
-        if e.kind == ast.TY_VOID {
-            _ = dg.err(te.span, "E0404", "slice element type cannot be void");
-        }
-        return ty.type_slice(e, te.is_mut);
-    }
-    if k == ast.TE_ARRAY {
-        let e = resolve_type(te.elem, tc);
-        if e.kind == ast.TY_VOID {
-            _ = dg.err(te.span, "E0404", "array element type cannot be void");
-        }
-        let l = te.len;
-        if u.isnil(l) {
-            return ty.t_invalid;
-        }
-        if l.kind == ast.TE_INTLIT {
-            return ty.type_array(e, @bit_cast(i64, l.ival));
-        }
-        let a = resolve_generic_arg(l, tc);
-        if a.kind == ast.TY_CONSTINT {
-            if a.cval < 0 {
-                _ = dg.err(l.span, "E0472", "array length must not be negative");
-                return ty.type_array(e, 0);
+    match te.shape {
+        .Prim(p) => { return ty.type_prim(p); }
+        .Error   => { return ty.t_error; }
+        .SelfType => {
+            if u.isnil(tc.self_) {
+                _ = dg.err(te.span, "E0205", "'Self' is only available inside a struct or union");
+                return ty.t_invalid;
             }
-            return ty.type_array(e, a.cval);
+            return tc.self_;
         }
-        if (a.kind == ast.TY_PARAM) and a.is_const {
-            return ty.type_array_param(e, a);
+        .IntLit => {
+            _ = dg.err(te.span, "E0400", "expected a type, found an integer");
+            return ty.t_invalid;
         }
-        if a.kind != ast.TY_INVALID {
-            _ = dg.err(l.span, "E0472", "array length must be an integer constant");
+        .ErrUnion(elem) => {
+            let e = resolve_type(elem, tc);
+            if e.kind == ast.TY_ERRUNION {
+                _ = dg.err(te.span, "E0401", "nested error unions (!!T) are not allowed");
+                return e;
+            }
+            return ty.type_errunion(e);
         }
-        return ty.t_invalid;
-    }
-    if k == ast.TE_FN {
-        let ps = u.newn.[*mut ast.Type](te.args.len);
-        for i in 0..te.args.len {
-            ps[i] = resolve_type(te.args.get(i), tc);
+        .Ptr(pt) => { return ty.type_ptr(resolve_type(pt.elem, tc), pt.is_mut); }
+        .Slice(pt) => {
+            let e = resolve_type(pt.elem, tc);
+            if e.kind == ast.TY_VOID {
+                _ = dg.err(te.span, "E0404", "slice element type cannot be void");
+            }
+            return ty.type_slice(e, pt.is_mut);
         }
-        return ty.type_fn(ps, resolve_type(te.elem, tc));
-    }
-    if k == ast.TE_ANON_STRUCT {
-        let mut fv = u.List.[ast.Field].empty();
-        for i in 0..te.fields.len {
-            let mut f = te.fields.get(i);
-            f.ty = resolve_type(f.te, tc);
-            for j in 0..i {
-                if u.same(fv.at(j).name, f.name) {
-                    dup_error(f.span, f.name, fv.at(j).span);
+        .Array(at) => { return resolve_array_type(te, at, tc); }
+        .Fn(ft) => {
+            let ps = u.newn.[*mut ast.Type](ft.params.len);
+            for i in 0..ft.params.len {
+                ps[i] = resolve_type(ft.params.get(i), tc);
+            }
+            return ty.type_fn(ps, resolve_type(ft.ret, tc));
+        }
+        .AnonStruct(fields) => {
+            let mut fv = u.List.[ast.Field].empty();
+            for i in 0..fields.len {
+                let mut f = fields.get(i);
+                f.ty = resolve_type(f.te, tc);
+                for j in 0..i {
+                    if u.same(fv.at(j).name, f.name) {
+                        dup_error(f.span, f.name, fv.at(j).span);
+                    }
                 }
+                fv.push(f);
             }
-            fv.push(f);
-        }
-        let d = ty.anon_struct_decl(tc.mod, fv, te.span);
-        return d.ty;
-    }
-    if k == ast.TE_NAMED {
-        if u.isnos(te.qual) {
-            let gp = lookup_gparam(tc, te.name);
-            if u.notnil(gp) {
-                if te.has_args {
-                    _ = dg.err(te.span, "E0468", u.f1("generic parameter '%s' cannot take arguments", te.name));
-                }
-                if gp.is_const {
-                    _ = dg.err(te.span, "E0400", u.f1("'%s' is a constant, not a type", te.name));
-                    return ty.t_invalid;
-                }
-                return gp;
-            }
-        }
-        let d = resolve_named_decl(te, tc, true);
-        if u.isnil(d) {
-            return ty.t_invalid;
-        }
-        if (d.kind != ast.D_STRUCT) and (d.kind != ast.D_UNION) and (d.kind != ast.D_ENUM) {
-            _ = dg.err(te.name_span, "E0400", u.f1("'%s' is not a type", te.name));
-            return ty.t_invalid;
-        }
-        resolve_decl(d);
-        if d.gparams.len == 0 {
-            if te.has_args {
-                _ = dg.err(te.span, "E0468", u.f1("'%s' is not generic", te.name));
-            }
+            let d = ty.anon_struct_decl(tc.mod, fv, te.span);
             return d.ty;
         }
-        if not te.has_args {
-            let g = dg.err(te.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", te.name,
-                                                  te.name));
-            dg.note(g, d.name_span, u.f1("'%s' declared here", d.name));
-            return ty.t_invalid;
+        .Named(nt) => { return resolve_named_type(te, nt, tc); }
+    }
+}
+
+fn resolve_array_type(te: *mut ast.TypeExpr, at: ast.ArrayType, tc: *mut TypeCtx) *mut ast.Type {
+    let e = resolve_type(at.elem, tc);
+    if e.kind == ast.TY_VOID {
+        _ = dg.err(te.span, "E0404", "array element type cannot be void");
+    }
+    let l = at.len;
+    if u.isnil(l) {
+        return ty.t_invalid;
+    }
+    match l.shape {
+        .IntLit(n) => { return ty.type_array(e, @bit_cast(i64, n)); }
+        else => {}
+    }
+    let a = resolve_generic_arg(l, tc);
+    if a.kind == ast.TY_CONSTINT {
+        if a.cval < 0 {
+            _ = dg.err(l.span, "E0472", "array length must not be negative");
+            return ty.type_array(e, 0);
         }
-        let args = u.newn.[*mut ast.Type](te.args.len);
-        for i in 0..te.args.len {
-            args[i] = resolve_generic_arg(te.args.get(i), tc);
-        }
-        if not check_generic_args(d, args, te.span, &te.args) {
-            return ty.t_invalid;
-        }
-        return ty.type_named(d, args);
+        return ty.type_array(e, a.cval);
+    }
+    if (a.kind == ast.TY_PARAM) and a.is_const {
+        return ty.type_array_param(e, a);
+    }
+    if a.kind != ast.TY_INVALID {
+        _ = dg.err(l.span, "E0472", "array length must be an integer constant");
     }
     return ty.t_invalid;
+}
+
+fn resolve_named_type(te: *mut ast.TypeExpr, nt: ast.NamedType, tc: *mut TypeCtx) *mut ast.Type {
+    if u.isnos(nt.qual) {
+        let gp = lookup_gparam(tc, nt.name);
+        if u.notnil(gp) {
+            if nt.has_args {
+                _ = dg.err(te.span, "E0468", u.f1("generic parameter '%s' cannot take arguments", nt.name));
+            }
+            if gp.is_const {
+                _ = dg.err(te.span, "E0400", u.f1("'%s' is a constant, not a type", nt.name));
+                return ty.t_invalid;
+            }
+            return gp;
+        }
+    }
+    let d = resolve_named_decl(nt, te.span, tc, true);
+    if u.isnil(d) {
+        return ty.t_invalid;
+    }
+    if (d.kind != ast.D_STRUCT) and (d.kind != ast.D_UNION) and (d.kind != ast.D_ENUM) {
+        _ = dg.err(nt.name_span, "E0400", u.f1("'%s' is not a type", nt.name));
+        return ty.t_invalid;
+    }
+    resolve_decl(d);
+    if d.gparams.len == 0 {
+        if nt.has_args {
+            _ = dg.err(te.span, "E0468", u.f1("'%s' is not generic", nt.name));
+        }
+        return d.ty;
+    }
+    if not nt.has_args {
+        let g = dg.err(te.span, "E0460", u.f2("generic type '%s' must be given arguments: %s.[...]", nt.name, nt.name));
+        dg.note(g, d.name_span, u.f1("'%s' declared here", d.name));
+        return ty.t_invalid;
+    }
+    let args = u.newn.[*mut ast.Type](nt.args.len);
+    for i in 0..nt.args.len {
+        args[i] = resolve_generic_arg(nt.args.get(i), tc);
+    }
+    if not check_generic_args(d, args, te.span, &nt.args) {
+        return ty.t_invalid;
+    }
+    return ty.type_named(d, args);
 }
 
 // ---------------------------------------------------------------------------
@@ -2226,21 +2227,24 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
 // Generic application  x.[args]
 // ---------------------------------------------------------------------------
 fn resolve_garg(te: *mut ast.TypeExpr) *mut ast.Type {
-    if te.kind == ast.TE_INTLIT {
-        return ty.type_constint(@bit_cast(i64, te.ival));
-    }
-    if (te.kind == ast.TE_NAMED) and not te.has_args and u.isnos(te.qual) {
-        let gp = lookup_gparam(&C.tc, te.name);
-        if u.notnil(gp) {
-            return gp;
-        }
-        let d = module_lookup(C.tc.mod, te.name);
-        if u.notnil(d) and (d.kind == ast.D_CONST) {
-            resolve_decl(d);
-            if u.notnil(d.cexpr) and d.cexpr.is_const and (d.ty.kind == ast.TY_INT) {
-                return ty.type_constint(d.cexpr.cval.i64v());
+    match te.shape {
+        .IntLit(v) => { return ty.type_constint(@bit_cast(i64, v)); }
+        .Named(nt) => {
+            if not nt.has_args and u.isnos(nt.qual) {
+                let gp = lookup_gparam(&C.tc, nt.name);
+                if u.notnil(gp) {
+                    return gp;
+                }
+                let d = module_lookup(C.tc.mod, nt.name);
+                if u.notnil(d) and (d.kind == ast.D_CONST) {
+                    resolve_decl(d);
+                    if u.notnil(d.cexpr) and d.cexpr.is_const and (d.ty.kind == ast.TY_INT) {
+                        return ty.type_constint(d.cexpr.cval.i64v());
+                    }
+                }
             }
         }
+        else => {}
     }
     return resolve_type(te, &mut C.tc);
 }
