@@ -45,20 +45,6 @@ const PARTIAL_TRIPS: i64 = 4096;
 
 let mut unroll_mark: i64 = 0x7000_0000_0000;
 
-let mut bld_: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
-
-// (for folding comparisons of constants: it never emits)
-fn builder() *mut ir.Builder {
-    if u.isnil(bld_) {
-        bld_ = ir.new_builder();
-    }
-    return bld_;
-}
-
-fn is_k(v: *ir.Value) bool {
-    return ir.is_cint(v) and (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64);
-}
-
 // v with the header phi i taking the constant iv: nil unless v is i, a
 // constant, or integer operations on those (up to `depth` levels), where a
 // phi outside the loop (marked tag) counts when its inputs are all the same.
@@ -66,7 +52,7 @@ fn eval(v: *mut ir.Value, i: *mut ir.Value, iv: *mut ir.Value, tag: i64, depth: 
     if v == i {
         return iv;
     }
-    if is_k(v) {
+    if ir.is_small_cint(v) {
         return v;
     }
     if (depth <= 0) or (v.kind != ir.V_INST) or (v.ty.kind != ir.T_INT) or (v.ty.bits > 64) {
@@ -185,8 +171,7 @@ fn trip_count(h: *mut ir.Block, tag: i64, stay: *mut *mut ir.Block) i64 {
     if u.isnil(start) or u.isnil(step) {
         return -1;
     }
-    let bld = builder();
-    let pred = @truncate(i32, @bit_cast(i64, c.cv));
+    let pred = ir.pred_of(c);
     let mut v = start;
     let mut n: i64 = 0;
     loop {
@@ -195,8 +180,8 @@ fn trip_count(h: *mut ir.Block, tag: i64, stay: *mut *mut ir.Block) i64 {
         if u.isnil(x) or u.isnil(y) {
             return -1;
         }
-        let r = ir.icmp(bld, pred, x, y);
-        if not ir.is_cint(r) {
+        let r = ir.fold_icmp(pred, x, y);
+        if u.isnil(r) {
             return -1;
         }
         if (r.cv != 0) != in_true {
@@ -368,7 +353,7 @@ fn fold_inst(y: *mut ir.Value) *mut ir.Value {
         let mut r = vnil();
         for k in 0..y.xs.len {
             let x = ir.resolve(y.xs.get(k));
-            if not is_k(x) or (u.notnil(r) and (x != r)) {
+            if not ir.is_small_cint(x) or (u.notnil(r) and (x != r)) {
                 return vnil();
             }
             r = x;
@@ -378,35 +363,26 @@ fn fold_inst(y: *mut ir.Value) *mut ir.Value {
     if (op >= ir.OP_ADD) and (op <= ir.OP_ASHR) {
         let a = ir.resolve(y.a);
         let b = ir.resolve(y.b);
-        if is_k(a) and is_k(b) {
+        if ir.is_small_cint(a) and ir.is_small_cint(b) {
             return ir.fold_int_bin(op, y.ty, a, b);
         }
         return vnil();
     }
     if (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) {
         let a = ir.resolve(y.a);
-        if is_k(a) {
-            return ir.cast(builder(), op, a, y.ty);
+        if ir.is_small_cint(a) {
+            return ir.fold_cast(op, a, y.ty);
         }
         return vnil();
     }
     if op == ir.OP_ICMP {
         let a = ir.resolve(y.a);
         let b = ir.resolve(y.b);
-        if is_k(a) and is_k(b) {
-            return ir.icmp(builder(), @truncate(i32, @bit_cast(i64, y.cv)), a, b);
+        if ir.is_small_cint(a) and ir.is_small_cint(b) {
+            return ir.fold_icmp(ir.pred_of(y), a, b);
         }
     }
     return vnil();
-}
-
-fn retarget(b: *mut ir.Block, from: *mut ir.Block, to: *mut ir.Block) void {
-    let t = ir.terminator(b);
-    for j in 0..ir.succ_count(t) {
-        if ir.succ(t, j) == from {
-            ir.set_succ(t, j, to);
-        }
-    }
 }
 
 // The exits of the copy just made (other than its header's): an input to
@@ -486,7 +462,7 @@ fn chain_copy(f: *mut ir.Func, h: *mut ir.Block, stay: *mut ir.Block, tag: i64, 
     }
     if link {
         for k in 0..from.len {
-            retarget(from.get(k), cur_h, nh);
+            ir.retarget(from.get(k), cur_h, nh);
         }
     }
     let nt = ir.terminator(nh);
@@ -630,7 +606,7 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         p = p.next;
     }
     for k in 0..from.len {
-        retarget(from.get(k), cur_h, h);
+        ir.retarget(from.get(k), cur_h, h);
     }
     if factor == 0 {
         // it runs last, and leaves
@@ -673,10 +649,10 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
             p = p.next;
         }
         for k in 0..from.len {
-            retarget(from.get(k), cur_h, h);
+            ir.retarget(from.get(k), cur_h, h);
         }
         for k in 0..latches.len {
-            retarget(latches.get(k), h, first);
+            ir.retarget(latches.get(k), h, first);
         }
         partial_done.push(h);
     }
@@ -755,14 +731,7 @@ pub fn full_unroll(f: *mut ir.Func) bool {
     while (k > 1) and not did {
         k -= 1;
         let h = order.get(k);
-        let mut is_header = false;
-        for j in 0..h.preds.len {
-            let p = h.preds.get(j);
-            if (p.rpo >= 0) and opt.dominates(h, p) {
-                is_header = true;
-            }
-        }
-        if not is_header {
+        if not opt.is_loop_header(h) {
             continue;
         }
         unroll_mark += 1;
@@ -811,10 +780,10 @@ fn eq_test(b: *mut ir.Block, x: *mut *mut ir.Value, c: *mut u64, yes: *mut *mut 
     if (cmp.kind != ir.V_INST) or (cmp.op != ir.OP_ICMP) {
         return false;
     }
-    let p = @truncate(i32, @bit_cast(i64, cmp.cv));
+    let p = ir.pred_of(cmp);
     let a = ir.resolve(cmp.a);
     let k = ir.resolve(cmp.b);
-    if not is_k(k) or is_k(a) or (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
+    if not ir.is_small_cint(k) or ir.is_small_cint(a) or (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
         return false;
     }
     if p == ir.IntEQ {
@@ -909,7 +878,7 @@ fn lin(e0: *mut ir.Value, depth: i32) Addr {
 
 fn addr_of(p0: *mut ir.Value, depth: i32) Addr {
     let p = ir.resolve(p0);
-    if (depth > 0) and (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+    if (depth > 0) and ir.is_op(p, ir.OP_PTRADD) {
         let x = addr_of(p.a, depth - 1);
         let y = lin(p.b, 4);
         let m = ir.mask_bits(ir.isz().bits);
@@ -1069,22 +1038,23 @@ fn try_onehot(f: *mut ir.Func, b0: *mut ir.Block, arms: *mut u.List.[Arm]) bool 
     // b0: if x - cmin < n { store v at base + o0 + s * (x - cmin) }
     let t0 = ir.terminator(b0);
     let first = arms.get(0).st;
-    ir.at_before(builder2(), t0);
-    let d = ir.sub(builder2(), x, ir.cint(x.ty, cmin));
-    let inr = ir.icmp(builder2(), ir.IntULT, d, ir.cint(x.ty, @as(u64, n)));
+    let bld = ir.new_builder();
+    ir.at_before(bld, t0);
+    let d = ir.sub(bld, x, ir.cint(x.ty, cmin));
+    let inr = ir.icmp(bld, ir.IntULT, d, ir.cint(x.ty, @as(u64, n)));
     let arm = ir.append_block(f, "onehot");
     ir.move_block_after(arm, b0);
     let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
     br.t1 = end;
     ir.append_inst(arm, br);
-    ir.at_before(builder2(), br);
-    let dz = ir.zext(builder2(), d, ity);
-    let mut off = ir.add(builder2(), ir.mul(builder2(), dz, ir.cint(ity, s)), ir.cint(ity, o0));
+    ir.at_before(bld, br);
+    let dz = ir.zext(bld, d, ity);
+    let mut off = ir.add(bld, ir.mul(bld, dz, ir.cint(ity, s)), ir.cint(ity, o0));
     if u.notnil(base.sym) {
-        off = ir.add(builder2(), ir.mul(builder2(), base.sym, ir.cint(ity, base.scale)), off);
+        off = ir.add(bld, ir.mul(bld, base.sym, ir.cint(ity, base.scale)), off);
     }
-    let addr = ir.ptradd(builder2(), base.base, off);
-    let st = ir.store(builder2(), val, addr);
+    let addr = ir.ptradd(bld, base.base, off);
+    let st = ir.store(bld, val, addr);
     st.align = first.align;
     st.src = first.src;
     t0.a = inr;
@@ -1092,16 +1062,6 @@ fn try_onehot(f: *mut ir.Func, b0: *mut ir.Block, arms: *mut u.List.[Arm]) bool 
     t0.t2 = end;
     ir.remove_unreachable(f);
     return true;
-}
-
-let mut bld2_: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
-
-// (for the instructions one-hot stores insert)
-fn builder2() *mut ir.Builder {
-    if u.isnil(bld2_) {
-        bld2_ = ir.new_builder();
-    }
-    return bld2_;
 }
 
 // True if any chain was merged.

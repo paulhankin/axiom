@@ -17,43 +17,6 @@ fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
 }
 
-fn is_op(v: *ir.Value, op: i32) bool {
-    return (v.kind == ir.V_INST) and (v.op == op);
-}
-
-fn count_uses(f: *mut ir.Func) void {
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            i.uses = 0;
-            i = i.next;
-        }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            use1(i.a, i);
-            use1(i.b, i);
-            use1(i.c, i);
-            for k in 0..i.xs.len {
-                use1(i.xs.get(k), i);
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-}
-
-fn use1(v: *mut ir.Value, i: *mut ir.Value) void {
-    if u.notnil(v) and (v.kind == ir.V_INST) {
-        v.uses += 1;
-        v.user = i;
-    }
-}
-
 // One term (cmp(load(base + off), c) as 0 or 1) << shift of a mask.
 struct Term {
     v: *mut ir.Value,    // the term
@@ -68,22 +31,22 @@ struct Term {
 fn term(v: *mut ir.Value, t: *mut Term) bool {
     let mut z = v;
     let mut s: i64 = 0;
-    if is_op(v, ir.OP_SHL) and ir.is_cint(v.b) {
+    if ir.is_op(v, ir.OP_SHL) and ir.is_cint(v.b) {
         z = v.a;
         s = @bit_cast(i64, ir.cint_val(v.b));
         if s >= 64 {
             return false;
         }
     }
-    if not is_op(z, ir.OP_ZEXT) or (z.a.ty.kind != ir.T_INT) or (z.a.ty.bits != 1) {
+    if not ir.is_op(z, ir.OP_ZEXT) or (z.a.ty.kind != ir.T_INT) or (z.a.ty.bits != 1) {
         return false;
     }
     let c = z.a;
-    if not is_op(c, ir.OP_ICMP) or not ir.is_cint(c.b) {
+    if not ir.is_op(c, ir.OP_ICMP) or not ir.is_cint(c.b) {
         return false;
     }
     let ld = c.a;
-    if not is_op(ld, ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.blk != v.blk) {
+    if not ir.is_op(ld, ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.blk != v.blk) {
         return false;
     }
     let lb = ld.ty.bits;
@@ -92,7 +55,7 @@ fn term(v: *mut ir.Value, t: *mut Term) bool {
     }
     let mut base = ld.a;
     let mut off: i64 = 0;
-    if is_op(base, ir.OP_PTRADD) and ir.is_cint(base.b) {
+    if ir.is_op(base, ir.OP_PTRADD) and ir.is_cint(base.b) {
         off = @bit_cast(i64, ir.cint_val(base.b));
         base = base.a;
     }
@@ -124,14 +87,14 @@ fn writes_between(from: *mut ir.Value, to: *mut ir.Value) bool {
 // An intrinsic with an effect on memory (or the stack, or a trap); not the
 // arithmetic ones (min, max, bit counts ...).
 fn writing_intr(i: *ir.Value) bool {
-    let id = @truncate(i32, @bit_cast(i64, i.cv));
+    let id = ir.intr_id(i);
     return ((id >= ir.IN_TRAP) and (id <= ir.IN_SET_SP)) or (id == ir.IN_GET_SP) or (id == ir.IN_STORE_PARTIAL) or
            ((id > ir.IN_BSWAP) and (id != ir.IN_SAD_U8) and not ir.is_widen(id));
 }
 
 // The leaves of the `or` tree at root (or-s of one use in its block).
 fn leaves(v: *mut ir.Value, root: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) void {
-    if is_op(v, ir.OP_OR) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 64) {
+    if ir.is_op(v, ir.OP_OR) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 64) {
         leaves(v.a, root, out);
         leaves(v.b, root, out);
         return;
@@ -276,7 +239,7 @@ fn vectorize_mask(B: *mut ir.Builder, f: *mut ir.Func, root: *mut ir.Value, avx5
     ir.at_before(B, root);
     let p = ir.ptradd(B, first.base, ir.cint(ir.isz(), @bit_cast(u64, lo_off)));
     let v = load_low(B, p, bits, n, avx512);
-    let c = ir.icmp(B, @truncate(i32, @bit_cast(i64, first.cmp.cv)), v, ir.splat(B, v.ty, first.cmp.b));
+    let c = ir.icmp(B, ir.pred_of(first.cmp), v, ir.splat(B, v.ty, first.cmp.b));
     let mut bargs: [1]*mut ir.Value = [c];
     let i32t = ir.t_int(32);
     let mut m = ir.intr(B, ir.IN_BITMASK, i32t, bargs[..]);
@@ -317,7 +280,7 @@ pub fn compare_masks(f: *mut ir.Func) bool {
     let feats = tg.fn_features(f);
     let need = (tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL;
     let avx512 = (feats & need) == need;
-    count_uses(f);
+    ir.count_uses(f);
     let B = ir.new_builder();
     let mut any = false;
     let mut b = f.first;
@@ -326,11 +289,11 @@ pub fn compare_masks(f: *mut ir.Func) bool {
         while u.notnil(i) {
             let prev = i.prev;
             // a root: an `or` of integers not itself part of a larger one
-            if is_op(i, ir.OP_OR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and (i.uses > 0) and
-               not ((i.uses == 1) and is_op(i.user, ir.OP_OR) and (i.user.blk == b)) {
+            if ir.is_op(i, ir.OP_OR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and (i.uses > 0) and
+               not ((i.uses == 1) and ir.is_op(i.user, ir.OP_OR) and (i.user.blk == b)) {
                 if vectorize_mask(B, f, i, avx512) {
                     any = true;
-                    count_uses(f);
+                    ir.count_uses(f);
                 }
             }
             i = prev;
@@ -385,7 +348,7 @@ fn all_same(xs: []mut *mut ir.Value) bool {
 
 fn all_op(xs: []mut *mut ir.Value, op: i32) bool {
     for k in 0..xs.len {
-        if not is_op(xs[k], op) or (xs[k].blk != xs[0].blk) {
+        if not ir.is_op(xs[k], op) or (xs[k].blk != xs[0].blk) {
             return false;
         }
     }
@@ -540,10 +503,6 @@ fn interval_of(p: i32, k: u64, b: i32, signed: bool, lo: *mut i64, hi: *mut i64)
     return true;
 }
 
-fn signed_pred(p: i32) bool {
-    return (p == ir.IntSGT) or (p == ir.IntSGE) or (p == ir.IntSLT) or (p == ir.IntSLE);
-}
-
 fn unsigned_pred(p: i32) bool {
     return (p == ir.IntUGT) or (p == ir.IntUGE) or (p == ir.IntULT) or (p == ir.IntULE);
 }
@@ -567,17 +526,17 @@ fn mask_of(s: *mut Slp, cs: []mut *mut ir.Value, ivt: *mut ir.Ty, depth: i32) *m
         let mut same_p = true;
         let mut sg = false;
         let mut us = false;
-        let p0 = @truncate(i32, @bit_cast(i64, cs[0].cv));
+        let p0 = ir.pred_of(cs[0]);
         for k in 0..n {
             let c = cs[k];
-            let p = @truncate(i32, @bit_cast(i64, c.cv));
+            let p = ir.pred_of(c);
             if (ir.resolve(c.a) != x) or not ir.is_cint(ir.resolve(c.b)) {
                 one_x = false;
             }
             if p != p0 {
                 same_p = false;
             }
-            sg = sg or signed_pred(p);
+            sg = sg or ir.is_signed_pred(p);
             us = us or unsigned_pred(p);
         }
         if one_x and not (sg and us) {
@@ -594,7 +553,7 @@ fn mask_of(s: *mut Slp, cs: []mut *mut ir.Value, ivt: *mut ir.Ty, depth: i32) *m
             let mut ok = true;
             for k in 0..n {
                 let c = cs[k];
-                let p = @truncate(i32, @bit_cast(i64, c.cv));
+                let p = ir.pred_of(c);
                 let kv = ir.cint_val(ir.resolve(c.b));
                 if same_p {
                     let mut kx = kv & ir.mask_bits(b);
@@ -726,7 +685,7 @@ fn neighbour_loads(s: *mut Slp, xs: []mut *mut ir.Value) bool {
         }
         let mut p = ir.resolve(ld.a);
         let mut off: i64 = 0;
-        if is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+        if ir.is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
             off = ir.sval(ir.resolve(p.b));
             p = ir.resolve(p.a);
         }
@@ -1087,7 +1046,7 @@ fn store_parts(st: *mut ir.Value, base: *mut *mut ir.Value, off: *mut i64) bool 
     }
     let mut p = ir.resolve(st.b);
     let mut o: i64 = 0;
-    if is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+    if ir.is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
         o = ir.sval(ir.resolve(p.b));
         p = ir.resolve(p.a);
     }
@@ -1185,7 +1144,7 @@ fn block_stores(f: *mut ir.Func, b: *mut ir.Block, vbytes: i64) bool {
                 }
                 if store_chunk(f, chunk, cb) {
                     changed = true;
-                    count_uses(f);
+                    ir.count_uses(f);
                 }
                 u.free_slice(chunk);
                 c += cn;
@@ -1217,7 +1176,7 @@ pub fn store_groups(f: *mut ir.Func) bool {
     if (feats & tg.X_AVX2) != 0 {
         vbytes = 32;
     }
-    count_uses(f);
+    ir.count_uses(f);
     let mut any = false;
     let mut b = f.first;
     while u.notnil(b) {
@@ -1268,7 +1227,7 @@ fn lane_leaf(v0: *mut ir.Value, base: *mut *mut ir.Value, off: *mut i64) bool {
         if v.op == ir.OP_LOAD {
             let mut p = ir.resolve(v.a);
             let mut o: i64 = 0;
-            if is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+            if ir.is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
                 o = ir.sval(ir.resolve(p.b));
                 p = ir.resolve(p.a);
             }
@@ -1282,16 +1241,6 @@ fn lane_leaf(v0: *mut ir.Value, base: *mut *mut ir.Value, off: *mut i64) bool {
         v = ir.resolve(v.a);
     }
     return false;
-}
-
-// What pred p brings to phi x.
-fn incoming(x: *mut ir.Value, p: *mut ir.Block) *mut ir.Value {
-    for k in 0..x.bs.len {
-        if x.bs.get(k) == p {
-            return ir.resolve(x.xs.get(k));
-        }
-    }
-    return vnil();
 }
 
 // The scalar instructions of s.tree made dead when the lane roots go (each
@@ -1393,7 +1342,7 @@ fn splat_group(f: *mut ir.Func, b: *mut ir.Block, xs: []mut *mut ir.Value) bool 
         for k in 0..n {
             lanes[k] = xs[k];
             if phis {
-                lanes[k] = incoming(xs[k], b.preds.get(w));
+                lanes[k] = ir.resolve(ir.incoming(xs[k], b.preds.get(w)));
                 if u.isnil(lanes[k]) {
                     ok = false;
                 }
@@ -1433,7 +1382,7 @@ fn splat_group(f: *mut ir.Func, b: *mut ir.Block, xs: []mut *mut ir.Value) bool 
         for k in 0..n {
             lanes[k] = xs[k];
             if phis {
-                lanes[k] = incoming(xs[k], b.preds.get(w));
+                lanes[k] = ir.resolve(ir.incoming(xs[k], b.preds.get(w)));
             }
         }
         let mut s = Slp.{ B: ir.new_builder(), emit: true, ok: true, cost: 0, first: first,
@@ -1477,7 +1426,7 @@ pub fn splat_groups(f: *mut ir.Func) bool {
         vbytes = 32;
     }
     let mut any = false;
-    count_uses(f);
+    ir.count_uses(f);
     let mut users = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
     let mut cands = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
     let mut offs = u.List.[i64].{ data: u.nil.[i64](), len: 0, cap: 0 };
@@ -1512,7 +1461,7 @@ pub fn splat_groups(f: *mut ir.Func) bool {
                ((i.op != ir.OP_PHI) or ((b.preds.len == 2) and (i.xs.len == 2))) {
                 let mut x = i;
                 if i.op == ir.OP_PHI {
-                    x = incoming(i, b.preds.get(0));
+                    x = ir.resolve(ir.incoming(i, b.preds.get(0)));
                 }
                 let mut base = vnil();
                 let mut off: i64 = 0;
@@ -1578,7 +1527,7 @@ pub fn splat_groups(f: *mut ir.Func) bool {
                         }
                     }
                 }
-                count_uses(f);
+                ir.count_uses(f);
             }
             u.free_slice(group);
         }
@@ -1616,18 +1565,18 @@ struct ByteTerm {
 // The leaf v as a byte of a sum of type t, if it is one.
 fn byte_term(v: *mut ir.Value, t: *ir.Ty, x: *mut ByteTerm) bool {
     let mut ld = v;
-    if is_op(v, ir.OP_ZEXT) {
+    if ir.is_op(v, ir.OP_ZEXT) {
         ld = v.a;
     } else if t.bits != 8 {
         return false;
     }
-    if not is_op(ld, ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.ty.bits != 8) or
+    if not ir.is_op(ld, ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.ty.bits != 8) or
        (ld.blk != v.blk) {
         return false;
     }
     let mut base = ld.a;
     let mut off: i64 = 0;
-    if is_op(base, ir.OP_PTRADD) and ir.is_cint(base.b) {
+    if ir.is_op(base, ir.OP_PTRADD) and ir.is_cint(base.b) {
         off = @bit_cast(i64, ir.cint_val(base.b));
         base = base.a;
     }
@@ -1640,7 +1589,7 @@ fn byte_term(v: *mut ir.Value, t: *ir.Ty, x: *mut ByteTerm) bool {
 
 // The leaves of the `add` tree at root (adds of one use in its block).
 fn add_leaves(v: *mut ir.Value, root: *mut ir.Value, out: *mut u.List.[*mut ir.Value]) void {
-    if is_op(v, ir.OP_ADD) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 256) {
+    if ir.is_op(v, ir.OP_ADD) and ((v == root) or ((v.uses == 1) and (v.blk == root.blk))) and (out.len < 256) {
         add_leaves(v.a, root, out);
         add_leaves(v.b, root, out);
         return;
@@ -1798,7 +1747,7 @@ pub fn byte_sums(f: *mut ir.Func) bool {
     let feats = tg.fn_features(f);
     let need = (tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL;
     let avx512 = (feats & need) == need;
-    count_uses(f);
+    ir.count_uses(f);
     let B = ir.new_builder();
     let mut any = false;
     let mut b = f.first;
@@ -1807,11 +1756,11 @@ pub fn byte_sums(f: *mut ir.Func) bool {
         while u.notnil(i) {
             let prev = i.prev;
             // a root: an `add` of integers not itself part of a larger one
-            if is_op(i, ir.OP_ADD) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
-               (i.uses > 0) and not ((i.uses == 1) and is_op(i.user, ir.OP_ADD) and (i.user.blk == b)) {
+            if ir.is_op(i, ir.OP_ADD) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
+               (i.uses > 0) and not ((i.uses == 1) and ir.is_op(i.user, ir.OP_ADD) and (i.user.blk == b)) {
                 if vectorize_sum(B, f, i, avx512) {
                     any = true;
-                    count_uses(f);
+                    ir.count_uses(f);
                 }
             }
             i = prev;

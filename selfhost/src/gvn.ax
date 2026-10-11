@@ -95,11 +95,6 @@ fn mix(h: u64, x: u64) u64 {
     return (h ^ x) *% 0x1000_0000_01B3 +% 0x7F4A_7C15;
 }
 
-fn commutative(op: i32) bool {
-    return (op == ir.OP_ADD) or (op == ir.OP_MUL) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) or
-           (op == ir.OP_FADD) or (op == ir.OP_FMUL);
-}
-
 // Operand identity: constants compare by value.
 fn same_val(a: *ir.Value, b: *ir.Value) bool {
     if a == b {
@@ -139,7 +134,7 @@ fn hv(v: *ir.Value) u64 {
 fn hash_expr(i: *ir.Value) u64 {
     let mut h = mix(@as(u64, @bit_cast(u32, i.op)), @as(u64, @bit_cast(u32, i.ty.id)));
     h = mix(h, i.cv);
-    if commutative(i.op) {
+    if ir.commutative(i.op) {
         h = mix(h, hv(i.a) +% hv(i.b));
     } else {
         h = mix(h, hv(i.a));
@@ -164,7 +159,7 @@ fn same_expr(x: *ir.Value, y: *ir.Value) bool {
     }
     let direct = same_val(x.a, y.a) and same_val(x.b, y.b);
     if not direct {
-        if not commutative(x.op) or not (same_val(x.a, y.b) and same_val(x.b, y.a)) {
+        if not ir.commutative(x.op) or not (same_val(x.a, y.b) and same_val(x.b, y.a)) {
             return false;
         }
     }
@@ -243,12 +238,8 @@ fn mem_hash(base: *ir.Value, off: i64, ty: *ir.Ty) u64 {
 // -----------------------------------------------------------------------------
 // Alias analysis
 // -----------------------------------------------------------------------------
-fn is_inst(v: *ir.Value, op: i32) bool {
-    return (v.kind == ir.V_INST) and (v.op == op);
-}
-
 fn is_obj(v: *ir.Value) bool {
-    return is_inst(v, ir.OP_ALLOCA) or (v.kind == ir.V_GLOBAL);
+    return ir.is_op(v, ir.OP_ALLOCA) or (v.kind == ir.V_GLOBAL);
 }
 
 struct Range {
@@ -316,13 +307,13 @@ fn range_of(v: *ir.Value, depth: i32) Range {
 fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     let mut p = p0;
     let mut off: i64 = 0;
-    while is_inst(p, ir.OP_PTRADD) and ir.is_cint(p.b) {
+    while ir.is_op(p, ir.OP_PTRADD) and ir.is_cint(p.b) {
         off = off +% ir.sval(p.b);
         p = p.a;
     }
     let base = p;
     let mut r = rng(off, off);
-    while is_inst(p, ir.OP_PTRADD) {
+    while ir.is_op(p, ir.OP_PTRADD) {
         if r.ok {
             let x = range_of(p.b, 0);
             if x.ok {
@@ -336,7 +327,7 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     let mut obj = vnil();
     if is_obj(p) {
         obj = p;
-    } else if is_inst(p, ir.OP_SELECT) and noalias_global(p.b) {
+    } else if ir.is_op(p, ir.OP_SELECT) and noalias_global(p.b) {
         // wasm: the thread's shadow stack record, or the main thread's
         obj = p.b;
     }
@@ -369,7 +360,7 @@ fn noalias_global(o: *ir.Value) bool {
 
 // An alloca whose address is not visible to calls (aux2 == 1 after escapes()).
 fn private_obj(o: *ir.Value) bool {
-    return u.notnil(o) and is_inst(o, ir.OP_ALLOCA) and (o.aux2 == 1);
+    return u.notnil(o) and ir.is_op(o, ir.OP_ALLOCA) and (o.aux2 == 1);
 }
 
 fn overlap(a: i64, an: i64, b: i64, bn: i64) bool {
@@ -400,8 +391,8 @@ fn may_alias(x: *Loc, w: *Write) bool {
     }
     // a pointer the function was given cannot point into its own stack
     // slots (they did not exist yet)
-    if (u.notnil(x.obj) and is_inst(x.obj, ir.OP_ALLOCA) and from_param(w.base)) or
-       (u.notnil(w.obj) and is_inst(w.obj, ir.OP_ALLOCA) and from_param(x.base)) {
+    if (u.notnil(x.obj) and ir.is_op(x.obj, ir.OP_ALLOCA) and from_param(w.base)) or
+       (u.notnil(w.obj) and ir.is_op(w.obj, ir.OP_ALLOCA) and from_param(x.base)) {
         return false;
     }
     if (private_obj(x.obj) and (w.obj != x.obj)) or (private_obj(w.obj) and (x.obj != w.obj)) {
@@ -417,7 +408,7 @@ fn may_alias(x: *Loc, w: *Write) bool {
 fn from_param(p0: *ir.Value) bool {
     let mut p = p0;
     let mut n: i32 = 0;
-    while u.notnil(p) and is_inst(p, ir.OP_PTRADD) and (n < 16) {
+    while u.notnil(p) and ir.is_op(p, ir.OP_PTRADD) and (n < 16) {
         p = p.a;
         n += 1;
     }
@@ -485,10 +476,10 @@ fn escapes(f: *mut ir.Func) void {
         while u.notnil(i) {
             if (i.op == ir.OP_PTRADD) and (i.aux2 == 2) {
                 let mut p = i.a;
-                while is_inst(p, ir.OP_PTRADD) {
+                while ir.is_op(p, ir.OP_PTRADD) {
                     p = p.a;
                 }
-                if is_inst(p, ir.OP_ALLOCA) {
+                if ir.is_op(p, ir.OP_ALLOCA) {
                     p.aux2 = 0;
                 }
             }
@@ -522,15 +513,8 @@ fn pure_intr(id: i32) bool {
 // x86-64's masked vector loads and stores (codegen.ax makes them for
 // @load_partial and @store_partial): memory accesses at their pointer, of at
 // most the vector's size.
-fn intr_id(i: *ir.Value) i32 {
-    if i.op != ir.OP_INTR {
-        return 0;
-    }
-    return @truncate(i32, @bit_cast(i64, i.cv));
-}
-
 fn partial_loc(i: *ir.Value) Loc {
-    if intr_id(i) == ir.IN_LOAD_PARTIAL {
+    if ir.intr_id(i) == ir.IN_LOAD_PARTIAL {
         return loc_of(i.xs.get(0), @bit_cast(i64, i.ty.size));
     }
     return loc_of(i.xs.get(1), @bit_cast(i64, i.xs.get(0).ty.size));
@@ -545,7 +529,7 @@ fn cse_able(i: *ir.Value) bool {
         return true;
     }
     if op == ir.OP_INTR {
-        return pure_intr(@truncate(i32, @bit_cast(i64, i.cv)));
+        return pure_intr(ir.intr_id(i));
     }
     return false;
 }
@@ -577,10 +561,10 @@ fn note_writes(i: *mut ir.Value) void {
         push_write(W_ALL, nowhere());
     } else if (op == ir.OP_LOAD) and (i.flags != 0) {
         push_write(W_ALL, nowhere());
-    } else if intr_id(i) == ir.IN_STORE_PARTIAL {
+    } else if ir.intr_id(i) == ir.IN_STORE_PARTIAL {
         push_write(W_LOC, partial_loc(i));
-    } else if (op == ir.OP_INTR) and not pure_intr(intr_id(i)) and (intr_id(i) != ir.IN_LOAD_PARTIAL) and
-              not ir.is_prefetch(intr_id(i)) {
+    } else if (op == ir.OP_INTR) and not pure_intr(ir.intr_id(i)) and (ir.intr_id(i) != ir.IN_LOAD_PARTIAL) and
+              not ir.is_prefetch(ir.intr_id(i)) {
         push_write(W_ALL, nowhere());
     }
 }
@@ -849,13 +833,6 @@ fn zero_since(l: Loc) bool {
 // -----------------------------------------------------------------------------
 // Conditions
 // -----------------------------------------------------------------------------
-fn kbool(b: bool) *mut ir.Value {
-    if b {
-        return ir.cint(ir.t_int(1), 1);
-    }
-    return ir.cint(ir.t_int(1), 0);
-}
-
 // Comparisons made up as keys for facts and queries: a pool that each run
 // of gvn starts again (the table they go in is cleared too).
 let mut synth: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
@@ -882,23 +859,23 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     if (depth > 4) or ir.is_const(c) {
         return;
     }
-    add_known(c, kbool(val));
+    add_known(c, ir.kbool(val));
     if c.kind != ir.V_INST {
         return;
     }
     if (c.op == ir.OP_ICMP) and (c.ty.kind == ir.T_INT) {
-        let p = cb.pred_of(c);
+        let p = ir.pred_of(c);
         let mut tp = p;  // the predicate that holds
         if not val {
-            tp = cb.inv_pred(p);
+            tp = ir.inv_pred(p);
         }
         assume_bounds(tp, c.a, c.b);
-        add_expr(synth_icmp(tp, c.a, c.b), kbool(true));
-        add_expr(synth_icmp(cb.inv_pred(tp), c.a, c.b), kbool(false));
-        add_expr(synth_icmp(cb.swap_pred(tp), c.b, c.a), kbool(true));
-        add_expr(synth_icmp(cb.inv_pred(cb.swap_pred(tp)), c.b, c.a), kbool(false));
+        add_expr(synth_icmp(tp, c.a, c.b), ir.kbool(true));
+        add_expr(synth_icmp(ir.inv_pred(tp), c.a, c.b), ir.kbool(false));
+        add_expr(synth_icmp(ir.swap_pred(tp), c.b, c.a), ir.kbool(true));
+        add_expr(synth_icmp(ir.inv_pred(ir.swap_pred(tp)), c.b, c.a), ir.kbool(false));
         // x > K is x >= K + 1, x >= K is x > K - 1, and so on
-        if cb.is_k(c.b) and not ir.is_const(c.a) {
+        if ir.is_cint(c.b) and not ir.is_const(c.a) {
             assume_adjacent(tp, c.a, c.b);
         }
         // x == K: x is K
@@ -926,7 +903,7 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
     } else if (c.op == ir.OP_OR) and not val and (c.ty.bits == 1) {
         assume(c.a, false, depth + 1);
         assume(c.b, false, depth + 1);
-    } else if (c.op == ir.OP_XOR) and (c.ty.bits == 1) and cb.is_k(c.b) {
+    } else if (c.op == ir.OP_XOR) and (c.ty.bits == 1) and ir.is_cint(c.b) {
         assume(c.a, val != (ir.cint_val(c.b) != 0), depth + 1);
     }
 }
@@ -963,8 +940,8 @@ fn assume_adjacent(tp: i32, x: *mut ir.Value, k: *mut ir.Value) void {
         return;
     }
     let c = ir.cint(t, nk);
-    add_expr(synth_icmp(np, x, c), kbool(true));
-    add_expr(synth_icmp(cb.inv_pred(np), x, c), kbool(false));
+    add_expr(synth_icmp(np, x, c), ir.kbool(true));
+    add_expr(synth_icmp(ir.inv_pred(np), x, c), ir.kbool(false));
 }
 
 const NO_RANK: i64 = 0x7fff_ffff_ffff_ffff;
@@ -1013,7 +990,7 @@ fn add_ge(x: *mut ir.Value, c: i64) void {
 }
 
 fn small_k(v: *ir.Value) bool {
-    return cb.is_k(v) and (v.ty.kind == ir.T_INT) and (ir.cint_val(v) < 0x4000_0000_0000_0000);
+    return ir.is_cint(v) and (v.ty.kind == ir.T_INT) and (ir.cint_val(v) < 0x4000_0000_0000_0000);
 }
 
 fn kv(v: *ir.Value) i64 {
@@ -1023,12 +1000,12 @@ fn kv(v: *ir.Value) i64 {
 // x - lo < n (a range check, as x + -lo): x is in [lo, lo + n - 1] when
 // that does not wrap.
 fn assume_range(a: *mut ir.Value, n: u64) void {
-    if not is_inst(a, ir.OP_ADD) and not is_inst(a, ir.OP_SUB) {
+    if not ir.is_op(a, ir.OP_ADD) and not ir.is_op(a, ir.OP_SUB) {
         return;
     }
     let x = ir.resolve(a.a);
     let k = ir.resolve(a.b);
-    if not cb.is_k(k) or ir.is_const(x) {
+    if not ir.is_cint(k) or ir.is_const(x) {
         return;
     }
     let m = ir.mask_bits(x.ty.bits);
@@ -1041,8 +1018,8 @@ fn assume_range(a: *mut ir.Value, n: u64) void {
     }
     add_le(x, vnil(), @bit_cast(i64, lo + (n - 1)));
     add_ge(x, @bit_cast(i64, lo));
-    add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), kbool(true));
-    add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), kbool(true));
+    add_expr(synth_icmp(ir.IntUGE, x, ir.cint(x.ty, lo)), ir.kbool(true));
+    add_expr(synth_icmp(ir.IntNE, x, ir.cint(x.ty, 0)), ir.kbool(true));
 }
 
 // a <= b + c with a = x + k (k a small constant, the sum not wrapping):
@@ -1051,7 +1028,7 @@ fn assume_range(a: *mut ir.Value, n: u64) void {
 let mut sum_le_busy: bool = false;
 
 fn assume_sum_le(a: *mut ir.Value, b: *mut ir.Value, c: i64) void {
-    if not is_inst(a, ir.OP_ADD) or not small_k(a.b) or ir.is_const(a.a) or (a.ty.bits > 64) {
+    if not ir.is_op(a, ir.OP_ADD) or not small_k(a.b) or ir.is_const(a.a) or (a.ty.bits > 64) {
         return;
     }
     let k = kv(a.b);
@@ -1090,21 +1067,21 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     if known_at_least(a, k) {
         return true;
     }
-    if is_inst(a, ir.OP_SUB) and not ir.is_const(a.a) and not ir.is_const(a.b) {
+    if ir.is_op(a, ir.OP_SUB) and not ir.is_const(a.a) and not ir.is_const(a.b) {
         return prove_le(a.b, a.a, 0 - k);  // (then x <= n: no wrap)
     }
     // x - d (or x + -d) with x >= k + d: no wrap, and at least k
     let mut d: i64 = 0;
-    if is_inst(a, ir.OP_ADD) and cb.is_k(ir.resolve(a.b)) {
+    if ir.is_op(a, ir.OP_ADD) and ir.is_cint(ir.resolve(a.b)) {
         d = @bit_cast(i64, (0 -% ir.cint_val(ir.resolve(a.b))) & ir.mask_bits(a.ty.bits));
-    } else if is_inst(a, ir.OP_SUB) and small_k(ir.resolve(a.b)) {
+    } else if ir.is_op(a, ir.OP_SUB) and small_k(ir.resolve(a.b)) {
         d = kv(ir.resolve(a.b));
     }
     if (d >= 1) and (d < 0x1_0000_0000) {
         return at_least(ir.resolve(a.a), k + d, depth + 1);
     }
     // x + j (j >= 1) that does not wrap: at least j, and at least k when x >= k - j
-    if is_inst(a, ir.OP_ADD) and small_k(ir.resolve(a.b)) and (kv(ir.resolve(a.b)) >= 1) and
+    if ir.is_op(a, ir.OP_ADD) and small_k(ir.resolve(a.b)) and (kv(ir.resolve(a.b)) >= 1) and
        (kv(ir.resolve(a.b)) < 0x1_0000_0000) and (a.ty.bits == 64) {
         let j = kv(ir.resolve(a.b));
         let saved = prove_budget;
@@ -1115,13 +1092,13 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
             return (j >= k) or at_least(ir.resolve(a.a), k - j, depth + 1);
         }
     }
-    if is_inst(a, ir.OP_ZEXT) {
+    if ir.is_op(a, ir.OP_ZEXT) {
         return at_least(ir.resolve(a.a), k, depth + 1);
     }
     let mut c: i64 = 0;
-    if is_inst(a, ir.OP_MUL) and small_k(a.b) {
+    if ir.is_op(a, ir.OP_MUL) and small_k(a.b) {
         c = kv(a.b);
-    } else if is_inst(a, ir.OP_SHL) and small_k(a.b) and (kv(a.b) < 32) {
+    } else if ir.is_op(a, ir.OP_SHL) and small_k(a.b) and (kv(a.b) < 32) {
         c = @as(i64, 1) << @truncate(u32, kv(a.b));
     }
     if (c < 1) or (c >= 0x1_0000_0000) {
@@ -1130,7 +1107,7 @@ fn at_least(a: *mut ir.Value, k: i64, depth: i32) bool {
     let s = a.a;
     prove_budget = 64;
     let mut m = ub(s, 0);
-    if (m < 0) and is_inst(s, ir.OP_SUB) and prove_le(s.b, s.a, 0) {
+    if (m < 0) and ir.is_op(s, ir.OP_SUB) and prove_le(s.b, s.a, 0) {
         prove_budget = 64;
         m = ub(s.a, 0);  // n - x <= n when x <= n
     }
@@ -1169,7 +1146,7 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
             }
         }
     } else if (tp == ir.IntUGT) or (tp == ir.IntUGE) {
-        let sw = cb.swap_pred(tp);
+        let sw = ir.swap_pred(tp);
         if not ir.is_const(b) {
             assume_bounds(sw, b, a);
         } else if small_k(b) {
@@ -1180,33 +1157,33 @@ fn assume_bounds(tp: i32, a: *mut ir.Value, b: *mut ir.Value) void {
             add_le(a, b, 0);
             add_le(b, a, 0);
         }
-    } else if (tp >= ir.IntSGT) and (tp <= ir.IntSLE) and cb.is_k(a) and not ir.is_const(b) {
-        assume_bounds(cb.swap_pred(tp), b, a);
-    } else if ((tp == ir.IntSGT) or (tp == ir.IntSGE)) and cb.is_k(b) and not ir.is_const(a) {
+    } else if (tp >= ir.IntSGT) and (tp <= ir.IntSLE) and ir.is_cint(a) and not ir.is_const(b) {
+        assume_bounds(ir.swap_pred(tp), b, a);
+    } else if ((tp == ir.IntSGT) or (tp == ir.IntSGE)) and ir.is_cint(b) and not ir.is_const(a) {
         // a >= lo >= 0 (signed): a is not negative, and at least lo
         let lo = ir.sval(b) + pick1(tp == ir.IntSGT);
         if lo >= 0 {
-            add_expr(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0)), kbool(true));
-            add_expr(synth_icmp(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo))), kbool(true));
+            add_expr(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0)), ir.kbool(true));
+            add_expr(synth_icmp(ir.IntUGE, a, ir.cint(a.ty, @bit_cast(u64, lo))), ir.kbool(true));
             if lo >= 1 {
-                add_expr(synth_icmp(ir.IntNE, a, ir.cint(a.ty, 0)), kbool(true));
+                add_expr(synth_icmp(ir.IntNE, a, ir.cint(a.ty, 0)), ir.kbool(true));
             }
         }
-    } else if ((tp == ir.IntSLT) or (tp == ir.IntSLE)) and cb.is_k(b) and not ir.is_const(a) {
+    } else if ((tp == ir.IntSLT) or (tp == ir.IntSLE)) and ir.is_cint(b) and not ir.is_const(a) {
         // a <= hi (signed) with a not negative: a <= hi
         let hi = ir.sval(b) - pick1(tp == ir.IntSLT);
         if (hi >= 0) and known_true(synth_icmp(ir.IntSGE, a, ir.cint(a.ty, 0))) {
             add_le(a, vnil(), hi);
         }
         // k - x <= hi with x in [0, ub(x)] (no signed overflow): x >= k - hi
-        if is_inst(a, ir.OP_SUB) and small_k(a.a) and not ir.is_const(a.b) and (kv(a.a) <= smax_of(a.ty)) and
+        if ir.is_op(a, ir.OP_SUB) and small_k(a.a) and not ir.is_const(a.b) and (kv(a.a) <= smax_of(a.ty)) and
            (hi > -0x4000_0000_0000_0000) {
             prove_budget = 64;
             let m = ub(a.b, 0);
             let lo = kv(a.a) - hi;
             if (m >= 0) and (m <= smax_of(a.ty)) and (lo >= 1) and (lo <= m) {
-                add_expr(synth_icmp(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo))), kbool(true));
-                add_expr(synth_icmp(ir.IntNE, a.b, ir.cint(a.ty, 0)), kbool(true));
+                add_expr(synth_icmp(ir.IntUGE, a.b, ir.cint(a.ty, @bit_cast(u64, lo))), ir.kbool(true));
+                add_expr(synth_icmp(ir.IntNE, a.b, ir.cint(a.ty, 0)), ir.kbool(true));
             }
         }
     }
@@ -1236,7 +1213,7 @@ fn known_at_least(x: *mut ir.Value, c: i64) bool {
        known_at_least(x, c - 1) {
         return true;
     }
-    if is_inst(x, ir.OP_PHI) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) and (c < 0x1_0000_0000) {
+    if ir.is_op(x, ir.OP_PHI) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) and (c < 0x1_0000_0000) {
         return phi_at_least(x, c);
     }
     return false;
@@ -1339,7 +1316,7 @@ fn known_true(i: *ir.Value) bool {
     while e >= 0 {
         let x = ents.at(@int_cast(usize, e));
         if (x.kind == K_EXPR) and same_expr(x.key, i) {
-            return fact_ok(e) and cb.is_k(x.val) and (ir.cint_val(x.val) == 1);
+            return fact_ok(e) and ir.is_cint(x.val) and (ir.cint_val(x.val) == 1);
         }
         e = x.next;
     }
@@ -1416,7 +1393,7 @@ fn le_path(x: *mut ir.Value, y: *mut ir.Value, bound: i64, depth: i32) bool {
     if (op == ir.OP_UREM) and not ir.is_const(x.b) {
         return le_path(x.b, y, bound + 1, depth + 1);
     }
-    if (op == ir.OP_ADD) and cb.is_k(x.b) and (x.ty.bits <= 64) and (x.ty.bits > 1) {
+    if (op == ir.OP_ADD) and ir.is_cint(x.b) and (x.ty.bits <= 64) and (x.ty.bits > 1) {
         let c = ir.cint_val(x.b);
         let half = ir.mask_bits(x.ty.bits) >> 1;
         if c <= half {
@@ -1587,11 +1564,11 @@ fn below_max(x: *mut ir.Value, d: i64, depth: i32) bool {
         }
         e = en.next;
     }
-    if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and cb.is_k(x.b) and
+    if (x.kind == ir.V_INST) and ((x.op == ir.OP_LSHR) or (x.op == ir.OP_UDIV)) and ir.is_cint(x.b) and
        (ir.cint_val(x.b) >= 2) {
         return true;  // at most MAX / 2
     }
-    if (x.kind == ir.V_INST) and (x.op == ir.OP_PHI) {
+    if ir.is_op(x, ir.OP_PHI) {
         return phi_below_max(x, d, depth);
     }
     if (x.kind == ir.V_INST) and ((x.op == ir.OP_ZEXT) or (x.op == ir.OP_TRUNC) or (x.op == ir.OP_AND)) {
@@ -1768,7 +1745,7 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
         if (b >= 0) and (b <= kv(x.a)) {
             d = kv(x.a) - lb(x.b, depth + 1);
         }
-    } else if (op == ir.OP_SHL) and not cb.is_k(x.b) {
+    } else if (op == ir.OP_SHL) and not ir.is_cint(x.b) {
         // by a count below the width
         let a = ub(x.a, depth + 1);
         let k = ub(x.b, depth + 1);
@@ -1790,13 +1767,13 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
         if (a >= 0) and (a <= smax_of(x.a.ty)) {
             d = a >> @truncate(u32, ir.cint_val(x.b));
         }
-    } else if (op == ir.OP_LSHR) and not cb.is_k(x.b) {
+    } else if (op == ir.OP_LSHR) and not ir.is_cint(x.b) {
         d = ub(x.a, depth + 1);
     } else if op == ir.OP_INTR {
         d = ub_intr(x, depth);
     } else if op == ir.OP_LOAD {
         d = table_max(x);
-    } else if (op == ir.OP_LSHR) and cb.is_k(x.b) and (ir.cint_val(x.b) < 63) {
+    } else if (op == ir.OP_LSHR) and ir.is_cint(x.b) and (ir.cint_val(x.b) < 63) {
         let a = ub(x.a, depth + 1);
         if a >= 0 {
             d = a >> @truncate(u32, ir.cint_val(x.b));
@@ -1818,7 +1795,7 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
         }
     } else if (op == ir.OP_ZEXT) or (op == ir.OP_TRUNC) {
         d = ub(x.a, depth + 1);
-    } else if (op == ir.OP_ADD) and cb.is_k(x.b) and (x.ty.bits > 1) and
+    } else if (op == ir.OP_ADD) and ir.is_cint(x.b) and (x.ty.bits > 1) and
               (ir.cint_val(x.b) > (ir.mask_bits(x.ty.bits) >> 1)) {
         // y - c, exact when y >= c, which a result known not negative also
         // shows when y is: else it would be y - c + 2^bits, at least
@@ -1855,7 +1832,7 @@ fn ub(x: *mut ir.Value, depth: i32) i64 {
            fits_type(a * kv(x.b), x.ty) {
             d = a * kv(x.b);
         }
-    } else if (op == ir.OP_SHL) and cb.is_k(x.b) and (ir.cint_val(x.b) < 32) {
+    } else if (op == ir.OP_SHL) and ir.is_cint(x.b) and (ir.cint_val(x.b) < 32) {
         let a = ub(x.a, depth + 1);
         if (a >= 0) and (a < 0x1_0000_0000) and fits_type(a << @truncate(u32, ir.cint_val(x.b)), x.ty) {
             d = a << @truncate(u32, ir.cint_val(x.b));
@@ -1899,7 +1876,7 @@ fn lb(x: *mut ir.Value, depth: i32) i64 {
     if small_k(x) {
         return kv(x);
     }
-    if is_inst(x, ir.OP_INTR) and (intr_id(x) == ir.IN_CTLZ) and (x.xs.len == 1) and (x.ty.kind == ir.T_INT) {
+    if ir.is_op(x, ir.OP_INTR) and (ir.intr_id(x) == ir.IN_CTLZ) and (x.xs.len == 1) and (x.ty.kind == ir.T_INT) {
         let a = x.xs.get(0);
         let m = ub(a, depth + 1);
         if (m >= 0) and (a.ty.bits <= 64) {
@@ -1987,7 +1964,7 @@ fn ub_phi(x: *mut ir.Value, depth: i32) i64 {
 // one for leading or trailing zeros of a value known not zero, and trailing
 // zeros are below its highest possible bit), minimums and maximums.
 fn ub_intr(x: *mut ir.Value, depth: i32) i64 {
-    let id = intr_id(x);
+    let id = ir.intr_id(x);
     if x.xs.len < 1 {
         return -1;
     }
@@ -2024,10 +2001,10 @@ fn ub_intr(x: *mut ir.Value, depth: i32) i64 {
         let mut q = ub(b, depth + 1);
         if id == ir.IN_SMAX {
             // the larger with a constant not negative is not negative
-            if cb.is_k(b) and (ir.sval(b) >= 0) and ((p < 0) or (p > smax_of(a.ty))) {
+            if ir.is_cint(b) and (ir.sval(b) >= 0) and ((p < 0) or (p > smax_of(a.ty))) {
                 p = smax_of(a.ty);
             }
-            if cb.is_k(a) and (ir.sval(a) >= 0) and ((q < 0) or (q > smax_of(a.ty))) {
+            if ir.is_cint(a) and (ir.sval(a) >= 0) and ((q < 0) or (q > smax_of(a.ty))) {
                 q = smax_of(a.ty);
             }
         }
@@ -2063,7 +2040,7 @@ fn table_max(i: *mut ir.Value) i64 {
     let sz = i.ty.size;
     let mut p = i.a;
     let mut n: i32 = 0;
-    while is_inst(p, ir.OP_PTRADD) {
+    while ir.is_op(p, ir.OP_PTRADD) {
         n += 1;
         if (n > 8) or not mult_of(p.b, sz, 0) {
             return -1;
@@ -2092,7 +2069,7 @@ fn mult_of(v: *ir.Value, sz: u64, depth: i32) bool {
     if sz == 1 {
         return true;
     }
-    if cb.is_k(v) {
+    if ir.is_cint(v) {
         return (ir.cint_val(v) % sz) == 0;
     }
     if (v.kind != ir.V_INST) or (depth > 4) {
@@ -2101,7 +2078,7 @@ fn mult_of(v: *ir.Value, sz: u64, depth: i32) bool {
     if (v.op == ir.OP_MUL) and (mult_of(v.a, sz, depth + 1) or mult_of(v.b, sz, depth + 1)) {
         return true;
     }
-    if (v.op == ir.OP_SHL) and cb.is_k(v.b) and (ir.cint_val(v.b) < 32) {
+    if (v.op == ir.OP_SHL) and ir.is_cint(v.b) and (ir.cint_val(v.b) < 32) {
         return (((@as(u64, 1) << @truncate(u32, ir.cint_val(v.b))) % sz) == 0) or mult_of(v.a, sz, depth + 1);
     }
     if (v.op == ir.OP_ADD) or (v.op == ir.OP_SUB) {
@@ -2154,27 +2131,27 @@ fn fits_type(v: i64, t: *ir.Ty) bool {
 
 // The value of an unsigned comparison the bounds decide, or nil.
 fn decide(i: *mut ir.Value) *mut ir.Value {
-    let mut p = cb.pred_of(i);
+    let mut p = ir.pred_of(i);
     let a = i.a;
     let b = i.b;
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) or (i.ty.kind != ir.T_INT) {
         return vnil();
     }
     // comparisons with constants near the top of the range (overflow checks)
-    if cb.is_k(b) and not small_k(b) and (a.ty.bits == 64) {
+    if ir.is_cint(b) and not small_k(b) and (a.ty.bits == 64) {
         let d = @bit_cast(i64, ir.mask_bits(64) - ir.cint_val(b));  // b = MAX - d
         if (d < 0x1_0000_0000) and (((p == ir.IntULE) and (d >= 1)) or ((p == ir.IntULT) and (d >= 0))) {
             prove_budget = 64;
             let need = d + pick1(p == ir.IntULT);
             if below_max(a, need, 0) {
-                return kbool(true);
+                return ir.kbool(true);
             }
         }
         if (d < 0x1_0000_0000) and (((p == ir.IntUGT) and (d >= 1)) or ((p == ir.IntUGE) and (d >= 0))) {
             prove_budget = 64;
             let need = d + pick1(p == ir.IntUGE);
             if below_max(a, need, 0) {
-                return kbool(false);
+                return ir.kbool(false);
             }
         }
         return vnil();
@@ -2188,14 +2165,14 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             p = p - (ir.IntSGT - ir.IntUGT);  // both not negative: the unsigned comparison
         }
         if (kv(b) == 0) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
-            return kbool(p == ir.IntUGE);
+            return ir.kbool(p == ir.IntUGE);
         }
         if m >= 0 {
             if ((p == ir.IntULT) and (m < kv(b))) or ((p == ir.IntUGE) and (m < kv(b))) {
-                return kbool(p == ir.IntULT);
+                return ir.kbool(p == ir.IntULT);
             }
             if ((p == ir.IntULE) and (m <= kv(b))) or ((p == ir.IntUGT) and (m <= kv(b))) {
-                return kbool(p == ir.IntULE);
+                return ir.kbool(p == ir.IntULE);
             }
         }
     }
@@ -2206,7 +2183,7 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             need += 1;
         }
         if at_least(a, need, 0) {
-            return kbool((p == ir.IntUGE) or (p == ir.IntUGT));
+            return ir.kbool((p == ir.IntUGE) or (p == ir.IntUGT));
         }
     }
     // k <= x, k < x (and their negations) likewise
@@ -2217,12 +2194,12 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
             need += 1;
         }
         if at_least(b, need, 0) {
-            return kbool((p == ir.IntULE) or (p == ir.IntULT));
+            return ir.kbool((p == ir.IntULE) or (p == ir.IntULT));
         }
     }
     // (x - d) against k >= 0, signed, with x in [0, ub(x)] and no overflow:
     // x - d >= k exactly when x >= d + k
-    if small_k(b) and is_inst(a, ir.OP_ADD) and cb.is_k(a.b) and not ir.is_const(a.a) and (p >= ir.IntSGT) and
+    if small_k(b) and ir.is_op(a, ir.OP_ADD) and ir.is_cint(a.b) and not ir.is_const(a.a) and (p >= ir.IntSGT) and
        (p <= ir.IntSLE) and (a.ty.bits > 1) {
         let d = 0 - ir.sval(a.b);
         let m = ub(a.a, 0);
@@ -2232,31 +2209,31 @@ fn decide(i: *mut ir.Value) *mut ir.Value {
         }
         if (d >= 1) and (d < 0x1_0000_0000) and (m >= 0) and (m <= smax_of(a.ty)) and (need >= 1) and
            (need <= smax_of(a.ty)) and known_at_least(a.a, need) {
-            return kbool((p == ir.IntSGT) or (p == ir.IntSGE));
+            return ir.kbool((p == ir.IntSGT) or (p == ir.IntSGE));
         }
     }
-    if is_inst(a, ir.OP_ADD) and ((a.a == b) or (a.b == b)) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
+    if ir.is_op(a, ir.OP_ADD) and ((a.a == b) or (a.b == b)) and ((p == ir.IntUGE) or (p == ir.IntULT)) {
         prove_budget = 64;
         let x = ub(a.a, 0);
         let y = ub(a.b, 0);
         if (x >= 0) and (y >= 0) and fits_type(x + y, a.ty) {
-            return kbool(p == ir.IntUGE);
+            return ir.kbool(p == ir.IntUGE);
         }
     }
     if (p == ir.IntULT) or (p == ir.IntUGE) {
         // a < b: a <= b - 1; a >= b: b <= a
         if prove_le(a, b, -1) {
-            return kbool(p == ir.IntULT);
+            return ir.kbool(p == ir.IntULT);
         }
         if not ir.is_const(b) and prove_le(b, a, 0) {
-            return kbool(p == ir.IntUGE);
+            return ir.kbool(p == ir.IntUGE);
         }
     } else if (p == ir.IntULE) or (p == ir.IntUGT) {
         if prove_le(a, b, 0) {
-            return kbool(p == ir.IntULE);
+            return ir.kbool(p == ir.IntULE);
         }
         if not ir.is_const(b) and prove_le(b, a, -1) {
-            return kbool(p == ir.IntUGT);
+            return ir.kbool(p == ir.IntUGT);
         }
     }
     return vnil();
@@ -2387,7 +2364,7 @@ fn visit_block(b: *mut ir.Block) void {
         }
         if (op == ir.OP_SUB) and small_k(i.a) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and
            not ir.is_const(i.b) and (kv(i.a) >= 1) and ((kv(i.a) & (kv(i.a) + 1)) == 0) and
-           not (tg.clz_is_bsr() and is_inst(i.b, ir.OP_INTR) and (intr_id(i.b) == ir.IN_CTLZ)) {
+           not (tg.clz_is_bsr() and ir.is_op(i.b, ir.OP_INTR) and (ir.intr_id(i.b) == ir.IN_CTLZ)) {
             // k - y with k = 2^n - 1 and y <= k: k ^ y (no borrow; one
             // instruction in place on x86-64, 31 - ctlz(x) after lzcnt)
             prove_budget = 64;
@@ -2823,25 +2800,8 @@ fn pre_load(f: *mut ir.Func, b: *mut ir.Block, i: *mut ir.Value, vals: []mut *mu
             if n != 1 {
                 return;
             }
-            at = ir.append_block(f, "pre");
+            at = ir.split_edge(f, "pre", p, b);
             at.rpo = -1;
-            let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
-            br.t1 = b;
-            ir.append_inst(at, br);
-            for k in 0..ir.succ_count(t) {
-                if ir.succ(t, k) == b {
-                    ir.set_succ(t, k, at);
-                }
-            }
-            let mut ph = b.first;
-            while u.notnil(ph) and (ph.op == ir.OP_PHI) {
-                for k in 0..ph.bs.len {
-                    if ph.bs.get(k) == p {
-                        ph.bs.set(k, at);
-                    }
-                }
-                ph = ph.next;
-            }
             b.preds.set(@int_cast(usize, missing), at);
         }
         ir.at_before(B, ir.terminator(at));
@@ -3039,7 +2999,7 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             killed.clear();
             at_ret = false;
             ss_reads();
-        } else if intr_id(i) == ir.IN_LOAD_PARTIAL {
+        } else if ir.intr_id(i) == ir.IN_LOAD_PARTIAL {
             let l = partial_loc(i);
             read_loc(killed, &l);
             if noalias_global(l.obj) and (ss_field(&l) != 0) {
@@ -3048,10 +3008,10 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
             if u.notnil(l.obj) {
                 read_objs.push(l.obj);
             }
-        } else if (intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(intr_id(i)) {
+        } else if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
             // (writes part of its location: nothing it makes dead, nothing it
             // reads; a prefetch neither reads nor writes)
-        } else if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
+        } else if (op == ir.OP_INTR) and not pure_intr(ir.intr_id(i)) {
             killed.clear();
             at_ret = false;
             ss_reads();
@@ -3108,14 +3068,14 @@ fn ss_reader(i: *mut ir.Value, depth: bool) bool {
     if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
         return true;
     }
-    if intr_id(i) == ir.IN_LOAD_PARTIAL {
+    if ir.intr_id(i) == ir.IN_LOAD_PARTIAL {
         let l = partial_loc(i);
         return noalias_global(l.obj);
     }
-    if (intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(intr_id(i)) {
+    if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
         return false;
     }
-    if (op == ir.OP_INTR) and not pure_intr(@truncate(i32, @bit_cast(i64, i.cv))) {
+    if (op == ir.OP_INTR) and not pure_intr(ir.intr_id(i)) {
         return true;
     }
     if (op == ir.OP_RET) and depth {
@@ -3467,28 +3427,13 @@ pub fn ss_opt(f: *mut ir.Func) bool {
 fn licm_speculatable(i: *ir.Value) bool {
     let op = i.op;
     if (op == ir.OP_UDIV) or (op == ir.OP_SDIV) or (op == ir.OP_UREM) or (op == ir.OP_SREM) {
-        if not cb.is_k(i.b) or (ir.cint_val(i.b) == 0) {
+        if not ir.is_cint(i.b) or (ir.cint_val(i.b) == 0) {
             return false;
         }
         // (a signed division by -1 overflows for MIN: the checks come first)
         return ((op == ir.OP_UDIV) or (op == ir.OP_UREM)) or (ir.sval(i.b) != -1);
     }
     return cse_able(i);
-}
-
-fn loop_headers(order: *u.List.[*mut ir.Block]) u.List.[*mut ir.Block] {
-    let mut hs = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
-    for i in 1..order.len {
-        let h = order.get(i);
-        for k in 0..h.preds.len {
-            let p = h.preds.get(k);
-            if (p.rpo >= 0) and opt.dominates(h, p) {
-                hs.push(h);
-                break;
-            }
-        }
-    }
-    return hs;
 }
 
 let mut loop_mark: i64 = 0x1000_0000;
@@ -3512,13 +3457,7 @@ fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
         br.t1 = h;
         ir.append_inst(pre, br);
         for k in 0..outside.len {
-            let q = outside.get(k);
-            let t = ir.terminator(q);
-            for j in 0..ir.succ_count(t) {
-                if ir.succ(t, j) == h {
-                    ir.set_succ(t, j, pre);
-                }
-            }
+            ir.retarget(outside.get(k), h, pre);
         }
         // h's phis: the outside inputs merge in the preheader
         let bld = ir.new_builder();
@@ -3535,10 +3474,7 @@ fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
                 if from.mark != tag {
                     if u.notnil(np) {
                         ir.add_incoming(np, p.xs.get(k), from);
-                        p.bs.set(k, p.bs.get(p.bs.len - 1));
-                        p.xs.set(k, p.xs.get(p.xs.len - 1));
-                        p.bs.len -= 1;
-                        p.xs.len -= 1;
+                        ir.remove_incoming(p, k);
                         continue;
                     }
                     p.bs.set(k, pre);
@@ -3562,7 +3498,7 @@ fn deref_ok(l: *Loc, size: i64) bool {
         return false;
     }
     let mut objsize: u64 = 0;
-    if is_inst(l.obj, ir.OP_ALLOCA) {
+    if ir.is_op(l.obj, ir.OP_ALLOCA) {
         objsize = l.obj.aty.size;
     } else if l.obj.kind == ir.V_GLOBAL {
         if l.obj.gv.tls {
@@ -3582,7 +3518,7 @@ pub fn licm(f: *mut ir.Func) bool {
     // preheaders
     opt.compute_preds(f);
     let mut order = opt.dominators(f);
-    let mut hs = loop_headers(&order);
+    let mut hs = opt.loop_headers(&order);
     if hs.len == 0 {
         u.free(@ptr_cast(*mut void, order.data));
         return false;
@@ -3601,7 +3537,7 @@ pub fn licm(f: *mut ir.Func) bool {
         u.free(@ptr_cast(*mut void, hs.data));
         opt.compute_preds(f);
         order = opt.dominators(f);
-        hs = loop_headers(&order);
+        hs = opt.loop_headers(&order);
     }
     escapes(f);
     // inner loops first
@@ -3719,7 +3655,7 @@ fn same_bytes(v: *ir.Value) i64 {
         }
         return -1;
     }
-    if not cb.is_k(v) {
+    if not ir.is_cint(v) {
         return -1;
     }
     let x = ir.cint_val(v);
@@ -3735,17 +3671,17 @@ fn same_bytes(v: *ir.Value) i64 {
 
 // The element index of an address base + i * size (or base + i for bytes).
 fn strided(p: *mut ir.Value, i: *mut ir.Value, size: u64) *mut ir.Value {
-    if not is_inst(p, ir.OP_PTRADD) {
+    if not ir.is_op(p, ir.OP_PTRADD) {
         return vnil();
     }
     let off = p.b;
     if (size == 1) and (off == i) {
         return p.a;
     }
-    if is_inst(off, ir.OP_MUL) and (off.a == i) and cb.is_k(off.b) and (ir.cint_val(off.b) == size) {
+    if ir.is_op(off, ir.OP_MUL) and (off.a == i) and ir.is_cint(off.b) and (ir.cint_val(off.b) == size) {
         return p.a;
     }
-    if is_inst(off, ir.OP_SHL) and (off.a == i) and cb.is_k(off.b) and (ir.cint_val(off.b) < 8) and
+    if ir.is_op(off, ir.OP_SHL) and (off.a == i) and ir.is_cint(off.b) and (ir.cint_val(off.b) < 8) and
        ((@as(u64, 1) << @truncate(u32, ir.cint_val(off.b))) == size) {
         return p.a;
     }
@@ -3797,10 +3733,10 @@ fn try_memset(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         return false;
     }
     let c = ht.a;
-    if not is_inst(c, ir.OP_ICMP) or (c.a != i) or (c.blk != h) or (c.next != ht) or (i.next != c) {
+    if not ir.is_op(c, ir.OP_ICMP) or (c.a != i) or (c.blk != h) or (c.next != ht) or (i.next != c) {
         return false;
     }
-    let p = cb.pred_of(c);
+    let p = ir.pred_of(c);
     let mut exit = ht.t2;
     if (p == ir.IntULT) and (ht.t1 == body) {
         exit = ht.t2;
@@ -3844,7 +3780,7 @@ fn try_memset(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
     if u.isnil(st) or (st.flags != 0) or not invariant(st.a, tag) {
         return false;
     }
-    if not (is_inst(next, ir.OP_ADD) and (next.a == i) and cb.is_kv1(next.b)) {
+    if not (ir.is_op(next, ir.OP_ADD) and (next.a == i) and cb.is_kv1(next.b)) {
         return false;
     }
     let size = st.a.ty.size;
@@ -3888,7 +3824,7 @@ pub fn loop_idioms(f: *mut ir.Func) bool {
     }
     opt.compute_preds(f);
     let order = opt.dominators(f);
-    let hs = loop_headers(&order);
+    let hs = opt.loop_headers(&order);
     let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     let mut any = false;
     for k in 0..hs.len {
@@ -3948,14 +3884,14 @@ fn check_bound(x: *mut ir.Block, i: *mut ir.Value, tag: i64) *mut ir.Value {
         return vnil();
     }
     let c = ir.resolve(t.a);
-    if not is_inst(c, ir.OP_ICMP) or (ir.resolve(c.a) != i) {
+    if not ir.is_op(c, ir.OP_ICMP) or (ir.resolve(c.a) != i) {
         return vnil();
     }
     let l = ir.resolve(c.b);
     if (l.ty != i.ty) or not invariant(l, tag) {
         return vnil();
     }
-    let p = cb.pred_of(c);
+    let p = ir.pred_of(c);
     if (p == ir.IntULT) and (t.t1.mark == tag) and trap_exit(t.t2, tag) {
         return l;
     }
@@ -3972,16 +3908,16 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     }
     // the header's test: i < end
     let c = ir.resolve(ht.a);
-    if not is_inst(c, ir.OP_ICMP) {
+    if not ir.is_op(c, ir.OP_ICMP) {
         return false;
     }
     let i = ir.resolve(c.a);
     let end = ir.resolve(c.b);
-    if not is_inst(i, ir.OP_PHI) or (i.blk != h) or (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or (end.ty != i.ty) or
+    if not ir.is_op(i, ir.OP_PHI) or (i.blk != h) or (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or (end.ty != i.ty) or
        not invariant(end, tag) {
         return false;
     }
-    let p = cb.pred_of(c);
+    let p = ir.pred_of(c);
     let mut exit = ir.bnil();
     if (p == ir.IntULT) and (ht.t1.mark == tag) and (ht.t2.mark != tag) {
         exit = ht.t2;
@@ -4052,10 +3988,7 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     // the copy leaves at i >= m for mid, which enters the loop
     let h2 = @ptr_cast(*mut ir.Block, h.auxp);
     let ht2 = ir.terminator(h2);
-    let mid = ir.append_block(f, "split");
-    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
-    br.t1 = h;
-    ir.append_inst(mid, br);
+    let mid = ir.edge_block(f, "split", pre, h);
     ir.at_before(bld, ht2);
     ht2.a = ir.icmp(bld, p, @ptr_cast(*mut ir.Value, i.auxp), m);
     if ht2.t1 == exit {
@@ -4066,19 +3999,13 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     let mut q = h.first;
     while u.notnil(q) and (q.op == ir.OP_PHI) {
         for k in 0..q.bs.len {
-            if q.bs.get(k) == pre {
-                q.bs.set(k, mid);
+            if q.bs.get(k) == mid {
                 q.xs.set(k, @ptr_cast(*mut ir.Value, q.auxp));
             }
         }
         q = q.next;
     }
-    let t = ir.terminator(pre);
-    for j in 0..ir.succ_count(t) {
-        if ir.succ(t, j) == h {
-            ir.set_succ(t, j, h2);
-        }
-    }
+    ir.retarget(pre, h, h2);
     h.split = true;
     h2.split = true;
     return true;
@@ -4096,7 +4023,7 @@ pub fn split_loops(f: *mut ir.Func) bool {
         rounds += 1;
         opt.compute_preds(f);
         let order = opt.dominators(f);
-        let hs = loop_headers(&order);
+        let hs = opt.loop_headers(&order);
         let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
         let mut did = false;
         for k in 0..hs.len {
@@ -4153,8 +4080,8 @@ fn writes_mem(x: *ir.Value) bool {
     let op = x.op;
     return (op == ir.OP_STORE) or (op == ir.OP_CALL) or (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or
            (op == ir.OP_MEMSET) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) or
-           ((op == ir.OP_INTR) and not cse_able(x) and (intr_id(x) != ir.IN_LOAD_PARTIAL) and
-            not ir.is_prefetch(intr_id(x))) or ((op == ir.OP_LOAD) and (x.flags != 0));
+           ((op == ir.OP_INTR) and not cse_able(x) and (ir.intr_id(x) != ir.IN_LOAD_PARTIAL) and
+            not ir.is_prefetch(ir.intr_id(x))) or ((op == ir.OP_LOAD) and (x.flags != 0));
 }
 
 // The blocks using v: their common dominator (nil: no uses).
@@ -4192,7 +4119,7 @@ fn sink_fills(f: *mut ir.Func, uses: *u.List.[u.List.[*mut ir.Value]]) bool {
         let mut i = b.first;
         while u.notnil(i) {
             let next = i.next;
-            if (i.op == ir.OP_MEMSET) and (b.rpo >= 0) and (i.aux >= 0) and is_inst(i.a, ir.OP_ALLOCA) and
+            if (i.op == ir.OP_MEMSET) and (b.rpo >= 0) and (i.aux >= 0) and ir.is_op(i.a, ir.OP_ALLOCA) and
                (i.a.aux >= 0) {
                 let mut users = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
                 let mut ok = true;
@@ -4248,11 +4175,8 @@ fn fill_places(r: *mut ir.Block, users: []*mut ir.Value, to: *mut u.List.[*mut i
     let mut t = l;
     let mut c = l;
     while c != r {
-        for k in 0..c.preds.len {
-            let p = c.preds.get(k);
-            if (p.rpo >= 0) and opt.dominates(c, p) {
-                t = c.idom;
-            }
+        if opt.is_loop_header(c) {
+            t = c.idom;
         }
         c = c.idom;
     }
@@ -4557,7 +4481,7 @@ fn iv_step(v0: *mut ir.Value, h: *mut ir.Block, tag: i64, ok: *mut bool, ops: *m
         for k in @as(usize, 0)..2 {
             if v.bs.get(k).mark == tag {
                 let n = ir.resolve(v.xs.get(k));
-                if is_inst(n, ir.OP_ADD) and (ir.resolve(n.a) == v) and cb.is_k(ir.resolve(n.b)) {
+                if ir.is_op(n, ir.OP_ADD) and (ir.resolve(n.a) == v) and ir.is_cint(ir.resolve(n.b)) {
                     return @bit_cast(i64, ir.cint_val(ir.resolve(n.b)));
                 }
             }
@@ -4575,7 +4499,7 @@ fn iv_step(v0: *mut ir.Value, h: *mut ir.Block, tag: i64, ok: *mut bool, ops: *m
         }
         return a -% b;
     }
-    if ((op == ir.OP_MUL) or (op == ir.OP_SHL)) and cb.is_k(ir.resolve(v.b)) {
+    if ((op == ir.OP_MUL) or (op == ir.OP_SHL)) and ir.is_cint(ir.resolve(v.b)) {
         let a = iv_step(v.a, h, tag, ok, ops, mulk, depth + 1);
         let k = @bit_cast(i64, ir.cint_val(ir.resolve(v.b)));
         ops.* += 1;
@@ -4675,7 +4599,7 @@ fn lin_term(l: *mut Lin, v: *mut ir.Value, c: i64) void {
 // Adds integer v * s to l.
 fn lin_add(v0: *mut ir.Value, s: i64, l: *mut Lin, depth: i32) void {
     let v = ir.resolve(v0);
-    if cb.is_k(v) {
+    if ir.is_cint(v) {
         l.k = l.k +% (ir.sval(v) *% s);
         return;
     }
@@ -4683,21 +4607,21 @@ fn lin_add(v0: *mut ir.Value, s: i64, l: *mut Lin, depth: i32) void {
         l.ok = false;
         return;
     }
-    if is_inst(v, ir.OP_ADD) {
+    if ir.is_op(v, ir.OP_ADD) {
         lin_add(v.a, s, l, depth + 1);
         lin_add(v.b, s, l, depth + 1);
         return;
     }
-    if is_inst(v, ir.OP_SUB) {
+    if ir.is_op(v, ir.OP_SUB) {
         lin_add(v.a, s, l, depth + 1);
         lin_add(v.b, 0 -% s, l, depth + 1);
         return;
     }
-    if is_inst(v, ir.OP_MUL) and cb.is_k(ir.resolve(v.b)) {
+    if ir.is_op(v, ir.OP_MUL) and ir.is_cint(ir.resolve(v.b)) {
         lin_add(v.a, s *% ir.sval(ir.resolve(v.b)), l, depth + 1);
         return;
     }
-    if is_inst(v, ir.OP_SHL) and cb.is_k(ir.resolve(v.b)) and (ir.sval(ir.resolve(v.b)) >= 0) and
+    if ir.is_op(v, ir.OP_SHL) and ir.is_cint(ir.resolve(v.b)) and (ir.sval(ir.resolve(v.b)) >= 0) and
        (ir.sval(ir.resolve(v.b)) < 63) {
         lin_add(v.a, s *% (@as(i64, 1) << @truncate(u32, @bit_cast(u64, ir.sval(ir.resolve(v.b))))), l, depth + 1);
         return;
@@ -4709,7 +4633,7 @@ fn lin_add(v0: *mut ir.Value, s: i64, l: *mut Lin, depth: i32) void {
 fn lin_ptr(p0: *mut ir.Value, l: *mut Lin) *mut ir.Value {
     let mut p = ir.resolve(p0);
     let mut n: i32 = 0;
-    while is_inst(p, ir.OP_PTRADD) and (n < 8) {
+    while ir.is_op(p, ir.OP_PTRADD) and (n < 8) {
         lin_add(p.b, 1, l, 0);
         p = ir.resolve(p.a);
         n += 1;
@@ -4768,7 +4692,7 @@ fn try_reduce(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
                         if u.isnil(q) and (e.step == st) {
                             if (e.base == base) and (e.off0 == off0) {
                                 q = e.q;
-                            } else if (e.base == base) and cb.is_k(e.off0) and cb.is_k(off0) {
+                            } else if (e.base == base) and ir.is_cint(e.off0) and ir.is_cint(off0) {
                                 q = e.q;
                                 d = @bit_cast(i64, ir.cint_val(off0)) -% @bit_cast(i64, ir.cint_val(e.off0));
                             } else if not no_modes {
@@ -4819,7 +4743,7 @@ pub fn reduce_addresses(f: *mut ir.Func, no_modes: bool) bool {
     let mut any = false;
     opt.compute_preds(f);
     let order = opt.dominators(f);
-    let hs = loop_headers(&order);
+    let hs = opt.loop_headers(&order);
     let mut members = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     // inner loops first (their pointers' starts are then reduced in the outer ones)
     let mut k = hs.len;

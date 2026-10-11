@@ -169,6 +169,32 @@ pub fn dominates(a: *mut ir.Block, b0: *mut ir.Block) bool {
     return b == a;
 }
 
+// Is the edge from p into h a back edge (p reachable, and h dominates it)?
+pub fn is_back_edge(p: *mut ir.Block, h: *mut ir.Block) bool {
+    return (p.rpo >= 0) and dominates(h, p);
+}
+
+// Does a back edge enter h?
+pub fn is_loop_header(h: *mut ir.Block) bool {
+    for k in 0..h.preds.len {
+        if is_back_edge(h.preds.get(k), h) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The loop headers in `order` (after its first block), in that order.
+pub fn loop_headers(order: *u.List.[*mut ir.Block]) u.List.[*mut ir.Block] {
+    let mut hs = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+    for i in 1..order.len {
+        if is_loop_header(order.get(i)) {
+            hs.push(order.get(i));
+        }
+    }
+    return hs;
+}
+
 // The blocks of the loop with header h (h first): the blocks that reach a
 // back edge into h without passing through h, each marked tag.
 pub fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) void {
@@ -178,7 +204,7 @@ pub fn members_of(h: *mut ir.Block, tag: i64, out: *mut u.List.[*mut ir.Block]) 
     let mut work = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     for k in 0..h.preds.len {
         let p = h.preds.get(k);
-        if (p.rpo >= 0) and dominates(h, p) and (p.mark != tag) {
+        if is_back_edge(p, h) and (p.mark != tag) {
             p.mark = tag;
             work.push(p);
         }
@@ -265,7 +291,7 @@ pub fn loop_depths(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) void {
         let mut body = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
         for k in 0..h.preds.len {
             let p = h.preds.get(k);
-            if (p.rpo >= 0) and dominates(h, p) {
+            if is_back_edge(p, h) {
                 body.push(p);
             }
         }
@@ -319,7 +345,7 @@ fn promotable_use(i: *mut ir.Value, a: *mut ir.Value) bool {
 }
 
 fn mark_escape(o: *mut ir.Value, i: *mut ir.Value) void {
-    if u.notnil(o) and (o.kind == ir.V_INST) and (o.op == ir.OP_ALLOCA) {
+    if ir.is_op(o, ir.OP_ALLOCA) {
         if not promotable_use(i, o) {
             o.aux = -1;
         }
@@ -357,7 +383,7 @@ pub fn mem2reg(f: *mut ir.Func) void {
             mark_escape(i.c, i);
             for k in 0..i.xs.len {
                 let o = i.xs.get(k);
-                if (o.kind == ir.V_INST) and (o.op == ir.OP_ALLOCA) {
+                if ir.is_op(o, ir.OP_ALLOCA) {
                     o.aux = -1;
                 }
             }
@@ -390,7 +416,7 @@ pub fn mem2reg(f: *mut ir.Func) void {
         let bb = order.get(bi);
         let mut i = bb.first;
         while u.notnil(i) {
-            if (i.op == ir.OP_STORE) and (i.b.kind == ir.V_INST) and (i.b.op == ir.OP_ALLOCA) and (i.b.aux > 0) {
+            if (i.op == ir.OP_STORE) and ir.is_op(i.b, ir.OP_ALLOCA) and (i.b.aux > 0) {
                 let s = slots.get(@int_cast(usize, i.b.aux - 1));
                 if (s.defs.len == 0) or (s.defs.last() != bb) {
                     s.defs.push(bb);
@@ -475,7 +501,7 @@ pub fn mem2reg(f: *mut ir.Func) void {
 }
 
 fn slot_of_ptr(slots: []mut *mut Slot, p: *mut ir.Value) *mut Slot {
-    if (p.kind == ir.V_INST) and (p.op == ir.OP_ALLOCA) and (p.aux > 0) {
+    if ir.is_op(p, ir.OP_ALLOCA) and (p.aux > 0) {
         return slots[@int_cast(usize, p.aux - 1)];
     }
     return u.nil.[Slot]();
@@ -584,7 +610,7 @@ fn has_side_effects(i: *ir.Value) bool {
         return i.flags != 0;
     }
     if op == ir.OP_INTR {
-        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        let id = ir.intr_id(i);
         return (id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_WAIT32) or (id == ir.IN_NOTIFY) or
                (id == ir.IN_SET_SP) or (id == ir.IN_GET_SP) or (id == ir.IN_FRAME_ADDR) or (id == ir.IN_MEMSIZE) or
                (id == ir.IN_CPUID) or (id == ir.IN_XGETBV) or (id == ir.IN_STORE_PARTIAL) or ir.is_prefetch(id);
@@ -609,7 +635,7 @@ fn const_lane(v: *mut ir.Value, k: usize) *mut ir.Value {
         }
         return vnil();
     }
-    if (v.kind == ir.V_INST) and (v.op == ir.OP_SPLAT) and is_ci(v.a) {
+    if ir.is_op(v, ir.OP_SPLAT) and is_ci(v.a) {
         return v.a;
     }
     return vnil();
@@ -637,7 +663,7 @@ fn fold_vec(i: *mut ir.Value) *mut ir.Value {
         }
         if op == ir.OP_ICMP {
             let mut r: u64 = 0;
-            if ir.cint_val(ir.icmp(FB, @truncate(i32, @bit_cast(i64, i.cv)), x, y)) != 0 {
+            if ir.cint_val(ir.fold_icmp(ir.pred_of(i), x, y)) != 0 {
                 r = ir.mask_bits(i.ty.elem.bits);
             }
             xs[k] = ir.cint(i.ty.elem, r);
@@ -729,7 +755,7 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
         return fold_float_bin(i);
     }
     if (op == ir.OP_ICMP) and (i.ty.kind == ir.T_INT) and is_ci(i.a) and is_ci(i.b) and (i.a.ty.kind == ir.T_INT) {
-        return ir.icmp(B, @truncate(i32, @bit_cast(i64, i.cv)), i.a, i.b);
+        return ir.icmp(B, ir.pred_of(i), i.a, i.b);
     }
     if op == ir.OP_SELECT {
         if i.a.kind == ir.V_CINT {
@@ -983,36 +1009,6 @@ pub fn dce(f: *mut ir.Func) void {
     }
 }
 
-fn remove_phi_input(s: *mut ir.Block, from: *mut ir.Block) void {
-    let mut p = s.first;
-    while u.notnil(p) and (p.op == ir.OP_PHI) {
-        let mut k: usize = 0;
-        while k < p.bs.len {
-            if p.bs.get(k) == from {
-                p.bs.set(k, p.bs.get(p.bs.len - 1));
-                p.xs.set(k, p.xs.get(p.xs.len - 1));
-                p.bs.len -= 1;
-                p.xs.len -= 1;
-            } else {
-                k += 1;
-            }
-        }
-        p = p.next;
-    }
-}
-
-fn replace_phi_block(s: *mut ir.Block, old: *mut ir.Block, new: *mut ir.Block) void {
-    let mut p = s.first;
-    while u.notnil(p) and (p.op == ir.OP_PHI) {
-        for k in 0..p.bs.len {
-            if p.bs.get(k) == old {
-                p.bs.set(k, new);
-            }
-        }
-        p = p.next;
-    }
-}
-
 fn has_phis(b: *ir.Block) bool {
     return u.notnil(b.first) and (b.first.op == ir.OP_PHI);
 }
@@ -1035,7 +1031,7 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
                     drop = t.t1;
                 }
                 if drop != keep {
-                    remove_phi_input(drop, b);
+                    ir.remove_phi_input(drop, b);
                 }
                 t.op = ir.OP_BR;
                 t.a = vnil();
@@ -1053,7 +1049,7 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
             for k in 0..ir.succ_count(t) {
                 let s = ir.succ(t, k);
                 if s != target {
-                    remove_phi_input(s, b);
+                    ir.remove_phi_input(s, b);
                 }
             }
             t.op = ir.OP_BR;
@@ -1121,7 +1117,7 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
                 let nt = ir.terminator(b);
                 for k in 0..ir.succ_count(nt) {
                     let ss = ir.succ(nt, k);
-                    replace_phi_block(ss, s, b);
+                    ir.replace_phi_block(ss, s, b);
                     // preds of the successor: s -> b
                     for j in 0..ss.preds.len {
                         if ss.preds.get(j) == s {
@@ -1184,10 +1180,10 @@ pub fn unlikely_succ(b: *ir.Block) *mut ir.Block {
     if (c.kind != ir.V_INST) or ((c.op != ir.OP_ICMP) and (c.op != ir.OP_FCMP)) or (c.a.ty.kind == ir.T_VEC) {
         return bnil();
     }
-    let p = @as(i32, @truncate(i32, @bit_cast(i64, c.cv)));
+    let p = ir.pred_of(c);
     if c.op == ir.OP_ICMP {
         let x = c.a;
-        if is_bool(x, 0) or ((x.kind == ir.V_INST) and (x.op == ir.OP_AND) and (one_bit(x.a) or one_bit(x.b))) {
+        if is_bool(x, 0) or (ir.is_op(x, ir.OP_AND) and (one_bit(x.a) or one_bit(x.b))) {
             return bnil();  // (a boolean, or a test of one bit: either way)
         }
         if p == ir.IntEQ {
@@ -1249,7 +1245,7 @@ fn one_bit(m: *ir.Value) bool {
         let k = ir.cint_val(m);
         return (k & (k - 1)) == 0;
     }
-    return (m.kind == ir.V_INST) and (m.op == ir.OP_SHL) and (m.a.kind == ir.V_CINT) and (ir.cint_val(m.a) == 1);
+    return ir.is_op(m, ir.OP_SHL) and (m.a.kind == ir.V_CINT) and (ir.cint_val(m.a) == 1);
 }
 
 // Could control pass from a to b without a jump (b is a successor of a)?
@@ -1367,17 +1363,7 @@ fn place_unlikely(order: *mut u.List.[*mut ir.Block]) void {
 // body instead of a jump to the header followed by the test. Needs
 // dominators; b.rpo holds the positions.
 fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
-    let mut headers = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
-    for i in 1..order.len {
-        let h = order.get(i);
-        for k in 0..h.preds.len {
-            let p = h.preds.get(k);
-            if (p.rpo >= 0) and dominates(h, p) {
-                headers.push(h);
-                break;
-            }
-        }
-    }
+    let headers = loop_headers(order);
     let mut body = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
     for hi in 0..headers.len {
         let h = headers.get(hi);
@@ -1392,7 +1378,7 @@ fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
         let mut last = h.rpo;
         for k in 0..h.preds.len {
             let p = h.preds.get(k);
-            if (p.rpo >= 0) and dominates(h, p) and (p.aux != tag) {
+            if is_back_edge(p, h) and (p.aux != tag) {
                 p.aux = tag;
                 body.push(p);
             }
@@ -1461,6 +1447,11 @@ fn rotate_loops(order: *mut u.List.[*mut ir.Block]) void {
 // operand has no index register: the address is built in one first). Needs
 // dominators and predecessors.
 // -----------------------------------------------------------------------------
+
+// One constant: of one kind and type, with the same value (integers, floats
+// by their bits), or else the same Value. Stricter than inline.same_const
+// (any zeros of a type, and globals and functions by what they name) and
+// combine.same_const (any zeros, of any kind).
 fn same_const(a: *ir.Value, b: *ir.Value) bool {
     if (a.kind != b.kind) or (a.ty != b.ty) {
         return false;
@@ -1481,12 +1472,8 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
     for i in 0..order.len {
         let b = order.get(i);
         b.auxp = u.vnil();
-        for k in 0..b.preds.len {
-            let p = b.preds.get(k);
-            if (p.rpo >= 0) and dominates(b, p) {
-                headers.push(b);
-                break;
-            }
+        if is_loop_header(b) {
+            headers.push(b);
         }
     }
     if headers.len == 0 {
@@ -1510,7 +1497,7 @@ pub fn hoist_constants(f: *mut ir.Func, order: *u.List.[*mut ir.Block], needs: f
         h.auxp = @ptr_cast(*mut void, h);
         for k in 0..h.preds.len {
             let p = h.preds.get(k);
-            if (p.rpo >= 0) and dominates(h, p) and (p.aux != tag) {
+            if is_back_edge(p, h) and (p.aux != tag) {
                 p.aux = tag;
                 work.push(p);
             }
@@ -1812,32 +1799,14 @@ pub fn split_critical_edges(f: *mut ir.Func) void {
         let t = ir.terminator(b);
         let n = ir.succ_count(t);
         if n >= 2 {
-            let mut made = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
-            let mut targets = u.List.[*mut ir.Block].{ data: u.nil.[*mut ir.Block](), len: 0, cap: 0 };
+            // (every edge to s at once: a later one sees the new block,
+            // which has no predecessors yet)
             for k in 0..n {
                 let s = ir.succ(t, k);
-                if (s.preds.len < 2) or not has_phis(s) {
-                    continue;
+                if (s.preds.len >= 2) and has_phis(s) {
+                    _ = ir.split_edge(f, "edge", b, s);
                 }
-                let mut nb = bnil();
-                for j in 0..targets.len {
-                    if targets.get(j) == s {
-                        nb = made.get(j);
-                    }
-                }
-                if u.isnil(nb) {
-                    nb = ir.append_block(f, "edge");
-                    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
-                    br.t1 = s;
-                    ir.append_inst(nb, br);
-                    replace_phi_block(s, b, nb);
-                    made.push(nb);
-                    targets.push(s);
-                }
-                ir.set_succ(t, k, nb);
             }
-            u.free(@ptr_cast(*mut void, made.data));
-            u.free(@ptr_cast(*mut void, targets.data));
         }
         b = b.next;
     }
@@ -1875,12 +1844,7 @@ pub fn split_loop_exits(f: *mut ir.Func) void {
             if dup {
                 continue;  // (both successors one block: left alone)
             }
-            let nb = ir.append_block(f, "exit");
-            let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
-            br.t1 = s;
-            ir.append_inst(nb, br);
-            replace_phi_block(s, b, nb);
-            ir.set_succ(t, k, nb);
+            ir.set_succ(t, k, ir.edge_block(f, "exit", b, s));
         }
     }
     u.free(@ptr_cast(*mut void, order.data));
@@ -1918,10 +1882,10 @@ fn sinkable_cmp(c: *ir.Value) bool {
 // c is `(x & k) ==/!= 0` with the `and` used only there.
 fn sink_and(c: *ir.Value) bool {
     let x = c.a;
-    let p = @truncate(i32, @bit_cast(i64, c.cv));
+    let p = ir.pred_of(c);
     return ((p == ir.IntEQ) or (p == ir.IntNE)) and ir.is_cint(c.b) and (ir.cint_val(c.b) == 0) and
-           (x.kind == ir.V_INST) and (x.op == ir.OP_AND) and (x.aux == 1) and ir.is_cint(x.b) and
-           (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64);
+           ir.is_op(x, ir.OP_AND) and (x.aux == 1) and ir.is_cint(x.b) and (x.ty.kind == ir.T_INT) and
+           (x.ty.bits <= 64);
 }
 
 fn clone_inst(f: *mut ir.Func, i: *ir.Value, before: *mut ir.Value) *mut ir.Value {

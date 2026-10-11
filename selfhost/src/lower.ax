@@ -31,10 +31,6 @@ fn vnil() *mut ir.Value {
     return u.nil.[ir.Value]();
 }
 
-fn agg(t: *ir.Ty) bool {
-    return ir.is_agg(t);
-}
-
 fn isz(v: u64) *mut ir.Value {
     return ir.cint(ir.isz(), v);
 }
@@ -77,17 +73,17 @@ fn leaves_of(t: *mut ir.Ty, off: u64, l: *mut Leaves) bool {
 
 fn split(t: *mut ir.Ty, l: *mut Leaves) bool {
     l.n = 0;
-    return agg(t) and leaves_of(t, 0, l);
+    return ir.is_agg(t) and leaves_of(t, 0, l);
 }
 
 // The signature with aggregates passed by address (small ones as their
 // leaves) and returned through sret.
 fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
-    let mut any = agg(t.ret);
+    let mut any = ir.is_agg(t.ret);
     let mut n = t.params.len;
     let mut l = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
     for p in t.params {
-        if agg(p) {
+        if ir.is_agg(p) {
             any = true;
             if split(p, &mut l) {
                 n += l.n;
@@ -100,7 +96,7 @@ fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
     let ps = u.newn.[*mut ir.Ty](n + 2);
     let mut k: usize = 0;
     let mut rt = t.ret;
-    if agg(t.ret) {
+    if ir.is_agg(t.ret) {
         ps[0] = ir.t_ptr();
         k = 1;
         rt = ir.t_void();
@@ -111,7 +107,7 @@ fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
                 ps[k] = l.tys[j];
                 k += 1;
             }
-        } else if agg(p) {
+        } else if ir.is_agg(p) {
             ps[k] = ir.t_ptr();
             k += 1;
         } else {
@@ -127,7 +123,7 @@ fn lower_sig(f: *mut ir.Func) void {
     if nt == f.ty {
         return;
     }
-    let sret = agg(f.ty.ret);
+    let sret = ir.is_agg(f.ty.ret);
     let n = nt.params.len;
     let mut k: usize = 0;
     let ps = u.newn.[*mut ir.Value](n + 2);
@@ -152,7 +148,7 @@ fn lower_sig(f: *mut ir.Func) void {
             }
             p.auxp = @ptr_cast(*mut void, s.ptr);  // (the leaves, until lower_body makes the slot)
             f.split.push(p);
-        } else if agg(p.ty) {
+        } else if ir.is_agg(p.ty) {
             let np = ir.new_param(f, ir.t_ptr(), k);
             p.auxp = @ptr_cast(*mut void, np);  // the slot of the aggregate parameter
             ps[k] = np;
@@ -241,7 +237,7 @@ fn store_const(c: *mut ir.Value, d: *mut ir.Value) void {
     if c.kind == ir.V_UNDEF {
         return;
     }
-    if not agg(t) {
+    if not ir.is_agg(t) {
         let st = ir.store(B, c, d);
         st.align = @int_cast(u32, t.align);
         return;
@@ -280,6 +276,9 @@ fn field_const(c: *mut ir.Value, i: usize) *mut ir.Value {
     return ir.undef(ft);
 }
 
+// Use counts (not ir.count_uses, which counts only the uses of instructions
+// and notes the user: this counts every operand that is not nil, constants
+// and parameters too, and only instructions are reset).
 fn count_uses(f: *mut ir.Func) void {
     let mut b = f.first;
     while u.notnil(b) {
@@ -315,7 +314,7 @@ fn lower_call(v: *mut ir.Value) void {
     if nt == old {
         return;
     }
-    let sret = agg(old.ret);
+    let sret = ir.is_agg(old.ret);
     let n = v.xs.len;
     let mut args = u.List.[*mut ir.Value].{ data: u.nil.[*mut ir.Value](), len: 0, cap: 0 };
     let ext = u.newn.[u8](nt.params.len + 3);
@@ -341,7 +340,7 @@ fn lower_call(v: *mut ir.Value) void {
             }
             continue;
         }
-        if agg(x.ty) {
+        if ir.is_agg(x.ty) {
             args.push(slot_of(x));
             ext[k] = ir.EXT_BYVAL;
         } else {
@@ -383,7 +382,7 @@ fn lower_body(f: *mut ir.Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) and (i.op == ir.OP_PHI) {
-            if agg(i.ty) {
+            if ir.is_agg(i.ty) {
                 set_slot(i, entry_alloca(i.ty));
                 i.aux2 = 1;
                 phis.push(i);
@@ -403,13 +402,13 @@ fn lower_body(f: *mut ir.Func) void {
             let next = i.next;
             ir.at_before(B, i);
             let op = i.op;
-            if (op == ir.OP_LOAD) and agg(i.ty) {
+            if (op == ir.OP_LOAD) and ir.is_agg(i.ty) {
                 let s = entry_alloca(i.ty);
                 memcpy(s, i.a, i.ty.size);
                 set_slot(i, s);
                 i.aux2 = 1;
                 ir.remove_inst(i);
-            } else if (op == ir.OP_STORE) and agg(i.a.ty) {
+            } else if (op == ir.OP_STORE) and ir.is_agg(i.a.ty) {
                 store_agg(i.a, i.b);
                 ir.remove_inst(i);
             } else if op == ir.OP_INSERTVALUE {
@@ -429,7 +428,7 @@ fn lower_body(f: *mut ir.Func) void {
                 let fi = @truncate(usize, i.cv);
                 let ft = ir.field_ty(i.ty, fi);
                 let d = ir.ptradd(B, s, isz(ir.field_off(i.ty, fi)));
-                if agg(ft) {
+                if ir.is_agg(ft) {
                     store_agg(i.b, d);
                 } else {
                     let st = ir.store(B, i.b, d);
@@ -443,14 +442,14 @@ fn lower_body(f: *mut ir.Func) void {
                 let fi = @truncate(usize, i.cv);
                 if ir.is_const(a) {
                     let c = field_const(a, fi);
-                    if agg(i.ty) {
+                    if ir.is_agg(i.ty) {
                         set_slot(i, slot_of(c));
                     } else {
                         ir.forward(i, c);
                     }
                 } else {
                     let p = ir.ptradd(B, slot_of(a), isz(ir.field_off(a.ty, fi)));
-                    if agg(i.ty) {
+                    if ir.is_agg(i.ty) {
                         set_slot(i, p);
                     } else {
                         let l = ir.load(B, i.ty, p);
@@ -458,12 +457,12 @@ fn lower_body(f: *mut ir.Func) void {
                     }
                 }
                 ir.remove_inst(i);
-            } else if (op == ir.OP_SELECT) and agg(i.ty) {
+            } else if (op == ir.OP_SELECT) and ir.is_agg(i.ty) {
                 set_slot(i, ir.select(B, i.a, slot_of(i.b), slot_of(i.c)));
                 ir.remove_inst(i);
             } else if op == ir.OP_CALL {
                 lower_call(i);
-            } else if (op == ir.OP_RET) and u.notnil(i.a) and agg(i.a.ty) {
+            } else if (op == ir.OP_RET) and u.notnil(i.a) and ir.is_agg(i.a.ty) {
                 store_agg(i.a, sret_p);
                 i.a = vnil();
             }
@@ -509,7 +508,7 @@ pub fn lower_module(m: *mut ir.Module) void {
 // lane-by-lane scalar code (extract, scalar operation, insert).
 // -----------------------------------------------------------------------------
 fn lane_of(x: *mut ir.Value, i: u64) *mut ir.Value {
-    if (x.kind == ir.V_INST) and (x.op == ir.OP_SPLAT) {
+    if ir.is_op(x, ir.OP_SPLAT) {
         return x.a;
     }
     if x.kind == ir.V_CAGG {
@@ -529,8 +528,8 @@ fn scalarize_one(v: *mut ir.Value) void {
         vt = v.xs.get(0).ty;
     }
     let n = @as(u64, @bit_cast(u32, vt.lanes));
-    let id = @truncate(i32, @bit_cast(i64, v.cv));
-    if (o == ir.OP_INTR) and (id == ir.IN_ALLTRUE) {
+    let id = ir.intr_id(v);
+    if id == ir.IN_ALLTRUE {
         let x = v.xs.get(0);
         let mut acc = ir.cint(ir.t_int(1), 1);
         for i in @as(u64, 0)..n {
@@ -549,7 +548,7 @@ fn scalarize_one(v: *mut ir.Value) void {
         } else if o == ir.OP_FNEG {
             s = ir.fneg(B, lane_of(v.a, i));
         } else if (o == ir.OP_ICMP) or (o == ir.OP_FCMP) {
-            let p = @truncate(i32, @bit_cast(i64, v.cv));
+            let p = ir.pred_of(v);
             let mut c = vnil();
             if o == ir.OP_ICMP {
                 c = ir.icmp(B, p, lane_of(v.a, i), lane_of(v.b, i));
@@ -616,7 +615,7 @@ pub fn expand_mul_overflow(f: *mut ir.Func) void {
         while u.notnil(i) {
             let next = i.next;
             if i.op == ir.OP_INTR {
-                let id = @truncate(i32, @bit_cast(i64, i.cv));
+                let id = ir.intr_id(i);
                 if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
                     ir.at_before(B, i);
                     ir.forward(i, mul_overflow(id == ir.IN_SMUL_OV, i.xs.get(0), i.xs.get(1)));

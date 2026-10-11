@@ -13,7 +13,6 @@
 // Values of B used outside it get B's value or N's copy, whichever reaches
 // the use, and a phi where both do (SSA repair).
 // =============================================================================
-import "combine.ax" as cb;
 import "ir.ax" as ir;
 import "opt.ax" as opt;
 import "target.ax" as tg;
@@ -25,22 +24,9 @@ fn vnil() *mut ir.Value {
 
 const MAX_COPY: i32 = 6;
 
-fn is_k(v: *ir.Value) bool {
-    return ir.is_cint(v) and (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64);
-}
-
-fn incoming(p: *mut ir.Value, from: *mut ir.Block) *mut ir.Value {
-    for k in 0..p.bs.len {
-        if p.bs.get(k) == from {
-            return p.xs.get(k);
-        }
-    }
-    return vnil();
-}
-
 // The constant v is when B is entered from P, or nil.
 fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut ir.Value {
-    if is_k(v) {
+    if ir.is_small_cint(v) {
         return v;
     }
     if (v.kind != ir.V_INST) or (v.blk != b) or (depth > 6) {
@@ -48,8 +34,8 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
     }
     let op = v.op;
     if op == ir.OP_PHI {
-        let x = incoming(v, p);
-        if u.notnil(x) and is_k(x) {
+        let x = ir.incoming(v, p);
+        if u.notnil(x) and ir.is_small_cint(x) {
             return x;
         }
         return vnil();
@@ -89,7 +75,7 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
         if u.isnil(x) or u.isnil(y) {
             return vnil();
         }
-        return ir.icmp(ir.new_builder(), @truncate(i32, @bit_cast(i64, v.cv)), x, y);
+        return ir.fold_icmp(ir.pred_of(v), x, y);
     }
     if op == ir.OP_SELECT {
         let c = eval(v.a, b, p, depth + 1);
@@ -107,7 +93,7 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
         if u.isnil(x) {
             return vnil();
         }
-        return ir.cast(ir.new_builder(), op, x, v.ty);
+        return ir.fold_cast(op, x, v.ty);
     }
     return vnil();
 }
@@ -120,23 +106,6 @@ fn eval(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block, depth: i32) *mut i
 // `if x == 2`, `if x >= 3` are known false.
 // -----------------------------------------------------------------------------
 
-let mut cmp_bld: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
-
-// (comparisons of constants fold: it never emits)
-fn cmp_builder() *mut ir.Builder {
-    if u.isnil(cmp_bld) {
-        cmp_bld = ir.new_builder();
-    }
-    return cmp_bld;
-}
-
-fn kbool(b: bool) *mut ir.Value {
-    if b {
-        return ir.cint(ir.t_int(1), 1);
-    }
-    return ir.cint(ir.t_int(1), 0);
-}
-
 // x as a key in the order of the domain: unsigned, or signed (biased).
 fn key(x: u64, signed: bool, bits: i32) u64 {
     if signed {
@@ -145,13 +114,9 @@ fn key(x: u64, signed: bool, bits: i32) u64 {
     return x;
 }
 
-fn is_signed(p: i32) bool {
-    return (p >= ir.IntSGT) and (p <= ir.IntSLE);
-}
-
 // The keys x with `x p k` (a relational predicate): [lo, hi]; false if none.
 fn interval(p: i32, k: u64, bits: i32, lo: *mut u64, hi: *mut u64) bool {
-    let kk = key(k, is_signed(p), bits);
+    let kk = key(k, ir.is_signed_pred(p), bits);
     let max = ir.mask_bits(bits);
     if (p == ir.IntULT) or (p == ir.IntSLT) {
         if kk == 0 {
@@ -180,19 +145,19 @@ fn decide(p0_: i32, k0: u64, v0: bool, p1: i32, k1: u64, t: *mut ir.Ty) *mut ir.
     let bits = t.bits;
     let mut p0 = p0_;
     if not v0 {
-        p0 = cb.inv_pred(p0);
+        p0 = ir.inv_pred(p0);
     }
     if p0 == ir.IntEQ {
-        return ir.icmp(cmp_builder(), p1, ir.cint(t, k0), ir.cint(t, k1));
+        return ir.fold_icmp(p1, ir.cint(t, k0), ir.cint(t, k1));
     }
     let eq1 = (p1 == ir.IntEQ) or (p1 == ir.IntNE);
     if p0 == ir.IntNE {
         if eq1 and (k0 == k1) {
-            return kbool(p1 == ir.IntNE);
+            return ir.kbool(p1 == ir.IntNE);
         }
         return vnil();
     }
-    let sg = is_signed(p0);
+    let sg = ir.is_signed_pred(p0);
     let mut lo0: u64 = 0;
     let mut hi0: u64 = 0;
     if not interval(p0, k0, bits, &mut lo0, &mut hi0) {
@@ -201,11 +166,11 @@ fn decide(p0_: i32, k0: u64, v0: bool, p1: i32, k1: u64, t: *mut ir.Ty) *mut ir.
     if eq1 {
         let kk = key(k1, sg, bits);
         if (kk < lo0) or (kk > hi0) {
-            return kbool(p1 == ir.IntNE);
+            return ir.kbool(p1 == ir.IntNE);
         }
         return vnil();
     }
-    if is_signed(p1) != sg {
+    if ir.is_signed_pred(p1) != sg {
         return vnil();
     }
     let mut lo1: u64 = 0;
@@ -233,15 +198,15 @@ fn split_cmp(c0: *mut ir.Value, x: *mut *mut ir.Value, p: *mut i32, k: *mut u64)
     if (a.ty.kind != ir.T_INT) or (a.ty.bits > 64) {
         return false;
     }
-    if is_k(b) and not is_k(a) {
+    if ir.is_small_cint(b) and not ir.is_small_cint(a) {
         x.* = a;
-        p.* = cb.pred_of(c);
+        p.* = ir.pred_of(c);
         k.* = ir.cint_val(b);
         return true;
     }
-    if is_k(a) and not is_k(b) {
+    if ir.is_small_cint(a) and not ir.is_small_cint(b) {
         x.* = b;
-        p.* = cb.swap_pred(cb.pred_of(c));
+        p.* = ir.swap_pred(ir.pred_of(c));
         k.* = ir.cint_val(a);
         return true;
     }
@@ -264,7 +229,7 @@ fn implied(c: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
         let t = ir.terminator(from);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and ((t.t1 == to) or (t.t2 == to)) {
             if ir.resolve(t.a) == c {
-                return kbool(t.t1 == to);
+                return ir.kbool(t.t1 == to);
             }
             let mut x0 = vnil();
             let mut p0: i32 = 0;
@@ -362,29 +327,11 @@ fn outside_uses(b: *mut ir.Block) void {
     u.free(@ptr_cast(*mut void, work.data));
 }
 
-fn remove_phi_input(s: *mut ir.Block, from: *mut ir.Block) void {
-    let mut p = s.first;
-    while u.notnil(p) and (p.op == ir.OP_PHI) {
-        let mut k: usize = 0;
-        while k < p.bs.len {
-            if p.bs.get(k) == from {
-                p.bs.set(k, p.bs.get(p.bs.len - 1));
-                p.xs.set(k, p.xs.get(p.xs.len - 1));
-                p.bs.len -= 1;
-                p.xs.len -= 1;
-            } else {
-                k += 1;
-            }
-        }
-        p = p.next;
-    }
-}
-
 // The value v of B as seen on the path through N (clones in auxp).
 fn mapped(v: *mut ir.Value, b: *mut ir.Block, p: *mut ir.Block) *mut ir.Value {
     if u.notnil(v) and (v.kind == ir.V_INST) and (v.blk == b) {
         if v.op == ir.OP_PHI {
-            return incoming(v, p);
+            return ir.incoming(v, p);
         }
         return @ptr_cast(*mut ir.Value, v.auxp);
     }
@@ -433,7 +380,7 @@ fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block,
     for j in 0..nsucc {
         let mut q = ss[j].first;
         while u.notnil(q) and (q.op == ir.OP_PHI) {
-            let x = incoming(q, b);
+            let x = ir.incoming(q, b);
             if u.notnil(x) {
                 ir.add_incoming(q, mapped(x, b, p), n);
             }
@@ -441,12 +388,7 @@ fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block,
         }
     }
     // P goes to N instead of B
-    let t = ir.terminator(p);
-    for k in 0..ir.succ_count(t) {
-        if ir.succ(t, k) == b {
-            ir.set_succ(t, k, n);
-        }
-    }
+    ir.retarget(p, b, n);
     // the predecessor lists, for the repair
     let mut k: usize = 0;
     while k < b.preds.len {
@@ -502,7 +444,7 @@ fn thread(f: *mut ir.Func, b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block,
         repaired.get(k3).blk.aux = 0;
     }
     repaired.clear();
-    remove_phi_input(b, p);
+    ir.remove_phi_input(b, p);
 }
 
 // SSA repair after threading: the value of v (B's) that reaches the end,
@@ -599,7 +541,7 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
         let b = order.get(bi);
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
-           (copy_cost(b) <= MAX_COPY) and not loop_header(b) {
+           (copy_cost(b) <= MAX_COPY) and not opt.is_loop_header(b) {
             // a switch on a value known on the edge from P: P goes to the case
             for k in 0..b.preds.len {
                 let p = b.preds.get(k);
@@ -631,14 +573,7 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             continue;
         }
         // not through a loop header: that would peel iterations, one per round
-        let mut header = false;
-        for k in 0..b.preds.len {
-            let p = b.preds.get(k);
-            if (p.rpo >= 0) and opt.dominates(b, p) {
-                header = true;
-            }
-        }
-        if header {
+        if opt.is_loop_header(b) {
             continue;
         }
         for k in 0..b.preds.len {
@@ -687,17 +622,6 @@ fn switch_target(t: *ir.Value, c: *ir.Value) *mut ir.Block {
     return t.t1;
 }
 
-// Is b a loop header (a predecessor it dominates)?
-fn loop_header(b: *mut ir.Block) bool {
-    for k in 0..b.preds.len {
-        let p = b.preds.get(k);
-        if (p.rpo >= 0) and opt.dominates(b, p) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // B (ending in t) branches on a phi of its own whose input from P is a
 // condition P computes, and P only goes to B: P can branch on it itself,
 // through a copy of B (tail duplication). The conditions of `legal = a < 2`
@@ -712,7 +636,7 @@ fn phi_branch(b: *mut ir.Block, t: *mut ir.Value, p: *mut ir.Block) bool {
     if u.isnil(pt) or (pt.op != ir.OP_BR) {
         return false;
     }
-    let x = incoming(c, p);
+    let x = ir.incoming(c, p);
     if u.isnil(x) or (x.kind != ir.V_INST) or (x.blk != p) {
         return false;
     }
@@ -810,7 +734,7 @@ fn speculatable(i: *ir.Value) bool {
     }
     if (op == ir.OP_INTR) and (i.ty.kind == ir.T_INT) {
         // cheap integer operations of a scalar
-        let id = @truncate(i32, @bit_cast(i64, i.cv));
+        let id = ir.intr_id(i);
         return (id == ir.IN_CTLZ) or (id == ir.IN_CTTZ) or (id == ir.IN_CTPOP) or (id == ir.IN_BSWAP) or
                (id == ir.IN_ROTL) or (id == ir.IN_ROTR) or (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or
                (id == ir.IN_UMIN) or (id == ir.IN_UMAX) or (id == ir.IN_ABS);
@@ -832,7 +756,7 @@ fn spec_load_base(i: *mut ir.Value) *mut ir.Value {
         return vnil();
     }
     let mut p = ir.resolve(i.a);
-    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
+    while ir.is_op(p, ir.OP_PTRADD) {
         p = ir.resolve(p.a);
     }
     if (p.kind != ir.V_GLOBAL) or not p.gv.is_const or p.gv.tls or (p.gv.ty.size < i.ty.size) {
@@ -855,14 +779,14 @@ fn stack_load(i: *mut ir.Value) bool {
     }
     let mut p = ir.resolve(i.a);
     let mut off: i64 = 0;
-    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) and is_k(ir.resolve(p.b)) {
+    while ir.is_op(p, ir.OP_PTRADD) and ir.is_small_cint(ir.resolve(p.b)) {
         off += ir.sval(ir.resolve(p.b));
         if (off < -0x1000_0000) or (off > 0x1000_0000) {
             return false;
         }
         p = ir.resolve(p.a);
     }
-    return (p.kind == ir.V_INST) and (p.op == ir.OP_ALLOCA) and u.notnil(p.aty) and (off >= 0) and
+    return ir.is_op(p, ir.OP_ALLOCA) and u.notnil(p.aty) and (off >= 0) and
            ((@as(u64, @bit_cast(u64, off)) + i.ty.size) <= p.aty.size);
 }
 
@@ -999,29 +923,10 @@ fn hoist(a: *mut ir.Block, before: *mut ir.Value) void {
     }
 }
 
-// The value phi p gets over the edge from block `from` (nil: none).
 // A float constant (which targets without a float select pick between as
 // integers: see x64.ax gen_select).
 fn fconst(v: *ir.Value) bool {
     return u.notnil(v) and ((v.kind == ir.V_CFP) or ((v.kind == ir.V_ZERO) and (v.ty.kind == ir.T_FLOAT)));
-}
-
-fn input(p: *mut ir.Value, from: *mut ir.Block) *mut ir.Value {
-    return incoming(p, from);
-}
-
-fn drop_input(p: *mut ir.Value, from: *mut ir.Block) void {
-    let mut k: usize = 0;
-    while k < p.bs.len {
-        if p.bs.get(k) == from {
-            p.bs.set(k, p.bs.get(p.bs.len - 1));
-            p.xs.set(k, p.xs.get(p.xs.len - 1));
-            p.bs.len -= 1;
-            p.xs.len -= 1;
-        } else {
-            k += 1;
-        }
-    }
 }
 
 // Values that go into the address of a load (marked aux2 = addr_gen). A
@@ -1141,7 +1046,7 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
         if values_only and
            (((p0.ty.kind == ir.T_INT) and (p0.ty.bits == 1)) or (p0.ty.kind == ir.T_VEC) or
             ((p0.ty.kind == ir.T_FLOAT) and not float_selects and
-             not (fconst(input(p0, tb)) and fconst(input(p0, eb))))) {
+             not (fconst(ir.incoming(p0, tb)) and fconst(ir.incoming(p0, eb))))) {
             // a condition, which threading may decide the tests of; or a
             // select the target would make a branch anyway (but for one of
             // two constants, which it selects as integers)
@@ -1161,16 +1066,16 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
     ir.at_before(bld, br);
     let mut p = m.first;
     while u.notnil(p) and (p.op == ir.OP_PHI) {
-        let vt = input(p, tb);
-        let ve = input(p, eb);
+        let vt = ir.incoming(p, tb);
+        let ve = ir.incoming(p, eb);
         let s = ir.select(bld, c, vt, ve);
         if via_t {
-            drop_input(p, t);
+            ir.drop_incoming(p, t);
         }
         if via_e {
-            drop_input(p, e);
+            ir.drop_incoming(p, e);
         }
-        drop_input(p, d);
+        ir.drop_incoming(p, d);
         ir.add_incoming(p, s, d);
         p = p.next;
     }
@@ -1185,12 +1090,8 @@ fn convert(f: *mut ir.Func, d: *mut ir.Block) bool {
 // scalars at the ends of both arms become one store in m of a phi of the
 // values (and of the addresses when they differ), which the conversion
 // below turns into a select.
-fn from_alloca(p0: *mut ir.Value) bool {
-    let mut p = p0;
-    while (p.kind == ir.V_INST) and (p.op == ir.OP_PTRADD) {
-        p = p.a;
-    }
-    return (p.kind == ir.V_INST) and (p.op == ir.OP_ALLOCA);
+fn from_alloca(p: *mut ir.Value) bool {
+    return ir.is_op(ir.ptr_base(p), ir.OP_ALLOCA);
 }
 
 fn sink_stores(d: *mut ir.Block) bool {
@@ -1341,7 +1242,7 @@ fn merge_conds(f: *mut ir.Func, d: *mut ir.Block) bool {
         }
         let mut p = m.first;
         while u.notnil(p) and (p.op == ir.OP_PHI) {
-            if ir.resolve(incoming(p, x)) != ir.resolve(incoming(p, from_y)) {
+            if ir.resolve(ir.incoming(p, x)) != ir.resolve(ir.incoming(p, from_y)) {
                 ok = false;
             }
             p = p.next;
@@ -1364,8 +1265,8 @@ fn merge_conds(f: *mut ir.Func, d: *mut ir.Block) bool {
         br.a = ir.and_(bld, c1, c2);
         br.t1 = t;
         br.t2 = y;
-        remove_phi_input(m, x);
-        rename_phi_input(t, x, d);
+        ir.remove_phi_input(m, x);
+        ir.replace_phi_block(t, x, d);
         _ = f;
         return true;
     }
@@ -1397,18 +1298,6 @@ fn convertible(m: *mut ir.Block, t: *mut ir.Block) bool {
 }
 
 // Phis of s take what came from block `from` from block `to` instead.
-fn rename_phi_input(s: *mut ir.Block, from: *mut ir.Block, to: *mut ir.Block) void {
-    let mut p = s.first;
-    while u.notnil(p) and (p.op == ir.OP_PHI) {
-        for k in 0..p.bs.len {
-            if p.bs.get(k) == from {
-                p.bs.set(k, to);
-            }
-        }
-        p = p.next;
-    }
-}
-
 fn same_value_tests(c1: *mut ir.Value, v1: bool, c2: *mut ir.Value, v2: bool) bool {
     let mut x1 = vnil();
     let mut x2 = vnil();
@@ -1420,10 +1309,10 @@ fn same_value_tests(c1: *mut ir.Value, v1: bool, c2: *mut ir.Value, v2: bool) bo
         return false;
     }
     if not v1 {
-        p1 = cb.inv_pred(p1);
+        p1 = ir.inv_pred(p1);
     }
     if not v2 {
-        p2 = cb.inv_pred(p2);
+        p2 = ir.inv_pred(p2);
     }
     let m = ir.mask_bits(x1.ty.bits);
     return unsigned_interval(p1, k1, m) and unsigned_interval(p2, k2, m);
@@ -1434,7 +1323,7 @@ fn unsigned_interval(p: i32, k: u64, max: u64) bool {
     if p == ir.IntNE {
         return (k == 0) or (k == max);
     }
-    return not is_signed(p);
+    return not ir.is_signed_pred(p);
 }
 
 // Moves all of a's instructions but its terminator before `before`.
@@ -1522,7 +1411,7 @@ pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
 // -----------------------------------------------------------------------------
 
 fn bool_const(v: *ir.Value) bool {
-    return is_k(v) and (v.ty.bits == 1);
+    return ir.is_small_cint(v) and (v.ty.bits == 1);
 }
 
 // Which edge of D's branch t leads to p, the predecessor of M: 1 the true
@@ -1636,7 +1525,7 @@ pub fn phi_conditions(f: *mut ir.Func) bool {
                         } else {
                             ir.at_end(bld, m);
                         }
-                        r = ir.xor(bld, r, kbool(true));
+                        r = ir.xor(bld, r, ir.kbool(true));
                     }
                     ir.forward(i, r);
                     ir.remove_inst(i);

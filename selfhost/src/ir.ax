@@ -1054,8 +1054,22 @@ pub fn is_const(v: *Value) bool {
     return (v.kind != V_INST) and (v.kind != V_PARAM);
 }
 
+// An integer (or null pointer) constant.
 pub fn is_cint(v: *Value) bool {
     return (v.kind == V_CINT) or ((v.kind == V_ZERO) and ((v.ty.kind == T_INT) or (v.ty.kind == T_PTR)));
+}
+
+// An integer constant of at most 64 bits (not a pointer).
+pub fn is_small_cint(v: *Value) bool {
+    return is_cint(v) and (v.ty.kind == T_INT) and (v.ty.bits <= 64);
+}
+
+// The i1 constant b.
+pub fn kbool(b: bool) *mut Value {
+    if b {
+        return cint(t_int(1), 1);
+    }
+    return cint(t_int(1), 0);
 }
 
 pub fn cint_val(v: *Value) u64 {
@@ -1400,6 +1414,231 @@ pub fn replace_in(i: *mut Value, old: *mut Value, new: *mut Value) void {
 }
 
 // -----------------------------------------------------------------------------
+// What the passes ask of instructions
+// -----------------------------------------------------------------------------
+
+// Is v an instruction with opcode op (false for nil)?
+pub fn is_op(v: *Value, op: i32) bool {
+    return u.notnil(v) and (v.kind == V_INST) and (v.op == op);
+}
+
+// The predicate (Int*, Real*) of a comparison.
+pub fn pred_of(v: *Value) i32 {
+    return @truncate(i32, @bit_cast(i64, v.cv));
+}
+
+// The intrinsic (IN_*) an instruction calls; 0 when it is not OP_INTR.
+pub fn intr_id(v: *Value) i32 {
+    if v.op != OP_INTR {
+        return 0;
+    }
+    return @truncate(i32, @bit_cast(i64, v.cv));
+}
+
+// The predicate with its operands swapped: a p b == b swap(p) a.
+pub fn swap_pred(p: i32) i32 {
+    if p == IntUGT {
+        return IntULT;
+    }
+    if p == IntULT {
+        return IntUGT;
+    }
+    if p == IntUGE {
+        return IntULE;
+    }
+    if p == IntULE {
+        return IntUGE;
+    }
+    if p == IntSGT {
+        return IntSLT;
+    }
+    if p == IntSLT {
+        return IntSGT;
+    }
+    if p == IntSGE {
+        return IntSLE;
+    }
+    if p == IntSLE {
+        return IntSGE;
+    }
+    return p;
+}
+
+// The negated predicate: not (a p b) == a inv(p) b.
+pub fn inv_pred(p: i32) i32 {
+    if p == IntEQ {
+        return IntNE;
+    }
+    if p == IntNE {
+        return IntEQ;
+    }
+    if p == IntUGT {
+        return IntULE;
+    }
+    if p == IntULE {
+        return IntUGT;
+    }
+    if p == IntUGE {
+        return IntULT;
+    }
+    if p == IntULT {
+        return IntUGE;
+    }
+    if p == IntSGT {
+        return IntSLE;
+    }
+    if p == IntSLE {
+        return IntSGT;
+    }
+    if p == IntSGE {
+        return IntSLT;
+    }
+    return IntSGE;  // SLT
+}
+
+pub fn is_signed_pred(p: i32) bool {
+    return (p >= IntSGT) and (p <= IntSLE);
+}
+
+// Integer operations whose operands may be swapped.
+pub fn commutative_int(op: i32) bool {
+    return (op == OP_ADD) or (op == OP_MUL) or (op == OP_AND) or (op == OP_OR) or (op == OP_XOR);
+}
+
+// The same, and the floating point ones (the same result, NaNs aside).
+pub fn commutative(op: i32) bool {
+    return commutative_int(op) or (op == OP_FADD) or (op == OP_FMUL);
+}
+
+// The base of address p, through additions of any offsets.
+pub fn ptr_base(p: *mut Value) *mut Value {
+    let mut q = p;
+    while is_op(q, OP_PTRADD) {
+        q = q.a;
+    }
+    return q;
+}
+
+// Number of uses of each instruction (uses; user: the last user).
+pub fn count_uses(f: *mut Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.uses = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            use1(i.a, i);
+            use1(i.b, i);
+            use1(i.c, i);
+            for k in 0..i.xs.len {
+                use1(i.xs.get(k), i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+fn use1(o: *mut Value, i: *mut Value) void {
+    if u.notnil(o) and (o.kind == V_INST) {
+        o.uses += 1;
+        o.user = i;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Phi inputs and edges
+// -----------------------------------------------------------------------------
+
+// The value phi p takes over the edge from block `from` (nil: none).
+pub fn incoming(p: *Value, from: *mut Block) *mut Value {
+    for k in 0..p.bs.len {
+        if p.bs.get(k) == from {
+            return p.xs.get(k);
+        }
+    }
+    return vnil();
+}
+
+// Removes input k of phi p (the last input takes its place).
+pub fn remove_incoming(p: *mut Value, k: usize) void {
+    p.bs.set(k, p.bs.get(p.bs.len - 1));
+    p.xs.set(k, p.xs.get(p.xs.len - 1));
+    p.bs.len -= 1;
+    p.xs.len -= 1;
+}
+
+// Removes phi p's inputs from block `from`.
+pub fn drop_incoming(p: *mut Value, from: *mut Block) void {
+    let mut k: usize = 0;
+    while k < p.bs.len {
+        if p.bs.get(k) == from {
+            remove_incoming(p, k);
+        } else {
+            k += 1;
+        }
+    }
+}
+
+// Removes the inputs from block `from` of the phis of s.
+pub fn remove_phi_input(s: *mut Block, from: *mut Block) void {
+    let mut p = s.first;
+    while u.notnil(p) and (p.op == OP_PHI) {
+        drop_incoming(p, from);
+        p = p.next;
+    }
+}
+
+// The phis of s take their inputs from `old` as from `new`.
+pub fn replace_phi_block(s: *mut Block, old: *mut Block, new: *mut Block) void {
+    let mut p = s.first;
+    while u.notnil(p) and (p.op == OP_PHI) {
+        for k in 0..p.bs.len {
+            if p.bs.get(k) == old {
+                p.bs.set(k, new);
+            }
+        }
+        p = p.next;
+    }
+}
+
+// Points the edges from b to `old` at `new`.
+pub fn retarget(b: *Block, old: *mut Block, new: *mut Block) void {
+    let t = terminator(b);
+    for k in 0..succ_count(t) {
+        if succ(t, k) == old {
+            set_succ(t, k, new);
+        }
+    }
+}
+
+// A new block (named `name`, last in f) on the way from `from` to `to`: it
+// jumps to `to`, whose phis take their inputs from `from` from it. The
+// caller points from's edges at it.
+pub fn edge_block(f: *mut Func, name: []u8, from: *mut Block, to: *mut Block) *mut Block {
+    let nb = append_block(f, name);
+    let j = new_inst(f, OP_BR, t_void());
+    j.t1 = to;
+    append_inst(nb, j);
+    replace_phi_block(to, from, nb);
+    return nb;
+}
+
+// Splits the edges from `from` to `to` by a new block (edge_block).
+pub fn split_edge(f: *mut Func, name: []u8, from: *mut Block, to: *mut Block) *mut Block {
+    let nb = edge_block(f, name, from, to);
+    retarget(from, to, nb);
+    return nb;
+}
+
+// -----------------------------------------------------------------------------
 // Builder
 // -----------------------------------------------------------------------------
 pub struct Builder {
@@ -1660,9 +1899,19 @@ fn cmp_ty(t: *mut Ty) *mut Ty {
     return t_int(1);
 }
 
-pub fn icmp(bd: *mut Builder, p: i32, x: *mut Value, y: *mut Value) *mut Value {
+// The comparison `x p y` folded: nil unless x and y are integer constants of
+// at most 64 bits.
+pub fn fold_icmp(p: i32, x: *Value, y: *Value) *mut Value {
     if (x.ty.kind != T_VEC) and is_cint(x) and is_cint(y) and (x.ty.bits <= 64) {
         return cint(t_int(1), @as(u64, @bit_cast(u32, cmp_fold(p, x, y))));
+    }
+    return vnil();
+}
+
+pub fn icmp(bd: *mut Builder, p: i32, x: *mut Value, y: *mut Value) *mut Value {
+    let k = fold_icmp(p, x, y);
+    if u.notnil(k) {
+        return k;
     }
     let v = emit(bd, OP_ICMP, cmp_ty(x.ty));
     v.cv = @as(u64, @bit_cast(u32, p));
@@ -1700,7 +1949,9 @@ pub fn select(bd: *mut Builder, c: *mut Value, x: *mut Value, y: *mut Value) *mu
     return v;
 }
 
-pub fn cast(bd: *mut Builder, op: i32, x: *mut Value, t: *mut Ty) *mut Value {
+// The cast of x to t, when it needs no instruction (x is t already, or a
+// constant): nil otherwise.
+pub fn fold_cast(op: i32, x: *mut Value, t: *mut Ty) *mut Value {
     if x.ty == t {
         if (op == OP_ZEXT) or (op == OP_SEXT) or (op == OP_TRUNC) or (op == OP_BITCAST) {
             return x;
@@ -1722,6 +1973,14 @@ pub fn cast(bd: *mut Builder, op: i32, x: *mut Value, t: *mut Ty) *mut Value {
     }
     if (x.kind == V_UNDEF) and (op != OP_FPTOSI_SAT) and (op != OP_FPTOUI_SAT) {
         return undef(t);
+    }
+    return vnil();
+}
+
+pub fn cast(bd: *mut Builder, op: i32, x: *mut Value, t: *mut Ty) *mut Value {
+    let k = fold_cast(op, x, t);
+    if u.notnil(k) {
+        return k;
     }
     let v = emit(bd, op, t);
     v.a = x;
@@ -2291,10 +2550,7 @@ pub fn remove_unreachable(f: *mut Func) void {
             let mut k: usize = 0;
             while k < i.bs.len {
                 if i.bs.get(k).aux == 0 {
-                    i.bs.set(k, i.bs.get(i.bs.len - 1));
-                    i.xs.set(k, i.xs.get(i.xs.len - 1));
-                    i.bs.len -= 1;
-                    i.xs.len -= 1;
+                    remove_incoming(i, k);
                 } else {
                     k += 1;
                 }
