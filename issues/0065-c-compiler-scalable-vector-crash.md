@@ -1,7 +1,7 @@
 # 0065: C compiler: "Invalid size request on a scalable vector" from LLVM at -O2
 
 - Type: bug
-- Status: open
+- Status: fixed (b3bf084)
 - Area: compiler (C)
 
 Found while writing `tests/run/simd_masks.ax` (0058, 0062). This program, built by the C
@@ -58,3 +58,12 @@ export fn run() void {
 
 (as `tests/run/<name>.ax`; `simd_masks.ax` reads the `u16` lanes from the widened vector
 instead, which builds.)
+
+## Fix
+
+LLVM 18's x86 DAG combine aborts on the second shuffle (`u16x16` lanes interleaved with
+zeros) once it is bit-cast to `u32x8` and split into halves; `llc -mcpu=cascadelake` on the
+IR reproduces it. The C compiler now builds a shuffle of a vector with zeros that
+interleaves its lanes with zeros as the zero extension it is (`shuffle_as_zext` in
+codegen.c, native targets), which LLVM selects as the same `vpmovzx`. The program is
+`tests/run/simd_widen_shuffles.ax`.

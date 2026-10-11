@@ -35,7 +35,6 @@ they travel with the code they describe.
 | [0012](0012-windows-native-target.md) | feature | compiler, runtime | Native Windows binaries (x86-64 done; runs on Windows 11) |
 | [0018](0018-scalable-vectors-and-more-simd.md) | feature | language, compiler, std | SVE/SVE2, mask types, FP16/BF16 and the rest of wide SIMD |
 | [0019](0019-faster-crypto-on-wide-vectors.md) | feature | std/crypto, std/net/tls | Faster cryptography with wide vectors and the remaining instructions |
-| [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 |
 | [0086](0086-selfhost-x64-baseline-remaining.md) | feature | compiler (selfhost: x64, mach, inline), the benchmark port | Self-hosted x86-64 without SIMD extensions: what is left in the benchmark |
 | [0087](0087-object-cache-eviction.md) | tooling | compiler, axiom cache | The module object cache is never evicted and grows without bound |
 | [0094](0094-selfhost-after-0088.md) | feature | compiler (selfhost: x64, mach, gvn, slp) | Self-hosted x86-64: what is left after 0088 (code placement, reloads in loops, race inputs, bounds checks) |
@@ -47,6 +46,8 @@ they travel with the code they describe.
 
 | # | Type | Area | Title |
 |---|------|------|-------|
+| [0103](0103-c-bitcast-function-pointers.md) | bug | compiler (C: codegen) | `@bit_cast` between a function pointer and an integer is invalid LLVM IR (fixed in b3bf084) |
+| [0065](0065-c-compiler-scalable-vector-crash.md) | bug | compiler (C) | LLVM aborts with "Invalid size request on a scalable vector" on two widening shuffles at -O2 (fixed in b3bf084) |
 | [0106](0106-selfhost-sse2-lane-inserts.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64 without SSE4.1: integers put into vector lanes through the stack (fixed in 1fb5609) |
 | [0107](0107-selfhost-pextrw-memory-operand.md) | bug | compiler (selfhost: x64) | Self-hosted x86-64: a constant vector folded into `pextrw` as a memory operand (SIGILL) (fixed in 1fb5609) |
 | [0108](0108-selfhost-float-selects-of-constants.md) | feature | compiler (selfhost: thread, x64) | Self-hosted x86-64 without AVX-512: floats chosen between two constants by branches (fixed in 1fb5609) |
