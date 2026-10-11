@@ -317,12 +317,13 @@ await inOrder(files(path.join(root, 'tests/sanitize')), async (f) => {
 // x86-64 hosts (--target=native is the host). A compiler without
 // --emit=asm (the self-hosted one) is checked on its object file as
 // objdump disassembles it (AT&T syntax, as LLVM's): its x86-64 lines, where
-// objdump is installed; it skips the others.
+// objdump is installed; it skips the others. "// lower-selfhost:" lines
+// check selection only the self-hosted backends make (LLVM's differs).
 await inOrder(files(path.join(root, 'tests/lowering')), async (f) => {
   const name = path.relative(root, f) + ' [instruction selection]';
   if (filter && !name.includes(filter)) return null;
   let problem = null, checked = 0;
-  for (const [, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower: (.+?) \| (.+?) \| (\d+)$/gm)) {
+  for (const [, only, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower(-selfhost)?: (.+?) \| (.+?) \| (\d+)$/gm)) {
     const fl = flags.trim().split(/\s+/);
     if (fl.includes('--target=native') && (process.arch !== 'x64' || process.env.AXIOM_NATIVE_TARGET)) continue;
     const out = path.join(tmp, `lower-${path.basename(f, '.ax')}.s`);
@@ -338,6 +339,8 @@ await inOrder(files(path.join(root, 'tests/lowering')), async (f) => {
       text = d.stdout;
     } else if (c.status !== 0) {
       problem = `${flags}: build failed:\n${c.stdout}${c.stderr}`; break;
+    } else if (only) {
+      continue;  // (a compiler with --emit=asm: the C compiler's LLVM)
     } else {
       text = fs.readFileSync(out, 'utf8');
     }
@@ -874,7 +877,7 @@ if (!skipPlatform) {
     },
     'the solver example (examples/solver)': async () => {
       // a native program: always tested natively, whatever the suite's target
-      const c = ph(['test', path.join(root, 'examples/solver'), '--format=agent-json', nativeTarget, '-O2']);
+      const c = ph(['test', path.join(root, 'examples/solver'), '--format=agent-json', nativeTarget, '-O2', ...testTimeout]);
       let j;
       try { j = JSON.parse(c.stdout); } catch { return `bad output: ${c.stdout}${c.stderr}`; }
       return j.status === 'pass' && j.tests.length >= 17 ? null : JSON.stringify(j).slice(0, 2000);
