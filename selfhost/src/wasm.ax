@@ -20,6 +20,7 @@
 import "bin.ax" as bn;
 import "combine.ax" as cb;
 import "ir.ax" as ir;
+import "isel.ax" as is;
 import "opt.ax" as opt;
 import "target.ax" as tg;
 import "util.ax" as u;
@@ -69,10 +70,6 @@ fn is_merge(b: *ir.Block) bool {
 
 fn is_header(b: *ir.Block) bool {
     return @slice_from_ptr(header_p, nblocks)[@int_cast(usize, b.rpo)];
-}
-
-fn vnil() *mut ir.Value {
-    return u.nil.[ir.Value]();
 }
 
 fn fail(msg: []u8) void {
@@ -294,7 +291,7 @@ fn push_const(x: *mut ir.Value) void {
     if v == wo.V128 {
         // v128.const with the lane bytes
         let mut bytes = bn.new_bytes();
-        const_bytes(x, &mut bytes, 0);
+        is.const_le(x, &mut bytes, 0);
         op_fd(12);
         C.put(bytes.view()[0..16]);
         bytes.free();
@@ -328,47 +325,6 @@ fn push_const(x: *mut ir.Value) void {
         i64c(@bit_cast(i64, x.cv));
     } else {
         i32c(@bit_cast(i64, x.cv));
-    }
-}
-
-// Little-endian bytes of a constant (for v128.const and data).
-fn const_bytes(x: *mut ir.Value, out: *mut bn.Bytes, base: usize) void {
-    let t = x.ty;
-    while out.len() < (base + @truncate(usize, t.size)) {
-        out.u8_(0);
-    }
-    let k = x.kind;
-    if (k == ir.V_ZERO) or (k == ir.V_UNDEF) {
-        return;
-    }
-    if k == ir.V_CINT {
-        for i in 0..@truncate(usize, t.size) {
-            out.set_u8(base + i, @truncate(u8, x.cv >> @int_cast(u32, i * 8)));
-        }
-        return;
-    }
-    if k == ir.V_CFP {
-        if t.bits == 32 {
-            out.set_u32(base, @as(u64, @bit_cast(u32, @float_cast(f32, x.fv))));
-        } else {
-            out.set_u64(base, @bit_cast(u64, x.fv));
-        }
-        return;
-    }
-    if k == ir.V_CAGG {
-        let mut esz: u64 = 0;
-        if (t.kind == ir.T_VEC) or (t.kind == ir.T_ARRAY) {
-            esz = t.elem.size;
-        }
-        for i in 0..x.xs.len {
-            let mut off: u64 = 0;
-            if t.kind == ir.T_STRUCT {
-                off = t.offs[i];
-            } else {
-                off = esz * @as(u64, i);
-            }
-            const_bytes(x.xs.get(i), out, base + @truncate(usize, off));
-        }
     }
 }
 
@@ -2302,7 +2258,7 @@ fn count_uses(f: *mut ir.Func) void {
         let mut pos: i32 = 0;
         while u.notnil(i) {
             i.uses = 0;
-            i.user = vnil();
+            i.user = ir.vnil();
             i.pos = pos;
             i.loc = -1;
             i.flag = FL_LOCAL;
@@ -2393,7 +2349,7 @@ fn classify(f: *mut ir.Func) void {
             } else if (i.uses == 1) and (o != ir.OP_PHI) and pure_op(i) and (i.user.op == ir.OP_PHI) and
                       phi_from(i.user, i) == b {
                 // computed where the phi copy at the end of this block pushes it
-                if not inlines_effects(i) or no_effects_between(i, vnil()) {
+                if not inlines_effects(i) or no_effects_between(i, ir.vnil()) {
                     i.flag = FL_INLINE;
                 }
             } else if (i.uses == 1) and (o != ir.OP_PHI) and not ir.is_term(o) and (i.user.blk == b) and
@@ -3233,7 +3189,7 @@ fn emit_data(g: *mut ir.Global, seg: *mut wo.Seg, x: *mut ir.Value, off: u64) vo
         }
         return;
     }
-    const_bytes(x, &mut seg.data, @truncate(usize, off));
+    is.const_le(x, &mut seg.data, @truncate(usize, off));
 }
 
 pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {

@@ -1,0 +1,409 @@
+// =============================================================================
+// isel.ax - what the native code generators (x64.ax and a64.ax) share:
+// questions about IR values that instruction selection asks, the use counts
+// it starts from, the parallel copies into phis, and the module's symbols
+// and data in the ELF object. wasm.ax uses the bytes of constants.
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "mach.ax" as mc;
+import "util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// Values
+// -----------------------------------------------------------------------------
+pub fn is_inst(v: *ir.Value, op: i32) bool {
+    return (v.kind == ir.V_INST) and (v.op == op);
+}
+
+// Constant integer value (sign-extended), if v is one.
+pub fn cval(v: *ir.Value) i64 {
+    if v.kind == ir.V_CINT {
+        if v.ty.bits == 1 {
+            return @bit_cast(i64, v.cv);  // i1 is 0 or 1
+        }
+        return ir.sval(v);
+    }
+    return 0;
+}
+
+pub fn is_c(v: *ir.Value) bool {
+    return (v.kind == ir.V_CINT) or ((v.kind == ir.V_ZERO) and ((v.ty.kind == ir.T_INT) or (v.ty.kind == ir.T_PTR)));
+}
+
+pub fn fits32(x: i64) bool {
+    return (x >= -2147483648) and (x <= 2147483647);
+}
+
+// Is v a comparison fused into its users (branches and selects, which
+// each compare again)?
+pub fn fused(v: *mut ir.Value) bool {
+    return (v.kind == ir.V_INST) and ((v.flag & 2) != 0);
+}
+
+// The opposite condition (both targets pair each condition code with its
+// inverse).
+pub fn invert(cc: i32) i32 {
+    return cc ^ 1;
+}
+
+pub fn is_f32(t: *ir.Ty) bool {
+    if t.kind == ir.T_VEC {
+        return t.elem.bits == 32;
+    }
+    return t.bits == 32;
+}
+
+pub fn mem_size(t: *ir.Ty) u8 {
+    if (t.kind == ir.T_INT) and (t.bits <= 8) {
+        return 1;
+    }
+    return @truncate(u8, t.size);
+}
+
+pub fn lane_bits(t: *ir.Ty) i32 {
+    return t.elem.bits;
+}
+
+pub fn lane_float(t: *ir.Ty) bool {
+    return t.elem.kind == ir.T_FLOAT;
+}
+
+// The processor instructions (spec §13.5) of either architecture.
+pub fn is_insn(id: i32) bool {
+    return (id >= ir.IN_AESENC) and (id <= ir.IN_CRC32C_A);
+}
+
+// The machine block of IR block s.
+pub fn blk(s: *ir.Block) i32 {
+    return @truncate(i32, s.aux);
+}
+
+// Is s laid out right after b?
+pub fn next_block_is(b: *mut ir.Block, s: *mut ir.Block) bool {
+    return s.aux == (b.aux + 1);
+}
+
+pub fn mk2(a: mc.MOp, b: mc.MOp) [2]mc.MOp {
+    return [a, b];
+}
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+// The little-endian bytes of constant x at out[base..] (zeros, undefined
+// values and padding are zeros).
+pub fn const_le(x: *mut ir.Value, out: *mut bn.Bytes, base: usize) void {
+    let t = x.ty;
+    while out.len() < (base + @truncate(usize, t.size)) {
+        out.u8_(0);
+    }
+    let k = x.kind;
+    if k == ir.V_CINT {
+        for i in 0..@truncate(usize, t.size) {
+            out.set_u8(base + i, @truncate(u8, x.cv >> @int_cast(u32, i * 8)));
+        }
+    } else if k == ir.V_CFP {
+        if t.bits == 32 {
+            out.set_u32(base, @as(u64, @bit_cast(u32, @float_cast(f32, x.fv))));
+        } else {
+            out.set_u64(base, @bit_cast(u64, x.fv));
+        }
+    } else if k == ir.V_CAGG {
+        for i in 0..x.xs.len {
+            const_le(x.xs.get(i), out, base + @truncate(usize, ir.field_off(t, i)));
+        }
+    }
+}
+
+pub fn le8(b: []u8) u64 {
+    let mut x: u64 = 0;
+    for i in @as(usize, 0)..8 {
+        x = x | (@as(u64, b[i]) << @int_cast(u32, i * 8));
+    }
+    return x;
+}
+
+pub fn all_ones(v: *ir.Value) bool {
+    if is_inst(v, ir.OP_COPY) {
+        return all_ones(v.a);  // (a constant hoisted out of a loop)
+    }
+    if v.kind == ir.V_CAGG {
+        for k in 0..v.xs.len {
+            let c = v.xs.get(k);
+            if (c.kind != ir.V_CINT) or ((c.cv & ir.mask_bits(c.ty.bits)) != ir.mask_bits(c.ty.bits)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return is_inst(v, ir.OP_SPLAT) and (v.a.kind == ir.V_CINT) and
+           ((v.a.cv & ir.mask_bits(v.a.ty.bits)) == ir.mask_bits(v.a.ty.bits));
+}
+
+// -----------------------------------------------------------------------------
+// Bit selects
+// -----------------------------------------------------------------------------
+// @select as codegen.ax makes it: (x & m) | (y & ~m), for a lane mask m.
+pub struct Sel {
+    x: *mut ir.Value,
+    y: *mut ir.Value,
+    m: *mut ir.Value,
+    p: *mut ir.Value,  // x & m
+    q: *mut ir.Value,  // y & ~m
+    n: *mut ir.Value,  // ~m
+}
+
+// The parts of o when it is such a select (else x is nil).
+pub fn sel_parts(o: *mut ir.Value) Sel {
+    let mut r = Sel.{ x: ir.vnil(), y: ir.vnil(), m: ir.vnil(), p: ir.vnil(), q: ir.vnil(), n: ir.vnil() };
+    if not is_inst(o, ir.OP_OR) or (o.ty.kind != ir.T_VEC) {
+        return r;
+    }
+    let ors: [2]*mut ir.Value = [o.a, o.b];
+    for j in @as(usize, 0)..2 {
+        let p = ors[j];
+        let q = ors[1 - j];
+        if not is_inst(p, ir.OP_AND) or not is_inst(q, ir.OP_AND) {
+            continue;
+        }
+        let ps: [2]*mut ir.Value = [p.a, p.b];
+        let qs: [2]*mut ir.Value = [q.a, q.b];
+        for k in @as(usize, 0)..2 {
+            let m = ps[1 - k];
+            for l in @as(usize, 0)..2 {
+                let n = qs[1 - l];
+                if is_inst(n, ir.OP_XOR) and (((n.a == m) and all_ones(n.b)) or ((n.b == m) and all_ones(n.a))) {
+                    r.x = ps[k];
+                    r.y = qs[l];
+                    r.m = m;
+                    r.p = p;
+                    r.q = q;
+                    r.n = n;
+                    return r;
+                }
+            }
+        }
+    }
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Uses
+// -----------------------------------------------------------------------------
+// Clears the selection state of f's values (loc, flag, uses, user, aux2),
+// then counts each instruction's uses (user: the last) and marks with flag
+// 1 the pointer arithmetic used only as addresses, folded into memory
+// operands: that of loads, stores, atomics and further pointer arithmetic,
+// and the arguments of intrinsics for which mem_arg says so. Without
+// [base + index + disp] addressing (index_disp false), a register offset
+// under further pointer arithmetic is added once, into a register its users
+// share (and so is a constant offset under a register one, which needs its
+// base in a register: built once rather than at every use).
+pub fn count_uses(f: *mut ir.Func, index_disp: bool, mem_arg: fn(*ir.Value, usize) bool) void {
+    for p in f.params {
+        p.loc = -1;
+        p.flag = 0;
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.loc = -1;
+            i.flag = 0;
+            i.uses = 0;
+            i.aux2 = 0;
+            i.user = ir.vnil();
+            if i.op == ir.OP_PTRADD {
+                i.flag = 1;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+            for k in @as(usize, 0)..3 {
+                let o = ops[k];
+                if u.isnil(o) or (o.kind != ir.V_INST) {
+                    continue;
+                }
+                o.uses += 1;
+                o.user = i;
+                if o.op == ir.OP_PTRADD {
+                    let is_addr = ((i.op == ir.OP_LOAD) and (k == 0)) or ((i.op == ir.OP_STORE) and (k == 1)) or
+                                  ((i.op == ir.OP_PTRADD) and (k == 0)) or
+                                  (((i.op == ir.OP_RMW) or (i.op == ir.OP_CMPXCHG)) and (k == 0));
+                    let indexed_base = not index_disp and (i.op == ir.OP_PTRADD) and (k == 0) and
+                                       (not is_c(o.b) or not is_c(i.b));
+                    if not is_addr or indexed_base {
+                        o.flag = o.flag & ~1;
+                    }
+                }
+            }
+            for k in 0..i.xs.len {
+                let o = i.xs.get(k);
+                if o.kind == ir.V_INST {
+                    o.uses += 1;
+                    o.user = i;
+                    if (o.op == ir.OP_PTRADD) and not mem_arg(i, k) {
+                        o.flag = o.flag & ~1;
+                    }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Module
+// -----------------------------------------------------------------------------
+pub fn bind_of(l: i32) u8 {
+    if l == ir.LINK_INTERNAL {
+        return elf.B_LOCAL;
+    }
+    if (l == ir.LINK_LINKONCE) or (l == ir.LINK_WEAK) or (l == ir.LINK_EXTWEAK) {
+        return elf.B_WEAK;
+    }
+    return elf.B_GLOBAL;
+}
+
+pub fn extern_global(g: *ir.Global) bool {
+    return u.isnil(g.init);
+}
+
+pub fn has_addresses(x: *ir.Value) bool {
+    if (x.kind == ir.V_GLOBAL) or (x.kind == ir.V_FUNC) {
+        return true;
+    }
+    if x.kind == ir.V_CAGG {
+        for i in 0..x.xs.len {
+            if has_addresses(x.xs.get(i)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The initial value x at offset base of s: its bytes, and for the addresses
+// in it relocations of type abs64 (fsym and gsym: the symbols of the
+// module's functions and globals).
+fn emit_data(s: *mut elf.Sec, base: u64, x: *mut ir.Value, abs64: u32, fsym: *u.List.[u32], gsym: *u.List.[u32]) void {
+    let t = x.ty;
+    let k = x.kind;
+    if k == ir.V_GLOBAL {
+        s.relocs.push(elf.Rel.{ off: base, ty: abs64, sym: gsym.get(@int_cast(usize, x.gv.id)), addend: 0 });
+        return;
+    }
+    if k == ir.V_FUNC {
+        s.relocs.push(elf.Rel.{ off: base, ty: abs64, sym: fsym.get(@int_cast(usize, x.fnp.id)), addend: 0 });
+        return;
+    }
+    if (k == ir.V_CAGG) and (t.kind != ir.T_VEC) {
+        for i in 0..x.xs.len {
+            emit_data(s, base + ir.field_off(t, i), x.xs.get(i), abs64, fsym, gsym);
+        }
+        return;
+    }
+    let mut b = bn.new_bytes();
+    const_le(x, &mut b, 0);
+    let v = s.data.view();
+    for i in 0..b.len() {
+        v[@truncate(usize, base) + i] = b.view()[i];
+    }
+    b.free();
+}
+
+// The symbols of m's functions (defined in text) and globals, in fsym and
+// gsym (by Func.id and Global.id); each defined global laid out in .data,
+// .bss, .tbss, .tdata, rodata or .data.rel.ro (sections added here), with
+// its initial value (abs64: the relocation type of an address in one).
+// Returns .data.rel.ro.
+pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32, abs64: u32, fsym: *mut u.List.[u32],
+                   gsym: *mut u.List.[u32]) i32 {
+    let data = elf.add_sec(obj, ".data", elf.S_DATA, 16);
+    let bss = elf.add_sec(obj, ".bss", elf.S_BSS, 16);
+    let tbss = elf.add_sec(obj, ".tbss", elf.S_TBSS, 16);
+    let tdata = elf.add_sec(obj, ".tdata", elf.S_TDATA, 16);
+    let relro = elf.add_sec(obj, ".data.rel.ro", elf.S_DATA, 16);
+    fsym.clear();
+    gsym.clear();
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if ir.is_decl(f) {
+            fsym.push(elf.ext_sym(obj, f.name, f.linkage == ir.LINK_EXTWEAK));
+        } else {
+            fsym.push(elf.add_sym(obj, elf.Sym.{ name: f.name, sec: text, value: 0, size: 0, bind: bind_of(f.linkage),
+                                                 ty: elf.T_FUNC, hidden: false }));
+        }
+    }
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if u.isnil(g.init) {
+            let si = elf.ext_sym(obj, g.name, g.linkage == ir.LINK_EXTWEAK);
+            if g.tls {
+                obj.syms.at(@as(usize, si)).ty = elf.T_TLS;
+            }
+            gsym.push(si);
+            continue;
+        }
+        let mut sec = data;
+        if g.tls {
+            sec = tbss;
+            if not ir.is_zero(g.init) {
+                sec = tdata;
+            }
+        } else if g.is_const {
+            sec = rodata;
+            if has_addresses(g.init) {
+                sec = relro;  // relocated at load time
+            }
+        } else if ir.is_zero(g.init) {
+            sec = bss;
+        }
+        let s = obj.secs.get(@int_cast(usize, sec));
+        let mut al = g.align;
+        if al == 0 {
+            al = 1;
+        }
+        if al > s.align {
+            s.align = al;  // the section is at least as aligned as its contents
+        }
+        let mut off: u64 = 0;
+        if (sec == bss) or (sec == tbss) {
+            s.size = (s.size + al - 1) & ~(al - 1);
+            off = s.size;
+            s.size += g.ty.size;
+        } else {
+            s.data.align(@truncate(usize, al));
+            off = @as(u64, s.data.len());
+            s.data.zeros(@truncate(usize, g.ty.size));
+        }
+        let mut ty = elf.T_OBJECT;
+        if g.tls {
+            ty = elf.T_TLS;
+        }
+        gsym.push(elf.add_sym(obj, elf.Sym.{ name: g.name, sec: sec, value: off, size: g.ty.size,
+                                             bind: bind_of(g.linkage), ty: ty, hidden: false }));
+    }
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        if u.isnil(g.init) {
+            continue;
+        }
+        let s = obj.syms.at(@as(usize, gsym.get(i)));
+        let sec = obj.secs.get(@int_cast(usize, s.sec));
+        if (sec.kind == elf.S_BSS) or (sec.kind == elf.S_TBSS) {
+            continue;
+        }
+        emit_data(sec, s.value, g.init, abs64, fsym, gsym);
+    }
+    return relro;
+}

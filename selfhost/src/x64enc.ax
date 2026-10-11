@@ -4,6 +4,7 @@
 // with VEX.L for 256-bit vectors, and EVEX for AVX-512's 512-bit ones).
 // =============================================================================
 import "bin.ax" as bn;
+import "elf.ax" as elf;
 import "util.ax" as u;
 
 // Physical registers: general purpose 0-15, xmm 16-31.
@@ -39,7 +40,7 @@ pub const LOAD: i32 = 3;      // r(D) <- m             sz 1/2/4/8, cc: 0 plain /
 pub const STORE: i32 = 4;     // m <- r(U)             sz 1/2/4/8
 pub const STORE_I: i32 = 5;   // m <- i                sz 1/2/4/8 (i sign-extended imm32)
 pub const LEA: i32 = 6;       // r(D) <- &m
-pub const ALU: i32 = 7;       // r(UD) op= r(U)|m|i    cc: /digit (0 add 1 or 4 and 5 sub 6 xor 7 cmp); sz 1/2/4/8
+pub const ALU: i32 = 7;       // r(UD) op= r(U)|m|i    cc: the operation (ALU_ADD ...); sz 1/2/4/8
 pub const TEST: i32 = 8;      // r(U) & r(U)|i         sz 1/2/4/8
 pub const IMUL: i32 = 9;      // r(UD) *= r(U)|m
 pub const IMUL_I: i32 = 10;   // r(D) <- r(U) * i
@@ -77,6 +78,16 @@ pub const ANDN: i32 = 41;        // BMI1: r(D) <- ~r(U) & r(U): ops dst, rm, vvv
 pub const BLS: i32 = 42;         // BMI1: r(D) <- r(U) & (r - 1) (cc 1, blsr), ^ (r - 1) (2, blsmsk), & -r (3, blsi)
 pub const BT: i32 = 43;          // CF <- bit r(U) (mod the width) of r(U): ops rm, bit index
 pub const PREFETCH: i32 = 44;    // m: cc 0 prefetcht0 (0F 18 /1), 1 prefetchw (0F 0D /1, PRFCHW)
+
+// The operations of ALU (its cc: the /digit of 80, 81 and 83)
+pub const ALU_ADD: i32 = 0;
+pub const ALU_OR: i32 = 1;
+pub const ALU_ADC: i32 = 2;
+pub const ALU_SBB: i32 = 3;
+pub const ALU_AND: i32 = 4;
+pub const ALU_SUB: i32 = 5;
+pub const ALU_XOR: i32 = 6;
+pub const ALU_CMP: i32 = 7;
 
 // Condition codes
 pub const CC_O: i32 = 0;
@@ -934,79 +945,10 @@ pub fn rm_b(m: *Mem) u64 {
     return 0;
 }
 
-// ModRM (+SIB, disp) for reg field `reg` and memory m. `imm_after`: bytes
-// of immediate following (rip-relative displacement adjustment).
+// ModRM (+SIB, disp) for reg field `reg` and memory m (modrm_mem_n, the
+// displacement in bytes).
 pub fn modrm_mem(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64) void {
-    let rf = (reg & 7) << 3;
-    if m.tpoff {
-        // [base + index*scale + disp32], the displacement relocated: with no
-        // base, via SIB (base field 5, mod 00); otherwise mod 10.
-        let mut ss: u64 = 0;
-        let mut xi: u64 = 4;
-        if m.index >= 0 {
-            ss = scale_bits(m.scale);
-            xi = gpr(m.index) & 7;
-        }
-        if m.base < 0 {
-            byte(e, 0x04 | rf);
-            byte(e, ((ss << 6) | (xi << 3)) | 5);
-        } else {
-            let tb = gpr(m.base) & 7;
-            if (m.index >= 0) or (tb == 4) {
-                byte(e, (0x80 | rf) | 4);
-                byte(e, ((ss << 6) | (xi << 3)) | tb);
-            } else {
-                byte(e, (0x80 | rf) | tb);
-            }
-        }
-        e.relocs.push(Reloc.{ off: @as(u64, e.b.len()), ty: 23, sym: m.sym, addend: m.disp });
-        e.b.u32_(0);
-        return;
-    }
-    if m.base < 0 {
-        if m.sym >= 0 {
-            // rip-relative
-            byte(e, 0x05 | rf);
-            e.relocs.push(Reloc.{ off: @as(u64, e.b.len()), ty: 2, sym: m.sym, addend: (m.disp - 4) - imm_after });
-            e.b.u32_(0);
-            return;
-        }
-        // absolute disp32 (index only)
-        byte(e, 0x04 | rf);
-        let mut ss: u64 = 0;
-        let mut xi: u64 = 4;
-        if m.index >= 0 {
-            ss = scale_bits(m.scale);
-            xi = gpr(m.index) & 7;
-        }
-        byte(e, ((ss << 6) | (xi << 3)) | 5);
-        e.b.u32_(@bit_cast(u64, m.disp));
-        return;
-    }
-    let bb = gpr(m.base) & 7;
-    let mut md: u64 = 2;
-    if (m.disp == 0) and (bb != 5) {
-        md = 0;
-    } else if (m.disp >= -128) and (m.disp <= 127) {
-        md = 1;
-    }
-    if (m.index >= 0) or (bb == 4) {
-        byte(e, ((md << 6) | rf) | 4);
-        let mut ss: u64 = 0;
-        let mut xi: u64 = 4;
-        if m.index >= 0 {
-            ss = scale_bits(m.scale);
-            xi = gpr(m.index) & 7;
-        }
-        byte(e, ((ss << 6) | (xi << 3)) | bb);
-    } else {
-        byte(e, ((md << 6) | rf) | bb);
-    }
-    if md == 1 {
-        byte(e, @bit_cast(u64, m.disp));
-    } else if md == 2 {
-        e.b.u32_(@bit_cast(u64, m.disp));
-    }
+    modrm_mem_n(e, reg, m, imm_after, 1);
 }
 
 // The unit an EVEX 8-bit displacement counts in for instruction id (the
@@ -1097,18 +1039,67 @@ fn evex(e: *mut Enc, id: i32, x: SseDesc, reg: i32, rm_reg: i32, m: *Mem, vvvv: 
     }
 }
 
-// modrm_mem with EVEX's compressed displacement: disp8 counts n-byte units
-// (n 0: no 8-bit displacement).
+// ModRM (+SIB, disp) for reg field `reg` and memory m, with EVEX's
+// compressed displacement: disp8 counts n-byte units (n 0: no 8-bit
+// displacement). `imm_after`: bytes of immediate following (rip-relative
+// displacement adjustment).
 fn modrm_mem_n(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64, n: i64) void {
-    if m.tpoff or (m.base < 0) or (m.disp == 0) {
-        modrm_mem(e, reg, m, imm_after);
+    let rf = (reg & 7) << 3;
+    if m.tpoff {
+        // [base + index*scale + disp32], the displacement relocated: with no
+        // base, via SIB (base field 5, mod 00); otherwise mod 10.
+        let mut ss: u64 = 0;
+        let mut xi: u64 = 4;
+        if m.index >= 0 {
+            ss = scale_bits(m.scale);
+            xi = gpr(m.index) & 7;
+        }
+        if m.base < 0 {
+            byte(e, 0x04 | rf);
+            byte(e, ((ss << 6) | (xi << 3)) | 5);
+        } else {
+            let tb = gpr(m.base) & 7;
+            if (m.index >= 0) or (tb == 4) {
+                byte(e, (0x80 | rf) | 4);
+                byte(e, ((ss << 6) | (xi << 3)) | tb);
+            } else {
+                byte(e, (0x80 | rf) | tb);
+            }
+        }
+        e.relocs.push(Reloc.{ off: @as(u64, e.b.len()), ty: elf.R_X86_64_TPOFF32, sym: m.sym, addend: m.disp });
+        e.b.u32_(0);
         return;
     }
-    let rf = (reg & 7) << 3;
+    if m.base < 0 {
+        if m.sym >= 0 {
+            // rip-relative
+            byte(e, 0x05 | rf);
+            e.relocs.push(Reloc.{ off: @as(u64, e.b.len()), ty: elf.R_X86_64_PC32, sym: m.sym,
+                                  addend: (m.disp - 4) - imm_after });
+            e.b.u32_(0);
+            return;
+        }
+        // absolute disp32 (index only)
+        byte(e, 0x04 | rf);
+        let mut ss: u64 = 0;
+        let mut xi: u64 = 4;
+        if m.index >= 0 {
+            ss = scale_bits(m.scale);
+            xi = gpr(m.index) & 7;
+        }
+        byte(e, ((ss << 6) | (xi << 3)) | 5);
+        e.b.u32_(@bit_cast(u64, m.disp));
+        return;
+    }
     let bb = gpr(m.base) & 7;
     let mut md: u64 = 2;
-    let mut q: i64 = 0;
-    if n > 0 {
+    let mut q = m.disp;
+    if m.disp == 0 {
+        md = 1;
+        if bb != 5 {
+            md = 0;  // ([rbp] and [r13] take a displacement)
+        }
+    } else if n > 0 {
         q = m.disp / n;
         if ((m.disp % n) == 0) and (q >= -128) and (q <= 127) {
             md = 1;
@@ -1128,7 +1119,7 @@ fn modrm_mem_n(e: *mut Enc, reg: u64, m: *Mem, imm_after: i64, n: i64) void {
     }
     if md == 1 {
         byte(e, @bit_cast(u64, q));
-    } else {
+    } else if md == 2 {
         e.b.u32_(@bit_cast(u64, m.disp));
     }
 }
