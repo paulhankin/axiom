@@ -2429,6 +2429,35 @@ static LLVMValueRef reduce_add(Type *vt, LLVMValueRef v) {
     return LLVMBuildExtractElement(B, v, LLVMConstInt(T_i32, 0, false), "");
 }
 
+// A shuffle of x with zeros that puts lanes base, base+1, ... of x each
+// followed by f-1 zeros ([0, Z, 1, Z, ...] for f = 2): on little-endian
+// targets, those lanes zero-extended to f times their width. Built so:
+// LLVM 18's x86 DAG combine can abort on the shuffle followed by a
+// bit_cast to the wider lanes ("Invalid size request on a scalable
+// vector", issue 0065). NULL for any other shuffle.
+static LLVMValueRef shuffle_as_zext(LLVMValueRef x, LLVMValueRef y, Expr *idx) {
+    if (g_target.wasm || !LLVMIsConstant(y) || !LLVMIsNull(y)) return NULL;
+    LLVMTypeRef xt = LLVMTypeOf(x), lane = LLVMGetElementType(xt);
+    if (LLVMGetTypeKind(lane) != LLVMIntegerTypeKind) return NULL;
+    unsigned nin = LLVMGetVectorSize(xt), n = (unsigned)idx->args.len, bits = LLVMGetIntTypeWidth(lane);
+    for (unsigned f = 2; f <= 8; f *= 2) {
+        if (n % f != 0 || bits * f > 64) continue;
+        i128 base = idx->args.data[0]->cval;
+        bool ok = base >= 0 && base + n / f <= nin;
+        for (unsigned i = 0; ok && i < n; i++) {
+            i128 k = idx->args.data[i]->cval;
+            ok = i % f == 0 ? k == base + i / f : k >= nin;
+        }
+        if (!ok) continue;
+        LLVMValueRef *m = NEWN(LLVMValueRef, n / f);
+        for (unsigned i = 0; i < n / f; i++) m[i] = LLVMConstInt(T_i32, (unsigned long long)(base + i), false);
+        LLVMValueRef lo = LLVMBuildShuffleVector(B, x, LLVMGetPoison(xt), LLVMConstVector(m, n / f), "");
+        LLVMValueRef w = LLVMBuildZExt(B, lo, LLVMVectorType(LLVMIntType(bits * f), n / f), "");
+        return LLVMBuildBitCast(B, w, LLVMVectorType(lane, n), "");
+    }
+    return NULL;
+}
+
 static LLVMValueRef ext_int(LLVMValueRef v, LLVMTypeRef to, bool is_signed) {
     unsigned a = LLVMGetIntTypeWidth(LLVMTypeOf(v)), b = LLVMGetIntTypeWidth(to);
     if (a == b) return v;
@@ -2962,10 +2991,15 @@ static LLVMValueRef gen_builtin(Expr *e) {
         Type *s = ct(a[1].e->type);
         LLVMValueRef v = gen(a[1].e);
         if (s == rt) return v;
-        if (s->kind == TY_PTR && rt->kind != TY_PTR) return LLVMBuildPtrToInt(B, v, lty(rt), "");
-        if (rt->kind == TY_PTR && s->kind != TY_PTR) return LLVMBuildIntToPtr(B, v, T_ptr, "");
-        if (rt->kind == TY_PTR) return v;
-        return LLVMBuildBitCast(B, v, lty(rt), "");
+        // By LLVM type: a function pointer is a `ptr` on native targets (a
+        // table index on wasm), like a pointer.
+        LLVMTypeRef dt = lty(rt);
+        bool from_ptr = LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind;
+        bool to_ptr = LLVMGetTypeKind(dt) == LLVMPointerTypeKind;
+        if (from_ptr && to_ptr) return v;
+        if (from_ptr) return LLVMBuildPtrToInt(B, v, dt, "");
+        if (to_ptr) return LLVMBuildIntToPtr(B, v, dt, "");
+        return LLVMBuildBitCast(B, v, dt, "");
     }
     case BI_INT_FROM_PTR: return LLVMBuildPtrToInt(B, gen(a[0].e), T_isz, "");
     case BI_PTR_FROM_INT: return LLVMBuildIntToPtr(B, gen(a[1].e), T_ptr, "");
@@ -3207,6 +3241,8 @@ static LLVMValueRef gen_builtin(Expr *e) {
     case BI_SHUFFLE: {
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e);
         Expr *idx = a[2].e;
+        LLVMValueRef zx = shuffle_as_zext(x, y, idx);
+        if (zx) return zx;
         LLVMValueRef *m = NEWN(LLVMValueRef, idx->args.len);
         for (int i = 0; i < idx->args.len; i++) m[i] = LLVMConstInt(T_i32, (unsigned long long)idx->args.data[i]->cval, false);
         return LLVMBuildShuffleVector(B, x, y, LLVMConstVector(m, (unsigned)idx->args.len), "");
