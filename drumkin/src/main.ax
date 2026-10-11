@@ -1,0 +1,1033 @@
+// =============================================================================
+// File: main.ax
+// Drumkin: a drum machine for macOS. Eight drums made from FM and noise
+// (std/... nothing but sines, white noise, a filter and envelopes: see
+// synth.ax), each with two settings, A and B, and a blend between them; a
+// sixteen-step sequencer with swing; knobs.
+//
+//   axiom build drumkin --target=aarch64-macos -O2 -o drumkin
+//   ./drumkin                     (the window; Cmd-Q or closing it quits)
+//   ./drumkin --wav beat.wav      (renders four bars of the pattern instead)
+//   ./drumkin --png drumkin.png   (draws the window offscreen, saves it)
+//
+// In the window: click a step to set or clear it, right-click (or shift-
+// click) to accent it; click a drum's name to choose it (and hear it), and
+// turn its knobs, which edit setting A or B (the tabs); the slider at the
+// end of each row, and the large one, blend between A and B. A knob's
+// coloured arc is the setting being edited, its dot the other setting, and
+// the white tick outside it where the blend puts it. Drag knobs up and down
+// (or scroll over them). Space plays and stops, 1 to 8 play the drums, the
+// arrow keys choose one, A and B choose the setting.
+//
+// The window is std/os/cocoa, drawn with std/graphics/quartz over
+// std/graphics/metal; the sound goes out through std/audio/output from a
+// thread of its own, a few milliseconds at a time.
+// =============================================================================
+
+import "kit.ax" as kit;
+import "synth.ax" as synth;
+import "std/audio" as audio;
+import "std/audio/output" as output;
+import "std/audio/wav" as wav;
+import "std/collections/vec" as vec;
+import "std/fmt" as fmt;
+import "std/graphics/image/png" as png;
+import "std/graphics/metal" as metal;
+import "std/graphics/quartz" as quartz;
+import "std/io" as io;
+import "std/math" as math;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/os/cli" as cli;
+import "std/os/cocoa" as cocoa;
+import "std/os/fs" as fs;
+import "std/str" as strs;
+import "std/thread" as thread;
+import "std/time" as time;
+
+// -----------------------------------------------------------------------------
+// Sound out: a thread keeps about 20 ms of audio queued ahead of the device
+// -----------------------------------------------------------------------------
+const BLOCK: usize = 256;   // frames rendered at a time
+const BLOCKS: usize = 16;   // buffers, used in turn
+const AHEAD: u64 = 1024;    // frames kept queued
+
+struct Audio {
+    model: *mut synth.Model,
+    out: output.Engine,
+    quit: u32,
+}
+
+fn audio_main(a: *mut Audio) void {
+    let mut engine = synth.Engine.init();
+    let mut voice = a.out.voice_for(2, 48000, audio.SampleFormat.F32) catch return;
+    let bufs = mem.alloc.[f32](BLOCK * 2 * BLOCKS) catch {
+        voice.destroy();
+        return;
+    };
+    @mem_set(bufs, 0.0);
+    voice.start();
+    let mut queued: u64 = 0;
+    let mut next: usize = 0;
+    while @atomic_load(&a.quit) == 0 {
+        while (queued - voice.frames_played()) < AHEAD {
+            let buf = bufs[(next * BLOCK * 2)..((next + 1) * BLOCK * 2)];
+            synth.lock(a.model);
+            synth.render(&mut engine, a.model, buf);
+            synth.unlock(a.model);
+            voice.queue(@slice_from_ptr(@ptr_cast(*u8, buf.ptr), buf.len * 4), false) catch break;
+            queued += @as(u64, BLOCK);
+            next = (next + 1) % BLOCKS;
+        }
+        time.sleep(time.Duration.milliseconds(1));
+    }
+    voice.stop();
+    voice.destroy();
+    mem.free(bufs);
+}
+
+// -----------------------------------------------------------------------------
+// Layout, in points (the window is scaled to fit)
+// -----------------------------------------------------------------------------
+const W: f32 = 1180.0;
+const H: f32 = 744.0;
+
+const ROW_TOP: f32 = 88.0;
+const ROW_PITCH: f32 = 40.0;
+const ROW_H: f32 = 34.0;
+const NAME_X: f32 = 24.0;
+const NAME_W: f32 = 122.0;
+const MUTE_X: f32 = 152.0;
+const MUTE_W: f32 = 28.0;
+const PAD_X: f32 = 194.0;
+const PAD_W: f32 = 34.0;
+const ROW_SLIDER_X: f32 = 896.0;
+const ROW_SLIDER_W: f32 = 236.0;
+
+const PANEL_TOP: f32 = 420.0;
+const TAB_Y: f32 = 436.0;
+const TAB_H: f32 = 30.0;
+const TAB_A_X: f32 = 250.0;
+const TAB_B_X: f32 = 312.0;
+const TAB_W: f32 = 56.0;
+const COPY_AB_X: f32 = 392.0;
+const COPY_BA_X: f32 = 466.0;
+const COPY_W: f32 = 68.0;
+const BLEND_X: f32 = 622.0;
+const BLEND_W: f32 = 480.0;
+const KNOB_ROW1: f32 = 482.0;
+const KNOB_ROW2: f32 = 604.0;
+const CELL_X: f32 = 48.0;
+const CELL_W: f32 = 104.0;
+const GROUP_GAP: f32 = 32.0;
+const KNOB_R: f32 = 25.0;
+
+const PLAY_X: f32 = 286.0;
+const PLAY_Y: f32 = 17.0;
+const PLAY_W: f32 = 92.0;
+const PLAY_H: f32 = 38.0;
+const SMALL_R: f32 = 16.0;
+const TEMPO_X: f32 = 428.0;
+const SWING_X: f32 = 500.0;
+const VOLUME_X: f32 = 572.0;
+const SMALL_Y: f32 = 30.0;
+const SCOPE_X: f32 = 636.0;
+const SCOPE_W: f32 = 300.0;
+
+// The knobs' places: two rows of ten cells, in two groups each.
+let ROW1: [10]usize = [synth.TUNE, synth.BEND, synth.BEND_DECAY, synth.RATIO, synth.FM, synth.FM_DECAY, synth.TONE,
+                       synth.DRIVE, synth.PAN, synth.LEVEL];
+let ROW2: [10]usize = [synth.NOISE, synth.CUTOFF, synth.RESO, synth.MODE, synth.FENV, synth.FENV_DECAY,
+                       synth.ATTACK, synth.DECAY, synth.SUSTAIN, synth.RELEASE];
+const SPLIT1: usize = 7;
+const SPLIT2: usize = 6;
+
+// What the mouse can hold
+const NOTHING: i32 = -1;
+const TEMPO: i32 = 100;
+const SWING: i32 = 101;
+const VOLUME: i32 = 102;
+const ROW_BLEND: i32 = 200;  // + the drum
+const BLEND: i32 = 300;
+
+fn pad_x(s: usize) f32 {
+    return PAD_X + (@float_from_int(f32, s) * 40.0) + (@float_from_int(f32, s / 4) * 10.0);
+}
+
+fn row_y(d: usize) f32 {
+    return ROW_TOP + (@float_from_int(f32, d) * ROW_PITCH);
+}
+
+fn cell_x(i: usize, split: usize) f32 {
+    let mut x = CELL_X + (@float_from_int(f32, i) * CELL_W);
+    if i >= split {
+        x += GROUP_GAP;
+    }
+    return x;
+}
+
+// The centre of parameter p's knob.
+fn knob_at(p: usize) [2]f32 {
+    for i in @as(usize, 0)..10 {
+        if ROW1[i] == p {
+            return [cell_x(i, SPLIT1) + (CELL_W * 0.5), KNOB_ROW1 + 64.0];
+        }
+        if ROW2[i] == p {
+            return [cell_x(i, SPLIT2) + (CELL_W * 0.5), KNOB_ROW2 + 64.0];
+        }
+    }
+    return [0.0, 0.0];
+}
+
+fn inside(x: f32, y: f32, rx: f32, ry: f32, rw: f32, rh: f32) bool {
+    return (x >= rx) and (x < (rx + rw)) and (y >= ry) and (y < (ry + rh));
+}
+
+fn near(x: f32, y: f32, cx: f32, cy: f32, r: f32) bool {
+    return (((x - cx) * (x - cx)) + ((y - cy) * (y - cy))) <= (r * r);
+}
+
+// -----------------------------------------------------------------------------
+// The window's state
+// -----------------------------------------------------------------------------
+struct Ui {
+    model: *mut synth.Model,
+    view: synth.Model,  // a copy, taken each frame, to draw
+    drum: usize,         // the drum being edited
+    edit_b: bool,        // editing setting B (else A)
+    held: i32,           // what the mouse is turning (NOTHING, a parameter, TEMPO, ...)
+    held_y: f32,
+    held_value: f32,
+    shift: bool,
+    lights: [8]f32,
+    seen: [8]u32,
+    meter: f32,
+}
+
+fn new_ui(m: *mut synth.Model) Ui {
+    return Ui.{ model: m, view: m.*, drum: 0, edit_b: false, held: NOTHING, held_y: 0.0, held_value: 0.0,
+                shift: false, lights: [0.0; 8], seen: [0; 8], meter: 0.0 };
+}
+
+// A control's value, 0..1 (the model locked).
+fn get(u: *Ui, m: *synth.Model, id: i32) f32 {
+    if (id >= 0) and (id < 20) {
+        let p = @int_cast(usize, id);
+        if u.edit_b {
+            return m.b[u.drum][p];
+        }
+        return m.a[u.drum][p];
+    }
+    if id == TEMPO {
+        return (m.bpm - 60.0) / 140.0;
+    }
+    if id == SWING {
+        return m.swing;
+    }
+    if id == VOLUME {
+        return m.volume;
+    }
+    if id == BLEND {
+        return m.blend[u.drum];
+    }
+    if (id >= ROW_BLEND) and (id < (ROW_BLEND + 8)) {
+        return m.blend[@int_cast(usize, id - ROW_BLEND)];
+    }
+    return 0.0;
+}
+
+fn set(u: *Ui, m: *mut synth.Model, id: i32, x: f32) void {
+    let v = @min(@max(x, 0.0), 1.0);
+    if (id >= 0) and (id < 20) {
+        let p = @int_cast(usize, id);
+        if u.edit_b {
+            m.b[u.drum][p] = v;
+        } else {
+            m.a[u.drum][p] = v;
+        }
+    } else if id == TEMPO {
+        m.bpm = @nearest(60.0 + (v * 140.0));
+    } else if id == SWING {
+        m.swing = v;
+    } else if id == VOLUME {
+        m.volume = v;
+    } else if id == BLEND {
+        m.blend[u.drum] = v;
+    } else if (id >= ROW_BLEND) and (id < (ROW_BLEND + 8)) {
+        m.blend[@int_cast(usize, id - ROW_BLEND)] = v;
+    }
+}
+
+// Sliders follow the mouse across; knobs turn with its movement up and down.
+fn slider_value(id: i32, x: f32) f32 {
+    if id == BLEND {
+        return (x - BLEND_X) / BLEND_W;
+    }
+    return (x - ROW_SLIDER_X) / ROW_SLIDER_W;
+}
+
+fn is_slider(id: i32) bool {
+    return id >= ROW_BLEND;
+}
+
+// The knob or slider at (x, y), or NOTHING.
+fn control_at(x: f32, y: f32) i32 {
+    for p in @as(usize, 0)..synth.PARAMS {
+        let c = knob_at(p);
+        if near(x, y, c[0], c[1], KNOB_R + 8.0) {
+            return @int_cast(i32, p);
+        }
+    }
+    if near(x, y, TEMPO_X, SMALL_Y, SMALL_R + 6.0) {
+        return TEMPO;
+    }
+    if near(x, y, SWING_X, SMALL_Y, SMALL_R + 6.0) {
+        return SWING;
+    }
+    if near(x, y, VOLUME_X, SMALL_Y, SMALL_R + 6.0) {
+        return VOLUME;
+    }
+    if inside(x, y, BLEND_X - 10.0, TAB_Y, BLEND_W + 20.0, TAB_H) {
+        return BLEND;
+    }
+    for d in @as(usize, 0)..synth.VOICES {
+        if inside(x, y, ROW_SLIDER_X - 10.0, row_y(d), ROW_SLIDER_W + 20.0, ROW_H) {
+            return ROW_BLEND + @int_cast(i32, d);
+        }
+    }
+    return NOTHING;
+}
+
+fn hear(u: *mut Ui, d: usize) void {
+    u.drum = d;
+    synth.lock(u.model);
+    u.model.audition[d] = 2;
+    synth.unlock(u.model);
+}
+
+// A press of mouse button `button` at (x, y) in points.
+fn press(u: *mut Ui, x: f32, y: f32, which: u32) void {
+    let m = u.model;
+    let id = control_at(x, y);
+    if id != NOTHING {
+        synth.lock(m);
+        if is_slider(id) {
+            set(u, m, id, slider_value(id, x));
+        }
+        u.held = id;
+        u.held_y = y;
+        u.held_value = get(u, m, id);
+        synth.unlock(m);
+        return;
+    }
+    synth.lock(m);
+    defer synth.unlock(m);
+    if inside(x, y, PLAY_X, PLAY_Y, PLAY_W, PLAY_H) {
+        m.playing = not m.playing;
+        return;
+    }
+    if inside(x, y, TAB_A_X, TAB_Y, TAB_W, TAB_H) {
+        u.edit_b = false;
+        return;
+    }
+    if inside(x, y, TAB_B_X, TAB_Y, TAB_W, TAB_H) {
+        u.edit_b = true;
+        return;
+    }
+    if inside(x, y, COPY_AB_X, TAB_Y, COPY_W, TAB_H) {
+        m.b[u.drum] = m.a[u.drum];
+        return;
+    }
+    if inside(x, y, COPY_BA_X, TAB_Y, COPY_W, TAB_H) {
+        m.a[u.drum] = m.b[u.drum];
+        return;
+    }
+    for d in @as(usize, 0)..synth.VOICES {
+        let ry = row_y(d);
+        if inside(x, y, NAME_X, ry, NAME_W, ROW_H) {
+            u.drum = d;
+            m.audition[d] = 2;
+            return;
+        }
+        if inside(x, y, MUTE_X, ry, MUTE_W, ROW_H) {
+            m.mute[d] = not m.mute[d];
+            return;
+        }
+        for s in @as(usize, 0)..synth.STEPS {
+            if inside(x, y, pad_x(s), ry, PAD_W, ROW_H) {
+                let accent = (which == 1) or u.shift;
+                let was = m.pattern[d][s];
+                if accent {
+                    if was == 2 {
+                        m.pattern[d][s] = 1;
+                    } else {
+                        m.pattern[d][s] = 2;
+                    }
+                } else if was == 0 {
+                    m.pattern[d][s] = 1;
+                } else {
+                    m.pattern[d][s] = 0;
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn drag(u: *mut Ui, x: f32, y: f32) void {
+    if u.held == NOTHING {
+        return;
+    }
+    synth.lock(u.model);
+    if is_slider(u.held) {
+        set(u, u.model, u.held, slider_value(u.held, x));
+    } else {
+        let mut per: f32 = 180.0;  // points for the whole turn
+        if u.shift {
+            per = 900.0;
+        }
+        set(u, u.model, u.held, u.held_value + ((u.held_y - y) / per));
+    }
+    synth.unlock(u.model);
+}
+
+fn scroll(u: *mut Ui, x: f32, y: f32, delta: i32) void {
+    let id = control_at(x, y);
+    if id == NOTHING {
+        return;
+    }
+    synth.lock(u.model);
+    set(u, u.model, id, get(u, u.model, id) + (@float_from_int(f32, delta) / 120.0 * 0.02));
+    synth.unlock(u.model);
+}
+
+fn key(u: *mut Ui, k: u32) void {
+    if k == cocoa.KEY_SPACE {
+        synth.lock(u.model);
+        u.model.playing = not u.model.playing;
+        synth.unlock(u.model);
+    } else if (k >= '1') and (k <= '8') {
+        hear(u, @as(usize, k - '1'));
+    } else if k == 'A' {
+        u.edit_b = false;
+    } else if k == 'B' {
+        u.edit_b = true;
+    } else if k == cocoa.KEY_UP {
+        hear(u, (u.drum + synth.VOICES - 1) % synth.VOICES);
+    } else if k == cocoa.KEY_DOWN {
+        hear(u, (u.drum + 1) % synth.VOICES);
+    }
+}
+
+// Takes the frame's copy of the model, and moves the lights and the meter.
+fn snapshot(u: *mut Ui) void {
+    synth.lock(u.model);
+    u.view = u.model.*;
+    u.model.peak = 0.0;
+    synth.unlock(u.model);
+    for d in @as(usize, 0)..synth.VOICES {
+        u.lights[d] *= 0.86;
+        if u.view.hits[d] != u.seen[d] {
+            u.seen[d] = u.view.hits[d];
+            u.lights[d] = 1.0;
+        }
+    }
+    u.meter = @max(u.meter * 0.9, u.view.peak);
+}
+
+// -----------------------------------------------------------------------------
+// Drawing
+// -----------------------------------------------------------------------------
+fn rgb(r: f32, g: f32, b: f32) quartz.Color {
+    return quartz.rgb(r, g, b);
+}
+
+fn mix(a: quartz.Color, b: quartz.Color, t: f32) quartz.Color {
+    return quartz.rgba(a.r + ((b.r - a.r) * t), a.g + ((b.g - a.g) * t), a.b + ((b.b - a.b) * t),
+                       a.a + ((b.a - a.a) * t));
+}
+
+fn fade(c: quartz.Color, alpha: f32) quartz.Color {
+    return quartz.rgba(c.r, c.g, c.b, c.a * alpha);
+}
+
+let BG: quartz.Color = quartz.Color.{ r: 0.07, g: 0.074, b: 0.086, a: 1.0 };
+let PANEL: quartz.Color = quartz.Color.{ r: 0.11, g: 0.116, b: 0.133, a: 1.0 };
+let RAISED: quartz.Color = quartz.Color.{ r: 0.16, g: 0.168, b: 0.19, a: 1.0 };
+let PAD_OFF: quartz.Color = quartz.Color.{ r: 0.19, g: 0.2, b: 0.225, a: 1.0 };
+let LINE: quartz.Color = quartz.Color.{ r: 0.27, g: 0.28, b: 0.31, a: 1.0 };
+let DIM: quartz.Color = quartz.Color.{ r: 0.52, g: 0.54, b: 0.58, a: 1.0 };
+let TEXT: quartz.Color = quartz.Color.{ r: 0.9, g: 0.91, b: 0.93, a: 1.0 };
+let COLOR_A: quartz.Color = quartz.Color.{ r: 1.0, g: 0.56, b: 0.16, a: 1.0 };
+let COLOR_B: quartz.Color = quartz.Color.{ r: 0.22, g: 0.76, b: 1.0, a: 1.0 };
+let RED: quartz.Color = quartz.Color.{ r: 0.95, g: 0.3, b: 0.3, a: 1.0 };
+
+struct Fonts {
+    title: quartz.Font,
+    subtitle: quartz.Font,
+    big: quartz.Font,
+    name: quartz.Font,
+    label: quartz.Font,  // centred
+    value: quartz.Font,  // centred
+    button: quartz.Font, // centred
+    small: quartz.Font,
+}
+
+fn font(c: *mut quartz.Canvas, size: f32, weight: u32, centred: bool) !quartz.Font {
+    let mut f = c.font("Helvetica Neue, Helvetica, system-ui", size, weight, false)!;
+    if centred {
+        f.align(quartz.Align.CENTER, quartz.Align.CENTER);
+    } else {
+        f.align(quartz.Align.START, quartz.Align.CENTER);
+    }
+    f.no_wrap();
+    return f;
+}
+
+fn fonts(c: *mut quartz.Canvas) !Fonts {
+    return Fonts.{ title: font(c, 27.0, quartz.BOLD, false)!, subtitle: font(c, 9.5, quartz.NORMAL, false)!,
+                   big: font(c, 20.0, quartz.BOLD, false)!, name: font(c, 11.5, quartz.BOLD, false)!,
+                   label: font(c, 9.5, quartz.BOLD, true)!, value: font(c, 10.5, quartz.NORMAL, true)!,
+                   button: font(c, 12.0, quartz.BOLD, true)!, small: font(c, 10.0, quartz.NORMAL, false)! };
+}
+
+fn release_fonts(f: *mut Fonts) void {
+    f.title.release();
+    f.subtitle.release();
+    f.big.release();
+    f.name.release();
+    f.label.release();
+    f.value.release();
+    f.button.release();
+    f.small.release();
+}
+
+// The angle (radians, anticlockwise from 3 o'clock) of a knob at x (0..1):
+// from 7:30 round clockwise to 4:30.
+fn angle(x: f32) f32 {
+    return (225.0 - (270.0 * x)) * 0.017453292;
+}
+
+fn arc(c: *mut quartz.Canvas, cx: f32, cy: f32, r: f32, x0: f32, x1: f32, col: quartz.Color, width: f32) !void {
+    let mut pts: [130]f32 = [0.0; 130];
+    let lo = @min(x0, x1);
+    let hi = @max(x0, x1);
+    let n = @min(@max(@int_from_float(usize, (hi - lo) * 64.0) + 2, 2), 65);
+    for i in 0..n {
+        let t = lo + (((hi - lo) * @float_from_int(f32, i)) / @float_from_int(f32, n - 1));
+        let a = angle(t);
+        pts[i * 2] = cx + (r * math.cosf(a));
+        pts[(i * 2) + 1] = cy - (r * math.sinf(a));
+    }
+    c.draw_lines(pts[..(n * 2)], false, col, width)!;
+}
+
+fn on_circle(cx: f32, cy: f32, r: f32, x: f32) [2]f32 {
+    let a = angle(x);
+    return [cx + (r * math.cosf(a)), cy - (r * math.sinf(a))];
+}
+
+// A knob at x (0..1) in colour col; `other` (if not negative) a dot where
+// the other setting is, `mark` (if not negative) a tick outside where the
+// blend is.
+fn knob(c: *mut quartz.Canvas, cx: f32, cy: f32, r: f32, x: f32, col: quartz.Color, from: f32, other: f32,
+        other_col: quartz.Color, mark: f32) !void {
+    c.fill_ellipse(cx, cy + 1.5, r - 4.0, r - 4.0, quartz.rgba(0.0, 0.0, 0.0, 0.35));
+    c.fill_ellipse(cx, cy, r - 5.0, r - 5.0, RAISED);
+    c.draw_ellipse(cx, cy, r - 5.0, r - 5.0, LINE, 1.0);
+    arc(c, cx, cy, r, 0.0, 1.0, PAD_OFF, 3.5)!;
+    if @abs(x - from) > 0.002 {
+        arc(c, cx, cy, r, from, x, col, 3.5)!;
+    }
+    let p0 = on_circle(cx, cy, r * 0.25, x);
+    let p1 = on_circle(cx, cy, r - 8.0, x);
+    c.line(p0[0], p0[1], p1[0], p1[1], TEXT, 2.5);
+    if other >= 0.0 {
+        let o = on_circle(cx, cy, r, other);
+        c.fill_ellipse(o[0], o[1], 3.2, 3.2, BG);
+        c.fill_ellipse(o[0], o[1], 2.4, 2.4, other_col);
+    }
+    if mark >= 0.0 {
+        let q0 = on_circle(cx, cy, r + 3.5, mark);
+        let q1 = on_circle(cx, cy, r + 8.5, mark);
+        c.line(q0[0], q0[1], q1[0], q1[1], TEXT, 2.0);
+    }
+}
+
+// A slider from A (left) to B (right) at x.
+fn slider(c: *mut quartz.Canvas, f: *Fonts, sx: f32, sy: f32, w: f32, h: f32, x: f32) !void {
+    let cy = sy + (h * 0.5);
+    c.text(&f.label, "A", sx - 24.0, sy, 12.0, h, COLOR_A)!;
+    c.text(&f.label, "B", sx + w + 12.0, sy, 12.0, h, COLOR_B)!;
+    c.fill_round_rect(sx, cy - 3.0, w, 6.0, 3.0, PAD_OFF);
+    // the track tinted from A's colour to B's, up to the thumb
+    let n: usize = 24;
+    let upto = x * w;
+    for i in 0..n {
+        let x0 = (@float_from_int(f32, i) * w) / @float_from_int(f32, n);
+        let x1 = @min((@float_from_int(f32, i + 1) * w) / @float_from_int(f32, n), upto);
+        if x1 > x0 {
+            c.fill_rect(sx + x0, cy - 2.0, x1 - x0, 4.0, mix(COLOR_A, COLOR_B, x0 / w));
+        }
+    }
+    let tx = sx + upto;
+    c.fill_ellipse(tx, cy, 8.0, 8.0, quartz.rgba(0.0, 0.0, 0.0, 0.4));
+    c.fill_ellipse(tx, cy, 7.0, 7.0, TEXT);
+    c.fill_ellipse(tx, cy, 3.0, 3.0, mix(COLOR_A, COLOR_B, x));
+}
+
+fn button(c: *mut quartz.Canvas, f: *Fonts, x: f32, y: f32, w: f32, h: f32, label: []u8, on: bool,
+          col: quartz.Color) !void {
+    if on {
+        c.fill_round_rect(x, y, w, h, 6.0, col);
+        c.text(&f.button, label, x, y, w, h, BG)!;
+    } else {
+        c.fill_round_rect(x, y, w, h, 6.0, RAISED);
+        c.draw_round_rect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, 6.0, LINE, 1.0);
+        c.text(&f.button, label, x, y, w, h, TEXT)!;
+    }
+}
+
+// A parameter's value as it reads.
+fn describe(buf: []mut u8, p: usize, x: f32) ![]u8 {
+    let v = synth.value(p, x);
+    let u = synth.UNITS[p];
+    if u == synth.U_HZ {
+        if v < 1000.0 {
+            return fmt.bufprint(buf, "{} Hz", [fmt.int(@int_from_float(i32, @nearest(v)))]);
+        }
+        return fmt.bufprint(buf, "{:.2} kHz", [fmt.float32(v / 1000.0)]);
+    }
+    if u == synth.U_SEMI {
+        return fmt.bufprint(buf, "{:.1} st", [fmt.float32(v)]);
+    }
+    if u == synth.U_SEC {
+        if v < 0.01 {
+            return fmt.bufprint(buf, "{:.1} ms", [fmt.float32(v * 1000.0)]);
+        }
+        if v < 1.0 {
+            return fmt.bufprint(buf, "{} ms", [fmt.int(@int_from_float(i32, @nearest(v * 1000.0)))]);
+        }
+        return fmt.bufprint(buf, "{:.2} s", [fmt.float32(v)]);
+    }
+    if u == synth.U_RATIO {
+        return fmt.bufprint(buf, "{:.2} : 1", [fmt.float32(v)]);
+    }
+    if u == synth.U_NUM {
+        return fmt.bufprint(buf, "{:.2}", [fmt.float32(v)]);
+    }
+    if u == synth.U_PCT {
+        return fmt.bufprint(buf, "{}%", [fmt.int(@int_from_float(i32, @nearest(v * 100.0)))]);
+    }
+    if u == synth.U_MODE {
+        if v < 0.12 {
+            return "low-pass";
+        }
+        if v < 0.4 {
+            return "low > band";
+        }
+        if v < 0.6 {
+            return "band-pass";
+        }
+        if v < 0.88 {
+            return "band > high";
+        }
+        return "high-pass";
+    }
+    if u == synth.U_OCT {
+        return fmt.bufprint(buf, "{:+.1} oct", [fmt.float32(v)]);
+    }
+    if u == synth.U_TIMES {
+        return fmt.bufprint(buf, "x {:.1}", [fmt.float32(v)]);
+    }
+    // pan
+    let n = @int_from_float(i32, @nearest(@abs(v) * 100.0));
+    if n == 0 {
+        return "centre";
+    }
+    if v < 0.0 {
+        return fmt.bufprint(buf, "L {}", [fmt.int(n)]);
+    }
+    return fmt.bufprint(buf, "R {}", [fmt.int(n)]);
+}
+
+fn header(c: *mut quartz.Canvas, f: *Fonts, u: *Ui) !void {
+    let m = &u.view;
+    let mut buf: [48]u8 = [0; 48];
+    c.text(&f.title, "DRUMKIN", 24.0, 10.0, 240.0, 34.0, TEXT)!;
+    c.text(&f.subtitle, "FM + NOISE DRUM MACHINE  ·  AXIOM", 26.0, 44.0, 240.0, 14.0, DIM)!;
+    // play / stop
+    if m.playing {
+        c.fill_round_rect(PLAY_X, PLAY_Y, PLAY_W, PLAY_H, 8.0, COLOR_A);
+        c.fill_rect(PLAY_X + 16.0, PLAY_Y + 13.0, 12.0, 12.0, BG);
+        c.text(&f.button, "STOP", PLAY_X + 26.0, PLAY_Y, PLAY_W - 30.0, PLAY_H, BG)!;
+    } else {
+        c.fill_round_rect(PLAY_X, PLAY_Y, PLAY_W, PLAY_H, 8.0, RAISED);
+        c.draw_round_rect(PLAY_X + 0.5, PLAY_Y + 0.5, PLAY_W - 1.0, PLAY_H - 1.0, 8.0, LINE, 1.0);
+        let tri: [6]f32 = [PLAY_X + 17.0, PLAY_Y + 12.0, PLAY_X + 29.0, PLAY_Y + 19.0, PLAY_X + 17.0, PLAY_Y + 26.0];
+        c.fill_polygon(tri[..], COLOR_A)!;
+        c.text(&f.button, "PLAY", PLAY_X + 26.0, PLAY_Y, PLAY_W - 30.0, PLAY_H, TEXT)!;
+    }
+    // tempo, swing, volume
+    let xs: [3]f32 = [TEMPO_X, SWING_X, VOLUME_X];
+    let vals: [3]f32 = [(m.bpm - 60.0) / 140.0, m.swing, m.volume];
+    for i in @as(usize, 0)..3 {
+        knob(c, xs[i], SMALL_Y, SMALL_R, vals[i], TEXT, 0.0, -1.0, TEXT, -1.0)!;
+    }
+    let tempo = fmt.bufprint(buf[..], "TEMPO {}", [fmt.int(@int_from_float(i32, m.bpm))])!;
+    c.text(&f.label, tempo, TEMPO_X - 36.0, 52.0, 72.0, 14.0, DIM)!;
+    let swing = fmt.bufprint(buf[..], "SWING {}%", [fmt.int(@int_from_float(i32, @nearest(m.swing * 100.0)))])!;
+    c.text(&f.label, swing, SWING_X - 36.0, 52.0, 72.0, 14.0, DIM)!;
+    c.text(&f.label, "VOLUME", VOLUME_X - 36.0, 52.0, 72.0, 14.0, DIM)!;
+    // the scope and the meter
+    c.fill_round_rect(SCOPE_X, 12.0, SCOPE_W, 50.0, 6.0, quartz.rgb(0.04, 0.045, 0.05));
+    c.line(SCOPE_X + 6.0, 37.0, (SCOPE_X + SCOPE_W) - 6.0, 37.0, quartz.rgba(1.0, 1.0, 1.0, 0.06), 1.0);
+    let mut pts: [512]f32 = [0.0; 512];
+    for i in @as(usize, 0)..synth.SCOPE {
+        pts[i * 2] = SCOPE_X + 6.0 + (((SCOPE_W - 12.0) * @float_from_int(f32, i)) / 255.0);
+        pts[(i * 2) + 1] = 37.0 - (@min(@max(m.scope[i], -1.0), 1.0) * 22.0);
+    }
+    c.draw_lines(pts[..], false, mix(COLOR_A, COLOR_B, 0.5), 1.5)!;
+    let mx = SCOPE_X + SCOPE_W + 10.0;
+    c.fill_round_rect(mx, 12.0, 8.0, 50.0, 3.0, PAD_OFF);
+    let lvl = @min(u.meter, 1.0) * 50.0;
+    let mut mcol = COLOR_B;
+    if u.meter > 0.95 {
+        mcol = RED;
+    }
+    c.fill_round_rect(mx, 62.0 - lvl, 8.0, lvl, 3.0, mcol);
+    // help
+    c.text(&f.small, "space  play / stop", 970.0, 12.0, 200.0, 14.0, DIM)!;
+    c.text(&f.small, "1 – 8  play a drum", 970.0, 28.0, 200.0, 14.0, DIM)!;
+    c.text(&f.small, "right-click  accent a step", 970.0, 44.0, 200.0, 14.0, DIM)!;
+}
+
+fn grid(c: *mut quartz.Canvas, f: *Fonts, u: *Ui) !void {
+    let m = &u.view;
+    // the playhead, over the columns
+    if m.step >= 0 {
+        let s = @int_cast(usize, m.step);
+        c.fill_round_rect(pad_x(s), ROW_TOP - 9.0, PAD_W, 4.0, 2.0, TEXT);
+    }
+    for d in @as(usize, 0)..synth.VOICES {
+        let y = row_y(d);
+        let col = mix(COLOR_A, COLOR_B, m.blend[d]);
+        let sel = d == u.drum;
+        // the name, with its light
+        if sel {
+            c.fill_round_rect(NAME_X, y, NAME_W, ROW_H, 6.0, quartz.rgb(0.22, 0.23, 0.26));
+            c.draw_round_rect(NAME_X + 0.5, y + 0.5, NAME_W - 1.0, ROW_H - 1.0, 6.0, col, 1.5);
+        } else {
+            c.fill_round_rect(NAME_X, y, NAME_W, ROW_H, 6.0, RAISED);
+        }
+        c.fill_ellipse(NAME_X + 14.0, y + (ROW_H * 0.5), 4.5, 4.5, PAD_OFF);
+        c.fill_ellipse(NAME_X + 14.0, y + (ROW_H * 0.5), 4.5, 4.5, fade(col, u.lights[d]));
+        let mut ncol = TEXT;
+        if m.mute[d] {
+            ncol = DIM;
+        }
+        c.text(&f.name, synth.DRUM_NAMES[d], NAME_X + 26.0, y, NAME_W - 28.0, ROW_H, ncol)!;
+        // mute
+        if m.mute[d] {
+            c.fill_round_rect(MUTE_X, y, MUTE_W, ROW_H, 6.0, RED);
+            c.text(&f.button, "M", MUTE_X, y, MUTE_W, ROW_H, BG)!;
+        } else {
+            c.fill_round_rect(MUTE_X, y, MUTE_W, ROW_H, 6.0, RAISED);
+            c.text(&f.button, "M", MUTE_X, y, MUTE_W, ROW_H, DIM)!;
+        }
+        // the steps
+        for s in @as(usize, 0)..synth.STEPS {
+            let x = pad_x(s);
+            let v = m.pattern[d][s];
+            let mut fill = PAD_OFF;
+            if (s / 4) % 2 == 1 {
+                fill = quartz.rgb(0.165, 0.175, 0.2);
+            }
+            if v == 1 {
+                fill = fade(col, 0.55);
+            } else if v == 2 {
+                fill = col;
+            }
+            if m.mute[d] and (v != 0) {
+                fill = fade(fill, 0.35);
+            }
+            c.fill_round_rect(x, y, PAD_W, ROW_H, 5.0, fill);
+            if v == 2 {
+                c.fill_ellipse(x + (PAD_W * 0.5), y + (ROW_H * 0.5), 3.0, 3.0, quartz.rgba(1.0, 1.0, 1.0, 0.85));
+            }
+            if m.step == @int_cast(i32, s) {
+                c.draw_round_rect(x + 0.5, y + 0.5, PAD_W - 1.0, ROW_H - 1.0, 5.0, quartz.rgba(1.0, 1.0, 1.0, 0.7),
+                                  1.5);
+                if v != 0 {
+                    c.fill_round_rect(x, y, PAD_W, ROW_H, 5.0, quartz.rgba(1.0, 1.0, 1.0, 0.25));
+                }
+            }
+        }
+        slider(c, f, ROW_SLIDER_X, y, ROW_SLIDER_W, ROW_H, m.blend[d])!;
+    }
+}
+
+fn group(c: *mut quartz.Canvas, f: *Fonts, title: []u8, x0: f32, x1: f32, y: f32) !void {
+    c.text(&f.label, title, x0, y, x1 - x0, 14.0, DIM)!;
+    let mid = (x0 + x1) * 0.5;
+    let half = (@float_from_int(f32, title.len) * 3.6) + 10.0;
+    c.line(x0 + 8.0, y + 7.0, mid - half, y + 7.0, LINE, 1.0);
+    c.line(mid + half, y + 7.0, x1 - 8.0, y + 7.0, LINE, 1.0);
+}
+
+fn editor(c: *mut quartz.Canvas, f: *Fonts, u: *Ui) !void {
+    let m = &u.view;
+    let d = u.drum;
+    c.fill_round_rect(16.0, PANEL_TOP, W - 32.0, H - PANEL_TOP - 14.0, 10.0, PANEL);
+    let col = mix(COLOR_A, COLOR_B, m.blend[d]);
+    c.fill_ellipse(42.0, TAB_Y + (TAB_H * 0.5), 6.0, 6.0, col);
+    c.text(&f.big, synth.DRUM_NAMES[d], 56.0, TAB_Y, 190.0, TAB_H, TEXT)!;
+    button(c, f, TAB_A_X, TAB_Y, TAB_W, TAB_H, "A", not u.edit_b, COLOR_A)!;
+    button(c, f, TAB_B_X, TAB_Y, TAB_W, TAB_H, "B", u.edit_b, COLOR_B)!;
+    button(c, f, COPY_AB_X, TAB_Y, COPY_W, TAB_H, "A → B", false, TEXT)!;
+    button(c, f, COPY_BA_X, TAB_Y, COPY_W, TAB_H, "B → A", false, TEXT)!;
+    c.text(&f.label, "BLEND", BLEND_X - 70.0, TAB_Y, 44.0, TAB_H, DIM)!;
+    slider(c, f, BLEND_X, TAB_Y, BLEND_W, TAB_H, m.blend[d])!;
+    // the groups
+    group(c, f, "FM TONE", cell_x(0, SPLIT1), cell_x(SPLIT1 - 1, SPLIT1) + CELL_W, KNOB_ROW1)!;
+    group(c, f, "OUTPUT", cell_x(SPLIT1, SPLIT1), cell_x(9, SPLIT1) + CELL_W, KNOB_ROW1)!;
+    group(c, f, "NOISE + FILTER", cell_x(0, SPLIT2), cell_x(SPLIT2 - 1, SPLIT2) + CELL_W, KNOB_ROW2)!;
+    group(c, f, "AMP ENVELOPE", cell_x(SPLIT2, SPLIT2), cell_x(9, SPLIT2) + CELL_W, KNOB_ROW2)!;
+    // the knobs
+    let mut buf: [32]u8 = [0; 32];
+    let mut mine = COLOR_A;
+    let mut theirs = COLOR_B;
+    if u.edit_b {
+        mine = COLOR_B;
+        theirs = COLOR_A;
+    }
+    for p in @as(usize, 0)..synth.PARAMS {
+        let at = knob_at(p);
+        let a = m.a[d][p];
+        let b = m.b[d][p];
+        let mut x = a;
+        let mut other = b;
+        if u.edit_b {
+            x = b;
+            other = a;
+        }
+        let mark = a + ((b - a) * m.blend[d]);
+        let mut from: f32 = 0.0;
+        if synth.bipolar(p) {
+            from = 0.5;
+        }
+        let mut name_col = DIM;
+        if u.held == @int_cast(i32, p) {
+            name_col = TEXT;
+        }
+        c.text(&f.label, synth.NAMES[p], at[0] - 50.0, at[1] - 46.0, 100.0, 14.0, name_col)!;
+        knob(c, at[0], at[1], KNOB_R, x, mine, from, other, theirs, mark)!;
+        c.text(&f.value, describe(buf[..], p, x)!, at[0] - 50.0, at[1] + 31.0, 100.0, 14.0, TEXT)!;
+    }
+}
+
+fn draw(c: *mut quartz.Canvas, f: *Fonts, u: *Ui) !void {
+    let pw = @float_from_int(f32, c.width);
+    let ph = @float_from_int(f32, c.height);
+    let s = @min(pw / W, ph / H);
+    c.begin();
+    c.fill_rect(0.0, 0.0, pw, ph, BG);
+    c.set_transform(s, 0.0, 0.0, s, (pw - (W * s)) * 0.5, (ph - (H * s)) * 0.5);
+    header(c, f, u)!;
+    grid(c, f, u)!;
+    editor(c, f, u)!;
+    c.end()!;
+}
+
+// A point in the window (pixels) in the layout's points.
+fn to_points(c: *quartz.Canvas, x: i32, y: i32) [2]f32 {
+    let pw = @float_from_int(f32, c.width);
+    let ph = @float_from_int(f32, c.height);
+    let s = @min(pw / W, ph / H);
+    return [(@float_from_int(f32, x) - ((pw - (W * s)) * 0.5)) / s,
+            (@float_from_int(f32, y) - ((ph - (H * s)) * 0.5)) / s];
+}
+
+// -----------------------------------------------------------------------------
+// Running
+// -----------------------------------------------------------------------------
+fn windowed(frames: i64) !i32 {
+    let model = mem.create.[synth.Model](kit.initial())!;
+    defer mem.destroy(model);
+    let mut au = Audio.{ model: model, out: output.Engine.none(), quit: 0 };
+    au.out = output.Engine.init() catch output.Engine.none();  // (no device: silence)
+    defer au.out.deinit();
+    let mut w = cocoa.Window.open("Drumkin", 1180, 744)!;
+    defer w.deinit();
+    let sz = w.size();
+    let mut gpu = metal.Device.init_window(w.handle(), sz[0], sz[1])!;
+    defer gpu.deinit();
+    let mut c = quartz.Canvas.init(sz[0], sz[1])!;
+    defer c.deinit();
+    let mut f = fonts(&mut c)!;
+    defer release_fonts(&mut f);
+    let mut ov = gpu.overlay(sz[0], sz[1])!;
+    defer ov.release();
+    let mut player = thread.spawn(audio_main, &mut au)!;
+    let mut u = new_ui(model);
+    let mut n: i64 = 0;
+    loop {
+        let e = w.next_event();
+        if e.kind == cocoa.EventKind.CLOSE {
+            break;
+        }
+        if e.kind == cocoa.EventKind.RESIZE {
+            gpu.resize(e.width, e.height)!;
+            c.resize(e.width, e.height)!;
+            gpu.resize_overlay(&mut ov, e.width, e.height)!;
+            continue;
+        }
+        if e.kind == cocoa.EventKind.KEY_DOWN {
+            if e.key == cocoa.KEY_SHIFT {
+                u.shift = true;
+            } else {
+                key(&mut u, e.key);
+            }
+            continue;
+        }
+        if e.kind == cocoa.EventKind.KEY_UP {
+            if e.key == cocoa.KEY_SHIFT {
+                u.shift = false;
+            }
+            continue;
+        }
+        if e.kind == cocoa.EventKind.MOUSE_DOWN {
+            let p = to_points(&c, e.x, e.y);
+            press(&mut u, p[0], p[1], e.button);
+            continue;
+        }
+        if e.kind == cocoa.EventKind.MOUSE_MOVE {
+            let p = to_points(&c, e.x, e.y);
+            drag(&mut u, p[0], p[1]);
+            continue;
+        }
+        if e.kind == cocoa.EventKind.MOUSE_UP {
+            u.held = NOTHING;
+            continue;
+        }
+        if e.kind == cocoa.EventKind.MOUSE_WHEEL {
+            let p = to_points(&c, e.x, e.y);
+            scroll(&mut u, p[0], p[1], e.delta);
+            continue;
+        }
+        if e.kind != cocoa.EventKind.NONE {
+            continue;
+        }
+        snapshot(&mut u);
+        draw(&mut c, &f, &u)!;
+        let t = gpu.screen();
+        gpu.begin(t)!;
+        gpu.clear(t, BG.r, BG.g, BG.b, 1.0);
+        gpu.draw_overlay(&mut ov, c.pixels());
+        gpu.present(true)!;
+        n += 1;
+        if (frames > 0) and (n >= frames) {
+            break;
+        }
+    }
+    @atomic_store(&mut au.quit, 1);
+    player.join();
+    return 0;
+}
+
+// Plays the pattern for `bars` bars into a WAV file.
+fn render_wav(out: []u8, bars: i64) !i32 {
+    let mut m = kit.initial();
+    m.playing = true;
+    let mut e = synth.Engine.init();
+    let frames = @int_from_float(usize, (@float_from_int(f32, bars) * 4.0 * 60.0 / m.bpm) * synth.RATE) + 24000;
+    let mut snd = audio.Sound.init(frames, 2, 48000, audio.SampleFormat.F32)!;
+    defer snd.deinit();
+    let data = snd.samples_f32();
+    let mut i: usize = 0;
+    while i < frames {
+        let k = @min(BLOCK, frames - i);
+        if (i + k) > (frames - 24000) {
+            m.playing = false;  // let the last hits ring
+        }
+        synth.render(&mut e, &mut m, data[(i * 2)..((i + k) * 2)]);
+        i += k;
+    }
+    let bytes = wav.encode(&snd)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    fmt.print("{}: {} bars, {} s, peak {}\n",
+              [fmt.str(out), fmt.int(bars), fmt.float(snd.duration()), fmt.float(snd.peak())])!;
+    return 0;
+}
+
+// The window drawn offscreen (after a moment of playing, so that the scope
+// and the lights show something), saved as a PNG.
+fn render_png(out: []u8) !i32 {
+    let model = mem.create.[synth.Model](kit.initial())!;
+    defer mem.destroy(model);
+    model.playing = true;
+    let mut e = synth.Engine.init();
+    let mut buf: [512]f32 = [0.0; 512];
+    let mut u = new_ui(model);
+    u.drum = 1;
+    for i in @as(usize, 0)..100 {
+        synth.render(&mut e, model, buf[..]);
+        if i >= 90 {
+            snapshot(&mut u);
+        }
+    }
+    let mut c = quartz.Canvas.init(2360, 1488)!;
+    defer c.deinit();
+    let mut f = fonts(&mut c)!;
+    defer release_fonts(&mut f);
+    draw(&mut c, &f, &u)!;
+    let mut img = c.to_image()!;
+    defer img.deinit();
+    let bytes = png.encode(&img, 6)!;
+    defer mem.free(bytes);
+    fs.write_file(out, bytes)!;
+    return 0;
+}
+
+fn run() !i32 {
+    let mut p = cli.Parser.init("drumkin", "A drum machine of FM and noise (macOS).");
+    defer p.deinit();
+    p.option("wav", 'w', "FILE", "render the pattern to a WAV file instead")!;
+    p.option("bars", 'b', "N", "bars to render (--wav; 4)")!;
+    p.option("png", 'o', "FILE", "draw the window offscreen and save it as a PNG")!;
+    p.option("frames", 'n', "N", "quit after N frames")!;
+    let mut args = os.args()!;
+    defer args.deinit();
+    let mut argv = vec.Vec.[[]u8].init();
+    defer argv.deinit();
+    for a in args.items.items()[1..] {
+        argv.push(a)!;
+    }
+    let m = p.parse(argv.items()) catch |e| {
+        if e == error.HelpRequested {
+            p.help(io.stdout())!;
+            return 0;
+        }
+        fmt.eprint("drumkin: {}\n", [fmt.str(p.message())])!;
+        return 2;
+    };
+    if m.has("wav") {
+        return render_wav(m.get("wav", ""), m.int("bars", 4)!);
+    }
+    if not strs.eq(os.system(), "macos") {
+        io.stderr().println("drumkin: the window needs macOS (--target=aarch64-macos)")!;
+        return 1;
+    }
+    if m.has("png") {
+        return render_png(m.get("png", ""));
+    }
+    return windowed(m.int("frames", 0)!);
+}
+
+export fn main() i32 {
+    return run() catch |e| {
+        io.stderr().println(@error_name(e)) catch {};
+        return 1;
+    };
+}

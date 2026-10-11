@@ -1,0 +1,420 @@
+// =============================================================================
+// File: synth.ax
+// The drum machine's sound: eight drum voices, each an FM pair (a sine
+// carrier whose phase a sine modulator bends) plus white noise, through a
+// state-variable filter that morphs from low-pass through band-pass to
+// high-pass, shaped by an ADSR envelope and driven into tanh. The carrier's
+// pitch, the modulation index and the filter's cutoff each have a decaying
+// envelope of their own.
+//
+// Every drum has two settings, A and B, of the same twenty parameters, and a
+// blend between them: a hit takes the parameters at that blend (they are
+// stored 0..1 and mapped afterwards, so frequencies and times blend
+// exponentially). A sixteen-step sequencer, with swing, plays the pattern.
+//
+// The model (the kit, the pattern, the transport) is shared by the window's
+// thread and the audio thread, under a spin lock: both hold it briefly.
+// =============================================================================
+
+import "std/math" as math;
+
+pub const RATE: f32 = 48000.0;
+pub const VOICES: usize = 8;
+pub const PARAMS: usize = 20;
+pub const STEPS: usize = 16;
+
+// The parameters
+pub const TUNE: usize = 0;      // the carrier's frequency
+pub const BEND: usize = 1;      // the pitch envelope's depth, in semitones
+pub const BEND_DECAY: usize = 2;
+pub const RATIO: usize = 3;     // the modulator's frequency over the carrier's
+pub const FM: usize = 4;        // the modulation index
+pub const FM_DECAY: usize = 5;
+pub const TONE: usize = 6;      // the FM pair's level
+pub const NOISE: usize = 7;     // the noise's level
+pub const CUTOFF: usize = 8;
+pub const RESO: usize = 9;
+pub const MODE: usize = 10;     // 0 low-pass, 0.5 band-pass, 1 high-pass
+pub const FENV: usize = 11;     // the cutoff envelope's depth, in octaves
+pub const FENV_DECAY: usize = 12;
+pub const ATTACK: usize = 13;
+pub const DECAY: usize = 14;
+pub const SUSTAIN: usize = 15;
+pub const RELEASE: usize = 16;
+pub const DRIVE: usize = 17;
+pub const PAN: usize = 18;
+pub const LEVEL: usize = 19;
+
+// How a parameter's value reads (the window shows it so)
+pub const U_HZ: u8 = 0;
+pub const U_SEMI: u8 = 1;
+pub const U_SEC: u8 = 2;
+pub const U_RATIO: u8 = 3;
+pub const U_NUM: u8 = 4;
+pub const U_PCT: u8 = 5;
+pub const U_MODE: u8 = 6;
+pub const U_OCT: u8 = 7;
+pub const U_TIMES: u8 = 8;
+pub const U_PAN: u8 = 9;
+
+pub let NAMES: [20][]u8 = ["TUNE", "BEND", "BEND DEC", "RATIO", "FM INDEX", "FM DEC", "TONE", "NOISE", "CUTOFF",
+                           "RESO", "MODE", "FILT ENV", "FENV DEC", "ATTACK", "DECAY", "SUSTAIN", "RELEASE", "DRIVE",
+                           "PAN", "LEVEL"];
+pub let UNITS: [20]u8 = [U_HZ, U_SEMI, U_SEC, U_RATIO, U_NUM, U_SEC, U_PCT, U_PCT, U_HZ, U_PCT, U_MODE, U_OCT, U_SEC,
+                         U_SEC, U_SEC, U_PCT, U_SEC, U_TIMES, U_PAN, U_PCT];
+let LO: [20]f32 = [20.0, 0.0, 0.001, 0.25, 0.0, 0.002, 0.0, 0.0, 30.0, 0.0, 0.0, -5.0, 0.002, 0.0005, 0.005, 0.0,
+                   0.005, 1.0, -1.0, 0.0];
+let HI: [20]f32 = [5000.0, 60.0, 1.0, 16.0, 10.0, 2.0, 1.0, 1.0, 20000.0, 1.0, 1.0, 5.0, 2.0, 0.5, 4.0, 1.0, 4.0, 12.0,
+                   1.0, 1.0];
+let EXPONENTIAL: [20]bool = [true, false, true, true, false, true, false, false, true, false, false, false, true, true,
+                             true, false, true, true, false, false];
+
+pub let DRUM_NAMES: [8][]u8 = ["KICK", "SNARE", "LOW TOM", "HIGH TOM", "RIM", "BELL", "CLOSED HAT", "OPEN HAT"];
+pub const CLOSED_HAT: usize = 6;
+pub const OPEN_HAT: usize = 7;
+
+/// Parameter p's value at x (0..1).
+pub fn value(p: usize, x: f32) f32 {
+    if EXPONENTIAL[p] {
+        return LO[p] * math.expf(x * math.logf(HI[p] / LO[p]));
+    }
+    return LO[p] + ((HI[p] - LO[p]) * x);
+}
+
+/// Where value v of parameter p is, 0..1.
+pub fn norm(p: usize, v: f32) f32 {
+    let mut x: f32 = 0.0;
+    if EXPONENTIAL[p] {
+        x = math.logf(v / LO[p]) / math.logf(HI[p] / LO[p]);
+    } else {
+        x = (v - LO[p]) / (HI[p] - LO[p]);
+    }
+    return @min(@max(x, 0.0), 1.0);
+}
+
+/// Is the parameter's middle its zero (its knob turns either way)?
+pub fn bipolar(p: usize) bool {
+    return (p == FENV) or (p == PAN);
+}
+
+// -----------------------------------------------------------------------------
+// The model
+// -----------------------------------------------------------------------------
+pub const SCOPE: usize = 256;
+
+pub struct Model {
+    lock: u32,
+    a: [8][20]f32,  // the two settings of each drum, 0..1
+    b: [8][20]f32,
+    blend: [8]f32,  // 0: A, 1: B
+    mute: [8]bool,
+    pattern: [8][16]u8,  // 0 rest, 1 hit, 2 accented hit
+    bpm: f32,
+    swing: f32,   // 0..1
+    volume: f32,  // 0..1
+    playing: bool,
+    step: i32,         // the step sounding (-1: stopped), for the window
+    hits: [8]u32,      // hits so far of each drum, for its light
+    audition: [8]u8,   // hits asked for by the window (1 or 2, as in a pattern)
+    scope: [256]f32,   // the latest output
+    peak: f32,         // the loudest sample since the window last looked
+}
+
+pub fn lock(m: *mut Model) void {
+    while @atomic_xchg(&mut m.lock, 1) != 0 {}
+}
+
+pub fn unlock(m: *mut Model) void {
+    _ = @atomic_xchg(&mut m.lock, 0);
+}
+
+/// A drum's parameters at its blend, 0..1.
+pub fn blended(m: *Model, d: usize) [20]f32 {
+    let mut p: [20]f32 = [0.0; 20];
+    let t = m.blend[d];
+    for k in @as(usize, 0)..PARAMS {
+        p[k] = m.a[d][k] + ((m.b[d][k] - m.a[d][k]) * t);
+    }
+    return p;
+}
+
+// -----------------------------------------------------------------------------
+// A voice
+// -----------------------------------------------------------------------------
+const IDLE: u8 = 0;
+const ATTACKING: u8 = 1;
+const DECAYING: u8 = 2;  // (to the sustain level, while the gate is open)
+const RELEASING: u8 = 3;
+
+const TWO_PI: f32 = 6.2831853;
+const LN2: f32 = 0.6931472;
+
+struct Voice {
+    // set by a hit
+    freq: f32,
+    bend: f32,  // octaves
+    bend_k: f32,
+    ratio: f32,
+    index: f32,
+    index_k: f32,
+    tone: f32,
+    noise: f32,
+    cutoff: f32,
+    k: f32,  // the filter's damping: 2 none, near 0 ringing
+    mode: f32,
+    fenv: f32,  // octaves
+    fenv_k: f32,
+    attack: f32,  // the envelope's rise per sample
+    decay_k: f32,
+    sustain: f32,
+    release_k: f32,
+    drive: f32,
+    left: f32,
+    right: f32,
+    // running
+    stage: u8,
+    env: f32,
+    gate: i64,  // samples until the gate closes
+    carrier: f32,  // phases, 0..1
+    modulator: f32,
+    bend_env: f32,
+    index_env: f32,
+    filter_env: f32,
+    ic1: f32,  // the filter's state
+    ic2: f32,
+    seed: u32,
+}
+
+fn silent(seed: u32) Voice {
+    return Voice.{ freq: 100.0, bend: 0.0, bend_k: 0.0, ratio: 1.0, index: 0.0, index_k: 0.0, tone: 0.0, noise: 0.0,
+                   cutoff: 1000.0, k: 2.0, mode: 0.0, fenv: 0.0, fenv_k: 0.0, attack: 1.0, decay_k: 0.0,
+                   sustain: 0.0, release_k: 0.0, drive: 1.0, left: 0.0, right: 0.0, stage: IDLE, env: 0.0, gate: 0,
+                   carrier: 0.0, modulator: 0.0, bend_env: 0.0, index_env: 0.0, filter_env: 0.0, ic1: 0.0, ic2: 0.0,
+                   seed: seed };
+}
+
+// The factor per sample of a decay with time constant t seconds.
+fn falloff(t: f32) f32 {
+    return math.expf(-1.0 / (t * RATE));
+}
+
+// The factor per sample of a decay that falls 60 dB in t seconds.
+fn falloff60(t: f32) f32 {
+    return math.expf(-6.9 / (t * RATE));
+}
+
+fn exp2(x: f32) f32 {
+    return math.expf(x * LN2);
+}
+
+// Starts a hit with parameters p (0..1), at velocity vel, the gate open for
+// `gate` samples. The envelope rises from where it is (no click when a
+// sounding drum is hit again); the oscillators start from the top.
+fn strike(v: *mut Voice, p: [20]f32, vel: f32, gate: i64) void {
+    v.freq = value(TUNE, p[TUNE]);
+    v.bend = value(BEND, p[BEND]) / 12.0;
+    v.bend_k = falloff(value(BEND_DECAY, p[BEND_DECAY]));
+    v.ratio = value(RATIO, p[RATIO]);
+    v.index = value(FM, p[FM]);
+    v.index_k = falloff(value(FM_DECAY, p[FM_DECAY]));
+    v.tone = value(TONE, p[TONE]);
+    v.noise = value(NOISE, p[NOISE]);
+    v.cutoff = value(CUTOFF, p[CUTOFF]);
+    v.k = 2.0 - (1.94 * value(RESO, p[RESO]));
+    v.mode = value(MODE, p[MODE]);
+    v.fenv = value(FENV, p[FENV]);
+    v.fenv_k = falloff(value(FENV_DECAY, p[FENV_DECAY]));
+    v.attack = 1.0 / (value(ATTACK, p[ATTACK]) * RATE);
+    v.decay_k = falloff60(value(DECAY, p[DECAY]));
+    v.sustain = value(SUSTAIN, p[SUSTAIN]);
+    v.release_k = falloff60(value(RELEASE, p[RELEASE]));
+    v.drive = value(DRIVE, p[DRIVE]);
+    // equal-power panning
+    let angle = (value(PAN, p[PAN]) + 1.0) * 0.25 * 3.1415927;
+    let gain = value(LEVEL, p[LEVEL]) * vel;
+    v.left = math.cosf(angle) * gain * 1.4142;
+    v.right = math.sinf(angle) * gain * 1.4142;
+    v.stage = ATTACKING;
+    v.gate = gate;
+    v.carrier = 0.0;
+    v.modulator = 0.0;
+    v.bend_env = 1.0;
+    v.index_env = 1.0;
+    v.filter_env = 1.0;
+}
+
+// Cuts a sounding voice short (an open hat closed by the closed one).
+fn choke(v: *mut Voice) void {
+    if v.stage != IDLE {
+        v.stage = RELEASING;
+        v.release_k = falloff60(0.03);
+    }
+}
+
+fn random(v: *mut Voice) f32 {
+    let mut x = v.seed;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    v.seed = x;
+    return (@float_from_int(f32, x >> 8) / 8388608.0) - 1.0;
+}
+
+fn wrap(x: f32) f32 {
+    return x - @floor(x);
+}
+
+// The voice's next sample (mono, before panning).
+fn tick(v: *mut Voice) f32 {
+    if v.stage == ATTACKING {
+        v.env += v.attack;
+        if v.env >= 1.0 {
+            v.env = 1.0;
+            v.stage = DECAYING;
+        }
+    } else if v.stage == DECAYING {
+        v.env = v.sustain + ((v.env - v.sustain) * v.decay_k);
+    } else {
+        v.env *= v.release_k;
+        if v.env < 0.00003 {
+            v.env = 0.0;
+            v.stage = IDLE;
+            return 0.0;
+        }
+    }
+    if v.gate > 0 {
+        v.gate -= 1;
+        if (v.gate == 0) and (v.stage != RELEASING) {
+            v.stage = RELEASING;
+        }
+    }
+    // FM: the modulator bends the carrier's phase
+    let f = v.freq * exp2(v.bend * v.bend_env);
+    let m = math.sinf(TWO_PI * v.modulator);
+    let c = math.sinf((TWO_PI * v.carrier) + (v.index * v.index_env * m));
+    v.carrier = wrap(v.carrier + (f / RATE));
+    v.modulator = wrap(v.modulator + ((f * v.ratio) / RATE));
+    v.bend_env *= v.bend_k;
+    v.index_env *= v.index_k;
+    let x = (c * v.tone) + (random(v) * v.noise);
+    // the filter: a trapezoidal state-variable filter (Simper's)
+    let fc = @min(@max(v.cutoff * exp2(v.fenv * v.filter_env), 20.0), RATE * 0.45);
+    v.filter_env *= v.fenv_k;
+    let g = math.tanf((3.1415927 * fc) / RATE);
+    let a1 = 1.0 / (1.0 + (g * (g + v.k)));
+    let a2 = g * a1;
+    let a3 = g * a2;
+    let v3 = x - v.ic2;
+    let v1 = (a1 * v.ic1) + (a2 * v3);
+    let v2 = v.ic2 + (a2 * v.ic1) + (a3 * v3);
+    v.ic1 = (2.0 * v1) - v.ic1;
+    v.ic2 = (2.0 * v2) - v.ic2;
+    let low = v2;
+    let band = v1;
+    let high = x - (v.k * v1) - v2;
+    let mut y: f32 = 0.0;
+    if v.mode < 0.5 {
+        let t = v.mode * 2.0;
+        y = low + ((band - low) * t);
+    } else {
+        let t = (v.mode - 0.5) * 2.0;
+        y = band + ((high - band) * t);
+    }
+    return math.tanhf(y * v.env * v.drive);
+}
+
+// -----------------------------------------------------------------------------
+// The engine: the voices and the sequencer
+// -----------------------------------------------------------------------------
+pub struct Engine {
+    voices: [8]Voice,
+    next: usize,  // the step to play next
+    wait: f32,    // samples until it
+    running: bool,
+
+    pub fn init() Engine {
+        let mut e = Engine.{ voices: [silent(1); 8], next: 0, wait: 0.0, running: false };
+        for d in @as(usize, 0)..VOICES {
+            e.voices[d].seed = 0x9e37_79b9 *% @truncate(u32, d + 1);
+        }
+        return e;
+    }
+}
+
+// A sixteenth's length in samples, long or short with swing.
+fn step_length(m: *Model, step: usize) f32 {
+    let base = (60.0 / m.bpm / 4.0) * RATE;
+    let swing = m.swing * 0.33;
+    if (step % 2) == 0 {
+        return base * (1.0 + swing);
+    }
+    return base * (1.0 - swing);
+}
+
+fn hit(e: *mut Engine, m: *mut Model, d: usize, how: u8) void {
+    let mut vel: f32 = 0.72;
+    if how == 2 {
+        vel = 1.0;
+    }
+    let gate = @int_from_float(i64, (60.0 / m.bpm / 4.0) * RATE);
+    strike(&mut e.voices[d], blended(m, d), vel, gate);
+    m.hits[d] +%= 1;
+    if d == CLOSED_HAT {
+        choke(&mut e.voices[OPEN_HAT]);
+    }
+}
+
+/// Fills `out` (stereo, interleaved) with what comes next. The model must
+/// be locked.
+pub fn render(e: *mut Engine, m: *mut Model, out: []mut f32) void {
+    let n = out.len / 2;
+    for d in @as(usize, 0)..VOICES {
+        if m.audition[d] != 0 {
+            hit(e, m, d, m.audition[d]);
+            m.audition[d] = 0;
+        }
+    }
+    let gain = m.volume * m.volume * 1.6;
+    let mut peak = m.peak;
+    for i in 0..n {
+        if m.playing {
+            if not e.running {
+                e.running = true;
+                e.next = 0;
+                e.wait = 0.0;
+            }
+            if e.wait <= 0.0 {
+                let s = e.next;
+                for d in @as(usize, 0)..VOICES {
+                    if (m.pattern[d][s] != 0) and not m.mute[d] {
+                        hit(e, m, d, m.pattern[d][s]);
+                    }
+                }
+                m.step = @int_cast(i32, s);
+                e.wait += step_length(m, s);
+                e.next = (s + 1) % STEPS;
+            }
+            e.wait -= 1.0;
+        } else if e.running {
+            e.running = false;
+            m.step = -1;
+        }
+        let mut l: f32 = 0.0;
+        let mut r: f32 = 0.0;
+        for d in @as(usize, 0)..VOICES {
+            let v = &mut e.voices[d];
+            if v.stage != IDLE {
+                let y = tick(v);
+                l += y * v.left;
+                r += y * v.right;
+            }
+        }
+        l = math.tanhf(l * gain);
+        r = math.tanhf(r * gain);
+        out[i * 2] = l;
+        out[(i * 2) + 1] = r;
+        peak = @max(peak, @max(@abs(l), @abs(r)));
+        m.scope[(i * SCOPE) / n] = (l + r) * 0.5;
+    }
+    m.peak = peak;
+}
