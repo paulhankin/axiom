@@ -4482,38 +4482,41 @@ fn check_match(s: *mut ast.Stmt) bool {
                 _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
             }
             scope_push();
-            if a.kind == ast.P_ELSE {
-                has_else = true;
-            } else if a.kind == ast.P_VARIANT {
-                let v = find_variant(ud, a.name);
-                if v < 0 {
-                    _ = dg.err(a.span, "E0632", u.f3("%s has no %s '%s'", tstr(t), what, a.name));
-                } else {
-                    let vi = @int_cast(usize, v);
-                    a.variant = v;
-                    a.ival = ud.variants.at(vi).value;
-                    if seen[vi] {
-                        _ = dg.err(a.span, "E0631", u.f2("%s '%s' is matched more than once", what, a.name));
-                    }
-                    seen[vi] = true;
-                    let mut pt = tnil();
-                    if not is_enum {
-                        pt = ty.type_variant(t, vi);
-                    }
-                    if not u.isnos(a.bind) {
-                        if u.isnil(pt) {
-                            _ = dg.err(a.bind_span, "E0633",
-                                       u.f2("%s '%s' has no payload to bind", u.pick(is_enum, "enum member", "variant"),
-                                            a.name));
-                        } else {
-                            a.bind_local = declare_local(a.bind, a.bind_span, pt, false, false);
+            match a.pat {
+                .Else => { has_else = true; }
+                .Variant(p) => {
+                    let v = find_variant(ud, p.name);
+                    if v < 0 {
+                        _ = dg.err(a.span, "E0632", u.f3("%s has no %s '%s'", tstr(t), what, p.name));
+                    } else {
+                        let vi = @int_cast(usize, v);
+                        a.variant = v;
+                        a.value = ud.variants.at(vi).value;
+                        if seen[vi] {
+                            _ = dg.err(a.span, "E0631", u.f2("%s '%s' is matched more than once", what, p.name));
+                        }
+                        seen[vi] = true;
+                        let mut pt = tnil();
+                        if not is_enum {
+                            pt = ty.type_variant(t, vi);
+                        }
+                        if not u.isnos(p.bind) {
+                            if u.isnil(pt) {
+                                _ = dg.err(p.bind_span, "E0633",
+                                           u.f2(
+                                               "%s '%s' has no payload to bind",
+                                               u.pick(is_enum, "enum member", "variant"), p.name));
+                            } else {
+                                a.bind_local = declare_local(p.bind, p.bind_span, pt, false, false);
+                            }
                         }
                     }
                 }
-            } else {
-                _ = dg.err(a.span, "E0634",
-                           u.f2("this pattern cannot match a value of %s type %s", u.pick(is_enum, "enum", "union"),
-                                tstr(t)));
+                else => {
+                    _ = dg.err(a.span, "E0634",
+                               u.f2("this pattern cannot match a value of %s type %s", u.pick(is_enum, "enum", "union"),
+                                    tstr(t)));
+                }
             }
             if not check_block(a.body) {
                 all_div = false;
@@ -4551,33 +4554,51 @@ fn check_match(s: *mut ast.Stmt) bool {
             scope_push();
             let mut key = u.I128.zero();
             let mut keyed = false;
-            if a.kind == ast.P_ELSE {
-                has_else = true;
-            } else if (a.kind == ast.P_INT) and (t.kind == ast.TY_INT) {
-                if not fits_type(a.ival, t) {
-                    _ = dg.err(a.span, "E0503", u.f1("pattern does not fit in %s", tstr(t)));
+            let mut fits = false;  // the pattern is of the scrutinee's kind
+            match a.pat {
+                .Else => {
+                    has_else = true;
+                    fits = true;
                 }
-                key = a.ival;
-                keyed = true;
-            } else if (a.kind == ast.P_BOOL) and (t.kind == ast.TY_BOOL) {
-                let dupe = (a.bval and seen_true) or (not a.bval and seen_false);
-                if dupe {
-                    _ = dg.err(a.span, "E0631", "pattern is matched more than once");
+                .Int(n) => {
+                    if t.kind == ast.TY_INT {
+                        if not fits_type(n, t) {
+                            _ = dg.err(a.span, "E0503", u.f1("pattern does not fit in %s", tstr(t)));
+                        }
+                        key = n;
+                        keyed = true;
+                        fits = true;
+                    }
                 }
-                if a.bval {
-                    seen_true = true;
-                } else {
-                    seen_false = true;
+                .Bool(bv) => {
+                    if t.kind == ast.TY_BOOL {
+                        let dupe = (bv and seen_true) or (not bv and seen_false);
+                        if dupe {
+                            _ = dg.err(a.span, "E0631", "pattern is matched more than once");
+                        }
+                        if bv {
+                            seen_true = true;
+                        } else {
+                            seen_false = true;
+                        }
+                        fits = true;
+                    }
                 }
-            } else if (a.kind == ast.P_ERROR) and (t.kind == ast.TY_ERROR) {
-                let code = error_code_of(a.name);
-                if code == 0 {
-                    _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", a.name));
+                .Error(name) => {
+                    if t.kind == ast.TY_ERROR {
+                        let code = error_code_of(name);
+                        if code == 0 {
+                            _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", name));
+                        }
+                        a.error_code = code;
+                        key = u.I128.ofu(@as(u64, code));
+                        keyed = true;
+                        fits = true;
+                    }
                 }
-                a.error_code = code;
-                key = u.I128.ofu(@as(u64, code));
-                keyed = true;
-            } else {
+                .Variant => {}
+            }
+            if not fits {
                 _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of type %s", tstr(t)));
             }
             if keyed {
