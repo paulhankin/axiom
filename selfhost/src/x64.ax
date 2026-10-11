@@ -1,7 +1,8 @@
 // =============================================================================
 // x64.ax - x86-64 code generation (System V ABI, Linux): instruction
-// selection from the scalar IR into machine IR (mach.ax), register
-// allocation, frame layout, and encoding (x64enc.ax) into an ELF object.
+// selection from the scalar IR into machine IR (mach.ax), and register
+// allocation; x64emit.ax then lays out the frame and encodes the function
+// (x64enc.ax) into an ELF object.
 //
 // Integers narrower than 32 bits live in 32-bit registers with unspecified
 // upper bits (i1 is always 0 or 1); instructions that depend on the upper
@@ -26,6 +27,7 @@ import "opt.ax" as opt;
 import "target.ax" as tg;
 import "util.ax" as u;
 import "vsplit.ax" as vs;
+import "x64emit.ax" as em;
 import "x64enc.ax" as xe;
 
 const GPR: u8 = 0;
@@ -33,67 +35,16 @@ const XMM: u8 = 1;
 const YMM: u8 = 2;  // 256-bit vectors (the same registers as XMM)
 const ZMM: u8 = 3;  // 512-bit vectors
 
-let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
-let mut TEXT: i32 = 0;
+// (The object, the function being compiled and its machine IR are in x64emit.ax.)
 let mut RODATA: i32 = 0;
-let mut LINES: i32 = -1;  // Windows: line tables (.axiom.lines, for plink.ax's PDB)
-let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
-let mut PDATA: i32 = -1;
-let mut XDATA_SYM: u32 = 0;
-let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
-                              chains_sym: 0, rel32: 0, abs64: 0, empty: 0 };  // frame tables (ftab.ax)
-let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut consts: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
                                                   cap: 0, len: 0 };
-let mut errors: bool = false;
-let mut AVX: bool = false;
-let mut VL: u8 = 0;           // the vector width of the instruction being selected: 0 (128 bits), 32 or 64 bytes
-let mut UPPER: bool = false;  // the function uses ymm or zmm registers (vzeroupper before calls and returns)
-let mut WIN: bool = false;    // Windows x64: its calling convention, and thread-locals through the TEB
-// Code placement (encode_func), with knobs for measuring it (issue 0095),
-// read from the environment and part of the object cache's key:
-//
-//   AXIOM_X64_FPAD=n    n bytes in front of every function (before it is
-//                       aligned): builds of one program with different n
-//                       place its code differently
-//   AXIOM_X64_FALIGN=a  functions start at multiples of a bytes (default 16)
-//   AXIOM_X64_LALIGN=a  hot loop tops start at multiples of a bytes (default
-//                       0: not aligned), with no more than AXIOM_X64_LMAX
-//                       (default 15) bytes of nops; AXIOM_X64_LMODE=1
-//                       (default) aligns the targets of jumps back, 2 any
-//                       block in a loop that is not often fallen into (as
-//                       LLVM does)
-//   AXIOM_X64_JCC=1     no jump, call or return (with the compare a jcc
-//                       fuses with) crosses or ends on a 32-byte boundary:
-//                       Intel's JCC erratum, whose microcode fix keeps such
-//                       a jump out of the decoded-µop cache on Skylake-family
-//                       cores; nops move it to the boundary
-//
-// .text is aligned to 64 bytes, so where each instruction will sit relative
-// to 32- and 64-byte boundaries is known while encoding (FBASE: where the
-// function being encoded will start). Measured on the benchmark (Cascade Lake,
-// 0095), neither aligned loops nor the JCC padding made the code faster
-// (the padding made it slower), so none is on by default.
-let mut FPAD: usize = 0;
-let mut FALIGN: u64 = 16;
-let mut LALIGN: u64 = 0;
-let mut LMAX: u64 = 15;
-let mut LMODE: i32 = 1;
-let mut JCC: bool = false;
-let mut FBASE: u64 = 0;
+let mut VL: u8 = 0;  // the vector width of the instruction being selected: 0 (128 bits), 32 or 64 bytes
 
-let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
-let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut IB: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // the IR block being selected
 let mut nlocal: i32 = 0;
-let mut out_area: u64 = 0;  // outgoing stack-argument bytes
-
-fn fail(msg: []u8) void {
-    u.eprint(u.f2("axiom: x86-64 code generation: %s (in %s)\n", msg, F.name));
-    errors = true;
-}
 
 // -----------------------------------------------------------------------------
 // Emission helpers
@@ -149,12 +100,12 @@ fn NONE() mc.MOp {
 }
 
 fn vgpr() i32 {
-    return mc.new_vreg(MF, GPR);
+    return mc.new_vreg(em.MF, GPR);
 }
 
 // A vector register for a value of the width being selected.
 fn vxmm() i32 {
-    return mc.new_vreg(MF, vclass());
+    return mc.new_vreg(em.MF, vclass());
 }
 
 fn vclass() u8 {
@@ -228,8 +179,8 @@ fn copy(d: i32, s: i32, class: u8) void {
         i.sz = class_bytes(class);
         i.is_move = true;
     }
-    mc.hint(MF, d, s);
-    mc.hint(MF, s, d);
+    mc.hint(em.MF, d, s);
+    mc.hint(em.MF, s, d);
 }
 
 // a op= b, an ALU operation (xe.ALU_ADD ...): sz 1, 2, 4 or 8 bytes.
@@ -257,7 +208,7 @@ fn sse_i(id: i32, a: mc.MOp, b: mc.MOp, x: i64) *mut mc.MInst {
 // d = a op b for a two-operand SSE instruction: VEX 3-operand with AVX,
 // otherwise a copy of a into d first.
 fn sse3(id: i32, d: i32, a: i32, b: mc.MOp) void {
-    if AVX {
+    if em.AVX {
         _ = vlz(sse4(id, 0, W(d), b, R(a), NONE()));
         return;
     }
@@ -277,7 +228,7 @@ fn sse3(id: i32, d: i32, a: i32, b: mc.MOp) void {
 // destination have no role, so d is not live before it).
 fn vzero(d: i32) void {
     let i = e4(xe.SSE, 0, W(d), mc.reg(d, 0), NONE(), NONE());
-    if AVX {
+    if em.AVX {
         i.ops[2] = mc.reg(d, 0);
     }
     i.cc = xe.PXOR;
@@ -285,7 +236,7 @@ fn vzero(d: i32) void {
 }
 
 fn sse3_i(id: i32, d: i32, a: i32, b: mc.MOp, x: i64) void {
-    if AVX {
+    if em.AVX {
         _ = vlz(sse4(id, 0, W(d), b, R(a), I(x)));
         return;
     }
@@ -321,7 +272,7 @@ fn jmp(l: i32) void {
 // Symbols and constants
 // -----------------------------------------------------------------------------
 fn func_sym(f: *ir.Func) i32 {
-    return @as(i32, @bit_cast(i32, fsym.get(@int_cast(usize, f.id))));
+    return @as(i32, @bit_cast(i32, em.fsym.get(@int_cast(usize, f.id))));
 }
 
 fn global_sym(g: *ir.Global) i32 {
@@ -340,7 +291,7 @@ fn const16(lo: u64, hi: u64) mc.MOp {
     if found != 0 {
         return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
     }
-    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    let s = em.OBJ.secs.get(@int_cast(usize, RODATA));
     s.data.align(@truncate(usize, n));
     let off = @as(u64, s.data.len());
     for _k in @as(u64, 0)..(n / 16) {
@@ -350,8 +301,8 @@ fn const16(lo: u64, hi: u64) mc.MOp {
     if n > s.align {
         s.align = n;
     }
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: n, bind: elf.B_LOCAL,
-                                         ty: elf.T_OBJECT, hidden: false });
+    let sym = elf.add_sym(em.OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: n, bind: elf.B_LOCAL,
+                                            ty: elf.T_OBJECT, hidden: false });
     consts.put(key, sym + 1);
     return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
 }
@@ -367,7 +318,7 @@ fn const_bytes(b: *bn.Bytes, n: usize) mc.MOp {
     if found != 0 {
         return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
     }
-    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    let s = em.OBJ.secs.get(@int_cast(usize, RODATA));
     s.data.align(n);
     let off = @as(u64, s.data.len());
     for k in 0..(n / 8) {
@@ -376,8 +327,8 @@ fn const_bytes(b: *bn.Bytes, n: usize) mc.MOp {
     if @as(u64, n) > s.align {
         s.align = @as(u64, n);
     }
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: @as(u64, n), bind: elf.B_LOCAL,
-                                         ty: elf.T_OBJECT, hidden: false });
+    let sym = elf.add_sym(em.OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: @as(u64, n), bind: elf.B_LOCAL,
+                                            ty: elf.T_OBJECT, hidden: false });
     consts.put(key, sym + 1);
     return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
 }
@@ -392,7 +343,7 @@ fn imm_ok(v: *ir.Value) bool {
 
 fn vreg(v: *mut ir.Value) i32 {
     if v.loc < 0 {
-        v.loc = mc.new_vreg(MF, class_of(v.ty));
+        v.loc = mc.new_vreg(em.MF, class_of(v.ty));
     }
     return v.loc;
 }
@@ -606,7 +557,7 @@ let mut ccache: u.List.[CEnt] = u.List.[CEnt].{ data: @ptr_from_int(*mut CEnt, 0
 // (The definition's aux holds the entry's index + 1 above bit 32, and so do
 // the copies the allocator makes of it.)
 fn note_remat(r: i32, def: *mut mc.MInst, full: mc.MOp, lane: u64, lb: u8, bytes: u8) void {
-    mc.set_remat(MF, r, def);
+    mc.set_remat(em.MF, r, def);
     rinfo.push(Remat.{ full: full, lane: lane, lb: lb, bytes: bytes });
     def.aux = def.aux | (@as(i64, @int_cast(i64, rinfo.len)) << 32);
 }
@@ -681,7 +632,7 @@ fn ones_into(r: i32) i32 {
         note_remat(r, i, NONE(), 0, 0, 64);
     } else {
         let i = e4(xe.SSE, 0, W(r), mc.reg(r, 0), NONE(), NONE());
-        if AVX {
+        if em.AVX {
             i.ops[2] = mc.reg(r, 0);
         }
         i.cc = xe.PCMPEQD;
@@ -698,7 +649,7 @@ fn const_small(x: u64, n: usize) mc.MOp {
     if found != 0 {
         return mc.mem_sym(@as(i32, @bit_cast(i32, found - 1)), 0);
     }
-    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    let s = em.OBJ.secs.get(@int_cast(usize, RODATA));
     s.data.align(n);
     let off = @as(u64, s.data.len());
     if n == 4 {
@@ -709,8 +660,8 @@ fn const_small(x: u64, n: usize) mc.MOp {
     if @as(u64, n) > s.align {
         s.align = @as(u64, n);
     }
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: @as(u64, n), bind: elf.B_LOCAL,
-                                         ty: elf.T_OBJECT, hidden: false });
+    let sym = elf.add_sym(em.OBJ, elf.Sym.{ name: ".LC", sec: RODATA, value: off, size: @as(u64, n), bind: elf.B_LOCAL,
+                                            ty: elf.T_OBJECT, hidden: false });
     consts.put(key, sym + 1);
     return mc.mem_sym(@as(i32, @bit_cast(i32, sym)), 0);
 }
@@ -783,7 +734,7 @@ fn gen_remat(v: *mut ir.Value) void {
 // a load folded into its only user (flag 8, with VEX or EVEX, which take
 // unaligned memory), else a register (constants: fold_remats).
 fn vsrc(x: *mut ir.Value) mc.MOp {
-    if AVX and (x.ty.kind == ir.T_VEC) and ir.is_op(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
+    if em.AVX and (x.ty.kind == ir.T_VEC) and ir.is_op(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
         return addr(x.a);
     }
     return R(reg(x));
@@ -882,7 +833,7 @@ fn base_mem(q: *mut ir.Value) mc.MOp {
             return m;
         }
     }
-    if tls_global(q) and not WIN {
+    if tls_global(q) and not em.WIN {
         // (fs-relative, with no base register: the thread pointer is not
         // loaded for each access)
         return tls_mem(q);
@@ -898,7 +849,7 @@ fn tls_global(p: *ir.Value) bool {
 // On Windows, [block + sym@tpoff], where the linker makes tpoff the offset
 // in the image's thread-local block.
 fn tls_mem(p: *ir.Value) mc.MOp {
-    if WIN {
+    if em.WIN {
         let mut m = mc.mem(tls_base(), -1, 0, 0);
         m.sym = global_sym(p.gv);
         m.slot = -2;
@@ -918,12 +869,12 @@ let mut tls_index_si: i32 = -1;
 // the index variable as axiom.tls_index).
 fn tls_base() i32 {
     let r = vgpr();
-    if not WIN {
+    if not em.WIN {
         _ = e1(xe.TLSBASE, 8, W(r));
         return r;
     }
     if tls_index_si < 0 {
-        tls_index_si = @bit_cast(i32, elf.ext_sym(OBJ, "axiom.tls_index", false));
+        tls_index_si = @bit_cast(i32, elf.ext_sym(em.OBJ, "axiom.tls_index", false));
     }
     let idx = vgpr();
     _ = e2(xe.LOAD, 4, W(idx), mc.mem_sym(tls_index_si, 0));
@@ -1158,7 +1109,7 @@ fn gen_alu(v: *mut ir.Value) void {
         }
         let rx = reg(x);
         copy(d, rx, GPR);
-        mc.hint(MF, d, rx);
+        mc.hint(em.MF, d, rx);
         let i = e2(xe.BT, sz, RW(d), R(reg(s.b)));
         i.cc = 1;
         if o == ir.OP_XOR {
@@ -1178,7 +1129,7 @@ fn gen_alu(v: *mut ir.Value) void {
     } else {
         let ra = reg(a);
         copy(d, ra, GPR);
-        mc.hint(MF, d, ra);
+        mc.hint(em.MF, d, ra);
     }
     if folded_load(b) {
         // op d, [m]
@@ -1669,7 +1620,7 @@ fn ptest_cond(v: *ir.Value) bool {
     if at.kind != ir.T_VEC {
         return false;
     }
-    return (at.size == 16) or ((at.size == 32) and AVX) or ((at.size == 64) and avx512_for(64));
+    return (at.size == 16) or ((at.size == 32) and em.AVX) or ((at.size == 64) and avx512_for(64));
 }
 
 // ptest for ptest_cond(v): the condition code that is true when v is.
@@ -1948,7 +1899,7 @@ fn gen_select(v: *mut ir.Value) void {
         // reuse): x + c
         let rx = reg(v.c);
         copy(d, rx, GPR);
-        mc.hint(MF, d, rx);
+        mc.hint(em.MF, d, rx);
         _ = alu(xe.ALU_ADD, isz(v.ty), RW(d), R(reg(sc)));
         return;
     }
@@ -2175,7 +2126,7 @@ fn gen_cast(v: *mut ir.Value) void {
 // otherwise a zero register (the block's, shared), so that the result does
 // not depend on whatever d held before.
 fn sse_unary(id: i32, d: i32, s: mc.MOp) void {
-    if AVX {
+    if em.AVX {
         let mut vv: i32 = 0;
         if s.kind == mc.K_REG {
             vv = s.reg;
@@ -2222,7 +2173,7 @@ fn cvt_i2f(d: i32, r: i32, is64int: bool, single: bool, unsigned: bool) void {
         }
     }
     let mut z: i32 = -1;
-    if AVX {
+    if em.AVX {
         z = scalar_zero();
     } else {
         vzero(d);
@@ -2231,7 +2182,7 @@ fn cvt_i2f(d: i32, r: i32, is64int: bool, single: bool, unsigned: bool) void {
     if is64int {
         i.sz = 8;
     }
-    if AVX {
+    if em.AVX {
         i.ops[2] = R(z);
     } else {
         i.ops[0] = RW(d);
@@ -2250,7 +2201,7 @@ fn scalar_zero() i32 {
 
 // u32 and u64 conversions in one instruction (vcvtusi2ss/sd).
 fn has_cvtusi() bool {
-    return AVX and tg.has(tg.X_AVX512F);
+    return em.AVX and tg.has(tg.X_AVX512F);
 }
 
 fn gen_int_to_float(v: *mut ir.Value, d: i32) void {
@@ -2736,7 +2687,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
                 rs = xe.VRNDSCALEPS;
             }
             _ = sse_i(rs, W(d), R(a), round_imm(id));
-        } else if AVX and not vec {
+        } else if em.AVX and not vec {
             // (the scalar form merges vvvv's upper lanes; the packed one
             // reads no vvvv, which must then be 1111)
             _ = sse4(op, 0, W(d), R(a), R(a), I(round_imm(id)));
@@ -2779,7 +2730,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         }
         return;
     }
-    fail(u.f1("float intrinsic %s", u.idec(id)));
+    em.fail(u.f1("float intrinsic %s", u.idec(id)));
 }
 
 // -----------------------------------------------------------------------------
@@ -2921,7 +2872,7 @@ fn gen_memop(v: *mut ir.Value) void {
 
 // The widest vector moves for memory operations (memop_chunk), in bytes.
 fn memop_width() i64 {
-    if AVX and (vector_bits() >= 256) {
+    if em.AVX and (vector_bits() >= 256) {
         return 32;
     }
     return 16;
@@ -3237,7 +3188,7 @@ let win_gprs: [4]i32 = [1, 2, 8, 9];
 const WIN_SHADOW: u64 = 32;
 
 fn caller_saved() u64 {
-    if WIN {
+    if em.WIN {
         // rax rcx rdx r8-r11, xmm0-xmm5 (rsi, rdi and xmm6-xmm15 are callee-saved)
         return (0x0f07 | (@as(u64, 0x3f) << 16)) | (@as(u64, 0xffff) << 48);
     }
@@ -3248,7 +3199,7 @@ fn caller_saved() u64 {
 // The register an argument or parameter arrives in (-1: on the stack),
 // counting the integer and floating-point ones seen so far.
 fn arg_reg(i: usize, c: u8, ng: *mut usize, nx: *mut usize) i32 {
-    if WIN {
+    if em.WIN {
         if i >= 4 {
             return -1;
         }
@@ -3293,7 +3244,7 @@ fn gen_call(v: *mut ir.Value) void {
     let mut ng: usize = 0;
     let mut nx: usize = 0;
     let mut off: u64 = 0;
-    if WIN {
+    if em.WIN {
         off = WIN_SHADOW;
     }
     let mut uses = u.List.[mc.MOp].empty();
@@ -3322,8 +3273,8 @@ fn gen_call(v: *mut ir.Value) void {
         }
     }
     off = (off + 15) & ~@as(u64, 15);
-    if off > out_area {
-        out_area = off;
+    if off > em.out_area {
+        em.out_area = off;
     }
     for i in 0..n {
         if dest[i] >= 0 {
@@ -3334,7 +3285,7 @@ fn gen_call(v: *mut ir.Value) void {
                 let m = e2(xe.MOV_RR, 8, W(dest[i]), R(regs[i]));
                 m.is_move = true;
             }
-            mc.hint(MF, regs[i], dest[i]);
+            mc.hint(em.MF, regs[i], dest[i]);
             uses.push(R(dest[i]));
         }
     }
@@ -3366,7 +3317,7 @@ fn gen_call(v: *mut ir.Value) void {
     if (v.a.kind == ir.V_FUNC) and v.a.fnp.noreturn {
         ci.clobber = 0;  // nothing is live after it
     }
-    MF.has_calls = true;
+    em.MF.has_calls = true;
     if has_ret {
         let d = vreg(v);
         if class_of(rt) == XMM {
@@ -3633,7 +3584,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         }
         return;
     }
-    fail(u.f1("integer intrinsic %s", u.idec(id)));
+    em.fail(u.f1("integer intrinsic %s", u.idec(id)));
 }
 
 // d = b where the compare of d (a) with b says b is the minimum / maximum.
@@ -4080,7 +4031,7 @@ fn vec_binop(v: *mut ir.Value) void {
             id = xe.PMULLD;
         }
     } else {
-        fail(u.f1("vector op %s", u.idec(o)));
+        em.fail(u.f1("vector op %s", u.idec(o)));
         return;
     }
     sse3(id, d, ra, b);
@@ -4106,7 +4057,7 @@ fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
             id = xe.PSRAW_I + (k - 1) * 3;
         }
         // immediate forms: legacy encodes the destination in r/m
-        if AVX {
+        if em.AVX {
             _ = vlz(sse4(id, 0, NONE(), R(a), W(d), I(n)));
         } else {
             copy(d, a, XMM);
@@ -4114,7 +4065,7 @@ fn vec_shift(v: *mut ir.Value, d: i32, a: i32) void {
         }
         return;
     }
-    let cnt = mc.new_vreg(MF, XMM);  // (the count: 64 bits, whatever the width)
+    let cnt = mc.new_vreg(em.MF, XMM);  // (the count: 64 bits, whatever the width)
     let cs = reg(c.a);
     let z = vgpr();
     let e = e2(xe.EXT, 4, W(z), R(cs));
@@ -4306,7 +4257,7 @@ fn expand_k1(d: i32, k: i32) void {
 
 // Lanes through a 16-byte stack slot.
 fn vec_slot() i32 {
-    return mc.new_slot(MF, 16, 16);
+    return mc.new_slot(em.MF, 16, 16);
 }
 
 // cpuid: eax, ebx, ecx and edx as the lanes of a u32x4 (through memory).
@@ -4431,7 +4382,7 @@ fn gen_insert(v: *mut ir.Value) void {
         VL = wl;
         return;
     }
-    if AVX and has41() and is.lane_float(v.ty) and (is.lane_bits(v.ty) == 32) and (v.cv < 4) and upper_zero(v.a, 8) {
+    if em.AVX and has41() and is.lane_float(v.ty) and (is.lane_bits(v.ty) == 32) and (v.cv < 4) and upper_zero(v.a, 8) {
         // into the low 128 bits of a vector zero above them: insertps,
         // which zeroes the register above (VEX and EVEX)
         let d = vreg(v);
@@ -4677,7 +4628,7 @@ fn gen_shuffle(v: *mut ir.Value) void {
         return;
     }
     // through memory: a and b in a 32-byte area, lanes copied one by one
-    let s = mc.new_slot(MF, 32, 16);
+    let s = mc.new_slot(em.MF, 32, 16);
     let r = vec_slot();
     _ = sse2(xe.MOVDQU_ST, R(a), mc.mem_slot(s, 0));
     _ = sse2(xe.MOVDQU_ST, R(b), mc.mem_slot(s, 16));
@@ -4772,7 +4723,7 @@ fn pack_shuffle(v: *mut ir.Value) bool {
 // d = a shifted by an immediate (id one of the PS*_I forms), 128 bits.
 fn vshift_imm(id: i32, d: i32, a: i32, n: i64) void {
     // (immediate forms: legacy encodes the destination in r/m)
-    if AVX {
+    if em.AVX {
         _ = sse4(id, 0, NONE(), R(a), W(d), I(n));
         return;
     }
@@ -5432,7 +5383,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     } else if id == ir.IN_USUB_SAT {
         op = xe.PSUBUSB + k;
     } else {
-        fail(u.f1("vector intrinsic %s", u.idec(id)));
+        em.fail(u.f1("vector intrinsic %s", u.idec(id)));
         return;
     }
     sse3(op, d, a, b);
@@ -6208,7 +6159,7 @@ fn mark_fused_vectors(f: *mut ir.Func) void {
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            if AVX and (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
+            if em.AVX and (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_VEC) and
                not remat(i) and u.notnil(i.user) and (i.user.blk == b) and
                ((i.user.flag & (((16 | 32) | 64) | (128 | 256))) == 0) and reads_as_rm(i.user, i) and
                quiet_between(i, i.user) {
@@ -6601,7 +6552,7 @@ fn gen_inst_at(v: *mut ir.Value) void {
     }
     if ((o == ir.OP_COPY) or (o == ir.OP_BITCAST)) and (class_of(t) != GPR) and (class_of(t) == class_of(v.a.ty)) {
         let sr = reg(v.a);
-        let def = mc.remat_def(MF, sr);
+        let def = mc.remat_def(em.MF, sr);
         if (u.notnil(def) or ((o == ir.OP_BITCAST) and (t.kind == ir.T_VEC))) and (v.loc < 0) {
             // a copy of a constant, or a vector as other lanes: the same register
             v.loc = sr;
@@ -6612,7 +6563,7 @@ fn gen_inst_at(v: *mut ir.Value) void {
             let d = vreg(v);
             let c = mc.clone_def(def, sr, d);
             mc.append(CB, c);
-            mc.set_remat(MF, d, c);
+            mc.set_remat(em.MF, d, c);
             return;
         }
         copy(vreg(v), sr, class_of(t));
@@ -6628,7 +6579,7 @@ fn gen_inst_at(v: *mut ir.Value) void {
             m.scale = 99;  // (from the GOT)
             op = xe.LOAD;
         }
-        mc.set_remat(MF, d, e2(op, 8, W(d), m));
+        mc.set_remat(em.MF, d, e2(op, 8, W(d), m));
         return;
     }
     if o == ir.OP_COPY {
@@ -6799,14 +6750,14 @@ fn gen_inst_at(v: *mut ir.Value) void {
         gen_int_intr(v, id);
         return;
     }
-    fail(u.f1("cannot select %s", ir.inst_str(v)));
+    em.fail(u.f1("cannot select %s", ir.inst_str(v)));
 }
 
 fn gen_term(b: *mut ir.Block) void {
     let t = ir.terminator(b);
     let o = t.op;
     if o == ir.OP_BR {
-        is.phi_copies(MF, b, reg, vreg, class_of, copy);
+        is.phi_copies(em.MF, b, reg, vreg, class_of, copy);
         if not is.next_block_is(b, t.t1) {
             jmp(is.blk(t.t1));
         }
@@ -6816,7 +6767,7 @@ fn gen_term(b: *mut ir.Block) void {
         let tt = t.t1;
         let ff = t.t2;
         if (t.a.kind == ir.V_INST) and ((t.a.flag & F_BRANCH) != 0) {
-            is.phi_copies(MF, b, reg, vreg, class_of, copy);
+            is.phi_copies(em.MF, b, reg, vreg, class_of, copy);
             let mut next: i32 = -1;
             if is.next_block_is(b, tt) {
                 next = is.blk(tt);
@@ -6827,7 +6778,7 @@ fn gen_term(b: *mut ir.Block) void {
             return;
         }
         let cc = cond_code(t.a);
-        is.phi_copies(MF, b, reg, vreg, class_of, copy);
+        is.phi_copies(em.MF, b, reg, vreg, class_of, copy);
         if cc == -1 {
             // equal and ordered
             jcc(xe.CC_NE, is.blk(ff));
@@ -6861,7 +6812,7 @@ fn gen_term(b: *mut ir.Block) void {
         let wide = isz(x.ty) == 8;
         let tr = vgpr();
         copy(tr, r, GPR);
-        is.phi_copies(MF, b, reg, vreg, class_of, copy);
+        is.phi_copies(em.MF, b, reg, vreg, class_of, copy);
         let mut sz: u8 = 4;
         if wide {
             sz = 8;
@@ -6887,8 +6838,8 @@ fn gen_term(b: *mut ir.Block) void {
         if u.notnil(t.a) {
             let x = t.a;
             let mut r = reg(x);
-            if (F.ret_ext != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
-                r = ext_reg(r, x.ty.bits, F.ret_ext == 2, false);
+            if (em.F.ret_ext != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
+                r = ext_reg(r, x.ty.bits, em.F.ret_ext == 2, false);
             }
             if class_of(x.ty) == XMM {
                 let m = sse2(xe.MOVAPS, W(xe.XMM0), R(r));
@@ -7485,7 +7436,7 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
 // Constants read once, in the block that builds them, are read from
 // memory instead (as an instruction's r/m operand); unread ones go.
 fn fold_remats() void {
-    let nv = mc.nvregs(MF);
+    let nv = mc.nvregs(em.MF);
     let nread = u.newn.[i32](nv + 1);
     let user = u.newn.[*mut mc.MInst](nv + 1);
     let ublk = u.newn.[i32](nv + 1);
@@ -7495,8 +7446,8 @@ fn fold_remats() void {
         ublk[k] = -1;
         dblk[k] = -1;
     }
-    for bi in 0..MF.blocks.len {
-        let b = MF.blocks.get(bi);
+    for bi in 0..em.MF.blocks.len {
+        let b = em.MF.blocks.get(bi);
         let mut i = b.first;
         while u.notnil(i) {
             for k in 0..i.ops.len {
@@ -7506,7 +7457,7 @@ fn fold_remats() void {
                     rs[0] = o.reg;
                 } else if (o.kind == mc.K_REG) and ((o.role & mc.RD) != 0) and mc.is_vreg(o.reg) {
                     let x = @int_cast(usize, o.reg - mc.VREG0);
-                    if MF.remat.get(x) == i {
+                    if em.MF.remat.get(x) == i {
                         dblk[x] = @int_cast(i32, bi);
                     }
                 } else if o.kind == mc.K_MEM {
@@ -7528,18 +7479,18 @@ fn fold_remats() void {
         }
     }
     for k in 0..nv {
-        let def = MF.remat.get(k);
+        let def = em.MF.remat.get(k);
         if u.isnil(def) or (dblk[k] < 0) {
             continue;
         }
         let r = @int_cast(i32, k) + mc.VREG0;
-        let b = MF.blocks.get(@int_cast(usize, dblk[k]));
+        let b = em.MF.blocks.get(@int_cast(usize, dblk[k]));
         if nread[k] == 0 {
             mc.remove(b, def);
-            MF.remat.set(k, u.nil.[mc.MInst]());
-        } else if (nread[k] == 1) and (ublk[k] == dblk[k]) and fold_remat(MF, user[k], r, def) {
+            em.MF.remat.set(k, u.nil.[mc.MInst]());
+        } else if (nread[k] == 1) and (ublk[k] == dblk[k]) and fold_remat(em.MF, user[k], r, def) {
             mc.remove(b, def);
-            MF.remat.set(k, u.nil.[mc.MInst]());
+            em.MF.remat.set(k, u.nil.[mc.MInst]());
         }
     }
 }
@@ -7585,10 +7536,10 @@ fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
     }
     let id = i.cc;
     let d = xe.desc(id);
-    if d.gpr_rm or (d.digit >= 0) or not rm_mem_ok(id) or (d.legacy and AVX) {
+    if d.gpr_rm or (d.digit >= 0) or not rm_mem_ok(id) or (d.legacy and em.AVX) {
         return false;
     }
-    if not AVX {
+    if not em.AVX {
         // legacy SSE: memory operands of packed instructions must be 16-byte
         // aligned, as the constant pool's 16-byte entries are
         if (info.bytes != 16) or (i.sz > 16) {
@@ -7635,7 +7586,7 @@ fn pool16(m: mc.MOp) bool {
     if (m.kind != mc.K_MEM) or (m.sym < 0) or (m.disp != 0) or (m.base >= 0) or (m.index >= 0) or (m.slot >= 0) {
         return false;
     }
-    let sy = OBJ.syms.at(@as(usize, @bit_cast(u32, m.sym)));
+    let sy = em.OBJ.syms.at(@as(usize, @bit_cast(u32, m.sym)));
     return (sy.size == 16) and (sy.sec == RODATA) and ((sy.value & 15) == 0) and u.str_eq(sy.name, ".LC");
 }
 
@@ -7713,7 +7664,7 @@ fn const_needs_reg(v: *ir.Value) bool {
 // A copy of a whole general purpose register (for mc.drop_reloads).
 fn full_copy(i: *mc.MInst) bool {
     return (i.op == xe.MOV_RR) and (i.sz == 8) and (i.ops[0].kind == mc.K_REG) and (i.ops[1].kind == mc.K_REG) and
-           (P(i.ops[0].reg) < 16) and (P(i.ops[1].reg) < 16);
+           (em.P(i.ops[0].reg) < 16) and (em.P(i.ops[1].reg) < 16);
 }
 
 fn is_label(i: *mc.MInst) bool {
@@ -7942,7 +7893,7 @@ fn phys_rw(i: *mc.MInst, rd: *mut u64, wr: *mut u64) void {
     for k in 0..i.ops.len {
         let o = i.ops[k];
         if (o.kind == mc.K_REG) and (o.reg >= 0) {
-            let r = P(o.reg);
+            let r = em.P(o.reg);
             if (r < 0) or (r >= 64) {
                 continue;
             }
@@ -7957,7 +7908,7 @@ fn phys_rw(i: *mc.MInst, rd: *mut u64, wr: *mut u64) void {
             let rs: [2]i32 = [o.base, o.index];
             for x in rs {
                 if x >= 0 {
-                    let r = P(x);
+                    let r = em.P(x);
                     if (r >= 0) and (r < 64) {
                         rd.* = rd.* | (@as(u64, 1) << @int_cast(u32, r));
                     }
@@ -7974,7 +7925,7 @@ fn phys_rw(i: *mc.MInst, rd: *mut u64, wr: *mut u64) void {
 // (After drop_reloads, which may have the register's value read later under
 // another name: liveness here is of physical registers.)
 fn fold_stack_reads() void {
-    let nb = MF.blocks.len;
+    let nb = em.MF.blocks.len;
     let lin = u.newn.[u64](nb + 1);
     let lout = u.newn.[u64](nb + 1);
     let use_s = u.newn.[u64](nb + 1);
@@ -7982,7 +7933,7 @@ fn fold_stack_reads() void {
     for bi in 0..nb {
         let mut uu: u64 = 0;
         let mut dd: u64 = 0;
-        let mut i = MF.blocks.get(bi).first;
+        let mut i = em.MF.blocks.get(bi).first;
         while u.notnil(i) {
             let mut rd: u64 = 0;
             let mut wr: u64 = 0;
@@ -8007,7 +7958,7 @@ fn fold_stack_reads() void {
         let mut bi = nb;
         while bi > 0 {
             bi -= 1;
-            let b = MF.blocks.get(bi);
+            let b = em.MF.blocks.get(bi);
             let mut o: u64 = 0;
             for k in 0..b.succs.len {
                 o = o | lin[@int_cast(usize, b.succs.get(k))];
@@ -8026,7 +7977,7 @@ fn fold_stack_reads() void {
     let mut after = u.List.[u64].empty();  // live after each instruction
     let mut insts = u.List.[*mut mc.MInst].empty();
     for bi in 0..nb {
-        let b = MF.blocks.get(bi);
+        let b = em.MF.blocks.get(bi);
         let mut again = true;
         let mut rounds: i32 = 0;
         while again and (rounds < 8) {
@@ -8082,7 +8033,7 @@ fn fold_stack_read(b: *mut mc.MBlock, insts: []*mut mc.MInst, after: []u64, li: 
     if not ((m.slot >= 0) or ((m.base == xe.RBP) and (m.index < 0) and (m.disp > 0))) {
         return false;  // (a spill slot, or a stack argument: nothing else writes either)
     }
-    let r = P(l.ops[0].reg);
+    let r = em.P(l.ops[0].reg);
     if (r < 0) or (r >= 16) {
         return false;
     }
@@ -8116,8 +8067,8 @@ fn forward_copy(mb: *mut mc.MBlock, insts: []*mut mc.MInst, after: []u64, li: us
     if not full_copy(c1) {
         return false;
     }
-    let rb = P(c1.ops[0].reg);
-    let ra = P(c1.ops[1].reg);
+    let rb = em.P(c1.ops[0].reg);
+    let ra = em.P(c1.ops[1].reg);
     if ra == rb {
         return false;
     }
@@ -8130,12 +8081,12 @@ fn forward_copy(mb: *mut mc.MBlock, insts: []*mut mc.MInst, after: []u64, li: us
         let mut wr: u64 = 0;
         phys_rw(j, &mut rd, &mut wr);
         if (rd & bb) != 0 {
-            if not full_copy(j) or ((after[ui] & bb) != 0) or (P(j.ops[1].reg) != rb) {
+            if not full_copy(j) or ((after[ui] & bb) != 0) or (em.P(j.ops[1].reg) != rb) {
                 return false;
             }
             j.ops[1] = c1.ops[1];  // (a, by its vreg)
             mc.remove(mb, c1);
-            if P(j.ops[0].reg) == ra {
+            if em.P(j.ops[0].reg) == ra {
                 mc.remove(mb, j);
             }
             return true;
@@ -8176,10 +8127,10 @@ fn fold_read(i: *mut mc.MInst, r: i32, m: mc.MOp) bool {
     if (a.kind != mc.K_REG) or ((b.kind != mc.K_REG) and (b.kind != mc.K_IMM)) {
         return false;
     }
-    let ra = P(a.reg);
+    let ra = em.P(a.reg);
     let mut rb: i32 = -1;
     if b.kind == mc.K_REG {
-        rb = P(b.reg);
+        rb = em.P(b.reg);
     }
     if op == xe.TEST {
         if (ra == r) and (rb == r) {
@@ -8219,10 +8170,10 @@ fn fold_read(i: *mut mc.MInst, r: i32, m: mc.MOp) bool {
 // into the copy's register instead. (Before drop_reloads, which takes a
 // register a reload wrote to hold the slot from then on.)
 fn fold_load_copies() void {
-    let nv = mc.nvregs(MF);
+    let nv = mc.nvregs(em.MF);
     let reads = u.newn.[i32](nv + 1);
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
+    for bi in 0..em.MF.blocks.len {
+        let mut i = em.MF.blocks.get(bi).first;
         while u.notnil(i) {
             for k in 0..i.ops.len {
                 let o = i.ops[k];
@@ -8240,8 +8191,8 @@ fn fold_load_copies() void {
             i = i.next;
         }
     }
-    for bi in 0..MF.blocks.len {
-        let b = MF.blocks.get(bi);
+    for bi in 0..em.MF.blocks.len {
+        let b = em.MF.blocks.get(bi);
         let mut i = b.first;
         while u.notnil(i) {
             let next = i.next;
@@ -8269,7 +8220,7 @@ fn fold_load_copies() void {
 // register or the copy's (or branches, calls or is a label); else nil.
 fn load_copy(l: *mut mc.MInst, gpr: bool) *mut mc.MInst {
     let a = l.ops[0].reg;
-    let ra = P(a);
+    let ra = em.P(a);
     let mut j = l.next;
     while u.notnil(j) {
         let op = j.op;
@@ -8281,43 +8232,26 @@ fn load_copy(l: *mut mc.MInst, gpr: bool) *mut mc.MInst {
                        (not gpr and (op == xe.SSE) and (j.cc == xe.MOVAPS))) and (j.ops[0].kind == mc.K_REG) and
                       (j.ops[0].role == mc.RD) and (j.ops[1].kind == mc.K_REG) and (j.ops[1].reg == a);
         if is_copy {
-            let rb = P(j.ops[0].reg);
+            let rb = em.P(j.ops[0].reg);
             if rb == ra {
                 return u.nil.[mc.MInst]();
             }
             // (nothing between names the copy's register: checked on the way)
             let mut x = l.next;
             while x != j {
-                if names_phys(x, rb) {
+                if em.names_phys(x, rb) {
                     return u.nil.[mc.MInst]();
                 }
                 x = x.next;
             }
             return j;
         }
-        if names_phys(j, ra) {
+        if em.names_phys(j, ra) {
             return u.nil.[mc.MInst]();
         }
         j = j.next;
     }
     return u.nil.[mc.MInst]();
-}
-
-// Does i name physical register r (an operand, or in a memory operand)?
-fn names_phys(i: *mc.MInst, r: i32) bool {
-    if (i.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
-        return true;
-    }
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if (o.kind == mc.K_REG) and (P(o.reg) == r) {
-            return true;
-        }
-        if (o.kind == mc.K_MEM) and (((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r))) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Are the flags i sets read by nothing? (Flags are never live into a block;
@@ -8577,11 +8511,11 @@ fn perm_lane_splats(f: *mut ir.Func) void {
 }
 
 fn compile_func(f: *mut ir.Func) void {
-    F = f;
+    em.F = f;
     nlocal = 0;
     rinfo.clear();
     ccache.clear();
-    out_area = 0;
+    em.out_area = 0;
     opt.split_critical_edges(f);
     opt.split_loop_exits(f);
     lower.scalarize(f, legal);
@@ -8595,11 +8529,11 @@ fn compile_func(f: *mut ir.Func) void {
     opt.sink_compares(f);
     prepare(f);
     sink_to_use(f);
-    MF = mc.new_func();
+    em.MF = mc.new_func();
     for i in 0..order.len {
         let b = order.get(i);
         b.aux = @int_cast(i64, i);
-        let mb = mc.new_block(MF);
+        let mb = mc.new_block(em.MF);
         mb.loop_depth = b.loop_depth;
         let bt = ir.terminator(b);
         mb.cold = u.notnil(bt) and (bt.op == ir.OP_UNREACHABLE);
@@ -8607,7 +8541,7 @@ fn compile_func(f: *mut ir.Func) void {
     for i in 0..order.len {
         let us = opt.unlikely_succ(order.get(i));
         if u.notnil(us) {
-            MF.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
+            em.MF.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
         }
     }
     // stack slots for allocas
@@ -8623,7 +8557,7 @@ fn compile_func(f: *mut ir.Func) void {
                 if al == 0 {
                     al = 1;
                 }
-                i.aux = @int_cast(i64, mc.new_slot(MF, i.aty.size, al));
+                i.aux = @int_cast(i64, mc.new_slot(em.MF, i.aty.size, al));
             }
             i = i.next;
         }
@@ -8631,11 +8565,11 @@ fn compile_func(f: *mut ir.Func) void {
     }
     // parameters
     mc.cur_src = f.src;
-    CB = MF.blocks.get(0);
+    CB = em.MF.blocks.get(0);
     let mut ng: usize = 0;
     let mut nx: usize = 0;
     let mut soff: i64 = 16;
-    if WIN {
+    if em.WIN {
         soff += @bit_cast(i64, WIN_SHADOW);
     }
     for pi in 0..f.params.len {
@@ -8649,7 +8583,7 @@ fn compile_func(f: *mut ir.Func) void {
             let m = mc.mem(xe.RBP, -1, 0, soff);
             if c == GPR {
                 // (never written: read again from there rather than spilled)
-                mc.set_remat(MF, d, e2(xe.LOAD, 8, W(d), m));
+                mc.set_remat(em.MF, d, e2(xe.LOAD, 8, W(d), m));
                 soff += 8;
             } else if p.ty.kind == ir.T_VEC {
                 soff = (soff + 15) & ~@as(i64, 15);
@@ -8668,7 +8602,7 @@ fn compile_func(f: *mut ir.Func) void {
     for bi in 0..order.len {
         let ib = order.get(bi);
         IB = ib;
-        CB = MF.blocks.get(bi);
+        CB = em.MF.blocks.get(bi);
         addr_regs.clear();
         imm_regs.clear();
         addr_block = CB;
@@ -8692,29 +8626,29 @@ fn compile_func(f: *mut ir.Func) void {
     }
     order.deinit();
     mc.cur_src = 0;
-    if errors {
+    if em.errors {
         return;
     }
     let mut gorder = gpr_order[..];
-    if WIN {
+    if em.WIN {
         gorder = win_gpr_order[..];
     }
     let mut wide_order = xmm_order[..];
     let mut zorder = xmm_order[..];
-    if WIN {
+    if em.WIN {
         wide_order = win_wide_order[..];
         zorder = win_wide_order[..];
     }
     if zmm16() {
         zorder = zmm_order[..];
-        if WIN {
+        if em.WIN {
             zorder = win_zmm_order[..];
         }
     }
-    UPPER = false;
-    for k in 0..MF.vclass.len {
-        if MF.vclass.get(k) >= YMM {
-            UPPER = true;
+    em.UPPER = false;
+    for k in 0..em.MF.vclass.len {
+        if em.MF.vclass.get(k) >= YMM {
+            em.UPPER = true;
         }
     }
     let tgt = mc.Target.{ nclasses: 4, alloc_order: [gorder, xmm_order[..], wide_order, zorder],
@@ -8725,2621 +8659,71 @@ fn compile_func(f: *mut ir.Func) void {
     // a select or branch comparing again what the flags already hold (the
     // second of two selects of one condition) does not keep the compared
     // registers alive past the first
-    PRE_RA = true;
-    for bi in 0..MF.blocks.len {
-        reuse_flags(MF.blocks.get(bi));
-        reuse_k1(MF.blocks.get(bi));
+    em.PRE_RA = true;
+    for bi in 0..em.MF.blocks.len {
+        em.reuse_flags(em.MF.blocks.get(bi));
+        em.reuse_k1(em.MF.blocks.get(bi));
     }
-    PRE_RA = false;
-    mc.dce(MF, pure_inst);
-    hoist_source_reads(MF);
+    em.PRE_RA = false;
+    mc.dce(em.MF, pure_inst);
+    hoist_source_reads(em.MF);
     fold_remats();
-    SW = -1;
-    if not WIN {
-        PRE_RA = true;
-        SW = mc.shrink_wrap(MF, &tgt, CALLEE_SAVED, sw_frame_free, sw_movable, is_ret);
-        PRE_RA = false;
+    em.SW = -1;
+    if not em.WIN {
+        em.PRE_RA = true;
+        em.SW = mc.shrink_wrap(em.MF, &tgt, em.CALLEE_SAVED, em.sw_frame_free, em.sw_movable, em.is_ret);
+        em.PRE_RA = false;
     }
-    mc.allocate(MF, &tgt);
+    mc.allocate(em.MF, &tgt);
     fold_load_copies();
-    mc.drop_reloads(MF, is_label, full_copy);
+    mc.drop_reloads(em.MF, is_label, full_copy);
     fold_stack_reads();
-    encode_func(f);
-}
-
-// -----------------------------------------------------------------------------
-// Encoding
-// -----------------------------------------------------------------------------
-let mut E: xe.Enc = xe.Enc.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
-                             relocs: u.List.[xe.Reloc].{ data: @ptr_from_int(*mut xe.Reloc, 0), len: 0, cap: 0 },
-                             fixups: u.List.[xe.Fixup].{ data: @ptr_from_int(*mut xe.Fixup, 0), len: 0, cap: 0 },
-                             avx: false };
-let mut nsaved: i64 = 0;
-let mut saved: [7]i32 = [0; 7];
-let mut nxsaved: i64 = 0;  // Windows: xmm6-xmm15 in use, saved below the pushed registers
-let mut xsaved: [10]i32 = [0; 10];
-let mut local_off: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-
-fn P(r: i32) i32 {
-    if PRE_RA {
-        return r;
-    }
-    return mc.phys(MF, r);
-}
-
-let mut PRE_RA: bool = false;  // (P names virtual registers: before allocation)
-
-fn b8(x: u64) void {
-    E.b.u8_(@truncate(u8, x));
-}
-
-fn to_mem(o: mc.MOp) xe.Mem {
-    let mut m = xe.Mem.{ base: -1, index: -1, scale: o.scale, disp: o.disp, sym: o.sym, tpoff: false };
-    if o.base >= 0 {
-        m.base = P(o.base);
-    }
-    if o.index >= 0 {
-        m.index = P(o.index);
-    }
-    if o.slot >= 0 {
-        m.base = xe.RBP;
-        m.disp += MF.slots.get(@int_cast(usize, o.slot)).offset;
-        m.sym = -1;
-    } else if (o.slot == -2) or (o.slot == -3) {
-        m.tpoff = true;
-    }
-    return m;
-}
-
-// ModRM for a memory operand, with TLS offsets relative to a base register.
-fn enc_mem(rf: i32, o: mc.MOp, imm_after: i64) void {
-    let m = to_mem(o);
-    xe.modrm_mem(&mut E, @as(u64, @bit_cast(u32, rf)), &m, imm_after);
-}
-
-fn rex_for_mem(w: u64, rf: i32, o: mc.MOp, force: bool) void {
-    let m = to_mem(o);
-    let r = @as(u64, @bit_cast(u32, (rf & 15) >> 3));
-    let x = xe.rm_x(&m);
-    let b = xe.rm_b(&m);
-    let v = ((w << 3) | (r << 2)) | ((x << 1) | b);
-    if (v != 0) or force {
-        b8(0x40 | v);
-    }
-}
-
-fn byte_reg_force(r: i32) bool {
-    let x = r & 15;
-    return (x >= 4) and (x <= 7);
-}
-
-// opcode (1-2 bytes) with reg field `reg` and r/m operand `rm` (register or memory)
-fn enc_op(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i64, byte_op: bool) void {
-    enc_op2(sz, nop, op0, op1, rf, rm, imm_after, byte_op, byte_op);
-}
-
-// enc_op where byte_rf and byte_rm say which of the reg field (not a /digit
-// or a wider register) and the r/m operand is a byte register: spl, bpl,
-// sil and dil need a REX prefix, al-bl do not.
-fn enc_op2(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, rm: mc.MOp, imm_after: i64, byte_rf: bool, byte_rm: bool) void {
-    if sz == 2 {
-        b8(0x66);
-    }
-    let mut w: u64 = 0;
-    if sz == 8 {
-        w = 1;
-    }
-    if rm.kind == mc.K_REG {
-        let rr = P(rm.reg);
-        let force = (byte_rf and byte_reg_force(rf)) or (byte_rm and byte_reg_force(rr));
-        let v = ((w << 3) | ((@as(u64, @bit_cast(u32, rf & 15)) >> 3) << 2)) | (@as(u64, @bit_cast(u32, rr & 15)) >> 3);
-        if (v != 0) or force {
-            b8(0x40 | v);
-        }
-        opcode(nop, op0, op1);
-        xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, rf)), @as(u64, @bit_cast(u32, rr)));
-        return;
-    }
-    rex_for_mem(w, rf, rm, byte_rf and byte_reg_force(rf));
-    opcode(nop, op0, op1);
-    enc_mem(rf, rm, imm_after);
-}
-
-fn opcode(n: i32, a: u8, b: u8) void {
-    E.b.u8_(a);
-    if n == 2 {
-        E.b.u8_(b);
-    }
-}
-
-// An instruction with a byte form (opcode op0, or op0 op1) and a wider one
-// (the last opcode byte one more), as sz says: reg field rf (a register, or
-// a /digit when digit) and r/m operand rm.
-fn enc_op_sz(sz: u8, nop: i32, op0: u8, op1: u8, rf: i32, digit: bool, rm: mc.MOp, imm_after: i64) void {
-    if sz == 1 {
-        enc_op2(1, nop, op0, op1, rf, rm, imm_after, not digit, true);
-    } else if nop == 1 {
-        enc_op(sz, 1, op0 + 1, op1, rf, rm, imm_after, false);
-    } else {
-        enc_op(sz, nop, op0, op1 + 1, rf, rm, imm_after, false);
-    }
-}
-
-fn imm_len(sz: u8) i64 {
-    if sz == 1 {
-        return 1;
-    }
-    if sz == 2 {
-        return 2;
-    }
-    return 4;
-}
-
-fn enc_imm(x: i64, n: i64) void {
-    xe.imm_n(&mut E, x, @truncate(u8, @bit_cast(u64, n)));
-}
-
-// After code with ymm or zmm registers, before code that may use the
-// legacy SSE encoding (which would otherwise pay to preserve the upper halves).
-fn vzeroupper() void {
-    b8(0xc5);
-    b8(0xf8);
-    b8(0x77);
-}
-
-fn label_ref(l: i32) void {
-    xe.rel32_fixup(&mut E, l);
-}
-
-// Branch relaxation (encode_func): the jumps, in the order they are encoded,
-// that take a rel8 displacement (jshort); in the first pass, which encodes
-// them all with rel32, where each starts and where it goes.
-let mut jshort: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
-let mut jstart: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-let mut jlabel: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
-let mut jnext: usize = 0;
-// the rel8 jumps of a pass: jump number << 32 | its fixup
-let mut jfix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
-
-// A jump (jmp: 0xe9 / 0xeb; jcc: 0x0f 0x80+cc / 0x70+cc) to label l.
-fn enc_jump(l: i32, cond: bool, cc: i32) void {
-    let k = jnext;
-    jnext += 1;
-    if k >= jshort.len {
-        jshort.push(false);
-        jstart.push(@as(u64, E.b.len()));
-        jlabel.push(l);
-    }
-    if jshort.get(k) {
-        if cond {
-            b8(0x70 + @as(u64, @bit_cast(u32, cc)));
-        } else {
-            b8(0xeb);
-        }
-        jfix.push((@as(u64, k) << 32) | @as(u64, E.fixups.len));
-        xe.rel8_fixup(&mut E, l);
-        return;
-    }
-    if cond {
-        b8(0x0f);
-        b8(0x80 + @as(u64, @bit_cast(u32, cc)));
-    } else {
-        b8(0xe9);
-    }
-    label_ref(l);
-}
-
-// After the first pass: the jumps whose targets are within a rel8 of them
-// once the others chosen so are short too (distances only shrink as more
-// are: repeated until none changes). True if any is.
-fn relax_jumps(boff: []u64) bool {
-    let n = jshort.len;
-    if n == 0 {
-        return false;
-    }
-    let tgt = u.newn.[u64](n + 1);
-    let longl = u.newn.[i64](n + 1);
-    for k in 0..n {
-        let l = jlabel.get(k);
-        if l >= xe.LOCAL_BASE {
-            tgt[k] = local_off.get(@int_cast(usize, l - xe.LOCAL_BASE));
-        } else {
-            tgt[k] = boff[@int_cast(usize, l)];
-        }
-        longl[k] = 5;
-        if E.b.view()[@truncate(usize, jstart.get(k))] == 0x0f {
-            longl[k] = 6;
-        }
-    }
-    // before[k]: bytes saved by the short jumps before jump k (starts increase)
-    let before = u.newn.[i64](n + 1);
-    let mut any = false;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut acc: i64 = 0;
-        for k in 0..n {
-            before[k] = acc;
-            if jshort.get(k) {
-                acc += longl[k] - 2;
-            }
-        }
-        before[n] = acc;
-        for k in 0..n {
-            if jshort.get(k) {
-                continue;
-            }
-            // the target, moved up by the savings before it: those of the
-            // jumps that start before it
-            let t = tgt[k];
-            let mut lo: usize = 0;
-            let mut hi: usize = n;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if jstart.get(mid) < t {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            let nt = @bit_cast(i64, t) - before[lo];
-            let ns = @bit_cast(i64, jstart.get(k)) - before[k];
-            let mut rel = nt - (ns + 2);
-            if t > jstart.get(k) {
-                rel -= longl[k] - 2;  // (this jump's own saving is among those before t)
-            }
-            if (rel >= -128) and (rel <= 127) {
-                jshort.set(k, true);
-                changed = true;
-                any = true;
-            }
-        }
-    }
-    return any;
-}
-
-// After a pass with rel8 jumps: those whose targets ended up out of reach
-// (padding, see encode_func, can lengthen what relax_jumps expected to
-// shrink) take a rel32 from now on. True if any does: encode again.
-fn unrelax_jumps(boff: []u64) bool {
-    let mut any = false;
-    for n in 0..jfix.len {
-        let x = jfix.get(n);
-        let f = E.fixups.get(@truncate(usize, x & 0xffff_ffff));
-        let mut target: u64 = 0;
-        if f.label >= xe.LOCAL_BASE {
-            target = local_off.get(@int_cast(usize, f.label - xe.LOCAL_BASE));
-        } else {
-            target = boff[@int_cast(usize, f.label)];
-        }
-        let rel = @bit_cast(i64, target) - @bit_cast(i64, f.off + 1);
-        if (rel < -128) or (rel > 127) {
-            jshort.set(@truncate(usize, x >> 32), false);
-            any = true;
-        }
-    }
-    return any;
-}
-
-// Multi-byte nops (as LLVM writes them), n bytes in all.
-// (the k-byte one at k * (k - 1) / 2)
-let NOPS: [55]u8 = [0x90, 0x66, 0x90, 0x0f, 0x1f, 0x00, 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66,
-                    0x0f, 0x1f, 0x44, 0x00, 0x00, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x84, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x2e, 0x0f,
-                    0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-fn emit_nops(n0: u64) void {
-    let mut n = n0;
-    while n > 0 {
-        let k = @min(n, 10);
-        let at = @truncate(usize, (k * (k - 1)) / 2);
-        E.b.put(NOPS[at..at + @truncate(usize, k)]);
-        n -= k;
-    }
-}
-
-// What the encoder has written so far, to take back an instruction encoded
-// in the wrong place (see enc_unit).
-struct EncMark {
-    b: usize,
-    relocs: usize,
-    fixups: usize,
-    jnext: usize,
-    jlen: usize,
-    jfix: usize,
-}
-
-fn enc_mark() EncMark {
-    return EncMark.{ b: E.b.len(), relocs: E.relocs.len, fixups: E.fixups.len, jnext: jnext, jlen: jshort.len,
-                     jfix: jfix.len };
-}
-
-fn enc_rewind(m: EncMark) void {
-    E.b.b.len = m.b;
-    E.relocs.len = m.relocs;
-    E.fixups.len = m.fixups;
-    jnext = m.jnext;
-    jshort.len = m.jlen;
-    jstart.len = m.jlen;
-    jlabel.len = m.jlen;
-    jfix.len = m.jfix;
-}
-
-// Encodes nothing (a no-op move, a local label).
-fn enc_nothing(i: *mc.MInst) bool {
-    return noop_move(i) or (i.op == xe.LABEL) or (i.op == xe.NOP);
-}
-
-// A compare or test that a jcc right after it fuses with (Skylake: cmp, test,
-// add, sub, and; inc and dec are adds here).
-fn fuses_with_jcc(i: *mc.MInst) bool {
-    if (i.op == xe.TEST) or (i.op == xe.CMP_M) {
-        return true;
-    }
-    return (i.op == xe.ALU) and
-           ((i.cc == xe.ALU_ADD) or (i.cc == xe.ALU_AND) or (i.cc == xe.ALU_SUB) or (i.cc == xe.ALU_CMP));
-}
-
-// Does code at s of length n cross or end on a 32-byte boundary?
-fn crosses32(s: u64, n: u64) bool {
-    return (s % 32) + n >= 32;
-}
-
-// Encodes i, or (JCC) the jump i starts with the compare it fuses with
-// through last: if that crosses or ends on a 32-byte boundary, it is
-// encoded again after nops that move it to the boundary. `extra`: the
-// length of a jcc that follows (at the start of the next block).
-fn enc_unit(i: *mut mc.MInst, last: *mut mc.MInst, extra: u64) void {
-    let m = enc_mark();
-    let mut x = i;
-    loop {
-        enc_inst(x);
-        if x == last {
-            break;
-        }
-        x = x.next;
-    }
-    if i.op == xe.RET {
-        // (only the ret itself, the epilogue's last byte)
-        let e = FBASE + @as(u64, E.b.len());
-        if (e % 32) == 0 {
-            let n = E.b.len();
-            if E.b.view()[n - 1] != 0xc3 {
-                fail("internal compiler error: an epilogue that does not end in ret");
-            }
-            E.b.b.len = n - 1;
-            emit_nops(1);
-            b8(0xc3);
-        }
-        return;
-    }
-    let s = FBASE + @as(u64, m.b);
-    let mut pad: u64 = 0;
-    if i.op == xe.REP {
-        // memmove's own jumps: a fused cmp + jae at 6, a jmp at 25 (see enc_inst)
-        while crosses32(s + pad + 6, 5) or crosses32(s + pad + 25, 2) {
-            pad += 1;
-        }
-    } else {
-        let len = @as(u64, E.b.len()) - @as(u64, m.b) + extra;
-        if crosses32(s, len) and (len < 32) {
-            pad = 32 - (s % 32);
-        }
-    }
-    if pad == 0 {
-        return;
-    }
-    enc_rewind(m);
-    emit_nops(pad);
-    x = i;
-    loop {
-        enc_inst(x);
-        if x == last {
-            break;
-        }
-        x = x.next;
-    }
-}
-
-// The length of the jcc that the blocks after bi start with, if they fall
-// into it with nothing between (no padding, no prologue); else 0.
-fn jcc_next_block(bi: usize, skip: []bool, lal: []bool, sw: i32) u64 {
-    let mut n = bi + 1;
-    while (n < MF.blocks.len) and skip[n] and not lal[n] and (@as(i32, @int_cast(i32, n)) != sw) {
-        n += 1;
-    }
-    if (n >= MF.blocks.len) or lal[n] or (@as(i32, @int_cast(i32, n)) == sw) {
-        return 0;
-    }
-    let mut j = MF.blocks.get(n).first;
-    while u.notnil(j) and enc_nothing(j) {
-        j = j.next;
-    }
-    if u.isnil(j) or (j.op != xe.JCC) {
-        return 0;
-    }
-    if (jnext < jshort.len) and jshort.get(jnext) {
-        return 2;
-    }
-    return 6;
-}
-
-// The blocks whose start is aligned to LALIGN bytes: hot loop tops (LMODE 1:
-// targets of a jump back from later in the function; 2: like LLVM, any
-// block in a loop, run at least a fifth as often as a loop header, that
-// its layout predecessor does not fall into as often as a fifth of its runs).
-fn loop_aligned(skip: []bool) []mut bool {
-    let nb = MF.blocks.len;
-    let al = u.newn.[bool](nb + 1);
-    for bi in 0..nb {
-        al[bi] = false;
-    }
-    if LALIGN == 0 {
-        return al;
-    }
-    let back = u.newn.[bool](nb + 1);
-    for bi in 0..nb {
-        back[bi] = false;
-    }
-    for bi in 0..nb {
-        if skip[bi] {
-            continue;
-        }
-        let mut i = MF.blocks.get(bi).first;
-        while u.notnil(i) {
-            if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) and
-               (@as(usize, @int_cast(usize, i.ops[0].label)) <= bi) {
-                back[@int_cast(usize, i.ops[0].label)] = true;
-            }
-            i = i.next;
-        }
-    }
-    for bi in 1..nb {
-        let b = MF.blocks.get(bi);
-        if skip[bi] or (b.loop_depth == 0) or b.cold {
-            continue;
-        }
-        if LMODE == 1 {
-            if not back[bi] {
-                continue;
-            }
-        } else if b.freq < 0.2 * mc.LOOP_SCALE {
-            continue;
-        }
-        // the layout predecessor, and how often it falls into b
-        let mut p = bi - 1;
-        while (p > 0) and skip[p] {
-            p -= 1;
-        }
-        let pb = MF.blocks.get(p);
-        let mut fall: f64 = 0.0;
-        if not ends_flow(pb) {
-            fall = pb.freq;
-            let l = pb.last;
-            if u.notnil(l) and (l.op == xe.JCC) {
-                fall = pb.freq * 0.5;
-            }
-        }
-        if fall <= 0.2 * b.freq {
-            al[bi] = true;
-        }
-    }
-    return al;
-}
-
-// A leaf with nothing on the stack needs no frame.
-let mut frameless: bool = false;
-
-// Shrink-wrapping (mc.shrink_wrap; not on Windows, whose unwind tables
-// describe a prologue at the start): blocks before SW run without the frame,
-// which block SW sets up; in_noframe while they are encoded.
-let mut SW: i32 = -1;
-let mut in_noframe: bool = false;
-const CALLEE_SAVED: u64 = (
-    ((@as(u64, 1) << 3) | (@as(u64, 1) << 12)) | ((@as(u64, 1) << 13) | (@as(u64, 1) << 14))) | (@as(u64, 1) << 15);  // rbx r12-r15
-
-// Does i need no frame: no call, no stack, no callee-saved register?
-fn sw_frame_free(i: *mc.MInst) bool {
-    if (i.clobber != 0) or (i.op == xe.CPUID) or (i.op == xe.REP) {
-        return false;  // (a call that does not return clobbers nothing: a trap's is fine)
-    }
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if o.kind == mc.K_REG {
-            let r = P(o.reg);
-            if (r == xe.RSP) or (r == xe.RBP) or
-               ((r >= 0) and (r < 64) and ((CALLEE_SAVED & (@as(u64, 1) << @int_cast(u32, r))) != 0)) {
-                return false;
-            }
-        } else if o.kind == mc.K_MEM {
-            if o.slot >= 0 {
-                return false;
-            }
-            let rs: [2]i32 = [o.base, o.index];
-            for x in rs {
-                let r = P(x);
-                if (r == xe.RSP) or (r == xe.RBP) or
-                   ((r >= 0) and (r < 64) and ((CALLEE_SAVED & (@as(u64, 1) << @int_cast(u32, r))) != 0)) {
-                    return false;
-                }
-            }
-        }
-    }
-    return true;
-}
-
-// A stack argument's load (rematerialized: see compile_func).
-fn sw_movable(i: *mc.MInst) bool {
-    return (i.op == xe.LOAD) and (i.ops.len == 2) and (i.ops[1].kind == mc.K_MEM) and (i.ops[1].base == xe.RBP) and
-           (i.ops[1].disp > 0) and (i.ops[1].index < 0);
-}
-
-fn is_ret(i: *mc.MInst) bool {
-    return i.op == xe.RET;
-}
-
-fn needs_frame() bool {
-    if (nsaved > 0) or (nxsaved > 0) or (MF.slots.len > 0) or (out_area != 0) {
-        return true;
-    }
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
-        while u.notnil(i) {
-            if i.clobber != 0 {
-                return true;  // a call that returns (a noreturn one only needs the stack aligned)
-            }
-            for k in 0..i.ops.len {
-                let o = i.ops[k];
-                if (o.kind == mc.K_REG) and ((P(o.reg) == xe.RSP) or (P(o.reg) == xe.RBP)) {
-                    return true;
-                }
-                if (o.kind == mc.K_MEM) and
-                   ((o.slot >= 0) or (o.base == xe.RBP) or (o.base == xe.RSP) or (o.index == xe.RBP) or
-                    (o.index == xe.RSP)) {
-                    return true;
-                }
-            }
-            i = i.next;
-        }
-    }
-    return false;
-}
-
-// movups [rbp + disp], xmm (store) or movups xmm, [rbp + disp]
-fn xmm_rbp(x: i32, disp: i64, store: bool) void {
-    let r = x - xe.XMM0;
-    if r >= 8 {
-        b8(0x44);
-    }
-    b8(0x0f);
-    if store {
-        b8(0x11);
-    } else {
-        b8(0x10);
-    }
-    b8(0x85 | (@as(u64, @bit_cast(u32, r & 7)) << 3));
-    E.b.u32_(@bit_cast(u64, disp));
-}
-
-fn xmm_save_off(k: i64) i64 {
-    return -((8 * nsaved) + (16 * (k + 1)));
-}
-
-fn epilogue() void {
-    if frameless or in_noframe {
-        b8(0xc3);
-        return;
-    }
-    for k in 0..nxsaved {
-        xmm_rbp(xsaved[@int_cast(usize, k)], xmm_save_off(k), false);
-    }
-    if nsaved > 0 {
-        // lea rsp, [rbp - 8*nsaved]
-        b8(0x48);
-        b8(0x8d);
-        let d = -8 * nsaved;
-        if d >= -128 {
-            b8(0x65);
-            b8(@bit_cast(u64, d));
-        } else {
-            b8(0xa5);
-            E.b.u32_(@bit_cast(u64, d));
-        }
-        let mut k = nsaved;
-        while k > 0 {
-            k -= 1;
-            let r = saved[@int_cast(usize, k)];
-            if r >= 8 {
-                b8(0x41);
-            }
-            b8(0x58 + @as(u64, @bit_cast(u32, r & 7)));
-        }
-    } else {
-        b8(0xc9);  // leave
-        b8(0xc3);
-        return;
-    }
-    b8(0x5d);
-    b8(0xc3);
-}
-
-// Windows: a function's line table, into .axiom.lines for plink.ax (which
-// writes the PDB). The section is a series of records: 'F', a file's path
-// (u32 length, bytes; files are numbered in order), or 'P', a function: its
-// symbol's name (u32 length, bytes), the number of rows, and rows of code
-// offset, file number and line (u32 each). rows: offset << 32 | ir.src_loc.
-let mut line_file: [4096]u32 = [0; 4096];  // file id -> its number + 1 in the section
-let mut nline_files: u32 = 0;
-
-fn emit_lines(name: []u8, rows: []u64) void {
-    let sec = OBJ.secs.get(@int_cast(usize, LINES));
-    let d = &mut sec.data;
-    for r in rows {
-        let file = ir.src_file(@truncate(u32, r));
-        let k = @as(usize, @bit_cast(u32, file));
-        if line_file[k] == 0 {
-            let path = u.real_path(u.file_of(file).path);
-            d.u8_('F');
-            d.u32_(@as(u64, path.len));
-            d.put(path);
-            nline_files += 1;
-            line_file[k] = nline_files;
-        }
-    }
-    d.u8_('P');
-    d.u32_(@as(u64, name.len));
-    d.put(name);
-    d.u32_(@as(u64, rows.len));
-    for r in rows {
-        let src = @truncate(u32, r);
-        d.u32_(r >> 32);
-        d.u32_(@as(u64, line_file[@as(usize, @bit_cast(u32, ir.src_file(src)))] - 1));
-        d.u32_(@as(u64, ir.src_line(src)));
-    }
-}
-
-// Windows: what the prologue did, step by step, for the function's unwind
-// information (see unwind_info).
-const UW_PUSH: u32 = 0;   // pushed register `reg`
-const UW_ALLOC: u32 = 1;  // lowered rsp by `val`
-const UW_XMM: u32 = 2;    // stored xmm `reg` at [rsp + val]
-
-struct UnwindStep {
-    off: u64,  // the code offset just after it
-    op: u32,
-    reg: u32,
-    val: u64,
-}
-
-let mut uw: [24]UnwindStep = [UnwindStep.{ off: 0, op: 0, reg: 0, val: 0 }; 24];
-let mut nuw: usize = 0;
-let mut prologue_end: u64 = 0;
-
-fn uw_step(op: u32, r: i32, val: u64) void {
-    uw[nuw] = UnwindStep.{ off: @as(u64, E.b.len()), op: op, reg: @bit_cast(u32, r), val: val };
-    nuw += 1;
-}
-
-fn prologue(sub: i64) void {
-    nuw = 0;
-    prologue_end = 0;
-    if frameless {
-        return;
-    }
-    b8(0x55);  // push rbp
-    uw_step(UW_PUSH, xe.RBP, 0);
-    b8(0x48);
-    b8(0x89);
-    b8(0xe5);  // mov rbp, rsp
-    for k in 0..@int_cast(usize, nsaved) {
-        let r = saved[k];
-        if r >= 8 {
-            b8(0x41);
-        }
-        b8(0x50 + @as(u64, @bit_cast(u32, r & 7)));
-        uw_step(UW_PUSH, r, 0);
-    }
-    if sub > 0 {
-        // touch each page of a large frame in order (stack guard)
-        let mut rem = sub;
-        while rem > 4096 {
-            b8(0x48);
-            b8(0x81);
-            b8(0xec);
-            E.b.u32_(4096);
-            // or qword [rsp], 0
-            b8(0x48);
-            b8(0x83);
-            b8(0x0c);
-            b8(0x24);
-            b8(0x00);
-            rem -= 4096;
-        }
-        b8(0x48);
-        b8(0x81);
-        b8(0xec);
-        E.b.u32_(@bit_cast(u64, rem));
-        uw_step(UW_ALLOC, 0, @bit_cast(u64, sub));
-    }
-    for k in 0..nxsaved {
-        xmm_rbp(xsaved[@int_cast(usize, k)], xmm_save_off(k), true);
-        // rbp - 8*nsaved - sub is rsp, so the save is at rsp + sub + its offset
-        uw_step(UW_XMM, xsaved[@int_cast(usize, k)] - xe.XMM0, @bit_cast(u64, sub + xmm_save_off(k) + (8 * nsaved)));
-    }
-    prologue_end = @as(u64, E.b.len());
-}
-
-// The function's UNWIND_INFO for Windows x64, which the system's stack
-// walker (exception dispatch, stack traces) needs for every function with a
-// frame: version 1, no handler, the prologue's size, the number of code
-// slots, no frame register (rsp stays put after the prologue, and rbp is
-// described as a saved register), then the codes in reverse order of the
-// prologue's steps: push (UWOP_PUSH_NONVOL), sub rsp (UWOP_ALLOC_SMALL or
-// _LARGE), xmm saves (UWOP_SAVE_XMM128_FAR, at an unscaled offset from rsp).
-// Offsets past 255 (only in prologues with large frames' probes) are
-// clamped.
-fn unwind_info() bn.Bytes {
-    let mut codes = bn.new_bytes();
-    let mut n: u64 = 0;
-    let mut k = nuw;
-    while k > 0 {
-        k -= 1;
-        let s = uw[k];
-        let off = @min(s.off, 255);
-        if s.op == UW_PUSH {
-            codes.u8_(@truncate(u8, off));
-            codes.u8_(@truncate(u8, 0 | (@as(u64, s.reg) << 4)));
-            n += 1;
-        } else if s.op == UW_ALLOC {
-            if s.val <= 128 {
-                codes.u8_(@truncate(u8, off));
-                codes.u8_(@truncate(u8, 2 | (((s.val / 8) - 1) << 4)));
-                n += 1;
-            } else if s.val <= 524280 {
-                codes.u8_(@truncate(u8, off));
-                codes.u8_(@truncate(u8, 1));
-                codes.u16_(s.val / 8);
-                n += 2;
-            } else {
-                codes.u8_(@truncate(u8, off));
-                codes.u8_(@truncate(u8, 1 | (1 << 4)));
-                codes.u32_(s.val);
-                n += 3;
-            }
-        } else {
-            codes.u8_(@truncate(u8, off));
-            codes.u8_(@truncate(u8, 9 | (@as(u64, s.reg) << 4)));
-            codes.u32_(s.val);
-            n += 3;
-        }
-    }
-    if (n & 1) != 0 {
-        codes.u16_(0);  // an even number of slots
-    }
-    let mut b = bn.new_bytes();
-    b.u8_(1);
-    b.u8_(@truncate(u8, @min(prologue_end, 255)));
-    b.u8_(@truncate(u8, n));
-    b.u8_(0);
-    b.put(codes.view());
-    codes.free();
-    return b;
-}
-
-// Windows: the function placed at `base` in .text with `size` bytes gets its
-// unwind information in .xdata and an entry in .pdata (start, end, unwind
-// information: addresses relative to the image, which plink.ax resolves).
-fn emit_unwind(fs: u32, base: u64, size: u64) void {
-    let x = OBJ.secs.get(@int_cast(usize, XDATA));
-    x.data.align(4);
-    let xoff = @as(u64, x.data.len());
-    let mut info = unwind_info();
-    x.data.put(info.view());
-    info.free();
-    let p = OBJ.secs.get(@int_cast(usize, PDATA));
-    let poff = @as(u64, p.data.len());
-    p.data.zeros(12);
-    p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_X86_64_RVA32, sym: fs, addend: 0 });
-    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, size) });
-    p.relocs.push(elf.Rel.{ off: poff + 8, ty: elf.R_X86_64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
-}
-
-fn enc_sse(i: *mut mc.MInst) void {
-    let id = i.cc;
-    let d = xe.desc(id);
-    let o0 = i.ops[0];
-    let o1 = i.ops[1];
-    let o2 = i.ops[2];
-    let o3 = i.ops[3];
-    let mut rf: i32 = 0;
-    if o0.kind == mc.K_REG {
-        rf = P(o0.reg);
-    }
-    let mut vv: i32 = -1;
-    if o2.kind == mc.K_REG {
-        vv = P(o2.reg);
-    }
-    let has_imm = o3.kind == mc.K_IMM;
-    let wide = i.sz == 8;
-    let mut vl: u64 = 0;  // (sz 32: a 256-bit operation, 64: a 512-bit one)
-    if i.sz == 32 {
-        vl = 1;
-    } else if i.sz == 64 {
-        vl = 2;
-    }
-    if o1.kind == mc.K_REG {
-        let m = xe.Mem.{ base: -1, index: -1, scale: 0, disp: 0, sym: -1, tpoff: false };
-        xe.sse(&mut E, id, rf, P(o1.reg), &m, vv, o3.disp, has_imm, wide, vl,
-               (@bit_cast(u64, i.aux) & 15) | (@bit_cast(u64, i.aux) & 32));
-    } else {
-        let mut m = to_mem(o1);
-        xe.sse(&mut E, id, rf, -1, &m, vv, o3.disp, has_imm, wide, vl, @bit_cast(u64, i.aux) & 63);
-    }
-    _ = d;
-}
-
-fn enc_inst(i: *mut mc.MInst) void {
-    let op = i.op;
-    let sz = i.sz;
-    // thread-local memory addressed relative to the fs segment
-    for k in 0..i.ops.len {
-        if (i.ops[k].kind == mc.K_MEM) and (i.ops[k].slot == -3) {
-            b8(0x64);
-            break;
-        }
-    }
-    if op == xe.MOV_RR {
-        let d = P(i.ops[0].reg);
-        let s = P(i.ops[1].reg);
-        if d == s {
-            return;
-        }
-        enc_op(sz, 1, 0x8b, 0, d, R(i.ops[1].reg), 0, false);
-        return;
-    }
-    if op == xe.MOV_RI {
-        let d = P(i.ops[0].reg);
-        let x = i.ops[1].disp;
-        if sz == 8 and not ((x >= 0) and (x <= 0xffff_ffff)) {
-            if is.fits32(x) {
-                b8(0x48 | @as(u64, @bit_cast(u32, (d >> 3) & 1)));
-                b8(0xc7);
-                b8(0xc0 | @as(u64, @bit_cast(u32, d & 7)));
-                E.b.u32_(@bit_cast(u64, x));
-                return;
-            }
-            b8(0x48 | @as(u64, @bit_cast(u32, (d >> 3) & 1)));
-            b8(0xb8 + @as(u64, @bit_cast(u32, d & 7)));
-            E.b.u64_(@bit_cast(u64, x));
-            return;
-        }
-        if d >= 8 {
-            b8(0x41);
-        }
-        b8(0xb8 + @as(u64, @bit_cast(u32, d & 7)));
-        E.b.u32_(@bit_cast(u64, x));
-        return;
-    }
-    if op == xe.LOAD {
-        let d = P(i.ops[0].reg);
-        let m = i.ops[1];
-        if m.scale == 99 {
-            // mov r64, [rip + sym@GOTPCREL]
-            b8(0x48 | (@as(u64, @bit_cast(u32, (d >> 3) & 1)) << 2));
-            b8(0x8b);
-            b8(0x05 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
-            E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_REX_GOTPCRELX, sym: m.sym,
-                                     addend: -4 });
-            E.b.u32_(0);
-            return;
-        }
-        let k = i.cc;
-        if (k == 1) and (sz <= 2) {
-            enc_op(4, 2, 0x0f, u.pick(sz == 1, "\xb6", "\xb7")[0], d, m, 0, false);
-            return;
-        }
-        if (k == 2) and (sz <= 2) {
-            enc_op(4, 2, 0x0f, u.pick(sz == 1, "\xbe", "\xbf")[0], d, m, 0, false);
-            return;
-        }
-        if sz == 1 {
-            enc_op(4, 2, 0x0f, 0xb6, d, m, 0, false);
-            return;
-        }
-        enc_op(sz, 1, 0x8b, 0, d, m, 0, false);
-        return;
-    }
-    if op == xe.STORE {
-        let s = P(i.ops[1].reg);
-        enc_op_sz(sz, 1, 0x88, 0, s, false, i.ops[0], 0);
-        return;
-    }
-    if op == xe.STORE_I {
-        let x = i.ops[1].disp;
-        enc_op_sz(sz, 1, 0xc6, 0, 0, true, i.ops[0], imm_len(sz));
-        enc_imm(x, imm_len(sz));
-        return;
-    }
-    if op == xe.LEA {
-        enc_op(u.pick(sz == 4, "\x04", "\x08")[0], 1, 0x8d, 0, P(i.ops[0].reg), i.ops[1], 0, false);
-        return;
-    }
-    if op == xe.ALU {
-        let digit = i.cc;
-        let d = P(i.ops[0].reg);
-        let s = i.ops[1];
-        if s.kind == mc.K_IMM {
-            // (the destination may be memory: cmp [m], k)
-            let x = s.disp;
-            let rm = i.ops[0];
-            if (sz != 1) and (x >= -128) and (x <= 127) {
-                enc_op(sz, 1, 0x83, 0, digit, rm, 1, false);
-                enc_imm(x, 1);
-            } else {
-                enc_op_sz(sz, 1, 0x80, 0, digit, true, rm, imm_len(sz));
-                enc_imm(x, imm_len(sz));
-            }
-            return;
-        }
-        let base = @truncate(u8, @bit_cast(u32, digit)) * 8;
-        if i.ops[0].kind == mc.K_MEM {
-            // op [m], r
-            let r = P(s.reg);
-            enc_op_sz(sz, 1, base, 0, r, false, i.ops[0], 0);
-            return;
-        }
-        enc_op_sz(sz, 1, base + 2, 0, d, false, s, 0);
-        return;
-    }
-    if op == xe.TEST {
-        let a = i.ops[0];
-        let s = i.ops[1];
-        if s.kind == mc.K_IMM {
-            enc_op_sz(sz, 1, 0xf6, 0, 0, true, a, imm_len(sz));
-            enc_imm(s.disp, imm_len(sz));
-            return;
-        }
-        enc_op_sz(sz, 1, 0x84, 0, P(s.reg), false, a, 0);
-        return;
-    }
-    if op == xe.IMUL {
-        enc_op(sz, 2, 0x0f, 0xaf, P(i.ops[0].reg), i.ops[1], 0, false);
-        return;
-    }
-    if op == xe.IMUL_I {
-        let x = i.ops[2].disp;
-        if (x >= -128) and (x <= 127) {
-            enc_op(sz, 1, 0x6b, 0, P(i.ops[0].reg), i.ops[1], 1, false);
-            enc_imm(x, 1);
-        } else {
-            enc_op(sz, 1, 0x69, 0, P(i.ops[0].reg), i.ops[1], 4, false);
-            enc_imm(x, 4);
-        }
-        return;
-    }
-    if op == xe.SHIFT {
-        let digit = i.cc;
-        let dst = i.ops[0];
-        if i.ops[2].kind == mc.K_IMM {
-            enc_op_sz(sz, 1, 0xc0, 0, digit, true, dst, 1);
-            enc_imm(i.ops[2].disp, 1);
-        } else {
-            enc_op_sz(sz, 1, 0xd2, 0, digit, true, dst, 0);
-        }
-        return;
-    }
-    if op == xe.SHIFTX {
-        // VEX.LZ.{66,F2,F3}.0F38.W F7 /r: reg = dst, rm = src, vvvv = count
-        let d = P(i.ops[0].reg);
-        let s = P(i.ops[1].reg);
-        let c = P(i.ops[2].reg);
-        let mut pp: u64 = 1;
-        if i.cc == 1 {
-            pp = 3;
-        } else if i.cc == 2 {
-            pp = 2;
-        }
-        let mut w: u64 = 0;
-        if sz == 8 {
-            w = 1;
-        }
-        b8(0xc4);
-        b8(
-            ((((~@as(u64, @bit_cast(u32, d >> 3))) & 1) << 7) | (1 << 6)) | (
-                (((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2));
-        b8(((w << 7) | (((~@as(u64, @bit_cast(u32, c))) & 15) << 3)) | pp);
-        b8(0xf7);
-        xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, d)), @as(u64, @bit_cast(u32, s)));
-        return;
-    }
-    if op == xe.BLS {
-        // VEX.LZ.0F38.W F3 /cc: vvvv = dst, rm = src
-        let d = P(i.ops[0].reg);
-        let s = P(i.ops[1].reg);
-        let mut w: u64 = 0;
-        if sz == 8 {
-            w = 1;
-        }
-        b8(0xc4);
-        b8((1 << 7) | ((1 << 6) | ((((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2)));
-        b8((w << 7) | (((~@as(u64, @bit_cast(u32, d))) & 15) << 3));
-        b8(0xf3);
-        xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, i.cc)), @as(u64, @bit_cast(u32, s)));
-        return;
-    }
-    if op == xe.ANDN {
-        // VEX.LZ.0F38.W F2 /r: reg = dst, vvvv = the negated source, rm = the other
-        let d = P(i.ops[0].reg);
-        let s = P(i.ops[1].reg);
-        let c = P(i.ops[2].reg);
-        let mut w: u64 = 0;
-        if sz == 8 {
-            w = 1;
-        }
-        b8(0xc4);
-        b8(
-            ((((~@as(u64, @bit_cast(u32, d >> 3))) & 1) << 7) | (1 << 6)) | (
-                (((~@as(u64, @bit_cast(u32, s >> 3))) & 1) << 5) | 2));
-        b8((w << 7) | (((~@as(u64, @bit_cast(u32, c))) & 15) << 3));
-        b8(0xf2);
-        xe.modrm_rr(&mut E, @as(u64, @bit_cast(u32, d)), @as(u64, @bit_cast(u32, s)));
-        return;
-    }
-    if op == xe.UNARY {
-        if i.cc == 8 {
-            // bswap: 0F C8+r
-            let r = P(i.ops[0].reg);
-            let mut v: u64 = @as(u64, @bit_cast(u32, r & 15)) >> 3;
-            if sz == 8 {
-                v = v | 8;
-            }
-            if v != 0 {
-                b8(0x40 | v);
-            }
-            b8(0x0f);
-            b8(0xc8 + @as(u64, @bit_cast(u32, r & 7)));
-            return;
-        }
-        enc_op_sz(sz, 1, 0xf6, 0, i.cc, true, i.ops[0], 0);
-        return;
-    }
-    if op == xe.EXT {
-        let d = P(i.ops[0].reg);
-        let s = i.ops[1];
-        let k = i.cc;
-        if k == 1 {
-            enc_op2(4, 2, 0x0f, 0xb6, d, s, 0, false, true);
-        } else if k == 2 {
-            enc_op(4, 2, 0x0f, 0xb7, d, s, 0, false);
-        } else if k == 3 {
-            enc_op2(sz, 2, 0x0f, 0xbe, d, s, 0, false, true);
-        } else if k == 4 {
-            enc_op(sz, 2, 0x0f, 0xbf, d, s, 0, false);
-        } else if k == 5 {
-            enc_op(8, 1, 0x63, 0, d, s, 0, false);
-        } else {
-            enc_op(4, 1, 0x8b, 0, d, s, 0, false);
-        }
-        return;
-    }
-    if op == xe.CQO {
-        if sz == 8 {
-            b8(0x48);
-        }
-        b8(0x99);
-        return;
-    }
-    if op == xe.DIV {
-        enc_op(sz, 1, 0xf7, 0, i.cc, i.ops[2], 0, false);
-        return;
-    }
-    if op == xe.SETCC {
-        enc_op2(1, 2, 0x0f, 0x90 + @truncate(u8, @bit_cast(u32, i.cc)), 0, i.ops[0], 0, false, true);
-        return;
-    }
-    if op == xe.CMOV {
-        enc_op(sz, 2, 0x0f, 0x40 + @truncate(u8, @bit_cast(u32, i.cc)), P(i.ops[0].reg), i.ops[1], 0, false);
-        return;
-    }
-    if op == xe.BITSCAN {
-        let k = i.cc;
-        if k >= 2 {
-            b8(0xf3);
-        }
-        let mut opc: u8 = 0xbc;
-        if (k == 1) or (k == 3) {
-            opc = 0xbd;
-        } else if k == 4 {
-            opc = 0xb8;
-        }
-        enc_op(sz, 2, 0x0f, opc, P(i.ops[0].reg), i.ops[1], 0, false);
-        return;
-    }
-    if op == xe.JMP {
-        enc_jump(i.ops[0].label, false, 0);
-        return;
-    }
-    if op == xe.JCC {
-        enc_jump(i.ops[0].label, true, i.cc);
-        return;
-    }
-    if op == xe.LABEL {
-        let l = @truncate(i32, i.aux) - xe.LOCAL_BASE;
-        while local_off.len <= @int_cast(usize, l) {
-            local_off.push(0);
-        }
-        local_off.set(@int_cast(usize, l), @as(u64, E.b.len()));
-        return;
-    }
-    if op == xe.CALL {
-        let t = i.ops[0];
-        if UPPER {
-            vzeroupper();
-        }
-        if frameless or in_noframe {
-            // sub rsp, 8: the call (which does not return) needs rsp aligned
-            b8(0x48);
-            b8(0x83);
-            b8(0xec);
-            b8(0x08);
-        }
-        if t.kind == mc.K_SYM {
-            b8(0xe8);
-            E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
-            E.b.u32_(0);
-        } else {
-            enc_op(4, 1, 0xff, 0, 2, t, 0, false);
-        }
-        return;
-    }
-    if op == xe.RET {
-        if UPPER {
-            vzeroupper();
-        }
-        epilogue();
-        return;
-    }
-    if op == xe.UD2 {
-        b8(0x0f);
-        b8(0x0b);
-        return;
-    }
-    if op == xe.XCHG {
-        let r = P(i.ops[1].reg);
-        enc_op_sz(sz, 1, 0x86, 0, r, false, i.ops[0], 0);
-        return;
-    }
-    if op == xe.XADD {
-        b8(0xf0);
-        let r = P(i.ops[1].reg);
-        enc_op_sz(sz, 2, 0x0f, 0xc0, r, false, i.ops[0], 0);
-        return;
-    }
-    if op == xe.CMPXCHG {
-        b8(0xf0);
-        let r = P(i.ops[1].reg);
-        enc_op_sz(sz, 2, 0x0f, 0xb0, r, false, i.ops[0], 0);
-        return;
-    }
-    if op == xe.MFENCE {
-        b8(0x0f);
-        b8(0xae);
-        b8(0xf0);
-        return;
-    }
-    if op == xe.PREFETCH {
-        enc_op(4, 2, 0x0f, u.pick(i.cc == 1, "\x0d", "\x18")[0], 1, i.ops[0], 0, false);
-        return;
-    }
-    if op == xe.CPUID {
-        b8(0x0f);
-        b8(0xa2);
-        return;
-    }
-    if op == xe.BT {
-        // [REX] 0F A3 /r: bt r/m, r (cc 1: bts 0F AB, 2: btr 0F B3, 3: btc 0F BB)
-        let opc: [4]u8 = [0xa3, 0xab, 0xb3, 0xbb];
-        enc_op(i.sz, 2, 0x0f, opc[@int_cast(usize, i.cc & 3)], P(i.ops[1].reg), i.ops[0], 0, false);
-        return;
-    }
-    if op == xe.CRC32 {
-        // [66] F2 [REX] 0F 38 F0/F1 /r: crc32 r32/r64, r/m8/16/32/64
-        let r = P(i.ops[0].reg);
-        let m = P(i.ops[1].reg);
-        if i.sz == 2 {
-            b8(0x66);
-        }
-        b8(0xf2);
-        let mut rex: u64 = 0;
-        if i.sz == 8 {
-            rex = rex | 8;
-        }
-        if r >= 8 {
-            rex = rex | 4;
-        }
-        if m >= 8 {
-            rex = rex | 1;
-        }
-        if (rex != 0) or ((i.sz == 1) and (m >= 4)) {
-            b8(0x40 | rex);
-        }
-        b8(0x0f);
-        b8(0x38);
-        if i.sz == 1 {
-            b8(0xf0);
-        } else {
-            b8(0xf1);
-        }
-        b8(0xc0 | ((@as(u64, @bit_cast(u32, r)) & 7) << 3) | (@as(u64, @bit_cast(u32, m)) & 7));
-        return;
-    }
-    if op == xe.XGETBV {
-        b8(0x0f);
-        b8(0x01);
-        b8(0xd0);
-        return;
-    }
-    if op == xe.TLSBASE {
-        let d = P(i.ops[0].reg);
-        if WIN {
-            // mov d, gs:[0x58]
-            b8(0x65);
-            b8(0x48 | (@as(u64, @bit_cast(u32, (d >> 3) & 1)) << 2));
-            b8(0x8b);
-            b8(0x04 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
-            b8(0x25);
-            E.b.u32_(0x58);
-            return;
-        }
-        b8(0x64);
-        b8(0x48 | (@as(u64, @bit_cast(u32, (d >> 3) & 1)) << 2));
-        b8(0x8b);
-        b8(0x04 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
-        b8(0x25);
-        E.b.u32_(0);
-        return;
-    }
-    if op == xe.SSE {
-        if not noop_move(i) {
-            enc_sse(i);
-        }
-        return;
-    }
-    if op == xe.REP {
-        if i.cc == 0 {
-            b8(0xf3);
-            b8(0xa4);
-        } else if i.cc == 1 {
-            b8(0xf3);
-            b8(0xaa);
-        } else {
-            // memmove: backwards when the destination overlaps the source's end
-            // mov rax, rdi; sub rax, rsi; cmp rax, rcx; jae fwd
-            let seq: [9]u8 = [0x48, 0x89, 0xf8, 0x48, 0x29, 0xf0, 0x48, 0x39, 0xc8];
-            E.b.put(seq[..]);
-            b8(0x73);
-            b8(0x10);  // jae +16 (over the backward copy)
-            // lea rsi, [rsi+rcx-1]; lea rdi, [rdi+rcx-1]; std; rep movsb; cld; jmp done
-            let back: [17]u8 = [0x48, 0x8d, 0x74, 0x0e, 0xff, 0x48, 0x8d, 0x7c, 0x0f, 0xff, 0xfd, 0xf3, 0xa4, 0xfc,
-                                0xeb, 0x02, 0x90];
-            E.b.put(back[0..16]);
-            // fwd: rep movsb
-            b8(0xf3);
-            b8(0xa4);
-        }
-        return;
-    }
-    if op == xe.NOP {
-        return;
-    }
-    fail(u.f1("cannot encode machine op %s", u.idec(op)));
-}
-
-// After allocation: blocks that only jump (their phi copies became no-op
-// moves) are bypassed, and a branch to the block that follows becomes a
-// fall-through (`jcc next; jmp x` is `j!cc x`). Returns the skipped blocks.
-fn noop_move(i: *mc.MInst) bool {
-    if (i.op == xe.SSE) and (i.cc == xe.MOVAPS) {
-        return (i.ops[0].kind == mc.K_REG) and (i.ops[1].kind == mc.K_REG) and (P(i.ops[0].reg) == P(i.ops[1].reg));
-    }
-    return (i.op == xe.MOV_RR) and (P(i.ops[0].reg) == P(i.ops[1].reg));
-}
-
-fn jump_target(b: *mc.MBlock) i32 {
-    let mut i = b.first;
-    while u.notnil(i) and (noop_move(i) or (i.op == xe.LABEL)) {
-        i = i.next;
-    }
-    if u.notnil(i) and (i.op == xe.JMP) and u.isnil(i.next) and (i.ops[0].label < xe.LOCAL_BASE) {
-        return i.ops[0].label;
-    }
-    return -1;
-}
-
-fn ends_flow(b: *mc.MBlock) bool {
-    let l = b.last;
-    return u.notnil(l) and ((l.op == xe.JMP) or (l.op == xe.RET) or (l.op == xe.UD2));
-}
-
-// Does the code after block bi start with block t (with nothing encoded
-// between)?
-fn falls_to(skip: []bool, bi: usize, t: i32) bool {
-    let nb = MF.blocks.len;
-    let mut k = bi + 1;
-    while k < nb {
-        if @int_cast(usize, t) == k {
-            return true;
-        }
-        if not skip[k] {
-            let mut i = MF.blocks.get(k).first;
-            while u.notnil(i) {
-                if not noop_move(i) and (i.op != xe.LABEL) {
-                    return false;
-                }
-                i = i.next;
-            }
-        }
-        k += 1;
-    }
-    return false;
-}
-
-// Jumps to a local label that nothing but no-op moves and labels precede.
-fn drop_local_jumps(b: *mut mc.MBlock) void {
-    let mut i = b.first;
-    while u.notnil(i) {
-        let nx = i.next;
-        if (i.op == xe.JMP) and (i.ops[0].label >= xe.LOCAL_BASE) {
-            let mut j = nx;
-            while u.notnil(j) and (noop_move(j) or ((j.op == xe.LABEL) and (j.aux != @as(i64, i.ops[0].label)))) {
-                j = j.next;
-            }
-            if u.notnil(j) and (j.op == xe.LABEL) and (j.aux == @as(i64, i.ops[0].label)) {
-                mc.remove(b, i);
-            }
-        }
-        i = nx;
-    }
-}
-
-// After allocation, where nothing reads the flags before they are set
-// again: `mov r, 0` becomes `xor r32, r32` (shorter, and a zeroing idiom),
-// and `mov d, a; add d, b|k` (or sub k) becomes `lea d, [a + b|k]`. Flags
-// are never live into a block, except one whose test dup_exit_tests dropped
-// (live out of the block falling into it); a label or jump makes them live
-// (conservatively), as do the instructions that read them.
-fn peephole(b: *mut mc.MBlock) void {
-    let mut live = flags_live_out(b);  // (after i)
-    let mut i = b.last;
-    while u.notnil(i) {
-        let op = i.op;
-        if not live and three_address(b, i) {
-            i = i.prev;
-            continue;
-        }
-        if (op == xe.JMP) and (i.ops[0].label < xe.LOCAL_BASE) {
-            live = false;  // (to another block)
-        } else if (op == xe.JCC) or (op == xe.CMOV) or (op == xe.SETCC) or (op == xe.JMP) or (op == xe.LABEL) {
-            live = true;
-        } else if (op == xe.ALU) or (op == xe.TEST) or (op == xe.CMP_M) or (op == xe.BT) or (op == xe.CALL) {
-            live = false;
-        } else if (op == xe.MOV_RI) and (i.ops[1].disp == 0) and not live {
-            i.op = xe.ALU;
-            i.cc = xe.ALU_XOR;
-            i.sz = 4;
-            i.ops[1] = i.ops[0];
-        }
-        i = i.prev;
-    }
-}
-
-// A compare of registers (or a register and a constant) that an identical
-// earlier one in the block makes redundant, with nothing between that sets
-// the flags or writes the registers, is dropped (before allocation, and
-// again after it, when copies may have made two compares the same).
-fn reuse_flags(b: *mut mc.MBlock) void {
-    let mut last = u.nil.[mc.MInst]();
-    let mut i = b.first;
-    while u.notnil(i) {
-        let nx = i.next;
-        let op = i.op;
-        let is_cmp = (((op == xe.ALU) and (i.cc == xe.ALU_CMP)) or (op == xe.TEST)) and (i.ops[0].kind == mc.K_REG) and
-                     ((i.ops[1].kind == mc.K_REG) or (i.ops[1].kind == mc.K_IMM));
-        if is_cmp {
-            if u.notnil(last) and (last.op == op) and (last.sz == i.sz) and (last.cc == i.cc) and
-               same_mop(last.ops[0], i.ops[0]) and same_mop(last.ops[1], i.ops[1]) {
-                mc.remove(b, i);
-            } else if u.notnil(last) and sub_of_copy(last, i) {
-                mc.remove(b, i);  // (`mov d, a; sub d, x` set the flags of `cmp a, x`)
-            } else if u.notnil(last) and (op == xe.TEST) and same_mop(i.ops[0], i.ops[1]) and (last.sz == i.sz) and
-                      sets_flags_of(last) and same_mop(last.ops[0], i.ops[0]) and
-                      flags_read_as_test(i, logic_flags(last)) {
-                mc.remove(b, i);  // (the flags of the operation that computed the register)
-            } else if (((op == xe.TEST) and same_mop(i.ops[0], i.ops[1])) or
-                       ((op == xe.ALU) and (i.ops[1].kind == mc.K_IMM) and (i.ops[1].disp == 0))) and
-                      sink_setter(b, i) {
-                mc.remove(b, i);  // (that operation moved down to here)
-            } else {
-                last = i;
-            }
-        } else if sets_flags_of(i) {
-            last = i;
-        } else if (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or (op == xe.STORE_I) or
-                  (op == xe.LEA) or (op == xe.EXT) or (op == xe.SETCC) or (op == xe.CMOV) or (op == xe.SHIFTX) or
-                  (op == xe.JCC) or
-                  ((op == xe.SSE) and (i.cc != xe.UCOMISS) and (i.cc != xe.UCOMISD) and (i.cc != xe.PTEST) and
-                   (i.cc != xe.KORTESTQ)) {
-            if u.notnil(last) and writes_reg_of(i, last) {
-                last = u.nil.[mc.MInst]();
-            }
-        } else {
-            last = u.nil.[mc.MInst]();
-        }
-        i = nx;
-    }
-}
-
-// Is s a `sub d, x` right after `mov d, a`, and c a `cmp a, x` of the same
-// size, with a not written between (s then set the flags c would)?
-fn sub_of_copy(s: *mc.MInst, c: *mc.MInst) bool {
-    if (s.op != xe.ALU) or (s.cc != xe.ALU_SUB) or (c.op != xe.ALU) or (c.cc != xe.ALU_CMP) or (s.sz != c.sz) or
-       (s.ops[0].kind != mc.K_REG) or not same_mop(s.ops[1], c.ops[1]) {
-        return false;
-    }
-    let mv = s.prev;
-    if u.isnil(mv) or (mv.op != xe.MOV_RR) or (mv.sz < s.sz) or (P(mv.ops[0].reg) != P(s.ops[0].reg)) or
-       not same_mop(mv.ops[1], c.ops[0]) or (P(mv.ops[1].reg) == P(s.ops[0].reg)) {
-        return false;
-    }
-    let a = P(c.ops[0].reg);
-    let mut j = s.next;
-    while u.notnil(j) and (@int_from_ptr(j) != @int_from_ptr(c)) {
-        if writes_phys(j, a) {
-            return false;
-        }
-        j = j.next;
-    }
-    return u.notnil(j);
-}
-
-// test r, r (t) after the operation that last wrote r in the block, which
-// sets the flags as it would, with nothing between naming that operation's
-// registers or reading the flags: the operation moves down to t, which is
-// then not needed (blsr early in a loop body, its test at the end). True if
-// it did.
-fn sink_setter(b: *mut mc.MBlock, t: *mut mc.MInst) bool {
-    let r = P(t.ops[0].reg);
-    let mut w = t.prev;
-    while u.notnil(w) and (noop_move(w) or not writes_phys(w, r)) {
-        let op = w.op;
-        if (op == xe.LABEL) or (op == xe.JMP) or (op == xe.JCC) or (op == xe.CALL) {
-            return false;
-        }
-        w = w.prev;
-    }
-    if u.isnil(w) {
-        return false;
-    }
-    // what reads the flags between reads another instruction's, set after w
-    let mut from_w = true;
-    let mut x = w.next;
-    while x != t {
-        let op = x.op;
-        let reads = (op == xe.SETCC) or (op == xe.CMOV) or
-                    ((op == xe.ALU) and ((x.cc == xe.ALU_ADC) or (x.cc == xe.ALU_SBB)));
-        if reads and from_w {
-            return false;
-        }
-        if not keeps_flags(x) {
-            from_w = false;
-        }
-        x = x.next;
-    }
-    if u.isnil(w) or not sets_flags_of(w) or (w.sz != t.sz) or not flags_read_as_test(t, logic_flags(w)) {
-        return false;
-    }
-    for k in 0..w.ops.len {
-        let o = w.ops[k];
-        if (o.kind != mc.K_REG) and (o.kind != mc.K_IMM) and (o.kind != mc.K_NONE) {
-            return false;
-        }
-    }
-    let mut j = w.next;
-    while j != t {
-        if touches_any(j, w) {
-            return false;
-        }
-        j = j.next;
-    }
-    if w.next == t {
-        return false;  // (reuse_flags' own case)
-    }
-    mc.remove(b, w);
-    mc.insert_before(b, t, w);
-    return true;
-}
-
-// Does i leave the flags as they are?
-fn keeps_flags(i: *mc.MInst) bool {
-    let op = i.op;
-    return (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or (op == xe.STORE_I) or
-           (op == xe.LEA) or (op == xe.EXT) or (op == xe.SETCC) or (op == xe.CMOV) or (op == xe.SHIFTX) or
-           ((op == xe.SSE) and (i.cc != xe.UCOMISS) and (i.cc != xe.UCOMISD) and (i.cc != xe.PTEST) and
-            (i.cc != xe.KORTESTQ));
-}
-
-// Does i set ZF and SF from the register it writes (its first operand), as
-// test r, r would? (and, or, xor, add, sub; andn, blsr, blsmsk, blsi)
-fn sets_flags_of(i: *mc.MInst) bool {
-    if (i.ops.len == 0) or (i.ops[0].kind != mc.K_REG) {
-        return false;
-    }
-    if i.op == xe.ALU {
-        return (i.cc == xe.ALU_ADD) or (i.cc == xe.ALU_OR) or (i.cc == xe.ALU_AND) or (i.cc == xe.ALU_SUB) or
-               (i.cc == xe.ALU_XOR);
-    }
-    return (i.op == xe.ANDN) or (i.op == xe.BLS);
-}
-
-// Does i also clear CF and OF, as test does (and, or, xor, andn)?
-fn logic_flags(i: *mc.MInst) bool {
-    return ((i.op == xe.ALU) and ((i.cc == xe.ALU_OR) or (i.cc == xe.ALU_AND) or (i.cc == xe.ALU_XOR))) or
-           (i.op == xe.ANDN);
-}
-
-// Is what test t sets read only for ZF and SF (or for anything, when all) up
-// to the next instruction that sets the flags? (Flags are never live into a
-// block; a local label or jump is taken to read them.)
-fn flags_read_as_test(t: *mc.MInst, all: bool) bool {
-    let mut j = t.next;
-    while u.notnil(j) {
-        let op = j.op;
-        if (op == xe.JCC) or (op == xe.SETCC) or (op == xe.CMOV) {
-            if not all and (j.cc != xe.CC_E) and (j.cc != xe.CC_NE) and (j.cc != xe.CC_S) and (j.cc != xe.CC_NS) {
-                return false;
-            }
-        } else if (op == xe.LABEL) or ((op == xe.JMP) and (j.ops[0].label >= xe.LOCAL_BASE)) {
-            return false;
-        } else if op == xe.JMP {
-            return true;
-        } else if (op == xe.ALU) and ((j.cc == xe.ALU_ADC) or (j.cc == xe.ALU_SBB)) {
-            return false;  // (adc, sbb)
-        } else if (op == xe.ALU) or (op == xe.TEST) or (op == xe.CMP_M) or (op == xe.CALL) {
-            return true;
-        }
-        j = j.next;
-    }
-    return true;
-}
-
-// Likewise a compare into k1 that an identical earlier one in the block
-// makes redundant: nothing between writes k1 or the compared registers
-// (k1 is the only mask register the selection uses, so two masks used by
-// turns are compared again; this drops the repeats that are not).
-fn reuse_k1(b: *mut mc.MBlock) void {
-    let mut last = u.nil.[mc.MInst]();
-    let mut i = b.first;
-    while u.notnil(i) {
-        let nx = i.next;
-        let wk = writes_k1(i);
-        if wk and (i.op == xe.SSE) and ((i.aux & 1) == 0) and plain_ops(i) {
-            if u.notnil(last) and (last.cc == i.cc) and (last.sz == i.sz) and (last.aux == i.aux) and
-               (last.ops.len == i.ops.len) and same_ops(last, i) {
-                mc.remove(b, i);
-            } else {
-                last = i;
-            }
-        } else if wk or (i.op == xe.CALL) or (i.op == xe.LABEL) {
-            last = u.nil.[mc.MInst]();
-        } else if u.notnil(last) and writes_reg_of_any(i, last) {
-            last = u.nil.[mc.MInst]();
-        }
-        i = nx;
-    }
-}
-
-fn writes_k1(i: *mc.MInst) bool {
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) and (P(o.reg) == xe.K1) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Only registers, immediates and nothing as operands (no memory)?
-fn plain_ops(i: *mc.MInst) bool {
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if (o.kind != mc.K_REG) and (o.kind != mc.K_IMM) and (o.kind != mc.K_NONE) {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn same_ops(a: *mc.MInst, b: *mc.MInst) bool {
-    for k in 0..a.ops.len {
-        let x = a.ops[k];
-        let y = b.ops[k];
-        if (x.kind != y.kind) or ((x.kind != mc.K_NONE) and not same_mop(x, y)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Does i write a register that c reads?
-fn writes_reg_of_any(i: *mc.MInst, c: *mc.MInst) bool {
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) {
-            let r = P(o.reg);
-            for j in 0..c.ops.len {
-                if (c.ops[j].kind == mc.K_REG) and ((c.ops[j].role & mc.RU) != 0) and (P(c.ops[j].reg) == r) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-fn same_mop(a: mc.MOp, b: mc.MOp) bool {
-    if a.kind != b.kind {
-        return false;
-    }
-    if a.kind == mc.K_REG {
-        return P(a.reg) == P(b.reg);
-    }
-    return (a.kind == mc.K_IMM) and (a.disp == b.disp);
-}
-
-// Does i write a register that compare c reads?
-fn writes_reg_of(i: *mc.MInst, c: *mc.MInst) bool {
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) {
-            let r = P(o.reg);
-            for j in @as(usize, 0)..2 {
-                if (c.ops[j].kind == mc.K_REG) and (P(c.ops[j].reg) == r) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-// `mov d, a; add d, b|k` (sub k) as `lea d, [a + b|k]` at i (the add),
-// when d is not a; and `mov d, a; shl d, 1-3` as `lea d, [a * 2-8]`.
-fn three_address(b: *mut mc.MBlock, i: *mut mc.MInst) bool {
-    let mv = i.prev;
-    if (i.op == xe.SHIFT) and (i.cc == 4) and (i.ops[2].kind == mc.K_IMM) and (i.ops[2].disp >= 1) and
-       (i.ops[2].disp <= 3) and ((i.sz == 4) or (i.sz == 8)) and u.notnil(mv) and (mv.op == xe.MOV_RR) and
-       (i.ops[0].kind == mc.K_REG) {
-        // `mov d, a; shl d, k` as `lea d, [a * 2^k]`
-        let d = P(i.ops[0].reg);
-        if (P(mv.ops[0].reg) != d) or (P(mv.ops[1].reg) == d) or ((mv.sz != 8) and (i.sz == 8)) {
-            return false;
-        }
-        let a = mv.ops[1].reg;
-        let k = i.ops[2].disp;
-        let mut m = mc.mem(-1, a, @truncate(u8, @as(i64, 1) << @int_cast(u32, k)), 0);
-        if k == 1 {
-            m = mc.mem(a, a, 1, 0);
-        }
-        i.op = xe.LEA;
-        i.cc = 0;
-        i.ops[0] = W(i.ops[0].reg);
-        i.ops[1] = m;
-        i.ops[2] = NONE();
-        mc.remove(b, mv);
-        return true;
-    }
-    if (i.op != xe.ALU) or ((i.cc != xe.ALU_ADD) and (i.cc != xe.ALU_SUB)) or ((i.sz != 4) and (i.sz != 8)) or
-       u.isnil(mv) or (mv.op != xe.MOV_RR) or (i.ops[0].kind != mc.K_REG) {
-        return false;
-    }
-    let d = P(i.ops[0].reg);
-    if (P(mv.ops[0].reg) != d) or (P(mv.ops[1].reg) == d) or ((mv.sz != 8) and (i.sz == 8)) {
-        return false;
-    }
-    let a = mv.ops[1].reg;
-    let s = i.ops[1];
-    let mut m = mc.mem(a, -1, 0, 0);
-    if s.kind == mc.K_IMM {
-        let mut k = s.disp;
-        if i.cc == 5 {
-            k = 0 - k;
-        }
-        if not is.fits32(k) {
-            return false;
-        }
-        m.disp = k;
-    } else if (s.kind == mc.K_REG) and (i.cc == 0) and (P(s.reg) != d) {
-        m.index = s.reg;
-        m.scale = 1;
-    } else {
-        return false;
-    }
-    i.op = xe.LEA;
-    i.cc = 0;
-    i.ops[0] = W(i.ops[0].reg);
-    i.ops[1] = m;
-    mc.remove(b, mv);
-    return true;
-}
-
-fn tidy_branches() []mut bool {
-    let nb = MF.blocks.len;
-    let skip = u.newn.[bool](nb + 1);
-    let fin = u.newn.[i32](nb + 1);
-    for bi in 0..nb {
-        fin[bi] = @int_cast(i32, bi);
-    }
-    // where a jump to each block ends up
-    for bi in 1..nb {
-        if @as(i32, @int_cast(i32, bi)) == SW {
-            continue;  // (where the frame is set up: jumps there stay)
-        }
-        let mut t = jump_target(MF.blocks.get(bi));
-        let mut steps: usize = 0;
-        while (t >= 0) and (steps < nb) {
-            fin[bi] = t;
-            if t == SW {
-                break;
-            }
-            t = jump_target(MF.blocks.get(@int_cast(usize, t)));
-            steps += 1;
-        }
-    }
-    for bi in 0..nb {
-        let mut i = MF.blocks.get(bi).first;
-        while u.notnil(i) {
-            if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) {
-                i.ops[0].label = fin[@int_cast(usize, i.ops[0].label)];
-            }
-            i = i.next;
-        }
-    }
-    // bypassed blocks are left out (a block falling into one jumps instead)
-    for bi in 1..nb {
-        if fin[bi] == @int_cast(i32, bi) {
-            continue;
-        }
-        let prev = MF.blocks.get(bi - 1);
-        if not ends_flow(prev) {
-            let ops: [1]mc.MOp = [mc.label(fin[bi])];
-            mc.append(prev, mc.new_inst(xe.JMP, 0, ops[..]));
-        }
-        skip[bi] = true;
-    }
-    dup_exit_tests(skip);
-    // fall-throughs (into the next block, or past blocks that encode
-    // nothing: skipped ones, and ones left with only no-op moves; from the
-    // last block back, so that a chain of jumps to one place all go)
-    for bj in 0..nb {
-        let bi = nb - 1 - bj;
-        if skip[bi] {
-            continue;
-        }
-        drop_local_jumps(MF.blocks.get(bi));
-        reuse_flags(MF.blocks.get(bi));
-        reuse_k1(MF.blocks.get(bi));
-        peephole(MF.blocks.get(bi));
-        let b = MF.blocks.get(bi);
-        let l = b.last;
-        if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
-            continue;
-        }
-        if falls_to(skip, bi, l.ops[0].label) {
-            mc.remove(b, l);
-            continue;
-        }
-        let pj = l.prev;
-        if u.notnil(pj) and (pj.op == xe.JCC) and (pj.ops[0].label < xe.LOCAL_BASE) and
-           falls_to(skip, bi, pj.ops[0].label) {
-            pj.cc = is.invert(pj.cc);
-            pj.ops[0].label = l.ops[0].label;
-            mc.remove(b, l);
-        }
-    }
-    return skip;
-}
-
-// A compare that starts a block, after every jump into it (and the code
-// falling into it) has left the flags of that same compare: it goes (`cmp
-// x, 2; jle L` ... `L: cmp x, 2; jge M`, the two tests of an if-else
-// chain on one value).
-fn reuse_flags_across(skip: []bool) void {
-    let nb = MF.blocks.len;
-    // the compare each block starts with, if any
-    let first = u.calloc_slice.[*mut mc.MInst](nb + 1);
-    let bad = u.calloc_slice.[bool](nb + 1);
-    let npred = u.calloc_slice.[i32](nb + 1);
-    let mut any = false;
-    for bi in 1..nb {
-        if skip[bi] {
-            continue;
-        }
-        let mut c = MF.blocks.get(bi).first;
-        while u.notnil(c) and noop_move(c) {
-            c = c.next;
-        }
-        if u.notnil(c) and plain_compare(c) {
-            first[bi] = c;
-            any = true;
-        }
-    }
-    if any {
-        for pj in 0..nb {
-            if skip[pj] {
-                continue;
-            }
-            let p = MF.blocks.get(pj);
-            let mut j = p.first;
-            while u.notnil(j) {
-                if ((j.op == xe.JMP) or (j.op == xe.JCC)) and (j.ops.len > 0) and (j.ops[0].kind == mc.K_LABEL) and
-                   (j.ops[0].label >= 0) and (j.ops[0].label < @int_cast(i32, nb)) {
-                    let t = @int_cast(usize, j.ops[0].label);
-                    if u.notnil(first[t]) {
-                        npred[t] += 1;
-                        if not flags_hold(j, first[t]) {
-                            bad[t] = true;
-                        }
-                    }
-                }
-                j = j.next;
-            }
-        }
-        for bi in 1..nb {
-            let c = first[bi];
-            if u.isnil(c) or bad[bi] {
-                continue;
-            }
-            // the code falling in (the block before, past skipped ones)
-            let mut pj = bi - 1;
-            while (pj > 0) and skip[pj] {
-                pj -= 1;
-            }
-            let p = MF.blocks.get(pj);
-            if not skip[pj] and not ends_flow(p) {
-                if u.isnil(p.last) or not falls_to(skip, pj, @int_cast(i32, bi)) or not flags_hold_after(p.last, c) {
-                    continue;
-                }
-                npred[bi] += 1;
-            }
-            if npred[bi] > 0 {
-                mc.remove(MF.blocks.get(bi), c);
-            }
-        }
-    }
-    u.free_slice(first);
-    u.free_slice(bad);
-    u.free_slice(npred);
-}
-
-// Do the flags at jump j (before it) come from a compare the same as c,
-// with c's registers unchanged since?
-fn flags_hold(j: *mc.MInst, c: *mc.MInst) bool {
-    if u.isnil(j.prev) {
-        return false;
-    }
-    return flags_hold_after(j.prev, c);
-}
-
-// The same after instruction i (included).
-fn flags_hold_after(i: *mc.MInst, c: *mc.MInst) bool {
-    let mut w = i;
-    while u.notnil(w) {
-        if (w.op == xe.LABEL) or (w.op == xe.CALL) {
-            return false;
-        }
-        if (w.op == xe.JCC) or noop_move(w) {
-            w = w.prev;
-            continue;
-        }
-        if (w.op == c.op) and (w.sz == c.sz) and (w.cc == c.cc) and same_mop(w.ops[0], c.ops[0]) and
-           same_mop(w.ops[1], c.ops[1]) {
-            return true;
-        }
-        if not keeps_flags(w) or writes_reg_of(w, c) {
-            return false;
-        }
-        w = w.prev;
-    }
-    return false;
-}
-
-// The real instructions of block b (no no-op moves or local labels), when
-// there are at most n of them, else none.
-fn few_insts(b: *mc.MBlock, n: usize) []mut *mut mc.MInst {
-    let out = u.newn.[*mut mc.MInst](n);
-    let mut k: usize = 0;
-    let mut i = b.first;
-    while u.notnil(i) {
-        if not noop_move(i) and (i.op != xe.LABEL) {
-            if k == n {
-                return out[0..0];
-            }
-            out[k] = i;
-            k += 1;
-        }
-        i = i.next;
-    }
-    return out[0..k];
-}
-
-// The next block after bi that is not skipped (nb at the end).
-fn next_kept(skip: []bool, bi: usize) usize {
-    let mut k = bi + 1;
-    while (k < MF.blocks.len) and skip[k] {
-        k += 1;
-    }
-    return k;
-}
-
-// A test of a register against itself, or a compare of a register with a
-// register or a constant.
-fn plain_compare(i: *mc.MInst) bool {
-    return (((i.op == xe.ALU) and (i.cc == xe.ALU_CMP)) or (i.op == xe.TEST)) and (i.ops[0].kind == mc.K_REG) and
-           ((i.ops[1].kind == mc.K_REG) or (i.ops[1].kind == mc.K_IMM));
-}
-
-// A jump to a block that only compares and branches (a loop's exit test,
-// which the layout places after the body, where the loop's entry jumps)
-// compares and branches itself, so that the test block is entered only by
-// the body falling into it; a test of a register the body's last operation
-// set the flags from is then dropped (blsr, and, sub ... before the test).
-// Blocks whose flags are live at their end: dup_exit_tests dropped the test
-// the block they fall into starts with, which now reads them.
-let mut flags_out: u.List.[*mut mc.MBlock] = u.List.[*mut mc.MBlock].{ data: @ptr_from_int(*mut *mut mc.MBlock, 0),
-                                                                       len: 0, cap: 0 };
-
-fn flags_live_out(b: *mut mc.MBlock) bool {
-    for k in 0..flags_out.len {
-        if flags_out.get(k) == b {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Can x, at the end of a block that then compares (cmp) and branches to
-// block `other` or falls on, move after the branch: an operation on general
-// registers only, that writes one the compare does not read and that is not
-// needed at `other`?
-fn movable_to_fall(x: *mc.MInst, cmp: *mc.MInst, skip: []bool, other: i32) bool {
-    let op = x.op;
-    if not ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.IMUL_I) or
-            ((op == xe.SHIFT) and (x.ops[1].kind != mc.K_REG)) or
-            ((op == xe.ALU) and (x.cc != xe.ALU_ADC) and (x.cc != xe.ALU_SBB) and (x.cc != xe.ALU_CMP))) {
-        return false;
-    }
-    if (x.ops.len == 0) or (x.ops[0].kind != mc.K_REG) or (x.sz < 4) {
-        return false;
-    }
-    let d = P(x.ops[0].reg);
-    if d >= 16 {
-        return false;
-    }
-    for k in 1..x.ops.len {
-        let o = x.ops[k];
-        if (o.kind == mc.K_MEM) and (op != xe.LEA) {
-            return false;
-        }
-        if (o.kind == mc.K_REG) and (P(o.reg) >= 16) {
-            return false;
-        }
-    }
-    if names_phys(cmp, d) {
-        return false;
-    }
-    let seen = u.calloc_slice.[bool](MF.blocks.len + 1);
-    let mut budget: i32 = 48;
-    let dead = dead_at(@int_cast(usize, other), d, skip, seen, &mut budget);
-    u.free_slice(seen);
-    return dead;
-}
-
-// Is general register r written before it is read on every way from the
-// start of block b (looking at `budget` blocks at most)? False when not
-// known. (A block seen before is not looked at again: a read from there on
-// is found the first time.)
-fn dead_at(b0: usize, r: i32, skip: []bool, seen: []mut bool, budget: *mut i32) bool {
-    let mut b = b0;
-    while (b < MF.blocks.len) and skip[b] {
-        b += 1;
-    }
-    if b >= MF.blocks.len {
-        return false;
-    }
-    if seen[b] {
-        return true;
-    }
-    seen[b] = true;
-    budget.* -= 1;
-    if budget.* < 0 {
-        return false;
-    }
-    if MF.blocks.get(b).cold {
-        return true;  // (a trap)
-    }
-    let mut i = MF.blocks.get(b).first;
-    while u.notnil(i) {
-        let op = i.op;
-        if (op == xe.JMP) or (op == xe.JCC) {
-            let t = i.ops[0].label;
-            if (t >= xe.LOCAL_BASE) or (t < 0) or not dead_at(@int_cast(usize, t), r, skip, seen, budget) {
-                return false;
-            }
-            if op == xe.JMP {
-                return true;
-            }
-        } else if op == xe.CALL {
-            // (its argument registers are its operands; what it clobbers is
-            // written)
-            for k in 0..i.ops.len {
-                let o = i.ops[k];
-                if ((o.kind == mc.K_REG) and (P(o.reg) == r)) or
-                   ((o.kind == mc.K_MEM) and
-                    (((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r)))) {
-                    return false;
-                }
-            }
-            if (i.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
-                return true;
-            }
-        } else if op == xe.RET {
-            // (registers no calling convention keeps or returns in)
-            return (r == xe.RCX) or (r == xe.R8) or (r == xe.R9) or (r == xe.R10) or (r == xe.R11);
-        } else if op != xe.LABEL {
-            if not ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or
-                    (op == xe.STORE_I) or (op == xe.LEA) or (op == xe.ALU) or (op == xe.TEST) or (op == xe.IMUL) or
-                    (op == xe.IMUL_I) or (op == xe.SHIFT) or (op == xe.EXT) or (op == xe.CMOV) or (op == xe.SETCC) or
-                    (op == xe.CMP_M) or (op == xe.ANDN) or (op == xe.BLS) or (op == xe.NOP) or (op == xe.BITSCAN) or
-                    (op == xe.SHIFTX) or (op == xe.BT) or (op == xe.SSE) or (op == xe.PREFETCH) or
-                    (op == xe.VZEROUPPER)) {
-                return false;
-            }
-            // (shift by cl: rcx is its operand)
-            let mut reads = false;
-            let mut full = false;
-            for k in 0..i.ops.len {
-                let o = i.ops[k];
-                if o.kind == mc.K_REG {
-                    if P(o.reg) == r {
-                        if (o.role & mc.RU) != 0 {
-                            reads = true;
-                        } else if (o.role & (mc.RD | mc.RE)) != 0 {
-                            full = true;
-                        }
-                    }
-                } else if o.kind == mc.K_MEM {
-                    if ((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r)) {
-                        reads = true;
-                    }
-                }
-            }
-            if reads {
-                return false;
-            }
-            if full {
-                // a write of 8 or 16 bits keeps the rest
-                if (op == xe.SETCC) or ((op == xe.LOAD) and (i.sz < 4) and (i.cc == 0)) or (op == xe.SSE) or
-                   ((op == xe.BITSCAN) and (i.cc < 2)) or ((op != xe.LOAD) and (op != xe.EXT) and (i.sz < 4)) {
-                    return false;
-                }
-                return true;
-            }
-        }
-        i = i.next;
-    }
-    return dead_at(b + 1, r, skip, seen, budget);
-}
-
-fn dup_exit_tests(skip: []bool) void {
-    flags_out.clear();
-    let nb = MF.blocks.len;
-    for bi in 0..nb {
-        if skip[bi] {
-            continue;
-        }
-        let p = MF.blocks.get(bi);
-        let l = p.last;
-        if u.isnil(l) or (l.op != xe.JMP) or (l.ops[0].label >= xe.LOCAL_BASE) {
-            continue;
-        }
-        let t = @int_cast(usize, l.ops[0].label);
-        if (t == bi) or (t >= nb) or skip[t] or falls_to(skip, bi, l.ops[0].label) or (l.ops[0].label == SW) {
-            continue;
-        }
-        let ins = few_insts(MF.blocks.get(t), 3);
-        if (ins.len < 2) or not plain_compare(ins[0]) or (ins[1].op != xe.JCC) or
-           (ins[1].ops[0].label >= xe.LOCAL_BASE) {
-            continue;
-        }
-        let mut after: i32 = -1;
-        if ins.len == 3 {
-            if (ins[2].op != xe.JMP) or (ins[2].ops[0].label >= xe.LOCAL_BASE) {
-                continue;
-            }
-            after = ins[2].ops[0].label;
-        } else {
-            let n = next_kept(skip, t);
-            if n >= nb {
-                continue;
-            }
-            after = @int_cast(i32, n);
-        }
-        mc.remove(p, l);
-        // the operations at p's end whose results only the way p falls
-        // into needs (the loop's preheader work, as `b * 16` before an inner
-        // loop) go after the branch, onto that way
-        let fall = @int_cast(i32, next_kept(skip, bi));
-        let tl = ins[1].ops[0].label;
-        let mut cc = ins[1].cc;
-        let mut other: i32 = -1;
-        if tl == fall {
-            other = after;
-            cc = cc ^ 1;
-        } else if after == fall {
-            other = tl;
-        }
-        let mut s = p.last;  // (the first of them, or nil)
-        let mut moved = false;
-        if other >= 0 {
-            let mut x = p.last;
-            while u.notnil(x) and movable_to_fall(x, ins[0], skip, other) {
-                s = x;
-                moved = true;
-                x = x.prev;
-            }
-        }
-        let mut tail = u.List.[*mut mc.MInst].empty();
-        if moved {
-            let mut x = s;
-            while u.notnil(x) {
-                let nx = x.next;
-                mc.remove(p, x);
-                tail.push(x);
-                x = nx;
-            }
-        }
-        for k in @as(usize, 0)..2 {
-            let c = mc.new_inst(ins[k].op, ins[k].sz, ins[k].ops);
-            c.cc = ins[k].cc;
-            c.aux = ins[k].aux;
-            c.src = ins[k].src;
-            if moved and (k == 1) {
-                c.cc = cc;
-                c.ops[0] = mc.label(other);
-            }
-            mc.append(p, c);
-        }
-        let mut to = after;
-        if moved {
-            for k in 0..tail.len {
-                mc.append(p, tail.get(k));
-            }
-            to = fall;
-        }
-        tail.deinit();
-        let ops: [1]mc.MOp = [mc.label(to)];
-        mc.append(p, mc.new_inst(xe.JMP, 0, ops[..]));
-    }
-    // blocks entered only by falling from the one before
-    let refs = u.newn.[i32](nb + 1);
-    for bi in 0..nb {
-        if skip[bi] {
-            continue;
-        }
-        let mut i = MF.blocks.get(bi).first;
-        while u.notnil(i) {
-            if ((i.op == xe.JMP) or (i.op == xe.JCC)) and (i.ops[0].label < xe.LOCAL_BASE) {
-                refs[@int_cast(usize, i.ops[0].label)] += 1;
-            }
-            i = i.next;
-        }
-    }
-    let mut prev: usize = nb;
-    for bi in 0..nb {
-        if skip[bi] {
-            continue;
-        }
-        let pb = prev;
-        prev = bi;
-        if (pb == nb) or (refs[bi] != 0) or ends_flow(MF.blocks.get(pb)) or (@as(i32, @int_cast(i32, bi)) == SW) {
-            continue;
-        }
-        let tb = MF.blocks.get(bi);
-        let mut ti = tb.first;
-        while u.notnil(ti) and noop_move(ti) {
-            ti = ti.next;
-        }
-        if u.isnil(ti) or (ti.op != xe.TEST) or not plain_compare(ti) or not same_mop(ti.ops[0], ti.ops[1]) {
-            continue;
-        }
-        // the operation that last wrote the tested register in the block
-        // before: its flags are the test's if nothing after it sets them, or
-        // when it can move to the end of the block
-        let r = P(ti.ops[0].reg);
-        let pbb = MF.blocks.get(pb);
-        let mut w = pbb.last;
-        while u.notnil(w) and not writes_phys(w, r) {
-            w = w.prev;
-        }
-        if u.isnil(w) or not sets_flags_of(w) or (w.sz != ti.sz) or not flags_read_as_test(ti, logic_flags(w)) {
-            continue;
-        }
-        let mut intact = true;
-        let mut movable = true;
-        for k in 1..w.ops.len {
-            if (w.ops[k].kind != mc.K_REG) and (w.ops[k].kind != mc.K_IMM) and (w.ops[k].kind != mc.K_NONE) {
-                movable = false;
-            }
-        }
-        let mut j = w.next;
-        let mut set_after = false;  // (flags set since w: what reads them reads those)
-        while u.notnil(j) {
-            let op = j.op;
-            if not noop_move(j) {
-                if not ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or
-                        (op == xe.STORE_I) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.SETCC) or (op == xe.CMOV) or
-                        (op == xe.SHIFTX) or (op == xe.JCC) or
-                        ((op == xe.SSE) and (j.cc != xe.UCOMISS) and (j.cc != xe.UCOMISD) and (j.cc != xe.PTEST) and
-                         (j.cc != xe.KORTESTQ))) {
-                    intact = false;
-                }
-                let plain = (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.STORE) or
-                            (op == xe.STORE_I) or (op == xe.LEA) or (op == xe.EXT) or (op == xe.SHIFT) or
-                            (op == xe.SHIFTX) or (op == xe.IMUL) or (op == xe.IMUL_I) or (op == xe.TEST) or
-                            (op == xe.BITSCAN) or (op == xe.SSE) or (op == xe.BLS) or (op == xe.ANDN) or
-                            ((op == xe.ALU) and (j.cc != xe.ALU_ADC) and (j.cc != xe.ALU_SBB)) or
-                            (((op == xe.SETCC) or (op == xe.CMOV)) and set_after);
-                if not plain or touches_any(j, w) {
-                    movable = false;
-                }
-                if not keeps_flags(j) {
-                    set_after = true;
-                }
-            }
-            j = j.next;
-        }
-        if intact {
-            mc.remove(tb, ti);
-            flags_out.push(pbb);
-        } else if movable {
-            mc.remove(pbb, w);
-            mc.append(pbb, w);
-            mc.remove(tb, ti);
-            flags_out.push(pbb);
-        }
-    }
-}
-
-// Does i write physical register r?
-fn writes_phys(i: *mc.MInst, r: i32) bool {
-    if i.op == xe.CALL {
-        return true;  // (and what it clobbers)
-    }
-    for k in 0..i.ops.len {
-        let o = i.ops[k];
-        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) and (P(o.reg) == r) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Does i name (read or write, or address memory with) a register that w names?
-fn touches_any(i: *mc.MInst, w: *mc.MInst) bool {
-    for k in 0..w.ops.len {
-        if w.ops[k].kind == mc.K_REG {
-            let r = P(w.ops[k].reg);
-            for j in 0..i.ops.len {
-                let o = i.ops[j];
-                if (o.kind == mc.K_REG) and (P(o.reg) == r) {
-                    return true;
-                }
-                if (o.kind == mc.K_MEM) and
-                   (((o.base >= 0) and (P(o.base) == r)) or ((o.index >= 0) and (P(o.index) == r))) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-fn encode_func(f: *mut ir.Func) void {
-    // callee-saved registers in use
-    nsaved = 0;
-    nxsaved = 0;
-    let cs: [5]i32 = [xe.RBX, xe.R12, xe.R13, xe.R14, xe.R15];
-    let wcs: [7]i32 = [xe.RBX, xe.RSI, xe.RDI, xe.R12, xe.R13, xe.R14, xe.R15];
-    let mut callee = cs[..];
-    // registers instructions name themselves (rsi and rdi of the string
-    // instructions, rbx of cpuid) are used too
-    for bi in 0..MF.blocks.len {
-        let mut i = MF.blocks.get(bi).first;
-        while u.notnil(i) {
-            for k in 0..i.ops.len {
-                let o = i.ops[k];
-                if (o.kind == mc.K_REG) and not mc.is_vreg(o.reg) and (o.reg >= 0) {
-                    MF.used_regs = MF.used_regs | (@as(u64, 1) << @int_cast(u32, o.reg));
-                }
-            }
-            i = i.next;
-        }
-    }
-    if WIN {
-        callee = wcs[..];
-        for k in @as(i32, 6)..16 {
-            if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, xe.XMM0 + k))) != 0 {
-                xsaved[@int_cast(usize, nxsaved)] = xe.XMM0 + k;
-                nxsaved += 1;
-            }
-        }
-    }
-    for r in callee {
-        if (MF.used_regs & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
-            saved[@int_cast(usize, nsaved)] = r;
-            nsaved += 1;
-        }
-    }
-    // frame layout (slots below the saved registers)
-    let mut cur: i64 = (8 * nsaved) + (16 * nxsaved);
-    for k in 0..MF.slots.len {
-        let s = MF.slots.at(k);
-        let a = @bit_cast(i64, s.align);
-        cur = (cur + @bit_cast(i64, s.size) + a - 1) & ~(a - 1);
-        s.offset = -cur;
-    }
-    let total = (cur + @bit_cast(i64, out_area) + 15) & ~@as(i64, 15);
-    let sub = total - (8 * nsaved);
-    frameless = not needs_frame();
-    let mut sw = SW;
-    if frameless or WIN {
-        sw = -1;
-    }
-    if sw >= 0 {
-        for bi in 0..MF.blocks.len {
-            if not MF.blocks.get(bi).noframe {
-                continue;
-            }
-            let mut i = MF.blocks.get(bi).first;
-            while u.notnil(i) {
-                if not sw_frame_free(i) {
-                    sw = -1;  // (spilled there after all)
-                }
-                i = i.next;
-            }
-        }
-    }
-    SW = sw;
-    // (shrink-wrapped: where each run of frameless blocks starts and ends)
-    let mut noframe = u.List.[u64].empty();
-    let nb = MF.blocks.len;
-    let skip = tidy_branches();
-    reuse_flags_across(skip);
-    let boff = u.newn.[u64](nb + 1);
-    // the line table: (code offset, source location) where the location changes
-    let mut rows = u.List.[u64].empty();
-    // frame tables: (offset after each call, its chain)
-    let mut calls = u.List.[u64].empty();
-    jshort.clear();
-    jstart.clear();
-    jlabel.clear();
-    // where the function will start (see FALIGN)
-    let text = OBJ.secs.get(@int_cast(usize, TEXT));
-    FBASE = (@as(u64, text.data.len()) + @as(u64, FPAD) + FALIGN - 1) & ~(FALIGN - 1);
-    let lal = loop_aligned(skip);
-    // again if relax_jumps finds jumps that take a rel8, and after that while
-    // unrelax_jumps finds that padding left some of them out of reach
-    let mut pass: i32 = 0;
-    loop {
-        E = xe.Enc.{ b: bn.new_bytes(), relocs: u.List.[xe.Reloc].empty(), fixups: u.List.[xe.Fixup].empty(),
-                     avx: AVX };
-        local_off.clear();
-        jnext = 0;
-        jfix.clear();
-        rows.clear();
-        calls.clear();
-        noframe.clear();
-        in_noframe = false;
-        if sw < 0 {
-            prologue(sub);
-        }
-        let mut last_src = f.src;
-        if WIN and (f.src != 0) {
-            rows.push(@as(u64, f.src));
-        }
-        for bi in 0..nb {
-            let b = MF.blocks.get(bi);
-            if lal[bi] {
-                let at = (FBASE + @as(u64, E.b.len())) % LALIGN;
-                if (at != 0) and (LALIGN - at <= LMAX) {
-                    emit_nops(LALIGN - at);
-                }
-            }
-            boff[bi] = @as(u64, E.b.len());
-            if @as(i32, @int_cast(i32, bi)) == sw {
-                prologue(sub);  // (jumps into the block go here)
-            }
-            if skip[bi] {
-                continue;
-            }
-            if (sw >= 0) and (b.noframe != in_noframe) {
-                noframe.push(@as(u64, E.b.len()));
-                in_noframe = b.noframe;
-            }
-            let mut i = b.first;
-            while u.notnil(i) {
-                if WIN and (i.src != 0) and (i.src != last_src) {
-                    rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
-                    last_src = i.src;
-                }
-                let mut last = i;
-                let mut unit = false;
-                let mut extra: u64 = 0;
-                if JCC {
-                    let op = i.op;
-                    unit = (op == xe.JCC) or (op == xe.JMP) or (op == xe.CALL) or (op == xe.RET) or
-                           ((op == xe.REP) and (i.cc == 2));
-                    if fuses_with_jcc(i) {
-                        let mut j = i.next;
-                        while u.notnil(j) and enc_nothing(j) {
-                            j = j.next;
-                        }
-                        if u.notnil(j) and (j.op == xe.JCC) {
-                            unit = true;
-                            last = j;
-                        } else if u.isnil(j) {
-                            extra = jcc_next_block(bi, skip, lal, sw);
-                            unit = extra > 0;
-                        }
-                    }
-                }
-                if unit {
-                    enc_unit(i, last, extra);
-                } else {
-                    enc_inst(i);
-                }
-                if FT.on and (i.op == xe.CALL) {
-                    let mut at = @as(u64, E.b.len());
-                    if in_noframe {
-                        at = at | ft.CALL_FRAMELESS;  // (a call that does not return, before the frame is set up)
-                    }
-                    calls.push(at);
-                    calls.push(@bit_cast(u64, i.aux));
-                }
-                i = last.next;
-            }
-        }
-        if pass == 0 {
-            if not relax_jumps(boff[0..nb]) {
-                break;
-            }
-        } else if not unrelax_jumps(boff[0..nb]) {
-            break;
-        }
-        pass += 1;
-        E.b.free();
-    }
-    if in_noframe {
-        noframe.push(@as(u64, E.b.len()));
-        in_noframe = false;
-    }
-    // branch targets
-    for k in 0..E.fixups.len {
-        let x = E.fixups.get(k);
-        let mut target: u64 = 0;
-        if x.label >= xe.LOCAL_BASE {
-            target = local_off.get(@int_cast(usize, x.label - xe.LOCAL_BASE));
-        } else {
-            target = boff[@int_cast(usize, x.label)];
-        }
-        if x.short {
-            let rel = @bit_cast(i64, target) - @bit_cast(i64, x.off + 1);
-            if (rel < -128) or (rel > 127) {
-                fail("internal compiler error: a short jump out of range");
-            }
-            E.b.view()[@truncate(usize, x.off)] = @truncate(u8, @bit_cast(u64, rel));
-            continue;
-        }
-        let rel = @bit_cast(i64, target) - @bit_cast(i64, x.off + 4);
-        E.b.set_u32(@truncate(usize, x.off), @bit_cast(u64, rel));
-    }
-    // into .text
-    text.data.zeros(FPAD);
-    text.data.align(@truncate(usize, FALIGN));
-    let base = @as(u64, text.data.len());
-    if base != FBASE {
-        fail("internal compiler error: a function placed elsewhere than expected");
-    }
-    text.data.put(E.b.view());
-    for k in 0..E.relocs.len {
-        let r = E.relocs.get(k);
-        text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
-    }
-    let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
-    s.value = base;
-    s.size = @as(u64, E.b.len());
-    ft.func(&FT, base, s.size, frameless, noframe.items(), calls.items());
-    noframe.deinit();
-    if WIN and not frameless {
-        emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
-    }
-    if WIN and (rows.len > 0) {
-        emit_lines(s.name, rows.items());
-    }
-    E.b.free();
+    em.encode_func(f);
 }
 
 // -----------------------------------------------------------------------------
 // Module
 // -----------------------------------------------------------------------------
-// (experiments) a number from the environment
-fn env_num(name: []u8, dflt: u64) u64 {
-    let e = u.env(name);
-    if u.isnos(e) or (e.len == 0) {
-        return dflt;
-    }
-    let mut x: u64 = 0;
-    for ch in e {
-        x = (x * 10) + @as(u64, ch - '0');
-    }
-    return x;
-}
-
 pub fn compile(m: *mut ir.Module) *mut elf.Obj {
-    errors = false;
-    AVX = tg.has(tg.X_AVX);
-    WIN = tg.is_windows();
-    FPAD = @truncate(usize, env_num("AXIOM_X64_FPAD", 0));
-    FALIGN = env_num("AXIOM_X64_FALIGN", 16);
-    LALIGN = env_num("AXIOM_X64_LALIGN", 0);
-    LMAX = env_num("AXIOM_X64_LMAX", 15);
-    LMODE = @truncate(i32, @bit_cast(i64, env_num("AXIOM_X64_LMODE", 1)));
-    JCC = env_num("AXIOM_X64_JCC", 0) != 0;
+    em.errors = false;
+    em.AVX = tg.has(tg.X_AVX);
+    em.WIN = tg.is_windows();
+    em.placement_knobs();
     tls_index_si = -1;
-    OBJ = elf.new_obj(elf.EM_X86_64);
+    em.OBJ = elf.new_obj(elf.EM_X86_64);
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 64);
-    RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
-    XDATA = -1;
-    PDATA = -1;
-    LINES = -1;
-    if WIN {
-        LINES = elf.add_sec(OBJ, ".axiom.lines", elf.S_DEBUG, 1);
-        @mem_set(line_file[..], 0);
-        nline_files = 0;
+    em.TEXT = elf.add_sec(em.OBJ, ".text", elf.S_TEXT, 64);
+    RODATA = elf.add_sec(em.OBJ, ".rodata", elf.S_RODATA, 16);
+    em.XDATA = -1;
+    em.PDATA = -1;
+    em.LINES = -1;
+    if em.WIN {
+        em.LINES = elf.add_sec(em.OBJ, ".axiom.lines", elf.S_DEBUG, 1);
+        @mem_set(em.line_file[..], 0);
+        em.nline_files = 0;
         // here, not when the first function needs them: functions are
         // compiled in scratch scopes (their sections must outlive them)
-        XDATA = elf.add_sec(OBJ, ".xdata", elf.S_RODATA, 4);
-        PDATA = elf.add_sec(OBJ, ".pdata", elf.S_RODATA, 4);
-        XDATA_SYM = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: XDATA, value: 0, size: 0, bind: elf.B_LOCAL,
-                                               ty: elf.T_NOTYPE, hidden: false });
+        em.XDATA = elf.add_sec(em.OBJ, ".xdata", elf.S_RODATA, 4);
+        em.PDATA = elf.add_sec(em.OBJ, ".pdata", elf.S_RODATA, 4);
+        em.XDATA_SYM = elf.add_sym(em.OBJ, elf.Sym.{ name: "", sec: em.XDATA, value: 0, size: 0, bind: elf.B_LOCAL,
+                                                     ty: elf.T_NOTYPE, hidden: false });
     }
-    let relro = is.add_symbols(OBJ, m, TEXT, RODATA, elf.R_X86_64_64, &mut fsym, &mut gsym);
-    FT = ft.begin(OBJ, m, TEXT, relro, gsym.items(), elf.R_X86_64_PC32, elf.R_X86_64_64);
+    let relro = is.add_symbols(em.OBJ, m, em.TEXT, RODATA, elf.R_X86_64_64, &mut em.fsym, &mut gsym);
+    em.FT = ft.begin(em.OBJ, m, em.TEXT, relro, gsym.items(), elf.R_X86_64_PC32, elf.R_X86_64_64);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if not ir.is_decl(f) {
             // the function's machine code is all that outlives it
             u.scratch_begin();
             let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
-            AVX = tg.has(tg.X_AVX);
+            em.AVX = tg.has(tg.X_AVX);
             compile_func(f);
             tg.end_fn(outer);
             u.scratch_end();
-            if errors {
+            if em.errors {
                 return u.nil.[elf.Obj]();
             }
         }
     }
-    return OBJ;
+    return em.OBJ;
 }
