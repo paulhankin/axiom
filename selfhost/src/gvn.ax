@@ -2228,6 +2228,127 @@ fn table_max(i: *mut ir.Value) i64 {
     return m;
 }
 
+// A comparison with a constant of a value computed from an element T[x] of
+// a constant table (cb.leaf_load: casts and operations with constants),
+// where x is known to lie in the table: decided for each x, then tested as
+// one range of x (x - a <u n) or as x's bit of a constant (tables of up to
+// 64 elements). The load goes (is_term(op), a property of the opcode from a
+// table, becomes op - k <u 5).
+fn table_cmp(i: *mut ir.Value) *mut ir.Value {
+    let c = i.b;
+    if not ir.is_cint(c) or (i.a.kind != ir.V_INST) or (i.a.ty.kind != ir.T_INT) or (i.a.ty.bits > 64) {
+        return vnil();
+    }
+    let ld = cb.leaf_load(i.a, 0);
+    if u.isnil(ld) or (ld.flags != 0) or (ld.ty.kind != ir.T_INT) or (ld.ty.bits > 64) or (ld.ty.size == 0) {
+        return vnil();
+    }
+    let esz = ld.ty.size;
+    // the address: the table plus constants plus x * esz
+    let mut p = ld.a;
+    let mut off: u64 = 0;
+    let mut x = vnil();
+    let mut n: i32 = 0;
+    while ir.is_op(p, ir.OP_PTRADD) and (n < 8) {
+        n += 1;
+        if ir.is_cint(p.b) {
+            off = off +% ir.cint_val(p.b);
+        } else {
+            if u.notnil(x) {
+                return vnil();
+            }
+            x = index_of(p.b, esz);
+            if u.isnil(x) {
+                return vnil();
+            }
+        }
+        p = p.a;
+    }
+    if u.isnil(x) or (x.ty.kind != ir.T_INT) or (x.ty.bits > 64) or (p.kind != ir.V_GLOBAL) or not p.gv.is_const or
+       u.isnil(p.gv.init) or p.gv.tls or (p.gv.linkage == ir.LINK_WEAK) or (p.gv.linkage == ir.LINK_EXTWEAK) or
+       (off >= p.gv.ty.size) {
+        return vnil();
+    }
+    let ne = (p.gv.ty.size - off) / esz;
+    prove_budget = 64;
+    let hi = ub(x, 0);
+    if (hi < 0) or (@bit_cast(u64, hi) >= ne) or (hi >= 4096) {
+        return vnil();
+    }
+    // which x make it true
+    let mut first: i64 = -1;
+    let mut last: i64 = -1;
+    let mut count: i64 = 0;
+    let mut runs: i32 = 0;
+    let mut mask: u64 = 0;
+    let p0 = ir.pred_of(i);
+    for j in @as(i64, 0)..(hi + 1) {
+        let mut ok = false;
+        let v = cb.table_int(p, off + (@bit_cast(u64, j) * esz), ld.ty, &mut ok);
+        if not ok {
+            return vnil();
+        }
+        let lv = cb.leaf_value(i.a, ld, v);
+        let r = ir.fold_icmp(p0, ir.cint(i.a.ty, lv), c);
+        if u.isnil(r) or not ir.is_cint(r) {
+            return vnil();
+        }
+        if ir.cint_val(r) != 0 {
+            if (last < 0) or (last != (j - 1)) {
+                runs += 1;
+            }
+            if first < 0 {
+                first = j;
+            }
+            last = j;
+            count += 1;
+            if j < 64 {
+                mask = mask | (@as(u64, 1) << @truncate(u32, @bit_cast(u64, j)));
+            }
+        }
+    }
+    if count == 0 {
+        return ir.kbool(false);
+    }
+    if count == (hi + 1) {
+        return ir.kbool(true);
+    }
+    ir.at_before(B, i);
+    if runs == 1 {
+        if first == 0 {
+            return ir.icmp(B, ir.IntULT, x, ir.cint(x.ty, @bit_cast(u64, last + 1)));
+        }
+        let d = ir.binop(B, ir.OP_SUB, x, ir.cint(x.ty, @bit_cast(u64, first)));
+        return ir.icmp(B, ir.IntULT, d, ir.cint(x.ty, @bit_cast(u64, (last - first) + 1)));
+    }
+    if hi >= 64 {
+        return vnil();
+    }
+    let t64 = ir.t_int(64);
+    let mut x64 = x;
+    if x.ty.bits < 64 {
+        x64 = ir.cast(B, ir.OP_ZEXT, x, t64);
+    }
+    let sh = ir.binop(B, ir.OP_LSHR, ir.cint(t64, mask), x64);
+    let bit = ir.binop(B, ir.OP_AND, sh, ir.cint(t64, 1));
+    return ir.icmp(B, ir.IntNE, bit, ir.cint(t64, 0));
+}
+
+// The x of a byte offset x * sz, or nil.
+fn index_of(v: *mut ir.Value, sz: u64) *mut ir.Value {
+    if sz == 1 {
+        return v;
+    }
+    if ir.is_op(v, ir.OP_MUL) and ir.is_cint(v.b) and (ir.cint_val(v.b) == sz) {
+        return v.a;
+    }
+    if ir.is_op(v, ir.OP_SHL) and ir.is_cint(v.b) and (ir.cint_val(v.b) < 32) and
+       ((@as(u64, 1) << @truncate(u32, ir.cint_val(v.b))) == sz) {
+        return v.a;
+    }
+    return vnil();
+}
+
 // Is v (a byte offset) a multiple of sz?
 fn mult_of(v: *ir.Value, sz: u64, depth: i32) bool {
     if sz == 1 {
@@ -2545,6 +2666,9 @@ fn visit_block(b: *mut ir.Block) void {
             let mut r = find_expr(i);
             if u.isnil(r) and (op == ir.OP_ICMP) {
                 r = decide(i);
+                if u.isnil(r) {
+                    r = table_cmp(i);
+                }
             }
             if u.notnil(r) {
                 replace(i, r);
